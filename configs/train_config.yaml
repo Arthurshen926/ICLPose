@@ -1,0 +1,186 @@
+# 隐式对应关系位姿估计训练配置文件
+# 使用方法: python train.py --config configs/train_config.yaml
+
+# 随机种子
+seed: 42
+
+# 输出目录
+output_dir: "/home/yons/Projects/SplatLoc/implicit_correspondence/output/exp005"
+
+# SplatLoc预训练模型配置
+splatloc:
+  # Gaussian模型路径（.ply文件）
+  gaussians_path: "/home/yons/Projects/data/room_0/splatloc-test/data/room_0/point_cloud/final/point_cloud.ply"
+  
+  # 特征解码器路径（.pth文件）
+  decoder_path: "/home/yons/Projects/data/room_0/splatloc-test/data/room_0/train_feat/ckpt.pth"
+  
+  # SplatLoc配置文件路径（可选，用于正确加载FeatureDecoder）
+  # 如果不提供，将使用下面decoder和scene配置
+  config_path: "/home/yons/Projects/SplatLoc/configs/replica_nerf/base_config.yaml"
+  
+  # 是否冻结解码器参数（True: 冻结，False: 可训练）
+  freeze_decoder: true
+
+# 场景配置（需与训练FeatureDecoder时使用的一致！）
+scene:
+  # 场景边界 [[x_min, x_max], [y_min, y_max], [z_min, z_max]]
+  # 注意：这必须与训练decoder时使用的边界完全一致，否则HashGrid大小会不匹配
+  # 从SplatLoc训练配置获取的真实边界
+  bound: [[-1.0, 7.0], [-1.3, 3.7], [-1.7, 1.4]]
+  # SDF体素大小（从训练配置获取）
+  voxel_sdf: 0.06
+
+# 特征解码器配置（需与训练时一致）
+decoder:
+  enc: 'HashGrid'  # HashGrid, identity, freq
+  num_layers: 4
+  hidden_dim: 128
+  final_dim: 256
+
+# ICPoseNet模型配置
+model:
+  # 特征维度（应与decoder的final_dim一致）
+  feature_dim: 256
+  
+  # 可学习query的数量
+  num_queries: 128
+  
+  # 跨模态融合层数
+  fusion_layers: 8 #6
+  
+  # 注意力头数
+  num_heads: 8
+  
+  # Dropout概率
+  dropout: 0.1
+
+# 数据集配置
+dataset:
+  # 数据根目录
+  data_root: "/home/yons/Projects/data/room_0"
+  
+  # 训练场景名称
+  train_scene: "Sequence_1"
+  
+  # 验证场景名称（使用不同序列避免数据泄露）
+  val_scene: "Sequence_2"
+  
+  # 训练集采样间隔（参考SplatLoc: 每5帧取1帧，900帧→180帧）
+  # train_step=5: 每5帧采样，train_step=1: 使用全部帧
+  train_step: 1
+  
+  # 验证集采样间隔（通常设为1，使用全部帧进行评估）
+  val_step: 1
+  
+  # 图像尺寸 [width, height]
+  image_size: [640, 480]
+  
+  # 最大训练样本数（null表示使用全部采样后的数据）
+  # 注意：采样后再限制，例如train_step=5时，900帧→180帧，若max_train_samples=100则取前100帧
+  max_train_samples: null
+  
+  # 最大验证样本数（null表示使用全部）
+  max_val_samples: null
+  
+  # Gaussian点云路径（用于视锥裁剪生成2D-3D对应）
+  gaussian_path: "/home/yons/Projects/data/room_0/splatloc-test/data/room_0/point_cloud/final/point_cloud.ply"
+  
+  # 是否使用深度图（可选，仅用于验证）
+  use_depth: false
+  
+  # 相机内参
+  fx: 320.0
+  fy: 320.0
+  cx: 319.5
+  cy: 239.5
+
+# 损失函数配置
+loss:
+ 
+  # 是否使用相对位姿
+  # true: 学习相对于初始位姿的增量变换（更稳定，适合SLAM/tracking场景）
+  # false: 学习绝对位姿（适合全局定位场景）
+  # 注意：启用时需要在数据集中提供initial_pose
+  use_relative_pose: false
+  
+  # 是否归一化平移（平衡旋转和平移的梯度）
+  # 先关闭，保持与之前训练一致
+  normalize_translation: true
+  
+  # 是否使用Kendall's Loss（自动学习权重）
+  # 注意：Kendall's Loss要求rotation和translation loss有合理的初始量级关系
+  # 目前先关闭，使用固定权重验证6D rotation是否work
+  use_kendall: false
+  # Kendall's Loss初始log_var（仅当use_kendall=true时有效）
+  # 旋转loss范围0-180度，平移loss范围0-5米
+  # 设置log_var_rotation=3.0 -> 初始权重=exp(-3)=0.05 (降低旋转权重)
+  # 设置log_var_translation=-1.0 -> 初始权重=exp(1)=2.7 (增大平移权重)
+  init_log_var_rotation: 3.0
+  init_log_var_translation: -1.0
+  
+  # 旋转损失类型（use_kendall=false时生效）: geodesic, l2, cosine, quaternion
+  rotation_loss: 'geodesic'
+  
+  # 平移损失类型（use_kendall=false时生效）: l1, l2, smooth_l1
+  translation_loss: 'l2'
+  
+  # 旋转损失权重（use_kendall=false时生效）
+  # 保持与之前训练一致
+  rotation_weight: 1.0
+  
+  # 平移损失权重（use_kendall=false时生效）
+  translation_weight: 1.0
+
+# 训练配置
+training:
+  # 总epoch数
+  num_epochs: 300
+  
+  # 批次大小（每GPU）
+  # 从8增大到24，充分利用24GB显存
+  # 两张卡总batch_size = 24 * 2 = 48
+  batch_size: 48 #24
+  
+  # 验证批次大小（每GPU）
+  val_batch_size: 48
+  
+  # DataLoader工作线程数（增大以加速数据加载）
+  # 多GPU训练时增大到8可以更好地喂饱GPU
+  num_workers: 32
+  
+  # 优化器类型: adam, adamw
+  optimizer: 'adamw'
+  
+  # 学习率（降低到5e-5以提高稳定性）
+  learning_rate: 5.0e-5 #1.0e-4
+  
+  # 解码器学习率（如果freeze_decoder=false）
+  decoder_lr: 1.0e-5
+  
+  # 权重衰减
+  weight_decay: 1.0e-4
+  
+  # 梯度裁剪阈值（提高到5.0以更好地控制梯度爆炸）
+  grad_clip: 5.0
+  
+  # 学习率调度器类型: cosine, step, exponential, none
+  scheduler: 'cosine'
+  
+  # 最小学习率（用于cosine scheduler）
+  min_lr: 1.0e-6
+  
+  # 学习率衰减步长（用于step scheduler）
+  lr_decay_step: 10
+  
+  # 学习率衰减系数（用于step/exponential scheduler）
+  lr_decay_gamma: 0.5
+  
+  # 验证间隔（每N个epoch验证一次）
+  val_interval: 10
+  
+  # checkpoint保存间隔（每N个epoch保存一次）
+  save_interval: 20
+  
+  # TensorBoard日志记录间隔（每N步记录一次）
+  log_interval: 5
