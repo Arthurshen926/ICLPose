@@ -24,17 +24,21 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
 
-# SplatLoc相关导入
-sys.path.append(str(Path(__file__).parent.parent))
-from gaussian_splatting.scene.gaussian_model import GaussianModel
-from models.decoders import FeatureDecoder
-from gaussian_splatting.gaussian_renderer import render
-from utils.camera_utils import Camera
+# SplatLoc相关导入（已集成到本仓库）
+from splatloc_modules.gaussian_splatting.scene.gaussian_model import GaussianModel
+from splatloc_modules.models.decoders import FeatureDecoder
+from splatloc_modules.gaussian_splatting.gaussian_renderer import render
 
 # 隐式对应关系模块导入
 from data.dataset import CorrespondenceDataset, collate_fn
 from losses.pose_loss import PoseLoss, PoseLossKendall
 from ic_models.ic_pose_net import ICPoseNet
+from utils.visualization import (
+    visualize_attention_maps,
+    visualize_2d3d_correspondence,
+    visualize_pose_prediction,
+    visualize_feature_similarity_matrix
+)
 
 
 def compute_relative_pose(pose_target, pose_init):
@@ -116,6 +120,13 @@ class ICPoseTrainer:
             self.log_dir = self.output_dir / 'logs'
             self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
             self.log_dir.mkdir(parents=True, exist_ok=True)
+            
+            # 可视化目录（如果启用）
+            if config.get('visualization', {}).get('enable', False):
+                self.vis_dir = self.output_dir / 'visualizations'
+                self.vis_dir.mkdir(parents=True, exist_ok=True)
+            else:
+                self.vis_dir = None
             
             # TensorBoard日志
             self.writer = SummaryWriter(log_dir=str(self.log_dir))
@@ -347,6 +358,7 @@ class ICPoseTrainer:
         data_cfg = self.config['dataset']
         
         # 训练集
+        use_relative_pose = self.config['loss'].get('use_relative_pose', False)
         self.train_dataset = CorrespondenceDataset(
             data_root=data_cfg['data_root'],
             scene_name=data_cfg['train_scene'],
@@ -360,6 +372,9 @@ class ICPoseTrainer:
             cx=data_cfg['cx'],
             cy=data_cfg['cy'],
             sample_step=data_cfg.get('train_step', 1),
+            use_initial_pose=use_relative_pose,
+            pose_noise_rot_deg=data_cfg.get('pose_noise_rot_deg', 5.0),
+            pose_noise_trans_m=data_cfg.get('pose_noise_trans_m', 0.1),
         )
         
         # 验证集
@@ -376,6 +391,9 @@ class ICPoseTrainer:
             cx=data_cfg['cx'],
             cy=data_cfg['cy'],
             sample_step=data_cfg.get('val_step', 1),
+            use_initial_pose=use_relative_pose,
+            pose_noise_rot_deg=data_cfg.get('pose_noise_rot_deg', 5.0),
+            pose_noise_trans_m=data_cfg.get('pose_noise_trans_m', 0.1),
         )
         
         # DataLoader
@@ -574,7 +592,7 @@ class ICPoseTrainer:
         if self.is_main_process:
             print("  ✓ 损失函数初始化完成")
     
-    def _extract_features(self, batch: Dict) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _extract_features(self, batch: Dict) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         从图像和点云提取特征
         
@@ -588,6 +606,10 @@ class ICPoseTrainer:
         返回:
             img_feats: (B, N_img, C) 图像特征
             pcd_feats: (B, N_pcd, C) 点云特征
+            img_pos_embeds: (B, N_img, C) 图像位置编码
+            pcd_pos_embeds: (B, N_pcd, C) 点云位置编码
+            img_pixels: (B, N_img, 2) 图像像素坐标 (u, v)
+            pcd_points: (B, N_pcd, 3) 3D点云坐标 (x, y, z)
         """
         import numpy as np
         
@@ -626,6 +648,14 @@ class ICPoseTrainer:
             mask = sample_indices == b
             n_pts = mask.sum().item()
             pcd_feats[b, :n_pts] = pcd_feats_flat[mask]
+        
+        # L2归一化3D特征（在添加位置编码之前）
+        for b in range(batch_size):
+            pcd_feats_batch = pcd_feats[b, :pts_per_sample[b]]
+            if pcd_feats_batch.shape[0] > 0:
+                pcd_feats[b, :pts_per_sample[b]] = torch.nn.functional.normalize(
+                    pcd_feats_batch, p=2, dim=-1
+                )
         
         # === 提取2D图像特征 ===
         img_feats = torch.zeros(batch_size, max_pts, feature_dim, device=self.device)
@@ -666,6 +696,15 @@ class ICPoseTrainer:
                 
                 sampled_feats = sampled_feats.squeeze(2).squeeze(0).permute(1, 0)  # [N_b, 256]
                 img_feats[b, :n_pts] = sampled_feats
+            
+            # L2归一化2D特征（在添加位置编码之前）
+            # 使2D和3D特征都在单位超球面上，特征匹配只关注方向
+            for b in range(batch_size):
+                img_feats_batch = img_feats[b, :pts_per_sample[b]]  # [N_b, 256]
+                if img_feats_batch.shape[0] > 0:
+                    img_feats[b, :pts_per_sample[b]] = torch.nn.functional.normalize(
+                        img_feats_batch, p=2, dim=-1
+                    )
         else:
             # Fallback: 使用3D特征
             print("警告: 没有融合特征，使用3D特征作为2D特征（不推荐）")
@@ -687,9 +726,10 @@ class ICPoseTrainer:
             n_pts = mask.sum()
             coords_2d_batch[b, :n_pts] = coords_2d_norm[mask]
         
-        # 生成2D位置编码
+        # 生成2D位置编码（不再直接添加到特征）
+        # 改为通过embeds参数传递给Transformer
         pos_enc_2d = actual_model.pos_enc_2d(coords_2d_batch)  # [B, N, 256]
-        img_feats = img_feats + pos_enc_2d  # 特征 + 位置编码
+        img_pos_embeds = pos_enc_2d
         
         # 3D位置编码: 基于世界坐标 (x, y, z)
         coords_3d_batch = torch.zeros(batch_size, max_pts, 3, device=self.device)
@@ -700,11 +740,23 @@ class ICPoseTrainer:
         
         # 生成3D位置编码
         pos_enc_3d = actual_model.pos_enc_3d(coords_3d_batch)  # [B, N, 258]
-        # 需要投影到256维
+        # 需要投影到25 6维
         pos_enc_3d_proj = actual_model.pos_enc_3d_proj(pos_enc_3d)  # [B, N, 256]
-        pcd_feats = pcd_feats + pos_enc_3d_proj  # 特征 + 位置编码
+        pcd_pos_embeds = pos_enc_3d_proj
         
-        return img_feats, pcd_feats
+        # 🆕 返回坐标（用于keypoint提取）
+        # img_pixels: (B, N, 2) - 像素坐标 (u, v)
+        # pcd_points: (B, N, 3) - 3D点坐标 (x, y, z)
+        img_pixels = coords_2d_batch  # 已经归一化到[0,1]，需要恢复到像素坐标
+        # 恢复到像素坐标
+        img_pixels = img_pixels.clone()
+        img_pixels[:, :, 0] = img_pixels[:, :, 0] * 639.0  # u
+        img_pixels[:, :, 1] = img_pixels[:, :, 1] * 479.0  # v
+        
+        pcd_points = coords_3d_batch  # 已经是世界坐标
+        
+        # 返回特征和位置编码（位置编码通过embeds参数传递）
+        return img_feats, pcd_feats, img_pos_embeds, pcd_pos_embeds, img_pixels, pcd_points
     
     def train_epoch(self, epoch: int) -> Dict[str, float]:
         """
@@ -733,12 +785,14 @@ class ICPoseTrainer:
         
         for batch_idx, batch in enumerate(pbar):
             try:
-                # 1. 提取特征
-                img_feats, pcd_feats = self._extract_features(batch)
+                # 1. 提取特征和位置编码 + 坐标
+                img_feats, pcd_feats, img_pos_embeds, pcd_pos_embeds, img_pixels, pcd_points = self._extract_features(batch)
                 
-                # 2. 前向传播
-                pose_matrix_pred, pose_9d, rotation_6d, translation_rel = self.model(
-                    img_feats, pcd_feats
+                # 2. 前向传播（传递位置编码 + 坐标）
+                pose_matrix_pred, pose_9d, rotation_6d, translation_rel, \
+                    img_heatmap, img_keypoints, pcd_keypoints = self.model(
+                    img_feats, pcd_feats, img_pixels, pcd_points,
+                    img_pos_embeds, pcd_pos_embeds
                 )
                 
                 # 3. 准备GT
@@ -749,9 +803,11 @@ class ICPoseTrainer:
                 normalize_translation = self.config['loss'].get('normalize_translation', False)
                 
                 if use_relative_pose:
-                    # 初始位姿：batch第一帧
-                    pose_init = gt_poses_abs[0:1].expand(gt_poses_abs.shape[0], 4, 4).clone()
-                    # 计算相对GT
+                    # 使用每帧的初始位姿（带噪声）
+                    if 'initial_pose' not in batch:
+                        raise ValueError("启用use_relative_pose但数据集中没有initial_pose！请检查数据集配置")
+                    pose_init = batch['initial_pose'].to(self.device)  # (B, 4, 4) 每帧独立的初始位姿
+                    # 计算相对GT：从pose_init到gt_poses_abs的变换
                     gt_poses = compute_relative_pose(gt_poses_abs, pose_init)
                 else:
                     # 使用绝对位姿
@@ -798,6 +854,25 @@ class ICPoseTrainer:
                 
                 loss = loss_dict['loss']
                 
+                # 🆕 添加Diversity Loss
+                from modules.diversity_loss import diversity_loss
+                # 配置参数：margin和权重
+                diversity_margin_2d = self.config['loss'].get('diversity_margin_2d', 10.0)  # 像素
+                diversity_margin_3d = self.config['loss'].get('diversity_margin_3d', 0.1)  # 米
+                diversity_weight = self.config['loss'].get('diversity_weight', 0.01)
+                
+                div_loss_2d = diversity_loss(img_keypoints, diversity_margin_2d)
+                div_loss_3d = diversity_loss(pcd_keypoints, diversity_margin_3d)
+                div_loss_total = diversity_weight * (div_loss_2d + div_loss_3d)
+                
+                # 添加到总loss
+                loss = loss + div_loss_total
+                
+                # 记录diversity loss
+                loss_dict['diversity_loss_2d'] = div_loss_2d.item()
+                loss_dict['diversity_loss_3d'] = div_loss_3d.item()
+                loss_dict['diversity_loss_total'] = div_loss_total.item()
+                
                 # 4. 检测NaN
                 if torch.isnan(loss) or torch.isinf(loss):
                     print(f"\n⚠️ 检测到NaN/Inf损失在batch {batch_idx}! 跳过此batch")
@@ -836,11 +911,22 @@ class ICPoseTrainer:
                 total_rot_loss += loss_dict['rotation_loss']
                 total_trans_loss += loss_dict['translation_loss']
                 
+                # 🆕 统计diversity loss
+                if 'diversity_loss_total' in loss_dict:
+                    if not hasattr(self, 'total_div_loss'):
+                        self.total_div_loss = 0.0
+                        self.total_div_loss_2d = 0.0
+                        self.total_div_loss_3d = 0.0
+                    self.total_div_loss += loss_dict['diversity_loss_total']
+                    self.total_div_loss_2d += loss_dict['diversity_loss_2d']
+                    self.total_div_loss_3d += loss_dict['diversity_loss_3d']
+                
                 # 9. 更新进度条
                 pbar.set_postfix({
                     'loss': f"{loss.item():.4f}",
                     'rot': f"{loss_dict['rotation_loss']:.4f}",
                     'trans': f"{loss_dict['translation_loss']:.4f}",
+                    'div': f"{loss_dict.get('diversity_loss_total', 0.0):.4f}",
                     'grad': f"{total_grad_norm:.2f}",
                     'lr': f"{self.optimizer.param_groups[0]['lr']:.2e}"
                 })
@@ -852,6 +938,12 @@ class ICPoseTrainer:
                     self.writer.add_scalar('train/translation_loss', loss_dict['translation_loss'], self.global_step)
                     self.writer.add_scalar('train/gradient_norm', total_grad_norm, self.global_step)
                     self.writer.add_scalar('train/learning_rate', self.optimizer.param_groups[0]['lr'], self.global_step)
+                    
+                    # 🆕 Diversity Loss日志
+                    if 'diversity_loss_total' in loss_dict:
+                        self.writer.add_scalar('train/diversity_loss_total', loss_dict['diversity_loss_total'], self.global_step)
+                        self.writer.add_scalar('train/diversity_loss_2d', loss_dict['diversity_loss_2d'], self.global_step)
+                        self.writer.add_scalar('train/diversity_loss_3d', loss_dict['diversity_loss_3d'], self.global_step)
                     
                     # Kendall's Loss权重监控
                     if hasattr(self.pose_loss, 'log_var_rotation'):
@@ -901,17 +993,30 @@ class ICPoseTrainer:
         rotation_errors = []
         translation_errors = []
         
+        # 可视化相关
+        vis_config = self.config.get('visualization', {})
+        should_visualize = (
+            self.is_main_process and 
+            vis_config.get('enable', False) and 
+            self.vis_dir is not None and
+            epoch % vis_config.get('vis_interval', 5) == 0
+        )
+        vis_samples_saved = 0
+        vis_num_samples = 1  # 只保存1个样本的置信度热力图
+        
         pbar = tqdm(self.val_loader, desc=f"Validation",
                    disable=not self.is_main_process)
         
         for batch_idx, batch in enumerate(pbar):
             try:
-                # 1. 提取特征
-                img_feats, pcd_feats = self._extract_features(batch)
+                # 1. 提取特征和位置编码 + 坐标
+                img_feats, pcd_feats, img_pos_embeds, pcd_pos_embeds, img_pixels, pcd_points = self._extract_features(batch)
                 
-                # 2. 前向传播
-                pose_matrix_pred, pose_9d, rotation_6d, translation = self.model(
-                    img_feats, pcd_feats
+                # 2. 前向传播（传递位置编码 + 坐标）
+                pose_matrix_pred, pose_9d, rotation_6d, translation, \
+                    img_heatmap, img_keypoints, pcd_keypoints = self.model(
+                    img_feats, pcd_feats, img_pixels, pcd_points,
+                    img_pos_embeds, pcd_pos_embeds
                 )
                 
                 # 3. 准备GT（与训练保持一致）
@@ -975,14 +1080,29 @@ class ICPoseTrainer:
                 
                 # 如果使用了相对位姿，需要转回绝对位姿
                 if use_relative_pose:
-                    pose_init = gt_poses_abs[0:1].expand(gt_poses_abs.shape[0], 4, 4).clone()
+                    # 使用每帧的初始位姿
+                    pose_init = batch['initial_pose'].to(self.device)
                     pose_pred_eval = compose_pose(pose_pred_eval, pose_init)
                 
                 rot_error, trans_error = self._compute_pose_error(pose_pred_eval, gt_poses_abs)
                 rotation_errors.extend(rot_error.cpu().numpy().tolist())
                 translation_errors.extend(trans_error.cpu().numpy().tolist())
                 
-                # 7. 更新进度条
+                # 7. 可视化（仅在主进程且满足条件时）
+                if should_visualize and vis_samples_saved < vis_num_samples:
+                    self._save_confidence_heatmap(
+                        epoch=epoch,
+                        sample_idx=vis_samples_saved,
+                        batch=batch,
+                        img_feats=img_feats,
+                        pcd_feats=pcd_feats,
+                        img_heatmap=img_heatmap,  # 🆕 传递真正的attention heatmap
+                        rot_error=rot_error[0].item(),
+                        trans_error=trans_error[0].item()
+                    )
+                    vis_samples_saved += 1
+                
+                # 8. 更新进度条
                 pbar.set_postfix({
                     'loss': f"{loss.item():.4f}",
                     'rot': f"{loss_dict['rotation_loss']:.4f}",
@@ -1094,6 +1214,196 @@ class ICPoseTrainer:
         translation_error = torch.norm(pred_t - gt_t, dim=1)
         
         return rotation_error, translation_error
+    
+    def _save_visualizations(self, epoch, batch_idx, sample_idx, batch, 
+                            img_feats, pcd_feats, pose_pred, pose_gt, 
+                            rot_error, trans_error, vis_types):
+        """
+        保存可视化结果
+        
+        参数:
+            epoch: 当前epoch
+            batch_idx: 当前batch索引
+            sample_idx: 当前样本索引
+            batch: 数据batch
+            img_feats: (B, N_img, C) 2D图像特征
+            pcd_feats: (B, N_pcd, C) 3D点云特征
+            pose_pred: (B, 4, 4) 预测位姿
+            pose_gt: (B, 4, 4) 真实位姿
+            rot_error: (B,) 旋转误差
+            trans_error: (B,) 平移误差
+            vis_types: 可视化类型配置
+        """
+        import cv2
+        
+        try:
+            # 只可视化batch中的第一个样本
+            idx = 0
+            
+            # 创建epoch专用目录
+            epoch_vis_dir = self.vis_dir / f'epoch_{epoch:04d}'
+            epoch_vis_dir.mkdir(exist_ok=True)
+            
+            # 准备图像（从batch中获取）
+            if 'image' in batch:
+                img = batch['image'][idx].cpu().numpy()  # (3, H, W)
+                if img.shape[0] == 3:  # 如果是CHW格式
+                    img = np.transpose(img, (1, 2, 0))  # 转为HWC
+                
+                # 反归一化 (ImageNet标准化)
+                mean = np.array([0.485, 0.456, 0.406])
+                std = np.array([0.229, 0.224, 0.225])
+                img = img * std + mean  # 反归一化到[0, 1]
+                img = np.clip(img, 0, 1)  # 裁剪到合法范围
+                
+                # 转换到[0, 255]
+                img = (img * 255).astype(np.uint8)
+            else:
+                # 如果没有原始图像，创建空白图像
+                img = np.zeros((480, 640, 3), dtype=np.uint8)
+            
+            # 1. 位姿预测可视化
+            if vis_types.get('pose_prediction', True):
+                pose_vis_path = epoch_vis_dir / f'sample_{sample_idx:02d}_pose.png'
+                visualize_pose_prediction(
+                    gt_pose=pose_gt[idx].cpu().numpy(),
+                    pred_pose=pose_pred[idx].cpu().numpy(),
+                    img=img,
+                    save_path=str(pose_vis_path)
+                )
+            
+            # 2. 2D-3D特征相似度可视化
+            if vis_types.get('correspondence', True) and 'pcd_xyz' in batch:
+                correspondence_vis_path = epoch_vis_dir / f'sample_{sample_idx:02d}_correspondence.png'
+                # 提取点云坐标
+                pcd_xyz = batch['pcd_xyz'][idx].cpu().numpy()  # (N_pcd, 3)
+                visualize_2d3d_correspondence(
+                    img_feats=img_feats[idx].cpu().numpy(),  # (N_img, C)
+                    pcd_feats=pcd_feats[idx].cpu().numpy(),  # (N_pcd, C)
+                    img=img,
+                    pcd_xyz=pcd_xyz,
+                    save_path=str(correspondence_vis_path)
+                )
+            
+            # 3. 特征相似度矩阵
+            if vis_types.get('feature_similarity', True):
+                similarity_vis_path = epoch_vis_dir / f'sample_{sample_idx:02d}_similarity.png'
+                
+                # 调试信息：检查特征统计
+                img_f = img_feats[idx].cpu().numpy()
+                pcd_f = pcd_feats[idx].cpu().numpy()
+                self._log(f"  [Debug] 2D特征: shape={img_f.shape}, mean={img_f.mean():.4f}, std={img_f.std():.4f}, range=[{img_f.min():.4f}, {img_f.max():.4f}]")
+                self._log(f"  [Debug] 3D特征: shape={pcd_f.shape}, mean={pcd_f.mean():.4f}, std={pcd_f.std():.4f}, range=[{pcd_f.min():.4f}, {pcd_f.max():.4f}]")
+                
+                visualize_feature_similarity_matrix(
+                    img_feats=img_f,
+                    pcd_feats=pcd_f,
+                    save_path=str(similarity_vis_path)
+                )
+            
+            if sample_idx == 0:  # 只在第一个样本时打印
+                self._log(f"  ✓ 可视化已保存至: {epoch_vis_dir}")
+        
+        except Exception as e:
+            self._log(f"  ⚠ 可视化保存失败: {str(e)}")
+            import traceback
+            traceback.print_exc()
+    
+    def _save_confidence_heatmap(self, epoch, sample_idx, batch, 
+                                 img_feats, pcd_feats, img_heatmap, rot_error, trans_error):
+        """
+        保存置信度热力图（原始图像尺寸）
+        
+        参数:
+            epoch: 当前epoch
+            sample_idx: 当前样本索引
+            batch: 数据batch
+            img_feats: (B, N_img, C) 2D图像特征（用于获取坐标）
+            pcd_feats: (B, N_pcd, C) 3D点云特征
+            img_heatmap: (B, N_query, N_img) Query的attention权重
+            rot_error: 旋转误差(标量)
+            trans_error: 平移误差(标量)
+        """
+        import cv2
+        import matplotlib.pyplot as plt
+        
+        try:
+            idx = 0  # 第一个样本
+            
+            # 创建epoch专用目录
+            epoch_vis_dir = self.vis_dir / f'epoch_{epoch:04d}'
+            epoch_vis_dir.mkdir(exist_ok=True)
+            
+            # 1. 准备原始图像
+            if 'image' in batch:
+                img = batch['image'][idx].cpu().numpy()  # (3, H, W)
+                if img.shape[0] == 3:
+                    img = np.transpose(img, (1, 2, 0))  # 转为HWC
+                
+                # 反归一化
+                mean = np.array([0.485, 0.456, 0.406])
+                std = np.array([0.229, 0.224, 0.225])
+                img = img * std + mean
+                img = np.clip(img, 0, 1)
+            else:
+                img = np.zeros((480, 640, 3))
+            
+            H, W = img.shape[:2]  # 480, 640
+            
+            # 2. 🆕 使用真正的Attention Heatmap（ICL-I2PReg方式）
+            # img_heatmap: (N_query, N_img) - 每个query对所有2D点的attention权重
+            heatmap_data = img_heatmap[idx].cpu()  # (N_query, N_img)
+            
+            # 对所有queries取最大值 → 每个2D点被关注的最大程度
+            confidence_scores = heatmap_data.max(dim=0)[0].numpy()  # (N_img,)
+            
+            # 3. 获取2D坐标
+            pts_2d = batch['points_2d']  # [total_N, 2]
+            sample_indices = batch['sample_indices']  # [total_N]
+            mask = (sample_indices == idx)
+            pts_2d_sample = pts_2d[mask].cpu().numpy()  # (N, 2) - (u, v)
+            
+            # 4. 创建原始图像尺寸的置信度热力图
+            heatmap = np.zeros((H, W), dtype=np.float32)
+            
+            # 将点的置信度分配到最近的像素
+            for i, (u, v) in enumerate(pts_2d_sample):
+                x, y = int(round(u)), int(round(v))
+                if 0 <= x < W and 0 <= y < H:
+                    heatmap[y, x] = max(heatmap[y, x], confidence_scores[i])
+            
+            # 高斯平滑使热力图更连续
+            heatmap = cv2.GaussianBlur(heatmap, (15, 15), 0)
+            
+            # 5. 可视化
+            fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+            
+            # 左图：原始图像
+            axes[0].imshow(img)
+            axes[0].set_title('Input Image', fontsize=14)
+            axes[0].axis('off')
+            
+            # 右图：置信度热力图叠加
+            axes[1].imshow(img)
+            im = axes[1].imshow(heatmap, cmap='jet', alpha=0.6, vmin=0, vmax=1)
+            axes[1].set_title(f'Confidence Heatmap\nRot: {rot_error:.2f}°, Trans: {trans_error:.3f}m', 
+                            fontsize=14)
+            axes[1].axis('off')
+            
+            # 添加colorbar
+            plt.colorbar(im, ax=axes[1], label='2D-3D Match Confidence', fraction=0.046)
+            
+            plt.tight_layout()
+            save_path = epoch_vis_dir / f'confidence_heatmap_epoch{epoch:04d}.png'
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            plt.close()
+            
+            self._log(f"  ✓ 置信度热力图已保存: {save_path}")
+            
+        except Exception as e:
+            self._log(f"  ⚠ 可视化保存失败: {str(e)}")
+            import traceback
+            traceback.print_exc()
     
     def save_checkpoint(self, epoch: int, is_best: bool = False):
         """

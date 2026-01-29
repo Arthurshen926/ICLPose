@@ -40,6 +40,9 @@ class CorrespondenceDataset(Dataset):
         cx: float = 319.5,
         cy: float = 239.5,
         sample_step: int = 1,
+        use_initial_pose: bool = False,
+        pose_noise_rot_deg: float = 5.0,
+        pose_noise_trans_m: float = 0.1,
     ):
         """
         初始化数据集
@@ -64,6 +67,11 @@ class CorrespondenceDataset(Dataset):
         self.augment = augment
         self.use_depth = use_depth
         self.sample_step = sample_step
+        
+        # 初始位姿配置（用于相对位姿学习）
+        self.use_initial_pose = use_initial_pose
+        self.pose_noise_rot_deg = pose_noise_rot_deg
+        self.pose_noise_trans_m = pose_noise_trans_m
         
         # 相机内参
         self.K = np.array([
@@ -107,11 +115,14 @@ class CorrespondenceDataset(Dataset):
                 print(f"警告: 深度图目录不存在: {self.depth_dir}")
                 self.use_depth = False
         
-        # 融合特征目录
+        # 融合特征目录（已压缩到256维）
+        # 如果目录不存在，将在训练时使用feat_decoder动态提取特征
         self.fused_feat_dir = os.path.join(self.scene_path, 'features_compressed/fused')
-        if not os.path.exists(self.fused_feat_dir):
+        self.use_fused_features = os.path.exists(self.fused_feat_dir)
+        if not self.use_fused_features:
             print(f"警告: 融合特征目录不存在: {self.fused_feat_dir}")
-            print("将使用随机特征作为fallback")
+            print("将在训练时动态提取特征")
+            self.fused_feat_dir = None
         
         # 加载Gaussian点云（用于视锥裁剪）
         if gaussian_path is None:
@@ -224,6 +235,42 @@ class CorrespondenceDataset(Dataset):
         
         return transforms.Compose(transform_list)
     
+    def _add_pose_noise(self, pose_gt: np.ndarray) -> np.ndarray:
+        """
+        给位姿添加噪声（模拟定位初始误差）
+        
+        参数:
+            pose_gt: (4, 4) numpy数组，真值位姿
+            
+        返回:
+            pose_noisy: (4, 4) numpy数组，带噪声的位姿
+        """
+        pose_noisy = pose_gt.copy()
+        
+        # 1. 旋转噪声：使用轴角表示
+        # 生成随机旋转角度（度 -> 弧度）
+        angle = np.random.randn() * (self.pose_noise_rot_deg * np.pi / 180.0)
+        # 生成随机旋转轴（归一化）
+        axis = np.random.randn(3)
+        axis = axis / (np.linalg.norm(axis) + 1e-8)
+        
+        # Rodrigues公式：轴角 -> 旋转矩阵
+        K = np.array([
+            [0, -axis[2], axis[1]],
+            [axis[2], 0, -axis[0]],
+            [-axis[1], axis[0], 0]
+        ])
+        R_noise = np.eye(3) + np.sin(angle) * K + (1 - np.cos(angle)) * (K @ K)
+        
+        # 应用旋转噪声：R_noisy = R_noise @ R_gt
+        pose_noisy[:3, :3] = R_noise @ pose_gt[:3, :3]
+        
+        # 2. 平移噪声（米）
+        trans_noise = np.random.randn(3) * self.pose_noise_trans_m
+        pose_noisy[:3, 3] = pose_gt[:3, 3] + trans_noise
+        
+        return pose_noisy
+    
     def _load_image(self, idx: int) -> torch.Tensor:
         """
         加载并处理RGB图像
@@ -285,34 +332,60 @@ class CorrespondenceDataset(Dataset):
         返回:
             fused_feat: [256, 35, 46] tensor (保持原始尺寸，不上采样) 或 None
         """
-        if not os.path.exists(self.fused_feat_dir):
+        # 如果禁用fused_features，直接返回None
+        if not self.use_fused_features:
+            return None
+            
+        if self.fused_feat_dir is None or not os.path.exists(self.fused_feat_dir):
             return None
         
         # 从rgb文件名推断融合特征文件名
-        # rgb_0.png -> rgb_0_fused_768x35x46_compressed.pt
+        # rgb_0.png -> rgb_0_fused_768x35x46_compressed.pt（注：实际已是256维，768是历史命名）
         rgb_basename = os.path.basename(self.rgb_files[idx])
         img_name = rgb_basename.replace('.png', '').replace('.jpg', '')
+        
+        # 标准格式：带_compressed后缀
         fused_feat_path = os.path.join(
             self.fused_feat_dir,
             f'{img_name}_fused_768x35x46_compressed.pt'
         )
-        
-        if not os.path.exists(fused_feat_path):
-            print(f"警告: 融合特征文件不存在: {fused_feat_path}")
-            return None
-        
-        try:
-            # 加载融合特征
-            fused_data = torch.load(fused_feat_path, map_location='cpu')
-            compressed_feat = fused_data['compressed']  # [35, 46, 256]
             
-            # 转换为 [C, H, W] - 不再上采样，保持原始35x46尺寸
-            feat_chw = compressed_feat.permute(2, 0, 1)  # [256, 35, 46]
-            
-            return feat_chw
-        except Exception as e:
-            print(f"加载融合特征时出错: {e}")
-            return None
+        if os.path.exists(fused_feat_path):
+            try:
+                # 加载融合特征（已压缩到256维）
+                fused_data = torch.load(fused_feat_path, map_location='cpu', weights_only=True)
+                
+                # 支持两种数据格式
+                if isinstance(fused_data, dict) and 'compressed' in fused_data:
+                    # 格式1: {'compressed': tensor}
+                    compressed_feat = fused_data['compressed']  # [35, 46, 256]
+                else:
+                    # 格式2: 直接是tensor
+                    compressed_feat = fused_data  # 可能是 [1, 256, 35, 46] 或 [35, 46, 256]
+                
+                # 处理不同的张量格式
+                if compressed_feat.ndim == 4:
+                    # [1, 256, 35, 46] -> [256, 35, 46]
+                    compressed_feat = compressed_feat.squeeze(0)
+                
+                # 现在应该是 [C, H, W] 或 [H, W, C]
+                if compressed_feat.shape[0] == 256:
+                    # 已经是 [C, H, W] 格式
+                    feat_chw = compressed_feat
+                elif compressed_feat.shape[-1] == 256:
+                    # [H, W, C] -> [C, H, W]
+                    feat_chw = compressed_feat.permute(2, 0, 1)
+                else:
+                    print(f"警告: 未知的特征形状 {compressed_feat.shape}，期望256维")
+                    return None
+                
+                return feat_chw  # [256, 35, 46]
+            except Exception as e:
+                print(f"加载融合特征时出错 {fused_feat_path}: {e}")
+                return None
+        
+        # 没找到文件
+        return None
     
     def _generate_2d_3d_pairs(
         self, 
@@ -414,10 +487,27 @@ class CorrespondenceDataset(Dataset):
         # 加载融合特征
         fused_feature = self._load_fused_feature(idx)  # [256, 480, 640] or None
         
-        # 获取位姿
-        pose = torch.from_numpy(self.poses[idx])
+        # 获取真值位姿
+        pose_gt = self.poses[idx].copy()
+        pose = torch.from_numpy(pose_gt)
+        
+        # 生成初始位姿（如果启用相对位姿模式）
+        if self.use_initial_pose:
+            # 训练集：添加随机噪声
+            if self.augment:
+                pose_init_np = self._add_pose_noise(pose_gt)
+            # 验证集：添加固定小噪声或直接使用GT（可根据需要调整）
+            else:
+                # 验证时也添加小噪声，模拟实际定位场景
+                pose_init_np = self._add_pose_noise(pose_gt)
+            pose_initial = torch.from_numpy(pose_init_np)
+        else:
+            # 不使用初始位姿时，设为None
+            pose_initial = None
         
         # 生成2D-3D对应关系
+        # 注意：这里仍使用GT位姿裁剪点云（保持与训练一致）
+        # 如果需要使用初始位姿裁剪（更符合实际定位场景），可传入pose_init_np
         points_2d, points_3d, valid_mask = self._generate_2d_3d_pairs(idx)
         
         # 内参矩阵
@@ -434,6 +524,10 @@ class CorrespondenceDataset(Dataset):
             'intrinsics': intrinsics,
             'idx': idx,
         }
+        
+        # 添加初始位姿（如果启用）
+        if pose_initial is not None:
+            sample['initial_pose'] = pose_initial
         
         if depth is not None:
             sample['depth'] = depth
@@ -459,6 +553,11 @@ def collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     images = torch.stack([item['image'] for item in batch])
     poses = torch.stack([item['pose'] for item in batch])
     intrinsics = torch.stack([item['intrinsics'] for item in batch])
+    
+    # 初始位姿（如果有）
+    initial_poses = None
+    if 'initial_pose' in batch[0]:
+        initial_poses = torch.stack([item['initial_pose'] for item in batch])
     
     # 融合特征 (可能为None)
     fused_features = []
@@ -498,6 +597,10 @@ def collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         'sample_indices': sample_indices,  # 记录每个点属于哪个样本
         'batch_size': len(batch),
     }
+    
+    # 添加初始位姿（如果有）
+    if initial_poses is not None:
+        batched['initial_pose'] = initial_poses
     
     # 处理深度图（如果有）
     if 'depth' in batch[0]:

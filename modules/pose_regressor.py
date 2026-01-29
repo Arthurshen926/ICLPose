@@ -69,20 +69,25 @@ def matrix_to_rotation_6d(R: torch.Tensor) -> torch.Tensor:
 
 class PoseRegressor(nn.Module):
     """
-    位姿回归器（使用6D旋转表示和相对位姿）
+    位姿回归器（使用6D旋转表示和相对位姿 + Keypoint坐标）
     
-    从融合后的查询特征回归6-DOF相机位姿
-    输入: fused_feats (B, N_query, 256)
+    从融合后的查询特征 + 检测到的keypoint坐标回归6-DOF相机位姿
+    输入: 
+        - fused_feats (B, N_query, 256)
+        - img_keypoints (B, N_query, 2) 
+        - pcd_keypoints (B, N_query, 3)
     输出: pose (B, 9) - [tx, ty, tz, r1, r2, r3, r4, r5, r6] (相对平移+6D旋转)
     
     改进:
         1. 使用6D旋转表示（Zhou et al. CVPR 2019），替代轴角表示
         2. 预测相对位姿（相对初始位姿），而非绝对位姿
-        3. 更稳定的梯度和收敛特性
+        3. 🆕 使用keypoint坐标作为显式几何约束（对齐ICL-I2PReg）
+        4. 更稳定的梯度和收敛特性
     
     架构:
-        1. 全局平均池化聚合查询特征
-        2. MLP回归位姿参数
+        1. Keypoint坐标编码器（MLP）
+        2. 特征聚合（query特征 + keypoint特征）
+        3. MLP回归位姿参数
     """
     
     def __init__(self, feature_dim=256, hidden_dim=512, output_dim=9):
@@ -97,9 +102,40 @@ class PoseRegressor(nn.Module):
         self.hidden_dim = hidden_dim
         self.output_dim = output_dim
         
-        # 特征聚合
+        # 🆕 Keypoint坐标编码器（对齐ICL-I2PReg）
+        self.kp_2d_encoder = nn.Sequential(
+            nn.Linear(2, 32),
+            nn.ReLU(inplace=True),
+            nn.Linear(32, 64),
+            nn.ReLU(inplace=True),
+            nn.Linear(64, 128),
+            nn.LayerNorm(128),
+            nn.ReLU(inplace=True),
+        )
+        
+        self.kp_3d_encoder = nn.Sequential(
+            nn.Linear(3, 32),
+            nn.ReLU(inplace=True),
+            nn.Linear(32, 64),
+            nn.ReLU(inplace=True),
+            nn.Linear(64, 128),
+            nn.LayerNorm(128),
+            nn.ReLU(inplace=True),
+        )
+        
+        # Query特征投影
+        self.query_proj = nn.Sequential(
+            nn.Linear(feature_dim, 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, 128),
+            nn.LayerNorm(128),
+            nn.ReLU(inplace=True),
+        )
+        
+        # 特征聚合（query特征 + keypoint特征）
+        # 输入: 128 (query) + 128 (2D kp) + 128 (3D kp) = 384
         self.feature_aggregation = nn.Sequential(
-            nn.Linear(feature_dim, hidden_dim),
+            nn.Linear(384, hidden_dim),
             nn.ReLU(inplace=True),
             nn.Dropout(0.1),
             nn.Linear(hidden_dim, hidden_dim),
@@ -133,12 +169,14 @@ class PoseRegressor(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
     
-    def forward(self, fused_feats, query_padding_mask=None):
+    def forward(self, fused_feats, img_keypoints, pcd_keypoints, query_padding_mask=None):
         """
         前向传播
         
         Args:
             fused_feats: (B, N_query, C) 融合后的查询特征
+            img_keypoints: (B, N_query, 2) 检测到的2D关键点坐标
+            pcd_keypoints: (B, N_query, 3) 检测到的3D关键点坐标
             query_padding_mask: (B, N_query) padding掩码，True表示无效位置
             
         Returns:
@@ -146,14 +184,26 @@ class PoseRegressor(nn.Module):
             rotation_6d: (B, 6) 6D旋转表示
             translation: (B, 3) 平移向量（相对）
         """
+        # 🆕 编码keypoint坐标
+        kp_2d_feats = self.kp_2d_encoder(img_keypoints)  # (B, N_query, 128)
+        kp_3d_feats = self.kp_3d_encoder(pcd_keypoints)  # (B, N_query, 128)
+        query_feats = self.query_proj(fused_feats)       # (B, N_query, 128)
+        
+        # 🆕 拼接所有特征（对齐ICL-I2PReg）
+        combined_feats = torch.cat([
+            kp_2d_feats,   # 2D keypoint特征
+            query_feats,   # query特征
+            kp_3d_feats,   # 3D keypoint特征
+        ], dim=-1)  # (B, N_query, 384)
+        
         # 全局平均池化（考虑padding mask）
         if query_padding_mask is not None:
             # 将padding位置的特征置零
             mask = (~query_padding_mask).float().unsqueeze(-1)  # (B, N, 1)
-            masked_feats = fused_feats * mask  # (B, N, C)
-            global_feat = masked_feats.sum(dim=1) / (mask.sum(dim=1) + 1e-8)  # (B, C)
+            masked_feats = combined_feats * mask  # (B, N, 384)
+            global_feat = masked_feats.sum(dim=1) / (mask.sum(dim=1) + 1e-8)  # (B, 384)
         else:
-            global_feat = fused_feats.mean(dim=1)  # (B, C)
+            global_feat = combined_feats.mean(dim=1)  # (B, 384)
         
         # 特征聚合
         feat = self.feature_aggregation(global_feat)  # (B, hidden_dim)
