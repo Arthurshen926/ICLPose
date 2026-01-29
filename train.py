@@ -43,30 +43,43 @@ from utils.visualization import (
 
 def compute_relative_pose(pose_target, pose_init):
     """
-    计算相对位姿: pose_rel = pose_target @ inv(pose_init)
+    计算相对位姿: pose_rel = inv(pose_init) @ pose_target
+    
+    即：从init坐标系到target坐标系的变换
+    满足：pose_target = pose_init @ pose_rel
     
     Args:
-        pose_target: (B, 4, 4) 目标位姿（绝对）
-        pose_init: (B, 4, 4) 初始位姿（绝对）
+        pose_target: (B, 4, 4) 目标位姿（绝对）- camera-to-world变换
+        pose_init: (B, 4, 4) 初始位姿（绝对）- camera-to-world变换
         
     Returns:
-        pose_rel: (B, 4, 4) 相对位姿
+        pose_rel: (B, 4, 4) 相对位姿（从init相机坐标系到target相机坐标系的变换）
+    
+    数学推导:
+        pose_rel = inv(pose_init) @ pose_target
+        
+        其中 inv(T) = [R^T, -R^T @ t; 0, 1]
+        
+        所以:
+        R_rel = R_init^T @ R_target
+        t_rel = R_init^T @ (t_target - t_init)
     """
-    # inv(pose_init) @ pose_target 等价于从init坐标系到target坐标系的变换
     R_init = pose_init[:, :3, :3]  # (B, 3, 3)
     t_init = pose_init[:, :3, 3]   # (B, 3)
     
     R_target = pose_target[:, :3, :3]  # (B, 3, 3)
     t_target = pose_target[:, :3, 3]   # (B, 3)
     
-    # 相对旋转: R_rel = R_target @ R_init^T
-    R_rel = torch.bmm(R_target, R_init.transpose(1, 2))
+    # 相对旋转: R_rel = R_init^T @ R_target
+    # 注意：这是 inv(pose_init) @ pose_target 的正确公式
+    R_rel = torch.bmm(R_init.transpose(1, 2), R_target)
     
     # 相对平移: t_rel = R_init^T @ (t_target - t_init)
     t_rel = torch.bmm(R_init.transpose(1, 2), (t_target - t_init).unsqueeze(-1)).squeeze(-1)
     
-    # 组合
-    pose_rel = torch.eye(4, device=pose_target.device).unsqueeze(0).expand(pose_target.shape[0], 4, 4).clone()
+    # 组合成4x4变换矩阵
+    batch_size = pose_target.shape[0]
+    pose_rel = torch.eye(4, device=pose_target.device).unsqueeze(0).expand(batch_size, 4, 4).clone()
     pose_rel[:, :3, :3] = R_rel
     pose_rel[:, :3, 3] = t_rel
     
@@ -873,6 +886,32 @@ class ICPoseTrainer:
                 loss_dict['diversity_loss_3d'] = div_loss_3d.item()
                 loss_dict['diversity_loss_total'] = div_loss_total.item()
                 
+                # 🆕 添加Reprojection Loss（几何一致性约束）
+                from losses.reprojection_loss import reprojection_loss
+                reprojection_weight = self.config['loss'].get('reprojection_weight', 0.1)
+                
+                if reprojection_weight > 0:
+                    # 注意：使用绝对位姿gt_poses_abs计算重投影
+                    # 因为img_keypoints和pcd_keypoints都是在绝对坐标系下检测的
+                    intrinsics_batch = batch['intrinsics'].to(self.device)  # (B, 3, 3)
+                    
+                    reproj_loss, reproj_valid_ratio = reprojection_loss(
+                        img_keypoints=img_keypoints,  # (B, N_query, 2) 像素坐标
+                        pcd_keypoints=pcd_keypoints,  # (B, N_query, 3) 世界坐标
+                        gt_pose=gt_poses_abs,         # (B, 4, 4) 绝对GT位姿
+                        intrinsics=intrinsics_batch,
+                        image_size=(640, 480),
+                        reduction='mean',
+                    )
+                    
+                    reproj_loss_weighted = reprojection_weight * reproj_loss
+                    loss = loss + reproj_loss_weighted
+                    
+                    # 记录reprojection loss
+                    loss_dict['reprojection_loss'] = reproj_loss.item()
+                    loss_dict['reprojection_loss_weighted'] = reproj_loss_weighted.item()
+                    loss_dict['reprojection_valid_ratio'] = reproj_valid_ratio.item()
+                
                 # 4. 检测NaN
                 if torch.isnan(loss) or torch.isinf(loss):
                     print(f"\n⚠️ 检测到NaN/Inf损失在batch {batch_idx}! 跳过此batch")
@@ -927,6 +966,7 @@ class ICPoseTrainer:
                     'rot': f"{loss_dict['rotation_loss']:.4f}",
                     'trans': f"{loss_dict['translation_loss']:.4f}",
                     'div': f"{loss_dict.get('diversity_loss_total', 0.0):.4f}",
+                    'reproj': f"{loss_dict.get('reprojection_loss', 0.0):.2f}",
                     'grad': f"{total_grad_norm:.2f}",
                     'lr': f"{self.optimizer.param_groups[0]['lr']:.2e}"
                 })
@@ -944,6 +984,12 @@ class ICPoseTrainer:
                         self.writer.add_scalar('train/diversity_loss_total', loss_dict['diversity_loss_total'], self.global_step)
                         self.writer.add_scalar('train/diversity_loss_2d', loss_dict['diversity_loss_2d'], self.global_step)
                         self.writer.add_scalar('train/diversity_loss_3d', loss_dict['diversity_loss_3d'], self.global_step)
+                    
+                    # 🆕 Reprojection Loss日志
+                    if 'reprojection_loss' in loss_dict:
+                        self.writer.add_scalar('train/reprojection_loss', loss_dict['reprojection_loss'], self.global_step)
+                        self.writer.add_scalar('train/reprojection_loss_weighted', loss_dict['reprojection_loss_weighted'], self.global_step)
+                        self.writer.add_scalar('train/reprojection_valid_ratio', loss_dict['reprojection_valid_ratio'], self.global_step)
                     
                     # Kendall's Loss权重监控
                     if hasattr(self.pose_loss, 'log_var_rotation'):

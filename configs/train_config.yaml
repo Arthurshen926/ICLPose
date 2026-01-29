@@ -5,15 +5,15 @@
 seed: 42
 
 # 输出目录
-output_dir: "/home/yons/Projects/implicit_correspondence/output/exp014"
+output_dir: "/home/yons/Projects/ICLPose/output/exp015"
 
 # SplatLoc预训练模型配置
 splatloc:
   # Gaussian模型路径（.ply文件）
-  gaussians_path: "/home/yons/Projects/data/room_0/splatloc-test/data/room_0/point_cloud/final/point_cloud.ply"
+  gaussians_path: "/home/yons/Projects/ICLPose/dataset/room_0/splatloc-test/data/room_0/point_cloud/final/point_cloud.ply"
   
   # 特征解码器路径（.pth文件）
-  decoder_path: "/home/yons/Projects/data/room_0/splatloc-test/data/room_0/train_feat/ckpt.pth"
+  decoder_path: "/home/yons/Projects/ICLPose/dataset/room_0/splatloc-test/data/room_0/train_feat/ckpt.pth"
   
   # SplatLoc配置文件路径（可选，用于正确加载FeatureDecoder）
   # 如果不提供，将使用下面decoder和scene配置
@@ -58,7 +58,7 @@ model:
 # 数据集配置
 dataset:
   # 数据根目录
-  data_root: "/home/yons/Projects/data/room_0"
+  data_root: "/home/yons/Projects/ICLPose/dataset/room_0"
   
   # 训练场景名称
   train_scene: "Sequence_1"
@@ -84,7 +84,7 @@ dataset:
   max_val_samples: null
   
   # Gaussian点云路径（用于视锥裁剪生成2D-3D对应）
-  gaussian_path: "/home/yons/Projects/data/room_0/splatloc-test/data/room_0/point_cloud/final/point_cloud.ply"
+  gaussian_path: "/home/yons/Projects/ICLPose/dataset/room_0/splatloc-test/data/room_0/point_cloud/final/point_cloud.ply"
   
   # 是否使用深度图（可选，仅用于验证）
   use_depth: false
@@ -139,9 +139,14 @@ loss:
   
   # 🆕 Diversity Loss配置（对齐ICL-I2PReg）
   # 防止所有keypoints坍缩到同一位置，确保检测到的关键点分散分布
-  diversity_weight: 0.01          # diversity loss权重
-  diversity_margin_2d: 10.0       # 2D keypoint最小距离阈值（像素）
-  diversity_margin_3d: 0.1        # 3D keypoint最小距离阈值（米）
+  diversity_weight: 0.05          # diversity loss权重（从0.01提高到0.05，增强约束）
+  diversity_margin_2d: 16.0       # 2D keypoint最小距离阈值（像素）- 对齐ICL-I2PReg的16
+  diversity_margin_3d: 0.16       # 3D keypoint最小距离阈值（米）- 对齐ICL-I2PReg的16cm
+  
+  # 🆕 Reprojection Loss配置（几何一致性约束）
+  # 将3D keypoints投影到2D，与检测到的2D keypoints计算距离
+  # 提供直接的几何监督，加速keypoint对应关系学习
+  reprojection_weight: 0.1        # reprojection loss权重
 
 # 训练配置
 training:
