@@ -57,7 +57,7 @@ def visualize_multiscale_pca(features, rgb_image, output_path):
         rgb_arr = np.array(pil_rgb)
         orig_H, orig_W = rgb_arr.shape[:2]
 
-        fig, axes = plt.subplots(1, 4, figsize=(24, 5))
+        fig, axes = plt.subplots(1, 5, figsize=(30, 5))
         fig.suptitle(
             f'Multi-Scale Feature Pyramid  |  RGB {orig_W}×{orig_H}',
             fontsize=12, fontweight='bold'
