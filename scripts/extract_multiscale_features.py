@@ -2,24 +2,29 @@
 """
 多尺度特征提取脚本 (v2-iterative-routing)
 
-从 RGB 图像提取三层特征金字塔 + DINO CLS Token:
-  - fine   : SD s3 (640d) + DINO Patch (768d) → 1408d @ 35×46
-  - mid    : SD s4 (1280d)  @ ~15×20
-  - coarse : SD s5 (1280d)  @ ~8×10
-  - cls    : DINO CLS Token (768d)
+从 RGB 图像提取多尺度特征金字塔 + DINO CLS Token:
+  - fine_sd  : SD s3 (640d)  @ 35×46 (上采样到 DINO 网格)
+  - fine_dino: DINO Patch (768d) @ 35×46
+  - mid      : SD s4 (1280d) @ ~15×20
+  - coarse   : SD s5 (1280d) @ ~8×10
+  - cls      : DINO CLS Token (768d)
+
+注意: fine_sd 和 fine_dino 分布差异大, 不直接拼接.
+      后续由各自的 AutoEncoder 独立压缩后再拼接嵌入 3DGS.
 
 用法:
-    CUDA_VISIBLE_DEVICES=0 python scripts/extract_multiscale_features.py \
-        --input_dir dataset/room_0/Sequence_1/rgb \
-        --output_dir output/features_multiscale/room_0 \
+    CUDA_VISIBLE_DEVICES=0 python scripts/extract_multiscale_features.py \\
+        --input_dir dataset/room_0/Sequence_1/rgb \\
+        --output_dir output/features_multiscale/room_0 \\
         --visualize --vis_interval 50
 
 输出结构 (output_dir/):
-    fine/rgb_0000_fine_1408x35x46.pt      # [1408, 35, 46]
-    mid/rgb_0000_mid_1280x15x20.pt        # [1280, 15, 20]
-    coarse/rgb_0000_coarse_1280x8x10.pt   # [1280,  8, 10]
-    cls/rgb_0000_cls_768.pt               # [768]
-    vis/rgb_0000_vis.png                  # (可选) PCA 可视化
+    fine_sd/rgb_0000_fine_sd_640x35x46.pt     # [640 , 35, 46]
+    fine_dino/rgb_0000_fine_dino_768x35x46.pt # [768 , 35, 46]
+    mid/rgb_0000_mid_1280x15x20.pt            # [1280, 15, 20]
+    coarse/rgb_0000_coarse_1280x8x10.pt       # [1280,  8, 10]
+    cls/rgb_0000_cls_768.pt                   # [768]
+    vis/rgb_0000_vis.png                      # (可选) PCA 可视化
 """
 import os
 import sys
@@ -63,8 +68,8 @@ def visualize_multiscale_pca(features, rgb_image, output_path):
         axes[0].set_title(f'RGB ({orig_W}×{orig_H})', fontsize=10)
         axes[0].axis('off')
 
-        level_names = ['Fine (s3+DINO)', 'Mid (s4)', 'Coarse (s5)']
-        level_keys = ['fine', 'mid', 'coarse']
+        level_names = ['Fine SD (s3)', 'Fine DINO', 'Mid (s4)', 'Coarse (s5)']
+        level_keys = ['fine_sd', 'fine_dino', 'mid', 'coarse']
 
         for idx, (name, key) in enumerate(zip(level_names, level_keys)):
             feat = features[key]  # [C, H, W]
@@ -112,7 +117,7 @@ def main():
 
     # 创建子目录
     dirs = {}
-    for sub in ['fine', 'mid', 'coarse', 'cls']:
+    for sub in ['fine_sd', 'fine_dino', 'mid', 'coarse', 'cls']:
         d = output_dir / sub
         d.mkdir(parents=True, exist_ok=True)
         dirs[sub] = d
@@ -144,23 +149,23 @@ def main():
 
         ms = extractor.extract(img_path)
 
-        # 保存各层特征
-        fine_shape = f"{ms.fine.shape[0]}x{ms.fine.shape[1]}x{ms.fine.shape[2]}"
-        torch.save(ms.fine, dirs['fine'] / f"{stem}_fine_{fine_shape}.pt")
+        # 保存各层特征 (fine_sd 和 fine_dino 独立保存, 不拼接)
+        def _save(tensor, subdir, tag):
+            shape_str = 'x'.join(str(s) for s in tensor.shape)
+            torch.save(tensor, dirs[subdir] / f"{stem}_{tag}_{shape_str}.pt")
 
-        mid_shape = f"{ms.mid.shape[0]}x{ms.mid.shape[1]}x{ms.mid.shape[2]}"
-        torch.save(ms.mid, dirs['mid'] / f"{stem}_mid_{mid_shape}.pt")
-
-        coarse_shape = f"{ms.coarse.shape[0]}x{ms.coarse.shape[1]}x{ms.coarse.shape[2]}"
-        torch.save(ms.coarse, dirs['coarse'] / f"{stem}_coarse_{coarse_shape}.pt")
-
+        _save(ms.fine_sd,   'fine_sd',   'fine_sd')
+        _save(ms.fine_dino, 'fine_dino', 'fine_dino')
+        _save(ms.mid,       'mid',       'mid')
+        _save(ms.coarse,    'coarse',    'coarse')
         torch.save(ms.cls_token, dirs['cls'] / f"{stem}_cls_{ms.cls_token.shape[0]}.pt")
 
         # 可视化
         if args.visualize and i % args.vis_interval == 0:
             vis_path = dirs['vis'] / f"{stem}_multiscale_vis.png"
             visualize_multiscale_pca(
-                {'fine': ms.fine, 'mid': ms.mid, 'coarse': ms.coarse},
+                {'fine_sd': ms.fine_sd, 'fine_dino': ms.fine_dino,
+                 'mid': ms.mid, 'coarse': ms.coarse},
                 str(img_path),
                 vis_path,
             )
@@ -169,17 +174,19 @@ def main():
         # 第一帧打印尺寸信息
         if i == 0:
             print(f"\n  特征尺寸:")
-            print(f"    Fine   : {list(ms.fine.shape)}  (SD s3 {640}d + DINO Patch {768}d → {ms.fine.shape[0]}d)")
-            print(f"    Mid    : {list(ms.mid.shape)}  (SD s4)")
-            print(f"    Coarse : {list(ms.coarse.shape)}  (SD s5)")
-            print(f"    CLS    : {list(ms.cls_token.shape)}  (DINO CLS Token)")
+            print(f"    Fine SD   : {list(ms.fine_sd.shape)}  (SD s3, 上采样到 DINO 网格)")
+            print(f"    Fine DINO : {list(ms.fine_dino.shape)}  (DINO Patch Tokens)")
+            print(f"    Mid       : {list(ms.mid.shape)}  (SD s4)")
+            print(f"    Coarse    : {list(ms.coarse.shape)}  (SD s5)")
+            print(f"    CLS       : {list(ms.cls_token.shape)}  (DINO CLS Token)")
             print()
 
     print(f"\n✓ 完成! 共提取 {len(image_paths)} 帧多尺度特征")
-    print(f"  Fine   → {dirs['fine']}")
-    print(f"  Mid    → {dirs['mid']}")
-    print(f"  Coarse → {dirs['coarse']}")
-    print(f"  CLS    → {dirs['cls']}")
+    print(f"  Fine SD   → {dirs['fine_sd']}")
+    print(f"  Fine DINO → {dirs['fine_dino']}")
+    print(f"  Mid       → {dirs['mid']}")
+    print(f"  Coarse    → {dirs['coarse']}")
+    print(f"  CLS       → {dirs['cls']}")
     if args.visualize:
         print(f"  可视化 → {dirs['vis']}  ({vis_count} 张)")
 

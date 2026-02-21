@@ -26,15 +26,21 @@ os.environ.setdefault("TORCH_HOME", "/home/yons/.cache/torch")
 
 @dataclass
 class MultiScaleFeatures:
-    """多尺度特征输出容器"""
-    fine: torch.Tensor       # [1408, fH, fW]  SD s3 + DINO patch
-    mid: torch.Tensor        # [1280, mH, mW]  SD s4
-    coarse: torch.Tensor     # [1280, cH, cW]  SD s5
-    cls_token: torch.Tensor  # [768]           DINO CLS token
+    """多尺度特征输出容器
+
+    Fine 层由 SD s3 和 DINO Patch 两个独立特征组成，
+    不进行拼接（两者分布差异大，拼接后 PCA/AE 效果差）。
+    后续由各自的 AutoEncoder 独立降维后再拼接嵌入 3DGS。
+    """
+    fine_sd: torch.Tensor     # [640 , fH, fW]  SD s3 (上采样到 DINO 网格)
+    fine_dino: torch.Tensor   # [768 , fH, fW]  DINO patch tokens
+    mid: torch.Tensor         # [1280, mH, mW]  SD s4
+    coarse: torch.Tensor      # [1280, cH, cW]  SD s5
+    cls_token: torch.Tensor   # [768]           DINO CLS token
     # 元数据
-    fine_hw: tuple = None    # (fH, fW) - DINO patch grid, 即定位坐标系的基准
-    mid_hw: tuple = None     # (mH, mW)
-    coarse_hw: tuple = None  # (cH, cW)
+    fine_hw: tuple = None     # (fH, fW) - DINO patch grid, 即定位坐标系的基准
+    mid_hw: tuple = None      # (mH, mW)
+    coarse_hw: tuple = None   # (cH, cW)
 
 
 class MultiScaleFeatureExtractor:
@@ -172,7 +178,7 @@ class MultiScaleFeatureExtractor:
         #  构建三层特征金字塔
         # ═══════════════════════════════════════════════════
 
-        # --- Fine (SD s3 + DINO Patch) ---
+        # --- Fine: SD s3 和 DINO Patch 独立保存 ---
         # 将 SD s3 上采样到 DINO 网格 (tokens_h × tokens_w)
         sd_s3_aligned = F.interpolate(
             feats_sd['s3'],
@@ -180,9 +186,9 @@ class MultiScaleFeatureExtractor:
             mode='bilinear',
             align_corners=False
         )
-        # 通道拼接: [1, 640, H, W] + [1, 768, H, W] → [1, 1408, H, W]
-        fine_feat = torch.cat([sd_s3_aligned, feats_dino_patch], dim=1)
-        fine_feat = fine_feat.squeeze(0).cpu()  # [1408, tokens_h, tokens_w]
+        # 不拼接! 两种特征分布差异大, 各自独立保存, 后续独立压缩
+        fine_sd_feat = sd_s3_aligned.squeeze(0).cpu()      # [640, tokens_h, tokens_w]
+        fine_dino_feat = feats_dino_patch.squeeze(0).cpu()  # [768, tokens_h, tokens_w]
 
         # --- Mid (SD s4 原生分辨率) ---
         mid_feat = feats_sd['s4'].squeeze(0).cpu()  # [1280, mH, mW]
@@ -194,7 +200,8 @@ class MultiScaleFeatureExtractor:
         cls_token = F.normalize(cls_token.float(), p=2, dim=-1).cpu()
 
         return MultiScaleFeatures(
-            fine=fine_feat,
+            fine_sd=fine_sd_feat,
+            fine_dino=fine_dino_feat,
             mid=mid_feat,
             coarse=coarse_feat,
             cls_token=cls_token,

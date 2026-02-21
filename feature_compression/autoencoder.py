@@ -36,7 +36,29 @@ FEATURE_CONFIGS = {
         'input_dim': 1280,
         'encoder_hidden_dims': [1024, 512, 256, 128, 32],  # 1280 -> 32维
         'decoder_hidden_dims': [128, 256, 512, 1024, 1280],
-    }
+    },
+    # ── v2 多尺度特征金字塔配置 ──
+    # Fine 层: SD s3 和 DINO Patch 各自独立压缩, 压缩后拼接嵌入 3DGS
+    'v2_fine_sd': {
+        'input_dim': 640,
+        'encoder_hidden_dims': [384, 256, 64],   # 640 -> 64维
+        'decoder_hidden_dims': [256, 384, 640],
+    },
+    'v2_fine_dino': {
+        'input_dim': 768,
+        'encoder_hidden_dims': [384, 256, 64],   # 768 -> 64维
+        'decoder_hidden_dims': [256, 384, 768],
+    },
+    'v2_mid': {
+        'input_dim': 1280,
+        'encoder_hidden_dims': [512, 256, 64],   # 1280 -> 64维
+        'decoder_hidden_dims': [256, 512, 1280],
+    },
+    'v2_coarse': {
+        'input_dim': 1280,
+        'encoder_hidden_dims': [512, 256, 32],   # 1280 -> 32维
+        'decoder_hidden_dims': [256, 512, 1280],
+    },
 }
 
 
