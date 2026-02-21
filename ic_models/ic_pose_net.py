@@ -39,7 +39,8 @@ class ICPoseNet(nn.Module):
                  num_queries=128,
                  fusion_layers=6,
                  num_heads=8,
-                 dropout=0.1):
+                 dropout=0.1,
+                 attention_temperature=None):  # None means sqrt(feature_dim)
         """
         Args:
             feature_dim: 特征维度（应与SplatLoc的decoder输出维度一致）
@@ -52,6 +53,9 @@ class ICPoseNet(nn.Module):
         
         self.feature_dim = feature_dim
         self.num_queries = num_queries
+        # Attention temperature for heatmap computation
+        # Lower temperature = sharper distribution
+        self.attention_temperature = attention_temperature if attention_temperature is not None else (feature_dim ** 0.5)
         
         # 可学习的query embeddings
         self.query_embed = nn.Parameter(torch.randn(1, num_queries, feature_dim))
@@ -129,16 +133,16 @@ class ICPoseNet(nn.Module):
         img_keypoint_heatmap = torch.matmul(
             query_img_feats,  # (B, N_query, C) - img-specific query
             img_tokens.transpose(1, 2)  # (B, C, N_img) - 处理后的tokens
-        ) / (self.feature_dim ** 0.5)  # Temperature scaling
+        ) / self.attention_temperature  # Temperature scaling (lower = sharper)
         
         # Softmax归一化 → 概率分布
         img_keypoint_heatmap = F.softmax(img_keypoint_heatmap, dim=-1)  # (B, N_query, N_img)
         
-        # 🆕 计算3D Keypoint Heatmap
+        # 🆕 计算3D Keypoint Heatmap（统一使用相同temperature - 对齐ICL-I2PReg）
         pcd_keypoint_heatmap = torch.matmul(
             query_pcd_feats,  # (B, N_query, C) - pcd-specific query
             pcd_tokens.transpose(1, 2)  # (B, C, N_pcd)
-        ) / (self.feature_dim ** 0.5)
+        ) / self.attention_temperature  # 与img heatmap使用相同的temperature
         pcd_keypoint_heatmap = F.softmax(pcd_keypoint_heatmap, dim=-1)  # (B, N_query, N_pcd)
         
         # 🆕 提取Keypoint坐标（soft-argmax）

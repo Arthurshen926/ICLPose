@@ -1,2 +1,8 @@
 output/
 
+dataset/
+reference/
+
+*.pyc
+__pycache__/
+.venv/

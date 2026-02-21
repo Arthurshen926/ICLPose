@@ -1,0 +1,136 @@
+# exp028 GPU优化训练
+# 目的：充分利用24GB GPU显存，增大模型容量和数据覆盖
+# 创建时间: 2026-02-17
+#
+# 改进内容:
+#   - num_pairs: 1024→4096 (4x更多2D-3D对应点)
+#   - num_queries: 64→128 (2x更夜keypoint候选)
+#   - fusion_layers: 2→4 (2x更深融合)
+#   - attention_temperature: 4.0 (适度尖锐)
+#   - epochs: 100→200 (充分收敛)
+#   - in_proj: 保持Linear (实验证实优于MLP)
+
+# 随机种子
+seed: 42
+
+# 输出目录
+output_dir: "/home/yons/Projects/ICLPose/output/exp028_gpu_optimized"
+
+# SplatLoc预训练模型配置
+splatloc:
+  gaussians_path: "/home/yons/Projects/ICLPose/dataset/room_0/splatloc-test/data/room_0/point_cloud/final/point_cloud.ply"
+  decoder_path: "/home/yons/Projects/ICLPose/dataset/room_0/splatloc-test/data/room_0/train_feat/ckpt.pth"
+  config_path: "/home/yons/Projects/SplatLoc/configs/replica_nerf/base_config.yaml"
+  freeze_decoder: true
+
+# 场景配置
+scene:
+  bound: [[-1.0, 7.0], [-1.3, 3.7], [-1.7, 1.4]]
+  voxel_sdf: 0.06
+
+# 特征解码器配置
+decoder:
+  enc: 'HashGrid'
+  num_layers: 4
+  hidden_dim: 128
+  final_dim: 256
+
+# ICPoseNet模型配置
+model:
+  feature_dim: 256
+  num_queries: 128           # 64→128: 更夜keypoint候选
+  fusion_layers: 4           # 2→4: 更深的跨模态融合
+  num_heads: 8
+  dropout: 0.1
+  attention_temperature: 4.0 # 适度降低(默认16.0太平)
+
+# ========================================
+# 数据集配置 - 支持多序列训练
+# ========================================
+dataset:
+  data_root: "/home/yons/Projects/ICLPose/dataset/room_0"
+  
+  # 🆕 支持多个训练序列
+  train_scenes:
+    - name: "Sequence_1"
+      weight: 1.0        # 原始数据权重
+    - name: "Synthetic_Multi/traj_1"
+      weight: 1.0
+    - name: "Synthetic_Multi/traj_2"
+      weight: 1.0
+    - name: "Synthetic_Multi/traj_3"
+      weight: 1.0
+    - name: "Synthetic_Multi/traj_4"
+      weight: 1.0
+    - name: "Synthetic_Multi/traj_5"
+      weight: 1.0
+  
+  # 验证集保持不变
+  val_scene: "Sequence_2"
+  
+  train_step: 1
+  val_step: 1
+  image_size: [640, 480]
+  max_train_samples: null
+  max_val_samples: null
+  gaussian_path: "/home/yons/Projects/ICLPose/dataset/room_0/splatloc-test/data/room_0/point_cloud/final/point_cloud.ply"
+  use_depth: false
+  
+  # 位姿噪声 (合成数据可能更准确,减少噪声)
+  pose_noise_rot_deg: 2.0
+  pose_noise_trans_m: 0.10
+  
+  fx: 320.0
+  fy: 320.0
+  cx: 319.5
+  cy: 239.5
+  num_pairs: 4096            # 1024→4096: 4x更多空间覆盖
+
+# ========================================
+# 损失函数配置
+# ========================================
+loss:
+  use_relative_pose: false
+  normalize_translation: false
+  use_kendall: false
+  
+  rotation_loss: 'geodesic'
+  translation_loss: 'l2'
+  rotation_weight: 1.0
+  translation_weight: 1.0
+  
+  # Diversity + Reprojection Loss
+  diversity_weight: 0.05
+  diversity_margin_2d: 16.0
+  diversity_margin_3d: 0.16
+  reprojection_weight: 0.1
+
+# ========================================
+# 训练配置
+# ========================================
+training:
+  num_epochs: 200            # 100→200: 充分收敛
+  batch_size: 32
+  val_batch_size: 32
+  num_workers: 8
+  optimizer: 'adamw'
+  learning_rate: 5.0e-5          # 1e-4→5e-5: 更深模型需要更小LR
+  decoder_lr: 5.0e-6
+  weight_decay: 1.0e-4
+  grad_clip: 1.0                 # 5.0→1.0: 防止4层融合梯度爆炸
+  scheduler: 'cosine'
+  min_lr: 1.0e-6
+  val_interval: 2
+  save_interval: 10
+  log_interval: 10
+
+# 可视化配置
+visualization:
+  enable: true
+  vis_interval: 5
+  num_samples: 3
+  vis_types:
+    pose_prediction: true
+    feature_similarity: false
+    correspondence: false
+    query_evolution: false

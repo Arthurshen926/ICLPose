@@ -62,7 +62,7 @@ class CrossModalFusionModule(nn.Module):
         self.num_layers = num_layers
         self.num_blocks = num_layers // 2  # 每2层构成1个block
         
-        # Token投影层
+        # Token投影层（单层Linear - exp025证实优于MLP+LN）
         self.img_in_proj = nn.Linear(feature_dim, feature_dim)
         self.pcd_in_proj = nn.Linear(feature_dim, feature_dim)
         
@@ -88,7 +88,7 @@ class CrossModalFusionModule(nn.Module):
             for _ in range(num_layers)
         ])
         
-        # Output投影层
+        # Output投影层（单层Linear - exp025证实优于MLP+LN）
         self.query_out_proj = nn.Linear(feature_dim, feature_dim)
         
     def forward(

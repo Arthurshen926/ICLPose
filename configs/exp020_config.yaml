@@ -1,0 +1,188 @@
+# ==============================================
+# EXP020: ICPoseNet V2 with C2F and Overlap Detection
+# ==============================================
+# 
+# 关键改进:
+# 1. C2F (Coarse-to-Fine): 12层Transformer，每2层输出一次，共6个阶段
+# 2. 重叠检测: 预测点云-图像重叠区域，对初始位姿误差鲁棒
+# 3. NeRF位置编码: 3D使用NeRF风格多频编码
+# 4. 内参归一化2D编码: 使用相机内参归一化像素坐标
+# 5. 旋转损失Warmup: 前50 epoch用L1+Cosine，后续过渡到测地线
+# 6. Dyntanh: 动态tanh软裁剪，防止异常值
+#
+# 目标: SLAM级别精度 (<1° 旋转, <0.1m 平移)
+
+seed: 42
+
+output_dir: "/home/yons/Projects/ICLPose/output/exp020"
+
+# SplatLoc预训练模型配置
+splatloc:
+  gaussians_path: "/home/yons/Projects/ICLPose/dataset/room_0/splatloc-test/data/room_0/point_cloud/final/point_cloud.ply"
+  decoder_path: "/home/yons/Projects/ICLPose/dataset/room_0/splatloc-test/data/room_0/train_feat/ckpt.pth"
+  config_path: "/home/yons/Projects/SplatLoc/configs/replica_nerf/base_config.yaml"
+  freeze_decoder: true
+
+# 场景配置
+scene:
+  bound: [[-1.0, 7.0], [-1.3, 3.7], [-1.7, 1.4]]
+  voxel_sdf: 0.06
+
+# 特征解码器配置
+decoder:
+  enc: 'HashGrid'
+  num_layers: 4
+  hidden_dim: 128
+  final_dim: 256
+
+# ============================================
+# 🆕 ICPoseNet V2 模型配置
+# ============================================
+model:
+  # 模型版本: v1 (原版) 或 v2 (C2F + 重叠检测)
+  version: 'v2'
+  
+  # 特征维度
+  feature_dim: 256
+  
+  # 可学习query数量
+  num_queries: 128
+  
+  # Transformer层数 (v2: 推荐12层，对齐MaRepo)
+  num_layers: 12
+  
+  # 注意力头数
+  num_heads: 8
+  
+  # Dropout概率
+  dropout: 0.1
+  
+  # C2F输出间隔 (每几层输出一次位姿)
+  # 12层，间隔2 → 6个阶段
+  output_interval: 2
+  
+  # 是否使用重叠检测
+  # true: 预测点云-图像重叠区域，对初始位姿误差鲁棒
+  # false: 直接使用所有点云特征
+  use_overlap_detection: true
+  
+  # 是否使用C2F多阶段输出
+  # true: 每个阶段都输出位姿，计算辅助损失
+  # false: 只使用最终阶段输出
+  use_c2f: true
+  
+  # NeRF位置编码频率数
+  nerf_frequencies: 10
+
+# 数据集配置
+dataset:
+  data_root: "/home/yons/Projects/ICLPose/dataset/room_0"
+  train_scene: "Sequence_1"
+  val_scene: "Sequence_2"
+  train_step: 1
+  val_step: 1
+  image_size: [640, 480]
+  max_train_samples: null
+  max_val_samples: null
+  gaussian_path: "/home/yons/Projects/ICLPose/dataset/room_0/splatloc-test/data/room_0/point_cloud/final/point_cloud.ply"
+  use_depth: false
+  
+  # 初始位姿噪声（模拟粗定位误差）
+  # 使用中等噪声，让重叠检测模块学习判断哪些点可见
+  pose_noise_rot_deg: 5.0
+  pose_noise_trans_m: 0.3
+  
+  # 相机内参
+  fx: 320.0
+  fy: 320.0
+  cx: 319.5
+  cy: 239.5
+
+# ============================================
+# 🆕 C2F损失函数配置
+# ============================================
+loss:
+  # 损失函数版本: standard (原版) 或 c2f (多阶段辅助损失)
+  version: 'c2f'
+  
+  # 是否使用相对位姿
+  use_relative_pose: true
+  
+  # 是否归一化平移
+  normalize_translation: false
+  
+  # === C2F阶段损失权重 ===
+  # 浅层权重较低（0.2），深层权重逐渐增加到1.0
+  # 6个阶段的权重: [0.2, 0.3, 0.5, 0.7, 0.9, 1.0]
+  stage_weights: [0.2, 0.3, 0.5, 0.7, 0.9, 1.0]
+  
+  # === 旋转损失配置 ===
+  # 旋转损失类型: geodesic, l1, cosine
+  rotation_loss: 'geodesic'
+  
+  # 旋转损失Warmup
+  # 前rotation_warmup_epochs使用L1+Cosine，然后过渡到geodesic
+  use_rotation_warmup: true
+  rotation_warmup_epochs: 50
+  
+  # === Dyntanh配置 ===
+  # 动态tanh软裁剪，防止异常损失值
+  use_dyntanh: true
+  dyntanh_start: 100.0    # 初始clamp值
+  dyntanh_end: 10.0       # 最终clamp值
+  
+  # === 重叠检测损失 ===
+  # 仅当 model.use_overlap_detection=true 时生效
+  overlap_loss_weight: 0.5
+  
+  # === 其他损失 ===
+  # Diversity Loss
+  diversity_weight: 0.05
+  diversity_margin_2d: 16.0
+  diversity_margin_3d: 0.16
+  
+  # Reprojection Loss
+  reprojection_weight: 0.1
+  
+  # === Kendall自动权重 ===
+  # C2F模式下仍可使用Kendall loss
+  use_kendall: true
+  init_log_var_rotation: 0.0
+  init_log_var_translation: -1.0
+
+# 训练配置
+training:
+  num_epochs: 500
+  batch_size: 16          # 12层Transformer占用更多显存，减小batch size
+  val_batch_size: 16
+  num_workers: 8
+  
+  optimizer: 'adamw'
+  learning_rate: 1.0e-4
+  decoder_lr: 1.0e-5
+  weight_decay: 1.0e-4
+  grad_clip: 5.0
+  
+  scheduler: 'cosine'
+  min_lr: 1.0e-6
+  
+  val_interval: 2
+  save_interval: 10
+  log_interval: 10
+  
+  # 混合精度训练（推荐用于12层Transformer）
+  use_amp: true
+
+# 可视化配置
+visualization:
+  enable: true
+  vis_interval: 5
+  num_samples: 3
+  vis_types:
+    pose_prediction: true
+    feature_similarity: true
+    correspondence: true
+    query_evolution: false
+    # 🆕 新增可视化
+    overlap_mask: true        # 重叠检测结果
+    c2f_stages: true          # C2F各阶段位姿

@@ -43,6 +43,11 @@ class CorrespondenceDataset(Dataset):
         use_initial_pose: bool = False,
         pose_noise_rot_deg: float = 5.0,
         pose_noise_trans_m: float = 0.1,
+        # 🆕 视锥裁切和负样本配置
+        use_init_pose_for_culling: bool = True,  # 是否使用初始位姿进行视锥裁切
+        frustum_margin: float = 0.0,              # 视锥边界扩展（像素）
+        negative_ratio: float = 0.0,              # 负样本比例 (0-1)
+        num_pairs: int = 1024,                    # 每张图像的2D-3D对应点数量
     ):
         """
         初始化数据集
@@ -57,6 +62,9 @@ class CorrespondenceDataset(Dataset):
             gaussian_path: Gaussian点云路径（用于特征提取）
             fx, fy, cx, cy: 相机内参
             sample_step: 采样间隔（1=使用全部帧，5=每5帧取1帧）
+            use_init_pose_for_culling: 是否使用初始位姿进行视锥裁切（更符合实际场景）
+            frustum_margin: 视锥边界扩展像素（正值扩大可见范围）
+            negative_ratio: 负样本比例，从视锥外采样的点
         """
         super().__init__()
         
@@ -73,6 +81,12 @@ class CorrespondenceDataset(Dataset):
         self.pose_noise_rot_deg = pose_noise_rot_deg
         self.pose_noise_trans_m = pose_noise_trans_m
         
+        # 🆕 视锥裁切配置
+        self.use_init_pose_for_culling = use_init_pose_for_culling
+        self.frustum_margin = frustum_margin
+        self.negative_ratio = negative_ratio
+        self.num_pairs = num_pairs
+        
         # 相机内参
         self.K = np.array([
             [fx, 0, cx],
@@ -80,17 +94,31 @@ class CorrespondenceDataset(Dataset):
             [0, 0, 1]
         ], dtype=np.float32)
         
-        # 加载RGB图像路径
+        # 加载RGB图像路径 - 支持多种命名格式
         self.rgb_dir = os.path.join(self.scene_path, "rgb")
+        
+        # 尝试不同的文件命名格式
         rgb_files = sorted(glob.glob(os.path.join(self.rgb_dir, "rgb_*.png")))
+        self.rgb_naming = "rgb"  # 默认命名格式
+        
+        if len(rgb_files) == 0:
+            # 尝试 frame_*.png 格式 (合成数据)
+            rgb_files = sorted(glob.glob(os.path.join(self.rgb_dir, "frame_*.png")))
+            self.rgb_naming = "frame"
+        
+        if len(rgb_files) == 0:
+            # 尝试通用 *.png 格式
+            rgb_files = sorted(glob.glob(os.path.join(self.rgb_dir, "*.png")))
+            self.rgb_naming = "generic"
         
         if len(rgb_files) == 0:
             raise ValueError(f"未找到RGB图像: {self.rgb_dir}")
         
         # 采样策略（参考SplatLoc）
         if sample_step > 1:
+            original_count = len(rgb_files)
             rgb_files = rgb_files[::sample_step]
-            print(f"  [数据集] {scene_name}: 原始{len(glob.glob(os.path.join(self.rgb_dir, 'rgb_*.png')))}帧 → 采样(step={sample_step}) → {len(rgb_files)}帧")
+            print(f"  [数据集] {scene_name}: 原始{original_count}帧 → 采样(step={sample_step}) → {len(rgb_files)}帧")
         
         self.rgb_files = rgb_files
         
@@ -98,8 +126,16 @@ class CorrespondenceDataset(Dataset):
         self.image_indices = []
         for rgb_file in self.rgb_files:
             basename = os.path.basename(rgb_file)
-            # 从 rgb_X.png 中提取 X
-            idx = int(basename.replace("rgb_", "").replace(".png", ""))
+            # 支持不同的命名格式
+            if self.rgb_naming == "rgb":
+                idx = int(basename.replace("rgb_", "").replace(".png", ""))
+            elif self.rgb_naming == "frame":
+                idx = int(basename.replace("frame_", "").replace(".png", ""))
+            else:
+                # 通用格式：尝试从文件名提取数字
+                import re
+                match = re.search(r'(\d+)', basename)
+                idx = int(match.group(1)) if match else len(self.image_indices)
             self.image_indices.append(idx)
         
         # 限制样本数量（在采样之后）
@@ -115,14 +151,24 @@ class CorrespondenceDataset(Dataset):
                 print(f"警告: 深度图目录不存在: {self.depth_dir}")
                 self.use_depth = False
         
-        # 融合特征目录（已压缩到256维）
-        # 如果目录不存在，将在训练时使用feat_decoder动态提取特征
-        self.fused_feat_dir = os.path.join(self.scene_path, 'features_compressed/fused')
-        self.use_fused_features = os.path.exists(self.fused_feat_dir)
+        # 融合特征目录 - 尝试多种可能的路径
+        possible_feat_dirs = [
+            os.path.join(self.scene_path, 'features_compressed/fused'),  # 原始格式
+            os.path.join(self.scene_path, 'fused_feat'),                  # 合成数据格式
+            os.path.join(self.scene_path, 'features_compressed'),         # 备选格式
+        ]
+        
+        self.fused_feat_dir = None
+        self.use_fused_features = False
+        for feat_dir in possible_feat_dirs:
+            if os.path.exists(feat_dir):
+                self.fused_feat_dir = feat_dir
+                self.use_fused_features = True
+                break
+        
         if not self.use_fused_features:
-            print(f"警告: 融合特征目录不存在: {self.fused_feat_dir}")
+            print(f"警告: 未找到融合特征目录，尝试的路径: {possible_feat_dirs}")
             print("将在训练时动态提取特征")
-            self.fused_feat_dir = None
         
         # 加载Gaussian点云（用于视锥裁剪）
         if gaussian_path is None:
@@ -176,34 +222,61 @@ class CorrespondenceDataset(Dataset):
     
     def _load_poses(self) -> np.ndarray:
         """
-        加载相机位姿文件 traj_w_c.txt
+        加载相机位姿文件
         
-        格式：每行16个数字,表示4x4变换矩阵（行优先）
+        支持两种格式:
+        1. traj_w_c.txt: 每行16个数字, 表示4x4变换矩阵（行优先）
+        2. traj_tum.txt: TUM格式, timestamp tx ty tz qx qy qz qw
         
         返回:
-            poses: [N, 4, 4] numpy数组，包含所有位姿
+            poses: [N, 4, 4] numpy数组，包含所有位姿 (c2w格式)
         """
-        pose_file = os.path.join(self.scene_path, "traj_w_c.txt")
+        from scipy.spatial.transform import Rotation as R
         
-        if not os.path.exists(pose_file):
-            raise ValueError(f"位姿文件不存在: {pose_file}")
+        # 尝试不同的位姿文件格式
+        pose_file_16 = os.path.join(self.scene_path, "traj_w_c.txt")
+        pose_file_tum = os.path.join(self.scene_path, "traj_tum.txt")
         
         poses = []
-        with open(pose_file, 'r') as f:
-            for line in f:
-                # 每行16个数字
-                values = list(map(float, line.strip().split()))
-                if len(values) != 16:
-                    continue
-                
-                # 重塑为4x4矩阵
-                pose = np.array(values).reshape(4, 4)
-                poses.append(pose)
         
-        poses = np.array(poses, dtype=np.float32)
-        print(f"[CorrespondenceDataset] 从文件加载了 {len(poses)} 个相机位姿")
+        if os.path.exists(pose_file_16):
+            # 格式1: 每行16个数字
+            with open(pose_file_16, 'r') as f:
+                for line in f:
+                    values = list(map(float, line.strip().split()))
+                    if len(values) != 16:
+                        continue
+                    pose = np.array(values).reshape(4, 4)
+                    poses.append(pose)
+            print(f"[CorrespondenceDataset] 从 traj_w_c.txt 加载了 {len(poses)} 个相机位姿")
+            
+        elif os.path.exists(pose_file_tum):
+            # 格式2: TUM格式 (timestamp tx ty tz qx qy qz qw)
+            with open(pose_file_tum, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    parts = line.split()
+                    if len(parts) != 8:
+                        continue
+                    
+                    # 解析位置和四元数
+                    tx, ty, tz = float(parts[1]), float(parts[2]), float(parts[3])
+                    qx, qy, qz, qw = float(parts[4]), float(parts[5]), float(parts[6]), float(parts[7])
+                    
+                    # 四元数转旋转矩阵
+                    rot = R.from_quat([qx, qy, qz, qw])
+                    pose = np.eye(4)
+                    pose[:3, :3] = rot.as_matrix()
+                    pose[:3, 3] = [tx, ty, tz]
+                    poses.append(pose)
+            print(f"[CorrespondenceDataset] 从 traj_tum.txt 加载了 {len(poses)} 个相机位姿")
+            
+        else:
+            raise ValueError(f"未找到位姿文件: {pose_file_16} 或 {pose_file_tum}")
         
-        return poses
+        return np.array(poses, dtype=np.float32)
     
     def _get_transforms(self):
         """定义图像变换"""
@@ -326,11 +399,15 @@ class CorrespondenceDataset(Dataset):
         """
         加载预提取的融合特征图
         
+        支持多种格式:
+        1. rgb_X_fused_768x35x46_compressed.pt (原始格式)
+        2. fused_feat_XXXX.npy (合成数据格式)
+        
         参数:
             idx: 图像索引
             
         返回:
-            fused_feat: [256, 35, 46] tensor (保持原始尺寸，不上采样) 或 None
+            fused_feat: [256, H, W] tensor 或 None
         """
         # 如果禁用fused_features，直接返回None
         if not self.use_fused_features:
@@ -340,57 +417,74 @@ class CorrespondenceDataset(Dataset):
             return None
         
         # 从rgb文件名推断融合特征文件名
-        # rgb_0.png -> rgb_0_fused_768x35x46_compressed.pt（注：实际已是256维，768是历史命名）
         rgb_basename = os.path.basename(self.rgb_files[idx])
         img_name = rgb_basename.replace('.png', '').replace('.jpg', '')
+        img_idx = self.image_indices[idx]
         
-        # 标准格式：带_compressed后缀
-        fused_feat_path = os.path.join(
-            self.fused_feat_dir,
-            f'{img_name}_fused_768x35x46_compressed.pt'
-        )
-            
-        if os.path.exists(fused_feat_path):
+        # 尝试多种可能的文件路径
+        possible_paths = [
+            # 格式1: 原始 .pt 格式
+            os.path.join(self.fused_feat_dir, f'{img_name}_fused_768x35x46_compressed.pt'),
+            # 格式2: 合成数据 .npy 格式 (fused_feat_0000.npy)
+            os.path.join(self.fused_feat_dir, f'fused_feat_{img_idx:04d}.npy'),
+            # 格式3: 简化命名
+            os.path.join(self.fused_feat_dir, f'{img_name}.npy'),
+            os.path.join(self.fused_feat_dir, f'{img_name}.pt'),
+        ]
+        
+        for feat_path in possible_paths:
+            if not os.path.exists(feat_path):
+                continue
+                
             try:
-                # 加载融合特征（已压缩到256维）
-                fused_data = torch.load(fused_feat_path, map_location='cpu', weights_only=True)
-                
-                # 支持两种数据格式
-                if isinstance(fused_data, dict) and 'compressed' in fused_data:
-                    # 格式1: {'compressed': tensor}
-                    compressed_feat = fused_data['compressed']  # [35, 46, 256]
+                if feat_path.endswith('.npy'):
+                    # 加载 .npy 格式
+                    feat_data = np.load(feat_path)
+                    compressed_feat = torch.from_numpy(feat_data)
                 else:
-                    # 格式2: 直接是tensor
-                    compressed_feat = fused_data  # 可能是 [1, 256, 35, 46] 或 [35, 46, 256]
+                    # 加载 .pt 格式
+                    fused_data = torch.load(feat_path, map_location='cpu', weights_only=True)
+                    
+                    # 支持两种数据格式
+                    if isinstance(fused_data, dict) and 'compressed' in fused_data:
+                        compressed_feat = fused_data['compressed']
+                    else:
+                        compressed_feat = fused_data
                 
-                # 处理不同的张量格式
+                # 处理不同的张量维度
                 if compressed_feat.ndim == 4:
-                    # [1, 256, 35, 46] -> [256, 35, 46]
+                    # [1, C, H, W] -> [C, H, W]
                     compressed_feat = compressed_feat.squeeze(0)
                 
-                # 现在应该是 [C, H, W] 或 [H, W, C]
-                if compressed_feat.shape[0] == 256:
-                    # 已经是 [C, H, W] 格式
-                    feat_chw = compressed_feat
-                elif compressed_feat.shape[-1] == 256:
-                    # [H, W, C] -> [C, H, W]
-                    feat_chw = compressed_feat.permute(2, 0, 1)
+                # 确保是 [C, H, W] 格式
+                if compressed_feat.ndim == 3:
+                    if compressed_feat.shape[0] == 256:
+                        feat_chw = compressed_feat  # 已经是 [C, H, W]
+                    elif compressed_feat.shape[-1] == 256:
+                        feat_chw = compressed_feat.permute(2, 0, 1)  # [H, W, C] -> [C, H, W]
+                    else:
+                        print(f"警告: 未知的特征形状 {compressed_feat.shape}")
+                        continue
                 else:
-                    print(f"警告: 未知的特征形状 {compressed_feat.shape}，期望256维")
-                    return None
+                    print(f"警告: 特征维度不正确 {compressed_feat.shape}")
+                    continue
                 
-                return feat_chw  # [256, 35, 46]
+                return feat_chw.float()
+                
             except Exception as e:
-                print(f"加载融合特征时出错 {fused_feat_path}: {e}")
-                return None
+                print(f"加载融合特征时出错 {feat_path}: {e}")
+                continue
         
-        # 没找到文件
+        # 没找到任何匹配的文件
         return None
     
     def _generate_2d_3d_pairs(
         self, 
         idx: int, 
-        num_samples: int = 1024
+        num_samples: int = 1024,
+        pose_for_culling: np.ndarray = None,
+        frustum_margin: float = 0.0,
+        negative_ratio: float = 0.0
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         使用视锥裁剪生成2D-3D对应关系对
@@ -398,21 +492,27 @@ class CorrespondenceDataset(Dataset):
         
         流程:
         1. 从Gaussian点云获取所有3D点
-        2. 将3D点投影到当前视角的图像平面
+        2. 将3D点投影到指定视角的图像平面
         3. 过滤：保留深度>0且在图像范围内的点
         4. 随机采样num_samples个点
         
         参数:
             idx: 图像索引
             num_samples: 采样点数量
+            pose_for_culling: 用于视锥裁切的位姿 (默认使用GT)
+            frustum_margin: 视锥边界扩展 (像素), 正值扩大边界
+            negative_ratio: 负样本比例 (0-1), 从视野外采样的点的比例
             
         返回:
             points_2d: [N, 2] 2D图像坐标 (u, v)
             points_3d: [N, 3] 3D世界坐标
-            valid_mask: [N] 有效点掩码（全为True）
+            valid_mask: [N] 有效点掩码（True=正样本，False=负样本）
         """
         # 获取相机位姿（c2w -> w2c）
-        c2w = self.poses[idx]  # [4, 4]
+        if pose_for_culling is None:
+            c2w = self.poses[idx]  # 使用GT位姿
+        else:
+            c2w = pose_for_culling  # 使用指定位姿（如初始位姿）
         w2c = np.linalg.inv(c2w)  # 世界到相机
         
         h, w = self.image_size[1], self.image_size[0]
@@ -427,32 +527,69 @@ class CorrespondenceDataset(Dataset):
         projected_points = (self.K @ points_camera.T).T  # [N_total, 3]
         projected_points = projected_points[:, :2] / (projected_points[:, 2:3] + 1e-8)  # [N_total, 2] (u, v)
         
-        # 4. 视锥裁剪：过滤在视野内的点
-        mask = (points_camera[:, 2] > 0.05) & \
-               (projected_points[:, 0] >= 0) & (projected_points[:, 0] < w) & \
-               (projected_points[:, 1] >= 0) & (projected_points[:, 1] < h)
+        # 4. 视锥裁剪：过滤在视野内的点（考虑margin）
+        margin = frustum_margin
+        in_frustum_mask = (points_camera[:, 2] > 0.05) & \
+                          (projected_points[:, 0] >= -margin) & (projected_points[:, 0] < w + margin) & \
+                          (projected_points[:, 1] >= -margin) & (projected_points[:, 1] < h + margin)
         
-        # 5. 获取视野内的点
-        visible_pts_3d = all_pts[mask]  # [N_visible, 3] 世界坐标
-        visible_pts_2d = projected_points[mask]  # [N_visible, 2] (u, v)
+        # 5. 获取视野内的点（正样本）
+        visible_pts_3d = all_pts[in_frustum_mask]
+        visible_pts_2d = projected_points[in_frustum_mask]
         
         if len(visible_pts_3d) == 0:
             raise ValueError(f"样本 {idx}: 没有可见的Gaussian点")
         
-        # 6. 随机采样num_samples个点
+        # 6. 计算正负样本数量
+        n_positive = int(num_samples * (1 - negative_ratio))
+        n_negative = num_samples - n_positive
+        
+        # 7. 采样正样本（视野内的点）
         n_visible = len(visible_pts_3d)
-        if n_visible < num_samples:
-            # 如果可见点不足，重复采样
-            indices = np.random.choice(n_visible, num_samples, replace=True)
+        if n_visible < n_positive:
+            pos_indices = np.random.choice(n_visible, n_positive, replace=True)
         else:
-            # 随机采样
-            indices = np.random.choice(n_visible, num_samples, replace=False)
+            pos_indices = np.random.choice(n_visible, n_positive, replace=False)
         
-        points_2d = visible_pts_2d[indices]  # [num_samples, 2]
-        points_3d = visible_pts_3d[indices]  # [num_samples, 3]
+        pos_pts_2d = visible_pts_2d[pos_indices]
+        pos_pts_3d = visible_pts_3d[pos_indices]
+        pos_mask = np.ones(n_positive, dtype=bool)
         
-        # 所有采样点都是有效的
-        valid_mask = np.ones(num_samples, dtype=bool)
+        # 8. 采样负样本（视野外的点）
+        if n_negative > 0:
+            # 视野外的点
+            out_frustum_mask = ~in_frustum_mask & (points_camera[:, 2] > 0.05)  # 在相机前方但在视锥外
+            out_pts_3d = all_pts[out_frustum_mask]
+            out_pts_2d = projected_points[out_frustum_mask]
+            
+            n_out = len(out_pts_3d)
+            if n_out > 0:
+                if n_out < n_negative:
+                    neg_indices = np.random.choice(n_out, n_negative, replace=True)
+                else:
+                    neg_indices = np.random.choice(n_out, n_negative, replace=False)
+                neg_pts_2d = out_pts_2d[neg_indices]
+                neg_pts_3d = out_pts_3d[neg_indices]
+            else:
+                # 没有视野外的点，用视野内的点填充
+                neg_pts_2d = pos_pts_2d[:n_negative]
+                neg_pts_3d = pos_pts_3d[:n_negative]
+            neg_mask = np.zeros(n_negative, dtype=bool)
+            
+            # 合并正负样本
+            points_2d = np.concatenate([pos_pts_2d, neg_pts_2d], axis=0)
+            points_3d = np.concatenate([pos_pts_3d, neg_pts_3d], axis=0)
+            valid_mask = np.concatenate([pos_mask, neg_mask], axis=0)
+            
+            # 打乱顺序
+            shuffle_idx = np.random.permutation(num_samples)
+            points_2d = points_2d[shuffle_idx]
+            points_3d = points_3d[shuffle_idx]
+            valid_mask = valid_mask[shuffle_idx]
+        else:
+            points_2d = pos_pts_2d
+            points_3d = pos_pts_3d
+            valid_mask = pos_mask
         
         # 转换为tensor
         points_2d = torch.from_numpy(points_2d.astype(np.float32))
@@ -492,6 +629,7 @@ class CorrespondenceDataset(Dataset):
         pose = torch.from_numpy(pose_gt)
         
         # 生成初始位姿（如果启用相对位姿模式）
+        pose_init_np = None
         if self.use_initial_pose:
             # 训练集：添加随机噪声
             if self.augment:
@@ -506,9 +644,24 @@ class CorrespondenceDataset(Dataset):
             pose_initial = None
         
         # 生成2D-3D对应关系
-        # 注意：这里仍使用GT位姿裁剪点云（保持与训练一致）
-        # 如果需要使用初始位姿裁剪（更符合实际定位场景），可传入pose_init_np
-        points_2d, points_3d, valid_mask = self._generate_2d_3d_pairs(idx)
+        # 🆕 支持使用初始位姿裁切 + 视锥扩展 + 负样本
+        use_init_pose_for_culling = getattr(self, 'use_init_pose_for_culling', False)
+        frustum_margin = getattr(self, 'frustum_margin', 0.0)
+        negative_ratio = getattr(self, 'negative_ratio', 0.0)
+        
+        # 决定用于裁切的位姿
+        if use_init_pose_for_culling and pose_init_np is not None:
+            culling_pose = pose_init_np  # 使用初始位姿（带噪声）
+        else:
+            culling_pose = None  # 使用GT位姿
+        
+        points_2d, points_3d, valid_mask = self._generate_2d_3d_pairs(
+            idx,
+            num_samples=self.num_pairs,
+            pose_for_culling=culling_pose,
+            frustum_margin=frustum_margin,
+            negative_ratio=negative_ratio
+        )
         
         # 内参矩阵
         intrinsics = torch.from_numpy(self.K)

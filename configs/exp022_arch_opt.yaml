@@ -1,0 +1,119 @@
+# exp022 架构优化配置 - 启用Diversity + Reprojection Loss
+# 目的：对齐ICL-I2PReg的完整训练约束
+# 创建时间: 2026-02-03
+# 
+# 优化内容:
+#   1. ✅ 启用Diversity Loss (weight=0.05)
+#   2. ✅ 启用Reprojection Loss (weight=0.1)
+#   3. ✅ 降低Temperature (16→8)
+
+# 随机种子
+seed: 42
+
+# 输出目录
+output_dir: "/home/yons/Projects/ICLPose/output/exp022_arch_opt"
+
+# SplatLoc预训练模型配置
+splatloc:
+  gaussians_path: "/home/yons/Projects/ICLPose/dataset/room_0/splatloc-test/data/room_0/point_cloud/final/point_cloud.ply"
+  decoder_path: "/home/yons/Projects/ICLPose/dataset/room_0/splatloc-test/data/room_0/train_feat/ckpt.pth"
+  config_path: "/home/yons/Projects/SplatLoc/configs/replica_nerf/base_config.yaml"
+  freeze_decoder: true
+
+# 场景配置
+scene:
+  bound: [[-1.0, 7.0], [-1.3, 3.7], [-1.7, 1.4]]
+  voxel_sdf: 0.06
+
+# 特征解码器配置
+decoder:
+  enc: 'HashGrid'
+  num_layers: 4
+  hidden_dim: 128
+  final_dim: 256
+
+# ICPoseNet模型配置
+model:
+  feature_dim: 256
+  num_queries: 64
+  fusion_layers: 2
+  num_heads: 8
+  dropout: 0.1
+  # 🆕 降低temperature使分布更尖锐
+  attention_temperature: 8.0   # 默认sqrt(256)=16
+
+# 数据集配置
+dataset:
+  data_root: "/home/yons/Projects/ICLPose/dataset/room_0"
+  train_scene: "Sequence_1"
+  val_scene: "Sequence_2"
+  train_step: 1
+  val_step: 1
+  image_size: [640, 480]
+  max_train_samples: null
+  max_val_samples: null
+  gaussian_path: "/home/yons/Projects/ICLPose/dataset/room_0/splatloc-test/data/room_0/point_cloud/final/point_cloud.ply"
+  use_depth: false
+  pose_noise_rot_deg: 3.0
+  pose_noise_trans_m: 0.15
+  fx: 320.0
+  fy: 320.0
+  cx: 319.5
+  cy: 239.5
+
+# ========================================
+# 损失函数配置 - 架构优化版本
+# ========================================
+loss:
+  # 使用绝对位姿（同exp021）
+  use_relative_pose: false
+  normalize_translation: false
+  
+  # 使用固定权重
+  use_kendall: false
+  
+  # 保持geodesic loss
+  rotation_loss: 'geodesic'
+  translation_loss: 'l2'
+  rotation_weight: 1.0
+  translation_weight: 1.0
+  
+  # ========================================
+  # 🆕 启用Diversity Loss - 防止keypoints聚集
+  # ========================================
+  diversity_weight: 0.05          # ICL-I2PReg标准值
+  diversity_margin_2d: 16.0       # 2D最小距离16像素
+  diversity_margin_3d: 0.16       # 3D最小距离16cm
+  
+  # ========================================
+  # 🆕 启用Reprojection Loss - 2D-3D几何一致性
+  # ========================================
+  reprojection_weight: 0.1        # ICL-I2PReg标准值
+
+# 训练配置
+training:
+  num_epochs: 100
+  batch_size: 32
+  val_batch_size: 32
+  num_workers: 8
+  optimizer: 'adamw'
+  learning_rate: 1.0e-4
+  decoder_lr: 1.0e-5
+  weight_decay: 1.0e-4
+  grad_clip: 5.0
+  scheduler: 'cosine'
+  min_lr: 1.0e-6
+  val_interval: 2
+  save_interval: 10
+  log_interval: 10
+
+# 可视化配置
+visualization:
+  enable: true
+  vis_interval: 5              # 更频繁的可视化
+  num_samples: 3
+  vis_types:
+    pose_prediction: true
+    feature_similarity: false
+    correspondence: false
+    query_evolution: false

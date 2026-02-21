@@ -5,7 +5,7 @@
 seed: 42
 
 # 输出目录
-output_dir: "/home/yons/Projects/ICLPose/output/exp015"
+output_dir: "/home/yons/Projects/ICLPose/output/exp016"
 
 # SplatLoc预训练模型配置
 splatloc:
@@ -91,9 +91,9 @@ dataset:
   
   # 初始位姿噪声配置（仅当loss.use_relative_pose=true时生效）
   # 用于模拟实际定位场景中的初始位姿误差
-  # 建议：从小噪声开始训练，逐步增大（课程学习）
-  pose_noise_rot_deg: 5.0    # 旋转噪声标准差（度）- 降低以便网络先学习基础修正
-  pose_noise_trans_m: 0.5    # 平移噪声标准差（米）- 室内场景应该很小
+  # 🔧 exp016: 增大平移噪声，让模型学习更大范围的位姿修正
+  pose_noise_rot_deg: 5.0    # 旋转噪声标准差（度）
+  pose_noise_trans_m: 0.3    # 平移噪声标准差（米）- 从0.1增大到0.3，让模型学习修正更大的初始误差
   
   # 相机内参
   fx: 320.0
@@ -118,11 +118,11 @@ loss:
   # 现已修复位置编码破坏归一化的问题，启用Kendall Loss
   use_kendall: true
   # Kendall's Loss初始log_var（仅当use_kendall=true时有效）
-  # 给旋转loss更高的初始权重（因为旋转更关键）
-  # log_var_rotation=-1.0 -> 初始权重=exp(1)=2.72
-  # log_var_translation=0.0 -> 初始权重=exp(0)=1.0
-  init_log_var_rotation: -1.0
-  init_log_var_translation: 0.0
+  # 🔧 exp016: 平衡旋转和平移的初始权重
+  # log_var_rotation=0.0 -> 初始权重=exp(0)=1.0
+  # log_var_translation=-1.0 -> 初始权重=exp(1)=2.72（给平移更高权重，因为平移更难学）
+  init_log_var_rotation: 0.0
+  init_log_var_translation: -1.0
   
   # 旋转损失类型（use_kendall=false时生效）: geodesic, l2, cosine, quaternion
   rotation_loss: 'geodesic'
@@ -160,9 +160,9 @@ training:
   # 验证批次大小（每GPU）
   val_batch_size: 32
   
-  # DataLoader工作线程数（增大以加速数据加载）
-  # 多GPU训练时增大到8可以更好地喂饱GPU
-  num_workers: 24
+  # DataLoader工作线程数
+  # 减少以避免worker崩溃问题
+  num_workers: 8
   
   # 优化器类型: adam, adamw
   optimizer: 'adamw'

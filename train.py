@@ -29,10 +29,14 @@ from splatloc_modules.gaussian_splatting.scene.gaussian_model import GaussianMod
 from splatloc_modules.models.decoders import FeatureDecoder
 from splatloc_modules.gaussian_splatting.gaussian_renderer import render
 
+# Feature3DGS相关导入
+from feature_3dgs.feature_3dgs_provider import Feature3DGSProvider
+
 # 隐式对应关系模块导入
 from data.dataset import CorrespondenceDataset, collate_fn
 from losses.pose_loss import PoseLoss, PoseLossKendall
 from ic_models.ic_pose_net import ICPoseNet
+from ic_models.ic_pose_net_iterative import ICPoseNetIterative, ICPoseNetIterativeLite
 from utils.visualization import (
     visualize_attention_maps,
     visualize_2d3d_correspondence,
@@ -170,9 +174,21 @@ class ICPoseTrainer:
             print(f"设备: {self.device}")
             print(f"输出目录: {self.output_dir}")
         
-        # 1. 加载SplatLoc预训练模型
-        self._load_splatloc_models()
-        
+        # 确定输入类型 ('splatloc' 或 'feature3dgs')
+        self.input_type = config.get('input_type', 'splatloc')
+        self.feature3dgs_provider: Optional[Feature3DGSProvider] = None
+
+        # 1. 加载场景模型
+        # feature3dgs 模式：只需 Gaussians 几何（视锥裁切），跳过 FeatureDecoder
+        # splatloc    模式：完整加载 Gaussians + FeatureDecoder
+        skip_decoder = (self.input_type == 'feature3dgs')
+        self._load_splatloc_models(skip_decoder=skip_decoder)
+        if self.input_type == 'feature3dgs':
+            self._load_feature3dgs_model()
+
+        if self.is_main_process:
+            print(f"  输入类型: {self.input_type}")
+
         # 2. 初始化ICPoseNet
         self._init_icposenet()
         
@@ -189,10 +205,47 @@ class ICPoseTrainer:
         if self.resume_path:
             self._load_checkpoint(self.resume_path)
     
-    def _load_splatloc_models(self):
-        """加载SplatLoc已训练的gaussians和feat_decoder"""
+    def _load_feature3dgs_model(self):
+        """加载预训练的 GaussianFeatureModel（特征3DGS），用于 feature3dgs 输入模式"""
+        if self.is_main_process:
+            print("\n[步骤 1b] 加载 Feature3DGS 模型...")
+
+        f3dgs_cfg = self.config.get('feature3dgs', {})
+        feature_ply_path = f3dgs_cfg.get('feature_ply_path')
+        feature_dim      = f3dgs_cfg.get('feature_dim', self.config['model']['feature_dim'])
+        depth_min        = f3dgs_cfg.get('depth_min', 0.01)
+        depth_max        = f3dgs_cfg.get('depth_max', 20.0)
+
+        if feature_ply_path is None:
+            raise ValueError(
+                "[Feature3DGS] 配置中缺少 feature3dgs.feature_ply_path，"
+                "请先运行 feature_3dgs/train_feature_embedding.py 训练特征嵌入"
+            )
+
+        self.feature3dgs_provider = Feature3DGSProvider(
+            feature_ply_path=feature_ply_path,
+            feature_dim=feature_dim,
+            device=str(self.device),
+            depth_min=depth_min,
+            depth_max=depth_max,
+        )
+
+        if self.is_main_process:
+            print(f"  ✓ Feature3DGS 加载完成: {feature_ply_path}")
+            print(f"  ✓ Gaussian 数量: {self.feature3dgs_provider.num_gaussians}")
+
+    def _load_splatloc_models(self, skip_decoder: bool = False):
+        """
+        加载 SplatLoc 预训练模型。
+
+        Args:
+            skip_decoder: True → 只加载 Gaussian 几何，跳过 FeatureDecoder
+                          （feature3dgs 模式下 FeatureDecoder 完全用不到）
+        """
         print("\n[步骤 1] 加载SplatLoc预训练模型...")
-        
+        if skip_decoder:
+            print("  (feature3dgs 模式：跳过 FeatureDecoder 加载)")
+
         splatloc_cfg = self.config['splatloc']
         gaussians_path = splatloc_cfg['gaussians_path']
         decoder_path = splatloc_cfg['decoder_path']
@@ -232,10 +285,25 @@ class ICPoseTrainer:
         # GaussianModel使用tensor属性，不是nn.Module
         # 将其移到CUDA并设置为eval模式（如果有的话）
         print(f"    ✓ Gaussian点数: {self.gaussians.get_xyz.shape[0]}")
-        
+
+        # feature3dgs 模式下不需要 FeatureDecoder，直接跳过
+        if skip_decoder:
+            self.feat_decoder = None
+            # 仍需初始化渲染参数（视锥裁切时用）
+            from munch import munchify
+            self.pipeline_params = munchify({
+                'convert_SHs_python': False,
+                'compute_cov3D_python': False,
+                'debug': False
+            })
+            self.background = torch.tensor([0, 0, 0], dtype=torch.float32, device=self.device)
+            if self.is_main_process:
+                print("  ✓ Gaussian 加载完成（FeatureDecoder 已跳过）")
+            return
+
         # 加载特征解码器
         print(f"  - 加载特征解码器: {decoder_path}")
-        
+
         # 确保splatloc_config有必需的scene和decoder配置
         if 'scene' not in splatloc_config:
             splatloc_config['scene'] = self.config.get('scene', {
@@ -331,13 +399,51 @@ class ICPoseTrainer:
             print("\n[步骤 2] 初始化ICPoseNet...")
         
         model_cfg = self.config['model']
-        self.model = ICPoseNet(
-            feature_dim=model_cfg['feature_dim'],
-            num_queries=model_cfg['num_queries'],
-            fusion_layers=model_cfg['fusion_layers'],
-            num_heads=model_cfg['num_heads'],
-            dropout=model_cfg['dropout']
-        ).to(self.device)
+        
+        # 选择模型架构
+        model_type = model_cfg.get('model_type', 'standard')  # standard, iterative, iterative_lite
+        
+        if model_type == 'iterative':
+            # 迭代精化版本（每阶段独立参数）
+            self.model = ICPoseNetIterative(
+                feature_dim=model_cfg['feature_dim'],
+                num_queries=model_cfg['num_queries'],
+                num_stages=model_cfg.get('num_stages', 3),
+                hidden_dim=model_cfg.get('hidden_dim', 512),
+                num_heads=model_cfg['num_heads'],
+                dropout=model_cfg['dropout']
+            ).to(self.device)
+            self.use_iterative_model = True
+            if self.is_main_process:
+                print(f"  - 模型类型: ICPoseNetIterative (迭代精化)")
+                print(f"  - 精化阶段数: {model_cfg.get('num_stages', 3)}")
+        elif model_type == 'iterative_lite':
+            # 轻量级迭代版本（共享参数）
+            self.model = ICPoseNetIterativeLite(
+                feature_dim=model_cfg['feature_dim'],
+                num_queries=model_cfg['num_queries'],
+                num_stages=model_cfg.get('num_stages', 3),
+                hidden_dim=model_cfg.get('hidden_dim', 512),
+                num_heads=model_cfg['num_heads'],
+                dropout=model_cfg['dropout']
+            ).to(self.device)
+            self.use_iterative_model = True
+            if self.is_main_process:
+                print(f"  - 模型类型: ICPoseNetIterativeLite (轻量级迭代)")
+                print(f"  - 精化阶段数: {model_cfg.get('num_stages', 3)} (共享参数)")
+        else:
+            # 标准版本（单阶段）
+            self.model = ICPoseNet(
+                feature_dim=model_cfg['feature_dim'],
+                num_queries=model_cfg['num_queries'],
+                fusion_layers=model_cfg['fusion_layers'],
+                num_heads=model_cfg['num_heads'],
+                dropout=model_cfg['dropout'],
+                attention_temperature=model_cfg.get('attention_temperature', None),
+            ).to(self.device)
+            self.use_iterative_model = False
+            if self.is_main_process:
+                print(f"  - 模型类型: ICPoseNet (标准单阶段)")
         
         # 包装为DDP模型
         if self.is_distributed:
@@ -358,7 +464,8 @@ class ICPoseTrainer:
         if self.is_main_process:
             print(f"  - 特征维度: {model_cfg['feature_dim']}")
             print(f"  - Query数量: {model_cfg['num_queries']}")
-            print(f"  - 融合层数: {model_cfg['fusion_layers']}")
+            if not self.use_iterative_model:
+                print(f"  - 融合层数: {model_cfg['fusion_layers']}")
             print(f"  - 注意力头数: {model_cfg['num_heads']}")
             print(f"  - 总参数量: {total_params:,}")
             print(f"  - 可训练参数: {trainable_params:,}")
@@ -388,9 +495,13 @@ class ICPoseTrainer:
             use_initial_pose=use_relative_pose,
             pose_noise_rot_deg=data_cfg.get('pose_noise_rot_deg', 5.0),
             pose_noise_trans_m=data_cfg.get('pose_noise_trans_m', 0.1),
+            # 🆕 视锥裁切和负样本配置
+            use_init_pose_for_culling=data_cfg.get('use_init_pose_for_culling', False),
+            frustum_margin=data_cfg.get('frustum_margin', 0.0),
+            negative_ratio=data_cfg.get('negative_ratio', 0.0),
         )
         
-        # 验证集
+        # 验证集 - 验证时总是使用GT位姿裁切，不使用负样本
         self.val_dataset = CorrespondenceDataset(
             data_root=data_cfg['data_root'],
             scene_name=data_cfg['val_scene'],
@@ -407,6 +518,10 @@ class ICPoseTrainer:
             use_initial_pose=use_relative_pose,
             pose_noise_rot_deg=data_cfg.get('pose_noise_rot_deg', 5.0),
             pose_noise_trans_m=data_cfg.get('pose_noise_trans_m', 0.1),
+            # 验证集不使用初始位姿裁切和负样本
+            use_init_pose_for_culling=False,
+            frustum_margin=0.0,
+            negative_ratio=0.0,
         )
         
         # DataLoader
@@ -607,8 +722,11 @@ class ICPoseTrainer:
     
     def _extract_features(self, batch: Dict) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        从图像和点云提取特征
-        
+        从图像和点云提取特征（根据 input_type 自动调度）
+
+        input_type='splatloc'    → 原始路径（FeatureDecoder + fused_feature图采样）
+        input_type='feature3dgs' → 新路径（Feature3DGS渲染深度反投影 + 渲染特征图采样）
+
         新实现:
         - 2D特征: 从预提取的融合特征图中采样
         - 3D特征: 使用FeatureDecoder直接查询3D点
@@ -626,6 +744,10 @@ class ICPoseTrainer:
         """
         import numpy as np
         
+        # ---- 根据 input_type 分支 ----
+        if self.input_type == 'feature3dgs':
+            return self._extract_features_feature3dgs(batch)
+
         images = batch['image'].to(self.device)  # [B, 3, H, W]
         poses = batch['pose'].to(self.device)    # [B, 4, 4]
         K = batch['intrinsics'].to(self.device)  # [B, 3, 3]
@@ -770,7 +892,145 @@ class ICPoseTrainer:
         
         # 返回特征和位置编码（位置编码通过embeds参数传递）
         return img_feats, pcd_feats, img_pos_embeds, pcd_pos_embeds, img_pixels, pcd_points
-    
+
+    # ==================================================================
+    # Feature3DGS 输入模式的特征提取
+    # ==================================================================
+
+    def _extract_features_feature3dgs(
+        self, batch: Dict
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Feature3DGS 模式的特征提取:
+
+        数据流:
+          1. 用 GT 位姿（或初始位姿）渲染 Feature3DGS → 深度图 + 特征图
+          2. 深度图反投影 → 世界坐标 3D 点 + 对应像素坐标
+          3. 在渲染特征图上采样 → 3D 特征 (与 DINO+SD 特征对齐)
+          4. 在预提取 fused_feature 上采样同一像素 → 2D 特征
+          5. 用像素坐标/世界坐标生成位置编码
+
+        Args:
+            batch: DataLoader 的 batch，必须含 'pose', 'fused_feature', 'intrinsics'
+
+        Returns:
+            同 _extract_features(): img_feats, pcd_feats, img_pos_embeds,
+                                     pcd_pos_embeds, img_pixels, pcd_points
+        """
+        assert self.feature3dgs_provider is not None, (
+            "feature3dgs_provider 未初始化，请检查 input_type 和 feature3dgs 配置"
+        )
+
+        data_cfg    = self.config['dataset']
+        f3dgs_cfg   = self.config.get('feature3dgs', {})
+        feature_dim = self.config['model']['feature_dim']
+
+        # 相机参数
+        fx = float(data_cfg['fx'])
+        fy = float(data_cfg['fy'])
+        cx = float(data_cfg['cx'])
+        cy = float(data_cfg['cy'])
+        img_h, img_w = int(data_cfg['image_size'][1]), int(data_cfg['image_size'][0])
+
+        # 每帧采样点数
+        num_samples = f3dgs_cfg.get('num_samples', data_cfg.get('num_pairs', 1024))
+
+        # 使用 GT 还是初始位姿渲染？
+        # - use_gt_pose_for_rendering=True (默认)：GT 位姿渲染，3D 点准确
+        # - False：初始（带噪声）位姿渲染，更接近真实定位场景
+        use_gt = f3dgs_cfg.get('use_gt_pose_for_rendering', True)
+
+        poses_gt   = batch['pose'].to(self.device)          # (B, 4, 4) c2w GT
+        batch_size = poses_gt.shape[0]
+
+        if (not use_gt) and ('initial_pose' in batch):
+            render_poses = batch['initial_pose'].to(self.device)  # (B, 4, 4) noisy
+        else:
+            render_poses = poses_gt  # (B, 4, 4) GT
+
+        # fused_feature: (B, 256, fH, fW)
+        fused_features = batch.get('fused_feature', None)
+        if fused_features is not None:
+            fused_features = fused_features.to(self.device)
+
+        # --------  逐帧渲染（共享投影, CUDA上顺序执行）  --------
+        all_pts3d   = []   # per-sample: (N_b, 3)
+        all_pix     = []   # per-sample: (N_b, 2)  (u, v)
+        all_pcd_f   = []   # per-sample: (N_b, feature_dim)
+        pts_per_sample = []
+
+        for b in range(batch_size):
+            result = self.feature3dgs_provider.render_and_backproject(
+                c2w=render_poses[b],
+                fx=fx, fy=fy, cx=cx, cy=cy,
+                img_height=img_h, img_width=img_w,
+                num_samples=num_samples,
+                norm_features=True,
+            )
+            N_b = result['points_3d'].shape[0]
+            all_pts3d.append(result['points_3d'])   # (N_b, 3)
+            all_pix.append(result['pixel_coords'])   # (N_b, 2)
+            all_pcd_f.append(result['pcd_feats'])    # (N_b, feature_dim)
+            pts_per_sample.append(N_b)
+
+        max_pts = max(pts_per_sample) if pts_per_sample else num_samples
+
+        # ----  组成 padded batch tensors  ----
+        pcd_points  = torch.zeros(batch_size, max_pts, 3,           device=self.device)
+        img_pixels  = torch.zeros(batch_size, max_pts, 2,           device=self.device)
+        pcd_feats   = torch.zeros(batch_size, max_pts, feature_dim, device=self.device)
+        img_feats   = torch.zeros(batch_size, max_pts, feature_dim, device=self.device)
+
+        for b in range(batch_size):
+            nb = pts_per_sample[b]
+            if nb == 0:
+                continue
+            pcd_points[b, :nb] = all_pts3d[b]
+            img_pixels[b, :nb] = all_pix[b]
+            pcd_feats[b, :nb]  = all_pcd_f[b]
+
+        # ----  2D 特征：从 fused_feature 在 img_pixels 位置采样  ----
+        if fused_features is not None:
+            fH, fW = fused_features.shape[2], fused_features.shape[3]
+
+            for b in range(batch_size):
+                nb = pts_per_sample[b]
+                if nb == 0:
+                    continue
+                uv = img_pixels[b, :nb]          # (nb, 2)  (u, v) pixel coords
+                u_feat = uv[:, 0] * (fW / img_w)
+                v_feat = uv[:, 1] * (fH / img_h)
+                gx = 2.0 * u_feat / (fW - 1) - 1.0
+                gy = 2.0 * v_feat / (fH - 1) - 1.0
+                grid = torch.stack([gx, gy], dim=-1).unsqueeze(0).unsqueeze(0)  # (1,1,nb,2)
+                sampled = torch.nn.functional.grid_sample(
+                    fused_features[b:b+1],                # (1, D, fH, fW)
+                    grid,
+                    mode='bilinear', padding_mode='border', align_corners=True
+                )  # (1, D, 1, nb)
+                sampled = sampled.squeeze(2).squeeze(0).T  # (nb, D)
+                img_feats[b, :nb] = torch.nn.functional.normalize(sampled, p=2, dim=-1)
+        else:
+            # Fallback: 直接用渲染的 3D 特征也作为 2D 特征（调试用）
+            if self.is_main_process:
+                print("[WARNING] feature3dgs 模式下未找到 fused_feature，2D 特征将使用渲染特征代替")
+            img_feats = pcd_feats.clone()
+
+        # ----  位置编码  ----
+        actual_model = self.model.module if self.is_distributed else self.model
+
+        # 2D 位置编码：归一化像素坐标 (u/W, v/H)
+        pix_norm = img_pixels.clone()
+        pix_norm[:, :, 0] = pix_norm[:, :, 0] / (img_w - 1)
+        pix_norm[:, :, 1] = pix_norm[:, :, 1] / (img_h - 1)
+        img_pos_embeds = actual_model.pos_enc_2d(pix_norm)    # (B, N, C)
+
+        # 3D 位置编码：世界坐标
+        pos_enc_3d      = actual_model.pos_enc_3d(pcd_points)           # (B, N, C_raw)
+        pcd_pos_embeds  = actual_model.pos_enc_3d_proj(pos_enc_3d)      # (B, N, C)
+
+        return img_feats, pcd_feats, img_pos_embeds, pcd_pos_embeds, img_pixels, pcd_points
+
     def train_epoch(self, epoch: int) -> Dict[str, float]:
         """
         训练一个epoch
@@ -801,14 +1061,34 @@ class ICPoseTrainer:
                 # 1. 提取特征和位置编码 + 坐标
                 img_feats, pcd_feats, img_pos_embeds, pcd_pos_embeds, img_pixels, pcd_points = self._extract_features(batch)
                 
-                # 2. 前向传播（传递位置编码 + 坐标）
-                pose_matrix_pred, pose_9d, rotation_6d, translation_rel, \
-                    img_heatmap, img_keypoints, pcd_keypoints = self.model(
-                    img_feats, pcd_feats, img_pixels, pcd_points,
-                    img_pos_embeds, pcd_pos_embeds
-                )
+                # 2. 准备初始位姿（迭代模型需要）
+                use_relative_pose = self.config['loss'].get('use_relative_pose', False)
+                if use_relative_pose and 'initial_pose' in batch:
+                    initial_pose = batch['initial_pose'].to(self.device)
+                else:
+                    initial_pose = None
                 
-                # 3. 准备GT
+                # 3. 前向传播（根据模型类型选择不同的调用方式）
+                if getattr(self, 'use_iterative_model', False):
+                    # 迭代精化模型：需要传入initial_pose
+                    if initial_pose is None:
+                        raise ValueError("迭代精化模型需要initial_pose！请启用use_relative_pose")
+                    pose_matrix_pred, pose_9d, rotation_6d, translation_rel, \
+                        img_heatmap, img_keypoints, pcd_keypoints, stage_poses = self.model(
+                        img_feats, pcd_feats, img_pixels, pcd_points,
+                        img_pos_embeds, pcd_pos_embeds,
+                        initial_pose=initial_pose
+                    )
+                else:
+                    # 标准模型
+                    pose_matrix_pred, pose_9d, rotation_6d, translation_rel, \
+                        img_heatmap, img_keypoints, pcd_keypoints = self.model(
+                        img_feats, pcd_feats, img_pixels, pcd_points,
+                        img_pos_embeds, pcd_pos_embeds
+                    )
+                    stage_poses = None
+                
+                # 4. 准备GT
                 gt_poses_abs = batch['pose'].to(self.device)  # (B, 4, 4) 绝对位姿
                 
                 # 相对位姿选项
@@ -1039,6 +1319,10 @@ class ICPoseTrainer:
         rotation_errors = []
         translation_errors = []
         
+        # 🆕 初始位姿误差统计（作为基准对比）
+        init_rotation_errors = []
+        init_translation_errors = []
+        
         # 可视化相关
         vis_config = self.config.get('visualization', {})
         should_visualize = (
@@ -1058,21 +1342,44 @@ class ICPoseTrainer:
                 # 1. 提取特征和位置编码 + 坐标
                 img_feats, pcd_feats, img_pos_embeds, pcd_pos_embeds, img_pixels, pcd_points = self._extract_features(batch)
                 
-                # 2. 前向传播（传递位置编码 + 坐标）
-                pose_matrix_pred, pose_9d, rotation_6d, translation, \
-                    img_heatmap, img_keypoints, pcd_keypoints = self.model(
-                    img_feats, pcd_feats, img_pixels, pcd_points,
-                    img_pos_embeds, pcd_pos_embeds
-                )
+                # 2. 准备初始位姿（迭代模型需要）
+                use_relative_pose = self.config['loss'].get('use_relative_pose', False)
+                if use_relative_pose and 'initial_pose' in batch:
+                    initial_pose = batch['initial_pose'].to(self.device)
+                else:
+                    initial_pose = None
                 
-                # 3. 准备GT（与训练保持一致）
+                # 3. 前向传播（根据模型类型选择不同的调用方式）
+                if getattr(self, 'use_iterative_model', False):
+                    # 迭代精化模型
+                    if initial_pose is None:
+                        raise ValueError("迭代精化模型需要initial_pose！请启用use_relative_pose")
+                    pose_matrix_pred, pose_9d, rotation_6d, translation, \
+                        img_heatmap, img_keypoints, pcd_keypoints, stage_poses = self.model(
+                        img_feats, pcd_feats, img_pixels, pcd_points,
+                        img_pos_embeds, pcd_pos_embeds,
+                        initial_pose=initial_pose
+                    )
+                else:
+                    # 标准模型
+                    pose_matrix_pred, pose_9d, rotation_6d, translation, \
+                        img_heatmap, img_keypoints, pcd_keypoints = self.model(
+                        img_feats, pcd_feats, img_pixels, pcd_points,
+                        img_pos_embeds, pcd_pos_embeds
+                    )
+                    stage_poses = None
+                
+                # 4. 准备GT（与训练保持一致）
                 gt_poses_abs = batch['pose'].to(self.device)
                 
                 use_relative_pose = self.config['loss'].get('use_relative_pose', False)
                 normalize_translation = self.config['loss'].get('normalize_translation', False)
                 
                 if use_relative_pose:
-                    pose_init = gt_poses_abs[0:1].expand(gt_poses_abs.shape[0], 4, 4).clone()
+                    # 🔧 修复：使用每帧独立的初始位姿，与训练保持一致
+                    if 'initial_pose' not in batch:
+                        raise ValueError("启用use_relative_pose但数据集中没有initial_pose！请检查数据集配置")
+                    pose_init = batch['initial_pose'].to(self.device)  # (B, 4, 4) 每帧独立的初始位姿
                     gt_poses = compute_relative_pose(gt_poses_abs, pose_init)
                 else:
                     gt_poses = gt_poses_abs
@@ -1119,20 +1426,30 @@ class ICPoseTrainer:
                 total_trans_loss += loss_dict['translation_loss']
                 
                 # 6. 计算位姿误差（使用绝对位姿进行评估）
-                # 重建完整的绝对位姿用于评估
-                pose_pred_eval = torch.eye(4, device=R_pred.device).unsqueeze(0).expand(R_pred.shape[0], 4, 4).clone()
-                pose_pred_eval[:, :3, :3] = R_pred
-                pose_pred_eval[:, :3, 3] = translation  # 使用原始translation（模型直接输出，从未归一化）
-                
-                # 如果使用了相对位姿，需要转回绝对位姿
-                if use_relative_pose:
-                    # 使用每帧的初始位姿
-                    pose_init = batch['initial_pose'].to(self.device)
-                    pose_pred_eval = compose_pose(pose_pred_eval, pose_init)
+                if getattr(self, 'use_iterative_model', False):
+                    # 迭代模型直接输出绝对位姿
+                    pose_pred_eval = pose_matrix_pred
+                else:
+                    # 标准模型：重建完整的绝对位姿用于评估
+                    pose_pred_eval = torch.eye(4, device=R_pred.device).unsqueeze(0).expand(R_pred.shape[0], 4, 4).clone()
+                    pose_pred_eval[:, :3, :3] = R_pred
+                    pose_pred_eval[:, :3, 3] = translation  # 使用原始translation
+                    
+                    # 如果使用了相对位姿，需要转回绝对位姿
+                    if use_relative_pose:
+                        pose_init = batch['initial_pose'].to(self.device)
+                        pose_pred_eval = compose_pose(pose_pred_eval, pose_init)
                 
                 rot_error, trans_error = self._compute_pose_error(pose_pred_eval, gt_poses_abs)
                 rotation_errors.extend(rot_error.cpu().numpy().tolist())
                 translation_errors.extend(trans_error.cpu().numpy().tolist())
+                
+                # 🆕 计算初始位姿的误差作为基准
+                if use_relative_pose and 'initial_pose' in batch:
+                    init_pose = batch['initial_pose'].to(self.device)
+                    init_rot_error, init_trans_error = self._compute_pose_error(init_pose, gt_poses_abs)
+                    init_rotation_errors.extend(init_rot_error.cpu().numpy().tolist())
+                    init_translation_errors.extend(init_trans_error.cpu().numpy().tolist())
                 
                 # 7. 可视化（仅在主进程且满足条件时）
                 if should_visualize and vis_samples_saved < vis_num_samples:
@@ -1203,6 +1520,10 @@ class ICPoseTrainer:
             num_batches = len(self.val_loader) * (dist.get_world_size() if self.is_distributed else 1)
             rotation_errors_np = np.array(rotation_errors) if not self.is_distributed else rotation_errors
             translation_errors_np = np.array(translation_errors) if not self.is_distributed else translation_errors
+            
+            # 🆕 初始位姿误差
+            init_rotation_errors_np = np.array(init_rotation_errors) if init_rotation_errors else None
+            init_translation_errors_np = np.array(init_translation_errors) if init_translation_errors else None
         else:
             # 非主进程返回空指标
             return {}
@@ -1216,6 +1537,11 @@ class ICPoseTrainer:
             'translation_error_mean': translation_errors_np.mean(),
             'translation_error_median': np.median(translation_errors_np),
         }
+        
+        # 🆕 添加初始位姿误差作为基准
+        if init_rotation_errors_np is not None and len(init_rotation_errors_np) > 0:
+            metrics['init_rotation_error_mean'] = init_rotation_errors_np.mean()
+            metrics['init_translation_error_mean'] = init_translation_errors_np.mean()
         
         # 记录到TensorBoard（只在主进程）
         if self.writer is not None:
@@ -1429,10 +1755,22 @@ class ICPoseTrainer:
             axes[0].set_title('Input Image', fontsize=14)
             axes[0].axis('off')
             
-            # 右图：置信度热力图叠加
+            # 右图：置信度热力图叠加（自适应归一化）
+            # 🆕 统计attention质量
+            heatmap_max = heatmap.max() if heatmap.max() > 0 else 1e-6
+            heatmap_mean = heatmap[heatmap > 0].mean() if (heatmap > 0).any() else 0
+            heatmap_std = heatmap[heatmap > 0].std() if (heatmap > 0).any() else 0
+            
+            # 🆕 打印attention统计信息
+            raw_attn_max = heatmap_data.max().item()
+            raw_attn_min = heatmap_data.min().item()
+            raw_attn_std = heatmap_data.std().item()
+            self._log(f"  📊 Attention Stats: max={raw_attn_max:.6f}, min={raw_attn_min:.6f}, std={raw_attn_std:.6f}")
+            
             axes[1].imshow(img)
-            im = axes[1].imshow(heatmap, cmap='jet', alpha=0.6, vmin=0, vmax=1)
-            axes[1].set_title(f'Confidence Heatmap\nRot: {rot_error:.2f}°, Trans: {trans_error:.3f}m', 
+            # 🆕 使用自适应归一化：vmax=heatmap_max 而非固定的 1.0
+            im = axes[1].imshow(heatmap, cmap='jet', alpha=0.6, vmin=0, vmax=heatmap_max)
+            axes[1].set_title(f'Confidence Heatmap (max={heatmap_max:.4f})\nRot: {rot_error:.2f}°, Trans: {trans_error:.3f}m', 
                             fontsize=14)
             axes[1].axis('off')
             
@@ -1577,6 +1915,17 @@ class ICPoseTrainer:
                         trans_msg = (f"       平移误差: {val_metrics['translation_error_mean']:.4f}m "
                                     f"(中位数: {val_metrics['translation_error_median']:.4f}m)")
                         self._log(trans_msg)
+                        
+                        # 🆕 显示初始位姿误差作为基准对比
+                        if 'init_rotation_error_mean' in val_metrics:
+                            init_msg = (f"       [基准] 初始位姿误差: {val_metrics['init_rotation_error_mean']:.2f}° / "
+                                       f"{val_metrics['init_translation_error_mean']:.4f}m")
+                            self._log(init_msg)
+                            # 计算改进率
+                            rot_improve = (1 - val_metrics['rotation_error_mean'] / val_metrics['init_rotation_error_mean']) * 100
+                            trans_improve = (1 - val_metrics['translation_error_mean'] / val_metrics['init_translation_error_mean']) * 100
+                            improve_msg = f"       [改进] 旋转: {rot_improve:+.1f}% | 平移: {trans_improve:+.1f}%"
+                            self._log(improve_msg)
                     
                         # 检查是否为最佳模型
                         is_best = val_metrics['loss'] < self.best_val_loss

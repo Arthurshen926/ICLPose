@@ -1,0 +1,160 @@
+# exp029 Feature3DGS 输入模式
+# ===================================================
+# 目的: 对比 SplatLoc (FeatureDecoder) vs Feature3DGS (渲染特征图) 两种 3D 特征来源
+#
+# 核心变化:
+#   input_type: 'feature3dgs'   ← 核心开关
+#   feature3dgs:
+#     feature_ply_path: ...     ← 由 train_feature_embedding.py 产出的 PLY
+#     use_gt_pose_for_rendering: true   ← 用 GT 位姿渲染（精确 3D 点）
+#
+# 数据流:
+#   渲染深度图 → 反投影 → 3D 点 (世界坐标)
+#   渲染特征图 → 采样 → 3D 特征 (与 DINO+SD 对齐)
+#   fused_feature → 对应像素采样 → 2D 特征
+#   Cross-Attention → 位姿预测
+#
+# 注意: 训练前需要先运行：
+#   python -m feature_3dgs.train_feature_embedding \
+#       --ply_path dataset/room_0/.../point_cloud.ply \
+#       --feature_dir dataset/room_0/Sequence_1/features_compressed/fused \
+#       --traj_path dataset/room_0/Sequence_1/traj_w_c.txt \
+#       --output_dir output/feature_3dgs/room_0 \
+#       --feature_dim 256 --num_iters 5000
+
+seed: 42
+
+# ========================================
+# 输入模式选择
+# ========================================
+# 'splatloc'    : 原始模式 (Gaussian 中心 + FeatureDecoder)
+# 'feature3dgs' : 新模式 (渲染深度反投影 + 渲染特征图)
+input_type: 'feature3dgs'
+
+output_dir: "/home/yons/Projects/ICLPose/output/exp029_feature3dgs"
+
+# ========================================
+# Feature3DGS 专属配置
+# ========================================
+feature3dgs:
+  # 训练好特征嵌入的 PLY 文件（含 loc_0...loc_255 属性）
+  feature_ply_path: "/home/yons/Projects/ICLPose/output/feature_3dgs/room_0/point_cloud_with_features.ply"
+
+  # 特征维度（需与训练时一致）
+  feature_dim: 256
+
+  # 每帧反投影的有效 3D 点数量
+  num_samples: 2048
+
+  # 渲染时使用的位姿策略:
+  #   true  → GT 位姿渲染，3D 点最准确 (推荐训练)
+  #   false → 带噪声的初始位姿渲染，更贴近推理场景
+  use_gt_pose_for_rendering: true
+
+  # 有效深度范围 (m)
+  depth_min: 0.05
+  depth_max: 15.0
+
+# ========================================
+# SplatLoc 配置（feature3dgs 模式下 gaussians 仍用于视锥裁切）
+# ========================================
+splatloc:
+  gaussians_path: "/home/yons/Projects/ICLPose/dataset/room_0/splatloc-test/data/room_0/point_cloud/final/point_cloud.ply"
+  decoder_path: "/home/yons/Projects/ICLPose/dataset/room_0/splatloc-test/data/room_0/train_feat/ckpt.pth"
+  config_path: "/home/yons/Projects/SplatLoc/configs/replica_nerf/base_config.yaml"
+  freeze_decoder: true
+
+# 场景配置
+scene:
+  bound: [[-1.0, 7.0], [-1.3, 3.7], [-1.7, 1.4]]
+  voxel_sdf: 0.06
+
+# 特征解码器配置（feature3dgs 模式下用于 SplatLoc 后备路径）
+decoder:
+  enc: 'HashGrid'
+  num_layers: 4
+  hidden_dim: 128
+  final_dim: 256
+
+# ========================================
+# 模型配置（与 exp028 保持一致，方便对比）
+# ========================================
+model:
+  feature_dim: 256
+  num_queries: 128
+  fusion_layers: 4
+  num_heads: 8
+  dropout: 0.1
+  attention_temperature: 4.0
+
+# ========================================
+# 数据集配置
+# ========================================
+dataset:
+  data_root: "/home/yons/Projects/ICLPose/dataset/room_0"
+  train_scene: "Sequence_1"
+  val_scene: "Sequence_2"
+
+  train_step: 1
+  val_step: 1
+  image_size: [640, 480]
+  max_train_samples: null
+  max_val_samples: null
+  gaussian_path: "/home/yons/Projects/ICLPose/dataset/room_0/splatloc-test/data/room_0/point_cloud/final/point_cloud.ply"
+  use_depth: false
+
+  pose_noise_rot_deg: 2.0
+  pose_noise_trans_m: 0.10
+
+  fx: 320.0
+  fy: 320.0
+  cx: 319.5
+  cy: 239.5
+  num_pairs: 2048   # feature3dgs 下 num_samples 优先，此项作为 dataset 内 Gaussian 采样的备选
+
+# ========================================
+# 损失函数配置（与 exp028 一致）
+# ========================================
+loss:
+  use_relative_pose: false
+  normalize_translation: false
+  use_kendall: false
+
+  rotation_loss: 'geodesic'
+  translation_loss: 'l2'
+  rotation_weight: 1.0
+  translation_weight: 1.0
+
+  diversity_weight: 0.05
+  diversity_margin_2d: 16.0
+  diversity_margin_3d: 0.16
+  reprojection_weight: 0.1
+
+# ========================================
+# 训练配置
+# ========================================
+training:
+  num_epochs: 200
+  batch_size: 16    # ← 渲染操作显存消耗更大，适当减小
+  val_batch_size: 8
+  num_workers: 4    # ← 减小 workers，因渲染在主进程 GPU 上执行
+  optimizer: 'adamw'
+  learning_rate: 5.0e-5
+  decoder_lr: 5.0e-6
+  weight_decay: 1.0e-4
+  grad_clip: 1.0
+  scheduler: 'cosine'
+  min_lr: 1.0e-6
+  val_interval: 2
+  save_interval: 10
+  log_interval: 10
+
+visualization:
+  enable: true
+  vis_interval: 5
+  num_samples: 3
+  vis_types:
+    pose_prediction: true
+    feature_similarity: false
+    correspondence: false
+    query_evolution: false
