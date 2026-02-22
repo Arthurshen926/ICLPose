@@ -107,24 +107,17 @@ class MultiScaleFeatureExtractor:
         sd_h = int(round(orig_h * scale))
 
         # ═══════════════════════════════════════════════════
-        #  SD 特征提取 (反射填充, 参考 ControlNet)
+        #  SD 特征提取
         # ═══════════════════════════════════════════════════
-        sd_align_h = int(math.ceil(sd_h / 64) * 64)
-        sd_align_w = int(math.ceil(sd_w / 64) * 64)
-        img_sd_base = img.resize((sd_w, sd_h), Image.Resampling.LANCZOS)
-
-        if sd_align_h != sd_h or sd_align_w != sd_w:
-            import torchvision.transforms.functional as TF
-            img_t = TF.to_tensor(img_sd_base)
-            pad_b = sd_align_h - sd_h
-            pad_r = sd_align_w - sd_w
-            img_t = F.pad(img_t.unsqueeze(0),
-                          (0, pad_r, 0, pad_b), mode='reflect').squeeze(0)
-            img_sd_input = Image.fromarray(
-                (img_t.permute(1, 2, 0).numpy() * 255).clip(0, 255).astype('uint8')
-            )
-        else:
-            img_sd_input = img_sd_base
+        # 重要: ODISE 的 aug 内含 ResizeShortestEdge(short_edge_length=sd_image_size)
+        # 它会把图像 resize 到短边=480。若我们先做反射填充再送入,
+        # ODISE 会对填充后的图像重新 resize, 导致尺寸计算错位。
+        #
+        # 正确策略: 不做外部填充, 直接按 sd_w×sd_h 送入 ODISE。
+        # ODISE 的 aug 会将其 resize (短边已经是 480, 所以 sd_w×sd_h 不变)。
+        # 但 SD UNet 内部要求 64 整除, 会在右/下 zero-pad。
+        # 我们从 feature shape 动态推算 zero-pad 范围并裁掉。
+        img_sd_input = img.resize((sd_w, sd_h), Image.Resampling.LANCZOS)
 
         from .extractor_sd import process_features_and_mask
         feats_sd = process_features_and_mask(
@@ -133,13 +126,20 @@ class MultiScaleFeatureExtractor:
         )
         del feats_sd['s2']  # 不使用 s2
 
-        # 裁回有效区域 (去掉反射填充对应的 feature 行/列)
+        # 裁掉 SD UNet 内部 zero-pad 对应的 feature 行/列
+        # sd_w×sd_h 是送入 ODISE 的实际图像尺寸 (ODISE aug 对已经是短边=480的图不再 resize)
+        # UNet 内部 pad 到 ceil(sd_h/64)*64 × ceil(sd_w/64)*64
+        sd_padded_h = int(math.ceil(sd_h / 64) * 64)
+        sd_padded_w = int(math.ceil(sd_w / 64) * 64)
+
         for key in ['s3', 's4', 's5']:
             if key not in feats_sd:
                 continue
             _, _, fh, fw = feats_sd[key].shape
-            factor_h = sd_align_h // fh
-            factor_w = sd_align_w // fw
+            # 从 padded 尺寸推算 stride (动态, 不硬编码)
+            factor_h = sd_padded_h // fh
+            factor_w = sd_padded_w // fw
+            # 仅保留原始内容区域的 token
             valid_fh = sd_h // factor_h
             valid_fw = sd_w // factor_w
             if valid_fh < fh or valid_fw < fw:

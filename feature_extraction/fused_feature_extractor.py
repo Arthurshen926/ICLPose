@@ -111,24 +111,15 @@ class FusedFeatureExtractor:
         sd_h = int(round(orig_h * scale))
 
         # ── SD 特征提取 ──────────────────────────────────────────────────────
-        # SD UNet 要求输入能被 64 整除（VAE 8× + UNet 8×）。
-        # 策略（参考 ControlNet）：在送入 SD 前将 sd_h/sd_w 各自向上取整到 64 倍数，
-        # 用反射填充补齐。这样 SD 内部无 zero-pad，边界特征质量比事后裁零填充更好。
-        sd_align_h = int(math.ceil(sd_h / 64) * 64)   # e.g. 480→512, 640→640
-        sd_align_w = int(math.ceil(sd_w / 64) * 64)   # e.g. 1080→1088, 720→768
-        img_sd_base = img.resize((sd_w, sd_h), Image.Resampling.LANCZOS)
-        if sd_align_h != sd_h or sd_align_w != sd_w:
-            import torchvision.transforms.functional as TF
-            img_t = TF.to_tensor(img_sd_base)          # [3, sd_h, sd_w] float32
-            pad_b = sd_align_h - sd_h
-            pad_r = sd_align_w - sd_w
-            img_t = F.pad(img_t.unsqueeze(0),
-                          (0, pad_r, 0, pad_b), mode='reflect').squeeze(0)
-            img_sd_input = Image.fromarray(
-                (img_t.permute(1, 2, 0).numpy() * 255).clip(0, 255).astype('uint8')
-            )
-        else:
-            img_sd_input = img_sd_base
+        # 重要: ODISE 的 aug 内含 ResizeShortestEdge(short_edge_length=sd_image_size)。
+        # 若我们先做反射填充再送入, ODISE 会对填充后的图像重新 resize,
+        # 导致宽度变为非 64 整除值, SD UNet 的内部 zero-pad 产生右侧伪影。
+        #
+        # 正确策略: 不做外部填充, 直接按 sd_w×sd_h 送入 ODISE。
+        # ODISE aug 不会改变其尺寸 (短边已等于 sd_image_size)。
+        # SD UNet 内部会在右/下 zero-pad 到 64 整除, 我们从 feature shape
+        # 动态推算 zero-pad 范围并裁掉即可。
+        img_sd_input = img.resize((sd_w, sd_h), Image.Resampling.LANCZOS)
 
         from .extractor_sd import process_features_and_mask
         feats_sd = process_features_and_mask(
@@ -137,15 +128,16 @@ class FusedFeatureExtractor:
         )
         del feats_sd['s2']  # 不使用s2
 
-        # 裁回有效内容区域（去掉反射填充对应的 feature 行/列）
-        # 从实际 feature shape 动态推算 down-factor，对任意分辨率自适应。
+        # 裁掉 SD UNet 内部 zero-pad 对应的 feature 行/列
+        sd_padded_h = int(math.ceil(sd_h / 64) * 64)
+        sd_padded_w = int(math.ceil(sd_w / 64) * 64)
         for key in ['s3', 's4', 's5']:
             if key not in feats_sd:
                 continue
             _, _, fh, fw = feats_sd[key].shape
-            factor_h = sd_align_h // fh
-            factor_w = sd_align_w // fw
-            valid_fh = sd_h // factor_h   # floor：仅保留对应原始内容（未填充）的 token
+            factor_h = sd_padded_h // fh
+            factor_w = sd_padded_w // fw
+            valid_fh = sd_h // factor_h
             valid_fw = sd_w // factor_w
             if valid_fh < fh or valid_fw < fw:
                 feats_sd[key] = feats_sd[key][:, :, :valid_fh, :valid_fw]
