@@ -14,7 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from splatloc_modules.place_recognition import PlaceRecognition
+from place_recognition.cls_retrieval import PlaceRecognition
 
 
 def rotation_error_deg(R1, R2):

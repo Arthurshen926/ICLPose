@@ -26,8 +26,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from splatloc_modules.vlad_place_recognition import VLADPlaceRecognition
-from splatloc_modules.place_recognition import PlaceRecognition
+from place_recognition.vlad_retrieval import VLADPlaceRecognition
+from place_recognition.cls_retrieval import PlaceRecognition
 
 
 def compute_pose_error(pose_pred, pose_gt):
