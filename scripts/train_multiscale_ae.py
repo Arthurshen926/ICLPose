@@ -165,14 +165,14 @@ def train_single_ae(config_key: str, samples: torch.Tensor,
         for (batch,) in loader:
             batch = batch.to(device)
 
-            # AE 前向: encode → normalize → decode → normalize
+            # AE 前向: encode(L2 norm) → decode
             reconstructed = model(batch)
 
-            # 重建损失: L1 + Cosine
-            loss_l1 = F_torch.l1_loss(reconstructed, batch)
+            # 重建损失: MSE + Cosine (方向+幅度都要对齐)
+            loss_mse = F_torch.mse_loss(reconstructed, batch)
             cos_sim = F_torch.cosine_similarity(reconstructed, batch, dim=1).mean()
             loss_cos = 1.0 - cos_sim
-            loss = loss_l1 + 0.5 * loss_cos
+            loss = loss_mse + 0.5 * loss_cos
 
             optimizer.zero_grad()
             loss.backward()
@@ -190,12 +190,17 @@ def train_single_ae(config_key: str, samples: torch.Tensor,
 
         if epoch % 10 == 0 or epoch == 1:
             print(f"    Epoch {epoch:3d}/{epochs}  loss={avg_loss:.6f}  "
-                  f"(L1={loss_l1.item():.4f}, cos={loss_cos.item():.4f})  "
+                  f"(MSE={loss_mse.item():.4f}, cos={loss_cos.item():.4f})  "
                   f"best={best_loss:.6f}")
 
     # 加载最佳权重
     model.load_state_dict(torch.load(save_path, map_location=device))
     model.eval()
+
+    # Calibrate: 用训练数据统计全局 bottleneck min/max
+    model.calibrate(loader, device=device)
+    torch.save(model.state_dict(), save_path)  # 保存含 calibration 数据的权重
+
     print(f"    → 最佳 loss: {best_loss:.6f}")
     print(f"    → 模型保存: {save_path}")
     return model
@@ -238,7 +243,7 @@ def main():
     parser.add_argument('--ae_save_dir', type=str, required=True,
                         help='AutoEncoder 模型保存目录')
     parser.add_argument('--device', type=str, default='cuda')
-    parser.add_argument('--epochs', type=int, default=50)
+    parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--batch_size', type=int, default=4096)
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--max_samples', type=int, default=500000,
