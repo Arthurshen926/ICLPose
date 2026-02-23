@@ -41,22 +41,31 @@ class VLADEncoder:
     VLAD (Vector of Locally Aggregated Descriptors) 编码器。
 
     将 patch-level tokens 聚合为紧凑的全局描述子。
+    
+    关键步骤 (AnyLoc 论文):
+      1. L2 归一化所有 patch tokens (norm_descs=True)
+      2. 余弦 K-Means 聚类 (归一化后欧氏等价余弦)
+      3. 对每帧: 归一化 tokens → 计算残差 → 按聚类求和
+      4. Intra-normalize → Flatten → Global L2-normalize
     """
 
     def __init__(
         self,
         n_clusters: int = 32,
         token_dim: int = 768,
+        norm_descs: bool = True,
         pca_dim: Optional[int] = None,
     ):
         """
         Args:
             n_clusters: VLAD 聚类数 (AnyLoc 推荐 32)
             token_dim: Patch token 维度 (DINOv2 = 768)
+            norm_descs: 是否 L2 归一化 tokens (AnyLoc 默认 True, 关键步骤!)
             pca_dim: 可选 PCA 降维 (None = 不降维, 输出 K×D 维)
         """
         self.n_clusters = n_clusters
         self.token_dim = token_dim
+        self.norm_descs = norm_descs
         self.pca_dim = pca_dim
         self.vlad_dim = n_clusters * token_dim  # 32×768 = 24576
 
@@ -86,6 +95,12 @@ class VLADEncoder:
             print(f"[VLADEncoder] 学习聚类中心...")
             print(f"  Patch tokens: {N:,} × {D}d")
             print(f"  K-means clusters: {self.n_clusters}")
+            print(f"  norm_descs: {self.norm_descs}")
+
+        # ★ AnyLoc 关键步骤: L2 归一化 tokens
+        if self.norm_descs:
+            norms = np.linalg.norm(patch_tokens, axis=1, keepdims=True)
+            patch_tokens = patch_tokens / np.maximum(norms, 1e-8)
 
         # 采样 (如果 token 数量过大)
         if N > max_samples:
@@ -96,7 +111,7 @@ class VLADEncoder:
         else:
             tokens_sample = patch_tokens
 
-        # K-Means 聚类
+        # K-Means 聚类 (归一化后欧氏 ≈ 余弦)
         self.kmeans = MiniBatchKMeans(
             n_clusters=self.n_clusters,
             batch_size=min(4096, len(tokens_sample)),
@@ -125,6 +140,11 @@ class VLADEncoder:
 
         n_patches, D = patch_tokens.shape
         K = self.n_clusters
+
+        # ★ AnyLoc 关键步骤: L2 归一化 tokens
+        if self.norm_descs:
+            norms = np.linalg.norm(patch_tokens, axis=1, keepdims=True)
+            patch_tokens = patch_tokens / np.maximum(norms, 1e-8)
 
         # 1. 分配 patch tokens 到最近聚类
         assignments = self.kmeans.predict(patch_tokens)  # [n_patches]
@@ -176,6 +196,7 @@ class VLADEncoder:
             'n_clusters': self.n_clusters,
             'token_dim': self.token_dim,
             'vlad_dim': self.vlad_dim,
+            'norm_descs': self.norm_descs,
             'pca_dim': self.pca_dim,
         }
         with open(save_dir / 'vlad_config.json', 'w') as f:
@@ -192,6 +213,7 @@ class VLADEncoder:
         encoder = cls(
             n_clusters=config['n_clusters'],
             token_dim=config['token_dim'],
+            norm_descs=config.get('norm_descs', True),
             pca_dim=config.get('pca_dim'),
         )
         encoder.cluster_centers = np.load(save_dir / 'cluster_centers.npy')

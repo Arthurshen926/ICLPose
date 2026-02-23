@@ -11,6 +11,15 @@ from .pose_loss_c2f import (
     PoseLossMapFree,
 )
 
+# V3: Sequence Loss for iterative refinement
+from .sequence_loss import (
+    SequenceLoss,
+    PoseOnlySequenceLoss,
+    rotation_geodesic_loss,
+    translation_loss,
+    confidence_weighted_flow_loss,
+)
+
 __all__ = [
     'PoseLoss',
     'PoseLossKendall',
@@ -20,4 +29,10 @@ __all__ = [
     # C2F 损失函数
     'PoseLossC2F',
     'PoseLossMapFree',
+    # V3 Sequence Loss
+    'SequenceLoss',
+    'PoseOnlySequenceLoss',
+    'rotation_geodesic_loss',
+    'translation_loss',
+    'confidence_weighted_flow_loss',
 ]
