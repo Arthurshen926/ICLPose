@@ -26,10 +26,10 @@ import torch.nn.functional as F
 import numpy as np
 from typing import Optional, Dict, Tuple
 
-from gsplat import project_gaussians, rasterize_gaussians
+from gsplat import rasterization as gsplat_rasterization
 
 from feature_3dgs.gaussian_feature_model import GaussianFeatureModel
-from feature_3dgs.feature_renderer import FeatureRenderer
+from feature_3dgs.feature_renderer import FeatureRenderer, _build_K
 
 
 BLOCK_WIDTH = 16  # gsplat tile size
@@ -136,40 +136,29 @@ class Feature3DGSProvider:
         c2w = c2w.to(device)
         w2c = torch.inverse(c2w)  # (4, 4)
 
-        # ====== 1. 投影所有Gaussians（一次投影，复用到深度和特征渲染）======
-        means3d = self.gaussian_model.get_xyz         # (N_gs, 3)
-        scales = self.gaussian_model.get_scaling      # (N_gs, 3)
-        quats = self.gaussian_model.get_rotation      # (N_gs, 4)
-        opacities = self.gaussian_model.get_opacity   # (N_gs, 1)
-
-        (xys, depths, radii, conics,
-         compensation, num_tiles_hit, cov3d) = project_gaussians(
-            means3d=means3d,
-            scales=scales,
-            glob_scale=1.0,
-            quats=quats,
+        # ====== 1. 渲染深度图 (gsplat v1.5+ 内置depth模式) ======
+        depth_map = FeatureRenderer.render_depth(
+            gaussian_model=self.gaussian_model,
             viewmat=w2c,
             fx=fx, fy=fy,
             cx=cx, cy=cy,
             img_height=img_height,
             img_width=img_width,
-            block_width=BLOCK_WIDTH,
-        )
-
-        visible_mask = radii.squeeze(-1) > 0  # (N_gs,)
-
-        # ====== 2. 渲染深度图 ======
-        depth_map = self._render_depth(
-            xys, depths, radii, conics, num_tiles_hit,
-            opacities, img_height, img_width, device
         )  # (H, W)
 
-        # ====== 3. 渲染特征图 ======
-        feature_map = self._render_feature_map(
-            xys, depths, radii, conics, num_tiles_hit,
-            opacities, img_height, img_width, device,
-            norm_features
-        )  # (feature_dim, H, W)
+        # ====== 2. 渲染特征图 ======
+        feat_result = FeatureRenderer.render_features(
+            gaussian_model=self.gaussian_model,
+            viewmat=w2c,
+            fx=fx, fy=fy,
+            cx=cx, cy=cy,
+            img_height=img_height,
+            img_width=img_width,
+            norm_feat_before_render=norm_features,
+            norm_feat_after_render=norm_features,
+            max_channels_per_chunk=self.max_channels_per_chunk,
+        )
+        feature_map = feat_result['feature_map']  # (feature_dim, H, W)
 
         # ====== 4. 有效深度像素 → 采样 ======
         valid_depth = (depth_map > self.depth_min) & (depth_map < self.depth_max)
@@ -350,103 +339,46 @@ class Feature3DGSProvider:
 
     def _render_depth(
         self,
-        xys, depths, radii, conics, num_tiles_hit,
-        opacities, img_height, img_width, device,
+        w2c, fx, fy, cx, cy, img_height, img_width, device,
     ) -> torch.Tensor:
         """
-        将 Gaussian 的 camera-space z 作为颜色渲染深度图。
-        渲染结果是 alpha-blended 深度，接近真实表面深度。
+        渲染深度图 (gsplat v1.5+ 内置depth模式)。
 
         Returns:
             depth_map: (H, W) camera-space depth
         """
-        # 用 z (camera-space depth) 作为 per-gaussian 的 1D 颜色
-        depth_colors = depths.unsqueeze(-1)  # (N_gs, 1)
-        bg_depth = torch.zeros(1, device=device)
-
-        out = rasterize_gaussians(
-            xys=xys,
-            depths=depths,
-            radii=radii,
-            conics=conics,
-            num_tiles_hit=num_tiles_hit,
-            colors=depth_colors,
-            opacity=opacities.squeeze(-1),
+        return FeatureRenderer.render_depth(
+            gaussian_model=self.gaussian_model,
+            viewmat=w2c,
+            fx=fx, fy=fy,
+            cx=cx, cy=cy,
             img_height=img_height,
             img_width=img_width,
-            block_width=BLOCK_WIDTH,
-            background=bg_depth,
-            return_alpha=False,
         )
-
-        if isinstance(out, tuple):
-            rendered, _ = out
-        else:
-            rendered = out
-
-        # rendered: (H, W, 1) -> (H, W)
-        depth_map = rendered.squeeze(-1)
-        return depth_map
 
     def _render_feature_map(
         self,
-        xys, depths, radii, conics, num_tiles_hit,
-        opacities, img_height, img_width, device,
+        w2c, fx, fy, cx, cy, img_height, img_width, device,
         norm_features: bool = True,
     ) -> torch.Tensor:
         """
-        分块渲染 feature_dim 通道的特征图。
+        渲染特征图 (gsplat v1.5+ 内置channel_chunk)。
 
         Returns:
             feature_map: (feature_dim, H, W)
         """
-        if norm_features:
-            loc_features = self.gaussian_model.get_loc_feature  # L2-normalized (N, D)
-        else:
-            loc_features = self.gaussian_model._loc_feature
-
-        D = self.feature_dim
-        chunk_size = self.max_channels_per_chunk
-        n_chunks = (D + chunk_size - 1) // chunk_size
-
-        feature_chunks = []
-
-        for i in range(n_chunks):
-            c_start = i * chunk_size
-            c_end = min((i + 1) * chunk_size, D)
-            chunk_colors = loc_features[:, c_start:c_end]  # (N_gs, c_dim)
-            c_dim = c_end - c_start
-            bg = torch.zeros(c_dim, device=device)
-
-            out = rasterize_gaussians(
-                xys=xys,
-                depths=depths,
-                radii=radii,
-                conics=conics,
-                num_tiles_hit=num_tiles_hit,
-                colors=chunk_colors,
-                opacity=opacities.squeeze(-1),
-                img_height=img_height,
-                img_width=img_width,
-                block_width=BLOCK_WIDTH,
-                background=bg,
-                return_alpha=False,
-            )
-
-            if isinstance(out, tuple):
-                chunk_img, _ = out
-            else:
-                chunk_img = out
-
-            # (H, W, c_dim) -> (c_dim, H, W)
-            feature_chunks.append(chunk_img.permute(2, 0, 1))
-
-        feature_map = torch.cat(feature_chunks, dim=0)  # (D, H, W)
-
-        if norm_features:
-            feature_map = F.normalize(feature_map, p=2, dim=0)
-
-        return feature_map
+        result = FeatureRenderer.render_features(
+            gaussian_model=self.gaussian_model,
+            viewmat=w2c,
+            fx=fx, fy=fy,
+            cx=cx, cy=cy,
+            img_height=img_height,
+            img_width=img_width,
+            norm_feat_before_render=norm_features,
+            norm_feat_after_render=norm_features,
+            max_channels_per_chunk=self.max_channels_per_chunk,
+        )
+        return result['feature_map']
 
     def _sample_features_at_pixels(
         self,

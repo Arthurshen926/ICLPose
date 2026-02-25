@@ -221,7 +221,7 @@ class MultiScaleRenderer(nn.Module):
         return_depth: bool = True,
     ) -> Dict[str, torch.Tensor]:
         """
-        批量渲染 (逐帧循环，因为 gsplat 不支持真正的 batch rendering)
+        批量渲染 (利用gsplat v1.5+ 原生batch rendering，一次CUDA调用渲染多视角)
         
         Args:
             poses_w2c: (B, 4, 4) batch of w2c poses
@@ -237,24 +237,64 @@ class MultiScaleRenderer(nn.Module):
             scales = list(self.models.keys())
         
         B = poses_w2c.shape[0]
-        
-        # 收集每帧结果
-        batch_results = {f'{s}_feat': [] for s in scales}
-        if return_depth:
-            batch_results['depth_map'] = []
-        
-        for b in range(B):
-            r = self.render_all_scales(poses_w2c[b], scales, return_depth)
-            for s in scales:
-                batch_results[f'{s}_feat'].append(r[f'{s}_feat'])
-            if return_depth and 'depth_map' in r:
-                batch_results['depth_map'].append(r['depth_map'])
-        
-        # Stack
         out = {}
-        for key, vals in batch_results.items():
-            if vals:
-                out[key] = torch.stack(vals, dim=0)
+        
+        for name in scales:
+            model = self.models[name]
+            info = self.scale_info[name]
+            fH, fW = info['resolution']
+            
+            scale_x = fW / self.img_width
+            scale_y = fH / self.img_height
+            render_fx = self.fx * scale_x
+            render_fy = self.fy * scale_y
+            render_cx = self.cx * scale_x
+            render_cy = self.cy * scale_y
+            
+            result = FeatureRenderer.render_features_batch(
+                gaussian_model=model,
+                viewmats=poses_w2c,          # [B, 4, 4] — 原生batch!
+                fx=render_fx, fy=render_fy,
+                cx=render_cx, cy=render_cy,
+                img_height=fH,
+                img_width=fW,
+                feature_height=fH,
+                feature_width=fW,
+                norm_feat_before_render=True,
+                norm_feat_after_render=True,
+                max_channels_per_chunk=128,
+            )
+            
+            out[f'{name}_feat'] = result['feature_map']  # [B, D, fH, fW]
+        
+        if return_depth:
+            # 使用第一个模型渲染深度 (批量)
+            first_model = self.models[scales[0]]
+            from feature_3dgs.feature_renderer import _build_K
+            K = _build_K(self.depth_fx, self.depth_fy, 
+                        self.depth_cx, self.depth_cy, poses_w2c.device)
+            Ks = K.unsqueeze(0).expand(B, -1, -1)
+            
+            dummy_colors = torch.zeros(
+                first_model.get_xyz.shape[0], 1, device=poses_w2c.device)
+            
+            from gsplat import rasterization
+            render_colors, _, _ = rasterization(
+                means=first_model.get_xyz,
+                quats=first_model.get_rotation,
+                scales=first_model.get_scaling,
+                opacities=first_model.get_opacity.squeeze(-1),
+                colors=dummy_colors,
+                viewmats=poses_w2c,
+                Ks=Ks,
+                width=self.depth_W,
+                height=self.depth_H,
+                packed=True,
+                render_mode='D',
+                near_plane=0.01,
+                far_plane=1e5,
+            )
+            out['depth_map'] = render_colors[:, :, :, 0]  # [B, H, W]
         
         return out
     
@@ -264,54 +304,19 @@ class MultiScaleRenderer(nn.Module):
         pose_w2c: torch.Tensor,
     ) -> torch.Tensor:
         """
-        渲染深度图 (使用 camera-space z 作为 1D "颜色" 渲染)
+        渲染深度图 (使用 gsplat v1.5+ 内置深度渲染模式)
         
         Returns:
             (H, W) depth map
         """
-        from gsplat import project_gaussians, rasterize_gaussians
-        
-        means3d = model.get_xyz
-        scales = model.get_scaling
-        quats = model.get_rotation
-        opacities = model.get_opacity
-        
-        xys, depths, radii, conics, comp, num_tiles, cov3d = project_gaussians(
-            means3d=means3d,
-            scales=scales,
-            glob_scale=1.0,
-            quats=quats,
+        return FeatureRenderer.render_depth(
+            gaussian_model=model,
             viewmat=pose_w2c,
             fx=self.depth_fx, fy=self.depth_fy,
             cx=self.depth_cx, cy=self.depth_cy,
             img_height=self.depth_H,
             img_width=self.depth_W,
-            block_width=16,
         )
-        
-        # 用 camera-space z 作为单通道颜色
-        colors = depths.unsqueeze(-1)  # (N, 1)
-        bg = torch.zeros(1, device=means3d.device)
-        
-        result = rasterize_gaussians(
-            xys=xys, depths=depths, radii=radii,
-            conics=conics, num_tiles_hit=num_tiles,
-            colors=colors,
-            opacity=opacities.squeeze(-1),
-            img_height=self.depth_H,
-            img_width=self.depth_W,
-            block_width=16,
-            background=bg,
-            return_alpha=False,
-        )
-        
-        if isinstance(result, tuple):
-            depth_img = result[0]
-        else:
-            depth_img = result
-        
-        # (H, W, 1) → (H, W)
-        return depth_img.squeeze(-1)
     
     def get_scale_info(self) -> Dict[str, Dict]:
         """返回所有已加载尺度的信息"""
