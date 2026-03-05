@@ -7,3 +7,6 @@ reference/
 __pycache__/
 .venv/
 nohup.out
+models/segformer-b2-ade/
+plat import*
+*.log

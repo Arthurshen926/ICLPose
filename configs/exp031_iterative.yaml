@@ -1,0 +1,93 @@
+# ============================================================
+#  exp031_iterative.yaml
+#  Outer-Loop Iterative Refinement + All exp030 Improvements
+#  核心改进: 每步 3 次 render→forward→update pose, 逐步缩小残差
+# ============================================================
+
+exp_name: exp031_iterative
+output_dir: output/exp031_iterative
+
+# ── Model ──
+model:
+  hidden_dim: 128
+  decode_dim: 64
+  local_radius: 4
+  damping: 0.001
+  fine_iters: 4         # RAFT-style 内层 GRU 迭代 (fine scale)
+  # v1 特征分辨率
+  coarse_hw: [7, 10]
+  mid_hw: [15, 20]
+  fine_hw: [35, 46]
+
+# ── Renderer (3DGS) ──
+renderer:
+  ply_path: dataset/room_0/splatloc-test/data/room_0/point_cloud/final/point_cloud.ply
+  scale_model_paths:
+    coarse:    output/feature_3dgs/room_0_raw/coarse/best_model.pth
+    mid:       output/feature_3dgs/room_0_raw/mid/best_model.pth
+    fine_sd:   output/feature_3dgs/room_0_raw/fine_sd/best_model.pth
+    fine_dino: output/feature_3dgs/room_0_raw/fine_dino/best_model.pth
+  img_height: 480
+  img_width: 640
+  fx: 320.0
+  fy: 320.0
+  cx: 319.5
+  cy: 239.5
+
+# ── Data ──
+data:
+  train_feature_dir: output/features_multiscale/room_0
+  train_traj_path: dataset/room_0/Sequence_1/traj_w_c.txt
+  train_depth_dir: dataset/room_0/Sequence_1/depth
+
+  val_feature_dir: null
+  val_traj_path: dataset/room_0/Sequence_2/traj_w_c.txt
+  val_depth_dir: dataset/room_0/Sequence_2/depth
+  val_netvlad_poses: null
+  val_split_ratio: 0.1
+
+  noise_rot_deg: 8.0
+  noise_trans_m: 0.25
+  val_noise_rot_deg: 8.0
+  val_noise_trans_m: 0.25
+
+  batch_size: 4          # 降低 batch_size: 3 outer iters × rendering/forward
+  val_batch_size: 4
+  num_workers: 4
+
+# ── Training ──
+training:
+  epochs: 80             # 迭代训练收敛更快, 可少跑一些
+  phase1_epochs: 15      # Phase 1 缩短 (迭代精化从一开始就有效)
+  lr: 0.0001
+  min_lr: 0.000001
+  weight_decay: 0.00001
+  grad_clip: 1.0
+  use_amp: true
+
+  # 外层迭代精化
+  outer_iters: 3          # 训练时每步 3 次迭代重渲染
+  val_outer_iters: 5      # 验证时 5 次迭代 (更充分精化)
+
+  loss:
+    flow_weights:
+      coarse: 0.1
+      mid: 0.3
+      fine: 1.0
+    pose_weight: 1.0
+    rot_weight: 1.0
+    gamma: 0.8            # RAFT sequence loss (内层 fine GRU)
+    gamma_outer: 0.8      # 外层迭代 sequence loss 衰减
+
+  # 噪声课程学习
+  noise_curriculum:
+    enabled: true
+    warmup_epochs: 25     # 比 exp030 快一些 (迭代精化更鲁棒)
+    noise_rot_min: 2.0
+    noise_trans_min: 0.05
+
+  # Pose loss warmup
+  pose_warmup:
+    enabled: true
+    warmup_epochs: 10
+    min_weight: 0.01

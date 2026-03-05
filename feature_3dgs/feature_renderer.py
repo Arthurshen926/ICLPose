@@ -1,19 +1,20 @@
 """
-Feature Renderer (gsplat v1.0+)
-===============================
-使用gsplat v1.0+ 统一API进行可微分渲染。
-支持批量渲染 (多视角一次调用) 和手动分块渲染 (channel chunking)。
+Feature Renderer (gsplat v1.4+)
+================================
+使用gsplat v1.4+ 统一API进行可微分渲染。
+同时支持 3DGS (rasterization) 和 2DGS (rasterization_2dgs) 两种模式。
+渲染模式根据 GaussianFeatureModel.is_2dgs 自动选择。
 
-gsplat v1.0 API:
-  rasterization(means, quats, scales, opacities, colors, viewmats, Ks, ...)
-  返回: render_colors [C, H, W, D], render_alphas [C, H, W, 1], meta
+gsplat v1.4 API:
+  rasterization:      3DGS 椭球光栅化, 内置 channel_chunk
+  rasterization_2dgs: 2DGS surfel 光栅化 (ray-surfel intersection, 更精确的几何)
 
-注意: gsplat 1.0.0 没有内置 channel_chunk, 需要手动分块渲染高维特征。
+参考 STDLoc gaussian_renderer/__init__.py 的双模式渲染设计。
 """
 
 import torch
 import torch.nn.functional as F
-from gsplat import rasterization
+from gsplat import rasterization, rasterization_2dgs
 
 
 def _build_K(fx: float, fy: float, cx: float, cy: float, device: torch.device) -> torch.Tensor:
@@ -29,14 +30,16 @@ def _build_K(fx: float, fy: float, cx: float, cy: float, device: torch.device) -
 
 class FeatureRenderer:
     """
-    使用gsplat v1.0+进行特征图渲染。
+    使用gsplat v1.4+进行特征图渲染。
     
-    核心流程 (单次调用):
-      rasterization(means, quats, scales, opacities, colors, viewmats, Ks, ...)
+    自动根据 gaussian_model.is_2dgs 选择渲染器：
+      - 3DGS: gsplat.rasterization() — 椭球光栅化
+      - 2DGS: gsplat.rasterization_2dgs() — surfel 光栅化 (更精确的几何)
+    
     支持:
       - 批量渲染: viewmats [C, 4, 4] 一次渲染C个视角
-      - N-D特征: 手动channel chunking (gsplat 1.0.0不支持内置channel_chunk)
-      - 深度渲染: render_mode='D'
+      - N-D特征: 内置 channel_chunk (gsplat 1.4.0)
+      - 深度渲染: render_mode='D' (3DGS) 或 'RGB+ED' (2DGS)
     """
     
     DEFAULT_CHANNEL_CHUNK = 32  # gsplat CUDA shared memory限制
@@ -133,7 +136,7 @@ class FeatureRenderer:
         
         # --- Gaussian参数 ---
         means3d = gaussian_model.get_xyz          # [N, 3]
-        scales = gaussian_model.get_scaling        # [N, 3]
+        scales = gaussian_model.get_scaling_for_render  # [N, 3] (2DGS已pad)
         quats = gaussian_model.get_rotation        # [N, 4]
         opacities = gaussian_model.get_opacity.squeeze(-1)  # [N] (v1.x要求1D)
         
@@ -149,44 +152,66 @@ class FeatureRenderer:
         K = _build_K(fx, fy, cx, cy, device)
         Ks = K.unsqueeze(0).expand(C, -1, -1)  # [C, 3, 3]
         
-        # --- 分块渲染 (gsplat 1.0.0 不支持内置 channel_chunk) ---
-        chunk_size = max_channels_per_chunk
-        n_chunks = (D + chunk_size - 1) // chunk_size
+        # --- 渲染 ---
+        is_2dgs = getattr(gaussian_model, 'is_2dgs', False)
         
-        feature_chunks = []
-        alpha_out = None
-        
-        for i in range(n_chunks):
-            c_start = i * chunk_size
-            c_end = min((i + 1) * chunk_size, D)
-            chunk_colors = colors[:, c_start:c_end]  # [N, c_dim]
+        if is_2dgs:
+            # ---- 2DGS: 使用 rasterization_2dgs ----
+            # gsplat 1.4.0 的 rasterization_2dgs 不支持 channel_chunk，手动分块
+            chunk_size = max_channels_per_chunk
+            n_chunks = (D + chunk_size - 1) // chunk_size
             
-            render_colors, render_alphas, meta = rasterization(
+            feature_chunks = []
+            alpha_out = None
+            
+            for i in range(n_chunks):
+                c_start = i * chunk_size
+                c_end = min((i + 1) * chunk_size, D)
+                chunk_colors = colors[:, c_start:c_end]
+                
+                render_colors, render_alphas, _normals, _surf_normals, _distort, _median_depth, meta = (
+                    rasterization_2dgs(
+                        means=means3d,
+                        quats=quats,
+                        scales=scales,
+                        opacities=opacities,
+                        colors=chunk_colors,
+                        viewmats=viewmats,
+                        Ks=Ks,
+                        width=img_width,
+                        height=img_height,
+                        packed=False,
+                        near_plane=0.01,
+                        far_plane=1e5,
+                        render_mode='RGB',
+                    )
+                )
+                feature_chunks.append(render_colors)
+                if i == 0:
+                    alpha_out = render_alphas
+            
+            if n_chunks == 1:
+                feature_map_hwd = feature_chunks[0]
+            else:
+                feature_map_hwd = torch.cat(feature_chunks, dim=-1)
+        else:
+            # ---- 3DGS: 使用 rasterization (支持内置 channel_chunk) ----
+            feature_map_hwd, alpha_out, meta = rasterization(
                 means=means3d,
                 quats=quats,
                 scales=scales,
                 opacities=opacities,
-                colors=chunk_colors,        # [N, c_dim]
-                viewmats=viewmats,          # [C, 4, 4]
-                Ks=Ks,                      # [C, 3, 3]
+                colors=colors,
+                viewmats=viewmats,
+                Ks=Ks,
                 width=img_width,
                 height=img_height,
                 packed=True,
                 render_mode='RGB',
                 near_plane=0.01,
                 far_plane=1e5,
+                channel_chunk=max_channels_per_chunk,
             )
-            # render_colors: [C, H, W, c_dim]
-            feature_chunks.append(render_colors)
-            
-            if i == 0:
-                alpha_out = render_alphas  # [C, H, W, 1]
-        
-        # 拼接所有chunks: [C, H, W, D]
-        if n_chunks == 1:
-            feature_map_hwd = feature_chunks[0]
-        else:
-            feature_map_hwd = torch.cat(feature_chunks, dim=-1)
         
         # [C, H, W, D] -> [C, D, H, W]
         feature_map = feature_map_hwd.permute(0, 3, 1, 2)
@@ -228,7 +253,7 @@ class FeatureRenderer:
         """
         device = gaussian_model.get_xyz.device
         means3d = gaussian_model.get_xyz
-        scales = gaussian_model.get_scaling
+        scales = gaussian_model.get_scaling_for_render  # [N, 3]
         quats = gaussian_model.get_rotation
         opacities = gaussian_model.get_opacity.squeeze(-1)  # [N]
         
@@ -242,20 +267,40 @@ class FeatureRenderer:
         viewmats = viewmat.unsqueeze(0)  # [1, 4, 4]
         background = torch.ones(3, device=device)
         
-        render_colors, render_alphas, meta = rasterization(
-            means=means3d,
-            quats=quats,
-            scales=scales,
-            opacities=opacities,
-            colors=colors,
-            viewmats=viewmats,
-            Ks=Ks,
-            width=img_width,
-            height=img_height,
-            packed=True,
-            backgrounds=background.unsqueeze(0),  # [1, 3]
-            render_mode='RGB',
-        )
+        is_2dgs = getattr(gaussian_model, 'is_2dgs', False)
+        
+        if is_2dgs:
+            render_colors, render_alphas, _n, _sn, _d, _md, meta = (
+                rasterization_2dgs(
+                    means=means3d,
+                    quats=quats,
+                    scales=scales,
+                    opacities=opacities,
+                    colors=colors,
+                    viewmats=viewmats,
+                    Ks=Ks,
+                    width=img_width,
+                    height=img_height,
+                    packed=False,
+                    backgrounds=background.unsqueeze(0),  # [1, 3]
+                    render_mode='RGB',
+                )
+            )
+        else:
+            render_colors, render_alphas, meta = rasterization(
+                means=means3d,
+                quats=quats,
+                scales=scales,
+                opacities=opacities,
+                colors=colors,
+                viewmats=viewmats,
+                Ks=Ks,
+                width=img_width,
+                height=img_height,
+                packed=True,
+                backgrounds=background.unsqueeze(0),  # [1, 3]
+                render_mode='RGB',
+            )
         # render_colors: [1, H, W, 3], render_alphas: [1, H, W, 1]
         
         rgb = render_colors[0].permute(2, 0, 1)       # [3, H, W]
@@ -275,39 +320,71 @@ class FeatureRenderer:
         img_height: int, img_width: int,
     ) -> torch.Tensor:
         """
-        渲染深度图 (使用gsplat内置的depth渲染模式)。
+        渲染深度图。
+        - 3DGS: render_mode='D' (alpha-blended expected depth)
+        - 2DGS: render_mode='RGB+ED' → 取第4通道 (expected depth from surfel intersection)
         
         Returns:
-            (H, W) depth map (accumulated z-depth)
+            (H, W) depth map
         """
         device = gaussian_model.get_xyz.device
         means3d = gaussian_model.get_xyz
-        scales = gaussian_model.get_scaling
+        scales = gaussian_model.get_scaling_for_render  # [N, 3]
         quats = gaussian_model.get_rotation
         opacities = gaussian_model.get_opacity.squeeze(-1)
-        
-        # 深度渲染模式需要colors占位 (不参与运算，但API要求)
-        # 使用1通道假颜色即可
-        dummy_colors = torch.zeros(means3d.shape[0], 1, device=device)
         
         K = _build_K(fx, fy, cx, cy, device)
         Ks = K.unsqueeze(0)
         viewmats = viewmat.unsqueeze(0)
         
-        render_colors, render_alphas, meta = rasterization(
-            means=means3d,
-            quats=quats,
-            scales=scales,
-            opacities=opacities,
-            colors=dummy_colors,
-            viewmats=viewmats,
-            Ks=Ks,
-            width=img_width,
-            height=img_height,
-            packed=True,
-            render_mode='D',      # 直接渲染深度
-            near_plane=0.01,
-            far_plane=1e5,
-        )
-        # render_colors: [1, H, W, 1] (depth)
-        return render_colors[0, :, :, 0]  # [H, W]
+        is_2dgs = getattr(gaussian_model, 'is_2dgs', False)
+        
+        if is_2dgs:
+            # 2DGS: rasterization_2dgs 使用 'RGB+ED' 模式获取深度
+            # 需要真实颜色维度，使用 SH DC
+            C0 = 0.28209479177387814
+            colors = gaussian_model._features_dc * C0 + 0.5
+            colors = torch.clamp(colors, 0.0, 1.0)
+            
+            bg_color = torch.zeros(4, device=device)  # RGBA=0 background
+            render_colors, _alphas, _n, _sn, _d, _md, meta = (
+                rasterization_2dgs(
+                    means=means3d,
+                    quats=quats,
+                    scales=scales,
+                    opacities=opacities,
+                    colors=colors,
+                    viewmats=viewmats,
+                    Ks=Ks,
+                    width=img_width,
+                    height=img_height,
+                    packed=False,
+                    backgrounds=bg_color.unsqueeze(0),
+                    render_mode='RGB+ED',
+                    near_plane=0.01,
+                    far_plane=1e5,
+                )
+            )
+            # render_colors: [1, H, W, 4] (RGB + expected_depth)
+            return render_colors[0, :, :, 3]  # [H, W] depth
+        else:
+            # 3DGS: 使用内置 depth 渲染模式
+            dummy_colors = torch.zeros(means3d.shape[0], 1, device=device)
+            
+            render_colors, render_alphas, meta = rasterization(
+                means=means3d,
+                quats=quats,
+                scales=scales,
+                opacities=opacities,
+                colors=dummy_colors,
+                viewmats=viewmats,
+                Ks=Ks,
+                width=img_width,
+                height=img_height,
+                packed=True,
+                render_mode='D',
+                near_plane=0.01,
+                far_plane=1e5,
+            )
+            # render_colors: [1, H, W, 1] (depth)
+            return render_colors[0, :, :, 0]  # [H, W]

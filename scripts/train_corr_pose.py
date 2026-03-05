@@ -35,6 +35,7 @@ import time
 from torch.utils.data import DataLoader
 from ic_models.corr_pose_net import CorrPoseNet
 from data.dataset_v3 import PoseDatasetV3, collate_v3
+from data.dataset_sim import SimPoseDataset, MixedPoseDataset
 from modules.multiscale_renderer import MultiScaleRenderer
 from modules.lie_algebra import se3_log, pose_inverse, compute_gt_flow
 
@@ -49,6 +50,11 @@ DEFAULT_FEATURE_MODEL = 'output/feature_3dgs/room_0_raw/fine_dino/best_model.pth
 DEFAULT_FEATURE_DIR = 'output/features_multiscale/room_0'
 DEFAULT_TRAJ = 'dataset/room_0/Sequence_1/traj_w_c.txt'
 DEFAULT_DEPTH_DIR = 'dataset/room_0/Sequence_1/depth'
+
+# Seq2 (independent test set)
+SEQ2_FEATURE_DIR = 'output/features_multiscale/room_0_seq2'
+SEQ2_TRAJ = 'dataset/room_0/Sequence_2/traj_w_c.txt'
+SEQ2_DEPTH_DIR = 'dataset/room_0/Sequence_2/depth'
 
 # Intrinsics at feature resolution 35×46
 # fx = 320 * (46/640), fy = 320 * (35/480), etc.
@@ -256,7 +262,7 @@ def train(args):
     # --- Dataset ---
     feat_dim = FEAT_DIM.get(args.scale, 768)
     
-    train_dataset = PoseDatasetV3(
+    real_dataset = PoseDatasetV3(
         feature_base_dir=args.feature_dir,
         traj_path=args.traj_path,
         depth_dir=args.depth_dir,
@@ -267,6 +273,26 @@ def train(args):
         is_train=True,
         depth_resize=(35, 46),
     )
+    
+    # --- Sim Data (可选) ---
+    if args.sim_data_dir and os.path.isdir(args.sim_data_dir):
+        sim_dataset = SimPoseDataset(
+            sim_data_dir=args.sim_data_dir,
+            scale_names=[args.scale],
+            noise_rot_deg=args.noise_rot_deg,
+            noise_trans_m=args.noise_rot_deg / 50.0,
+            max_samples=args.sim_max_samples,
+        )
+        train_dataset = MixedPoseDataset(
+            real_dataset=real_dataset,
+            sim_dataset=sim_dataset,
+            real_ratio=args.real_ratio,
+            epoch_size=args.sim_epoch_size,
+        )
+        use_sim = True
+    else:
+        train_dataset = real_dataset
+        use_sim = False
     
     val_dataset = PoseDatasetV3(
         feature_base_dir=args.feature_dir,
@@ -289,7 +315,9 @@ def train(args):
         drop_last=True,
         pin_memory=True,
     )
-    print(f"  Train: {len(train_dataset)} frames, Val: {len(val_dataset)} frames")
+    print(f"  Train: {len(train_dataset)} samples"
+          f"{f' (real={len(real_dataset)} + sim={len(sim_dataset)}, ratio={args.real_ratio:.0%})' if use_sim else ''}"
+          f", Val: {len(val_dataset)} frames")
     print(f"  Noise: rot={args.noise_rot_deg}°, trans={args.noise_rot_deg/50:.3f}m")
     
     # --- Network ---
@@ -303,7 +331,15 @@ def train(args):
         use_multiscale=args.use_multiscale,
         coarse_iters=args.coarse_iters,
         coarse_scale_factor=args.coarse_scale_factor,
+        use_upsampler=args.use_upsampler,
+        upsample_dim=args.upsample_dim,
+        upsample_scale=args.upsample_scale,
+        upsample_after_iter=args.upsample_after_iter,
+        use_motion_input=args.use_motion_input,
+        use_flow_init=args.use_flow_init,
+        learnable_damping=args.learnable_damping,
     ).to(device)
+    net.render_chunk_size = args.render_chunk_size
     print(f"\n{net}\n")
     
     # --- Optimizer ---
@@ -316,11 +352,32 @@ def train(args):
     
     # --- Resume ---
     start_epoch = 0
+    best_val_error_resume = None
     if args.resume and os.path.exists(args.resume):
         ckpt = torch.load(args.resume, map_location=device)
-        net.load_state_dict(ckpt['model_state_dict'])
-        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-        start_epoch = ckpt.get('epoch', 0)
+        # Always use strict=False to handle architecture changes between experiments
+        # (e.g. adding/removing upsampler, motion_encoder, etc.)
+        missing, unexpected = net.load_state_dict(ckpt['model_state_dict'], strict=False)
+        if missing:
+            print(f"  Missing keys (will be randomly initialized): {list(set(k.split('.')[0] for k in missing))}")
+        if unexpected:
+            print(f"  Unexpected keys (ignored): {list(set(k.split('.')[0] for k in unexpected))}")
+        if 'optimizer_state_dict' in ckpt:
+            optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        if 'scheduler_state_dict' in ckpt:
+            scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+        # 仅当有 optimizer state 时恢复 epoch (完整 checkpoint)
+        # best_model.pth 没有 optimizer state, 视为 fine-tune, epoch 从 0 开始
+        if 'optimizer_state_dict' in ckpt:
+            start_epoch = ckpt.get('epoch', 0)
+        else:
+            print(f"  Fine-tune mode: epoch restarted from 0 (loaded weights from epoch {ckpt.get('epoch', '?')})")
+        # 尝试从 best_model 恢复 best val error
+        best_model_path = os.path.join(args.output_dir, 'best_model.pth')
+        if os.path.exists(best_model_path):
+            best_ckpt = torch.load(best_model_path, map_location='cpu')
+            best_val_error_resume = best_ckpt.get('val_rot_median', None)
+            print(f"  Best val so far: {best_val_error_resume:.2f}°")
         print(f"Resumed from {args.resume} (epoch {start_epoch})")
     
     # --- Output directory ---
@@ -337,7 +394,7 @@ def train(args):
     log(f"Params: {net.num_parameters():,}")
     log("=" * 70)
     
-    best_val_error = float('inf')
+    best_val_error = best_val_error_resume if best_val_error_resume is not None else float('inf')
     
     # ================================================================
     # Training loop
@@ -347,8 +404,18 @@ def train(args):
         current_noise = get_noise_for_epoch(epoch)
         current_trans_noise = current_noise / 50.0
         if curriculum_schedule is not None:
-            train_dataset.noise_rot_deg = current_noise
-            train_dataset.noise_trans_m = current_trans_noise
+            if use_sim:
+                train_dataset.real_dataset.noise_rot_deg = current_noise
+                train_dataset.real_dataset.noise_trans_m = current_trans_noise
+                train_dataset.sim_dataset.noise_rot_deg = current_noise
+                train_dataset.sim_dataset.noise_trans_m = current_trans_noise
+            else:
+                train_dataset.noise_rot_deg = current_noise
+                train_dataset.noise_trans_m = current_trans_noise
+        
+        # 仿真混合数据集: 每 epoch 重新采样
+        if use_sim:
+            train_dataset.resample_epoch()
         
         net.train()
         epoch_stats = {
@@ -383,14 +450,51 @@ def train(args):
             # Optional: linearized flow supervision
             if args.flow_loss_weight > 0 and depth is not None:
                 from modules.featuremetric import compute_image_jacobian
-                Ju, Jv, valid = compute_image_jacobian(depth, INTRINSICS)
+                # Compute Jacobian at standard resolution
+                Ju_std, Jv_std, valid_std = compute_image_jacobian(depth, INTRINSICS)
                 
-                flow_loss = linearized_flow_loss_fn(
-                    results['flows'], results['confidences'],
-                    results['poses'], pose_gt,
-                    Ju, Jv, valid,
-                    gamma=args.gamma,
-                )
+                # For upsampler mode, also compute Jacobian at upsampled resolution
+                if args.use_upsampler:
+                    s = args.upsample_scale
+                    up_depth = F.interpolate(
+                        depth.unsqueeze(1), size=(35 * s, 46 * s), mode='nearest'
+                    ).squeeze(1)
+                    up_intr = {k: v * s for k, v in INTRINSICS.items()}
+                    Ju_up, Jv_up, valid_up = compute_image_jacobian(up_depth, up_intr)
+                    
+                    # Split flows by resolution: first upsample_after_iter at std, rest at upsampled
+                    aft = args.upsample_after_iter
+                    std_flows = results['flows'][:aft]
+                    std_confs = results['confidences'][:aft]
+                    up_flows = results['flows'][aft:]
+                    up_confs = results['confidences'][aft:]
+                    
+                    flow_loss = torch.tensor(0.0, device=device)
+                    if std_flows:
+                        flow_loss = flow_loss + linearized_flow_loss_fn(
+                            std_flows, std_confs,
+                            results['poses'][:aft+1], pose_gt,
+                            Ju_std, Jv_std, valid_std,
+                            gamma=args.gamma,
+                        )
+                    if up_flows:
+                        # Shift poses to match upsampled iterations
+                        up_poses = results['poses'][aft:]
+                        flow_loss = flow_loss + linearized_flow_loss_fn(
+                            up_flows, up_confs,
+                            up_poses, pose_gt,
+                            Ju_up, Jv_up, valid_up,
+                            gamma=args.gamma,
+                        )
+                else:
+                    Ju, Jv, valid = Ju_std, Jv_std, valid_std
+                    
+                    flow_loss = linearized_flow_loss_fn(
+                        results['flows'], results['confidences'],
+                        results['poses'], pose_gt,
+                        Ju, Jv, valid,
+                        gamma=args.gamma,
+                    )
                 loss = loss + args.flow_loss_weight * flow_loss
             
             # Backward with gradient accumulation
@@ -469,6 +573,33 @@ def train(args):
                 }, save_path)
                 log(f"  → Best model saved (val_rot={val_results['rot_median']:.2f}°)")
         
+        # --- Seq2 Periodic Evaluation ---
+        if args.seq2_val_every > 0 and (epoch + 1) % args.seq2_val_every == 0:
+            seq2_feature_dir = SEQ2_FEATURE_DIR
+            seq2_traj = SEQ2_TRAJ
+            seq2_depth_dir = SEQ2_DEPTH_DIR
+            if os.path.isdir(seq2_feature_dir) and os.path.exists(seq2_traj):
+                seq2_dataset = PoseDatasetV3(
+                    feature_base_dir=seq2_feature_dir,
+                    traj_path=seq2_traj,
+                    depth_dir=seq2_depth_dir,
+                    frame_indices=list(range(0, 900)),
+                    scale_names=[args.scale],
+                    noise_rot_deg=args.noise_rot_deg,
+                    noise_trans_m=args.noise_rot_deg / 50.0,
+                    is_train=True,
+                    depth_resize=(35, 46),
+                )
+                seq2_results = validate(net, seq2_dataset, renderer, device, args)
+                log(f"  Seq2:  rot: {seq2_results['rot_init']:.1f}° → "
+                    f"{seq2_results['rot_median']:.2f}° "
+                    f"(mean {seq2_results['rot_mean']:.2f}°)  "
+                    f"<1°={seq2_results['pct_1deg']:.1f}%  "
+                    f"<5°={seq2_results['pct_5deg']:.1f}%  "
+                    f"trans={seq2_results['trans_median']:.4f}m")
+            else:
+                log(f"  Seq2 data not found, skipping.")
+
         # --- Checkpoint ---
         if (epoch + 1) % args.save_every == 0:
             save_path = os.path.join(args.output_dir, f'checkpoint_{epoch+1}.pth')
@@ -566,6 +697,8 @@ if __name__ == '__main__':
     g.add_argument('--depth_dir', default=DEFAULT_DEPTH_DIR)
     g.add_argument('--output_dir', default='output/corr_pose_net/room_0')
     g.add_argument('--resume', default=None, help='Resume from checkpoint')
+    g.add_argument('--sim_data_dir', default=None,
+                   help='仿真训练数据目录 (generate_sim_training_data.py 输出)')
     
     # --- Architecture ---
     g = parser.add_argument_group('Architecture')
@@ -587,6 +720,22 @@ if __name__ == '__main__':
                    help='Number of coarse-scale iterations (only with --use_multiscale)')
     g.add_argument('--coarse_scale_factor', type=float, default=0.5,
                    help='Coarse downscale factor (0.5 → 18×23 from 35×46)')
+    g.add_argument('--render_chunk_size', type=int, default=128,
+                   help='gsplat channel chunk size (768/128=6 chunks; 256→3 chunks, faster)')
+    g.add_argument('--use_upsampler', action='store_true',
+                   help='Enable PoseAwareUpsampler for translation accuracy improvement')
+    g.add_argument('--upsample_dim', type=int, default=64,
+                   help='Upsampler output feature dimension (64 recommended)')
+    g.add_argument('--upsample_scale', type=int, default=4, choices=[1, 2, 4],
+                   help='Spatial upsample factor (4 → 140×184, 2 → 70×92)')
+    g.add_argument('--upsample_after_iter', type=int, default=2,
+                   help='Switch to upsampled resolution after this iteration (coarse-to-fine)')
+    g.add_argument('--use_motion_input', action='store_true',
+                   help='Inject depth + flow feedback into GRU (exp013: 3D geometry awareness)')
+    g.add_argument('--use_flow_init', action='store_true',
+                   help='Soft-argmax flow initialization from correlation peak (exp015)')
+    g.add_argument('--learnable_damping', action='store_true',
+                   help='Per-iteration learnable LM damping (exp015)')
     
     # --- Training ---
     g = parser.add_argument_group('Training')
@@ -611,6 +760,12 @@ if __name__ == '__main__':
                         'e.g. "0:5,50:10,100:15" → epoch 0-49 用5°, 50-99 用10°, 100+ 用15°')
     g.add_argument('--num_workers', type=int, default=2)
     g.add_argument('--seed', type=int, default=42)
+    g.add_argument('--real_ratio', type=float, default=0.3,
+                   help='真实数据比例 (仅 --sim_data_dir 有效)')
+    g.add_argument('--sim_max_samples', type=int, default=None,
+                   help='仿真数据最大使用量')
+    g.add_argument('--sim_epoch_size', type=int, default=None,
+                   help='混合训练每 epoch 总样本数 (None=real+sim)')
     
     # --- Logging ---
     g = parser.add_argument_group('Logging')
@@ -620,6 +775,8 @@ if __name__ == '__main__':
                    help='Validate every N epochs')
     g.add_argument('--save_every', type=int, default=10,
                    help='Save checkpoint every N epochs')
+    g.add_argument('--seq2_val_every', type=int, default=20,
+                   help='Evaluate on Seq2 test set every N epochs (0=disabled)')
     
     args = parser.parse_args()
     

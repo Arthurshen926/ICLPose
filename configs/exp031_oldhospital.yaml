@@ -1,0 +1,117 @@
+# Cambridge Landmarks OldHospital 场景训练配置
+# ===============================================
+# 数据集: Cambridge Landmarks / OldHospital (室外, 1920×1080)
+# 相机: 单焦距相机, fx=fy=1673.27, cx=960, cy=540
+# 将 Cambridge 转换到项目格式后使用本配置：
+#   python scripts/data_prep/convert_cambridge.py \
+#       --src /home/yons/Projects/ICLPose/dataset/OldHospital \
+#       --dst /home/yons/Projects/ICLPose/dataset/cambridge_OldHospital
+#
+# 然后运行训练：
+#   python train_v3.py --config configs/exp031_oldhospital.yaml
+#
+# 注意：OldHospital 是室外大场景，场景边界、噪声参数与室内场景不同。
+
+seed: 42
+
+output_dir: "/home/yons/Projects/ICLPose/output/corr_pose/exp031_oldhospital"
+
+# ── SplatLoc / Feature-3DGS 预训练模型 ──
+# 需要先用 2DGS (https://github.com/hbb1/2d-gaussian-splatting) 对 OldHospital 重建，
+# 再用 feature_3dgs 嵌入特征。详见 scripts/data_prep/README_3dgs.md
+# 一键重建: bash scripts/data_prep/run_2dgs.sh oldhospital 1
+splatloc:
+  gaussians_path: "/home/yons/Projects/ICLPose/dataset/cambridge_OldHospital/gaussian_splatting/point_cloud/final/point_cloud.ply"
+  decoder_path:   "/home/yons/Projects/ICLPose/output/feature_3dgs/oldhospital/fused_feature/checkpoint_best.pth"
+  config_path:    null
+  freeze_decoder: true
+
+# 室外大场景，边界更大；运行 scripts/data_prep/compute_scene_bound.py 自动计算
+scene:
+  bound: [[-20.0, 20.0], [-5.0, 5.0], [-5.0, 25.0]]
+  voxel_sdf: 0.15   # 室外场景体素稍大
+
+decoder:
+  enc: 'HashGrid'
+  num_layers: 4
+  hidden_dim: 128
+  final_dim: 256
+
+model:
+  feature_dim: 256
+  num_queries: 64
+  fusion_layers: 2
+  num_heads: 8
+  dropout: 0.1
+
+# ── 数据集配置 ──
+dataset:
+  data_root: "/home/yons/Projects/ICLPose/dataset/cambridge_OldHospital"
+
+  train_scene: "train"
+  val_scene:   "test"
+
+  train_step: 5   # 室外图像数量大，每 5 帧采 1 帧
+  val_step:   1
+  max_train_samples: null
+  max_val_samples:   null
+
+  gaussian_path: "/home/yons/Projects/ICLPose/dataset/cambridge_OldHospital/gaussian_splatting/point_cloud/final/point_cloud.ply"
+
+  use_depth: false  # Cambridge 无深度图
+
+  # 室外场景位移更大，噪声范围加大
+  pose_noise_rot_deg:   8.0
+  pose_noise_trans_m:   0.5
+
+  # ── Cambridge OldHospital 相机内参 ──
+  # NVM focal = ~1673.27 for 1920×1080
+  # 注意：如需缩放图像，要相应更新 fx/fy/cx/cy
+  image_size: [1920, 1080]
+  fx: 1673.27
+  fy: 1673.27
+  cx: 960.0
+  cy: 540.0
+
+loss:
+  use_relative_pose:    true
+  normalize_translation: true   # 室外大场景建议归一化平移
+  use_kendall:          true
+  init_log_var_rotation:    0.0
+  init_log_var_translation: -1.0
+  rotation_loss:    'geodesic'
+  translation_loss: 'l2'
+  rotation_weight:    1.0
+  translation_weight: 1.0
+  diversity_weight:   0.05
+  diversity_margin_2d: 32.0    # 室外图像分辨率大，margin 相应加大
+  diversity_margin_3d: 0.50    # 室外场景尺度更大
+  reprojection_weight: 0.1
+
+training:
+  num_epochs: 500
+  batch_size: 16    # 1080p 图像更大，适当减小 batch size
+  val_batch_size: 8
+  num_workers: 8
+  optimizer: 'adamw'
+  learning_rate: 1.0e-4
+  decoder_lr:    1.0e-5
+  weight_decay:  1.0e-4
+  grad_clip: 5.0
+  scheduler: 'cosine'
+  min_lr: 1.0e-6
+  lr_decay_step: 10
+  lr_decay_gamma: 0.5
+  val_interval: 2
+  save_interval: 10
+  log_interval: 10
+
+visualization:
+  enable: true
+  vis_interval: 5
+  num_samples: 3
+  vis_types:
+    pose_prediction:   true
+    feature_similarity: true
+    correspondence:    true
+    query_evolution:   false

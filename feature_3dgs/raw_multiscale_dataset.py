@@ -33,6 +33,15 @@ RAW_SCALE_CONFIGS = {
     'coarse':    {'dim': 1280, 'subdir': 'coarse',    'resolution': (7, 10)},
 }
 
+# v2: SD 保留 UNet 零填充后的原生分辨率, 形成干净的 2× 层级
+# coarse 8×10 → mid 16×20 → fine_sd 32×40, DINO 独立 35×46
+RAW_SCALE_CONFIGS_V2 = {
+    'fine_sd':   {'dim': 640,  'subdir': 'sd_s3',  'resolution': (32, 40)},
+    'fine_dino': {'dim': 768,  'subdir': 'dino',   'resolution': (35, 46)},
+    'mid':       {'dim': 1280, 'subdir': 'sd_s4',  'resolution': (16, 20)},
+    'coarse':    {'dim': 1280, 'subdir': 'sd_s5',  'resolution': (8, 10)},
+}
+
 
 class RawScaleFeatureDataset(Dataset):
     """

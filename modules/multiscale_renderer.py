@@ -50,6 +50,14 @@ class MultiScaleRenderer(nn.Module):
         'fine_dino': (35, 46),
     }
     
+    # v2: SD 保留 UNet 零填充后的原生分辨率, 2× 层级
+    SCALE_RESOLUTIONS_V2 = {
+        'coarse': (8, 10),
+        'mid': (16, 20),
+        'fine_sd': (32, 40),
+        'fine_dino': (35, 46),
+    }
+    
     def __init__(
         self,
         ply_path: str,

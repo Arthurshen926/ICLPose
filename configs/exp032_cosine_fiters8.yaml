@@ -1,0 +1,100 @@
+# ============================================================
+#  exp032_cosine_fiters8.yaml
+#  在 exp031 基础上的关键优化:
+#   1. cosine 旋转损失 (1-cos(θ), 替代 acos — 消除梯度爆炸)
+#   2. fine_iters=8 (RAFT GRU 迭代从 4→8, 提升 sub-pixel flow 精度)
+#   3. warmstart from exp031 best checkpoint (跳过初期学习)
+#   4. 修正验证指标 (clamp 1e-7, 消除 0.81° 假底)
+#   5. 更慢噪声课程 + 更早 Phase2 (基于 exp031 E6-E10 性能回落分析)
+#      exp031 在 noise>4° 时 <1% 从 88.9% 跌到 83.3%
+#      Phase2 pose loss 尽早引入可稳定高噪声适应
+# ============================================================
+
+exp_name: exp032_cosine_fiters8
+output_dir: output/exp032_cosine_fiters8
+
+# ── Model ──
+model:
+  hidden_dim: 128
+  decode_dim: 64
+  local_radius: 4
+  damping: 0.001
+  fine_iters: 8          # 从 4 增到 8: RAFT 论文验证更多迭代 → 更精确 flow
+  coarse_hw: [7, 10]
+  mid_hw: [15, 20]
+  fine_hw: [35, 46]
+
+# ── Renderer (3DGS) ──
+renderer:
+  ply_path: dataset/room_0/splatloc-test/data/room_0/point_cloud/final/point_cloud.ply
+  scale_model_paths:
+    coarse:    output/feature_3dgs/room_0_raw/coarse/best_model.pth
+    mid:       output/feature_3dgs/room_0_raw/mid/best_model.pth
+    fine_sd:   output/feature_3dgs/room_0_raw/fine_sd/best_model.pth
+    fine_dino: output/feature_3dgs/room_0_raw/fine_dino/best_model.pth
+  img_height: 480
+  img_width: 640
+  fx: 320.0
+  fy: 320.0
+  cx: 319.5
+  cy: 239.5
+
+# ── Data ──
+data:
+  train_feature_dir: output/features_multiscale/room_0
+  train_traj_path: dataset/room_0/Sequence_1/traj_w_c.txt
+  train_depth_dir: dataset/room_0/Sequence_1/depth
+
+  val_feature_dir: null
+  val_traj_path: dataset/room_0/Sequence_2/traj_w_c.txt
+  val_depth_dir: dataset/room_0/Sequence_2/depth
+  val_netvlad_poses: null
+  val_split_ratio: 0.1
+
+  noise_rot_deg: 8.0
+  noise_trans_m: 0.25
+  val_noise_rot_deg: 8.0
+  val_noise_trans_m: 0.25
+
+  batch_size: 4
+  val_batch_size: 4
+  num_workers: 4
+
+# ── Training ──
+training:
+  epochs: 60             # warmstart -> fewer epochs needed
+  phase1_epochs: 3       # ★ exp031 showed Phase1=15 too long; early pose loss helps high-noise adaptation
+  lr: 0.00005            # lower lr (warmstart, fine-tuning)
+  min_lr: 0.000001
+  weight_decay: 0.00001
+  grad_clip: 1.0
+  use_amp: true
+
+  # 外层迭代精化
+  outer_iters: 3
+  val_outer_iters: 5
+
+  loss:
+    flow_weights:
+      coarse: 0.1
+      mid: 0.3
+      fine: 1.0
+    pose_weight: 1.0
+    rot_weight: 1.0       # cosine loss: 1-cos(theta), same scale as CorrPoseNet
+    trans_weight: 10.0     # ★ CorrPoseNet uses trans_weight=10, match it
+    rot_loss_type: cosine  # ★ Key: 1-cos(theta) replaces acos(theta)
+    gamma: 0.8             # RAFT sequence loss (内层 fine GRU)
+    gamma_outer: 0.8       # 外层迭代 sequence loss
+
+  # Noise curriculum - ★ MUCH SLOWER than exp031 (exp031 peaked at noise=3.5 then dropped)
+  noise_curriculum:
+    enabled: true
+    warmup_epochs: 40      # exp031 used 25 -> too fast; 40 epochs for gradual adaptation
+    noise_rot_min: 2.0     # start from 2 deg (warmstart model handles 3-4 well)
+    noise_trans_min: 0.05
+
+  # Pose loss warmup
+  pose_warmup:
+    enabled: true
+    warmup_epochs: 8       # gradual ramp up over 8 epochs after Phase1
+    min_weight: 0.1        # start at 10% of full pose weight

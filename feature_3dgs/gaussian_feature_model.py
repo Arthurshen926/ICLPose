@@ -15,18 +15,20 @@ from plyfile import PlyData, PlyElement
 
 class GaussianFeatureModel(nn.Module):
     """
-    带特征嵌入的3DGS模型。
+    带特征嵌入的3DGS/2DGS模型。
     
     冻结几何参数 (xyz, rotation, scaling, opacity, SH)，
     仅优化每个Gaussian的特征嵌入向量。
+    支持 3DGS (3 scales) 和 2DGS (2 scales, surfel) 两种模式。
     
     Attributes:
         _xyz: [N, 3] Gaussian中心位置 (frozen)
         _rotation: [N, 4] 旋转四元数 (frozen)
-        _scaling: [N, 3] 缩放 log空间 (frozen)
+        _scaling: [N, 2或3] 缩放 log空间 (frozen, 2DGS为2维)
         _opacity: [N, 1] 不透明度 logit空间 (frozen)
         _features_dc: [N, 1, 3] SH DC系数 (frozen)
         _loc_feature: [N, D] 可学习的特征嵌入 (trainable)
+        is_2dgs: bool, 是否为2DGS surfel模型
     """
     
     def __init__(self, feature_dim: int = 256):
@@ -36,6 +38,7 @@ class GaussianFeatureModel(nn.Module):
         """
         super().__init__()
         self.feature_dim = feature_dim
+        self.is_2dgs = False  # 加载PLY时根据scale维数自动设置
         
         # 冻结的3DGS几何/外观参数 (register_buffer不参与梯度)
         self.register_buffer('_xyz', torch.empty(0))
@@ -66,7 +69,22 @@ class GaussianFeatureModel(nn.Module):
     
     @property
     def get_scaling(self) -> torch.Tensor:
+        """返回激活后的缩放 [N, 2] (2DGS) 或 [N, 3] (3DGS)"""
         return self.scaling_activation(self._scaling)
+    
+    @property
+    def get_scaling_for_render(self) -> torch.Tensor:
+        """
+        返回渲染用的 [N, 3] 缩放。
+        2DGS: 在激活后 pad 第3维为 1.0 (与 STDLoc 一致)
+        3DGS: 直接返回 [N, 3]
+        """
+        scales = self.scaling_activation(self._scaling)
+        if self.is_2dgs:
+            # 参考 STDLoc: pad ones 作为第3维 (surfel 不关心厚度)
+            ones = torch.ones(scales.shape[0], 1, device=scales.device, dtype=scales.dtype)
+            return torch.cat([scales, ones], dim=-1)
+        return scales
     
     @property
     def get_opacity(self) -> torch.Tensor:
@@ -115,6 +133,13 @@ class GaussianFeatureModel(nn.Module):
         scales = np.zeros((N, len(scale_names)))
         for idx, name in enumerate(scale_names):
             scales[:, idx] = np.asarray(vertex[name])
+        
+        # 检测 2DGS: 2D surfel 只有 2 个 scale
+        if scales.shape[1] == 2:
+            self.is_2dgs = True
+            print(f"  [2DGS] 检测到 2 个 scale，使用 rasterization_2dgs 渲染")
+        else:
+            self.is_2dgs = False
         
         # 加载rotation
         rot_names = sorted(
@@ -194,6 +219,12 @@ class GaussianFeatureModel(nn.Module):
         
         scale_names = sorted([p.name for p in vertex.properties if p.name.startswith('scale_')], key=lambda x: int(x.split('_')[-1]))
         scales = np.stack([np.asarray(vertex[n]) for n in scale_names], axis=1)
+        
+        # 检测 2DGS: 2D surfel 只有 2 个 scale
+        if scales.shape[1] == 2:
+            self.is_2dgs = True
+        else:
+            self.is_2dgs = False
         
         rot_names = sorted([p.name for p in vertex.properties if p.name.startswith('rot')], key=lambda x: int(x.split('_')[-1]))
         rots = np.stack([np.asarray(vertex[n]) for n in rot_names], axis=1)

@@ -1,0 +1,115 @@
+# 7-Scenes Stairs 场景训练配置
+# ==============================
+# 数据集: 7-Scenes / stairs
+# 相机: Kinect, fx=fy=525.505, cx=320, cy=240, 640×480
+# 将 7scenes 转换到项目格式后使用本配置：
+#   python scripts/data_prep/convert_7scenes.py \
+#       --src /mnt/pool1/sqy/7scenes/stairs \
+#       --dst /home/yons/Projects/ICLPose/dataset/stairs
+#
+# 然后运行训练（修改 output_dir 和 experiment 名称即可）：
+#   python train_v3.py --config configs/exp030_stairs.yaml
+
+seed: 42
+
+output_dir: "/home/yons/Projects/ICLPose/output/corr_pose/exp030_stairs"
+
+# ── SplatLoc / Feature-3DGS 预训练模型 ──
+# 需要先用 2DGS (https://github.com/hbb1/2d-gaussian-splatting) 对 stairs 重建，
+# 再用 feature_3dgs 嵌入特征。详见 scripts/data_prep/README_3dgs.md
+# 一键重建: bash scripts/data_prep/run_2dgs.sh stairs 1
+splatloc:
+  gaussians_path: "/home/yons/Projects/ICLPose/dataset/stairs/gaussian_splatting/point_cloud/final/point_cloud.ply"
+  decoder_path:   "/home/yons/Projects/ICLPose/output/feature_3dgs/stairs/fused_feature/checkpoint_best.pth"
+  config_path:    null  # 不使用 SplatLoc 配置，使用下方 decoder/scene 配置
+  freeze_decoder: true
+
+# 场景边界需在重建后从 point_cloud.ply 中统计获得，这里给出近似值。
+# 运行 scripts/data_prep/compute_scene_bound.py --ply <path> 自动计算
+scene:
+  bound: [[-5.0, 5.0], [-3.0, 3.0], [-1.0, 8.0]]
+  voxel_sdf: 0.08
+
+decoder:
+  enc: 'HashGrid'
+  num_layers: 4
+  hidden_dim: 128
+  final_dim: 256
+
+model:
+  feature_dim: 256
+  num_queries: 64
+  fusion_layers: 2
+  num_heads: 8
+  dropout: 0.1
+
+# ── 数据集配置 ──
+dataset:
+  data_root: "/home/yons/Projects/ICLPose/dataset/stairs"
+
+  # TrainSplit: seq-02 seq-03 seq-05 seq-06; TestSplit: seq-01 seq-04
+  train_scene: "seq-02"   # 主训练序列
+  val_scene:   "seq-01"   # 测试序列
+
+  train_step: 1
+  val_step:   1
+  max_train_samples: null
+  max_val_samples:   null
+
+  gaussian_path: "/home/yons/Projects/ICLPose/dataset/stairs/gaussian_splatting/point_cloud/final/point_cloud.ply"
+
+  use_depth: true   # 7-Scenes 提供深度图，可启用
+
+  pose_noise_rot_deg:   5.0
+  pose_noise_trans_m:   0.15   # 室内小场景，噪声适当缩小
+
+  # ── Kinect 相机内参 ──
+  # SIMPLE_RADIAL from COLMAP: fx=fy=525.505, cx=320, cy=240
+  image_size: [640, 480]
+  fx: 525.505
+  fy: 525.505
+  cx: 320.0
+  cy: 240.0
+
+loss:
+  use_relative_pose:    true
+  normalize_translation: false
+  use_kendall:          true
+  init_log_var_rotation:    0.0
+  init_log_var_translation: -1.0
+  rotation_loss:    'geodesic'
+  translation_loss: 'l2'
+  rotation_weight:    1.0
+  translation_weight: 1.0
+  diversity_weight:   0.05
+  diversity_margin_2d: 16.0
+  diversity_margin_3d: 0.16
+  reprojection_weight: 0.1
+
+training:
+  num_epochs: 500
+  batch_size: 32
+  val_batch_size: 32
+  num_workers: 8
+  optimizer: 'adamw'
+  learning_rate: 1.0e-4
+  decoder_lr:    1.0e-5
+  weight_decay:  1.0e-4
+  grad_clip: 5.0
+  scheduler: 'cosine'
+  min_lr: 1.0e-6
+  lr_decay_step: 10
+  lr_decay_gamma: 0.5
+  val_interval: 2
+  save_interval: 10
+  log_interval: 10
+
+visualization:
+  enable: true
+  vis_interval: 5
+  num_samples: 3
+  vis_types:
+    pose_prediction:   true
+    feature_similarity: true
+    correspondence:    true
+    query_evolution:   false

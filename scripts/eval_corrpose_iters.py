@@ -9,8 +9,14 @@
 更多迭代 → 更多 render-and-compare 机会 → 可能收敛到更小误差。
 
 使用方法:
-    python scripts/eval_corrpose_iters.py --checkpoint output/corr_pose/exp005_bs32/best_model.pth
-    python scripts/eval_corrpose_iters.py --checkpoint output/corr_pose/exp005_bs32/best_model.pth --iters 3 5 7 10 15 20
+    # 验证集 (Seq1 frame 810-899)
+    python scripts/eval_corrpose_iters.py --checkpoint output/corr_pose/exp007_curriculum_K5/best_model.pth
+    
+    # 测试集 (Seq2 全部 900 帧)
+    python scripts/eval_corrpose_iters.py --checkpoint output/corr_pose/exp007_curriculum_K5/best_model.pth --test_seq2
+    
+    # 自定义帧范围
+    python scripts/eval_corrpose_iters.py --checkpoint ... --frame_start 0 --frame_end 900 --feature_dir ... --traj_path ...
 """
 
 import os
@@ -32,6 +38,11 @@ DEFAULT_FEATURE_MODEL = 'output/feature_3dgs/room_0_raw/fine_dino/best_model.pth
 DEFAULT_FEATURE_DIR = 'output/features_multiscale/room_0'
 DEFAULT_TRAJ = 'dataset/room_0/Sequence_1/traj_w_c.txt'
 DEFAULT_DEPTH_DIR = 'dataset/room_0/Sequence_1/depth'
+
+# Sequence 2 (test set) paths
+SEQ2_FEATURE_DIR = 'output/features_multiscale/room_0_seq2'
+SEQ2_TRAJ = 'dataset/room_0/Sequence_2/traj_w_c.txt'
+SEQ2_DEPTH_DIR = 'dataset/room_0/Sequence_2/depth'
 
 INTRINSICS = {'fx': 23.0, 'fy': 23.3, 'cx': 22.97, 'cy': 17.47}
 FEAT_DIM = {'fine_dino': 768, 'fine_sd': 640}
@@ -132,7 +143,28 @@ def main():
                         help='Validation noise level (should match training)')
     parser.add_argument('--seed', type=int, default=12345,
                         help='Random seed for reproducible noise')
+    parser.add_argument('--frame_start', type=int, default=None,
+                        help='Start frame index (default: 810 for val, 0 for test_seq2)')
+    parser.add_argument('--frame_end', type=int, default=None,
+                        help='End frame index (default: 900 for val, 900 for test_seq2)')
+    parser.add_argument('--test_seq2', action='store_true',
+                        help='Evaluate on Sequence_2 (test set, 900 frames)')
     args = parser.parse_args()
+    
+    # --test_seq2 覆盖路径和帧范围
+    if args.test_seq2:
+        args.feature_dir = SEQ2_FEATURE_DIR
+        args.traj_path = SEQ2_TRAJ
+        args.depth_dir = SEQ2_DEPTH_DIR
+        if args.frame_start is None:
+            args.frame_start = 0
+        if args.frame_end is None:
+            args.frame_end = 900
+    else:
+        if args.frame_start is None:
+            args.frame_start = 810
+        if args.frame_end is None:
+            args.frame_end = 900
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
@@ -171,13 +203,16 @@ def main():
         fx=320.0, fy=320.0, cx=319.5, cy=239.5,
     )
     
-    # --- Validation dataset ---
+    # --- Dataset ---
     noise_trans = args.noise_rot_deg / 50.0
-    val_dataset = PoseDatasetV3(
+    frame_indices = list(range(args.frame_start, args.frame_end))
+    split_name = 'TEST (Seq2)' if args.test_seq2 else f'VAL (Seq1 [{args.frame_start}:{args.frame_end}])'
+    
+    eval_dataset = PoseDatasetV3(
         feature_base_dir=args.feature_dir,
         traj_path=args.traj_path,
         depth_dir=args.depth_dir,
-        frame_indices=list(range(810, 900)),
+        frame_indices=frame_indices,
         scale_names=[args.scale],
         noise_rot_deg=args.noise_rot_deg,
         noise_trans_m=noise_trans,
@@ -187,7 +222,7 @@ def main():
     
     # --- Evaluate ---
     print(f"\n{'='*80}")
-    print(f"Evaluating K = {args.iters} iterations on {len(val_dataset)} val frames")
+    print(f"[{split_name}] Evaluating K = {args.iters} on {len(eval_dataset)} frames")
     print(f"Noise: rot={args.noise_rot_deg}°, trans={noise_trans:.3f}m, seed={args.seed}")
     print(f"{'='*80}\n")
     
@@ -196,7 +231,7 @@ def main():
     for K in sorted(args.iters):
         print(f"--- K={K} iterations ---")
         result = evaluate_iters(
-            net, val_dataset, renderer, device, args.scale, K, seed=args.seed
+            net, eval_dataset, renderer, device, args.scale, K, seed=args.seed
         )
         all_results.append(result)
         

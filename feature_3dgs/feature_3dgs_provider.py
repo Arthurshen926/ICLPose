@@ -26,8 +26,6 @@ import torch.nn.functional as F
 import numpy as np
 from typing import Optional, Dict, Tuple
 
-from gsplat import rasterization as gsplat_rasterization
-
 from feature_3dgs.gaussian_feature_model import GaussianFeatureModel
 from feature_3dgs.feature_renderer import FeatureRenderer, _build_K
 
