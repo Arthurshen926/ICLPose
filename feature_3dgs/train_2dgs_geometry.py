@@ -783,8 +783,9 @@ class WildGaussiansAppearance(nn.Module):
         """Initialize per-Gaussian embeddings with Fourier features from positions.
 
         Following WildGaussians: normalize positions to [0,1], then compute
-        sin(π·p_k·2^m) and cos(π·p_k·2^m) for k=1,2,3 and m=1,...,4
-        giving 3×4×2 = 24 dimensions.
+        sin(π·p_k·2^m) and cos(π·p_k·2^m) for k=1,2,3 and m=1,...,M
+        giving 3×M×2 dimensions. M is auto-determined from gaussian_embed_dim.
+        For default 24d: M=4, for 48d: M=8, etc.
         """
         with torch.no_grad():
             p = xyz.detach().clone()
@@ -793,15 +794,27 @@ class WildGaussiansAppearance(nn.Module):
             q97 = torch.quantile(linf, 0.97)
             p = p / (q97 + 1e-8) * 0.5 + 0.5  # ~[0, 1]
 
+            # M Fourier octaves: each produces 3*2=6 dims (sin+cos for xyz)
+            n_octaves = self.gaussian_embed_dim // 6  # 24→4, 48→8, etc.
+            if n_octaves < 1:
+                n_octaves = 1
             fourier = []
-            for m in range(1, 5):  # m = 1, 2, 3, 4
+            for m in range(1, n_octaves + 1):
                 freq = math.pi * (2 ** m)
                 fourier.append(torch.sin(freq * p))  # [N, 3]
                 fourier.append(torch.cos(freq * p))  # [N, 3]
-            fourier = torch.cat(fourier, dim=1)  # [N, 24]
+            fourier = torch.cat(fourier, dim=1)  # [N, 6*n_octaves]
+
+            # Truncate or pad to exact gaussian_embed_dim
+            if fourier.shape[1] >= self.gaussian_embed_dim:
+                fourier = fourier[:, :self.gaussian_embed_dim]
+            else:
+                pad = torch.zeros(fourier.shape[0], self.gaussian_embed_dim - fourier.shape[1],
+                                  device=fourier.device)
+                fourier = torch.cat([fourier, pad], dim=1)
 
             self.gaussian_embedding.data.copy_(fourier)
-        print(f"    Per-Gaussian Fourier embeddings initialized from 3D positions")
+        print(f"    Per-Gaussian Fourier embeddings initialized from 3D positions ({n_octaves} octaves → {self.gaussian_embed_dim}d)")
 
     def compute_toned_colors(self, image_idx, base_colors):
         """Compute toned DC colors for a single image.
@@ -1595,21 +1608,26 @@ def train(args):
         # --- WildGaussians Appearance ---
         n_gaussians = gaussians.num_points
         wg_output_scale = getattr(args, 'wg_output_scale', 0.3)
+        wg_hidden_dim = getattr(args, 'wg_hidden_dim', 128)
+        wg_n_hidden = getattr(args, 'wg_n_hidden', 2)
+        wg_image_embed_dim = getattr(args, 'wg_image_embed_dim', 32)
+        wg_gaussian_embed_dim = getattr(args, 'wg_gaussian_embed_dim', 24)
         appearance_net = WildGaussiansAppearance(
             n_images=len(train_cams),
             n_gaussians=n_gaussians,
-            image_embed_dim=32,
-            gaussian_embed_dim=24,
-            hidden_dim=128,
-            n_hidden=2,
+            image_embed_dim=wg_image_embed_dim,
+            gaussian_embed_dim=wg_gaussian_embed_dim,
+            hidden_dim=wg_hidden_dim,
+            n_hidden=wg_n_hidden,
             output_scale=wg_output_scale,
         ).cuda()
         appearance_net.init_gaussian_embeddings(gaussians.get_xyz)
 
+        input_dim = wg_image_embed_dim + wg_gaussian_embed_dim + 3
         n_params = sum(p.numel() for p in appearance_net.parameters())
         print(f"  WildGaussians appearance: {len(train_cams)} images × {n_gaussians:,} Gaussians")
-        print(f"    Image embedding: 32d, Gaussian embedding: 24d (Fourier init)")
-        print(f"    MLP: (32+24+3) → 128 → 128 → 6 (affine), output_scale={wg_output_scale}")
+        print(f"    Image embedding: {wg_image_embed_dim}d, Gaussian embedding: {wg_gaussian_embed_dim}d (Fourier init)")
+        print(f"    MLP: ({input_dim}) → {wg_hidden_dim}×{wg_n_hidden} → 6 (affine), output_scale={wg_output_scale}")
         print(f"    Total params: {n_params:,} ({n_params*4/1024/1024:.1f} MB)")
 
         # Separate LR for image embeddings, gaussian embeddings, and MLP
@@ -1626,16 +1644,22 @@ def train(args):
         appearance_scheduler = torch.optim.lr_scheduler.ExponentialLR(appearance_optimizer, gamma=gamma)
         print(f"    LR: MLP={app_lr_init}, GaussEmb={gauss_emb_lr}, ImageEmb={image_emb_lr}")
 
-        # --- DINO Uncertainty ---
-        dino_uncertainty = DinoUncertaintyPredictor(
-            dino_feature_dim=768,
-            max_dino_size=getattr(args, 'dino_max_size', 350),
-            lambda_prior=0.5,
-        ).cuda()
-        dino_optimizer = torch.optim.Adam(
-            dino_uncertainty.uncertainty_linear.parameters(),
-            lr=1e-3, eps=1e-15)
-        print(f"    DINO uncertainty: ViT-B/14, max_size={dino_uncertainty.max_dino_size}")
+        # --- DINO Uncertainty (optional, can be disabled to save GPU memory) ---
+        use_dino = not getattr(args, 'no_dino_uncertainty', False)
+        if use_dino:
+            dino_uncertainty = DinoUncertaintyPredictor(
+                dino_feature_dim=768,
+                max_dino_size=getattr(args, 'dino_max_size', 350),
+                lambda_prior=0.5,
+            ).cuda()
+            dino_optimizer = torch.optim.Adam(
+                dino_uncertainty.uncertainty_linear.parameters(),
+                lr=1e-3, eps=1e-15)
+            print(f"    DINO uncertainty: ViT-B/14, max_size={dino_uncertainty.max_dino_size}")
+        else:
+            dino_uncertainty = None
+            dino_optimizer = None
+            print(f"    DINO uncertainty: DISABLED (--no_dino_uncertainty)")
 
     elif getattr(args, 'use_appearance', False):
         # Legacy appearance modes (AppearanceNetwork / SpatialAppearanceNetwork)
@@ -2052,7 +2076,9 @@ def train(args):
                 evaluate(gaussians, test_cams, bg_color, args.longest_edge, iteration,
                          masks=masks, appearance_net=appearance_net,
                          use_wildgaussians=use_wildgaussians,
-                         wg_test_opt_steps=wg_steps)
+                         wg_test_opt_steps=wg_steps,
+                         train_cams=train_cams,
+                         lambda_dssim=args.lambda_dssim)
 
             # Densification
             max_gaussians = getattr(args, 'max_gaussians', 0)
@@ -2185,17 +2211,33 @@ def train(args):
         evaluate(gaussians, test_cams, bg_color, args.longest_edge, args.iterations,
                  masks=masks, appearance_net=appearance_net,
                  use_wildgaussians=use_wildgaussians,
-                 wg_test_opt_steps=wg_steps_final)
+                 wg_test_opt_steps=wg_steps_final,
+                 train_cams=train_cams,
+                 lambda_dssim=args.lambda_dssim)
+
+
+def _get_camera_position(cam):
+    """Extract camera center (world coords) from a camera object.
+
+    CameraData stores R (= W2C_rot^T in 3DGS convention) and T (W2C translation).
+    W2C = [R^T | T], so camera center = -R * T (numpy, fast).
+    """
+    return torch.from_numpy(-cam.R @ cam.T).float()  # [3] CPU tensor
 
 
 def evaluate(gaussians, test_cams, bg_color, longest_edge, iteration,
              masks=None, appearance_net=None, use_wildgaussians=False,
-             wg_test_opt_steps=0):
+             wg_test_opt_steps=0, train_cams=None, lambda_dssim=0.2):
     """Evaluate PSNR on test cameras.
 
     Reports raw PSNR (standard) and optionally appearance-corrected PSNR.
     For WildGaussians with wg_test_opt_steps>0: per-test-image embedding optimization
     (WildGaussians paper protocol). With wg_test_opt_steps=0: mean embedding eval.
+
+    Improvements over vanilla WG test-time opt:
+      - Nearest-neighbor embedding init (top-K avg of closest train cameras)
+      - L1 + DSSIM combined loss (matching training objective)
+      - Cosine annealing LR schedule (fast convergence + fine-tuning)
     """
     psnrs = []
     corrected_psnrs = []
@@ -2221,17 +2263,51 @@ def evaluate(gaussians, test_cams, bg_color, longest_edge, iteration,
     # Test-time embedding optimization config
     # wg_test_opt_steps=0 → fast eval with mean embedding (default during training)
     # wg_test_opt_steps>0 → per-test-image optimization (WildGaussians paper protocol)
-    wg_test_opt_lr = 0.01   # learning rate for test embedding optimization
+    wg_test_opt_lr = 0.01   # initial learning rate for test embedding optimization
+
+    # Pre-cache nearest-neighbor embeddings for all test cameras (if train_cams provided)
+    nn_emb_cache = {}
+    if wg_appearance_net is not None and wg_test_opt_steps > 0 and train_cams is not None:
+        print(f"  [Test-time opt] Pre-computing nearest-neighbor embeddings (top-3)...")
+        # Pre-compute all train camera positions once
+        train_positions = []
+        for tc in train_cams:
+            train_positions.append(_get_camera_position(tc))
+        train_positions = torch.stack(train_positions)  # [N_train, 3]
+
+        for tc in test_cams:
+            test_pos = _get_camera_position(tc)
+            dists = (train_positions - test_pos.unsqueeze(0)).norm(dim=1)
+            topk = torch.topk(dists, k=min(3, len(train_cams)), largest=False)
+            with torch.no_grad():
+                nn_embs = wg_appearance_net.image_embedding(topk.indices.cuda())
+                nn_emb_cache[tc.image_name] = nn_embs.mean(dim=0).detach()
+        print(f"  [Test-time opt] Cached {len(nn_emb_cache)} NN embeddings")
 
     for cam in test_cams:
+        # --- Pre-compute mask for this test view ---
+        test_rgb_mask = None  # float [1, H, W] or None
+        _precomputed_rh = None
+        _precomputed_rw = None
+
         # --- Raw render & standard PSNR (no gradients needed) ---
         with torch.no_grad():
             render_pkg = render_2dgs(gaussians, cam, bg_color, longest_edge=longest_edge)
             image = render_pkg["render"].clamp(0, 1)
             rw, rh = render_pkg["width"], render_pkg["height"]
+            _precomputed_rw, _precomputed_rh = rw, rh
 
             gt_image = load_image_tensor(cam)
             gt_image = F.interpolate(gt_image.unsqueeze(0), size=(rh, rw), mode="bilinear", align_corners=False).squeeze(0)
+
+            # Pre-compute mask (used by test-time opt AND masked PSNR)
+            if masks is not None and cam.image_name in masks:
+                obj_mask = masks[cam.image_name][0].cuda()[None]
+                distort_mask = masks[cam.image_name][2].cuda()[None]
+                rgb_mask = obj_mask & distort_mask
+                if rgb_mask.shape[1] != rh or rgb_mask.shape[2] != rw:
+                    rgb_mask = F.interpolate(rgb_mask[None].float(), size=(rh, rw), mode="nearest").squeeze(0) > 0.5
+                test_rgb_mask = rgb_mask.float()  # [1, H, W]
 
             # Raw PSNR (standard metric — no appearance correction)
             mse = F.mse_loss(image, gt_image)
@@ -2256,10 +2332,16 @@ def evaluate(gaussians, test_cams, bg_color, longest_edge, iteration,
 
             if wg_test_opt_steps > 0:
                 # Full eval: per-test-image embedding optimization
-                test_emb = mean_emb.clone()
+                # Use nearest-neighbor init if available, else mean
+                init_emb = nn_emb_cache.get(cam.image_name, mean_emb)
+                test_emb = init_emb.clone()
                 test_emb.requires_grad_(True)
                 opt_emb = torch.optim.Adam([test_emb], lr=wg_test_opt_lr)
+                # Cosine annealing: LR decays from wg_test_opt_lr → 0.1 * wg_test_opt_lr
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    opt_emb, T_max=wg_test_opt_steps, eta_min=wg_test_opt_lr * 0.1)
 
+                gt_for_opt = gt_image.detach()
                 for _opt_step in range(wg_test_opt_steps):
                     opt_emb.zero_grad()
                     emb_expanded = test_emb.unsqueeze(0).expand(N_g, -1)
@@ -2272,9 +2354,19 @@ def evaluate(gaussians, test_cams, bg_color, longest_edge, iteration,
                                           longest_edge=longest_edge,
                                           override_colors=opt_colors)
                     opt_image = opt_pkg["render"]
-                    opt_loss = F.l1_loss(opt_image, gt_image.detach())
+                    # Combined L1 + DSSIM loss (matching training objective)
+                    # Apply mask during test-time opt to ignore dynamic objects
+                    if test_rgb_mask is not None:
+                        n_valid = test_rgb_mask.sum().clamp(min=1.0)
+                        opt_l1 = ((opt_image - gt_for_opt).abs() * test_rgb_mask).sum() / (n_valid * 3)
+                        opt_ssim = ssim(opt_image * test_rgb_mask, gt_for_opt * test_rgb_mask)
+                    else:
+                        opt_l1 = F.l1_loss(opt_image, gt_for_opt)
+                        opt_ssim = ssim(opt_image, gt_for_opt)
+                    opt_loss = (1.0 - lambda_dssim) * opt_l1 + lambda_dssim * (1.0 - opt_ssim)
                     opt_loss.backward()
                     opt_emb.step()
+                    scheduler.step()
                 final_emb = test_emb.detach()
             else:
                 # Fast eval: mean training embedding
@@ -2298,14 +2390,9 @@ def evaluate(gaussians, test_cams, bg_color, longest_edge, iteration,
 
         # --- Masked PSNR ---
         with torch.no_grad():
-            if masks is not None and cam.image_name in masks:
-                obj_mask = masks[cam.image_name][0].cuda()[None]
-                distort_mask = masks[cam.image_name][2].cuda()[None]
-                rgb_mask = obj_mask & distort_mask
-                if rgb_mask.shape[1] != rh or rgb_mask.shape[2] != rw:
-                    rgb_mask = F.interpolate(rgb_mask[None].float(), size=(rh, rw), mode="nearest").squeeze(0) > 0.5
-                n_valid = rgb_mask.sum().clamp(min=1.0)
-                masked_mse = ((image - gt_image) ** 2 * rgb_mask).sum() / (n_valid * 3)
+            if test_rgb_mask is not None:
+                n_valid = test_rgb_mask.sum().clamp(min=1.0)
+                masked_mse = ((image - gt_image) ** 2 * test_rgb_mask).sum() / (n_valid * 3)
                 if masked_mse > 0:
                     masked_psnrs.append(-10 * math.log10(masked_mse.item()))
 
@@ -2453,9 +2540,21 @@ def parse_args():
     parser.add_argument("--wg_output_scale", type=float, default=0.3,
                         help="WildGaussians output scale: controls color correction range. "
                              "scale ∈ [1-s, 1+s], bias ∈ [-s, s]. Default 0.3.")
+    parser.add_argument("--wg_hidden_dim", type=int, default=128,
+                        help="WildGaussians MLP hidden dimension")
+    parser.add_argument("--wg_n_hidden", type=int, default=2,
+                        help="WildGaussians MLP number of hidden layers")
+    parser.add_argument("--wg_image_embed_dim", type=int, default=32,
+                        help="WildGaussians per-image embedding dimension (default 32). "
+                             "Larger values may improve test-time opt expressiveness.")
+    parser.add_argument("--wg_gaussian_embed_dim", type=int, default=24,
+                        help="WildGaussians per-Gaussian embedding dimension (default 24, Fourier init)")
     parser.add_argument("--wg_test_opt_steps", type=int, default=0,
                         help="Test-time embedding optimization steps per test image (WildGaussians). "
                              "0=fast eval (mean embedding). 50-100=full eval. Slow: ~10min per eval at 100.")
+    parser.add_argument("--no_dino_uncertainty", action="store_true",
+                        help="Disable DINO uncertainty predictor (saves ~1GB GPU memory). "
+                             "Uses static masks only (masks.pkl).")
     parser.add_argument("--max_gaussians", type=int, default=0,
                         help="Maximum number of Gaussians (0=unlimited). Prevents overfitting.")
     parser.add_argument("--random_background", action="store_true",
@@ -2544,16 +2643,31 @@ def eval_only(args):
         ckpt = torch.load(app_path, map_location='cuda')
         if ckpt.get('type') == 'wildgaussians' or use_wildgaussians:
             wg_output_scale = getattr(args, 'wg_output_scale', 0.3)
+            # Infer MLP architecture from state_dict
+            wg_hidden_dim = getattr(args, 'wg_hidden_dim', 128)
+            wg_n_hidden = getattr(args, 'wg_n_hidden', 2)
+            # Try to infer from first layer weight shape
+            sd = ckpt['state_dict']
+            for k, v in sd.items():
+                if 'mlp.0.weight' in k:
+                    wg_hidden_dim = v.shape[0]
+                    break
+            # Count hidden layers from state_dict
+            n_linear = sum(1 for k in sd if k.startswith('mlp.') and k.endswith('.weight'))
+            if n_linear > 1:
+                wg_n_hidden = n_linear - 1  # last linear is output layer
             appearance_net = WildGaussiansAppearance(
                 n_images=ckpt['n_images'],
                 n_gaussians=gaussians.num_points,
                 image_embed_dim=ckpt.get('image_embed_dim', 32),
                 gaussian_embed_dim=ckpt.get('gaussian_embed_dim', 24),
+                hidden_dim=wg_hidden_dim,
+                n_hidden=wg_n_hidden,
                 output_scale=wg_output_scale,
             ).cuda()
             appearance_net.load_state_dict(ckpt['state_dict'])
             use_wildgaussians = True
-            print(f"  Loaded WildGaussians appearance (output_scale={appearance_net.output_scale})")
+            print(f"  Loaded WildGaussians appearance (hidden={wg_hidden_dim}×{wg_n_hidden}, output_scale={appearance_net.output_scale})")
         else:
             appearance_net = AppearanceNetwork(
                 n_images=ckpt['n_images'],
@@ -2572,7 +2686,9 @@ def eval_only(args):
     evaluate(gaussians, test_cams, bg_color, args.longest_edge, args.checkpoint_iter,
              masks=masks, appearance_net=appearance_net,
              use_wildgaussians=use_wildgaussians,
-             wg_test_opt_steps=wg_steps)
+             wg_test_opt_steps=wg_steps,
+             train_cams=train_cams,
+             lambda_dssim=getattr(args, 'lambda_dssim', 0.2))
 
 
 if __name__ == "__main__":

@@ -1,172 +1,102 @@
-# Implicit Correspondence Pose Estimation
+# ICLPose — 基于 3DGS 特征图的 6-DOF 位姿估计
 
 <div align="center">
 
-[![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)](https://www.python.org/)
-[![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-orange.svg)](https://pytorch.org/)
-[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.9-blue.svg)](https://www.python.org/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-1.13+-orange.svg)](https://pytorch.org/)
+[![Branch](https://img.shields.io/badge/Branch-v2--iterative--routing-green.svg)]()
 
-**6-DOF相机位姿估计框架，使用隐式2D-3D对应关系**
+**多尺度光流 + 可微渲染 + 几何求解的迭代位姿精化框架**
 
 </div>
 
 ---
 
-## 🎯 概览
+## 当前最佳结果 (exp032, Replica room_0)
 
-本项目实现了基于隐式对应关系的6-DOF相机位姿估计，适用于3D Gaussian Splatting场景。通过学习图像特征和点云特征之间的隐式对应关系，无需显式特征匹配即可完成精确的位姿估计。
-
-### 核心特性
-
-✨ **Keypoint-Based Regression**
-- 从attention heatmap提取2D/3D关键点坐标
-- 使用关键点作为显式几何约束
-- 完全对齐ICL-I2PReg架构
-
-🔥 **Diversity Loss**
-- 防止关键点坍缩到同一位置
-- 确保关键点分散分布
-
-⚡ **高级训练功能**
-- 支持相对位姿和绝对位姿训练
-- Kendall's Loss自动权重学习
-- 多GPU分布式训练支持
-
-🎨 **集成SplatLoc模块**
-- 内置Gaussian Splatting渲染器
-- 特征解码器集成
-- 无需外部依赖
+| 指标 | 数值 | vs CorrPoseNet 基线 |
+|------|------|-------------------|
+| **Rot Mean** | **0.33°** | -28% ✅ |
+| Rot Median | 0.23° | — |
+| **<1°** | **95.6%** | +12pp ✅ |
+| Trans Mean | 20.7mm | -19% ✅ |
 
 ---
 
-## 📦 安装
+## 概览
 
-### 1. 克隆仓库
+ICLPose 通过 **3DGS 特征场** 的可微分渲染实现高精度位姿估计:
+
+```
+查询特征 + 初始位姿 → [外循环 ×3-5] → 精确 6-DOF 位姿
+                         ↓
+               可微渲染参考特征 (gsplat)
+                         ↓
+               多尺度光流 (coarse→mid→fine)
+                         ↓
+               Image Jacobian + WLS → Δξ
+                         ↓
+               更新位姿, 继续迭代
+```
+
+核心模型: **MSFlowPoseNet** (~4.17M 参数)
+- SD+DINOv2 多尺度特征 (Coarse 7×10, Mid 15×20, Fine 35×46)
+- RAFT-style ConvGRU 光流精化 (8 iterations)
+- 置信度加权几何求解
+
+---
+
+## 快速开始
 
 ```bash
-git clone https://github.com/yourusername/implicit_correspondence.git
-cd implicit_correspondence
-```
-
-### 2. 安装依赖
-
-```bash
-# 创建conda环境
-conda create -n ic-pose python=3.10
-conda activate ic-pose
-
-# 安装PyTorch
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
-
-# 安装依赖
-pip install -r requirements.txt
-```
-
-### 3. 准备数据
-
-```
-data/
-└── room_0/
-    ├── Sequence_1/          # 训练序列
-    │   ├── rgb/
-    │   ├── traj_w_c.txt
-    │   └── features_compressed/fused/
-    └── Sequence_2/          # 验证序列
+conda activate geo-aware
+CUDA_VISIBLE_DEVICES=0 python scripts/train_ms_flow.py \
+    --config configs/exp032_cosine_fiters8.yaml
 ```
 
 ---
 
-## 🚀 快速开始
+## 文档
 
-### 配置训练
+| 文档 | 内容 |
+|------|------|
+| **[docs/PROJECT_TRANSFER_GUIDE.md](docs/PROJECT_TRANSFER_GUIDE.md)** | 完整项目迁移指南 (推荐首读) |
+| **[docs/AGENT_QUICKSTART.md](docs/AGENT_QUICKSTART.md)** | Agent 快速上手指南 |
+| **[docs/ARCHITECTURE_DETAIL.md](docs/ARCHITECTURE_DETAIL.md)** | MSFlowPoseNet 架构详解 |
+| **[docs/EXPERIMENT_HISTORY.md](docs/EXPERIMENT_HISTORY.md)** | 实验历史与改进记录 |
+| **[docs/ENVIRONMENT_SETUP.md](docs/ENVIRONMENT_SETUP.md)** | 环境配置 (含 4090 适配) |
 
-编辑 `configs/train_config.yaml`:
+---
 
-```yaml
-dataset:
-  data_root: "/path/to/your/data/room_0"
-  train_scene: "Sequence_1"
-  val_scene: "Sequence_2"
+## 项目结构
+
 ```
-
-### 开始训练
-
-**单GPU：**
-```bash
-python train.py --config configs/train_config.yaml --exp_name my_exp
-```
-
-**多GPU（推荐）：**
-```bash
-bash scripts/train_distributed.sh
-```
-
-### 监控训练
-
-```bash
-tensorboard --logdir=output/your_exp_name/logs
+ICLPose/
+├── scripts/train_ms_flow.py      ★ 主训练脚本
+├── ic_models/ms_flow_pose_net.py  ★ 核心模型
+├── modules/
+│   ├── geometry_solver.py         Image Jacobian + WLS
+│   ├── multiscale_renderer.py     多尺度 3DGS 渲染
+│   └── lie_algebra.py             SE(3) Lie 代数
+├── data/dataset_v4.py             多尺度特征数据集
+├── configs/exp032_*.yaml          最佳配置
+├── feature_3dgs/                  3DGS 特征模型 + 渲染器
+├── feature_extraction/            SD/DINO 特征提取
+└── output/                        训练输出
 ```
 
 ---
 
-## 📊 项目结构
+## 致谢
 
-```
-implicit_correspondence/
-├── configs/                 # 配置文件
-├── data/                    # 数据加载
-├── ic_models/               # 核心模型
-├── modules/                 # 模型组件
-├── losses/                  # 损失函数
-├── splatloc_modules/        # 集成的SplatLoc模块
-├── scripts/                 # 脚本和工具
-├── docs/                    # 详细文档
-├── train.py                 # 训练入口
-└── requirements.txt
-```
+- **RAFT** — 迭代光流精化
+- **DROID-SLAM** — SE(3) Lie 代数
+- **3D Gaussian Splatting / gsplat** — 可微渲染
+- **Stable Diffusion / DINOv2** — 多尺度特征提取
+- **STDLoc / SplatLoc** — Feature 3DGS 设计
 
 ---
 
-## 📖 文档
+## License
 
-- **[TRAINING_GUIDE.md](TRAINING_GUIDE.md)** - 完整训练指南
-- **[DISTRIBUTED_TRAINING.md](DISTRIBUTED_TRAINING.md)** - 多GPU训练
-- **[docs/KEYPOINT_IMPLEMENTATION_SUMMARY.md](docs/KEYPOINT_IMPLEMENTATION_SUMMARY.md)** - 技术细节
-- **[VISUALIZATION_README.md](VISUALIZATION_README.md)** - 可视化工具
-
----
-
-## 🔬 架构
-
-```
-图像特征 + 点云特征 → FusionModule → Keypoint提取 → PoseRegressor → 6-DOF Pose
-                                  ↓
-                           Diversity Loss
-```
-
-核心改进：
-1. **Keypoint提取** - Soft-argmax，可微分
-2. **Keypoint编码** - 显式几何约束
-3. **Diversity Loss** - 防止模式坍缩
-
----
-
-## 🙏 致谢
-
-- **ICL-I2PReg** - Keypoint架构灵感
-- **SplatLoc** - Gaussian Splatting模块
-- **3D Gaussian Splatting** - 渲染框架
-
----
-
-## 📄 License
-
-MIT License - see [LICENSE](LICENSE) file
-
----
-
-<div align="center">
-
-[⬆ 返回顶部](#implicit-correspondence-pose-estimation)
-
-</div>
+MIT License
