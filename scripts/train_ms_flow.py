@@ -46,6 +46,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from ic_models.ms_flow_pose_net import MSFlowPoseNet
 from modules.multiscale_renderer import MultiScaleRenderer
 from modules.lie_algebra import se3_exp
+from modules.localizability_head import localizability_loss
 from data.dataset_v4 import PoseDatasetV4, collate_v4
 
 
@@ -429,6 +430,68 @@ def pose_loss(
     }
 
 
+def flow_consistency_loss(
+    pred: Dict[str, torch.Tensor],
+    coarse_hw: Tuple[int, int],
+    mid_hw: Tuple[int, int],
+    fine_hw: Tuple[int, int],
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """
+    Cross-scale flow consistency regularization.
+
+    Penalizes disagreement between coarse→fine and mid→fine upsampled flows.
+    Encourages the cascade to produce coherent predictions across scales,
+    which helps with repetitive textures where coarse context disambiguates.
+
+    Uses Huber loss for robustness (some disagreement at boundaries is natural).
+
+    Returns:
+        loss: scalar
+        metrics: dict
+    """
+    flow_fine = pred.get('flow_fine')
+    flow_coarse = pred.get('flow_coarse')
+    flow_mid = pred.get('flow_mid')
+
+    if flow_fine is None or flow_coarse is None:
+        return torch.tensor(0.0), {}
+
+    fH, fW = fine_hw
+    cH, cW = coarse_hw
+    mH, mW = mid_hw
+    device = flow_fine.device
+
+    total = torch.tensor(0.0, device=device)
+    metrics = {}
+
+    # Upsample coarse flow to fine resolution (rescale pixel values)
+    flow_c_up = F.interpolate(
+        flow_coarse.detach(), size=(fH, fW),
+        mode='bilinear', align_corners=False)
+    flow_c_up[:, 0] *= fW / cW
+    flow_c_up[:, 1] *= fH / cH
+
+    # Huber loss between fine and upsampled coarse
+    diff_cf = F.huber_loss(flow_fine, flow_c_up, delta=2.0, reduction='mean')
+    total = total + diff_cf
+    metrics['flow_cons_cf'] = diff_cf.item()
+
+    if flow_mid is not None:
+        flow_m_up = F.interpolate(
+            flow_mid.detach(), size=(fH, fW),
+            mode='bilinear', align_corners=False)
+        flow_m_up[:, 0] *= fW / mW
+        flow_m_up[:, 1] *= fH / mH
+
+        diff_mf = F.huber_loss(flow_fine, flow_m_up, delta=2.0, reduction='mean')
+        total = total + diff_mf
+        metrics['flow_cons_mf'] = diff_mf.item()
+        total = total / 2.0  # average the two terms
+
+    metrics['flow_cons_total'] = total.item()
+    return total, metrics
+
+
 # ==============================================================================
 #  Trainer Class
 # ==============================================================================
@@ -545,11 +608,13 @@ class MSFlowTrainer:
             positional_encoding=mc.get('positional_encoding', False),
             pe_mode=mc.get('pe_mode', 'concat'),
             pe_dim=mc.get('pe_dim', 32),
+            depth_pe_dim=mc.get('depth_pe_dim', 0),
             skip_coarse_flow=mc.get('skip_coarse_flow', False),
             learnable_temperature=mc.get('learnable_temperature', False),
             directional_confidence=mc.get('directional_confidence', False),
             dino_all_scales=mc.get('dino_all_scales', False),
             dino_replace_sd=mc.get('dino_replace_sd', False),
+            localizability_prior=mc.get('localizability_prior', False),
         ).to(self.device)
 
         n_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
@@ -561,16 +626,18 @@ class MSFlowTrainer:
         gu_str = f", geo_up={mc['geometry_upsample']}×" if mc.get('geometry_upsample', 1) > 1 else ""
         msc_str = ", ms_consistency" if mc.get('multiscale_consistency', False) else ""
         pe_str = f", pos_enc({mc.get('pe_mode', 'concat')},{mc.get('pe_dim', 32)})" if mc.get('positional_encoding', False) else ""
+        dpe_str = f"+depth{mc.get('depth_pe_dim')}" if mc.get('depth_pe_dim', 0) > 0 and mc.get('positional_encoding', False) else ""
         scf_str = ", skip_coarse_flow" if mc.get('skip_coarse_flow', False) else ""
         lt_str = ", learnable_temp" if mc.get('learnable_temperature', False) else ""
         dc_str = ", dir_conf" if mc.get('directional_confidence', False) else ""
         ad_str = ", adaptive_damp" if mc.get('adaptive_damping', False) else ""
         das_str = ", dino_all_scales" if mc.get('dino_all_scales', False) else ""
         drs_str = ", dino_replace_sd" if mc.get('dino_replace_sd', False) else ""
+        loc_str = ", loc_prior" if mc.get('localizability_prior', False) else ""
         print(f"[Model] MSFlowPoseNet: {n_params/1e6:.2f}M trainable params, "
               f"fine_iters={mc.get('fine_iters', 4)}, "
               f"mid_iters={mc.get('mid_iters', 1)}, "
-              f"corr_temp={mc.get('corr_temperature', 1.0)}{irls_str}{dfh_str}{csc_str}{pr_str}{cd_str}{gu_str}{msc_str}{pe_str}{scf_str}{lt_str}{dc_str}{ad_str}{das_str}{drs_str}")
+              f"corr_temp={mc.get('corr_temperature', 1.0)}{irls_str}{dfh_str}{csc_str}{pr_str}{cd_str}{gu_str}{msc_str}{pe_str}{dpe_str}{scf_str}{lt_str}{dc_str}{ad_str}{das_str}{drs_str}{loc_str}")
 
     def _init_datasets(self):
         """准备训练/验证数据集."""
@@ -644,11 +711,61 @@ class MSFlowTrainer:
 
     def _init_optimizer(self):
         tc = self.config.get('training', {})
-        self.optimizer = optim.AdamW(
-            self.model.parameters(),
-            lr=tc.get('lr', 1e-4),
-            weight_decay=tc.get('weight_decay', 1e-5),
-        )
+        base_lr = tc.get('lr', 1e-4)
+        weight_decay = tc.get('weight_decay', 1e-5)
+
+        # ── Per-scale learning rates ──
+        psl = tc.get('per_scale_lr', {})
+        if psl.get('enabled', False):
+            coarse_scale = psl.get('coarse_scale', 0.5)
+            mid_scale = psl.get('mid_scale', 0.75)
+            fine_scale = psl.get('fine_scale', 1.0)
+
+            coarse_params, mid_params, fine_params, other_params = [], [], [], []
+            for name, param in self.model.named_parameters():
+                if not param.requires_grad:
+                    continue
+                if name.startswith(('coarse_dec.', 'coarse_head.', 'coarse_pe.',
+                                    'coarse_dino_')):
+                    coarse_params.append(param)
+                elif name.startswith(('temp_coarse',)):
+                    coarse_params.append(param)
+                elif name.startswith(('mid_dec.', 'mid_head.', 'mid_pe.',
+                                      'mid_context.', 'mid_dino_')):
+                    mid_params.append(param)
+                elif name.startswith(('temp_mid',)):
+                    mid_params.append(param)
+                elif name.startswith(('fine_dec.', 'fine_head.', 'fine_context.',
+                                      'fine_pe.', 'context_net.', 'temp_fine')):
+                    fine_params.append(param)
+                else:
+                    # GRU, cross_scale_ctx, pose_refine_head, etc.
+                    fine_params.append(param)
+
+            param_groups = [
+                {'params': coarse_params, 'lr': base_lr * coarse_scale, 'name': 'coarse'},
+                {'params': mid_params, 'lr': base_lr * mid_scale, 'name': 'mid'},
+                {'params': fine_params, 'lr': base_lr * fine_scale, 'name': 'fine'},
+            ]
+            # Filter empty groups
+            param_groups = [g for g in param_groups if g['params']]
+
+            print(f"[Optimizer] Per-scale LR: coarse={base_lr*coarse_scale:.6f} "
+                  f"({len(coarse_params)} tensors), mid={base_lr*mid_scale:.6f} "
+                  f"({len(mid_params)} tensors), fine={base_lr*fine_scale:.6f} "
+                  f"({len(fine_params)} tensors)")
+
+            self.optimizer = optim.AdamW(
+                param_groups,
+                lr=base_lr,
+                weight_decay=weight_decay,
+            )
+        else:
+            self.optimizer = optim.AdamW(
+                self.model.parameters(),
+                lr=base_lr,
+                weight_decay=weight_decay,
+            )
         total_epochs = tc.get('epochs', 100)
         self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer, T_max=total_epochs, eta_min=tc.get('min_lr', 1e-6),
@@ -671,6 +788,8 @@ class MSFlowTrainer:
         self.conf_reg_weight = lc.get('conf_reg_weight', 0.01)
         self.conf_coverage_range = tuple(lc.get('conf_coverage_range', [0.05, 0.95]))
         self.div_reg_weight = lc.get('div_reg_weight', 0.0)  # diversity loss weight
+        self.flow_cons_weight = lc.get('flow_consistency_weight', 0.0)
+        self.loc_loss_weight = lc.get('localizability_weight', 0.0)
 
         # ── 噪声课程学习 ──
         nc = tc.get('noise_curriculum', {})
@@ -839,6 +958,21 @@ class MSFlowTrainer:
                 else:
                     div_metrics = {}
 
+                # Flow consistency regularization (cross-scale agreement)
+                flow_cons_metrics = {}
+                if self.flow_cons_weight > 0:
+                    fc_loss, flow_cons_metrics = flow_consistency_loss(
+                        pred, self.model.COARSE_HW, self.model.MID_HW, self.model.FINE_HW)
+                    iter_loss = iter_loss + self.flow_cons_weight * fc_loss
+
+                # Localizability prior loss
+                loc_metrics = {}
+                if self.loc_loss_weight > 0 and 'loc_score' in pred:
+                    l_loss, loc_metrics = localizability_loss(
+                        pred['loc_score'], pred['flow_fine'],
+                        gt_flows['fine'], gt_masks.get('fine'))
+                    iter_loss = iter_loss + self.loc_loss_weight * l_loss
+
                 # Pose loss (Phase 2)
                 if use_pose_loss and 'delta_xi' in pred:
                     p_loss, p_metrics = pose_loss(
@@ -865,6 +999,8 @@ class MSFlowTrainer:
                 all_metrics = flow_metrics.copy()
                 all_metrics.update(conf_metrics)
                 all_metrics.update(div_metrics)
+                all_metrics.update(flow_cons_metrics)
+                all_metrics.update(loc_metrics)
                 if use_pose_loss and 'delta_xi' in pred:
                     all_metrics.update(p_metrics)
                     all_metrics['eff_pose_w'] = effective_pose_weight
@@ -1018,6 +1154,10 @@ class MSFlowTrainer:
         if all_rot_errs:
             rot = np.array(all_rot_errs)
             trans = np.array(all_trans_errs)
+            # Joint metrics: percentage where BOTH rotation AND translation thresholds are met
+            joint_01_53 = float(np.mean((rot < 0.1) & (trans < 5.3)) * 100)
+            joint_1_50 = float(np.mean((rot < 1.0) & (trans < 50.0)) * 100)
+            joint_5_100 = float(np.mean((rot < 5.0) & (trans < 100.0)) * 100)
             val_metrics = {
                 'val_rot_mean': float(np.mean(rot)),
                 'val_rot_median': float(np.median(rot)),
@@ -1025,6 +1165,9 @@ class MSFlowTrainer:
                 'val_trans_median': float(np.median(trans)),
                 'val_pct_1deg': float(np.mean(rot < 1.0) * 100),
                 'val_pct_5deg': float(np.mean(rot < 5.0) * 100),
+                'val_joint_01deg_53mm': joint_01_53,
+                'val_joint_1deg_50mm': joint_1_50,
+                'val_joint_5deg_100mm': joint_5_100,
             }
             if all_flow_epe:
                 val_metrics['val_flow_epe'] = float(np.mean(all_flow_epe))
@@ -1032,7 +1175,9 @@ class MSFlowTrainer:
             print(f"[Val E{epoch}]  rot={val_metrics['val_rot_mean']:.2f}° "
                   f"(med {val_metrics['val_rot_median']:.2f}°)  "
                   f"trans={val_metrics['val_trans_mean']:.1f}mm  "
-                  f"<1°={val_metrics['val_pct_1deg']:.1f}%"
+                  f"<1°={val_metrics['val_pct_1deg']:.1f}%  "
+                  f"joint@0.1°/5.3mm={joint_01_53:.1f}%  "
+                  f"joint@1°/50mm={joint_1_50:.1f}%"
                   f"  flow_epe={val_metrics.get('val_flow_epe', -1):.2f}"
                   f"{iters_str}")
 
@@ -1180,12 +1325,13 @@ class MSFlowTrainer:
             # Scheduler step
             self.scheduler.step()
 
-            # Checkpoint
+            # Checkpoint — track best by rot_mean + joint metric
             is_best = False
             if val_metrics and val_metrics.get('val_rot_mean', float('inf')) < self.best_val_rot:
                 self.best_val_rot = val_metrics['val_rot_mean']
                 is_best = True
-                print(f"  ★ New best: rot={self.best_val_rot:.2f}°")
+                joint_str = f"  joint@0.1°/5.3mm={val_metrics.get('val_joint_01deg_53mm', 0):.1f}%"
+                print(f"  ★ New best: rot={self.best_val_rot:.2f}°{joint_str}")
 
             self._save_checkpoint(epoch, is_best)
 
@@ -1202,6 +1348,7 @@ class MSFlowTrainer:
 
         total_time = (time.time() - train_start) / 60
         print(f"\nTraining complete in {total_time:.0f}min! Best val rot: {self.best_val_rot:.2f}°")
+        print(f"Final metrics: {val_metrics}")
         self.writer.close()
 
 

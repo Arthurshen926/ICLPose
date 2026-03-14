@@ -28,6 +28,7 @@ import torch.nn.functional as F
 from typing import Dict, List, Optional, Tuple
 
 from modules.geometry_solver import compute_image_jacobian, diff_pose_solve
+from modules.localizability_head import LocalizabilityHead
 
 
 # ==============================================================================
@@ -92,11 +93,12 @@ class PositionalEncoding2D(nn.Module):
 
         return pe.permute(2, 0, 1).unsqueeze(0)
 
-    def forward(self, feat: torch.Tensor) -> torch.Tensor:
+    def forward(self, feat: torch.Tensor, depth: torch.Tensor = None) -> torch.Tensor:
         """
         Add or concatenate PE to features.
         - 'add':    (B, C, H, W) → (B, C, H, W)
         - 'concat': (B, C, H, W) → (B, C + pe_dim, H, W)
+        depth argument is ignored by 2D PE (accepted for interface compatibility).
         """
         B, C, H, W = feat.shape
         pe = self._make_pe(H, W, feat.device)
@@ -110,6 +112,133 @@ class PositionalEncoding2D(nn.Module):
             pe = F.normalize(pe, p=2, dim=1)
             pe = self.scale * pe.expand(B, -1, -1, -1)
             return torch.cat([feat, pe], dim=1)
+
+
+class PositionalEncoding3D(nn.Module):
+    """
+    Depth-aware 3D positional encoding: extends 2D PE with per-pixel depth encoding.
+
+    The depth channel adds z-axis awareness to correlation, making it possible to
+    distinguish repeated textures at different depths (e.g. parallel walls, floor patterns).
+
+    Output (concat mode): (B, C + xy_pe_dim + depth_pe_dim, H, W)
+
+    Depth is log-normalized before encoding to handle the large dynamic range of depth values.
+    When depth is not provided, falls back to pure 2D PE (depth channels are zeros).
+    """
+
+    def __init__(self, feat_dim: int = 64, pe_dim: int = 32,
+                 depth_pe_dim: int = 8, mode: str = 'concat'):
+        super().__init__()
+        self.feat_dim = feat_dim
+        self.xy_pe_dim = pe_dim
+        self.depth_pe_dim = depth_pe_dim
+        # Total PE channels = xy + depth
+        self.pe_dim = pe_dim + depth_pe_dim
+        self.mode = mode
+
+        if mode == 'add':
+            proj_dim = pe_dim + depth_pe_dim
+            if proj_dim != feat_dim:
+                self.proj = nn.Conv2d(proj_dim, feat_dim, 1, bias=False)
+            else:
+                self.proj = nn.Identity()
+            self.scale = nn.Parameter(torch.tensor(0.1))
+        else:
+            self.scale = nn.Parameter(torch.tensor(1.0))
+
+        # XY frequencies (same as 2D PE)
+        half_xy = pe_dim // 2
+        freq_xy = torch.exp(torch.arange(0, half_xy, dtype=torch.float32) *
+                            -(math.log(10000.0) / half_xy))
+        self.register_buffer('freq_xy', freq_xy)
+
+        # Depth frequencies (higher frequency range for finer depth discrimination)
+        half_z = depth_pe_dim // 2
+        freq_z = torch.exp(torch.arange(0, half_z, dtype=torch.float32) *
+                           -(math.log(1000.0) / max(half_z, 1)))
+        self.register_buffer('freq_z', freq_z)
+
+        # Learnable depth scale (initialized so that log-depth ∈ [0, 1] maps well)
+        self.depth_scale = nn.Parameter(torch.tensor(1.0))
+
+    def _make_xy_pe(self, H: int, W: int, device: torch.device) -> torch.Tensor:
+        """Generate 2D sinusoidal PE grid. Returns (1, xy_pe_dim, H, W)."""
+        half = self.xy_pe_dim // 2
+        y_pos = torch.linspace(0, 1, H, device=device)
+        x_pos = torch.linspace(0, 1, W, device=device)
+
+        y_enc = y_pos.unsqueeze(1) * self.freq_xy.unsqueeze(0) * math.pi * 2
+        x_enc = x_pos.unsqueeze(1) * self.freq_xy.unsqueeze(0) * math.pi * 2
+
+        q = half // 2
+        pe_y = torch.cat([torch.sin(y_enc[:, :q]), torch.cos(y_enc[:, :q])], dim=1)
+        pe_x = torch.cat([torch.sin(x_enc[:, :q]), torch.cos(x_enc[:, :q])], dim=1)
+
+        pe = torch.zeros(H, W, self.xy_pe_dim, device=device)
+        pe[:, :, :half] = pe_y.unsqueeze(1).expand(-1, W, -1)
+        pe[:, :, half:] = pe_x.unsqueeze(0).expand(H, -1, -1)
+        return pe.permute(2, 0, 1).unsqueeze(0)
+
+    def _make_depth_pe(self, depth: torch.Tensor) -> torch.Tensor:
+        """Encode per-pixel depth values. Input (B, 1, H, W) → (B, depth_pe_dim, H, W)."""
+        # Log-normalize depth: log(1 + d) / log(1 + d_max)
+        # Clamp to avoid log(0) and bound the range
+        d = depth.float().clamp(min=0.01)
+        d_log = torch.log1p(d)
+        # Normalize per-batch to [0, 1] for stable encoding
+        d_max = d_log.flatten(1).max(dim=1, keepdim=True)[0].unsqueeze(-1).unsqueeze(-1)
+        d_norm = d_log / d_max.clamp(min=1e-6) * self.depth_scale
+
+        B, _, H, W = depth.shape
+        half_z = self.depth_pe_dim // 2
+
+        # (B, 1, H, W) * (half_z,) → (B, half_z, H, W)
+        d_flat = d_norm.squeeze(1)  # (B, H, W)
+        # Expand frequencies: (B, H, W, half_z)
+        z_enc = d_flat.unsqueeze(-1) * self.freq_z.unsqueeze(0).unsqueeze(0).unsqueeze(0) * math.pi * 2
+
+        # Sin/cos encoding
+        z_sin = torch.sin(z_enc[..., :half_z])
+        z_cos = torch.cos(z_enc[..., :half_z])
+        depth_pe = torch.cat([z_sin, z_cos], dim=-1)  # (B, H, W, depth_pe_dim)
+
+        return depth_pe.permute(0, 3, 1, 2)  # (B, depth_pe_dim, H, W)
+
+    def forward(self, feat: torch.Tensor, depth: torch.Tensor = None) -> torch.Tensor:
+        """
+        Apply 3D positional encoding.
+        Args:
+            feat:  (B, C, H, W) feature map
+            depth: (B, 1, H, W) or (B, H, W) depth map. If None, depth PE is zeros.
+        Returns:
+            concat mode: (B, C + xy_pe_dim + depth_pe_dim, H, W)
+            add mode:    (B, C, H, W)
+        """
+        B, C, H, W = feat.shape
+        xy_pe = self._make_xy_pe(H, W, feat.device).expand(B, -1, -1, -1)
+
+        if depth is not None:
+            # Ensure (B, 1, H, W)
+            if depth.ndim == 3:
+                depth = depth.unsqueeze(1)
+            # Resize depth to match feature resolution
+            if depth.shape[-2:] != (H, W):
+                depth = F.interpolate(depth, size=(H, W), mode='bilinear', align_corners=False)
+            depth_pe = self._make_depth_pe(depth)
+        else:
+            depth_pe = torch.zeros(B, self.depth_pe_dim, H, W, device=feat.device)
+
+        full_pe = torch.cat([xy_pe, depth_pe], dim=1)  # (B, pe_dim, H, W)
+
+        if self.mode == 'add':
+            full_pe = self.proj(full_pe)
+            out = feat + self.scale * full_pe
+            return F.normalize(out, p=2, dim=1)
+        else:
+            full_pe = F.normalize(full_pe, p=2, dim=1)
+            full_pe = self.scale * full_pe
+            return torch.cat([feat, full_pe], dim=1)
 
 
 class ScaleDecoder(nn.Module):
@@ -780,6 +909,7 @@ class MSFlowPoseNet(nn.Module):
         positional_encoding: bool = False,
         pe_mode: str = 'concat',   # 'concat' (strong) or 'add' (weak)
         pe_dim: int = 32,          # PE channel count (concat only)
+        depth_pe_dim: int = 0,     # >0 enables 3D PE with depth encoding channels
         # Skip coarse flow: initialize mid from zero instead of coarse prediction.
         # Useful when coarse features are too similar for reliable global correlation.
         skip_coarse_flow: bool = False,
@@ -794,6 +924,10 @@ class MSFlowPoseNet(nn.Module):
         # More aggressive than dino_all_scales (which blends). Directly addresses
         # the OldHospital structural floor caused by flat SD correlations.
         dino_replace_sd: bool = False,
+        # Localizability prior: per-pixel scoring of how localizable each pixel is,
+        # based on correlation volume statistics (peak, sharpness, entropy).
+        # Modulates confidence before geometry solver. Supervised by flow error.
+        localizability_prior: bool = False,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -819,9 +953,11 @@ class MSFlowPoseNet(nn.Module):
         self.adaptive_damping_cond_thresh = adaptive_damping_cond_thresh
         self.use_positional_encoding = positional_encoding
         self.pe_mode = pe_mode
+        self.depth_pe_dim = depth_pe_dim
         self.skip_coarse_flow = skip_coarse_flow
         self.dino_all_scales = dino_all_scales
         self.dino_replace_sd = dino_replace_sd
+        self.use_localizability = localizability_prior
 
         # Configurable intrinsics and image resolution
         self.BASE_INTRINSICS = intrinsics if intrinsics is not None else self.DEFAULT_INTRINSICS.copy()
@@ -895,12 +1031,17 @@ class MSFlowPoseNet(nn.Module):
 
         # ── Positional encoding: add spatial identity to decoded features ──
         if positional_encoding:
-            self.fine_pe = PositionalEncoding2D(
-                feat_dim=decode_dim, pe_dim=pe_dim, mode=pe_mode)
-            self.mid_pe = PositionalEncoding2D(
-                feat_dim=decode_dim, pe_dim=pe_dim, mode=pe_mode)
-            self.coarse_pe = PositionalEncoding2D(
-                feat_dim=decode_dim, pe_dim=pe_dim, mode=pe_mode)
+            if depth_pe_dim > 0:
+                # 3D PE: xy + depth sinusoidal encoding
+                PE_cls = lambda: PositionalEncoding3D(
+                    feat_dim=decode_dim, pe_dim=pe_dim,
+                    depth_pe_dim=depth_pe_dim, mode=pe_mode)
+            else:
+                PE_cls = lambda: PositionalEncoding2D(
+                    feat_dim=decode_dim, pe_dim=pe_dim, mode=pe_mode)
+            self.fine_pe = PE_cls()
+            self.mid_pe = PE_cls()
+            self.coarse_pe = PE_cls()
 
         # ── Cross-scale context: coarse+mid → compact vector for fine iterations ──
         if cross_scale_context:
@@ -922,6 +1063,11 @@ class MSFlowPoseNet(nn.Module):
         # ── Per-scale context adapters: inject scale-specific query features ──
         self.mid_context = ContextAdapter(hidden_dim, decode_dim)
         self.fine_context = ContextAdapter(hidden_dim, decode_dim)
+
+        # ── Localizability prior: score how localizable each fine pixel is ──
+        if localizability_prior:
+            self.loc_head = LocalizabilityHead(
+                corr_channels=fine_corr_ch, hidden_dim=32)
 
         # Intrinsics at fine resolution for geometry solving
         self.fine_intrinsics = self._scale_intrinsics(*self.FINE_HW)
@@ -1068,13 +1214,15 @@ class MSFlowPoseNet(nn.Module):
         # Apply positional encoding to disambiguate repetitive textures
         # PE is applied to ALL scales' correlation inputs (coarse/mid/fine)
         # NOT context adapter inputs, because concat PE changes channel count
+        # For 3D PE (depth_pe_dim > 0), depth is passed for z-axis encoding
         if self.use_positional_encoding:
-            q_coarse_corr = self.coarse_pe(q_coarse)
-            r_coarse_corr = self.coarse_pe(r_coarse)
-            q_mid_corr = self.mid_pe(q_mid)
-            r_mid_corr = self.mid_pe(r_mid)
-            q_fine_corr = self.fine_pe(q_fine)
-            r_fine_corr = self.fine_pe(r_fine)
+            pe_depth = depth if self.depth_pe_dim > 0 else None
+            q_coarse_corr = self.coarse_pe(q_coarse, pe_depth)
+            r_coarse_corr = self.coarse_pe(r_coarse, pe_depth)
+            q_mid_corr = self.mid_pe(q_mid, pe_depth)
+            r_mid_corr = self.mid_pe(r_mid, pe_depth)
+            q_fine_corr = self.fine_pe(q_fine, pe_depth)
+            r_fine_corr = self.fine_pe(r_fine, pe_depth)
         else:
             q_coarse_corr = q_coarse
             r_coarse_corr = r_coarse
@@ -1165,6 +1313,12 @@ class MSFlowPoseNet(nn.Module):
 
             fine_flow_preds.append(flow_f)
 
+        # ── Localizability prior: modulate confidence with per-pixel score ──
+        loc_score = None
+        if self.use_localizability:
+            loc_score = self.loc_head(fine_corr)  # (B, 1, H, W)
+            conf_f = conf_f * loc_score  # modulate: low localizability → low weight
+
         # ══════════════════════════════════════════════
         #  5. Geometry Solver (if depth available)
         #     直接在 35×46 分辨率求解, 无需上采样
@@ -1184,6 +1338,8 @@ class MSFlowPoseNet(nn.Module):
             'decoded_q_mid': q_mid,
             'decoded_q_fine': q_fine,
         }
+        if loc_score is not None:
+            result['loc_score'] = loc_score
 
         if depth is not None:
             # Geometry solver must run in fp32 (linalg.solve doesn't support fp16)
