@@ -59,9 +59,11 @@ def multiscale_flow_loss(
     gt_masks: Dict[str, torch.Tensor] = None,
     weights: Dict[str, float] = None,
     gamma: float = 0.8,
+    use_huber: bool = True,
+    huber_delta: float = 5.0,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
-    多尺度 flow 监督损失 (masked L1 + masked endpoint error).
+    多尺度 flow 监督损失 (masked L1/Huber + masked endpoint error).
     Fine 层使用 RAFT-style sequence loss: 对每次 GRU 迭代都计算 loss,
     后面的迭代权重更大 (gamma^(N-1-i)).
 
@@ -79,6 +81,8 @@ def multiscale_flow_loss(
         }
         weights: per-scale loss weights
         gamma: RAFT sequence loss 衰减系数 (越大越均匀, 0.8=标准RAFT)
+        use_huber: 使用 Huber loss 代替 L1 (对 flow 大误差更鲁棒)
+        huber_delta: Huber loss 阈值 (像素), 超过此值的误差线性增长而非二次
 
     Returns:
         total_loss, metrics_dict
@@ -88,6 +92,25 @@ def multiscale_flow_loss(
 
     total = torch.tensor(0.0, device=pred['flow_fine'].device)
     metrics = {}
+
+    def _masked_flow_loss(flow_pred, flow_gt, mask=None):
+        """Compute masked per-pixel flow loss (L1 or Huber)."""
+        diff = flow_pred - flow_gt
+        if use_huber:
+            # Huber loss per-pixel: smooth at small errors, linear at large
+            abs_diff = diff.abs()
+            loss_map = torch.where(
+                abs_diff <= huber_delta,
+                0.5 * diff.pow(2) / huber_delta,
+                abs_diff - 0.5 * huber_delta,
+            )
+        else:
+            loss_map = diff.abs()
+
+        if mask is not None:
+            n_valid = mask.sum().clamp(min=1.0)
+            return (loss_map * mask).sum() / (n_valid * 2)
+        return loss_map.mean()
 
     scale_map = {
         'coarse': 'flow_coarse',
@@ -111,13 +134,8 @@ def multiscale_flow_loss(
             for i, iter_flow in enumerate(fine_preds):
                 # 权重: gamma^(N-1-i), 最后一次迭代权重=1.0
                 iter_w = gamma ** (n_iters - 1 - i)
-                if mask is not None:
-                    diff = (iter_flow - gt_flow).abs()
-                    n_valid = mask.sum().clamp(min=1.0)
-                    iter_l1 = (diff * mask).sum() / (n_valid * 2)
-                else:
-                    iter_l1 = F.l1_loss(iter_flow, gt_flow)
-                seq_loss = seq_loss + iter_w * iter_l1
+                iter_loss = _masked_flow_loss(iter_flow, gt_flow, mask)
+                seq_loss = seq_loss + iter_w * iter_loss
 
             total = total + w * seq_loss
 
@@ -141,20 +159,43 @@ def multiscale_flow_loss(
             metrics['flow_fine_seq_loss'] = seq_loss.item()
             continue
 
-        # ── Coarse / Mid: 标准单次 loss ──
+        # ── Mid: sequence loss when mid_iters > 1 ──
+        if scale_name == 'mid' and 'mid_flow_preds' in pred and len(pred['mid_flow_preds']) > 1:
+            mid_preds = pred['mid_flow_preds']
+            n_iters = len(mid_preds)
+            seq_loss = torch.tensor(0.0, device=gt_flow.device)
+            for i, iter_flow in enumerate(mid_preds):
+                iter_w = gamma ** (n_iters - 1 - i)
+                seq_loss = seq_loss + iter_w * _masked_flow_loss(iter_flow, gt_flow, mask)
+            total = total + w * seq_loss
+
+            pred_flow = mid_preds[-1]
+            if mask is not None:
+                n_valid = mask.sum().clamp(min=1.0)
+                epe_map = torch.norm(pred_flow - gt_flow, dim=1, keepdim=True)
+                epe = (epe_map * mask).sum() / n_valid
+                valid_ratio = mask.mean().item()
+            else:
+                epe = torch.norm(pred_flow - gt_flow, dim=1).mean()
+                valid_ratio = 1.0
+
+            metrics[f'flow_{scale_name}_l1'] = _masked_flow_loss(pred_flow, gt_flow, mask).item()
+            metrics[f'flow_{scale_name}_epe'] = epe.item()
+            metrics[f'flow_{scale_name}_valid'] = valid_ratio
+            metrics['flow_mid_seq_loss'] = seq_loss.item()
+            continue
+
+        # ── Coarse / Mid(single iter): 标准单次 loss ──
         pred_flow = pred[pred_key]
+        l1 = _masked_flow_loss(pred_flow, gt_flow, mask)
 
         if mask is not None:
-            # Masked L1: only valid pixels contribute
-            diff = (pred_flow - gt_flow).abs()  # (B, 2, H, W)
+            # EPE for monitoring
+            epe_map = torch.norm(pred_flow - gt_flow, dim=1, keepdim=True)
             n_valid = mask.sum().clamp(min=1.0)
-            l1 = (diff * mask).sum() / (n_valid * 2)  # normalize by valid pixels & channels
-            # Masked EPE
-            epe_map = torch.norm(pred_flow - gt_flow, dim=1, keepdim=True)  # (B,1,H,W)
             epe = (epe_map * mask).sum() / n_valid
             valid_ratio = mask.mean().item()
         else:
-            l1 = F.l1_loss(pred_flow, gt_flow)
             epe = torch.norm(pred_flow - gt_flow, dim=1).mean()
             valid_ratio = 1.0
 
@@ -166,6 +207,156 @@ def multiscale_flow_loss(
 
     metrics['flow_total'] = total.item()
     return total, metrics
+
+
+def confidence_regularization_loss(
+    pred: Dict[str, torch.Tensor],
+    gt_flows: Dict[str, torch.Tensor] = None,
+    gt_masks: Dict[str, torch.Tensor] = None,
+    conf_coverage_range: Tuple[float, float] = (0.05, 0.95),
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """
+    置信度正则化损失.
+
+    防止置信度坍塌 (全 0 或全 1):
+      1. Coverage: 鼓励置信度均值接近合理范围 (soft penalty when mean < 0.3 or > 0.9)
+      2. Calibration (可选): 高置信度处 flow 误差应更小 — 鼓励置信度与实际精度对齐
+
+    只对 fine 层的置信度计算，因为精细层直接输入几何求解器。
+
+    Args:
+        pred: model output with conf_fine (B, 1, H, W)
+        gt_flows: optional, for calibration loss
+        gt_masks: optional
+
+    Returns:
+        loss, metrics
+    """
+    conf = pred.get('conf_fine')
+    if conf is None:
+        return torch.tensor(0.0), {}
+
+    device = conf.device
+    metrics = {}
+
+    # ── 1. Coverage loss: 防止均值极端 ──
+    # For directional confidence (B,2,H,W), average across both channels
+    conf_mean = conf.mean()
+    metrics['conf_mean'] = conf_mean.item()
+    metrics['conf_std'] = conf.std().item()
+
+    # Soft penalty: push mean toward [target_low, target_high] range
+    # Configurable per dataset — indoor scenes can use wider range
+    target_low, target_high = conf_coverage_range
+    if conf_mean < target_low:
+        coverage_loss = (target_low - conf_mean) ** 2
+    elif conf_mean > target_high:
+        coverage_loss = (conf_mean - target_high) ** 2
+    else:
+        coverage_loss = torch.tensor(0.0, device=device)
+
+    # ── 2. Calibration loss: 置信度应与 flow 精度一致 ──
+    cal_loss = torch.tensor(0.0, device=device)
+    if gt_flows is not None and 'fine' in gt_flows:
+        flow_pred = pred.get('flow_fine')
+        flow_gt = gt_flows['fine']
+        mask = gt_masks.get('fine') if gt_masks else None
+
+        if flow_pred is not None:
+            # Per-pixel flow error (detached, as supervision signal)
+            flow_err = torch.norm(flow_pred.detach() - flow_gt.detach(), dim=1, keepdim=True)
+            # Normalize error to [0, 1] range roughly (clamp at 10 pixels)
+            flow_err_norm = (flow_err / 10.0).clamp(0, 1)
+            # Target confidence: high where error is low
+            # For directional conf (B,2,H,W), expand target to match
+            target_conf = 1.0 - flow_err_norm
+            if conf.shape[1] == 2:
+                target_conf = target_conf.expand_as(conf)
+
+            if mask is not None:
+                n_valid = mask.sum().clamp(min=1.0)
+                cal_loss = ((conf - target_conf).pow(2) * mask).sum() / n_valid
+            else:
+                cal_loss = (conf - target_conf).pow(2).mean()
+
+    total = coverage_loss + 0.1 * cal_loss
+    metrics['conf_coverage_loss'] = coverage_loss.item()
+    metrics['conf_cal_loss'] = cal_loss.item()
+    metrics['conf_reg_total'] = total.item()
+
+    return total, metrics
+
+
+def diversity_regularization_loss(
+    pred: Dict[str, torch.Tensor],
+    scales: Tuple[str, ...] = ('coarse', 'mid', 'fine'),
+    max_samples: int = 64,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """
+    Diversity regularization: penalize inter-pixel cosine similarity collapse.
+
+    When decoded features collapse to a single direction (cosine similarity → 1),
+    the correlation volume becomes uninformative and the flow head cannot learn.
+    This loss pushes off-diagonal cosine similarity DOWN by penalizing the mean.
+
+    Args:
+        pred: model output containing decoded_q_{scale} tensors (B, C, H, W)
+        scales: which decoder outputs to regularize
+        max_samples: randomly sample this many spatial positions (saves memory)
+
+    Returns:
+        loss, metrics dict
+    """
+    device = None
+    total_loss = torch.tensor(0.0)
+    metrics = {}
+    n_terms = 0
+
+    for scale in scales:
+        key = f'decoded_q_{scale}'
+        feats = pred.get(key)
+        if feats is None:
+            continue
+        if device is None:
+            device = feats.device
+            total_loss = total_loss.to(device)
+
+        B, C, H, W = feats.shape
+        HW = H * W
+
+        # Reshape to (B, C, HW) — already L2-normalized by ScaleDecoder
+        f = feats.reshape(B, C, HW)
+
+        # Subsample spatial positions if too many (saves memory for large maps)
+        if HW > max_samples:
+            idx = torch.randperm(HW, device=device)[:max_samples]
+            f = f[:, :, idx]
+            n = max_samples
+        else:
+            n = HW
+
+        # Cosine similarity matrix: (B, n, n)
+        sim = torch.bmm(f.permute(0, 2, 1), f)
+
+        # Off-diagonal mean — this is what we want to minimize
+        mask = 1.0 - torch.eye(n, device=device).unsqueeze(0)
+        off_diag_mean = (sim * mask).sum() / (mask.sum() * B)
+
+        # Penalty: ReLU(off_diag_mean - target) squared
+        # Target 0.5 = healthy diversity; penalty kicks in above 0.7
+        target = 0.5
+        penalty = F.relu(off_diag_mean - target) ** 2
+
+        total_loss = total_loss + penalty
+        n_terms += 1
+        metrics[f'div_{scale}_sim'] = off_diag_mean.item()
+        metrics[f'div_{scale}_penalty'] = penalty.item()
+
+    if n_terms > 0:
+        total_loss = total_loss / n_terms
+
+    metrics['div_total'] = total_loss.item()
+    return total_loss, metrics
 
 
 def pose_loss(
@@ -245,7 +436,8 @@ def pose_loss(
 class MSFlowTrainer:
     """MSFlowPoseNet 训练器."""
 
-    def __init__(self, config: Dict, resume_path: str = None, warmstart_path: str = None):
+    def __init__(self, config: Dict, resume_path: str = None,
+                 warmstart_path: str = None, continue_path: str = None):
         self.config = config
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -283,6 +475,8 @@ class MSFlowTrainer:
 
         if resume_path:
             self._load_checkpoint(resume_path)
+        elif continue_path:
+            self._continue_training(continue_path)
         elif warmstart_path:
             self._warmstart(warmstart_path)
 
@@ -310,6 +504,13 @@ class MSFlowTrainer:
     def _init_model(self):
         """创建 MSFlowPoseNet."""
         mc = self.config.get('model', {})
+        rc = self.config.get('renderer', {})
+        intrinsics = {
+            'fx': rc.get('fx', 320.0),
+            'fy': rc.get('fy', 320.0),
+            'cx': rc.get('cx', 319.5),
+            'cy': rc.get('cy', 239.5),
+        }
         self.model = MSFlowPoseNet(
             hidden_dim=mc.get('hidden_dim', 128),
             decode_dim=mc.get('decode_dim', 64),
@@ -319,11 +520,57 @@ class MSFlowTrainer:
             mid_hw=tuple(mc.get('mid_hw', [15, 20])),
             fine_hw=tuple(mc.get('fine_hw', [35, 46])),
             fine_iters=mc.get('fine_iters', 4),
+            mid_iters=mc.get('mid_iters', 1),
+            corr_temperature=mc.get('corr_temperature', 1.0),
+            intrinsics=intrinsics,
+            img_hw=(rc.get('img_height', 480), rc.get('img_width', 640)),
+            coarse_in_dim=mc.get('coarse_in_dim', 512),
+            mid_in_dim=mc.get('mid_in_dim', 512),
+            fine_sd_in_dim=mc.get('fine_sd_in_dim', 512),
+            fine_dino_in_dim=mc.get('fine_dino_in_dim', 768),
+            irls_iters=mc.get('irls_iters', 0),
+            irls_huber_k=mc.get('irls_huber_k', 1.345),
+            deep_flow_head=mc.get('deep_flow_head', False),
+            cross_scale_context=mc.get('cross_scale_context', False),
+            cross_scale_dim=mc.get('cross_scale_dim', 32),
+            pose_refinement=mc.get('pose_refinement', False),
+            corr_dilations=tuple(mc['corr_dilations']) if mc.get('corr_dilations') else None,
+            geometry_upsample=mc.get('geometry_upsample', 1),
+            multiscale_consistency=mc.get('multiscale_consistency', False),
+            ms_consistency_sigma=mc.get('ms_consistency_sigma', 1.0),
+            pixel_stride=mc.get('pixel_stride', 1),
+            adaptive_damping=mc.get('adaptive_damping', False),
+            adaptive_damping_max=mc.get('adaptive_damping_max', 0.1),
+            adaptive_damping_cond_thresh=mc.get('adaptive_damping_cond_thresh', 1e4),
+            positional_encoding=mc.get('positional_encoding', False),
+            pe_mode=mc.get('pe_mode', 'concat'),
+            pe_dim=mc.get('pe_dim', 32),
+            skip_coarse_flow=mc.get('skip_coarse_flow', False),
+            learnable_temperature=mc.get('learnable_temperature', False),
+            directional_confidence=mc.get('directional_confidence', False),
+            dino_all_scales=mc.get('dino_all_scales', False),
+            dino_replace_sd=mc.get('dino_replace_sd', False),
         ).to(self.device)
 
         n_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        irls_str = f", irls_iters={mc.get('irls_iters', 0)}" if mc.get('irls_iters', 0) > 0 else ""
+        dfh_str = ", deep_flow_head" if mc.get('deep_flow_head', False) else ""
+        csc_str = ", cross_scale_ctx" if mc.get('cross_scale_context', False) else ""
+        pr_str = ", pose_refine" if mc.get('pose_refinement', False) else ""
+        cd_str = f", corr_dilations={mc['corr_dilations']}" if mc.get('corr_dilations') else ""
+        gu_str = f", geo_up={mc['geometry_upsample']}×" if mc.get('geometry_upsample', 1) > 1 else ""
+        msc_str = ", ms_consistency" if mc.get('multiscale_consistency', False) else ""
+        pe_str = f", pos_enc({mc.get('pe_mode', 'concat')},{mc.get('pe_dim', 32)})" if mc.get('positional_encoding', False) else ""
+        scf_str = ", skip_coarse_flow" if mc.get('skip_coarse_flow', False) else ""
+        lt_str = ", learnable_temp" if mc.get('learnable_temperature', False) else ""
+        dc_str = ", dir_conf" if mc.get('directional_confidence', False) else ""
+        ad_str = ", adaptive_damp" if mc.get('adaptive_damping', False) else ""
+        das_str = ", dino_all_scales" if mc.get('dino_all_scales', False) else ""
+        drs_str = ", dino_replace_sd" if mc.get('dino_replace_sd', False) else ""
         print(f"[Model] MSFlowPoseNet: {n_params/1e6:.2f}M trainable params, "
-              f"fine_iters={mc.get('fine_iters', 4)}")
+              f"fine_iters={mc.get('fine_iters', 4)}, "
+              f"mid_iters={mc.get('mid_iters', 1)}, "
+              f"corr_temp={mc.get('corr_temperature', 1.0)}{irls_str}{dfh_str}{csc_str}{pr_str}{cd_str}{gu_str}{msc_str}{pe_str}{scf_str}{lt_str}{dc_str}{ad_str}{das_str}{drs_str}")
 
     def _init_datasets(self):
         """准备训练/验证数据集."""
@@ -368,14 +615,19 @@ class MSFlowTrainer:
             # val subset 使用较小噪声以更好检测进步
             print(f"[Data] Auto-split: {n_train} train + {n_val} val from {n_total} total")
 
+        # persistent_workers=False so noise curriculum updates propagate to workers
+        # (persistent workers keep stale copies of dataset attributes)
+        n_workers = dc.get('num_workers', 4)
         self.train_loader = DataLoader(
             self.train_dataset,
             batch_size=dc.get('batch_size', 4),
             shuffle=True,
-            num_workers=dc.get('num_workers', 4),
+            num_workers=n_workers,
             collate_fn=collate_v4,
             pin_memory=True,
             drop_last=True,
+            persistent_workers=False,
+            prefetch_factor=2 if n_workers > 0 else None,
         )
         self.val_loader = DataLoader(
             self.val_dataset,
@@ -384,6 +636,7 @@ class MSFlowTrainer:
             num_workers=2,
             collate_fn=collate_v4,
             pin_memory=True,
+            persistent_workers=False,
         )
 
         print(f"[Data] Train: {len(self.train_dataset)} samples, "
@@ -411,8 +664,13 @@ class MSFlowTrainer:
         self.pose_weight = lc.get('pose_weight', 1.0)
         self.rot_weight = lc.get('rot_weight', 1.0)
         self.trans_weight = lc.get('trans_weight', 1.0)
-        self.rot_loss_type = lc.get('rot_loss_type', 'acos')  # 'acos' or 'cosine'
+        self.rot_loss_type = lc.get('rot_loss_type', 'cosine')  # 'cosine' (stable) or 'acos'
         self.gamma = lc.get('gamma', 0.8)  # RAFT sequence loss decay
+        self.use_huber = lc.get('use_huber', True)
+        self.huber_delta = lc.get('huber_delta', 5.0)
+        self.conf_reg_weight = lc.get('conf_reg_weight', 0.01)
+        self.conf_coverage_range = tuple(lc.get('conf_coverage_range', [0.05, 0.95]))
+        self.div_reg_weight = lc.get('div_reg_weight', 0.0)  # diversity loss weight
 
         # ── 噪声课程学习 ──
         nc = tc.get('noise_curriculum', {})
@@ -563,9 +821,23 @@ class MSFlowTrainer:
             # 4. Flow loss
             with torch.cuda.amp.autocast(enabled=self.use_amp):
                 flow_loss, flow_metrics = multiscale_flow_loss(
-                    pred, gt_flows, gt_masks, self.flow_weights, gamma=self.gamma)
+                    pred, gt_flows, gt_masks, self.flow_weights, gamma=self.gamma,
+                    use_huber=self.use_huber, huber_delta=self.huber_delta)
 
                 iter_loss = flow_loss
+
+                # Confidence regularization
+                conf_loss, conf_metrics = confidence_regularization_loss(
+                    pred, gt_flows, gt_masks,
+                    conf_coverage_range=self.conf_coverage_range)
+                iter_loss = iter_loss + self.conf_reg_weight * conf_loss
+
+                # Diversity regularization (prevents decoder feature collapse)
+                if self.div_reg_weight > 0:
+                    div_loss, div_metrics = diversity_regularization_loss(pred)
+                    iter_loss = iter_loss + self.div_reg_weight * div_loss
+                else:
+                    div_metrics = {}
 
                 # Pose loss (Phase 2)
                 if use_pose_loss and 'delta_xi' in pred:
@@ -591,6 +863,8 @@ class MSFlowTrainer:
             # 6. 记录最后一次迭代的 metrics
             if outer_i == N - 1:
                 all_metrics = flow_metrics.copy()
+                all_metrics.update(conf_metrics)
+                all_metrics.update(div_metrics)
                 if use_pose_loss and 'delta_xi' in pred:
                     all_metrics.update(p_metrics)
                     all_metrics['eff_pose_w'] = effective_pose_weight
@@ -675,6 +949,8 @@ class MSFlowTrainer:
                f"flow={avg.get('flow_total', 0):.4f}")
         if 'rot_err_deg' in avg:
             msg += f"  rot={avg['rot_err_deg']:.2f}°  trans={avg['trans_err_mm']:.1f}mm"
+        if 'div_coarse_sim' in avg:
+            msg += f"  div_sim=[{avg['div_coarse_sim']:.3f}/{avg['div_mid_sim']:.3f}/{avg['div_fine_sim']:.3f}]"
         if self.num_outer_iters > 1:
             msg += f"  ({self.num_outer_iters} outer iters)"
         print(msg)
@@ -787,27 +1063,93 @@ class MSFlowTrainer:
         ckpt = torch.load(path, map_location=self.device)
         self.model.load_state_dict(ckpt['model_state_dict'])
         self.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-        self.scheduler.load_state_dict(ckpt['scheduler_state_dict'])
         if 'scaler_state_dict' in ckpt:
             self.scaler.load_state_dict(ckpt['scaler_state_dict'])
         self.epoch = ckpt['epoch'] + 1
         self.global_step = ckpt['global_step']
         self.best_val_rot = ckpt.get('best_val_rot', float('inf'))
+
+        # If config epochs > checkpoint's original epochs, extend with fresh cosine cycle
+        old_epochs = ckpt.get('config', {}).get('training', {}).get('epochs', self.total_epochs)
+        if self.total_epochs > old_epochs and self.epoch >= old_epochs:
+            remaining = self.total_epochs - self.epoch
+            tc = self.config.get('training', {})
+            ext_lr = tc.get('continue_lr', tc.get('min_lr', 1e-6) * 10)
+            for pg in self.optimizer.param_groups:
+                pg['lr'] = ext_lr
+                pg['initial_lr'] = ext_lr
+            self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer, T_max=max(remaining, 1),
+                eta_min=tc.get('min_lr', 1e-6),
+            )
+            print(f"  Extended training: fresh cosine LR={ext_lr} over {remaining} epochs")
+        else:
+            self.scheduler.load_state_dict(ckpt['scheduler_state_dict'])
         print(f"  Resumed at epoch {self.epoch}, step {self.global_step}")
 
     def _warmstart(self, path: str):
-        """Warmstart: 只加载模型权重, 保持新的 optimizer/scheduler/epoch."""
+        """Warmstart: 只加载模型权重, 保持新的 optimizer/scheduler/epoch.
+        Handles size mismatches gracefully (e.g., when corr_dilations changes
+        the corr_encoder input channels)."""
         print(f"[Warmstart] Loading model weights from {path}")
         ckpt = torch.load(path, map_location=self.device)
         state_dict = ckpt['model_state_dict']
-        # 允许 fine_iters 不同 (GRU 迭代次数可变, 权重共享)
-        missing, unexpected = self.model.load_state_dict(state_dict, strict=False)
+
+        # Filter out keys with size mismatch
+        model_state = self.model.state_dict()
+        filtered_state = {}
+        skipped = []
+        for k, v in state_dict.items():
+            if k in model_state and v.shape != model_state[k].shape:
+                skipped.append(f"{k}: ckpt {list(v.shape)} vs model {list(model_state[k].shape)}")
+            else:
+                filtered_state[k] = v
+
+        if skipped:
+            print(f"  Skipped {len(skipped)} size-mismatched keys (random init):")
+            for s in skipped:
+                print(f"    {s}")
+
+        missing, unexpected = self.model.load_state_dict(filtered_state, strict=False)
         if missing:
             print(f"  Missing keys: {missing}")
         if unexpected:
             print(f"  Unexpected keys: {unexpected}")
         src_epoch = ckpt.get('epoch', '?')
         print(f"  Loaded weights from epoch {src_epoch}, fresh optimizer")
+
+    def _continue_training(self, path: str):
+        """Continue training: load model + optimizer state, fresh scheduler.
+        The scheduler is created to cover REMAINING epochs only (T_max = total - start),
+        starting at config LR and decaying to min_lr. This avoids the LR jump
+        that occurs when stepping a full-length cosine schedule forward."""
+        print(f"[Continue] Loading model + optimizer from {path}")
+        ckpt = torch.load(path, map_location=self.device)
+        self.model.load_state_dict(ckpt['model_state_dict'])
+        self.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        if 'scaler_state_dict' in ckpt:
+            self.scaler.load_state_dict(ckpt['scaler_state_dict'])
+        self.epoch = ckpt['epoch'] + 1
+        self.global_step = ckpt.get('global_step', 0)
+        self.best_val_rot = ckpt.get('best_val_rot', float('inf'))
+
+        tc = self.config.get('training', {})
+        remaining = self.total_epochs - self.epoch
+        cont_lr = tc.get('continue_lr', tc.get('lr', 1e-4))
+        min_lr = tc.get('min_lr', 1e-6)
+
+        # Reset optimizer LR to config value, then create fresh cosine schedule
+        for pg in self.optimizer.param_groups:
+            pg['lr'] = cont_lr
+            pg['initial_lr'] = cont_lr
+        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=max(remaining, 1), eta_min=min_lr,
+        )
+
+        old_tmax = ckpt.get('config', {}).get('training', {}).get('epochs', '?')
+        print(f"  Restored model+optimizer from epoch {ckpt['epoch']}")
+        print(f"  Fresh scheduler: T_max={remaining} (remaining of {self.total_epochs}), LR={cont_lr}")
+        print(f"  Continuing from epoch {self.epoch}, best_val_rot={self.best_val_rot:.2f}°")
 
     def train(self):
         """完整训练循环."""
@@ -873,12 +1215,16 @@ def main():
     parser.add_argument('--resume', type=str, default=None)
     parser.add_argument('--warmstart', type=str, default=None,
                         help='Warmstart from checkpoint (load model weights only)')
+    parser.add_argument('--continue_training', type=str, default=None,
+                        help='Continue training (load model+optimizer, fresh scheduler)')
     args = parser.parse_args()
 
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
 
-    trainer = MSFlowTrainer(config, resume_path=args.resume, warmstart_path=args.warmstart)
+    trainer = MSFlowTrainer(config, resume_path=args.resume,
+                            warmstart_path=args.warmstart,
+                            continue_path=args.continue_training)
     trainer.train()
 
 
