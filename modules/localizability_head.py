@@ -133,8 +133,9 @@ def localizability_loss(
         err_norm = (flow_err / error_clamp).clamp(0, 1)
         target = 1.0 - err_norm  # (B, 1, H, W)
 
-    # Binary cross-entropy loss (stable form)
-    loss = F.binary_cross_entropy(loc_score, target, reduction='none')
+    # Disable autocast for BCE (it's unsafe under AMP autocast)
+    with torch.cuda.amp.autocast(enabled=False):
+        loss = F.binary_cross_entropy(loc_score.float(), target.float(), reduction='none')
 
     if mask is not None:
         n_valid = mask.sum().clamp(min=1.0)
