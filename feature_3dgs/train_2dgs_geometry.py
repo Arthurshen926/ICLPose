@@ -349,7 +349,8 @@ class GaussianModel2DGS:
         self.xyz_gradient_accum[visibility_filter] += torch.norm(grad[visibility_filter, :2], dim=-1, keepdim=True)
         self.denom[visibility_filter] += 1
 
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
+    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size,
+                           min_gaussians=0):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
@@ -364,6 +365,26 @@ class GaussianModel2DGS:
             big_points_vs = self.max_radii2D > max_screen_size
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
             prune_mask = prune_mask | big_points_vs | big_points_ws
+
+        # Enforce minimum gaussian count: limit pruning to keep at least min_gaussians
+        if min_gaussians > 0 and prune_mask.sum() > 0:
+            n_current = self.num_points
+            n_to_prune = prune_mask.sum().item()
+            max_prune = max(0, n_current - min_gaussians)
+            if n_to_prune > max_prune:
+                # Keep only the worst (lowest opacity) gaussians for pruning
+                if max_prune > 0:
+                    opacities = self.get_opacity.squeeze()
+                    # Among candidates, keep only the max_prune lowest-opacity ones
+                    candidate_opacities = opacities.clone()
+                    candidate_opacities[~prune_mask] = float('inf')
+                    _, sorted_idx = candidate_opacities.sort()
+                    new_mask = torch.zeros_like(prune_mask)
+                    new_mask[sorted_idx[:max_prune]] = True
+                    prune_mask = new_mask
+                else:
+                    prune_mask = torch.zeros_like(prune_mask)
+
         self._prune_points(prune_mask)
         torch.cuda.empty_cache()
 
@@ -955,7 +976,7 @@ class DinoUncertaintyPredictor(nn.Module):
         if self.dino_model is not None:
             return
         print("  [DINO Uncertainty] Loading DINOv2 ViT-B/14...")
-        local_dir = '/home/yons/.cache/torch/hub/facebookresearch_dinov2_main'
+        local_dir = os.path.expanduser('~/.cache/torch/hub/facebookresearch_dinov2_main')
         if os.path.isdir(local_dir):
             self.dino_model = torch.hub.load(local_dir, 'dinov2_vitb14', source='local')
         else:
@@ -1178,20 +1199,42 @@ def load_scene(source_dir, images_subdir="", eval_split=True):
         train_cams = all_cams
         test_cams = []
 
-    # Load point cloud
+    # Load point cloud (SfM or depth-based fallback)
     ply_path = os.path.join(sparse_dir, "points3D.ply")
     bin_path = os.path.join(sparse_dir, "points3D.bin")
-    if os.path.exists(ply_path):
+    init_from_depth = getattr(args, 'init_from_depth', False)
+    sensor_depth_dir = getattr(args, 'sensor_depth_dir', None)
+
+    if os.path.exists(ply_path) and not init_from_depth:
         plydata = PlyData.read(ply_path)
         vertices = plydata["vertex"]
         pcd_xyz = np.vstack([vertices["x"], vertices["y"], vertices["z"]]).T.astype(np.float32)
         pcd_rgb = np.vstack([vertices["red"], vertices["green"], vertices["blue"]]).T.astype(np.float32) / 255.0
-    elif os.path.exists(bin_path):
+    elif os.path.exists(bin_path) and not init_from_depth:
         pcd_xyz, pcd_rgb = read_points3d_binary(bin_path)
+    elif init_from_depth and sensor_depth_dir:
+        # Depth-based initialization: unproject depth maps to 3D (no SfM needed)
+        max_init_pts = getattr(args, 'max_init_points', 100000)
+        print(f"  Using depth-based initialization from {sensor_depth_dir}")
+        pcd_xyz, pcd_rgb = init_pointcloud_from_depth(
+            all_cams, sensor_depth_dir, max_points=max_init_pts,
+            stride=8, max_depth=10.0)
     else:
-        raise FileNotFoundError(f"No point cloud found in {sparse_dir}")
+        raise FileNotFoundError(
+            f"No point cloud found in {sparse_dir}. "
+            f"Use --init_from_depth --sensor_depth_dir <path> for depth-based initialization.")
 
     print(f"  Point cloud: {pcd_xyz.shape[0]:,} points")
+
+    # Subsample very dense point clouds (e.g., mesh-sampled PLY) to prevent
+    # over-densification and training instability
+    max_init_pts = getattr(args, 'max_init_points', 100000)
+    if pcd_xyz.shape[0] > max_init_pts:
+        print(f"  Subsampling point cloud from {pcd_xyz.shape[0]:,} to {max_init_pts:,}")
+        rng = np.random.RandomState(42)
+        idx = rng.choice(pcd_xyz.shape[0], max_init_pts, replace=False)
+        pcd_xyz = pcd_xyz[idx]
+        pcd_rgb = pcd_rgb[idx]
 
     # Compute cameras extent (scene scale)
     cam_centers = []
@@ -1450,6 +1493,7 @@ def pearson_depth_loss(rendered_depth, mono_depth, valid_mask=None):
     md = mono_depth
 
     if valid_mask is not None:
+        valid_mask = valid_mask.bool()  # Ensure bool type for indexing
         rd = rd[valid_mask]
         md = md[valid_mask]
     else:
@@ -1511,6 +1555,203 @@ def load_mono_depth(cam, mono_depth_dir, target_h, target_w):
     return depth_t
 
 
+def load_sensor_depth(cam, sensor_depth_dir, target_h, target_w):
+    """Load raw sensor depth map (16-bit PNG, uint16, value/1000 = meters).
+
+    Naming conventions:
+      - stairs: frame-XXXXXX.color.png -> frame-XXXXXX.depth.png
+      - room_0: rgb/rgb_N.png -> depth/depth_N.png
+
+    Args:
+        cam: CameraData with .image_name
+        sensor_depth_dir: Base directory (e.g. 'dataset/stairs')
+        target_h, target_w: Render resolution
+
+    Returns:
+        depth_t: [H, W] float32 tensor in meters, or None if not found
+    """
+    import cv2
+
+    image_name = cam.image_name
+
+    # Try multiple naming conventions
+    candidates = []
+
+    # Convention 1: stairs - replace .color.png with .depth.png
+    if '.color.' in image_name:
+        candidates.append(image_name.replace('.color.', '.depth.'))
+
+    # Convention 2: room_0 - replace rgb/rgb_ with depth/depth_
+    if '/rgb/rgb_' in image_name:
+        candidates.append(image_name.replace('/rgb/rgb_', '/depth/depth_'))
+
+    # Convention 3: generic - same name in depth/ subdirectory
+    base = os.path.basename(image_name)
+    parent = os.path.dirname(image_name)
+    candidates.append(os.path.join(parent, 'depth', base))
+
+    # Convention 4: .png extension with depth_ prefix
+    name_noext = os.path.splitext(base)[0]
+    candidates.append(os.path.join(parent, 'depth', f"depth_{name_noext}.png"))
+
+    for depth_name in candidates:
+        depth_path = os.path.join(sensor_depth_dir, depth_name)
+        if os.path.exists(depth_path):
+            depth_raw = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)  # uint16
+            if depth_raw is None:
+                continue
+            depth_m = depth_raw.astype(np.float32) / 1000.0  # mm -> meters
+            # Clamp invalid depths: uint16 max (65535) -> 65.535m is invalid
+            depth_m[depth_m > 20.0] = 0.0  # treat >20m as invalid
+            depth_t = torch.from_numpy(depth_m).float().cuda()
+
+            # Resize to render resolution
+            if depth_t.shape[0] != target_h or depth_t.shape[1] != target_w:
+                depth_t = F.interpolate(
+                    depth_t[None, None], size=(target_h, target_w),
+                    mode="nearest"  # nearest for depth to avoid interpolation artifacts
+                ).squeeze()
+
+            return depth_t
+
+    return None
+
+
+def l1_depth_loss(rendered_depth, sensor_depth, valid_mask=None):
+    """L1 depth loss for absolute (metric) sensor depth.
+
+    Args:
+        rendered_depth: [1, H, W] rendered depth from 2DGS (meters)
+        sensor_depth: [H, W] sensor depth (meters)
+        valid_mask: [H, W] optional boolean mask
+
+    Returns:
+        loss: L1 distance between rendered and sensor depth (valid pixels only)
+    """
+    rd = rendered_depth.squeeze()  # [H, W]
+    sd = sensor_depth
+
+    # Valid pixels: sensor depth > 0 (0 = missing/invalid)
+    # Don't require rd > 0 — zero rendered depth should still incur loss
+    # to pull Gaussians toward correct depth (provides gradient for coverage)
+    valid = (sd > 0.01) & (sd < 20.0) & (rd < 50.0)
+    if valid_mask is not None:
+        valid = valid & valid_mask
+
+    if valid.sum() < 10:
+        return torch.tensor(0.0, device=rendered_depth.device)
+
+    loss = F.l1_loss(rd[valid], sd[valid])
+    return loss.clamp(max=2.0)
+
+
+def init_pointcloud_from_depth(train_cams, sensor_depth_dir, max_points=100000,
+                               stride=8, max_depth=10.0):
+    """Initialize point cloud from depth maps + camera poses (no SfM needed).
+
+    For each training camera, unprojects depth pixels to 3D world coordinates.
+    Uses strided sampling to keep point count manageable.
+
+    Args:
+        train_cams: list of CameraData (with FovX, FovY, R, T, width, height)
+        sensor_depth_dir: directory containing depth images
+        max_points: maximum total points (random subsample if exceeded)
+        stride: pixel stride for subsampling (8 -> every 64th pixel area)
+        max_depth: ignore depths beyond this (meters)
+
+    Returns:
+        xyz: [N, 3] float32 numpy array (world coordinates)
+        rgb: [N, 3] float32 numpy array (colors 0-1, gray default)
+    """
+    import cv2
+    all_xyz = []
+    all_rgb = []
+
+    for cam in train_cams:
+        image_name = cam.image_name
+        H, W = cam.height, cam.width
+
+        # Find depth file (same logic as load_sensor_depth)
+        candidates = []
+        if '.color.' in image_name:
+            candidates.append(image_name.replace('.color.', '.depth.'))
+        if '/rgb/rgb_' in image_name:
+            candidates.append(image_name.replace('/rgb/rgb_', '/depth/depth_'))
+        base = os.path.basename(image_name)
+        parent = os.path.dirname(image_name)
+        candidates.append(os.path.join(parent, 'depth', base))
+
+        depth_raw = None
+        for depth_name in candidates:
+            depth_path = os.path.join(sensor_depth_dir, depth_name)
+            if os.path.exists(depth_path):
+                depth_raw = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
+                if depth_raw is not None:
+                    break
+
+        if depth_raw is None:
+            continue
+
+        depth_m = depth_raw.astype(np.float32) / 1000.0  # mm -> meters
+
+        # Compute intrinsics from FoV
+        fx = W / (2 * math.tan(cam.FovX * 0.5))
+        fy = H / (2 * math.tan(cam.FovY * 0.5))
+        cx, cy = W / 2.0, H / 2.0
+
+        # Strided pixel grid
+        v_coords = np.arange(0, H, stride)
+        u_coords = np.arange(0, W, stride)
+        uu, vv = np.meshgrid(u_coords, v_coords)
+        uu = uu.flatten()
+        vv = vv.flatten()
+
+        d = depth_m[vv, uu]
+        valid = (d > 0.01) & (d < max_depth)
+        uu, vv, d = uu[valid], vv[valid], d[valid]
+
+        if len(d) == 0:
+            continue
+
+        # Unproject to camera coordinates
+        x_cam = (uu - cx) / fx * d
+        y_cam = (vv - cy) / fy * d
+        z_cam = d
+        pts_cam = np.stack([x_cam, y_cam, z_cam], axis=-1)  # [N, 3]
+
+        # Camera-to-world transform
+        # CameraData stores R (COLMAP convention transposed) and T
+        # World-to-camera: Rt[:3,:3] = R^T, Rt[:3,3] = T
+        # Camera-to-world: C2W = inv(W2C)
+        W2C = np.eye(4)
+        W2C[:3, :3] = cam.R.T
+        W2C[:3, 3] = cam.T
+        C2W = np.linalg.inv(W2C)
+
+        # Transform to world coordinates
+        pts_world = (C2W[:3, :3] @ pts_cam.T).T + C2W[:3, 3]
+
+        all_xyz.append(pts_world.astype(np.float32))
+        # Default gray color (will be overridden by SH optimization)
+        all_rgb.append(np.full_like(pts_world, 0.5, dtype=np.float32))
+
+    if not all_xyz:
+        raise RuntimeError(f"No depth maps found in {sensor_depth_dir} for depth-based initialization")
+
+    xyz = np.concatenate(all_xyz, axis=0)
+    rgb = np.concatenate(all_rgb, axis=0)
+    print(f"  Depth init: {xyz.shape[0]:,} points from {len(all_xyz)} cameras (stride={stride})")
+
+    # Random subsample if too many points
+    if xyz.shape[0] > max_points:
+        rng = np.random.RandomState(42)
+        idx = rng.choice(xyz.shape[0], max_points, replace=False)
+        xyz = xyz[idx]
+        rgb = rgb[idx]
+        print(f"  Subsampled to {max_points:,} points")
+
+    return xyz, rgb
+
 def train(args):
     print(f"\n{'='*60}")
     print(f"  2DGS Geometry Training (RGB-only)")
@@ -1527,6 +1768,10 @@ def train(args):
     print(f"  Random BG:  {'ON' if getattr(args, 'random_background', False) else 'OFF'}")
     print(f"  Appearance: {'ON' if getattr(args, 'use_appearance', False) else 'OFF'}")
     print(f"  Mono depth: {args.mono_depth_dir or 'NONE'}")
+    sensor_depth_dir_print = getattr(args, 'sensor_depth_dir', None)
+    print(f"  Sensor dep: {sensor_depth_dir_print or 'NONE'} (lambda={getattr(args, 'lambda_sensor_depth', 0.0)})")
+    if getattr(args, 'init_from_depth', False):
+        print(f"  Init mode:  DEPTH-BASED (no SfM points needed)")
     print(f"  Densify:    until_iter={args.densify_until_iter}, grad_thresh={args.densify_grad_threshold}")
     lr_decay = getattr(args, 'lr_decay_factor', 1.0)
     if lr_decay < 1.0:
@@ -1578,6 +1823,21 @@ def train(args):
         n_depths = sum(1 for c in train_cams
                        if os.path.exists(os.path.join(mono_depth_dir, os.path.splitext(c.image_name)[0] + ".npy")))
         print(f"  Mono depth: {n_depths}/{len(train_cams)} depth maps available")
+
+    # Check sensor depth directory
+    sensor_depth_dir = getattr(args, 'sensor_depth_dir', None)
+    if sensor_depth_dir and not os.path.isdir(sensor_depth_dir):
+        print(f"  Warning: sensor_depth_dir={sensor_depth_dir} not found, sensor depth disabled")
+        sensor_depth_dir = None
+    if sensor_depth_dir:
+        test_depth = load_sensor_depth(train_cams[0], sensor_depth_dir,
+                                       train_cams[0].height, train_cams[0].width)
+        if test_depth is not None:
+            print(f"  Sensor depth: verified (range [{test_depth.min():.2f}, {test_depth.max():.2f}] m)")
+        else:
+            print(f"  Warning: Could not load sensor depth for {train_cams[0].image_name}")
+            print(f"           Check naming convention vs sensor_depth_dir={sensor_depth_dir}")
+    lambda_sensor_depth = getattr(args, 'lambda_sensor_depth', 0.0) if sensor_depth_dir else 0.0
 
     # Initialize Gaussian model
     print("Initializing Gaussians...")
@@ -1739,6 +1999,7 @@ def train(args):
     # Training loop
     viewpoint_stack = None
     ema_loss = 0.0
+    consecutive_extreme = 0  # Track consecutive extreme loss events
     batch_size = getattr(args, 'batch_size', 1)
     if batch_size > 1:
         print(f"  Batch parallel rendering: batch_size={batch_size} views per optimizer step")
@@ -1918,7 +2179,12 @@ def train(args):
 
             # Monocular depth supervision (Pearson correlation loss)
             depth_loss_val = torch.tensor(0.0)
-            lambda_depth = args.lambda_depth if iteration > args.depth_start_iter else 0.0
+            depth_warmup_iters = getattr(args, 'depth_warmup_iters', 1000)
+            if iteration > args.depth_start_iter:
+                warmup_progress = min(1.0, (iteration - args.depth_start_iter) / max(1, depth_warmup_iters))
+                lambda_depth = args.lambda_depth * warmup_progress
+            else:
+                lambda_depth = 0.0
             if lambda_depth > 0 and mono_depth_dir:
                 rendered_depth = render_pkg["depth"]  # [1, H, W]
                 # Use cached depth map (fast) or load from disk (fallback)
@@ -1933,12 +2199,39 @@ def train(args):
                 else:
                     mono_d = load_mono_depth(cam, mono_depth_dir, rh, rw)
                 if mono_d is not None:
-                    # Apply mask to depth supervision: exclude dynamic objects
-                    # where DPT depth is unreliable
-                    depth_mask = mask.squeeze(0) if mask is not None else None
+                    depth_mask = mask.squeeze(0).bool() if mask is not None else None
                     depth_loss_val = lambda_depth * pearson_depth_loss(
                         rendered_depth, mono_d, valid_mask=depth_mask)
                     loss = loss + depth_loss_val
+
+            # Sensor depth supervision (L1 loss in metric space)
+            sensor_depth_loss_val = torch.tensor(0.0)
+            if iteration > args.depth_start_iter:
+                _lambda_sd = lambda_sensor_depth * warmup_progress  # reuse warmup_progress from above
+            else:
+                _lambda_sd = 0.0
+            if _lambda_sd > 0 and sensor_depth_dir:
+                rendered_depth = render_pkg["depth"]  # [1, H, W]
+                sensor_d = load_sensor_depth(cam, sensor_depth_dir, rh, rw)
+                if sensor_d is not None:
+                    depth_mask = mask.squeeze(0).bool() if mask is not None else None
+                    sensor_depth_loss_val = _lambda_sd * l1_depth_loss(
+                        rendered_depth, sensor_d, valid_mask=depth_mask)
+                    loss = loss + sensor_depth_loss_val
+                    # Debug: log sensor depth diagnostics every 1000 iters
+                    if iteration % 1000 == 1 and _b == 0:
+                        rd = rendered_depth.squeeze()
+                        sd_valid = (sensor_d > 0.01) & (sensor_d < 20.0)
+                        rd_valid = (rd > 0.01) & (rd < 50.0)
+                        both_valid = sd_valid & (rd < 50.0)
+                        tqdm.write(f"  [Iter {iteration}] SensorDepth diag: "
+                                   f"sd_valid={sd_valid.sum().item()} rd_nonzero={rd_valid.sum().item()} "
+                                   f"both_valid={both_valid.sum().item()} "
+                                   f"rd_range=[{rd.min():.3f},{rd.max():.3f}] "
+                                   f"sd_range=[{sensor_d.min():.3f},{sensor_d.max():.3f}] "
+                                   f"loss={sensor_depth_loss_val.item():.6f}")
+                elif iteration % 1000 == 1 and _b == 0:
+                    tqdm.write(f"  [Iter {iteration}] WARNING: load_sensor_depth returned None for {cam.image_name}")
 
             # Log loss components every 500 iters for diagnostics
             if iteration % 500 == 1 and _b == 0:
@@ -1947,10 +2240,11 @@ def train(args):
                 d_val = lambda_dist * rend_dist.mean().item() if lambda_dist > 0 and 'rend_dist' in dir() else 0
                 s_val = scale_loss_val.item() if hasattr(scale_loss_val, 'item') else 0
                 dep_val = depth_loss_val.item() if hasattr(depth_loss_val, 'item') else 0
+                sdep_val = sensor_depth_loss_val.item() if hasattr(sensor_depth_loss_val, 'item') else 0
                 tqdm.write(f"  [Iter {iteration}] Loss breakdown: "
                            f"RGB={rgb_loss_val:.4f} Normal={n_val:.4f} "
                            f"Dist={d_val:.4f} Scale={s_val:.6f} "
-                           f"Depth={dep_val:.4f} "
+                           f"Depth={dep_val:.4f} SensorD={sdep_val:.4f} "
                            f"Total={loss.item():.4f} N={gaussians.num_points:,}")
 
             losses.append(loss)
@@ -2001,11 +2295,72 @@ def train(args):
                 emb_l2 = (appearance_net.image_embedding.weight ** 2).mean()
                 total_loss = total_loss + wg_emb_reg * emb_l2
 
-        # Robust loss guard: skip backward for NaN/Inf AND extreme finite values
-        if torch.isnan(total_loss) or torch.isinf(total_loss) or total_loss.item() > 10.0:
-            tqdm.write(f"  [Iter {iteration}] WARNING: Extreme loss={total_loss.item():.4g}, skipping backward")
+        # Robust loss guard: handle NaN/Inf and extreme losses
+        loss_val = total_loss.item()
+        is_nan_inf = torch.isnan(total_loss) or torch.isinf(total_loss) or loss_val < -0.01
+        is_extreme = loss_val > 10.0
+        if is_nan_inf:
+            # NaN/Inf/negative: skip backward entirely
+            consecutive_extreme += 1
+            tqdm.write(f"  [Iter {iteration}] WARNING: NaN/Inf loss={loss_val:.4g}, "
+                       f"skipping backward (consecutive={consecutive_extreme})")
             gaussians.optimizer.zero_grad(set_to_none=True)
+
+            # Sanitize NaN/Inf Gaussian parameters to prevent persistent corruption
+            with torch.no_grad():
+                nan_mask = torch.zeros(gaussians._xyz.shape[0], dtype=torch.bool, device="cuda")
+                for param in [gaussians._xyz, gaussians._features_dc, gaussians._scaling,
+                              gaussians._rotation, gaussians._opacity]:
+                    nan_mask |= torch.any(torch.isnan(param.data.view(param.shape[0], -1)) |
+                                          torch.isinf(param.data.view(param.shape[0], -1)), dim=1)
+                # Also flag Gaussians with extreme scaling (log-scale > 5 ≈ e^5 ≈ 148x)
+                extreme_scale = torch.any(gaussians._scaling.data.abs() > 5.0, dim=1)
+                nan_mask |= extreme_scale
+                n_nan = nan_mask.sum().item()
+                if n_nan > 0:
+                    tqdm.write(f"  [Iter {iteration}] Sanitizing {n_nan} bad Gaussians "
+                               f"({n_nan}/{gaussians._xyz.shape[0]}, "
+                               f"NaN/Inf + extreme_scale={extreme_scale.sum().item()})")
+                    # Replace NaN Gaussians with random healthy ones
+                    healthy_idx = (~nan_mask).nonzero(as_tuple=True)[0]
+                    if len(healthy_idx) > 0:
+                        replace_idx = healthy_idx[torch.randint(len(healthy_idx), (n_nan,))]
+                        for param in [gaussians._xyz, gaussians._features_dc, gaussians._features_rest,
+                                      gaussians._scaling, gaussians._rotation, gaussians._opacity]:
+                            param.data[nan_mask] = param.data[replace_idx]
+                        # Also reset optimizer state for these Gaussians
+                        for group in gaussians.optimizer.param_groups:
+                            for p in group['params']:
+                                if p in gaussians.optimizer.state:
+                                    state = gaussians.optimizer.state[p]
+                                    if 'exp_avg' in state and state['exp_avg'].shape[0] == nan_mask.shape[0]:
+                                        state['exp_avg'][nan_mask] = 0
+                                    if 'exp_avg_sq' in state and state['exp_avg_sq'].shape[0] == nan_mask.shape[0]:
+                                        state['exp_avg_sq'][nan_mask] = 0
+
+            if consecutive_extreme >= 10:
+                tqdm.write(f"  [Iter {iteration}] CRITICAL: {consecutive_extreme} consecutive bad losses. "
+                           f"Resetting optimizer state.")
+                for group in gaussians.optimizer.param_groups:
+                    for p in group['params']:
+                        if p in gaussians.optimizer.state:
+                            state = gaussians.optimizer.state[p]
+                            if 'exp_avg' in state:
+                                state['exp_avg'].zero_()
+                            if 'exp_avg_sq' in state:
+                                state['exp_avg_sq'].zero_()
+                consecutive_extreme = 0
             continue
+        elif is_extreme:
+            # Extreme but finite: clamp and still backward to allow recovery
+            consecutive_extreme += 1
+            if consecutive_extreme % 50 == 1:
+                tqdm.write(f"  [Iter {iteration}] WARNING: Extreme loss={loss_val:.4g}, "
+                           f"clamping to 10.0 (consecutive={consecutive_extreme})")
+            total_loss = total_loss.clamp(max=10.0)
+            # Fall through to backward
+        else:
+            consecutive_extreme = 0  # Reset on normal iteration
 
         total_loss.backward()
 
@@ -2088,6 +2443,7 @@ def train(args):
                 in_cooldown = (iters_since_reset > 0 and iters_since_reset < 500) or \
                               (iteration > 0 and iters_since_reset == 0)
 
+                min_gauss = getattr(args, 'min_gaussians', 0)
                 if iteration > args.densify_from_iter and iteration % args.densification_interval == 0:
                     size_threshold = 20 if iteration > args.opacity_reset_interval else None
                     if in_cooldown:
@@ -2095,11 +2451,13 @@ def train(args):
                         gaussians.densify_and_prune(
                             args.densify_grad_threshold, 0.0,
                             cameras_extent, None,
+                            min_gaussians=min_gauss,
                         )
                     else:
                         gaussians.densify_and_prune(
                             args.densify_grad_threshold, 0.005,
                             cameras_extent, size_threshold,
+                            min_gaussians=min_gauss,
                         )
 
                 if iteration % args.opacity_reset_interval == 0:
@@ -2136,6 +2494,11 @@ def train(args):
                                    (gaussians.get_opacity.squeeze() > 0.3)
                     dead_mask = gaussians.get_opacity.squeeze() < prune_dead_thresh
                     prune_mask = floater_mask | dead_mask
+                    # Respect min_gaussians floor
+                    if min_gauss > 0 and prune_mask.sum() > 0:
+                        max_prune = max(0, gaussians.num_points - min_gauss)
+                        if prune_mask.sum() > max_prune:
+                            prune_mask = torch.zeros_like(prune_mask)  # skip pruning if it would go below floor
                     if prune_mask.sum() > 0:
                         n_before = gaussians.num_points
                         gaussians._prune_points(prune_mask)
@@ -2491,6 +2854,15 @@ def parse_args():
                              "Requires --mono_depth_dir with precomputed depth maps.")
     parser.add_argument("--depth_start_iter", type=int, default=2000,
                         help="Enable depth supervision after this iteration")
+    parser.add_argument("--sensor_depth_dir", type=str, default=None,
+                        help="Base directory for raw sensor depth maps (16-bit PNG, uint16, mm). "
+                             "Supports stairs (.depth.png) and room_0 (depth/depth_N.png) naming.")
+    parser.add_argument("--lambda_sensor_depth", type=float, default=0.5,
+                        help="Sensor depth supervision weight (L1 loss in meters). "
+                             "Requires --sensor_depth_dir with raw depth images.")
+    parser.add_argument("--init_from_depth", action="store_true",
+                        help="Initialize point cloud from depth maps instead of SfM points. "
+                             "Requires --sensor_depth_dir. Useful when no sparse point cloud available.")
     parser.add_argument("--lambda_scale", type=float, default=0.1,
                         help="Scale regularization weight (penalize overly large Gaussians)")
     parser.add_argument("--scale_reg_threshold", type=float, default=1.0,
@@ -2557,6 +2929,12 @@ def parse_args():
                              "Uses static masks only (masks.pkl).")
     parser.add_argument("--max_gaussians", type=int, default=0,
                         help="Maximum number of Gaussians (0=unlimited). Prevents overfitting.")
+    parser.add_argument("--min_gaussians", type=int, default=0,
+                        help="Minimum Gaussian count floor. Pruning is limited to keep at least this many. 0=no floor.")
+    parser.add_argument("--depth_warmup_iters", type=int, default=1000,
+                        help="Ramp up depth loss from 0 to full weight over this many iters after depth_start_iter.")
+    parser.add_argument("--max_init_points", type=int, default=100000,
+                        help="Max initial point cloud size. Dense mesh-sampled PLYs are subsampled.")
     parser.add_argument("--random_background", action="store_true",
                         help="Use random background color during training (encourages opaque Gaussians, "
                              "improves sky/transparent region reconstruction)")

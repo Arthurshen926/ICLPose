@@ -31,18 +31,22 @@ from data.dataset_v3 import PoseDatasetV3, collate_v3
 
 
 # ============ Camera Intrinsics ============
-# Replica room_0: 640×480, fx=fy=320, cx=319.5, cy=239.5
+# Default: Replica room_0 — override via --fx, --fy, --cx, --cy, --img_w, --img_h
 
 IMG_W, IMG_H = 640, 480
 FLOW_W, FLOW_H = 46, 35  # Model output resolution
 
-INTRINSICS_FULL = {'fx': 320.0, 'fy': 320.0, 'cx': 319.5, 'cy': 239.5}
-INTRINSICS_FLOW = {
-    'fx': 320.0 * FLOW_W / IMG_W,   # ≈ 23.0
-    'fy': 320.0 * FLOW_H / IMG_H,   # ≈ 23.3
-    'cx': 319.5 * FLOW_W / IMG_W,   # ≈ 22.97
-    'cy': 239.5 * FLOW_H / IMG_H,   # ≈ 17.47
-}
+
+def make_intrinsics(fx, fy, cx, cy, img_w, img_h, flow_w=FLOW_W, flow_h=FLOW_H):
+    """Compute full and flow-resolution intrinsics from base values."""
+    full = {'fx': fx, 'fy': fy, 'cx': cx, 'cy': cy}
+    flow = {
+        'fx': fx * flow_w / img_w,
+        'fy': fy * flow_h / img_h,
+        'cx': cx * flow_w / img_w,
+        'cy': cy * flow_h / img_h,
+    }
+    return full, flow
 
 
 # ============ Curriculum Noise Schedule ============
@@ -122,12 +126,31 @@ def parse_args():
     # Depth 
     p.add_argument('--depth_scale', type=float, default=1000.0)
     
+    # Camera intrinsics (default: Replica room_0)
+    p.add_argument('--fx', type=float, default=320.0)
+    p.add_argument('--fy', type=float, default=320.0)
+    p.add_argument('--cx', type=float, default=319.5)
+    p.add_argument('--cy', type=float, default=239.5)
+    p.add_argument('--img_w', type=int, default=640)
+    p.add_argument('--img_h', type=int, default=480)
+    
     # 其他
     p.add_argument('--val_ratio', type=float, default=0.1)
     p.add_argument('--log_interval', type=int, default=20)
     p.add_argument('--save_interval', type=int, default=10)
     p.add_argument('--seed', type=int, default=42)
     p.add_argument('--resume', type=str, default=None)
+    
+    # Dataset type
+    p.add_argument('--dataset_type', default='replica',
+                   choices=['replica', '7scenes', 'cambridge'],
+                   help='Dataset format for pose/depth loading')
+    p.add_argument('--traj_path', default=None,
+                   help='Direct path to trajectory file (overrides auto-construction)')
+    p.add_argument('--depth_dir', default=None,
+                   help='Direct path to depth directory (overrides auto-construction)')
+    p.add_argument('--num_frames', type=int, default=None,
+                   help='Total frames (auto-detected if None)')
     
     return p.parse_args()
 
@@ -155,20 +178,68 @@ def setup_renderer(args, device):
         ply_path=args.ply_path,
         scale_model_paths=scale_model_paths,
         device=device,
+        img_height=args.img_h,
+        img_width=args.img_w,
+        fx=args.fx, fy=args.fy,
+        cx=args.cx, cy=args.cy,
     )
 
 
 def setup_data(args, scale_names, use_depth=True):
-    """创建训练/验证数据集"""
-    traj_path = os.path.join(args.dataset_root, args.scene, 'Sequence_1', 'traj_w_c.txt')
-    depth_dir = os.path.join(args.dataset_root, args.scene, 'Sequence_1', 'depth') if use_depth else None
+    """创建训练/验证数据集 — 支持多种数据集格式"""
     
-    all_indices = list(range(900))
-    np.random.seed(args.seed)
-    np.random.shuffle(all_indices)
-    val_size = int(len(all_indices) * args.val_ratio)
-    val_indices = sorted(all_indices[:val_size])
-    train_indices = sorted(all_indices[val_size:])
+    if args.dataset_type == 'replica':
+        # Replica: single traj_w_c.txt, depth/depth_{idx}.png
+        traj_path = args.traj_path or os.path.join(
+            args.dataset_root, args.scene, 'Sequence_1', 'traj_w_c.txt')
+        depth_dir = (args.depth_dir or os.path.join(
+            args.dataset_root, args.scene, 'Sequence_1', 'depth')) if use_depth else None
+        num_frames = args.num_frames or 900
+        
+        all_indices = list(range(num_frames))
+        np.random.seed(args.seed)
+        np.random.shuffle(all_indices)
+        val_size = int(len(all_indices) * args.val_ratio)
+        val_indices = sorted(all_indices[:val_size])
+        train_indices = sorted(all_indices[val_size:])
+    
+    elif args.dataset_type == '7scenes':
+        # 7-Scenes: per-frame pose files, combined via feature extraction trajectory
+        traj_path = args.traj_path or os.path.join(
+            'output', 'features_multiscale', args.scene, 'trajectory.txt')
+        depth_dir = args.depth_dir if use_depth else None
+        
+        # Count frames from trajectory file
+        if os.path.exists(traj_path):
+            traj = np.loadtxt(traj_path)
+            num_frames = traj.shape[0]
+        else:
+            raise FileNotFoundError(f"Trajectory file not found: {traj_path}")
+        
+        all_indices = list(range(num_frames))
+        np.random.seed(args.seed)
+        np.random.shuffle(all_indices)
+        val_size = int(len(all_indices) * args.val_ratio)
+        val_indices = sorted(all_indices[:val_size])
+        train_indices = sorted(all_indices[val_size:])
+    
+    elif args.dataset_type == 'cambridge':
+        traj_path = args.traj_path
+        depth_dir = None  # Cambridge Landmarks has no depth
+        if traj_path is None:
+            raise ValueError("--traj_path required for cambridge dataset")
+        traj = np.loadtxt(traj_path)
+        num_frames = traj.shape[0]
+        
+        all_indices = list(range(num_frames))
+        np.random.seed(args.seed)
+        np.random.shuffle(all_indices)
+        val_size = int(len(all_indices) * args.val_ratio)
+        val_indices = sorted(all_indices[:val_size])
+        train_indices = sorted(all_indices[val_size:])
+    
+    else:
+        raise ValueError(f"Unknown dataset_type: {args.dataset_type}")
     
     print(f"[Data] Train: {len(train_indices)} frames, Val: {len(val_indices)} frames")
     
@@ -185,7 +256,7 @@ def setup_data(args, scale_names, use_depth=True):
         noise_rot_deg=init_noise_rot,
         noise_trans_m=init_noise_trans,
         is_train=True,
-        depth_resize=(FLOW_H, FLOW_W),  # Resize depth to 35×46 for flow
+        depth_resize=(FLOW_H, FLOW_W),
     )
     
     val_dataset = PoseDatasetV3(
@@ -397,6 +468,10 @@ def main():
     print("=" * 70)
     print("ICPoseNetV3 Training (v4 - Flow Loss + Curriculum)")
     print("=" * 70)
+    
+    # Compute intrinsics from args
+    INTRINSICS_FULL, INTRINSICS_FLOW = make_intrinsics(
+        args.fx, args.fy, args.cx, args.cy, args.img_w, args.img_h)
     
     # 1. Renderer  
     print(f"\n[1] Loading renderer with scales: {args.scales}")

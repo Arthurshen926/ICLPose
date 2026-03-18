@@ -285,55 +285,50 @@ def compute_gt_flow(
         indexing='ij'
     )  # (H, W) each
     
-    flows = []
-    valids = []
+    # ── Vectorized: no per-batch loop ──
+    # 反投影到相机坐标系  (B, H, W)
+    z = depth_gt
+    valid_depth = z > 0.05
     
-    for b in range(B):
-        z = depth_gt[b]  # (H, W)
-        valid_depth = z > 0.05
-        
-        # 反投影到相机坐标系
-        x_c = (u_coords - cx) / fx * z
-        y_c = (v_coords - cy) / fy * z
-        points_cam = torch.stack([x_c, y_c, z], dim=-1)  # (H, W, 3)
-        
-        # 相机坐标 → 世界坐标 (pose_gt 是 w2c: p_c = R·p_w + t)
-        R_gt = pose_gt[b, :3, :3]
-        t_gt = pose_gt[b, :3, 3]
-        R_gt_inv = R_gt.T
-        t_gt_inv = -R_gt.T @ t_gt
-        
-        points_flat = points_cam.reshape(-1, 3)  # (HW, 3)
-        points_world = (R_gt_inv @ points_flat.T).T + t_gt_inv  # (HW, 3)
-        
-        # 世界坐标 → 当前位姿的相机坐标
-        R_cur = pose_current[b, :3, :3]
-        t_cur = pose_current[b, :3, 3]
-        points_cur_cam = (R_cur @ points_world.T).T + t_cur  # (HW, 3)
-        
-        # 投影到像素坐标
-        z_cur = points_cur_cam[:, 2]
-        valid_z = z_cur > 0.05
-        
-        u_proj = fx * points_cur_cam[:, 0] / (z_cur + 1e-8) + cx
-        v_proj = fy * points_cur_cam[:, 1] / (z_cur + 1e-8) + cy
-        
-        u_proj = u_proj.reshape(H, W)
-        v_proj = v_proj.reshape(H, W)
-        
-        flow_u = u_proj - u_coords
-        flow_v = v_proj - v_coords
-        flow = torch.stack([flow_u, flow_v], dim=0)  # (2, H, W)
-        
-        valid_z = valid_z.reshape(H, W)
-        valid_proj = (u_proj >= 0) & (u_proj < W) & (v_proj >= 0) & (v_proj < H)
-        valid = valid_depth & valid_z & valid_proj  # (H, W)
-        
-        flows.append(flow)
-        valids.append(valid)
+    x_c = (u_coords.unsqueeze(0) - cx) / fx * z   # (B, H, W)
+    y_c = (v_coords.unsqueeze(0) - cy) / fy * z   # (B, H, W)
     
-    flow_out = torch.stack(flows, dim=0)                  # (B, 2, H, W)
-    valid_out = torch.stack(valids, dim=0).unsqueeze(1)    # (B, 1, H, W)
+    # 相机坐标 → 世界坐标 (pose_gt 是 w2c: p_c = R·p_w + t)
+    points_cam = torch.stack([x_c, y_c, z], dim=-1)  # (B, H, W, 3)
+    points_flat = points_cam.reshape(B, -1, 3)        # (B, HW, 3)
+    
+    R_gt = pose_gt[:, :3, :3]    # (B, 3, 3)
+    t_gt = pose_gt[:, :3, 3]     # (B, 3)
+    R_gt_inv = R_gt.transpose(-1, -2)                 # (B, 3, 3)
+    t_gt_inv = -torch.bmm(R_gt_inv, t_gt.unsqueeze(-1)).squeeze(-1)  # (B, 3)
+    
+    # (B, 3, 3) @ (B, 3, HW) → (B, 3, HW) → (B, HW, 3) + (B, 1, 3)
+    points_world = torch.bmm(R_gt_inv, points_flat.transpose(1, 2)).transpose(1, 2) + t_gt_inv.unsqueeze(1)
+    
+    # 世界坐标 → 当前位姿的相机坐标
+    R_cur = pose_current[:, :3, :3]   # (B, 3, 3)
+    t_cur = pose_current[:, :3, 3]    # (B, 3)
+    points_cur_cam = torch.bmm(R_cur, points_world.transpose(1, 2)).transpose(1, 2) + t_cur.unsqueeze(1)  # (B, HW, 3)
+    
+    # 投影到像素坐标
+    z_cur = points_cur_cam[:, :, 2]    # (B, HW)
+    valid_z = z_cur > 0.05
+    # Safe division: use 1.0 for invalid z to avoid inf/nan, masked out later
+    z_safe = torch.where(valid_z, z_cur, torch.ones_like(z_cur))
+    
+    u_proj = fx * points_cur_cam[:, :, 0] / z_safe + cx   # (B, HW)
+    v_proj = fy * points_cur_cam[:, :, 1] / z_safe + cy   # (B, HW)
+    
+    u_proj = u_proj.reshape(B, H, W)
+    v_proj = v_proj.reshape(B, H, W)
+    
+    flow_u = u_proj - u_coords.unsqueeze(0)    # (B, H, W)
+    flow_v = v_proj - v_coords.unsqueeze(0)    # (B, H, W)
+    flow_out = torch.stack([flow_u, flow_v], dim=1)  # (B, 2, H, W)
+    
+    valid_z = valid_z.reshape(B, H, W)
+    valid_proj = (u_proj >= 0) & (u_proj < W) & (v_proj >= 0) & (v_proj < H)
+    valid_out = (valid_depth & valid_z & valid_proj).unsqueeze(1).float()  # (B, 1, H, W)
     
     if not batched:
         flow_out = flow_out.squeeze(0)    # (2, H, W)

@@ -423,9 +423,16 @@ def pose_loss(
         # Loss: rot + trans
         loss = rot_loss_val * rot_weight + trans_err.mean() * trans_weight
 
+    # Guard against NaN in metrics
+    rot_mean = rot_err_deg.mean().item()
+    trans_mean = (trans_err * 1000).mean().item()
+    if not math.isfinite(rot_mean):
+        rot_mean = float('nan')
+    if not math.isfinite(trans_mean):
+        trans_mean = float('nan')
     return loss, {
-        'rot_err_deg': rot_err_deg.mean().item(),
-        'trans_err_mm': (trans_err * 1000).mean().item(),
+        'rot_err_deg': rot_mean,
+        'trans_err_mm': trans_mean,
         'pose_loss': loss.item(),
     }
 
@@ -615,6 +622,9 @@ class MSFlowTrainer:
             dino_all_scales=mc.get('dino_all_scales', False),
             dino_replace_sd=mc.get('dino_replace_sd', False),
             localizability_prior=mc.get('localizability_prior', False),
+            attention_coarse=mc.get('attention_coarse', False),
+            attention_coarse_heads=mc.get('attention_coarse_heads', 4),
+            attention_coarse_layers=mc.get('attention_coarse_layers', 2),
         ).to(self.device)
 
         n_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
@@ -634,10 +644,11 @@ class MSFlowTrainer:
         das_str = ", dino_all_scales" if mc.get('dino_all_scales', False) else ""
         drs_str = ", dino_replace_sd" if mc.get('dino_replace_sd', False) else ""
         loc_str = ", loc_prior" if mc.get('localizability_prior', False) else ""
+        attn_str = ", attn_coarse" if mc.get('attention_coarse', False) else ""
         print(f"[Model] MSFlowPoseNet: {n_params/1e6:.2f}M trainable params, "
               f"fine_iters={mc.get('fine_iters', 4)}, "
               f"mid_iters={mc.get('mid_iters', 1)}, "
-              f"corr_temp={mc.get('corr_temperature', 1.0)}{irls_str}{dfh_str}{csc_str}{pr_str}{cd_str}{gu_str}{msc_str}{pe_str}{dpe_str}{scf_str}{lt_str}{dc_str}{ad_str}{das_str}{drs_str}{loc_str}")
+              f"corr_temp={mc.get('corr_temperature', 1.0)}{irls_str}{dfh_str}{csc_str}{pr_str}{cd_str}{gu_str}{msc_str}{pe_str}{dpe_str}{scf_str}{lt_str}{dc_str}{ad_str}{das_str}{drs_str}{loc_str}{attn_str}")
 
     def _init_datasets(self):
         """准备训练/验证数据集."""
@@ -798,8 +809,9 @@ class MSFlowTrainer:
         dc = self.config['data']
         self.noise_rot_max = dc.get('noise_rot_deg', 8.0)
         self.noise_trans_max = dc.get('noise_trans_m', 0.25)
-        self.noise_rot_min = nc.get('noise_rot_min', 2.0)
-        self.noise_trans_min = nc.get('noise_trans_min', 0.05)
+        # Accept both naming conventions: noise_rot_min / start_noise_rot / start_rot_deg
+        self.noise_rot_min = nc.get('noise_rot_min', nc.get('start_noise_rot', nc.get('start_rot_deg', 2.0)))
+        self.noise_trans_min = nc.get('noise_trans_min', nc.get('start_noise_trans', nc.get('start_trans_m', 0.05)))
 
         # ── Pose loss warmup ──
         pw = tc.get('pose_warmup', {})
@@ -811,6 +823,184 @@ class MSFlowTrainer:
         self.num_outer_iters = tc.get('outer_iters', 1)
         self.val_outer_iters = tc.get('val_outer_iters', 1)
         self.gamma_outer = lc.get('gamma_outer', 0.8)
+
+        # ── Depth-warp mode: bypass 3DGS feature rendering ──
+        self.use_depth_warp = tc.get('use_depth_warp', False)
+        self.use_cross_frame_warp = tc.get('use_cross_frame_warp', False)
+        if self.use_depth_warp or self.use_cross_frame_warp:
+            from modules.depth_warp import backward_warp_features
+            self._backward_warp = backward_warp_features
+            self._scale_intrinsics = self.renderer.get_scale_intrinsics()
+            if self.use_cross_frame_warp:
+                self._init_cross_frame_cache()
+                print(f"  ✓ Cross-frame warp mode enabled (warp from nearest neighbor)")
+            else:
+                print(f"  ✓ Depth-warp mode enabled (bypass 3DGS feature rendering)")
+
+        # ── Pre-loaded rendered reference features (for render-extract training) ──
+        self._ref_feature_cache = None  # {frame_idx: {scale: (C,H,W)}}
+        ref_feature_dir = tc.get('ref_feature_dir', None)
+        if ref_feature_dir:
+            self._init_ref_feature_cache(ref_feature_dir)
+
+        # ── Reference feature augmentation (train-only) ──
+        ref_aug = tc.get('ref_feat_augmentation', {})
+        self.ref_aug_enabled = ref_aug.get('enabled', False)
+        self.ref_aug_noise_std = ref_aug.get('noise_std', 0.2)
+        self.ref_aug_spatial_dropout = ref_aug.get('spatial_dropout', 0.15)
+        self.ref_aug_channel_jitter = ref_aug.get('channel_jitter', 0.1)
+        if self.ref_aug_enabled:
+            print(f"  ✓ Ref feature augmentation: noise={self.ref_aug_noise_std}, "
+                  f"dropout={self.ref_aug_spatial_dropout}, ch_jitter={self.ref_aug_channel_jitter}")
+
+        # ── Pose-warp augmentation (train-only): perturb source pose before warping ──
+        pose_aug = tc.get('pose_warp_augmentation', {})
+        self.pose_aug_enabled = pose_aug.get('enabled', False)
+        self.pose_aug_rot_deg = pose_aug.get('rot_deg', 5.0)
+        self.pose_aug_trans_m = pose_aug.get('trans_m', 0.3)
+        if self.pose_aug_enabled:
+            print(f"  ✓ Pose-warp augmentation: rot={self.pose_aug_rot_deg}°, trans={self.pose_aug_trans_m}m")
+
+    def _augment_ref_feats(self, feats: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Apply augmentation to reference features (training only).
+
+        Simulates imperfect reference features to bridge domain gap between
+        same-frame warp (training) and cross-frame warp (inference).
+        """
+        augmented = {}
+        for scale, feat in feats.items():
+            f = feat  # (B, C, H, W)
+            # 1. Gaussian noise
+            if self.ref_aug_noise_std > 0:
+                f = f + torch.randn_like(f) * self.ref_aug_noise_std
+            # 2. Spatial dropout (zero entire spatial locations)
+            if self.ref_aug_spatial_dropout > 0:
+                B, C, H, W = f.shape
+                mask = torch.rand(B, 1, H, W, device=f.device) > self.ref_aug_spatial_dropout
+                f = f * mask.float()
+            # 3. Channel-wise jitter (scale each channel randomly)
+            if self.ref_aug_channel_jitter > 0:
+                B, C, H, W = f.shape
+                jitter = 1.0 + (torch.rand(B, C, 1, 1, device=f.device) - 0.5) * 2 * self.ref_aug_channel_jitter
+                f = f * jitter
+            augmented[scale] = f
+        return augmented
+
+    def _perturb_source_pose(self, pose_gt: torch.Tensor) -> torch.Tensor:
+        """Perturb the GT pose before warping to simulate cross-frame geometric differences.
+
+        Creates realistic occlusion/distortion artifacts matching actual nearest-neighbor warping.
+        """
+        from modules.lie_algebra import se3_exp
+        B = pose_gt.shape[0]
+        noise_rot_rad = self.pose_aug_rot_deg * np.pi / 180.0
+        xi = torch.zeros(B, 6, device=pose_gt.device)
+        xi[:, :3] = torch.randn(B, 3, device=pose_gt.device) * self.pose_aug_trans_m
+        xi[:, 3:] = torch.randn(B, 3, device=pose_gt.device) * noise_rot_rad
+        delta = se3_exp(xi)  # (B, 4, 4)
+        return torch.bmm(delta, pose_gt)
+
+    def _init_ref_feature_cache(self, ref_feature_dir: str):
+        """Pre-load rendered reference features for render-extract training.
+
+        When set, depth-warp uses these pre-computed rendered features
+        instead of query features as the warp source, bridging the
+        domain gap between training and render-extract inference.
+        """
+        from data.dataset_v4 import PoseDatasetV4
+        dc = self.config['data']
+        cache_ds = PoseDatasetV4(
+            feature_base_dir=ref_feature_dir,
+            traj_path=dc['train_traj_path'],
+            noise_rot_deg=0.0,
+            noise_trans_m=0.0,
+            is_train=False,
+        )
+        print(f"[RefFeatureCache] Loading {len(cache_ds)} rendered ref features from {ref_feature_dir}...")
+        self._ref_feature_cache = {}
+        for i in range(len(cache_ds)):
+            item = cache_ds[i]
+            frame_idx = item['frame_idx']
+            self._ref_feature_cache[frame_idx] = {
+                k: v for k, v in item['query_feats'].items()
+            }
+        print(f"[RefFeatureCache] Cached {len(self._ref_feature_cache)} frames")
+
+    @torch.no_grad()
+    def _get_ref_features_batch(self, frame_indices, device):
+        """Look up cached rendered reference features for a batch."""
+        ref = {scale: [] for scale in self._ref_feature_cache[frame_indices[0]].keys()}
+        for idx in frame_indices:
+            for scale in ref:
+                ref[scale].append(self._ref_feature_cache[idx][scale])
+        return {scale: torch.stack(ref[scale]).to(device) for scale in ref}
+
+    def _init_cross_frame_cache(self):
+        """Build a cache of all training features + poses for cross-frame retrieval."""
+        dc = self.config['data']
+        from data.dataset_v4 import PoseDatasetV4, load_poses_c2w
+        # Load all poses in c2w for position-based nearest neighbor
+        poses_c2w = load_poses_c2w(dc['train_traj_path'])
+        all_positions = torch.from_numpy(poses_c2w[:, :3, 3].astype(np.float32))
+        all_poses_w2c = torch.from_numpy(np.stack([
+            np.linalg.inv(p.astype(np.float64)).astype(np.float32)
+            for p in poses_c2w
+        ]))  # (N_all, 4, 4)
+
+        # Load all features
+        cache_ds = PoseDatasetV4(
+            feature_base_dir=dc['train_feature_dir'],
+            traj_path=dc['train_traj_path'],
+            noise_rot_deg=0.0,
+            noise_trans_m=0.0,
+            is_train=False,
+        )
+        print(f"[CrossFrameCache] Loading {len(cache_ds)} frames...")
+        self._cf_features = []  # list of {scale: (C,H,W)}
+        for i in range(len(cache_ds)):
+            item = cache_ds[i]
+            self._cf_features.append({
+                k: v for k, v in item['query_feats'].items()
+            })
+        self._cf_positions = all_positions  # (N, 3) world positions
+        self._cf_poses_w2c = all_poses_w2c  # (N, 4, 4)
+        print(f"[CrossFrameCache] Cached {len(self._cf_features)} frames")
+
+    @torch.no_grad()
+    def _get_cross_frame_refs(self, frame_indices, device):
+        """Get features and poses from nearest neighbor (excluding self).
+
+        Args:
+            frame_indices: list of frame indices in current batch
+        Returns:
+            ref_feats: {scale: (B, C, H, W)} on device
+            ref_poses: (B, 4, 4) w2c poses of reference frames
+        """
+        B = len(frame_indices)
+        query_pos = self._cf_positions[frame_indices]  # (B, 3)
+
+        # Compute distances to all frames
+        dists = torch.cdist(query_pos, self._cf_positions)  # (B, N)
+        # Exclude self (set self-distance to inf)
+        for b in range(B):
+            dists[b, frame_indices[b]] = float('inf')
+        # Find nearest
+        _, nn_idx = dists.min(dim=1)  # (B,)
+
+        ref_feats_list = {scale: [] for scale in self._cf_features[0].keys()}
+        ref_poses = []
+        for b in range(B):
+            idx = nn_idx[b].item()
+            for scale in ref_feats_list:
+                ref_feats_list[scale].append(self._cf_features[idx][scale])
+            ref_poses.append(self._cf_poses_w2c[idx])
+
+        ref_feats = {
+            scale: torch.stack(ref_feats_list[scale]).to(device)
+            for scale in ref_feats_list
+        }
+        ref_poses_tensor = torch.stack(ref_poses).to(device)
+        return ref_feats, ref_poses_tensor
 
     @torch.no_grad()
     def _render_batch(
@@ -924,11 +1114,46 @@ class MSFlowTrainer:
         total_loss_val = 0.0
 
         for outer_i in range(N):
-            # 1. 渲染
-            render_feats, depth_rendered = self._render_batch(pose_cur)
-            depth = depth_rendered
+            # 1. 渲染 (or depth-warp) — depth-warp uses fp32 to avoid fp16 overflow
+            if self.use_cross_frame_warp:
+                frame_indices = batch.get('frame_idx', list(range(pose_gt.shape[0])))
+                with torch.cuda.amp.autocast(enabled=False):
+                    depth_rendered = self.renderer.render_depth_batch(pose_cur.float())
+                    ref_feats, ref_poses = self._get_cross_frame_refs(
+                        frame_indices, self.device)
+                    render_feats = self._backward_warp(
+                        {k: v.float() for k, v in ref_feats.items()},
+                        depth_rendered, ref_poses.float(), pose_cur.float(),
+                        self._scale_intrinsics)
+                depth = depth_rendered
+            elif self.use_depth_warp:
+                with torch.cuda.amp.autocast(enabled=False):
+                    depth_rendered = self.renderer.render_depth_batch(pose_cur.float())
+                    # Pose-warp augmentation: perturb source pose to simulate cross-frame warp
+                    source_pose = pose_gt.float()
+                    if self.pose_aug_enabled and self.model.training:
+                        source_pose = self._perturb_source_pose(source_pose)
+                    # Use pre-loaded rendered refs if available, else use query feats
+                    if self._ref_feature_cache is not None:
+                        frame_indices = batch.get('frame_idx', list(range(pose_gt.shape[0])))
+                        warp_src = self._get_ref_features_batch(frame_indices, self.device)
+                        warp_src = {k: v.float() for k, v in warp_src.items()}
+                    else:
+                        warp_src = {k: v.float() for k, v in query_feats.items()}
+                    render_feats = self._backward_warp(
+                        warp_src,
+                        depth_rendered, source_pose, pose_cur.float(),
+                        self._scale_intrinsics)
+                depth = depth_rendered
+            else:
+                render_feats, depth_rendered = self._render_batch(pose_cur)
+                depth = depth_rendered
             if depth is None and depth_gt is not None:
                 depth = depth_gt.to(self.device)
+
+            # 1b. Reference feature augmentation (training only)
+            if self.ref_aug_enabled and self.model.training:
+                render_feats = self._augment_ref_feats(render_feats)
 
             # 2. Forward (with AMP)
             with torch.cuda.amp.autocast(enabled=self.use_amp):
@@ -1110,9 +1335,39 @@ class MSFlowTrainer:
 
             # ── 外层迭代精化 ──
             for outer_i in range(N):
-                with torch.cuda.amp.autocast(enabled=self.use_amp):
-                    render_feats, depth = self._render_batch(pose_cur)
-                    pred = self.model(query_feats, render_feats, depth)
+                # Depth-warp must run in fp32 (coordinate math overflows in fp16)
+                if self.use_cross_frame_warp:
+                    frame_indices = batch.get('frame_idx', list(range(pose_gt.shape[0])))
+                    with torch.cuda.amp.autocast(enabled=False):
+                        depth = self.renderer.render_depth_batch(pose_cur.float())
+                        ref_feats, ref_poses = self._get_cross_frame_refs(
+                            frame_indices, self.device)
+                        render_feats = self._backward_warp(
+                            {k: v.float() for k, v in ref_feats.items()},
+                            depth, ref_poses.float(), pose_cur.float(),
+                            self._scale_intrinsics)
+                    with torch.cuda.amp.autocast(enabled=self.use_amp):
+                        pred = self.model(query_feats, render_feats, depth)
+                elif self.use_depth_warp:
+                    with torch.cuda.amp.autocast(enabled=False):
+                        depth = self.renderer.render_depth_batch(pose_cur.float())
+                        # Use rendered refs if available
+                        if self._ref_feature_cache is not None:
+                            frame_indices = batch.get('frame_idx', list(range(pose_gt.shape[0])))
+                            warp_src = self._get_ref_features_batch(frame_indices, self.device)
+                            warp_src = {k: v.float() for k, v in warp_src.items()}
+                        else:
+                            warp_src = {k: v.float() for k, v in query_feats.items()}
+                        render_feats = self._backward_warp(
+                            warp_src,
+                            depth, pose_gt.float(), pose_cur.float(),
+                            self._scale_intrinsics)
+                    with torch.cuda.amp.autocast(enabled=self.use_amp):
+                        pred = self.model(query_feats, render_feats, depth)
+                else:
+                    with torch.cuda.amp.autocast(enabled=self.use_amp):
+                        render_feats, depth = self._render_batch(pose_cur)
+                        pred = self.model(query_feats, render_feats, depth)
 
                 # 除最后一次外, 用预测 delta_xi 更新 pose
                 if outer_i < N - 1 and 'delta_xi' in pred:
@@ -1159,10 +1414,10 @@ class MSFlowTrainer:
             joint_1_50 = float(np.mean((rot < 1.0) & (trans < 50.0)) * 100)
             joint_5_100 = float(np.mean((rot < 5.0) & (trans < 100.0)) * 100)
             val_metrics = {
-                'val_rot_mean': float(np.mean(rot)),
-                'val_rot_median': float(np.median(rot)),
-                'val_trans_mean': float(np.mean(trans)),
-                'val_trans_median': float(np.median(trans)),
+                'val_rot_mean': float(np.nanmean(rot)),
+                'val_rot_median': float(np.nanmedian(rot)),
+                'val_trans_mean': float(np.nanmean(trans)),
+                'val_trans_median': float(np.nanmedian(trans)),
                 'val_pct_1deg': float(np.mean(rot < 1.0) * 100),
                 'val_pct_5deg': float(np.mean(rot < 5.0) * 100),
                 'val_joint_01deg_53mm': joint_01_53,

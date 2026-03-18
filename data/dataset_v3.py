@@ -14,6 +14,7 @@ DatasetV3: ICPoseNetV3 训练/验证数据集
 """
 
 import os
+import glob as glob_module
 import cv2
 import numpy as np
 import torch
@@ -23,10 +24,10 @@ from typing import Dict, List, Optional, Tuple
 
 # 默认尺度配置
 SCALE_FILE_PATTERNS = {
-    'coarse':    'rgb_{idx}_coarse_1280x7x10.pt',
-    'mid':       'rgb_{idx}_mid_1280x15x20.pt',
-    'fine_sd':   'rgb_{idx}_fine_sd_640x35x46.pt',
-    'fine_dino': 'rgb_{idx}_fine_dino_768x35x46.pt',
+    'coarse':    'rgb_{idx}_coarse_*.pt',
+    'mid':       'rgb_{idx}_mid_*.pt',
+    'fine_sd':   'rgb_{idx}_fine_sd_*.pt',
+    'fine_dino': 'rgb_{idx}_fine_dino_*.pt',
 }
 
 
@@ -107,6 +108,7 @@ class PoseDatasetV3(Dataset):
         is_train: bool = True,
         netvlad_poses_path: str = None,
         depth_resize: Tuple[int, int] = None,
+        depth_pattern: str = 'depth_{idx}.png',
     ):
         self.feature_base_dir = feature_base_dir
         self.depth_dir = depth_dir
@@ -115,6 +117,7 @@ class PoseDatasetV3(Dataset):
         self.noise_trans_m = noise_trans_m
         self.depth_scale = depth_scale
         self.depth_resize = depth_resize  # (H, W) for flow loss resolution
+        self.depth_pattern = depth_pattern
         
         if scale_names is None:
             scale_names = ['coarse', 'fine_sd', 'fine_dino']
@@ -154,10 +157,11 @@ class PoseDatasetV3(Dataset):
         for idx in self.frame_indices[:5]:
             for scale in self.scale_names:
                 pattern = SCALE_FILE_PATTERNS[scale]
-                fname = pattern.format(idx=idx)
-                fpath = os.path.join(self.feature_base_dir, scale, fname)
-                if not os.path.exists(fpath):
-                    print(f"  [Warning] Missing: {fpath}")
+                glob_pattern = os.path.join(self.feature_base_dir, scale,
+                                            pattern.format(idx=idx))
+                matches = glob_module.glob(glob_pattern)
+                if not matches:
+                    print(f"  [Warning] Missing: {glob_pattern}")
                     missing += 1
         if missing > 0:
             print(f"  [Warning] {missing} feature files missing in first 5 frames!")
@@ -172,9 +176,13 @@ class PoseDatasetV3(Dataset):
         query_feats = {}
         for scale in self.scale_names:
             pattern = SCALE_FILE_PATTERNS[scale]
-            fname = pattern.format(idx=frame_idx)
-            fpath = os.path.join(self.feature_base_dir, scale, fname)
-            query_feats[scale] = torch.load(fpath, map_location='cpu', weights_only=True)
+            glob_pattern = os.path.join(self.feature_base_dir, scale,
+                                        pattern.format(idx=frame_idx))
+            matches = glob_module.glob(glob_pattern)
+            if not matches:
+                raise FileNotFoundError(
+                    f"找不到帧 {frame_idx} 的 {scale} 特征: {glob_pattern}")
+            query_feats[scale] = torch.load(matches[0], map_location='cpu')
         
         # 2. GT 位姿 (w2c)
         pose_gt = torch.from_numpy(self.poses_w2c[i]).float()
@@ -197,7 +205,8 @@ class PoseDatasetV3(Dataset):
         # 4. 深度图（用于 flow loss）
         depth = None
         if self.depth_dir is not None:
-            depth_path = os.path.join(self.depth_dir, f'depth_{frame_idx}.png')
+            depth_path = os.path.join(
+                self.depth_dir, self.depth_pattern.format(idx=frame_idx))
             if os.path.exists(depth_path):
                 depth_uint16 = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
                 depth = torch.from_numpy(

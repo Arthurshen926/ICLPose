@@ -38,11 +38,12 @@ FEATURE_CONFIGS = {
         'decoder_hidden_dims': [128, 256, 512, 1024, 1280],
     },
     # ── v2 多尺度特征金字塔配置 ──
+    # 注: ODISE backbone 将所有 SD 特征投影到 512 维 (非原始 640/1280)
     # Fine 层: SD s3 和 DINO Patch 各自独立压缩, 压缩后拼接嵌入 3DGS
     'v2_fine_sd': {
-        'input_dim': 640,
-        'encoder_hidden_dims': [384, 256, 64],   # 640 -> 64维
-        'decoder_hidden_dims': [256, 384, 640],
+        'input_dim': 512,
+        'encoder_hidden_dims': [256, 128, 64],   # 512 -> 64维
+        'decoder_hidden_dims': [128, 256, 512],
     },
     'v2_fine_dino': {
         'input_dim': 768,
@@ -50,14 +51,14 @@ FEATURE_CONFIGS = {
         'decoder_hidden_dims': [256, 384, 768],
     },
     'v2_mid': {
-        'input_dim': 1280,
-        'encoder_hidden_dims': [512, 256, 64],   # 1280 -> 64维
-        'decoder_hidden_dims': [256, 512, 1280],
+        'input_dim': 512,
+        'encoder_hidden_dims': [256, 128, 64],   # 512 -> 64维
+        'decoder_hidden_dims': [128, 256, 512],
     },
     'v2_coarse': {
-        'input_dim': 1280,
-        'encoder_hidden_dims': [512, 256, 32],   # 1280 -> 32维
-        'decoder_hidden_dims': [256, 512, 1280],
+        'input_dim': 512,
+        'encoder_hidden_dims': [256, 128, 32],   # 512 -> 32维
+        'decoder_hidden_dims': [128, 256, 512],
     },
 }
 
@@ -97,15 +98,49 @@ class AutoencoderFlexible(nn.Module):
         self.register_buffer('bottleneck_max', torch.ones(bottleneck_dim))
         self.register_buffer('is_calibrated', torch.tensor(False))
 
+        # 输入归一化缓冲区 (通过 set_input_norm() 设置)
+        # 消除不同特征尺度间的数量级差异 (例如 SD fine 均值~9.5 vs coarse 均值~0.7)
+        self.register_buffer('input_mean', torch.zeros(input_dim))
+        self.register_buffer('input_std', torch.ones(input_dim))
+        self.register_buffer('has_input_norm', torch.tensor(False))
+
+    def set_input_norm(self, mean: torch.Tensor, std: torch.Tensor):
+        """设置输入归一化参数 (per-channel z-score).
+
+        Args:
+            mean: [input_dim] 每通道均值
+            std:  [input_dim] 每通道标准差 (接近 0 的通道被截断到 1e-6)
+        """
+        self.input_mean.copy_(mean.to(self.input_mean.device))
+        self.input_std.copy_(std.clamp(min=1e-6).to(self.input_std.device))
+        self.has_input_norm.fill_(True)
+
+    def _normalize_input(self, x: torch.Tensor) -> torch.Tensor:
+        """若已设置归一化参数则应用 z-score 归一化, 否则原样返回."""
+        if self.has_input_norm:
+            return (x - self.input_mean) / self.input_std
+        return x
+
+    def _denormalize_output(self, x: torch.Tensor) -> torch.Tensor:
+        """与 _normalize_input 互逆, 将网络输出映射回原始特征空间."""
+        if self.has_input_norm:
+            return x * self.input_std + self.input_mean
+        return x
+
     def _encode_raw(self, x):
-        """编码器前向, 仅 L2 归一化, 不做 min-max"""
+        """编码器前向: 输入归一化 → encoder → L2 norm on bottleneck"""
+        x = self._normalize_input(x)
         for m in self.encoder:
             x = m(x)
         x = x / (x.norm(dim=-1, keepdim=True) + 1e-8)
         return x
 
     def forward(self, x):
-        """训练用: encode → L2 norm → decode (不做 min-max, 保持与 decode 对齐)"""
+        """训练用: normalize → encode → L2 norm → decode → 返回归一化空间的重建结果.
+        
+        Loss 应在归一化空间计算: mse(forward(x), model._normalize_input(x))
+        这样无论输入特征量级如何, MSE 都保持 O(1) 尺度.
+        """
         z = self._encode_raw(x)
         out = z
         for m in self.decoder:

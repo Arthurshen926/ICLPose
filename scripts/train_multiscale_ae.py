@@ -3,10 +3,10 @@
 多尺度特征 AutoEncoder 训练与压缩
 
 对 extract_multiscale_features.py 提取的原始高维特征进行 AutoEncoder 降维:
-  - fine_sd   (SD s3)  : 640d  → 64d   (v2_fine_sd)
+  - fine_sd   (SD s3)  : 512d  → 64d   (v2_fine_sd)
   - fine_dino (DINO)   : 768d  → 64d   (v2_fine_dino)
-  - mid       (SD s4)  : 1280d → 64d   (v2_mid)
-  - coarse    (SD s5)  : 1280d → 32d   (v2_coarse)
+  - mid       (SD s4)  : 512d  → 64d   (v2_mid)
+  - coarse    (SD s5)  : 512d  → 32d   (v2_coarse)
 
 嵌入 3DGS 时: fine = fine_sd(64d) + fine_dino(64d) = 128d, mid = 64d, coarse = 32d
 总计 224d, 比原始单层 256d 还小
@@ -55,7 +55,7 @@ COMPRESS_TASKS = [
         'config_key': 'v2_fine_sd',
         'subdir': 'fine_sd',
         'pattern': '*_fine_sd_*.pt',
-        'desc': 'Fine SD (s3): 640d → 64d',
+        'desc': 'Fine SD (s3): 512d → 64d',
     },
     {
         'name': 'fine_dino',
@@ -69,14 +69,14 @@ COMPRESS_TASKS = [
         'config_key': 'v2_mid',
         'subdir': 'mid',
         'pattern': '*_mid_*.pt',
-        'desc': 'Mid (s4): 1280d → 64d',
+        'desc': 'Mid (s4): 512d → 64d',
     },
     {
         'name': 'coarse',
         'config_key': 'v2_coarse',
         'subdir': 'coarse',
         'pattern': '*_coarse_*.pt',
-        'desc': 'Coarse (s5): 1280d → 32d',
+        'desc': 'Coarse (s5): 512d → 32d',
     },
 ]
 
@@ -118,6 +118,7 @@ def collect_pixel_samples(feat_dir: Path, pattern: str,
 
 
 def train_single_ae(config_key: str, samples: torch.Tensor,
+                    feat_mean: torch.Tensor, feat_std: torch.Tensor,
                     save_path: Path, device: str,
                     epochs: int = 50, batch_size: int = 4096,
                     lr: float = 1e-3) -> AutoencoderFlexible:
@@ -126,7 +127,9 @@ def train_single_ae(config_key: str, samples: torch.Tensor,
 
     Args:
         config_key: FEATURE_CONFIGS 中的 key
-        samples: [N, C] 训练样本
+        samples: [N, C] 训练样本 (原始尺度, 未归一化)
+        feat_mean: [C] per-channel 均值, 注入模型用于推理时一致归一化
+        feat_std:  [C] per-channel 标准差
         save_path: 模型保存路径
         device: 计算设备
         epochs: 训练轮数
@@ -149,6 +152,11 @@ def train_single_ae(config_key: str, samples: torch.Tensor,
         decoder_hidden_dims=config['decoder_hidden_dims'],
     ).to(device)
 
+    # 注入 per-channel 归一化参数, 消除特征尺度差异 (如 SD fine 均值~9.5 vs coarse ~0.7)
+    model.set_input_norm(feat_mean, feat_std)
+    print(f"    输入归一化已注入: mean∈[{feat_mean.min():.3f},{feat_mean.max():.3f}], "
+          f"std∈[{feat_std.min():.3f},{feat_std.max():.3f}]")
+
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
@@ -165,12 +173,15 @@ def train_single_ae(config_key: str, samples: torch.Tensor,
         for (batch,) in loader:
             batch = batch.to(device)
 
-            # AE 前向: encode(L2 norm) → decode
+            # AE 前向: normalize → encode → L2 norm → decode (在归一化空间重建)
             reconstructed = model(batch)
 
-            # 重建损失: MSE + Cosine (方向+幅度都要对齐)
-            loss_mse = F_torch.mse_loss(reconstructed, batch)
-            cos_sim = F_torch.cosine_similarity(reconstructed, batch, dim=1).mean()
+            # 目标: 归一化后的 batch (消除不同特征尺度的 MSE 差异)
+            target = model._normalize_input(batch)
+
+            # 重建损失: MSE + Cosine (方向+幅度都要对齐), 在归一化空间计算
+            loss_mse = F_torch.mse_loss(reconstructed, target)
+            cos_sim = F_torch.cosine_similarity(reconstructed, target, dim=1).mean()
             loss_cos = 1.0 - cos_sim
             loss = loss_mse + 0.5 * loss_cos
 
@@ -287,7 +298,7 @@ def main():
                 encoder_hidden_dims=config['encoder_hidden_dims'],
                 decoder_hidden_dims=config['decoder_hidden_dims'],
             ).to(args.device)
-            model.load_state_dict(torch.load(ae_path, map_location=args.device))
+            model.load_state_dict(torch.load(ae_path, map_location=args.device), strict=False)
             model.eval()
             print(f"  加载已训练权重: {ae_path}")
         else:
@@ -298,9 +309,18 @@ def main():
             )
             print(f"  训练样本: {samples.shape[0]} 个像素, {samples.shape[1]} 维")
 
+            # 计算 per-channel 归一化统计并打印诊断信息
+            feat_mean = samples.mean(dim=0)
+            feat_std = samples.std(dim=0)
+            print(f"  特征统计: mean=[{feat_mean.min():.3f}, {feat_mean.max():.3f}], "
+                  f"std=[{feat_std.min():.3f}, {feat_std.max():.3f}], "
+                  f"L2 norm (per pixel) = {samples.norm(dim=1).mean():.2f}")
+
             model = train_single_ae(
                 config_key=config_key,
                 samples=samples,
+                feat_mean=feat_mean,
+                feat_std=feat_std,
                 save_path=ae_path,
                 device=args.device,
                 epochs=args.epochs,

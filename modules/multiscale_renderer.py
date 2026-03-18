@@ -78,14 +78,6 @@ class MultiScaleRenderer(nn.Module):
         self.cx = cx
         self.cy = cy
         
-        # 深度渲染用最细分辨率 (fine_sd/fine_dino 的 35×46)
-        self.depth_H = 35
-        self.depth_W = 46
-        self.depth_fx = fx * (self.depth_W / img_width)
-        self.depth_fy = fy * (self.depth_H / img_height)
-        self.depth_cx = cx * (self.depth_W / img_width)
-        self.depth_cy = cy * (self.depth_H / img_height)
-        
         self.scale_names = sorted(scale_model_paths.keys())
         self.models = nn.ModuleDict()
         self.scale_info = {}
@@ -127,8 +119,22 @@ class MultiScaleRenderer(nn.Module):
             print(f"  [{name}] feat_dim={feat_dim}, "
                   f"res={resolution}, N={loc_feature.shape[0]}")
         
+        # 深度渲染用最细分辨率 (从 fine_sd 模型中获取, 适配不同宽高比)
+        fine_res = None
+        for name in ['fine_sd', 'fine_dino']:
+            if name in self.scale_info:
+                fine_res = self.scale_info[name]['resolution']
+                break
+        if fine_res is None:
+            fine_res = (35, 46)
+        self.depth_H, self.depth_W = fine_res
+        self.depth_fx = fx * (self.depth_W / img_width)
+        self.depth_fy = fy * (self.depth_H / img_height)
+        self.depth_cx = cx * (self.depth_W / img_width)
+        self.depth_cy = cy * (self.depth_H / img_height)
+        
         print(f"[MultiScaleRenderer] Loaded {len(self.models)} scale models: "
-              f"{list(self.models.keys())}")
+              f"{list(self.models.keys())}, depth_res={self.depth_H}×{self.depth_W}")
     
     @torch.no_grad()
     def render_scale(
@@ -286,11 +292,13 @@ class MultiScaleRenderer(nn.Module):
             dummy_colors = torch.zeros(
                 first_model.get_xyz.shape[0], 1, device=poses_w2c.device)
             
+            is_2dgs = getattr(first_model, 'is_2dgs', False)
             from gsplat import rasterization
+            scales = first_model.get_scaling_for_render if is_2dgs else first_model.get_scaling
             render_colors, _, _ = rasterization(
                 means=first_model.get_xyz,
                 quats=first_model.get_rotation,
-                scales=first_model.get_scaling,
+                scales=scales,
                 opacities=first_model.get_opacity.squeeze(-1),
                 colors=dummy_colors,
                 viewmats=poses_w2c,
@@ -305,6 +313,57 @@ class MultiScaleRenderer(nn.Module):
             out['depth_map'] = render_colors[:, :, :, 0]  # [B, H, W]
         
         return out
+
+    @torch.no_grad()
+    def render_depth_batch(
+        self,
+        poses_w2c: torch.Tensor,
+    ) -> torch.Tensor:
+        """Render depth only (no features) for a batch of poses.
+        
+        Returns: (B, H, W) depth map at fine resolution.
+        """
+        first_model = list(self.models.values())[0]
+        B = poses_w2c.shape[0]
+        from feature_3dgs.feature_renderer import _build_K
+        K = _build_K(self.depth_fx, self.depth_fy,
+                     self.depth_cx, self.depth_cy, poses_w2c.device)
+        Ks = K.unsqueeze(0).expand(B, -1, -1)
+        dummy_colors = torch.zeros(
+            first_model.get_xyz.shape[0], 1, device=poses_w2c.device)
+
+        is_2dgs = getattr(first_model, 'is_2dgs', False)
+        # Use regular rasterization for depth (works for both 3DGS and 2DGS with padded scales)
+        from gsplat import rasterization
+        scales = first_model.get_scaling_for_render if is_2dgs else first_model.get_scaling
+        render_colors, _, _ = rasterization(
+            means=first_model.get_xyz,
+            quats=first_model.get_rotation,
+            scales=scales,
+            opacities=first_model.get_opacity.squeeze(-1),
+            colors=dummy_colors,
+            viewmats=poses_w2c,
+            Ks=Ks,
+            width=self.depth_W,
+            height=self.depth_H,
+            packed=True,
+            render_mode='D',
+            near_plane=0.01, far_plane=1e5,
+        )
+        return render_colors[:, :, :, 0]  # [B, H, W]
+
+    def get_scale_intrinsics(self) -> dict:
+        """Get per-scale camera intrinsics for depth warping."""
+        result = {}
+        for name, info in self.scale_info.items():
+            H, W = info['resolution']
+            result[name] = {
+                'fx': self.fx * W / self.img_width,
+                'fy': self.fy * H / self.img_height,
+                'cx': self.cx * W / self.img_width,
+                'cy': self.cy * H / self.img_height,
+            }
+        return result
     
     def _render_depth(
         self,

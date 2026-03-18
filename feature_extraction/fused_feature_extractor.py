@@ -11,8 +11,8 @@ from PIL import Image
 from pathlib import Path
 
 # 设置缓存路径
-os.environ.setdefault("HF_HOME", "/home/yons/.cache/huggingface")
-os.environ.setdefault("TORCH_HOME", "/home/yons/.cache/torch")
+os.environ.setdefault("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
+os.environ.setdefault("TORCH_HOME", os.path.expanduser("~/.cache/torch"))
 
 
 class FusedFeatureExtractor:

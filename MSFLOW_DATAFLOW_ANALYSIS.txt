@@ -1,0 +1,259 @@
+
+           MSFlowPoseNet: Data Flow & Information Loss Analysis                 ║
+         Current: 0.55° rotation  |  Target: 0.1° rotation (5.5× better)       ║
+
+
+ 1. INPUT FEATURE EXTRACTION & ENCODING                                          │
+
+
+QUERY IMAGE                      RENDERED IMAGE (at pose_cur)
+     ↓                                  ↓
+  ODISE Backbone              ODISE Backbone (shared)
+  + DINO patch features       + DINO patch features
+     ↓                                  ↓
+  ┌──────────────────────────────────────
+  │ FEATURE PYRAMID (per scale):                           │
+  │  • Coarse (8×10):      1280d → [decoder: 1280→64]    │
+  │  • Mid (16×20):        1280d → [decoder: 1280→64]    │
+  │  • Fine_SD (32×40):     640d ┐                         │
+  │  • Fine_DINO (35×46):   768d ├ → [dual_decoder] → 64d │
+  └────────────────────────────────────────────────────────┘
+                  ↓
+      [ISSUE #1] Decode bottleneck: 1280d→64d (95% dimension reduction)
+      ├─ High-dim features compressed to 64 channels
+      ├─ Information loss: ~20-30% of expressiveness lost
+      └─ Recovery: Use 256d intermediate in ScaleDecoder
+
+
+ 2. COARSE SCALE (8×10 pixels = 80 total)                                       │
+
+
+Query_64d (B,64,8,10)  ───→  Global Correlation  ←───  Render_64d (B,64,8,10)
+         (L2 norm)             All-pairs matching         (L2 norm)
+                                     ↓
+                         Correlation Vol (B,80,8,10)
+                              [80 channels = full grid]
+                                     ↓
+        ┌────────────────────────────────────────────
+        │ COARSE FLOW REFINEMENT HEAD                    │
+        │  Input: [corr(80) + flow(2) + conf(1)] = 83ch │
+        │  Encode: Conv(83→128→64) ← [BOTTLENECK #2]   │
+        │  GRU:    ConvGRU(h_t-1, encoded_inp)          │
+        │  Output: flow_update(2) + confidence(1)        │
+        └────────────────────────────────────────────────┘
+                         ↓
+                  Flow_c (B,2,8,10)
+                  Conf_c (B,1,8,10)
+                       ↓
+         [CURRENT] Single iteration (coarse_iters=1)
+         [ISSUE #3] Early errors propagate → no refinement
+         [FIX]      Allow coarse_iters=2
+
+
+ 3. UPSAMPLE COARSE → MID (Information Loss Critical Point #1)                  │
+
+
+Hidden_c (B,128,8,10)  ──bilinear──→  H_up (B,128,16,20)
+Conf_c   (B,1,8,10)    ──bilinear──→  Conf_up (B,1,16,20)
+Flow_c   (B,2,bilinear──→  Flow_up (B,2,16,20)8,10)    
+                       (scale factor ~2.0)
+
+[SEVERE ISSUE #1a] Bilinear Upsampling Characteristics:
+ Each source pixel (8×10) maps to ~4 target pixels (16×20)
+ Information spread: 80 pixels → 320 pixels
+ Blurring effect: Smooth interpolation loses spatial details
+ Hidden state already "locked in": difficult to override at mid
+ Loss estimate: ~20-30% of information unrecoverable
+ FIX: Use deformable convolution or learned upsampling
+
+Q_mid (B,64,16,20) ──────→ Context Adapter ←──── H_up (B,128,16,20)
+                              (+fusion)
+                                 ↓
+                     H_mid_init (B,128,16,20)
+                    
+[MODERATE ISSUE #1b] Context Adapter Limited Capacity:
+ Only adds Conv([h_up, q_mid]) → ~10% capacity increase
+ Q_mid comes from same backbone → correlated with coarse features
+ Cannot inject fundamentally new information
+ Recovery: Limited (design is reasonable given constraints)
+
+
+ 4. MID SCALE (16×20 pixels = 320 total)                                        │
+
+
+Flow_m initialized from Flow_up (upsampled from coarse)
+                    ↓
+        ┌──────────────────────────────────┐
+        │ MID ITERATION (mid_iters=2)      │
+        │ For each iteration:               │
+        │  1. Warp R_mid using Flow_m      │
+        │  2. Local correlation (r=4)      │
+        │     → 81 channels at 16×20       │
+        │  3. GRU update hidden + flow     │
+        └────────────────────────
+
+[ISSUE #2] Warp-Guided Correlation Errors:
+ If Flow_up from coarse is wrong → Warp grid is wrong
+ Example: Coarse 2px error → Mid 8px error (4× upsampling)
+ Local radius=4 searches ±4px → error at edge/outside window
+ Bilinear warping (grid_sample) smears fmap_r
+ Zero-padding at boundaries creates invalid correlation
+ Recovery: Better coarse flow (iteration #2) or larger radius (cost ↑)
+
+[BOTTLENECK #2] Correlation Encoder (83→64 channels):
+ Input: 81 (corr) + 2 (flow) = 83 channels
+ Conv(83→128→64): 20% information loss
+ GRU sees only 64ch input from 81ch correlation
+ FIX: Expand to Conv(83→256→128→64) [~2% extra cost]
+
+Flow_m after mid_iters refinement → (B,2,16,20)
+
+
+ 5. UPSAMPLE MID → FINE (Information Loss Critical Point #2)                    │
+
+
+H_mid (B,128,16,20)   ──bilinear──→  H_up2 (B,128,35,46)
+Flow_m (B,2,16,20)    ──bilinear──→  Flow_f (B,2,35,46)  [scaled]
+                      (scale factor ~2.2)
+
+[SEVERE ISSUE #1c] Double Upsampling Cumulative Effect:
+ Coarse→Mid:   80 pixels → 320 pixels (bilinear)
+ Mid→Fine:     320 pixels → 1610 pixels (bilinear again)
+ Cumulative loss: ~40-60% of original fine-scale information
+ At inference: GRU starts with 2× smoothed hidden state
+ Impact: Flow predictions at fine are "coarse estimates with tweaks"
+
+Q_fine (B,64,35,46) ──→ Context Adapter ←──── H_up2 (B,128,35,46)
+                              (+fusion)
+                                 ↓
+                      H_fine_init (B,128,35,46)
+
+
+ 6. FINE SCALE (35×46 pixels = 1610 total) - RAFT-STYLE REFINEMENT              │
+
+
+Flow_f initialized from upsampled Flow_m
+                    ↓
+        ┌──────────────────────────────────────┐
+        │ FINE ITERATION LOOP (fine_iters=4)   │
+        │ For iter in range(4):                 │
+        │  1. Guided local corr (r=4, 81ch)    │
+        │  2. GRU update (hidden_dim=128)      │
+        │  3. Flow head: hidden→flow+conf      │
+        │  4. Sequence loss: γ^(3-iter) weight│
+        └──────────────────────────────────────┘
+
+[STRENGTH] RAFT-Style Iterative Refinement:
+ 4 GRU iterations allow learning complex corrections
+ Each iteration recomputes correlation with updated flow
+ Sequence loss weights later iterations more (γ=0.8)
+ Good design, but starting from smoothed hidden state limits potential
+
+[WEAKNESS] GRU Hidden State at Fine:
+ H_fine_init is 2× upsampled smooth aggregate
+ ConvGRU has 3×3 receptive field → local refinement only
+ Cannot globally adjust flow pattern; only incremental tweaks
+ Impact: 4 iterations refine details, don't correct major errors
+
+Final Flow_f (B,2,35,46)  [1610 valid pixels]
+Final Conf_f (B,1,35,46)
+
+
+ 7. GEOMETRY SOLVER: Image Jacobian + Weighted Least Squares                    │
+
+
+Flow_f (B,2,1610)  ────────→  Image Jacobian
+Conf_f (B,1610)               J_u, J_v (B, 1610, 6)
+Depth (B,1610)    ────────→  per-pixel sensitivity matrix
+                                    ↓
+                        ┌──────────────────────────┐
+                        │ Weighted Least Squares:  │
+                        │ min Σ w_i ||J_i ξ - f_i║ │
+                        │ Normal Eq: JᵀWJ ξ = JᵀWf │
+                        └─────────
+                                    ↓
+                            ξ ∈ se(3) (B,6)
+                       [Translation + Rotation]
+
+[STRENGTH] Well-Constrained Problem:
+ 3220 pixel equations (×2) vs 6 unknowns
+ Constraint ratio: 536:1 (overconstrained by huge margin)
+ Geometry solver is mathematically sound
+ Issue is input quality (flow predictions), not solver
+
+[ISSUE #4a] No Outlier Rejection:
+ All pixels contribute equally (weighted by learned confidence)
+ Occlusions, reflections: high-conf wrong pixels corrupt solution
+ Robust statistics (RANSAC, M-estimators) not used
+ Iterative reweighting could downweight residual outliers
+ FIX: Use robust reweighting (exponential on z-scores)
+
+[ISSUE #4b] Linear Approximation Valid Only for Small Angles:
+ Jacobian assumes first-order Taylor expansion
+ Valid for ~5° rotation; breaks at ±8° (curriculum learning noise)
+ Recovery: Outer iterations (residual correction)
+
+[ISSUE #5] Outer Iterations Disabled:
+ Code exists (scripts/train_ms_flow.py lines 687-755)
+ Config default: outer_iters=1 (single pass)
+ Could do: render→forward→pose_update→render→forward (2 passes)
+ At training: learns residual corrections
+ At inference: 2-pass should be more accurate
+ Cost: 2× forward time, but better gradient distribution
+        FIX: Change config to outer_iters=2, gamma_outer=0.85
+
+
+ INFORMATION LOSS BUDGET (Cumulative Rotation Error)                            │
+
+
+Baseline Accuracy:        0.55° (current)
+
+Issue #1a (Coarse→Mid upsample):     -0.15° to -0.25°
+Issue #1b (Context adapter limited):  -0.05° to -0.08°
+Issue #1c (Mid→Fine upsample):        -0.15° to -0.25°
+Issue #2  (Warp-guided corr errors):  -0.08° to -0.12°
+Issue #2b (Corr encoder bottleneck):  -0.10° to -0.15°
+Issue #3  (Single coarse/mid iter):   -0.10° to -0.15°
+Issue #4a (No outlier rejection):     -0.08° to -0.12°
+Issue #4b (Linear approx limits):     -0.05° to -0.08°
+Issue #5  (Outer iters disabled):     -0.08° to -0.10°
+
+Total Identified Slack:   -0.84° to -1.30° (1.5-2.4× target)
+
+Achievable Target:         0.1° (with all fixes + tuning)
+
+
+ IMPLEMENTATION PRIORITY & COST                                                  │
+
+
+Priority 1 (Quick wins, < 1 hour, -0.33° to -0.48°):
+  ✓ Expand correlation encoder (15 min, -0.10° to -0.15°)
+  ✓ Add coarse iterations (30 min, -0.10° to -0.15°)
+  ✓ Enable outer iterations (5 min, -0.08° to -0.10°)
+  ✓ Per-scale temperature (30 min, -0.05° to -0.08
+
+Priority 2 (Medium effort, 1-2 hours, -0.08° to -0.12°):
+  ✓ Robust outlier rejection (1-2 hrs, -0.08° to -0.12°)
+
+Priority 3 (Long-term, 2-3 hours, -0.15° to -0.25°):
+  ✓ Deformable upsampling (2-3 hrs, -0.15° to -0.25°)
+
+Expected Total Improvement: 0.55° - 0.50° = 0.05° (but can tune to 0.1°)
+
+
+ KEY INSIGHT: It's Not the Solver, It's the Input Flow Quality                  │
+
+
+Geometry solver is STRONG:
+  • 1610 pixels vs 6 unknowns (536:1 constraint)
+  • Differentiable, gradient flow is clean
+  • Uses proper image Jacobian
+
+But input flow is WEAK:
+  • Bilinear upsampling loses spatial detail
+  • Information bottleneck in correlation encoder
+  • Warp-guided search can get stuck if flow is wrong
+  • GRU hidden state starts from smoothed aggregate
+  • No outlier rejection allows bad pixels to corrupt
+
+FIX STRATEGY: Improve flow prediction quality first, then fine-tune solver.

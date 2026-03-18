@@ -29,6 +29,7 @@ from typing import Dict, List, Optional, Tuple
 
 from modules.geometry_solver import compute_image_jacobian, diff_pose_solve
 from modules.localizability_head import LocalizabilityHead
+from ic_models.cross_attention_matcher import CrossAttentionMatcher
 
 
 # ==============================================================================
@@ -928,6 +929,11 @@ class MSFlowPoseNet(nn.Module):
         # based on correlation volume statistics (peak, sharpness, entropy).
         # Modulates confidence before geometry solver. Supervised by flow error.
         localizability_prior: bool = False,
+        # Cross-attention coarse matcher: replaces global_correlation with
+        # learned Transformer attention for more robust coarse matching
+        attention_coarse: bool = False,
+        attention_coarse_heads: int = 4,
+        attention_coarse_layers: int = 2,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -958,6 +964,7 @@ class MSFlowPoseNet(nn.Module):
         self.dino_all_scales = dino_all_scales
         self.dino_replace_sd = dino_replace_sd
         self.use_localizability = localizability_prior
+        self.attention_coarse = attention_coarse
 
         # Configurable intrinsics and image resolution
         self.BASE_INTRINSICS = intrinsics if intrinsics is not None else self.DEFAULT_INTRINSICS.copy()
@@ -1068,6 +1075,14 @@ class MSFlowPoseNet(nn.Module):
         if localizability_prior:
             self.loc_head = LocalizabilityHead(
                 corr_channels=fine_corr_ch, hidden_dim=32)
+
+        # ── Cross-attention coarse matcher ──
+        if attention_coarse:
+            self.coarse_attn_matcher = CrossAttentionMatcher(
+                feat_dim=decode_dim,
+                n_heads=attention_coarse_heads,
+                n_layers=attention_coarse_layers,
+            )
 
         # Intrinsics at fine resolution for geometry solving
         self.fine_intrinsics = self._scale_intrinsics(*self.FINE_HW)
@@ -1234,7 +1249,10 @@ class MSFlowPoseNet(nn.Module):
         # ══════════════════════════════════════════════
         #  2. Coarse: Global correlation → initial flow
         # ══════════════════════════════════════════════
-        coarse_corr = global_correlation(q_coarse_corr, r_coarse_corr)
+        if self.attention_coarse:
+            coarse_corr = self.coarse_attn_matcher(q_coarse_corr, r_coarse_corr)
+        else:
+            coarse_corr = global_correlation(q_coarse_corr, r_coarse_corr)
         temp_coarse = self._get_temperature('coarse')
         if self.learnable_temperature or temp_coarse != 1.0:
             coarse_corr = coarse_corr / temp_coarse

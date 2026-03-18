@@ -180,8 +180,15 @@ def load_model(config_path="Panoptic/odise_label_coco_50e.py", seed=42, diffusio
     aug = instantiate(dataset_cfg.mapper).augmentations
 
     model = instantiate_odise(cfg.model)
-    model.to(cfg.train.device)
     ODISECheckpointer(model).load(cfg.train.init_checkpoint)
+    # Free non-backbone components to save GPU memory before moving to device
+    for attr in ['sem_seg_head', 'criterion', 'clip_head', 'word_head',
+                 'grounding_criterion', 'category_head']:
+        if hasattr(model, attr) and getattr(model, attr) is not None:
+            setattr(model, attr, None)
+    import gc; gc.collect()
+    model.to(cfg.train.device)
+    torch.cuda.empty_cache()
 
     return model, aug
 
@@ -205,26 +212,24 @@ def inference(model, aug, image, vocab, label_list):
         return (pred, demo_classes)
     
 def get_features(model, aug, image, vocab, label_list, caption=None, pca=False):
-    
-    demo_classes, demo_metadata = build_demo_classes_and_metadata(vocab, label_list)
-    with ExitStack() as stack:
-        inference_model = OpenPanopticInference(
-            model=model,
-            labels=demo_classes,
-            metadata=demo_metadata,
-            semantic_on=False,
-            instance_on=False,
-            panoptic_on=True,
-        )
-        stack.enter_context(inference_context(inference_model))
-        stack.enter_context(torch.no_grad())
+    """Extract backbone features directly without full segmentation pipeline."""
+    from detectron2.structures import ImageList
 
-        demo = StableDiffusionSeg(inference_model, demo_metadata, aug)
-        if caption is not None:
-            features = demo.get_features(np.array(image), caption, pca=pca)
-        else:
-            features = demo.get_features(np.array(image), pca=pca)
-        return features
+    original_image = np.array(image)
+    height, width = original_image.shape[:2]
+    aug_input = T.AugInput(original_image, sem_seg=None)
+    aug(aug_input)
+    img_tensor = aug_input.image
+    img_tensor = torch.as_tensor(img_tensor.astype("float32").transpose(2, 0, 1))
+
+    images = [img_tensor.to(model.device)]
+    images = [(x - model.pixel_mean) / model.pixel_std for x in images]
+    images = ImageList.from_tensors(images, model.size_divisibility)
+
+    with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.float16):
+        features = model.backbone(images.tensor)
+
+    return features
 
 
 def process_features_and_mask(model, aug, image, category=None, input_text=None, mask=False, raw=True):

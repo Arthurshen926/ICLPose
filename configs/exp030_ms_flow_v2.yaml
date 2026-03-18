@@ -14,6 +14,8 @@ model:
   local_radius: 4
   damping: 0.001
   fine_iters: 4         # RAFT-style 迭代次数 (fine scale)
+  mid_iters: 2          # mid scale 迭代次数 (>1 时用 sequence loss)
+  corr_temperature: 1.0 # correlation 温度, <1.0 使 correlation 更尖锐
   # v1 特征分辨率
   coarse_hw: [7, 10]
   mid_hw: [15, 20]
@@ -75,7 +77,11 @@ training:
       fine: 1.0
     pose_weight: 1.0
     rot_weight: 1.0
-    gamma: 0.8           # RAFT sequence loss 衰减因子
+    rot_loss_type: cosine  # 'cosine' (stable) or 'acos' (gradient explosion at small angles)
+    gamma: 0.8             # RAFT sequence loss 衰减因子
+    use_huber: true        # Huber loss for flow (robust to outliers)
+    huber_delta: 5.0       # Huber transition point (pixels)
+    conf_reg_weight: 0.01  # confidence regularization weight
 
   # 噪声课程学习: 从小噪声逐步增加到 data 中设定的最大值
   noise_curriculum:

@@ -20,8 +20,8 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import Dict, Optional, Union
 
-os.environ.setdefault("HF_HOME", "/home/yons/.cache/huggingface")
-os.environ.setdefault("TORCH_HOME", "/home/yons/.cache/torch")
+os.environ.setdefault("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
+os.environ.setdefault("TORCH_HOME", os.path.expanduser("~/.cache/torch"))
 
 
 @dataclass
@@ -56,9 +56,11 @@ class MultiScaleFeatureExtractor:
 
     def __init__(self,
                  device: str = 'cuda',
-                 sd_image_size: int = 480):
+                 sd_image_size: int = 480,
+                 dino_stride: int = 14):
         self.device = device
         self.sd_image_size = sd_image_size
+        self.dino_stride = dino_stride
         self._load_models()
         torch.set_grad_enabled(False)
 
@@ -78,9 +80,10 @@ class MultiScaleFeatureExtractor:
         # DINO 模型
         from .extractor_dino import ViTExtractor
         self.extractor_vit = ViTExtractor(
-            'dinov2_vitb14', stride=14, device=self.device
+            'dinov2_vitb14', stride=self.dino_stride, device=self.device
         )
-        print("  ✓ DINOv2 模型加载完成")
+        self.dino_patch_size = 14  # ViT-B/14 patch size (always 14)
+        print(f"  ✓ DINOv2 模型加载完成 (stride={self.dino_stride})")
         print("[MultiScaleFeatureExtractor] 模型加载完成\n")
 
     def extract(self, image_input: Union[str, Path, Image.Image]) -> MultiScaleFeatures:
@@ -148,12 +151,15 @@ class MultiScaleFeatureExtractor:
         # ═══════════════════════════════════════════════════
         #  DINO 特征提取 (Patch Tokens + CLS Token)
         # ═══════════════════════════════════════════════════
-        dino_w = int(math.ceil(sd_w / 14) * 14)
-        dino_h = int(math.ceil(sd_h / 14) * 14)
+        # Align input to patch_size=14 (works for any stride that divides 14)
+        dino_w = int(math.ceil(sd_w / self.dino_patch_size) * self.dino_patch_size)
+        dino_h = int(math.ceil(sd_h / self.dino_patch_size) * self.dino_patch_size)
         img_dino_input = img.resize((dino_w, dino_h), Image.Resampling.BILINEAR)
         img_batch = self.extractor_vit.preprocess_pil(img_dino_input)
 
-        tokens_h, tokens_w = dino_h // 14, dino_w // 14
+        # Token grid size depends on stride (not just patch_size)
+        tokens_h = 1 + (dino_h - self.dino_patch_size) // self.dino_stride
+        tokens_w = 1 + (dino_w - self.dino_patch_size) // self.dino_stride
 
         # Patch tokens (不含 CLS)
         feats_dino_patch = self.extractor_vit.extract_descriptors(

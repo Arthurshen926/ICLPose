@@ -1,0 +1,63 @@
+# exp113 — room_0 high-res fine flow (91×120 → from 69×91)
+# Hypothesis: higher fine_hw provides finer correlation + more geometry samples
+# Warmstart from exp098 best (0.119° at 69×91)
+exp_name: exp113_room0_highres
+output_dir: output/exp113_room0_highres
+
+model:
+  hidden_dim: 128
+  decode_dim: 64
+  local_radius: 4
+  damping: 0.001
+  fine_iters: 8
+  mid_iters: 1
+  coarse_hw: [15, 20]
+  mid_hw: [30, 40]
+  fine_hw: [91, 120]
+  coarse_in_dim: 32
+  mid_in_dim: 64
+  fine_sd_in_dim: 64
+  fine_dino_in_dim: 64
+  irls_iters: 3
+
+renderer:
+  ply_path: output/2dgs_models/room_0/v8_fixed_poses/point_cloud/iteration_30000/point_cloud.ply
+  scale_model_paths:
+    coarse:    output/feature_3dgs/room_0_v4_stride7_decoupled/per_scale/coarse.pth
+    mid:       output/feature_3dgs/room_0_v4_stride7_decoupled/per_scale/mid.pth
+    fine_sd:   output/feature_3dgs/room_0_v4_stride7_decoupled/per_scale/fine_sd.pth
+    fine_dino: output/feature_3dgs/room_0_v4_stride7_decoupled/per_scale/fine_dino.pth
+
+data:
+  train_traj_path: dataset/room_0/Sequence_1/traj_w_c.txt
+  train_feature_dir: output/features_multiscale_stride7_compressed/room_0
+  val_split_ratio: 0.1
+  batch_size: 4
+  val_batch_size: 2
+  num_workers: 4
+  noise_rot_deg: 3.0
+  noise_trans_m: 0.10
+
+training:
+  epochs: 50
+  lr: 0.00003
+  min_lr: 1.0e-07
+  weight_decay: 0.0001
+  grad_clip: 1.0
+  use_amp: true
+
+  outer_iters: 10
+  val_outer_iters: 15
+  phase1_epochs: 0
+
+  loss:
+    flow_weights:
+      coarse: 0.1
+      mid: 0.3
+      fine: 1.0
+    pose_weight: 1.0
+    rot_weight: 1.0
+    trans_weight: 10.0
+    rot_loss_type: cosine
+    gamma: 0.95
+    gamma_outer: 0.95

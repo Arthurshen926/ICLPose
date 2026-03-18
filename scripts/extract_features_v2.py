@@ -35,8 +35,9 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-os.environ.setdefault("HF_HOME", "/home/yons/.cache/huggingface")
-os.environ.setdefault("TORCH_HOME", "/home/yons/.cache/torch")
+# 模型缓存路径 (自动使用 ~/.cache)
+os.environ.setdefault("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
+os.environ.setdefault("TORCH_HOME", os.path.expanduser("~/.cache/torch"))
 
 
 def extract_v2(sd_model, sd_aug, extractor_vit, img_path, device='cuda'):

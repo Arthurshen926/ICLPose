@@ -3,13 +3,10 @@ Multi-Scale Gaussian Feature Model
 ====================================
 在 GaussianFeatureModel 基础上，支持多尺度特征嵌入的拆分和渲染。
 
-每个 Gaussian 存储一个 total_dim=224 的特征向量:
-  [fine_sd(64) | fine_dino(64) | mid(64) | coarse(32)]
+每个 Gaussian 存储一个 total_dim 的特征向量 (默认224):
+  [fine_sd(D_fine) | fine_dino(D_fine) | mid(D_mid) | coarse(D_coarse)]
 
-渲染后按偏移量拆分出 3 个尺度的特征图:
-  - fine:   [128, fH, fW] = fine_sd + fine_dino
-  - mid:    [64, mH, mW]
-  - coarse: [32, cH, cW]
+渲染后按偏移量拆分出 3 个尺度的特征图。
 """
 
 import torch
@@ -21,19 +18,17 @@ from feature_3dgs.gaussian_feature_model import GaussianFeatureModel
 
 class MultiScaleGaussianModel(GaussianFeatureModel):
     """
-    多尺度特征嵌入的 3DGS 模型。
-    
-    继承 GaussianFeatureModel，添加多尺度 split 信息。
+    多尺度特征嵌入的 3DGS 模型。支持可配置维度。
     """
 
-    # 各尺度维度 (压缩后)
+    # 默认维度 (兼容旧模型)
     FINE_SD_DIM = 64
     FINE_DINO_DIM = 64
     MID_DIM = 64
     COARSE_DIM = 32
     TOTAL_DIM = FINE_SD_DIM + FINE_DINO_DIM + MID_DIM + COARSE_DIM  # 224
 
-    # 偏移量
+    # 默认偏移量
     FINE_SD_START = 0
     FINE_SD_END = FINE_SD_DIM
     FINE_DINO_START = FINE_SD_END
@@ -44,45 +39,46 @@ class MultiScaleGaussianModel(GaussianFeatureModel):
     COARSE_START = MID_END
     COARSE_END = COARSE_START + COARSE_DIM  # 224
 
-    def __init__(self):
-        super().__init__(feature_dim=self.TOTAL_DIM)
+    def __init__(self, fine_sd_dim=64, fine_dino_dim=64, mid_dim=64, coarse_dim=32):
+        total_dim = fine_sd_dim + fine_dino_dim + mid_dim + coarse_dim
+        super().__init__(feature_dim=total_dim)
+        
+        # Store instance-level dimensions (override class defaults)
+        self._fine_sd_dim = fine_sd_dim
+        self._fine_dino_dim = fine_dino_dim
+        self._mid_dim = mid_dim
+        self._coarse_dim = coarse_dim
+        self._total_dim = total_dim
+        
+        # Instance-level offsets
+        self._fine_sd_start = 0
+        self._fine_sd_end = fine_sd_dim
+        self._fine_dino_start = fine_sd_dim
+        self._fine_dino_end = fine_sd_dim + fine_dino_dim
+        self._fine_end = fine_sd_dim + fine_dino_dim
+        self._mid_start = self._fine_end
+        self._mid_end = self._mid_start + mid_dim
+        self._coarse_start = self._mid_end
+        self._coarse_end = self._coarse_start + coarse_dim
 
     @property
     def get_fine_feature(self) -> torch.Tensor:
-        """[N, 128] fine_sd + fine_dino (L2 normalized)"""
-        feat = self._loc_feature[:, :self.FINE_END]
+        feat = self._loc_feature[:, :self._fine_end]
         return F.normalize(feat, p=2, dim=-1)
 
     @property
     def get_mid_feature(self) -> torch.Tensor:
-        """[N, 64] mid (L2 normalized)"""
-        feat = self._loc_feature[:, self.MID_START:self.MID_END]
+        feat = self._loc_feature[:, self._mid_start:self._mid_end]
         return F.normalize(feat, p=2, dim=-1)
 
     @property
     def get_coarse_feature(self) -> torch.Tensor:
-        """[N, 32] coarse (L2 normalized)"""
-        feat = self._loc_feature[:, self.COARSE_START:self.COARSE_END]
+        feat = self._loc_feature[:, self._coarse_start:self._coarse_end]
         return F.normalize(feat, p=2, dim=-1)
 
-    @staticmethod
-    def split_feature_map(feature_map: torch.Tensor) -> dict:
-        """
-        将渲染后的 [224, H, W] 特征图拆分为多尺度。
-        
-        Args:
-            feature_map: [224, H, W] 完整渲染特征图
-            
-        Returns:
-            dict: {
-                'fine': [128, H, W],
-                'mid':  [64, H, W],
-                'coarse': [32, H, W],
-            }
-        """
-        S = MultiScaleGaussianModel
+    def split_feature_map(self, feature_map: torch.Tensor) -> dict:
         return {
-            'fine': feature_map[S.FINE_SD_START:S.FINE_END],
-            'mid': feature_map[S.MID_START:S.MID_END],
-            'coarse': feature_map[S.COARSE_START:S.COARSE_END],
+            'fine': feature_map[self._fine_sd_start:self._fine_end],
+            'mid': feature_map[self._mid_start:self._mid_end],
+            'coarse': feature_map[self._coarse_start:self._coarse_end],
         }

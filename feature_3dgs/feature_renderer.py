@@ -14,7 +14,11 @@ gsplat v1.4 API:
 
 import torch
 import torch.nn.functional as F
-from gsplat import rasterization, rasterization_2dgs
+from gsplat import rasterization
+try:
+    from gsplat import rasterization_2dgs
+except ImportError:
+    rasterization_2dgs = None
 
 
 def _build_K(fx: float, fy: float, cx: float, cy: float, device: torch.device) -> torch.Tensor:
@@ -56,6 +60,7 @@ class FeatureRenderer:
         norm_feat_before_render: bool = True,
         norm_feat_after_render: bool = True,
         max_channels_per_chunk: int = None,
+        colors_override: torch.Tensor = None,
     ) -> dict:
         """
         渲染特征图 (单视角, 向后兼容接口)。
@@ -85,6 +90,7 @@ class FeatureRenderer:
             norm_feat_before_render=norm_feat_before_render,
             norm_feat_after_render=norm_feat_after_render,
             max_channels_per_chunk=max_channels_per_chunk,
+            colors_override=colors_override,
         )
         
         return {
@@ -104,6 +110,7 @@ class FeatureRenderer:
         norm_feat_before_render: bool = True,
         norm_feat_after_render: bool = True,
         max_channels_per_chunk: int = None,
+        colors_override: torch.Tensor = None,
     ) -> dict:
         """
         批量渲染特征图 (多视角一次调用)。
@@ -141,7 +148,9 @@ class FeatureRenderer:
         opacities = gaussian_model.get_opacity.squeeze(-1)  # [N] (v1.x要求1D)
         
         # --- 特征嵌入 ---
-        if norm_feat_before_render:
+        if colors_override is not None:
+            colors = colors_override
+        elif norm_feat_before_render:
             colors = gaussian_model.get_loc_feature  # L2 normalized [N, D]
         else:
             colors = gaussian_model._loc_feature     # raw [N, D]

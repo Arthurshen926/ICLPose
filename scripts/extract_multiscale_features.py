@@ -110,6 +110,14 @@ def main():
                         help='生成 PCA 可视化')
     parser.add_argument('--vis_interval', type=int, default=50,
                         help='可视化间隔 (每 N 帧)')
+    parser.add_argument('--recursive', action='store_true',
+                        help='递归扫描 input_dir 的所有直接子目录 (用于多序列数据集如 OldHospital), '
+                             '输出文件名格式为 {subdir}_{stem}_*.pt')
+    parser.add_argument('--subdir_pattern', type=str, default='*',
+                        help='--recursive 模式下过滤子目录名的 glob 模式 (默认 "*", '
+                             '例如 "seq*" 只处理 seq 开头的目录)')
+    parser.add_argument('--dino_stride', type=int, default=14, choices=[7, 14],
+                        help='DINOv2 stride (7 for 2× resolution, 14 for default)')
     args = parser.parse_args()
 
     input_dir = Path(args.input_dir)
@@ -126,43 +134,66 @@ def main():
         dirs['vis'].mkdir(parents=True, exist_ok=True)
 
     # 查找图像
-    image_paths = sorted(
-        glob.glob(str(input_dir / '*.png')) +
-        glob.glob(str(input_dir / '*.jpg'))
-    )
-    print(f"找到 {len(image_paths)} 张图像")
-    if not image_paths:
+    if args.recursive:
+        # 递归扫描 input_dir 下一级的子目录 (不含 input_dir 自身)
+        # 用 --subdir_pattern 过滤 (默认 "*", 可设为 "seq*" 等)
+        import fnmatch
+        raw_paths = []
+        for subdir in sorted(input_dir.iterdir()):
+            if subdir.is_dir() and fnmatch.fnmatch(subdir.name, args.subdir_pattern):
+                raw_paths.extend(sorted(
+                    glob.glob(str(subdir / '*.png')) +
+                    glob.glob(str(subdir / '*.jpg'))
+                ))
+        # 构建 (img_path, output_stem) 对, stem 编码相对路径
+        image_pairs = []
+        for p in raw_paths:
+            rel = Path(p).relative_to(input_dir)  # e.g. seq1/frame00001.png
+            # Replace path separators with underscore to form a flat unique stem
+            output_stem = '_'.join(rel.with_suffix('').parts)  # e.g. seq1_frame00001
+            image_pairs.append((Path(p), output_stem))
+    else:
+        raw_paths = sorted(
+            glob.glob(str(input_dir / '*.png')) +
+            glob.glob(str(input_dir / '*.jpg'))
+        )
+        image_pairs = [(Path(p), Path(p).stem) for p in raw_paths]
+
+    print(f"找到 {len(image_pairs)} 张图像" + (" (递归)" if args.recursive else ""))
+    if not image_pairs:
         print(f"错误: 在 {input_dir} 中未找到图像")
         return
 
     # 初始化提取器
     print("\n初始化多尺度特征提取器...")
     from feature_extraction.multiscale_extractor import MultiScaleFeatureExtractor
-    extractor = MultiScaleFeatureExtractor(device=args.device)
+    extractor = MultiScaleFeatureExtractor(device=args.device, dino_stride=args.dino_stride)
 
     # 提取特征
     print("\n开始提取多尺度特征...")
     vis_count = 0
-    for i, img_path in enumerate(tqdm(image_paths, desc="提取特征")):
-        img_path = Path(img_path)
-        stem = img_path.stem
+    for i, (img_path, output_stem) in enumerate(tqdm(image_pairs, desc="提取特征")):
+        # Resume support: skip if all outputs already exist
+        existing = list(dirs['fine_dino'].glob(f"{output_stem}_fine_dino_*.pt"))
+        if existing and len(existing) > 0:
+            continue
 
         ms = extractor.extract(img_path)
 
         # 保存各层特征 (fine_sd 和 fine_dino 独立保存, 不拼接)
         def _save(tensor, subdir, tag):
             shape_str = 'x'.join(str(s) for s in tensor.shape)
-            torch.save(tensor, dirs[subdir] / f"{stem}_{tag}_{shape_str}.pt")
+            torch.save(tensor, dirs[subdir] / f"{output_stem}_{tag}_{shape_str}.pt")
 
         _save(ms.fine_sd,   'fine_sd',   'fine_sd')
         _save(ms.fine_dino, 'fine_dino', 'fine_dino')
         _save(ms.mid,       'mid',       'mid')
         _save(ms.coarse,    'coarse',    'coarse')
-        torch.save(ms.cls_token, dirs['cls'] / f"{stem}_cls_{ms.cls_token.shape[0]}.pt")
+        torch.save(ms.cls_token, dirs['cls'] / f"{output_stem}_cls_{ms.cls_token.shape[0]}.pt")
 
         # 可视化
         if args.visualize and i % args.vis_interval == 0:
-            vis_path = dirs['vis'] / f"{stem}_multiscale_vis.png"
+            vis_path = dirs['vis'] / f"{output_stem}_multiscale_vis.png"
             visualize_multiscale_pca(
                 {'fine_sd': ms.fine_sd, 'fine_dino': ms.fine_dino,
                  'mid': ms.mid, 'coarse': ms.coarse},
@@ -181,7 +212,7 @@ def main():
             print(f"    CLS       : {list(ms.cls_token.shape)}  (DINO CLS Token)")
             print()
 
-    print(f"\n✓ 完成! 共提取 {len(image_paths)} 帧多尺度特征")
+    print(f"\n✓ 完成! 共提取 {len(image_pairs)} 帧多尺度特征")
     print(f"  Fine SD   → {dirs['fine_sd']}")
     print(f"  Fine DINO → {dirs['fine_dino']}")
     print(f"  Mid       → {dirs['mid']}")

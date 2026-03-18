@@ -42,6 +42,17 @@ def main():
         local_radius=mc.get('local_radius', 4),
         damping=mc.get('damping', 0.001),
         fine_iters=mc.get('fine_iters', 4),
+        mid_iters=mc.get('mid_iters', 1),
+        coarse_hw=tuple(mc.get('coarse_hw', [7, 10])),
+        mid_hw=tuple(mc.get('mid_hw', [15, 20])),
+        fine_hw=tuple(mc.get('fine_hw', [35, 46])),
+        coarse_in_dim=mc.get('coarse_in_dim', 32),
+        mid_in_dim=mc.get('mid_in_dim', 64),
+        fine_sd_in_dim=mc.get('fine_sd_in_dim', 64),
+        fine_dino_in_dim=mc.get('fine_dino_in_dim', 64),
+        irls_iters=mc.get('irls_iters', 3),
+        corr_temperature=mc.get('corr_temperature', 1.0),
+        skip_coarse_flow=mc.get('skip_coarse_flow', False),
     ).to(device)
 
     # Dataset (val split)

@@ -1,3 +1,4 @@
+import os
 import torch
 from torch import nn
 from torchvision import transforms
@@ -63,9 +64,12 @@ class ViTExtractor:
         """
         torch.hub._validate_not_a_forked_repo=lambda a,b,c: True
         if 'v2' in model_type:
-            # 使用本地缓存的dinov2模型 (使用完整路径)
-            local_dir = '/home/yons/.cache/torch/hub/facebookresearch_dinov2_main'
-            model = torch.hub.load(local_dir, model_type, source='local')
+            # 尝试本地缓存, 否则从 GitHub 下载
+            local_dir = os.path.expanduser('~/.cache/torch/hub/facebookresearch_dinov2_main')
+            if os.path.isdir(local_dir):
+                model = torch.hub.load(local_dir, model_type, source='local')
+            else:
+                model = torch.hub.load('facebookresearch/dinov2', model_type)
         elif 'dino' in model_type:
             model = torch.hub.load('facebookresearch/dino:main', model_type, source='local')
         elif 'ibot' in model_type:

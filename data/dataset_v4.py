@@ -23,26 +23,48 @@ from typing import Dict, List, Optional, Tuple
 
 
 # v1 特征布局: subdir名 = scale名, 文件名包含 scale名
+# 注: ODISE backbone 将所有 SD 特征投影到 512 维 (非原始 640/1280)
+# 压缩后特征维度更低 (coarse=32, mid/fine=64), 但目录结构相同
 V1_SCALE_CONFIG = {
-    'coarse':    {'subdir': 'coarse',    'dim': 1280},
-    'mid':       {'subdir': 'mid',       'dim': 1280},
-    'fine_sd':   {'subdir': 'fine_sd',   'dim': 640},
+    'coarse':    {'subdir': 'coarse',    'dim': 512},
+    'mid':       {'subdir': 'mid',       'dim': 512},
+    'fine_sd':   {'subdir': 'fine_sd',   'dim': 512},
     'fine_dino': {'subdir': 'fine_dino', 'dim': 768},
 }
 
 # v2 特征布局: subdir名 = SD层名/dino
 V2_SCALE_CONFIG = {
-    'coarse':    {'subdir': 'sd_s5',  'dim': 1280},
-    'mid':       {'subdir': 'sd_s4',  'dim': 1280},
-    'fine_sd':   {'subdir': 'sd_s3',  'dim': 640},
+    'coarse':    {'subdir': 'sd_s5',  'dim': 512},
+    'mid':       {'subdir': 'sd_s4',  'dim': 512},
+    'fine_sd':   {'subdir': 'sd_s3',  'dim': 512},
     'fine_dino': {'subdir': 'dino',   'dim': 768},
 }
+
+
+def _orthogonalize_rotations(poses: np.ndarray) -> np.ndarray:
+    """SVD-orthogonalize rotation matrices to ensure det(R)=1, R@R^T=I.
+    Some datasets (e.g. 7-Scenes stairs) have slightly non-orthogonal rotations
+    (det≈0.9998) which causes ~40% pose error inflation and solver accuracy floors.
+    """
+    fixed = poses.copy()
+    for i in range(len(poses)):
+        R = poses[i, :3, :3]
+        U, _, Vh = np.linalg.svd(R)
+        R_orth = U @ Vh
+        if np.linalg.det(R_orth) < 0:
+            R_orth = U @ np.diag([1, 1, -1]) @ Vh
+        fixed[i, :3, :3] = R_orth
+    return fixed
 
 
 def load_poses_c2w(traj_path: str) -> np.ndarray:
     """加载 traj_w_c.txt 中的 c2w 位姿, Returns: (N, 4, 4)"""
     raw = np.loadtxt(traj_path)
-    return raw.reshape(-1, 4, 4)
+    if raw.size % 16 != 0:
+        raise ValueError(f"Pose file {traj_path} has {raw.size} elements, not divisible by 16")
+    poses = raw.reshape(-1, 4, 4)
+    poses = _orthogonalize_rotations(poses)
+    return poses
 
 
 def c2w_to_w2c(c2w: np.ndarray) -> np.ndarray:
@@ -230,14 +252,19 @@ class PoseDatasetV4(Dataset):
             depth_path = os.path.join(self.depth_dir, f'depth_{frame_idx}.png')
             if os.path.exists(depth_path):
                 depth_uint16 = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
-                depth = torch.from_numpy(
-                    depth_uint16.astype(np.float32) / self.depth_scale
-                )
-                tH, tW = self.FLOW_RESOLUTION
-                depth = F.interpolate(
-                    depth.unsqueeze(0).unsqueeze(0),
-                    size=(tH, tW), mode='nearest',
-                ).squeeze(0).squeeze(0)
+                if depth_uint16 is None:
+                    pass  # leave depth = None
+                else:
+                    if depth_uint16.ndim == 3:
+                        depth_uint16 = depth_uint16[..., 0]
+                    depth = torch.from_numpy(
+                        depth_uint16.astype(np.float32) / self.depth_scale
+                    )
+                    tH, tW = self.FLOW_RESOLUTION
+                    depth = F.interpolate(
+                        depth.unsqueeze(0).unsqueeze(0),
+                        size=(tH, tW), mode='nearest',
+                    ).squeeze(0).squeeze(0)
 
         result = {
             'query_feats': query_feats,

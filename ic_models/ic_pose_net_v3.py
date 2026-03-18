@@ -249,6 +249,7 @@ class ICPoseNetV3(nn.Module):
         rendered_feats_list: List[Dict[str, torch.Tensor]],
         initial_pose: torch.Tensor,
         num_iters: int = None,
+        depth_gt: Optional[torch.Tensor] = None,
     ) -> Dict[str, object]:
         """
         使用预渲染的特征进行前向传播 (训练时避免在 backward 中重复渲染)
@@ -262,6 +263,7 @@ class ICPoseNetV3(nn.Module):
             rendered_feats_list: length=num_iters, 
                 每个元素是 {scale_name: (B, D_i, H_i, W_i)}
             initial_pose: (B, 4, 4)
+            depth_gt: (B, H, W) 深度图 (用于 FlowToPose 几何转换, 可选)
         """
         if num_iters is None:
             num_iters = min(self.num_iters, len(rendered_feats_list))
@@ -290,7 +292,7 @@ class ICPoseNetV3(nn.Module):
             )
             
             hidden = self.update_block(fused_residual, hidden)
-            head_output = self.dual_head(hidden)
+            head_output = self.dual_head(hidden, depth=depth_gt)
             
             xi = head_output['xi']
             flow = head_output['flow']
