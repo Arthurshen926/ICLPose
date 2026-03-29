@@ -30,6 +30,7 @@ from typing import Dict, List, Optional, Tuple
 from modules.geometry_solver import compute_image_jacobian, diff_pose_solve
 from modules.localizability_head import LocalizabilityHead
 from ic_models.cross_attention_matcher import CrossAttentionMatcher
+from ic_models.transformer_feature_refiner import TransformerFeatureRefiner, TransformerFlowDecoder
 
 
 # ==============================================================================
@@ -335,6 +336,35 @@ class FineDualDecoder(nn.Module):
 
 
 # ==============================================================================
+#  Feature Standardization
+# ==============================================================================
+
+def channel_standardize(feat: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
+    """
+    Channel-wise spatial standardization to remove global mean bias.
+
+    Problem: decoded features share a large mean component across all spatial
+    positions, causing cosine similarity ≈ 1.0 everywhere and flat correlation.
+
+    Fix: for each channel, subtract its spatial mean and divide by spatial std.
+    Then re-L2-normalize per pixel so correlation scores remain bounded in [-1, 1].
+
+    Args:
+        feat: (B, C, H, W) decoded feature map (typically L2-normalized)
+        eps: numerical stability for division
+
+    Returns:
+        (B, C, H, W) standardized and re-L2-normalized per pixel
+    """
+    # Per-channel spatial statistics: mean/std over (H, W)
+    mean = feat.mean(dim=(-2, -1), keepdim=True)   # (B, C, 1, 1)
+    std = feat.std(dim=(-2, -1), keepdim=True)      # (B, C, 1, 1)
+    feat = (feat - mean) / (std + eps)
+    # Re-normalize per pixel so dot-product correlation ∈ [-1, 1]
+    return F.normalize(feat, p=2, dim=1)
+
+
+# ==============================================================================
 #  Correlation Functions
 # ==============================================================================
 
@@ -539,6 +569,92 @@ def guided_multiscale_correlation(
             corrs.append(dilated_local_correlation(fmap_q, warped_r, radius=radius, dilation=d))
 
     return torch.cat(corrs, dim=1)
+
+
+# ==============================================================================
+#  Convex Upsampling (RAFT-style learned upsampling for flow)
+# ==============================================================================
+
+class ConvexUpsampler(nn.Module):
+    """
+    Learned convex upsampling for optical flow (from RAFT, Teed & Deng 2020).
+
+    Instead of bilinear interpolation, predicts a weight mask over a 3×3
+    neighborhood of coarse-resolution pixels. Each fine pixel is a convex
+    combination of its 9 nearest coarse neighbors, with softmax-normalized
+    weights predicted from the GRU hidden state.
+
+    For scale factor s, each coarse pixel produces s×s fine pixels.
+    Output weights: (B, s*s*9, H_coarse, W_coarse) → softmax over 9-dim.
+
+    This preserves sharp flow boundaries (critical for sub-pixel geometry
+    solving) that bilinear interpolation smears.
+
+    Args:
+        hidden_dim: GRU hidden dimension (input to weight predictor)
+        scale_factor: integer upsampling factor (2 for coarse→mid, etc.)
+        conf_channels: number of confidence channels (1 or 2)
+    """
+
+    def __init__(self, hidden_dim: int = 128, scale_factor: int = 2, conf_channels: int = 1):
+        super().__init__()
+        self.scale_factor = scale_factor
+        self.conf_channels = conf_channels
+        # Predict (s*s * 9) weights per coarse pixel
+        # 9 = 3×3 neighborhood, s*s = fine pixels per coarse pixel
+        self.mask_net = nn.Sequential(
+            nn.Conv2d(hidden_dim, 128, 3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(128, scale_factor * scale_factor * 9, 1),
+        )
+
+    def forward(
+        self,
+        flow: torch.Tensor,       # (B, 2, H, W) coarse flow
+        conf: torch.Tensor,        # (B, C, H, W) coarse confidence
+        hidden: torch.Tensor,      # (B, hidden_dim, H, W) GRU hidden state
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Returns:
+            flow_up: (B, 2, H*s, W*s) upsampled flow (with scaled values)
+            conf_up: (B, C, H*s, W*s) upsampled confidence
+        """
+        B, _, H, W = flow.shape
+        s = self.scale_factor
+
+        # Predict and reshape weights: (B, s*s*9, H, W) → (B, 1, s*s, 9, H, W)
+        mask = self.mask_net(hidden)
+        mask = mask.view(B, 1, s * s, 9, H, W)
+        mask = torch.softmax(mask, dim=3)  # softmax over 3×3 neighborhood
+
+        # Pad flow and conf for 3×3 unfold
+        # flow_channels = 2, conf_channels = C
+        up_data = torch.cat([flow, conf], dim=1)  # (B, 2+C, H, W)
+        C_total = up_data.shape[1]
+        up_padded = F.pad(up_data, [1, 1, 1, 1], mode='replicate')
+
+        # Unfold 3×3 patches: (B, C_total, H, W) → (B, C_total*9, H, W)
+        up_unf = F.unfold(up_padded, kernel_size=3, padding=0)  # (B, C_total*9, H*W)
+        up_unf = up_unf.view(B, C_total, 9, H, W)  # (B, C_total, 9, H, W)
+
+        # Apply convex weights: (B, C_total, s*s, H, W)
+        # mask: (B, 1, s*s, 9, H, W), up_unf: (B, C_total, 1, 9, H, W)
+        up_unf = up_unf.unsqueeze(2)  # (B, C_total, 1, 9, H, W)
+        weighted = (mask * up_unf).sum(dim=3)  # (B, C_total, s*s, H, W)
+
+        # Reshape: (B, C_total, s*s, H, W) → (B, C_total, H*s, W*s)
+        weighted = weighted.view(B, C_total, s, s, H, W)
+        weighted = weighted.permute(0, 1, 4, 2, 5, 3).contiguous()
+        weighted = weighted.view(B, C_total, H * s, W * s)
+
+        # Split back and scale flow values
+        flow_up = weighted[:, :2]
+        conf_up = weighted[:, 2:]
+
+        flow_up[:, 0] *= s  # scale u by upsampling factor
+        flow_up[:, 1] *= s  # scale v by upsampling factor
+
+        return flow_up, conf_up
 
 
 # ==============================================================================
@@ -882,6 +998,10 @@ class MSFlowPoseNet(nn.Module):
         # IRLS robust estimation in geometry solver
         irls_iters: int = 0,
         irls_huber_k: float = 1.345,
+        # Robust kernel: 'huber' | 'gm' (Geman-McClure) | 'gnc_gm' (GNC + GM)
+        robust_kernel: str = 'huber',
+        gnc_mu_init: float = 1.0,
+        gnc_mu_step: float = 1.4,
         # Deeper flow head with residual blocks
         deep_flow_head: bool = False,
         # Cross-scale context: inject coarse+mid features into fine iterations
@@ -934,6 +1054,29 @@ class MSFlowPoseNet(nn.Module):
         attention_coarse: bool = False,
         attention_coarse_heads: int = 4,
         attention_coarse_layers: int = 2,
+        # FlowFeat mode: 3 scales (coarse/mid/fine) with single fine decoder
+        # instead of 4 scales (coarse/mid/fine_sd/fine_dino) with dual decoder.
+        # Input features come from FlowFeat DPT intermediate layers + PCA.
+        flowfeat_mode: bool = False,
+        fine_in_dim: int = 64,  # PCA-compressed FlowFeat fine dim (flowfeat_mode only)
+        # Convex upsampling: learned upsampling for flow between scales
+        # Replaces bilinear interpolation with content-aware convex combination
+        # (RAFT-style, preserves sharp flow boundaries for better geometry solving)
+        convex_upsampling: bool = False,
+        # Transformer feature refiner: cross-attention before correlation
+        # Enhances Q/R features via self+cross attention at each scale
+        # 'none' | 'all' | 'coarse_mid' (fine uses windowed attention)
+        transformer_refiner: str = 'none',
+        transformer_refiner_layers: int = 2,
+        transformer_refiner_heads: int = 4,
+        # Transformer flow decoder: replace correlation + FlowRefinementHead
+        # with full cross-attention flow prediction at coarse/mid scales
+        transformer_flow_decoder: bool = False,
+        transformer_flow_layers: int = 3,
+        # Channel-wise standardization before correlation: removes global mean
+        # bias from decoded features, making correlation more discriminative.
+        # Applies per-channel (mean-center + div-by-std) then re-L2-norm.
+        standardize_before_corr: bool = False,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -947,6 +1090,9 @@ class MSFlowPoseNet(nn.Module):
         self.directional_confidence = directional_confidence
         self.irls_iters = irls_iters
         self.irls_huber_k = irls_huber_k
+        self.robust_kernel = robust_kernel
+        self.gnc_mu_init = gnc_mu_init
+        self.gnc_mu_step = gnc_mu_step
         self.use_cross_scale = cross_scale_context
         self.use_pose_refinement = pose_refinement
         self.corr_dilations = corr_dilations
@@ -965,6 +1111,11 @@ class MSFlowPoseNet(nn.Module):
         self.dino_replace_sd = dino_replace_sd
         self.use_localizability = localizability_prior
         self.attention_coarse = attention_coarse
+        self.flowfeat_mode = flowfeat_mode
+        self.convex_upsampling = convex_upsampling
+        self.transformer_refiner_mode = transformer_refiner
+        self.transformer_flow_decoder = transformer_flow_decoder
+        self.standardize_before_corr = standardize_before_corr
 
         # Configurable intrinsics and image resolution
         self.BASE_INTRINSICS = intrinsics if intrinsics is not None else self.DEFAULT_INTRINSICS.copy()
@@ -987,8 +1138,12 @@ class MSFlowPoseNet(nn.Module):
         # ── Decoders (Q/R shared) ──
         self.coarse_dec = ScaleDecoder(coarse_in_dim, decode_dim)
         self.mid_dec = ScaleDecoder(mid_in_dim, decode_dim)
-        self.fine_dec = FineDualDecoder(
-            fine_sd_in_dim, fine_dino_in_dim, decode_dim, target_hw=self.FINE_HW)
+        if flowfeat_mode:
+            # FlowFeat: single fine decoder (no SD+DINO dual branch)
+            self.fine_single_dec = ScaleDecoder(fine_in_dim, decode_dim)
+        else:
+            self.fine_dec = FineDualDecoder(
+                fine_sd_in_dim, fine_dino_in_dim, decode_dim, target_hw=self.FINE_HW)
 
         # ── DINOv2 at all scales: parallel decoders + learned fusion gates ──
         if dino_all_scales:
@@ -1071,6 +1226,22 @@ class MSFlowPoseNet(nn.Module):
         self.mid_context = ContextAdapter(hidden_dim, decode_dim)
         self.fine_context = ContextAdapter(hidden_dim, decode_dim)
 
+        # ── Convex upsampling: learned flow upsampling between scales ──
+        if convex_upsampling:
+            # Compute integer scale factors between resolution levels
+            # coarse→mid and mid→fine
+            cm_scale_h = round(mid_hw[0] / coarse_hw[0])
+            cm_scale_w = round(mid_hw[1] / coarse_hw[1])
+            mf_scale_h = round(fine_hw[0] / mid_hw[0])
+            mf_scale_w = round(fine_hw[1] / mid_hw[1])
+            # Use the geometric mean scale; must be integer for pixel shuffle
+            cm_scale = max(cm_scale_h, cm_scale_w)
+            mf_scale = max(mf_scale_h, mf_scale_w)
+            self.coarse_to_mid_up = ConvexUpsampler(
+                hidden_dim=hidden_dim, scale_factor=cm_scale, conf_channels=conf_dim)
+            self.mid_to_fine_up = ConvexUpsampler(
+                hidden_dim=hidden_dim, scale_factor=mf_scale, conf_channels=conf_dim)
+
         # ── Localizability prior: score how localizable each fine pixel is ──
         if localizability_prior:
             self.loc_head = LocalizabilityHead(
@@ -1082,6 +1253,38 @@ class MSFlowPoseNet(nn.Module):
                 feat_dim=decode_dim,
                 n_heads=attention_coarse_heads,
                 n_layers=attention_coarse_layers,
+            )
+
+        # ── Transformer feature refiner: cross-attention enhancement before correlation ──
+        if transformer_refiner != 'none':
+            self.coarse_refiner = TransformerFeatureRefiner(
+                feat_dim=decode_dim, n_heads=transformer_refiner_heads,
+                n_layers=transformer_refiner_layers, ffn_dim=decode_dim * 2,
+                mode='full',
+            )
+            self.mid_refiner = TransformerFeatureRefiner(
+                feat_dim=decode_dim, n_heads=transformer_refiner_heads,
+                n_layers=transformer_refiner_layers, ffn_dim=decode_dim * 2,
+                mode='full',
+            )
+            if transformer_refiner == 'all':
+                self.fine_refiner = TransformerFeatureRefiner(
+                    feat_dim=decode_dim, n_heads=transformer_refiner_heads,
+                    n_layers=transformer_refiner_layers, ffn_dim=decode_dim * 2,
+                    mode='windowed', window_size=7,
+                )
+
+        # ── Transformer flow decoder: replace correlation at coarse/mid ──
+        if transformer_flow_decoder:
+            self.coarse_transformer_head = TransformerFlowDecoder(
+                feat_dim=decode_dim, hidden_dim=hidden_dim,
+                n_heads=4, n_layers=transformer_flow_layers,
+                ffn_dim=decode_dim * 4, conf_dim=conf_dim,
+            )
+            self.mid_transformer_head = TransformerFlowDecoder(
+                feat_dim=decode_dim, hidden_dim=hidden_dim,
+                n_heads=4, n_layers=transformer_flow_layers,
+                ffn_dim=decode_dim * 4, conf_dim=conf_dim,
             )
 
         # Intrinsics at fine resolution for geometry solving
@@ -1157,10 +1360,15 @@ class MSFlowPoseNet(nn.Module):
 
         Args:
             query_feats: {
-                'coarse':    (B, 1280, 8, 10),
-                'mid':       (B, 1280, 16, 20),
-                'fine_sd':   (B, 640, 32, 40),
-                'fine_dino': (B, 768, 35, 46),
+                SD+DINO mode (default):
+                  'coarse':    (B, 1280, 8, 10),
+                  'mid':       (B, 1280, 16, 20),
+                  'fine_sd':   (B, 640, 32, 40),
+                  'fine_dino': (B, 768, 35, 46),
+                FlowFeat mode (flowfeat_mode=True):
+                  'coarse': (B, 32, H_c, W_c),
+                  'mid':    (B, 64, H_m, W_m),
+                  'fine':   (B, 64, H_f, W_f),
             }
             render_feats: same structure (from 3DGS rendering)
             depth: (B, 35, 46) rendered depth at fine resolution
@@ -1182,22 +1390,30 @@ class MSFlowPoseNet(nn.Module):
         # ══════════════════════════════════════════════
         q_coarse = self._match_spatial(
             self.coarse_dec(query_feats['coarse']), self.COARSE_HW)
-        r_coarse = self.coarse_dec(render_feats['coarse'])
+        r_coarse = self._match_spatial(
+            self.coarse_dec(render_feats['coarse']), self.COARSE_HW)
 
         q_mid = self._match_spatial(
             self.mid_dec(query_feats['mid']), self.MID_HW)
         r_mid = self._match_spatial(
             self.mid_dec(render_feats['mid']), self.MID_HW)
 
-        q_fine = self._match_spatial(
-            self.fine_dec(query_feats['fine_sd'], query_feats['fine_dino']),
-            self.FINE_HW)
-        r_fine = self._match_spatial(
-            self.fine_dec(render_feats['fine_sd'], render_feats['fine_dino']),
-            self.FINE_HW)
+        if self.flowfeat_mode:
+            # FlowFeat: single fine branch
+            q_fine = self._match_spatial(
+                self.fine_single_dec(query_feats['fine']), self.FINE_HW)
+            r_fine = self._match_spatial(
+                self.fine_single_dec(render_feats['fine']), self.FINE_HW)
+        else:
+            q_fine = self._match_spatial(
+                self.fine_dec(query_feats['fine_sd'], query_feats['fine_dino']),
+                self.FINE_HW)
+            r_fine = self._match_spatial(
+                self.fine_dec(render_feats['fine_sd'], render_feats['fine_dino']),
+                self.FINE_HW)
 
         # ── DINOv2 at all scales: fuse downsampled DINOv2 with SD at coarse/mid ──
-        if self.dino_all_scales:
+        if self.dino_all_scales and not self.flowfeat_mode:
             # Downsample fine_dino to coarse/mid resolutions
             q_dino_c = self.coarse_dino_dec(self._match_spatial(
                 query_feats['fine_dino'], self.COARSE_HW))
@@ -1216,7 +1432,7 @@ class MSFlowPoseNet(nn.Module):
             r_mid = F.normalize(r_mid + gm * r_dino_m, p=2, dim=1)
 
         # ── DINOv2 replace SD at coarse/mid: complete replacement ──
-        if self.dino_replace_sd:
+        if self.dino_replace_sd and not self.flowfeat_mode:
             q_coarse = self.coarse_dino_dec(self._match_spatial(
                 query_feats['fine_dino'], self.COARSE_HW))
             r_coarse = self.coarse_dino_dec(self._match_spatial(
@@ -1246,25 +1462,49 @@ class MSFlowPoseNet(nn.Module):
             q_fine_corr = q_fine
             r_fine_corr = r_fine
 
+        # ── Transformer feature refiner: enhance features via cross-attention ──
+        if self.transformer_refiner_mode != 'none':
+            q_coarse_corr, r_coarse_corr = self.coarse_refiner(q_coarse_corr, r_coarse_corr)
+            q_mid_corr, r_mid_corr = self.mid_refiner(q_mid_corr, r_mid_corr)
+            if self.transformer_refiner_mode == 'all':
+                q_fine_corr, r_fine_corr = self.fine_refiner(q_fine_corr, r_fine_corr)
+
+        # ── Channel-wise standardization: remove global mean bias ──
+        # Applied after all feature processing (decode, PE, transformer refiner)
+        # but before correlation, so dot-product measures relative differences
+        # rather than shared mean component.
+        if self.standardize_before_corr:
+            q_coarse_corr = channel_standardize(q_coarse_corr)
+            r_coarse_corr = channel_standardize(r_coarse_corr)
+            q_mid_corr = channel_standardize(q_mid_corr)
+            r_mid_corr = channel_standardize(r_mid_corr)
+            q_fine_corr = channel_standardize(q_fine_corr)
+            r_fine_corr = channel_standardize(r_fine_corr)
+
         # ══════════════════════════════════════════════
         #  2. Coarse: Global correlation → initial flow
         # ══════════════════════════════════════════════
-        if self.attention_coarse:
-            coarse_corr = self.coarse_attn_matcher(q_coarse_corr, r_coarse_corr)
-        else:
-            coarse_corr = global_correlation(q_coarse_corr, r_coarse_corr)
-        temp_coarse = self._get_temperature('coarse')
-        if self.learnable_temperature or temp_coarse != 1.0:
-            coarse_corr = coarse_corr / temp_coarse
-
         # Context → initial hidden (at coarse resolution)
         h_coarse = self.context_net(q_coarse)  # (B, hidden_dim, 8, 10)
 
         flow_c, conf_c = self._init_flow(
             B, *self.COARSE_HW, device)
 
-        _, conf_c, h_coarse, flow_c = self.coarse_head(
-            coarse_corr, h_coarse, flow_c, conf_c)
+        if self.transformer_flow_decoder:
+            # Full transformer flow prediction (replaces correlation + FlowRefinementHead)
+            _, conf_c, h_coarse, flow_c = self.coarse_transformer_head(
+                q_coarse_corr, r_coarse_corr, flow_c, conf_c)
+        else:
+            if self.attention_coarse:
+                coarse_corr = self.coarse_attn_matcher(q_coarse_corr, r_coarse_corr)
+            else:
+                coarse_corr = global_correlation(q_coarse_corr, r_coarse_corr)
+            temp_coarse = self._get_temperature('coarse')
+            if self.learnable_temperature or temp_coarse != 1.0:
+                coarse_corr = coarse_corr / temp_coarse
+
+            _, conf_c, h_coarse, flow_c = self.coarse_head(
+                coarse_corr, h_coarse, flow_c, conf_c)
 
         # ══════════════════════════════════════════════
         #  3. Mid: Warp-guided local correlation (iterative)
@@ -1273,8 +1513,17 @@ class MSFlowPoseNet(nn.Module):
             # Start mid from zero flow — coarse correlation too flat to be useful
             flow_m, conf_m = self._init_flow(B, *self.MID_HW, device)
         else:
-            flow_m, conf_m = self._upsample_flow(
-                flow_c, conf_c, self.MID_HW)
+            if self.convex_upsampling:
+                flow_m, conf_m = self.coarse_to_mid_up(flow_c, conf_c, h_coarse)
+                # Trim to exact target resolution (convex up produces integer multiples)
+                if flow_m.shape[-2:] != tuple(self.MID_HW):
+                    flow_m = F.interpolate(flow_m, size=self.MID_HW,
+                                           mode='bilinear', align_corners=False)
+                    conf_m = F.interpolate(conf_m, size=self.MID_HW,
+                                           mode='bilinear', align_corners=False)
+            else:
+                flow_m, conf_m = self._upsample_flow(
+                    flow_c, conf_c, self.MID_HW)
 
         # Initialize mid hidden: upsample coarse hidden + inject mid query context
         h_mid = F.interpolate(
@@ -1283,24 +1532,39 @@ class MSFlowPoseNet(nn.Module):
 
         mid_flow_preds = []  # 存储 mid 迭代的 flow, 用于 sequence loss
 
-        for _iter in range(self.mid_iters):
-            mid_corr = guided_local_correlation(
-                q_mid_corr, r_mid_corr, flow_m, radius=self.local_radius)
-            temp_mid = self._get_temperature('mid')
-            if self.learnable_temperature or temp_mid != 1.0:
-                mid_corr = mid_corr / temp_mid
-
-            _, conf_m, h_mid, flow_m = self.mid_head(
-                mid_corr, h_mid, flow_m, conf_m)
-
+        if self.transformer_flow_decoder:
+            # Full transformer flow prediction for mid
+            _, conf_m, h_mid, flow_m = self.mid_transformer_head(
+                q_mid_corr, r_mid_corr, flow_m, conf_m)
             mid_flow_preds.append(flow_m)
+        else:
+            for _iter in range(self.mid_iters):
+                mid_corr = guided_local_correlation(
+                    q_mid_corr, r_mid_corr, flow_m, radius=self.local_radius)
+                temp_mid = self._get_temperature('mid')
+                if self.learnable_temperature or temp_mid != 1.0:
+                    mid_corr = mid_corr / temp_mid
+
+                _, conf_m, h_mid, flow_m = self.mid_head(
+                    mid_corr, h_mid, flow_m, conf_m)
+
+                mid_flow_preds.append(flow_m)
 
         # ══════════════════════════════════════════════
         #  4. Fine: RAFT-style iterative refinement
         #     多次 GRU 迭代, 每次重新计算 warp-guided correlation
         # ══════════════════════════════════════════════
-        flow_f, conf_f = self._upsample_flow(
-            flow_m, conf_m, self.FINE_HW)
+        if self.convex_upsampling:
+            flow_f, conf_f = self.mid_to_fine_up(flow_m, conf_m, h_mid)
+            # Trim to exact target resolution
+            if flow_f.shape[-2:] != tuple(self.FINE_HW):
+                flow_f = F.interpolate(flow_f, size=self.FINE_HW,
+                                       mode='bilinear', align_corners=False)
+                conf_f = F.interpolate(conf_f, size=self.FINE_HW,
+                                       mode='bilinear', align_corners=False)
+        else:
+            flow_f, conf_f = self._upsample_flow(
+                flow_m, conf_m, self.FINE_HW)
 
         h_fine = F.interpolate(
             h_mid, size=self.FINE_HW, mode='bilinear', align_corners=False)
@@ -1439,6 +1703,9 @@ class MSFlowPoseNet(nn.Module):
                     adaptive_damping=self.adaptive_damping,
                     adaptive_damping_max=self.adaptive_damping_max,
                     adaptive_damping_cond_thresh=self.adaptive_damping_cond_thresh,
+                    robust_kernel=self.robust_kernel,
+                    gnc_mu_init=self.gnc_mu_init,
+                    gnc_mu_step=self.gnc_mu_step,
                 )
 
                 # Learnable pose refinement (if enabled)

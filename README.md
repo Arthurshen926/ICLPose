@@ -60,6 +60,7 @@ CUDA_VISIBLE_DEVICES=0 python scripts/train_ms_flow.py \
 
 | 文档 | 内容 |
 |------|------|
+| **[docs/STABLE_IMPLEMENTATION_SUMMARY.md](docs/STABLE_IMPLEMENTATION_SUMMARY.md)** | 当前稳定实现的项目总览与原理说明 |
 | **[docs/PROJECT_TRANSFER_GUIDE.md](docs/PROJECT_TRANSFER_GUIDE.md)** | 完整项目迁移指南 (推荐首读) |
 | **[docs/AGENT_QUICKSTART.md](docs/AGENT_QUICKSTART.md)** | Agent 快速上手指南 |
 | **[docs/ARCHITECTURE_DETAIL.md](docs/ARCHITECTURE_DETAIL.md)** | MSFlowPoseNet 架构详解 |

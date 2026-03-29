@@ -1,0 +1,88 @@
+# ============================================================
+#  exp061_oh_transformer.yaml
+#  TransformerPoseNet on OldHospital
+#  Self-attention + Cross-attention → direct flow decode
+#  替代 correlation-based matching
+# ============================================================
+
+exp_name: exp061_oh_transformer
+output_dir: output/exp061_oh_transformer
+
+# ── Model ──
+model:
+  type: transformer           # 'single_scale' or 'transformer'
+  feat_dim: 64
+  feat_in_dim: 64             # DA3 fine features
+  n_heads: 8
+  n_layers: 4
+  ffn_dim: 256
+  dropout: 0.0
+  fine_iters: 4               # iterative flow refinement
+  attn_hw: [35, 61]           # half resolution for attention
+  fine_hw: [69, 121]          # full DA3 fine resolution
+  damping: 0.001
+  irls_iters: 3
+  irls_huber_k: 1.345
+  robust_kernel: huber
+  pixel_stride: 1
+
+# ── Renderer (per-Gaussian fine features) ──
+renderer:
+  ply_path: output/2dgs_models/OldHospital/v7_depth/point_cloud/iteration_30000/point_cloud.ply
+  scale_model_paths:
+    fine: output/feature_3dgs/oldhospital_da3_perscale_v2/fine/best_model.pth
+  scale_resolutions:
+    fine: [69, 121]
+  img_height: 1080
+  img_width: 1920
+  fx: 1673.5
+  fy: 1673.5
+  cx: 960.0
+  cy: 540.0
+
+# ── Data (DA3 unified extraction) ──
+data:
+  train_feature_dir: output/features_da3_unified/OldHospital
+  train_traj_path: output/features_da3_unified/OldHospital/traj_w_c.txt
+
+  val_feature_dir: null
+  val_traj_path: null
+  val_netvlad_poses: null
+  val_split_ratio: 0.1
+
+  noise_rot_deg: 8.0
+  noise_trans_m: 0.5
+  val_noise_rot_deg: 8.0
+  val_noise_trans_m: 0.5
+
+  batch_size: 2
+  val_batch_size: 2
+  num_workers: 4
+
+# ── Training ──
+training:
+  lr: 1e-4                    # slightly lower for transformer stability
+  weight_decay: 1e-4          # higher weight decay for transformer
+  min_lr: 1e-6
+  epochs: 120
+  phase1_epochs: 10            # flow-only warmup
+  grad_clip: 0.5              # tighter gradient clipping for transformer
+  use_amp: true
+
+  loss:
+    pose_weight: 1.0
+    rot_weight: 1.0
+    trans_weight: 10.0
+    gamma: 0.85
+    huber_delta: 5.0
+    conf_reg_weight: 0.01
+    gamma_outer: 0.8
+
+  outer_iters: 1
+  val_outer_iters: 3
+
+  noise_curriculum:
+    enabled: true
+    warmup_epochs: 40
+    start_rot_deg: 2.0
+    start_trans_m: 0.1

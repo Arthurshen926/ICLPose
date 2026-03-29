@@ -1,0 +1,110 @@
+# Joint 2DGS Geometry + RADIO Feature — OldHospital  v11-RADIO
+# =============================================================
+# v7 复刻 + 修复投影/排序bug
+#
+# 目的: 测试v7的15.75dB是否可复现, 以及正确投影修剪的效果
+# v7 使用了broken projection(修剪无效), 但其per-pixel设置表现优异
+# v11 = v7完整设置 + 正确投影 + 正确排序
+#
+# v10 对比: v10更激进(opacity=0.05, scale_pct=70, veg_max_scale=0.003)
+# v11 更温和: opacity=0.15, scale_pct=95(veg-local), 无scale clamping
+#
+# Usage:
+#   CUDA_VISIBLE_DEVICES=1 python -m feature_3dgs.train_2dgs_joint_v3 \
+#     --config configs/joint_oh_v11_radio.yaml
+
+exp_name: joint_oh_v11_radio
+
+dataset:
+  type: cambridge
+  source_dir: dataset/OldHospital
+  images: ''
+  feature_dir: output/features_radio/OldHospital_indexed
+  feature_scales:
+    - fine_radio
+
+model:
+  sh_degree: 3
+  white_background: false
+  random_background: false
+
+training:
+  iterations: 40000
+  longest_edge: 0
+  eval_interval: 1000
+  save_interval: 5000
+  vis_frames: [0, 200, 500, 800]
+
+  # Learning rates — same as v7
+  position_lr_init: 0.00016
+  position_lr_final: 0.0000016
+  feature_lr: 0.0025
+  opacity_lr: 0.05
+  scaling_lr: 0.005
+  rotation_lr: 0.001
+  percent_dense: 0.01
+
+  # Feature embedding — same as v7
+  feature_embedding_lr: 0.01
+  feature_weight: 0.5
+  feature_cos_weight: 0.5
+  feature_start_iter: 500
+  detach_feat_geometry: false
+
+  # RGB loss
+  lambda_dssim: 0.2
+
+  # 2DGS geometry regularization
+  lambda_normal: 0.05
+  lambda_dist: 0.01
+  lambda_scale: 0.001
+  scale_reg_threshold: 0.3
+  reg_start_iter: 500
+
+  # Monocular depth supervision — exclude vegetation (same as v7)
+  mono_depth_dir: output/oh_depth_local/mono_depth
+  lambda_depth: 0.05
+  depth_start_iter: 3000
+  depth_warmup_iters: 2000
+  depth_exclude_vegetation: true
+
+  # Densification — same as v7
+  densify_from_iter: 500
+  densify_until_iter: 25000
+  densification_interval: 100
+  densify_grad_threshold: 0.0002
+  opacity_reset_interval: 6000         # same as v7 (not 5000 like v10)
+  opacity_reset_value: 0.01
+  size_threshold: null
+  max_gaussians: 0
+
+  # Sky / object masking
+  use_mask: true
+  mask_path: dataset/OldHospital/masks.pkl
+
+  # AppearanceNetwork
+  use_appearance: true
+  appearance_embed_dim: 32
+  appearance_lr: 0.001
+  appearance_reg: 0.0
+  appearance_mean_reg: 0.01
+
+  # Transient mask
+  use_transient: true
+  transient_lr: 0.001
+  transient_reg: 0.01
+
+  # Semantic-guided — SAME as v7 (now with correct projection + order)
+  semantic_mask_dir: dataset/OldHospital/semantic_masks
+  vegetation_reg_scale: 0.3            # same as v7
+  vegetation_scale_boost: 3.0          # same as v7
+  veg_prune_opacity: 0.15             # same as v7 (checks real pre-reset opacity)
+  veg_prune_scale_percentile: 95      # same as v7 (now veg-local, removes top 5%)
+  veg_max_scale: 0.0                  # disabled (same as v7 default)
+  veg_sample_cams: 50
+  veg_vote_threshold: 0.3
+
+  # Gradient accumulation
+  grad_accum_steps: 4
+
+output_dir: output/2dgs_joint

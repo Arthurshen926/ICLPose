@@ -78,6 +78,7 @@ def build_model(cfg, device):
         dino_all_scales=mc.get('dino_all_scales', False),
         dino_replace_sd=mc.get('dino_replace_sd', False),
         localizability_prior=mc.get('localizability_prior', False),
+        standardize_before_corr=mc.get('standardize_before_corr', False),
     ).to(device)
     return model
 
@@ -94,6 +95,8 @@ def build_renderer(cfg, device):
         fy=rc.get('fy', 320.0),
         cx=rc.get('cx', 319.5),
         cy=rc.get('cy', 239.5),
+        sharpen_strength=rc.get('sharpen_strength', 0.0),
+        sharpen_kernel_size=rc.get('sharpen_kernel_size', 3),
     )
 
 

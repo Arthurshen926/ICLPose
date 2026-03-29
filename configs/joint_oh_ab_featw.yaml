@@ -1,0 +1,65 @@
+# Ablation: v1 baseline + higher feature weight (STDLoc-inspired)
+# Tests: feature_weight=0.5 (5x v1's 0.1, STDLoc uses 1.0)
+# Insight: STDLoc gives feature loss equal weight to RGB, we may be under-weighting features
+# All other params identical to joint_oh_v1.yaml
+#
+# CUDA_VISIBLE_DEVICES=5 python -m feature_3dgs.train_2dgs_joint_v2 \
+#   --config configs/joint_oh_ab_featw.yaml
+
+exp_name: joint_oh_ab_featw
+
+dataset:
+  type: cambridge
+  source_dir: dataset/OldHospital
+  images: ''
+  feature_dir: output/features_da3/OldHospital_indexed
+  feature_scales:
+    - fine
+
+model:
+  sh_degree: 3
+  white_background: false
+
+training:
+  iterations: 30000
+  longest_edge: 0
+  eval_interval: 2500
+  save_interval: 5000
+  vis_frames: [0, 200, 500, 800]
+
+  # LR (same as v1)
+  position_lr_init: 0.00016
+  position_lr_final: 0.0000016
+  feature_lr: 0.0025
+  opacity_lr: 0.05
+  scaling_lr: 0.005
+  rotation_lr: 0.001
+  percent_dense: 0.01
+
+  # Feature embedding
+  feature_embedding_lr: 0.01
+  # >>> ABLATION VARIABLE: Higher feature weight (STDLoc-inspired) <<<
+  feature_weight: 0.5          # v1: 0.1, v2: 0.15, STDLoc: 1.0
+  feature_cos_weight: 0.5
+  feature_start_iter: 500
+  detach_feat_geometry: false
+
+  # RGB loss
+  lambda_dssim: 0.2
+
+  # 2DGS geometry regularization (same as v1)
+  lambda_normal: 0.05
+  lambda_dist: 0.01
+  lambda_scale: 0.001
+  scale_reg_threshold: 0.3
+  reg_start_iter: 500
+
+  # Densification (same as v1)
+  densify_from_iter: 500
+  densify_until_iter: 20000
+  densification_interval: 100
+  densify_grad_threshold: 0.0002
+  opacity_reset_interval: 3000
+  opacity_reset_value: 0.01
+
+output_dir: output/2dgs_joint

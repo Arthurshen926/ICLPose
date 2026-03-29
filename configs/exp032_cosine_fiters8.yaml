@@ -69,6 +69,7 @@ training:
   weight_decay: 0.00001
   grad_clip: 1.0
   use_amp: true
+  vis_epoch_interval: 10   # 每10个epoch生成特征可视化
 
   # 外层迭代精化
   outer_iters: 3

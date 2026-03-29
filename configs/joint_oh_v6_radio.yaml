@@ -1,0 +1,104 @@
+# Joint 2DGS Geometry + RADIO Feature — OldHospital  v6-RADIO
+# ============================================================
+# 改进版: 针对树木伪影问题的全面优化
+#   - 启用 size_threshold 剪枝大高斯体
+#   - 启用植被语义剪枝 (veg_prune_opacity > 0)
+#   - 增强植被区域 scale 正则化 (vegetation_scale_boost)
+#   - 更早更强的深度监督
+#   - 更保守的 densification
+#   - 高斯总数上限防止过度增长
+#
+# Usage:
+#   CUDA_VISIBLE_DEVICES=1 python -m feature_3dgs.train_2dgs_joint_v3 \
+#     --config configs/joint_oh_v6_radio.yaml
+
+exp_name: joint_oh_v6_radio
+
+dataset:
+  type: cambridge
+  source_dir: dataset/OldHospital
+  images: ''
+  feature_dir: output/features_radio/OldHospital_indexed
+  feature_scales:
+    - fine_radio
+
+model:
+  sh_degree: 3
+  white_background: false
+  random_background: false
+
+training:
+  iterations: 40000
+  longest_edge: 0
+  eval_interval: 1000
+  save_interval: 5000
+  vis_frames: [0, 200, 500, 800]
+
+  # Learning rates
+  position_lr_init: 0.00016
+  position_lr_final: 0.0000016
+  feature_lr: 0.0025
+  opacity_lr: 0.05
+  scaling_lr: 0.005
+  rotation_lr: 0.001
+  percent_dense: 0.01
+
+  # Feature embedding
+  feature_embedding_lr: 0.01
+  feature_weight: 0.5
+  feature_cos_weight: 0.5
+  feature_start_iter: 500
+  detach_feat_geometry: false
+
+  # RGB loss
+  lambda_dssim: 0.2
+
+  # 2DGS geometry regularization — STRENGTHENED
+  lambda_normal: 0.1           # v5=0.05 → v6: 更强法线一致性
+  lambda_dist: 0.02            # v5=0.01 → v6: 更强距离正则
+  lambda_scale: 0.005          # v5=0.001 → v6: 5x更强尺度约束
+  scale_reg_threshold: 0.2     # v5=0.3 → v6: 更低阈值, 更早惩罚大高斯
+  reg_start_iter: 500
+
+  # Monocular depth supervision — EARLIER & STRONGER
+  mono_depth_dir: output/oh_depth_local/mono_depth
+  lambda_depth: 0.1            # v5=0.05 → v6: 2x更强深度约束
+  depth_start_iter: 500        # v5=3000 → v6: 更早开始深度监督
+  depth_warmup_iters: 3000     # v5=2000 → v6: 更长warmup避免震荡
+
+  # Densification — MORE CONSERVATIVE
+  densify_from_iter: 500
+  densify_until_iter: 20000    # v5=25000 → v6: 更早停止densification
+  densification_interval: 100
+  densify_grad_threshold: 0.0003  # v5=0.0002 → v6: 更高阈值, 更少新高斯
+  opacity_reset_interval: 3000    # v5=6000 → v6: 更频繁清理死高斯
+  opacity_reset_value: 0.01
+  size_threshold: 20           # v5=null → v6: 启用! 剪枝屏幕空间过大的高斯
+  max_gaussians: 200000        # NEW: 高斯数量上限, 防止无限增长
+
+  # Sky / object masking
+  use_mask: true
+  mask_path: dataset/OldHospital/masks.pkl
+
+  # AppearanceNetwork
+  use_appearance: true
+  appearance_embed_dim: 32
+  appearance_lr: 0.001
+  appearance_reg: 0.0
+  appearance_mean_reg: 0.01
+
+  # Transient mask
+  use_transient: true
+  transient_lr: 0.001
+  transient_reg: 0.01
+
+  # Semantic-guided regularization — STRENGTHENED
+  semantic_mask_dir: dataset/OldHospital/semantic_masks
+  vegetation_reg_scale: 0.3    # v5=0.1 → v6: 更强植被normal/dist正则
+  vegetation_scale_boost: 3.0  # NEW: 植被区域scale正则3倍加强
+  veg_prune_opacity: 0.05     # v5=0.0 → v6: 启用! 剪枝低透明度植被高斯
+
+  # Gradient accumulation
+  grad_accum_steps: 4
+
+output_dir: output/2dgs_joint

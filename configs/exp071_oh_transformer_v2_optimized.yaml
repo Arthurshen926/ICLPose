@@ -1,0 +1,94 @@
+# ============================================================
+#  exp071_oh_transformer_v2_optimized.yaml
+#  TransformerPoseNetV2 on OldHospital - GPU 利用率优化版
+#
+#  vs exp070:
+#    - d_model: 128→256, n_layers: 6→8, n_heads: 4→8 (~12M params, 4× capacity)
+#    - batch_size: 2→48 (充分利用 24GB VRAM)
+#    - outer_iters: 1→2 (训练时多次迭代)
+#    - cache_features: true (预加载所有特征到内存)
+#    - persistent_workers: true, num_workers: 8
+#    - gradient_accumulation_steps: 1
+# ============================================================
+
+exp_name: exp071_oh_transformer_v2_optimized
+output_dir: output/exp071_oh_transformer_v2_optimized
+
+# ── Model (4× larger capacity) ──
+model:
+  type: transformer_v2
+  d_model: 256                # 128→256
+  feat_in_dim: 64             # DA3 fine features
+  n_heads: 8                  # 4→8 (256/8=32 per head)
+  n_layers: 8                 # 6→8
+  ffn_dim: 512                # 256→512
+  dropout: 0.0
+  attn_hw: [35, 61]           # keep half-res attention (safe, 2135 tokens)
+  fine_hw: [69, 121]          # full DA3 fine resolution
+  damping: 0.001
+  irls_iters: 3
+  irls_huber_k: 1.345
+  robust_kernel: huber
+  pixel_stride: 1
+
+# ── Renderer (per-Gaussian fine features) ──
+renderer:
+  ply_path: output/2dgs_models/OldHospital/v7_depth/point_cloud/iteration_30000/point_cloud.ply
+  scale_model_paths:
+    fine: output/feature_3dgs/oldhospital_da3_perscale_v2/fine/best_model.pth
+  scale_resolutions:
+    fine: [69, 121]
+  img_height: 1080
+  img_width: 1920
+  fx: 1673.5
+  fy: 1673.5
+  cx: 960.0
+  cy: 540.0
+
+# ── Data ──
+data:
+  train_feature_dir: output/features_da3_unified/OldHospital
+  train_traj_path: output/features_da3_unified/OldHospital/traj_w_c.txt
+
+  val_feature_dir: null
+  val_traj_path: null
+  val_netvlad_poses: null
+  val_split_ratio: 0.1
+
+  # Fixed moderate noise
+  noise_rot_deg: 4.0
+  noise_trans_m: 0.2
+  val_noise_rot_deg: 4.0
+  val_noise_trans_m: 0.2
+
+  batch_size: 16              # conservative start, can increase after profiling
+  val_batch_size: 8
+  num_workers: 8              # 4→8
+  cache_features: true        # 预加载特征到内存
+
+# ── Training ──
+training:
+  lr: 3e-4                    # slightly higher LR for larger batch
+  weight_decay: 1e-4
+  min_lr: 1e-6
+  warmup_epochs: 10           # longer warmup for larger batch
+  epochs: 200                 # more epochs for thorough training
+  phase1_epochs: 0
+  grad_clip: 1.0
+  use_amp: true
+  gradient_accumulation_steps: 1
+
+  loss:
+    pose_weight: 1.0
+    rot_weight: 1.0
+    trans_weight: 10.0
+    gamma: 0.85
+    huber_delta: 5.0
+    conf_reg_weight: 0.01
+    gamma_outer: 0.8
+
+  outer_iters: 2              # 1→2 (更多迭代)
+  val_outer_iters: 3
+
+  noise_curriculum:
+    enabled: false

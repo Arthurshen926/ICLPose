@@ -40,6 +40,13 @@ V2_SCALE_CONFIG = {
     'fine_dino': {'subdir': 'dino',   'dim': 768},
 }
 
+# FlowFeat 特征布局: 3 scales from DPT intermediate layers (PCA compressed)
+FLOWFEAT_SCALE_CONFIG = {
+    'coarse': {'subdir': 'coarse', 'dim': 32},
+    'mid':    {'subdir': 'mid',    'dim': 64},
+    'fine':   {'subdir': 'fine',   'dim': 64},
+}
+
 
 def _orthogonalize_rotations(poses: np.ndarray) -> np.ndarray:
     """SVD-orthogonalize rotation matrices to ensure det(R)=1, R@R^T=I.
@@ -130,6 +137,8 @@ class PoseDatasetV4(Dataset):
         noise_trans_m: float = 0.5,
         is_train: bool = True,
         netvlad_poses_path: str = None,
+        flow_resolution: Tuple[int, int] = None,
+        cache_in_memory: bool = False,
     ):
         self.feature_base_dir = feature_base_dir
         self.depth_dir = depth_dir
@@ -137,13 +146,18 @@ class PoseDatasetV4(Dataset):
         self.noise_rot_deg = noise_rot_deg
         self.noise_trans_m = noise_trans_m
         self.depth_scale = depth_scale
+        if flow_resolution is not None:
+            self.FLOW_RESOLUTION = tuple(flow_resolution)
+
+        # 自动检测 v1/v2/flowfeat 格式
+        self.scale_config = self._detect_format(feature_base_dir)
 
         if scale_names is None:
-            scale_names = ['coarse', 'mid', 'fine_sd', 'fine_dino']
+            if self.scale_config is FLOWFEAT_SCALE_CONFIG:
+                scale_names = ['coarse', 'mid', 'fine']
+            else:
+                scale_names = ['coarse', 'mid', 'fine_sd', 'fine_dino']
         self.scale_names = scale_names
-
-        # 自动检测 v1/v2 格式
-        self.scale_config = self._detect_format(feature_base_dir)
 
         # 加载位姿
         poses_c2w = load_poses_c2w(traj_path)
@@ -189,14 +203,36 @@ class PoseDatasetV4(Dataset):
         # 验证
         self._verify_features()
 
-        fmt = "v1" if self.scale_config is V1_SCALE_CONFIG else "v2"
+        # 特征缓存: 预加载所有 .pt 到内存, 消除训练时磁盘 I/O
+        self._feature_cache = None
+        if cache_in_memory:
+            self._feature_cache = {}
+            total_bytes = 0
+            for scale in self.scale_names:
+                self._feature_cache[scale] = {}
+                for fid, fpath in self.file_maps[scale].items():
+                    t = torch.load(fpath, map_location='cpu', weights_only=True)
+                    self._feature_cache[scale][fid] = t
+                    total_bytes += t.nelement() * t.element_size()
+            print(f"[DatasetV4] Cached {len(self.frame_indices)} frames "
+                  f"× {len(self.scale_names)} scales = "
+                  f"{total_bytes / 1024**2:.0f} MB in CPU memory")
+
+        fmt = "flowfeat" if self.scale_config is FLOWFEAT_SCALE_CONFIG else \
+              "v1" if self.scale_config is V1_SCALE_CONFIG else "v2"
+        cache_str = ", cached" if cache_in_memory else ""
         print(f"[DatasetV4] {len(self)} frames, {fmt} format, "
               f"scales={self.scale_names}, train={is_train}, "
-              f"noise=({noise_rot_deg}°, {noise_trans_m}m)")
+              f"noise=({noise_rot_deg}°, {noise_trans_m}m){cache_str}")
 
     @staticmethod
     def _detect_format(feature_base_dir: str) -> Dict:
-        """自动检测 v1 还是 v2 特征布局."""
+        """自动检测 v1/v2/flowfeat 特征布局."""
+        # flowfeat: 有 fine/ 子目录 (而非 fine_sd/ 或 fine_dino/)
+        has_fine = os.path.isdir(os.path.join(feature_base_dir, 'fine'))
+        has_fine_sd = os.path.isdir(os.path.join(feature_base_dir, 'fine_sd'))
+        if has_fine and not has_fine_sd:
+            return FLOWFEAT_SCALE_CONFIG
         # v1: 有 coarse/ 子目录
         if os.path.isdir(os.path.join(feature_base_dir, 'coarse')):
             return V1_SCALE_CONFIG
@@ -205,7 +241,7 @@ class PoseDatasetV4(Dataset):
             return V2_SCALE_CONFIG
         raise FileNotFoundError(
             f"无法检测特征格式: {feature_base_dir}, "
-            f"需要 coarse/ (v1) 或 sd_s5/ (v2) 子目录")
+            f"需要 coarse/ (v1) 或 sd_s5/ (v2) 或 fine/ (flowfeat) 子目录")
 
     def _verify_features(self):
         missing = 0
@@ -226,13 +262,16 @@ class PoseDatasetV4(Dataset):
         # 1. 查询特征
         query_feats = {}
         for scale in self.scale_names:
-            fpath = self.file_maps[scale].get(frame_idx)
-            if fpath is None:
-                raise FileNotFoundError(
-                    f"特征不存在: scale={scale}, frame={frame_idx}")
-            query_feats[scale] = torch.load(
-                fpath, map_location='cpu', weights_only=True
-            )
+            if self._feature_cache is not None:
+                query_feats[scale] = self._feature_cache[scale][frame_idx]
+            else:
+                fpath = self.file_maps[scale].get(frame_idx)
+                if fpath is None:
+                    raise FileNotFoundError(
+                        f"特征不存在: scale={scale}, frame={frame_idx}")
+                query_feats[scale] = torch.load(
+                    fpath, map_location='cpu', weights_only=True
+                )
 
         # 2. GT w2c 位姿
         pose_gt = torch.from_numpy(self.poses_w2c[i]).float()

@@ -28,6 +28,66 @@ from feature_3dgs.gaussian_feature_model import GaussianFeatureModel
 from feature_3dgs.feature_renderer import FeatureRenderer
 
 
+def _load_triplane_renderer(
+    ply_path: str,
+    triplane_path: str,
+    scale_resolutions: Dict[str, Tuple[int, int]],
+    device: str,
+    img_height: int,
+    img_width: int,
+    fx: float, fy: float, cx: float, cy: float,
+):
+    """Load a TriPlaneFeatureModel and build per-scale rendering info.
+    
+    Returns (models_dict, scale_info_dict, scale_names) where models_dict has a single
+    'triplane' entry and scale_info has per-scale resolution + dim info.
+    """
+    from feature_3dgs.triplane_feature_model import TriPlaneFeatureModel
+    
+    ckpt = torch.load(triplane_path, map_location='cpu')
+    
+    # Extract config from checkpoint (flat keys, not nested)
+    head_dims = ckpt['head_dims']  # e.g. {'coarse': 32, 'mid': 64, 'fine': 64}
+    
+    model = TriPlaneFeatureModel(
+        plane_resolution=ckpt['plane_resolution'],
+        plane_channels=ckpt['plane_channels'],
+        trunk_dim=ckpt.get('trunk_dim', 128),
+        head_dims=head_dims,
+    )
+    model.load_ply(ply_path)
+    
+    # Load tri-plane parameters and decoder weights
+    model.plane_xy.data = ckpt['plane_xy'].to(device)
+    model.plane_xz.data = ckpt['plane_xz'].to(device)
+    model.plane_yz.data = ckpt['plane_yz'].to(device)
+    model.decoder.load_state_dict(ckpt['decoder_state_dict'])
+    model.bbox_min = ckpt['bbox_min'].to(device)
+    model.bbox_max = ckpt['bbox_max'].to(device)
+    
+    for param in model.parameters():
+        param.requires_grad = False
+    model = model.to(device).eval()
+    
+    # Build scale info from head_dims
+    scale_names = sorted(head_dims.keys())
+    scale_info = {}
+    dim_offset = 0
+    for name in scale_names:
+        dim = head_dims[name]
+        res = scale_resolutions.get(name, (35, 46))
+        scale_info[name] = {
+            'feat_dim': dim,
+            'resolution': tuple(res),
+            'dim_offset': dim_offset,
+            'num_gaussians': model.get_xyz.shape[0],
+        }
+        dim_offset += dim
+        print(f"  [{name}] feat_dim={dim}, res={res} (triplane)")
+    
+    return {'triplane': model}, scale_info, scale_names
+
+
 class MultiScaleRenderer(nn.Module):
     """
     多尺度 3DGS 特征渲染器
@@ -67,6 +127,12 @@ class MultiScaleRenderer(nn.Module):
         img_width: int = 640,
         fx: float = 320.0, fy: float = 320.0,
         cx: float = 319.5, cy: float = 239.5,
+        triplane_model_path: str = None,
+        scale_resolutions: Dict[str, Tuple[int, int]] = None,
+        # Feature sharpening: unsharp mask to counteract alpha-blending low-pass
+        # filter. Applied after rendering + L2 norm. 0.0 = disabled.
+        sharpen_strength: float = 0.0,
+        sharpen_kernel_size: int = 3,
     ):
         super().__init__()
         
@@ -77,51 +143,66 @@ class MultiScaleRenderer(nn.Module):
         self.fy = fy
         self.cx = cx
         self.cy = cy
+        self.triplane_mode = triplane_model_path is not None
+        self.sharpen_strength = sharpen_strength
+        self.sharpen_kernel_size = sharpen_kernel_size
         
-        self.scale_names = sorted(scale_model_paths.keys())
-        self.models = nn.ModuleDict()
-        self.scale_info = {}
+        if self.triplane_mode:
+            # Tri-plane mode: single shared model, per-scale feature slicing
+            res_config = scale_resolutions or {}
+            self.models, self.scale_info, self.scale_names = _load_triplane_renderer(
+                ply_path, triplane_model_path, res_config,
+                device, img_height, img_width, fx, fy, cx, cy)
+            self.models = nn.ModuleDict(self.models)
+        else:
+            # Legacy per-scale models mode
+            self.scale_names = sorted(scale_model_paths.keys())
+            self.models = nn.ModuleDict()
+            self.scale_info = {}
+            
+            for name, pth_path in scale_model_paths.items():
+                pth_path = Path(pth_path)
+                if not pth_path.exists():
+                    print(f"  [Warning] {name} model not found: {pth_path}, skipping")
+                    continue
+                
+                # 加载 checkpoint
+                ckpt = torch.load(str(pth_path), map_location='cpu')
+                feat_dim = ckpt['feature_dim']
+                loc_feature = ckpt['loc_feature']  # (N, D)
+                resolution = ckpt.get('resolution', self.SCALE_RESOLUTIONS.get(name, (35, 46)))
+                # Explicit scale_resolutions override (e.g. joint-trained models without resolution in ckpt)
+                if scale_resolutions and name in scale_resolutions:
+                    resolution = tuple(scale_resolutions[name])
+                
+                # 创建 model 并加载几何参数
+                model = GaussianFeatureModel(feature_dim=feat_dim)
+                model.load_ply(ply_path)
+                
+                # 覆盖特征嵌入
+                with torch.no_grad():
+                    model._loc_feature = nn.Parameter(loc_feature.to(device))
+                
+                # 冻结所有参数 (推理模式)
+                for param in model.parameters():
+                    param.requires_grad = False
+                
+                model = model.to(device)
+                model.eval()
+                
+                self.models[name] = model
+                self.scale_info[name] = {
+                    'feat_dim': feat_dim,
+                    'resolution': tuple(resolution) if hasattr(resolution, '__iter__') else resolution,
+                    'num_gaussians': loc_feature.shape[0],
+                }
+                
+                print(f"  [{name}] feat_dim={feat_dim}, "
+                      f"res={resolution}, N={loc_feature.shape[0]}")
         
-        for name, pth_path in scale_model_paths.items():
-            pth_path = Path(pth_path)
-            if not pth_path.exists():
-                print(f"  [Warning] {name} model not found: {pth_path}, skipping")
-                continue
-            
-            # 加载 checkpoint
-            ckpt = torch.load(str(pth_path), map_location='cpu')
-            feat_dim = ckpt['feature_dim']
-            loc_feature = ckpt['loc_feature']  # (N, D)
-            resolution = ckpt.get('resolution', self.SCALE_RESOLUTIONS.get(name, (35, 46)))
-            
-            # 创建 model 并加载几何参数
-            model = GaussianFeatureModel(feature_dim=feat_dim)
-            model.load_ply(ply_path)
-            
-            # 覆盖特征嵌入
-            with torch.no_grad():
-                model._loc_feature = nn.Parameter(loc_feature.to(device))
-            
-            # 冻结所有参数 (推理模式)
-            for param in model.parameters():
-                param.requires_grad = False
-            
-            model = model.to(device)
-            model.eval()
-            
-            self.models[name] = model
-            self.scale_info[name] = {
-                'feat_dim': feat_dim,
-                'resolution': tuple(resolution) if hasattr(resolution, '__iter__') else resolution,
-                'num_gaussians': loc_feature.shape[0],
-            }
-            
-            print(f"  [{name}] feat_dim={feat_dim}, "
-                  f"res={resolution}, N={loc_feature.shape[0]}")
-        
-        # 深度渲染用最细分辨率 (从 fine_sd 模型中获取, 适配不同宽高比)
+        # 深度渲染用最细分辨率
         fine_res = None
-        for name in ['fine_sd', 'fine_dino']:
+        for name in ['fine', 'fine_sd', 'fine_dino']:
             if name in self.scale_info:
                 fine_res = self.scale_info[name]['resolution']
                 break
@@ -134,7 +215,43 @@ class MultiScaleRenderer(nn.Module):
         self.depth_cy = cy * (self.depth_H / img_height)
         
         print(f"[MultiScaleRenderer] Loaded {len(self.models)} scale models: "
-              f"{list(self.models.keys())}, depth_res={self.depth_H}×{self.depth_W}")
+              f"{list(self.models.keys())}, depth_res={self.depth_H}×{self.depth_W}"
+              + (f", sharpen={self.sharpen_strength}" if self.sharpen_strength > 0 else ""))
+
+    def _sharpen_features(self, feat: torch.Tensor) -> torch.Tensor:
+        """
+        Unsharp mask to counteract alpha-blending low-pass filtering.
+
+        Alpha-blending averages ~10-50 overlapping Gaussians per pixel,
+        producing blurred features. This sharpens them:
+          feat' = feat + strength * (feat - blur(feat))
+        then re-L2-normalizes per pixel.
+
+        Args:
+            feat: (C, H, W) or (B, C, H, W) L2-normalized feature map
+
+        Returns:
+            same shape, sharpened and re-L2-normalized
+        """
+        if self.sharpen_strength <= 0:
+            return feat
+
+        squeeze = feat.ndim == 3
+        if squeeze:
+            feat = feat.unsqueeze(0)  # (1, C, H, W)
+
+        k = self.sharpen_kernel_size
+        padding = k // 2
+        # Average-pool blur (depthwise, per-channel)
+        blurred = F.avg_pool2d(feat, k, stride=1, padding=padding)
+        # Unsharp mask
+        sharpened = feat + self.sharpen_strength * (feat - blurred)
+        # Re-L2-normalize per pixel
+        sharpened = F.normalize(sharpened, p=2, dim=1)
+
+        if squeeze:
+            sharpened = sharpened.squeeze(0)
+        return sharpened
     
     @torch.no_grad()
     def render_scale(
@@ -156,15 +273,21 @@ class MultiScaleRenderer(nn.Module):
                 'feature_map': (D, fH, fW) 特征图 (L2 normalized)
                 'depth_map': (H, W) 深度图 (仅当 return_depth=True)
         """
-        assert scale_name in self.models, \
-            f"Scale '{scale_name}' not loaded. Available: {list(self.models.keys())}"
+        assert scale_name in self.scale_info, \
+            f"Scale '{scale_name}' not loaded. Available: {list(self.scale_info.keys())}"
         
-        model = self.models[scale_name]
         info = self.scale_info[scale_name]
         fH, fW = info['resolution']
+
+        if self.triplane_mode:
+            model = self.models['triplane']
+            # Render full concatenated feature at this scale's resolution
+            total_dim = sum(self.scale_info[s]['feat_dim'] for s in self.scale_names)
+        else:
+            model = self.models[scale_name]
+            total_dim = info['feat_dim']
         
-        # 缩放内参以匹配特征分辨率 (与 train_raw_embedding 一致)
-        # 训练时直接在特征分辨率下光栅化，而非 640×480 再 resize
+        # 缩放内参以匹配特征分辨率
         scale_x = fW / self.img_width
         scale_y = fH / self.img_height
         render_fx = self.fx * scale_x
@@ -183,10 +306,22 @@ class MultiScaleRenderer(nn.Module):
             feature_width=fW,
             norm_feat_before_render=True,
             norm_feat_after_render=True,
-            max_channels_per_chunk=128,  # 128 vs 32 default: 21% faster on RTX 3090
+            max_channels_per_chunk=128,
         )
         
-        out = {'feature_map': result['feature_map']}  # (D, fH, fW)
+        feat_map = result['feature_map']  # (D_total, fH, fW)
+        
+        if self.triplane_mode:
+            # Slice the scale's channels from the concatenated output
+            offset = info['dim_offset']
+            dim = info['feat_dim']
+            feat_map = feat_map[offset:offset + dim]
+            feat_map = F.normalize(feat_map, p=2, dim=0)
+        
+        # Apply feature sharpening (counteract alpha-blending blur)
+        feat_map = self._sharpen_features(feat_map)
+        
+        out = {'feature_map': feat_map}
         
         if return_depth:
             out['depth_map'] = self._render_depth(model, pose_w2c)
@@ -214,7 +349,7 @@ class MultiScaleRenderer(nn.Module):
                 'depth_map': (H, W) 深度图 (若 return_depth)
         """
         if scales is None:
-            scales = list(self.models.keys())
+            scales = list(self.scale_info.keys())
         
         result = {}
         
@@ -248,13 +383,13 @@ class MultiScaleRenderer(nn.Module):
                 'depth_map': (B, H, W) 如果 return_depth
         """
         if scales is None:
-            scales = list(self.models.keys())
+            scales = list(self.scale_info.keys())
         
         B = poses_w2c.shape[0]
         out = {}
         
         for name in scales:
-            model = self.models[name]
+            model = self.models['triplane'] if self.triplane_mode else self.models[name]
             info = self.scale_info[name]
             fH, fW = info['resolution']
             
@@ -279,11 +414,23 @@ class MultiScaleRenderer(nn.Module):
                 max_channels_per_chunk=128,
             )
             
-            out[f'{name}_feat'] = result['feature_map']  # [B, D, fH, fW]
+            feat = result['feature_map']  # [B, D_total, fH, fW]
+            
+            if self.triplane_mode:
+                # Slice this scale's channels from concatenated output
+                offset = info['dim_offset']
+                dim = info['feat_dim']
+                feat = feat[:, offset:offset + dim]
+                feat = F.normalize(feat, p=2, dim=1)
+            
+            # Apply feature sharpening (counteract alpha-blending blur)
+            feat = self._sharpen_features(feat)
+            
+            out[f'{name}_feat'] = feat
         
         if return_depth:
             # 使用第一个模型渲染深度 (批量)
-            first_model = self.models[scales[0]]
+            first_model = self.models['triplane'] if self.triplane_mode else self.models[scales[0]]
             from feature_3dgs.feature_renderer import _build_K
             K = _build_K(self.depth_fx, self.depth_fy, 
                         self.depth_cx, self.depth_cy, poses_w2c.device)
@@ -294,11 +441,11 @@ class MultiScaleRenderer(nn.Module):
             
             is_2dgs = getattr(first_model, 'is_2dgs', False)
             from gsplat import rasterization
-            scales = first_model.get_scaling_for_render if is_2dgs else first_model.get_scaling
+            gauss_scales = first_model.get_scaling_for_render if is_2dgs else first_model.get_scaling
             render_colors, _, _ = rasterization(
                 means=first_model.get_xyz,
                 quats=first_model.get_rotation,
-                scales=scales,
+                scales=gauss_scales,
                 opacities=first_model.get_opacity.squeeze(-1),
                 colors=dummy_colors,
                 viewmats=poses_w2c,
@@ -391,4 +538,4 @@ class MultiScaleRenderer(nn.Module):
     
     def get_available_scales(self) -> List[str]:
         """返回可用的尺度名称列表"""
-        return list(self.models.keys())
+        return list(self.scale_info.keys())

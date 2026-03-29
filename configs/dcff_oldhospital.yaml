@@ -1,0 +1,81 @@
+# DCFF: Deferred Cascaded Feature Field — OldHospital
+# Joint 2DGS + 16d latent + Hash Grid + Deferred Rendering
+#
+# Architecture:
+#   Explicit: 2DGS surfels + 16d latent z_i → Fine decoder → 64d geometric features
+#   Implicit: Multi-res Hash Grid + MLP → 64d semantic features
+#   Supervision: Dual-scale RADIO (shallow=geo, deep=sem), each PCA→64d
+
+exp_name: dcff_oldhospital
+output_dir: output
+
+dataset:
+  type: cambridge
+  source_dir: dataset/OldHospital
+  images: ''
+  feature_dir: output/features_radio_dual/OldHospital
+
+model:
+  sh_degree: 3
+  white_background: false
+  latent_dim: 16        # Per-Gaussian latent embedding dimension
+  feature_dim: 64       # Target feature dimension (matches RADIO PCA output)
+
+hash_grid:
+  n_levels: 16          # Multi-resolution levels
+  n_features_per_level: 2
+  log2_hashmap_size: 19 # 2^19 = 524K entries per level
+  base_resolution: 16
+  max_resolution: 2048
+  sh_degree: 3          # View direction SH encoding degree
+  mlp_hidden: 128
+  mlp_layers: 2
+
+training:
+  iterations: 40000
+
+  # Phase schedule
+  fine_start_iter: 2000     # Phase 2: activate fine features
+  coarse_start_iter: 8000   # Phase 3: activate coarse features (hash grid)
+
+  # 2DGS geometry LR
+  position_lr_init: 0.00016
+  position_lr_final: 0.0000016
+  feature_lr: 0.0025
+  opacity_lr: 0.05
+  scaling_lr: 0.005
+  rotation_lr: 0.001
+
+  # Latent + DCFF module LR
+  latent_lr: 0.0005
+  lr_hash_grid: 0.001
+  lr_fine_decoder: 0.0001
+
+  # Densification
+  percent_dense: 0.01
+  densify_from_iter: 500
+  densify_until_iter: 15000
+  densify_every: 100
+  densify_grad_threshold: 0.0002
+  min_opacity: 0.005
+  max_num_gaussians: 500000
+  opacity_reset_every: 3000
+
+  # Image processing
+  longest_edge: 960
+
+  # Logging / checkpoint
+  log_every: 100
+  save_every: 5000
+  sh_degree_up_every: 1000
+
+  # Loss weights
+  loss:
+    lambda_dssim: 0.2       # SSIM weight in RGB loss
+    lambda_fine_cos: 1.0    # Fine feature cosine loss
+    lambda_fine_l1: 0.5     # Fine feature L1 loss
+    lambda_coarse_cos: 1.0  # Coarse feature cosine loss
+    lambda_coarse_l1: 0.5   # Coarse feature L1 loss
+    lambda_tv: 0.01         # Hash grid total variation
+    lambda_normal: 0.05     # Normal consistency
+    lambda_dist: 0.01       # Distortion regularization

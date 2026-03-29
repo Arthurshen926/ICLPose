@@ -437,6 +437,86 @@ def pose_loss(
     }
 
 
+def occlusion_aware_confidence_loss(
+    pred: Dict[str, torch.Tensor],
+    gt_masks: Dict[str, torch.Tensor],
+    gt_flows: Dict[str, torch.Tensor],
+    occlusion_weight: float = 1.0,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """
+    Depth-based occlusion-aware confidence supervision.
+
+    Uses GT validity masks (derived from depth reprojection) to directly
+    supervise the confidence network:
+      - Occluded/invalid pixels → confidence should be LOW
+      - Visible pixels with small flow error → confidence should be HIGH
+      - Visible pixels with large flow error → confidence should be MODERATE
+
+    This replaces the indirect calibration loss with a geometrically-grounded
+    supervision signal, making the confidence network aware of physical
+    occlusions from the very start of training.
+
+    Args:
+        pred: model output with conf_fine
+        gt_masks: validity masks from depth reprojection {'fine': (B,1,H,W)}
+        gt_flows: GT flow for visible-pixel accuracy calibration
+        occlusion_weight: weight for the occlusion term
+
+    Returns:
+        loss, metrics
+    """
+    conf = pred.get('conf_fine')
+    if conf is None:
+        return torch.tensor(0.0), {}
+
+    device = conf.device
+    metrics = {}
+
+    fine_mask = gt_masks.get('fine')
+    if fine_mask is None:
+        return torch.tensor(0.0, device=device), {}
+
+    # For directional confidence (B,2,H,W), work with the mean across directions
+    if conf.dim() == 4 and conf.shape[1] == 2:
+        conf_scalar = conf.mean(dim=1, keepdim=True)  # (B, 1, H, W)
+    else:
+        conf_scalar = conf
+
+    # Build target confidence from geometry:
+    # 1) Invalid/occluded pixels → target = 0
+    # 2) Valid pixels → target based on flow accuracy
+    flow_pred = pred.get('flow_fine')
+    flow_gt = gt_flows.get('fine')
+
+    if flow_pred is not None and flow_gt is not None:
+        flow_err = torch.norm(flow_pred.detach() - flow_gt.detach(), dim=1, keepdim=True)
+        # Sigmoid-like mapping: flow_err=0→1.0, flow_err=5px→~0.37, flow_err=10px→~0.14
+        accuracy_conf = torch.exp(-flow_err / 5.0)
+        # Target: valid * accuracy, invalid → 0
+        target_conf = fine_mask.float() * accuracy_conf
+    else:
+        # Fallback: just use mask (valid=0.7, invalid=0.0)
+        target_conf = fine_mask.float() * 0.7
+
+    # Focal-style loss: harder examples (further from target) get more weight
+    diff = (conf_scalar - target_conf).abs()
+    focal_weight = (1.0 + diff).detach()  # detach to avoid second-order gradients
+    loss = (focal_weight * diff.pow(2)).mean() * occlusion_weight
+
+    # Metrics
+    with torch.no_grad():
+        n_invalid = (1.0 - fine_mask.float()).sum().clamp(min=1.0)
+        n_valid = fine_mask.float().sum().clamp(min=1.0)
+        conf_at_invalid = ((1.0 - fine_mask.float()) * conf_scalar).sum() / n_invalid
+        conf_at_valid = (fine_mask.float() * conf_scalar).sum() / n_valid
+        metrics['occ_conf_at_invalid'] = conf_at_invalid.item()
+        metrics['occ_conf_at_valid'] = conf_at_valid.item()
+        metrics['occ_conf_loss'] = loss.item()
+        metrics['occ_invalid_ratio'] = (1.0 - fine_mask.float()).mean().item()
+
+    return loss, metrics
+
+
 def flow_consistency_loss(
     pred: Dict[str, torch.Tensor],
     coarse_hw: Tuple[int, int],
@@ -554,7 +634,8 @@ class MSFlowTrainer:
         """加载 3DGS 渲染器."""
         rc = self.config['renderer']
         ply_path = rc['ply_path']
-        scale_model_paths = rc['scale_model_paths']
+        scale_model_paths = rc.get('scale_model_paths', {})
+        triplane_path = rc.get('triplane_model_path', None)
 
         print("[Trainer] 加载 MultiScaleRenderer...")
         self.renderer = MultiScaleRenderer(
@@ -567,9 +648,13 @@ class MSFlowTrainer:
             fy=rc.get('fy', 320.0),
             cx=rc.get('cx', 319.5),
             cy=rc.get('cy', 239.5),
+            triplane_model_path=triplane_path,
+            scale_resolutions=rc.get('scale_resolutions', None),
+            sharpen_strength=rc.get('sharpen_strength', 0.0),
+            sharpen_kernel_size=rc.get('sharpen_kernel_size', 3),
         )
-        # v1 uses default SCALE_RESOLUTIONS (7×10, 15×20, 35×46)
-        print("  ✓ Renderer loaded (v1 resolutions)")
+        mode_str = "triplane" if triplane_path else "per-scale"
+        print(f"  ✓ Renderer loaded ({mode_str})")
 
     def _init_model(self):
         """创建 MSFlowPoseNet."""
@@ -600,6 +685,9 @@ class MSFlowTrainer:
             fine_dino_in_dim=mc.get('fine_dino_in_dim', 768),
             irls_iters=mc.get('irls_iters', 0),
             irls_huber_k=mc.get('irls_huber_k', 1.345),
+            robust_kernel=mc.get('robust_kernel', 'huber'),
+            gnc_mu_init=mc.get('gnc_mu_init', 1.0),
+            gnc_mu_step=mc.get('gnc_mu_step', 1.4),
             deep_flow_head=mc.get('deep_flow_head', False),
             cross_scale_context=mc.get('cross_scale_context', False),
             cross_scale_dim=mc.get('cross_scale_dim', 32),
@@ -625,6 +713,15 @@ class MSFlowTrainer:
             attention_coarse=mc.get('attention_coarse', False),
             attention_coarse_heads=mc.get('attention_coarse_heads', 4),
             attention_coarse_layers=mc.get('attention_coarse_layers', 2),
+            flowfeat_mode=mc.get('flowfeat_mode', False),
+            fine_in_dim=mc.get('fine_in_dim', 64),
+            convex_upsampling=mc.get('convex_upsampling', False),
+            transformer_refiner=mc.get('transformer_refiner', 'none'),
+            transformer_refiner_layers=mc.get('transformer_refiner_layers', 2),
+            transformer_refiner_heads=mc.get('transformer_refiner_heads', 4),
+            transformer_flow_decoder=mc.get('transformer_flow_decoder', False),
+            transformer_flow_layers=mc.get('transformer_flow_layers', 3),
+            standardize_before_corr=mc.get('standardize_before_corr', False),
         ).to(self.device)
 
         n_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
@@ -645,14 +742,20 @@ class MSFlowTrainer:
         drs_str = ", dino_replace_sd" if mc.get('dino_replace_sd', False) else ""
         loc_str = ", loc_prior" if mc.get('localizability_prior', False) else ""
         attn_str = ", attn_coarse" if mc.get('attention_coarse', False) else ""
+        std_str = ", standardize_corr" if mc.get('standardize_before_corr', False) else ""
         print(f"[Model] MSFlowPoseNet: {n_params/1e6:.2f}M trainable params, "
               f"fine_iters={mc.get('fine_iters', 4)}, "
               f"mid_iters={mc.get('mid_iters', 1)}, "
-              f"corr_temp={mc.get('corr_temperature', 1.0)}{irls_str}{dfh_str}{csc_str}{pr_str}{cd_str}{gu_str}{msc_str}{pe_str}{dpe_str}{scf_str}{lt_str}{dc_str}{ad_str}{das_str}{drs_str}{loc_str}{attn_str}")
+              f"corr_temp={mc.get('corr_temperature', 1.0)}{irls_str}{dfh_str}{csc_str}{pr_str}{cd_str}{gu_str}{msc_str}{pe_str}{dpe_str}{scf_str}{lt_str}{dc_str}{ad_str}{das_str}{drs_str}{loc_str}{attn_str}{std_str}")
 
     def _init_datasets(self):
         """准备训练/验证数据集."""
         dc = self.config['data']
+        mc = self.config.get('model', {})
+        
+        # FlowFeat mode uses 3 scales and custom fine resolution
+        flow_res = tuple(mc.get('fine_hw', [35, 46]))
+        ds_scale_names = dc.get('scale_names', None)
 
         if dc.get('val_feature_dir'):
             # 独立验证集 (例如 Sequence 2)
@@ -663,6 +766,8 @@ class MSFlowTrainer:
                 noise_rot_deg=dc.get('noise_rot_deg', 15.0),
                 noise_trans_m=dc.get('noise_trans_m', 0.5),
                 is_train=True,
+                flow_resolution=flow_res,
+                scale_names=ds_scale_names,
             )
             self.val_dataset = PoseDatasetV4(
                 feature_base_dir=dc['val_feature_dir'],
@@ -672,26 +777,74 @@ class MSFlowTrainer:
                 noise_trans_m=dc.get('val_noise_trans_m', 0.5),
                 is_train=False,
                 netvlad_poses_path=dc.get('val_netvlad_poses'),
+                flow_resolution=flow_res,
+                scale_names=ds_scale_names,
             )
         else:
-            # 从训练集自动拆分 val (最后 10%)
-            full_dataset = PoseDatasetV4(
-                feature_base_dir=dc['train_feature_dir'],
-                traj_path=dc['train_traj_path'],
-                depth_dir=dc.get('train_depth_dir'),
-                noise_rot_deg=dc.get('noise_rot_deg', 15.0),
-                noise_trans_m=dc.get('noise_trans_m', 0.5),
-                is_train=True,
-            )
-            n_total = len(full_dataset)
-            n_val = max(1, int(n_total * dc.get('val_split_ratio', 0.1)))
-            n_train = n_total - n_val
-            self.train_dataset, self.val_dataset = \
-                torch.utils.data.random_split(
-                    full_dataset, [n_train, n_val],
-                    generator=torch.Generator().manual_seed(42))
-            # val subset 使用较小噪声以更好检测进步
-            print(f"[Data] Auto-split: {n_train} train + {n_val} val from {n_total} total")
+            # Check for official train/test indices (e.g. Cambridge Landmarks)
+            import numpy as np
+            feat_dir = dc['train_feature_dir']
+            train_idx_path = os.path.join(feat_dir, 'train_indices.npy')
+            test_idx_path = os.path.join(feat_dir, 'test_indices.npy')
+            use_official = dc.get('use_official_split', False)
+
+            if use_official and os.path.exists(train_idx_path):
+                train_indices = np.load(train_idx_path).tolist()
+                self.train_dataset = PoseDatasetV4(
+                    feature_base_dir=dc['train_feature_dir'],
+                    traj_path=dc['train_traj_path'],
+                    depth_dir=dc.get('train_depth_dir'),
+                    frame_indices=train_indices,
+                    noise_rot_deg=dc.get('noise_rot_deg', 15.0),
+                    noise_trans_m=dc.get('noise_trans_m', 0.5),
+                    is_train=True,
+                    flow_resolution=flow_res,
+                    scale_names=ds_scale_names,
+                )
+                if os.path.exists(test_idx_path):
+                    test_indices = np.load(test_idx_path).tolist()
+                    self.val_dataset = PoseDatasetV4(
+                        feature_base_dir=dc['train_feature_dir'],
+                        traj_path=dc['train_traj_path'],
+                        depth_dir=dc.get('train_depth_dir'),
+                        frame_indices=test_indices,
+                        noise_rot_deg=dc.get('val_noise_rot_deg', dc.get('noise_rot_deg', 15.0)),
+                        noise_trans_m=dc.get('val_noise_trans_m', dc.get('noise_trans_m', 0.5)),
+                        is_train=False,
+                        flow_resolution=flow_res,
+                        scale_names=ds_scale_names,
+                    )
+                else:
+                    # Fall back to splitting from train
+                    n_val = max(1, int(len(self.train_dataset) * 0.1))
+                    n_train = len(self.train_dataset) - n_val
+                    self.train_dataset, self.val_dataset = \
+                        torch.utils.data.random_split(
+                            self.train_dataset, [n_train, n_val],
+                            generator=torch.Generator().manual_seed(42))
+                print(f"[Data] Official split: {len(self.train_dataset)} train + "
+                      f"{len(self.val_dataset)} val")
+            else:
+                # 从训练集自动拆分 val (最后 10%)
+                full_dataset = PoseDatasetV4(
+                    feature_base_dir=dc['train_feature_dir'],
+                    traj_path=dc['train_traj_path'],
+                    depth_dir=dc.get('train_depth_dir'),
+                    noise_rot_deg=dc.get('noise_rot_deg', 15.0),
+                    noise_trans_m=dc.get('noise_trans_m', 0.5),
+                    is_train=True,
+                    flow_resolution=flow_res,
+                    scale_names=ds_scale_names,
+                )
+                n_total = len(full_dataset)
+                n_val = max(1, int(n_total * dc.get('val_split_ratio', 0.1)))
+                n_train = n_total - n_val
+                self.train_dataset, self.val_dataset = \
+                    torch.utils.data.random_split(
+                        full_dataset, [n_train, n_val],
+                        generator=torch.Generator().manual_seed(42))
+                # val subset 使用较小噪声以更好检测进步
+                print(f"[Data] Auto-split: {n_train} train + {n_val} val from {n_total} total")
 
         # persistent_workers=False so noise curriculum updates propagate to workers
         # (persistent workers keep stale copies of dataset attributes)
@@ -801,6 +954,7 @@ class MSFlowTrainer:
         self.div_reg_weight = lc.get('div_reg_weight', 0.0)  # diversity loss weight
         self.flow_cons_weight = lc.get('flow_consistency_weight', 0.0)
         self.loc_loss_weight = lc.get('localizability_weight', 0.0)
+        self.occ_conf_weight = lc.get('occ_conf_weight', 0.0)  # occlusion-aware confidence
 
         # ── 噪声课程学习 ──
         nc = tc.get('noise_curriculum', {})
@@ -964,6 +1118,21 @@ class MSFlowTrainer:
             })
         self._cf_positions = all_positions  # (N, 3) world positions
         self._cf_poses_w2c = all_poses_w2c  # (N, 4, 4)
+
+        # Build mask for train-only retrieval (prevents cross-frame leakage to test set)
+        feat_dir = dc['train_feature_dir']
+        train_idx_path = os.path.join(feat_dir, 'train_indices.npy')
+        if dc.get('use_official_split', False) and os.path.exists(train_idx_path):
+            train_indices = set(np.load(train_idx_path).tolist())
+            N = len(all_positions)
+            self._cf_train_mask = torch.zeros(N, dtype=torch.bool)
+            for idx in train_indices:
+                if idx < N:
+                    self._cf_train_mask[idx] = True
+            print(f"[CrossFrameCache] Train-only mask: {self._cf_train_mask.sum().item()}/{N} frames")
+        else:
+            self._cf_train_mask = None
+
         print(f"[CrossFrameCache] Cached {len(self._cf_features)} frames")
 
     @torch.no_grad()
@@ -984,6 +1153,9 @@ class MSFlowTrainer:
         # Exclude self (set self-distance to inf)
         for b in range(B):
             dists[b, frame_indices[b]] = float('inf')
+        # Exclude test frames if using official split
+        if self._cf_train_mask is not None:
+            dists[:, ~self._cf_train_mask] = float('inf')
         # Find nearest
         _, nn_idx = dists.min(dim=1)  # (B,)
 
@@ -1011,20 +1183,19 @@ class MSFlowTrainer:
         渲染一个 batch 的多尺度特征 + 深度.
 
         Returns:
-            render_feats: {'coarse': (B,1280,8,10), 'mid': ..., 'fine_sd': ..., 'fine_dino': ...}
-            depth: (B, 35, 46)
+            render_feats: {'coarse': ..., 'mid': ..., ...}
+            depth: (B, H, W)
         """
-        scales = ['coarse', 'mid', 'fine_sd', 'fine_dino']
+        mc = self.config.get('model', {})
+        if mc.get('flowfeat_mode', False):
+            scales = ['coarse', 'mid', 'fine']
+        else:
+            scales = ['coarse', 'mid', 'fine_sd', 'fine_dino']
         result = self.renderer.render_batch(
             poses_w2c, scales=scales, return_depth=True)
 
-        render_feats = {
-            'coarse': result['coarse_feat'],
-            'mid': result['mid_feat'],
-            'fine_sd': result['fine_sd_feat'],
-            'fine_dino': result['fine_dino_feat'],
-        }
-        depth = result.get('depth_map')  # (B, 35, 46)
+        render_feats = {s: result[f'{s}_feat'] for s in scales}
+        depth = result.get('depth_map')
         return render_feats, depth
 
     @torch.no_grad()
@@ -1176,6 +1347,14 @@ class MSFlowTrainer:
                     conf_coverage_range=self.conf_coverage_range)
                 iter_loss = iter_loss + self.conf_reg_weight * conf_loss
 
+                # Occlusion-aware confidence supervision (geometry-grounded)
+                occ_conf_metrics = {}
+                if self.occ_conf_weight > 0:
+                    occ_loss, occ_conf_metrics = occlusion_aware_confidence_loss(
+                        pred, gt_masks, gt_flows,
+                        occlusion_weight=self.occ_conf_weight)
+                    iter_loss = iter_loss + occ_loss
+
                 # Diversity regularization (prevents decoder feature collapse)
                 if self.div_reg_weight > 0:
                     div_loss, div_metrics = diversity_regularization_loss(pred)
@@ -1223,6 +1402,7 @@ class MSFlowTrainer:
             if outer_i == N - 1:
                 all_metrics = flow_metrics.copy()
                 all_metrics.update(conf_metrics)
+                all_metrics.update(occ_conf_metrics)
                 all_metrics.update(div_metrics)
                 all_metrics.update(flow_cons_metrics)
                 all_metrics.update(loc_metrics)
@@ -1551,6 +1731,124 @@ class MSFlowTrainer:
         print(f"  Fresh scheduler: T_max={remaining} (remaining of {self.total_epochs}), LR={cont_lr}")
         print(f"  Continuing from epoch {self.epoch}, best_val_rot={self.best_val_rot:.2f}°")
 
+    @torch.no_grad()
+    def _visualize_features(self, epoch: int):
+        """每隔 vis_epoch_interval epochs 生成特征可视化图像.
+
+        保存到 output_dir/vis/epoch_N/ 和 TensorBoard.
+        可视化内容：
+          - 各尺度渲染特征 vs. query 特征的 cosine 相似度热图
+          - Fine 尺度光流预测可视化
+        """
+        try:
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+        except ImportError:
+            return
+
+        vis_dir = self.output_dir / 'vis' / f'epoch_{epoch:04d}'
+        vis_dir.mkdir(parents=True, exist_ok=True)
+
+        self.model.eval()
+        torch.cuda.empty_cache()
+
+        # 取验证集第一个 batch
+        batch = next(iter(self.val_loader))
+        query_feats = {k: v.to(self.device) for k, v in batch['query_feats'].items()}
+        pose_gt = batch['pose_gt'].to(self.device)
+        pose_cur = batch['initial_pose'].to(self.device)
+
+        # 渲染 GT 位姿下的特征（用于评估特征重建质量）
+        with torch.cuda.amp.autocast(enabled=False):
+            render_feats_gt, depth = self._render_batch(pose_gt.float())
+
+        # Forward pass（初始位姿）
+        with torch.cuda.amp.autocast(enabled=self.use_amp):
+            render_feats_init, depth_init = self._render_batch(pose_cur)
+            pred = self.model(query_feats, render_feats_init, depth_init)
+
+        # ── (1) 特征 cosine 相似度热图 ──
+        scale_pairs = [
+            ('coarse', 'coarse'),
+            ('mid', 'mid'),
+            ('fine_sd', 'fine_sd'),
+        ]
+        available_pairs = [(s, s) for s, _ in scale_pairs
+                           if s in query_feats and s in render_feats_gt]
+
+        if available_pairs:
+            n_scales = len(available_pairs)
+            fig, axes = plt.subplots(1, n_scales, figsize=(5 * n_scales, 4))
+            if n_scales == 1:
+                axes = [axes]
+
+            for ax, (scale, _) in zip(axes, available_pairs):
+                q = query_feats[scale][0]        # (C, H, W)
+                r = render_feats_gt[scale][0]    # (C, H, W)
+                # cosine sim per-pixel
+                q_n = F.normalize(q, dim=0)
+                r_n = F.normalize(r, dim=0)
+                cos_sim = (q_n * r_n).sum(dim=0).cpu().float().numpy()  # (H, W)
+                im = ax.imshow(cos_sim, vmin=-1, vmax=1, cmap='RdYlGn')
+                ax.set_title(f'{scale}\ncos_sim mean={cos_sim.mean():.3f}', fontsize=9)
+                ax.axis('off')
+                plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+            fig.suptitle(f'Feature Cosine Similarity (Epoch {epoch})', fontsize=11)
+            fig.tight_layout()
+            save_path = vis_dir / 'cosine_sim.png'
+            fig.savefig(str(save_path), dpi=120, bbox_inches='tight')
+            plt.close(fig)
+
+            # TensorBoard image
+            import torchvision.transforms.functional as TF
+            from PIL import Image
+            img = Image.open(str(save_path))
+            img_tensor = TF.to_tensor(img)
+            self.writer.add_image('vis/cosine_sim', img_tensor, epoch)
+
+        # ── (2) Fine 流场可视化 ──
+        if 'flow_fine' in pred:
+            flow = pred['flow_fine'][0].cpu().float()  # (2, H, W)
+            H, W = flow.shape[1], flow.shape[2]
+
+            fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+            # u-component
+            axes[0].imshow(flow[0].numpy(), cmap='RdBu_r',
+                           vmin=-4, vmax=4)
+            axes[0].set_title(f'Flow u (fine) E{epoch}', fontsize=9)
+            axes[0].axis('off')
+            # v-component
+            axes[1].imshow(flow[1].numpy(), cmap='RdBu_r',
+                           vmin=-4, vmax=4)
+            axes[1].set_title(f'Flow v (fine) E{epoch}', fontsize=9)
+            axes[1].axis('off')
+            fig.tight_layout()
+            flow_path = vis_dir / 'flow_fine.png'
+            fig.savefig(str(flow_path), dpi=120, bbox_inches='tight')
+            plt.close(fig)
+
+            img = Image.open(str(flow_path))
+            self.writer.add_image('vis/flow_fine', TF.to_tensor(img), epoch)
+
+        # ── (3) 打印 per-scale cosine similarity 汇总 ──
+        scale_sims = {}
+        for scale in ('coarse', 'mid', 'fine_sd', 'fine_dino'):
+            if scale in query_feats and scale in render_feats_gt:
+                q = F.normalize(query_feats[scale][0], dim=0)
+                r = F.normalize(render_feats_gt[scale][0], dim=0)
+                sim = (q * r).sum(dim=0).mean().item()
+                scale_sims[scale] = sim
+                self.writer.add_scalar(f'vis/feat_cosine_{scale}', sim, epoch)
+
+        if scale_sims:
+            sim_str = '  '.join(f'{k}={v:.3f}' for k, v in scale_sims.items())
+            print(f"  [Vis E{epoch}] feat cos_sim: {sim_str}  → {vis_dir}")
+
+        self.model.train()
+        torch.cuda.empty_cache()
+
     def train(self):
         """完整训练循环."""
         print(f"\n{'='*60}")
@@ -1560,6 +1858,9 @@ class MSFlowTrainer:
         print(f"  Output: {self.output_dir}")
         print(f"  AMP: {self.use_amp}")
         print(f"{'='*60}\n")
+
+        tc = self.config.get('training', {})
+        vis_epoch_interval = tc.get('vis_epoch_interval', 10)  # 每10个epoch可视化一次
 
         epoch_times = []
         train_start = time.time()
@@ -1589,6 +1890,10 @@ class MSFlowTrainer:
                 print(f"  ★ New best: rot={self.best_val_rot:.2f}°{joint_str}")
 
             self._save_checkpoint(epoch, is_best)
+
+            # 周期性特征可视化
+            if vis_epoch_interval > 0 and (epoch % vis_epoch_interval == 0 or epoch == self.total_epochs - 1):
+                self._visualize_features(epoch)
 
             elapsed = time.time() - t0
             epoch_times.append(elapsed)

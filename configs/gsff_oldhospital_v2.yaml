@@ -1,0 +1,98 @@
+# ============================================================
+#  gsff_oldhospital_v2.yaml
+#  GSFF Reproduction on OldHospital — v2
+#
+#  Key fix: Use smaller coarse resolution (7×12) for global 
+#  correlation, matching the proven room_0 architecture.
+#  Global corr channels: 7×12=84 (vs 15×26=390 which failed).
+#
+#  Other improvements:
+#  - Lower noise start (1°), slower curriculum (80 epoch warmup)
+#  - Max train noise 8° (eval at 10°)
+#  - Batch size 16 for stable gradients
+#  - Phase1 only 5 epochs, then add pose loss
+#  - Standard 3DGS rendering (diagnostic shows cos_sim 0.85-0.92)
+#
+#  Training:
+#    CUDA_VISIBLE_DEVICES=0 python scripts/train_ms_flow.py \
+#        --config configs/gsff_oldhospital_v2.yaml
+# ============================================================
+
+exp_name: gsff_oldhospital_v2
+output_dir: output/gsff_oldhospital_v2
+
+model:
+  hidden_dim: 128
+  decode_dim: 64
+  local_radius: 4
+  damping: 0.001
+  fine_iters: 8
+  mid_iters: 1
+  # ★ KEY FIX: Smaller coarse for manageable global correlation
+  # 7×12=84 channels (close to room_0's 7×10=70)
+  coarse_hw: [7, 12]
+  mid_hw: [15, 26]
+  fine_hw: [35, 61]
+  # AE-compressed feature dimensions
+  coarse_in_dim: 32
+  mid_in_dim: 64
+  fine_sd_in_dim: 64
+  fine_dino_in_dim: 64
+
+renderer:
+  ply_path: output/2dgs_models/OldHospital/v7_depth/point_cloud/iteration_30000/point_cloud.ply
+  scale_model_paths:
+    coarse:    output/feature_3dgs/oldhospital_ae_div_perscale/coarse/best_model.pth
+    mid:       output/feature_3dgs/oldhospital_ae_div_perscale/mid/best_model.pth
+    fine_sd:   output/feature_3dgs/oldhospital_ae_div_perscale/fine_sd/best_model.pth
+    fine_dino: output/feature_3dgs/oldhospital_ae_div_perscale/fine_dino/best_model.pth
+  img_height: 1080
+  img_width: 1920
+  fx: 1673.5
+  fy: 1673.5
+  cx: 960.0
+  cy: 540.0
+
+data:
+  train_feature_dir: output/features_multiscale_compressed/OldHospital_indexed
+  train_traj_path: output/features_multiscale_compressed/OldHospital_indexed/traj_w_c.txt
+  use_official_split: true
+  val_feature_dir: null
+  val_traj_path: null
+  val_netvlad_poses: null
+  val_split_ratio: 0.1
+  # Training noise: 8° max (eval at 10°)
+  noise_rot_deg: 8.0
+  noise_trans_m: 0.5
+  val_noise_rot_deg: 10.0
+  val_noise_trans_m: 0.5
+  batch_size: 16
+  val_batch_size: 4
+  num_workers: 4
+
+training:
+  epochs: 120
+  phase1_epochs: 5
+  lr: 0.0002
+  min_lr: 0.000005
+  weight_decay: 0.00001
+  grad_clip: 1.0
+  use_amp: true
+  outer_iters: 3
+  val_outer_iters: 5
+  loss:
+    flow_weights:
+      coarse: 0.1
+      mid: 0.3
+      fine: 1.0
+    gamma: 0.8
+    gamma_outer: 0.9
+    rot_weight: 1.0
+    trans_weight: 10.0
+    rot_loss_type: cosine
+  conf_coverage_range: [0.3, 0.8]
+  noise_curriculum:
+    enabled: true
+    warmup_epochs: 80
+    start_rot_deg: 1.0
+    start_trans_m: 0.05

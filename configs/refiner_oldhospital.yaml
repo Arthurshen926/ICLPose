@@ -1,0 +1,88 @@
+# ============================================================
+#  refiner_oldhospital.yaml
+#  PoseRefiner on OldHospital (Cambridge Landmarks)
+#
+#  Matches v15 training settings with PoseRefiner architecture:
+#    - Solver at 68x120 (bilinear upsample from 34x60)
+#    - Translation disabled (solver_trans_scale=0)
+#    - 3 outer iterations during training (critical for convergence)
+#    - flow_weight=5.0, conf_reg_weight=0.3
+#    - 8 GRU fine iterations, sequential rotation solve
+#
+#  Training:
+#    CUDA_VISIBLE_DEVICES=0 python scripts/train_refiner.py \
+#        --config configs/refiner_oldhospital.yaml
+# ============================================================
+
+exp_name: refiner_oh_v1
+output_dir: output/refiner_oh_v1
+
+model:
+  in_dim: 64
+  match_dim: 64
+  hidden_dim: 128
+  n_heads: 4
+  n_attn_layers: 2
+  ffn_dim: 128
+  local_radius: 4
+  fine_iters: 4
+  damping: 0.001
+  coarse_hw: [17, 30]
+  fine_hw: [34, 60]
+  solver_hw: [68, 120]          # solve at RADIO native res (bilinear upsample)
+  solver_upsample: 4            # for ConvexUpsampler (future use)
+  depth_normalize: false         # not needed when translation disabled
+  sequential_solve: true         # rotation-first solve
+  detach_conf: true              # prevent pose loss -> confidence collapse
+  conf_floor: 0.1               # minimum confidence (anti-collapse)
+  solver_trans_scale: 0.0        # disable translation (unobservable at 33m depth)
+  use_trans_head: false
+  trans_head_mode: replace
+
+renderer:
+  ply_path: output/2dgs_joint/joint_oh_v7_radio/point_cloud/best/point_cloud.ply
+  feature_model_path: output/2dgs_joint/joint_oh_v7_radio/features_best/fine_radio/best_model.pth
+  feat_hw: [68, 120]
+  img_hw: [1080, 1920]
+  fx: 1663.12
+  fy: 1663.12
+  cx: 960.0
+  cy: 540.0
+
+data:
+  feature_dir: output/features_radio/OldHospital_indexed
+  traj_path: output/features_radio/OldHospital_indexed/traj_w_c.txt
+  noise_rot_deg: 8.0
+  noise_trans_m: 0.25
+  val_noise_rot_deg: 8.0
+  val_noise_trans_m: 0.25
+  batch_size: 16
+  val_batch_size: 8
+  num_workers: 4
+
+training:
+  epochs: 200
+  phase1_epochs: 200             # flow-only for all epochs (proven in v15)
+  lr: 0.0002
+  min_lr: 0.000001
+  weight_decay: 0.00001
+  grad_clip: 1.0
+  use_amp: true
+  outer_iters: 3                 # 3 outer iterations (CRITICAL - matches v15)
+  val_outer_iters: 3             # 3 outer iterations during validation
+  loss:
+    flow_weight: 5.0             # dominant signal (matches v15)
+    pose_weight: 0.0             # disabled
+    rot_weight: 1.0
+    trans_weight: 10.0
+    gamma: 0.8                   # RAFT-style sequence loss decay
+    conf_reg_weight: 0.3         # stronger confidence regularization (matches v15)
+    contrast_weight: 0.5         # InfoNCE for discriminative projections
+    xi_weight: 0.0               # disabled
+  noise_curriculum:
+    enabled: true
+    warmup_epochs: 20            # faster curriculum (matches v15)
+    base_rot_deg: 2.0
+    base_trans_m: 0.05
+    max_rot_deg: 8.0
+    max_trans_m: 0.25

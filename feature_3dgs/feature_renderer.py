@@ -12,12 +12,17 @@ gsplat v1.4 API:
 参考 STDLoc gaussian_renderer/__init__.py 的双模式渲染设计。
 """
 
+import os
 import torch
 import torch.nn.functional as F
 from gsplat import rasterization
 try:
     from gsplat import rasterization_2dgs
 except ImportError:
+    rasterization_2dgs = None
+
+# Force 3DGS rasterization for all models (including 2DGS) when set
+if os.environ.get('FORCE_3DGS_RASTERIZATION', '0') == '1':
     rasterization_2dgs = None
 
 
@@ -164,7 +169,7 @@ class FeatureRenderer:
         # --- 渲染 ---
         is_2dgs = getattr(gaussian_model, 'is_2dgs', False)
         
-        if is_2dgs:
+        if is_2dgs and rasterization_2dgs is not None:
             # ---- 2DGS: 使用 rasterization_2dgs ----
             # gsplat 1.4.0 的 rasterization_2dgs 不支持 channel_chunk，手动分块
             chunk_size = max_channels_per_chunk

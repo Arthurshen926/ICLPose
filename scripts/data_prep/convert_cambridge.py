@@ -97,11 +97,12 @@ def parse_cambridge_pose_file(pose_txt: str, src_root: Path):
 
         # 四元数 → 旋转矩阵（C2W，即世界坐标系下的相机旋转）
         # 使用 numpy 手算，避免额外依赖
-        R = quat2rot(qw, qx, qy, qz)
+        R_w2c = quat2rot(qw, qx, qy, qz)
 
-        # C2W 矩阵
+        # Cambridge 四元数与 COLMAP qvec 一致，都表示 W2C 旋转
+        # 构建 C2W 矩阵: R_c2w = R_w2c.T, position = camera center in world
         T = np.eye(4, dtype=np.float64)
-        T[:3, :3] = R
+        T[:3, :3] = R_w2c.T  # R_c2w
         T[:3, 3] = [x, y, z]
 
         img_abs = src_root / rel_path
