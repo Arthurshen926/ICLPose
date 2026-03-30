@@ -38,7 +38,8 @@ def load_model_and_codec(config, checkpoint_path, device):
         from radio_gs.models.hybrid_gaussian import HybridFeatureGaussian
         model = HybridFeatureGaussian(latent_dim=config.hybrid_latent_dim)
 
-    model.load_from_ply(config.ply_path)
+    if config.ply_path:
+        model.load_from_ply(config.ply_path)
 
     codec = HCDCodec(
         input_dim=config.radio_feature_dim,
@@ -56,7 +57,8 @@ def load_model_and_codec(config, checkpoint_path, device):
     )
 
     ckpt = torch.load(checkpoint_path, map_location='cpu')
-    model.load_checkpoint(checkpoint_path)
+    if 'model_state_dict' in ckpt:
+        model.load_state_dict(ckpt['model_state_dict'], strict=False)
     if 'codec_state_dict' in ckpt:
         codec.load_state_dict(ckpt['codec_state_dict'])
 

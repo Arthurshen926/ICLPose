@@ -42,7 +42,7 @@ from radio_gs.losses.distillation_loss import (
 )
 from radio_gs.models.explicit_gaussian import ExplicitFeatureGaussian
 from radio_gs.models.featsharp_3d import FeatSharp3D
-from radio_gs.models.hcd_codec import HCDCodec, HCDDecoder, HCDEncoder
+from radio_gs.models.hcd_codec import HCDCodec
 from radio_gs.models.hybrid_gaussian import HybridFeatureGaussian
 from radio_gs.rendering.feature_renderer import FeatureFieldRenderer
 
@@ -167,7 +167,16 @@ class RadioGSTrainer:
         # Components
         self.model = self.build_model(config).to(self.device)
         self.codec = self._build_codec(config).to(self.device)
-        self.renderer = FeatureFieldRenderer(config).to(self.device)
+        self.renderer = FeatureFieldRenderer(
+            image_height=getattr(config, "feature_height", 30),
+            image_width=getattr(config, "feature_width", 40),
+            fx=getattr(config, "fx", 320.0) * getattr(config, "feature_width", 40) / getattr(config, "image_width", 640),
+            fy=getattr(config, "fy", 320.0) * getattr(config, "feature_height", 30) / getattr(config, "image_height", 480),
+            cx=getattr(config, "cx", 319.5) * getattr(config, "feature_width", 40) / getattr(config, "image_width", 640),
+            cy=getattr(config, "cy", 239.5) * getattr(config, "feature_height", 30) / getattr(config, "image_height", 480),
+            max_channels_per_chunk=getattr(config, "max_channels_per_chunk", 32),
+            use_2dgs=getattr(config, "use_2dgs", False),
+        ).to(self.device)
         self.sharpener = FeatSharp3D(
             mode=getattr(config, "featsharp_mode", "analytical"),
             feature_dim=self._resolve_latent_dim(config),
@@ -247,7 +256,7 @@ class RadioGSTrainer:
             raise ValueError(f"Unknown architecture: {arch}")
 
         ply_path = getattr(config, "ply_path", None)
-        if ply_path is not None:
+        if ply_path:
             self._log(f"Loading geometry from {ply_path}")
             model.load_from_ply(ply_path)
 
@@ -255,18 +264,11 @@ class RadioGSTrainer:
 
     @staticmethod
     def _build_codec(config: RadioGSConfig) -> nn.Module:
-        encoder = HCDEncoder(
+        return HCDCodec(
             input_dim=getattr(config, "radio_feature_dim", 1280),
             bottleneck_dim=getattr(config, "bottleneck_dim", 64),
             dual_stream=getattr(config, "dual_stream", True),
         )
-        decoder = HCDDecoder(
-            bottleneck_dim=getattr(config, "bottleneck_dim", 64),
-            output_dim=getattr(config, "radio_feature_dim", 1280),
-            hidden_dim=getattr(config, "decoder_hidden_dim", 512),
-            num_layers=getattr(config, "decoder_num_layers", 3),
-        )
-        return HCDCodec(encoder=encoder, decoder=decoder)
 
     def _build_optimizer(self, config: RadioGSConfig) -> optim.Optimizer:
         param_groups = [
@@ -379,9 +381,10 @@ class RadioGSTrainer:
                     gt_compact = self.codec.encoder(gt_radio)    # [B, D, Hp, Wp]
 
                 # Render compact features from 3DGS
-                rendered_compact = self.renderer.render_features(
+                result = self.renderer.render_features_batch(
                     self.model, pose_w2c
-                )  # [B, D, Hf, Wf]
+                )
+                rendered_compact = result["feature_map"]  # [B, D, Hf, Wf]
 
                 # Sharpen rendered features
                 rendered_compact = self.sharpener(rendered_compact)
@@ -497,7 +500,7 @@ class RadioGSTrainer:
             gt_radio = batch["radio_features"].to(self.device)
             pose_w2c = batch["pose_w2c"].to(self.device)
 
-            rendered_compact = self.renderer.render_features(self.model, pose_w2c)
+            rendered_compact = self.renderer.render_features_batch(self.model, pose_w2c)["feature_map"]
             rendered_compact = self.sharpener(rendered_compact)
             decoded = self.codec.decoder(rendered_compact)
 
@@ -663,7 +666,7 @@ class RadioGSTrainer:
             gt = sample["radio_features"].unsqueeze(0).to(self.device)
             pose = sample["pose_w2c"].unsqueeze(0).to(self.device)
 
-            rendered = self.renderer.render_features(self.model, pose)
+            rendered = self.renderer.render_features_batch(self.model, pose)["feature_map"]
             rendered = self.sharpener(rendered)
             decoded = self.codec.decoder(rendered)
 
