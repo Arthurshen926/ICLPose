@@ -1,0 +1,76 @@
+# RADIO-GS Base Configuration: Replica room_0, Explicit Architecture
+exp_name: "radio_gs_replica_explicit"
+output_dir: "output/radio_gs/replica_explicit"
+seed: 42
+
+# Scene
+scene: "room_0"
+ply_path: "dataset/room_0/splatloc-test/data/room_0/point_cloud/final/point_cloud.ply"
+
+# RADIO
+radio_version: "c-radio_v4-h"
+radio_repo: "/root/RADIO"
+radio_feature_dim: 1280
+
+# Architecture
+architecture: "explicit"
+latent_dim: 64
+
+# HCD Codec
+bottleneck_dim: 64
+dual_stream: true
+decoder_hidden_dim: 512
+decoder_num_layers: 3
+
+# FeatSharp
+featsharp_mode: "analytical"
+featsharp_strength: 0.5
+
+# Rendering
+image_height: 480
+image_width: 640
+fx: 320.0
+fy: 320.0
+cx: 319.5
+cy: 239.5
+feature_height: 30
+feature_width: 40
+max_channels_per_chunk: 32
+use_2dgs: false
+
+# Training
+epochs: 100
+batch_size: 4
+lr_features: 1.0e-3
+lr_decoder: 1.0e-4
+lr_heads: 1.0e-4
+weight_decay: 1.0e-5
+grad_clip: 10.0
+warmup_epochs: 5
+scheduler: "cosine"
+
+# Loss weights
+l2_weight: 1.0
+cosine_weight: 0.5
+consistency_weight: 0.1
+adaptor_weight: 0.1
+tv_weight: 0.01
+
+# Data
+feature_dir: "output/radio_features/room_0"
+depth_dir: "dataset/room_0/Sequence_1/depth"
+semantics_dir: ""
+train_split: "Sequence_1"
+val_split: "Sequence_2"
+num_workers: 4
+
+# Downstream tasks
+depth_head_type: "mlp"
+seg_num_classes: 40
+seg_head_type: "mlp"
+grounding_use_adaptor: true
+
+# Checkpointing
+save_every: 10
+eval_every: 5
+log_every: 100
