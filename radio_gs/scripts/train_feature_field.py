@@ -44,6 +44,7 @@ from radio_gs.models.explicit_gaussian import ExplicitFeatureGaussian
 from radio_gs.models.featsharp_3d import FeatSharp3D
 from radio_gs.models.hcd_codec import HCDCodec
 from radio_gs.models.hybrid_gaussian import HybridFeatureGaussian
+from radio_gs.models.screen_refiner import ScreenSpaceRefiner
 from radio_gs.rendering.feature_renderer import FeatureFieldRenderer
 
 try:
@@ -187,6 +188,18 @@ class RadioGSTrainer:
             strength=getattr(config, "featsharp_strength", 0.5),
         ).to(self.device)
 
+        # Optional screen-space refiner (corrects alpha-blending artifacts)
+        self.use_refiner = getattr(config, "use_refiner", False)
+        if self.use_refiner:
+            self.refiner = ScreenSpaceRefiner(
+                latent_dim=self._resolve_latent_dim(config),
+                hidden_dim=getattr(config, "refiner_hidden_dim", 128),
+                num_blocks=getattr(config, "refiner_num_blocks", 4),
+                dropout=getattr(config, "refiner_dropout", 0.1),
+            ).to(self.device)
+        else:
+            self.refiner = None
+
         # In latent mode, freeze codec entirely
         if self.train_mode == "latent":
             for p in self.codec.parameters():
@@ -240,6 +253,8 @@ class RadioGSTrainer:
         self._log(f"Model params: {self._count_params(self.model):.2f}M")
         self._log(f"Codec params: {self._count_params(self.codec):.2f}M")
         self._log(f"Sharpener mode: {self.sharpener.mode}")
+        if self.use_refiner and self.refiner is not None:
+            self._log(f"Refiner params: {self._count_params(self.refiner):.2f}M")
 
     # ------------------------------------------------------------------
     # Building blocks
@@ -306,6 +321,14 @@ class RadioGSTrainer:
                     "params": self.sharpener.parameters(),
                     "lr": getattr(config, "lr_heads", 1e-4),
                     "name": "sharpener",
+                }
+            )
+        if self.use_refiner and self.refiner is not None:
+            param_groups.append(
+                {
+                    "params": self.refiner.parameters(),
+                    "lr": getattr(config, "lr_refiner", 5e-4),
+                    "name": "refiner",
                 }
             )
         return optim.AdamW(
@@ -381,6 +404,8 @@ class RadioGSTrainer:
         if self.train_mode != "latent":
             self.codec.train()
         self.sharpener.train()
+        if self.use_refiner and self.refiner is not None:
+            self.refiner.train()
 
         loss_accum = {"total": 0.0, "distill": 0.0, "compact": 0.0, "tv": 0.0}
         cos_accum = 0.0
@@ -408,6 +433,10 @@ class RadioGSTrainer:
 
                 # Sharpen rendered features
                 rendered_compact = self.sharpener(rendered_compact)
+
+                # Apply screen-space refiner if enabled
+                if self.use_refiner and self.refiner is not None:
+                    rendered_compact = self.refiner(rendered_compact)
 
                 if self.train_mode == "latent":
                     # LATENT MODE: gt_features are already 64d (pre-encoded)
@@ -555,6 +584,8 @@ class RadioGSTrainer:
         self.model.eval()
         self.codec.eval()
         self.sharpener.eval()
+        if self.use_refiner and self.refiner is not None:
+            self.refiner.eval()
 
         cos_latent_accum = 0.0
         cos_decoded_accum = 0.0
@@ -569,6 +600,8 @@ class RadioGSTrainer:
 
             rendered_compact = self.renderer.render_features_batch(self.model, pose_w2c)["feature_map"]
             rendered_compact = self.sharpener(rendered_compact)
+            if self.use_refiner and self.refiner is not None:
+                rendered_compact = self.refiner(rendered_compact)
 
             if self.train_mode == "latent":
                 # gt_features are 64d
@@ -682,6 +715,8 @@ class RadioGSTrainer:
             "best_cosine": self.best_cosine,
             "metrics": metrics,
         }
+        if self.use_refiner and self.refiner is not None:
+            state["refiner_state_dict"] = self.refiner.state_dict()
         torch.save(state, self.ckpt_dir / "latest.pth")
         if is_best:
             torch.save(state, self.ckpt_dir / "best.pth")
@@ -694,6 +729,10 @@ class RadioGSTrainer:
         if "sharpener_state_dict" in ckpt:
             self.sharpener.load_state_dict(
                 ckpt["sharpener_state_dict"], strict=False
+            )
+        if "refiner_state_dict" in ckpt and self.use_refiner and self.refiner is not None:
+            self.refiner.load_state_dict(
+                ckpt["refiner_state_dict"], strict=False
             )
 
         if resume:
@@ -755,6 +794,8 @@ class RadioGSTrainer:
             params += list(self.codec.decoder.parameters())
         if self.sharpener.mode not in ("analytical", "none"):
             params += list(self.sharpener.parameters())
+        if self.use_refiner and self.refiner is not None:
+            params += list(self.refiner.parameters())
         return params
 
     def _get_1280d_val_path(self, batch) -> Optional[str]:
@@ -804,6 +845,8 @@ class RadioGSTrainer:
 
             rendered = self.renderer.render_features_batch(self.model, pose)["feature_map"]
             rendered = self.sharpener(rendered)
+            if self.use_refiner and self.refiner is not None:
+                rendered = self.refiner(rendered)
             decoded = self.codec.decoder(rendered)
 
             if decoded.shape[-2:] != gt.shape[-2:]:

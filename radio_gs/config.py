@@ -54,6 +54,13 @@ class RadioGSConfig:
     featsharp_strength: float = 0.5
     featsharp_num_source_views: int = 2
 
+    # Screen-space refiner
+    use_refiner: bool = False
+    refiner_hidden_dim: int = 128
+    refiner_num_blocks: int = 4
+    refiner_dropout: float = 0.1
+    lr_refiner: float = 5e-4
+
     # Rendering
     image_height: int = 480
     image_width: int = 640
