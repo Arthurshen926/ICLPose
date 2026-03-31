@@ -63,7 +63,7 @@ def load_model_and_render(config_path, checkpoint_path):
             latent_dim=getattr(config, "latent_dim", 64),
             hidden_dim=getattr(config, "refiner_hidden_dim", 128),
             num_blocks=getattr(config, "refiner_num_blocks", 4),
-            dropout=0.0,  # no dropout at eval
+            dropout=getattr(config, "refiner_dropout", 0.1),  # must match training architecture
         ).to(device).eval()
     
     # Load checkpoint
