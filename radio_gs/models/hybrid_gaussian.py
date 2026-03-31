@@ -454,15 +454,15 @@ class HybridFeatureGaussian(nn.Module):
         )
         rots = np.stack([np.asarray(vertex[n]) for n in rot_names], axis=1)
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        self._xyz = torch.tensor(xyz, dtype=torch.float32, device=device)
-        self._rotation = torch.tensor(rots, dtype=torch.float32, device=device)
-        self._scaling = torch.tensor(scales, dtype=torch.float32, device=device)
-        self._opacity = torch.tensor(opacity, dtype=torch.float32, device=device)
-        self._features_dc = torch.tensor(features_dc, dtype=torch.float32, device=device)
+        # Re-register as buffers so .to(device) moves them properly
+        self.register_buffer("_xyz", torch.tensor(xyz, dtype=torch.float32))
+        self.register_buffer("_rotation", torch.tensor(rots, dtype=torch.float32))
+        self.register_buffer("_scaling", torch.tensor(scales, dtype=torch.float32))
+        self.register_buffer("_opacity", torch.tensor(opacity, dtype=torch.float32))
+        self.register_buffer("_features_dc", torch.tensor(features_dc, dtype=torch.float32))
 
         # Initialise learnable latent codes
-        latent = torch.randn(N, self._latent_dim, device=device) * 0.01
+        latent = torch.randn(N, self._latent_dim) * 0.01
         self._latent = nn.Parameter(latent)
 
         print(f"  Gaussians: {N}, latent_dim: {self._latent_dim}")

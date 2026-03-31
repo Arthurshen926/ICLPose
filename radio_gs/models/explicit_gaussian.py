@@ -134,12 +134,19 @@ class ExplicitFeatureGaussian(nn.Module):
             [np.asarray(vertex[n]) for n in rot_names], axis=1
         )  # [N, 4]
 
-        # -- Store as frozen buffers ------------------------------------
-        self._xyz = torch.tensor(xyz, dtype=torch.float32)
-        self._rotation = torch.tensor(rots, dtype=torch.float32)
-        self._scaling = torch.tensor(scales, dtype=torch.float32)
-        self._opacity = torch.tensor(opacity, dtype=torch.float32)
-        self._features_dc = torch.tensor(features_dc, dtype=torch.float32)
+        # -- Store as frozen buffers (use .data to preserve buffer registration)
+        device = self._xyz.device
+        self._xyz = self._xyz.new_tensor(xyz)
+        self._rotation = self._rotation.new_tensor(rots)
+        self._scaling = self._scaling.new_tensor(scales)
+        self._opacity = self._opacity.new_tensor(opacity)
+        self._features_dc = self._features_dc.new_tensor(features_dc)
+        # Re-register buffers since new_tensor creates new tensors
+        self.register_buffer("_xyz", self._xyz)
+        self.register_buffer("_rotation", self._rotation)
+        self.register_buffer("_scaling", self._scaling)
+        self.register_buffer("_opacity", self._opacity)
+        self.register_buffer("_features_dc", self._features_dc)
 
         # -- Default feature init ---------------------------------------
         self.init_features_random()

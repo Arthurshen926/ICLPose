@@ -329,10 +329,16 @@ class RadioGSTrainer:
         self, config: RadioGSConfig
     ) -> Tuple[SimpleRadioDataset, SimpleRadioDataset]:
         feature_dir = getattr(config, "feature_dir", "")
-        scene_root = Path(getattr(config, "ply_path", "")).parents[3]  # dataset/room_0
+        scene = getattr(config, "scene", "room_0")
+        scene_root = Path("dataset") / scene
         train_split = getattr(config, "train_split", "Sequence_1")
         val_split = getattr(config, "val_split", "Sequence_2")
         depth_dir = getattr(config, "depth_dir", None)
+
+        # Val features use a separate directory
+        val_feature_dir = feature_dir.replace(train_split, val_split)
+        if not Path(val_feature_dir).exists():
+            val_feature_dir = feature_dir  # fallback: same dir
 
         train_ds = SimpleRadioDataset(
             feature_dir=feature_dir,
@@ -341,7 +347,7 @@ class RadioGSTrainer:
             split="train",
         )
         val_ds = SimpleRadioDataset(
-            feature_dir=feature_dir,
+            feature_dir=val_feature_dir,
             pose_file=str(scene_root / val_split / "traj_w_c.txt"),
             depth_dir=None,
             split="val",
@@ -414,7 +420,8 @@ class RadioGSTrainer:
                     gt_compact_rs = gt_compact
 
                 # Losses
-                l_distill = self.distill_loss_fn(decoded, gt_radio_rs)
+                distill_dict = self.distill_loss_fn(decoded, gt_radio_rs)
+                l_distill = distill_dict["total"]
                 l_compact = F.mse_loss(rendered_compact, gt_compact_rs)
                 l_tv = self.tv_loss_fn(rendered_compact)
 

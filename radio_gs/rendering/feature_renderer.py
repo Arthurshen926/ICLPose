@@ -220,27 +220,54 @@ class FeatureFieldRenderer(nn.Module):
         bg = torch.ones(3, device=device)
 
         raster_fn = rasterization_2dgs if self.use_2dgs else rasterization
-        renders, alphas, info = raster_fn(
-            means=means,
-            quats=quats,
-            scales=scales,
-            opacities=opacities,
-            colors=colors,
-            viewmats=viewmats_b,
-            Ks=Ks,
-            width=W,
-            height=H,
-            near_plane=self.near_plane,
-            far_plane=self.far_plane,
-            backgrounds=bg.unsqueeze(0),
-        )
+
+        if self.use_2dgs and scales.shape[-1] == 2:
+            pad = torch.full(
+                (scales.shape[0], 1), -10.0,
+                device=scales.device, dtype=scales.dtype,
+            )
+            scales = torch.cat([scales, pad], dim=-1)
+
+        if self.use_2dgs:
+            renders, alphas, _normals, _nd, _distort, _median, info = raster_fn(
+                means=means,
+                quats=quats,
+                scales=scales,
+                opacities=opacities,
+                colors=colors,
+                viewmats=viewmats_b,
+                Ks=Ks,
+                width=W,
+                height=H,
+                near_plane=self.near_plane,
+                far_plane=self.far_plane,
+                backgrounds=bg.unsqueeze(0),
+            )
+        else:
+            renders, alphas, info = raster_fn(
+                means=means,
+                quats=quats,
+                scales=scales,
+                opacities=opacities,
+                colors=colors,
+                viewmats=viewmats_b,
+                Ks=Ks,
+                width=W,
+                height=H,
+                near_plane=self.near_plane,
+                far_plane=self.far_plane,
+                backgrounds=bg.unsqueeze(0),
+            )
         # renders: [1, H, W, 3], alphas: [1, H, W, 1]
 
         rgb = renders[0].permute(2, 0, 1)   # [3, H, W]
         alpha = alphas[0, :, :, 0]           # [H, W]
 
         depth_map = torch.zeros(H, W, device=device)
-        if "depths" in info:
+        if self.use_2dgs:
+            # _median is render_median from rasterization_2dgs: [C, H, W, 1]
+            depth_map = _median[0, :, :, 0]
+        elif "depths" in info:
             depth_map = info["depths"][0, :, :, 0]
 
         return {"rgb": rgb, "depth": depth_map, "alpha": alpha}
@@ -278,6 +305,15 @@ class FeatureFieldRenderer(nn.Module):
 
         raster_fn = rasterization_2dgs if self.use_2dgs else rasterization
 
+        # gsplat rasterization_2dgs requires [N, 3] scales; 2DGS PLY files
+        # store only 2 components.  Pad with a small third scale if needed.
+        if self.use_2dgs and scales.shape[-1] == 2:
+            pad = torch.full(
+                (scales.shape[0], 1), -10.0,
+                device=scales.device, dtype=scales.dtype,
+            )
+            scales = torch.cat([scales, pad], dim=-1)
+
         rendered_chunks: list[Tensor] = []
         depth_out: Tensor | None = None
         alpha_out: Tensor | None = None
@@ -293,20 +329,37 @@ class FeatureFieldRenderer(nn.Module):
                 device=features.device,
             )
 
-            renders, alphas, info = raster_fn(
-                means=means,
-                quats=quats,
-                scales=scales,
-                opacities=opacities,
-                colors=chunk_feat,
-                viewmats=viewmats,
-                Ks=Ks,
-                width=width,
-                height=height,
-                near_plane=self.near_plane,
-                far_plane=self.far_plane,
-                backgrounds=bg.unsqueeze(0).expand(viewmats.shape[0], -1),
-            )
+            if self.use_2dgs:
+                renders, alphas, _normals, _nd, _distort, _median, info = raster_fn(
+                    means=means,
+                    quats=quats,
+                    scales=scales,
+                    opacities=opacities,
+                    colors=chunk_feat,
+                    viewmats=viewmats,
+                    Ks=Ks,
+                    width=width,
+                    height=height,
+                    near_plane=self.near_plane,
+                    far_plane=self.far_plane,
+                    backgrounds=bg.unsqueeze(0).expand(viewmats.shape[0], -1),
+                )
+            else:
+                _median = None
+                renders, alphas, info = raster_fn(
+                    means=means,
+                    quats=quats,
+                    scales=scales,
+                    opacities=opacities,
+                    colors=chunk_feat,
+                    viewmats=viewmats,
+                    Ks=Ks,
+                    width=width,
+                    height=height,
+                    near_plane=self.near_plane,
+                    far_plane=self.far_plane,
+                    backgrounds=bg.unsqueeze(0).expand(viewmats.shape[0], -1),
+                )
             # renders: [C, H, W, c_dim], alphas: [C, H, W, 1]
 
             rendered_chunks.append(renders)
@@ -314,7 +367,9 @@ class FeatureFieldRenderer(nn.Module):
             # Capture depth and alpha from the first chunk only
             if i == 0:
                 alpha_out = alphas
-                if "depths" in info:
+                if _median is not None:
+                    depth_out = _median
+                elif "depths" in info:
                     depth_out = info["depths"]
 
         # Concatenate feature chunks along the channel dimension
