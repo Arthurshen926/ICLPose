@@ -38,15 +38,17 @@ class ResidualBlock(nn.Module):
 class ScreenSpaceRefiner(nn.Module):
     """Lightweight CNN that refines rendered latent features in screen space.
 
-    The refiner takes alpha-blended 64d feature maps and produces corrected
-    64d feature maps that, when decoded, better match the original RADIO
-    features. Uses a residual architecture so it can start from identity.
+    The refiner takes alpha-blended feature maps (optionally with RGB guide)
+    and produces corrected feature maps that, when decoded, better match the
+    original RADIO features. Uses a residual architecture so it can start
+    from identity.
 
     Args:
         latent_dim: Input/output feature dimension (default 64).
         hidden_dim: Hidden channel width (default 128).
         num_blocks: Number of residual blocks (default 4).
         dropout: Dropout rate for regularization (default 0.1).
+        extra_channels: Additional input channels (e.g. 3 for RGB guide).
     """
 
     def __init__(
@@ -55,13 +57,16 @@ class ScreenSpaceRefiner(nn.Module):
         hidden_dim: int = 128,
         num_blocks: int = 4,
         dropout: float = 0.1,
+        extra_channels: int = 0,
     ):
         super().__init__()
         self.latent_dim = latent_dim
+        self.extra_channels = extra_channels
+        in_channels = latent_dim + extra_channels
 
         # Project to hidden dim
         layers: list[nn.Module] = [
-            nn.Conv2d(latent_dim, hidden_dim, 3, padding=1, bias=False),
+            nn.Conv2d(in_channels, hidden_dim, 3, padding=1, bias=False),
             nn.BatchNorm2d(hidden_dim),
             nn.ReLU(inplace=True),
         ]
@@ -84,19 +89,25 @@ class ScreenSpaceRefiner(nn.Module):
         nn.init.zeros_(self.net[-1].bias)
 
         n_params = sum(p.numel() for p in self.parameters()) / 1e6
+        tag = f"+{extra_channels}ch guide" if extra_channels > 0 else ""
         print(f"[ScreenSpaceRefiner] {latent_dim}d, {num_blocks} blocks, "
-              f"hidden={hidden_dim}, {n_params:.2f}M params")
+              f"hidden={hidden_dim}, {n_params:.2f}M params {tag}")
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, guide: torch.Tensor | None = None) -> torch.Tensor:
         """Refine rendered features with residual correction.
 
         Args:
             x: Rendered latent feature map [B, D, H, W].
+            guide: Optional guide signal [B, extra_channels, H, W] (e.g. RGB).
 
         Returns:
             Refined feature map [B, D, H, W].
         """
-        delta = self.net(x)
+        if guide is not None:
+            inp = torch.cat([x, guide], dim=1)
+        else:
+            inp = x
+        delta = self.net(inp)
         return x + delta
 
 

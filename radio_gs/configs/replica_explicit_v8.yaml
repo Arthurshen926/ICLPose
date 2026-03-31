@@ -1,0 +1,83 @@
+# RADIO-GS V8: 128d latent (10x compression instead of 20x)
+# Key hypothesis: 64d bottleneck loses too much information; 128d should
+# substantially improve feature fidelity and downstream task performance.
+# Uses the same enhanced refiner as V7.
+exp_name: "radio_gs_room0_explicit_v8"
+output_dir: "output/radio_gs/room0_explicit_v8"
+seed: 42
+
+# Scene
+scene: "room_0"
+ply_path: "output/2dgs_models/room_0/v6_sfm/point_cloud/iteration_30000/point_cloud.ply"
+
+# RADIO
+radio_version: "c-radio_v4-h"
+radio_repo: "/root/RADIO"
+radio_feature_dim: 1280
+
+# Architecture — 128d latent (doubled from 64d)
+architecture: "explicit"
+latent_dim: 128
+
+# Training mode
+train_mode: "decoded"
+
+# HCD Codec — 128d bottleneck
+bottleneck_dim: 128
+dual_stream: true
+
+# Enhanced screen-space refiner (operates on 128d now)
+use_refiner: true
+refiner_hidden_dim: 192
+refiner_num_blocks: 6
+refiner_dropout: 0.05
+lr_refiner: 3.0e-4
+
+# FeatSharp
+featsharp_mode: "analytical"
+featsharp_strength: 0.3
+
+# Rendering — 2DGS surfels
+image_height: 480
+image_width: 640
+fx: 320.0
+fy: 320.0
+cx: 319.5
+cy: 239.5
+feature_height: 30
+feature_width: 40
+max_channels_per_chunk: 32
+use_2dgs: true
+
+# Training — from scratch (no compatible warmstart due to dim change)
+epochs: 150
+batch_size: 4
+lr_features: 3.0e-4
+lr_decoder: 5.0e-5
+weight_decay: 1.0e-4
+grad_clip: 5.0
+warmup_epochs: 10
+scheduler: "cosine"
+
+# Loss weights
+l2_weight: 1.0
+cosine_weight: 3.0
+adaptor_weight: 0.5
+tv_weight: 0.05
+feat_norm_weight: 0.0
+
+# Data — 1280d features
+feature_dir: "output/radio_features_1280d/room_0/Sequence_1"
+depth_dir: "dataset/room_0/Sequence_1/depth"
+semantics_dir: "dataset/room_0/Sequence_1/semantic_class"
+train_split: "Sequence_1"
+val_split: "Sequence_2"
+num_workers: 4
+
+# Downstream tasks
+seg_num_classes: 101
+
+# Checkpointing
+save_every: 10
+eval_every: 5
+log_every: 50

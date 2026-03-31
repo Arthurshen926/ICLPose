@@ -59,6 +59,7 @@ class RadioGSConfig:
     refiner_hidden_dim: int = 128
     refiner_num_blocks: int = 4
     refiner_dropout: float = 0.1
+    refiner_rgb_guide: bool = False  # Use RGB as additional input to refiner
     lr_refiner: float = 5e-4
 
     # Rendering

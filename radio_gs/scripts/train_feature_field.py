@@ -67,11 +67,15 @@ class SimpleRadioDataset(Dataset):
         feature_dir: str,
         pose_file: str,
         depth_dir: Optional[str] = None,
+        rgb_dir: Optional[str] = None,
+        feature_size: Optional[tuple] = None,
         split: str = "train",
     ):
         super().__init__()
         self.feature_dir = Path(feature_dir)
         self.depth_dir = Path(depth_dir) if depth_dir else None
+        self.rgb_dir = Path(rgb_dir) if rgb_dir else None
+        self.feature_size = feature_size  # (H, W) for downsampling RGB
         self.split = split
 
         # --- discover feature files (backbone/rgb_{idx}.pt) ---------------
@@ -133,6 +137,20 @@ class SimpleRadioDataset(Dataset):
             if d is not None:
                 depth = torch.from_numpy(d.astype(np.float32) / 1000.0)
 
+        # --- optional RGB guide (downsampled to feature resolution) --------
+        rgb_guide: Optional[torch.Tensor] = None
+        if self.rgb_dir is not None:
+            import cv2
+
+            rgb_path = self.rgb_dir / f"rgb_{idx}.png"
+            if rgb_path.exists():
+                img = cv2.imread(str(rgb_path))
+                if img is not None:
+                    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                    if self.feature_size is not None:
+                        img = cv2.resize(img, (self.feature_size[1], self.feature_size[0]))
+                    rgb_guide = torch.from_numpy(img).float().permute(2, 0, 1) / 255.0
+
         out: Dict[str, torch.Tensor] = {
             "radio_features": radio_feat,
             "pose_w2c": pose_w2c,
@@ -140,6 +158,8 @@ class SimpleRadioDataset(Dataset):
         }
         if depth is not None:
             out["depth"] = depth
+        if rgb_guide is not None:
+            out["rgb_guide"] = rgb_guide
         return out
 
 
@@ -190,12 +210,15 @@ class RadioGSTrainer:
 
         # Optional screen-space refiner (corrects alpha-blending artifacts)
         self.use_refiner = getattr(config, "use_refiner", False)
+        self.refiner_rgb_guide = getattr(config, "refiner_rgb_guide", False)
         if self.use_refiner:
+            extra_ch = 3 if self.refiner_rgb_guide else 0
             self.refiner = ScreenSpaceRefiner(
                 latent_dim=self._resolve_latent_dim(config),
                 hidden_dim=getattr(config, "refiner_hidden_dim", 128),
                 num_blocks=getattr(config, "refiner_num_blocks", 4),
                 dropout=getattr(config, "refiner_dropout", 0.1),
+                extra_channels=extra_ch,
             ).to(self.device)
         else:
             self.refiner = None
@@ -380,16 +403,31 @@ class RadioGSTrainer:
         if not Path(val_feature_dir).exists():
             val_feature_dir = feature_dir  # fallback: same dir
 
+        # RGB guide setup
+        rgb_dir_train = rgb_dir_val = None
+        feature_size = None
+        if self.refiner_rgb_guide:
+            feature_size = (
+                getattr(config, "feature_height", 30),
+                getattr(config, "feature_width", 40),
+            )
+            rgb_dir_train = str(scene_root / train_split / "rgb")
+            rgb_dir_val = str(scene_root / val_split / "rgb")
+
         train_ds = SimpleRadioDataset(
             feature_dir=feature_dir,
             pose_file=str(scene_root / train_split / "traj_w_c.txt"),
             depth_dir=depth_dir,
+            rgb_dir=rgb_dir_train,
+            feature_size=feature_size,
             split="train",
         )
         val_ds = SimpleRadioDataset(
             feature_dir=val_feature_dir,
             pose_file=str(scene_root / val_split / "traj_w_c.txt"),
             depth_dir=None,
+            rgb_dir=rgb_dir_val,
+            feature_size=feature_size,
             split="val",
         )
         self._log(f"Train: {len(train_ds)} frames  |  Val: {len(val_ds)} frames")
@@ -436,7 +474,10 @@ class RadioGSTrainer:
 
                 # Apply screen-space refiner if enabled
                 if self.use_refiner and self.refiner is not None:
-                    rendered_compact = self.refiner(rendered_compact)
+                    rgb_guide = batch.get("rgb_guide")
+                    if rgb_guide is not None:
+                        rgb_guide = rgb_guide.to(self.device)
+                    rendered_compact = self.refiner(rendered_compact, guide=rgb_guide)
 
                 if self.train_mode == "latent":
                     # LATENT MODE: gt_features are already 64d (pre-encoded)
@@ -601,7 +642,10 @@ class RadioGSTrainer:
             rendered_compact = self.renderer.render_features_batch(self.model, pose_w2c)["feature_map"]
             rendered_compact = self.sharpener(rendered_compact)
             if self.use_refiner and self.refiner is not None:
-                rendered_compact = self.refiner(rendered_compact)
+                rgb_guide = batch.get("rgb_guide")
+                if rgb_guide is not None:
+                    rgb_guide = rgb_guide.to(self.device)
+                rendered_compact = self.refiner(rendered_compact, guide=rgb_guide)
 
             if self.train_mode == "latent":
                 # gt_features are 64d
@@ -731,9 +775,13 @@ class RadioGSTrainer:
                 ckpt["sharpener_state_dict"], strict=False
             )
         if "refiner_state_dict" in ckpt and self.use_refiner and self.refiner is not None:
-            self.refiner.load_state_dict(
-                ckpt["refiner_state_dict"], strict=False
-            )
+            try:
+                self.refiner.load_state_dict(
+                    ckpt["refiner_state_dict"], strict=False
+                )
+            except RuntimeError as e:
+                self._log(f"Refiner state_dict size mismatch (architecture changed), "
+                          f"starting refiner from scratch: {e}")
 
         if resume:
             self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
@@ -846,7 +894,10 @@ class RadioGSTrainer:
             rendered = self.renderer.render_features_batch(self.model, pose)["feature_map"]
             rendered = self.sharpener(rendered)
             if self.use_refiner and self.refiner is not None:
-                rendered = self.refiner(rendered)
+                rgb_guide = sample.get("rgb_guide")
+                if rgb_guide is not None:
+                    rgb_guide = rgb_guide.unsqueeze(0).to(self.device)
+                rendered = self.refiner(rendered, guide=rgb_guide)
             decoded = self.codec.decoder(rendered)
 
             if decoded.shape[-2:] != gt.shape[-2:]:

@@ -1,8 +1,9 @@
 """Stage 2: Fine-tune the HCD decoder on rendered features from trained Gaussians.
 
-After latent-space training (V3) produces good Gaussian features,
-this script freezes the Gaussians and fine-tunes the decoder to reconstruct
-1280d features from rendered 64d features (bridging distribution gap).
+After latent-space training (V3) or end-to-end training (V5) produces good
+Gaussian features, this script freezes the Gaussians (and optional refiner)
+and fine-tunes the decoder to reconstruct 1280d features from rendered 64d
+features (bridging distribution gap).
 """
 import argparse, sys, time
 from pathlib import Path
@@ -20,6 +21,7 @@ from radio_gs.config import RadioGSConfig, load_config
 from radio_gs.models.explicit_gaussian import ExplicitFeatureGaussian
 from radio_gs.models.hcd_codec import HCDCodec
 from radio_gs.models.featsharp_3d import FeatSharp3D
+from radio_gs.models.screen_refiner import ScreenSpaceRefiner
 from radio_gs.rendering.feature_renderer import FeatureFieldRenderer
 
 
@@ -46,7 +48,7 @@ class PairedDataset(Dataset):
         return {"gt_1280": gt, "rendered_64": rendered}
 
 
-def render_all_features(model, renderer, sharpener, pose_file, output_dir, device):
+def render_all_features(model, renderer, sharpener, pose_file, output_dir, device, refiner=None):
     """Pre-render all 64d features from trained Gaussians."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -61,6 +63,8 @@ def render_all_features(model, renderer, sharpener, pose_file, output_dir, devic
             pose = torch.from_numpy(w2c[i:i+1]).to(device)
             result = renderer.render_features_batch(model, pose)
             feat = sharpener(result["feature_map"])  # [1, 64, H, W]
+            if refiner is not None:
+                feat = refiner(feat)
             torch.save(feat.squeeze(0).cpu(), output_dir / f"rgb_{i}.pt")
     print(f"Saved {len(w2c)} rendered features to {output_dir}")
 
@@ -107,18 +111,34 @@ def main():
         strength=getattr(config, "featsharp_strength", 0.3),
     ).to(device)
 
+    # Optional screen-space refiner
+    refiner = None
+    if getattr(config, "use_refiner", False):
+        refiner = ScreenSpaceRefiner(
+            latent_dim=latent_dim,
+            hidden_dim=getattr(config, "refiner_hidden_dim", 128),
+            num_blocks=getattr(config, "refiner_num_blocks", 4),
+            dropout=getattr(config, "refiner_dropout", 0.1),
+        ).to(device)
+
     # Load checkpoint
     ckpt = torch.load(args.checkpoint, map_location=device)
     model.load_state_dict(ckpt["model_state_dict"], strict=False)
     codec.load_state_dict(ckpt["codec_state_dict"], strict=False)
     if "sharpener_state_dict" in ckpt:
         sharpener.load_state_dict(ckpt["sharpener_state_dict"], strict=False)
+    if refiner is not None and "refiner_state_dict" in ckpt:
+        refiner.load_state_dict(ckpt["refiner_state_dict"], strict=False)
     print(f"Loaded checkpoint from {args.checkpoint}")
 
-    # Freeze Gaussians
+    # Freeze Gaussians and refiner
     for p in model.parameters():
         p.requires_grad = False
     model.eval()
+    if refiner is not None:
+        for p in refiner.parameters():
+            p.requires_grad = False
+        refiner.eval()
 
     # Pre-render all features for train+val
     output_base = Path(getattr(config, "output_dir", "output/radio_gs"))
@@ -132,7 +152,7 @@ def main():
             render_all_features(
                 model, renderer, sharpener,
                 str(scene_root / split / "traj_w_c.txt"),
-                str(rendered_dir), device
+                str(rendered_dir), device, refiner=refiner
             )
         else:
             print(f"Using cached rendered features: {rendered_dir}")
@@ -209,14 +229,17 @@ def main():
             is_best = avg_val_cos > best_cos
             if is_best:
                 best_cos = avg_val_cos
-                # Save updated codec + model state
-                torch.save({
+                # Save updated codec + model + refiner state
+                save_dict = {
                     "model_state_dict": model.state_dict(),
                     "codec_state_dict": codec.state_dict(),
                     "sharpener_state_dict": sharpener.state_dict(),
                     "epoch": epoch,
                     "val_cosine": best_cos,
-                }, out_dir / "best.pth")
+                }
+                if refiner is not None:
+                    save_dict["refiner_state_dict"] = refiner.state_dict()
+                torch.save(save_dict, out_dir / "best.pth")
             marker = " ★" if is_best else ""
             print(f"[E{epoch:03d}] train_cos={avg_train_cos:.4f} val_cos={avg_val_cos:.4f}{marker}")
         else:
