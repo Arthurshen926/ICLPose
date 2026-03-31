@@ -88,8 +88,8 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
 
     # Load model
-    from radio_gs.scripts.eval_downstream import load_model_and_codec, render_and_decode
-    model, codec, renderer = load_model_and_codec(config, args.checkpoint, device)
+    from radio_gs.scripts.eval_downstream import build_components, render_decoded
+    model, codec, sharpener, renderer = build_components(config, args.checkpoint, device)
 
     print(f'Rendering {args.num_views} views for visualization...')
     print(f'Output: {output_dir}')
@@ -97,41 +97,76 @@ def main():
     # Load poses
     pose_file = os.path.join('dataset', config.scene, config.val_split, 'traj_w_c.txt')
     if os.path.exists(pose_file):
-        poses_c2w = []
-        with open(pose_file) as f:
-            lines = f.read().strip().split('\n')
-        for i in range(0, len(lines), 4):
-            if i + 4 > len(lines):
-                break
-            rows = [list(map(float, lines[i + j].split())) for j in range(4)]
-            poses_c2w.append(torch.tensor(rows, dtype=torch.float32))
+        raw_poses = np.loadtxt(pose_file).reshape(-1, 4, 4).astype(np.float32)
 
-        for view_idx in range(min(args.num_views, len(poses_c2w))):
-            c2w = poses_c2w[view_idx]
-            w2c = torch.inverse(c2w)
+        # Load GT features for comparison
+        feature_dir = config.feature_dir.replace(config.train_split, config.val_split)
+        backbone_dir = os.path.join(feature_dir, 'backbone')
+        if not os.path.isdir(backbone_dir):
+            backbone_dir = feature_dir
 
-            decoded, depth = render_and_decode(
-                model, codec, renderer, w2c, device, config
+        for view_idx in range(min(args.num_views, len(raw_poses))):
+            c2w = raw_poses[view_idx]
+            w2c = torch.tensor(np.linalg.inv(c2w).astype(np.float32))
+
+            decoded, result = render_decoded(
+                model, codec, sharpener, renderer, w2c, device
             )
 
-            # PCA visualization of decoded features
-            decoded_np = features_to_pca_rgb(decoded.squeeze(0).cpu())
+            # Load GT feature if available
+            gt_path = os.path.join(backbone_dir, f'rgb_{view_idx}.pt')
+            gt_feat = None
+            if os.path.exists(gt_path):
+                gt_feat = torch.load(gt_path, map_location='cpu')
+                if gt_feat.dim() == 4:
+                    gt_feat = gt_feat.squeeze(0)
 
             try:
                 from PIL import Image
-                save_path = os.path.join(output_dir, f'view_{view_idx:04d}_decoded_pca.png')
-                Image.fromarray(decoded_np).save(save_path)
 
+                # PCA of decoded
+                decoded_pca = features_to_pca_rgb(decoded.squeeze(0).cpu())
+                Image.fromarray(decoded_pca).save(
+                    os.path.join(output_dir, f'view_{view_idx:04d}_decoded_pca.png')
+                )
+
+                # PCA of GT
+                if gt_feat is not None:
+                    gt_pca = features_to_pca_rgb(gt_feat)
+                    Image.fromarray(gt_pca).save(
+                        os.path.join(output_dir, f'view_{view_idx:04d}_gt_pca.png')
+                    )
+                    # Side-by-side: GT | Decoded
+                    combined = np.concatenate([gt_pca, decoded_pca], axis=1)
+                    Image.fromarray(combined).save(
+                        os.path.join(output_dir, f'view_{view_idx:04d}_comparison.png')
+                    )
+
+                # Depth visualization
+                depth = result.get('depth_map', None) if isinstance(result, dict) else None
                 if depth is not None:
                     depth_np = depth.cpu().numpy()
                     depth_norm = (depth_np - depth_np.min()) / (depth_np.max() - depth_np.min() + 1e-8)
                     depth_img = (depth_norm * 255).astype(np.uint8)
-                    depth_path = os.path.join(output_dir, f'view_{view_idx:04d}_depth.png')
-                    Image.fromarray(depth_img).save(depth_path)
-            except ImportError:
-                np.save(os.path.join(output_dir, f'view_{view_idx:04d}_decoded_pca.npy'), decoded_np)
+                    Image.fromarray(depth_img).save(
+                        os.path.join(output_dir, f'view_{view_idx:04d}_depth.png')
+                    )
 
-            print(f'  View {view_idx}: saved')
+            except ImportError:
+                np.save(os.path.join(output_dir, f'view_{view_idx:04d}_decoded.npy'),
+                        decoded.squeeze(0).cpu().numpy())
+
+            # Per-pixel cosine similarity
+            if gt_feat is not None:
+                gt_dev = gt_feat.unsqueeze(0).float().to(device)
+                if decoded.shape[-2:] != gt_dev.shape[-2:]:
+                    decoded_rs = F.interpolate(decoded, gt_dev.shape[-2:], mode='bilinear', align_corners=False)
+                else:
+                    decoded_rs = decoded
+                cos = F.cosine_similarity(decoded_rs, gt_dev, dim=1).mean().item()
+                print(f'  View {view_idx}: cosine={cos:.4f}')
+            else:
+                print(f'  View {view_idx}: saved')
     else:
         print(f'  Pose file not found: {pose_file}')
         print('  Provide poses via dataset or --pose_file flag')

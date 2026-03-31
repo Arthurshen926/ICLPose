@@ -1,6 +1,6 @@
-# RADIO-GS: Replica room_0, Explicit Architecture (64d per-Gaussian)
-exp_name: "radio_gs_room0_explicit"
-output_dir: "output/radio_gs/room0_explicit"
+# RADIO-GS: Replica room_0, Explicit Architecture v2 (pretrained codec)
+exp_name: "radio_gs_room0_explicit_v2"
+output_dir: "output/radio_gs/room0_explicit_v2"
 seed: 42
 
 # Scene
@@ -66,7 +66,7 @@ num_workers: 4
 
 # Downstream tasks
 depth_head_type: "mlp"
-seg_num_classes: 101
+seg_num_classes: 40
 seg_head_type: "mlp"
 grounding_use_adaptor: true
 

@@ -153,6 +153,10 @@ class RadioGSTrainer:
         self.cfg = config
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+        # Training mode: "latent" trains in 64d space with frozen decoder,
+        # "decoded" (default/legacy) trains through decoder in 1280d space
+        self.train_mode = getattr(config, "train_mode", "decoded")
+
         # Reproducibility
         self._set_seed(getattr(config, "seed", 42))
 
@@ -183,6 +187,12 @@ class RadioGSTrainer:
             strength=getattr(config, "featsharp_strength", 0.5),
         ).to(self.device)
 
+        # In latent mode, freeze codec entirely
+        if self.train_mode == "latent":
+            for p in self.codec.parameters():
+                p.requires_grad = False
+            self._log("Latent mode: codec frozen, training in 64d space")
+
         # Losses
         self.distill_loss_fn = DistillationLoss(
             l2_weight=getattr(config, "l2_weight", 1.0),
@@ -190,6 +200,9 @@ class RadioGSTrainer:
         )
         self.mv_loss_fn = MultiViewConsistencyLoss()
         self.tv_loss_fn = TotalVariationLoss()
+
+        # Feature norm regularization weight
+        self.feat_norm_weight = getattr(config, "feat_norm_weight", 0.0)
 
         # Optimizer with separate LR groups
         self.optimizer = self._build_optimizer(config)
@@ -277,12 +290,16 @@ class RadioGSTrainer:
                 "lr": getattr(config, "lr_features", 1e-3),
                 "name": "features",
             },
-            {
-                "params": self.codec.decoder.parameters(),
-                "lr": getattr(config, "lr_decoder", 1e-4),
-                "name": "decoder",
-            },
         ]
+        # Only add decoder to optimizer if not in latent mode (decoder is frozen)
+        if self.train_mode != "latent":
+            param_groups.append(
+                {
+                    "params": self.codec.decoder.parameters(),
+                    "lr": getattr(config, "lr_decoder", 1e-4),
+                    "name": "decoder",
+                }
+            )
         if self.sharpener.mode not in ("analytical", "none"):
             param_groups.append(
                 {
@@ -361,7 +378,8 @@ class RadioGSTrainer:
 
     def train_epoch(self, epoch: int) -> Dict[str, float]:
         self.model.train()
-        self.codec.train()
+        if self.train_mode != "latent":
+            self.codec.train()
         self.sharpener.train()
 
         loss_accum = {"total": 0.0, "distill": 0.0, "compact": 0.0, "tv": 0.0}
@@ -376,16 +394,12 @@ class RadioGSTrainer:
             dynamic_ncols=True,
         )
         for batch in pbar:
-            gt_radio = batch["radio_features"].to(self.device)   # [B, C, Hp, Wp]
+            gt_features = batch["radio_features"].to(self.device)   # [B, C, Hp, Wp]
             pose_w2c = batch["pose_w2c"].to(self.device)         # [B, 4, 4]
 
             self.optimizer.zero_grad(set_to_none=True)
 
             with autocast():
-                # Encode GT to compact space
-                with torch.no_grad():
-                    gt_compact = self.codec.encoder(gt_radio)    # [B, D, Hp, Wp]
-
                 # Render compact features from 3DGS
                 result = self.renderer.render_features_batch(
                     self.model, pose_w2c
@@ -395,39 +409,77 @@ class RadioGSTrainer:
                 # Sharpen rendered features
                 rendered_compact = self.sharpener(rendered_compact)
 
-                # Decode to full dimension
-                decoded = self.codec.decoder(rendered_compact)   # [B, 1280, Hf, Wf]
+                if self.train_mode == "latent":
+                    # LATENT MODE: gt_features are already 64d (pre-encoded)
+                    gt_compact = gt_features
+                    if gt_compact.shape[-2:] != rendered_compact.shape[-2:]:
+                        gt_compact = F.interpolate(
+                            gt_compact,
+                            size=rendered_compact.shape[-2:],
+                            mode="bilinear",
+                            align_corners=False,
+                        )
 
-                # Match spatial resolution of GT if necessary
-                if decoded.shape[-2:] != gt_radio.shape[-2:]:
-                    gt_radio_rs = F.interpolate(
-                        gt_radio,
-                        size=decoded.shape[-2:],
-                        mode="bilinear",
-                        align_corners=False,
-                    )
+                    # Primary loss: cosine + L2 in latent space
+                    l_cos = 1.0 - F.cosine_similarity(
+                        rendered_compact.float().flatten(2),
+                        gt_compact.float().flatten(2),
+                        dim=1,
+                    ).mean()
+                    l_l2 = F.mse_loss(rendered_compact.float(), gt_compact.float())
+                    l2_w = getattr(self.cfg, "l2_weight", 1.0)
+                    cos_w = getattr(self.cfg, "cosine_weight", 0.5)
+                    l_distill = l2_w * l_l2 + cos_w * l_cos
+
+                    l_compact = torch.tensor(0.0, device=self.device)
+
+                    # Feature norm regularization
+                    l_feat_norm = torch.tensor(0.0, device=self.device)
+                    if self.feat_norm_weight > 0:
+                        feat_norms = rendered_compact.float().norm(dim=1).mean()
+                        gt_norms = gt_compact.float().norm(dim=1).mean()
+                        l_feat_norm = (feat_norms - gt_norms).abs()
+
                 else:
-                    gt_radio_rs = gt_radio
+                    # DECODED MODE (legacy V1/V2): compare in 1280d space
+                    gt_radio = gt_features
+                    with torch.no_grad():
+                        gt_compact = self.codec.encoder(gt_radio)
 
-                if gt_compact.shape[-2:] != rendered_compact.shape[-2:]:
-                    gt_compact_rs = F.interpolate(
-                        gt_compact,
-                        size=rendered_compact.shape[-2:],
-                        mode="bilinear",
-                        align_corners=False,
-                    )
-                else:
-                    gt_compact_rs = gt_compact
+                    decoded = self.codec.decoder(rendered_compact)
 
-                # Losses
-                distill_dict = self.distill_loss_fn(decoded, gt_radio_rs)
-                l_distill = distill_dict["total"]
-                l_compact = F.mse_loss(rendered_compact, gt_compact_rs)
+                    if decoded.shape[-2:] != gt_radio.shape[-2:]:
+                        gt_radio_rs = F.interpolate(
+                            gt_radio,
+                            size=decoded.shape[-2:],
+                            mode="bilinear",
+                            align_corners=False,
+                        )
+                    else:
+                        gt_radio_rs = gt_radio
+
+                    distill_dict = self.distill_loss_fn(decoded, gt_radio_rs)
+                    l_distill = distill_dict["total"]
+
+                    if gt_compact.shape[-2:] != rendered_compact.shape[-2:]:
+                        gt_compact_rs = F.interpolate(
+                            gt_compact,
+                            size=rendered_compact.shape[-2:],
+                            mode="bilinear",
+                            align_corners=False,
+                        )
+                    else:
+                        gt_compact_rs = gt_compact
+                    l_compact = F.mse_loss(rendered_compact, gt_compact_rs)
+                    l_feat_norm = torch.tensor(0.0, device=self.device)
+
                 l_tv = self.tv_loss_fn(rendered_compact)
 
                 adaptor_w = getattr(self.cfg, "adaptor_weight", 0.1)
                 tv_w = getattr(self.cfg, "tv_weight", 0.01)
                 loss = l_distill + adaptor_w * l_compact + tv_w * l_tv
+                if self.feat_norm_weight > 0:
+                    loss = loss + self.feat_norm_weight * l_feat_norm
 
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)
@@ -438,13 +490,20 @@ class RadioGSTrainer:
             self.scaler.step(self.optimizer)
             self.scaler.update()
 
-            # Accumulate metrics (detach to avoid graph retention)
+            # Compute monitoring cosine in appropriate space
             with torch.no_grad():
-                cos_sim = F.cosine_similarity(
-                    decoded.detach().float().flatten(2),
-                    gt_radio_rs.detach().float().flatten(2),
-                    dim=1,
-                ).mean()
+                if self.train_mode == "latent":
+                    cos_sim = F.cosine_similarity(
+                        rendered_compact.detach().float().flatten(2),
+                        gt_compact.detach().float().flatten(2),
+                        dim=1,
+                    ).mean()
+                else:
+                    cos_sim = F.cosine_similarity(
+                        decoded.detach().float().flatten(2),
+                        gt_radio_rs.detach().float().flatten(2),
+                        dim=1,
+                    ).mean()
 
             loss_accum["total"] += loss.item()
             loss_accum["distill"] += l_distill.item()
@@ -497,56 +556,107 @@ class RadioGSTrainer:
         self.codec.eval()
         self.sharpener.eval()
 
-        cos_accum = 0.0
+        cos_latent_accum = 0.0
+        cos_decoded_accum = 0.0
         mse_accum = 0.0
         n = 0
 
         for batch in tqdm(
             self.val_loader, desc=f"Val   E{epoch:03d}", leave=False, dynamic_ncols=True
         ):
-            gt_radio = batch["radio_features"].to(self.device)
+            gt_features = batch["radio_features"].to(self.device)
             pose_w2c = batch["pose_w2c"].to(self.device)
 
             rendered_compact = self.renderer.render_features_batch(self.model, pose_w2c)["feature_map"]
             rendered_compact = self.sharpener(rendered_compact)
-            decoded = self.codec.decoder(rendered_compact)
 
-            if decoded.shape[-2:] != gt_radio.shape[-2:]:
-                gt_radio = F.interpolate(
-                    gt_radio,
-                    size=decoded.shape[-2:],
-                    mode="bilinear",
-                    align_corners=False,
-                )
+            if self.train_mode == "latent":
+                # gt_features are 64d
+                gt_compact = gt_features
+                if gt_compact.shape[-2:] != rendered_compact.shape[-2:]:
+                    gt_compact = F.interpolate(
+                        gt_compact, size=rendered_compact.shape[-2:],
+                        mode="bilinear", align_corners=False,
+                    )
+                cos_latent = F.cosine_similarity(
+                    rendered_compact.float().flatten(2),
+                    gt_compact.float().flatten(2),
+                    dim=1,
+                ).mean()
+                cos_latent_accum += cos_latent.item()
 
-            cos = F.cosine_similarity(
-                decoded.float().flatten(2),
-                gt_radio.float().flatten(2),
-                dim=1,
-            ).mean()
-            mse = F.mse_loss(decoded.float(), gt_radio.float())
-            cos_accum += cos.item()
-            mse_accum += mse.item()
+                # Also decode and compare to 1280d GT for monitoring
+                decoded = self.codec.decoder(rendered_compact)
+                # Load 1280d GT for this frame
+                gt_1280_path = self._get_1280d_val_path(batch)
+                if gt_1280_path is not None:
+                    gt_1280 = torch.load(gt_1280_path).float().unsqueeze(0).to(self.device)
+                    if gt_1280.shape[-2:] != decoded.shape[-2:]:
+                        gt_1280 = F.interpolate(
+                            gt_1280, size=decoded.shape[-2:],
+                            mode="bilinear", align_corners=False,
+                        )
+                    cos_dec = F.cosine_similarity(
+                        decoded.float().flatten(2),
+                        gt_1280.float().flatten(2),
+                        dim=1,
+                    ).mean()
+                    mse = F.mse_loss(decoded.float(), gt_1280.float())
+                    cos_decoded_accum += cos_dec.item()
+                    mse_accum += mse.item()
+                else:
+                    cos_decoded_accum += cos_latent.item()
+                    mse_accum += F.mse_loss(rendered_compact.float(), gt_compact.float()).item()
+            else:
+                # Decoded mode: gt_features are 1280d
+                gt_radio = gt_features
+                decoded = self.codec.decoder(rendered_compact)
+                if decoded.shape[-2:] != gt_radio.shape[-2:]:
+                    gt_radio = F.interpolate(
+                        gt_radio, size=decoded.shape[-2:],
+                        mode="bilinear", align_corners=False,
+                    )
+                cos_dec = F.cosine_similarity(
+                    decoded.float().flatten(2),
+                    gt_radio.float().flatten(2),
+                    dim=1,
+                ).mean()
+                mse = F.mse_loss(decoded.float(), gt_radio.float())
+                cos_decoded_accum += cos_dec.item()
+                cos_latent_accum += cos_dec.item()
+                mse_accum += mse.item()
+
             n += 1
 
         if n == 0:
             return {}
 
-        avg_cos = cos_accum / n
+        avg_cos_latent = cos_latent_accum / n
+        avg_cos_decoded = cos_decoded_accum / n
         avg_mse = mse_accum / n
         psnr = -10.0 * np.log10(avg_mse + 1e-8)
 
-        metrics = {"cosine": avg_cos, "mse": avg_mse, "psnr": psnr}
+        # Primary metric for best model selection: latent cosine in latent mode
+        primary_cos = avg_cos_latent if self.train_mode == "latent" else avg_cos_decoded
+
+        metrics = {
+            "cosine": primary_cos,
+            "cosine_latent": avg_cos_latent,
+            "cosine_decoded": avg_cos_decoded,
+            "mse": avg_mse,
+            "psnr": psnr,
+        }
 
         if self.writer is not None:
-            self.writer.add_scalar("val/cosine", avg_cos, epoch)
+            self.writer.add_scalar("val/cosine_latent", avg_cos_latent, epoch)
+            self.writer.add_scalar("val/cosine_decoded", avg_cos_decoded, epoch)
             self.writer.add_scalar("val/psnr", psnr, epoch)
 
-        # Save a PCA visualisation of the first validation frame
         self._save_vis(epoch)
 
         self._log(
-            f"[Val E{epoch:03d}] psnr={psnr:.2f} cosine={avg_cos:.4f}"
+            f"[Val E{epoch:03d}] cos_latent={avg_cos_latent:.4f} "
+            f"cos_decoded={avg_cos_decoded:.4f} psnr={psnr:.2f}"
         )
         return metrics
 
@@ -641,10 +751,29 @@ class RadioGSTrainer:
     def _all_trainable_params(self):
         """Gather all trainable parameters for gradient clipping."""
         params = list(self.model.trainable_parameters())
-        params += list(self.codec.decoder.parameters())
+        if self.train_mode != "latent":
+            params += list(self.codec.decoder.parameters())
         if self.sharpener.mode not in ("analytical", "none"):
             params += list(self.sharpener.parameters())
         return params
+
+    def _get_1280d_val_path(self, batch) -> Optional[str]:
+        """In latent mode, try to locate the original 1280d feature for monitoring."""
+        try:
+            idx = batch["frame_idx"].item()
+            val_1280_dir = getattr(self.cfg, "val_1280d_dir", None)
+            if val_1280_dir is None:
+                # Derive from feature_dir: replace 64d with 1280d
+                feat_dir = getattr(self.cfg, "feature_dir", "")
+                val_split = getattr(self.cfg, "val_split", "Sequence_2")
+                train_split = getattr(self.cfg, "train_split", "Sequence_1")
+                val_1280_dir = feat_dir.replace("64d", "1280d").replace(train_split, val_split)
+            p = Path(val_1280_dir) / "backbone" / f"rgb_{idx}.pt"
+            if not p.exists():
+                p = Path(val_1280_dir) / f"rgb_{idx}.pt"
+            return str(p) if p.exists() else None
+        except Exception:
+            return None
 
     @staticmethod
     def _count_params(module: nn.Module) -> float:
@@ -709,10 +838,20 @@ def main() -> None:
     parser.add_argument(
         "--warmstart", default=None, help="Load model weights only"
     )
+    parser.add_argument(
+        "--pretrained_codec", default=None,
+        help="Path to pretrained HCD codec checkpoint (from train_codec.py)",
+    )
     args = parser.parse_args()
 
     config = load_config(args.config)
     trainer = RadioGSTrainer(config)
+
+    # Load pretrained codec first (before resume/warmstart which may override)
+    if args.pretrained_codec:
+        ckpt = torch.load(args.pretrained_codec, map_location=trainer.device)
+        trainer.codec.load_state_dict(ckpt["codec_state_dict"])
+        trainer._log(f"Loaded pretrained codec from {args.pretrained_codec}")
 
     if args.resume:
         trainer.load_checkpoint(args.resume, resume=True)

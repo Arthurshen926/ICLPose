@@ -1,6 +1,12 @@
-# RADIO-GS: Replica room_0, Explicit Architecture (64d per-Gaussian)
-exp_name: "radio_gs_room0_explicit"
-output_dir: "output/radio_gs/room0_explicit"
+# RADIO-GS V3: Latent-space distillation with frozen decoder
+# Key changes vs V1/V2:
+#   - train_mode: latent (train in 64d space, no decoder in loop)
+#   - feature_dir points to pre-encoded 64d features
+#   - Higher TV weight for spatial regularization
+#   - Cosine-dominant loss
+#   - Feature norm regularization
+exp_name: "radio_gs_room0_explicit_v3"
+output_dir: "output/radio_gs/room0_explicit_v3"
 seed: 42
 
 # Scene
@@ -16,15 +22,16 @@ radio_feature_dim: 1280
 architecture: "explicit"
 latent_dim: 64
 
-# HCD Codec
+# Training mode: "latent" = train in 64d space, "decoded" = train through decoder
+train_mode: "latent"
+
+# HCD Codec (frozen in latent mode, loaded from pretrained)
 bottleneck_dim: 64
 dual_stream: true
-decoder_hidden_dim: 512
-decoder_num_layers: 3
 
 # FeatSharp
 featsharp_mode: "analytical"
-featsharp_strength: 0.5
+featsharp_strength: 0.3
 
 # Rendering — 2DGS surfels
 image_height: 480
@@ -39,25 +46,23 @@ max_channels_per_chunk: 32
 use_2dgs: true
 
 # Training
-epochs: 100
+epochs: 200
 batch_size: 4
-lr_features: 1.0e-3
-lr_decoder: 1.0e-4
-lr_heads: 1.0e-4
-weight_decay: 1.0e-5
-grad_clip: 10.0
-warmup_epochs: 5
+lr_features: 5.0e-4
+weight_decay: 1.0e-4
+grad_clip: 5.0
+warmup_epochs: 10
 scheduler: "cosine"
 
-# Loss weights
+# Loss weights — cosine-dominant for latent space
 l2_weight: 1.0
-cosine_weight: 0.5
-consistency_weight: 0.1
-adaptor_weight: 0.1
-tv_weight: 0.01
+cosine_weight: 2.0
+adaptor_weight: 0.0
+tv_weight: 0.1
+feat_norm_weight: 0.01
 
-# Data
-feature_dir: "output/radio_features_1280d/room_0/Sequence_1"
+# Data — pre-encoded 64d features
+feature_dir: "output/radio_features_64d/room_0/Sequence_1"
 depth_dir: "dataset/room_0/Sequence_1/depth"
 semantics_dir: "dataset/room_0/Sequence_1/semantic_class"
 train_split: "Sequence_1"

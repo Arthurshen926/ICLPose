@@ -76,6 +76,7 @@ class RadioGSConfig:
     grad_clip: float = 10.0
     warmup_epochs: int = 5
     scheduler: str = "cosine"  # "cosine", "step", "plateau"
+    train_mode: str = "decoded"  # "decoded" (1280d) or "latent" (64d)
 
     # Loss weights
     l2_weight: float = 1.0
@@ -83,6 +84,7 @@ class RadioGSConfig:
     consistency_weight: float = 0.1
     adaptor_weight: float = 0.1
     tv_weight: float = 0.01
+    feat_norm_weight: float = 0.0
 
     # Data
     feature_dir: str = ""  # pre-extracted RADIO features

@@ -1,12 +1,11 @@
 """
-Evaluate RADIO-GS on downstream tasks: depth, segmentation, text grounding.
+Evaluate RADIO-GS on downstream tasks: feature quality, depth, segmentation.
 
 Usage:
     python radio_gs/scripts/eval_downstream.py \
         --config radio_gs/configs/replica_explicit.yaml \
-        --checkpoint output/radio_gs/replica_explicit/checkpoints/best.pth \
-        --tasks depth segmentation grounding \
-        --output_dir output/radio_gs/eval_results/
+        --checkpoint output/radio_gs/room0_explicit/checkpoints/best.pth \
+        --tasks feature_quality depth segmentation
 """
 from __future__ import annotations
 
@@ -15,8 +14,11 @@ import json
 import os
 import sys
 from pathlib import Path
+from typing import Dict, Optional
 
+import cv2
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from tqdm import tqdm
@@ -24,96 +26,238 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from radio_gs.config import RadioGSConfig, load_config
+from radio_gs.models.hcd_codec import HCDCodec
+from radio_gs.models.featsharp_3d import FeatSharp3D
+from radio_gs.rendering.feature_renderer import FeatureFieldRenderer
 
 
-def load_model_and_codec(config, checkpoint_path, device):
-    """Load trained feature field model and HCD codec from checkpoint."""
-    from radio_gs.models.hcd_codec import HCDCodec
-    from radio_gs.rendering.feature_renderer import FeatureFieldRenderer
-
-    if config.architecture == 'explicit':
+def build_components(config: RadioGSConfig, checkpoint_path: str, device: torch.device):
+    """Load trained model, codec, sharpener, renderer from checkpoint."""
+    if getattr(config, "architecture", "explicit") == "explicit":
         from radio_gs.models.explicit_gaussian import ExplicitFeatureGaussian
-        model = ExplicitFeatureGaussian(latent_dim=config.latent_dim)
+        model = ExplicitFeatureGaussian(latent_dim=getattr(config, "latent_dim", 64))
     else:
         from radio_gs.models.hybrid_gaussian import HybridFeatureGaussian
-        model = HybridFeatureGaussian(latent_dim=config.hybrid_latent_dim)
+        model = HybridFeatureGaussian(
+            latent_dim=getattr(config, "hybrid_latent_dim", 16),
+        )
 
-    if config.ply_path:
-        model.load_from_ply(config.ply_path)
+    ply_path = getattr(config, "ply_path", None)
+    if ply_path:
+        model.load_from_ply(ply_path)
 
     codec = HCDCodec(
-        input_dim=config.radio_feature_dim,
-        bottleneck_dim=config.bottleneck_dim,
-        dual_stream=config.dual_stream,
+        input_dim=getattr(config, "radio_feature_dim", 1280),
+        bottleneck_dim=getattr(config, "bottleneck_dim", 64),
+        dual_stream=getattr(config, "dual_stream", True),
+    )
+
+    sharpener = FeatSharp3D(
+        mode=getattr(config, "featsharp_mode", "analytical"),
+        feature_dim=getattr(config, "latent_dim", 64),
+        strength=getattr(config, "featsharp_strength", 0.5),
     )
 
     renderer = FeatureFieldRenderer(
-        image_height=config.feature_height,
-        image_width=config.feature_width,
+        image_height=getattr(config, "feature_height", 30),
+        image_width=getattr(config, "feature_width", 40),
         fx=config.fx * config.feature_width / config.image_width,
         fy=config.fy * config.feature_height / config.image_height,
         cx=config.cx * config.feature_width / config.image_width,
         cy=config.cy * config.feature_height / config.image_height,
+        max_channels_per_chunk=getattr(config, "max_channels_per_chunk", 32),
+        use_2dgs=getattr(config, "use_2dgs", False),
     )
 
-    ckpt = torch.load(checkpoint_path, map_location='cpu')
-    if 'model_state_dict' in ckpt:
-        model.load_state_dict(ckpt['model_state_dict'], strict=False)
-    if 'codec_state_dict' in ckpt:
-        codec.load_state_dict(ckpt['codec_state_dict'])
+    # Load checkpoint
+    ckpt = torch.load(checkpoint_path, map_location="cpu")
+    if "model_state_dict" in ckpt:
+        model.load_state_dict(ckpt["model_state_dict"], strict=False)
+    if "codec_state_dict" in ckpt:
+        codec.load_state_dict(ckpt["codec_state_dict"], strict=False)
+    if "sharpener_state_dict" in ckpt:
+        sharpener.load_state_dict(ckpt["sharpener_state_dict"], strict=False)
 
-    model = model.to(device)
+    model = model.to(device).eval()
     codec = codec.to(device).eval()
+    sharpener = sharpener.to(device).eval()
     renderer = renderer.to(device)
 
-    return model, codec, renderer
-
-
-def render_and_decode(model, codec, renderer, pose_w2c, device, config):
-    """Render features from model and decode to 1280d."""
-    pose_w2c = pose_w2c.to(device)
-    if pose_w2c.ndim == 2:
-        pose_w2c = pose_w2c.unsqueeze(0)
-
-    with torch.no_grad():
-        result = renderer.render_features(model, pose_w2c[0])
-        compact_feat = result['feature_map'].unsqueeze(0)  # [1, D, H, W]
-        decoded = codec.decode(compact_feat)  # [1, 1280, H, W]
-    return decoded, result.get('depth_map', None)
+    return model, codec, sharpener, renderer
 
 
 @torch.no_grad()
-def eval_depth(model, codec, renderer, dataset, head, loss_fn, device, config):
-    """Evaluate depth estimation."""
+def render_decoded(model, codec, sharpener, renderer, pose_w2c, device):
+    """Render + sharpen + decode → 1280d features."""
+    pose = pose_w2c.to(device)
+    result = renderer.render_features(model, pose)
+    compact = result["feature_map"].unsqueeze(0)  # [1, D, H, W]
+    compact = sharpener(compact)
+    decoded = codec.decode(compact)  # [1, 1280, H, W]
+    return decoded, result
+
+
+# ===================================================================
+# Feature Quality Evaluation
+# ===================================================================
+
+@torch.no_grad()
+def eval_feature_quality(
+    model, codec, sharpener, renderer, config, device, split="val"
+) -> Dict[str, float]:
+    """Evaluate feature reconstruction quality vs GT RADIO features."""
+    scene = getattr(config, "scene", "room_0")
+    train_split = getattr(config, "train_split", "Sequence_1")
+    val_split = getattr(config, "val_split", "Sequence_2")
+    feature_dir = getattr(config, "feature_dir", "")
+
+    if split == "val":
+        feat_dir = Path(feature_dir.replace(train_split, val_split))
+        pose_file = Path("dataset") / scene / val_split / "traj_w_c.txt"
+    else:
+        feat_dir = Path(feature_dir)
+        pose_file = Path("dataset") / scene / train_split / "traj_w_c.txt"
+
+    backbone_dir = feat_dir / "backbone"
+    if not backbone_dir.exists():
+        backbone_dir = feat_dir
+    feat_paths = sorted(backbone_dir.glob("rgb_*.pt"), key=lambda p: int(p.stem.split("_")[1]))
+
+    raw_poses = np.loadtxt(str(pose_file)).reshape(-1, 4, 4).astype(np.float32)
+    w2c_poses = np.linalg.inv(raw_poses)
+
+    cosines, l2s, psnrs_norm = [], [], []
+
+    for idx in tqdm(range(len(feat_paths)), desc=f"Feature Quality ({split})"):
+        gt = torch.load(feat_paths[idx], map_location="cpu")
+        if gt.dim() == 4:
+            gt = gt.squeeze(0)
+        gt = gt.float().unsqueeze(0).to(device)  # [1, 1280, H, W]
+
+        pose_w2c = torch.tensor(w2c_poses[idx], dtype=torch.float32)
+        decoded, _ = render_decoded(model, codec, sharpener, renderer, pose_w2c, device)
+
+        # Match spatial dims
+        if decoded.shape[-2:] != gt.shape[-2:]:
+            decoded = F.interpolate(decoded, gt.shape[-2:], mode="bilinear", align_corners=False)
+
+        # Cosine similarity (channel-wise, per pixel)
+        cos = F.cosine_similarity(decoded, gt, dim=1).mean().item()
+        cosines.append(cos)
+
+        # L2
+        l2 = F.mse_loss(decoded, gt).item()
+        l2s.append(l2)
+
+        # Normalized PSNR (normalize features to [0,1] range for meaningful dB)
+        gt_norm = (gt - gt.min()) / (gt.max() - gt.min() + 1e-8)
+        dec_norm = (decoded - decoded.min()) / (decoded.max() - decoded.min() + 1e-8)
+        mse_norm = F.mse_loss(dec_norm, gt_norm).item()
+        psnr_norm = -10 * np.log10(max(mse_norm, 1e-10))
+        psnrs_norm.append(psnr_norm)
+
+    return {
+        f"{split}_cosine_sim": float(np.mean(cosines)),
+        f"{split}_l2_loss": float(np.mean(l2s)),
+        f"{split}_psnr_norm": float(np.mean(psnrs_norm)),
+        f"{split}_n_frames": len(feat_paths),
+    }
+
+
+# ===================================================================
+# Depth Evaluation
+# ===================================================================
+
+def eval_depth(
+    model, codec, sharpener, renderer, config, device, split="val"
+) -> Dict[str, float]:
+    """Evaluate depth prediction from decoded features with a linear probe."""
     from radio_gs.heads.depth_head import DepthHead
 
-    metrics = {'abs_rel': [], 'rmse': [], 'delta_1': []}
-    head = head.to(device).eval()
+    scene = getattr(config, "scene", "room_0")
+    val_split = getattr(config, "val_split", "Sequence_2")
+    train_split = getattr(config, "train_split", "Sequence_1")
+    feature_dir = getattr(config, "feature_dir", "")
 
-    for i in tqdm(range(len(dataset)), desc='Eval Depth'):
-        sample = dataset[i]
-        decoded, _ = render_and_decode(
-            model, codec, renderer, sample['pose_w2c'], device, config
-        )
-        pred_depth = head(decoded).squeeze(0).squeeze(0)  # [H, W]
+    target_split = val_split if split == "val" else train_split
+    feat_dir = Path(feature_dir.replace(train_split, target_split))
+    backbone_dir = feat_dir / "backbone"
+    if not backbone_dir.exists():
+        backbone_dir = feat_dir
+    feat_paths = sorted(backbone_dir.glob("rgb_*.pt"), key=lambda p: int(p.stem.split("_")[1]))
 
-        if 'depth' not in sample or sample['depth'] is None:
+    scene_root = Path("dataset") / scene
+    pose_file = scene_root / target_split / "traj_w_c.txt"
+    depth_dir = scene_root / target_split / "depth"
+
+    raw_poses = np.loadtxt(str(pose_file)).reshape(-1, 4, 4).astype(np.float32)
+    w2c_poses = np.linalg.inv(raw_poses)
+
+    depth_paths = sorted(depth_dir.glob("*.png"), key=lambda p: int(p.stem.split("_")[-1])
+                         if p.stem.split("_")[-1].isdigit() else 0)
+
+    if not depth_paths:
+        print("  No depth GT found, skipping depth eval")
+        return {}
+
+    # Train a quick linear probe on GT RADIO features → depth
+    print("  Training depth linear probe...")
+    feat_dim = getattr(config, "radio_feature_dim", 1280)
+    depth_head = DepthHead(feat_dim, head_type="linear").to(device)
+    optimizer = torch.optim.Adam(depth_head.parameters(), lr=1e-3)
+
+    # Train on train split GT features
+    train_feat_dir = Path(feature_dir) / "backbone"
+    if not train_feat_dir.exists():
+        train_feat_dir = Path(feature_dir)
+    train_feat_paths = sorted(train_feat_dir.glob("rgb_*.pt"), key=lambda p: int(p.stem.split("_")[1]))
+    train_depth_dir = scene_root / train_split / "depth"
+    train_depth_paths = sorted(train_depth_dir.glob("*.png"), key=lambda p: int(p.stem.split("_")[-1])
+                               if p.stem.split("_")[-1].isdigit() else 0)
+
+    n_train = min(len(train_feat_paths), len(train_depth_paths), 200)
+    fH, fW = getattr(config, "feature_height", 30), getattr(config, "feature_width", 40)
+
+    depth_head.train()
+    for ep in range(10):
+        indices = np.random.permutation(n_train)[:50]
+        for idx in indices:
+            gt_feat = torch.load(train_feat_paths[idx], map_location=device).float().unsqueeze(0)
+            d = cv2.imread(str(train_depth_paths[idx]), cv2.IMREAD_UNCHANGED)
+            if d is None:
+                continue
+            gt_d = torch.tensor(d.astype(np.float32) / 1000.0, device=device)
+            gt_d = F.interpolate(gt_d.unsqueeze(0).unsqueeze(0), (fH, fW), mode="bilinear", align_corners=False)
+            pred_d = depth_head(gt_feat)  # [1, 1, fH, fW]
+            valid = gt_d > 0.01
+            if valid.sum() < 10:
+                continue
+            loss = F.l1_loss(pred_d[valid], gt_d[valid])
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+    # Now evaluate with rendered+decoded features
+    depth_head.eval()
+    abs_rels, rmses, delta1s = [], [], []
+
+    for idx in tqdm(range(min(len(feat_paths), len(depth_paths))), desc="Eval Depth"):
+        pose_w2c = torch.tensor(w2c_poses[idx], dtype=torch.float32)
+        decoded, _ = render_decoded(model, codec, sharpener, renderer, pose_w2c, device)
+
+        pred_d = depth_head(decoded).squeeze()  # [H, W]
+
+        d = cv2.imread(str(depth_paths[idx]), cv2.IMREAD_UNCHANGED)
+        if d is None:
             continue
-        gt_depth = sample['depth'].to(device)
+        gt_d = torch.tensor(d.astype(np.float32) / 1000.0, device=device)
+        gt_d = F.interpolate(gt_d.unsqueeze(0).unsqueeze(0), pred_d.shape, mode="bilinear", align_corners=False).squeeze()
 
-        # Resize to match
-        if pred_depth.shape != gt_depth.shape:
-            pred_depth = F.interpolate(
-                pred_depth.unsqueeze(0).unsqueeze(0),
-                gt_depth.shape, mode='bilinear', align_corners=True,
-            ).squeeze()
-
-        valid = gt_depth > 0.01
+        valid = gt_d > 0.01
         if valid.sum() < 10:
             continue
 
-        pred_v = pred_depth[valid]
-        gt_v = gt_depth[valid]
+        pred_v, gt_v = pred_d[valid], gt_d[valid]
 
         # Scale-invariant alignment
         scale = (gt_v * pred_v).sum() / (pred_v * pred_v).sum().clamp(min=1e-8)
@@ -124,179 +268,196 @@ def eval_depth(model, codec, renderer, dataset, head, loss_fn, device, config):
         ratio = torch.max(pred_v / gt_v.clamp(min=1e-8), gt_v / pred_v.clamp(min=1e-8))
         delta_1 = (ratio < 1.25).float().mean().item()
 
-        metrics['abs_rel'].append(abs_rel)
-        metrics['rmse'].append(rmse)
-        metrics['delta_1'].append(delta_1)
+        abs_rels.append(abs_rel)
+        rmses.append(rmse)
+        delta1s.append(delta_1)
 
-    return {k: np.mean(v) for k, v in metrics.items() if v}
+    if not abs_rels:
+        return {}
+    return {
+        "depth_abs_rel": float(np.mean(abs_rels)),
+        "depth_rmse": float(np.mean(rmses)),
+        "depth_delta1": float(np.mean(delta1s)),
+    }
 
 
-@torch.no_grad()
-def eval_segmentation(model, codec, renderer, dataset, head, device, config):
-    """Evaluate semantic segmentation."""
-    from radio_gs.heads.segmentation_head import compute_miou, compute_pixel_accuracy
+# ===================================================================
+# Segmentation Evaluation
+# ===================================================================
 
-    all_preds, all_gts = [], []
-    head = head.to(device).eval()
+def eval_segmentation(
+    model, codec, sharpener, renderer, config, device, split="val"
+) -> Dict[str, float]:
+    """Evaluate semantic segmentation with a linear probe."""
+    from radio_gs.heads.segmentation_head import SegmentationHead
 
-    for i in tqdm(range(len(dataset)), desc='Eval Segmentation'):
-        sample = dataset[i]
-        decoded, _ = render_and_decode(
-            model, codec, renderer, sample['pose_w2c'], device, config
-        )
-        logits = head(decoded)  # [1, C, H, W]
-        pred = logits.argmax(dim=1).squeeze(0)  # [H, W]
+    scene = getattr(config, "scene", "room_0")
+    val_split = getattr(config, "val_split", "Sequence_2")
+    train_split = getattr(config, "train_split", "Sequence_1")
+    feature_dir = getattr(config, "feature_dir", "")
+    num_classes = getattr(config, "seg_num_classes", 40)
 
-        if 'semantics' not in sample or sample['semantics'] is None:
-            continue
-        gt = sample['semantics'].to(device)
+    target_split = val_split if split == "val" else train_split
+    feat_dir = Path(feature_dir.replace(train_split, target_split))
+    backbone_dir = feat_dir / "backbone"
+    if not backbone_dir.exists():
+        backbone_dir = feat_dir
+    feat_paths = sorted(backbone_dir.glob("rgb_*.pt"), key=lambda p: int(p.stem.split("_")[1]))
 
-        if pred.shape != gt.shape:
-            pred = F.interpolate(
-                pred.unsqueeze(0).unsqueeze(0).float(),
-                gt.shape, mode='nearest',
-            ).squeeze().long()
+    scene_root = Path("dataset") / scene
+    pose_file = scene_root / target_split / "traj_w_c.txt"
+    sem_dir = scene_root / target_split / "semantic_class"
 
-        all_preds.append(pred.cpu())
-        all_gts.append(gt.cpu())
+    raw_poses = np.loadtxt(str(pose_file)).reshape(-1, 4, 4).astype(np.float32)
+    w2c_poses = np.linalg.inv(raw_poses)
 
-    if not all_preds:
+    sem_paths = sorted(sem_dir.glob("*.png"), key=lambda p: int(p.stem.split("_")[-1])
+                       if p.stem.split("_")[-1].isdigit() else 0)
+
+    if not sem_paths:
+        print("  No semantic GT found, skipping segmentation eval")
         return {}
 
-    preds = torch.stack(all_preds)
-    gts = torch.stack(all_gts)
+    fH, fW = getattr(config, "feature_height", 30), getattr(config, "feature_width", 40)
+    feat_dim = getattr(config, "radio_feature_dim", 1280)
 
-    miou = compute_miou(preds, gts, config.seg_num_classes)
-    acc = compute_pixel_accuracy(preds, gts)
-    return {'mIoU': miou, 'pixel_accuracy': acc}
+    # Train linear probe on GT features
+    print("  Training segmentation linear probe...")
+    seg_head = SegmentationHead(feat_dim, num_classes=num_classes, head_type="linear").to(device)
+    optimizer = torch.optim.Adam(seg_head.parameters(), lr=1e-3)
 
+    train_feat_dir = Path(feature_dir) / "backbone"
+    if not train_feat_dir.exists():
+        train_feat_dir = Path(feature_dir)
+    train_feat_paths = sorted(train_feat_dir.glob("rgb_*.pt"), key=lambda p: int(p.stem.split("_")[1]))
+    train_sem_dir = scene_root / train_split / "semantic_class"
+    train_sem_paths = sorted(train_sem_dir.glob("*.png"), key=lambda p: int(p.stem.split("_")[-1])
+                             if p.stem.split("_")[-1].isdigit() else 0)
 
-@torch.no_grad()
-def eval_grounding(model, codec, renderer, dataset, head, device, config):
-    """Evaluate text grounding."""
-    from radio_gs.heads.grounding_head import compute_grounding_iou
+    n_train = min(len(train_feat_paths), len(train_sem_paths), 200)
 
-    metrics = {'iou_25': [], 'iou_50': []}
-    head = head.to(device).eval()
+    seg_head.train()
+    for ep in range(15):
+        indices = np.random.permutation(n_train)[:50]
+        for idx in indices:
+            gt_feat = torch.load(train_feat_paths[idx], map_location=device).float().unsqueeze(0)
+            sem = cv2.imread(str(train_sem_paths[idx]), cv2.IMREAD_GRAYSCALE)
+            if sem is None:
+                continue
+            gt_sem = torch.tensor(sem.astype(np.int64), device=device)
+            gt_sem = F.interpolate(gt_sem.float().unsqueeze(0).unsqueeze(0), (fH, fW), mode="nearest").squeeze().long()
+            gt_sem = gt_sem.clamp(0, num_classes - 1)
+            logits = seg_head(gt_feat)  # [1, C, fH, fW]
+            loss = F.cross_entropy(logits, gt_sem.unsqueeze(0), ignore_index=255)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
-    for i in tqdm(range(len(dataset)), desc='Eval Grounding'):
-        sample = dataset[i]
-        if 'text_embeddings' not in sample or 'grounding_masks' not in sample:
+    # Evaluate with rendered+decoded features
+    seg_head.eval()
+    correct, total = 0, 0
+    class_intersect = torch.zeros(num_classes, device=device)
+    class_union = torch.zeros(num_classes, device=device)
+
+    for idx in tqdm(range(min(len(feat_paths), len(sem_paths))), desc="Eval Segmentation"):
+        pose_w2c = torch.tensor(w2c_poses[idx], dtype=torch.float32)
+        decoded, _ = render_decoded(model, codec, sharpener, renderer, pose_w2c, device)
+
+        logits = seg_head(decoded)  # [1, C, H, W]
+        pred = logits.argmax(dim=1).squeeze(0)  # [H, W]
+
+        sem = cv2.imread(str(sem_paths[idx]), cv2.IMREAD_GRAYSCALE)
+        if sem is None:
+            continue
+        gt_sem = torch.tensor(sem.astype(np.int64), device=device)
+        gt_sem = F.interpolate(gt_sem.float().unsqueeze(0).unsqueeze(0), pred.shape, mode="nearest").squeeze().long()
+        gt_sem = gt_sem.clamp(0, num_classes - 1)
+
+        valid = gt_sem != 255
+        if valid.sum() < 10:
             continue
 
-        decoded, _ = render_and_decode(
-            model, codec, renderer, sample['pose_w2c'], device, config
-        )
-        text_emb = sample['text_embeddings'].to(device)  # [N_q, D]
-        gt_masks = sample['grounding_masks'].to(device)  # [N_q, H, W]
+        correct += (pred[valid] == gt_sem[valid]).sum().item()
+        total += valid.sum().item()
 
-        sim = head(decoded, text_emb)  # [1, N_q, H, W]
-        sim = sim.squeeze(0)
+        for c in range(num_classes):
+            pred_c = pred == c
+            gt_c = gt_sem == c
+            class_intersect[c] += (pred_c & gt_c & valid).sum()
+            class_union[c] += ((pred_c | gt_c) & valid).sum()
 
-        for q in range(sim.shape[0]):
-            iou_25 = compute_grounding_iou(
-                sim[q].unsqueeze(0), gt_masks[q].unsqueeze(0), threshold=0.25
-            )
-            iou_50 = compute_grounding_iou(
-                sim[q].unsqueeze(0), gt_masks[q].unsqueeze(0), threshold=0.5
-            )
-            metrics['iou_25'].append(iou_25)
-            metrics['iou_50'].append(iou_50)
+    if total == 0:
+        return {}
 
-    return {k: np.mean(v) for k, v in metrics.items() if v}
+    pixel_acc = correct / total
+    valid_classes = class_union > 0
+    iou_per_class = class_intersect[valid_classes] / class_union[valid_classes].clamp(min=1)
+    miou = iou_per_class.mean().item()
+
+    return {
+        "seg_mIoU": float(miou),
+        "seg_pixel_acc": float(pixel_acc),
+        "seg_num_valid_classes": int(valid_classes.sum().item()),
+    }
 
 
-@torch.no_grad()
-def eval_feature_quality(model, codec, renderer, dataset, device, config):
-    """Evaluate feature reconstruction quality (PSNR, cosine sim vs GT RADIO)."""
-    psnrs, cosines = [], []
-
-    for i in tqdm(range(min(len(dataset), 100)), desc='Eval Feature Quality'):
-        sample = dataset[i]
-        decoded, _ = render_and_decode(
-            model, codec, renderer, sample['pose_w2c'], device, config
-        )
-        gt = sample['radio_features'].unsqueeze(0).to(device)
-
-        if decoded.shape != gt.shape:
-            decoded = F.interpolate(decoded, gt.shape[-2:], mode='bilinear', align_corners=True)
-
-        mse = F.mse_loss(decoded, gt).item()
-        psnr = -10 * np.log10(max(mse, 1e-10))
-        cos = F.cosine_similarity(decoded, gt, dim=1).mean().item()
-
-        psnrs.append(psnr)
-        cosines.append(cos)
-
-    return {'feature_psnr': np.mean(psnrs), 'cosine_similarity': np.mean(cosines)}
-
+# ===================================================================
+# Main
+# ===================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description='RADIO-GS Downstream Evaluation')
-    parser.add_argument('--config', required=True, help='Path to config YAML')
-    parser.add_argument('--checkpoint', required=True, help='Path to model checkpoint')
-    parser.add_argument('--tasks', nargs='+', default=['depth', 'segmentation', 'grounding', 'feature_quality'],
-                        help='Tasks to evaluate')
-    parser.add_argument('--output_dir', default=None, help='Output directory for results')
-    parser.add_argument('--device', default='cuda', help='Device')
+    parser = argparse.ArgumentParser(description="RADIO-GS Downstream Evaluation")
+    parser.add_argument("--config", required=True, help="Path to config YAML")
+    parser.add_argument("--checkpoint", required=True, help="Path to model checkpoint")
+    parser.add_argument(
+        "--tasks", nargs="+",
+        default=["feature_quality", "depth", "segmentation"],
+        help="Tasks to evaluate",
+    )
+    parser.add_argument("--split", default="val", choices=["train", "val"])
+    parser.add_argument("--output_dir", default=None)
+    parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
 
     config = load_config(args.config)
     device = torch.device(args.device)
-    output_dir = args.output_dir or os.path.join(config.output_dir, 'eval_results')
+    output_dir = args.output_dir or os.path.join(getattr(config, "output_dir", "output"), "eval_results")
     os.makedirs(output_dir, exist_ok=True)
 
-    print(f'Loading model from {args.checkpoint}...')
-    model, codec, renderer = load_model_and_codec(config, args.checkpoint, device)
-
-    # Placeholder dataset — in practice, load the actual test dataset
-    print(f'Note: Using SimpleRadioDataset from feature_dir={config.feature_dir}')
-    print(f'Tasks to evaluate: {args.tasks}')
+    print(f"Loading model from {args.checkpoint}...")
+    model, codec, sharpener, renderer = build_components(config, args.checkpoint, device)
+    print(f"Model: {sum(p.numel() for p in model.parameters())/1e6:.2f}M params")
 
     results = {}
 
-    # Feature quality always evaluated
-    if 'feature_quality' in args.tasks:
-        print('\n=== Feature Reconstruction Quality ===')
-        # Would call: eval_feature_quality(model, codec, renderer, dataset, device, config)
-        print('  (Requires dataset — skipping in dry run)')
+    if "feature_quality" in args.tasks:
+        print("\n=== Feature Reconstruction Quality ===")
+        fq = eval_feature_quality(model, codec, sharpener, renderer, config, device, args.split)
+        results.update(fq)
+        for k, v in fq.items():
+            print(f"  {k}: {v:.4f}" if isinstance(v, float) else f"  {k}: {v}")
 
-    if 'depth' in args.tasks:
-        print('\n=== Depth Estimation ===')
-        from radio_gs.heads.depth_head import DepthHead, DepthLoss
-        depth_head = DepthHead(config.radio_feature_dim, head_type=config.depth_head_type)
-        ckpt = torch.load(args.checkpoint, map_location='cpu')
-        if 'depth_head_state_dict' in ckpt:
-            depth_head.load_state_dict(ckpt['depth_head_state_dict'])
-            print('  Loaded depth head weights')
-        print('  (Requires dataset — skipping in dry run)')
+    if "depth" in args.tasks:
+        print("\n=== Depth Estimation ===")
+        dm = eval_depth(model, codec, sharpener, renderer, config, device, args.split)
+        results.update(dm)
+        for k, v in dm.items():
+            print(f"  {k}: {v:.4f}")
 
-    if 'segmentation' in args.tasks:
-        print('\n=== Semantic Segmentation ===')
-        from radio_gs.heads.segmentation_head import SegmentationHead
-        seg_head = SegmentationHead(config.radio_feature_dim, num_classes=config.seg_num_classes)
-        ckpt = torch.load(args.checkpoint, map_location='cpu')
-        if 'seg_head_state_dict' in ckpt:
-            seg_head.load_state_dict(ckpt['seg_head_state_dict'])
-            print('  Loaded segmentation head weights')
-        print('  (Requires dataset — skipping in dry run)')
-
-    if 'grounding' in args.tasks:
-        print('\n=== Text Grounding ===')
-        from radio_gs.heads.grounding_head import GroundingHead
-        ground_head = GroundingHead(config.radio_feature_dim, use_adaptor=config.grounding_use_adaptor)
-        ckpt = torch.load(args.checkpoint, map_location='cpu')
-        if 'grounding_head_state_dict' in ckpt:
-            ground_head.load_state_dict(ckpt['grounding_head_state_dict'])
-            print('  Loaded grounding head weights')
-        print('  (Requires dataset — skipping in dry run)')
+    if "segmentation" in args.tasks:
+        print("\n=== Semantic Segmentation ===")
+        sm = eval_segmentation(model, codec, sharpener, renderer, config, device, args.split)
+        results.update(sm)
+        for k, v in sm.items():
+            print(f"  {k}: {v:.4f}" if isinstance(v, float) else f"  {k}: {v}")
 
     # Save results
-    results_path = os.path.join(output_dir, 'eval_results.json')
-    with open(results_path, 'w') as f:
+    results_path = os.path.join(output_dir, "eval_results.json")
+    with open(results_path, "w") as f:
         json.dump(results, f, indent=2)
-    print(f'\nResults saved to {results_path}')
+    print(f"\n✓ Results saved to {results_path}")
+    print(json.dumps(results, indent=2))
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
