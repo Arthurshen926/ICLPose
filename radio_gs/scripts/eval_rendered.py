@@ -96,6 +96,15 @@ def _load_rgb_guide(rgb_dir, idx, feature_size):
     return torch.from_numpy(img).float().permute(2, 0, 1).unsqueeze(0) / 255.0
 
 
+def _render_rgb_guide(model, rgb_renderer, viewmat, feature_size):
+    """Render RGB from 2DGS at full resolution, downsample to feature size."""
+    with torch.no_grad():
+        result = rgb_renderer.render_rgb(model, viewmat)
+        rgb = result["rgb"].unsqueeze(0)  # [1, 3, H_full, W_full]
+        rgb = F.interpolate(rgb, size=feature_size, mode="bilinear", align_corners=False)
+    return rgb  # [1, 3, fH, fW]
+
+
 def render_decoded_features(model, codec, renderer, sharpener, pose_file,
                             refiner=None, rgb_dir=None, feature_size=None):
     """Render and decode features for all frames."""
@@ -266,6 +275,8 @@ def main():
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--n_train", type=int, default=200)
     parser.add_argument("--n_val", type=int, default=100)
+    parser.add_argument("--use_rendered_rgb", action="store_true",
+                        help="Use 2DGS-rendered RGB as refiner guide instead of GT RGB")
     args = parser.parse_args()
     
     print(f"Loading model from {args.checkpoint}...")
@@ -279,8 +290,24 @@ def main():
     # RGB guide config
     rgb_guide_enabled = getattr(config, "refiner_rgb_guide", False)
     feature_size = (getattr(config, "feature_height", 30), getattr(config, "feature_width", 40))
-    train_rgb_dir = str(scene_root / train_split / "rgb") if rgb_guide_enabled else None
-    val_rgb_dir = str(scene_root / val_split / "rgb") if rgb_guide_enabled else None
+    use_rendered_rgb = args.use_rendered_rgb
+    rgb_renderer = None
+    if use_rendered_rgb and rgb_guide_enabled:
+        # Full-resolution renderer for RGB (renders at image_width×image_height, then downsampled)
+        rgb_renderer = FeatureFieldRenderer(
+            image_height=getattr(config, "image_height", 480),
+            image_width=getattr(config, "image_width", 640),
+            fx=getattr(config, "fx", 320.0),
+            fy=getattr(config, "fy", 320.0),
+            cx=getattr(config, "cx", 319.5),
+            cy=getattr(config, "cy", 239.5),
+            use_2dgs=getattr(config, "use_2dgs", False),
+        ).to(device)
+        train_rgb_dir = None
+        val_rgb_dir = None
+    else:
+        train_rgb_dir = str(scene_root / train_split / "rgb") if rgb_guide_enabled else None
+        val_rgb_dir = str(scene_root / val_split / "rgb") if rgb_guide_enabled else None
     
     # Subsample for speed
     train_indices = list(range(0, 900, max(1, 900 // args.n_train)))[:args.n_train]
@@ -288,7 +315,10 @@ def main():
     
     print(f"\n=== Rendering features ({len(train_indices)} train, {len(val_indices)} val) ===")
     if rgb_guide_enabled:
-        print(f"  RGB guide: enabled (feature_size={feature_size})")
+        if use_rendered_rgb:
+            print(f"  RGB guide: RENDERED from 2DGS (feature_size={feature_size})")
+        else:
+            print(f"  RGB guide: GT from disk (feature_size={feature_size})")
     
     # Render train features
     train_poses_file = str(scene_root / train_split / "traj_w_c.txt")
@@ -306,9 +336,12 @@ def main():
             result = renderer.render_features_batch(model, pose)
             rendered = sharpener(result["feature_map"])
             if refiner is not None:
-                guide = _load_rgb_guide(train_rgb_dir, i, feature_size) if train_rgb_dir else None
-                if guide is not None:
-                    guide = guide.to(device)
+                if rgb_renderer is not None:
+                    guide = _render_rgb_guide(model, rgb_renderer, pose[0], feature_size)
+                else:
+                    guide = _load_rgb_guide(train_rgb_dir, i, feature_size) if train_rgb_dir else None
+                    if guide is not None:
+                        guide = guide.to(device)
                 rendered = refiner(rendered, guide=guide)
             decoded = codec.decoder(rendered).squeeze(0).cpu()
             train_decoded.append(decoded)
@@ -332,9 +365,12 @@ def main():
             result = renderer.render_features_batch(model, pose)
             rendered = sharpener(result["feature_map"])
             if refiner is not None:
-                guide = _load_rgb_guide(val_rgb_dir, i, feature_size) if val_rgb_dir else None
-                if guide is not None:
-                    guide = guide.to(device)
+                if rgb_renderer is not None:
+                    guide = _render_rgb_guide(model, rgb_renderer, pose[0], feature_size)
+                else:
+                    guide = _load_rgb_guide(val_rgb_dir, i, feature_size) if val_rgb_dir else None
+                    if guide is not None:
+                        guide = guide.to(device)
                 rendered = refiner(rendered, guide=guide)
             decoded = codec.decoder(rendered).squeeze(0).cpu()
             val_decoded.append(decoded)

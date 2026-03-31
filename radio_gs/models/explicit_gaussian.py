@@ -43,6 +43,8 @@ class ExplicitFeatureGaussian(nn.Module):
         self.register_buffer("_scaling", torch.empty(0))
         self.register_buffer("_opacity", torch.empty(0))
         self.register_buffer("_features_dc", torch.empty(0))
+        self.register_buffer("_features_rest", torch.empty(0))
+        self._sh_degree = 0
 
         # Learnable feature embedding
         self._feature = nn.Parameter(torch.empty(0))
@@ -116,6 +118,27 @@ class ExplicitFeatureGaussian(nn.Module):
             if prop_name in [p.name for p in vertex.properties]:
                 features_dc[:, 0, i] = np.asarray(vertex[prop_name])
 
+        # -- SH rest (higher-order coefficients for RGB rendering) ------
+        rest_names = sorted(
+            [p.name for p in vertex.properties if p.name.startswith("f_rest_")],
+            key=lambda x: int(x.split("_")[-1]),
+        )
+        n_rest = len(rest_names)
+        if n_rest > 0:
+            n_coeffs_per_ch = n_rest // 3
+            features_rest = np.zeros((N, n_coeffs_per_ch, 3), dtype=np.float32)
+            # Original 3DGS saves as transpose(1,2).flatten():
+            # [ch0_c0, ch0_c1, ..., ch0_cK, ch1_c0, ..., ch2_cK]
+            for i, rn in enumerate(rest_names):
+                ch = i // n_coeffs_per_ch
+                coeff_idx = i % n_coeffs_per_ch
+                features_rest[:, coeff_idx, ch] = np.asarray(vertex[rn])
+            import math
+            sh_degree = int(math.sqrt(n_coeffs_per_ch + 1)) - 1
+        else:
+            features_rest = np.zeros((N, 0, 3), dtype=np.float32)
+            sh_degree = 0
+
         # -- scaling (2 or 3 components) --------------------------------
         scale_names = sorted(
             [p.name for p in vertex.properties if p.name.startswith("scale_")],
@@ -141,19 +164,23 @@ class ExplicitFeatureGaussian(nn.Module):
         self._scaling = self._scaling.new_tensor(scales)
         self._opacity = self._opacity.new_tensor(opacity)
         self._features_dc = self._features_dc.new_tensor(features_dc)
+        self._features_rest = self._features_rest.new_tensor(features_rest)
+        self._sh_degree = sh_degree
         # Re-register buffers since new_tensor creates new tensors
         self.register_buffer("_xyz", self._xyz)
         self.register_buffer("_rotation", self._rotation)
         self.register_buffer("_scaling", self._scaling)
         self.register_buffer("_opacity", self._opacity)
         self.register_buffer("_features_dc", self._features_dc)
+        self.register_buffer("_features_rest", self._features_rest)
 
         # -- Default feature init ---------------------------------------
         self.init_features_random()
 
         print(
             f"[ExplicitFeatureGaussian] Loaded {N:,} Gaussians from {ply_path}\n"
-            f"  scaling components: {scales.shape[1]}  |  latent_dim: {self._latent_dim}\n"
+            f"  scaling components: {scales.shape[1]}  |  latent_dim: {self._latent_dim}"
+            f"  |  SH degree: {sh_degree}\n"
             f"  trainable params: {N * self._latent_dim:,}"
         )
 

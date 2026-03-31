@@ -184,11 +184,14 @@ class FeatureFieldRenderer(nn.Module):
         gaussian_model: nn.Module,
         viewmat: Tensor,
     ) -> dict[str, Tensor]:
-        """Standard RGB rendering using SH DC coefficients.
+        """Standard RGB rendering using SH coefficients.
+
+        Uses full spherical harmonics if available (degree > 0), otherwise
+        falls back to DC-only rendering.
 
         Args:
-            gaussian_model: Must expose ``_features_dc`` [N, 1, 3] in addition
-                to the usual geometry accessors.
+            gaussian_model: Must expose ``_features_dc`` [N, 1, 3] and optionally
+                ``_features_rest`` [N, K, 3] and ``_sh_degree`` int.
             viewmat: [4, 4] world-to-camera matrix.
 
         Returns:
@@ -210,9 +213,16 @@ class FeatureFieldRenderer(nn.Module):
                 "alpha": torch.zeros(H, W, device=device),
             }
 
-        # SH DC → linear RGB: color = coeff * C0 + 0.5
-        C0 = 0.28209479177387814
-        colors = (gaussian_model._features_dc[:, 0, :] * C0 + 0.5).clamp(0.0, 1.0)  # [N, 3]
+        # Build SH colors: [N, K, 3] where K = (degree+1)^2
+        sh_degree = getattr(gaussian_model, "_sh_degree", 0)
+        features_rest = getattr(gaussian_model, "_features_rest", None)
+        if sh_degree > 0 and features_rest is not None and features_rest.numel() > 0:
+            colors = torch.cat([gaussian_model._features_dc, features_rest], dim=1)  # [N, K, 3]
+        else:
+            # DC-only fallback
+            C0 = 0.28209479177387814
+            colors = (gaussian_model._features_dc[:, 0, :] * C0 + 0.5).clamp(0.0, 1.0)  # [N, 3]
+            sh_degree = None  # tell gsplat no SH eval needed
 
         viewmats_b = viewmat.unsqueeze(0)  # [1, 4, 4]
         Ks = self.K.unsqueeze(0)           # [1, 3, 3]
@@ -242,6 +252,7 @@ class FeatureFieldRenderer(nn.Module):
                 near_plane=self.near_plane,
                 far_plane=self.far_plane,
                 backgrounds=bg.unsqueeze(0),
+                sh_degree=sh_degree,
             )
         else:
             renders, alphas, info = raster_fn(
@@ -257,15 +268,15 @@ class FeatureFieldRenderer(nn.Module):
                 near_plane=self.near_plane,
                 far_plane=self.far_plane,
                 backgrounds=bg.unsqueeze(0),
+                sh_degree=sh_degree,
             )
         # renders: [1, H, W, 3], alphas: [1, H, W, 1]
 
-        rgb = renders[0].permute(2, 0, 1)   # [3, H, W]
+        rgb = renders[0].permute(2, 0, 1).clamp(0.0, 1.0)   # [3, H, W]
         alpha = alphas[0, :, :, 0]           # [H, W]
 
         depth_map = torch.zeros(H, W, device=device)
         if self.use_2dgs:
-            # _median is render_median from rasterization_2dgs: [C, H, W, 1]
             depth_map = _median[0, :, :, 0]
         elif "depths" in info:
             depth_map = info["depths"][0, :, :, 0]
