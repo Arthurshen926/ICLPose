@@ -1,0 +1,89 @@
+# RADIO-GS V11: Self-rendered RGB guide on v8 geometry (132K surfels)
+# Key insight: v8_fixed_poses has 23 dB RGB PSNR — rendered RGB retains 96.7%
+# of GT RGB guide benefit for the refiner. This eliminates GT RGB dependency
+# at both training and inference, enabling true novel-view feature synthesis.
+#
+# Architecture: v8 geometry (frozen) + 64d feature embeddings + RGB-guided refiner
+# Guide signal: rendered from model's own SH coefficients (no GT RGB needed)
+exp_name: "radio_gs_room2_explicit_v11"
+output_dir: "output/radio_gs/room2_explicit_v11"
+seed: 42
+
+# Scene
+scene: "room_2"
+ply_path: "output/2dgs_models/room_2/v8_fixed_poses/point_cloud/iteration_30000/point_cloud.ply"
+
+# RADIO
+radio_version: "c-radio_v4-h"
+radio_repo: "/root/RADIO"
+radio_feature_dim: 1280
+
+# Architecture
+architecture: "explicit"
+latent_dim: 64
+
+# Training mode
+train_mode: "decoded"
+
+# HCD Codec
+bottleneck_dim: 64
+dual_stream: true
+
+# Self-rendered RGB-guided screen-space refiner
+use_refiner: true
+refiner_hidden_dim: 192
+refiner_num_blocks: 6
+refiner_dropout: 0.1
+refiner_rgb_guide: true
+refiner_norm_type: "gn"
+self_guided: true          # Use rendered RGB from own SH, not GT RGB
+lr_refiner: 3.0e-4
+
+# FeatSharp
+featsharp_mode: "analytical"
+featsharp_strength: 0.3
+
+# Rendering — 2DGS surfels
+image_height: 480
+image_width: 640
+fx: 320.0
+fy: 320.0
+cx: 319.5
+cy: 239.5
+feature_height: 30
+feature_width: 40
+max_channels_per_chunk: 32
+use_2dgs: true
+
+# Training — from scratch on v8 geometry
+epochs: 100
+batch_size: 4
+lr_features: 1.0e-4
+lr_decoder: 2.0e-5
+weight_decay: 1.0e-4
+grad_clip: 5.0
+warmup_epochs: 5
+scheduler: "cosine"
+
+# Loss weights
+l2_weight: 1.0
+cosine_weight: 3.0
+adaptor_weight: 0.5
+tv_weight: 0.05
+feat_norm_weight: 0.0
+
+# Data — 1280d features
+feature_dir: "output/radio_features_1280d/room_2/Sequence_1"
+depth_dir: "dataset/room_2/Sequence_1/depth"
+semantics_dir: "dataset/room_2/Sequence_1/semantic_class"
+train_split: "Sequence_1"
+val_split: "Sequence_2"
+num_workers: 4
+
+# Downstream tasks
+seg_num_classes: 101
+
+# Checkpointing
+save_every: 10
+eval_every: 5
+log_every: 50

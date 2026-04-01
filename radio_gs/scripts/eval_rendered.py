@@ -367,7 +367,7 @@ def main():
     
     train_decoded = []
     train_gt_1280 = []
-    gt_dir = Path(f"output/radio_features_1280d/room_0/{train_split}/backbone")
+    gt_dir = Path(f"output/radio_features_1280d/{scene}/{train_split}/backbone")
     
     print("  Rendering train features...")
     with torch.no_grad():
@@ -405,7 +405,7 @@ def main():
     all_val_poses = np.loadtxt(val_poses_file).reshape(-1, 4, 4).astype(np.float32)
     val_w2c = np.linalg.inv(all_val_poses)
     
-    gt_val_dir = Path(f"output/radio_features_1280d/room_0/{val_split}/backbone")
+    gt_val_dir = Path(f"output/radio_features_1280d/{scene}/{val_split}/backbone")
     val_decoded = []
     val_gt_1280 = []
     
