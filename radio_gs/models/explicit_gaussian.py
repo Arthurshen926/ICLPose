@@ -33,9 +33,10 @@ class ExplicitFeatureGaussian(nn.Module):
         _feature        [N, latent_dim]  per-Gaussian feature embedding
     """
 
-    def __init__(self, latent_dim: int = 64) -> None:
+    def __init__(self, latent_dim: int = 64, train_sh: bool = False) -> None:
         super().__init__()
         self._latent_dim = latent_dim
+        self._train_sh = train_sh
 
         # Frozen geometry (registered as buffers → no grad, saved in state_dict)
         self.register_buffer("_xyz", torch.empty(0))
@@ -225,8 +226,41 @@ class ExplicitFeatureGaussian(nn.Module):
     # ------------------------------------------------------------------
 
     def trainable_parameters(self) -> List[nn.Parameter]:
-        """Return only the learnable feature parameters (geometry is frozen)."""
-        return [self._feature]
+        """Return learnable parameters (feature embeddings + optionally SH)."""
+        params = [self._feature]
+        if self._train_sh and hasattr(self, "_sh_dc_param"):
+            params.append(self._sh_dc_param)
+            if hasattr(self, "_sh_rest_param") and self._sh_rest_param is not None:
+                params.append(self._sh_rest_param)
+        return params
+
+    def enable_sh_training(self) -> None:
+        """Convert frozen SH buffers to trainable parameters."""
+        self._train_sh = True
+        self._sh_dc_param = nn.Parameter(self._features_dc.clone())
+        if self._features_rest.numel() > 0:
+            self._sh_rest_param = nn.Parameter(self._features_rest.clone())
+        else:
+            self._sh_rest_param = None
+        print(f"[ExplicitFeatureGaussian] SH coefficients unfrozen "
+              f"(DC: {self._sh_dc_param.shape}, "
+              f"rest: {self._sh_rest_param.shape if self._sh_rest_param is not None else 'none'})")
+
+    def get_sh_colors(self) -> torch.Tensor:
+        """Return SH coefficients [N, K, 3] for RGB rendering.
+
+        Uses trainable parameters if SH training is enabled, else frozen buffers.
+        """
+        if self._train_sh and hasattr(self, "_sh_dc_param"):
+            dc = self._sh_dc_param
+            rest = self._sh_rest_param
+        else:
+            dc = self._features_dc
+            rest = self._features_rest
+
+        if rest is not None and rest.numel() > 0:
+            return torch.cat([dc, rest], dim=1)  # [N, K, 3]
+        return dc  # [N, 1, 3]
 
     # ------------------------------------------------------------------
     # Checkpoint I/O

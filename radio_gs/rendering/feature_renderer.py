@@ -179,6 +179,89 @@ class FeatureFieldRenderer(nn.Module):
             "alpha_map": alpha_map,
         }
 
+    def render_features_and_rgb(
+        self,
+        gaussian_model: nn.Module,
+        viewmats: Tensor,
+        feature_height: int | None = None,
+        feature_width: int | None = None,
+    ) -> dict[str, Tensor]:
+        """Render feature maps AND RGB simultaneously from the same model.
+
+        Renders features at ``feature_height × feature_width`` resolution
+        and RGB at ``image_height × image_width`` (or same as feature if None).
+
+        Args:
+            gaussian_model: Must expose ``get_sh_colors()`` in addition to
+                the standard feature accessors.
+            viewmats: [B, 4, 4] world-to-camera matrices.
+
+        Returns:
+            dict with ``feature_map``, ``rgb``, ``depth_map``, ``alpha_map``.
+        """
+        # Feature rendering (same as render_features_batch)
+        feat_result = self.render_features_batch(
+            gaussian_model, viewmats, feature_height, feature_width
+        )
+
+        # RGB rendering at feature resolution for guide signal
+        B = viewmats.shape[0]
+        fH = feature_height or self.image_height
+        fW = feature_width or self.image_width
+
+        means = gaussian_model.get_xyz()
+        quats = gaussian_model.get_rotation()
+        scales = gaussian_model.get_scaling()
+        opacities = gaussian_model.get_opacity().squeeze(-1)
+
+        sh_degree = getattr(gaussian_model, "_sh_degree", 0)
+        if hasattr(gaussian_model, "get_sh_colors"):
+            colors = gaussian_model.get_sh_colors()  # [N, K, 3]
+        else:
+            C0 = 0.28209479177387814
+            colors = (gaussian_model._features_dc[:, 0, :] * C0 + 0.5).clamp(0.0, 1.0)
+            sh_degree = None
+
+        if self.use_2dgs and scales.shape[-1] == 2:
+            pad = torch.full(
+                (scales.shape[0], 1), -10.0,
+                device=scales.device, dtype=scales.dtype,
+            )
+            scales = torch.cat([scales, pad], dim=-1)
+
+        Ks = self.K.unsqueeze(0).expand(B, -1, -1)
+        bg = torch.zeros(B, 3, device=means.device)
+
+        # Render RGB per-view (gsplat SH eval requires per-view)
+        rgb_list = []
+        for b in range(B):
+            raster_fn = rasterization_2dgs if self.use_2dgs else rasterization
+            if self.use_2dgs:
+                renders, alphas, *_ = raster_fn(
+                    means=means, quats=quats,
+                    scales=torch.exp(scales) if not hasattr(gaussian_model, 'get_scaling') else scales,
+                    opacities=opacities, colors=colors,
+                    viewmats=viewmats[b:b+1], Ks=Ks[b:b+1],
+                    width=fW, height=fH,
+                    near_plane=self.near_plane, far_plane=self.far_plane,
+                    backgrounds=bg[b:b+1],
+                    sh_degree=sh_degree if sh_degree and sh_degree > 0 else None,
+                )
+            else:
+                renders, alphas, _ = raster_fn(
+                    means=means, quats=quats, scales=scales,
+                    opacities=opacities, colors=colors,
+                    viewmats=viewmats[b:b+1], Ks=Ks[b:b+1],
+                    width=fW, height=fH,
+                    near_plane=self.near_plane, far_plane=self.far_plane,
+                    backgrounds=bg[b:b+1],
+                    sh_degree=sh_degree if sh_degree and sh_degree > 0 else None,
+                )
+            rgb_list.append(renders[0].permute(2, 0, 1).clamp(0.0, 1.0))
+
+        feat_result["rgb"] = torch.stack(rgb_list, dim=0)  # [B, 3, fH, fW]
+        return feat_result
+
     def render_rgb(
         self,
         gaussian_model: nn.Module,

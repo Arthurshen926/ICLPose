@@ -211,14 +211,29 @@ class RadioGSTrainer:
         # Optional screen-space refiner (corrects alpha-blending artifacts)
         self.use_refiner = getattr(config, "use_refiner", False)
         self.refiner_rgb_guide = getattr(config, "refiner_rgb_guide", False)
+        self.refiner_depth_guide = getattr(config, "refiner_depth_guide", False)
+        self.self_guided = getattr(config, "self_guided", False)
+        self.train_sh = getattr(config, "train_sh", False)
+        self.rgb_loss_weight = getattr(config, "rgb_loss_weight", 0.0)
+
+        # Enable SH training if requested
+        if self.train_sh and hasattr(self.model, "enable_sh_training"):
+            self.model.enable_sh_training()
+            self._log("Joint RGB training: SH coefficients unfrozen")
+
         if self.use_refiner:
-            extra_ch = 3 if self.refiner_rgb_guide else 0
+            extra_ch = 0
+            if self.refiner_rgb_guide:
+                extra_ch += 3
+            if self.refiner_depth_guide:
+                extra_ch += 3 if getattr(config, "refiner_depth_grad", False) else 1
             self.refiner = ScreenSpaceRefiner(
                 latent_dim=self._resolve_latent_dim(config),
                 hidden_dim=getattr(config, "refiner_hidden_dim", 128),
                 num_blocks=getattr(config, "refiner_num_blocks", 4),
                 dropout=getattr(config, "refiner_dropout", 0.1),
                 extra_channels=extra_ch,
+                norm_type=getattr(config, "refiner_norm_type", "gn"),
             ).to(self.device)
         else:
             self.refiner = None
@@ -295,6 +310,7 @@ class RadioGSTrainer:
         if arch == "explicit":
             model = ExplicitFeatureGaussian(
                 latent_dim=getattr(config, "latent_dim", 64),
+                train_sh=getattr(config, "train_sh", False),
             )
         elif arch == "hybrid":
             model = HybridFeatureGaussian(
@@ -322,13 +338,27 @@ class RadioGSTrainer:
         )
 
     def _build_optimizer(self, config: RadioGSConfig) -> optim.Optimizer:
+        # Feature embeddings (always trainable)
+        feature_params = [self.model._feature]
         param_groups = [
             {
-                "params": self.model.trainable_parameters(),
+                "params": feature_params,
                 "lr": getattr(config, "lr_features", 1e-3),
                 "name": "features",
             },
         ]
+        # SH params (separate group for joint RGB training)
+        if self.train_sh and hasattr(self.model, "_sh_dc_param"):
+            sh_params = [self.model._sh_dc_param]
+            if hasattr(self.model, "_sh_rest_param") and self.model._sh_rest_param is not None:
+                sh_params.append(self.model._sh_rest_param)
+            param_groups.append(
+                {
+                    "params": sh_params,
+                    "lr": getattr(config, "lr_sh", 5e-4),
+                    "name": "sh_colors",
+                }
+            )
         # Only add decoder to optimizer if not in latent mode (decoder is frozen)
         if self.train_mode != "latent":
             param_groups.append(
@@ -445,7 +475,7 @@ class RadioGSTrainer:
         if self.use_refiner and self.refiner is not None:
             self.refiner.train()
 
-        loss_accum = {"total": 0.0, "distill": 0.0, "compact": 0.0, "tv": 0.0}
+        loss_accum = {"total": 0.0, "distill": 0.0, "compact": 0.0, "tv": 0.0, "rgb": 0.0}
         cos_accum = 0.0
         n_batches = 0
         log_every = getattr(self.cfg, "log_every", 100)
@@ -463,21 +493,42 @@ class RadioGSTrainer:
             self.optimizer.zero_grad(set_to_none=True)
 
             with autocast():
-                # Render compact features from 3DGS
-                result = self.renderer.render_features_batch(
-                    self.model, pose_w2c
-                )
-                rendered_compact = result["feature_map"]  # [B, D, Hf, Wf]
+                # Render compact features (and optionally RGB) from 3DGS
+                rendered_rgb = None
+                l_rgb = torch.tensor(0.0, device=self.device)
+
+                if self.self_guided and self.train_sh:
+                    # Joint rendering with SH training: features + RGB, backprop RGB loss
+                    result = self.renderer.render_features_and_rgb(
+                        self.model, pose_w2c
+                    )
+                    rendered_compact = result["feature_map"]
+                    rendered_rgb = result["rgb"]
+
+                    gt_rgb = batch.get("rgb_guide")
+                    if gt_rgb is not None:
+                        gt_rgb = gt_rgb.to(self.device)
+                        l_rgb = F.l1_loss(rendered_rgb.float(), gt_rgb.float())
+                elif self.self_guided:
+                    # Self-guided with frozen SH: render RGB as guide (no gradient)
+                    result = self.renderer.render_features_and_rgb(
+                        self.model, pose_w2c
+                    )
+                    rendered_compact = result["feature_map"]
+                    rendered_rgb = result["rgb"].detach()
+                else:
+                    result = self.renderer.render_features_batch(
+                        self.model, pose_w2c
+                    )
+                    rendered_compact = result["feature_map"]
 
                 # Sharpen rendered features
                 rendered_compact = self.sharpener(rendered_compact)
 
                 # Apply screen-space refiner if enabled
                 if self.use_refiner and self.refiner is not None:
-                    rgb_guide = batch.get("rgb_guide")
-                    if rgb_guide is not None:
-                        rgb_guide = rgb_guide.to(self.device)
-                    rendered_compact = self.refiner(rendered_compact, guide=rgb_guide)
+                    guide = self._build_guide(batch, result, rendered_rgb)
+                    rendered_compact = self.refiner(rendered_compact, guide=guide)
 
                 if self.train_mode == "latent":
                     # LATENT MODE: gt_features are already 64d (pre-encoded)
@@ -550,6 +601,8 @@ class RadioGSTrainer:
                 loss = l_distill + adaptor_w * l_compact + tv_w * l_tv
                 if self.feat_norm_weight > 0:
                     loss = loss + self.feat_norm_weight * l_feat_norm
+                if self.rgb_loss_weight > 0:
+                    loss = loss + self.rgb_loss_weight * l_rgb
 
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)
@@ -579,6 +632,7 @@ class RadioGSTrainer:
             loss_accum["distill"] += l_distill.item()
             loss_accum["compact"] += l_compact.item()
             loss_accum["tv"] += l_tv.item()
+            loss_accum["rgb"] += l_rgb.item()
             cos_accum += cos_sim.item()
             n_batches += 1
             self.global_step += 1
@@ -639,13 +693,17 @@ class RadioGSTrainer:
             gt_features = batch["radio_features"].to(self.device)
             pose_w2c = batch["pose_w2c"].to(self.device)
 
-            rendered_compact = self.renderer.render_features_batch(self.model, pose_w2c)["feature_map"]
+            rendered_rgb = None
+            if self.self_guided:
+                val_result = self.renderer.render_features_and_rgb(self.model, pose_w2c)
+                rendered_rgb = val_result["rgb"]
+            else:
+                val_result = self.renderer.render_features_batch(self.model, pose_w2c)
+            rendered_compact = val_result["feature_map"]
             rendered_compact = self.sharpener(rendered_compact)
             if self.use_refiner and self.refiner is not None:
-                rgb_guide = batch.get("rgb_guide")
-                if rgb_guide is not None:
-                    rgb_guide = rgb_guide.to(self.device)
-                rendered_compact = self.refiner(rendered_compact, guide=rgb_guide)
+                guide = self._build_guide(batch, val_result, rendered_rgb=rendered_rgb)
+                rendered_compact = self.refiner(rendered_compact, guide=guide)
 
             if self.train_mode == "latent":
                 # gt_features are 64d
@@ -784,8 +842,15 @@ class RadioGSTrainer:
                           f"starting refiner from scratch: {e}")
 
         if resume:
-            self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-            self.scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+            try:
+                self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            except (ValueError, KeyError) as e:
+                self._log(f"Optimizer state mismatch (new param groups?), "
+                          f"re-initializing optimizer: {e}")
+            try:
+                self.scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+            except (ValueError, KeyError) as e:
+                self._log(f"Scheduler state mismatch, re-initializing: {e}")
             if "scaler_state_dict" in ckpt:
                 self.scaler.load_state_dict(ckpt["scaler_state_dict"])
             self.start_epoch = ckpt.get("epoch", 0) + 1
@@ -845,6 +910,56 @@ class RadioGSTrainer:
         if self.use_refiner and self.refiner is not None:
             params += list(self.refiner.parameters())
         return params
+
+    def _build_guide(
+        self,
+        batch: dict,
+        render_result: dict,
+        rendered_rgb: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        """Build the guide signal for the screen-space refiner.
+
+        Supports RGB guide (GT or self-rendered), depth guide, or both.
+        Returns None if no guide is configured.
+        """
+        parts = []
+
+        if self.refiner_rgb_guide:
+            if self.self_guided and rendered_rgb is not None:
+                parts.append(rendered_rgb.detach())
+            else:
+                rgb = batch.get("rgb_guide")
+                if rgb is not None:
+                    parts.append(rgb.to(self.device))
+                else:
+                    # Zero-pad if RGB not available
+                    B, _, H, W = render_result["feature_map"].shape
+                    parts.append(torch.zeros(B, 3, H, W, device=self.device))
+
+        if self.refiner_depth_guide:
+            depth = render_result["depth_map"]  # [B, H, W]
+            depth = depth.unsqueeze(1)           # [B, 1, H, W]
+            # Normalize depth to [0, 1] per-batch for stable input
+            dmin = depth.amin(dim=(2, 3), keepdim=True)
+            dmax = depth.amax(dim=(2, 3), keepdim=True)
+            depth = (depth - dmin) / (dmax - dmin + 1e-6)
+
+            if getattr(self.cfg, "refiner_depth_grad", False):
+                # 3ch guide: depth + spatial gradients (edge info)
+                dx = depth[:, :, :, 1:] - depth[:, :, :, :-1]
+                dy = depth[:, :, 1:, :] - depth[:, :, :-1, :]
+                dx = F.pad(dx, (0, 1, 0, 0))  # pad right
+                dy = F.pad(dy, (0, 0, 0, 1))  # pad bottom
+                # Scale gradients for visibility (they're typically small)
+                dx = dx * 10.0
+                dy = dy * 10.0
+                parts.append(torch.cat([depth, dx, dy], dim=1))  # 3ch
+            else:
+                parts.append(depth)  # 1ch
+
+        if not parts:
+            return None
+        return torch.cat(parts, dim=1)
 
     def _get_1280d_val_path(self, batch) -> Optional[str]:
         """In latent mode, try to locate the original 1280d feature for monitoring."""
@@ -951,6 +1066,15 @@ def main() -> None:
         trainer.load_checkpoint(args.resume, resume=True)
     elif args.warmstart:
         trainer.load_checkpoint(args.warmstart, resume=False)
+    else:
+        # Check config for resume_from / warmstart_from
+        resume_from = getattr(config, "resume_from", None) or None
+        warmstart_from = getattr(config, "warmstart_from", None) or None
+        if resume_from:
+            trainer.load_checkpoint(resume_from, resume=False)
+            trainer._log(f"Warmstart from config: {resume_from}")
+        elif warmstart_from:
+            trainer.load_checkpoint(warmstart_from, resume=False)
 
     trainer.train()
 

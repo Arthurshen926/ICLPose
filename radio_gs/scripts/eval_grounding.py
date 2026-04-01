@@ -134,12 +134,18 @@ def load_model_and_render_pipeline(config_path, checkpoint_path):
     rgb_guide = getattr(config, "refiner_rgb_guide", False)
     if getattr(config, "use_refiner", False):
         extra_ch = 3 if rgb_guide else 0
+        depth_guide_enabled = getattr(config, "refiner_depth_guide", False)
+        depth_grad_enabled = getattr(config, "refiner_depth_grad", False)
+        if depth_guide_enabled:
+            extra_ch += 3 if depth_grad_enabled else 1
+        norm_type = getattr(config, "refiner_norm_type", "gn")
         refiner = ScreenSpaceRefiner(
             latent_dim=getattr(config, "latent_dim", 64),
             hidden_dim=getattr(config, "refiner_hidden_dim", 128),
             num_blocks=getattr(config, "refiner_num_blocks", 4),
             dropout=getattr(config, "refiner_dropout", 0.1),
             extra_channels=extra_ch,
+            norm_type=norm_type,
         ).to(device).eval()
 
     ckpt = torch.load(checkpoint_path, map_location=device)

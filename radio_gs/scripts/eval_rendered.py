@@ -37,6 +37,7 @@ def load_model_and_render(config_path, checkpoint_path):
     codec = HCDCodec(
         input_dim=getattr(config, "radio_feature_dim", 1280),
         bottleneck_dim=getattr(config, "bottleneck_dim", 64),
+        dual_stream=getattr(config, "dual_stream", True),
     ).to(device).eval()
     
     renderer = FeatureFieldRenderer(
@@ -59,14 +60,23 @@ def load_model_and_render(config_path, checkpoint_path):
     # Optional screen-space refiner
     refiner = None
     rgb_guide_enabled = getattr(config, "refiner_rgb_guide", False)
+    depth_guide_enabled = getattr(config, "refiner_depth_guide", False)
+    depth_grad_enabled = getattr(config, "refiner_depth_grad", False)
     if getattr(config, "use_refiner", False):
-        extra_ch = 3 if rgb_guide_enabled else 0
+        extra_ch = 0
+        if rgb_guide_enabled:
+            extra_ch += 3
+        if depth_guide_enabled:
+            extra_ch += 3 if depth_grad_enabled else 1
+        # Detect norm type: if checkpoint has BN keys (running_mean), use "bn"
+        norm_type = getattr(config, "refiner_norm_type", "gn")
         refiner = ScreenSpaceRefiner(
             latent_dim=getattr(config, "latent_dim", 64),
             hidden_dim=getattr(config, "refiner_hidden_dim", 128),
             num_blocks=getattr(config, "refiner_num_blocks", 4),
-            dropout=getattr(config, "refiner_dropout", 0.1),  # must match training architecture
+            dropout=getattr(config, "refiner_dropout", 0.1),
             extra_channels=extra_ch,
+            norm_type=norm_type,
         ).to(device).eval()
     
     # Load checkpoint
@@ -105,8 +115,25 @@ def _render_rgb_guide(model, rgb_renderer, viewmat, feature_size):
     return rgb  # [1, 3, fH, fW]
 
 
+def _build_depth_guide(render_result, depth_grad=False):
+    """Build depth guide (1ch or 3ch with gradients) from render result."""
+    depth = render_result["depth_map"]  # [B, H, W]
+    depth = depth.unsqueeze(1)           # [B, 1, H, W]
+    dmin = depth.amin(dim=(2, 3), keepdim=True)
+    dmax = depth.amax(dim=(2, 3), keepdim=True)
+    depth = (depth - dmin) / (dmax - dmin + 1e-6)
+    if depth_grad:
+        dx = depth[:, :, :, 1:] - depth[:, :, :, :-1]
+        dy = depth[:, :, 1:, :] - depth[:, :, :-1, :]
+        dx = F.pad(dx, (0, 1, 0, 0)) * 10.0
+        dy = F.pad(dy, (0, 0, 0, 1)) * 10.0
+        return torch.cat([depth, dx, dy], dim=1)  # [B, 3, H, W]
+    return depth  # [B, 1, H, W]
+
+
 def render_decoded_features(model, codec, renderer, sharpener, pose_file,
-                            refiner=None, rgb_dir=None, feature_size=None):
+                            refiner=None, rgb_dir=None, feature_size=None,
+                            depth_guide=False, depth_grad=False):
     """Render and decode features for all frames."""
     poses = np.loadtxt(pose_file).reshape(-1, 4, 4).astype(np.float32)
     w2c = np.linalg.inv(poses)
@@ -123,6 +150,12 @@ def render_decoded_features(model, codec, renderer, sharpener, pose_file,
                     guide = _load_rgb_guide(rgb_dir, i, feature_size)
                     if guide is not None:
                         guide = guide.to(device)
+                if depth_guide:
+                    dguide = _build_depth_guide(result, depth_grad)
+                    if guide is not None:
+                        guide = torch.cat([guide, dguide], dim=1)
+                    else:
+                        guide = dguide
                 rendered = refiner(rendered, guide=guide)
             decoded = codec.decoder(rendered)  # [1, 1280, H, W]
             decoded_features.append(decoded.squeeze(0).cpu())
@@ -289,8 +322,11 @@ def main():
     
     # RGB guide config
     rgb_guide_enabled = getattr(config, "refiner_rgb_guide", False)
+    depth_guide_enabled = getattr(config, "refiner_depth_guide", False)
+    depth_grad_enabled = getattr(config, "refiner_depth_grad", False)
+    self_guided = getattr(config, "self_guided", False)
     feature_size = (getattr(config, "feature_height", 30), getattr(config, "feature_width", 40))
-    use_rendered_rgb = args.use_rendered_rgb
+    use_rendered_rgb = args.use_rendered_rgb or self_guided  # self_guided implies rendered RGB
     rgb_renderer = None
     if use_rendered_rgb and rgb_guide_enabled:
         # Full-resolution renderer for RGB (renders at image_width×image_height, then downsampled)
@@ -315,10 +351,14 @@ def main():
     
     print(f"\n=== Rendering features ({len(train_indices)} train, {len(val_indices)} val) ===")
     if rgb_guide_enabled:
-        if use_rendered_rgb:
+        if self_guided:
+            print(f"  RGB guide: SELF-RENDERED from model SH (feature_size={feature_size})")
+        elif use_rendered_rgb:
             print(f"  RGB guide: RENDERED from 2DGS (feature_size={feature_size})")
         else:
             print(f"  RGB guide: GT from disk (feature_size={feature_size})")
+    if depth_guide_enabled:
+        print(f"  Depth guide: {'3ch (depth+grad)' if depth_grad_enabled else '1ch'}")
     
     # Render train features
     train_poses_file = str(scene_root / train_split / "traj_w_c.txt")
@@ -333,15 +373,26 @@ def main():
     with torch.no_grad():
         for i in tqdm(train_indices, leave=False):
             pose = torch.from_numpy(train_w2c[i:i+1]).to(device)
-            result = renderer.render_features_batch(model, pose)
+            if self_guided and rgb_guide_enabled:
+                result = renderer.render_features_and_rgb(model, pose)
+                self_rgb = result["rgb"]  # [1, 3, fH, fW]
+            else:
+                result = renderer.render_features_batch(model, pose)
+                self_rgb = None
             rendered = sharpener(result["feature_map"])
             if refiner is not None:
-                if rgb_renderer is not None:
+                guide = None
+                if self_rgb is not None:
+                    guide = self_rgb
+                elif rgb_renderer is not None:
                     guide = _render_rgb_guide(model, rgb_renderer, pose[0], feature_size)
-                else:
-                    guide = _load_rgb_guide(train_rgb_dir, i, feature_size) if train_rgb_dir else None
+                elif train_rgb_dir:
+                    guide = _load_rgb_guide(train_rgb_dir, i, feature_size)
                     if guide is not None:
                         guide = guide.to(device)
+                if depth_guide_enabled:
+                    dguide = _build_depth_guide(result, depth_grad_enabled)
+                    guide = torch.cat([guide, dguide], dim=1) if guide is not None else dguide
                 rendered = refiner(rendered, guide=guide)
             decoded = codec.decoder(rendered).squeeze(0).cpu()
             train_decoded.append(decoded)
@@ -362,15 +413,26 @@ def main():
     with torch.no_grad():
         for i in tqdm(val_indices, leave=False):
             pose = torch.from_numpy(val_w2c[i:i+1]).to(device)
-            result = renderer.render_features_batch(model, pose)
+            if self_guided and rgb_guide_enabled:
+                result = renderer.render_features_and_rgb(model, pose)
+                self_rgb = result["rgb"]
+            else:
+                result = renderer.render_features_batch(model, pose)
+                self_rgb = None
             rendered = sharpener(result["feature_map"])
             if refiner is not None:
-                if rgb_renderer is not None:
+                guide = None
+                if self_rgb is not None:
+                    guide = self_rgb
+                elif rgb_renderer is not None:
                     guide = _render_rgb_guide(model, rgb_renderer, pose[0], feature_size)
-                else:
-                    guide = _load_rgb_guide(val_rgb_dir, i, feature_size) if val_rgb_dir else None
+                elif val_rgb_dir:
+                    guide = _load_rgb_guide(val_rgb_dir, i, feature_size)
                     if guide is not None:
                         guide = guide.to(device)
+                if depth_guide_enabled:
+                    dguide = _build_depth_guide(result, depth_grad_enabled)
+                    guide = torch.cat([guide, dguide], dim=1) if guide is not None else dguide
                 rendered = refiner(rendered, guide=guide)
             decoded = codec.decoder(rendered).squeeze(0).cpu()
             val_decoded.append(decoded)

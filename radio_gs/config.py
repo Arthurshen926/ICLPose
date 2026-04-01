@@ -60,7 +60,16 @@ class RadioGSConfig:
     refiner_num_blocks: int = 4
     refiner_dropout: float = 0.1
     refiner_rgb_guide: bool = False  # Use RGB as additional input to refiner
+    refiner_depth_guide: bool = False  # Use rendered depth as guide (always available)
+    refiner_depth_grad: bool = False   # Use depth gradients (3ch: depth+dx+dy) instead of 1ch
+    refiner_norm_type: str = "gn"      # "gn" (GroupNorm, stable) or "bn" (BatchNorm, legacy)
+    self_guided: bool = False  # Use rendered RGB (not GT) as refiner guide
     lr_refiner: float = 5e-4
+
+    # Joint RGB training (V10)
+    train_sh: bool = False  # Unfreeze SH coefficients for joint RGB training
+    rgb_loss_weight: float = 0.0  # Weight for RGB reconstruction loss
+    lr_sh: float = 5e-4  # Learning rate for SH coefficients
 
     # Rendering
     image_height: int = 480
@@ -113,6 +122,8 @@ class RadioGSConfig:
     save_every: int = 10
     eval_every: int = 5
     log_every: int = 100  # iterations
+    resume_from: str = ""  # Resume training from checkpoint (model + optimizer)
+    warmstart_from: str = ""  # Warmstart model weights only
 
 
 def config_to_dict(config: RadioGSConfig) -> Dict[str, Any]:
