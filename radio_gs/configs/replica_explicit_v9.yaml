@@ -32,6 +32,7 @@ refiner_hidden_dim: 192
 refiner_num_blocks: 6
 refiner_dropout: 0.1
 refiner_rgb_guide: true
+refiner_norm_type: "bn"
 lr_refiner: 3.0e-4
 
 # FeatSharp
