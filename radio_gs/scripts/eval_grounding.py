@@ -160,16 +160,23 @@ def load_model_and_render_pipeline(config_path, checkpoint_path):
 
 
 def render_1280d(model, codec, renderer, sharpener, refiner, viewmat,
-                 rgb_guide=None):
+                 rgb_guide=None, self_guided=False):
     """Render a single frame's 1280d decoded features.
     
     Args:
         viewmat: [1, 4, 4] world-to-camera matrix.
-        rgb_guide: [1, 3, H, W] RGB guide for refiner.
+        rgb_guide: [1, 3, H, W] RGB guide for refiner (GT or external).
+        self_guided: if True, render RGB from the model's own SH coefficients.
     """
     with torch.no_grad():
-        result = renderer.render_features(model, viewmat.squeeze(0))
-        latent = result["feature_map"].unsqueeze(0)  # [1, D, H, W]
+        if self_guided:
+            vm = viewmat if viewmat.dim() == 3 else viewmat.unsqueeze(0)
+            result = renderer.render_features_and_rgb(model, vm)
+            latent = result["feature_map"]  # already [1, D, H, W]
+            rgb_guide = result["rgb"]       # [1, 3, H, W]
+        else:
+            result = renderer.render_features(model, viewmat.squeeze(0))
+            latent = result["feature_map"].unsqueeze(0)  # [1, D, H, W]
         latent = sharpener(latent)
         if refiner is not None:
             latent = refiner(latent, guide=rgb_guide)
@@ -259,6 +266,7 @@ def evaluate_grounding(args):
     fH = getattr(config, "feature_height", 30)
     fW = getattr(config, "feature_width", 40)
     rgb_guide_enabled = getattr(config, "refiner_rgb_guide", False)
+    self_guided = getattr(config, "self_guided", False)
 
     # Load poses (traj_w_c.txt: camera-to-world, need inverse for renderer)
     pose_file = args.pose_file
@@ -299,13 +307,13 @@ def evaluate_grounding(args):
         # Render decoded features
         viewmat = torch.from_numpy(w2c[frame_idx:frame_idx+1]).float().to(device)
         rgb_guide = None
-        if refiner is not None and rgb_guide_enabled and rgb_dir is not None:
+        if refiner is not None and rgb_guide_enabled and rgb_dir is not None and not self_guided:
             img = cv2.imread(str(rgb_dir / f"rgb_{frame_idx}.png"))
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             img = cv2.resize(img, (fW, fH))
             rgb_guide = torch.from_numpy(img).float().permute(2, 0, 1).unsqueeze(0).to(device) / 255.0
         rend_feat = render_1280d(model, codec, renderer, sharpener, refiner,
-                                 viewmat, rgb_guide)
+                                 viewmat, rgb_guide, self_guided=self_guided)
 
         # Project to SigLIP2 space
         gt_siglip = project_to_siglip2(gt_feat.half(), proj)    # [1, 1536, H, W]
