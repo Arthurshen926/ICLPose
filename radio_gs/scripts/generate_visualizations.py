@@ -134,18 +134,62 @@ def render_features(model, codec, renderer, sharpener, refiner, config, viewmat)
             latent = result["feature_map"]
             rgb_guide = result["rgb"]
         else:
-            result = renderer.render_features_batch(model, viewmat)
+            vm = viewmat if viewmat.dim() == 3 else viewmat.unsqueeze(0)
+            result = renderer.render_features_batch(model, vm)
             latent = result["feature_map"]
             rgb_guide = None
 
-        geom_depth = result.get("depth_map", None)
         alpha_map = result.get("alpha_map", None)
+
+        # Render geometry depth by splatting camera-space z as 1-ch color
+        geom_depth = _render_geometry_depth(model, renderer, vm)
 
         latent = sharpener(latent)
         if refiner is not None:
             latent = refiner(latent, guide=rgb_guide)
         decoded = codec.decoder(latent)
-    return decoded, geom_depth, alpha_map  # [1, 1280, H, W], [fH, fW], [fH, fW]
+    return decoded, geom_depth, alpha_map
+
+
+def _render_geometry_depth(model, renderer, viewmat):
+    """Render per-pixel geometry depth by splatting camera-space z-coordinates."""
+    from gsplat import rasterization_2dgs, rasterization
+
+    means = model.get_xyz()
+    quats = model.get_rotation()
+    scales = model.get_scaling()
+    opacs = model.get_opacity().squeeze(-1)
+
+    # Camera-space z-depth per Gaussian
+    vm = viewmat[0] if viewmat.dim() == 3 else viewmat
+    R, t = vm[:3, :3], vm[:3, 3]
+    z_depth = (means @ R.T + t)[:, 2:3]  # [N, 1]
+
+    if renderer.use_2dgs and scales.shape[-1] == 2:
+        pad = torch.full((scales.shape[0], 1), -10.0,
+                         device=scales.device, dtype=scales.dtype)
+        scales = torch.cat([scales, pad], dim=-1)
+
+    Ks = renderer.K.unsqueeze(0)
+    bg = torch.zeros(1, 1, device=means.device)
+    raster_fn = rasterization_2dgs if renderer.use_2dgs else rasterization
+
+    if renderer.use_2dgs:
+        renders, *_ = raster_fn(
+            means=means, quats=quats, scales=scales, opacities=opacs,
+            colors=z_depth, viewmats=viewmat[:1], Ks=Ks,
+            width=renderer.image_width, height=renderer.image_height,
+            near_plane=renderer.near_plane, far_plane=renderer.far_plane,
+            backgrounds=bg)
+    else:
+        renders, *_ = raster_fn(
+            means=means, quats=quats, scales=scales, opacities=opacs,
+            colors=z_depth, viewmats=viewmat[:1], Ks=Ks,
+            width=renderer.image_width, height=renderer.image_height,
+            near_plane=renderer.near_plane, far_plane=renderer.far_plane,
+            backgrounds=bg)
+
+    return renders[0, :, :, 0]  # [fH, fW]
 
 
 # ── Visualization helpers ─────────────────────────────────────────────────────
@@ -395,7 +439,7 @@ def load_siglip2_projection(projection_weights):
     return proj.to(device).half().eval()
 
 
-def compute_grounding_heatmaps(features_1280, proj_model, text_emb, temperature=0.07):
+def compute_grounding_heatmaps(features_1280, proj_model, text_emb, temperature=1.0):
     """Compute text grounding heatmaps with softmax normalization.
 
     Args:
