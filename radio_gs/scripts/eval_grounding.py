@@ -194,20 +194,25 @@ def project_to_siglip2(features_1280, proj_model):
     return siglip_feat.permute(0, 2, 1).reshape(B, -1, H, W)  # [B, 1536, H, W]
 
 
-def compute_heatmaps(visual_feat, text_emb):
-    """Compute per-query cosine similarity heatmaps.
+def compute_heatmaps(visual_feat, text_emb, temperature=0.07):
+    """Compute per-query cosine similarity heatmaps with softmax normalization.
 
     Args:
         visual_feat: [1, D, H, W] normalized SigLIP2 visual features.
         text_emb: [N, D] normalized text embeddings.
+        temperature: Softmax temperature for cross-query normalization.
 
     Returns:
-        [N, H, W] similarity heatmaps.
+        raw_sim: [N, H, W] raw cosine similarity heatmaps.
+        probs: [N, H, W] softmax-normalized probabilities across queries.
     """
     _, D, H, W = visual_feat.shape
     vis_flat = visual_feat.squeeze(0).reshape(D, H * W)  # [D, HW]
     sim = text_emb @ vis_flat  # [N, HW]
-    return sim.reshape(-1, H, W)
+    raw_sim = sim.reshape(-1, H, W)
+    # Softmax across queries for discriminative zero-shot segmentation
+    probs = F.softmax(sim / temperature, dim=0).reshape(-1, H, W)
+    return raw_sim, probs
 
 
 def load_semantic_gt(sem_dir, idx, target_size):
@@ -319,13 +324,13 @@ def evaluate_grounding(args):
         gt_siglip = project_to_siglip2(gt_feat.half(), proj)    # [1, 1536, H, W]
         rend_siglip = project_to_siglip2(rend_feat.half(), proj)  # [1, 1536, H, W]
 
-        # Compute heatmaps
-        gt_hm = compute_heatmaps(gt_siglip, active_text_emb)      # [K, H, W]
-        rend_hm = compute_heatmaps(rend_siglip, active_text_emb)  # [K, H, W]
+        # Compute heatmaps (raw for correlation, softmax probs for segmentation)
+        gt_raw, gt_probs = compute_heatmaps(gt_siglip, active_text_emb)
+        rend_raw, rend_probs = compute_heatmaps(rend_siglip, active_text_emb)
 
-        # Heatmap correlation
-        gt_flat = gt_hm.reshape(len(active_queries), -1).float()
-        rend_flat = rend_hm.reshape(len(active_queries), -1).float()
+        # Heatmap correlation (use raw cosine similarity)
+        gt_flat = gt_raw.reshape(len(active_queries), -1).float()
+        rend_flat = rend_raw.reshape(len(active_queries), -1).float()
         # Per-query Pearson correlation
         corrs = []
         for q in range(len(active_queries)):
@@ -340,14 +345,14 @@ def evaluate_grounding(args):
         # Load semantic GT
         sem_gt = load_semantic_gt(sem_dir, frame_idx, (fH, fW)).to(device)
 
-        # Per-class IoU and AP
+        # Per-class IoU and AP (use raw similarity for per-class thresholding)
         for qi, (qname, cid) in enumerate(zip(active_queries, active_class_ids)):
             mask_gt = (sem_gt == cid)
             if mask_gt.sum() == 0:
                 continue  # Class not in this frame
 
             # GT grounding
-            gt_sim = gt_hm[qi]
+            gt_sim = gt_raw[qi]
             thresh = gt_sim.median().item()
             pred_gt = gt_sim > thresh
             inter = (pred_gt & mask_gt).float().sum()
@@ -366,7 +371,7 @@ def evaluate_grounding(args):
             per_class_ap_gt[qname].append(ap.item())
 
             # Rendered grounding
-            rend_sim = rend_hm[qi]
+            rend_sim = rend_raw[qi]
             thresh_r = rend_sim.median().item()
             pred_rend = rend_sim > thresh_r
             inter_r = (pred_rend & mask_gt).float().sum()
@@ -383,9 +388,9 @@ def evaluate_grounding(args):
             ap_r = (prec_r * labels_sr).sum() / labels_sr.sum()
             per_class_ap_rend[qname].append(ap_r.item())
 
-        # Argmax segmentation (zero-shot)
-        gt_argmax = gt_hm.argmax(dim=0)   # [H, W] index into active queries
-        rend_argmax = rend_hm.argmax(dim=0)
+        # Argmax segmentation (zero-shot, use softmax probs)
+        gt_argmax = gt_probs.argmax(dim=0)   # [H, W] index into active queries
+        rend_argmax = rend_probs.argmax(dim=0)
         for qi, cid in enumerate(active_class_ids):
             mask = (sem_gt == cid)
             if mask.sum() == 0:
@@ -398,8 +403,10 @@ def evaluate_grounding(args):
         if len(vis_frames) < 5:
             vis_frames.append({
                 'idx': frame_idx,
-                'gt_hm': gt_hm.cpu(),
-                'rend_hm': rend_hm.cpu(),
+                'gt_hm': gt_raw.cpu(),
+                'rend_hm': rend_raw.cpu(),
+                'gt_probs': gt_probs.cpu(),
+                'rend_probs': rend_probs.cpu(),
                 'sem_gt': sem_gt.cpu(),
             })
 

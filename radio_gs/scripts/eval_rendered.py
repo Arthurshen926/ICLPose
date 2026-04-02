@@ -134,6 +134,13 @@ def _render_rgb_guide(model, rgb_renderer, viewmat, feature_size):
     return rgb  # [1, 3, fH, fW]
 
 
+def _render_fullres_depth(model, fullres_renderer, viewmat):
+    """Render geometric depth at full image resolution from 3DGS."""
+    with torch.no_grad():
+        result = fullres_renderer.render_rgb(model, viewmat)
+        return result["depth"]  # [H_full, W_full]
+
+
 def _build_depth_guide(render_result, depth_grad=False):
     """Build depth guide (1ch or 3ch with gradients) from render result."""
     depth = render_result["depth_map"]  # [B, H, W]
@@ -393,6 +400,19 @@ def main():
     # Subsample for speed
     train_indices = list(range(0, 900, max(1, 900 // args.n_train)))[:args.n_train]
     val_indices = list(range(0, 900, max(1, 900 // args.n_val)))[:args.n_val]
+
+    # Full-resolution renderer for geometric depth (renders at image resolution)
+    img_h = getattr(config, "image_height", 480)
+    img_w = getattr(config, "image_width", 640)
+    fullres_depth_renderer = FeatureFieldRenderer(
+        image_height=img_h,
+        image_width=img_w,
+        fx=getattr(config, "fx", 320.0),
+        fy=getattr(config, "fy", 320.0),
+        cx=getattr(config, "cx", 319.5),
+        cy=getattr(config, "cy", 239.5),
+        use_2dgs=getattr(config, "use_2dgs", False),
+    ).to(device)
     
     print(f"\n=== Rendering features ({len(train_indices)} train, {len(val_indices)} val) ===")
     if rgb_guide_enabled:
@@ -412,6 +432,7 @@ def main():
     
     train_decoded = []
     train_gt_1280 = []
+    train_geom_depths = []
     gt_dir = Path(f"output/radio_features_1280d/{scene}/{train_split}/backbone")
     
     print("  Rendering train features...")
@@ -425,6 +446,9 @@ def main():
                 result = renderer.render_features_batch(model, pose)
                 self_rgb = None
             rendered = sharpener(result["feature_map"])
+            # Store geometric depth from 3DGS rendering
+            geom_depth = result["depth_map"].squeeze(0).cpu()  # [fH, fW]
+            train_geom_depths.append(geom_depth)
             if refiner is not None:
                 guide = None
                 if self_rgb is not None:
@@ -455,6 +479,8 @@ def main():
     gt_val_dir = Path(f"output/radio_features_1280d/{scene}/{val_split}/backbone")
     val_decoded = []
     val_gt_1280 = []
+    val_geom_depths = []
+    val_fullres_depths = []
     
     print("  Rendering val features...")
     with torch.no_grad():
@@ -467,6 +493,12 @@ def main():
                 result = renderer.render_features_batch(model, pose)
                 self_rgb = None
             rendered = sharpener(result["feature_map"])
+            # Store geometric depth from 3DGS rendering (feature resolution)
+            geom_depth = result["depth_map"].squeeze(0).cpu()  # [fH, fW]
+            val_geom_depths.append(geom_depth)
+            # Render full-resolution geometric depth
+            fullres_d = _render_fullres_depth(model, fullres_depth_renderer, pose[0])
+            val_fullres_depths.append(fullres_d.cpu())  # [img_h, img_w]
             if refiner is not None:
                 guide = None
                 if self_rgb is not None:
@@ -527,6 +559,21 @@ def main():
     rendered_seg = eval_seg_indexed(train_decoded, train_indices, train_sem,
                                      val_decoded, val_indices, val_sem)
     print(f"  mIoU={rendered_seg['seg_mIoU']:.4f}  PixelAcc={rendered_seg['seg_pixel_acc']:.4f}")
+
+    # ====== Evaluation Mode 2b: Geometric depth (scale-shift aligned) ======
+    print("\n=== GEOMETRIC: Depth (3DGS rendered, scale-shift aligned, 30x40) ===")
+    geom_depth = eval_geom_depth(val_geom_depths, val_indices, val_depth)
+    print(f"  AbsRel={geom_depth['depth_abs_rel']:.4f}  RMSE={geom_depth['depth_rmse']:.4f}  δ<1.25={geom_depth['depth_delta1']:.4f}")
+
+    print("\n=== GEOMETRIC-HR: Depth (3DGS rendered, scale-shift aligned, full-res) ===")
+    geom_hr_depth = eval_fullres_geom_depth(val_fullres_depths, val_indices, val_depth)
+    print(f"  AbsRel={geom_hr_depth['depth_abs_rel']:.4f}  RMSE={geom_hr_depth['depth_rmse']:.4f}  δ<1.25={geom_hr_depth['depth_delta1']:.4f}")
+
+    # ====== Evaluation Mode 2c: Fused depth (features + geometric) ======
+    print("\n=== FUSED: Depth (features + geometric depth) ===")
+    fused_depth = eval_fused_depth(train_decoded, train_geom_depths, train_indices, train_depth,
+                                    val_decoded, val_geom_depths, val_indices, val_depth)
+    print(f"  AbsRel={fused_depth['depth_abs_rel']:.4f}  RMSE={fused_depth['depth_rmse']:.4f}  δ<1.25={fused_depth['depth_delta1']:.4f}")
     
     # ====== Evaluation Mode 3: Cross (GT-trained heads on rendered) ======
     print("\n=== CROSS: Depth (GT-trained, rendered-eval) ===")
@@ -540,13 +587,16 @@ def main():
     print(f"  mIoU={cross_seg['seg_mIoU']:.4f}  PixelAcc={cross_seg['seg_pixel_acc']:.4f}")
     
     # Summary table
-    print("\n" + "="*70)
-    print(f"{'Mode':<20} {'AbsRel':>8} {'RMSE':>8} {'δ<1.25':>8} {'mIoU':>8} {'PixAcc':>8}")
-    print("-"*70)
-    print(f"{'Oracle (GT)':<20} {oracle_depth['depth_abs_rel']:>8.4f} {oracle_depth['depth_rmse']:>8.4f} {oracle_depth['depth_delta1']:>8.4f} {oracle_seg['seg_mIoU']:>8.4f} {oracle_seg['seg_pixel_acc']:>8.4f}")
-    print(f"{'Rendered (adapted)':<20} {rendered_depth['depth_abs_rel']:>8.4f} {rendered_depth['depth_rmse']:>8.4f} {rendered_depth['depth_delta1']:>8.4f} {rendered_seg['seg_mIoU']:>8.4f} {rendered_seg['seg_pixel_acc']:>8.4f}")
-    print(f"{'Cross (GT→render)':<20} {cross_depth['depth_abs_rel']:>8.4f} {cross_depth['depth_rmse']:>8.4f} {cross_depth['depth_delta1']:>8.4f} {cross_seg['seg_mIoU']:>8.4f} {cross_seg['seg_pixel_acc']:>8.4f}")
-    print("="*70)
+    print("\n" + "="*90)
+    print(f"{'Mode':<25} {'AbsRel':>8} {'RMSE':>8} {'δ<1.25':>8} {'mIoU':>8} {'PixAcc':>8}")
+    print("-"*90)
+    print(f"{'Oracle (GT feat)':<25} {oracle_depth['depth_abs_rel']:>8.4f} {oracle_depth['depth_rmse']:>8.4f} {oracle_depth['depth_delta1']:>8.4f} {oracle_seg['seg_mIoU']:>8.4f} {oracle_seg['seg_pixel_acc']:>8.4f}")
+    print(f"{'Rendered (adapted)':<25} {rendered_depth['depth_abs_rel']:>8.4f} {rendered_depth['depth_rmse']:>8.4f} {rendered_depth['depth_delta1']:>8.4f} {rendered_seg['seg_mIoU']:>8.4f} {rendered_seg['seg_pixel_acc']:>8.4f}")
+    print(f"{'Geom 30x40':<25} {geom_depth['depth_abs_rel']:>8.4f} {geom_depth['depth_rmse']:>8.4f} {geom_depth['depth_delta1']:>8.4f} {'   N/A':>8} {'   N/A':>8}")
+    print(f"{'Geom full-res':<25} {geom_hr_depth['depth_abs_rel']:>8.4f} {geom_hr_depth['depth_rmse']:>8.4f} {geom_hr_depth['depth_delta1']:>8.4f} {'   N/A':>8} {'   N/A':>8}")
+    print(f"{'Fused (feat+geom)':<25} {fused_depth['depth_abs_rel']:>8.4f} {fused_depth['depth_rmse']:>8.4f} {fused_depth['depth_delta1']:>8.4f} {'   N/A':>8} {'   N/A':>8}")
+    print(f"{'Cross (GT→render)':<25} {cross_depth['depth_abs_rel']:>8.4f} {cross_depth['depth_rmse']:>8.4f} {cross_depth['depth_delta1']:>8.4f} {cross_seg['seg_mIoU']:>8.4f} {cross_seg['seg_pixel_acc']:>8.4f}")
+    print("="*90)
 
 
 def eval_depth_indexed(train_feats, train_idx, depth_dir, val_feats, val_idx, val_depth_dir, fH=30, fW=40):
@@ -672,6 +722,141 @@ def eval_seg_indexed(train_feats, train_idx, sem_dir, val_feats, val_idx, val_se
             ious.append((inter / union).item())
     
     return {"seg_mIoU": np.mean(ious), "seg_pixel_acc": (all_preds == all_gts).float().mean().item(), "seg_n_classes": len(ious)}
+
+
+def eval_geom_depth(geom_depths, val_idx, val_depth_dir, fH=30, fW=40):
+    """Evaluate 3DGS geometric depth directly (with scale-shift alignment)."""
+    abs_rels, rmses, delta1s = [], [], []
+    for geom, i in zip(geom_depths, val_idx):
+        dpath = val_depth_dir / f"depth_{i}.png"
+        if not dpath.exists():
+            continue
+        d = cv2.imread(str(dpath), cv2.IMREAD_UNCHANGED)
+        if d is None:
+            continue
+        gt = torch.from_numpy(d.astype(np.float32) / 1000.0)
+        gt = F.interpolate(gt.unsqueeze(0).unsqueeze(0), (fH, fW),
+                           mode="bilinear", align_corners=False).squeeze()
+        valid = gt > 0.01
+        if valid.sum() < 10:
+            continue
+        g_vals = geom[valid].float()
+        gt_vals = gt[valid].float()
+        # Least-squares scale-shift alignment: gt ≈ scale * geom + shift
+        A = torch.stack([g_vals, torch.ones_like(g_vals)], dim=1)
+        params = torch.linalg.lstsq(A, gt_vals).solution  # [scale, shift]
+        aligned = geom.float() * params[0] + params[1]
+        p, g = aligned[valid], gt_vals
+        abs_rels.append((torch.abs(p - g) / g).mean().item())
+        rmses.append(torch.sqrt(((p - g)**2).mean()).item())
+        delta1s.append((torch.max(p/g, g/p) < 1.25).float().mean().item())
+
+    return {"depth_abs_rel": np.mean(abs_rels), "depth_rmse": np.mean(rmses), "depth_delta1": np.mean(delta1s)}
+
+
+def eval_fullres_geom_depth(fullres_depths, val_idx, val_depth_dir):
+    """Evaluate full-resolution 3DGS geometric depth (scale-shift aligned at native image res)."""
+    abs_rels, rmses, delta1s = [], [], []
+    for geom, i in zip(fullres_depths, val_idx):
+        dpath = val_depth_dir / f"depth_{i}.png"
+        if not dpath.exists():
+            continue
+        d = cv2.imread(str(dpath), cv2.IMREAD_UNCHANGED)
+        if d is None:
+            continue
+        gt = torch.from_numpy(d.astype(np.float32) / 1000.0)
+        H, W = gt.shape
+        # Resize geom to match GT resolution if needed
+        if geom.shape != gt.shape:
+            geom = F.interpolate(geom.unsqueeze(0).unsqueeze(0).float(),
+                                  (H, W), mode="bilinear", align_corners=False).squeeze()
+        valid = gt > 0.01
+        if valid.sum() < 10:
+            continue
+        g_vals = geom[valid].float()
+        gt_vals = gt[valid].float()
+        A = torch.stack([g_vals, torch.ones_like(g_vals)], dim=1)
+        params = torch.linalg.lstsq(A, gt_vals).solution
+        aligned = geom.float() * params[0] + params[1]
+        p, g = aligned[valid], gt_vals
+        abs_rels.append((torch.abs(p - g) / g).mean().item())
+        rmses.append(torch.sqrt(((p - g)**2).mean()).item())
+        delta1s.append((torch.max(p/g, g/p) < 1.25).float().mean().item())
+
+    return {"depth_abs_rel": np.mean(abs_rels), "depth_rmse": np.mean(rmses), "depth_delta1": np.mean(delta1s)}
+
+
+def eval_fused_depth(train_feats, train_geom, train_idx, train_depth_dir,
+                     val_feats, val_geom, val_idx, val_depth_dir, fH=30, fW=40):
+    """Train linear probe on features + geometric depth jointly for depth fusion."""
+    print("  Training fused depth probe (features + geometric depth)...")
+    train_X, train_Y = [], []
+    for feat, geom, i in zip(train_feats, train_geom, train_idx):
+        dpath = train_depth_dir / f"depth_{i}.png"
+        if not dpath.exists():
+            continue
+        d = cv2.imread(str(dpath), cv2.IMREAD_UNCHANGED)
+        if d is None:
+            continue
+        d = torch.from_numpy(d.astype(np.float32) / 1000.0)
+        d = F.interpolate(d.unsqueeze(0).unsqueeze(0), (fH, fW),
+                           mode="bilinear", align_corners=False).squeeze()
+        C = feat.shape[0]
+        if feat.shape[1:] != (fH, fW):
+            feat = F.interpolate(feat.unsqueeze(0), (fH, fW),
+                                  mode="bilinear", align_corners=False).squeeze(0)
+        valid = d > 0.01
+        if valid.sum() < 10:
+            continue
+        # Concatenate features + geometric depth as extra channel
+        geom_flat = geom.reshape(1, -1).T  # [HW, 1]
+        feat_flat = feat.reshape(C, -1).T  # [HW, C]
+        combined = torch.cat([feat_flat, geom_flat], dim=1)  # [HW, C+1]
+        train_X.append(combined[valid.reshape(-1)])
+        train_Y.append(d.reshape(-1)[valid.reshape(-1)])
+
+    train_X = torch.cat(train_X, 0).to(device)
+    train_Y = torch.cat(train_Y, 0).to(device)
+
+    probe = nn.Linear(train_X.shape[1], 1).to(device)
+    opt = torch.optim.Adam(probe.parameters(), lr=1e-3)
+    for ep in range(100):
+        pred = probe(train_X).squeeze()
+        loss = F.l1_loss(pred, train_Y)
+        opt.zero_grad(); loss.backward(); opt.step()
+
+    probe.eval()
+    abs_rels, rmses, delta1s = [], [], []
+    with torch.no_grad():
+        for feat, geom, i in zip(val_feats, val_geom, val_idx):
+            dpath = val_depth_dir / f"depth_{i}.png"
+            if not dpath.exists():
+                continue
+            d = cv2.imread(str(dpath), cv2.IMREAD_UNCHANGED)
+            if d is None:
+                continue
+            d = torch.from_numpy(d.astype(np.float32) / 1000.0).to(device)
+            d = F.interpolate(d.unsqueeze(0).unsqueeze(0), (fH, fW),
+                               mode="bilinear", align_corners=False).squeeze()
+            C = feat.shape[0]
+            if feat.shape[1:] != (fH, fW):
+                feat_r = F.interpolate(feat.unsqueeze(0).to(device), (fH, fW),
+                                        mode="bilinear", align_corners=False).squeeze(0)
+            else:
+                feat_r = feat.to(device)
+            valid = d > 0.01
+            if valid.sum() < 10:
+                continue
+            geom_flat = geom.reshape(1, -1).T.to(device)  # [HW, 1]
+            feat_flat = feat_r.reshape(C, -1).T  # [HW, C]
+            combined = torch.cat([feat_flat, geom_flat], dim=1)  # [HW, C+1]
+            pred = probe(combined).squeeze().reshape(fH, fW)
+            p, g = pred[valid], d[valid]
+            abs_rels.append((torch.abs(p - g) / g).mean().item())
+            rmses.append(torch.sqrt(((p - g)**2).mean()).item())
+            delta1s.append((torch.max(p/g, g/p) < 1.25).float().mean().item())
+
+    return {"depth_abs_rel": np.mean(abs_rels), "depth_rmse": np.mean(rmses), "depth_delta1": np.mean(delta1s)}
 
 
 if __name__ == "__main__":
