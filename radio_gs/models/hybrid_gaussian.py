@@ -358,6 +358,8 @@ class HybridFeatureGaussian(nn.Module):
         self.register_buffer("_scaling", torch.empty(0))
         self.register_buffer("_opacity", torch.empty(0))
         self.register_buffer("_features_dc", torch.empty(0))
+        self.register_buffer("_features_rest", torch.empty(0))
+        self._sh_degree = 0
 
         # Activation helpers (match GaussianFeatureModel conventions)
         self.scaling_activation = torch.exp
@@ -385,7 +387,7 @@ class HybridFeatureGaussian(nn.Module):
         self.coarse_decoder = CoarseDecoder(hash_output_dim, coarse_hidden_dim, coarse_dim)
         self.fusion_head = FusionHead(fine_dim, coarse_dim, fusion_hidden_dim, output_dim)
 
-    # -- properties ---------------------------------------------------------
+    # -- accessors (match ExplicitFeatureGaussian API) ---------------------
 
     @property
     def num_gaussians(self) -> int:
@@ -395,19 +397,15 @@ class HybridFeatureGaussian(nn.Module):
     def latent_dim(self) -> int:
         return self._latent_dim
 
-    @property
     def get_xyz(self) -> torch.Tensor:
         return self._xyz
 
-    @property
     def get_rotation(self) -> torch.Tensor:
         return self.rotation_activation(self._rotation, dim=-1)
 
-    @property
     def get_scaling(self) -> torch.Tensor:
         return self.scaling_activation(self._scaling)
 
-    @property
     def get_opacity(self) -> torch.Tensor:
         return self.opacity_activation(self._opacity)
 
@@ -420,6 +418,12 @@ class HybridFeatureGaussian(nn.Module):
     def get_features(self) -> torch.Tensor:
         """Return features used for rasterization (= latent codes)."""
         return self._latent
+
+    def get_sh_colors(self) -> torch.Tensor:
+        """Return SH coefficients [N, K, 3] for RGB rendering."""
+        if self._features_rest.numel() > 0:
+            return torch.cat([self._features_dc, self._features_rest], dim=1)
+        return self._features_dc  # [N, 1, 3]
 
     # -- PLY I/O ------------------------------------------------------------
 
@@ -438,9 +442,9 @@ class HybridFeatureGaussian(nn.Module):
             axis=1,
         )
         opacity = np.asarray(vertex["opacity"])[..., np.newaxis]
-        features_dc = np.zeros((N, 3))
+        features_dc = np.zeros((N, 1, 3))
         for i in range(3):
-            features_dc[:, i] = np.asarray(vertex[f"f_dc_{i}"])
+            features_dc[:, 0, i] = np.asarray(vertex[f"f_dc_{i}"])
 
         scale_names = sorted(
             [p.name for p in vertex.properties if p.name.startswith("scale_")],
@@ -460,6 +464,28 @@ class HybridFeatureGaussian(nn.Module):
         self.register_buffer("_scaling", torch.tensor(scales, dtype=torch.float32))
         self.register_buffer("_opacity", torch.tensor(opacity, dtype=torch.float32))
         self.register_buffer("_features_dc", torch.tensor(features_dc, dtype=torch.float32))
+
+        # Load SH rest coefficients for RGB rendering
+        rest_names = sorted(
+            [p.name for p in vertex.properties if p.name.startswith("f_rest_")],
+            key=lambda x: int(x.split("_")[-1]),
+        )
+        if rest_names:
+            features_rest = np.stack(
+                [np.asarray(vertex[n]) for n in rest_names], axis=1
+            )  # [N, K*3]
+            num_sh_coeffs = features_rest.shape[1] // 3
+            features_rest = features_rest.reshape(N, num_sh_coeffs, 3)
+            self.register_buffer(
+                "_features_rest", torch.tensor(features_rest, dtype=torch.float32)
+            )
+            # Infer SH degree from number of coefficients
+            import math
+            total_coeffs = num_sh_coeffs + 1  # +1 for DC
+            self._sh_degree = int(math.sqrt(total_coeffs)) - 1
+        else:
+            self.register_buffer("_features_rest", torch.empty(0))
+            self._sh_degree = 0
 
         # Initialise learnable latent codes
         latent = torch.randn(N, self._latent_dim) * 0.01

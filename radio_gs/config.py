@@ -42,6 +42,12 @@ class RadioGSConfig:
     hash_levels: int = 16
     hash_features_per_level: int = 2
     hash_log2_size: int = 19
+    hash_base_resolution: int = 16
+    hash_max_resolution: int = 2048
+    hash_output_dim: int = 48
+    fine_dim: int = 64
+    coarse_dim: int = 64
+    hybrid_output_dim: int = 128
 
     # HCD Codec
     bottleneck_dim: int = 64
@@ -88,6 +94,7 @@ class RadioGSConfig:
     batch_size: int = 4
     lr_features: float = 1e-3
     lr_decoder: float = 1e-4
+    lr_hash: float = 1e-3
     lr_heads: float = 1e-4
     weight_decay: float = 1e-5
     grad_clip: float = 10.0
@@ -109,6 +116,9 @@ class RadioGSConfig:
     semantics_dir: str = ""
     train_split: str = "Sequence_1"
     val_split: str = "Sequence_2"
+    mixed_split: bool = False
+    mixed_train_ratio: float = 0.8
+    mixed_seed: int = 42
     num_workers: int = 4
 
     # Downstream tasks

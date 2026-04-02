@@ -28,7 +28,26 @@ def load_model_and_render(config_path, checkpoint_path):
     """Load trained model and render 1280d features for all frames."""
     config = load_config(config_path)
     
-    model = ExplicitFeatureGaussian(latent_dim=getattr(config, "latent_dim", 64))
+    architecture = getattr(config, "architecture", "explicit")
+    is_hybrid = architecture == "hybrid"
+    if is_hybrid:
+        from radio_gs.models.hybrid_gaussian import HybridFeatureGaussian
+        latent_dim = getattr(config, "hybrid_latent_dim", 16)
+        model = HybridFeatureGaussian(
+            latent_dim=latent_dim,
+            hash_output_dim=getattr(config, "hash_output_dim", 48),
+            fine_dim=getattr(config, "fine_dim", 64),
+            coarse_dim=getattr(config, "coarse_dim", 64),
+            output_dim=getattr(config, "hybrid_output_dim", 128),
+            num_levels=getattr(config, "hash_levels", 16),
+            features_per_level=getattr(config, "hash_features_per_level", 2),
+            log2_hashmap_size=getattr(config, "hash_log2_size", 19),
+            base_resolution=getattr(config, "hash_base_resolution", 16),
+            max_resolution=getattr(config, "hash_max_resolution", 2048),
+        )
+    else:
+        latent_dim = getattr(config, "latent_dim", 64)
+        model = ExplicitFeatureGaussian(latent_dim=latent_dim)
     ply_path = getattr(config, "ply_path", "")
     if ply_path:
         model.load_from_ply(ply_path)
@@ -53,7 +72,7 @@ def load_model_and_render(config_path, checkpoint_path):
     
     sharpener = FeatSharp3D(
         mode=getattr(config, "featsharp_mode", "analytical"),
-        feature_dim=getattr(config, "latent_dim", 64),
+        feature_dim=latent_dim,
         strength=getattr(config, "featsharp_strength", 0.3),
     ).to(device).eval()
     
@@ -71,7 +90,7 @@ def load_model_and_render(config_path, checkpoint_path):
         # Detect norm type: if checkpoint has BN keys (running_mean), use "bn"
         norm_type = getattr(config, "refiner_norm_type", "gn")
         refiner = ScreenSpaceRefiner(
-            latent_dim=getattr(config, "latent_dim", 64),
+            latent_dim=latent_dim,
             hidden_dim=getattr(config, "refiner_hidden_dim", 128),
             num_blocks=getattr(config, "refiner_num_blocks", 4),
             dropout=getattr(config, "refiner_dropout", 0.1),
@@ -88,7 +107,7 @@ def load_model_and_render(config_path, checkpoint_path):
     if refiner is not None and "refiner_state_dict" in ckpt:
         refiner.load_state_dict(ckpt["refiner_state_dict"], strict=False)
     
-    return model, codec, renderer, sharpener, refiner, config
+    return model, codec, renderer, sharpener, refiner, config, is_hybrid
 
 
 def _load_rgb_guide(rgb_dir, idx, feature_size):
@@ -131,9 +150,33 @@ def _build_depth_guide(render_result, depth_grad=False):
     return depth  # [B, 1, H, W]
 
 
+def _hybrid_decode(model, rendered, result, pose_w2c, K):
+    """Apply hybrid hash-grid decode to rendered features.
+    
+    Args:
+        rendered: [B, latent_dim, H, W] post-sharpener/refiner latent features
+        result: render result dict (contains depth_map)
+        pose_w2c: [B, 4, 4] world-to-camera transform
+        K: [3, 3] intrinsic matrix
+    """
+    from radio_gs.models.hybrid_gaussian import unproject_depth_to_positions
+    depth_map = result["depth_map"].float()
+    H, W = depth_map.shape[1], depth_map.shape[2]
+    position_map = unproject_depth_to_positions(depth_map, pose_w2c.float(), K.float(), H, W)
+    # Normalize positions to [0,1] using scene bounds
+    xyz = model.get_xyz()
+    margin = 0.1
+    lo = xyz.min(dim=0).values - margin
+    hi = xyz.max(dim=0).values + margin
+    extent = (hi - lo).clamp(min=1e-6)
+    position_map = ((position_map - lo.view(1, 3, 1, 1)) / extent.view(1, 3, 1, 1)).clamp(0, 1)
+    return model.decode_screen_space(rendered.float(), position_map)
+
+
 def render_decoded_features(model, codec, renderer, sharpener, pose_file,
                             refiner=None, rgb_dir=None, feature_size=None,
-                            depth_guide=False, depth_grad=False):
+                            depth_guide=False, depth_grad=False,
+                            is_hybrid=False):
     """Render and decode features for all frames."""
     poses = np.loadtxt(pose_file).reshape(-1, 4, 4).astype(np.float32)
     w2c = np.linalg.inv(poses)
@@ -157,6 +200,8 @@ def render_decoded_features(model, codec, renderer, sharpener, pose_file,
                     else:
                         guide = dguide
                 rendered = refiner(rendered, guide=guide)
+            if is_hybrid:
+                rendered = _hybrid_decode(model, rendered, result, pose, renderer.K)
             decoded = codec.decoder(rendered)  # [1, 1280, H, W]
             decoded_features.append(decoded.squeeze(0).cpu())
     return decoded_features
@@ -313,7 +358,7 @@ def main():
     args = parser.parse_args()
     
     print(f"Loading model from {args.checkpoint}...")
-    model, codec, renderer, sharpener, refiner, config = load_model_and_render(args.config, args.checkpoint)
+    model, codec, renderer, sharpener, refiner, config, is_hybrid = load_model_and_render(args.config, args.checkpoint)
     
     scene = getattr(config, "scene", "room_0")
     scene_root = Path("dataset") / scene
@@ -394,6 +439,8 @@ def main():
                     dguide = _build_depth_guide(result, depth_grad_enabled)
                     guide = torch.cat([guide, dguide], dim=1) if guide is not None else dguide
                 rendered = refiner(rendered, guide=guide)
+            if is_hybrid:
+                rendered = _hybrid_decode(model, rendered, result, pose, renderer.K)
             decoded = codec.decoder(rendered).squeeze(0).cpu()
             train_decoded.append(decoded)
             # Also load GT 1280d
@@ -434,6 +481,8 @@ def main():
                     dguide = _build_depth_guide(result, depth_grad_enabled)
                     guide = torch.cat([guide, dguide], dim=1) if guide is not None else dguide
                 rendered = refiner(rendered, guide=guide)
+            if is_hybrid:
+                rendered = _hybrid_decode(model, rendered, result, pose, renderer.K)
             decoded = codec.decoder(rendered).squeeze(0).cpu()
             val_decoded.append(decoded)
             gt_feat = torch.load(gt_val_dir / f"rgb_{i}.pt").float()

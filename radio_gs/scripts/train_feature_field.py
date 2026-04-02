@@ -26,7 +26,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.cuda.amp import GradScaler, autocast
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import ConcatDataset, DataLoader, Dataset, Subset
 from tqdm import tqdm
 
 # ---------------------------------------------------------------------------
@@ -215,6 +215,7 @@ class RadioGSTrainer:
         self.self_guided = getattr(config, "self_guided", False)
         self.train_sh = getattr(config, "train_sh", False)
         self.rgb_loss_weight = getattr(config, "rgb_loss_weight", 0.0)
+        self._is_hybrid = getattr(config, "architecture", "explicit") == "hybrid"
 
         # Enable SH training if requested
         if self.train_sh and hasattr(self.model, "enable_sh_training"):
@@ -315,9 +316,15 @@ class RadioGSTrainer:
         elif arch == "hybrid":
             model = HybridFeatureGaussian(
                 latent_dim=getattr(config, "hybrid_latent_dim", 16),
-                hash_levels=getattr(config, "hash_levels", 16),
-                hash_features_per_level=getattr(config, "hash_features_per_level", 2),
-                hash_log2_size=getattr(config, "hash_log2_size", 19),
+                hash_output_dim=getattr(config, "hash_output_dim", 48),
+                fine_dim=getattr(config, "fine_dim", 64),
+                coarse_dim=getattr(config, "coarse_dim", 64),
+                output_dim=getattr(config, "hybrid_output_dim", 128),
+                num_levels=getattr(config, "hash_levels", 16),
+                features_per_level=getattr(config, "hash_features_per_level", 2),
+                log2_hashmap_size=getattr(config, "hash_log2_size", 19),
+                base_resolution=getattr(config, "hash_base_resolution", 16),
+                max_resolution=getattr(config, "hash_max_resolution", 2048),
             )
         else:
             raise ValueError(f"Unknown architecture: {arch}")
@@ -338,8 +345,9 @@ class RadioGSTrainer:
         )
 
     def _build_optimizer(self, config: RadioGSConfig) -> optim.Optimizer:
+        arch = getattr(config, "architecture", "explicit")
         # Feature embeddings (always trainable)
-        feature_params = [self.model._feature]
+        feature_params = [self.model._feature if arch == "explicit" else self.model._latent]
         param_groups = [
             {
                 "params": feature_params,
@@ -347,6 +355,23 @@ class RadioGSTrainer:
                 "name": "features",
             },
         ]
+        # Hybrid architecture: hash grid + screen-space decoders
+        if arch == "hybrid":
+            param_groups.append({
+                "params": list(self.model.hash_field.parameters()),
+                "lr": getattr(config, "lr_hash", 1e-3),
+                "name": "hash_field",
+            })
+            hybrid_decoder_params = (
+                list(self.model.fine_decoder.parameters())
+                + list(self.model.coarse_decoder.parameters())
+                + list(self.model.fusion_head.parameters())
+            )
+            param_groups.append({
+                "params": hybrid_decoder_params,
+                "lr": getattr(config, "lr_decoder", 1e-4),
+                "name": "hybrid_decoders",
+            })
         # SH params (separate group for joint RGB training)
         if self.train_sh and hasattr(self.model, "_sh_dc_param"):
             sh_params = [self.model._sh_dc_param]
@@ -420,13 +445,14 @@ class RadioGSTrainer:
 
     def build_dataset(
         self, config: RadioGSConfig
-    ) -> Tuple[SimpleRadioDataset, SimpleRadioDataset]:
+    ) -> Tuple[Dataset, Dataset]:
         feature_dir = getattr(config, "feature_dir", "")
         scene = getattr(config, "scene", "room_0")
         scene_root = Path("dataset") / scene
         train_split = getattr(config, "train_split", "Sequence_1")
         val_split = getattr(config, "val_split", "Sequence_2")
         depth_dir = getattr(config, "depth_dir", None)
+        mixed_split = getattr(config, "mixed_split", False)
 
         # Val features use a separate directory
         val_feature_dir = feature_dir.replace(train_split, val_split)
@@ -443,6 +469,41 @@ class RadioGSTrainer:
             )
             rgb_dir_train = str(scene_root / train_split / "rgb")
             rgb_dir_val = str(scene_root / val_split / "rgb")
+
+        if mixed_split:
+            # Merge both sequences and random 80/20 split
+            val_depth_dir = depth_dir.replace(train_split, val_split) if depth_dir else None
+            ds_seq1 = SimpleRadioDataset(
+                feature_dir=feature_dir,
+                pose_file=str(scene_root / train_split / "traj_w_c.txt"),
+                depth_dir=depth_dir,
+                rgb_dir=rgb_dir_train,
+                feature_size=feature_size,
+                split="train",
+            )
+            ds_seq2 = SimpleRadioDataset(
+                feature_dir=val_feature_dir,
+                pose_file=str(scene_root / val_split / "traj_w_c.txt"),
+                depth_dir=val_depth_dir,
+                rgb_dir=rgb_dir_val,
+                feature_size=feature_size,
+                split="train",
+            )
+            combined = ConcatDataset([ds_seq1, ds_seq2])
+            total = len(combined)
+            train_ratio = getattr(config, "mixed_train_ratio", 0.8)
+            train_size = int(train_ratio * total)
+            val_size = total - train_size
+            seed = getattr(config, "mixed_seed", 42)
+            gen = torch.Generator().manual_seed(seed)
+            train_ds, val_ds = torch.utils.data.random_split(
+                combined, [train_size, val_size], generator=gen
+            )
+            self._log(
+                f"Mixed split: {total} total → Train: {train_size} | Val: {val_size} "
+                f"(ratio={train_ratio}, seed={seed})"
+            )
+            return train_ds, val_ds
 
         train_ds = SimpleRadioDataset(
             feature_dir=feature_dir,
@@ -489,10 +550,13 @@ class RadioGSTrainer:
         for batch in pbar:
             gt_features = batch["radio_features"].to(self.device)   # [B, C, Hp, Wp]
             pose_w2c = batch["pose_w2c"].to(self.device)         # [B, 4, 4]
+            if self._is_hybrid:
+                gt_features = gt_features.float()
+                pose_w2c = pose_w2c.float()
 
             self.optimizer.zero_grad(set_to_none=True)
 
-            with autocast():
+            with autocast(enabled=not self._is_hybrid):
                 # Render compact features (and optionally RGB) from 3DGS
                 rendered_rgb = None
                 l_rgb = torch.tensor(0.0, device=self.device)
@@ -529,6 +593,19 @@ class RadioGSTrainer:
                 if self.use_refiner and self.refiner is not None:
                     guide = self._build_guide(batch, result, rendered_rgb)
                     rendered_compact = self.refiner(rendered_compact, guide=guide)
+
+                # Hybrid architecture: decode via hash grid + fusion
+                if self._is_hybrid:
+                    from radio_gs.models.hybrid_gaussian import unproject_depth_to_positions
+                    depth_map = result["depth_map"].float()
+                    position_map = unproject_depth_to_positions(
+                        depth_map, pose_w2c.float(), self.renderer.K.float(),
+                        depth_map.shape[1], depth_map.shape[2],
+                    )
+                    position_map = self._normalize_positions(position_map)
+                    rendered_compact = self.model.decode_screen_space(
+                        rendered_compact.float(), position_map
+                    )
 
                 if self.train_mode == "latent":
                     # LATENT MODE: gt_features are already 64d (pre-encoded)
@@ -704,6 +781,19 @@ class RadioGSTrainer:
             if self.use_refiner and self.refiner is not None:
                 guide = self._build_guide(batch, val_result, rendered_rgb=rendered_rgb)
                 rendered_compact = self.refiner(rendered_compact, guide=guide)
+
+            # Hybrid decode: latent + hash grid → fused output
+            if self._is_hybrid:
+                from radio_gs.models.hybrid_gaussian import unproject_depth_to_positions
+                depth_map = val_result["depth_map"].float()
+                position_map = unproject_depth_to_positions(
+                    depth_map, pose_w2c.float(), self.renderer.K.float(),
+                    depth_map.shape[1], depth_map.shape[2],
+                )
+                position_map = self._normalize_positions(position_map)
+                rendered_compact = self.model.decode_screen_space(
+                    rendered_compact.float(), position_map
+                )
 
             if self.train_mode == "latent":
                 # gt_features are 64d
@@ -910,6 +1000,22 @@ class RadioGSTrainer:
         if self.use_refiner and self.refiner is not None:
             params += list(self.refiner.parameters())
         return params
+
+    def _normalize_positions(self, position_map: torch.Tensor) -> torch.Tensor:
+        """Normalize world-space positions to [0, 1] using scene bounds from Gaussians."""
+        if not hasattr(self, "_scene_bounds"):
+            xyz = self.model.get_xyz()
+            margin = 0.1
+            self._scene_bounds = (
+                xyz.min(dim=0).values - margin,
+                xyz.max(dim=0).values + margin,
+            )
+        lo, hi = self._scene_bounds
+        extent = (hi - lo).clamp(min=1e-6)
+        # position_map: [B, 3, H, W]
+        lo_v = lo.view(1, 3, 1, 1)
+        extent_v = extent.view(1, 3, 1, 1)
+        return ((position_map - lo_v) / extent_v).clamp(0.0, 1.0)
 
     def _build_guide(
         self,
