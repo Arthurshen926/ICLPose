@@ -446,8 +446,10 @@ def main():
                 result = renderer.render_features_batch(model, pose)
                 self_rgb = None
             rendered = sharpener(result["feature_map"])
-            # Store geometric depth from 3DGS rendering
-            geom_depth = result["depth_map"].squeeze(0).cpu()  # [fH, fW]
+            # Geometric depth via SH-based render_rgb (feature chunk render
+            # returns broken median depth for non-SH colors)
+            rgb_d = renderer.render_rgb(model, torch.from_numpy(train_w2c[i]).float().to(device))
+            geom_depth = rgb_d["depth"].cpu()  # [fH, fW]
             train_geom_depths.append(geom_depth)
             if refiner is not None:
                 guide = None
@@ -493,8 +495,9 @@ def main():
                 result = renderer.render_features_batch(model, pose)
                 self_rgb = None
             rendered = sharpener(result["feature_map"])
-            # Store geometric depth from 3DGS rendering (feature resolution)
-            geom_depth = result["depth_map"].squeeze(0).cpu()  # [fH, fW]
+            # Geometric depth via SH-based render_rgb (correct median depth)
+            rgb_d = renderer.render_rgb(model, torch.from_numpy(val_w2c[i]).float().to(device))
+            geom_depth = rgb_d["depth"].cpu()  # [fH, fW]
             val_geom_depths.append(geom_depth)
             # Render full-resolution geometric depth
             fullres_d = _render_fullres_depth(model, fullres_depth_renderer, pose[0])

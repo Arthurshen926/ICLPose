@@ -175,9 +175,13 @@ def render_features(model, codec, renderer, sharpener, refiner, config, viewmat,
             latent = result["feature_map"]
             rgb_guide = None
 
-        # Geometry depth from 3DGS
-        geom_depth = result.get("depth_map", None)
-        alpha_map = result.get("alpha_map", None)
+        # Geometry depth from SH-based rendering (correct median depth).
+        # The feature chunk render returns broken _median depths for non-SH
+        # colors; render_rgb with SH gives correct geometric depth.
+        vm_2d = viewmat if viewmat.dim() == 2 else viewmat.squeeze(0)
+        rgb_result = renderer.render_rgb(model, vm_2d)
+        geom_depth = rgb_result["depth"]      # [fH, fW]
+        alpha_map = rgb_result["alpha"]        # [fH, fW]
 
         latent = sharpener(latent)
         if refiner is not None:
@@ -1027,9 +1031,17 @@ def main():
 
             gd = geom_depths[j]
             has_geom = gd is not None and gd.max() > 0.01
-            geom_depth_panel = (upscale(depth_to_colormap(gd, vmin_d, vmax_d), S)
-                                if has_geom
-                                else np.zeros((fH * S, fW * S, 3), dtype=np.uint8))
+            if has_geom:
+                # Use geometric depth's own range for colormap since it may
+                # be in a different coordinate frame than GT depth.
+                gd_valid = gd[gd > 0.01]
+                gd_vmin = float(gd_valid.min()) if gd_valid.size > 0 else 0
+                gd_vmax = float(gd.max())
+                geom_depth_panel = upscale(
+                    depth_to_colormap(gd, gd_vmin, gd_vmax), S)
+            else:
+                geom_depth_panel = np.zeros(
+                    (fH * S, fW * S, 3), dtype=np.uint8)
         else:
             h_, w_ = fH * S, fW * S
             gt_depth_panel = np.zeros((h_, w_, 3), dtype=np.uint8)
