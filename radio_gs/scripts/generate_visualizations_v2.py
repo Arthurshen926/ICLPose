@@ -401,7 +401,7 @@ def predict_depth(probe, feat, fH, fW):
 
 
 def predict_seg(probe, feat, fH, fW):
-    """Predict segmentation from feature using probe."""
+    """Predict segmentation from feature using probe (low-res, for metrics)."""
     C = feat.shape[0]
     if feat.shape[1:] != (fH, fW):
         feat = F.interpolate(feat[None].to(device), (fH, fW), mode="bilinear", align_corners=False).squeeze(0)
@@ -409,6 +409,27 @@ def predict_seg(probe, feat, fH, fW):
         feat = feat.to(device)
     with torch.no_grad():
         pred = probe(feat.reshape(C, -1).T).argmax(1).reshape(fH, fW)
+    return pred.cpu().numpy()
+
+
+def predict_seg_smooth(probe, feat, fH, fW, target_h, target_w):
+    """Predict segmentation with bilinear-upscaled logits for smooth boundaries.
+    
+    Upscales logits (soft class probabilities) BEFORE argmax so that class
+    boundaries are interpolated smoothly instead of blocky nearest-neighbor.
+    """
+    C = feat.shape[0]
+    if feat.shape[1:] != (fH, fW):
+        feat = F.interpolate(feat[None].to(device), (fH, fW), mode="bilinear", align_corners=False).squeeze(0)
+    else:
+        feat = feat.to(device)
+    with torch.no_grad():
+        logits = probe(feat.reshape(C, -1).T)  # [fH*fW, n_classes]
+        n_classes = logits.shape[1]
+        logits_map = logits.T.reshape(1, n_classes, fH, fW)
+        logits_up = F.interpolate(logits_map, (target_h, target_w),
+                                  mode="bilinear", align_corners=False)
+        pred = logits_up.squeeze(0).argmax(0)  # [target_h, target_w]
     return pred.cpu().numpy()
 
 
@@ -640,10 +661,11 @@ def main():
 
         rgb = cv2.imread(str(rgb_dir / f"rgb_{idx}.png"))
         rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
-        rgb_small = cv2.resize(rgb, (fW, fH))
+        tH, tW = fH * S, fW * S
+        rgb_display = cv2.resize(rgb, (tW, tH), interpolation=cv2.INTER_LINEAR)
 
         panels = [
-            upscale(rgb_small, S, cv2.INTER_LINEAR),
+            rgb_display,
             upscale(gt_pcas[j], S),
             upscale(rend_pcas[j], S),
             upscale(cosine_map_to_heatmap(cos), S),
@@ -708,11 +730,12 @@ def main():
 
         rgb = cv2.imread(str(rgb_dir / f"rgb_{idx}.png"))
         rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
-        rgb_small = cv2.resize(rgb, (fW, fH))
+        tH, tW = fH * S, fW * S
+        rgb_display = cv2.resize(rgb, (tW, tH), interpolation=cv2.INTER_LINEAR)
 
         # 6 panels: RGB | GT Depth | Geom Depth | Oracle Pred | Rendered Pred | Error Map
         panels = [
-            upscale(rgb_small, S, cv2.INTER_LINEAR),
+            rgb_display,
             upscale(depth_to_colormap(gt_depth_feat, vmin, vmax), S),
         ]
 
@@ -781,35 +804,32 @@ def main():
 
     # ── Step 5: Segmentation visualization ───────────────────────────────────
     print("\n[5/7] Generating segmentation visualizations...")
+    tH, tW = fH * S, fW * S  # display resolution (e.g. 480×640)
     for j, idx in enumerate(vis_indices):
         spath = sem_dir / f"semantic_class_{idx}.png"
         sem_raw = cv2.imread(str(spath), cv2.IMREAD_GRAYSCALE)
         if sem_raw is None:
             continue
-        gt_sem = cv2.resize(sem_raw, (fW, fH), interpolation=cv2.INTER_NEAREST)
+        # Work at display resolution for smooth boundaries
+        gt_sem_hr = cv2.resize(sem_raw, (tW, tH), interpolation=cv2.INTER_NEAREST)
 
-        oracle_seg = predict_seg(oracle_seg_probe, gt_feats[j], fH, fW)
-        rend_seg = predict_seg(rend_seg_probe, rend_feats[j], fH, fW)
+        oracle_seg_hr = predict_seg_smooth(oracle_seg_probe, gt_feats[j], fH, fW, tH, tW)
+        rend_seg_hr = predict_seg_smooth(rend_seg_probe, rend_feats[j], fH, fW, tH, tW)
 
         rgb = cv2.imread(str(rgb_dir / f"rgb_{idx}.png"))
         rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
-        rgb_small = cv2.resize(rgb, (fW, fH))
+        rgb_hr = cv2.resize(rgb, (tW, tH))
 
         alpha = 0.6
-        gt_seg_rgb = seg_to_color(gt_sem)
-        oracle_seg_rgb = seg_to_color(oracle_seg)
-        rend_seg_rgb = seg_to_color(rend_seg)
+        gt_blend = (alpha * seg_to_color(gt_sem_hr) + (1 - alpha) * rgb_hr).astype(np.uint8)
+        oracle_blend = (alpha * seg_to_color(oracle_seg_hr) + (1 - alpha) * rgb_hr).astype(np.uint8)
+        rend_blend = (alpha * seg_to_color(rend_seg_hr) + (1 - alpha) * rgb_hr).astype(np.uint8)
 
-        gt_blend = (alpha * gt_seg_rgb + (1 - alpha) * rgb_small).astype(np.uint8)
-        oracle_blend = (alpha * oracle_seg_rgb + (1 - alpha) * rgb_small).astype(np.uint8)
-        rend_blend = (alpha * rend_seg_rgb + (1 - alpha) * rgb_small).astype(np.uint8)
-
-        # Segmentation masks use INTER_NEAREST to preserve class boundaries
         panels = [
-            upscale(rgb_small, S, cv2.INTER_LINEAR),
-            upscale(gt_blend, S, cv2.INTER_NEAREST),
-            upscale(oracle_blend, S, cv2.INTER_NEAREST),
-            upscale(rend_blend, S, cv2.INTER_NEAREST),
+            cv2.resize(rgb, (tW, tH)),
+            gt_blend,
+            oracle_blend,
+            rend_blend,
         ]
 
         labels = ["Input RGB", "GT Segmentation", "Oracle Pred", "Rendered Pred"]
@@ -828,18 +848,14 @@ def main():
         sem_raw = cv2.imread(str(spath), cv2.IMREAD_GRAYSCALE)
         if sem_raw is None:
             continue
-        gt_sem = cv2.resize(sem_raw, (fW, fH), interpolation=cv2.INTER_NEAREST)
-        r_seg = predict_seg(rend_seg_probe, rend_feats[j], fH, fW)
+        gt_sem_hr = cv2.resize(sem_raw, (tW, tH), interpolation=cv2.INTER_NEAREST)
+        r_seg_hr = predict_seg_smooth(rend_seg_probe, rend_feats[j], fH, fW, tH, tW)
         rgb = cv2.imread(str(rgb_dir / f"rgb_{idx}.png"))
         rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
-        rgb_s = cv2.resize(rgb, (fW, fH))
-        gt_blend = (0.6 * seg_to_color(gt_sem) + 0.4 * rgb_s).astype(np.uint8)
-        rend_blend = (0.6 * seg_to_color(r_seg) + 0.4 * rgb_s).astype(np.uint8)
-        panels = [
-            upscale(rgb_s, S, cv2.INTER_LINEAR),
-            upscale(gt_blend, S, cv2.INTER_NEAREST),
-            upscale(rend_blend, S, cv2.INTER_NEAREST),
-        ]
+        rgb_hr = cv2.resize(rgb, (tW, tH))
+        gt_blend = (0.6 * seg_to_color(gt_sem_hr) + 0.4 * rgb_hr).astype(np.uint8)
+        rend_blend = (0.6 * seg_to_color(r_seg_hr) + 0.4 * rgb_hr).astype(np.uint8)
+        panels = [rgb_hr, gt_blend, rend_blend]
         grid_rows.append(hconcat_with_border(panels, border=2))
 
     if grid_rows:
@@ -892,12 +908,14 @@ def main():
             sem_raw = cv2.imread(str(spath), cv2.IMREAD_GRAYSCALE)
             if sem_raw is not None:
                 gt_sem = cv2.resize(sem_raw, (fW, fH), interpolation=cv2.INTER_NEAREST)
+                gt_sem_hr = cv2.resize(sem_raw, (tW, tH), interpolation=cv2.INTER_NEAREST)
             else:
                 gt_sem = None
+                gt_sem_hr = None
 
             rgb = cv2.imread(str(rgb_dir / f"rgb_{idx}.png"))
             rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
-            rgb_small = cv2.resize(rgb, (fW, fH))
+            rgb_hr = cv2.resize(rgb, (tW, tH), interpolation=cv2.INTER_LINEAR)
 
             # Per-query rows: GT Semantic Mask | GT Heatmap | Rendered Heatmap
             query_rows = []
@@ -915,70 +933,69 @@ def main():
                 gt_norm = _normalize(gt_h)
                 rend_norm = _normalize(rend_h)
 
+                # Upscale heatmaps to display resolution (bilinear for smooth gradients)
+                gt_norm_hr = cv2.resize(gt_norm, (tW, tH), interpolation=cv2.INTER_LINEAR)
+                rend_norm_hr = cv2.resize(rend_norm, (tW, tH), interpolation=cv2.INTER_LINEAR)
+
                 gt_color = cv2.applyColorMap(
-                    (gt_norm * 255).astype(np.uint8), cv2.COLORMAP_JET)
+                    (gt_norm_hr * 255).astype(np.uint8), cv2.COLORMAP_JET)
                 gt_color = cv2.cvtColor(gt_color, cv2.COLOR_BGR2RGB)
                 rend_color = cv2.applyColorMap(
-                    (rend_norm * 255).astype(np.uint8), cv2.COLORMAP_JET)
+                    (rend_norm_hr * 255).astype(np.uint8), cv2.COLORMAP_JET)
                 rend_color = cv2.cvtColor(rend_color, cv2.COLOR_BGR2RGB)
 
-                # GT semantic mask for this class
-                if gt_sem is not None and qname in name_to_cid:
+                # GT semantic mask for this class (at display resolution)
+                if gt_sem_hr is not None and qname in name_to_cid:
                     cid = name_to_cid[qname]
-                    mask = (gt_sem == cid).astype(np.uint8)
-                    mask_vis = np.zeros((fH, fW, 3), dtype=np.uint8)
+                    mask = (gt_sem_hr == cid).astype(np.uint8)
+                    mask_vis = np.zeros((tH, tW, 3), dtype=np.uint8)
                     mask_vis[mask > 0] = (0, 255, 100)
-                    mask_blend = (0.5 * mask_vis + 0.5 * rgb_small).astype(np.uint8)
+                    mask_blend = (0.5 * mask_vis + 0.5 * rgb_hr).astype(np.uint8)
                 else:
-                    mask_blend = np.zeros_like(rgb_small)
+                    mask_blend = np.zeros_like(rgb_hr)
 
-                # Heatmap overlays on RGB
-                gt_overlay = (0.5 * gt_color + 0.5 * rgb_small).astype(np.uint8)
-                rend_overlay = (0.5 * rend_color + 0.5 * rgb_small).astype(np.uint8)
+                # Heatmap overlays on RGB (at display resolution)
+                gt_overlay = (0.5 * gt_color + 0.5 * rgb_hr).astype(np.uint8)
+                rend_overlay = (0.5 * rend_color + 0.5 * rgb_hr).astype(np.uint8)
 
-                panels = [
-                    upscale(mask_blend, S, cv2.INTER_NEAREST),
-                    upscale(gt_overlay, S),
-                    upscale(rend_overlay, S),
-                ]
+                panels = [mask_blend, gt_overlay, rend_overlay]
                 panels[0] = add_text(panels[0], qname, pos=(5, 20), font_scale=0.55)
                 query_rows.append(hconcat_with_border(panels, border=2))
 
             if query_rows:
                 header = make_header(
                     ["GT Semantic Mask", "GT Heatmap", "Rendered Heatmap"],
-                    fW * S, height=28, border=2)
-                rgb_up = upscale(rgb_small, S, cv2.INTER_LINEAR)
-                rgb_labeled = add_text(rgb_up, f"Frame {idx}", pos=(5, 20), font_scale=0.55)
-                rgb_row = np.zeros((rgb_up.shape[0], header.shape[1], 3), dtype=np.uint8)
-                x_off = (rgb_row.shape[1] - rgb_up.shape[1]) // 2
-                rgb_row[:, x_off:x_off + rgb_up.shape[1]] = rgb_labeled
+                    tW, height=28, border=2)
+                rgb_labeled = add_text(rgb_hr.copy(), f"Frame {idx}", pos=(5, 20), font_scale=0.55)
+                rgb_row = np.zeros((rgb_hr.shape[0], header.shape[1], 3), dtype=np.uint8)
+                x_off = (rgb_row.shape[1] - rgb_hr.shape[1]) // 2
+                rgb_row[:, x_off:x_off + rgb_hr.shape[1]] = rgb_labeled
 
                 full = vconcat_with_border([rgb_row, header] + query_rows, border=2)
                 save_path = dirs["grounding"] / f"grounding_frame_{idx:04d}.png"
                 cv2.imwrite(str(save_path), cv2.cvtColor(full, cv2.COLOR_RGB2BGR))
 
             # ── Zero-shot segmentation from softmax grounding ────────────
-            rend_seg_map = rend_probs.argmax(dim=0).cpu().numpy()  # [H, W]
-            rend_seg_vis = np.zeros((fH, fW, 3), dtype=np.uint8)
+            # Upscale grounding probabilities bilinearly before argmax
+            rend_probs_hr = F.interpolate(
+                rend_probs.unsqueeze(0), (tH, tW), mode="bilinear", align_corners=False
+            ).squeeze(0)
+            rend_seg_map = rend_probs_hr.argmax(dim=0).cpu().numpy()  # [tH, tW]
+            rend_seg_vis = np.zeros((tH, tW, 3), dtype=np.uint8)
             for qi in range(len(active_queries)):
                 rend_seg_vis[rend_seg_map == qi] = query_colors[qi]
 
-            # GT semantic mask restricted to active query classes
-            if gt_sem is not None:
-                gt_seg_vis = np.zeros((fH, fW, 3), dtype=np.uint8)
+            # GT semantic mask restricted to active query classes (display resolution)
+            if gt_sem_hr is not None:
+                gt_seg_vis = np.zeros((tH, tW, 3), dtype=np.uint8)
                 for qi, qname in enumerate(active_queries):
                     if qname in name_to_cid:
                         cid = name_to_cid[qname]
-                        gt_seg_vis[gt_sem == cid] = query_colors[qi]
+                        gt_seg_vis[gt_sem_hr == cid] = query_colors[qi]
             else:
-                gt_seg_vis = np.zeros((fH, fW, 3), dtype=np.uint8)
+                gt_seg_vis = np.zeros((tH, tW, 3), dtype=np.uint8)
 
-            panels = [
-                upscale(rgb_small, S, cv2.INTER_LINEAR),
-                upscale(gt_seg_vis, S, cv2.INTER_NEAREST),
-                upscale(rend_seg_vis, S, cv2.INTER_NEAREST),
-            ]
+            panels = [rgb_hr, gt_seg_vis, rend_seg_vis]
             seg_labels = ["RGB", "GT Seg (queries)", "Softmax Seg"]
             for k, label in enumerate(seg_labels):
                 panels[k] = add_text(panels[k], label, pos=(5, 20), font_scale=0.5)
@@ -1009,6 +1026,8 @@ def main():
         rgb = cv2.imread(str(rgb_dir / f"rgb_{idx}.png"))
         rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
         rgb_small = cv2.resize(rgb, (fW, fH))
+        tH_c, tW_c = fH * S, fW * S
+        rgb_display = cv2.resize(rgb, (tW_c, tH_c), interpolation=cv2.INTER_LINEAR)
 
         # PCA
         cos = F.cosine_similarity(
@@ -1048,18 +1067,17 @@ def main():
             rend_depth_panel = np.zeros((h_, w_, 3), dtype=np.uint8)
             geom_depth_panel = np.zeros((h_, w_, 3), dtype=np.uint8)
 
-        # Segmentation
+        # Segmentation (smooth: upscale logits before argmax)
         spath = sem_dir / f"semantic_class_{idx}.png"
         sem_raw_img = cv2.imread(str(spath), cv2.IMREAD_GRAYSCALE)
         if sem_raw_img is not None:
-            gt_sem = cv2.resize(sem_raw_img, (fW, fH), interpolation=cv2.INTER_NEAREST)
-            r_seg = predict_seg(rend_seg_probe, rend_feats[j], fH, fW)
-            gt_seg_panel = upscale(
-                (0.6 * seg_to_color(gt_sem) + 0.4 * rgb_small).astype(np.uint8),
-                S, cv2.INTER_NEAREST)
-            rend_seg_panel = upscale(
-                (0.6 * seg_to_color(r_seg) + 0.4 * rgb_small).astype(np.uint8),
-                S, cv2.INTER_NEAREST)
+            gt_sem_hr = cv2.resize(sem_raw_img, (tW, tH), interpolation=cv2.INTER_NEAREST)
+            r_seg_hr = predict_seg_smooth(rend_seg_probe, rend_feats[j], fH, fW, tH, tW)
+            rgb_hr = cv2.resize(
+                cv2.cvtColor(cv2.imread(str(rgb_dir / f"rgb_{idx}.png")), cv2.COLOR_BGR2RGB),
+                (tW, tH))
+            gt_seg_panel = (0.6 * seg_to_color(gt_sem_hr) + 0.4 * rgb_hr).astype(np.uint8)
+            rend_seg_panel = (0.6 * seg_to_color(r_seg_hr) + 0.4 * rgb_hr).astype(np.uint8)
         else:
             h_, w_ = fH * S, fW * S
             gt_seg_panel = np.zeros((h_, w_, 3), dtype=np.uint8)
@@ -1070,7 +1088,7 @@ def main():
         # Row 2: Cos | (blank)     | Rend Depth | (blank)    | Rend Seg
         cell_w = fW * S
         cell_h = fH * S
-        rgb_panel = upscale(rgb_small, S, cv2.INTER_LINEAR)
+        rgb_panel = rgb_display
         blank = np.zeros((cell_h, cell_w, 3), dtype=np.uint8)
 
         row1_panels = [rgb_panel, pca_panel, gt_depth_panel,
