@@ -125,7 +125,7 @@ def load_pipeline(config_path, checkpoint_path):
 
 
 def render_features(model, codec, renderer, sharpener, refiner, config, viewmat):
-    """Render and decode 1280d features for a single view."""
+    """Render and decode 1280d features + geometry depth for a single view."""
     self_guided = getattr(config, "self_guided", False)
     with torch.no_grad():
         if self_guided:
@@ -137,11 +137,15 @@ def render_features(model, codec, renderer, sharpener, refiner, config, viewmat)
             result = renderer.render_features_batch(model, viewmat)
             latent = result["feature_map"]
             rgb_guide = None
+
+        geom_depth = result.get("depth_map", None)
+        alpha_map = result.get("alpha_map", None)
+
         latent = sharpener(latent)
         if refiner is not None:
             latent = refiner(latent, guide=rgb_guide)
         decoded = codec.decoder(latent)
-    return decoded  # [1, 1280, H, W]
+    return decoded, geom_depth, alpha_map  # [1, 1280, H, W], [fH, fW], [fH, fW]
 
 
 # ── Visualization helpers ─────────────────────────────────────────────────────
@@ -217,7 +221,7 @@ def seg_to_color(seg_map, color_map=None):
     return rgb
 
 
-def upscale(img, scale, interp=cv2.INTER_NEAREST):
+def upscale(img, scale, interp=cv2.INTER_LINEAR):
     """Upscale image by integer factor."""
     h, w = img.shape[:2]
     return cv2.resize(img, (w * scale, h * scale), interpolation=interp)
@@ -391,24 +395,33 @@ def load_siglip2_projection(projection_weights):
     return proj.to(device).half().eval()
 
 
-def compute_grounding_heatmaps(features_1280, proj_model, text_emb):
-    """Compute text grounding heatmaps.
+def compute_grounding_heatmaps(features_1280, proj_model, text_emb, temperature=0.07):
+    """Compute text grounding heatmaps with softmax normalization.
 
     Args:
         features_1280: [1, 1280, H, W]
         proj_model: SigLIP2 projection
         text_emb: [K, 1536] normalized text embeddings
+        temperature: softmax temperature for cross-query normalization
 
     Returns:
-        [K, H, W] similarity heatmaps
+        raw_sim: [K, H, W] raw cosine similarity heatmaps
+        softmax_probs: [K, H, W] softmax-normalized probabilities across queries
     """
     B, C, H, W = features_1280.shape
     feat_flat = features_1280.reshape(B, C, H * W).permute(0, 2, 1)
     with torch.no_grad():
         siglip = proj_model(feat_flat.half())
     siglip = F.normalize(siglip, dim=-1).squeeze(0)  # [HW, 1536]
-    sim = text_emb @ siglip.T  # [K, HW]
-    return sim.float().reshape(-1, H, W)
+    raw_sim = text_emb @ siglip.T  # [K, HW]
+    raw_sim = raw_sim.float().reshape(-1, H, W)
+
+    # Softmax across queries per pixel for zero-shot segmentation
+    sim_flat = raw_sim.reshape(raw_sim.shape[0], -1)  # [K, HW]
+    probs = F.softmax(sim_flat / temperature, dim=0)  # softmax across K queries
+    probs = probs.reshape(raw_sim.shape)  # [K, H, W]
+
+    return raw_sim, probs
 
 
 # ── Main visualization ────────────────────────────────────────────────────────
@@ -422,7 +435,7 @@ def main():
                         help="Number of novel-view frames to visualize")
     parser.add_argument("--n_train", type=int, default=200,
                         help="Number of training frames for probes")
-    parser.add_argument("--scale", type=int, default=8,
+    parser.add_argument("--scale", type=int, default=16,
                         help="Upscale factor for feature-resolution images")
     parser.add_argument("--text_embeddings",
                         default="output/radio_gs/siglip2_text_embeddings.pt")
@@ -472,7 +485,7 @@ def main():
 
     # ── Step 1: Render all features ──────────────────────────────────────────
     print("\n[1/6] Rendering decoded features for visualization frames...")
-    gt_feats, rend_feats = [], []
+    gt_feats, rend_feats, geom_depths = [], [], []
     with torch.no_grad():
         for i in tqdm(vis_indices, desc="Rendering"):
             gt = torch.load(gt_feat_dir / f"rgb_{i}.pt", map_location="cpu").float()
@@ -481,9 +494,13 @@ def main():
             gt_feats.append(gt)
 
             pose = torch.from_numpy(all_w2c[i:i + 1]).to(device)
-            decoded = render_features(model, codec, renderer, sharpener, refiner,
-                                      config, pose)
+            decoded, geom_depth, alpha_map = render_features(
+                model, codec, renderer, sharpener, refiner, config, pose)
             rend_feats.append(decoded.squeeze(0).cpu())
+            if geom_depth is not None:
+                geom_depths.append(geom_depth.cpu().numpy())
+            else:
+                geom_depths.append(None)
 
     # ── Step 2: Train probes on training data ────────────────────────────────
     print("\n[2/6] Training linear probes on training split features...")
@@ -508,7 +525,7 @@ def main():
             train_gt_feats.append(gt)
 
             pose = torch.from_numpy(train_w2c[i:i + 1]).to(device)
-            decoded = render_features(model, codec, renderer, sharpener, refiner,
+            decoded, _, _ = render_features(model, codec, renderer, sharpener, refiner,
                                       config, pose)
             train_rend_feats.append(decoded.squeeze(0).cpu())
 
@@ -605,6 +622,17 @@ def main():
         # Rendered prediction
         rend_pred = predict_depth(rend_depth_probe, rend_feats[j], fH, fW)
 
+        # Geometry depth from 3DGS
+        geom_d = geom_depths[j]
+        if geom_d is not None:
+            if geom_d.ndim == 2 and geom_d.shape == (fH, fW):
+                geom_depth_vis = geom_d
+            else:
+                geom_depth_vis = cv2.resize(geom_d.squeeze(), (fW, fH),
+                                            interpolation=cv2.INTER_LINEAR)
+        else:
+            geom_depth_vis = np.zeros((fH, fW), dtype=np.float32)
+
         rgb = cv2.imread(str(rgb_dir / f"rgb_{idx}.png"))
         rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
         rgb_small = cv2.resize(rgb, (fW, fH))
@@ -612,14 +640,14 @@ def main():
         panels = [
             upscale(rgb_small, S, cv2.INTER_LINEAR),
             upscale(depth_to_colormap(gt_depth_feat, vmin, vmax), S),
+            upscale(depth_to_colormap(geom_depth_vis, vmin, vmax), S),
             upscale(depth_to_colormap(oracle_pred, vmin, vmax), S),
             upscale(depth_to_colormap(rend_pred, vmin, vmax), S),
-            upscale(depth_error_map(oracle_pred, gt_depth_feat), S),
             upscale(depth_error_map(rend_pred, gt_depth_feat), S),
         ]
 
-        labels = ["Input RGB", "GT Depth", "Oracle Pred", "Rendered Pred",
-                   "Oracle Error", "Rendered Error"]
+        labels = ["Input RGB", "GT Depth", "Geom Depth", "Oracle Pred",
+                   "Rendered Pred", "Rendered Error"]
         for k, label in enumerate(labels):
             panels[k] = add_text(panels[k], label, pos=(5, 20), font_scale=0.5)
 
@@ -639,20 +667,29 @@ def main():
         gt_d_f = cv2.resize(gt_d, (fW, fH), interpolation=cv2.INTER_LINEAR)
         vmin = gt_d_f[gt_d_f > 0.01].min() if (gt_d_f > 0.01).any() else 0
         vmax = gt_d_f.max()
-        o_pred = predict_depth(oracle_depth_probe, gt_feats[j], fH, fW)
         r_pred = predict_depth(rend_depth_probe, rend_feats[j], fH, fW)
+        geom_d = geom_depths[j]
+        if geom_d is not None:
+            if geom_d.ndim == 2 and geom_d.shape == (fH, fW):
+                geom_d_vis = geom_d
+            else:
+                geom_d_vis = cv2.resize(geom_d.squeeze(), (fW, fH),
+                                        interpolation=cv2.INTER_LINEAR)
+        else:
+            geom_d_vis = np.zeros((fH, fW), dtype=np.float32)
         rgb = cv2.imread(str(rgb_dir / f"rgb_{idx}.png"))
         rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
         panels = [
             upscale(cv2.resize(rgb, (fW, fH)), S, cv2.INTER_LINEAR),
             upscale(depth_to_colormap(gt_d_f, vmin, vmax), S),
+            upscale(depth_to_colormap(geom_d_vis, vmin, vmax), S),
             upscale(depth_to_colormap(r_pred, vmin, vmax), S),
             upscale(depth_error_map(r_pred, gt_d_f), S),
         ]
         grid_rows.append(hconcat_with_border(panels, border=2))
 
     if grid_rows:
-        header = make_header(["Input RGB", "GT Depth", "Rendered Pred", "Error Map"],
+        header = make_header(["Input RGB", "GT Depth", "Geom Depth", "Rendered Pred", "Error Map"],
                              fW * S, height=30, border=2)
         full_grid = vconcat_with_border([header] + grid_rows, border=2)
         cv2.imwrite(str(dirs["depth"] / "depth_grid.png"),
@@ -687,9 +724,9 @@ def main():
 
         panels = [
             upscale(rgb_small, S, cv2.INTER_LINEAR),
-            upscale(gt_blend, S),
-            upscale(oracle_blend, S),
-            upscale(rend_blend, S),
+            upscale(gt_blend, S, cv2.INTER_NEAREST),
+            upscale(oracle_blend, S, cv2.INTER_NEAREST),
+            upscale(rend_blend, S, cv2.INTER_NEAREST),
         ]
 
         labels = ["Input RGB", "GT Segmentation", "Oracle Pred", "Rendered Pred"]
@@ -717,8 +754,8 @@ def main():
         rend_blend = (0.6 * seg_to_color(r_seg) + 0.4 * rgb_s).astype(np.uint8)
         panels = [
             upscale(rgb_s, S, cv2.INTER_LINEAR),
-            upscale(gt_blend, S),
-            upscale(rend_blend, S),
+            upscale(gt_blend, S, cv2.INTER_NEAREST),
+            upscale(rend_blend, S, cv2.INTER_NEAREST),
         ]
         grid_rows.append(hconcat_with_border(panels, border=2))
 
@@ -734,6 +771,10 @@ def main():
     print("\n[6/6] Generating text grounding heatmaps...")
     text_emb_path = Path(args.text_embeddings)
     proj_path = Path(args.projection_weights)
+    # Create grounding_seg output dir
+    grounding_seg_dir = out_root / "grounding_seg"
+    grounding_seg_dir.mkdir(parents=True, exist_ok=True)
+
     if text_emb_path.exists() and proj_path.exists():
         text_data = torch.load(str(text_emb_path), map_location="cpu")
         all_queries = text_data["queries"]
@@ -748,14 +789,19 @@ def main():
         # Also get class IDs for mask overlay
         name_to_cid = {v: k for k, v in REPLICA_CLASSES.items()}
 
+        # Assign colors for grounding queries
+        np.random.seed(123)
+        query_colors = {q: tuple(np.random.randint(80, 255, 3).tolist())
+                        for q in active_queries}
+
         print(f"  Active grounding queries: {active_queries}")
 
         for j, idx in enumerate(vis_indices):
             gt_f = gt_feats[j].unsqueeze(0).to(device)
             rend_f = rend_feats[j].unsqueeze(0).to(device)
 
-            gt_hm = compute_grounding_heatmaps(gt_f, proj_model, active_text_emb)
-            rend_hm = compute_grounding_heatmaps(rend_f, proj_model, active_text_emb)
+            gt_raw, gt_probs = compute_grounding_heatmaps(gt_f, proj_model, active_text_emb)
+            rend_raw, rend_probs = compute_grounding_heatmaps(rend_f, proj_model, active_text_emb)
 
             # Load semantic GT for mask overlay
             spath = sem_dir / f"semantic_class_{idx}.png"
@@ -772,18 +818,18 @@ def main():
             # Per-query rows: Query Label | GT Mask | GT Heatmap | Rendered Heatmap
             query_rows = []
             for qi, qname in enumerate(active_queries):
-                gt_h = gt_hm[qi].cpu().numpy()
-                rend_h = rend_hm[qi].cpu().numpy()
+                gt_h = gt_raw[qi].cpu().numpy()
+                rend_h = rend_raw[qi].cpu().numpy()
 
-                # Shared normalization
-                vmin = min(gt_h.min(), rend_h.min())
-                vmax = max(gt_h.max(), rend_h.max())
-                if vmax - vmin > 1e-6:
-                    gt_norm = (gt_h - vmin) / (vmax - vmin)
-                    rend_norm = (rend_h - vmin) / (vmax - vmin)
-                else:
-                    gt_norm = np.zeros_like(gt_h)
-                    rend_norm = np.zeros_like(rend_h)
+                # Per-query min-max normalization (independent for GT and rendered)
+                def per_query_norm(h):
+                    lo, hi = h.min(), h.max()
+                    if hi - lo > 1e-6:
+                        return (h - lo) / (hi - lo)
+                    return np.zeros_like(h)
+
+                gt_norm = per_query_norm(gt_h)
+                rend_norm = per_query_norm(rend_h)
 
                 gt_color = cv2.applyColorMap((gt_norm * 255).astype(np.uint8), cv2.COLORMAP_JET)
                 gt_color = cv2.cvtColor(gt_color, cv2.COLOR_BGR2RGB)
@@ -805,7 +851,7 @@ def main():
                 rend_overlay = (0.5 * rend_color + 0.5 * rgb_small).astype(np.uint8)
 
                 panels = [
-                    upscale(mask_blend, S),
+                    upscale(mask_blend, S, cv2.INTER_NEAREST),
                     upscale(gt_overlay, S),
                     upscale(rend_overlay, S),
                 ]
@@ -820,13 +866,39 @@ def main():
                 rgb_up = upscale(rgb_small, S, cv2.INTER_LINEAR)
                 rgb_labeled = add_text(rgb_up, f"Frame {idx}", pos=(5, 20), font_scale=0.55)
                 rgb_row = np.zeros((rgb_up.shape[0], header.shape[1], 3), dtype=np.uint8)
-                # Center the RGB panel
                 x_off = (rgb_row.shape[1] - rgb_up.shape[1]) // 2
                 rgb_row[:, x_off:x_off + rgb_up.shape[1]] = rgb_labeled
 
                 full = vconcat_with_border([rgb_row, header] + query_rows, border=2)
                 save_path = dirs["grounding"] / f"grounding_frame_{idx:04d}.png"
                 cv2.imwrite(str(save_path), cv2.cvtColor(full, cv2.COLOR_RGB2BGR))
+
+            # ── Zero-shot segmentation from softmax grounding ──
+            rend_seg_argmax = rend_probs.argmax(dim=0).cpu().numpy()  # [H, W]
+            rend_seg_color = np.zeros((fH, fW, 3), dtype=np.uint8)
+            for qi, qname in enumerate(active_queries):
+                mask = rend_seg_argmax == qi
+                if mask.any():
+                    rend_seg_color[mask] = query_colors[qname]
+
+            gt_seg_argmax = gt_probs.argmax(dim=0).cpu().numpy()
+            gt_seg_color = np.zeros((fH, fW, 3), dtype=np.uint8)
+            for qi, qname in enumerate(active_queries):
+                mask = gt_seg_argmax == qi
+                if mask.any():
+                    gt_seg_color[mask] = query_colors[qname]
+
+            panels = [
+                upscale(rgb_small, S, cv2.INTER_LINEAR),
+                upscale((0.5 * gt_seg_color + 0.5 * rgb_small).astype(np.uint8), S, cv2.INTER_NEAREST),
+                upscale((0.5 * rend_seg_color + 0.5 * rgb_small).astype(np.uint8), S, cv2.INTER_NEAREST),
+            ]
+            labels_seg = ["Input RGB", "GT Softmax Seg", "Rendered Softmax Seg"]
+            for k, label in enumerate(labels_seg):
+                panels[k] = add_text(panels[k], label, pos=(5, 20), font_scale=0.5)
+            row = hconcat_with_border(panels, border=3)
+            cv2.imwrite(str(grounding_seg_dir / f"grounding_seg_{idx:04d}.png"),
+                        cv2.cvtColor(row, cv2.COLOR_RGB2BGR))
 
         print(f"  Saved grounding visualizations for {len(vis_indices)} frames")
     else:
@@ -875,20 +947,34 @@ def main():
             gt_seg_panel = np.zeros((h_, w_, 3), dtype=np.uint8)
             rend_seg_panel = np.zeros((h_, w_, 3), dtype=np.uint8)
 
-        # Layout: 2 rows × 4 cols
-        # Row 1: RGB | Feature PCA | GT Depth | GT Seg
-        # Row 2: Cosine Sim | (blank/label) | Rendered Depth | Rendered Seg
+        # Layout: 2 rows × 5 cols
+        # Row 1: RGB | Feature PCA | GT Depth | Geom Depth | GT Seg
+        # Row 2: Cosine Sim | (blank) | Rendered Depth | Error | Rendered Seg
         cell_w = fW * S
         cell_h = fH * S
         rgb_panel = upscale(rgb_small, S, cv2.INTER_LINEAR)
 
-        row1_panels = [rgb_panel, pca_panel, gt_depth_panel, gt_seg_panel]
-        row1_labels = ["Input RGB", "Feature PCA", "GT Depth", "GT Segmentation"]
-        row2_panels = [cos_panel, np.zeros((cell_h, cell_w, 3), dtype=np.uint8),
-                       rend_depth_panel, rend_seg_panel]
-        row2_labels = [f"Cosine (mean={cos.mean():.3f})", "", "Pred Depth", "Pred Segmentation"]
+        # Geometry depth
+        geom_d = geom_depths[j]
+        if d_raw is not None and geom_d is not None:
+            if geom_d.ndim == 2 and geom_d.shape == (fH, fW):
+                geom_d_vis = geom_d
+            else:
+                geom_d_vis = cv2.resize(geom_d.squeeze(), (fW, fH),
+                                        interpolation=cv2.INTER_LINEAR)
+            geom_depth_panel = upscale(depth_to_colormap(geom_d_vis, vmin_d, vmax_d), S)
+        else:
+            geom_depth_panel = np.zeros((cell_h, cell_w, 3), dtype=np.uint8)
 
-        for k in range(4):
+        row1_panels = [rgb_panel, pca_panel, gt_depth_panel, geom_depth_panel, gt_seg_panel]
+        row1_labels = ["Input RGB", "Feature PCA", "GT Depth", "Geom Depth", "GT Segmentation"]
+        row2_panels = [cos_panel, np.zeros((cell_h, cell_w, 3), dtype=np.uint8),
+                       rend_depth_panel,
+                       upscale(depth_error_map(r_depth, gt_d_f), S) if d_raw is not None else np.zeros((cell_h, cell_w, 3), dtype=np.uint8),
+                       rend_seg_panel]
+        row2_labels = [f"Cosine ({cos.mean():.3f})", "", "Pred Depth", "Depth Error", "Pred Seg"]
+
+        for k in range(5):
             row1_panels[k] = add_text(row1_panels[k], row1_labels[k], font_scale=0.45)
             if row2_labels[k]:
                 row2_panels[k] = add_text(row2_panels[k], row2_labels[k], font_scale=0.45)
