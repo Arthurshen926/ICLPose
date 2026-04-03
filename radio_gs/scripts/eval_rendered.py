@@ -24,6 +24,37 @@ from radio_gs.rendering.feature_renderer import FeatureFieldRenderer
 device = torch.device("cuda")
 
 
+def _build_probe(in_dim, out_dim, hidden=256):
+    """Build a 2-layer MLP probe (much better than linear for harder scenes)."""
+    return nn.Sequential(
+        nn.Linear(in_dim, hidden),
+        nn.ReLU(),
+        nn.Linear(hidden, out_dim),
+    )
+
+
+def _train_probe(probe, train_X, train_Y, epochs=300, batch_size=16384,
+                 lr=1e-3, task="regression", class_weights=None):
+    """Train probe with mini-batch SGD. task='regression' or 'classification'."""
+    probe.to(device).train()
+    opt = torch.optim.Adam(probe.parameters(), lr=lr, weight_decay=1e-5)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+    n = train_X.shape[0]
+    for ep in range(epochs):
+        idx = torch.randint(0, n, (min(batch_size, n),))
+        pred = probe(train_X[idx])
+        if task == "regression":
+            loss = F.l1_loss(pred.squeeze(), train_Y[idx])
+        else:
+            loss = F.cross_entropy(pred, train_Y[idx], weight=class_weights)
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        scheduler.step()
+    probe.eval()
+    return probe
+
+
 def load_model_and_render(config_path, checkpoint_path):
     """Load trained model and render 1280d features for all frames."""
     config = load_config(config_path)
@@ -239,15 +270,10 @@ def eval_depth(train_features, train_depth_dir, val_features, val_depth_dir, fH=
     train_X = torch.cat(train_X, 0).to(device)
     train_Y = torch.cat(train_Y, 0).to(device)
     
-    probe = nn.Linear(train_X.shape[1], 1).to(device)
-    opt = torch.optim.Adam(probe.parameters(), lr=1e-3)
-    for ep in range(100):
-        pred = probe(train_X).squeeze()
-        loss = F.l1_loss(pred, train_Y)
-        opt.zero_grad(); loss.backward(); opt.step()
+    probe = _build_probe(train_X.shape[1], 1)
+    _train_probe(probe, train_X, train_Y, epochs=300, task="regression")
     
     # Evaluate
-    probe.eval()
     abs_rels, rmses, delta1s = [], [], []
     with torch.no_grad():
         for i, feat in enumerate(val_features):
@@ -301,17 +327,27 @@ def eval_segmentation(train_features, train_sem_dir, val_features, val_sem_dir, 
     
     train_X = torch.cat(train_X, 0).to(device)
     train_Y = torch.cat(train_Y, 0).to(device)
-    n_classes = int(train_Y.max().item()) + 1
     
-    probe = nn.Linear(train_X.shape[1], n_classes).to(device)
-    opt = torch.optim.Adam(probe.parameters(), lr=1e-3)
-    for ep in range(200):
-        logits = probe(train_X)
-        loss = F.cross_entropy(logits, train_Y)
-        opt.zero_grad(); loss.backward(); opt.step()
+    # Remap sparse class IDs to contiguous [0, N-1]
+    unique_classes = torch.unique(train_Y).tolist()
+    id_to_contiguous = {c: i for i, c in enumerate(unique_classes)}
+    contiguous_to_id = {i: c for c, i in id_to_contiguous.items()}
+    train_Y = torch.tensor([id_to_contiguous[y.item()] for y in train_Y], 
+                           dtype=torch.long, device=device)
+    n_classes = len(unique_classes)
+    print(f"  Seg: {n_classes} active classes (remapped from max_id={max(unique_classes)})")
+    
+    # Compute class weights for imbalanced datasets
+    counts = torch.bincount(train_Y, minlength=n_classes).float()
+    counts = counts.clamp(min=1)
+    weights = (1.0 / counts)
+    weights = (weights / weights.sum() * n_classes).to(device)
+    
+    probe = _build_probe(train_X.shape[1], n_classes)
+    _train_probe(probe, train_X, train_Y, epochs=500, task="classification",
+                 class_weights=weights)
     
     # Evaluate
-    probe.eval()
     all_preds, all_gts = [], []
     with torch.no_grad():
         for i, feat in enumerate(val_features):
@@ -323,15 +359,18 @@ def eval_segmentation(train_features, train_sem_dir, val_features, val_sem_dir, 
                 continue
             sem = torch.from_numpy(sem.astype(np.int64))
             sem = F.interpolate(sem.float().unsqueeze(0).unsqueeze(0), (fH, fW), mode="nearest").squeeze().long()
-            sem = sem.clamp(0, n_classes - 1)
+            sem_remapped = torch.full_like(sem, -1)
+            for orig_id, cont_id in id_to_contiguous.items():
+                sem_remapped[sem == orig_id] = cont_id
             C = feat.shape[0]
             if feat.shape[1:] != (fH, fW):
                 feat_r = F.interpolate(feat.unsqueeze(0).to(device), (fH, fW), mode="bilinear", align_corners=False).squeeze(0)
             else:
                 feat_r = feat.to(device)
             pred = probe(feat_r.reshape(C, -1).T).argmax(1).reshape(fH, fW).cpu()
-            all_preds.append(pred.reshape(-1))
-            all_gts.append(sem.reshape(-1))
+            valid = sem_remapped >= 0
+            all_preds.append(pred[valid].reshape(-1))
+            all_gts.append(sem_remapped[valid].reshape(-1))
     
     all_preds = torch.cat(all_preds)
     all_gts = torch.cat(all_gts)
@@ -709,14 +748,9 @@ def eval_depth_indexed(train_feats, train_idx, depth_dir, val_feats, val_idx, va
     train_X = torch.cat(train_X, 0).to(device)
     train_Y = torch.cat(train_Y, 0).to(device)
     
-    probe = nn.Linear(train_X.shape[1], 1).to(device)
-    opt = torch.optim.Adam(probe.parameters(), lr=1e-3)
-    for ep in range(100):
-        pred = probe(train_X).squeeze()
-        loss = F.l1_loss(pred, train_Y)
-        opt.zero_grad(); loss.backward(); opt.step()
+    probe = _build_probe(train_X.shape[1], 1)
+    _train_probe(probe, train_X, train_Y, epochs=300, task="regression")
     
-    probe.eval()
     abs_rels, rmses, delta1s = [], [], []
     with torch.no_grad():
         for feat, (ddir, i) in zip(val_feats, _val_pairs):
@@ -773,16 +807,23 @@ def eval_seg_indexed(train_feats, train_idx, sem_dir, val_feats, val_idx, val_se
     
     train_X = torch.cat(train_X, 0).to(device)
     train_Y = torch.cat(train_Y, 0).to(device)
-    n_classes = int(train_Y.max().item()) + 1
     
-    probe = nn.Linear(train_X.shape[1], n_classes).to(device)
-    opt = torch.optim.Adam(probe.parameters(), lr=1e-3)
-    for ep in range(200):
-        logits = probe(train_X)
-        loss = F.cross_entropy(logits, train_Y)
-        opt.zero_grad(); loss.backward(); opt.step()
+    # Remap sparse class IDs to contiguous [0, N-1]
+    unique_classes = torch.unique(train_Y).tolist()
+    id_to_contiguous = {c: i for i, c in enumerate(unique_classes)}
+    train_Y = torch.tensor([id_to_contiguous[y.item()] for y in train_Y],
+                           dtype=torch.long, device=device)
+    n_classes = len(unique_classes)
+    print(f"  Seg: {n_classes} active classes (remapped from max_id={max(unique_classes)})")
     
-    probe.eval()
+    counts = torch.bincount(train_Y, minlength=n_classes).float().clamp(min=1)
+    weights = (1.0 / counts)
+    weights = (weights / weights.sum() * n_classes).to(device)
+    
+    probe = _build_probe(train_X.shape[1], n_classes)
+    _train_probe(probe, train_X, train_Y, epochs=500, task="classification",
+                 class_weights=weights)
+    
     all_preds, all_gts = [], []
     with torch.no_grad():
         for feat, (sdir, i) in zip(val_feats, _val_pairs):
@@ -794,15 +835,18 @@ def eval_seg_indexed(train_feats, train_idx, sem_dir, val_feats, val_idx, val_se
                 continue
             sem = torch.from_numpy(sem.astype(np.int64))
             sem = F.interpolate(sem.float().unsqueeze(0).unsqueeze(0), (fH, fW), mode="nearest").squeeze().long()
-            sem = sem.clamp(0, n_classes - 1)
+            sem_remapped = torch.full_like(sem, -1)
+            for orig_id, cont_id in id_to_contiguous.items():
+                sem_remapped[sem == orig_id] = cont_id
             C = feat.shape[0]
             if feat.shape[1:] != (fH, fW):
                 feat_r = F.interpolate(feat.unsqueeze(0).to(device), (fH, fW), mode="bilinear", align_corners=False).squeeze(0)
             else:
                 feat_r = feat.to(device)
             pred = probe(feat_r.reshape(C, -1).T).argmax(1).reshape(fH, fW).cpu()
-            all_preds.append(pred.reshape(-1))
-            all_gts.append(sem.reshape(-1))
+            valid = sem_remapped >= 0
+            all_preds.append(pred[valid].reshape(-1))
+            all_gts.append(sem_remapped[valid].reshape(-1))
     
     all_preds = torch.cat(all_preds)
     all_gts = torch.cat(all_gts)
@@ -920,14 +964,9 @@ def eval_fused_depth(train_feats, train_geom, train_idx, train_depth_dir,
     train_X = torch.cat(train_X, 0).to(device)
     train_Y = torch.cat(train_Y, 0).to(device)
 
-    probe = nn.Linear(train_X.shape[1], 1).to(device)
-    opt = torch.optim.Adam(probe.parameters(), lr=1e-3)
-    for ep in range(100):
-        pred = probe(train_X).squeeze()
-        loss = F.l1_loss(pred, train_Y)
-        opt.zero_grad(); loss.backward(); opt.step()
+    probe = _build_probe(train_X.shape[1], 1)
+    _train_probe(probe, train_X, train_Y, epochs=300, task="regression")
 
-    probe.eval()
     abs_rels, rmses, delta1s = [], [], []
     with torch.no_grad():
         for feat, geom, (ddir, i) in zip(val_feats, val_geom, _val_pairs):

@@ -1114,21 +1114,35 @@ def main():
             rend_seg_panel = np.zeros((h_, w_, 3), dtype=np.uint8)
 
         # Layout: 2 rows × 5 cols
-        # Row 1: RGB | Feature PCA | GT Depth   | Geom Depth | GT Seg
-        # Row 2: Cos | (blank)     | Rend Depth | (blank)    | Rend Seg
+        # Row 1: RGB      | Rendered PCA | GT Depth   | Geom Depth  | GT Seg
+        # Row 2: Cosine   | GT PCA       | Pred Depth | Depth Error | Pred Seg
         cell_w = fW * S
         cell_h = fH * S
         rgb_panel = rgb_display
-        blank = np.zeros((cell_h, cell_w, 3), dtype=np.uint8)
+
+        gt_pca_panel = upscale(gt_pcas[j], S)
+
+        # Depth error map (absolute difference, jet colormap)
+        if d_raw is not None:
+            r_depth = predict_depth(rend_depth_probe, rend_feats[j], fH, fW)
+            depth_err = np.abs(r_depth - gt_d_f)
+            depth_err[gt_d_f < 0.01] = 0
+            err_max = np.percentile(depth_err[gt_d_f > 0.01], 95) if (gt_d_f > 0.01).any() else 1.0
+            err_norm = np.clip(depth_err / max(err_max, 1e-6), 0, 1)
+            err_color = cv2.applyColorMap((err_norm * 255).astype(np.uint8), cv2.COLORMAP_HOT)
+            err_color = cv2.cvtColor(err_color, cv2.COLOR_BGR2RGB)
+            depth_err_panel = upscale(err_color, S)
+        else:
+            depth_err_panel = np.zeros((cell_h, cell_w, 3), dtype=np.uint8)
 
         row1_panels = [rgb_panel, pca_panel, gt_depth_panel,
                        geom_depth_panel, gt_seg_panel]
-        row1_labels = ["Input RGB", "Feature PCA", "GT Depth",
+        row1_labels = ["Input RGB", "Rendered PCA", "GT Depth",
                        "Geom Depth", "GT Segmentation"]
-        row2_panels = [cos_panel, blank, rend_depth_panel,
-                       blank.copy(), rend_seg_panel]
-        row2_labels = [f"Cosine ({cos.mean():.3f})", "",
-                       "Pred Depth", "", "Pred Segmentation"]
+        row2_panels = [cos_panel, gt_pca_panel, rend_depth_panel,
+                       depth_err_panel, rend_seg_panel]
+        row2_labels = [f"Cosine ({cos.mean():.3f})", "GT PCA",
+                       "Pred Depth", "Depth Error", "Pred Segmentation"]
 
         for k in range(5):
             row1_panels[k] = add_text(row1_panels[k], row1_labels[k], font_scale=0.45)
