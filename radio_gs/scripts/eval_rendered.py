@@ -583,7 +583,6 @@ def main():
             # Render full-resolution geometric depth
             fullres_d = _render_fullres_depth(model, fullres_depth_renderer, pose[0])
             val_fullres_depths.append(fullres_d.cpu())
-            val_gt_1280.append(gt_feat)
     
     # Feature quality
     print("\n=== Feature Quality ===")

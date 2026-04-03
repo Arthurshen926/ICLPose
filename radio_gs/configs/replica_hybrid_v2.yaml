@@ -1,0 +1,99 @@
+# RADIO-GS Hybrid V2: Enhanced 24d per-Gaussian + hash grid decoding
+# Improvements over V1:
+#   - Larger per-Gaussian latent (16→24d), richer hash grid (4 features/level, 20 levels)
+#   - Adaptive gating fusion head (replaces naive concatenation)
+#   - Fixed decoder LR (5e-5→5e-4, 10× boost for proper training)
+#   - Deeper refiner (6 blocks, 256 hidden) to match larger fusion output (192d)
+#   - Better loss balance and initialization
+exp_name: "radio_gs_room0_hybrid_v2"
+output_dir: "output/radio_gs/room0_hybrid_v2"
+seed: 42
+
+# Scene
+scene: "room_0"
+ply_path: "output/2dgs_models/room_0/v8_fixed_poses/point_cloud/iteration_30000/point_cloud.ply"
+
+# RADIO
+radio_version: "c-radio_v4-h"
+radio_repo: "/root/RADIO"
+radio_feature_dim: 1280
+
+# Architecture — Enhanced Hybrid (24d Gaussian + Hash Grid)
+architecture: "hybrid"
+hybrid_latent_dim: 24
+hash_levels: 20
+hash_features_per_level: 4
+hash_log2_size: 20
+hash_base_resolution: 16
+hash_max_resolution: 4096
+hash_output_dim: 96
+fine_dim: 96
+coarse_dim: 96
+hybrid_output_dim: 192
+
+# Training mode
+train_mode: "decoded"
+
+# HCD Codec (192d hybrid output → 1280d RADIO space)
+bottleneck_dim: 192
+dual_stream: true
+
+# Self-rendered RGB-guided screen-space refiner (scaled up)
+use_refiner: true
+refiner_hidden_dim: 256
+refiner_num_blocks: 6
+refiner_dropout: 0.05
+refiner_rgb_guide: true
+refiner_norm_type: "gn"
+self_guided: true
+lr_refiner: 3.0e-4
+
+# FeatSharp
+featsharp_mode: "analytical"
+featsharp_strength: 0.5
+
+# Rendering — 2DGS surfels
+image_height: 480
+image_width: 640
+fx: 320.0
+fy: 320.0
+cx: 319.5
+cy: 239.5
+feature_height: 30
+feature_width: 40
+max_channels_per_chunk: 32
+use_2dgs: true
+
+# Training — fixed learning rates for hybrid
+epochs: 120
+batch_size: 4
+lr_features: 5.0e-4
+lr_decoder: 5.0e-4
+lr_hash: 8.0e-4
+weight_decay: 1.0e-4
+grad_clip: 5.0
+warmup_epochs: 8
+scheduler: "cosine"
+
+# Loss weights
+l2_weight: 1.5
+cosine_weight: 4.0
+adaptor_weight: 0.8
+tv_weight: 0.02
+feat_norm_weight: 0.0
+
+# Data
+feature_dir: "output/radio_features_1280d/room_0/Sequence_1"
+depth_dir: "dataset/room_0/Sequence_1/depth"
+semantics_dir: "dataset/room_0/Sequence_1/semantic_class"
+train_split: "Sequence_1"
+val_split: "Sequence_2"
+num_workers: 4
+
+# Downstream tasks
+seg_num_classes: 101
+
+# Checkpointing
+save_every: 10
+eval_every: 5
+log_every: 50

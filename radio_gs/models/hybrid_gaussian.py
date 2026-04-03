@@ -82,7 +82,7 @@ class SpatialHashField(nn.Module):
             for _ in range(num_levels)
         ])
         for table in self.hash_tables:
-            nn.init.uniform_(table, -1e-4, 1e-4)
+            nn.init.normal_(table, mean=0.0, std=0.01)
 
         # Large primes for the spatial hash function
         self.register_buffer(
@@ -238,19 +238,36 @@ class CoarseDecoder(nn.Module):
 
 
 class FusionHead(nn.Module):
-    """Fuse fine + coarse feature streams into final output."""
+    """Fuse fine + coarse feature streams with adaptive gating."""
 
     def __init__(self, fine_dim: int = 64, coarse_dim: int = 64, hidden_dim: int = 128, output_dim: int = 128):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(fine_dim + coarse_dim, hidden_dim, 1),
+        in_dim = fine_dim + coarse_dim
+        # Adaptive gate: learns per-pixel weighting of fine vs coarse
+        self.gate = nn.Sequential(
+            nn.Conv2d(in_dim, hidden_dim // 2, 1),
+            nn.GELU(),
+            nn.Conv2d(hidden_dim // 2, 2, 1),
+            nn.Softmax(dim=1),
+        )
+        # Main fusion pathway (deeper than V1)
+        self.fuse = nn.Sequential(
+            nn.Conv2d(in_dim, hidden_dim, 1),
+            nn.GELU(),
+            nn.Conv2d(hidden_dim, hidden_dim, 1),
             nn.GELU(),
             nn.Conv2d(hidden_dim, output_dim, 1),
         )
 
     def forward(self, fine_feat: torch.Tensor, coarse_feat: torch.Tensor) -> torch.Tensor:
         """[B, fine_dim, H, W] + [B, coarse_dim, H, W] → [B, output_dim, H, W]"""
-        return self.net(torch.cat([fine_feat, coarse_feat], dim=1))
+        concat = torch.cat([fine_feat, coarse_feat], dim=1)
+        weights = self.gate(concat)  # [B, 2, H, W]
+        # Scale streams by learned weights (additive residual to avoid vanishing)
+        fine_weighted = fine_feat * (weights[:, 0:1] + 1.0)
+        coarse_weighted = coarse_feat * (weights[:, 1:2] + 1.0)
+        fused_input = torch.cat([fine_weighted, coarse_weighted], dim=1)
+        return self.fuse(fused_input)
 
 
 # ---------------------------------------------------------------------------
