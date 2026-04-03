@@ -461,7 +461,7 @@ def load_siglip2_projection(projection_weights):
 
 
 def compute_grounding_heatmaps(features_1280, proj_model, text_emb, temperature=0.07):
-    """Compute discriminative text grounding heatmaps with softmax normalization.
+    """Compute discriminative text grounding heatmaps with per-query normalization.
 
     Args:
         features_1280: [1, 1280, H, W]
@@ -483,8 +483,19 @@ def compute_grounding_heatmaps(features_1280, proj_model, text_emb, temperature=
     raw_sim = text_emb @ siglip.T  # [K, HW]
     raw_sim = raw_sim.float().reshape(-1, H, W)
 
-    # Softmax across queries for zero-shot segmentation
-    sim_flat = raw_sim.reshape(raw_sim.shape[0], -1)  # [K, HW]
+    # Per-query min-max normalization before softmax to boost discrimination
+    K = raw_sim.shape[0]
+    norm_sim = torch.zeros_like(raw_sim)
+    for k in range(K):
+        hm = raw_sim[k]
+        lo, hi = hm.min(), hm.max()
+        if hi - lo > 1e-8:
+            norm_sim[k] = (hm - lo) / (hi - lo)
+        else:
+            norm_sim[k] = 0.5
+
+    # Softmax across queries on normalized similarities
+    sim_flat = norm_sim.reshape(K, -1)  # [K, HW]
     probs = F.softmax(sim_flat / temperature, dim=0)   # softmax across queries
     probs = probs.reshape(raw_sim.shape)               # [K, H, W]
 
@@ -494,7 +505,7 @@ def compute_grounding_heatmaps(features_1280, proj_model, text_emb, temperature=
 # ── Geometry depth helpers ────────────────────────────────────────────────────
 
 def extract_geom_depth_np(geom_depth, alpha_map, fH, fW):
-    """Convert raw geometry depth tensor to numpy [fH, fW], masking low-alpha."""
+    """Convert raw geometry depth tensor to numpy [fH, fW] with soft alpha weighting."""
     if geom_depth is None:
         return None
     d = geom_depth
@@ -507,7 +518,7 @@ def extract_geom_depth_np(geom_depth, alpha_map, fH, fW):
         d = d.float().numpy()
     if d.shape != (fH, fW):
         d = cv2.resize(d, (fW, fH), interpolation=cv2.INTER_LINEAR)
-    # Mask out low-alpha regions
+    # Soft alpha weighting instead of hard threshold to avoid sparse/grainy holes
     if alpha_map is not None:
         a = alpha_map
         if isinstance(a, torch.Tensor):
@@ -519,8 +530,25 @@ def extract_geom_depth_np(geom_depth, alpha_map, fH, fW):
             a = a.float().numpy()
         if a.shape != (fH, fW):
             a = cv2.resize(a, (fW, fH), interpolation=cv2.INTER_LINEAR)
-        d[a < 0.5] = 0.0
+        # Soft transition: linearly ramp from 0 at alpha=0 to full at alpha=0.3
+        weight = np.clip(a / 0.3, 0.0, 1.0)
+        d = d * weight
     return d
+
+
+def align_depth_scale_shift(pred, gt, valid_mask=None):
+    """Least-squares scale-shift alignment: gt ≈ scale * pred + shift."""
+    if valid_mask is None:
+        valid_mask = gt > 0.01
+    if valid_mask.sum() < 10:
+        return pred
+    p_vals = pred[valid_mask].astype(np.float64)
+    g_vals = gt[valid_mask].astype(np.float64)
+    A = np.stack([p_vals, np.ones_like(p_vals)], axis=1)
+    result = np.linalg.lstsq(A, g_vals, rcond=None)
+    scale, shift = result[0]
+    aligned = pred.astype(np.float64) * scale + shift
+    return aligned.astype(np.float32)
 
 
 # ── Main visualization ────────────────────────────────────────────────────────
@@ -719,9 +747,11 @@ def main():
         vmin = gt_depth_feat[gt_depth_feat > 0.01].min() if (gt_depth_feat > 0.01).any() else 0
         vmax = gt_depth_feat.max()
 
-        # Geometry depth from 3DGS
+        # Geometry depth from 3DGS (scale/shift aligned to GT range)
         gd = geom_depths[j]
         has_geom = gd is not None and gd.max() > 0.01
+        if has_geom:
+            gd = align_depth_scale_shift(gd, gt_depth_feat)
 
         # Oracle prediction (from GT features)
         oracle_pred = predict_depth(oracle_depth_probe, gt_feats[j], fH, fW)
@@ -775,6 +805,8 @@ def main():
 
         gd = geom_depths[j]
         has_geom = gd is not None and gd.max() > 0.01
+        if has_geom:
+            gd = align_depth_scale_shift(gd, gt_d_f)
 
         r_pred = predict_depth(rend_depth_probe, rend_feats[j], fH, fW)
         rgb = cv2.imread(str(rgb_dir / f"rgb_{idx}.png"))
@@ -923,11 +955,12 @@ def main():
                 gt_h = gt_raw[qi].cpu().numpy()
                 rend_h = rend_raw[qi].cpu().numpy()
 
-                # Per-query min-max normalization (independent for GT and rendered)
-                def _normalize(arr):
-                    lo, hi = arr.min(), arr.max()
+                # Per-query percentile normalization for better contrast
+                def _normalize(arr, plo=2, phi=98):
+                    lo = np.percentile(arr, plo)
+                    hi = np.percentile(arr, phi)
                     if hi - lo > 1e-8:
-                        return (arr - lo) / (hi - lo)
+                        return np.clip((arr - lo) / (hi - lo), 0, 1)
                     return np.zeros_like(arr)
 
                 gt_norm = _normalize(gt_h)
@@ -1051,13 +1084,10 @@ def main():
             gd = geom_depths[j]
             has_geom = gd is not None and gd.max() > 0.01
             if has_geom:
-                # Use geometric depth's own range for colormap since it may
-                # be in a different coordinate frame than GT depth.
-                gd_valid = gd[gd > 0.01]
-                gd_vmin = float(gd_valid.min()) if gd_valid.size > 0 else 0
-                gd_vmax = float(gd.max())
+                # Scale/shift align geom depth to GT range, then use same colormap
+                gd_aligned = align_depth_scale_shift(gd, gt_d_f)
                 geom_depth_panel = upscale(
-                    depth_to_colormap(gd, gd_vmin, gd_vmax), S)
+                    depth_to_colormap(gd_aligned, vmin_d, vmax_d), S)
             else:
                 geom_depth_panel = np.zeros(
                     (fH * S, fW * S, 3), dtype=np.uint8)
