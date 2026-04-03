@@ -433,6 +433,70 @@ def predict_seg_smooth(probe, feat, fH, fW, target_h, target_w):
     return pred.cpu().numpy()
 
 
+def train_depth_probe_paths(features, depth_paths, fH, fW):
+    """Train a linear depth probe using explicit file paths (mixed_split compatible)."""
+    train_X, train_Y = [], []
+    for feat, dpath in zip(features, depth_paths):
+        dpath = Path(dpath)
+        if not dpath.exists():
+            continue
+        d = cv2.imread(str(dpath), cv2.IMREAD_UNCHANGED)
+        if d is None:
+            continue
+        d = torch.from_numpy(d.astype(np.float32) / 1000.0)
+        d = F.interpolate(d[None, None], (fH, fW), mode="bilinear", align_corners=False).squeeze()
+        C = feat.shape[0]
+        if feat.shape[1:] != (fH, fW):
+            feat = F.interpolate(feat[None], (fH, fW), mode="bilinear", align_corners=False).squeeze(0)
+        valid = d > 0.01
+        if valid.sum() < 10:
+            continue
+        train_X.append(feat.reshape(C, -1).T[valid.reshape(-1)])
+        train_Y.append(d.reshape(-1)[valid.reshape(-1)])
+
+    train_X = torch.cat(train_X, 0).to(device)
+    train_Y = torch.cat(train_Y, 0).to(device)
+    probe = nn.Linear(train_X.shape[1], 1).to(device)
+    opt = torch.optim.Adam(probe.parameters(), lr=1e-3)
+    for _ in range(100):
+        pred = probe(train_X).squeeze()
+        loss = F.l1_loss(pred, train_Y)
+        opt.zero_grad(); loss.backward(); opt.step()
+    probe.eval()
+    return probe
+
+
+def train_seg_probe_paths(features, sem_paths, fH, fW):
+    """Train a linear segmentation probe using explicit file paths (mixed_split compatible)."""
+    train_X, train_Y = [], []
+    for feat, spath in zip(features, sem_paths):
+        spath = Path(spath)
+        if not spath.exists():
+            continue
+        sem = cv2.imread(str(spath), cv2.IMREAD_GRAYSCALE)
+        if sem is None:
+            continue
+        sem = torch.from_numpy(sem.astype(np.int64))
+        sem = F.interpolate(sem.float()[None, None], (fH, fW), mode="nearest").squeeze().long()
+        C = feat.shape[0]
+        if feat.shape[1:] != (fH, fW):
+            feat = F.interpolate(feat[None], (fH, fW), mode="bilinear", align_corners=False).squeeze(0)
+        train_X.append(feat.reshape(C, -1).T)
+        train_Y.append(sem.reshape(-1))
+
+    train_X = torch.cat(train_X, 0).to(device)
+    train_Y = torch.cat(train_Y, 0).to(device)
+    n_classes = int(train_Y.max().item()) + 1
+    probe = nn.Linear(train_X.shape[1], n_classes).to(device)
+    opt = torch.optim.Adam(probe.parameters(), lr=1e-3)
+    for _ in range(200):
+        logits = probe(train_X)
+        loss = F.cross_entropy(logits, train_Y)
+        opt.zero_grad(); loss.backward(); opt.step()
+    probe.eval()
+    return probe, n_classes
+
+
 # ── SigLIP2 grounding ────────────────────────────────────────────────────────
 
 def load_siglip2_projection(projection_weights):
@@ -505,7 +569,10 @@ def compute_grounding_heatmaps(features_1280, proj_model, text_emb, temperature=
 # ── Geometry depth helpers ────────────────────────────────────────────────────
 
 def extract_geom_depth_np(geom_depth, alpha_map, fH, fW):
-    """Convert raw geometry depth tensor to numpy [fH, fW] with soft alpha weighting."""
+    """Convert raw geometry depth tensor to numpy [fH, fW] with alpha masking.
+
+    Uses hard alpha threshold + median filter to remove granular noise artifacts.
+    """
     if geom_depth is None:
         return None
     d = geom_depth
@@ -518,7 +585,7 @@ def extract_geom_depth_np(geom_depth, alpha_map, fH, fW):
         d = d.float().numpy()
     if d.shape != (fH, fW):
         d = cv2.resize(d, (fW, fH), interpolation=cv2.INTER_LINEAR)
-    # Soft alpha weighting instead of hard threshold to avoid sparse/grainy holes
+    # Hard alpha threshold: mask out low-opacity regions
     if alpha_map is not None:
         a = alpha_map
         if isinstance(a, torch.Tensor):
@@ -530,10 +597,15 @@ def extract_geom_depth_np(geom_depth, alpha_map, fH, fW):
             a = a.float().numpy()
         if a.shape != (fH, fW):
             a = cv2.resize(a, (fW, fH), interpolation=cv2.INTER_LINEAR)
-        # Soft transition: linearly ramp from 0 at alpha=0 to full at alpha=0.3
-        weight = np.clip(a / 0.3, 0.0, 1.0)
-        d = d * weight
-    return d
+        # Hard threshold: zero-out low-alpha regions entirely
+        valid = a > 0.1
+        d[~valid] = 0.0
+    # Median filter to remove speckle noise (kernel=3 for small feature maps)
+    d_filtered = cv2.medianBlur(d.astype(np.float32), 3)
+    # Preserve zeros (invalid regions) from alpha masking
+    if alpha_map is not None:
+        d_filtered[~valid] = 0.0
+    return d_filtered
 
 
 def align_depth_scale_shift(pred, gt, valid_mask=None):
@@ -596,33 +668,115 @@ def main():
     fH = getattr(config, "feature_height", 30)
     fW = getattr(config, "feature_width", 40)
 
-    # Load val poses
-    val_pose_file = scene_root / val_split / "traj_w_c.txt"
-    all_c2w = np.loadtxt(str(val_pose_file)).reshape(-1, 4, 4).astype(np.float32)
-    all_w2c = np.linalg.inv(all_c2w)
-    n_total = len(all_w2c)
+    # ── Handle mixed_split (rooms 1&2 use random 80/20 split across sequences) ──
+    mixed_split = getattr(config, "mixed_split", False)
+    if mixed_split:
+        n_per_seq = 900
+        mixed_ratio = getattr(config, "mixed_train_ratio", 0.8)
+        mixed_seed = getattr(config, "mixed_seed", 42)
+        total = n_per_seq * 2
+        train_size = int(mixed_ratio * total)
+        gen = torch.Generator().manual_seed(mixed_seed)
+        perm = torch.randperm(total, generator=gen).tolist()
+        train_mixed = sorted(perm[:train_size])
+        val_mixed = sorted(perm[train_size:])
 
-    gt_feat_dir = Path(f"output/radio_features_1280d/{scene}/{val_split}/backbone")
-    rgb_dir = scene_root / val_split / "rgb"
-    depth_dir = scene_root / val_split / "depth"
-    sem_dir = scene_root / val_split / "semantic_class"
+        def _split_idx(combined_idx):
+            """Map combined index → (sequence_name, frame_idx_in_sequence)."""
+            if combined_idx < n_per_seq:
+                return train_split, combined_idx
+            else:
+                return val_split, combined_idx - n_per_seq
 
-    # Select evenly-spaced novel-view frames
-    vis_indices = list(range(0, n_total, max(1, n_total // args.num_views)))[:args.num_views]
-    print(f"Visualizing {len(vis_indices)} novel views from {val_split}")
+        # Load poses from both sequences
+        poses_s1 = np.loadtxt(str(scene_root / train_split / "traj_w_c.txt")).reshape(-1, 4, 4).astype(np.float32)
+        poses_s2 = np.loadtxt(str(scene_root / val_split / "traj_w_c.txt")).reshape(-1, 4, 4).astype(np.float32)
+        w2c_s1 = np.linalg.inv(poses_s1)
+        w2c_s2 = np.linalg.inv(poses_s2)
+
+        def _get_w2c(seq, fidx):
+            return w2c_s1[fidx] if seq == train_split else w2c_s2[fidx]
+
+        # Select vis frames from the val portion of the mixed split
+        vis_step = max(1, len(val_mixed) // args.num_views)
+        vis_mixed = val_mixed[::vis_step][:args.num_views]
+        vis_seq_frame = [_split_idx(ci) for ci in vis_mixed]
+
+        # For training probes, sample from train portion
+        train_step = max(1, len(train_mixed) // args.n_train)
+        train_mixed_sub = train_mixed[::train_step][:args.n_train]
+        train_seq_frame = [_split_idx(ci) for ci in train_mixed_sub]
+
+        print(f"Mixed split: total={total}, train={len(train_mixed)}, val={len(val_mixed)}")
+        print(f"Visualizing {len(vis_seq_frame)} val frames, training probes on {len(train_seq_frame)} frames")
+    else:
+        # Standard sequential split
+        val_pose_file = scene_root / val_split / "traj_w_c.txt"
+        all_c2w = np.loadtxt(str(val_pose_file)).reshape(-1, 4, 4).astype(np.float32)
+        all_w2c = np.linalg.inv(all_c2w)
+        n_total = len(all_w2c)
+        vis_indices = list(range(0, n_total, max(1, n_total // args.num_views)))[:args.num_views]
+        print(f"Visualizing {len(vis_indices)} novel views from {val_split}")
+
+    # Helper functions for loading GT data (unified for both split modes)
+    def get_vis_w2c(j):
+        """Get w2c matrix for visualization frame j."""
+        if mixed_split:
+            seq, fidx = vis_seq_frame[j]
+            return _get_w2c(seq, fidx)
+        return all_w2c[vis_indices[j]]
+
+    def get_vis_gt_feat_path(j):
+        """Get GT feature path for visualization frame j."""
+        if mixed_split:
+            seq, fidx = vis_seq_frame[j]
+            return Path(f"output/radio_features_1280d/{scene}/{seq}/backbone") / f"rgb_{fidx}.pt"
+        return Path(f"output/radio_features_1280d/{scene}/{val_split}/backbone") / f"rgb_{vis_indices[j]}.pt"
+
+    def get_vis_rgb_path(j):
+        """Get RGB image path for visualization frame j."""
+        if mixed_split:
+            seq, fidx = vis_seq_frame[j]
+            return scene_root / seq / "rgb" / f"rgb_{fidx}.png"
+        return scene_root / val_split / "rgb" / f"rgb_{vis_indices[j]}.png"
+
+    def get_vis_depth_path(j):
+        """Get depth map path for visualization frame j."""
+        if mixed_split:
+            seq, fidx = vis_seq_frame[j]
+            return scene_root / seq / "depth" / f"depth_{fidx}.png"
+        return scene_root / val_split / "depth" / f"depth_{vis_indices[j]}.png"
+
+    def get_vis_sem_path(j):
+        """Get semantic label path for visualization frame j."""
+        if mixed_split:
+            seq, fidx = vis_seq_frame[j]
+            return scene_root / seq / "semantic_class" / f"semantic_class_{fidx}.png"
+        return scene_root / val_split / "semantic_class" / f"semantic_class_{vis_indices[j]}.png"
+
+    def get_vis_label(j):
+        """Get a short label for the frame (for filenames)."""
+        if mixed_split:
+            seq, fidx = vis_seq_frame[j]
+            return f"{seq}_f{fidx}"
+        return f"f{vis_indices[j]:04d}"
+
+    n_vis = len(vis_seq_frame) if mixed_split else len(vis_indices)
 
     # ── Step 1: Render all features ──────────────────────────────────────────
-    print("\n[1/7] Rendering decoded features for visualization frames...")
+    print(f"\n[1/7] Rendering decoded features for {n_vis} visualization frames...")
     gt_feats, rend_feats = [], []
     geom_depths = []  # geometry depth from 3DGS per vis frame
     with torch.no_grad():
-        for i in tqdm(vis_indices, desc="Rendering"):
-            gt = torch.load(gt_feat_dir / f"rgb_{i}.pt", map_location="cpu").float()
+        for j in tqdm(range(n_vis), desc="Rendering"):
+            gt_path = get_vis_gt_feat_path(j)
+            gt = torch.load(str(gt_path), map_location="cpu").float()
             if gt.dim() == 2:
                 gt = gt.reshape(fH, fW, -1).permute(2, 0, 1)
             gt_feats.append(gt)
 
-            pose = torch.from_numpy(all_w2c[i:i + 1]).to(device)
+            w2c = get_vis_w2c(j)
+            pose = torch.from_numpy(w2c[np.newaxis]).to(device)
             decoded, geom_depth, alpha_map = render_features(
                 model, codec, renderer, sharpener, refiner, config, pose,
                 is_hybrid=is_hybrid)
@@ -632,47 +786,58 @@ def main():
 
     # ── Step 2: Train probes on training data ────────────────────────────────
     print("\n[2/7] Training linear probes on training split features...")
-    train_pose_file = scene_root / train_split / "traj_w_c.txt"
-    train_c2w = np.loadtxt(str(train_pose_file)).reshape(-1, 4, 4).astype(np.float32)
-    train_w2c = np.linalg.inv(train_c2w)
-    n_train_total = len(train_w2c)
-    train_indices = list(range(0, n_train_total,
-                               max(1, n_train_total // args.n_train)))[:args.n_train]
+    if mixed_split:
+        n_train_use = len(train_seq_frame)
+        train_depth_paths = [scene_root / seq / "depth" / f"depth_{fidx}.png"
+                             for seq, fidx in train_seq_frame]
+        train_sem_paths = [scene_root / seq / "semantic_class" / f"semantic_class_{fidx}.png"
+                           for seq, fidx in train_seq_frame]
+    else:
+        train_pose_file = scene_root / train_split / "traj_w_c.txt"
+        train_c2w = np.loadtxt(str(train_pose_file)).reshape(-1, 4, 4).astype(np.float32)
+        train_w2c_all = np.linalg.inv(train_c2w)
+        n_train_total = len(train_w2c_all)
+        train_indices = list(range(0, n_train_total,
+                                   max(1, n_train_total // args.n_train)))[:args.n_train]
+        n_train_use = len(train_indices)
+        train_depth_paths = [scene_root / train_split / "depth" / f"depth_{i}.png"
+                             for i in train_indices]
+        train_sem_paths = [scene_root / train_split / "semantic_class" / f"semantic_class_{i}.png"
+                           for i in train_indices]
 
     # Render training features
     train_gt_feats, train_rend_feats = [], []
-    gt_train_dir = Path(f"output/radio_features_1280d/{scene}/{train_split}/backbone")
-    train_depth_dir = scene_root / train_split / "depth"
-    train_sem_dir = scene_root / train_split / "semantic_class"
 
-    print("  Rendering training features...")
+    print(f"  Rendering {n_train_use} training features...")
     with torch.no_grad():
-        for i in tqdm(train_indices, desc="Train render", leave=False):
-            gt = torch.load(gt_train_dir / f"rgb_{i}.pt", map_location="cpu").float()
+        for j in tqdm(range(n_train_use), desc="Train render", leave=False):
+            if mixed_split:
+                seq, fidx = train_seq_frame[j]
+                gt_path = Path(f"output/radio_features_1280d/{scene}/{seq}/backbone") / f"rgb_{fidx}.pt"
+                w2c = _get_w2c(seq, fidx)
+            else:
+                gt_path = Path(f"output/radio_features_1280d/{scene}/{train_split}/backbone") / f"rgb_{train_indices[j]}.pt"
+                w2c = train_w2c_all[train_indices[j]]
+            gt = torch.load(str(gt_path), map_location="cpu").float()
             if gt.dim() == 2:
                 gt = gt.reshape(fH, fW, -1).permute(2, 0, 1)
             train_gt_feats.append(gt)
 
-            pose = torch.from_numpy(train_w2c[i:i + 1]).to(device)
+            pose = torch.from_numpy(w2c[np.newaxis]).to(device)
             decoded, _, _ = render_features(
                 model, codec, renderer, sharpener, refiner, config, pose,
                 is_hybrid=is_hybrid)
             train_rend_feats.append(decoded.squeeze(0).cpu())
 
-    # Train oracle probes (on GT features)
+    # Train probes using path-based loaders (compatible with mixed_split)
     print("  Training oracle depth probe...")
-    oracle_depth_probe = train_depth_probe(train_gt_feats, train_depth_dir,
-                                           train_indices, fH, fW)
+    oracle_depth_probe = train_depth_probe_paths(train_gt_feats, train_depth_paths, fH, fW)
     print("  Training oracle segmentation probe...")
-    oracle_seg_probe, n_classes = train_seg_probe(train_gt_feats, train_sem_dir,
-                                                  train_indices, fH, fW)
-    # Train rendered probes
+    oracle_seg_probe, n_classes = train_seg_probe_paths(train_gt_feats, train_sem_paths, fH, fW)
     print("  Training rendered depth probe...")
-    rend_depth_probe = train_depth_probe(train_rend_feats, train_depth_dir,
-                                         train_indices, fH, fW)
+    rend_depth_probe = train_depth_probe_paths(train_rend_feats, train_depth_paths, fH, fW)
     print("  Training rendered segmentation probe...")
-    rend_seg_probe, _ = train_seg_probe(train_rend_feats, train_sem_dir,
-                                        train_indices, fH, fW)
+    rend_seg_probe, _ = train_seg_probe_paths(train_rend_feats, train_sem_paths, fH, fW)
 
     # ── Step 3: Feature PCA visualization ────────────────────────────────────
     print("\n[3/7] Generating feature PCA visualizations...")
@@ -681,13 +846,13 @@ def main():
     gt_pcas = pca_imgs[:len(gt_feats)]
     rend_pcas = pca_imgs[len(gt_feats):]
 
-    for j, idx in enumerate(vis_indices):
+    for j in range(n_vis):
         gt_f, rend_f = gt_feats[j], rend_feats[j]
         cos = F.cosine_similarity(
             rend_f.reshape(-1, fH * fW), gt_f.reshape(-1, fH * fW), dim=0
         ).reshape(fH, fW).numpy()
 
-        rgb = cv2.imread(str(rgb_dir / f"rgb_{idx}.png"))
+        rgb = cv2.imread(str(get_vis_rgb_path(j)))
         rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
         tH, tW = fH * S, fW * S
         rgb_display = cv2.resize(rgb, (tW, tH), interpolation=cv2.INTER_LINEAR)
@@ -705,18 +870,18 @@ def main():
             panels[k] = add_text(panels[k], label, pos=(5, 20), font_scale=0.55)
 
         row = hconcat_with_border(panels, border=3)
-        save_path = dirs["feature_pca"] / f"pca_frame_{idx:04d}_cos{cos.mean():.3f}.png"
+        save_path = dirs["feature_pca"] / f"pca_frame_{get_vis_label(j)}_cos{cos.mean():.3f}.png"
         cv2.imwrite(str(save_path), cv2.cvtColor(row, cv2.COLOR_RGB2BGR))
 
     # PCA summary grid (up to 8 frames)
-    n_grid = min(8, len(vis_indices))
+    n_grid = min(8, n_vis)
     grid_rows = []
     for j in range(n_grid):
-        idx = vis_indices[j]
+        idx = get_vis_label(j)
         cos = F.cosine_similarity(
             rend_feats[j].reshape(-1, fH * fW), gt_feats[j].reshape(-1, fH * fW), dim=0
         ).reshape(fH, fW).numpy()
-        rgb = cv2.imread(str(rgb_dir / f"rgb_{idx}.png"))
+        rgb = cv2.imread(str(get_vis_rgb_path(j)))
         rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
         panels = [
             upscale(cv2.resize(rgb, (fW, fH)), S, cv2.INTER_LINEAR),
@@ -731,13 +896,13 @@ def main():
     full_grid = vconcat_with_border([header] + grid_rows, border=2)
     cv2.imwrite(str(dirs["feature_pca"] / "pca_grid.png"),
                 cv2.cvtColor(full_grid, cv2.COLOR_RGB2BGR))
-    print(f"  Saved PCA grid and {len(vis_indices)} individual frames")
+    print(f"  Saved PCA grid and {n_vis} individual frames")
 
     # ── Step 4: Depth visualization (with geometry depth) ────────────────────
     print("\n[4/7] Generating depth estimation visualizations...")
-    for j, idx in enumerate(vis_indices):
+    for j in range(n_vis):
         # GT depth
-        dpath = depth_dir / f"depth_{idx}.png"
+        dpath = get_vis_depth_path(j)
         d_raw = cv2.imread(str(dpath), cv2.IMREAD_UNCHANGED)
         if d_raw is None:
             continue
@@ -758,7 +923,7 @@ def main():
         # Rendered prediction (from rendered features)
         rend_pred = predict_depth(rend_depth_probe, rend_feats[j], fH, fW)
 
-        rgb = cv2.imread(str(rgb_dir / f"rgb_{idx}.png"))
+        rgb = cv2.imread(str(get_vis_rgb_path(j)))
         rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
         tH, tW = fH * S, fW * S
         rgb_display = cv2.resize(rgb, (tW, tH), interpolation=cv2.INTER_LINEAR)
@@ -787,14 +952,14 @@ def main():
             panels[k] = add_text(panels[k], label, pos=(5, 20), font_scale=0.5)
 
         row = hconcat_with_border(panels, border=3)
-        save_path = dirs["depth"] / f"depth_frame_{idx:04d}.png"
+        save_path = dirs["depth"] / f"depth_frame_{get_vis_label(j)}.png"
         cv2.imwrite(str(save_path), cv2.cvtColor(row, cv2.COLOR_RGB2BGR))
 
     # Depth grid
     grid_rows = []
-    for j in range(min(8, len(vis_indices))):
-        idx = vis_indices[j]
-        dpath = depth_dir / f"depth_{idx}.png"
+    for j in range(min(8, n_vis)):
+        idx = get_vis_label(j)
+        dpath = get_vis_depth_path(j)
         d_raw = cv2.imread(str(dpath), cv2.IMREAD_UNCHANGED)
         if d_raw is None:
             continue
@@ -809,7 +974,7 @@ def main():
             gd = align_depth_scale_shift(gd, gt_d_f)
 
         r_pred = predict_depth(rend_depth_probe, rend_feats[j], fH, fW)
-        rgb = cv2.imread(str(rgb_dir / f"rgb_{idx}.png"))
+        rgb = cv2.imread(str(get_vis_rgb_path(j)))
         rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
 
         geom_panel = (upscale(depth_to_colormap(gd, vmin, vmax), S)
@@ -832,13 +997,13 @@ def main():
         full_grid = vconcat_with_border([header] + grid_rows, border=2)
         cv2.imwrite(str(dirs["depth"] / "depth_grid.png"),
                     cv2.cvtColor(full_grid, cv2.COLOR_RGB2BGR))
-    print(f"  Saved depth grid and {len(vis_indices)} individual frames")
+    print(f"  Saved depth grid and {n_vis} individual frames")
 
     # ── Step 5: Segmentation visualization ───────────────────────────────────
     print("\n[5/7] Generating segmentation visualizations...")
     tH, tW = fH * S, fW * S  # display resolution (e.g. 480×640)
-    for j, idx in enumerate(vis_indices):
-        spath = sem_dir / f"semantic_class_{idx}.png"
+    for j in range(n_vis):
+        spath = get_vis_sem_path(j)
         sem_raw = cv2.imread(str(spath), cv2.IMREAD_GRAYSCALE)
         if sem_raw is None:
             continue
@@ -848,7 +1013,7 @@ def main():
         oracle_seg_hr = predict_seg_smooth(oracle_seg_probe, gt_feats[j], fH, fW, tH, tW)
         rend_seg_hr = predict_seg_smooth(rend_seg_probe, rend_feats[j], fH, fW, tH, tW)
 
-        rgb = cv2.imread(str(rgb_dir / f"rgb_{idx}.png"))
+        rgb = cv2.imread(str(get_vis_rgb_path(j)))
         rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
         rgb_hr = cv2.resize(rgb, (tW, tH))
 
@@ -869,20 +1034,20 @@ def main():
             panels[k] = add_text(panels[k], label, pos=(5, 20), font_scale=0.5)
 
         row = hconcat_with_border(panels, border=3)
-        save_path = dirs["segmentation"] / f"seg_frame_{idx:04d}.png"
+        save_path = dirs["segmentation"] / f"seg_frame_{get_vis_label(j)}.png"
         cv2.imwrite(str(save_path), cv2.cvtColor(row, cv2.COLOR_RGB2BGR))
 
     # Segmentation grid
     grid_rows = []
-    for j in range(min(8, len(vis_indices))):
-        idx = vis_indices[j]
-        spath = sem_dir / f"semantic_class_{idx}.png"
+    for j in range(min(8, n_vis)):
+        idx = get_vis_label(j)
+        spath = get_vis_sem_path(j)
         sem_raw = cv2.imread(str(spath), cv2.IMREAD_GRAYSCALE)
         if sem_raw is None:
             continue
         gt_sem_hr = cv2.resize(sem_raw, (tW, tH), interpolation=cv2.INTER_NEAREST)
         r_seg_hr = predict_seg_smooth(rend_seg_probe, rend_feats[j], fH, fW, tH, tW)
-        rgb = cv2.imread(str(rgb_dir / f"rgb_{idx}.png"))
+        rgb = cv2.imread(str(get_vis_rgb_path(j)))
         rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
         rgb_hr = cv2.resize(rgb, (tW, tH))
         gt_blend = (0.6 * seg_to_color(gt_sem_hr) + 0.4 * rgb_hr).astype(np.uint8)
@@ -896,7 +1061,7 @@ def main():
         full_grid = vconcat_with_border([header] + grid_rows, border=2)
         cv2.imwrite(str(dirs["segmentation"] / "seg_grid.png"),
                     cv2.cvtColor(full_grid, cv2.COLOR_RGB2BGR))
-    print(f"  Saved segmentation grid and {len(vis_indices)} individual frames")
+    print(f"  Saved segmentation grid and {n_vis} individual frames")
 
     # ── Step 6: Text grounding heatmaps (per-query normalized + softmax) ─────
     print("\n[6/7] Generating text grounding heatmaps...")
@@ -926,7 +1091,7 @@ def main():
 
         print(f"  Active grounding queries: {active_queries}")
 
-        for j, idx in enumerate(vis_indices):
+        for j in range(n_vis):
             gt_f = gt_feats[j].unsqueeze(0).to(device)
             rend_f = rend_feats[j].unsqueeze(0).to(device)
 
@@ -936,7 +1101,7 @@ def main():
                 rend_f, proj_model, active_text_emb)
 
             # Load semantic GT for mask overlay
-            spath = sem_dir / f"semantic_class_{idx}.png"
+            spath = get_vis_sem_path(j)
             sem_raw = cv2.imread(str(spath), cv2.IMREAD_GRAYSCALE)
             if sem_raw is not None:
                 gt_sem = cv2.resize(sem_raw, (fW, fH), interpolation=cv2.INTER_NEAREST)
@@ -945,7 +1110,7 @@ def main():
                 gt_sem = None
                 gt_sem_hr = None
 
-            rgb = cv2.imread(str(rgb_dir / f"rgb_{idx}.png"))
+            rgb = cv2.imread(str(get_vis_rgb_path(j)))
             rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
             rgb_hr = cv2.resize(rgb, (tW, tH), interpolation=cv2.INTER_LINEAR)
 
@@ -977,15 +1142,12 @@ def main():
                     (rend_norm_hr * 255).astype(np.uint8), cv2.COLORMAP_JET)
                 rend_color = cv2.cvtColor(rend_color, cv2.COLOR_BGR2RGB)
 
-                # GT semantic mask for this class (at display resolution)
-                if gt_sem_hr is not None and qname in name_to_cid:
-                    cid = name_to_cid[qname]
-                    mask = (gt_sem_hr == cid).astype(np.uint8)
-                    mask_vis = np.zeros((tH, tW, 3), dtype=np.uint8)
-                    mask_vis[mask > 0] = (0, 255, 100)
-                    mask_blend = (0.5 * mask_vis + 0.5 * rgb_hr).astype(np.uint8)
-                else:
-                    mask_blend = np.zeros_like(rgb_hr)
+                # GT heatmap mask: threshold GT oracle heatmap for ground-truth
+                # (avoids reliance on hardcoded class-ID-to-name mapping)
+                gt_mask_thresh = (gt_norm_hr > 0.5).astype(np.uint8)
+                mask_vis = np.zeros((tH, tW, 3), dtype=np.uint8)
+                mask_vis[gt_mask_thresh > 0] = (0, 255, 100)
+                mask_blend = (0.5 * mask_vis + 0.5 * rgb_hr).astype(np.uint8)
 
                 # Heatmap overlays on RGB (at display resolution)
                 gt_overlay = (0.5 * gt_color + 0.5 * rgb_hr).astype(np.uint8)
@@ -997,15 +1159,15 @@ def main():
 
             if query_rows:
                 header = make_header(
-                    ["GT Semantic Mask", "GT Heatmap", "Rendered Heatmap"],
+                    ["GT Oracle Mask", "GT Heatmap", "Rendered Heatmap"],
                     tW, height=28, border=2)
-                rgb_labeled = add_text(rgb_hr.copy(), f"Frame {idx}", pos=(5, 20), font_scale=0.55)
+                rgb_labeled = add_text(rgb_hr.copy(), f"Frame {get_vis_label(j)}", pos=(5, 20), font_scale=0.55)
                 rgb_row = np.zeros((rgb_hr.shape[0], header.shape[1], 3), dtype=np.uint8)
                 x_off = (rgb_row.shape[1] - rgb_hr.shape[1]) // 2
                 rgb_row[:, x_off:x_off + rgb_hr.shape[1]] = rgb_labeled
 
                 full = vconcat_with_border([rgb_row, header] + query_rows, border=2)
-                save_path = dirs["grounding"] / f"grounding_frame_{idx:04d}.png"
+                save_path = dirs["grounding"] / f"grounding_frame_{get_vis_label(j)}.png"
                 cv2.imwrite(str(save_path), cv2.cvtColor(full, cv2.COLOR_RGB2BGR))
 
             # ── Zero-shot segmentation from softmax grounding ────────────
@@ -1018,28 +1180,27 @@ def main():
             for qi in range(len(active_queries)):
                 rend_seg_vis[rend_seg_map == qi] = query_colors[qi]
 
-            # GT semantic mask restricted to active query classes (display resolution)
-            if gt_sem_hr is not None:
-                gt_seg_vis = np.zeros((tH, tW, 3), dtype=np.uint8)
-                for qi, qname in enumerate(active_queries):
-                    if qname in name_to_cid:
-                        cid = name_to_cid[qname]
-                        gt_seg_vis[gt_sem_hr == cid] = query_colors[qi]
-            else:
-                gt_seg_vis = np.zeros((tH, tW, 3), dtype=np.uint8)
+            # GT segmentation from oracle heatmap argmax (avoids class-ID mapping)
+            gt_probs_hr = F.interpolate(
+                gt_probs.unsqueeze(0), (tH, tW), mode="bilinear", align_corners=False
+            ).squeeze(0)
+            gt_seg_map = gt_probs_hr.argmax(dim=0).cpu().numpy()
+            gt_seg_vis = np.zeros((tH, tW, 3), dtype=np.uint8)
+            for qi in range(len(active_queries)):
+                gt_seg_vis[gt_seg_map == qi] = query_colors[qi]
 
             panels = [rgb_hr, gt_seg_vis, rend_seg_vis]
-            seg_labels = ["RGB", "GT Seg (queries)", "Softmax Seg"]
+            seg_labels = ["RGB", "GT Oracle Seg", "Softmax Seg"]
             for k, label in enumerate(seg_labels):
                 panels[k] = add_text(panels[k], label, pos=(5, 20), font_scale=0.5)
             seg_row = hconcat_with_border(panels, border=3)
-            save_path = dirs["grounding_seg"] / f"grounding_seg_frame_{idx:04d}.png"
+            save_path = dirs["grounding_seg"] / f"grounding_seg_frame_{get_vis_label(j)}.png"
             cv2.imwrite(str(save_path), cv2.cvtColor(seg_row, cv2.COLOR_RGB2BGR))
 
         # Grounding segmentation grid
         seg_grid_rows = []
-        for j in range(min(8, len(vis_indices))):
-            p = dirs["grounding_seg"] / f"grounding_seg_frame_{vis_indices[j]:04d}.png"
+        for j in range(min(8, n_vis)):
+            p = dirs["grounding_seg"] / f"grounding_seg_frame_{get_vis_label(j)}.png"
             if p.exists():
                 img = cv2.imread(str(p))
                 if img is not None:
@@ -1049,14 +1210,14 @@ def main():
             cv2.imwrite(str(dirs["grounding_seg"] / "grounding_seg_grid.png"),
                         cv2.cvtColor(full_grid, cv2.COLOR_RGB2BGR))
 
-        print(f"  Saved grounding + grounding_seg for {len(vis_indices)} frames")
+        print(f"  Saved grounding + grounding_seg for {n_vis} frames")
     else:
         print("  ⚠ Skipping grounding: text embeddings or projection weights not found")
 
     # ── Step 7: Composite multi-task figure ──────────────────────────────────
     print("\n[7/7] Generating composite multi-task figures...")
-    for j, idx in enumerate(vis_indices[:5]):  # Top 5 frames
-        rgb = cv2.imread(str(rgb_dir / f"rgb_{idx}.png"))
+    for j in range(min(5, n_vis)):  # Top 5 frames
+        rgb = cv2.imread(str(get_vis_rgb_path(j)))
         rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
         rgb_small = cv2.resize(rgb, (fW, fH))
         tH_c, tW_c = fH * S, fW * S
@@ -1070,7 +1231,7 @@ def main():
         cos_panel = upscale(cosine_map_to_heatmap(cos), S)
 
         # Depth
-        dpath = depth_dir / f"depth_{idx}.png"
+        dpath = get_vis_depth_path(j)
         d_raw = cv2.imread(str(dpath), cv2.IMREAD_UNCHANGED)
         if d_raw is not None:
             gt_d = d_raw.astype(np.float32) / 1000.0
@@ -1098,13 +1259,13 @@ def main():
             geom_depth_panel = np.zeros((h_, w_, 3), dtype=np.uint8)
 
         # Segmentation (smooth: upscale logits before argmax)
-        spath = sem_dir / f"semantic_class_{idx}.png"
+        spath = get_vis_sem_path(j)
         sem_raw_img = cv2.imread(str(spath), cv2.IMREAD_GRAYSCALE)
         if sem_raw_img is not None:
             gt_sem_hr = cv2.resize(sem_raw_img, (tW, tH), interpolation=cv2.INTER_NEAREST)
             r_seg_hr = predict_seg_smooth(rend_seg_probe, rend_feats[j], fH, fW, tH, tW)
             rgb_hr = cv2.resize(
-                cv2.cvtColor(cv2.imread(str(rgb_dir / f"rgb_{idx}.png")), cv2.COLOR_BGR2RGB),
+                cv2.cvtColor(cv2.imread(str(get_vis_rgb_path(j))), cv2.COLOR_BGR2RGB),
                 (tW, tH))
             gt_seg_panel = (0.6 * seg_to_color(gt_sem_hr) + 0.4 * rgb_hr).astype(np.uint8)
             rend_seg_panel = (0.6 * seg_to_color(r_seg_hr) + 0.4 * rgb_hr).astype(np.uint8)
@@ -1153,10 +1314,10 @@ def main():
         row2 = hconcat_with_border(row2_panels, border=3)
         composite = vconcat_with_border([row1, row2], border=3)
 
-        save_path = dirs["composite"] / f"composite_frame_{idx:04d}.png"
+        save_path = dirs["composite"] / f"composite_frame_{get_vis_label(j)}.png"
         cv2.imwrite(str(save_path), cv2.cvtColor(composite, cv2.COLOR_RGB2BGR))
 
-    print(f"  Saved {min(5, len(vis_indices))} composite figures")
+    print(f"  Saved {min(5, n_vis)} composite figures")
 
     # ── Summary ──────────────────────────────────────────────────────────────
     print("\n" + "=" * 60)
@@ -1169,13 +1330,13 @@ def main():
 
     # Compute and print quality stats
     cos_vals = []
-    for j in range(len(vis_indices)):
+    for j in range(n_vis):
         cos = F.cosine_similarity(
             rend_feats[j].flatten().unsqueeze(0),
             gt_feats[j].flatten().unsqueeze(0)
         ).item()
         cos_vals.append(cos)
-    print(f"\nFeature quality (val novel views, {len(vis_indices)} frames):")
+    print(f"\nFeature quality (val novel views, {n_vis} frames):")
     print(f"  Mean cosine similarity: {np.mean(cos_vals):.4f}")
     print(f"  Min cosine similarity:  {np.min(cos_vals):.4f}")
 
