@@ -102,8 +102,9 @@ def prepare_depth_fusion_sample(
     geom_t = ensure_depth_size(geom_depth, fH, fW, device)
     geom_valid = (geom_t > 0.01).float()
     align_mask = geom_valid > 0.5
-    geom_aligned = align_depth_scale_shift(geom_t, feat_depth, align_mask)
-    geom_aligned = torch.where(align_mask, geom_aligned, feat_depth)
+    # Align feature depth to geometric depth (geom is metric and more accurate)
+    feat_depth = align_depth_scale_shift(feat_depth, geom_t, align_mask)
+    geom_aligned = geom_t
 
     diff = geom_aligned - feat_depth
     abs_diff = diff.abs()
@@ -148,7 +149,7 @@ def prepare_depth_fusion_sample(
 class DepthFusionProbe(nn.Module):
     """Blend feature-predicted and geometric depth with learned gating."""
 
-    def __init__(self, in_dim: int, hidden: int = 256, geom_bias: float = 2.0):
+    def __init__(self, in_dim: int, hidden: int = 256, geom_bias: float = 4.0):
         super().__init__()
         self.encoder = nn.Sequential(
             nn.Linear(in_dim, hidden),
@@ -158,7 +159,7 @@ class DepthFusionProbe(nn.Module):
         )
         self.gate_head = nn.Linear(hidden, 1)
         self.residual_head = nn.Linear(hidden, 1)
-        # Initialize gate bias to favor geometric depth (sigmoid(2.0) ≈ 0.88)
+        # Initialize gate bias to strongly favor geometric depth (sigmoid(4.0) ≈ 0.98)
         nn.init.constant_(self.gate_head.bias, geom_bias)
         nn.init.zeros_(self.residual_head.bias)
 
@@ -172,7 +173,7 @@ class DepthFusionProbe(nn.Module):
         hidden = self.encoder(input_flat)
         gate = torch.sigmoid(self.gate_head(hidden)) * geom_valid_flat
         base = gate * geom_depth_flat + (1.0 - gate) * feat_depth_flat
-        correction_scale = (geom_depth_flat - feat_depth_flat).abs().clamp(max=0.5) + 0.1
+        correction_scale = (geom_depth_flat - feat_depth_flat).abs().clamp(max=0.3) + 0.05
         residual = torch.tanh(self.residual_head(hidden)) * correction_scale
         return base + residual, gate
 
@@ -185,9 +186,9 @@ def train_depth_fusion_probe(
     train_targets: torch.Tensor,
     device: torch.device,
     *,
-    epochs: int = 300,
+    epochs: int = 500,
     batch_size: int = 16384,
-    lr: float = 1e-3,
+    lr: float = 5e-4,
 ) -> DepthFusionProbe:
     """Train the learned depth-fusion probe."""
     probe = DepthFusionProbe(train_input_flat.shape[1]).to(device).train()
