@@ -1,0 +1,8 @@
+Loaded: output/feature_3dgs/room_0_v1/best_model.pth
+  loc_feature: torch.Size([132218, 224])
+  scale_dims: {'fine_sd': 64, 'fine_dino': 64, 'mid': 64, 'coarse': 32}
+  Saved fine_sd: torch.Size([132218, 64]) → output/feature_3dgs/room_0_v1/per_scale/fine_sd.pth
+  Saved fine_dino: torch.Size([132218, 64]) → output/feature_3dgs/room_0_v1/per_scale/fine_dino.pth
+  Saved mid: torch.Size([132218, 64]) → output/feature_3dgs/room_0_v1/per_scale/mid.pth
+  Saved coarse: torch.Size([132218, 32]) → output/feature_3dgs/room_0_v1/per_scale/coarse.pth
+Done. Per-scale checkpoints in: output/feature_3dgs/room_0_v1/per_scale

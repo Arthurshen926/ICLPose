@@ -641,13 +641,25 @@ def main():
             fullres_d = _render_fullres_depth(model, fullres_depth_renderer, pose[0])
             val_fullres_depths.append(fullres_d.cpu())
     
-    # Feature quality
+    # Feature quality (handle resolution mismatch by resizing decoded to GT size)
     print("\n=== Feature Quality ===")
     cos_sims = []
     for dec, gt in zip(val_decoded, val_gt_1280):
-        cos = F.cosine_similarity(dec.flatten().unsqueeze(0), gt.flatten().unsqueeze(0)).item()
+        if dec.shape != gt.shape:
+            dec_resized = F.interpolate(dec.unsqueeze(0), size=gt.shape[1:], mode="bilinear", align_corners=False).squeeze(0)
+        else:
+            dec_resized = dec
+        cos = F.cosine_similarity(dec_resized.flatten().unsqueeze(0), gt.flatten().unsqueeze(0)).item()
         cos_sims.append(cos)
     print(f"  Val decoded cosine: {np.mean(cos_sims):.4f}")
+    print(f"  Rendered resolution: {val_decoded[0].shape[1:] if val_decoded else 'N/A'}")
+    print(f"  GT resolution: {val_gt_1280[0].shape[1:] if val_gt_1280 else 'N/A'}")
+    
+    # Determine actual rendered feature resolution
+    rend_fH = val_decoded[0].shape[1] if val_decoded else getattr(config, "feature_height", 30)
+    rend_fW = val_decoded[0].shape[2] if val_decoded else getattr(config, "feature_width", 40)
+    gt_fH = val_gt_1280[0].shape[1] if val_gt_1280 else 30
+    gt_fW = val_gt_1280[0].shape[2] if val_gt_1280 else 40
     
     # Depth dirs (used as fallback when not mixed_split)
     train_depth = scene_root / train_split / "depth"
@@ -661,6 +673,7 @@ def main():
     val_gt_sub = [val_gt_1280[j] for j in range(len(val_indices))]
     oracle_depth = eval_depth_indexed(train_gt_sub, train_indices, train_depth,
                                        val_gt_sub, val_indices, val_depth,
+                                       fH=gt_fH, fW=gt_fW,
                                        train_dir_idx=train_depth_dir_idx,
                                        val_dir_idx=val_depth_dir_idx)
     print(f"  AbsRel={oracle_depth['depth_abs_rel']:.4f}  RMSE={oracle_depth['depth_rmse']:.4f}  δ<1.25={oracle_depth['depth_delta1']:.4f}")
@@ -668,6 +681,7 @@ def main():
     print("\n=== ORACLE: Segmentation (GT features) ===")
     oracle_seg = eval_seg_indexed(train_gt_sub, train_indices, train_sem,
                                    val_gt_sub, val_indices, val_sem,
+                                   fH=gt_fH, fW=gt_fW,
                                    train_dir_idx=train_sem_dir_idx,
                                    val_dir_idx=val_sem_dir_idx)
     print(f"  mIoU={oracle_seg['seg_mIoU']:.4f}  PixelAcc={oracle_seg['seg_pixel_acc']:.4f}")
@@ -676,6 +690,7 @@ def main():
     print("\n=== RENDERED: Depth (adapted heads) ===")
     rendered_depth = eval_depth_indexed(train_decoded, train_indices, train_depth,
                                          val_decoded, val_indices, val_depth,
+                                         fH=rend_fH, fW=rend_fW,
                                          train_dir_idx=train_depth_dir_idx,
                                          val_dir_idx=val_depth_dir_idx)
     print(f"  AbsRel={rendered_depth['depth_abs_rel']:.4f}  RMSE={rendered_depth['depth_rmse']:.4f}  δ<1.25={rendered_depth['depth_delta1']:.4f}")
@@ -683,6 +698,7 @@ def main():
     print("\n=== RENDERED: Segmentation (adapted heads) ===")
     rendered_seg = eval_seg_indexed(train_decoded, train_indices, train_sem,
                                      val_decoded, val_indices, val_sem,
+                                     fH=rend_fH, fW=rend_fW,
                                      train_dir_idx=train_sem_dir_idx,
                                      val_dir_idx=val_sem_dir_idx)
     print(f"  mIoU={rendered_seg['seg_mIoU']:.4f}  PixelAcc={rendered_seg['seg_pixel_acc']:.4f}")
@@ -690,6 +706,7 @@ def main():
     # ====== Evaluation Mode 2b: Geometric depth (scale-shift aligned) ======
     print("\n=== GEOMETRIC: Depth (3DGS rendered, scale-shift aligned, 30x40) ===")
     geom_depth = eval_geom_depth(val_geom_depths, val_indices, val_depth,
+                                  fH=rend_fH, fW=rend_fW,
                                   val_dir_idx=val_depth_dir_idx)
     print(f"  AbsRel={geom_depth['depth_abs_rel']:.4f}  RMSE={geom_depth['depth_rmse']:.4f}  δ<1.25={geom_depth['depth_delta1']:.4f}")
 
@@ -702,6 +719,7 @@ def main():
     print("\n=== FUSED: Depth (features + geometric depth) ===")
     fused_depth = eval_fused_depth(train_decoded, train_geom_depths, train_indices, train_depth,
                                     val_decoded, val_geom_depths, val_indices, val_depth,
+                                    fH=rend_fH, fW=rend_fW,
                                     train_dir_idx=train_depth_dir_idx,
                                     val_dir_idx=val_depth_dir_idx)
     print(f"  AbsRel={fused_depth['depth_abs_rel']:.4f}  RMSE={fused_depth['depth_rmse']:.4f}  δ<1.25={fused_depth['depth_delta1']:.4f}")
@@ -710,6 +728,7 @@ def main():
     print("\n=== CROSS: Depth (GT-trained, rendered-eval) ===")
     cross_depth = eval_depth_indexed(train_gt_sub, train_indices, train_depth,
                                       val_decoded, val_indices, val_depth,
+                                      fH=rend_fH, fW=rend_fW,
                                       train_dir_idx=train_depth_dir_idx,
                                       val_dir_idx=val_depth_dir_idx)
     print(f"  AbsRel={cross_depth['depth_abs_rel']:.4f}  RMSE={cross_depth['depth_rmse']:.4f}  δ<1.25={cross_depth['depth_delta1']:.4f}")
@@ -717,6 +736,7 @@ def main():
     print("\n=== CROSS: Segmentation (GT-trained, rendered-eval) ===")
     cross_seg = eval_seg_indexed(train_gt_sub, train_indices, train_sem,
                                   val_decoded, val_indices, val_sem,
+                                  fH=rend_fH, fW=rend_fW,
                                   train_dir_idx=train_sem_dir_idx,
                                   val_dir_idx=val_sem_dir_idx)
     print(f"  mIoU={cross_seg['seg_mIoU']:.4f}  PixelAcc={cross_seg['seg_pixel_acc']:.4f}")

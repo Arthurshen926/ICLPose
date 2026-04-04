@@ -1,0 +1,103 @@
+# RADIO-GS V3 Hybrid for room_2: 16d hybrid mainline + mixed split + geometry-depth supervision
+exp_name: "radio_gs_room2_hybrid_v3"
+output_dir: "output/radio_gs/room2_hybrid_v3"
+seed: 42
+
+# Scene
+scene: "room_2"
+ply_path: "output/2dgs_models/room_2/v8_fixed_poses/point_cloud/iteration_30000/point_cloud.ply"
+
+# RADIO
+radio_version: "c-radio_v4-h"
+radio_repo: "/root/RADIO"
+radio_feature_dim: 1280
+
+# Architecture
+architecture: "hybrid"
+hybrid_latent_dim: 16
+hash_levels: 16
+hash_features_per_level: 2
+hash_log2_size: 19
+hash_base_resolution: 16
+hash_max_resolution: 2048
+hash_output_dim: 48
+fine_dim: 32
+coarse_dim: 32
+hybrid_output_dim: 64
+
+# Training mode
+train_mode: "decoded"
+
+# HCD Codec
+bottleneck_dim: 64
+dual_stream: true
+
+# Self-rendered RGB-guided refiner
+use_refiner: true
+refiner_hidden_dim: 128
+refiner_num_blocks: 4
+refiner_dropout: 0.15
+refiner_rgb_guide: true
+refiner_norm_type: "gn"
+self_guided: true
+lr_refiner: 2.0e-4
+
+# FeatSharp
+featsharp_mode: "analytical"
+featsharp_strength: 0.3
+
+# Rendering
+image_height: 480
+image_width: 640
+fx: 320.0
+fy: 320.0
+cx: 319.5
+cy: 239.5
+feature_height: 30
+feature_width: 40
+max_channels_per_chunk: 32
+use_2dgs: true
+
+# Training
+epochs: 60
+batch_size: 4
+lr_features: 3.0e-4
+lr_hash: 5.0e-4
+lr_decoder: 1.0e-4
+lr_heads: 1.0e-4
+weight_decay: 2.0e-4
+grad_clip: 5.0
+warmup_epochs: 5
+scheduler: "cosine"
+
+# Loss weights
+l2_weight: 1.0
+cosine_weight: 3.0
+adaptor_weight: 0.5
+tv_weight: 0.1
+feat_norm_weight: 0.01
+depth_loss_weight: 0.2
+geom_depth_loss_weight: 0.1
+depth_alpha_threshold: 0.05
+depth_head_type: "mlp"
+depth_head_hidden_dim: 128
+depth_head_num_layers: 3
+
+# Data — mixed sequence split
+feature_dir: "output/radio_features_1280d/room_2/Sequence_1"
+depth_dir: "dataset/room_2/Sequence_1/depth"
+semantics_dir: "dataset/room_2/Sequence_1/semantic_class"
+train_split: "Sequence_1"
+val_split: "Sequence_2"
+mixed_split: true
+mixed_train_ratio: 0.8
+mixed_seed: 42
+num_workers: 4
+
+# Downstream tasks
+seg_num_classes: 101
+
+# Checkpointing
+save_every: 5
+eval_every: 5
+log_every: 50

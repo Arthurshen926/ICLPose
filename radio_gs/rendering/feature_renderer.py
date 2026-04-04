@@ -231,24 +231,28 @@ class FeatureFieldRenderer(nn.Module):
 
         Ks = self.K.unsqueeze(0).expand(B, -1, -1)
         bg = torch.zeros(B, 3, device=means.device)
+        bg_rgbed = torch.zeros(B, 4, device=means.device) if self.use_2dgs else None
 
         # Render RGB per-view (gsplat SH eval requires per-view)
         rgb_list = []
+        geom_depth_list = []
+        geom_alpha_list = []
         for b in range(B):
             raster_fn = rasterization_2dgs if self.use_2dgs else rasterization
             if self.use_2dgs:
-                renders, alphas, *_ = raster_fn(
+                renders, alphas, _normals, _nd, _distort, _median, info = raster_fn(
                     means=means, quats=quats,
                     scales=torch.exp(scales) if not hasattr(gaussian_model, 'get_scaling') else scales,
                     opacities=opacities, colors=colors,
                     viewmats=viewmats[b:b+1], Ks=Ks[b:b+1],
                     width=fW, height=fH,
                     near_plane=self.near_plane, far_plane=self.far_plane,
-                    backgrounds=bg[b:b+1],
+                    backgrounds=bg_rgbed[b:b+1],
+                    render_mode="RGB+ED",
                     sh_degree=sh_degree if sh_degree and sh_degree > 0 else None,
                 )
             else:
-                renders, alphas, _ = raster_fn(
+                renders, alphas, info = raster_fn(
                     means=means, quats=quats, scales=scales,
                     opacities=opacities, colors=colors,
                     viewmats=viewmats[b:b+1], Ks=Ks[b:b+1],
@@ -257,9 +261,16 @@ class FeatureFieldRenderer(nn.Module):
                     backgrounds=bg[b:b+1],
                     sh_degree=sh_degree if sh_degree and sh_degree > 0 else None,
                 )
-            rgb_list.append(renders[0].permute(2, 0, 1).clamp(0.0, 1.0))
+            rgb_render = renders[0, ..., :3] if self.use_2dgs else renders[0]
+            rgb_list.append(rgb_render.permute(2, 0, 1).clamp(0.0, 1.0))
+            geom_alpha_list.append(alphas[0, :, :, 0])
+            if self.use_2dgs:
+                geom_depth_list.append(renders[0, :, :, 3])
 
         feat_result["rgb"] = torch.stack(rgb_list, dim=0)  # [B, 3, fH, fW]
+        feat_result["geom_alpha"] = torch.stack(geom_alpha_list, dim=0)  # [B, fH, fW]
+        if geom_depth_list:
+            feat_result["geom_depth"] = torch.stack(geom_depth_list, dim=0)  # [B, fH, fW]
         return feat_result
 
     def render_rgb(
@@ -311,6 +322,7 @@ class FeatureFieldRenderer(nn.Module):
         Ks = self.K.unsqueeze(0)           # [1, 3, 3]
 
         bg = torch.ones(3, device=device)
+        bg_rgbed = torch.tensor([1.0, 1.0, 1.0, 0.0], device=device) if self.use_2dgs else None
 
         raster_fn = rasterization_2dgs if self.use_2dgs else rasterization
 
@@ -334,7 +346,8 @@ class FeatureFieldRenderer(nn.Module):
                 height=H,
                 near_plane=self.near_plane,
                 far_plane=self.far_plane,
-                backgrounds=bg.unsqueeze(0),
+                backgrounds=bg_rgbed.unsqueeze(0),
+                render_mode="RGB+ED",
                 sh_degree=sh_degree,
             )
         else:
@@ -355,12 +368,13 @@ class FeatureFieldRenderer(nn.Module):
             )
         # renders: [1, H, W, 3], alphas: [1, H, W, 1]
 
-        rgb = renders[0].permute(2, 0, 1).clamp(0.0, 1.0)   # [3, H, W]
+        rgb_render = renders[0, ..., :3] if self.use_2dgs else renders[0]
+        rgb = rgb_render.permute(2, 0, 1).clamp(0.0, 1.0)   # [3, H, W]
         alpha = alphas[0, :, :, 0]           # [H, W]
 
         depth_map = torch.zeros(H, W, device=device)
         if self.use_2dgs:
-            depth_map = _median[0, :, :, 0]
+            depth_map = renders[0, :, :, 3]
         elif "depths" in info:
             depth_map = info["depths"][0, :, :, 0]
 
