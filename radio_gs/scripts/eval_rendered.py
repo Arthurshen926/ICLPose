@@ -740,18 +740,44 @@ def main():
                                   train_dir_idx=train_sem_dir_idx,
                                   val_dir_idx=val_sem_dir_idx)
     print(f"  mIoU={cross_seg['seg_mIoU']:.4f}  PixelAcc={cross_seg['seg_pixel_acc']:.4f}")
-    
+
+    # ====== Seg-based Grounding (replaces broken SigLIP2 projection) ======
+    print("\n=== ORACLE: Seg-Grounding (GT features) ===")
+    oracle_grnd = eval_seg_grounding(train_gt_sub, train_indices, train_sem,
+                                     val_gt_sub, val_indices, val_sem,
+                                     scene=scene, fH=gt_fH, fW=gt_fW,
+                                     train_dir_idx=train_sem_dir_idx,
+                                     val_dir_idx=val_sem_dir_idx)
+
+    print("\n=== RENDERED: Seg-Grounding (adapted heads) ===")
+    rendered_grnd = eval_seg_grounding(train_decoded, train_indices, train_sem,
+                                       val_decoded, val_indices, val_sem,
+                                       scene=scene, fH=rend_fH, fW=rend_fW,
+                                       train_dir_idx=train_sem_dir_idx,
+                                       val_dir_idx=val_sem_dir_idx)
+
+    print("\n=== CROSS: Seg-Grounding (GT-trained, rendered-eval) ===")
+    cross_grnd = eval_seg_grounding(train_gt_sub, train_indices, train_sem,
+                                    val_decoded, val_indices, val_sem,
+                                    scene=scene, fH=rend_fH, fW=rend_fW,
+                                    train_dir_idx=train_sem_dir_idx,
+                                    val_dir_idx=val_sem_dir_idx)
+
+    # Helper to safely extract grounding metrics
+    def _g(d, key, default="   N/A"):
+        return f"{d[key]:>8.4f}" if d and key in d else f"{default:>8}"
+
     # Summary table
-    print("\n" + "="*90)
-    print(f"{'Mode':<25} {'AbsRel':>8} {'RMSE':>8} {'δ<1.25':>8} {'mIoU':>8} {'PixAcc':>8}")
-    print("-"*90)
-    print(f"{'Oracle (GT feat)':<25} {oracle_depth['depth_abs_rel']:>8.4f} {oracle_depth['depth_rmse']:>8.4f} {oracle_depth['depth_delta1']:>8.4f} {oracle_seg['seg_mIoU']:>8.4f} {oracle_seg['seg_pixel_acc']:>8.4f}")
-    print(f"{'Rendered (adapted)':<25} {rendered_depth['depth_abs_rel']:>8.4f} {rendered_depth['depth_rmse']:>8.4f} {rendered_depth['depth_delta1']:>8.4f} {rendered_seg['seg_mIoU']:>8.4f} {rendered_seg['seg_pixel_acc']:>8.4f}")
-    print(f"{'Geom 30x40':<25} {geom_depth['depth_abs_rel']:>8.4f} {geom_depth['depth_rmse']:>8.4f} {geom_depth['depth_delta1']:>8.4f} {'   N/A':>8} {'   N/A':>8}")
-    print(f"{'Geom full-res':<25} {geom_hr_depth['depth_abs_rel']:>8.4f} {geom_hr_depth['depth_rmse']:>8.4f} {geom_hr_depth['depth_delta1']:>8.4f} {'   N/A':>8} {'   N/A':>8}")
-    print(f"{'Fused (feat+geom)':<25} {fused_depth['depth_abs_rel']:>8.4f} {fused_depth['depth_rmse']:>8.4f} {fused_depth['depth_delta1']:>8.4f} {'   N/A':>8} {'   N/A':>8}")
-    print(f"{'Cross (GT→render)':<25} {cross_depth['depth_abs_rel']:>8.4f} {cross_depth['depth_rmse']:>8.4f} {cross_depth['depth_delta1']:>8.4f} {cross_seg['seg_mIoU']:>8.4f} {cross_seg['seg_pixel_acc']:>8.4f}")
-    print("="*90)
+    print("\n" + "="*114)
+    print(f"{'Mode':<25} {'AbsRel':>8} {'RMSE':>8} {'δ<1.25':>8} {'mIoU':>8} {'PixAcc':>8} {'Grnd_mAP':>9} {'Grnd_IoU':>9} {'Grnd_Cor':>9}")
+    print("-"*114)
+    print(f"{'Oracle (GT feat)':<25} {oracle_depth['depth_abs_rel']:>8.4f} {oracle_depth['depth_rmse']:>8.4f} {oracle_depth['depth_delta1']:>8.4f} {oracle_seg['seg_mIoU']:>8.4f} {oracle_seg['seg_pixel_acc']:>8.4f} {_g(oracle_grnd, 'grnd_mAP')} {_g(oracle_grnd, 'grnd_mIoU@0.5')} {_g(oracle_grnd, 'grnd_corr')}")
+    print(f"{'Rendered (adapted)':<25} {rendered_depth['depth_abs_rel']:>8.4f} {rendered_depth['depth_rmse']:>8.4f} {rendered_depth['depth_delta1']:>8.4f} {rendered_seg['seg_mIoU']:>8.4f} {rendered_seg['seg_pixel_acc']:>8.4f} {_g(rendered_grnd, 'grnd_mAP')} {_g(rendered_grnd, 'grnd_mIoU@0.5')} {_g(rendered_grnd, 'grnd_corr')}")
+    print(f"{'Geom 30x40':<25} {geom_depth['depth_abs_rel']:>8.4f} {geom_depth['depth_rmse']:>8.4f} {geom_depth['depth_delta1']:>8.4f} {'   N/A':>8} {'   N/A':>8} {'   N/A':>9} {'   N/A':>9} {'   N/A':>9}")
+    print(f"{'Geom full-res':<25} {geom_hr_depth['depth_abs_rel']:>8.4f} {geom_hr_depth['depth_rmse']:>8.4f} {geom_hr_depth['depth_delta1']:>8.4f} {'   N/A':>8} {'   N/A':>8} {'   N/A':>9} {'   N/A':>9} {'   N/A':>9}")
+    print(f"{'Fused (feat+geom)':<25} {fused_depth['depth_abs_rel']:>8.4f} {fused_depth['depth_rmse']:>8.4f} {fused_depth['depth_delta1']:>8.4f} {'   N/A':>8} {'   N/A':>8} {'   N/A':>9} {'   N/A':>9} {'   N/A':>9}")
+    print(f"{'Cross (GT→render)':<25} {cross_depth['depth_abs_rel']:>8.4f} {cross_depth['depth_rmse']:>8.4f} {cross_depth['depth_delta1']:>8.4f} {cross_seg['seg_mIoU']:>8.4f} {cross_seg['seg_pixel_acc']:>8.4f} {_g(cross_grnd, 'grnd_mAP')} {_g(cross_grnd, 'grnd_mIoU@0.5')} {_g(cross_grnd, 'grnd_corr')}")
+    print("="*114)
 
 
 def eval_depth_indexed(train_feats, train_idx, depth_dir, val_feats, val_idx, val_depth_dir, fH=30, fW=40,
@@ -900,6 +926,172 @@ def eval_seg_indexed(train_feats, train_idx, sem_dir, val_feats, val_idx, val_se
             ious.append((inter / union).item())
     
     return {"seg_mIoU": np.mean(ious), "seg_pixel_acc": (all_preds == all_gts).float().mean().item(), "seg_n_classes": len(ious)}
+
+
+def eval_seg_grounding(train_feats, train_idx, sem_dir, val_feats, val_idx, val_sem_dir,
+                       scene="room_0", fH=30, fW=40,
+                       train_dir_idx=None, val_dir_idx=None):
+    """Evaluate text grounding using segmentation probe softmax as heatmap.
+
+    Instead of projecting to SigLIP2 space and computing cosine similarity
+    with text embeddings (which gives near-random results), this function
+    trains a per-pixel linear segmentation probe and uses the softmax
+    probability for each grounding query's class as the grounding heatmap.
+
+    Metrics per query:
+      - IoU@0.5: threshold softmax probability at 0.5 → binary mask vs GT
+      - mAP: average precision using softmax probability as confidence score
+      - Heatmap correlation: Pearson correlation between softmax heatmap and GT binary mask
+    """
+    from radio_gs.replica_constants import GROUNDING_QUERIES, REPLICA_CLASSES, ROOM_CLASS_IDS
+
+    # ── Train segmentation probe (same as eval_seg_indexed) ──────────────
+    _train_pairs = train_dir_idx if train_dir_idx else [(sem_dir, i) for i in train_idx]
+    _val_pairs = val_dir_idx if val_dir_idx else [(val_sem_dir, i) for i in val_idx]
+
+    train_X, train_Y = [], []
+    for feat, (sdir, i) in zip(train_feats, _train_pairs):
+        spath = Path(sdir) / f"semantic_class_{i}.png"
+        if not spath.exists():
+            continue
+        sem = cv2.imread(str(spath), cv2.IMREAD_GRAYSCALE)
+        if sem is None:
+            continue
+        sem = torch.from_numpy(sem.astype(np.int64))
+        sem = F.interpolate(sem.float().unsqueeze(0).unsqueeze(0),
+                            (fH, fW), mode="nearest").squeeze().long()
+        C = feat.shape[0]
+        if feat.shape[1:] != (fH, fW):
+            feat = F.interpolate(feat.unsqueeze(0), (fH, fW),
+                                 mode="bilinear", align_corners=False).squeeze(0)
+        train_X.append(feat.reshape(C, -1).T)
+        train_Y.append(sem.reshape(-1))
+
+    train_X = torch.cat(train_X, 0).to(device)
+    train_Y = torch.cat(train_Y, 0).to(device)
+
+    unique_classes = torch.unique(train_Y).tolist()
+    id_to_contiguous = {c: i for i, c in enumerate(unique_classes)}
+    contiguous_to_id = {i: c for c, i in id_to_contiguous.items()}
+    train_Y_mapped = torch.tensor([id_to_contiguous[y.item()] for y in train_Y],
+                                  dtype=torch.long, device=device)
+    n_classes = len(unique_classes)
+
+    counts = torch.bincount(train_Y_mapped, minlength=n_classes).float().clamp(min=1)
+    weights = (1.0 / counts)
+    weights = (weights / weights.sum() * n_classes).to(device)
+
+    probe = _build_probe(train_X.shape[1], n_classes)
+    _train_probe(probe, train_X, train_Y_mapped, epochs=500, task="classification",
+                 class_weights=weights)
+
+    # ── Determine active grounding queries for this scene ────────────────
+    room_ids = ROOM_CLASS_IDS.get(scene, set())
+    active_queries = {}
+    for qname, cid in sorted(GROUNDING_QUERIES.items(), key=lambda x: x[1]):
+        if cid in id_to_contiguous and (not room_ids or cid in room_ids):
+            active_queries[qname] = cid
+    if not active_queries:
+        print("  No grounding queries matched scene classes — skipping.")
+        return {}
+
+    print(f"  Seg-grounding: {len(active_queries)} queries for {scene}: "
+          f"{list(active_queries.keys())}")
+
+    # ── Evaluate on validation set ───────────────────────────────────────
+    per_query_iou = {q: [] for q in active_queries}
+    per_query_ap = {q: [] for q in active_queries}
+    per_query_corr = {q: [] for q in active_queries}
+
+    with torch.no_grad():
+        for feat, (sdir, i) in zip(val_feats, _val_pairs):
+            spath = Path(sdir) / f"semantic_class_{i}.png"
+            if not spath.exists():
+                continue
+            sem = cv2.imread(str(spath), cv2.IMREAD_GRAYSCALE)
+            if sem is None:
+                continue
+            sem = torch.from_numpy(sem.astype(np.int64))
+            sem = F.interpolate(sem.float().unsqueeze(0).unsqueeze(0),
+                                (fH, fW), mode="nearest").squeeze().long()
+
+            C = feat.shape[0]
+            if feat.shape[1:] != (fH, fW):
+                feat_r = F.interpolate(feat.unsqueeze(0).to(device), (fH, fW),
+                                       mode="bilinear", align_corners=False).squeeze(0)
+            else:
+                feat_r = feat.to(device)
+
+            # Get softmax probabilities over all classes
+            logits = probe(feat_r.reshape(C, -1).T)          # [H*W, n_classes]
+            probs = F.softmax(logits, dim=1)                  # [H*W, n_classes]
+            probs_2d = probs.T.reshape(n_classes, fH, fW)     # [n_classes, H, W]
+
+            for qname, cid in active_queries.items():
+                gt_mask = (sem == cid)
+                if gt_mask.sum() == 0:
+                    continue
+
+                cont_id = id_to_contiguous[cid]
+                heatmap = probs_2d[cont_id]                   # [H, W] on device
+                gt_mask_dev = gt_mask.to(device)
+                gt_binary = gt_mask_dev.float()
+
+                # IoU @ 0.5
+                pred_mask = heatmap > 0.5
+                inter = (pred_mask & gt_mask_dev).float().sum()
+                union = (pred_mask | gt_mask_dev).float().sum()
+                iou = (inter / union).item() if union > 0 else 0.0
+                per_query_iou[qname].append(iou)
+
+                # Average Precision
+                scores = heatmap.flatten().float()
+                labels = gt_binary.flatten()
+                sorted_idx = scores.argsort(descending=True)
+                labels_sorted = labels[sorted_idx]
+                tp_cum = labels_sorted.cumsum(0)
+                precision = tp_cum / torch.arange(
+                    1, len(labels_sorted) + 1, device=device, dtype=torch.float32)
+                ap = (precision * labels_sorted).sum() / labels_sorted.sum()
+                per_query_ap[qname].append(ap.item())
+
+                # Pearson correlation between heatmap and GT binary mask
+                h = heatmap.flatten().float()
+                g = gt_binary.flatten()
+                h_centered = h - h.mean()
+                g_centered = g - g.mean()
+                denom = h_centered.norm() * g_centered.norm()
+                corr = (h_centered @ g_centered / denom).item() if denom > 0 else 0.0
+                per_query_corr[qname].append(corr)
+
+    # ── Aggregate and print ──────────────────────────────────────────────
+    print(f"\n  {'Query':<18} {'IoU@0.5':>8} {'mAP':>8} {'Corr':>8} {'#frames':>8}")
+    print(f"  {'-'*54}")
+    all_ious, all_aps, all_corrs = [], [], []
+    for qname in active_queries:
+        if not per_query_iou[qname]:
+            continue
+        m_iou = np.mean(per_query_iou[qname])
+        m_ap = np.mean(per_query_ap[qname])
+        m_corr = np.mean(per_query_corr[qname])
+        n_frames = len(per_query_iou[qname])
+        print(f"  {qname:<18} {m_iou:>8.4f} {m_ap:>8.4f} {m_corr:>8.4f} {n_frames:>8d}")
+        all_ious.append(m_iou)
+        all_aps.append(m_ap)
+        all_corrs.append(m_corr)
+
+    mean_iou = np.mean(all_ious) if all_ious else 0.0
+    mean_ap = np.mean(all_aps) if all_aps else 0.0
+    mean_corr = np.mean(all_corrs) if all_corrs else 0.0
+    print(f"  {'-'*54}")
+    print(f"  {'MEAN':<18} {mean_iou:>8.4f} {mean_ap:>8.4f} {mean_corr:>8.4f}")
+
+    return {
+        "grnd_mIoU@0.5": mean_iou,
+        "grnd_mAP": mean_ap,
+        "grnd_corr": mean_corr,
+        "grnd_n_queries": len(all_ious),
+    }
 
 
 def eval_geom_depth(geom_depths, val_idx, val_depth_dir, fH=30, fW=40, val_dir_idx=None):
