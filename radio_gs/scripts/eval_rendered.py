@@ -93,6 +93,7 @@ def load_model_and_render(config_path, checkpoint_path):
         input_dim=getattr(config, "radio_feature_dim", 1280),
         bottleneck_dim=getattr(config, "bottleneck_dim", 64),
         dual_stream=getattr(config, "dual_stream", True),
+        symmetric_decoder=getattr(config, "symmetric_decoder", False),
     ).to(device).eval()
     
     renderer = FeatureFieldRenderer(

@@ -107,6 +107,8 @@ def load_model_and_render_pipeline(config_path, checkpoint_path):
     codec = HCDCodec(
         input_dim=getattr(config, "radio_feature_dim", 1280),
         bottleneck_dim=getattr(config, "bottleneck_dim", 64),
+        dual_stream=getattr(config, "dual_stream", True),
+        symmetric_decoder=getattr(config, "symmetric_decoder", False),
     ).to(device).eval()
 
     fH = getattr(config, "feature_height", 30)
@@ -209,13 +211,13 @@ def project_to_siglip2(features_1280, proj_model):
     return siglip_feat.permute(0, 2, 1).reshape(B, -1, H, W)  # [B, 1536, H, W]
 
 
-def compute_heatmaps(visual_feat, text_emb, temperature=0.07):
+def compute_heatmaps(visual_feat, text_emb, temperature=1.0):
     """Compute per-query cosine similarity heatmaps with softmax normalization.
 
     Args:
         visual_feat: [1, D, H, W] normalized SigLIP2 visual features.
         text_emb: [N, D] normalized text embeddings.
-        temperature: Softmax temperature for cross-query normalization.
+        temperature: Softmax temperature (1.0 recommended; 0.07 was too aggressive).
 
     Returns:
         raw_sim: [N, H, W] raw cosine similarity heatmaps.

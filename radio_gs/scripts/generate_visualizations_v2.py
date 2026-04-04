@@ -103,6 +103,7 @@ def load_pipeline(config_path, checkpoint_path):
         input_dim=getattr(config, "radio_feature_dim", 1280),
         bottleneck_dim=getattr(config, "bottleneck_dim", 64),
         dual_stream=getattr(config, "dual_stream", True),
+        symmetric_decoder=getattr(config, "symmetric_decoder", False),
     ).to(device).eval()
 
     renderer = build_renderer(config)
@@ -285,23 +286,25 @@ def smooth_depth_for_display(depth, valid_mask=None, guide_rgb=None):
     return d_smooth
 
 
-def grounding_mask_from_probs(prob_map, prob_stack, query_idx, base_threshold=0.35):
-    """Create a text-derived binary mask from per-query grounding probabilities."""
-    num_queries = max(prob_stack.shape[0], 1)
-    baseline = 1.0 / num_queries
-    adaptive_thresh = max(
-        baseline + 0.05,
-        min(float(base_threshold), float(np.percentile(prob_map, 90))),
-    )
+def grounding_mask_from_probs(prob_map, prob_stack, query_idx, base_threshold=None):
+    """Create binary mask from softmax probabilities using per-query thresholding.
+
+    Uses argmax winner + 75th-percentile threshold for robust mask generation.
+    """
     winner = prob_stack.argmax(axis=0) == query_idx
-    mask = winner & (prob_map >= adaptive_thresh)
+    # Threshold at 75th percentile of this query's probability distribution
+    thresh = float(np.percentile(prob_map, 75.0))
+    thresh = max(thresh, 0.01)
+    mask = winner & (prob_map >= thresh)
     if not mask.any():
-        fallback_thresh = max(baseline, float(np.percentile(prob_map, 95)))
-        mask = winner & (prob_map >= fallback_thresh)
+        # Fallback: just use argmax winner above median
+        thresh = float(np.median(prob_map))
+        mask = winner & (prob_map >= thresh)
     mask_u8 = mask.astype(np.uint8)
-    kernel = np.ones((3, 3), dtype=np.uint8)
-    mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_OPEN, kernel)
-    mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, kernel)
+    if mask_u8.any():
+        kernel = np.ones((3, 3), dtype=np.uint8)
+        mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_OPEN, kernel)
+        mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, kernel)
     return mask_u8
 
 
@@ -639,7 +642,10 @@ def predict_fused_depth(probe, feat, geom_depth, fH, fW):
 # ── SigLIP2 grounding ────────────────────────────────────────────────────────
 
 def load_siglip2_projection(projection_weights):
-    """Load SigLIP2 feature projection model."""
+    """Load SigLIP2 feature projection model.
+
+    Handles both standalone projection weights and full RADIO checkpoint files.
+    """
     from timm.models.vision_transformer import Block
 
     class SigLIP2FeatureProjection(nn.Module):
@@ -659,7 +665,22 @@ def load_siglip2_projection(projection_weights):
             return self.mlp_final(x)
 
     proj = SigLIP2FeatureProjection()
-    proj.load_state_dict(torch.load(projection_weights, map_location="cpu"))
+    ckpt = torch.load(projection_weights, map_location="cpu")
+    # Handle full RADIO checkpoint vs standalone projection weights
+    if "state_dict" in ckpt:
+        # Full RADIO checkpoint — extract SigLIP2 adaptor head weights
+        sd = ckpt["state_dict"]
+        prefix = "model.summary.adaptors.siglip2."
+        proj_sd = {}
+        for k, v in sd.items():
+            if k.startswith(prefix):
+                new_key = k[len(prefix):]
+                proj_sd[new_key] = v
+        if not proj_sd:
+            raise RuntimeError(f"No SigLIP2 adaptor keys found in checkpoint with prefix '{prefix}'")
+        proj.load_state_dict(proj_sd)
+    else:
+        proj.load_state_dict(ckpt)
     return proj.to(device).half().eval()
 
 
@@ -759,14 +780,14 @@ def select_scene_text_embeddings(
     return torch.stack(selected_embeddings).to(device).half(), selected_sources
 
 
-def compute_grounding_heatmaps(features_1280, proj_model, text_emb, temperature=0.07):
-    """Compute text grounding heatmaps with direct cosine-softmax normalization.
+def compute_grounding_heatmaps(features_1280, proj_model, text_emb, temperature=1.0):
+    """Compute text grounding heatmaps with cosine-softmax normalization.
 
     Args:
         features_1280: [1, 1280, H, W]
         proj_model: SigLIP2 projection
         text_emb: [K, 1536] normalized text embeddings
-        temperature: softmax temperature for cross-query normalization
+        temperature: softmax temperature (1.0 recommended; 0.07 is too aggressive)
 
     Returns:
         raw_sim: [K, H, W] raw cosine similarity heatmaps
@@ -776,13 +797,13 @@ def compute_grounding_heatmaps(features_1280, proj_model, text_emb, temperature=
     feat_flat = features_1280.reshape(B, C, H * W).permute(0, 2, 1)
     with torch.no_grad():
         siglip = proj_model(feat_flat.half())
-    siglip = F.normalize(siglip, dim=-1).squeeze(0)  # [HW, 1536]
+    siglip = F.normalize(siglip.float(), dim=-1).squeeze(0)  # [HW, 1536]
 
-    # Raw cosine similarity
-    raw_sim = text_emb @ siglip.T  # [K, HW]
+    # Raw cosine similarity (ensure float32 for both operands)
+    raw_sim = text_emb.float() @ siglip.float().T  # [K, HW]
     raw_sim = raw_sim.float().reshape(-1, H, W)
 
-    # Softmax directly across queries so probabilities preserve relative relevance.
+    # Softmax across queries with moderate temperature
     K = raw_sim.shape[0]
     sim_flat = raw_sim.reshape(K, -1)  # [K, HW]
     probs = F.softmax(sim_flat / temperature, dim=0)   # softmax across queries
