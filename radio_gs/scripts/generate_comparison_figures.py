@@ -54,18 +54,7 @@ DEFAULT_METHODS = [
     },
 ]
 
-REPLICA_CLASSES = {
-    0: "undefined", 11: "wall", 12: "floor", 13: "ceiling", 20: "door",
-    29: "table", 31: "chair", 40: "window", 44: "picture", 47: "cabinet",
-    59: "cushion", 60: "sofa", 63: "bed", 64: "curtain",
-    65: "chest of drawers", 76: "plant", 80: "stool", 92: "lamp",
-    93: "shelf", 97: "blanket", 98: "mirror",
-}
-
-SEG_COLORS = {}
-np.random.seed(42)
-for cid in REPLICA_CLASSES:
-    SEG_COLORS[cid] = (40, 40, 40) if cid == 0 else tuple(np.random.randint(60, 255, 3).tolist())
+from radio_gs.replica_constants import REPLICA_CLASSES, SEG_COLORS
 
 
 # ── Pipeline loading ──────────────────────────────────────────────────────────

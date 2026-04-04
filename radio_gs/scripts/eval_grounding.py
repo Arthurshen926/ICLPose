@@ -22,37 +22,16 @@ from timm.models.vision_transformer import Block
 sys.path.insert(0, '.')
 from radio_gs.config import load_config
 from radio_gs.models.explicit_gaussian import ExplicitFeatureGaussian
+from radio_gs.models.hybrid_gaussian import HybridFeatureGaussian
 from radio_gs.models.hcd_codec import HCDCodec
 from radio_gs.models.featsharp_3d import FeatSharp3D
 from radio_gs.models.screen_refiner import ScreenSpaceRefiner
 from radio_gs.rendering.feature_renderer import FeatureFieldRenderer
 
 device = torch.device("cuda")
+DEFAULT_SIGLIP2_TEXT_EMBEDDINGS = "output/radio_gs/siglip2_text_embeddings_v2.pt"
 
-# Standard Replica semantic class names (NYU-style) mapped to class IDs in room_0
-REPLICA_CLASSES = {
-    0: "undefined",
-    11: "wall",
-    12: "floor",
-    13: "ceiling",
-    20: "door",
-    29: "table",
-    31: "chair",
-    40: "window",
-    44: "picture",
-    47: "cabinet",
-    59: "cushion",
-    60: "sofa",
-    63: "bed",
-    64: "curtain",
-    65: "chest of drawers",
-    76: "plant",
-    80: "stool",
-    92: "lamp",
-    93: "shelf",
-    97: "blanket",
-    98: "mirror",
-}
+from radio_gs.replica_constants import REPLICA_CLASSES, GROUNDING_QUERIES, SEG_COLORS
 
 
 class SigLIP2FeatureProjection(nn.Module):
@@ -101,7 +80,25 @@ def load_model_and_render_pipeline(config_path, checkpoint_path):
     """Load trained RADIO-GS model and components."""
     config = load_config(config_path)
 
-    model = ExplicitFeatureGaussian(latent_dim=getattr(config, "latent_dim", 64))
+    architecture = getattr(config, "architecture", "explicit")
+    is_hybrid = architecture == "hybrid"
+    if is_hybrid:
+        latent_dim = getattr(config, "hybrid_latent_dim", 16)
+        model = HybridFeatureGaussian(
+            latent_dim=latent_dim,
+            hash_output_dim=getattr(config, "hash_output_dim", 48),
+            fine_dim=getattr(config, "fine_dim", 64),
+            coarse_dim=getattr(config, "coarse_dim", 64),
+            output_dim=getattr(config, "hybrid_output_dim", 128),
+            num_levels=getattr(config, "hash_levels", 16),
+            features_per_level=getattr(config, "hash_features_per_level", 2),
+            log2_hashmap_size=getattr(config, "hash_log2_size", 19),
+            base_resolution=getattr(config, "hash_base_resolution", 16),
+            max_resolution=getattr(config, "hash_max_resolution", 2048),
+        )
+    else:
+        latent_dim = getattr(config, "latent_dim", 64)
+        model = ExplicitFeatureGaussian(latent_dim=latent_dim)
     ply_path = getattr(config, "ply_path", "")
     if ply_path:
         model.load_from_ply(ply_path)
@@ -126,7 +123,7 @@ def load_model_and_render_pipeline(config_path, checkpoint_path):
 
     sharpener = FeatSharp3D(
         mode=getattr(config, "featsharp_mode", "analytical"),
-        feature_dim=getattr(config, "latent_dim", 64),
+        feature_dim=latent_dim,
         strength=getattr(config, "featsharp_strength", 0.3),
     ).to(device).eval()
 
@@ -140,7 +137,7 @@ def load_model_and_render_pipeline(config_path, checkpoint_path):
             extra_ch += 3 if depth_grad_enabled else 1
         norm_type = getattr(config, "refiner_norm_type", "gn")
         refiner = ScreenSpaceRefiner(
-            latent_dim=getattr(config, "latent_dim", 64),
+            latent_dim=latent_dim,
             hidden_dim=getattr(config, "refiner_hidden_dim", 128),
             num_blocks=getattr(config, "refiner_num_blocks", 4),
             dropout=getattr(config, "refiner_dropout", 0.1),
@@ -156,11 +153,27 @@ def load_model_and_render_pipeline(config_path, checkpoint_path):
     if refiner is not None and "refiner_state_dict" in ckpt:
         refiner.load_state_dict(ckpt["refiner_state_dict"], strict=False)
 
-    return model, codec, renderer, sharpener, refiner, config
+    return model, codec, renderer, sharpener, refiner, config, is_hybrid
+
+
+def _hybrid_decode(model, rendered, result, pose_w2c, K):
+    """Apply hybrid hash-grid decode to rendered latent features."""
+    from radio_gs.models.hybrid_gaussian import unproject_depth_to_positions
+
+    depth_map = result["depth_map"].float()
+    H, W = depth_map.shape[1], depth_map.shape[2]
+    position_map = unproject_depth_to_positions(depth_map, pose_w2c.float(), K.float(), H, W)
+    xyz = model.get_xyz()
+    margin = 0.1
+    lo = xyz.min(dim=0).values - margin
+    hi = xyz.max(dim=0).values + margin
+    extent = (hi - lo).clamp(min=1e-6)
+    position_map = ((position_map - lo.view(1, 3, 1, 1)) / extent.view(1, 3, 1, 1)).clamp(0, 1)
+    return model.decode_screen_space(rendered.float(), position_map)
 
 
 def render_1280d(model, codec, renderer, sharpener, refiner, viewmat,
-                 rgb_guide=None, self_guided=False):
+                 rgb_guide=None, self_guided=False, is_hybrid=False):
     """Render a single frame's 1280d decoded features.
     
     Args:
@@ -180,6 +193,8 @@ def render_1280d(model, codec, renderer, sharpener, refiner, viewmat,
         latent = sharpener(latent)
         if refiner is not None:
             latent = refiner(latent, guide=rgb_guide)
+        if is_hybrid:
+            latent = _hybrid_decode(model, latent, result, viewmat, renderer.K)
         decoded = codec.decode(latent)  # [1, 1280, H, W]
     return decoded
 
@@ -224,33 +239,131 @@ def load_semantic_gt(sem_dir, idx, target_size):
     return torch.from_numpy(sem.astype(np.int64))
 
 
+def load_text_embedding_candidates(text_emb_path):
+    """Load one or more SigLIP2 text banks and prefer v2 by default."""
+    text_emb_path = Path(text_emb_path)
+    if text_emb_path.name.startswith("siglip2_text_embeddings"):
+        candidate_paths = sorted(
+            text_emb_path.parent.glob("siglip2_text_embeddings*.pt"),
+            key=lambda p: (
+                0 if p.name == "siglip2_text_embeddings_v2.pt" else 1,
+                0 if p.name == text_emb_path.name else 1,
+                p.name,
+            ),
+        )
+        if not candidate_paths:
+            candidate_paths = [text_emb_path]
+    else:
+        candidate_paths = [text_emb_path]
+
+    candidates = []
+    for path in candidate_paths:
+        if not path.exists():
+            continue
+        data = torch.load(str(path), map_location="cpu")
+        bank = {
+            q: F.normalize(e.float(), dim=0)
+            for q, e in zip(data["queries"], data["embeddings"])
+        }
+        candidates.append((path.name, bank))
+    if not candidates:
+        raise FileNotFoundError(f"No valid text embedding banks found from {text_emb_path}")
+    return candidates
+
+
+def select_scene_text_embeddings(
+    candidates,
+    proj_model,
+    gt_feat_dir,
+    sem_dir,
+    active_queries,
+    active_class_ids,
+    n_frames,
+    fH,
+    fW,
+    max_frames=32,
+):
+    """Pick the best bank per query using GT feature/semantic agreement."""
+    if len(candidates) == 1:
+        name, bank = candidates[0]
+        return (
+            torch.stack([bank[q] for q in active_queries]).to(device).half(),
+            {q: name for q in active_queries},
+        )
+
+    projected_feats = []
+    projected_sems = []
+    for frame_idx in range(min(n_frames, max_frames)):
+        gt_path = Path(gt_feat_dir) / f"rgb_{frame_idx}.pt"
+        sem_path = Path(sem_dir) / f"semantic_class_{frame_idx}.png"
+        if not gt_path.exists() or not sem_path.exists():
+            continue
+        feat = torch.load(gt_path, map_location=device).float()
+        if feat.dim() == 3:
+            feat = feat.unsqueeze(0)
+        elif feat.dim() == 2:
+            feat = feat.reshape(fH, fW, -1).permute(2, 0, 1).unsqueeze(0)
+        sem = cv2.imread(str(sem_path), cv2.IMREAD_GRAYSCALE)
+        if sem is None:
+            continue
+        sem = cv2.resize(sem, (fW, fH), interpolation=cv2.INTER_NEAREST)
+
+        B, C, H, W = feat.shape
+        feat_flat = feat.reshape(B, C, H * W).permute(0, 2, 1)
+        with torch.no_grad():
+            siglip = proj_model(feat_flat.half())
+        projected_feats.append(F.normalize(siglip.float().squeeze(0), dim=-1))
+        projected_sems.append(sem.reshape(-1))
+
+    selected_embeddings = []
+    selected_sources = {}
+    for query, cid in zip(active_queries, active_class_ids):
+        best_name = None
+        best_emb = None
+        best_score = -float("inf")
+        for name, bank in candidates:
+            if query not in bank:
+                continue
+            emb = bank[query].to(device)
+            margins = []
+            for siglip, sem_flat in zip(projected_feats, projected_sems):
+                pos_mask = sem_flat == cid
+                if pos_mask.sum() < 10:
+                    continue
+                pos_mask_t = torch.from_numpy(pos_mask).to(device)
+                sim = siglip @ emb
+                margins.append((sim[pos_mask_t].mean() - sim[~pos_mask_t].mean()).item())
+            score = float(np.mean(margins)) if margins else -float("inf")
+            if score > best_score:
+                best_name = name
+                best_emb = emb
+                best_score = score
+        if best_emb is None:
+            best_name, bank = candidates[0]
+            best_emb = bank[query].to(device)
+            best_score = float("nan")
+        selected_embeddings.append(best_emb)
+        selected_sources[query] = f"{best_name} ({best_score:.4f})"
+
+    return torch.stack(selected_embeddings).to(device).half(), selected_sources
+
+
 def evaluate_grounding(args):
     print("=" * 60)
     print("RADIO-GS Text Grounding Evaluation (SigLIP2)")
     print("=" * 60)
 
-    # Load text embeddings
-    text_data = torch.load(args.text_embeddings, map_location="cpu")
-    all_queries = text_data["queries"]
-    all_text_emb = text_data["embeddings"].to(device).half()  # [N_all, 1536]
-    print(f"Loaded {len(all_queries)} text queries, dim={all_text_emb.shape[-1]}")
+    candidate_banks = load_text_embedding_candidates(args.text_embeddings)
+    all_queries = sorted({q for _, bank in candidate_banks for q in bank.keys()})
+    print(f"Loaded {len(candidate_banks)} text bank(s), {len(all_queries)} unique queries")
 
-    # Filter to only queries that match Replica classes in this scene
-    class_ids_in_scene = sorted(REPLICA_CLASSES.keys())
-    class_names = [REPLICA_CLASSES[cid] for cid in class_ids_in_scene]
-
-    # Map query names to indices in text_emb
-    query_to_idx = {q: i for i, q in enumerate(all_queries)}
+    # Filter to only grounding-eligible queries present in text banks
     active_queries = []
-    active_text_emb = []
     active_class_ids = []
-    for cid in class_ids_in_scene:
-        name = REPLICA_CLASSES[cid]
-        if name in query_to_idx:
+    for name, cid in sorted(GROUNDING_QUERIES.items(), key=lambda x: x[1]):
+        if any(name in bank for _, bank in candidate_banks):
             active_queries.append(name)
-            active_text_emb.append(all_text_emb[query_to_idx[name]])
             active_class_ids.append(cid)
-    active_text_emb = torch.stack(active_text_emb)  # [K, 1536]
     print(f"Active queries ({len(active_queries)}): {active_queries}")
     print(f"Active class IDs: {active_class_ids}")
 
@@ -266,7 +379,7 @@ def evaluate_grounding(args):
     print("Loaded SigLIP2 feature projection")
 
     # Load RADIO-GS model
-    model, codec, renderer, sharpener, refiner, config = \
+    model, codec, renderer, sharpener, refiner, config, is_hybrid = \
         load_model_and_render_pipeline(args.config, args.checkpoint)
     fH = getattr(config, "feature_height", 30)
     fW = getattr(config, "feature_width", 40)
@@ -289,6 +402,21 @@ def evaluate_grounding(args):
     gt_feat_dir = Path(args.gt_features)
     sem_dir = Path(args.semantic_dir)
     rgb_dir = Path(args.rgb_dir) if args.rgb_dir else None
+
+    active_text_emb, text_sources = select_scene_text_embeddings(
+        candidate_banks,
+        proj,
+        gt_feat_dir,
+        sem_dir,
+        active_queries,
+        active_class_ids,
+        n_frames,
+        fH,
+        fW,
+    )
+    print("Selected text bank per query:")
+    for q in active_queries:
+        print(f"  {q:<18} {text_sources[q]}")
 
     # Metrics accumulators
     heatmap_corrs = []      # per-frame mean correlation between GT and rendered heatmaps
@@ -318,7 +446,8 @@ def evaluate_grounding(args):
             img = cv2.resize(img, (fW, fH))
             rgb_guide = torch.from_numpy(img).float().permute(2, 0, 1).unsqueeze(0).to(device) / 255.0
         rend_feat = render_1280d(model, codec, renderer, sharpener, refiner,
-                                 viewmat, rgb_guide, self_guided=self_guided)
+                                 viewmat, rgb_guide, self_guided=self_guided,
+                                 is_hybrid=is_hybrid)
 
         # Project to SigLIP2 space
         gt_siglip = project_to_siglip2(gt_feat.half(), proj)    # [1, 1536, H, W]
@@ -541,7 +670,7 @@ def main():
     parser.add_argument("--rgb_dir", default=None,
                         help="RGB dir for refiner guide")
     parser.add_argument("--text_embeddings",
-                        default="output/radio_gs/siglip2_text_embeddings.pt",
+                        default=DEFAULT_SIGLIP2_TEXT_EMBEDDINGS,
                         help="Pre-computed SigLIP2 text embeddings")
     parser.add_argument("--projection_weights",
                         default="output/radio_gs/siglip2_feat_projection.pth",

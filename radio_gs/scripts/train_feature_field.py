@@ -35,6 +35,8 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from radio_gs.config import RadioGSConfig, load_config
+from radio_gs.heads.depth_head import DepthHead, DepthLoss
+from radio_gs.heads.segmentation_head import SegmentationHead, SegmentationLoss, compute_miou
 from radio_gs.losses.distillation_loss import (
     DistillationLoss,
     MultiViewConsistencyLoss,
@@ -44,6 +46,7 @@ from radio_gs.models.explicit_gaussian import ExplicitFeatureGaussian
 from radio_gs.models.featsharp_3d import FeatSharp3D
 from radio_gs.models.hcd_codec import HCDCodec
 from radio_gs.models.hybrid_gaussian import HybridFeatureGaussian
+from radio_gs.models.siglip_projection import SigLIP2FeatureProjection
 from radio_gs.models.screen_refiner import ScreenSpaceRefiner
 from radio_gs.rendering.feature_renderer import FeatureFieldRenderer
 
@@ -67,6 +70,7 @@ class SimpleRadioDataset(Dataset):
         feature_dir: str,
         pose_file: str,
         depth_dir: Optional[str] = None,
+        semantics_dir: Optional[str] = None,
         rgb_dir: Optional[str] = None,
         feature_size: Optional[tuple] = None,
         split: str = "train",
@@ -74,6 +78,7 @@ class SimpleRadioDataset(Dataset):
         super().__init__()
         self.feature_dir = Path(feature_dir)
         self.depth_dir = Path(depth_dir) if depth_dir else None
+        self.semantics_dir = Path(semantics_dir) if semantics_dir else None
         self.rgb_dir = Path(rgb_dir) if rgb_dir else None
         self.feature_size = feature_size  # (H, W) for downsampling RGB
         self.split = split
@@ -107,6 +112,15 @@ class SimpleRadioDataset(Dataset):
             )
         else:
             self.depth_paths = None
+        if self.semantics_dir is not None and self.semantics_dir.exists():
+            self.semantics_paths: Optional[List[Path]] = sorted(
+                self.semantics_dir.glob("semantic_class_*.png"),
+                key=lambda p: int(p.stem.split("_")[-1])
+                if p.stem.split("_")[-1].isdigit()
+                else 0,
+            )
+        else:
+            self.semantics_paths = None
 
     # ------------------------------------------------------------------
     def _load_poses(self, pose_file: str) -> np.ndarray:
@@ -135,7 +149,15 @@ class SimpleRadioDataset(Dataset):
 
             d = cv2.imread(str(self.depth_paths[idx]), cv2.IMREAD_UNCHANGED)
             if d is not None:
-                depth = torch.from_numpy(d.astype(np.float32) / 1000.0)
+                depth = torch.from_numpy(d.astype(np.float32) / 1000.0).clone()
+
+        semantics: Optional[torch.Tensor] = None
+        if self.semantics_paths is not None and idx < len(self.semantics_paths):
+            from PIL import Image
+
+            with Image.open(self.semantics_paths[idx]) as sem_img:
+                sem = np.array(sem_img, dtype=np.int64)
+            semantics = torch.from_numpy(sem).clone()
 
         # --- optional RGB guide (downsampled to feature resolution) --------
         rgb_guide: Optional[torch.Tensor] = None
@@ -149,7 +171,7 @@ class SimpleRadioDataset(Dataset):
                     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
                     if self.feature_size is not None:
                         img = cv2.resize(img, (self.feature_size[1], self.feature_size[0]))
-                    rgb_guide = torch.from_numpy(img).float().permute(2, 0, 1) / 255.0
+                    rgb_guide = torch.from_numpy(img.copy()).float().permute(2, 0, 1) / 255.0
 
         out: Dict[str, torch.Tensor] = {
             "radio_features": radio_feat,
@@ -158,6 +180,8 @@ class SimpleRadioDataset(Dataset):
         }
         if depth is not None:
             out["depth"] = depth
+        if semantics is not None:
+            out["semantics"] = semantics
         if rgb_guide is not None:
             out["rgb_guide"] = rgb_guide
         return out
@@ -252,6 +276,69 @@ class RadioGSTrainer:
         )
         self.mv_loss_fn = MultiViewConsistencyLoss()
         self.tv_loss_fn = TotalVariationLoss()
+        self.depth_loss_weight = getattr(config, "depth_loss_weight", 0.0)
+        self.geom_depth_loss_weight = getattr(config, "geom_depth_loss_weight", 0.0)
+        self.depth_alpha_threshold = getattr(config, "depth_alpha_threshold", 0.05)
+        self.depth_head: Optional[DepthHead] = None
+        self.depth_supervision_loss: Optional[DepthLoss] = None
+        self.geom_depth_supervision_loss: Optional[DepthLoss] = None
+        self.seg_loss_weight = getattr(config, "seg_loss_weight", 0.0)
+        self.seg_head: Optional[SegmentationHead] = None
+        self.seg_loss_fn: Optional[SegmentationLoss] = None
+        self.siglip_alignment_weight = getattr(config, "siglip_alignment_weight", 0.0)
+        self.siglip_projection: Optional[SigLIP2FeatureProjection] = None
+        if self.depth_loss_weight > 0 or self.geom_depth_loss_weight > 0:
+            self.depth_head = DepthHead(
+                feature_dim=getattr(config, "radio_feature_dim", 1280),
+                hidden_dim=getattr(config, "depth_head_hidden_dim", 256),
+                num_layers=getattr(config, "depth_head_num_layers", 3),
+                head_type=getattr(config, "depth_head_type", "mlp"),
+            ).to(self.device)
+            self.depth_supervision_loss = DepthLoss(
+                loss_type=getattr(config, "depth_supervision_loss_type", "scale_invariant"),
+                weight=1.0,
+            )
+            self.geom_depth_supervision_loss = DepthLoss(
+                loss_type=getattr(
+                    config,
+                    "geom_depth_supervision_loss_type",
+                    getattr(config, "depth_supervision_loss_type", "scale_invariant"),
+                ),
+                weight=1.0,
+            )
+        if self.seg_loss_weight > 0:
+            self.seg_head = SegmentationHead(
+                feature_dim=getattr(config, "radio_feature_dim", 1280),
+                num_classes=getattr(config, "seg_num_classes", 40),
+                hidden_dim=getattr(config, "seg_head_hidden_dim", 256),
+                num_layers=getattr(config, "seg_head_num_layers", 2),
+                head_type=getattr(config, "seg_head_type", "mlp"),
+            ).to(self.device)
+            self.seg_loss_fn = SegmentationLoss(
+                loss_type=getattr(config, "seg_loss_type", "ce"),
+                ignore_index=getattr(config, "seg_ignore_index", 255),
+            )
+        if self.siglip_alignment_weight > 0:
+            proj_path = Path(
+                getattr(
+                    config,
+                    "siglip_projection_weights",
+                    "output/radio_gs/siglip2_feat_projection.pth",
+                )
+            )
+            if not proj_path.is_absolute():
+                proj_path = Path(__file__).resolve().parents[2] / proj_path
+            if not proj_path.exists():
+                raise FileNotFoundError(
+                    f"SigLIP2 projection weights not found: {proj_path}"
+                )
+            self.siglip_projection = SigLIP2FeatureProjection().to(self.device)
+            self.siglip_projection.load_state_dict(
+                torch.load(proj_path, map_location="cpu")
+            )
+            self.siglip_projection.eval()
+            for param in self.siglip_projection.parameters():
+                param.requires_grad = False
 
         # Feature norm regularization weight
         self.feat_norm_weight = getattr(config, "feat_norm_weight", 0.0)
@@ -270,6 +357,7 @@ class RadioGSTrainer:
             num_workers=getattr(config, "num_workers", 4),
             pin_memory=True,
             drop_last=True,
+            collate_fn=self._collate_batch,
         )
         self.val_loader = DataLoader(
             self.val_dataset,
@@ -277,6 +365,7 @@ class RadioGSTrainer:
             shuffle=False,
             num_workers=getattr(config, "num_workers", 4),
             pin_memory=True,
+            collate_fn=self._collate_batch,
         )
 
         # Logging
@@ -294,6 +383,10 @@ class RadioGSTrainer:
         self._log(f"Sharpener mode: {self.sharpener.mode}")
         if self.use_refiner and self.refiner is not None:
             self._log(f"Refiner params: {self._count_params(self.refiner):.2f}M")
+        if self.depth_head is not None:
+            self._log(f"Depth aux head params: {self._count_params(self.depth_head):.2f}M")
+        if self.seg_head is not None:
+            self._log(f"Seg aux head params: {self._count_params(self.seg_head):.2f}M")
 
     # ------------------------------------------------------------------
     # Building blocks
@@ -409,6 +502,22 @@ class RadioGSTrainer:
                     "name": "refiner",
                 }
             )
+        if self.depth_head is not None:
+            param_groups.append(
+                {
+                    "params": self.depth_head.parameters(),
+                    "lr": getattr(config, "lr_heads", 1e-4),
+                    "name": "depth_head",
+                }
+            )
+        if self.seg_head is not None:
+            param_groups.append(
+                {
+                    "params": self.seg_head.parameters(),
+                    "lr": getattr(config, "lr_heads", 1e-4),
+                    "name": "seg_head",
+                }
+            )
         return optim.AdamW(
             param_groups,
             weight_decay=getattr(config, "weight_decay", 1e-5),
@@ -452,6 +561,7 @@ class RadioGSTrainer:
         train_split = getattr(config, "train_split", "Sequence_1")
         val_split = getattr(config, "val_split", "Sequence_2")
         depth_dir = getattr(config, "depth_dir", None)
+        semantics_dir = getattr(config, "semantics_dir", None)
         mixed_split = getattr(config, "mixed_split", False)
 
         # Val features use a separate directory
@@ -473,10 +583,14 @@ class RadioGSTrainer:
         if mixed_split:
             # Merge both sequences and random 80/20 split
             val_depth_dir = depth_dir.replace(train_split, val_split) if depth_dir else None
+            val_semantics_dir = (
+                semantics_dir.replace(train_split, val_split) if semantics_dir else None
+            )
             ds_seq1 = SimpleRadioDataset(
                 feature_dir=feature_dir,
                 pose_file=str(scene_root / train_split / "traj_w_c.txt"),
                 depth_dir=depth_dir,
+                semantics_dir=semantics_dir,
                 rgb_dir=rgb_dir_train,
                 feature_size=feature_size,
                 split="train",
@@ -485,6 +599,7 @@ class RadioGSTrainer:
                 feature_dir=val_feature_dir,
                 pose_file=str(scene_root / val_split / "traj_w_c.txt"),
                 depth_dir=val_depth_dir,
+                semantics_dir=val_semantics_dir,
                 rgb_dir=rgb_dir_val,
                 feature_size=feature_size,
                 split="train",
@@ -509,6 +624,7 @@ class RadioGSTrainer:
             feature_dir=feature_dir,
             pose_file=str(scene_root / train_split / "traj_w_c.txt"),
             depth_dir=depth_dir,
+            semantics_dir=semantics_dir,
             rgb_dir=rgb_dir_train,
             feature_size=feature_size,
             split="train",
@@ -516,7 +632,10 @@ class RadioGSTrainer:
         val_ds = SimpleRadioDataset(
             feature_dir=val_feature_dir,
             pose_file=str(scene_root / val_split / "traj_w_c.txt"),
-            depth_dir=None,
+            depth_dir=depth_dir.replace(train_split, val_split) if depth_dir else None,
+            semantics_dir=(
+                semantics_dir.replace(train_split, val_split) if semantics_dir else None
+            ),
             rgb_dir=rgb_dir_val,
             feature_size=feature_size,
             split="val",
@@ -535,8 +654,22 @@ class RadioGSTrainer:
         self.sharpener.train()
         if self.use_refiner and self.refiner is not None:
             self.refiner.train()
+        if self.depth_head is not None:
+            self.depth_head.train()
+        if self.seg_head is not None:
+            self.seg_head.train()
 
-        loss_accum = {"total": 0.0, "distill": 0.0, "compact": 0.0, "tv": 0.0, "rgb": 0.0}
+        loss_accum = {
+            "total": 0.0,
+            "distill": 0.0,
+            "compact": 0.0,
+            "tv": 0.0,
+            "rgb": 0.0,
+            "depth_gt": 0.0,
+            "depth_geom": 0.0,
+            "seg_aux": 0.0,
+            "siglip_align": 0.0,
+        }
         cos_accum = 0.0
         n_batches = 0
         log_every = getattr(self.cfg, "log_every", 100)
@@ -630,6 +763,7 @@ class RadioGSTrainer:
                     l_distill = l2_w * l_l2 + cos_w * l_cos
 
                     l_compact = torch.tensor(0.0, device=self.device)
+                    decoded_for_depth = self.codec.decoder(rendered_compact)
 
                     # Feature norm regularization
                     l_feat_norm = torch.tensor(0.0, device=self.device)
@@ -670,6 +804,21 @@ class RadioGSTrainer:
                         gt_compact_rs = gt_compact
                     l_compact = F.mse_loss(rendered_compact, gt_compact_rs)
                     l_feat_norm = torch.tensor(0.0, device=self.device)
+                    decoded_for_depth = decoded
+
+                depth_losses = self._compute_depth_aux_losses(
+                    batch=batch,
+                    render_result=result,
+                    decoded=decoded_for_depth,
+                )
+                seg_losses = self._compute_seg_aux_losses(
+                    batch=batch,
+                    decoded=decoded_for_depth if self.train_mode != "latent" else None,
+                )
+                l_siglip = self._compute_siglip_alignment_loss(
+                    decoded=decoded_for_depth if self.train_mode != "latent" else None,
+                    target=gt_radio_rs if self.train_mode != "latent" else None,
+                )
 
                 l_tv = self.tv_loss_fn(rendered_compact)
 
@@ -680,6 +829,7 @@ class RadioGSTrainer:
                     loss = loss + self.feat_norm_weight * l_feat_norm
                 if self.rgb_loss_weight > 0:
                     loss = loss + self.rgb_loss_weight * l_rgb
+                loss = loss + depth_losses["total"] + seg_losses["total"] + l_siglip
 
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)
@@ -710,6 +860,10 @@ class RadioGSTrainer:
             loss_accum["compact"] += l_compact.item()
             loss_accum["tv"] += l_tv.item()
             loss_accum["rgb"] += l_rgb.item()
+            loss_accum["depth_gt"] += depth_losses["depth_gt"].item()
+            loss_accum["depth_geom"] += depth_losses["depth_geom"].item()
+            loss_accum["seg_aux"] += seg_losses["total"].item()
+            loss_accum["siglip_align"] += l_siglip.item()
             cos_accum += cos_sim.item()
             n_batches += 1
             self.global_step += 1
@@ -735,6 +889,18 @@ class RadioGSTrainer:
                 self.writer.add_scalar(
                     "train/cosine", cos_sim.item(), self.global_step
                 )
+                self.writer.add_scalar(
+                    "train/depth_gt", depth_losses["depth_gt"].item(), self.global_step
+                )
+                self.writer.add_scalar(
+                    "train/depth_geom", depth_losses["depth_geom"].item(), self.global_step
+                )
+                self.writer.add_scalar(
+                    "train/seg_aux", seg_losses["total"].item(), self.global_step
+                )
+                self.writer.add_scalar(
+                    "train/siglip_align", l_siglip.item(), self.global_step
+                )
                 lr = self.optimizer.param_groups[0]["lr"]
                 self.writer.add_scalar("train/lr", lr, self.global_step)
 
@@ -758,10 +924,19 @@ class RadioGSTrainer:
         self.sharpener.eval()
         if self.use_refiner and self.refiner is not None:
             self.refiner.eval()
+        if self.depth_head is not None:
+            self.depth_head.eval()
+        if self.seg_head is not None:
+            self.seg_head.eval()
 
         cos_latent_accum = 0.0
         cos_decoded_accum = 0.0
         mse_accum = 0.0
+        depth_gt_accum = 0.0
+        depth_geom_accum = 0.0
+        seg_aux_accum = 0.0
+        seg_aux_miou_accum = 0.0
+        siglip_align_accum = 0.0
         n = 0
 
         for batch in tqdm(
@@ -832,6 +1007,7 @@ class RadioGSTrainer:
                 else:
                     cos_decoded_accum += cos_latent.item()
                     mse_accum += F.mse_loss(rendered_compact.float(), gt_compact.float()).item()
+                decoded_for_depth = decoded
             else:
                 # Decoded mode: gt_features are 1280d
                 gt_radio = gt_features
@@ -850,6 +1026,25 @@ class RadioGSTrainer:
                 cos_decoded_accum += cos_dec.item()
                 cos_latent_accum += cos_dec.item()
                 mse_accum += mse.item()
+                decoded_for_depth = decoded
+
+            depth_losses = self._compute_depth_aux_losses(
+                batch=batch,
+                render_result=val_result,
+                decoded=decoded_for_depth,
+            )
+            seg_losses = self._compute_seg_aux_losses(
+                batch=batch,
+                decoded=decoded_for_depth if self.train_mode != "latent" else None,
+            )
+            depth_gt_accum += depth_losses["depth_gt"].item()
+            depth_geom_accum += depth_losses["depth_geom"].item()
+            seg_aux_accum += seg_losses["total"].item()
+            seg_aux_miou_accum += seg_losses["miou"]
+            siglip_align_accum += self._compute_siglip_alignment_loss(
+                decoded=decoded_for_depth if self.train_mode != "latent" else None,
+                target=gt_radio if self.train_mode != "latent" else None,
+            ).item()
 
             n += 1
 
@@ -870,12 +1065,22 @@ class RadioGSTrainer:
             "cosine_decoded": avg_cos_decoded,
             "mse": avg_mse,
             "psnr": psnr,
+            "depth_gt": depth_gt_accum / n,
+            "depth_geom": depth_geom_accum / n,
+            "seg_aux": seg_aux_accum / n,
+            "seg_aux_miou": seg_aux_miou_accum / n,
+            "siglip_align": siglip_align_accum / n,
         }
 
         if self.writer is not None:
             self.writer.add_scalar("val/cosine_latent", avg_cos_latent, epoch)
             self.writer.add_scalar("val/cosine_decoded", avg_cos_decoded, epoch)
             self.writer.add_scalar("val/psnr", psnr, epoch)
+            self.writer.add_scalar("val/depth_gt", metrics["depth_gt"], epoch)
+            self.writer.add_scalar("val/depth_geom", metrics["depth_geom"], epoch)
+            self.writer.add_scalar("val/seg_aux", metrics["seg_aux"], epoch)
+            self.writer.add_scalar("val/seg_aux_miou", metrics["seg_aux_miou"], epoch)
+            self.writer.add_scalar("val/siglip_align", metrics["siglip_align"], epoch)
 
         self._save_vis(epoch)
 
@@ -909,6 +1114,10 @@ class RadioGSTrainer:
         }
         if self.use_refiner and self.refiner is not None:
             state["refiner_state_dict"] = self.refiner.state_dict()
+        if self.depth_head is not None:
+            state["depth_head_state_dict"] = self.depth_head.state_dict()
+        if self.seg_head is not None:
+            state["seg_head_state_dict"] = self.seg_head.state_dict()
         torch.save(state, self.ckpt_dir / "latest.pth")
         if is_best:
             torch.save(state, self.ckpt_dir / "best.pth")
@@ -930,6 +1139,24 @@ class RadioGSTrainer:
             except RuntimeError as e:
                 self._log(f"Refiner state_dict size mismatch (architecture changed), "
                           f"starting refiner from scratch: {e}")
+        if "depth_head_state_dict" in ckpt and self.depth_head is not None:
+            try:
+                self.depth_head.load_state_dict(
+                    ckpt["depth_head_state_dict"], strict=False
+                )
+            except RuntimeError as e:
+                self._log(
+                    f"Depth head state_dict size mismatch, starting depth head from scratch: {e}"
+                )
+        if "seg_head_state_dict" in ckpt and self.seg_head is not None:
+            try:
+                self.seg_head.load_state_dict(
+                    ckpt["seg_head_state_dict"], strict=False
+                )
+            except RuntimeError as e:
+                self._log(
+                    f"Seg head state_dict size mismatch, starting seg head from scratch: {e}"
+                )
 
         if resume:
             try:
@@ -999,7 +1226,154 @@ class RadioGSTrainer:
             params += list(self.sharpener.parameters())
         if self.use_refiner and self.refiner is not None:
             params += list(self.refiner.parameters())
+        if self.depth_head is not None:
+            params += list(self.depth_head.parameters())
+        if self.seg_head is not None:
+            params += list(self.seg_head.parameters())
         return params
+
+    @staticmethod
+    def _collate_batch(batch):
+        elem = batch[0]
+        if isinstance(elem, torch.Tensor):
+            return torch.stack([item.clone() for item in batch], dim=0)
+        if isinstance(elem, dict):
+            return {
+                key: RadioGSTrainer._collate_batch([item[key] for item in batch])
+                for key in elem
+            }
+        if isinstance(elem, (int, float)):
+            return torch.tensor(batch)
+        return batch
+
+    @staticmethod
+    def _resize_map(
+        x: torch.Tensor,
+        size: Tuple[int, int],
+        is_mask: bool = False,
+    ) -> torch.Tensor:
+        """Resize a dense [B,H,W] or [B,1,H,W] map to the target spatial size."""
+        if x.dim() == 3:
+            x = x.unsqueeze(1)
+        if x.shape[-2:] == size:
+            return x.float()
+        if is_mask:
+            return F.interpolate(x.float(), size=size, mode="nearest")
+        if x.shape[-2] >= size[0] and x.shape[-1] >= size[1]:
+            return F.interpolate(x.float(), size=size, mode="area")
+        return F.interpolate(x.float(), size=size, mode="bilinear", align_corners=False)
+
+    def _compute_depth_aux_losses(
+        self,
+        batch: Dict[str, torch.Tensor],
+        render_result: Dict[str, torch.Tensor],
+        decoded: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        zero = decoded.sum() * 0.0
+        losses = {
+            "total": zero,
+            "depth_gt": zero,
+            "depth_geom": zero,
+        }
+        if self.depth_head is None:
+            return losses
+
+        gt_depth = batch.get("depth")
+        if gt_depth is None:
+            return losses
+
+        pred_depth = self.depth_head(decoded.float())
+        target_size = pred_depth.shape[-2:]
+        gt_depth = self._resize_map(gt_depth.to(self.device).float(), target_size)
+        alpha = self._resize_map(
+            render_result["alpha_map"].to(self.device).float(),
+            target_size,
+        )
+        valid_mask = (gt_depth > 0) & (alpha > self.depth_alpha_threshold)
+
+        if self.depth_loss_weight > 0 and valid_mask.any():
+            assert self.depth_supervision_loss is not None
+            losses["depth_gt"] = self.depth_supervision_loss(pred_depth, gt_depth, valid_mask)
+
+        if self.geom_depth_loss_weight > 0:
+            geom_key = "geom_depth" if "geom_depth" in render_result else "depth_map"
+            geom_depth = self._resize_map(
+                render_result[geom_key].detach().to(self.device).float(),
+                target_size,
+            )
+            geom_mask = (geom_depth > 0) & (alpha > self.depth_alpha_threshold)
+            geom_mask = geom_mask & valid_mask
+            if geom_mask.any():
+                assert self.geom_depth_supervision_loss is not None
+                losses["depth_geom"] = self.geom_depth_supervision_loss(
+                    pred_depth, geom_depth, geom_mask
+                )
+
+        losses["total"] = (
+            self.depth_loss_weight * losses["depth_gt"]
+            + self.geom_depth_loss_weight * losses["depth_geom"]
+        )
+        return losses
+
+    def _project_siglip_features(self, features: torch.Tensor) -> torch.Tensor:
+        assert self.siglip_projection is not None
+        B, C, H, W = features.shape
+        feat_flat = features.permute(0, 2, 3, 1).reshape(B, H * W, C).float()
+        projected = self.siglip_projection(feat_flat)
+        projected = projected.permute(0, 2, 1).reshape(B, -1, H, W)
+        return F.normalize(projected, dim=1)
+
+    def _compute_siglip_alignment_loss(
+        self,
+        decoded: Optional[torch.Tensor],
+        target: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if (
+            self.siglip_projection is None
+            or self.siglip_alignment_weight <= 0
+            or decoded is None
+            or target is None
+        ):
+            return torch.tensor(0.0, device=self.device)
+        if decoded.shape[-2:] != target.shape[-2:]:
+            target = self._resize_map(target, decoded.shape[-2:])
+        pred_siglip = self._project_siglip_features(decoded)
+        with torch.no_grad():
+            target_siglip = self._project_siglip_features(target)
+        return self.siglip_alignment_weight * F.mse_loss(pred_siglip, target_siglip)
+
+    def _compute_seg_aux_losses(
+        self,
+        batch: Dict[str, torch.Tensor],
+        decoded: Optional[torch.Tensor],
+    ) -> Dict[str, float | torch.Tensor]:
+        zero = torch.tensor(0.0, device=self.device)
+        losses: Dict[str, float | torch.Tensor] = {
+            "total": zero,
+            "miou": 0.0,
+        }
+        if self.seg_head is None or self.seg_loss_fn is None or decoded is None:
+            return losses
+        gt_sem = batch.get("semantics")
+        if gt_sem is None:
+            return losses
+        gt_sem = gt_sem.to(self.device).long()
+        if gt_sem.shape[-2:] != decoded.shape[-2:]:
+            gt_sem = self._resize_map(
+                gt_sem.unsqueeze(1).float(), decoded.shape[-2:], is_mask=True
+            ).squeeze(1).long()
+        seg_logits = self.seg_head(decoded.float())
+        seg_loss = self.seg_loss_fn(seg_logits, gt_sem)
+        losses["total"] = self.seg_loss_weight * seg_loss
+        with torch.no_grad():
+            pred = seg_logits.argmax(dim=1)
+            losses["miou"] = compute_miou(
+                pred,
+                gt_sem,
+                num_classes=getattr(self.cfg, "seg_num_classes", 40),
+                ignore_index=getattr(self.cfg, "seg_ignore_index", 255),
+            )
+        return losses
 
     def _normalize_positions(self, position_map: torch.Tensor) -> torch.Tensor:
         """Normalize world-space positions to [0, 1] using scene bounds from Gaussians."""

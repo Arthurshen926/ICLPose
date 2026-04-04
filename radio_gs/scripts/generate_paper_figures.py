@@ -40,27 +40,10 @@ from radio_gs.rendering.feature_renderer import FeatureFieldRenderer
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-REPLICA_CLASSES = {
-    0: "undefined", 11: "wall", 12: "floor", 13: "ceiling", 20: "door",
-    29: "table", 31: "chair", 40: "window", 44: "picture", 47: "cabinet",
-    59: "cushion", 60: "sofa", 63: "bed", 64: "curtain",
-    65: "chest of drawers", 76: "plant", 80: "stool", 92: "lamp",
-    93: "shelf", 97: "blanket", 98: "mirror",
-}
+from radio_gs.replica_constants import REPLICA_CLASSES, SEG_COLORS, GROUNDING_QUERIES
 
-SEG_COLORS = {}
-np.random.seed(42)
-for cid in REPLICA_CLASSES:
-    if cid == 0:
-        SEG_COLORS[cid] = (40, 40, 40)
-    else:
-        SEG_COLORS[cid] = tuple(np.random.randint(60, 255, 3).tolist())
-
-ALL_GROUNDING_QUERIES = [
-    "chair", "table", "sofa", "plant", "shelf",
-    "cushion", "floor", "wall", "door", "window",
-]
-SELECTED_QUERIES = ["chair", "plant", "floor", "wall"]
+ALL_GROUNDING_QUERIES = list(GROUNDING_QUERIES.keys())
+SELECTED_QUERIES = ["chair", "plant", "wall", "sofa"]
 FRAME_INDICES = [0, 180, 360]
 
 
@@ -837,7 +820,7 @@ def main():
     parser.add_argument("--scale", type=int, default=8,
                         help="Upscale factor for feature-res images")
     parser.add_argument("--text_embeddings",
-                        default="output/radio_gs/siglip2_text_embeddings.pt")
+                        default="output/radio_gs/siglip2_text_embeddings_v2.pt")
     parser.add_argument("--projection_weights",
                         default="output/radio_gs/siglip2_feat_projection.pth")
     args = parser.parse_args()

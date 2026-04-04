@@ -39,22 +39,7 @@ from radio_gs.rendering.feature_renderer import FeatureFieldRenderer
 device = torch.device("cuda")
 
 # Replica semantic classes
-REPLICA_CLASSES = {
-    0: "undefined", 11: "wall", 12: "floor", 13: "ceiling", 20: "door",
-    29: "table", 31: "chair", 40: "window", 44: "picture", 47: "cabinet",
-    59: "cushion", 60: "sofa", 63: "bed", 64: "curtain",
-    65: "chest of drawers", 76: "plant", 80: "stool", 92: "lamp",
-    93: "shelf", 97: "blanket", 98: "mirror",
-}
-
-# Distinct colors for segmentation visualization (per class ID)
-SEG_COLORS = {}
-np.random.seed(42)
-for cid in REPLICA_CLASSES:
-    if cid == 0:
-        SEG_COLORS[cid] = (40, 40, 40)  # dark gray for undefined
-    else:
-        SEG_COLORS[cid] = tuple(np.random.randint(60, 255, 3).tolist())
+from radio_gs.replica_constants import REPLICA_CLASSES, SEG_COLORS
 
 
 # ── Pipeline loading ──────────────────────────────────────────────────────────
@@ -482,7 +467,7 @@ def main():
     parser.add_argument("--scale", type=int, default=16,
                         help="Upscale factor for feature-resolution images")
     parser.add_argument("--text_embeddings",
-                        default="output/radio_gs/siglip2_text_embeddings.pt")
+                        default="output/radio_gs/siglip2_text_embeddings_v2.pt")
     parser.add_argument("--projection_weights",
                         default="output/radio_gs/siglip2_feat_projection.pth")
     parser.add_argument("--grounding_queries", nargs="+",

@@ -16,6 +16,11 @@ from tqdm import tqdm
 sys.path.insert(0, '.')
 from radio_gs.config import load_config
 from radio_gs.models.explicit_gaussian import ExplicitFeatureGaussian
+from radio_gs.models.depth_fusion import (
+    predict_depth_fusion,
+    prepare_depth_fusion_sample,
+    train_depth_fusion_probe,
+)
 from radio_gs.models.hcd_codec import HCDCodec
 from radio_gs.models.featsharp_3d import FeatSharp3D
 from radio_gs.models.screen_refiner import ScreenSpaceRefiner
@@ -440,10 +445,13 @@ def main():
     mixed_split = getattr(config, "mixed_split", False)
     if mixed_split:
         # Combine both sequences, apply same random split as training
-        n_per_seq = 900
+        poses_s1 = np.loadtxt(str(scene_root / train_split / "traj_w_c.txt")).reshape(-1, 4, 4).astype(np.float32)
+        poses_s2 = np.loadtxt(str(scene_root / val_split / "traj_w_c.txt")).reshape(-1, 4, 4).astype(np.float32)
+        n_s1 = len(poses_s1)
+        n_s2 = len(poses_s2)
         mixed_ratio = getattr(config, "mixed_train_ratio", 0.8)
         mixed_seed = getattr(config, "mixed_seed", 42)
-        total = n_per_seq * 2
+        total = n_s1 + n_s2
         train_size = int(mixed_ratio * total)
         val_size = total - train_size
         gen = torch.Generator().manual_seed(mixed_seed)
@@ -460,18 +468,16 @@ def main():
         
         # Map combined idx → (sequence_name, frame_idx_in_sequence)
         def _split_idx(combined_idx):
-            if combined_idx < n_per_seq:
+            if combined_idx < n_s1:
                 return train_split, combined_idx
             else:
-                return val_split, combined_idx - n_per_seq
+                return val_split, combined_idx - n_s1
         
         train_seq_frame = [_split_idx(ci) for ci in train_mixed_sub]
         val_seq_frame = [_split_idx(ci) for ci in val_mixed_sub]
         
         # For rendering: need (w2c_matrix, gt_feat_dir, seq_name, frame_idx) per frame
         # Load poses from both sequences
-        poses_s1 = np.loadtxt(str(scene_root / train_split / "traj_w_c.txt")).reshape(-1, 4, 4).astype(np.float32)
-        poses_s2 = np.loadtxt(str(scene_root / val_split / "traj_w_c.txt")).reshape(-1, 4, 4).astype(np.float32)
         w2c_s1 = np.linalg.inv(poses_s1)
         w2c_s2 = np.linalg.inv(poses_s2)
         
@@ -494,8 +500,12 @@ def main():
         print(f"\n  Mixed split: total={total}, train={len(train_mixed_sub)} (from {train_size}), "
               f"val={len(val_mixed_sub)} (from {val_size}), seed={mixed_seed}")
     else:
-        train_indices = list(range(0, 900, max(1, 900 // args.n_train)))[:args.n_train]
-        val_indices = list(range(0, 900, max(1, 900 // args.n_val)))[:args.n_val]
+        train_pose_file = str(scene_root / train_split / "traj_w_c.txt")
+        val_pose_file = str(scene_root / val_split / "traj_w_c.txt")
+        n_train_total = len(np.loadtxt(train_pose_file).reshape(-1, 4, 4))
+        n_val_total = len(np.loadtxt(val_pose_file).reshape(-1, 4, 4))
+        train_indices = list(range(0, n_train_total, max(1, n_train_total // args.n_train)))[:args.n_train]
+        val_indices = list(range(0, n_val_total, max(1, n_val_total // args.n_val)))[:args.n_val]
         train_depth_dir_idx = None
         val_depth_dir_idx = None
         train_sem_dir_idx = None
@@ -546,12 +556,17 @@ def main():
         if self_guided and rgb_guide_enabled:
             result = renderer.render_features_and_rgb(model, pose)
             self_rgb = result["rgb"]
+            geom_depth = result.get("geom_depth")
         else:
             result = renderer.render_features_batch(model, pose)
             self_rgb = None
+            geom_depth = None
         rendered = sharpener(result["feature_map"])
-        rgb_d = renderer.render_rgb(model, torch.from_numpy(w2c_mat).float().to(device))
-        geom_depth = rgb_d["depth"].cpu()
+        rgb_d = None
+        if geom_depth is None:
+            rgb_d = renderer.render_rgb(model, torch.from_numpy(w2c_mat).float().to(device))
+            geom_depth = rgb_d["depth"]
+        geom_depth = geom_depth.squeeze(0).cpu() if geom_depth.dim() == 3 else geom_depth.cpu()
         if refiner is not None:
             guide = None
             if self_rgb is not None:
@@ -563,6 +578,8 @@ def main():
                 if guide is not None:
                     guide = guide.to(device)
             if depth_guide_enabled:
+                if rgb_d is None:
+                    rgb_d = renderer.render_rgb(model, torch.from_numpy(w2c_mat).float().to(device))
                 dguide = _build_depth_guide(result, depth_grad_enabled)
                 guide = torch.cat([guide, dguide], dim=1) if guide is not None else dguide
             rendered = refiner(rendered, guide=guide)
@@ -931,12 +948,36 @@ def eval_fullres_geom_depth(fullres_depths, val_idx, val_depth_dir, val_dir_idx=
 def eval_fused_depth(train_feats, train_geom, train_idx, train_depth_dir,
                      val_feats, val_geom, val_idx, val_depth_dir, fH=30, fW=40,
                      train_dir_idx=None, val_dir_idx=None):
-    """Train linear probe on features + geometric depth jointly for depth fusion."""
-    print("  Training fused depth probe (features + geometric depth)...")
+    """Train a learned depth-fusion probe on feature and geometric depth cues."""
+    print("  Training fused depth probe (aligned geom + learned gating)...")
     _train_pairs = train_dir_idx if train_dir_idx else [(train_depth_dir, i) for i in train_idx]
     _val_pairs = val_dir_idx if val_dir_idx else [(val_depth_dir, i) for i in val_idx]
 
-    train_X, train_Y = [], []
+    depth_train_X, depth_train_Y = [], []
+    for feat, (ddir, i) in zip(train_feats, _train_pairs):
+        dpath = Path(ddir) / f"depth_{i}.png"
+        if not dpath.exists():
+            continue
+        d = cv2.imread(str(dpath), cv2.IMREAD_UNCHANGED)
+        if d is None:
+            continue
+        d = torch.from_numpy(d.astype(np.float32) / 1000.0)
+        d = F.interpolate(d.unsqueeze(0).unsqueeze(0), (fH, fW), mode="bilinear", align_corners=False).squeeze()
+        C = feat.shape[0]
+        if feat.shape[1:] != (fH, fW):
+            feat = F.interpolate(feat.unsqueeze(0), (fH, fW), mode="bilinear", align_corners=False).squeeze(0)
+        valid = d > 0.01
+        if valid.sum() < 10:
+            continue
+        depth_train_X.append(feat.reshape(C, -1).T[valid.reshape(-1)])
+        depth_train_Y.append(d.reshape(-1)[valid.reshape(-1)])
+
+    depth_train_X = torch.cat(depth_train_X, 0).to(device)
+    depth_train_Y = torch.cat(depth_train_Y, 0).to(device)
+    depth_probe = _build_probe(depth_train_X.shape[1], 1)
+    _train_probe(depth_probe, depth_train_X, depth_train_Y, epochs=300, task="regression")
+
+    train_input, train_feat_depth, train_geom_depth, train_geom_valid, train_Y = [], [], [], [], []
     for feat, geom, (ddir, i) in zip(train_feats, train_geom, _train_pairs):
         dpath = Path(ddir) / f"depth_{i}.png"
         if not dpath.exists():
@@ -947,25 +988,26 @@ def eval_fused_depth(train_feats, train_geom, train_idx, train_depth_dir,
         d = torch.from_numpy(d.astype(np.float32) / 1000.0)
         d = F.interpolate(d.unsqueeze(0).unsqueeze(0), (fH, fW),
                            mode="bilinear", align_corners=False).squeeze()
-        C = feat.shape[0]
-        if feat.shape[1:] != (fH, fW):
-            feat = F.interpolate(feat.unsqueeze(0), (fH, fW),
-                                  mode="bilinear", align_corners=False).squeeze(0)
         valid = d > 0.01
         if valid.sum() < 10:
             continue
-        # Concatenate features + geometric depth as extra channel
-        geom_flat = geom.reshape(1, -1).T  # [HW, 1]
-        feat_flat = feat.reshape(C, -1).T  # [HW, C]
-        combined = torch.cat([feat_flat, geom_flat], dim=1)  # [HW, C+1]
-        train_X.append(combined[valid.reshape(-1)])
-        train_Y.append(d.reshape(-1)[valid.reshape(-1)])
+        sample = prepare_depth_fusion_sample(feat, geom, depth_probe, fH, fW, device)
+        valid_flat = valid.reshape(-1)
+        train_input.append(sample["input_flat"][valid_flat])
+        train_feat_depth.append(sample["feat_depth_flat"][valid_flat])
+        train_geom_depth.append(sample["geom_depth_flat"][valid_flat])
+        train_geom_valid.append(sample["geom_valid_flat"][valid_flat])
+        train_Y.append(d.reshape(-1)[valid_flat])
 
-    train_X = torch.cat(train_X, 0).to(device)
-    train_Y = torch.cat(train_Y, 0).to(device)
-
-    probe = _build_probe(train_X.shape[1], 1)
-    _train_probe(probe, train_X, train_Y, epochs=300, task="regression")
+    fusion_probe = train_depth_fusion_probe(
+        torch.cat(train_input, 0).to(device),
+        torch.cat(train_feat_depth, 0).to(device),
+        torch.cat(train_geom_depth, 0).to(device),
+        torch.cat(train_geom_valid, 0).to(device),
+        torch.cat(train_Y, 0).to(device),
+        device,
+        epochs=300,
+    )
 
     abs_rels, rmses, delta1s = [], [], []
     with torch.no_grad():
@@ -979,19 +1021,11 @@ def eval_fused_depth(train_feats, train_geom, train_idx, train_depth_dir,
             d = torch.from_numpy(d.astype(np.float32) / 1000.0).to(device)
             d = F.interpolate(d.unsqueeze(0).unsqueeze(0), (fH, fW),
                                mode="bilinear", align_corners=False).squeeze()
-            C = feat.shape[0]
-            if feat.shape[1:] != (fH, fW):
-                feat_r = F.interpolate(feat.unsqueeze(0).to(device), (fH, fW),
-                                        mode="bilinear", align_corners=False).squeeze(0)
-            else:
-                feat_r = feat.to(device)
             valid = d > 0.01
             if valid.sum() < 10:
                 continue
-            geom_flat = geom.reshape(1, -1).T.to(device)  # [HW, 1]
-            feat_flat = feat_r.reshape(C, -1).T  # [HW, C]
-            combined = torch.cat([feat_flat, geom_flat], dim=1)  # [HW, C+1]
-            pred = probe(combined).squeeze().reshape(fH, fW)
+            sample = prepare_depth_fusion_sample(feat, geom, depth_probe, fH, fW, device)
+            pred = predict_depth_fusion(fusion_probe, sample, fH, fW)["depth"]
             p, g = pred[valid], d[valid]
             abs_rels.append((torch.abs(p - g) / g).mean().item())
             rmses.append(torch.sqrt(((p - g)**2).mean()).item())
