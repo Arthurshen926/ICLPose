@@ -1048,7 +1048,20 @@ def main():
             gt_path = get_vis_gt_feat_path(j)
             gt = torch.load(str(gt_path), map_location="cpu").float()
             if gt.dim() == 2:
-                gt = gt.reshape(fH, fW, -1).permute(2, 0, 1)
+                # Features stored at native RADIO resolution (e.g. 30x40)
+                n_pixels = gt.shape[0]
+                C = gt.shape[1]
+                native_h = int(round((n_pixels * fH / fW) ** 0.5))
+                native_w = n_pixels // native_h
+                if native_h * native_w != n_pixels:
+                    native_h, native_w = fH, fW
+                gt = gt.reshape(native_h, native_w, C).permute(2, 0, 1)
+                if native_h != fH or native_w != fW:
+                    gt = F.interpolate(gt.unsqueeze(0), (fH, fW),
+                                       mode="bilinear", align_corners=False).squeeze(0)
+            elif gt.shape[-2] != fH or gt.shape[-1] != fW:
+                gt = F.interpolate(gt.unsqueeze(0), (fH, fW),
+                                   mode="bilinear", align_corners=False).squeeze(0)
             gt_feats.append(gt)
 
             w2c = get_vis_w2c(j)
@@ -1100,7 +1113,19 @@ def main():
                 w2c = train_w2c_all[train_indices[j]]
             gt = torch.load(str(gt_path), map_location="cpu").float()
             if gt.dim() == 2:
-                gt = gt.reshape(fH, fW, -1).permute(2, 0, 1)
+                n_pixels = gt.shape[0]
+                C = gt.shape[1]
+                native_h = int(round((n_pixels * fH / fW) ** 0.5))
+                native_w = n_pixels // native_h
+                if native_h * native_w != n_pixels:
+                    native_h, native_w = fH, fW
+                gt = gt.reshape(native_h, native_w, C).permute(2, 0, 1)
+                if native_h != fH or native_w != fW:
+                    gt = F.interpolate(gt.unsqueeze(0), (fH, fW),
+                                       mode="bilinear", align_corners=False).squeeze(0)
+            elif gt.shape[-2] != fH or gt.shape[-1] != fW:
+                gt = F.interpolate(gt.unsqueeze(0), (fH, fW),
+                                   mode="bilinear", align_corners=False).squeeze(0)
             train_gt_feats.append(gt)
 
             pose = torch.from_numpy(w2c[np.newaxis]).to(device)
@@ -1245,22 +1270,28 @@ def main():
         rgb = load_vis_rgb(j)
         rgb_display = cv2.resize(rgb, (tW, tH), interpolation=cv2.INTER_LINEAR)
 
+        def _resize_panel(img):
+            """Ensure panel matches display resolution tH×tW."""
+            if img.shape[0] != tH or img.shape[1] != tW:
+                return cv2.resize(img, (tW, tH), interpolation=cv2.INTER_LINEAR)
+            return img
+
         # 7 panels: RGB | GT Depth(full-res) | Geom Depth | Oracle Pred | Feature Pred | Fused Pred | Error Map
         panels = [
             rgb_display,
-            depth_to_colormap(gt_depth, gt_vmin, gt_vmax),
+            _resize_panel(depth_to_colormap(gt_depth, gt_vmin, gt_vmax)),
         ]
 
         if has_geom:
-            panels.append(gd_panel)
+            panels.append(_resize_panel(gd_panel))
         else:
             panels.append(np.zeros((tH, tW, 3), dtype=np.uint8))
 
         panels += [
-            depth_to_colormap(oracle_pred, gt_vmin, gt_vmax),
-            depth_to_colormap(rend_pred, gt_vmin, gt_vmax),
-            depth_to_colormap(fused_pred, gt_vmin, gt_vmax),
-            depth_error_map(fused_pred, gt_depth),
+            _resize_panel(depth_to_colormap(oracle_pred, gt_vmin, gt_vmax)),
+            _resize_panel(depth_to_colormap(rend_pred, gt_vmin, gt_vmax)),
+            _resize_panel(depth_to_colormap(fused_pred, gt_vmin, gt_vmax)),
+            _resize_panel(depth_error_map(fused_pred, gt_depth)),
         ]
 
         labels = ["RGB", "GT Depth (Full)", "Geom Depth", "Oracle Pred",
@@ -1299,13 +1330,18 @@ def main():
                       if has_geom
                       else np.zeros((tH, tW, 3), dtype=np.uint8))
 
+        def _dgrid(img):
+            if img.shape[0] != tH or img.shape[1] != tW:
+                return cv2.resize(img, (tW, tH), interpolation=cv2.INTER_LINEAR)
+            return img
+
         panels = [
             cv2.resize(rgb, (tW, tH), interpolation=cv2.INTER_LINEAR),
-            depth_to_colormap(gt_d, gt_vmin, gt_vmax),
+            _dgrid(depth_to_colormap(gt_d, gt_vmin, gt_vmax)),
             geom_panel,
-            depth_to_colormap(r_pred, gt_vmin, gt_vmax),
-            depth_to_colormap(f_pred, gt_vmin, gt_vmax),
-            depth_error_map(f_pred, gt_d),
+            _dgrid(depth_to_colormap(r_pred, gt_vmin, gt_vmax)),
+            _dgrid(depth_to_colormap(f_pred, gt_vmin, gt_vmax)),
+            _dgrid(depth_error_map(f_pred, gt_d)),
         ]
         grid_rows.append(hconcat_with_border(panels, border=2))
 
@@ -1590,6 +1626,15 @@ def main():
         ).reshape(fH, fW).numpy()
         pca_panel = upscale(rend_pcas[j], S)
         cos_panel = upscale(cosine_map_to_heatmap(cos), S)
+        if pca_panel.shape[0] != tH_c or pca_panel.shape[1] != tW_c:
+            pca_panel = cv2.resize(pca_panel, (tW_c, tH_c), interpolation=cv2.INTER_LINEAR)
+            cos_panel = cv2.resize(cos_panel, (tW_c, tH_c), interpolation=cv2.INTER_LINEAR)
+
+        def _to_display(img):
+            """Resize any panel to composite display resolution."""
+            if img.shape[0] != tH_c or img.shape[1] != tW_c:
+                return cv2.resize(img, (tW_c, tH_c), interpolation=cv2.INTER_LINEAR)
+            return img
 
         # Depth
         dpath = get_vis_depth_path(j)
@@ -1599,49 +1644,46 @@ def main():
             gt_vmin = gt_d[gt_d > 0.01].min() if (gt_d > 0.01).any() else 0
             gt_vmax = gt_d.max()
             r_depth = resize_depth_map(fused_depth_preds[j], gt_d.shape[:2])
-            gt_depth_panel = depth_to_colormap(gt_d, gt_vmin, gt_vmax)
-            rend_depth_panel = depth_to_colormap(r_depth, gt_vmin, gt_vmax)
+            gt_depth_panel = _to_display(depth_to_colormap(gt_d, gt_vmin, gt_vmax))
+            rend_depth_panel = _to_display(depth_to_colormap(r_depth, gt_vmin, gt_vmax))
 
             gd = geom_depths[j]
             has_geom = gd is not None and gd.max() > 0.01
             if has_geom:
                 gd_aligned = align_depth_scale_shift(gd, gt_d)
                 gd_aligned = smooth_depth_for_display(gd_aligned, gd_aligned > 0.01)
-                geom_depth_panel = cv2.resize(
-                    depth_to_colormap(gd_aligned, gt_vmin, gt_vmax), (tW_c, tH_c),
-                    interpolation=cv2.INTER_LINEAR,
-                )
+                geom_depth_panel = _to_display(
+                    depth_to_colormap(gd_aligned, gt_vmin, gt_vmax))
             else:
-                geom_depth_panel = np.zeros(
-                    (fH * S, fW * S, 3), dtype=np.uint8)
+                geom_depth_panel = np.zeros((tH_c, tW_c, 3), dtype=np.uint8)
         else:
-            h_, w_ = fH * S, fW * S
-            gt_depth_panel = np.zeros((h_, w_, 3), dtype=np.uint8)
-            rend_depth_panel = np.zeros((h_, w_, 3), dtype=np.uint8)
-            geom_depth_panel = np.zeros((h_, w_, 3), dtype=np.uint8)
+            gt_depth_panel = np.zeros((tH_c, tW_c, 3), dtype=np.uint8)
+            rend_depth_panel = np.zeros((tH_c, tW_c, 3), dtype=np.uint8)
+            geom_depth_panel = np.zeros((tH_c, tW_c, 3), dtype=np.uint8)
 
         # Segmentation (smooth: upscale logits before argmax)
         spath = get_vis_sem_path(j)
         sem_raw_img = load_vis_sem(j)
         if sem_raw_img is not None:
-            gt_sem_hr = cv2.resize(sem_raw_img, (tW, tH), interpolation=cv2.INTER_NEAREST)
+            gt_sem_hr = cv2.resize(sem_raw_img, (tW_c, tH_c), interpolation=cv2.INTER_NEAREST)
             r_seg_hr = rend_seg_preds_hr[j]
-            rgb_hr = cv2.resize(rgb, (tW, tH))
+            if r_seg_hr.shape[0] != tH_c or r_seg_hr.shape[1] != tW_c:
+                r_seg_hr = cv2.resize(r_seg_hr, (tW_c, tH_c), interpolation=cv2.INTER_NEAREST)
+            rgb_hr = cv2.resize(rgb, (tW_c, tH_c))
             gt_seg_panel = (0.6 * seg_to_color(gt_sem_hr) + 0.4 * rgb_hr).astype(np.uint8)
             rend_seg_panel = (0.6 * seg_to_color(r_seg_hr) + 0.4 * rgb_hr).astype(np.uint8)
         else:
-            h_, w_ = fH * S, fW * S
-            gt_seg_panel = np.zeros((h_, w_, 3), dtype=np.uint8)
-            rend_seg_panel = np.zeros((h_, w_, 3), dtype=np.uint8)
+            gt_seg_panel = np.zeros((tH_c, tW_c, 3), dtype=np.uint8)
+            rend_seg_panel = np.zeros((tH_c, tW_c, 3), dtype=np.uint8)
 
         # Layout: 2 rows × 5 cols
         # Row 1: RGB      | Rendered PCA | GT Depth   | Geom Depth  | GT Seg
         # Row 2: Cosine   | GT PCA       | Pred Depth | Depth Error | Pred Seg
-        cell_w = fW * S
-        cell_h = fH * S
         rgb_panel = rgb_display
 
         gt_pca_panel = upscale(gt_pcas[j], S)
+        if gt_pca_panel.shape[0] != tH_c or gt_pca_panel.shape[1] != tW_c:
+            gt_pca_panel = cv2.resize(gt_pca_panel, (tW_c, tH_c), interpolation=cv2.INTER_LINEAR)
 
         # Depth error map (absolute difference, jet colormap)
         if d_raw is not None:
@@ -1652,9 +1694,9 @@ def main():
             err_norm = np.clip(depth_err / max(err_max, 1e-6), 0, 1)
             err_color = cv2.applyColorMap((err_norm * 255).astype(np.uint8), cv2.COLORMAP_HOT)
             err_color = cv2.cvtColor(err_color, cv2.COLOR_BGR2RGB)
-            depth_err_panel = err_color
+            depth_err_panel = _to_display(err_color)
         else:
-            depth_err_panel = np.zeros((cell_h, cell_w, 3), dtype=np.uint8)
+            depth_err_panel = np.zeros((tH_c, tW_c, 3), dtype=np.uint8)
 
         row1_panels = [rgb_panel, pca_panel, gt_depth_panel,
                        geom_depth_panel, gt_seg_panel]
