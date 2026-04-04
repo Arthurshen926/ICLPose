@@ -269,8 +269,8 @@ def resize_depth_map(depth, target_hw, interp=cv2.INTER_LINEAR):
 def smooth_depth_for_display(depth, valid_mask=None, guide_rgb=None):
     """Make noisy geometry depth easier to interpret for visualization only.
     
-    Uses edge-preserving filtering. If guide_rgb is provided, uses joint
-    bilateral filtering to preserve RGB-aligned edges.
+    Uses a single light median filter to remove salt-and-pepper noise without
+    adding texture artifacts from edge-preserving bilateral filters.
     """
     d = depth.astype(np.float32).copy()
     if valid_mask is None:
@@ -279,17 +279,8 @@ def smooth_depth_for_display(depth, valid_mask=None, guide_rgb=None):
         valid_mask = valid_mask.astype(bool)
     if valid_mask.sum() < 10:
         return d
-    # Estimate depth range for appropriate sigma
-    d_valid = d[valid_mask]
-    depth_range = float(np.percentile(d_valid, 95) - np.percentile(d_valid, 5))
-    sigma_color = max(depth_range * 0.1, 0.05)
     ksize = 5 if min(d.shape[:2]) >= 60 else 3
-    # Step 1: Median filter to remove salt-and-pepper noise
     d_smooth = cv2.medianBlur(d, ksize)
-    # Step 2: Edge-preserving bilateral filter with depth-adaptive sigma
-    d_smooth = cv2.bilateralFilter(d_smooth, 7, sigma_color, 7.0)
-    # Step 3: Second pass for remaining noise
-    d_smooth = cv2.bilateralFilter(d_smooth, 5, sigma_color * 0.5, 5.0)
     d_smooth[~valid_mask] = 0.0
     return d_smooth
 
@@ -835,11 +826,10 @@ def extract_geom_depth_np(geom_depth, alpha_map, fH=None, fW=None):
             a = cv2.resize(a, (fW, fH), interpolation=cv2.INTER_LINEAR)
         valid = a > 0.1
         d[~valid] = 0.0
-    # Bilateral filter: smooth noise while preserving depth edges
+    # Bilateral filter: smooth ED noise while preserving depth edges
     d_f32 = d.astype(np.float32)
     if d_f32.max() > 0:
         d_norm = d_f32 / (d_f32.max() + 1e-6)
-        # d=5 window, sigma_color=0.05 (small = edge-preserving), sigma_space=5
         d_filtered = cv2.bilateralFilter(d_norm, d=5, sigmaColor=0.05, sigmaSpace=5.0)
         d_filtered = d_filtered * (d_f32.max() + 1e-6)
     else:
@@ -1151,8 +1141,11 @@ def main():
 
     for j in range(n_vis):
         gt_f, rend_f = gt_feats[j], rend_feats[j]
+        # Normalize along channel dim before cosine (matches training loss)
+        rend_norm = F.normalize(rend_f, p=2, dim=0)
+        gt_norm = F.normalize(gt_f, p=2, dim=0)
         cos = F.cosine_similarity(
-            rend_f.reshape(-1, fH * fW), gt_f.reshape(-1, fH * fW), dim=0
+            rend_norm.reshape(-1, fH * fW), gt_norm.reshape(-1, fH * fW), dim=0
         ).reshape(fH, fW).numpy()
 
         rgb = load_vis_rgb(j)
@@ -1180,8 +1173,10 @@ def main():
     grid_rows = []
     for j in range(n_grid):
         idx = get_vis_label(j)
+        rend_norm_g = F.normalize(rend_feats[j], p=2, dim=0)
+        gt_norm_g = F.normalize(gt_feats[j], p=2, dim=0)
         cos = F.cosine_similarity(
-            rend_feats[j].reshape(-1, fH * fW), gt_feats[j].reshape(-1, fH * fW), dim=0
+            rend_norm_g.reshape(-1, fH * fW), gt_norm_g.reshape(-1, fH * fW), dim=0
         ).reshape(fH, fW).numpy()
         rgb = cv2.imread(str(get_vis_rgb_path(j)))
         rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
@@ -1449,6 +1444,12 @@ def main():
             rgb_hr = cv2.resize(rgb, (tW, tH), interpolation=cv2.INTER_LINEAR)
 
             # Per-query rows: GT Semantic Mask | Rendered Text Mask | Rendered Heatmap
+            if j == 0:
+                print(f"  [DEBUG] Frame {get_vis_label(j)} grounding correspondence:")
+                for qi_dbg, q_dbg in enumerate(active_queries):
+                    cid_dbg = active_query_cids[qi_dbg]
+                    gt_area = int((gt_sem == cid_dbg).sum()) if gt_sem is not None else 0
+                    print(f"    qi={qi_dbg}: query='{q_dbg}' class_id={cid_dbg} gt_pixels={gt_area}")
             query_rows = []
             for qi, qname in enumerate(active_queries):
                 gt_h = gt_raw[qi].cpu().numpy()
@@ -1560,9 +1561,11 @@ def main():
         tH_c, tW_c = fH * S, fW * S
         rgb_display = cv2.resize(rgb, (tW_c, tH_c), interpolation=cv2.INTER_LINEAR)
 
-        # PCA
+        # PCA + cosine (normalize along channel dim to match training)
+        rend_norm_c = F.normalize(rend_feats[j], p=2, dim=0)
+        gt_norm_c = F.normalize(gt_feats[j], p=2, dim=0)
         cos = F.cosine_similarity(
-            rend_feats[j].reshape(-1, fH * fW), gt_feats[j].reshape(-1, fH * fW), dim=0
+            rend_norm_c.reshape(-1, fH * fW), gt_norm_c.reshape(-1, fH * fW), dim=0
         ).reshape(fH, fW).numpy()
         pca_panel = upscale(rend_pcas[j], S)
         cos_panel = upscale(cosine_map_to_heatmap(cos), S)
