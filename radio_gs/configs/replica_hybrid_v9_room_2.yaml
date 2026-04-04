@@ -104,11 +104,11 @@ seg_loss_type: "ce"
 seg_ignore_index: 255
 
 # Data
-feature_dir: "output/radio_features_1280d/room_2/traj0_frei"
-depth_dir: "dataset/room_2/traj0_frei/depth"
-semantics_dir: "dataset/room_2/traj0_frei/semantic_class"
-train_split: "traj0_frei"
-val_split: "traj1_frei"
+feature_dir: "output/radio_features_1280d/room_2/Sequence_1"
+depth_dir: "dataset/room_2/Sequence_1/depth"
+semantics_dir: "dataset/room_2/Sequence_1/semantic_class"
+train_split: "Sequence_1"
+val_split: "Sequence_2"
 mixed_split: true
 num_workers: 4
 
