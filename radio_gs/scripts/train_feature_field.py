@@ -149,11 +149,11 @@ class SimpleRadioDataset(Dataset):
             _, cur_h, cur_w = radio_feat.shape
             if tgt_h > cur_h or tgt_w > cur_w:
                 radio_feat = F.interpolate(
-                    radio_feat.unsqueeze(0),
+                    radio_feat.float().unsqueeze(0),
                     size=(tgt_h, tgt_w),
                     mode="bilinear",
                     align_corners=False,
-                ).squeeze(0)
+                ).squeeze(0).half()
 
         pose_w2c = torch.from_numpy(self.poses_w2c[idx])  # [4, 4]
 
@@ -857,6 +857,7 @@ class RadioGSTrainer:
 
                 # Depth-guided feature smoothness loss
                 l_depth_feat = torch.tensor(0.0, device=self.device)
+                geom_depth = result.get("depth_map")
                 if self.depth_guided_feat_loss is not None and geom_depth is not None:
                     feat_for_smooth = rendered_compact
                     gd = geom_depth.unsqueeze(0).unsqueeze(0) if geom_depth.dim() == 2 else geom_depth

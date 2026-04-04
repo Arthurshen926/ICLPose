@@ -1,4 +1,4 @@
-# RADIO-GS V9 Hybrid: 60x80 resolution + improved loss
+# RADIO-GS V9 Hybrid: 60x80 resolution + depth-guided feature smoothness + Berhu
 exp_name: "radio_gs_room2_hybrid_v9"
 output_dir: "output/radio_gs/room2_hybrid_v9"
 seed: 42
@@ -89,6 +89,12 @@ depth_head_num_layers: 3
 gradient_loss_weight: 0.5
 gradient_loss_type: "sobel"
 
+# Depth-guided feature smoothness — geometry edges guide feature edges
+depth_guided_feature_weight: 0.3
+
+# Geometric depth loss type — Berhu for better edge handling
+geom_depth_supervision_loss_type: "berhu"
+
 # Segmentation auxiliary — stronger
 seg_loss_weight: 0.3
 seg_head_type: "mlp"
@@ -98,11 +104,12 @@ seg_loss_type: "ce"
 seg_ignore_index: 255
 
 # Data
-feature_dir: "output/radio_features_1280d/room_2/Sequence_1"
-depth_dir: "dataset/room_2/Sequence_1/depth"
-semantics_dir: "dataset/room_2/Sequence_1/semantic_class"
-train_split: "Sequence_1"
-val_split: "Sequence_2"
+feature_dir: "output/radio_features_1280d/room_2/traj0_frei"
+depth_dir: "dataset/room_2/traj0_frei/depth"
+semantics_dir: "dataset/room_2/traj0_frei/semantic_class"
+train_split: "traj0_frei"
+val_split: "traj1_frei"
+mixed_split: true
 num_workers: 4
 
 # Downstream tasks
@@ -112,6 +119,3 @@ seg_num_classes: 101
 save_every: 10
 eval_every: 5
 log_every: 50
-
-# Mixed split (train=Seq1, val=Seq2)
-mixed_split: true
