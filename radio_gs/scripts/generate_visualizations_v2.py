@@ -847,12 +847,12 @@ def extract_geom_depth_np(geom_depth, alpha_map, fH=None, fW=None):
             a = cv2.resize(a, (fW, fH), interpolation=cv2.INTER_LINEAR)
         valid = a > 0.1
         d[~valid] = 0.0
-    # Bilateral filter: smooth ED noise while preserving depth edges
+    # Median filter to remove per-Gaussian salt-and-pepper noise,
+    # then light Gaussian blur for smooth appearance.
     d_f32 = d.astype(np.float32)
     if d_f32.max() > 0:
-        d_norm = d_f32 / (d_f32.max() + 1e-6)
-        d_filtered = cv2.bilateralFilter(d_norm, d=5, sigmaColor=0.05, sigmaSpace=5.0)
-        d_filtered = d_filtered * (d_f32.max() + 1e-6)
+        d_filtered = cv2.medianBlur(d_f32, 3)
+        d_filtered = cv2.GaussianBlur(d_filtered, (3, 3), 0.8)
     else:
         d_filtered = d_f32
     d_filtered[~valid] = 0.0
