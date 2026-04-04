@@ -142,6 +142,18 @@ class SimpleRadioDataset(Dataset):
         if radio_feat.dim() == 4:
             radio_feat = radio_feat.squeeze(0)
 
+        # Upsample features if target resolution exceeds native resolution
+        if self.feature_size is not None:
+            tgt_h, tgt_w = self.feature_size
+            _, cur_h, cur_w = radio_feat.shape
+            if tgt_h > cur_h or tgt_w > cur_w:
+                radio_feat = F.interpolate(
+                    radio_feat.unsqueeze(0),
+                    size=(tgt_h, tgt_w),
+                    mode="bilinear",
+                    align_corners=False,
+                ).squeeze(0)
+
         pose_w2c = torch.from_numpy(self.poses_w2c[idx])  # [4, 4]
 
         depth: Optional[torch.Tensor] = None
@@ -579,12 +591,11 @@ class RadioGSTrainer:
 
         # RGB guide setup
         rgb_dir_train = rgb_dir_val = None
-        feature_size = None
+        feature_size = (
+            getattr(config, "feature_height", 30),
+            getattr(config, "feature_width", 40),
+        )
         if self.refiner_rgb_guide:
-            feature_size = (
-                getattr(config, "feature_height", 30),
-                getattr(config, "feature_width", 40),
-            )
             rgb_dir_train = str(scene_root / train_split / "rgb")
             rgb_dir_val = str(scene_root / val_split / "rgb")
 
