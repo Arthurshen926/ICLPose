@@ -148,7 +148,7 @@ def prepare_depth_fusion_sample(
 class DepthFusionProbe(nn.Module):
     """Blend feature-predicted and geometric depth with learned gating."""
 
-    def __init__(self, in_dim: int, hidden: int = 256):
+    def __init__(self, in_dim: int, hidden: int = 256, geom_bias: float = 2.0):
         super().__init__()
         self.encoder = nn.Sequential(
             nn.Linear(in_dim, hidden),
@@ -158,6 +158,9 @@ class DepthFusionProbe(nn.Module):
         )
         self.gate_head = nn.Linear(hidden, 1)
         self.residual_head = nn.Linear(hidden, 1)
+        # Initialize gate bias to favor geometric depth (sigmoid(2.0) ≈ 0.88)
+        nn.init.constant_(self.gate_head.bias, geom_bias)
+        nn.init.zeros_(self.residual_head.bias)
 
     def forward(
         self,
@@ -169,7 +172,7 @@ class DepthFusionProbe(nn.Module):
         hidden = self.encoder(input_flat)
         gate = torch.sigmoid(self.gate_head(hidden)) * geom_valid_flat
         base = gate * geom_depth_flat + (1.0 - gate) * feat_depth_flat
-        correction_scale = (geom_depth_flat - feat_depth_flat).abs() + 0.25
+        correction_scale = (geom_depth_flat - feat_depth_flat).abs().clamp(max=0.5) + 0.1
         residual = torch.tanh(self.residual_head(hidden)) * correction_scale
         return base + residual, gate
 
