@@ -52,6 +52,7 @@ class RadioGSConfig:
     # HCD Codec
     bottleneck_dim: int = 64
     dual_stream: bool = True
+    symmetric_decoder: bool = False
     decoder_hidden_dim: int = 512
     decoder_num_layers: int = 3
 
@@ -107,8 +108,18 @@ class RadioGSConfig:
     cosine_weight: float = 0.5
     consistency_weight: float = 0.1
     adaptor_weight: float = 0.1
+    siglip_alignment_weight: float = 0.0
     tv_weight: float = 0.01
     feat_norm_weight: float = 0.0
+    gradient_loss_weight: float = 0.0
+    gradient_loss_type: str = "sobel"
+    depth_loss_weight: float = 0.0
+    geom_depth_loss_weight: float = 0.0
+    geom_depth_detach: bool = True
+    depth_alpha_threshold: float = 0.05
+    depth_supervision_loss_type: str = "scale_invariant"
+    geom_depth_supervision_loss_type: str = "scale_invariant"
+    siglip_projection_weights: str = "output/radio_gs/siglip2_feat_projection.pth"
 
     # Data
     feature_dir: str = ""  # pre-extracted RADIO features
@@ -123,9 +134,16 @@ class RadioGSConfig:
 
     # Downstream tasks
     depth_head_type: str = "mlp"  # "linear", "mlp", "dpt"
+    depth_head_hidden_dim: int = 256
+    depth_head_num_layers: int = 3
     depth_num_classes: int = 1
     seg_num_classes: int = 40
     seg_head_type: str = "mlp"
+    seg_head_hidden_dim: int = 256
+    seg_head_num_layers: int = 2
+    seg_loss_weight: float = 0.0
+    seg_loss_type: str = "ce"
+    seg_ignore_index: int = 255
     grounding_use_adaptor: bool = True
 
     # Checkpointing

@@ -39,6 +39,7 @@ from radio_gs.heads.depth_head import DepthHead, DepthLoss
 from radio_gs.heads.segmentation_head import SegmentationHead, SegmentationLoss, compute_miou
 from radio_gs.losses.distillation_loss import (
     DistillationLoss,
+    GradientWeightedLoss,
     MultiViewConsistencyLoss,
     TotalVariationLoss,
 )
@@ -276,6 +277,12 @@ class RadioGSTrainer:
         )
         self.mv_loss_fn = MultiViewConsistencyLoss()
         self.tv_loss_fn = TotalVariationLoss()
+        self.gradient_loss_weight = getattr(config, "gradient_loss_weight", 0.0)
+        self.gradient_loss_fn: Optional[GradientWeightedLoss] = None
+        if self.gradient_loss_weight > 0:
+            self.gradient_loss_fn = GradientWeightedLoss(
+                base_weight=1.0, edge_multiplier=3.0,
+            ).to(self.device)
         self.depth_loss_weight = getattr(config, "depth_loss_weight", 0.0)
         self.geom_depth_loss_weight = getattr(config, "geom_depth_loss_weight", 0.0)
         self.depth_alpha_threshold = getattr(config, "depth_alpha_threshold", 0.05)
@@ -435,6 +442,7 @@ class RadioGSTrainer:
             input_dim=getattr(config, "radio_feature_dim", 1280),
             bottleneck_dim=getattr(config, "bottleneck_dim", 64),
             dual_stream=getattr(config, "dual_stream", True),
+            symmetric_decoder=getattr(config, "symmetric_decoder", False),
         )
 
     def _build_optimizer(self, config: RadioGSConfig) -> optim.Optimizer:
@@ -664,6 +672,7 @@ class RadioGSTrainer:
             "distill": 0.0,
             "compact": 0.0,
             "tv": 0.0,
+            "gradient": 0.0,
             "rgb": 0.0,
             "depth_gt": 0.0,
             "depth_geom": 0.0,
@@ -822,9 +831,18 @@ class RadioGSTrainer:
 
                 l_tv = self.tv_loss_fn(rendered_compact)
 
+                # Gradient-weighted loss for sharper boundaries
+                l_gradient = torch.tensor(0.0, device=self.device)
+                if self.gradient_loss_fn is not None and decoded_for_depth is not None:
+                    gt_for_grad = gt_radio_rs if self.train_mode != "latent" else gt_compact
+                    pred_for_grad = decoded_for_depth if self.train_mode != "latent" else rendered_compact
+                    l_gradient = self.gradient_loss_fn(pred_for_grad, gt_for_grad)
+
                 adaptor_w = getattr(self.cfg, "adaptor_weight", 0.1)
                 tv_w = getattr(self.cfg, "tv_weight", 0.01)
                 loss = l_distill + adaptor_w * l_compact + tv_w * l_tv
+                if self.gradient_loss_weight > 0:
+                    loss = loss + self.gradient_loss_weight * l_gradient
                 if self.feat_norm_weight > 0:
                     loss = loss + self.feat_norm_weight * l_feat_norm
                 if self.rgb_loss_weight > 0:
@@ -859,6 +877,7 @@ class RadioGSTrainer:
             loss_accum["distill"] += l_distill.item()
             loss_accum["compact"] += l_compact.item()
             loss_accum["tv"] += l_tv.item()
+            loss_accum["gradient"] += l_gradient.item()
             loss_accum["rgb"] += l_rgb.item()
             loss_accum["depth_gt"] += depth_losses["depth_gt"].item()
             loss_accum["depth_geom"] += depth_losses["depth_geom"].item()
@@ -885,6 +904,9 @@ class RadioGSTrainer:
                 )
                 self.writer.add_scalar(
                     "train/tv", l_tv.item(), self.global_step
+                )
+                self.writer.add_scalar(
+                    "train/gradient", l_gradient.item(), self.global_step
                 )
                 self.writer.add_scalar(
                     "train/cosine", cos_sim.item(), self.global_step
@@ -1297,10 +1319,10 @@ class RadioGSTrainer:
 
         if self.geom_depth_loss_weight > 0:
             geom_key = "geom_depth" if "geom_depth" in render_result else "depth_map"
-            geom_depth = self._resize_map(
-                render_result[geom_key].detach().to(self.device).float(),
-                target_size,
-            )
+            geom_raw = render_result[geom_key].to(self.device).float()
+            if getattr(self.cfg, "geom_depth_detach", True):
+                geom_raw = geom_raw.detach()
+            geom_depth = self._resize_map(geom_raw, target_size)
             geom_mask = (geom_depth > 0) & (alpha > self.depth_alpha_threshold)
             geom_mask = geom_mask & valid_mask
             if geom_mask.any():

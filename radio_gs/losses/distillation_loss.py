@@ -299,6 +299,60 @@ class TotalVariationLoss(nn.Module):
         return diff_h + diff_w
 
 
+class GradientWeightedLoss(nn.Module):
+    """Edge-aware distillation loss that upweights high-gradient (boundary) regions.
+
+    Uses Sobel filtering on GT features (channel-mean) to detect edges, then
+    produces a per-pixel weight map that focuses the L2/cosine loss on boundaries
+    where sharpness matters most.
+    """
+
+    def __init__(self, base_weight: float = 1.0, edge_multiplier: float = 3.0):
+        super().__init__()
+        self.base_weight = base_weight
+        self.edge_multiplier = edge_multiplier
+        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32)
+        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32)
+        self.register_buffer("sobel_x", sobel_x.view(1, 1, 3, 3))
+        self.register_buffer("sobel_y", sobel_y.view(1, 1, 3, 3))
+
+    def _compute_edge_weight(self, target: torch.Tensor) -> torch.Tensor:
+        """Compute per-pixel edge weight from GT features.
+
+        Args:
+            target: [B, C, H, W] ground truth features.
+
+        Returns:
+            [B, 1, H, W] weight map in [base_weight, base_weight + edge_multiplier].
+        """
+        gray = target.mean(dim=1, keepdim=True)  # [B, 1, H, W]
+        gx = F.conv2d(gray, self.sobel_x, padding=1)
+        gy = F.conv2d(gray, self.sobel_y, padding=1)
+        magnitude = (gx.pow(2) + gy.pow(2)).sqrt()  # [B, 1, H, W]
+        # Normalize to [0, 1] per-image
+        mag_max = magnitude.flatten(1).max(dim=1)[0].view(-1, 1, 1, 1).clamp(min=1e-6)
+        norm_mag = magnitude / mag_max
+        return self.base_weight + self.edge_multiplier * norm_mag
+
+    def forward(
+        self,
+        decoded: torch.Tensor,
+        target: torch.Tensor,
+    ) -> torch.Tensor:
+        """Gradient-weighted L2 loss focusing on boundary regions.
+
+        Args:
+            decoded: [B, C, H, W] predicted features.
+            target: [B, C, H, W] ground truth features.
+
+        Returns:
+            Scalar loss.
+        """
+        weight = self._compute_edge_weight(target.detach())  # [B, 1, H, W]
+        pixel_err = (decoded - target).pow(2).mean(dim=1, keepdim=True)  # [B, 1, H, W]
+        return (pixel_err * weight).mean()
+
+
 class RadioGSLoss(nn.Module):
     """Combined loss manager for RADIO-GS training.
 

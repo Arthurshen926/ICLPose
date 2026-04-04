@@ -111,27 +111,39 @@ class HCDDecoder(nn.Module):
     Args:
         bottleneck_dim: Input compact dimension.
         output_dim:     Reconstructed feature dimension (default 1280).
+        symmetric:      If True, use a deeper decoder that mirrors the encoder
+                        capacity (bottleneck → 256 → 512 → 512 → output_dim).
     """
 
     def __init__(
         self,
         bottleneck_dim: int = 64,
         output_dim: int = 1280,
+        symmetric: bool = False,
     ) -> None:
         super().__init__()
         self.bottleneck_dim = bottleneck_dim
         self.output_dim = output_dim
 
-        self.mlp = nn.Sequential(
-            _conv1x1_gnorm_gelu(bottleneck_dim, 256),
-            _conv1x1_gnorm_gelu(256, 512),
-            nn.Conv2d(512, output_dim, kernel_size=1),
-        )
+        if symmetric:
+            self.mlp = nn.Sequential(
+                _conv1x1_gnorm_gelu(bottleneck_dim, 256),
+                _conv1x1_gnorm_gelu(256, 512),
+                _conv1x1_gnorm_gelu(512, 512),
+                nn.Conv2d(512, output_dim, kernel_size=1),
+            )
+        else:
+            self.mlp = nn.Sequential(
+                _conv1x1_gnorm_gelu(bottleneck_dim, 256),
+                _conv1x1_gnorm_gelu(256, 512),
+                nn.Conv2d(512, output_dim, kernel_size=1),
+            )
         self.residual = nn.Conv2d(bottleneck_dim, output_dim, kernel_size=1)
         self.norm = nn.GroupNorm(1, output_dim)  # equivalent to LayerNorm over C
 
         n_params = sum(p.numel() for p in self.parameters())
-        print(f"[HCDDecoder] {bottleneck_dim}d → {output_dim}d | "
+        print(f"[HCDDecoder] {bottleneck_dim}d → {output_dim}d "
+              f"({'symmetric' if symmetric else 'standard'}) | "
               f"{n_params / 1e6:.2f}M params")
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
@@ -163,13 +175,14 @@ class HCDCodec(nn.Module):
         input_dim: int = 1280,
         bottleneck_dim: int = 64,
         dual_stream: bool = True,
+        symmetric_decoder: bool = False,
     ) -> None:
         super().__init__()
         self.input_dim = input_dim
         self.bottleneck_dim = bottleneck_dim
 
         self.encoder = HCDEncoder(input_dim, bottleneck_dim, dual_stream)
-        self.decoder = HCDDecoder(bottleneck_dim, input_dim)
+        self.decoder = HCDDecoder(bottleneck_dim, input_dim, symmetric=symmetric_decoder)
 
         total = sum(p.numel() for p in self.parameters())
         print(f"[HCDCodec] total {total / 1e6:.2f}M params | "
