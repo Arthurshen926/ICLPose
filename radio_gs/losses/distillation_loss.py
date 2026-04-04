@@ -353,6 +353,49 @@ class GradientWeightedLoss(nn.Module):
         return (pixel_err * weight).mean()
 
 
+class DepthGuidedFeatureLoss(nn.Module):
+    """Enforce feature spatial structure to match geometry depth edges.
+
+    Where the geometric depth is smooth, features should also be smooth.
+    Where the geometric depth has edges, features are allowed to be sharp.
+    This transfers 3DGS geometric quality into the feature field.
+    """
+
+    def __init__(self, smoothness_weight: float = 1.0, epsilon: float = 1e-3):
+        super().__init__()
+        self.smoothness_weight = smoothness_weight
+        self.epsilon = epsilon
+
+    def forward(
+        self,
+        features: torch.Tensor,
+        geom_depth: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute depth-guided feature smoothness loss.
+
+        Args:
+            features: [B, C, H, W] rendered feature map (compact or decoded).
+            geom_depth: [B, 1, H, W] geometric depth from 3DGS rendering.
+
+        Returns:
+            Scalar loss.
+        """
+        # Feature gradients (horizontal and vertical)
+        feat_dx = (features[:, :, :, 1:] - features[:, :, :, :-1]).abs().mean(dim=1, keepdim=True)
+        feat_dy = (features[:, :, 1:, :] - features[:, :, :-1, :]).abs().mean(dim=1, keepdim=True)
+
+        # Depth gradients → edge weight (high gradient = edge = allow feature variation)
+        depth_dx = (geom_depth[:, :, :, 1:] - geom_depth[:, :, :, :-1]).abs()
+        depth_dy = (geom_depth[:, :, 1:, :] - geom_depth[:, :, :-1, :]).abs()
+
+        # Exponential weighting: smooth depth → high weight → penalize feature gradients
+        weight_x = torch.exp(-depth_dx / (depth_dx.mean() + self.epsilon))
+        weight_y = torch.exp(-depth_dy / (depth_dy.mean() + self.epsilon))
+
+        loss = (weight_x * feat_dx).mean() + (weight_y * feat_dy).mean()
+        return self.smoothness_weight * loss
+
+
 class RadioGSLoss(nn.Module):
     """Combined loss manager for RADIO-GS training.
 

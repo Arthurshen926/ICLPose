@@ -113,6 +113,7 @@ class RadioGSConfig:
     feat_norm_weight: float = 0.0
     gradient_loss_weight: float = 0.0
     gradient_loss_type: str = "sobel"
+    depth_guided_feature_weight: float = 0.0
     depth_loss_weight: float = 0.0
     geom_depth_loss_weight: float = 0.0
     geom_depth_detach: bool = True

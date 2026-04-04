@@ -1,4 +1,4 @@
-# RADIO-GS V9 Hybrid: 60x80 resolution + improved loss
+# RADIO-GS V9 Hybrid: 60x80 resolution + depth-guided feature smoothness + Berhu
 exp_name: "radio_gs_room0_hybrid_v9"
 output_dir: "output/radio_gs/room0_hybrid_v9"
 seed: 42
@@ -88,6 +88,12 @@ depth_head_num_layers: 3
 # Gradient-weighted distillation loss for sharp boundaries
 gradient_loss_weight: 0.5
 gradient_loss_type: "sobel"
+
+# Depth-guided feature smoothness — geometry edges guide feature edges
+depth_guided_feature_weight: 0.3
+
+# Geometric depth loss type — Berhu for better edge handling
+geom_depth_supervision_loss_type: "berhu"
 
 # Segmentation auxiliary — stronger
 seg_loss_weight: 0.3

@@ -38,6 +38,7 @@ from radio_gs.config import RadioGSConfig, load_config
 from radio_gs.heads.depth_head import DepthHead, DepthLoss
 from radio_gs.heads.segmentation_head import SegmentationHead, SegmentationLoss, compute_miou
 from radio_gs.losses.distillation_loss import (
+    DepthGuidedFeatureLoss,
     DistillationLoss,
     GradientWeightedLoss,
     MultiViewConsistencyLoss,
@@ -297,6 +298,10 @@ class RadioGSTrainer:
             ).to(self.device)
         self.depth_loss_weight = getattr(config, "depth_loss_weight", 0.0)
         self.geom_depth_loss_weight = getattr(config, "geom_depth_loss_weight", 0.0)
+        self.depth_guided_feat_weight = getattr(config, "depth_guided_feature_weight", 0.0)
+        self.depth_guided_feat_loss: Optional[DepthGuidedFeatureLoss] = None
+        if self.depth_guided_feat_weight > 0:
+            self.depth_guided_feat_loss = DepthGuidedFeatureLoss().to(self.device)
         self.depth_alpha_threshold = getattr(config, "depth_alpha_threshold", 0.05)
         self.depth_head: Optional[DepthHead] = None
         self.depth_supervision_loss: Optional[DepthLoss] = None
@@ -684,6 +689,7 @@ class RadioGSTrainer:
             "compact": 0.0,
             "tv": 0.0,
             "gradient": 0.0,
+            "depth_feat": 0.0,
             "rgb": 0.0,
             "depth_gt": 0.0,
             "depth_geom": 0.0,
@@ -849,11 +855,24 @@ class RadioGSTrainer:
                     pred_for_grad = decoded_for_depth if self.train_mode != "latent" else rendered_compact
                     l_gradient = self.gradient_loss_fn(pred_for_grad, gt_for_grad)
 
+                # Depth-guided feature smoothness loss
+                l_depth_feat = torch.tensor(0.0, device=self.device)
+                if self.depth_guided_feat_loss is not None and geom_depth is not None:
+                    feat_for_smooth = rendered_compact
+                    gd = geom_depth.unsqueeze(0).unsqueeze(0) if geom_depth.dim() == 2 else geom_depth
+                    if gd.dim() == 3:
+                        gd = gd.unsqueeze(0)
+                    if gd.shape[-2:] != feat_for_smooth.shape[-2:]:
+                        gd = F.interpolate(gd, size=feat_for_smooth.shape[-2:], mode='bilinear', align_corners=False)
+                    l_depth_feat = self.depth_guided_feat_loss(feat_for_smooth, gd)
+
                 adaptor_w = getattr(self.cfg, "adaptor_weight", 0.1)
                 tv_w = getattr(self.cfg, "tv_weight", 0.01)
                 loss = l_distill + adaptor_w * l_compact + tv_w * l_tv
                 if self.gradient_loss_weight > 0:
                     loss = loss + self.gradient_loss_weight * l_gradient
+                if self.depth_guided_feat_weight > 0:
+                    loss = loss + self.depth_guided_feat_weight * l_depth_feat
                 if self.feat_norm_weight > 0:
                     loss = loss + self.feat_norm_weight * l_feat_norm
                 if self.rgb_loss_weight > 0:
@@ -889,6 +908,7 @@ class RadioGSTrainer:
             loss_accum["compact"] += l_compact.item()
             loss_accum["tv"] += l_tv.item()
             loss_accum["gradient"] += l_gradient.item()
+            loss_accum["depth_feat"] += l_depth_feat.item()
             loss_accum["rgb"] += l_rgb.item()
             loss_accum["depth_gt"] += depth_losses["depth_gt"].item()
             loss_accum["depth_geom"] += depth_losses["depth_geom"].item()
