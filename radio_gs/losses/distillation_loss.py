@@ -16,7 +16,9 @@ class DistillationLoss(nn.Module):
     """Core feature distillation loss between decoded and GT RADIO features.
 
     Combines pixel-wise L2 (or Huber) with cosine similarity loss,
-    optionally masked by alpha visibility.
+    optionally masked by alpha visibility.  Supports channel-standardized
+    loss to address rank-1 RADIO features (where normalization destroys
+    spatial structure).
     """
 
     def __init__(
@@ -26,6 +28,7 @@ class DistillationLoss(nn.Module):
         huber_weight: float = 0.0,
         huber_delta: float = 0.1,
         normalize_features: bool = True,
+        channel_std_weight: float = 0.0,
     ):
         super().__init__()
         self.l2_weight = l2_weight
@@ -33,9 +36,45 @@ class DistillationLoss(nn.Module):
         self.huber_weight = huber_weight
         self.huber_delta = huber_delta
         self.normalize_features = normalize_features
+        self.channel_std_weight = channel_std_weight
 
         if huber_weight > 0:
             self.huber_loss = nn.HuberLoss(reduction='none', delta=huber_delta)
+
+    @staticmethod
+    def _channel_standardized_loss(
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """L1 loss after per-channel spatial standardization.
+
+        Scale-invariant: preserves spatial structure by ensuring the per-channel
+        spatial distribution of pred matches target (mean=0, std=1).
+        Addresses rank-1 RADIO features where >99.9% variance is in one direction.
+        """
+        def _standardize(x: torch.Tensor, m: Optional[torch.Tensor] = None) -> torch.Tensor:
+            B, C, H, W = x.shape
+            x_flat = x.reshape(B, C, -1)
+            if m is not None:
+                m_flat = m.expand_as(x).reshape(B, C, -1)
+                n_valid = m_flat.sum(-1, keepdim=True).clamp(min=1)
+                mu = (x_flat * m_flat).sum(-1, keepdim=True) / n_valid
+                var = ((x_flat - mu) ** 2 * m_flat).sum(-1, keepdim=True) / n_valid
+            else:
+                mu = x_flat.mean(-1, keepdim=True)
+                var = x_flat.var(-1, keepdim=True)
+            sigma = var.sqrt().clamp(min=1e-6)
+            return ((x_flat - mu) / sigma).reshape(B, C, H, W)
+
+        pred_s = _standardize(pred, mask)
+        target_s = _standardize(target, mask)
+        diff = (pred_s - target_s).abs()
+        if mask is not None:
+            diff = diff * mask
+            n_valid = mask.sum().clamp(min=1) * pred.shape[1]
+            return diff.sum() / n_valid
+        return diff.mean()
 
     def forward(
         self,
@@ -51,8 +90,13 @@ class DistillationLoss(nn.Module):
             mask: [B, 1, H, W] optional validity mask (e.g. alpha > threshold).
 
         Returns:
-            Dict with 'total', 'l2', 'cosine' loss tensors.
+            Dict with 'total', 'l2', 'cosine', and optionally 'channel_std' loss tensors.
         """
+        # Channel-standardized loss operates on raw (unnormalized) features
+        channel_std_loss = torch.tensor(0.0, device=decoded.device)
+        if self.channel_std_weight > 0:
+            channel_std_loss = self._channel_standardized_loss(decoded, target, mask)
+
         if self.normalize_features:
             decoded = F.normalize(decoded, p=2, dim=1)
             target = F.normalize(target, p=2, dim=1)
@@ -83,11 +127,16 @@ class DistillationLoss(nn.Module):
         else:
             total = (self.l2_weight * l2_loss) + (self.cosine_weight * cosine_loss)
 
-        return {
+        total = total + self.channel_std_weight * channel_std_loss
+
+        result = {
             'total': total,
             'l2': l2_loss,
             'cosine': cosine_loss,
         }
+        if self.channel_std_weight > 0:
+            result['channel_std'] = channel_std_loss
+        return result
 
 
 class CompactDistillationLoss(nn.Module):
@@ -353,6 +402,58 @@ class GradientWeightedLoss(nn.Module):
         return (pixel_err * weight).mean()
 
 
+class GeometricEdgeAlignmentLoss(nn.Module):
+    """Align rendered feature boundaries with geometric depth / alpha edges."""
+
+    def __init__(self, alpha_weight: float = 0.5):
+        super().__init__()
+        self.alpha_weight = alpha_weight
+        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32)
+        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32)
+        self.register_buffer("sobel_x", sobel_x.view(1, 1, 3, 3))
+        self.register_buffer("sobel_y", sobel_y.view(1, 1, 3, 3))
+
+    def _edge_map(self, x: torch.Tensor) -> torch.Tensor:
+        gx = F.conv2d(x, self.sobel_x, padding=1)
+        gy = F.conv2d(x, self.sobel_y, padding=1)
+        mag = (gx.pow(2) + gy.pow(2) + 1e-8).sqrt()
+        mag_max = mag.flatten(1).max(dim=1)[0].view(-1, 1, 1, 1).clamp(min=1e-6)
+        return mag / mag_max
+
+    def forward(
+        self,
+        features: torch.Tensor,
+        geom_depth: torch.Tensor,
+        alpha_map: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        feat_scalar = features.float().norm(dim=1, keepdim=True)
+        depth = geom_depth.float()
+        if depth.dim() == 3:
+            depth = depth.unsqueeze(1)
+        if depth.dim() == 4 and depth.shape[1] != 1:
+            depth = depth.mean(dim=1, keepdim=True)
+        if alpha_map is not None:
+            alpha = alpha_map.float()
+            if alpha.dim() == 3:
+                alpha = alpha.unsqueeze(1)
+            if alpha.dim() == 4 and alpha.shape[1] != 1:
+                alpha = alpha.mean(dim=1, keepdim=True)
+        else:
+            alpha = None
+
+        feat_edges = self._edge_map(feat_scalar)
+        depth_edges = self._edge_map(depth)
+        edge_weight = 1.0 + depth_edges
+        edge_loss = (feat_edges - depth_edges).abs() * edge_weight
+
+        if alpha is not None:
+            alpha_edges = self._edge_map(alpha.clamp(0.0, 1.0))
+            reliability = alpha.clamp(0.0, 1.0) + self.alpha_weight * alpha_edges
+            edge_loss = edge_loss * reliability.clamp(min=0.1)
+
+        return edge_loss.mean()
+
+
 class DepthGuidedFeatureLoss(nn.Module):
     """Enforce feature spatial structure to match geometry depth edges.
 
@@ -394,6 +495,124 @@ class DepthGuidedFeatureLoss(nn.Module):
 
         loss = (weight_x * feat_dx).mean() + (weight_y * feat_dy).mean()
         return self.smoothness_weight * loss
+
+
+class BoundaryAwareFeatureLoss(nn.Module):
+    """Enforce feature sharpness at depth boundaries while preserving smoothness elsewhere.
+
+    Addresses the fundamental alpha-blending smoothing problem:
+    3DGS blends features across depth discontinuities, producing blurred boundaries.
+    This loss directly penalizes the *mismatch* between feature gradients and depth
+    gradients, encouraging the rendered feature field to be sharp where geometry
+    has edges.  Unlike DepthGuidedFeatureLoss (which only penalizes feature gradients
+    in smooth regions), this also *encourages* feature gradients at depth boundaries.
+
+    The loss has two terms:
+        1. Sharpness term: at depth edges, feature gradients should be large
+        2. Smoothness term: at smooth depth regions, feature gradients should be small
+
+    Args:
+        sharpness_weight: Scale for the boundary sharpness encouragement term.
+        smoothness_weight: Scale for the smooth-region feature penalty.
+        edge_threshold: Normalized depth gradient above which a pixel is considered a boundary.
+        temperature: Softness of the edge/smooth boundary (higher = sharper transition).
+    """
+
+    def __init__(
+        self,
+        sharpness_weight: float = 1.0,
+        smoothness_weight: float = 1.0,
+        edge_threshold: float = 0.1,
+        temperature: float = 10.0,
+    ):
+        super().__init__()
+        self.sharpness_weight = sharpness_weight
+        self.smoothness_weight = smoothness_weight
+        self.edge_threshold = edge_threshold
+        self.temperature = temperature
+        # Sobel filters for robust gradient computation
+        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32)
+        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32)
+        self.register_buffer("sobel_x", sobel_x.view(1, 1, 3, 3))
+        self.register_buffer("sobel_y", sobel_y.view(1, 1, 3, 3))
+
+    def _compute_gradients(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute gradient magnitude using Sobel filters.
+
+        Args:
+            x: [B, 1, H, W] single-channel map.
+        Returns:
+            [B, 1, H, W] gradient magnitude.
+        """
+        gx = F.conv2d(x, self.sobel_x, padding=1)
+        gy = F.conv2d(x, self.sobel_y, padding=1)
+        return (gx.pow(2) + gy.pow(2) + 1e-8).sqrt()
+
+    def forward(
+        self,
+        features: torch.Tensor,
+        gt_features: torch.Tensor,
+        geom_depth: torch.Tensor,
+        alpha_map: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Compute boundary-aware feature loss.
+
+        Args:
+            features: [B, C, H, W] rendered/decoded feature map.
+            gt_features: [B, C, H, W] ground truth feature map.
+            geom_depth: [B, 1, H, W] geometric depth from 3DGS.
+            alpha_map: [B, 1, H, W] optional alpha/opacity map.
+
+        Returns:
+            Scalar loss.
+        """
+        # Compute depth edge map (normalized)
+        depth = geom_depth.float()
+        if depth.dim() == 3:
+            depth = depth.unsqueeze(1)
+        if depth.shape[1] != 1:
+            depth = depth.mean(dim=1, keepdim=True)
+        depth_grad = self._compute_gradients(depth)
+        # Normalize to [0, 1]
+        dg_max = depth_grad.flatten(1).max(dim=1)[0].view(-1, 1, 1, 1).clamp(min=1e-6)
+        depth_edge = depth_grad / dg_max  # [B, 1, H, W]
+
+        # Soft edge mask via sigmoid
+        edge_mask = torch.sigmoid(self.temperature * (depth_edge - self.edge_threshold))
+        smooth_mask = 1.0 - edge_mask
+
+        # Apply alpha masking if available
+        if alpha_map is not None:
+            alpha = alpha_map.float()
+            if alpha.dim() == 3:
+                alpha = alpha.unsqueeze(1)
+            if alpha.shape[-2:] != features.shape[-2:]:
+                alpha = F.interpolate(alpha, size=features.shape[-2:], mode='bilinear', align_corners=False)
+            visibility = (alpha > 0.05).float()
+            edge_mask = edge_mask * visibility
+            smooth_mask = smooth_mask * visibility
+
+        # Feature error map: per-pixel L1 between predicted and GT features
+        feat_error = (features - gt_features).abs().mean(dim=1, keepdim=True)  # [B, 1, H, W]
+
+        # Feature gradient magnitude (channel-mean)
+        feat_scalar = features.float().norm(dim=1, keepdim=True)
+        feat_grad = self._compute_gradients(feat_scalar)
+        # Normalize
+        fg_max = feat_grad.flatten(1).max(dim=1)[0].view(-1, 1, 1, 1).clamp(min=1e-6)
+        feat_edge = feat_grad / fg_max
+
+        # Term 1: Sharpness — at depth boundaries, encourage feature gradients
+        # Penalize *low* feature gradients at depth edges
+        sharpness_loss = (edge_mask * (1.0 - feat_edge)).mean()
+
+        # Term 2: Smoothness — at smooth depth, penalize feature error
+        smoothness_loss = (smooth_mask * feat_error).mean()
+
+        return (
+            self.sharpness_weight * sharpness_loss
+            + self.smoothness_weight * smoothness_loss
+        )
 
 
 class RadioGSLoss(nn.Module):

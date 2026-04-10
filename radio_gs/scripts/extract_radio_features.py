@@ -16,6 +16,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -30,20 +31,35 @@ from tqdm import tqdm
 # Ensure project root is importable
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
+from radio_gs.data.benchmark_paths import extract_feature_frame_index
+
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
 
 
 # ---- image loading helpers ------------------------------------------------
 
-def _collect_image_paths(image_dir: str) -> list[Path]:
-    """Return sorted list of image paths in *image_dir*."""
-    paths = sorted(
+def _collect_image_paths(image_dir: str) -> tuple[list[Path], str]:
+    """Return image paths with numeric frame-order when indices are parseable."""
+    paths = [
         p for p in Path(image_dir).iterdir()
         if p.suffix.lower() in IMAGE_EXTENSIONS
-    )
+    ]
     if not paths:
         raise FileNotFoundError(f"No images found in {image_dir}")
-    return paths
+
+    indexed: list[tuple[int, Path]] = []
+    for path in paths:
+        try:
+            indexed.append((extract_feature_frame_index(path), path))
+        except ValueError:
+            indexed = []
+            break
+
+    if indexed:
+        indexed.sort(key=lambda item: item[0])
+        return [path for _, path in indexed], "numeric"
+
+    return sorted(paths), "lexicographic"
 
 
 def _nearest_radio_resolution(h: int, w: int, patch_size: int = 16) -> tuple[int, int]:
@@ -137,8 +153,9 @@ def extract(args: argparse.Namespace) -> None:
     )
 
     # Collect images
-    image_paths = _collect_image_paths(args.image_dir)
+    image_paths, image_sort_mode = _collect_image_paths(args.image_dir)
     print(f"[RADIO] Found {len(image_paths)} images in {args.image_dir}")
+    print(f"[RADIO] Image ordering: {image_sort_mode}")
 
     # Probe resolution from first image
     probe_img = Image.open(image_paths[0])
@@ -156,6 +173,7 @@ def extract(args: argparse.Namespace) -> None:
         os.makedirs(os.path.join(args.output_dir, sd), exist_ok=True)
 
     pca_accumulator: list[torch.Tensor] = []
+    frame_manifest: list[dict[str, object]] = []
     total_bytes: int = 0
     t0 = time.time()
 
@@ -184,8 +202,21 @@ def extract(args: argparse.Namespace) -> None:
 
         # Save per-frame
         for i in range(B):
-            idx = start + i
-            stem = f"rgb_{idx}"
+            source_path = batch_paths[i]
+            source_rank = start + i
+            try:
+                frame_idx = extract_feature_frame_index(source_path)
+            except ValueError:
+                frame_idx = source_rank
+            stem = f"rgb_{frame_idx}"
+            frame_manifest.append(
+                {
+                    "source_rank": source_rank,
+                    "frame_idx": frame_idx,
+                    "source_file": source_path.name,
+                    "saved_stem": stem,
+                }
+            )
 
             # Backbone: float16
             bb = spatial_2d[i].cpu().half()
@@ -227,6 +258,21 @@ def extract(args: argparse.Namespace) -> None:
     pca_path = os.path.join(args.output_dir, "pca_stats.pt")
     torch.save(pca_stats, pca_path)
 
+    manifest_path = Path(args.output_dir) / "frame_manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "scene": args.scene,
+                "image_dir": str(Path(args.image_dir).resolve()),
+                "image_sort_mode": image_sort_mode,
+                "num_frames": len(frame_manifest),
+                "frames": frame_manifest,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
     # Summary
     elapsed = time.time() - t0
     disk_mb = total_bytes / (1024 * 1024)
@@ -237,6 +283,7 @@ def extract(args: argparse.Namespace) -> None:
     print(f"  Summary dim : {summary.shape[-1]}")
     print(f"  Disk usage  : {disk_mb:.1f} MB  (float16 spatial + float32 summary)")
     print(f"  PCA saved   : {pca_path}")
+    print(f"  Manifest    : {manifest_path}")
     print(f"  Time        : {elapsed:.1f}s  ({elapsed / n:.2f}s/frame)")
     print("=" * 60)
 

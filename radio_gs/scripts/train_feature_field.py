@@ -35,11 +35,29 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from radio_gs.config import RadioGSConfig, load_config
+from radio_gs.data.benchmark_paths import (
+    extract_feature_frame_index,
+    list_feature_paths,
+    load_w2c_from_pose_dir,
+    load_w2c_from_pose_file,
+    resolve_dataset_type,
+    resolve_depth_path,
+    resolve_rgb_path,
+    resolve_scene_root,
+    resolve_semantics_path,
+    resolve_split_data_dir,
+    resolve_split_feature_dir,
+    resolve_split_frame_ids,
+    resolve_split_pose_source,
+)
+from radio_gs.heads.grounding_head import QueryGroundingAuxLoss
 from radio_gs.heads.depth_head import DepthHead, DepthLoss
 from radio_gs.heads.segmentation_head import SegmentationHead, SegmentationLoss, compute_miou
 from radio_gs.losses.distillation_loss import (
+    BoundaryAwareFeatureLoss,
     DepthGuidedFeatureLoss,
     DistillationLoss,
+    GeometricEdgeAlignmentLoss,
     GradientWeightedLoss,
     MultiViewConsistencyLoss,
     TotalVariationLoss,
@@ -49,8 +67,13 @@ from radio_gs.models.featsharp_3d import FeatSharp3D
 from radio_gs.models.hcd_codec import HCDCodec
 from radio_gs.models.hybrid_gaussian import HybridFeatureGaussian
 from radio_gs.models.siglip_projection import SigLIP2FeatureProjection
-from radio_gs.models.screen_refiner import ScreenSpaceRefiner
+from radio_gs.models.screen_refiner import (
+    ScreenSpaceRefiner,
+    build_refiner_guide,
+    compute_refiner_extra_channels,
+)
 from radio_gs.rendering.feature_renderer import FeatureFieldRenderer
+from radio_gs.replica_constants import GROUNDING_QUERIES
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -70,67 +93,50 @@ class SimpleRadioDataset(Dataset):
     def __init__(
         self,
         feature_dir: str,
-        pose_file: str,
+        pose_file: Optional[str] = None,
+        pose_dir: Optional[str] = None,
         depth_dir: Optional[str] = None,
         semantics_dir: Optional[str] = None,
         rgb_dir: Optional[str] = None,
         feature_size: Optional[tuple] = None,
         split: str = "train",
+        dataset_type: str = "replica",
+        frame_ids: Optional[List[int]] = None,
     ):
         super().__init__()
         self.feature_dir = Path(feature_dir)
+        self.pose_file = Path(pose_file) if pose_file else None
+        self.pose_dir = Path(pose_dir) if pose_dir else None
         self.depth_dir = Path(depth_dir) if depth_dir else None
         self.semantics_dir = Path(semantics_dir) if semantics_dir else None
         self.rgb_dir = Path(rgb_dir) if rgb_dir else None
         self.feature_size = feature_size  # (H, W) for downsampling RGB
         self.split = split
+        self.dataset_type = resolve_dataset_type(dataset_type)
+        self.frame_filter = {int(fid) for fid in frame_ids} if frame_ids is not None else None
 
         # --- discover feature files (backbone/rgb_{idx}.pt) ---------------
-        backbone_dir = self.feature_dir / "backbone"
-        if not backbone_dir.exists():
-            backbone_dir = self.feature_dir  # fallback: features at root
-        self.feature_paths: List[Path] = sorted(
-            backbone_dir.glob("rgb_*.pt"),
-            key=lambda p: int(p.stem.split("_")[1]),
-        )
+        self.feature_paths = list_feature_paths(self.feature_dir, frame_ids=frame_ids)
         assert len(self.feature_paths) > 0, (
-            f"No feature files found in {backbone_dir}"
+            f"No feature files found in {self.feature_dir}"
         )
+        self.frame_indices = [extract_feature_frame_index(path) for path in self.feature_paths]
 
         # --- load poses (traj_w_c.txt: one 4x4 c2w per line) --------------
-        self.poses_w2c = self._load_poses(pose_file)
-        assert len(self.poses_w2c) >= len(self.feature_paths), (
-            f"Fewer poses ({len(self.poses_w2c)}) than features "
+        self.poses_w2c = self._load_poses()
+        assert len(self.poses_w2c) == len(self.feature_paths), (
+            f"Pose count ({len(self.poses_w2c)}) does not match features "
             f"({len(self.feature_paths)})"
         )
 
-        # --- optional depth maps ------------------------------------------
-        if self.depth_dir is not None and self.depth_dir.exists():
-            self.depth_paths: Optional[List[Path]] = sorted(
-                self.depth_dir.glob("*.png"),
-                key=lambda p: int(p.stem.split("_")[-1])
-                if p.stem.split("_")[-1].isdigit()
-                else 0,
-            )
-        else:
-            self.depth_paths = None
-        if self.semantics_dir is not None and self.semantics_dir.exists():
-            self.semantics_paths: Optional[List[Path]] = sorted(
-                self.semantics_dir.glob("semantic_class_*.png"),
-                key=lambda p: int(p.stem.split("_")[-1])
-                if p.stem.split("_")[-1].isdigit()
-                else 0,
-            )
-        else:
-            self.semantics_paths = None
-
     # ------------------------------------------------------------------
-    def _load_poses(self, pose_file: str) -> np.ndarray:
-        """Load poses from traj_w_c.txt → convert c2w to w2c."""
-        raw = np.loadtxt(pose_file).reshape(-1, 4, 4).astype(np.float32)
-        # Invert c2w → w2c
-        w2c = np.linalg.inv(raw)
-        return w2c
+    def _load_poses(self) -> np.ndarray:
+        """Load poses from a flat traj file or a per-frame pose directory."""
+        if self.pose_dir is not None:
+            return load_w2c_from_pose_dir(self.pose_dir, self.frame_indices)
+        if self.pose_file is None:
+            raise ValueError("Either pose_file or pose_dir must be provided")
+        return load_w2c_from_pose_file(self.pose_file, self.frame_indices)
 
     # ------------------------------------------------------------------
     def __len__(self) -> int:
@@ -155,21 +161,24 @@ class SimpleRadioDataset(Dataset):
                     align_corners=False,
                 ).squeeze(0).half()
 
+        frame_idx = self.frame_indices[idx]
         pose_w2c = torch.from_numpy(self.poses_w2c[idx])  # [4, 4]
 
         depth: Optional[torch.Tensor] = None
-        if self.depth_paths is not None and idx < len(self.depth_paths):
+        depth_path = resolve_depth_path(self.depth_dir, frame_idx, self.dataset_type)
+        if depth_path is not None and depth_path.exists():
             import cv2
 
-            d = cv2.imread(str(self.depth_paths[idx]), cv2.IMREAD_UNCHANGED)
+            d = cv2.imread(str(depth_path), cv2.IMREAD_UNCHANGED)
             if d is not None:
                 depth = torch.from_numpy(d.astype(np.float32) / 1000.0).clone()
 
         semantics: Optional[torch.Tensor] = None
-        if self.semantics_paths is not None and idx < len(self.semantics_paths):
+        sem_path = resolve_semantics_path(self.semantics_dir, frame_idx, self.dataset_type)
+        if sem_path is not None and sem_path.exists():
             from PIL import Image
 
-            with Image.open(self.semantics_paths[idx]) as sem_img:
+            with Image.open(sem_path) as sem_img:
                 sem = np.array(sem_img, dtype=np.int64)
             semantics = torch.from_numpy(sem).clone()
 
@@ -178,8 +187,8 @@ class SimpleRadioDataset(Dataset):
         if self.rgb_dir is not None:
             import cv2
 
-            rgb_path = self.rgb_dir / f"rgb_{idx}.png"
-            if rgb_path.exists():
+            rgb_path = resolve_rgb_path(self.rgb_dir, frame_idx, self.dataset_type)
+            if rgb_path is not None and rgb_path.exists():
                 img = cv2.imread(str(rgb_path))
                 if img is not None:
                     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
@@ -190,7 +199,7 @@ class SimpleRadioDataset(Dataset):
         out: Dict[str, torch.Tensor] = {
             "radio_features": radio_feat,
             "pose_w2c": pose_w2c,
-            "frame_idx": torch.tensor(idx, dtype=torch.long),
+            "frame_idx": torch.tensor(frame_idx, dtype=torch.long),
         }
         if depth is not None:
             out["depth"] = depth
@@ -250,10 +259,16 @@ class RadioGSTrainer:
         self.use_refiner = getattr(config, "use_refiner", False)
         self.refiner_rgb_guide = getattr(config, "refiner_rgb_guide", False)
         self.refiner_depth_guide = getattr(config, "refiner_depth_guide", False)
+        self.refiner_alpha_guide = getattr(config, "refiner_alpha_guide", False)
+        self.refiner_boundary_guide = getattr(config, "refiner_boundary_guide", False)
         self.self_guided = getattr(config, "self_guided", False)
         self.train_sh = getattr(config, "train_sh", False)
         self.rgb_loss_weight = getattr(config, "rgb_loss_weight", 0.0)
         self._is_hybrid = getattr(config, "architecture", "explicit") == "hybrid"
+        self.hybrid_decoupled_heads = getattr(config, "hybrid_decoupled_heads", False)
+        self.hybrid_semantic_adaptor_reg_weight = getattr(
+            config, "hybrid_semantic_adaptor_reg_weight", 0.0
+        )
 
         # Enable SH training if requested
         if self.train_sh and hasattr(self.model, "enable_sh_training"):
@@ -261,11 +276,13 @@ class RadioGSTrainer:
             self._log("Joint RGB training: SH coefficients unfrozen")
 
         if self.use_refiner:
-            extra_ch = 0
-            if self.refiner_rgb_guide:
-                extra_ch += 3
-            if self.refiner_depth_guide:
-                extra_ch += 3 if getattr(config, "refiner_depth_grad", False) else 1
+            extra_ch = compute_refiner_extra_channels(
+                rgb_guide=self.refiner_rgb_guide,
+                depth_guide=self.refiner_depth_guide,
+                depth_grad=getattr(config, "refiner_depth_grad", False),
+                alpha_guide=self.refiner_alpha_guide,
+                boundary_guide=self.refiner_boundary_guide,
+            )
             self.refiner = ScreenSpaceRefiner(
                 latent_dim=self._resolve_latent_dim(config),
                 hidden_dim=getattr(config, "refiner_hidden_dim", 128),
@@ -287,6 +304,7 @@ class RadioGSTrainer:
         self.distill_loss_fn = DistillationLoss(
             l2_weight=getattr(config, "l2_weight", 1.0),
             cosine_weight=getattr(config, "cosine_weight", 0.5),
+            channel_std_weight=getattr(config, "channel_std_weight", 0.0),
         )
         self.mv_loss_fn = MultiViewConsistencyLoss()
         self.tv_loss_fn = TotalVariationLoss()
@@ -302,6 +320,19 @@ class RadioGSTrainer:
         self.depth_guided_feat_loss: Optional[DepthGuidedFeatureLoss] = None
         if self.depth_guided_feat_weight > 0:
             self.depth_guided_feat_loss = DepthGuidedFeatureLoss().to(self.device)
+        self.geometric_edge_loss_weight = getattr(config, "geometric_edge_loss_weight", 0.0)
+        self.geometric_edge_loss_fn: Optional[GeometricEdgeAlignmentLoss] = None
+        if self.geometric_edge_loss_weight > 0:
+            self.geometric_edge_loss_fn = GeometricEdgeAlignmentLoss().to(self.device)
+        self.boundary_aware_loss_weight = getattr(config, "boundary_aware_loss_weight", 0.0)
+        self.boundary_aware_loss_fn: Optional[BoundaryAwareFeatureLoss] = None
+        if self.boundary_aware_loss_weight > 0:
+            self.boundary_aware_loss_fn = BoundaryAwareFeatureLoss(
+                sharpness_weight=getattr(config, "boundary_aware_sharpness_weight", 1.0),
+                smoothness_weight=getattr(config, "boundary_aware_smoothness_weight", 1.0),
+                edge_threshold=getattr(config, "boundary_aware_edge_threshold", 0.1),
+            ).to(self.device)
+        self.hybrid_semantic_aux_weight = getattr(config, "hybrid_semantic_aux_weight", 0.0)
         self.depth_alpha_threshold = getattr(config, "depth_alpha_threshold", 0.05)
         self.depth_head: Optional[DepthHead] = None
         self.depth_supervision_loss: Optional[DepthLoss] = None
@@ -310,6 +341,16 @@ class RadioGSTrainer:
         self.seg_head: Optional[SegmentationHead] = None
         self.seg_loss_fn: Optional[SegmentationLoss] = None
         self.siglip_alignment_weight = getattr(config, "siglip_alignment_weight", 0.0)
+        self.grounding_query_loss_weight = getattr(
+            config, "grounding_query_loss_weight", 0.0
+        )
+        self.grounding_query_temperature = getattr(
+            config, "grounding_query_temperature", 1.0
+        )
+        self.grounding_query_loss_fn: Optional[QueryGroundingAuxLoss] = None
+        self.grounding_query_names: List[str] = []
+        self.grounding_query_class_ids: List[int] = []
+        self.grounding_text_embeddings: Optional[torch.Tensor] = None
         self.siglip_projection: Optional[SigLIP2FeatureProjection] = None
         if self.depth_loss_weight > 0 or self.geom_depth_loss_weight > 0:
             self.depth_head = DepthHead(
@@ -342,7 +383,7 @@ class RadioGSTrainer:
                 loss_type=getattr(config, "seg_loss_type", "ce"),
                 ignore_index=getattr(config, "seg_ignore_index", 255),
             )
-        if self.siglip_alignment_weight > 0:
+        if self.siglip_alignment_weight > 0 or self.grounding_query_loss_weight > 0:
             proj_path = Path(
                 getattr(
                     config,
@@ -363,6 +404,28 @@ class RadioGSTrainer:
             self.siglip_projection.eval()
             for param in self.siglip_projection.parameters():
                 param.requires_grad = False
+        if self.grounding_query_loss_weight > 0:
+            if resolve_dataset_type(getattr(config, "dataset_type", "replica")) != "replica":
+                self._log(
+                    "grounding_query_loss_weight is currently implemented for "
+                    "Replica only; disabling grounding query aux loss"
+                )
+                self.grounding_query_loss_weight = 0.0
+            else:
+                self.grounding_query_loss_fn = QueryGroundingAuxLoss(
+                    feature_dim=1536,
+                    temperature=self.grounding_query_temperature,
+                ).to(self.device)
+                (
+                    self.grounding_query_names,
+                    self.grounding_query_class_ids,
+                    self.grounding_text_embeddings,
+                ) = self._load_grounding_text_embeddings(config)
+                self._log(
+                    "Loaded grounding query aux bank: "
+                    f"{len(self.grounding_query_names)} queries "
+                    f"from {getattr(config, 'grounding_text_embeddings', '')}"
+                )
 
         # Feature norm regularization weight
         self.feat_norm_weight = getattr(config, "feat_norm_weight", 0.0)
@@ -442,6 +505,23 @@ class RadioGSTrainer:
                 log2_hashmap_size=getattr(config, "hash_log2_size", 19),
                 base_resolution=getattr(config, "hash_base_resolution", 16),
                 max_resolution=getattr(config, "hash_max_resolution", 2048),
+                decoupled_heads=getattr(config, "hybrid_decoupled_heads", False),
+                use_semantic_adaptor=getattr(config, "hybrid_semantic_adaptor", False),
+                semantic_adaptor_mode=getattr(
+                    config, "hybrid_semantic_adaptor_mode", "confidence"
+                ),
+                semantic_adaptor_hidden_dim=getattr(
+                    config, "hybrid_semantic_adaptor_hidden_dim", 64
+                ),
+                semantic_adaptor_use_geometry_guidance=getattr(
+                    config, "hybrid_semantic_adaptor_use_geometry_guidance", True
+                ),
+                semantic_adaptor_use_depth_guidance=getattr(
+                    config, "hybrid_semantic_adaptor_use_depth_guidance", False
+                ),
+                semantic_adaptor_residual=getattr(
+                    config, "hybrid_semantic_adaptor_residual", True
+                ),
             )
         else:
             raise ValueError(f"Unknown architecture: {arch}")
@@ -580,53 +660,110 @@ class RadioGSTrainer:
     def build_dataset(
         self, config: RadioGSConfig
     ) -> Tuple[Dataset, Dataset]:
-        feature_dir = getattr(config, "feature_dir", "")
-        scene = getattr(config, "scene", "room_0")
-        scene_root = Path("dataset") / scene
+        dataset_type = resolve_dataset_type(config)
+        scene_root = resolve_scene_root(config)
         train_split = getattr(config, "train_split", "Sequence_1")
         val_split = getattr(config, "val_split", "Sequence_2")
-        depth_dir = getattr(config, "depth_dir", None)
-        semantics_dir = getattr(config, "semantics_dir", None)
         mixed_split = getattr(config, "mixed_split", False)
 
-        # Val features use a separate directory
-        val_feature_dir = feature_dir.replace(train_split, val_split)
-        if not Path(val_feature_dir).exists():
-            val_feature_dir = feature_dir  # fallback: same dir
-
         # RGB guide setup
-        rgb_dir_train = rgb_dir_val = None
         feature_size = (
             getattr(config, "feature_height", 30),
             getattr(config, "feature_width", 40),
         )
-        if self.refiner_rgb_guide:
-            rgb_dir_train = str(scene_root / train_split / "rgb")
-            rgb_dir_val = str(scene_root / val_split / "rgb")
+        rgb_dir_train = str(resolve_split_data_dir(config, "train", "rgb")) if self.refiner_rgb_guide and resolve_split_data_dir(config, "train", "rgb") is not None else None
+        rgb_dir_val = str(resolve_split_data_dir(config, "val", "rgb")) if self.refiner_rgb_guide and resolve_split_data_dir(config, "val", "rgb") is not None else None
 
-        if mixed_split:
-            # Merge both sequences and random 80/20 split
-            val_depth_dir = depth_dir.replace(train_split, val_split) if depth_dir else None
-            val_semantics_dir = (
-                semantics_dir.replace(train_split, val_split) if semantics_dir else None
-            )
-            ds_seq1 = SimpleRadioDataset(
-                feature_dir=feature_dir,
-                pose_file=str(scene_root / train_split / "traj_w_c.txt"),
-                depth_dir=depth_dir,
-                semantics_dir=semantics_dir,
+        if dataset_type != "replica":
+            train_feature_dir = resolve_split_feature_dir(config, "train")
+            val_feature_dir = resolve_split_feature_dir(config, "val")
+            train_pose_file, train_pose_dir = resolve_split_pose_source(config, "train")
+            val_pose_file, val_pose_dir = resolve_split_pose_source(config, "val")
+            train_depth_dir = resolve_split_data_dir(config, "train", "depth")
+            val_depth_dir = resolve_split_data_dir(config, "val", "depth")
+            train_semantics_dir = resolve_split_data_dir(config, "train", "semantics")
+            val_semantics_dir = resolve_split_data_dir(config, "val", "semantics")
+            train_frame_ids = resolve_split_frame_ids(config, "train")
+            val_frame_ids = resolve_split_frame_ids(config, "val")
+
+            if train_frame_ids is not None and val_frame_ids is not None:
+                train_ds = SimpleRadioDataset(
+                    feature_dir=str(train_feature_dir),
+                    pose_file=train_pose_file,
+                    pose_dir=train_pose_dir,
+                    depth_dir=str(train_depth_dir) if train_depth_dir else None,
+                    semantics_dir=str(train_semantics_dir) if train_semantics_dir else None,
+                    rgb_dir=rgb_dir_train,
+                    feature_size=feature_size,
+                    split="train",
+                    dataset_type=dataset_type,
+                    frame_ids=train_frame_ids,
+                )
+                val_ds = SimpleRadioDataset(
+                    feature_dir=str(val_feature_dir),
+                    pose_file=val_pose_file,
+                    pose_dir=val_pose_dir,
+                    depth_dir=str(val_depth_dir) if val_depth_dir else None,
+                    semantics_dir=str(val_semantics_dir) if val_semantics_dir else None,
+                    rgb_dir=rgb_dir_val,
+                    feature_size=feature_size,
+                    split="val",
+                    dataset_type=dataset_type,
+                    frame_ids=val_frame_ids,
+                )
+                self._log(
+                    f"{dataset_type} split lists: Train {len(train_ds)} frames | Val {len(val_ds)} frames"
+                )
+                return train_ds, val_ds
+
+            full_ds = SimpleRadioDataset(
+                feature_dir=str(train_feature_dir),
+                pose_file=train_pose_file,
+                pose_dir=train_pose_dir,
+                depth_dir=str(train_depth_dir) if train_depth_dir else None,
+                semantics_dir=str(train_semantics_dir) if train_semantics_dir else None,
                 rgb_dir=rgb_dir_train,
                 feature_size=feature_size,
                 split="train",
+                dataset_type=dataset_type,
+            )
+            train_ratio = getattr(config, "mixed_train_ratio", 0.8)
+            train_size = int(train_ratio * len(full_ds))
+            val_size = len(full_ds) - train_size
+            seed = getattr(config, "mixed_seed", 42)
+            gen = torch.Generator().manual_seed(seed)
+            train_ds, val_ds = torch.utils.data.random_split(
+                full_ds, [train_size, val_size], generator=gen
+            )
+            self._log(
+                f"{dataset_type} random split: {len(full_ds)} total → Train: {train_size} | "
+                f"Val: {val_size} (ratio={train_ratio}, seed={seed})"
+            )
+            return train_ds, val_ds
+
+        if mixed_split:
+            # Merge both sequences and random 80/20 split
+            ds_seq1 = SimpleRadioDataset(
+                feature_dir=str(resolve_split_feature_dir(config, "train")),
+                pose_file=resolve_split_pose_source(config, "train")[0],
+                pose_dir=resolve_split_pose_source(config, "train")[1],
+                depth_dir=str(resolve_split_data_dir(config, "train", "depth")) if resolve_split_data_dir(config, "train", "depth") else None,
+                semantics_dir=str(resolve_split_data_dir(config, "train", "semantics")) if resolve_split_data_dir(config, "train", "semantics") else None,
+                rgb_dir=rgb_dir_train,
+                feature_size=feature_size,
+                split="train",
+                dataset_type=dataset_type,
             )
             ds_seq2 = SimpleRadioDataset(
-                feature_dir=val_feature_dir,
-                pose_file=str(scene_root / val_split / "traj_w_c.txt"),
-                depth_dir=val_depth_dir,
-                semantics_dir=val_semantics_dir,
+                feature_dir=str(resolve_split_feature_dir(config, "val")),
+                pose_file=resolve_split_pose_source(config, "val")[0],
+                pose_dir=resolve_split_pose_source(config, "val")[1],
+                depth_dir=str(resolve_split_data_dir(config, "val", "depth")) if resolve_split_data_dir(config, "val", "depth") else None,
+                semantics_dir=str(resolve_split_data_dir(config, "val", "semantics")) if resolve_split_data_dir(config, "val", "semantics") else None,
                 rgb_dir=rgb_dir_val,
                 feature_size=feature_size,
                 split="train",
+                dataset_type=dataset_type,
             )
             combined = ConcatDataset([ds_seq1, ds_seq2])
             total = len(combined)
@@ -645,24 +782,26 @@ class RadioGSTrainer:
             return train_ds, val_ds
 
         train_ds = SimpleRadioDataset(
-            feature_dir=feature_dir,
-            pose_file=str(scene_root / train_split / "traj_w_c.txt"),
-            depth_dir=depth_dir,
-            semantics_dir=semantics_dir,
+            feature_dir=str(resolve_split_feature_dir(config, "train")),
+            pose_file=resolve_split_pose_source(config, "train")[0],
+            pose_dir=resolve_split_pose_source(config, "train")[1],
+            depth_dir=str(resolve_split_data_dir(config, "train", "depth")) if resolve_split_data_dir(config, "train", "depth") else None,
+            semantics_dir=str(resolve_split_data_dir(config, "train", "semantics")) if resolve_split_data_dir(config, "train", "semantics") else None,
             rgb_dir=rgb_dir_train,
             feature_size=feature_size,
             split="train",
+            dataset_type=dataset_type,
         )
         val_ds = SimpleRadioDataset(
-            feature_dir=val_feature_dir,
-            pose_file=str(scene_root / val_split / "traj_w_c.txt"),
-            depth_dir=depth_dir.replace(train_split, val_split) if depth_dir else None,
-            semantics_dir=(
-                semantics_dir.replace(train_split, val_split) if semantics_dir else None
-            ),
+            feature_dir=str(resolve_split_feature_dir(config, "val")),
+            pose_file=resolve_split_pose_source(config, "val")[0],
+            pose_dir=resolve_split_pose_source(config, "val")[1],
+            depth_dir=str(resolve_split_data_dir(config, "val", "depth")) if resolve_split_data_dir(config, "val", "depth") else None,
+            semantics_dir=str(resolve_split_data_dir(config, "val", "semantics")) if resolve_split_data_dir(config, "val", "semantics") else None,
             rgb_dir=rgb_dir_val,
             feature_size=feature_size,
             split="val",
+            dataset_type=dataset_type,
         )
         self._log(f"Train: {len(train_ds)} frames  |  Val: {len(val_ds)} frames")
         return train_ds, val_ds
@@ -690,11 +829,18 @@ class RadioGSTrainer:
             "tv": 0.0,
             "gradient": 0.0,
             "depth_feat": 0.0,
+            "geom_edge": 0.0,
+            "boundary": 0.0,
+            "sem_aux": 0.0,
+            "sem_adaptor_reg": 0.0,
             "rgb": 0.0,
             "depth_gt": 0.0,
             "depth_geom": 0.0,
             "seg_aux": 0.0,
             "siglip_align": 0.0,
+            "ground_query": 0.0,
+            "ground_query_acc": 0.0,
+            "ground_query_valid": 0.0,
         }
         cos_accum = 0.0
         n_batches = 0
@@ -719,6 +865,7 @@ class RadioGSTrainer:
                 # Render compact features (and optionally RGB) from 3DGS
                 rendered_rgb = None
                 l_rgb = torch.tensor(0.0, device=self.device)
+                hybrid_aux = None
 
                 if self.self_guided and self.train_sh:
                     # Joint rendering with SH training: features + RGB, backprop RGB loss
@@ -762,9 +909,17 @@ class RadioGSTrainer:
                         depth_map.shape[1], depth_map.shape[2],
                     )
                     position_map = self._normalize_positions(position_map)
-                    rendered_compact = self.model.decode_screen_space(
-                        rendered_compact.float(), position_map
+                    decode_result = self.model.decode_screen_space(
+                        rendered_compact.float(),
+                        position_map,
+                        return_aux=self.hybrid_decoupled_heads,
+                        depth_map=depth_map,
                     )
+                    if self.hybrid_decoupled_heads:
+                        hybrid_aux = decode_result
+                        rendered_compact = decode_result["fused"]
+                    else:
+                        rendered_compact = decode_result
 
                 if self.train_mode == "latent":
                     # LATENT MODE: gt_features are already 64d (pre-encoded)
@@ -858,14 +1013,103 @@ class RadioGSTrainer:
                 # Depth-guided feature smoothness loss
                 l_depth_feat = torch.tensor(0.0, device=self.device)
                 geom_depth = result.get("depth_map")
+                alpha_for_edges = result.get("alpha_map")
                 if self.depth_guided_feat_loss is not None and geom_depth is not None:
-                    feat_for_smooth = rendered_compact
+                    feat_for_smooth = (
+                        hybrid_aux["geometry"]
+                        if hybrid_aux is not None and "geometry" in hybrid_aux
+                        else rendered_compact
+                    )
                     gd = geom_depth.unsqueeze(0).unsqueeze(0) if geom_depth.dim() == 2 else geom_depth
                     if gd.dim() == 3:
-                        gd = gd.unsqueeze(0)
+                        gd = gd.unsqueeze(1)
                     if gd.shape[-2:] != feat_for_smooth.shape[-2:]:
                         gd = F.interpolate(gd, size=feat_for_smooth.shape[-2:], mode='bilinear', align_corners=False)
                     l_depth_feat = self.depth_guided_feat_loss(feat_for_smooth, gd)
+
+                # Boundary-aware feature loss
+                l_boundary = torch.tensor(0.0, device=self.device)
+                if self.boundary_aware_loss_fn is not None and geom_depth is not None:
+                    pred_feat = decoded_for_depth if self.train_mode != "latent" else rendered_compact
+                    gt_feat = gt_radio_rs if self.train_mode != "latent" else gt_compact
+                    gd_ba = geom_depth.unsqueeze(0).unsqueeze(0) if geom_depth.dim() == 2 else geom_depth
+                    if gd_ba.dim() == 3:
+                        gd_ba = gd_ba.unsqueeze(1)
+                    alpha_ba = None
+                    if alpha_for_edges is not None:
+                        alpha_ba = alpha_for_edges.unsqueeze(0).unsqueeze(0) if alpha_for_edges.dim() == 2 else alpha_for_edges
+                        if alpha_ba.dim() == 3:
+                            alpha_ba = alpha_ba.unsqueeze(1)
+                    if gd_ba.shape[-2:] != pred_feat.shape[-2:]:
+                        gd_ba = F.interpolate(gd_ba, size=pred_feat.shape[-2:], mode='bilinear', align_corners=False)
+                    if alpha_ba is not None and alpha_ba.shape[-2:] != pred_feat.shape[-2:]:
+                        alpha_ba = F.interpolate(alpha_ba.float(), size=pred_feat.shape[-2:], mode='bilinear', align_corners=False)
+                    l_boundary = self.boundary_aware_loss_fn(pred_feat, gt_feat, gd_ba, alpha_ba)
+
+                l_geom_edge = torch.tensor(0.0, device=self.device)
+                l_semantic_aux = torch.tensor(0.0, device=self.device)
+                l_semantic_adaptor_reg = torch.tensor(0.0, device=self.device)
+                l_ground_query = torch.tensor(0.0, device=self.device)
+                ground_query_acc = torch.tensor(0.0, device=self.device)
+                ground_query_valid = torch.tensor(0.0, device=self.device)
+                sem_decoded = None
+                if hybrid_aux is not None and self.train_mode != "latent":
+                    sem_decoded = self.codec.decoder(hybrid_aux["semantic"])
+                    if sem_decoded.shape[-2:] != gt_radio_rs.shape[-2:]:
+                        sem_target = F.interpolate(
+                            gt_radio_rs,
+                            size=sem_decoded.shape[-2:],
+                            mode="bilinear",
+                            align_corners=False,
+                        )
+                    else:
+                        sem_target = gt_radio_rs
+                    if self.hybrid_semantic_aux_weight > 0:
+                        l_semantic_aux = self.distill_loss_fn(
+                            sem_decoded, sem_target
+                        )["total"]
+                    if self.grounding_query_loss_weight > 0:
+                        ground_query_stats = self._compute_grounding_query_loss(
+                            batch=batch,
+                            decoded=sem_decoded,
+                        )
+                        l_ground_query = ground_query_stats["loss"]
+                        ground_query_acc = ground_query_stats["accuracy"]
+                        ground_query_valid = ground_query_stats["valid_ratio"]
+                if hybrid_aux is not None and geom_depth is not None:
+                    if self.geometric_edge_loss_fn is not None:
+                        gd = geom_depth.unsqueeze(0).unsqueeze(0) if geom_depth.dim() == 2 else geom_depth
+                        if gd.dim() == 3:
+                            gd = gd.unsqueeze(1)
+                        alpha_map = None
+                        if alpha_for_edges is not None:
+                            alpha_map = (
+                                alpha_for_edges.unsqueeze(0).unsqueeze(0)
+                                if alpha_for_edges.dim() == 2 else alpha_for_edges
+                            )
+                            if alpha_map.dim() == 3:
+                                alpha_map = alpha_map.unsqueeze(1)
+                        if gd.shape[-2:] != hybrid_aux["geometry"].shape[-2:]:
+                            gd = F.interpolate(
+                                gd, size=hybrid_aux["geometry"].shape[-2:],
+                                mode="bilinear", align_corners=False,
+                            )
+                        if alpha_map is not None and alpha_map.shape[-2:] != hybrid_aux["geometry"].shape[-2:]:
+                            alpha_map = F.interpolate(
+                                alpha_map.float(), size=hybrid_aux["geometry"].shape[-2:],
+                                mode="bilinear", align_corners=False,
+                            )
+                        l_geom_edge = self.geometric_edge_loss_fn(
+                            hybrid_aux["geometry"], gd, alpha_map,
+                        )
+                if (
+                    hybrid_aux is not None
+                    and "semantic_confidence" in hybrid_aux
+                    and self.hybrid_semantic_adaptor_reg_weight > 0
+                ):
+                    l_semantic_adaptor_reg = (
+                        hybrid_aux["semantic_confidence"].float() - 1.0
+                    ).pow(2).mean()
 
                 adaptor_w = getattr(self.cfg, "adaptor_weight", 0.1)
                 tv_w = getattr(self.cfg, "tv_weight", 0.01)
@@ -874,6 +1118,16 @@ class RadioGSTrainer:
                     loss = loss + self.gradient_loss_weight * l_gradient
                 if self.depth_guided_feat_weight > 0:
                     loss = loss + self.depth_guided_feat_weight * l_depth_feat
+                if self.geometric_edge_loss_weight > 0:
+                    loss = loss + self.geometric_edge_loss_weight * l_geom_edge
+                if self.boundary_aware_loss_weight > 0:
+                    loss = loss + self.boundary_aware_loss_weight * l_boundary
+                if self.hybrid_semantic_aux_weight > 0:
+                    loss = loss + self.hybrid_semantic_aux_weight * l_semantic_aux
+                if self.hybrid_semantic_adaptor_reg_weight > 0:
+                    loss = loss + self.hybrid_semantic_adaptor_reg_weight * l_semantic_adaptor_reg
+                if self.grounding_query_loss_weight > 0:
+                    loss = loss + self.grounding_query_loss_weight * l_ground_query
                 if self.feat_norm_weight > 0:
                     loss = loss + self.feat_norm_weight * l_feat_norm
                 if self.rgb_loss_weight > 0:
@@ -910,11 +1164,18 @@ class RadioGSTrainer:
             loss_accum["tv"] += l_tv.item()
             loss_accum["gradient"] += l_gradient.item()
             loss_accum["depth_feat"] += l_depth_feat.item()
+            loss_accum["geom_edge"] += l_geom_edge.item()
+            loss_accum["boundary"] += l_boundary.item()
+            loss_accum["sem_aux"] += l_semantic_aux.item()
+            loss_accum["sem_adaptor_reg"] += l_semantic_adaptor_reg.item()
             loss_accum["rgb"] += l_rgb.item()
             loss_accum["depth_gt"] += depth_losses["depth_gt"].item()
             loss_accum["depth_geom"] += depth_losses["depth_geom"].item()
             loss_accum["seg_aux"] += seg_losses["total"].item()
             loss_accum["siglip_align"] += l_siglip.item()
+            loss_accum["ground_query"] += l_ground_query.item()
+            loss_accum["ground_query_acc"] += ground_query_acc.item()
+            loss_accum["ground_query_valid"] += ground_query_valid.item()
             cos_accum += cos_sim.item()
             n_batches += 1
             self.global_step += 1
@@ -941,6 +1202,20 @@ class RadioGSTrainer:
                     "train/gradient", l_gradient.item(), self.global_step
                 )
                 self.writer.add_scalar(
+                    "train/geom_edge", l_geom_edge.item(), self.global_step
+                )
+                self.writer.add_scalar(
+                    "train/boundary", l_boundary.item(), self.global_step
+                )
+                self.writer.add_scalar(
+                    "train/sem_aux", l_semantic_aux.item(), self.global_step
+                )
+                self.writer.add_scalar(
+                    "train/sem_adaptor_reg",
+                    l_semantic_adaptor_reg.item(),
+                    self.global_step,
+                )
+                self.writer.add_scalar(
                     "train/cosine", cos_sim.item(), self.global_step
                 )
                 self.writer.add_scalar(
@@ -955,6 +1230,25 @@ class RadioGSTrainer:
                 self.writer.add_scalar(
                     "train/siglip_align", l_siglip.item(), self.global_step
                 )
+                self.writer.add_scalar(
+                    "train/ground_query", l_ground_query.item(), self.global_step
+                )
+                self.writer.add_scalar(
+                    "train/ground_query_acc", ground_query_acc.item(), self.global_step
+                )
+                self.writer.add_scalar(
+                    "train/ground_query_valid",
+                    ground_query_valid.item(),
+                    self.global_step,
+                )
+                if hybrid_aux is not None and "semantic_confidence" in hybrid_aux:
+                    conf = hybrid_aux["semantic_confidence"].float()
+                    self.writer.add_scalar(
+                        "train/sem_conf_mean", conf.mean().item(), self.global_step
+                    )
+                    self.writer.add_scalar(
+                        "train/sem_conf_std", conf.std().item(), self.global_step
+                    )
                 lr = self.optimizer.param_groups[0]["lr"]
                 self.writer.add_scalar("train/lr", lr, self.global_step)
 
@@ -991,6 +1285,9 @@ class RadioGSTrainer:
         seg_aux_accum = 0.0
         seg_aux_miou_accum = 0.0
         siglip_align_accum = 0.0
+        ground_query_accum = 0.0
+        ground_query_acc_metric = 0.0
+        ground_query_valid_accum = 0.0
         n = 0
 
         for batch in tqdm(
@@ -1012,6 +1309,7 @@ class RadioGSTrainer:
                 rendered_compact = self.refiner(rendered_compact, guide=guide)
 
             # Hybrid decode: latent + hash grid → fused output
+            hybrid_aux = None
             if self._is_hybrid:
                 from radio_gs.models.hybrid_gaussian import unproject_depth_to_positions
                 depth_map = val_result["depth_map"].float()
@@ -1020,9 +1318,17 @@ class RadioGSTrainer:
                     depth_map.shape[1], depth_map.shape[2],
                 )
                 position_map = self._normalize_positions(position_map)
-                rendered_compact = self.model.decode_screen_space(
-                    rendered_compact.float(), position_map
+                decode_result = self.model.decode_screen_space(
+                    rendered_compact.float(),
+                    position_map,
+                    return_aux=self.hybrid_decoupled_heads,
+                    depth_map=depth_map,
                 )
+                if self.hybrid_decoupled_heads:
+                    hybrid_aux = decode_result
+                    rendered_compact = decode_result["fused"]
+                else:
+                    rendered_compact = decode_result
 
             if self.train_mode == "latent":
                 # gt_features are 64d
@@ -1099,6 +1405,20 @@ class RadioGSTrainer:
                 decoded=decoded_for_depth if self.train_mode != "latent" else None,
                 target=gt_radio if self.train_mode != "latent" else None,
             ).item()
+            semantic_decoded = None
+            if (
+                hybrid_aux is not None
+                and "semantic" in hybrid_aux
+                and self.train_mode != "latent"
+            ):
+                semantic_decoded = self.codec.decoder(hybrid_aux["semantic"])
+            ground_query_stats = self._compute_grounding_query_loss(
+                batch=batch,
+                decoded=semantic_decoded if semantic_decoded is not None else decoded_for_depth,
+            )
+            ground_query_accum += ground_query_stats["loss"].item()
+            ground_query_acc_metric += ground_query_stats["accuracy"].item()
+            ground_query_valid_accum += ground_query_stats["valid_ratio"].item()
 
             n += 1
 
@@ -1124,6 +1444,9 @@ class RadioGSTrainer:
             "seg_aux": seg_aux_accum / n,
             "seg_aux_miou": seg_aux_miou_accum / n,
             "siglip_align": siglip_align_accum / n,
+            "ground_query": ground_query_accum / n,
+            "ground_query_acc": ground_query_acc_metric / n,
+            "ground_query_valid": ground_query_valid_accum / n,
         }
 
         if self.writer is not None:
@@ -1135,6 +1458,9 @@ class RadioGSTrainer:
             self.writer.add_scalar("val/seg_aux", metrics["seg_aux"], epoch)
             self.writer.add_scalar("val/seg_aux_miou", metrics["seg_aux_miou"], epoch)
             self.writer.add_scalar("val/siglip_align", metrics["siglip_align"], epoch)
+            self.writer.add_scalar("val/ground_query", metrics["ground_query"], epoch)
+            self.writer.add_scalar("val/ground_query_acc", metrics["ground_query_acc"], epoch)
+            self.writer.add_scalar("val/ground_query_valid", metrics["ground_query_valid"], epoch)
 
         self._save_vis(epoch)
 
@@ -1176,23 +1502,209 @@ class RadioGSTrainer:
         if is_best:
             torch.save(state, self.ckpt_dir / "best.pth")
 
+    def _warmstart_refiner_state(
+        self, refiner_state_dict: Dict[str, torch.Tensor]
+    ) -> None:
+        """Warmstart refiner weights when guide-channel count changes.
+
+        V9->V10 style upgrades expand the first refiner conv from
+        latent+RGB to latent+RGB+depth-guide channels. We preserve the learned
+        V9 mapping for overlapping channels and zero-init only the newly added
+        guide channels instead of restarting the full refiner.
+        """
+        if self.refiner is None:
+            return
+
+        current_state = self.refiner.state_dict()
+        exact_loaded = 0
+        partial_loaded = 0
+        skipped: list[str] = []
+
+        for key, source in refiner_state_dict.items():
+            if key not in current_state:
+                skipped.append(f"{key}:missing")
+                continue
+
+            target = current_state[key]
+            if source.shape == target.shape:
+                current_state[key] = source
+                exact_loaded += 1
+                continue
+
+            if (
+                key == "net.0.weight"
+                and source.ndim == 4
+                and target.ndim == 4
+                and source.shape[0] == target.shape[0]
+                and source.shape[2:] == target.shape[2:]
+            ):
+                copy_channels = min(source.shape[1], target.shape[1])
+                patched = target.clone()
+                patched.zero_()
+                patched[:, :copy_channels] = source[:, :copy_channels]
+                current_state[key] = patched
+                partial_loaded += 1
+                skipped.append(
+                    f"{key}:partial {tuple(source.shape)} -> {tuple(target.shape)}"
+                )
+                continue
+
+            skipped.append(f"{key}:{tuple(source.shape)} -> {tuple(target.shape)}")
+
+        self.refiner.load_state_dict(current_state, strict=False)
+        self._log(
+            f"Warmstarted refiner with {exact_loaded} exact tensors and "
+            f"{partial_loaded} partial tensor(s)"
+        )
+        if skipped:
+            preview = ", ".join(skipped[:4])
+            if len(skipped) > 4:
+                preview += ", ..."
+            self._log(f"Refiner warmstart skipped/mismatched: {preview}")
+
+    def _warmstart_module_state(
+        self,
+        module: nn.Module,
+        module_state_dict: Dict[str, torch.Tensor],
+        module_name: str,
+    ) -> None:
+        """Warmstart only the exact-shape tensors for an upgraded module."""
+        current_state = module.state_dict()
+        exact_loaded = 0
+        remapped_loaded = 0
+        skipped: list[str] = []
+
+        for key, source in module_state_dict.items():
+            if key not in current_state:
+                skipped.append(f"{key}:missing")
+                continue
+
+            target = current_state[key]
+            if source.shape == target.shape:
+                current_state[key] = source
+                exact_loaded += 1
+            else:
+                skipped.append(f"{key}:{tuple(source.shape)} -> {tuple(target.shape)}")
+
+        if module_name == "model" and getattr(self.cfg, "hybrid_decoupled_heads", False):
+            old_fuse_prefix = "fusion_head.fuse."
+            for suffix in ("0.weight", "0.bias", "2.weight", "2.bias", "4.weight", "4.bias"):
+                source_key = old_fuse_prefix + suffix
+                if source_key not in module_state_dict:
+                    continue
+                source = module_state_dict[source_key]
+                for branch in ("geometry_head", "semantic_head"):
+                    target_key = f"fusion_head.{branch}.{suffix}"
+                    target = current_state.get(target_key)
+                    if target is not None and source.shape == target.shape:
+                        current_state[target_key] = source
+                        remapped_loaded += 1
+
+            gate_stem = "fusion_head.gate.0"
+            for suffix in ("weight", "bias"):
+                source_key = f"{gate_stem}.{suffix}"
+                source = module_state_dict.get(source_key)
+                if source is None:
+                    continue
+                for branch in ("geometry_gate", "semantic_gate"):
+                    target_key = f"fusion_head.{branch}.0.{suffix}"
+                    target = current_state.get(target_key)
+                    if target is not None and source.shape == target.shape:
+                        current_state[target_key] = source
+                        remapped_loaded += 1
+
+            for suffix in ("weight", "bias"):
+                source_key = f"fusion_head.gate.2.{suffix}"
+                source = module_state_dict.get(source_key)
+                if source is None:
+                    continue
+                if suffix == "weight" and source.ndim == 4:
+                    source_reduced = source.mean(dim=0, keepdim=True)
+                elif suffix == "bias" and source.ndim == 1:
+                    source_reduced = source.mean(dim=0, keepdim=True)
+                else:
+                    source_reduced = source
+                for branch in ("geometry_gate", "semantic_gate"):
+                    target_key = f"fusion_head.{branch}.2.{suffix}"
+                    target = current_state.get(target_key)
+                    if target is not None and source_reduced.shape == target.shape:
+                        current_state[target_key] = source_reduced
+                        remapped_loaded += 1
+
+            source_key = "fusion_head.fuse.0.weight"
+            target_key = "fusion_head.fuse.0.weight"
+            source = module_state_dict.get(source_key)
+            target = current_state.get(target_key)
+            if (
+                source is not None
+                and target is not None
+                and source.ndim == 4
+                and target.ndim == 4
+                and source.shape[0] == target.shape[0]
+                and source.shape[2:] == target.shape[2:]
+                and target.shape[1] == source.shape[1] * 2
+            ):
+                patched = target.clone()
+                patched.zero_()
+                patched[:, :source.shape[1]] = source * 0.5
+                patched[:, source.shape[1]: source.shape[1] * 2] = source * 0.5
+                current_state[target_key] = patched
+                remapped_loaded += 1
+
+        module.load_state_dict(current_state, strict=False)
+        self._log(
+            f"Warmstarted {module_name} with {exact_loaded} exact tensors"
+            + (f" and {remapped_loaded} remapped tensor(s)" if remapped_loaded else "")
+        )
+        if skipped:
+            preview = ", ".join(skipped[:4])
+            if len(skipped) > 4:
+                preview += ", ..."
+            self._log(f"{module_name} warmstart skipped/mismatched: {preview}")
+
     def load_checkpoint(self, path: str, resume: bool = True) -> None:
         ckpt = torch.load(path, map_location=self.device)
-        self.model.load_state_dict(ckpt["model_state_dict"], strict=False)
-        if "codec_state_dict" in ckpt:
-            self.codec.load_state_dict(ckpt["codec_state_dict"], strict=False)
-        if "sharpener_state_dict" in ckpt:
-            self.sharpener.load_state_dict(
-                ckpt["sharpener_state_dict"], strict=False
+        try:
+            self.model.load_state_dict(ckpt["model_state_dict"], strict=False)
+        except RuntimeError as e:
+            self._log(
+                f"Model state_dict size mismatch, attempting partial warmstart: {e}"
             )
+            self._warmstart_module_state(
+                self.model, ckpt["model_state_dict"], "model"
+            )
+        if "codec_state_dict" in ckpt:
+            try:
+                self.codec.load_state_dict(ckpt["codec_state_dict"], strict=False)
+            except RuntimeError as e:
+                self._log(
+                    f"Codec state_dict size mismatch, attempting partial warmstart: {e}"
+                )
+                self._warmstart_module_state(
+                    self.codec, ckpt["codec_state_dict"], "codec"
+                )
+        if "sharpener_state_dict" in ckpt:
+            try:
+                self.sharpener.load_state_dict(
+                    ckpt["sharpener_state_dict"], strict=False
+                )
+            except RuntimeError as e:
+                self._log(
+                    f"Sharpener state_dict size mismatch, attempting partial warmstart: {e}"
+                )
+                self._warmstart_module_state(
+                    self.sharpener, ckpt["sharpener_state_dict"], "sharpener"
+                )
         if "refiner_state_dict" in ckpt and self.use_refiner and self.refiner is not None:
             try:
                 self.refiner.load_state_dict(
                     ckpt["refiner_state_dict"], strict=False
                 )
             except RuntimeError as e:
-                self._log(f"Refiner state_dict size mismatch (architecture changed), "
-                          f"starting refiner from scratch: {e}")
+                self._log(
+                    f"Refiner state_dict size mismatch, attempting partial warmstart: {e}"
+                )
+                self._warmstart_refiner_state(ckpt["refiner_state_dict"])
         if "depth_head_state_dict" in ckpt and self.depth_head is not None:
             try:
                 self.depth_head.load_state_dict(
@@ -1396,6 +1908,76 @@ class RadioGSTrainer:
             target_siglip = self._project_siglip_features(target)
         return self.siglip_alignment_weight * F.mse_loss(pred_siglip, target_siglip)
 
+    def _load_grounding_text_embeddings(
+        self,
+        config: RadioGSConfig,
+    ) -> Tuple[List[str], List[int], torch.Tensor]:
+        text_path = Path(
+            getattr(
+                config,
+                "grounding_text_embeddings",
+                "output/radio_gs/siglip2_text_embeddings_v2.pt",
+            )
+        )
+        if not text_path.is_absolute():
+            text_path = Path(__file__).resolve().parents[2] / text_path
+        if not text_path.exists():
+            raise FileNotFoundError(f"Grounding text embeddings not found: {text_path}")
+        data = torch.load(text_path, map_location="cpu")
+        bank = {
+            query: F.normalize(embedding.float(), dim=0)
+            for query, embedding in zip(data["queries"], data["embeddings"])
+        }
+        selected = [
+            (query, class_id)
+            for query, class_id in sorted(GROUNDING_QUERIES.items(), key=lambda x: x[1])
+            if query in bank
+        ]
+        if not selected:
+            raise ValueError(
+                f"No Replica grounding queries from {list(GROUNDING_QUERIES)} found in {text_path}"
+            )
+        query_names = [query for query, _ in selected]
+        query_class_ids = [class_id for _, class_id in selected]
+        text_embeddings = torch.stack([bank[query] for query in query_names]).to(self.device)
+        return query_names, query_class_ids, text_embeddings
+
+    def _compute_grounding_query_loss(
+        self,
+        batch: Dict[str, torch.Tensor],
+        decoded: Optional[torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        zero = torch.tensor(0.0, device=self.device)
+        stats = {
+            "loss": zero,
+            "accuracy": zero.detach(),
+            "valid_ratio": zero.detach(),
+        }
+        if (
+            self.grounding_query_loss_fn is None
+            or self.grounding_query_loss_weight <= 0
+            or self.grounding_text_embeddings is None
+            or decoded is None
+        ):
+            return stats
+        gt_sem = batch.get("semantics")
+        if gt_sem is None:
+            return stats
+        gt_sem = gt_sem.to(self.device).long()
+        if gt_sem.shape[-2:] != decoded.shape[-2:]:
+            gt_sem = self._resize_map(
+                gt_sem.unsqueeze(1).float(),
+                decoded.shape[-2:],
+                is_mask=True,
+            ).squeeze(1).long()
+        pred_siglip = self._project_siglip_features(decoded)
+        return self.grounding_query_loss_fn(
+            pred_siglip,
+            self.grounding_text_embeddings,
+            gt_sem,
+            self.grounding_query_class_ids,
+        )
+
     def _compute_seg_aux_losses(
         self,
         batch: Dict[str, torch.Tensor],
@@ -1456,44 +2038,27 @@ class RadioGSTrainer:
         Supports RGB guide (GT or self-rendered), depth guide, or both.
         Returns None if no guide is configured.
         """
-        parts = []
-
+        rgb_part = None
         if self.refiner_rgb_guide:
             if self.self_guided and rendered_rgb is not None:
-                parts.append(rendered_rgb.detach())
+                rgb_part = rendered_rgb.detach()
             else:
                 rgb = batch.get("rgb_guide")
                 if rgb is not None:
-                    parts.append(rgb.to(self.device))
+                    rgb_part = rgb.to(self.device)
                 else:
-                    # Zero-pad if RGB not available
                     B, _, H, W = render_result["feature_map"].shape
-                    parts.append(torch.zeros(B, 3, H, W, device=self.device))
+                    rgb_part = torch.zeros(B, 3, H, W, device=self.device)
 
-        if self.refiner_depth_guide:
-            depth = render_result["depth_map"]  # [B, H, W]
-            depth = depth.unsqueeze(1)           # [B, 1, H, W]
-            # Normalize depth to [0, 1] per-batch for stable input
-            dmin = depth.amin(dim=(2, 3), keepdim=True)
-            dmax = depth.amax(dim=(2, 3), keepdim=True)
-            depth = (depth - dmin) / (dmax - dmin + 1e-6)
-
-            if getattr(self.cfg, "refiner_depth_grad", False):
-                # 3ch guide: depth + spatial gradients (edge info)
-                dx = depth[:, :, :, 1:] - depth[:, :, :, :-1]
-                dy = depth[:, :, 1:, :] - depth[:, :, :-1, :]
-                dx = F.pad(dx, (0, 1, 0, 0))  # pad right
-                dy = F.pad(dy, (0, 0, 0, 1))  # pad bottom
-                # Scale gradients for visibility (they're typically small)
-                dx = dx * 10.0
-                dy = dy * 10.0
-                parts.append(torch.cat([depth, dx, dy], dim=1))  # 3ch
-            else:
-                parts.append(depth)  # 1ch
-
-        if not parts:
-            return None
-        return torch.cat(parts, dim=1)
+        return build_refiner_guide(
+            render_result,
+            rgb_guide=rgb_part,
+            use_depth_guide=self.refiner_depth_guide,
+            use_depth_grad=getattr(self.cfg, "refiner_depth_grad", False),
+            depth_grad_scale=getattr(self.cfg, "refiner_depth_grad_scale", 10.0),
+            use_alpha_guide=self.refiner_alpha_guide,
+            use_boundary_guide=self.refiner_boundary_guide,
+        )
 
     def _get_1280d_val_path(self, batch) -> Optional[str]:
         """In latent mode, try to locate the original 1280d feature for monitoring."""

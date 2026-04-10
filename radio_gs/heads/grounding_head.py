@@ -150,6 +150,112 @@ class GroundingLoss(nn.Module):
         return torch.stack(losses).mean()
 
 
+def build_query_target_map(
+    semantic_labels: Tensor,
+    query_class_ids: List[int],
+    ignore_index: int = -100,
+) -> Tensor:
+    """Map sparse semantic IDs to compact query indices for grounding CE loss."""
+    if semantic_labels.ndim != 3:
+        raise ValueError(
+            f"Expected semantic_labels [B, H, W], got {tuple(semantic_labels.shape)}"
+        )
+    target = torch.full_like(semantic_labels, fill_value=ignore_index)
+    for query_idx, class_id in enumerate(query_class_ids):
+        target = torch.where(
+            semantic_labels == int(class_id),
+            torch.full_like(target, query_idx),
+            target,
+        )
+    return target
+
+
+class QueryGroundingAuxLoss(nn.Module):
+    """Cross-entropy grounding loss over SigLIP-style text queries.
+
+    This auxiliary loss is designed for training-time language calibration:
+    projected visual features are compared against a fixed text bank, and only
+    pixels belonging to grounding-eligible semantic classes contribute.
+    """
+
+    def __init__(
+        self,
+        feature_dim: int = 1536,
+        temperature: float = 1.0,
+        ignore_index: int = -100,
+    ) -> None:
+        super().__init__()
+        self.ignore_index = ignore_index
+        self.grounding_head = GroundingHead(
+            feature_dim=feature_dim,
+            adaptor_dim=feature_dim,
+            use_adaptor=False,
+            temperature=temperature,
+        )
+
+    def forward(
+        self,
+        projected_features: Tensor,
+        text_embeddings: Tensor,
+        semantic_labels: Tensor,
+        query_class_ids: List[int],
+    ) -> dict[str, Tensor]:
+        if projected_features.ndim != 4:
+            raise ValueError(
+                "Expected projected_features [B, C, H, W], "
+                f"got {tuple(projected_features.shape)}"
+            )
+        if text_embeddings.ndim != 2:
+            raise ValueError(
+                f"Expected text_embeddings [N, C], got {tuple(text_embeddings.shape)}"
+            )
+        if semantic_labels.ndim != 3:
+            raise ValueError(
+                f"Expected semantic_labels [B, H, W], got {tuple(semantic_labels.shape)}"
+            )
+        if projected_features.shape[0] != semantic_labels.shape[0]:
+            raise ValueError(
+                "Batch size mismatch between projected_features and semantic_labels: "
+                f"{projected_features.shape[0]} vs {semantic_labels.shape[0]}"
+            )
+        if projected_features.shape[-2:] != semantic_labels.shape[-2:]:
+            raise ValueError(
+                "Spatial size mismatch between projected_features and semantic_labels: "
+                f"{tuple(projected_features.shape[-2:])} vs {tuple(semantic_labels.shape[-2:])}"
+            )
+        if projected_features.shape[1] != text_embeddings.shape[1]:
+            raise ValueError(
+                "Feature/text dim mismatch for QueryGroundingAuxLoss: "
+                f"{projected_features.shape[1]} vs {text_embeddings.shape[1]}"
+            )
+
+        targets = build_query_target_map(
+            semantic_labels,
+            query_class_ids,
+            ignore_index=self.ignore_index,
+        )
+        valid_mask = targets != self.ignore_index
+        zero = projected_features.sum() * 0.0
+        if not valid_mask.any():
+            return {
+                "loss": zero,
+                "accuracy": zero.detach(),
+                "valid_ratio": zero.detach(),
+            }
+
+        logits = self.grounding_head(projected_features, text_embeddings)
+        loss = F.cross_entropy(logits, targets, ignore_index=self.ignore_index)
+        with torch.no_grad():
+            pred = logits.argmax(dim=1)
+            accuracy = (pred[valid_mask] == targets[valid_mask]).float().mean()
+            valid_ratio = valid_mask.float().mean()
+        return {
+            "loss": loss,
+            "accuracy": accuracy,
+            "valid_ratio": valid_ratio,
+        }
+
+
 def compute_grounding_iou(
     pred_mask: Tensor, gt_mask: Tensor, threshold: float = 0.5,
 ) -> float:

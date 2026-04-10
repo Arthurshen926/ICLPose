@@ -105,6 +105,10 @@ def test_hybrid_gaussian():
         output_dim=output_dim,
         num_levels=4,          # fewer levels for speed
         log2_hashmap_size=10,  # smaller hash table for test
+        decoupled_heads=True,
+        use_semantic_adaptor=True,
+        semantic_adaptor_mode="confidence",
+        semantic_adaptor_hidden_dim=32,
     )
 
     # Manually populate geometry buffers
@@ -118,8 +122,7 @@ def test_hybrid_gaussian():
     model._latent = nn.Parameter(torch.randn(N, latent_dim) * 0.01)
 
     assert model.num_gaussians == N
-    # get_xyz is a property on HybridFeatureGaussian (not a method)
-    assert model.get_xyz.shape == (N, 3)
+    assert model.get_xyz().shape == (N, 3)
     assert model.get_features().shape == (N, latent_dim)
 
     params = model.trainable_parameters()
@@ -131,10 +134,21 @@ def test_hybrid_gaussian():
     latent_map = torch.randn(B, latent_dim, H, W)
     # Normalise positions to [0, 1] for hash grid
     position_map = torch.rand(B, 3, H, W)
+    depth_map = torch.rand(B, H, W)
 
     with torch.no_grad():
-        out = model.decode_screen_space(latent_map, position_map)
+        out = model.decode_screen_space(latent_map, position_map, depth_map=depth_map)
+        aux = model.decode_screen_space(
+            latent_map,
+            position_map,
+            return_aux=True,
+            depth_map=depth_map,
+        )
     assert out.shape == (B, output_dim, H, W), f"Output shape: {out.shape}"
+    assert aux["fused"].shape == (B, output_dim, H, W)
+    assert aux["geometry"].shape == (B, output_dim, H, W)
+    assert aux["semantic"].shape == (B, output_dim, H, W)
+    assert aux["semantic_confidence"].shape == (B, 1, H, W)
 
     print(f"    {N} Gaussians, latent_dim={latent_dim}, output_dim={output_dim}")
     print(f"    trainable params: {total_trainable:,}")
@@ -197,7 +211,7 @@ def test_featsharp():
 def test_task_heads():
     from radio_gs.heads.depth_head import DepthHead
     from radio_gs.heads.segmentation_head import SegmentationHead
-    from radio_gs.heads.grounding_head import GroundingHead
+    from radio_gs.heads.grounding_head import GroundingHead, QueryGroundingAuxLoss
 
     B, C, H, W = 2, 1280, 8, 10
     feat = torch.randn(B, C, H, W)
@@ -233,13 +247,47 @@ def test_task_heads():
     assert ground_out.shape == (B, N_queries, H, W), f"GroundingHead: {ground_out.shape}"
     print(f"    GroundingHead: feat {tuple(feat.shape)} + text {tuple(text_emb.shape)} → {tuple(ground_out.shape)}")
 
+    # --- Query grounding auxiliary loss ---
+    siglip_dim = 1536
+    projected_feat = torch.randn(B, siglip_dim, H, W)
+    query_text = torch.randn(N_queries, siglip_dim)
+    semantic_labels = torch.full((B, H, W), 255, dtype=torch.long)
+    semantic_labels[:, : H // 2, : W // 3] = 11
+    semantic_labels[:, H // 2 :, W // 3 : 2 * W // 3] = 20
+    semantic_labels[:, :, 2 * W // 3 :] = 40
+    query_loss = QueryGroundingAuxLoss(feature_dim=siglip_dim)
+    query_result = query_loss(
+        projected_feat,
+        query_text,
+        semantic_labels,
+        [11, 20, 40],
+    )
+    assert query_result["loss"].ndim == 0, "QueryGroundingAuxLoss loss should be scalar"
+    assert 0.0 <= query_result["accuracy"].item() <= 1.0
+    assert 0.0 < query_result["valid_ratio"].item() <= 1.0
+    print(
+        "    QueryGroundingAuxLoss: "
+        f"loss={query_result['loss'].item():.4f}, "
+        f"acc={query_result['accuracy'].item():.3f}, "
+        f"valid={query_result['valid_ratio'].item():.3f}"
+    )
+
 
 # ---------------------------------------------------------------------------
 # 6. Loss functions
 # ---------------------------------------------------------------------------
 
 def test_losses():
-    from radio_gs.losses.distillation_loss import DistillationLoss, TotalVariationLoss
+    from radio_gs.losses.distillation_loss import (
+        DistillationLoss,
+        GeometricEdgeAlignmentLoss,
+        TotalVariationLoss,
+    )
+    from radio_gs.models.screen_refiner import (
+        build_boundary_guide,
+        build_depth_guide,
+        compute_refiner_extra_channels,
+    )
 
     B, C, H, W = 2, 1280, 8, 10
     pred = torch.randn(B, C, H, W, requires_grad=True)
@@ -267,6 +315,31 @@ def test_losses():
     tv.backward()
     assert feat.grad is not None, "TV gradient not computed"
     print(f"    TotalVariationLoss: {tv.item():.4f}")
+
+    # --- GeometricEdgeAlignmentLoss ---
+    geom_depth = torch.rand(B, 1, H, W)
+    alpha_map = torch.rand(B, 1, H, W)
+    edge_loss = GeometricEdgeAlignmentLoss()
+    geom_edge = edge_loss(torch.randn(B, 64, H, W), geom_depth, alpha_map)
+    geom_edge_bhw = edge_loss(torch.randn(B, 64, H, W), geom_depth.squeeze(1), alpha_map.squeeze(1))
+    assert geom_edge.ndim == 0, "Geometric edge loss should be scalar"
+    assert geom_edge_bhw.ndim == 0, "Geometric edge loss should accept [B,H,W] depth/alpha"
+    print(f"    GeometricEdgeAlignmentLoss: {geom_edge.item():.4f}")
+
+    # --- Refiner guide helpers ---
+    depth_guide = build_depth_guide(geom_depth, depth_grad=True, grad_scale=5.0)
+    boundary_guide = build_boundary_guide(geom_depth, alpha_map, grad_scale=5.0)
+    extra_ch = compute_refiner_extra_channels(
+        rgb_guide=True,
+        depth_guide=True,
+        depth_grad=True,
+        alpha_guide=True,
+        boundary_guide=True,
+    )
+    assert depth_guide.shape == (B, 3, H, W)
+    assert boundary_guide.shape == (B, 1, H, W)
+    assert extra_ch == 8, f"Unexpected extra channel count: {extra_ch}"
+    print(f"    refiner helpers: depth={tuple(depth_guide.shape)}, boundary={tuple(boundary_guide.shape)}, extra_ch={extra_ch}")
 
 
 # ---------------------------------------------------------------------------

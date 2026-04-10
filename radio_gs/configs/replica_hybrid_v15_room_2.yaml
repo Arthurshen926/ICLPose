@@ -1,0 +1,131 @@
+exp_name: "radio_gs_room2_hybrid_v15"
+output_dir: "output/radio_gs/room2_hybrid_v15"
+seed: 42
+
+scene: "room_2"
+ply_path: "output/2dgs_models/room_2/v8_fixed_poses/point_cloud/iteration_30000/point_cloud.ply"
+
+radio_version: "c-radio_v4-h"
+radio_repo: "/root/RADIO"
+radio_feature_dim: 1280
+
+architecture: "hybrid"
+hybrid_latent_dim: 32
+hash_levels: 16
+hash_features_per_level: 4
+hash_log2_size: 19
+hash_base_resolution: 16
+hash_max_resolution: 2048
+hash_output_dim: 96
+fine_dim: 96
+coarse_dim: 96
+hybrid_output_dim: 192
+hybrid_decoupled_heads: true
+hybrid_semantic_adaptor: true
+hybrid_semantic_adaptor_mode: "confidence"
+hybrid_semantic_adaptor_hidden_dim: 64
+hybrid_semantic_adaptor_use_geometry_guidance: true
+hybrid_semantic_adaptor_use_depth_guidance: false
+hybrid_semantic_adaptor_residual: true
+hybrid_semantic_adaptor_reg_weight: 0.001
+grounding_query_loss_weight: 0.10
+grounding_query_temperature: 1.0
+grounding_text_embeddings: "output/radio_gs/siglip2_text_embeddings_v2.pt"
+
+train_mode: "decoded"
+
+bottleneck_dim: 192
+dual_stream: true
+symmetric_decoder: true
+
+use_refiner: true
+refiner_hidden_dim: 256
+refiner_num_blocks: 8
+refiner_dropout: 0.1
+refiner_rgb_guide: true
+refiner_depth_guide: true
+refiner_depth_grad: true
+refiner_alpha_guide: true
+refiner_boundary_guide: true
+refiner_depth_grad_scale: 14.0
+refiner_norm_type: "gn"
+self_guided: true
+lr_refiner: 2.0e-4
+
+featsharp_mode: "analytical"
+featsharp_strength: 0.35
+
+image_height: 480
+image_width: 640
+fx: 320.0
+fy: 320.0
+cx: 319.5
+cy: 239.5
+feature_height: 60
+feature_width: 80
+max_channels_per_chunk: 32
+use_2dgs: true
+
+epochs: 120
+batch_size: 2
+lr_features: 1.0e-4
+lr_hash: 1.5e-4
+lr_decoder: 6.0e-5
+lr_heads: 6.0e-5
+weight_decay: 1.0e-4
+grad_clip: 5.0
+warmup_epochs: 4
+scheduler: "cosine"
+resume_from: "output/radio_gs/room2_hybrid_v14/checkpoints/best.pth"
+
+# --- Loss weights ---
+l2_weight: 1.0
+cosine_weight: 2.0
+adaptor_weight: 0.5
+tv_weight: 0.03
+feat_norm_weight: 0.0
+depth_loss_weight: 0.2
+geom_depth_loss_weight: 0.1
+geom_depth_detach: false
+depth_alpha_threshold: 0.05
+depth_head_type: "mlp"
+depth_head_hidden_dim: 256
+depth_head_num_layers: 3
+
+gradient_loss_weight: 0.3
+gradient_loss_type: "sobel"
+depth_guided_feature_weight: 0.2
+geometric_edge_loss_weight: 0.15
+hybrid_semantic_aux_weight: 0.2
+geom_depth_supervision_loss_type: "berhu"
+
+# --- NEW v15: channel-standardized distillation ---
+channel_std_weight: 0.5
+
+# --- NEW v15: boundary-aware feature loss ---
+boundary_aware_loss_weight: 0.2
+boundary_aware_sharpness_weight: 1.0
+boundary_aware_smoothness_weight: 1.0
+boundary_aware_edge_threshold: 0.1
+
+# Seg head: 保持 mlp 不变，downstream head 直接使用 RADIO adaptor 泛化
+seg_loss_weight: 0.3
+seg_head_type: "mlp"
+seg_head_hidden_dim: 256
+seg_head_num_layers: 3
+seg_loss_type: "ce"
+seg_ignore_index: 255
+
+feature_dir: "output/radio_features_1280d/room_2/Sequence_1"
+depth_dir: "dataset/room_2/Sequence_1/depth"
+semantics_dir: "dataset/room_2/Sequence_1/semantic_class"
+train_split: "Sequence_1"
+val_split: "Sequence_2"
+mixed_split: true
+num_workers: 4
+
+seg_num_classes: 101
+
+save_every: 10
+eval_every: 5
+log_every: 50

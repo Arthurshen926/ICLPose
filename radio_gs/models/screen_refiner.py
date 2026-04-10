@@ -11,9 +11,123 @@ Architecture:
 
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+def compute_refiner_extra_channels(
+    *,
+    rgb_guide: bool = False,
+    depth_guide: bool = False,
+    depth_grad: bool = False,
+    alpha_guide: bool = False,
+    boundary_guide: bool = False,
+) -> int:
+    """Return the number of auxiliary guide channels expected by the refiner."""
+    extra_ch = 3 if rgb_guide else 0
+    if depth_guide:
+        extra_ch += 3 if depth_grad else 1
+    if alpha_guide:
+        extra_ch += 1
+    if boundary_guide:
+        extra_ch += 1
+    return extra_ch
+
+
+def _ensure_map_4d(x: torch.Tensor) -> torch.Tensor:
+    if x.dim() == 2:
+        x = x.unsqueeze(0).unsqueeze(0)
+    elif x.dim() == 3:
+        x = x.unsqueeze(1)
+    return x.float()
+
+
+def _normalize_per_image(x: torch.Tensor) -> torch.Tensor:
+    lo = x.amin(dim=(2, 3), keepdim=True)
+    hi = x.amax(dim=(2, 3), keepdim=True)
+    return (x - lo) / (hi - lo + 1e-6)
+
+
+def _gradient_channels(x: torch.Tensor, grad_scale: float = 1.0) -> tuple[torch.Tensor, torch.Tensor]:
+    dx = x[:, :, :, 1:] - x[:, :, :, :-1]
+    dy = x[:, :, 1:, :] - x[:, :, :-1, :]
+    dx = F.pad(dx, (0, 1, 0, 0)) * grad_scale
+    dy = F.pad(dy, (0, 0, 0, 1)) * grad_scale
+    return dx, dy
+
+
+def build_depth_guide(
+    depth_map: torch.Tensor,
+    *,
+    depth_grad: bool = False,
+    grad_scale: float = 10.0,
+) -> torch.Tensor:
+    """Build a normalized depth guide for the screen refiner."""
+    depth = _normalize_per_image(_ensure_map_4d(depth_map))
+    if depth_grad:
+        dx, dy = _gradient_channels(depth, grad_scale=grad_scale)
+        return torch.cat([depth, dx, dy], dim=1)
+    return depth
+
+
+def build_boundary_guide(
+    depth_map: torch.Tensor,
+    alpha_map: Optional[torch.Tensor] = None,
+    *,
+    grad_scale: float = 10.0,
+) -> torch.Tensor:
+    """Build a single-channel geometry boundary cue from depth/alpha edges."""
+    depth = _normalize_per_image(_ensure_map_4d(depth_map))
+    dx, dy = _gradient_channels(depth, grad_scale=1.0)
+    boundary = torch.sqrt(dx.square() + dy.square() + 1e-8)
+    if alpha_map is not None:
+        alpha = _ensure_map_4d(alpha_map).clamp(0.0, 1.0)
+        adx, ady = _gradient_channels(alpha, grad_scale=1.0)
+        alpha_boundary = torch.sqrt(adx.square() + ady.square() + 1e-8)
+        boundary = torch.maximum(boundary, alpha_boundary)
+    boundary = _normalize_per_image(boundary)
+    return boundary * grad_scale
+
+
+def build_refiner_guide(
+    render_result: dict,
+    *,
+    rgb_guide: Optional[torch.Tensor] = None,
+    use_depth_guide: bool = False,
+    use_depth_grad: bool = False,
+    depth_grad_scale: float = 10.0,
+    use_alpha_guide: bool = False,
+    use_boundary_guide: bool = False,
+) -> Optional[torch.Tensor]:
+    """Assemble the optional guide tensor used by the screen-space refiner."""
+    parts: list[torch.Tensor] = []
+    if rgb_guide is not None:
+        parts.append(rgb_guide)
+    if use_depth_guide:
+        parts.append(
+            build_depth_guide(
+                render_result["depth_map"],
+                depth_grad=use_depth_grad,
+                grad_scale=depth_grad_scale,
+            )
+        )
+    alpha_map = render_result.get("alpha_map")
+    if use_alpha_guide and alpha_map is not None:
+        parts.append(_ensure_map_4d(alpha_map).clamp(0.0, 1.0))
+    if use_boundary_guide:
+        parts.append(
+            build_boundary_guide(
+                render_result["depth_map"],
+                alpha_map=alpha_map,
+                grad_scale=depth_grad_scale,
+            )
+        )
+    if not parts:
+        return None
+    return torch.cat(parts, dim=1)
 
 
 def _make_norm(channels: int, norm_type: str = "gn") -> nn.Module:

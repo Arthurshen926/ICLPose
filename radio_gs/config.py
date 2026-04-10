@@ -29,6 +29,8 @@ class RadioGSConfig:
     # Scene
     scene: str = "room_0"
     ply_path: str = ""
+    dataset_type: str = "replica"  # "replica", "scannet", or "lerf"
+    scene_root: str = ""  # optional absolute/relative override for scene root
 
     # RADIO
     radio_version: str = "c-radio_v4-h"
@@ -48,6 +50,17 @@ class RadioGSConfig:
     fine_dim: int = 64
     coarse_dim: int = 64
     hybrid_output_dim: int = 128
+    hybrid_decoupled_heads: bool = False
+    hybrid_semantic_adaptor: bool = False
+    hybrid_semantic_adaptor_mode: str = "confidence"  # "confidence" or "refinement"
+    hybrid_semantic_adaptor_hidden_dim: int = 64
+    hybrid_semantic_adaptor_use_geometry_guidance: bool = True
+    hybrid_semantic_adaptor_use_depth_guidance: bool = False
+    hybrid_semantic_adaptor_residual: bool = True
+    hybrid_semantic_adaptor_reg_weight: float = 0.0
+    grounding_query_loss_weight: float = 0.0
+    grounding_query_temperature: float = 1.0
+    grounding_text_embeddings: str = "output/radio_gs/siglip2_text_embeddings_v2.pt"
 
     # HCD Codec
     bottleneck_dim: int = 64
@@ -69,6 +82,9 @@ class RadioGSConfig:
     refiner_rgb_guide: bool = False  # Use RGB as additional input to refiner
     refiner_depth_guide: bool = False  # Use rendered depth as guide (always available)
     refiner_depth_grad: bool = False   # Use depth gradients (3ch: depth+dx+dy) instead of 1ch
+    refiner_alpha_guide: bool = False  # Use opacity/alpha as a guide channel
+    refiner_boundary_guide: bool = False  # Use depth/alpha boundary cue as a guide
+    refiner_depth_grad_scale: float = 10.0  # Scale factor for depth-gradient guide channels
     refiner_norm_type: str = "gn"      # "gn" (GroupNorm, stable) or "bn" (BatchNorm, legacy)
     self_guided: bool = False  # Use rendered RGB (not GT) as refiner guide
     lr_refiner: float = 5e-4
@@ -114,6 +130,13 @@ class RadioGSConfig:
     gradient_loss_weight: float = 0.0
     gradient_loss_type: str = "sobel"
     depth_guided_feature_weight: float = 0.0
+    geometric_edge_loss_weight: float = 0.0
+    boundary_aware_loss_weight: float = 0.0
+    boundary_aware_sharpness_weight: float = 1.0
+    boundary_aware_smoothness_weight: float = 1.0
+    boundary_aware_edge_threshold: float = 0.1
+    channel_std_weight: float = 0.0
+    hybrid_semantic_aux_weight: float = 0.0
     depth_loss_weight: float = 0.0
     geom_depth_loss_weight: float = 0.0
     geom_depth_detach: bool = True
@@ -124,14 +147,29 @@ class RadioGSConfig:
 
     # Data
     feature_dir: str = ""  # pre-extracted RADIO features
+    val_feature_dir: str = ""
+    pose_file: str = ""
+    pose_dir: str = ""
+    val_pose_file: str = ""
+    val_pose_dir: str = ""
+    rgb_dir: str = ""
+    val_rgb_dir: str = ""
     depth_dir: str = ""
+    val_depth_dir: str = ""
     semantics_dir: str = ""
+    val_semantics_dir: str = ""
+    instance_dir: str = ""
+    val_instance_dir: str = ""
     train_split: str = "Sequence_1"
     val_split: str = "Sequence_2"
+    train_frame_ids_path: str = ""
+    val_frame_ids_path: str = ""
     mixed_split: bool = False
     mixed_train_ratio: float = 0.8
     mixed_seed: int = 42
     num_workers: int = 4
+    grounding_source: str = "replica"
+    grounding_annotations_path: str = ""
 
     # Downstream tasks
     depth_head_type: str = "mlp"  # "linear", "mlp", "dpt"

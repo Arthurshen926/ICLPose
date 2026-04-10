@@ -25,8 +25,14 @@ from radio_gs.models.explicit_gaussian import ExplicitFeatureGaussian
 from radio_gs.models.hybrid_gaussian import HybridFeatureGaussian
 from radio_gs.models.hcd_codec import HCDCodec
 from radio_gs.models.featsharp_3d import FeatSharp3D
-from radio_gs.models.screen_refiner import ScreenSpaceRefiner
+from radio_gs.models.screen_refiner import (
+    ScreenSpaceRefiner,
+    build_depth_guide,
+    build_refiner_guide,
+    compute_refiner_extra_channels,
+)
 from radio_gs.rendering.feature_renderer import FeatureFieldRenderer
+from radio_gs.data.benchmark_paths import resolve_split_pose_source
 
 device = torch.device("cuda")
 DEFAULT_SIGLIP2_TEXT_EMBEDDINGS = "output/radio_gs/siglip2_text_embeddings_v2.pt"
@@ -95,6 +101,19 @@ def load_model_and_render_pipeline(config_path, checkpoint_path):
             log2_hashmap_size=getattr(config, "hash_log2_size", 19),
             base_resolution=getattr(config, "hash_base_resolution", 16),
             max_resolution=getattr(config, "hash_max_resolution", 2048),
+            decoupled_heads=getattr(config, "hybrid_decoupled_heads", False),
+            use_semantic_adaptor=getattr(config, "hybrid_semantic_adaptor", False),
+            semantic_adaptor_mode=getattr(config, "hybrid_semantic_adaptor_mode", "confidence"),
+            semantic_adaptor_hidden_dim=getattr(config, "hybrid_semantic_adaptor_hidden_dim", 64),
+            semantic_adaptor_use_geometry_guidance=getattr(
+                config, "hybrid_semantic_adaptor_use_geometry_guidance", True
+            ),
+            semantic_adaptor_use_depth_guidance=getattr(
+                config, "hybrid_semantic_adaptor_use_depth_guidance", False
+            ),
+            semantic_adaptor_residual=getattr(
+                config, "hybrid_semantic_adaptor_residual", True
+            ),
         )
     else:
         latent_dim = getattr(config, "latent_dim", 64)
@@ -132,11 +151,13 @@ def load_model_and_render_pipeline(config_path, checkpoint_path):
     refiner = None
     rgb_guide = getattr(config, "refiner_rgb_guide", False)
     if getattr(config, "use_refiner", False):
-        extra_ch = 3 if rgb_guide else 0
-        depth_guide_enabled = getattr(config, "refiner_depth_guide", False)
-        depth_grad_enabled = getattr(config, "refiner_depth_grad", False)
-        if depth_guide_enabled:
-            extra_ch += 3 if depth_grad_enabled else 1
+        extra_ch = compute_refiner_extra_channels(
+            rgb_guide=rgb_guide,
+            depth_guide=getattr(config, "refiner_depth_guide", False),
+            depth_grad=getattr(config, "refiner_depth_grad", False),
+            alpha_guide=getattr(config, "refiner_alpha_guide", False),
+            boundary_guide=getattr(config, "refiner_boundary_guide", False),
+        )
         norm_type = getattr(config, "refiner_norm_type", "gn")
         refiner = ScreenSpaceRefiner(
             latent_dim=latent_dim,
@@ -171,11 +192,24 @@ def _hybrid_decode(model, rendered, result, pose_w2c, K):
     hi = xyz.max(dim=0).values + margin
     extent = (hi - lo).clamp(min=1e-6)
     position_map = ((position_map - lo.view(1, 3, 1, 1)) / extent.view(1, 3, 1, 1)).clamp(0, 1)
-    return model.decode_screen_space(rendered.float(), position_map)
+    return model.decode_screen_space(
+        rendered.float(),
+        position_map,
+        depth_map=depth_map,
+    )
+
+
+def _build_depth_guide(render_result, depth_grad=False, grad_scale=10.0):
+    """Backwards-compatible wrapper for shared depth-guide logic."""
+    return build_depth_guide(
+        render_result["depth_map"],
+        depth_grad=depth_grad,
+        grad_scale=grad_scale,
+    )
 
 
 def render_1280d(model, codec, renderer, sharpener, refiner, viewmat,
-                 rgb_guide=None, self_guided=False, is_hybrid=False):
+                 rgb_guide=None, self_guided=False, is_hybrid=False, config=None):
     """Render a single frame's 1280d decoded features.
     
     Args:
@@ -194,7 +228,16 @@ def render_1280d(model, codec, renderer, sharpener, refiner, viewmat,
             latent = result["feature_map"].unsqueeze(0)  # [1, D, H, W]
         latent = sharpener(latent)
         if refiner is not None:
-            latent = refiner(latent, guide=rgb_guide)
+            guide = build_refiner_guide(
+                result,
+                rgb_guide=rgb_guide,
+                use_depth_guide=getattr(config, "refiner_depth_guide", False) if config is not None else False,
+                use_depth_grad=getattr(config, "refiner_depth_grad", False) if config is not None else False,
+                depth_grad_scale=getattr(config, "refiner_depth_grad_scale", 10.0) if config is not None else 10.0,
+                use_alpha_guide=getattr(config, "refiner_alpha_guide", False) if config is not None else False,
+                use_boundary_guide=getattr(config, "refiner_boundary_guide", False) if config is not None else False,
+            )
+            latent = refiner(latent, guide=guide)
         if is_hybrid:
             latent = _hybrid_decode(model, latent, result, viewmat, renderer.K)
         decoded = codec.decode(latent)  # [1, 1280, H, W]
@@ -273,6 +316,23 @@ def load_text_embedding_candidates(text_emb_path):
     return candidates
 
 
+def resolve_gt_feature_dir(gt_features) -> Path:
+    """Resolve a feature directory that may contain a nested backbone/ subdir."""
+    root = Path(gt_features)
+    if any(root.glob("rgb_*.pt")):
+        return root
+    backbone = root / "backbone"
+    if backbone.is_dir() and any(backbone.glob("rgb_*.pt")):
+        return backbone
+    return root
+
+
+def resolve_feature_split_dir(gt_features) -> Path:
+    """Resolve the split directory that should contain traj_w_c.txt."""
+    root = Path(gt_features)
+    return root.parent if root.name == "backbone" else root
+
+
 def select_scene_text_embeddings(
     candidates,
     proj_model,
@@ -305,12 +365,11 @@ def select_scene_text_embeddings(
             feat = feat.unsqueeze(0)
         elif feat.dim() == 2:
             feat = feat.reshape(fH, fW, -1).permute(2, 0, 1).unsqueeze(0)
+        B, C, H, W = feat.shape
         sem = cv2.imread(str(sem_path), cv2.IMREAD_GRAYSCALE)
         if sem is None:
             continue
-        sem = cv2.resize(sem, (fW, fH), interpolation=cv2.INTER_NEAREST)
-
-        B, C, H, W = feat.shape
+        sem = cv2.resize(sem, (W, H), interpolation=cv2.INTER_NEAREST)
         feat_flat = feat.reshape(B, C, H * W).permute(0, 2, 1)
         with torch.no_grad():
             siglip = proj_model(feat_flat.half())
@@ -391,17 +450,23 @@ def evaluate_grounding(args):
     # Load poses (traj_w_c.txt: camera-to-world, need inverse for renderer)
     pose_file = args.pose_file
     if not pose_file:
-        # Auto-detect from gt_features dir
-        feat_parent = Path(args.gt_features).parent
-        pose_file = str(feat_parent / "traj_w_c.txt")
-    assert Path(pose_file).exists(), f"Pose file not found: {pose_file}"
+        feat_split_dir = resolve_feature_split_dir(args.gt_features)
+        candidates = [feat_split_dir / "traj_w_c.txt"]
+        val_pose_file, _ = resolve_split_pose_source(config, "val")
+        train_pose_file, _ = resolve_split_pose_source(config, "train")
+        if val_pose_file:
+            candidates.append(Path(val_pose_file))
+        if train_pose_file:
+            candidates.append(Path(train_pose_file))
+        pose_file = next((str(path) for path in candidates if path.exists()), "")
+    assert pose_file and Path(pose_file).exists(), f"Pose file not found: {pose_file}"
     c2w = np.loadtxt(pose_file).reshape(-1, 4, 4).astype(np.float32)
     w2c = np.linalg.inv(c2w)
     n_frames = len(w2c)
     print(f"Loaded {n_frames} poses from {pose_file}")
 
     # Setup paths
-    gt_feat_dir = Path(args.gt_features)
+    gt_feat_dir = resolve_gt_feature_dir(args.gt_features)
     sem_dir = Path(args.semantic_dir)
     rgb_dir = Path(args.rgb_dir) if args.rgb_dir else None
 
@@ -449,7 +514,15 @@ def evaluate_grounding(args):
             rgb_guide = torch.from_numpy(img).float().permute(2, 0, 1).unsqueeze(0).to(device) / 255.0
         rend_feat = render_1280d(model, codec, renderer, sharpener, refiner,
                                  viewmat, rgb_guide, self_guided=self_guided,
-                                 is_hybrid=is_hybrid)
+                                 is_hybrid=is_hybrid, config=config)
+        target_size = rend_feat.shape[-2:]
+        if gt_feat.shape[-2:] != target_size:
+            gt_feat = F.interpolate(
+                gt_feat.float(),
+                size=target_size,
+                mode="bilinear",
+                align_corners=False,
+            )
 
         # Project to SigLIP2 space
         gt_siglip = project_to_siglip2(gt_feat.half(), proj)    # [1, 1536, H, W]
@@ -474,7 +547,7 @@ def evaluate_grounding(args):
             heatmap_corrs.append(np.mean(corrs))
 
         # Load semantic GT
-        sem_gt = load_semantic_gt(sem_dir, frame_idx, (fH, fW)).to(device)
+        sem_gt = load_semantic_gt(sem_dir, frame_idx, target_size).to(device)
 
         # Per-class IoU and AP (use raw similarity for per-class thresholding)
         for qi, (qname, cid) in enumerate(zip(active_queries, active_class_ids)):

@@ -26,6 +26,19 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from radio_gs.config import RadioGSConfig, load_config
+from radio_gs.data.benchmark_paths import (
+    list_feature_paths,
+    load_w2c_from_pose_dir,
+    load_w2c_from_pose_file,
+    resolve_dataset_type,
+    resolve_depth_path,
+    resolve_scene_root,
+    resolve_semantics_path,
+    resolve_split_data_dir,
+    resolve_split_feature_dir,
+    resolve_split_frame_ids,
+    resolve_split_pose_source,
+)
 from radio_gs.models.hcd_codec import HCDCodec
 from radio_gs.models.featsharp_3d import FeatSharp3D
 from radio_gs.rendering.feature_renderer import FeatureFieldRenderer
@@ -33,13 +46,38 @@ from radio_gs.rendering.feature_renderer import FeatureFieldRenderer
 
 def build_components(config: RadioGSConfig, checkpoint_path: str, device: torch.device):
     """Load trained model, codec, sharpener, renderer from checkpoint."""
-    if getattr(config, "architecture", "explicit") == "explicit":
+    is_hybrid = getattr(config, "architecture", "explicit") == "hybrid"
+    if not is_hybrid:
         from radio_gs.models.explicit_gaussian import ExplicitFeatureGaussian
-        model = ExplicitFeatureGaussian(latent_dim=getattr(config, "latent_dim", 64))
+        latent_dim = getattr(config, "latent_dim", 64)
+        model = ExplicitFeatureGaussian(latent_dim=latent_dim)
     else:
         from radio_gs.models.hybrid_gaussian import HybridFeatureGaussian
+        latent_dim = getattr(config, "hybrid_latent_dim", 16)
         model = HybridFeatureGaussian(
-            latent_dim=getattr(config, "hybrid_latent_dim", 16),
+            latent_dim=latent_dim,
+            hash_output_dim=getattr(config, "hash_output_dim", 48),
+            fine_dim=getattr(config, "fine_dim", 64),
+            coarse_dim=getattr(config, "coarse_dim", 64),
+            output_dim=getattr(config, "hybrid_output_dim", 128),
+            num_levels=getattr(config, "hash_levels", 16),
+            features_per_level=getattr(config, "hash_features_per_level", 2),
+            log2_hashmap_size=getattr(config, "hash_log2_size", 19),
+            base_resolution=getattr(config, "hash_base_resolution", 16),
+            max_resolution=getattr(config, "hash_max_resolution", 2048),
+            decoupled_heads=getattr(config, "hybrid_decoupled_heads", False),
+            use_semantic_adaptor=getattr(config, "hybrid_semantic_adaptor", False),
+            semantic_adaptor_mode=getattr(config, "hybrid_semantic_adaptor_mode", "confidence"),
+            semantic_adaptor_hidden_dim=getattr(config, "hybrid_semantic_adaptor_hidden_dim", 64),
+            semantic_adaptor_use_geometry_guidance=getattr(
+                config, "hybrid_semantic_adaptor_use_geometry_guidance", True
+            ),
+            semantic_adaptor_use_depth_guidance=getattr(
+                config, "hybrid_semantic_adaptor_use_depth_guidance", False
+            ),
+            semantic_adaptor_residual=getattr(
+                config, "hybrid_semantic_adaptor_residual", True
+            ),
         )
 
     ply_path = getattr(config, "ply_path", None)
@@ -54,7 +92,7 @@ def build_components(config: RadioGSConfig, checkpoint_path: str, device: torch.
 
     sharpener = FeatSharp3D(
         mode=getattr(config, "featsharp_mode", "analytical"),
-        feature_dim=getattr(config, "latent_dim", 64),
+        feature_dim=latent_dim,
         strength=getattr(config, "featsharp_strength", 0.5),
     )
 
@@ -97,6 +135,29 @@ def render_decoded(model, codec, sharpener, renderer, pose_w2c, device):
     return decoded, result
 
 
+def _collect_split_inputs(config: RadioGSConfig, split: str) -> Dict[str, object]:
+    feature_dir = resolve_split_feature_dir(config, split)
+    frame_ids = resolve_split_frame_ids(config, split)
+    feat_paths = list_feature_paths(feature_dir, frame_ids=frame_ids)
+    frame_indices = [int(p.stem.split("_")[1]) for p in feat_paths]
+    pose_file, pose_dir = resolve_split_pose_source(config, split)
+    if pose_dir:
+        w2c_poses = load_w2c_from_pose_dir(pose_dir, frame_indices)
+    elif pose_file:
+        w2c_poses = load_w2c_from_pose_file(pose_file, frame_indices)
+    else:
+        raise ValueError(f"No pose source configured for split={split}")
+    return {
+        "dataset_type": resolve_dataset_type(config),
+        "feature_dir": feature_dir,
+        "feature_paths": feat_paths,
+        "frame_indices": frame_indices,
+        "w2c_poses": w2c_poses,
+        "depth_dir": resolve_split_data_dir(config, split, "depth"),
+        "semantics_dir": resolve_split_data_dir(config, split, "semantics"),
+    }
+
+
 # ===================================================================
 # Feature Quality Evaluation
 # ===================================================================
@@ -106,25 +167,9 @@ def eval_feature_quality(
     model, codec, sharpener, renderer, config, device, split="val"
 ) -> Dict[str, float]:
     """Evaluate feature reconstruction quality vs GT RADIO features."""
-    scene = getattr(config, "scene", "room_0")
-    train_split = getattr(config, "train_split", "Sequence_1")
-    val_split = getattr(config, "val_split", "Sequence_2")
-    feature_dir = getattr(config, "feature_dir", "")
-
-    if split == "val":
-        feat_dir = Path(feature_dir.replace(train_split, val_split))
-        pose_file = Path("dataset") / scene / val_split / "traj_w_c.txt"
-    else:
-        feat_dir = Path(feature_dir)
-        pose_file = Path("dataset") / scene / train_split / "traj_w_c.txt"
-
-    backbone_dir = feat_dir / "backbone"
-    if not backbone_dir.exists():
-        backbone_dir = feat_dir
-    feat_paths = sorted(backbone_dir.glob("rgb_*.pt"), key=lambda p: int(p.stem.split("_")[1]))
-
-    raw_poses = np.loadtxt(str(pose_file)).reshape(-1, 4, 4).astype(np.float32)
-    w2c_poses = np.linalg.inv(raw_poses)
+    split_inputs = _collect_split_inputs(config, split)
+    feat_paths = split_inputs["feature_paths"]
+    w2c_poses = split_inputs["w2c_poses"]
 
     cosines, l2s, psnrs_norm = [], [], []
 
@@ -174,29 +219,15 @@ def eval_depth(
     """Evaluate depth prediction from decoded features with a linear probe."""
     from radio_gs.heads.depth_head import DepthHead
 
-    scene = getattr(config, "scene", "room_0")
-    val_split = getattr(config, "val_split", "Sequence_2")
-    train_split = getattr(config, "train_split", "Sequence_1")
-    feature_dir = getattr(config, "feature_dir", "")
+    eval_inputs = _collect_split_inputs(config, split)
+    train_inputs = _collect_split_inputs(config, "train")
+    feat_paths = eval_inputs["feature_paths"]
+    frame_indices = eval_inputs["frame_indices"]
+    w2c_poses = eval_inputs["w2c_poses"]
+    depth_dir = eval_inputs["depth_dir"]
+    dataset_type = eval_inputs["dataset_type"]
 
-    target_split = val_split if split == "val" else train_split
-    feat_dir = Path(feature_dir.replace(train_split, target_split))
-    backbone_dir = feat_dir / "backbone"
-    if not backbone_dir.exists():
-        backbone_dir = feat_dir
-    feat_paths = sorted(backbone_dir.glob("rgb_*.pt"), key=lambda p: int(p.stem.split("_")[1]))
-
-    scene_root = Path("dataset") / scene
-    pose_file = scene_root / target_split / "traj_w_c.txt"
-    depth_dir = scene_root / target_split / "depth"
-
-    raw_poses = np.loadtxt(str(pose_file)).reshape(-1, 4, 4).astype(np.float32)
-    w2c_poses = np.linalg.inv(raw_poses)
-
-    depth_paths = sorted(depth_dir.glob("*.png"), key=lambda p: int(p.stem.split("_")[-1])
-                         if p.stem.split("_")[-1].isdigit() else 0)
-
-    if not depth_paths:
+    if depth_dir is None:
         print("  No depth GT found, skipping depth eval")
         return {}
 
@@ -207,23 +238,29 @@ def eval_depth(
     optimizer = torch.optim.Adam(depth_head.parameters(), lr=1e-3)
 
     # Train on train split GT features
-    train_feat_dir = Path(feature_dir) / "backbone"
-    if not train_feat_dir.exists():
-        train_feat_dir = Path(feature_dir)
-    train_feat_paths = sorted(train_feat_dir.glob("rgb_*.pt"), key=lambda p: int(p.stem.split("_")[1]))
-    train_depth_dir = scene_root / train_split / "depth"
-    train_depth_paths = sorted(train_depth_dir.glob("*.png"), key=lambda p: int(p.stem.split("_")[-1])
-                               if p.stem.split("_")[-1].isdigit() else 0)
+    train_feat_paths = train_inputs["feature_paths"]
+    train_frame_indices = train_inputs["frame_indices"]
+    train_depth_dir = train_inputs["depth_dir"]
+    if train_depth_dir is None:
+        print("  No train depth GT found, skipping depth eval")
+        return {}
 
-    n_train = min(len(train_feat_paths), len(train_depth_paths), 200)
+    train_pairs = []
+    for path, frame_idx in zip(train_feat_paths, train_frame_indices):
+        depth_path = resolve_depth_path(train_depth_dir, frame_idx, dataset_type)
+        if depth_path is not None and depth_path.exists():
+            train_pairs.append((path, depth_path))
+
+    n_train = min(len(train_pairs), 200)
     fH, fW = getattr(config, "feature_height", 30), getattr(config, "feature_width", 40)
 
     depth_head.train()
     for ep in range(10):
         indices = np.random.permutation(n_train)[:50]
         for idx in indices:
-            gt_feat = torch.load(train_feat_paths[idx], map_location=device).float().unsqueeze(0)
-            d = cv2.imread(str(train_depth_paths[idx]), cv2.IMREAD_UNCHANGED)
+            feat_path, depth_path = train_pairs[idx]
+            gt_feat = torch.load(feat_path, map_location=device).float().unsqueeze(0)
+            d = cv2.imread(str(depth_path), cv2.IMREAD_UNCHANGED)
             if d is None:
                 continue
             gt_d = torch.tensor(d.astype(np.float32) / 1000.0, device=device)
@@ -241,13 +278,16 @@ def eval_depth(
     depth_head.eval()
     abs_rels, rmses, delta1s = [], [], []
 
-    for idx in tqdm(range(min(len(feat_paths), len(depth_paths))), desc="Eval Depth"):
+    for idx, frame_idx in enumerate(tqdm(frame_indices, desc="Eval Depth")):
         pose_w2c = torch.tensor(w2c_poses[idx], dtype=torch.float32)
         decoded, _ = render_decoded(model, codec, sharpener, renderer, pose_w2c, device)
 
         pred_d = depth_head(decoded).squeeze()  # [H, W]
 
-        d = cv2.imread(str(depth_paths[idx]), cv2.IMREAD_UNCHANGED)
+        depth_path = resolve_depth_path(depth_dir, frame_idx, dataset_type)
+        if depth_path is None:
+            continue
+        d = cv2.imread(str(depth_path), cv2.IMREAD_UNCHANGED)
         if d is None:
             continue
         gt_d = torch.tensor(d.astype(np.float32) / 1000.0, device=device)
@@ -291,30 +331,16 @@ def eval_segmentation(
     """Evaluate semantic segmentation with a linear probe."""
     from radio_gs.heads.segmentation_head import SegmentationHead
 
-    scene = getattr(config, "scene", "room_0")
-    val_split = getattr(config, "val_split", "Sequence_2")
-    train_split = getattr(config, "train_split", "Sequence_1")
-    feature_dir = getattr(config, "feature_dir", "")
     num_classes = getattr(config, "seg_num_classes", 40)
+    eval_inputs = _collect_split_inputs(config, split)
+    train_inputs = _collect_split_inputs(config, "train")
+    feat_paths = eval_inputs["feature_paths"]
+    frame_indices = eval_inputs["frame_indices"]
+    w2c_poses = eval_inputs["w2c_poses"]
+    sem_dir = eval_inputs["semantics_dir"]
+    dataset_type = eval_inputs["dataset_type"]
 
-    target_split = val_split if split == "val" else train_split
-    feat_dir = Path(feature_dir.replace(train_split, target_split))
-    backbone_dir = feat_dir / "backbone"
-    if not backbone_dir.exists():
-        backbone_dir = feat_dir
-    feat_paths = sorted(backbone_dir.glob("rgb_*.pt"), key=lambda p: int(p.stem.split("_")[1]))
-
-    scene_root = Path("dataset") / scene
-    pose_file = scene_root / target_split / "traj_w_c.txt"
-    sem_dir = scene_root / target_split / "semantic_class"
-
-    raw_poses = np.loadtxt(str(pose_file)).reshape(-1, 4, 4).astype(np.float32)
-    w2c_poses = np.linalg.inv(raw_poses)
-
-    sem_paths = sorted(sem_dir.glob("*.png"), key=lambda p: int(p.stem.split("_")[-1])
-                       if p.stem.split("_")[-1].isdigit() else 0)
-
-    if not sem_paths:
+    if sem_dir is None:
         print("  No semantic GT found, skipping segmentation eval")
         return {}
 
@@ -326,22 +352,28 @@ def eval_segmentation(
     seg_head = SegmentationHead(feat_dim, num_classes=num_classes, head_type="linear").to(device)
     optimizer = torch.optim.Adam(seg_head.parameters(), lr=1e-3)
 
-    train_feat_dir = Path(feature_dir) / "backbone"
-    if not train_feat_dir.exists():
-        train_feat_dir = Path(feature_dir)
-    train_feat_paths = sorted(train_feat_dir.glob("rgb_*.pt"), key=lambda p: int(p.stem.split("_")[1]))
-    train_sem_dir = scene_root / train_split / "semantic_class"
-    train_sem_paths = sorted(train_sem_dir.glob("*.png"), key=lambda p: int(p.stem.split("_")[-1])
-                             if p.stem.split("_")[-1].isdigit() else 0)
+    train_feat_paths = train_inputs["feature_paths"]
+    train_frame_indices = train_inputs["frame_indices"]
+    train_sem_dir = train_inputs["semantics_dir"]
+    if train_sem_dir is None:
+        print("  No train semantic GT found, skipping segmentation eval")
+        return {}
 
-    n_train = min(len(train_feat_paths), len(train_sem_paths), 200)
+    train_pairs = []
+    for path, frame_idx in zip(train_feat_paths, train_frame_indices):
+        sem_path = resolve_semantics_path(train_sem_dir, frame_idx, dataset_type)
+        if sem_path is not None and sem_path.exists():
+            train_pairs.append((path, sem_path))
+
+    n_train = min(len(train_pairs), 200)
 
     seg_head.train()
     for ep in range(15):
         indices = np.random.permutation(n_train)[:50]
         for idx in indices:
-            gt_feat = torch.load(train_feat_paths[idx], map_location=device).float().unsqueeze(0)
-            sem = cv2.imread(str(train_sem_paths[idx]), cv2.IMREAD_GRAYSCALE)
+            feat_path, sem_path = train_pairs[idx]
+            gt_feat = torch.load(feat_path, map_location=device).float().unsqueeze(0)
+            sem = cv2.imread(str(sem_path), cv2.IMREAD_GRAYSCALE)
             if sem is None:
                 continue
             gt_sem = torch.tensor(sem.astype(np.int64), device=device)
@@ -359,14 +391,17 @@ def eval_segmentation(
     class_intersect = torch.zeros(num_classes, device=device)
     class_union = torch.zeros(num_classes, device=device)
 
-    for idx in tqdm(range(min(len(feat_paths), len(sem_paths))), desc="Eval Segmentation"):
+    for idx, frame_idx in enumerate(tqdm(frame_indices, desc="Eval Segmentation")):
         pose_w2c = torch.tensor(w2c_poses[idx], dtype=torch.float32)
         decoded, _ = render_decoded(model, codec, sharpener, renderer, pose_w2c, device)
 
         logits = seg_head(decoded)  # [1, C, H, W]
         pred = logits.argmax(dim=1).squeeze(0)  # [H, W]
 
-        sem = cv2.imread(str(sem_paths[idx]), cv2.IMREAD_GRAYSCALE)
+        sem_path = resolve_semantics_path(sem_dir, frame_idx, dataset_type)
+        if sem_path is None:
+            continue
+        sem = cv2.imread(str(sem_path), cv2.IMREAD_GRAYSCALE)
         if sem is None:
             continue
         gt_sem = torch.tensor(sem.astype(np.int64), device=device)

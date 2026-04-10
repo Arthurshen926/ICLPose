@@ -17,7 +17,9 @@ class SegmentationHead(nn.Module):
         num_classes: Number of semantic classes.
         hidden_dim: Hidden layer width for the MLP variant.
         num_layers: Number of hidden layers for the MLP variant.
-        head_type: One of 'linear', 'mlp'.
+        head_type: One of 'linear', 'mlp', 'adaptor'.
+            - 'adaptor': deeper MLP with residual skip connections and
+              bottleneck design for improved gradient flow.
     """
 
     def __init__(
@@ -36,6 +38,8 @@ class SegmentationHead(nn.Module):
             self.head = nn.Conv2d(feature_dim, num_classes, 1)
         elif head_type == "mlp":
             self.head = self._build_mlp(feature_dim, hidden_dim, num_layers, num_classes)
+        elif head_type == "adaptor":
+            self.head = self._build_adaptor(feature_dim, hidden_dim, num_layers, num_classes)
         else:
             raise ValueError(f"Unknown head_type '{head_type}'")
 
@@ -54,6 +58,17 @@ class SegmentationHead(nn.Module):
             in_dim = cur_out
         return nn.Sequential(*layers)
 
+    @staticmethod
+    def _build_adaptor(
+        in_dim: int, hidden_dim: int, num_layers: int, out_dim: int,
+    ) -> nn.Module:
+        """Build an adaptor-style head with residual skip connections.
+
+        Architecture: project → [residual block] × N → classify.
+        Each residual block is: GroupNorm → GELU → Conv1x1 → GroupNorm → GELU → Conv1x1 + skip.
+        """
+        return _AdaptorHead(in_dim, hidden_dim, num_layers, out_dim)
+
     def forward(self, features: Tensor) -> Tensor:
         """Predict per-pixel class logits.
 
@@ -64,6 +79,50 @@ class SegmentationHead(nn.Module):
             [B, num_classes, H, W] pre-softmax logits.
         """
         return self.head(features)
+
+
+class _ResidualBlock(nn.Module):
+    """Single residual block: GroupNorm → GELU → Conv1x1 → GroupNorm → GELU → Conv1x1 + skip."""
+
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.norm1 = nn.GroupNorm(min(32, dim), dim)
+        self.conv1 = nn.Conv2d(dim, dim, 1)
+        self.norm2 = nn.GroupNorm(min(32, dim), dim)
+        self.conv2 = nn.Conv2d(dim, dim, 1)
+        self.act = nn.GELU()
+
+    def forward(self, x: Tensor) -> Tensor:
+        residual = x
+        out = self.act(self.norm1(x))
+        out = self.conv1(out)
+        out = self.act(self.norm2(out))
+        out = self.conv2(out)
+        return out + residual
+
+
+class _AdaptorHead(nn.Module):
+    """Adaptor-style segmentation head with residual skip connections.
+
+    Pipeline: project_in (in_dim → hidden_dim) → N residual blocks → project_out (hidden_dim → out_dim).
+    """
+
+    def __init__(self, in_dim: int, hidden_dim: int, num_layers: int, out_dim: int) -> None:
+        super().__init__()
+        self.project_in = nn.Sequential(
+            nn.Conv2d(in_dim, hidden_dim, 1),
+            nn.GroupNorm(min(32, hidden_dim), hidden_dim),
+            nn.GELU(),
+        )
+        self.blocks = nn.Sequential(
+            *[_ResidualBlock(hidden_dim) for _ in range(max(num_layers, 1))]
+        )
+        self.project_out = nn.Conv2d(hidden_dim, out_dim, 1)
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = self.project_in(x)
+        x = self.blocks(x)
+        return self.project_out(x)
 
 
 class SegmentationLoss(nn.Module):

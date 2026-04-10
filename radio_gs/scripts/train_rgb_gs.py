@@ -33,6 +33,7 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from gsplat import rasterization
+from radio_gs.data.benchmark_paths import extract_feature_frame_index
 
 
 # ─── helpers ───────────────────────────────────────────────────────
@@ -45,8 +46,14 @@ def load_replica_data(scene: str, sequence: str, dataset_root: str = "dataset",
     depth_dir = base / "depth"
     pose_file = base / "traj_w_c.txt"
 
-    rgb_files = sorted(glob.glob(str(rgb_dir / "rgb_*.png")))
-    depth_files = sorted(glob.glob(str(depth_dir / "depth_*.png")))
+    rgb_files = sorted(
+        glob.glob(str(rgb_dir / "rgb_*.png")),
+        key=lambda p: extract_feature_frame_index(Path(p)),
+    )
+    depth_files = sorted(
+        glob.glob(str(depth_dir / "depth_*.png")),
+        key=lambda p: extract_feature_frame_index(Path(p)),
+    )
     poses_flat = np.loadtxt(str(pose_file))
     poses = poses_flat.reshape(-1, 4, 4)  # camera-to-world
 

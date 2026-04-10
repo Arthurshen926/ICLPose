@@ -17,6 +17,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import gc
 import sys
 from pathlib import Path
 
@@ -33,16 +34,28 @@ from radio_gs.config import load_config
 from radio_gs.models.depth_fusion import (
     predict_depth_fusion,
     prepare_depth_fusion_sample,
+    sample_depth_fusion_training_pixels,
     train_depth_fusion_probe,
 )
 from radio_gs.models.explicit_gaussian import ExplicitFeatureGaussian
 from radio_gs.models.hcd_codec import HCDCodec
 from radio_gs.models.featsharp_3d import FeatSharp3D
-from radio_gs.models.screen_refiner import ScreenSpaceRefiner
+from radio_gs.models.screen_refiner import (
+    ScreenSpaceRefiner,
+    build_depth_guide,
+    build_refiner_guide,
+    compute_refiner_extra_channels,
+)
+from radio_gs.data.benchmark_paths import resolve_split_feature_dir
 from radio_gs.rendering.feature_renderer import FeatureFieldRenderer
 
 device = torch.device("cuda")
+probe_device = torch.device("cpu")
 DEFAULT_SIGLIP2_TEXT_EMBEDDINGS = "output/radio_gs/siglip2_text_embeddings_v2.pt"
+
+def inference_dtype(target_device: torch.device) -> torch.dtype:
+    return torch.float16 if target_device.type == "cuda" else torch.float32
+
 
 # Replica semantic classes
 from radio_gs.replica_constants import (
@@ -89,6 +102,19 @@ def load_pipeline(config_path, checkpoint_path):
             log2_hashmap_size=getattr(config, "hash_log2_size", 19),
             base_resolution=getattr(config, "hash_base_resolution", 16),
             max_resolution=getattr(config, "hash_max_resolution", 2048),
+            decoupled_heads=getattr(config, "hybrid_decoupled_heads", False),
+            use_semantic_adaptor=getattr(config, "hybrid_semantic_adaptor", False),
+            semantic_adaptor_mode=getattr(config, "hybrid_semantic_adaptor_mode", "confidence"),
+            semantic_adaptor_hidden_dim=getattr(config, "hybrid_semantic_adaptor_hidden_dim", 64),
+            semantic_adaptor_use_geometry_guidance=getattr(
+                config, "hybrid_semantic_adaptor_use_geometry_guidance", True
+            ),
+            semantic_adaptor_use_depth_guidance=getattr(
+                config, "hybrid_semantic_adaptor_use_depth_guidance", False
+            ),
+            semantic_adaptor_residual=getattr(
+                config, "hybrid_semantic_adaptor_residual", True
+            ),
         )
     else:
         latent_dim = getattr(config, "latent_dim", 64)
@@ -119,11 +145,13 @@ def load_pipeline(config_path, checkpoint_path):
     depth_guide_enabled = getattr(config, "refiner_depth_guide", False)
     depth_grad_enabled = getattr(config, "refiner_depth_grad", False)
     if getattr(config, "use_refiner", False):
-        extra_ch = 0
-        if rgb_guide_enabled:
-            extra_ch += 3
-        if depth_guide_enabled:
-            extra_ch += 3 if depth_grad_enabled else 1
+        extra_ch = compute_refiner_extra_channels(
+            rgb_guide=rgb_guide_enabled,
+            depth_guide=depth_guide_enabled,
+            depth_grad=depth_grad_enabled,
+            alpha_guide=getattr(config, "refiner_alpha_guide", False),
+            boundary_guide=getattr(config, "refiner_boundary_guide", False),
+        )
         norm_type = getattr(config, "refiner_norm_type", "gn")
         refiner = ScreenSpaceRefiner(
             latent_dim=latent_dim,
@@ -157,13 +185,28 @@ def _hybrid_decode(model, rendered, result, pose_w2c, K):
     hi = xyz.max(dim=0).values + margin
     extent = (hi - lo).clamp(min=1e-6)
     position_map = ((position_map - lo.view(1, 3, 1, 1)) / extent.view(1, 3, 1, 1)).clamp(0, 1)
-    return model.decode_screen_space(rendered.float(), position_map)
+    return model.decode_screen_space(
+        rendered.float(),
+        position_map,
+        depth_map=depth_map,
+    )
+
+
+def _build_depth_guide(render_result, depth_grad=False, grad_scale=10.0):
+    """Backwards-compatible wrapper for shared depth-guide logic."""
+    return build_depth_guide(
+        render_result["depth_map"],
+        depth_grad=depth_grad,
+        grad_scale=grad_scale,
+    )
 
 
 def render_features(model, codec, renderer, sharpener, refiner, config, viewmat,
                     is_hybrid=False):
     """Render and decode 1280d features + geometry depth for a single view."""
     self_guided = getattr(config, "self_guided", False)
+    depth_guide_enabled = getattr(config, "refiner_depth_guide", False)
+    depth_grad_enabled = getattr(config, "refiner_depth_grad", False)
     with torch.no_grad():
         if self_guided:
             vm = viewmat if viewmat.dim() == 3 else viewmat.unsqueeze(0)
@@ -194,7 +237,16 @@ def render_features(model, codec, renderer, sharpener, refiner, config, viewmat,
 
         latent = sharpener(latent)
         if refiner is not None:
-            latent = refiner(latent, guide=rgb_guide)
+            guide = build_refiner_guide(
+                result,
+                rgb_guide=rgb_guide,
+                use_depth_guide=depth_guide_enabled,
+                use_depth_grad=depth_grad_enabled,
+                depth_grad_scale=getattr(config, "refiner_depth_grad_scale", 10.0),
+                use_alpha_guide=getattr(config, "refiner_alpha_guide", False),
+                use_boundary_guide=getattr(config, "refiner_boundary_guide", False),
+            )
+            latent = refiner(latent, guide=guide)
         if is_hybrid:
             latent = _hybrid_decode(model, latent, result, viewmat, renderer.K)
         decoded = codec.decoder(latent)
@@ -392,7 +444,7 @@ def _build_probe(in_dim, out_dim, hidden=256):
 def _train_probe(probe, train_X, train_Y, epochs=300, batch_size=16384,
                  lr=1e-3, task="regression", class_weights=None):
     """Train a probe with mini-batch sampling for stable visualization heads."""
-    probe = probe.to(device).train()
+    probe = probe.to(probe_device).train()
     opt = torch.optim.Adam(probe.parameters(), lr=lr, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
     n = train_X.shape[0]
@@ -431,8 +483,8 @@ def train_depth_probe(features, depth_dir, indices, fH, fW):
         train_X.append(feat.reshape(C, -1).T[valid.reshape(-1)])
         train_Y.append(d.reshape(-1)[valid.reshape(-1)])
 
-    train_X = torch.cat(train_X, 0).to(device)
-    train_Y = torch.cat(train_Y, 0).to(device)
+    train_X = torch.cat(train_X, 0).to(probe_device)
+    train_Y = torch.cat(train_Y, 0).to(probe_device)
     probe = _build_probe(train_X.shape[1], 1)
     return _train_probe(probe, train_X, train_Y, epochs=300, task="regression")
 
@@ -455,17 +507,17 @@ def train_seg_probe(features, sem_dir, indices, fH, fW):
         train_X.append(feat.reshape(C, -1).T)
         train_Y.append(sem.reshape(-1))
 
-    train_X = torch.cat(train_X, 0).to(device)
-    train_Y = torch.cat(train_Y, 0).to(device)
+    train_X = torch.cat(train_X, 0).to(probe_device)
+    train_Y = torch.cat(train_Y, 0).to(probe_device)
     unique_classes = torch.unique(train_Y).tolist()
     id_to_contiguous = {c: i for i, c in enumerate(unique_classes)}
     contiguous_to_id = {i: c for c, i in id_to_contiguous.items()}
     train_Y = torch.tensor([id_to_contiguous[y.item()] for y in train_Y],
-                           dtype=torch.long, device=device)
+                           dtype=torch.long, device=probe_device)
     n_classes = len(unique_classes)
     counts = torch.bincount(train_Y, minlength=n_classes).float().clamp(min=1)
     weights = (1.0 / counts)
-    weights = (weights / weights.sum() * n_classes).to(device)
+    weights = (weights / weights.sum() * n_classes).to(probe_device)
     probe = _build_probe(train_X.shape[1], n_classes)
     probe = _train_probe(probe, train_X, train_Y, epochs=500, task="classification",
                          class_weights=weights)
@@ -476,9 +528,9 @@ def predict_depth(probe, feat, fH, fW):
     """Predict depth from feature using probe."""
     C = feat.shape[0]
     if feat.shape[1:] != (fH, fW):
-        feat = F.interpolate(feat[None].to(device), (fH, fW), mode="bilinear", align_corners=False).squeeze(0)
+        feat = F.interpolate(feat[None].to(probe_device), (fH, fW), mode="bilinear", align_corners=False).squeeze(0)
     else:
-        feat = feat.to(device)
+        feat = feat.to(probe_device)
     with torch.no_grad():
         pred = probe(feat.reshape(C, -1).T).squeeze().reshape(fH, fW)
     return pred.cpu().numpy()
@@ -498,9 +550,9 @@ def predict_seg(probe, feat, fH, fW, contiguous_to_id=None):
     """Predict segmentation from feature using probe (low-res, for metrics)."""
     C = feat.shape[0]
     if feat.shape[1:] != (fH, fW):
-        feat = F.interpolate(feat[None].to(device), (fH, fW), mode="bilinear", align_corners=False).squeeze(0)
+        feat = F.interpolate(feat[None].to(probe_device), (fH, fW), mode="bilinear", align_corners=False).squeeze(0)
     else:
-        feat = feat.to(device)
+        feat = feat.to(probe_device)
     with torch.no_grad():
         pred = probe(feat.reshape(C, -1).T).argmax(1).reshape(fH, fW)
     return _restore_original_seg_ids(pred.cpu().numpy(), contiguous_to_id)
@@ -514,9 +566,9 @@ def predict_seg_smooth(probe, feat, fH, fW, target_h, target_w, contiguous_to_id
     """
     C = feat.shape[0]
     if feat.shape[1:] != (fH, fW):
-        feat = F.interpolate(feat[None].to(device), (fH, fW), mode="bilinear", align_corners=False).squeeze(0)
+        feat = F.interpolate(feat[None].to(probe_device), (fH, fW), mode="bilinear", align_corners=False).squeeze(0)
     else:
-        feat = feat.to(device)
+        feat = feat.to(probe_device)
     with torch.no_grad():
         logits = probe(feat.reshape(C, -1).T)  # [fH*fW, n_classes]
         n_classes = logits.shape[1]
@@ -548,17 +600,22 @@ def train_depth_probe_paths(features, depth_paths, fH, fW):
         train_X.append(feat.reshape(C, -1).T[valid.reshape(-1)])
         train_Y.append(d.reshape(-1)[valid.reshape(-1)])
 
-    train_X = torch.cat(train_X, 0).to(device)
-    train_Y = torch.cat(train_Y, 0).to(device)
+    train_X = torch.cat(train_X, 0).to(probe_device)
+    train_Y = torch.cat(train_Y, 0).to(probe_device)
     probe = _build_probe(train_X.shape[1], 1)
     return _train_probe(probe, train_X, train_Y, epochs=300, task="regression")
 
 
-def train_fused_depth_probe_paths(features, geom_depths, depth_paths, fH, fW):
+def train_fused_depth_probe_paths(features, geom_depths, geom_alphas, depth_paths, fH, fW):
     """Train a learned depth-fusion probe and return the full fusion bundle."""
     depth_probe = train_depth_probe_paths(features, depth_paths, fH, fW)
     train_input, train_feat_depth, train_geom_depth, train_geom_valid, train_Y = [], [], [], [], []
-    for feat, geom, dpath in zip(features, geom_depths, depth_paths):
+    fusion_train_pixel_budget = 100_000
+    per_frame_budget = max(256, fusion_train_pixel_budget // max(1, len(depth_paths)))
+    fusion_sample_gen = torch.Generator(device="cpu").manual_seed(42)
+    if probe_device.type == "cuda":
+        torch.cuda.empty_cache()
+    for feat, geom, alpha, dpath in zip(features, geom_depths, geom_alphas, depth_paths):
         dpath = Path(dpath)
         if geom is None or not dpath.exists():
             continue
@@ -567,24 +624,34 @@ def train_fused_depth_probe_paths(features, geom_depths, depth_paths, fH, fW):
             continue
         d = torch.from_numpy(d.astype(np.float32) / 1000.0)
         d = F.interpolate(d[None, None], (fH, fW), mode="bilinear", align_corners=False).squeeze()
-        valid = d > 0.01
-        if valid.sum() < 10:
+        sample = prepare_depth_fusion_sample(
+            feat, geom, alpha, depth_probe, fH, fW, probe_device, output_device="cpu"
+        )
+        train_sample = sample_depth_fusion_training_pixels(
+            sample,
+            d,
+            max_samples=per_frame_budget,
+            generator=fusion_sample_gen,
+        )
+        if train_sample is None:
             continue
-        sample = prepare_depth_fusion_sample(feat, geom, depth_probe, fH, fW, device)
-        valid_flat = valid.reshape(-1)
-        train_input.append(sample["input_flat"][valid_flat])
-        train_feat_depth.append(sample["feat_depth_flat"][valid_flat])
-        train_geom_depth.append(sample["geom_depth_flat"][valid_flat])
-        train_geom_valid.append(sample["geom_valid_flat"][valid_flat])
-        train_Y.append(d.reshape(-1)[valid_flat])
+        train_input.append(train_sample["input_flat"])
+        train_feat_depth.append(train_sample["feat_depth_flat"])
+        train_geom_depth.append(train_sample["geom_depth_flat"])
+        train_geom_valid.append(train_sample["geom_valid_flat"])
+        train_Y.append(train_sample["targets"])
 
+    if probe_device.type == "cuda":
+        torch.cuda.empty_cache()
+    if not train_input:
+        raise RuntimeError("No valid samples collected for fused depth probe training.")
     fusion_probe = train_depth_fusion_probe(
-        torch.cat(train_input, 0).to(device),
-        torch.cat(train_feat_depth, 0).to(device),
-        torch.cat(train_geom_depth, 0).to(device),
-        torch.cat(train_geom_valid, 0).to(device),
-        torch.cat(train_Y, 0).to(device),
-        device,
+        torch.cat(train_input, 0),
+        torch.cat(train_feat_depth, 0),
+        torch.cat(train_geom_depth, 0),
+        torch.cat(train_geom_valid, 0),
+        torch.cat(train_Y, 0),
+        probe_device,
         epochs=300,
     )
     return {"depth_probe": depth_probe, "fusion_probe": fusion_probe}
@@ -608,32 +675,33 @@ def train_seg_probe_paths(features, sem_paths, fH, fW):
         train_X.append(feat.reshape(C, -1).T)
         train_Y.append(sem.reshape(-1))
 
-    train_X = torch.cat(train_X, 0).to(device)
-    train_Y = torch.cat(train_Y, 0).to(device)
+    train_X = torch.cat(train_X, 0).to(probe_device)
+    train_Y = torch.cat(train_Y, 0).to(probe_device)
     unique_classes = torch.unique(train_Y).tolist()
     id_to_contiguous = {c: i for i, c in enumerate(unique_classes)}
     contiguous_to_id = {i: c for c, i in id_to_contiguous.items()}
     train_Y = torch.tensor([id_to_contiguous[y.item()] for y in train_Y],
-                           dtype=torch.long, device=device)
+                           dtype=torch.long, device=probe_device)
     n_classes = len(unique_classes)
     counts = torch.bincount(train_Y, minlength=n_classes).float().clamp(min=1)
     weights = (1.0 / counts)
-    weights = (weights / weights.sum() * n_classes).to(device)
+    weights = (weights / weights.sum() * n_classes).to(probe_device)
     probe = _build_probe(train_X.shape[1], n_classes)
     probe = _train_probe(probe, train_X, train_Y, epochs=500, task="classification",
                          class_weights=weights)
     return probe, id_to_contiguous, contiguous_to_id
 
 
-def predict_fused_depth(probe, feat, geom_depth, fH, fW):
+def predict_fused_depth(probe, feat, geom_depth, geom_alpha, fH, fW):
     """Predict depth using the learned aligned-geometry fusion bundle."""
     sample = prepare_depth_fusion_sample(
         feat,
         geom_depth,
+        geom_alpha,
         probe["depth_probe"],
         fH,
         fW,
-        device,
+        probe_device,
     )
     pred = predict_depth_fusion(probe["fusion_probe"], sample, fH, fW)["depth"]
     return pred.cpu().numpy()
@@ -641,11 +709,13 @@ def predict_fused_depth(probe, feat, geom_depth, fH, fW):
 
 # ── SigLIP2 grounding ────────────────────────────────────────────────────────
 
-def load_siglip2_projection(projection_weights):
+def load_siglip2_projection(projection_weights, target_device=None):
     """Load SigLIP2 feature projection model.
 
     Handles both standalone projection weights and full RADIO checkpoint files.
     """
+    target_device = target_device or device
+    target_dtype = inference_dtype(target_device)
     from timm.models.vision_transformer import Block
 
     class SigLIP2FeatureProjection(nn.Module):
@@ -681,7 +751,7 @@ def load_siglip2_projection(projection_weights):
         proj.load_state_dict(proj_sd)
     else:
         proj.load_state_dict(ckpt)
-    return proj.to(device).half().eval()
+    return proj.to(target_device, dtype=target_dtype).eval()
 
 
 def load_text_embedding_candidates(text_emb_path):
@@ -724,13 +794,19 @@ def select_scene_text_embeddings(
     fH,
     fW,
     max_frames=32,
+    target_device=None,
 ):
     """Pick the best embedding bank per query using training GT features/semantics."""
+    target_device = target_device or device
+    target_dtype = inference_dtype(target_device)
     if not candidates:
         raise ValueError("No text embedding candidates were loaded")
     if len(candidates) == 1:
         name, bank = candidates[0]
-        return torch.stack([bank[q] for q in active_queries]).to(device).half(), {q: name for q in active_queries}
+        return (
+            torch.stack([bank[q] for q in active_queries]).to(target_device, dtype=torch.float32),
+            {q: name for q in active_queries},
+        )
 
     projected_feats = []
     projected_sems = []
@@ -738,12 +814,12 @@ def select_scene_text_embeddings(
         sem = cv2.imread(str(spath), cv2.IMREAD_GRAYSCALE)
         if sem is None:
             continue
-        sem = cv2.resize(sem, (fW, fH), interpolation=cv2.INTER_NEAREST)
-        feat_b = feat.unsqueeze(0).to(device)
+        feat_b = feat.unsqueeze(0).to(target_device, dtype=target_dtype)
         B, C, H, W = feat_b.shape
+        sem = cv2.resize(sem, (W, H), interpolation=cv2.INTER_NEAREST)
         feat_flat = feat_b.reshape(B, C, H * W).permute(0, 2, 1)
         with torch.no_grad():
-            siglip = proj_model(feat_flat.half())
+            siglip = proj_model(feat_flat)
         siglip = F.normalize(siglip.float().squeeze(0), dim=-1)  # [HW, 1536]
         projected_feats.append(siglip)
         projected_sems.append(sem.reshape(-1))
@@ -757,13 +833,13 @@ def select_scene_text_embeddings(
         for name, bank in candidates:
             if query not in bank:
                 continue
-            emb = bank[query].to(device)
+            emb = bank[query].to(target_device, dtype=torch.float32)
             margins = []
             for siglip, sem_flat in zip(projected_feats, projected_sems):
                 pos_mask = sem_flat == cid
                 if pos_mask.sum() < 10:
                     continue
-                pos_mask_t = torch.from_numpy(pos_mask).to(device)
+                pos_mask_t = torch.from_numpy(pos_mask).to(target_device)
                 sim = siglip @ emb
                 margins.append((sim[pos_mask_t].mean() - sim[~pos_mask_t].mean()).item())
             score = float(np.mean(margins)) if margins else -float("inf")
@@ -773,14 +849,14 @@ def select_scene_text_embeddings(
                 best_emb = emb
         if best_emb is None:
             best_name, bank = candidates[0]
-            best_emb = bank[query].to(device)
+            best_emb = bank[query].to(target_device, dtype=torch.float32)
         selected_embeddings.append(best_emb)
         selected_sources[query] = f"{best_name} ({best_score:.4f})"
 
-    return torch.stack(selected_embeddings).to(device).half(), selected_sources
+    return torch.stack(selected_embeddings).to(target_device, dtype=torch.float32), selected_sources
 
 
-def compute_grounding_heatmaps(features_1280, proj_model, text_emb, temperature=1.0):
+def compute_grounding_heatmaps(features_1280, proj_model, text_emb, temperature=1.0, target_device=None):
     """Compute text grounding heatmaps with cosine-softmax normalization.
 
     Args:
@@ -793,10 +869,14 @@ def compute_grounding_heatmaps(features_1280, proj_model, text_emb, temperature=
         raw_sim: [K, H, W] raw cosine similarity heatmaps
         probs:   [K, H, W] softmax-normalized probabilities across queries
     """
+    target_device = target_device or device
+    target_dtype = inference_dtype(target_device)
+    features_1280 = features_1280.to(target_device, dtype=target_dtype)
+    text_emb = text_emb.to(target_device, dtype=target_dtype)
     B, C, H, W = features_1280.shape
     feat_flat = features_1280.reshape(B, C, H * W).permute(0, 2, 1)
     with torch.no_grad():
-        siglip = proj_model(feat_flat.half())
+        siglip = proj_model(feat_flat)
     siglip = F.normalize(siglip.float(), dim=-1).squeeze(0)  # [HW, 1536]
 
     # Raw cosine similarity (ensure float32 for both operands)
@@ -859,6 +939,23 @@ def extract_geom_depth_np(geom_depth, alpha_map, fH=None, fW=None):
     return d_filtered
 
 
+def extract_alpha_np(alpha_map, fH=None, fW=None):
+    """Convert a geometry alpha map to numpy [fH, fW]."""
+    if alpha_map is None:
+        return None
+    a = alpha_map
+    if isinstance(a, torch.Tensor):
+        a = a.detach().cpu()
+        if a.dim() == 4:
+            a = a.squeeze(0).squeeze(0)
+        elif a.dim() == 3:
+            a = a.squeeze(0)
+        a = a.float().numpy()
+    if fH is not None and fW is not None and a.shape != (fH, fW):
+        a = cv2.resize(a, (fW, fH), interpolation=cv2.INTER_LINEAR)
+    return np.clip(a.astype(np.float32), 0.0, 1.0)
+
+
 def align_depth_scale_shift(pred, gt, valid_mask=None):
     """Least-squares scale-shift alignment: gt ≈ scale * pred + shift."""
     if valid_mask is None:
@@ -877,6 +974,7 @@ def align_depth_scale_shift(pred, gt, valid_mask=None):
 # ── Main visualization ────────────────────────────────────────────────────────
 
 def main():
+    global probe_device
     parser = argparse.ArgumentParser(description="RADIO-GS Visualization v2")
     parser.add_argument("--config", required=True)
     parser.add_argument("--checkpoint", required=True)
@@ -895,9 +993,15 @@ def main():
                         default=list(GROUNDING_QUERY_CLASS_IDS.keys()))
     parser.add_argument("--grounding_seg_threshold", type=float, default=0.35,
                         help="Confidence threshold for text-derived grounding masks")
+    parser.add_argument("--grounding_device", choices=["cpu", "cuda"], default="cpu",
+                        help="Device for qualitative grounding visualization")
+    parser.add_argument("--probe_device", choices=["cpu", "cuda"], default="cpu",
+                        help="Device for visualization probe training/prediction")
     args = parser.parse_args()
 
     S = args.scale
+    grounding_device = torch.device(args.grounding_device)
+    probe_device = torch.device(args.probe_device)
     out_root = Path(args.output_dir)
 
     # Create output subdirectories
@@ -917,6 +1021,10 @@ def main():
     scene_root = Path("dataset") / scene
     train_split = getattr(config, "train_split", "Sequence_1")
     val_split = getattr(config, "val_split", "Sequence_2")
+    train_feat_dir = resolve_split_feature_dir(config, "train")
+    val_feat_dir = resolve_split_feature_dir(config, "val")
+    train_feat_root = train_feat_dir / "backbone" if (train_feat_dir / "backbone").exists() else train_feat_dir
+    val_feat_root = val_feat_dir / "backbone" if (val_feat_dir / "backbone").exists() else val_feat_dir
     fH = getattr(config, "feature_height", 30)
     fW = getattr(config, "feature_width", 40)
     imgH = getattr(config, "image_height", 480)
@@ -985,8 +1093,9 @@ def main():
         """Get GT feature path for visualization frame j."""
         if mixed_split:
             seq, fidx = vis_seq_frame[j]
-            return Path(f"output/radio_features_1280d/{scene}/{seq}/backbone") / f"rgb_{fidx}.pt"
-        return Path(f"output/radio_features_1280d/{scene}/{val_split}/backbone") / f"rgb_{vis_indices[j]}.pt"
+            feat_root = train_feat_root if seq == train_split else val_feat_root
+            return feat_root / f"rgb_{fidx}.pt"
+        return val_feat_root / f"rgb_{vis_indices[j]}.pt"
 
     def get_vis_rgb_path(j):
         """Get RGB image path for visualization frame j."""
@@ -1043,6 +1152,7 @@ def main():
     gt_feats, rend_feats = [], []
     geom_depths = []        # full-resolution geometry depth from 3DGS per vis frame
     geom_depths_lowres = [] # feature-resolution geometry depth for fusion
+    geom_alphas_lowres = []
     with torch.no_grad():
         for j in tqdm(range(n_vis), desc="Rendering"):
             gt_path = get_vis_gt_feat_path(j)
@@ -1072,6 +1182,8 @@ def main():
             rend_feats.append(decoded.squeeze(0).cpu())
             geom_depths_lowres.append(
                 extract_geom_depth_np(geom_depth, alpha_map, fH, fW))
+            geom_alphas_lowres.append(
+                extract_alpha_np(alpha_map, fH, fW))
             geom_full = geom_renderer.render_rgb(model, pose.squeeze(0))
             geom_depths.append(
                 extract_geom_depth_np(geom_full["depth"], geom_full["alpha"]))
@@ -1100,16 +1212,18 @@ def main():
     # Render training features
     train_gt_feats, train_rend_feats = [], []
     train_geom_depths_lowres = []
+    train_geom_alphas_lowres = []
 
     print(f"  Rendering {n_train_use} training features...")
     with torch.no_grad():
         for j in tqdm(range(n_train_use), desc="Train render", leave=False):
             if mixed_split:
                 seq, fidx = train_seq_frame[j]
-                gt_path = Path(f"output/radio_features_1280d/{scene}/{seq}/backbone") / f"rgb_{fidx}.pt"
+                feat_root = train_feat_root if seq == train_split else val_feat_root
+                gt_path = feat_root / f"rgb_{fidx}.pt"
                 w2c = _get_w2c(seq, fidx)
             else:
-                gt_path = Path(f"output/radio_features_1280d/{scene}/{train_split}/backbone") / f"rgb_{train_indices[j]}.pt"
+                gt_path = train_feat_root / f"rgb_{train_indices[j]}.pt"
                 w2c = train_w2c_all[train_indices[j]]
             gt = torch.load(str(gt_path), map_location="cpu").float()
             if gt.dim() == 2:
@@ -1135,6 +1249,8 @@ def main():
             train_rend_feats.append(decoded.squeeze(0).cpu())
             train_geom_depths_lowres.append(
                 extract_geom_depth_np(geom_depth, alpha_map, fH, fW))
+            train_geom_alphas_lowres.append(
+                extract_alpha_np(alpha_map, fH, fW))
 
     # Train probes using path-based loaders (compatible with mixed_split)
     print("  Training oracle depth probe...")
@@ -1146,7 +1262,8 @@ def main():
     rend_depth_probe = train_depth_probe_paths(train_rend_feats, train_depth_paths, fH, fW)
     print("  Training fused depth probe...")
     fused_depth_probe = train_fused_depth_probe_paths(
-        train_rend_feats, train_geom_depths_lowres, train_depth_paths, fH, fW)
+        train_rend_feats, train_geom_depths_lowres, train_geom_alphas_lowres,
+        train_depth_paths, fH, fW)
     print("  Training rendered segmentation probe...")
     rend_seg_probe, rend_seg_id_to_contig, rend_seg_contig_to_id = train_seg_probe_paths(
         train_rend_feats, train_sem_paths, fH, fW)
@@ -1163,7 +1280,8 @@ def main():
         rend_depth_preds.append(predict_depth(rend_depth_probe, rend_feats[j], fH, fW))
         fused_depth_preds.append(
             predict_fused_depth(
-                fused_depth_probe, rend_feats[j], geom_depths_lowres[j], fH, fW)
+                fused_depth_probe, rend_feats[j], geom_depths_lowres[j],
+                geom_alphas_lowres[j], fH, fW)
         )
         oracle_seg_preds_hr.append(
             predict_seg_smooth(
@@ -1177,6 +1295,18 @@ def main():
                 contiguous_to_id=rend_seg_contig_to_id,
             )
         )
+
+    if device.type == "cuda":
+        for module in [
+            model, codec, renderer, geom_renderer, sharpener, refiner,
+            oracle_depth_probe, rend_depth_probe, fused_depth_probe,
+            oracle_seg_probe, rend_seg_probe,
+        ]:
+            if isinstance(module, nn.Module):
+                module.to("cpu")
+        gc.collect()
+        torch.cuda.empty_cache()
+        print("  Released feature-field/probe GPU state before CPU-heavy visualization stages")
 
     # ── Step 3: Feature PCA visualization ────────────────────────────────────
     print("\n[3/7] Generating feature PCA visualizations...")
@@ -1425,7 +1555,7 @@ def main():
         all_queries = sorted({q for _, bank in candidate_banks for q in bank.keys()})
         query_to_idx = {q: i for i, q in enumerate(all_queries)}
 
-        proj_model = load_siglip2_projection(str(proj_path))
+        proj_model = load_siglip2_projection(str(proj_path), grounding_device)
 
         scene_present_ids = set()
         for spath in train_sem_paths[: min(len(train_sem_paths), 64)]:
@@ -1460,6 +1590,7 @@ def main():
                 active_query_cids,
                 fH,
                 fW,
+                target_device=grounding_device,
             )
             print("  Selected text embeddings:")
             for q in active_queries:
@@ -1479,13 +1610,13 @@ def main():
         for j in range(n_vis):
             if not active_queries:
                 break
-            gt_f = gt_feats[j].unsqueeze(0).to(device)
-            rend_f = rend_feats[j].unsqueeze(0).to(device)
+            gt_f = gt_feats[j].unsqueeze(0)
+            rend_f = rend_feats[j].unsqueeze(0)
 
             gt_raw, gt_probs = compute_grounding_heatmaps(
-                gt_f, proj_model, active_text_emb)
+                gt_f, proj_model, active_text_emb, target_device=grounding_device)
             rend_raw, rend_probs = compute_grounding_heatmaps(
-                rend_f, proj_model, active_text_emb)
+                rend_f, proj_model, active_text_emb, target_device=grounding_device)
             rend_probs_np = rend_probs.cpu().numpy()
 
             # Load semantic GT for mask overlay

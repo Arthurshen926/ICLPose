@@ -15,15 +15,35 @@ from tqdm import tqdm
 
 sys.path.insert(0, '.')
 from radio_gs.config import load_config
+from radio_gs.data.benchmark_paths import (
+    list_feature_paths,
+    load_w2c_from_pose_dir,
+    load_w2c_from_pose_file,
+    resolve_dataset_type,
+    resolve_depth_path,
+    resolve_rgb_path,
+    resolve_scene_root,
+    resolve_semantics_path,
+    resolve_split_data_dir,
+    resolve_split_feature_dir,
+    resolve_split_frame_ids,
+    resolve_split_pose_source,
+)
 from radio_gs.models.explicit_gaussian import ExplicitFeatureGaussian
 from radio_gs.models.depth_fusion import (
     predict_depth_fusion,
     prepare_depth_fusion_sample,
+    sample_depth_fusion_training_pixels,
     train_depth_fusion_probe,
 )
 from radio_gs.models.hcd_codec import HCDCodec
 from radio_gs.models.featsharp_3d import FeatSharp3D
-from radio_gs.models.screen_refiner import ScreenSpaceRefiner
+from radio_gs.models.screen_refiner import (
+    ScreenSpaceRefiner,
+    build_depth_guide,
+    build_refiner_guide,
+    compute_refiner_extra_channels,
+)
 from radio_gs.rendering.feature_renderer import FeatureFieldRenderer
 
 device = torch.device("cuda")
@@ -42,16 +62,20 @@ def _train_probe(probe, train_X, train_Y, epochs=300, batch_size=16384,
                  lr=1e-3, task="regression", class_weights=None):
     """Train probe with mini-batch SGD. task='regression' or 'classification'."""
     probe.to(device).train()
+    if class_weights is not None:
+        class_weights = class_weights.to(device)
     opt = torch.optim.Adam(probe.parameters(), lr=lr, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
     n = train_X.shape[0]
     for ep in range(epochs):
         idx = torch.randint(0, n, (min(batch_size, n),))
-        pred = probe(train_X[idx])
+        batch_X = train_X[idx].to(device)
+        batch_Y = train_Y[idx].to(device)
+        pred = probe(batch_X)
         if task == "regression":
-            loss = F.l1_loss(pred.squeeze(), train_Y[idx])
+            loss = F.l1_loss(pred.squeeze(), batch_Y)
         else:
-            loss = F.cross_entropy(pred, train_Y[idx], weight=class_weights)
+            loss = F.cross_entropy(pred, batch_Y, weight=class_weights)
         opt.zero_grad()
         loss.backward()
         opt.step()
@@ -80,6 +104,19 @@ def load_model_and_render(config_path, checkpoint_path):
             log2_hashmap_size=getattr(config, "hash_log2_size", 19),
             base_resolution=getattr(config, "hash_base_resolution", 16),
             max_resolution=getattr(config, "hash_max_resolution", 2048),
+            decoupled_heads=getattr(config, "hybrid_decoupled_heads", False),
+            use_semantic_adaptor=getattr(config, "hybrid_semantic_adaptor", False),
+            semantic_adaptor_mode=getattr(config, "hybrid_semantic_adaptor_mode", "confidence"),
+            semantic_adaptor_hidden_dim=getattr(config, "hybrid_semantic_adaptor_hidden_dim", 64),
+            semantic_adaptor_use_geometry_guidance=getattr(
+                config, "hybrid_semantic_adaptor_use_geometry_guidance", True
+            ),
+            semantic_adaptor_use_depth_guidance=getattr(
+                config, "hybrid_semantic_adaptor_use_depth_guidance", False
+            ),
+            semantic_adaptor_residual=getattr(
+                config, "hybrid_semantic_adaptor_residual", True
+            ),
         )
     else:
         latent_dim = getattr(config, "latent_dim", 64)
@@ -119,11 +156,13 @@ def load_model_and_render(config_path, checkpoint_path):
     depth_guide_enabled = getattr(config, "refiner_depth_guide", False)
     depth_grad_enabled = getattr(config, "refiner_depth_grad", False)
     if getattr(config, "use_refiner", False):
-        extra_ch = 0
-        if rgb_guide_enabled:
-            extra_ch += 3
-        if depth_guide_enabled:
-            extra_ch += 3 if depth_grad_enabled else 1
+        extra_ch = compute_refiner_extra_channels(
+            rgb_guide=rgb_guide_enabled,
+            depth_guide=depth_guide_enabled,
+            depth_grad=depth_grad_enabled,
+            alpha_guide=getattr(config, "refiner_alpha_guide", False),
+            boundary_guide=getattr(config, "refiner_boundary_guide", False),
+        )
         # Detect norm type: if checkpoint has BN keys (running_mean), use "bn"
         norm_type = getattr(config, "refiner_norm_type", "gn")
         refiner = ScreenSpaceRefiner(
@@ -147,11 +186,13 @@ def load_model_and_render(config_path, checkpoint_path):
     return model, codec, renderer, sharpener, refiner, config, is_hybrid
 
 
-def _load_rgb_guide(rgb_dir, idx, feature_size):
+def _load_rgb_guide(rgb_dir, idx, feature_size, dataset_type="replica"):
     """Load and resize an RGB image as a refiner guide tensor."""
     if rgb_dir is None:
         return None
-    rgb_path = Path(rgb_dir) / f"rgb_{idx}.png"
+    rgb_path = resolve_rgb_path(rgb_dir, idx, dataset_type)
+    if rgb_path is None:
+        return None
     if not rgb_path.exists():
         return None
     img = cv2.imread(str(rgb_path))
@@ -178,20 +219,25 @@ def _render_fullres_depth(model, fullres_renderer, viewmat):
         return result["depth"]  # [H_full, W_full]
 
 
-def _build_depth_guide(render_result, depth_grad=False):
-    """Build depth guide (1ch or 3ch with gradients) from render result."""
-    depth = render_result["depth_map"]  # [B, H, W]
-    depth = depth.unsqueeze(1)           # [B, 1, H, W]
-    dmin = depth.amin(dim=(2, 3), keepdim=True)
-    dmax = depth.amax(dim=(2, 3), keepdim=True)
-    depth = (depth - dmin) / (dmax - dmin + 1e-6)
-    if depth_grad:
-        dx = depth[:, :, :, 1:] - depth[:, :, :, :-1]
-        dy = depth[:, :, 1:, :] - depth[:, :, :-1, :]
-        dx = F.pad(dx, (0, 1, 0, 0)) * 10.0
-        dy = F.pad(dy, (0, 0, 0, 1)) * 10.0
-        return torch.cat([depth, dx, dy], dim=1)  # [B, 3, H, W]
-    return depth  # [B, 1, H, W]
+def _build_depth_guide(render_result, depth_grad=False, grad_scale=10.0):
+    """Backwards-compatible wrapper for shared depth-guide logic."""
+    return build_depth_guide(
+        render_result["depth_map"],
+        depth_grad=depth_grad,
+        grad_scale=grad_scale,
+    )
+
+
+def _build_refiner_guide(render_result, config, rgb_guide=None):
+    return build_refiner_guide(
+        render_result,
+        rgb_guide=rgb_guide,
+        use_depth_guide=getattr(config, "refiner_depth_guide", False),
+        use_depth_grad=getattr(config, "refiner_depth_grad", False),
+        depth_grad_scale=getattr(config, "refiner_depth_grad_scale", 10.0),
+        use_alpha_guide=getattr(config, "refiner_alpha_guide", False),
+        use_boundary_guide=getattr(config, "refiner_boundary_guide", False),
+    )
 
 
 def _hybrid_decode(model, rendered, result, pose_w2c, K):
@@ -214,13 +260,17 @@ def _hybrid_decode(model, rendered, result, pose_w2c, K):
     hi = xyz.max(dim=0).values + margin
     extent = (hi - lo).clamp(min=1e-6)
     position_map = ((position_map - lo.view(1, 3, 1, 1)) / extent.view(1, 3, 1, 1)).clamp(0, 1)
-    return model.decode_screen_space(rendered.float(), position_map)
+    return model.decode_screen_space(
+        rendered.float(),
+        position_map,
+        depth_map=depth_map,
+    )
 
 
 def render_decoded_features(model, codec, renderer, sharpener, pose_file,
                             refiner=None, rgb_dir=None, feature_size=None,
                             depth_guide=False, depth_grad=False,
-                            is_hybrid=False):
+                            is_hybrid=False, dataset_type="replica", config=None):
     """Render and decode features for all frames."""
     poses = np.loadtxt(pose_file).reshape(-1, 4, 4).astype(np.float32)
     w2c = np.linalg.inv(poses)
@@ -234,15 +284,18 @@ def render_decoded_features(model, codec, renderer, sharpener, pose_file,
             if refiner is not None:
                 guide = None
                 if rgb_dir is not None and feature_size is not None:
-                    guide = _load_rgb_guide(rgb_dir, i, feature_size)
+                    guide = _load_rgb_guide(rgb_dir, i, feature_size, dataset_type=dataset_type)
                     if guide is not None:
                         guide = guide.to(device)
-                if depth_guide:
-                    dguide = _build_depth_guide(result, depth_grad)
-                    if guide is not None:
-                        guide = torch.cat([guide, dguide], dim=1)
-                    else:
-                        guide = dguide
+                if config is not None and (
+                    depth_guide
+                    or getattr(config, "refiner_alpha_guide", False)
+                    or getattr(config, "refiner_boundary_guide", False)
+                ):
+                    guide = _build_refiner_guide(result, config, rgb_guide=guide)
+                elif depth_guide:
+                    dguide = _build_depth_guide(result, depth_grad, 10.0)
+                    guide = torch.cat([guide, dguide], dim=1) if guide is not None else dguide
                 rendered = refiner(rendered, guide=guide)
             if is_hybrid:
                 rendered = _hybrid_decode(model, rendered, result, pose, renderer.K)
@@ -273,8 +326,8 @@ def eval_depth(train_features, train_depth_dir, val_features, val_depth_dir, fH=
         train_X.append(feat.reshape(C, -1).T[valid.reshape(-1)])
         train_Y.append(d.reshape(-1)[valid.reshape(-1)])
     
-    train_X = torch.cat(train_X, 0).to(device)
-    train_Y = torch.cat(train_Y, 0).to(device)
+    train_X = torch.cat(train_X, 0)
+    train_Y = torch.cat(train_Y, 0)
     
     probe = _build_probe(train_X.shape[1], 1)
     _train_probe(probe, train_X, train_Y, epochs=300, task="regression")
@@ -331,15 +384,14 @@ def eval_segmentation(train_features, train_sem_dir, val_features, val_sem_dir, 
         train_X.append(feat.reshape(C, -1).T)
         train_Y.append(sem.reshape(-1))
     
-    train_X = torch.cat(train_X, 0).to(device)
-    train_Y = torch.cat(train_Y, 0).to(device)
+    train_X = torch.cat(train_X, 0)
+    train_Y = torch.cat(train_Y, 0)
     
     # Remap sparse class IDs to contiguous [0, N-1]
     unique_classes = torch.unique(train_Y).tolist()
     id_to_contiguous = {c: i for i, c in enumerate(unique_classes)}
     contiguous_to_id = {i: c for c, i in id_to_contiguous.items()}
-    train_Y = torch.tensor([id_to_contiguous[y.item()] for y in train_Y], 
-                           dtype=torch.long, device=device)
+    train_Y = torch.tensor([id_to_contiguous[y.item()] for y in train_Y], dtype=torch.long)
     n_classes = len(unique_classes)
     print(f"  Seg: {n_classes} active classes (remapped from max_id={max(unique_classes)})")
     
@@ -347,7 +399,7 @@ def eval_segmentation(train_features, train_sem_dir, val_features, val_sem_dir, 
     counts = torch.bincount(train_Y, minlength=n_classes).float()
     counts = counts.clamp(min=1)
     weights = (1.0 / counts)
-    weights = (weights / weights.sum() * n_classes).to(device)
+    weights = (weights / weights.sum() * n_classes)
     
     probe = _build_probe(train_X.shape[1], n_classes)
     _train_probe(probe, train_X, train_Y, epochs=500, task="classification",
@@ -412,8 +464,9 @@ def main():
     print(f"Loading model from {args.checkpoint}...")
     model, codec, renderer, sharpener, refiner, config, is_hybrid = load_model_and_render(args.config, args.checkpoint)
     
+    dataset_type = resolve_dataset_type(config)
     scene = getattr(config, "scene", "room_0")
-    scene_root = Path("dataset") / scene
+    scene_root = resolve_scene_root(config)
     train_split = getattr(config, "train_split", "Sequence_1")
     val_split = getattr(config, "val_split", "Sequence_2")
     
@@ -439,11 +492,13 @@ def main():
         train_rgb_dir = None
         val_rgb_dir = None
     else:
-        train_rgb_dir = str(scene_root / train_split / "rgb") if rgb_guide_enabled else None
-        val_rgb_dir = str(scene_root / val_split / "rgb") if rgb_guide_enabled else None
+        train_rgb_root = resolve_split_data_dir(config, "train", "rgb")
+        val_rgb_root = resolve_split_data_dir(config, "val", "rgb")
+        train_rgb_dir = str(train_rgb_root) if rgb_guide_enabled and train_rgb_root is not None else None
+        val_rgb_dir = str(val_rgb_root) if rgb_guide_enabled and val_rgb_root is not None else None
     
     # Subsample for speed
-    mixed_split = getattr(config, "mixed_split", False)
+    mixed_split = getattr(config, "mixed_split", False) and dataset_type == "replica"
     if mixed_split:
         # Combine both sequences, apply same random split as training
         poses_s1 = np.loadtxt(str(scene_root / train_split / "traj_w_c.txt")).reshape(-1, 4, 4).astype(np.float32)
@@ -501,12 +556,75 @@ def main():
         print(f"\n  Mixed split: total={total}, train={len(train_mixed_sub)} (from {train_size}), "
               f"val={len(val_mixed_sub)} (from {val_size}), seed={mixed_seed}")
     else:
-        train_pose_file = str(scene_root / train_split / "traj_w_c.txt")
-        val_pose_file = str(scene_root / val_split / "traj_w_c.txt")
-        n_train_total = len(np.loadtxt(train_pose_file).reshape(-1, 4, 4))
-        n_val_total = len(np.loadtxt(val_pose_file).reshape(-1, 4, 4))
-        train_indices = list(range(0, n_train_total, max(1, n_train_total // args.n_train)))[:args.n_train]
-        val_indices = list(range(0, n_val_total, max(1, n_val_total // args.n_val)))[:args.n_val]
+        def _collect_split(split_name, n_target):
+            feat_dir = resolve_split_feature_dir(config, split_name)
+            frame_ids = resolve_split_frame_ids(config, split_name)
+            feat_paths_all = list_feature_paths(feat_dir, frame_ids=frame_ids)
+            frame_ids_all = [int(p.stem.split("_")[1]) for p in feat_paths_all]
+            pose_file, pose_dir = resolve_split_pose_source(config, split_name)
+            if pose_dir:
+                w2c_all = load_w2c_from_pose_dir(pose_dir, frame_ids_all)
+            elif pose_file:
+                w2c_all = load_w2c_from_pose_file(pose_file, frame_ids_all)
+            else:
+                raise ValueError(f"No pose source configured for split={split_name}")
+            step = max(1, len(frame_ids_all) // n_target)
+            sel = list(range(0, len(frame_ids_all), step))[:n_target]
+            feat_root = feat_dir / "backbone" if (feat_dir / "backbone").exists() else feat_dir
+            return {
+                "frame_ids": [frame_ids_all[j] for j in sel],
+                "w2c": w2c_all[sel],
+                "feat_dir": feat_root,
+                "depth_dir": resolve_split_data_dir(config, split_name, "depth"),
+                "sem_dir": resolve_split_data_dir(config, split_name, "semantics"),
+                "rgb_dir": resolve_split_data_dir(config, split_name, "rgb"),
+            }
+
+        train_frame_ids_cfg = resolve_split_frame_ids(config, "train")
+        val_frame_ids_cfg = resolve_split_frame_ids(config, "val")
+        if dataset_type != "replica" and train_frame_ids_cfg is None and val_frame_ids_cfg is None:
+            feat_dir = resolve_split_feature_dir(config, "train")
+            feat_paths_all = list_feature_paths(feat_dir)
+            frame_ids_all = [int(p.stem.split("_")[1]) for p in feat_paths_all]
+            pose_file, pose_dir = resolve_split_pose_source(config, "train")
+            if pose_dir:
+                w2c_all = load_w2c_from_pose_dir(pose_dir, frame_ids_all)
+            elif pose_file:
+                w2c_all = load_w2c_from_pose_file(pose_file, frame_ids_all)
+            else:
+                raise ValueError("No pose source configured for generic dataset split")
+            train_ratio = getattr(config, "mixed_train_ratio", 0.8)
+            seed = getattr(config, "mixed_seed", 42)
+            gen = torch.Generator().manual_seed(seed)
+            perm = torch.randperm(len(frame_ids_all), generator=gen).tolist()
+            train_cut = int(train_ratio * len(frame_ids_all))
+            train_sel = sorted(perm[:train_cut])
+            val_sel = sorted(perm[train_cut:])
+
+            def _pack(sel, n_target):
+                step = max(1, len(sel) // n_target)
+                sel_sub = sel[::step][:n_target]
+                feat_root = feat_dir / "backbone" if (feat_dir / "backbone").exists() else feat_dir
+                return {
+                    "frame_ids": [frame_ids_all[j] for j in sel_sub],
+                    "w2c": w2c_all[sel_sub],
+                    "feat_dir": feat_root,
+                    "depth_dir": resolve_split_data_dir(config, "train", "depth"),
+                    "sem_dir": resolve_split_data_dir(config, "train", "semantics"),
+                    "rgb_dir": resolve_split_data_dir(config, "train", "rgb"),
+                }
+
+            train_split_inputs = _pack(train_sel, args.n_train)
+            val_split_inputs = _pack(val_sel, args.n_val)
+        else:
+            train_split_inputs = _collect_split("train", args.n_train)
+            val_split_inputs = _collect_split("val", args.n_val)
+        train_indices = train_split_inputs["frame_ids"]
+        val_indices = val_split_inputs["frame_ids"]
+        train_w2c = train_split_inputs["w2c"]
+        val_w2c = val_split_inputs["w2c"]
+        gt_dir = train_split_inputs["feat_dir"]
+        gt_val_dir = val_split_inputs["feat_dir"]
         train_depth_dir_idx = None
         val_depth_dir_idx = None
         train_sem_dir_idx = None
@@ -548,26 +666,34 @@ def main():
     train_decoded = []
     train_gt_1280 = []
     train_geom_depths = []
+    train_geom_alphas = []
     if not mixed_split:
         gt_dir = Path(f"output/radio_features_1280d/{scene}/{train_split}/backbone")
     
     def _render_one_frame(w2c_mat, frame_idx, gt_feat_path, rgb_dir_for_guide=None):
-        """Render a single frame and return (decoded_feat, gt_1280, geom_depth)."""
+        """Render a single frame and return decoded features plus geometric cues."""
         pose = torch.from_numpy(w2c_mat[np.newaxis]).to(device)
         if self_guided and rgb_guide_enabled:
             result = renderer.render_features_and_rgb(model, pose)
             self_rgb = result["rgb"]
             geom_depth = result.get("geom_depth")
+            geom_alpha = result.get("geom_alpha")
         else:
             result = renderer.render_features_batch(model, pose)
             self_rgb = None
             geom_depth = None
+            geom_alpha = None
         rendered = sharpener(result["feature_map"])
         rgb_d = None
         if geom_depth is None:
             rgb_d = renderer.render_rgb(model, torch.from_numpy(w2c_mat).float().to(device))
             geom_depth = rgb_d["depth"]
+        if geom_alpha is None:
+            if rgb_d is None:
+                rgb_d = renderer.render_rgb(model, torch.from_numpy(w2c_mat).float().to(device))
+            geom_alpha = rgb_d["alpha"]
         geom_depth = geom_depth.squeeze(0).cpu() if geom_depth.dim() == 3 else geom_depth.cpu()
+        geom_alpha = geom_alpha.squeeze(0).cpu() if geom_alpha.dim() == 3 else geom_alpha.cpu()
         if refiner is not None:
             guide = None
             if self_rgb is not None:
@@ -575,20 +701,17 @@ def main():
             elif rgb_renderer is not None:
                 guide = _render_rgb_guide(model, rgb_renderer, pose[0], feature_size)
             elif rgb_dir_for_guide:
-                guide = _load_rgb_guide(rgb_dir_for_guide, frame_idx, feature_size)
+                guide = _load_rgb_guide(rgb_dir_for_guide, frame_idx, feature_size, dataset_type=dataset_type)
                 if guide is not None:
                     guide = guide.to(device)
-            if depth_guide_enabled:
-                if rgb_d is None:
-                    rgb_d = renderer.render_rgb(model, torch.from_numpy(w2c_mat).float().to(device))
-                dguide = _build_depth_guide(result, depth_grad_enabled)
-                guide = torch.cat([guide, dguide], dim=1) if guide is not None else dguide
+            if depth_guide_enabled or getattr(config, "refiner_alpha_guide", False) or getattr(config, "refiner_boundary_guide", False):
+                guide = _build_refiner_guide(result, config, rgb_guide=guide)
             rendered = refiner(rendered, guide=guide)
         if is_hybrid:
             rendered = _hybrid_decode(model, rendered, result, pose, renderer.K)
         decoded = codec.decoder(rendered).squeeze(0).cpu()
         gt_feat = torch.load(gt_feat_path).float()
-        return decoded, gt_feat, geom_depth, result, pose
+        return decoded, gt_feat, geom_depth, geom_alpha, result, pose
     
     print("  Rendering train features...")
     with torch.no_grad():
@@ -599,24 +722,21 @@ def main():
                 gt_path = _get_gt_dir(seq) / f"rgb_{fidx}.pt"
                 rgb_guide_dir = str(scene_root / seq / "rgb") if (rgb_guide_enabled and not use_rendered_rgb) else None
             else:
-                w2c_mat = train_w2c[i]
+                w2c_mat = train_w2c[j]
                 gt_path = gt_dir / f"rgb_{i}.pt"
                 rgb_guide_dir = train_rgb_dir
-            decoded, gt_feat, geom_depth, _, _ = _render_one_frame(w2c_mat, i if not mixed_split else fidx, gt_path, rgb_guide_dir)
+            decoded, gt_feat, geom_depth, geom_alpha, _, _ = _render_one_frame(
+                w2c_mat, i if not mixed_split else fidx, gt_path, rgb_guide_dir)
             train_decoded.append(decoded)
             train_gt_1280.append(gt_feat)
             train_geom_depths.append(geom_depth)
+            train_geom_alphas.append(geom_alpha)
     
     # Render val features
-    if not mixed_split:
-        val_poses_file = str(scene_root / val_split / "traj_w_c.txt")
-        all_val_poses = np.loadtxt(val_poses_file).reshape(-1, 4, 4).astype(np.float32)
-        val_w2c = np.linalg.inv(all_val_poses)
-        gt_val_dir = Path(f"output/radio_features_1280d/{scene}/{val_split}/backbone")
-    
     val_decoded = []
     val_gt_1280 = []
     val_geom_depths = []
+    val_geom_alphas = []
     val_fullres_depths = []
     
     print("  Rendering val features...")
@@ -628,15 +748,16 @@ def main():
                 gt_path = _get_gt_dir(seq) / f"rgb_{fidx}.pt"
                 rgb_guide_dir = str(scene_root / seq / "rgb") if (rgb_guide_enabled and not use_rendered_rgb) else None
             else:
-                w2c_mat = val_w2c[i]
+                w2c_mat = val_w2c[j]
                 gt_path = gt_val_dir / f"rgb_{i}.pt"
                 rgb_guide_dir = val_rgb_dir
             
-            decoded, gt_feat, geom_depth, result, pose = _render_one_frame(
+            decoded, gt_feat, geom_depth, geom_alpha, result, pose = _render_one_frame(
                 w2c_mat, i if not mixed_split else fidx, gt_path, rgb_guide_dir)
             val_decoded.append(decoded)
             val_gt_1280.append(gt_feat)
             val_geom_depths.append(geom_depth)
+            val_geom_alphas.append(geom_alpha)
             # Render full-resolution geometric depth
             fullres_d = _render_fullres_depth(model, fullres_depth_renderer, pose[0])
             val_fullres_depths.append(fullres_d.cpu())
@@ -662,10 +783,16 @@ def main():
     gt_fW = val_gt_1280[0].shape[2] if val_gt_1280 else 40
     
     # Depth dirs (used as fallback when not mixed_split)
-    train_depth = scene_root / train_split / "depth"
-    val_depth = scene_root / val_split / "depth"
-    train_sem = scene_root / train_split / "semantic_class"
-    val_sem = scene_root / val_split / "semantic_class"
+    if mixed_split:
+        train_depth = scene_root / train_split / "depth"
+        val_depth = scene_root / val_split / "depth"
+        train_sem = scene_root / train_split / "semantic_class"
+        val_sem = scene_root / val_split / "semantic_class"
+    else:
+        train_depth = train_split_inputs["depth_dir"]
+        val_depth = val_split_inputs["depth_dir"]
+        train_sem = train_split_inputs["sem_dir"]
+        val_sem = val_split_inputs["sem_dir"]
     
     # ====== Evaluation Mode 1: Oracle (GT features) ======
     print("\n=== ORACLE: Depth (GT features) ===")
@@ -675,70 +802,79 @@ def main():
                                        val_gt_sub, val_indices, val_depth,
                                        fH=gt_fH, fW=gt_fW,
                                        train_dir_idx=train_depth_dir_idx,
-                                       val_dir_idx=val_depth_dir_idx)
+                                       val_dir_idx=val_depth_dir_idx,
+                                       dataset_type=dataset_type)
     print(f"  AbsRel={oracle_depth['depth_abs_rel']:.4f}  RMSE={oracle_depth['depth_rmse']:.4f}  δ<1.25={oracle_depth['depth_delta1']:.4f}")
     
     print("\n=== ORACLE: Segmentation (GT features) ===")
     oracle_seg = eval_seg_indexed(train_gt_sub, train_indices, train_sem,
-                                   val_gt_sub, val_indices, val_sem,
-                                   fH=gt_fH, fW=gt_fW,
-                                   train_dir_idx=train_sem_dir_idx,
-                                   val_dir_idx=val_sem_dir_idx)
+                                    val_gt_sub, val_indices, val_sem,
+                                    fH=gt_fH, fW=gt_fW,
+                                    train_dir_idx=train_sem_dir_idx,
+                                    val_dir_idx=val_sem_dir_idx,
+                                    dataset_type=dataset_type)
     print(f"  mIoU={oracle_seg['seg_mIoU']:.4f}  PixelAcc={oracle_seg['seg_pixel_acc']:.4f}")
     
     # ====== Evaluation Mode 2: Rendered (adapted heads) ======
     print("\n=== RENDERED: Depth (adapted heads) ===")
     rendered_depth = eval_depth_indexed(train_decoded, train_indices, train_depth,
-                                         val_decoded, val_indices, val_depth,
-                                         fH=rend_fH, fW=rend_fW,
-                                         train_dir_idx=train_depth_dir_idx,
-                                         val_dir_idx=val_depth_dir_idx)
+                                          val_decoded, val_indices, val_depth,
+                                          fH=rend_fH, fW=rend_fW,
+                                          train_dir_idx=train_depth_dir_idx,
+                                          val_dir_idx=val_depth_dir_idx,
+                                          dataset_type=dataset_type)
     print(f"  AbsRel={rendered_depth['depth_abs_rel']:.4f}  RMSE={rendered_depth['depth_rmse']:.4f}  δ<1.25={rendered_depth['depth_delta1']:.4f}")
     
     print("\n=== RENDERED: Segmentation (adapted heads) ===")
     rendered_seg = eval_seg_indexed(train_decoded, train_indices, train_sem,
-                                     val_decoded, val_indices, val_sem,
-                                     fH=rend_fH, fW=rend_fW,
-                                     train_dir_idx=train_sem_dir_idx,
-                                     val_dir_idx=val_sem_dir_idx)
+                                      val_decoded, val_indices, val_sem,
+                                      fH=rend_fH, fW=rend_fW,
+                                      train_dir_idx=train_sem_dir_idx,
+                                      val_dir_idx=val_sem_dir_idx,
+                                      dataset_type=dataset_type)
     print(f"  mIoU={rendered_seg['seg_mIoU']:.4f}  PixelAcc={rendered_seg['seg_pixel_acc']:.4f}")
 
     # ====== Evaluation Mode 2b: Geometric depth (scale-shift aligned) ======
     print("\n=== GEOMETRIC: Depth (3DGS rendered, scale-shift aligned, 30x40) ===")
     geom_depth = eval_geom_depth(val_geom_depths, val_indices, val_depth,
                                   fH=rend_fH, fW=rend_fW,
-                                  val_dir_idx=val_depth_dir_idx)
+                                  val_dir_idx=val_depth_dir_idx,
+                                  dataset_type=dataset_type)
     print(f"  AbsRel={geom_depth['depth_abs_rel']:.4f}  RMSE={geom_depth['depth_rmse']:.4f}  δ<1.25={geom_depth['depth_delta1']:.4f}")
 
     print("\n=== GEOMETRIC-HR: Depth (3DGS rendered, scale-shift aligned, full-res) ===")
     geom_hr_depth = eval_fullres_geom_depth(val_fullres_depths, val_indices, val_depth,
-                                             val_dir_idx=val_depth_dir_idx)
+                                             val_dir_idx=val_depth_dir_idx,
+                                             dataset_type=dataset_type)
     print(f"  AbsRel={geom_hr_depth['depth_abs_rel']:.4f}  RMSE={geom_hr_depth['depth_rmse']:.4f}  δ<1.25={geom_hr_depth['depth_delta1']:.4f}")
 
     # ====== Evaluation Mode 2c: Fused depth (features + geometric) ======
     print("\n=== FUSED: Depth (features + geometric depth) ===")
-    fused_depth = eval_fused_depth(train_decoded, train_geom_depths, train_indices, train_depth,
-                                    val_decoded, val_geom_depths, val_indices, val_depth,
-                                    fH=rend_fH, fW=rend_fW,
-                                    train_dir_idx=train_depth_dir_idx,
-                                    val_dir_idx=val_depth_dir_idx)
+    fused_depth = eval_fused_depth(train_decoded, train_geom_depths, train_geom_alphas, train_indices, train_depth,
+                                     val_decoded, val_geom_depths, val_geom_alphas, val_indices, val_depth,
+                                     fH=rend_fH, fW=rend_fW,
+                                     train_dir_idx=train_depth_dir_idx,
+                                     val_dir_idx=val_depth_dir_idx,
+                                     dataset_type=dataset_type)
     print(f"  AbsRel={fused_depth['depth_abs_rel']:.4f}  RMSE={fused_depth['depth_rmse']:.4f}  δ<1.25={fused_depth['depth_delta1']:.4f}")
     
     # ====== Evaluation Mode 3: Cross (GT-trained heads on rendered) ======
     print("\n=== CROSS: Depth (GT-trained, rendered-eval) ===")
     cross_depth = eval_depth_indexed(train_gt_sub, train_indices, train_depth,
-                                      val_decoded, val_indices, val_depth,
-                                      fH=rend_fH, fW=rend_fW,
-                                      train_dir_idx=train_depth_dir_idx,
-                                      val_dir_idx=val_depth_dir_idx)
+                                       val_decoded, val_indices, val_depth,
+                                       fH=rend_fH, fW=rend_fW,
+                                       train_dir_idx=train_depth_dir_idx,
+                                       val_dir_idx=val_depth_dir_idx,
+                                       dataset_type=dataset_type)
     print(f"  AbsRel={cross_depth['depth_abs_rel']:.4f}  RMSE={cross_depth['depth_rmse']:.4f}  δ<1.25={cross_depth['depth_delta1']:.4f}")
     
     print("\n=== CROSS: Segmentation (GT-trained, rendered-eval) ===")
     cross_seg = eval_seg_indexed(train_gt_sub, train_indices, train_sem,
-                                  val_decoded, val_indices, val_sem,
-                                  fH=rend_fH, fW=rend_fW,
-                                  train_dir_idx=train_sem_dir_idx,
-                                  val_dir_idx=val_sem_dir_idx)
+                                   val_decoded, val_indices, val_sem,
+                                   fH=rend_fH, fW=rend_fW,
+                                   train_dir_idx=train_sem_dir_idx,
+                                   val_dir_idx=val_sem_dir_idx,
+                                   dataset_type=dataset_type)
     print(f"  mIoU={cross_seg['seg_mIoU']:.4f}  PixelAcc={cross_seg['seg_pixel_acc']:.4f}")
 
     # ====== Seg-based Grounding (replaces broken SigLIP2 projection) ======
@@ -747,21 +883,24 @@ def main():
                                      val_gt_sub, val_indices, val_sem,
                                      scene=scene, fH=gt_fH, fW=gt_fW,
                                      train_dir_idx=train_sem_dir_idx,
-                                     val_dir_idx=val_sem_dir_idx)
+                                     val_dir_idx=val_sem_dir_idx,
+                                     dataset_type=dataset_type)
 
     print("\n=== RENDERED: Seg-Grounding (adapted heads) ===")
     rendered_grnd = eval_seg_grounding(train_decoded, train_indices, train_sem,
                                        val_decoded, val_indices, val_sem,
                                        scene=scene, fH=rend_fH, fW=rend_fW,
                                        train_dir_idx=train_sem_dir_idx,
-                                       val_dir_idx=val_sem_dir_idx)
+                                       val_dir_idx=val_sem_dir_idx,
+                                       dataset_type=dataset_type)
 
     print("\n=== CROSS: Seg-Grounding (GT-trained, rendered-eval) ===")
     cross_grnd = eval_seg_grounding(train_gt_sub, train_indices, train_sem,
                                     val_decoded, val_indices, val_sem,
                                     scene=scene, fH=rend_fH, fW=rend_fW,
                                     train_dir_idx=train_sem_dir_idx,
-                                    val_dir_idx=val_sem_dir_idx)
+                                    val_dir_idx=val_sem_dir_idx,
+                                    dataset_type=dataset_type)
 
     # Helper to safely extract grounding metrics
     def _g(d, key, default="   N/A"):
@@ -781,7 +920,7 @@ def main():
 
 
 def eval_depth_indexed(train_feats, train_idx, depth_dir, val_feats, val_idx, val_depth_dir, fH=30, fW=40,
-                       train_dir_idx=None, val_dir_idx=None):
+                       train_dir_idx=None, val_dir_idx=None, dataset_type="replica"):
     """Train linear probe on features for depth and evaluate.
     
     If train_dir_idx / val_dir_idx are provided (lists of (dir_path, frame_idx) tuples),
@@ -792,7 +931,9 @@ def eval_depth_indexed(train_feats, train_idx, depth_dir, val_feats, val_idx, va
 
     train_X, train_Y = [], []
     for feat, (ddir, i) in zip(train_feats, _train_pairs):
-        dpath = Path(ddir) / f"depth_{i}.png"
+        dpath = resolve_depth_path(ddir, i, dataset_type)
+        if dpath is None:
+            continue
         if not dpath.exists():
             continue
         d = cv2.imread(str(dpath), cv2.IMREAD_UNCHANGED)
@@ -809,8 +950,8 @@ def eval_depth_indexed(train_feats, train_idx, depth_dir, val_feats, val_idx, va
         train_X.append(feat.reshape(C, -1).T[valid.reshape(-1)])
         train_Y.append(d.reshape(-1)[valid.reshape(-1)])
     
-    train_X = torch.cat(train_X, 0).to(device)
-    train_Y = torch.cat(train_Y, 0).to(device)
+    train_X = torch.cat(train_X, 0)
+    train_Y = torch.cat(train_Y, 0)
     
     probe = _build_probe(train_X.shape[1], 1)
     _train_probe(probe, train_X, train_Y, epochs=300, task="regression")
@@ -818,7 +959,9 @@ def eval_depth_indexed(train_feats, train_idx, depth_dir, val_feats, val_idx, va
     abs_rels, rmses, delta1s = [], [], []
     with torch.no_grad():
         for feat, (ddir, i) in zip(val_feats, _val_pairs):
-            dpath = Path(ddir) / f"depth_{i}.png"
+            dpath = resolve_depth_path(ddir, i, dataset_type)
+            if dpath is None:
+                continue
             if not dpath.exists():
                 continue
             d = cv2.imread(str(dpath), cv2.IMREAD_UNCHANGED)
@@ -844,7 +987,7 @@ def eval_depth_indexed(train_feats, train_idx, depth_dir, val_feats, val_idx, va
 
 
 def eval_seg_indexed(train_feats, train_idx, sem_dir, val_feats, val_idx, val_sem_dir, fH=30, fW=40,
-                     train_dir_idx=None, val_dir_idx=None):
+                     train_dir_idx=None, val_dir_idx=None, dataset_type="replica"):
     """Train linear probe for segmentation and evaluate.
     
     If train_dir_idx / val_dir_idx are provided (lists of (dir_path, frame_idx) tuples),
@@ -855,7 +998,9 @@ def eval_seg_indexed(train_feats, train_idx, sem_dir, val_feats, val_idx, val_se
 
     train_X, train_Y = [], []
     for feat, (sdir, i) in zip(train_feats, _train_pairs):
-        spath = Path(sdir) / f"semantic_class_{i}.png"
+        spath = resolve_semantics_path(sdir, i, dataset_type)
+        if spath is None:
+            continue
         if not spath.exists():
             continue
         sem = cv2.imread(str(spath), cv2.IMREAD_GRAYSCALE)
@@ -869,20 +1014,19 @@ def eval_seg_indexed(train_feats, train_idx, sem_dir, val_feats, val_idx, val_se
         train_X.append(feat.reshape(C, -1).T)
         train_Y.append(sem.reshape(-1))
     
-    train_X = torch.cat(train_X, 0).to(device)
-    train_Y = torch.cat(train_Y, 0).to(device)
+    train_X = torch.cat(train_X, 0)
+    train_Y = torch.cat(train_Y, 0)
     
     # Remap sparse class IDs to contiguous [0, N-1]
     unique_classes = torch.unique(train_Y).tolist()
     id_to_contiguous = {c: i for i, c in enumerate(unique_classes)}
-    train_Y = torch.tensor([id_to_contiguous[y.item()] for y in train_Y],
-                           dtype=torch.long, device=device)
+    train_Y = torch.tensor([id_to_contiguous[y.item()] for y in train_Y], dtype=torch.long)
     n_classes = len(unique_classes)
     print(f"  Seg: {n_classes} active classes (remapped from max_id={max(unique_classes)})")
     
     counts = torch.bincount(train_Y, minlength=n_classes).float().clamp(min=1)
     weights = (1.0 / counts)
-    weights = (weights / weights.sum() * n_classes).to(device)
+    weights = (weights / weights.sum() * n_classes)
     
     probe = _build_probe(train_X.shape[1], n_classes)
     _train_probe(probe, train_X, train_Y, epochs=500, task="classification",
@@ -891,7 +1035,9 @@ def eval_seg_indexed(train_feats, train_idx, sem_dir, val_feats, val_idx, val_se
     all_preds, all_gts = [], []
     with torch.no_grad():
         for feat, (sdir, i) in zip(val_feats, _val_pairs):
-            spath = Path(sdir) / f"semantic_class_{i}.png"
+            spath = resolve_semantics_path(sdir, i, dataset_type)
+            if spath is None:
+                continue
             if not spath.exists():
                 continue
             sem = cv2.imread(str(spath), cv2.IMREAD_GRAYSCALE)
@@ -930,7 +1076,7 @@ def eval_seg_indexed(train_feats, train_idx, sem_dir, val_feats, val_idx, val_se
 
 def eval_seg_grounding(train_feats, train_idx, sem_dir, val_feats, val_idx, val_sem_dir,
                        scene="room_0", fH=30, fW=40,
-                       train_dir_idx=None, val_dir_idx=None):
+                       train_dir_idx=None, val_dir_idx=None, dataset_type="replica"):
     """Evaluate text grounding using segmentation probe softmax as heatmap.
 
     Instead of projecting to SigLIP2 space and computing cosine similarity
@@ -943,7 +1089,12 @@ def eval_seg_grounding(train_feats, train_idx, sem_dir, val_feats, val_idx, val_
       - mAP: average precision using softmax probability as confidence score
       - Heatmap correlation: Pearson correlation between softmax heatmap and GT binary mask
     """
-    from radio_gs.replica_constants import GROUNDING_QUERIES, REPLICA_CLASSES, ROOM_CLASS_IDS
+    if resolve_dataset_type(dataset_type) == "scannet":
+        from radio_gs.scannet_constants import GROUNDING_QUERIES
+        room_ids = set()
+    else:
+        from radio_gs.replica_constants import GROUNDING_QUERIES, ROOM_CLASS_IDS
+        room_ids = ROOM_CLASS_IDS.get(scene, set())
 
     # ── Train segmentation probe (same as eval_seg_indexed) ──────────────
     _train_pairs = train_dir_idx if train_dir_idx else [(sem_dir, i) for i in train_idx]
@@ -951,7 +1102,9 @@ def eval_seg_grounding(train_feats, train_idx, sem_dir, val_feats, val_idx, val_
 
     train_X, train_Y = [], []
     for feat, (sdir, i) in zip(train_feats, _train_pairs):
-        spath = Path(sdir) / f"semantic_class_{i}.png"
+        spath = resolve_semantics_path(sdir, i, dataset_type)
+        if spath is None:
+            continue
         if not spath.exists():
             continue
         sem = cv2.imread(str(spath), cv2.IMREAD_GRAYSCALE)
@@ -967,26 +1120,24 @@ def eval_seg_grounding(train_feats, train_idx, sem_dir, val_feats, val_idx, val_
         train_X.append(feat.reshape(C, -1).T)
         train_Y.append(sem.reshape(-1))
 
-    train_X = torch.cat(train_X, 0).to(device)
-    train_Y = torch.cat(train_Y, 0).to(device)
+    train_X = torch.cat(train_X, 0)
+    train_Y = torch.cat(train_Y, 0)
 
     unique_classes = torch.unique(train_Y).tolist()
     id_to_contiguous = {c: i for i, c in enumerate(unique_classes)}
     contiguous_to_id = {i: c for c, i in id_to_contiguous.items()}
-    train_Y_mapped = torch.tensor([id_to_contiguous[y.item()] for y in train_Y],
-                                  dtype=torch.long, device=device)
+    train_Y_mapped = torch.tensor([id_to_contiguous[y.item()] for y in train_Y], dtype=torch.long)
     n_classes = len(unique_classes)
 
     counts = torch.bincount(train_Y_mapped, minlength=n_classes).float().clamp(min=1)
     weights = (1.0 / counts)
-    weights = (weights / weights.sum() * n_classes).to(device)
+    weights = (weights / weights.sum() * n_classes)
 
     probe = _build_probe(train_X.shape[1], n_classes)
     _train_probe(probe, train_X, train_Y_mapped, epochs=500, task="classification",
                  class_weights=weights)
 
     # ── Determine active grounding queries for this scene ────────────────
-    room_ids = ROOM_CLASS_IDS.get(scene, set())
     active_queries = {}
     for qname, cid in sorted(GROUNDING_QUERIES.items(), key=lambda x: x[1]):
         if cid in id_to_contiguous and (not room_ids or cid in room_ids):
@@ -1005,7 +1156,9 @@ def eval_seg_grounding(train_feats, train_idx, sem_dir, val_feats, val_idx, val_
 
     with torch.no_grad():
         for feat, (sdir, i) in zip(val_feats, _val_pairs):
-            spath = Path(sdir) / f"semantic_class_{i}.png"
+            spath = resolve_semantics_path(sdir, i, dataset_type)
+            if spath is None:
+                continue
             if not spath.exists():
                 continue
             sem = cv2.imread(str(spath), cv2.IMREAD_GRAYSCALE)
@@ -1094,12 +1247,14 @@ def eval_seg_grounding(train_feats, train_idx, sem_dir, val_feats, val_idx, val_
     }
 
 
-def eval_geom_depth(geom_depths, val_idx, val_depth_dir, fH=30, fW=40, val_dir_idx=None):
+def eval_geom_depth(geom_depths, val_idx, val_depth_dir, fH=30, fW=40, val_dir_idx=None, dataset_type="replica"):
     """Evaluate 3DGS geometric depth directly (with scale-shift alignment)."""
     _val_pairs = val_dir_idx if val_dir_idx else [(val_depth_dir, i) for i in val_idx]
     abs_rels, rmses, delta1s = [], [], []
     for geom, (ddir, i) in zip(geom_depths, _val_pairs):
-        dpath = Path(ddir) / f"depth_{i}.png"
+        dpath = resolve_depth_path(ddir, i, dataset_type)
+        if dpath is None:
+            continue
         if not dpath.exists():
             continue
         d = cv2.imread(str(dpath), cv2.IMREAD_UNCHANGED)
@@ -1125,12 +1280,14 @@ def eval_geom_depth(geom_depths, val_idx, val_depth_dir, fH=30, fW=40, val_dir_i
     return {"depth_abs_rel": np.mean(abs_rels), "depth_rmse": np.mean(rmses), "depth_delta1": np.mean(delta1s)}
 
 
-def eval_fullres_geom_depth(fullres_depths, val_idx, val_depth_dir, val_dir_idx=None):
+def eval_fullres_geom_depth(fullres_depths, val_idx, val_depth_dir, val_dir_idx=None, dataset_type="replica"):
     """Evaluate full-resolution 3DGS geometric depth (scale-shift aligned at native image res)."""
     _val_pairs = val_dir_idx if val_dir_idx else [(val_depth_dir, i) for i in val_idx]
     abs_rels, rmses, delta1s = [], [], []
     for geom, (ddir, i) in zip(fullres_depths, _val_pairs):
-        dpath = Path(ddir) / f"depth_{i}.png"
+        dpath = resolve_depth_path(ddir, i, dataset_type)
+        if dpath is None:
+            continue
         if not dpath.exists():
             continue
         d = cv2.imread(str(dpath), cv2.IMREAD_UNCHANGED)
@@ -1158,9 +1315,9 @@ def eval_fullres_geom_depth(fullres_depths, val_idx, val_depth_dir, val_dir_idx=
     return {"depth_abs_rel": np.mean(abs_rels), "depth_rmse": np.mean(rmses), "depth_delta1": np.mean(delta1s)}
 
 
-def eval_fused_depth(train_feats, train_geom, train_idx, train_depth_dir,
-                     val_feats, val_geom, val_idx, val_depth_dir, fH=30, fW=40,
-                     train_dir_idx=None, val_dir_idx=None):
+def eval_fused_depth(train_feats, train_geom, train_alpha, train_idx, train_depth_dir,
+                     val_feats, val_geom, val_alpha, val_idx, val_depth_dir, fH=30, fW=40,
+                     train_dir_idx=None, val_dir_idx=None, dataset_type="replica"):
     """Train a learned depth-fusion probe on feature and geometric depth cues."""
     print("  Training fused depth probe (aligned geom + learned gating)...")
     _train_pairs = train_dir_idx if train_dir_idx else [(train_depth_dir, i) for i in train_idx]
@@ -1168,7 +1325,9 @@ def eval_fused_depth(train_feats, train_geom, train_idx, train_depth_dir,
 
     depth_train_X, depth_train_Y = [], []
     for feat, (ddir, i) in zip(train_feats, _train_pairs):
-        dpath = Path(ddir) / f"depth_{i}.png"
+        dpath = resolve_depth_path(ddir, i, dataset_type)
+        if dpath is None:
+            continue
         if not dpath.exists():
             continue
         d = cv2.imread(str(dpath), cv2.IMREAD_UNCHANGED)
@@ -1185,14 +1344,21 @@ def eval_fused_depth(train_feats, train_geom, train_idx, train_depth_dir,
         depth_train_X.append(feat.reshape(C, -1).T[valid.reshape(-1)])
         depth_train_Y.append(d.reshape(-1)[valid.reshape(-1)])
 
-    depth_train_X = torch.cat(depth_train_X, 0).to(device)
-    depth_train_Y = torch.cat(depth_train_Y, 0).to(device)
+    depth_train_X = torch.cat(depth_train_X, 0)
+    depth_train_Y = torch.cat(depth_train_Y, 0)
     depth_probe = _build_probe(depth_train_X.shape[1], 1)
     _train_probe(depth_probe, depth_train_X, depth_train_Y, epochs=300, task="regression")
 
     train_input, train_feat_depth, train_geom_depth, train_geom_valid, train_Y = [], [], [], [], []
-    for feat, geom, (ddir, i) in zip(train_feats, train_geom, _train_pairs):
-        dpath = Path(ddir) / f"depth_{i}.png"
+    fusion_train_pixel_budget = 100_000
+    per_frame_budget = max(256, fusion_train_pixel_budget // max(1, len(_train_pairs)))
+    fusion_sample_gen = torch.Generator(device="cpu").manual_seed(42)
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    for feat, geom, alpha, (ddir, i) in zip(train_feats, train_geom, train_alpha, _train_pairs):
+        dpath = resolve_depth_path(ddir, i, dataset_type)
+        if dpath is None:
+            continue
         if not dpath.exists():
             continue
         d = cv2.imread(str(dpath), cv2.IMREAD_UNCHANGED)
@@ -1201,31 +1367,43 @@ def eval_fused_depth(train_feats, train_geom, train_idx, train_depth_dir,
         d = torch.from_numpy(d.astype(np.float32) / 1000.0)
         d = F.interpolate(d.unsqueeze(0).unsqueeze(0), (fH, fW),
                            mode="bilinear", align_corners=False).squeeze()
-        valid = d > 0.01
-        if valid.sum() < 10:
+        sample = prepare_depth_fusion_sample(
+            feat, geom, alpha, depth_probe, fH, fW, device, output_device="cpu"
+        )
+        train_sample = sample_depth_fusion_training_pixels(
+            sample,
+            d,
+            max_samples=per_frame_budget,
+            generator=fusion_sample_gen,
+        )
+        if train_sample is None:
             continue
-        sample = prepare_depth_fusion_sample(feat, geom, depth_probe, fH, fW, device)
-        valid_flat = valid.reshape(-1)
-        train_input.append(sample["input_flat"][valid_flat])
-        train_feat_depth.append(sample["feat_depth_flat"][valid_flat])
-        train_geom_depth.append(sample["geom_depth_flat"][valid_flat])
-        train_geom_valid.append(sample["geom_valid_flat"][valid_flat])
-        train_Y.append(d.reshape(-1)[valid_flat])
+        train_input.append(train_sample["input_flat"])
+        train_feat_depth.append(train_sample["feat_depth_flat"])
+        train_geom_depth.append(train_sample["geom_depth_flat"])
+        train_geom_valid.append(train_sample["geom_valid_flat"])
+        train_Y.append(train_sample["targets"])
 
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    if not train_input:
+        raise RuntimeError("No valid samples collected for fused depth probe training.")
     fusion_probe = train_depth_fusion_probe(
-        torch.cat(train_input, 0).to(device),
-        torch.cat(train_feat_depth, 0).to(device),
-        torch.cat(train_geom_depth, 0).to(device),
-        torch.cat(train_geom_valid, 0).to(device),
-        torch.cat(train_Y, 0).to(device),
+        torch.cat(train_input, 0),
+        torch.cat(train_feat_depth, 0),
+        torch.cat(train_geom_depth, 0),
+        torch.cat(train_geom_valid, 0),
+        torch.cat(train_Y, 0),
         device,
         epochs=300,
     )
 
     abs_rels, rmses, delta1s = [], [], []
     with torch.no_grad():
-        for feat, geom, (ddir, i) in zip(val_feats, val_geom, _val_pairs):
-            dpath = Path(ddir) / f"depth_{i}.png"
+        for feat, geom, alpha, (ddir, i) in zip(val_feats, val_geom, val_alpha, _val_pairs):
+            dpath = resolve_depth_path(ddir, i, dataset_type)
+            if dpath is None:
+                continue
             if not dpath.exists():
                 continue
             d = cv2.imread(str(dpath), cv2.IMREAD_UNCHANGED)
@@ -1237,7 +1415,7 @@ def eval_fused_depth(train_feats, train_geom, train_idx, train_depth_dir,
             valid = d > 0.01
             if valid.sum() < 10:
                 continue
-            sample = prepare_depth_fusion_sample(feat, geom, depth_probe, fH, fW, device)
+            sample = prepare_depth_fusion_sample(feat, geom, alpha, depth_probe, fH, fW, device)
             pred = predict_depth_fusion(fusion_probe, sample, fH, fW)["depth"]
             p, g = pred[valid], d[valid]
             abs_rels.append((torch.abs(p - g) / g).mean().item())

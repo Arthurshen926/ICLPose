@@ -13,6 +13,8 @@ Components:
     HybridFeatureGaussian – full model with frozen geometry + learnable latent/hash/decoders
 """
 
+from __future__ import annotations
+
 import math
 import os
 from typing import List, Optional, Tuple
@@ -270,6 +272,217 @@ class FusionHead(nn.Module):
         return self.fuse(fused_input)
 
 
+class DecoupledFusionHead(nn.Module):
+    """Explicit geometry/semantic heads before final feature fusion."""
+
+    class SemanticFilterAdaptor(nn.Module):
+        """LESV-style semantic reliability filtering before final fusion."""
+
+        def __init__(
+            self,
+            feat_dim: int,
+            hidden_dim: int = 64,
+            mode: str = "confidence",
+            use_geometry_guidance: bool = True,
+            use_depth_guidance: bool = False,
+            residual: bool = True,
+        ):
+            super().__init__()
+            if mode not in {"confidence", "refinement"}:
+                raise ValueError(f"Unsupported semantic adaptor mode: {mode}")
+            self.mode = mode
+            self.use_geometry_guidance = use_geometry_guidance
+            self.use_depth_guidance = use_depth_guidance
+            self.residual = residual
+
+            extra_ch = 0
+            if use_geometry_guidance:
+                extra_ch += 1
+            if use_depth_guidance:
+                extra_ch += 1
+
+            self.confidence_net = nn.Sequential(
+                nn.Conv2d(feat_dim + extra_ch, hidden_dim, 3, padding=1),
+                nn.GELU(),
+                nn.Conv2d(hidden_dim, hidden_dim, 3, padding=1),
+                nn.GELU(),
+                nn.Conv2d(hidden_dim, 1, 1),
+            )
+            nn.init.normal_(self.confidence_net[-1].weight, mean=0.0, std=1e-3)
+            nn.init.zeros_(self.confidence_net[-1].bias)
+
+            if self.mode == "refinement":
+                self.refinement_net = nn.Sequential(
+                    nn.Conv2d(feat_dim + 1, hidden_dim, 3, padding=1),
+                    nn.GELU(),
+                    nn.Conv2d(hidden_dim, hidden_dim, 3, padding=1),
+                    nn.GELU(),
+                    nn.Conv2d(hidden_dim, feat_dim, 1),
+                )
+                nn.init.normal_(self.refinement_net[-1].weight, mean=0.0, std=1e-3)
+                nn.init.zeros_(self.refinement_net[-1].bias)
+            else:
+                self.refinement_net = None
+
+        @staticmethod
+        def _normalize_map(x: torch.Tensor) -> torch.Tensor:
+            dims = tuple(range(2, x.dim()))
+            min_v = x.amin(dim=dims, keepdim=True)
+            max_v = x.amax(dim=dims, keepdim=True)
+            return (x - min_v) / (max_v - min_v + 1e-6)
+
+        def forward(
+            self,
+            semantic_feat: torch.Tensor,
+            geometry_feat: Optional[torch.Tensor] = None,
+            depth_map: Optional[torch.Tensor] = None,
+        ) -> dict[str, torch.Tensor]:
+            feat_dtype = semantic_feat.dtype
+            feat_float = semantic_feat.float()
+            conf_inputs = [feat_float]
+
+            if self.use_geometry_guidance and geometry_feat is not None:
+                geom_norm = geometry_feat.float().norm(dim=1, keepdim=True)
+                conf_inputs.append(self._normalize_map(geom_norm))
+
+            if self.use_depth_guidance and depth_map is not None:
+                depth = depth_map.float()
+                if depth.dim() == 3:
+                    depth = depth.unsqueeze(1)
+                if depth.shape[-2:] != semantic_feat.shape[-2:]:
+                    depth = F.interpolate(
+                        depth,
+                        size=semantic_feat.shape[-2:],
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                conf_inputs.append(self._normalize_map(depth))
+
+            confidence = 2.0 * torch.sigmoid(
+                self.confidence_net(torch.cat(conf_inputs, dim=1))
+            )
+            semantic_filtered = semantic_feat * confidence.to(dtype=feat_dtype)
+
+            result = {
+                "semantic_filtered": semantic_filtered,
+                "semantic_confidence": confidence,
+            }
+            if self.refinement_net is not None:
+                refinement = self.refinement_net(
+                    torch.cat([semantic_filtered.float(), confidence], dim=1)
+                ).to(dtype=feat_dtype)
+                semantic_filtered = (
+                    semantic_filtered + refinement if self.residual else refinement
+                )
+                result["semantic_filtered"] = semantic_filtered
+                result["semantic_refinement"] = refinement
+            return result
+
+    def __init__(
+        self,
+        fine_dim: int = 64,
+        coarse_dim: int = 64,
+        hidden_dim: int = 128,
+        output_dim: int = 128,
+        use_semantic_adaptor: bool = False,
+        semantic_adaptor_mode: str = "confidence",
+        semantic_adaptor_hidden_dim: int = 64,
+        semantic_adaptor_use_geometry_guidance: bool = True,
+        semantic_adaptor_use_depth_guidance: bool = False,
+        semantic_adaptor_residual: bool = True,
+    ):
+        super().__init__()
+        in_dim = fine_dim + coarse_dim
+        gate_hidden = max(hidden_dim // 2, 32)
+        self.geometry_gate = nn.Sequential(
+            nn.Conv2d(in_dim, gate_hidden, 1),
+            nn.GELU(),
+            nn.Conv2d(gate_hidden, 1, 1),
+            nn.Sigmoid(),
+        )
+        self.semantic_gate = nn.Sequential(
+            nn.Conv2d(in_dim, gate_hidden, 1),
+            nn.GELU(),
+            nn.Conv2d(gate_hidden, 1, 1),
+            nn.Sigmoid(),
+        )
+        self.geometry_head = nn.Sequential(
+            nn.Conv2d(in_dim, hidden_dim, 1),
+            nn.GELU(),
+            nn.Conv2d(hidden_dim, hidden_dim, 1),
+            nn.GELU(),
+            nn.Conv2d(hidden_dim, output_dim, 1),
+        )
+        self.semantic_head = nn.Sequential(
+            nn.Conv2d(in_dim, hidden_dim, 1),
+            nn.GELU(),
+            nn.Conv2d(hidden_dim, hidden_dim, 1),
+            nn.GELU(),
+            nn.Conv2d(hidden_dim, output_dim, 1),
+        )
+        self.fuse = nn.Sequential(
+            nn.Conv2d(output_dim * 2, hidden_dim, 1),
+            nn.GELU(),
+            nn.Conv2d(hidden_dim, hidden_dim, 1),
+            nn.GELU(),
+            nn.Conv2d(hidden_dim, output_dim, 1),
+        )
+        self.semantic_adaptor = (
+            self.SemanticFilterAdaptor(
+                feat_dim=output_dim,
+                hidden_dim=semantic_adaptor_hidden_dim,
+                mode=semantic_adaptor_mode,
+                use_geometry_guidance=semantic_adaptor_use_geometry_guidance,
+                use_depth_guidance=semantic_adaptor_use_depth_guidance,
+                residual=semantic_adaptor_residual,
+            )
+            if use_semantic_adaptor
+            else None
+        )
+
+    def forward(
+        self,
+        fine_feat: torch.Tensor,
+        coarse_feat: torch.Tensor,
+        return_aux: bool = False,
+        depth_map: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor | dict[str, torch.Tensor]:
+        concat = torch.cat([fine_feat, coarse_feat], dim=1)
+        geom_gate = self.geometry_gate(concat)
+        sem_gate = self.semantic_gate(concat)
+
+        geometry_input = torch.cat([fine_feat, coarse_feat * geom_gate], dim=1)
+        semantic_input = torch.cat([coarse_feat, fine_feat * sem_gate], dim=1)
+        geometry_feat = self.geometry_head(geometry_input)
+        semantic_feat = self.semantic_head(semantic_input)
+        adaptor_aux: dict[str, torch.Tensor] = {}
+        if self.semantic_adaptor is not None:
+            adaptor_result = self.semantic_adaptor(
+                semantic_feat,
+                geometry_feat=geometry_feat,
+                depth_map=depth_map,
+            )
+            semantic_feat = adaptor_result["semantic_filtered"]
+            adaptor_aux = {
+                key: value
+                for key, value in adaptor_result.items()
+                if key != "semantic_filtered"
+            }
+        fused = self.fuse(torch.cat([geometry_feat, semantic_feat], dim=1))
+
+        if return_aux:
+            result = {
+                "fused": fused,
+                "geometry": geometry_feat,
+                "semantic": semantic_feat,
+                "geometry_gate": geom_gate,
+                "semantic_gate": sem_gate,
+            }
+            result.update(adaptor_aux)
+            return result
+        return fused
+
+
 # ---------------------------------------------------------------------------
 # Utility: depth un-projection
 # ---------------------------------------------------------------------------
@@ -364,10 +577,22 @@ class HybridFeatureGaussian(nn.Module):
         fine_hidden_dim: int = 64,
         coarse_hidden_dim: int = 64,
         fusion_hidden_dim: int = 128,
+        decoupled_heads: bool = False,
+        use_semantic_adaptor: bool = False,
+        semantic_adaptor_mode: str = "confidence",
+        semantic_adaptor_hidden_dim: int = 64,
+        semantic_adaptor_use_geometry_guidance: bool = True,
+        semantic_adaptor_use_depth_guidance: bool = False,
+        semantic_adaptor_residual: bool = True,
     ):
         super().__init__()
         self._latent_dim = latent_dim
         self._output_dim = output_dim
+        self.decoupled_heads = decoupled_heads
+        if use_semantic_adaptor and not decoupled_heads:
+            raise ValueError(
+                "Semantic adaptor requires hybrid_decoupled_heads=true"
+            )
 
         # --- frozen geometry (populated by load_from_ply) ---
         self.register_buffer("_xyz", torch.empty(0))
@@ -402,7 +627,21 @@ class HybridFeatureGaussian(nn.Module):
         # --- screen-space decoders ---
         self.fine_decoder = FineDecoder(latent_dim, fine_hidden_dim, fine_dim)
         self.coarse_decoder = CoarseDecoder(hash_output_dim, coarse_hidden_dim, coarse_dim)
-        self.fusion_head = FusionHead(fine_dim, coarse_dim, fusion_hidden_dim, output_dim)
+        if decoupled_heads:
+            self.fusion_head = DecoupledFusionHead(
+                fine_dim,
+                coarse_dim,
+                fusion_hidden_dim,
+                output_dim,
+                use_semantic_adaptor=use_semantic_adaptor,
+                semantic_adaptor_mode=semantic_adaptor_mode,
+                semantic_adaptor_hidden_dim=semantic_adaptor_hidden_dim,
+                semantic_adaptor_use_geometry_guidance=semantic_adaptor_use_geometry_guidance,
+                semantic_adaptor_use_depth_guidance=semantic_adaptor_use_depth_guidance,
+                semantic_adaptor_residual=semantic_adaptor_residual,
+            )
+        else:
+            self.fusion_head = FusionHead(fine_dim, coarse_dim, fusion_hidden_dim, output_dim)
 
     # -- accessors (match ExplicitFeatureGaussian API) ---------------------
 
@@ -518,7 +757,9 @@ class HybridFeatureGaussian(nn.Module):
         latent_map: torch.Tensor,
         position_map: torch.Tensor,
         view_dirs: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        return_aux: bool = False,
+        depth_map: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor | dict[str, torch.Tensor]:
         """Decode rendered latent + 3-D position maps into output features.
 
         Args:
@@ -537,6 +778,13 @@ class HybridFeatureGaussian(nn.Module):
         coarse_feat = self.coarse_decoder(hash_feat)  # [B, coarse_dim, H, W]
 
         # Fusion
+        if self.decoupled_heads:
+            return self.fusion_head(
+                fine_feat,
+                coarse_feat,
+                return_aux=return_aux,
+                depth_map=depth_map,
+            )
         return self.fusion_head(fine_feat, coarse_feat)  # [B, output_dim, H, W]
 
     # -- trainable parameters -----------------------------------------------
