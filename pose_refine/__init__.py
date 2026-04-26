@@ -14,7 +14,21 @@ from pose_refine.runtime import (
     load_concat_pose_model,
     run_model_refine_iteration,
 )
-from pose_refine.sparse_init import LoFTRInitializer, LoFTRResult
+
+try:
+    from pose_refine.sparse_init import LoFTRInitializer, LoFTRResult
+except ModuleNotFoundError as exc:
+    if exc.name != "cv2":
+        raise
+
+    class LoFTRInitializer:  # type: ignore[no-redef]
+        def __init__(self, *args, **kwargs):
+            raise ModuleNotFoundError(
+                "LoFTRInitializer requires OpenCV (cv2). Install opencv-python "
+                "or opencv-python-headless to use sparse initialization."
+            ) from exc
+
+    LoFTRResult = None  # type: ignore[assignment]
 
 
 __all__ = [

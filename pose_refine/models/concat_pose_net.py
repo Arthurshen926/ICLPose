@@ -7,7 +7,8 @@ Two modes:
   2. **GRU mode** (use_gru=True): RAFT-style iterative refinement using
      warp-guided local correlation + ConvGRU for much better flow.
 
-Both modes use decoupled rotation (flow->solver) + translation (regression).
+Both modes default to depth-aware WLS for the final 6-DoF update.  The older
+MLP translation/rotation heads remain available for ablations.
 """
 
 import torch
@@ -306,7 +307,10 @@ class ConcatPoseNet(nn.Module):
         # Projection mode: 'separate' (legacy), 'shared' (shared+GroupNorm)
         proj_mode: str = 'separate',
         # Full WLS: derive both rotation and translation from flow (no MLP trans)
-        full_wls: bool = False,
+        full_wls: bool = True,
+        # Keep coarse features out of the fine metric head unless an ablation
+        # explicitly asks for the legacy coarse-conditioned MLP heads.
+        use_coarse_in_fine_head: bool = True,
         # Flow head init: 'zero' (legacy RAFT) or 'kaiming' or 'small' (std=0.01)
         flow_init: str = 'zero',
         # Detach trans: stop gradient from MLP trans back to GRU (forces flow learning)
@@ -344,6 +348,7 @@ class ConcatPoseNet(nn.Module):
         self.coarse_pool_factor = coarse_pool_factor
         self.proj_mode = proj_mode
         self.full_wls = full_wls
+        self.use_coarse_in_fine_head = use_coarse_in_fine_head
         self.flow_init = flow_init
         self.detach_trans = detach_trans
         self.detach_wls_rot = detach_wls_rot
@@ -460,8 +465,8 @@ class ConcatPoseNet(nn.Module):
 
         # -- Shared: Translation regression head (skip if full_wls) --
         if not full_wls:
-            coarse_context_dim = 128 if use_coarse else 0
-            if use_coarse:
+            coarse_context_dim = 128 if use_coarse and use_coarse_in_fine_head else 0
+            if use_coarse and use_coarse_in_fine_head:
                 self.coarse_encoder = nn.Sequential(
                     nn.AdaptiveAvgPool2d(1),
                     nn.Flatten(),
@@ -481,7 +486,7 @@ class ConcatPoseNet(nn.Module):
         # -- MLP rotation head (when rot_mode='mlp' or 'hybrid') --
         if rot_mode in ('mlp', 'hybrid'):
             self.rot_pool = nn.AdaptiveAvgPool2d(4)
-            coarse_ctx_dim = 128 if use_coarse else 0
+            coarse_ctx_dim = 128 if use_coarse and use_coarse_in_fine_head else 0
             self.rot_fc = nn.Sequential(
                 nn.Linear(feat_ch * 16 + coarse_ctx_dim, 256),
                 nn.ReLU(inplace=True),
@@ -574,7 +579,8 @@ class ConcatPoseNet(nn.Module):
             # Translation from MLP
             feat_input = feat_for_trans.detach() if self.detach_trans else feat_for_trans
             trans_feat = self.trans_pool(feat_input).flatten(1)
-            if self.use_coarse and query_coarse is not None:
+            coarse_ctx = None
+            if self.use_coarse and self.use_coarse_in_fine_head and query_coarse is not None:
                 coarse_ctx = self.coarse_encoder(query_coarse)
                 trans_feat = torch.cat([trans_feat, coarse_ctx], dim=1)
             trans_delta = self.trans_fc(trans_feat)
@@ -582,14 +588,14 @@ class ConcatPoseNet(nn.Module):
             # Rotation: choose source based on rot_mode
             if self.rot_mode == 'mlp':
                 rot_feat = self.rot_pool(feat_input).flatten(1)
-                if self.use_coarse and query_coarse is not None:
+                if coarse_ctx is not None:
                     rot_feat = torch.cat([rot_feat, coarse_ctx], dim=1)
                 rot_delta = self.rot_fc(rot_feat)
             elif self.rot_mode == 'hybrid':
                 # WLS rotation (detached) + MLP residual
                 wls_rot = delta_xi_full[:, 3:].float().detach()
                 rot_feat = self.rot_pool(feat_input).flatten(1)
-                if self.use_coarse and query_coarse is not None:
+                if coarse_ctx is not None:
                     rot_feat = torch.cat([rot_feat, coarse_ctx], dim=1)
                 rot_delta = wls_rot + self.rot_fc(rot_feat)
             else:  # 'wls' (default)

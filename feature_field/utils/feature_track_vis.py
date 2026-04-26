@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from pathlib import Path
 
 import numpy as np
@@ -125,6 +127,84 @@ def feature_to_rgb_image(features: torch.Tensor, mask: torch.Tensor = None) -> I
     return Image.fromarray((rgb * 255.0).astype(np.uint8))
 
 
+def feature_group_to_rgb_images(
+    features_list: list[torch.Tensor | None],
+    masks: list[torch.Tensor | None] | None = None,
+) -> list[Image.Image | None]:
+    if masks is None:
+        masks = [None] * len(features_list)
+    if len(masks) != len(features_list):
+        raise ValueError("masks must match features_list length")
+
+    prepared = []
+    valid_chunks = []
+    for features, mask in zip(features_list, masks):
+        if features is None:
+            prepared.append(None)
+            continue
+        feat = features.detach().float().cpu()
+        if feat.dim() == 4:
+            feat = feat[0]
+        if feat.dim() == 2:
+            feat = feat.unsqueeze(0)
+        c, h, w = feat.shape
+        flat = feat.reshape(c, -1).transpose(0, 1)
+        valid_mask = _mask_to_numpy(mask, (h, w))
+        if valid_mask is not None and bool(valid_mask.any()):
+            valid_values = flat[torch.from_numpy(valid_mask.reshape(-1))]
+        else:
+            valid_values = flat
+            valid_mask = None if valid_mask is None else valid_mask
+        prepared.append((feat, flat, valid_mask))
+        if valid_values.numel() > 0:
+            valid_chunks.append(valid_values)
+
+    if not valid_chunks:
+        return [None if feat is None else feature_to_rgb_image(feat) for feat in features_list]
+
+    stacked = torch.cat(valid_chunks, dim=0)
+    mean = stacked.mean(dim=0, keepdim=True)
+    centered = stacked - mean
+    q = min(3, centered.shape[0], centered.shape[1])
+
+    if q == 0:
+        return [None if feat is None else Image.fromarray(np.zeros((feat.shape[-2], feat.shape[-1], 3), dtype=np.uint8))
+                for feat in features_list]
+
+    try:
+        _, _, v = torch.pca_lowrank(centered, q=q)
+        basis = v[:, :q]
+    except RuntimeError:
+        _, _, v = torch.linalg.svd(centered, full_matrices=False)
+        basis = v[:q].transpose(0, 1)
+
+    stacked_proj = centered @ basis
+    if q < 3:
+        stacked_proj = torch.cat(
+            [stacked_proj, torch.zeros(stacked_proj.shape[0], 3 - q, dtype=stacked_proj.dtype)],
+            dim=1,
+        )
+    value_min = stacked_proj[:, :3].min(dim=0).values
+    value_max = stacked_proj[:, :3].max(dim=0).values
+    value_scale = torch.clamp(value_max - value_min, min=1e-8)
+
+    images: list[Image.Image | None] = []
+    for item in prepared:
+        if item is None:
+            images.append(None)
+            continue
+        feat, flat, valid_mask = item
+        proj = (flat - mean) @ basis
+        if q < 3:
+            proj = torch.cat([proj, torch.zeros(proj.shape[0], 3 - q, dtype=proj.dtype)], dim=1)
+        proj = ((proj[:, :3] - value_min) / value_scale).clamp(0.0, 1.0).numpy()
+        rgb = proj.reshape(feat.shape[-2], feat.shape[-1], 3)
+        if valid_mask is not None:
+            rgb[~valid_mask] = 0.0
+        images.append(Image.fromarray((rgb * 255.0).astype(np.uint8)))
+    return images
+
+
 def error_to_heatmap_image(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor = None) -> Image.Image:
     pred = pred.detach().float().cpu()
     target = target.detach().float().cpu()
@@ -173,17 +253,24 @@ def save_feature_track_visual(
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    fine_group = [teacher_fine, student_fine, rendered_map_fine_raw, rendered_map_fine]
+    fine_masks = [None, None, rendered_map_mask, rendered_map_mask]
+    fine_rgb = feature_group_to_rgb_images(fine_group, fine_masks)
+    coarse_group = [teacher_coarse, student_coarse, rendered_map_coarse]
+    coarse_masks = [None, None, rendered_map_mask]
+    coarse_rgb = feature_group_to_rgb_images(coarse_group, coarse_masks)
+
     panels = []
     if rendered_map_fine is None or rendered_map_coarse is None:
         panels.extend(
             [
                 _annotate(tensor_to_display_rgb(query_rgb), "query_rgb"),
-                _annotate(feature_to_rgb_image(teacher_fine), "teacher_fine"),
-                _annotate(feature_to_rgb_image(student_fine), "student_fine"),
+                _annotate(fine_rgb[0], "teacher_fine"),
+                _annotate(fine_rgb[1], "student_fine"),
                 _annotate(error_to_heatmap_image(student_fine, teacher_fine), "fine_error"),
                 _annotate(tensor_to_display_rgb(query_rgb), "query_rgb"),
-                _annotate(feature_to_rgb_image(teacher_coarse), "teacher_coarse"),
-                _annotate(feature_to_rgb_image(student_coarse), "student_coarse"),
+                _annotate(coarse_rgb[0], "teacher_coarse"),
+                _annotate(coarse_rgb[1], "student_coarse"),
                 _annotate(error_to_heatmap_image(student_coarse, teacher_coarse), "coarse_error"),
             ]
         )
@@ -191,15 +278,15 @@ def save_feature_track_visual(
         panels.extend(
             [
                 _annotate(tensor_to_display_rgb(query_rgb), "query_rgb"),
-                _annotate(feature_to_rgb_image(teacher_fine), "teacher_fine"),
-                _annotate(feature_to_rgb_image(student_fine), "student_fine"),
+                _annotate(fine_rgb[0], "teacher_fine"),
+                _annotate(fine_rgb[1], "student_fine"),
                 _annotate(
-                    feature_to_rgb_image(rendered_map_fine_raw, mask=rendered_map_mask),
+                    fine_rgb[2],
                     "map_fine_raw",
                 )
                 if rendered_map_fine_raw is not None
-                else _annotate(feature_to_rgb_image(rendered_map_fine, mask=rendered_map_mask), "map_fine"),
-                _annotate(feature_to_rgb_image(rendered_map_fine, mask=rendered_map_mask), "map_fine"),
+                else _annotate(fine_rgb[3], "map_fine"),
+                _annotate(fine_rgb[3], "map_fine"),
                 _annotate(error_to_heatmap_image(student_fine, teacher_fine), "fine_student_err"),
                 _annotate(
                     error_to_heatmap_image(rendered_map_fine_raw, teacher_fine, mask=rendered_map_mask),
@@ -209,9 +296,9 @@ def save_feature_track_visual(
                 else _annotate(error_to_heatmap_image(rendered_map_fine, teacher_fine, mask=rendered_map_mask), "fine_map_err"),
                 _annotate(error_to_heatmap_image(rendered_map_fine, teacher_fine, mask=rendered_map_mask), "fine_map_err"),
                 _annotate(tensor_to_display_rgb(query_rgb), "query_rgb"),
-                _annotate(feature_to_rgb_image(teacher_coarse), "teacher_coarse"),
-                _annotate(feature_to_rgb_image(student_coarse), "student_coarse"),
-                _annotate(feature_to_rgb_image(rendered_map_coarse, mask=rendered_map_mask), "map_coarse"),
+                _annotate(coarse_rgb[0], "teacher_coarse"),
+                _annotate(coarse_rgb[1], "student_coarse"),
+                _annotate(coarse_rgb[2], "map_coarse"),
                 _annotate(error_to_heatmap_image(student_coarse, teacher_coarse), "coarse_student_err"),
                 _annotate(error_to_heatmap_image(rendered_map_coarse, teacher_coarse, mask=rendered_map_mask), "coarse_map_err"),
             ]

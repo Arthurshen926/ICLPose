@@ -12,6 +12,7 @@ import yaml
 from feature_field.dcff import DeferredCascadedRenderer, SpatialHashGrid
 from feature_field.dcff.feature_selection import FeatureSelectionModule
 from feature_field.dcff.hybrid_gaussian import HybridGaussianModel
+from feature_field.utils.checkpoint_io import safe_torch_load
 from feature_field.utils.project_paths import resolve_checkpoint_path, resolve_repo_path
 
 
@@ -277,7 +278,10 @@ def apply_localization_map_state(
     else:
         ckpt_path = resolve_checkpoint_path(str(checkpoint_or_path), must_exist=True)
         assert ckpt_path is not None
-        checkpoint = torch.load(ckpt_path, map_location=next(dcff_renderer.parameters()).device)
+        checkpoint = safe_torch_load(
+            ckpt_path,
+            map_location=next(dcff_renderer.parameters()).device,
+        )
 
     loaded: list[str] = []
     if _load_state_dict_compatible(
@@ -324,7 +328,7 @@ def build_dcff_runtime(
     joint_ckpt_path = resolve_checkpoint_path(cfg_dcff.get("joint_checkpoint"))
 
     assert dcff_ckpt_path is not None
-    checkpoint = torch.load(dcff_ckpt_path, map_location=device)
+    checkpoint = safe_torch_load(dcff_ckpt_path, map_location=device)
     ckpt_ply_path = dcff_ckpt_path.with_suffix(".ply")
     if ckpt_ply_path.exists():
         ply_path = ckpt_ply_path
@@ -495,7 +499,7 @@ def build_dcff_runtime(
         joint_ckpt = resolve_checkpoint_path(joint_ckpt_path, must_exist=True)
         assert joint_ckpt is not None
         _print(printer, f"  Loading joint feature checkpoint: {joint_ckpt}")
-        joint_state = torch.load(joint_ckpt, map_location=device)
+        joint_state = safe_torch_load(joint_ckpt, map_location=device)
         joint_map_state = joint_state.get("map_renderer_state_dict") or {}
         # Optionally restrict which components to override from joint checkpoint
         allowed = cfg_dcff.get("joint_override_components")

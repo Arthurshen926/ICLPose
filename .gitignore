@@ -4,8 +4,11 @@ output/
 
 
 dataset/
+result/
+output/
 
 */output/
+*/checkpoints/
 
 .vscode/
 .github/

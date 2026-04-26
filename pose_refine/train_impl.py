@@ -351,6 +351,16 @@ def confidence_nll_loss(
     }
 
 
+def feature_cosine_distance_per_sample(
+    query_feat: torch.Tensor,
+    rendered_feat: torch.Tensor,
+) -> torch.Tensor:
+    """Per-sample cosine distance between query and rendered feature maps."""
+    q = F.normalize(query_feat.float(), dim=1)
+    r = F.normalize(rendered_feat.float(), dim=1)
+    return 1.0 - (q * r).sum(dim=1).mean(dim=(1, 2))
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 #  Visualization Utilities
 # ═════════════════════════════════════════════════════════════════════════════
@@ -439,9 +449,18 @@ class ConcatLocTrainer:
         self.use_direct_trans_loss = loss_cfg.get('direct_trans_loss', True)
         self.coarse_pose_weight = loss_cfg.get('coarse_pose_weight', self.pose_weight)
         self.full_pose_weight = loss_cfg.get('full_pose_weight', 0.0)
+        self.pose_rank_weight = float(loss_cfg.get('pose_rank_weight', 0.0))
+        self.pose_rank_margin = float(loss_cfg.get('pose_rank_margin', 0.05))
+        self.pose_rank_rot_deg = float(loss_cfg.get('pose_rank_rot_deg', 2.0))
+        self.pose_rank_trans_m = float(loss_cfg.get('pose_rank_trans_m', 0.25))
 
         # Phases
         self.phase1_epochs = tc.get('phase1_epochs', 30)
+        self.map_finetune_start_epoch = int(tc.get('map_finetune_start_epoch', self.phase1_epochs))
+        self.fsm_finetune_start_epoch = int(tc.get('fsm_finetune_start_epoch', self.map_finetune_start_epoch))
+        self.pose_rank_start_epoch = int(tc.get('pose_rank_start_epoch', self.map_finetune_start_epoch))
+        self._map_decoder_active = False
+        self._map_fsm_active = False
 
         # Outer iterations
         self.outer_iters_train = tc.get('outer_iters_train', 1)
@@ -472,6 +491,7 @@ class ConcatLocTrainer:
         self._build_model()
         self._build_datasets()
         self._build_optimizer()
+        self._sync_map_finetune_state(0, force=True)
 
         # Mixed precision
         self.scaler = GradScaler(enabled=self.use_amp)
@@ -493,6 +513,7 @@ class ConcatLocTrainer:
             self._load_checkpoint(resume_path)
         elif warmstart_path:
             self._warmstart(warmstart_path)
+        self._sync_map_finetune_state(self.epoch, force=True)
 
         if not self.save_epoch_checkpoints:
             self._cleanup_epoch_checkpoints()
@@ -877,8 +898,9 @@ class ConcatLocTrainer:
         if getattr(self, 'finetune_decoder', False):
             decoder_lr = tc.get('decoder_lr', lr * 0.1)
             decoder_params = list(self.dcff_renderer.fine_decoder.parameters()) + list(self.feat_sharp_fine.parameters())
-            if self.dcff_renderer.coarse_carrier_fusion is not None:
-                decoder_params += list(self.dcff_renderer.coarse_carrier_fusion.parameters())
+            coarse_fusion = getattr(self.dcff_renderer, 'coarse_carrier_fusion', None)
+            if coarse_fusion is not None:
+                decoder_params += list(coarse_fusion.parameters())
             param_groups.append({
                 'params': decoder_params,
                 'lr': decoder_lr,
@@ -904,19 +926,65 @@ class ConcatLocTrainer:
             eta_min=tc.get('min_lr', 1e-6),
         )
 
+    def _iter_decoder_finetune_modules(self):
+        yield self.dcff_renderer.fine_decoder
+        yield self.feat_sharp_fine
+        coarse_fusion = getattr(self.dcff_renderer, 'coarse_carrier_fusion', None)
+        if coarse_fusion is not None:
+            yield coarse_fusion
+
+    @staticmethod
+    def _set_module_trainable(module: nn.Module | None, enabled: bool) -> None:
+        if module is None:
+            return
+        for param in module.parameters():
+            param.requires_grad_(enabled)
+
+    def _sync_map_finetune_state(self, epoch: int, force: bool = False) -> None:
+        decoder_active = bool(
+            getattr(self, 'finetune_decoder', False)
+            and epoch >= self.map_finetune_start_epoch
+        )
+        fsm_active = bool(
+            getattr(self, 'finetune_fsm', False)
+            and self.feat_select is not None
+            and epoch >= self.fsm_finetune_start_epoch
+        )
+
+        if force or decoder_active != self._map_decoder_active:
+            for module in self._iter_decoder_finetune_modules():
+                self._set_module_trainable(module, decoder_active)
+            if decoder_active:
+                self.logger.info(
+                    f'  Map decoder fine-tuning active from epoch {epoch} '
+                    f'(start={self.map_finetune_start_epoch})')
+            elif getattr(self, 'finetune_decoder', False):
+                self.logger.info(
+                    f'  Map decoder frozen until epoch {self.map_finetune_start_epoch}')
+            self._map_decoder_active = decoder_active
+
+        if force or fsm_active != self._map_fsm_active:
+            self._set_module_trainable(self.feat_select, fsm_active)
+            if fsm_active:
+                self.logger.info(
+                    f'  FSM fine-tuning active from epoch {epoch} '
+                    f'(start={self.fsm_finetune_start_epoch})')
+            elif getattr(self, 'finetune_fsm', False) and self.feat_select is not None:
+                self.logger.info(
+                    f'  FSM frozen until epoch {self.fsm_finetune_start_epoch}')
+            self._map_fsm_active = fsm_active
+
     def _set_map_train_mode(self, enabled: bool) -> None:
-        if enabled:
-            self.dcff_renderer.train(self.finetune_decoder or self.finetune_fsm)
-            self.feat_sharp_fine.train(self.finetune_decoder)
-            if self.dcff_renderer.coarse_carrier_fusion is not None:
-                self.dcff_renderer.coarse_carrier_fusion.train(self.finetune_decoder)
-            if self.feat_select is not None:
-                self.feat_select.train(self.finetune_fsm)
-        else:
-            self.dcff_renderer.eval()
-            self.feat_sharp_fine.eval()
-            if self.feat_select is not None:
-                self.feat_select.eval()
+        decoder_train = bool(enabled and self._map_decoder_active)
+        fsm_train = bool(enabled and self._map_fsm_active)
+        self.dcff_renderer.train(decoder_train or fsm_train)
+        self.dcff_renderer.fine_decoder.train(decoder_train)
+        self.feat_sharp_fine.train(decoder_train)
+        coarse_fusion = getattr(self.dcff_renderer, 'coarse_carrier_fusion', None)
+        if coarse_fusion is not None:
+            coarse_fusion.train(decoder_train)
+        if self.feat_select is not None:
+            self.feat_select.train(fsm_train)
 
     # ── DCFF Rendering ────────────────────────────────────────────────────
 
@@ -1172,6 +1240,37 @@ class ConcatLocTrainer:
 
         return query_fine, query_coarse, alpha
 
+    def _pose_perturb_rank_loss(
+        self,
+        query_fine: torch.Tensor,
+        pose_gt: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """Rank GT-pose renders ahead of perturbed-pose renders."""
+        B = pose_gt.shape[0]
+        with torch.cuda.amp.autocast(enabled=False):
+            noise = torch.randn(B, 6, device=self.device, dtype=torch.float32)
+            noise[:, :3] *= self.pose_rank_trans_m
+            noise[:, 3:] *= math.radians(self.pose_rank_rot_deg)
+            pose_neg = torch.bmm(se3_exp(noise), pose_gt.float())
+
+        pos_feat = self._render_batch_differentiable(
+            pose_gt,
+            render_coarse=False,
+        )['fine_features']
+        neg_feat = self._render_batch_differentiable(
+            pose_neg,
+            render_coarse=False,
+        )['fine_features']
+
+        pos_dist = feature_cosine_distance_per_sample(query_fine, pos_feat)
+        neg_dist = feature_cosine_distance_per_sample(query_fine, neg_feat)
+        rank_loss = F.relu(self.pose_rank_margin + pos_dist - neg_dist).mean()
+        return rank_loss, {
+            'pose_rank_loss': rank_loss.item(),
+            'pose_rank_pos_dist': pos_dist.mean().item(),
+            'pose_rank_neg_dist': neg_dist.mean().item(),
+        }
+
     # ── Training Step ─────────────────────────────────────────────────────
 
     def _train_step(
@@ -1198,7 +1297,7 @@ class ConcatLocTrainer:
         N = self.outer_iters_train
         all_metrics = {}
         total_loss_val = 0.0
-        differentiable_render = self.finetune_decoder or self.finetune_fsm
+        differentiable_render = self._map_decoder_active or self._map_fsm_active
         if student_query_alpha is not None:
             all_metrics['student_query_alpha'] = float(student_query_alpha)
 
@@ -1347,7 +1446,7 @@ class ConcatLocTrainer:
         all_metrics['total_loss'] = total_loss_val / N
 
         # Auxiliary feature matching loss for decoder fine-tuning
-        if self.finetune_decoder and self.feat_match_weight > 0:
+        if (self._map_decoder_active or self._map_fsm_active) and self.feat_match_weight > 0:
             ref_gt = self._render_batch_differentiable(pose_gt)['fine_features']
             # Cosine similarity between rendered features at GT pose and query features
             ref_norm = F.normalize(ref_gt.float(), dim=1)
@@ -1359,12 +1458,27 @@ class ConcatLocTrainer:
             all_metrics['feat_cos_sim'] = cos_sim.item()
             all_metrics['total_loss'] += self.feat_match_weight * feat_match_loss.item()
 
+        if (
+            (self._map_decoder_active or self._map_fsm_active)
+            and self.pose_rank_weight > 0
+            and self.epoch >= self.pose_rank_start_epoch
+        ):
+            rank_loss, rank_metrics = self._pose_perturb_rank_loss(
+                query_fine,
+                pose_gt,
+            )
+            self.scaler.scale(self.pose_rank_weight * rank_loss).backward()
+            for k, v in rank_metrics.items():
+                all_metrics[k] = v
+            all_metrics['total_loss'] += self.pose_rank_weight * rank_loss.item()
+
         return all_metrics
 
     # ── Training Epoch ────────────────────────────────────────────────────
 
     def train_epoch(self, epoch: int) -> Dict[str, float]:
         """Train one epoch."""
+        self._sync_map_finetune_state(epoch)
         self.model.train()
         self._set_map_train_mode(True)
         use_pose_loss = epoch >= self.phase1_epochs
@@ -1386,8 +1500,14 @@ class ConcatLocTrainer:
             # Gradient clipping
             if self.grad_clip > 0:
                 self.scaler.unscale_(self.optimizer)
+                trainable_params = [
+                    p
+                    for group in self.optimizer.param_groups
+                    for p in group['params']
+                    if p.requires_grad
+                ]
                 valid_grads = True
-                for p in self.model.parameters():
+                for p in trainable_params:
                     if p.grad is not None and (torch.isnan(p.grad).any() or torch.isinf(p.grad).any()):
                         valid_grads = False
                         break
@@ -1396,7 +1516,7 @@ class ConcatLocTrainer:
                     self.scaler.update()
                     self.global_step += 1
                     continue
-                nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+                nn.utils.clip_grad_norm_(trainable_params, self.grad_clip)
 
             self.scaler.step(self.optimizer)
             self.scaler.update()

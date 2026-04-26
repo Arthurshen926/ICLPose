@@ -30,6 +30,31 @@ except ImportError:
     TCNN_AVAILABLE = False
 
 
+class FourierFeatureEncoder(nn.Module):
+    """Parameter-free sinusoidal encoder used as a tiny-cudann fallback."""
+
+    def __init__(self, input_dim: int, n_frequencies: int = 8, include_input: bool = True):
+        super().__init__()
+        self.input_dim = input_dim
+        self.include_input = include_input
+        self.register_buffer(
+            'freq_bands',
+            2.0 ** torch.arange(n_frequencies, dtype=torch.float32),
+            persistent=False,
+        )
+        self.n_output_dims = input_dim * ((1 if include_input else 0) + 2 * n_frequencies)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        encoded = []
+        if self.include_input:
+            encoded.append(x)
+        for freq in self.freq_bands:
+            scaled = x * freq * torch.pi
+            encoded.append(torch.sin(scaled))
+            encoded.append(torch.cos(scaled))
+        return torch.cat(encoded, dim=-1)
+
+
 class ScalePositionalEncoder(nn.Module):
     """Sinusoidal encoding for 2D Gaussian scales."""
 
@@ -82,49 +107,50 @@ class SpatialHashGrid(nn.Module):
         mlp_layers: int = 2,
     ):
         super().__init__()
-        if not TCNN_AVAILABLE:
-            raise RuntimeError(
-                "tinycudann is required for SpatialHashGrid. "
-                "Install: pip install git+https://github.com/NVlabs/tiny-cuda-nn/#subdirectory=bindings/torch"
-            )
-
         self.scene_extent = scene_extent
         self.feature_dim = feature_dim
         self.input_mode = input_mode
         self.latent_dim = latent_dim
+        self.uses_tcnn = TCNN_AVAILABLE
 
         if self.input_mode not in {'legacy', 'implicit_scale'}:
             raise ValueError(f"Unsupported input_mode={input_mode}")
 
-        # Multi-resolution hash grid: positions [0, 1]^3 → hash features
-        per_level_scale = np.exp2(
-            np.log2(max_resolution / base_resolution) / (n_levels - 1)
-        )
-        self.hash_encoding = tcnn.Encoding(
-            n_input_dims=3,
-            encoding_config={
-                "otype": "HashGrid",
-                "n_levels": n_levels,
-                "n_features_per_level": n_features_per_level,
-                "log2_hashmap_size": log2_hashmap_size,
-                "base_resolution": base_resolution,
-                "per_level_scale": per_level_scale,
-            },
-            dtype=torch.float32,
-        )
-        hash_dim = self.hash_encoding.n_output_dims  # n_levels * n_features_per_level
-
-        if self.input_mode == 'legacy':
-            # Legacy path kept for checkpoint compatibility.
-            self.sh_degree = sh_degree
-            self.sh_encoding = tcnn.Encoding(
+        if self.uses_tcnn:
+            # Multi-resolution hash grid: positions [0, 1]^3 → hash features
+            per_level_scale = np.exp2(
+                np.log2(max_resolution / base_resolution) / (n_levels - 1)
+            )
+            self.hash_encoding = tcnn.Encoding(
                 n_input_dims=3,
                 encoding_config={
-                    "otype": "SphericalHarmonics",
-                    "degree": sh_degree,
+                    "otype": "HashGrid",
+                    "n_levels": n_levels,
+                    "n_features_per_level": n_features_per_level,
+                    "log2_hashmap_size": log2_hashmap_size,
+                    "base_resolution": base_resolution,
+                    "per_level_scale": per_level_scale,
                 },
                 dtype=torch.float32,
             )
+        else:
+            fallback_freqs = max(4, min(10, n_levels // 2))
+            self.hash_encoding = FourierFeatureEncoder(3, n_frequencies=fallback_freqs)
+        hash_dim = self.hash_encoding.n_output_dims
+
+        if self.input_mode == 'legacy':
+            self.sh_degree = sh_degree
+            if self.uses_tcnn:
+                self.sh_encoding = tcnn.Encoding(
+                    n_input_dims=3,
+                    encoding_config={
+                        "otype": "SphericalHarmonics",
+                        "degree": sh_degree,
+                    },
+                    dtype=torch.float32,
+                )
+            else:
+                self.sh_encoding = FourierFeatureEncoder(3, n_frequencies=max(2, sh_degree + 1))
             sh_dim = self.sh_encoding.n_output_dims
             self.scale_encoder = None
             mlp_input_dim = hash_dim + latent_dim + sh_dim
@@ -150,6 +176,8 @@ class SpatialHashGrid(nn.Module):
         n_hash = sum(p.numel() for p in self.hash_encoding.parameters())
         n_mlp = sum(p.numel() for p in self.mlp.parameters())
         print(f"  [SpatialHashGrid] hash={n_hash:,} + mlp={n_mlp:,} = {n_hash+n_mlp:,} params")
+        if not self.uses_tcnn:
+            print("    tinycudann unavailable, using Fourier fallback encoder")
         if self.input_mode == 'legacy':
             print(f"    mode=legacy, hash_dim={hash_dim}, sh_dim={sh_dim}, latent_dim={latent_dim}")
         else:
@@ -223,7 +251,7 @@ class SpatialHashGrid(nn.Module):
         Samples random 3D points and computes finite-difference gradients.
         """
         n_samples = 4096
-        pts = torch.rand(n_samples, 3, device=next(self.hash_encoding.parameters()).device)
+        pts = torch.rand(n_samples, 3, device=next(self.mlp.parameters()).device)
         eps = 1e-3
 
         tv = 0.0

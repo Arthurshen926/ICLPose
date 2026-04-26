@@ -156,7 +156,12 @@ def resolve_repo_path(
         else:
             resolved = candidate
     else:
-        resolved = _redirect_legacy_relative_path(candidate) or (REPO_ROOT / candidate)
+        direct = REPO_ROOT / candidate
+        redirected = _redirect_legacy_relative_path(candidate)
+        if direct.exists() or redirected is None:
+            resolved = direct
+        else:
+            resolved = redirected
 
     if must_exist and not resolved.exists():
         raise FileNotFoundError(f"Resolved path does not exist: {resolved}")

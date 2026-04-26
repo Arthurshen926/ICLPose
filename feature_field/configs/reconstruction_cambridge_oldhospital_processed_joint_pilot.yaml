@@ -1,0 +1,13 @@
+dataset:
+  source_dir: /hy-tmp/Cambridge_stdloc/OldHospital
+  colmap_dir: /hy-tmp/Cambridge_stdloc/OldHospital/sparse/0
+  train_split: /hy-tmp/Cambridge_stdloc/OldHospital/dataset_train.txt
+  test_split: /hy-tmp/Cambridge_stdloc/OldHospital/dataset_test.txt
+
+dcff:
+  checkpoint: /root/ICLPose/result/feature_field/dcff_cambridge_oldhospital_processed_joint_pilot/checkpoints/best.pth
+  ply_path: /root/ICLPose/result/feature_gaussian/joint_radio_dual_cambridge_oldhospital_processed_pilot/point_cloud/iteration_60/point_cloud.ply
+  feature_dim: 64
+  latent_dim: 32
+  render_width: 120
+  render_height: 68

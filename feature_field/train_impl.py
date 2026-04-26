@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 DCFF v5 Training — Feature Field with Online/Cached RADIO Teacher.
 
@@ -41,6 +43,7 @@ from feature_field.dcff.deferred_renderer import DeferredCascadedRenderer
 from feature_field.dcff.losses import DCFFLoss
 from feature_field.dcff.radio_teacher import OnlineRadioTeacher, CachedFeatureTeacher
 from feature_field.runtime import DepthGuidedRefiner
+from feature_field.utils.checkpoint_io import safe_torch_load
 from feature_field.utils.scene_colmap import (
     CameraData,
     build_da3_image_order,
@@ -117,6 +120,135 @@ def warmup_lr_scale(iteration, warmup_iters):
     if warmup_iters <= 0 or iteration >= warmup_iters:
         return 1.0
     return 0.1 + 0.9 * (iteration / warmup_iters)
+
+
+def _infer_explicit_feature_root(init_ply: str | None) -> Path | None:
+    if not init_ply:
+        return None
+    ply_path = Path(init_ply).expanduser()
+    if not ply_path.is_absolute():
+        ply_path = (Path.cwd() / ply_path).resolve()
+    candidates = []
+    if ply_path.parent.name.startswith("iteration_") or ply_path.parent.name == "best":
+        candidates.append(ply_path.parent.parent.parent)
+    candidates.append(ply_path.parent.parent)
+    seen = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if (candidate / "features_best").exists() or (candidate / "features").exists():
+            return candidate
+    return None
+
+
+def _resolve_explicit_feature_checkpoint(feature_root: Path, scale_name: str) -> Path | None:
+    candidates = [
+        feature_root / "features_best" / scale_name / "best_model.pth",
+        feature_root / "features" / scale_name / "best_model.pth",
+        feature_root / "features_best" / scale_name / "latest_model.pth",
+        feature_root / "features" / scale_name / "latest_model.pth",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _load_explicit_loc_feature(path: Path) -> torch.Tensor:
+    payload = safe_torch_load(path, map_location="cpu")
+    if not isinstance(payload, dict) or "loc_feature" not in payload:
+        raise KeyError(f"{path} does not contain loc_feature")
+    feat = payload["loc_feature"]
+    if not torch.is_tensor(feat) or feat.ndim != 2:
+        raise ValueError(f"Expected 2D loc_feature tensor in {path}")
+    return feat.float()
+
+
+def _maybe_init_latent_from_explicit_features(
+    gaussians: HybridGaussianModel,
+    init_ply: str | None,
+    tcfg: dict,
+) -> bool:
+    scale_names = tcfg.get("init_latent_from_explicit_scales")
+    if not scale_names:
+        return False
+    if isinstance(scale_names, str):
+        scale_names = [scale_names]
+
+    feature_root_cfg = tcfg.get("explicit_feature_root")
+    feature_root = (
+        Path(feature_root_cfg).expanduser()
+        if feature_root_cfg
+        else _infer_explicit_feature_root(init_ply)
+    )
+    if feature_root is None:
+        print("  [LatentInit] Could not infer explicit feature root; skipping latent warm start")
+        return False
+    if not feature_root.is_absolute():
+        feature_root = (Path.cwd() / feature_root).resolve()
+    if not feature_root.exists():
+        print(f"  [LatentInit] Explicit feature root not found: {feature_root}")
+        return False
+
+    explicit_features = []
+    loaded_scales = []
+    for scale_name in scale_names:
+        ckpt_path = _resolve_explicit_feature_checkpoint(feature_root, scale_name)
+        if ckpt_path is None:
+            print(f"  [LatentInit] Missing explicit feature checkpoint for {scale_name} under {feature_root}")
+            continue
+        feature = _load_explicit_loc_feature(ckpt_path)
+        if feature.shape[0] != gaussians.num_points:
+            print(
+                f"  [LatentInit] Shape mismatch for {scale_name}: "
+                f"{tuple(feature.shape)} vs gaussians={gaussians.num_points}"
+            )
+            continue
+        explicit_features.append(feature)
+        loaded_scales.append(scale_name)
+
+    if not explicit_features:
+        print("  [LatentInit] No compatible explicit features found; skipping latent warm start")
+        return False
+
+    fused = torch.cat(explicit_features, dim=1)
+    fused = fused - fused.mean(dim=0, keepdim=True)
+    latent_dim = gaussians.latent_dim
+    q = min(latent_dim, fused.shape[0], fused.shape[1])
+    if q <= 0:
+        print("  [LatentInit] Degenerate explicit feature tensor; skipping latent warm start")
+        return False
+
+    try:
+        _, singular_values, basis = torch.pca_lowrank(fused, q=q, center=False)
+        projected = fused @ basis[:, :q]
+    except RuntimeError:
+        _, singular_values, vh = torch.linalg.svd(fused, full_matrices=False)
+        basis = vh[:q].transpose(0, 1)
+        projected = fused @ basis
+
+    projected = projected[:, :q]
+    proj_mean = projected.mean(dim=0, keepdim=True)
+    proj_std = projected.std(dim=0, keepdim=True).clamp(min=1e-6)
+    projected = (projected - proj_mean) / proj_std
+
+    if q < latent_dim:
+        projected = torch.cat(
+            [projected, torch.zeros(projected.shape[0], latent_dim - q, dtype=projected.dtype)],
+            dim=1,
+        )
+
+    latent_scale = float(tcfg.get("init_latent_scale", 0.1))
+    projected = projected[:, :latent_dim] * latent_scale
+    gaussians._latent.data.copy_(projected.to(device=gaussians._latent.device, dtype=gaussians._latent.dtype))
+
+    var_explained = float((singular_values[:q] ** 2).sum() / (singular_values ** 2).sum().clamp(min=1e-6))
+    print(
+        f"  [LatentInit] Initialized {latent_dim}d latent from explicit scales {loaded_scales} "
+        f"(source_dim={fused.shape[1]}, pca_var={var_explained:.3f}, scale={latent_scale:.3f})"
+    )
+    return True
 
 
 # ═════════════════════════════════════════════════════════════════
@@ -254,6 +386,7 @@ def train(cfg, resume_path=None):
         print(f"  Gaussians: {gaussians.num_points:,}, geometry frozen={freeze_geometry}")
     else:
         gaussians.create_from_pcd(pcd_xyz, pcd_rgb, cameras_extent)
+    _maybe_init_latent_from_explicit_features(gaussians, init_ply, tcfg)
     gaussians.training_setup(train_args)
 
     bg_color = torch.tensor(
@@ -409,7 +542,7 @@ def train(cfg, resume_path=None):
     # ── 4b. Optional warm-start (weights only, no optimizer/iteration restore) ──
     if warmstart_path and os.path.exists(warmstart_path):
         restore_warmstart_geometry = bool(tcfg.get('warmstart_restore_geometry_state', True))
-        warm_ckpt = torch.load(warmstart_path, map_location='cuda')
+        warm_ckpt = safe_torch_load(warmstart_path, map_location='cuda')
         hash_grid.load_state_dict(warm_ckpt['hash_grid_state'])
         renderer.fine_decoder.load_state_dict(warm_ckpt['fine_decoder_state'])
         if renderer.coarse_carrier_fusion is not None and 'coarse_fusion_state' in warm_ckpt:
@@ -452,7 +585,7 @@ def train(cfg, resume_path=None):
     best_metrics = {'total_loss': float('inf')}
 
     if resume_path and os.path.exists(resume_path):
-        ckpt = torch.load(resume_path, map_location='cuda')
+        ckpt = safe_torch_load(resume_path, map_location='cuda')
         hash_grid.load_state_dict(ckpt['hash_grid_state'])
         renderer.fine_decoder.load_state_dict(ckpt['fine_decoder_state'])
         if renderer.coarse_carrier_fusion is not None and 'coarse_fusion_state' in ckpt:

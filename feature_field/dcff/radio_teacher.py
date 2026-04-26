@@ -14,6 +14,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from feature_extract.utils.radio_loader import load_radio_model
+
 
 class OnlineRadioTeacher(nn.Module):
     """Online RADIO inference + learned linear projection.
@@ -33,13 +35,12 @@ class OnlineRadioTeacher(nn.Module):
         self.target_dim = target_dim
         self.shallow_block = shallow_block
         self.device_str = device
+        self.intermediate_aggregation = 'dense'
+        self.intermediate_norm_alpha_scheme = 'post-alpha'
 
         # Load frozen RADIO model
         print(f"[RadioTeacher] Loading RADIO ViT-H/16...")
-        self.radio = torch.hub.load(
-            radio_repo, 'radio_model',
-            version='c-radio_v4-h', source='local', skip_validation=True,
-        )
+        self.radio = load_radio_model(version='c-radio_v4-h', radio_repo=radio_repo)
         self.radio.eval()
         for p in self.radio.parameters():
             p.requires_grad_(False)
@@ -59,9 +60,15 @@ class OnlineRadioTeacher(nn.Module):
             # Orthogonal initialization
             self._init_orthogonal()
 
-        # Hook for shallow features
         self._shallow_features = None
-        self._register_hook()
+        self._use_forward_intermediates = hasattr(self.radio, 'forward_intermediates')
+        if self._use_forward_intermediates:
+            print(
+                f"  Using RADIO forward_intermediates() for shallow block {self.shallow_block} "
+                f"(aggregation={self.intermediate_aggregation})"
+            )
+        else:
+            self._register_hook()
 
         print(f"  Projections: 1280d → {target_dim}d (fine + coarse)")
 
@@ -157,17 +164,36 @@ class OnlineRadioTeacher(nn.Module):
 
         self._shallow_features = None
         with torch.autocast('cuda', dtype=torch.bfloat16):
-            summary, deep_feat = self.radio(images, feature_fmt='NCHW')
+            if self._use_forward_intermediates:
+                final, intermediates = self.radio.forward_intermediates(
+                    images,
+                    indices=[self.shallow_block],
+                    return_prefix_tokens=False,
+                    norm=False,
+                    stop_early=False,
+                    output_fmt='NCHW',
+                    intermediates_only=False,
+                    aggregation=self.intermediate_aggregation,
+                    norm_alpha_scheme=self.intermediate_norm_alpha_scheme,
+                )
+                deep_features = final.features if hasattr(final, 'features') else final[1]
+                deep_feat = deep_features.float()
+                if intermediates:
+                    fine_feat = intermediates[0].float()
+                else:
+                    fine_feat = deep_feat
+            else:
+                summary, deep_feat = self.radio(images, feature_fmt='NCHW')
 
-        deep_feat = deep_feat.float()  # [B, 1280, Hp, Wp]
+                deep_feat = deep_feat.float()  # [B, 1280, Hp, Wp]
 
-        # Process shallow features from hook
-        shallow = self._shallow_features.float()  # [B, N_tokens, D]
-        if shallow.shape[1] == Hp * Wp + 1:
-            shallow = shallow[:, 1:]  # remove CLS
-        elif shallow.shape[1] != Hp * Wp:
-            shallow = shallow[:, -Hp * Wp:]
-        fine_feat = shallow.permute(0, 2, 1).reshape(B, -1, Hp, Wp)
+                # Process shallow features from hook
+                shallow = self._shallow_features.float()  # [B, N_tokens, D]
+                if shallow.shape[1] == Hp * Wp + 1:
+                    shallow = shallow[:, 1:]  # remove CLS
+                elif shallow.shape[1] != Hp * Wp:
+                    shallow = shallow[:, -Hp * Wp:]
+                fine_feat = shallow.permute(0, 2, 1).reshape(B, -1, Hp, Wp)
 
         return fine_feat, deep_feat
 

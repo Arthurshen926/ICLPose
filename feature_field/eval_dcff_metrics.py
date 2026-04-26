@@ -31,6 +31,7 @@ def parse_args():
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--source_dir", default="dataset/OldHospital")
     parser.add_argument("--feature_dir", default="feature_extract/output/features_radio_dual/OldHospital_pilot")
+    parser.add_argument("--images_subdir", default="", help="Optional image subdir, e.g. processed")
     parser.add_argument("--camera_split", default="test", choices=["train", "test", "all", "auto"])
     parser.add_argument("--camera_indices", default=None, help="Comma-separated indices into the selected split")
     parser.add_argument("--max_cameras", type=int, default=None)
@@ -73,11 +74,18 @@ def main():
     longest_edge = bundle['longest_edge']
     coarse_downsample = bundle['coarse_downsample']
 
-    train_cams, test_cams, _, _, _ = load_scene_colmap(args.source_dir, '')
+    train_cams, test_cams, _, _, _ = load_scene_colmap(args.source_dir, args.images_subdir)
     radio_cache = CachedFeatureTeacher(args.feature_dir)
     feat_h, feat_w = radio_cache.feat_h, radio_cache.feat_w
 
-    images_dir = os.path.join(args.source_dir, 'images') if os.path.isdir(os.path.join(args.source_dir, 'images')) else args.source_dir
+    if args.images_subdir:
+        images_dir = os.path.join(args.source_dir, args.images_subdir)
+    else:
+        images_dir = (
+            os.path.join(args.source_dir, 'images')
+            if os.path.isdir(os.path.join(args.source_dir, 'images'))
+            else args.source_dir
+        )
     da3_name_to_fid = build_da3_image_order(images_dir)
 
     cam_to_fid = {}

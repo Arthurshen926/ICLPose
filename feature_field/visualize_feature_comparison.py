@@ -44,6 +44,7 @@ from feature_field.dcff.deferred_renderer import DeferredCascadedRenderer
 from feature_field.dcff.feature_selection import FeatureSelectionModule
 from feature_field.dcff.radio_teacher import CachedFeatureTeacher
 from feature_field.runtime import DepthGuidedRefiner, FeatSharp
+from feature_field.utils.checkpoint_io import safe_torch_load
 from feature_field.utils.region_metrics import (
     compute_region_masks,
     empty_region_score_dict,
@@ -275,7 +276,7 @@ def _load_checkpoint_with_retry(ckpt_path, attempts=5, sleep_s=2.0):
     last_err = None
     for attempt in range(attempts):
         try:
-            return torch.load(ckpt_path, map_location='cpu')
+            return safe_torch_load(ckpt_path, map_location='cpu')
         except RuntimeError as err:
             last_err = err
             if 'PytorchStreamReader failed reading zip archive' not in str(err) or attempt == attempts - 1:

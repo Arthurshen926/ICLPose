@@ -99,8 +99,91 @@ def _compute_feature_loss(query_feat, ref_feat, alpha, loss_type, render_h, rend
         return (diff.sum(dim=1, keepdim=True) * mask).sum() / mask.sum().clamp(min=1)
 
 
+def _featuremetric_step_loss(
+    query_feat,
+    ref_feat,
+    depth,
+    alpha,
+    render_intr,
+    *,
+    damping: float,
+    device,
+):
+    """Depth-aware stationarity loss from one feature-metric GN update."""
+    from pose_refine.utils.geometry_solver import feature_metric_solve
+
+    if depth is None:
+        return torch.zeros((), device=device)
+    depth_s = depth.float()
+    if depth_s.dim() == 4:
+        depth_s = depth_s.squeeze(1)
+    valid_mask = (alpha.float() > 0.5).float() if alpha is not None else None
+
+    try:
+        direct_xi, _ = feature_metric_solve(
+            query_feat.float(),
+            ref_feat.float(),
+            depth_s,
+            render_intr,
+            damping=damping,
+            valid_mask=valid_mask,
+        )
+    except RuntimeError:
+        return torch.zeros((), device=device)
+
+    trans_norm = direct_xi[:, :3].norm(dim=1)
+    rot_norm = direct_xi[:, 3:].norm(dim=1)
+    return (trans_norm + 0.25 * rot_norm).mean()
+
+
+def _apply_featuremetric_update(
+    pose_t,
+    query_feat,
+    gaussians,
+    dcff_renderer,
+    feat_sharp,
+    K,
+    render_intr,
+    render_h,
+    render_w,
+    *,
+    damping: float,
+    step_scale: float,
+):
+    """Apply one depth-aware feature-metric update at the current pose."""
+    from pose_refine.utils.geometry_solver import feature_metric_solve
+    from pose_refine.utils.lie_algebra import se3_exp
+
+    ref_feat, depth, alpha = render_features_differentiable(
+        gaussians, dcff_renderer, feat_sharp,
+        pose_t.squeeze(0), K, render_h, render_w,
+    )
+    if depth is None:
+        return pose_t, torch.zeros(pose_t.shape[0], 6, device=pose_t.device)
+    depth_s = depth.float()
+    if depth_s.dim() == 4:
+        depth_s = depth_s.squeeze(1)
+    valid_mask = (alpha.float() > 0.5).float() if alpha is not None else None
+    try:
+        direct_xi, _ = feature_metric_solve(
+            query_feat.float(),
+            ref_feat.float(),
+            depth_s,
+            render_intr,
+            damping=damping,
+            valid_mask=valid_mask,
+        )
+    except RuntimeError:
+        return pose_t, torch.zeros(pose_t.shape[0], 6, device=pose_t.device)
+    if step_scale != 1.0:
+        direct_xi = direct_xi * float(step_scale)
+    return torch.bmm(se3_exp(direct_xi.float()), pose_t.float()), direct_xi
+
+
 def _render_and_loss(xi_np, init_pose_t, query_feat, gaussians, dcff_renderer,
-                     feat_sharp, K, render_h, render_w, loss_type, device):
+                     feat_sharp, K, render_intr, render_h, render_w, loss_type,
+                     device, geometry_weight=0.0, geometry_damping=1e-2,
+                     coverage_weight=0.0):
     """Render at pose defined by se3 delta and compute loss."""
     from pose_refine.utils.lie_algebra import se3_exp
     with torch.no_grad():
@@ -113,6 +196,20 @@ def _render_and_loss(xi_np, init_pose_t, query_feat, gaussians, dcff_renderer,
         loss = _compute_feature_loss(
             query_feat, ref_feat, alpha, loss_type, render_h, render_w, device,
         )
+        if geometry_weight > 0:
+            geom_loss = _featuremetric_step_loss(
+                query_feat,
+                ref_feat,
+                depth,
+                alpha,
+                render_intr,
+                damping=geometry_damping,
+                device=device,
+            )
+            loss = loss + float(geometry_weight) * geom_loss
+        if coverage_weight > 0 and alpha is not None:
+            coverage = (alpha.float() > 0.5).float().mean()
+            loss = loss + float(coverage_weight) * (1.0 - coverage)
     return loss.item()
 
 
@@ -128,22 +225,68 @@ def optimize_pose(
     num_steps: int = 100,
     lr: float = 1e-3,
     loss_type: str = "l2",
+    render_intr: dict | None = None,
+    optim_mode: str = "hybrid",
+    geometry_weight: float = 0.05,
+    fm_damping: float = 1e-2,
+    fm_step_scale: float = 1.0,
+    coverage_weight: float = 0.0,
 ):
-    """Optimize pose via numerical-gradient descent on feature similarity.
+    """Optimize pose with feature similarity and depth-aware geometry.
 
-    Uses finite-difference gradients since gsplat 2DGS doesn't backpropagate
-    through viewmats. 6 DOF → 12 forward passes per step.
+    ``finite_diff`` keeps the legacy numerical-gradient feature optimizer.
+    ``featuremetric`` applies depth-aware feature-metric GN updates.
+    ``hybrid`` runs finite differences and then one feature-metric update.
 
     Returns:
         optimized_pose: [4, 4] numpy array
         loss_history: list of loss values
     """
-    from pose_refine.utils.lie_algebra import se3_exp
+    from pose_refine.utils.lie_algebra import se3_exp, se3_log
 
     device = query_feat.device
+    if render_intr is None:
+        raise ValueError("render_intr is required for depth-aware render-compare")
+    if optim_mode not in {"finite_diff", "featuremetric", "hybrid"}:
+        raise ValueError(f"Unknown optim_mode: {optim_mode}")
     init_pose_t = init_pose.float().to(device)
     if init_pose_t.dim() == 2:
         init_pose_t = init_pose_t.unsqueeze(0)
+
+    if optim_mode == "featuremetric":
+        pose_cur = init_pose_t.clone()
+        loss_history = []
+        best_loss = float("inf")
+        best_pose = pose_cur.clone()
+        for _ in range(num_steps):
+            with torch.no_grad():
+                ref_feat, depth, alpha = render_features_differentiable(
+                    gaussians, dcff_renderer, feat_sharp,
+                    pose_cur.squeeze(0), K, render_h, render_w,
+                )
+                loss = _compute_feature_loss(
+                    query_feat, ref_feat, alpha, loss_type, render_h, render_w, device,
+                )
+                loss_history.append(float(loss.item()))
+                if loss.item() < best_loss:
+                    best_loss = float(loss.item())
+                    best_pose = pose_cur.clone()
+                pose_cur, direct_xi = _apply_featuremetric_update(
+                    pose_cur,
+                    query_feat,
+                    gaussians,
+                    dcff_renderer,
+                    feat_sharp,
+                    K,
+                    render_intr,
+                    render_h,
+                    render_w,
+                    damping=fm_damping,
+                    step_scale=fm_step_scale,
+                )
+            if direct_xi.norm(dim=1).max().item() < 1e-8:
+                break
+        return best_pose.squeeze(0).cpu().numpy(), loss_history
 
     xi = np.zeros(6, dtype=np.float64)
     eps = 1e-4  # finite difference epsilon
@@ -156,7 +299,10 @@ def optimize_pose(
         # Current loss
         curr_loss = _render_and_loss(
             xi, init_pose_t, query_feat, gaussians, dcff_renderer,
-            feat_sharp, K, render_h, render_w, loss_type, device,
+            feat_sharp, K, render_intr, render_h, render_w, loss_type, device,
+            geometry_weight=geometry_weight,
+            geometry_damping=fm_damping,
+            coverage_weight=coverage_weight,
         )
         loss_history.append(curr_loss)
         if curr_loss < best_loss:
@@ -170,11 +316,17 @@ def optimize_pose(
             xi_n = xi.copy(); xi_n[d] -= eps
             loss_p = _render_and_loss(
                 xi_p, init_pose_t, query_feat, gaussians, dcff_renderer,
-                feat_sharp, K, render_h, render_w, loss_type, device,
+                feat_sharp, K, render_intr, render_h, render_w, loss_type, device,
+                geometry_weight=geometry_weight,
+                geometry_damping=fm_damping,
+                coverage_weight=coverage_weight,
             )
             loss_n = _render_and_loss(
                 xi_n, init_pose_t, query_feat, gaussians, dcff_renderer,
-                feat_sharp, K, render_h, render_w, loss_type, device,
+                feat_sharp, K, render_intr, render_h, render_w, loss_type, device,
+                geometry_weight=geometry_weight,
+                geometry_damping=fm_damping,
+                coverage_weight=coverage_weight,
             )
             grad[d] = (loss_p - loss_n) / (2 * eps)
 
@@ -184,6 +336,25 @@ def optimize_pose(
             break
         step_lr = lr / (1.0 + 0.01 * step)
         xi = xi - step_lr * grad
+        if optim_mode == "hybrid":
+            with torch.no_grad():
+                d = torch.tensor(xi, device=device, dtype=torch.float32).unsqueeze(0)
+                pose_cur = torch.bmm(se3_exp(d), init_pose_t)
+                pose_cur, _ = _apply_featuremetric_update(
+                    pose_cur,
+                    query_feat,
+                    gaussians,
+                    dcff_renderer,
+                    feat_sharp,
+                    K,
+                    render_intr,
+                    render_h,
+                    render_w,
+                    damping=fm_damping,
+                    step_scale=fm_step_scale,
+                )
+                rel = torch.bmm(pose_cur, torch.inverse(init_pose_t))
+                xi = se3_log(rel).squeeze(0).detach().cpu().double().numpy()
 
     # Return best pose
     with torch.no_grad():
@@ -201,6 +372,17 @@ def main():
     parser.add_argument("--num_steps", type=int, default=100, help="Optimization steps per image")
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--loss_type", type=str, default="l2", choices=["l2", "cosine"])
+    parser.add_argument("--optim_mode", type=str, default="hybrid",
+                        choices=["finite_diff", "featuremetric", "hybrid"],
+                        help="Pose optimizer: legacy finite differences, feature-metric GN, or both")
+    parser.add_argument("--geometry_weight", type=float, default=0.05,
+                        help="Weight for depth-aware featuremetric stationarity term in finite-diff loss")
+    parser.add_argument("--fm_damping", type=float, default=1e-2,
+                        help="LM damping for feature-metric depth-aware GN")
+    parser.add_argument("--fm_step_scale", type=float, default=1.0,
+                        help="Scale applied to feature-metric GN updates")
+    parser.add_argument("--coverage_weight", type=float, default=0.0,
+                        help="Optional alpha coverage penalty weight")
     parser.add_argument("--noise_deg", type=float, default=3.0, help="Rotation noise (degrees)")
     parser.add_argument("--noise_trans", type=float, default=0.1, help="Translation noise (metres)")
     parser.add_argument("--num_seeds", type=int, default=3)
@@ -261,8 +443,9 @@ def main():
         'cy': base_intr['cy'] * sy,
     }
     K = intrinsics_to_K(render_intr, device)
-    logger.info("Render: %d×%d  Steps: %d  LR: %.4f  Seeds: %d  Test: %d",
-                render_w, render_h, args.num_steps, args.lr, args.num_seeds, len(val_ds))
+    logger.info("Render: %d×%d  Steps: %d  LR: %.4f  Mode: %s  Seeds: %d  Test: %d",
+                render_w, render_h, args.num_steps, args.lr, args.optim_mode,
+                args.num_seeds, len(val_ds))
     logger.info("Intrinsics (render): fx=%.1f fy=%.1f cx=%.1f cy=%.1f",
                 render_intr['fx'], render_intr['fy'], render_intr['cx'], render_intr['cy'])
 
@@ -295,6 +478,12 @@ def main():
                 gaussians_dcff, dcff_renderer, feat_sharp,
                 K, render_h, render_w,
                 num_steps=args.num_steps, lr=args.lr, loss_type=args.loss_type,
+                render_intr=render_intr,
+                optim_mode=args.optim_mode,
+                geometry_weight=args.geometry_weight,
+                fm_damping=args.fm_damping,
+                fm_step_scale=args.fm_step_scale,
+                coverage_weight=args.coverage_weight,
             )
 
             o_rot, o_trans = _pose_errors(opt_pose, gt_pose)
@@ -343,7 +532,7 @@ def main():
     print("=" * 70)
     print(f"Config: {args.config}")
     print(f"Noise: {args.noise_deg}° / {args.noise_trans}m")
-    print(f"Steps: {args.num_steps}  LR: {args.lr}  Loss: {args.loss_type}")
+    print(f"Steps: {args.num_steps}  LR: {args.lr}  Loss: {args.loss_type}  Mode: {args.optim_mode}")
     print(f"Seeds: {args.num_seeds}")
     print()
 
@@ -365,7 +554,7 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
     result_path = os.path.join(
         out_dir, f"results_n{args.num_steps}_lr{args.lr}_{args.loss_type}_"
-                 f"noise{args.noise_deg}deg_{args.noise_trans}m.json"
+                 f"mode{args.optim_mode}_noise{args.noise_deg}deg_{args.noise_trans}m.json"
     )
     with open(result_path, "w") as f:
         json.dump({

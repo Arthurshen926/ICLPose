@@ -16,6 +16,8 @@ import torch
 import torch.nn.functional as F
 from pathlib import Path
 
+from feature_extract.utils.radio_loader import load_radio_model
+
 
 class RADIOFeatureExtractor:
     """Extract features from NVIDIA RADIO model."""
@@ -26,10 +28,7 @@ class RADIOFeatureExtractor:
         self.radio_repo = radio_repo
 
         print(f"Loading RADIO {version}...")
-        self.model = torch.hub.load(
-            radio_repo, 'radio_model',
-            version=version, source='local', skip_validation=True
-        )
+        self.model = load_radio_model(version=version, radio_repo=radio_repo)
         self.model = self.model.to(self.device).eval()
         self.patch_size = self.model.patch_size  # 16 for v4-H
         n_params = sum(p.numel() for p in self.model.parameters()) / 1e6

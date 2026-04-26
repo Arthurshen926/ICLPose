@@ -11,15 +11,15 @@ from feature_field.utils.project_paths import resolve_checkpoint_path, resolve_r
 MAINLINE_PATH_SPECS: tuple[tuple[tuple[str, ...], str], ...] = (
     (("dataset", "feature_dir"), "repo"),
     (("dataset", "teacher_feature_dir"), "repo"),
-    (("dataset", "colmap_dir"), "repo"),
-    (("dataset", "source_dir"), "repo"),
-    (("dataset", "train_split"), "repo"),
-    (("dataset", "test_split"), "repo"),
-    (("dataset", "val_split"), "repo"),
-    (("dataset", "train_traj_path"), "repo"),
-    (("dataset", "val_traj_path"), "repo"),
-    (("dataset", "train_depth_dir"), "repo"),
-    (("dataset", "val_depth_dir"), "repo"),
+    (("dataset", "colmap_dir"), "path"),
+    (("dataset", "source_dir"), "path"),
+    (("dataset", "train_split"), "path"),
+    (("dataset", "test_split"), "path"),
+    (("dataset", "val_split"), "path"),
+    (("dataset", "train_traj_path"), "path"),
+    (("dataset", "val_traj_path"), "path"),
+    (("dataset", "train_depth_dir"), "path"),
+    (("dataset", "val_depth_dir"), "path"),
     (("dataset", "feature_base_dir"), "repo"),
     (("dcff", "checkpoint"), "checkpoint"),
     (("dcff", "joint_checkpoint"), "checkpoint"),
@@ -36,18 +36,18 @@ MAINLINE_PATH_SPECS: tuple[tuple[tuple[str, ...], str], ...] = (
 
 
 JOINT_RADIO_PATH_SPECS: tuple[tuple[tuple[str, ...], str], ...] = (
-    (("dataset", "source_dir"), "repo"),
+    (("dataset", "source_dir"), "path"),
     (("dataset", "feature_dir"), "repo"),
-    (("dataset", "train_split"), "repo"),
-    (("dataset", "val_split"), "repo"),
+    (("dataset", "train_split"), "path"),
+    (("dataset", "val_split"), "path"),
     (("retrieval", "feature_dir"), "repo"),
     (("map_supervision", "config_path"), "repo"),
-    (("map_supervision", "colmap_dir"), "repo"),
+    (("map_supervision", "colmap_dir"), "path"),
 )
 
 
 FEATURE_FIELD_PATH_SPECS: tuple[tuple[tuple[str, ...], str], ...] = (
-    (("dataset", "source_dir"), "repo"),
+    (("dataset", "source_dir"), "path"),
     (("dataset", "feature_dir"), "repo"),
     (("teacher", "radio_repo"), "repo"),
     (("teacher", "pca_init_dir"), "repo"),
@@ -103,6 +103,8 @@ def normalize_config_paths(
             continue
         if kind == "checkpoint":
             resolved = resolve_checkpoint_path(value)
+        elif kind == "path":
+            resolved = resolve_repo_path(value, enforce_local=False)
         else:
             resolved = resolve_repo_path(value, enforce_local=True)
         if resolved is not None:

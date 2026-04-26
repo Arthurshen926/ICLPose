@@ -378,37 +378,7 @@ def load_model(config, checkpoint_path, device):
         model: ConcatPoseNet in eval mode
         epoch: checkpoint epoch
     """
-    model_cfg = config.get('model', {})
-    model = ConcatPoseNet(
-        feature_dim=model_cfg.get('feature_dim', 64),
-        hidden_dim=model_cfg.get('hidden_dim', 256),
-        irls_iters=model_cfg.get('irls_iters', 0),
-        use_coarse=model_cfg.get('use_coarse', True),
-        use_gru=model_cfg.get('use_gru', True),
-        gru_iters=model_cfg.get('gru_iters', 8),
-        local_radius=model_cfg.get('local_radius', 4),
-        proj_dim=model_cfg.get('proj_dim', 32),
-        proj_mode=model_cfg.get('proj_mode', 'separate'),
-        full_wls=model_cfg.get('full_wls', False),
-        flow_init=model_cfg.get('flow_init', 'zero'),
-        coarse_flow_init=model_cfg.get('coarse_flow_init', False),
-        coarse_pool_factor=model_cfg.get('coarse_pool_factor', 4),
-        detach_trans=model_cfg.get('detach_trans', False),
-        detach_wls_rot=model_cfg.get('detach_wls_rot', False),
-        rot_mode=model_cfg.get('rot_mode', 'wls'),
-        use_cross_attention=model_cfg.get('use_cross_attention', False),
-        cross_attn_heads=model_cfg.get('cross_attn_heads', 4),
-        cross_attn_layers=model_cfg.get('cross_attn_layers', 1),
-        cross_attn_downsample=model_cfg.get('cross_attn_downsample', 2),
-        cross_attn_dropout=model_cfg.get('cross_attn_dropout', 0.1),
-    ).to(device)
-
-    ckpt = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(ckpt['model_state_dict'])
-    model.eval()
-    epoch = ckpt.get('epoch', '?')
-    print(f'Loaded localization model from epoch {epoch}')
-    return model, epoch
+    return load_concat_pose_model(config, checkpoint_path, device, printer=print)
 
 
 # Shared system-layer runtime is authoritative. The legacy helpers remain in

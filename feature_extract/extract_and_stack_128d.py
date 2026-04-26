@@ -27,6 +27,8 @@ from tqdm import tqdm
 from torchvision import transforms
 from PIL import Image
 
+from feature_extract.utils.radio_loader import load_radio_model
+
 
 class DualScaleRADIOExtractor:
     """Extract both shallow (geometric) and deep (semantic) RADIO features."""
@@ -36,12 +38,11 @@ class DualScaleRADIOExtractor:
                  shallow_block=10):
         self.device = torch.device(device)
         self.shallow_block = shallow_block
+        self.intermediate_aggregation = 'dense'
+        self.intermediate_norm_alpha_scheme = 'post-alpha'
 
         print(f"Loading RADIO {version}...")
-        self.model = torch.hub.load(
-            radio_repo, 'radio_model',
-            version=version, source='local', skip_validation=True,
-        )
+        self.model = load_radio_model(version=version, radio_repo=radio_repo)
         self.model = self.model.to(self.device).eval()
         self.patch_size = self.model.patch_size
 
@@ -49,7 +50,14 @@ class DualScaleRADIOExtractor:
         print(f"  RADIO loaded: {n_params:.0f}M params, patch_size={self.patch_size}")
 
         self._shallow_features = None
-        self._register_hooks()
+        self._use_forward_intermediates = hasattr(self.model, 'forward_intermediates')
+        if self._use_forward_intermediates:
+            print(
+                f"  Using RADIO forward_intermediates() for shallow block {self.shallow_block} "
+                f"(aggregation={self.intermediate_aggregation})"
+            )
+        else:
+            self._register_hooks()
 
     def _register_hooks(self):
         blocks = None
@@ -108,28 +116,50 @@ class DualScaleRADIOExtractor:
             else nullcontext()
         )
         with autocast_context:
-            summary, features = self.model(image_tensor, feature_fmt='NCHW')
-
-        sem = features.squeeze(0).float()  # (D, Hp, Wp)
-
-        if hasattr(self, '_use_single_layer') and self._use_single_layer:
-            geo = sem.clone()
-        else:
-            shallow = self._shallow_features
-            if shallow is not None:
-                shallow = shallow.squeeze(0).float()
-                if shallow.shape[0] == Hp * Wp + 1:
-                    shallow = shallow[1:]
-                elif shallow.shape[0] != Hp * Wp:
-                    shallow = shallow[-Hp * Wp:]
-                geo = shallow.T.reshape(-1, Hp, Wp)
+            if self._use_forward_intermediates:
+                final, intermediates = self.model.forward_intermediates(
+                    image_tensor,
+                    indices=[self.shallow_block],
+                    return_prefix_tokens=False,
+                    norm=False,
+                    stop_early=False,
+                    output_fmt='NCHW',
+                    intermediates_only=False,
+                    aggregation=self.intermediate_aggregation,
+                    norm_alpha_scheme=self.intermediate_norm_alpha_scheme,
+                )
+                final_features = final.features if hasattr(final, 'features') else final[1]
+                final_summary = final.summary if hasattr(final, 'summary') else final[0]
+                sem = final_features.squeeze(0).float()
+                summary = final_summary.squeeze(0).float()
+                if intermediates:
+                    geo = intermediates[0].squeeze(0).float()
+                else:
+                    geo = sem.clone()
             else:
-                geo = sem.clone()
+                summary, features = self.model(image_tensor, feature_fmt='NCHW')
+
+                sem = features.squeeze(0).float()  # (D, Hp, Wp)
+
+                if hasattr(self, '_use_single_layer') and self._use_single_layer:
+                    geo = sem.clone()
+                else:
+                    shallow = self._shallow_features
+                    if shallow is not None:
+                        shallow = shallow.squeeze(0).float()
+                        if shallow.shape[0] == Hp * Wp + 1:
+                            shallow = shallow[1:]
+                        elif shallow.shape[0] != Hp * Wp:
+                            shallow = shallow[-Hp * Wp:]
+                        geo = shallow.T.reshape(-1, Hp, Wp)
+                    else:
+                        geo = sem.clone()
+                summary = summary.squeeze(0).float()
 
         return {
             'geo': geo,
             'sem': sem,
-            'summary': summary.squeeze(0).float(),
+            'summary': summary,
         }
 
 

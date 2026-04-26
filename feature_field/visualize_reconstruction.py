@@ -21,18 +21,18 @@ import argparse
 import numpy as np
 import torch
 import torch.nn.functional as F
-from pathlib import Path
 from PIL import Image
 import matplotlib.pyplot as plt
-import matplotlib.cm as cm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from feature_field.dcff.hybrid_gaussian import HybridGaussianModel
-from feature_field.dcff.hash_grid import SpatialHashGrid
-from feature_field.dcff.deferred_renderer import DeferredCascadedRenderer
 from feature_field.dcff.radio_teacher import CachedFeatureTeacher
+from feature_field.utils.feature_track_vis import feature_group_to_rgb_images
 from feature_field.utils.scene_colmap import load_scene_colmap, build_da3_image_order
+from feature_field.visualize_feature_comparison import (
+    _apply_dcff_postprocess,
+    _build_dcff_eval_components,
+)
 
 
 def cosine_similarity_map(pred, target, mask=None):
@@ -72,88 +72,32 @@ def visualize_reconstruction(
     output_dir,
     camera_idx=0,
     device='cuda',
+    images_subdir='',
 ):
     os.makedirs(output_dir, exist_ok=True)
 
     print(f"Loading checkpoint: {ckpt_path}")
-    ckpt = torch.load(ckpt_path, map_location=device)
-    cfg = ckpt.get('config', {})
+    bundle = _build_dcff_eval_components(ckpt_path, device)
+    ckpt = bundle['ckpt']
+    cfg = bundle['cfg']
     mcfg = cfg.get('model', {})
-    dcfg = cfg.get('dataset', {})
-    ccfg = cfg.get('coarse_decoder', {})
-    fcfg = cfg.get('fine_decoder', {})
-    feat_dim = mcfg.get('feature_dim', 64)
-    latent_dim = mcfg.get('latent_dim', 32)
+    feat_dim = bundle['feat_dim']
+    renderer = bundle['renderer']
+    gaussians = bundle['gaussians']
+    feat_sharp_fine = bundle['feat_sharp_fine']
+    feat_select = bundle['feat_select']
 
     # Load scene
     train_cams, test_cams, pcd_xyz, pcd_rgb, cameras_extent = \
-        load_scene_colmap(source_dir, '')
+        load_scene_colmap(source_dir, images_subdir)
     radio_cache = CachedFeatureTeacher(feature_dir)
     feat_h, feat_w = radio_cache.feat_h, radio_cache.feat_w
-    coarse_h, coarse_w = feat_h // 2, feat_w // 2
-
-    # Setup models
-    gaussians = HybridGaussianModel(sh_degree=3, latent_dim=latent_dim)
-    gaussians.load_ply(ckpt.get('init_ply') or cfg.get('training', {}).get('init_ply'))
-    gaussians.training_setup(argparse.Namespace(
-        position_lr_init=0.00016, position_lr_final=0.0000016,
-        feature_lr=0.0025, opacity_lr=0.05, scaling_lr=0.005,
-        rotation_lr=0.001, latent_lr=0.0003, percent_dense=0.01, iterations=1,
-    ))
-
-    if 'latent' in ckpt:
-        latent = ckpt['latent']
-        gs_latent = gaussians._latent
-        n_copy = min(latent.shape[0], gs_latent.shape[0])
-        gs_latent.data[:n_copy].copy_(latent[:n_copy].cuda())
-
-    hash_grid = SpatialHashGrid(
-        scene_extent=cameras_extent * 1.2,
-        feature_dim=feat_dim,
-        input_mode='implicit_scale',
-        latent_dim=latent_dim,
-        scale_dim=2,
-        scale_pe_freqs=4,
-        include_raw_scale=True,
-        n_levels=16,
-        n_features_per_level=2,
-        log2_hashmap_size=20,
-        base_resolution=16,
-        max_resolution=4096,
-        sh_degree=3,
-        mlp_hidden=128,
-        mlp_layers=2,
-    ).to(device)
-    hash_grid.load_state_dict(ckpt['hash_grid_state'])
-
-    carrier_hidden = 64
-    gate_hidden = 64
-    if 'coarse_fusion_state' in ckpt:
-        cstate = ckpt['coarse_fusion_state']
-        carrier_hidden = cstate['carrier_proj.0.weight'].shape[0]
-        gate_hidden = cstate['residual_gate.0.weight'].shape[0]
-
-    renderer = DeferredCascadedRenderer(
-        hash_grid=hash_grid,
-        latent_dim=latent_dim,
-        fine_feature_dim=feat_dim,
-        coarse_feature_dim=feat_dim,
-        fine_hidden_dim=fcfg.get('hidden_dim', 128),
-        fine_num_layers=fcfg.get('num_layers', 5),
-        fine_use_viewdirs=fcfg.get('use_viewdirs', False),
-        fine_decoder_type=fcfg.get('type', 'spatial'),
-        coarse_mode=ccfg.get('mode', 'carrier_residual'),
-        coarse_carrier_hidden_dim=carrier_hidden,
-        coarse_gate_hidden_dim=gate_hidden,
-        coarse_smoothing_kernel=mcfg.get('coarse_smoothing_kernel', 1),
-    ).to(device)
-    renderer.fine_decoder.load_state_dict(ckpt['fine_decoder_state'])
-    if 'coarse_fusion_state' in ckpt:
-        renderer.coarse_carrier_fusion.load_state_dict(ckpt['coarse_fusion_state'])
 
     # Camera-to-feature mapping
     import glob
-    if os.path.isdir(os.path.join(source_dir, 'images')):
+    if images_subdir:
+        images_dir = os.path.join(source_dir, images_subdir)
+    elif os.path.isdir(os.path.join(source_dir, 'images')):
         images_dir = os.path.join(source_dir, 'images')
     else:
         images_dir = source_dir
@@ -202,9 +146,7 @@ def visualize_reconstruction(
                      dtype=torch.float32, device=device).unsqueeze(0)
 
     # Render
-    hash_grid.eval()
     renderer.eval()
-    hash_grid.zero_grad()
     renderer.zero_grad()
 
     with torch.no_grad():
@@ -217,6 +159,13 @@ def visualize_reconstruction(
             render_coarse=True,
             feature_height=feat_h,
             feature_width=feat_w,
+        )
+        result = _apply_dcff_postprocess(
+            result,
+            feat_h,
+            feat_w,
+            feat_sharp_fine=feat_sharp_fine,
+            feat_select=feat_select,
         )
 
     # Get features
@@ -265,15 +214,18 @@ def visualize_reconstruction(
     axes[0, 1].set_title('Depth')
     axes[0, 1].axis('off')
 
-    fine_vis = F.normalize(fine_pred_up, p=2, dim=1)
-    fine_rgb = (fine_vis[:, :3] + 1) / 2
-    axes[0, 2].imshow(fine_rgb.squeeze(0).permute(1, 2, 0).cpu().clamp(0, 1))
+    fine_rgb, geo_rgb = [
+        np.asarray(img)
+        for img in feature_group_to_rgb_images(
+            [fine_pred_up.squeeze(0), geo_target.squeeze(0)],
+            [mask_fine.squeeze(0), mask_fine.squeeze(0)],
+        )
+    ]
+    axes[0, 2].imshow(fine_rgb)
     axes[0, 2].set_title(f'Fine Pred (cos={fine_cos_mean:.3f})')
     axes[0, 2].axis('off')
 
-    geo_vis = F.normalize(geo_target, p=2, dim=1)
-    geo_rgb = (geo_vis[:, :3] + 1) / 2
-    axes[0, 3].imshow(geo_rgb.squeeze(0).permute(1, 2, 0).cpu().clamp(0, 1))
+    axes[0, 3].imshow(geo_rgb)
     axes[0, 3].set_title('Fine Target (RADIO)')
     axes[0, 3].axis('off')
 
@@ -288,15 +240,18 @@ def visualize_reconstruction(
     axes[1, 1].axis('off')
     plt.colorbar(im, ax=axes[1, 1])
 
-    coarse_vis = F.normalize(coarse_pred_up, p=2, dim=1)
-    coarse_rgb = (coarse_vis[:, :3] + 1) / 2
-    axes[1, 2].imshow(coarse_rgb.squeeze(0).permute(1, 2, 0).cpu().clamp(0, 1))
+    coarse_rgb, sem_rgb = [
+        np.asarray(img)
+        for img in feature_group_to_rgb_images(
+            [coarse_pred_up.squeeze(0), sem_target.squeeze(0)],
+            [mask_coarse.squeeze(0), mask_coarse.squeeze(0)],
+        )
+    ]
+    axes[1, 2].imshow(coarse_rgb)
     axes[1, 2].set_title(f'Coarse Pred (cos={coarse_cos_mean:.3f})')
     axes[1, 2].axis('off')
 
-    sem_vis = F.normalize(sem_target, p=2, dim=1)
-    sem_rgb = (sem_vis[:, :3] + 1) / 2
-    axes[1, 3].imshow(sem_rgb.squeeze(0).permute(1, 2, 0).cpu().clamp(0, 1))
+    axes[1, 3].imshow(sem_rgb)
     axes[1, 3].set_title('Coarse Target (RADIO)')
     axes[1, 3].axis('off')
 
@@ -368,6 +323,7 @@ if __name__ == '__main__':
     parser.add_argument('--feature_dir', default='/root/ICLPose-loc/feature_extract/output/features_radio_dual/OldHospital_pilot')
     parser.add_argument('--output_dir', default='feature_field/output/vis/reconstruction')
     parser.add_argument('--camera_idx', type=int, default=0)
+    parser.add_argument('--images_subdir', default='', help='Optional image subdir, e.g. processed')
     args = parser.parse_args()
 
     visualize_reconstruction(
@@ -376,4 +332,5 @@ if __name__ == '__main__':
         args.feature_dir,
         args.output_dir,
         args.camera_idx,
+        images_subdir=args.images_subdir,
     )

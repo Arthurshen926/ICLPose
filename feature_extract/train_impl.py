@@ -59,10 +59,10 @@ from feature_field.utils.feature_track_vis import save_feature_track_visual
 
 DEFAULT_CONFIG = {
     "exp_name": "joint_radio_dcff_oh_v1",
-    "output_dir": "feature_extract/output",
+    "output_dir": "/root/ICLPose/result/feature_extract",
     "dataset": {
         "source_dir": "dataset/OldHospital",
-        "feature_dir": "feature_extract/output/features_radio_dual/OldHospital",
+        "feature_dir": "/root/ICLPose/result/feature_extract/features_radio_dual/OldHospital",
         "train_split": "dataset/OldHospital/dataset_train.txt",
         "val_split": "dataset/OldHospital/dataset_test.txt",
         "image_patterns": [
@@ -116,6 +116,7 @@ DEFAULT_CONFIG = {
         "coarse_l1_weight": 1.0,
         "coarse_cos_weight": 1.0,
         "coarse_channel_std_weight": 0.0,
+        "fine_coarse_ortho_weight": 0.0,
         "teacher_norm_weight": 0.0,
         "query_teacher_infonce_weight": 0.0,
         "infonce_temperature": 0.07,
@@ -147,12 +148,21 @@ DEFAULT_CONFIG = {
         "train_fine_decoder": False,
         "train_feat_sharp": False,
         "train_hash_mlp": False,
+        "train_latent": False,
+        "train_geometry": False,
+        "reset_latent": False,
+        "latent_init_std": 0.01,
         "detach_query_features": False,
         "coarse_smoothing_kernel": 1,
+        "latent_lr_scale": 0.05,
+        "geometry_lr_scale": 0.01,
         "coarse_start_epoch": 999999,
         "query_fine_weight": 0.0,
         "query_fine_raw_weight": 0.0,
         "query_coarse_weight": 0.0,
+        "query_fine_infonce_weight": 0.0,
+        "query_coarse_infonce_weight": 0.0,
+        "fine_coarse_ortho_weight": 0.0,
         "perturb_rank_weight": 0.0,
         "perturb_max_shift_px": 2,
         "perturb_margin": 0.1,
@@ -162,10 +172,12 @@ DEFAULT_CONFIG = {
         "rendered_teacher_fine_weight": 0.0,
         "rendered_teacher_fine_raw_weight": 0.0,
         "rendered_teacher_coarse_weight": 0.0,
+        "rendered_teacher_fine_infonce_weight": 0.0,
+        "rendered_teacher_coarse_infonce_weight": 0.0,
     },
     "visualization": {
         "num_val_vis": 4,
-        "save_root": "/root/result/loc/feature_track",
+        "save_root": "/root/ICLPose/result/feature_extract/visualizations/feature_track",
     },
 }
 
@@ -482,15 +494,30 @@ class MapFeatureRenderer(nn.Module):
         self.train_feat_sharp = self.trainable and bool(map_cfg.get("train_feat_sharp", False))
         self.train_fsm = self.trainable and bool(map_cfg.get("train_fsm", False))
         self.train_hash_mlp = self.trainable and bool(map_cfg.get("train_hash_mlp", False))
+        self.train_latent = self.trainable and bool(map_cfg.get("train_latent", False))
+        self.train_geometry = self.trainable and bool(map_cfg.get("train_geometry", False))
         self.map_lr_scale = float(map_cfg.get("map_lr_scale", 0.1))
         self.hash_mlp_lr_scale = float(map_cfg.get("hash_mlp_lr_scale", 0.05))
+        self.latent_lr_scale = float(map_cfg.get("latent_lr_scale", self.map_lr_scale))
+        self.geometry_lr_scale = float(map_cfg.get("geometry_lr_scale", self.map_lr_scale * 0.25))
 
         runtime = build_dcff_runtime(render_cfg, device, printer=logger.info)
         self.gaussians = runtime.gaussians
         self.dcff_renderer = runtime.renderer
         self.feat_sharp = runtime.refiner
         self.feat_select = runtime.feat_select
-        self.gaussians._latent.requires_grad_(False)
+        if bool(map_cfg.get("reset_latent", False)):
+            latent_std = float(map_cfg.get("latent_init_std", 0.01))
+            with torch.no_grad():
+                self.gaussians._latent.normal_(mean=0.0, std=latent_std)
+            logger.info("  Reset Gaussian latent to N(0, %.4f^2)", latent_std)
+        self.gaussians._latent.requires_grad_(self.train_latent)
+        self.gaussians._xyz.requires_grad_(self.train_geometry)
+        self.gaussians._rotation.requires_grad_(self.train_geometry)
+        self.gaussians._scaling.requires_grad_(self.train_geometry)
+        self.gaussians._opacity.requires_grad_(self.train_geometry)
+        self.gaussians._features_dc.requires_grad_(False)
+        self.gaussians._features_rest.requires_grad_(False)
         for p in self.dcff_renderer.fine_decoder.parameters():
             p.requires_grad_(self.train_fine_decoder)
         for p in self.feat_sharp.parameters():
@@ -526,7 +553,7 @@ class MapFeatureRenderer(nn.Module):
             self.basename_to_name.setdefault(Path(name).name, name)
 
         logger.info(
-            "Map renderer loaded: config=%s, views=%d, feature_hw=%s, cache=%s, trainable=%s, fine_decoder=%s, feat_sharp=%s, fsm=%s, hash_mlp=%s",
+            "Map renderer loaded: config=%s, views=%d, feature_hw=%s, cache=%s, trainable=%s, fine_decoder=%s, feat_sharp=%s, fsm=%s, hash_mlp=%s, latent=%s, geometry=%s",
             config_path,
             len(self.name_to_pose),
             self.feature_hw,
@@ -536,6 +563,8 @@ class MapFeatureRenderer(nn.Module):
             self.train_feat_sharp,
             self.train_fsm,
             self.train_hash_mlp,
+            self.train_latent,
+            self.train_geometry,
         )
 
     def _normalize_name(self, sample_name):
@@ -568,7 +597,14 @@ class MapFeatureRenderer(nn.Module):
         return torch.tensor(pose_np.tolist(), dtype=torch.float32)
 
     def has_trainable_params(self):
-        return self.train_fine_decoder or self.train_feat_sharp or self.train_fsm or self.train_hash_mlp
+        return (
+            self.train_fine_decoder
+            or self.train_feat_sharp
+            or self.train_fsm
+            or self.train_hash_mlp
+            or self.train_latent
+            or self.train_geometry
+        )
 
     def set_train_mode(self, enabled):
         if enabled and self.has_trainable_params():
@@ -616,6 +652,27 @@ class MapFeatureRenderer(nn.Module):
                     "weight_decay": weight_decay,
                 }
             )
+        if self.train_latent:
+            groups.append(
+                {
+                    "params": [self.gaussians._latent],
+                    "lr": base_lr * self.latent_lr_scale,
+                    "weight_decay": weight_decay,
+                }
+            )
+        if self.train_geometry:
+            groups.append(
+                {
+                    "params": [
+                        self.gaussians._xyz,
+                        self.gaussians._rotation,
+                        self.gaussians._scaling,
+                        self.gaussians._opacity,
+                    ],
+                    "lr": base_lr * self.geometry_lr_scale,
+                    "weight_decay": weight_decay,
+                }
+            )
         return [group for group in groups if group["params"]]
 
     def export_trainable_state(self):
@@ -628,6 +685,15 @@ class MapFeatureRenderer(nn.Module):
             state["fsm"] = self.feat_select.state_dict()
         if self.train_hash_mlp:
             state["hash_grid_mlp"] = self.dcff_renderer.hash_grid.mlp.state_dict()
+        if self.train_latent:
+            state["gaussian_latent"] = self.gaussians._latent.detach().cpu()
+        if self.train_geometry:
+            state["gaussian_geometry"] = {
+                "xyz": self.gaussians._xyz.detach().cpu(),
+                "rotation": self.gaussians._rotation.detach().cpu(),
+                "scaling": self.gaussians._scaling.detach().cpu(),
+                "opacity": self.gaussians._opacity.detach().cpu(),
+            }
         return state
 
     def load_trainable_state(self, state_dict):
@@ -653,6 +719,19 @@ class MapFeatureRenderer(nn.Module):
                 self.dcff_renderer.hash_grid.mlp.load_state_dict(state_dict["hash_grid_mlp"])
             except RuntimeError as e:
                 self.logger.info("Skipping map warmstart hash_grid_mlp (architecture changed): %s", e)
+        if "gaussian_latent" in state_dict:
+            latent = state_dict["gaussian_latent"]
+            if latent.shape == self.gaussians._latent.shape:
+                self.gaussians._latent.data.copy_(latent.to(self.device))
+        if "gaussian_geometry" in state_dict:
+            try:
+                geom = state_dict["gaussian_geometry"]
+                self.gaussians._xyz.data.copy_(geom["xyz"].to(self.device))
+                self.gaussians._rotation.data.copy_(geom["rotation"].to(self.device))
+                self.gaussians._scaling.data.copy_(geom["scaling"].to(self.device))
+                self.gaussians._opacity.data.copy_(geom["opacity"].to(self.device))
+            except KeyError as e:
+                self.logger.info("Skipping map warmstart geometry (missing key): %s", e)
 
     def clear_cache(self):
         self._cache.clear()
@@ -798,6 +877,18 @@ def resolve_linear_weight(map_cfg, key, epoch):
     return start + (end - start) * alpha
 
 
+def feature_orthogonality_loss(pred_a, pred_b, mask=None):
+    pred_a_n = F.normalize(pred_a, dim=1)
+    pred_b_n = F.normalize(pred_b, dim=1)
+    cos = (pred_a_n * pred_b_n).sum(dim=1, keepdim=True)
+    penalty = cos.square()
+    if mask is not None:
+        penalty = penalty * mask
+        denom = mask.sum().clamp(min=1.0)
+        return penalty.sum() / denom
+    return penalty.mean()
+
+
 def compute_main_losses(outputs, batch, cfg):
     loss_cfg = cfg["loss"]
     teacher_fine = batch["teacher_fine"]
@@ -820,6 +911,8 @@ def compute_main_losses(outputs, batch, cfg):
         + loss_cfg["coarse_cos_weight"] * coarse_cos
         + float(loss_cfg.get("coarse_channel_std_weight", 0.0)) * coarse_cs
     )
+    fine_coarse_ortho = feature_orthogonality_loss(pred_fine, pred_coarse)
+    total = total + float(loss_cfg.get("fine_coarse_ortho_weight", 0.0)) * fine_coarse_ortho
 
     metrics = {
         "loss_total": total.detach(),
@@ -829,6 +922,7 @@ def compute_main_losses(outputs, batch, cfg):
         "coarse_l1": coarse_l1.detach(),
         "coarse_cos_loss": coarse_cos.detach(),
         "coarse_channel_std_loss": coarse_cs.detach(),
+        "fine_coarse_ortho_loss": fine_coarse_ortho.detach(),
         "fine_cosine": (1.0 - fine_cos).detach(),
         "coarse_cosine": (1.0 - coarse_cos).detach(),
     }
@@ -925,6 +1019,7 @@ def compute_main_losses(outputs, batch, cfg):
 
 def compute_map_supervision(batch, outputs, cfg, device, epoch=0):
     map_cfg = cfg.get("map_supervision", {})
+    loss_cfg = cfg.get("loss", {})
     zero = torch.zeros((), device=device)
     if not map_cfg.get("enabled", False):
         return zero, {"map_hook_active": zero, "map_hook_loss": zero}
@@ -956,6 +1051,21 @@ def compute_map_supervision(batch, outputs, cfg, device, epoch=0):
     rendered_teacher_fine_raw_weight = resolve_linear_weight(
         map_cfg, "rendered_teacher_fine_raw_weight", epoch
     )
+    query_fine_infonce_weight = resolve_linear_weight(map_cfg, "query_fine_infonce_weight", epoch)
+    query_coarse_infonce_weight = (
+        resolve_linear_weight(map_cfg, "query_coarse_infonce_weight", epoch) if coarse_active else 0.0
+    )
+    rendered_teacher_fine_infonce_weight = resolve_linear_weight(
+        map_cfg, "rendered_teacher_fine_infonce_weight", epoch
+    )
+    rendered_teacher_coarse_infonce_weight = (
+        resolve_linear_weight(map_cfg, "rendered_teacher_coarse_infonce_weight", epoch)
+        if coarse_active
+        else 0.0
+    )
+    infonce_temperature = float(map_cfg.get("infonce_temperature", loss_cfg.get("infonce_temperature", 0.07)))
+    infonce_samples = int(map_cfg.get("infonce_samples", loss_cfg.get("infonce_samples", 256)))
+    fine_coarse_ortho_weight = float(map_cfg.get("fine_coarse_ortho_weight", 0.0))
 
     query_fine_loss = (
         l1_feature_loss(pred_fine_target, rendered_fine, mask)
@@ -976,14 +1086,51 @@ def compute_map_supervision(batch, outputs, cfg, device, epoch=0):
         l1_feature_loss(pred_coarse_target, rendered_coarse, mask)
         + cosine_loss(pred_coarse_target, rendered_coarse, mask)
     ) * query_coarse_weight
+    query_fine_nce_loss = zero
+    if query_fine_infonce_weight > 0:
+        query_fine_nce_loss = infonce_contrastive_loss(
+            pred_fine_target,
+            rendered_fine,
+            mask=mask,
+            temperature=infonce_temperature,
+            n_samples=infonce_samples,
+        ) * query_fine_infonce_weight
+    query_coarse_nce_loss = zero
+    if query_coarse_infonce_weight > 0:
+        query_coarse_nce_loss = infonce_contrastive_loss(
+            pred_coarse_target,
+            rendered_coarse,
+            mask=mask,
+            temperature=infonce_temperature,
+            n_samples=infonce_samples,
+        ) * query_coarse_infonce_weight
     rendered_teacher_fine_loss = (
         l1_feature_loss(rendered_fine, teacher_fine, mask)
         + cosine_loss(rendered_fine, teacher_fine, mask)
     ) * rendered_teacher_fine_weight
+    rendered_teacher_fine_nce_loss = zero
+    if rendered_teacher_fine_infonce_weight > 0:
+        rendered_teacher_fine_nce_loss = infonce_contrastive_loss(
+            rendered_fine,
+            teacher_fine,
+            mask=mask,
+            temperature=infonce_temperature,
+            n_samples=infonce_samples,
+        ) * rendered_teacher_fine_infonce_weight
     rendered_teacher_coarse_loss = (
         l1_feature_loss(rendered_coarse, teacher_coarse, mask)
         + cosine_loss(rendered_coarse, teacher_coarse, mask)
     ) * rendered_teacher_coarse_weight
+    rendered_teacher_coarse_nce_loss = zero
+    if rendered_teacher_coarse_infonce_weight > 0:
+        rendered_teacher_coarse_nce_loss = infonce_contrastive_loss(
+            rendered_coarse,
+            teacher_coarse,
+            mask=mask,
+            temperature=infonce_temperature,
+            n_samples=infonce_samples,
+        ) * rendered_teacher_coarse_infonce_weight
+    map_fine_coarse_ortho_loss = feature_orthogonality_loss(rendered_fine, rendered_coarse, mask) * fine_coarse_ortho_weight
 
     perturb_rank_weight = float(map_cfg.get("perturb_rank_weight", 0.0))
     perturb_rank_loss = zero
@@ -1020,9 +1167,14 @@ def compute_map_supervision(batch, outputs, cfg, device, epoch=0):
         query_fine_loss
         + query_fine_raw_loss
         + query_coarse_loss
+        + query_fine_nce_loss
+        + query_coarse_nce_loss
         + rendered_teacher_fine_loss
         + rendered_teacher_fine_raw_loss
         + rendered_teacher_coarse_loss
+        + rendered_teacher_fine_nce_loss
+        + rendered_teacher_coarse_nce_loss
+        + map_fine_coarse_ortho_loss
         + perturb_rank_weight * perturb_rank_loss
     )
 
@@ -1043,9 +1195,14 @@ def compute_map_supervision(batch, outputs, cfg, device, epoch=0):
         "map_query_fine_loss": query_fine_loss.detach(),
         "map_query_fine_raw_loss": query_fine_raw_loss.detach(),
         "map_query_coarse_loss": query_coarse_loss.detach(),
+        "map_query_fine_nce_loss": query_fine_nce_loss.detach(),
+        "map_query_coarse_nce_loss": query_coarse_nce_loss.detach(),
         "map_rendered_teacher_fine_loss": rendered_teacher_fine_loss.detach(),
         "map_rendered_teacher_fine_raw_loss": rendered_teacher_fine_raw_loss.detach(),
         "map_rendered_teacher_coarse_loss": rendered_teacher_coarse_loss.detach(),
+        "map_rendered_teacher_fine_nce_loss": rendered_teacher_fine_nce_loss.detach(),
+        "map_rendered_teacher_coarse_nce_loss": rendered_teacher_coarse_nce_loss.detach(),
+        "map_fine_coarse_ortho_loss": map_fine_coarse_ortho_loss.detach(),
         "map_perturb_rank_loss": perturb_rank_loss.detach(),
         "map_query_fine_weight": torch.tensor(query_fine_weight, device=device),
         "map_query_fine_raw_weight": torch.tensor(query_fine_raw_weight, device=device),
@@ -1053,6 +1210,15 @@ def compute_map_supervision(batch, outputs, cfg, device, epoch=0):
         "map_rendered_teacher_fine_raw_weight": torch.tensor(
             rendered_teacher_fine_raw_weight, device=device
         ),
+        "map_query_fine_infonce_weight": torch.tensor(query_fine_infonce_weight, device=device),
+        "map_query_coarse_infonce_weight": torch.tensor(query_coarse_infonce_weight, device=device),
+        "map_rendered_teacher_fine_infonce_weight": torch.tensor(
+            rendered_teacher_fine_infonce_weight, device=device
+        ),
+        "map_rendered_teacher_coarse_infonce_weight": torch.tensor(
+            rendered_teacher_coarse_infonce_weight, device=device
+        ),
+        "map_fine_coarse_ortho_weight": torch.tensor(fine_coarse_ortho_weight, device=device),
         "map_teacher_fine_cosine": fine_map_teacher_cos.detach(),
         "map_teacher_fine_raw_cosine": fine_map_raw_teacher_cos.detach(),
         "map_teacher_coarse_cosine": coarse_map_teacher_cos.detach(),
