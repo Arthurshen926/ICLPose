@@ -1,0 +1,606 @@
+Loading data...
+  Train: 895 samples
+  Test: 182 samples
+
+Pooling features (spp)...
+  Feature dim: 7936
+
+======================================================================
+k-NN REGRESSION EXPERIMENTS
+======================================================================
+  knn_k1_cosine_uniform: R@10°/2m=15.9%, R@5°/1m=3.8%  (0.8s)
+  knn_k3_cosine_uniform: R@10°/2m=18.7%, R@5°/1m=3.8%  (0.7s)
+  knn_k5_cosine_uniform: R@10°/2m=16.5%, R@5°/1m=5.5%  (0.7s)
+  knn_k7_cosine_uniform: R@10°/2m=16.5%, R@5°/1m=6.6%  (0.7s)
+  knn_k10_cosine_uniform: R@10°/2m=19.8%, R@5°/1m=4.9%  (0.7s)
+  knn_k15_cosine_uniform: R@10°/2m=14.8%, R@5°/1m=3.3%  (0.6s)
+  knn_k20_cosine_uniform: R@10°/2m=18.7%, R@5°/1m=4.4%  (0.6s)
+  knn_k30_cosine_uniform: R@10°/2m=19.8%, R@5°/1m=2.7%  (0.6s)
+  knn_k50_cosine_uniform: R@10°/2m=13.2%, R@5°/1m=3.3%  (0.7s)
+  knn_k1_cosine_distance: R@10°/2m=15.9%, R@5°/1m=3.8%  (0.6s)
+  knn_k3_cosine_distance: R@10°/2m=18.1%, R@5°/1m=4.9%  (0.6s)
+  knn_k5_cosine_distance: R@10°/2m=17.6%, R@5°/1m=6.0%  (0.6s)
+  knn_k7_cosine_distance: R@10°/2m=17.6%, R@5°/1m=6.6%  (0.6s)
+  knn_k10_cosine_distance: R@10°/2m=20.3%, R@5°/1m=4.9%  (0.7s)
+  knn_k15_cosine_distance: R@10°/2m=15.4%, R@5°/1m=3.8%  (0.6s)
+  knn_k20_cosine_distance: R@10°/2m=19.8%, R@5°/1m=4.9%  (0.6s)
+  knn_k30_cosine_distance: R@10°/2m=20.9%, R@5°/1m=2.7%  (0.6s)
+  knn_k50_cosine_distance: R@10°/2m=14.3%, R@5°/1m=3.8%  (0.6s)
+  knn_k1_cosine_gaussian: R@10°/2m=15.9%, R@5°/1m=3.8%  (0.6s)
+  knn_k3_cosine_gaussian: R@10°/2m=18.7%, R@5°/1m=4.9%  (0.6s)
+  knn_k5_cosine_gaussian: R@10°/2m=17.6%, R@5°/1m=6.0%  (0.6s)
+  knn_k7_cosine_gaussian: R@10°/2m=17.0%, R@5°/1m=6.0%  (0.6s)
+  knn_k10_cosine_gaussian: R@10°/2m=21.4%, R@5°/1m=5.5%  (0.6s)
+  knn_k15_cosine_gaussian: R@10°/2m=15.9%, R@5°/1m=3.8%  (0.6s)
+  knn_k20_cosine_gaussian: R@10°/2m=19.8%, R@5°/1m=4.4%  (0.6s)
+  knn_k30_cosine_gaussian: R@10°/2m=21.4%, R@5°/1m=2.2%  (0.6s)
+  knn_k50_cosine_gaussian: R@10°/2m=13.2%, R@5°/1m=3.3%  (0.6s)
+  knn_k1_euclidean_uniform: R@10°/2m=14.8%, R@5°/1m=3.8%  (0.6s)
+  knn_k3_euclidean_uniform: R@10°/2m=18.1%, R@5°/1m=3.8%  (0.6s)
+  knn_k5_euclidean_uniform: R@10°/2m=15.9%, R@5°/1m=5.5%  (0.7s)
+  knn_k7_euclidean_uniform: R@10°/2m=16.5%, R@5°/1m=7.1%  (0.6s)
+  knn_k10_euclidean_uniform: R@10°/2m=19.2%, R@5°/1m=4.9%  (0.6s)
+  knn_k15_euclidean_uniform: R@10°/2m=16.5%, R@5°/1m=3.3%  (0.6s)
+  knn_k20_euclidean_uniform: R@10°/2m=19.2%, R@5°/1m=5.5%  (0.6s)
+  knn_k30_euclidean_uniform: R@10°/2m=18.1%, R@5°/1m=3.3%  (0.6s)
+  knn_k50_euclidean_uniform: R@10°/2m=12.6%, R@5°/1m=3.8%  (0.6s)
+  knn_k1_euclidean_distance: R@10°/2m=14.8%, R@5°/1m=3.8%  (0.6s)
+  knn_k3_euclidean_distance: R@10°/2m=17.6%, R@5°/1m=4.9%  (0.7s)
+  knn_k5_euclidean_distance: R@10°/2m=17.6%, R@5°/1m=5.5%  (0.6s)
+  knn_k7_euclidean_distance: R@10°/2m=17.0%, R@5°/1m=6.6%  (0.7s)
+  knn_k10_euclidean_distance: R@10°/2m=18.7%, R@5°/1m=6.0%  (0.6s)
+  knn_k15_euclidean_distance: R@10°/2m=15.9%, R@5°/1m=3.8%  (0.7s)
+  knn_k20_euclidean_distance: R@10°/2m=19.8%, R@5°/1m=6.0%  (0.6s)
+  knn_k30_euclidean_distance: R@10°/2m=17.6%, R@5°/1m=3.3%  (0.6s)
+  knn_k50_euclidean_distance: R@10°/2m=13.7%, R@5°/1m=3.8%  (0.6s)
+  knn_k1_euclidean_gaussian: R@10°/2m=14.8%, R@5°/1m=3.8%  (0.6s)
+  knn_k3_euclidean_gaussian: R@10°/2m=17.6%, R@5°/1m=4.9%  (0.6s)
+  knn_k5_euclidean_gaussian: R@10°/2m=17.6%, R@5°/1m=6.0%  (0.6s)
+  knn_k7_euclidean_gaussian: R@10°/2m=17.0%, R@5°/1m=6.6%  (0.6s)
+  knn_k10_euclidean_gaussian: R@10°/2m=19.2%, R@5°/1m=6.0%  (0.7s)
+  knn_k15_euclidean_gaussian: R@10°/2m=15.9%, R@5°/1m=3.8%  (0.6s)
+  knn_k20_euclidean_gaussian: R@10°/2m=19.8%, R@5°/1m=5.5%  (0.6s)
+  knn_k30_euclidean_gaussian: R@10°/2m=17.6%, R@5°/1m=3.3%  (0.6s)
+  knn_k50_euclidean_gaussian: R@10°/2m=12.6%, R@5°/1m=4.4%  (0.6s)
+  PCA 7936d → 128d (explained variance: 96.4%)
+  knn_k1_cosine_uniform_pca128: R@10°/2m=15.4%, R@5°/1m=2.7%  (0.1s)
+  knn_k3_cosine_uniform_pca128: R@10°/2m=20.9%, R@5°/1m=4.4%  (0.1s)
+  knn_k5_cosine_uniform_pca128: R@10°/2m=17.6%, R@5°/1m=5.5%  (0.1s)
+  knn_k7_cosine_uniform_pca128: R@10°/2m=19.2%, R@5°/1m=7.1%  (0.1s)
+  knn_k10_cosine_uniform_pca128: R@10°/2m=17.6%, R@5°/1m=2.7%  (0.1s)
+  knn_k15_cosine_uniform_pca128: R@10°/2m=17.6%, R@5°/1m=4.4%  (0.1s)
+  knn_k20_cosine_uniform_pca128: R@10°/2m=19.2%, R@5°/1m=3.8%  (0.1s)
+  knn_k30_cosine_uniform_pca128: R@10°/2m=22.0%, R@5°/1m=3.8%  (0.1s)
+  knn_k50_cosine_uniform_pca128: R@10°/2m=16.5%, R@5°/1m=6.6%  (0.1s)
+  knn_k1_cosine_distance_pca128: R@10°/2m=15.4%, R@5°/1m=2.7%  (0.1s)
+  knn_k3_cosine_distance_pca128: R@10°/2m=20.9%, R@5°/1m=5.5%  (0.1s)
+  knn_k5_cosine_distance_pca128: R@10°/2m=18.7%, R@5°/1m=6.0%  (0.1s)
+  knn_k7_cosine_distance_pca128: R@10°/2m=20.3%, R@5°/1m=8.2%  (0.1s)
+  knn_k10_cosine_distance_pca128: R@10°/2m=18.7%, R@5°/1m=4.4%  (0.1s)
+  knn_k15_cosine_distance_pca128: R@10°/2m=18.1%, R@5°/1m=4.4%  (0.1s)
+  knn_k20_cosine_distance_pca128: R@10°/2m=18.7%, R@5°/1m=3.8%  (0.1s)
+  knn_k30_cosine_distance_pca128: R@10°/2m=23.1%, R@5°/1m=3.8%  (0.1s)
+  knn_k50_cosine_distance_pca128: R@10°/2m=16.5%, R@5°/1m=6.6%  (0.1s)
+  knn_k1_cosine_gaussian_pca128: R@10°/2m=15.4%, R@5°/1m=2.7%  (0.1s)
+  knn_k3_cosine_gaussian_pca128: R@10°/2m=21.4%, R@5°/1m=5.5%  (0.1s)
+  knn_k5_cosine_gaussian_pca128: R@10°/2m=18.7%, R@5°/1m=6.0%  (0.1s)
+  knn_k7_cosine_gaussian_pca128: R@10°/2m=20.3%, R@5°/1m=7.1%  (0.1s)
+  knn_k10_cosine_gaussian_pca128: R@10°/2m=19.2%, R@5°/1m=4.4%  (0.1s)
+  knn_k15_cosine_gaussian_pca128: R@10°/2m=17.6%, R@5°/1m=4.4%  (0.1s)
+  knn_k20_cosine_gaussian_pca128: R@10°/2m=19.8%, R@5°/1m=3.8%  (0.1s)
+  knn_k30_cosine_gaussian_pca128: R@10°/2m=22.0%, R@5°/1m=3.3%  (0.1s)
+  knn_k50_cosine_gaussian_pca128: R@10°/2m=16.5%, R@5°/1m=6.6%  (0.1s)
+  knn_k1_euclidean_uniform_pca128: R@10°/2m=15.4%, R@5°/1m=2.7%  (0.1s)
+  knn_k3_euclidean_uniform_pca128: R@10°/2m=19.2%, R@5°/1m=3.8%  (0.1s)
+  knn_k5_euclidean_uniform_pca128: R@10°/2m=16.5%, R@5°/1m=6.0%  (0.1s)
+  knn_k7_euclidean_uniform_pca128: R@10°/2m=17.0%, R@5°/1m=8.2%  (0.1s)
+  knn_k10_euclidean_uniform_pca128: R@10°/2m=18.7%, R@5°/1m=3.8%  (0.1s)
+  knn_k15_euclidean_uniform_pca128: R@10°/2m=14.8%, R@5°/1m=3.8%  (0.1s)
+  knn_k20_euclidean_uniform_pca128: R@10°/2m=19.8%, R@5°/1m=4.9%  (0.1s)
+  knn_k30_euclidean_uniform_pca128: R@10°/2m=19.2%, R@5°/1m=3.3%  (0.1s)
+  knn_k50_euclidean_uniform_pca128: R@10°/2m=13.7%, R@5°/1m=4.4%  (0.1s)
+  knn_k1_euclidean_distance_pca128: R@10°/2m=15.4%, R@5°/1m=2.7%  (0.1s)
+  knn_k3_euclidean_distance_pca128: R@10°/2m=19.2%, R@5°/1m=4.9%  (0.1s)
+  knn_k5_euclidean_distance_pca128: R@10°/2m=18.1%, R@5°/1m=7.1%  (0.1s)
+  knn_k7_euclidean_distance_pca128: R@10°/2m=18.1%, R@5°/1m=6.6%  (0.1s)
+  knn_k10_euclidean_distance_pca128: R@10°/2m=18.7%, R@5°/1m=4.4%  (0.1s)
+  knn_k15_euclidean_distance_pca128: R@10°/2m=16.5%, R@5°/1m=4.4%  (0.1s)
+  knn_k20_euclidean_distance_pca128: R@10°/2m=20.9%, R@5°/1m=6.0%  (0.1s)
+  knn_k30_euclidean_distance_pca128: R@10°/2m=18.1%, R@5°/1m=3.3%  (0.1s)
+  knn_k50_euclidean_distance_pca128: R@10°/2m=14.8%, R@5°/1m=5.5%  (0.1s)
+  knn_k1_euclidean_gaussian_pca128: R@10°/2m=15.4%, R@5°/1m=2.7%  (0.1s)
+  knn_k3_euclidean_gaussian_pca128: R@10°/2m=19.2%, R@5°/1m=4.9%  (0.1s)
+  knn_k5_euclidean_gaussian_pca128: R@10°/2m=18.1%, R@5°/1m=6.6%  (0.1s)
+  knn_k7_euclidean_gaussian_pca128: R@10°/2m=18.1%, R@5°/1m=6.6%  (0.1s)
+  knn_k10_euclidean_gaussian_pca128: R@10°/2m=18.7%, R@5°/1m=4.4%  (0.1s)
+  knn_k15_euclidean_gaussian_pca128: R@10°/2m=15.9%, R@5°/1m=3.8%  (0.1s)
+  knn_k20_euclidean_gaussian_pca128: R@10°/2m=20.9%, R@5°/1m=5.5%  (0.1s)
+  knn_k30_euclidean_gaussian_pca128: R@10°/2m=18.1%, R@5°/1m=3.3%  (0.1s)
+  knn_k50_euclidean_gaussian_pca128: R@10°/2m=14.3%, R@5°/1m=4.4%  (0.1s)
+  PCA 7936d → 256d (explained variance: 98.7%)
+  knn_k1_cosine_uniform_pca256: R@10°/2m=15.9%, R@5°/1m=3.3%  (0.1s)
+  knn_k3_cosine_uniform_pca256: R@10°/2m=20.3%, R@5°/1m=4.4%  (0.1s)
+  knn_k5_cosine_uniform_pca256: R@10°/2m=17.0%, R@5°/1m=6.0%  (0.1s)
+  knn_k7_cosine_uniform_pca256: R@10°/2m=19.8%, R@5°/1m=7.1%  (0.1s)
+  knn_k10_cosine_uniform_pca256: R@10°/2m=18.7%, R@5°/1m=4.9%  (0.1s)
+  knn_k15_cosine_uniform_pca256: R@10°/2m=17.6%, R@5°/1m=4.4%  (0.1s)
+  knn_k20_cosine_uniform_pca256: R@10°/2m=19.8%, R@5°/1m=3.3%  (0.1s)
+  knn_k30_cosine_uniform_pca256: R@10°/2m=21.4%, R@5°/1m=4.4%  (0.1s)
+  knn_k50_cosine_uniform_pca256: R@10°/2m=15.4%, R@5°/1m=7.7%  (0.1s)
+  knn_k1_cosine_distance_pca256: R@10°/2m=15.9%, R@5°/1m=3.3%  (0.1s)
+  knn_k3_cosine_distance_pca256: R@10°/2m=19.8%, R@5°/1m=5.5%  (0.1s)
+  knn_k5_cosine_distance_pca256: R@10°/2m=18.1%, R@5°/1m=6.0%  (0.1s)
+  knn_k7_cosine_distance_pca256: R@10°/2m=21.4%, R@5°/1m=8.8%  (0.1s)
+  knn_k10_cosine_distance_pca256: R@10°/2m=19.8%, R@5°/1m=6.0%  (0.1s)
+  knn_k15_cosine_distance_pca256: R@10°/2m=17.6%, R@5°/1m=4.4%  (0.1s)
+  knn_k20_cosine_distance_pca256: R@10°/2m=19.2%, R@5°/1m=3.3%  (0.1s)
+  knn_k30_cosine_distance_pca256: R@10°/2m=23.1%, R@5°/1m=3.8%  (0.1s)
+  knn_k50_cosine_distance_pca256: R@10°/2m=15.4%, R@5°/1m=7.7%  (0.1s)
+  knn_k1_cosine_gaussian_pca256: R@10°/2m=15.9%, R@5°/1m=3.3%  (0.1s)
+  knn_k3_cosine_gaussian_pca256: R@10°/2m=20.3%, R@5°/1m=5.5%  (0.1s)
+  knn_k5_cosine_gaussian_pca256: R@10°/2m=18.1%, R@5°/1m=6.0%  (0.1s)
+  knn_k7_cosine_gaussian_pca256: R@10°/2m=21.4%, R@5°/1m=7.7%  (0.1s)
+  knn_k10_cosine_gaussian_pca256: R@10°/2m=20.3%, R@5°/1m=6.0%  (0.1s)
+  knn_k15_cosine_gaussian_pca256: R@10°/2m=18.1%, R@5°/1m=4.4%  (0.1s)
+  knn_k20_cosine_gaussian_pca256: R@10°/2m=20.3%, R@5°/1m=3.3%  (0.1s)
+  knn_k30_cosine_gaussian_pca256: R@10°/2m=22.5%, R@5°/1m=4.4%  (0.1s)
+  knn_k50_cosine_gaussian_pca256: R@10°/2m=15.4%, R@5°/1m=7.1%  (0.1s)
+  knn_k1_euclidean_uniform_pca256: R@10°/2m=14.8%, R@5°/1m=3.8%  (0.1s)
+  knn_k3_euclidean_uniform_pca256: R@10°/2m=18.1%, R@5°/1m=3.8%  (0.1s)
+  knn_k5_euclidean_uniform_pca256: R@10°/2m=15.9%, R@5°/1m=5.5%  (0.1s)
+  knn_k7_euclidean_uniform_pca256: R@10°/2m=16.5%, R@5°/1m=7.7%  (0.1s)
+  knn_k10_euclidean_uniform_pca256: R@10°/2m=18.1%, R@5°/1m=4.9%  (0.1s)
+  knn_k15_euclidean_uniform_pca256: R@10°/2m=16.5%, R@5°/1m=3.3%  (0.1s)
+  knn_k20_euclidean_uniform_pca256: R@10°/2m=18.7%, R@5°/1m=5.5%  (0.1s)
+  knn_k30_euclidean_uniform_pca256: R@10°/2m=18.7%, R@5°/1m=3.3%  (0.1s)
+  knn_k50_euclidean_uniform_pca256: R@10°/2m=12.6%, R@5°/1m=3.8%  (0.1s)
+  knn_k1_euclidean_distance_pca256: R@10°/2m=14.8%, R@5°/1m=3.8%  (0.1s)
+  knn_k3_euclidean_distance_pca256: R@10°/2m=17.6%, R@5°/1m=4.9%  (0.1s)
+  knn_k5_euclidean_distance_pca256: R@10°/2m=17.6%, R@5°/1m=6.0%  (0.1s)
+  knn_k7_euclidean_distance_pca256: R@10°/2m=17.0%, R@5°/1m=7.7%  (0.1s)
+  knn_k10_euclidean_distance_pca256: R@10°/2m=18.1%, R@5°/1m=5.5%  (0.1s)
+  knn_k15_euclidean_distance_pca256: R@10°/2m=15.9%, R@5°/1m=4.4%  (0.1s)
+  knn_k20_euclidean_distance_pca256: R@10°/2m=19.2%, R@5°/1m=6.0%  (0.1s)
+  knn_k30_euclidean_distance_pca256: R@10°/2m=18.1%, R@5°/1m=3.3%  (0.1s)
+  knn_k50_euclidean_distance_pca256: R@10°/2m=13.7%, R@5°/1m=4.4%  (0.1s)
+  knn_k1_euclidean_gaussian_pca256: R@10°/2m=14.8%, R@5°/1m=3.8%  (0.1s)
+  knn_k3_euclidean_gaussian_pca256: R@10°/2m=18.1%, R@5°/1m=4.9%  (0.1s)
+  knn_k5_euclidean_gaussian_pca256: R@10°/2m=17.6%, R@5°/1m=6.0%  (0.1s)
+  knn_k7_euclidean_gaussian_pca256: R@10°/2m=17.6%, R@5°/1m=7.1%  (0.1s)
+  knn_k10_euclidean_gaussian_pca256: R@10°/2m=18.1%, R@5°/1m=5.5%  (0.1s)
+  knn_k15_euclidean_gaussian_pca256: R@10°/2m=15.9%, R@5°/1m=4.4%  (0.1s)
+  knn_k20_euclidean_gaussian_pca256: R@10°/2m=19.2%, R@5°/1m=5.5%  (0.1s)
+  knn_k30_euclidean_gaussian_pca256: R@10°/2m=18.1%, R@5°/1m=3.3%  (0.1s)
+  knn_k50_euclidean_gaussian_pca256: R@10°/2m=13.2%, R@5°/1m=3.8%  (0.1s)
+  PCA 7936d → 512d (explained variance: 99.8%)
+  knn_k1_cosine_uniform_pca512: R@10°/2m=15.9%, R@5°/1m=3.3%  (0.1s)
+  knn_k3_cosine_uniform_pca512: R@10°/2m=20.3%, R@5°/1m=4.4%  (0.1s)
+  knn_k5_cosine_uniform_pca512: R@10°/2m=17.6%, R@5°/1m=6.0%  (0.1s)
+  knn_k7_cosine_uniform_pca512: R@10°/2m=19.2%, R@5°/1m=7.1%  (0.1s)
+  knn_k10_cosine_uniform_pca512: R@10°/2m=18.7%, R@5°/1m=4.4%  (0.1s)
+  knn_k15_cosine_uniform_pca512: R@10°/2m=17.6%, R@5°/1m=3.8%  (0.1s)
+  knn_k20_cosine_uniform_pca512: R@10°/2m=19.8%, R@5°/1m=3.8%  (0.1s)
+  knn_k30_cosine_uniform_pca512: R@10°/2m=20.9%, R@5°/1m=4.4%  (0.1s)
+  knn_k50_cosine_uniform_pca512: R@10°/2m=15.9%, R@5°/1m=7.1%  (0.1s)
+  knn_k1_cosine_distance_pca512: R@10°/2m=15.9%, R@5°/1m=3.3%  (0.1s)
+  knn_k3_cosine_distance_pca512: R@10°/2m=19.8%, R@5°/1m=5.5%  (0.1s)
+  knn_k5_cosine_distance_pca512: R@10°/2m=18.7%, R@5°/1m=6.0%  (0.1s)
+  knn_k7_cosine_distance_pca512: R@10°/2m=20.9%, R@5°/1m=8.8%  (0.1s)
+  knn_k10_cosine_distance_pca512: R@10°/2m=20.3%, R@5°/1m=5.5%  (0.1s)
+  knn_k15_cosine_distance_pca512: R@10°/2m=17.0%, R@5°/1m=3.8%  (0.1s)
+  knn_k20_cosine_distance_pca512: R@10°/2m=20.3%, R@5°/1m=3.8%  (0.1s)
+  knn_k30_cosine_distance_pca512: R@10°/2m=22.5%, R@5°/1m=4.4%  (0.1s)
+  knn_k50_cosine_distance_pca512: R@10°/2m=15.9%, R@5°/1m=7.7%  (0.1s)
+  knn_k1_cosine_gaussian_pca512: R@10°/2m=15.9%, R@5°/1m=3.3%  (0.1s)
+  knn_k3_cosine_gaussian_pca512: R@10°/2m=20.3%, R@5°/1m=5.5%  (0.1s)
+  knn_k5_cosine_gaussian_pca512: R@10°/2m=18.7%, R@5°/1m=6.0%  (0.1s)
+  knn_k7_cosine_gaussian_pca512: R@10°/2m=20.9%, R@5°/1m=7.7%  (0.1s)
+  knn_k10_cosine_gaussian_pca512: R@10°/2m=20.3%, R@5°/1m=5.5%  (0.1s)
+  knn_k15_cosine_gaussian_pca512: R@10°/2m=17.6%, R@5°/1m=3.8%  (0.1s)
+  knn_k20_cosine_gaussian_pca512: R@10°/2m=21.4%, R@5°/1m=3.8%  (0.1s)
+  knn_k30_cosine_gaussian_pca512: R@10°/2m=21.4%, R@5°/1m=4.4%  (0.1s)
+  knn_k50_cosine_gaussian_pca512: R@10°/2m=15.9%, R@5°/1m=7.1%  (0.2s)
+  knn_k1_euclidean_uniform_pca512: R@10°/2m=14.8%, R@5°/1m=3.8%  (0.1s)
+  knn_k3_euclidean_uniform_pca512: R@10°/2m=18.1%, R@5°/1m=3.8%  (0.1s)
+  knn_k5_euclidean_uniform_pca512: R@10°/2m=15.4%, R@5°/1m=4.9%  (0.1s)
+  knn_k7_euclidean_uniform_pca512: R@10°/2m=16.5%, R@5°/1m=7.1%  (0.1s)
+  knn_k10_euclidean_uniform_pca512: R@10°/2m=18.7%, R@5°/1m=4.9%  (0.1s)
+  knn_k15_euclidean_uniform_pca512: R@10°/2m=16.5%, R@5°/1m=3.3%  (0.1s)
+  knn_k20_euclidean_uniform_pca512: R@10°/2m=19.2%, R@5°/1m=5.5%  (0.1s)
+  knn_k30_euclidean_uniform_pca512: R@10°/2m=18.7%, R@5°/1m=3.3%  (0.1s)
+  knn_k50_euclidean_uniform_pca512: R@10°/2m=12.6%, R@5°/1m=3.8%  (0.1s)
+  knn_k1_euclidean_distance_pca512: R@10°/2m=14.8%, R@5°/1m=3.8%  (0.1s)
+  knn_k3_euclidean_distance_pca512: R@10°/2m=17.6%, R@5°/1m=4.9%  (0.1s)
+  knn_k5_euclidean_distance_pca512: R@10°/2m=17.0%, R@5°/1m=5.5%  (0.1s)
+  knn_k7_euclidean_distance_pca512: R@10°/2m=17.0%, R@5°/1m=6.6%  (0.1s)
+  knn_k10_euclidean_distance_pca512: R@10°/2m=18.7%, R@5°/1m=6.0%  (0.1s)
+  knn_k15_euclidean_distance_pca512: R@10°/2m=15.9%, R@5°/1m=4.4%  (0.1s)
+  knn_k20_euclidean_distance_pca512: R@10°/2m=19.2%, R@5°/1m=6.0%  (0.1s)
+  knn_k30_euclidean_distance_pca512: R@10°/2m=18.1%, R@5°/1m=3.3%  (0.1s)
+  knn_k50_euclidean_distance_pca512: R@10°/2m=13.7%, R@5°/1m=3.8%  (0.1s)
+  knn_k1_euclidean_gaussian_pca512: R@10°/2m=14.8%, R@5°/1m=3.8%  (0.1s)
+  knn_k3_euclidean_gaussian_pca512: R@10°/2m=18.1%, R@5°/1m=4.9%  (0.1s)
+  knn_k5_euclidean_gaussian_pca512: R@10°/2m=17.0%, R@5°/1m=5.5%  (0.1s)
+  knn_k7_euclidean_gaussian_pca512: R@10°/2m=17.0%, R@5°/1m=6.6%  (0.1s)
+  knn_k10_euclidean_gaussian_pca512: R@10°/2m=18.7%, R@5°/1m=6.0%  (0.1s)
+  knn_k15_euclidean_gaussian_pca512: R@10°/2m=15.9%, R@5°/1m=4.4%  (0.1s)
+  knn_k20_euclidean_gaussian_pca512: R@10°/2m=19.8%, R@5°/1m=5.5%  (0.1s)
+  knn_k30_euclidean_gaussian_pca512: R@10°/2m=18.1%, R@5°/1m=3.3%  (0.1s)
+  knn_k50_euclidean_gaussian_pca512: R@10°/2m=12.6%, R@5°/1m=4.4%  (0.1s)
+
+  --- With Feature Whitening ---
+  Whitening 7936d → 128d (explained variance: 96.4%)
+  knn_k1_cosine_uniform_whiten128: R@10°/2m=17.6%, R@5°/1m=4.9%
+  knn_k3_cosine_uniform_whiten128: R@10°/2m=21.4%, R@5°/1m=5.5%
+  knn_k5_cosine_uniform_whiten128: R@10°/2m=20.9%, R@5°/1m=5.5%
+  knn_k7_cosine_uniform_whiten128: R@10°/2m=22.0%, R@5°/1m=5.5%
+  knn_k10_cosine_uniform_whiten128: R@10°/2m=18.1%, R@5°/1m=6.6%
+  knn_k15_cosine_uniform_whiten128: R@10°/2m=15.9%, R@5°/1m=4.9%
+  knn_k20_cosine_uniform_whiten128: R@10°/2m=17.0%, R@5°/1m=6.0%
+  knn_k30_cosine_uniform_whiten128: R@10°/2m=12.1%, R@5°/1m=3.8%
+  knn_k50_cosine_uniform_whiten128: R@10°/2m=6.0%, R@5°/1m=2.2%
+  knn_k1_cosine_distance_whiten128: R@10°/2m=17.6%, R@5°/1m=4.9%
+  knn_k3_cosine_distance_whiten128: R@10°/2m=20.3%, R@5°/1m=6.6%
+  knn_k5_cosine_distance_whiten128: R@10°/2m=21.4%, R@5°/1m=6.0%
+  knn_k7_cosine_distance_whiten128: R@10°/2m=22.0%, R@5°/1m=6.0%
+  knn_k10_cosine_distance_whiten128: R@10°/2m=19.2%, R@5°/1m=6.6%
+  knn_k15_cosine_distance_whiten128: R@10°/2m=17.6%, R@5°/1m=5.5%
+  knn_k20_cosine_distance_whiten128: R@10°/2m=17.0%, R@5°/1m=6.0%
+  knn_k30_cosine_distance_whiten128: R@10°/2m=13.7%, R@5°/1m=4.4%
+  knn_k50_cosine_distance_whiten128: R@10°/2m=6.0%, R@5°/1m=2.7%
+  knn_k1_euclidean_uniform_whiten128: R@10°/2m=14.3%, R@5°/1m=3.3%
+  knn_k3_euclidean_uniform_whiten128: R@10°/2m=16.5%, R@5°/1m=4.4%
+  knn_k5_euclidean_uniform_whiten128: R@10°/2m=15.9%, R@5°/1m=3.8%
+  knn_k7_euclidean_uniform_whiten128: R@10°/2m=16.5%, R@5°/1m=3.3%
+  knn_k10_euclidean_uniform_whiten128: R@10°/2m=12.6%, R@5°/1m=4.4%
+  knn_k15_euclidean_uniform_whiten128: R@10°/2m=11.0%, R@5°/1m=3.3%
+  knn_k20_euclidean_uniform_whiten128: R@10°/2m=9.3%, R@5°/1m=2.2%
+  knn_k30_euclidean_uniform_whiten128: R@10°/2m=4.9%, R@5°/1m=1.6%
+  knn_k50_euclidean_uniform_whiten128: R@10°/2m=1.6%, R@5°/1m=0.0%
+  knn_k1_euclidean_distance_whiten128: R@10°/2m=14.3%, R@5°/1m=3.3%
+  knn_k3_euclidean_distance_whiten128: R@10°/2m=16.5%, R@5°/1m=5.5%
+  knn_k5_euclidean_distance_whiten128: R@10°/2m=17.0%, R@5°/1m=3.8%
+  knn_k7_euclidean_distance_whiten128: R@10°/2m=17.6%, R@5°/1m=3.3%
+  knn_k10_euclidean_distance_whiten128: R@10°/2m=12.6%, R@5°/1m=3.8%
+  knn_k15_euclidean_distance_whiten128: R@10°/2m=11.0%, R@5°/1m=3.8%
+  knn_k20_euclidean_distance_whiten128: R@10°/2m=9.9%, R@5°/1m=2.7%
+  knn_k30_euclidean_distance_whiten128: R@10°/2m=4.9%, R@5°/1m=1.6%
+  knn_k50_euclidean_distance_whiten128: R@10°/2m=2.2%, R@5°/1m=0.0%
+  Whitening 7936d → 256d (explained variance: 98.7%)
+  knn_k1_cosine_uniform_whiten256: R@10°/2m=17.0%, R@5°/1m=5.5%
+  knn_k3_cosine_uniform_whiten256: R@10°/2m=23.6%, R@5°/1m=5.5%
+  knn_k5_cosine_uniform_whiten256: R@10°/2m=20.3%, R@5°/1m=5.5%
+  knn_k7_cosine_uniform_whiten256: R@10°/2m=19.2%, R@5°/1m=4.4%
+  knn_k10_cosine_uniform_whiten256: R@10°/2m=16.5%, R@5°/1m=5.5%
+  knn_k15_cosine_uniform_whiten256: R@10°/2m=15.4%, R@5°/1m=3.8%
+  knn_k20_cosine_uniform_whiten256: R@10°/2m=9.9%, R@5°/1m=1.6%
+  knn_k30_cosine_uniform_whiten256: R@10°/2m=7.1%, R@5°/1m=1.6%
+  knn_k50_cosine_uniform_whiten256: R@10°/2m=3.8%, R@5°/1m=0.5%
+  knn_k1_cosine_distance_whiten256: R@10°/2m=17.0%, R@5°/1m=5.5%
+  knn_k3_cosine_distance_whiten256: R@10°/2m=23.6%, R@5°/1m=5.5%
+  knn_k5_cosine_distance_whiten256: R@10°/2m=22.0%, R@5°/1m=6.6%
+  knn_k7_cosine_distance_whiten256: R@10°/2m=18.7%, R@5°/1m=4.4%
+  knn_k10_cosine_distance_whiten256: R@10°/2m=17.0%, R@5°/1m=6.0%
+  knn_k15_cosine_distance_whiten256: R@10°/2m=14.8%, R@5°/1m=3.8%
+  knn_k20_cosine_distance_whiten256: R@10°/2m=10.4%, R@5°/1m=2.2%
+  knn_k30_cosine_distance_whiten256: R@10°/2m=7.1%, R@5°/1m=2.2%
+  knn_k50_cosine_distance_whiten256: R@10°/2m=3.8%, R@5°/1m=1.1%
+  knn_k1_euclidean_uniform_whiten256: R@10°/2m=14.3%, R@5°/1m=4.4%
+  knn_k3_euclidean_uniform_whiten256: R@10°/2m=16.5%, R@5°/1m=4.4%
+  knn_k5_euclidean_uniform_whiten256: R@10°/2m=15.4%, R@5°/1m=3.3%
+  knn_k7_euclidean_uniform_whiten256: R@10°/2m=14.8%, R@5°/1m=4.9%
+  knn_k10_euclidean_uniform_whiten256: R@10°/2m=10.4%, R@5°/1m=3.8%
+  knn_k15_euclidean_uniform_whiten256: R@10°/2m=6.6%, R@5°/1m=2.2%
+  knn_k20_euclidean_uniform_whiten256: R@10°/2m=4.4%, R@5°/1m=0.5%
+  knn_k30_euclidean_uniform_whiten256: R@10°/2m=1.1%, R@5°/1m=0.0%
+  knn_k50_euclidean_uniform_whiten256: R@10°/2m=0.0%, R@5°/1m=0.0%
+  knn_k1_euclidean_distance_whiten256: R@10°/2m=14.3%, R@5°/1m=4.4%
+  knn_k3_euclidean_distance_whiten256: R@10°/2m=16.5%, R@5°/1m=5.5%
+  knn_k5_euclidean_distance_whiten256: R@10°/2m=15.4%, R@5°/1m=3.3%
+  knn_k7_euclidean_distance_whiten256: R@10°/2m=15.4%, R@5°/1m=4.9%
+  knn_k10_euclidean_distance_whiten256: R@10°/2m=10.4%, R@5°/1m=3.3%
+  knn_k15_euclidean_distance_whiten256: R@10°/2m=6.6%, R@5°/1m=1.6%
+  knn_k20_euclidean_distance_whiten256: R@10°/2m=4.4%, R@5°/1m=1.1%
+  knn_k30_euclidean_distance_whiten256: R@10°/2m=1.1%, R@5°/1m=0.0%
+  knn_k50_euclidean_distance_whiten256: R@10°/2m=0.0%, R@5°/1m=0.0%
+  Whitening 7936d → 512d (explained variance: 99.8%)
+  knn_k1_cosine_uniform_whiten512: R@10°/2m=17.0%, R@5°/1m=4.9%
+  knn_k3_cosine_uniform_whiten512: R@10°/2m=17.6%, R@5°/1m=5.5%
+  knn_k5_cosine_uniform_whiten512: R@10°/2m=19.8%, R@5°/1m=6.0%
+  knn_k7_cosine_uniform_whiten512: R@10°/2m=17.6%, R@5°/1m=7.7%
+  knn_k10_cosine_uniform_whiten512: R@10°/2m=14.8%, R@5°/1m=4.4%
+  knn_k15_cosine_uniform_whiten512: R@10°/2m=6.0%, R@5°/1m=2.2%
+  knn_k20_cosine_uniform_whiten512: R@10°/2m=3.8%, R@5°/1m=1.1%
+  knn_k30_cosine_uniform_whiten512: R@10°/2m=2.2%, R@5°/1m=1.1%
+  knn_k50_cosine_uniform_whiten512: R@10°/2m=2.7%, R@5°/1m=0.0%
+  knn_k1_cosine_distance_whiten512: R@10°/2m=17.0%, R@5°/1m=4.9%
+  knn_k3_cosine_distance_whiten512: R@10°/2m=18.7%, R@5°/1m=6.6%
+  knn_k5_cosine_distance_whiten512: R@10°/2m=19.8%, R@5°/1m=6.0%
+  knn_k7_cosine_distance_whiten512: R@10°/2m=17.6%, R@5°/1m=7.7%
+  knn_k10_cosine_distance_whiten512: R@10°/2m=15.9%, R@5°/1m=4.9%
+  knn_k15_cosine_distance_whiten512: R@10°/2m=6.6%, R@5°/1m=2.2%
+  knn_k20_cosine_distance_whiten512: R@10°/2m=3.8%, R@5°/1m=1.1%
+  knn_k30_cosine_distance_whiten512: R@10°/2m=2.2%, R@5°/1m=1.1%
+  knn_k50_cosine_distance_whiten512: R@10°/2m=2.7%, R@5°/1m=0.0%
+  knn_k1_euclidean_uniform_whiten512: R@10°/2m=12.1%, R@5°/1m=3.3%
+  knn_k3_euclidean_uniform_whiten512: R@10°/2m=8.8%, R@5°/1m=1.1%
+  knn_k5_euclidean_uniform_whiten512: R@10°/2m=3.3%, R@5°/1m=1.1%
+  knn_k7_euclidean_uniform_whiten512: R@10°/2m=3.3%, R@5°/1m=0.0%
+  knn_k10_euclidean_uniform_whiten512: R@10°/2m=0.0%, R@5°/1m=0.0%
+  knn_k15_euclidean_uniform_whiten512: R@10°/2m=0.0%, R@5°/1m=0.0%
+  knn_k20_euclidean_uniform_whiten512: R@10°/2m=0.0%, R@5°/1m=0.0%
+  knn_k30_euclidean_uniform_whiten512: R@10°/2m=0.0%, R@5°/1m=0.0%
+  knn_k50_euclidean_uniform_whiten512: R@10°/2m=0.0%, R@5°/1m=0.0%
+  knn_k1_euclidean_distance_whiten512: R@10°/2m=12.1%, R@5°/1m=3.3%
+  knn_k3_euclidean_distance_whiten512: R@10°/2m=9.3%, R@5°/1m=1.6%
+  knn_k5_euclidean_distance_whiten512: R@10°/2m=3.8%, R@5°/1m=1.1%
+  knn_k7_euclidean_distance_whiten512: R@10°/2m=3.3%, R@5°/1m=0.0%
+  knn_k10_euclidean_distance_whiten512: R@10°/2m=0.0%, R@5°/1m=0.0%
+  knn_k15_euclidean_distance_whiten512: R@10°/2m=0.0%, R@5°/1m=0.0%
+  knn_k20_euclidean_distance_whiten512: R@10°/2m=0.0%, R@5°/1m=0.0%
+  knn_k30_euclidean_distance_whiten512: R@10°/2m=0.0%, R@5°/1m=0.0%
+  knn_k50_euclidean_distance_whiten512: R@10°/2m=0.0%, R@5°/1m=0.0%
+
+======================================================================
+KERNEL REGRESSION (Nadaraya-Watson)
+======================================================================
+  kernel_cosine_sigma0.1: R@10°/2m=20.3%, R@5°/1m=5.5%
+  kernel_cosine_sigma0.25: R@10°/2m=6.6%, R@5°/1m=1.1%
+  kernel_cosine_sigma0.5: R@10°/2m=1.6%, R@5°/1m=0.0%
+  kernel_cosine_sigma1.0: R@10°/2m=0.0%, R@5°/1m=0.0%
+  kernel_cosine_sigma2.0: R@10°/2m=0.0%, R@5°/1m=0.0%
+  kernel_euclidean_sigma0.1: R@10°/2m=19.2%, R@5°/1m=7.1%
+  kernel_euclidean_sigma0.25: R@10°/2m=4.4%, R@5°/1m=1.6%
+  kernel_euclidean_sigma0.5: R@10°/2m=1.6%, R@5°/1m=0.0%
+  kernel_euclidean_sigma1.0: R@10°/2m=0.0%, R@5°/1m=0.0%
+  kernel_euclidean_sigma2.0: R@10°/2m=0.0%, R@5°/1m=0.0%
+  PCA 7936d → 128d (explained variance: 96.4%)
+  kernel_cosine_sigma0.1_pca128: R@10°/2m=18.1%, R@5°/1m=6.0%
+  kernel_cosine_sigma0.25_pca128: R@10°/2m=15.4%, R@5°/1m=4.9%
+  kernel_cosine_sigma0.5_pca128: R@10°/2m=2.7%, R@5°/1m=0.5%
+  kernel_cosine_sigma1.0_pca128: R@10°/2m=0.0%, R@5°/1m=0.0%
+  kernel_cosine_sigma2.0_pca128: R@10°/2m=0.0%, R@5°/1m=0.0%
+  kernel_euclidean_sigma0.1_pca128: R@10°/2m=18.7%, R@5°/1m=6.0%
+  kernel_euclidean_sigma0.25_pca128: R@10°/2m=4.4%, R@5°/1m=1.6%
+  kernel_euclidean_sigma0.5_pca128: R@10°/2m=1.6%, R@5°/1m=0.0%
+  kernel_euclidean_sigma1.0_pca128: R@10°/2m=0.0%, R@5°/1m=0.0%
+  kernel_euclidean_sigma2.0_pca128: R@10°/2m=0.0%, R@5°/1m=0.0%
+  PCA 7936d → 256d (explained variance: 98.7%)
+  kernel_cosine_sigma0.1_pca256: R@10°/2m=18.1%, R@5°/1m=6.0%
+  kernel_cosine_sigma0.25_pca256: R@10°/2m=15.4%, R@5°/1m=3.8%
+  kernel_cosine_sigma0.5_pca256: R@10°/2m=2.7%, R@5°/1m=0.5%
+  kernel_cosine_sigma1.0_pca256: R@10°/2m=0.0%, R@5°/1m=0.0%
+  kernel_cosine_sigma2.0_pca256: R@10°/2m=0.0%, R@5°/1m=0.0%
+  kernel_euclidean_sigma0.1_pca256: R@10°/2m=19.2%, R@5°/1m=7.1%
+  kernel_euclidean_sigma0.25_pca256: R@10°/2m=4.4%, R@5°/1m=1.6%
+  kernel_euclidean_sigma0.5_pca256: R@10°/2m=1.6%, R@5°/1m=0.0%
+  kernel_euclidean_sigma1.0_pca256: R@10°/2m=0.0%, R@5°/1m=0.0%
+  kernel_euclidean_sigma2.0_pca256: R@10°/2m=0.0%, R@5°/1m=0.0%
+  PCA 7936d → 512d (explained variance: 99.8%)
+  kernel_cosine_sigma0.1_pca512: R@10°/2m=18.7%, R@5°/1m=6.0%
+  kernel_cosine_sigma0.25_pca512: R@10°/2m=14.3%, R@5°/1m=3.8%
+  kernel_cosine_sigma0.5_pca512: R@10°/2m=2.7%, R@5°/1m=0.0%
+  kernel_cosine_sigma1.0_pca512: R@10°/2m=0.0%, R@5°/1m=0.0%
+  kernel_cosine_sigma2.0_pca512: R@10°/2m=0.0%, R@5°/1m=0.0%
+  kernel_euclidean_sigma0.1_pca512: R@10°/2m=19.2%, R@5°/1m=7.1%
+  kernel_euclidean_sigma0.25_pca512: R@10°/2m=4.4%, R@5°/1m=1.6%
+  kernel_euclidean_sigma0.5_pca512: R@10°/2m=1.6%, R@5°/1m=0.0%
+  kernel_euclidean_sigma1.0_pca512: R@10°/2m=0.0%, R@5°/1m=0.0%
+  kernel_euclidean_sigma2.0_pca512: R@10°/2m=0.0%, R@5°/1m=0.0%
+
+======================================================================
+RANDOM FOREST REGRESSION
+======================================================================
+  PCA 7936d → 128d (explained variance: 96.4%)
+  Training Random Forest (n_estimators=200, max_depth=None)...
+  rf_n200_dNone_pca128: R@10°/2m=8.8%, R@5°/1m=2.7%  (1.7s)
+  PCA 7936d → 128d (explained variance: 96.4%)
+  Training Random Forest (n_estimators=200, max_depth=10)...
+  rf_n200_d10_pca128: R@10°/2m=8.8%, R@5°/1m=1.6%  (1.6s)
+  PCA 7936d → 128d (explained variance: 96.4%)
+  Training Random Forest (n_estimators=200, max_depth=20)...
+  rf_n200_d20_pca128: R@10°/2m=8.8%, R@5°/1m=1.6%  (1.6s)
+  PCA 7936d → 128d (explained variance: 96.4%)
+  Training Random Forest (n_estimators=500, max_depth=None)...
+  rf_n500_dNone_pca128: R@10°/2m=10.4%, R@5°/1m=2.7%  (3.0s)
+  PCA 7936d → 128d (explained variance: 96.4%)
+  Training Random Forest (n_estimators=500, max_depth=10)...
+  rf_n500_d10_pca128: R@10°/2m=9.3%, R@5°/1m=2.7%  (2.8s)
+  PCA 7936d → 128d (explained variance: 96.4%)
+  Training Random Forest (n_estimators=500, max_depth=20)...
+  rf_n500_d20_pca128: R@10°/2m=9.3%, R@5°/1m=2.7%  (3.0s)
+  PCA 7936d → 128d (explained variance: 96.4%)
+  Training Random Forest (n_estimators=1000, max_depth=None)...
+  rf_n1000_dNone_pca128: R@10°/2m=10.4%, R@5°/1m=2.2%  (4.9s)
+  PCA 7936d → 128d (explained variance: 96.4%)
+  Training Random Forest (n_estimators=1000, max_depth=10)...
+  rf_n1000_d10_pca128: R@10°/2m=9.3%, R@5°/1m=2.7%  (4.8s)
+  PCA 7936d → 128d (explained variance: 96.4%)
+  Training Random Forest (n_estimators=1000, max_depth=20)...
+  rf_n1000_d20_pca128: R@10°/2m=11.0%, R@5°/1m=2.7%  (5.1s)
+  PCA 7936d → 256d (explained variance: 98.7%)
+  Training Random Forest (n_estimators=200, max_depth=None)...
+  rf_n200_dNone_pca256: R@10°/2m=6.6%, R@5°/1m=1.6%  (2.4s)
+  PCA 7936d → 256d (explained variance: 98.7%)
+  Training Random Forest (n_estimators=200, max_depth=10)...
+  rf_n200_d10_pca256: R@10°/2m=8.2%, R@5°/1m=1.1%  (2.3s)
+  PCA 7936d → 256d (explained variance: 98.7%)
+  Training Random Forest (n_estimators=200, max_depth=20)...
+  rf_n200_d20_pca256: R@10°/2m=7.1%, R@5°/1m=1.6%  (2.3s)
+  PCA 7936d → 256d (explained variance: 98.7%)
+  Training Random Forest (n_estimators=500, max_depth=None)...
+  rf_n500_dNone_pca256: R@10°/2m=8.2%, R@5°/1m=1.6%  (3.8s)
+  PCA 7936d → 256d (explained variance: 98.7%)
+  Training Random Forest (n_estimators=500, max_depth=10)...
+  rf_n500_d10_pca256: R@10°/2m=9.3%, R@5°/1m=2.2%  (3.6s)
+  PCA 7936d → 256d (explained variance: 98.7%)
+  Training Random Forest (n_estimators=500, max_depth=20)...
+  rf_n500_d20_pca256: R@10°/2m=9.9%, R@5°/1m=1.6%  (3.8s)
+  PCA 7936d → 256d (explained variance: 98.7%)
+  Training Random Forest (n_estimators=1000, max_depth=None)...
+  rf_n1000_dNone_pca256: R@10°/2m=8.8%, R@5°/1m=2.2%  (6.4s)
+  PCA 7936d → 256d (explained variance: 98.7%)
+  Training Random Forest (n_estimators=1000, max_depth=10)...
+  rf_n1000_d10_pca256: R@10°/2m=9.9%, R@5°/1m=1.6%  (6.3s)
+  PCA 7936d → 256d (explained variance: 98.7%)
+  Training Random Forest (n_estimators=1000, max_depth=20)...
+  rf_n1000_d20_pca256: R@10°/2m=9.3%, R@5°/1m=2.2%  (6.2s)
+  PCA 7936d → 512d (explained variance: 99.8%)
+  Training Random Forest (n_estimators=200, max_depth=None)...
+  rf_n200_dNone_pca512: R@10°/2m=8.8%, R@5°/1m=1.1%  (3.8s)
+  PCA 7936d → 512d (explained variance: 99.8%)
+  Training Random Forest (n_estimators=200, max_depth=10)...
+  rf_n200_d10_pca512: R@10°/2m=8.8%, R@5°/1m=1.6%  (4.0s)
+  PCA 7936d → 512d (explained variance: 99.8%)
+  Training Random Forest (n_estimators=200, max_depth=20)...
+  rf_n200_d20_pca512: R@10°/2m=8.8%, R@5°/1m=1.1%  (4.3s)
+  PCA 7936d → 512d (explained variance: 99.8%)
+  Training Random Forest (n_estimators=500, max_depth=None)...
+  rf_n500_dNone_pca512: R@10°/2m=10.4%, R@5°/1m=2.2%  (6.6s)
+  PCA 7936d → 512d (explained variance: 99.8%)
+  Training Random Forest (n_estimators=500, max_depth=10)...
+  rf_n500_d10_pca512: R@10°/2m=9.3%, R@5°/1m=2.2%  (6.2s)
+  PCA 7936d → 512d (explained variance: 99.8%)
+  Training Random Forest (n_estimators=500, max_depth=20)...
+  rf_n500_d20_pca512: R@10°/2m=10.4%, R@5°/1m=1.6%  (6.2s)
+  PCA 7936d → 512d (explained variance: 99.8%)
+  Training Random Forest (n_estimators=1000, max_depth=None)...
+  rf_n1000_dNone_pca512: R@10°/2m=8.8%, R@5°/1m=1.6%  (10.1s)
+  PCA 7936d → 512d (explained variance: 99.8%)
+  Training Random Forest (n_estimators=1000, max_depth=10)...
+  rf_n1000_d10_pca512: R@10°/2m=8.8%, R@5°/1m=2.2%  (9.9s)
+  PCA 7936d → 512d (explained variance: 99.8%)
+  Training Random Forest (n_estimators=1000, max_depth=20)...
+  rf_n1000_d20_pca512: R@10°/2m=8.8%, R@5°/1m=1.6%  (10.5s)
+
+======================================================================
+GRADIENT BOOSTING REGRESSION
+======================================================================
+  PCA 7936d → 128d (explained variance: 96.4%)
+  Training GBR (n_estimators=500, max_depth=3, lr=0.05)...
+  gbr_n500_d3_lr0.05_pca128: R@10°/2m=22.5%, R@5°/1m=3.8%  (111.9s)
+  PCA 7936d → 128d (explained variance: 96.4%)
+  Training GBR (n_estimators=500, max_depth=3, lr=0.1)...
+  gbr_n500_d3_lr0.1_pca128: R@10°/2m=17.6%, R@5°/1m=3.3%  (112.9s)
+  PCA 7936d → 128d (explained variance: 96.4%)
+  Training GBR (n_estimators=500, max_depth=5, lr=0.05)...
+  gbr_n500_d5_lr0.05_pca128: R@10°/2m=20.3%, R@5°/1m=4.9%  (176.4s)
+  PCA 7936d → 128d (explained variance: 96.4%)
+  Training GBR (n_estimators=500, max_depth=5, lr=0.1)...
+  gbr_n500_d5_lr0.1_pca128: R@10°/2m=22.0%, R@5°/1m=3.8%  (182.0s)
+  PCA 7936d → 128d (explained variance: 96.4%)
+  Training GBR (n_estimators=500, max_depth=8, lr=0.05)...
+  gbr_n500_d8_lr0.05_pca128: R@10°/2m=14.8%, R@5°/1m=1.6%  (260.9s)
+  PCA 7936d → 128d (explained variance: 96.4%)
+  Training GBR (n_estimators=500, max_depth=8, lr=0.1)...
+  gbr_n500_d8_lr0.1_pca128: R@10°/2m=12.1%, R@5°/1m=1.1%  (214.6s)
+  PCA 7936d → 128d (explained variance: 96.4%)
+  Training GBR (n_estimators=1000, max_depth=3, lr=0.05)...
+  gbr_n1000_d3_lr0.05_pca128: R@10°/2m=22.0%, R@5°/1m=4.4%  (228.5s)
+  PCA 7936d → 128d (explained variance: 96.4%)
+  Training GBR (n_estimators=1000, max_depth=3, lr=0.1)...
+  gbr_n1000_d3_lr0.1_pca128: R@10°/2m=21.4%, R@5°/1m=3.8%  (232.9s)
+  PCA 7936d → 128d (explained variance: 96.4%)
+  Training GBR (n_estimators=1000, max_depth=5, lr=0.05)...
+  gbr_n1000_d5_lr0.05_pca128: R@10°/2m=18.7%, R@5°/1m=4.4%  (371.7s)
+  PCA 7936d → 128d (explained variance: 96.4%)
+  Training GBR (n_estimators=1000, max_depth=5, lr=0.1)...
+  gbr_n1000_d5_lr0.1_pca128: R@10°/2m=22.5%, R@5°/1m=3.3%  (359.9s)
+  PCA 7936d → 128d (explained variance: 96.4%)
+  Training GBR (n_estimators=1000, max_depth=8, lr=0.05)...
+  gbr_n1000_d8_lr0.05_pca128: R@10°/2m=14.3%, R@5°/1m=2.7%  (444.7s)
+  PCA 7936d → 128d (explained variance: 96.4%)
+  Training GBR (n_estimators=1000, max_depth=8, lr=0.1)...
+  gbr_n1000_d8_lr0.1_pca128: R@10°/2m=14.3%, R@5°/1m=2.2%  (211.6s)
+  PCA 7936d → 256d (explained variance: 98.7%)
+  Training GBR (n_estimators=500, max_depth=3, lr=0.05)...
+  gbr_n500_d3_lr0.05_pca256: R@10°/2m=20.9%, R@5°/1m=3.8%  (220.0s)
+  PCA 7936d → 256d (explained variance: 98.7%)
+  Training GBR (n_estimators=500, max_depth=3, lr=0.1)...
+  gbr_n500_d3_lr0.1_pca256: R@10°/2m=20.9%, R@5°/1m=6.0%  (220.4s)
+  PCA 7936d → 256d (explained variance: 98.7%)
+  Training GBR (n_estimators=500, max_depth=5, lr=0.05)...
+  gbr_n500_d5_lr0.05_pca256: R@10°/2m=19.2%, R@5°/1m=1.6%  (356.6s)
+  PCA 7936d → 256d (explained variance: 98.7%)
+  Training GBR (n_estimators=500, max_depth=5, lr=0.1)...
+  gbr_n500_d5_lr0.1_pca256: R@10°/2m=18.7%, R@5°/1m=3.8%  (351.4s)
+  PCA 7936d → 256d (explained variance: 98.7%)
+  Training GBR (n_estimators=500, max_depth=8, lr=0.05)...
+  gbr_n500_d8_lr0.05_pca256: R@10°/2m=13.7%, R@5°/1m=2.2%  (494.7s)
+  PCA 7936d → 256d (explained variance: 98.7%)
+  Training GBR (n_estimators=500, max_depth=8, lr=0.1)...
+  gbr_n500_d8_lr0.1_pca256: R@10°/2m=13.2%, R@5°/1m=0.5%  (323.4s)
+  PCA 7936d → 256d (explained variance: 98.7%)
+  Training GBR (n_estimators=1000, max_depth=3, lr=0.05)...
+  gbr_n1000_d3_lr0.05_pca256: R@10°/2m=17.6%, R@5°/1m=3.8%  (477.2s)
+  PCA 7936d → 256d (explained variance: 98.7%)
+  Training GBR (n_estimators=1000, max_depth=3, lr=0.1)...
+  gbr_n1000_d3_lr0.1_pca256: R@10°/2m=20.9%, R@5°/1m=3.3%  (482.7s)
+  PCA 7936d → 256d (explained variance: 98.7%)
+  Training GBR (n_estimators=1000, max_depth=5, lr=0.05)...
+  gbr_n1000_d5_lr0.05_pca256: R@10°/2m=19.2%, R@5°/1m=4.9%  (717.3s)
+  PCA 7936d → 256d (explained variance: 98.7%)
+  Training GBR (n_estimators=1000, max_depth=5, lr=0.1)...
+  gbr_n1000_d5_lr0.1_pca256: R@10°/2m=18.1%, R@5°/1m=3.8%  (670.4s)
+  PCA 7936d → 256d (explained variance: 98.7%)
+  Training GBR (n_estimators=1000, max_depth=8, lr=0.05)...
+  gbr_n1000_d8_lr0.05_pca256: R@10°/2m=14.3%, R@5°/1m=3.8%  (610.3s)
+  PCA 7936d → 256d (explained variance: 98.7%)
+  Training GBR (n_estimators=1000, max_depth=8, lr=0.1)...
+  gbr_n1000_d8_lr0.1_pca256: R@10°/2m=13.7%, R@5°/1m=2.7%  (291.1s)
+
+======================================================================
+SUMMARY — All Methods Ranked by R@10°/2m
+======================================================================
+   1. knn_k3_cosine_uniform_whiten256                     R@10/2m=23.6%  R@5/1m=5.5%  rot=6.5°  trans=4000mm
+   2. knn_k3_cosine_distance_whiten256                    R@10/2m=23.6%  R@5/1m=5.5%  rot=6.5°  trans=4004mm
+   3. knn_k30_cosine_distance_pca128                      R@10/2m=23.1%  R@5/1m=3.8%  rot=7.5°  trans=3968mm
+   4. knn_k30_cosine_distance_pca256                      R@10/2m=23.1%  R@5/1m=3.8%  rot=7.5°  trans=3978mm
+   5. knn_k30_cosine_gaussian_pca256                      R@10/2m=22.5%  R@5/1m=4.4%  rot=7.4°  trans=3909mm
+   6. knn_k30_cosine_distance_pca512                      R@10/2m=22.5%  R@5/1m=4.4%  rot=7.5°  trans=3965mm
+   7. gbr_n500_d3_lr0.05_pca128                           R@10/2m=22.5%  R@5/1m=3.8%  rot=5.5°  trans=4232mm
+   8. gbr_n1000_d5_lr0.1_pca128                           R@10/2m=22.5%  R@5/1m=3.3%  rot=6.2°  trans=4187mm
+   9. knn_k30_cosine_uniform_pca128                       R@10/2m=22.0%  R@5/1m=3.8%  rot=7.6°  trans=3859mm
+  10. knn_k30_cosine_gaussian_pca128                      R@10/2m=22.0%  R@5/1m=3.3%  rot=7.4°  trans=3856mm
+  11. knn_k7_cosine_uniform_whiten128                     R@10/2m=22.0%  R@5/1m=5.5%  rot=6.8°  trans=4249mm
+  12. knn_k7_cosine_distance_whiten128                    R@10/2m=22.0%  R@5/1m=6.0%  rot=6.6°  trans=4229mm
+  13. knn_k5_cosine_distance_whiten256                    R@10/2m=22.0%  R@5/1m=6.6%  rot=6.3°  trans=4103mm
+  14. gbr_n500_d5_lr0.1_pca128                            R@10/2m=22.0%  R@5/1m=3.8%  rot=5.9°  trans=4233mm
+  15. gbr_n1000_d3_lr0.05_pca128                          R@10/2m=22.0%  R@5/1m=4.4%  rot=5.2°  trans=3820mm
+  16. knn_k10_cosine_gaussian                             R@10/2m=21.4%  R@5/1m=5.5%  rot=6.8°  trans=4092mm
+  17. knn_k30_cosine_gaussian                             R@10/2m=21.4%  R@5/1m=2.2%  rot=7.2°  trans=4240mm
+  18. knn_k3_cosine_gaussian_pca128                       R@10/2m=21.4%  R@5/1m=5.5%  rot=7.7°  trans=4421mm
+  19. knn_k30_cosine_uniform_pca256                       R@10/2m=21.4%  R@5/1m=4.4%  rot=7.4°  trans=3856mm
+  20. knn_k7_cosine_distance_pca256                       R@10/2m=21.4%  R@5/1m=8.8%  rot=7.5°  trans=4315mm
+  21. knn_k7_cosine_gaussian_pca256                       R@10/2m=21.4%  R@5/1m=7.7%  rot=7.5°  trans=4327mm
+  22. knn_k20_cosine_gaussian_pca512                      R@10/2m=21.4%  R@5/1m=3.8%  rot=7.6°  trans=3909mm
+  23. knn_k30_cosine_gaussian_pca512                      R@10/2m=21.4%  R@5/1m=4.4%  rot=7.4°  trans=3905mm
+  24. knn_k3_cosine_uniform_whiten128                     R@10/2m=21.4%  R@5/1m=5.5%  rot=6.9°  trans=4037mm
+  25. knn_k5_cosine_distance_whiten128                    R@10/2m=21.4%  R@5/1m=6.0%  rot=7.4°  trans=4088mm
+  26. gbr_n1000_d3_lr0.1_pca128                           R@10/2m=21.4%  R@5/1m=3.8%  rot=5.4°  trans=3865mm
+  27. knn_k30_cosine_distance                             R@10/2m=20.9%  R@5/1m=2.7%  rot=7.2°  trans=4230mm
+  28. knn_k3_cosine_uniform_pca128                        R@10/2m=20.9%  R@5/1m=4.4%  rot=7.7°  trans=4422mm
+  29. knn_k3_cosine_distance_pca128                       R@10/2m=20.9%  R@5/1m=5.5%  rot=7.7°  trans=4419mm
+  30. knn_k20_euclidean_distance_pca128                   R@10/2m=20.9%  R@5/1m=6.0%  rot=7.4°  trans=4134mm
+
+  BEST: knn_k3_cosine_uniform_whiten256 → R@10°/2m = 23.6%
+
+======================================================================
+RESULTS: knn_k3_cosine_uniform_whiten256
+======================================================================
+Rotation  (median): 6.53deg
+Translation (median): 4000mm
+
+  R@5deg_1m: 5.5%  (rot_pass=31.3%, trans_pass=9.9%)
+  R@10deg_2m: 23.6%  (rot_pass=78.6%, trans_pass=25.3%)
+  R@15deg_5m: 65.9%  (rot_pass=95.6%, trans_pass=67.0%)
+  R@25deg_5m: 67.0%  (rot_pass=100.0%, trans_pass=67.0%)
+
+Retrieval median: 10.80deg / 4241mm
+  R@5deg_1m: 2.7%  (rot=11.5%, trans=8.2%)
+  R@10deg_2m: 13.7%  (rot=44.5%, trans=19.8%)
+  R@15deg_5m: 55.5%  (rot=79.1%, trans=65.4%)
+  R@25deg_5m: 62.6%  (rot=94.0%, trans=65.4%)
+======================================================================
+
+Results saved to output/feature_retrieval/pose_regression/exp19_knn_nonparam/all_results.json

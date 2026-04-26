@@ -1,0 +1,169 @@
+/root/miniconda3/envs/iclpose/lib/python3.9/site-packages/tinycudann/modules.py:59: UserWarning: tinycudann was built for lower compute capability (80) than the system's (89). Performance may be suboptimal.
+  warnings.warn(f"tinycudann was built for lower compute capability ({cc}) than the system's ({system_compute_capability}). Performance may be suboptimal.")
+/root/miniconda3/envs/iclpose/lib/python3.9/site-packages/torch/_utils.py:776: UserWarning: TypedStorage is deprecated. It will be removed in the future and UntypedStorage will be the only storage class. This should only matter to you if you are using storages directly.  To access UntypedStorage directly, use tensor.untyped_storage() instead of tensor.storage()
+  return self.fget.__get__(instance, owner)()
+Building DCFF rendering pipeline...
+  No latent in PLY, initialized 32d random
+  [HybridGaussian] Loaded 300,845 Gaussians from /root/ICLPose-loc/output/feature_gaussian/joint_radio_dual_oldhospital_teacher_geom_v1/point_cloud/best/point_cloud.ply
+    scales: 2D (2DGS)
+    latent: 32d, geometry frozen=True
+  Loaded 300,845 Gaussians from /root/ICLPose-loc/output/feature_gaussian/joint_radio_dual_oldhospital_teacher_geom_v1/point_cloud/best/point_cloud.ply
+  Scene extent: 15949968.00
+  Loaded DCFF config from /root/ICLPose-loc/output/feature_field/dcff_oldhospital_v15d_v14b_coarse_smooth_frozen/config.yaml
+  [SpatialHashGrid] hash=24,134,256 + mlp=14,784 = 24,149,040 params
+    mode=implicit_scale, hash_dim=32, scale_dim=2, scale_pe_dim=18
+    mlp: 50 → 128 → 64
+  [SpatialFineDecoder] mode=latent-only, input=32d, hidden=128, receptive_field=5×5, params=193,344
+  [CarrierResidualCoarseFusion] latent=32d, feature=64d, carrier_hidden=128, gate_hidden=64, params=20,802
+  FSM enabled: 2,849 params
+  Using DepthGuidedRefiner (hidden=256) [from config]
+  Loading DCFF checkpoint: /root/ICLPose-loc/output/feature_field/dcff_oldhospital_v15d_v14b_coarse_smooth_frozen/checkpoints/best.pth
+  Loaded fine_decoder weights
+  Loaded coarse carrier fusion
+  Loaded feat_sharp weights
+  Loaded FSM weights
+  Restored latent embeddings from checkpoint
+  Loading joint feature checkpoint: /root/ICLPose-loc/output/feature_extract/joint_radio_dcff_oh_v5l_pointwise_featsharp_full_fsm_v1_b4/checkpoints/best.pth
+  Skipping joint fine_decoder (architecture changed): Error(s) in loading state_dict for SpatialFineDecoder:
+	Missing key(s) in state_dict: "decoder.1.weight", "decoder.1.bias", "decoder.3.weight", "decoder.3.bias", "decoder.6.weight", "decoder.6.bias". 
+	Unexpected key(s) in state_dict: "decoder.2.weight", "decoder.2.bias". 
+	size mismatch for decoder.0.weight: copying a param with shape torch.Size([128, 32, 1, 1]) from checkpoint, the shape in current model is torch.Size([128, 32, 3, 3]).
+	size mismatch for decoder.4.weight: copying a param with shape torch.Size([64, 128, 1, 1]) from checkpoint, the shape in current model is torch.Size([128]).
+	size mismatch for decoder.4.bias: copying a param with shape torch.Size([64]) from checkpoint, the shape in current model is torch.Size([128]).
+  Skipping joint feat_sharp (architecture changed): Error(s) in loading state_dict for DepthGuidedRefiner:
+	Missing key(s) in state_dict: "refiner.0.weight", "refiner.0.bias", "refiner.1.weight", "refiner.1.bias", "refiner.3.weight", "refiner.3.bias", "refiner.4.weight", "refiner.4.bias", "refiner.6.weight", "refiner.6.bias". 
+	Unexpected key(s) in state_dict: "sharpen.0.weight", "sharpen.0.bias", "sharpen.1.weight", "sharpen.1.bias". 
+  Loaded joint FSM
+  Overrode DCFF modules from joint checkpoint: fsm
+  DCFF loaded (iter 9152)
+  Decoder fine-tuning enabled: 974,018 params unfrozen
+  FSM fine-tuning enabled: 2,849 params unfrozen
+  Render resolution: 120×68
+Loaded localization model from epoch 0
+  Loaded localization fine_decoder
+  Loaded localization coarse_fusion
+  Loaded localization feat_sharp
+  Loaded localization FSM
+Restored localization map state: fine_decoder, coarse_fusion, feat_sharp, fsm
+[RadioLocDataset] Caching 182 samples (test) into memory...
+[RadioLocDataset] split=test, samples=182, fine_hw=(68, 120), coarse_hw=(68, 120), noise=3.0°/0.1m
+========================================================================
+Real-init eval: concat_loc_oh_v20k_v5l_pointwise_featsharp_full_fsm_v1_b4_bs4 epoch=0
+Retrieval feature dir: /root/ICLPose-loc/output/feature_extract/features_multiscale_compressed/OldHospital
+Init pose cache: /root/ICLPose-loc/output/feature_retrieval/pose_regression/best_ensemble_init_top5.npz
+Init stats: {'method_requested': 'learned_ensemble', 'method_used': 'learned_best_ensemble', 'retrieval_topk_requested': 5, 'num_train_samples': 895, 'num_query_samples': 182, 'counts_by_source': {'learned_best_ensemble': 182}, 'translation_weights': {'e123': 2.5822784810126587, 'e38': 1.5949367088607593, 'f42': 1.1012658227848102, 'e40': 0.11392405063291139, 'e47': 0.6075949367088608, 'f15': 0.2, 'e60': 0.1, 's314': 0.05}, 'rotation_source': 'f15'}
+Retrieval top-k: 5  fusion: none
+========================================================================
+real-init eval:   0%|          | 0/46 [00:00<?, ?it/s]/root/miniconda3/envs/iclpose/lib/python3.9/site-packages/torch/utils/cpp_extension.py:25: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  from pkg_resources import packaging  # type: ignore[attr-defined]
+real-init eval:   2%|▏         | 1/46 [00:15<11:42, 15.62s/it]real-init eval:   4%|▍         | 2/46 [00:29<10:52, 14.83s/it]real-init eval:   7%|▋         | 3/46 [00:44<10:30, 14.67s/it]real-init eval:   9%|▊         | 4/46 [00:57<09:55, 14.19s/it]real-init eval:  11%|█         | 5/46 [01:10<09:21, 13.69s/it]real-init eval:  13%|█▎        | 6/46 [01:24<09:08, 13.70s/it]real-init eval:  15%|█▌        | 7/46 [01:37<08:48, 13.55s/it]real-init eval:  17%|█▋        | 8/46 [01:51<08:35, 13.58s/it]real-init eval:  20%|█▉        | 9/46 [02:04<08:13, 13.33s/it]real-init eval:  22%|██▏       | 10/46 [02:16<07:54, 13.17s/it]real-init eval:  24%|██▍       | 11/46 [02:29<07:40, 13.16s/it]real-init eval:  26%|██▌       | 12/46 [02:43<07:26, 13.12s/it]real-init eval:  28%|██▊       | 13/46 [02:56<07:14, 13.18s/it]real-init eval:  30%|███       | 14/46 [03:09<07:02, 13.21s/it]real-init eval:  33%|███▎      | 15/46 [03:23<06:53, 13.33s/it]real-init eval:  35%|███▍      | 16/46 [03:36<06:40, 13.34s/it]real-init eval:  37%|███▋      | 17/46 [03:49<06:24, 13.27s/it]real-init eval:  39%|███▉      | 18/46 [04:02<06:07, 13.12s/it]real-init eval:  41%|████▏     | 19/46 [04:14<05:48, 12.92s/it]real-init eval:  43%|████▎     | 20/46 [04:26<05:25, 12.51s/it]real-init eval:  46%|████▌     | 21/46 [04:39<05:15, 12.61s/it]real-init eval:  48%|████▊     | 22/46 [04:52<05:04, 12.69s/it]real-init eval:  50%|█████     | 23/46 [05:04<04:49, 12.60s/it]real-init eval:  52%|█████▏    | 24/46 [05:17<04:36, 12.56s/it]real-init eval:  54%|█████▍    | 25/46 [05:29<04:22, 12.50s/it]real-init eval:  57%|█████▋    | 26/46 [05:40<04:04, 12.23s/it]real-init eval:  59%|█████▊    | 27/46 [05:52<03:49, 12.09s/it]real-init eval:  61%|██████    | 28/46 [06:03<03:30, 11.67s/it]real-init eval:  63%|██████▎   | 29/46 [06:11<03:00, 10.60s/it]real-init eval:  65%|██████▌   | 30/46 [06:19<02:35,  9.69s/it]real-init eval:  67%|██████▋   | 31/46 [06:27<02:18,  9.22s/it]real-init eval:  70%|██████▉   | 32/46 [06:34<02:01,  8.67s/it]real-init eval:  72%|███████▏  | 33/46 [06:42<01:48,  8.34s/it]real-init eval:  74%|███████▍  | 34/46 [06:52<01:45,  8.80s/it]real-init eval:  76%|███████▌  | 35/46 [07:00<01:35,  8.69s/it]real-init eval:  78%|███████▊  | 36/46 [07:09<01:28,  8.81s/it]real-init eval:  80%|████████  | 37/46 [07:18<01:20,  8.95s/it]real-init eval:  83%|████████▎ | 38/46 [07:28<01:12,  9.03s/it]real-init eval:  85%|████████▍ | 39/46 [07:36<01:02,  8.97s/it]real-init eval:  87%|████████▋ | 40/46 [07:45<00:53,  8.84s/it]real-init eval:  89%|████████▉ | 41/46 [07:54<00:44,  8.83s/it]real-init eval:  91%|█████████▏| 42/46 [08:03<00:35,  8.93s/it]real-init eval:  93%|█████████▎| 43/46 [08:11<00:26,  8.72s/it]real-init eval:  96%|█████████▌| 44/46 [08:20<00:17,  8.77s/it]real-init eval:  98%|█████████▊| 45/46 [08:27<00:08,  8.26s/it]real-init eval: 100%|██████████| 46/46 [08:32<00:00,  7.31s/it]                                                               {
+  "config": "/root/ICLPose-loc/pose_refine/configs/concat_loc_oh_v20k_v5l_pointwise_featsharp_full_fsm_v1_b4_bs4.yaml",
+  "checkpoint": "/root/ICLPose-loc/output/pose_refine/concat_loc_oh_v20k_v5l_pointwise_featsharp_full_fsm_v1_b4_bs4/checkpoints/best.pth",
+  "output_dir": "/root/ICLPose-loc/output/feature_retrieval/full_eval_best_ens_none",
+  "epoch": 0,
+  "solver": "flow+direct5",
+  "outer_iters": 10,
+  "gru_iters": 8,
+  "retrieval_topk": 5,
+  "pose_fusion": "none",
+  "consensus_radius_m": 1.0,
+  "num_samples": 182,
+  "retrieval_feature_dir": "/root/ICLPose-loc/output/feature_extract/features_multiscale_compressed/OldHospital",
+  "init_pose_cache": "/root/ICLPose-loc/output/feature_retrieval/pose_regression/best_ensemble_init_top5.npz",
+  "dataset_init_stats": {
+    "method_requested": "learned_ensemble",
+    "method_used": "learned_best_ensemble",
+    "retrieval_topk_requested": 5,
+    "num_train_samples": 895,
+    "num_query_samples": 182,
+    "counts_by_source": {
+      "learned_best_ensemble": 182
+    },
+    "translation_weights": {
+      "e123": 2.5822784810126587,
+      "e38": 1.5949367088607593,
+      "f42": 1.1012658227848102,
+      "e40": 0.11392405063291139,
+      "e47": 0.6075949367088608,
+      "f15": 0.2,
+      "e60": 0.1,
+      "s314": 0.05
+    },
+    "rotation_source": "f15"
+  },
+  "counts_by_source": {
+    "learned_best_ensemble": 182
+  },
+  "init_metrics": {
+    "rot_mean": 2.064146451815799,
+    "rot_median": 1.7393330931663513,
+    "trans_mean": 1661.2910259372586,
+    "trans_median": 1280.889892578125,
+    "pct_1deg": 15.934065934065933,
+    "pct_5deg": 96.15384615384616,
+    "pct_10deg": 100.0,
+    "pct_1000mm": 39.56043956043956,
+    "pct_2000mm": 76.37362637362637,
+    "joint_01deg_53mm": 0.0,
+    "joint_1deg_50mm": 0.0,
+    "joint_5deg_100mm": 0.0,
+    "joint_5deg_1000mm": 39.010989010989015,
+    "joint_10deg_2000mm": 76.37362637362637
+  },
+  "top1_final_metrics": {
+    "rot_mean": 2.0901418390509847,
+    "rot_median": 1.8305381536483765,
+    "trans_mean": 1734.3450823773394,
+    "trans_median": 1273.0639038085938,
+    "pct_1deg": 16.483516483516482,
+    "pct_5deg": 97.25274725274726,
+    "pct_10deg": 100.0,
+    "pct_1000mm": 40.10989010989011,
+    "pct_2000mm": 75.82417582417582,
+    "joint_01deg_53mm": 0.0,
+    "joint_1deg_50mm": 0.0,
+    "joint_5deg_100mm": 0.0,
+    "joint_5deg_1000mm": 39.56043956043956,
+    "joint_10deg_2000mm": 75.82417582417582
+  },
+  "final_metrics": {
+    "rot_mean": 2.0901418390509847,
+    "rot_median": 1.8305381536483765,
+    "trans_mean": 1734.3450823773394,
+    "trans_median": 1273.0639038085938,
+    "pct_1deg": 16.483516483516482,
+    "pct_5deg": 97.25274725274726,
+    "pct_10deg": 100.0,
+    "pct_1000mm": 40.10989010989011,
+    "pct_2000mm": 75.82417582417582,
+    "joint_01deg_53mm": 0.0,
+    "joint_1deg_50mm": 0.0,
+    "joint_5deg_100mm": 0.0,
+    "joint_5deg_1000mm": 39.56043956043956,
+    "joint_10deg_2000mm": 75.82417582417582
+  },
+  "oracle_final_metrics": {
+    "rot_mean": 2.844478334044362,
+    "rot_median": 1.9161010384559631,
+    "trans_mean": 1652.5139363886235,
+    "trans_median": 1148.8597412109375,
+    "pct_1deg": 15.384615384615385,
+    "pct_5deg": 89.56043956043956,
+    "pct_10deg": 92.85714285714286,
+    "pct_1000mm": 43.40659340659341,
+    "pct_2000mm": 78.02197802197803,
+    "joint_01deg_53mm": 0.0,
+    "joint_1deg_50mm": 0.0,
+    "joint_5deg_100mm": 0.0,
+    "joint_5deg_1000mm": 37.91208791208791,
+    "joint_10deg_2000mm": 71.42857142857143
+  },
+  "fusion_stats": {
+    "cluster_size_mean": 1.0,
+    "cluster_size_median": 1.0,
+    "top1_fallback_rate": 100.0
+  },
+  "readiness": "ready",
+  "blocker": "",
+  "qual_dir": "/root/ICLPose-loc/output/feature_retrieval/full_eval_best_ens_none/qual_real_init_top5_none"
+}

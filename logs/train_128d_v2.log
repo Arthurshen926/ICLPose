@@ -1,0 +1,200 @@
+=== Training on 128d PCA features ===
+Feature dir: output/feature_extract/features_radio_dual_128/OldHospital_pilot
+
+=== exp14m: SPP(1,2,4) both+sum 128d, hidden=[1024,512,256] ===
+
+Loaded best model from epoch 1310
+
+======================================================================
+EVALUATION RESULTS (Direct Regression)
+======================================================================
+Rotation  (median): 1.77deg
+Translation (median): 1352mm
+
+  R@5deg_1m: 36.3%  (rot_pass=92.9%, trans_pass=36.3%)
+  R@10deg_2m: 64.3%  (rot_pass=99.5%, trans_pass=64.8%)
+  R@15deg_5m: 92.3%  (rot_pass=100.0%, trans_pass=92.3%)
+  R@25deg_5m: 92.3%  (rot_pass=100.0%, trans_pass=92.3%)
+
+======================================================================
+EVALUATION RESULTS (Retrieval Mode)
+======================================================================
+Retrieval median: 11.77deg / 2447mm
+  R@5deg_1m: 2.7%  (rot=4.4%, trans=19.8%)
+  R@10deg_2m: 18.1%  (rot=37.9%, trans=42.3%)
+  R@15deg_5m: 57.1%  (rot=69.2%, trans=87.4%)
+  R@25deg_5m: 83.5%  (rot=96.2%, trans=87.4%)
+======================================================================
+
+Done!
+--- exp14m done ---
+
+=== exp14m2: SPP(1,2,4) both+sum 128d, hidden=[2048,1024,512] ===
+
+Loaded best model from epoch 1370
+
+======================================================================
+EVALUATION RESULTS (Direct Regression)
+======================================================================
+Rotation  (median): 1.54deg
+Translation (median): 1378mm
+
+  R@5deg_1m: 36.3%  (rot_pass=93.4%, trans_pass=36.3%)
+  R@10deg_2m: 69.8%  (rot_pass=100.0%, trans_pass=69.8%)
+  R@15deg_5m: 92.3%  (rot_pass=100.0%, trans_pass=92.3%)
+  R@25deg_5m: 92.3%  (rot_pass=100.0%, trans_pass=92.3%)
+
+======================================================================
+EVALUATION RESULTS (Retrieval Mode)
+======================================================================
+Retrieval median: 11.34deg / 2370mm
+  R@5deg_1m: 3.3%  (rot=7.7%, trans=19.8%)
+  R@10deg_2m: 21.4%  (rot=43.4%, trans=44.0%)
+  R@15deg_5m: 56.6%  (rot=70.9%, trans=85.7%)
+  R@25deg_5m: 83.0%  (rot=97.3%, trans=85.7%)
+======================================================================
+
+Done!
+--- exp14m2 done ---
+
+=== exp14m3_seed123: SPP(1,2,4) both+sum 128d ===
+
+Loaded best model from epoch 750
+
+======================================================================
+EVALUATION RESULTS (Direct Regression)
+======================================================================
+Rotation  (median): 1.69deg
+Translation (median): 1317mm
+
+  R@5deg_1m: 35.7%  (rot_pass=94.0%, trans_pass=35.7%)
+  R@10deg_2m: 64.3%  (rot_pass=99.5%, trans_pass=64.8%)
+  R@15deg_5m: 90.7%  (rot_pass=100.0%, trans_pass=90.7%)
+  R@25deg_5m: 90.7%  (rot_pass=100.0%, trans_pass=90.7%)
+
+======================================================================
+EVALUATION RESULTS (Retrieval Mode)
+======================================================================
+Retrieval median: 11.50deg / 2473mm
+  R@5deg_1m: 3.3%  (rot=6.0%, trans=17.6%)
+  R@10deg_2m: 19.2%  (rot=42.3%, trans=40.7%)
+  R@15deg_5m: 56.0%  (rot=68.7%, trans=86.3%)
+  R@25deg_5m: 84.1%  (rot=97.8%, trans=86.3%)
+======================================================================
+
+Done!
+--- exp14m3_seed123 done ---
+
+=== exp14m3_seed456: SPP(1,2,4) both+sum 128d ===
+
+Loaded best model from epoch 770
+
+======================================================================
+EVALUATION RESULTS (Direct Regression)
+======================================================================
+Rotation  (median): 1.64deg
+Translation (median): 1361mm
+
+  R@5deg_1m: 34.6%  (rot_pass=94.0%, trans_pass=34.6%)
+  R@10deg_2m: 65.4%  (rot_pass=99.5%, trans_pass=65.9%)
+  R@15deg_5m: 95.1%  (rot_pass=100.0%, trans_pass=95.1%)
+  R@25deg_5m: 95.1%  (rot_pass=100.0%, trans_pass=95.1%)
+
+======================================================================
+EVALUATION RESULTS (Retrieval Mode)
+======================================================================
+Retrieval median: 11.77deg / 2354mm
+  R@5deg_1m: 3.3%  (rot=6.6%, trans=20.9%)
+  R@10deg_2m: 20.3%  (rot=40.1%, trans=44.5%)
+  R@15deg_5m: 56.0%  (rot=66.5%, trans=89.6%)
+  R@25deg_5m: 84.1%  (rot=94.5%, trans=89.6%)
+======================================================================
+
+Done!
+--- exp14m3_seed456 done ---
+
+=== exp14m3_seed789: SPP(1,2,4) both+sum 128d ===
+
+Loaded best model from epoch 780
+
+======================================================================
+EVALUATION RESULTS (Direct Regression)
+======================================================================
+Rotation  (median): 1.59deg
+Translation (median): 1433mm
+
+  R@5deg_1m: 34.6%  (rot_pass=92.3%, trans_pass=35.2%)
+  R@10deg_2m: 65.4%  (rot_pass=99.5%, trans_pass=65.9%)
+  R@15deg_5m: 92.3%  (rot_pass=100.0%, trans_pass=92.3%)
+  R@25deg_5m: 92.3%  (rot_pass=100.0%, trans_pass=92.3%)
+
+======================================================================
+EVALUATION RESULTS (Retrieval Mode)
+======================================================================
+Retrieval median: 11.54deg / 2473mm
+  R@5deg_1m: 2.7%  (rot=5.5%, trans=21.4%)
+  R@10deg_2m: 18.7%  (rot=41.2%, trans=43.4%)
+  R@15deg_5m: 56.0%  (rot=69.2%, trans=86.8%)
+  R@25deg_5m: 83.0%  (rot=96.2%, trans=86.8%)
+======================================================================
+
+Done!
+--- exp14m3_seed789 done ---
+
+=== exp14m4: SPP(1,2,4) both+sum 128d, hidden=[512,256,128] (small) ===
+
+Loaded best model from epoch 1410
+
+======================================================================
+EVALUATION RESULTS (Direct Regression)
+======================================================================
+Rotation  (median): 1.60deg
+Translation (median): 1232mm
+
+  R@5deg_1m: 37.4%  (rot_pass=91.8%, trans_pass=37.4%)
+  R@10deg_2m: 64.8%  (rot_pass=99.5%, trans_pass=65.4%)
+  R@15deg_5m: 86.8%  (rot_pass=100.0%, trans_pass=86.8%)
+  R@25deg_5m: 86.8%  (rot_pass=100.0%, trans_pass=86.8%)
+
+======================================================================
+EVALUATION RESULTS (Retrieval Mode)
+======================================================================
+Retrieval median: 11.12deg / 2490mm
+  R@5deg_1m: 2.2%  (rot=4.4%, trans=20.9%)
+  R@10deg_2m: 18.7%  (rot=42.3%, trans=40.1%)
+  R@15deg_5m: 56.0%  (rot=72.0%, trans=81.3%)
+  R@25deg_5m: 80.2%  (rot=98.9%, trans=81.3%)
+======================================================================
+
+Done!
+--- exp14m4 done ---
+
+=== exp14m5: SPP(1,2,4) coarse+sum 128d ===
+
+Loaded best model from epoch 860
+
+======================================================================
+EVALUATION RESULTS (Direct Regression)
+======================================================================
+Rotation  (median): 1.72deg
+Translation (median): 1350mm
+
+  R@5deg_1m: 34.6%  (rot_pass=92.9%, trans_pass=35.2%)
+  R@10deg_2m: 64.3%  (rot_pass=99.5%, trans_pass=64.8%)
+  R@15deg_5m: 92.3%  (rot_pass=100.0%, trans_pass=92.3%)
+  R@25deg_5m: 92.3%  (rot_pass=100.0%, trans_pass=92.3%)
+
+======================================================================
+EVALUATION RESULTS (Retrieval Mode)
+======================================================================
+Retrieval median: 11.38deg / 2390mm
+  R@5deg_1m: 2.2%  (rot=3.8%, trans=20.9%)
+  R@10deg_2m: 20.3%  (rot=42.3%, trans=41.2%)
+  R@15deg_5m: 57.1%  (rot=68.7%, trans=87.4%)
+  R@25deg_5m: 83.0%  (rot=95.1%, trans=87.4%)
+======================================================================
+
+Done!
+--- exp14m5 done ---
+
+=== All 128d training complete! ===

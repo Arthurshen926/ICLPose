@@ -1,0 +1,47 @@
+=== exp24e_attn_h4_wider_seed123 on GPU 5 ===
+======================================================================
+Experiment: exp24e_attn_h4_wider_seed123
+Pool: attn, Features: both+sum
+======================================================================
+Random seed: 123
+Using device: cuda:5
+
+Loading data (fine=True, coarse=True, summary=True)...
+  Loaded fine_geo: torch.Size([895, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([895, 128, 68, 120])
+  Loaded summary: torch.Size([895, 2560])
+  [train] 895 samples loaded
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+Translation norm: mean=[13.19548    -0.64731836 23.103329  ], std=[10.827089    0.94348246  9.766839  ]
+  Feature dim after pooling: 3584
+Model parameters: 10,001,042
+Model parameters: 10,001,042
+[    1/10000] loss=3.1942 (t=0.5843 r=2.6099 beta=1.00) | val: 32.57deg/29172mm | 0.4s
+[  100/10000] loss=0.1132 (t=0.0457 r=0.0728 beta=0.93) | val: 5.25deg/2900mm | 3.5s
+[  200/10000] loss=0.0663 (t=0.0235 r=0.0484 beta=0.88) | val: 4.19deg/2236mm | 6.4s
+[  300/10000] loss=0.0528 (t=0.0182 r=0.0410 beta=0.85) | val: 2.30deg/1748mm | 8.7s
+[  400/10000] loss=0.0495 (t=0.0180 r=0.0389 beta=0.81) | val: 2.92deg/1705mm | 11.0s
+[  500/10000] loss=0.0381 (t=0.0112 r=0.0345 beta=0.78) | val: 2.19deg/1416mm | 13.0s
+[  600/10000] loss=0.0338 (t=0.0089 r=0.0332 beta=0.75) | val: 2.06deg/1489mm | 14.8s
+[  700/10000] loss=0.0289 (t=0.0085 r=0.0282 beta=0.72) | val: 2.06deg/1531mm | 16.8s
+[  800/10000] loss=0.0297 (t=0.0077 r=0.0316 beta=0.70) | val: 1.82deg/1531mm | 18.6s
+[  900/10000] loss=0.0253 (t=0.0067 r=0.0277 beta=0.67) | val: 1.88deg/1648mm | 20.6s
+[ 1000/10000] loss=0.0212 (t=0.0053 r=0.0245 beta=0.65) | val: 1.89deg/1498mm | 22.5s
+[ 1100/10000] loss=0.0180 (t=0.0045 r=0.0217 beta=0.62) | val: 1.96deg/1550mm | 24.3s
+[ 1200/10000] loss=0.0192 (t=0.0039 r=0.0255 beta=0.60) | val: 1.90deg/1575mm | 26.3s
+[ 1300/10000] loss=0.0182 (t=0.0047 r=0.0233 beta=0.58) | val: 1.97deg/1518mm | 28.2s
+[ 1400/10000] loss=0.0165 (t=0.0036 r=0.0229 beta=0.56) | val: 1.82deg/1255mm | 30.0s
+[ 1500/10000] loss=0.0165 (t=0.0037 r=0.0238 beta=0.54) | val: 1.92deg/1535mm | 31.8s
+[ 1600/10000] loss=0.0149 (t=0.0032 r=0.0225 beta=0.52) | val: 1.82deg/1381mm | 33.7s
+[ 1700/10000] loss=0.0137 (t=0.0033 r=0.0208 beta=0.50) | val: 1.93deg/1426mm | 35.5s
+[ 1800/10000] loss=0.0132 (t=0.0035 r=0.0201 beta=0.49) | val: 1.88deg/1466mm | 37.3s
+[ 1900/10000] loss=0.0126 (t=0.0030 r=0.0205 beta=0.47) | val: 2.01deg/1528mm | 39.2s
+[ 2000/10000] loss=0.0130 (t=0.0032 r=0.0216 beta=0.45) | val: 1.94deg/1403mm | 41.0s
+[ 2100/10000] loss=0.0107 (t=0.0023 r=0.0191 beta=0.44) | val: 1.86deg/1421mm | 42.8s
+[ 2200/10000] loss=0.0115 (t=0.0031 r=0.0197 beta=0.42) | val: 1.93deg/1373mm | 44.7s
+[ 2300/10000] loss=0.0103 (t=0.0031 r=0.0175 beta=0.41) | val: 2.01deg/1507mm | 46.5s
+[ 2400/10000] loss=0.0105 (t=0.0025 r=0.0202 beta=0.40) | val: 1.98deg/1502mm | 48.3s
+[ 2500/10000] loss=0.0093 (t=0.0020 r=0.0190 beta=0.38) | val: 2.07deg/1758mm | 50.2s

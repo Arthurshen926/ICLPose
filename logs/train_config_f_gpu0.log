@@ -1,0 +1,58 @@
+[Mon 20 Apr 2026 06:06:00 AM CST] Starting config=f on GPU=0, seeds=(123 314 7 24 38 42 456 999)
+[Mon 20 Apr 2026 06:06:00 AM CST] Training exp24f_attn_h8_wider_seed123 on GPU 0 ...
+  R@15deg_5m: 58.8%  (rot=72.0%, trans=85.2%)
+  R@25deg_5m: 83.5%  (rot=98.4%, trans=85.2%)
+======================================================================
+
+Done!
+[Mon 20 Apr 2026 06:09:29 AM CST] Done exp24f_attn_h8_wider_seed123
+[Mon 20 Apr 2026 06:09:29 AM CST] Training exp24f_attn_h8_wider_seed314 on GPU 0 ...
+  R@15deg_5m: 53.8%  (rot=70.9%, trans=80.8%)
+  R@25deg_5m: 79.1%  (rot=97.8%, trans=80.8%)
+======================================================================
+
+Done!
+[Mon 20 Apr 2026 06:13:01 AM CST] Done exp24f_attn_h8_wider_seed314
+[Mon 20 Apr 2026 06:13:01 AM CST] Training exp24f_attn_h8_wider_seed7 on GPU 0 ...
+  R@15deg_5m: 58.2%  (rot=70.3%, trans=86.3%)
+  R@25deg_5m: 86.3%  (rot=100.0%, trans=86.3%)
+======================================================================
+
+Done!
+[Mon 20 Apr 2026 06:16:29 AM CST] Done exp24f_attn_h8_wider_seed7
+[Mon 20 Apr 2026 06:16:29 AM CST] Training exp24f_attn_h8_wider_seed24 on GPU 0 ...
+  R@15deg_5m: 56.0%  (rot=66.5%, trans=89.0%)
+  R@25deg_5m: 86.8%  (rot=97.8%, trans=89.0%)
+======================================================================
+
+Done!
+[Mon 20 Apr 2026 06:19:59 AM CST] Done exp24f_attn_h8_wider_seed24
+[Mon 20 Apr 2026 06:19:59 AM CST] Training exp24f_attn_h8_wider_seed38 on GPU 0 ...
+  R@15deg_5m: 56.6%  (rot=68.7%, trans=87.4%)
+  R@25deg_5m: 84.1%  (rot=96.7%, trans=87.4%)
+======================================================================
+
+Done!
+[Mon 20 Apr 2026 06:23:29 AM CST] Done exp24f_attn_h8_wider_seed38
+[Mon 20 Apr 2026 06:23:29 AM CST] Training exp24f_attn_h8_wider_seed42 on GPU 0 ...
+  R@15deg_5m: 57.1%  (rot=69.2%, trans=86.3%)
+  R@25deg_5m: 83.5%  (rot=96.7%, trans=86.3%)
+======================================================================
+
+Done!
+[Mon 20 Apr 2026 06:26:58 AM CST] Done exp24f_attn_h8_wider_seed42
+[Mon 20 Apr 2026 06:26:58 AM CST] Training exp24f_attn_h8_wider_seed456 on GPU 0 ...
+  R@15deg_5m: 56.0%  (rot=67.6%, trans=86.8%)
+  R@25deg_5m: 83.0%  (rot=96.2%, trans=86.8%)
+======================================================================
+
+Done!
+[Mon 20 Apr 2026 06:30:27 AM CST] Done exp24f_attn_h8_wider_seed456
+[Mon 20 Apr 2026 06:30:27 AM CST] Training exp24f_attn_h8_wider_seed999 on GPU 0 ...
+  R@15deg_5m: 60.4%  (rot=72.5%, trans=85.7%)
+  R@25deg_5m: 83.0%  (rot=97.3%, trans=85.7%)
+======================================================================
+
+Done!
+[Mon 20 Apr 2026 06:33:56 AM CST] Done exp24f_attn_h8_wider_seed999
+[Mon 20 Apr 2026 06:33:56 AM CST] All done for config=f on GPU=0

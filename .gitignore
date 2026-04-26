@@ -1,5 +1,6 @@
 output/
 # logs/
+# *.log
 
 
 dataset/
@@ -15,4 +16,3 @@ __pycache__/
 nohup.out
 models/segformer-b2-ade/
 plat import*
-*.log

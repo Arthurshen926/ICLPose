@@ -1,0 +1,167 @@
+=== 256d Training ===
+=== exp14q_256d_wider_seed123 (GPU 5) ===
+  File "/root/miniconda3/envs/iclpose/lib/python3.9/runpy.py", line 197, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/root/miniconda3/envs/iclpose/lib/python3.9/runpy.py", line 87, in _run_code
+    exec(code, run_globals)
+  File "/root/ICLPose-loc/feature_retrieval/patch_regressor_v7.py", line 865, in <module>
+    main()
+  File "/root/ICLPose-loc/feature_retrieval/patch_regressor_v7.py", line 850, in main
+    model, train_data, test_data, trans_mean, trans_std, history = train(args)
+  File "/root/ICLPose-loc/feature_retrieval/patch_regressor_v7.py", line 533, in train
+    pf = train_data.patch_fine[indices] if train_data.patch_fine is not None else None
+torch.cuda.OutOfMemoryError: CUDA out of memory. Tried to allocate 6.97 GiB (GPU 0; 23.52 GiB total capacity; 16.88 GiB already allocated; 6.18 GiB free; 16.89 GiB reserved in total by PyTorch) If reserved memory is >> allocated memory try setting max_split_size_mb to avoid fragmentation.  See documentation for Memory Management and PYTORCH_CUDA_ALLOC_CONF
+======================================================================
+Experiment: exp14q_256d_wider_seed123
+Pool: spp, Features: both+sum
+======================================================================
+Random seed: 123
+Using device: cuda:0
+
+Loading data (fine=True, coarse=True, summary=True)...
+  Loaded fine_geo: torch.Size([895, 256, 68, 120])
+  Loaded coarse_sem: torch.Size([895, 256, 68, 120])
+  Loaded summary: torch.Size([895, 2560])
+  [train] 895 samples loaded
+  Loaded fine_geo: torch.Size([182, 256, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 256, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+Translation norm: mean=[13.19548    -0.64731836 23.103329  ], std=[10.827089    0.94348246  9.766839  ]
+  Feature dim after pooling: 13312
+Model parameters: 29,926,410
+--- exp14q_256d_wider_seed123 done ---
+
+=== exp14q_256d_wider_seed456 (GPU 5) ===
+  File "/root/miniconda3/envs/iclpose/lib/python3.9/runpy.py", line 197, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/root/miniconda3/envs/iclpose/lib/python3.9/runpy.py", line 87, in _run_code
+    exec(code, run_globals)
+  File "/root/ICLPose-loc/feature_retrieval/patch_regressor_v7.py", line 865, in <module>
+    main()
+  File "/root/ICLPose-loc/feature_retrieval/patch_regressor_v7.py", line 850, in main
+    model, train_data, test_data, trans_mean, trans_std, history = train(args)
+  File "/root/ICLPose-loc/feature_retrieval/patch_regressor_v7.py", line 533, in train
+    pf = train_data.patch_fine[indices] if train_data.patch_fine is not None else None
+torch.cuda.OutOfMemoryError: CUDA out of memory. Tried to allocate 6.97 GiB (GPU 0; 23.52 GiB total capacity; 16.88 GiB already allocated; 6.18 GiB free; 16.89 GiB reserved in total by PyTorch) If reserved memory is >> allocated memory try setting max_split_size_mb to avoid fragmentation.  See documentation for Memory Management and PYTORCH_CUDA_ALLOC_CONF
+======================================================================
+Experiment: exp14q_256d_wider_seed456
+Pool: spp, Features: both+sum
+======================================================================
+Random seed: 456
+Using device: cuda:0
+
+Loading data (fine=True, coarse=True, summary=True)...
+  Loaded fine_geo: torch.Size([895, 256, 68, 120])
+  Loaded coarse_sem: torch.Size([895, 256, 68, 120])
+  Loaded summary: torch.Size([895, 2560])
+  [train] 895 samples loaded
+  Loaded fine_geo: torch.Size([182, 256, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 256, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+Translation norm: mean=[13.19548    -0.64731836 23.103329  ], std=[10.827089    0.94348246  9.766839  ]
+  Feature dim after pooling: 13312
+Model parameters: 29,926,410
+--- exp14q_256d_wider_seed456 done ---
+
+=== exp14q_256d_wider_seed789 (GPU 5) ===
+  File "/root/miniconda3/envs/iclpose/lib/python3.9/runpy.py", line 197, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/root/miniconda3/envs/iclpose/lib/python3.9/runpy.py", line 87, in _run_code
+    exec(code, run_globals)
+  File "/root/ICLPose-loc/feature_retrieval/patch_regressor_v7.py", line 865, in <module>
+    main()
+  File "/root/ICLPose-loc/feature_retrieval/patch_regressor_v7.py", line 850, in main
+    model, train_data, test_data, trans_mean, trans_std, history = train(args)
+  File "/root/ICLPose-loc/feature_retrieval/patch_regressor_v7.py", line 533, in train
+    pf = train_data.patch_fine[indices] if train_data.patch_fine is not None else None
+torch.cuda.OutOfMemoryError: CUDA out of memory. Tried to allocate 6.97 GiB (GPU 0; 23.52 GiB total capacity; 16.88 GiB already allocated; 6.18 GiB free; 16.89 GiB reserved in total by PyTorch) If reserved memory is >> allocated memory try setting max_split_size_mb to avoid fragmentation.  See documentation for Memory Management and PYTORCH_CUDA_ALLOC_CONF
+======================================================================
+Experiment: exp14q_256d_wider_seed789
+Pool: spp, Features: both+sum
+======================================================================
+Random seed: 789
+Using device: cuda:0
+
+Loading data (fine=True, coarse=True, summary=True)...
+  Loaded fine_geo: torch.Size([895, 256, 68, 120])
+  Loaded coarse_sem: torch.Size([895, 256, 68, 120])
+  Loaded summary: torch.Size([895, 2560])
+  [train] 895 samples loaded
+  Loaded fine_geo: torch.Size([182, 256, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 256, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+Translation norm: mean=[13.19548    -0.64731836 23.103329  ], std=[10.827089    0.94348246  9.766839  ]
+  Feature dim after pooling: 13312
+Model parameters: 29,926,410
+--- exp14q_256d_wider_seed789 done ---
+
+=== exp14q2_256d_extrawide_seed123 (GPU 5) ===
+  File "/root/miniconda3/envs/iclpose/lib/python3.9/runpy.py", line 197, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/root/miniconda3/envs/iclpose/lib/python3.9/runpy.py", line 87, in _run_code
+    exec(code, run_globals)
+  File "/root/ICLPose-loc/feature_retrieval/patch_regressor_v7.py", line 865, in <module>
+    main()
+  File "/root/ICLPose-loc/feature_retrieval/patch_regressor_v7.py", line 850, in main
+    model, train_data, test_data, trans_mean, trans_std, history = train(args)
+  File "/root/ICLPose-loc/feature_retrieval/patch_regressor_v7.py", line 533, in train
+    pf = train_data.patch_fine[indices] if train_data.patch_fine is not None else None
+torch.cuda.OutOfMemoryError: CUDA out of memory. Tried to allocate 6.97 GiB (GPU 0; 23.52 GiB total capacity; 17.02 GiB already allocated; 6.04 GiB free; 17.03 GiB reserved in total by PyTorch) If reserved memory is >> allocated memory try setting max_split_size_mb to avoid fragmentation.  See documentation for Memory Management and PYTORCH_CUDA_ALLOC_CONF
+======================================================================
+Experiment: exp14q2_256d_extrawide_seed123
+Pool: spp, Features: both+sum
+======================================================================
+Random seed: 123
+Using device: cuda:0
+
+Loading data (fine=True, coarse=True, summary=True)...
+  Loaded fine_geo: torch.Size([895, 256, 68, 120])
+  Loaded coarse_sem: torch.Size([895, 256, 68, 120])
+  Loaded summary: torch.Size([895, 2560])
+  [train] 895 samples loaded
+  Loaded fine_geo: torch.Size([182, 256, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 256, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+Translation norm: mean=[13.19548    -0.64731836 23.103329  ], std=[10.827089    0.94348246  9.766839  ]
+  Feature dim after pooling: 13312
+Model parameters: 65,069,066
+--- exp14q2_256d_extrawide_seed123 done ---
+
+=== exp14q2_256d_extrawide_seed456 (GPU 5) ===
+  File "/root/miniconda3/envs/iclpose/lib/python3.9/runpy.py", line 197, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/root/miniconda3/envs/iclpose/lib/python3.9/runpy.py", line 87, in _run_code
+    exec(code, run_globals)
+  File "/root/ICLPose-loc/feature_retrieval/patch_regressor_v7.py", line 865, in <module>
+    main()
+  File "/root/ICLPose-loc/feature_retrieval/patch_regressor_v7.py", line 850, in main
+    model, train_data, test_data, trans_mean, trans_std, history = train(args)
+  File "/root/ICLPose-loc/feature_retrieval/patch_regressor_v7.py", line 533, in train
+    pf = train_data.patch_fine[indices] if train_data.patch_fine is not None else None
+torch.cuda.OutOfMemoryError: CUDA out of memory. Tried to allocate 6.97 GiB (GPU 0; 23.52 GiB total capacity; 17.02 GiB already allocated; 6.04 GiB free; 17.03 GiB reserved in total by PyTorch) If reserved memory is >> allocated memory try setting max_split_size_mb to avoid fragmentation.  See documentation for Memory Management and PYTORCH_CUDA_ALLOC_CONF
+======================================================================
+Experiment: exp14q2_256d_extrawide_seed456
+Pool: spp, Features: both+sum
+======================================================================
+Random seed: 456
+Using device: cuda:0
+
+Loading data (fine=True, coarse=True, summary=True)...
+  Loaded fine_geo: torch.Size([895, 256, 68, 120])
+  Loaded coarse_sem: torch.Size([895, 256, 68, 120])
+  Loaded summary: torch.Size([895, 2560])
+  [train] 895 samples loaded
+  Loaded fine_geo: torch.Size([182, 256, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 256, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+Translation norm: mean=[13.19548    -0.64731836 23.103329  ], std=[10.827089    0.94348246  9.766839  ]
+  Feature dim after pooling: 13312
+Model parameters: 65,069,066
+--- exp14q2_256d_extrawide_seed456 done ---
+
+=== All 256d training on GPU 5 complete! ===

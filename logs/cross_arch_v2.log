@@ -1,0 +1,166 @@
+  Loaded summary: torch.Size([895, 2560])
+  [train] 895 samples loaded
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Loaded fine_geo: torch.Size([895, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([895, 128, 68, 120])
+  Loaded summary: torch.Size([895, 2560])
+  [train] 895 samples loaded
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+  Loaded spp_s314
+  Loaded fine_geo: torch.Size([895, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([895, 128, 68, 120])
+  Loaded summary: torch.Size([895, 2560])
+  [train] 895 samples loaded
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+  Loaded spp_n123
+  Loaded fine_geo: torch.Size([895, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([895, 128, 68, 120])
+  Loaded summary: torch.Size([895, 2560])
+  [train] 895 samples loaded
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+  Loaded spp_p123
+  Loaded fine_geo: torch.Size([895, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([895, 128, 68, 120])
+  Loaded summary: torch.Size([895, 2560])
+  [train] 895 samples loaded
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 3584
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Pre-computed pooled features: torch.Size([182, 3584]) (2.6 MB)
+  Loaded attn_e123
+  Loaded fine_geo: torch.Size([895, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([895, 128, 68, 120])
+  Loaded summary: torch.Size([895, 2560])
+  [train] 895 samples loaded
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 3584
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Pre-computed pooled features: torch.Size([182, 3584]) (2.6 MB)
+  Loaded attn_e314
+  Loaded fine_geo: torch.Size([895, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([895, 128, 68, 120])
+  Loaded summary: torch.Size([895, 2560])
+  [train] 895 samples loaded
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 6656
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Pre-computed pooled features: torch.Size([182, 6656]) (4.8 MB)
+  Loaded attn_c314
+  Loaded fine_geo: torch.Size([895, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([895, 128, 68, 120])
+  Loaded summary: torch.Size([895, 2560])
+  [train] 895 samples loaded
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 6656
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Pre-computed pooled features: torch.Size([182, 6656]) (4.8 MB)
+  Loaded attn_c7
+  Loaded fine_geo: torch.Size([895, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([895, 128, 68, 120])
+  Loaded summary: torch.Size([895, 2560])
+  [train] 895 samples loaded
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 3584
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Pre-computed pooled features: torch.Size([182, 3584]) (2.6 MB)
+  Loaded attn_a123
+  Loaded fine_geo: torch.Size([895, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([895, 128, 68, 120])
+  Loaded summary: torch.Size([895, 2560])
+  [train] 895 samples loaded
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 3584
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Pre-computed pooled features: torch.Size([182, 3584]) (2.6 MB)
+  Loaded attn_a314
+
+======================================================================
+INDIVIDUAL MODELS
+======================================================================
+  [attn] attn_a123            R@10= 70.9% R@5= 31.9% 2.14°/1290mm
+  [attn] attn_a314            R@10= 70.9% R@5= 34.1% 2.06°/1354mm
+  [attn] attn_c314            R@10= 65.9% R@5= 41.8% 2.22°/1193mm
+  [attn] attn_c7              R@10= 71.4% R@5= 31.3% 1.90°/1239mm
+  [attn] attn_e123            R@10= 75.3% R@5= 42.9% 2.08°/1138mm
+  [attn] attn_e314            R@10= 68.7% R@5= 39.0% 1.70°/1166mm
+  [spp ] spp_n123             R@10= 70.9% R@5= 38.5% 1.64°/1269mm
+  [spp ] spp_p123             R@10= 70.9% R@5= 40.1% 1.59°/1257mm
+  [spp ] spp_s314             R@10= 72.0% R@5= 37.9% 1.70°/1272mm
+
+======================================================================
+PAIRWISE: attn_e123 (BEST) + SPP models
+======================================================================
+  Best R@10: spp_s314+attn_e123 w=0.2:2.4 → R@10=76.4%, R@5=41.8%
+  Best R@5:  spp_p123+attn_e123 w=0.6:1.0 → R@10=73.6%, R@5=44.5%
+
+======================================================================
+3-MODEL ENSEMBLES (always including attn_e123)
+======================================================================
+  Best R@10: ['attn_a123', 'attn_a314', 'attn_e123'] w=(1, 1, 3) → R@10=76.9%, R@5=40.1%
+  Best R@5:  ['spp_n123', 'attn_e314', 'attn_e123'] w=(1, 2, 1) → R@10=72.0%, R@5=48.4%
+
+======================================================================
+4-MODEL ENSEMBLES (always including attn_e123)
+======================================================================
+  Best R@10: ['spp_s314', 'spp_p123', 'attn_a314', 'attn_e123'] w=(1, 1, 2, 2) → R@10=76.4%, R@5=40.7%
+  Best R@5:  ['spp_n123', 'spp_p123', 'attn_e314', 'attn_e123'] w=(1, 1, 1, 2) → R@10=72.5%, R@5=47.3%
+
+======================================================================
+SUMMARY OF BEST RESULTS
+======================================================================
+  Best single model:     attn_e123  R@10=75.3%  R@5=42.9%
+  Best pairwise R@10:    76.4%
+  Best pairwise R@5:     44.5%
+  Best 3-model R@10:     76.9%
+  Best 3-model R@5:      48.4%
+  Best 4-model R@10:     76.4%
+  Best 4-model R@5:      47.3%

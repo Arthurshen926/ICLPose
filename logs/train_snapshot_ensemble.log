@@ -1,0 +1,771 @@
+============================================================
+Config A: T0=500, T_mult=1, 10 cycles, seed 314 (baseline)
+  Total epochs: 5000, 10 snapshots
+============================================================
+======================================================================
+Snapshot Ensemble: exp15a_snapshot_T500x10
+Schedule: T0=500, T_mult=1, 10 cycles
+LR: 0.001 -> 1e-06
+Total epochs: 5000
+======================================================================
+Random seed: 314
+Using device: cuda:5
+
+Cycle schedule: T0=500, T_mult=1, n_cycles=10
+Cycle end epochs: [500, 1000, 1500, 2000, 2500, 3000, 3500, 4000, 4500, 5000]
+Total epochs: 5000
+
+Loading data...
+  Loaded fine_geo: torch.Size([895, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([895, 128, 68, 120])
+  Loaded summary: torch.Size([895, 2560])
+  [train] 895 samples loaded
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+Translation norm: mean=[13.19548    -0.64731836 23.103329  ], std=[10.827089    0.94348246  9.766839  ]
+  Feature dim after pooling: 7936
+Model parameters: 18,905,610
+
+Pre-computing pooled features...
+  Pre-computed pooled features: torch.Size([895, 7936]) (28.4 MB)
+  Pre-computed pooled features: torch.Size([182, 7936]) (5.8 MB)
+
+Starting training for 5000 epochs...
+======================================================================
+[    1/5000] loss=2.7334 lr=1.00e-03 beta=1.00 | val: 48.25deg/15594mm | 0.4s
+[  100/5000] loss=0.0630 lr=9.05e-04 beta=0.93 | val: 2.17deg/1578mm | 2.2s
+[  200/5000] loss=0.0418 lr=6.55e-04 beta=0.89 | val: 1.87deg/1754mm | 3.2s
+[  300/5000] loss=0.0324 lr=3.46e-04 beta=0.87 | val: 1.84deg/1580mm | 3.9s
+[  400/5000] loss=0.0306 lr=9.64e-05 beta=0.86 | val: 1.63deg/1513mm | 4.4s
+[  500/5000] loss=0.0296 lr=1.00e-03 beta=0.86 | val: 1.73deg/1538mm | 5.0s *** CYCLE END ***
+  >> Saved snapshot 0: 1.73deg / 1538mm, R@10/2=63.2%
+[  600/5000] loss=0.0249 lr=9.05e-04 beta=0.81 | val: 1.89deg/1562mm | 5.7s
+[  700/5000] loss=0.0213 lr=6.55e-04 beta=0.78 | val: 1.75deg/1598mm | 6.4s
+[  800/5000] loss=0.0205 lr=3.46e-04 beta=0.76 | val: 1.64deg/1509mm | 7.3s
+[  900/5000] loss=0.0190 lr=9.64e-05 beta=0.75 | val: 1.67deg/1448mm | 7.8s
+[ 1000/5000] loss=0.0183 lr=1.00e-03 beta=0.75 | val: 1.65deg/1481mm | 8.4s *** CYCLE END ***
+  >> Saved snapshot 1: 1.65deg / 1481mm, R@10/2=68.7%
+[ 1100/5000] loss=0.0190 lr=9.05e-04 beta=0.71 | val: 1.67deg/1652mm | 9.1s
+[ 1200/5000] loss=0.0168 lr=6.55e-04 beta=0.68 | val: 1.79deg/1453mm | 9.6s
+[ 1300/5000] loss=0.0155 lr=3.46e-04 beta=0.66 | val: 1.72deg/1554mm | 10.2s
+[ 1400/5000] loss=0.0141 lr=9.64e-05 beta=0.66 | val: 1.63deg/1438mm | 10.8s
+[ 1500/5000] loss=0.0143 lr=1.00e-03 beta=0.66 | val: 1.63deg/1461mm | 11.3s *** CYCLE END ***
+  >> Saved snapshot 2: 1.63deg / 1461mm, R@10/2=70.3%
+[ 1600/5000] loss=0.0151 lr=9.05e-04 beta=0.62 | val: 1.85deg/1353mm | 12.0s
+[ 1700/5000] loss=0.0136 lr=6.55e-04 beta=0.59 | val: 1.78deg/1412mm | 12.7s
+[ 1800/5000] loss=0.0122 lr=3.46e-04 beta=0.58 | val: 1.74deg/1435mm | 13.3s
+[ 1900/5000] loss=0.0118 lr=9.64e-05 beta=0.57 | val: 1.75deg/1446mm | 13.9s
+[ 2000/5000] loss=0.0115 lr=1.00e-03 beta=0.57 | val: 1.69deg/1393mm | 14.5s *** CYCLE END ***
+  >> Saved snapshot 3: 1.69deg / 1393mm, R@10/2=67.6%
+[ 2100/5000] loss=0.0122 lr=9.05e-04 beta=0.54 | val: 1.80deg/1436mm | 15.2s
+[ 2200/5000] loss=0.0111 lr=6.55e-04 beta=0.52 | val: 1.94deg/1545mm | 15.9s
+[ 2300/5000] loss=0.0106 lr=3.46e-04 beta=0.50 | val: 1.90deg/1458mm | 16.5s
+[ 2400/5000] loss=0.0101 lr=9.64e-05 beta=0.50 | val: 1.75deg/1394mm | 17.0s
+[ 2500/5000] loss=0.0098 lr=1.00e-03 beta=0.50 | val: 1.73deg/1463mm | 17.6s *** CYCLE END ***
+  >> Saved snapshot 4: 1.73deg / 1463mm, R@10/2=63.7%
+[ 2600/5000] loss=0.0106 lr=9.05e-04 beta=0.47 | val: 1.93deg/1510mm | 18.3s
+[ 2700/5000] loss=0.0096 lr=6.55e-04 beta=0.45 | val: 1.81deg/1472mm | 18.9s
+[ 2800/5000] loss=0.0090 lr=3.46e-04 beta=0.44 | val: 1.75deg/1430mm | 19.4s
+[ 2900/5000] loss=0.0084 lr=9.64e-05 beta=0.43 | val: 1.82deg/1464mm | 20.0s
+[ 3000/5000] loss=0.0083 lr=1.00e-03 beta=0.43 | val: 1.81deg/1472mm | 20.6s *** CYCLE END ***
+  >> Saved snapshot 5: 1.81deg / 1472mm, R@10/2=63.2%
+[ 3100/5000] loss=0.0088 lr=9.05e-04 beta=0.41 | val: 1.73deg/1419mm | 21.3s
+[ 3200/5000] loss=0.0082 lr=6.55e-04 beta=0.39 | val: 1.84deg/1591mm | 21.8s
+[ 3300/5000] loss=0.0079 lr=3.46e-04 beta=0.38 | val: 1.88deg/1583mm | 22.4s
+[ 3400/5000] loss=0.0072 lr=9.64e-05 beta=0.38 | val: 1.88deg/1502mm | 22.9s
+[ 3500/5000] loss=0.0073 lr=1.00e-03 beta=0.38 | val: 1.84deg/1444mm | 23.5s *** CYCLE END ***
+  >> Saved snapshot 6: 1.84deg / 1444mm, R@10/2=63.2%
+[ 3600/5000] loss=0.0075 lr=9.05e-04 beta=0.36 | val: 1.82deg/1529mm | 24.2s
+[ 3700/5000] loss=0.0069 lr=6.55e-04 beta=0.34 | val: 1.85deg/1529mm | 24.8s
+[ 3800/5000] loss=0.0068 lr=3.46e-04 beta=0.33 | val: 1.71deg/1541mm | 25.3s
+[ 3900/5000] loss=0.0064 lr=9.64e-05 beta=0.33 | val: 1.80deg/1511mm | 25.9s
+[ 4000/5000] loss=0.0062 lr=1.00e-03 beta=0.33 | val: 1.89deg/1517mm | 26.5s *** CYCLE END ***
+  >> Saved snapshot 7: 1.89deg / 1517mm, R@10/2=60.4%
+[ 4100/5000] loss=0.0066 lr=9.05e-04 beta=0.31 | val: 1.90deg/1572mm | 27.2s
+[ 4200/5000] loss=0.0063 lr=6.55e-04 beta=0.29 | val: 1.91deg/1707mm | 27.7s
+[ 4300/5000] loss=0.0057 lr=3.46e-04 beta=0.29 | val: 1.89deg/1696mm | 28.3s
+[ 4400/5000] loss=0.0054 lr=9.64e-05 beta=0.28 | val: 1.89deg/1500mm | 28.9s
+[ 4500/5000] loss=0.0055 lr=1.00e-03 beta=0.28 | val: 1.90deg/1617mm | 29.4s *** CYCLE END ***
+  >> Saved snapshot 8: 1.90deg / 1617mm, R@10/2=59.3%
+[ 4600/5000] loss=0.0059 lr=9.05e-04 beta=0.27 | val: 2.04deg/1713mm | 30.1s
+[ 4700/5000] loss=0.0054 lr=6.55e-04 beta=0.25 | val: 1.90deg/1649mm | 30.6s
+[ 4800/5000] loss=0.0050 lr=3.46e-04 beta=0.25 | val: 1.92deg/1608mm | 31.2s
+[ 4900/5000] loss=0.0048 lr=9.64e-05 beta=0.24 | val: 1.89deg/1629mm | 31.7s
+[ 5000/5000] loss=0.0047 lr=1.00e-03 beta=0.24 | val: 1.90deg/1624mm | 32.3s *** CYCLE END ***
+  >> Saved snapshot 9: 1.90deg / 1624mm, R@10/2=56.0%
+
+======================================================================
+Training complete in 32.4s (0.5min)
+Best single epoch: 2150 (score=1.4821)
+Saved 10 snapshots
+
+Loading 10 snapshots for ensemble evaluation...
+
+======================================================================
+INDIVIDUAL SNAPSHOT RESULTS
+======================================================================
+ Snap  Epoch  Rot(deg)  Trans(mm)  R@10/2
+---------------------------------------------
+    0    500      1.73       1538    63.2%
+    1   1000      1.65       1481    68.7%
+    2   1500      1.63       1461    70.3%
+    3   2000      1.69       1393    67.6%
+    4   2500      1.73       1463    63.7%
+    5   3000      1.81       1472    63.2%
+    6   3500      1.84       1444    63.2%
+    7   4000      1.89       1517    60.4%
+    8   4500      1.90       1617    59.3%
+    9   5000      1.90       1624    56.0%
+
+======================================================================
+ENSEMBLE RESULTS
+======================================================================
+
+  Mean Ensemble (10 snapshots):
+    Rot median: 1.67deg
+    Trans median: 1443mm
+    R@5deg_1m: 31.3%
+    R@10deg_2m: 63.7%
+    R@15deg_5m: 91.2%
+    R@25deg_5m: 91.2%
+
+  Weighted Ensemble (10 snapshots, inverse-error weights):
+    Weights: ['0.098', '0.102', '0.103', '0.107', '0.102', '0.101', '0.103', '0.098', '0.093', '0.092']
+    Rot median: 1.67deg
+    Trans median: 1440mm
+    R@5deg_1m: 31.3%
+    R@10deg_2m: 63.7%
+    R@15deg_5m: 91.2%
+    R@25deg_5m: 91.2%
+
+  Greedy Forward Selection:
+    +snap 2 (epoch 1500) -> 2 snaps, R@10/2=69.2%
+    (no improvement, stopping at 2 snapshots)
+
+    Best greedy subset: [3, 2] (2 snapshots)
+    Rot median: 1.66deg
+    Trans median: 1448mm
+    R@5deg_1m: 32.4%
+    R@10deg_2m: 69.2%
+    R@15deg_5m: 91.2%
+    R@25deg_5m: 91.2%
+
+======================================================================
+Results saved to output/feature_retrieval/pose_regression/exp15a_snapshot_T500x10/ensemble_results.json
+
+Done!
+
+============================================================
+Config B: T0=200, T_mult=2, 4 cycles, seed 314 (increasing)
+  Cycles: 200,400,800,1600 = 3000 total, 4 snapshots
+============================================================
+======================================================================
+Snapshot Ensemble: exp15b_snapshot_T200xmult2
+Schedule: T0=200, T_mult=2, 4 cycles
+LR: 0.001 -> 1e-06
+Total epochs: 3000
+======================================================================
+Random seed: 314
+Using device: cuda:5
+
+Cycle schedule: T0=200, T_mult=2, n_cycles=4
+Cycle end epochs: [200, 600, 1400, 3000]
+Total epochs: 3000
+
+Loading data...
+  Loaded fine_geo: torch.Size([895, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([895, 128, 68, 120])
+  Loaded summary: torch.Size([895, 2560])
+  [train] 895 samples loaded
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+Translation norm: mean=[13.19548    -0.64731836 23.103329  ], std=[10.827089    0.94348246  9.766839  ]
+  Feature dim after pooling: 7936
+Model parameters: 18,905,610
+
+Pre-computing pooled features...
+  Pre-computed pooled features: torch.Size([895, 7936]) (28.4 MB)
+  Pre-computed pooled features: torch.Size([182, 7936]) (5.8 MB)
+
+Starting training for 3000 epochs...
+======================================================================
+[    1/3000] loss=2.7334 lr=1.00e-03 beta=1.00 | val: 48.25deg/15594mm | 0.5s
+[  100/3000] loss=0.0673 lr=5.01e-04 beta=0.94 | val: 2.35deg/1848mm | 2.2s
+[  200/3000] loss=0.0571 lr=1.00e-03 beta=0.93 | val: 2.07deg/1604mm | 3.5s *** CYCLE END ***
+  >> Saved snapshot 0: 2.07deg / 1604mm, R@10/2=57.7%
+[  300/3000] loss=0.0369 lr=8.54e-04 beta=0.88 | val: 2.01deg/1664mm | 4.3s
+[  400/3000] loss=0.0298 lr=5.01e-04 beta=0.85 | val: 1.91deg/1621mm | 4.8s
+[  500/3000] loss=0.0263 lr=1.47e-04 beta=0.83 | val: 1.67deg/1492mm | 5.5s
+[  600/3000] loss=0.0249 lr=1.00e-03 beta=0.83 | val: 1.67deg/1467mm | 6.1s *** CYCLE END ***
+  >> Saved snapshot 1: 1.67deg / 1467mm, R@10/2=67.6%
+[  700/3000] loss=0.0230 lr=9.62e-04 beta=0.79 | val: 1.81deg/1662mm | 6.7s
+[  800/3000] loss=0.0206 lr=8.54e-04 beta=0.75 | val: 1.68deg/1532mm | 7.4s
+[  900/3000] loss=0.0186 lr=6.92e-04 beta=0.73 | val: 1.68deg/1491mm | 8.0s
+[ 1000/3000] loss=0.0173 lr=5.01e-04 beta=0.71 | val: 1.75deg/1299mm | 8.6s
+[ 1100/3000] loss=0.0166 lr=3.09e-04 beta=0.69 | val: 1.66deg/1471mm | 9.3s
+[ 1200/3000] loss=0.0156 lr=1.47e-04 beta=0.69 | val: 1.69deg/1414mm | 9.8s
+[ 1300/3000] loss=0.0156 lr=3.90e-05 beta=0.68 | val: 1.62deg/1454mm | 10.4s
+[ 1400/3000] loss=0.0147 lr=1.00e-03 beta=0.68 | val: 1.61deg/1470mm | 11.0s *** CYCLE END ***
+  >> Saved snapshot 2: 1.61deg / 1470mm, R@10/2=68.1%
+[ 1500/3000] loss=0.0154 lr=9.90e-04 beta=0.65 | val: 1.58deg/1343mm | 11.6s
+[ 1600/3000] loss=0.0147 lr=9.62e-04 beta=0.61 | val: 1.80deg/1393mm | 12.2s
+[ 1700/3000] loss=0.0136 lr=9.16e-04 beta=0.58 | val: 1.83deg/1529mm | 12.7s
+[ 1800/3000] loss=0.0128 lr=8.54e-04 beta=0.56 | val: 1.86deg/1614mm | 13.3s
+[ 1900/3000] loss=0.0117 lr=7.78e-04 beta=0.54 | val: 1.76deg/1448mm | 13.8s
+[ 2000/3000] loss=0.0109 lr=6.92e-04 beta=0.52 | val: 1.70deg/1487mm | 14.4s
+[ 2100/3000] loss=0.0109 lr=5.98e-04 beta=0.50 | val: 1.93deg/1628mm | 14.9s
+[ 2200/3000] loss=0.0099 lr=5.01e-04 beta=0.49 | val: 1.75deg/1501mm | 15.5s
+[ 2300/3000] loss=0.0098 lr=4.03e-04 beta=0.48 | val: 1.93deg/1489mm | 16.1s
+[ 2400/3000] loss=0.0095 lr=3.09e-04 beta=0.47 | val: 1.86deg/1518mm | 16.6s
+[ 2500/3000] loss=0.0092 lr=2.23e-04 beta=0.46 | val: 1.82deg/1526mm | 17.2s
+[ 2600/3000] loss=0.0091 lr=1.47e-04 beta=0.46 | val: 1.88deg/1494mm | 17.8s
+[ 2700/3000] loss=0.0090 lr=8.52e-05 beta=0.46 | val: 1.81deg/1485mm | 18.4s
+[ 2800/3000] loss=0.0090 lr=3.90e-05 beta=0.46 | val: 1.85deg/1535mm | 19.0s
+[ 2900/3000] loss=0.0086 lr=1.06e-05 beta=0.46 | val: 1.82deg/1517mm | 19.6s
+[ 3000/3000] loss=0.0087 lr=1.00e-03 beta=0.45 | val: 1.79deg/1519mm | 20.1s *** CYCLE END ***
+  >> Saved snapshot 3: 1.79deg / 1519mm, R@10/2=62.6%
+
+======================================================================
+Training complete in 20.2s (0.3min)
+Best single epoch: 1000 (score=1.4738)
+Saved 4 snapshots
+
+Loading 4 snapshots for ensemble evaluation...
+
+======================================================================
+INDIVIDUAL SNAPSHOT RESULTS
+======================================================================
+ Snap  Epoch  Rot(deg)  Trans(mm)  R@10/2
+---------------------------------------------
+    0    200      2.07       1604    57.7%
+    1    600      1.67       1467    67.6%
+    2   1400      1.61       1470    68.1%
+    3   3000      1.79       1519    62.6%
+
+======================================================================
+ENSEMBLE RESULTS
+======================================================================
+
+  Mean Ensemble (4 snapshots):
+    Rot median: 1.70deg
+    Trans median: 1486mm
+    R@5deg_1m: 33.0%
+    R@10deg_2m: 65.9%
+    R@15deg_5m: 91.8%
+    R@25deg_5m: 91.8%
+
+  Weighted Ensemble (4 snapshots, inverse-error weights):
+    Weights: ['0.233', '0.259', '0.259', '0.249']
+    Rot median: 1.68deg
+    Trans median: 1480mm
+    R@5deg_1m: 33.0%
+    R@10deg_2m: 65.9%
+    R@15deg_5m: 91.8%
+    R@25deg_5m: 91.8%
+
+  Greedy Forward Selection:
+    +snap 1 (epoch 600) -> 2 snaps, R@10/2=68.1%
+    (no improvement, stopping at 2 snapshots)
+
+    Best greedy subset: [2, 1] (2 snapshots)
+    Rot median: 1.68deg
+    Trans median: 1476mm
+    R@5deg_1m: 31.3%
+    R@10deg_2m: 68.1%
+    R@15deg_5m: 92.9%
+    R@25deg_5m: 92.9%
+
+======================================================================
+Results saved to output/feature_retrieval/pose_regression/exp15b_snapshot_T200xmult2/ensemble_results.json
+
+Done!
+
+============================================================
+Config C: T0=500, T_mult=1, 10 cycles, seed 123
+  Same as A but different seed for comparison
+============================================================
+======================================================================
+Snapshot Ensemble: exp15c_snapshot_T500x10_seed123
+Schedule: T0=500, T_mult=1, 10 cycles
+LR: 0.001 -> 1e-06
+Total epochs: 5000
+======================================================================
+Random seed: 123
+Using device: cuda:5
+
+Cycle schedule: T0=500, T_mult=1, n_cycles=10
+Cycle end epochs: [500, 1000, 1500, 2000, 2500, 3000, 3500, 4000, 4500, 5000]
+Total epochs: 5000
+
+Loading data...
+  Loaded fine_geo: torch.Size([895, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([895, 128, 68, 120])
+  Loaded summary: torch.Size([895, 2560])
+  [train] 895 samples loaded
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+Translation norm: mean=[13.19548    -0.64731836 23.103329  ], std=[10.827089    0.94348246  9.766839  ]
+  Feature dim after pooling: 7936
+Model parameters: 18,905,610
+
+Pre-computing pooled features...
+  Pre-computed pooled features: torch.Size([895, 7936]) (28.4 MB)
+  Pre-computed pooled features: torch.Size([182, 7936]) (5.8 MB)
+
+Starting training for 5000 epochs...
+======================================================================
+[    1/5000] loss=2.2322 lr=1.00e-03 beta=1.00 | val: 30.52deg/20029mm | 0.2s
+[  100/5000] loss=0.0646 lr=9.05e-04 beta=0.93 | val: 2.54deg/1994mm | 1.8s
+[  200/5000] loss=0.0410 lr=6.55e-04 beta=0.89 | val: 2.00deg/1699mm | 3.0s
+[  300/5000] loss=0.0334 lr=3.46e-04 beta=0.87 | val: 1.90deg/1620mm | 3.9s
+[  400/5000] loss=0.0303 lr=9.64e-05 beta=0.86 | val: 1.72deg/1550mm | 4.7s
+[  500/5000] loss=0.0294 lr=1.00e-03 beta=0.86 | val: 1.68deg/1546mm | 5.3s *** CYCLE END ***
+  >> Saved snapshot 0: 1.68deg / 1546mm, R@10/2=63.2%
+[  600/5000] loss=0.0263 lr=9.05e-04 beta=0.81 | val: 1.90deg/1805mm | 6.1s
+[  700/5000] loss=0.0226 lr=6.55e-04 beta=0.78 | val: 1.66deg/1516mm | 7.2s
+[  800/5000] loss=0.0197 lr=3.46e-04 beta=0.76 | val: 1.58deg/1390mm | 7.9s
+[  900/5000] loss=0.0181 lr=9.64e-05 beta=0.75 | val: 1.64deg/1454mm | 8.6s
+[ 1000/5000] loss=0.0193 lr=1.00e-03 beta=0.75 | val: 1.64deg/1451mm | 9.2s *** CYCLE END ***
+  >> Saved snapshot 1: 1.64deg / 1451mm, R@10/2=64.8%
+[ 1100/5000] loss=0.0183 lr=9.05e-04 beta=0.71 | val: 1.61deg/1390mm | 10.0s
+[ 1200/5000] loss=0.0166 lr=6.55e-04 beta=0.68 | val: 1.61deg/1552mm | 10.6s
+[ 1300/5000] loss=0.0152 lr=3.46e-04 beta=0.66 | val: 1.75deg/1508mm | 11.2s
+[ 1400/5000] loss=0.0148 lr=9.64e-05 beta=0.66 | val: 1.63deg/1447mm | 11.7s
+[ 1500/5000] loss=0.0143 lr=1.00e-03 beta=0.65 | val: 1.60deg/1428mm | 12.3s *** CYCLE END ***
+  >> Saved snapshot 2: 1.60deg / 1428mm, R@10/2=64.3%
+[ 1600/5000] loss=0.0152 lr=9.05e-04 beta=0.62 | val: 1.65deg/1371mm | 12.9s
+[ 1700/5000] loss=0.0136 lr=6.55e-04 beta=0.59 | val: 1.70deg/1500mm | 13.4s
+[ 1800/5000] loss=0.0127 lr=3.46e-04 beta=0.58 | val: 1.80deg/1488mm | 14.0s
+[ 1900/5000] loss=0.0119 lr=9.64e-05 beta=0.57 | val: 1.66deg/1442mm | 14.6s
+[ 2000/5000] loss=0.0116 lr=1.00e-03 beta=0.57 | val: 1.65deg/1463mm | 15.2s *** CYCLE END ***
+  >> Saved snapshot 3: 1.65deg / 1463mm, R@10/2=63.7%
+[ 2100/5000] loss=0.0118 lr=9.05e-04 beta=0.54 | val: 1.93deg/1520mm | 15.9s
+[ 2200/5000] loss=0.0109 lr=6.55e-04 beta=0.52 | val: 1.78deg/1550mm | 16.4s
+[ 2300/5000] loss=0.0106 lr=3.46e-04 beta=0.50 | val: 1.84deg/1540mm | 17.0s
+[ 2400/5000] loss=0.0098 lr=9.64e-05 beta=0.50 | val: 1.80deg/1455mm | 17.6s
+[ 2500/5000] loss=0.0097 lr=1.00e-03 beta=0.50 | val: 1.77deg/1448mm | 18.2s *** CYCLE END ***
+  >> Saved snapshot 4: 1.77deg / 1448mm, R@10/2=63.2%
+[ 2600/5000] loss=0.0105 lr=9.05e-04 beta=0.47 | val: 1.74deg/1635mm | 18.9s
+[ 2700/5000] loss=0.0093 lr=6.55e-04 beta=0.45 | val: 1.78deg/1520mm | 19.5s
+[ 2800/5000] loss=0.0086 lr=3.46e-04 beta=0.44 | val: 1.71deg/1484mm | 20.0s
+[ 2900/5000] loss=0.0086 lr=9.64e-05 beta=0.43 | val: 1.78deg/1501mm | 20.6s
+[ 3000/5000] loss=0.0084 lr=1.00e-03 beta=0.43 | val: 1.82deg/1478mm | 21.2s *** CYCLE END ***
+  >> Saved snapshot 5: 1.82deg / 1478mm, R@10/2=61.0%
+[ 3100/5000] loss=0.0089 lr=9.05e-04 beta=0.41 | val: 1.90deg/1639mm | 21.9s
+[ 3200/5000] loss=0.0082 lr=6.55e-04 beta=0.39 | val: 1.93deg/1498mm | 22.4s
+[ 3300/5000] loss=0.0077 lr=3.46e-04 beta=0.38 | val: 1.79deg/1514mm | 23.0s
+[ 3400/5000] loss=0.0074 lr=9.64e-05 beta=0.38 | val: 1.89deg/1502mm | 23.6s
+[ 3500/5000] loss=0.0074 lr=1.00e-03 beta=0.38 | val: 1.90deg/1589mm | 24.1s *** CYCLE END ***
+  >> Saved snapshot 6: 1.90deg / 1589mm, R@10/2=61.5%
+[ 3600/5000] loss=0.0075 lr=9.05e-04 beta=0.36 | val: 1.87deg/1442mm | 24.8s
+[ 3700/5000] loss=0.0071 lr=6.55e-04 beta=0.34 | val: 1.98deg/1642mm | 25.4s
+[ 3800/5000] loss=0.0066 lr=3.46e-04 beta=0.33 | val: 1.87deg/1616mm | 26.0s
+[ 3900/5000] loss=0.0066 lr=9.64e-05 beta=0.33 | val: 1.78deg/1608mm | 26.6s
+[ 4000/5000] loss=0.0064 lr=1.00e-03 beta=0.33 | val: 1.92deg/1629mm | 27.1s *** CYCLE END ***
+  >> Saved snapshot 7: 1.92deg / 1629mm, R@10/2=59.9%
+[ 4100/5000] loss=0.0066 lr=9.05e-04 beta=0.31 | val: 1.89deg/1660mm | 27.8s
+[ 4200/5000] loss=0.0061 lr=6.55e-04 beta=0.29 | val: 1.96deg/1752mm | 28.4s
+[ 4300/5000] loss=0.0059 lr=3.46e-04 beta=0.29 | val: 1.91deg/1628mm | 29.0s
+[ 4400/5000] loss=0.0058 lr=9.64e-05 beta=0.28 | val: 1.89deg/1732mm | 29.5s
+[ 4500/5000] loss=0.0054 lr=1.00e-03 beta=0.28 | val: 1.90deg/1731mm | 30.1s *** CYCLE END ***
+  >> Saved snapshot 8: 1.90deg / 1731mm, R@10/2=59.3%
+[ 4600/5000] loss=0.0059 lr=9.05e-04 beta=0.27 | val: 1.94deg/1652mm | 30.8s
+[ 4700/5000] loss=0.0057 lr=6.55e-04 beta=0.25 | val: 1.92deg/1681mm | 31.3s
+[ 4800/5000] loss=0.0051 lr=3.46e-04 beta=0.25 | val: 1.95deg/1725mm | 31.9s
+[ 4900/5000] loss=0.0051 lr=9.64e-05 beta=0.24 | val: 1.94deg/1776mm | 32.5s
+[ 5000/5000] loss=0.0048 lr=1.00e-03 beta=0.24 | val: 1.93deg/1750mm | 33.0s *** CYCLE END ***
+  >> Saved snapshot 9: 1.93deg / 1750mm, R@10/2=58.8%
+
+======================================================================
+Training complete in 33.1s (0.6min)
+Best single epoch: 1020 (score=1.4926)
+Saved 10 snapshots
+
+Loading 10 snapshots for ensemble evaluation...
+
+======================================================================
+INDIVIDUAL SNAPSHOT RESULTS
+======================================================================
+ Snap  Epoch  Rot(deg)  Trans(mm)  R@10/2
+---------------------------------------------
+    0    500      1.68       1546    63.2%
+    1   1000      1.64       1451    64.8%
+    2   1500      1.60       1428    64.3%
+    3   2000      1.65       1463    63.7%
+    4   2500      1.77       1448    63.2%
+    5   3000      1.82       1478    61.0%
+    6   3500      1.90       1589    61.5%
+    7   4000      1.92       1629    59.9%
+    8   4500      1.90       1731    59.3%
+    9   5000      1.93       1750    58.8%
+
+======================================================================
+ENSEMBLE RESULTS
+======================================================================
+
+  Mean Ensemble (10 snapshots):
+    Rot median: 1.77deg
+    Trans median: 1505mm
+    R@5deg_1m: 32.4%
+    R@10deg_2m: 62.1%
+    R@15deg_5m: 89.6%
+    R@25deg_5m: 89.6%
+
+  Weighted Ensemble (10 snapshots, inverse-error weights):
+    Weights: ['0.100', '0.107', '0.108', '0.106', '0.106', '0.104', '0.097', '0.094', '0.090', '0.089']
+    Rot median: 1.75deg
+    Trans median: 1491mm
+    R@5deg_1m: 32.4%
+    R@10deg_2m: 62.1%
+    R@15deg_5m: 89.6%
+    R@25deg_5m: 89.6%
+
+  Greedy Forward Selection:
+    +snap 0 (epoch 500) -> 2 snaps, R@10/2=66.5%
+    (no improvement, stopping at 2 snapshots)
+
+    Best greedy subset: [2, 0] (2 snapshots)
+    Rot median: 1.62deg
+    Trans median: 1470mm
+    R@5deg_1m: 31.3%
+    R@10deg_2m: 66.5%
+    R@15deg_5m: 91.2%
+    R@25deg_5m: 91.2%
+
+======================================================================
+Results saved to output/feature_retrieval/pose_regression/exp15c_snapshot_T500x10_seed123/ensemble_results.json
+
+Done!
+
+============================================================
+Config D: T0=300, T_mult=1, 15 cycles, seed 314
+  Shorter cycles, more snapshots (4500 total, 15 snapshots)
+============================================================
+======================================================================
+Snapshot Ensemble: exp15d_snapshot_T300x15
+Schedule: T0=300, T_mult=1, 15 cycles
+LR: 0.001 -> 1e-06
+Total epochs: 4500
+======================================================================
+Random seed: 314
+Using device: cuda:5
+
+Cycle schedule: T0=300, T_mult=1, n_cycles=15
+Cycle end epochs: [300, 600, 900, 1200, 1500, 1800, 2100, 2400, 2700, 3000, 3300, 3600, 3900, 4200, 4500]
+Total epochs: 4500
+
+Loading data...
+  Loaded fine_geo: torch.Size([895, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([895, 128, 68, 120])
+  Loaded summary: torch.Size([895, 2560])
+  [train] 895 samples loaded
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+Translation norm: mean=[13.19548    -0.64731836 23.103329  ], std=[10.827089    0.94348246  9.766839  ]
+  Feature dim after pooling: 7936
+Model parameters: 18,905,610
+
+Pre-computing pooled features...
+  Pre-computed pooled features: torch.Size([895, 7936]) (28.4 MB)
+  Pre-computed pooled features: torch.Size([182, 7936]) (5.8 MB)
+
+Starting training for 4500 epochs...
+======================================================================
+[    1/4500] loss=2.7334 lr=1.00e-03 beta=1.00 | val: 48.25deg/15594mm | 0.2s
+[  100/4500] loss=0.0638 lr=7.50e-04 beta=0.93 | val: 2.18deg/1713mm | 2.2s
+[  200/4500] loss=0.0467 lr=2.51e-04 beta=0.91 | val: 1.99deg/1600mm | 3.6s
+[  300/4500] loss=0.0431 lr=1.00e-03 beta=0.90 | val: 1.85deg/1660mm | 4.5s *** CYCLE END ***
+  >> Saved snapshot 0: 1.85deg / 1660mm, R@10/2=62.1%
+[  400/4500] loss=0.0330 lr=7.50e-04 beta=0.85 | val: 1.88deg/1630mm | 5.2s
+[  500/4500] loss=0.0271 lr=2.51e-04 beta=0.83 | val: 1.66deg/1525mm | 6.0s
+[  600/4500] loss=0.0254 lr=1.00e-03 beta=0.83 | val: 1.59deg/1481mm | 7.1s *** CYCLE END ***
+  >> Saved snapshot 1: 1.59deg / 1481mm, R@10/2=67.0%
+[  700/4500] loss=0.0229 lr=7.50e-04 beta=0.79 | val: 1.67deg/1581mm | 8.0s
+[  800/4500] loss=0.0209 lr=2.51e-04 beta=0.77 | val: 1.68deg/1566mm | 8.9s
+[  900/4500] loss=0.0199 lr=1.00e-03 beta=0.76 | val: 1.69deg/1474mm | 9.5s *** CYCLE END ***
+  >> Saved snapshot 2: 1.69deg / 1474mm, R@10/2=68.1%
+[ 1000/4500] loss=0.0191 lr=7.50e-04 beta=0.73 | val: 1.96deg/1356mm | 10.3s
+[ 1100/4500] loss=0.0179 lr=2.51e-04 beta=0.71 | val: 1.66deg/1474mm | 11.0s
+[ 1200/4500] loss=0.0167 lr=1.00e-03 beta=0.71 | val: 1.69deg/1427mm | 11.5s *** CYCLE END ***
+  >> Saved snapshot 3: 1.69deg / 1427mm, R@10/2=67.6%
+[ 1300/4500] loss=0.0168 lr=7.50e-04 beta=0.67 | val: 1.76deg/1576mm | 12.2s
+[ 1400/4500] loss=0.0145 lr=2.51e-04 beta=0.66 | val: 1.72deg/1382mm | 13.1s
+[ 1500/4500] loss=0.0144 lr=1.00e-03 beta=0.65 | val: 1.71deg/1451mm | 13.7s *** CYCLE END ***
+  >> Saved snapshot 4: 1.71deg / 1451mm, R@10/2=68.1%
+[ 1600/4500] loss=0.0148 lr=7.50e-04 beta=0.62 | val: 1.87deg/1530mm | 14.4s
+[ 1700/4500] loss=0.0132 lr=2.51e-04 beta=0.61 | val: 1.71deg/1472mm | 14.9s
+[ 1800/4500] loss=0.0124 lr=1.00e-03 beta=0.60 | val: 1.69deg/1387mm | 15.5s *** CYCLE END ***
+  >> Saved snapshot 5: 1.69deg / 1387mm, R@10/2=67.0%
+[ 1900/4500] loss=0.0128 lr=7.50e-04 beta=0.57 | val: 1.73deg/1459mm | 16.2s
+[ 2000/4500] loss=0.0116 lr=2.51e-04 beta=0.56 | val: 1.68deg/1426mm | 16.8s
+[ 2100/4500] loss=0.0117 lr=1.00e-03 beta=0.56 | val: 1.71deg/1442mm | 17.4s *** CYCLE END ***
+  >> Saved snapshot 6: 1.71deg / 1442mm, R@10/2=64.3%
+[ 2200/4500] loss=0.0114 lr=7.50e-04 beta=0.53 | val: 1.86deg/1678mm | 18.1s
+[ 2300/4500] loss=0.0105 lr=2.51e-04 beta=0.51 | val: 1.82deg/1463mm | 18.7s
+[ 2400/4500] loss=0.0102 lr=1.00e-03 beta=0.51 | val: 1.75deg/1424mm | 19.2s *** CYCLE END ***
+  >> Saved snapshot 7: 1.75deg / 1424mm, R@10/2=64.3%
+[ 2500/4500] loss=0.0104 lr=7.50e-04 beta=0.49 | val: 1.76deg/1364mm | 19.9s
+[ 2600/4500] loss=0.0097 lr=2.51e-04 beta=0.47 | val: 1.78deg/1499mm | 20.5s
+[ 2700/4500] loss=0.0094 lr=1.00e-03 beta=0.47 | val: 1.74deg/1505mm | 21.0s *** CYCLE END ***
+  >> Saved snapshot 8: 1.74deg / 1505mm, R@10/2=63.7%
+[ 2800/4500] loss=0.0097 lr=7.50e-04 beta=0.45 | val: 1.86deg/1419mm | 21.7s
+[ 2900/4500] loss=0.0086 lr=2.51e-04 beta=0.44 | val: 1.91deg/1382mm | 22.2s
+[ 3000/4500] loss=0.0084 lr=1.00e-03 beta=0.43 | val: 1.83deg/1454mm | 22.8s *** CYCLE END ***
+  >> Saved snapshot 9: 1.83deg / 1454mm, R@10/2=64.3%
+[ 3100/4500] loss=0.0087 lr=7.50e-04 beta=0.41 | val: 1.77deg/1538mm | 23.5s
+[ 3200/4500] loss=0.0078 lr=2.51e-04 beta=0.40 | val: 1.80deg/1533mm | 24.0s
+[ 3300/4500] loss=0.0079 lr=1.00e-03 beta=0.40 | val: 1.78deg/1498mm | 24.6s *** CYCLE END ***
+  >> Saved snapshot 10: 1.78deg / 1498mm, R@10/2=63.2%
+[ 3400/4500] loss=0.0078 lr=7.50e-04 beta=0.38 | val: 1.87deg/1692mm | 25.2s
+[ 3500/4500] loss=0.0073 lr=2.51e-04 beta=0.37 | val: 1.93deg/1415mm | 25.8s
+[ 3600/4500] loss=0.0069 lr=1.00e-03 beta=0.37 | val: 1.91deg/1470mm | 26.3s *** CYCLE END ***
+  >> Saved snapshot 11: 1.91deg / 1470mm, R@10/2=62.1%
+[ 3700/4500] loss=0.0071 lr=7.50e-04 beta=0.35 | val: 1.81deg/1571mm | 27.0s
+[ 3800/4500] loss=0.0068 lr=2.51e-04 beta=0.34 | val: 1.72deg/1455mm | 27.5s
+[ 3900/4500] loss=0.0065 lr=1.00e-03 beta=0.34 | val: 1.86deg/1545mm | 28.1s *** CYCLE END ***
+  >> Saved snapshot 12: 1.86deg / 1545mm, R@10/2=62.6%
+[ 4000/4500] loss=0.0069 lr=7.50e-04 beta=0.32 | val: 1.96deg/1661mm | 28.7s
+[ 4100/4500] loss=0.0061 lr=2.51e-04 beta=0.31 | val: 1.96deg/1545mm | 29.3s
+[ 4200/4500] loss=0.0060 lr=1.00e-03 beta=0.31 | val: 1.87deg/1661mm | 29.9s *** CYCLE END ***
+  >> Saved snapshot 13: 1.87deg / 1661mm, R@10/2=59.9%
+[ 4300/4500] loss=0.0061 lr=7.50e-04 beta=0.29 | val: 1.77deg/1560mm | 30.6s
+[ 4400/4500] loss=0.0056 lr=2.51e-04 beta=0.28 | val: 1.88deg/1496mm | 31.1s
+[ 4500/4500] loss=0.0056 lr=1.00e-03 beta=0.28 | val: 1.88deg/1637mm | 31.7s *** CYCLE END ***
+  >> Saved snapshot 14: 1.88deg / 1637mm, R@10/2=61.5%
+
+======================================================================
+Training complete in 31.8s (0.5min)
+Best single epoch: 1330 (score=1.5022)
+Saved 15 snapshots
+
+Loading 15 snapshots for ensemble evaluation...
+
+======================================================================
+INDIVIDUAL SNAPSHOT RESULTS
+======================================================================
+ Snap  Epoch  Rot(deg)  Trans(mm)  R@10/2
+---------------------------------------------
+    0    300      1.85       1660    62.1%
+    1    600      1.59       1481    67.0%
+    2    900      1.69       1474    68.1%
+    3   1200      1.69       1427    67.6%
+    4   1500      1.71       1451    68.1%
+    5   1800      1.69       1387    67.0%
+    6   2100      1.71       1442    64.3%
+    7   2400      1.75       1424    64.3%
+    8   2700      1.74       1505    63.7%
+    9   3000      1.83       1454    64.3%
+   10   3300      1.78       1498    63.2%
+   11   3600      1.91       1470    62.1%
+   12   3900      1.86       1545    62.6%
+   13   4200      1.87       1661    59.9%
+   14   4500      1.88       1637    61.5%
+
+======================================================================
+ENSEMBLE RESULTS
+======================================================================
+
+  Mean Ensemble (15 snapshots):
+    Rot median: 1.74deg
+    Trans median: 1439mm
+    R@5deg_1m: 32.4%
+    R@10deg_2m: 64.3%
+    R@15deg_5m: 91.2%
+    R@25deg_5m: 91.2%
+
+  Weighted Ensemble (15 snapshots, inverse-error weights):
+    Weights: ['0.060', '0.068', '0.068', '0.070', '0.069', '0.072', '0.069', '0.070', '0.066', '0.068', '0.067', '0.067', '0.064', '0.060', '0.061']
+    Rot median: 1.73deg
+    Trans median: 1431mm
+    R@5deg_1m: 32.4%
+    R@10deg_2m: 64.3%
+    R@15deg_5m: 91.2%
+    R@25deg_5m: 91.2%
+
+  Greedy Forward Selection:
+    +snap 3 (epoch 1200) -> 2 snaps, R@10/2=68.1%
+    +snap 1 (epoch 600) -> 3 snaps, R@10/2=68.7%
+    +snap 2 (epoch 900) -> 4 snaps, R@10/2=69.2%
+    (no improvement, stopping at 4 snapshots)
+
+    Best greedy subset: [5, 3, 1, 2] (4 snapshots)
+    Rot median: 1.68deg
+    Trans median: 1474mm
+    R@5deg_1m: 33.0%
+    R@10deg_2m: 69.2%
+    R@15deg_5m: 91.8%
+    R@25deg_5m: 91.8%
+
+======================================================================
+Results saved to output/feature_retrieval/pose_regression/exp15d_snapshot_T300x15/ensemble_results.json
+
+Done!
+
+============================================================
+Config E: T0=500, T_mult=1, 10 cycles, lr_max=0.003
+  Aggressive restarts for more basin diversity
+============================================================
+======================================================================
+Snapshot Ensemble: exp15e_snapshot_T500x10_aggr
+Schedule: T0=500, T_mult=1, 10 cycles
+LR: 0.003 -> 1e-06
+Total epochs: 5000
+======================================================================
+Random seed: 314
+Using device: cuda:5
+
+Cycle schedule: T0=500, T_mult=1, n_cycles=10
+Cycle end epochs: [500, 1000, 1500, 2000, 2500, 3000, 3500, 4000, 4500, 5000]
+Total epochs: 5000
+
+Loading data...
+  Loaded fine_geo: torch.Size([895, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([895, 128, 68, 120])
+  Loaded summary: torch.Size([895, 2560])
+  [train] 895 samples loaded
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+Translation norm: mean=[13.19548    -0.64731836 23.103329  ], std=[10.827089    0.94348246  9.766839  ]
+  Feature dim after pooling: 7936
+Model parameters: 18,905,610
+
+Pre-computing pooled features...
+  Pre-computed pooled features: torch.Size([895, 7936]) (28.4 MB)
+  Pre-computed pooled features: torch.Size([182, 7936]) (5.8 MB)
+
+Starting training for 5000 epochs...
+======================================================================
+[    1/5000] loss=2.7334 lr=3.00e-03 beta=1.00 | val: 47.67deg/17660mm | 0.5s
+[  100/5000] loss=0.0746 lr=2.71e-03 beta=0.82 | val: 3.81deg/2468mm | 1.9s
+[  200/5000] loss=0.0409 lr=1.96e-03 beta=0.75 | val: 1.85deg/1685mm | 3.5s
+[  300/5000] loss=0.0318 lr=1.04e-03 beta=0.72 | val: 1.89deg/1644mm | 4.2s
+[  400/5000] loss=0.0289 lr=2.87e-04 beta=0.71 | val: 1.87deg/1561mm | 4.8s
+[  500/5000] loss=0.0283 lr=3.00e-03 beta=0.71 | val: 1.87deg/1567mm | 5.5s *** CYCLE END ***
+  >> Saved snapshot 0: 1.87deg / 1567mm, R@10/2=58.8%
+[  600/5000] loss=0.0219 lr=2.71e-03 beta=0.63 | val: 1.82deg/1608mm | 6.1s
+[  700/5000] loss=0.0180 lr=1.96e-03 beta=0.58 | val: 1.69deg/1468mm | 6.8s
+[  800/5000] loss=0.0164 lr=1.04e-03 beta=0.56 | val: 1.80deg/1609mm | 7.9s
+[  900/5000] loss=0.0147 lr=2.87e-04 beta=0.55 | val: 1.62deg/1454mm | 8.4s
+[ 1000/5000] loss=0.0145 lr=3.00e-03 beta=0.55 | val: 1.65deg/1481mm | 9.0s *** CYCLE END ***
+  >> Saved snapshot 1: 1.65deg / 1481mm, R@10/2=65.4%
+[ 1100/5000] loss=0.0146 lr=2.71e-03 beta=0.49 | val: 1.99deg/1717mm | 9.6s
+[ 1200/5000] loss=0.0124 lr=1.96e-03 beta=0.46 | val: 2.03deg/1628mm | 10.2s
+[ 1300/5000] loss=0.0114 lr=1.04e-03 beta=0.44 | val: 1.86deg/1667mm | 10.7s
+[ 1400/5000] loss=0.0104 lr=2.87e-04 beta=0.43 | val: 1.85deg/1572mm | 11.3s
+[ 1500/5000] loss=0.0103 lr=3.00e-03 beta=0.43 | val: 1.75deg/1520mm | 11.8s *** CYCLE END ***
+  >> Saved snapshot 2: 1.75deg / 1520mm, R@10/2=69.2%
+[ 1600/5000] loss=0.0105 lr=2.71e-03 beta=0.39 | val: 1.71deg/1349mm | 12.6s
+[ 1700/5000] loss=0.0089 lr=1.96e-03 beta=0.36 | val: 1.69deg/1453mm | 13.4s
+[ 1800/5000] loss=0.0083 lr=1.04e-03 beta=0.35 | val: 1.76deg/1547mm | 13.9s
+[ 1900/5000] loss=0.0079 lr=2.87e-04 beta=0.34 | val: 1.73deg/1565mm | 14.5s
+[ 2000/5000] loss=0.0079 lr=3.00e-03 beta=0.34 | val: 1.72deg/1580mm | 15.1s *** CYCLE END ***
+  >> Saved snapshot 3: 1.72deg / 1580mm, R@10/2=65.9%
+[ 2100/5000] loss=0.0080 lr=2.71e-03 beta=0.31 | val: 1.86deg/1466mm | 15.7s
+[ 2200/5000] loss=0.0072 lr=1.96e-03 beta=0.29 | val: 1.91deg/1669mm | 16.3s
+[ 2300/5000] loss=0.0067 lr=1.04e-03 beta=0.28 | val: 1.72deg/1542mm | 16.8s
+[ 2400/5000] loss=0.0063 lr=2.87e-04 beta=0.27 | val: 1.80deg/1558mm | 17.4s
+[ 2500/5000] loss=0.0063 lr=3.00e-03 beta=0.27 | val: 1.76deg/1596mm | 18.0s *** CYCLE END ***
+  >> Saved snapshot 4: 1.76deg / 1596mm, R@10/2=62.1%
+[ 2600/5000] loss=0.0066 lr=2.71e-03 beta=0.25 | val: 1.87deg/1661mm | 18.6s
+[ 2700/5000] loss=0.0058 lr=1.96e-03 beta=0.23 | val: 1.66deg/1693mm | 19.2s
+[ 2800/5000] loss=0.0053 lr=1.04e-03 beta=0.22 | val: 1.79deg/1709mm | 19.8s
+[ 2900/5000] loss=0.0053 lr=2.87e-04 beta=0.22 | val: 1.73deg/1681mm | 20.4s
+[ 3000/5000] loss=0.0051 lr=3.00e-03 beta=0.22 | val: 1.78deg/1718mm | 21.0s *** CYCLE END ***
+  >> Saved snapshot 5: 1.78deg / 1718mm, R@10/2=59.9%
+[ 3100/5000] loss=0.0053 lr=2.71e-03 beta=0.20 | val: 1.90deg/1765mm | 21.7s
+[ 3200/5000] loss=0.0048 lr=1.96e-03 beta=0.18 | val: 1.80deg/1580mm | 22.2s
+[ 3300/5000] loss=0.0046 lr=1.04e-03 beta=0.18 | val: 1.77deg/1686mm | 22.8s
+[ 3400/5000] loss=0.0042 lr=2.87e-04 beta=0.17 | val: 1.80deg/1716mm | 23.3s
+[ 3500/5000] loss=0.0041 lr=3.00e-03 beta=0.17 | val: 1.76deg/1700mm | 23.9s *** CYCLE END ***
+  >> Saved snapshot 6: 1.76deg / 1700mm, R@10/2=59.3%
+[ 3600/5000] loss=0.0044 lr=2.71e-03 beta=0.16 | val: 1.80deg/1695mm | 24.5s
+[ 3700/5000] loss=0.0041 lr=1.96e-03 beta=0.15 | val: 1.77deg/1522mm | 25.1s
+[ 3800/5000] loss=0.0039 lr=1.04e-03 beta=0.14 | val: 1.77deg/1650mm | 25.7s
+[ 3900/5000] loss=0.0035 lr=2.87e-04 beta=0.14 | val: 1.76deg/1706mm | 26.2s
+[ 4000/5000] loss=0.0036 lr=3.00e-03 beta=0.14 | val: 1.85deg/1685mm | 26.8s *** CYCLE END ***
+  >> Saved snapshot 7: 1.85deg / 1685mm, R@10/2=58.8%
+[ 4100/5000] loss=0.0036 lr=2.71e-03 beta=0.13 | val: 1.92deg/1744mm | 27.5s
+[ 4200/5000] loss=0.0033 lr=1.96e-03 beta=0.12 | val: 1.87deg/1645mm | 28.0s
+[ 4300/5000] loss=0.0031 lr=1.04e-03 beta=0.11 | val: 1.97deg/1724mm | 28.6s
+[ 4400/5000] loss=0.0031 lr=2.87e-04 beta=0.11 | val: 1.88deg/1581mm | 29.2s
+[ 4500/5000] loss=0.0030 lr=3.00e-03 beta=0.11 | val: 1.89deg/1679mm | 29.7s *** CYCLE END ***
+  >> Saved snapshot 8: 1.89deg / 1679mm, R@10/2=58.2%
+[ 4600/5000] loss=0.0032 lr=2.71e-03 beta=0.10 | val: 1.95deg/1801mm | 30.4s
+[ 4700/5000] loss=0.0030 lr=1.96e-03 beta=0.09 | val: 1.95deg/1649mm | 30.9s
+[ 4800/5000] loss=0.0029 lr=1.04e-03 beta=0.09 | val: 1.97deg/1778mm | 31.5s
+[ 4900/5000] loss=0.0025 lr=2.87e-04 beta=0.09 | val: 1.93deg/1679mm | 32.1s
+[ 5000/5000] loss=0.0025 lr=3.00e-03 beta=0.09 | val: 1.90deg/1746mm | 32.6s *** CYCLE END ***
+  >> Saved snapshot 9: 1.90deg / 1746mm, R@10/2=57.7%
+
+======================================================================
+Training complete in 32.7s (0.5min)
+Best single epoch: 1600 (score=1.5200)
+Saved 10 snapshots
+
+Loading 10 snapshots for ensemble evaluation...
+
+======================================================================
+INDIVIDUAL SNAPSHOT RESULTS
+======================================================================
+ Snap  Epoch  Rot(deg)  Trans(mm)  R@10/2
+---------------------------------------------
+    0    500      1.87       1567    58.8%
+    1   1000      1.65       1481    65.4%
+    2   1500      1.75       1520    69.2%
+    3   2000      1.72       1580    65.9%
+    4   2500      1.76       1596    62.1%
+    5   3000      1.78       1718    59.9%
+    6   3500      1.76       1700    59.3%
+    7   4000      1.85       1685    58.8%
+    8   4500      1.89       1679    58.2%
+    9   5000      1.90       1746    57.7%
+
+======================================================================
+ENSEMBLE RESULTS
+======================================================================
+
+  Mean Ensemble (10 snapshots):
+    Rot median: 1.76deg
+    Trans median: 1605mm
+    R@5deg_1m: 34.6%
+    R@10deg_2m: 63.2%
+    R@15deg_5m: 90.7%
+    R@25deg_5m: 90.7%
+
+  Weighted Ensemble (10 snapshots, inverse-error weights):
+    Weights: ['0.103', '0.109', '0.106', '0.103', '0.102', '0.095', '0.096', '0.096', '0.096', '0.093']
+    Rot median: 1.75deg
+    Trans median: 1618mm
+    R@5deg_1m: 35.2%
+    R@10deg_2m: 63.2%
+    R@15deg_5m: 90.7%
+    R@25deg_5m: 90.7%
+
+  Greedy Forward Selection:
+    +snap 2 (epoch 1500) -> 2 snaps, R@10/2=67.6%
+    (no improvement, stopping at 2 snapshots)
+
+    Best greedy subset: [1, 2] (2 snapshots)
+    Rot median: 1.75deg
+    Trans median: 1515mm
+    R@5deg_1m: 34.6%
+    R@10deg_2m: 67.6%
+    R@15deg_5m: 92.9%
+    R@25deg_5m: 92.9%
+
+======================================================================
+Results saved to output/feature_retrieval/pose_regression/exp15e_snapshot_T500x10_aggr/ensemble_results.json
+
+Done!
+
+All snapshot ensemble configs complete!

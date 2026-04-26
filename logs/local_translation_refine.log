@@ -1,0 +1,215 @@
+  Loaded summary: torch.Size([895, 2560])
+  [train] 895 samples loaded
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Loaded fine_geo: torch.Size([895, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([895, 128, 68, 120])
+  Loaded summary: torch.Size([895, 2560])
+  [train] 895 samples loaded
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 3584
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Pre-computed pooled features: torch.Size([182, 3584]) (2.6 MB)
+  Loaded fine_geo: torch.Size([895, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([895, 128, 68, 120])
+  Loaded summary: torch.Size([895, 2560])
+  [train] 895 samples loaded
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 3584
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Pre-computed pooled features: torch.Size([182, 3584]) (2.6 MB)
+  Loaded fine_geo: torch.Size([895, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([895, 128, 68, 120])
+  Loaded summary: torch.Size([895, 2560])
+  [train] 895 samples loaded
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 4608
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Pre-computed pooled features: torch.Size([182, 4608]) (3.4 MB)
+  Loaded fine_geo: torch.Size([895, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([895, 128, 68, 120])
+  Loaded summary: torch.Size([895, 2560])
+  [train] 895 samples loaded
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 3584
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Pre-computed pooled features: torch.Size([182, 3584]) (2.6 MB)
+  Loaded fine_geo: torch.Size([895, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([895, 128, 68, 120])
+  Loaded summary: torch.Size([895, 2560])
+  [train] 895 samples loaded
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 3584
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Pre-computed pooled features: torch.Size([182, 3584]) (2.6 MB)
+  Loaded fine_geo: torch.Size([895, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([895, 128, 68, 120])
+  Loaded summary: torch.Size([895, 2560])
+  [train] 895 samples loaded
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 3584
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Pre-computed pooled features: torch.Size([182, 3584]) (2.6 MB)
+  Loaded fine_geo: torch.Size([895, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([895, 128, 68, 120])
+  Loaded summary: torch.Size([895, 2560])
+  [train] 895 samples loaded
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 4608
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Pre-computed pooled features: torch.Size([182, 4608]) (3.4 MB)
+  Feature dim after pooling: 3584
+  Loaded fine_geo: torch.Size([895, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([895, 128, 68, 120])
+  Loaded summary: torch.Size([895, 2560])
+  [train] 895 samples loaded
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Pre-computed pooled features: torch.Size([895, 3584]) (12.8 MB)
+  Pre-computed pooled features: torch.Size([182, 3584]) (2.6 MB)
+  Loaded fine_geo: torch.Size([895, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([895, 128, 68, 120])
+  Loaded summary: torch.Size([895, 2560])
+  [train] 895 samples loaded
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 3584
+  Loaded fine_geo: torch.Size([895, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([895, 128, 68, 120])
+  Loaded summary: torch.Size([895, 2560])
+  [train] 895 samples loaded
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+Baseline:
+  base5 + rot_base5: {'r5': 44.505494505494504, 'r10': 81.86813186813187, 'retr_r5': 3.8461538461538463, 'retr_r10': 21.428571428571427, 'med_rot': 2.0829968452453613, 'med_trans_mm': 1113.1362835573752, 'retr_med_rot': 11.162489891052246, 'retr_med_trans_mm': 2189.5742416381836}
+  base5 + rot_f15: {'r5': 45.05494505494506, 'r10': 81.86813186813187, 'retr_r5': 3.8461538461538463, 'retr_r10': 21.428571428571427, 'med_rot': 1.7389954328536987, 'med_trans_mm': 1113.1362835573752, 'retr_med_rot': 11.162489891052246, 'retr_med_trans_mm': 2189.5742416381836}
+  base5 + rot_e123: {'r5': 44.505494505494504, 'r10': 81.86813186813187, 'retr_r5': 3.8461538461538463, 'retr_r10': 21.428571428571427, 'med_rot': 2.082245349884033, 'med_trans_mm': 1113.1362835573752, 'retr_med_rot': 11.162489891052246, 'retr_med_trans_mm': 2189.5742416381836}
+
+Global local search
+  NEW BEST global: {'r10': 81.86813186813187, 'res': {'r5': 44.505494505494504, 'r10': 81.86813186813187, 'retr_r5': 3.8461538461538463, 'retr_r10': 21.428571428571427, 'med_rot': 2.0829968452453613, 'med_trans_mm': 1113.1362835573752, 'retr_med_rot': 11.162489891052246, 'retr_med_trans_mm': 2189.5742416381836}, 'cfg': {'rot': 'rot_base5', 'weights': {'base5': 2.0, 'f15': 0.0, 'e60': 0.0, 'mem28': 0.0, 'grid32v2': 0.0, 's314': 0.0}}}
+  NEW BEST global: {'r10': 81.86813186813187, 'res': {'r5': 45.05494505494506, 'r10': 81.86813186813187, 'retr_r5': 3.8461538461538463, 'retr_r10': 21.428571428571427, 'med_rot': 2.0829968452453613, 'med_trans_mm': 1110.6081902012127, 'retr_med_rot': 11.14604377746582, 'retr_med_trans_mm': 2189.5742416381836}, 'cfg': {'rot': 'rot_base5', 'weights': {'base5': 2.0, 'f15': 0.0, 'e60': 0.05, 'mem28': 0.0, 'grid32v2': 0.0, 's314': 0.0}}}
+  NEW BEST global: {'r10': 81.86813186813187, 'res': {'r5': 45.604395604395606, 'r10': 81.86813186813187, 'retr_r5': 3.8461538461538463, 'retr_r10': 20.87912087912088, 'med_rot': 2.0829968452453613, 'med_trans_mm': 1100.0249768815843, 'retr_med_rot': 11.14604377746582, 'retr_med_trans_mm': 2216.390609741211}, 'cfg': {'rot': 'rot_base5', 'weights': {'base5': 2.0, 'f15': 0.0, 'e60': 0.1, 'mem28': 0.0, 'grid32v2': 0.0, 's314': 0.0}}}
+  NEW BEST global: {'r10': 81.86813186813187, 'res': {'r5': 46.15384615384615, 'r10': 81.86813186813187, 'retr_r5': 3.8461538461538463, 'retr_r10': 21.428571428571427, 'med_rot': 2.0829968452453613, 'med_trans_mm': 1099.9787191169285, 'retr_med_rot': 11.14604377746582, 'retr_med_trans_mm': 2189.5742416381836}, 'cfg': {'rot': 'rot_base5', 'weights': {'base5': 6.0, 'f15': 0.2, 'e60': 0.1, 'mem28': 0.0, 'grid32v2': 0.0, 's314': 0.05}}}
+  NEW BEST global: {'r10': 81.86813186813187, 'res': {'r5': 46.7032967032967, 'r10': 81.86813186813187, 'retr_r5': 3.8461538461538463, 'retr_r10': 21.428571428571427, 'med_rot': 1.7389954328536987, 'med_trans_mm': 1099.9787191169285, 'retr_med_rot': 11.14604377746582, 'retr_med_trans_mm': 2189.5742416381836}, 'cfg': {'rot': 'rot_f15', 'weights': {'base5': 6.0, 'f15': 0.2, 'e60': 0.1, 'mem28': 0.0, 'grid32v2': 0.0, 's314': 0.05}}}
+
+Per-axis local search
+  NEW BEST axis: {'r10': 81.86813186813187, 'res': {'r5': 44.505494505494504, 'r10': 81.86813186813187, 'retr_r5': 3.8461538461538463, 'retr_r10': 21.428571428571427, 'med_rot': 2.0829968452453613, 'med_trans_mm': 1113.1362835573752, 'retr_med_rot': 11.162489891052246, 'retr_med_trans_mm': 2189.5742416381836}, 'cfg': {'rot': 'rot_base5', 'weights_xyz': {'base5': [4.0, 4.0, 4.0], 'f15': [0.0, 0.0, 0.0], 'e60': [0.0, 0.0, 0.0], 'mem28': [0.0, 0.0, 0.0]}}}
+  NEW BEST axis: {'r10': 81.86813186813187, 'res': {'r5': 45.05494505494506, 'r10': 81.86813186813187, 'retr_r5': 3.8461538461538463, 'retr_r10': 21.428571428571427, 'med_rot': 2.0829968452453613, 'med_trans_mm': 1110.6081902012127, 'retr_med_rot': 11.14604377746582, 'retr_med_trans_mm': 2189.5742416381836}, 'cfg': {'rot': 'rot_base5', 'weights_xyz': {'base5': [4.0, 4.0, 4.0], 'f15': [0.0, 0.0, 0.0], 'e60': [0.1, 0.1, 0.1], 'mem28': [0.0, 0.0, 0.0]}}}
+  NEW BEST axis: {'r10': 81.86813186813187, 'res': {'r5': 45.604395604395606, 'r10': 81.86813186813187, 'retr_r5': 3.8461538461538463, 'retr_r10': 20.87912087912088, 'med_rot': 2.0829968452453613, 'med_trans_mm': 1100.0249768815843, 'retr_med_rot': 11.14604377746582, 'retr_med_trans_mm': 2216.390609741211}, 'cfg': {'rot': 'rot_base5', 'weights_xyz': {'base5': [4.0, 4.0, 4.0], 'f15': [0.0, 0.0, 0.0], 'e60': [0.2, 0.2, 0.2], 'mem28': [0.0, 0.0, 0.0]}}}
+  NEW BEST axis: {'r10': 81.86813186813187, 'res': {'r5': 46.15384615384615, 'r10': 81.86813186813187, 'retr_r5': 3.8461538461538463, 'retr_r10': 20.87912087912088, 'med_rot': 1.7389954328536987, 'med_trans_mm': 1100.0249768815843, 'retr_med_rot': 11.14604377746582, 'retr_med_trans_mm': 2216.390609741211}, 'cfg': {'rot': 'rot_f15', 'weights_xyz': {'base5': [4.0, 4.0, 4.0], 'f15': [0.0, 0.0, 0.0], 'e60': [0.2, 0.2, 0.2], 'mem28': [0.0, 0.0, 0.0]}}}
+
+FINAL
+{
+  "best_global": {
+    "r10": 81.86813186813187,
+    "res": {
+      "r5": 46.7032967032967,
+      "r10": 81.86813186813187,
+      "retr_r5": 3.8461538461538463,
+      "retr_r10": 21.428571428571427,
+      "med_rot": 1.7389954328536987,
+      "med_trans_mm": 1099.9787191169285,
+      "retr_med_rot": 11.14604377746582,
+      "retr_med_trans_mm": 2189.5742416381836
+    },
+    "cfg": {
+      "rot": "rot_f15",
+      "weights": {
+        "base5": 6.0,
+        "f15": 0.2,
+        "e60": 0.1,
+        "mem28": 0.0,
+        "grid32v2": 0.0,
+        "s314": 0.05
+      }
+    }
+  },
+  "best_axis": {
+    "r10": 81.86813186813187,
+    "res": {
+      "r5": 46.15384615384615,
+      "r10": 81.86813186813187,
+      "retr_r5": 3.8461538461538463,
+      "retr_r10": 20.87912087912088,
+      "med_rot": 1.7389954328536987,
+      "med_trans_mm": 1100.0249768815843,
+      "retr_med_rot": 11.14604377746582,
+      "retr_med_trans_mm": 2216.390609741211
+    },
+    "cfg": {
+      "rot": "rot_f15",
+      "weights_xyz": {
+        "base5": [
+          4.0,
+          4.0,
+          4.0
+        ],
+        "f15": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "e60": [
+          0.2,
+          0.2,
+          0.2
+        ],
+        "mem28": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      }
+    }
+  }
+}
+Saved to output/feature_retrieval/pose_regression/local_translation_refine_results.json

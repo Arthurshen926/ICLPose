@@ -1,0 +1,140 @@
+=== Training 128d wider with multiple seeds ===
+=== exp14n_128d_wider_seed123 ===
+======================================================================
+Rotation  (median): 1.64deg
+Translation (median): 1269mm
+
+  R@5deg_1m: 38.5%  (rot_pass=95.1%, trans_pass=39.0%)
+  R@10deg_2m: 70.9%  (rot_pass=99.5%, trans_pass=71.4%)
+  R@15deg_5m: 90.7%  (rot_pass=100.0%, trans_pass=90.7%)
+  R@25deg_5m: 90.7%  (rot_pass=100.0%, trans_pass=90.7%)
+
+======================================================================
+EVALUATION RESULTS (Retrieval Mode)
+======================================================================
+Retrieval median: 11.77deg / 2359mm
+  R@5deg_1m: 2.2%  (rot=6.6%, trans=20.3%)
+  R@10deg_2m: 18.1%  (rot=40.1%, trans=45.6%)
+  R@15deg_5m: 56.0%  (rot=68.1%, trans=86.3%)
+  R@25deg_5m: 83.0%  (rot=96.2%, trans=86.3%)
+======================================================================
+
+Done!
+--- exp14n_128d_wider_seed123 done ---
+
+=== exp14n_128d_wider_seed456 ===
+======================================================================
+Rotation  (median): 1.61deg
+Translation (median): 1312mm
+
+  R@5deg_1m: 33.5%  (rot_pass=92.9%, trans_pass=34.1%)
+  R@10deg_2m: 64.8%  (rot_pass=100.0%, trans_pass=64.8%)
+  R@15deg_5m: 90.7%  (rot_pass=100.0%, trans_pass=90.7%)
+  R@25deg_5m: 90.7%  (rot_pass=100.0%, trans_pass=90.7%)
+
+======================================================================
+EVALUATION RESULTS (Retrieval Mode)
+======================================================================
+Retrieval median: 11.41deg / 2473mm
+  R@5deg_1m: 2.2%  (rot=4.9%, trans=20.3%)
+  R@10deg_2m: 19.2%  (rot=41.8%, trans=43.4%)
+  R@15deg_5m: 55.5%  (rot=67.6%, trans=86.8%)
+  R@25deg_5m: 83.5%  (rot=96.2%, trans=86.8%)
+======================================================================
+
+Done!
+--- exp14n_128d_wider_seed456 done ---
+
+=== exp14n_128d_wider_seed789 ===
+======================================================================
+Rotation  (median): 1.65deg
+Translation (median): 1334mm
+
+  R@5deg_1m: 33.0%  (rot_pass=94.5%, trans_pass=33.0%)
+  R@10deg_2m: 69.8%  (rot_pass=99.5%, trans_pass=69.8%)
+  R@15deg_5m: 90.7%  (rot_pass=100.0%, trans_pass=90.7%)
+  R@25deg_5m: 90.7%  (rot_pass=100.0%, trans_pass=90.7%)
+
+======================================================================
+EVALUATION RESULTS (Retrieval Mode)
+======================================================================
+Retrieval median: 11.38deg / 2443mm
+  R@5deg_1m: 1.6%  (rot=4.4%, trans=18.7%)
+  R@10deg_2m: 19.2%  (rot=40.7%, trans=44.5%)
+  R@15deg_5m: 57.7%  (rot=69.2%, trans=87.9%)
+  R@25deg_5m: 84.6%  (rot=96.7%, trans=87.9%)
+======================================================================
+
+Done!
+--- exp14n_128d_wider_seed789 done ---
+
+=== exp14n_128d_wider_seed2024 ===
+======================================================================
+Rotation  (median): 1.57deg
+Translation (median): 1342mm
+
+  R@5deg_1m: 34.1%  (rot_pass=92.3%, trans_pass=34.6%)
+  R@10deg_2m: 67.6%  (rot_pass=99.5%, trans_pass=68.1%)
+  R@15deg_5m: 89.6%  (rot_pass=100.0%, trans_pass=89.6%)
+  R@25deg_5m: 89.6%  (rot_pass=100.0%, trans_pass=89.6%)
+
+======================================================================
+EVALUATION RESULTS (Retrieval Mode)
+======================================================================
+Retrieval median: 11.54deg / 2490mm
+  R@5deg_1m: 2.2%  (rot=4.9%, trans=20.3%)
+  R@10deg_2m: 18.1%  (rot=41.2%, trans=44.0%)
+  R@15deg_5m: 55.5%  (rot=69.2%, trans=84.6%)
+  R@25deg_5m: 81.9%  (rot=96.2%, trans=84.6%)
+======================================================================
+
+Done!
+--- exp14n_128d_wider_seed2024 done ---
+
+=== exp14n_128d_wider_seed7777 ===
+======================================================================
+Rotation  (median): 1.60deg
+Translation (median): 1364mm
+
+  R@5deg_1m: 33.0%  (rot_pass=94.0%, trans_pass=33.0%)
+  R@10deg_2m: 68.1%  (rot_pass=99.5%, trans_pass=68.7%)
+  R@15deg_5m: 93.4%  (rot_pass=100.0%, trans_pass=93.4%)
+  R@25deg_5m: 93.4%  (rot_pass=100.0%, trans_pass=93.4%)
+
+======================================================================
+EVALUATION RESULTS (Retrieval Mode)
+======================================================================
+Retrieval median: 10.91deg / 2404mm
+  R@5deg_1m: 3.3%  (rot=6.0%, trans=20.3%)
+  R@10deg_2m: 18.1%  (rot=40.1%, trans=44.5%)
+  R@15deg_5m: 60.4%  (rot=73.1%, trans=86.3%)
+  R@25deg_5m: 83.0%  (rot=96.7%, trans=86.3%)
+======================================================================
+
+Done!
+--- exp14n_128d_wider_seed7777 done ---
+
+=== exp14n_128d_wider_seed9999 ===
+======================================================================
+Rotation  (median): 1.81deg
+Translation (median): 1249mm
+
+  R@5deg_1m: 34.6%  (rot_pass=95.1%, trans_pass=34.6%)
+  R@10deg_2m: 69.8%  (rot_pass=99.5%, trans_pass=69.8%)
+  R@15deg_5m: 93.4%  (rot_pass=100.0%, trans_pass=93.4%)
+  R@25deg_5m: 93.4%  (rot_pass=100.0%, trans_pass=93.4%)
+
+======================================================================
+EVALUATION RESULTS (Retrieval Mode)
+======================================================================
+Retrieval median: 11.85deg / 2408mm
+  R@5deg_1m: 4.4%  (rot=7.7%, trans=22.0%)
+  R@10deg_2m: 20.9%  (rot=40.7%, trans=44.5%)
+  R@15deg_5m: 56.6%  (rot=68.7%, trans=87.9%)
+  R@25deg_5m: 83.5%  (rot=95.6%, trans=87.9%)
+======================================================================
+
+Done!
+--- exp14n_128d_wider_seed9999 done ---
+
+=== All 128d wider training complete! ===

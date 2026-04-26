@@ -1,0 +1,212 @@
+Loading GT...
+  Loaded summary: torch.Size([895, 2560])
+  [train] 895 samples loaded
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+
+Loading model predictions...
+  loading e123 (patch)
+  Loaded fine_geo: torch.Size([895, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([895, 128, 68, 120])
+  Loaded summary: torch.Size([895, 2560])
+  [train] 895 samples loaded
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 3584
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Pre-computed pooled features: torch.Size([182, 3584]) (2.6 MB)
+  loading e38 (patch)
+  Loaded fine_geo: torch.Size([895, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([895, 128, 68, 120])
+  Loaded summary: torch.Size([895, 2560])
+  [train] 895 samples loaded
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 3584
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Pre-computed pooled features: torch.Size([182, 3584]) (2.6 MB)
+  loading f42 (patch)
+  Loaded fine_geo: torch.Size([895, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([895, 128, 68, 120])
+  Loaded summary: torch.Size([895, 2560])
+  [train] 895 samples loaded
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 4608
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Pre-computed pooled features: torch.Size([182, 4608]) (3.4 MB)
+  loading e40 (patch)
+  Loaded fine_geo: torch.Size([895, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([895, 128, 68, 120])
+  Loaded summary: torch.Size([895, 2560])
+  [train] 895 samples loaded
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 3584
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Pre-computed pooled features: torch.Size([182, 3584]) (2.6 MB)
+  loading e47 (patch)
+  Loaded fine_geo: torch.Size([895, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([895, 128, 68, 120])
+  Loaded summary: torch.Size([895, 2560])
+  [train] 895 samples loaded
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 3584
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Pre-computed pooled features: torch.Size([182, 3584]) (2.6 MB)
+  loading e60 (patch)
+  Loaded fine_geo: torch.Size([895, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([895, 128, 68, 120])
+  Loaded summary: torch.Size([895, 2560])
+  [train] 895 samples loaded
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 3584
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Pre-computed pooled features: torch.Size([182, 3584]) (2.6 MB)
+  loading f15 (patch)
+  Loaded fine_geo: torch.Size([895, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([895, 128, 68, 120])
+  Loaded summary: torch.Size([895, 2560])
+  [train] 895 samples loaded
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 4608
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Pre-computed pooled features: torch.Size([182, 4608]) (3.4 MB)
+  loading s314 (patch)
+  Loaded fine_geo: torch.Size([895, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([895, 128, 68, 120])
+  Loaded summary: torch.Size([895, 2560])
+  [train] 895 samples loaded
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+  loading grid32v1 (grid)
+  Loaded fine_geo: torch.Size([895, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([895, 128, 68, 120])
+  Loaded summary: torch.Size([895, 2560])
+  [train] 895 samples loaded
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 3584
+  loading grid32v2 (grid)
+  Loaded fine_geo: torch.Size([895, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([895, 128, 68, 120])
+  Loaded summary: torch.Size([895, 2560])
+  [train] 895 samples loaded
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 3584
+  loading mem28 (memory)
+  Feature dim after pooling: 3584
+  Loaded fine_geo: torch.Size([895, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([895, 128, 68, 120])
+  Loaded summary: torch.Size([895, 2560])
+  [train] 895 samples loaded
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Pre-computed pooled features: torch.Size([895, 3584]) (12.8 MB)
+  Pre-computed pooled features: torch.Size([182, 3584]) (2.6 MB)
+
+Individual models:
+  e123       direct R@10= 75.3%  R@5= 42.9%  retr R@10= 17.6%
+  e38        direct R@10= 72.0%  R@5= 34.1%  retr R@10= 20.3%
+  f42        direct R@10= 74.7%  R@5= 44.0%  retr R@10= 20.9%
+  e40        direct R@10= 71.4%  R@5= 39.6%  retr R@10= 18.1%
+  e47        direct R@10= 74.2%  R@5= 38.5%  retr R@10= 19.2%
+  e60        direct R@10= 73.6%  R@5= 38.5%  retr R@10= 19.2%
+  f15        direct R@10= 74.7%  R@5= 45.6%  retr R@10= 20.3%
+  s314       direct R@10= 72.0%  R@5= 37.9%  retr R@10= 20.3%
+  grid32v1   direct R@10= 32.4%  R@5= 13.7%  retr R@10= 19.2%
+  grid32v2   direct R@10= 36.8%  R@5= 15.4%  retr R@10= 20.9%
+  mem28      direct R@10= 55.5%  R@5= 33.0%  retr R@10= 20.3%
+
+Baseline decoupled evaluations:
+  baseline5 + e123      -> direct R@10= 81.9% R@5= 44.5% retr R@10= 21.4%
+  baseline5 + e38       -> direct R@10= 81.9% R@5= 44.0% retr R@10= 21.4%
+  baseline5 + f42       -> direct R@10= 81.9% R@5= 44.0% retr R@10= 21.4%
+  baseline5 + f15       -> direct R@10= 81.9% R@5= 45.1% retr R@10= 21.4%
+  baseline5 + e47       -> direct R@10= 81.9% R@5= 44.0% retr R@10= 21.4%
+  baseline5 + mem28     -> direct R@10= 81.9% R@5= 44.0% retr R@10= 21.4%
+  baseline5 + rot_best5 -> direct R@10= 81.9% R@5= 44.5% retr R@10= 21.4%
+  baseline5 + rot_old3  -> direct R@10= 81.9% R@5= 44.0% retr R@10= 21.4%
+
+Random search: global translation weights
+  NEW BEST global: rot=e123 models=['e123', 'e38', 'f42', 'e40', 'e47', 's314'] R@10=76.9% R@5=45.1% retr=21.4%
+  NEW BEST global: rot=e123 models=['e123', 'e38', 'f42', 'e40', 'e47', 'e60', 'grid32v2'] R@10=78.0% R@5=43.4% retr=21.4%
+  NEW BEST global: rot=e123 models=['e123', 'f42', 'e47', 'e60', 's314'] R@10=78.6% R@5=46.7% retr=19.8%
+  NEW BEST global: rot=e123 models=['e123', 'f42', 'e40', 'e47', 'e60', 'grid32v2'] R@10=79.7% R@5=43.4% retr=20.9%
+  NEW BEST global: rot=e123 models=['e123', 'e38', 'e40', 'f15'] R@10=79.7% R@5=47.8% retr=21.4%
+  NEW BEST global: rot=e123 models=['e123', 'f42', 'e40', 'e47', 'f15'] R@10=80.2% R@5=46.2% retr=20.3%
+  NEW BEST global: rot=e123 models=['e123', 'f42', 'e40', 'e47', 'e60'] R@10=80.2% R@5=47.8% retr=19.8%
+  NEW BEST global: rot=e123 models=['e123', 'e38', 'f42', 'e40', 'e47'] R@10=80.8% R@5=45.6% retr=22.0%
+  NEW BEST global: rot=e123 models=['e123', 'e40', 'e47', 'e60', 'f15'] R@10=80.8% R@5=47.8% retr=19.2%
+  NEW BEST global: rot=e123 models=['e123', 'e40', 'e47', 'e60', 'f15'] R@10=81.3% R@5=47.3% retr=19.2%
+
+Random search: per-axis translation weights
+  NEW BEST axis: rot=e123 R@10=74.2% R@5=37.9% retr=19.2%
+  NEW BEST axis: rot=e123 R@10=79.7% R@5=44.0% retr=22.5%
+  NEW BEST axis: rot=e123 R@10=79.7% R@5=44.5% retr=22.0%
+  NEW BEST axis: rot=e123 R@10=80.8% R@5=44.0% retr=20.3%
+  NEW BEST axis: rot=e123 R@10=80.8% R@5=44.5% retr=21.4%
+  NEW BEST axis: rot=e123 R@10=80.8% R@5=47.8% retr=21.4%
+  NEW BEST axis: rot=e38 R@10=81.3% R@5=44.0% retr=21.4%
+  NEW BEST axis: rot=e38 R@10=81.3% R@5=46.2% retr=19.8%
+  NEW BEST axis: rot=f42 R@10=81.3% R@5=46.7% retr=21.4%
+  NEW BEST axis: rot=rot_best5 R@10=81.3% R@5=47.3% retr=21.4%
+
+======================================================================
+BEST RESULTS
+======================================================================
+Best global translation ensemble: rot=e123 models=['e123', 'e40', 'e47', 'e60', 'f15']
+  Result: {'r5': 47.25274725274725, 'r10': 81.31868131868131, 'retr_r5': 2.7472527472527473, 'retr_r10': 19.230769230769234, 'med_rot': 2.082245349884033, 'med_trans_mm': 1085.192155608503, 'retr_med_rot': 12.06927490234375, 'retr_med_trans_mm': 2095.0188636779785}
+  Weights: {'e123': 0.23293190685726858, 'e40': 0.1772377611365142, 'e47': 0.2850542560620521, 'e60': 0.13748866988381958, 'f15': 0.16728740606034562}
+Best per-axis translation ensemble: rot=rot_best5
+  Result: {'r5': 47.25274725274725, 'r10': 81.31868131868131, 'retr_r5': 3.296703296703297, 'retr_r10': 21.428571428571427, 'med_rot': 2.0829968452453613, 'med_trans_mm': 1076.8322944641113, 'retr_med_rot': 11.873939514160156, 'retr_med_trans_mm': 2128.169059753418}
+
+Saved to output/feature_retrieval/pose_regression/decoupled_init_search_results.json

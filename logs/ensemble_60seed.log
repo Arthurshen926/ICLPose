@@ -1,0 +1,510 @@
+Running ensemble analysis with 65 models...
+Loading train data...
+  Loaded fine_geo: torch.Size([895, 64, 68, 120])
+  Loaded coarse_sem: torch.Size([895, 64, 68, 120])
+  Loaded summary: torch.Size([895, 2560])
+  [train] 895 samples loaded
+
+Loading models...
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=69.2% | R@5/1m=33.5% | 1.69deg/1354mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=66.5% | R@5/1m=37.4% | 1.72deg/1279mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=68.7% | R@5/1m=36.3% | 1.82deg/1327mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=69.8% | R@5/1m=32.4% | 1.58deg/1388mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=67.6% | R@5/1m=33.5% | 1.72deg/1326mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=66.5% | R@5/1m=32.4% | 1.60deg/1337mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=67.6% | R@5/1m=34.1% | 1.65deg/1331mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=67.6% | R@5/1m=34.1% | 1.73deg/1292mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=65.4% | R@5/1m=32.4% | 1.63deg/1394mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=66.5% | R@5/1m=35.7% | 1.74deg/1301mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=65.4% | R@5/1m=30.2% | 1.60deg/1369mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=69.2% | R@5/1m=35.2% | 1.71deg/1345mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=67.0% | R@5/1m=35.7% | 1.80deg/1369mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=68.7% | R@5/1m=35.2% | 1.65deg/1334mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=68.7% | R@5/1m=34.1% | 1.64deg/1340mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=68.7% | R@5/1m=36.3% | 1.73deg/1369mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=67.0% | R@5/1m=38.5% | 1.77deg/1298mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=68.7% | R@5/1m=36.8% | 1.71deg/1277mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=64.8% | R@5/1m=30.2% | 1.76deg/1391mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=66.5% | R@5/1m=33.0% | 1.79deg/1401mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=68.7% | R@5/1m=36.8% | 1.56deg/1313mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=69.2% | R@5/1m=35.2% | 1.47deg/1383mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=69.8% | R@5/1m=34.6% | 1.73deg/1278mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=67.0% | R@5/1m=35.2% | 1.98deg/1325mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=69.2% | R@5/1m=33.5% | 1.61deg/1345mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=68.7% | R@5/1m=34.6% | 1.73deg/1420mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=68.7% | R@5/1m=35.2% | 1.78deg/1345mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=67.6% | R@5/1m=34.6% | 1.66deg/1297mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=64.3% | R@5/1m=32.4% | 1.68deg/1395mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=68.7% | R@5/1m=35.2% | 1.55deg/1330mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=68.7% | R@5/1m=35.2% | 1.67deg/1328mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=66.5% | R@5/1m=30.2% | 1.67deg/1424mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=67.0% | R@5/1m=35.2% | 1.58deg/1383mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=64.8% | R@5/1m=38.5% | 1.73deg/1385mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=64.8% | R@5/1m=35.2% | 1.62deg/1381mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=68.7% | R@5/1m=37.4% | 1.74deg/1282mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=68.7% | R@5/1m=35.2% | 1.61deg/1383mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=70.3% | R@5/1m=36.8% | 1.69deg/1358mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=65.4% | R@5/1m=36.8% | 1.67deg/1295mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=65.4% | R@5/1m=33.0% | 1.51deg/1346mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=68.1% | R@5/1m=31.9% | 1.74deg/1318mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=66.5% | R@5/1m=35.7% | 1.64deg/1305mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=67.6% | R@5/1m=33.0% | 1.72deg/1300mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=67.6% | R@5/1m=30.8% | 1.59deg/1360mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=64.3% | R@5/1m=35.2% | 1.69deg/1387mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=65.4% | R@5/1m=31.9% | 1.70deg/1379mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=65.4% | R@5/1m=36.8% | 1.69deg/1363mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=65.9% | R@5/1m=34.1% | 1.78deg/1283mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=68.1% | R@5/1m=29.1% | 1.62deg/1353mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=67.0% | R@5/1m=34.6% | 1.79deg/1335mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=67.6% | R@5/1m=33.5% | 1.59deg/1332mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=68.1% | R@5/1m=33.0% | 1.58deg/1358mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=65.9% | R@5/1m=30.8% | 1.59deg/1360mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=68.7% | R@5/1m=35.2% | 1.88deg/1331mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=67.6% | R@5/1m=35.7% | 1.59deg/1331mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=64.3% | R@5/1m=28.0% | 1.67deg/1442mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=64.8% | R@5/1m=33.5% | 1.64deg/1327mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=67.0% | R@5/1m=32.4% | 1.66deg/1327mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=65.9% | R@5/1m=34.1% | 1.91deg/1437mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=69.2% | R@5/1m=34.1% | 1.63deg/1379mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=69.8% | R@5/1m=36.3% | 1.54deg/1378mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=70.9% | R@5/1m=38.5% | 1.64deg/1269mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=69.8% | R@5/1m=34.6% | 1.81deg/1249mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=69.8% | R@5/1m=37.9% | 1.73deg/1255mm
+  Loading:  (128d)
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+  Feature dim after pooling: 7936
+    R@10/2m=72.0% | R@5/1m=37.9% | 1.70deg/1272mm
+
+Filtered to top 30 models: ['', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '']
+
+======================================================================
+ENSEMBLE STRATEGIES (30 models)
+======================================================================
+
+  1. Simple Mean:
+    Rot: 1.50deg | Trans: 1327mm
+    R@5deg_1m: 36.3%  (rot=92.9%, trans=37.4%)
+    R@10deg_2m: 69.8%  (rot=99.5%, trans=70.3%)
+    R@15deg_5m: 92.3%  (rot=100.0%, trans=92.3%)
+    R@25deg_5m: 92.3%  (rot=100.0%, trans=92.3%)
+    Retrieval: R@10/2=20.3% R@5/1=2.2%
+
+  2. Median:
+    Rot: 1.50deg | Trans: 1323mm
+    R@5deg_1m: 35.2%  (rot=92.9%, trans=36.3%)
+    R@10deg_2m: 69.8%  (rot=99.5%, trans=70.3%)
+    R@15deg_5m: 92.3%  (rot=100.0%, trans=92.3%)
+    R@25deg_5m: 92.3%  (rot=100.0%, trans=92.3%)
+    Retrieval: R@10/2=20.3% R@5/1=2.7%
+
+  3. Trimmed Mean (20%):
+    Rot: 1.50deg | Trans: 1344mm
+    R@5deg_1m: 35.7%  (rot=92.9%, trans=36.8%)
+    R@10deg_2m: 69.2%  (rot=99.5%, trans=69.8%)
+    R@15deg_5m: 92.3%  (rot=100.0%, trans=92.3%)
+    R@25deg_5m: 92.3%  (rot=100.0%, trans=92.3%)
+    Retrieval: R@10/2=20.9% R@5/1=2.2%
+
+  4. Trimmed Mean (40%):
+    Rot: 1.50deg | Trans: 1331mm
+    R@5deg_1m: 36.8%  (rot=92.9%, trans=37.9%)
+    R@10deg_2m: 69.2%  (rot=99.5%, trans=69.8%)
+    R@15deg_5m: 92.9%  (rot=100.0%, trans=92.9%)
+    R@25deg_5m: 92.9%  (rot=100.0%, trans=92.9%)
+    Retrieval: R@10/2=20.9% R@5/1=2.2%
+Traceback (most recent call last):
+  File "/root/ICLPose-loc/feature_retrieval/advanced_ensemble.py", line 639, in <module>
+    main()
+  File "/root/ICLPose-loc/feature_retrieval/advanced_ensemble.py", line 494, in main
+    ens_t, ens_r = ensemble_weighted(all_trans, all_rot, weights_inv)
+  File "/root/ICLPose-loc/feature_retrieval/advanced_ensemble.py", line 249, in ensemble_weighted
+    ens_trans = (stacked * w.view(-1, 1, 1)).sum(dim=0)
+RuntimeError: Expected all tensors to be on the same device, but found at least two devices, cuda:5 and cpu!
+=== ENSEMBLE ANALYSIS DONE ===

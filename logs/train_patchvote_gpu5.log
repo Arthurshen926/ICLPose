@@ -1,0 +1,39 @@
+=== exp23d_patchvote_long_seed314 ===
+Random seed: 314
+Using device: cuda:5
+
+Loading data (fine=True, coarse=True, summary_broadcast=False)...
+/root/miniconda3/envs/iclpose/lib/python3.9/site-packages/torch/_utils.py:776: UserWarning: TypedStorage is deprecated. It will be removed in the future and UntypedStorage will be the only storage class. This should only matter to you if you are using storages directly.  To access UntypedStorage directly, use tensor.untyped_storage() instead of tensor.storage()
+  return self.fget.__get__(instance, owner)()
+  Loaded fine_geo: torch.Size([895, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([895, 128, 68, 120])
+  [train] 895 images, 8160 patches/image, 7303200 total patches
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  [test] 182 images, 8160 patches/image, 1485120 total patches
+Translation norm: mean=[13.19548    -0.64731836 23.103329  ], std=[10.827089    0.94348246  9.766839  ]
+Model: input_dim=258, params=299,785
+[    1/500] loss=6.6696 (t=5.1206 r=1.5506 β=1.00) | val: 65.87deg/46453mm | R@10/2m=0.0% R@5/1m=0.0% | 27.5s
+[   20/500] loss=2.2555 (t=1.7261 r=0.5402 β=0.98) | val: 26.70deg/12488mm | R@10/2m=0.0% R@5/1m=0.0% | 86.6s
+[   40/500] loss=1.4924 (t=1.0188 r=0.4933 β=0.96) | val: 24.59deg/12134mm | R@10/2m=1.1% R@5/1m=0.0% | 143.5s
+[   60/500] loss=1.1469 (t=0.7122 r=0.4624 β=0.94) | val: 22.50deg/9938mm | R@10/2m=1.1% R@5/1m=0.0% | 198.8s
+[   80/500] loss=0.9491 (t=0.5574 r=0.4258 β=0.92) | val: 19.57deg/7860mm | R@10/2m=2.7% R@5/1m=0.0% | 257.0s
+[  100/500] loss=0.8182 (t=0.4520 r=0.4069 β=0.90) | val: 15.88deg/6639mm | R@10/2m=2.7% R@5/1m=0.0% | 315.8s
+[  120/500] loss=0.7323 (t=0.3986 r=0.3793 β=0.88) | val: 13.36deg/6411mm | R@10/2m=2.2% R@5/1m=0.0% | 373.1s
+[  140/500] loss=0.6272 (t=0.3365 r=0.3380 β=0.86) | val: 11.26deg/6627mm | R@10/2m=2.2% R@5/1m=0.0% | 429.4s
+[  160/500] loss=0.5897 (t=0.3103 r=0.3326 β=0.84) | val: 9.77deg/5326mm | R@10/2m=4.4% R@5/1m=0.0% | 485.0s
+[  180/500] loss=0.5597 (t=0.2900 r=0.3289 β=0.82) | val: 9.59deg/5001mm | R@10/2m=5.5% R@5/1m=0.0% | 541.1s
+[  200/500] loss=0.5167 (t=0.2606 r=0.3201 β=0.80) | val: 9.10deg/4544mm | R@10/2m=6.0% R@5/1m=0.0% | 597.1s
+[  220/500] loss=0.4713 (t=0.2401 r=0.2964 β=0.78) | val: 9.20deg/4115mm | R@10/2m=8.8% R@5/1m=0.0% | 655.1s
+[  240/500] loss=0.4453 (t=0.2276 r=0.2864 β=0.76) | val: 8.84deg/4288mm | R@10/2m=7.1% R@5/1m=0.5% | 710.9s
+[  260/500] loss=0.4377 (t=0.2303 r=0.2802 β=0.74) | val: 8.77deg/4150mm | R@10/2m=9.3% R@5/1m=0.0% | 771.7s
+[  280/500] loss=0.4016 (t=0.2060 r=0.2717 β=0.72) | val: 8.53deg/3661mm | R@10/2m=13.2% R@5/1m=0.0% | 832.3s
+[  300/500] loss=0.3921 (t=0.2067 r=0.2649 β=0.70) | val: 8.38deg/3765mm | R@10/2m=12.1% R@5/1m=0.5% | 890.2s
+[  320/500] loss=0.3774 (t=0.1983 r=0.2634 β=0.68) | val: 8.33deg/3757mm | R@10/2m=13.2% R@5/1m=0.0% | 947.8s
+[  340/500] loss=0.3775 (t=0.2026 r=0.2650 β=0.66) | val: 8.32deg/4030mm | R@10/2m=8.2% R@5/1m=0.0% | 1005.1s
+[  360/500] loss=0.3624 (t=0.1967 r=0.2589 β=0.64) | val: 8.32deg/3710mm | R@10/2m=12.1% R@5/1m=1.1% | 1063.0s
+[  380/500] loss=0.3605 (t=0.1956 r=0.2659 β=0.62) | val: 8.32deg/3736mm | R@10/2m=12.1% R@5/1m=0.5% | 1122.9s
+[  400/500] loss=0.3463 (t=0.1892 r=0.2617 β=0.60) | val: 8.37deg/3618mm | R@10/2m=13.7% R@5/1m=0.5% | 1182.4s
+[  420/500] loss=0.3461 (t=0.1885 r=0.2717 β=0.58) | val: 8.32deg/3589mm | R@10/2m=14.8% R@5/1m=0.5% | 1235.4s
+[  440/500] loss=0.3351 (t=0.1894 r=0.2602 β=0.56) | val: 8.36deg/3596mm | R@10/2m=14.8% R@5/1m=0.5% | 1296.7s
+[  460/500] loss=0.3433 (t=0.1938 r=0.2768 β=0.54) | val: 8.36deg/3585mm | R@10/2m=14.3% R@5/1m=0.5% | 1352.4s

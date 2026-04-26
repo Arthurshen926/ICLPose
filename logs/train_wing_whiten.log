@@ -1,0 +1,421 @@
+============================================================
+Wing Loss + Whitening Experiments on GPU 3
+============================================================
+=== exp16d_128d_spp_wing_seed314 ===
+======================================================================
+Experiment: exp16d_128d_spp_wing_seed314
+Pool: spp, Features: both+sum
+======================================================================
+Random seed: 314
+Using device: cuda:3
+
+Loading data (fine=True, coarse=True, summary=True)...
+  Loaded fine_geo: torch.Size([895, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([895, 128, 68, 120])
+  Loaded summary: torch.Size([895, 2560])
+  [train] 895 samples loaded
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+Translation norm: mean=[13.19548    -0.64731836 23.103329  ], std=[10.827089    0.94348246  9.766839  ]
+  Feature dim after pooling: 7936
+Model parameters: 18,905,610
+
+Pre-computing pooled features (OOM-safe mode)...
+  Pre-computed pooled features: torch.Size([895, 7936]) (28.4 MB)
+  Pre-computed pooled features: torch.Size([182, 7936]) (5.8 MB)
+  GPU memory freed. Training with pre-pooled features (7936d)
+Model parameters: 18,905,610
+[    1/5000] loss=5.7519 (t=3.5522 r=2.1997 beta=1.00) | val: 49.88deg/8439mm | 0.2s
+[  100/5000] loss=0.9684 (t=0.8583 r=0.1180 beta=0.93) | val: 6.32deg/2503mm | 3.2s
+[  200/5000] loss=0.5805 (t=0.5178 r=0.0706 beta=0.89) | val: 4.76deg/1683mm | 5.7s
+[  300/5000] loss=0.4603 (t=0.4123 r=0.0562 beta=0.85) | val: 4.10deg/1812mm | 6.6s
+[  400/5000] loss=0.4435 (t=0.4039 r=0.0481 beta=0.82) | val: 3.40deg/1864mm | 7.5s
+[  500/5000] loss=0.3785 (t=0.3431 r=0.0444 beta=0.80) | val: 2.78deg/1813mm | 8.8s
+[  600/5000] loss=0.3573 (t=0.3253 r=0.0415 beta=0.77) | val: 2.77deg/1657mm | 10.1s
+[  700/5000] loss=0.3118 (t=0.2827 r=0.0391 beta=0.74) | val: 2.49deg/2030mm | 11.0s
+[  800/5000] loss=0.3054 (t=0.2787 r=0.0372 beta=0.72) | val: 2.45deg/1565mm | 11.9s
+[  900/5000] loss=0.2852 (t=0.2597 r=0.0367 beta=0.69) | val: 2.50deg/1723mm | 12.7s
+[ 1000/5000] loss=0.2596 (t=0.2353 r=0.0361 beta=0.67) | val: 2.66deg/1598mm | 13.6s
+[ 1100/5000] loss=0.2596 (t=0.2363 r=0.0357 beta=0.65) | val: 2.60deg/1775mm | 14.5s
+[ 1200/5000] loss=0.2491 (t=0.2267 r=0.0356 beta=0.63) | val: 2.47deg/1796mm | 15.4s
+[ 1300/5000] loss=0.2342 (t=0.2129 r=0.0351 beta=0.61) | val: 2.37deg/1851mm | 16.3s
+[ 1400/5000] loss=0.2469 (t=0.2268 r=0.0342 beta=0.59) | val: 2.41deg/1959mm | 17.2s
+[ 1500/5000] loss=0.2264 (t=0.2066 r=0.0349 beta=0.57) | val: 2.61deg/1829mm | 18.1s
+[ 1600/5000] loss=0.2272 (t=0.2083 r=0.0346 beta=0.55) | val: 2.66deg/1778mm | 19.0s
+[ 1700/5000] loss=0.2168 (t=0.1989 r=0.0340 beta=0.53) | val: 2.55deg/1740mm | 19.8s
+[ 1800/5000] loss=0.2290 (t=0.2115 r=0.0345 beta=0.51) | val: 2.35deg/1620mm | 20.7s
+[ 1900/5000] loss=0.2188 (t=0.2019 r=0.0346 beta=0.49) | val: 2.77deg/1773mm | 21.6s
+[ 2000/5000] loss=0.2120 (t=0.1957 r=0.0346 beta=0.47) | val: 2.60deg/1775mm | 22.5s
+[ 2100/5000] loss=0.2072 (t=0.1917 r=0.0340 beta=0.45) | val: 2.35deg/1798mm | 23.4s
+[ 2200/5000] loss=0.2119 (t=0.1973 r=0.0333 beta=0.44) | val: 2.58deg/1999mm | 24.3s
+[ 2300/5000] loss=0.2053 (t=0.1909 r=0.0342 beta=0.42) | val: 2.55deg/1881mm | 25.2s
+[ 2400/5000] loss=0.2103 (t=0.1967 r=0.0336 beta=0.41) | val: 2.58deg/1951mm | 26.1s
+[ 2500/5000] loss=0.1967 (t=0.1838 r=0.0327 beta=0.39) | val: 2.33deg/1920mm | 27.0s
+[ 2600/5000] loss=0.2075 (t=0.1944 r=0.0344 beta=0.38) | val: 2.48deg/1911mm | 27.8s
+[ 2700/5000] loss=0.1909 (t=0.1784 r=0.0338 beta=0.37) | val: 2.38deg/1797mm | 28.7s
+[ 2800/5000] loss=0.2081 (t=0.1951 r=0.0363 beta=0.36) | val: 2.70deg/1946mm | 29.6s
+[ 2900/5000] loss=0.1850 (t=0.1732 r=0.0341 beta=0.35) | val: 2.49deg/1899mm | 30.5s
+[ 3000/5000] loss=0.1850 (t=0.1737 r=0.0333 beta=0.34) | val: 2.74deg/1899mm | 31.4s
+[ 3100/5000] loss=0.1874 (t=0.1764 r=0.0333 beta=0.33) | val: 2.58deg/1954mm | 32.3s
+[ 3200/5000] loss=0.1806 (t=0.1697 r=0.0340 beta=0.32) | val: 2.53deg/1910mm | 33.2s
+[ 3300/5000] loss=0.1837 (t=0.1730 r=0.0341 beta=0.31) | val: 2.52deg/1953mm | 34.1s
+[ 3400/5000] loss=0.1770 (t=0.1668 r=0.0335 beta=0.30) | val: 2.69deg/1852mm | 35.0s
+[ 3500/5000] loss=0.1813 (t=0.1711 r=0.0340 beta=0.30) | val: 2.43deg/1881mm | 35.9s
+[ 3600/5000] loss=0.1823 (t=0.1725 r=0.0335 beta=0.29) | val: 2.67deg/1896mm | 36.8s
+[ 3700/5000] loss=0.1781 (t=0.1684 r=0.0338 beta=0.29) | val: 2.61deg/1949mm | 37.7s
+[ 3800/5000] loss=0.1717 (t=0.1621 r=0.0341 beta=0.28) | val: 2.61deg/1925mm | 38.6s
+[ 3900/5000] loss=0.1708 (t=0.1611 r=0.0343 beta=0.28) | val: 2.58deg/2002mm | 39.5s
+[ 4000/5000] loss=0.1724 (t=0.1632 r=0.0332 beta=0.28) | val: 2.60deg/1895mm | 40.4s
+[ 4100/5000] loss=0.1677 (t=0.1584 r=0.0341 beta=0.27) | val: 2.62deg/2008mm | 41.4s
+[ 4200/5000] loss=0.1650 (t=0.1559 r=0.0336 beta=0.27) | val: 2.66deg/1922mm | 42.3s
+[ 4300/5000] loss=0.1636 (t=0.1546 r=0.0334 beta=0.27) | val: 2.60deg/1918mm | 43.2s
+[ 4400/5000] loss=0.1617 (t=0.1526 r=0.0338 beta=0.27) | val: 2.60deg/1943mm | 44.1s
+[ 4500/5000] loss=0.1619 (t=0.1529 r=0.0338 beta=0.27) | val: 2.65deg/1962mm | 45.0s
+[ 4600/5000] loss=0.1671 (t=0.1580 r=0.0344 beta=0.27) | val: 2.61deg/1940mm | 45.9s
+[ 4700/5000] loss=0.1661 (t=0.1572 r=0.0332 beta=0.27) | val: 2.65deg/1980mm | 46.8s
+[ 4800/5000] loss=0.1623 (t=0.1532 r=0.0340 beta=0.27) | val: 2.66deg/1967mm | 47.7s
+[ 4900/5000] loss=0.1628 (t=0.1537 r=0.0342 beta=0.27) | val: 2.66deg/1989mm | 48.5s
+[ 5000/5000] loss=0.1606 (t=0.1518 r=0.0333 beta=0.27) | val: 2.67deg/1962mm | 49.4s
+
+Training done. Best epoch: 590, score: 1.7195
+
+Loaded best model from epoch 590
+
+======================================================================
+EVALUATION RESULTS (Direct Regression)
+======================================================================
+Rotation  (median): 2.60deg
+Translation (median): 1483mm
+
+  R@5deg_1m: 34.1%  (rot_pass=81.9%, trans_pass=34.6%)
+  R@10deg_2m: 64.3%  (rot_pass=97.3%, trans_pass=65.4%)
+  R@15deg_5m: 89.6%  (rot_pass=99.5%, trans_pass=90.1%)
+  R@25deg_5m: 90.1%  (rot_pass=100.0%, trans_pass=90.1%)
+
+======================================================================
+EVALUATION RESULTS (Retrieval Mode)
+======================================================================
+Retrieval median: 11.77deg / 2411mm
+  R@5deg_1m: 1.6%  (rot=3.8%, trans=17.0%)
+  R@10deg_2m: 16.5%  (rot=38.5%, trans=42.9%)
+  R@15deg_5m: 54.4%  (rot=69.8%, trans=83.5%)
+  R@25deg_5m: 81.9%  (rot=97.8%, trans=83.5%)
+======================================================================
+
+Done!
+--- exp16d_128d_spp_wing_seed314 done ---
+
+=== exp16d_128d_spp_wing_seed123 ===
+======================================================================
+Experiment: exp16d_128d_spp_wing_seed123
+Pool: spp, Features: both+sum
+======================================================================
+Random seed: 123
+Using device: cuda:3
+
+Loading data (fine=True, coarse=True, summary=True)...
+  Loaded fine_geo: torch.Size([895, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([895, 128, 68, 120])
+  Loaded summary: torch.Size([895, 2560])
+  [train] 895 samples loaded
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+Translation norm: mean=[13.19548    -0.64731836 23.103329  ], std=[10.827089    0.94348246  9.766839  ]
+  Feature dim after pooling: 7936
+Model parameters: 18,905,610
+
+Pre-computing pooled features (OOM-safe mode)...
+  Pre-computed pooled features: torch.Size([895, 7936]) (28.4 MB)
+  Pre-computed pooled features: torch.Size([182, 7936]) (5.8 MB)
+  GPU memory freed. Training with pre-pooled features (7936d)
+Model parameters: 18,905,610
+[    1/5000] loss=5.2566 (t=3.5613 r=1.6953 beta=1.00) | val: 27.68deg/24738mm | 0.2s
+[  100/5000] loss=0.7407 (t=0.6408 r=0.1081 beta=0.92) | val: 6.32deg/2530mm | 4.0s
+[  200/5000] loss=0.5384 (t=0.4797 r=0.0668 beta=0.88) | val: 4.40deg/1820mm | 5.6s
+[  300/5000] loss=0.5452 (t=0.4926 r=0.0625 beta=0.84) | val: 4.15deg/1943mm | 6.9s
+[  400/5000] loss=0.3865 (t=0.3486 r=0.0473 beta=0.80) | val: 3.34deg/1601mm | 8.6s
+[  500/5000] loss=0.3520 (t=0.3169 r=0.0455 beta=0.77) | val: 2.52deg/1598mm | 9.8s
+[  600/5000] loss=0.3071 (t=0.2766 r=0.0411 beta=0.74) | val: 2.55deg/1600mm | 11.4s
+[  700/5000] loss=0.3352 (t=0.3052 r=0.0422 beta=0.71) | val: 2.60deg/1872mm | 12.6s
+[  800/5000] loss=0.2757 (t=0.2498 r=0.0381 beta=0.68) | val: 2.52deg/1763mm | 13.5s
+[  900/5000] loss=0.2850 (t=0.2599 r=0.0384 beta=0.65) | val: 2.58deg/2190mm | 14.4s
+[ 1000/5000] loss=0.2447 (t=0.2217 r=0.0365 beta=0.63) | val: 2.35deg/1718mm | 15.3s
+[ 1100/5000] loss=0.2539 (t=0.2322 r=0.0360 beta=0.60) | val: 2.35deg/1904mm | 16.3s
+[ 1200/5000] loss=0.2466 (t=0.2256 r=0.0362 beta=0.58) | val: 2.36deg/1646mm | 17.1s
+[ 1300/5000] loss=0.3045 (t=0.2839 r=0.0370 beta=0.56) | val: 2.37deg/1863mm | 18.0s
+[ 1400/5000] loss=0.2367 (t=0.2179 r=0.0354 beta=0.53) | val: 2.30deg/1768mm | 18.9s
+[ 1500/5000] loss=0.2449 (t=0.2267 r=0.0358 beta=0.51) | val: 2.37deg/1906mm | 19.8s
+[ 1600/5000] loss=0.2145 (t=0.1971 r=0.0357 beta=0.49) | val: 2.44deg/1878mm | 20.7s
+[ 1700/5000] loss=0.2346 (t=0.2174 r=0.0369 beta=0.47) | val: 2.51deg/1911mm | 21.6s
+[ 1800/5000] loss=0.2163 (t=0.2008 r=0.0346 beta=0.45) | val: 2.60deg/2028mm | 22.5s
+[ 1900/5000] loss=0.2131 (t=0.1977 r=0.0358 beta=0.43) | val: 2.63deg/2040mm | 23.4s
+[ 2000/5000] loss=0.1994 (t=0.1850 r=0.0345 beta=0.42) | val: 2.54deg/1952mm | 24.3s
+[ 2100/5000] loss=0.2194 (t=0.2050 r=0.0360 beta=0.40) | val: 2.63deg/1981mm | 25.2s
+[ 2200/5000] loss=0.2078 (t=0.1943 r=0.0353 beta=0.38) | val: 2.57deg/1805mm | 26.1s
+[ 2300/5000] loss=0.2081 (t=0.1951 r=0.0353 beta=0.37) | val: 2.42deg/1745mm | 26.9s
+[ 2400/5000] loss=0.1953 (t=0.1827 r=0.0353 beta=0.36) | val: 2.47deg/2057mm | 27.8s
+[ 2500/5000] loss=0.2062 (t=0.1938 r=0.0362 beta=0.34) | val: 2.65deg/1960mm | 28.7s
+[ 2600/5000] loss=0.2072 (t=0.1957 r=0.0350 beta=0.33) | val: 2.46deg/1820mm | 29.6s
+[ 2700/5000] loss=0.1882 (t=0.1769 r=0.0355 beta=0.32) | val: 2.64deg/1977mm | 30.5s
+[ 2800/5000] loss=0.1870 (t=0.1761 r=0.0351 beta=0.31) | val: 2.60deg/1930mm | 31.4s
+[ 2900/5000] loss=0.1834 (t=0.1732 r=0.0339 beta=0.30) | val: 2.58deg/1779mm | 32.3s
+[ 3000/5000] loss=0.1771 (t=0.1667 r=0.0357 beta=0.29) | val: 2.47deg/1852mm | 33.2s
+[ 3100/5000] loss=0.1786 (t=0.1687 r=0.0351 beta=0.28) | val: 2.51deg/1865mm | 34.1s
+[ 3200/5000] loss=0.1727 (t=0.1633 r=0.0345 beta=0.27) | val: 2.59deg/1960mm | 34.7s
+[ 3300/5000] loss=0.1807 (t=0.1712 r=0.0352 beta=0.27) | val: 2.49deg/1988mm | 35.4s
+[ 3400/5000] loss=0.1817 (t=0.1725 r=0.0350 beta=0.26) | val: 2.60deg/1951mm | 36.1s
+[ 3500/5000] loss=0.1720 (t=0.1630 r=0.0349 beta=0.26) | val: 2.68deg/2002mm | 36.9s
+[ 3600/5000] loss=0.1735 (t=0.1649 r=0.0343 beta=0.25) | val: 2.56deg/1911mm | 37.7s
+[ 3700/5000] loss=0.1686 (t=0.1599 r=0.0349 beta=0.25) | val: 2.48deg/2002mm | 38.4s
+[ 3800/5000] loss=0.1698 (t=0.1612 r=0.0353 beta=0.24) | val: 2.70deg/1857mm | 39.1s
+[ 3900/5000] loss=0.1663 (t=0.1580 r=0.0346 beta=0.24) | val: 2.54deg/1964mm | 39.9s
+[ 4000/5000] loss=0.1638 (t=0.1554 r=0.0351 beta=0.24) | val: 2.64deg/1888mm | 40.5s
+[ 4100/5000] loss=0.1660 (t=0.1577 r=0.0351 beta=0.24) | val: 2.61deg/1941mm | 41.3s
+[ 4200/5000] loss=0.1679 (t=0.1597 r=0.0350 beta=0.23) | val: 2.68deg/1939mm | 42.0s
+[ 4300/5000] loss=0.1634 (t=0.1554 r=0.0343 beta=0.23) | val: 2.53deg/1910mm | 42.7s
+[ 4400/5000] loss=0.1637 (t=0.1555 r=0.0357 beta=0.23) | val: 2.56deg/1941mm | 43.4s
+[ 4500/5000] loss=0.1616 (t=0.1537 r=0.0344 beta=0.23) | val: 2.56deg/1977mm | 44.1s
+[ 4600/5000] loss=0.1627 (t=0.1547 r=0.0352 beta=0.23) | val: 2.55deg/1906mm | 44.8s
+[ 4700/5000] loss=0.1632 (t=0.1550 r=0.0356 beta=0.23) | val: 2.58deg/1985mm | 45.5s
+[ 4800/5000] loss=0.1649 (t=0.1570 r=0.0346 beta=0.23) | val: 2.57deg/1951mm | 46.2s
+[ 4900/5000] loss=0.1652 (t=0.1572 r=0.0347 beta=0.23) | val: 2.56deg/1961mm | 46.9s
+[ 5000/5000] loss=0.1628 (t=0.1550 r=0.0342 beta=0.23) | val: 2.56deg/1972mm | 47.7s
+
+Training done. Best epoch: 640, score: 1.8028
+
+Loaded best model from epoch 640
+
+======================================================================
+EVALUATION RESULTS (Direct Regression)
+======================================================================
+Rotation  (median): 2.45deg
+Translation (median): 1595mm
+
+  R@5deg_1m: 28.0%  (rot_pass=84.6%, trans_pass=28.0%)
+  R@10deg_2m: 59.3%  (rot_pass=98.4%, trans_pass=60.4%)
+  R@15deg_5m: 89.0%  (rot_pass=99.5%, trans_pass=89.6%)
+  R@25deg_5m: 89.6%  (rot_pass=100.0%, trans_pass=89.6%)
+
+======================================================================
+EVALUATION RESULTS (Retrieval Mode)
+======================================================================
+Retrieval median: 11.39deg / 2668mm
+  R@5deg_1m: 2.2%  (rot=3.8%, trans=14.8%)
+  R@10deg_2m: 19.8%  (rot=40.7%, trans=41.2%)
+  R@15deg_5m: 54.9%  (rot=69.2%, trans=84.6%)
+  R@25deg_5m: 82.4%  (rot=96.7%, trans=84.6%)
+======================================================================
+
+Done!
+--- exp16d_128d_spp_wing_seed123 done ---
+
+=== exp16d_128d_spp_wing_seed456 ===
+======================================================================
+Experiment: exp16d_128d_spp_wing_seed456
+Pool: spp, Features: both+sum
+======================================================================
+Random seed: 456
+Using device: cuda:3
+
+Loading data (fine=True, coarse=True, summary=True)...
+  Loaded fine_geo: torch.Size([895, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([895, 128, 68, 120])
+  Loaded summary: torch.Size([895, 2560])
+  [train] 895 samples loaded
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+Translation norm: mean=[13.19548    -0.64731836 23.103329  ], std=[10.827089    0.94348246  9.766839  ]
+  Feature dim after pooling: 7936
+Model parameters: 18,905,610
+
+Pre-computing pooled features (OOM-safe mode)...
+  Pre-computed pooled features: torch.Size([895, 7936]) (28.4 MB)
+  Pre-computed pooled features: torch.Size([182, 7936]) (5.8 MB)
+  GPU memory freed. Training with pre-pooled features (7936d)
+Model parameters: 18,905,610
+[    1/5000] loss=5.6901 (t=3.5858 r=2.1043 beta=1.00) | val: 29.16deg/14153mm | 0.2s
+[  100/5000] loss=0.8447 (t=0.7333 r=0.1204 beta=0.93) | val: 6.28deg/1983mm | 3.2s
+[  200/5000] loss=0.5911 (t=0.5295 r=0.0696 beta=0.89) | val: 4.56deg/2427mm | 4.9s
+[  300/5000] loss=0.6351 (t=0.5821 r=0.0620 beta=0.85) | val: 4.06deg/2381mm | 6.6s
+[  400/5000] loss=0.4218 (t=0.3817 r=0.0488 beta=0.82) | val: 3.25deg/1849mm | 7.9s
+[  500/5000] loss=0.4016 (t=0.3627 r=0.0489 beta=0.79) | val: 3.21deg/2207mm | 9.2s
+[  600/5000] loss=0.3792 (t=0.3443 r=0.0456 beta=0.77) | val: 2.71deg/1865mm | 10.1s
+[  700/5000] loss=0.2916 (t=0.2627 r=0.0390 beta=0.74) | val: 2.46deg/1816mm | 11.0s
+[  800/5000] loss=0.2742 (t=0.2472 r=0.0377 beta=0.72) | val: 2.35deg/1691mm | 11.9s
+[  900/5000] loss=0.2794 (t=0.2534 r=0.0374 beta=0.69) | val: 2.32deg/1474mm | 12.7s
+[ 1000/5000] loss=0.2635 (t=0.2385 r=0.0372 beta=0.67) | val: 2.63deg/1802mm | 13.6s
+[ 1100/5000] loss=0.2674 (t=0.2443 r=0.0355 beta=0.65) | val: 2.46deg/1717mm | 14.6s
+[ 1200/5000] loss=0.2613 (t=0.2394 r=0.0350 beta=0.62) | val: 2.29deg/1628mm | 15.4s
+[ 1300/5000] loss=0.2371 (t=0.2167 r=0.0341 beta=0.60) | val: 2.16deg/1779mm | 16.3s
+[ 1400/5000] loss=0.2339 (t=0.2138 r=0.0349 beta=0.58) | val: 2.44deg/1742mm | 17.3s
+[ 1500/5000] loss=0.2225 (t=0.2033 r=0.0345 beta=0.56) | val: 2.28deg/1793mm | 18.1s
+[ 1600/5000] loss=0.2340 (t=0.2158 r=0.0339 beta=0.54) | val: 2.35deg/1955mm | 19.0s
+[ 1700/5000] loss=0.2277 (t=0.2101 r=0.0341 beta=0.52) | val: 2.18deg/1755mm | 19.9s
+[ 1800/5000] loss=0.2113 (t=0.1949 r=0.0330 beta=0.50) | val: 2.50deg/1906mm | 20.8s
+[ 1900/5000] loss=0.2374 (t=0.2202 r=0.0358 beta=0.48) | val: 2.52deg/1661mm | 21.7s
+[ 2000/5000] loss=0.2043 (t=0.1886 r=0.0339 beta=0.46) | val: 2.35deg/1848mm | 22.6s
+[ 2100/5000] loss=0.2093 (t=0.1943 r=0.0336 beta=0.44) | val: 2.55deg/1913mm | 23.5s
+[ 2200/5000] loss=0.2012 (t=0.1871 r=0.0330 beta=0.43) | val: 2.46deg/1826mm | 24.4s
+[ 2300/5000] loss=0.2206 (t=0.2063 r=0.0346 beta=0.41) | val: 2.52deg/1943mm | 25.3s
+[ 2400/5000] loss=0.2042 (t=0.1909 r=0.0334 beta=0.40) | val: 2.45deg/1793mm | 26.2s
+[ 2500/5000] loss=0.1919 (t=0.1789 r=0.0336 beta=0.38) | val: 2.29deg/1795mm | 27.1s
+[ 2600/5000] loss=0.1971 (t=0.1847 r=0.0333 beta=0.37) | val: 2.45deg/1868mm | 28.0s
+[ 2700/5000] loss=0.2032 (t=0.1910 r=0.0339 beta=0.36) | val: 2.46deg/1859mm | 28.9s
+[ 2800/5000] loss=0.1989 (t=0.1871 r=0.0338 beta=0.35) | val: 2.54deg/1836mm | 29.8s
+[ 2900/5000] loss=0.1872 (t=0.1759 r=0.0335 beta=0.34) | val: 2.59deg/1946mm | 30.7s
+[ 3000/5000] loss=0.1898 (t=0.1786 r=0.0342 beta=0.33) | val: 2.48deg/1798mm | 31.6s
+[ 3100/5000] loss=0.1825 (t=0.1715 r=0.0342 beta=0.32) | val: 2.53deg/1872mm | 32.5s
+[ 3200/5000] loss=0.1817 (t=0.1714 r=0.0331 beta=0.31) | val: 2.51deg/1834mm | 33.4s
+[ 3300/5000] loss=0.1754 (t=0.1654 r=0.0328 beta=0.31) | val: 2.39deg/1815mm | 34.3s
+[ 3400/5000] loss=0.1743 (t=0.1642 r=0.0338 beta=0.30) | val: 2.62deg/1847mm | 35.2s
+[ 3500/5000] loss=0.1804 (t=0.1706 r=0.0334 beta=0.29) | val: 2.47deg/1903mm | 36.1s
+[ 3600/5000] loss=0.1761 (t=0.1665 r=0.0335 beta=0.29) | val: 2.57deg/1871mm | 37.0s
+[ 3700/5000] loss=0.1686 (t=0.1592 r=0.0332 beta=0.28) | val: 2.67deg/1983mm | 37.9s
+[ 3800/5000] loss=0.1710 (t=0.1617 r=0.0335 beta=0.28) | val: 2.65deg/1840mm | 38.8s
+[ 3900/5000] loss=0.1706 (t=0.1615 r=0.0329 beta=0.28) | val: 2.67deg/1834mm | 39.7s
+[ 4000/5000] loss=0.1678 (t=0.1586 r=0.0337 beta=0.27) | val: 2.59deg/1876mm | 40.6s
+[ 4100/5000] loss=0.1721 (t=0.1632 r=0.0332 beta=0.27) | val: 2.64deg/1822mm | 41.5s
+[ 4200/5000] loss=0.1711 (t=0.1624 r=0.0324 beta=0.27) | val: 2.69deg/1861mm | 42.4s
+[ 4300/5000] loss=0.1671 (t=0.1581 r=0.0336 beta=0.27) | val: 2.69deg/1855mm | 43.3s
+[ 4400/5000] loss=0.1616 (t=0.1528 r=0.0334 beta=0.26) | val: 2.62deg/1852mm | 44.2s
+[ 4500/5000] loss=0.1622 (t=0.1533 r=0.0338 beta=0.26) | val: 2.61deg/1847mm | 45.1s
+[ 4600/5000] loss=0.1615 (t=0.1528 r=0.0331 beta=0.26) | val: 2.64deg/1857mm | 46.0s
+[ 4700/5000] loss=0.1657 (t=0.1572 r=0.0324 beta=0.26) | val: 2.68deg/1864mm | 46.9s
+[ 4800/5000] loss=0.1636 (t=0.1548 r=0.0335 beta=0.26) | val: 2.63deg/1843mm | 47.9s
+[ 4900/5000] loss=0.1654 (t=0.1567 r=0.0332 beta=0.26) | val: 2.63deg/1854mm | 48.7s
+[ 5000/5000] loss=0.1654 (t=0.1567 r=0.0332 beta=0.26) | val: 2.63deg/1843mm | 49.7s
+
+Training done. Best epoch: 420, score: 1.6789
+
+Loaded best model from epoch 420
+
+======================================================================
+EVALUATION RESULTS (Direct Regression)
+======================================================================
+Rotation  (median): 2.98deg
+Translation (median): 1389mm
+
+  R@5deg_1m: 31.3%  (rot_pass=76.9%, trans_pass=35.7%)
+  R@10deg_2m: 63.2%  (rot_pass=97.3%, trans_pass=64.3%)
+  R@15deg_5m: 91.2%  (rot_pass=99.5%, trans_pass=91.8%)
+  R@25deg_5m: 91.8%  (rot_pass=100.0%, trans_pass=91.8%)
+
+======================================================================
+EVALUATION RESULTS (Retrieval Mode)
+======================================================================
+Retrieval median: 11.87deg / 2619mm
+  R@5deg_1m: 3.8%  (rot=6.6%, trans=19.8%)
+  R@10deg_2m: 19.8%  (rot=39.6%, trans=43.4%)
+  R@15deg_5m: 57.1%  (rot=68.7%, trans=86.8%)
+  R@25deg_5m: 84.1%  (rot=96.2%, trans=86.8%)
+======================================================================
+
+Done!
+--- exp16d_128d_spp_wing_seed456 done ---
+
+=== exp17a_128d_spp_whiten_seed314 ===
+Traceback (most recent call last):
+  File "/root/miniconda3/envs/iclpose/lib/python3.9/runpy.py", line 197, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/root/miniconda3/envs/iclpose/lib/python3.9/runpy.py", line 87, in _run_code
+    exec(code, run_globals)
+  File "/root/ICLPose-loc/feature_retrieval/patch_regressor_v7.py", line 1224, in <module>
+    main()
+  File "/root/ICLPose-loc/feature_retrieval/patch_regressor_v7.py", line 1194, in main
+    ckpt = torch.load(Path(args.output_dir) / 'model_best.pt',
+  File "/root/miniconda3/envs/iclpose/lib/python3.9/site-packages/torch/serialization.py", line 791, in load
+    with _open_file_like(f, 'rb') as opened_file:
+  File "/root/miniconda3/envs/iclpose/lib/python3.9/site-packages/torch/serialization.py", line 271, in _open_file_like
+    return _open_file(name_or_buffer, mode)
+  File "/root/miniconda3/envs/iclpose/lib/python3.9/site-packages/torch/serialization.py", line 252, in __init__
+    super().__init__(open(name, mode))
+FileNotFoundError: [Errno 2] No such file or directory: 'output/feature_retrieval/pose_regression/exp17a_128d_spp_whiten_seed314/model_best.pt'
+======================================================================
+Experiment: exp17a_128d_spp_whiten_seed314
+Pool: spp, Features: both+sum
+======================================================================
+Random seed: 314
+Using device: cuda:3
+
+Loading data (fine=True, coarse=True, summary=True)...
+  Loaded fine_geo: torch.Size([895, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([895, 128, 68, 120])
+  Loaded summary: torch.Size([895, 2560])
+  [train] 895 samples loaded
+  Loaded fine_geo: torch.Size([182, 128, 68, 120])
+  Loaded coarse_sem: torch.Size([182, 128, 68, 120])
+  Loaded summary: torch.Size([182, 2560])
+  [test] 182 samples loaded
+Translation norm: mean=[13.19548    -0.64731836 23.103329  ], std=[10.827089    0.94348246  9.766839  ]
+  Feature dim after pooling: 7936
+Model parameters: 18,905,610
+
+Pre-computing pooled features (OOM-safe mode)...
+  Pre-computed pooled features: torch.Size([895, 7936]) (28.4 MB)
+  Pre-computed pooled features: torch.Size([182, 7936]) (5.8 MB)
+  GPU memory freed. Training with pre-pooled features (7936d)
+
+Applying PCA whitening to pooled features...
+  Effective rank: nan/7936
+  Top-10 eigenvalue ratio: 65.0%
+  Whitened features: mean=nan, std=nan
+Model parameters: 18,905,610
+[    1/5000] loss=nan (t=nan r=nan beta=1.00) | val: nandeg/nanmm | 0.2s
+[  100/5000] loss=nan (t=nan r=nan beta=nan) | val: nandeg/nanmm | 1.0s
+[  200/5000] loss=nan (t=nan r=nan beta=nan) | val: nandeg/nanmm | 1.8s
+[  300/5000] loss=nan (t=nan r=nan beta=nan) | val: nandeg/nanmm | 2.7s
+[  400/5000] loss=nan (t=nan r=nan beta=nan) | val: nandeg/nanmm | 3.5s
+[  500/5000] loss=nan (t=nan r=nan beta=nan) | val: nandeg/nanmm | 4.4s
+[  600/5000] loss=nan (t=nan r=nan beta=nan) | val: nandeg/nanmm | 5.2s
+[  700/5000] loss=nan (t=nan r=nan beta=nan) | val: nandeg/nanmm | 6.1s
+[  800/5000] loss=nan (t=nan r=nan beta=nan) | val: nandeg/nanmm | 6.9s
+[  900/5000] loss=nan (t=nan r=nan beta=nan) | val: nandeg/nanmm | 7.8s
+[ 1000/5000] loss=nan (t=nan r=nan beta=nan) | val: nandeg/nanmm | 8.6s
+[ 1100/5000] loss=nan (t=nan r=nan beta=nan) | val: nandeg/nanmm | 9.5s
+[ 1200/5000] loss=nan (t=nan r=nan beta=nan) | val: nandeg/nanmm | 10.3s
+[ 1300/5000] loss=nan (t=nan r=nan beta=nan) | val: nandeg/nanmm | 11.2s
+[ 1400/5000] loss=nan (t=nan r=nan beta=nan) | val: nandeg/nanmm | 12.1s
+[ 1500/5000] loss=nan (t=nan r=nan beta=nan) | val: nandeg/nanmm | 13.0s
+[ 1600/5000] loss=nan (t=nan r=nan beta=nan) | val: nandeg/nanmm | 13.8s
+[ 1700/5000] loss=nan (t=nan r=nan beta=nan) | val: nandeg/nanmm | 14.7s
+[ 1800/5000] loss=nan (t=nan r=nan beta=nan) | val: nandeg/nanmm | 15.5s
+[ 1900/5000] loss=nan (t=nan r=nan beta=nan) | val: nandeg/nanmm | 16.4s
+[ 2000/5000] loss=nan (t=nan r=nan beta=nan) | val: nandeg/nanmm | 17.3s
+[ 2100/5000] loss=nan (t=nan r=nan beta=nan) | val: nandeg/nanmm | 18.2s
+[ 2200/5000] loss=nan (t=nan r=nan beta=nan) | val: nandeg/nanmm | 19.0s
+[ 2300/5000] loss=nan (t=nan r=nan beta=nan) | val: nandeg/nanmm | 19.9s
+[ 2400/5000] loss=nan (t=nan r=nan beta=nan) | val: nandeg/nanmm | 20.7s
+[ 2500/5000] loss=nan (t=nan r=nan beta=nan) | val: nandeg/nanmm | 21.6s
+[ 2600/5000] loss=nan (t=nan r=nan beta=nan) | val: nandeg/nanmm | 22.4s
+[ 2700/5000] loss=nan (t=nan r=nan beta=nan) | val: nandeg/nanmm | 23.3s
+[ 2800/5000] loss=nan (t=nan r=nan beta=nan) | val: nandeg/nanmm | 24.1s
+[ 2900/5000] loss=nan (t=nan r=nan beta=nan) | val: nandeg/nanmm | 25.0s
+[ 3000/5000] loss=nan (t=nan r=nan beta=nan) | val: nandeg/nanmm | 25.9s
+[ 3100/5000] loss=nan (t=nan r=nan beta=nan) | val: nandeg/nanmm | 26.8s
+[ 3200/5000] loss=nan (t=nan r=nan beta=nan) | val: nandeg/nanmm | 27.6s
+[ 3300/5000] loss=nan (t=nan r=nan beta=nan) | val: nandeg/nanmm | 28.5s
+[ 3400/5000] loss=nan (t=nan r=nan beta=nan) | val: nandeg/nanmm | 29.3s
+[ 3500/5000] loss=nan (t=nan r=nan beta=nan) | val: nandeg/nanmm | 30.2s
+[ 3600/5000] loss=nan (t=nan r=nan beta=nan) | val: nandeg/nanmm | 31.0s
+[ 3700/5000] loss=nan (t=nan r=nan beta=nan) | val: nandeg/nanmm | 31.7s
+[ 3800/5000] loss=nan (t=nan r=nan beta=nan) | val: nandeg/nanmm | 32.5s
+[ 3900/5000] loss=nan (t=nan r=nan beta=nan) | val: nandeg/nanmm | 33.3s
+[ 4000/5000] loss=nan (t=nan r=nan beta=nan) | val: nandeg/nanmm | 34.2s
+[ 4100/5000] loss=nan (t=nan r=nan beta=nan) | val: nandeg/nanmm | 35.1s
+[ 4200/5000] loss=nan (t=nan r=nan beta=nan) | val: nandeg/nanmm | 35.9s
+[ 4300/5000] loss=nan (t=nan r=nan beta=nan) | val: nandeg/nanmm | 36.8s
+[ 4400/5000] loss=nan (t=nan r=nan beta=nan) | val: nandeg/nanmm | 37.7s
+[ 4500/5000] loss=nan (t=nan r=nan beta=nan) | val: nandeg/nanmm | 38.5s
+[ 4600/5000] loss=nan (t=nan r=nan beta=nan) | val: nandeg/nanmm | 39.4s
+[ 4700/5000] loss=nan (t=nan r=nan beta=nan) | val: nandeg/nanmm | 40.3s
+[ 4800/5000] loss=nan (t=nan r=nan beta=nan) | val: nandeg/nanmm | 41.1s
+[ 4900/5000] loss=nan (t=nan r=nan beta=nan) | val: nandeg/nanmm | 41.9s
+[ 5000/5000] loss=nan (t=nan r=nan beta=nan) | val: nandeg/nanmm | 42.8s
+
+Training done. Best epoch: 0, score: inf
