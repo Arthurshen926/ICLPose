@@ -1,0 +1,1 @@
+../feature_extract/extractors/extractor_dino.py

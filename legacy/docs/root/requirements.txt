@@ -1,0 +1,39 @@
+# Implicit Correspondence Pose Estimation
+# Requirements for training and inference
+
+# Core dependencies
+torch>=2.0.0
+torchvision>=0.15.0
+numpy>=1.24.0
+scipy>=1.10.0
+PyYAML>=6.0
+tqdm>=4.65.0
+pillow>=9.5.0
+opencv-python>=4.7.0
+matplotlib>=3.7.0
+tensorboard>=2.13.0
+
+# Geometry and 3D
+plyfile>=0.7.4
+open3d>=0.17.0
+trimesh>=3.21.0
+
+# Point cloud processing
+scikit-learn>=1.2.0
+
+# Gaussian Splatting dependencies
+diff-gaussian-rasterization>=0.0.0  # Custom package
+simple-knn>=0.0.0  # Custom package
+
+# Additional utilities
+munch>=2.5.0
+einops>=0.6.1
+
+# Development tools (optional)
+pytest>=7.3.0
+black>=23.3.0
+flake8>=6.0.0
+
+# Note: Install custom packages with:
+# pip install submodules/diff-gaussian-rasterization
+# pip install submodules/simple-knn

@@ -1,0 +1,93 @@
+# ============================================================
+#  exp045_oldhospital_conservative_conf.yaml
+#  OldHospital with conservative confidence range [0.2, 0.85]
+#  exp041 diverged with [0.05, 0.95] — outdoor scenes need
+#  conservative confidence to avoid extreme weighting
+#  Otherwise identical to exp041/exp035 settings
+# ============================================================
+
+exp_name: exp045_oldhospital_conservative_conf
+output_dir: output/exp045_oldhospital_conservative_conf
+
+model:
+  hidden_dim: 128
+  decode_dim: 64
+  local_radius: 4
+  damping: 0.001
+  fine_iters: 8
+  mid_iters: 1
+  coarse_hw: [15, 26]
+  mid_hw: [30, 53]
+  fine_hw: [35, 61]
+  coarse_in_dim: 32
+  mid_in_dim: 64
+  fine_sd_in_dim: 64
+  fine_dino_in_dim: 64
+
+renderer:
+  ply_path: output/2dgs_models/OldHospital/v7_depth/point_cloud/iteration_30000/point_cloud.ply
+  scale_model_paths:
+    coarse:    output/feature_3dgs/oldhospital_v1/per_scale/coarse.pth
+    mid:       output/feature_3dgs/oldhospital_v1/per_scale/mid.pth
+    fine_sd:   output/feature_3dgs/oldhospital_v1/per_scale/fine_sd.pth
+    fine_dino: output/feature_3dgs/oldhospital_v1/per_scale/fine_dino.pth
+  img_height: 1080
+  img_width: 1920
+  fx: 1673.5
+  fy: 1673.5
+  cx: 960.0
+  cy: 540.0
+
+data:
+  train_feature_dir: output/features_multiscale_compressed/OldHospital_indexed
+  train_traj_path: output/features_multiscale_compressed/OldHospital_indexed/traj_w_c.txt
+
+  val_feature_dir: null
+  val_traj_path: null
+  val_netvlad_poses: null
+  val_split_ratio: 0.1
+
+  noise_rot_deg: 10.0
+  noise_trans_m: 1.0
+  val_noise_rot_deg: 10.0
+  val_noise_trans_m: 1.0
+
+  batch_size: 2
+  val_batch_size: 2
+  num_workers: 4
+
+training:
+  epochs: 120
+  phase1_epochs: 5
+  lr: 0.0002
+  min_lr: 0.000005
+  weight_decay: 0.00001
+  grad_clip: 1.0
+  use_amp: true
+
+  outer_iters: 3
+  val_outer_iters: 5
+
+  loss:
+    flow_weights:
+      coarse: 0.1
+      mid: 0.3
+      fine: 1.0
+    pose_weight: 1.0
+    rot_weight: 1.0
+    trans_weight: 10.0
+    rot_loss_type: cosine
+    gamma: 0.8
+    gamma_outer: 0.8
+    conf_coverage_range: [0.2, 0.85]
+
+  noise_curriculum:
+    enabled: true
+    warmup_epochs: 40
+    noise_rot_min: 2.0
+    noise_trans_min: 0.1
+
+  pose_warmup:
+    enabled: true
+    warmup_epochs: 8
+    min_weight: 0.1

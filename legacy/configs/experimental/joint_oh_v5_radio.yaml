@@ -1,0 +1,100 @@
+# Joint 2DGS Geometry + RADIO Feature — OldHospital  v5-RADIO
+# ============================================================
+# 全新联合重建: 几何 + RADIO C-RADIOv4-H 特征同步训练
+#   - RADIO local: 64d @ 68×120 (PCA from 1280d, 1077 frames)
+#   - RADIO原始特征: ViT-H/16, patch_size=16, 1280d → PCA → 64d
+#   - 深度监督已启用 (本地深度数据)
+#   - GPU: 1 (~22 GB free)
+#
+# Usage:
+#   CUDA_VISIBLE_DEVICES=1 python -m feature_3dgs.train_2dgs_joint_v3 \
+#     --config configs/joint_oh_v5_radio.yaml
+
+exp_name: joint_oh_v5_radio
+
+dataset:
+  type: cambridge
+  source_dir: dataset/OldHospital
+  images: ''
+  feature_dir: output/features_radio/OldHospital_indexed
+  feature_scales:
+    - fine_radio    # RADIO C-RADIOv4-H PCA-64: 64d @ 68×120
+
+model:
+  sh_degree: 3
+  white_background: false
+  random_background: false
+
+training:
+  iterations: 40000
+  longest_edge: 0           # Full resolution 1920×1080
+  eval_interval: 1000
+  save_interval: 5000
+  vis_frames: [0, 200, 500, 800]
+
+  # Learning rates
+  position_lr_init: 0.00016
+  position_lr_final: 0.0000016
+  feature_lr: 0.0025
+  opacity_lr: 0.05
+  scaling_lr: 0.005
+  rotation_lr: 0.001
+  percent_dense: 0.01
+
+  # Feature embedding
+  feature_embedding_lr: 0.01
+  feature_weight: 0.5
+  feature_cos_weight: 0.5
+  feature_start_iter: 500
+  detach_feat_geometry: false
+
+  # RGB loss
+  lambda_dssim: 0.2
+
+  # 2DGS geometry regularization
+  lambda_normal: 0.05
+  lambda_dist: 0.01
+  lambda_scale: 0.001
+  scale_reg_threshold: 0.3
+  reg_start_iter: 500
+
+  # Monocular depth supervision — ENABLED (local copy)
+  mono_depth_dir: output/oh_depth_local/mono_depth
+  lambda_depth: 0.05
+  depth_start_iter: 3000
+  depth_warmup_iters: 2000
+
+  # Densification
+  densify_from_iter: 500
+  densify_until_iter: 25000
+  densification_interval: 100
+  densify_grad_threshold: 0.0002
+  opacity_reset_interval: 6000
+  opacity_reset_value: 0.01
+  size_threshold: null
+
+  # Sky / object masking
+  use_mask: true
+  mask_path: dataset/OldHospital/masks.pkl
+
+  # AppearanceNetwork
+  use_appearance: true
+  appearance_embed_dim: 32
+  appearance_lr: 0.001
+  appearance_reg: 0.0
+  appearance_mean_reg: 0.01
+
+  # Transient mask
+  use_transient: true
+  transient_lr: 0.001
+  transient_reg: 0.01
+
+  # Semantic-guided regularization
+  semantic_mask_dir: dataset/OldHospital/semantic_masks
+  vegetation_reg_scale: 0.1
+  veg_prune_opacity: 0.0
+
+  # Gradient accumulation
+  grad_accum_steps: 4
+
+output_dir: output/2dgs_joint

@@ -1,0 +1,100 @@
+# DCFF v10b — Coarse fix: larger MLP capacity + full-resolution coarse training
+#
+# Key changes from v10 retrain (baseline):
+#   1. hash_grid.mlp_hidden: 128 → 256 (4x more params)
+#   2. hash_grid.mlp_layers: 2 → 3  (deeper decoder)
+#   3. coarse_downsample: false (train at full resolution)
+#   4. coarse_start_iter: 200 (earlier coarse engagement)
+#
+# Diagnosis: v10 coarse_cos plateaued at ~0.47 from iter 1000 onwards,
+# with only 14K MLP params (50→128→64). This config increases to ~100K params
+# and trains coarse at full resolution to match the evaluation resolution.
+
+exp_name: dcff_oldhospital_v10b_coarse_fix
+output_dir: feature_field/output
+
+dataset:
+  type: cambridge
+  source_dir: dataset/OldHospital
+  images: ''
+  feature_dir: feature_extract/output/features_radio_dual/OldHospital_pilot
+
+teacher:
+  mode: cached
+
+model:
+  sh_degree: 3
+  white_background: false
+  latent_dim: 32
+  feature_dim: 64
+
+fine_decoder:
+  type: spatial
+  hidden_dim: 128
+  use_viewdirs: false
+
+refiner:
+  type: depth_guided
+  hidden_dim: 256
+
+hash_grid:
+  input_mode: implicit_scale
+  scale_dim: 2
+  scale_pe_freqs: 4
+  include_raw_scale: true
+  n_levels: 16
+  n_features_per_level: 2
+  log2_hashmap_size: 20
+  base_resolution: 16
+  max_resolution: 4096
+  mlp_hidden: 256
+  mlp_layers: 3
+
+training:
+  init_ply: feature_gaussian/output/2dgs_models/OldHospital/v7_depth/point_cloud/iteration_30000/point_cloud.ply
+  iterations: 40000
+  freeze_geometry: true
+  batch_size: 8
+
+  fine_start_iter: 0
+  coarse_start_iter: 200
+  warmup_iters: 500
+  grad_clip: 0.75
+  coarse_downsample: false
+
+  position_lr_init: 0.00016
+  position_lr_final: 0.0000016
+  feature_lr: 0.0025
+  opacity_lr: 0.05
+  scaling_lr: 0.005
+  rotation_lr: 0.001
+
+  latent_lr: 0.0002
+  lr_hash_grid: 0.0002
+  lr_fine_decoder: 0.0006
+
+  percent_dense: 0.01
+  densify_from_iter: 999999
+  densify_until_iter: 0
+  densify_every: 100
+  densify_grad_threshold: 0.0002
+  min_opacity: 0.005
+  max_num_gaussians: 500000
+  opacity_reset_every: 999999
+
+  longest_edge: 640
+
+  log_every: 50
+  save_every: 5000
+  val_every: 1000
+  sh_degree_up_every: 1000
+
+  loss:
+    lambda_dssim: 0.2
+    lambda_fine_cos: 1.0
+    lambda_fine_l1: 1.0
+    lambda_coarse_cos: 1.0
+    lambda_coarse_l1: 1.0
+    lambda_tv: 0.03
+    lambda_normal: 0.0
+    lambda_dist: 0.0

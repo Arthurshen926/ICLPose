@@ -1,0 +1,1 @@
+../feature_retrieval/retrievers/render_augmented_vlad.py

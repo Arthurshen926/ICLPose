@@ -1,0 +1,18 @@
+output/
+# logs/
+
+
+dataset/
+
+*/output/
+
+.vscode/
+.github/
+
+*.pyc
+__pycache__/
+.venv/
+nohup.out
+models/segformer-b2-ade/
+plat import*
+*.log

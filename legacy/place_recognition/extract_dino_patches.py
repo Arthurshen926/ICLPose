@@ -1,0 +1,1 @@
+../feature_retrieval/retrievers/extract_dino_patches.py

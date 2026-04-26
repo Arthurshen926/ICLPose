@@ -1,0 +1,94 @@
+# ============================================================
+#  exp032_fresh.yaml — 从零开始复现 exp032
+#  基于 exp032_cosine_fiters8.yaml, 但因为没有 warmstart checkpoint,
+#  适当调整学习率和训练参数以从零训练。
+# ============================================================
+
+exp_name: exp032_fresh
+output_dir: output/exp032_fresh
+
+# ── Model ──
+model:
+  hidden_dim: 128
+  decode_dim: 64
+  local_radius: 4
+  damping: 0.001
+  fine_iters: 8
+  coarse_hw: [7, 10]
+  mid_hw: [15, 20]
+  fine_hw: [35, 46]
+
+# ── Renderer (3DGS) ──
+renderer:
+  ply_path: dataset/room_0/splatloc-test/data/room_0/point_cloud/final/point_cloud.ply
+  scale_model_paths:
+    coarse:    output/feature_3dgs/room_0_raw/coarse/best_model.pth
+    mid:       output/feature_3dgs/room_0_raw/mid/best_model.pth
+    fine_sd:   output/feature_3dgs/room_0_raw/fine_sd/best_model.pth
+    fine_dino: output/feature_3dgs/room_0_raw/fine_dino/best_model.pth
+  img_height: 480
+  img_width: 640
+  fx: 320.0
+  fy: 320.0
+  cx: 319.5
+  cy: 239.5
+
+# ── Data ──
+data:
+  train_feature_dir: output/features_multiscale/room_0
+  train_traj_path: dataset/room_0/Sequence_1/traj_w_c.txt
+  train_depth_dir: dataset/room_0/Sequence_1/depth
+
+  val_feature_dir: null
+  val_traj_path: dataset/room_0/Sequence_2/traj_w_c.txt
+  val_depth_dir: dataset/room_0/Sequence_2/depth
+  val_netvlad_poses: null
+  val_split_ratio: 0.1
+
+  noise_rot_deg: 8.0
+  noise_trans_m: 0.25
+  val_noise_rot_deg: 8.0
+  val_noise_trans_m: 0.25
+
+  batch_size: 4
+  val_batch_size: 4
+  num_workers: 4
+
+# ── Training ──
+training:
+  epochs: 80             # 从零训练需要更多 epochs
+  phase1_epochs: 10      # 从零需要更长的 flow-only warmup
+  lr: 0.0001             # 从零训练用更高的初始学习率
+  min_lr: 0.000001
+  weight_decay: 0.00001
+  grad_clip: 1.0
+  use_amp: true
+
+  # 外层迭代精化
+  outer_iters: 3
+  val_outer_iters: 5
+
+  loss:
+    flow_weights:
+      coarse: 0.1
+      mid: 0.3
+      fine: 1.0
+    pose_weight: 1.0
+    rot_weight: 1.0
+    trans_weight: 10.0
+    rot_loss_type: cosine
+    gamma: 0.8
+    gamma_outer: 0.8
+
+  # 噪声课程 — 从零训练, 从更小噪声开始
+  noise_curriculum:
+    enabled: true
+    warmup_epochs: 50
+    noise_rot_min: 1.0     # 从 1° 开始
+    noise_trans_min: 0.02
+
+  # Pose loss warmup
+  pose_warmup:
+    enabled: true
+    warmup_epochs: 10
+    min_weight: 0.05       # 从 5% 开始

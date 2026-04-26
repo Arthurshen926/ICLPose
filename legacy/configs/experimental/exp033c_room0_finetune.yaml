@@ -1,0 +1,93 @@
+# ============================================================
+#  exp033c_room0_finetune.yaml
+#  Warmstart from exp033 best (2.11°), fine-tune with lower LR
+#  Key changes: lower LR, no curriculum (start at max noise),
+#  longer training with cosine decay
+# ============================================================
+
+exp_name: exp033c_room0_finetune
+output_dir: output/exp033c_room0_finetune
+
+model:
+  hidden_dim: 128
+  decode_dim: 64
+  local_radius: 4
+  damping: 0.001
+  fine_iters: 8
+  mid_iters: 1
+  coarse_hw: [15, 20]
+  mid_hw: [30, 40]
+  fine_hw: [35, 46]
+  coarse_in_dim: 32
+  mid_in_dim: 64
+  fine_sd_in_dim: 64
+  fine_dino_in_dim: 64
+
+renderer:
+  ply_path: output/2dgs_models/room_0/v8_fixed_poses/point_cloud/iteration_30000/point_cloud.ply
+  scale_model_paths:
+    coarse:    output/feature_3dgs/room_0_v2/per_scale/coarse.pth
+    mid:       output/feature_3dgs/room_0_v2/per_scale/mid.pth
+    fine_sd:   output/feature_3dgs/room_0_v2/per_scale/fine_sd.pth
+    fine_dino: output/feature_3dgs/room_0_v2/per_scale/fine_dino.pth
+  img_height: 480
+  img_width: 640
+  fx: 320.0
+  fy: 320.0
+  cx: 319.5
+  cy: 239.5
+
+data:
+  train_feature_dir: output/features_multiscale_compressed/room_0
+  train_traj_path: dataset/room_0/Sequence_1/traj_w_c.txt
+  train_depth_dir: dataset/room_0/Sequence_1/depth
+
+  val_feature_dir: null
+  val_traj_path: null
+  val_netvlad_poses: null
+  val_split_ratio: 0.1
+
+  # Keep val noise at 8° for comparable eval; push training noise higher
+  noise_rot_deg: 15.0
+  noise_trans_m: 0.5
+  val_noise_rot_deg: 8.0
+  val_noise_trans_m: 0.25
+
+  batch_size: 4
+  val_batch_size: 4
+  num_workers: 4
+
+training:
+  epochs: 80
+  phase1_epochs: 0
+  lr: 0.00005
+  min_lr: 0.000002
+  weight_decay: 0.00001
+  grad_clip: 1.0
+  use_amp: true
+
+  outer_iters: 3
+  val_outer_iters: 5
+
+  loss:
+    flow_weights:
+      coarse: 0.1
+      mid: 0.3
+      fine: 1.0
+    pose_weight: 1.0
+    rot_weight: 1.0
+    trans_weight: 10.0
+    rot_loss_type: cosine
+    gamma: 0.8
+    gamma_outer: 0.8
+
+  noise_curriculum:
+    enabled: true
+    warmup_epochs: 30
+    noise_rot_min: 8.0
+    noise_trans_min: 0.25
+
+  pose_warmup:
+    enabled: false
+    warmup_epochs: 0
+    min_weight: 1.0

@@ -1,0 +1,93 @@
+# ============================================================
+#  gsff_oldhospital_render.yaml
+#  Standard GSFF Reproduction: 3DGS Feature Rendering
+#
+#  Uses 3DGS feature rendering at both train and test time.
+#  This is the "pure" GSFF paper approach.
+#  Official Cambridge Landmarks train/test split.
+#
+#  Training:
+#    CUDA_VISIBLE_DEVICES=4 python scripts/train_ms_flow.py \
+#        --config legacy/gsff_baseline/configs/gsff_oldhospital_render.yaml
+#
+#  Evaluation:
+#    python scripts/eval_cambridge.py \
+#        --config legacy/gsff_baseline/configs/gsff_oldhospital_render.yaml \
+#        --checkpoint output/gsff_oldhospital_render/checkpoints/best.pth \
+#        --mode render --iters 1 3 5 10
+# ============================================================
+
+exp_name: gsff_oldhospital_render
+output_dir: output/gsff_oldhospital_render
+
+model:
+  hidden_dim: 128
+  decode_dim: 64
+  local_radius: 4
+  damping: 0.001
+  fine_iters: 8
+  mid_iters: 1
+  coarse_hw: [15, 26]
+  mid_hw: [30, 53]
+  fine_hw: [35, 61]
+  coarse_in_dim: 32
+  mid_in_dim: 64
+  fine_sd_in_dim: 64
+  fine_dino_in_dim: 64
+
+renderer:
+  ply_path: output/2dgs_models/OldHospital/v7_depth/point_cloud/iteration_30000/point_cloud.ply
+  scale_model_paths:
+    coarse:    output/feature_3dgs/oldhospital_ae_div_perscale/coarse/best_model.pth
+    mid:       output/feature_3dgs/oldhospital_ae_div_perscale/mid/best_model.pth
+    fine_sd:   output/feature_3dgs/oldhospital_ae_div_perscale/fine_sd/best_model.pth
+    fine_dino: output/feature_3dgs/oldhospital_ae_div_perscale/fine_dino/best_model.pth
+  img_height: 1080
+  img_width: 1920
+  fx: 1673.5
+  fy: 1673.5
+  cx: 960.0
+  cy: 540.0
+
+data:
+  train_feature_dir: output/features_multiscale_compressed/OldHospital_indexed
+  train_traj_path: output/features_multiscale_compressed/OldHospital_indexed/traj_w_c.txt
+  use_official_split: true
+  val_feature_dir: null
+  val_traj_path: null
+  val_netvlad_poses: null
+  val_split_ratio: 0.1
+  noise_rot_deg: 10.0
+  noise_trans_m: 1.0
+  val_noise_rot_deg: 10.0
+  val_noise_trans_m: 1.0
+  batch_size: 2
+  val_batch_size: 2
+  num_workers: 4
+
+training:
+  epochs: 120
+  phase1_epochs: 10
+  lr: 0.0002
+  min_lr: 0.000005
+  weight_decay: 0.00001
+  grad_clip: 1.0
+  use_amp: true
+  outer_iters: 3
+  val_outer_iters: 5
+  # No depth-warp: use standard 3DGS feature rendering
+  loss:
+    flow_weights:
+      coarse: 0.1
+      mid: 0.3
+      fine: 1.0
+    gamma: 0.8
+    rot_weight: 1.0
+    trans_weight: 10.0
+    rot_loss_type: cosine
+  conf_coverage_range: [0.3, 0.8]
+  noise_curriculum:
+    enabled: true
+    warmup_epochs: 50
+    start_rot_deg: 2.0
+    start_trans_m: 0.1

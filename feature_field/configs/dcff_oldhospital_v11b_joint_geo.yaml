@@ -1,0 +1,100 @@
+exp_name: dcff_oldhospital_v11b_joint_geo
+output_dir: feature_field/output
+joint_geometry_training: true
+
+dataset:
+  type: cambridge
+  source_dir: /root/ICLPose-loc/dataset/OldHospital
+  images: ''
+  feature_dir: /root/ICLPose-loc/feature_extract/output/features_radio_dual/OldHospital_pilot
+
+model:
+  feature_dim: 64
+  latent_dim: 32
+  sh_degree: 3
+  white_background: false
+
+fine_decoder:
+  type: spatial
+  hidden_dim: 128
+  use_viewdirs: false
+
+coarse_decoder:
+  mode: carrier_residual
+  carrier_hidden_dim: 128
+  gate_hidden_dim: 64
+
+hash_grid:
+  input_mode: implicit_scale
+  n_levels: 16
+  n_features_per_level: 2
+  log2_hashmap_size: 20
+  base_resolution: 16
+  max_resolution: 4096
+  mlp_hidden: 128
+  mlp_layers: 2
+  scale_dim: 2
+  scale_pe_freqs: 4
+  include_raw_scale: true
+  sh_degree: 3
+
+refiner:
+  type: depth_guided
+  hidden_dim: 256
+
+teacher:
+  mode: cached
+
+training:
+  iterations: 50000
+  longest_edge: 640
+  batch_size: 32
+  freeze_geometry: false
+
+  position_lr_init: 0.00016
+  position_lr_final: 0.0000016
+  rotation_lr: 0.001
+  scaling_lr: 0.005
+  opacity_lr: 0.05
+  feature_lr: 0.0025
+  latent_lr: 0.0003
+
+  lr_hash_grid: 0.0002
+  lr_fine_decoder: 0.0006
+  lr_coarse_fusion: 0.0006
+  lr_refiner: 0.0006
+
+  grad_clip: 0.75
+  percent_dense: 0.01
+
+  fine_start_iter: 0
+  coarse_start_iter: 500
+  warmup_iters: 500
+  sh_degree_up_every: 1000
+
+  densify_from_iter: 100
+  densify_until_iter: 5000
+  densify_every: 100
+  densify_grad_threshold: 0.0002
+  opacity_reset_every: 3000
+  min_opacity: 0.005
+  max_num_gaussians: 600000
+
+  coarse_downsample: true
+  val_every: 2000
+  save_every: 5000
+  log_every: 100
+
+  init_ply: /root/ICLPose-loc/feature_gaussian/output/2dgs_models/OldHospital/v7_depth/point_cloud/iteration_30000/point_cloud.ply
+  use_amp: true
+
+  loss:
+    lambda_dssim: 0.2
+    lambda_fine_cos: 1.0
+    lambda_fine_l1: 1.0
+    lambda_coarse_cos: 1.0
+    lambda_coarse_l1: 1.0
+    lambda_tv: 0.05
+    lambda_normal: 0.0
+    lambda_dist: 0.0
+    lambda_channel_std: 0.3

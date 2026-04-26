@@ -1,0 +1,61 @@
+# Joint 2DGS Geometry + DA3 Feature Training — OldHospital
+# Usage:
+#   CUDA_VISIBLE_DEVICES=0 python -m feature_3dgs.train_2dgs_joint_v2 \
+#     --config configs/joint_oh_v1.yaml
+
+exp_name: joint_oh_v1
+
+dataset:
+  type: cambridge           # Cambridge Landmarks dataset (COLMAP sparse format)
+  source_dir: dataset/OldHospital
+  images: ''                # images are under seq*/frame*.png, referenced by COLMAP
+  feature_dir: output/features_da3/OldHospital_indexed
+  feature_scales:
+    - fine                  # 64d @ 69×121
+
+model:
+  sh_degree: 3
+  white_background: false
+
+training:
+  iterations: 30000
+  longest_edge: 0           # Full resolution 1920×1080
+  eval_interval: 2500
+  save_interval: 5000
+  vis_frames: [0, 200, 500, 800]
+
+  # LR
+  position_lr_init: 0.00016
+  position_lr_final: 0.0000016
+  feature_lr: 0.0025
+  opacity_lr: 0.05
+  scaling_lr: 0.005
+  rotation_lr: 0.001
+  percent_dense: 0.01
+
+  # Feature embedding
+  feature_embedding_lr: 0.01
+  feature_weight: 0.1
+  feature_cos_weight: 0.5
+  feature_start_iter: 500
+  detach_feat_geometry: false
+
+  # RGB loss
+  lambda_dssim: 0.2
+
+  # 2DGS geometry regulalrization
+  lambda_normal: 0.05
+  lambda_dist: 0.01
+  lambda_scale: 0.001
+  scale_reg_threshold: 0.3
+  reg_start_iter: 500
+
+  # Densification
+  densify_from_iter: 500
+  densify_until_iter: 20000
+  densification_interval: 100
+  densify_grad_threshold: 0.0002
+  opacity_reset_interval: 3000
+  opacity_reset_value: 0.01
+
+output_dir: output/2dgs_joint

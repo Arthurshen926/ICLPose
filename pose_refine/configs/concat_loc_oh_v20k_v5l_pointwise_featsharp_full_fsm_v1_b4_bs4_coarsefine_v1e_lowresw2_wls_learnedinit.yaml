@@ -1,0 +1,101 @@
+exp_name: concat_loc_oh_v20k_v5l_pointwise_featsharp_full_fsm_v1_b4_bs4_coarsefine_v1e_lowresw2_wls_learnedinit
+output_dir: output/pose_refine
+
+dataset:
+  feature_dir: output/feature_extract/features_query_student_v5l_pointwise_featsharp_full_fsm_v1_b4/OldHospital
+  colmap_dir: dataset/OldHospital/sparse/0
+  source_dir: dataset/OldHospital
+  train_split: dataset/OldHospital/dataset_train.txt
+  test_split: dataset/OldHospital/dataset_test.txt
+  train_init_poses_path: output/feature_retrieval/pose_regression/exp29a_direct_both_seed123/init_top5_learned_train.npz
+  val_init_poses_path: output/feature_retrieval/pose_regression/exp29a_direct_both_seed123/init_top5_learned.npz
+  cache_in_memory: true
+  coarse_hw: [17, 30]
+
+dcff:
+  checkpoint: output/feature_field/dcff_oldhospital_v15d_v14b_coarse_smooth_frozen/checkpoints/best.pth
+  joint_checkpoint: output/feature_extract/joint_radio_dcff_oh_v5l_pointwise_featsharp_full_fsm_v1_b4/checkpoints/best.pth
+  joint_override_components: [fsm, hash_grid_mlp]
+  ply_path: output/feature_gaussian/joint_radio_dual_oldhospital_teacher_geom_v1/point_cloud/best/point_cloud.ply
+  feature_dim: 64
+  latent_dim: 32
+  render_width: 120
+  render_height: 68
+  finetune_decoder: true
+  finetune_fsm: true
+  coarse_smoothing_kernel: 5
+
+model:
+  feature_dim: 64
+  hidden_dim: 256
+  irls_iters: 0
+  use_coarse: true
+  use_gru: true
+  gru_iters: 4
+  local_radius: 4
+  proj_dim: 32
+  proj_mode: shared
+  full_wls: false
+  flow_init: small
+  coarse_flow_init: true
+  coarse_pool_factor: 4
+  detach_trans: false
+  detach_wls_rot: false
+  rot_mode: wls
+  use_two_stage_refine: true
+  coarse_only_first_iter: true
+  coarse_stage_hidden_dim: 256
+  coarse_stage_use_transformer: true
+  coarse_stage_heads: 4
+  coarse_stage_layers: 1
+  coarse_stage_downsample: 2
+  coarse_stage_dropout: 0.1
+  coarse_stage_pool_hw: 4
+  coarse_stage_use_fsm: true
+
+training:
+  epochs: 16
+  batch_size: 4
+  use_amp: false
+  lr: 8.0e-6
+  decoder_lr: 1.0e-6
+  fsm_lr: 1.0e-6
+  weight_decay: 1.0e-4
+  grad_clip: 1.0
+
+  noise_curriculum:
+    rot_start_deg: 2.0
+    rot_end_deg: 2.0
+    trans_start_m: 0.50
+    trans_end_m: 0.50
+    warmup_epochs: 0
+    rot_min_deg: 0.2
+    trans_min_m: 0.05
+
+  val_noise_deg: 2.0
+  val_noise_m: 0.5
+
+  loss:
+    flow_weight: 5.0
+    pose_weight: 1.0
+    coarse_pose_weight: 2.0
+    pose_loss_mode: lie
+    rot_loss_type: cosine
+    trans_weight: 10.0
+    conf_reg_weight: 0.05
+    conf_nll_weight: 0.3
+    direct_trans_loss: false
+    feat_match_weight: 0.2
+
+  phase1_epochs: 0
+  outer_iters_train: 2
+  outer_iters_val: 2
+
+  val_every: 2
+  save_every: 2
+  save_epoch_checkpoints: false
+  vis_every: 0
+  num_vis_samples: 4
+
+renderer:
+  longest_edge: 1088

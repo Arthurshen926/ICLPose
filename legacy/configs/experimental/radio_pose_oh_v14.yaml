@@ -1,0 +1,85 @@
+# RadioPoseNet v14: OldHospital — Larger noise for detectable flow
+#
+# INSIGHT: Rotation solver (trans_scale=0) handles 8° fine — linearization only
+# breaks for TRANSLATION at large depths, not rotation! With 8° noise, flow at
+# fine resolution = 7.3px (vs 2.7px at 3°) → much easier to detect and match.
+# This should dramatically improve flow prediction quality.
+#
+# FIXES in v14:
+#   - noise: 8°/0.25m (back to standard, matching MSFlowPoseNet)
+#   - outer_iters: 3 (each iteration halves rotation error)
+#   - val_outer_iters: 3
+#   - Inherits v13 fixes (shared_projection, flow_weight=5, solver_trans_scale=0)
+
+exp_name: radio_pose_oh_v14
+output_dir: output/radio_pose_oh_v14
+
+renderer:
+  ply_path: output/2dgs_joint/joint_oh_v7_radio/point_cloud/best/point_cloud.ply
+  feature_model_path: output/2dgs_joint/joint_oh_v7_radio/features_best/fine_radio/best_model.pth
+  img_hw: [1080, 1920]
+  feat_hw: [68, 120]
+  fx: 1663.12
+  fy: 1663.12
+  cx: 960.0
+  cy: 540.0
+
+model:
+  feat_dim: 64
+  hidden_dim: 128
+  n_heads: 4
+  n_attn_layers: 2
+  ffn_dim: 128
+  local_radius: 4
+  fine_iters: 4
+  damping: 0.001
+  coarse_hw: [17, 30]
+  fine_hw: [34, 60]
+  irls_iters: 0
+  conf_floor: 0.1                  # NEW: minimum confidence prevents collapse
+  detach_conf_in_solver: true      # NEW: conf not trained by pose loss
+  solver_hw: [68, 120]             # NEW: solve at RADIO native res (2× fine → 4× pixels, 2× fx)
+  sequential_solve: true           # NEW: rotation-first then translation (decouples ill-conditioning)
+  solver_trans_scale: 0.0          # NEW: disable translation from solver (unobservable at 33m depth)
+  shared_projection: true          # NEW: guarantee Q/R feature alignment
+
+data:
+  feature_dir: output/features_radio/OldHospital_indexed
+  traj_path: output/features_radio/OldHospital_indexed/traj_w_c.txt
+  batch_size: 16
+  val_batch_size: 8
+  num_workers: 4
+  noise_rot_deg: 8.0               # INCREASED: larger flow = detectable
+  noise_trans_m: 0.25              # Match standard (solver ignores trans)
+  val_noise_rot_deg: 8.0           # Match train
+  val_noise_trans_m: 0.25
+
+  noise_curriculum:
+    enabled: true
+    warmup_epochs: 20
+    base_rot_deg: 2.0              # Start moderate
+    base_trans_m: 0.05
+    max_rot_deg: 8.0               # INCREASED: full range
+    max_trans_m: 0.25
+
+training:
+  epochs: 200
+  lr: 0.0002
+  min_lr: 0.000001
+  weight_decay: 0.00001
+  grad_clip: 1.0
+  use_amp: true
+  phase1_epochs: 20                # Extended flow-only warmup
+  outer_iters: 3                   # Multiple iterations for 8° correction
+  val_outer_iters: 3               # Match train
+  pose_loss_last_only: false       # Pose loss at every iter
+
+  loss:
+    flow_weight: 5.0              # 5×: flow learning is now dominant
+    pose_weight: 0.5               # Reduced: don't fight flow
+    rot_weight: 1.0
+    trans_weight: 10.0
+    gamma: 0.8
+    conf_reg_weight: 0.3
+    xi_weight: 0.5                 # Reduced: don't fight flow
+    contrast_weight: 0.5           # Reduced: good enough, don't dominate

@@ -1,0 +1,110 @@
+# DCFF v14b — frozen geometry + FSM spatial confidence only.
+
+exp_name: dcff_oldhospital_v14b_spatial_only_frozen
+output_dir: feature_field/output
+
+dataset:
+  type: cambridge
+  source_dir: dataset/OldHospital
+  images: ''
+  feature_dir: feature_extract/output/features_radio_dual/OldHospital_pilot
+
+teacher:
+  mode: cached
+
+model:
+  sh_degree: 3
+  white_background: false
+  latent_dim: 32
+  feature_dim: 64
+
+fine_decoder:
+  type: spatial
+  hidden_dim: 128
+  use_viewdirs: false
+
+coarse_decoder:
+  mode: carrier_residual
+  carrier_hidden_dim: 128
+  gate_hidden_dim: 64
+
+refiner:
+  type: depth_guided
+  hidden_dim: 256
+
+fsm:
+  enable: true
+  hidden_dim: 16
+  num_heads: 4
+  use_channel_select: false
+  use_cross_attn: false
+  use_spatial_conf: true
+  lr: 0.0003
+  lambda_conf: 0.05
+
+hash_grid:
+  input_mode: implicit_scale
+  scale_dim: 2
+  scale_pe_freqs: 4
+  include_raw_scale: true
+  n_levels: 16
+  n_features_per_level: 2
+  log2_hashmap_size: 20
+  base_resolution: 16
+  max_resolution: 4096
+  mlp_hidden: 128
+  mlp_layers: 2
+
+training:
+  init_ply: feature_gaussian/output/2dgs_models/OldHospital/v7_depth/point_cloud/iteration_30000/point_cloud.ply
+  warmstart_checkpoint: feature_field/output/dcff_oldhospital_v10c_carrier_residual/checkpoints/best.pth
+  iterations: 15000
+  freeze_geometry: true
+  batch_size: 8
+
+  fine_start_iter: 0
+  coarse_start_iter: 500
+  warmup_iters: 500
+  grad_clip: 0.75
+  coarse_downsample: true
+
+  position_lr_init: 0.00016
+  position_lr_final: 0.0000016
+  feature_lr: 0.0025
+  opacity_lr: 0.05
+  scaling_lr: 0.005
+  rotation_lr: 0.001
+
+  latent_lr: 0.0002
+  lr_hash_grid: 0.0002
+  lr_fine_decoder: 0.0006
+  lr_coarse_fusion: 0.0006
+  lr_refiner: 0.0006
+
+  percent_dense: 0.01
+  densify_from_iter: 999999
+  densify_until_iter: 0
+  densify_every: 100
+  densify_grad_threshold: 0.0002
+  min_opacity: 0.005
+  max_num_gaussians: 500000
+  opacity_reset_every: 999999
+
+  longest_edge: 640
+
+  log_every: 50
+  save_every: 5000
+  val_every: 1000
+  sh_degree_up_every: 1000
+  use_amp: true
+
+  loss:
+    lambda_dssim: 0.2
+    lambda_fine_cos: 1.0
+    lambda_fine_l1: 1.0
+    lambda_coarse_cos: 1.0
+    lambda_coarse_l1: 1.0
+    lambda_tv: 0.03
+    lambda_normal: 0.0
+    lambda_dist: 0.0
+    lambda_channel_std: 0.1

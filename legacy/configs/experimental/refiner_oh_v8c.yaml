@@ -1,0 +1,90 @@
+# ============================================================
+#  refiner_oh_v8c.yaml
+#  PoseRefiner V8c: radius=8 with SMART weight initialization
+#
+#  V8 and V8b failed because random corr_encoder init with 289
+#  channels is nearly impossible to train at B=2.
+#
+#  V8c uses the new smart weight mapping in _load_checkpoint:
+#  - Maps V1's r=4 corr_encoder weights (81 channels) to r=8
+#    positions (289 channels) with zero-padding
+#  - This gives the model a head start: central 81 channels
+#    already know how to process ±4° displacements
+#  - Only the outer 208 channels need to be learned
+#
+#  Also: grad_accum=4 for effective B=8, no curriculum (full 8°).
+#
+#  Training:
+#    CUDA_VISIBLE_DEVICES=0 python scripts/train_refiner.py \
+#        --config configs/refiner_oh_v8c.yaml \
+#        --warmstart output/refiner_oh_v1/checkpoints/latest.pth
+# ============================================================
+
+exp_name: refiner_oh_v8c
+output_dir: output/refiner_oh_v8c
+
+model:
+  in_dim: 64
+  match_dim: 64
+  hidden_dim: 128
+  n_heads: 4
+  n_attn_layers: 2
+  ffn_dim: 128
+  local_radius: 8
+  fine_iters: 8
+  damping: 0.001
+  coarse_hw: [17, 30]
+  fine_hw: [68, 120]
+  solver_hw: [68, 120]
+  solver_upsample: 4
+  depth_normalize: false
+  sequential_solve: true
+  detach_conf: true
+  conf_floor: 0.1
+  solver_trans_scale: 0.0
+  use_trans_head: false
+  trans_head_mode: replace
+
+renderer:
+  ply_path: output/2dgs_joint/joint_oh_v7_radio/point_cloud/best/point_cloud.ply
+  feature_model_path: output/2dgs_joint/joint_oh_v7_radio/features_best/fine_radio/best_model.pth
+  feat_hw: [68, 120]
+  img_hw: [1080, 1920]
+  fx: 1663.12
+  fy: 1663.12
+  cx: 960.0
+  cy: 540.0
+
+data:
+  feature_dir: output/features_radio/OldHospital_indexed
+  traj_path: output/features_radio/OldHospital_indexed/traj_w_c.txt
+  noise_rot_deg: 8.0
+  noise_trans_m: 0.25
+  val_noise_rot_deg: 8.0
+  val_noise_trans_m: 0.25
+  batch_size: 2
+  val_batch_size: 2
+  num_workers: 4
+
+training:
+  epochs: 200
+  phase1_epochs: 200
+  lr: 0.0002
+  min_lr: 0.000001
+  weight_decay: 0.00001
+  grad_clip: 1.0
+  use_amp: true
+  outer_iters: 1
+  val_outer_iters: 5
+  grad_accum_steps: 4
+  loss:
+    flow_weight: 5.0
+    pose_weight: 0.0
+    rot_weight: 1.0
+    trans_weight: 10.0
+    gamma: 0.8
+    conf_reg_weight: 0.3
+    contrast_weight: 0.5
+    xi_weight: 0.0
+  noise_curriculum:
+    enabled: false

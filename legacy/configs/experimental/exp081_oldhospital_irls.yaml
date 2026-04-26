@@ -1,0 +1,92 @@
+# ============================================================
+#  exp081_oldhospital_irls.yaml
+#  OldHospital: exp035 baseline + IRLS for better conditioning
+#  Key changes vs exp035:
+#    - irls_iters: 3 (better outlier rejection for 8-86m depth)
+#    - warmstart from exp035 best (3.27° at E34)
+#    - lr: 0.00005 (lower for fine-tuning from warmstart)
+#    - No diversity loss (hurt performance in exp077b)
+#  Proven recipe: oi=3, gamma=0.8, curriculum
+# ============================================================
+
+exp_name: exp081_oldhospital_irls
+output_dir: output/exp081_oldhospital_irls
+
+model:
+  hidden_dim: 128
+  decode_dim: 64
+  local_radius: 4
+  damping: 0.001
+  fine_iters: 4
+  mid_iters: 1
+  coarse_hw: [15, 26]
+  mid_hw: [30, 53]
+  fine_hw: [35, 61]
+  coarse_in_dim: 32
+  mid_in_dim: 64
+  fine_sd_in_dim: 64
+  fine_dino_in_dim: 64
+  irls_iters: 3
+
+renderer:
+  ply_path: output/2dgs_models/OldHospital/v7_depth/point_cloud/iteration_30000/point_cloud.ply
+  scale_model_paths:
+    coarse:    output/feature_3dgs/oldhospital_v1/per_scale/coarse.pth
+    mid:       output/feature_3dgs/oldhospital_v1/per_scale/mid.pth
+    fine_sd:   output/feature_3dgs/oldhospital_v1/per_scale/fine_sd.pth
+    fine_dino: output/feature_3dgs/oldhospital_v1/per_scale/fine_dino.pth
+  img_height: 1080
+  img_width: 1920
+  fx: 1673.5
+  fy: 1673.5
+  cx: 960.0
+  cy: 540.0
+
+data:
+  train_feature_dir: output/features_multiscale_compressed/OldHospital_indexed
+  train_traj_path: output/features_multiscale_compressed/OldHospital_indexed/traj_w_c.txt
+
+  val_feature_dir: null
+  val_split_ratio: 0.1
+
+  noise_rot_deg: 10.0
+  noise_trans_m: 1.0
+  val_noise_rot_deg: 10.0
+  val_noise_trans_m: 1.0
+
+  batch_size: 2
+  val_batch_size: 2
+  num_workers: 4
+
+training:
+  epochs: 120
+  phase1_epochs: 3
+  lr: 0.00005
+  min_lr: 0.000005
+  weight_decay: 0.00001
+  grad_clip: 1.0
+  use_amp: true
+
+  outer_iters: 3
+  val_outer_iters: 3
+
+  loss:
+    flow_weights:
+      coarse: 0.1
+      mid: 0.3
+      fine: 1.0
+    pose_weight: 1.0
+    rot_weight: 1.0
+    trans_weight: 10.0
+    rot_loss_type: cosine
+    gamma: 0.8
+    gamma_outer: 0.8
+    conf_coverage_range: [0.2, 0.85]
+
+  noise_curriculum:
+    enabled: true
+    start_rot_deg: 2.0
+    start_trans_m: 0.10
+    noise_rot_min: 2.0
+    noise_trans_min: 0.1
+    warmup_epochs: 40

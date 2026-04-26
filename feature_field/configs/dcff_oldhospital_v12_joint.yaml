@@ -1,0 +1,88 @@
+exp_name: dcff_oldhospital_v12_joint
+output_dir: feature_field/output
+joint_geometry_training: true
+
+dataset:
+  type: cambridge
+  source_dir: /root/ICLPose-loc/dataset/OldHospital
+  images: ''
+  feature_dir: /root/ICLPose-loc/feature_extract/output/features_radio_dual/OldHospital_pilot
+
+model:
+  feature_dim: 64
+  latent_dim: 32
+  sh_degree: 3
+  white_background: false
+
+fine_decoder:
+  type: spatial
+  hidden_dim: 128
+  use_viewdirs: false
+
+coarse_decoder:
+  mode: carrier_residual
+  carrier_hidden_dim: 128
+  gate_hidden_dim: 64
+
+hash_grid:
+  input_mode: implicit_scale
+  n_levels: 16
+  n_features_per_level: 2
+  log2_hashmap_size: 20
+  base_resolution: 16
+  max_resolution: 4096
+  mlp_hidden: 128
+  mlp_layers: 2
+  scale_dim: 2
+  scale_pe_freqs: 4
+  include_raw_scale: true
+  sh_degree: 3
+
+query:
+  img_size: 224
+  matcher_num_heads: 4
+  matcher_num_layers: 2
+  pose_hidden_dim: 256
+  pose_num_layers: 3
+  lr: 0.0001
+
+joint:
+  stage: query_only
+  joint_start: 5000
+  rotation_weight: 1.0
+  translation_weight: 1.0
+  use_feature_consistency: true
+  feat_cons_weight: 0.1
+
+training:
+  iterations: 30000
+  longest_edge: 960
+  batch_size: 4
+  freeze_geometry: true
+  coarse_downsample: true
+  val_every: 2000
+  save_every: 5000
+  log_every: 100
+  use_amp: true
+  grad_clip: 1.0
+
+  init_ply: /root/ICLPose-loc/feature_gaussian/output/2dgs_models/OldHospital/v7_depth/point_cloud/iteration_30000/point_cloud.ply
+
+  position_lr_init: 0.00016
+  position_lr_final: 0.0000016
+  rotation_lr: 0.001
+  scaling_lr: 0.005
+  opacity_lr: 0.05
+  feature_lr: 0.0025
+  latent_lr: 0.0003
+  lr_hash_grid: 0.0002
+  lr_fine_decoder: 0.0006
+
+  loss:
+    lambda_dssim: 0.2
+    lambda_fine_cos: 1.0
+    lambda_fine_l1: 1.0
+    lambda_coarse_cos: 1.0
+    lambda_coarse_l1: 1.0
+    lambda_tv: 0.03
+    lambda_channel_std: 0.1

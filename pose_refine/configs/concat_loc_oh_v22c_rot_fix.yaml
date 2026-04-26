@@ -1,0 +1,92 @@
+# v22c: Fix rotation bottleneck with stronger rotation supervision
+# Key changes from v22b:
+#   - rot_loss_type: geodesic (acos angle, better gradient at small angles)
+#   - rot_weight: 100.0 (upweight rotation vs translation)
+#   - trans_weight: 5.0 (reduce translation dominance)
+#   - direct_trans_loss: false (was adding extra translation bias)
+#   - outer_iters_train: 4 (match val regime better, was 2)
+#   - phase1_epochs: 0 (start with pose loss immediately, decoder already aligned)
+#   - feat_match_weight: 0.5 (maintain decoder alignment)
+#   - Warmstart from v22a best (pre-aligned decoder + flow model)
+
+exp_name: concat_loc_oh_v22c_rot_fix
+output_dir: pose_refine/output
+
+dataset:
+  feature_dir: feature_extract/output/features_query_student_v5g/OldHospital
+  colmap_dir: dataset/OldHospital/sparse/0
+  source_dir: dataset/OldHospital
+  train_split: dataset/OldHospital/dataset_train.txt
+  test_split: dataset/OldHospital/dataset_test.txt
+  cache_in_memory: true
+
+dcff:
+  checkpoint: feature_field/output/dcff_radio_oh_v10/checkpoints/best.pth
+  joint_checkpoint: feature_extract/output/joint_radio_dcff_oh_v5d_joint_fine_schedule/checkpoints/best.pth
+  ply_path: feature_gaussian/output/2dgs_models/OldHospital/v7_depth/point_cloud/iteration_30000/point_cloud.ply
+  feature_dim: 64
+  latent_dim: 32
+  render_width: 120
+  render_height: 68
+  finetune_decoder: true
+  coarse_smoothing_kernel: 1
+
+model:
+  feature_dim: 64
+  hidden_dim: 256
+  irls_iters: 0
+  use_coarse: true
+  use_gru: true
+  gru_iters: 8
+  local_radius: 4
+  proj_dim: 32
+  proj_mode: shared
+  full_wls: false
+  flow_init: small
+  coarse_flow_init: true
+  coarse_pool_factor: 4
+  detach_trans: false
+  detach_wls_rot: false
+  rot_mode: wls
+
+training:
+  epochs: 80
+  batch_size: 16
+  lr: 5.0e-5
+  decoder_lr: 2.0e-5
+  weight_decay: 1.0e-4
+  grad_clip: 1.0
+  min_lr: 1.0e-6
+
+  noise_curriculum:
+    rot_start_deg: 1.0
+    rot_end_deg: 3.0
+    trans_start_m: 0.03
+    trans_end_m: 0.10
+    warmup_epochs: 20
+    rot_min_deg: 0.3
+    trans_min_m: 0.01
+
+  loss:
+    flow_weight: 5.0
+    pose_weight: 1.0
+    rot_loss_type: geodesic
+    rot_weight: 100.0
+    trans_weight: 5.0
+    conf_reg_weight: 0.05
+    conf_nll_weight: 0.3
+    direct_trans_loss: false
+    feat_match_weight: 0.5
+
+  phase1_epochs: 0
+  outer_iters_train: 4
+  outer_iters_val: 5
+
+  val_every: 5
+  save_every: 10
+  save_epoch_checkpoints: false
+  vis_every: 10
+  num_vis_samples: 4
+
+renderer:
+  longest_edge: 1088

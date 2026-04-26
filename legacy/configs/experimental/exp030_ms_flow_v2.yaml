@@ -1,0 +1,97 @@
+# ============================================================
+#  exp030_ms_flow_v2.yaml
+#  SD-Primary Coarse-to-Fine Multi-Scale Flow Pose Estimation
+#  改进: RAFT-style fine iterations, 噪声课程学习, pose loss warmup
+# ============================================================
+
+exp_name: exp030_ms_flow_v2
+output_dir: output/exp030_ms_flow_v2
+
+# ── Model ──
+model:
+  hidden_dim: 128
+  decode_dim: 64
+  local_radius: 4
+  damping: 0.001
+  fine_iters: 4         # RAFT-style 迭代次数 (fine scale)
+  mid_iters: 2          # mid scale 迭代次数 (>1 时用 sequence loss)
+  corr_temperature: 1.0 # correlation 温度, <1.0 使 correlation 更尖锐
+  # v1 特征分辨率
+  coarse_hw: [7, 10]
+  mid_hw: [15, 20]
+  fine_hw: [35, 46]
+
+# ── Renderer (3DGS) ──
+renderer:
+  ply_path: dataset/room_0/splatloc-test/data/room_0/point_cloud/final/point_cloud.ply
+  scale_model_paths:
+    coarse:    output/feature_3dgs/room_0_raw/coarse/best_model.pth
+    mid:       output/feature_3dgs/room_0_raw/mid/best_model.pth
+    fine_sd:   output/feature_3dgs/room_0_raw/fine_sd/best_model.pth
+    fine_dino: output/feature_3dgs/room_0_raw/fine_dino/best_model.pth
+  img_height: 480
+  img_width: 640
+  fx: 320.0
+  fy: 320.0
+  cx: 319.5
+  cy: 239.5
+
+# ── Data ──
+data:
+  # 训练 (Sequence 1, v1 preextracted features)
+  train_feature_dir: output/features_multiscale/room_0
+  train_traj_path: dataset/room_0/Sequence_1/traj_w_c.txt
+  train_depth_dir: dataset/room_0/Sequence_1/depth
+
+  # 验证 (auto-split 10%)
+  val_feature_dir: null
+  val_traj_path: dataset/room_0/Sequence_2/traj_w_c.txt
+  val_depth_dir: dataset/room_0/Sequence_2/depth
+  val_netvlad_poses: null
+  val_split_ratio: 0.1
+
+  # 噪声上限 (课程学习会从小值逐步增长到这些值)
+  noise_rot_deg: 8.0
+  noise_trans_m: 0.25
+  val_noise_rot_deg: 8.0
+  val_noise_trans_m: 0.25
+
+  batch_size: 8
+  val_batch_size: 8
+  num_workers: 4
+
+# ── Training ──
+training:
+  epochs: 100
+  phase1_epochs: 20   # Phase1: flow only, Phase2: flow + pose
+  lr: 0.0001
+  min_lr: 0.000001
+  weight_decay: 0.00001
+  grad_clip: 1.0
+  use_amp: true
+
+  loss:
+    flow_weights:
+      coarse: 0.1
+      mid: 0.3
+      fine: 1.0
+    pose_weight: 1.0
+    rot_weight: 1.0
+    rot_loss_type: cosine  # 'cosine' (stable) or 'acos' (gradient explosion at small angles)
+    gamma: 0.8             # RAFT sequence loss 衰减因子
+    use_huber: true        # Huber loss for flow (robust to outliers)
+    huber_delta: 5.0       # Huber transition point (pixels)
+    conf_reg_weight: 0.01  # confidence regularization weight
+
+  # 噪声课程学习: 从小噪声逐步增加到 data 中设定的最大值
+  noise_curriculum:
+    enabled: true
+    warmup_epochs: 30     # 在前 30 个 epoch 内线性增加噪声
+    noise_rot_min: 2.0    # 起始旋转噪声 (°)
+    noise_trans_min: 0.05  # 起始平移噪声 (m)
+
+  # Pose loss warmup: Phase 2 开始时从小权重逐渐增加
+  pose_warmup:
+    enabled: true
+    warmup_epochs: 10     # 10 个 epoch 内从 min_weight 增长到 pose_weight
+    min_weight: 0.01

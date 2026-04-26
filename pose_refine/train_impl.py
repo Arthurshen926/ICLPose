@@ -1,0 +1,2113 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+"""
+Concatenation-Based Localization Training Script
+=================================================
+End-to-end camera pose estimation using concatenated query + rendered features
+(no correlation) fed through a CNN to predict optical flow + geometry solver.
+
+Pipeline:
+  1. DCFF Feature Field (pre-trained, frozen): renders 64d fine features + depth
+     from a 3DGS scene at a given pose
+  2. ConcatPoseNet (trainable): concatenates query + rendered features + depth
+     + positional encoding, predicts flow via CNN, solves pose via geometry
+
+Usage:
+    CUDA_VISIBLE_DEVICES=5 python -m pose_refine.train \\
+        --config pose_refine/configs/concat_loc_oh_v20k_v5g_student_querymap_adapt.yaml --gpu 0
+
+    # Resume from checkpoint
+    python -m pose_refine.train --config pose_refine/configs/concat_loc_oh_v20k_v5g_student_querymap_adapt.yaml \
+        --resume pose_refine/output/concat_loc_oh_v20k_v5g_student_querymap_adapt/checkpoints/latest.pth
+
+    # Warmstart (model weights only, fresh optimizer/scheduler)
+    python -m pose_refine.train --config pose_refine/configs/concat_loc_oh_v20k_v5g_student_querymap_adapt.yaml \
+        --warmstart pose_refine/output/concat_loc_oh_v20k_v5g_student_querymap_adapt/checkpoints/best.pth
+
+    # Override DCFF checkpoint
+    python -m pose_refine.train --config pose_refine/configs/concat_loc_oh_v20k_v5g_student_querymap_adapt.yaml \
+        --dcff_checkpoint feature_field/output/dcff_radio_oh_v10/checkpoints/best.pth
+"""
+
+import argparse
+import logging
+import math
+import os
+import sys
+import time
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import yaml
+from torch.cuda.amp import GradScaler, autocast
+from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
+
+# Project root
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from data.radio_loc_dataset import RadioLocDataset, collate_fn, read_colmap_cameras
+from data.radio_loc_retrieval_dataset import RadioLocRetrievalDataset
+from feature_field.dcff import DeferredCascadedRenderer, HybridGaussianModel, SpatialHashGrid
+from pose_refine import build_concat_pose_model, run_model_refine_iteration
+from pose_refine.models.concat_pose_net import ConcatPoseNet
+from pose_refine.utils.lie_algebra import se3_exp, se3_log
+from feature_field import build_dcff_runtime, intrinsics_to_K, render_feature_bundle_batch
+from feature_field.runtime import _apply_dcff_postprocess
+from feature_field.utils.loc_reporting import save_experiment_bundle
+from feature_field.utils.project_config import load_mainline_config
+from feature_field.utils.project_paths import resolve_repo_path
+
+
+def camera_centers_from_w2c(poses_w2c: torch.Tensor) -> torch.Tensor:
+    R = poses_w2c[:, :3, :3]
+    t = poses_w2c[:, :3, 3]
+    return -(R.transpose(1, 2) @ t.unsqueeze(-1)).squeeze(-1)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  FeatSharp / DepthGuidedRefiner must stay aligned with feature_field.runtime
+# ═════════════════════════════════════════════════════════════════════════════
+
+class FeatSharp(nn.Module):
+    """Lightweight learnable sharpening applied after rasterization."""
+
+    def __init__(self, feature_dim, kernel_size=3):
+        super().__init__()
+        self.sharpen = nn.Sequential(
+            nn.Conv2d(
+                feature_dim, feature_dim, kernel_size,
+                padding=kernel_size // 2, groups=feature_dim,
+            ),
+            nn.Conv2d(feature_dim, feature_dim, 1),
+        )
+        for m in self.sharpen:
+            if isinstance(m, nn.Conv2d):
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+                if m.kernel_size == (1, 1):
+                    nn.init.zeros_(m.weight)
+                else:
+                    nn.init.kaiming_normal_(m.weight, nonlinearity='linear')
+                    m.weight.data *= 0.01
+
+    def forward(self, x, depth=None, alpha=None):
+        return x + self.sharpen(x)
+
+
+class DepthGuidedRefiner(nn.Module):
+    """Spatial refinement conditioned on depth and alpha."""
+
+    def __init__(self, feature_dim=64, hidden_dim=128):
+        super().__init__()
+        input_dim = feature_dim + 2
+        self.refiner = nn.Sequential(
+            nn.Conv2d(input_dim, hidden_dim, 3, padding=1),
+            nn.GroupNorm(8, hidden_dim),
+            nn.GELU(),
+            nn.Conv2d(hidden_dim, hidden_dim, 3, padding=1),
+            nn.GroupNorm(8, hidden_dim),
+            nn.GELU(),
+            nn.Conv2d(hidden_dim, feature_dim, 1),
+        )
+        nn.init.zeros_(self.refiner[-1].weight)
+        nn.init.zeros_(self.refiner[-1].bias)
+
+    def forward(self, features, depth=None, alpha=None):
+        if depth is None or alpha is None:
+            return features
+        fh, fw = features.shape[-2:]
+        if depth.shape[-2:] != (fh, fw):
+            depth = F.interpolate(depth, (fh, fw), mode='bilinear', align_corners=False)
+        if alpha.shape[-2:] != (fh, fw):
+            alpha = F.interpolate(alpha, (fh, fw), mode='bilinear', align_corners=False)
+        depth_norm = depth / (depth.amax(dim=(-2, -1), keepdim=True) + 1e-6)
+        x = torch.cat([features, depth_norm, alpha], dim=1)
+        return features + self.refiner(x)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  Logging
+# ═════════════════════════════════════════════════════════════════════════════
+
+def setup_logging(output_dir: str, exp_name: str) -> logging.Logger:
+    """Configure dual logging to console and file."""
+    os.makedirs(output_dir, exist_ok=True)
+    logger = logging.getLogger(exp_name)
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+
+    fmt = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s',
+                            datefmt='%H:%M:%S')
+    ch = logging.StreamHandler()
+    ch.setFormatter(fmt)
+    logger.addHandler(ch)
+
+    fh = logging.FileHandler(os.path.join(output_dir, f'{exp_name}_train.log'))
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+
+    return logger
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  Loss Functions
+# ═════════════════════════════════════════════════════════════════════════════
+
+def pose_loss(
+    delta_xi: torch.Tensor,
+    pose_init: torch.Tensor,
+    pose_gt: torch.Tensor,
+    rot_weight: float = 1.0,
+    trans_weight: float = 1.0,
+    rot_loss_type: str = 'cosine',
+    loss_mode: str = 'compose',
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """SE(3) pose refinement loss. All computation in fp32."""
+    with torch.cuda.amp.autocast(enabled=False):
+        delta_xi = delta_xi.float()
+        pose_init = pose_init.float()
+        pose_gt = pose_gt.float()
+
+        T_rel_gt = torch.bmm(pose_gt, torch.inverse(pose_init))
+        gt_xi = se3_log(T_rel_gt)
+
+        if loss_mode == 'lie':
+            pred_trans = delta_xi[:, :3]
+            pred_rot = delta_xi[:, 3:]
+            gt_trans = gt_xi[:, :3]
+            gt_rot = gt_xi[:, 3:]
+            rot_loss_val = F.smooth_l1_loss(pred_rot, gt_rot)
+            trans_loss_val = F.smooth_l1_loss(pred_trans, gt_trans)
+            loss = rot_loss_val * rot_weight + trans_loss_val * trans_weight
+        else:
+            T_delta = se3_exp(delta_xi)
+            pose_pred = torch.bmm(T_delta, pose_init)
+
+            R_pred = pose_pred[:, :3, :3]
+            R_gt = pose_gt[:, :3, :3]
+            R_rel = torch.bmm(R_pred.transpose(1, 2), R_gt)
+            trace = R_rel[:, 0, 0] + R_rel[:, 1, 1] + R_rel[:, 2, 2]
+            cos_angle = torch.clamp((trace - 1.0) / 2.0, -1.0, 1.0)
+
+            if rot_loss_type == 'cosine':
+                rot_loss_val = (1.0 - cos_angle).mean()
+            else:
+                cos_clamped = cos_angle.clamp(-1.0 + 1e-4, 1.0 - 1e-4)
+                rot_loss_val = torch.acos(cos_clamped).mean()
+
+            c_pred = camera_centers_from_w2c(pose_pred)
+            c_gt = camera_centers_from_w2c(pose_gt)
+            trans_loss_val = torch.norm(c_pred - c_gt, dim=1).mean()
+            loss = rot_loss_val * rot_weight + trans_loss_val * trans_weight
+
+        # Metrics always stay in composed pose space.
+        T_delta = se3_exp(delta_xi)
+        pose_pred = torch.bmm(T_delta, pose_init)
+        R_pred = pose_pred[:, :3, :3]
+        R_gt = pose_gt[:, :3, :3]
+        R_rel = torch.bmm(R_pred.transpose(1, 2), R_gt)
+        trace = R_rel[:, 0, 0] + R_rel[:, 1, 1] + R_rel[:, 2, 2]
+        cos_angle = torch.clamp((trace - 1.0) / 2.0, -1.0, 1.0)
+
+        cos_for_metric = cos_angle.clamp(-1.0 + 1e-7, 1.0 - 1e-7)
+        rot_err_deg = torch.acos(cos_for_metric) * 180.0 / math.pi
+
+        c_pred = camera_centers_from_w2c(pose_pred)
+        c_gt = camera_centers_from_w2c(pose_gt)
+        trans_err = torch.norm(c_pred - c_gt, dim=1)
+
+    rot_mean = rot_err_deg.mean().item()
+    trans_mean = (trans_err * 1000).mean().item()
+    if not math.isfinite(rot_mean):
+        rot_mean = float('nan')
+    if not math.isfinite(trans_mean):
+        trans_mean = float('nan')
+    return loss, {
+        'rot_err_deg': rot_mean,
+        'trans_err_mm': trans_mean,
+        'pose_loss': loss.item(),
+    }
+
+
+def flow_loss_fn(
+    flow_pred: torch.Tensor,
+    flow_gt: torch.Tensor,
+    valid_mask: torch.Tensor,
+    huber_delta: float = 5.0,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """Masked Huber flow loss with EPE metric.
+
+    Args:
+        flow_pred: (B, 2, H, W) predicted flow
+        flow_gt:   (B, 2, H, W) GT flow
+        valid_mask: (B, 1, H, W) validity mask
+        huber_delta: Huber threshold in pixels
+    """
+    diff = flow_pred - flow_gt
+    abs_diff = diff.abs()
+    loss_map = torch.where(
+        abs_diff <= huber_delta,
+        0.5 * diff.pow(2) / huber_delta,
+        abs_diff - 0.5 * huber_delta,
+    )
+    n_valid = valid_mask.sum().clamp(min=1.0)
+    loss = (loss_map * valid_mask).sum() / (n_valid * 2)
+
+    # EPE metric
+    epe_map = torch.norm(diff, dim=1, keepdim=True)
+    epe = (epe_map * valid_mask).sum() / n_valid
+
+    return loss, {
+        'flow_loss': loss.item(),
+        'flow_epe': epe.item(),
+    }
+
+
+def confidence_regularization_loss(
+    confidence: torch.Tensor,
+    target_range: Tuple[float, float] = (0.05, 0.95),
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """Prevent confidence collapse by penalizing extremes."""
+    mean_conf = confidence.mean()
+    lo, hi = target_range
+    loss = torch.tensor(0.0, device=confidence.device)
+    if mean_conf < lo:
+        loss = (lo - mean_conf) ** 2
+    elif mean_conf > hi:
+        loss = (mean_conf - hi) ** 2
+    return loss, {
+        'conf_mean': mean_conf.item(),
+        'conf_reg_loss': loss.item(),
+    }
+
+
+def confidence_nll_loss(
+    flow_pred: torch.Tensor,
+    flow_gt: torch.Tensor,
+    confidence: torch.Tensor,
+    valid: torch.Tensor,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """Self-supervised confidence via Laplacian NLL.
+
+    Models flow error as Laplace(0, b) with b = 1/conf:
+        NLL = |error| * conf - log(conf)
+    Optimal conf* = 1/|error|, so confidence is high where flow is accurate.
+
+    Args:
+        flow_pred: (B, 2, H, W) predicted flow
+        flow_gt: (B, 2, H, W) ground truth flow
+        confidence: (B, 2, H, W) predicted confidence (sigmoid, 0-1)
+        valid: (B, H, W) or (B, 1, H, W) valid mask
+    Returns:
+        loss, metrics dict
+    """
+    # Per-channel absolute error
+    error = (flow_pred - flow_gt).abs()  # (B, 2, H, W)
+
+    # Clamp confidence to avoid log(0)
+    conf = confidence.clamp(min=1e-4, max=1.0 - 1e-4)
+
+    # Laplacian NLL: |error| * conf - log(conf)
+    # conf acts as precision (1/scale), higher conf = tighter distribution
+    nll = error * conf - torch.log(conf)
+
+    # Mask
+    if valid.ndim == 3:
+        mask = valid.unsqueeze(1).expand_as(nll).float()
+    else:
+        mask = valid.expand_as(nll).float()
+
+    n_valid = mask.sum().clamp(min=1.0)
+    loss = (nll * mask).sum() / n_valid
+
+    # Metrics
+    with torch.no_grad():
+        conf_mean = confidence.mean().item()
+        conf_std = confidence.std().item()
+        # Correlation between confidence and inverse error
+        err_flat = (error * mask).sum(dim=1).reshape(-1)
+        conf_flat = (conf[:, :1] * mask[:, :1]).sum(dim=1).reshape(-1)
+        # Simple correlation metric (higher = more aligned)
+        high_conf_mask = conf_flat > conf_flat.median()
+        if high_conf_mask.sum() > 0:
+            err_high_conf = err_flat[high_conf_mask].mean().item()
+            err_low_conf = err_flat[~high_conf_mask].mean().item()
+        else:
+            err_high_conf = err_low_conf = 0.0
+
+    return loss, {
+        'conf_nll_loss': loss.item(),
+        'conf_mean': conf_mean,
+        'conf_std': conf_std,
+        'conf_err_ratio': err_low_conf / max(err_high_conf, 1e-6),
+    }
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  Visualization Utilities
+# ═════════════════════════════════════════════════════════════════════════════
+
+def features_to_pca_rgb(features: torch.Tensor) -> torch.Tensor:
+    """Convert (C, H, W) feature map to (3, H, W) RGB via PCA."""
+    from sklearn.decomposition import PCA
+    C, H, W = features.shape
+    feat_np = features.detach().cpu().float().numpy().reshape(C, -1).T
+    pca = PCA(n_components=3)
+    proj = pca.fit_transform(feat_np)
+    for i in range(3):
+        lo, hi = np.percentile(proj[:, i], [2, 98])
+        proj[:, i] = np.clip((proj[:, i] - lo) / max(hi - lo, 1e-8), 0, 1)
+    return torch.from_numpy(proj.T.reshape(3, H, W)).float()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  ConcatLocTrainer
+# ═════════════════════════════════════════════════════════════════════════════
+
+class ConcatLocTrainer:
+    """End-to-end localization trainer: concatenated RADIO query + DCFF map."""
+
+    def __init__(
+        self,
+        config: dict,
+        gpu: int = 0,
+        resume_path: str = None,
+        warmstart_path: str = None,
+        dcff_checkpoint: str = None,
+    ):
+        self.config = config
+        self.gpu = gpu
+        self.device = torch.device(f'cuda:{gpu}')
+
+        # Output directories
+        exp_name = config['exp_name']
+        self.exp_name = exp_name
+        output_base = resolve_repo_path(config.get('output_dir', 'output'))
+        assert output_base is not None
+        self.output_dir = Path(output_base) / exp_name
+        self.ckpt_dir = self.output_dir / 'checkpoints'
+        self.vis_dir = self.output_dir / 'vis'
+        self.ckpt_dir.mkdir(parents=True, exist_ok=True)
+        self.vis_dir.mkdir(parents=True, exist_ok=True)
+
+        self.logger = setup_logging(str(self.output_dir), exp_name)
+        self.logger.info(f'Experiment: {exp_name}')
+        self.logger.info(f'Output: {self.output_dir}')
+        self.logger.info(f'Device: {self.device}')
+
+        # Save config
+        with open(self.output_dir / 'config.yaml', 'w') as f:
+            yaml.dump(config, f, default_flow_style=False)
+
+        # Override DCFF checkpoint from CLI
+        if dcff_checkpoint:
+            config.setdefault('dcff', {})['checkpoint'] = dcff_checkpoint
+
+        # Training config
+        tc = config.get('training', {})
+        self.total_epochs = tc.get('epochs', 200)
+        self.grad_clip = tc.get('grad_clip', 1.0)
+        self.val_every = tc.get('val_every', 5)
+        self.save_every = tc.get('save_every', 10)
+        self.save_epoch_checkpoints = tc.get('save_epoch_checkpoints', False)
+        self.vis_every = tc.get('vis_every', 10)
+        self.num_vis_samples = tc.get('num_vis_samples', 4)
+        self.use_amp = bool(tc.get('use_amp', True))
+        self.warmstart_skip_prefixes = [
+            str(prefix) for prefix in tc.get('warmstart_skip_prefixes', [])
+        ]
+
+        # Loss config
+        loss_cfg = tc.get('loss', {})
+        self.pose_weight = loss_cfg.get('pose_weight', 0.5)
+        self.flow_weight = loss_cfg.get('flow_weight', 1.0)
+        self.rot_weight = loss_cfg.get('rot_weight', 1.0)
+        self.trans_weight = loss_cfg.get('trans_weight', 10.0)
+        self.rot_loss_type = loss_cfg.get('rot_loss_type', 'cosine')
+        self.pose_loss_mode = loss_cfg.get('pose_loss_mode', 'compose')
+        self.conf_reg_weight = loss_cfg.get('conf_reg_weight', 0.01)
+        self.conf_nll_weight = loss_cfg.get('conf_nll_weight', 0.0)
+        self.feat_match_weight = loss_cfg.get('feat_match_weight', 0.0)
+        self.use_direct_trans_loss = loss_cfg.get('direct_trans_loss', True)
+        self.coarse_pose_weight = loss_cfg.get('coarse_pose_weight', self.pose_weight)
+        self.full_pose_weight = loss_cfg.get('full_pose_weight', 0.0)
+
+        # Phases
+        self.phase1_epochs = tc.get('phase1_epochs', 30)
+
+        # Outer iterations
+        self.outer_iters_train = tc.get('outer_iters_train', 1)
+        self.outer_iters_val = tc.get('outer_iters_val', 5)
+
+        # Noise curriculum
+        nc = tc.get('noise_curriculum', {})
+        self.noise_rot_start = nc.get('rot_start_deg', 2.0)
+        self.noise_rot_end = nc.get('rot_end_deg', 10.0)
+        self.noise_trans_start = nc.get('trans_start_m', 0.05)
+        self.noise_trans_end = nc.get('trans_end_m', 0.50)
+        self.noise_warmup_epochs = nc.get('warmup_epochs', 60)
+        # Per-sample noise range: randomize noise magnitude per sample
+        self.noise_rot_min = nc.get('rot_min_deg', None)
+        self.noise_trans_min = nc.get('trans_min_m', None)
+
+        # Optional separate val noise (defaults to noise_end values)
+        self.val_noise_deg = tc.get('val_noise_deg', self.noise_rot_end)
+        self.val_noise_m = tc.get('val_noise_m', self.noise_trans_end)
+
+        qc = tc.get('query_curriculum', {})
+        self.query_curriculum_enabled = bool(qc.get('enabled', False))
+        self.query_curriculum_start_epoch = int(qc.get('start_epoch', 0))
+        self.query_curriculum_end_epoch = int(qc.get('end_epoch', 0))
+
+        # Build components
+        self._build_dcff()
+        self._build_model()
+        self._build_datasets()
+        self._build_optimizer()
+
+        # Mixed precision
+        self.scaler = GradScaler(enabled=self.use_amp)
+
+        # TensorBoard
+        self.writer = SummaryWriter(log_dir=str(self.output_dir / 'tb'))
+
+        # Training state
+        self.epoch = 0
+        self.global_step = 0
+        self.best_val_trans = float('inf')
+        self.latest_val_metrics: Dict[str, float] = {}
+        self.epochs_since_best = 0
+        tc = self.config.get('training', {})
+        self.early_stop_patience = tc.get('early_stop_patience', 0)  # 0 = disabled
+
+        # Resume / warmstart
+        if resume_path:
+            self._load_checkpoint(resume_path)
+        elif warmstart_path:
+            self._warmstart(warmstart_path)
+
+        if not self.save_epoch_checkpoints:
+            self._cleanup_epoch_checkpoints()
+
+    # ── DCFF Loading ──────────────────────────────────────────────────────
+
+    def _build_dcff(self):
+        """Load pre-trained DCFF model (frozen) for rendering."""
+        torch.cuda.set_device(self.gpu)
+        runtime = build_dcff_runtime(
+            self.config,
+            self.device,
+            printer=self.logger.info,
+        )
+        self.gaussians = runtime.gaussians
+        self.hash_grid = runtime.hash_grid
+        self.dcff_renderer = runtime.renderer
+        self.feat_sharp_fine = runtime.refiner
+        self.feat_select = runtime.feat_select
+        self.finetune_decoder = runtime.finetune_decoder
+        self.finetune_fsm = runtime.finetune_fsm
+        self.render_h = runtime.render_height
+        self.render_w = runtime.render_width
+        return
+
+        cfg_dcff = self.config.get('dcff', {})
+        dcff_ckpt_path = cfg_dcff.get('checkpoint')
+        joint_ckpt_path = cfg_dcff.get('joint_checkpoint')
+        ply_path = cfg_dcff.get('ply_path')
+
+        if not dcff_ckpt_path or not os.path.isfile(dcff_ckpt_path):
+            raise FileNotFoundError(
+                f"DCFF checkpoint not found: {dcff_ckpt_path}\n"
+                f"Set dcff.checkpoint in config or use --dcff_checkpoint"
+            )
+        if not ply_path or not os.path.isfile(ply_path):
+            raise FileNotFoundError(
+                f"PLY file not found: {ply_path}\n"
+                f"Set dcff.ply_path in config"
+            )
+
+        torch.cuda.set_device(self.gpu)
+
+        latent_dim = cfg_dcff.get('latent_dim', 32)
+        feature_dim = cfg_dcff.get('feature_dim', 64)
+
+        # 1. Load 2DGS geometry + latent
+        self.gaussians = HybridGaussianModel(sh_degree=3, latent_dim=latent_dim)
+        self.gaussians.load_ply(ply_path, freeze_geometry=True)
+        self.gaussians.active_sh_degree = 3
+        self.logger.info(f'Loaded {self.gaussians.num_points:,} Gaussians from {ply_path}')
+
+        # Scene extent for hash grid
+        xyz = self.gaussians.get_xyz.detach()
+        scene_extent = float((xyz.max(dim=0).values - xyz.min(dim=0).values).max()) * 0.6
+        self.logger.info(f'Scene extent: {scene_extent:.2f}')
+
+        # Load DCFF training config if available
+        dcff_config_path = os.path.join(os.path.dirname(dcff_ckpt_path), '..', 'config.yaml')
+        dcff_cfg = {}
+        if os.path.isfile(dcff_config_path):
+            with open(dcff_config_path) as f:
+                dcff_cfg = yaml.safe_load(f) or {}
+            self.logger.info(f'Loaded DCFF config from {dcff_config_path}')
+
+        hcfg = dcff_cfg.get('hash_grid', {})
+        fcfg = dcff_cfg.get('fine_decoder', {})
+
+        # 2. Build hash grid
+        input_mode = hcfg.get('input_mode', 'implicit_scale')
+        self.hash_grid = SpatialHashGrid(
+            scene_extent=hcfg.get('scene_extent', scene_extent),
+            feature_dim=feature_dim,
+            input_mode=input_mode,
+            latent_dim=latent_dim,
+            n_levels=hcfg.get('n_levels', 16),
+            n_features_per_level=hcfg.get('n_features_per_level', 2),
+            log2_hashmap_size=hcfg.get('log2_hashmap_size', 19),
+            base_resolution=hcfg.get('base_resolution', 16),
+            max_resolution=hcfg.get('max_resolution', 2048),
+            mlp_hidden=hcfg.get('mlp_hidden', 128),
+            mlp_layers=hcfg.get('mlp_layers', 2),
+            scale_pe_freqs=hcfg.get('scale_pe_freqs', 4),
+            include_raw_scale=hcfg.get('include_raw_scale', True),
+        ).to(self.device)
+
+        # 3. Build renderer (wraps fine decoder)
+        self.dcff_renderer = DeferredCascadedRenderer(
+            hash_grid=self.hash_grid,
+            latent_dim=latent_dim,
+            fine_feature_dim=feature_dim,
+            coarse_feature_dim=feature_dim,
+            fine_hidden_dim=fcfg.get('hidden_dim', 128),
+            fine_num_layers=fcfg.get('num_layers', 3),
+            fine_use_viewdirs=fcfg.get('use_viewdirs', False),
+            fine_view_degree=fcfg.get('view_degree', 2),
+            fine_decoder_type=fcfg.get('type', 'mlp'),
+            coarse_smoothing_kernel=cfg_dcff.get('coarse_smoothing_kernel', 1),
+        ).to(self.device)
+
+        # 4. Feature refinement module (auto-detect from DCFF config)
+        refiner_type = dcff_cfg.get('refiner', {}).get('type', 'featsharp')
+        if refiner_type == 'depth_guided':
+            refiner_hidden = dcff_cfg.get('refiner', {}).get('hidden_dim', 128)
+            self.feat_sharp_fine = DepthGuidedRefiner(
+                feature_dim, hidden_dim=refiner_hidden).to(self.device)
+            self.logger.info(f'  Using DepthGuidedRefiner (hidden={refiner_hidden})')
+        else:
+            self.feat_sharp_fine = FeatSharp(feature_dim).to(self.device)
+            self.logger.info('  Using FeatSharp')
+
+        # 5. Load checkpoint weights
+        self.logger.info(f'Loading DCFF checkpoint: {dcff_ckpt_path}')
+        ckpt = torch.load(dcff_ckpt_path, map_location=self.device)
+        self.hash_grid.load_state_dict(ckpt['hash_grid_state'])
+        self.dcff_renderer.fine_decoder.load_state_dict(ckpt['fine_decoder_state'])
+        if 'feat_sharp_fine_state' in ckpt:
+            try:
+                self.feat_sharp_fine.load_state_dict(
+                    ckpt['feat_sharp_fine_state'], strict=True)
+            except RuntimeError:
+                self.logger.warning(
+                    '  feat_sharp_fine shape mismatch — loading partial')
+                self.feat_sharp_fine.load_state_dict(
+                    ckpt['feat_sharp_fine_state'], strict=False)
+        if 'latent' in ckpt:
+            saved_latent = ckpt['latent'].to(self.device)
+            if saved_latent.shape == self.gaussians._latent.shape:
+                with torch.no_grad():
+                    self.gaussians._latent.data.copy_(saved_latent)
+                self.logger.info('  Restored latent embeddings from checkpoint')
+            else:
+                self.logger.warning(
+                    f'  Latent shape mismatch: ckpt={saved_latent.shape} vs '
+                    f'model={self.gaussians._latent.shape}, skipping'
+                )
+
+        if joint_ckpt_path:
+            if not os.path.isfile(joint_ckpt_path):
+                raise FileNotFoundError(f"Joint checkpoint not found: {joint_ckpt_path}")
+            self.logger.info(f'Loading joint feature checkpoint: {joint_ckpt_path}')
+            joint_ckpt = torch.load(joint_ckpt_path, map_location=self.device)
+            joint_map_state = joint_ckpt.get('map_renderer_state_dict') or {}
+
+            # Allow config to restrict which components are overridden
+            allowed = cfg_dcff.get('joint_override_components', None)
+            if allowed is not None:
+                allowed = set(allowed)
+                self.logger.info(f'  joint_override_components filter: {sorted(allowed)}')
+
+            loaded_components = []
+            if 'fine_decoder' in joint_map_state and (allowed is None or 'fine_decoder' in allowed):
+                try:
+                    self.dcff_renderer.fine_decoder.load_state_dict(joint_map_state['fine_decoder'])
+                    loaded_components.append('fine_decoder')
+                except (RuntimeError, KeyError) as e:
+                    self.logger.warning(f'  Skipping joint fine_decoder (architecture changed): {e}')
+            if 'feat_sharp' in joint_map_state and (allowed is None or 'feat_sharp' in allowed):
+                try:
+                    self.feat_sharp_fine.load_state_dict(joint_map_state['feat_sharp'])
+                    loaded_components.append('feat_sharp')
+                except (RuntimeError, KeyError) as e:
+                    self.logger.warning(f'  Skipping joint feat_sharp (architecture changed): {e}')
+            if 'hash_grid_mlp' in joint_map_state and (allowed is None or 'hash_grid_mlp' in allowed):
+                try:
+                    self.dcff_renderer.hash_grid.mlp.load_state_dict(joint_map_state['hash_grid_mlp'])
+                    loaded_components.append('hash_grid_mlp')
+                except (RuntimeError, KeyError) as e:
+                    self.logger.warning(f'  Skipping joint hash_grid_mlp (architecture changed): {e}')
+            if loaded_components:
+                self.logger.info(
+                    '  Overrode DCFF modules from joint checkpoint: %s',
+                    ', '.join(loaded_components),
+                )
+            else:
+                self.logger.warning(
+                    '  joint checkpoint has no map_renderer_state_dict overrides; keeping base DCFF weights'
+                )
+
+        dcff_iter = ckpt.get('iteration', '?')
+        self.logger.info(f'  DCFF loaded (iter {dcff_iter})')
+
+        # 6. Freeze DCFF parameters (optionally unfreeze fine_decoder)
+        self.gaussians._latent.requires_grad_(False)
+        for p in self.hash_grid.parameters():
+            p.requires_grad_(False)
+        for p in self.dcff_renderer.parameters():
+            p.requires_grad_(False)
+        for p in self.feat_sharp_fine.parameters():
+            p.requires_grad_(False)
+        self.hash_grid.eval()
+        self.dcff_renderer.eval()
+        self.feat_sharp_fine.eval()
+
+        # End-to-end decoder fine-tuning: unfreeze fine_decoder + feat_sharp
+        self.finetune_decoder = cfg_dcff.get('finetune_decoder', False)
+        if self.finetune_decoder:
+            for p in self.dcff_renderer.fine_decoder.parameters():
+                p.requires_grad_(True)
+            for p in self.feat_sharp_fine.parameters():
+                p.requires_grad_(True)
+            self.dcff_renderer.fine_decoder.train()
+            self.feat_sharp_fine.train()
+            n_dec = sum(p.numel() for p in self.dcff_renderer.fine_decoder.parameters())
+            n_fs = sum(p.numel() for p in self.feat_sharp_fine.parameters())
+            self.logger.info(f'  Decoder fine-tuning enabled: {n_dec + n_fs:,} params unfrozen')
+
+        # Rendering resolution
+        self.render_w = cfg_dcff.get('render_width', 120)
+        self.render_h = cfg_dcff.get('render_height', 68)
+        self.logger.info(f'  Render resolution: {self.render_w}×{self.render_h}')
+
+    # ── Model ─────────────────────────────────────────────────────────────
+
+    def _build_model(self):
+        """Build ConcatPoseNet (trainable)."""
+        mcfg = self.config.get('model', {})
+        self.use_coarse = mcfg.get('use_coarse', False)
+        self.use_gru = mcfg.get('use_gru', False)
+        self.model = build_concat_pose_model(mcfg, self.device)
+        self.use_two_stage_refine = bool(getattr(self.model, 'use_two_stage_refine', False))
+
+        n_params = sum(p.numel() for p in self.model.parameters())
+        n_train = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        mode_str = 'GRU' if self.use_gru else 'Concat'
+        stage_str = 'two-stage' if self.use_two_stage_refine else 'single-stage'
+        self.logger.info(f'ConcatPoseNet ({mode_str}, {stage_str}): {n_params:,} params ({n_train:,} trainable)')
+
+    # ── Datasets ──────────────────────────────────────────────────────────
+
+    def _build_datasets(self):
+        """Build train/val datasets + DataLoaders."""
+        dcfg = self.config.get('dataset', {})
+
+        fine_hw = tuple(dcfg.get('fine_hw', [self.render_h, self.render_w]))
+        coarse_hw = tuple(dcfg.get('coarse_hw', fine_hw))
+        common_kwargs = dict(
+            feature_dir=dcfg['feature_dir'],
+            colmap_dir=dcfg['colmap_dir'],
+            source_dir=dcfg.get('source_dir'),
+            coarse_hw=coarse_hw,
+            fine_hw=fine_hw,
+            cache_in_memory=dcfg.get('cache_in_memory', True),
+            normalize_features=dcfg.get('normalize_features', False),
+        )
+        teacher_feature_dir = dcfg.get('teacher_feature_dir') if self.query_curriculum_enabled else None
+        source_dir = dcfg.get('source_dir')
+        retrieval_train_split = dcfg.get('retrieval_train_split', dcfg.get('train_split'))
+
+        def _validate_init_cache(config_key: str) -> Optional[str]:
+            cache_path = dcfg.get(config_key)
+            if cache_path in (None, ''):
+                return None
+            resolved = resolve_repo_path(cache_path, must_exist=True)
+            assert resolved is not None
+            return str(resolved)
+
+        train_init_poses_path = _validate_init_cache('train_init_poses_path')
+        val_init_poses_path = _validate_init_cache('val_init_poses_path')
+        self.train_uses_explicit_init = train_init_poses_path is not None
+        self.val_uses_explicit_init = val_init_poses_path is not None
+        self.train_jitter_loaded_init = bool(dcfg.get('train_jitter_loaded_init', False))
+
+        def _build_dataset(
+            *,
+            split: str,
+            split_file: Optional[str],
+            noise_rot_deg: float,
+            noise_trans_m: float,
+            teacher_feature_dir_override: Optional[str] = None,
+            init_poses_path: Optional[str] = None,
+        ):
+            dataset_kwargs = dict(
+                split=split,
+                split_file=split_file,
+                noise_rot_deg=noise_rot_deg,
+                noise_trans_m=noise_trans_m,
+                teacher_feature_dir=teacher_feature_dir_override,
+                **common_kwargs,
+            )
+            if init_poses_path is None:
+                return RadioLocDataset(**dataset_kwargs)
+            return RadioLocRetrievalDataset(
+                init_poses_path=init_poses_path,
+                retrieval_train_split=retrieval_train_split,
+                jitter_loaded_init=bool(dcfg.get('train_jitter_loaded_init', False)) if split == 'train' else False,
+                sample_topk_init=bool(dcfg.get('train_sample_topk_init', False)) if split == 'train' else False,
+                sample_topk_prob=float(dcfg.get('train_sample_topk_prob', 0.0)) if split == 'train' else 0.0,
+                **dataset_kwargs,
+            )
+
+        self.train_dataset = _build_dataset(
+            split='train',
+            split_file=dcfg.get('train_split'),
+            noise_rot_deg=self.noise_rot_start,
+            noise_trans_m=self.noise_trans_start,
+            teacher_feature_dir_override=teacher_feature_dir,
+            init_poses_path=train_init_poses_path,
+        )
+        # Set per-sample noise range if configured.
+        if not self.train_uses_explicit_init and self.noise_rot_min is not None:
+            self.train_dataset.noise_rot_min = self.noise_rot_min
+            self.train_dataset.noise_trans_min = self.noise_trans_min
+            self.logger.info(f'  Per-sample noise range: rot=[{self.noise_rot_min}°, {self.noise_rot_start}°] '
+                             f'trans=[{self.noise_trans_min}m, {self.noise_trans_start}m]')
+        if self.train_uses_explicit_init:
+            self.logger.info(f'  Train init poses: {train_init_poses_path}')
+            self.logger.info(f'  Train init stats: {getattr(self.train_dataset, "init_stats", {})}')
+        self.val_dataset = _build_dataset(
+            split='test',
+            split_file=dcfg.get('test_split'),
+            noise_rot_deg=self.val_noise_deg,
+            noise_trans_m=self.val_noise_m,
+            init_poses_path=val_init_poses_path,
+        )
+        if self.val_uses_explicit_init:
+            self.logger.info(f'  Val init poses: {val_init_poses_path}')
+            self.logger.info(f'  Val init stats: {getattr(self.val_dataset, "init_stats", {})}')
+
+        # Store intrinsics (at COLMAP native resolution)
+        self.intrinsics = self.train_dataset.intrinsics
+
+        # Read original COLMAP camera resolution for proper scaling
+        colmap_dir = dcfg['colmap_dir']
+        colmap_cameras = read_colmap_cameras(
+            os.path.join(colmap_dir, 'cameras.bin'))
+        first_cam = next(iter(colmap_cameras.values()))
+        self.orig_img_hw = (int(first_cam.height), int(first_cam.width))
+
+        if self.intrinsics:
+            self.logger.info(
+                f'Intrinsics (native {self.orig_img_hw[1]}×{self.orig_img_hw[0]}): '
+                f'fx={self.intrinsics["fx"]:.1f} '
+                f'fy={self.intrinsics["fy"]:.1f} '
+                f'cx={self.intrinsics["cx"]:.1f} '
+                f'cy={self.intrinsics["cy"]:.1f}'
+            )
+            # Set on model for intrinsics scaling
+            self.model.BASE_INTRINSICS = self.intrinsics
+            self.model.IMG_HW = self.orig_img_hw
+
+        tc = self.config.get('training', {})
+        batch_size = tc.get('batch_size', 6)
+
+        self.train_loader = DataLoader(
+            self.train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=4,
+            pin_memory=True,
+            persistent_workers=False,
+            collate_fn=collate_fn,
+            drop_last=True,
+        )
+        self.val_loader = DataLoader(
+            self.val_dataset,
+            batch_size=min(batch_size, 6),
+            shuffle=False,
+            num_workers=4,
+            pin_memory=True,
+            collate_fn=collate_fn,
+        )
+
+        self.logger.info(f'Train: {len(self.train_dataset)} samples, '
+                         f'{len(self.train_loader)} batches')
+        self.logger.info(f'Val: {len(self.val_dataset)} samples, '
+                         f'{len(self.val_loader)} batches')
+
+    # ── Optimizer ─────────────────────────────────────────────────────────
+
+    def _build_optimizer(self):
+        """AdamW + CosineAnnealingLR."""
+        tc = self.config.get('training', {})
+        lr = tc.get('lr', 3e-4)
+        weight_decay = tc.get('weight_decay', 1e-5)
+
+        param_groups = [
+            {'params': self.model.parameters(), 'lr': lr},
+        ]
+
+        # End-to-end decoder fine-tuning at lower LR
+        if getattr(self, 'finetune_decoder', False):
+            decoder_lr = tc.get('decoder_lr', lr * 0.1)
+            decoder_params = list(self.dcff_renderer.fine_decoder.parameters()) + list(self.feat_sharp_fine.parameters())
+            if self.dcff_renderer.coarse_carrier_fusion is not None:
+                decoder_params += list(self.dcff_renderer.coarse_carrier_fusion.parameters())
+            param_groups.append({
+                'params': decoder_params,
+                'lr': decoder_lr,
+            })
+            self.logger.info(f'  Decoder LR: {decoder_lr:.1e} (main: {lr:.1e})')
+        if getattr(self, 'finetune_fsm', False) and self.feat_select is not None:
+            fsm_lr = tc.get('fsm_lr', tc.get('decoder_lr', lr * 0.1))
+            param_groups.append({
+                'params': list(self.feat_select.parameters()),
+                'lr': fsm_lr,
+            })
+            self.logger.info(f'  FSM LR: {fsm_lr:.1e} (main: {lr:.1e})')
+
+        self.optimizer = optim.AdamW(
+            param_groups,
+            lr=lr,
+            weight_decay=weight_decay,
+        )
+
+        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer,
+            T_max=max(tc.get('epochs', 200), 1),
+            eta_min=tc.get('min_lr', 1e-6),
+        )
+
+    def _set_map_train_mode(self, enabled: bool) -> None:
+        if enabled:
+            self.dcff_renderer.train(self.finetune_decoder or self.finetune_fsm)
+            self.feat_sharp_fine.train(self.finetune_decoder)
+            if self.dcff_renderer.coarse_carrier_fusion is not None:
+                self.dcff_renderer.coarse_carrier_fusion.train(self.finetune_decoder)
+            if self.feat_select is not None:
+                self.feat_select.train(self.finetune_fsm)
+        else:
+            self.dcff_renderer.eval()
+            self.feat_sharp_fine.eval()
+            if self.feat_select is not None:
+                self.feat_select.eval()
+
+    # ── DCFF Rendering ────────────────────────────────────────────────────
+
+    def _intrinsics_to_K(self, intrinsics: Dict[str, float]) -> torch.Tensor:
+        """Convert intrinsics dict to 3×3 K matrix on device."""
+        return intrinsics_to_K(intrinsics, self.device)
+
+    @torch.no_grad()
+    def _render_dcff_at_pose(
+        self,
+        pose_w2c: torch.Tensor,
+        render_coarse: bool | None = None,
+    ) -> Dict[str, Optional[torch.Tensor]]:
+        """Render DCFF fine/coarse features + depth at a given w2c pose.
+
+        Args:
+            pose_w2c: (4, 4) world-to-camera transform
+
+        Returns:
+            dict containing fine/coarse features, depth, and FSM aux outputs
+        """
+        render_intr = self.model._scale_intrinsics(self.render_h, self.render_w)
+        K = self._intrinsics_to_K(render_intr)
+        render_bundle = render_feature_bundle_batch(
+            self.gaussians,
+            self.dcff_renderer,
+            self.feat_sharp_fine,
+            pose_w2c.unsqueeze(0).to(self.device),
+            K,
+            self.render_h,
+            self.render_w,
+            render_coarse=render_coarse,
+        )
+        return render_bundle
+
+    def _render_dcff_at_pose_differentiable(
+        self,
+        pose_w2c: torch.Tensor,
+        render_coarse: bool | None = None,
+    ) -> Dict[str, Optional[torch.Tensor]]:
+        """Render DCFF with gradient through fine_decoder + feat_sharp."""
+        viewmat = pose_w2c.float().to(self.device)
+        render_intr = self.model._scale_intrinsics(self.render_h, self.render_w)
+        K = self._intrinsics_to_K(render_intr)
+        use_coarse_for_fsm = bool(getattr(self.dcff_renderer, '_fsm_use_coarse', False))
+        should_render_coarse = use_coarse_for_fsm if render_coarse is None else bool(render_coarse)
+
+        # Rasterize z_map without gradient (geometry is frozen)
+        with torch.no_grad():
+            result = self.dcff_renderer(
+                self.gaussians,
+                viewmat=viewmat,
+                K=K,
+                width=self.render_w,
+                height=self.render_h,
+                render_coarse=should_render_coarse,
+                feature_height=self.render_h,
+                feature_width=self.render_w,
+            )
+            z_map = result['z_map'].detach()
+            depth = result['depth'].detach()
+            alpha = result.get('alpha')
+            scale_map = result.get('scale_map')
+            if alpha is not None:
+                alpha = alpha.detach()
+            if scale_map is not None:
+                scale_map = scale_map.detach()
+
+        position_map = None
+        if self.dcff_renderer.fine_decoder.use_viewdirs or should_render_coarse:
+            position_map = self.dcff_renderer.depth_to_position_map(depth, K, viewmat)
+
+        coarse_features = None
+        if should_render_coarse:
+            coarse_features = self.dcff_renderer.decode_coarse(
+                position_map=position_map,
+                alpha=alpha if alpha is not None else torch.ones_like(depth),
+                z_map=z_map,
+                scale_map=scale_map,
+                viewmat=viewmat,
+            ).float()
+            if self.dcff_renderer.coarse_carrier_fusion is not None:
+                coarse_features, _, _ = self.dcff_renderer.coarse_carrier_fusion(
+                    z_map,
+                    coarse_features,
+                )
+
+        # Re-decode through fine_decoder WITH gradient
+        fine_feat = self.dcff_renderer.decode_fine(
+            z_map,
+            position_map=position_map,
+            viewmat=viewmat,
+        ).float()
+
+        post_result = {
+            'fine_features': fine_feat,
+            'coarse_features': coarse_features,
+            'depth': depth,
+            'alpha': alpha if alpha is not None else torch.ones_like(depth),
+        }
+        post_result = _apply_dcff_postprocess(
+            post_result,
+            self.render_h,
+            self.render_w,
+            feat_sharp=self.feat_sharp_fine,
+            feat_select=self.feat_select,
+            use_coarse_for_fsm=use_coarse_for_fsm,
+            temperature=0.5,
+            hard=False,
+        )
+
+        return {
+            'fine_features': post_result['fine_features'].float(),
+            'coarse_features': post_result.get('coarse_features').float() if post_result.get('coarse_features') is not None else None,
+            'depth': depth,
+            'fsm_spatial_conf': post_result.get('fsm_spatial_conf').float() if post_result.get('fsm_spatial_conf') is not None else None,
+            'fsm_channel_weights': post_result.get('fsm_channel_weights').float() if post_result.get('fsm_channel_weights') is not None else None,
+        }
+
+    @torch.no_grad()
+    def _render_batch(
+        self,
+        poses_w2c: torch.Tensor,
+        render_coarse: bool | None = None,
+    ) -> Dict[str, Optional[torch.Tensor]]:
+        """Render DCFF features + depth for a batch of poses.
+
+        Args:
+            poses_w2c: (B, 4, 4)
+
+        Returns:
+            dict containing batched fine/coarse features, depth, and FSM aux outputs
+        """
+        render_intr = self.model._scale_intrinsics(self.render_h, self.render_w)
+        K = self._intrinsics_to_K(render_intr)
+        return render_feature_bundle_batch(
+            self.gaussians,
+            self.dcff_renderer,
+            self.feat_sharp_fine,
+            poses_w2c.to(self.device),
+            K,
+            self.render_h,
+            self.render_w,
+            render_coarse=render_coarse,
+        )
+
+    def _render_batch_differentiable(
+        self,
+        poses_w2c: torch.Tensor,
+        render_coarse: bool | None = None,
+    ) -> Dict[str, Optional[torch.Tensor]]:
+        """Render with gradient through fine_decoder for end-to-end training."""
+        B = poses_w2c.shape[0]
+        fine_list, depth_list = [], []
+        coarse_list = []
+        fsm_spatial_list = []
+        fsm_channel_list = []
+
+        for i in range(B):
+            rendered_i = self._render_dcff_at_pose_differentiable(poses_w2c[i], render_coarse=render_coarse)
+            fine_list.append(rendered_i['fine_features'].squeeze(0))
+            depth_list.append(rendered_i['depth'].squeeze(0).squeeze(0))
+            if rendered_i['coarse_features'] is not None:
+                coarse_list.append(rendered_i['coarse_features'].squeeze(0))
+            if rendered_i['fsm_spatial_conf'] is not None:
+                fsm_spatial_list.append(rendered_i['fsm_spatial_conf'].squeeze(0))
+            if rendered_i['fsm_channel_weights'] is not None:
+                fsm_channel_list.append(rendered_i['fsm_channel_weights'].squeeze(0))
+
+        render_bundle: Dict[str, Optional[torch.Tensor]] = {
+            'fine_features': torch.stack(fine_list, dim=0),
+            'depth': torch.stack(depth_list, dim=0),
+            'coarse_features': torch.stack(coarse_list, dim=0) if len(coarse_list) == B else None,
+            'fsm_spatial_conf': torch.stack(fsm_spatial_list, dim=0) if len(fsm_spatial_list) == B else None,
+            'fsm_channel_weights': torch.stack(fsm_channel_list, dim=0) if len(fsm_channel_list) == B else None,
+        }
+
+        return render_bundle
+
+    def _render_bundle_batch(
+        self,
+        poses_w2c: torch.Tensor,
+        *,
+        differentiable: bool = False,
+        render_coarse: bool | None = None,
+    ) -> Dict[str, Optional[torch.Tensor]]:
+        if differentiable:
+            return self._render_batch_differentiable(poses_w2c, render_coarse=render_coarse)
+        return self._render_batch(poses_w2c, render_coarse=render_coarse)
+
+    # ── Noise Curriculum ──────────────────────────────────────────────────
+
+    def _update_noise_for_epoch(self, epoch: int):
+        """Linearly ramp noise from start to end over warmup epochs."""
+        if getattr(self, 'train_uses_explicit_init', False):
+            if not getattr(self, 'train_jitter_loaded_init', False):
+                if epoch == 0:
+                    self.logger.info('  Noise curriculum disabled: explicit train init poses are in use')
+                return
+
+        t = min(epoch / max(self.noise_warmup_epochs, 1), 1.0)
+        rot_deg = self.noise_rot_start + (self.noise_rot_end - self.noise_rot_start) * t
+        trans_m = self.noise_trans_start + (self.noise_trans_end - self.noise_trans_start) * t
+
+        self.train_dataset.noise_rot_deg = rot_deg
+        self.train_dataset.noise_trans_m = trans_m
+
+        if epoch % 10 == 0 or epoch == 0:
+            self.logger.info(f'  Noise curriculum E{epoch}: '
+                             f'rot={rot_deg:.1f}° trans={trans_m:.3f}m')
+
+    def _student_query_alpha(self) -> float:
+        if not self.query_curriculum_enabled:
+            return 1.0
+
+        start = self.query_curriculum_start_epoch
+        end = self.query_curriculum_end_epoch
+        if end <= start:
+            return 1.0 if self.epoch >= end else 0.0
+        if self.epoch <= start:
+            return 0.0
+        if self.epoch >= end:
+            return 1.0
+        return float(self.epoch - start) / float(end - start)
+
+    def _apply_query_curriculum(
+        self,
+        batch: Dict,
+        query_fine: torch.Tensor,
+        query_coarse: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[float]]:
+        if not self.query_curriculum_enabled:
+            return query_fine, query_coarse, None
+
+        teacher_query_fine = batch.get('teacher_query_fine')
+        if teacher_query_fine is None:
+            return query_fine, query_coarse, None
+
+        alpha = self._student_query_alpha()
+        teacher_query_fine = teacher_query_fine.to(self.device)
+        if alpha <= 0.0:
+            query_fine = teacher_query_fine
+        elif alpha < 1.0:
+            query_fine = torch.lerp(teacher_query_fine, query_fine, alpha)
+
+        teacher_query_coarse = batch.get('teacher_query_coarse')
+        if query_coarse is not None and teacher_query_coarse is not None and self.use_coarse:
+            teacher_query_coarse = teacher_query_coarse.to(self.device)
+            if alpha <= 0.0:
+                query_coarse = teacher_query_coarse
+            elif alpha < 1.0:
+                query_coarse = torch.lerp(teacher_query_coarse, query_coarse, alpha)
+
+        return query_fine, query_coarse, alpha
+
+    # ── Training Step ─────────────────────────────────────────────────────
+
+    def _train_step(
+        self,
+        batch: Dict,
+        use_pose_loss: bool,
+    ) -> Dict[str, float]:
+        """Single training step with optional outer iteration refinement."""
+        query_fine = batch['query_fine'].to(self.device)
+        query_coarse = batch.get('query_coarse')
+        if query_coarse is not None and self.use_coarse:
+            query_coarse = query_coarse.to(self.device)
+        else:
+            query_coarse = None
+        query_fine, query_coarse, student_query_alpha = self._apply_query_curriculum(
+            batch, query_fine, query_coarse,
+        )
+        pose_gt = batch['pose_gt'].to(self.device)
+        pose_cur = batch['pose_init'].to(self.device)
+
+        flow_hw = (self.render_h, self.render_w)
+        render_intr = self.model._scale_intrinsics(self.render_h, self.render_w)
+
+        N = self.outer_iters_train
+        all_metrics = {}
+        total_loss_val = 0.0
+        differentiable_render = self.finetune_decoder or self.finetune_fsm
+        if student_query_alpha is not None:
+            all_metrics['student_query_alpha'] = float(student_query_alpha)
+
+        def render_batch_fn(poses_w2c: torch.Tensor, render_coarse: bool | None) -> Dict[str, Optional[torch.Tensor]]:
+            return self._render_bundle_batch(
+                poses_w2c,
+                differentiable=differentiable_render,
+                render_coarse=render_coarse,
+            )
+
+        for outer_i in range(N):
+            iter_state = run_model_refine_iteration(
+                self.model,
+                render_batch_fn,
+                query_fine,
+                query_coarse,
+                pose_cur,
+                render_intr,
+                outer_iter=outer_i,
+                autocast_enabled=self.use_amp,
+            )
+            pred = iter_state['fine_pred']
+            fine_bundle = iter_state['fine_bundle']
+            depth = fine_bundle['depth']
+            pose_mid = iter_state['pose_mid']
+            coarse_pred = iter_state['coarse_pred']
+
+            # 3. GT flow
+            with torch.no_grad():
+                gt_flow, gt_valid = ConcatPoseNet.compute_gt_flow(
+                    pose_mid, pose_gt, depth, flow_hw, render_intr,
+                )
+
+            # 4. Losses
+            with autocast(enabled=self.use_amp):
+                iter_loss = torch.tensor(0.0, device=self.device)
+                coarse_metrics = {}
+
+                if coarse_pred is not None and use_pose_loss:
+                    coarse_loss, coarse_pose_metrics = pose_loss(
+                        coarse_pred['delta_xi'], pose_cur, pose_gt,
+                        rot_weight=self.rot_weight,
+                        trans_weight=self.trans_weight,
+                        rot_loss_type=self.rot_loss_type,
+                        loss_mode=self.pose_loss_mode,
+                    )
+                    iter_loss = iter_loss + self.coarse_pose_weight * coarse_loss
+                    coarse_metrics = {
+                        f'coarse_{k}': v for k, v in coarse_pose_metrics.items()
+                    }
+
+                # Flow loss — RAFT-style sequence loss if GRU provides flow_preds
+                if 'flow_preds' in pred and len(pred['flow_preds']) > 1:
+                    n_preds = len(pred['flow_preds'])
+                    gamma_seq = 0.8
+                    seq_flow_loss = torch.tensor(0.0, device=self.device)
+                    for pi, fp in enumerate(pred['flow_preds']):
+                        w = gamma_seq ** (n_preds - 1 - pi)
+                        fl, _ = flow_loss_fn(fp, gt_flow, gt_valid)
+                        seq_flow_loss = seq_flow_loss + w * fl
+                    seq_flow_loss = seq_flow_loss / n_preds
+                    iter_loss = iter_loss + self.flow_weight * seq_flow_loss
+                    # EPE metric from final prediction
+                    _, f_metrics = flow_loss_fn(pred['flow'], gt_flow, gt_valid)
+                    f_metrics['flow_loss'] = seq_flow_loss.item()
+                else:
+                    f_loss, f_metrics = flow_loss_fn(
+                        pred['flow'], gt_flow, gt_valid,
+                    )
+                    iter_loss = iter_loss + self.flow_weight * f_loss
+
+                # Confidence regularization
+                c_loss, c_metrics = confidence_regularization_loss(
+                    pred['confidence'],
+                )
+                iter_loss = iter_loss + self.conf_reg_weight * c_loss
+
+                # Confidence NLL (self-supervised: high conf where flow is good)
+                if self.conf_nll_weight > 0:
+                    cnll_loss, cnll_metrics = confidence_nll_loss(
+                        pred['flow'], gt_flow, pred['confidence'], gt_valid,
+                    )
+                    iter_loss = iter_loss + self.conf_nll_weight * cnll_loss
+                    c_metrics.update(cnll_metrics)
+
+                # Pose loss (Phase 2)
+                p_metrics = {}
+                if use_pose_loss:
+                    p_loss, p_metrics = pose_loss(
+                        pred['delta_xi'], pose_mid, pose_gt,
+                        rot_weight=self.rot_weight,
+                        trans_weight=self.trans_weight,
+                        rot_loss_type=self.rot_loss_type,
+                        loss_mode=self.pose_loss_mode,
+                    )
+                    iter_loss = iter_loss + self.pose_weight * p_loss
+
+                    if self.full_pose_weight > 0 and 'delta_xi_full' in pred:
+                        full_p_loss, full_p_metrics = pose_loss(
+                            pred['delta_xi_full'], pose_mid, pose_gt,
+                            rot_weight=self.rot_weight,
+                            trans_weight=self.trans_weight,
+                            rot_loss_type=self.rot_loss_type,
+                            loss_mode=self.pose_loss_mode,
+                        )
+                        iter_loss = iter_loss + self.full_pose_weight * full_p_loss
+                        p_metrics.update({
+                            f'full_{k}': v for k, v in full_p_metrics.items()
+                        })
+
+                    # Direct translation supervision for regression head
+                    if self.use_direct_trans_loss:
+                        with torch.cuda.amp.autocast(enabled=False):
+                            T_rel_gt = torch.bmm(pose_gt.float(), torch.inverse(pose_mid.float()))
+                            gt_xi = se3_log(T_rel_gt)  # (B, 6) correct Lie algebra
+                            gt_trans_lie = gt_xi[:, :3]
+                            pred_trans = pred['delta_xi'][:, :3].float()
+                            direct_trans_loss = F.l1_loss(pred_trans, gt_trans_lie)
+                        iter_loss = iter_loss + self.trans_weight * direct_trans_loss
+                        p_metrics['direct_trans_loss'] = direct_trans_loss.item()
+
+            # NaN check
+            if torch.isnan(iter_loss) or torch.isinf(iter_loss):
+                return {'nan_step': True}
+
+            # Weighted backward
+            gamma_outer = 0.8
+            iter_w = gamma_outer ** (N - 1 - outer_i)
+            scaled_loss = iter_w * iter_loss / N
+            self.scaler.scale(scaled_loss).backward()
+
+            total_loss_val += iter_loss.item()
+
+            # Record last iteration metrics
+            if outer_i == N - 1:
+                all_metrics = f_metrics.copy()
+                all_metrics.update(c_metrics)
+                all_metrics.update(coarse_metrics)
+                all_metrics.update(p_metrics)
+                all_metrics['ran_coarse_stage'] = float(iter_state['ran_coarse_stage'])
+
+            # Update pose for next outer iteration
+            if outer_i < N - 1:
+                pose_cur = iter_state['pose_next'].detach()
+
+        all_metrics['total_loss'] = total_loss_val / N
+
+        # Auxiliary feature matching loss for decoder fine-tuning
+        if self.finetune_decoder and self.feat_match_weight > 0:
+            ref_gt = self._render_batch_differentiable(pose_gt)['fine_features']
+            # Cosine similarity between rendered features at GT pose and query features
+            ref_norm = F.normalize(ref_gt.float(), dim=1)
+            q_norm = F.normalize(query_fine.float(), dim=1)
+            cos_sim = (ref_norm * q_norm).sum(dim=1).mean()
+            feat_match_loss = 1.0 - cos_sim
+            self.scaler.scale(self.feat_match_weight * feat_match_loss).backward()
+            all_metrics['feat_match_loss'] = feat_match_loss.item()
+            all_metrics['feat_cos_sim'] = cos_sim.item()
+            all_metrics['total_loss'] += self.feat_match_weight * feat_match_loss.item()
+
+        return all_metrics
+
+    # ── Training Epoch ────────────────────────────────────────────────────
+
+    def train_epoch(self, epoch: int) -> Dict[str, float]:
+        """Train one epoch."""
+        self.model.train()
+        self._set_map_train_mode(True)
+        use_pose_loss = epoch >= self.phase1_epochs
+
+        epoch_metrics = {}
+        pbar = tqdm(self.train_loader,
+                    desc=f'Epoch {epoch}/{self.total_epochs}',
+                    leave=False)
+
+        for batch in pbar:
+            self.optimizer.zero_grad()
+            metrics = self._train_step(batch, use_pose_loss)
+
+            # NaN guard
+            if metrics.get('nan_step'):
+                self.global_step += 1
+                continue
+
+            # Gradient clipping
+            if self.grad_clip > 0:
+                self.scaler.unscale_(self.optimizer)
+                valid_grads = True
+                for p in self.model.parameters():
+                    if p.grad is not None and (torch.isnan(p.grad).any() or torch.isinf(p.grad).any()):
+                        valid_grads = False
+                        break
+                if not valid_grads:
+                    self.optimizer.zero_grad()
+                    self.scaler.update()
+                    self.global_step += 1
+                    continue
+                nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            self.global_step += 1
+
+            # Accumulate metrics
+            for k, v in metrics.items():
+                if isinstance(v, (int, float)) and k != 'nan_step':
+                    epoch_metrics.setdefault(k, []).append(v)
+
+            # Progress bar
+            pbar_dict = {'loss': f"{metrics.get('total_loss', 0):.4f}"}
+            if 'rot_err_deg' in metrics:
+                pbar_dict['rot'] = f"{metrics['rot_err_deg']:.2f}°"
+                pbar_dict['trans'] = f"{metrics['trans_err_mm']:.1f}mm"
+            pbar.set_postfix(pbar_dict)
+
+            # TensorBoard
+            if self.global_step % 50 == 0:
+                for k, v in metrics.items():
+                    if isinstance(v, (int, float)) and k != 'nan_step':
+                        self.writer.add_scalar(f'train/{k}', v, self.global_step)
+                self.writer.add_scalar(
+                    'train/lr', self.optimizer.param_groups[0]['lr'],
+                    self.global_step)
+
+        # Epoch averages
+        avg = {k: np.mean(v) for k, v in epoch_metrics.items()}
+        phase = "Phase2(flow+pose)" if use_pose_loss else "Phase1(flow only)"
+        msg = (f"[Train E{epoch}] {phase}  "
+               f"loss={avg.get('total_loss', 0):.4f}  "
+               f"flow={avg.get('flow_loss', 0):.4f}  "
+               f"epe={avg.get('flow_epe', 0):.2f}")
+        if 'rot_err_deg' in avg:
+            msg += f"  rot={avg['rot_err_deg']:.2f}°  trans={avg['trans_err_mm']:.1f}mm"
+        if 'feat_cos_sim' in avg:
+            msg += f"  cos_sim={avg['feat_cos_sim']:.3f}"
+        if self.outer_iters_train > 1:
+            msg += f"  ({self.outer_iters_train} outer iters)"
+        self.logger.info(msg)
+
+        return avg
+
+    # ── Validation ────────────────────────────────────────────────────────
+
+    @torch.no_grad()
+    def validate(self, epoch: int) -> Dict[str, float]:
+        """Run validation with multi-iteration refinement."""
+        torch.cuda.empty_cache()
+        self.model.eval()
+        self._set_map_train_mode(False)
+        all_rot_errs, all_trans_errs = [], []
+        all_flow_epe = []
+        N = self.outer_iters_val
+
+        flow_hw = (self.render_h, self.render_w)
+        render_intr = self.model._scale_intrinsics(self.render_h, self.render_w)
+
+        def render_batch_fn(poses_w2c: torch.Tensor, render_coarse: bool | None) -> Dict[str, Optional[torch.Tensor]]:
+            return self._render_bundle_batch(
+                poses_w2c,
+                differentiable=False,
+                render_coarse=render_coarse,
+            )
+
+        for batch in tqdm(self.val_loader, desc='Validating', leave=False):
+            query_fine = batch['query_fine'].to(self.device)
+            query_coarse = batch.get('query_coarse')
+            if query_coarse is not None and self.use_coarse:
+                query_coarse = query_coarse.to(self.device)
+            else:
+                query_coarse = None
+            pose_gt = batch['pose_gt'].to(self.device)
+            pose_cur = batch['pose_init'].to(self.device)
+            final_state = None
+
+            # Outer iteration refinement
+            for outer_i in range(N):
+                final_state = run_model_refine_iteration(
+                    self.model,
+                    render_batch_fn,
+                    query_fine,
+                    query_coarse,
+                    pose_cur,
+                    render_intr,
+                    outer_iter=outer_i,
+                    autocast_enabled=self.use_amp,
+                )
+                if outer_i < N - 1:
+                    pose_cur = final_state['pose_next']
+
+            if final_state is None:
+                continue
+
+            pred = final_state['fine_pred']
+            depth = final_state['fine_bundle']['depth']
+            pose_mid = final_state['pose_mid']
+            pose_pred = final_state['pose_next']
+
+            # Flow EPE on final iteration
+            gt_flow, gt_valid = ConcatPoseNet.compute_gt_flow(
+                pose_mid, pose_gt, depth, flow_hw, render_intr,
+            )
+            epe_map = torch.norm(
+                pred['flow'].float() - gt_flow.float(),
+                dim=1, keepdim=True,
+            )
+            n_valid = gt_valid.sum().clamp(min=1.0)
+            epe = (epe_map * gt_valid).sum() / n_valid
+            all_flow_epe.append(epe.item())
+
+            # Pose evaluation
+            if 'delta_xi' in pred:
+                with torch.cuda.amp.autocast(enabled=False):
+                    R_pred = pose_pred[:, :3, :3]
+                    R_gt = pose_gt.float()[:, :3, :3]
+                    R_rel = torch.bmm(R_pred.transpose(1, 2), R_gt)
+                    trace = R_rel[:, 0, 0] + R_rel[:, 1, 1] + R_rel[:, 2, 2]
+                    cos_angle = torch.clamp(
+                        (trace - 1.0) / 2.0, -1.0 + 1e-7, 1.0 - 1e-7)
+                    rot_err = torch.acos(cos_angle) * 180.0 / math.pi
+                    c_pred = camera_centers_from_w2c(pose_pred)
+                    c_gt = camera_centers_from_w2c(pose_gt.float())
+                    trans_err = torch.norm(c_pred - c_gt, dim=1) * 1000  # mm
+
+                all_rot_errs.extend(rot_err.cpu().tolist())
+                all_trans_errs.extend(trans_err.cpu().tolist())
+
+        val_metrics = {}
+        if all_rot_errs:
+            rot = np.array(all_rot_errs)
+            trans = np.array(all_trans_errs)
+
+            joint_01_53 = float(np.mean((rot < 0.1) & (trans < 5.3)) * 100)
+            joint_1_50 = float(np.mean((rot < 1.0) & (trans < 50.0)) * 100)
+            joint_5_100 = float(np.mean((rot < 5.0) & (trans < 100.0)) * 100)
+
+            val_metrics = {
+                'val_rot_mean': float(np.nanmean(rot)),
+                'val_rot_median': float(np.nanmedian(rot)),
+                'val_trans_mean': float(np.nanmean(trans)),
+                'val_trans_median': float(np.nanmedian(trans)),
+                'val_pct_1deg': float(np.mean(rot < 1.0) * 100),
+                'val_pct_5deg': float(np.mean(rot < 5.0) * 100),
+                'val_joint_01deg_53mm': joint_01_53,
+                'val_joint_1deg_50mm': joint_1_50,
+                'val_joint_5deg_100mm': joint_5_100,
+            }
+            if all_flow_epe:
+                val_metrics['val_flow_epe'] = float(np.mean(all_flow_epe))
+
+            iters_str = f'  ({N} iters)' if N > 1 else ''
+            self.logger.info(
+                f'[Val E{epoch}]  rot={val_metrics["val_rot_mean"]:.2f}° '
+                f'(med {val_metrics["val_rot_median"]:.2f}°)  '
+                f'trans={val_metrics["val_trans_mean"]:.1f}mm '
+                f'(med {val_metrics["val_trans_median"]:.1f}mm)  '
+                f'<1°={val_metrics["val_pct_1deg"]:.1f}%  '
+                f'joint@1°/50mm={joint_1_50:.1f}%'
+                f'{iters_str}'
+            )
+
+            for k, v in val_metrics.items():
+                self.writer.add_scalar(f'val/{k}', v, epoch)
+
+        self.model.train()
+        self._set_map_train_mode(True)
+        return val_metrics
+
+    # ── Checkpointing ─────────────────────────────────────────────────────
+
+    def _save_checkpoint(self, epoch: int, is_best: bool = False):
+        ckpt = {
+            'epoch': epoch,
+            'global_step': self.global_step,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict(),
+            'scaler_state_dict': self.scaler.state_dict(),
+            'best_val_trans': self.best_val_trans,
+            'config': self.config,
+        }
+        if self.finetune_decoder:
+            ckpt['fine_decoder_state'] = self.dcff_renderer.fine_decoder.state_dict()
+            ckpt['feat_sharp_state'] = self.feat_sharp_fine.state_dict()
+            if self.dcff_renderer.coarse_carrier_fusion is not None:
+                ckpt['coarse_fusion_state'] = self.dcff_renderer.coarse_carrier_fusion.state_dict()
+        if self.feat_select is not None and self.finetune_fsm:
+            ckpt['fsm_state'] = self.feat_select.state_dict()
+        torch.save(ckpt, self.ckpt_dir / 'latest.pth')
+        if is_best:
+            torch.save(ckpt, self.ckpt_dir / 'best.pth')
+        if self.save_epoch_checkpoints and self.save_every > 0 and epoch % self.save_every == 0:
+            torch.save(ckpt, self.ckpt_dir / f'epoch_{epoch:03d}.pth')
+
+    def _cleanup_epoch_checkpoints(self):
+        for ckpt_path in self.ckpt_dir.glob('epoch_*.pth'):
+            if ckpt_path.is_file():
+                ckpt_path.unlink()
+
+    def _load_checkpoint(self, path: str):
+        self.logger.info(f'[Resume] Loading from {path}')
+        ckpt = torch.load(path, map_location=self.device)
+        self.model.load_state_dict(ckpt['model_state_dict'])
+        self.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        if 'scaler_state_dict' in ckpt:
+            self.scaler.load_state_dict(ckpt['scaler_state_dict'])
+        self.epoch = ckpt['epoch'] + 1
+        self.global_step = ckpt.get('global_step', 0)
+        self.best_val_trans = ckpt.get('best_val_trans', float('inf'))
+
+        # Handle epoch extension
+        old_epochs = ckpt.get('config', {}).get('training', {}).get(
+            'epochs', self.total_epochs)
+        if self.total_epochs > old_epochs and self.epoch >= old_epochs:
+            remaining = self.total_epochs - self.epoch
+            tc = self.config.get('training', {})
+            ext_lr = tc.get('lr', 3e-4) * 0.1
+            for pg in self.optimizer.param_groups:
+                pg['lr'] = ext_lr
+                pg['initial_lr'] = ext_lr
+            self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer, T_max=max(remaining, 1),
+                eta_min=tc.get('min_lr', 1e-6),
+            )
+            self.logger.info(
+                f'  Extended training: fresh cosine LR={ext_lr} '
+                f'over {remaining} epochs')
+        else:
+            self.scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+
+        # Restore fine-tuned decoder state if available
+        if self.finetune_decoder:
+            if 'fine_decoder_state' in ckpt:
+                self.dcff_renderer.fine_decoder.load_state_dict(
+                    ckpt['fine_decoder_state'])
+                self.logger.info('  Restored fine-tuned decoder weights')
+            if self.dcff_renderer.coarse_carrier_fusion is not None and 'coarse_fusion_state' in ckpt:
+                self.dcff_renderer.coarse_carrier_fusion.load_state_dict(
+                    ckpt['coarse_fusion_state'])
+                self.logger.info('  Restored fine-tuned coarse fusion weights')
+            if 'feat_sharp_state' in ckpt:
+                self.feat_sharp_fine.load_state_dict(
+                    ckpt['feat_sharp_state'])
+                self.logger.info('  Restored fine-tuned feat_sharp weights')
+        if self.finetune_fsm and self.feat_select is not None and 'fsm_state' in ckpt:
+            self.feat_select.load_state_dict(ckpt['fsm_state'])
+            self.logger.info('  Restored fine-tuned FSM weights')
+
+        self.logger.info(f'  Resumed at epoch {self.epoch}, step {self.global_step}')
+
+    def _warmstart(self, path: str):
+        """Load model weights only, keep fresh optimizer/scheduler."""
+        self.logger.info(f'[Warmstart] Loading model weights from {path}')
+        ckpt = torch.load(path, map_location=self.device)
+        state_dict = ckpt['model_state_dict']
+
+        model_state = self.model.state_dict()
+        filtered_state = {}
+        skip_prefixes = tuple(self.warmstart_skip_prefixes)
+        skipped_by_prefix = []
+        skipped = []
+        for k, v in state_dict.items():
+            if skip_prefixes and any(k.startswith(prefix) for prefix in skip_prefixes):
+                skipped_by_prefix.append(k)
+            elif k in model_state and v.shape != model_state[k].shape:
+                skipped.append(
+                    f'{k}: ckpt {list(v.shape)} vs model {list(model_state[k].shape)}')
+            else:
+                filtered_state[k] = v
+
+        if skipped_by_prefix:
+            self.logger.info(
+                '  Skipped %d warmstart keys by prefix: %s',
+                len(skipped_by_prefix),
+                ', '.join(sorted(skip_prefixes)),
+            )
+
+        if skipped:
+            self.logger.warning(f'  Skipped {len(skipped)} size-mismatched keys:')
+            for s in skipped:
+                self.logger.warning(f'    {s}')
+
+        missing, unexpected = self.model.load_state_dict(
+            filtered_state, strict=False)
+        if missing:
+            self.logger.warning(f'  Missing keys: {missing}')
+        if unexpected:
+            self.logger.warning(f'  Unexpected keys: {unexpected}')
+
+        # Restore fine-tuned decoder weights if present in warmstart checkpoint
+        if 'fine_decoder_state' in ckpt and hasattr(self, 'dcff_renderer'):
+            self.dcff_renderer.fine_decoder.load_state_dict(
+                ckpt['fine_decoder_state'])
+            self.logger.info('  Restored fine-tuned decoder weights from warmstart')
+        if ('coarse_fusion_state' in ckpt and hasattr(self, 'dcff_renderer')
+                and self.dcff_renderer.coarse_carrier_fusion is not None):
+            self.dcff_renderer.coarse_carrier_fusion.load_state_dict(
+                ckpt['coarse_fusion_state'])
+            self.logger.info('  Restored coarse fusion weights from warmstart')
+        if 'feat_sharp_state' in ckpt and hasattr(self, 'feat_sharp_fine'):
+            self.feat_sharp_fine.load_state_dict(ckpt['feat_sharp_state'])
+            self.logger.info('  Restored feat_sharp weights from warmstart')
+        if 'fsm_state' in ckpt and getattr(self, 'feat_select', None) is not None:
+            self.feat_select.load_state_dict(ckpt['fsm_state'])
+            self.logger.info('  Restored FSM weights from warmstart')
+
+        src_epoch = ckpt.get('epoch', '?')
+        self.logger.info(f'  Loaded weights from epoch {src_epoch}, fresh optimizer')
+
+    # ── Visualization ─────────────────────────────────────────────────────
+
+    @torch.no_grad()
+    def _visualize(self, epoch: int):
+        """Generate feature + flow + confidence visualizations."""
+        try:
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+        except ImportError:
+            return
+
+        vis_dir = self.vis_dir / f'epoch_{epoch:04d}'
+        vis_dir.mkdir(parents=True, exist_ok=True)
+
+        self.model.eval()
+        self._set_map_train_mode(False)
+        torch.cuda.empty_cache()
+
+        batch = next(iter(self.val_loader))
+        n_vis = min(self.num_vis_samples, batch['query_fine'].shape[0])
+        query_fine = batch['query_fine'][:n_vis].to(self.device)
+        query_coarse = batch.get('query_coarse')
+        if query_coarse is not None and self.use_coarse:
+            query_coarse = query_coarse[:n_vis].to(self.device)
+        else:
+            query_coarse = None
+        pose_gt = batch['pose_gt'][:n_vis].to(self.device)
+        pose_init = batch['pose_init'][:n_vis].to(self.device)
+
+        render_intr = self.model._scale_intrinsics(self.render_h, self.render_w)
+
+        def render_batch_fn(poses_w2c: torch.Tensor, render_coarse: bool | None) -> Dict[str, Optional[torch.Tensor]]:
+            return self._render_bundle_batch(
+                poses_w2c,
+                differentiable=False,
+                render_coarse=render_coarse,
+            )
+
+        iter_state = run_model_refine_iteration(
+            self.model,
+            render_batch_fn,
+            query_fine,
+            query_coarse,
+            pose_init,
+            render_intr,
+            outer_iter=0,
+            autocast_enabled=self.use_amp,
+        )
+        pred = iter_state['fine_pred']
+        ref_fine = iter_state['fine_bundle']['fine_features']
+        depth = iter_state['fine_bundle']['depth']
+        ref_coarse = None
+        fsm_spatial = None
+        if iter_state['coarse_bundle'] is not None:
+            ref_coarse = iter_state['coarse_bundle'].get('coarse_features')
+            fsm_spatial = iter_state['coarse_bundle'].get('fsm_spatial_conf')
+        if fsm_spatial is None:
+            fsm_spatial = iter_state['fine_bundle'].get('fsm_spatial_conf')
+
+        # (1) PCA Feature Visualization
+        fig, axes = plt.subplots(n_vis, 2, figsize=(8, 4 * n_vis))
+        if n_vis == 1:
+            axes = axes[np.newaxis, :]
+        for i in range(n_vis):
+            q_pca = features_to_pca_rgb(query_fine[i].cpu())
+            r_pca = features_to_pca_rgb(ref_fine[i].cpu())
+
+            axes[i, 0].imshow(q_pca.permute(1, 2, 0).numpy())
+            axes[i, 0].set_title('Query Fine' if i == 0 else '', fontsize=8)
+            axes[i, 0].axis('off')
+            axes[i, 1].imshow(r_pca.permute(1, 2, 0).numpy())
+            axes[i, 1].set_title('Rendered Fine' if i == 0 else '', fontsize=8)
+            axes[i, 1].axis('off')
+
+        fig.suptitle(f'Feature PCA (Epoch {epoch})', fontsize=11)
+        fig.tight_layout()
+        fig.savefig(str(vis_dir / 'features_pca.png'), dpi=120, bbox_inches='tight')
+        plt.close(fig)
+
+        if ref_coarse is not None:
+            fig, axes = plt.subplots(n_vis, 2, figsize=(8, 4 * n_vis))
+            if n_vis == 1:
+                axes = axes[np.newaxis, :]
+            for i in range(n_vis):
+                q_src = query_coarse[i].cpu() if query_coarse is not None else query_fine[i].cpu()
+                q_pca = features_to_pca_rgb(q_src)
+                r_pca = features_to_pca_rgb(ref_coarse[i].cpu())
+
+                axes[i, 0].imshow(q_pca.permute(1, 2, 0).numpy())
+                axes[i, 0].set_title('Query Coarse' if i == 0 else '', fontsize=8)
+                axes[i, 0].axis('off')
+                axes[i, 1].imshow(r_pca.permute(1, 2, 0).numpy())
+                axes[i, 1].set_title('Rendered Coarse' if i == 0 else '', fontsize=8)
+                axes[i, 1].axis('off')
+
+            fig.suptitle(f'Coarse Feature PCA (Epoch {epoch})', fontsize=11)
+            fig.tight_layout()
+            fig.savefig(str(vis_dir / 'coarse_features_pca.png'), dpi=120, bbox_inches='tight')
+            plt.close(fig)
+
+        # (2) Flow Visualization
+        flow = pred['flow'][0].cpu().float()
+        fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+        vmax = max(flow.abs().max().item(), 1.0)
+        im0 = axes[0].imshow(flow[0].numpy(), cmap='RdBu_r',
+                             vmin=-vmax, vmax=vmax)
+        axes[0].set_title(f'Flow u E{epoch}', fontsize=9)
+        axes[0].axis('off')
+        plt.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
+        im1 = axes[1].imshow(flow[1].numpy(), cmap='RdBu_r',
+                             vmin=-vmax, vmax=vmax)
+        axes[1].set_title(f'Flow v E{epoch}', fontsize=9)
+        axes[1].axis('off')
+        plt.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
+        fig.tight_layout()
+        fig.savefig(str(vis_dir / 'flow.png'), dpi=120, bbox_inches='tight')
+        plt.close(fig)
+
+        # (3) Confidence Map
+        conf = pred['confidence'][0].cpu().float()
+        fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+        for ch, label in enumerate(['u', 'v']):
+            im = axes[ch].imshow(conf[ch].numpy(), cmap='viridis', vmin=0, vmax=1)
+            axes[ch].set_title(
+                f'Conf {label} E{epoch} mean={conf[ch].mean():.3f}', fontsize=9)
+            axes[ch].axis('off')
+            plt.colorbar(im, ax=axes[ch], fraction=0.046, pad=0.04)
+        fig.tight_layout()
+        fig.savefig(str(vis_dir / 'confidence.png'), dpi=120, bbox_inches='tight')
+        plt.close(fig)
+
+        # (4) Depth Visualization
+        d = depth[0].cpu().float().numpy()
+        d_valid = d[d > 0.05]
+        if len(d_valid) > 0:
+            d_lo, d_hi = np.percentile(d_valid, [2, 98])
+            d_norm = np.clip((d - d_lo) / max(d_hi - d_lo, 1e-6), 0, 1)
+        else:
+            d_norm = np.zeros_like(d)
+        fig, ax = plt.subplots(1, 1, figsize=(6, 4))
+        ax.imshow(d_norm, cmap='turbo')
+        ax.set_title(f'Depth E{epoch}', fontsize=9)
+        ax.axis('off')
+        fig.tight_layout()
+        fig.savefig(str(vis_dir / 'depth.png'), dpi=120, bbox_inches='tight')
+        plt.close(fig)
+
+        if fsm_spatial is not None:
+            conf_map = fsm_spatial[0].cpu().float().squeeze(0).numpy()
+            fig, ax = plt.subplots(1, 1, figsize=(6, 4))
+            im = ax.imshow(conf_map, cmap='viridis', vmin=0, vmax=1)
+            ax.set_title(f'FSM Spatial Confidence E{epoch}', fontsize=9)
+            ax.axis('off')
+            plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            fig.tight_layout()
+            fig.savefig(str(vis_dir / 'fsm_spatial_conf.png'), dpi=120, bbox_inches='tight')
+            plt.close(fig)
+
+        # TensorBoard images
+        try:
+            import torchvision.transforms.functional as TF
+            from PIL import Image
+            for fname in ['features_pca.png', 'coarse_features_pca.png', 'fsm_spatial_conf.png', 'flow.png', 'confidence.png',
+                          'depth.png']:
+                fpath = vis_dir / fname
+                if fpath.exists():
+                    img = Image.open(str(fpath))
+                    self.writer.add_image(
+                        f'vis/{fname.replace(".png", "")}',
+                        TF.to_tensor(img), epoch,
+                    )
+        except Exception:
+            pass
+
+        self.logger.info(f'  [Vis E{epoch}] Saved to {vis_dir}')
+        self.model.train()
+        self._set_map_train_mode(True)
+        torch.cuda.empty_cache()
+
+    # ── Main Training Loop ────────────────────────────────────────────────
+
+    def train(self):
+        """Full training loop."""
+        self.logger.info(f'\n{"="*60}')
+        self.logger.info(f'  Concat-Based Localization Training')
+        self.logger.info(f'  Epochs: {self.total_epochs} '
+                         f'(Phase1: {self.phase1_epochs})')
+        self.logger.info(f'  Outer iters: {self.outer_iters_train} train / '
+                         f'{self.outer_iters_val} val')
+        self.logger.info(f'  Output: {self.output_dir}')
+        self.logger.info(f'{"="*60}\n')
+
+        epoch_times = []
+        train_start = time.time()
+
+        for epoch in range(self.epoch, self.total_epochs):
+            self.epoch = epoch
+            t0 = time.time()
+
+            # Noise curriculum
+            self._update_noise_for_epoch(epoch)
+
+            # Train
+            train_metrics = self.train_epoch(epoch)
+
+            # Validate
+            val_metrics = {}
+            if epoch % self.val_every == 0 or epoch == self.total_epochs - 1:
+                val_metrics = self.validate(epoch)
+                self.latest_val_metrics = dict(val_metrics)
+
+            # Scheduler step
+            self.scheduler.step()
+
+            # Checkpoint — track best by median translation error
+            is_best = False
+            if val_metrics:
+                med_trans = val_metrics.get('val_trans_median', float('inf'))
+                if med_trans < self.best_val_trans:
+                    self.best_val_trans = med_trans
+                    self.epochs_since_best = 0
+                    is_best = True
+                    self.logger.info(
+                        f'  ★ New best: trans_med={med_trans:.1f}mm  '
+                        f'rot_med={val_metrics.get("val_rot_median", 0):.2f}°  '
+                        f'joint@1°/50mm='
+                        f'{val_metrics.get("val_joint_1deg_50mm", 0):.1f}%'
+                    )
+                else:
+                    self.epochs_since_best += 1
+
+            self._save_checkpoint(epoch, is_best)
+
+            # Early stopping
+            if (self.early_stop_patience > 0 and
+                    self.epochs_since_best >= self.early_stop_patience):
+                self.logger.info(
+                    f'  ⏹ Early stopping: {self.epochs_since_best} epochs '
+                    f'without improvement (best={self.best_val_trans:.1f}mm)'
+                )
+                break
+
+            # Periodic visualization
+            if self.vis_every > 0 and (
+                epoch % self.vis_every == 0 or epoch == self.total_epochs - 1
+            ):
+                self._visualize(epoch)
+
+            # Timing
+            elapsed = time.time() - t0
+            epoch_times.append(elapsed)
+            avg_epoch = np.mean(epoch_times[-5:])
+            remaining = (self.total_epochs - epoch - 1) * avg_epoch
+            eta_min = remaining / 60
+            total_elapsed = (time.time() - train_start) / 60
+            self.logger.info(
+                f'  Epoch {epoch}: {elapsed:.0f}s  '
+                f'lr={self.optimizer.param_groups[0]["lr"]:.6f}  '
+                f'ETA: {eta_min:.0f}min  '
+                f'[{total_elapsed:.0f}min elapsed]\n'
+            )
+
+        total_time = (time.time() - train_start) / 60
+        self.logger.info(
+            f'\nTraining complete in {total_time:.0f}min! '
+            f'Best val trans_med: {self.best_val_trans:.1f}mm'
+        )
+
+        final_metrics = {
+            'best_val_trans_median': float(self.best_val_trans),
+            'epochs_completed': int(self.epoch + 1),
+            'global_step': int(self.global_step),
+            'total_time_min': float(total_time),
+            'train_dataset_size': len(self.train_dataset),
+            'val_dataset_size': len(self.val_dataset),
+            'outer_iters_train': int(self.outer_iters_train),
+            'outer_iters_val': int(self.outer_iters_val),
+            'gru_iters': int(self.model.gru_iters),
+            'use_coarse': bool(self.use_coarse),
+            'use_two_stage_refine': bool(getattr(self.model, 'use_two_stage_refine', False)),
+            'finetune_decoder': bool(self.finetune_decoder),
+            'finetune_fsm': bool(getattr(self, 'finetune_fsm', False)),
+        }
+        if hasattr(self, 'latest_val_metrics') and self.latest_val_metrics:
+            final_metrics['latest_val'] = dict(self.latest_val_metrics)
+
+        summary_lines = [
+            f'best val trans={self.best_val_trans:.1f}mm',
+            f'epochs={self.epoch + 1} steps={self.global_step}',
+            f'use_coarse={self.use_coarse} two_stage={bool(getattr(self.model, "use_two_stage_refine", False))} finetune_fsm={bool(getattr(self, "finetune_fsm", False))}',
+        ]
+        if hasattr(self, 'latest_val_metrics') and self.latest_val_metrics:
+            summary_lines.append(
+                'latest val rot={:.2f}deg trans={:.1f}mm joint@1/50={:.1f}%'.format(
+                    float(self.latest_val_metrics.get('val_rot_median', 0.0)),
+                    float(self.latest_val_metrics.get('val_trans_median', 0.0)),
+                    float(self.latest_val_metrics.get('val_joint_1deg_50mm', 0.0)),
+                )
+            )
+
+        notes = [
+            f'config={self.output_dir / "config.yaml"}',
+            f'gpu={self.device}',
+        ]
+        artifact_paths = [
+            self.output_dir / 'config.yaml',
+            self.ckpt_dir / 'best.pth',
+            self.ckpt_dir / 'latest.pth',
+            self.vis_dir,
+            self.output_dir / f'{self.exp_name}_train.log',
+        ]
+        save_experiment_bundle(
+            exp_name=self.exp_name,
+            output_dir=self.output_dir,
+            metrics=final_metrics,
+            summary_lines=summary_lines,
+            notes=notes,
+            artifact_paths=artifact_paths,
+            results_json_name='results.json',
+            results_text_name='results.txt',
+            report_markdown_name='report.md',
+            report_text_name='report.txt',
+        )
+        self.writer.close()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  Main
+# ═════════════════════════════════════════════════════════════════════════════
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Train Concat-Based Localization Network')
+    parser.add_argument('--config', type=str, required=True,
+                        help='Path to config YAML')
+    parser.add_argument('--gpu', type=int, default=0,
+                        help='GPU device index')
+    parser.add_argument('--resume', type=str, default=None,
+                        help='Resume from checkpoint (full state)')
+    parser.add_argument('--warmstart', type=str, default=None,
+                        help='Warmstart from checkpoint (model weights only)')
+    parser.add_argument('--dcff_checkpoint', type=str, default=None,
+                        help='Override DCFF checkpoint path')
+    parser.add_argument('--eval_only', action='store_true',
+                        help='Run evaluation only (no training)')
+    parser.add_argument('--eval_outer_iters', type=int, nargs='+', default=None,
+                        help='Override outer iters for eval sweep')
+    parser.add_argument('--eval_gru_iters', type=int, nargs='+', default=None,
+                        help='Override GRU iters for eval sweep')
+    parser.add_argument('--eval_seeds', type=int, default=1,
+                        help='Number of random seeds for eval averaging')
+    args = parser.parse_args()
+
+    config = load_mainline_config(args.config)
+
+    trainer = ConcatLocTrainer(
+        config=config,
+        gpu=args.gpu,
+        resume_path=args.resume,
+        warmstart_path=args.warmstart,
+        dcff_checkpoint=args.dcff_checkpoint,
+    )
+
+    if args.eval_only:
+        # Eval sweep mode with optional multi-seed averaging
+        outer_list = args.eval_outer_iters or [trainer.outer_iters_val]
+        gru_list = args.eval_gru_iters or [trainer.model.gru_iters]
+        n_seeds = args.eval_seeds
+        orig_gru = trainer.model.gru_iters
+        orig_outer = trainer.outer_iters_val
+        print(f"\n{'outer':>6} {'gru':>4} | {'rot_med':>8} {'trans_med':>10} {'<1°':>6} {'j@1/50':>7}"
+              + (f" (avg {n_seeds} seeds)" if n_seeds > 1 else ""))
+        print("-" * 60)
+        for outer in outer_list:
+            for gru in gru_list:
+                trainer.outer_iters_val = outer
+                trainer.model.gru_iters = gru
+                all_rm, all_tm, all_p1, all_j1 = [], [], [], []
+                for seed in range(n_seeds):
+                    torch.manual_seed(42 + seed)
+                    np.random.seed(42 + seed)
+                    metrics = trainer.validate(epoch=0)
+                    all_rm.append(metrics.get('val_rot_median', 0))
+                    all_tm.append(metrics.get('val_trans_median', 0))
+                    all_p1.append(metrics.get('val_pct_1deg', 0))
+                    all_j1.append(metrics.get('val_joint_1deg_50mm', 0))
+                rm = np.mean(all_rm)
+                tm = np.mean(all_tm)
+                p1 = np.mean(all_p1)
+                j1 = np.mean(all_j1)
+                if n_seeds > 1:
+                    print(f"{outer:>6} {gru:>4} | {rm:>7.2f}° {tm:>9.1f}mm {p1:>5.1f}% {j1:>6.1f}%"
+                          f"  (±{np.std(all_tm):.1f}mm)")
+                else:
+                    print(f"{outer:>6} {gru:>4} | {rm:>7.2f}° {tm:>9.1f}mm {p1:>5.1f}% {j1:>6.1f}%")
+        trainer.model.gru_iters = orig_gru
+        trainer.outer_iters_val = orig_outer
+    else:
+        trainer.train()
+
+
+if __name__ == '__main__':
+    main()
