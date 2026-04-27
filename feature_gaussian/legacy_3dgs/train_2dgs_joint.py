@@ -466,6 +466,89 @@ def render_rgb_2dgs(gaussians, cam, bg_color, longest_edge=0):
     }
 
 
+def render_rgb_2dgs_batch(gaussians, cams, bg_color, longest_edge=0):
+    """Render RGB + geometry outputs for multiple cameras in one 2DGS call."""
+    if not cams:
+        return []
+    if len(cams) == 1:
+        return [render_rgb_2dgs(gaussians, cams[0], bg_color, longest_edge)]
+
+    means3D = gaussians.get_xyz
+    opacity = gaussians.get_opacity
+    scales_2d = gaussians.get_scaling
+    rotations = gaussians.get_rotation
+    colors = gaussians.get_features
+    sh_deg = gaussians.active_sh_degree
+
+    scales = torch.cat([
+        scales_2d,
+        torch.ones(scales_2d.shape[0], 1, device=scales_2d.device),
+    ], dim=-1)
+
+    width, height = cams[0].width, cams[0].height
+    if longest_edge > 0 and max(width, height) > longest_edge:
+        factor = longest_edge / max(width, height)
+        width, height = int(width * factor), int(height * factor)
+
+    viewmats = []
+    Ks = []
+    for cam in cams:
+        viewmats.append(cam.get_world_view_transform())
+        tanfovx = math.tan(cam.FovX * 0.5)
+        tanfovy = math.tan(cam.FovY * 0.5)
+        fx = width / (2 * tanfovx)
+        fy = height / (2 * tanfovy)
+        Ks.append(torch.tensor(
+            [[fx, 0, width / 2.0], [0, fy, height / 2.0], [0, 0, 1]],
+            device="cuda",
+        ))
+
+    bg4 = (
+        torch.cat([bg_color, bg_color[:1]])
+        if bg_color.shape[0] == 3
+        else bg_color
+    )
+    backgrounds = bg4[None].expand(len(cams), -1).contiguous()
+
+    (render_colors, alphas, normals, surf_normals,
+     distort, median_depth, info) = rasterization_2dgs(
+        means=means3D, quats=rotations, scales=scales,
+        opacities=opacity.squeeze(-1), colors=colors,
+        viewmats=torch.stack(viewmats), Ks=torch.stack(Ks),
+        width=width, height=height,
+        packed=False, sh_degree=sh_deg,
+        backgrounds=backgrounds,
+        near_plane=0.01, far_plane=500,
+        render_mode="RGB+ED", absgrad=True,
+    )
+
+    try:
+        info["gradient_2dgs"].retain_grad()
+    except Exception:
+        pass
+
+    radii_all = info["radii"]
+    results = []
+    for b in range(len(cams)):
+        rendered_image = render_colors[b].permute(2, 0, 1)
+        radii = radii_all[b]
+        results.append({
+            "render": rendered_image[:3],
+            "rend_alpha": alphas[b:b + 1],
+            "rend_normal": normals[b:b + 1],
+            "surf_normal": surf_normals[b:b + 1],
+            "rend_dist": distort[b:b + 1],
+            "depth": rendered_image[3:],
+            "viewspace_points": info["gradient_2dgs"],
+            "visibility_filter": radii > 0,
+            "radii": radii,
+            "width": width,
+            "height": height,
+            "_batch_idx": b,
+        })
+    return results
+
+
 def render_rgb_3dgs(gaussians, cam, bg_color, longest_edge=0):
     """Render RGB using standard 3DGS (ellipsoid) rasterization.
 

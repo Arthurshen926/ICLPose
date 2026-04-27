@@ -674,7 +674,15 @@ class ConcatPoseNet(nn.Module):
         B, _, H, W = query_fine.shape
         device = query_fine.device
 
-        # Project features for correlation (L2-normalize)
+        # Project features for correlation (L2-normalize).
+        #
+        # Flow in this module is defined on rendered/current pixels:
+        #   rendered pixel p -> query pixel p + flow[p]
+        # Therefore local correlation must be centered on rendered features and
+        # search in the query feature map.  The earlier query-centered ordering
+        # produced the inverse/query-indexed match, which is especially harmful
+        # for translation because the downstream WLS/PnP solvers consume
+        # rendered-indexed depth.
         if self.proj_mode == 'shared':
             q_proj = F.normalize(self.proj_shared(query_fine), dim=1)
             r_proj = F.normalize(self.proj_shared(rendered_fine), dim=1)
@@ -700,7 +708,7 @@ class ConcatPoseNet(nn.Module):
             r_ds = F.avg_pool2d(r_proj, pf)
             q_ds = F.normalize(q_ds, dim=1)
             r_ds = F.normalize(r_ds, dim=1)
-            coarse_corr = local_correlation(q_ds, r_ds, self.local_radius)
+            coarse_corr = local_correlation(r_ds, q_ds, self.local_radius)
             coarse_flow = self.coarse_flow_head(coarse_corr)   # (B, 2, H/pf, W/pf)
             # Upsample to full resolution and scale displacement by pool factor
             flow = F.interpolate(
@@ -714,10 +722,10 @@ class ConcatPoseNet(nn.Module):
 
         for i in range(self.gru_iters):
             if i == 0 and not self.coarse_flow_init:
-                corr = local_correlation(q_proj, r_proj, self.local_radius)
+                corr = local_correlation(r_proj, q_proj, self.local_radius)
             else:
                 corr = guided_local_correlation(
-                    q_proj, r_proj, flow.detach(), self.local_radius)
+                    r_proj, q_proj, flow.detach(), self.local_radius)
 
             inp = torch.cat([corr, flow, conf], dim=1)
             inp_encoded = self.corr_encoder(inp)

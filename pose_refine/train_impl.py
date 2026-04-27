@@ -47,7 +47,21 @@ import torch.optim as optim
 import yaml
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except ModuleNotFoundError:
+    class SummaryWriter:  # type: ignore[no-redef]
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def add_scalar(self, *args, **kwargs):
+            pass
+
+        def add_image(self, *args, **kwargs):
+            pass
+
+        def close(self):
+            pass
 from tqdm import tqdm
 
 # Project root
@@ -1053,28 +1067,48 @@ class ConcatLocTrainer:
             if scale_map is not None:
                 scale_map = scale_map.detach()
 
+        if getattr(self.dcff_renderer, 'split_latent', False):
+            fine_dim = int(self.dcff_renderer.fine_latent_dim)
+            coarse_dim = int(self.dcff_renderer.coarse_latent_dim)
+            z_fine_map = z_map[:, :fine_dim]
+            z_coarse_map = z_map[:, fine_dim:fine_dim + coarse_dim]
+        else:
+            z_fine_map = z_map
+            z_coarse_map = z_map
+
         position_map = None
         if self.dcff_renderer.fine_decoder.use_viewdirs or should_render_coarse:
             position_map = self.dcff_renderer.depth_to_position_map(depth, K, viewmat)
 
         coarse_features = None
         if should_render_coarse:
-            coarse_features = self.dcff_renderer.decode_coarse(
-                position_map=position_map,
-                alpha=alpha if alpha is not None else torch.ones_like(depth),
-                z_map=z_map,
-                scale_map=scale_map,
-                viewmat=viewmat,
-            ).float()
-            if self.dcff_renderer.coarse_carrier_fusion is not None:
-                coarse_features, _, _ = self.dcff_renderer.coarse_carrier_fusion(
-                    z_map,
-                    coarse_features,
+            if self.dcff_renderer.coarse_mode in {'spatial_direct', 'spatial_full_direct'}:
+                coarse_input_map = (
+                    z_map
+                    if getattr(self.dcff_renderer, 'coarse_direct_uses_full_latent', False)
+                    else z_coarse_map
                 )
+                coarse_features, _, _ = self.dcff_renderer.coarse_carrier_fusion(
+                    coarse_input_map,
+                    None,
+                )
+            else:
+                coarse_features = self.dcff_renderer.decode_coarse(
+                    position_map=position_map,
+                    alpha=alpha if alpha is not None else torch.ones_like(depth),
+                    z_map=z_coarse_map,
+                    scale_map=scale_map,
+                    viewmat=viewmat,
+                ).float()
+                if self.dcff_renderer.coarse_carrier_fusion is not None:
+                    coarse_features, _, _ = self.dcff_renderer.coarse_carrier_fusion(
+                        z_coarse_map,
+                        coarse_features,
+                    )
 
         # Re-decode through fine_decoder WITH gradient
         fine_feat = self.dcff_renderer.decode_fine(
-            z_map,
+            z_fine_map,
             position_map=position_map,
             viewmat=viewmat,
         ).float()
@@ -1569,11 +1603,27 @@ class ConcatLocTrainer:
         self.model.eval()
         self._set_map_train_mode(False)
         all_rot_errs, all_trans_errs = [], []
+        all_init_rot_errs, all_init_trans_errs = [], []
+        all_one_rot_errs, all_one_trans_errs = [], []
         all_flow_epe = []
         N = self.outer_iters_val
 
         flow_hw = (self.render_h, self.render_w)
         render_intr = self.model._scale_intrinsics(self.render_h, self.render_w)
+
+        def compute_pose_error(pose_est: torch.Tensor, pose_ref: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            with torch.cuda.amp.autocast(enabled=False):
+                R_est = pose_est.float()[:, :3, :3]
+                R_ref = pose_ref.float()[:, :3, :3]
+                R_rel = torch.bmm(R_est.transpose(1, 2), R_ref)
+                trace = R_rel[:, 0, 0] + R_rel[:, 1, 1] + R_rel[:, 2, 2]
+                cos_angle = torch.clamp(
+                    (trace - 1.0) / 2.0, -1.0 + 1e-7, 1.0 - 1e-7)
+                rot_err = torch.acos(cos_angle) * 180.0 / math.pi
+                c_est = camera_centers_from_w2c(pose_est.float())
+                c_ref = camera_centers_from_w2c(pose_ref.float())
+                trans_err = torch.norm(c_est - c_ref, dim=1) * 1000
+            return rot_err, trans_err
 
         def render_batch_fn(poses_w2c: torch.Tensor, render_coarse: bool | None) -> Dict[str, Optional[torch.Tensor]]:
             return self._render_bundle_batch(
@@ -1592,6 +1642,11 @@ class ConcatLocTrainer:
             pose_gt = batch['pose_gt'].to(self.device)
             pose_cur = batch['pose_init'].to(self.device)
             final_state = None
+            pose_after_one = None
+
+            init_rot, init_trans = compute_pose_error(pose_cur, pose_gt)
+            all_init_rot_errs.extend(init_rot.cpu().tolist())
+            all_init_trans_errs.extend(init_trans.cpu().tolist())
 
             # Outer iteration refinement
             for outer_i in range(N):
@@ -1605,6 +1660,8 @@ class ConcatLocTrainer:
                     outer_iter=outer_i,
                     autocast_enabled=self.use_amp,
                 )
+                if outer_i == 0:
+                    pose_after_one = final_state['pose_next']
                 if outer_i < N - 1:
                     pose_cur = final_state['pose_next']
 
@@ -1630,17 +1687,12 @@ class ConcatLocTrainer:
 
             # Pose evaluation
             if 'delta_xi' in pred:
-                with torch.cuda.amp.autocast(enabled=False):
-                    R_pred = pose_pred[:, :3, :3]
-                    R_gt = pose_gt.float()[:, :3, :3]
-                    R_rel = torch.bmm(R_pred.transpose(1, 2), R_gt)
-                    trace = R_rel[:, 0, 0] + R_rel[:, 1, 1] + R_rel[:, 2, 2]
-                    cos_angle = torch.clamp(
-                        (trace - 1.0) / 2.0, -1.0 + 1e-7, 1.0 - 1e-7)
-                    rot_err = torch.acos(cos_angle) * 180.0 / math.pi
-                    c_pred = camera_centers_from_w2c(pose_pred)
-                    c_gt = camera_centers_from_w2c(pose_gt.float())
-                    trans_err = torch.norm(c_pred - c_gt, dim=1) * 1000  # mm
+                if pose_after_one is not None:
+                    one_rot, one_trans = compute_pose_error(pose_after_one, pose_gt)
+                    all_one_rot_errs.extend(one_rot.cpu().tolist())
+                    all_one_trans_errs.extend(one_trans.cpu().tolist())
+
+                rot_err, trans_err = compute_pose_error(pose_pred, pose_gt)
 
                 all_rot_errs.extend(rot_err.cpu().tolist())
                 all_trans_errs.extend(trans_err.cpu().tolist())
@@ -1665,10 +1717,36 @@ class ConcatLocTrainer:
                 'val_joint_1deg_50mm': joint_1_50,
                 'val_joint_5deg_100mm': joint_5_100,
             }
+            if all_init_rot_errs:
+                init_rot = np.array(all_init_rot_errs)
+                init_trans = np.array(all_init_trans_errs)
+                val_metrics.update({
+                    'val_init_rot_mean': float(np.nanmean(init_rot)),
+                    'val_init_rot_median': float(np.nanmedian(init_rot)),
+                    'val_init_trans_mean': float(np.nanmean(init_trans)),
+                    'val_init_trans_median': float(np.nanmedian(init_trans)),
+                })
+            if all_one_rot_errs:
+                one_rot = np.array(all_one_rot_errs)
+                one_trans = np.array(all_one_trans_errs)
+                val_metrics.update({
+                    'val_one_rot_mean': float(np.nanmean(one_rot)),
+                    'val_one_rot_median': float(np.nanmedian(one_rot)),
+                    'val_one_trans_mean': float(np.nanmean(one_trans)),
+                    'val_one_trans_median': float(np.nanmedian(one_trans)),
+                })
             if all_flow_epe:
                 val_metrics['val_flow_epe'] = float(np.mean(all_flow_epe))
 
             iters_str = f'  ({N} iters)' if N > 1 else ''
+            stage_str = ''
+            if 'val_init_trans_median' in val_metrics and 'val_one_trans_median' in val_metrics:
+                stage_str = (
+                    f'  init_med={val_metrics["val_init_rot_median"]:.2f}°/'
+                    f'{val_metrics["val_init_trans_median"]:.1f}mm'
+                    f'  one_med={val_metrics["val_one_rot_median"]:.2f}°/'
+                    f'{val_metrics["val_one_trans_median"]:.1f}mm'
+                )
             self.logger.info(
                 f'[Val E{epoch}]  rot={val_metrics["val_rot_mean"]:.2f}° '
                 f'(med {val_metrics["val_rot_median"]:.2f}°)  '
@@ -1676,6 +1754,7 @@ class ConcatLocTrainer:
                 f'(med {val_metrics["val_trans_median"]:.1f}mm)  '
                 f'<1°={val_metrics["val_pct_1deg"]:.1f}%  '
                 f'joint@1°/50mm={joint_1_50:.1f}%'
+                f'{stage_str}'
                 f'{iters_str}'
             )
 

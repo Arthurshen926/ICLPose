@@ -22,6 +22,7 @@ import argparse
 import math
 import os
 import pickle
+import random
 import re
 import sys
 import time
@@ -30,6 +31,7 @@ from random import randint, shuffle
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 import yaml
@@ -60,6 +62,7 @@ from feature_gaussian.legacy_3dgs.train_2dgs_joint import (
     DA3FeatureCache,
     GaussianModel2DGSJoint,
     render_rgb_2dgs,
+    render_rgb_2dgs_batch,
     render_rgb_3dgs,
     render_features_2dgs,
     build_da3_image_order,
@@ -178,8 +181,14 @@ DEFAULT_CONFIG = {
         # 3DGS comparison mode
         'use_3dgs': False,            # Use 3DGS (ellipsoid) instead of 2DGS (surfel)
 
-        # Gradient accumulation (multi-camera batch)
-        'grad_accum_steps': 1,        # number of cameras per optimizer step
+        # Multi-camera batching. batch_size uses one batched rasterization call
+        # for 2DGS; grad_accum_steps is kept only as a legacy fallback alias.
+        'batch_size': 1,
+        'grad_accum_steps': 1,
+        'cache_resized_images': False,
+        'cache_resized_masks': False,
+        'image_cache_dtype': 'float16',
+        'max_consecutive_bad_steps': 50,
     },
 
     'output_dir': 'output/2dgs_joint',
@@ -216,6 +225,106 @@ def _deep_merge(base, override):
         else:
             base[k] = v
     return base
+
+
+def _init_distributed():
+    """Initialize torchrun/NCCL if this process is part of a multi-GPU job."""
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    is_distributed = world_size > 1
+    if is_distributed:
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(
+            backend="nccl",
+            device_id=torch.device("cuda", local_rank),
+        )
+    return is_distributed, rank, local_rank, world_size
+
+
+def _cleanup_distributed(is_distributed):
+    if is_distributed and dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def _all_reduce_optimizer_grads(optimizers, world_size):
+    """Average gradients across ranks for non-DDP Parameter containers."""
+    if world_size <= 1:
+        return
+    seen = set()
+    for optimizer in optimizers:
+        if optimizer is None:
+            continue
+        for group in optimizer.param_groups:
+            for param in group.get("params", []):
+                if param.grad is None or id(param) in seen:
+                    continue
+                seen.add(id(param))
+                dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
+                param.grad.div_(world_size)
+
+
+def _sync_densification_stats(gaussians, before_accum, before_denom, world_size):
+    """Synchronize per-rank densification evidence while preserving history once."""
+    if world_size <= 1 or before_accum is None or before_denom is None:
+        return
+    delta_accum = gaussians.xyz_gradient_accum - before_accum
+    delta_denom = gaussians.denom - before_denom
+    dist.all_reduce(delta_accum, op=dist.ReduceOp.SUM)
+    dist.all_reduce(delta_denom, op=dist.ReduceOp.SUM)
+    gaussians.xyz_gradient_accum.copy_(before_accum + delta_accum)
+    gaussians.denom.copy_(before_denom + delta_denom)
+    dist.all_reduce(gaussians.max_radii2D, op=dist.ReduceOp.MAX)
+
+
+def _target_render_size(cam, longest_edge):
+    width, height = cam.width, cam.height
+    if longest_edge > 0 and max(width, height) > longest_edge:
+        factor = longest_edge / max(width, height)
+        width, height = int(width * factor), int(height * factor)
+    return width, height
+
+
+def _cache_resized_images(train_cams, longest_edge, dtype, show_progress):
+    image_cache = {}
+    with torch.no_grad():
+        for cam in tqdm(train_cams, desc="Image cache", disable=not show_progress):
+            width, height = _target_render_size(cam, longest_edge)
+            gt = load_image_tensor(cam)
+            gt = F.interpolate(
+                gt.unsqueeze(0), size=(height, width),
+                mode="bilinear", align_corners=False,
+            ).squeeze(0)
+            image_cache[cam.uid] = gt.to(dtype=dtype).contiguous()
+    return image_cache
+
+
+def _cache_resized_masks(train_cams, masks, longest_edge, show_progress):
+    mask_cache = {}
+    with torch.no_grad():
+        for cam in tqdm(train_cams, desc="Mask cache", disable=not show_progress):
+            if cam.image_name not in masks:
+                continue
+            width, height = _target_render_size(cam, longest_edge)
+            obj_mask = torch.as_tensor(masks[cam.image_name][0], device="cuda")[None].bool()
+            sky_mask = torch.as_tensor(masks[cam.image_name][1], device="cuda")[None].bool()
+            distort_mask = torch.as_tensor(masks[cam.image_name][2], device="cuda")[None].bool()
+            if obj_mask.shape[1] != height or obj_mask.shape[2] != width:
+                obj_mask = F.interpolate(
+                    obj_mask[None].float(), size=(height, width), mode="nearest"
+                ).squeeze(0) > 0.5
+                sky_mask = F.interpolate(
+                    sky_mask[None].float(), size=(height, width), mode="nearest"
+                ).squeeze(0) > 0.5
+                distort_mask = F.interpolate(
+                    distort_mask[None].float(), size=(height, width), mode="nearest"
+                ).squeeze(0) > 0.5
+            mask_cache[cam.uid] = (
+                obj_mask.contiguous(),
+                sky_mask.contiguous(),
+                distort_mask.contiguous(),
+            )
+    return mask_cache
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -675,6 +784,8 @@ def contrastive_feature_loss(
 # ════════════════════════════════════════════════════════════════════════════
 
 def train(cfg):
+    is_distributed, rank, local_rank, world_size = _init_distributed()
+    is_main_process = rank == 0
     exp_name = cfg['exp_name']
     output_dir = os.path.join(cfg['output_dir'], exp_name)
     os.makedirs(output_dir, exist_ok=True)
@@ -683,37 +794,48 @@ def train(cfg):
     mcfg = cfg['model']
     tcfg = cfg['training']
 
-    print(f"\n{'='*70}")
-    print(f"  Joint 2DGS Geometry + Feature Training v3")
-    print(f"  Experiment: {exp_name}")
-    print(f"{'='*70}")
-    print(f"  Dataset type:      {dcfg['type']}")
-    print(f"  Source:             {dcfg['source_dir']}")
-    print(f"  Features:           {dcfg['feature_dir']}")
-    print(f"  Scales:             {dcfg['feature_scales']}")
-    print(f"  Iterations:         {tcfg['iterations']}")
-    le = tcfg['longest_edge']
-    print(f"  Resolution:         {'FULL' if le == 0 else f'longest_edge={le}'}")
-    print(f"  Feature weight:     {tcfg['feature_weight']}")
-    print(f"  Depth supervision:  λ={tcfg['lambda_depth']}")
-    print(f"  Use mask:           {tcfg['use_mask']}")
-    print(f"  Use appearance:     {tcfg['use_appearance']}")
-    print(f"  Use transient:      {tcfg['use_transient']}")
-    print(f"  Use 3DGS:           {tcfg.get('use_3dgs', False)}")
-    print(f"  Semantic reg:       veg_scale={tcfg['vegetation_reg_scale']}")
-    print(f"  Veg prune opacity:  {tcfg.get('veg_prune_opacity', 0.0)}")
-    print(f"  Veg prune scale %: {tcfg.get('veg_prune_scale_percentile', 0)} (veg-local)")
-    print(f"  Veg max scale:      {tcfg.get('veg_max_scale', 0.0)} * extent")
-    print(f"  Grad accum steps:   {tcfg.get('grad_accum_steps', 1)}")
-    print(f"  Output:             {output_dir}")
-    print(f"{'='*70}\n")
+    seed = int(tcfg.get('seed', 12345)) + rank * 100003
+    random.seed(seed)
+    np.random.seed(seed % (2 ** 32 - 1))
+    torch.manual_seed(seed)
+
+    if is_main_process:
+        print(f"\n{'='*70}")
+        print(f"  Joint 2DGS Geometry + Feature Training v3")
+        print(f"  Experiment: {exp_name}")
+        print(f"{'='*70}")
+        print(f"  Dataset type:      {dcfg['type']}")
+        print(f"  Source:             {dcfg['source_dir']}")
+        print(f"  Features:           {dcfg['feature_dir']}")
+        print(f"  Scales:             {dcfg['feature_scales']}")
+        print(f"  Iterations:         {tcfg['iterations']}")
+        le = tcfg['longest_edge']
+        print(f"  Resolution:         {'FULL' if le == 0 else f'longest_edge={le}'}")
+        print(f"  Feature weight:     {tcfg['feature_weight']}")
+        print(f"  Depth supervision:  λ={tcfg['lambda_depth']}")
+        print(f"  Use mask:           {tcfg['use_mask']}")
+        print(f"  Use appearance:     {tcfg['use_appearance']}")
+        print(f"  Use transient:      {tcfg['use_transient']}")
+        print(f"  Use 3DGS:           {tcfg.get('use_3dgs', False)}")
+        print(f"  Semantic reg:       veg_scale={tcfg['vegetation_reg_scale']}")
+        print(f"  Veg prune opacity:  {tcfg.get('veg_prune_opacity', 0.0)}")
+        print(f"  Veg prune scale %: {tcfg.get('veg_prune_scale_percentile', 0)} (veg-local)")
+        print(f"  Veg max scale:      {tcfg.get('veg_max_scale', 0.0)} * extent")
+        print(f"  Batch size / GPU:   {tcfg.get('batch_size', tcfg.get('grad_accum_steps', 1))}")
+        print(f"  Distributed:        {world_size} GPU(s), local_rank={local_rank}")
+        print(f"  Output:             {output_dir}")
+        print(f"{'='*70}\n")
 
     # Save config
-    with open(os.path.join(output_dir, 'config.yaml'), 'w') as f:
-        yaml.dump(cfg, f, default_flow_style=False)
+    if is_main_process:
+        with open(os.path.join(output_dir, 'config.yaml'), 'w') as f:
+            yaml.dump(cfg, f, default_flow_style=False)
+    if is_distributed:
+        dist.barrier()
 
     # ── 1. Load scene ──
-    print("Loading scene...")
+    if is_main_process:
+        print("Loading scene...")
     ds_type = dcfg['type']
     if ds_type in ('colmap', 'cambridge'):
         train_cams, test_cams, pcd_xyz, pcd_rgb, cameras_extent = \
@@ -721,40 +843,59 @@ def train(cfg):
     else:
         raise ValueError(f"Unknown dataset type: {ds_type}")
 
-    # ── 2. Load features ──
-    scales = dcfg['feature_scales']
-    if isinstance(scales, str):
-        scales = [s.strip() for s in scales.split(',')]
-    print(f"\nLoading features ({scales})...")
-    feat_cache = DA3FeatureCache(dcfg['feature_dir'], scales)
+    # ── 2. Load features only when explicit feature supervision is active ──
+    configured_scales = dcfg['feature_scales']
+    if isinstance(configured_scales, str):
+        configured_scales = [s.strip() for s in configured_scales.split(',') if s.strip()]
+    feature_training_enabled = (
+        float(tcfg.get('feature_weight', 0.0)) > 0.0
+        and int(tcfg.get('feature_start_iter', 0)) <= int(tcfg['iterations'])
+    )
 
-    # Map cameras to feature frame IDs
-    images_subdir = dcfg.get('images', '')
-    if images_subdir:
-        images_dir = os.path.join(dcfg['source_dir'], images_subdir)
-    else:
-        import glob as _glob
-        if _glob.glob(os.path.join(dcfg['source_dir'], 'seq*')):
-            images_dir = dcfg['source_dir']
-        elif os.path.isdir(os.path.join(dcfg['source_dir'], 'images')):
-            images_dir = os.path.join(dcfg['source_dir'], 'images')
-        else:
-            images_dir = dcfg['source_dir']
-    da3_name_to_fid = build_da3_image_order(images_dir)
-    available_fids = feat_cache.frame_ids(scales[0])
-
+    feat_cache = None
     cam_to_fid = {}
-    for cam in train_cams:
-        fid = da3_name_to_fid.get(cam.image_name)
-        if fid is not None and fid in available_fids:
-            cam_to_fid[cam.uid] = fid
-    print(f"  Matched {len(cam_to_fid)}/{len(train_cams)} cameras to features")
-    if len(cam_to_fid) == 0:
-        print("ERROR: No cameras matched to features!")
-        return
+    scale_infos = {}
+    scales = []
+
+    if feature_training_enabled:
+        scales = configured_scales
+        if is_main_process:
+            print(f"\nLoading features ({scales})...")
+        feat_cache = DA3FeatureCache(dcfg['feature_dir'], scales)
+
+        # Map cameras to feature frame IDs
+        images_subdir = dcfg.get('images', '')
+        if images_subdir:
+            images_dir = os.path.join(dcfg['source_dir'], images_subdir)
+        else:
+            import glob as _glob
+            if _glob.glob(os.path.join(dcfg['source_dir'], 'seq*')):
+                images_dir = dcfg['source_dir']
+            elif os.path.isdir(os.path.join(dcfg['source_dir'], 'images')):
+                images_dir = os.path.join(dcfg['source_dir'], 'images')
+            else:
+                images_dir = dcfg['source_dir']
+        da3_name_to_fid = build_da3_image_order(images_dir)
+        available_fids = feat_cache.frame_ids(scales[0])
+
+        for cam in train_cams:
+            fid = da3_name_to_fid.get(cam.image_name)
+            if fid is not None and fid in available_fids:
+                cam_to_fid[cam.uid] = fid
+        if is_main_process:
+            print(f"  Matched {len(cam_to_fid)}/{len(train_cams)} cameras to features")
+        if len(cam_to_fid) == 0:
+            print("ERROR: No cameras matched to features!")
+            return
+    else:
+        if is_main_process:
+            print(
+            "\nFeature training disabled "
+            "(feature_weight=0 or feature_start_iter > iterations); "
+            "skipping teacher feature cache and explicit feature embeddings"
+            )
 
     # ── 3. Feature scale info ──
-    scale_infos = {}
     cam0 = train_cams[0]
     tanfovx = math.tan(cam0.FovX * 0.5)
     tanfovy = math.tan(cam0.FovY * 0.5)
@@ -770,10 +911,12 @@ def train(cfg):
             [0, 0, 1],
         ], device="cuda", dtype=torch.float32)
         scale_infos[scale] = {'dim': dim, 'h': h, 'w': w, 'K': feat_K}
-        print(f"  [{scale}] {dim}d @ {w}×{h}")
+        if is_main_process:
+            print(f"  [{scale}] {dim}d @ {w}×{h}")
 
     # ── 4. Create model ──
-    print("\nInitializing model...")
+    if is_main_process:
+        print("\nInitializing model...")
     feature_dims = {s: scale_infos[s]['dim'] for s in scales}
     gaussians = GaussianModel2DGSJoint(
         sh_degree=mcfg['sh_degree'],
@@ -784,8 +927,9 @@ def train(cfg):
         gaussians.load_ply(init_ply)
         gaussians.spatial_lr_scale = cameras_extent
         gaussians.init_feature_embeddings()
-        print(f"  Warmstarted Gaussians from {init_ply}")
-        print(f"  Loaded {gaussians.num_points:,} Gaussians")
+        if is_main_process:
+            print(f"  Warmstarted Gaussians from {init_ply}")
+            print(f"  Loaded {gaussians.num_points:,} Gaussians")
     else:
         gaussians.create_from_pcd(pcd_xyz, pcd_rgb, cameras_extent)
 
@@ -803,7 +947,8 @@ def train(cfg):
     gaussians.training_setup(train_args)
     if tcfg.get('freeze_geometry', False):
         _freeze_base_gaussians(gaussians)
-        print("  Base Gaussian geometry/appearance frozen; training feature embeddings only")
+        if is_main_process:
+            print("  Base Gaussian geometry/appearance frozen; training feature embeddings only")
 
     bg_color = torch.tensor(
         [1, 1, 1] if mcfg['white_background'] else [0, 0, 0],
@@ -819,13 +964,15 @@ def train(cfg):
         ]
         for mp in mask_candidates:
             if mp and os.path.exists(mp):
-                print(f"  Loading masks from {mp}")
+                if is_main_process:
+                    print(f"  Loading masks from {mp}")
                 with open(mp, 'rb') as f:
                     masks = pickle.load(f)
                 matched = sum(1 for c in train_cams if c.image_name in masks)
-                print(f"  Loaded masks for {len(masks)} images, matched {matched}/{len(train_cams)}")
+                if is_main_process:
+                    print(f"  Loaded masks for {len(masks)} images, matched {matched}/{len(train_cams)}")
                 break
-        if masks is None:
+        if masks is None and is_main_process:
             print("  WARNING: use_mask=True but no masks.pkl found")
 
     # ── 6. Load semantic masks ──
@@ -847,7 +994,8 @@ def train(cfg):
             appearance_net.parameters(),
             lr=tcfg.get('appearance_lr', 0.001),
         )
-        print(f"  AppearanceNetwork: {n_images} images, embed_dim={tcfg.get('appearance_embed_dim', 32)}")
+        if is_main_process:
+            print(f"  AppearanceNetwork: {n_images} images, embed_dim={tcfg.get('appearance_embed_dim', 32)}")
 
     # ── 8. TransientHead ──
     transient_head = None
@@ -858,28 +1006,66 @@ def train(cfg):
             transient_head.parameters(),
             lr=tcfg.get('transient_lr', 0.001),
         )
-        print(f"  TransientHead enabled")
+        if is_main_process:
+            print(f"  TransientHead enabled")
 
     # ── 9. Pre-cache mono depth ──
     mono_depth_dir = tcfg.get('mono_depth_dir', '')
     mono_depth_cache = {}
     if mono_depth_dir and os.path.isdir(mono_depth_dir):
-        print(f"Pre-caching monocular depth from {mono_depth_dir}...")
+        if is_main_process:
+            print(f"Pre-caching monocular depth from {mono_depth_dir}...")
         for cam in train_cams:
             depth_name = os.path.splitext(cam.image_name)[0] + ".npy"
             depth_path = os.path.join(mono_depth_dir, depth_name)
             if os.path.exists(depth_path):
                 d = np.load(depth_path)
                 mono_depth_cache[cam.image_name] = 1.0 - d  # invert DPT disparity
-        print(f"  Cached {len(mono_depth_cache)} depth maps")
-    elif tcfg.get('lambda_depth', 0) > 0:
+        if is_main_process:
+            print(f"  Cached {len(mono_depth_cache)} depth maps")
+    elif tcfg.get('lambda_depth', 0) > 0 and is_main_process:
         print(f"  WARNING: lambda_depth={tcfg['lambda_depth']} but mono_depth_dir not found")
 
-    # ── 10. Pre-cache images ──
-    # Skip bulk pre-caching (NFS can be slow/unstable under parallel load).
-    # Images will be loaded on-demand via load_image_tensor() during training,
-    # which uses the OS page cache and benefits from sequential access.
-    print("Skipping image pre-cache (on-demand loading enabled)")
+    # ── 10. Optional fixed-resolution GPU caches ──
+    image_cache = {}
+    mask_cache = {}
+    if tcfg.get('cache_resized_images', False):
+        cache_dtype_name = str(tcfg.get('image_cache_dtype', 'float16')).lower()
+        cache_dtype = torch.float32 if cache_dtype_name == 'float32' else torch.float16
+        if is_main_process:
+            print(f"Pre-caching resized train images on GPU ({cache_dtype_name})...")
+        try:
+            image_cache = _cache_resized_images(
+                train_cams, tcfg['longest_edge'], cache_dtype, is_main_process
+            )
+            if is_main_process:
+                print(f"  Cached {len(image_cache)} resized images")
+        except RuntimeError as e:
+            if "out of memory" not in str(e).lower():
+                raise
+            image_cache.clear()
+            torch.cuda.empty_cache()
+            if is_main_process:
+                print("  WARNING: image cache OOM; falling back to on-demand image loads")
+    elif is_main_process:
+        print("Skipping image pre-cache (on-demand loading enabled)")
+
+    if masks is not None and tcfg.get('cache_resized_masks', False):
+        if is_main_process:
+            print("Pre-caching resized train masks on GPU...")
+        try:
+            mask_cache = _cache_resized_masks(
+                train_cams, masks, tcfg['longest_edge'], is_main_process
+            )
+            if is_main_process:
+                print(f"  Cached {len(mask_cache)} resized masks")
+        except RuntimeError as e:
+            if "out of memory" not in str(e).lower():
+                raise
+            mask_cache.clear()
+            torch.cuda.empty_cache()
+            if is_main_process:
+                print("  WARNING: mask cache OOM; falling back to on-demand mask resize")
 
     # Build cam_uid → sequential index mapping for AppearanceNetwork
     cam_uid_to_idx = {cam.uid: i for i, cam in enumerate(train_cams)}
@@ -909,7 +1095,10 @@ def train(cfg):
         log("  [3DGS mode] Disabled normal/dist regularization")
     veg_reg_scale = tcfg.get('vegetation_reg_scale', 0.1)
 
-    grad_accum_steps = max(1, tcfg.get('grad_accum_steps', 1))
+    grad_accum_steps = max(1, int(tcfg.get('grad_accum_steps', 1)))
+    batch_size = max(1, int(tcfg.get('batch_size', grad_accum_steps)))
+    if batch_size == 1 and grad_accum_steps > 1:
+        batch_size = grad_accum_steps
 
     viewpoint_stack = []
     ema_loss = 0.0
@@ -918,38 +1107,73 @@ def train(cfg):
     ema_feat = {s: 0.0 for s in scales}
     best_psnr = 0.0
 
-    log_file = open(os.path.join(output_dir, 'train.log'), 'w')
+    log_file = open(os.path.join(output_dir, 'train.log'), 'w') if is_main_process else None
 
     def log(msg):
+        if not is_main_process:
+            return
         print(msg)
         log_file.write(msg + '\n')
         log_file.flush()
 
-    log(f"  Grad accumulation: {grad_accum_steps} cameras per optimizer step")
+    if batch_size > 1 and not use_3dgs:
+        log(f"  Batched rasterization: {batch_size} cameras per optimizer step per GPU (global batch={batch_size * world_size})")
+    elif batch_size > 1:
+        log(f"  Batch size: {batch_size} cameras per step (sequential 3DGS fallback)")
+    else:
+        log("  Batch size: 1 camera per optimizer step")
 
-    pbar = tqdm(range(1, iterations + 1), desc="Joint v3")
+    pbar = tqdm(range(1, iterations + 1), desc="Joint v3", disable=not is_main_process)
+    consecutive_bad_steps = 0
+    max_consecutive_bad_steps = max(1, int(tcfg.get('max_consecutive_bad_steps', 50)))
     for iteration in pbar:
         gaussians.update_learning_rate(iteration)
         if iteration % 1000 == 0:
             gaussians.oneupSHdegree()
 
-        # ── Accumulate losses across grad_accum_steps cameras ──
+        # ── Render a multi-camera batch, then average per-view losses ──
         accum_loss_val = 0.0
         accum_rgb_val = 0.0
         accum_depth_val = 0.0
         bad_step = False
+        losses = []
 
-        for accum_step in range(grad_accum_steps):
-            # Sample camera
+        cams_batch = []
+        for _ in range(batch_size):
             if not viewpoint_stack:
                 viewpoint_stack = list(train_cams)
                 shuffle(viewpoint_stack)
-            cam = viewpoint_stack.pop()
+            cams_batch.append(viewpoint_stack.pop())
+
+        if batch_size > 1 and not use_3dgs:
+            try:
+                render_pkgs = render_rgb_2dgs_batch(
+                    gaussians, cams_batch, bg_color, longest_edge
+                )
+            except RuntimeError as e:
+                if "out of memory" not in str(e).lower():
+                    raise
+                torch.cuda.empty_cache()
+                if is_main_process:
+                    tqdm.write(
+                        f"  [Iter {iteration}] OOM in batched render; "
+                        "falling back to sequential views"
+                    )
+                render_pkgs = [
+                    render_fn(gaussians, cam, bg_color, longest_edge)
+                    for cam in cams_batch
+                ]
+        else:
+            render_pkgs = [
+                render_fn(gaussians, cam, bg_color, longest_edge)
+                for cam in cams_batch
+            ]
+
+        for accum_step, (cam, render_pkg) in enumerate(zip(cams_batch, render_pkgs)):
             fid = cam_to_fid.get(cam.uid)
             cam_idx = cam_uid_to_idx[cam.uid]
 
             # ── RGB render ──
-            render_pkg = render_fn(gaussians, cam, bg_color, longest_edge)
             image = render_pkg["render"]  # [3, H, W]
             rw, rh = render_pkg["width"], render_pkg["height"]
 
@@ -957,16 +1181,25 @@ def train(cfg):
             if appearance_net is not None:
                 image = appearance_net(image, cam_idx)
 
-            gt_image = load_image_tensor(cam)
-            gt_image = F.interpolate(
-                gt_image.unsqueeze(0), size=(rh, rw),
-                mode="bilinear", align_corners=False
-            ).squeeze(0)
+            gt_image = image_cache.get(cam.uid) if image_cache else None
+            if gt_image is not None and (gt_image.shape[1] != rh or gt_image.shape[2] != rw):
+                gt_image = None
+            if gt_image is None:
+                gt_image = load_image_tensor(cam)
+                gt_image = F.interpolate(
+                    gt_image.unsqueeze(0), size=(rh, rw),
+                    mode="bilinear", align_corners=False
+                ).squeeze(0)
+            else:
+                gt_image = gt_image.to(dtype=image.dtype)
 
             # ── Sky / object masking ──
             rgb_mask = None
             sky_mask_2d = None
-            if masks is not None and cam.image_name in masks:
+            cached_masks = mask_cache.get(cam.uid) if mask_cache else None
+            if cached_masks is not None:
+                obj_mask, sky_mask_raw, distort_mask = cached_masks
+            elif masks is not None and cam.image_name in masks:
                 obj_mask = masks[cam.image_name][0].cuda()[None]
                 sky_mask_raw = masks[cam.image_name][1].cuda()[None]
                 distort_mask = masks[cam.image_name][2].cuda()[None]
@@ -978,7 +1211,10 @@ def train(cfg):
                                                   mode="nearest").squeeze(0) > 0.5
                     distort_mask = F.interpolate(distort_mask[None].float(), size=(rh, rw),
                                                   mode="nearest").squeeze(0) > 0.5
+            else:
+                obj_mask = sky_mask_raw = distort_mask = None
 
+            if obj_mask is not None:
                 rgb_mask = (obj_mask & distort_mask).float()
                 sky_mask_2d = ~sky_mask_raw
 
@@ -1053,12 +1289,24 @@ def train(cfg):
                         surf_n = surf_n.squeeze(0)
                     surf_n = surf_n.permute(2, 0, 1)
                     normal_error = (1 - (rend_n * surf_n).sum(dim=0))[None]
+                    normal_error = torch.nan_to_num(
+                        normal_error,
+                        nan=0.0,
+                        posinf=tcfg.get('normal_error_max', 2.0),
+                        neginf=0.0,
+                    ).clamp(min=0.0, max=tcfg.get('normal_error_max', 2.0))
                     if sem_weight is not None:
                         normal_error = normal_error * sem_weight
                     loss = loss + lambda_normal * normal_error.mean()
 
                 if lambda_dist > 0 and rend_dist is not None:
                     dist_loss = rend_dist.squeeze(-1)
+                    dist_loss = torch.nan_to_num(
+                        dist_loss,
+                        nan=0.0,
+                        posinf=tcfg.get('dist_loss_max', 10.0),
+                        neginf=0.0,
+                    ).clamp(min=0.0, max=tcfg.get('dist_loss_max', 10.0))
                     if len(dist_loss.shape) == 3:
                         if sem_weight is not None:
                             dist_loss = dist_loss * sem_weight
@@ -1071,6 +1319,10 @@ def train(cfg):
                     excess = torch.clamp(
                         gaussians._scaling.max(dim=1).values - log_threshold, min=0
                     )
+                    scale_penalty = torch.clamp(
+                        excess ** 2,
+                        max=tcfg.get('scale_loss_max', 10.0),
+                    ).mean()
                     # Boost scale regularization in vegetation areas
                     veg_scale_boost = tcfg.get('vegetation_scale_boost', 1.0)
                     if veg_scale_boost > 1.0 and sem_masks and cam.image_name in sem_masks:
@@ -1085,9 +1337,9 @@ def train(cfg):
                         # based on vegetation fraction in current view
                         veg_frac = (scale_sem_weight > 1.0).float().mean()
                         effective_boost = 1.0 + (veg_scale_boost - 1.0) * veg_frac.item()
-                        loss = loss + lambda_scale * effective_boost * (excess ** 2).mean()
+                        loss = loss + lambda_scale * effective_boost * scale_penalty
                     else:
-                        loss = loss + lambda_scale * (excess ** 2).mean()
+                        loss = loss + lambda_scale * scale_penalty
 
             # ── Monocular depth supervision ──
             depth_loss_val = torch.tensor(0.0, device="cuda")
@@ -1230,7 +1482,7 @@ def train(cfg):
                 loss = loss + feat_weight * total_feat_loss
 
             # ── Appearance regularization (once per batch, on last step) ──
-            if accum_step == grad_accum_steps - 1 and appearance_net is not None:
+            if accum_step == batch_size - 1 and appearance_net is not None:
                 app_reg_w = tcfg.get('appearance_reg', 0.0)
                 app_mean_reg = tcfg.get('appearance_mean_reg', 0.0)
                 if app_reg_w > 0 or app_mean_reg > 0:
@@ -1256,44 +1508,76 @@ def train(cfg):
             # ── Safety check ──
             loss_val = loss.item()
             if torch.isnan(loss) or torch.isinf(loss) or loss_val < -0.01:
-                tqdm.write(f"  [Iter {iteration}] Bad loss={loss_val:.4g}, skipping batch")
+                if is_main_process:
+                    tqdm.write(f"  [Iter {iteration}] Bad loss={loss_val:.4g}, skipping batch")
                 bad_step = True
                 break
             if loss_val > 10.0:
                 loss = loss.clamp(max=10.0)
-
-            # ── Backward (scaled by 1/grad_accum_steps) ──
-            scaled_loss = loss / grad_accum_steps
-            scaled_loss.backward()
-
-            # ── Densification stats: use RAW rgb loss gradients (not transient-weighted)
-            #    to ensure healthy densification despite additional networks ──
-            with torch.no_grad():
-                if iteration < tcfg['densify_until_iter']:
-                    vp = render_pkg["viewspace_points"]
-                    grad_data = vp.grad if vp.grad is not None else vp
-                    radii = render_pkg["radii"]
-                    vis = render_pkg["visibility_filter"]
-                    gaussians.max_radii2D[vis] = torch.max(
-                        gaussians.max_radii2D[vis], radii[vis]
-                    )
-                    gaussians.add_densification_stats(grad_data, vis, rw, rh)
+                loss_val = loss.item()
 
             # ── Accumulate EMA values ──
-            accum_loss_val += loss_val / grad_accum_steps
-            accum_rgb_val += rgb_loss_raw.item() / grad_accum_steps
+            losses.append(loss)
+            accum_loss_val += loss_val / batch_size
+            accum_rgb_val += rgb_loss_raw.item() / batch_size
             depth_v = depth_loss_val.item() if torch.is_tensor(depth_loss_val) else depth_loss_val
-            accum_depth_val += depth_v / grad_accum_steps
+            accum_depth_val += depth_v / batch_size
 
-        # ── End of accumulation loop ──
+        # ── End of per-view loss loop ──
 
-        if bad_step:
+        bad_step_tensor = torch.tensor(
+            [1 if bad_step or not losses else 0],
+            device="cuda",
+            dtype=torch.int32,
+        )
+        if is_distributed:
+            dist.all_reduce(bad_step_tensor, op=dist.ReduceOp.MAX)
+
+        if bad_step_tensor.item() > 0:
+            consecutive_bad_steps += 1
             gaussians.optimizer.zero_grad(set_to_none=True)
             if app_optimizer is not None:
                 app_optimizer.zero_grad(set_to_none=True)
             if transient_optimizer is not None:
                 transient_optimizer.zero_grad(set_to_none=True)
+            if consecutive_bad_steps >= max_consecutive_bad_steps:
+                raise RuntimeError(
+                    f"Aborting after {consecutive_bad_steps} consecutive bad steps; "
+                    "Gaussian parameters are likely unstable."
+                )
             continue
+
+        consecutive_bad_steps = 0
+
+        total_loss = sum(losses) / batch_size
+        total_loss.backward()
+
+        # ── Densification stats from every view in the rasterization batch ──
+        with torch.no_grad():
+            if iteration < tcfg['densify_until_iter']:
+                before_accum = gaussians.xyz_gradient_accum.clone() if is_distributed else None
+                before_denom = gaussians.denom.clone() if is_distributed else None
+                for view_idx, render_pkg in enumerate(render_pkgs):
+                    vp = render_pkg["viewspace_points"]
+                    grad_data = vp.grad if vp.grad is not None else vp
+                    if grad_data.dim() == 3 and grad_data.size(0) > 1:
+                        grad_data = grad_data[view_idx:view_idx + 1]
+                    radii = render_pkg["radii"]
+                    vis = render_pkg["visibility_filter"]
+                    gaussians.max_radii2D[vis] = torch.max(
+                        gaussians.max_radii2D[vis], radii[vis]
+                    )
+                    gaussians.add_densification_stats(
+                        grad_data, vis, render_pkg["width"], render_pkg["height"]
+                    )
+                _sync_densification_stats(
+                    gaussians, before_accum, before_denom, world_size
+                )
+
+        _all_reduce_optimizer_grads(
+            [gaussians.optimizer, app_optimizer, transient_optimizer],
+            world_size,
+        )
 
         # ── Gradient clipping ──
         clip_params = [
@@ -1310,7 +1594,7 @@ def train(cfg):
         ema_depth = 0.4 * accum_depth_val + 0.6 * ema_depth
 
         with torch.no_grad():
-            if iteration % 10 == 0:
+            if is_main_process and iteration % 10 == 0:
                 feat_str = " ".join(f"{s[0]}={ema_feat[s]:.3f}" for s in scales)
                 pbar.set_postfix({
                     "L": f"{ema_loss:.4f}", "RGB": f"{ema_rgb:.4f}",
@@ -1320,7 +1604,7 @@ def train(cfg):
 
             # ── Periodic eval + visualization ──
             eval_interval = tcfg['eval_interval']
-            if iteration % eval_interval == 0 or iteration == iterations:
+            if is_main_process and (iteration % eval_interval == 0 or iteration == iterations):
                 eval_cams = test_cams if test_cams else train_cams
                 psnr_val = evaluate_psnr(
                     gaussians, eval_cams, bg_color, longest_edge
@@ -1350,7 +1634,7 @@ def train(cfg):
 
             # ── Checkpoints ──
             save_interval = tcfg['save_interval']
-            if iteration % save_interval == 0 or iteration == iterations:
+            if is_main_process and (iteration % save_interval == 0 or iteration == iterations):
                 save_dir = os.path.join(
                     output_dir, "point_cloud", f"iteration_{iteration}"
                 )
@@ -1379,6 +1663,8 @@ def train(cfg):
                             gaussians._prune_points(prune_mask)
                             torch.cuda.empty_cache()
                     else:
+                        if is_distributed:
+                            torch.manual_seed(1000000 + iteration)
                         gaussians.densify_and_prune(
                             tcfg['densify_grad_threshold'], 0.005,
                             cameras_extent, size_threshold,
@@ -1431,7 +1717,9 @@ def train(cfg):
     # ── Final ──
     log(f"\n  Training complete. Best PSNR: {best_psnr:.2f}dB")
     log(f"  Output: {output_dir}")
-    log_file.close()
+    if log_file is not None:
+        log_file.close()
+    _cleanup_distributed(is_distributed)
 
 
 # ════════════════════════════════════════════════════════════════════════════

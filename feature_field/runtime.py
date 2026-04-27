@@ -342,8 +342,11 @@ def build_dcff_runtime(
             f"Tried checkpoint sibling {ckpt_ply_path} and configured path {cfg_dcff.get('ply_path')}"
         )
 
-    latent_dim = cfg_dcff.get("latent_dim", 32)
-    feature_dim = cfg_dcff.get("feature_dim", 64)
+    ckpt_latent = checkpoint.get("latent")
+    latent_dim = int(cfg_dcff.get(
+        "latent_dim",
+        ckpt_latent.shape[1] if hasattr(ckpt_latent, "shape") and ckpt_latent.ndim == 2 else 32,
+    ))
 
     gaussians = HybridGaussianModel(sh_degree=3, latent_dim=latent_dim)
     gaussians.load_ply(str(ply_path), freeze_geometry=True)
@@ -386,12 +389,18 @@ def build_dcff_runtime(
     ccfg = dcff_cfg.get("coarse_decoder", {})
     mcfg = dcff_cfg.get("model", {})
     fsm_cfg = dcff_cfg.get("fsm", {})
+    feature_dim = int(cfg_dcff.get("feature_dim", mcfg.get("feature_dim", 64)))
+    fine_latent_dim = cfg_dcff.get("fine_latent_dim", mcfg.get("fine_latent_dim"))
+    coarse_latent_dim = cfg_dcff.get("coarse_latent_dim", mcfg.get("coarse_latent_dim"))
+    fine_latent_dim = int(fine_latent_dim) if fine_latent_dim is not None else None
+    coarse_latent_dim = int(coarse_latent_dim) if coarse_latent_dim is not None else None
+    hash_latent_dim = coarse_latent_dim if coarse_latent_dim is not None else latent_dim
 
     hash_grid = SpatialHashGrid(
         scene_extent=hcfg.get("scene_extent", scene_extent),
         feature_dim=feature_dim,
         input_mode=hcfg.get("input_mode", "implicit_scale"),
-        latent_dim=latent_dim,
+        latent_dim=hash_latent_dim,
         n_levels=hcfg.get("n_levels", 16),
         n_features_per_level=hcfg.get("n_features_per_level", 2),
         log2_hashmap_size=hcfg.get("log2_hashmap_size", 19),
@@ -401,6 +410,7 @@ def build_dcff_runtime(
         mlp_layers=hcfg.get("mlp_layers", 2),
         scale_pe_freqs=hcfg.get("scale_pe_freqs", 4),
         include_raw_scale=hcfg.get("include_raw_scale", True),
+        forward_chunk_size=hcfg.get("forward_chunk_size", 0),
     ).to(device)
 
     renderer = DeferredCascadedRenderer(
@@ -413,9 +423,12 @@ def build_dcff_runtime(
         fine_use_viewdirs=fcfg.get("use_viewdirs", False),
         fine_view_degree=fcfg.get("view_degree", 2),
         fine_decoder_type=fcfg.get("type", "mlp"),
+        fine_latent_dim=fine_latent_dim,
+        coarse_latent_dim=coarse_latent_dim,
         coarse_mode=ccfg.get("mode", "implicit_only"),
         coarse_carrier_hidden_dim=ccfg.get("carrier_hidden_dim"),
         coarse_gate_hidden_dim=ccfg.get("gate_hidden_dim"),
+        coarse_forward_batch_chunk_size=ccfg.get("forward_batch_chunk_size", 0),
         coarse_smoothing_kernel=cfg_dcff.get("coarse_smoothing_kernel", mcfg.get("coarse_smoothing_kernel", 1)),
     ).to(device)
 

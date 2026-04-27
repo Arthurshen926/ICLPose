@@ -1269,7 +1269,7 @@ def evaluate_nn_then_fm(model, gaussians, dcff_renderer, feat_sharp,
     Returns dict with rot/trans statistics for both NN-only and NN+FM.
     """
     from data.radio_loc_dataset import add_pose_noise
-    from modules.featuremetric import featuremetric_gauss_newton_step
+    from pose_refine.utils.featuremetric import featuremetric_gauss_newton_step
 
     model.eval()
     original_gru = model.gru_iters
@@ -1343,7 +1343,9 @@ def evaluate_nn_then_fm(model, gaussians, dcff_renderer, feat_sharp,
             trace = R_rel[:, 0, 0] + R_rel[:, 1, 1] + R_rel[:, 2, 2]
             cos_angle = torch.clamp((trace - 1.0) / 2.0, -1.0 + 1e-7, 1.0 - 1e-7)
             nn_rot_err = (torch.acos(cos_angle) * 180.0 / math.pi).item()
-            nn_trans_err = (torch.norm(nn_pose.float()[:, :3, 3] - pose_gt.float()[:, :3, 3], dim=1) * 1000).item()
+            c_nn = camera_centers_from_w2c(nn_pose.float())
+            c_gt = camera_centers_from_w2c(pose_gt.float())
+            nn_trans_err = (torch.norm(c_nn - c_gt, dim=1) * 1000).item()
 
         nn_rot_errs.append(nn_rot_err)
         nn_trans_errs.append(nn_trans_err)
@@ -1401,7 +1403,9 @@ def evaluate_nn_then_fm(model, gaussians, dcff_renderer, feat_sharp,
             trace = R_rel[:, 0, 0] + R_rel[:, 1, 1] + R_rel[:, 2, 2]
             cos_angle = torch.clamp((trace - 1.0) / 2.0, -1.0 + 1e-7, 1.0 - 1e-7)
             fm_rot_err = (torch.acos(cos_angle) * 180.0 / math.pi).item()
-            fm_trans_err = (torch.norm(pose_fm.float()[:, :3, 3] - pose_gt.float()[:, :3, 3], dim=1) * 1000).item()
+            c_fm = camera_centers_from_w2c(pose_fm.float())
+            c_gt = camera_centers_from_w2c(pose_gt.float())
+            fm_trans_err = (torch.norm(c_fm - c_gt, dim=1) * 1000).item()
 
         fm_rot_errs.append(fm_rot_err)
         fm_trans_errs.append(fm_trans_err)

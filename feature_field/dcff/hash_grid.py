@@ -105,12 +105,14 @@ class SpatialHashGrid(nn.Module):
         # MLP params
         mlp_hidden: int = 128,
         mlp_layers: int = 2,
+        forward_chunk_size: int = 0,
     ):
         super().__init__()
         self.scene_extent = scene_extent
         self.feature_dim = feature_dim
         self.input_mode = input_mode
         self.latent_dim = latent_dim
+        self.forward_chunk_size = int(forward_chunk_size or 0)
         self.uses_tcnn = TCNN_AVAILABLE
 
         if self.input_mode not in {'legacy', 'implicit_scale'}:
@@ -220,9 +222,31 @@ class SpatialHashGrid(nn.Module):
             scale_v = scales[valid_mask] if scales is not None else None
             lat_v = latent[valid_mask] if latent is not None else None
             vd_v = view_dirs[valid_mask] if view_dirs is not None else None
-            out[valid_mask] = self._forward_impl(pos_v, scale_v, lat_v, vd_v)
+            out[valid_mask] = self._forward_impl_chunked(pos_v, scale_v, lat_v, vd_v)
             return out
-        return self._forward_impl(positions, scales, latent, view_dirs)
+        return self._forward_impl_chunked(positions, scales, latent, view_dirs)
+
+    def _forward_impl_chunked(self, positions, scales, latent, view_dirs):
+        chunk = self.forward_chunk_size
+        if chunk <= 0 or positions.shape[0] <= chunk:
+            return self._forward_impl(positions, scales, latent, view_dirs)
+
+        outputs = None
+        for start in range(0, positions.shape[0], chunk):
+            end = min(start + chunk, positions.shape[0])
+            scale_chunk = scales[start:end] if scales is not None else None
+            latent_chunk = latent[start:end] if latent is not None else None
+            view_chunk = view_dirs[start:end] if view_dirs is not None else None
+            chunk_out = self._forward_impl(
+                positions[start:end],
+                scale_chunk,
+                latent_chunk,
+                view_chunk,
+            )
+            if outputs is None:
+                outputs = chunk_out.new_empty(positions.shape[0], chunk_out.shape[1])
+            outputs[start:end] = chunk_out
+        return outputs
 
     def _forward_impl(self, positions, scales, latent, view_dirs):
         """Core forward without masking."""

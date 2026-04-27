@@ -1,0 +1,9 @@
+python -m feature_field.train --config feature_field/configs/dcff_cambridge_oldhospital_processed_rebuild_v2.yaml
+
+/usr/local/miniconda3/envs/iclpose/bin/python -u -m feature_gaussian.train --config feature_gaussian/configs/joint_rgb_geometry_cambridge_oldhospital_processed_rebuild_v3_batched_30k.yaml
+
+ps aux | grep python
+pgrep python
+
+
+TORCH_CUDA_ARCH_LIST=8.6+PTX torchrun --nproc_per_node=4 -m feature_gaussian.train --config feature_gaussian/configs/joint_rgb_geometry_cambridge_oldhospital_processed_rebuild_v4_4gpu_1280_safe_rgbft_30k.yaml

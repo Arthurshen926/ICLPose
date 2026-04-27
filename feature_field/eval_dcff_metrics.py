@@ -3,7 +3,6 @@
 
 import argparse
 import json
-import os
 import numpy as np
 import torch
 from PIL import Image
@@ -15,7 +14,7 @@ from feature_field.visualize_feature_comparison import (
     _cam_to_viewmat,
     _cam_to_K,
 )
-from feature_field.dcff.radio_teacher import CachedFeatureTeacher
+from feature_field.utils.dcff_eval_targets import build_teacher_target_provider
 from feature_field.utils.region_metrics import (
     compute_region_masks,
     empty_region_score_dict,
@@ -23,7 +22,7 @@ from feature_field.utils.region_metrics import (
     score_regions,
     summarize_region_scores,
 )
-from feature_field.utils.scene_colmap import load_scene_colmap, build_da3_image_order
+from feature_field.utils.scene_colmap import load_scene_colmap
 
 
 def parse_args():
@@ -75,24 +74,14 @@ def main():
     coarse_downsample = bundle['coarse_downsample']
 
     train_cams, test_cams, _, _, _ = load_scene_colmap(args.source_dir, args.images_subdir)
-    radio_cache = CachedFeatureTeacher(args.feature_dir)
-    feat_h, feat_w = radio_cache.feat_h, radio_cache.feat_w
-
-    if args.images_subdir:
-        images_dir = os.path.join(args.source_dir, args.images_subdir)
-    else:
-        images_dir = (
-            os.path.join(args.source_dir, 'images')
-            if os.path.isdir(os.path.join(args.source_dir, 'images'))
-            else args.source_dir
-        )
-    da3_name_to_fid = build_da3_image_order(images_dir)
-
-    cam_to_fid = {}
-    for cam in train_cams + test_cams:
-        fid = da3_name_to_fid.get(cam.image_name)
-        if fid is not None and fid in radio_cache.frame_ids:
-            cam_to_fid[cam.uid] = fid
+    teacher_provider = build_teacher_target_provider(
+        bundle['cfg'],
+        bundle['ckpt'],
+        source_dir=args.source_dir,
+        feature_dir=args.feature_dir,
+        device=device,
+        images_subdir=args.images_subdir,
+    )
 
     if args.camera_split == 'train':
         cam_pool = train_cams
@@ -103,7 +92,7 @@ def main():
     else:
         cam_pool = test_cams if test_cams else train_cams
 
-    valid_cams = [c for c in cam_pool if c.uid in cam_to_fid]
+    valid_cams = teacher_provider.filter_cameras(cam_pool)
     if args.camera_indices:
         indices = [int(x) for x in args.camera_indices.split(',') if x.strip()]
         valid_cams = [valid_cams[i] for i in indices if 0 <= i < len(valid_cams)]
@@ -122,18 +111,12 @@ def main():
 
     with torch.no_grad():
         processed = 0
-        coarse_h, coarse_w = feat_h // 2, feat_w // 2
         for (h_render, w_render), cams_in_group in grouped_cams.items():
             for start in range(0, len(cams_in_group), args.batch_size):
                 cams = cams_in_group[start:start + args.batch_size]
-                fids = [cam_to_fid[c.uid] for c in cams]
-                geo_batch, sem_batch = [], []
-                for fid in fids:
-                    geo, sem = radio_cache.get(fid)
-                    geo_batch.append(geo)
-                    sem_batch.append(sem)
-                geo_target = torch.stack(geo_batch, dim=0).to(device)
-                sem_target = torch.stack(sem_batch, dim=0).to(device)
+                geo_target, sem_target, fids = teacher_provider.get_batch(cams)
+                feat_h, feat_w = geo_target.shape[-2:]
+                coarse_h, coarse_w = feat_h // 2, feat_w // 2
 
                 viewmat = torch.cat([_cam_to_viewmat(cam, device) for cam in cams], dim=0)
                 K = torch.cat([_cam_to_K(cam, w_render, h_render, device) for cam in cams], dim=0)
@@ -195,7 +178,7 @@ def main():
                     per_camera.append({
                         'index': processed - 1,
                         'uid': int(cam.uid),
-                        'fid': int(fid),
+                        'fid': None if fid is None else int(fid),
                         'image_name': cam.image_name,
                         'fine_cos': fine,
                         'coarse_cos': coarse,

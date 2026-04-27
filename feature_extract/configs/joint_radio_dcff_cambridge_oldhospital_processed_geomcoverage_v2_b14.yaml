@@ -1,0 +1,124 @@
+exp_name: joint_radio_dcff_cambridge_oldhospital_processed_geomcoverage_v2_b14_masklr_from_v1
+output_dir: /root/ICLPose/result/feature_extract
+
+dataset:
+  source_dir: /hy-tmp/Cambridge_stdloc/OldHospital/processed
+  feature_dir: /root/ICLPose/result/feature_extract/features_radio_dual/cambridge_oldhospital_processed
+  train_split: /hy-tmp/Cambridge_stdloc/OldHospital/dataset_train.txt
+  val_split: /hy-tmp/Cambridge_stdloc/OldHospital/dataset_test.txt
+  image_patterns:
+    - seq*/*.png
+    - seq*/*.jpg
+    - images/*.png
+    - images/*.jpg
+    - "*.png"
+    - "*.jpg"
+  patch_size: 16
+  input_hw: [1088, 1920]
+  feature_hw: [68, 120]
+  cache_teacher: false
+  fallback_val_ratio: 0.1
+  max_train_samples: null
+  max_val_samples: 182
+  synthetic_if_missing: false
+  prior_mask_path: /hy-tmp/Cambridge_stdloc/OldHospital/processed/masks.pkl
+  prior_mask_channels: [0, 1, 2]
+
+model:
+  feature_dim: 64
+  base_channels: 32
+  stage_dims: [32, 64, 96, 128]
+  dropout: 0.0
+  l2_normalize: true
+  predict_magnitude: true
+  fine_init_norm: 4.38
+  coarse_init_norm: 25.50
+  magnitude_min: 0.0001
+  warmstart_strict: false
+
+training:
+  device: cuda
+  seed: 44
+  epochs: 18
+  batch_size: 14
+  num_workers: 12
+  lr: 0.00005
+  weight_decay: 0.00001
+  grad_clip: 1.0
+  amp: true
+  log_every: 10
+  save_every_epochs: 1
+  val_every_epochs: 1
+  max_steps: 900
+
+loss:
+  fine_l1_weight: 1.0
+  fine_cos_weight: 1.0
+  fine_channel_std_weight: 0.1
+  coarse_l1_weight: 1.0
+  coarse_cos_weight: 1.0
+  coarse_channel_std_weight: 0.1
+  fine_coarse_ortho_weight: 0.02
+  teacher_norm_weight: 0.05
+  query_teacher_infonce_weight: 0.05
+  infonce_temperature: 0.07
+  infonce_samples: 512
+
+retrieval:
+  enabled: false
+
+map_supervision:
+  enabled: true
+  config_path: feature_field/configs/reconstruction_cambridge_oldhospital_processed_joint_pilot.yaml
+  colmap_dir: /hy-tmp/Cambridge_stdloc/OldHospital/sparse/0
+  cache_rendered: true
+  trainable: true
+  map_lr_scale: 0.20
+  hash_mlp_lr_scale: 0.20
+  latent_lr_scale: 0.08
+  geometry_lr_scale: 1.0
+  position_lr_scale: 3.0
+  opacity_lr_scale: 1000.0
+  scaling_lr_scale: 100.0
+  rotation_lr_scale: 20.0
+  color_lr_scale: 50.0
+  train_fine_decoder: true
+  train_feat_sharp: true
+  train_hash_mlp: true
+  train_latent: true
+  train_geometry: true
+  train_color: true
+  reset_latent: false
+  latent_init_std: 0.01
+  detach_query_features: false
+  fine_decoder_override: null
+  refiner_override: null
+  alpha_threshold: 0.5
+  alpha_use_prior_mask: true
+  alpha_coverage_weight: 0.40
+  alpha_target: 0.90
+  rgb_l1_weight: 0.25
+  rgb_loss_mask: prior
+  coarse_start_epoch: 0
+  query_fine_weight: 0.10
+  query_fine_raw_weight: 0.03
+  query_coarse_weight: 0.05
+  query_fine_infonce_weight: 0.04
+  query_coarse_infonce_weight: 0.03
+  fine_coarse_ortho_weight: 0.02
+  rendered_teacher_fine_weight: 0.60
+  rendered_teacher_fine_raw_weight: 0.20
+  rendered_teacher_coarse_weight: 0.30
+  rendered_teacher_fine_infonce_weight: 0.05
+  rendered_teacher_coarse_infonce_weight: 0.03
+  infonce_temperature: 0.07
+  infonce_samples: 768
+  coarse_smoothing_kernel: 5
+  perturb_rank_weight: 0.02
+  perturb_render_negatives: true
+  perturb_rot_deg: 1.0
+  perturb_trans_m: 0.05
+
+visualization:
+  num_val_vis: 4
+  save_root: /root/ICLPose/result/feature_extract/visualizations/feature_track

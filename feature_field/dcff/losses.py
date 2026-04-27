@@ -39,8 +39,8 @@ def infonce_contrastive_loss(
     B, C, H, W = pred.shape
     N = H * W
 
-    pred_n = F.normalize(pred, p=2, dim=1).flatten(2)    # (B, C, N)
-    target_n = F.normalize(target, p=2, dim=1).flatten(2)
+    pred_n = F.normalize(pred.float(), p=2, dim=1).flatten(2)    # (B, C, N)
+    target_n = F.normalize(target.float(), p=2, dim=1).flatten(2)
 
     total_loss = torch.tensor(0.0, device=pred.device)
     count = 0
@@ -147,6 +147,33 @@ def channel_standardized_loss(pred: torch.Tensor, target: torch.Tensor,
     return diff.mean()
 
 
+def feature_gradient_loss(pred: torch.Tensor, target: torch.Tensor,
+                          mask: torch.Tensor = None) -> torch.Tensor:
+    """Match screen-space feature gradients to preserve teacher structure."""
+    pred_n = F.normalize(pred.float(), p=2, dim=1)
+    target_n = F.normalize(target.float(), p=2, dim=1)
+
+    pred_dx = pred_n[:, :, :, 1:] - pred_n[:, :, :, :-1]
+    target_dx = target_n[:, :, :, 1:] - target_n[:, :, :, :-1]
+    pred_dy = pred_n[:, :, 1:, :] - pred_n[:, :, :-1, :]
+    target_dy = target_n[:, :, 1:, :] - target_n[:, :, :-1, :]
+
+    dx = (pred_dx - target_dx).abs()
+    dy = (pred_dy - target_dy).abs()
+
+    if mask is None:
+        return 0.5 * (dx.mean() + dy.mean())
+
+    mask = mask.float()
+    mask_x = mask[:, :, :, 1:] * mask[:, :, :, :-1]
+    mask_y = mask[:, :, 1:, :] * mask[:, :, :-1, :]
+    dx = dx * mask_x
+    dy = dy * mask_y
+    denom_x = (mask_x.sum() * pred.shape[1]).clamp(min=1.0)
+    denom_y = (mask_y.sum() * pred.shape[1]).clamp(min=1.0)
+    return 0.5 * (dx.sum() / denom_x + dy.sum() / denom_y)
+
+
 def screen_space_tv_loss(feat: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
     """L1 screen-space TV on normalized feature maps.
 
@@ -214,6 +241,12 @@ class DCFFLoss(nn.Module):
         lambda_normal: float = 0.05,
         lambda_dist: float = 0.01,
         lambda_channel_std: float = 0.0,
+        lambda_fine_grad: float = 0.0,
+        lambda_coarse_grad: float = 0.0,
+        lambda_fine_nce: float = 0.0,
+        lambda_coarse_nce: float = 0.0,
+        nce_temperature: float = 0.07,
+        nce_samples: int = 512,
     ):
         super().__init__()
         self.lambda_dssim = lambda_dssim
@@ -226,6 +259,12 @@ class DCFFLoss(nn.Module):
         self.lambda_normal = lambda_normal
         self.lambda_dist = lambda_dist
         self.lambda_channel_std = lambda_channel_std
+        self.lambda_fine_grad = lambda_fine_grad
+        self.lambda_coarse_grad = lambda_coarse_grad
+        self.lambda_fine_nce = lambda_fine_nce
+        self.lambda_coarse_nce = lambda_coarse_nce
+        self.nce_temperature = nce_temperature
+        self.nce_samples = nce_samples
 
     def rgb_loss(self, rendered: torch.Tensor, gt: torch.Tensor,
                  mask: torch.Tensor = None) -> torch.Tensor:
@@ -244,8 +283,9 @@ class DCFFLoss(nn.Module):
         cos = cosine_loss(pred, target, mask)
         l1 = l1_feature_loss(pred, target, mask)
         cs = channel_standardized_loss(pred, target, mask) if self.lambda_channel_std > 0 else torch.tensor(0.0, device=pred.device)
-        total = self.lambda_fine_cos * cos + self.lambda_fine_l1 * l1 + self.lambda_channel_std * cs
-        return {'fine_cos': cos, 'fine_l1': l1, 'fine_cs': cs, 'fine_total': total}
+        grad = feature_gradient_loss(pred, target, mask) if self.lambda_fine_grad > 0 else torch.tensor(0.0, device=pred.device)
+        total = self.lambda_fine_cos * cos + self.lambda_fine_l1 * l1 + self.lambda_channel_std * cs + self.lambda_fine_grad * grad
+        return {'fine_cos': cos, 'fine_l1': l1, 'fine_cs': cs, 'fine_grad': grad, 'fine_total': total}
 
     def coarse_loss(self, pred: torch.Tensor, target: torch.Tensor,
                     mask: torch.Tensor = None) -> dict:
@@ -253,8 +293,9 @@ class DCFFLoss(nn.Module):
         cos = cosine_loss(pred, target, mask)
         l1 = l1_feature_loss(pred, target, mask)
         cs = channel_standardized_loss(pred, target, mask) if self.lambda_channel_std > 0 else torch.tensor(0.0, device=pred.device)
-        total = self.lambda_coarse_cos * cos + self.lambda_coarse_l1 * l1 + self.lambda_channel_std * cs
-        return {'coarse_cos': cos, 'coarse_l1': l1, 'coarse_cs': cs, 'coarse_total': total}
+        grad = feature_gradient_loss(pred, target, mask) if self.lambda_coarse_grad > 0 else torch.tensor(0.0, device=pred.device)
+        total = self.lambda_coarse_cos * cos + self.lambda_coarse_l1 * l1 + self.lambda_channel_std * cs + self.lambda_coarse_grad * grad
+        return {'coarse_cos': cos, 'coarse_l1': l1, 'coarse_cs': cs, 'coarse_grad': grad, 'coarse_total': total}
 
     def compute(
         self,
@@ -287,7 +328,11 @@ class DCFFLoss(nn.Module):
         total = losses['rgb']
 
         # Geometry regularization
-        if render_result.get('normals') is not None and render_result.get('surf_normals') is not None:
+        if (
+            self.lambda_normal > 0
+            and render_result.get('normals') is not None
+            and render_result.get('surf_normals') is not None
+        ):
             normals = render_result['normals']
             surf_normals = render_result['surf_normals']
             if surf_normals is not None and normals is not None:
@@ -295,15 +340,15 @@ class DCFFLoss(nn.Module):
                     sn = surf_normals.permute(0, 3, 1, 2) if surf_normals.shape[-1] == 3 else surf_normals
                     nn_out = normals
                     normal_loss = (1.0 - (nn_out * sn).sum(dim=1)).mean()
-                    if not torch.isnan(normal_loss):
+                    if torch.isfinite(normal_loss):
                         losses['normal'] = normal_loss
                         total = total + self.lambda_normal * normal_loss
 
-        if render_result.get('distort') is not None:
+        if self.lambda_dist > 0 and render_result.get('distort') is not None:
             distort = render_result['distort']
             if distort is not None:
                 dist_loss = distort.mean()
-                if not torch.isnan(dist_loss):
+                if torch.isfinite(dist_loss):
                     losses['distort'] = dist_loss
                     total = total + self.lambda_dist * dist_loss
 
@@ -325,6 +370,15 @@ class DCFFLoss(nn.Module):
             fl = self.fine_loss(fine, radio_geo, alpha_mask)
             losses.update(fl)
             total = total + fl['fine_total']
+            if self.lambda_fine_nce > 0:
+                fine_nce = infonce_contrastive_loss(
+                    fine, radio_geo, alpha_mask,
+                    temperature=self.nce_temperature,
+                    n_samples=self.nce_samples,
+                )
+                if not torch.isnan(fine_nce):
+                    losses['fine_nce'] = fine_nce
+                    total = total + self.lambda_fine_nce * fine_nce
 
         # Coarse feature alignment (phase 3)
         if phase >= 3 and radio_sem is not None and render_result.get('coarse_features') is not None:
@@ -343,6 +397,15 @@ class DCFFLoss(nn.Module):
             cl = self.coarse_loss(coarse, radio_sem, alpha_mask)
             losses.update(cl)
             total = total + cl['coarse_total']
+            if self.lambda_coarse_nce > 0:
+                coarse_nce = infonce_contrastive_loss(
+                    coarse, radio_sem, alpha_mask,
+                    temperature=self.nce_temperature,
+                    n_samples=self.nce_samples,
+                )
+                if not torch.isnan(coarse_nce):
+                    losses['coarse_nce'] = coarse_nce
+                    total = total + self.lambda_coarse_nce * coarse_nce
 
             if self.lambda_coarse_screen_tv > 0:
                 coarse_tv = screen_space_tv_loss(coarse, alpha_mask)

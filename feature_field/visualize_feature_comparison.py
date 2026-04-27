@@ -45,6 +45,10 @@ from feature_field.dcff.feature_selection import FeatureSelectionModule
 from feature_field.dcff.radio_teacher import CachedFeatureTeacher
 from feature_field.runtime import DepthGuidedRefiner, FeatSharp
 from feature_field.utils.checkpoint_io import safe_torch_load
+from feature_field.utils.dcff_eval_targets import (
+    build_teacher_target_provider,
+    infer_feature_dims,
+)
 from feature_field.utils.region_metrics import (
     compute_region_masks,
     empty_region_score_dict,
@@ -169,6 +173,111 @@ def joint_pca_colorize(feats, n_components=3, mask=None):
             img = img * mask.unsqueeze(0)
         outputs.append(img)
     return outputs
+
+
+def target_basis_pca_colorize(
+    pred_feats,
+    target_feats,
+    n_components=3,
+    mask=None,
+    normalize_inputs=True,
+):
+    """Colorize predictions and targets with a PCA basis fitted on targets only.
+
+    This keeps predicted and teacher feature colors comparable. The target
+    projections also define the normalization range; predictions are projected
+    into that same range instead of getting their own contrast stretch.
+    """
+    if len(pred_feats) != len(target_feats):
+        raise ValueError("pred_feats and target_feats must have the same length")
+
+    all_feats = [f for pair in zip(pred_feats, target_feats) for f in pair if f is not None]
+    if not all_feats:
+        return [None for _ in pred_feats], [None for _ in target_feats]
+
+    first = all_feats[0]
+    C = first.shape[0]
+    H = first.shape[1]
+    W = first.shape[2]
+    comp = min(n_components, C)
+    mask_flat = None if mask is None else mask.reshape(-1).bool()
+
+    def _prepare(feat):
+        feat = feat.float()
+        if normalize_inputs:
+            feat = F.normalize(feat.unsqueeze(0), p=2, dim=1).squeeze(0)
+        return feat
+
+    target_pixels = []
+    for feat in target_feats:
+        if feat is None:
+            continue
+        if feat.shape[0] != C:
+            raise ValueError("all features must share channel dimension")
+        feat = _prepare(feat)
+        flat = feat.reshape(C, -1).T.float()
+        if mask_flat is not None:
+            flat = flat[mask_flat]
+        if flat.numel() > 0:
+            target_pixels.append(flat)
+
+    if not target_pixels:
+        zero = torch.zeros(n_components, H, W, device=first.device)
+        return (
+            [zero.clone() if f is not None else None for f in pred_feats],
+            [zero.clone() if f is not None else None for f in target_feats],
+        )
+
+    target_stack = torch.cat(target_pixels, dim=0)
+    mean = target_stack.mean(dim=0, keepdim=True)
+    centered = target_stack - mean
+
+    basis = None
+    if centered.shape[0] >= 2 and comp > 0:
+        try:
+            cov = centered.T @ centered
+            cov = cov / max(1, centered.shape[0] - 1)
+            eigvals, eigvecs = torch.linalg.eigh(cov)
+            order = torch.argsort(eigvals, descending=True)
+            basis = eigvecs[:, order[:comp]].T
+        except Exception:
+            basis = None
+
+    if basis is None:
+        basis = torch.eye(C, device=target_stack.device, dtype=target_stack.dtype)[:comp]
+
+    target_proj_for_range = (target_stack - mean) @ basis.T
+    mins = target_proj_for_range.min(dim=0).values
+    maxs = target_proj_for_range.max(dim=0).values
+
+    def _project(feat):
+        if feat is None:
+            return None
+        feat = _prepare(feat)
+        flat = feat.reshape(C, -1).T.float()
+        proj = (flat - mean.to(flat.device)) @ basis.to(flat.device).T
+        proj = proj.clone()
+        mins_dev = mins.to(proj.device)
+        maxs_dev = maxs.to(proj.device)
+        for i in range(comp):
+            if maxs_dev[i] > mins_dev[i]:
+                proj[:, i] = (proj[:, i] - mins_dev[i]) / (maxs_dev[i] - mins_dev[i])
+            else:
+                proj[:, i] = 0.5
+        if comp < n_components:
+            pad = torch.full(
+                (proj.shape[0], n_components - comp),
+                0.5,
+                device=proj.device,
+                dtype=proj.dtype,
+            )
+            proj = torch.cat([proj, pad], dim=1)
+        img = proj[:, :n_components].T.reshape(n_components, feat.shape[1], feat.shape[2])
+        if mask is not None:
+            img = img * mask.to(device=img.device, dtype=img.dtype).unsqueeze(0)
+        return img
+
+    return [_project(f) for f in pred_feats], [_project(f) for f in target_feats]
 
 
 def compute_position_mean(features):
@@ -296,9 +405,12 @@ def _build_dcff_eval_components(ckpt_path, device):
     refiner_cfg = cfg.get('refiner', {})
     fsm_cfg = cfg.get('fsm', {})
 
-    feat_dim = int(mcfg.get('feature_dim', 64))
+    fine_feat_dim, coarse_feat_dim = infer_feature_dims(cfg)
+    feat_dim = fine_feat_dim
     latent_dim = int(mcfg.get('latent_dim', 32))
     sh_degree = int(mcfg.get('sh_degree', 3))
+    fine_latent_dim = mcfg.get('fine_latent_dim')
+    coarse_latent_dim = mcfg.get('coarse_latent_dim')
 
     ckpt_ply = str(Path(ckpt_path).with_suffix('.ply'))
     init_ply = tcfg.get('init_ply')
@@ -315,11 +427,13 @@ def _build_dcff_eval_components(ckpt_path, device):
         np.percentile(np.linalg.norm(gaussians.get_xyz.detach().cpu().numpy(), axis=1), 99)
     ) * 1.2
 
+    hash_latent_dim = int(coarse_latent_dim) if coarse_latent_dim is not None else latent_dim
+
     hash_grid = SpatialHashGrid(
         scene_extent=scene_extent,
-        feature_dim=feat_dim,
+        feature_dim=coarse_feat_dim,
         input_mode=hcfg.get('input_mode', 'implicit_scale'),
-        latent_dim=latent_dim,
+        latent_dim=hash_latent_dim,
         scale_dim=hcfg.get('scale_dim', 2),
         scale_pe_freqs=hcfg.get('scale_pe_freqs', 4),
         include_raw_scale=hcfg.get('include_raw_scale', True),
@@ -331,14 +445,17 @@ def _build_dcff_eval_components(ckpt_path, device):
         sh_degree=hcfg.get('sh_degree', sh_degree),
         mlp_hidden=hcfg.get('mlp_hidden', 256),
         mlp_layers=hcfg.get('mlp_layers', 4),
+        forward_chunk_size=hcfg.get('forward_chunk_size', 0),
     ).to(device)
     hash_grid.load_state_dict(ckpt['hash_grid_state'])
 
     renderer = DeferredCascadedRenderer(
         hash_grid=hash_grid,
         latent_dim=latent_dim,
-        fine_feature_dim=feat_dim,
-        coarse_feature_dim=feat_dim,
+        fine_latent_dim=int(fine_latent_dim) if fine_latent_dim is not None else None,
+        coarse_latent_dim=int(coarse_latent_dim) if coarse_latent_dim is not None else None,
+        fine_feature_dim=fine_feat_dim,
+        coarse_feature_dim=coarse_feat_dim,
         fine_hidden_dim=fcfg.get('hidden_dim', 256),
         fine_num_layers=fcfg.get('num_layers', 5),
         fine_use_viewdirs=fcfg.get('use_viewdirs', True),
@@ -347,6 +464,7 @@ def _build_dcff_eval_components(ckpt_path, device):
         coarse_mode=ccfg.get('mode', 'implicit_only'),
         coarse_carrier_hidden_dim=ccfg.get('carrier_hidden_dim'),
         coarse_gate_hidden_dim=ccfg.get('gate_hidden_dim'),
+        coarse_forward_batch_chunk_size=ccfg.get('forward_batch_chunk_size', 0),
         coarse_smoothing_kernel=mcfg.get('coarse_smoothing_kernel', 1),
     ).to(device)
     renderer.fine_decoder.load_state_dict(ckpt['fine_decoder_state'])
@@ -357,19 +475,21 @@ def _build_dcff_eval_components(ckpt_path, device):
     refiner_type = refiner_cfg.get('type')
     if refiner_type == 'depth_guided':
         feat_sharp_fine = DepthGuidedRefiner(
-            feat_dim,
+            fine_feat_dim,
             hidden_dim=int(refiner_cfg.get('hidden_dim', 128)),
         ).to(device)
     elif refiner_type == 'featsharp':
-        feat_sharp_fine = FeatSharp(feat_dim).to(device)
+        feat_sharp_fine = FeatSharp(fine_feat_dim).to(device)
     if feat_sharp_fine is not None and 'feat_sharp_fine_state' in ckpt:
         feat_sharp_fine.load_state_dict(ckpt['feat_sharp_fine_state'])
         feat_sharp_fine.eval()
 
     feat_select = None
     if fsm_cfg.get('enable', False):
+        if fine_feat_dim != coarse_feat_dim:
+            raise ValueError("FSM eval requires equal fine/coarse feature dims")
         feat_select = FeatureSelectionModule(
-            feature_dim=feat_dim,
+            feature_dim=fine_feat_dim,
             hidden_dim=int(fsm_cfg.get('hidden_dim', 32)),
             num_heads=int(fsm_cfg.get('num_heads', 4)),
             channel_routing_mode=fsm_cfg.get('channel_routing_mode', 'categorical'),
@@ -394,6 +514,8 @@ def _build_dcff_eval_components(ckpt_path, device):
         'feat_sharp_fine': feat_sharp_fine,
         'feat_select': feat_select,
         'feat_dim': feat_dim,
+        'fine_feat_dim': fine_feat_dim,
+        'coarse_feat_dim': coarse_feat_dim,
         'latent_dim': latent_dim,
         'longest_edge': int(tcfg.get('longest_edge', 960)),
         'coarse_downsample': bool(tcfg.get('coarse_downsample', False)),
@@ -500,6 +622,7 @@ def visualize_dcff(
     camera_split='auto',
     device='cuda',
     exp_name='dcff',
+    images_subdir=None,
 ):
     """Visualize DCFF implicit feature field."""
     os.makedirs(output_dir, exist_ok=True)
@@ -518,17 +641,17 @@ def visualize_dcff(
     longest_edge = bundle['longest_edge']
     coarse_downsample = bundle['coarse_downsample']
 
-    train_cams, test_cams, _, _, cameras_extent = load_scene_colmap(source_dir, '')
-    radio_cache = CachedFeatureTeacher(feature_dir)
-    feat_h, feat_w = radio_cache.feat_h, radio_cache.feat_w
-
-    images_dir = os.path.join(source_dir, 'images') if os.path.isdir(os.path.join(source_dir, 'images')) else source_dir
-    da3_name_to_fid = build_da3_image_order(images_dir)
-    cam_to_fid = {}
-    for cam in train_cams + test_cams:
-        fid = da3_name_to_fid.get(cam.image_name)
-        if fid is not None and fid in radio_cache.frame_ids:
-            cam_to_fid[cam.uid] = fid
+    if images_subdir is None:
+        images_subdir = cfg.get('dataset', {}).get('images', '')
+    train_cams, test_cams, _, _, cameras_extent = load_scene_colmap(source_dir, images_subdir)
+    teacher_provider = build_teacher_target_provider(
+        cfg,
+        ckpt,
+        source_dir=source_dir,
+        feature_dir=feature_dir,
+        device=device,
+        images_subdir=images_subdir,
+    )
 
     if camera_split == 'train':
         cam_pool = train_cams
@@ -539,7 +662,7 @@ def visualize_dcff(
     else:
         cam_pool = test_cams if test_cams else train_cams
 
-    valid_cams = [c for c in cam_pool if c.uid in cam_to_fid]
+    valid_cams = teacher_provider.filter_cameras(cam_pool)
     if camera_indices is None:
         camera_indices = list(range(min(6, len(valid_cams))))
 
@@ -563,19 +686,18 @@ def visualize_dcff(
 
     print(f"  COLMAP scene: {len(train_cams)} train, {len(test_cams)} test, extent={cameras_extent:.2f}")
     print(f"  PLY: {bundle['ply_path']}")
-    print(f"  Fine: {feat_w}×{feat_h}, coarse_downsample={coarse_downsample}, split={camera_split}")
+    print(
+        f"  Teacher: {teacher_provider.mode}, dims fine={bundle['fine_feat_dim']} "
+        f"coarse={bundle['coarse_feat_dim']}, coarse_downsample={coarse_downsample}, split={camera_split}"
+    )
 
     for idx in camera_indices:
         if idx >= len(valid_cams):
             continue
         cam = valid_cams[idx]
-        fid = cam_to_fid.get(cam.uid)
-        if fid is None:
-            continue
-
-        geo_target, sem_target = radio_cache.get(fid)
-        geo_target = geo_target.unsqueeze(0).to(device)
-        sem_target = sem_target.unsqueeze(0).to(device)
+        geo_target, sem_target, fids = teacher_provider.get_batch([cam])
+        fid = fids[0]
+        feat_h, feat_w = geo_target.shape[-2:]
 
         gt_rgb = _load_image_tensor(cam, longest_edge, device)
         _, _, H_render, W_render = gt_rgb.shape
@@ -641,7 +763,7 @@ def visualize_dcff(
 
         cached_visuals.append({
             'idx': idx,
-            'fid': fid,
+            'fid': fid if fid is not None else cam.image_name,
             'rgb': rgb.detach().cpu(),
             'depth': depth.detach().cpu(),
             'alpha': alpha.detach().cpu(),
@@ -659,23 +781,14 @@ def visualize_dcff(
 
         print(f"  Camera {idx}: fine_cos={fine_cos_mean:.4f}, coarse_cos={coarse_cos_mean:.4f}")
 
-    fine_position_mean = compute_position_mean(fine_pred_samples + fine_target_samples)
-    coarse_position_mean = compute_position_mean(coarse_pred_samples + coarse_target_samples)
-
-    fine_pred_vis_list = joint_pca_colorize(
-        [subtract_position_mean(f, fine_position_mean) for f in fine_pred_samples],
+    fine_pred_vis_list, fine_target_vis_list = target_basis_pca_colorize(
+        fine_pred_samples,
+        fine_target_samples,
         mask=None,
     )
-    fine_target_vis_list = joint_pca_colorize(
-        [subtract_position_mean(f, fine_position_mean) for f in fine_target_samples],
-        mask=None,
-    )
-    coarse_pred_vis_list = joint_pca_colorize(
-        [subtract_position_mean(f, coarse_position_mean) for f in coarse_pred_samples],
-        mask=None,
-    )
-    coarse_target_vis_list = joint_pca_colorize(
-        [subtract_position_mean(f, coarse_position_mean) for f in coarse_target_samples],
+    coarse_pred_vis_list, coarse_target_vis_list = target_basis_pca_colorize(
+        coarse_pred_samples,
+        coarse_target_samples,
         mask=None,
     )
 
@@ -973,23 +1086,14 @@ def visualize_2dgs_explicit(
             'coarse_valid': coarse_cos[mask_coarse.squeeze(1) > 0.5].detach().cpu().numpy(),
         })
 
-    fine_position_mean = compute_position_mean(fine_pred_samples + fine_target_samples)
-    coarse_position_mean = compute_position_mean(coarse_pred_samples + coarse_target_samples)
-
-    fine_pred_vis_list = joint_pca_colorize(
-        [subtract_position_mean(f, fine_position_mean) for f in fine_pred_samples],
+    fine_pred_vis_list, fine_target_vis_list = target_basis_pca_colorize(
+        fine_pred_samples,
+        fine_target_samples,
         mask=None,
     )
-    fine_target_vis_list = joint_pca_colorize(
-        [subtract_position_mean(f, fine_position_mean) for f in fine_target_samples],
-        mask=None,
-    )
-    coarse_pred_vis_list = joint_pca_colorize(
-        [subtract_position_mean(f, coarse_position_mean) for f in coarse_pred_samples],
-        mask=None,
-    )
-    coarse_target_vis_list = joint_pca_colorize(
-        [subtract_position_mean(f, coarse_position_mean) for f in coarse_target_samples],
+    coarse_pred_vis_list, coarse_target_vis_list = target_basis_pca_colorize(
+        coarse_pred_samples,
+        coarse_target_samples,
         mask=None,
     )
 
@@ -1112,6 +1216,9 @@ def main():
     parser.add_argument('--source_dir', type=str, default='/root/ICLPose-loc/dataset/OldHospital')
     parser.add_argument('--feature_dir', type=str, 
                        default='/root/ICLPose-loc/feature_extract/output/features_radio_dual/OldHospital_pilot')
+    parser.add_argument('--images_subdir', type=str, default=None)
+    parser.add_argument('--dcff_checkpoint', type=str, default=None)
+    parser.add_argument('--dcff_exp_name', type=str, default='dcff_custom')
     parser.add_argument('--camera_indices', type=str, default=None,
                        help='Comma-separated camera indices, e.g., "0,1,2,3,4,5"')
     parser.add_argument('--camera_split', type=str, default='auto', choices=['auto', 'train', 'test', 'all'])
@@ -1129,12 +1236,15 @@ def main():
     results = {}
 
     if not args.skip_dcff:
-        experiments = {
-            'v10c_baseline': 'feature_field/output/dcff_oldhospital_v10c_carrier_residual/checkpoints/best.pth',
-            'v12_fsm': 'feature_field/output/dcff_oldhospital_v12_fsm/checkpoints/latest.pth',
-            'v13a_no_fsm': 'feature_field/output/dcff_oldhospital_v13a_no_fsm/checkpoints/latest.pth',
-            'v13b_fsm_b16': 'feature_field/output/dcff_oldhospital_v13b_fsm_b16_test/checkpoints/latest.pth',
-        }
+        if args.dcff_checkpoint:
+            experiments = {args.dcff_exp_name: args.dcff_checkpoint}
+        else:
+            experiments = {
+                'v10c_baseline': 'feature_field/output/dcff_oldhospital_v10c_carrier_residual/checkpoints/best.pth',
+                'v12_fsm': 'feature_field/output/dcff_oldhospital_v12_fsm/checkpoints/latest.pth',
+                'v13a_no_fsm': 'feature_field/output/dcff_oldhospital_v13a_no_fsm/checkpoints/latest.pth',
+                'v13b_fsm_b16': 'feature_field/output/dcff_oldhospital_v13b_fsm_b16_test/checkpoints/latest.pth',
+            }
         
         for exp_name, ckpt_path in experiments.items():
             if not os.path.exists(ckpt_path):
@@ -1152,6 +1262,7 @@ def main():
                     camera_split=args.camera_split,
                     device=args.device,
                     exp_name=exp_name,
+                    images_subdir=args.images_subdir,
                 )
                 results[exp_name] = result
             except Exception as e:

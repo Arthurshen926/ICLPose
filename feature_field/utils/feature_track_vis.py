@@ -248,6 +248,8 @@ def save_feature_track_visual(
     rendered_map_coarse: torch.Tensor = None,
     rendered_map_fine_raw: torch.Tensor = None,
     rendered_map_mask: torch.Tensor = None,
+    rendered_map_alpha: torch.Tensor = None,
+    prior_mask: torch.Tensor = None,
     sample_name: str = "",
 ):
     output_path = Path(output_path)
@@ -299,6 +301,13 @@ def save_feature_track_visual(
                 _annotate(coarse_rgb[0], "teacher_coarse"),
                 _annotate(coarse_rgb[1], "student_coarse"),
                 _annotate(coarse_rgb[2], "map_coarse"),
+                _annotate(tensor_to_display_rgb(rendered_map_alpha), "map_alpha")
+                if rendered_map_alpha is not None
+                else _annotate(tensor_to_display_rgb(rendered_map_mask), "map_mask"),
+                _annotate(tensor_to_display_rgb(rendered_map_mask), "map_mask"),
+                _annotate(tensor_to_display_rgb(prior_mask), "prior_mask")
+                if prior_mask is not None
+                else _annotate(tensor_to_display_rgb(rendered_map_mask), "prior_mask(n/a)"),
                 _annotate(error_to_heatmap_image(student_coarse, teacher_coarse), "coarse_student_err"),
                 _annotate(error_to_heatmap_image(rendered_map_coarse, teacher_coarse, mask=rendered_map_mask), "coarse_map_err"),
             ]

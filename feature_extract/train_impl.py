@@ -21,6 +21,7 @@ import argparse
 import copy
 import logging
 import os
+import pickle
 import random
 import re
 import sys
@@ -81,6 +82,8 @@ DEFAULT_CONFIG = {
         "max_train_samples": None,
         "max_val_samples": None,
         "synthetic_if_missing": False,
+        "prior_mask_path": None,
+        "prior_mask_channels": [0, 1, 2],
     },
     "model": {
         "feature_dim": 64,
@@ -156,6 +159,11 @@ DEFAULT_CONFIG = {
         "coarse_smoothing_kernel": 1,
         "latent_lr_scale": 0.05,
         "geometry_lr_scale": 0.01,
+        "position_lr_scale": None,
+        "opacity_lr_scale": None,
+        "scaling_lr_scale": None,
+        "rotation_lr_scale": None,
+        "color_lr_scale": None,
         "coarse_start_epoch": 999999,
         "query_fine_weight": 0.0,
         "query_fine_raw_weight": 0.0,
@@ -416,14 +424,33 @@ class JointRADIOQueryDataset(Dataset):
         records,
         teacher_store,
         input_hw,
+        feature_hw,
         synthetic_rgb=False,
         retrieval_teacher_store=None,
+        prior_mask_path=None,
+        prior_mask_channels=None,
     ):
         self.records = records
         self.teacher_store = teacher_store
         self.input_hw = tuple(input_hw)
+        self.feature_hw = tuple(feature_hw)
         self.synthetic_rgb = synthetic_rgb
         self.retrieval_teacher_store = retrieval_teacher_store
+        self.prior_masks = None
+        self.prior_mask_channels = list(prior_mask_channels or [0, 1, 2])
+        if prior_mask_path:
+            prior_mask_path = Path(prior_mask_path)
+            if prior_mask_path.is_file():
+                with open(prior_mask_path, "rb") as handle:
+                    raw_masks = pickle.load(handle)
+                self.prior_masks = {}
+                for key, mask_tuple in raw_masks.items():
+                    self.prior_masks[key] = tuple(
+                        (mask.detach().to("cpu").bool() if torch.is_tensor(mask) else torch.as_tensor(mask).bool())
+                        for mask in mask_tuple
+                    )
+            else:
+                raise FileNotFoundError(f"prior_mask_path not found: {prior_mask_path}")
 
     def __len__(self):
         return len(self.records)
@@ -440,6 +467,29 @@ class JointRADIOQueryDataset(Dataset):
             arr = np.asarray(img, dtype=np.float32) / 255.0
         return torch.from_numpy(arr).permute(2, 0, 1)
 
+    def _load_prior_mask(self, record):
+        if self.prior_masks is None:
+            return None
+        sample_name = record["sample_name"].replace("\\", "/")
+        mask_tuple = self.prior_masks.get(sample_name)
+        if mask_tuple is None:
+            mask_tuple = self.prior_masks.get(Path(sample_name).name)
+        if mask_tuple is None:
+            return torch.ones(1, *self.feature_hw, dtype=torch.float32)
+
+        valid = None
+        for channel_idx in self.prior_mask_channels:
+            if channel_idx < 0 or channel_idx >= len(mask_tuple):
+                continue
+            channel = mask_tuple[channel_idx].bool()
+            valid = channel if valid is None else (valid & channel)
+        if valid is None:
+            return torch.ones(1, *self.feature_hw, dtype=torch.float32)
+        mask = valid.float().unsqueeze(0).unsqueeze(0)
+        if tuple(mask.shape[-2:]) != self.feature_hw:
+            mask = F.interpolate(mask, size=self.feature_hw, mode="nearest")
+        return mask.squeeze(0).float()
+
     def __getitem__(self, idx):
         record = self.records[idx]
         rgb = self._load_rgb(record)
@@ -451,6 +501,9 @@ class JointRADIOQueryDataset(Dataset):
             "teacher_idx": record["teacher_idx"],
             "sample_name": record["sample_name"],
         }
+        prior_mask = self._load_prior_mask(record)
+        if prior_mask is not None:
+            item["prior_mask"] = prior_mask
         if self.retrieval_teacher_store is not None:
             item["teacher_retrieval"] = self.retrieval_teacher_store.load(record["sample_name"])
         return item
@@ -489,6 +542,7 @@ class MapFeatureRenderer(nn.Module):
         self.perturb_render_negatives = bool(map_cfg.get("perturb_render_negatives", False))
         self.perturb_rot_deg = float(map_cfg.get("perturb_rot_deg", 0.0))
         self.perturb_trans_m = float(map_cfg.get("perturb_trans_m", 0.0))
+        self.alpha_threshold = float(map_cfg.get("alpha_threshold", 0.5))
         self.trainable = bool(map_cfg.get("trainable", False))
         self.train_fine_decoder = self.trainable and bool(map_cfg.get("train_fine_decoder", False))
         self.train_feat_sharp = self.trainable and bool(map_cfg.get("train_feat_sharp", False))
@@ -496,10 +550,16 @@ class MapFeatureRenderer(nn.Module):
         self.train_hash_mlp = self.trainable and bool(map_cfg.get("train_hash_mlp", False))
         self.train_latent = self.trainable and bool(map_cfg.get("train_latent", False))
         self.train_geometry = self.trainable and bool(map_cfg.get("train_geometry", False))
+        self.train_color = self.trainable and bool(map_cfg.get("train_color", False))
         self.map_lr_scale = float(map_cfg.get("map_lr_scale", 0.1))
         self.hash_mlp_lr_scale = float(map_cfg.get("hash_mlp_lr_scale", 0.05))
         self.latent_lr_scale = float(map_cfg.get("latent_lr_scale", self.map_lr_scale))
         self.geometry_lr_scale = float(map_cfg.get("geometry_lr_scale", self.map_lr_scale * 0.25))
+        self.position_lr_scale = map_cfg.get("position_lr_scale", None)
+        self.opacity_lr_scale = map_cfg.get("opacity_lr_scale", None)
+        self.scaling_lr_scale = map_cfg.get("scaling_lr_scale", None)
+        self.rotation_lr_scale = map_cfg.get("rotation_lr_scale", None)
+        self.color_lr_scale = map_cfg.get("color_lr_scale", None)
 
         runtime = build_dcff_runtime(render_cfg, device, printer=logger.info)
         self.gaussians = runtime.gaussians
@@ -516,8 +576,8 @@ class MapFeatureRenderer(nn.Module):
         self.gaussians._rotation.requires_grad_(self.train_geometry)
         self.gaussians._scaling.requires_grad_(self.train_geometry)
         self.gaussians._opacity.requires_grad_(self.train_geometry)
-        self.gaussians._features_dc.requires_grad_(False)
-        self.gaussians._features_rest.requires_grad_(False)
+        self.gaussians._features_dc.requires_grad_(self.train_color)
+        self.gaussians._features_rest.requires_grad_(self.train_color)
         for p in self.dcff_renderer.fine_decoder.parameters():
             p.requires_grad_(self.train_fine_decoder)
         for p in self.feat_sharp.parameters():
@@ -604,6 +664,7 @@ class MapFeatureRenderer(nn.Module):
             or self.train_hash_mlp
             or self.train_latent
             or self.train_geometry
+            or self.train_color
         )
 
     def set_train_mode(self, enabled):
@@ -661,16 +722,33 @@ class MapFeatureRenderer(nn.Module):
                 }
             )
         if self.train_geometry:
+            geom_specs = [
+                (self.gaussians._xyz, self.position_lr_scale, "map_xyz"),
+                (self.gaussians._rotation, self.rotation_lr_scale, "map_rotation"),
+                (self.gaussians._scaling, self.scaling_lr_scale, "map_scaling"),
+                (self.gaussians._opacity, self.opacity_lr_scale, "map_opacity"),
+            ]
+            for param, lr_scale, name in geom_specs:
+                scale = self.geometry_lr_scale if lr_scale is None else float(lr_scale)
+                groups.append(
+                    {
+                        "params": [param],
+                        "lr": base_lr * scale,
+                        "weight_decay": weight_decay,
+                        "name": name,
+                    }
+                )
+        if self.train_color:
+            color_scale = self.geometry_lr_scale if self.color_lr_scale is None else float(self.color_lr_scale)
             groups.append(
                 {
                     "params": [
-                        self.gaussians._xyz,
-                        self.gaussians._rotation,
-                        self.gaussians._scaling,
-                        self.gaussians._opacity,
+                        self.gaussians._features_dc,
+                        self.gaussians._features_rest,
                     ],
-                    "lr": base_lr * self.geometry_lr_scale,
+                    "lr": base_lr * color_scale,
                     "weight_decay": weight_decay,
+                    "name": "map_color",
                 }
             )
         return [group for group in groups if group["params"]]
@@ -693,6 +771,11 @@ class MapFeatureRenderer(nn.Module):
                 "rotation": self.gaussians._rotation.detach().cpu(),
                 "scaling": self.gaussians._scaling.detach().cpu(),
                 "opacity": self.gaussians._opacity.detach().cpu(),
+            }
+        if self.train_color:
+            state["gaussian_color"] = {
+                "features_dc": self.gaussians._features_dc.detach().cpu(),
+                "features_rest": self.gaussians._features_rest.detach().cpu(),
             }
         return state
 
@@ -732,6 +815,13 @@ class MapFeatureRenderer(nn.Module):
                 self.gaussians._opacity.data.copy_(geom["opacity"].to(self.device))
             except KeyError as e:
                 self.logger.info("Skipping map warmstart geometry (missing key): %s", e)
+        if "gaussian_color" in state_dict:
+            try:
+                color = state_dict["gaussian_color"]
+                self.gaussians._features_dc.data.copy_(color["features_dc"].to(self.device))
+                self.gaussians._features_rest.data.copy_(color["features_rest"].to(self.device))
+            except KeyError as e:
+                self.logger.info("Skipping map warmstart color (missing key): %s", e)
 
     def clear_cache(self):
         self._cache.clear()
@@ -740,12 +830,15 @@ class MapFeatureRenderer(nn.Module):
         normalized = self._normalize_name(sample_name)
         use_cache = self.cache_in_memory and not require_grad
         if use_cache and normalized in self._cache:
-            fine_raw_cpu, fine_cpu, coarse_cpu, mask_cpu = self._cache[normalized]
+            fine_raw_cpu, fine_cpu, coarse_cpu, mask_cpu, alpha_cpu, rgb_cpu, depth_cpu = self._cache[normalized]
             return (
                 fine_raw_cpu.to(device=self.device, dtype=torch.float32, non_blocking=True),
                 fine_cpu.to(device=self.device, dtype=torch.float32, non_blocking=True),
                 coarse_cpu.to(device=self.device, dtype=torch.float32, non_blocking=True),
                 mask_cpu.to(device=self.device, dtype=torch.float32, non_blocking=True),
+                alpha_cpu.to(device=self.device, dtype=torch.float32, non_blocking=True),
+                rgb_cpu.to(device=self.device, dtype=torch.float32, non_blocking=True),
+                depth_cpu.to(device=self.device, dtype=torch.float32, non_blocking=True),
             )
 
         pose = self.name_to_pose[normalized].to(self.device)
@@ -774,7 +867,22 @@ class MapFeatureRenderer(nn.Module):
         fine = post_result["fine_features"].float()
         coarse = post_result["coarse_features"].float()
         alpha = post_result["alpha"].float()
-        mask = (F.interpolate(alpha, size=self.feature_hw, mode="bilinear", align_corners=False) > 0.5).float()
+        alpha_feat = F.interpolate(alpha, size=self.feature_hw, mode="bilinear", align_corners=False)
+        mask = (alpha_feat > self.alpha_threshold).float()
+        rgb = result.get("rgb")
+        if rgb is None:
+            rgb = torch.zeros((1, 3, *self.feature_hw), device=self.device, dtype=fine.dtype)
+        elif rgb.shape[-2:] != self.feature_hw:
+            rgb = F.interpolate(rgb.float(), size=self.feature_hw, mode="bilinear", align_corners=False)
+        else:
+            rgb = rgb.float()
+        depth = result.get("depth")
+        if depth is None:
+            depth = torch.zeros((1, 1, *self.feature_hw), device=self.device, dtype=fine.dtype)
+        elif depth.shape[-2:] != self.feature_hw:
+            depth = F.interpolate(depth.float(), size=self.feature_hw, mode="bilinear", align_corners=False)
+        else:
+            depth = depth.float()
 
         if use_cache:
             self._cache[normalized] = (
@@ -782,8 +890,11 @@ class MapFeatureRenderer(nn.Module):
                 fine.detach().cpu().to(self.cache_dtype),
                 coarse.detach().cpu().to(self.cache_dtype),
                 mask.detach().cpu().to(self.cache_dtype),
+                alpha_feat.detach().cpu().to(self.cache_dtype),
+                rgb.detach().cpu().to(self.cache_dtype),
+                depth.detach().cpu().to(self.cache_dtype),
             )
-        return fine_raw, fine, coarse, mask
+        return fine_raw, fine, coarse, mask, alpha_feat, rgb, depth
 
     def _render_pose(self, sample_name, pose, require_grad=False):
         normalized = self._normalize_name(sample_name)
@@ -812,46 +923,77 @@ class MapFeatureRenderer(nn.Module):
         fine = post_result["fine_features"].float()
         coarse = post_result["coarse_features"].float()
         alpha = post_result["alpha"].float()
-        mask = (F.interpolate(alpha, size=self.feature_hw, mode="bilinear", align_corners=False) > 0.5).float()
-        return fine_raw, fine, coarse, mask
+        alpha_feat = F.interpolate(alpha, size=self.feature_hw, mode="bilinear", align_corners=False)
+        mask = (alpha_feat > self.alpha_threshold).float()
+        rgb = result.get("rgb")
+        if rgb is None:
+            rgb = torch.zeros((1, 3, *self.feature_hw), device=self.device, dtype=fine.dtype)
+        elif rgb.shape[-2:] != self.feature_hw:
+            rgb = F.interpolate(rgb.float(), size=self.feature_hw, mode="bilinear", align_corners=False)
+        else:
+            rgb = rgb.float()
+        depth = result.get("depth")
+        if depth is None:
+            depth = torch.zeros((1, 1, *self.feature_hw), device=self.device, dtype=fine.dtype)
+        elif depth.shape[-2:] != self.feature_hw:
+            depth = F.interpolate(depth.float(), size=self.feature_hw, mode="bilinear", align_corners=False)
+        else:
+            depth = depth.float()
+        return fine_raw, fine, coarse, mask, alpha_feat, rgb, depth
 
     def attach_to_batch(self, batch, require_grad=False):
         fine_raw_list = []
         fine_list = []
         coarse_list = []
         mask_list = []
+        alpha_list = []
+        rgb_list = []
+        depth_list = []
         context = torch.enable_grad if require_grad else torch.no_grad
         with context():
             for sample_name in batch["sample_name"]:
-                fine_raw, fine, coarse, mask = self._render_single(sample_name, require_grad=require_grad)
+                fine_raw, fine, coarse, mask, alpha, rgb, depth = self._render_single(sample_name, require_grad=require_grad)
                 fine_raw_list.append(fine_raw.squeeze(0))
                 fine_list.append(fine.squeeze(0))
                 coarse_list.append(coarse.squeeze(0))
                 mask_list.append(mask.squeeze(0))
+                alpha_list.append(alpha.squeeze(0))
+                rgb_list.append(rgb.squeeze(0))
+                depth_list.append(depth.squeeze(0))
 
         neg_fine_raw_list = []
         neg_fine_list = []
         neg_coarse_list = []
         neg_mask_list = []
+        neg_alpha_list = []
         if self.perturb_render_negatives:
             with context():
                 for sample_name in batch["sample_name"]:
                     normalized = self._normalize_name(sample_name)
                     neg_pose = self._perturb_w2c_pose(self.name_to_pose[normalized])
-                    fine_raw, fine, coarse, mask = self._render_pose(sample_name, neg_pose, require_grad=require_grad)
+                    fine_raw, fine, coarse, mask, alpha, _rgb, _depth = self._render_pose(
+                        sample_name,
+                        neg_pose,
+                        require_grad=require_grad,
+                    )
                     neg_fine_raw_list.append(fine_raw.squeeze(0))
                     neg_fine_list.append(fine.squeeze(0))
                     neg_coarse_list.append(coarse.squeeze(0))
                     neg_mask_list.append(mask.squeeze(0))
+                    neg_alpha_list.append(alpha.squeeze(0))
 
         batch["rendered_map_fine_raw"] = torch.stack(fine_raw_list, dim=0)
         batch["rendered_map_fine"] = torch.stack(fine_list, dim=0)
         batch["rendered_map_coarse"] = torch.stack(coarse_list, dim=0)
         batch["rendered_map_mask"] = torch.stack(mask_list, dim=0)
+        batch["rendered_map_alpha"] = torch.stack(alpha_list, dim=0)
+        batch["rendered_map_rgb"] = torch.stack(rgb_list, dim=0)
+        batch["rendered_map_depth"] = torch.stack(depth_list, dim=0)
         if neg_fine_list:
             batch["rendered_map_fine_neg"] = torch.stack(neg_fine_list, dim=0)
             batch["rendered_map_coarse_neg"] = torch.stack(neg_coarse_list, dim=0)
             batch["rendered_map_mask_neg"] = torch.stack(neg_mask_list, dim=0)
+            batch["rendered_map_alpha_neg"] = torch.stack(neg_alpha_list, dim=0)
         return batch
 
 
@@ -1028,7 +1170,17 @@ def compute_map_supervision(batch, outputs, cfg, device, epoch=0):
     if not all(key in batch for key in required):
         return zero, {"map_hook_active": zero, "map_hook_loss": zero}
 
-    mask = batch["rendered_map_mask"]
+    rendered_mask = batch["rendered_map_mask"]
+    prior_mask = batch.get("prior_mask")
+    if prior_mask is not None:
+        prior_mask = prior_mask.float()
+        if prior_mask.shape[-2:] != rendered_mask.shape[-2:]:
+            prior_mask = F.interpolate(prior_mask, size=rendered_mask.shape[-2:], mode="nearest")
+        mask = rendered_mask * prior_mask
+    else:
+        mask = rendered_mask
+    alpha = batch.get("rendered_map_alpha")
+    rendered_rgb = batch.get("rendered_map_rgb")
     rendered_fine_raw = batch.get("rendered_map_fine_raw")
     rendered_fine = batch["rendered_map_fine"]
     rendered_coarse = batch["rendered_map_coarse"]
@@ -1066,6 +1218,8 @@ def compute_map_supervision(batch, outputs, cfg, device, epoch=0):
     infonce_temperature = float(map_cfg.get("infonce_temperature", loss_cfg.get("infonce_temperature", 0.07)))
     infonce_samples = int(map_cfg.get("infonce_samples", loss_cfg.get("infonce_samples", 256)))
     fine_coarse_ortho_weight = float(map_cfg.get("fine_coarse_ortho_weight", 0.0))
+    alpha_coverage_weight = resolve_linear_weight(map_cfg, "alpha_coverage_weight", epoch)
+    rgb_l1_weight = resolve_linear_weight(map_cfg, "rgb_l1_weight", epoch)
 
     query_fine_loss = (
         l1_feature_loss(pred_fine_target, rendered_fine, mask)
@@ -1132,6 +1286,43 @@ def compute_map_supervision(batch, outputs, cfg, device, epoch=0):
         ) * rendered_teacher_coarse_infonce_weight
     map_fine_coarse_ortho_loss = feature_orthogonality_loss(rendered_fine, rendered_coarse, mask) * fine_coarse_ortho_weight
 
+    alpha_coverage_loss = zero
+    if alpha is not None and alpha_coverage_weight > 0:
+        alpha_target = float(map_cfg.get("alpha_target", 0.9))
+        alpha_gap = F.relu(alpha_target - alpha.float())
+        if prior_mask is not None and bool(map_cfg.get("alpha_use_prior_mask", True)):
+            alpha_gap = alpha_gap * prior_mask
+            alpha_coverage_loss = alpha_gap.sum() / torch.clamp(prior_mask.sum(), min=1.0)
+        else:
+            alpha_coverage_loss = alpha_gap.mean()
+        alpha_coverage_loss = alpha_coverage_loss * alpha_coverage_weight
+
+    rgb_reconstruction_loss = zero
+    if rendered_rgb is not None and rgb_l1_weight > 0:
+        query_rgb = F.interpolate(
+            batch["rgb"].float(),
+            size=rendered_rgb.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+        rgb_loss_mask_mode = str(map_cfg.get("rgb_loss_mask", "all")).lower()
+        if rgb_loss_mask_mode == "alpha":
+            rgb_mask = mask
+            rgb_reconstruction_loss = (
+                (rendered_rgb.float() - query_rgb).abs() * rgb_mask
+            ).sum() / torch.clamp(rgb_mask.sum() * rendered_rgb.shape[1], min=1.0)
+        elif rgb_loss_mask_mode == "prior" and prior_mask is not None:
+            rgb_reconstruction_loss = (
+                (rendered_rgb.float() - query_rgb).abs() * prior_mask
+            ).sum() / torch.clamp(prior_mask.sum() * rendered_rgb.shape[1], min=1.0)
+        elif rgb_loss_mask_mode in {"alpha_prior", "prior_alpha"} and prior_mask is not None:
+            rgb_reconstruction_loss = (
+                (rendered_rgb.float() - query_rgb).abs() * mask
+            ).sum() / torch.clamp(mask.sum() * rendered_rgb.shape[1], min=1.0)
+        else:
+            rgb_reconstruction_loss = F.l1_loss(rendered_rgb.float(), query_rgb)
+        rgb_reconstruction_loss = rgb_reconstruction_loss * rgb_l1_weight
+
     perturb_rank_weight = float(map_cfg.get("perturb_rank_weight", 0.0))
     perturb_rank_loss = zero
     if perturb_rank_weight > 0:
@@ -1149,6 +1340,8 @@ def compute_map_supervision(batch, outputs, cfg, device, epoch=0):
                 neg_fine = torch.roll(rendered_fine, shifts=(shift_y, shift_x), dims=(2, 3))
                 neg_coarse = torch.roll(rendered_coarse, shifts=(shift_y, shift_x), dims=(2, 3))
                 neg_mask = torch.roll(mask, shifts=(shift_y, shift_x), dims=(2, 3)) if mask is not None else None
+        elif prior_mask is not None:
+            neg_mask = neg_mask * prior_mask
         if neg_fine is not None and neg_coarse is not None:
             pos_fine = l1_feature_loss(pred_fine_target, rendered_fine, mask) + cosine_loss(
                 pred_fine_target, rendered_fine, mask
@@ -1175,6 +1368,8 @@ def compute_map_supervision(batch, outputs, cfg, device, epoch=0):
         + rendered_teacher_fine_nce_loss
         + rendered_teacher_coarse_nce_loss
         + map_fine_coarse_ortho_loss
+        + alpha_coverage_loss
+        + rgb_reconstruction_loss
         + perturb_rank_weight * perturb_rank_loss
     )
 
@@ -1188,6 +1383,19 @@ def compute_map_supervision(batch, outputs, cfg, device, epoch=0):
     else:
         fine_map_raw_teacher_cos = zero
         fine_query_raw_map_cos = zero
+    if alpha is not None:
+        alpha_float = alpha.float()
+        map_alpha_mean = alpha_float.mean()
+        map_alpha_coverage = (alpha_float > float(map_cfg.get("alpha_threshold", 0.5))).float().mean()
+        if prior_mask is not None:
+            alpha_binary = (alpha_float > float(map_cfg.get("alpha_threshold", 0.5))).float()
+            map_alpha_coverage_valid = (alpha_binary * prior_mask).sum() / torch.clamp(prior_mask.sum(), min=1.0)
+        else:
+            map_alpha_coverage_valid = map_alpha_coverage
+    else:
+        map_alpha_mean = zero
+        map_alpha_coverage = zero
+        map_alpha_coverage_valid = zero
 
     return total, {
         "map_hook_active": torch.ones((), device=device),
@@ -1203,6 +1411,8 @@ def compute_map_supervision(batch, outputs, cfg, device, epoch=0):
         "map_rendered_teacher_fine_nce_loss": rendered_teacher_fine_nce_loss.detach(),
         "map_rendered_teacher_coarse_nce_loss": rendered_teacher_coarse_nce_loss.detach(),
         "map_fine_coarse_ortho_loss": map_fine_coarse_ortho_loss.detach(),
+        "map_alpha_coverage_loss": alpha_coverage_loss.detach(),
+        "map_rgb_reconstruction_loss": rgb_reconstruction_loss.detach(),
         "map_perturb_rank_loss": perturb_rank_loss.detach(),
         "map_query_fine_weight": torch.tensor(query_fine_weight, device=device),
         "map_query_fine_raw_weight": torch.tensor(query_fine_raw_weight, device=device),
@@ -1219,12 +1429,17 @@ def compute_map_supervision(batch, outputs, cfg, device, epoch=0):
             rendered_teacher_coarse_infonce_weight, device=device
         ),
         "map_fine_coarse_ortho_weight": torch.tensor(fine_coarse_ortho_weight, device=device),
+        "map_alpha_coverage_weight": torch.tensor(alpha_coverage_weight, device=device),
+        "map_rgb_l1_weight": torch.tensor(rgb_l1_weight, device=device),
         "map_teacher_fine_cosine": fine_map_teacher_cos.detach(),
         "map_teacher_fine_raw_cosine": fine_map_raw_teacher_cos.detach(),
         "map_teacher_coarse_cosine": coarse_map_teacher_cos.detach(),
         "map_query_fine_cosine": fine_query_map_cos.detach(),
         "map_query_fine_raw_cosine": fine_query_raw_map_cos.detach(),
         "map_query_coarse_cosine": coarse_query_map_cos.detach(),
+        "map_alpha_mean": map_alpha_mean.detach(),
+        "map_alpha_coverage": map_alpha_coverage.detach(),
+        "map_alpha_coverage_valid": map_alpha_coverage_valid.detach(),
         "map_coarse_active": torch.tensor(float(coarse_active), device=device),
     }
 
@@ -1253,6 +1468,12 @@ def save_validation_visuals(batch, outputs, qual_dir, feature_track_root, step, 
                 else None,
                 rendered_map_mask=batch.get("rendered_map_mask", [None] * limit)[idx].detach().cpu()
                 if "rendered_map_mask" in batch
+                else None,
+                rendered_map_alpha=batch.get("rendered_map_alpha", [None] * limit)[idx].detach().cpu()
+                if "rendered_map_alpha" in batch
+                else None,
+                prior_mask=batch.get("prior_mask", [None] * limit)[idx].detach().cpu()
+                if "prior_mask" in batch
                 else None,
                 sample_name=batch["sample_name"][idx],
             )
@@ -1336,6 +1557,15 @@ def validate(model, loader, cfg, device, qual_dir, feature_track_root, step, log
             [
                 result.get("map_query_fine_raw_cosine", 0.0),
                 result.get("map_teacher_fine_raw_cosine", 0.0),
+            ]
+        )
+    if "map_alpha_coverage" in result:
+        log_msg += " alpha_cov=%.4f alpha_cov_valid=%.4f alpha_mean=%.4f"
+        log_args.extend(
+            [
+                result.get("map_alpha_coverage", 0.0),
+                result.get("map_alpha_coverage_valid", result.get("map_alpha_coverage", 0.0)),
+                result.get("map_alpha_mean", 0.0),
             ]
         )
     logger.info(log_msg, *log_args)
@@ -1469,15 +1699,21 @@ def main():
         train_records,
         teacher_store,
         input_hw=cfg["dataset"]["input_hw"],
+        feature_hw=cfg["dataset"]["feature_hw"],
         synthetic_rgb=bool(cfg["dataset"].get("synthetic_if_missing", False)),
         retrieval_teacher_store=retrieval_store,
+        prior_mask_path=cfg["dataset"].get("prior_mask_path"),
+        prior_mask_channels=cfg["dataset"].get("prior_mask_channels"),
     )
     val_dataset = JointRADIOQueryDataset(
         val_records,
         teacher_store,
         input_hw=cfg["dataset"]["input_hw"],
+        feature_hw=cfg["dataset"]["feature_hw"],
         synthetic_rgb=bool(cfg["dataset"].get("synthetic_if_missing", False)),
         retrieval_teacher_store=retrieval_store,
+        prior_mask_path=cfg["dataset"].get("prior_mask_path"),
+        prior_mask_channels=cfg["dataset"].get("prior_mask_channels"),
     )
 
     train_loader = DataLoader(
@@ -1630,6 +1866,15 @@ def main():
                 if "map_query_fine_raw_cosine" in mean_train:
                     log_msg += " map_q_f_raw=%.4f"
                     log_args.append(mean_train.get("map_query_fine_raw_cosine", 0.0))
+                if "map_alpha_coverage" in mean_train:
+                    log_msg += " alpha_cov=%.4f alpha_cov_valid=%.4f alpha_mean=%.4f"
+                    log_args.extend(
+                        [
+                            mean_train.get("map_alpha_coverage", 0.0),
+                            mean_train.get("map_alpha_coverage_valid", mean_train.get("map_alpha_coverage", 0.0)),
+                            mean_train.get("map_alpha_mean", 0.0),
+                        ]
+                    )
                 log_msg += " lr=%.2e"
                 log_args.append(optimizer.param_groups[0]["lr"])
                 logger.info(log_msg, *log_args)

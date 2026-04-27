@@ -1,0 +1,124 @@
+exp_name: dcff_cambridge_oldhospital_processed_adaptive_bottleneck_v2_detached_highpass_4gpu_b16_cache
+output_dir: /root/ICLPose/result/feature_field
+
+dataset:
+  type: cambridge
+  source_dir: /hy-tmp/Cambridge_stdloc/OldHospital
+  images: processed
+  feature_dir: /root/ICLPose/result/feature_extract/features_radio_dual/cambridge_oldhospital_processed
+
+teacher:
+  mode: online_bottleneck
+  input_longest_edge: 640
+  micro_batch: 4
+  pca_init_dir: /root/ICLPose/result/feature_extract/features_radio_dual/cambridge_oldhospital_processed/pca_params
+  lr_projection: 0.00025
+  detach_targets_for_field_loss: true
+  compress:
+    hidden_dim: 256
+    sample_pixels: 1024
+    recon_chunk_pixels: 2048
+    recon_cos_weight: 0.5
+    recon_l1_weight: 0.1
+    min_spatial_std: 0.035
+    std_weight: 0.20
+    decorrelation_weight: 0.05
+    fine_raw_highpass_kernel: 7
+    coarse_raw_highpass_kernel: 0
+    loss_weight: 0.15
+    normalize_output: true
+
+model:
+  sh_degree: 3
+  white_background: false
+  latent_dim: 48
+  fine_latent_dim: 32
+  coarse_latent_dim: 16
+  feature_dim: 96
+  fine_feature_dim: 96
+  coarse_feature_dim: 32
+  coarse_smoothing_kernel: 5
+
+fine_decoder:
+  type: spatial
+  hidden_dim: 160
+  use_viewdirs: false
+
+coarse_decoder:
+  mode: carrier_residual
+  carrier_hidden_dim: 64
+  gate_hidden_dim: 64
+
+refiner:
+  type: depth_guided
+  hidden_dim: 192
+
+hash_grid:
+  input_mode: implicit_scale
+  scale_dim: 2
+  scale_pe_freqs: 4
+  include_raw_scale: true
+  n_levels: 16
+  n_features_per_level: 2
+  log2_hashmap_size: 20
+  base_resolution: 16
+  max_resolution: 4096
+  mlp_hidden: 128
+  mlp_layers: 2
+
+training:
+  init_ply: /root/ICLPose/result/feature_gaussian/joint_rgb_geometry_cambridge_oldhospital_processed_rebuild_v4_4gpu_1280_safe_rgbft_5k/point_cloud/best/point_cloud.ply
+  warmstart_checkpoint: /root/ICLPose/result/feature_field/dcff_cambridge_oldhospital_processed_adaptive_bottleneck_v1_4gpu_b16_cache/checkpoints/best.pth
+  warmstart_restore_geometry_state: true
+  warmstart_restore_projection_state: false
+  iterations: 10000
+  seed: 12345
+  freeze_geometry: false
+  batch_size: 18
+  cache_resized_images: true
+  image_cache_dtype: float16
+
+  fine_start_iter: 0
+  coarse_start_iter: 100
+  warmup_iters: 200
+  grad_clip: 0.75
+  coarse_downsample: true
+
+  position_lr_init: 0.000005
+  position_lr_final: 0.00000005
+  feature_lr: 0.0005
+  opacity_lr: 0.002
+  scaling_lr: 0.0002
+  rotation_lr: 0.0001
+
+  latent_lr: 0.00035
+  lr_hash_grid: 0.0003
+  lr_fine_decoder: 0.0006
+  lr_coarse_fusion: 0.0006
+  lr_refiner: 0.0006
+
+  percent_dense: 0.01
+  longest_edge: 640
+
+  log_every: 50
+  best_save_every: 250
+  save_every: 1000
+  val_every: 1000
+  sh_degree_up_every: 1000
+  use_amp: true
+
+  loss:
+    lambda_dssim: 0.2
+    lambda_fine_cos: 1.0
+    lambda_fine_l1: 1.0
+    lambda_coarse_cos: 1.0
+    lambda_coarse_l1: 1.0
+    lambda_fine_nce: 0.03
+    lambda_coarse_nce: 0.03
+    nce_temperature: 0.07
+    nce_samples: 256
+    lambda_tv: 0.03
+    lambda_coarse_screen_tv: 0.10
+    lambda_normal: 0.0
+    lambda_dist: 0.0
+    lambda_channel_std: 0.08

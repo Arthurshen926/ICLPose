@@ -423,7 +423,7 @@ def feature_metric_solve(
       Feature residual: r(ξ) = F_query(p) - F_ref(warp(p, ξ))
       Linearize: r(ξ) ≈ r(0) + J_feat * ξ
       where J_feat[c, :] = (dF_c/du) * Ju + (dF_c/dv) * Jv
-      WLS: ξ = (J^T J + λI)^{-1} J^T r
+      WLS: ξ = -(J^T J + λI)^{-1} J^T r
 
     Args:
         query_feat: (B, C, H, W) query features (RADIO)
@@ -466,7 +466,10 @@ def feature_metric_solve(
         vmask = depth_valid.float().unsqueeze(1)  # (B, 1, N)
 
     # J^T J = sum_c sum_n [grad_u_c * Ju_n + grad_v_c * Jv_n]^T [grad_u_c * Ju_n + grad_v_c * Jv_n]
-    # J^T r = sum_c sum_n [grad_u_c * Ju_n + grad_v_c * Jv_n]^T r_c_n
+    # For a rendered-indexed pose update, the rendered feature at a fixed
+    # output pixel moves as F_new(p) ~= F_ref(p - J_img xi).  Thus
+    # residual = F_query - F_new ~= residual_0 + J_feat xi, and the
+    # Gauss-Newton right hand side is -J^T residual_0.
     # Efficient: accumulate over channels
     JtJ = torch.zeros(B, 6, 6, device=device)
     Jtr = torch.zeros(B, 6, device=device)
@@ -480,7 +483,7 @@ def feature_metric_solve(
         J_c = gu.unsqueeze(-1) * Ju + gv.unsqueeze(-1) * Jv
 
         JtJ += torch.bmm(J_c.transpose(1, 2), J_c)
-        Jtr += torch.bmm(J_c.transpose(1, 2), rc.unsqueeze(-1)).squeeze(-1)
+        Jtr -= torch.bmm(J_c.transpose(1, 2), rc.unsqueeze(-1)).squeeze(-1)
 
     # Damping
     diag = JtJ.diagonal(dim1=-2, dim2=-1).clamp(min=1e-6)

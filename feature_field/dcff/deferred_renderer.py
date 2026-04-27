@@ -150,9 +150,9 @@ class SpatialFineDecoder(nn.Module):
 class CarrierResidualCoarseFusion(nn.Module):
     """Carrier-conditioned residual on top of the implicit coarse field.
 
-    Starts as an exact identity on the legacy implicit coarse path: both the
-    carrier projection and residual gate are zero-initialized, so old
-    checkpoints remain behaviorally unchanged until this branch is trained.
+    Starts as a conservative, trainable residual on top of the legacy implicit
+    coarse path. The gate is biased low instead of zeroing both factors; a
+    product of two zero-initialized branches is a dead path with no gradient.
     """
 
     def __init__(
@@ -161,8 +161,10 @@ class CarrierResidualCoarseFusion(nn.Module):
         feature_dim: int = 64,
         carrier_hidden_dim: int = 128,
         gate_hidden_dim: int = 64,
+        forward_batch_chunk_size: int = 0,
     ):
         super().__init__()
+        self.forward_batch_chunk_size = int(forward_batch_chunk_size or 0)
         self.carrier_proj = nn.Sequential(
             nn.Conv2d(latent_dim, carrier_hidden_dim, 1),
             nn.GELU(),
@@ -172,14 +174,12 @@ class CarrierResidualCoarseFusion(nn.Module):
             nn.Conv2d(feature_dim * 2, gate_hidden_dim, 1),
             nn.GELU(),
             nn.Conv2d(gate_hidden_dim, 1, 1),
-            nn.Tanh(),
+            nn.Sigmoid(),
         )
         self.residual_scale = nn.Parameter(torch.tensor(1.0))
 
-        nn.init.zeros_(self.carrier_proj[-1].weight)
-        nn.init.zeros_(self.carrier_proj[-1].bias)
         nn.init.zeros_(self.residual_gate[-2].weight)
-        nn.init.zeros_(self.residual_gate[-2].bias)
+        nn.init.constant_(self.residual_gate[-2].bias, -2.0)
 
         n_params = sum(p.numel() for p in self.parameters())
         print(
@@ -192,10 +192,58 @@ class CarrierResidualCoarseFusion(nn.Module):
         z_map: torch.Tensor,
         implicit_coarse: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        chunk = self.forward_batch_chunk_size
+        if chunk > 0 and z_map.shape[0] > chunk:
+            fused_out = None
+            for start in range(0, z_map.shape[0], chunk):
+                end = min(start + chunk, z_map.shape[0])
+                fused, carrier, gate = self.forward(
+                    z_map[start:end],
+                    implicit_coarse[start:end],
+                )
+                if fused_out is None:
+                    fused_out = fused.new_empty(
+                        z_map.shape[0],
+                        fused.shape[1],
+                        fused.shape[2],
+                        fused.shape[3],
+                    )
+                fused_out[start:end] = fused
+            return fused_out, None, None
+
         carrier_coarse = self.carrier_proj(z_map)
         gate = self.residual_gate(torch.cat([carrier_coarse, implicit_coarse], dim=1))
         fused = implicit_coarse + self.residual_scale * gate * carrier_coarse
         return fused, carrier_coarse, gate
+
+
+class SpatialDirectCoarseDecoder(nn.Module):
+    """Direct spatial decoder for coarse features from rasterized coarse latent.
+
+    This mode is useful when an implicit position MLP collapses to low-frequency
+    view gradients and the coarse target still contains object/layout structure.
+    """
+
+    def __init__(
+        self,
+        latent_dim: int = 24,
+        feature_dim: int = 64,
+        hidden_dim: int = 160,
+    ):
+        super().__init__()
+        self.decoder = SpatialFineDecoder(
+            latent_dim=latent_dim,
+            feature_dim=feature_dim,
+            hidden_dim=hidden_dim,
+            use_viewdirs=False,
+        )
+
+    def forward(
+        self,
+        z_map: torch.Tensor,
+        implicit_coarse: torch.Tensor = None,
+    ) -> tuple[torch.Tensor, None, None]:
+        return self.decoder(z_map), None, None
 
 
 class DeferredCascadedRenderer(nn.Module):
@@ -209,6 +257,8 @@ class DeferredCascadedRenderer(nn.Module):
         self,
         hash_grid: nn.Module,
         latent_dim: int = 16,
+        fine_latent_dim: int | None = None,
+        coarse_latent_dim: int | None = None,
         fine_feature_dim: int = 64,
         coarse_feature_dim: int = 64,
         fine_hidden_dim: int = None,
@@ -219,14 +269,38 @@ class DeferredCascadedRenderer(nn.Module):
         coarse_mode: str = 'implicit_only',
         coarse_carrier_hidden_dim: int | None = None,
         coarse_gate_hidden_dim: int | None = None,
+        coarse_forward_batch_chunk_size: int = 0,
         chunk_size: int = 16,
         coarse_smoothing_kernel: int = 1,
     ):
         super().__init__()
         self.hash_grid = hash_grid
+        self.latent_dim = latent_dim
+        if fine_latent_dim is None and coarse_latent_dim is None:
+            self.fine_latent_dim = latent_dim
+            self.coarse_latent_dim = latent_dim
+            self.split_latent = False
+        else:
+            if fine_latent_dim is None:
+                fine_latent_dim = latent_dim - int(coarse_latent_dim)
+            if coarse_latent_dim is None:
+                coarse_latent_dim = latent_dim - int(fine_latent_dim)
+            self.fine_latent_dim = int(fine_latent_dim)
+            self.coarse_latent_dim = int(coarse_latent_dim)
+            if self.fine_latent_dim <= 0 or self.coarse_latent_dim <= 0:
+                raise ValueError(
+                    f"Invalid split latent dims: fine={self.fine_latent_dim}, "
+                    f"coarse={self.coarse_latent_dim}"
+                )
+            if self.fine_latent_dim + self.coarse_latent_dim != latent_dim:
+                raise ValueError(
+                    f"fine_latent_dim + coarse_latent_dim must equal latent_dim "
+                    f"({self.fine_latent_dim}+{self.coarse_latent_dim}!={latent_dim})"
+                )
+            self.split_latent = True
         if fine_decoder_type == 'spatial':
             self.fine_decoder = SpatialFineDecoder(
-                latent_dim=latent_dim,
+                latent_dim=self.fine_latent_dim,
                 feature_dim=fine_feature_dim,
                 hidden_dim=fine_hidden_dim or 128,
                 use_viewdirs=fine_use_viewdirs,
@@ -234,17 +308,17 @@ class DeferredCascadedRenderer(nn.Module):
             )
         else:
             self.fine_decoder = FineDecoder(
-                latent_dim=latent_dim,
+                latent_dim=self.fine_latent_dim,
                 feature_dim=fine_feature_dim,
                 hidden_dim=fine_hidden_dim,
                 num_layers=fine_num_layers,
                 use_viewdirs=fine_use_viewdirs,
                 view_degree=fine_view_degree,
             )
-        self.latent_dim = latent_dim
         self.fine_feature_dim = fine_feature_dim
         self.coarse_feature_dim = coarse_feature_dim
         self.coarse_mode = coarse_mode
+        self.coarse_direct_uses_full_latent = coarse_mode == 'spatial_full_direct'
         self.chunk_size = chunk_size
         kernel = max(1, int(coarse_smoothing_kernel))
         if kernel % 2 == 0:
@@ -254,10 +328,23 @@ class DeferredCascadedRenderer(nn.Module):
         self.coarse_carrier_fusion = None
         if coarse_mode == 'carrier_residual':
             self.coarse_carrier_fusion = CarrierResidualCoarseFusion(
+                latent_dim=self.coarse_latent_dim,
+                feature_dim=coarse_feature_dim,
+                carrier_hidden_dim=coarse_carrier_hidden_dim or max(coarse_feature_dim, self.coarse_latent_dim),
+                gate_hidden_dim=coarse_gate_hidden_dim or max(coarse_feature_dim, self.coarse_latent_dim),
+                forward_batch_chunk_size=coarse_forward_batch_chunk_size,
+            )
+        elif coarse_mode == 'spatial_direct':
+            self.coarse_carrier_fusion = SpatialDirectCoarseDecoder(
+                latent_dim=self.coarse_latent_dim,
+                feature_dim=coarse_feature_dim,
+                hidden_dim=coarse_carrier_hidden_dim or max(128, coarse_feature_dim),
+            )
+        elif coarse_mode == 'spatial_full_direct':
+            self.coarse_carrier_fusion = SpatialDirectCoarseDecoder(
                 latent_dim=latent_dim,
                 feature_dim=coarse_feature_dim,
-                carrier_hidden_dim=coarse_carrier_hidden_dim or max(coarse_feature_dim, latent_dim),
-                gate_hidden_dim=coarse_gate_hidden_dim or max(coarse_feature_dim, latent_dim),
+                hidden_dim=coarse_carrier_hidden_dim or max(128, coarse_feature_dim),
             )
         elif coarse_mode != 'implicit_only':
             raise ValueError(f"Unsupported coarse_mode '{coarse_mode}'")
@@ -602,7 +689,7 @@ class DeferredCascadedRenderer(nn.Module):
             if z_map is None or viewmat is None:
                 raise ValueError("Legacy coarse decoding requires z_map and viewmat")
             view_dirs = self.compute_view_directions(position_map, viewmat)
-            z_flat = z_map.permute(0, 2, 3, 1).reshape(-1, self.latent_dim)
+            z_flat = z_map.permute(0, 2, 3, 1).reshape(-1, z_map.shape[1])
             vd_flat = view_dirs.reshape(-1, 3)
             coarse_flat = self.hash_grid(
                 positions=pos_flat,
@@ -717,6 +804,13 @@ class DeferredCascadedRenderer(nn.Module):
             alpha_feat = rgb_result['alpha']
             depth_feat = rgb_result['depth']
 
+        if self.split_latent:
+            z_fine_map = z_map[:, :self.fine_latent_dim]
+            z_coarse_map = z_map[:, self.fine_latent_dim:self.fine_latent_dim + self.coarse_latent_dim]
+        else:
+            z_fine_map = z_map
+            z_coarse_map = z_map
+
         scale_map = None
         if render_coarse and getattr(self.hash_grid, 'input_mode', 'legacy') == 'implicit_scale':
             scale_map = self.render_scales(
@@ -724,11 +818,15 @@ class DeferredCascadedRenderer(nn.Module):
             )
 
         position_map = None
-        if render_coarse or self.fine_decoder.use_viewdirs:
+        needs_position_map = (
+            render_coarse
+            and self.coarse_mode not in {'spatial_direct', 'spatial_full_direct'}
+        ) or self.fine_decoder.use_viewdirs
+        if needs_position_map:
             position_map = self.depth_to_position_map(depth_feat, K_feat, viewmat)
 
         # Step 3: Fine features (explicit decode)
-        fine_features = self.decode_fine(z_map, position_map=position_map, viewmat=viewmat)
+        fine_features = self.decode_fine(z_fine_map, position_map=position_map, viewmat=viewmat)
 
         # Step 4: Coarse features (implicit decode via hash grid)
         coarse_features = None
@@ -736,19 +834,26 @@ class DeferredCascadedRenderer(nn.Module):
         coarse_carrier_features = None
         coarse_fusion_gate = None
         if render_coarse:
-            coarse_implicit_features = self.decode_coarse(
-                position_map=position_map,
-                alpha=alpha_feat,
-                z_map=z_map,
-                scale_map=scale_map,
-                viewmat=viewmat,
-            )
-            coarse_features = coarse_implicit_features
-            if self.coarse_carrier_fusion is not None:
+            if self.coarse_mode in {'spatial_direct', 'spatial_full_direct'}:
+                coarse_input_map = z_map if self.coarse_direct_uses_full_latent else z_coarse_map
                 coarse_features, coarse_carrier_features, coarse_fusion_gate = self.coarse_carrier_fusion(
-                    z_map,
-                    coarse_implicit_features,
+                    coarse_input_map,
+                    None,
                 )
+            else:
+                coarse_implicit_features = self.decode_coarse(
+                    position_map=position_map,
+                    alpha=alpha_feat,
+                    z_map=z_coarse_map,
+                    scale_map=scale_map,
+                    viewmat=viewmat,
+                )
+                coarse_features = coarse_implicit_features
+                if self.coarse_carrier_fusion is not None:
+                    coarse_features, coarse_carrier_features, coarse_fusion_gate = self.coarse_carrier_fusion(
+                        z_coarse_map,
+                        coarse_implicit_features,
+                    )
 
         return {
             'rgb': rgb_result['rgb'],
@@ -758,6 +863,8 @@ class DeferredCascadedRenderer(nn.Module):
             'surf_normals': rgb_result['surf_normals'],
             'distort': rgb_result['distort'],
             'z_map': z_map,
+            'z_fine_map': z_fine_map,
+            'z_coarse_map': z_coarse_map,
             'scale_map': scale_map,
             'fine_features': fine_features,
             'coarse_features': coarse_features,
