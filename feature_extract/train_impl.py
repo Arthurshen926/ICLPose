@@ -77,6 +77,7 @@ DEFAULT_CONFIG = {
         "patch_size": 16,
         "input_hw": [1088, 1920],
         "feature_hw": [68, 120],
+        "coarse_feature_hw": None,
         "cache_teacher": False,
         "fallback_val_ratio": 0.1,
         "max_train_samples": None,
@@ -87,6 +88,8 @@ DEFAULT_CONFIG = {
     },
     "model": {
         "feature_dim": 64,
+        "fine_feature_dim": None,
+        "coarse_feature_dim": None,
         "base_channels": 32,
         "stage_dims": [32, 64, 96, 128],
         "dropout": 0.0,
@@ -124,6 +127,7 @@ DEFAULT_CONFIG = {
         "query_teacher_infonce_weight": 0.0,
         "infonce_temperature": 0.07,
         "infonce_samples": 256,
+        "infonce_cross_batch": False,
     },
     "retrieval": {
         "enabled": False,
@@ -149,6 +153,7 @@ DEFAULT_CONFIG = {
         "map_lr_scale": 0.1,
         "hash_mlp_lr_scale": 0.05,
         "train_fine_decoder": False,
+        "train_coarse_fusion": False,
         "train_feat_sharp": False,
         "train_hash_mlp": False,
         "train_latent": False,
@@ -182,6 +187,12 @@ DEFAULT_CONFIG = {
         "rendered_teacher_coarse_weight": 0.0,
         "rendered_teacher_fine_infonce_weight": 0.0,
         "rendered_teacher_coarse_infonce_weight": 0.0,
+        "infonce_cross_batch": True,
+        "variance_target_std": 0.05,
+        "query_variance_weight": 0.0,
+        "map_variance_weight": 0.0,
+        "query_covariance_weight": 0.0,
+        "map_covariance_weight": 0.0,
     },
     "visualization": {
         "num_val_vis": 4,
@@ -289,8 +300,12 @@ class TeacherFeatureStore:
             raise RuntimeError(f"No paired teacher features found in {self.feature_dir}")
 
         sample = safe_torch_load(self.fine_files[self.indices[0]]).float()
-        self.feature_dim = int(sample.shape[0])
+        coarse_sample = safe_torch_load(self.coarse_files[self.indices[0]]).float()
+        self.fine_feature_dim = int(sample.shape[0])
+        self.coarse_feature_dim = int(coarse_sample.shape[0])
+        self.feature_dim = self.fine_feature_dim
         self.feature_hw = (int(sample.shape[1]), int(sample.shape[2]))
+        self.coarse_feature_hw = (int(coarse_sample.shape[1]), int(coarse_sample.shape[2]))
         self.cache_in_memory = cache_in_memory
         self._cache = {}
 
@@ -545,6 +560,9 @@ class MapFeatureRenderer(nn.Module):
         self.alpha_threshold = float(map_cfg.get("alpha_threshold", 0.5))
         self.trainable = bool(map_cfg.get("trainable", False))
         self.train_fine_decoder = self.trainable and bool(map_cfg.get("train_fine_decoder", False))
+        self.train_coarse_fusion = self.trainable and bool(
+            map_cfg.get("train_coarse_fusion", self.train_fine_decoder)
+        )
         self.train_feat_sharp = self.trainable and bool(map_cfg.get("train_feat_sharp", False))
         self.train_fsm = self.trainable and bool(map_cfg.get("train_fsm", False))
         self.train_hash_mlp = self.trainable and bool(map_cfg.get("train_hash_mlp", False))
@@ -580,6 +598,9 @@ class MapFeatureRenderer(nn.Module):
         self.gaussians._features_rest.requires_grad_(self.train_color)
         for p in self.dcff_renderer.fine_decoder.parameters():
             p.requires_grad_(self.train_fine_decoder)
+        if getattr(self.dcff_renderer, "coarse_carrier_fusion", None) is not None:
+            for p in self.dcff_renderer.coarse_carrier_fusion.parameters():
+                p.requires_grad_(self.train_coarse_fusion)
         for p in self.feat_sharp.parameters():
             p.requires_grad_(self.train_feat_sharp)
         if self.feat_select is not None:
@@ -613,13 +634,14 @@ class MapFeatureRenderer(nn.Module):
             self.basename_to_name.setdefault(Path(name).name, name)
 
         logger.info(
-            "Map renderer loaded: config=%s, views=%d, feature_hw=%s, cache=%s, trainable=%s, fine_decoder=%s, feat_sharp=%s, fsm=%s, hash_mlp=%s, latent=%s, geometry=%s",
+            "Map renderer loaded: config=%s, views=%d, feature_hw=%s, cache=%s, trainable=%s, fine_decoder=%s, coarse_fusion=%s, feat_sharp=%s, fsm=%s, hash_mlp=%s, latent=%s, geometry=%s",
             config_path,
             len(self.name_to_pose),
             self.feature_hw,
             self.cache_in_memory,
             self.trainable,
             self.train_fine_decoder,
+            self.train_coarse_fusion,
             self.train_feat_sharp,
             self.train_fsm,
             self.train_hash_mlp,
@@ -659,6 +681,7 @@ class MapFeatureRenderer(nn.Module):
     def has_trainable_params(self):
         return (
             self.train_fine_decoder
+            or self.train_coarse_fusion
             or self.train_feat_sharp
             or self.train_fsm
             or self.train_hash_mlp
@@ -687,6 +710,15 @@ class MapFeatureRenderer(nn.Module):
                     "params": list(self.dcff_renderer.fine_decoder.parameters()),
                     "lr": base_lr * self.map_lr_scale,
                     "weight_decay": weight_decay,
+                }
+            )
+        if self.train_coarse_fusion and getattr(self.dcff_renderer, "coarse_carrier_fusion", None) is not None:
+            groups.append(
+                {
+                    "params": list(self.dcff_renderer.coarse_carrier_fusion.parameters()),
+                    "lr": base_lr * self.map_lr_scale,
+                    "weight_decay": weight_decay,
+                    "name": "map_coarse_fusion",
                 }
             )
         if self.train_feat_sharp:
@@ -757,6 +789,8 @@ class MapFeatureRenderer(nn.Module):
         state = {}
         if self.train_fine_decoder:
             state["fine_decoder"] = self.dcff_renderer.fine_decoder.state_dict()
+        if self.train_coarse_fusion and getattr(self.dcff_renderer, "coarse_carrier_fusion", None) is not None:
+            state["coarse_fusion"] = self.dcff_renderer.coarse_carrier_fusion.state_dict()
         if self.train_feat_sharp:
             state["feat_sharp"] = self.feat_sharp.state_dict()
         if self.train_fsm and self.feat_select is not None:
@@ -787,6 +821,11 @@ class MapFeatureRenderer(nn.Module):
                 self.dcff_renderer.fine_decoder.load_state_dict(state_dict["fine_decoder"])
             except RuntimeError as e:
                 self.logger.info("Skipping map warmstart fine_decoder (architecture changed): %s", e)
+        if "coarse_fusion" in state_dict and getattr(self.dcff_renderer, "coarse_carrier_fusion", None) is not None:
+            try:
+                self.dcff_renderer.coarse_carrier_fusion.load_state_dict(state_dict["coarse_fusion"])
+            except RuntimeError as e:
+                self.logger.info("Skipping map warmstart coarse_fusion (architecture changed): %s", e)
         if "feat_sharp" in state_dict:
             try:
                 self.feat_sharp.load_state_dict(state_dict["feat_sharp"])
@@ -1019,7 +1058,41 @@ def resolve_linear_weight(map_cfg, key, epoch):
     return start + (end - start) * alpha
 
 
+def resolve_query_feature_dims(cfg, teacher_store):
+    """Resolve fine/coarse query dimensions from config or teacher cache."""
+    model_cfg = cfg.setdefault("model", {})
+    dataset_cfg = cfg.setdefault("dataset", {})
+    fallback_dim = int(model_cfg.get("feature_dim", teacher_store.fine_feature_dim))
+
+    fine_dim_cfg = model_cfg.get("fine_feature_dim")
+    coarse_dim_cfg = model_cfg.get("coarse_feature_dim")
+    fine_dim = teacher_store.fine_feature_dim if fine_dim_cfg is None else int(fine_dim_cfg)
+    coarse_dim = teacher_store.coarse_feature_dim if coarse_dim_cfg is None else int(coarse_dim_cfg)
+
+    if fine_dim != teacher_store.fine_feature_dim:
+        raise ValueError(
+            f"Query fine_feature_dim={fine_dim} does not match teacher fine dim "
+            f"{teacher_store.fine_feature_dim}"
+        )
+    if coarse_dim != teacher_store.coarse_feature_dim:
+        raise ValueError(
+            f"Query coarse_feature_dim={coarse_dim} does not match teacher coarse dim "
+            f"{teacher_store.coarse_feature_dim}"
+        )
+
+    model_cfg["feature_dim"] = fallback_dim
+    model_cfg["fine_feature_dim"] = fine_dim
+    model_cfg["coarse_feature_dim"] = coarse_dim
+    dataset_cfg["feature_hw"] = list(teacher_store.feature_hw)
+    dataset_cfg["coarse_feature_hw"] = list(teacher_store.coarse_feature_hw)
+    return fine_dim, coarse_dim
+
+
 def feature_orthogonality_loss(pred_a, pred_b, mask=None):
+    if pred_a.shape[1] != pred_b.shape[1]:
+        return pred_a.new_zeros(())
+    if pred_a.shape[-2:] != pred_b.shape[-2:]:
+        pred_b = F.interpolate(pred_b, pred_a.shape[-2:], mode="bilinear", align_corners=False)
     pred_a_n = F.normalize(pred_a, dim=1)
     pred_b_n = F.normalize(pred_b, dim=1)
     cos = (pred_a_n * pred_b_n).sum(dim=1, keepdim=True)
@@ -1031,12 +1104,63 @@ def feature_orthogonality_loss(pred_a, pred_b, mask=None):
     return penalty.mean()
 
 
+def feature_variance_loss(feat, mask=None, target_std=0.05):
+    """Penalize collapsed feature channels using a VICReg-style variance floor."""
+    B, C, H, W = feat.shape
+    x = feat.float().reshape(B, C, -1)
+    if mask is not None:
+        m = mask.float()
+        if m.shape[-2:] != (H, W):
+            m = F.interpolate(m, (H, W), mode="nearest")
+        m = m.reshape(B, 1, -1)
+        denom = m.sum(dim=-1).clamp(min=1.0)
+        mean = (x * m).sum(dim=-1) / denom
+        var = ((x - mean.unsqueeze(-1)) ** 2 * m).sum(dim=-1) / denom
+    else:
+        var = x.var(dim=-1, unbiased=False)
+    std = torch.sqrt(var + 1e-6)
+    return F.relu(float(target_std) - std).mean()
+
+
+def feature_covariance_loss(feat, mask=None, max_samples=1024):
+    """Reduce channel redundancy without requiring fine/coarse same dimensionality."""
+    B, C, H, W = feat.shape
+    x = feat.float().permute(0, 2, 3, 1).reshape(-1, C)
+    if mask is not None:
+        m = mask.float()
+        if m.shape[-2:] != (H, W):
+            m = F.interpolate(m, (H, W), mode="nearest")
+        valid = (m.reshape(-1) > 0.5).nonzero(as_tuple=True)[0]
+        if valid.numel() > 1:
+            x = x[valid]
+    if x.shape[0] > max_samples:
+        idx = torch.randperm(x.shape[0], device=x.device)[:max_samples]
+        x = x[idx]
+    if x.shape[0] <= 1:
+        return feat.new_zeros(())
+    x = x - x.mean(dim=0, keepdim=True)
+    x = x / x.std(dim=0, keepdim=True).clamp(min=1e-6)
+    cov = (x.T @ x) / max(1, x.shape[0] - 1)
+    off_diag = cov - torch.diag(torch.diag(cov))
+    return off_diag.pow(2).sum() / max(1, C * (C - 1))
+
+
 def compute_main_losses(outputs, batch, cfg):
     loss_cfg = cfg["loss"]
     teacher_fine = batch["teacher_fine"]
     teacher_coarse = batch["teacher_coarse"]
     pred_fine = outputs["fine"]
     pred_coarse = outputs["coarse"]
+    if pred_fine.shape[-2:] != teacher_fine.shape[-2:]:
+        pred_fine = F.interpolate(pred_fine, teacher_fine.shape[-2:], mode="bilinear", align_corners=False)
+    if pred_coarse.shape[-2:] != teacher_coarse.shape[-2:]:
+        pred_coarse = F.interpolate(pred_coarse, teacher_coarse.shape[-2:], mode="bilinear", align_corners=False)
+    if pred_fine.shape[1] != teacher_fine.shape[1]:
+        raise ValueError(f"Student fine dim {pred_fine.shape[1]} does not match teacher fine dim {teacher_fine.shape[1]}")
+    if pred_coarse.shape[1] != teacher_coarse.shape[1]:
+        raise ValueError(
+            f"Student coarse dim {pred_coarse.shape[1]} does not match teacher coarse dim {teacher_coarse.shape[1]}"
+        )
 
     fine_l1 = l1_feature_loss(pred_fine, teacher_fine)
     fine_cos = cosine_loss(pred_fine, teacher_fine)
@@ -1102,12 +1226,14 @@ def compute_main_losses(outputs, batch, cfg):
             teacher_fine,
             temperature=float(loss_cfg.get("infonce_temperature", 0.07)),
             n_samples=int(loss_cfg.get("infonce_samples", 256)),
+            cross_batch=bool(loss_cfg.get("infonce_cross_batch", False)),
         )
         coarse_nce = infonce_contrastive_loss(
             pred_coarse,
             teacher_coarse,
             temperature=float(loss_cfg.get("infonce_temperature", 0.07)),
             n_samples=int(loss_cfg.get("infonce_samples", 256)),
+            cross_batch=bool(loss_cfg.get("infonce_cross_batch", False)),
         )
         nce_total = 0.5 * (fine_nce + coarse_nce)
         total = total + infonce_weight * nce_total
@@ -1188,6 +1314,17 @@ def compute_map_supervision(batch, outputs, cfg, device, epoch=0):
     teacher_coarse = batch["teacher_coarse"]
     pred_fine = outputs["fine"]
     pred_coarse = outputs["coarse"]
+
+    def _resize_feature(feat, spatial_hw):
+        if feat is None or feat.shape[-2:] == tuple(spatial_hw):
+            return feat
+        return F.interpolate(feat, size=spatial_hw, mode="bilinear", align_corners=False)
+
+    def _resize_mask(feat_mask, spatial_hw):
+        if feat_mask is None or feat_mask.shape[-2:] == tuple(spatial_hw):
+            return feat_mask
+        return F.interpolate(feat_mask.float(), size=spatial_hw, mode="nearest")
+
     detach_query_features = bool(map_cfg.get("detach_query_features", False))
     pred_fine_target = pred_fine.detach() if detach_query_features else pred_fine
     pred_coarse_target = pred_coarse.detach() if detach_query_features else pred_coarse
@@ -1217,74 +1354,121 @@ def compute_map_supervision(batch, outputs, cfg, device, epoch=0):
     )
     infonce_temperature = float(map_cfg.get("infonce_temperature", loss_cfg.get("infonce_temperature", 0.07)))
     infonce_samples = int(map_cfg.get("infonce_samples", loss_cfg.get("infonce_samples", 256)))
+    infonce_cross_batch = bool(map_cfg.get("infonce_cross_batch", True))
     fine_coarse_ortho_weight = float(map_cfg.get("fine_coarse_ortho_weight", 0.0))
     alpha_coverage_weight = resolve_linear_weight(map_cfg, "alpha_coverage_weight", epoch)
     rgb_l1_weight = resolve_linear_weight(map_cfg, "rgb_l1_weight", epoch)
+    variance_target_std = float(map_cfg.get("variance_target_std", 0.05))
+    variance_weight_query = float(map_cfg.get("query_variance_weight", 0.0))
+    variance_weight_map = float(map_cfg.get("map_variance_weight", 0.0))
+    covariance_weight_query = float(map_cfg.get("query_covariance_weight", 0.0))
+    covariance_weight_map = float(map_cfg.get("map_covariance_weight", 0.0))
+
+    fine_query_mask = _resize_mask(mask, pred_fine_target.shape[-2:])
+    coarse_query_mask = _resize_mask(mask, pred_coarse_target.shape[-2:])
+    rendered_fine_query = _resize_feature(rendered_fine, pred_fine_target.shape[-2:])
+    rendered_coarse_query = _resize_feature(rendered_coarse, pred_coarse_target.shape[-2:])
+    rendered_fine_raw_query = _resize_feature(rendered_fine_raw, pred_fine_target.shape[-2:])
+
+    fine_teacher_mask = _resize_mask(mask, teacher_fine.shape[-2:])
+    coarse_teacher_mask = _resize_mask(mask, teacher_coarse.shape[-2:])
+    rendered_fine_teacher = _resize_feature(rendered_fine, teacher_fine.shape[-2:])
+    rendered_coarse_teacher = _resize_feature(rendered_coarse, teacher_coarse.shape[-2:])
+    rendered_fine_raw_teacher = _resize_feature(rendered_fine_raw, teacher_fine.shape[-2:])
 
     query_fine_loss = (
-        l1_feature_loss(pred_fine_target, rendered_fine, mask)
-        + cosine_loss(pred_fine_target, rendered_fine, mask)
+        l1_feature_loss(pred_fine_target, rendered_fine_query, fine_query_mask)
+        + cosine_loss(pred_fine_target, rendered_fine_query, fine_query_mask)
     ) * query_fine_weight
     query_fine_raw_loss = zero
     rendered_teacher_fine_raw_loss = zero
-    if rendered_fine_raw is not None:
+    if rendered_fine_raw_query is not None:
         query_fine_raw_loss = (
-            l1_feature_loss(pred_fine_target, rendered_fine_raw, mask)
-            + cosine_loss(pred_fine_target, rendered_fine_raw, mask)
+            l1_feature_loss(pred_fine_target, rendered_fine_raw_query, fine_query_mask)
+            + cosine_loss(pred_fine_target, rendered_fine_raw_query, fine_query_mask)
         ) * query_fine_raw_weight
         rendered_teacher_fine_raw_loss = (
-            l1_feature_loss(rendered_fine_raw, teacher_fine, mask)
-            + cosine_loss(rendered_fine_raw, teacher_fine, mask)
+            l1_feature_loss(rendered_fine_raw_teacher, teacher_fine, fine_teacher_mask)
+            + cosine_loss(rendered_fine_raw_teacher, teacher_fine, fine_teacher_mask)
         ) * rendered_teacher_fine_raw_weight
     query_coarse_loss = (
-        l1_feature_loss(pred_coarse_target, rendered_coarse, mask)
-        + cosine_loss(pred_coarse_target, rendered_coarse, mask)
+        l1_feature_loss(pred_coarse_target, rendered_coarse_query, coarse_query_mask)
+        + cosine_loss(pred_coarse_target, rendered_coarse_query, coarse_query_mask)
     ) * query_coarse_weight
     query_fine_nce_loss = zero
     if query_fine_infonce_weight > 0:
         query_fine_nce_loss = infonce_contrastive_loss(
             pred_fine_target,
-            rendered_fine,
-            mask=mask,
+            rendered_fine_query,
+            mask=fine_query_mask,
             temperature=infonce_temperature,
             n_samples=infonce_samples,
+            cross_batch=infonce_cross_batch,
         ) * query_fine_infonce_weight
     query_coarse_nce_loss = zero
     if query_coarse_infonce_weight > 0:
         query_coarse_nce_loss = infonce_contrastive_loss(
             pred_coarse_target,
-            rendered_coarse,
-            mask=mask,
+            rendered_coarse_query,
+            mask=coarse_query_mask,
             temperature=infonce_temperature,
             n_samples=infonce_samples,
+            cross_batch=infonce_cross_batch,
         ) * query_coarse_infonce_weight
     rendered_teacher_fine_loss = (
-        l1_feature_loss(rendered_fine, teacher_fine, mask)
-        + cosine_loss(rendered_fine, teacher_fine, mask)
+        l1_feature_loss(rendered_fine_teacher, teacher_fine, fine_teacher_mask)
+        + cosine_loss(rendered_fine_teacher, teacher_fine, fine_teacher_mask)
     ) * rendered_teacher_fine_weight
     rendered_teacher_fine_nce_loss = zero
     if rendered_teacher_fine_infonce_weight > 0:
         rendered_teacher_fine_nce_loss = infonce_contrastive_loss(
-            rendered_fine,
+            rendered_fine_teacher,
             teacher_fine,
-            mask=mask,
+            mask=fine_teacher_mask,
             temperature=infonce_temperature,
             n_samples=infonce_samples,
+            cross_batch=infonce_cross_batch,
         ) * rendered_teacher_fine_infonce_weight
     rendered_teacher_coarse_loss = (
-        l1_feature_loss(rendered_coarse, teacher_coarse, mask)
-        + cosine_loss(rendered_coarse, teacher_coarse, mask)
+        l1_feature_loss(rendered_coarse_teacher, teacher_coarse, coarse_teacher_mask)
+        + cosine_loss(rendered_coarse_teacher, teacher_coarse, coarse_teacher_mask)
     ) * rendered_teacher_coarse_weight
     rendered_teacher_coarse_nce_loss = zero
     if rendered_teacher_coarse_infonce_weight > 0:
         rendered_teacher_coarse_nce_loss = infonce_contrastive_loss(
-            rendered_coarse,
+            rendered_coarse_teacher,
             teacher_coarse,
-            mask=mask,
+            mask=coarse_teacher_mask,
             temperature=infonce_temperature,
             n_samples=infonce_samples,
+            cross_batch=infonce_cross_batch,
         ) * rendered_teacher_coarse_infonce_weight
     map_fine_coarse_ortho_loss = feature_orthogonality_loss(rendered_fine, rendered_coarse, mask) * fine_coarse_ortho_weight
+
+    query_variance_loss = zero
+    map_variance_loss = zero
+    query_covariance_loss = zero
+    map_covariance_loss = zero
+    if variance_weight_query > 0:
+        query_variance_loss = 0.5 * (
+            feature_variance_loss(pred_fine_target, fine_query_mask, variance_target_std)
+            + feature_variance_loss(pred_coarse_target, coarse_query_mask, variance_target_std)
+        )
+    if variance_weight_map > 0:
+        map_variance_loss = 0.5 * (
+            feature_variance_loss(rendered_fine_query, fine_query_mask, variance_target_std)
+            + feature_variance_loss(rendered_coarse_query, coarse_query_mask, variance_target_std)
+        )
+    if covariance_weight_query > 0:
+        query_covariance_loss = 0.5 * (
+            feature_covariance_loss(pred_fine_target, fine_query_mask)
+            + feature_covariance_loss(pred_coarse_target, coarse_query_mask)
+        )
+    if covariance_weight_map > 0:
+        map_covariance_loss = 0.5 * (
+            feature_covariance_loss(rendered_fine_query, fine_query_mask)
+            + feature_covariance_loss(rendered_coarse_query, coarse_query_mask)
+        )
 
     alpha_coverage_loss = zero
     if alpha is not None and alpha_coverage_weight > 0:
@@ -1343,17 +1527,21 @@ def compute_map_supervision(batch, outputs, cfg, device, epoch=0):
         elif prior_mask is not None:
             neg_mask = neg_mask * prior_mask
         if neg_fine is not None and neg_coarse is not None:
-            pos_fine = l1_feature_loss(pred_fine_target, rendered_fine, mask) + cosine_loss(
-                pred_fine_target, rendered_fine, mask
+            neg_fine_query = _resize_feature(neg_fine, pred_fine_target.shape[-2:])
+            neg_coarse_query = _resize_feature(neg_coarse, pred_coarse_target.shape[-2:])
+            neg_fine_mask = _resize_mask(neg_mask, pred_fine_target.shape[-2:])
+            neg_coarse_mask = _resize_mask(neg_mask, pred_coarse_target.shape[-2:])
+            pos_fine = l1_feature_loss(pred_fine_target, rendered_fine_query, fine_query_mask) + cosine_loss(
+                pred_fine_target, rendered_fine_query, fine_query_mask
             )
-            neg_fine_loss = l1_feature_loss(pred_fine_target, neg_fine, neg_mask) + cosine_loss(
-                pred_fine_target, neg_fine, neg_mask
+            neg_fine_loss = l1_feature_loss(pred_fine_target, neg_fine_query, neg_fine_mask) + cosine_loss(
+                pred_fine_target, neg_fine_query, neg_fine_mask
             )
-            pos_coarse = l1_feature_loss(pred_coarse_target, rendered_coarse, mask) + cosine_loss(
-                pred_coarse_target, rendered_coarse, mask
+            pos_coarse = l1_feature_loss(pred_coarse_target, rendered_coarse_query, coarse_query_mask) + cosine_loss(
+                pred_coarse_target, rendered_coarse_query, coarse_query_mask
             )
-            neg_coarse_loss = l1_feature_loss(pred_coarse_target, neg_coarse, neg_mask) + cosine_loss(
-                pred_coarse_target, neg_coarse, neg_mask
+            neg_coarse_loss = l1_feature_loss(pred_coarse_target, neg_coarse_query, neg_coarse_mask) + cosine_loss(
+                pred_coarse_target, neg_coarse_query, neg_coarse_mask
             )
             perturb_rank_loss = F.relu(margin + 0.5 * (pos_fine + pos_coarse) - 0.5 * (neg_fine_loss + neg_coarse_loss))
     total = (
@@ -1368,18 +1556,22 @@ def compute_map_supervision(batch, outputs, cfg, device, epoch=0):
         + rendered_teacher_fine_nce_loss
         + rendered_teacher_coarse_nce_loss
         + map_fine_coarse_ortho_loss
+        + variance_weight_query * query_variance_loss
+        + variance_weight_map * map_variance_loss
+        + covariance_weight_query * query_covariance_loss
+        + covariance_weight_map * map_covariance_loss
         + alpha_coverage_loss
         + rgb_reconstruction_loss
         + perturb_rank_weight * perturb_rank_loss
     )
 
-    fine_map_teacher_cos = 1.0 - cosine_loss(rendered_fine, teacher_fine, mask)
-    coarse_map_teacher_cos = 1.0 - cosine_loss(rendered_coarse, teacher_coarse, mask)
-    fine_query_map_cos = 1.0 - cosine_loss(pred_fine, rendered_fine, mask)
-    coarse_query_map_cos = 1.0 - cosine_loss(pred_coarse, rendered_coarse, mask)
-    if rendered_fine_raw is not None:
-        fine_map_raw_teacher_cos = 1.0 - cosine_loss(rendered_fine_raw, teacher_fine, mask)
-        fine_query_raw_map_cos = 1.0 - cosine_loss(pred_fine, rendered_fine_raw, mask)
+    fine_map_teacher_cos = 1.0 - cosine_loss(rendered_fine_teacher, teacher_fine, fine_teacher_mask)
+    coarse_map_teacher_cos = 1.0 - cosine_loss(rendered_coarse_teacher, teacher_coarse, coarse_teacher_mask)
+    fine_query_map_cos = 1.0 - cosine_loss(pred_fine, rendered_fine_query, fine_query_mask)
+    coarse_query_map_cos = 1.0 - cosine_loss(pred_coarse, rendered_coarse_query, coarse_query_mask)
+    if rendered_fine_raw_query is not None:
+        fine_map_raw_teacher_cos = 1.0 - cosine_loss(rendered_fine_raw_teacher, teacher_fine, fine_teacher_mask)
+        fine_query_raw_map_cos = 1.0 - cosine_loss(pred_fine, rendered_fine_raw_query, fine_query_mask)
     else:
         fine_map_raw_teacher_cos = zero
         fine_query_raw_map_cos = zero
@@ -1411,6 +1603,10 @@ def compute_map_supervision(batch, outputs, cfg, device, epoch=0):
         "map_rendered_teacher_fine_nce_loss": rendered_teacher_fine_nce_loss.detach(),
         "map_rendered_teacher_coarse_nce_loss": rendered_teacher_coarse_nce_loss.detach(),
         "map_fine_coarse_ortho_loss": map_fine_coarse_ortho_loss.detach(),
+        "map_query_variance_loss": query_variance_loss.detach(),
+        "map_variance_loss": map_variance_loss.detach(),
+        "map_query_covariance_loss": query_covariance_loss.detach(),
+        "map_covariance_loss": map_covariance_loss.detach(),
         "map_alpha_coverage_loss": alpha_coverage_loss.detach(),
         "map_rgb_reconstruction_loss": rgb_reconstruction_loss.detach(),
         "map_perturb_rank_loss": perturb_rank_loss.detach(),
@@ -1429,6 +1625,10 @@ def compute_map_supervision(batch, outputs, cfg, device, epoch=0):
             rendered_teacher_coarse_infonce_weight, device=device
         ),
         "map_fine_coarse_ortho_weight": torch.tensor(fine_coarse_ortho_weight, device=device),
+        "map_query_variance_weight": torch.tensor(variance_weight_query, device=device),
+        "map_variance_weight": torch.tensor(variance_weight_map, device=device),
+        "map_query_covariance_weight": torch.tensor(covariance_weight_query, device=device),
+        "map_covariance_weight": torch.tensor(covariance_weight_map, device=device),
         "map_alpha_coverage_weight": torch.tensor(alpha_coverage_weight, device=device),
         "map_rgb_l1_weight": torch.tensor(rgb_l1_weight, device=device),
         "map_teacher_fine_cosine": fine_map_teacher_cos.detach(),
@@ -1635,13 +1835,14 @@ def main():
         cfg["dataset"]["feature_dir"],
         cache_in_memory=bool(cfg["dataset"].get("cache_teacher", False)),
     )
-    if tuple(cfg["dataset"]["feature_hw"]) != teacher_store.feature_hw:
-        logger.info(
-            "Overriding feature_hw from config %s -> teacher cache %s",
-            cfg["dataset"]["feature_hw"],
-            teacher_store.feature_hw,
-        )
-        cfg["dataset"]["feature_hw"] = list(teacher_store.feature_hw)
+    fine_feature_dim, coarse_feature_dim = resolve_query_feature_dims(cfg, teacher_store)
+    logger.info(
+        "Teacher feature space: fine=%dd@%s coarse=%dd@%s",
+        fine_feature_dim,
+        teacher_store.feature_hw,
+        coarse_feature_dim,
+        teacher_store.coarse_feature_hw,
+    )
 
     retrieval_cfg = cfg.get("retrieval", {})
     retrieval_store = None
@@ -1734,9 +1935,12 @@ def main():
     model = RadioQueryStudent(
         in_channels=3,
         feature_dim=int(cfg["model"]["feature_dim"]),
+        fine_feature_dim=fine_feature_dim,
+        coarse_feature_dim=coarse_feature_dim,
         base_channels=int(cfg["model"]["base_channels"]),
         stage_dims=tuple(cfg["model"]["stage_dims"]),
         output_hw=tuple(cfg["dataset"]["feature_hw"]),
+        coarse_output_hw=tuple(cfg["dataset"].get("coarse_feature_hw") or cfg["dataset"]["feature_hw"]),
         input_hw=tuple(cfg["dataset"]["input_hw"]),
         dropout=float(cfg["model"].get("dropout", 0.0)),
         l2_normalize=bool(cfg["model"].get("l2_normalize", True)),

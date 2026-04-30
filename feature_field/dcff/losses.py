@@ -22,6 +22,7 @@ def infonce_contrastive_loss(
     mask: torch.Tensor = None,
     temperature: float = 0.07,
     n_samples: int = 512,
+    cross_batch: bool = False,
 ) -> torch.Tensor:
     """Pixel-level InfoNCE contrastive loss.
 
@@ -35,12 +36,33 @@ def infonce_contrastive_loss(
         mask:   [B, 1, H, W] optional valid-pixel mask
         temperature: softmax temperature (lower → sharper)
         n_samples:   pixels to sample per image (memory: O(n²))
+        cross_batch: if true, sampled pixels from all batch items share the
+            same negative pool, which matches query-map contrastive training.
     """
     B, C, H, W = pred.shape
     N = H * W
 
     pred_n = F.normalize(pred.float(), p=2, dim=1).flatten(2)    # (B, C, N)
     target_n = F.normalize(target.float(), p=2, dim=1).flatten(2)
+
+    if cross_batch:
+        pred_flat = pred_n.permute(0, 2, 1).reshape(B * N, C)
+        target_flat = target_n.permute(0, 2, 1).reshape(B * N, C)
+        if mask is not None:
+            valid_idx = (mask.reshape(B, -1).flatten() > 0.5).nonzero(as_tuple=True)[0]
+        else:
+            valid_idx = torch.arange(B * N, device=pred.device)
+        n_valid = valid_idx.numel()
+        if n_valid < 2:
+            return pred.new_zeros((), dtype=torch.float32)
+        k = min(int(n_samples) * max(1, B), n_valid)
+        perm = torch.randperm(n_valid, device=pred.device)[:k]
+        idx = valid_idx[perm]
+        p = pred_flat[idx]
+        t = target_flat[idx]
+        logits = torch.mm(p, t.T) / temperature
+        labels = torch.arange(k, device=pred.device)
+        return F.cross_entropy(logits, labels)
 
     total_loss = torch.tensor(0.0, device=pred.device)
     count = 0
@@ -174,6 +196,66 @@ def feature_gradient_loss(pred: torch.Tensor, target: torch.Tensor,
     return 0.5 * (dx.sum() / denom_x + dy.sum() / denom_y)
 
 
+def feature_edge_weight(
+    target: torch.Tensor,
+    mask: torch.Tensor = None,
+    edge_strength: float = 2.0,
+    edge_dilation: int = 3,
+) -> torch.Tensor:
+    """Build a per-pixel weight map from target feature discontinuities."""
+    target_n = F.normalize(target.float(), p=2, dim=1)
+    B, _, H, W = target_n.shape
+    edge = target_n.new_zeros((B, 1, H, W))
+
+    dx = (target_n[:, :, :, 1:] - target_n[:, :, :, :-1]).pow(2).sum(dim=1, keepdim=True).sqrt()
+    dy = (target_n[:, :, 1:, :] - target_n[:, :, :-1, :]).pow(2).sum(dim=1, keepdim=True).sqrt()
+    edge[:, :, :, 1:] = torch.maximum(edge[:, :, :, 1:], dx)
+    edge[:, :, :, :-1] = torch.maximum(edge[:, :, :, :-1], dx)
+    edge[:, :, 1:, :] = torch.maximum(edge[:, :, 1:, :], dy)
+    edge[:, :, :-1, :] = torch.maximum(edge[:, :, :-1, :], dy)
+
+    dilation = max(1, int(edge_dilation))
+    if dilation % 2 == 0:
+        dilation += 1
+    if dilation > 1:
+        edge = F.max_pool2d(edge, kernel_size=dilation, stride=1, padding=dilation // 2)
+
+    if mask is not None:
+        mask = mask.float()
+        edge = edge * mask
+        denom = mask.sum(dim=(2, 3), keepdim=True).clamp(min=1.0)
+        mean_edge = edge.sum(dim=(2, 3), keepdim=True) / denom
+    else:
+        mean_edge = edge.mean(dim=(2, 3), keepdim=True).clamp(min=1e-6)
+
+    normalized_edge = edge / mean_edge.clamp(min=1e-6)
+    weight = 1.0 + float(edge_strength) * normalized_edge.clamp(max=8.0)
+    if mask is not None:
+        weight = weight * mask
+    return weight
+
+
+def edge_weighted_cosine_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor = None,
+    edge_strength: float = 2.0,
+    edge_dilation: int = 3,
+) -> torch.Tensor:
+    """Cosine feature loss that emphasizes target feature boundaries."""
+    pred_n = F.normalize(pred.float(), p=2, dim=1)
+    target_n = F.normalize(target.float(), p=2, dim=1)
+    cos_sim = (pred_n * target_n).sum(dim=1, keepdim=True)
+    weight = feature_edge_weight(
+        target,
+        mask=mask,
+        edge_strength=edge_strength,
+        edge_dilation=edge_dilation,
+    )
+    loss = (1.0 - cos_sim) * weight
+    return loss.sum() / weight.sum().clamp(min=1.0)
+
+
 def screen_space_tv_loss(feat: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
     """L1 screen-space TV on normalized feature maps.
 
@@ -242,6 +324,9 @@ class DCFFLoss(nn.Module):
         lambda_dist: float = 0.01,
         lambda_channel_std: float = 0.0,
         lambda_fine_grad: float = 0.0,
+        lambda_fine_edge: float = 0.0,
+        fine_edge_strength: float = 2.0,
+        fine_edge_dilation: int = 3,
         lambda_coarse_grad: float = 0.0,
         lambda_fine_nce: float = 0.0,
         lambda_coarse_nce: float = 0.0,
@@ -260,6 +345,9 @@ class DCFFLoss(nn.Module):
         self.lambda_dist = lambda_dist
         self.lambda_channel_std = lambda_channel_std
         self.lambda_fine_grad = lambda_fine_grad
+        self.lambda_fine_edge = lambda_fine_edge
+        self.fine_edge_strength = fine_edge_strength
+        self.fine_edge_dilation = fine_edge_dilation
         self.lambda_coarse_grad = lambda_coarse_grad
         self.lambda_fine_nce = lambda_fine_nce
         self.lambda_coarse_nce = lambda_coarse_nce
@@ -284,8 +372,21 @@ class DCFFLoss(nn.Module):
         l1 = l1_feature_loss(pred, target, mask)
         cs = channel_standardized_loss(pred, target, mask) if self.lambda_channel_std > 0 else torch.tensor(0.0, device=pred.device)
         grad = feature_gradient_loss(pred, target, mask) if self.lambda_fine_grad > 0 else torch.tensor(0.0, device=pred.device)
-        total = self.lambda_fine_cos * cos + self.lambda_fine_l1 * l1 + self.lambda_channel_std * cs + self.lambda_fine_grad * grad
-        return {'fine_cos': cos, 'fine_l1': l1, 'fine_cs': cs, 'fine_grad': grad, 'fine_total': total}
+        edge = edge_weighted_cosine_loss(
+            pred,
+            target,
+            mask=mask,
+            edge_strength=self.fine_edge_strength,
+            edge_dilation=self.fine_edge_dilation,
+        ) if self.lambda_fine_edge > 0 else torch.tensor(0.0, device=pred.device)
+        total = (
+            self.lambda_fine_cos * cos
+            + self.lambda_fine_l1 * l1
+            + self.lambda_channel_std * cs
+            + self.lambda_fine_grad * grad
+            + self.lambda_fine_edge * edge
+        )
+        return {'fine_cos': cos, 'fine_l1': l1, 'fine_cs': cs, 'fine_grad': grad, 'fine_edge': edge, 'fine_total': total}
 
     def coarse_loss(self, pred: torch.Tensor, target: torch.Tensor,
                     mask: torch.Tensor = None) -> dict:

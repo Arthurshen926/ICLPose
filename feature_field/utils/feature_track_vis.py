@@ -4,6 +4,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image, ImageDraw
 
 
@@ -16,6 +17,12 @@ def _mask_to_numpy(mask, hw):
             mask = mask[0]
         if mask.dim() == 3:
             mask = mask[0]
+        if tuple(mask.shape[-2:]) != tuple(hw):
+            mask = F.interpolate(
+                mask.unsqueeze(0).unsqueeze(0),
+                size=tuple(hw),
+                mode="nearest",
+            ).squeeze(0).squeeze(0)
         mask = mask.numpy()
     mask = np.asarray(mask, dtype=np.float32)
     if mask.shape != tuple(hw):
@@ -212,6 +219,13 @@ def error_to_heatmap_image(pred: torch.Tensor, target: torch.Tensor, mask: torch
         pred = pred[0]
     if target.dim() == 4:
         target = target[0]
+    if pred.shape[-2:] != target.shape[-2:]:
+        pred = F.interpolate(
+            pred.unsqueeze(0),
+            size=target.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(0)
 
     h, w = pred.shape[-2:]
     valid_mask = _mask_to_numpy(mask, (h, w))

@@ -198,6 +198,56 @@ def test_dcff_loss_can_penalize_missing_feature_gradients():
     assert torch.allclose(coarse["coarse_total"], coarse["coarse_grad"])
 
 
+def test_dcff_loss_can_weight_fine_edges_more_than_flat_regions():
+    from feature_field.dcff.losses import edge_weighted_cosine_loss
+
+    target = torch.zeros(1, 4, 6, 6)
+    target[:, 0, :, :3] = 1.0
+    target[:, 1, :, 3:] = 1.0
+    pred = target.clone()
+    pred[:, :, :, 3] = 0.0
+    pred[:, 0, :, 3] = 1.0
+
+    weighted = edge_weighted_cosine_loss(pred, target, edge_strength=3.0)
+    unweighted = DCFFLoss(lambda_tv=0.0).fine_loss(pred, target)["fine_cos"]
+
+    assert torch.isfinite(weighted)
+    assert weighted.item() > unweighted.item()
+
+
+def test_residual_spatial_fine_decoder_outputs_expected_shape_and_gradients():
+    from feature_field.dcff.deferred_renderer import DeferredCascadedRenderer
+
+    class DummyHashGrid(torch.nn.Module):
+        input_mode = "implicit_scale"
+
+        def forward(self, positions, scales=None, valid_mask=None):
+            return torch.zeros(positions.shape[0], 8, device=positions.device)
+
+        def total_variation_loss(self):
+            return torch.tensor(0.0)
+
+    renderer = DeferredCascadedRenderer(
+        hash_grid=DummyHashGrid(),
+        latent_dim=12,
+        fine_latent_dim=8,
+        coarse_latent_dim=4,
+        fine_feature_dim=16,
+        coarse_feature_dim=8,
+        fine_hidden_dim=24,
+        fine_decoder_type="residual_spatial",
+    )
+    z = torch.randn(2, 8, 5, 7, requires_grad=True)
+
+    out = renderer.fine_decoder(z)
+    loss = out.square().mean()
+    loss.backward()
+
+    assert out.shape == (2, 16, 5, 7)
+    assert z.grad is not None
+    assert torch.isfinite(z.grad).all()
+
+
 def test_online_radio_teacher_uses_snapped_radio_resolution_for_feature_grid():
     from feature_field.dcff.radio_teacher import OnlineRadioTeacher
 
@@ -459,6 +509,8 @@ if __name__ == "__main__":
     test_dcff_loss_accepts_asymmetric_fine_and_coarse_dims()
     test_dcff_infonce_accepts_mixed_amp_and_cached_teacher_dtypes()
     test_dcff_loss_can_penalize_missing_feature_gradients()
+    test_dcff_loss_can_weight_fine_edges_more_than_flat_regions()
+    test_residual_spatial_fine_decoder_outputs_expected_shape_and_gradients()
     test_online_radio_teacher_uses_snapped_radio_resolution_for_feature_grid()
     test_deferred_renderer_splits_fine_and_coarse_latent_dims()
     test_deferred_renderer_legacy_hash_uses_split_coarse_latent_dim()

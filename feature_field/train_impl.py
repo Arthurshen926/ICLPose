@@ -100,6 +100,7 @@ def _extract_project_teacher_batch(
     teacher_images: torch.Tensor,
     teacher_mode: str,
     micro_batch: int = 0,
+    return_compression_loss: bool = True,
 ):
     """Run online teacher extraction/projection in micro-batches.
 
@@ -117,13 +118,16 @@ def _extract_project_teacher_batch(
         end = min(start + micro_batch, batch)
         chunk = teacher_images[start:end]
         fine_raw, coarse_raw = teacher.extract_raw(chunk)
-        if teacher_mode == 'online_bottleneck':
+        if teacher_mode == 'online_bottleneck' and return_compression_loss:
             fine_proj, coarse_proj, chunk_losses = teacher.project(
                 fine_raw, coarse_raw, return_loss=True,
             )
             weight = (end - start) / batch
             for name, value in chunk_losses.items():
                 loss_sums[name] = loss_sums.get(name, value.new_tensor(0.0)) + value * weight
+        elif teacher_mode == 'online_bottleneck':
+            with torch.no_grad():
+                fine_proj, coarse_proj = teacher.project(fine_raw, coarse_raw)
         else:
             fine_proj, coarse_proj = teacher.project(fine_raw, coarse_raw)
 
@@ -395,6 +399,7 @@ def train(cfg, resume_path=None):
     fcfg = cfg.get('fine_decoder', {})
     ccfg = cfg.get('coarse_decoder', {})
     teacher_cfg = cfg.get('teacher', {})
+    freeze_teacher_projection = bool(teacher_cfg.get('freeze_projection', False))
 
     teacher_mode = teacher_cfg.get('mode', 'cached')
     seed = int(tcfg.get('seed', 12345)) + rank * 100003
@@ -641,6 +646,10 @@ def train(cfg, resume_path=None):
         n_fsm_local = sum(p.numel() for p in feat_select.parameters())
         print(f"  FSM: {n_fsm_local:,} params")
 
+    if teacher is not None and freeze_teacher_projection:
+        for param in teacher.get_projection_params():
+            param.requires_grad_(False)
+        print("  Teacher projection/compressor frozen")
 
     # Loss
     loss_cfg = tcfg.get('loss', {})
@@ -656,6 +665,9 @@ def train(cfg, resume_path=None):
         lambda_dist=float(loss_cfg.get('lambda_dist', 0.0)),
         lambda_channel_std=float(loss_cfg.get('lambda_channel_std', 0.1)),
         lambda_fine_grad=float(loss_cfg.get('lambda_fine_grad', 0.0)),
+        lambda_fine_edge=float(loss_cfg.get('lambda_fine_edge', 0.0)),
+        fine_edge_strength=float(loss_cfg.get('fine_edge_strength', 2.0)),
+        fine_edge_dilation=int(loss_cfg.get('fine_edge_dilation', 3)),
         lambda_coarse_grad=float(loss_cfg.get('lambda_coarse_grad', 0.0)),
         lambda_fine_nce=float(loss_cfg.get('lambda_fine_nce', 0.0)),
         lambda_coarse_nce=float(loss_cfg.get('lambda_coarse_nce', 0.0)),
@@ -671,7 +683,7 @@ def train(cfg, resume_path=None):
     n_fsm = sum(p.numel() for p in feat_select.parameters()) if feat_select is not None else 0
     n_proj = 0
     if teacher is not None:
-        n_proj = sum(p.numel() for p in teacher.get_projection_params())
+        n_proj = sum(p.numel() for p in teacher.get_projection_params() if p.requires_grad)
     print(f"\n  Gaussians:    {gaussians.num_points:,}")
     print(f"  Latent dim:   {mcfg['latent_dim']}")
     print(f"  Hash grid:    {n_hash:,} params")
@@ -706,7 +718,7 @@ def train(cfg, resume_path=None):
             'params': feat_select.parameters(),
             'lr': float(fsm_cfg.get('lr', 0.0003)),
         })
-    if teacher is not None:
+    if teacher is not None and not freeze_teacher_projection and float(teacher_cfg.get('lr_projection', 0.0005)) > 0:
         dcff_params.append({
             'params': teacher.get_projection_params(),
             'lr': float(teacher_cfg.get('lr_projection', 0.0005)),
@@ -727,9 +739,16 @@ def train(cfg, resume_path=None):
     if warmstart_path and os.path.exists(warmstart_path):
         restore_warmstart_geometry = bool(tcfg.get('warmstart_restore_geometry_state', True))
         restore_warmstart_coarse_fusion = bool(tcfg.get('warmstart_restore_coarse_fusion_state', True))
+        restore_warmstart_fine_decoder = bool(tcfg.get('warmstart_restore_fine_decoder_state', True))
         warm_ckpt = safe_torch_load(warmstart_path, map_location='cuda')
         hash_grid.load_state_dict(warm_ckpt['hash_grid_state'])
-        renderer.fine_decoder.load_state_dict(warm_ckpt['fine_decoder_state'])
+        if restore_warmstart_fine_decoder and 'fine_decoder_state' in warm_ckpt:
+            try:
+                renderer.fine_decoder.load_state_dict(warm_ckpt['fine_decoder_state'])
+            except RuntimeError as exc:
+                print(f"  Skipped warm-start fine decoder state due to mismatch: {exc}")
+        elif 'fine_decoder_state' in warm_ckpt:
+            print("  Skipped warm-start fine decoder state")
         if (
             renderer.coarse_carrier_fusion is not None
             and 'coarse_fusion_state' in warm_ckpt
@@ -943,6 +962,11 @@ def train(cfg, resume_path=None):
                     teacher_images=teacher_images,
                     teacher_mode=teacher_mode,
                     micro_batch=teacher_micro_batch,
+                    return_compression_loss=(
+                        teacher_mode == 'online_bottleneck'
+                        and compress_loss_weight > 0
+                        and not freeze_teacher_projection
+                    ),
                 )
 
                 if teacher_cfg.get('detach_targets_for_field_loss', False):
@@ -1236,6 +1260,8 @@ def train(cfg, resume_path=None):
                 parts.append(f"fine_cs={losses['fine_cs'].item():.4f}")
             if 'fine_grad' in losses and loss_cfg.get('lambda_fine_grad', 0.0) > 0:
                 parts.append(f"fine_grad={losses['fine_grad'].item():.4f}")
+            if 'fine_edge' in losses and loss_cfg.get('lambda_fine_edge', 0.0) > 0:
+                parts.append(f"fine_edge={losses['fine_edge'].item():.4f}")
             if 'coarse_cos' in losses:
                 parts.append(f"coarse_cos={1 - losses['coarse_cos'].item():.3f}")
             if 'coarse_cs' in losses:

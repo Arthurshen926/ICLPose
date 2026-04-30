@@ -225,13 +225,10 @@ def _solve_pnp(
                 pts_3d, pts_2d, camera_matrix, None,
                 params=params,
             )
-            # USAC variant may return 5 values: (ok, R_mat, tvec, rvec, inliers)
+            # OpenCV's USAC overload returns:
+            #   (ok, cameraMatrix, rvec, tvec, inliers)
             if len(ret) == 5:
-                success, R_or_rvec, tvec, rvec_extra, inliers = ret
-                if R_or_rvec.shape == (3, 3):
-                    rvec, _ = cv2.Rodrigues(R_or_rvec)
-                else:
-                    rvec = R_or_rvec
+                success, _camera_matrix_out, rvec, tvec, inliers = ret
             else:
                 success, rvec, tvec, inliers = ret
         except (cv2.error, TypeError):

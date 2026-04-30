@@ -389,7 +389,9 @@ def build_dcff_runtime(
     ccfg = dcff_cfg.get("coarse_decoder", {})
     mcfg = dcff_cfg.get("model", {})
     fsm_cfg = dcff_cfg.get("fsm", {})
-    feature_dim = int(cfg_dcff.get("feature_dim", mcfg.get("feature_dim", 64)))
+    fallback_feature_dim = int(cfg_dcff.get("feature_dim", mcfg.get("feature_dim", 64)))
+    fine_feature_dim = int(cfg_dcff.get("fine_feature_dim", mcfg.get("fine_feature_dim", fallback_feature_dim)))
+    coarse_feature_dim = int(cfg_dcff.get("coarse_feature_dim", mcfg.get("coarse_feature_dim", fallback_feature_dim)))
     fine_latent_dim = cfg_dcff.get("fine_latent_dim", mcfg.get("fine_latent_dim"))
     coarse_latent_dim = cfg_dcff.get("coarse_latent_dim", mcfg.get("coarse_latent_dim"))
     fine_latent_dim = int(fine_latent_dim) if fine_latent_dim is not None else None
@@ -398,7 +400,7 @@ def build_dcff_runtime(
 
     hash_grid = SpatialHashGrid(
         scene_extent=hcfg.get("scene_extent", scene_extent),
-        feature_dim=feature_dim,
+        feature_dim=coarse_feature_dim,
         input_mode=hcfg.get("input_mode", "implicit_scale"),
         latent_dim=hash_latent_dim,
         n_levels=hcfg.get("n_levels", 16),
@@ -416,8 +418,8 @@ def build_dcff_runtime(
     renderer = DeferredCascadedRenderer(
         hash_grid=hash_grid,
         latent_dim=latent_dim,
-        fine_feature_dim=feature_dim,
-        coarse_feature_dim=feature_dim,
+        fine_feature_dim=fine_feature_dim,
+        coarse_feature_dim=coarse_feature_dim,
         fine_hidden_dim=fcfg.get("hidden_dim", 128),
         fine_num_layers=fcfg.get("num_layers", 3),
         fine_use_viewdirs=fcfg.get("use_viewdirs", False),
@@ -434,8 +436,10 @@ def build_dcff_runtime(
 
     feat_select = None
     if fsm_cfg.get("enable", False):
+        if fine_feature_dim != coarse_feature_dim:
+            raise ValueError("Runtime FSM requires equal fine/coarse feature dimensions")
         feat_select = FeatureSelectionModule(
-            feature_dim=feature_dim,
+            feature_dim=fine_feature_dim,
             hidden_dim=int(fsm_cfg.get("hidden_dim", 32)),
             num_heads=int(fsm_cfg.get("num_heads", 4)),
             channel_routing_mode=fsm_cfg.get("channel_routing_mode", "categorical"),
@@ -450,21 +454,21 @@ def build_dcff_runtime(
     refiner_state = checkpoint.get("feat_sharp_fine_state", {})
     if refiner_type == "depth_guided":
         hidden_dim = dcff_cfg.get("refiner", {}).get("hidden_dim", 128)
-        refiner = DepthGuidedRefiner(feature_dim, hidden_dim=hidden_dim).to(device)
+        refiner = DepthGuidedRefiner(fine_feature_dim, hidden_dim=hidden_dim).to(device)
         _print(printer, f"  Using DepthGuidedRefiner (hidden={hidden_dim}) [from config]")
     elif refiner_type == "featsharp":
-        refiner = FeatSharp(feature_dim).to(device)
+        refiner = FeatSharp(fine_feature_dim).to(device)
         _print(printer, "  Using FeatSharp [from config]")
     elif (
         refiner_type is None
         and "refiner.0.weight" in refiner_state
-        and refiner_state["refiner.0.weight"].shape[1] == feature_dim + 2
+        and refiner_state["refiner.0.weight"].shape[1] == fine_feature_dim + 2
     ):
         hidden_dim = refiner_state["refiner.0.weight"].shape[0]
-        refiner = DepthGuidedRefiner(feature_dim, hidden_dim=hidden_dim).to(device)
+        refiner = DepthGuidedRefiner(fine_feature_dim, hidden_dim=hidden_dim).to(device)
         _print(printer, f"  Using DepthGuidedRefiner (hidden={hidden_dim}) [auto-detected]")
     else:
-        refiner = FeatSharp(feature_dim).to(device)
+        refiner = FeatSharp(fine_feature_dim).to(device)
         _print(printer, "  Using FeatSharp")
 
     _print(printer, f"  Loading DCFF checkpoint: {dcff_ckpt_path}")

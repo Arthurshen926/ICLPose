@@ -26,6 +26,7 @@ import sys
 import argparse
 import math
 import time
+import json
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -315,6 +316,141 @@ def _load_image_tensor(cam, longest_edge, device):
     if scale < 1.0:
         img = img.resize((int(width * scale), int(height * scale)), Image.LANCZOS)
     return torch.from_numpy(np.array(img)).permute(2, 0, 1).unsqueeze(0).float().to(device) / 255.0
+
+
+def _discover_indexed_feature_files(root_dir, scale_name):
+    mapping = {}
+    import re
+
+    pattern = re.compile(rf"rgb_(\d+)_{re.escape(scale_name)}_.*\.pt$")
+    for path in sorted(Path(root_dir).glob("*.pt")):
+        match = pattern.match(path.name)
+        if match:
+            mapping[int(match.group(1))] = path
+    return mapping
+
+
+class CachedQueryFeatureProvider:
+    """Load exported query-student fine/coarse features for visualization."""
+
+    def __init__(
+        self,
+        feature_dir,
+        device="cuda",
+        expected_fine_dim=None,
+        expected_coarse_dim=None,
+    ):
+        self.feature_dir = Path(feature_dir)
+        self.device = torch.device(device)
+        self.fine_files = _discover_indexed_feature_files(self.feature_dir / "fine_geo", "fine_geo")
+        self.coarse_files = _discover_indexed_feature_files(self.feature_dir / "coarse_sem", "coarse_sem")
+        self.indices = sorted(set(self.fine_files) & set(self.coarse_files))
+        if not self.indices:
+            raise RuntimeError(f"No paired query features found under {self.feature_dir}")
+
+        self.name_to_index = {}
+        export_index = self.feature_dir / "export_index.json"
+        if export_index.is_file():
+            rows = json.loads(export_index.read_text(encoding="utf-8"))
+            for row in rows:
+                sample_name = str(row.get("sample_name", "")).replace("\\", "/")
+                candidates = [sample_name, Path(sample_name).name]
+                for candidate in candidates:
+                    if candidate:
+                        if row.get("teacher_idx") is not None:
+                            self.name_to_index.setdefault(candidate, int(row["teacher_idx"]))
+                        if row.get("colmap_image_id") is not None:
+                            self.name_to_index.setdefault(candidate, int(row["colmap_image_id"]))
+
+        fine_sample, coarse_sample = self.get_by_fid(self.indices[0])
+        self.fine_dim = int(fine_sample.shape[1])
+        self.coarse_dim = int(coarse_sample.shape[1])
+        if expected_fine_dim is not None and self.fine_dim != int(expected_fine_dim):
+            raise ValueError(f"Query fine dim {self.fine_dim} does not match expected {expected_fine_dim}")
+        if expected_coarse_dim is not None and self.coarse_dim != int(expected_coarse_dim):
+            raise ValueError(f"Query coarse dim {self.coarse_dim} does not match expected {expected_coarse_dim}")
+
+    def get_by_fid(self, fid):
+        fid = int(fid)
+        if fid not in self.fine_files or fid not in self.coarse_files:
+            raise KeyError(f"Missing query features for fid={fid}")
+        fine = safe_torch_load(self.fine_files[fid], map_location="cpu").float().unsqueeze(0).to(self.device)
+        coarse = safe_torch_load(self.coarse_files[fid], map_location="cpu").float().unsqueeze(0).to(self.device)
+        return fine, coarse
+
+    def get_for_camera(self, cam, fid=None):
+        candidates = []
+        if fid is not None:
+            candidates.append(int(fid))
+        image_name = str(cam.image_name).replace("\\", "/")
+        for key in (image_name, Path(image_name).name):
+            if key in self.name_to_index:
+                candidates.append(int(self.name_to_index[key]))
+        for idx in candidates:
+            if idx in self.fine_files and idx in self.coarse_files:
+                return self.get_by_fid(idx)
+        raise KeyError(f"Missing query features for camera {cam.image_name} (fid={fid})")
+
+
+class OnlineQueryStudentProvider:
+    """Run a query-student checkpoint online for visualization."""
+
+    def __init__(
+        self,
+        config_path,
+        checkpoint_path,
+        device="cuda",
+        expected_fine_dim=None,
+        expected_coarse_dim=None,
+    ):
+        from feature_extract import load_config as load_query_config
+        from feature_extract.students.radio_query_student import RadioQueryStudent
+
+        self.cfg = load_query_config(config_path)
+        self.device = torch.device(device)
+        model_cfg = self.cfg.get("model", {})
+        dataset_cfg = self.cfg.get("dataset", {})
+        fallback_dim = int(model_cfg.get("feature_dim", 64))
+        fine_dim = int(model_cfg.get("fine_feature_dim") or fallback_dim)
+        coarse_dim = int(model_cfg.get("coarse_feature_dim") or fallback_dim)
+        if expected_fine_dim is not None and fine_dim != int(expected_fine_dim):
+            raise ValueError(f"Query fine dim {fine_dim} does not match expected {expected_fine_dim}")
+        if expected_coarse_dim is not None and coarse_dim != int(expected_coarse_dim):
+            raise ValueError(f"Query coarse dim {coarse_dim} does not match expected {expected_coarse_dim}")
+
+        self.input_hw = tuple(dataset_cfg.get("input_hw", [1088, 1920]))
+        self.model = RadioQueryStudent(
+            feature_dim=fallback_dim,
+            fine_feature_dim=fine_dim,
+            coarse_feature_dim=coarse_dim,
+            base_channels=int(model_cfg.get("base_channels", 32)),
+            stage_dims=tuple(model_cfg.get("stage_dims", [32, 64, 96, 128])),
+            output_hw=tuple(dataset_cfg.get("feature_hw", [68, 120])),
+            coarse_output_hw=tuple(dataset_cfg.get("coarse_feature_hw") or dataset_cfg.get("feature_hw", [68, 120])),
+            input_hw=self.input_hw,
+            dropout=float(model_cfg.get("dropout", 0.0)),
+            l2_normalize=bool(model_cfg.get("l2_normalize", True)),
+            predict_magnitude=bool(model_cfg.get("predict_magnitude", False)),
+            fine_init_norm=float(model_cfg.get("fine_init_norm", 1.0)),
+            coarse_init_norm=float(model_cfg.get("coarse_init_norm", 1.0)),
+            magnitude_min=float(model_cfg.get("magnitude_min", 1e-4)),
+        ).to(self.device)
+        ckpt = safe_torch_load(checkpoint_path, map_location="cpu")
+        self.model.load_state_dict(ckpt["model_state_dict"], strict=True)
+        self.model.eval()
+        self.fine_dim = fine_dim
+        self.coarse_dim = coarse_dim
+
+    def get_for_camera(self, cam, fid=None):
+        img = Image.open(cam.image).convert("RGB")
+        target_w, target_h = self.input_hw[1], self.input_hw[0]
+        if img.size != (target_w, target_h):
+            img = img.resize((target_w, target_h), Image.BILINEAR)
+        arr = np.asarray(img, dtype=np.float32) / 255.0
+        tensor = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            out = self.model(tensor)
+        return out["fine"].float(), out["coarse"].float()
 
 
 def _cam_to_viewmat(cam, device):
@@ -623,6 +759,9 @@ def visualize_dcff(
     device='cuda',
     exp_name='dcff',
     images_subdir=None,
+    query_feature_dir=None,
+    query_student_config=None,
+    query_student_checkpoint=None,
 ):
     """Visualize DCFF implicit feature field."""
     os.makedirs(output_dir, exist_ok=True)
@@ -668,6 +807,10 @@ def visualize_dcff(
 
     all_fine_cos = []
     all_coarse_cos = []
+    all_query_fine_teacher = []
+    all_query_fine_map = []
+    all_query_coarse_teacher = []
+    all_query_coarse_map = []
     fine_region_all = empty_region_score_dict()
     coarse_region_all = empty_region_score_dict()
 
@@ -675,6 +818,8 @@ def visualize_dcff(
     fine_target_samples = []
     coarse_pred_samples = []
     coarse_target_samples = []
+    fine_query_samples = []
+    coarse_query_samples = []
     cached_visuals = []
 
     hash_grid.eval()
@@ -690,6 +835,26 @@ def visualize_dcff(
         f"  Teacher: {teacher_provider.mode}, dims fine={bundle['fine_feat_dim']} "
         f"coarse={bundle['coarse_feat_dim']}, coarse_downsample={coarse_downsample}, split={camera_split}"
     )
+    query_provider = None
+    if query_feature_dir:
+        query_provider = CachedQueryFeatureProvider(
+            query_feature_dir,
+            device=device,
+            expected_fine_dim=bundle['fine_feat_dim'],
+            expected_coarse_dim=bundle['coarse_feat_dim'],
+        )
+        print(f"  Query: cached features from {query_feature_dir}")
+    elif query_student_config and query_student_checkpoint:
+        query_provider = OnlineQueryStudentProvider(
+            query_student_config,
+            query_student_checkpoint,
+            device=device,
+            expected_fine_dim=bundle['fine_feat_dim'],
+            expected_coarse_dim=bundle['coarse_feat_dim'],
+        )
+        print(f"  Query: online student {query_student_checkpoint}")
+    elif query_student_config or query_student_checkpoint:
+        raise ValueError("Both --query_student_config and --query_student_checkpoint are required for online query visualization")
 
     for idx in camera_indices:
         if idx >= len(valid_cams):
@@ -761,6 +926,80 @@ def visualize_dcff(
         coarse_pred_samples.append(coarse_pred_chw)
         coarse_target_samples.append(coarse_target_chw)
 
+        query_payload = {}
+        if query_provider is not None:
+            query_fine, query_coarse = query_provider.get_for_camera(cam, fid=fid)
+            if query_fine.shape[-2:] != geo_target.shape[-2:]:
+                query_fine = F.interpolate(query_fine, geo_target.shape[-2:], mode='bilinear', align_corners=False)
+            if query_fine.shape[1] != geo_target.shape[1]:
+                raise ValueError(f"Query fine dim {query_fine.shape[1]} != teacher/map fine dim {geo_target.shape[1]}")
+
+            coarse_metric_target = sem_target
+            if coarse_downsample:
+                coarse_metric_target = F.interpolate(sem_target, metrics['coarse_pred'].shape[-2:], mode='bilinear', align_corners=False)
+            if query_coarse.shape[-2:] != metrics['coarse_pred'].shape[-2:]:
+                query_coarse_metric = F.interpolate(
+                    query_coarse,
+                    metrics['coarse_pred'].shape[-2:],
+                    mode='bilinear',
+                    align_corners=False,
+                )
+            else:
+                query_coarse_metric = query_coarse
+            if query_coarse_metric.shape[1] != metrics['coarse_pred'].shape[1]:
+                raise ValueError(
+                    f"Query coarse dim {query_coarse_metric.shape[1]} != teacher/map coarse dim {metrics['coarse_pred'].shape[1]}"
+                )
+
+            query_fine_teacher = cosine_similarity_map(query_fine, geo_target, mask_fine)
+            query_fine_map = cosine_similarity_map(query_fine, fine_pred_up, mask_fine)
+            query_coarse_teacher = cosine_similarity_map(query_coarse_metric, coarse_metric_target, metrics['mask_coarse'])
+            query_coarse_map = cosine_similarity_map(query_coarse_metric, metrics['coarse_pred'], metrics['mask_coarse'])
+
+            fine_valid_mask = mask_fine.squeeze(1) > 0.5
+            coarse_valid_mask = metrics['mask_coarse'].squeeze(1) > 0.5
+            qft_mean = query_fine_teacher[fine_valid_mask].mean().item()
+            qfm_mean = query_fine_map[fine_valid_mask].mean().item()
+            qct_mean = query_coarse_teacher[coarse_valid_mask].mean().item()
+            qcm_mean = query_coarse_map[coarse_valid_mask].mean().item()
+            all_query_fine_teacher.append(qft_mean)
+            all_query_fine_map.append(qfm_mean)
+            all_query_coarse_teacher.append(qct_mean)
+            all_query_coarse_map.append(qcm_mean)
+
+            query_coarse_vis = query_coarse_metric
+            query_coarse_teacher_vis = query_coarse_teacher
+            query_coarse_map_vis = query_coarse_map
+            if query_coarse_vis.shape[-2:] != (feat_h, feat_w):
+                query_coarse_vis = F.interpolate(query_coarse_vis, (feat_h, feat_w), mode='bilinear', align_corners=False)
+                query_coarse_teacher_vis = F.interpolate(
+                    query_coarse_teacher.unsqueeze(1),
+                    (feat_h, feat_w),
+                    mode='bilinear',
+                    align_corners=False,
+                ).squeeze(1)
+                query_coarse_map_vis = F.interpolate(
+                    query_coarse_map.unsqueeze(1),
+                    (feat_h, feat_w),
+                    mode='bilinear',
+                    align_corners=False,
+                ).squeeze(1)
+
+            fine_query_samples.append(query_fine.squeeze(0).detach().cpu())
+            coarse_query_samples.append(query_coarse_vis.squeeze(0).detach().cpu())
+            query_payload = {
+                'fine_query': query_fine.squeeze(0).detach().cpu(),
+                'coarse_query': query_coarse_vis.squeeze(0).detach().cpu(),
+                'query_fine_teacher': query_fine_teacher.detach().cpu(),
+                'query_fine_map': query_fine_map.detach().cpu(),
+                'query_coarse_teacher': query_coarse_teacher_vis.detach().cpu(),
+                'query_coarse_map': query_coarse_map_vis.detach().cpu(),
+                'query_fine_teacher_mean': qft_mean,
+                'query_fine_map_mean': qfm_mean,
+                'query_coarse_teacher_mean': qct_mean,
+                'query_coarse_map_mean': qcm_mean,
+            }
+
         cached_visuals.append({
             'idx': idx,
             'fid': fid if fid is not None else cam.image_name,
@@ -777,27 +1016,62 @@ def visualize_dcff(
             'coarse_cos_mean': coarse_cos_mean,
             'fine_valid': fine_cos[mask_fine.squeeze(1) > 0.5].detach().cpu().numpy(),
             'coarse_valid': coarse_cos[mask_coarse.squeeze(1) > 0.5].detach().cpu().numpy(),
+            **query_payload,
         })
 
         print(f"  Camera {idx}: fine_cos={fine_cos_mean:.4f}, coarse_cos={coarse_cos_mean:.4f}")
+        if query_payload:
+            print(
+                f"    Query: q_t_f={query_payload['query_fine_teacher_mean']:.4f}, "
+                f"q_m_f={query_payload['query_fine_map_mean']:.4f}, "
+                f"q_t_c={query_payload['query_coarse_teacher_mean']:.4f}, "
+                f"q_m_c={query_payload['query_coarse_map_mean']:.4f}"
+            )
 
-    fine_pred_vis_list, fine_target_vis_list = target_basis_pca_colorize(
-        fine_pred_samples,
-        fine_target_samples,
-        mask=None,
-    )
-    coarse_pred_vis_list, coarse_target_vis_list = target_basis_pca_colorize(
-        coarse_pred_samples,
-        coarse_target_samples,
-        mask=None,
-    )
+    if fine_query_samples:
+        fine_all_pred_vis, fine_all_target_vis = target_basis_pca_colorize(
+            fine_pred_samples + fine_query_samples,
+            fine_target_samples + fine_target_samples,
+            mask=None,
+        )
+        n_fine = len(fine_pred_samples)
+        fine_pred_vis_list = fine_all_pred_vis[:n_fine]
+        fine_query_vis_list = fine_all_pred_vis[n_fine:]
+        fine_target_vis_list = fine_all_target_vis[:n_fine]
+    else:
+        fine_pred_vis_list, fine_target_vis_list = target_basis_pca_colorize(
+            fine_pred_samples,
+            fine_target_samples,
+            mask=None,
+        )
+        fine_query_vis_list = [None for _ in fine_pred_vis_list]
 
-    for item, fine_pred_rgb, fine_target_rgb, coarse_pred_rgb, coarse_target_rgb in zip(
+    if coarse_query_samples:
+        coarse_all_pred_vis, coarse_all_target_vis = target_basis_pca_colorize(
+            coarse_pred_samples + coarse_query_samples,
+            coarse_target_samples + coarse_target_samples,
+            mask=None,
+        )
+        n_coarse = len(coarse_pred_samples)
+        coarse_pred_vis_list = coarse_all_pred_vis[:n_coarse]
+        coarse_query_vis_list = coarse_all_pred_vis[n_coarse:]
+        coarse_target_vis_list = coarse_all_target_vis[:n_coarse]
+    else:
+        coarse_pred_vis_list, coarse_target_vis_list = target_basis_pca_colorize(
+            coarse_pred_samples,
+            coarse_target_samples,
+            mask=None,
+        )
+        coarse_query_vis_list = [None for _ in coarse_pred_vis_list]
+
+    for item, fine_pred_rgb, fine_target_rgb, fine_query_rgb, coarse_pred_rgb, coarse_target_rgb, coarse_query_rgb in zip(
         cached_visuals,
         fine_pred_vis_list,
         fine_target_vis_list,
+        fine_query_vis_list,
         coarse_pred_vis_list,
         coarse_target_vis_list,
+        coarse_query_vis_list,
     ):
         idx = item['idx']
         fid = item['fid']
@@ -888,10 +1162,48 @@ def visualize_dcff(
         fig2.savefig(os.path.join(output_dir, f'dcff_{exp_name}_cam{idx}_dist.png'), dpi=150)
         plt.close(fig2)
 
+        if fine_query_rgb is not None and coarse_query_rgb is not None:
+            figq, axesq = plt.subplots(2, 4, figsize=(20, 8))
+            figq.suptitle(f'DCFF+Query {exp_name} - cam={idx} (fid={fid})')
+            axesq[0, 0].imshow(fine_pred_rgb.permute(1, 2, 0).cpu().clamp(0, 1))
+            axesq[0, 0].set_title(f"Fine Map\nm-t={fine_cos_mean:.3f}")
+            axesq[0, 1].imshow(fine_query_rgb.permute(1, 2, 0).cpu().clamp(0, 1))
+            axesq[0, 1].set_title(
+                f"Fine Query\nq-t={item['query_fine_teacher_mean']:.3f} q-m={item['query_fine_map_mean']:.3f}"
+            )
+            axesq[0, 2].imshow(fine_target_rgb.permute(1, 2, 0).cpu().clamp(0, 1))
+            axesq[0, 2].set_title("Fine Teacher")
+            axesq[0, 3].imshow(item['query_fine_map'].squeeze(0).cpu(), cmap='RdYlGn', vmin=0, vmax=1)
+            axesq[0, 3].set_title("Fine Query-Map")
+
+            axesq[1, 0].imshow(coarse_pred_rgb.permute(1, 2, 0).cpu().clamp(0, 1))
+            axesq[1, 0].set_title(f"Coarse Map\nm-t={coarse_cos_mean:.3f}")
+            axesq[1, 1].imshow(coarse_query_rgb.permute(1, 2, 0).cpu().clamp(0, 1))
+            axesq[1, 1].set_title(
+                f"Coarse Query\nq-t={item['query_coarse_teacher_mean']:.3f} q-m={item['query_coarse_map_mean']:.3f}"
+            )
+            axesq[1, 2].imshow(coarse_target_rgb.permute(1, 2, 0).cpu().clamp(0, 1))
+            axesq[1, 2].set_title("Coarse Teacher")
+            axesq[1, 3].imshow(item['query_coarse_map'].squeeze(0).cpu(), cmap='RdYlGn', vmin=0, vmax=1)
+            axesq[1, 3].set_title("Coarse Query-Map")
+            for ax in axesq.reshape(-1):
+                ax.axis('off')
+            plt.tight_layout()
+            figq.savefig(os.path.join(output_dir, f'dcff_{exp_name}_cam{idx}_query.png'), dpi=150)
+            plt.close(figq)
+
     fine_mean = np.mean(all_fine_cos) if all_fine_cos else 0
     coarse_mean = np.mean(all_coarse_cos) if all_coarse_cos else 0
     print(f"  [{exp_name}] Summary: fine_cos={fine_mean:.4f}, coarse_cos={coarse_mean:.4f}")
-    
+    if all_query_fine_map:
+        print(
+            f"  [{exp_name}] Query Summary: "
+            f"q_t_f={np.mean(all_query_fine_teacher):.4f}, "
+            f"q_m_f={np.mean(all_query_fine_map):.4f}, "
+            f"q_t_c={np.mean(all_query_coarse_teacher):.4f}, "
+            f"q_m_c={np.mean(all_query_coarse_map):.4f}"
+        )
+
     return {
         'fine_cos': fine_mean,
         'coarse_cos': coarse_mean,
@@ -899,6 +1211,10 @@ def visualize_dcff(
         'coarse_cos_std': np.std(all_coarse_cos) if all_coarse_cos else 0,
         'fine_region_cos': summarize_region_scores(fine_region_all),
         'coarse_region_cos': summarize_region_scores(coarse_region_all),
+        'query_fine_teacher_cos': np.mean(all_query_fine_teacher) if all_query_fine_teacher else None,
+        'query_fine_map_cos': np.mean(all_query_fine_map) if all_query_fine_map else None,
+        'query_coarse_teacher_cos': np.mean(all_query_coarse_teacher) if all_query_coarse_teacher else None,
+        'query_coarse_map_cos': np.mean(all_query_coarse_map) if all_query_coarse_map else None,
     }
 
 
@@ -1225,6 +1541,12 @@ def main():
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--skip_dcff', action='store_true')
     parser.add_argument('--skip_2dgs', action='store_true')
+    parser.add_argument('--query_feature_dir', type=str, default=None,
+                       help='Optional exported query-student feature directory with fine_geo/coarse_sem tensors.')
+    parser.add_argument('--query_student_config', type=str, default=None,
+                       help='Optional query-student training config for online query visualization.')
+    parser.add_argument('--query_student_checkpoint', type=str, default=None,
+                       help='Optional query-student checkpoint for online query visualization.')
     args = parser.parse_args()
 
     os.makedirs(args.output_base, exist_ok=True)
@@ -1263,6 +1585,9 @@ def main():
                     device=args.device,
                     exp_name=exp_name,
                     images_subdir=args.images_subdir,
+                    query_feature_dir=args.query_feature_dir,
+                    query_student_config=args.query_student_config,
+                    query_student_checkpoint=args.query_student_checkpoint,
                 )
                 results[exp_name] = result
             except Exception as e:
@@ -1304,11 +1629,28 @@ def main():
     print("\n" + "=" * 70)
     print("  FEATURE VISUALIZATION SUMMARY")
     print("=" * 70)
-    print(f"{'Experiment':<25} {'Fine Cos':<12} {'Coarse Cos':<12}")
+    has_query = any(res.get('query_fine_map_cos') is not None for res in results.values())
+    if has_query:
+        print(
+            f"{'Experiment':<25} {'Map-Fine':<12} {'Map-Coarse':<12} "
+            f"{'Q-Map-F':<12} {'Q-Map-C':<12}"
+        )
+    else:
+        print(f"{'Experiment':<25} {'Fine Cos':<12} {'Coarse Cos':<12}")
     print("-" * 70)
     for name, res in sorted(results.items()):
-        print(f"{name:<25} {res['fine_cos']:.4f} ± {res.get('fine_cos_std', 0):.3f}   "
-              f"{res['coarse_cos']:.4f} ± {res.get('coarse_cos_std', 0):.3f}")
+        if has_query:
+            qmf = res.get('query_fine_map_cos')
+            qmc = res.get('query_coarse_map_cos')
+            qmf_s = f"{qmf:.4f}" if qmf is not None else "n/a"
+            qmc_s = f"{qmc:.4f}" if qmc is not None else "n/a"
+            print(
+                f"{name:<25} {res['fine_cos']:.4f}       {res['coarse_cos']:.4f}       "
+                f"{qmf_s:<12} {qmc_s:<12}"
+            )
+        else:
+            print(f"{name:<25} {res['fine_cos']:.4f} ± {res.get('fine_cos_std', 0):.3f}   "
+                  f"{res['coarse_cos']:.4f} ± {res.get('coarse_cos_std', 0):.3f}")
     print("=" * 70)
     print(f"\nAll visualizations saved to: {args.output_base}/")
     print("Use these directories for your quantitative evaluation.")

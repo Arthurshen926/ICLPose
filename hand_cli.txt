@@ -7,3 +7,6 @@ pgrep python
 
 
 TORCH_CUDA_ARCH_LIST=8.6+PTX torchrun --nproc_per_node=4 -m feature_gaussian.train --config feature_gaussian/configs/joint_rgb_geometry_cambridge_oldhospital_processed_rebuild_v4_4gpu_1280_safe_rgbft_30k.yaml
+
+
+PYTHONPATH=/root/ICLPose CUDA_VISIBLE_DEVICES=0 TORCH_CUDA_ARCH_LIST=8.6+PTX PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True /usr/local/miniconda3/envs/iclpose/bin/python feature_field/visualize_feature_comparison.py --source_dir /hy-tmp/Cambridge_stdloc/OldHospital --feature_dir /root/ICLPose/result/result/feature_extract/features_radio_dual/cambridge_oldhospital_processed --images_subdir processed --dcff_checkpoint /root/ICLPose/result/result/feature_field/dcff_cambridge_oldhospital_processed_adaptive_bottleneck_v6_fullres_fixedtarget_gpu0_b16/checkpoints/best.pth --dcff_exp_name adaptive_v6_fixedtarget_iter800 --camera_split train --camera_indices 0,20,50,100,200,400 --output_base /root/ICLPose/result/result/feature_field/vis_adaptive_v6_fixedtarget_iter800 --skip_2dgs

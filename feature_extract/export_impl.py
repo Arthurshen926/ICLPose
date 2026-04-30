@@ -85,11 +85,17 @@ def build_model(cfg: dict, checkpoint: dict, device: torch.device) -> RadioQuery
         retrieval_dropout = float(retrieval_cfg.get("dropout", 0.0))
         retrieval_l2_normalize = bool(retrieval_cfg.get("l2_normalize", True))
 
+    feature_dim = int(cfg["model"]["feature_dim"])
+    fine_feature_dim = int(cfg["model"].get("fine_feature_dim") or feature_dim)
+    coarse_feature_dim = int(cfg["model"].get("coarse_feature_dim") or feature_dim)
     model = RadioQueryStudent(
-        feature_dim=int(cfg["model"]["feature_dim"]),
+        feature_dim=feature_dim,
+        fine_feature_dim=fine_feature_dim,
+        coarse_feature_dim=coarse_feature_dim,
         base_channels=int(cfg["model"].get("base_channels", 32)),
         stage_dims=tuple(cfg["model"].get("stage_dims", [32, 64, 96, 128])),
         output_hw=tuple(cfg["dataset"]["feature_hw"]),
+        coarse_output_hw=tuple(cfg["dataset"].get("coarse_feature_hw") or cfg["dataset"]["feature_hw"]),
         input_hw=tuple(cfg["dataset"]["input_hw"]),
         dropout=float(cfg["model"].get("dropout", 0.0)),
         l2_normalize=bool(cfg["model"].get("l2_normalize", True)),
@@ -129,6 +135,11 @@ def main() -> None:
         cfg["dataset"]["feature_dir"],
         cache_in_memory=bool(cfg["dataset"].get("cache_teacher", False)),
     )
+    cfg.setdefault("model", {})
+    cfg["model"]["fine_feature_dim"] = int(cfg["model"].get("fine_feature_dim") or teacher_store.fine_feature_dim)
+    cfg["model"]["coarse_feature_dim"] = int(cfg["model"].get("coarse_feature_dim") or teacher_store.coarse_feature_dim)
+    cfg["dataset"]["feature_hw"] = list(teacher_store.feature_hw)
+    cfg["dataset"]["coarse_feature_hw"] = list(teacher_store.coarse_feature_hw)
     records = select_records(cfg, teacher_store, args.split, args.limit)
     if not records:
         raise RuntimeError("No records selected for export")
@@ -233,7 +244,10 @@ def main() -> None:
         "name_mode": args.name_mode,
         "colmap_dir": str(Path(args.colmap_dir).resolve()) if args.colmap_dir else cfg["dataset"].get("colmap_dir"),
         "feature_hw": list(cfg["dataset"]["feature_hw"]),
+        "coarse_feature_hw": list(cfg["dataset"].get("coarse_feature_hw") or cfg["dataset"]["feature_hw"]),
         "feature_dim": int(cfg["model"]["feature_dim"]),
+        "fine_feature_dim": int(cfg["model"].get("fine_feature_dim") or cfg["model"]["feature_dim"]),
+        "coarse_feature_dim": int(cfg["model"].get("coarse_feature_dim") or cfg["model"]["feature_dim"]),
     }
     export_index = [
         {
@@ -248,7 +262,9 @@ def main() -> None:
 
     print(
         f"Exported {exported} samples to {output_dir} "
-        f"(split={args.split}, feature_hw={tuple(cfg['dataset']['feature_hw'])}, dim={cfg['model']['feature_dim']})"
+        f"(split={args.split}, feature_hw={tuple(cfg['dataset']['feature_hw'])}, "
+        f"coarse_hw={tuple(cfg['dataset'].get('coarse_feature_hw') or cfg['dataset']['feature_hw'])}, "
+        f"dims={cfg['model'].get('fine_feature_dim')}/{cfg['model'].get('coarse_feature_dim')})"
     )
 
 

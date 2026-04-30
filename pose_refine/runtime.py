@@ -48,12 +48,17 @@ def build_concat_pose_model(model_cfg: dict, device: torch.device | str) -> Conc
         coarse_stage_dropout=model_cfg.get("coarse_stage_dropout", 0.1),
         coarse_stage_pool_hw=model_cfg.get("coarse_stage_pool_hw", 4),
         coarse_stage_use_fsm=model_cfg.get("coarse_stage_use_fsm", True),
+        pose_update_scale=model_cfg.get("pose_update_scale", 1.0),
     ).to(device)
 
 
-def apply_pose_delta(pose_w2c: torch.Tensor, delta_xi: torch.Tensor) -> torch.Tensor:
+def apply_pose_delta(
+    pose_w2c: torch.Tensor,
+    delta_xi: torch.Tensor,
+    scale: float = 1.0,
+) -> torch.Tensor:
     with torch.cuda.amp.autocast(enabled=False):
-        return torch.bmm(se3_exp(delta_xi.float()), pose_w2c.float())
+        return torch.bmm(se3_exp(delta_xi.float() * float(scale)), pose_w2c.float())
 
 
 def run_model_refine_iteration(
@@ -87,7 +92,8 @@ def run_model_refine_iteration(
                     rendered_coarse,
                     fsm_spatial_conf=coarse_bundle.get("fsm_spatial_conf"),
                 )
-            pose_mid = apply_pose_delta(pose_cur, coarse_pred["delta_xi"])
+            update_scale = float(getattr(model, "pose_update_scale", 1.0))
+            pose_mid = apply_pose_delta(pose_cur, coarse_pred["delta_xi"], scale=update_scale)
 
     fine_bundle = render_batch_fn(pose_mid, False)
     with torch.cuda.amp.autocast(enabled=autocast_enabled):
@@ -102,7 +108,8 @@ def run_model_refine_iteration(
         )
     pose_next = pose_mid
     if apply_fine_update and "delta_xi" in fine_pred:
-        pose_next = apply_pose_delta(pose_mid, fine_pred["delta_xi"])
+        update_scale = float(getattr(model, "pose_update_scale", 1.0))
+        pose_next = apply_pose_delta(pose_mid, fine_pred["delta_xi"], scale=update_scale)
 
     return {
         "pose_mid": pose_mid,

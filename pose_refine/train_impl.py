@@ -70,8 +70,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from data.radio_loc_dataset import RadioLocDataset, collate_fn, read_colmap_cameras
 from data.radio_loc_retrieval_dataset import RadioLocRetrievalDataset
 from feature_field.dcff import DeferredCascadedRenderer, HybridGaussianModel, SpatialHashGrid
-from pose_refine import build_concat_pose_model, run_model_refine_iteration
-from pose_refine.models.concat_pose_net import ConcatPoseNet
+from pose_refine import apply_pose_delta, build_concat_pose_model, feature_metric_solve, run_model_refine_iteration
+from pose_refine.models.concat_pose_net import ConcatPoseNet, local_correlation
 from pose_refine.utils.lie_algebra import se3_exp, se3_log
 from feature_field import build_dcff_runtime, intrinsics_to_K, render_feature_bundle_batch
 from feature_field.runtime import _apply_dcff_postprocess
@@ -84,6 +84,193 @@ def camera_centers_from_w2c(poses_w2c: torch.Tensor) -> torch.Tensor:
     R = poses_w2c[:, :3, :3]
     t = poses_w2c[:, :3, 3]
     return -(R.transpose(1, 2) @ t.unsqueeze(-1)).squeeze(-1)
+
+
+def perturb_w2c_camera_center(
+    poses_w2c: torch.Tensor,
+    offsets: torch.Tensor,
+    *,
+    frame: str = 'camera',
+) -> torch.Tensor:
+    """Translate camera centres by metric offsets while preserving rotation."""
+    with torch.cuda.amp.autocast(enabled=False):
+        poses = poses_w2c.float()
+        offsets = offsets.to(device=poses.device, dtype=poses.dtype)
+        if offsets.ndim == 1:
+            offsets = offsets.unsqueeze(0).expand(poses.shape[0], -1)
+        if offsets.shape[0] == 1 and poses.shape[0] > 1:
+            offsets = offsets.expand(poses.shape[0], -1)
+        if offsets.shape != (poses.shape[0], 3):
+            raise ValueError(
+                f'offsets must have shape (B,3), got {tuple(offsets.shape)} '
+                f'for B={poses.shape[0]}'
+            )
+
+        R = poses[:, :3, :3]
+        centres = camera_centers_from_w2c(poses)
+        if frame == 'camera':
+            offsets_world = torch.bmm(R.transpose(1, 2), offsets.unsqueeze(-1)).squeeze(-1)
+        elif frame == 'world':
+            offsets_world = offsets
+        else:
+            raise ValueError(f"Unsupported perturb frame '{frame}', expected 'camera' or 'world'")
+
+        out = poses.clone()
+        new_centres = centres + offsets_world
+        out[:, :3, 3] = -torch.bmm(R, new_centres.unsqueeze(-1)).squeeze(-1)
+        return out
+
+
+def pose_error_tensors(
+    pose_pred: torch.Tensor,
+    pose_gt: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return rotation cosine loss, rotation error in degrees, translation error in metres."""
+    R_pred = pose_pred[:, :3, :3].float()
+    R_gt = pose_gt[:, :3, :3].float()
+    R_rel = torch.bmm(R_pred.transpose(1, 2), R_gt)
+    trace = R_rel[:, 0, 0] + R_rel[:, 1, 1] + R_rel[:, 2, 2]
+    cos_angle = torch.clamp((trace - 1.0) / 2.0, -1.0, 1.0)
+    rot_cos_loss = 1.0 - cos_angle
+    rot_err = torch.acos(cos_angle.clamp(-1.0 + 1e-7, 1.0 - 1e-7)) * 180.0 / math.pi
+    trans_err = torch.norm(
+        camera_centers_from_w2c(pose_pred.float()) - camera_centers_from_w2c(pose_gt.float()),
+        dim=1,
+    )
+    return rot_cos_loss, rot_err, trans_err
+
+
+def has_trainable_localization_feature_path(
+    model: Optional[nn.Module],
+    *,
+    loc_use_projection: bool,
+    map_decoder_active: bool,
+    map_fsm_active: bool,
+) -> bool:
+    """Return whether localization feature losses can reach trainable parameters."""
+    if map_decoder_active or map_fsm_active:
+        return True
+    if not loc_use_projection or model is None:
+        return False
+    for module_name in ('proj_shared', 'proj_query', 'proj_render', 'cross_attn'):
+        module = getattr(model, module_name, None)
+        if module is None:
+            continue
+        if any(param.requires_grad for param in module.parameters()):
+            return True
+    return False
+
+
+def masked_feature_cosine_distance_per_sample(
+    query_feat: torch.Tensor,
+    rendered_feat: torch.Tensor,
+    mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Per-sample cosine distance between query and rendered feature maps."""
+    query = query_feat.float()
+    rendered = rendered_feat.float()
+    if query.shape[-2:] != rendered.shape[-2:]:
+        query = F.interpolate(query, rendered.shape[-2:], mode='bilinear', align_corners=False)
+    q = F.normalize(query, dim=1)
+    r = F.normalize(rendered, dim=1)
+    dist = 1.0 - (q * r).sum(dim=1, keepdim=True)
+    if mask is None:
+        return dist.mean(dim=(1, 2, 3))
+    mask_f = mask.float()
+    if mask_f.ndim == 3:
+        mask_f = mask_f.unsqueeze(1)
+    if mask_f.shape[-2:] != dist.shape[-2:]:
+        mask_f = F.interpolate(mask_f, dist.shape[-2:], mode='nearest')
+    denom = mask_f.sum(dim=(1, 2, 3)).clamp(min=1.0)
+    return (dist * mask_f).sum(dim=(1, 2, 3)) / denom
+
+
+def feature_metric_pose_update(
+    query_feat: torch.Tensor,
+    rendered_feat: torch.Tensor,
+    depth: torch.Tensor,
+    pose_ref: torch.Tensor,
+    intrinsics: Dict[str, float],
+    *,
+    damping: float = 1e-3,
+    valid_mask: Optional[torch.Tensor] = None,
+    normalize_features: bool = True,
+    update_scale: float = 1.0,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """One differentiable feature-metric GN/WLS pose update."""
+    with torch.cuda.amp.autocast(enabled=False):
+        query = query_feat.float()
+        rendered = rendered_feat.float()
+        if query.shape[-2:] != rendered.shape[-2:]:
+            query = F.interpolate(query, rendered.shape[-2:], mode='bilinear', align_corners=False)
+        if normalize_features:
+            query = F.normalize(query, dim=1)
+            rendered = F.normalize(rendered, dim=1)
+        depth_s = depth.float()
+        if depth_s.ndim == 4:
+            depth_s = depth_s.squeeze(1)
+        if valid_mask is None:
+            valid_mask = (depth_s > 0.05).unsqueeze(1).float()
+        elif valid_mask.ndim == 3:
+            valid_mask = valid_mask.unsqueeze(1).float()
+        else:
+            valid_mask = valid_mask.float()
+        if valid_mask.shape[-2:] != rendered.shape[-2:]:
+            valid_mask = F.interpolate(valid_mask, rendered.shape[-2:], mode='nearest')
+        delta_xi, residual = feature_metric_solve(
+            query,
+            rendered,
+            depth_s,
+            intrinsics,
+            damping=damping,
+            valid_mask=valid_mask,
+        )
+        pose_pred = apply_pose_delta(pose_ref.float(), delta_xi.float(), scale=update_scale)
+        return delta_xi, pose_pred, residual
+
+
+def feature_metric_pose_update_loss(
+    query_feat: torch.Tensor,
+    rendered_feat: torch.Tensor,
+    depth: torch.Tensor,
+    pose_ref: torch.Tensor,
+    pose_gt: torch.Tensor,
+    intrinsics: Dict[str, float],
+    *,
+    damping: float = 1e-3,
+    valid_mask: Optional[torch.Tensor] = None,
+    normalize_features: bool = True,
+    update_scale: float = 1.0,
+    rot_weight: float = 1.0,
+    trans_weight: float = 50.0,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """Loss that trains features to produce a useful feature-metric pose update."""
+    delta_xi, pose_pred, residual = feature_metric_pose_update(
+        query_feat,
+        rendered_feat,
+        depth,
+        pose_ref,
+        intrinsics,
+        damping=damping,
+        valid_mask=valid_mask,
+        normalize_features=normalize_features,
+        update_scale=update_scale,
+    )
+    with torch.cuda.amp.autocast(enabled=False):
+        rot_cos_loss, rot_err_deg, trans_err_m = pose_error_tensors(pose_pred, pose_gt.float())
+        trans_loss = trans_err_m.mean()
+        rot_loss = rot_cos_loss.mean()
+        loss = rot_weight * rot_loss + trans_weight * trans_loss
+        delta_trans_mm = torch.linalg.norm(delta_xi[:, :3].float(), dim=1).mean() * 1000.0
+        residual_mean = residual.float().abs().mean()
+
+    return loss, {
+        'fm_pose_loss': float(loss.detach().item()),
+        'fm_rot_err_deg': float(rot_err_deg.detach().mean().item()),
+        'fm_trans_err_mm': float((trans_err_m.detach() * 1000.0).mean().item()),
+        'fm_delta_trans_mm': float(delta_trans_mm.detach().item()),
+        'fm_residual_l1': float(residual_mean.detach().item()),
+    }
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -365,14 +552,445 @@ def confidence_nll_loss(
     }
 
 
+def confidence_validity_loss(
+    confidence: torch.Tensor,
+    valid: torch.Tensor,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """Supervise solver confidence to suppress pixels without GT correspondences."""
+    with torch.cuda.amp.autocast(enabled=False):
+        if valid.ndim == 3:
+            target = valid.unsqueeze(1).float()
+        else:
+            target = valid.float()
+
+        conf = confidence.float()
+        if conf.shape[1] > 1:
+            conf = conf.mean(dim=1, keepdim=True)
+        conf = conf.clamp(min=1e-4, max=1.0 - 1e-4)
+        if target.shape[-2:] != conf.shape[-2:]:
+            target = F.interpolate(target, conf.shape[-2:], mode='nearest')
+
+        pos = target > 0.5
+        neg = ~pos
+        pos_loss = -torch.log(conf[pos]).mean() if pos.any() else conf.new_tensor(0.0)
+        neg_loss = -torch.log(1.0 - conf[neg]).mean() if neg.any() else conf.new_tensor(0.0)
+        loss = 0.5 * (pos_loss + neg_loss)
+        with torch.no_grad():
+            conf_valid = conf[pos].mean().item() if pos.any() else 0.0
+            conf_invalid = conf[neg].mean().item() if neg.any() else 0.0
+
+    return loss, {
+        'conf_valid_loss': loss.item(),
+        'conf_valid_mean': conf_valid,
+        'conf_invalid_mean': conf_invalid,
+    }
+
+
+def flow_correspondence_feature_loss(
+    rendered_feat: torch.Tensor,
+    query_feat: torch.Tensor,
+    flow_gt: torch.Tensor,
+    valid_mask: torch.Tensor,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """Align rendered features with query features at GT-flow correspondences."""
+    with torch.cuda.amp.autocast(enabled=False):
+        rendered = rendered_feat.float()
+        query = query_feat.float()
+        flow = flow_gt.float()
+        valid = valid_mask.float()
+        if valid.ndim == 3:
+            valid = valid.unsqueeze(1)
+
+        B, _, H, W = rendered.shape
+        if query.shape[-2:] != (H, W):
+            src_h, src_w = query.shape[-2:]
+            query = F.interpolate(query, (H, W), mode='bilinear', align_corners=False)
+            flow = F.interpolate(flow, (H, W), mode='bilinear', align_corners=False)
+            flow[:, 0] *= W / src_w
+            flow[:, 1] *= H / src_h
+            valid = F.interpolate(valid, (H, W), mode='nearest')
+
+        y, x = torch.meshgrid(
+            torch.arange(H, device=rendered.device, dtype=torch.float32),
+            torch.arange(W, device=rendered.device, dtype=torch.float32),
+            indexing='ij',
+        )
+        sample_x = x.unsqueeze(0) + flow[:, 0]
+        sample_y = y.unsqueeze(0) + flow[:, 1]
+        grid_x = sample_x / max(W - 1, 1) * 2.0 - 1.0
+        grid_y = sample_y / max(H - 1, 1) * 2.0 - 1.0
+        grid = torch.stack([grid_x, grid_y], dim=-1)
+
+        query_warp = F.grid_sample(
+            query,
+            grid,
+            mode='bilinear',
+            padding_mode='zeros',
+            align_corners=True,
+        )
+        q = F.normalize(query_warp, dim=1)
+        r = F.normalize(rendered, dim=1)
+        cos = (q * r).sum(dim=1, keepdim=True)
+
+        denom = valid.sum().clamp(min=1.0)
+        loss = ((1.0 - cos) * valid).sum() / denom
+        with torch.no_grad():
+            cos_mean = (cos * valid).sum() / denom
+            valid_ratio = valid.mean()
+
+    return loss, {
+        'corr_feat_loss': loss.item(),
+        'corr_feat_cos': cos_mean.item(),
+        'corr_feat_valid': valid_ratio.item(),
+    }
+
+
+def local_correlation_ce_loss(
+    model: ConcatPoseNet,
+    rendered_feat: torch.Tensor,
+    query_feat: torch.Tensor,
+    flow_gt: torch.Tensor,
+    valid_mask: torch.Tensor,
+    radius: int,
+    temperature: float = 0.1,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """Classify the GT local offset in the rendered-centered correlation window."""
+    B, _, H, W = rendered_feat.shape
+    with torch.cuda.amp.autocast(enabled=False):
+        query = query_feat.float()
+        rendered = rendered_feat.float()
+        flow = flow_gt.float()
+        valid = valid_mask.float()
+        if valid.ndim == 4:
+            valid = valid.squeeze(1)
+
+        if query.shape[-2:] != (H, W):
+            src_h, src_w = query.shape[-2:]
+            query = F.interpolate(query, (H, W), mode='bilinear', align_corners=False)
+            flow = F.interpolate(flow, (H, W), mode='bilinear', align_corners=False)
+            flow[:, 0] *= W / src_w
+            flow[:, 1] *= H / src_h
+            valid = F.interpolate(valid.unsqueeze(1), (H, W), mode='nearest').squeeze(1)
+
+        if model.proj_mode == 'shared':
+            q_proj = F.normalize(model.proj_shared(query), dim=1)
+            r_proj = F.normalize(model.proj_shared(rendered), dim=1)
+        else:
+            q_proj = F.normalize(model.proj_query(query), dim=1)
+            r_proj = F.normalize(model.proj_render(rendered), dim=1)
+
+        if model.use_cross_attention:
+            q_proj = model.cross_attn(q_proj, r_proj)
+            q_proj = F.normalize(q_proj, dim=1)
+
+        corr = local_correlation(r_proj, q_proj, radius=radius)
+        dx = torch.round(flow[:, 0]).long()
+        dy = torch.round(flow[:, 1]).long()
+        in_window = (
+            (dx >= -radius) & (dx <= radius)
+            & (dy >= -radius) & (dy <= radius)
+            & (valid > 0.5)
+        )
+        target = ((dy + radius) * (2 * radius + 1) + (dx + radius)).clamp(
+            0, (2 * radius + 1) ** 2 - 1,
+        )
+        loss_map = F.cross_entropy(
+            corr.float() / max(float(temperature), 1e-6),
+            target,
+            reduction='none',
+        )
+        denom = in_window.float().sum().clamp(min=1.0)
+        loss = (loss_map * in_window.float()).sum() / denom
+
+        with torch.no_grad():
+            pred = corr.argmax(dim=1)
+            acc = ((pred == target) & in_window).float().sum() / denom
+            coverage = in_window.float().mean()
+
+    return loss, {
+        'corr_ce_loss': loss.item(),
+        'corr_ce_acc': acc.item(),
+        'corr_ce_cov': coverage.item(),
+    }
+
+
+def local_correlation_subpixel_ce_loss_from_corr(
+    corr: torch.Tensor,
+    flow_gt: torch.Tensor,
+    valid_mask: torch.Tensor,
+    radius: int,
+    temperature: float = 0.1,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """Soft cross-entropy with bilinear subpixel targets in the local window."""
+    with torch.cuda.amp.autocast(enabled=False):
+        corr_f = corr.float()
+        flow = flow_gt.float()
+        valid = valid_mask.float()
+        if valid.ndim == 3:
+            valid = valid.unsqueeze(1)
+
+        B, channels, H, W = corr_f.shape
+        window = 2 * radius + 1
+        expected_channels = window * window
+        if channels != expected_channels:
+            raise ValueError(
+                f'corr has {channels} channels, expected {expected_channels} '
+                f'for radius={radius}'
+            )
+        if flow.shape[-2:] != (H, W):
+            src_h, src_w = flow.shape[-2:]
+            flow = F.interpolate(flow, (H, W), mode='bilinear', align_corners=False)
+            flow[:, 0] *= W / src_w
+            flow[:, 1] *= H / src_h
+            valid = F.interpolate(valid, (H, W), mode='nearest')
+        elif valid.shape[-2:] != (H, W):
+            valid = F.interpolate(valid, (H, W), mode='nearest')
+
+        log_probs = F.log_softmax(corr_f / max(float(temperature), 1e-6), dim=1)
+        fx = flow[:, 0:1]
+        fy = flow[:, 1:2]
+        x0 = torch.floor(fx)
+        y0 = torch.floor(fy)
+        x1 = x0 + 1.0
+        y1 = y0 + 1.0
+        wx1 = (fx - x0).clamp(0.0, 1.0)
+        wy1 = (fy - y0).clamp(0.0, 1.0)
+        wx0 = 1.0 - wx1
+        wy0 = 1.0 - wy1
+
+        loss_map = torch.zeros(B, 1, H, W, device=corr_f.device, dtype=corr_f.dtype)
+        target_mass = torch.zeros_like(loss_map)
+        for yy, wy in ((y0, wy0), (y1, wy1)):
+            for xx, wx in ((x0, wx0), (x1, wx1)):
+                in_bounds = (
+                    (valid > 0.5)
+                    & (xx >= -radius)
+                    & (xx <= radius)
+                    & (yy >= -radius)
+                    & (yy <= radius)
+                )
+                weight = (wx * wy) * in_bounds.float()
+                idx = ((yy.long() + radius) * window + (xx.long() + radius)).clamp(
+                    0,
+                    expected_channels - 1,
+                )
+                gathered = log_probs.gather(1, idx)
+                loss_map = loss_map - weight * gathered
+                target_mass = target_mass + weight
+
+        in_window = ((valid > 0.5) & (target_mass > 1e-6)).float()
+        denom = in_window.sum().clamp(min=1.0)
+        loss = ((loss_map / target_mass.clamp(min=1e-6)) * in_window).sum() / denom
+
+        with torch.no_grad():
+            offsets = torch.arange(-radius, radius + 1, device=corr_f.device, dtype=corr_f.dtype)
+            dy, dx = torch.meshgrid(offsets, offsets, indexing='ij')
+            dx = dx.reshape(1, expected_channels, 1, 1)
+            dy = dy.reshape(1, expected_channels, 1, 1)
+            probs = torch.softmax(corr_f / max(float(temperature), 1e-6), dim=1)
+            pred_flow = torch.cat([
+                (probs * dx).sum(dim=1, keepdim=True),
+                (probs * dy).sum(dim=1, keepdim=True),
+            ], dim=1)
+            epe_map = torch.norm(pred_flow - flow, dim=1, keepdim=True)
+            epe = (epe_map * in_window).sum() / denom
+            nearest_dx = torch.round(fx).long()
+            nearest_dy = torch.round(fy).long()
+            nearest_target = ((nearest_dy + radius) * window + (nearest_dx + radius)).clamp(
+                0,
+                expected_channels - 1,
+            )
+            pred = corr_f.argmax(dim=1, keepdim=True)
+            acc = ((pred == nearest_target) & (in_window > 0.5)).float().sum() / denom
+            coverage = in_window.mean()
+
+    return loss, {
+        'corr_subpx_ce_loss': loss.item(),
+        'corr_subpx_flow_epe': epe.item(),
+        'corr_subpx_acc': acc.item(),
+        'corr_subpx_cov': coverage.item(),
+    }
+
+
+def local_correlation_subpixel_ce_loss(
+    model: ConcatPoseNet,
+    rendered_feat: torch.Tensor,
+    query_feat: torch.Tensor,
+    flow_gt: torch.Tensor,
+    valid_mask: torch.Tensor,
+    radius: int,
+    temperature: float = 0.1,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """Train projected local correlation with a bilinear subpixel target."""
+    B, _, H, W = rendered_feat.shape
+    with torch.cuda.amp.autocast(enabled=False):
+        query = query_feat.float()
+        rendered = rendered_feat.float()
+        flow = flow_gt.float()
+        valid = valid_mask.float()
+        if valid.ndim == 4:
+            valid = valid.squeeze(1)
+
+        if query.shape[-2:] != (H, W):
+            src_h, src_w = query.shape[-2:]
+            query = F.interpolate(query, (H, W), mode='bilinear', align_corners=False)
+            flow = F.interpolate(flow, (H, W), mode='bilinear', align_corners=False)
+            flow[:, 0] *= W / src_w
+            flow[:, 1] *= H / src_h
+            valid = F.interpolate(valid.unsqueeze(1), (H, W), mode='nearest').squeeze(1)
+
+        if model.proj_mode == 'shared':
+            q_proj = F.normalize(model.proj_shared(query), dim=1)
+            r_proj = F.normalize(model.proj_shared(rendered), dim=1)
+        else:
+            q_proj = F.normalize(model.proj_query(query), dim=1)
+            r_proj = F.normalize(model.proj_render(rendered), dim=1)
+
+        if model.use_cross_attention:
+            q_proj = model.cross_attn(q_proj, r_proj)
+            q_proj = F.normalize(q_proj, dim=1)
+
+        corr = local_correlation(r_proj, q_proj, radius=radius)
+
+    return local_correlation_subpixel_ce_loss_from_corr(
+        corr,
+        flow,
+        valid,
+        radius=radius,
+        temperature=temperature,
+    )
+
+
+def local_correlation_soft_flow_loss_from_corr(
+    corr: torch.Tensor,
+    flow_gt: torch.Tensor,
+    valid_mask: torch.Tensor,
+    radius: int,
+    temperature: float = 0.1,
+    huber_delta: float = 1.0,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """Regress subpixel flow from a rendered-centered local correlation volume."""
+    with torch.cuda.amp.autocast(enabled=False):
+        corr_f = corr.float()
+        flow = flow_gt.float()
+        valid = valid_mask.float()
+        if valid.ndim == 3:
+            valid = valid.unsqueeze(1)
+
+        B, channels, H, W = corr_f.shape
+        window = 2 * radius + 1
+        expected_channels = window * window
+        if channels != expected_channels:
+            raise ValueError(
+                f'corr has {channels} channels, expected {expected_channels} '
+                f'for radius={radius}'
+            )
+        if flow.shape[-2:] != (H, W):
+            src_h, src_w = flow.shape[-2:]
+            flow = F.interpolate(flow, (H, W), mode='bilinear', align_corners=False)
+            flow[:, 0] *= W / src_w
+            flow[:, 1] *= H / src_h
+            valid = F.interpolate(valid, (H, W), mode='nearest')
+        elif valid.shape[-2:] != (H, W):
+            valid = F.interpolate(valid, (H, W), mode='nearest')
+
+        offsets = torch.arange(-radius, radius + 1, device=corr_f.device, dtype=corr_f.dtype)
+        dy, dx = torch.meshgrid(offsets, offsets, indexing='ij')
+        dx = dx.reshape(1, expected_channels, 1, 1)
+        dy = dy.reshape(1, expected_channels, 1, 1)
+
+        weights = torch.softmax(corr_f / max(float(temperature), 1e-6), dim=1)
+        pred_flow = torch.cat([
+            (weights * dx).sum(dim=1, keepdim=True),
+            (weights * dy).sum(dim=1, keepdim=True),
+        ], dim=1)
+
+        in_window = (
+            (valid > 0.5)
+            & (flow[:, :1] >= -radius)
+            & (flow[:, :1] <= radius)
+            & (flow[:, 1:2] >= -radius)
+            & (flow[:, 1:2] <= radius)
+        ).float()
+
+        diff = pred_flow - flow
+        abs_diff = diff.abs()
+        loss_map = torch.where(
+            abs_diff <= huber_delta,
+            0.5 * diff.pow(2) / max(float(huber_delta), 1e-6),
+            abs_diff - 0.5 * huber_delta,
+        )
+        denom = (in_window.sum() * 2.0).clamp(min=1.0)
+        loss = (loss_map * in_window).sum() / denom
+
+        with torch.no_grad():
+            pixel_denom = in_window.sum().clamp(min=1.0)
+            epe_map = torch.norm(diff, dim=1, keepdim=True)
+            epe = (epe_map * in_window).sum() / pixel_denom
+            coverage = in_window.mean()
+
+    return loss, {
+        'corr_flow_loss': loss.item(),
+        'corr_flow_epe': epe.item(),
+        'corr_flow_cov': coverage.item(),
+    }
+
+
+def local_correlation_soft_flow_loss(
+    model: ConcatPoseNet,
+    rendered_feat: torch.Tensor,
+    query_feat: torch.Tensor,
+    flow_gt: torch.Tensor,
+    valid_mask: torch.Tensor,
+    radius: int,
+    temperature: float = 0.1,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """Train the model's projected local correlation to encode subpixel flow."""
+    B, _, H, W = rendered_feat.shape
+    with torch.cuda.amp.autocast(enabled=False):
+        query = query_feat.float()
+        rendered = rendered_feat.float()
+        flow = flow_gt.float()
+        valid = valid_mask.float()
+        if valid.ndim == 4:
+            valid = valid.squeeze(1)
+
+        if query.shape[-2:] != (H, W):
+            src_h, src_w = query.shape[-2:]
+            query = F.interpolate(query, (H, W), mode='bilinear', align_corners=False)
+            flow = F.interpolate(flow, (H, W), mode='bilinear', align_corners=False)
+            flow[:, 0] *= W / src_w
+            flow[:, 1] *= H / src_h
+            valid = F.interpolate(valid.unsqueeze(1), (H, W), mode='nearest').squeeze(1)
+
+        if model.proj_mode == 'shared':
+            q_proj = F.normalize(model.proj_shared(query), dim=1)
+            r_proj = F.normalize(model.proj_shared(rendered), dim=1)
+        else:
+            q_proj = F.normalize(model.proj_query(query), dim=1)
+            r_proj = F.normalize(model.proj_render(rendered), dim=1)
+
+        if model.use_cross_attention:
+            q_proj = model.cross_attn(q_proj, r_proj)
+            q_proj = F.normalize(q_proj, dim=1)
+
+        corr = local_correlation(r_proj, q_proj, radius=radius)
+
+    return local_correlation_soft_flow_loss_from_corr(
+        corr,
+        flow,
+        valid,
+        radius=radius,
+        temperature=temperature,
+    )
+
+
 def feature_cosine_distance_per_sample(
     query_feat: torch.Tensor,
     rendered_feat: torch.Tensor,
 ) -> torch.Tensor:
     """Per-sample cosine distance between query and rendered feature maps."""
-    q = F.normalize(query_feat.float(), dim=1)
-    r = F.normalize(rendered_feat.float(), dim=1)
-    return 1.0 - (q * r).sum(dim=1).mean(dim=(1, 2))
+    return masked_feature_cosine_distance_per_sample(query_feat, rendered_feat)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -445,6 +1063,9 @@ class ConcatLocTrainer:
         self.vis_every = tc.get('vis_every', 10)
         self.num_vis_samples = tc.get('num_vis_samples', 4)
         self.use_amp = bool(tc.get('use_amp', True))
+        self.max_train_batches = int(tc.get('max_train_batches', 0) or 0)
+        self.max_val_batches = int(tc.get('max_val_batches', 0) or 0)
+        self.feature_only_train = bool(tc.get('feature_only_train', False))
         self.warmstart_skip_prefixes = [
             str(prefix) for prefix in tc.get('warmstart_skip_prefixes', [])
         ]
@@ -459,7 +1080,21 @@ class ConcatLocTrainer:
         self.pose_loss_mode = loss_cfg.get('pose_loss_mode', 'compose')
         self.conf_reg_weight = loss_cfg.get('conf_reg_weight', 0.01)
         self.conf_nll_weight = loss_cfg.get('conf_nll_weight', 0.0)
+        self.conf_valid_weight = loss_cfg.get('conf_valid_weight', 0.0)
         self.feat_match_weight = loss_cfg.get('feat_match_weight', 0.0)
+        self.corr_feat_weight = loss_cfg.get('corr_feat_weight', 0.0)
+        self.corr_ce_weight = loss_cfg.get('corr_ce_weight', 0.0)
+        self.corr_ce_temperature = loss_cfg.get('corr_ce_temperature', 0.1)
+        self.corr_subpixel_ce_weight = loss_cfg.get('corr_subpixel_ce_weight', 0.0)
+        self.corr_subpixel_ce_temperature = loss_cfg.get(
+            'corr_subpixel_ce_temperature',
+            self.corr_ce_temperature,
+        )
+        self.corr_flow_weight = loss_cfg.get('corr_flow_weight', 0.0)
+        self.corr_flow_temperature = loss_cfg.get(
+            'corr_flow_temperature',
+            self.corr_ce_temperature,
+        )
         self.use_direct_trans_loss = loss_cfg.get('direct_trans_loss', True)
         self.coarse_pose_weight = loss_cfg.get('coarse_pose_weight', self.pose_weight)
         self.full_pose_weight = loss_cfg.get('full_pose_weight', 0.0)
@@ -467,12 +1102,40 @@ class ConcatLocTrainer:
         self.pose_rank_margin = float(loss_cfg.get('pose_rank_margin', 0.05))
         self.pose_rank_rot_deg = float(loss_cfg.get('pose_rank_rot_deg', 2.0))
         self.pose_rank_trans_m = float(loss_cfg.get('pose_rank_trans_m', 0.25))
+        self.loc_rank_weight = float(loss_cfg.get('loc_rank_weight', 0.0))
+        loc_rank_distances = loss_cfg.get('loc_rank_distances_m', [0.01, 0.02, 0.05])
+        if isinstance(loc_rank_distances, (int, float)):
+            loc_rank_distances = [float(loc_rank_distances)]
+        self.loc_rank_distances_m = [float(v) for v in loc_rank_distances]
+        self.loc_rank_negatives = max(1, int(loss_cfg.get('loc_rank_negatives', 3)))
+        self.loc_rank_margin = float(loss_cfg.get('loc_rank_margin', 0.02))
+        self.loc_rank_margin_per_m = float(loss_cfg.get('loc_rank_margin_per_m', 0.0))
+        self.loc_rank_frame = str(loss_cfg.get('loc_rank_frame', 'camera'))
+        self.loc_rank_hard_mining = bool(loss_cfg.get('loc_rank_hard_mining', True))
+        self.loc_detach_query = bool(loss_cfg.get('loc_detach_query', True))
+        self.loc_use_projection = bool(loss_cfg.get('loc_use_projection', False))
+        self.feature_metric_weight = float(loss_cfg.get('feature_metric_weight', 0.0))
+        self.feature_metric_damping = float(loss_cfg.get('feature_metric_damping', 1e-3))
+        self.feature_metric_normalize = bool(loss_cfg.get('feature_metric_normalize', True))
+        self.feature_metric_detach_query = bool(loss_cfg.get('feature_metric_detach_query', True))
+        self.feature_metric_rot_weight = float(loss_cfg.get('feature_metric_rot_weight', 1.0))
+        self.feature_metric_trans_weight = float(loss_cfg.get('feature_metric_trans_weight', 50.0))
+        self.feature_metric_update_scale = float(loss_cfg.get('feature_metric_update_scale', 1.0))
+        self.feature_metric_eval = bool(loss_cfg.get('feature_metric_eval', self.feature_metric_weight > 0.0))
 
         # Phases
         self.phase1_epochs = tc.get('phase1_epochs', 30)
         self.map_finetune_start_epoch = int(tc.get('map_finetune_start_epoch', self.phase1_epochs))
         self.fsm_finetune_start_epoch = int(tc.get('fsm_finetune_start_epoch', self.map_finetune_start_epoch))
         self.pose_rank_start_epoch = int(tc.get('pose_rank_start_epoch', self.map_finetune_start_epoch))
+        self.loc_rank_start_epoch = int(loss_cfg.get(
+            'loc_rank_start_epoch',
+            tc.get('loc_rank_start_epoch', self.map_finetune_start_epoch),
+        ))
+        self.feature_metric_start_epoch = int(loss_cfg.get(
+            'feature_metric_start_epoch',
+            tc.get('feature_metric_start_epoch', self.map_finetune_start_epoch),
+        ))
         self._map_decoder_active = False
         self._map_fsm_active = False
 
@@ -494,6 +1157,7 @@ class ConcatLocTrainer:
         # Optional separate val noise (defaults to noise_end values)
         self.val_noise_deg = tc.get('val_noise_deg', self.noise_rot_end)
         self.val_noise_m = tc.get('val_noise_m', self.noise_trans_end)
+        self.val_seed = int(tc.get('val_seed', 12345))
 
         qc = tc.get('query_curriculum', {})
         self.query_curriculum_enabled = bool(qc.get('enabled', False))
@@ -745,9 +1409,19 @@ class ConcatLocTrainer:
     def _build_model(self):
         """Build ConcatPoseNet (trainable)."""
         mcfg = self.config.get('model', {})
+        tc = self.config.get('training', {})
         self.use_coarse = mcfg.get('use_coarse', False)
         self.use_gru = mcfg.get('use_gru', False)
         self.model = build_concat_pose_model(mcfg, self.device)
+        if bool(tc.get('freeze_pose_model', False)):
+            for param in self.model.parameters():
+                param.requires_grad_(False)
+            if bool(tc.get('train_feature_projection', False)):
+                for module_name in ('proj_shared', 'proj_query', 'proj_render', 'cross_attn'):
+                    module = getattr(self.model, module_name, None)
+                    if module is not None:
+                        for param in module.parameters():
+                            param.requires_grad_(True)
         self.use_two_stage_refine = bool(getattr(self.model, 'use_two_stage_refine', False))
 
         n_params = sum(p.numel() for p in self.model.parameters())
@@ -871,14 +1545,15 @@ class ConcatLocTrainer:
 
         tc = self.config.get('training', {})
         batch_size = tc.get('batch_size', 6)
+        num_workers = int(tc.get('num_workers', 4))
 
         self.train_loader = DataLoader(
             self.train_dataset,
             batch_size=batch_size,
             shuffle=True,
-            num_workers=4,
+            num_workers=num_workers,
             pin_memory=True,
-            persistent_workers=False,
+            persistent_workers=num_workers > 0,
             collate_fn=collate_fn,
             drop_last=True,
         )
@@ -886,7 +1561,7 @@ class ConcatLocTrainer:
             self.val_dataset,
             batch_size=min(batch_size, 6),
             shuffle=False,
-            num_workers=4,
+            num_workers=num_workers,
             pin_memory=True,
             collate_fn=collate_fn,
         )
@@ -895,6 +1570,7 @@ class ConcatLocTrainer:
                          f'{len(self.train_loader)} batches')
         self.logger.info(f'Val: {len(self.val_dataset)} samples, '
                          f'{len(self.val_loader)} batches')
+        self.logger.info(f'DataLoader workers: {num_workers}')
 
     # ── Optimizer ─────────────────────────────────────────────────────────
 
@@ -904,9 +1580,10 @@ class ConcatLocTrainer:
         lr = tc.get('lr', 3e-4)
         weight_decay = tc.get('weight_decay', 1e-5)
 
-        param_groups = [
-            {'params': self.model.parameters(), 'lr': lr},
-        ]
+        param_groups = []
+        model_params = [p for p in self.model.parameters() if p.requires_grad]
+        if model_params:
+            param_groups.append({'params': model_params, 'lr': lr})
 
         # End-to-end decoder fine-tuning at lower LR
         if getattr(self, 'finetune_decoder', False):
@@ -1134,6 +1811,7 @@ class ConcatLocTrainer:
             'fine_features': post_result['fine_features'].float(),
             'coarse_features': post_result.get('coarse_features').float() if post_result.get('coarse_features') is not None else None,
             'depth': depth,
+            'alpha': post_result.get('alpha').float() if post_result.get('alpha') is not None else torch.ones_like(depth),
             'fsm_spatial_conf': post_result.get('fsm_spatial_conf').float() if post_result.get('fsm_spatial_conf') is not None else None,
             'fsm_channel_weights': post_result.get('fsm_channel_weights').float() if post_result.get('fsm_channel_weights') is not None else None,
         }
@@ -1173,6 +1851,7 @@ class ConcatLocTrainer:
         """Render with gradient through fine_decoder for end-to-end training."""
         B = poses_w2c.shape[0]
         fine_list, depth_list = [], []
+        alpha_list = []
         coarse_list = []
         fsm_spatial_list = []
         fsm_channel_list = []
@@ -1181,6 +1860,7 @@ class ConcatLocTrainer:
             rendered_i = self._render_dcff_at_pose_differentiable(poses_w2c[i], render_coarse=render_coarse)
             fine_list.append(rendered_i['fine_features'].squeeze(0))
             depth_list.append(rendered_i['depth'].squeeze(0).squeeze(0))
+            alpha_list.append(rendered_i['alpha'].squeeze(0))
             if rendered_i['coarse_features'] is not None:
                 coarse_list.append(rendered_i['coarse_features'].squeeze(0))
             if rendered_i['fsm_spatial_conf'] is not None:
@@ -1191,6 +1871,7 @@ class ConcatLocTrainer:
         render_bundle: Dict[str, Optional[torch.Tensor]] = {
             'fine_features': torch.stack(fine_list, dim=0),
             'depth': torch.stack(depth_list, dim=0),
+            'alpha': torch.stack(alpha_list, dim=0),
             'coarse_features': torch.stack(coarse_list, dim=0) if len(coarse_list) == B else None,
             'fsm_spatial_conf': torch.stack(fsm_spatial_list, dim=0) if len(fsm_spatial_list) == B else None,
             'fsm_channel_weights': torch.stack(fsm_channel_list, dim=0) if len(fsm_channel_list) == B else None,
@@ -1305,6 +1986,163 @@ class ConcatLocTrainer:
             'pose_rank_neg_dist': neg_dist.mean().item(),
         }
 
+    def _sample_loc_rank_offsets(
+        self,
+        batch_size: int,
+        negative_index: int,
+    ) -> torch.Tensor:
+        distances = torch.tensor(
+            self.loc_rank_distances_m or [0.05],
+            device=self.device,
+            dtype=torch.float32,
+        )
+        dist_idx = torch.randint(0, distances.numel(), (batch_size,), device=self.device)
+        axes = (torch.arange(batch_size, device=self.device) + int(negative_index)) % 3
+        signs = torch.where(
+            torch.rand(batch_size, device=self.device) < 0.5,
+            -torch.ones(batch_size, device=self.device),
+            torch.ones(batch_size, device=self.device),
+        )
+        offsets = torch.zeros(batch_size, 3, device=self.device, dtype=torch.float32)
+        offsets[torch.arange(batch_size, device=self.device), axes] = signs * distances[dist_idx]
+        return offsets
+
+    @staticmethod
+    def _depth_alpha_mask(bundle: Dict[str, Optional[torch.Tensor]]) -> torch.Tensor:
+        depth = bundle['depth']
+        mask = (depth.float() > 0.05).unsqueeze(1) if depth.ndim == 3 else (depth.float() > 0.05)
+        alpha = bundle.get('alpha')
+        if alpha is not None:
+            alpha_f = alpha.float()
+            if alpha_f.ndim == 3:
+                alpha_f = alpha_f.unsqueeze(1)
+            mask = mask.float() * (alpha_f > 0.1).float()
+        return mask.float()
+
+    def _render_localization_train_bundle(
+        self,
+        poses_w2c: torch.Tensor,
+        *,
+        render_coarse: bool | None = False,
+    ) -> Dict[str, Optional[torch.Tensor]]:
+        return self._render_bundle_batch(
+            poses_w2c,
+            differentiable=bool(self._map_decoder_active or self._map_fsm_active),
+            render_coarse=render_coarse,
+        )
+
+    def _localization_feature_pair(
+        self,
+        query_fine: torch.Tensor,
+        rendered_fine: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        query = query_fine.float()
+        rendered = rendered_fine.float()
+        if query.shape[-2:] != rendered.shape[-2:]:
+            query = F.interpolate(query, rendered.shape[-2:], mode='bilinear', align_corners=False)
+        if not self.loc_use_projection:
+            return query, rendered
+        if getattr(self.model, 'proj_mode', 'separate') == 'shared':
+            query = self.model.proj_shared(query)
+            rendered = self.model.proj_shared(rendered)
+        else:
+            query = self.model.proj_query(query)
+            rendered = self.model.proj_render(rendered)
+        return F.normalize(query.float(), dim=1), F.normalize(rendered.float(), dim=1)
+
+    def _loc_cm_perturb_rank_loss(
+        self,
+        query_fine: torch.Tensor,
+        pose_gt: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """Rank GT-pose DCFF features ahead of centimetre-scale pose negatives."""
+        B = pose_gt.shape[0]
+        query = query_fine.detach() if self.loc_detach_query else query_fine
+        pos_bundle = self._render_localization_train_bundle(pose_gt, render_coarse=False)
+        pos_feat = pos_bundle['fine_features']
+        pos_mask = self._depth_alpha_mask(pos_bundle)
+        q_pos, r_pos = self._localization_feature_pair(query, pos_feat)
+        pos_dist = masked_feature_cosine_distance_per_sample(q_pos, r_pos, pos_mask)
+
+        losses = []
+        neg_dists = []
+        margins = []
+        neg_mm = []
+        for k in range(self.loc_rank_negatives):
+            offsets = self._sample_loc_rank_offsets(B, k)
+            pose_neg = perturb_w2c_camera_center(
+                pose_gt,
+                offsets,
+                frame=self.loc_rank_frame,
+            )
+            neg_bundle = self._render_localization_train_bundle(pose_neg, render_coarse=False)
+            neg_mask = pos_mask * self._depth_alpha_mask(neg_bundle)
+            q_neg, r_neg = self._localization_feature_pair(query, neg_bundle['fine_features'])
+            neg_dist = masked_feature_cosine_distance_per_sample(q_neg, r_neg, neg_mask)
+            margin = self.loc_rank_margin + self.loc_rank_margin_per_m * torch.linalg.norm(offsets, dim=1)
+            losses.append(F.relu(margin + pos_dist - neg_dist))
+            neg_dists.append(neg_dist)
+            margins.append(margin)
+            neg_mm.append(torch.linalg.norm(offsets, dim=1) * 1000.0)
+
+        loss_stack = torch.stack(losses, dim=0)
+        neg_dist_stack = torch.stack(neg_dists, dim=0)
+        margin_stack = torch.stack(margins, dim=0)
+        neg_mm_stack = torch.stack(neg_mm, dim=0)
+        if self.loc_rank_hard_mining:
+            rank_loss = loss_stack.max(dim=0).values.mean()
+            hard_idx = neg_dist_stack.argmin(dim=0, keepdim=True)
+            hard_neg_dist = neg_dist_stack.gather(0, hard_idx).squeeze(0)
+            hard_margin = margin_stack.gather(0, hard_idx).squeeze(0)
+            hard_neg_mm = neg_mm_stack.gather(0, hard_idx).squeeze(0)
+        else:
+            rank_loss = loss_stack.mean()
+            hard_neg_dist = neg_dist_stack.mean(dim=0)
+            hard_margin = margin_stack.mean(dim=0)
+            hard_neg_mm = neg_mm_stack.mean(dim=0)
+
+        with torch.no_grad():
+            rank_acc = (hard_neg_dist > pos_dist + hard_margin).float().mean()
+            gap = hard_neg_dist - pos_dist
+
+        return rank_loss, {
+            'loc_rank_loss': float(rank_loss.detach().item()),
+            'loc_rank_pos_dist': float(pos_dist.detach().mean().item()),
+            'loc_rank_neg_dist': float(hard_neg_dist.detach().mean().item()),
+            'loc_rank_gap': float(gap.detach().mean().item()),
+            'loc_rank_acc': float(rank_acc.detach().item()),
+            'loc_rank_neg_mm': float(hard_neg_mm.detach().mean().item()),
+        }
+
+    def _feature_metric_training_loss(
+        self,
+        query_fine: torch.Tensor,
+        pose_ref: torch.Tensor,
+        pose_gt: torch.Tensor,
+        intrinsics: Dict[str, float],
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        query = query_fine.detach() if self.feature_metric_detach_query else query_fine
+        bundle = self._render_localization_train_bundle(pose_ref, render_coarse=False)
+        valid_mask = self._depth_alpha_mask(bundle)
+        query_for_solve, rendered_for_solve = self._localization_feature_pair(
+            query,
+            bundle['fine_features'],
+        )
+        return feature_metric_pose_update_loss(
+            query_for_solve,
+            rendered_for_solve,
+            bundle['depth'],
+            pose_ref,
+            pose_gt,
+            intrinsics,
+            damping=self.feature_metric_damping,
+            valid_mask=valid_mask,
+            normalize_features=self.feature_metric_normalize and not self.loc_use_projection,
+            update_scale=self.feature_metric_update_scale,
+            rot_weight=self.feature_metric_rot_weight,
+            trans_weight=self.feature_metric_trans_weight,
+        )
+
     # ── Training Step ─────────────────────────────────────────────────────
 
     def _train_step(
@@ -1323,12 +2161,17 @@ class ConcatLocTrainer:
             batch, query_fine, query_coarse,
         )
         pose_gt = batch['pose_gt'].to(self.device)
-        pose_cur = batch['pose_init'].to(self.device)
+        pose_start = batch['pose_init'].to(self.device)
+        pose_cur = pose_start
 
         flow_hw = (self.render_h, self.render_w)
         render_intr = self.model._scale_intrinsics(self.render_h, self.render_w)
 
-        N = self.outer_iters_train
+        # Phase1 is pure flow pretraining.  Do not feed an untrained WLS update
+        # back into the second outer step; that makes the flow target depend on
+        # the model's own early mistakes.  Iterative closed-loop training starts
+        # once pose loss is active.
+        N = self.outer_iters_train if use_pose_loss else 1
         all_metrics = {}
         total_loss_val = 0.0
         differentiable_render = self._map_decoder_active or self._map_fsm_active
@@ -1341,6 +2184,132 @@ class ConcatLocTrainer:
                 differentiable=differentiable_render,
                 render_coarse=render_coarse,
             )
+
+        if self.feature_only_train:
+            all_metrics: Dict[str, float] = {'outer_iters_used': 0.0}
+            total_loss_val = 0.0
+            pose_start_bundle: Optional[Dict[str, Optional[torch.Tensor]]] = None
+            localization_feature_train_active = has_trainable_localization_feature_path(
+                self.model,
+                loc_use_projection=self.loc_use_projection,
+                map_decoder_active=self._map_decoder_active,
+                map_fsm_active=self._map_fsm_active,
+            )
+
+            def get_pose_start_bundle() -> Dict[str, Optional[torch.Tensor]]:
+                nonlocal pose_start_bundle
+                if pose_start_bundle is None:
+                    pose_start_bundle = self._render_localization_train_bundle(
+                        pose_start,
+                        render_coarse=False,
+                    )
+                return pose_start_bundle
+
+            if (
+                self.corr_flow_weight > 0
+                or self.corr_ce_weight > 0
+                or self.corr_subpixel_ce_weight > 0
+            ):
+                corr_bundle = get_pose_start_bundle()
+                with torch.no_grad():
+                    gt_flow, gt_valid = ConcatPoseNet.compute_gt_flow(
+                        pose_start,
+                        pose_gt,
+                        corr_bundle['depth'],
+                        flow_hw,
+                        render_intr,
+                    )
+                corr_total_loss = torch.tensor(0.0, device=self.device)
+                if self.corr_ce_weight > 0:
+                    corr_ce_loss, corr_ce_metrics = local_correlation_ce_loss(
+                        self.model,
+                        corr_bundle['fine_features'],
+                        query_fine,
+                        gt_flow,
+                        gt_valid,
+                        radius=int(getattr(self.model, 'local_radius', 4)),
+                        temperature=self.corr_ce_temperature,
+                    )
+                    corr_total_loss = corr_total_loss + self.corr_ce_weight * corr_ce_loss
+                    for k, v in corr_ce_metrics.items():
+                        all_metrics[k] = v
+                if self.corr_subpixel_ce_weight > 0:
+                    corr_subpx_loss, corr_subpx_metrics = local_correlation_subpixel_ce_loss(
+                        self.model,
+                        corr_bundle['fine_features'],
+                        query_fine,
+                        gt_flow,
+                        gt_valid,
+                        radius=int(getattr(self.model, 'local_radius', 4)),
+                        temperature=self.corr_subpixel_ce_temperature,
+                    )
+                    corr_total_loss = (
+                        corr_total_loss
+                        + self.corr_subpixel_ce_weight * corr_subpx_loss
+                    )
+                    for k, v in corr_subpx_metrics.items():
+                        all_metrics[k] = v
+                if self.corr_flow_weight > 0:
+                    corr_flow_loss, corr_flow_metrics = local_correlation_soft_flow_loss(
+                        self.model,
+                        corr_bundle['fine_features'],
+                        query_fine,
+                        gt_flow,
+                        gt_valid,
+                        radius=int(getattr(self.model, 'local_radius', 4)),
+                        temperature=self.corr_flow_temperature,
+                    )
+                    corr_total_loss = corr_total_loss + self.corr_flow_weight * corr_flow_loss
+                    for k, v in corr_flow_metrics.items():
+                        all_metrics[k] = v
+                self.scaler.scale(corr_total_loss).backward()
+                total_loss_val += corr_total_loss.item()
+
+            if localization_feature_train_active and self.feat_match_weight > 0:
+                ref_gt = self._render_localization_train_bundle(pose_gt, render_coarse=False)['fine_features']
+                ref_norm = F.normalize(ref_gt.float(), dim=1)
+                q_norm = F.normalize(query_fine.float(), dim=1)
+                cos_sim = (ref_norm * q_norm).sum(dim=1).mean()
+                feat_match_loss = 1.0 - cos_sim
+                self.scaler.scale(self.feat_match_weight * feat_match_loss).backward()
+                all_metrics['feat_match_loss'] = feat_match_loss.item()
+                all_metrics['feat_cos_sim'] = cos_sim.item()
+                total_loss_val += self.feat_match_weight * feat_match_loss.item()
+
+            if (
+                localization_feature_train_active
+                and self.loc_rank_weight > 0
+                and self.epoch >= self.loc_rank_start_epoch
+            ):
+                loc_rank_loss, loc_rank_metrics = self._loc_cm_perturb_rank_loss(
+                    query_fine,
+                    pose_gt,
+                )
+                self.scaler.scale(self.loc_rank_weight * loc_rank_loss).backward()
+                for k, v in loc_rank_metrics.items():
+                    all_metrics[k] = v
+                total_loss_val += self.loc_rank_weight * loc_rank_loss.item()
+
+            if (
+                localization_feature_train_active
+                and self.feature_metric_weight > 0
+                and self.epoch >= self.feature_metric_start_epoch
+            ):
+                fm_loss, fm_metrics = self._feature_metric_training_loss(
+                    query_fine,
+                    pose_start,
+                    pose_gt,
+                    render_intr,
+                )
+                self.scaler.scale(self.feature_metric_weight * fm_loss).backward()
+                for k, v in fm_metrics.items():
+                    all_metrics[k] = v
+                total_loss_val += self.feature_metric_weight * fm_loss.item()
+
+            all_metrics['total_loss'] = total_loss_val
+            if total_loss_val <= 0:
+                all_metrics['nan_step'] = True
+            return all_metrics
 
         for outer_i in range(N):
             iter_state = run_model_refine_iteration(
@@ -1417,6 +2386,66 @@ class ConcatLocTrainer:
                     iter_loss = iter_loss + self.conf_nll_weight * cnll_loss
                     c_metrics.update(cnll_metrics)
 
+                if self.conf_valid_weight > 0:
+                    cv_loss, cv_metrics = confidence_validity_loss(
+                        pred['confidence'], gt_valid,
+                    )
+                    iter_loss = iter_loss + self.conf_valid_weight * cv_loss
+                    c_metrics.update(cv_metrics)
+
+                if (
+                    self.corr_feat_weight > 0
+                    and (self._map_decoder_active or self._map_fsm_active)
+                    and fine_bundle.get('fine_features') is not None
+                ):
+                    corr_feat_loss, corr_feat_metrics = flow_correspondence_feature_loss(
+                        fine_bundle['fine_features'],
+                        query_fine,
+                        gt_flow,
+                        gt_valid,
+                    )
+                    iter_loss = iter_loss + self.corr_feat_weight * corr_feat_loss
+                    c_metrics.update(corr_feat_metrics)
+
+                if self.corr_ce_weight > 0 and fine_bundle.get('fine_features') is not None:
+                    corr_ce_loss, corr_ce_metrics = local_correlation_ce_loss(
+                        self.model,
+                        fine_bundle['fine_features'],
+                        query_fine,
+                        gt_flow,
+                        gt_valid,
+                        radius=int(getattr(self.model, 'local_radius', 4)),
+                        temperature=self.corr_ce_temperature,
+                    )
+                    iter_loss = iter_loss + self.corr_ce_weight * corr_ce_loss
+                    c_metrics.update(corr_ce_metrics)
+
+                if self.corr_subpixel_ce_weight > 0 and fine_bundle.get('fine_features') is not None:
+                    corr_subpx_loss, corr_subpx_metrics = local_correlation_subpixel_ce_loss(
+                        self.model,
+                        fine_bundle['fine_features'],
+                        query_fine,
+                        gt_flow,
+                        gt_valid,
+                        radius=int(getattr(self.model, 'local_radius', 4)),
+                        temperature=self.corr_subpixel_ce_temperature,
+                    )
+                    iter_loss = iter_loss + self.corr_subpixel_ce_weight * corr_subpx_loss
+                    c_metrics.update(corr_subpx_metrics)
+
+                if self.corr_flow_weight > 0 and fine_bundle.get('fine_features') is not None:
+                    corr_flow_loss, corr_flow_metrics = local_correlation_soft_flow_loss(
+                        self.model,
+                        fine_bundle['fine_features'],
+                        query_fine,
+                        gt_flow,
+                        gt_valid,
+                        radius=int(getattr(self.model, 'local_radius', 4)),
+                        temperature=self.corr_flow_temperature,
+                    )
+                    iter_loss = iter_loss + self.corr_flow_weight * corr_flow_loss
+                    c_metrics.update(corr_flow_metrics)
+
                 # Pose loss (Phase 2)
                 p_metrics = {}
                 if use_pose_loss:
@@ -1478,6 +2507,7 @@ class ConcatLocTrainer:
                 pose_cur = iter_state['pose_next'].detach()
 
         all_metrics['total_loss'] = total_loss_val / N
+        all_metrics['outer_iters_used'] = float(N)
 
         # Auxiliary feature matching loss for decoder fine-tuning
         if (self._map_decoder_active or self._map_fsm_active) and self.feat_match_weight > 0:
@@ -1506,6 +2536,36 @@ class ConcatLocTrainer:
                 all_metrics[k] = v
             all_metrics['total_loss'] += self.pose_rank_weight * rank_loss.item()
 
+        if (
+            (self._map_decoder_active or self._map_fsm_active)
+            and self.loc_rank_weight > 0
+            and self.epoch >= self.loc_rank_start_epoch
+        ):
+            loc_rank_loss, loc_rank_metrics = self._loc_cm_perturb_rank_loss(
+                query_fine,
+                pose_gt,
+            )
+            self.scaler.scale(self.loc_rank_weight * loc_rank_loss).backward()
+            for k, v in loc_rank_metrics.items():
+                all_metrics[k] = v
+            all_metrics['total_loss'] += self.loc_rank_weight * loc_rank_loss.item()
+
+        if (
+            (self._map_decoder_active or self._map_fsm_active)
+            and self.feature_metric_weight > 0
+            and self.epoch >= self.feature_metric_start_epoch
+        ):
+            fm_loss, fm_metrics = self._feature_metric_training_loss(
+                query_fine,
+                pose_start,
+                pose_gt,
+                render_intr,
+            )
+            self.scaler.scale(self.feature_metric_weight * fm_loss).backward()
+            for k, v in fm_metrics.items():
+                all_metrics[k] = v
+            all_metrics['total_loss'] += self.feature_metric_weight * fm_loss.item()
+
         return all_metrics
 
     # ── Training Epoch ────────────────────────────────────────────────────
@@ -1522,7 +2582,9 @@ class ConcatLocTrainer:
                     desc=f'Epoch {epoch}/{self.total_epochs}',
                     leave=False)
 
-        for batch in pbar:
+        for batch_idx, batch in enumerate(pbar):
+            if self.max_train_batches > 0 and batch_idx >= self.max_train_batches:
+                break
             self.optimizer.zero_grad()
             metrics = self._train_step(batch, use_pose_loss)
 
@@ -1579,7 +2641,10 @@ class ConcatLocTrainer:
 
         # Epoch averages
         avg = {k: np.mean(v) for k, v in epoch_metrics.items()}
-        phase = "Phase2(flow+pose)" if use_pose_loss else "Phase1(flow only)"
+        if self.feature_only_train:
+            phase = "Feature-only"
+        else:
+            phase = "Phase2(flow+pose)" if use_pose_loss else "Phase1(flow only)"
         msg = (f"[Train E{epoch}] {phase}  "
                f"loss={avg.get('total_loss', 0):.4f}  "
                f"flow={avg.get('flow_loss', 0):.4f}  "
@@ -1588,8 +2653,27 @@ class ConcatLocTrainer:
             msg += f"  rot={avg['rot_err_deg']:.2f}°  trans={avg['trans_err_mm']:.1f}mm"
         if 'feat_cos_sim' in avg:
             msg += f"  cos_sim={avg['feat_cos_sim']:.3f}"
-        if self.outer_iters_train > 1:
-            msg += f"  ({self.outer_iters_train} outer iters)"
+        if 'corr_feat_cos' in avg:
+            msg += f"  corr_cos={avg['corr_feat_cos']:.3f}"
+        if 'corr_ce_acc' in avg:
+            msg += f"  corr_acc={avg['corr_ce_acc']:.3f}"
+        if 'corr_subpx_flow_epe' in avg:
+            msg += f"  corr_subpx_epe={avg['corr_subpx_flow_epe']:.2f}"
+        if 'corr_flow_epe' in avg:
+            msg += f"  corr_flow_epe={avg['corr_flow_epe']:.2f}"
+        if 'loc_rank_acc' in avg:
+            msg += (
+                f"  loc_rank={avg['loc_rank_acc']:.3f}/"
+                f"gap={avg.get('loc_rank_gap', 0.0):.3f}"
+            )
+        if 'fm_trans_err_mm' in avg:
+            msg += (
+                f"  fm={avg.get('fm_rot_err_deg', 0.0):.2f}°/"
+                f"{avg['fm_trans_err_mm']:.1f}mm"
+            )
+        outer_used = int(round(float(avg.get('outer_iters_used', self.outer_iters_train))))
+        if outer_used > 1:
+            msg += f"  ({outer_used} outer iters)"
         self.logger.info(msg)
 
         return avg
@@ -1599,6 +2683,8 @@ class ConcatLocTrainer:
     @torch.no_grad()
     def validate(self, epoch: int) -> Dict[str, float]:
         """Run validation with multi-iteration refinement."""
+        np_state = np.random.get_state()
+        np.random.seed(self.val_seed)
         torch.cuda.empty_cache()
         self.model.eval()
         self._set_map_train_mode(False)
@@ -1606,6 +2692,8 @@ class ConcatLocTrainer:
         all_init_rot_errs, all_init_trans_errs = [], []
         all_one_rot_errs, all_one_trans_errs = [], []
         all_flow_epe = []
+        all_corr_flow_epe = []
+        all_fm_rot_errs, all_fm_trans_errs = [], []
         N = self.outer_iters_val
 
         flow_hw = (self.render_h, self.render_w)
@@ -1632,7 +2720,9 @@ class ConcatLocTrainer:
                 render_coarse=render_coarse,
             )
 
-        for batch in tqdm(self.val_loader, desc='Validating', leave=False):
+        for batch_idx, batch in enumerate(tqdm(self.val_loader, desc='Validating', leave=False)):
+            if self.max_val_batches > 0 and batch_idx >= self.max_val_batches:
+                break
             query_fine = batch['query_fine'].to(self.device)
             query_coarse = batch.get('query_coarse')
             if query_coarse is not None and self.use_coarse:
@@ -1641,12 +2731,39 @@ class ConcatLocTrainer:
                 query_coarse = None
             pose_gt = batch['pose_gt'].to(self.device)
             pose_cur = batch['pose_init'].to(self.device)
+            pose_init_for_eval = pose_cur
             final_state = None
             pose_after_one = None
 
             init_rot, init_trans = compute_pose_error(pose_cur, pose_gt)
             all_init_rot_errs.extend(init_rot.cpu().tolist())
             all_init_trans_errs.extend(init_trans.cpu().tolist())
+
+            if self.feature_metric_eval:
+                fm_bundle = self._render_bundle_batch(
+                    pose_init_for_eval,
+                    differentiable=False,
+                    render_coarse=False,
+                )
+                fm_mask = self._depth_alpha_mask(fm_bundle)
+                fm_query, fm_rendered = self._localization_feature_pair(
+                    query_fine,
+                    fm_bundle['fine_features'],
+                )
+                _fm_delta, fm_pose, _fm_residual = feature_metric_pose_update(
+                    fm_query,
+                    fm_rendered,
+                    fm_bundle['depth'],
+                    pose_init_for_eval,
+                    render_intr,
+                    damping=self.feature_metric_damping,
+                    valid_mask=fm_mask,
+                    normalize_features=self.feature_metric_normalize and not self.loc_use_projection,
+                    update_scale=self.feature_metric_update_scale,
+                )
+                fm_rot, fm_trans = compute_pose_error(fm_pose, pose_gt)
+                all_fm_rot_errs.extend(fm_rot.cpu().tolist())
+                all_fm_trans_errs.extend(fm_trans.cpu().tolist())
 
             # Outer iteration refinement
             for outer_i in range(N):
@@ -1684,6 +2801,18 @@ class ConcatLocTrainer:
             n_valid = gt_valid.sum().clamp(min=1.0)
             epe = (epe_map * gt_valid).sum() / n_valid
             all_flow_epe.append(epe.item())
+
+            if self.corr_flow_weight > 0 and final_state['fine_bundle'].get('fine_features') is not None:
+                _corr_loss, corr_metrics = local_correlation_soft_flow_loss(
+                    self.model,
+                    final_state['fine_bundle']['fine_features'],
+                    query_fine,
+                    gt_flow,
+                    gt_valid,
+                    radius=int(getattr(self.model, 'local_radius', 4)),
+                    temperature=self.corr_flow_temperature,
+                )
+                all_corr_flow_epe.append(float(corr_metrics.get('corr_flow_epe', 0.0)))
 
             # Pose evaluation
             if 'delta_xi' in pred:
@@ -1737,6 +2866,17 @@ class ConcatLocTrainer:
                 })
             if all_flow_epe:
                 val_metrics['val_flow_epe'] = float(np.mean(all_flow_epe))
+            if all_corr_flow_epe:
+                val_metrics['val_corr_flow_epe'] = float(np.mean(all_corr_flow_epe))
+            if all_fm_rot_errs:
+                fm_rot = np.array(all_fm_rot_errs)
+                fm_trans = np.array(all_fm_trans_errs)
+                val_metrics.update({
+                    'val_fm_rot_mean': float(np.nanmean(fm_rot)),
+                    'val_fm_rot_median': float(np.nanmedian(fm_rot)),
+                    'val_fm_trans_mean': float(np.nanmean(fm_trans)),
+                    'val_fm_trans_median': float(np.nanmedian(fm_trans)),
+                })
 
             iters_str = f'  ({N} iters)' if N > 1 else ''
             stage_str = ''
@@ -1747,6 +2887,17 @@ class ConcatLocTrainer:
                     f'  one_med={val_metrics["val_one_rot_median"]:.2f}°/'
                     f'{val_metrics["val_one_trans_median"]:.1f}mm'
                 )
+            flow_str = ''
+            if 'val_flow_epe' in val_metrics:
+                flow_str = f'  flow_epe={val_metrics["val_flow_epe"]:.2f}px'
+            if 'val_corr_flow_epe' in val_metrics:
+                flow_str += f'  corr_epe={val_metrics["val_corr_flow_epe"]:.2f}px'
+            fm_str = ''
+            if 'val_fm_trans_median' in val_metrics:
+                fm_str = (
+                    f'  fm_med={val_metrics["val_fm_rot_median"]:.2f}°/'
+                    f'{val_metrics["val_fm_trans_median"]:.1f}mm'
+                )
             self.logger.info(
                 f'[Val E{epoch}]  rot={val_metrics["val_rot_mean"]:.2f}° '
                 f'(med {val_metrics["val_rot_median"]:.2f}°)  '
@@ -1755,6 +2906,8 @@ class ConcatLocTrainer:
                 f'<1°={val_metrics["val_pct_1deg"]:.1f}%  '
                 f'joint@1°/50mm={joint_1_50:.1f}%'
                 f'{stage_str}'
+                f'{flow_str}'
+                f'{fm_str}'
                 f'{iters_str}'
             )
 
@@ -1763,6 +2916,7 @@ class ConcatLocTrainer:
 
         self.model.train()
         self._set_map_train_mode(True)
+        np.random.set_state(np_state)
         return val_metrics
 
     # ── Checkpointing ─────────────────────────────────────────────────────
@@ -1778,12 +2932,14 @@ class ConcatLocTrainer:
             'best_val_trans': self.best_val_trans,
             'config': self.config,
         }
-        if self.finetune_decoder:
-            ckpt['fine_decoder_state'] = self.dcff_renderer.fine_decoder.state_dict()
-            ckpt['feat_sharp_state'] = self.feat_sharp_fine.state_dict()
-            if self.dcff_renderer.coarse_carrier_fusion is not None:
-                ckpt['coarse_fusion_state'] = self.dcff_renderer.coarse_carrier_fusion.state_dict()
-        if self.feat_select is not None and self.finetune_fsm:
+        dcff_renderer = getattr(self, 'dcff_renderer', None)
+        if dcff_renderer is not None and getattr(dcff_renderer, 'fine_decoder', None) is not None:
+            ckpt['fine_decoder_state'] = dcff_renderer.fine_decoder.state_dict()
+            if getattr(self, 'feat_sharp_fine', None) is not None:
+                ckpt['feat_sharp_state'] = self.feat_sharp_fine.state_dict()
+            if getattr(dcff_renderer, 'coarse_carrier_fusion', None) is not None:
+                ckpt['coarse_fusion_state'] = dcff_renderer.coarse_carrier_fusion.state_dict()
+        if getattr(self, 'feat_select', None) is not None:
             ckpt['fsm_state'] = self.feat_select.state_dict()
         torch.save(ckpt, self.ckpt_dir / 'latest.pth')
         if is_best:
@@ -1827,23 +2983,27 @@ class ConcatLocTrainer:
         else:
             self.scheduler.load_state_dict(ckpt['scheduler_state_dict'])
 
-        # Restore fine-tuned decoder state if available
-        if self.finetune_decoder:
-            if 'fine_decoder_state' in ckpt:
-                self.dcff_renderer.fine_decoder.load_state_dict(
-                    ckpt['fine_decoder_state'])
-                self.logger.info('  Restored fine-tuned decoder weights')
-            if self.dcff_renderer.coarse_carrier_fusion is not None and 'coarse_fusion_state' in ckpt:
-                self.dcff_renderer.coarse_carrier_fusion.load_state_dict(
-                    ckpt['coarse_fusion_state'])
-                self.logger.info('  Restored fine-tuned coarse fusion weights')
-            if 'feat_sharp_state' in ckpt:
-                self.feat_sharp_fine.load_state_dict(
-                    ckpt['feat_sharp_state'])
-                self.logger.info('  Restored fine-tuned feat_sharp weights')
-        if self.finetune_fsm and self.feat_select is not None and 'fsm_state' in ckpt:
+        # Restore the exact DCFF feature runtime used by the checkpoint.  This
+        # matters even when the decoder/FSM are frozen in the resumed config.
+        if 'fine_decoder_state' in ckpt and hasattr(self, 'dcff_renderer'):
+            self.dcff_renderer.fine_decoder.load_state_dict(
+                ckpt['fine_decoder_state'])
+            self.logger.info('  Restored checkpoint decoder weights')
+        if (
+            'coarse_fusion_state' in ckpt
+            and hasattr(self, 'dcff_renderer')
+            and self.dcff_renderer.coarse_carrier_fusion is not None
+        ):
+            self.dcff_renderer.coarse_carrier_fusion.load_state_dict(
+                ckpt['coarse_fusion_state'])
+            self.logger.info('  Restored checkpoint coarse fusion weights')
+        if 'feat_sharp_state' in ckpt and hasattr(self, 'feat_sharp_fine'):
+            self.feat_sharp_fine.load_state_dict(
+                ckpt['feat_sharp_state'])
+            self.logger.info('  Restored checkpoint feat_sharp weights')
+        if self.feat_select is not None and 'fsm_state' in ckpt:
             self.feat_select.load_state_dict(ckpt['fsm_state'])
-            self.logger.info('  Restored fine-tuned FSM weights')
+            self.logger.info('  Restored checkpoint FSM weights')
 
         self.logger.info(f'  Resumed at epoch {self.epoch}, step {self.global_step}')
 
@@ -2184,11 +3344,14 @@ class ConcatLocTrainer:
             'val_dataset_size': len(self.val_dataset),
             'outer_iters_train': int(self.outer_iters_train),
             'outer_iters_val': int(self.outer_iters_val),
+            'max_train_batches': int(self.max_train_batches),
+            'max_val_batches': int(self.max_val_batches),
             'gru_iters': int(self.model.gru_iters),
             'use_coarse': bool(self.use_coarse),
             'use_two_stage_refine': bool(getattr(self.model, 'use_two_stage_refine', False)),
             'finetune_decoder': bool(self.finetune_decoder),
             'finetune_fsm': bool(getattr(self, 'finetune_fsm', False)),
+            'feature_only_train': bool(self.feature_only_train),
         }
         if hasattr(self, 'latest_val_metrics') and self.latest_val_metrics:
             final_metrics['latest_val'] = dict(self.latest_val_metrics)

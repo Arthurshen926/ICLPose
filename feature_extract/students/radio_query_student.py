@@ -50,9 +50,12 @@ class RadioQueryStudent(nn.Module):
         self,
         in_channels=3,
         feature_dim=64,
+        fine_feature_dim=None,
+        coarse_feature_dim=None,
         base_channels=32,
         stage_dims=(32, 64, 96, 128),
         output_hw=(68, 120),
+        coarse_output_hw=None,
         input_hw=(1088, 1920),
         dropout=0.0,
         l2_normalize=True,
@@ -71,8 +74,11 @@ class RadioQueryStudent(nn.Module):
             raise ValueError("stage_dims must have four entries")
 
         self.output_hw = tuple(output_hw) if output_hw is not None else None
+        self.coarse_output_hw = tuple(coarse_output_hw) if coarse_output_hw is not None else self.output_hw
         self.input_hw = tuple(input_hw) if input_hw is not None else None
-        self.feature_dim = feature_dim
+        self.feature_dim = int(feature_dim)
+        self.fine_feature_dim = int(fine_feature_dim) if fine_feature_dim is not None else self.feature_dim
+        self.coarse_feature_dim = int(coarse_feature_dim) if coarse_feature_dim is not None else self.feature_dim
         self.l2_normalize = l2_normalize
         self.predict_magnitude = bool(predict_magnitude)
         self.fine_init_norm = float(fine_init_norm)
@@ -111,11 +117,11 @@ class RadioQueryStudent(nn.Module):
 
         self.fine_head = nn.Sequential(
             ConvNormAct(stage_dims[3], stage_dims[2], kernel_size=3),
-            nn.Conv2d(stage_dims[2], feature_dim, kernel_size=1),
+            nn.Conv2d(stage_dims[2], self.fine_feature_dim, kernel_size=1),
         )
         self.coarse_head = nn.Sequential(
             ConvNormAct(stage_dims[3], stage_dims[2], kernel_size=3),
-            nn.Conv2d(stage_dims[2], feature_dim, kernel_size=1),
+            nn.Conv2d(stage_dims[2], self.coarse_feature_dim, kernel_size=1),
         )
         if self.predict_magnitude:
             self.fine_norm_head = nn.Conv2d(stage_dims[3], 1, kernel_size=1)
@@ -179,10 +185,12 @@ class RadioQueryStudent(nn.Module):
 
         if self.output_hw is not None:
             fine = F.interpolate(fine, self.output_hw, mode="bilinear", align_corners=False)
-            coarse = F.interpolate(coarse, self.output_hw, mode="bilinear", align_corners=False)
             if fine_mag is not None:
                 fine_mag = F.interpolate(fine_mag, self.output_hw, mode="bilinear", align_corners=False)
-                coarse_mag = F.interpolate(coarse_mag, self.output_hw, mode="bilinear", align_corners=False)
+        if self.coarse_output_hw is not None:
+            coarse = F.interpolate(coarse, self.coarse_output_hw, mode="bilinear", align_corners=False)
+            if coarse_mag is not None:
+                coarse_mag = F.interpolate(coarse_mag, self.coarse_output_hw, mode="bilinear", align_corners=False)
 
         if self.predict_magnitude:
             fine = F.normalize(fine, dim=1) * fine_mag

@@ -10,6 +10,7 @@ import math
 import os
 import sys
 from pathlib import Path
+from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -381,6 +382,19 @@ def load_model(config, checkpoint_path, device):
     return load_concat_pose_model(config, checkpoint_path, device, printer=print)
 
 
+def resolve_eval_num_workers(cli_num_workers: Optional[int], config: dict) -> int:
+    """Choose DataLoader workers for eval without overrunning small /dev/shm."""
+    if cli_num_workers is not None:
+        return int(cli_num_workers)
+    return int(config.get('training', {}).get('num_workers', 4))
+
+
+def resolve_eval_pose_update_scale(cli_pose_update_scale: Optional[float], config: dict) -> float:
+    if cli_pose_update_scale is not None:
+        return float(cli_pose_update_scale)
+    return float(config.get('model', {}).get('pose_update_scale', 1.0))
+
+
 # Shared system-layer runtime is authoritative. The legacy helpers remain in
 # this file for continuity, but actual execution uses the centralized versions.
 build_dcff = shared_build_dcff
@@ -412,6 +426,7 @@ def evaluate(model, gaussians, dcff_renderer, feat_sharp, val_loader, device,
     model.eval()
     original_gru = model.gru_iters
     model.gru_iters = gru_iters
+    update_scale = float(getattr(model, 'pose_update_scale', 1.0))
 
     render_intr = model._scale_intrinsics(render_h, render_w)
     K = intrinsics_to_K(render_intr, device)
@@ -466,13 +481,13 @@ def evaluate(model, gaussians, dcff_renderer, feat_sharp, val_loader, device,
                         reprojection_threshold=4.0,
                         n_iters=2000,
                     )
-                    T_delta = se3_exp(pnp_xi.float())
+                    T_delta = se3_exp(pnp_xi.float() * update_scale)
             elif solver == 'wls_full' and 'delta_xi_full' in pred:
                 with torch.cuda.amp.autocast(enabled=False):
-                    T_delta = se3_exp(pred['delta_xi_full'].float())
+                    T_delta = se3_exp(pred['delta_xi_full'].float() * update_scale)
             elif 'delta_xi' in pred:
                 with torch.cuda.amp.autocast(enabled=False):
-                    T_delta = se3_exp(pred['delta_xi'].float())
+                    T_delta = se3_exp(pred['delta_xi'].float() * update_scale)
             else:
                 continue
 
@@ -1467,6 +1482,10 @@ def main():
                         help='Translation noise in meters (default: 0.10)')
     parser.add_argument('--batch_size', type=int, default=4,
                         help='Batch size (default: 4)')
+    parser.add_argument('--num_workers', type=int, default=None,
+                        help='DataLoader workers. Defaults to training.num_workers from config.')
+    parser.add_argument('--pose_update_scale', type=float, default=None,
+                        help='Override model.pose_update_scale during evaluation.')
     parser.add_argument('--solver', type=str, nargs='+',
                         default=['default'],
                         choices=['default', 'wls_full', 'pnp', 'hybrid',
@@ -1529,6 +1548,7 @@ def main():
 
     # ── Load localization model ───────────────────────────────────────────
     model, ckpt_epoch = load_model(config, args.checkpoint, device)
+    model.pose_update_scale = resolve_eval_pose_update_scale(args.pose_update_scale, config)
     pose_ckpt = load_concat_pose_checkpoint(args.checkpoint, device)
     restored_map = apply_localization_map_state(
         dcff_renderer,
@@ -1544,6 +1564,7 @@ def main():
     render_w = dcff_cfg.get('render_width', 120)
     use_coarse = config.get('model', {}).get('use_coarse', True)
     ds_cfg = config['dataset']
+    num_workers = resolve_eval_num_workers(args.num_workers, config)
 
     # ── Set intrinsics on model (needed for _scale_intrinsics) ────────────
     from data.radio_loc_dataset import read_colmap_cameras, camera_params_to_intrinsics
@@ -1565,6 +1586,8 @@ def main():
     print(f'Config: {args.config}')
     print(f'Noise: {args.noise_deg}° / {args.noise_m}m')
     print(f'Render: {render_w}×{render_h}  Seeds: {args.num_seeds}')
+    print(f'DataLoader workers: {num_workers}')
+    print(f'Pose update scale: {model.pose_update_scale:.3f}')
     print(f'Solvers: {args.solver}')
     print(f'{"=" * 72}\n')
 
@@ -1976,7 +1999,9 @@ def main():
                     )
                     val_loader = DataLoader(
                         val_ds, batch_size=args.batch_size, shuffle=False,
-                        num_workers=4, pin_memory=True, collate_fn=collate_fn,
+                        num_workers=num_workers, pin_memory=True,
+                        persistent_workers=num_workers > 0,
+                        collate_fn=collate_fn,
                     )
 
                     metrics = evaluate(

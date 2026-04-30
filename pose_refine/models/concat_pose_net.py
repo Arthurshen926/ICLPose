@@ -45,9 +45,7 @@ def local_correlation(fmap1: torch.Tensor, fmap2: torch.Tensor,
 def guided_local_correlation(fmap1: torch.Tensor, fmap2: torch.Tensor,
                              flow: torch.Tensor, radius: int = 4
                              ) -> torch.Tensor:
-    """Warp fmap2 by current flow, then local correlation.
-    Centers the search window on the predicted correspondence.
-    """
+    """Local correlation centered at each pixel's current flow estimate."""
     B, C, H, W = fmap1.shape
     device = fmap1.device
     grid_y, grid_x = torch.meshgrid(
@@ -57,12 +55,24 @@ def guided_local_correlation(fmap1: torch.Tensor, fmap2: torch.Tensor,
     )
     grid_x = grid_x.unsqueeze(0).expand(B, -1, -1)
     grid_y = grid_y.unsqueeze(0).expand(B, -1, -1)
-    warp_x = (grid_x + flow[:, 0]) / max(W - 1, 1) * 2.0 - 1.0
-    warp_y = (grid_y + flow[:, 1]) / max(H - 1, 1) * 2.0 - 1.0
-    grid = torch.stack([warp_x, warp_y], dim=-1)
-    warped = F.grid_sample(
-        fmap2, grid, mode='bilinear', padding_mode='zeros', align_corners=True)
-    return local_correlation(fmap1, warped, radius=radius)
+    base_x = grid_x + flow[:, 0]
+    base_y = grid_y + flow[:, 1]
+
+    corrs = []
+    for dy in range(-radius, radius + 1):
+        for dx in range(-radius, radius + 1):
+            sample_x = (base_x + dx) / max(W - 1, 1) * 2.0 - 1.0
+            sample_y = (base_y + dy) / max(H - 1, 1) * 2.0 - 1.0
+            sample_grid = torch.stack([sample_x, sample_y], dim=-1)
+            sampled = F.grid_sample(
+                fmap2,
+                sample_grid,
+                mode='bilinear',
+                padding_mode='zeros',
+                align_corners=True,
+            )
+            corrs.append((fmap1 * sampled).sum(dim=1))
+    return torch.stack(corrs, dim=1).contiguous()
 
 
 # ======================================================================
@@ -335,6 +345,7 @@ class ConcatPoseNet(nn.Module):
         coarse_stage_dropout: float = 0.1,
         coarse_stage_pool_hw: int = 4,
         coarse_stage_use_fsm: bool = True,
+        pose_update_scale: float = 1.0,
     ):
         super().__init__()
         self.feature_dim = feature_dim
@@ -356,6 +367,7 @@ class ConcatPoseNet(nn.Module):
         self.use_cross_attention = use_cross_attention
         self.use_two_stage_refine = use_two_stage_refine
         self.coarse_only_first_iter = coarse_only_first_iter
+        self.pose_update_scale = float(pose_update_scale)
 
         self.coarse_pose_stage = None
         if self.use_two_stage_refine:

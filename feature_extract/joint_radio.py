@@ -31,6 +31,7 @@ DEFAULT_JOINT_RADIO_CONFIG: Dict = {
         "patch_size": 16,
         "input_hw": [1088, 1920],
         "feature_hw": [68, 120],
+        "coarse_feature_hw": None,
         "cache_teacher": False,
         "fallback_val_ratio": 0.1,
         "max_train_samples": None,
@@ -39,6 +40,8 @@ DEFAULT_JOINT_RADIO_CONFIG: Dict = {
     },
     "model": {
         "feature_dim": 64,
+        "fine_feature_dim": None,
+        "coarse_feature_dim": None,
         "base_channels": 32,
         "stage_dims": [32, 64, 96, 128],
         "dropout": 0.0,
@@ -73,6 +76,7 @@ DEFAULT_JOINT_RADIO_CONFIG: Dict = {
         "query_teacher_infonce_weight": 0.0,
         "infonce_temperature": 0.07,
         "infonce_samples": 256,
+        "infonce_cross_batch": False,
     },
     "retrieval": {
         "enabled": False,
@@ -98,6 +102,7 @@ DEFAULT_JOINT_RADIO_CONFIG: Dict = {
         "map_lr_scale": 0.1,
         "hash_mlp_lr_scale": 0.05,
         "train_fine_decoder": False,
+        "train_coarse_fusion": False,
         "train_feat_sharp": False,
         "train_hash_mlp": False,
         "detach_query_features": False,
@@ -106,9 +111,19 @@ DEFAULT_JOINT_RADIO_CONFIG: Dict = {
         "query_fine_weight": 0.0,
         "query_fine_raw_weight": 0.0,
         "query_coarse_weight": 0.0,
+        "query_fine_infonce_weight": 0.0,
+        "query_coarse_infonce_weight": 0.0,
         "rendered_teacher_fine_weight": 0.0,
         "rendered_teacher_fine_raw_weight": 0.0,
         "rendered_teacher_coarse_weight": 0.0,
+        "rendered_teacher_fine_infonce_weight": 0.0,
+        "rendered_teacher_coarse_infonce_weight": 0.0,
+        "infonce_cross_batch": True,
+        "variance_target_std": 0.05,
+        "query_variance_weight": 0.0,
+        "map_variance_weight": 0.0,
+        "query_covariance_weight": 0.0,
+        "map_covariance_weight": 0.0,
     },
     "visualization": {
         "num_val_vis": 4,
@@ -179,8 +194,12 @@ class TeacherFeatureStore:
             raise RuntimeError(f"No paired teacher features found in {self.feature_dir}")
 
         sample = safe_torch_load(self.fine_files[self.indices[0]]).float()
-        self.feature_dim = int(sample.shape[0])
+        coarse_sample = safe_torch_load(self.coarse_files[self.indices[0]]).float()
+        self.fine_feature_dim = int(sample.shape[0])
+        self.coarse_feature_dim = int(coarse_sample.shape[0])
+        self.feature_dim = self.fine_feature_dim
         self.feature_hw = (int(sample.shape[1]), int(sample.shape[2]))
+        self.coarse_feature_hw = (int(coarse_sample.shape[1]), int(coarse_sample.shape[2]))
         self.cache_in_memory = cache_in_memory
         self._cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
 

@@ -130,10 +130,17 @@ def add_pose_noise(
     rot_deg: float,
     trans_m: float,
 ) -> np.ndarray:
-    """Add random SE(3) perturbation to a w2c pose.
+    """Add random camera-centre/rotation perturbation to a w2c pose.
 
     Rotation noise: random axis-angle with magnitude ~ N(0, rot_deg) degrees.
-    Translation noise: isotropic Gaussian with std = trans_m meters.
+    Translation noise: isotropic Gaussian camera-centre offset in world metres.
+
+    COLMAP stores ``w2c`` as ``X_cam = R X_world + t`` with camera centre
+    ``C = -R^T t``.  Adding noise directly to ``t`` makes the measured
+    camera-centre error depend on the scene coordinate magnitude and couples a
+    small rotation perturbation into a large apparent translation error.  Keep
+    the noise in the metric space used by evaluation instead: rotate the camera
+    orientation, perturb ``C`` in world coordinates, then recompute ``t``.
 
     Args:
         pose_w2c: (4, 4) world-to-camera matrix
@@ -143,7 +150,7 @@ def add_pose_noise(
     Returns:
         (4, 4) noisy w2c pose
     """
-    noisy = pose_w2c.copy()
+    pose = np.asarray(pose_w2c, dtype=np.float64)
 
     # Rotation noise via axis-angle
     angle = np.random.randn() * (rot_deg * np.pi / 180.0)
@@ -155,12 +162,19 @@ def add_pose_noise(
         [-axis[1], axis[0], 0],
     ])
     R_noise = np.eye(3) + np.sin(angle) * K + (1 - np.cos(angle)) * (K @ K)
-    noisy[:3, :3] = R_noise @ pose_w2c[:3, :3]
 
-    # Translation noise
-    noisy[:3, 3] = pose_w2c[:3, 3] + np.random.randn(3) * trans_m
+    R_gt = pose[:3, :3]
+    t_gt = pose[:3, 3]
+    C_gt = -(R_gt.T @ t_gt)
 
-    return noisy
+    R_noisy = R_noise @ R_gt
+    C_noisy = C_gt + np.random.randn(3) * trans_m
+
+    noisy = pose.copy()
+    noisy[:3, :3] = R_noisy
+    noisy[:3, 3] = -(R_noisy @ C_noisy)
+
+    return noisy.astype(pose_w2c.dtype, copy=False)
 
 
 def camera_params_to_intrinsics(

@@ -1,0 +1,126 @@
+exp_name: concat_loc_cambridge_oldhospital_processed_locguided_dcff_stagea_projfm_v6
+output_dir: /root/ICLPose/result/pose_refine
+
+dataset:
+  feature_dir: /root/ICLPose/result/feature_extract/features_radio_dual/cambridge_oldhospital_processed
+  colmap_dir: /hy-tmp/Cambridge_stdloc/OldHospital/sparse/0
+  source_dir: /hy-tmp/Cambridge_stdloc/OldHospital
+  train_split: /hy-tmp/Cambridge_stdloc/OldHospital/dataset_train.txt
+  test_split: /hy-tmp/Cambridge_stdloc/OldHospital/dataset_test.txt
+  fine_hw: [68, 120]
+  coarse_hw: [68, 120]
+  cache_in_memory: true
+
+dcff:
+  checkpoint: /root/ICLPose/result/feature_field/dcff_cambridge_oldhospital_processed_cached64_v10_fine_stable_4gpu/checkpoints/best.pth
+  ply_path: /root/ICLPose/result/feature_field/dcff_cambridge_oldhospital_processed_cached64_v10_fine_stable_4gpu/checkpoints/best.ply
+  feature_dim: 64
+  latent_dim: 64
+  render_width: 120
+  render_height: 68
+  finetune_decoder: false
+  finetune_fsm: false
+  coarse_smoothing_kernel: 1
+
+model:
+  feature_dim: 64
+  hidden_dim: 256
+  irls_iters: 2
+  robust_kernel: huber
+  use_coarse: false
+  use_gru: true
+  gru_iters: 8
+  local_radius: 4
+  proj_dim: 32
+  proj_mode: shared
+  full_wls: true
+  flow_init: small
+  coarse_flow_init: true
+  coarse_pool_factor: 4
+  detach_trans: false
+  detach_wls_rot: false
+  rot_mode: wls
+  use_two_stage_refine: false
+  pose_update_scale: 0.0
+
+training:
+  epochs: 30
+  batch_size: 24
+  num_workers: 0
+  use_amp: false
+  freeze_pose_model: true
+  train_feature_projection: true
+  feature_only_train: true
+  lr: 1.0e-4
+  decoder_lr: 0.0
+  weight_decay: 1.0e-5
+  grad_clip: 1.0
+
+  noise_curriculum:
+    rot_start_deg: 1.0
+    rot_end_deg: 1.0
+    trans_start_m: 0.05
+    trans_end_m: 0.05
+    warmup_epochs: 1
+    rot_min_deg: 0.05
+    trans_min_m: 0.005
+
+  val_noise_deg: 1.0
+  val_noise_m: 0.05
+  val_seed: 12345
+
+  loss:
+    flow_weight: 0.0
+    pose_weight: 0.0
+    pose_loss_mode: compose
+    rot_loss_type: cosine
+    trans_weight: 20.0
+    conf_reg_weight: 0.0
+    conf_nll_weight: 0.0
+    conf_valid_weight: 0.0
+    direct_trans_loss: false
+
+    feat_match_weight: 0.0
+    corr_feat_weight: 0.0
+    corr_ce_weight: 0.0
+    corr_ce_temperature: 0.07
+    corr_flow_weight: 5.0
+    corr_flow_temperature: 0.05
+
+    pose_rank_weight: 0.0
+    loc_rank_weight: 5.0
+    loc_rank_start_epoch: 0
+    loc_rank_distances_m: [0.01, 0.02, 0.05, 0.10]
+    loc_rank_negatives: 3
+    loc_rank_margin: 0.001
+    loc_rank_margin_per_m: 0.0
+    loc_rank_frame: camera
+    loc_rank_hard_mining: true
+    loc_detach_query: true
+    loc_use_projection: true
+
+    feature_metric_weight: 1.0
+    feature_metric_start_epoch: 0
+    feature_metric_damping: 0.01
+    feature_metric_normalize: true
+    feature_metric_detach_query: true
+    feature_metric_rot_weight: 0.5
+    feature_metric_trans_weight: 50.0
+    feature_metric_update_scale: 0.25
+    feature_metric_eval: true
+
+  phase1_epochs: 999
+  map_finetune_start_epoch: 999
+  fsm_finetune_start_epoch: 999
+  pose_rank_start_epoch: 999
+  outer_iters_train: 1
+  outer_iters_val: 1
+
+  val_every: 1
+  save_every: 1
+  save_epoch_checkpoints: false
+  vis_every: 0
+  num_vis_samples: 0
+
+renderer:
+  longest_edge: 640

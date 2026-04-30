@@ -147,6 +147,81 @@ class SpatialFineDecoder(nn.Module):
         return self.decoder(z_map)
 
 
+def _group_norm_groups(channels: int) -> int:
+    for groups in (16, 8, 4, 2):
+        if channels % groups == 0:
+            return groups
+    return 1
+
+
+class ResidualSpatialBlock(nn.Module):
+    """Small residual conv block for preserving high-frequency feature detail."""
+
+    def __init__(self, channels: int, dilation: int = 1):
+        super().__init__()
+        padding = int(dilation)
+        groups = _group_norm_groups(channels)
+        self.block = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, padding=padding, dilation=dilation),
+            nn.GroupNorm(groups, channels),
+            nn.GELU(),
+            nn.Conv2d(channels, channels, 3, padding=1),
+            nn.GroupNorm(groups, channels),
+        )
+        self.act = nn.GELU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.act(x + self.block(x))
+
+
+class ResidualSpatialFineDecoder(nn.Module):
+    """Higher-capacity fine decoder with residual 3x3 spatial context."""
+
+    def __init__(
+        self,
+        latent_dim: int = 32,
+        feature_dim: int = 64,
+        hidden_dim: int = 192,
+        num_blocks: int = 3,
+        use_viewdirs: bool = False,
+        view_degree: int = 2,
+    ):
+        super().__init__()
+        self.use_viewdirs = use_viewdirs
+        self.view_degree = view_degree
+        self.view_dim = 0 if not use_viewdirs else sum(2 * order + 1 for order in range(view_degree + 1))
+        input_dim = latent_dim + self.view_dim
+        groups = _group_norm_groups(hidden_dim)
+
+        self.stem = nn.Sequential(
+            nn.Conv2d(input_dim, hidden_dim, 3, padding=1),
+            nn.GroupNorm(groups, hidden_dim),
+            nn.GELU(),
+        )
+        dilations = [1, 2, 1, 2]
+        self.blocks = nn.Sequential(*[
+            ResidualSpatialBlock(hidden_dim, dilation=dilations[i % len(dilations)])
+            for i in range(max(1, int(num_blocks)))
+        ])
+        self.head = nn.Conv2d(hidden_dim, feature_dim, 1)
+
+        n_params = sum(p.numel() for p in self.parameters())
+        mode = 'latent+view' if use_viewdirs else 'latent-only'
+        print(
+            f"  [ResidualSpatialFineDecoder] mode={mode}, input={input_dim}d, "
+            f"hidden={hidden_dim}, blocks={max(1, int(num_blocks))}, params={n_params:,}"
+        )
+
+    def forward(self, z_map: torch.Tensor, view_dir_map: torch.Tensor = None) -> torch.Tensor:
+        if self.use_viewdirs:
+            if view_dir_map is None:
+                raise ValueError("ResidualSpatialFineDecoder requires view_dir_map when use_viewdirs=True")
+            z_map = torch.cat([z_map, view_dir_map], dim=1)
+        x = self.stem(z_map)
+        x = self.blocks(x)
+        return self.head(x)
+
+
 class CarrierResidualCoarseFusion(nn.Module):
     """Carrier-conditioned residual on top of the implicit coarse field.
 
@@ -303,6 +378,15 @@ class DeferredCascadedRenderer(nn.Module):
                 latent_dim=self.fine_latent_dim,
                 feature_dim=fine_feature_dim,
                 hidden_dim=fine_hidden_dim or 128,
+                use_viewdirs=fine_use_viewdirs,
+                view_degree=fine_view_degree,
+            )
+        elif fine_decoder_type == 'residual_spatial':
+            self.fine_decoder = ResidualSpatialFineDecoder(
+                latent_dim=self.fine_latent_dim,
+                feature_dim=fine_feature_dim,
+                hidden_dim=fine_hidden_dim or 192,
+                num_blocks=fine_num_layers,
                 use_viewdirs=fine_use_viewdirs,
                 view_degree=fine_view_degree,
             )

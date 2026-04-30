@@ -45,6 +45,27 @@ def test_extract_project_teacher_batch_respects_microbatch_and_concatenates():
     assert losses["compress_total"].requires_grad is False
 
 
+def test_extract_project_teacher_batch_can_skip_bottleneck_reconstruction_loss():
+    from feature_field.train_impl import _extract_project_teacher_batch
+
+    teacher = FakeTeacher()
+    images = torch.arange(3 * 3 * 4 * 4, dtype=torch.float32).reshape(3, 3, 4, 4)
+
+    fine, coarse, losses = _extract_project_teacher_batch(
+        teacher=teacher,
+        teacher_images=images,
+        teacher_mode="online_bottleneck",
+        micro_batch=2,
+        return_compression_loss=False,
+    )
+
+    assert teacher.extract_sizes == [2, 1]
+    assert tuple(fine.shape) == (3, 2, 2, 2)
+    assert tuple(coarse.shape) == (3, 3, 2, 2)
+    assert losses == {}
+
+
 if __name__ == "__main__":
     test_extract_project_teacher_batch_respects_microbatch_and_concatenates()
+    test_extract_project_teacher_batch_can_skip_bottleneck_reconstruction_loss()
     print("teacher_microbatch tests passed")
