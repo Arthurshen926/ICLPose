@@ -434,6 +434,8 @@ class OnlineQueryStudentProvider:
             fine_init_norm=float(model_cfg.get("fine_init_norm", 1.0)),
             coarse_init_norm=float(model_cfg.get("coarse_init_norm", 1.0)),
             magnitude_min=float(model_cfg.get("magnitude_min", 1e-4)),
+            fine_low_level_skip=bool(model_cfg.get("fine_low_level_skip", False)),
+            fine_low_level_init=float(model_cfg.get("fine_low_level_init", 0.0)),
         ).to(self.device)
         ckpt = safe_torch_load(checkpoint_path, map_location="cpu")
         self.model.load_state_dict(ckpt["model_state_dict"], strict=True)

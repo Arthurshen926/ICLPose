@@ -672,17 +672,7 @@ def local_correlation_ce_loss(
             flow[:, 1] *= H / src_h
             valid = F.interpolate(valid.unsqueeze(1), (H, W), mode='nearest').squeeze(1)
 
-        if model.proj_mode == 'shared':
-            q_proj = F.normalize(model.proj_shared(query), dim=1)
-            r_proj = F.normalize(model.proj_shared(rendered), dim=1)
-        else:
-            q_proj = F.normalize(model.proj_query(query), dim=1)
-            r_proj = F.normalize(model.proj_render(rendered), dim=1)
-
-        if model.use_cross_attention:
-            q_proj = model.cross_attn(q_proj, r_proj)
-            q_proj = F.normalize(q_proj, dim=1)
-
+        q_proj, r_proj = model._project_for_local_corr(query, rendered)
         corr = local_correlation(r_proj, q_proj, radius=radius)
         dx = torch.round(flow[:, 0]).long()
         dy = torch.round(flow[:, 1]).long()
@@ -839,17 +829,7 @@ def local_correlation_subpixel_ce_loss(
             flow[:, 1] *= H / src_h
             valid = F.interpolate(valid.unsqueeze(1), (H, W), mode='nearest').squeeze(1)
 
-        if model.proj_mode == 'shared':
-            q_proj = F.normalize(model.proj_shared(query), dim=1)
-            r_proj = F.normalize(model.proj_shared(rendered), dim=1)
-        else:
-            q_proj = F.normalize(model.proj_query(query), dim=1)
-            r_proj = F.normalize(model.proj_render(rendered), dim=1)
-
-        if model.use_cross_attention:
-            q_proj = model.cross_attn(q_proj, r_proj)
-            q_proj = F.normalize(q_proj, dim=1)
-
+        q_proj, r_proj = model._project_for_local_corr(query, rendered)
         corr = local_correlation(r_proj, q_proj, radius=radius)
 
     return local_correlation_subpixel_ce_loss_from_corr(
@@ -963,17 +943,7 @@ def local_correlation_soft_flow_loss(
             flow[:, 1] *= H / src_h
             valid = F.interpolate(valid.unsqueeze(1), (H, W), mode='nearest').squeeze(1)
 
-        if model.proj_mode == 'shared':
-            q_proj = F.normalize(model.proj_shared(query), dim=1)
-            r_proj = F.normalize(model.proj_shared(rendered), dim=1)
-        else:
-            q_proj = F.normalize(model.proj_query(query), dim=1)
-            r_proj = F.normalize(model.proj_render(rendered), dim=1)
-
-        if model.use_cross_attention:
-            q_proj = model.cross_attn(q_proj, r_proj)
-            q_proj = F.normalize(q_proj, dim=1)
-
+        q_proj, r_proj = model._project_for_local_corr(query, rendered)
         corr = local_correlation(r_proj, q_proj, radius=radius)
 
     return local_correlation_soft_flow_loss_from_corr(
@@ -2042,13 +2012,7 @@ class ConcatLocTrainer:
             query = F.interpolate(query, rendered.shape[-2:], mode='bilinear', align_corners=False)
         if not self.loc_use_projection:
             return query, rendered
-        if getattr(self.model, 'proj_mode', 'separate') == 'shared':
-            query = self.model.proj_shared(query)
-            rendered = self.model.proj_shared(rendered)
-        else:
-            query = self.model.proj_query(query)
-            rendered = self.model.proj_render(rendered)
-        return F.normalize(query.float(), dim=1), F.normalize(rendered.float(), dim=1)
+        return self.model._project_for_local_corr(query, rendered)
 
     def _loc_cm_perturb_rank_loss(
         self,

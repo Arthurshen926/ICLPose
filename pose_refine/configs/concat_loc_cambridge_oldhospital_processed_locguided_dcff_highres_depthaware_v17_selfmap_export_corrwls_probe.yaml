@@ -1,0 +1,102 @@
+exp_name: concat_loc_cambridge_oldhospital_processed_locguided_dcff_highres_depthaware_v17_selfmap_export_corrwls_probe
+output_dir: /root/ICLPose/result/pose_refine
+
+dataset:
+  feature_dir: /root/ICLPose/result/feature_extract/features_query_depthaware_v17_selfmap_s2highres/cambridge_oldhospital_processed
+  colmap_dir: /hy-tmp/Cambridge_stdloc/OldHospital/sparse/0
+  source_dir: /hy-tmp/Cambridge_stdloc/OldHospital
+  train_split: /hy-tmp/Cambridge_stdloc/OldHospital/dataset_train.txt
+  test_split: /hy-tmp/Cambridge_stdloc/OldHospital/dataset_test.txt
+  fine_hw: [272, 480]
+  coarse_hw: [68, 120]
+  cache_in_memory: false
+
+dcff:
+  checkpoint: /root/ICLPose/result/feature_field/dcff_cambridge_oldhospital_processed_cached64_v10_fine_stable_4gpu/checkpoints/best.pth
+  ply_path: /root/ICLPose/result/feature_field/dcff_cambridge_oldhospital_processed_cached64_v10_fine_stable_4gpu/checkpoints/best.ply
+  joint_checkpoint: /root/ICLPose/result/feature_extract/joint_radio_dcff_cambridge_oldhospital_processed_pca64_depthaware_v17_selfmap_s2highres_zero_fm/checkpoints/best.pth
+  joint_override_components: [fine_decoder, feat_sharp, fsm]
+  feature_dim: 64
+  latent_dim: 64
+  render_width: 480
+  render_height: 272
+  finetune_decoder: false
+  finetune_fsm: false
+  coarse_smoothing_kernel: 1
+
+model:
+  feature_dim: 64
+  hidden_dim: 64
+  irls_iters: 0
+  robust_kernel: huber
+  use_coarse: false
+  use_gru: false
+  use_corr_wls: true
+  local_radius: 8
+  proj_dim: 64
+  proj_mode: shared_linear
+  corr_wls_temperature: 0.04
+  full_wls: true
+  detach_trans: false
+  detach_wls_rot: false
+  rot_mode: wls
+  use_two_stage_refine: false
+  pose_update_scale: 1.0
+
+training:
+  epochs: 4
+  batch_size: 1
+  num_workers: 0
+  use_amp: true
+  lr: 1.0e-4
+  min_lr: 1.0e-6
+  decoder_lr: 0.0
+  weight_decay: 1.0e-5
+  grad_clip: 1.0
+  max_train_batches: 80
+  max_val_batches: 80
+
+  noise_curriculum:
+    rot_start_deg: 1.0
+    rot_end_deg: 1.0
+    trans_start_m: 0.05
+    trans_end_m: 0.05
+    warmup_epochs: 1
+
+  val_noise_deg: 1.0
+  val_noise_m: 0.05
+  val_seed: 12345
+
+  loss:
+    flow_weight: 20.0
+    pose_weight: 0.1
+    pose_loss_mode: compose
+    rot_loss_type: cosine
+    trans_weight: 20.0
+    conf_reg_weight: 0.0
+    conf_nll_weight: 0.0
+    conf_valid_weight: 0.0
+    direct_trans_loss: false
+    corr_ce_weight: 0.25
+    corr_ce_temperature: 0.04
+    corr_subpixel_ce_weight: 4.0
+    corr_subpixel_ce_temperature: 0.04
+    corr_flow_weight: 4.0
+    corr_flow_temperature: 0.04
+    feature_metric_weight: 0.0
+    feature_metric_eval: false
+
+  phase1_epochs: 0
+  map_finetune_start_epoch: 999
+  fsm_finetune_start_epoch: 999
+  outer_iters_train: 1
+  outer_iters_val: 1
+
+  val_every: 1
+  save_every: 1
+  save_epoch_checkpoints: false
+  vis_every: 0
+  num_vis_samples: 0
+
+renderer:
+  longest_edge: 640

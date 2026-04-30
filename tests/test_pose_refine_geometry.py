@@ -11,7 +11,12 @@ import torch.nn.functional as F
 import numpy as np
 
 from data.radio_loc_dataset import add_pose_noise
-from pose_refine.models.concat_pose_net import guided_local_correlation, local_correlation
+from pose_refine.models.concat_pose_net import (
+    ConcatPoseNet,
+    guided_local_correlation,
+    local_correlation,
+    soft_argmax_flow_from_correlation,
+)
 from pose_refine.runtime import apply_pose_delta
 from pose_refine.sparse_init import _solve_pnp
 from pose_refine.train_impl import (
@@ -101,6 +106,23 @@ def test_wls_recovers_render_to_query_flow_update():
     xi_pred = diff_pose_solve(flow, confidence, Ju, Jv, valid, damping=1e-6)
 
     assert torch.allclose(xi_pred, xi_true, atol=2e-4, rtol=2e-3)
+
+
+def test_image_jacobian_accepts_batched_intrinsics():
+    depth = torch.ones(2, 4, 5)
+    intrinsics = torch.tensor(
+        [
+            [10.0, 12.0, 2.0, 1.5],
+            [20.0, 24.0, 2.0, 1.5],
+        ]
+    )
+
+    Ju, Jv, valid = compute_image_jacobian(depth, intrinsics)
+
+    assert Ju.shape == (2, 20, 6)
+    assert Jv.shape == (2, 20, 6)
+    assert valid.all()
+    assert torch.isclose(Ju[1, 0, 0], 2.0 * Ju[0, 0, 0])
 
 
 def test_feature_metric_step_has_forward_translation_sign():
@@ -214,6 +236,70 @@ def test_local_correlation_soft_flow_loss_recovers_subpixel_offset():
 
     assert loss.item() < 1e-6
     assert metrics["corr_flow_epe"] < 1e-4
+
+
+def test_soft_argmax_flow_from_correlation_recovers_subpixel_offset():
+    radius = 2
+    window = 2 * radius + 1
+    temperature = 0.2
+    corr = torch.full((1, window * window, 1, 1), -40.0)
+
+    def set_prob(dy: int, dx: int, prob: float) -> None:
+        idx = (dy + radius) * window + (dx + radius)
+        corr[0, idx, 0, 0] = torch.log(torch.tensor(prob)) * temperature
+
+    set_prob(-1, 1, 0.375)
+    set_prob(0, 1, 0.375)
+    set_prob(-1, 2, 0.125)
+    set_prob(0, 2, 0.125)
+
+    flow = soft_argmax_flow_from_correlation(corr, radius=radius, temperature=temperature)
+
+    assert torch.allclose(flow, torch.tensor([[[[1.25]], [[-0.5]]]]), atol=1e-4)
+
+
+def test_corr_wls_mode_predicts_flow_from_local_match_peak():
+    height, width = 4, 8
+    channels = height * width
+    rendered = torch.zeros(1, channels, height, width)
+    query = torch.zeros_like(rendered)
+    flow_dy, flow_dx = 1, -2
+    for y in range(height):
+        for x in range(width):
+            c = y * width + x
+            rendered[0, c, y, x] = 1.0
+            yq, xq = y + flow_dy, x + flow_dx
+            if 0 <= yq < height and 0 <= xq < width:
+                query[0, c, yq, xq] = 1.0
+
+    model = ConcatPoseNet(
+        feature_dim=channels,
+        use_corr_wls=True,
+        local_radius=2,
+        corr_wls_temperature=0.01,
+        proj_mode="identity",
+        full_wls=True,
+    )
+    ConcatPoseNet.BASE_INTRINSICS = {
+        "fx": 50.0,
+        "fy": 50.0,
+        "cx": (width - 1) / 2.0,
+        "cy": (height - 1) / 2.0,
+    }
+    ConcatPoseNet.IMG_HW = (height, width)
+
+    pred = model(
+        query,
+        rendered,
+        torch.ones(1, height, width),
+        ConcatPoseNet.BASE_INTRINSICS,
+    )
+
+    assert pred["flow"].shape == (1, 2, height, width)
+    assert pred["confidence"].shape == (1, 2, height, width)
+    expected_flow = torch.tensor([flow_dx, flow_dy], dtype=pred["flow"].dtype)
+    assert torch.allclose(pred["flow"][0, :, 2, 3], expected_flow, atol=1e-3)
+    assert pred["delta_xi"].shape == (1, 6)
 
 
 def test_local_correlation_subpixel_ce_loss_recovers_soft_target_offset():
@@ -390,11 +476,14 @@ if __name__ == "__main__":
     test_render_centered_correlation_matches_render_to_query_flow()
     test_guided_correlation_centers_offsets_on_same_pixel_flow()
     test_wls_recovers_render_to_query_flow_update()
+    test_image_jacobian_accepts_batched_intrinsics()
     test_feature_metric_step_has_forward_translation_sign()
     test_pose_noise_rotation_preserves_camera_center()
     test_camera_center_perturbation_preserves_rotation_and_metric_offset()
     test_masked_feature_distance_prefers_aligned_render()
     test_local_correlation_soft_flow_loss_recovers_subpixel_offset()
+    test_soft_argmax_flow_from_correlation_recovers_subpixel_offset()
+    test_corr_wls_mode_predicts_flow_from_local_match_peak()
     test_local_correlation_subpixel_ce_loss_recovers_soft_target_offset()
     test_apply_pose_delta_zero_scale_keeps_pose_fixed()
     test_projection_only_path_enables_localization_feature_losses()

@@ -3,6 +3,7 @@ output_dir: /root/ICLPose/result/feature_extract
 
 dataset:
   source_dir: /hy-tmp/Cambridge_stdloc/OldHospital/processed
+  colmap_dir: /hy-tmp/Cambridge_stdloc/OldHospital/sparse/0
   feature_dir: /root/ICLPose/result/feature_extract/features_radio_adaptive_v7/cambridge_oldhospital_processed
   train_split: /hy-tmp/Cambridge_stdloc/OldHospital/dataset_train.txt
   val_split: /hy-tmp/Cambridge_stdloc/OldHospital/dataset_test.txt

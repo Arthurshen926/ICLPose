@@ -34,22 +34,52 @@ def compute_image_jacobian(
     B, H, W = depth.shape
     N = H * W
     device = depth.device
+    dtype = depth.dtype
 
-    fx = intrinsics['fx']
-    fy = intrinsics['fy']
-    cx = intrinsics['cx']
-    cy = intrinsics['cy']
+    def _as_batched_intrinsic(value):
+        value_t = torch.as_tensor(value, device=device, dtype=dtype)
+        if value_t.ndim == 0:
+            return value_t.view(1, 1, 1).expand(B, H, W)
+        if value_t.ndim == 1:
+            if value_t.numel() == 1:
+                return value_t.view(1, 1, 1).expand(B, H, W)
+            if value_t.numel() != B:
+                raise ValueError(f"Batched intrinsics must have B={B} values, got {value_t.numel()}")
+            return value_t.view(B, 1, 1).expand(B, H, W)
+        if value_t.shape == (B, 1, 1):
+            return value_t.expand(B, H, W)
+        if value_t.shape == (B, H, W):
+            return value_t
+        raise ValueError(f"Unsupported intrinsic tensor shape {tuple(value_t.shape)} for B,H,W={(B, H, W)}")
+
+    if isinstance(intrinsics, torch.Tensor):
+        intr_t = intrinsics.to(device=device, dtype=dtype)
+        if intr_t.ndim == 1:
+            intr_t = intr_t.view(1, 4).expand(B, -1)
+        if intr_t.ndim != 2 or intr_t.shape[1] != 4:
+            raise ValueError(f"Tensor intrinsics must have shape (4,) or (B,4), got {tuple(intr_t.shape)}")
+        if intr_t.shape[0] == 1 and B > 1:
+            intr_t = intr_t.expand(B, -1)
+        if intr_t.shape[0] != B:
+            raise ValueError(f"Tensor intrinsics batch {intr_t.shape[0]} does not match depth batch {B}")
+        fx = _as_batched_intrinsic(intr_t[:, 0])
+        fy = _as_batched_intrinsic(intr_t[:, 1])
+        cx = _as_batched_intrinsic(intr_t[:, 2])
+        cy = _as_batched_intrinsic(intr_t[:, 3])
+    else:
+        fx = _as_batched_intrinsic(intrinsics['fx'])
+        fy = _as_batched_intrinsic(intrinsics['fy'])
+        cx = _as_batched_intrinsic(intrinsics['cx'])
+        cy = _as_batched_intrinsic(intrinsics['cy'])
 
     v_coords, u_coords = torch.meshgrid(
-        torch.arange(H, device=device, dtype=torch.float32),
-        torch.arange(W, device=device, dtype=torch.float32),
+        torch.arange(H, device=device, dtype=dtype),
+        torch.arange(W, device=device, dtype=dtype),
         indexing='ij'
     )
 
-    x = (u_coords - cx) / fx  # (H, W)
-    y = (v_coords - cy) / fy
-    x = x.unsqueeze(0).expand(B, -1, -1)  # (B, H, W)
-    y = y.unsqueeze(0).expand(B, -1, -1)
+    x = (u_coords.unsqueeze(0) - cx) / fx.clamp(min=1e-6)  # (B, H, W)
+    y = (v_coords.unsqueeze(0) - cy) / fy.clamp(min=1e-6)
 
     Z = depth.clamp(min=0.05)
     inv_Z = 1.0 / Z

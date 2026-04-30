@@ -73,6 +73,19 @@ def build_colmap_name_to_id(colmap_dir: str | None, records: list[dict]) -> dict
     return mapping
 
 
+def apply_export_feature_dims(cfg: dict, teacher_store: TeacherFeatureStore) -> None:
+    cfg.setdefault("model", {})
+    cfg.setdefault("dataset", {})
+    cfg["model"]["fine_feature_dim"] = int(cfg["model"].get("fine_feature_dim") or teacher_store.fine_feature_dim)
+    cfg["model"]["coarse_feature_dim"] = int(cfg["model"].get("coarse_feature_dim") or teacher_store.coarse_feature_dim)
+    cfg["dataset"]["teacher_feature_hw"] = list(teacher_store.feature_hw)
+    cfg["dataset"]["teacher_coarse_feature_hw"] = list(teacher_store.coarse_feature_hw)
+    cfg["dataset"]["feature_hw"] = list(cfg["dataset"].get("student_feature_hw") or teacher_store.feature_hw)
+    cfg["dataset"]["coarse_feature_hw"] = list(
+        cfg["dataset"].get("student_coarse_feature_hw") or teacher_store.coarse_feature_hw
+    )
+
+
 def build_model(cfg: dict, checkpoint: dict, device: torch.device) -> RadioQueryStudent:
     retrieval_cfg = cfg.get("retrieval", {})
     retrieval_dim = None
@@ -107,6 +120,29 @@ def build_model(cfg: dict, checkpoint: dict, device: torch.device) -> RadioQuery
         retrieval_hidden_dim=retrieval_hidden_dim,
         retrieval_dropout=retrieval_dropout,
         retrieval_l2_normalize=retrieval_l2_normalize,
+        fine_low_level_skip=bool(cfg["model"].get("fine_low_level_skip", False)),
+        fine_low_level_init=float(cfg["model"].get("fine_low_level_init", 0.0)),
+        fine_highres_skip=bool(cfg["model"].get("fine_highres_skip", False)),
+        fine_highres_source=str(cfg["model"].get("fine_highres_source", "stage2")),
+        fine_highres_init=float(cfg["model"].get("fine_highres_init", 0.0)),
+        fine_highres_zero_init=bool(cfg["model"].get("fine_highres_zero_init", False)),
+        fine_loc_head=bool(cfg["model"].get("fine_loc_head", False)),
+        fine_loc_init=float(cfg["model"].get("fine_loc_init", 1.0)),
+        fine_loc_zero_init=bool(cfg["model"].get("fine_loc_zero_init", True)),
+        fine_loc_detach_base=bool(cfg["model"].get("fine_loc_detach_base", False)),
+        fine_loc_highres_source=cfg["model"].get("fine_loc_highres_source"),
+        fine_loc_highres_init=float(cfg["model"].get("fine_loc_highres_init", 1.0)),
+        fine_loc_highres_zero_init=bool(cfg["model"].get("fine_loc_highres_zero_init", True)),
+        fine_loc_highres_detach=bool(cfg["model"].get("fine_loc_highres_detach", True)),
+        teacher_fine_condition=bool(cfg["model"].get("teacher_fine_condition", False)),
+        teacher_fine_init=float(cfg["model"].get("teacher_fine_init", 1.0)),
+        teacher_fine_zero_init=bool(cfg["model"].get("teacher_fine_zero_init", True)),
+        teacher_fine_detach=bool(cfg["model"].get("teacher_fine_detach", True)),
+        scene_coord_head=bool(cfg["model"].get("scene_coord_head", False)),
+        scene_coord_zero_init=bool(cfg["model"].get("scene_coord_zero_init", True)),
+        scene_coord_detach_base=bool(cfg["model"].get("scene_coord_detach_base", False)),
+        scene_coord_use_pixel_grid=bool(cfg["model"].get("scene_coord_use_pixel_grid", False)),
+        scene_coord_global_context=bool(cfg["model"].get("scene_coord_global_context", False)),
     ).to(device)
     model.load_state_dict(checkpoint["model_state_dict"], strict=True)
     model.eval()
@@ -135,11 +171,7 @@ def main() -> None:
         cfg["dataset"]["feature_dir"],
         cache_in_memory=bool(cfg["dataset"].get("cache_teacher", False)),
     )
-    cfg.setdefault("model", {})
-    cfg["model"]["fine_feature_dim"] = int(cfg["model"].get("fine_feature_dim") or teacher_store.fine_feature_dim)
-    cfg["model"]["coarse_feature_dim"] = int(cfg["model"].get("coarse_feature_dim") or teacher_store.coarse_feature_dim)
-    cfg["dataset"]["feature_hw"] = list(teacher_store.feature_hw)
-    cfg["dataset"]["coarse_feature_hw"] = list(teacher_store.coarse_feature_hw)
+    apply_export_feature_dims(cfg, teacher_store)
     records = select_records(cfg, teacher_store, args.split, args.limit)
     if not records:
         raise RuntimeError("No records selected for export")
@@ -174,6 +206,12 @@ def main() -> None:
 
     checkpoint = safe_torch_load(args.checkpoint)
     model = build_model(cfg, checkpoint, device)
+    fine_key = str(
+        cfg.get("export", {}).get(
+            "fine_key",
+            cfg.get("model", {}).get("export_fine_key", "fine"),
+        )
+    )
 
     output_dir = Path(args.output_dir)
     fine_dir = output_dir / "fine_geo"
@@ -191,9 +229,14 @@ def main() -> None:
         teacher_indices = batch["teacher_idx"]
         sample_names = batch["sample_name"]
         with torch.autocast(device_type=device.type, enabled=use_amp):
-            pred = model(rgb)
+            if bool(cfg["model"].get("teacher_fine_condition", False)):
+                pred = model(rgb, teacher_fine=batch.get("teacher_fine").to(device, non_blocking=True))
+            else:
+                pred = model(rgb)
 
-        fine = pred["fine"].detach().float().cpu()
+        if fine_key not in pred:
+            raise KeyError(f"export fine_key={fine_key!r} not found in model outputs")
+        fine = pred[fine_key].detach().float().cpu()
         coarse = pred["coarse"].detach().float().cpu()
         retrieval = pred.get("retrieval")
         if retrieval is not None:
@@ -245,6 +288,12 @@ def main() -> None:
         "colmap_dir": str(Path(args.colmap_dir).resolve()) if args.colmap_dir else cfg["dataset"].get("colmap_dir"),
         "feature_hw": list(cfg["dataset"]["feature_hw"]),
         "coarse_feature_hw": list(cfg["dataset"].get("coarse_feature_hw") or cfg["dataset"]["feature_hw"]),
+        "teacher_feature_hw": list(cfg["dataset"].get("teacher_feature_hw") or cfg["dataset"]["feature_hw"]),
+        "teacher_coarse_feature_hw": list(
+            cfg["dataset"].get("teacher_coarse_feature_hw")
+            or cfg["dataset"].get("coarse_feature_hw")
+            or cfg["dataset"]["feature_hw"]
+        ),
         "feature_dim": int(cfg["model"]["feature_dim"]),
         "fine_feature_dim": int(cfg["model"].get("fine_feature_dim") or cfg["model"]["feature_dim"]),
         "coarse_feature_dim": int(cfg["model"].get("coarse_feature_dim") or cfg["model"]["feature_dim"]),

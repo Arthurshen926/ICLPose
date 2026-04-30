@@ -9,6 +9,7 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
+from data.radio_loc_dataset import read_colmap_images
 from feature_field.utils.project_config import load_joint_radio_config
 
 
@@ -177,6 +178,115 @@ def discover_images(source_dir: str | Path, patterns: list[str]) -> list[Path]:
     return []
 
 
+def _normalize_record_name(name: str | Path) -> str:
+    return Path(str(name).replace("\\", "/")).as_posix()
+
+
+def _candidate_record_names(name: str | Path) -> list[str]:
+    norm = _normalize_record_name(name)
+    candidates = [norm]
+    if norm.startswith("images/"):
+        candidates.append(norm[len("images/"):])
+    candidates.append(Path(norm).name)
+    stem = str(Path(norm).with_suffix(""))
+    candidates.append(stem)
+    seen = set()
+    ordered = []
+    for item in candidates:
+        if item and item not in seen:
+            ordered.append(item)
+            seen.add(item)
+    return ordered
+
+
+def infer_colmap_dir_from_dataset(dataset_cfg: Dict) -> str | None:
+    explicit = dataset_cfg.get("colmap_dir")
+    if explicit:
+        return explicit
+    source_dir = Path(dataset_cfg.get("source_dir", ""))
+    candidates = [
+        source_dir / "sparse" / "0",
+        source_dir.parent / "sparse" / "0",
+    ]
+    for candidate in candidates:
+        if (candidate / "images.bin").is_file():
+            return str(candidate)
+    return None
+
+
+def load_image_id_to_name(dataset_cfg: Dict) -> dict[int, str] | None:
+    if dataset_cfg.get("image_id_to_name"):
+        return {int(k): _normalize_record_name(v) for k, v in dataset_cfg["image_id_to_name"].items()}
+    colmap_dir = infer_colmap_dir_from_dataset(dataset_cfg)
+    if not colmap_dir:
+        return None
+    images_bin = Path(colmap_dir) / "images.bin"
+    if not images_bin.is_file():
+        return None
+    images = read_colmap_images(str(images_bin))
+    return {int(image_id): _normalize_record_name(meta.name) for image_id, meta in images.items()}
+
+
+def build_records_from_feature_ids(
+    dataset_cfg: Dict,
+    teacher_indices,
+    image_id_to_name: dict[int, str] | None = None,
+) -> list[dict]:
+    images = discover_images(dataset_cfg["source_dir"], dataset_cfg["image_patterns"])
+    if not images:
+        return []
+
+    source_dir = Path(dataset_cfg["source_dir"])
+    name_to_path = {}
+    for image_path in images:
+        rel_name = _normalize_record_name(image_path.relative_to(source_dir))
+        for key in _candidate_record_names(rel_name):
+            name_to_path.setdefault(key, (image_path, rel_name))
+
+    records = []
+    if image_id_to_name:
+        normalized_id_to_name = {
+            int(image_id): _normalize_record_name(name)
+            for image_id, name in image_id_to_name.items()
+        }
+        for teacher_idx in teacher_indices:
+            image_name = normalized_id_to_name.get(int(teacher_idx))
+            if image_name is None:
+                continue
+            match = None
+            for key in _candidate_record_names(image_name):
+                if key in name_to_path:
+                    match = name_to_path[key]
+                    break
+            if match is None:
+                continue
+            image_path, rel_name = match
+            records.append(
+                {
+                    "teacher_idx": int(teacher_idx),
+                    "image_path": str(image_path),
+                    "sample_name": rel_name,
+                    "normalized_name": rel_name.replace("\\", "/"),
+                }
+            )
+        return records
+
+    for teacher_idx in teacher_indices:
+        if teacher_idx >= len(images):
+            continue
+        image_path = images[teacher_idx]
+        rel_name = _normalize_record_name(image_path.relative_to(source_dir))
+        records.append(
+            {
+                "teacher_idx": int(teacher_idx),
+                "image_path": str(image_path),
+                "sample_name": rel_name,
+                "normalized_name": rel_name.replace("\\", "/"),
+            }
+        )
+    return records
+
+
 class TeacherFeatureStore:
     def __init__(self, feature_dir: str | Path, cache_in_memory: bool = False):
         self.feature_dir = Path(feature_dir)
@@ -265,27 +375,23 @@ class RetrievalTeacherStore:
 
 
 def build_all_records(dataset_cfg: Dict, teacher_store: TeacherFeatureStore, allow_synthetic: bool = False) -> list[dict]:
+    image_id_to_name = load_image_id_to_name(dataset_cfg)
+    records = build_records_from_feature_ids(dataset_cfg, teacher_store.indices, image_id_to_name)
+    if records:
+        return records
+
     images = discover_images(dataset_cfg["source_dir"], dataset_cfg["image_patterns"])
-    records = []
     if images:
-        for teacher_idx in teacher_store.indices:
-            if teacher_idx >= len(images):
-                continue
-            image_path = images[teacher_idx]
-            rel_name = image_path.relative_to(dataset_cfg["source_dir"]).as_posix()
-            records.append(
-                {
-                    "teacher_idx": teacher_idx,
-                    "image_path": str(image_path),
-                    "sample_name": rel_name,
-                    "normalized_name": rel_name.replace("\\", "/"),
-                }
-            )
+        raise RuntimeError(
+            "No teacher feature ids could be matched to RGB images. "
+            "Check dataset.colmap_dir/image_id_to_name and feature cache filenames."
+        )
     elif allow_synthetic:
+        records = []
         for teacher_idx in teacher_store.indices:
             records.append(
                 {
-                    "teacher_idx": teacher_idx,
+                    "teacher_idx": int(teacher_idx),
                     "image_path": None,
                     "sample_name": f"synthetic_{teacher_idx:05d}",
                     "normalized_name": f"synthetic_{teacher_idx:05d}",

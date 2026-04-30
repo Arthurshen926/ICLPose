@@ -34,12 +34,16 @@ def local_correlation(fmap1: torch.Tensor, fmap2: torch.Tensor,
         corr: (B, (2r+1)^2, H, W)
     """
     B, C, H, W = fmap1.shape
-    d = 2 * radius + 1
+    radius = int(radius)
     fmap2_pad = F.pad(fmap2, [radius] * 4, mode='constant', value=0)
-    fmap2_unfold = fmap2_pad.unfold(2, d, 1).unfold(3, d, 1)
-    fmap2_unfold = fmap2_unfold.reshape(B, C, H, W, d * d)
-    corr = torch.einsum('bchw,bchwn->bhwn', fmap1, fmap2_unfold)
-    return corr.permute(0, 3, 1, 2).contiguous()
+    corrs = []
+    for dy in range(-radius, radius + 1):
+        y0 = dy + radius
+        for dx in range(-radius, radius + 1):
+            x0 = dx + radius
+            sampled = fmap2_pad[:, :, y0:y0 + H, x0:x0 + W]
+            corrs.append((fmap1 * sampled).sum(dim=1))
+    return torch.stack(corrs, dim=1).contiguous()
 
 
 def guided_local_correlation(fmap1: torch.Tensor, fmap2: torch.Tensor,
@@ -73,6 +77,34 @@ def guided_local_correlation(fmap1: torch.Tensor, fmap2: torch.Tensor,
             )
             corrs.append((fmap1 * sampled).sum(dim=1))
     return torch.stack(corrs, dim=1).contiguous()
+
+
+def soft_argmax_flow_from_correlation(
+    corr: torch.Tensor,
+    radius: int = 4,
+    temperature: float = 0.05,
+) -> torch.Tensor:
+    """Convert a rendered-centered local correlation volume to subpixel flow."""
+    B, channels, H, W = corr.shape
+    window = 2 * int(radius) + 1
+    expected_channels = window * window
+    if channels != expected_channels:
+        raise ValueError(
+            f"corr has {channels} channels, expected {expected_channels} "
+            f"for radius={radius}"
+        )
+    offsets = torch.arange(-int(radius), int(radius) + 1, device=corr.device, dtype=corr.dtype)
+    dy, dx = torch.meshgrid(offsets, offsets, indexing="ij")
+    dx = dx.reshape(1, expected_channels, 1, 1)
+    dy = dy.reshape(1, expected_channels, 1, 1)
+    probs = torch.softmax(corr.float() / max(float(temperature), 1e-6), dim=1).to(corr.dtype)
+    return torch.cat(
+        [
+            (probs * dx).sum(dim=1, keepdim=True),
+            (probs * dy).sum(dim=1, keepdim=True),
+        ],
+        dim=1,
+    ).reshape(B, 2, H, W)
 
 
 # ======================================================================
@@ -309,9 +341,11 @@ class ConcatPoseNet(nn.Module):
         use_coarse: bool = False,
         # GRU mode
         use_gru: bool = False,
+        use_corr_wls: bool = False,
         gru_iters: int = 8,
         local_radius: int = 4,
         proj_dim: int = 32,
+        corr_wls_temperature: float = 0.04,
         coarse_flow_init: bool = False,
         coarse_pool_factor: int = 4,
         # Projection mode: 'separate' (legacy), 'shared' (shared+GroupNorm)
@@ -353,8 +387,10 @@ class ConcatPoseNet(nn.Module):
         self.robust_kernel = robust_kernel
         self.use_coarse = use_coarse
         self.use_gru = use_gru
+        self.use_corr_wls = use_corr_wls
         self.gru_iters = gru_iters
         self.local_radius = local_radius
+        self.corr_wls_temperature = float(corr_wls_temperature)
         self.coarse_flow_init = coarse_flow_init
         self.coarse_pool_factor = coarse_pool_factor
         self.proj_mode = proj_mode
@@ -368,6 +404,9 @@ class ConcatPoseNet(nn.Module):
         self.use_two_stage_refine = use_two_stage_refine
         self.coarse_only_first_iter = coarse_only_first_iter
         self.pose_update_scale = float(pose_update_scale)
+
+        if self.use_corr_wls and not self.full_wls:
+            raise ValueError("use_corr_wls requires full_wls=True")
 
         self.coarse_pose_stage = None
         if self.use_two_stage_refine:
@@ -386,17 +425,24 @@ class ConcatPoseNet(nn.Module):
         in_channels = feature_dim * 2 + 3   # 64+64+1(depth)+2(pos) = 131
         feat_ch = hidden_dim // 2            # 128
 
-        if use_gru:
-            # -- GRU mode components --
+        if use_gru or use_corr_wls:
+            # -- Projection components for local matching --
             corr_channels = (2 * local_radius + 1) ** 2   # 81
 
-            if proj_mode == 'shared':
+            if proj_mode == 'identity':
+                pass
+            elif proj_mode == 'shared':
                 # Shared projection: same weights for query and render features.
                 # Uses GroupNorm (batch-independent) instead of BatchNorm.
                 self.proj_shared = nn.Sequential(
                     nn.Conv2d(feature_dim, proj_dim, 1, bias=False),
                     nn.GroupNorm(min(8, proj_dim), proj_dim),
                 )
+            elif proj_mode == 'shared_linear':
+                # Shared linear projection without normalization; when
+                # feature_dim == proj_dim it is initialized as an identity map
+                # so training starts from the raw DCFF descriptor geometry.
+                self.proj_shared = nn.Conv2d(feature_dim, proj_dim, 1, bias=False)
             else:
                 # Legacy separate projections (kept for backward compatibility)
                 self.proj_query = nn.Sequential(
@@ -408,6 +454,8 @@ class ConcatPoseNet(nn.Module):
                     nn.BatchNorm2d(proj_dim),
                 )
 
+        if use_gru:
+            # -- GRU mode components --
             # Context encoder -> GRU hidden state init
             self.context_encoder = nn.Sequential(
                 nn.Conv2d(in_channels, hidden_dim, 3, padding=1, bias=False),
@@ -454,6 +502,11 @@ class ConcatPoseNet(nn.Module):
                     downsample=cross_attn_downsample,
                     dropout=cross_attn_dropout,
                 )
+        elif use_corr_wls:
+            # -- Lightweight depth-aware correlation consumer --
+            # No dense CNN/GRU head: projected DCFF features must themselves
+            # produce a local match peak; depth/Jacobian converts it to SE(3).
+            pass
         else:
             # -- Concat mode components --
             self.encoder = nn.Sequential(
@@ -526,14 +579,15 @@ class ConcatPoseNet(nn.Module):
             if self.use_gru:
                 nn.init.zeros_(self.gru_flow_head[-1].weight)
                 nn.init.zeros_(self.gru_flow_head[-1].bias)
-            else:
+            elif hasattr(self, 'flow_head'):
                 nn.init.zeros_(self.flow_head.weight)
                 nn.init.zeros_(self.flow_head.bias)
         elif self.flow_init == 'small':
             # Small non-zero init: breaks zero-gradient trap without destabilizing WLS
-            target = self.gru_flow_head[-1] if self.use_gru else self.flow_head
-            nn.init.normal_(target.weight, std=0.01)
-            nn.init.zeros_(target.bias)
+            target = self.gru_flow_head[-1] if self.use_gru else getattr(self, 'flow_head', None)
+            if target is not None:
+                nn.init.normal_(target.weight, std=0.01)
+                nn.init.zeros_(target.bias)
         # 'kaiming' leaves the default kaiming init from the loop above
         if not self.full_wls:
             nn.init.zeros_(self.trans_fc[-1].weight)
@@ -544,6 +598,19 @@ class ConcatPoseNet(nn.Module):
         if self.coarse_pose_stage is not None:
             nn.init.zeros_(self.coarse_pose_stage.head[-1].weight)
             nn.init.zeros_(self.coarse_pose_stage.head[-1].bias)
+        if (
+            self.proj_mode == 'shared_linear'
+            and hasattr(self, 'proj_shared')
+            and isinstance(self.proj_shared, nn.Conv2d)
+            and self.proj_shared.weight.shape[0] == self.proj_shared.weight.shape[1]
+        ):
+            nn.init.zeros_(self.proj_shared.weight)
+            eye = torch.eye(
+                self.proj_shared.weight.shape[0],
+                device=self.proj_shared.weight.device,
+                dtype=self.proj_shared.weight.dtype,
+            )
+            self.proj_shared.weight.data[:, :, 0, 0].copy_(eye)
 
     def _scale_intrinsics(self, target_h: int, target_w: int) -> Dict[str, float]:
         if self.BASE_INTRINSICS is None:
@@ -654,7 +721,11 @@ class ConcatPoseNet(nn.Module):
 
     def forward(self, query_fine, rendered_fine, depth, intrinsics,
                 irls_iters=None, robust_kernel=None, query_coarse=None):
-        if self.use_gru:
+        if self.use_corr_wls:
+            return self._forward_corr_wls(
+                query_fine, rendered_fine, depth, intrinsics,
+                irls_iters, robust_kernel, query_coarse)
+        elif self.use_gru:
             return self._forward_gru(
                 query_fine, rendered_fine, depth, intrinsics,
                 irls_iters, robust_kernel, query_coarse)
@@ -681,6 +752,56 @@ class ConcatPoseNet(nn.Module):
             'confidence': confidence,
         }
 
+    def _project_for_local_corr(self, query_fine, rendered_fine):
+        if self.proj_mode == 'identity':
+            q_proj = F.normalize(query_fine, dim=1)
+            r_proj = F.normalize(rendered_fine, dim=1)
+        elif self.proj_mode in ('shared', 'shared_linear'):
+            q_proj = F.normalize(self.proj_shared(query_fine), dim=1)
+            r_proj = F.normalize(self.proj_shared(rendered_fine), dim=1)
+        else:
+            q_proj = F.normalize(self.proj_query(query_fine), dim=1)
+            r_proj = F.normalize(self.proj_render(rendered_fine), dim=1)
+        if self.use_cross_attention:
+            q_proj = self.cross_attn(q_proj, r_proj)
+            q_proj = F.normalize(q_proj, dim=1)
+        return q_proj, r_proj
+
+    def _forward_corr_wls(self, query_fine, rendered_fine, depth, intrinsics,
+                          irls_iters, robust_kernel, query_coarse):
+        if query_fine.shape[-2:] != rendered_fine.shape[-2:]:
+            query_fine = F.interpolate(
+                query_fine,
+                rendered_fine.shape[-2:],
+                mode='bilinear',
+                align_corners=False,
+            )
+
+        q_proj, r_proj = self._project_for_local_corr(query_fine, rendered_fine)
+        corr = local_correlation(r_proj, q_proj, self.local_radius)
+        flow = soft_argmax_flow_from_correlation(
+            corr,
+            radius=self.local_radius,
+            temperature=self.corr_wls_temperature,
+        )
+        probs = torch.softmax(
+            corr.float() / max(float(self.corr_wls_temperature), 1e-6),
+            dim=1,
+        )
+        confidence = probs.max(dim=1, keepdim=True).values.to(flow.dtype)
+        confidence = confidence.expand(-1, 2, -1, -1).contiguous()
+
+        delta_xi, delta_xi_full = self._solve_and_regress(
+            flow, confidence, depth, intrinsics, r_proj,
+            query_coarse, irls_iters, robust_kernel)
+        return {
+            'delta_xi': delta_xi,
+            'delta_xi_full': delta_xi_full,
+            'flow': flow,
+            'confidence': confidence,
+            'corr': corr,
+        }
+
     def _forward_gru(self, query_fine, rendered_fine, depth, intrinsics,
                      irls_iters, robust_kernel, query_coarse):
         B, _, H, W = query_fine.shape
@@ -695,17 +816,7 @@ class ConcatPoseNet(nn.Module):
         # produced the inverse/query-indexed match, which is especially harmful
         # for translation because the downstream WLS/PnP solvers consume
         # rendered-indexed depth.
-        if self.proj_mode == 'shared':
-            q_proj = F.normalize(self.proj_shared(query_fine), dim=1)
-            r_proj = F.normalize(self.proj_shared(rendered_fine), dim=1)
-        else:
-            q_proj = F.normalize(self.proj_query(query_fine), dim=1)
-            r_proj = F.normalize(self.proj_render(rendered_fine), dim=1)
-
-        # Cross-attention: enrich query with global context from rendered map
-        if self.use_cross_attention:
-            q_proj = self.cross_attn(q_proj, r_proj)
-            q_proj = F.normalize(q_proj, dim=1)
+        q_proj, r_proj = self._project_for_local_corr(query_fine, rendered_fine)
 
         # Context -> initial GRU hidden state
         ctx_input = self._make_context_input(

@@ -17,12 +17,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from data.radio_loc_dataset import RadioLocDataset, collate_fn, read_colmap_cameras
 from feature_field import build_dcff_runtime, intrinsics_to_K, render_feature_bundle_batch
+from pose_refine.models.concat_pose_net import (
+    ConcatPoseNet,
+    local_correlation,
+    soft_argmax_flow_from_correlation,
+)
 from pose_refine.runtime import build_concat_pose_model
 from pose_refine.train_impl import (
+    apply_pose_delta,
     feature_metric_pose_update,
     masked_feature_cosine_distance_per_sample,
     perturb_w2c_camera_center,
 )
+from pose_refine.utils.geometry_solver import compute_image_jacobian, diff_pose_solve
 
 
 def camera_centers_from_w2c(poses_w2c: torch.Tensor) -> torch.Tensor:
@@ -72,13 +79,96 @@ def project_feature_pair(model, config, query_feat, rendered_feat):
     if query.shape[-2:] != rendered.shape[-2:]:
         query = F.interpolate(query, rendered.shape[-2:], mode="bilinear", align_corners=False)
     mode = config.get("model", {}).get("proj_mode", "separate")
-    if mode == "shared":
+    if mode in {"shared", "shared_linear"}:
         query = model.proj_shared(query)
         rendered = model.proj_shared(rendered)
+    elif mode == "identity":
+        pass
     else:
         query = model.proj_query(query)
         rendered = model.proj_render(rendered)
     return F.normalize(query.float(), dim=1), F.normalize(rendered.float(), dim=1)
+
+
+def correlation_wls_pose_update(
+    query_feat: torch.Tensor,
+    rendered_feat: torch.Tensor,
+    depth: torch.Tensor,
+    pose_ref: torch.Tensor,
+    pose_gt: torch.Tensor,
+    intrinsics: dict,
+    *,
+    radius: int,
+    temperature: float,
+    damping: float,
+    valid_mask=None,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    """Local feature correlation -> soft subpixel flow -> depth WLS update."""
+    with torch.cuda.amp.autocast(enabled=False):
+        query = query_feat.float()
+        rendered = rendered_feat.float()
+        if query.shape[-2:] != rendered.shape[-2:]:
+            query = F.interpolate(query, rendered.shape[-2:], mode="bilinear", align_corners=False)
+        query_n = F.normalize(query, dim=1)
+        rendered_n = F.normalize(rendered, dim=1)
+        corr = local_correlation(rendered_n, query_n, radius=int(radius)).float()
+        probs = torch.softmax(corr / max(float(temperature), 1e-6), dim=1)
+        flow = soft_argmax_flow_from_correlation(
+            corr,
+            radius=int(radius),
+            temperature=float(temperature),
+        ).float()
+        conf = probs.max(dim=1, keepdim=True).values
+        depth_s = depth.float()
+        if depth_s.ndim == 4:
+            depth_s = depth_s.squeeze(1)
+        if valid_mask is None:
+            valid_w = (depth_s > 0.05).unsqueeze(1).float()
+        elif valid_mask.ndim == 3:
+            valid_w = valid_mask.unsqueeze(1).float()
+        else:
+            valid_w = valid_mask.float()
+        if valid_w.shape[-2:] != rendered.shape[-2:]:
+            valid_w = F.interpolate(valid_w, rendered.shape[-2:], mode="nearest")
+
+        gt_flow, gt_valid = ConcatPoseNet.compute_gt_flow(
+            pose_ref.float(),
+            pose_gt.float(),
+            depth_s,
+            rendered.shape[-2:],
+            intrinsics,
+        )
+        in_window = (
+            (gt_valid > 0.5)
+            & (valid_w > 0.5)
+            & (gt_flow[:, :1] >= -radius)
+            & (gt_flow[:, :1] <= radius)
+            & (gt_flow[:, 1:2] >= -radius)
+            & (gt_flow[:, 1:2] <= radius)
+        ).float()
+        epe_map = torch.linalg.norm(flow - gt_flow.float(), dim=1, keepdim=True)
+        denom = in_window.sum().clamp(min=1.0)
+        epe = (epe_map * in_window).sum() / denom
+        cov = in_window.mean()
+        conf_w = conf * in_window
+
+        Ju, Jv, depth_valid = compute_image_jacobian(depth_s, intrinsics)
+        delta_xi = diff_pose_solve(
+            flow,
+            conf_w.expand(-1, 2, -1, -1).contiguous(),
+            Ju,
+            Jv,
+            depth_valid,
+            damping=float(damping),
+        )
+        pose_pred = apply_pose_delta(pose_ref.float(), delta_xi.float())
+        metrics = {
+            "flow_epe": epe.detach(),
+            "flow_cov": cov.detach(),
+            "conf_mean": ((conf * in_window).sum() / denom).detach(),
+            "delta_trans_m": torch.linalg.norm(delta_xi[:, :3], dim=1).detach(),
+        }
+        return delta_xi, pose_pred, metrics
 
 
 @torch.no_grad()
@@ -95,9 +185,19 @@ def main() -> None:
     parser.add_argument("--noise_m", type=float, default=0.05)
     parser.add_argument("--fm_damping", type=float, default=1e-3)
     parser.add_argument("--fm_scales", type=float, nargs="+", default=[1.0])
+    parser.add_argument("--corr_radius", type=int, default=8)
+    parser.add_argument("--corr_temperature", type=float, default=0.04)
+    parser.add_argument("--corr_wls_damping", type=float, default=1e-3)
+    parser.add_argument("--no_corr_wls", action="store_true")
     parser.add_argument("--pose_checkpoint", default=None)
     parser.add_argument("--use_projection", action="store_true")
     parser.add_argument("--no_feature_metric", action="store_true")
+    parser.add_argument(
+        "--query_source",
+        choices=["dataset", "self_render"],
+        default="dataset",
+        help="Use exported query features or GT rendered DCFF features as the query signal.",
+    )
     args = parser.parse_args()
 
     device = torch.device(f"cuda:{args.gpu}")
@@ -155,10 +255,12 @@ def main() -> None:
     rank_stats = {float(cm): {"neg": [], "acc": [], "gap": []} for cm in args.dist_cm}
     init_rot_all, init_trans_all = [], []
     fm_stats = {float(scale): {"rot": [], "trans": [], "delta": []} for scale in args.fm_scales}
+    corr_stats = {"rot": [], "trans": [], "epe": [], "cov": [], "conf": [], "delta": []}
 
     print(
         f"Render: {render_w}x{render_h}  split={args.split}  "
-        f"noise={args.noise_deg}deg/{args.noise_m}m  frame={args.frame}"
+        f"noise={args.noise_deg}deg/{args.noise_m}m  frame={args.frame}  "
+        f"query_source={args.query_source}"
     )
 
     for batch_idx, batch in enumerate(tqdm(loader, desc="dcff-cm", leave=False)):
@@ -170,8 +272,9 @@ def main() -> None:
 
         gt_bundle = render_bundle(runtime, pose_gt, K, render_h, render_w)
         gt_mask = (gt_bundle["depth"].float() > 0.05).unsqueeze(1)
+        query_eval = gt_bundle["fine_features"].float() if args.query_source == "self_render" else query_fine
         pos_dist = masked_feature_cosine_distance_per_sample(
-            query_fine,
+            query_eval,
             gt_bundle["fine_features"].float(),
             gt_mask,
         )
@@ -188,7 +291,7 @@ def main() -> None:
                     neg_bundle = render_bundle(runtime, pose_neg, K, render_h, render_w)
                     neg_mask = gt_mask * (neg_bundle["depth"].float() > 0.05).unsqueeze(1)
                     neg_dist = masked_feature_cosine_distance_per_sample(
-                        query_fine,
+                        query_eval,
                         neg_bundle["fine_features"].float(),
                         neg_mask,
                     )
@@ -206,7 +309,7 @@ def main() -> None:
             init_trans_all.extend(init_trans.cpu().tolist())
             init_bundle = render_bundle(runtime, pose_init, K, render_h, render_w)
             init_mask = (init_bundle["depth"].float() > 0.05).unsqueeze(1)
-            fm_query = query_fine
+            fm_query = query_eval
             fm_rendered = init_bundle["fine_features"].float()
             fm_normalize = True
             if proj_model is not None:
@@ -234,6 +337,37 @@ def main() -> None:
                 stat["rot"].extend(fm_rot.cpu().tolist())
                 stat["trans"].extend(fm_trans.cpu().tolist())
                 stat["delta"].extend(torch.linalg.norm(_delta[:, :3].float(), dim=1).cpu().tolist())
+        if not args.no_corr_wls:
+            init_bundle = render_bundle(runtime, pose_init, K, render_h, render_w)
+            init_mask = (init_bundle["depth"].float() > 0.05).unsqueeze(1)
+            corr_query = query_eval
+            corr_rendered = init_bundle["fine_features"].float()
+            if proj_model is not None:
+                corr_query, corr_rendered = project_feature_pair(
+                    proj_model,
+                    config,
+                    query_fine,
+                    corr_rendered,
+                )
+            _corr_delta, corr_pose, corr_metrics = correlation_wls_pose_update(
+                corr_query,
+                corr_rendered,
+                init_bundle["depth"].float(),
+                pose_init,
+                pose_gt,
+                render_intr,
+                radius=args.corr_radius,
+                temperature=args.corr_temperature,
+                damping=args.corr_wls_damping,
+                valid_mask=init_mask,
+            )
+            corr_rot, corr_trans = pose_errors(corr_pose, pose_gt)
+            corr_stats["rot"].extend(corr_rot.cpu().tolist())
+            corr_stats["trans"].extend(corr_trans.cpu().tolist())
+            corr_stats["epe"].append(float(corr_metrics["flow_epe"].cpu()))
+            corr_stats["cov"].append(float(corr_metrics["flow_cov"].cpu()))
+            corr_stats["conf"].append(float(corr_metrics["conf_mean"].cpu()))
+            corr_stats["delta"].extend(corr_metrics["delta_trans_m"].cpu().tolist())
 
     print(f"pos_dist: mean={np.mean(pos_all):.4f} median={np.median(pos_all):.4f}")
     for cm in args.dist_cm:
@@ -256,6 +390,16 @@ def main() -> None:
                 f"{np.median(stat['trans']):.1f}mm  "
                 f"delta_mean={np.mean(stat['delta']) * 1000.0:.1f}mm"
             )
+    if corr_stats["trans"]:
+        print(
+            f"corr_wls: r={args.corr_radius} temp={args.corr_temperature:.3f} "
+            f"corr_med={np.median(corr_stats['rot']):.3f}deg/"
+            f"{np.median(corr_stats['trans']):.1f}mm  "
+            f"flow_epe={np.mean(corr_stats['epe']):.3f}px "
+            f"cov={np.mean(corr_stats['cov']):.3f} "
+            f"conf={np.mean(corr_stats['conf']):.3f} "
+            f"delta_mean={np.mean(corr_stats['delta']) * 1000.0:.1f}mm"
+        )
 
 
 if __name__ == "__main__":
