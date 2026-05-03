@@ -1,0 +1,35 @@
+base_config: joint_radio_dcff_cambridge_oldhospital_processed_adaptive_v7_stagea_locaware_flowhead_v14_mapjoint_lowres.yaml
+exp_name: joint_radio_dcff_cambridge_oldhospital_processed_adaptive_v7_stagea_locaware_flowhead_v19_mapjoint_anchor_self
+
+training:
+  seed: 331
+  lr: 0.00003
+  max_steps: 500
+
+model:
+  warmstart_skip_prefixes: ["local_flow_head."]
+
+map_supervision:
+  # v14/v18 reached high query-map cosine but drifted away from teacher and stayed locally flat.
+  # Keep map/query joint learning, but make fine features locally discriminative and teacher anchored.
+  query_fine_weight: 0.035
+  query_fine_infonce_weight: 0.025
+  query_fine_grad_weight: 0.02
+  query_variance_weight: 0.025
+  query_covariance_weight: 0.006
+
+  rendered_teacher_fine_weight: 0.08
+  rendered_teacher_fine_infonce_weight: 0.02
+  rendered_teacher_fine_grad_weight: 0.025
+  map_variance_weight: 0.012
+  map_covariance_weight: 0.004
+
+  query_flow_warp_contrastive_weight: 10.0
+  query_flow_warp_contrastive_margin: 0.15
+  map_self_corr_subpixel_weight: 4.0
+  map_self_corr_flow_weight: 0.5
+  map_self_flow_warp_contrastive_weight: 8.0
+
+  # WLS pose loss was noisy before hard correspondences formed; keep it out of this stage.
+  query_corr_wls_pose_weight: 0.0
+  query_corr_pose_gain_weight: 0.0

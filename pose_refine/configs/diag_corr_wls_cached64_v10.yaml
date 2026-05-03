@@ -1,0 +1,22 @@
+dataset:
+  source_dir: /hy-tmp/Cambridge_stdloc/OldHospital/processed
+  colmap_dir: /hy-tmp/Cambridge_stdloc/OldHospital/sparse/0
+  feature_dir: /root/ICLPose/result/feature_extract/features_radio_dual/cambridge_oldhospital_processed
+  train_split: /hy-tmp/Cambridge_stdloc/OldHospital/dataset_train.txt
+  test_split: /hy-tmp/Cambridge_stdloc/OldHospital/dataset_test.txt
+  fine_hw: [68, 120]
+  coarse_hw: [34, 60]
+  normalize_features: false
+
+dcff:
+  checkpoint: /root/ICLPose/result/feature_field/dcff_cambridge_oldhospital_processed_cached64_v10_fine_stable_4gpu/checkpoints/best.pth
+  ply_path: /root/ICLPose/result/feature_field/dcff_cambridge_oldhospital_processed_cached64_v10_fine_stable_4gpu/checkpoints/best.ply
+  feature_dim: 64
+  fine_feature_dim: 64
+  coarse_feature_dim: 64
+  latent_dim: 64
+  fine_latent_dim: 40
+  coarse_latent_dim: 24
+  render_width: 120
+  render_height: 68
+  coarse_smoothing_kernel: 1

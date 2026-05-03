@@ -12,6 +12,7 @@ from pose_refine.runtime import (
     build_concat_pose_model,
     load_concat_pose_checkpoint,
     load_concat_pose_model,
+    load_local_matcher_weights,
     run_model_refine_iteration,
 )
 
@@ -42,6 +43,7 @@ __all__ = [
     "feature_metric_solve",
     "load_concat_pose_checkpoint",
     "load_concat_pose_model",
+    "load_local_matcher_weights",
     "pnp_ransac_solve",
     "run_model_refine_iteration",
 ]

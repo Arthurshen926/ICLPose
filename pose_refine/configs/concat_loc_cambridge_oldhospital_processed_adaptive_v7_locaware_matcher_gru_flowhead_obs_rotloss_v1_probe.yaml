@@ -1,0 +1,8 @@
+base_config: concat_loc_cambridge_oldhospital_processed_adaptive_v7_locaware_matcher_gru_flowhead_obs_v1_probe.yaml
+exp_name: concat_loc_cambridge_oldhospital_processed_adaptive_v7_locaware_matcher_gru_flowhead_obs_rotloss_v1_probe
+
+training:
+  loss:
+    flow_observability_weight: 1.0
+    flow_observability_mode: rot
+    flow_observability_max_weight: 6.0

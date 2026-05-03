@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,15 +18,27 @@ from pose_refine.models.concat_pose_net import (
     local_correlation,
     soft_argmax_flow_from_correlation,
 )
-from pose_refine.runtime import apply_pose_delta
+from pose_refine.runtime import (
+    apply_pose_delta,
+    build_concat_pose_model,
+    load_local_matcher_weights,
+)
 from pose_refine.sparse_init import _solve_pnp
+from pose_refine.tools.diag_dcff_cm_sensitivity import (
+    correlation_wls_pose_update,
+    load_query_local_matcher,
+)
 from pose_refine.train_impl import (
     ConcatLocTrainer,
+    confidence_epe_bce_loss,
+    compute_observability_flow_weight,
     feature_metric_pose_update_loss,
     has_trainable_localization_feature_path,
     local_correlation_subpixel_ce_loss_from_corr,
     local_correlation_soft_flow_loss_from_corr,
     masked_feature_cosine_distance_per_sample,
+    flow_loss_fn,
+    pose_loss,
     perturb_w2c_camera_center,
 )
 from pose_refine.utils.geometry_solver import (
@@ -81,6 +94,25 @@ def test_guided_correlation_centers_offsets_on_same_pixel_flow():
     assert _offset_from_argmax(best, radius) == (0, 1)
 
 
+def test_checkpointed_guided_correlation_matches_default():
+    torch.manual_seed(123)
+    height, width = 5, 6
+    rendered = F.normalize(torch.randn(1, 3, height, width), dim=1)
+    query = F.normalize(torch.randn(1, 3, height, width), dim=1)
+    flow = torch.randn(1, 2, height, width) * 0.25
+
+    expected = guided_local_correlation(rendered, query, flow, radius=2)
+    actual = guided_local_correlation(
+        rendered,
+        query,
+        flow,
+        radius=2,
+        checkpoint_offsets=True,
+    )
+
+    assert torch.allclose(actual, expected, atol=1e-6)
+
+
 def test_wls_recovers_render_to_query_flow_update():
     height, width = 16, 20
     v, u = torch.meshgrid(
@@ -106,6 +138,252 @@ def test_wls_recovers_render_to_query_flow_update():
     xi_pred = diff_pose_solve(flow, confidence, Ju, Jv, valid, damping=1e-6)
 
     assert torch.allclose(xi_pred, xi_true, atol=2e-4, rtol=2e-3)
+
+
+def test_full_wls_can_keep_translation_and_use_hybrid_rotation_head():
+    height, width = 8, 10
+    model = ConcatPoseNet(
+        feature_dim=4,
+        hidden_dim=32,
+        use_gru=False,
+        full_wls=True,
+        rot_mode="hybrid",
+    )
+    with torch.no_grad():
+        model.rot_fc[-1].bias.copy_(torch.tensor([0.01, -0.02, 0.03]))
+
+    depth = torch.ones(1, height, width) * 3.0
+    flow = torch.zeros(1, 2, height, width)
+    confidence = torch.ones(1, 1, height, width)
+    intrinsics = {
+        "fx": 40.0,
+        "fy": 42.0,
+        "cx": (width - 1) / 2.0,
+        "cy": (height - 1) / 2.0,
+    }
+    feat_for_trans = torch.ones(1, 16, height, width)
+
+    delta_xi, delta_xi_full = model._solve_and_regress(
+        flow,
+        confidence,
+        depth,
+        intrinsics,
+        feat_for_trans,
+        query_coarse=None,
+        irls_iters=0,
+        robust_kernel="huber",
+    )
+
+    assert torch.allclose(delta_xi[:, :3], delta_xi_full[:, :3], atol=1e-6)
+    assert torch.allclose(delta_xi[:, 3:], torch.tensor([[0.01, -0.02, 0.03]]), atol=1e-6)
+
+
+def test_full_wls_hybrid_rotation_accepts_asymmetric_coarse_context():
+    height, width = 8, 10
+    model = ConcatPoseNet(
+        feature_dim=4,
+        coarse_feature_dim=2,
+        hidden_dim=32,
+        use_coarse=True,
+        use_coarse_in_fine_head=True,
+        use_gru=False,
+        full_wls=True,
+        rot_mode="hybrid",
+    )
+
+    depth = torch.ones(1, height, width) * 3.0
+    flow = torch.zeros(1, 2, height, width)
+    confidence = torch.ones(1, 1, height, width)
+    intrinsics = {
+        "fx": 40.0,
+        "fy": 42.0,
+        "cx": (width - 1) / 2.0,
+        "cy": (height - 1) / 2.0,
+    }
+    feat_for_trans = torch.ones(1, 16, height, width)
+    query_coarse = torch.randn(1, 2, 3, 4)
+    rendered_coarse = torch.randn(1, 2, 3, 4)
+
+    delta_xi, delta_xi_full = model._solve_and_regress(
+        flow,
+        confidence,
+        depth,
+        intrinsics,
+        feat_for_trans,
+        query_coarse=query_coarse,
+        rendered_coarse=rendered_coarse,
+        irls_iters=0,
+        robust_kernel="huber",
+    )
+
+    assert delta_xi.shape == (1, 6)
+    assert torch.allclose(delta_xi[:, :3], delta_xi_full[:, :3], atol=1e-6)
+
+
+def test_runtime_renders_map_coarse_for_fine_stage_context():
+    class DummyModel(torch.nn.Module):
+        use_coarse = True
+        use_coarse_in_fine_head = True
+        pose_update_scale = 1.0
+
+        def should_run_coarse_stage(self, outer_iter=0):
+            return False
+
+        def forward_fine_stage(
+            self,
+            query_fine,
+            rendered_fine,
+            depth,
+            intrinsics,
+            irls_iters=None,
+            robust_kernel=None,
+            query_coarse=None,
+            rendered_coarse=None,
+        ):
+            self.received_rendered_coarse = rendered_coarse
+            return {
+                "delta_xi": torch.zeros(query_fine.shape[0], 6),
+                "flow": torch.zeros(query_fine.shape[0], 2, *query_fine.shape[-2:]),
+                "confidence": torch.ones(query_fine.shape[0], 2, *query_fine.shape[-2:]),
+            }
+
+    from pose_refine.runtime import run_model_refine_iteration
+
+    model = DummyModel()
+    calls = []
+
+    def render_batch_fn(_poses, render_coarse):
+        calls.append(render_coarse)
+        return {
+            "fine_features": torch.zeros(1, 4, 5, 6),
+            "coarse_features": torch.ones(1, 2, 3, 4) if render_coarse else None,
+            "depth": torch.ones(1, 5, 6),
+        }
+
+    run_model_refine_iteration(
+        model,
+        render_batch_fn,
+        query_fine=torch.zeros(1, 4, 5, 6),
+        query_coarse=torch.zeros(1, 2, 3, 4),
+        pose_cur=torch.eye(4).unsqueeze(0),
+        render_intr={"fx": 1.0, "fy": 1.0, "cx": 0.0, "cy": 0.0},
+    )
+
+    assert calls == [True]
+    assert model.received_rendered_coarse is not None
+
+
+def test_geodesic_pose_loss_keeps_gradient_below_one_degree():
+    pose_init = torch.eye(4).unsqueeze(0)
+    pose_gt = torch.eye(4).unsqueeze(0)
+    angle = torch.tensor(0.1 * torch.pi / 180.0)
+    pose_gt[0, 0, 0] = torch.cos(angle)
+    pose_gt[0, 0, 1] = -torch.sin(angle)
+    pose_gt[0, 1, 0] = torch.sin(angle)
+    pose_gt[0, 1, 1] = torch.cos(angle)
+
+    delta_xi = torch.zeros(1, 6, requires_grad=True)
+    loss, _metrics = pose_loss(
+        delta_xi,
+        pose_init,
+        pose_gt,
+        rot_weight=1.0,
+        trans_weight=0.0,
+        rot_loss_type="geodesic",
+        loss_mode="compose",
+    )
+    loss.backward()
+
+    assert delta_xi.grad is not None
+    assert delta_xi.grad[:, 3:].abs().max().item() > 1e-6
+
+
+def test_corr_wls_diagnostic_applies_optional_depth_aware_matcher():
+    class CenterMatcher(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.depth_shape = None
+            self.valid_shape = None
+
+        def forward(self, corr, depth=None, valid_mask=None):
+            self.depth_shape = None if depth is None else tuple(depth.shape)
+            self.valid_shape = None if valid_mask is None else tuple(valid_mask.shape)
+            refined = corr.new_full(corr.shape, -20.0)
+            refined[:, corr.shape[1] // 2] = 20.0
+            return refined
+
+    height, width = 8, 10
+    radius = 1
+    query = torch.randn(1, 4, height, width)
+    rendered = torch.randn(1, 4, height, width)
+    depth = torch.ones(1, height, width) * 3.0
+    pose = torch.eye(4).unsqueeze(0)
+    intrinsics = {
+        "fx": 40.0,
+        "fy": 42.0,
+        "cx": (width - 1) / 2.0,
+        "cy": (height - 1) / 2.0,
+    }
+    valid = torch.ones(1, 1, height, width)
+    matcher = CenterMatcher()
+
+    _delta, pose_pred, metrics = correlation_wls_pose_update(
+        query,
+        rendered,
+        depth,
+        pose,
+        pose,
+        intrinsics,
+        radius=radius,
+        temperature=0.05,
+        damping=1e-3,
+        valid_mask=valid,
+        matcher=matcher,
+    )
+
+    assert matcher.depth_shape == (1, height, width)
+    assert matcher.valid_shape == (1, 1, height, width)
+    assert metrics["flow_epe"].item() < 1e-3
+    assert torch.allclose(pose_pred, pose, atol=1e-4)
+
+
+def test_corr_wls_diagnostic_loads_query_student_local_matcher_submodule():
+    from feature_extract.students.radio_query_student import DepthAwareLocalMatcher
+
+    matcher = DepthAwareLocalMatcher(radius=1, hidden_dim=12, residual_scale=0.25)
+    with torch.no_grad():
+        matcher.residual_scale.fill_(0.75)
+        matcher.refine[-1].bias.fill_(0.125)
+    checkpoint = {
+        "model_state_dict": {
+            f"local_matcher.{key}": value.detach().clone()
+            for key, value in matcher.state_dict().items()
+        }
+    }
+
+    with tempfile.TemporaryDirectory(dir=Path.cwd()) as tmp:
+        tmp_path = Path(tmp)
+        config_path = tmp_path / "query.yaml"
+        checkpoint_path = tmp_path / "query.pth"
+        config_path.write_text(
+            "\n".join(
+                [
+                    "model:",
+                    "  local_matcher_enabled: true",
+                    "  local_matcher_radius: 1",
+                    "  local_matcher_hidden_dim: 12",
+                    "  local_matcher_residual_scale: 0.25",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        torch.save(checkpoint, checkpoint_path)
+
+        loaded = load_query_local_matcher(str(config_path), str(checkpoint_path), torch.device("cpu"))
+
+    assert loaded is not None
+    assert torch.allclose(loaded.residual_scale, torch.tensor(0.75))
+    assert torch.allclose(loaded.refine[-1].bias, torch.full_like(loaded.refine[-1].bias, 0.125))
 
 
 def test_image_jacobian_accepts_batched_intrinsics():
@@ -238,6 +516,85 @@ def test_local_correlation_soft_flow_loss_recovers_subpixel_offset():
     assert metrics["corr_flow_epe"] < 1e-4
 
 
+def test_flow_loss_fn_applies_normalized_weight_map():
+    flow_pred = torch.tensor([[[[1.0, 3.0]], [[0.0, 0.0]]]])
+    flow_gt = torch.zeros_like(flow_pred)
+    valid = torch.ones(1, 1, 1, 2)
+    weights = torch.tensor([[[[1.0, 3.0]]]])
+
+    unweighted, _ = flow_loss_fn(flow_pred, flow_gt, valid, huber_delta=5.0)
+    weighted, metrics = flow_loss_fn(
+        flow_pred,
+        flow_gt,
+        valid,
+        huber_delta=5.0,
+        weight_map=weights,
+    )
+
+    assert torch.isclose(unweighted, torch.tensor(0.25), atol=1e-6)
+    assert torch.isclose(weighted, torch.tensor(0.35), atol=1e-6)
+    assert np.isclose(metrics["flow_weight_mean"], 2.0)
+
+
+def test_observability_flow_weight_prioritizes_yaw_sensitive_edges():
+    height, width = 5, 7
+    depth = torch.ones(1, height, width) * 3.0
+    valid = torch.ones(1, 1, height, width)
+    intrinsics = {
+        "fx": 30.0,
+        "fy": 32.0,
+        "cx": (width - 1) / 2.0,
+        "cy": (height - 1) / 2.0,
+    }
+
+    weights = compute_observability_flow_weight(
+        depth,
+        target_hw=(height, width),
+        intrinsics=intrinsics,
+        valid_mask=valid,
+        mode="yaw",
+        strength=1.0,
+        max_weight=8.0,
+    )
+
+    center = weights[0, 0, height // 2, width // 2]
+    corner = weights[0, 0, 0, 0]
+
+    assert weights.shape == valid.shape
+    assert corner > center
+    assert torch.isclose((weights * valid).sum() / valid.sum(), torch.tensor(1.0), atol=1e-5)
+
+
+def test_confidence_epe_bce_loss_prefers_high_confidence_on_accurate_flow():
+    flow_gt = torch.zeros(1, 2, 1, 2)
+    flow_pred = torch.tensor([[[[0.1, 6.0]], [[0.0, 0.0]]]])
+    valid = torch.ones(1, 1, 1, 2)
+
+    calibrated = torch.tensor([[[[0.9, 0.1]]]])
+    inverted = torch.tensor([[[[0.1, 0.9]]]])
+
+    good_loss, good_metrics = confidence_epe_bce_loss(
+        flow_pred,
+        flow_gt,
+        calibrated,
+        valid,
+        good_px=1.0,
+        bad_px=5.0,
+    )
+    bad_loss, _ = confidence_epe_bce_loss(
+        flow_pred,
+        flow_gt,
+        inverted,
+        valid,
+        good_px=1.0,
+        bad_px=5.0,
+    )
+
+    assert good_loss < bad_loss
+    assert good_metrics["conf_epe_target_mean"] == 0.5
+    assert good_metrics["conf_epe_pos_mean"] > good_metrics["conf_epe_neg_mean"]
+
+
 def test_soft_argmax_flow_from_correlation_recovers_subpixel_offset():
     radius = 2
     window = 2 * radius + 1
@@ -302,6 +659,319 @@ def test_corr_wls_mode_predicts_flow_from_local_match_peak():
     assert pred["delta_xi"].shape == (1, 6)
 
 
+def test_corr_wls_mode_applies_optional_depth_aware_matcher():
+    class RightBiasMatcher(torch.nn.Module):
+        def __init__(self, radius: int):
+            super().__init__()
+            self.radius = radius
+            self.seen_depth_shape = None
+            self.seen_valid_shape = None
+
+        def forward(self, corr, depth=None, valid_mask=None):
+            self.seen_depth_shape = None if depth is None else tuple(depth.shape)
+            self.seen_valid_shape = None if valid_mask is None else tuple(valid_mask.shape)
+            refined = corr.new_full(corr.shape, -20.0)
+            window = 2 * self.radius + 1
+            right_index = self.radius * window + (self.radius + 1)
+            refined[:, right_index] = 20.0
+            return refined
+
+    height, width = 5, 6
+    channels = 3
+    query = torch.zeros(1, channels, height, width)
+    rendered = torch.zeros_like(query)
+    depth = torch.ones(1, height, width)
+    radius = 1
+    matcher = RightBiasMatcher(radius)
+
+    model = ConcatPoseNet(
+        feature_dim=channels,
+        use_corr_wls=True,
+        local_radius=radius,
+        corr_wls_temperature=0.05,
+        proj_mode="identity",
+        full_wls=True,
+    )
+    model.local_matcher = matcher
+
+    pred = model(
+        query,
+        rendered,
+        depth,
+        {
+            "fx": 30.0,
+            "fy": 30.0,
+            "cx": (width - 1) / 2.0,
+            "cy": (height - 1) / 2.0,
+        },
+    )
+
+    assert matcher.seen_depth_shape == (1, height, width)
+    assert matcher.seen_valid_shape == (1, 1, height, width)
+    assert pred["flow"][:, 0].mean().item() > 0.95
+    assert pred["flow"][:, 1].abs().mean().item() < 1e-4
+
+
+def test_pose_runtime_builds_depth_aware_local_matcher_from_config():
+    model = build_concat_pose_model(
+        {
+            "feature_dim": 4,
+            "use_corr_wls": True,
+            "full_wls": True,
+            "local_radius": 2,
+            "local_matcher_enabled": True,
+            "local_matcher_hidden_dim": 12,
+            "local_matcher_zero_init": True,
+            "local_matcher_residual_scale": 0.25,
+        },
+        torch.device("cpu"),
+    )
+
+    assert model.local_matcher is not None
+    assert model.local_matcher.radius == 2
+    assert torch.allclose(model.local_matcher.residual_scale, torch.tensor(0.25))
+
+
+def test_pose_runtime_depth_aware_local_matcher_zero_init_is_noop():
+    model = build_concat_pose_model(
+        {
+            "feature_dim": 4,
+            "use_corr_wls": True,
+            "full_wls": True,
+            "local_radius": 1,
+            "local_matcher_enabled": True,
+            "local_matcher_hidden_dim": 12,
+            "local_matcher_zero_init": True,
+        },
+        torch.device("cpu"),
+    )
+    corr = torch.randn(1, 9, 4, 5)
+    depth = torch.ones(1, 4, 5)
+
+    refined = model.local_matcher(corr, depth=depth)
+
+    assert torch.allclose(refined, corr, atol=1e-6)
+
+
+def test_pose_runtime_builds_depth_aware_local_flow_head_from_config():
+    model = build_concat_pose_model(
+        {
+            "feature_dim": 4,
+            "use_gru": True,
+            "full_wls": True,
+            "local_radius": 2,
+            "local_flow_head_enabled": True,
+            "local_flow_head_hidden_dim": 12,
+            "local_flow_head_zero_init": True,
+            "local_flow_head_max_flow": 1.5,
+            "local_flow_head_base_flow_mode": "argmax",
+        },
+        torch.device("cpu"),
+    )
+
+    assert model.local_flow_head is not None
+    assert model.local_flow_head.radius == 2
+    assert model.local_flow_head.max_flow == 1.5
+    assert model.local_flow_head.base_flow_mode == "argmax"
+
+
+def test_pose_runtime_builds_observability_aware_local_flow_head_from_config():
+    model = build_concat_pose_model(
+        {
+            "feature_dim": 4,
+            "use_gru": True,
+            "full_wls": True,
+            "local_radius": 1,
+            "local_flow_head_enabled": True,
+            "local_flow_head_hidden_dim": 12,
+            "local_flow_head_zero_init": True,
+            "local_flow_head_context_mode": "observability",
+        },
+        torch.device("cpu"),
+    )
+
+    assert model.local_flow_head is not None
+    assert model.local_flow_head.context_mode == "observability"
+    assert model.local_flow_head.predict[0].block[0].in_channels == 9 + 12
+
+
+def test_gru_zero_iter_can_seed_flow_from_depth_aware_local_flow_head():
+    height, width = 5, 7
+    channels = height * width
+    rendered = torch.zeros(1, channels, height, width)
+    query = torch.zeros_like(rendered)
+    for y in range(height):
+        for x in range(width - 1):
+            c = y * width + x
+            rendered[0, c, y, x] = 1.0
+            query[0, c, y, x + 1] = 1.0
+    depth = torch.ones(1, height, width)
+
+    model = ConcatPoseNet(
+        feature_dim=channels,
+        hidden_dim=32,
+        use_gru=True,
+        gru_iters=0,
+        local_radius=1,
+        proj_mode="identity",
+        full_wls=True,
+        local_flow_head_enabled=True,
+        local_flow_head_zero_init=True,
+        local_flow_head_base_flow_mode="argmax",
+        local_flow_head_max_flow=1.0,
+    )
+    pred = model(
+        query,
+        rendered,
+        depth,
+        {
+            "fx": 30.0,
+            "fy": 30.0,
+            "cx": (width - 1) / 2.0,
+            "cy": (height - 1) / 2.0,
+        },
+    )
+
+    assert pred["flow"][0, 0, 2, 2].item() > 0.9
+    assert pred["flow"][0, 1, 2, 2].abs().item() < 1e-4
+    assert torch.allclose(
+        pred["confidence"][0, :, 2, 2],
+        torch.full((2,), 0.5),
+        atol=1e-6,
+    )
+
+
+def test_gru_zero_iter_accepts_observability_context_for_local_flow_head():
+    height, width = 5, 7
+    channels = height * width
+    rendered = torch.zeros(1, channels, height, width)
+    query = torch.zeros_like(rendered)
+    for y in range(height):
+        for x in range(width - 1):
+            c = y * width + x
+            rendered[0, c, y, x] = 1.0
+            query[0, c, y, x + 1] = 1.0
+    depth = torch.ones(1, height, width) * 3.0
+
+    model = ConcatPoseNet(
+        feature_dim=channels,
+        hidden_dim=32,
+        use_gru=True,
+        gru_iters=0,
+        local_radius=1,
+        proj_mode="identity",
+        full_wls=True,
+        local_flow_head_enabled=True,
+        local_flow_head_zero_init=True,
+        local_flow_head_base_flow_mode="argmax",
+        local_flow_head_context_mode="observability",
+    )
+    pred = model(
+        query,
+        rendered,
+        depth,
+        {
+            "fx": 30.0,
+            "fy": 32.0,
+            "cx": (width - 1) / 2.0,
+            "cy": (height - 1) / 2.0,
+        },
+    )
+
+    assert pred["flow"].shape == (1, 2, height, width)
+    assert pred["confidence"].shape == (1, 2, height, width)
+    assert pred["flow"][0, 0, 2, 2].item() > 0.9
+
+
+def test_gru_forward_exposes_local_flow_head_initial_prediction():
+    height, width = 5, 7
+    channels = height * width
+    rendered = torch.zeros(1, channels, height, width)
+    query = torch.zeros_like(rendered)
+    for y in range(height):
+        for x in range(width - 1):
+            c = y * width + x
+            rendered[0, c, y, x] = 1.0
+            query[0, c, y, x + 1] = 1.0
+    depth = torch.ones(1, height, width)
+
+    model = ConcatPoseNet(
+        feature_dim=channels,
+        hidden_dim=32,
+        use_gru=True,
+        gru_iters=1,
+        local_radius=1,
+        proj_mode="identity",
+        full_wls=True,
+        local_flow_head_enabled=True,
+        local_flow_head_zero_init=True,
+        local_flow_head_base_flow_mode="argmax",
+        local_flow_head_max_flow=1.0,
+    )
+    pred = model(
+        query,
+        rendered,
+        depth,
+        {
+            "fx": 30.0,
+            "fy": 30.0,
+            "cx": (width - 1) / 2.0,
+            "cy": (height - 1) / 2.0,
+        },
+    )
+
+    assert "init_flow" in pred
+    assert "init_confidence" in pred
+    assert pred["init_flow"].shape == (1, 2, height, width)
+    assert pred["init_confidence"].shape == (1, 1, height, width)
+    assert pred["init_flow"][0, 0, 2, 2].item() > 0.9
+
+
+def test_pose_runtime_loads_query_student_local_matcher_weights():
+    source = build_concat_pose_model(
+        {
+            "feature_dim": 4,
+            "use_corr_wls": True,
+            "full_wls": True,
+            "local_radius": 1,
+            "local_matcher_enabled": True,
+            "local_matcher_hidden_dim": 12,
+        },
+        torch.device("cpu"),
+    )
+    with torch.no_grad():
+        source.local_matcher.residual_scale.fill_(0.75)
+        source.local_matcher.refine[-1].bias.fill_(0.125)
+
+    target = build_concat_pose_model(
+        {
+            "feature_dim": 4,
+            "use_corr_wls": True,
+            "full_wls": True,
+            "local_radius": 1,
+            "local_matcher_enabled": True,
+            "local_matcher_hidden_dim": 12,
+        },
+        torch.device("cpu"),
+    )
+
+    with tempfile.TemporaryDirectory(dir=Path.cwd()) as tmp:
+        checkpoint_path = Path(tmp) / "query_student.pth"
+        torch.save(
+            {
+                "model_state_dict": {
+                    f"local_matcher.{key}": value.detach().clone()
+                    for key, value in source.local_matcher.state_dict().items()
+                }
+            },
+            checkpoint_path,
+        )
+        load_local_matcher_weights(target, str(checkpoint_path), torch.device("cpu"))
+
+    assert torch.allclose(target.local_matcher.residual_scale, torch.tensor(0.75))
+    assert torch.allclose(target.local_matcher.refine[-1].bias, torch.full_like(target.local_matcher.refine[-1].bias, 0.125))
+
+
 def test_local_correlation_subpixel_ce_loss_recovers_soft_target_offset():
     radius = 2
     window = 2 * radius + 1
@@ -339,6 +1009,70 @@ def test_apply_pose_delta_zero_scale_keeps_pose_fixed():
     updated = apply_pose_delta(pose, delta, scale=0.0)
 
     assert torch.allclose(updated, pose, atol=1e-7)
+
+
+def test_apply_pose_delta_can_scale_translation_and_rotation_separately():
+    pose = torch.eye(4).unsqueeze(0)
+    trans_delta = torch.tensor([[0.2, 0.0, 0.0, 0.0, 0.0, 0.0]])
+    rot_delta = torch.tensor([[0.0, 0.0, 0.0, 0.0, 0.0, 0.2]])
+
+    half_trans = apply_pose_delta(pose, trans_delta, trans_scale=0.5, rot_scale=1.0)
+    no_rot = apply_pose_delta(pose, rot_delta, trans_scale=1.0, rot_scale=0.0)
+
+    assert torch.allclose(half_trans[0, :3, 3], torch.tensor([0.1, 0.0, 0.0]), atol=1e-6)
+    assert torch.allclose(no_rot, pose, atol=1e-6)
+
+
+def test_runtime_uses_after_first_component_update_scales():
+    class DummyModel(torch.nn.Module):
+        pose_update_scale = 1.0
+        pose_update_trans_scale = 1.0
+        pose_update_rot_scale = 1.0
+        pose_update_trans_scale_after_first = 0.25
+        pose_update_rot_scale_after_first = 1.0
+
+        def should_run_coarse_stage(self, outer_iter=0):
+            return False
+
+        def forward_fine_stage(
+            self,
+            query_fine,
+            rendered_fine,
+            depth,
+            intrinsics,
+            query_coarse=None,
+            rendered_coarse=None,
+            irls_iters=None,
+            robust_kernel=None,
+        ):
+            return {
+                "delta_xi": torch.tensor([[0.2, 0.0, 0.0, 0.0, 0.0, 0.0]]),
+                "flow": torch.zeros(1, 2, *query_fine.shape[-2:]),
+                "confidence": torch.ones(1, 2, *query_fine.shape[-2:]),
+            }
+
+    from pose_refine.runtime import run_model_refine_iteration
+
+    model = DummyModel()
+
+    def render_batch_fn(_poses, _render_coarse):
+        return {
+            "fine_features": torch.zeros(1, 4, 3, 4),
+            "depth": torch.ones(1, 3, 4),
+            "coarse_features": None,
+        }
+
+    state = run_model_refine_iteration(
+        model,
+        render_batch_fn,
+        query_fine=torch.zeros(1, 4, 3, 4),
+        query_coarse=None,
+        pose_cur=torch.eye(4).unsqueeze(0),
+        render_intr={"fx": 1.0, "fy": 1.0, "cx": 0.0, "cy": 0.0},
+        outer_iter=1,
+    )
+
+    assert torch.allclose(state["pose_next"][0, :3, 3], torch.tensor([0.05, 0.0, 0.0]), atol=1e-6)
 
 
 def test_projection_only_path_enables_localization_feature_losses():

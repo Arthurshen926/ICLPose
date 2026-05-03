@@ -1,0 +1,84 @@
+base_config: joint_radio_dcff_cambridge_oldhospital_processed_adaptive_v7_stagea_locaware_flowhead_v23_scenecoord_fasthead_frozenmap.yaml
+exp_name: joint_radio_dcff_cambridge_oldhospital_processed_adaptive_v7_stagea_locaware_flowhead_v30_flowhead_fineloc_frozenmap
+
+model:
+  scene_coord_head: false
+  local_matcher_enabled: false
+  local_flow_head_enabled: true
+  local_flow_head_radius: 10
+  local_flow_head_hidden_dim: 128
+  local_flow_head_zero_init: true
+  local_flow_head_max_flow: 10.0
+  local_flow_head_base_flow_mode: softargmax
+  local_flow_head_base_temperature: 0.01
+  warmstart_strict: false
+  warmstart_skip_prefixes: ["scene_coord_head.", "scene_context_proj.", "local_matcher.", "local_flow_head."]
+
+training:
+  seed: 409
+  lr: 0.00005
+  batch_size: 2
+  num_workers: 0
+  max_steps: 900
+  freeze_model_except_prefixes:
+    - "local_flow_head."
+    - "fine_loc_head."
+    - "fine_loc_highres_fuse."
+    - "fine_loc_scale"
+    - "fine_loc_highres_scale"
+  model_lr_scales:
+    local_flow_head.: 4.0
+
+map_supervision:
+  trainable: false
+  local_matcher_enabled: false
+  local_flow_head_enabled: true
+
+  query_fine_weight: 0.03
+  query_fine_infonce_weight: 0.004
+  query_fine_grad_weight: 0.004
+  query_coarse_weight: 0.0
+  query_coarse_infonce_weight: 0.0
+  query_coarse_grad_weight: 0.0
+  query_variance_weight: 0.01
+  query_covariance_weight: 0.002
+  rendered_teacher_fine_weight: 0.0
+  rendered_teacher_fine_infonce_weight: 0.0
+  rendered_teacher_fine_grad_weight: 0.0
+  rendered_teacher_coarse_weight: 0.0
+
+  query_scene_coord_weight: 0.0
+  query_scene_coord_warp_weight: 0.0
+  query_corr_scene_coord_weight: 0.0
+  feature_metric_scene_coord_weight: 0.0
+
+  query_corr_ce_weight: 0.0
+  query_corr_subpixel_weight: 0.0
+  query_corr_flow_weight: 14.0
+  query_corr_flow_head_conf_weight: 0.2
+  query_corr_peak_margin_weight: 0.0
+  query_corr_wls_pose_weight: 3.0
+  query_corr_pose_gain_weight: 1.0
+  query_corr_pose_gain_trans_margin_mm: 1.0
+  query_corr_pose_gain_rot_margin_deg: 0.02
+  query_corr_flow_decode_mode: argmax_st
+  query_corr_min_flow_px: 0.75
+  query_corr_max_flow_px: 8.0
+  query_corr_radius: 10
+  query_corr_temperature: 0.005
+  query_corr_huber_delta: 0.05
+  query_corr_wls_pose_damping: 0.02
+  query_corr_wls_pose_update_scale: 0.35
+  query_corr_wls_pose_rot_weight: 0.2
+  query_corr_wls_pose_trans_weight: 40.0
+  query_corr_wls_conf_threshold: 0.0
+  query_corr_wls_conf_power: 2.0
+
+  query_flow_warp_weight: 0.03
+  query_flow_warp_contrastive_weight: 2.0
+  map_self_flow_warp_weight: 0.0
+  map_self_flow_warp_contrastive_weight: 0.0
+  map_self_corr_subpixel_weight: 0.0
+  map_self_corr_flow_weight: 0.0
+  map_self_feature_metric_pose_weight: 0.0
+  feature_metric_pose_weight: 0.0

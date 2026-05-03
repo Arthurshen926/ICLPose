@@ -1,0 +1,11 @@
+base_config: joint_radio_dcff_cambridge_oldhospital_processed_adaptive_v7_stagea_locaware_flowhead_v9_matcher_argmaxst_pretrain.yaml
+exp_name: joint_radio_dcff_cambridge_oldhospital_processed_adaptive_v7_stagea_locaware_flowhead_v11_matcher_argmaxst_corronly
+
+training:
+  seed: 277
+  max_steps: 700
+
+map_supervision:
+  query_corr_flow_weight: 0.05
+  query_corr_wls_pose_weight: 0.0
+  query_corr_pose_gain_weight: 0.0

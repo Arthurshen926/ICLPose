@@ -1,0 +1,29 @@
+base_config: joint_radio_dcff_cambridge_oldhospital_processed_adaptive_v7_locdriven_decoupled_flowhead_v17_zero_base_flowdir.yaml
+exp_name: joint_radio_dcff_cambridge_oldhospital_processed_adaptive_v7_locdriven_decoupled_flowhead_v18_feature_first_flowdir
+
+training:
+  seed: 919
+  lr: 0.00008
+  max_steps: 500
+  model_lr_scales:
+    local_flow_head.: 1.5
+    stage3.: 0.03
+    stage4.: 0.08
+    fine_head.: 0.35
+    fine_loc_head.: 4.0
+    fine_loc_highres_fuse.: 4.0
+    local_corr_projector.: 4.0
+
+map_supervision:
+  query_fine_weight: 0.06
+  query_fine_infonce_weight: 0.004
+  query_fine_grad_weight: 0.010
+  query_local_fine_weight: 0.030
+  query_local_fine_infonce_weight: 0.100
+  query_local_fine_grad_weight: 0.020
+  query_corr_flow_weight: 6.0
+  query_corr_flow_cosine_weight: 16.0
+  query_corr_flow_head_conf_weight: 0.0
+  query_corr_min_flow_px: 1.25
+  query_corr_max_flow_px: 8.0
+  query_corr_huber_delta: 0.30

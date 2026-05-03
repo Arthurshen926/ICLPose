@@ -1,0 +1,48 @@
+base_config: joint_radio_dcff_cambridge_oldhospital_processed_adaptive_v7_locdriven_fineidentity_mapjoint_v4.yaml
+exp_name: joint_radio_dcff_cambridge_oldhospital_processed_adaptive_v7_locdriven_fineidentity_strong_v5
+
+pose_init:
+  enabled: false
+
+training:
+  seed: 853
+  lr: 0.00003
+  max_steps: 500
+
+map_supervision:
+  train_coarse_fusion: false
+  query_coarse_weight: 0.0
+  coarse_pose_rank_weight: 0.0
+  query_coarse_infonce_weight: 0.0
+  query_coarse_grad_weight: 0.0
+
+  query_fine_weight: 0.04
+  query_fine_infonce_weight: 0.004
+  query_fine_grad_weight: 0.020
+
+  rendered_teacher_fine_weight: 0.005
+  rendered_teacher_fine_infonce_weight: 0.001
+  rendered_teacher_fine_grad_weight: 0.002
+
+  query_identity_corr_radius: 3
+  query_identity_corr_temperature: 0.006
+  query_identity_corr_ce_temperature: 0.035
+  query_identity_corr_ce_weight: 4.0
+  query_identity_corr_subpixel_weight: 5.0
+  query_identity_corr_flow_weight: 0.5
+  query_identity_corr_peak_margin_weight: 45.0
+  query_identity_corr_peak_margin: 0.08
+
+  query_corr_ce_weight: 0.10
+  query_corr_subpixel_weight: 0.20
+  query_corr_flow_weight: 0.05
+  query_corr_peak_margin_weight: 1.5
+  query_corr_wls_pose_weight: 0.0
+  query_corr_pose_gain_weight: 0.0
+
+  query_flow_warp_weight: 0.02
+  query_flow_warp_contrastive_weight: 0.8
+  map_self_corr_ce_weight: 0.10
+  map_self_corr_subpixel_weight: 0.15
+  map_self_corr_flow_weight: 0.03
+  map_self_corr_peak_margin_weight: 0.4

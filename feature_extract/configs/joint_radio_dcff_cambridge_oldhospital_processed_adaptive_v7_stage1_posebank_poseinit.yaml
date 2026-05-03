@@ -1,0 +1,39 @@
+base_config: joint_radio_dcff_cambridge_oldhospital_processed_adaptive_v7_stage1_anchor_poseinit.yaml
+exp_name: joint_radio_dcff_cambridge_oldhospital_processed_adaptive_v7_stage1_posebank_poseinit
+output_dir: /root/ICLPose/result/feature_extract
+
+model:
+  pose_init_head: true
+  pose_init_mode: anchor
+  pose_init_anchor_sampling: train_all
+  pose_init_hypotheses: 10
+  pose_init_num_anchors: 895
+  pose_init_residual_scale: 0.5
+  pose_init_hidden_dim: 512
+  apply_query_channel_gate: false
+  warmstart_strict: false
+  warmstart_skip_prefixes:
+    - "local_matcher."
+    - "local_flow_head."
+    - "pose_init_head."
+    - "query_channel_gate."
+
+pose_init:
+  enabled: true
+  trans_weight: 4.0
+  rot_weight: 1.0
+  score_weight: 0.1
+  uncertainty_weight: 0.01
+  rot_cost_weight: 0.05
+  anchor_weight: 2.0
+
+training:
+  epochs: 10
+  batch_size: 1
+  num_workers: 0
+  lr: 0.00004
+  max_steps: 1800
+  log_every: 10
+  model_lr_scales:
+    pose_init_head: 12.0
+    query_channel_gate: 1.0

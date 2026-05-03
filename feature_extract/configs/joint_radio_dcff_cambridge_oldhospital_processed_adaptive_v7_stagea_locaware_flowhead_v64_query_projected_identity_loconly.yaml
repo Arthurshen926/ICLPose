@@ -1,0 +1,22 @@
+base_config: joint_radio_dcff_cambridge_oldhospital_processed_adaptive_v7_stagea_locaware_flowhead_v63_query_projected_identity_curriculum.yaml
+exp_name: joint_radio_dcff_cambridge_oldhospital_processed_adaptive_v7_stagea_locaware_flowhead_v64_query_projected_identity_loconly
+
+training:
+  seed: 709
+  freeze_model_except_prefixes:
+    - "fine_loc_head."
+    - "fine_loc_highres_fuse."
+    - "fine_loc_scale"
+    - "fine_loc_highres_scale"
+  model_lr_scales:
+    fine_loc_head.: 3.0
+    fine_loc_highres_fuse.: 3.0
+
+map_supervision:
+  query_projected_fine_weight: 6.0
+  query_fine_weight: 0.18
+  query_corr_ce_weight: 0.15
+  query_corr_subpixel_weight: 0.15
+  query_corr_flow_weight: 0.0
+  query_corr_peak_margin_weight: 1.0
+  query_corr_distill_weight: 0.5

@@ -1,0 +1,6 @@
+base_config: concat_loc_cambridge_oldhospital_processed_adaptive_v7_locaware_matcher_gru_flowhead_obs_aftertrans0_outer3_v1_full_eval.yaml
+exp_name: concat_loc_cambridge_oldhospital_processed_adaptive_v7_locaware_matcher_gru_flowhead_obs_aftertrans0_outer5_v1_short_eval
+
+training:
+  max_val_batches: 64
+  outer_iters_val: 5

@@ -1,0 +1,12 @@
+base_config: joint_radio_dcff_cambridge_oldhospital_processed_adaptive_v7_stagea_locaware_flowhead_v71_directloc_projected_only.yaml
+exp_name: joint_radio_dcff_cambridge_oldhospital_processed_adaptive_v7_stagea_locaware_flowhead_v73_directloc_maponly_projected
+
+training:
+  seed: 773
+  max_steps: 300
+  lr: 0.00006
+
+map_supervision:
+  local_corr_projector_apply_to_query: false
+  query_projected_fine_weight: 10.0
+  query_fine_weight: 0.02

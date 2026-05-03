@@ -1,0 +1,14 @@
+base_config: concat_loc_cambridge_oldhospital_processed_adaptive_v7_locaware_matcher_gru_flowhead_obs_v1_probe.yaml
+exp_name: concat_loc_cambridge_oldhospital_processed_adaptive_v7_locaware_matcher_gru_flowhead_initflow_v1_probe
+
+model:
+  local_flow_head_base_flow_mode: none
+  local_flow_head_context_mode: observability
+
+training:
+  epochs: 4
+  best_metric: joint_1deg_50mm
+  max_train_batches: 192
+  max_val_batches: 64
+  loss:
+    init_flow_weight: 8.0

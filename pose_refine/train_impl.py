@@ -31,6 +31,7 @@ Usage:
 """
 
 import argparse
+import json
 import logging
 import math
 import os
@@ -70,8 +71,15 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from data.radio_loc_dataset import RadioLocDataset, collate_fn, read_colmap_cameras
 from data.radio_loc_retrieval_dataset import RadioLocRetrievalDataset
 from feature_field.dcff import DeferredCascadedRenderer, HybridGaussianModel, SpatialHashGrid
-from pose_refine import apply_pose_delta, build_concat_pose_model, feature_metric_solve, run_model_refine_iteration
+from pose_refine import (
+    apply_pose_delta,
+    build_concat_pose_model,
+    feature_metric_solve,
+    load_local_matcher_weights,
+    run_model_refine_iteration,
+)
 from pose_refine.models.concat_pose_net import ConcatPoseNet, local_correlation
+from pose_refine.utils.geometry_solver import compute_image_jacobian
 from pose_refine.utils.lie_algebra import se3_exp, se3_log
 from feature_field import build_dcff_runtime, intrinsics_to_K, render_feature_bundle_batch
 from feature_field.runtime import _apply_dcff_postprocess
@@ -401,8 +409,20 @@ def pose_loss(
             if rot_loss_type == 'cosine':
                 rot_loss_val = (1.0 - cos_angle).mean()
             else:
-                cos_clamped = cos_angle.clamp(-1.0 + 1e-4, 1.0 - 1e-4)
-                rot_loss_val = torch.acos(cos_clamped).mean()
+                # atan2(sin, cos) keeps a usable gradient for sub-degree
+                # errors. Clamping cos to 1 - eps makes the loss flat below
+                # about 0.8 deg, which is exactly the regime this refiner must
+                # improve for Cambridge OldHospital.
+                skew_vec = torch.stack(
+                    [
+                        R_rel[:, 2, 1] - R_rel[:, 1, 2],
+                        R_rel[:, 0, 2] - R_rel[:, 2, 0],
+                        R_rel[:, 1, 0] - R_rel[:, 0, 1],
+                    ],
+                    dim=1,
+                )
+                sin_angle = 0.5 * torch.linalg.vector_norm(skew_vec, dim=1)
+                rot_loss_val = torch.atan2(sin_angle, cos_angle).mean()
 
             c_pred = camera_centers_from_w2c(pose_pred)
             c_gt = camera_centers_from_w2c(pose_gt)
@@ -443,6 +463,7 @@ def flow_loss_fn(
     flow_gt: torch.Tensor,
     valid_mask: torch.Tensor,
     huber_delta: float = 5.0,
+    weight_map: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """Masked Huber flow loss with EPE metric.
 
@@ -450,6 +471,8 @@ def flow_loss_fn(
         flow_pred: (B, 2, H, W) predicted flow
         flow_gt:   (B, 2, H, W) GT flow
         valid_mask: (B, 1, H, W) validity mask
+        weight_map: optional (B, 1, H, W) per-pixel weights. The map is
+            normalized over valid pixels to keep the loss scale comparable.
         huber_delta: Huber threshold in pixels
     """
     diff = flow_pred - flow_gt
@@ -459,6 +482,24 @@ def flow_loss_fn(
         0.5 * diff.pow(2) / huber_delta,
         abs_diff - 0.5 * huber_delta,
     )
+    metrics: Dict[str, float] = {}
+    if weight_map is not None:
+        weight_map = weight_map.to(device=loss_map.device, dtype=loss_map.dtype)
+        if weight_map.shape[-2:] != loss_map.shape[-2:]:
+            weight_map = F.interpolate(
+                weight_map,
+                size=loss_map.shape[-2:],
+                mode='bilinear',
+                align_corners=False,
+            )
+        if weight_map.shape[1] != 1:
+            weight_map = weight_map.mean(dim=1, keepdim=True)
+        raw_mean = (weight_map * valid_mask).sum() / valid_mask.sum().clamp(min=1.0)
+        weight_map = weight_map / raw_mean.clamp(min=1e-6)
+        loss_map = loss_map * weight_map
+        metrics['flow_weight_mean'] = raw_mean.item()
+        metrics['flow_weight_max'] = weight_map.max().item()
+
     n_valid = valid_mask.sum().clamp(min=1.0)
     loss = (loss_map * valid_mask).sum() / (n_valid * 2)
 
@@ -466,10 +507,87 @@ def flow_loss_fn(
     epe_map = torch.norm(diff, dim=1, keepdim=True)
     epe = (epe_map * valid_mask).sum() / n_valid
 
-    return loss, {
+    metrics.update({
         'flow_loss': loss.item(),
         'flow_epe': epe.item(),
-    }
+    })
+    return loss, metrics
+
+
+def compute_observability_flow_weight(
+    depth: torch.Tensor,
+    target_hw: Tuple[int, int],
+    intrinsics: Dict[str, float],
+    valid_mask: Optional[torch.Tensor] = None,
+    mode: str = 'rot',
+    strength: float = 1.0,
+    max_weight: float = 6.0,
+) -> torch.Tensor:
+    """Build a normalized per-pixel flow-loss weight from image Jacobians.
+
+    This emphasizes pixels whose flow residuals are more informative for the
+    requested pose components. It is intentionally normalized to mean 1 over
+    valid pixels so enabling it changes emphasis, not the effective LR.
+    """
+    if depth.ndim == 4:
+        depth = depth.squeeze(1)
+    B, H, W = depth.shape
+    tH, tW = target_hw
+    if (tH, tW) != (H, W):
+        sx, sy = tW / W, tH / H
+        depth_for_jac = F.interpolate(
+            depth.unsqueeze(1),
+            size=(tH, tW),
+            mode='nearest',
+        ).squeeze(1)
+        jac_intr = dict(intrinsics)
+        jac_intr['fx'] = intrinsics['fx'] * sx
+        jac_intr['fy'] = intrinsics['fy'] * sy
+        jac_intr['cx'] = intrinsics['cx'] * sx
+        jac_intr['cy'] = intrinsics['cy'] * sy
+    else:
+        depth_for_jac = depth
+        jac_intr = intrinsics
+
+    Ju, Jv, jac_valid = compute_image_jacobian(depth_for_jac.float(), jac_intr)
+    mode = str(mode).lower()
+    if mode in {'yaw', 'wz', 'zrot'}:
+        cols = slice(5, 6)
+    elif mode in {'rot', 'rotation'}:
+        cols = slice(3, 6)
+    elif mode in {'trans', 'translation'}:
+        cols = slice(0, 3)
+    elif mode in {'pose', 'all', 'balanced'}:
+        cols = slice(0, 6)
+    else:
+        raise ValueError(
+            f"Unsupported observability flow-weight mode '{mode}'. "
+            "Expected yaw, rot, trans, or pose."
+        )
+
+    signal = torch.sqrt(
+        Ju[:, :, cols].pow(2).sum(dim=(2,))
+        + Jv[:, :, cols].pow(2).sum(dim=(2,))
+        + 1e-12
+    ).reshape(B, 1, tH, tW)
+
+    if valid_mask is None:
+        valid = jac_valid.reshape(B, 1, tH, tW).to(signal.dtype)
+    else:
+        valid = valid_mask.to(device=signal.device, dtype=signal.dtype)
+        if valid.shape[-2:] != (tH, tW):
+            valid = F.interpolate(valid, size=(tH, tW), mode='nearest')
+        valid = valid * jac_valid.reshape(B, 1, tH, tW).to(signal.dtype)
+
+    valid_sum = valid.sum(dim=(2, 3), keepdim=True).clamp(min=1.0)
+    signal_mean = (signal * valid).sum(dim=(2, 3), keepdim=True) / valid_sum
+    signal_norm = signal / signal_mean.clamp(min=1e-6)
+    weights = 1.0 + float(strength) * signal_norm
+    if max_weight and max_weight > 0:
+        weights = weights.clamp(max=float(max_weight))
+    weight_mean = (weights * valid).sum(dim=(2, 3), keepdim=True) / valid_sum
+    weights = weights / weight_mean.clamp(min=1e-6)
+    return weights * valid
 
 
 def confidence_regularization_loss(
@@ -583,6 +701,61 @@ def confidence_validity_loss(
         'conf_valid_loss': loss.item(),
         'conf_valid_mean': conf_valid,
         'conf_invalid_mean': conf_invalid,
+    }
+
+
+def confidence_epe_bce_loss(
+    flow_pred: torch.Tensor,
+    flow_gt: torch.Tensor,
+    confidence: torch.Tensor,
+    valid: torch.Tensor,
+    good_px: float = 1.0,
+    bad_px: float = 5.0,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """Calibrate confidence from endpoint error thresholds.
+
+    Pixels below ``good_px`` are positive, pixels above ``bad_px`` are
+    negative, and the band in between is ignored. This gives the WLS confidence
+    head a direct signal to suppress unreliable local matches.
+    """
+    with torch.cuda.amp.autocast(enabled=False):
+        epe = torch.norm((flow_pred - flow_gt).float(), dim=1, keepdim=True)
+        conf = confidence.float()
+        if conf.shape[1] > 1:
+            conf = conf.mean(dim=1, keepdim=True)
+        conf = conf.clamp(min=1e-4, max=1.0 - 1e-4)
+
+        if valid.ndim == 3:
+            mask = valid.unsqueeze(1).float()
+        else:
+            mask = valid.float()
+        if mask.shape[-2:] != conf.shape[-2:]:
+            mask = F.interpolate(mask, conf.shape[-2:], mode='nearest')
+        if epe.shape[-2:] != conf.shape[-2:]:
+            epe = F.interpolate(epe, conf.shape[-2:], mode='bilinear', align_corners=False)
+
+        pos = (epe <= float(good_px)) & (mask > 0.5)
+        neg = (epe >= float(bad_px)) & (mask > 0.5)
+        used = pos | neg
+        if used.any():
+            target = pos.float()
+            loss_map = F.binary_cross_entropy(conf, target, reduction='none')
+            loss = loss_map[used].mean()
+        else:
+            loss = conf.new_tensor(0.0)
+
+        with torch.no_grad():
+            target_mean = pos.float()[used].mean().item() if used.any() else 0.0
+            pos_mean = conf[pos].mean().item() if pos.any() else 0.0
+            neg_mean = conf[neg].mean().item() if neg.any() else 0.0
+            used_frac = used.float().mean().item()
+
+    return loss, {
+        'conf_epe_bce_loss': loss.item(),
+        'conf_epe_target_mean': target_mean,
+        'conf_epe_pos_mean': pos_mean,
+        'conf_epe_neg_mean': neg_mean,
+        'conf_epe_used_frac': used_frac,
     }
 
 
@@ -963,6 +1136,78 @@ def feature_cosine_distance_per_sample(
     return masked_feature_cosine_distance_per_sample(query_feat, rendered_feat)
 
 
+def resolve_best_metric_value(
+    metrics: Dict[str, float],
+    metric_name: str,
+) -> Tuple[float, bool, str]:
+    """Return metric value, comparison direction, and resolved metric key."""
+    aliases = {
+        'trans': 'val_trans_median',
+        'trans_median': 'val_trans_median',
+        'rot': 'val_rot_median',
+        'rot_median': 'val_rot_median',
+        'joint_1deg_50mm': 'val_joint_1deg_50mm',
+        'joint_5deg_100mm': 'val_joint_5deg_100mm',
+    }
+    metric_key = aliases.get(str(metric_name), str(metric_name))
+    value = float(metrics.get(metric_key, float('-inf')))
+    higher_is_better = metric_key.startswith('val_joint_') or metric_key.startswith('val_pct_')
+    if not higher_is_better and metric_key not in metrics:
+        value = float('inf')
+    return value, higher_is_better, metric_key
+
+
+def build_eval_sweep_record(
+    *,
+    outer_iters: int,
+    gru_iters: int,
+    metrics: Dict[str, float],
+    seed_count: int = 1,
+) -> Dict[str, float | int]:
+    """Compact JSON-friendly record for pose-refine eval sweeps."""
+    return {
+        'outer_iters': int(outer_iters),
+        'gru_iters': int(gru_iters),
+        'seed_count': int(seed_count),
+        'rot_median_deg': float(metrics.get('val_rot_median', 0.0)),
+        'trans_median_mm': float(metrics.get('val_trans_median', 0.0)),
+        'pct_1deg': float(metrics.get('val_pct_1deg', 0.0)),
+        'joint_1deg_50mm': float(metrics.get('val_joint_1deg_50mm', 0.0)),
+    }
+
+
+def build_eval_sample_record(
+    *,
+    image_id: int,
+    image_name: str = '',
+    outer_iters: int,
+    gru_iters: int,
+    seed: int,
+    init_rot_deg: float,
+    init_trans_mm: float,
+    one_rot_deg: float,
+    one_trans_mm: float,
+    final_rot_deg: float,
+    final_trans_mm: float,
+    flow_epe_px: float,
+) -> Dict[str, float | int | str]:
+    """JSON-friendly per-sample localization eval record."""
+    return {
+        'image_id': int(image_id),
+        'image_name': str(image_name),
+        'outer_iters': int(outer_iters),
+        'gru_iters': int(gru_iters),
+        'seed': int(seed),
+        'init_rot_deg': float(init_rot_deg),
+        'init_trans_mm': float(init_trans_mm),
+        'one_rot_deg': float(one_rot_deg),
+        'one_trans_mm': float(one_trans_mm),
+        'final_rot_deg': float(final_rot_deg),
+        'final_trans_mm': float(final_trans_mm),
+        'flow_epe_px': float(flow_epe_px),
+    }
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 #  Visualization Utilities
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1044,6 +1289,10 @@ class ConcatLocTrainer:
         loss_cfg = tc.get('loss', {})
         self.pose_weight = loss_cfg.get('pose_weight', 0.5)
         self.flow_weight = loss_cfg.get('flow_weight', 1.0)
+        self.init_flow_weight = float(loss_cfg.get('init_flow_weight', 0.0))
+        self.flow_observability_weight = float(loss_cfg.get('flow_observability_weight', 0.0))
+        self.flow_observability_mode = str(loss_cfg.get('flow_observability_mode', 'rot'))
+        self.flow_observability_max_weight = float(loss_cfg.get('flow_observability_max_weight', 6.0))
         self.rot_weight = loss_cfg.get('rot_weight', 1.0)
         self.trans_weight = loss_cfg.get('trans_weight', 10.0)
         self.rot_loss_type = loss_cfg.get('rot_loss_type', 'cosine')
@@ -1051,6 +1300,9 @@ class ConcatLocTrainer:
         self.conf_reg_weight = loss_cfg.get('conf_reg_weight', 0.01)
         self.conf_nll_weight = loss_cfg.get('conf_nll_weight', 0.0)
         self.conf_valid_weight = loss_cfg.get('conf_valid_weight', 0.0)
+        self.conf_epe_bce_weight = float(loss_cfg.get('conf_epe_bce_weight', 0.0))
+        self.conf_epe_good_px = float(loss_cfg.get('conf_epe_good_px', 1.0))
+        self.conf_epe_bad_px = float(loss_cfg.get('conf_epe_bad_px', 5.0))
         self.feat_match_weight = loss_cfg.get('feat_match_weight', 0.0)
         self.corr_feat_weight = loss_cfg.get('corr_feat_weight', 0.0)
         self.corr_ce_weight = loss_cfg.get('corr_ce_weight', 0.0)
@@ -1151,6 +1403,9 @@ class ConcatLocTrainer:
         self.epoch = 0
         self.global_step = 0
         self.best_val_trans = float('inf')
+        self.best_metric_name = str(tc.get('best_metric', 'trans_median'))
+        self.best_metric_value = float('-inf') if self.best_metric_name.startswith(('joint_', 'val_joint_', 'pct_', 'val_pct_')) else float('inf')
+        self.best_metric_label = 'val_trans_median'
         self.latest_val_metrics: Dict[str, float] = {}
         self.epochs_since_best = 0
         tc = self.config.get('training', {})
@@ -1383,6 +1638,10 @@ class ConcatLocTrainer:
         self.use_coarse = mcfg.get('use_coarse', False)
         self.use_gru = mcfg.get('use_gru', False)
         self.model = build_concat_pose_model(mcfg, self.device)
+        local_matcher_init = mcfg.get('local_matcher_init_checkpoint')
+        if local_matcher_init:
+            load_local_matcher_weights(self.model, local_matcher_init, self.device)
+            self.logger.info(f'  Loaded local matcher weights from {local_matcher_init}')
         if bool(tc.get('freeze_pose_model', False)):
             for param in self.model.parameters():
                 param.requires_grad_(False)
@@ -2297,6 +2556,17 @@ class ConcatLocTrainer:
                 gt_flow, gt_valid = ConcatPoseNet.compute_gt_flow(
                     pose_mid, pose_gt, depth, flow_hw, render_intr,
                 )
+                flow_weight_map = None
+                if self.flow_observability_weight > 0:
+                    flow_weight_map = compute_observability_flow_weight(
+                        depth,
+                        flow_hw,
+                        render_intr,
+                        valid_mask=gt_valid,
+                        mode=self.flow_observability_mode,
+                        strength=self.flow_observability_weight,
+                        max_weight=self.flow_observability_max_weight,
+                    )
 
             # 4. Losses
             with autocast(enabled=self.use_amp):
@@ -2323,18 +2593,44 @@ class ConcatLocTrainer:
                     seq_flow_loss = torch.tensor(0.0, device=self.device)
                     for pi, fp in enumerate(pred['flow_preds']):
                         w = gamma_seq ** (n_preds - 1 - pi)
-                        fl, _ = flow_loss_fn(fp, gt_flow, gt_valid)
+                        fl, _ = flow_loss_fn(
+                            fp,
+                            gt_flow,
+                            gt_valid,
+                            weight_map=flow_weight_map,
+                        )
                         seq_flow_loss = seq_flow_loss + w * fl
                     seq_flow_loss = seq_flow_loss / n_preds
                     iter_loss = iter_loss + self.flow_weight * seq_flow_loss
                     # EPE metric from final prediction
-                    _, f_metrics = flow_loss_fn(pred['flow'], gt_flow, gt_valid)
+                    _, f_metrics = flow_loss_fn(
+                        pred['flow'],
+                        gt_flow,
+                        gt_valid,
+                        weight_map=flow_weight_map,
+                    )
                     f_metrics['flow_loss'] = seq_flow_loss.item()
                 else:
                     f_loss, f_metrics = flow_loss_fn(
-                        pred['flow'], gt_flow, gt_valid,
+                        pred['flow'],
+                        gt_flow,
+                        gt_valid,
+                        weight_map=flow_weight_map,
                     )
                     iter_loss = iter_loss + self.flow_weight * f_loss
+
+                if self.init_flow_weight > 0 and 'init_flow' in pred:
+                    init_f_loss, init_f_metrics = flow_loss_fn(
+                        pred['init_flow'],
+                        gt_flow,
+                        gt_valid,
+                        weight_map=flow_weight_map,
+                    )
+                    iter_loss = iter_loss + self.init_flow_weight * init_f_loss
+                    f_metrics.update({
+                        'init_flow_loss': init_f_loss.item(),
+                        'init_flow_epe': init_f_metrics.get('flow_epe', 0.0),
+                    })
 
                 # Confidence regularization
                 c_loss, c_metrics = confidence_regularization_loss(
@@ -2356,6 +2652,18 @@ class ConcatLocTrainer:
                     )
                     iter_loss = iter_loss + self.conf_valid_weight * cv_loss
                     c_metrics.update(cv_metrics)
+
+                if self.conf_epe_bce_weight > 0:
+                    cepe_loss, cepe_metrics = confidence_epe_bce_loss(
+                        pred['flow'],
+                        gt_flow,
+                        pred['confidence'],
+                        gt_valid,
+                        good_px=self.conf_epe_good_px,
+                        bad_px=self.conf_epe_bad_px,
+                    )
+                    iter_loss = iter_loss + self.conf_epe_bce_weight * cepe_loss
+                    c_metrics.update(cepe_metrics)
 
                 if (
                     self.corr_feat_weight > 0
@@ -2658,7 +2966,10 @@ class ConcatLocTrainer:
         all_flow_epe = []
         all_corr_flow_epe = []
         all_fm_rot_errs, all_fm_trans_errs = [], []
+        sample_records = []
         N = self.outer_iters_val
+        eval_gru_iters = int(getattr(self.model, 'gru_iters', 0))
+        eval_seed = int(getattr(self, '_eval_current_seed', -1))
 
         flow_hw = (self.render_h, self.render_w)
         render_intr = self.model._scale_intrinsics(self.render_h, self.render_w)
@@ -2696,6 +3007,8 @@ class ConcatLocTrainer:
             pose_gt = batch['pose_gt'].to(self.device)
             pose_cur = batch['pose_init'].to(self.device)
             pose_init_for_eval = pose_cur
+            image_ids = batch.get('image_id', [])
+            image_names = batch.get('image_name', [])
             final_state = None
             pose_after_one = None
 
@@ -2790,6 +3103,38 @@ class ConcatLocTrainer:
                 all_rot_errs.extend(rot_err.cpu().tolist())
                 all_trans_errs.extend(trans_err.cpu().tolist())
 
+                if bool(getattr(self, '_eval_collect_samples', False)):
+                    if pose_after_one is not None:
+                        one_rot, one_trans = compute_pose_error(pose_after_one, pose_gt)
+                    else:
+                        one_rot, one_trans = init_rot, init_trans
+                    epe_per_sample = (
+                        (epe_map * gt_valid).sum(dim=(1, 2, 3))
+                        / gt_valid.sum(dim=(1, 2, 3)).clamp(min=1.0)
+                    )
+                    B = int(rot_err.shape[0])
+                    for bi in range(B):
+                        image_id = image_ids[bi] if isinstance(image_ids, list) else image_ids[bi].item()
+                        image_name = ''
+                        if isinstance(image_names, list) and bi < len(image_names):
+                            image_name = str(image_names[bi])
+                        sample_records.append(
+                            build_eval_sample_record(
+                                image_id=int(image_id),
+                                image_name=image_name,
+                                outer_iters=N,
+                                gru_iters=eval_gru_iters,
+                                seed=eval_seed,
+                                init_rot_deg=float(init_rot[bi].item()),
+                                init_trans_mm=float(init_trans[bi].item()),
+                                one_rot_deg=float(one_rot[bi].item()),
+                                one_trans_mm=float(one_trans[bi].item()),
+                                final_rot_deg=float(rot_err[bi].item()),
+                                final_trans_mm=float(trans_err[bi].item()),
+                                flow_epe_px=float(epe_per_sample[bi].item()),
+                            )
+                        )
+
         val_metrics = {}
         if all_rot_errs:
             rot = np.array(all_rot_errs)
@@ -2877,6 +3222,8 @@ class ConcatLocTrainer:
 
             for k, v in val_metrics.items():
                 self.writer.add_scalar(f'val/{k}', v, epoch)
+        if bool(getattr(self, '_eval_collect_samples', False)):
+            self._eval_sample_records = sample_records
 
         self.model.train()
         self._set_map_train_mode(True)
@@ -2894,6 +3241,9 @@ class ConcatLocTrainer:
             'scheduler_state_dict': self.scheduler.state_dict(),
             'scaler_state_dict': self.scaler.state_dict(),
             'best_val_trans': self.best_val_trans,
+            'best_metric_name': getattr(self, 'best_metric_name', 'trans_median'),
+            'best_metric_value': getattr(self, 'best_metric_value', self.best_val_trans),
+            'best_metric_label': getattr(self, 'best_metric_label', 'val_trans_median'),
             'config': self.config,
         }
         dcff_renderer = getattr(self, 'dcff_renderer', None)
@@ -2926,6 +3276,9 @@ class ConcatLocTrainer:
         self.epoch = ckpt['epoch'] + 1
         self.global_step = ckpt.get('global_step', 0)
         self.best_val_trans = ckpt.get('best_val_trans', float('inf'))
+        self.best_metric_name = ckpt.get('best_metric_name', self.best_metric_name)
+        self.best_metric_value = ckpt.get('best_metric_value', self.best_metric_value)
+        self.best_metric_label = ckpt.get('best_metric_label', self.best_metric_label)
 
         # Handle epoch extension
         old_epochs = ckpt.get('config', {}).get('training', {}).get(
@@ -3245,16 +3598,30 @@ class ConcatLocTrainer:
             # Scheduler step
             self.scheduler.step()
 
-            # Checkpoint — track best by median translation error
+            # Checkpoint — default to median translation, but allow rotation/joint
+            # metrics for later localization-focused stages.
             is_best = False
             if val_metrics:
                 med_trans = val_metrics.get('val_trans_median', float('inf'))
                 if med_trans < self.best_val_trans:
                     self.best_val_trans = med_trans
+                current_best_value, higher_is_better, metric_label = resolve_best_metric_value(
+                    val_metrics,
+                    self.best_metric_name,
+                )
+                improved = (
+                    current_best_value > self.best_metric_value
+                    if higher_is_better
+                    else current_best_value < self.best_metric_value
+                )
+                if improved:
+                    self.best_metric_value = current_best_value
+                    self.best_metric_label = metric_label
                     self.epochs_since_best = 0
                     is_best = True
                     self.logger.info(
-                        f'  ★ New best: trans_med={med_trans:.1f}mm  '
+                        f'  ★ New best {metric_label}={current_best_value:.3f}: '
+                        f'trans_med={med_trans:.1f}mm  '
                         f'rot_med={val_metrics.get("val_rot_median", 0):.2f}°  '
                         f'joint@1°/50mm='
                         f'{val_metrics.get("val_joint_1deg_50mm", 0):.1f}%'
@@ -3301,6 +3668,9 @@ class ConcatLocTrainer:
 
         final_metrics = {
             'best_val_trans_median': float(self.best_val_trans),
+            'best_metric_name': str(self.best_metric_name),
+            'best_metric_value': float(self.best_metric_value),
+            'best_metric_label': str(self.best_metric_label),
             'epochs_completed': int(self.epoch + 1),
             'global_step': int(self.global_step),
             'total_time_min': float(total_time),
@@ -3322,6 +3692,7 @@ class ConcatLocTrainer:
 
         summary_lines = [
             f'best val trans={self.best_val_trans:.1f}mm',
+            f'best {self.best_metric_label}={self.best_metric_value:.3f}',
             f'epochs={self.epoch + 1} steps={self.global_step}',
             f'use_coarse={self.use_coarse} two_stage={bool(getattr(self.model, "use_two_stage_refine", False))} finetune_fsm={bool(getattr(self, "finetune_fsm", False))}',
         ]
@@ -3385,6 +3756,8 @@ def main():
                         help='Override GRU iters for eval sweep')
     parser.add_argument('--eval_seeds', type=int, default=1,
                         help='Number of random seeds for eval averaging')
+    parser.add_argument('--eval_sample_json', type=str, default=None,
+                        help='Optional path for per-sample eval records JSON')
     args = parser.parse_args()
 
     config = load_mainline_config(args.config)
@@ -3404,9 +3777,12 @@ def main():
         n_seeds = args.eval_seeds
         orig_gru = trainer.model.gru_iters
         orig_outer = trainer.outer_iters_val
+        sample_records = []
+        trainer._eval_collect_samples = bool(args.eval_sample_json)
         print(f"\n{'outer':>6} {'gru':>4} | {'rot_med':>8} {'trans_med':>10} {'<1°':>6} {'j@1/50':>7}"
               + (f" (avg {n_seeds} seeds)" if n_seeds > 1 else ""))
         print("-" * 60)
+        sweep_records = []
         for outer in outer_list:
             for gru in gru_list:
                 trainer.outer_iters_val = outer
@@ -3415,7 +3791,11 @@ def main():
                 for seed in range(n_seeds):
                     torch.manual_seed(42 + seed)
                     np.random.seed(42 + seed)
+                    trainer._eval_current_seed = seed
+                    trainer._eval_sample_records = []
                     metrics = trainer.validate(epoch=0)
+                    if args.eval_sample_json:
+                        sample_records.extend(getattr(trainer, '_eval_sample_records', []))
                     all_rm.append(metrics.get('val_rot_median', 0))
                     all_tm.append(metrics.get('val_trans_median', 0))
                     all_p1.append(metrics.get('val_pct_1deg', 0))
@@ -3424,11 +3804,35 @@ def main():
                 tm = np.mean(all_tm)
                 p1 = np.mean(all_p1)
                 j1 = np.mean(all_j1)
+                avg_metrics = {
+                    'val_rot_median': rm,
+                    'val_trans_median': tm,
+                    'val_pct_1deg': p1,
+                    'val_joint_1deg_50mm': j1,
+                }
+                sweep_records.append(
+                    build_eval_sweep_record(
+                        outer_iters=outer,
+                        gru_iters=gru,
+                        metrics=avg_metrics,
+                        seed_count=n_seeds,
+                    )
+                )
                 if n_seeds > 1:
                     print(f"{outer:>6} {gru:>4} | {rm:>7.2f}° {tm:>9.1f}mm {p1:>5.1f}% {j1:>6.1f}%"
                           f"  (±{np.std(all_tm):.1f}mm)")
                 else:
                     print(f"{outer:>6} {gru:>4} | {rm:>7.2f}° {tm:>9.1f}mm {p1:>5.1f}% {j1:>6.1f}%")
+        sweep_path = trainer.output_dir / 'eval_sweep_results.json'
+        with open(sweep_path, 'w', encoding='utf-8') as f:
+            json.dump({'records': sweep_records}, f, indent=2)
+        print(f"Eval sweep results saved to {sweep_path}")
+        if args.eval_sample_json:
+            sample_path = Path(args.eval_sample_json)
+            sample_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(sample_path, 'w', encoding='utf-8') as f:
+                json.dump({'records': sample_records}, f, indent=2)
+            print(f"Per-sample eval records saved to {sample_path}")
         trainer.model.gru_iters = orig_gru
         trainer.outer_iters_val = orig_outer
     else:

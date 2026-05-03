@@ -1,0 +1,20 @@
+base_config: joint_radio_dcff_cambridge_oldhospital_processed_adaptive_v7_stagea_locaware_flowhead_v34_fineloc_corr_anchor_frozenmap.yaml
+exp_name: joint_radio_dcff_cambridge_oldhospital_processed_adaptive_v7_stagea_locaware_flowhead_v36_fineloc_warp_anchor_frozenmap
+
+training:
+  seed: 467
+  lr: 0.00003
+  max_steps: 700
+
+map_supervision:
+  query_fine_weight: 0.12
+  query_fine_infonce_weight: 0.012
+  query_fine_grad_weight: 0.008
+  query_corr_ce_weight: 0.25
+  query_corr_subpixel_weight: 0.0
+  query_corr_flow_weight: 0.0
+  query_corr_peak_margin_weight: 0.0
+  query_corr_wls_pose_weight: 0.0
+  query_flow_warp_weight: 0.2
+  query_flow_warp_contrastive_weight: 20.0
+  query_flow_warp_contrastive_margin: 0.15

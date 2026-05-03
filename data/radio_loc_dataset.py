@@ -510,6 +510,7 @@ class RadioLocDataset(Dataset):
 
             self.samples.append({
                 'img_id': img_id,
+                'image_name': meta.name,
                 'fine_path': fine_path,
                 'coarse_path': coarse_path,
                 'teacher_fine_path': teacher_fine_path,
@@ -614,6 +615,7 @@ class RadioLocDataset(Dataset):
             'pose_gt': pose_gt,              # (4, 4)
             'pose_init': pose_init,          # (4, 4)
             'image_id': s['img_id'],
+            'image_name': s.get('image_name', ''),
             'intrinsics': self.intrinsics,   # {fx, fy, cx, cy}
         }
 

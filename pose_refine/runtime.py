@@ -16,6 +16,7 @@ RenderBatchFn = Callable[[torch.Tensor, Optional[bool]], dict]
 def build_concat_pose_model(model_cfg: dict, device: torch.device | str) -> ConcatPoseNet:
     return ConcatPoseNet(
         feature_dim=model_cfg.get("feature_dim", 64),
+        coarse_feature_dim=model_cfg.get("coarse_feature_dim", model_cfg.get("feature_dim", 64)),
         hidden_dim=model_cfg.get("hidden_dim", 256),
         irls_iters=model_cfg.get("irls_iters", 0),
         robust_kernel=model_cfg.get("robust_kernel", "huber"),
@@ -51,16 +52,76 @@ def build_concat_pose_model(model_cfg: dict, device: torch.device | str) -> Conc
         coarse_stage_pool_hw=model_cfg.get("coarse_stage_pool_hw", 4),
         coarse_stage_use_fsm=model_cfg.get("coarse_stage_use_fsm", True),
         pose_update_scale=model_cfg.get("pose_update_scale", 1.0),
+        local_matcher_enabled=model_cfg.get("local_matcher_enabled", False),
+        local_matcher_hidden_dim=model_cfg.get("local_matcher_hidden_dim", 64),
+        local_matcher_zero_init=model_cfg.get("local_matcher_zero_init", True),
+        local_matcher_residual_scale=model_cfg.get("local_matcher_residual_scale", 1.0),
+        local_matcher_context_mode=model_cfg.get("local_matcher_context_mode", "basic"),
+        checkpoint_guided_corr=model_cfg.get("checkpoint_guided_corr", False),
+        local_flow_head_enabled=model_cfg.get("local_flow_head_enabled", False),
+        local_flow_head_hidden_dim=model_cfg.get("local_flow_head_hidden_dim", 64),
+        local_flow_head_zero_init=model_cfg.get("local_flow_head_zero_init", True),
+        local_flow_head_max_flow=model_cfg.get("local_flow_head_max_flow", None),
+        local_flow_head_base_flow_mode=model_cfg.get("local_flow_head_base_flow_mode", "none"),
+        local_flow_head_base_temperature=model_cfg.get("local_flow_head_base_temperature", 0.05),
+        local_flow_head_context_mode=model_cfg.get("local_flow_head_context_mode", "basic"),
+        pose_update_trans_scale=model_cfg.get("pose_update_trans_scale", 1.0),
+        pose_update_rot_scale=model_cfg.get("pose_update_rot_scale", 1.0),
+        pose_update_trans_scale_after_first=model_cfg.get("pose_update_trans_scale_after_first", None),
+        pose_update_rot_scale_after_first=model_cfg.get("pose_update_rot_scale_after_first", None),
     ).to(device)
+
+
+def load_local_matcher_weights(
+    model: ConcatPoseNet,
+    checkpoint_path: str,
+    device: torch.device | str,
+    *,
+    strict: bool = False,
+) -> object:
+    """Load ``local_matcher.*`` weights from a query-student or pose-refine checkpoint."""
+    matcher = getattr(model, "local_matcher", None)
+    if matcher is None:
+        raise RuntimeError("Cannot load local matcher weights: model.local_matcher is disabled")
+    resolved_ckpt = resolve_checkpoint_path(checkpoint_path, must_exist=True)
+    assert resolved_ckpt is not None
+    checkpoint = torch.load(resolved_ckpt, map_location=device)
+    state = checkpoint.get("model_state_dict", checkpoint)
+    matcher_state = {
+        key[len("local_matcher."):]: value
+        for key, value in state.items()
+        if key.startswith("local_matcher.")
+    }
+    if not matcher_state:
+        raise RuntimeError(f"No local_matcher.* weights found in {resolved_ckpt}")
+    return matcher.load_state_dict(matcher_state, strict=strict)
 
 
 def apply_pose_delta(
     pose_w2c: torch.Tensor,
     delta_xi: torch.Tensor,
     scale: float = 1.0,
+    trans_scale: float = 1.0,
+    rot_scale: float = 1.0,
 ) -> torch.Tensor:
     with torch.cuda.amp.autocast(enabled=False):
-        return torch.bmm(se3_exp(delta_xi.float() * float(scale)), pose_w2c.float())
+        scaled = delta_xi.float().clone()
+        scaled[:, :3] = scaled[:, :3] * float(scale) * float(trans_scale)
+        scaled[:, 3:] = scaled[:, 3:] * float(scale) * float(rot_scale)
+        return torch.bmm(se3_exp(scaled), pose_w2c.float())
+
+
+def _pose_update_component_scales(model: ConcatPoseNet, outer_iter: int) -> tuple[float, float]:
+    trans_scale = float(getattr(model, "pose_update_trans_scale", 1.0))
+    rot_scale = float(getattr(model, "pose_update_rot_scale", 1.0))
+    if int(outer_iter) > 0:
+        trans_after = getattr(model, "pose_update_trans_scale_after_first", None)
+        rot_after = getattr(model, "pose_update_rot_scale_after_first", None)
+        if trans_after is not None:
+            trans_scale = float(trans_after)
+        if rot_after is not None:
+            rot_scale = float(rot_after)
+    return trans_scale, rot_scale
 
 
 def run_model_refine_iteration(
@@ -95,9 +156,21 @@ def run_model_refine_iteration(
                     fsm_spatial_conf=coarse_bundle.get("fsm_spatial_conf"),
                 )
             update_scale = float(getattr(model, "pose_update_scale", 1.0))
-            pose_mid = apply_pose_delta(pose_cur, coarse_pred["delta_xi"], scale=update_scale)
+            trans_scale, rot_scale = _pose_update_component_scales(model, outer_iter)
+            pose_mid = apply_pose_delta(
+                pose_cur,
+                coarse_pred["delta_xi"],
+                scale=update_scale,
+                trans_scale=trans_scale,
+                rot_scale=rot_scale,
+            )
 
-    fine_bundle = render_batch_fn(pose_mid, False)
+    needs_fine_coarse_context = bool(
+        query_coarse is not None
+        and getattr(model, "use_coarse", False)
+        and getattr(model, "use_coarse_in_fine_head", False)
+    )
+    fine_bundle = render_batch_fn(pose_mid, needs_fine_coarse_context)
     with torch.cuda.amp.autocast(enabled=autocast_enabled):
         fine_pred = model.forward_fine_stage(
             query_fine,
@@ -105,13 +178,21 @@ def run_model_refine_iteration(
             fine_bundle["depth"],
             intrinsics=render_intr,
             query_coarse=query_coarse,
+            rendered_coarse=fine_bundle.get("coarse_features"),
             irls_iters=irls_iters,
             robust_kernel=robust_kernel,
         )
     pose_next = pose_mid
     if apply_fine_update and "delta_xi" in fine_pred:
         update_scale = float(getattr(model, "pose_update_scale", 1.0))
-        pose_next = apply_pose_delta(pose_mid, fine_pred["delta_xi"], scale=update_scale)
+        trans_scale, rot_scale = _pose_update_component_scales(model, outer_iter)
+        pose_next = apply_pose_delta(
+            pose_mid,
+            fine_pred["delta_xi"],
+            scale=update_scale,
+            trans_scale=trans_scale,
+            rot_scale=rot_scale,
+        )
 
     return {
         "pose_mid": pose_mid,

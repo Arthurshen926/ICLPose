@@ -1,0 +1,13 @@
+base_config: joint_radio_dcff_cambridge_oldhospital_processed_adaptive_v7_stagea_locaware_flowhead_v48_negmap_distill_raw_finedecoder.yaml
+exp_name: joint_radio_dcff_cambridge_oldhospital_processed_adaptive_v7_stagea_locaware_flowhead_v49_negmap_distill_concat_highpass_finedecoder
+
+training:
+  seed: 607
+
+map_supervision:
+  query_corr_feature_preprocess: concat_highpass
+  query_corr_highpass_kernel: 5
+  query_corr_highpass_scale: 1.0
+  query_identity_corr_feature_preprocess: concat_highpass
+  query_identity_corr_highpass_kernel: 5
+  query_identity_corr_highpass_scale: 1.0

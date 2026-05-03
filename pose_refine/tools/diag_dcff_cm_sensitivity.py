@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from data.radio_loc_dataset import RadioLocDataset, collate_fn, read_colmap_cameras
 from feature_field import build_dcff_runtime, intrinsics_to_K, render_feature_bundle_batch
+from feature_extract.students.radio_query_student import DepthAwareLocalMatcher
 from pose_refine.models.concat_pose_net import (
     ConcatPoseNet,
     local_correlation,
@@ -90,6 +91,38 @@ def project_feature_pair(model, config, query_feat, rendered_feat):
     return F.normalize(query.float(), dim=1), F.normalize(rendered.float(), dim=1)
 
 
+def load_query_local_matcher(
+    config_path: str,
+    checkpoint_path: str,
+    device: torch.device | str,
+) -> DepthAwareLocalMatcher:
+    """Load only the query-student local matcher for pose diagnostics."""
+    with open(config_path, "r", encoding="utf-8") as f:
+        query_config = yaml.safe_load(f)
+    model_cfg = query_config.get("model", {})
+    if not bool(model_cfg.get("local_matcher_enabled", False)):
+        raise ValueError(f"Query config does not enable local matcher: {config_path}")
+    matcher = DepthAwareLocalMatcher(
+        radius=int(model_cfg.get("local_matcher_radius", 4)),
+        hidden_dim=int(model_cfg.get("local_matcher_hidden_dim", 64)),
+        zero_init=False,
+        residual_scale=float(model_cfg.get("local_matcher_residual_scale", 1.0)),
+    )
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    state = checkpoint.get("model_state_dict", checkpoint)
+    matcher_state = {
+        key[len("local_matcher."):]: value
+        for key, value in state.items()
+        if key.startswith("local_matcher.")
+    }
+    if not matcher_state:
+        raise RuntimeError(f"No local_matcher.* weights found in {checkpoint_path}")
+    matcher.load_state_dict(matcher_state, strict=True)
+    matcher.to(device)
+    matcher.eval()
+    return matcher
+
+
 def correlation_wls_pose_update(
     query_feat: torch.Tensor,
     rendered_feat: torch.Tensor,
@@ -102,6 +135,7 @@ def correlation_wls_pose_update(
     temperature: float,
     damping: float,
     valid_mask=None,
+    matcher=None,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
     """Local feature correlation -> soft subpixel flow -> depth WLS update."""
     with torch.cuda.amp.autocast(enabled=False):
@@ -112,6 +146,8 @@ def correlation_wls_pose_update(
         query_n = F.normalize(query, dim=1)
         rendered_n = F.normalize(rendered, dim=1)
         corr = local_correlation(rendered_n, query_n, radius=int(radius)).float()
+        if matcher is not None:
+            corr = matcher(corr, depth=depth, valid_mask=valid_mask).float()
         probs = torch.softmax(corr / max(float(temperature), 1e-6), dim=1)
         flow = soft_argmax_flow_from_correlation(
             corr,
@@ -190,6 +226,8 @@ def main() -> None:
     parser.add_argument("--corr_wls_damping", type=float, default=1e-3)
     parser.add_argument("--no_corr_wls", action="store_true")
     parser.add_argument("--pose_checkpoint", default=None)
+    parser.add_argument("--query_student_config", default=None)
+    parser.add_argument("--query_student_checkpoint", default=None)
     parser.add_argument("--use_projection", action="store_true")
     parser.add_argument("--no_feature_metric", action="store_true")
     parser.add_argument(
@@ -250,6 +288,19 @@ def main() -> None:
             state = ckpt.get("model_state_dict", ckpt)
             proj_model.load_state_dict(state, strict=False)
         proj_model.eval()
+    query_matcher = None
+    if args.query_student_config or args.query_student_checkpoint:
+        if not args.query_student_config or not args.query_student_checkpoint:
+            raise ValueError("--query_student_config and --query_student_checkpoint must be provided together")
+        query_matcher = load_query_local_matcher(
+            args.query_student_config,
+            args.query_student_checkpoint,
+            device,
+        )
+        print(
+            "Loaded query local matcher: "
+            f"config={args.query_student_config} checkpoint={args.query_student_checkpoint}"
+        )
 
     pos_all = []
     rank_stats = {float(cm): {"neg": [], "acc": [], "gap": []} for cm in args.dist_cm}
@@ -360,6 +411,7 @@ def main() -> None:
                 temperature=args.corr_temperature,
                 damping=args.corr_wls_damping,
                 valid_mask=init_mask,
+                matcher=query_matcher,
             )
             corr_rot, corr_trans = pose_errors(corr_pose, pose_gt)
             corr_stats["rot"].extend(corr_rot.cpu().tolist())

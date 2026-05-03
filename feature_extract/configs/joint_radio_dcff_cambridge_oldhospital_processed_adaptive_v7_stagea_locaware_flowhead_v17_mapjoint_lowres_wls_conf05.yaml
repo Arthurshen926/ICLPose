@@ -1,0 +1,8 @@
+base_config: joint_radio_dcff_cambridge_oldhospital_processed_adaptive_v7_stagea_locaware_flowhead_v16_mapjoint_lowres_wls_conf02.yaml
+exp_name: joint_radio_dcff_cambridge_oldhospital_processed_adaptive_v7_stagea_locaware_flowhead_v17_mapjoint_lowres_wls_conf05
+
+training:
+  seed: 313
+
+map_supervision:
+  query_corr_wls_conf_threshold: 0.5

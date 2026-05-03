@@ -1,0 +1,22 @@
+base_config: joint_radio_dcff_cambridge_oldhospital_processed_adaptive_v7_stagea_locaware_flowhead_v26_corrfocus_matcher_frozenmap.yaml
+exp_name: joint_radio_dcff_cambridge_oldhospital_processed_adaptive_v7_stagea_locaware_flowhead_v27_matcher_only_frozenmap
+
+training:
+  seed: 383
+  lr: 0.0000001
+  max_steps: 700
+  model_lr_scales:
+    local_matcher.: 1500.0
+
+map_supervision:
+  query_fine_weight: 0.0
+  query_fine_infonce_weight: 0.0
+  query_fine_grad_weight: 0.0
+  query_variance_weight: 0.0
+  query_covariance_weight: 0.0
+  query_corr_ce_weight: 1.5
+  query_corr_subpixel_weight: 6.0
+  query_corr_flow_weight: 3.0
+  query_corr_peak_margin_weight: 20.0
+  query_flow_warp_weight: 0.0
+  query_flow_warp_contrastive_weight: 0.0

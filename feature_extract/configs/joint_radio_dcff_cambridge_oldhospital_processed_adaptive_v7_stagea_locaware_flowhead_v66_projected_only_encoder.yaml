@@ -1,0 +1,26 @@
+base_config: joint_radio_dcff_cambridge_oldhospital_processed_adaptive_v7_stagea_locaware_flowhead_v65_projected_only_loc.yaml
+exp_name: joint_radio_dcff_cambridge_oldhospital_processed_adaptive_v7_stagea_locaware_flowhead_v66_projected_only_encoder
+
+training:
+  seed: 727
+  lr: 0.00004
+  freeze_model_except_prefixes:
+    - "stage3."
+    - "stage4."
+    - "fine_fuse."
+    - "fine_head."
+    - "fine_loc_head."
+    - "fine_loc_highres_fuse."
+    - "fine_loc_scale"
+    - "fine_loc_highres_scale"
+  model_lr_scales:
+    stage3.: 0.15
+    stage4.: 0.30
+    fine_fuse.: 0.60
+    fine_head.: 0.60
+    fine_loc_head.: 2.0
+    fine_loc_highres_fuse.: 2.0
+
+map_supervision:
+  query_projected_fine_weight: 8.0
+  query_fine_weight: 0.10

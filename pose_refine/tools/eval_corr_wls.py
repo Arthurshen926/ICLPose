@@ -16,6 +16,7 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from data.radio_loc_dataset import RadioLocDataset, collate_fn, read_colmap_cameras
+from feature_extract.students.radio_query_student import DepthAwareLocalMatcher
 from feature_field import build_dcff_runtime, intrinsics_to_K, render_feature_bundle_batch
 from pose_refine.models.concat_pose_net import local_correlation
 from pose_refine.utils.geometry_solver import compute_image_jacobian, diff_pose_solve
@@ -55,10 +56,15 @@ def soft_corr_flow(
     query_feat: torch.Tensor,
     radius: int,
     temperature: float,
+    matcher: torch.nn.Module | None = None,
+    depth: torch.Tensor | None = None,
+    valid_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     r = F.normalize(rendered_feat.float(), dim=1)
     q = F.normalize(query_feat.float(), dim=1)
     corr = local_correlation(r, q, radius=radius)
+    if matcher is not None:
+        corr = matcher(corr, depth=depth, valid_mask=valid_mask)
     B, _, H, W = corr.shape
     win = 2 * radius + 1
 
@@ -78,6 +84,42 @@ def soft_corr_flow(
     return flow, confidence
 
 
+def load_feature_extract_local_matcher(
+    config_path: str | None,
+    checkpoint_path: str | None,
+    device: torch.device,
+) -> DepthAwareLocalMatcher | None:
+    if not config_path and not checkpoint_path:
+        return None
+    if not config_path or not checkpoint_path:
+        raise ValueError("--local_matcher_config and --local_matcher_checkpoint must be provided together")
+
+    with open(config_path, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+    model_cfg = cfg.get("model", {})
+    if not bool(model_cfg.get("local_matcher_enabled", False)):
+        return None
+
+    matcher = DepthAwareLocalMatcher(
+        radius=int(model_cfg.get("local_matcher_radius", 4)),
+        hidden_dim=int(model_cfg.get("local_matcher_hidden_dim", 64)),
+        zero_init=bool(model_cfg.get("local_matcher_zero_init", True)),
+        residual_scale=float(model_cfg.get("local_matcher_residual_scale", 1.0)),
+    ).to(device)
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    state = checkpoint.get("model_state_dict", checkpoint)
+    matcher_state = {
+        key[len("local_matcher.") :]: value
+        for key, value in state.items()
+        if key.startswith("local_matcher.")
+    }
+    if not matcher_state:
+        raise RuntimeError(f"No local_matcher.* weights found in {checkpoint_path}")
+    matcher.load_state_dict(matcher_state, strict=True)
+    matcher.eval()
+    return matcher
+
+
 @torch.no_grad()
 def main() -> None:
     parser = argparse.ArgumentParser(description="Zero-shot local-correlation flow + WLS evaluation")
@@ -91,6 +133,8 @@ def main() -> None:
     parser.add_argument("--radius", type=int, default=4)
     parser.add_argument("--temperature", type=float, default=0.05)
     parser.add_argument("--irls_iters", type=int, default=2)
+    parser.add_argument("--local_matcher_config", default=None)
+    parser.add_argument("--local_matcher_checkpoint", default=None)
     args = parser.parse_args()
 
     device = torch.device(f"cuda:{args.gpu}")
@@ -101,6 +145,11 @@ def main() -> None:
     runtime = build_dcff_runtime(config, device, printer=print)
     render_h = int(runtime.render_height)
     render_w = int(runtime.render_width)
+    local_matcher = load_feature_extract_local_matcher(
+        args.local_matcher_config,
+        args.local_matcher_checkpoint,
+        device,
+    )
 
     ds_cfg = config["dataset"]
     dataset = RadioLocDataset(
@@ -127,6 +176,8 @@ def main() -> None:
         f"Render: {render_w}x{render_h}  noise={args.noise_deg}deg/{args.noise_m}m  "
         f"radius={args.radius} temp={args.temperature}"
     )
+    if local_matcher is not None:
+        print(f"Local matcher: radius={local_matcher.radius}")
 
     for max_oi in args.outer_iters:
         init_rot_all, init_trans_all = [], []
@@ -160,11 +211,19 @@ def main() -> None:
                 if depth.ndim == 4:
                     depth = depth.squeeze(1)
 
-                flow, confidence = soft_corr_flow(rendered, query_fine, args.radius, args.temperature)
+                Ju, Jv, valid = compute_image_jacobian(depth.float(), render_intr)
+                valid_mask = valid.view(depth.shape[0], 1, render_h, render_w).float()
+                flow, confidence = soft_corr_flow(
+                    rendered,
+                    query_fine,
+                    args.radius,
+                    args.temperature,
+                    matcher=local_matcher,
+                    depth=depth,
+                    valid_mask=valid_mask,
+                )
                 flow_mag_all.append(float(flow.norm(dim=1).mean().item()))
                 conf_all.append(float(confidence.mean().item()))
-
-                Ju, Jv, valid = compute_image_jacobian(depth.float(), render_intr)
                 delta_xi = diff_pose_solve(
                     flow.float(),
                     confidence.float(),

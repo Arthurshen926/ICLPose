@@ -1,0 +1,32 @@
+base_config: joint_radio_dcff_cambridge_oldhospital_processed_adaptive_v7_stagea_locaware_flowhead_v38_identitycorr_unfreezefine.yaml
+exp_name: joint_radio_dcff_cambridge_oldhospital_processed_adaptive_v7_stagea_locaware_flowhead_v40_identitycorr_balanced_unfreezefine
+
+training:
+  seed: 521
+  lr: 0.000015
+  batch_size: 2
+  max_steps: 700
+
+map_supervision:
+  query_fine_weight: 0.25
+  query_fine_infonce_weight: 0.015
+  query_fine_grad_weight: 0.020
+  query_variance_weight: 0.015
+  query_covariance_weight: 0.003
+
+  query_identity_corr_radius: 4
+  query_identity_corr_ce_weight: 0.6
+  query_identity_corr_subpixel_weight: 1.0
+  query_identity_corr_flow_weight: 0.2
+  query_identity_corr_peak_margin_weight: 8.0
+  query_identity_corr_peak_margin: 0.04
+  query_identity_corr_temperature: 0.02
+  query_identity_corr_ce_temperature: 0.05
+
+  query_corr_ce_weight: 0.8
+  query_corr_subpixel_weight: 0.8
+  query_corr_flow_weight: 0.4
+  query_corr_peak_margin_weight: 8.0
+  query_corr_peak_margin: 0.04
+  query_flow_warp_weight: 0.08
+  query_flow_warp_contrastive_weight: 6.0

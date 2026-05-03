@@ -1,0 +1,51 @@
+base_config: joint_radio_dcff_cambridge_oldhospital_processed_adaptive_v7_stagea_locaware_flowhead_v37_fineloc_warp_peak_frozenmap.yaml
+exp_name: joint_radio_dcff_cambridge_oldhospital_processed_adaptive_v7_stagea_locaware_flowhead_v38_identitycorr_unfreezefine
+
+training:
+  seed: 491
+  lr: 0.00002
+  batch_size: 2
+  max_steps: 700
+  freeze_model_except_prefixes:
+    - "stem."
+    - "stage2."
+    - "fine_fuse."
+    - "fine_low_fuse."
+    - "fine_low_scale"
+    - "fine_highres_fuse."
+    - "fine_highres_scale"
+    - "fine_head."
+    - "fine_loc_head."
+    - "fine_loc_highres_fuse."
+    - "fine_loc_scale"
+    - "fine_loc_highres_scale"
+  model_lr_scales:
+    stem.: 0.25
+    stage2.: 0.5
+    fine_loc_head.: 2.0
+    fine_loc_highres_fuse.: 2.0
+
+map_supervision:
+  query_fine_weight: 0.10
+  query_fine_infonce_weight: 0.010
+  query_fine_grad_weight: 0.010
+  query_variance_weight: 0.020
+  query_covariance_weight: 0.004
+
+  # Same-pose local identity contrastive target: map_gt/query should peak at zero offset.
+  query_identity_corr_ce_weight: 2.0
+  query_identity_corr_subpixel_weight: 3.0
+  query_identity_corr_flow_weight: 0.8
+  query_identity_corr_peak_margin_weight: 40.0
+  query_identity_corr_peak_margin: 0.08
+  query_identity_corr_temperature: 0.005
+  query_identity_corr_ce_temperature: 0.04
+
+  # Perturbed-pose flow remains as a weaker localization target after identity sharpening.
+  query_corr_ce_weight: 1.0
+  query_corr_subpixel_weight: 1.0
+  query_corr_flow_weight: 0.5
+  query_corr_peak_margin_weight: 12.0
+  query_corr_peak_margin: 0.05
+  query_flow_warp_weight: 0.08
+  query_flow_warp_contrastive_weight: 6.0

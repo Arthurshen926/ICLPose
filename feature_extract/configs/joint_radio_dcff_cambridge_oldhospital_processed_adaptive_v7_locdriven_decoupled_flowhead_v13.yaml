@@ -1,0 +1,109 @@
+base_config: joint_radio_dcff_cambridge_oldhospital_processed_adaptive_v7_locdriven_decoupled_fineloc_v10.yaml
+exp_name: joint_radio_dcff_cambridge_oldhospital_processed_adaptive_v7_locdriven_decoupled_flowhead_v13
+
+model:
+  local_matcher_enabled: false
+  local_flow_head_enabled: true
+  local_flow_head_radius: 10
+  local_flow_head_hidden_dim: 128
+  local_flow_head_zero_init: true
+  local_flow_head_max_flow: 10.0
+  local_flow_head_base_flow_mode: softargmax
+  local_flow_head_base_temperature: 0.01
+  warmstart_strict: false
+  warmstart_skip_prefixes: ["local_flow_head."]
+
+training:
+  seed: 893
+  lr: 0.00006
+  batch_size: 2
+  max_steps: 900
+  freeze_model_except_prefixes:
+    - "local_flow_head."
+    - "stage3."
+    - "stage4."
+    - "fine_fuse."
+    - "fine_low_fuse."
+    - "fine_low_scale"
+    - "fine_highres_fuse."
+    - "fine_highres_scale"
+    - "fine_head."
+    - "fine_loc_head."
+    - "fine_loc_highres_fuse."
+    - "fine_loc_scale"
+    - "fine_loc_highres_scale"
+    - "local_corr_projector."
+  model_lr_scales:
+    local_flow_head.: 6.0
+    stage3.: 0.03
+    stage4.: 0.08
+    fine_head.: 0.35
+    fine_loc_head.: 3.0
+    fine_loc_highres_fuse.: 3.0
+    local_corr_projector.: 3.0
+
+map_supervision:
+  local_matcher_enabled: false
+  local_flow_head_enabled: true
+
+  query_fine_key: fine
+  query_local_fine_key: fine_loc
+
+  query_fine_weight: 0.06
+  query_fine_infonce_weight: 0.004
+  query_fine_grad_weight: 0.010
+
+  query_local_fine_weight: 0.010
+  query_local_fine_infonce_weight: 0.050
+  query_local_fine_grad_weight: 0.010
+  query_projected_fine_weight: 0.0
+
+  query_coarse_weight: 0.0
+  query_coarse_infonce_weight: 0.0
+  query_coarse_grad_weight: 0.0
+  coarse_pose_rank_weight: 0.0
+
+  rendered_teacher_fine_weight: 0.0
+  rendered_teacher_fine_infonce_weight: 0.0
+  rendered_teacher_fine_grad_weight: 0.0
+  rendered_teacher_coarse_weight: 0.0
+
+  query_identity_corr_ce_weight: 0.0
+  query_identity_corr_subpixel_weight: 0.0
+  query_identity_corr_flow_weight: 0.0
+  query_identity_corr_peak_margin_weight: 0.0
+  query_identity_corr_distill_weight: 0.0
+
+  query_corr_ce_weight: 0.0
+  query_corr_subpixel_weight: 0.0
+  query_corr_flow_weight: 14.0
+  query_corr_flow_head_conf_weight: 0.2
+  query_corr_peak_margin_weight: 0.0
+  query_corr_distill_weight: 0.0
+  query_corr_wls_pose_weight: 2.0
+  query_corr_pose_gain_weight: 0.8
+  query_corr_pose_gain_trans_margin_mm: 1.0
+  query_corr_pose_gain_rot_margin_deg: 0.02
+  query_corr_flow_decode_mode: argmax_st
+  query_corr_min_flow_px: 0.75
+  query_corr_max_flow_px: 8.0
+  query_corr_radius: 10
+  query_corr_temperature: 0.005
+  query_corr_huber_delta: 0.05
+  query_corr_wls_pose_damping: 0.02
+  query_corr_wls_pose_update_scale: 0.35
+  query_corr_wls_pose_rot_weight: 0.2
+  query_corr_wls_pose_trans_weight: 40.0
+  query_corr_wls_conf_threshold: 0.0
+  query_corr_wls_conf_power: 2.0
+
+  query_flow_warp_weight: 0.0
+  query_flow_warp_contrastive_weight: 0.0
+  map_self_flow_warp_weight: 0.0
+  map_self_flow_warp_contrastive_weight: 0.0
+  map_self_corr_ce_weight: 0.0
+  map_self_corr_subpixel_weight: 0.0
+  map_self_corr_flow_weight: 0.0
+  map_self_corr_peak_margin_weight: 0.0
+  map_self_feature_metric_pose_weight: 0.0
+  feature_metric_pose_weight: 0.0

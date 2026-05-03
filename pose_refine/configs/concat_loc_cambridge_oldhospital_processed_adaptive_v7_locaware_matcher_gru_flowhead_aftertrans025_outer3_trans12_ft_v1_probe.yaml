@@ -1,0 +1,12 @@
+base_config: concat_loc_cambridge_oldhospital_processed_adaptive_v7_locaware_matcher_gru_flowhead_aftertrans025_outer3_v1_probe.yaml
+exp_name: concat_loc_cambridge_oldhospital_processed_adaptive_v7_locaware_matcher_gru_flowhead_aftertrans025_outer3_trans12_ft_v1_probe
+
+training:
+  epochs: 3
+  lr: 1.5e-6
+  min_lr: 1.5e-7
+  max_train_batches: 160
+  max_val_batches: 64
+  best_metric: joint_1deg_50mm
+  loss:
+    trans_weight: 12.0

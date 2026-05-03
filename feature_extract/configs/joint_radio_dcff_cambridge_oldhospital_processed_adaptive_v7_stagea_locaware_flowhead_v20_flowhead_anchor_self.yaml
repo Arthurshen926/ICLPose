@@ -1,0 +1,24 @@
+base_config: joint_radio_dcff_cambridge_oldhospital_processed_adaptive_v7_stagea_locaware_flowhead_v19_mapjoint_anchor_self.yaml
+exp_name: joint_radio_dcff_cambridge_oldhospital_processed_adaptive_v7_stagea_locaware_flowhead_v20_flowhead_anchor_self
+
+model:
+  local_flow_head_enabled: true
+  local_flow_head_radius: 10
+  local_flow_head_hidden_dim: 64
+  local_flow_head_zero_init: true
+  local_flow_head_max_flow: 4.0
+  local_flow_head_base_flow_mode: argmax
+  local_flow_head_base_temperature: 0.005
+
+training:
+  seed: 337
+  lr: 0.00003
+  max_steps: 500
+
+map_supervision:
+  local_flow_head_enabled: true
+  query_corr_flow_weight: 1.0
+  query_corr_flow_head_conf_weight: 0.05
+  query_corr_wls_pose_weight: 0.0
+  query_corr_pose_gain_weight: 0.0
+

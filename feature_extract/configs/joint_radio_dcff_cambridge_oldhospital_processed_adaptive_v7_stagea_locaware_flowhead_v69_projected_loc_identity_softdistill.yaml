@@ -1,0 +1,24 @@
+base_config: joint_radio_dcff_cambridge_oldhospital_processed_adaptive_v7_stagea_locaware_flowhead_v65_projected_only_loc.yaml
+exp_name: joint_radio_dcff_cambridge_oldhospital_processed_adaptive_v7_stagea_locaware_flowhead_v69_projected_loc_identity_softdistill
+
+training:
+  seed: 743
+  batch_size: 1
+  max_steps: 400
+  lr: 0.000025
+
+map_supervision:
+  query_projected_fine_weight: 5.0
+  query_fine_weight: 0.06
+
+  query_identity_corr_ce_weight: 0.0
+  query_identity_corr_subpixel_weight: 0.0
+  query_identity_corr_flow_weight: 0.0
+  query_identity_corr_peak_margin_weight: 0.0
+  query_identity_corr_distill_weight: 4.0
+
+  query_corr_ce_weight: 0.0
+  query_corr_subpixel_weight: 0.0
+  query_corr_flow_weight: 0.0
+  query_corr_peak_margin_weight: 0.0
+  query_corr_distill_weight: 0.0

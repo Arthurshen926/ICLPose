@@ -112,6 +112,7 @@ DEFAULT_CONFIG = {
         "fine_highres_init": 0.0,
         "fine_highres_zero_init": False,
         "fine_loc_head": False,
+        "fine_loc_mode": "residual",
         "fine_loc_init": 1.0,
         "fine_loc_zero_init": True,
         "fine_loc_detach_base": False,
@@ -128,6 +129,50 @@ DEFAULT_CONFIG = {
         "scene_coord_detach_base": False,
         "scene_coord_use_pixel_grid": False,
         "scene_coord_global_context": False,
+        "local_matcher_enabled": False,
+        "local_matcher_radius": 4,
+        "local_matcher_hidden_dim": 64,
+        "local_matcher_zero_init": True,
+        "local_matcher_residual_scale": 1.0,
+        "local_flow_head_enabled": False,
+        "local_flow_head_radius": 4,
+        "local_flow_head_hidden_dim": 64,
+        "local_flow_head_zero_init": True,
+        "local_flow_head_max_flow": None,
+        "local_flow_head_base_flow_mode": "none",
+        "local_flow_head_base_temperature": 0.05,
+        "local_corr_projector_enabled": False,
+        "local_corr_projector_hidden_dim": 96,
+        "local_corr_projector_output_dim": None,
+        "local_corr_projector_zero_init": True,
+        "local_corr_projector_l2_normalize": True,
+        "query_channel_gate_enabled": False,
+        "query_channel_gate_hidden_dim": None,
+        "query_channel_gate_zero_init": True,
+        "apply_query_channel_gate": False,
+        "pose_init_head": False,
+        "pose_init_hypotheses": 3,
+        "pose_init_hidden_dim": None,
+        "pose_init_mode": "direct",
+        "pose_init_anchor_centers": None,
+        "pose_init_anchor_rotmats": None,
+        "pose_init_anchor_descriptors": None,
+        "pose_init_anchor_sampling": "fps",
+        "pose_init_num_anchors": 64,
+        "pose_init_residual_scale": 1.5,
+        "pose_init_temperature": 0.05,
+        "pose_init_feature_bank_projector": "mlp",
+        "pose_init_feature_source": "fine_coarse",
+        "pose_init_feature_bank_source": "teacher",
+    },
+    "pose_init": {
+        "enabled": False,
+        "trans_weight": 1.0,
+        "rot_weight": 1.0,
+        "score_weight": 0.1,
+        "uncertainty_weight": 0.0,
+        "rot_cost_weight": 0.1,
+        "anchor_weight": 0.0,
     },
     "training": {
         "device": "cuda",
@@ -143,6 +188,8 @@ DEFAULT_CONFIG = {
         "save_every_epochs": 1,
         "val_every_epochs": 1,
         "max_steps": None,
+        "model_lr_scales": {},
+        "freeze_model_except_prefixes": None,
     },
     "loss": {
         "fine_l1_weight": 1.0,
@@ -202,6 +249,8 @@ DEFAULT_CONFIG = {
         "query_fine_weight": 0.0,
         "query_fine_raw_weight": 0.0,
         "query_coarse_weight": 0.0,
+        "coarse_pose_rank_weight": 0.0,
+        "coarse_pose_rank_temperature": 0.07,
         "query_fine_infonce_weight": 0.0,
         "query_coarse_infonce_weight": 0.0,
         "fine_coarse_ortho_weight": 0.0,
@@ -239,15 +288,43 @@ DEFAULT_CONFIG = {
         "feature_metric_pose_rot_weight": 1.0,
         "feature_metric_pose_trans_weight": 50.0,
         "feature_metric_pose_normalize": True,
+        "query_corr_ce_weight": 0.0,
+        "query_corr_ce_temperature": None,
         "query_corr_subpixel_weight": 0.0,
         "query_corr_flow_weight": 0.0,
+        "query_corr_flow_cosine_weight": 0.0,
+        "query_corr_flow_head_conf_weight": 0.0,
         "query_corr_peak_margin_weight": 0.0,
+        "query_corr_distill_weight": 0.0,
+        "query_corr_distill_temperature": None,
+        "query_corr_distill_target_temperature": None,
         "query_corr_peak_margin": 0.05,
+        "query_identity_corr_ce_weight": 0.0,
+        "query_identity_corr_subpixel_weight": 0.0,
+        "query_identity_corr_flow_weight": 0.0,
+        "query_identity_corr_peak_margin_weight": 0.0,
+        "query_identity_corr_distill_weight": 0.0,
+        "query_identity_corr_distill_temperature": None,
+        "query_identity_corr_distill_target_temperature": None,
+        "query_identity_corr_peak_margin": None,
+        "query_identity_corr_radius": None,
+        "query_identity_corr_temperature": None,
+        "query_identity_corr_ce_temperature": None,
+        "query_identity_corr_feature_preprocess": None,
+        "query_identity_corr_highpass_kernel": None,
+        "query_identity_corr_highpass_scale": None,
         "query_corr_wls_pose_weight": 0.0,
         "query_corr_wls_pose_damping": 1e-3,
         "query_corr_wls_pose_update_scale": 1.0,
         "query_corr_wls_pose_rot_weight": 1.0,
         "query_corr_wls_pose_trans_weight": 50.0,
+        "query_corr_wls_conf_threshold": 0.0,
+        "query_corr_wls_conf_power": 1.0,
+        "query_corr_pose_gain_weight": 0.0,
+        "query_corr_pose_gain_rot_margin_deg": 0.0,
+        "query_corr_pose_gain_trans_margin_mm": 0.0,
+        "query_corr_pose_gain_rot_weight": 0.0,
+        "query_corr_pose_gain_trans_weight": 1.0,
         "query_scene_coord_weight": 0.0,
         "query_scene_coord_warp_weight": 0.0,
         "query_scene_coord_huber_beta": 0.02,
@@ -258,13 +335,30 @@ DEFAULT_CONFIG = {
         "query_corr_radius": 4,
         "query_corr_temperature": 0.05,
         "query_corr_huber_delta": 1.0,
+        "query_corr_min_flow_px": 0.0,
+        "query_corr_max_flow_px": 0.0,
+        "query_corr_flow_decode_mode": "softargmax",
+        "query_corr_feature_preprocess": "none",
+        "query_corr_highpass_kernel": 3,
+        "query_corr_highpass_scale": 1.0,
+        "query_projected_fine_weight": 0.0,
+        "local_corr_projector_apply_to_query": True,
         "query_flow_warp_weight": 0.0,
         "query_flow_warp_contrastive_weight": 0.0,
         "query_flow_warp_contrastive_margin": 0.1,
         "query_flow_warp_contrastive_offsets": None,
         "query_fine_key": "fine",
+        "query_local_fine_key": None,
+        "query_local_fine_weight": 0.0,
+        "query_local_fine_infonce_weight": 0.0,
+        "query_local_fine_grad_weight": 0.0,
+        "local_matcher_enabled": False,
+        "local_flow_head_enabled": False,
+        "local_corr_projector_enabled": False,
+        "map_self_corr_ce_weight": 0.0,
         "map_self_corr_subpixel_weight": 0.0,
         "map_self_corr_flow_weight": 0.0,
+        "map_self_corr_peak_margin_weight": 0.0,
         "map_self_flow_warp_weight": 0.0,
         "map_self_flow_warp_contrastive_weight": 0.0,
         "map_self_feature_metric_pose_weight": 0.0,
@@ -287,8 +381,15 @@ def deep_merge(base, override):
 
 
 def load_config(path):
-    with open(path, "r") as f:
+    config_path = Path(path)
+    with open(config_path, "r") as f:
         user_cfg = yaml.safe_load(f) or {}
+    base_config = user_cfg.pop("base_config", None)
+    if base_config:
+        base_path = Path(base_config)
+        if not base_path.is_absolute():
+            base_path = config_path.parent / base_path
+        return deep_merge(load_config(base_path), user_cfg)
     return deep_merge(DEFAULT_CONFIG, user_cfg)
 
 
@@ -297,6 +398,56 @@ def safe_torch_load(path):
         return torch.load(path, map_location="cpu", weights_only=True)
     except TypeError:
         return torch.load(path, map_location="cpu")
+
+
+def load_model_warmstart(model, checkpoint, strict=True, skip_prefixes=None):
+    """Load model weights for warmstart, optionally skipping incompatible tensors.
+
+    PyTorch's strict=False still raises on shape mismatches. Warmstarting across
+    high-res student variants needs the compatible layers while leaving resized
+    heads/skip branches randomly initialized.
+    """
+    source_state = checkpoint.get("model_state_dict", checkpoint)
+    skip_prefixes = tuple(str(prefix) for prefix in (skip_prefixes or []) if str(prefix))
+    if strict:
+        if skip_prefixes:
+            raise ValueError("skip_prefixes requires strict=False warmstart")
+        load_result = model.load_state_dict(source_state, strict=True)
+        return {
+            "load_result": load_result,
+            "missing_keys": list(getattr(load_result, "missing_keys", [])),
+            "unexpected_keys": list(getattr(load_result, "unexpected_keys", [])),
+            "skipped_mismatched": {},
+            "skipped_unexpected": [],
+            "skipped_by_prefix": [],
+        }
+
+    target_state = model.state_dict()
+    filtered_state = {}
+    skipped_mismatched = {}
+    skipped_unexpected = []
+    skipped_by_prefix = []
+    for key, value in source_state.items():
+        if any(key.startswith(prefix) for prefix in skip_prefixes):
+            skipped_by_prefix.append(key)
+            continue
+        if key not in target_state:
+            skipped_unexpected.append(key)
+            continue
+        if tuple(value.shape) != tuple(target_state[key].shape):
+            skipped_mismatched[key] = (tuple(value.shape), tuple(target_state[key].shape))
+            continue
+        filtered_state[key] = value
+
+    load_result = model.load_state_dict(filtered_state, strict=False)
+    return {
+        "load_result": load_result,
+        "missing_keys": list(load_result.missing_keys),
+        "unexpected_keys": list(load_result.unexpected_keys),
+        "skipped_mismatched": skipped_mismatched,
+        "skipped_unexpected": skipped_unexpected,
+        "skipped_by_prefix": skipped_by_prefix,
+    }
 
 
 def perturb_w2c_camera_center(pose: torch.Tensor, offset: torch.Tensor, frame: str = "camera") -> torch.Tensor:
@@ -344,6 +495,361 @@ def pose_error_tensors(pose_pred: torch.Tensor, pose_gt: torch.Tensor):
         dim=1,
     )
     return rot_cos_loss, rot_err_deg, trans_err_m
+
+
+def _rotation_error_from_mats(rot_pred: torch.Tensor, rot_gt: torch.Tensor):
+    rot_gt = rot_gt.to(device=rot_pred.device, dtype=rot_pred.dtype)
+    rot_rel = rot_pred.transpose(-1, -2) @ rot_gt
+    trace = rot_rel[..., 0, 0] + rot_rel[..., 1, 1] + rot_rel[..., 2, 2]
+    cos_angle = torch.clamp((trace - 1.0) / 2.0, -1.0, 1.0)
+    rot_cos_loss = 1.0 - cos_angle
+    rot_err_deg = torch.acos(cos_angle.clamp(-1.0 + 1e-7, 1.0 - 1e-7)) * 180.0 / math.pi
+    return rot_cos_loss, rot_err_deg
+
+
+def farthest_point_anchor_centers(centers: torch.Tensor, num_anchors: int) -> torch.Tensor:
+    """Deterministic farthest-point sampling over camera centers."""
+    centers = torch.as_tensor(centers, dtype=torch.float32)
+    if centers.ndim != 2 or centers.shape[1] != 3:
+        raise ValueError("centers must have shape (N, 3)")
+    if centers.shape[0] <= 0:
+        raise ValueError("centers must contain at least one point")
+    num_anchors = max(1, min(int(num_anchors), int(centers.shape[0])))
+    centroid = centers.mean(dim=0, keepdim=True)
+    first_idx = torch.linalg.norm(centers - centroid, dim=1).argmax()
+    selected = [int(first_idx.item())]
+    min_dist = torch.linalg.norm(centers - centers[first_idx].view(1, 3), dim=1)
+    for _ in range(1, num_anchors):
+        next_idx = int(min_dist.argmax().item())
+        selected.append(next_idx)
+        next_dist = torch.linalg.norm(centers - centers[next_idx].view(1, 3), dim=1)
+        min_dist = torch.minimum(min_dist, next_dist)
+    return centers[selected].clone()
+
+
+def pose_anchor_centers_from_dataset(dataset, num_anchors: int) -> torch.Tensor:
+    centers = []
+    for record in dataset.records:
+        sample_name = record["sample_name"].replace("\\", "/")
+        pose = dataset.name_to_pose.get(sample_name)
+        if pose is None:
+            pose = dataset.basename_to_pose.get(Path(sample_name).name)
+        if pose is not None:
+            centers.append(camera_centers_from_w2c(pose.float().unsqueeze(0))[0])
+    if not centers:
+        raise RuntimeError(
+            "Cannot build anchor pose initializer: no COLMAP pose_gt was found for the training split."
+        )
+    return farthest_point_anchor_centers(torch.stack(centers, dim=0), num_anchors=num_anchors)
+
+
+def pose_anchors_from_dataset(dataset, num_anchors: int, sampling: str = "fps"):
+    poses = []
+    centers = []
+    for record in dataset.records:
+        sample_name = record["sample_name"].replace("\\", "/")
+        pose = dataset.name_to_pose.get(sample_name)
+        if pose is None:
+            pose = dataset.basename_to_pose.get(Path(sample_name).name)
+        if pose is not None:
+            pose = pose.float()
+            poses.append(pose)
+            centers.append(camera_centers_from_w2c(pose.unsqueeze(0))[0])
+    if not centers:
+        raise RuntimeError(
+            "Cannot build anchor pose initializer: no COLMAP pose_gt was found for the training split."
+        )
+    centers = torch.stack(centers, dim=0)
+    sampling = str(sampling or "fps").lower()
+    if sampling in {"all", "train_all", "pose_bank"}:
+        rotmats = torch.stack([pose[:3, :3] for pose in poses], dim=0)
+        return centers, rotmats
+    if sampling != "fps":
+        raise ValueError("pose_init_anchor_sampling must be one of {'fps', 'train_all'}")
+    anchors = farthest_point_anchor_centers(centers, num_anchors=num_anchors)
+    dist = torch.cdist(anchors, centers)
+    nearest = dist.argmin(dim=1)
+    rotmats = torch.stack([poses[int(idx.item())][:3, :3] for idx in nearest], dim=0)
+    return anchors, rotmats
+
+
+def _channel_mean_descriptor(feature):
+    feature_t = torch.as_tensor(feature).float()
+    if feature_t.ndim <= 1:
+        return feature_t.reshape(-1)
+    if feature_t.shape[0] == 1 and feature_t.ndim >= 3:
+        feature_t = feature_t.squeeze(0)
+    return feature_t.reshape(feature_t.shape[0], -1).mean(dim=1)
+
+
+def _global_descriptor_from_teacher_pair(fine, coarse, feature_source: str = "fine_coarse"):
+    feature_source = str(feature_source or "fine_coarse").lower()
+    if feature_source not in {"fine_coarse", "fine", "coarse"}:
+        raise ValueError("pose_init_feature_source must be one of {'fine_coarse', 'fine', 'coarse'}")
+    fine_vec = _channel_mean_descriptor(fine)
+    coarse_vec = _channel_mean_descriptor(coarse)
+    if feature_source == "fine":
+        return fine_vec
+    if feature_source == "coarse":
+        return coarse_vec
+    return torch.cat([fine_vec, coarse_vec], dim=0)
+
+
+def pose_feature_bank_from_dataset(
+    dataset,
+    teacher_store,
+    num_anchors: int,
+    sampling: str = "train_all",
+    feature_source: str = "fine_coarse",
+):
+    poses = []
+    centers = []
+    descriptors = []
+    for record in dataset.records:
+        sample_name = record["sample_name"].replace("\\", "/")
+        pose = dataset.name_to_pose.get(sample_name)
+        if pose is None:
+            pose = dataset.basename_to_pose.get(Path(sample_name).name)
+        if pose is None:
+            continue
+        fine, coarse = teacher_store.load_pair(record["teacher_idx"])
+        pose = pose.float()
+        poses.append(pose)
+        centers.append(camera_centers_from_w2c(pose.unsqueeze(0))[0])
+        descriptors.append(_global_descriptor_from_teacher_pair(fine, coarse, feature_source=feature_source))
+    if not centers:
+        raise RuntimeError(
+            "Cannot build feature-bank pose initializer: no COLMAP pose_gt was found for the training split."
+        )
+    centers = torch.stack(centers, dim=0)
+    descriptors = torch.stack(descriptors, dim=0)
+    sampling = str(sampling or "train_all").lower()
+    if sampling in {"all", "train_all", "pose_bank", "feature_bank"}:
+        rotmats = torch.stack([pose[:3, :3] for pose in poses], dim=0)
+        return centers, rotmats, descriptors
+    if sampling != "fps":
+        raise ValueError("pose_init_anchor_sampling must be one of {'fps', 'train_all'}")
+    anchors = farthest_point_anchor_centers(centers, num_anchors=num_anchors)
+    dist = torch.cdist(anchors, centers)
+    nearest = dist.argmin(dim=1)
+    rotmats = torch.stack([poses[int(idx.item())][:3, :3] for idx in nearest], dim=0)
+    desc = descriptors[nearest]
+    return anchors, rotmats, desc
+
+
+def pose_feature_bank_from_map_renderer(
+    dataset,
+    map_renderer,
+    num_anchors: int,
+    sampling: str = "train_all",
+    feature_source: str = "fine_coarse",
+):
+    poses = []
+    centers = []
+    descriptors = []
+    for record in dataset.records:
+        sample_name = record["sample_name"].replace("\\", "/")
+        pose = dataset.name_to_pose.get(sample_name)
+        if pose is None:
+            pose = dataset.basename_to_pose.get(Path(sample_name).name)
+        if pose is None:
+            continue
+        with torch.no_grad():
+            _fine_raw, fine, coarse, mask, *_rest = map_renderer._render_single(sample_name, require_grad=False)
+            if mask is not None:
+                mask_t = mask.float()
+                if mask_t.shape[-2:] != fine.shape[-2:]:
+                    mask_t = F.interpolate(mask_t, size=fine.shape[-2:], mode="nearest")
+                denom = torch.clamp(mask_t.sum(dim=(-1, -2)), min=1.0)
+                fine_vec = (fine.float() * mask_t).sum(dim=(-1, -2)) / denom
+                if mask_t.shape[-2:] != coarse.shape[-2:]:
+                    coarse_mask = F.interpolate(mask_t, size=coarse.shape[-2:], mode="nearest")
+                else:
+                    coarse_mask = mask_t
+                coarse_denom = torch.clamp(coarse_mask.sum(dim=(-1, -2)), min=1.0)
+                coarse_vec = (coarse.float() * coarse_mask).sum(dim=(-1, -2)) / coarse_denom
+            else:
+                fine_vec = fine.float().mean(dim=(-1, -2))
+                coarse_vec = coarse.float().mean(dim=(-1, -2))
+            descriptors.append(
+                _global_descriptor_from_teacher_pair(
+                    fine_vec.squeeze(0),
+                    coarse_vec.squeeze(0),
+                    feature_source=feature_source,
+                )
+            )
+        pose = pose.float()
+        poses.append(pose)
+        centers.append(camera_centers_from_w2c(pose.unsqueeze(0))[0])
+    if not centers:
+        raise RuntimeError(
+            "Cannot build feature-bank pose initializer: no COLMAP pose_gt was found for the training split."
+        )
+    centers = torch.stack(centers, dim=0)
+    descriptors = torch.stack(descriptors, dim=0)
+    sampling = str(sampling or "train_all").lower()
+    if sampling in {"all", "train_all", "pose_bank", "feature_bank"}:
+        rotmats = torch.stack([pose[:3, :3] for pose in poses], dim=0)
+        return centers, rotmats, descriptors
+    if sampling != "fps":
+        raise ValueError("pose_init_anchor_sampling must be one of {'fps', 'train_all'}")
+    anchors = farthest_point_anchor_centers(centers, num_anchors=num_anchors)
+    dist = torch.cdist(anchors, centers)
+    nearest = dist.argmin(dim=1)
+    rotmats = torch.stack([poses[int(idx.item())][:3, :3] for idx in nearest], dim=0)
+    desc = descriptors[nearest]
+    return anchors, rotmats, desc
+
+
+def compute_pose_init_losses(outputs, batch, cfg):
+    pose_cfg = cfg.get("pose_init", {})
+    device = outputs["fine"].device if "fine" in outputs else batch["pose_gt"].device
+    if not pose_cfg.get("enabled", False):
+        return torch.zeros((), device=device), {}
+    pose_init = outputs.get("pose_init")
+    pose_gt = batch.get("pose_gt", batch.get("rendered_map_pose_gt"))
+    if pose_init is None or pose_gt is None:
+        return torch.zeros((), device=device), {}
+
+    centers = pose_init["center"].float()
+    rotmat = pose_init["rotmat"].float()
+    scores = pose_init["scores"].float()
+    log_var = pose_init.get("log_var")
+    pose_gt = pose_gt.to(device=centers.device, dtype=centers.dtype)
+    gt_centers = camera_centers_from_w2c(pose_gt).unsqueeze(1)
+    gt_rot = pose_gt[:, :3, :3].unsqueeze(1)
+
+    trans_err_m = torch.linalg.norm(centers - gt_centers, dim=-1)
+    rot_cos_loss, rot_err_deg = _rotation_error_from_mats(rotmat, gt_rot)
+    cost = trans_err_m + float(pose_cfg.get("rot_cost_weight", 0.1)) * (rot_err_deg / 180.0)
+    best_idx = cost.argmin(dim=1)
+    batch_idx = torch.arange(centers.shape[0], device=centers.device)
+
+    best_trans = trans_err_m[batch_idx, best_idx]
+    best_rot_cos = rot_cos_loss[batch_idx, best_idx]
+    best_rot_deg = rot_err_deg[batch_idx, best_idx]
+    loss = (
+        float(pose_cfg.get("trans_weight", 1.0)) * F.smooth_l1_loss(best_trans, torch.zeros_like(best_trans))
+        + float(pose_cfg.get("rot_weight", 1.0)) * best_rot_cos.mean()
+    )
+
+    score_weight = float(pose_cfg.get("score_weight", 0.0))
+    score_loss = torch.zeros((), device=centers.device)
+    if score_weight > 0:
+        score_loss = F.cross_entropy(scores, best_idx.detach())
+        loss = loss + score_weight * score_loss
+
+    uncertainty_weight = float(pose_cfg.get("uncertainty_weight", 0.0))
+    uncertainty_loss = torch.zeros((), device=centers.device)
+    if uncertainty_weight > 0 and log_var is not None:
+        best_log_var = log_var.float()[batch_idx, best_idx]
+        trans_nll = best_trans.square() * torch.exp(-best_log_var[:, 0]) + best_log_var[:, 0]
+        rot_rad = best_rot_deg * math.pi / 180.0
+        rot_nll = rot_rad.square() * torch.exp(-best_log_var[:, 1]) + best_log_var[:, 1]
+        uncertainty_loss = 0.5 * (trans_nll + rot_nll).mean()
+        loss = loss + uncertainty_weight * uncertainty_loss
+
+    anchor_loss = torch.zeros((), device=centers.device)
+    anchor_target_idx = None
+    anchor_acc = torch.zeros((), device=centers.device)
+    anchor_topk_recall = torch.zeros((), device=centers.device)
+    anchor_target_dist_mm = torch.zeros((), device=centers.device)
+    anchor_weight = float(pose_cfg.get("anchor_weight", 0.0))
+    if anchor_weight > 0 and "anchor_logits" in pose_init and "anchor_centers" in pose_init:
+        anchor_logits = pose_init["anchor_logits"].float()
+        anchor_centers = pose_init["anchor_centers"].to(device=centers.device, dtype=centers.dtype)
+        anchor_dist = torch.linalg.norm(anchor_centers.unsqueeze(0) - gt_centers, dim=-1)
+        anchor_target_idx = anchor_dist.argmin(dim=1)
+        anchor_loss = F.cross_entropy(anchor_logits, anchor_target_idx)
+        loss = loss + anchor_weight * anchor_loss
+        with torch.no_grad():
+            topk_idx = pose_init.get("anchor_indices")
+            if topk_idx is None:
+                topk = min(centers.shape[1], anchor_logits.shape[1])
+                topk_idx = torch.topk(anchor_logits, k=topk, dim=1).indices
+            topk_idx = topk_idx.to(device=centers.device)
+            anchor_acc = (anchor_logits.argmax(dim=1) == anchor_target_idx).float().mean() * 100.0
+            anchor_topk_recall = (topk_idx == anchor_target_idx.unsqueeze(1)).any(dim=1).float().mean() * 100.0
+            anchor_target_dist_mm = anchor_dist[batch_idx, anchor_target_idx] * 1000.0
+
+    with torch.no_grad():
+        pred_idx = scores.argmax(dim=1)
+        pred_trans = trans_err_m[batch_idx, pred_idx]
+        pred_rot = rot_err_deg[batch_idx, pred_idx]
+        best_trans_mm = best_trans * 1000.0
+        pred_trans_mm = pred_trans * 1000.0
+    metrics = {
+        "pose_init_loss": loss.detach(),
+        "pose_init_score_loss": score_loss.detach(),
+        "pose_init_uncertainty_loss": uncertainty_loss.detach(),
+        "pose_init_anchor_loss": anchor_loss.detach(),
+        "pose_init_best_idx": best_idx.float().mean().detach(),
+        "pose_init_best_trans_mm": best_trans_mm.mean().detach(),
+        "pose_init_best_rot_deg": best_rot_deg.mean().detach(),
+        "pose_init_pred_trans_mm": pred_trans_mm.mean().detach(),
+        "pose_init_pred_rot_deg": pred_rot.mean().detach(),
+        "pose_init_joint_5deg_1000mm": (
+            ((best_rot_deg < 5.0) & (best_trans_mm < 1000.0)).float().mean() * 100.0
+        ).detach(),
+        "pose_init_joint_1deg_100mm": (
+            ((best_rot_deg < 1.0) & (best_trans_mm < 100.0)).float().mean() * 100.0
+        ).detach(),
+        "pose_init_joint_1deg_50mm": (
+            ((best_rot_deg < 1.0) & (best_trans_mm < 50.0)).float().mean() * 100.0
+        ).detach(),
+    }
+    if anchor_target_idx is not None:
+        metrics.update(
+            {
+                "pose_init_anchor_target_idx": anchor_target_idx.float().mean().detach(),
+                "pose_init_anchor_acc": anchor_acc.detach(),
+                "pose_init_anchor_topk_recall": anchor_topk_recall.detach(),
+                "pose_init_anchor_target_dist_mm": anchor_target_dist_mm.mean().detach(),
+            }
+        )
+    return loss, metrics
+
+
+def pose_update_gain_loss(
+    pose_pred: torch.Tensor,
+    pose_ref: torch.Tensor,
+    pose_gt: torch.Tensor,
+    *,
+    trans_margin_m: float = 0.0,
+    rot_margin_deg: float = 0.0,
+    rot_weight: float = 0.0,
+    trans_weight: float = 1.0,
+):
+    """Penalize pose updates that fail to improve over the initial pose by a margin."""
+    _, rot_err_deg, trans_err_m = pose_error_tensors(pose_pred.float(), pose_gt.float())
+    _, init_rot_err_deg, init_trans_err_m = pose_error_tensors(pose_ref.float(), pose_gt.float())
+    trans_margin = max(float(trans_margin_m), 0.0)
+    rot_margin = max(float(rot_margin_deg), 0.0)
+    trans_loss_m = F.relu(trans_err_m + trans_margin - init_trans_err_m)
+    rot_loss_deg = F.relu(rot_err_deg + rot_margin - init_rot_err_deg)
+    loss = float(trans_weight) * trans_loss_m.mean() + float(rot_weight) * rot_loss_deg.mean()
+    with torch.no_grad():
+        trans_improved = (trans_err_m < init_trans_err_m).float().mean()
+        trans_margin_met = (trans_err_m + trans_margin <= init_trans_err_m).float().mean()
+        rot_margin_met = (rot_err_deg + rot_margin <= init_rot_err_deg).float().mean()
+    return loss, {
+        "map_corr_pose_gain_loss": loss.detach(),
+        "map_corr_pose_gain_trans_loss_mm": (trans_loss_m.detach().mean() * 1000.0),
+        "map_corr_pose_gain_rot_loss_deg": rot_loss_deg.detach().mean(),
+        "map_corr_pose_gain_trans_margin_mm": torch.tensor(
+            trans_margin * 1000.0,
+            device=pose_pred.device,
+            dtype=pose_pred.dtype,
+        ),
+        "map_corr_pose_gain_rot_margin_deg": torch.tensor(
+            rot_margin,
+            device=pose_pred.device,
+            dtype=pose_pred.dtype,
+        ),
+        "map_corr_pose_gain_trans_improved": trans_improved.detach(),
+        "map_corr_pose_gain_trans_margin_met": trans_margin_met.detach(),
+        "map_corr_pose_gain_rot_margin_met": rot_margin_met.detach(),
+    }
 
 
 def compute_w2c_flow(
@@ -433,6 +939,20 @@ def set_seed(seed):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def resolve_safe_num_workers(training_cfg: dict, dataset_cfg: dict) -> int:
+    """Avoid DataLoader shared-memory crashes for full-resolution RGB tensors."""
+    workers = int(training_cfg.get("num_workers", 0))
+    if workers <= 0 or bool(training_cfg.get("allow_highres_num_workers", False)):
+        return workers
+    input_hw = dataset_cfg.get("input_hw") or []
+    if len(input_hw) >= 2:
+        pixels = int(input_hw[0]) * int(input_hw[1])
+        threshold = int(training_cfg.get("highres_worker_pixel_threshold", 1024 * 1024))
+        if pixels >= threshold:
+            return 0
+    return workers
 
 
 def setup_logger(output_dir):
@@ -776,6 +1296,7 @@ class JointRADIOQueryDataset(Dataset):
         retrieval_teacher_store=None,
         prior_mask_path=None,
         prior_mask_channels=None,
+        colmap_dir=None,
     ):
         self.records = records
         self.teacher_store = teacher_store
@@ -784,6 +1305,16 @@ class JointRADIOQueryDataset(Dataset):
         self.synthetic_rgb = synthetic_rgb
         self.retrieval_teacher_store = retrieval_teacher_store
         self.prior_masks = None
+        self.name_to_pose = {}
+        self.basename_to_pose = {}
+        if colmap_dir:
+            images_bin = Path(colmap_dir) / "images.bin"
+            if images_bin.is_file():
+                for _image_id, image_meta in read_colmap_images(str(images_bin)).items():
+                    name = image_meta.name.replace("\\", "/")
+                    pose = torch.from_numpy(colmap_to_w2c(image_meta.qvec, image_meta.tvec)).float()
+                    self.name_to_pose[name] = pose
+                    self.basename_to_pose.setdefault(Path(name).name, pose)
         self.prior_mask_channels = list(prior_mask_channels or [0, 1, 2])
         if prior_mask_path:
             prior_mask_path = Path(prior_mask_path)
@@ -848,6 +1379,12 @@ class JointRADIOQueryDataset(Dataset):
             "teacher_idx": record["teacher_idx"],
             "sample_name": record["sample_name"],
         }
+        sample_name = record["sample_name"].replace("\\", "/")
+        pose_gt = self.name_to_pose.get(sample_name)
+        if pose_gt is None:
+            pose_gt = self.basename_to_pose.get(Path(sample_name).name)
+        if pose_gt is not None:
+            item["pose_gt"] = pose_gt.clone()
         prior_mask = self._load_prior_mask(record)
         if prior_mask is not None:
             item["prior_mask"] = prior_mask
@@ -1518,6 +2055,193 @@ def resolve_query_feature_dims(cfg, teacher_store):
     return fine_dim, coarse_dim
 
 
+def build_radio_query_student(
+    cfg,
+    *,
+    fine_feature_dim,
+    coarse_feature_dim,
+    retrieval_dim=None,
+    retrieval_hidden_dim=None,
+):
+    """Build the query student from the same config used by training/eval."""
+    model_cfg = cfg["model"]
+    dataset_cfg = cfg["dataset"]
+    retrieval_cfg = cfg.get("retrieval", {})
+    return RadioQueryStudent(
+        in_channels=3,
+        feature_dim=int(model_cfg["feature_dim"]),
+        fine_feature_dim=int(fine_feature_dim),
+        coarse_feature_dim=int(coarse_feature_dim),
+        base_channels=int(model_cfg["base_channels"]),
+        stage_dims=tuple(model_cfg["stage_dims"]),
+        output_hw=tuple(dataset_cfg["feature_hw"]),
+        coarse_output_hw=tuple(dataset_cfg.get("coarse_feature_hw") or dataset_cfg["feature_hw"]),
+        input_hw=tuple(dataset_cfg["input_hw"]),
+        dropout=float(model_cfg.get("dropout", 0.0)),
+        l2_normalize=bool(model_cfg.get("l2_normalize", True)),
+        predict_magnitude=bool(model_cfg.get("predict_magnitude", False)),
+        fine_init_norm=float(model_cfg.get("fine_init_norm", 1.0)),
+        coarse_init_norm=float(model_cfg.get("coarse_init_norm", 1.0)),
+        magnitude_min=float(model_cfg.get("magnitude_min", 1e-4)),
+        retrieval_dim=retrieval_dim,
+        retrieval_hidden_dim=retrieval_hidden_dim,
+        retrieval_dropout=float(retrieval_cfg.get("dropout", 0.0)) if retrieval_dim is not None else 0.0,
+        retrieval_l2_normalize=bool(retrieval_cfg.get("l2_normalize", True)),
+        fine_low_level_skip=bool(model_cfg.get("fine_low_level_skip", False)),
+        fine_low_level_init=float(model_cfg.get("fine_low_level_init", 0.0)),
+        fine_highres_skip=bool(model_cfg.get("fine_highres_skip", False)),
+        fine_highres_source=str(model_cfg.get("fine_highres_source", "stage2")),
+        fine_highres_init=float(model_cfg.get("fine_highres_init", 0.0)),
+        fine_highres_zero_init=bool(model_cfg.get("fine_highres_zero_init", False)),
+        fine_loc_head=bool(model_cfg.get("fine_loc_head", False)),
+        fine_loc_mode=str(model_cfg.get("fine_loc_mode", "residual")),
+        fine_loc_init=float(model_cfg.get("fine_loc_init", 1.0)),
+        fine_loc_zero_init=bool(model_cfg.get("fine_loc_zero_init", True)),
+        fine_loc_detach_base=bool(model_cfg.get("fine_loc_detach_base", False)),
+        fine_loc_highres_source=model_cfg.get("fine_loc_highres_source"),
+        fine_loc_highres_init=float(model_cfg.get("fine_loc_highres_init", 1.0)),
+        fine_loc_highres_zero_init=bool(model_cfg.get("fine_loc_highres_zero_init", True)),
+        fine_loc_highres_detach=bool(model_cfg.get("fine_loc_highres_detach", True)),
+        teacher_fine_condition=bool(model_cfg.get("teacher_fine_condition", False)),
+        teacher_fine_init=float(model_cfg.get("teacher_fine_init", 1.0)),
+        teacher_fine_zero_init=bool(model_cfg.get("teacher_fine_zero_init", True)),
+        teacher_fine_detach=bool(model_cfg.get("teacher_fine_detach", True)),
+        scene_coord_head=bool(model_cfg.get("scene_coord_head", False)),
+        scene_coord_zero_init=bool(model_cfg.get("scene_coord_zero_init", True)),
+        scene_coord_detach_base=bool(model_cfg.get("scene_coord_detach_base", False)),
+        scene_coord_use_pixel_grid=bool(model_cfg.get("scene_coord_use_pixel_grid", False)),
+        scene_coord_global_context=bool(model_cfg.get("scene_coord_global_context", False)),
+        local_matcher_enabled=bool(model_cfg.get("local_matcher_enabled", False)),
+        local_matcher_radius=int(model_cfg.get("local_matcher_radius", 4)),
+        local_matcher_hidden_dim=int(model_cfg.get("local_matcher_hidden_dim", 64)),
+        local_matcher_zero_init=bool(model_cfg.get("local_matcher_zero_init", True)),
+        local_matcher_residual_scale=float(model_cfg.get("local_matcher_residual_scale", 1.0)),
+        local_flow_head_enabled=bool(model_cfg.get("local_flow_head_enabled", False)),
+        local_flow_head_radius=int(model_cfg.get("local_flow_head_radius", model_cfg.get("local_matcher_radius", 4))),
+        local_flow_head_hidden_dim=int(model_cfg.get("local_flow_head_hidden_dim", 64)),
+        local_flow_head_zero_init=bool(model_cfg.get("local_flow_head_zero_init", True)),
+        local_flow_head_max_flow=model_cfg.get("local_flow_head_max_flow"),
+        local_flow_head_base_flow_mode=str(model_cfg.get("local_flow_head_base_flow_mode", "none")),
+        local_flow_head_base_temperature=float(model_cfg.get("local_flow_head_base_temperature", 0.05)),
+        local_corr_projector_enabled=bool(model_cfg.get("local_corr_projector_enabled", False)),
+        local_corr_projector_hidden_dim=int(model_cfg.get("local_corr_projector_hidden_dim", 96)),
+        local_corr_projector_output_dim=model_cfg.get("local_corr_projector_output_dim"),
+        local_corr_projector_zero_init=bool(model_cfg.get("local_corr_projector_zero_init", True)),
+        local_corr_projector_l2_normalize=bool(
+            model_cfg.get("local_corr_projector_l2_normalize", True)
+        ),
+        query_channel_gate_enabled=bool(model_cfg.get("query_channel_gate_enabled", False)),
+        query_channel_gate_hidden_dim=model_cfg.get("query_channel_gate_hidden_dim"),
+        query_channel_gate_zero_init=bool(model_cfg.get("query_channel_gate_zero_init", True)),
+        apply_query_channel_gate=bool(model_cfg.get("apply_query_channel_gate", False)),
+        pose_init_head=bool(model_cfg.get("pose_init_head", False)),
+        pose_init_hypotheses=int(model_cfg.get("pose_init_hypotheses", 3)),
+        pose_init_hidden_dim=model_cfg.get("pose_init_hidden_dim"),
+        pose_init_mode=str(model_cfg.get("pose_init_mode", "direct")),
+        pose_init_anchor_centers=model_cfg.get("pose_init_anchor_centers"),
+        pose_init_anchor_rotmats=model_cfg.get("pose_init_anchor_rotmats"),
+        pose_init_anchor_descriptors=model_cfg.get("pose_init_anchor_descriptors"),
+        pose_init_residual_scale=float(model_cfg.get("pose_init_residual_scale", 1.5)),
+        pose_init_temperature=float(model_cfg.get("pose_init_temperature", 0.05)),
+        pose_init_feature_bank_projector=str(model_cfg.get("pose_init_feature_bank_projector", "mlp")),
+        pose_init_feature_source=str(model_cfg.get("pose_init_feature_source", "fine_coarse")),
+    )
+
+
+def build_model_param_groups(model, *, base_lr, weight_decay, lr_scales=None):
+    """Build optimizer groups with optional name-prefix LR multipliers."""
+    scales = {
+        str(prefix): float(scale)
+        for prefix, scale in (lr_scales or {}).items()
+        if str(prefix) and abs(float(scale) - 1.0) > 1e-12
+    }
+    if not scales:
+        return [
+            {
+                "params": [param for param in model.parameters() if param.requires_grad],
+                "lr": float(base_lr),
+                "weight_decay": float(weight_decay),
+            }
+        ]
+
+    ordered_prefixes = sorted(scales, key=len, reverse=True)
+    grouped_params = {prefix: [] for prefix in ordered_prefixes}
+    default_params = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        matched = next((prefix for prefix in ordered_prefixes if name.startswith(prefix)), None)
+        if matched is None:
+            default_params.append(param)
+        else:
+            grouped_params[matched].append(param)
+
+    groups = []
+    if default_params:
+        groups.append(
+            {
+                "name": "model.default",
+                "params": default_params,
+                "lr": float(base_lr),
+                "weight_decay": float(weight_decay),
+            }
+        )
+    for prefix in ordered_prefixes:
+        params = grouped_params[prefix]
+        if not params:
+            continue
+        groups.append(
+            {
+                "name": f"model.{prefix}",
+                "params": params,
+                "lr": float(base_lr) * scales[prefix],
+                "weight_decay": float(weight_decay),
+            }
+        )
+    return groups
+
+
+def _matches_name_prefix(name, prefixes):
+    for prefix in prefixes or []:
+        prefix = str(prefix)
+        if not prefix:
+            continue
+        if name == prefix or name.startswith(prefix):
+            return True
+    return False
+
+
+def apply_model_trainable_filter(model, *, trainable_prefixes=None):
+    """Freeze all model parameters except those matching requested name prefixes."""
+    prefixes = [str(prefix) for prefix in (trainable_prefixes or []) if str(prefix)]
+    summary = {
+        "trainable_tensors": 0,
+        "frozen_tensors": 0,
+        "trainable_parameters": 0,
+        "frozen_parameters": 0,
+    }
+    if not prefixes:
+        for param in model.parameters():
+            if param.requires_grad:
+                summary["trainable_tensors"] += 1
+                summary["trainable_parameters"] += int(param.numel())
+            else:
+                summary["frozen_tensors"] += 1
+                summary["frozen_parameters"] += int(param.numel())
+        return summary
+
+    for name, param in model.named_parameters():
+        keep_trainable = _matches_name_prefix(name, prefixes)
+        param.requires_grad_(keep_trainable)
+        if keep_trainable:
+            summary["trainable_tensors"] += 1
+            summary["trainable_parameters"] += int(param.numel())
+        else:
+            summary["frozen_tensors"] += 1
+            summary["frozen_parameters"] += int(param.numel())
+    return summary
+
+
 def depth_observability_weight(
     depth,
     mask=None,
@@ -1702,6 +2426,38 @@ def feature_covariance_loss(feat, mask=None, max_samples=1024):
     return off_diag.pow(2).sum() / max(1, C * (C - 1))
 
 
+def masked_global_feature_descriptor(feat, mask=None):
+    feat_f = feat.float()
+    if mask is None:
+        return feat_f.mean(dim=(-1, -2))
+    mask_f = mask.float()
+    if mask_f.ndim == 3:
+        mask_f = mask_f.unsqueeze(1)
+    if mask_f.shape[-2:] != feat_f.shape[-2:]:
+        mask_f = F.interpolate(mask_f, size=feat_f.shape[-2:], mode="nearest")
+    denom = torch.clamp(mask_f.sum(dim=(-1, -2)), min=1.0)
+    return (feat_f * mask_f).sum(dim=(-1, -2)) / denom
+
+
+def coarse_pose_ranking_loss(query_coarse, pos_coarse, neg_coarse, pos_mask=None, neg_mask=None, temperature=0.07):
+    query_desc = F.normalize(masked_global_feature_descriptor(query_coarse, pos_mask), dim=1)
+    pos_desc = F.normalize(masked_global_feature_descriptor(pos_coarse, pos_mask), dim=1)
+    neg_desc = F.normalize(masked_global_feature_descriptor(neg_coarse, neg_mask), dim=1)
+    pos_sim = (query_desc * pos_desc).sum(dim=1)
+    neg_sim = (query_desc * neg_desc).sum(dim=1)
+    logits = torch.stack([pos_sim, neg_sim], dim=1) / max(float(temperature), 1e-6)
+    targets = torch.zeros(query_desc.shape[0], dtype=torch.long, device=query_desc.device)
+    loss = F.cross_entropy(logits, targets)
+    metrics = {
+        "map_coarse_pose_rank_loss": loss.detach(),
+        "map_coarse_pose_rank_pos": pos_sim.mean().detach(),
+        "map_coarse_pose_rank_neg": neg_sim.mean().detach(),
+        "map_coarse_pose_rank_gap": (pos_sim - neg_sim).mean().detach(),
+        "map_coarse_pose_rank_acc": (pos_sim > neg_sim).float().mean().detach(),
+    }
+    return loss, metrics
+
+
 def _resize_query_flow_valid(query_feat, flow_gt, valid_mask, target_hw):
     h, w = int(target_hw[0]), int(target_hw[1])
     query = query_feat.float()
@@ -1710,19 +2466,13 @@ def _resize_query_flow_valid(query_feat, flow_gt, valid_mask, target_hw):
     if valid.ndim == 3:
         valid = valid.unsqueeze(1)
     if query.shape[-2:] != (h, w):
-        src_h, src_w = query.shape[-2:]
         query = F.interpolate(query, (h, w), mode="bilinear", align_corners=False)
-        flow = F.interpolate(flow, (h, w), mode="bilinear", align_corners=False)
-        flow[:, 0] *= w / max(src_w, 1)
-        flow[:, 1] *= h / max(src_h, 1)
-        valid = F.interpolate(valid, (h, w), mode="nearest")
-    elif flow.shape[-2:] != (h, w):
+    if flow.shape[-2:] != (h, w):
         src_h, src_w = flow.shape[-2:]
         flow = F.interpolate(flow, (h, w), mode="bilinear", align_corners=False)
         flow[:, 0] *= w / max(src_w, 1)
         flow[:, 1] *= h / max(src_h, 1)
-        valid = F.interpolate(valid, (h, w), mode="nearest")
-    elif valid.shape[-2:] != (h, w):
+    if valid.shape[-2:] != (h, w):
         valid = F.interpolate(valid, (h, w), mode="nearest")
     return query, flow, valid
 
@@ -1732,6 +2482,46 @@ def _local_correlation_offsets(radius, device, dtype):
     dy, dx = torch.meshgrid(offsets, offsets, indexing="ij")
     channels = (2 * radius + 1) ** 2
     return dx.reshape(1, channels, 1, 1), dy.reshape(1, channels, 1, 1)
+
+
+def local_correlation_feature_preprocess(
+    feat,
+    *,
+    mode="none",
+    highpass_kernel=3,
+    highpass_scale=1.0,
+):
+    """Preprocess descriptors for local correlation without changing stored features."""
+    mode = str(mode or "none").lower()
+    if mode in {"none", "identity", "raw"}:
+        return feat
+    kernel = int(highpass_kernel)
+    if kernel <= 1:
+        high = torch.zeros_like(feat)
+    else:
+        if kernel % 2 == 0:
+            raise ValueError(f"highpass_kernel must be odd, got {kernel}")
+        pad = kernel // 2
+        low = F.avg_pool2d(
+            feat,
+            kernel_size=kernel,
+            stride=1,
+            padding=pad,
+            count_include_pad=False,
+        )
+        high = feat - low
+    high = high * float(highpass_scale)
+    if mode in {"highpass", "hp"}:
+        return high
+    if mode in {"residual_highpass", "highpass_residual", "residual_hp"}:
+        return feat + high
+    if mode in {"concat_highpass", "cat_highpass", "concat_hp"}:
+        return torch.cat([feat, high], dim=1)
+    raise ValueError(
+        "local correlation feature preprocess must be one of "
+        "{'none', 'highpass', 'residual_highpass', 'concat_highpass'}, "
+        f"got {mode!r}"
+    )
 
 
 def shifted_local_correlation(fmap1, fmap2, radius=4):
@@ -1747,6 +2537,96 @@ def shifted_local_correlation(fmap1, fmap2, radius=4):
             sampled = fmap2_pad[:, :, y0 : y0 + H, x0 : x0 + W]
             corrs.append((fmap1 * sampled).sum(dim=1))
     return torch.stack(corrs, dim=1).contiguous()
+
+
+def local_correlation_distribution_loss(
+    rendered_feat,
+    query_feat,
+    valid_mask=None,
+    *,
+    target_feat=None,
+    radius=4,
+    student_temperature=0.05,
+    target_temperature=0.05,
+    feature_preprocess="none",
+    highpass_kernel=3,
+    highpass_scale=1.0,
+):
+    """Distill query-map local correlation toward a map-self correlation distribution."""
+    with torch.cuda.amp.autocast(enabled=False):
+        rendered = rendered_feat.float()
+        query = query_feat.float()
+        if query.shape[-2:] != rendered.shape[-2:]:
+            query = F.interpolate(query, size=rendered.shape[-2:], mode="bilinear", align_corners=False)
+        if target_feat is None:
+            target = rendered
+        else:
+            target = target_feat.float()
+            if target.shape[-2:] != rendered.shape[-2:]:
+                target = F.interpolate(target, size=rendered.shape[-2:], mode="bilinear", align_corners=False)
+        if valid_mask is None:
+            valid_weight = rendered.new_ones(rendered.shape[0], 1, rendered.shape[-2], rendered.shape[-1])
+        else:
+            valid_weight = valid_mask.float()
+            if valid_weight.ndim == 3:
+                valid_weight = valid_weight.unsqueeze(1)
+            if valid_weight.shape[-2:] != rendered.shape[-2:]:
+                valid_weight = F.interpolate(valid_weight, size=rendered.shape[-2:], mode="nearest")
+            valid_weight = valid_weight.clamp(min=0.0)
+
+        rendered_corr = local_correlation_feature_preprocess(
+            rendered,
+            mode=feature_preprocess,
+            highpass_kernel=highpass_kernel,
+            highpass_scale=highpass_scale,
+        )
+        query_corr = local_correlation_feature_preprocess(
+            query,
+            mode=feature_preprocess,
+            highpass_kernel=highpass_kernel,
+            highpass_scale=highpass_scale,
+        )
+        target_corr = local_correlation_feature_preprocess(
+            target,
+            mode=feature_preprocess,
+            highpass_kernel=highpass_kernel,
+            highpass_scale=highpass_scale,
+        )
+
+        rendered_n = F.normalize(rendered_corr, dim=1)
+        query_n = F.normalize(query_corr, dim=1)
+        target_n = F.normalize(target_corr, dim=1)
+        student_corr = shifted_local_correlation(rendered_n, query_n, radius=int(radius)).float()
+        with torch.no_grad():
+            teacher_corr = shifted_local_correlation(rendered_n, target_n, radius=int(radius)).float()
+            target_probs = torch.softmax(
+                teacher_corr / max(float(target_temperature), 1e-6),
+                dim=1,
+            )
+
+        log_probs = F.log_softmax(
+            student_corr / max(float(student_temperature), 1e-6),
+            dim=1,
+        )
+        loss_map = -(target_probs * log_probs).sum(dim=1, keepdim=True)
+        denom = valid_weight.sum().clamp(min=1.0)
+        loss = (loss_map * valid_weight).sum() / denom
+
+        with torch.no_grad():
+            student_top2 = torch.topk(student_corr, k=2, dim=1).values
+            teacher_top2 = torch.topk(teacher_corr, k=2, dim=1).values
+            student_argmax = student_corr.argmax(dim=1, keepdim=True)
+            teacher_argmax = teacher_corr.argmax(dim=1, keepdim=True)
+            argmax_agree = ((student_argmax == teacher_argmax).float() * valid_weight).sum() / denom
+            student_gap = ((student_top2[:, 0:1] - student_top2[:, 1:2]) * valid_weight).sum() / denom
+            teacher_gap = ((teacher_top2[:, 0:1] - teacher_top2[:, 1:2]) * valid_weight).sum() / denom
+
+    return loss, {
+        "map_query_corr_distill_loss": loss.detach(),
+        "map_query_corr_distill_argmax_agree": argmax_agree.detach(),
+        "map_query_corr_distill_student_gap": student_gap.detach(),
+        "map_query_corr_distill_target_gap": teacher_gap.detach(),
+    }
 
 
 def local_correlation_subpixel_loss(
@@ -2008,12 +2888,16 @@ def local_correlation_joint_losses(
     *,
     radius=4,
     temperature=0.05,
+    ce_temperature=None,
     huber_delta=1.0,
     peak_margin=0.05,
+    compute_ce=False,
     compute_subpixel=False,
     compute_flow=False,
+    compute_flow_cosine=False,
     compute_peak=False,
     compute_wls_pose=False,
+    compute_pose_gain=False,
     depth=None,
     pose_ref=None,
     pose_gt=None,
@@ -2022,6 +2906,21 @@ def local_correlation_joint_losses(
     update_scale=1.0,
     rot_weight=1.0,
     trans_weight=50.0,
+    wls_conf_threshold=0.0,
+    wls_conf_power=1.0,
+    pose_gain_trans_margin_m=0.0,
+    pose_gain_rot_margin_deg=0.0,
+    pose_gain_rot_weight=0.0,
+    pose_gain_trans_weight=1.0,
+    min_flow_px=0.0,
+    max_flow_px=0.0,
+    matcher=None,
+    flow_head=None,
+    flow_head_conf_weight=0.0,
+    flow_decode_mode="softargmax",
+    feature_preprocess="none",
+    highpass_kernel=3,
+    highpass_scale=1.0,
 ):
     """Compute all local-correlation losses from a single correlation volume."""
     with torch.cuda.amp.autocast(enabled=False):
@@ -2032,9 +2931,46 @@ def local_correlation_joint_losses(
             valid_mask,
             rendered.shape[-2:],
         )
-        rendered_n = F.normalize(rendered, dim=1)
-        query_n = F.normalize(query, dim=1)
+        min_flow_threshold = float(min_flow_px)
+        metrics = {}
+        max_flow_threshold = float(max_flow_px)
+        if min_flow_threshold > 0.0 or max_flow_threshold > 0.0:
+            flow_mag = torch.linalg.norm(flow.float(), dim=1, keepdim=True)
+        if min_flow_threshold > 0.0:
+            min_flow_mask = flow_mag >= min_flow_threshold
+            valid_weight = valid_weight * min_flow_mask.float()
+            metrics.update(
+                {
+                    "map_query_corr_min_flow_px": rendered.new_tensor(min_flow_threshold),
+                    "map_query_corr_min_flow_cov": (valid_weight > 0.0).float().mean().detach(),
+                }
+            )
+        if max_flow_threshold > 0.0:
+            max_flow_mask = flow_mag <= max_flow_threshold
+            valid_weight = valid_weight * max_flow_mask.float()
+            metrics.update(
+                {
+                    "map_query_corr_max_flow_px": rendered.new_tensor(max_flow_threshold),
+                    "map_query_corr_max_flow_cov": (valid_weight > 0.0).float().mean().detach(),
+                }
+            )
+        rendered_corr = local_correlation_feature_preprocess(
+            rendered,
+            mode=feature_preprocess,
+            highpass_kernel=highpass_kernel,
+            highpass_scale=highpass_scale,
+        )
+        query_corr = local_correlation_feature_preprocess(
+            query,
+            mode=feature_preprocess,
+            highpass_kernel=highpass_kernel,
+            highpass_scale=highpass_scale,
+        )
+        rendered_n = F.normalize(rendered_corr, dim=1)
+        query_n = F.normalize(query_corr, dim=1)
         corr = shifted_local_correlation(rendered_n, query_n, radius=int(radius)).float()
+        if matcher is not None:
+            corr = matcher(corr, depth=depth, valid_mask=valid_weight).float()
 
         B, channels, H, W = corr.shape
         radius = int(radius)
@@ -2046,12 +2982,15 @@ def local_correlation_joint_losses(
         device = corr.device
         dtype = corr.dtype
         losses = {
+            "ce": corr.new_zeros(()),
             "subpixel": corr.new_zeros(()),
             "flow": corr.new_zeros(()),
+            "flow_cosine": corr.new_zeros(()),
             "peak": corr.new_zeros(()),
             "wls_pose": corr.new_zeros(()),
+            "pose_gain": corr.new_zeros(()),
+            "flow_conf": corr.new_zeros(()),
         }
-        metrics = {}
 
         valid_positive = valid_weight > 0.0
         fx = flow[:, 0:1]
@@ -2098,18 +3037,227 @@ def local_correlation_joint_losses(
         pixel_weight = torch.where(in_window, valid_weight.clamp(min=0.0), torch.zeros_like(valid_weight))
         denom = pixel_weight.sum().clamp(min=1.0)
 
-        need_probs = compute_subpixel or compute_flow or compute_wls_pose
-        probs = None
+        nearest_dx = torch.round(fx).long()
+        nearest_dy = torch.round(fy).long()
+        nearest_target = ((nearest_dy + radius) * window + (nearest_dx + radius)).clamp(
+            0,
+            expected_channels - 1,
+        )
+        nearest_in_window = (
+            valid_positive
+            & (nearest_dx >= -radius)
+            & (nearest_dx <= radius)
+            & (nearest_dy >= -radius)
+            & (nearest_dy <= radius)
+        )
+        nearest_weight = torch.where(
+            nearest_in_window,
+            valid_weight.clamp(min=0.0),
+            torch.zeros_like(valid_weight),
+        )
+        nearest_denom = nearest_weight.sum().clamp(min=1.0)
+
+        if compute_ce:
+            ce_temp = float(ce_temperature if ce_temperature is not None else temperature)
+            ce_logits = corr / max(ce_temp, 1e-6)
+            ce_flat = F.cross_entropy(
+                ce_logits.permute(0, 2, 3, 1).reshape(-1, expected_channels),
+                nearest_target.reshape(-1),
+                reduction="none",
+            ).view(B, 1, H, W)
+            ce_loss = (ce_flat * nearest_weight).sum() / nearest_denom
+            losses["ce"] = ce_loss
+            with torch.no_grad():
+                pred = corr.argmax(dim=1, keepdim=True)
+                ce_acc = ((pred == nearest_target).float() * nearest_weight).sum() / nearest_denom
+                ce_cov = nearest_in_window.float().mean()
+            metrics.update(
+                {
+                    "map_query_corr_ce_loss": ce_loss.detach(),
+                    "map_query_corr_ce_acc": ce_acc.detach(),
+                    "map_query_corr_ce_cov": ce_cov.detach(),
+                }
+            )
+
+        use_explicit_flow = flow_head is not None and (
+            compute_flow
+            or compute_flow_cosine
+            or compute_wls_pose
+            or compute_pose_gain
+            or float(flow_head_conf_weight) > 0.0
+        )
         pred_flow = None
+        explicit_confidence = None
+        explicit_confidence_logits = None
+        if use_explicit_flow:
+            flow_pred = flow_head(corr, depth=depth, valid_mask=valid_weight)
+            pred_flow = flow_pred["flow"].float()
+            explicit_confidence = flow_pred.get("confidence")
+            if explicit_confidence is not None:
+                explicit_confidence = explicit_confidence.float()
+            explicit_confidence_logits = flow_pred.get("confidence_logits")
+            if explicit_confidence_logits is not None:
+                explicit_confidence_logits = explicit_confidence_logits.float()
+            if pred_flow.shape[-2:] != corr.shape[-2:]:
+                pred_flow = F.interpolate(pred_flow, size=corr.shape[-2:], mode="bilinear", align_corners=False)
+            if explicit_confidence is None:
+                explicit_confidence = corr.new_ones(B, 1, H, W)
+            elif explicit_confidence.shape[-2:] != corr.shape[-2:]:
+                explicit_confidence = F.interpolate(
+                    explicit_confidence,
+                    size=corr.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            if explicit_confidence_logits is not None and explicit_confidence_logits.shape[-2:] != corr.shape[-2:]:
+                explicit_confidence_logits = F.interpolate(
+                    explicit_confidence_logits,
+                    size=corr.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            metrics["map_query_corr_flow_source_explicit"] = corr.new_tensor(1.0).detach()
+        else:
+            metrics["map_query_corr_flow_source_explicit"] = corr.new_tensor(0.0).detach()
+
+        flow_decode = str(flow_decode_mode or "softargmax").lower()
+        if flow_decode not in {"softargmax", "argmax", "argmax_st"}:
+            raise ValueError(
+                "flow_decode_mode must be one of {'softargmax', 'argmax', 'argmax_st'}, "
+                f"got {flow_decode_mode!r}"
+            )
+        need_probs = (
+            compute_subpixel
+            or compute_flow
+            or compute_flow_cosine
+            or compute_wls_pose
+            or compute_pose_gain
+        ) and not use_explicit_flow
+        probs = None
         if need_probs:
             dx, dy = _local_correlation_offsets(radius, device, dtype)
             probs = torch.softmax(corr / max(float(temperature), 1e-6), dim=1)
-            pred_flow = torch.cat(
+            soft_flow = torch.cat(
                 [
                     (probs * dx).sum(dim=1, keepdim=True),
                     (probs * dy).sum(dim=1, keepdim=True),
                 ],
                 dim=1,
+            )
+            hard_idx = corr.argmax(dim=1, keepdim=True)
+            hard_flow = torch.cat(
+                [
+                    dx.expand(B, -1, H, W).gather(1, hard_idx),
+                    dy.expand(B, -1, H, W).gather(1, hard_idx),
+                ],
+                dim=1,
+            )
+            if flow_decode == "argmax":
+                pred_flow = hard_flow
+            elif flow_decode == "argmax_st":
+                pred_flow = hard_flow + (soft_flow - soft_flow.detach())
+            else:
+                pred_flow = soft_flow
+            with torch.no_grad():
+                flow_metric_weight = valid_weight.clamp(min=0.0)
+                flow_metric_denom = flow_metric_weight.sum().clamp(min=1.0)
+                gt_flow_mag = torch.linalg.norm(flow.float(), dim=1, keepdim=True)
+                pred_flow_mag = torch.linalg.norm(pred_flow.float(), dim=1, keepdim=True)
+                hard_flow_mag = torch.linalg.norm(hard_flow.float(), dim=1, keepdim=True)
+                hard_epe_map = torch.linalg.norm(hard_flow.float() - flow.float(), dim=1, keepdim=True)
+                hard_cosine = (hard_flow.float() * flow.float()).sum(dim=1, keepdim=True) / (
+                    hard_flow_mag * gt_flow_mag
+                ).clamp(min=1e-6)
+                metrics.update(
+                    {
+                        "map_query_corr_gt_flow_mag_px": (
+                            gt_flow_mag * flow_metric_weight
+                        ).sum()
+                        / flow_metric_denom,
+                        "map_query_corr_pred_flow_mag_px": (
+                            pred_flow_mag * flow_metric_weight
+                        ).sum()
+                        / flow_metric_denom,
+                        "map_query_corr_argmax_flow_mag_px": (
+                            hard_flow_mag * flow_metric_weight
+                        ).sum()
+                        / flow_metric_denom,
+                        "map_query_corr_argmax_flow_epe": (
+                            hard_epe_map * flow_metric_weight
+                        ).sum()
+                        / flow_metric_denom,
+                        "map_query_corr_argmax_flow_cosine": (
+                            hard_cosine * flow_metric_weight
+                        ).sum()
+                        / flow_metric_denom,
+                    }
+                )
+        elif pred_flow is not None and (compute_flow or compute_flow_cosine or compute_wls_pose or compute_pose_gain):
+            with torch.no_grad():
+                flow_metric_weight = valid_weight.clamp(min=0.0)
+                flow_metric_denom = flow_metric_weight.sum().clamp(min=1.0)
+                gt_flow_mag = torch.linalg.norm(flow.float(), dim=1, keepdim=True)
+                pred_flow_mag = torch.linalg.norm(pred_flow.float(), dim=1, keepdim=True)
+                metrics.update(
+                    {
+                        "map_query_corr_gt_flow_mag_px": (
+                            gt_flow_mag * flow_metric_weight
+                        ).sum()
+                        / flow_metric_denom,
+                        "map_query_corr_pred_flow_mag_px": (
+                            pred_flow_mag * flow_metric_weight
+                        ).sum()
+                        / flow_metric_denom,
+                    }
+                )
+
+        if pred_flow is not None and (compute_flow or compute_flow_cosine or compute_wls_pose or compute_pose_gain):
+            cosine_weight = pixel_weight.clamp(min=0.0)
+            pred_norm = torch.linalg.norm(pred_flow.float(), dim=1, keepdim=True)
+            gt_norm = torch.linalg.norm(flow.float(), dim=1, keepdim=True)
+            direction_valid = (gt_norm > 1e-6).float()
+            cosine_weight = cosine_weight * direction_valid
+            cosine_denom = cosine_weight.sum().clamp(min=1.0)
+            flow_cosine_metric = (pred_flow.float() * flow.float()).sum(dim=1, keepdim=True) / (
+                pred_norm * gt_norm
+            ).clamp(min=1e-6)
+            pred_unit_for_loss = pred_flow.float() / pred_norm.clamp(min=1.0)
+            gt_unit_for_loss = flow.float() / gt_norm.clamp(min=1e-6)
+            flow_cosine_for_loss = (pred_unit_for_loss * gt_unit_for_loss).sum(dim=1, keepdim=True)
+            flow_cosine_loss = ((1.0 - flow_cosine_for_loss) * cosine_weight).sum() / cosine_denom
+            if compute_flow_cosine:
+                losses["flow_cosine"] = flow_cosine_loss
+            with torch.no_grad():
+                metrics["map_query_corr_flow_cosine"] = (
+                    flow_cosine_metric * cosine_weight
+                ).sum() / cosine_denom
+                if compute_flow_cosine:
+                    metrics["map_query_corr_flow_cosine_loss"] = flow_cosine_loss.detach()
+
+        if use_explicit_flow and float(flow_head_conf_weight) > 0.0:
+            conf_target = (pixel_weight > 0.0).float()
+            conf_weight = valid_weight.clamp(min=0.0)
+            if explicit_confidence_logits is not None:
+                conf_loss_map = F.binary_cross_entropy_with_logits(
+                    explicit_confidence_logits,
+                    conf_target,
+                    reduction="none",
+                )
+            else:
+                conf_prob = explicit_confidence.clamp(min=1e-4, max=1.0 - 1e-4)
+                conf_loss_map = F.binary_cross_entropy(conf_prob, conf_target, reduction="none")
+            conf_denom = conf_weight.sum().clamp(min=1.0)
+            flow_conf_loss = (conf_loss_map * conf_weight).sum() / conf_denom
+            losses["flow_conf"] = flow_conf_loss
+            with torch.no_grad():
+                conf_pos = (explicit_confidence * pixel_weight).sum() / pixel_weight.sum().clamp(min=1.0)
+                conf_all = (explicit_confidence * conf_weight).sum() / conf_denom
+            metrics.update(
+                {
+                    "map_query_corr_flow_conf_loss": flow_conf_loss.detach(),
+                    "map_query_corr_flow_conf_pos": conf_pos.detach(),
+                    "map_query_corr_flow_conf_mean": conf_all.detach(),
+                }
             )
 
         if compute_subpixel:
@@ -2119,12 +3267,6 @@ def local_correlation_joint_losses(
             with torch.no_grad():
                 epe_map = torch.linalg.norm(pred_flow - flow, dim=1, keepdim=True)
                 epe = (epe_map * pixel_weight).sum() / denom
-                nearest_dx = torch.round(fx).long()
-                nearest_dy = torch.round(fy).long()
-                nearest_target = ((nearest_dy + radius) * window + (nearest_dx + radius)).clamp(
-                    0,
-                    expected_channels - 1,
-                )
                 pred = corr.argmax(dim=1, keepdim=True)
                 acc = ((pred == nearest_target) & in_window).float().sum() / in_window.float().sum().clamp(min=1.0)
                 coverage = in_window.float().mean()
@@ -2181,10 +3323,19 @@ def local_correlation_joint_losses(
                 }
             )
 
-        if compute_wls_pose:
+        if compute_wls_pose or compute_pose_gain:
             if depth is None or pose_ref is None or pose_gt is None or intrinsics is None:
-                raise ValueError("compute_wls_pose=True requires depth, pose_ref, pose_gt, and intrinsics")
-            confidence = probs.max(dim=1, keepdim=True).values
+                raise ValueError("pose update losses require depth, pose_ref, pose_gt, and intrinsics")
+            if use_explicit_flow:
+                confidence = explicit_confidence
+            else:
+                confidence = probs.max(dim=1, keepdim=True).values
+            conf_threshold = float(wls_conf_threshold)
+            if conf_threshold > 0.0:
+                confidence = confidence * (confidence >= conf_threshold).float()
+            conf_power = float(wls_conf_power)
+            if abs(conf_power - 1.0) > 1e-6:
+                confidence = confidence.clamp(min=0.0, max=1.0).pow(conf_power)
             depth_s = depth.float()
             if depth_s.ndim == 4:
                 depth_s = depth_s.squeeze(1)
@@ -2215,11 +3366,26 @@ def local_correlation_joint_losses(
                 pose_ref.float(),
                 pose_gt.float(),
             )
-            wls_loss = float(rot_weight) * rot_loss.mean() + float(trans_weight) * trans_err_m.mean()
-            losses["wls_pose"] = wls_loss
+            wls_loss = corr.new_zeros(())
+            if compute_wls_pose:
+                wls_loss = float(rot_weight) * rot_loss.mean() + float(trans_weight) * trans_err_m.mean()
+                losses["wls_pose"] = wls_loss
+            if compute_pose_gain:
+                pose_gain_loss, pose_gain_metrics = pose_update_gain_loss(
+                    pose_pred,
+                    pose_ref.float(),
+                    pose_gt.float(),
+                    trans_margin_m=pose_gain_trans_margin_m,
+                    rot_margin_deg=pose_gain_rot_margin_deg,
+                    rot_weight=pose_gain_rot_weight,
+                    trans_weight=pose_gain_trans_weight,
+                )
+                losses["pose_gain"] = pose_gain_loss
+                metrics.update(pose_gain_metrics)
             delta_trans_mm = torch.linalg.norm(delta_xi[:, :3].float(), dim=1).mean() * 1000.0
             conf_denom = valid_wls.sum().clamp(min=1.0)
             conf_mean = (confidence * valid_wls).sum() / conf_denom
+            conf_cov = ((confidence > 0.0).float() * valid_wls).sum() / conf_denom
             metrics.update(
                 {
                     "map_corr_wls_pose_loss": wls_loss.detach(),
@@ -2230,6 +3396,7 @@ def local_correlation_joint_losses(
                     "map_corr_wls_trans_gain_mm": ((init_trans_err_m - trans_err_m).detach() * 1000.0).mean(),
                     "map_corr_wls_delta_trans_mm": delta_trans_mm.detach(),
                     "map_corr_wls_conf_mean": conf_mean.detach(),
+                    "map_corr_wls_conf_cov": conf_cov.detach(),
                 }
             )
 
@@ -2838,10 +4005,24 @@ def compute_main_losses(outputs, batch, cfg):
             total = total + similarity_weight * similarity_loss
             metrics["retrieval_similarity_loss"] = similarity_loss.detach()
 
+    pose_init_total, pose_init_metrics = compute_pose_init_losses(outputs, batch, cfg)
+    if pose_init_metrics:
+        total = total + pose_init_total
+        metrics.update(pose_init_metrics)
+
     return total, metrics
 
 
-def compute_map_supervision(batch, outputs, cfg, device, epoch=0):
+def compute_map_supervision(
+    batch,
+    outputs,
+    cfg,
+    device,
+    epoch=0,
+    local_matcher=None,
+    local_flow_head=None,
+    local_corr_projector=None,
+):
     map_cfg = cfg.get("map_supervision", {})
     loss_cfg = cfg.get("loss", {})
     zero = torch.zeros((), device=device)
@@ -2874,7 +4055,13 @@ def compute_map_supervision(batch, outputs, cfg, device, epoch=0):
     query_fine_key = str(map_cfg.get("query_fine_key", "fine"))
     if query_fine_key not in outputs:
         raise KeyError(f"map_supervision.query_fine_key={query_fine_key!r} not found in model outputs")
+    query_local_fine_key = str(map_cfg.get("query_local_fine_key") or query_fine_key)
+    if query_local_fine_key not in outputs:
+        raise KeyError(
+            f"map_supervision.query_local_fine_key={query_local_fine_key!r} not found in model outputs"
+        )
     pred_fine = outputs[query_fine_key]
+    pred_local_fine = outputs[query_local_fine_key]
     pred_coarse = outputs["coarse"]
     pred_scene_coord = outputs.get("scene_coord")
 
@@ -2890,9 +4077,12 @@ def compute_map_supervision(batch, outputs, cfg, device, epoch=0):
 
     detach_query_features = bool(map_cfg.get("detach_query_features", False))
     pred_fine_target = pred_fine.detach() if detach_query_features else pred_fine
+    pred_local_fine_target = pred_local_fine.detach() if detach_query_features else pred_local_fine
     pred_coarse_target = pred_coarse.detach() if detach_query_features else pred_coarse
     coarse_active = int(epoch) >= int(map_cfg.get("coarse_start_epoch", 0))
     query_coarse_weight = float(map_cfg.get("query_coarse_weight", 0.0)) if coarse_active else 0.0
+    coarse_pose_rank_weight = resolve_linear_weight(map_cfg, "coarse_pose_rank_weight", epoch) if coarse_active else 0.0
+    coarse_pose_rank_temperature = float(map_cfg.get("coarse_pose_rank_temperature", 0.07))
     rendered_teacher_coarse_weight = (
         float(map_cfg.get("rendered_teacher_coarse_weight", 0.0)) if coarse_active else 0.0
     )
@@ -2921,15 +4111,22 @@ def compute_map_supervision(batch, outputs, cfg, device, epoch=0):
 
     query_fine_weight = resolve_linear_weight(map_cfg, "query_fine_weight", epoch)
     query_fine_raw_weight = resolve_linear_weight(map_cfg, "query_fine_raw_weight", epoch)
+    query_local_fine_weight = resolve_linear_weight(map_cfg, "query_local_fine_weight", epoch)
     rendered_teacher_fine_weight = resolve_linear_weight(map_cfg, "rendered_teacher_fine_weight", epoch)
     rendered_teacher_fine_raw_weight = resolve_linear_weight(
         map_cfg, "rendered_teacher_fine_raw_weight", epoch
     )
     query_fine_infonce_weight = resolve_linear_weight(map_cfg, "query_fine_infonce_weight", epoch)
+    query_local_fine_infonce_weight = resolve_linear_weight(
+        map_cfg,
+        "query_local_fine_infonce_weight",
+        epoch,
+    )
     query_coarse_infonce_weight = (
         resolve_linear_weight(map_cfg, "query_coarse_infonce_weight", epoch) if coarse_active else 0.0
     )
     query_fine_grad_weight = resolve_linear_weight(map_cfg, "query_fine_grad_weight", epoch)
+    query_local_fine_grad_weight = resolve_linear_weight(map_cfg, "query_local_fine_grad_weight", epoch)
     query_coarse_grad_weight = (
         resolve_linear_weight(map_cfg, "query_coarse_grad_weight", epoch) if coarse_active else 0.0
     )
@@ -2960,15 +4157,35 @@ def compute_map_supervision(batch, outputs, cfg, device, epoch=0):
     variance_weight_map = float(map_cfg.get("map_variance_weight", 0.0))
     covariance_weight_query = float(map_cfg.get("query_covariance_weight", 0.0))
     covariance_weight_map = float(map_cfg.get("map_covariance_weight", 0.0))
+    query_corr_ce_weight = resolve_linear_weight(map_cfg, "query_corr_ce_weight", epoch)
+    query_corr_ce_temperature = map_cfg.get("query_corr_ce_temperature")
     query_corr_subpixel_weight = resolve_linear_weight(map_cfg, "query_corr_subpixel_weight", epoch)
     query_corr_flow_weight = resolve_linear_weight(map_cfg, "query_corr_flow_weight", epoch)
+    query_corr_flow_cosine_weight = resolve_linear_weight(
+        map_cfg,
+        "query_corr_flow_cosine_weight",
+        epoch,
+    )
+    query_corr_flow_head_conf_weight = resolve_linear_weight(
+        map_cfg,
+        "query_corr_flow_head_conf_weight",
+        epoch,
+    )
     query_corr_peak_margin_weight = resolve_linear_weight(map_cfg, "query_corr_peak_margin_weight", epoch)
+    query_corr_distill_weight = resolve_linear_weight(map_cfg, "query_corr_distill_weight", epoch)
     query_corr_peak_margin = float(map_cfg.get("query_corr_peak_margin", 0.05))
     query_corr_wls_pose_weight = resolve_linear_weight(map_cfg, "query_corr_wls_pose_weight", epoch)
     query_corr_wls_pose_damping = float(map_cfg.get("query_corr_wls_pose_damping", 1e-3))
     query_corr_wls_pose_update_scale = float(map_cfg.get("query_corr_wls_pose_update_scale", 1.0))
     query_corr_wls_pose_rot_weight = float(map_cfg.get("query_corr_wls_pose_rot_weight", 1.0))
     query_corr_wls_pose_trans_weight = float(map_cfg.get("query_corr_wls_pose_trans_weight", 50.0))
+    query_corr_wls_conf_threshold = float(map_cfg.get("query_corr_wls_conf_threshold", 0.0))
+    query_corr_wls_conf_power = float(map_cfg.get("query_corr_wls_conf_power", 1.0))
+    query_corr_pose_gain_weight = resolve_linear_weight(map_cfg, "query_corr_pose_gain_weight", epoch)
+    query_corr_pose_gain_rot_margin_deg = float(map_cfg.get("query_corr_pose_gain_rot_margin_deg", 0.0))
+    query_corr_pose_gain_trans_margin_m = float(map_cfg.get("query_corr_pose_gain_trans_margin_mm", 0.0)) / 1000.0
+    query_corr_pose_gain_rot_weight = float(map_cfg.get("query_corr_pose_gain_rot_weight", 0.0))
+    query_corr_pose_gain_trans_weight = float(map_cfg.get("query_corr_pose_gain_trans_weight", 1.0))
     query_scene_coord_weight = resolve_linear_weight(map_cfg, "query_scene_coord_weight", epoch)
     query_scene_coord_warp_weight = resolve_linear_weight(map_cfg, "query_scene_coord_warp_weight", epoch)
     query_scene_coord_huber_beta = float(map_cfg.get("query_scene_coord_huber_beta", 0.02))
@@ -2977,6 +4194,106 @@ def compute_map_supervision(batch, outputs, cfg, device, epoch=0):
     query_corr_radius = int(map_cfg.get("query_corr_radius", 4))
     query_corr_temperature = float(map_cfg.get("query_corr_temperature", 0.05))
     query_corr_huber_delta = float(map_cfg.get("query_corr_huber_delta", 1.0))
+    query_corr_min_flow_px = float(map_cfg.get("query_corr_min_flow_px", 0.0))
+    query_corr_max_flow_px = float(map_cfg.get("query_corr_max_flow_px", 0.0))
+    query_corr_flow_decode_mode = str(map_cfg.get("query_corr_flow_decode_mode", "softargmax"))
+    query_corr_feature_preprocess = str(map_cfg.get("query_corr_feature_preprocess", "none"))
+    query_corr_highpass_kernel = int(map_cfg.get("query_corr_highpass_kernel", 3))
+    query_corr_highpass_scale = float(map_cfg.get("query_corr_highpass_scale", 1.0))
+    query_projected_fine_weight = resolve_linear_weight(
+        map_cfg,
+        "query_projected_fine_weight",
+        epoch,
+    )
+    query_corr_distill_temperature = float(
+        map_cfg.get("query_corr_distill_temperature")
+        if map_cfg.get("query_corr_distill_temperature") is not None
+        else query_corr_temperature
+    )
+    query_corr_distill_target_temperature = float(
+        map_cfg.get("query_corr_distill_target_temperature")
+        if map_cfg.get("query_corr_distill_target_temperature") is not None
+        else query_corr_distill_temperature
+    )
+    query_identity_corr_ce_weight = resolve_linear_weight(map_cfg, "query_identity_corr_ce_weight", epoch)
+    query_identity_corr_subpixel_weight = resolve_linear_weight(
+        map_cfg,
+        "query_identity_corr_subpixel_weight",
+        epoch,
+    )
+    query_identity_corr_flow_weight = resolve_linear_weight(
+        map_cfg,
+        "query_identity_corr_flow_weight",
+        epoch,
+    )
+    query_identity_corr_peak_margin_weight = resolve_linear_weight(
+        map_cfg,
+        "query_identity_corr_peak_margin_weight",
+        epoch,
+    )
+    query_identity_corr_distill_weight = resolve_linear_weight(
+        map_cfg,
+        "query_identity_corr_distill_weight",
+        epoch,
+    )
+    query_identity_corr_distill_temperature = float(
+        map_cfg.get("query_identity_corr_distill_temperature")
+        if map_cfg.get("query_identity_corr_distill_temperature") is not None
+        else query_corr_temperature
+    )
+    query_identity_corr_distill_target_temperature = float(
+        map_cfg.get("query_identity_corr_distill_target_temperature")
+        if map_cfg.get("query_identity_corr_distill_target_temperature") is not None
+        else query_identity_corr_distill_temperature
+    )
+    query_identity_corr_peak_margin = float(
+        map_cfg.get("query_identity_corr_peak_margin")
+        if map_cfg.get("query_identity_corr_peak_margin") is not None
+        else query_corr_peak_margin
+    )
+    query_identity_corr_radius = int(
+        map_cfg.get("query_identity_corr_radius")
+        if map_cfg.get("query_identity_corr_radius") is not None
+        else query_corr_radius
+    )
+    query_identity_corr_temperature = float(
+        map_cfg.get("query_identity_corr_temperature")
+        if map_cfg.get("query_identity_corr_temperature") is not None
+        else query_corr_temperature
+    )
+    query_identity_corr_ce_temperature = (
+        map_cfg.get("query_identity_corr_ce_temperature")
+        if map_cfg.get("query_identity_corr_ce_temperature") is not None
+        else query_corr_ce_temperature
+    )
+    query_identity_corr_feature_preprocess = str(
+        map_cfg.get("query_identity_corr_feature_preprocess")
+        if map_cfg.get("query_identity_corr_feature_preprocess") is not None
+        else query_corr_feature_preprocess
+    )
+    query_identity_corr_highpass_kernel = int(
+        map_cfg.get("query_identity_corr_highpass_kernel")
+        if map_cfg.get("query_identity_corr_highpass_kernel") is not None
+        else query_corr_highpass_kernel
+    )
+    query_identity_corr_highpass_scale = float(
+        map_cfg.get("query_identity_corr_highpass_scale")
+        if map_cfg.get("query_identity_corr_highpass_scale") is not None
+        else query_corr_highpass_scale
+    )
+    query_local_matcher = local_matcher if bool(map_cfg.get("local_matcher_enabled", False)) else None
+    query_local_flow_head = local_flow_head if bool(map_cfg.get("local_flow_head_enabled", False)) else None
+    query_local_corr_projector = (
+        local_corr_projector if bool(map_cfg.get("local_corr_projector_enabled", False)) else None
+    )
+    project_query_corr_features = bool(map_cfg.get("local_corr_projector_apply_to_query", True))
+
+    def _project_corr_feature(feat, *, is_query=False):
+        if query_local_corr_projector is None or feat is None:
+            return feat
+        if is_query and not project_query_corr_features:
+            return feat
+        return query_local_corr_projector(feat)
     query_flow_warp_weight = resolve_linear_weight(map_cfg, "query_flow_warp_weight", epoch)
     query_flow_warp_contrastive_weight = resolve_linear_weight(
         map_cfg, "query_flow_warp_contrastive_weight", epoch
@@ -3003,11 +4320,15 @@ def compute_map_supervision(batch, outputs, cfg, device, epoch=0):
     map_self_flow_warp_contrastive_weight = resolve_linear_weight(
         map_cfg, "map_self_flow_warp_contrastive_weight", epoch
     )
+    map_self_corr_ce_weight = resolve_linear_weight(map_cfg, "map_self_corr_ce_weight", epoch)
     map_self_corr_subpixel_weight = resolve_linear_weight(
         map_cfg, "map_self_corr_subpixel_weight", epoch
     )
     map_self_corr_flow_weight = resolve_linear_weight(
         map_cfg, "map_self_corr_flow_weight", epoch
+    )
+    map_self_corr_peak_margin_weight = resolve_linear_weight(
+        map_cfg, "map_self_corr_peak_margin_weight", epoch
     )
     map_self_feature_metric_pose_weight = resolve_linear_weight(
         map_cfg, "map_self_feature_metric_pose_weight", epoch
@@ -3020,8 +4341,10 @@ def compute_map_supervision(batch, outputs, cfg, device, epoch=0):
     feature_metric_pose_normalize = bool(map_cfg.get("feature_metric_pose_normalize", True))
 
     fine_query_mask = _resize_mask(mask, pred_fine_target.shape[-2:])
+    local_fine_query_mask = _resize_mask(mask, pred_local_fine_target.shape[-2:])
     coarse_query_mask = _resize_mask(mask, pred_coarse_target.shape[-2:])
     rendered_fine_query = _resize_feature(rendered_fine, pred_fine_target.shape[-2:])
+    rendered_fine_local_query = _resize_feature(rendered_fine, pred_local_fine_target.shape[-2:])
     rendered_coarse_query = _resize_feature(rendered_coarse, pred_coarse_target.shape[-2:])
     rendered_fine_raw_query = _resize_feature(rendered_fine_raw, pred_fine_target.shape[-2:])
 
@@ -3035,6 +4358,10 @@ def compute_map_supervision(batch, outputs, cfg, device, epoch=0):
         l1_feature_loss(pred_fine_target, rendered_fine_query, fine_query_mask)
         + cosine_loss(pred_fine_target, rendered_fine_query, fine_query_mask)
     ) * query_fine_weight
+    query_local_fine_loss = (
+        l1_feature_loss(pred_local_fine_target, rendered_fine_local_query, local_fine_query_mask)
+        + cosine_loss(pred_local_fine_target, rendered_fine_local_query, local_fine_query_mask)
+    ) * query_local_fine_weight
     query_fine_raw_loss = zero
     rendered_teacher_fine_raw_loss = zero
     if rendered_fine_raw_query is not None:
@@ -3050,6 +4377,20 @@ def compute_map_supervision(batch, outputs, cfg, device, epoch=0):
         l1_feature_loss(pred_coarse_target, rendered_coarse_query, coarse_query_mask)
         + cosine_loss(pred_coarse_target, rendered_coarse_query, coarse_query_mask)
     ) * query_coarse_weight
+    coarse_pose_rank_loss = zero
+    coarse_pose_rank_metrics = {}
+    neg_coarse_for_rank = batch.get("rendered_map_coarse_neg")
+    if coarse_pose_rank_weight > 0 and neg_coarse_for_rank is not None:
+        neg_coarse_query_for_rank = _resize_feature(neg_coarse_for_rank, pred_coarse_target.shape[-2:])
+        neg_mask_for_rank = _resize_mask(batch.get("rendered_map_mask_neg"), pred_coarse_target.shape[-2:])
+        coarse_pose_rank_loss, coarse_pose_rank_metrics = coarse_pose_ranking_loss(
+            pred_coarse_target,
+            rendered_coarse_query,
+            neg_coarse_query_for_rank,
+            pos_mask=coarse_query_mask,
+            neg_mask=neg_mask_for_rank,
+            temperature=coarse_pose_rank_temperature,
+        )
     query_fine_nce_loss = zero
     if query_fine_infonce_weight > 0:
         query_fine_nce_loss = infonce_contrastive_loss(
@@ -3060,6 +4401,16 @@ def compute_map_supervision(batch, outputs, cfg, device, epoch=0):
             n_samples=infonce_samples,
             cross_batch=infonce_cross_batch,
         ) * query_fine_infonce_weight
+    query_local_fine_nce_loss = zero
+    if query_local_fine_infonce_weight > 0:
+        query_local_fine_nce_loss = infonce_contrastive_loss(
+            pred_local_fine_target,
+            rendered_fine_local_query,
+            mask=local_fine_query_mask,
+            temperature=infonce_temperature,
+            n_samples=infonce_samples,
+            cross_batch=infonce_cross_batch,
+        ) * query_local_fine_infonce_weight
     query_coarse_nce_loss = zero
     if query_coarse_infonce_weight > 0:
         query_coarse_nce_loss = infonce_contrastive_loss(
@@ -3077,6 +4428,13 @@ def compute_map_supervision(batch, outputs, cfg, device, epoch=0):
             rendered_fine_query,
             fine_query_mask,
         ) * query_fine_grad_weight
+    query_local_fine_grad_loss = zero
+    if query_local_fine_grad_weight > 0:
+        query_local_fine_grad_loss = feature_gradient_loss(
+            pred_local_fine_target,
+            rendered_fine_local_query,
+            local_fine_query_mask,
+        ) * query_local_fine_grad_weight
     query_coarse_grad_loss = zero
     if query_coarse_grad_weight > 0:
         query_coarse_grad_loss = feature_gradient_loss(
@@ -3126,6 +4484,28 @@ def compute_map_supervision(batch, outputs, cfg, device, epoch=0):
             teacher_coarse,
             coarse_teacher_mask,
         ) * rendered_teacher_coarse_grad_weight
+    query_projected_fine_loss = zero
+    query_projected_fine_cos = zero
+    if query_projected_fine_weight > 0:
+        if query_local_corr_projector is None:
+            raise KeyError(
+                "map_supervision.query_projected_fine_weight > 0 requires "
+                "map_supervision.local_corr_projector_enabled=true"
+            )
+        projected_query = _project_corr_feature(pred_local_fine_target, is_query=True)
+        projected_map = _project_corr_feature(rendered_fine).detach()
+        projected_map_query = _resize_feature(projected_map, projected_query.shape[-2:])
+        projected_mask = _resize_mask(mask, projected_query.shape[-2:])
+        query_projected_fine_loss = (
+            l1_feature_loss(projected_query, projected_map_query, projected_mask)
+            + cosine_loss(projected_query, projected_map_query, projected_mask)
+        )
+        with torch.no_grad():
+            query_projected_fine_cos = 1.0 - cosine_loss(
+                projected_query,
+                projected_map_query,
+                projected_mask,
+            )
     map_fine_coarse_ortho_loss = feature_orthogonality_loss(rendered_fine, rendered_coarse, mask) * fine_coarse_ortho_weight
 
     query_variance_loss = zero
@@ -3212,17 +4592,28 @@ def compute_map_supervision(batch, outputs, cfg, device, epoch=0):
                 beta=query_scene_coord_huber_beta,
             )
 
+    query_corr_ce_loss = zero
     query_corr_subpx_loss = zero
     query_corr_flow_loss = zero
+    query_corr_flow_cosine_loss = zero
     query_corr_peak_margin_loss = zero
+    query_corr_distill_loss = zero
     query_corr_wls_pose_loss = zero
+    query_corr_pose_gain_loss = zero
+    query_corr_flow_conf_loss = zero
     query_corr_wls_pose_metrics = {}
     query_corr_metrics = {}
     if (
+        query_corr_ce_weight > 0
+        or
         query_corr_subpixel_weight > 0
         or query_corr_flow_weight > 0
+        or query_corr_flow_cosine_weight > 0
+        or query_corr_flow_head_conf_weight > 0
         or query_corr_peak_margin_weight > 0
+        or query_corr_distill_weight > 0
         or query_corr_wls_pose_weight > 0
+        or query_corr_pose_gain_weight > 0
     ):
         neg_fine_for_corr = batch.get("rendered_map_fine_neg")
         neg_mask_for_corr = batch.get("rendered_map_mask_neg")
@@ -3236,7 +4627,7 @@ def compute_map_supervision(batch, outputs, cfg, device, epoch=0):
             and flow_valid_neg_to_gt is not None
         ):
             corr_rendered_feat = neg_fine_for_corr
-            corr_query_feat = pred_fine_target
+            corr_query_feat = pred_local_fine_target
             if query_corr_scene_coord_weight > 0:
                 if pred_scene_coord is None:
                     raise KeyError("query_corr_scene_coord_weight > 0 requires model.scene_coord_head=true")
@@ -3258,6 +4649,9 @@ def compute_map_supervision(batch, outputs, cfg, device, epoch=0):
                     pred_scene_coord,
                     query_corr_scene_coord_weight,
                 )
+            if query_local_corr_projector is not None and query_corr_scene_coord_weight <= 0:
+                corr_rendered_feat = _project_corr_feature(corr_rendered_feat)
+                corr_query_feat = _project_corr_feature(corr_query_feat, is_query=True)
             corr_valid = flow_valid_neg_to_gt.float()
             if neg_mask_for_corr is not None:
                 if neg_mask_for_corr.shape[-2:] != corr_valid.shape[-2:]:
@@ -3301,45 +4695,196 @@ def compute_map_supervision(batch, outputs, cfg, device, epoch=0):
             pose_neg = batch.get("rendered_map_pose_neg")
             pose_gt = batch.get("rendered_map_pose_gt")
             compute_corr_wls = (
-                query_corr_wls_pose_weight > 0
+                (query_corr_wls_pose_weight > 0 or query_corr_pose_gain_weight > 0)
                 and neg_depth_for_corr is not None
                 and pose_neg is not None
                 and pose_gt is not None
                 and rendered_intrinsics is not None
             )
-            joint_corr = local_correlation_joint_losses(
-                corr_rendered_feat,
-                corr_query_feat,
-                flow_neg_to_gt,
-                corr_valid,
-                radius=query_corr_radius,
-                temperature=query_corr_temperature,
-                huber_delta=query_corr_huber_delta,
-                peak_margin=query_corr_peak_margin,
-                compute_subpixel=query_corr_subpixel_weight > 0,
-                compute_flow=query_corr_flow_weight > 0,
-                compute_peak=query_corr_peak_margin_weight > 0,
-                compute_wls_pose=compute_corr_wls,
-                depth=neg_depth_for_corr,
-                pose_ref=pose_neg,
-                pose_gt=pose_gt,
-                intrinsics=rendered_intrinsics,
-                damping=query_corr_wls_pose_damping,
-                update_scale=query_corr_wls_pose_update_scale,
-                rot_weight=query_corr_wls_pose_rot_weight,
-                trans_weight=query_corr_wls_pose_trans_weight,
+            if (
+                query_corr_ce_weight > 0
+                or query_corr_subpixel_weight > 0
+                or query_corr_flow_weight > 0
+                or query_corr_flow_cosine_weight > 0
+                or query_corr_flow_head_conf_weight > 0
+                or query_corr_peak_margin_weight > 0
+                or query_corr_wls_pose_weight > 0
+                or query_corr_pose_gain_weight > 0
+            ):
+                joint_corr = local_correlation_joint_losses(
+                    corr_rendered_feat,
+                    corr_query_feat,
+                    flow_neg_to_gt,
+                    corr_valid,
+                    radius=query_corr_radius,
+                    temperature=query_corr_temperature,
+                    ce_temperature=query_corr_ce_temperature,
+                    huber_delta=query_corr_huber_delta,
+                    peak_margin=query_corr_peak_margin,
+                    compute_ce=query_corr_ce_weight > 0,
+                    compute_subpixel=query_corr_subpixel_weight > 0,
+                    compute_flow=query_corr_flow_weight > 0,
+                    compute_flow_cosine=query_corr_flow_cosine_weight > 0,
+                    compute_peak=query_corr_peak_margin_weight > 0,
+                    compute_wls_pose=compute_corr_wls and query_corr_wls_pose_weight > 0,
+                    compute_pose_gain=compute_corr_wls and query_corr_pose_gain_weight > 0,
+                    matcher=query_local_matcher,
+                    flow_head=query_local_flow_head,
+                    flow_head_conf_weight=query_corr_flow_head_conf_weight,
+                    depth=neg_depth_for_corr,
+                    pose_ref=pose_neg,
+                    pose_gt=pose_gt,
+                    intrinsics=rendered_intrinsics,
+                    damping=query_corr_wls_pose_damping,
+                    update_scale=query_corr_wls_pose_update_scale,
+                    rot_weight=query_corr_wls_pose_rot_weight,
+                    trans_weight=query_corr_wls_pose_trans_weight,
+                    wls_conf_threshold=query_corr_wls_conf_threshold,
+                    wls_conf_power=query_corr_wls_conf_power,
+                    pose_gain_trans_margin_m=query_corr_pose_gain_trans_margin_m,
+                    pose_gain_rot_margin_deg=query_corr_pose_gain_rot_margin_deg,
+                    pose_gain_rot_weight=query_corr_pose_gain_rot_weight,
+                    pose_gain_trans_weight=query_corr_pose_gain_trans_weight,
+                    min_flow_px=query_corr_min_flow_px,
+                    max_flow_px=query_corr_max_flow_px,
+                    flow_decode_mode=query_corr_flow_decode_mode,
+                    feature_preprocess=query_corr_feature_preprocess,
+                    highpass_kernel=query_corr_highpass_kernel,
+                    highpass_scale=query_corr_highpass_scale,
+                )
+                query_corr_ce_loss = joint_corr["losses"]["ce"]
+                query_corr_subpx_loss = joint_corr["losses"]["subpixel"]
+                query_corr_flow_loss = joint_corr["losses"]["flow"]
+                query_corr_flow_cosine_loss = joint_corr["losses"].get("flow_cosine", zero)
+                query_corr_peak_margin_loss = joint_corr["losses"]["peak"]
+                query_corr_pose_gain_loss = joint_corr["losses"]["pose_gain"]
+                query_corr_flow_conf_loss = joint_corr["losses"]["flow_conf"]
+                query_corr_metrics.update(joint_corr["metrics"])
+                if compute_corr_wls:
+                    query_corr_wls_pose_loss = joint_corr["losses"]["wls_pose"]
+                    query_corr_wls_pose_metrics = {
+                        key: value
+                        for key, value in joint_corr["metrics"].items()
+                        if key.startswith("map_corr_wls_")
+                    }
+            if query_corr_distill_weight > 0:
+                corr_target_feat = rendered_fine
+                if query_corr_scene_coord_weight > 0:
+                    if rendered_position is None:
+                        raise KeyError("query_corr_distill_weight with scene_coord requires rendered_map_position")
+                    gt_scene_for_corr = normalize_scene_coord_map(
+                        rendered_position,
+                        scene_center,
+                        scene_scale,
+                        target_hw=rendered_fine.shape[-2:],
+                    )
+                    corr_target_feat = augment_feature_with_scene_coord(
+                        rendered_fine,
+                        gt_scene_for_corr,
+                        query_corr_scene_coord_weight,
+                    )
+                elif query_local_corr_projector is not None:
+                    corr_target_feat = _project_corr_feature(corr_target_feat)
+                query_corr_distill_loss, query_corr_distill_metrics = local_correlation_distribution_loss(
+                    corr_rendered_feat,
+                    corr_query_feat,
+                    corr_valid,
+                    target_feat=corr_target_feat,
+                    radius=query_corr_radius,
+                    student_temperature=query_corr_distill_temperature,
+                    target_temperature=query_corr_distill_target_temperature,
+                    feature_preprocess=query_corr_feature_preprocess,
+                    highpass_kernel=query_corr_highpass_kernel,
+                    highpass_scale=query_corr_highpass_scale,
+                )
+                query_corr_metrics.update(query_corr_distill_metrics)
+
+    query_identity_corr_ce_loss = zero
+    query_identity_corr_subpx_loss = zero
+    query_identity_corr_flow_loss = zero
+    query_identity_corr_peak_margin_loss = zero
+    query_identity_corr_distill_loss = zero
+    query_identity_corr_metrics = {}
+    if (
+        query_identity_corr_ce_weight > 0
+        or query_identity_corr_subpixel_weight > 0
+        or query_identity_corr_flow_weight > 0
+        or query_identity_corr_peak_margin_weight > 0
+        or query_identity_corr_distill_weight > 0
+    ):
+        identity_valid = _resize_mask(mask, rendered_fine.shape[-2:])
+        if identity_valid is None:
+            identity_valid = torch.ones(
+                pred_local_fine_target.shape[0],
+                1,
+                rendered_fine.shape[-2],
+                rendered_fine.shape[-1],
+                device=device,
+                dtype=pred_local_fine_target.dtype,
             )
-            query_corr_subpx_loss = joint_corr["losses"]["subpixel"]
-            query_corr_flow_loss = joint_corr["losses"]["flow"]
-            query_corr_peak_margin_loss = joint_corr["losses"]["peak"]
-            query_corr_metrics.update(joint_corr["metrics"])
-            if compute_corr_wls:
-                query_corr_wls_pose_loss = joint_corr["losses"]["wls_pose"]
-                query_corr_wls_pose_metrics = {
-                    key: value
-                    for key, value in joint_corr["metrics"].items()
-                    if key.startswith("map_corr_wls_")
-                }
+        identity_flow = pred_local_fine_target.new_zeros(
+            pred_local_fine_target.shape[0],
+            2,
+            rendered_fine.shape[-2],
+            rendered_fine.shape[-1],
+        )
+        identity_depth = _resize_feature(rendered_depth, rendered_fine.shape[-2:])
+        if (
+            query_identity_corr_ce_weight > 0
+            or query_identity_corr_subpixel_weight > 0
+            or query_identity_corr_flow_weight > 0
+            or query_identity_corr_peak_margin_weight > 0
+        ):
+            identity_corr = local_correlation_joint_losses(
+                _project_corr_feature(rendered_fine),
+                _project_corr_feature(pred_local_fine_target, is_query=True),
+                identity_flow,
+                identity_valid,
+                radius=query_identity_corr_radius,
+                temperature=query_identity_corr_temperature,
+                ce_temperature=query_identity_corr_ce_temperature,
+                huber_delta=query_corr_huber_delta,
+                peak_margin=query_identity_corr_peak_margin,
+                compute_ce=query_identity_corr_ce_weight > 0,
+                compute_subpixel=query_identity_corr_subpixel_weight > 0,
+                compute_flow=query_identity_corr_flow_weight > 0,
+                compute_peak=query_identity_corr_peak_margin_weight > 0,
+                matcher=query_local_matcher,
+                depth=identity_depth,
+                flow_decode_mode=query_corr_flow_decode_mode,
+                feature_preprocess=query_identity_corr_feature_preprocess,
+                highpass_kernel=query_identity_corr_highpass_kernel,
+                highpass_scale=query_identity_corr_highpass_scale,
+            )
+            query_identity_corr_ce_loss = identity_corr["losses"]["ce"]
+            query_identity_corr_subpx_loss = identity_corr["losses"]["subpixel"]
+            query_identity_corr_flow_loss = identity_corr["losses"]["flow"]
+            query_identity_corr_peak_margin_loss = identity_corr["losses"]["peak"]
+            query_identity_corr_metrics = prefix_metric_keys(
+                identity_corr["metrics"],
+                "map_query_corr_",
+                "map_query_identity_corr_",
+            )
+        if query_identity_corr_distill_weight > 0:
+            query_identity_corr_distill_loss, identity_distill_metrics = local_correlation_distribution_loss(
+                _project_corr_feature(rendered_fine),
+                _project_corr_feature(pred_local_fine_target, is_query=True),
+                identity_valid,
+                target_feat=_project_corr_feature(rendered_fine),
+                radius=query_identity_corr_radius,
+                student_temperature=query_identity_corr_distill_temperature,
+                target_temperature=query_identity_corr_distill_target_temperature,
+                feature_preprocess=query_identity_corr_feature_preprocess,
+                highpass_kernel=query_identity_corr_highpass_kernel,
+                highpass_scale=query_identity_corr_highpass_scale,
+            )
+            query_identity_corr_metrics.update(
+                prefix_metric_keys(
+                    identity_distill_metrics,
+                    "map_query_corr_",
+                    "map_query_identity_corr_",
+                )
+            )
 
     query_flow_warp_loss = zero
     query_flow_warp_metrics = {}
@@ -3394,7 +4939,7 @@ def compute_map_supervision(batch, outputs, cfg, device, epoch=0):
             if query_flow_warp_weight > 0:
                 query_flow_warp_loss, query_flow_warp_metrics = flow_warp_feature_alignment_loss(
                     neg_fine_for_warp,
-                    pred_fine_target,
+                    pred_local_fine_target,
                     flow_neg_to_gt,
                     warp_valid,
                 )
@@ -3404,7 +4949,7 @@ def compute_map_supervision(batch, outputs, cfg, device, epoch=0):
                     query_flow_warp_contrastive_metrics,
                 ) = flow_warp_contrastive_loss(
                     neg_fine_for_warp,
-                    pred_fine_target,
+                    pred_local_fine_target,
                     flow_neg_to_gt,
                     warp_valid,
                     margin=query_flow_warp_contrastive_margin,
@@ -3415,14 +4960,18 @@ def compute_map_supervision(batch, outputs, cfg, device, epoch=0):
     map_self_flow_warp_metrics = {}
     map_self_flow_warp_contrastive_loss = zero
     map_self_flow_warp_contrastive_metrics = {}
+    map_self_corr_ce_loss = zero
     map_self_corr_subpx_loss = zero
     map_self_corr_flow_loss = zero
+    map_self_corr_peak_margin_loss = zero
     map_self_corr_metrics = {}
     if (
         map_self_flow_warp_weight > 0
         or map_self_flow_warp_contrastive_weight > 0
+        or map_self_corr_ce_weight > 0
         or map_self_corr_subpixel_weight > 0
         or map_self_corr_flow_weight > 0
+        or map_self_corr_peak_margin_weight > 0
     ):
         neg_fine_for_self = batch.get("rendered_map_fine_neg")
         neg_mask_for_self = batch.get("rendered_map_mask_neg")
@@ -3469,20 +5018,30 @@ def compute_map_supervision(batch, outputs, cfg, device, epoch=0):
                     power=float(map_cfg.get("translation_observability_power", 1.0)),
                     max_weight=float(map_cfg.get("translation_observability_max", 4.0)),
                 )
-            if map_self_corr_subpixel_weight > 0 or map_self_corr_flow_weight > 0:
+            if (
+                map_self_corr_ce_weight > 0
+                or map_self_corr_subpixel_weight > 0
+                or map_self_corr_flow_weight > 0
+                or map_self_corr_peak_margin_weight > 0
+            ):
                 self_joint_corr = local_correlation_joint_losses(
-                    neg_fine_for_self,
-                    rendered_fine,
+                    _project_corr_feature(neg_fine_for_self),
+                    _project_corr_feature(rendered_fine),
                     flow_neg_to_gt,
                     self_valid,
                     radius=query_corr_radius,
                     temperature=query_corr_temperature,
                     huber_delta=query_corr_huber_delta,
+                    peak_margin=query_corr_peak_margin,
+                    compute_ce=map_self_corr_ce_weight > 0,
                     compute_subpixel=map_self_corr_subpixel_weight > 0,
                     compute_flow=map_self_corr_flow_weight > 0,
+                    compute_peak=map_self_corr_peak_margin_weight > 0,
                 )
+                map_self_corr_ce_loss = self_joint_corr["losses"]["ce"]
                 map_self_corr_subpx_loss = self_joint_corr["losses"]["subpixel"]
                 map_self_corr_flow_loss = self_joint_corr["losses"]["flow"]
+                map_self_corr_peak_margin_loss = self_joint_corr["losses"]["peak"]
                 map_self_corr_metrics.update(
                     prefix_metric_keys(self_joint_corr["metrics"], "map_query_", "map_self_")
                 )
@@ -3637,7 +5196,7 @@ def compute_map_supervision(batch, outputs, cfg, device, epoch=0):
                     power=float(map_cfg.get("translation_observability_power", 1.0)),
                     max_weight=float(map_cfg.get("translation_observability_max", 4.0)),
                 )
-            fm_query_feat = pred_fine_target
+            fm_query_feat = pred_local_fine_target
             fm_rendered_feat = neg_fine_for_fm
             if feature_metric_scene_coord_weight > 0:
                 if pred_scene_coord is None:
@@ -3733,15 +5292,27 @@ def compute_map_supervision(batch, outputs, cfg, device, epoch=0):
         elif prior_mask is not None:
             neg_mask = neg_mask * prior_mask
         if neg_fine is not None and neg_coarse is not None:
-            neg_fine_query = _resize_feature(neg_fine, pred_fine_target.shape[-2:])
+            neg_fine_query = _resize_feature(neg_fine, pred_local_fine_target.shape[-2:])
             neg_coarse_query = _resize_feature(neg_coarse, pred_coarse_target.shape[-2:])
-            neg_fine_mask = _resize_mask(neg_mask, pred_fine_target.shape[-2:])
+            neg_fine_mask = _resize_mask(neg_mask, pred_local_fine_target.shape[-2:])
             neg_coarse_mask = _resize_mask(neg_mask, pred_coarse_target.shape[-2:])
-            pos_fine = l1_feature_loss(pred_fine_target, rendered_fine_query, fine_query_mask) + cosine_loss(
-                pred_fine_target, rendered_fine_query, fine_query_mask
+            pos_fine = l1_feature_loss(
+                pred_local_fine_target,
+                rendered_fine_local_query,
+                local_fine_query_mask,
+            ) + cosine_loss(
+                pred_local_fine_target,
+                rendered_fine_local_query,
+                local_fine_query_mask,
             )
-            neg_fine_loss = l1_feature_loss(pred_fine_target, neg_fine_query, neg_fine_mask) + cosine_loss(
-                pred_fine_target, neg_fine_query, neg_fine_mask
+            neg_fine_loss = l1_feature_loss(
+                pred_local_fine_target,
+                neg_fine_query,
+                neg_fine_mask,
+            ) + cosine_loss(
+                pred_local_fine_target,
+                neg_fine_query,
+                neg_fine_mask,
             )
             pos_coarse = l1_feature_loss(pred_coarse_target, rendered_coarse_query, coarse_query_mask) + cosine_loss(
                 pred_coarse_target, rendered_coarse_query, coarse_query_mask
@@ -3755,10 +5326,14 @@ def compute_map_supervision(batch, outputs, cfg, device, epoch=0):
     total = (
         query_fine_loss
         + query_fine_raw_loss
+        + query_local_fine_loss
         + query_coarse_loss
+        + coarse_pose_rank_weight * coarse_pose_rank_loss
         + query_fine_nce_loss
+        + query_local_fine_nce_loss
         + query_coarse_nce_loss
         + query_fine_grad_loss
+        + query_local_fine_grad_loss
         + query_coarse_grad_loss
         + rendered_teacher_fine_loss
         + rendered_teacher_fine_raw_loss
@@ -3767,6 +5342,7 @@ def compute_map_supervision(batch, outputs, cfg, device, epoch=0):
         + rendered_teacher_coarse_nce_loss
         + rendered_teacher_fine_grad_loss
         + rendered_teacher_coarse_grad_loss
+        + query_projected_fine_weight * query_projected_fine_loss
         + map_fine_coarse_ortho_loss
         + variance_weight_query * query_variance_loss
         + variance_weight_map * map_variance_loss
@@ -3774,14 +5350,26 @@ def compute_map_supervision(batch, outputs, cfg, device, epoch=0):
         + covariance_weight_map * map_covariance_loss
         + query_scene_coord_weight * query_scene_coord_loss
         + query_scene_coord_warp_weight * query_scene_coord_warp_loss
+        + query_corr_ce_weight * query_corr_ce_loss
         + query_corr_subpixel_weight * query_corr_subpx_loss
         + query_corr_flow_weight * query_corr_flow_loss
+        + query_corr_flow_cosine_weight * query_corr_flow_cosine_loss
+        + query_corr_flow_head_conf_weight * query_corr_flow_conf_loss
         + query_corr_peak_margin_weight * query_corr_peak_margin_loss
+        + query_corr_distill_weight * query_corr_distill_loss
         + query_corr_wls_pose_weight * query_corr_wls_pose_loss
+        + query_corr_pose_gain_weight * query_corr_pose_gain_loss
+        + query_identity_corr_ce_weight * query_identity_corr_ce_loss
+        + query_identity_corr_subpixel_weight * query_identity_corr_subpx_loss
+        + query_identity_corr_flow_weight * query_identity_corr_flow_loss
+        + query_identity_corr_peak_margin_weight * query_identity_corr_peak_margin_loss
+        + query_identity_corr_distill_weight * query_identity_corr_distill_loss
         + query_flow_warp_weight * query_flow_warp_loss
         + query_flow_warp_contrastive_weight * query_flow_warp_contrastive_loss
+        + map_self_corr_ce_weight * map_self_corr_ce_loss
         + map_self_corr_subpixel_weight * map_self_corr_subpx_loss
         + map_self_corr_flow_weight * map_self_corr_flow_loss
+        + map_self_corr_peak_margin_weight * map_self_corr_peak_margin_loss
         + map_self_flow_warp_weight * map_self_flow_warp_loss
         + map_self_flow_warp_contrastive_weight * map_self_flow_warp_contrastive_loss
         + map_self_feature_metric_pose_weight * map_self_feature_metric_pose_loss
@@ -3795,6 +5383,11 @@ def compute_map_supervision(batch, outputs, cfg, device, epoch=0):
         fine_map_teacher_cos = 1.0 - cosine_loss(rendered_fine_teacher, teacher_fine, fine_teacher_mask)
         coarse_map_teacher_cos = 1.0 - cosine_loss(rendered_coarse_teacher, teacher_coarse, coarse_teacher_mask)
         fine_query_map_cos = 1.0 - cosine_loss(pred_fine, rendered_fine_query, fine_query_mask)
+        local_fine_query_map_cos = 1.0 - cosine_loss(
+            pred_local_fine,
+            rendered_fine_local_query,
+            local_fine_query_mask,
+        )
         coarse_query_map_cos = 1.0 - cosine_loss(pred_coarse, rendered_coarse_query, coarse_query_mask)
         if rendered_fine_raw_query is not None:
             fine_map_raw_teacher_cos = 1.0 - cosine_loss(rendered_fine_raw_teacher, teacher_fine, fine_teacher_mask)
@@ -3821,10 +5414,14 @@ def compute_map_supervision(batch, outputs, cfg, device, epoch=0):
         "map_hook_loss": total.detach(),
         "map_query_fine_loss": query_fine_loss.detach(),
         "map_query_fine_raw_loss": query_fine_raw_loss.detach(),
+        "map_query_local_fine_loss": query_local_fine_loss.detach(),
         "map_query_coarse_loss": query_coarse_loss.detach(),
+        **coarse_pose_rank_metrics,
         "map_query_fine_nce_loss": query_fine_nce_loss.detach(),
+        "map_query_local_fine_nce_loss": query_local_fine_nce_loss.detach(),
         "map_query_coarse_nce_loss": query_coarse_nce_loss.detach(),
         "map_query_fine_grad_loss": query_fine_grad_loss.detach(),
+        "map_query_local_fine_grad_loss": query_local_fine_grad_loss.detach(),
         "map_query_coarse_grad_loss": query_coarse_grad_loss.detach(),
         "map_rendered_teacher_fine_loss": rendered_teacher_fine_loss.detach(),
         "map_rendered_teacher_fine_raw_loss": rendered_teacher_fine_raw_loss.detach(),
@@ -3833,6 +5430,7 @@ def compute_map_supervision(batch, outputs, cfg, device, epoch=0):
         "map_rendered_teacher_coarse_nce_loss": rendered_teacher_coarse_nce_loss.detach(),
         "map_rendered_teacher_fine_grad_loss": rendered_teacher_fine_grad_loss.detach(),
         "map_rendered_teacher_coarse_grad_loss": rendered_teacher_coarse_grad_loss.detach(),
+        "map_query_projected_fine_loss": query_projected_fine_loss.detach(),
         "map_fine_coarse_ortho_loss": map_fine_coarse_ortho_loss.detach(),
         "map_query_variance_loss": query_variance_loss.detach(),
         "map_variance_loss": map_variance_loss.detach(),
@@ -3842,18 +5440,35 @@ def compute_map_supervision(batch, outputs, cfg, device, epoch=0):
         "map_query_scene_coord_warp_loss": query_scene_coord_warp_loss.detach(),
         **query_scene_coord_metrics,
         **query_scene_coord_warp_metrics,
+        "map_query_corr_ce_loss": query_corr_ce_loss.detach(),
         "map_query_corr_subpx_loss": query_corr_subpx_loss.detach(),
         "map_query_corr_flow_loss": query_corr_flow_loss.detach(),
+        "map_query_corr_flow_cosine_loss": query_corr_flow_cosine_loss.detach(),
+        "map_query_corr_flow_conf_loss": query_corr_flow_conf_loss.detach(),
         "map_query_corr_peak_margin_loss": query_corr_peak_margin_loss.detach(),
+        "map_query_corr_distill_loss": query_corr_distill_loss.detach(),
         "map_query_corr_wls_pose_loss": query_corr_wls_pose_loss.detach(),
+        "map_query_corr_pose_gain_loss": query_corr_pose_gain_loss.detach(),
+        "map_query_corr_projector_active": torch.tensor(
+            1.0 if query_local_corr_projector is not None else 0.0,
+            device=device,
+        ),
         **query_corr_metrics,
         **query_corr_wls_pose_metrics,
+        "map_query_identity_corr_ce_loss": query_identity_corr_ce_loss.detach(),
+        "map_query_identity_corr_subpx_loss": query_identity_corr_subpx_loss.detach(),
+        "map_query_identity_corr_flow_loss": query_identity_corr_flow_loss.detach(),
+        "map_query_identity_corr_peak_margin_loss": query_identity_corr_peak_margin_loss.detach(),
+        "map_query_identity_corr_distill_loss": query_identity_corr_distill_loss.detach(),
+        **query_identity_corr_metrics,
         "map_query_flow_warp_loss": query_flow_warp_loss.detach(),
         **query_flow_warp_metrics,
         "map_query_flow_warp_contrastive_loss": query_flow_warp_contrastive_loss.detach(),
         **query_flow_warp_contrastive_metrics,
+        "map_self_corr_ce_loss": map_self_corr_ce_loss.detach(),
         "map_self_corr_subpx_loss": map_self_corr_subpx_loss.detach(),
         "map_self_corr_flow_loss": map_self_corr_flow_loss.detach(),
+        "map_self_corr_peak_margin_loss": map_self_corr_peak_margin_loss.detach(),
         **map_self_corr_metrics,
         "map_self_flow_warp_loss": map_self_flow_warp_loss.detach(),
         **map_self_flow_warp_metrics,
@@ -3872,13 +5487,20 @@ def compute_map_supervision(batch, outputs, cfg, device, epoch=0):
         "map_perturb_margin": perturb_margin.detach(),
         "map_query_fine_weight": torch.tensor(query_fine_weight, device=device),
         "map_query_fine_raw_weight": torch.tensor(query_fine_raw_weight, device=device),
+        "map_query_local_fine_weight": torch.tensor(query_local_fine_weight, device=device),
         "map_rendered_teacher_fine_weight": torch.tensor(rendered_teacher_fine_weight, device=device),
         "map_rendered_teacher_fine_raw_weight": torch.tensor(
             rendered_teacher_fine_raw_weight, device=device
         ),
         "map_query_fine_infonce_weight": torch.tensor(query_fine_infonce_weight, device=device),
+        "map_query_local_fine_infonce_weight": torch.tensor(
+            query_local_fine_infonce_weight,
+            device=device,
+        ),
         "map_query_coarse_infonce_weight": torch.tensor(query_coarse_infonce_weight, device=device),
+        "map_coarse_pose_rank_weight": torch.tensor(coarse_pose_rank_weight, device=device),
         "map_query_fine_grad_weight": torch.tensor(query_fine_grad_weight, device=device),
+        "map_query_local_fine_grad_weight": torch.tensor(query_local_fine_grad_weight, device=device),
         "map_query_coarse_grad_weight": torch.tensor(query_coarse_grad_weight, device=device),
         "map_rendered_teacher_fine_infonce_weight": torch.tensor(
             rendered_teacher_fine_infonce_weight, device=device
@@ -3892,6 +5514,7 @@ def compute_map_supervision(batch, outputs, cfg, device, epoch=0):
         "map_rendered_teacher_coarse_grad_weight": torch.tensor(
             rendered_teacher_coarse_grad_weight, device=device
         ),
+        "map_query_projected_fine_weight": torch.tensor(query_projected_fine_weight, device=device),
         "map_fine_coarse_ortho_weight": torch.tensor(fine_coarse_ortho_weight, device=device),
         "map_query_variance_weight": torch.tensor(variance_weight_query, device=device),
         "map_variance_weight": torch.tensor(variance_weight_map, device=device),
@@ -3901,16 +5524,46 @@ def compute_map_supervision(batch, outputs, cfg, device, epoch=0):
         "map_query_scene_coord_warp_weight": torch.tensor(query_scene_coord_warp_weight, device=device),
         "map_query_corr_scene_coord_weight": torch.tensor(query_corr_scene_coord_weight, device=device),
         "map_feature_metric_scene_coord_weight": torch.tensor(feature_metric_scene_coord_weight, device=device),
+        "map_query_corr_ce_weight": torch.tensor(query_corr_ce_weight, device=device),
         "map_query_corr_subpixel_weight": torch.tensor(query_corr_subpixel_weight, device=device),
         "map_query_corr_flow_weight": torch.tensor(query_corr_flow_weight, device=device),
+        "map_query_corr_flow_cosine_weight": torch.tensor(
+            query_corr_flow_cosine_weight,
+            device=device,
+        ),
+        "map_query_corr_flow_head_conf_weight": torch.tensor(
+            query_corr_flow_head_conf_weight,
+            device=device,
+        ),
         "map_query_corr_peak_margin_weight": torch.tensor(query_corr_peak_margin_weight, device=device),
+        "map_query_corr_distill_weight": torch.tensor(query_corr_distill_weight, device=device),
         "map_query_corr_wls_pose_weight": torch.tensor(query_corr_wls_pose_weight, device=device),
+        "map_query_corr_pose_gain_weight": torch.tensor(query_corr_pose_gain_weight, device=device),
+        "map_query_identity_corr_ce_weight": torch.tensor(query_identity_corr_ce_weight, device=device),
+        "map_query_identity_corr_subpixel_weight": torch.tensor(
+            query_identity_corr_subpixel_weight,
+            device=device,
+        ),
+        "map_query_identity_corr_flow_weight": torch.tensor(query_identity_corr_flow_weight, device=device),
+        "map_query_identity_corr_peak_margin_weight": torch.tensor(
+            query_identity_corr_peak_margin_weight,
+            device=device,
+        ),
+        "map_query_identity_corr_distill_weight": torch.tensor(
+            query_identity_corr_distill_weight,
+            device=device,
+        ),
         "map_query_flow_warp_weight": torch.tensor(query_flow_warp_weight, device=device),
         "map_query_flow_warp_contrastive_weight": torch.tensor(
             query_flow_warp_contrastive_weight, device=device
         ),
+        "map_self_corr_ce_weight": torch.tensor(map_self_corr_ce_weight, device=device),
         "map_self_corr_subpixel_weight": torch.tensor(map_self_corr_subpixel_weight, device=device),
         "map_self_corr_flow_weight": torch.tensor(map_self_corr_flow_weight, device=device),
+        "map_self_corr_peak_margin_weight": torch.tensor(
+            map_self_corr_peak_margin_weight,
+            device=device,
+        ),
         "map_self_flow_warp_weight": torch.tensor(map_self_flow_warp_weight, device=device),
         "map_self_flow_warp_contrastive_weight": torch.tensor(
             map_self_flow_warp_contrastive_weight, device=device
@@ -3925,7 +5578,9 @@ def compute_map_supervision(batch, outputs, cfg, device, epoch=0):
         "map_teacher_fine_raw_cosine": fine_map_raw_teacher_cos.detach(),
         "map_teacher_coarse_cosine": coarse_map_teacher_cos.detach(),
         "map_query_fine_cosine": fine_query_map_cos.detach(),
+        "map_query_local_fine_cosine": local_fine_query_map_cos.detach(),
         "map_query_fine_raw_cosine": fine_query_raw_map_cos.detach(),
+        "map_query_projected_fine_cosine": query_projected_fine_cos.detach(),
         "map_query_coarse_cosine": coarse_query_map_cos.detach(),
         "map_alpha_mean": map_alpha_mean.detach(),
         "map_alpha_coverage": map_alpha_coverage.detach(),
@@ -3934,7 +5589,9 @@ def compute_map_supervision(batch, outputs, cfg, device, epoch=0):
     }
 
 
-def save_validation_visuals(batch, outputs, qual_dir, feature_track_root, step, limit):
+def save_validation_visuals(batch, outputs, qual_dir, feature_track_root, step, limit, student_fine_key="fine"):
+    if student_fine_key not in outputs:
+        raise KeyError(f"student_fine_key={student_fine_key!r} not found in model outputs")
     limit = min(limit, batch["rgb"].shape[0])
     for idx in range(limit):
         sample_name = Path(batch["sample_name"][idx]).with_suffix("").as_posix().replace("/", "_")
@@ -3944,7 +5601,7 @@ def save_validation_visuals(batch, outputs, qual_dir, feature_track_root, step, 
                 Path(root) / filename,
                 query_rgb=batch["rgb"][idx].detach().cpu(),
                 teacher_fine=batch["teacher_fine"][idx].detach().cpu(),
-                student_fine=outputs["fine"][idx].detach().cpu(),
+                student_fine=outputs[student_fine_key][idx].detach().cpu(),
                 teacher_coarse=batch["teacher_coarse"][idx].detach().cpu(),
                 student_coarse=outputs["coarse"][idx].detach().cpu(),
                 rendered_map_fine_raw=batch.get("rendered_map_fine_raw", [None] * limit)[idx].detach().cpu()
@@ -4004,7 +5661,16 @@ def validate(model, loader, cfg, device, qual_dir, feature_track_root, step, log
                 else:
                     outputs = model(batch["rgb"])
                 main_total, batch_metrics = compute_main_losses(outputs, batch, cfg)
-                map_total, map_metrics = compute_map_supervision(batch, outputs, cfg, device, epoch=epoch)
+                map_total, map_metrics = compute_map_supervision(
+                    batch,
+                    outputs,
+                    cfg,
+                    device,
+                    epoch=epoch,
+                    local_matcher=getattr(model, "local_matcher", None),
+                    local_flow_head=getattr(model, "local_flow_head", None),
+                    local_corr_projector=getattr(model, "local_corr_projector", None),
+                )
                 total = main_total + map_total
             batch_metrics.update(map_metrics)
             batch_metrics["loss_total"] = total.detach()
@@ -4018,6 +5684,7 @@ def validate(model, loader, cfg, device, qual_dir, feature_track_root, step, log
                     feature_track_root=feature_track_root,
                     step=step,
                     limit=int(cfg["visualization"].get("num_val_vis", 4)),
+                    student_fine_key=str(cfg.get("map_supervision", {}).get("query_fine_key", "fine")),
                 )
                 saved_visuals = True
 
@@ -4032,13 +5699,31 @@ def validate(model, loader, cfg, device, qual_dir, feature_track_root, step, log
     if "retrieval_cosine" in result:
         log_msg += " retrieval_cos=%.4f"
         log_args.append(result.get("retrieval_cosine", 0.0))
+    if "pose_init_best_trans_mm" in result:
+        log_msg += " init=%.1fmm/%.3fdeg j5m=%.1f"
+        log_args.extend(
+            [
+                result.get("pose_init_best_trans_mm", 0.0),
+                result.get("pose_init_best_rot_deg", 0.0),
+                result.get("pose_init_joint_5deg_1000mm", 0.0),
+            ]
+        )
+        if "pose_init_anchor_topk_recall" in result:
+            log_msg += " anchor=%.1f/%.1f"
+            log_args.extend(
+                [
+                    result.get("pose_init_anchor_acc", 0.0),
+                    result.get("pose_init_anchor_topk_recall", 0.0),
+                ]
+            )
     log_msg += " map_hook=%.4f"
     log_args.append(result.get("map_hook_active", 0.0))
     if "map_query_fine_cosine" in result:
-        log_msg += " map_q_f=%.4f map_q_c=%.4f map_t_f=%.4f map_t_c=%.4f"
+        log_msg += " map_q_f=%.4f map_q_loc=%.4f map_q_c=%.4f map_t_f=%.4f map_t_c=%.4f"
         log_args.extend(
             [
                 result.get("map_query_fine_cosine", 0.0),
+                result.get("map_query_local_fine_cosine", 0.0),
                 result.get("map_query_coarse_cosine", 0.0),
                 result.get("map_teacher_fine_cosine", 0.0),
                 result.get("map_teacher_coarse_cosine", 0.0),
@@ -4050,6 +5735,17 @@ def validate(model, loader, cfg, device, qual_dir, feature_track_root, step, log
             [
                 result.get("map_query_fine_raw_cosine", 0.0),
                 result.get("map_teacher_fine_raw_cosine", 0.0),
+            ]
+        )
+    if "map_query_projected_fine_cosine" in result:
+        log_msg += " qproj=%.4f"
+        log_args.append(result.get("map_query_projected_fine_cosine", 0.0))
+    if "map_coarse_pose_rank_gap" in result:
+        log_msg += " c_rank=%.4f/%.3f"
+        log_args.extend(
+            [
+                result.get("map_coarse_pose_rank_gap", 0.0),
+                result.get("map_coarse_pose_rank_acc", 0.0),
             ]
         )
     if "map_alpha_coverage" in result:
@@ -4070,12 +5766,42 @@ def validate(model, loader, cfg, device, qual_dir, feature_track_root, step, log
                 result.get("map_query_corr_subpx_cov", 0.0),
             ]
         )
+    if "map_query_corr_pred_flow_mag_px" in result:
+        log_msg += " flow=%.2f/%.2f fcos=%.3f src=%.0f"
+        log_args.extend(
+            [
+                result.get("map_query_corr_pred_flow_mag_px", 0.0),
+                result.get("map_query_corr_gt_flow_mag_px", 0.0),
+                result.get("map_query_corr_flow_cosine", 0.0),
+                result.get("map_query_corr_flow_source_explicit", 0.0),
+            ]
+        )
+    if "map_query_corr_argmax_flow_mag_px" in result:
+        log_msg += " aflow=%.2f aepe=%.2f afcos=%.3f"
+        log_args.extend(
+            [
+                result.get("map_query_corr_argmax_flow_mag_px", 0.0),
+                result.get("map_query_corr_argmax_flow_epe", 0.0),
+                result.get("map_query_corr_argmax_flow_cosine", 0.0),
+            ]
+        )
+    if "map_query_corr_flow_conf_mean" in result:
+        log_msg += " fconf=%.3f"
+        log_args.append(result.get("map_query_corr_flow_conf_mean", 0.0))
     if "map_query_scene_coord_err_cm" in result:
         log_msg += " scene=%.1fcm"
         log_args.append(result.get("map_query_scene_coord_err_cm", 0.0))
     if "map_query_scene_coord_warp_err_cm" in result:
         log_msg += " scene_warp=%.1fcm"
         log_args.append(result.get("map_query_scene_coord_warp_err_cm", 0.0))
+    if "map_query_corr_ce_acc" in result:
+        log_msg += " ce_acc=%.3f ce_cov=%.3f"
+        log_args.extend(
+            [
+                result.get("map_query_corr_ce_acc", 0.0),
+                result.get("map_query_corr_ce_cov", 0.0),
+            ]
+        )
     if "map_query_corr_peak_gap" in result:
         log_msg += " peak_gap=%.4f peak_acc=%.3f"
         log_args.extend(
@@ -4084,19 +5810,47 @@ def validate(model, loader, cfg, device, qual_dir, feature_track_root, step, log
                 result.get("map_query_corr_peak_acc", 0.0),
             ]
         )
+    if "map_query_corr_distill_argmax_agree" in result:
+        log_msg += " dist=%.3f/%.4f"
+        log_args.extend(
+            [
+                result.get("map_query_corr_distill_argmax_agree", 0.0),
+                result.get("map_query_corr_distill_student_gap", 0.0),
+            ]
+        )
+    if "map_query_identity_corr_peak_gap" in result:
+        log_msg += " id_peak=%.4f/%.3f"
+        log_args.extend(
+            [
+                result.get("map_query_identity_corr_peak_gap", 0.0),
+                result.get("map_query_identity_corr_peak_acc", 0.0),
+            ]
+        )
+    if "map_query_identity_corr_distill_argmax_agree" in result:
+        log_msg += " id_dist=%.3f/%.4f"
+        log_args.extend(
+            [
+                result.get("map_query_identity_corr_distill_argmax_agree", 0.0),
+                result.get("map_query_identity_corr_distill_student_gap", 0.0),
+            ]
+        )
     if "map_corr_wls_trans_err_mm" in result:
-        log_msg += " corr_wls=%.1fmm gain=%.1fmm"
+        log_msg += " corr_wls=%.1fmm gain=%.1fmm wcov=%.3f"
         log_args.extend(
             [
                 result.get("map_corr_wls_trans_err_mm", 0.0),
                 result.get("map_corr_wls_trans_gain_mm", 0.0),
+                result.get("map_corr_wls_conf_cov", 0.0),
             ]
         )
-    if "map_self_corr_subpx_flow_epe" in result:
+    if "map_self_corr_argmax_flow_epe" in result or "map_self_corr_subpx_flow_epe" in result:
         log_msg += " self_corr_epe=%.3f self_corr_acc=%.3f"
         log_args.extend(
             [
-                result.get("map_self_corr_subpx_flow_epe", 0.0),
+                result.get(
+                    "map_self_corr_argmax_flow_epe",
+                    result.get("map_self_corr_subpx_flow_epe", 0.0),
+                ),
                 result.get("map_self_corr_subpx_acc", 0.0),
             ]
         )
@@ -4205,6 +5959,17 @@ def main():
             "loss.teacher_norm_weight > 0 requires model.predict_magnitude=true."
         )
 
+    safe_num_workers = resolve_safe_num_workers(cfg["training"], cfg["dataset"])
+    if safe_num_workers != int(cfg["training"].get("num_workers", 0)):
+        logger.info(
+            "Reducing DataLoader num_workers from %d to %d for input_hw=%s to avoid shared-memory worker crashes. "
+            "Set training.allow_highres_num_workers=true to override.",
+            int(cfg["training"].get("num_workers", 0)),
+            safe_num_workers,
+            cfg["dataset"].get("input_hw"),
+        )
+        cfg["training"]["num_workers"] = safe_num_workers
+
     teacher_store = TeacherFeatureStore(
         cfg["dataset"]["feature_dir"],
         cache_in_memory=bool(cfg["dataset"].get("cache_teacher", False)),
@@ -4269,6 +6034,11 @@ def main():
             device=device,
             logger=logger,
         )
+    colmap_dir = (
+        cfg["dataset"].get("colmap_dir")
+        or cfg.get("map_supervision", {}).get("colmap_dir")
+        or str(Path(cfg["dataset"]["source_dir"]) / "sparse" / "0")
+    )
 
     train_dataset = JointRADIOQueryDataset(
         train_records,
@@ -4279,6 +6049,7 @@ def main():
         retrieval_teacher_store=retrieval_store,
         prior_mask_path=cfg["dataset"].get("prior_mask_path"),
         prior_mask_channels=cfg["dataset"].get("prior_mask_channels"),
+        colmap_dir=colmap_dir,
     )
     val_dataset = JointRADIOQueryDataset(
         val_records,
@@ -4289,7 +6060,63 @@ def main():
         retrieval_teacher_store=retrieval_store,
         prior_mask_path=cfg["dataset"].get("prior_mask_path"),
         prior_mask_channels=cfg["dataset"].get("prior_mask_channels"),
+        colmap_dir=colmap_dir,
     )
+
+    if bool(cfg["model"].get("pose_init_head", False)) and cfg["model"].get("pose_init_anchor_centers") is None:
+        pose_init_mode = str(cfg["model"].get("pose_init_mode", "direct")).lower()
+        if pose_init_mode == "anchor":
+            anchors, anchor_rotmats = pose_anchors_from_dataset(
+                train_dataset,
+                num_anchors=int(cfg["model"].get("pose_init_num_anchors", 64)),
+                sampling=str(cfg["model"].get("pose_init_anchor_sampling", "fps")),
+            )
+            cfg["model"]["pose_init_anchor_centers"] = anchors.tolist()
+            cfg["model"]["pose_init_anchor_rotmats"] = anchor_rotmats.tolist()
+            logger.info(
+                "Pose init anchors: mode=%s count=%d scene_extent=%.3fm",
+                str(cfg["model"].get("pose_init_anchor_sampling", "fps")),
+                anchors.shape[0],
+                torch.pdist(anchors).max().item() if anchors.shape[0] > 1 else 0.0,
+            )
+            with open(output_dir / "config.yaml", "w") as f:
+                yaml.safe_dump(cfg, f, sort_keys=False)
+        elif pose_init_mode == "feature_bank":
+            bank_source = str(cfg["model"].get("pose_init_feature_bank_source", "teacher")).lower()
+            if bank_source == "teacher":
+                anchors, anchor_rotmats, anchor_desc = pose_feature_bank_from_dataset(
+                    train_dataset,
+                    teacher_store,
+                    num_anchors=int(cfg["model"].get("pose_init_num_anchors", 64)),
+                    sampling=str(cfg["model"].get("pose_init_anchor_sampling", "train_all")),
+                    feature_source=str(cfg["model"].get("pose_init_feature_source", "fine_coarse")),
+                )
+            elif bank_source == "map":
+                if map_renderer is None:
+                    raise ValueError("pose_init_feature_bank_source='map' requires map_supervision.enabled=true")
+                anchors, anchor_rotmats, anchor_desc = pose_feature_bank_from_map_renderer(
+                    train_dataset,
+                    map_renderer,
+                    num_anchors=int(cfg["model"].get("pose_init_num_anchors", 64)),
+                    sampling=str(cfg["model"].get("pose_init_anchor_sampling", "train_all")),
+                    feature_source=str(cfg["model"].get("pose_init_feature_source", "fine_coarse")),
+                )
+            else:
+                raise ValueError("pose_init_feature_bank_source must be either 'teacher' or 'map'")
+            cfg["model"]["pose_init_anchor_centers"] = anchors.tolist()
+            cfg["model"]["pose_init_anchor_rotmats"] = anchor_rotmats.tolist()
+            cfg["model"]["pose_init_anchor_descriptors"] = anchor_desc.tolist()
+            logger.info(
+                "Pose init feature bank: mode=%s bank_source=%s feature_source=%s count=%d desc_dim=%d scene_extent=%.3fm",
+                str(cfg["model"].get("pose_init_anchor_sampling", "train_all")),
+                bank_source,
+                str(cfg["model"].get("pose_init_feature_source", "fine_coarse")),
+                anchors.shape[0],
+                anchor_desc.shape[1],
+                torch.pdist(anchors).max().item() if anchors.shape[0] > 1 else 0.0,
+            )
+            with open(output_dir / "config.yaml", "w") as f:
+                yaml.safe_dump(cfg, f, sort_keys=False)
 
     train_loader = DataLoader(
         train_dataset,
@@ -4306,60 +6133,36 @@ def main():
         pin_memory=device.type == "cuda",
     )
 
-    model = RadioQueryStudent(
-        in_channels=3,
-        feature_dim=int(cfg["model"]["feature_dim"]),
+    model = build_radio_query_student(
+        cfg,
         fine_feature_dim=fine_feature_dim,
         coarse_feature_dim=coarse_feature_dim,
-        base_channels=int(cfg["model"]["base_channels"]),
-        stage_dims=tuple(cfg["model"]["stage_dims"]),
-        output_hw=tuple(cfg["dataset"]["feature_hw"]),
-        coarse_output_hw=tuple(cfg["dataset"].get("coarse_feature_hw") or cfg["dataset"]["feature_hw"]),
-        input_hw=tuple(cfg["dataset"]["input_hw"]),
-        dropout=float(cfg["model"].get("dropout", 0.0)),
-        l2_normalize=bool(cfg["model"].get("l2_normalize", True)),
-        predict_magnitude=bool(cfg["model"].get("predict_magnitude", False)),
-        fine_init_norm=float(cfg["model"].get("fine_init_norm", 1.0)),
-        coarse_init_norm=float(cfg["model"].get("coarse_init_norm", 1.0)),
-        magnitude_min=float(cfg["model"].get("magnitude_min", 1e-4)),
         retrieval_dim=int(cfg["retrieval"]["student_dim"]) if retrieval_store is not None else None,
         retrieval_hidden_dim=int(cfg["retrieval"].get("hidden_dim", 0)) if retrieval_store is not None else None,
-        retrieval_dropout=float(cfg["retrieval"].get("dropout", 0.0)) if retrieval_store is not None else 0.0,
-        retrieval_l2_normalize=bool(cfg["retrieval"].get("l2_normalize", True)),
-        fine_low_level_skip=bool(cfg["model"].get("fine_low_level_skip", False)),
-        fine_low_level_init=float(cfg["model"].get("fine_low_level_init", 0.0)),
-        fine_highres_skip=bool(cfg["model"].get("fine_highres_skip", False)),
-        fine_highres_source=str(cfg["model"].get("fine_highres_source", "stage2")),
-        fine_highres_init=float(cfg["model"].get("fine_highres_init", 0.0)),
-        fine_highres_zero_init=bool(cfg["model"].get("fine_highres_zero_init", False)),
-        fine_loc_head=bool(cfg["model"].get("fine_loc_head", False)),
-        fine_loc_init=float(cfg["model"].get("fine_loc_init", 1.0)),
-        fine_loc_zero_init=bool(cfg["model"].get("fine_loc_zero_init", True)),
-        fine_loc_detach_base=bool(cfg["model"].get("fine_loc_detach_base", False)),
-        fine_loc_highres_source=cfg["model"].get("fine_loc_highres_source"),
-        fine_loc_highres_init=float(cfg["model"].get("fine_loc_highres_init", 1.0)),
-        fine_loc_highres_zero_init=bool(cfg["model"].get("fine_loc_highres_zero_init", True)),
-        fine_loc_highres_detach=bool(cfg["model"].get("fine_loc_highres_detach", True)),
-        teacher_fine_condition=bool(cfg["model"].get("teacher_fine_condition", False)),
-        teacher_fine_init=float(cfg["model"].get("teacher_fine_init", 1.0)),
-        teacher_fine_zero_init=bool(cfg["model"].get("teacher_fine_zero_init", True)),
-        teacher_fine_detach=bool(cfg["model"].get("teacher_fine_detach", True)),
-        scene_coord_head=bool(cfg["model"].get("scene_coord_head", False)),
-        scene_coord_zero_init=bool(cfg["model"].get("scene_coord_zero_init", True)),
-        scene_coord_detach_base=bool(cfg["model"].get("scene_coord_detach_base", False)),
-        scene_coord_use_pixel_grid=bool(cfg["model"].get("scene_coord_use_pixel_grid", False)),
-        scene_coord_global_context=bool(cfg["model"].get("scene_coord_global_context", False)),
     ).to(device)
+    trainable_prefixes = cfg["training"].get("freeze_model_except_prefixes")
+    if trainable_prefixes:
+        trainable_summary = apply_model_trainable_filter(
+            model,
+            trainable_prefixes=trainable_prefixes,
+        )
+        logger.info(
+            "Model trainable filter active: prefixes=%s trainable=%d tensors/%d params frozen=%d tensors/%d params",
+            trainable_prefixes,
+            trainable_summary["trainable_tensors"],
+            trainable_summary["trainable_parameters"],
+            trainable_summary["frozen_tensors"],
+            trainable_summary["frozen_parameters"],
+        )
 
     base_lr = float(cfg["training"]["lr"])
     weight_decay = float(cfg["training"].get("weight_decay", 0.0))
-    optimizer_groups = [
-        {
-            "params": list(model.parameters()),
-            "lr": base_lr,
-            "weight_decay": weight_decay,
-        }
-    ]
+    optimizer_groups = build_model_param_groups(
+        model,
+        base_lr=base_lr,
+        weight_decay=weight_decay,
+        lr_scales=cfg["training"].get("model_lr_scales"),
+    )
     if map_renderer is not None and map_renderer.has_trainable_params():
         optimizer_groups.extend(map_renderer.get_param_groups(base_lr=base_lr, weight_decay=weight_decay))
     optimizer = torch.optim.AdamW(optimizer_groups, lr=base_lr, weight_decay=weight_decay)
@@ -4392,19 +6195,30 @@ def main():
     elif args.warmstart:
         checkpoint = safe_torch_load(args.warmstart)
         warmstart_strict = bool(cfg["model"].get("warmstart_strict", True))
-        load_result = model.load_state_dict(checkpoint["model_state_dict"], strict=warmstart_strict)
+        warmstart_skip_prefixes = cfg["model"].get("warmstart_skip_prefixes") or []
+        load_result = load_model_warmstart(
+            model,
+            checkpoint,
+            strict=warmstart_strict,
+            skip_prefixes=warmstart_skip_prefixes,
+        )
         if map_renderer is not None:
             map_renderer.load_trainable_state(checkpoint.get("map_renderer_state_dict"))
         if warmstart_strict:
             logger.info("Warmstarted weights from %s", args.warmstart)
         else:
             logger.info(
-                "Warmstarted weights from %s (strict=%s, missing=%s, unexpected=%s)",
+                "Warmstarted weights from %s (strict=%s, missing=%d, unexpected=%d, mismatched=%d)",
                 args.warmstart,
                 warmstart_strict,
-                load_result.missing_keys,
-                load_result.unexpected_keys,
+                len(load_result["missing_keys"]),
+                len(load_result["skipped_unexpected"]) + len(load_result["unexpected_keys"]),
+                len(load_result["skipped_mismatched"]) + len(load_result.get("skipped_by_prefix", [])),
             )
+            if load_result["skipped_mismatched"]:
+                logger.info("Skipped mismatched warmstart tensors: %s", load_result["skipped_mismatched"])
+            if load_result.get("skipped_by_prefix"):
+                logger.info("Skipped warmstart tensors by prefix: %s", load_result["skipped_by_prefix"])
 
     max_steps = cfg["training"].get("max_steps")
     use_amp = bool(cfg["training"].get("amp", True) and device.type == "cuda")
@@ -4432,7 +6246,16 @@ def main():
                 else:
                     outputs = model(batch["rgb"])
                 main_total, metrics = compute_main_losses(outputs, batch, cfg)
-                map_total, map_metrics = compute_map_supervision(batch, outputs, cfg, device, epoch=epoch)
+                map_total, map_metrics = compute_map_supervision(
+                    batch,
+                    outputs,
+                    cfg,
+                    device,
+                    epoch=epoch,
+                    local_matcher=getattr(model, "local_matcher", None),
+                    local_flow_head=getattr(model, "local_flow_head", None),
+                    local_corr_projector=getattr(model, "local_corr_projector", None),
+                )
                 total_loss = main_total + map_total
 
             scaler.scale(total_loss).backward()
@@ -4459,17 +6282,46 @@ def main():
                 if "retrieval_cosine" in mean_train:
                     log_msg += " retrieval_cos=%.4f"
                     log_args.append(mean_train.get("retrieval_cosine", 0.0))
+                if "pose_init_best_trans_mm" in mean_train:
+                    log_msg += " init=%.1fmm/%.3fdeg j5m=%.1f"
+                    log_args.extend(
+                        [
+                            mean_train.get("pose_init_best_trans_mm", 0.0),
+                            mean_train.get("pose_init_best_rot_deg", 0.0),
+                            mean_train.get("pose_init_joint_5deg_1000mm", 0.0),
+                        ]
+                    )
+                    if "pose_init_anchor_topk_recall" in mean_train:
+                        log_msg += " anchor=%.1f/%.1f"
+                        log_args.extend(
+                            [
+                                mean_train.get("pose_init_anchor_acc", 0.0),
+                                mean_train.get("pose_init_anchor_topk_recall", 0.0),
+                            ]
+                        )
                 if "map_query_fine_cosine" in mean_train:
-                    log_msg += " map_q_f=%.4f map_q_c=%.4f"
+                    log_msg += " map_q_f=%.4f map_q_loc=%.4f map_q_c=%.4f"
                     log_args.extend(
                         [
                             mean_train.get("map_query_fine_cosine", 0.0),
+                            mean_train.get("map_query_local_fine_cosine", 0.0),
                             mean_train.get("map_query_coarse_cosine", 0.0),
                         ]
                     )
                 if "map_query_fine_raw_cosine" in mean_train:
                     log_msg += " map_q_f_raw=%.4f"
                     log_args.append(mean_train.get("map_query_fine_raw_cosine", 0.0))
+                if "map_query_projected_fine_cosine" in mean_train:
+                    log_msg += " qproj=%.4f"
+                    log_args.append(mean_train.get("map_query_projected_fine_cosine", 0.0))
+                if "map_coarse_pose_rank_gap" in mean_train:
+                    log_msg += " c_rank=%.4f/%.3f"
+                    log_args.extend(
+                        [
+                            mean_train.get("map_coarse_pose_rank_gap", 0.0),
+                            mean_train.get("map_coarse_pose_rank_acc", 0.0),
+                        ]
+                    )
                 if "map_alpha_coverage" in mean_train:
                     log_msg += " alpha_cov=%.4f alpha_cov_valid=%.4f alpha_mean=%.4f"
                     log_args.extend(
@@ -4488,12 +6340,42 @@ def main():
                             mean_train.get("map_query_corr_subpx_cov", 0.0),
                         ]
                     )
+                if "map_query_corr_pred_flow_mag_px" in mean_train:
+                    log_msg += " flow=%.2f/%.2f fcos=%.3f src=%.0f"
+                    log_args.extend(
+                        [
+                            mean_train.get("map_query_corr_pred_flow_mag_px", 0.0),
+                            mean_train.get("map_query_corr_gt_flow_mag_px", 0.0),
+                            mean_train.get("map_query_corr_flow_cosine", 0.0),
+                            mean_train.get("map_query_corr_flow_source_explicit", 0.0),
+                        ]
+                    )
+                if "map_query_corr_argmax_flow_mag_px" in mean_train:
+                    log_msg += " aflow=%.2f aepe=%.2f afcos=%.3f"
+                    log_args.extend(
+                        [
+                            mean_train.get("map_query_corr_argmax_flow_mag_px", 0.0),
+                            mean_train.get("map_query_corr_argmax_flow_epe", 0.0),
+                            mean_train.get("map_query_corr_argmax_flow_cosine", 0.0),
+                        ]
+                    )
+                if "map_query_corr_flow_conf_mean" in mean_train:
+                    log_msg += " fconf=%.3f"
+                    log_args.append(mean_train.get("map_query_corr_flow_conf_mean", 0.0))
                 if "map_query_scene_coord_err_cm" in mean_train:
                     log_msg += " scene=%.1fcm"
                     log_args.append(mean_train.get("map_query_scene_coord_err_cm", 0.0))
                 if "map_query_scene_coord_warp_err_cm" in mean_train:
                     log_msg += " scene_warp=%.1fcm"
                     log_args.append(mean_train.get("map_query_scene_coord_warp_err_cm", 0.0))
+                if "map_query_corr_ce_acc" in mean_train:
+                    log_msg += " ce_acc=%.3f ce_cov=%.3f"
+                    log_args.extend(
+                        [
+                            mean_train.get("map_query_corr_ce_acc", 0.0),
+                            mean_train.get("map_query_corr_ce_cov", 0.0),
+                        ]
+                    )
                 if "map_query_corr_peak_gap" in mean_train:
                     log_msg += " peak_gap=%.4f peak_acc=%.3f"
                     log_args.extend(
@@ -4502,12 +6384,56 @@ def main():
                             mean_train.get("map_query_corr_peak_acc", 0.0),
                         ]
                     )
+                if "map_query_corr_distill_argmax_agree" in mean_train:
+                    log_msg += " dist=%.3f/%.4f"
+                    log_args.extend(
+                        [
+                            mean_train.get("map_query_corr_distill_argmax_agree", 0.0),
+                            mean_train.get("map_query_corr_distill_student_gap", 0.0),
+                        ]
+                    )
+                if "map_query_identity_corr_peak_gap" in mean_train:
+                    log_msg += " id_peak=%.4f/%.3f"
+                    log_args.extend(
+                        [
+                            mean_train.get("map_query_identity_corr_peak_gap", 0.0),
+                            mean_train.get("map_query_identity_corr_peak_acc", 0.0),
+                        ]
+                    )
+                if "map_query_identity_corr_distill_argmax_agree" in mean_train:
+                    log_msg += " id_dist=%.3f/%.4f"
+                    log_args.extend(
+                        [
+                            mean_train.get("map_query_identity_corr_distill_argmax_agree", 0.0),
+                            mean_train.get("map_query_identity_corr_distill_student_gap", 0.0),
+                        ]
+                    )
                 if "map_corr_wls_trans_err_mm" in mean_train:
-                    log_msg += " corr_wls=%.1fmm gain=%.1fmm"
+                    log_msg += " corr_wls=%.1fmm gain=%.1fmm wcov=%.3f"
                     log_args.extend(
                         [
                             mean_train.get("map_corr_wls_trans_err_mm", 0.0),
                             mean_train.get("map_corr_wls_trans_gain_mm", 0.0),
+                            mean_train.get("map_corr_wls_conf_cov", 0.0),
+                        ]
+                    )
+                if "map_self_corr_argmax_flow_epe" in mean_train or "map_self_corr_subpx_flow_epe" in mean_train:
+                    log_msg += " self_corr_epe=%.3f self_corr_acc=%.3f"
+                    log_args.extend(
+                        [
+                            mean_train.get(
+                                "map_self_corr_argmax_flow_epe",
+                                mean_train.get("map_self_corr_subpx_flow_epe", 0.0),
+                            ),
+                            mean_train.get("map_self_corr_subpx_acc", 0.0),
+                        ]
+                    )
+                if "map_self_corr_peak_gap" in mean_train:
+                    log_msg += " self_peak=%.4f/%.3f"
+                    log_args.extend(
+                        [
+                            mean_train.get("map_self_corr_peak_gap", 0.0),
+                            mean_train.get("map_self_corr_peak_acc", 0.0),
                         ]
                     )
                 if "map_query_flow_warp_cosine" in mean_train:
@@ -4634,8 +6560,9 @@ def main():
         )
         if "map_query_coarse_cosine" in latest_val_metrics:
             summary_lines.append(
-                "map q_f={:.4f} q_c={:.4f} t_f={:.4f} t_c={:.4f}".format(
+                "map q_f={:.4f} q_loc={:.4f} q_c={:.4f} t_f={:.4f} t_c={:.4f}".format(
                     float(latest_val_metrics.get("map_query_fine_cosine", 0.0)),
+                    float(latest_val_metrics.get("map_query_local_fine_cosine", 0.0)),
                     float(latest_val_metrics.get("map_query_coarse_cosine", 0.0)),
                     float(latest_val_metrics.get("map_teacher_fine_cosine", 0.0)),
                     float(latest_val_metrics.get("map_teacher_coarse_cosine", 0.0)),

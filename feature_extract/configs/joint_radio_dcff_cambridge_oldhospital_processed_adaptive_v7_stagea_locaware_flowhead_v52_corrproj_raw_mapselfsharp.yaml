@@ -1,0 +1,17 @@
+base_config: joint_radio_dcff_cambridge_oldhospital_processed_adaptive_v7_stagea_locaware_flowhead_v50_corrproj_raw_negmap_distill.yaml
+exp_name: joint_radio_dcff_cambridge_oldhospital_processed_adaptive_v7_stagea_locaware_flowhead_v52_corrproj_raw_mapselfsharp
+
+training:
+  seed: 631
+  max_steps: 800
+  model_lr_scales:
+    local_corr_projector.: 8.0
+
+map_supervision:
+  query_corr_distill_weight: 2.5
+  query_corr_peak_margin_weight: 6.0
+
+  # First make the shared projected map descriptor locally discriminative.
+  # Query-map localization cannot improve if map-self correlation is still flat.
+  map_self_corr_subpixel_weight: 3.0
+  map_self_corr_flow_weight: 0.5

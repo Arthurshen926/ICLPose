@@ -11,11 +11,18 @@ Both modes default to depth-aware WLS for the final 6-DoF update.  The older
 MLP translation/rotation heads remain available for ablations.
 """
 
+import inspect
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
 from typing import Dict, List, Optional, Tuple
 
+from pose_refine.models.depth_aware_matcher import (
+    DepthAwareLocalFlowHead,
+    DepthAwareLocalMatcher,
+)
 from pose_refine.utils.geometry_solver import compute_image_jacobian, diff_pose_solve
 
 
@@ -47,11 +54,17 @@ def local_correlation(fmap1: torch.Tensor, fmap2: torch.Tensor,
 
 
 def guided_local_correlation(fmap1: torch.Tensor, fmap2: torch.Tensor,
-                             flow: torch.Tensor, radius: int = 4
+                             flow: torch.Tensor, radius: int = 4,
+                             checkpoint_offsets: bool = False,
                              ) -> torch.Tensor:
     """Local correlation centered at each pixel's current flow estimate."""
     B, C, H, W = fmap1.shape
     device = fmap1.device
+    use_checkpoint = (
+        bool(checkpoint_offsets)
+        and torch.is_grad_enabled()
+        and (fmap1.requires_grad or fmap2.requires_grad)
+    )
     grid_y, grid_x = torch.meshgrid(
         torch.arange(H, device=device, dtype=flow.dtype),
         torch.arange(W, device=device, dtype=flow.dtype),
@@ -63,19 +76,40 @@ def guided_local_correlation(fmap1: torch.Tensor, fmap2: torch.Tensor,
     base_y = grid_y + flow[:, 1]
 
     corrs = []
+
+    def _sample_corr(
+        fmap1_arg: torch.Tensor,
+        fmap2_arg: torch.Tensor,
+        sample_grid_arg: torch.Tensor,
+    ) -> torch.Tensor:
+        sampled = F.grid_sample(
+            fmap2_arg,
+            sample_grid_arg,
+            mode='bilinear',
+            padding_mode='zeros',
+            align_corners=True,
+        )
+        return (fmap1_arg * sampled).sum(dim=1)
+
     for dy in range(-radius, radius + 1):
         for dx in range(-radius, radius + 1):
             sample_x = (base_x + dx) / max(W - 1, 1) * 2.0 - 1.0
             sample_y = (base_y + dy) / max(H - 1, 1) * 2.0 - 1.0
             sample_grid = torch.stack([sample_x, sample_y], dim=-1)
-            sampled = F.grid_sample(
-                fmap2,
-                sample_grid,
-                mode='bilinear',
-                padding_mode='zeros',
-                align_corners=True,
+            if use_checkpoint:
+                corrs.append(
+                    torch_checkpoint(
+                        _sample_corr,
+                        fmap1,
+                        fmap2,
+                        sample_grid,
+                        use_reentrant=False,
+                    )
+                )
+            else:
+                corrs.append(
+                    _sample_corr(fmap1, fmap2, sample_grid)
             )
-            corrs.append((fmap1 * sampled).sum(dim=1))
     return torch.stack(corrs, dim=1).contiguous()
 
 
@@ -335,6 +369,7 @@ class ConcatPoseNet(nn.Module):
     def __init__(
         self,
         feature_dim: int = 64,
+        coarse_feature_dim: Optional[int] = None,
         hidden_dim: int = 256,
         irls_iters: int = 0,
         robust_kernel: str = 'huber',
@@ -380,9 +415,27 @@ class ConcatPoseNet(nn.Module):
         coarse_stage_pool_hw: int = 4,
         coarse_stage_use_fsm: bool = True,
         pose_update_scale: float = 1.0,
+        local_matcher_enabled: bool = False,
+        local_matcher_hidden_dim: int = 64,
+        local_matcher_zero_init: bool = True,
+        local_matcher_residual_scale: float = 1.0,
+        local_matcher_context_mode: str = "basic",
+        checkpoint_guided_corr: bool = False,
+        local_flow_head_enabled: bool = False,
+        local_flow_head_hidden_dim: int = 64,
+        local_flow_head_zero_init: bool = True,
+        local_flow_head_max_flow: Optional[float] = None,
+        local_flow_head_base_flow_mode: str = "none",
+        local_flow_head_base_temperature: float = 0.05,
+        local_flow_head_context_mode: str = "basic",
+        pose_update_trans_scale: float = 1.0,
+        pose_update_rot_scale: float = 1.0,
+        pose_update_trans_scale_after_first: Optional[float] = None,
+        pose_update_rot_scale_after_first: Optional[float] = None,
     ):
         super().__init__()
         self.feature_dim = feature_dim
+        self.coarse_feature_dim = int(coarse_feature_dim or feature_dim)
         self.irls_iters = irls_iters
         self.robust_kernel = robust_kernel
         self.use_coarse = use_coarse
@@ -404,6 +457,23 @@ class ConcatPoseNet(nn.Module):
         self.use_two_stage_refine = use_two_stage_refine
         self.coarse_only_first_iter = coarse_only_first_iter
         self.pose_update_scale = float(pose_update_scale)
+        self.pose_update_trans_scale = float(pose_update_trans_scale)
+        self.pose_update_rot_scale = float(pose_update_rot_scale)
+        self.pose_update_trans_scale_after_first = (
+            None
+            if pose_update_trans_scale_after_first is None
+            else float(pose_update_trans_scale_after_first)
+        )
+        self.pose_update_rot_scale_after_first = (
+            None
+            if pose_update_rot_scale_after_first is None
+            else float(pose_update_rot_scale_after_first)
+        )
+        self.local_matcher_enabled = bool(local_matcher_enabled)
+        self.local_matcher_zero_init = bool(local_matcher_zero_init)
+        self.checkpoint_guided_corr = bool(checkpoint_guided_corr)
+        self.local_flow_head_enabled = bool(local_flow_head_enabled)
+        self.local_flow_head_zero_init = bool(local_flow_head_zero_init)
 
         if self.use_corr_wls and not self.full_wls:
             raise ValueError("use_corr_wls requires full_wls=True")
@@ -453,6 +523,33 @@ class ConcatPoseNet(nn.Module):
                     nn.Conv2d(feature_dim, proj_dim, 1, bias=False),
                     nn.BatchNorm2d(proj_dim),
                 )
+            self.local_matcher = (
+                DepthAwareLocalMatcher(
+                    radius=int(local_radius),
+                    hidden_dim=int(local_matcher_hidden_dim),
+                    zero_init=bool(local_matcher_zero_init),
+                    residual_scale=float(local_matcher_residual_scale),
+                    context_mode=str(local_matcher_context_mode),
+                )
+                if self.local_matcher_enabled
+                else None
+            )
+            self.local_flow_head = (
+                DepthAwareLocalFlowHead(
+                    radius=int(local_radius),
+                    hidden_dim=int(local_flow_head_hidden_dim),
+                    zero_init=bool(local_flow_head_zero_init),
+                    max_flow=local_flow_head_max_flow,
+                    base_flow_mode=str(local_flow_head_base_flow_mode),
+                    base_temperature=float(local_flow_head_base_temperature),
+                    context_mode=str(local_flow_head_context_mode),
+                )
+                if self.local_flow_head_enabled
+                else None
+            )
+        else:
+            self.local_matcher = None
+            self.local_flow_head = None
 
         if use_gru:
             # -- GRU mode components --
@@ -529,16 +626,16 @@ class ConcatPoseNet(nn.Module):
             )
 
         # -- Shared: Translation regression head (skip if full_wls) --
-        if not full_wls:
-            coarse_context_dim = 128 if use_coarse and use_coarse_in_fine_head else 0
-            if use_coarse and use_coarse_in_fine_head:
-                self.coarse_encoder = nn.Sequential(
-                    nn.AdaptiveAvgPool2d(1),
-                    nn.Flatten(),
-                    nn.Linear(feature_dim, coarse_context_dim),
-                    nn.ReLU(inplace=True),
-                )
+        coarse_context_dim = 128 if use_coarse and use_coarse_in_fine_head else 0
+        if use_coarse and use_coarse_in_fine_head:
+            self.coarse_encoder = nn.Sequential(
+                nn.AdaptiveAvgPool2d(1),
+                nn.Flatten(),
+                nn.Linear(self.coarse_feature_dim, coarse_context_dim),
+                nn.ReLU(inplace=True),
+            )
 
+        if not full_wls:
             self.trans_pool = nn.AdaptiveAvgPool2d(4)
             self.trans_fc = nn.Sequential(
                 nn.Linear(feat_ch * 16 + coarse_context_dim, 256),
@@ -598,6 +695,14 @@ class ConcatPoseNet(nn.Module):
         if self.coarse_pose_stage is not None:
             nn.init.zeros_(self.coarse_pose_stage.head[-1].weight)
             nn.init.zeros_(self.coarse_pose_stage.head[-1].bias)
+        if self.local_matcher is not None and self.local_matcher_zero_init:
+            nn.init.zeros_(self.local_matcher.refine[-1].weight)
+            if self.local_matcher.refine[-1].bias is not None:
+                nn.init.zeros_(self.local_matcher.refine[-1].bias)
+        if self.local_flow_head is not None and self.local_flow_head_zero_init:
+            nn.init.zeros_(self.local_flow_head.predict[-1].weight)
+            if self.local_flow_head.predict[-1].bias is not None:
+                nn.init.zeros_(self.local_flow_head.predict[-1].bias)
         if (
             self.proj_mode == 'shared_linear'
             and hasattr(self, 'proj_shared')
@@ -640,7 +745,7 @@ class ConcatPoseNet(nn.Module):
 
     def _solve_and_regress(self, flow, confidence, depth, intrinsics,
                            feat_for_trans, query_coarse, irls_iters,
-                           robust_kernel):
+                           robust_kernel, rendered_coarse=None):
         with torch.cuda.amp.autocast(enabled=False):
             flow_f = flow.float()
             conf_f = confidence.float()
@@ -654,6 +759,33 @@ class ConcatPoseNet(nn.Module):
             )
         if self.full_wls:
             delta_xi = delta_xi_full
+            if self.rot_mode in ('mlp', 'hybrid'):
+                # Keep translation from depth-WLS while allowing a learned
+                # rotation correction; WLS rotation is weak under noisy query
+                # flow and was previously forced by full_wls=True.
+                rot_feat = self.rot_pool(feat_for_trans).flatten(1)
+                if (
+                    self.use_coarse
+                    and self.use_coarse_in_fine_head
+                    and query_coarse is not None
+                ):
+                    coarse_input = query_coarse
+                    if rendered_coarse is not None:
+                        if rendered_coarse.shape[-2:] != query_coarse.shape[-2:]:
+                            rendered_coarse = F.interpolate(
+                                rendered_coarse,
+                                query_coarse.shape[-2:],
+                                mode='bilinear',
+                                align_corners=False,
+                            )
+                        coarse_input = query_coarse - rendered_coarse
+                    coarse_ctx = self.coarse_encoder(coarse_input)
+                    rot_feat = torch.cat([rot_feat, coarse_ctx], dim=1)
+                if self.rot_mode == 'hybrid':
+                    rot_delta = delta_xi_full[:, 3:].float().detach() + self.rot_fc(rot_feat)
+                else:
+                    rot_delta = self.rot_fc(rot_feat)
+                delta_xi = torch.cat([delta_xi_full[:, :3].float(), rot_delta.float()], dim=1)
         else:
             # Translation from MLP
             feat_input = feat_for_trans.detach() if self.detach_trans else feat_for_trans
@@ -708,7 +840,8 @@ class ConcatPoseNet(nn.Module):
         )
 
     def forward_fine_stage(self, query_fine, rendered_fine, depth, intrinsics,
-                           irls_iters=None, robust_kernel=None, query_coarse=None):
+                           irls_iters=None, robust_kernel=None, query_coarse=None,
+                           rendered_coarse=None):
         return self.forward(
             query_fine,
             rendered_fine,
@@ -717,18 +850,20 @@ class ConcatPoseNet(nn.Module):
             irls_iters=irls_iters,
             robust_kernel=robust_kernel,
             query_coarse=query_coarse,
+            rendered_coarse=rendered_coarse,
         )
 
     def forward(self, query_fine, rendered_fine, depth, intrinsics,
-                irls_iters=None, robust_kernel=None, query_coarse=None):
+                irls_iters=None, robust_kernel=None, query_coarse=None,
+                rendered_coarse=None):
         if self.use_corr_wls:
             return self._forward_corr_wls(
                 query_fine, rendered_fine, depth, intrinsics,
-                irls_iters, robust_kernel, query_coarse)
+                irls_iters, robust_kernel, query_coarse, rendered_coarse=rendered_coarse)
         elif self.use_gru:
             return self._forward_gru(
                 query_fine, rendered_fine, depth, intrinsics,
-                irls_iters, robust_kernel, query_coarse)
+                irls_iters, robust_kernel, query_coarse, rendered_coarse=rendered_coarse)
         else:
             return self._forward_concat(
                 query_fine, rendered_fine, depth, intrinsics,
@@ -767,8 +902,49 @@ class ConcatPoseNet(nn.Module):
             q_proj = F.normalize(q_proj, dim=1)
         return q_proj, r_proj
 
+    @staticmethod
+    def _depth_valid_mask(depth: Optional[torch.Tensor], target_hw: Tuple[int, int]) -> Optional[torch.Tensor]:
+        if depth is None:
+            return None
+        depth_f = depth.float()
+        if depth_f.ndim == 3:
+            depth_f = depth_f.unsqueeze(1)
+        if depth_f.shape[-2:] != target_hw:
+            depth_f = F.interpolate(depth_f, target_hw, mode='nearest')
+        return (depth_f > 0.05).float()
+
+    def _apply_local_matcher(
+        self,
+        corr: torch.Tensor,
+        depth: Optional[torch.Tensor],
+        valid_mask: Optional[torch.Tensor] = None,
+        intrinsics=None,
+    ) -> torch.Tensor:
+        matcher = getattr(self, 'local_matcher', None)
+        if matcher is None:
+            return corr
+        if valid_mask is None:
+            valid_mask = self._depth_valid_mask(depth, corr.shape[-2:])
+        if "intrinsics" in inspect.signature(matcher.forward).parameters:
+            return matcher(corr, depth=depth, valid_mask=valid_mask, intrinsics=intrinsics)
+        return matcher(corr, depth=depth, valid_mask=valid_mask)
+
+    def _local_flow_head_init(
+        self,
+        corr: torch.Tensor,
+        depth: Optional[torch.Tensor],
+        valid_mask: Optional[torch.Tensor] = None,
+        intrinsics=None,
+    ) -> Optional[dict]:
+        head = getattr(self, 'local_flow_head', None)
+        if head is None:
+            return None
+        if valid_mask is None:
+            valid_mask = self._depth_valid_mask(depth, corr.shape[-2:])
+        return head(corr, depth=depth, valid_mask=valid_mask, intrinsics=intrinsics)
+
     def _forward_corr_wls(self, query_fine, rendered_fine, depth, intrinsics,
-                          irls_iters, robust_kernel, query_coarse):
+                          irls_iters, robust_kernel, query_coarse, rendered_coarse=None):
         if query_fine.shape[-2:] != rendered_fine.shape[-2:]:
             query_fine = F.interpolate(
                 query_fine,
@@ -779,6 +955,7 @@ class ConcatPoseNet(nn.Module):
 
         q_proj, r_proj = self._project_for_local_corr(query_fine, rendered_fine)
         corr = local_correlation(r_proj, q_proj, self.local_radius)
+        corr = self._apply_local_matcher(corr, depth, intrinsics=intrinsics)
         flow = soft_argmax_flow_from_correlation(
             corr,
             radius=self.local_radius,
@@ -793,7 +970,7 @@ class ConcatPoseNet(nn.Module):
 
         delta_xi, delta_xi_full = self._solve_and_regress(
             flow, confidence, depth, intrinsics, r_proj,
-            query_coarse, irls_iters, robust_kernel)
+            query_coarse, irls_iters, robust_kernel, rendered_coarse=rendered_coarse)
         return {
             'delta_xi': delta_xi,
             'delta_xi_full': delta_xi_full,
@@ -803,7 +980,7 @@ class ConcatPoseNet(nn.Module):
         }
 
     def _forward_gru(self, query_fine, rendered_fine, depth, intrinsics,
-                     irls_iters, robust_kernel, query_coarse):
+                     irls_iters, robust_kernel, query_coarse, rendered_coarse=None):
         B, _, H, W = query_fine.shape
         device = query_fine.device
 
@@ -823,6 +1000,10 @@ class ConcatPoseNet(nn.Module):
             query_fine, rendered_fine, depth, B, H, W, device)
         h = self.context_encoder(ctx_input)
 
+        init_corr = None
+        flow_init = None
+        init_flow = None
+        init_confidence = None
         # Coarse flow initialization: predict flow at downsampled resolution
         # then upsample to full resolution to seed the GRU
         if self.coarse_flow_init:
@@ -838,17 +1019,33 @@ class ConcatPoseNet(nn.Module):
                 coarse_flow, size=(H, W), mode='bilinear', align_corners=False
             ) * pf
         else:
-            flow = torch.zeros(B, 2, H, W, device=device, dtype=q_proj.dtype)
+            init_corr = local_correlation(r_proj, q_proj, self.local_radius)
+            init_corr = self._apply_local_matcher(init_corr, depth, intrinsics=intrinsics)
+            flow_init = self._local_flow_head_init(init_corr, depth, intrinsics=intrinsics)
+            if flow_init is None:
+                flow = torch.zeros(B, 2, H, W, device=device, dtype=q_proj.dtype)
+            else:
+                flow = flow_init['flow']
+                init_flow = flow_init['flow']
+                init_confidence = flow_init['confidence']
 
         conf = torch.full((B, 1, H, W), 0.5, device=device, dtype=q_proj.dtype)
+        if flow_init is not None:
+            conf = flow_init['confidence']
         flow_preds: List[torch.Tensor] = []
 
         for i in range(self.gru_iters):
-            if i == 0 and not self.coarse_flow_init:
-                corr = local_correlation(r_proj, q_proj, self.local_radius)
+            if i == 0 and not self.coarse_flow_init and init_corr is not None:
+                corr = init_corr
             else:
                 corr = guided_local_correlation(
-                    r_proj, q_proj, flow.detach(), self.local_radius)
+                    r_proj,
+                    q_proj,
+                    flow.detach(),
+                    self.local_radius,
+                    checkpoint_offsets=self.checkpoint_guided_corr,
+                )
+            corr = self._apply_local_matcher(corr, depth, intrinsics=intrinsics)
 
             inp = torch.cat([corr, flow, conf], dim=1)
             inp_encoded = self.corr_encoder(inp)
@@ -860,19 +1057,29 @@ class ConcatPoseNet(nn.Module):
             flow = flow + delta_flow
             flow_preds.append(flow)
 
+        if self.gru_iters <= 0:
+            flow_preds.append(flow)
+
         confidence = conf.expand(-1, 2, -1, -1).contiguous()
 
         delta_xi, delta_xi_full = self._solve_and_regress(
             flow, confidence, depth, intrinsics, h,
-            query_coarse, irls_iters, robust_kernel)
+            query_coarse, irls_iters, robust_kernel, rendered_coarse=rendered_coarse)
 
-        return {
+        result = {
             'delta_xi': delta_xi,
             'delta_xi_full': delta_xi_full,
             'flow': flow,
             'confidence': confidence,
             'flow_preds': flow_preds,
         }
+        if init_flow is not None:
+            result['init_flow'] = init_flow
+        if init_confidence is not None:
+            result['init_confidence'] = init_confidence
+        if init_corr is not None:
+            result['init_corr'] = init_corr
+        return result
 
     # -- GT flow computation --
 

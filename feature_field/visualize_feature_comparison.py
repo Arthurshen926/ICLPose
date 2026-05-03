@@ -410,6 +410,7 @@ class OnlineQueryStudentProvider:
         self.device = torch.device(device)
         model_cfg = self.cfg.get("model", {})
         dataset_cfg = self.cfg.get("dataset", {})
+        export_cfg = self.cfg.get("export", {})
         fallback_dim = int(model_cfg.get("feature_dim", 64))
         fine_dim = int(model_cfg.get("fine_feature_dim") or fallback_dim)
         coarse_dim = int(model_cfg.get("coarse_feature_dim") or fallback_dim)
@@ -436,12 +437,39 @@ class OnlineQueryStudentProvider:
             magnitude_min=float(model_cfg.get("magnitude_min", 1e-4)),
             fine_low_level_skip=bool(model_cfg.get("fine_low_level_skip", False)),
             fine_low_level_init=float(model_cfg.get("fine_low_level_init", 0.0)),
+            fine_highres_skip=bool(model_cfg.get("fine_highres_skip", False)),
+            fine_highres_source=str(model_cfg.get("fine_highres_source", "stage2")),
+            fine_highres_init=float(model_cfg.get("fine_highres_init", 0.0)),
+            fine_highres_zero_init=bool(model_cfg.get("fine_highres_zero_init", False)),
+            fine_loc_head=bool(model_cfg.get("fine_loc_head", False)),
+            fine_loc_init=float(model_cfg.get("fine_loc_init", 1.0)),
+            fine_loc_zero_init=bool(model_cfg.get("fine_loc_zero_init", True)),
+            fine_loc_detach_base=bool(model_cfg.get("fine_loc_detach_base", False)),
+            fine_loc_highres_source=model_cfg.get("fine_loc_highres_source"),
+            fine_loc_highres_init=float(model_cfg.get("fine_loc_highres_init", 1.0)),
+            fine_loc_highres_zero_init=bool(model_cfg.get("fine_loc_highres_zero_init", True)),
+            fine_loc_highres_detach=bool(model_cfg.get("fine_loc_highres_detach", True)),
+            teacher_fine_condition=bool(model_cfg.get("teacher_fine_condition", False)),
+            teacher_fine_init=float(model_cfg.get("teacher_fine_init", 1.0)),
+            teacher_fine_zero_init=bool(model_cfg.get("teacher_fine_zero_init", True)),
+            teacher_fine_detach=bool(model_cfg.get("teacher_fine_detach", True)),
+            scene_coord_head=bool(model_cfg.get("scene_coord_head", False)),
+            scene_coord_zero_init=bool(model_cfg.get("scene_coord_zero_init", True)),
+            scene_coord_detach_base=bool(model_cfg.get("scene_coord_detach_base", False)),
+            scene_coord_use_pixel_grid=bool(model_cfg.get("scene_coord_use_pixel_grid", False)),
+            scene_coord_global_context=bool(model_cfg.get("scene_coord_global_context", False)),
+            local_matcher_enabled=bool(model_cfg.get("local_matcher_enabled", False)),
+            local_matcher_radius=int(model_cfg.get("local_matcher_radius", 4)),
+            local_matcher_hidden_dim=int(model_cfg.get("local_matcher_hidden_dim", 64)),
+            local_matcher_zero_init=bool(model_cfg.get("local_matcher_zero_init", True)),
+            local_matcher_residual_scale=float(model_cfg.get("local_matcher_residual_scale", 1.0)),
         ).to(self.device)
         ckpt = safe_torch_load(checkpoint_path, map_location="cpu")
         self.model.load_state_dict(ckpt["model_state_dict"], strict=True)
         self.model.eval()
         self.fine_dim = fine_dim
         self.coarse_dim = coarse_dim
+        self.fine_key = str(export_cfg.get("fine_key", model_cfg.get("export_fine_key", "fine")))
 
     def get_for_camera(self, cam, fid=None):
         img = Image.open(cam.image).convert("RGB")
@@ -452,7 +480,9 @@ class OnlineQueryStudentProvider:
         tensor = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).to(self.device)
         with torch.no_grad():
             out = self.model(tensor)
-        return out["fine"].float(), out["coarse"].float()
+        if self.fine_key not in out:
+            raise KeyError(f"query fine_key={self.fine_key!r} not found in model outputs")
+        return out[self.fine_key].float(), out["coarse"].float()
 
 
 def _cam_to_viewmat(cam, device):

@@ -1,0 +1,10 @@
+base_config: concat_loc_cambridge_oldhospital_processed_adaptive_v7_locaware_matcher_gru_flowhead_softbase_v1_probe.yaml
+exp_name: concat_loc_cambridge_oldhospital_processed_adaptive_v7_locaware_matcher_gru_flowhead_softbase_matcher_v1_probe
+
+model:
+  local_matcher_init_checkpoint:
+  local_matcher_enabled: true
+  local_matcher_hidden_dim: 96
+  local_matcher_zero_init: true
+  local_matcher_residual_scale: 0.25
+  local_matcher_context_mode: observability

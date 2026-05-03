@@ -1,0 +1,19 @@
+base_config: joint_radio_dcff_cambridge_oldhospital_processed_adaptive_v7_stagea_locaware_flowhead_v5_corrpretrain.yaml
+exp_name: joint_radio_dcff_cambridge_oldhospital_processed_adaptive_v7_stagea_locaware_flowhead_v6_matcher_flowpretrain
+
+model:
+  local_matcher_enabled: true
+  local_matcher_radius: 10
+  local_matcher_hidden_dim: 64
+  local_matcher_zero_init: true
+  local_matcher_residual_scale: 1.0
+
+training:
+  seed: 233
+  lr: 0.00004
+  max_steps: 700
+
+map_supervision:
+  local_matcher_enabled: true
+  query_corr_wls_pose_weight: 0.0
+  query_corr_pose_gain_weight: 0.0

@@ -1,0 +1,94 @@
+base_config: joint_radio_dcff_cambridge_oldhospital_processed_adaptive_v7_locdriven_fineidentity_frozenmap_v6.yaml
+exp_name: joint_radio_dcff_cambridge_oldhospital_processed_adaptive_v7_locdriven_decoupled_fineloc_v10
+
+model:
+  warmstart_strict: false
+
+pose_init:
+  enabled: false
+
+training:
+  seed: 877
+  lr: 0.00005
+  epochs: 2
+  max_steps: 600
+  log_every: 10
+  val_every_epochs: 1
+  save_every_epochs: 1
+  freeze_model_except_prefixes:
+    - "stage3."
+    - "stage4."
+    - "fine_fuse."
+    - "fine_low_fuse."
+    - "fine_low_scale"
+    - "fine_highres_fuse."
+    - "fine_highres_scale"
+    - "fine_head."
+    - "fine_loc_head."
+    - "fine_loc_highres_fuse."
+    - "fine_loc_scale"
+    - "fine_loc_highres_scale"
+    - "local_corr_projector."
+  model_lr_scales:
+    stage3.: 0.05
+    stage4.: 0.10
+    fine_head.: 0.5
+    fine_loc_head.: 6.0
+    fine_loc_highres_fuse.: 6.0
+    local_corr_projector.: 8.0
+
+map_supervision:
+  trainable: false
+  train_fine_decoder: false
+  train_coarse_fusion: false
+  train_feat_sharp: false
+  train_fsm: false
+  train_hash_mlp: false
+  train_latent: false
+  train_geometry: false
+
+  query_fine_key: fine
+  query_local_fine_key: fine_loc
+
+  query_fine_weight: 0.08
+  query_fine_infonce_weight: 0.01
+  query_fine_grad_weight: 0.02
+
+  query_local_fine_weight: 0.02
+  query_local_fine_infonce_weight: 0.20
+  query_local_fine_grad_weight: 0.02
+
+  query_coarse_weight: 0.0
+  query_coarse_infonce_weight: 0.0
+  query_coarse_grad_weight: 0.0
+  coarse_pose_rank_weight: 0.0
+
+  rendered_teacher_fine_weight: 0.0
+  rendered_teacher_fine_infonce_weight: 0.0
+  rendered_teacher_fine_grad_weight: 0.0
+
+  infonce_samples: 768
+  infonce_temperature: 0.04
+
+  query_identity_corr_radius: 4
+  query_identity_corr_temperature: 0.006
+  query_identity_corr_ce_temperature: 0.035
+  query_identity_corr_ce_weight: 4.0
+  query_identity_corr_subpixel_weight: 5.0
+  query_identity_corr_flow_weight: 0.5
+  query_identity_corr_peak_margin_weight: 45.0
+  query_identity_corr_peak_margin: 0.08
+
+  query_corr_ce_weight: 0.05
+  query_corr_subpixel_weight: 0.10
+  query_corr_flow_weight: 0.02
+  query_corr_peak_margin_weight: 1.0
+  query_corr_wls_pose_weight: 0.0
+  query_corr_pose_gain_weight: 0.0
+
+  query_flow_warp_weight: 0.01
+  query_flow_warp_contrastive_weight: 0.30
+  map_self_corr_ce_weight: 0.0
+  map_self_corr_subpixel_weight: 0.0
+  map_self_corr_flow_weight: 0.0
+  map_self_corr_peak_margin_weight: 0.0

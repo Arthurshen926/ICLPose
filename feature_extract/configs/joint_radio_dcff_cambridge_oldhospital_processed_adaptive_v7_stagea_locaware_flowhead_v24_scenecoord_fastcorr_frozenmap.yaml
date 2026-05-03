@@ -1,0 +1,47 @@
+base_config: joint_radio_dcff_cambridge_oldhospital_processed_adaptive_v7_stagea_locaware_flowhead_v18_mapjoint_lowres_wls_conf01.yaml
+exp_name: joint_radio_dcff_cambridge_oldhospital_processed_adaptive_v7_stagea_locaware_flowhead_v24_scenecoord_fastcorr_frozenmap
+
+model:
+  warmstart_strict: false
+  warmstart_skip_prefixes: ["local_flow_head."]
+  scene_coord_head: true
+  scene_coord_zero_init: true
+  scene_coord_detach_base: true
+  scene_coord_use_pixel_grid: true
+  scene_coord_global_context: true
+  local_flow_head_enabled: false
+
+training:
+  seed: 367
+  lr: 0.00001
+  max_steps: 600
+  model_lr_scales:
+    scene_coord_head.: 30.0
+    scene_context_proj.: 30.0
+
+map_supervision:
+  trainable: false
+  map_lr_scale: 0.0
+  hash_mlp_lr_scale: 0.0
+  latent_lr_scale: 0.0
+  train_fine_decoder: false
+  train_coarse_fusion: false
+  train_feat_sharp: false
+  train_fsm: false
+  train_hash_mlp: false
+  train_latent: false
+  train_geometry: false
+  local_flow_head_enabled: false
+
+  scene_coord_center: [13.28, 9.93, 0.67]
+  scene_coord_scale: 32.0
+  query_scene_coord_weight: 12.0
+  query_scene_coord_warp_weight: 6.0
+  query_scene_coord_huber_beta: 0.004
+  query_corr_scene_coord_weight: 1.5
+  feature_metric_scene_coord_weight: 0.0
+
+  query_corr_flow_decode_mode: argmax_st
+  query_corr_wls_pose_weight: 0.0
+  query_corr_pose_gain_weight: 0.0
+  query_corr_flow_head_conf_weight: 0.0

@@ -1,0 +1,58 @@
+base_config: joint_radio_dcff_cambridge_oldhospital_processed_adaptive_v7_locdriven_coarseinit_fineloc_mapjoint_v3_fps128.yaml
+exp_name: joint_radio_dcff_cambridge_oldhospital_processed_adaptive_v7_locdriven_fineidentity_mapjoint_v4
+
+pose_init:
+  enabled: true
+  trans_weight: 0.35
+  rot_weight: 0.08
+  score_weight: 0.5
+  uncertainty_weight: 0.0
+  rot_cost_weight: 0.1
+  anchor_weight: 1.0
+
+training:
+  seed: 839
+  lr: 0.000025
+  max_steps: 700
+
+map_supervision:
+  query_fine_key: fine_loc
+  query_fine_weight: 0.06
+  query_fine_raw_weight: 0.001
+  query_fine_infonce_weight: 0.006
+  query_fine_grad_weight: 0.015
+
+  query_coarse_weight: 0.06
+  coarse_pose_rank_weight: 0.75
+  query_coarse_infonce_weight: 0.015
+
+  query_identity_corr_feature_preprocess: concat_highpass
+  query_identity_corr_highpass_kernel: 5
+  query_identity_corr_highpass_scale: 1.0
+  query_identity_corr_radius: 4
+  query_identity_corr_temperature: 0.01
+  query_identity_corr_ce_temperature: 0.04
+  query_identity_corr_ce_weight: 1.5
+  query_identity_corr_subpixel_weight: 2.5
+  query_identity_corr_flow_weight: 0.25
+  query_identity_corr_peak_margin_weight: 18.0
+  query_identity_corr_peak_margin: 0.05
+
+  query_corr_feature_preprocess: concat_highpass
+  query_corr_highpass_kernel: 5
+  query_corr_highpass_scale: 1.0
+  query_corr_radius: 8
+  query_corr_temperature: 0.008
+  query_corr_ce_temperature: 0.04
+  query_corr_ce_weight: 0.4
+  query_corr_subpixel_weight: 0.8
+  query_corr_flow_weight: 0.12
+  query_corr_peak_margin_weight: 5.0
+  query_corr_wls_pose_weight: 0.02
+  query_corr_pose_gain_weight: 0.0
+  feature_metric_pose_weight: 0.0
+
+  map_self_corr_ce_weight: 0.15
+  map_self_corr_subpixel_weight: 0.25
+  map_self_corr_flow_weight: 0.04
+  map_self_corr_peak_margin_weight: 0.5

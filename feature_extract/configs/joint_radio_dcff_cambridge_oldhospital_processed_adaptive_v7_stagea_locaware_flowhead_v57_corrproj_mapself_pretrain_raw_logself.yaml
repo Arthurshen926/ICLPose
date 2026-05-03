@@ -1,0 +1,6 @@
+base_config: joint_radio_dcff_cambridge_oldhospital_processed_adaptive_v7_stagea_locaware_flowhead_v55_corrproj_mapself_pretrain_raw.yaml
+exp_name: joint_radio_dcff_cambridge_oldhospital_processed_adaptive_v7_stagea_locaware_flowhead_v57_corrproj_mapself_pretrain_raw_logself
+
+training:
+  seed: 661
+  max_steps: 300

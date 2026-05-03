@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 import yaml
@@ -113,7 +114,15 @@ def normalize_config_paths(
 
 
 def load_mainline_config(path: str) -> dict[str, Any]:
-    config = load_yaml_config(path)
+    resolved = resolve_repo_path(path, must_exist=True)
+    assert resolved is not None
+    config = load_yaml_config(str(resolved))
+    base_config = config.pop("base_config", None)
+    if base_config:
+        base_path = Path(base_config)
+        if not base_path.is_absolute():
+            base_path = Path(resolved).parent / base_path
+        config = deep_merge(load_mainline_config(str(base_path)), config)
     return normalize_config_paths(config, MAINLINE_PATH_SPECS)
 
 
@@ -122,8 +131,18 @@ def load_joint_radio_config(
     *,
     default_config: dict[str, Any],
 ) -> dict[str, Any]:
-    user_cfg = load_yaml_config(path)
-    merged = deep_merge(default_config, user_cfg)
+    resolved = resolve_repo_path(path, must_exist=True)
+    assert resolved is not None
+    user_cfg = load_yaml_config(str(resolved))
+    base_config = user_cfg.pop("base_config", None)
+    if base_config:
+        base_path = Path(base_config)
+        if not base_path.is_absolute():
+            base_path = Path(resolved).parent / base_path
+        base_cfg = load_joint_radio_config(str(base_path), default_config=default_config)
+    else:
+        base_cfg = default_config
+    merged = deep_merge(base_cfg, user_cfg)
     return normalize_config_paths(merged, JOINT_RADIO_PATH_SPECS)
 
 

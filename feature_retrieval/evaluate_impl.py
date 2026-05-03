@@ -89,9 +89,40 @@ def summarize_pose_metrics(rot_errs: np.ndarray, trans_errs: np.ndarray) -> Dict
         "pct_2000mm": float(np.mean(trans_errs < 2000.0) * 100.0),
         "joint_01deg_53mm": float(np.mean((rot_errs < 0.1) & (trans_errs < 5.3)) * 100.0),
         "joint_1deg_50mm": float(np.mean((rot_errs < 1.0) & (trans_errs < 50.0)) * 100.0),
+        "joint_1deg_100mm": float(np.mean((rot_errs < 1.0) & (trans_errs < 100.0)) * 100.0),
+        "joint_2deg_100mm": float(np.mean((rot_errs < 2.0) & (trans_errs < 100.0)) * 100.0),
+        "joint_5deg_250mm": float(np.mean((rot_errs < 5.0) & (trans_errs < 250.0)) * 100.0),
         "joint_5deg_100mm": float(np.mean((rot_errs < 5.0) & (trans_errs < 100.0)) * 100.0),
         "joint_5deg_1000mm": float(np.mean((rot_errs < 5.0) & (trans_errs < 1000.0)) * 100.0),
         "joint_10deg_2000mm": float(np.mean((rot_errs < 10.0) & (trans_errs < 2000.0)) * 100.0),
+    }
+
+
+def summarize_full_pipeline_metrics(
+    *,
+    init_rot_errs,
+    init_trans_errs,
+    final_rot_errs,
+    final_trans_errs,
+) -> Dict[str, Dict[str, float]]:
+    """Summarize the single paper-facing real-init full-pipeline protocol."""
+    init_rot = np.asarray(init_rot_errs, dtype=np.float64)
+    init_trans = np.asarray(init_trans_errs, dtype=np.float64)
+    final_rot = np.asarray(final_rot_errs, dtype=np.float64)
+    final_trans = np.asarray(final_trans_errs, dtype=np.float64)
+    init = summarize_pose_metrics(init_rot, init_trans)
+    final = summarize_pose_metrics(final_rot, final_trans)
+    return {
+        "protocol": "real_init_full_pipeline",
+        "init": init,
+        "final": final,
+        "gain": {
+            "rot_median_deg": float(init["rot_median"] - final["rot_median"]),
+            "trans_median_mm": float(init["trans_median"] - final["trans_median"]),
+            "joint_1deg_50mm": float(final["joint_1deg_50mm"] - init["joint_1deg_50mm"]),
+            "joint_1deg_100mm": float(final["joint_1deg_100mm"] - init["joint_1deg_100mm"]),
+            "joint_5deg_250mm": float(final["joint_5deg_250mm"] - init["joint_5deg_250mm"]),
+        },
     }
 
 
@@ -991,6 +1022,12 @@ def main():
         "init_metrics": summaries["init"],
         "top1_final_metrics": summaries["top1_final"],
         "final_metrics": summaries["final"],
+        "full_pipeline_metrics": summarize_full_pipeline_metrics(
+            init_rot_errs=[r["init_rot_err_deg"] for r in records],
+            init_trans_errs=[r["init_trans_err_mm"] for r in records],
+            final_rot_errs=[r["fused_final_rot_err_deg"] for r in records],
+            final_trans_errs=[r["fused_final_trans_err_mm"] for r in records],
+        ),
         "oracle_final_metrics": summaries["oracle_final"],
         "fusion_stats": summaries["fusion_stats"],
         "readiness": readiness,

@@ -1,0 +1,31 @@
+base_config: joint_radio_dcff_cambridge_oldhospital_processed_adaptive_v7_locdriven_decoupled_corrmatcher_v21_peakce.yaml
+exp_name: joint_radio_dcff_cambridge_oldhospital_processed_adaptive_v7_locdriven_decoupled_corrmatcher_v23_projected_peakce
+
+model:
+  local_corr_projector_enabled: true
+  local_corr_projector_hidden_dim: 128
+  local_corr_projector_output_dim: 64
+  local_corr_projector_zero_init: true
+  local_corr_projector_l2_normalize: true
+  warmstart_skip_prefixes: ["local_matcher.", "local_corr_projector."]
+
+training:
+  seed: 953
+  lr: 0.00006
+  max_steps: 500
+  model_lr_scales:
+    local_matcher.: 4.0
+    local_corr_projector.: 6.0
+    stage3.: 0.03
+    stage4.: 0.08
+    fine_head.: 0.35
+    fine_loc_head.: 4.0
+    fine_loc_highres_fuse.: 4.0
+
+map_supervision:
+  local_corr_projector_enabled: true
+  local_corr_projector_apply_to_query: true
+  query_projected_fine_weight: 0.0
+  query_corr_ce_weight: 8.0
+  query_corr_subpixel_weight: 3.0
+  query_corr_peak_margin_weight: 20.0
