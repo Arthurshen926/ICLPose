@@ -1,0 +1,26 @@
+base_config: joint_radio_dcff_cambridge_oldhospital_processed_pca64_depthaware_v31_querymap_domain_stagea.yaml
+exp_name: joint_radio_dcff_cambridge_oldhospital_processed_pca64_depthaware_v32_locdriven_domain_jointmap_stageb
+
+training:
+  seed: 132
+  lr: 0.00004
+  max_steps: 1800
+
+map_supervision:
+  trainable: true
+  map_lr_scale: 0.01
+  train_fine_decoder: true
+  train_feat_sharp: true
+  train_fsm: true
+  train_hash_mlp: false
+  train_latent: false
+  train_geometry: false
+  query_fine_weight: 0.16
+  query_fine_infonce_weight: 0.08
+  rendered_teacher_fine_weight: 0.18
+  rendered_teacher_fine_raw_weight: 0.04
+  query_corr_peak_margin_weight: 24.0
+  query_corr_wls_pose_weight: 0.8
+  query_corr_wls_pose_update_scale: 0.5
+  feature_metric_pose_weight: 0.08
+  map_self_feature_metric_pose_weight: 0.08

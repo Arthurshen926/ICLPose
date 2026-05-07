@@ -12,6 +12,7 @@ MLP translation/rotation heads remain available for ablations.
 """
 
 import inspect
+import math
 
 import torch
 import torch.nn as nn
@@ -139,6 +140,174 @@ def soft_argmax_flow_from_correlation(
         ],
         dim=1,
     ).reshape(B, 2, H, W)
+
+
+def correlation_confidence_from_probs(
+    probs: torch.Tensor,
+    radius: int = 4,
+    *,
+    mode: str = "max",
+    variance_scale: float = 0.5,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Estimate WLS confidence from a local-correlation probability volume.
+
+    ``max`` preserves the legacy peak-probability behavior. ``variance`` is
+    useful when the correct match is represented by a precise soft/subpixel
+    distribution whose maximum probability is not high enough for peak-based
+    gating.
+    """
+    B, channels, H, W = probs.shape
+    radius = int(radius)
+    window = 2 * radius + 1
+    expected_channels = window * window
+    if channels != expected_channels:
+        raise ValueError(
+            f"probs has {channels} channels, expected {expected_channels} "
+            f"for radius={radius}"
+        )
+    mode_key = str(mode or "max").lower()
+    if mode_key in {"max", "peak", "probmax", "softmax_max"}:
+        return probs.max(dim=1, keepdim=True).values
+    if mode_key in {"uniform", "one", "ones", "none"}:
+        return torch.ones(B, 1, H, W, device=probs.device, dtype=probs.dtype)
+    if mode_key in {"entropy", "negentropy"}:
+        entropy = -(probs.clamp(min=eps) * probs.clamp(min=eps).log()).sum(dim=1, keepdim=True)
+        max_entropy = math.log(float(expected_channels))
+        return (1.0 - entropy / max(max_entropy, eps)).clamp(min=0.0, max=1.0).to(probs.dtype)
+    if mode_key in {"variance", "var", "soft_variance"}:
+        offsets = torch.arange(-radius, radius + 1, device=probs.device, dtype=probs.dtype)
+        dy, dx = torch.meshgrid(offsets, offsets, indexing="ij")
+        dx = dx.reshape(1, expected_channels, 1, 1)
+        dy = dy.reshape(1, expected_channels, 1, 1)
+        mean_x = (probs * dx).sum(dim=1, keepdim=True)
+        mean_y = (probs * dy).sum(dim=1, keepdim=True)
+        variance = (probs * ((dx - mean_x).square() + (dy - mean_y).square())).sum(
+            dim=1,
+            keepdim=True,
+        )
+        return torch.exp(-variance / max(float(variance_scale), eps)).clamp(
+            min=0.0,
+            max=1.0,
+        ).to(probs.dtype)
+    raise ValueError(
+        "correlation confidence mode must be one of "
+        "{'max', 'uniform', 'entropy', 'variance'}, "
+        f"got {mode!r}"
+    )
+
+
+def _as_pool_factors(pool_factors) -> Tuple[int, ...]:
+    if pool_factors is None:
+        return (4, 2)
+    if isinstance(pool_factors, int):
+        factors = (int(pool_factors),)
+    else:
+        factors = tuple(int(v) for v in pool_factors)
+    factors = tuple(v for v in factors if v > 1)
+    return tuple(sorted(set(factors), reverse=True))
+
+
+def coarse_to_fine_correlation_flow(
+    fmap1: torch.Tensor,
+    fmap2: torch.Tensor,
+    *,
+    radius: int = 4,
+    coarse_radius: Optional[int] = None,
+    pool_factors=(4, 2),
+    temperature: float = 0.05,
+    confidence_mode: str = "max",
+    confidence_variance_scale: float = 0.5,
+    checkpoint_offsets: bool = False,
+) -> Dict[str, torch.Tensor]:
+    """Estimate rendered->query flow with a coarse-to-fine correlation pyramid."""
+    if fmap1.shape != fmap2.shape:
+        raise ValueError(
+            f"fmap1 and fmap2 must have the same shape, got {tuple(fmap1.shape)} and {tuple(fmap2.shape)}"
+        )
+    radius = int(radius)
+    coarse_radius = int(coarse_radius if coarse_radius is not None else radius)
+    factors = _as_pool_factors(pool_factors)
+    H, W = fmap1.shape[-2:]
+
+    flow_full = None
+    confidence_full = None
+
+    for factor in factors:
+        if H // factor < 2 or W // factor < 2:
+            continue
+        r_s = F.normalize(F.avg_pool2d(fmap1, factor), dim=1)
+        q_s = F.normalize(F.avg_pool2d(fmap2, factor), dim=1)
+        hs, ws = r_s.shape[-2:]
+        if flow_full is None:
+            corr = local_correlation(r_s, q_s, coarse_radius)
+            flow_s = soft_argmax_flow_from_correlation(
+                corr,
+                radius=coarse_radius,
+                temperature=temperature,
+            )
+        else:
+            flow_s = F.interpolate(flow_full, size=(hs, ws), mode="bilinear", align_corners=False) / float(factor)
+            corr = guided_local_correlation(
+                r_s,
+                q_s,
+                flow_s,
+                radius=radius,
+                checkpoint_offsets=checkpoint_offsets,
+            )
+            flow_s = flow_s + soft_argmax_flow_from_correlation(
+                corr,
+                radius=radius,
+                temperature=temperature,
+            )
+        probs = torch.softmax(corr.float() / max(float(temperature), 1e-6), dim=1)
+        confidence_s = correlation_confidence_from_probs(
+            probs,
+            radius=coarse_radius if flow_full is None else radius,
+            mode=confidence_mode,
+            variance_scale=confidence_variance_scale,
+        ).to(fmap1.dtype)
+        flow_full = F.interpolate(flow_s, size=(H, W), mode="bilinear", align_corners=False) * float(factor)
+        confidence_full = F.interpolate(confidence_s, size=(H, W), mode="bilinear", align_corners=False)
+
+    if flow_full is None:
+        corr = local_correlation(fmap1, fmap2, radius)
+        flow_full = soft_argmax_flow_from_correlation(corr, radius=radius, temperature=temperature)
+        probs = torch.softmax(corr.float() / max(float(temperature), 1e-6), dim=1)
+        confidence_full = correlation_confidence_from_probs(
+            probs,
+            radius=radius,
+            mode=confidence_mode,
+            variance_scale=confidence_variance_scale,
+        ).to(fmap1.dtype)
+
+    corr_final = guided_local_correlation(
+        fmap1,
+        fmap2,
+        flow_full,
+        radius=radius,
+        checkpoint_offsets=checkpoint_offsets,
+    )
+    flow_full = flow_full + soft_argmax_flow_from_correlation(
+        corr_final,
+        radius=radius,
+        temperature=temperature,
+    )
+    probs_final = torch.softmax(corr_final.float() / max(float(temperature), 1e-6), dim=1)
+    confidence_final = correlation_confidence_from_probs(
+        probs_final,
+        radius=radius,
+        mode=confidence_mode,
+        variance_scale=confidence_variance_scale,
+    ).to(fmap1.dtype)
+    if confidence_full is not None:
+        confidence_final = torch.maximum(confidence_final, confidence_full.to(confidence_final.dtype))
+
+    return {
+        "flow": flow_full,
+        "confidence": confidence_final.expand(-1, 2, -1, -1).contiguous(),
+        "corr": corr_final,
+    }
 
 
 # ======================================================================
@@ -381,8 +550,13 @@ class ConcatPoseNet(nn.Module):
         local_radius: int = 4,
         proj_dim: int = 32,
         corr_wls_temperature: float = 0.04,
+        corr_wls_conf_mode: str = "max",
+        corr_wls_conf_variance_scale: float = 0.5,
         coarse_flow_init: bool = False,
         coarse_pool_factor: int = 4,
+        use_multiscale_corr: bool = False,
+        multiscale_corr_pool_factors=(4, 2),
+        multiscale_corr_coarse_radius: Optional[int] = None,
         # Projection mode: 'separate' (legacy), 'shared' (shared+GroupNorm)
         proj_mode: str = 'separate',
         # Full WLS: derive both rotation and translation from flow (no MLP trans)
@@ -428,6 +602,7 @@ class ConcatPoseNet(nn.Module):
         local_flow_head_base_flow_mode: str = "none",
         local_flow_head_base_temperature: float = 0.05,
         local_flow_head_context_mode: str = "basic",
+        corr_wls_use_local_flow_head: bool = False,
         pose_update_trans_scale: float = 1.0,
         pose_update_rot_scale: float = 1.0,
         pose_update_trans_scale_after_first: Optional[float] = None,
@@ -444,8 +619,15 @@ class ConcatPoseNet(nn.Module):
         self.gru_iters = gru_iters
         self.local_radius = local_radius
         self.corr_wls_temperature = float(corr_wls_temperature)
+        self.corr_wls_conf_mode = str(corr_wls_conf_mode or "max")
+        self.corr_wls_conf_variance_scale = float(corr_wls_conf_variance_scale)
         self.coarse_flow_init = coarse_flow_init
         self.coarse_pool_factor = coarse_pool_factor
+        self.use_multiscale_corr = bool(use_multiscale_corr)
+        self.multiscale_corr_pool_factors = _as_pool_factors(multiscale_corr_pool_factors)
+        self.multiscale_corr_coarse_radius = (
+            None if multiscale_corr_coarse_radius is None else int(multiscale_corr_coarse_radius)
+        )
         self.proj_mode = proj_mode
         self.full_wls = full_wls
         self.use_coarse_in_fine_head = use_coarse_in_fine_head
@@ -474,6 +656,9 @@ class ConcatPoseNet(nn.Module):
         self.checkpoint_guided_corr = bool(checkpoint_guided_corr)
         self.local_flow_head_enabled = bool(local_flow_head_enabled)
         self.local_flow_head_zero_init = bool(local_flow_head_zero_init)
+        self.corr_wls_use_local_flow_head = bool(corr_wls_use_local_flow_head)
+        self.external_local_corr_projector = None
+        self.external_local_corr_projector_bypass_pose_proj = False
 
         if self.use_corr_wls and not self.full_wls:
             raise ValueError("use_corr_wls requires full_wls=True")
@@ -888,6 +1073,19 @@ class ConcatPoseNet(nn.Module):
         }
 
     def _project_for_local_corr(self, query_fine, rendered_fine):
+        external_projector = getattr(self, 'external_local_corr_projector', None)
+        if external_projector is not None:
+            if hasattr(external_projector, 'project_query'):
+                q_external = external_projector.project_query(query_fine)
+                r_external = external_projector.project_render(rendered_fine)
+            else:
+                q_external = external_projector(query_fine)
+                r_external = external_projector(rendered_fine)
+            if bool(getattr(self, 'external_local_corr_projector_bypass_pose_proj', False)):
+                return F.normalize(q_external, dim=1), F.normalize(r_external, dim=1)
+            query_fine = q_external
+            rendered_fine = r_external
+
         if self.proj_mode == 'identity':
             q_proj = F.normalize(query_fine, dim=1)
             r_proj = F.normalize(rendered_fine, dim=1)
@@ -954,19 +1152,77 @@ class ConcatPoseNet(nn.Module):
             )
 
         q_proj, r_proj = self._project_for_local_corr(query_fine, rendered_fine)
-        corr = local_correlation(r_proj, q_proj, self.local_radius)
-        corr = self._apply_local_matcher(corr, depth, intrinsics=intrinsics)
-        flow = soft_argmax_flow_from_correlation(
-            corr,
-            radius=self.local_radius,
-            temperature=self.corr_wls_temperature,
+        use_local_flow_head = (
+            bool(getattr(self, 'corr_wls_use_local_flow_head', False))
+            and getattr(self, 'local_flow_head', None) is not None
         )
-        probs = torch.softmax(
-            corr.float() / max(float(self.corr_wls_temperature), 1e-6),
-            dim=1,
-        )
-        confidence = probs.max(dim=1, keepdim=True).values.to(flow.dtype)
-        confidence = confidence.expand(-1, 2, -1, -1).contiguous()
+        if self.use_multiscale_corr:
+            corr_result = coarse_to_fine_correlation_flow(
+                r_proj,
+                q_proj,
+                radius=self.local_radius,
+                coarse_radius=self.multiscale_corr_coarse_radius,
+                pool_factors=self.multiscale_corr_pool_factors,
+                temperature=self.corr_wls_temperature,
+                confidence_mode=self.corr_wls_conf_mode,
+                confidence_variance_scale=self.corr_wls_conf_variance_scale,
+                checkpoint_offsets=self.checkpoint_guided_corr,
+            )
+            corr = self._apply_local_matcher(corr_result["corr"], depth, intrinsics=intrinsics)
+            if use_local_flow_head:
+                flow_init = self._local_flow_head_init(corr, depth, intrinsics=intrinsics)
+                flow = corr_result["flow"] + flow_init["flow"]
+                confidence = flow_init.get("confidence")
+                if confidence is None:
+                    confidence = torch.ones_like(flow[:, :1])
+                confidence = confidence.to(flow.dtype).expand(-1, 2, -1, -1).contiguous()
+            elif corr is corr_result["corr"]:
+                flow = corr_result["flow"]
+                confidence = corr_result["confidence"]
+            else:
+                flow = corr_result["flow"] + soft_argmax_flow_from_correlation(
+                    corr,
+                    radius=self.local_radius,
+                    temperature=self.corr_wls_temperature,
+                )
+                probs = torch.softmax(
+                    corr.float() / max(float(self.corr_wls_temperature), 1e-6),
+                    dim=1,
+                )
+                confidence = correlation_confidence_from_probs(
+                    probs,
+                    radius=self.local_radius,
+                    mode=self.corr_wls_conf_mode,
+                    variance_scale=self.corr_wls_conf_variance_scale,
+                ).to(flow.dtype)
+                confidence = confidence.expand(-1, 2, -1, -1).contiguous()
+        else:
+            corr = local_correlation(r_proj, q_proj, self.local_radius)
+            corr = self._apply_local_matcher(corr, depth, intrinsics=intrinsics)
+            if use_local_flow_head:
+                flow_init = self._local_flow_head_init(corr, depth, intrinsics=intrinsics)
+                flow = flow_init["flow"]
+                confidence = flow_init.get("confidence")
+                if confidence is None:
+                    confidence = torch.ones_like(flow[:, :1])
+                confidence = confidence.to(flow.dtype).expand(-1, 2, -1, -1).contiguous()
+            else:
+                flow = soft_argmax_flow_from_correlation(
+                    corr,
+                    radius=self.local_radius,
+                    temperature=self.corr_wls_temperature,
+                )
+                probs = torch.softmax(
+                    corr.float() / max(float(self.corr_wls_temperature), 1e-6),
+                    dim=1,
+                )
+                confidence = correlation_confidence_from_probs(
+                    probs,
+                    radius=self.local_radius,
+                    mode=self.corr_wls_conf_mode,
+                    variance_scale=self.corr_wls_conf_variance_scale,
+                ).to(flow.dtype)
+                confidence = confidence.expand(-1, 2, -1, -1).contiguous()
 
         delta_xi, delta_xi_full = self._solve_and_regress(
             flow, confidence, depth, intrinsics, r_proj,
@@ -1006,7 +1262,22 @@ class ConcatPoseNet(nn.Module):
         init_confidence = None
         # Coarse flow initialization: predict flow at downsampled resolution
         # then upsample to full resolution to seed the GRU
-        if self.coarse_flow_init:
+        if self.use_multiscale_corr:
+            corr_result = coarse_to_fine_correlation_flow(
+                r_proj,
+                q_proj,
+                radius=self.local_radius,
+                coarse_radius=self.multiscale_corr_coarse_radius,
+                pool_factors=self.multiscale_corr_pool_factors,
+                temperature=self.corr_wls_temperature,
+                confidence_mode=self.corr_wls_conf_mode,
+                confidence_variance_scale=self.corr_wls_conf_variance_scale,
+                checkpoint_offsets=self.checkpoint_guided_corr,
+            )
+            flow = corr_result["flow"]
+            init_corr = corr_result["corr"]
+            init_confidence = corr_result["confidence"][:, :1]
+        elif self.coarse_flow_init:
             pf = self.coarse_pool_factor
             q_ds = F.avg_pool2d(q_proj, pf)            # (B, 32, H/pf, W/pf)
             r_ds = F.avg_pool2d(r_proj, pf)
@@ -1030,7 +1301,9 @@ class ConcatPoseNet(nn.Module):
                 init_confidence = flow_init['confidence']
 
         conf = torch.full((B, 1, H, W), 0.5, device=device, dtype=q_proj.dtype)
-        if flow_init is not None:
+        if init_confidence is not None:
+            conf = init_confidence
+        elif flow_init is not None:
             conf = flow_init['confidence']
         flow_preds: List[torch.Tensor] = []
 

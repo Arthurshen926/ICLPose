@@ -1,0 +1,5 @@
+base_config: joint_radio_dcff_cambridge_oldhospital_processed_pca64_depthaware_v62_unified_attn_residual_spatial.yaml
+exp_name: joint_radio_dcff_cambridge_oldhospital_processed_pca64_depthaware_v63_unified_attn_residual_spatial_decoderfix
+
+training:
+  seed: 163

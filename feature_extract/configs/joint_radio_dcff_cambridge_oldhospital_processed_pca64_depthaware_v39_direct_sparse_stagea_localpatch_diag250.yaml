@@ -1,0 +1,9 @@
+base_config: joint_radio_dcff_cambridge_oldhospital_processed_pca64_depthaware_v37_direct_sparse_stagea_tolerant_diag250.yaml
+exp_name: joint_radio_dcff_cambridge_oldhospital_processed_pca64_depthaware_v39_direct_sparse_stagea_localpatch_diag250
+
+map_supervision:
+  teacher_corr_weight: 1.0
+  teacher_corr_local_patch_weight: 8.0
+  teacher_corr_local_patch_radius: 3
+  teacher_corr_local_patch_temperature: 0.05
+  teacher_corr_local_patch_min_points: 16

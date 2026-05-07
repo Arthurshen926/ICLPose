@@ -4,6 +4,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from pose_refine.utils.geometry_solver import compute_image_jacobian
+
 
 class ConvNormAct(nn.Module):
     def __init__(self, in_ch, out_ch, kernel_size=3, stride=1, groups=1):
@@ -37,6 +39,98 @@ class ResidualDepthwiseBlock(nn.Module):
         return x + self.pw(self.dw(x))
 
 
+def _window_partition_nchw(x, window_size):
+    B, C, H, W = x.shape
+    window_size = int(window_size)
+    if window_size <= 0:
+        return x.flatten(2).transpose(1, 2), (H, W)
+    pad_h = (window_size - H % window_size) % window_size
+    pad_w = (window_size - W % window_size) % window_size
+    if pad_h > 0 or pad_w > 0:
+        x = F.pad(x, (0, pad_w, 0, pad_h), mode="replicate")
+    Hp, Wp = H + pad_h, W + pad_w
+    windows = x.view(B, C, Hp // window_size, window_size, Wp // window_size, window_size)
+    windows = windows.permute(0, 2, 4, 3, 5, 1).reshape(-1, window_size * window_size, C)
+    return windows, (Hp, Wp)
+
+
+def _window_reverse_nchw(windows, window_size, H, W, pad_hw):
+    window_size = int(window_size)
+    Hp, Wp = pad_hw
+    if window_size <= 0:
+        B = windows.shape[0]
+        return windows.transpose(1, 2).reshape(B, -1, H, W)
+    B = int(windows.shape[0] // max((Hp // window_size) * (Wp // window_size), 1))
+    x = windows.view(B, Hp // window_size, Wp // window_size, window_size, window_size, -1)
+    x = x.permute(0, 5, 1, 3, 2, 4).reshape(B, windows.shape[-1], Hp, Wp)
+    return x[:, :, :H, :W].contiguous()
+
+
+class WindowSelfAttentionBlock(nn.Module):
+    """Windowed self-attention over NCHW feature maps with residual MLP."""
+
+    def __init__(
+        self,
+        dim,
+        num_heads=8,
+        window_size=16,
+        mlp_ratio=2.0,
+        dropout=0.0,
+        shift_size=0,
+        zero_init=True,
+    ):
+        super().__init__()
+        dim = int(dim)
+        num_heads = int(num_heads)
+        if dim % num_heads != 0:
+            raise ValueError(f"window_attention_heads={num_heads} must divide dim={dim}")
+        self.window_size = int(window_size)
+        self.shift_size = int(shift_size)
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=dim,
+            num_heads=num_heads,
+            dropout=float(dropout),
+            batch_first=True,
+        )
+        self.norm2 = nn.LayerNorm(dim)
+        hidden_dim = max(dim, int(round(dim * float(mlp_ratio))))
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(float(dropout)) if dropout > 0 else nn.Identity(),
+            nn.Linear(hidden_dim, dim),
+        )
+        self.dropout = nn.Dropout(float(dropout)) if dropout > 0 else nn.Identity()
+        if zero_init:
+            self.zero_init_residual()
+
+    def zero_init_residual(self):
+        nn.init.zeros_(self.attn.out_proj.weight)
+        if self.attn.out_proj.bias is not None:
+            nn.init.zeros_(self.attn.out_proj.bias)
+        nn.init.zeros_(self.mlp[-1].weight)
+        if self.mlp[-1].bias is not None:
+            nn.init.zeros_(self.mlp[-1].bias)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        shift = self.shift_size if self.window_size > 0 and H > self.window_size and W > self.window_size else 0
+        if shift:
+            x_attn = torch.roll(x, shifts=(-shift, -shift), dims=(-2, -1))
+        else:
+            x_attn = x
+        windows, pad_hw = _window_partition_nchw(x_attn, self.window_size)
+        attn_in = self.norm1(windows)
+        attn_out, _ = self.attn(attn_in, attn_in, attn_in, need_weights=False)
+        windows = windows + self.dropout(attn_out)
+        windows = windows + self.dropout(self.mlp(self.norm2(windows)))
+        out = _window_reverse_nchw(windows, self.window_size, H, W, pad_hw)
+        if shift:
+            out = torch.roll(out, shifts=(shift, shift), dims=(-2, -1))
+        return out
+
+
 class DepthAwareLocalMatcher(nn.Module):
     """Small residual head that refines local correlation logits with geometry context."""
 
@@ -46,11 +140,18 @@ class DepthAwareLocalMatcher(nn.Module):
         hidden_dim=64,
         zero_init=True,
         residual_scale=1.0,
+        context_mode="basic",
     ):
         super().__init__()
         self.radius = int(radius)
         self.corr_channels = (2 * self.radius + 1) ** 2
-        context_channels = 5  # log-depth, inverse-depth, x/y pixel coords, valid/depth mask.
+        self.context_mode = str(context_mode or "basic").lower()
+        if self.context_mode not in {"basic", "observability"}:
+            raise ValueError(
+                "context_mode must be one of {'basic', 'observability'}, "
+                f"got {context_mode!r}"
+            )
+        context_channels = 5 + (4 if self.context_mode == "observability" else 0)
         self.refine = nn.Sequential(
             ConvNormAct(self.corr_channels + context_channels, hidden_dim, kernel_size=3),
             ResidualDepthwiseBlock(hidden_dim),
@@ -74,7 +175,79 @@ class DepthAwareLocalMatcher(nn.Module):
         var = ((value - mean).square() * mask).sum(dim=(-2, -1), keepdim=True) / denom
         return (value - mean) / torch.sqrt(var + 1e-6)
 
-    def _build_context(self, corr, depth=None, valid_mask=None):
+    @staticmethod
+    def _resize_intrinsics(intrinsics, *, src_hw, dst_hw):
+        if intrinsics is None:
+            return None
+        src_h, src_w = src_hw
+        dst_h, dst_w = dst_hw
+        sx = float(dst_w) / max(float(src_w), 1.0)
+        sy = float(dst_h) / max(float(src_h), 1.0)
+        if isinstance(intrinsics, torch.Tensor):
+            scaled = intrinsics.clone()
+            scaled[..., 0] = scaled[..., 0] * sx
+            scaled[..., 1] = scaled[..., 1] * sy
+            scaled[..., 2] = scaled[..., 2] * sx
+            scaled[..., 3] = scaled[..., 3] * sy
+            return scaled
+        return {
+            "fx": intrinsics["fx"] * sx,
+            "fy": intrinsics["fy"] * sy,
+            "cx": intrinsics["cx"] * sx,
+            "cy": intrinsics["cy"] * sy,
+        }
+
+    def _build_observability_context(self, depth, intrinsics, target_hw, valid_mask, dtype):
+        if depth is None or intrinsics is None:
+            return None
+        H, W = target_hw
+        depth_f = depth.float()
+        if depth_f.ndim == 4:
+            depth_f = depth_f.squeeze(1)
+        src_hw = depth_f.shape[-2:]
+        if src_hw != (H, W):
+            depth_f = F.interpolate(
+                depth_f.unsqueeze(1),
+                (H, W),
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(1)
+        scaled_intrinsics = self._resize_intrinsics(
+            intrinsics,
+            src_hw=src_hw,
+            dst_hw=(H, W),
+        )
+        Ju, Jv, jac_valid = compute_image_jacobian(depth_f, scaled_intrinsics)
+        B = depth_f.shape[0]
+        trans_obs = torch.sqrt(
+            Ju[..., :3].square().sum(dim=-1) + Jv[..., :3].square().sum(dim=-1) + 1e-6
+        ).reshape(B, 1, H, W)
+        rot_obs = torch.sqrt(
+            Ju[..., 3:].square().sum(dim=-1) + Jv[..., 3:].square().sum(dim=-1) + 1e-6
+        ).reshape(B, 1, H, W)
+        yaw_obs = torch.sqrt(
+            Ju[..., 5].square() + Jv[..., 5].square() + 1e-6
+        ).reshape(B, 1, H, W)
+        balance = torch.log((rot_obs + 1e-3) / (trans_obs + 1e-3))
+        jac_valid = jac_valid.reshape(B, 1, H, W).float()
+        if valid_mask is not None:
+            vm = valid_mask.float()
+            if vm.ndim == 3:
+                vm = vm.unsqueeze(1)
+            if vm.shape[-2:] != (H, W):
+                vm = F.interpolate(vm, (H, W), mode="nearest")
+            jac_valid = jac_valid * vm
+        return torch.cat(
+            [
+                self._masked_standardize(trans_obs, jac_valid),
+                self._masked_standardize(rot_obs, jac_valid),
+                self._masked_standardize(yaw_obs, jac_valid),
+                self._masked_standardize(balance, jac_valid),
+            ],
+            dim=1,
+        ).to(dtype=dtype)
+
+    def _build_context(self, corr, depth=None, valid_mask=None, intrinsics=None):
         B, _C, H, W = corr.shape
         device = corr.device
         dtype = corr.dtype
@@ -108,15 +281,32 @@ class DepthAwareLocalMatcher(nn.Module):
             indexing="ij",
         )
         xy = torch.stack([xx, yy], dim=0).unsqueeze(0).expand(B, -1, -1, -1)
-        return torch.cat([depth_ch, inv_depth_ch, xy, depth_valid.to(dtype=dtype)], dim=1)
+        context = [depth_ch, inv_depth_ch, xy, depth_valid.to(dtype=dtype)]
+        if self.context_mode == "observability":
+            obs_context = self._build_observability_context(
+                depth,
+                intrinsics,
+                (H, W),
+                depth_valid,
+                dtype,
+            )
+            if obs_context is None:
+                obs_context = torch.zeros(B, 4, H, W, device=device, dtype=dtype)
+            context.append(obs_context)
+        return torch.cat(context, dim=1)
 
-    def forward(self, corr, depth=None, valid_mask=None):
+    def forward(self, corr, depth=None, valid_mask=None, intrinsics=None):
         if corr.shape[1] != self.corr_channels:
             raise ValueError(
                 f"DepthAwareLocalMatcher expected {self.corr_channels} channels "
                 f"for radius={self.radius}, got {corr.shape[1]}"
             )
-        context = self._build_context(corr, depth=depth, valid_mask=valid_mask)
+        context = self._build_context(
+            corr,
+            depth=depth,
+            valid_mask=valid_mask,
+            intrinsics=intrinsics,
+        )
         residual = self.refine(torch.cat([corr.float(), context.float()], dim=1))
         return corr + self.residual_scale.to(dtype=corr.dtype) * residual.to(dtype=corr.dtype)
 
@@ -132,19 +322,26 @@ class DepthAwareLocalFlowHead(nn.Module):
         max_flow=None,
         base_flow_mode="none",
         base_temperature=0.05,
+        context_mode="basic",
     ):
         super().__init__()
         self.radius = int(radius)
         self.corr_channels = (2 * self.radius + 1) ** 2
         self.max_flow = float(max_flow) if max_flow is not None else float(self.radius)
+        self.context_mode = str(context_mode or "basic").lower()
+        if self.context_mode not in {"basic", "observability"}:
+            raise ValueError(
+                "context_mode must be one of {'basic', 'observability'}, "
+                f"got {context_mode!r}"
+            )
         self.base_flow_mode = str(base_flow_mode or "none").lower()
         if self.base_flow_mode not in {"none", "softargmax", "argmax"}:
             raise ValueError(
                 "base_flow_mode must be one of {'none', 'softargmax', 'argmax'}, "
                 f"got {base_flow_mode!r}"
-            )
+        )
         self.base_temperature = float(base_temperature)
-        context_channels = 8
+        context_channels = 8 + (4 if self.context_mode == "observability" else 0)
         self.predict = nn.Sequential(
             ConvNormAct(self.corr_channels + context_channels, hidden_dim, kernel_size=3),
             ResidualDepthwiseBlock(hidden_dim),
@@ -156,13 +353,16 @@ class DepthAwareLocalFlowHead(nn.Module):
                 nn.init.zeros_(self.predict[-1].bias)
 
     _masked_standardize = staticmethod(DepthAwareLocalMatcher._masked_standardize)
+    _resize_intrinsics = staticmethod(DepthAwareLocalMatcher._resize_intrinsics)
+    _build_observability_context = DepthAwareLocalMatcher._build_observability_context
 
-    def _build_context(self, corr, depth=None, valid_mask=None):
+    def _build_context(self, corr, depth=None, valid_mask=None, intrinsics=None):
         geometry_context = DepthAwareLocalMatcher._build_context(
             self,
             corr,
             depth=depth,
             valid_mask=valid_mask,
+            intrinsics=intrinsics,
         )
         prior_flow = self._softargmax_flow(corr, temperature=self.base_temperature)
         top2 = torch.topk(corr.float(), k=min(2, corr.shape[1]), dim=1).values
@@ -215,13 +415,18 @@ class DepthAwareLocalFlowHead(nn.Module):
         dy_map = dy.expand(corr.shape[0], -1, corr.shape[2], corr.shape[3]).gather(1, idx)
         return torch.cat([dx_map, dy_map], dim=1)
 
-    def forward(self, corr, depth=None, valid_mask=None):
+    def forward(self, corr, depth=None, valid_mask=None, intrinsics=None):
         if corr.shape[1] != self.corr_channels:
             raise ValueError(
                 f"DepthAwareLocalFlowHead expected {self.corr_channels} channels "
                 f"for radius={self.radius}, got {corr.shape[1]}"
             )
-        context = self._build_context(corr, depth=depth, valid_mask=valid_mask)
+        context = self._build_context(
+            corr,
+            depth=depth,
+            valid_mask=valid_mask,
+            intrinsics=intrinsics,
+        )
         raw = self.predict(torch.cat([corr.float(), context.float()], dim=1))
         base_flow = self._base_flow(corr)
         residual_flow = torch.tanh(raw[:, :2]) * self.max_flow
@@ -279,6 +484,54 @@ class LocalCorrProjector(nn.Module):
         return projected
 
 
+class LocalCorrDomainAdapter(nn.Module):
+    """Asymmetric query/render projections into one local-correlation space."""
+
+    def __init__(
+        self,
+        feature_dim,
+        hidden_dim=96,
+        output_dim=None,
+        zero_init=True,
+        l2_normalize=True,
+        query_zero_init=None,
+        render_zero_init=None,
+    ):
+        super().__init__()
+        if query_zero_init is None:
+            query_zero_init = zero_init
+        if render_zero_init is None:
+            render_zero_init = zero_init
+        self.query_projector = LocalCorrProjector(
+            feature_dim=feature_dim,
+            hidden_dim=hidden_dim,
+            output_dim=output_dim,
+            zero_init=bool(query_zero_init),
+            l2_normalize=bool(l2_normalize),
+        )
+        self.render_projector = LocalCorrProjector(
+            feature_dim=feature_dim,
+            hidden_dim=hidden_dim,
+            output_dim=output_dim,
+            zero_init=bool(render_zero_init),
+            l2_normalize=bool(l2_normalize),
+        )
+
+    def project_query(self, feat):
+        return self.query_projector(feat)
+
+    def project_render(self, feat):
+        return self.render_projector(feat)
+
+    def forward(self, feat, domain="query"):
+        domain = str(domain).lower()
+        if domain == "query":
+            return self.project_query(feat)
+        if domain in {"render", "map"}:
+            return self.project_render(feat)
+        raise ValueError(f"LocalCorrDomainAdapter domain must be query or render, got {domain}")
+
+
 def rotation_6d_to_matrix(rot_6d):
     """Convert a 6D rotation representation to a valid rotation matrix."""
     a1 = rot_6d[..., 0:3]
@@ -319,6 +572,233 @@ class QueryChannelGate(nn.Module):
             "fine_logits": fine_logits,
             "coarse_logits": coarse_logits,
         }
+
+
+class CandidateScoreFusionHead(nn.Module):
+    """Small per-candidate scorer for fusing render scores with retrieval/PnP priors."""
+
+    def __init__(self, input_dim, hidden_dim=64, zero_init=False, initial_weights=None, initial_bias=0.0):
+        super().__init__()
+        input_dim = int(input_dim)
+        hidden_dim = int(hidden_dim or 0)
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.initial_weights = None if initial_weights is None else [float(v) for v in initial_weights]
+        self.initial_bias = float(initial_bias)
+        if self.initial_weights is not None and hidden_dim > 0:
+            raise ValueError("CandidateScoreFusionHead initial_weights require hidden_dim=0")
+        if self.initial_weights is not None and len(self.initial_weights) != input_dim:
+            raise ValueError(
+                f"initial_weights length {len(self.initial_weights)} does not match input_dim={input_dim}"
+            )
+        if hidden_dim > 0:
+            self.hidden = nn.Sequential(
+                nn.Linear(input_dim, hidden_dim),
+                nn.GELU(),
+            )
+            self.linear = nn.Linear(hidden_dim, 1)
+        else:
+            self.hidden = nn.Identity()
+            self.linear = nn.Linear(input_dim, 1)
+        if zero_init:
+            nn.init.zeros_(self.linear.weight)
+            nn.init.zeros_(self.linear.bias)
+        if self.initial_weights is not None:
+            self.apply_explicit_initialization()
+
+    def apply_explicit_initialization(self):
+        if self.initial_weights is None:
+            return
+        with torch.no_grad():
+            weights = torch.tensor(
+                self.initial_weights,
+                device=self.linear.weight.device,
+                dtype=self.linear.weight.dtype,
+            )
+            self.linear.weight.copy_(weights.view(1, -1))
+            self.linear.bias.fill_(self.initial_bias)
+
+    def forward(self, features):
+        if features.shape[-1] != self.input_dim:
+            raise ValueError(
+                f"CandidateScoreFusionHead expected input_dim={self.input_dim}, "
+                f"got {features.shape[-1]}"
+            )
+        hidden = self.hidden(features.float())
+        return self.linear(hidden).squeeze(-1)
+
+
+class CandidateScoreMapFusionHead(nn.Module):
+    """Per-candidate scorer that reads spatial score maps plus candidate priors."""
+
+    expects_score_map = True
+
+    def __init__(
+        self,
+        vector_dim,
+        score_map_channels=3,
+        map_channels=8,
+        grid_size=4,
+        hidden_dim=64,
+        zero_init=False,
+        initial_vector_weights=None,
+        initial_bias=0.0,
+        context_layers=0,
+        context_heads=1,
+        context_feedforward_dim=None,
+        context_residual=False,
+    ):
+        super().__init__()
+        self.vector_dim = int(vector_dim)
+        self.score_map_channels = int(score_map_channels)
+        self.map_channels = int(map_channels)
+        self.grid_size = int(grid_size)
+        self.hidden_dim = int(hidden_dim or 0)
+        self.context_layers = int(context_layers or 0)
+        self.context_heads = int(context_heads or 1)
+        self.context_feedforward_dim = (
+            None if context_feedforward_dim is None else int(context_feedforward_dim)
+        )
+        self.context_residual = bool(context_residual)
+        self.initial_vector_weights = (
+            None if initial_vector_weights is None else [float(v) for v in initial_vector_weights]
+        )
+        self.initial_bias = float(initial_bias)
+        if self.vector_dim < 0:
+            raise ValueError("vector_dim must be non-negative")
+        if self.score_map_channels <= 0:
+            raise ValueError("score_map_channels must be positive")
+        if self.map_channels <= 0:
+            raise ValueError("map_channels must be positive")
+        if self.grid_size <= 0:
+            raise ValueError("grid_size must be positive")
+        if self.context_layers < 0:
+            raise ValueError("context_layers must be non-negative")
+        if self.context_heads <= 0:
+            raise ValueError("context_heads must be positive")
+        if self.context_residual and self.context_layers <= 0:
+            raise ValueError("context_residual requires context_layers > 0")
+        if self.initial_vector_weights is not None and self.hidden_dim > 0:
+            raise ValueError("CandidateScoreMapFusionHead initial_vector_weights require hidden_dim=0")
+        if self.initial_vector_weights is not None and len(self.initial_vector_weights) != self.vector_dim:
+            raise ValueError(
+                f"initial_vector_weights length {len(self.initial_vector_weights)} "
+                f"does not match vector_dim={self.vector_dim}"
+            )
+
+        self.map_encoder = nn.Sequential(
+            nn.Conv2d(self.score_map_channels, self.map_channels, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(self.map_channels, self.map_channels, kernel_size=3, padding=1),
+            nn.GELU(),
+        )
+        pooled_dim = self.map_channels * self.grid_size * self.grid_size
+        input_dim = pooled_dim + self.vector_dim
+        if self.context_layers > 0 and input_dim % self.context_heads != 0:
+            raise ValueError(
+                f"context_heads={self.context_heads} must divide candidate scorer input_dim={input_dim}"
+            )
+        if self.context_layers > 0:
+            context_ff_dim = int(self.context_feedforward_dim or max(input_dim * 4, input_dim))
+            context_layer = nn.TransformerEncoderLayer(
+                d_model=input_dim,
+                nhead=self.context_heads,
+                dim_feedforward=context_ff_dim,
+                dropout=0.0,
+                activation="gelu",
+                batch_first=True,
+                norm_first=True,
+            )
+            self.context_encoder = nn.TransformerEncoder(context_layer, num_layers=self.context_layers)
+        else:
+            self.context_encoder = None
+        if self.hidden_dim > 0:
+            self.hidden = nn.Sequential(
+                nn.Linear(input_dim, self.hidden_dim),
+                nn.GELU(),
+            )
+            self.linear = nn.Linear(self.hidden_dim, 1)
+        else:
+            self.hidden = nn.Identity()
+            self.linear = nn.Linear(input_dim, 1)
+        if self.context_residual:
+            if self.hidden_dim > 0:
+                self.context_hidden = nn.Sequential(
+                    nn.Linear(input_dim, self.hidden_dim),
+                    nn.GELU(),
+                )
+                context_linear_dim = self.hidden_dim
+            else:
+                self.context_hidden = nn.Identity()
+                context_linear_dim = input_dim
+            self.context_linear = nn.Linear(context_linear_dim, 1)
+            nn.init.zeros_(self.context_linear.weight)
+            nn.init.zeros_(self.context_linear.bias)
+        else:
+            self.context_hidden = None
+            self.context_linear = None
+        if zero_init:
+            nn.init.zeros_(self.linear.weight)
+            nn.init.zeros_(self.linear.bias)
+        if self.initial_vector_weights is not None:
+            self.apply_explicit_initialization()
+
+    def apply_explicit_initialization(self):
+        if self.initial_vector_weights is None:
+            return
+        if self.hidden_dim > 0:
+            raise ValueError("CandidateScoreMapFusionHead initial_vector_weights require hidden_dim=0")
+        pooled_dim = self.map_channels * self.grid_size * self.grid_size
+        with torch.no_grad():
+            self.linear.weight.zero_()
+            if self.vector_dim > 0:
+                weights = torch.tensor(
+                    self.initial_vector_weights,
+                    device=self.linear.weight.device,
+                    dtype=self.linear.weight.dtype,
+                )
+                self.linear.weight[:, pooled_dim : pooled_dim + self.vector_dim].copy_(weights.view(1, -1))
+            self.linear.bias.fill_(self.initial_bias)
+
+    def forward(self, score_maps, vector_features=None):
+        if score_maps.ndim != 5:
+            raise ValueError("score_maps must have shape (B,K,C,H,W)")
+        if score_maps.shape[2] != self.score_map_channels:
+            raise ValueError(
+                f"CandidateScoreMapFusionHead expected score_map_channels={self.score_map_channels}, "
+                f"got {score_maps.shape[2]}"
+            )
+        bsz, num_candidates, channels, height, width = score_maps.shape
+        flat_maps = score_maps.float().reshape(bsz * num_candidates, channels, height, width)
+        encoded = self.map_encoder(flat_maps)
+        pooled = F.adaptive_avg_pool2d(encoded, (self.grid_size, self.grid_size)).flatten(1)
+        if self.vector_dim > 0:
+            if vector_features is None:
+                raise ValueError("vector_features are required when vector_dim > 0")
+            if vector_features.shape[:2] != (bsz, num_candidates) or vector_features.shape[-1] != self.vector_dim:
+                raise ValueError(
+                    f"vector_features must have shape {(bsz, num_candidates, self.vector_dim)}, "
+                    f"got {tuple(vector_features.shape)}"
+                )
+            vector_flat = vector_features.float().reshape(bsz * num_candidates, self.vector_dim)
+            features = torch.cat([pooled, vector_flat], dim=1)
+        else:
+            features = pooled
+        if self.context_encoder is not None:
+            if self.context_residual:
+                base_logits = self.linear(self.hidden(features)).reshape(bsz, num_candidates)
+                context_features = features.reshape(bsz, num_candidates, -1)
+                context_features = self.context_encoder(context_features)
+                context_features = context_features.reshape(bsz * num_candidates, -1)
+                residual_logits = self.context_linear(self.context_hidden(context_features)).reshape(
+                    bsz, num_candidates
+                )
+                return base_logits + residual_logits
+            features = features.reshape(bsz, num_candidates, -1)
+            features = self.context_encoder(features)
+            features = features.reshape(bsz * num_candidates, -1)
+        hidden = self.hidden(features)
+        return self.linear(hidden).reshape(bsz, num_candidates)
 
 
 class AbsolutePoseInitHead(nn.Module):
@@ -412,16 +892,20 @@ class AnchorPoseInitHead(nn.Module):
         hidden = self.trunk(token.float())
         anchor_logits = self.anchor_logits(hidden)
         pose_raw = self.pose_raw(hidden).view(token.shape[0], self.num_anchors, 11)
+        anchor_centers = self.anchor_centers.to(device=token.device, dtype=pose_raw.dtype).unsqueeze(0)
+        anchor_rot6d = self.anchor_rot6d.to(device=token.device, dtype=pose_raw.dtype).unsqueeze(0)
+        all_residual = torch.tanh(pose_raw[..., 0:3]) * self.residual_scale
+        all_center = anchor_centers + all_residual
+        all_rot6d = anchor_rot6d + pose_raw[..., 3:9]
+        all_log_var = pose_raw[..., 9:11].clamp(min=-8.0, max=8.0)
+        all_rotmat = rotation_6d_to_matrix(all_rot6d)
         top_scores, top_idx = torch.topk(anchor_logits, k=self.hypotheses, dim=1)
-        gather_idx = top_idx.unsqueeze(-1).expand(-1, -1, pose_raw.shape[-1])
-        selected_raw = pose_raw.gather(1, gather_idx)
-        selected_anchor = self.anchor_centers.to(device=token.device, dtype=selected_raw.dtype)[top_idx]
-        selected_rot6d = self.anchor_rot6d.to(device=token.device, dtype=selected_raw.dtype)[top_idx]
-        residual = torch.tanh(selected_raw[..., 0:3]) * self.residual_scale
-        center = selected_anchor + residual
-        rot6d = selected_rot6d + selected_raw[..., 3:9]
-        log_var = selected_raw[..., 9:11].clamp(min=-8.0, max=8.0)
-        rotmat = rotation_6d_to_matrix(rot6d)
+        gather_vec = top_idx.unsqueeze(-1)
+        center = all_center.gather(1, gather_vec.expand(-1, -1, 3))
+        rot6d = all_rot6d.gather(1, gather_vec.expand(-1, -1, 6))
+        log_var = all_log_var.gather(1, gather_vec.expand(-1, -1, 2))
+        rotmat = all_rotmat.gather(1, gather_vec.unsqueeze(-1).expand(-1, -1, 3, 3))
+        residual = all_residual.gather(1, gather_vec.expand(-1, -1, 3))
         return {
             "center": center,
             "rot6d": rot6d,
@@ -429,6 +913,10 @@ class AnchorPoseInitHead(nn.Module):
             "pose_w2c": AbsolutePoseInitHead._centers_rot_to_w2c(center, rotmat),
             "scores": top_scores,
             "log_var": log_var,
+            "all_center": all_center,
+            "all_rot6d": all_rot6d,
+            "all_rotmat": all_rotmat,
+            "all_log_var": all_log_var,
             "anchor_logits": anchor_logits,
             "anchor_indices": top_idx,
             "anchor_centers": self.anchor_centers,
@@ -471,12 +959,17 @@ class FeatureBankPoseInitHead(AnchorPoseInitHead):
         self.fine_dim = int(fine_dim)
         self.coarse_dim = int(coarse_dim)
         self.feature_source = str(feature_source or "fine_coarse").lower()
-        if self.feature_source not in {"fine_coarse", "fine", "coarse"}:
-            raise ValueError("FeatureBankPoseInitHead feature_source must be one of {'fine_coarse', 'fine', 'coarse'}")
+        if self.feature_source not in {"fine_coarse", "fine", "coarse", "retrieval"}:
+            raise ValueError(
+                "FeatureBankPoseInitHead feature_source must be one of "
+                "{'fine_coarse', 'fine', 'coarse', 'retrieval'}"
+            )
         if self.feature_source == "fine":
             query_input_dim = self.fine_dim
         elif self.feature_source == "coarse":
             query_input_dim = self.coarse_dim
+        elif self.feature_source == "retrieval":
+            query_input_dim = int(token_dim)
         else:
             query_input_dim = self.fine_dim + self.coarse_dim
         self.temperature = max(float(temperature), 1e-6)
@@ -496,7 +989,11 @@ class FeatureBankPoseInitHead(AnchorPoseInitHead):
         else:
             raise ValueError("FeatureBankPoseInitHead projector must be either 'identity' or 'mlp'")
 
-    def _pool_query_features(self, fine, coarse):
+    def _pool_query_features(self, fine, coarse, token=None):
+        if self.feature_source == "retrieval":
+            if token is None:
+                raise ValueError("FeatureBankPoseInitHead.forward requires token for retrieval feature_source")
+            return token.float()
         if self.feature_source in {"fine", "fine_coarse"}:
             if fine is None:
                 raise ValueError("FeatureBankPoseInitHead.forward requires fine feature maps")
@@ -517,23 +1014,27 @@ class FeatureBankPoseInitHead(AnchorPoseInitHead):
 
     def forward(self, token, *, fine=None, coarse=None):
         hidden = self.trunk(token.float())
-        query_feat = self._pool_query_features(fine, coarse)
+        query_feat = self._pool_query_features(fine, coarse, token=token)
         query_desc = F.normalize(self.query_descriptor(query_feat), dim=1)
         anchor_logits = torch.matmul(
             query_desc,
             self.anchor_descriptors.to(device=query_desc.device, dtype=query_desc.dtype).t(),
         ) / self.temperature
         pose_raw = self.pose_raw(hidden).view(token.shape[0], self.num_anchors, 11)
+        anchor_centers = self.anchor_centers.to(device=token.device, dtype=pose_raw.dtype).unsqueeze(0)
+        anchor_rot6d = self.anchor_rot6d.to(device=token.device, dtype=pose_raw.dtype).unsqueeze(0)
+        all_residual = torch.tanh(pose_raw[..., 0:3]) * self.residual_scale
+        all_center = anchor_centers + all_residual
+        all_rot6d = anchor_rot6d + pose_raw[..., 3:9]
+        all_log_var = pose_raw[..., 9:11].clamp(min=-8.0, max=8.0)
+        all_rotmat = rotation_6d_to_matrix(all_rot6d)
         top_scores, top_idx = torch.topk(anchor_logits, k=self.hypotheses, dim=1)
-        gather_idx = top_idx.unsqueeze(-1).expand(-1, -1, pose_raw.shape[-1])
-        selected_raw = pose_raw.gather(1, gather_idx)
-        selected_anchor = self.anchor_centers.to(device=token.device, dtype=selected_raw.dtype)[top_idx]
-        selected_rot6d = self.anchor_rot6d.to(device=token.device, dtype=selected_raw.dtype)[top_idx]
-        residual = torch.tanh(selected_raw[..., 0:3]) * self.residual_scale
-        center = selected_anchor + residual
-        rot6d = selected_rot6d + selected_raw[..., 3:9]
-        log_var = selected_raw[..., 9:11].clamp(min=-8.0, max=8.0)
-        rotmat = rotation_6d_to_matrix(rot6d)
+        gather_vec = top_idx.unsqueeze(-1)
+        center = all_center.gather(1, gather_vec.expand(-1, -1, 3))
+        rot6d = all_rot6d.gather(1, gather_vec.expand(-1, -1, 6))
+        log_var = all_log_var.gather(1, gather_vec.expand(-1, -1, 2))
+        rotmat = all_rotmat.gather(1, gather_vec.unsqueeze(-1).expand(-1, -1, 3, 3))
+        residual = all_residual.gather(1, gather_vec.expand(-1, -1, 3))
         return {
             "center": center,
             "rot6d": rot6d,
@@ -541,6 +1042,10 @@ class FeatureBankPoseInitHead(AnchorPoseInitHead):
             "pose_w2c": AbsolutePoseInitHead._centers_rot_to_w2c(center, rotmat),
             "scores": top_scores,
             "log_var": log_var,
+            "all_center": all_center,
+            "all_rot6d": all_rot6d,
+            "all_rotmat": all_rotmat,
+            "all_log_var": all_log_var,
             "anchor_logits": anchor_logits,
             "anchor_indices": top_idx,
             "anchor_centers": self.anchor_centers,
@@ -580,6 +1085,15 @@ class RadioQueryStudent(nn.Module):
         fine_highres_source="stage2",
         fine_highres_init=0.0,
         fine_highres_zero_init=False,
+        global_context_enabled=False,
+        global_context_zero_init=True,
+        window_attention_layers=0,
+        window_attention_heads=8,
+        window_attention_size=16,
+        window_attention_mlp_ratio=2.0,
+        window_attention_dropout=0.0,
+        window_attention_shift=False,
+        window_attention_zero_init=True,
         fine_loc_head=False,
         fine_loc_mode="residual",
         fine_loc_init=1.0,
@@ -603,6 +1117,7 @@ class RadioQueryStudent(nn.Module):
         local_matcher_hidden_dim=64,
         local_matcher_zero_init=True,
         local_matcher_residual_scale=1.0,
+        local_matcher_context_mode="basic",
         local_flow_head_enabled=False,
         local_flow_head_radius=4,
         local_flow_head_hidden_dim=64,
@@ -610,15 +1125,34 @@ class RadioQueryStudent(nn.Module):
         local_flow_head_max_flow=None,
         local_flow_head_base_flow_mode="none",
         local_flow_head_base_temperature=0.05,
+        local_flow_head_context_mode="basic",
         local_corr_projector_enabled=False,
         local_corr_projector_hidden_dim=96,
         local_corr_projector_output_dim=None,
         local_corr_projector_zero_init=True,
         local_corr_projector_l2_normalize=True,
+        local_corr_projector_domain_adapter=False,
+        local_corr_query_projector_zero_init=None,
+        local_corr_render_projector_zero_init=None,
         query_channel_gate_enabled=False,
         query_channel_gate_hidden_dim=None,
         query_channel_gate_zero_init=True,
         apply_query_channel_gate=False,
+        candidate_score_fusion_head=False,
+        candidate_score_fusion_input_dim=12,
+        candidate_score_fusion_hidden_dim=64,
+        candidate_score_fusion_zero_init=False,
+        candidate_score_fusion_initial_weights=None,
+        candidate_score_fusion_initial_bias=0.0,
+        candidate_score_map_fusion_head=False,
+        candidate_score_map_fusion_channels=3,
+        candidate_score_map_fusion_map_channels=8,
+        candidate_score_map_fusion_grid_size=4,
+        candidate_score_map_fusion_hidden_dim=64,
+        candidate_score_map_fusion_context_layers=0,
+        candidate_score_map_fusion_context_heads=1,
+        candidate_score_map_fusion_context_feedforward_dim=None,
+        candidate_score_map_fusion_context_residual=False,
         pose_init_head=False,
         pose_init_hypotheses=3,
         pose_init_hidden_dim=None,
@@ -630,6 +1164,7 @@ class RadioQueryStudent(nn.Module):
         pose_init_temperature=0.05,
         pose_init_feature_bank_projector="mlp",
         pose_init_feature_source="fine_coarse",
+        pose_init_token_source="global",
     ):
         super().__init__()
         stage_dims = tuple(stage_dims)
@@ -655,6 +1190,13 @@ class RadioQueryStudent(nn.Module):
         self.fine_highres_source = str(fine_highres_source).lower()
         self.fine_highres_init = float(fine_highres_init)
         self.fine_highres_zero_init = bool(fine_highres_zero_init)
+        self.global_context_enabled = bool(global_context_enabled)
+        self.global_context_zero_init = bool(global_context_zero_init)
+        self.window_attention_layers = int(window_attention_layers or 0)
+        self.window_attention_heads = int(window_attention_heads)
+        self.window_attention_size = int(window_attention_size)
+        self.window_attention_shift = bool(window_attention_shift)
+        self.window_attention_zero_init = bool(window_attention_zero_init)
         self.fine_loc_highres_source = (
             str(fine_loc_highres_source).lower()
             if fine_loc_highres_source is not None
@@ -685,13 +1227,24 @@ class RadioQueryStudent(nn.Module):
         self.query_channel_gate_enabled = bool(query_channel_gate_enabled)
         self.query_channel_gate_zero_init = bool(query_channel_gate_zero_init)
         self.apply_query_channel_gate = bool(apply_query_channel_gate)
+        self.candidate_score_map_fusion_head_enabled = bool(candidate_score_map_fusion_head)
+        self.candidate_score_fusion_head_enabled = bool(
+            candidate_score_fusion_head or self.candidate_score_map_fusion_head_enabled
+        )
         self.pose_init_head_enabled = bool(pose_init_head)
         self.pose_init_mode = str(pose_init_mode or "direct").lower()
         if self.pose_init_mode not in {"direct", "anchor", "feature_bank"}:
             raise ValueError("pose_init_mode must be one of {'direct', 'anchor', 'feature_bank'}")
         self.pose_init_feature_source = str(pose_init_feature_source or "fine_coarse").lower()
-        if self.pose_init_feature_source not in {"fine_coarse", "fine", "coarse"}:
-            raise ValueError("pose_init_feature_source must be one of {'fine_coarse', 'fine', 'coarse'}")
+        if self.pose_init_feature_source not in {"fine_coarse", "fine", "coarse", "retrieval"}:
+            raise ValueError(
+                "pose_init_feature_source must be one of {'fine_coarse', 'fine', 'coarse', 'retrieval'}"
+            )
+        self.pose_init_token_source = str(pose_init_token_source or "global").lower()
+        if self.pose_init_token_source not in {"global", "retrieval"}:
+            raise ValueError("pose_init_token_source must be either 'global' or 'retrieval'")
+        if self.pose_init_token_source == "retrieval" and self.retrieval_dim <= 0:
+            raise ValueError("pose_init_token_source='retrieval' requires retrieval_dim > 0")
 
         stem_dim = stage_dims[0] or base_channels
         self.stem = nn.Sequential(
@@ -710,6 +1263,37 @@ class RadioQueryStudent(nn.Module):
             ConvNormAct(stage_dims[2], stage_dims[3], stride=2),
             ResidualDepthwiseBlock(stage_dims[3]),
             ResidualDepthwiseBlock(stage_dims[3]),
+        )
+        self.global_context = (
+            nn.Sequential(
+                nn.AdaptiveAvgPool2d(1),
+                nn.Conv2d(stage_dims[3], stage_dims[3], kernel_size=1),
+                nn.GELU(),
+            )
+            if self.global_context_enabled
+            else None
+        )
+        self.window_attention = (
+            nn.Sequential(
+                *[
+                    WindowSelfAttentionBlock(
+                        dim=stage_dims[3],
+                        num_heads=self.window_attention_heads,
+                        window_size=self.window_attention_size,
+                        mlp_ratio=float(window_attention_mlp_ratio),
+                        dropout=float(window_attention_dropout),
+                        shift_size=(
+                            self.window_attention_size // 2
+                            if self.window_attention_shift and idx % 2 == 1
+                            else 0
+                        ),
+                        zero_init=self.window_attention_zero_init,
+                    )
+                    for idx in range(self.window_attention_layers)
+                ]
+            )
+            if self.window_attention_layers > 0
+            else None
         )
 
         self.fine_fuse = nn.Sequential(
@@ -861,9 +1445,35 @@ class RadioQueryStudent(nn.Module):
             if self.query_channel_gate_enabled
             else None
         )
+        if self.candidate_score_map_fusion_head_enabled:
+            self.candidate_score_fusion_head = CandidateScoreMapFusionHead(
+                vector_dim=int(candidate_score_fusion_input_dim),
+                score_map_channels=int(candidate_score_map_fusion_channels),
+                map_channels=int(candidate_score_map_fusion_map_channels),
+                grid_size=int(candidate_score_map_fusion_grid_size),
+                hidden_dim=int(candidate_score_map_fusion_hidden_dim or 0),
+                zero_init=bool(candidate_score_fusion_zero_init),
+                initial_vector_weights=candidate_score_fusion_initial_weights,
+                initial_bias=float(candidate_score_fusion_initial_bias),
+                context_layers=int(candidate_score_map_fusion_context_layers or 0),
+                context_heads=int(candidate_score_map_fusion_context_heads or 1),
+                context_feedforward_dim=candidate_score_map_fusion_context_feedforward_dim,
+                context_residual=bool(candidate_score_map_fusion_context_residual),
+            )
+        elif self.candidate_score_fusion_head_enabled:
+            self.candidate_score_fusion_head = CandidateScoreFusionHead(
+                input_dim=int(candidate_score_fusion_input_dim),
+                hidden_dim=int(candidate_score_fusion_hidden_dim or 0),
+                zero_init=bool(candidate_score_fusion_zero_init),
+                initial_weights=candidate_score_fusion_initial_weights,
+                initial_bias=float(candidate_score_fusion_initial_bias),
+            )
+        else:
+            self.candidate_score_fusion_head = None
+        pose_init_token_dim = self.retrieval_dim if self.pose_init_token_source == "retrieval" else stage_dims[3]
         if self.pose_init_head_enabled and self.pose_init_mode == "feature_bank":
             self.pose_init_head = FeatureBankPoseInitHead(
-                token_dim=stage_dims[3],
+                token_dim=pose_init_token_dim,
                 hidden_dim=pose_init_hidden_dim,
                 hypotheses=int(pose_init_hypotheses),
                 anchor_centers=pose_init_anchor_centers,
@@ -878,7 +1488,7 @@ class RadioQueryStudent(nn.Module):
             )
         elif self.pose_init_head_enabled and self.pose_init_mode == "anchor":
             self.pose_init_head = AnchorPoseInitHead(
-                token_dim=stage_dims[3],
+                token_dim=pose_init_token_dim,
                 hidden_dim=pose_init_hidden_dim,
                 hypotheses=int(pose_init_hypotheses),
                 anchor_centers=pose_init_anchor_centers,
@@ -888,7 +1498,7 @@ class RadioQueryStudent(nn.Module):
         else:
             self.pose_init_head = (
                 AbsolutePoseInitHead(
-                    token_dim=stage_dims[3],
+                    token_dim=pose_init_token_dim,
                     hidden_dim=pose_init_hidden_dim,
                     hypotheses=int(pose_init_hypotheses),
                 )
@@ -902,6 +1512,7 @@ class RadioQueryStudent(nn.Module):
                 hidden_dim=int(local_matcher_hidden_dim),
                 zero_init=bool(local_matcher_zero_init),
                 residual_scale=float(local_matcher_residual_scale),
+                context_mode=str(local_matcher_context_mode),
             )
             if self.local_matcher_enabled
             else None
@@ -914,12 +1525,23 @@ class RadioQueryStudent(nn.Module):
                 max_flow=local_flow_head_max_flow,
                 base_flow_mode=local_flow_head_base_flow_mode,
                 base_temperature=float(local_flow_head_base_temperature),
+                context_mode=str(local_flow_head_context_mode),
             )
             if self.local_flow_head_enabled
             else None
         )
         self.local_corr_projector = (
-            LocalCorrProjector(
+            LocalCorrDomainAdapter(
+                feature_dim=self.fine_feature_dim,
+                hidden_dim=int(local_corr_projector_hidden_dim),
+                output_dim=local_corr_projector_output_dim,
+                zero_init=bool(local_corr_projector_zero_init),
+                l2_normalize=bool(local_corr_projector_l2_normalize),
+                query_zero_init=local_corr_query_projector_zero_init,
+                render_zero_init=local_corr_render_projector_zero_init,
+            )
+            if self.local_corr_projector_enabled and bool(local_corr_projector_domain_adapter)
+            else LocalCorrProjector(
                 feature_dim=self.fine_feature_dim,
                 hidden_dim=int(local_corr_projector_hidden_dim),
                 output_dim=local_corr_projector_output_dim,
@@ -931,6 +1553,13 @@ class RadioQueryStudent(nn.Module):
         )
 
         self._init_weights()
+        if self.window_attention is not None and self.window_attention_zero_init:
+            for block in self.window_attention:
+                block.zero_init_residual()
+        if self.global_context is not None and self.global_context_zero_init:
+            nn.init.zeros_(self.global_context[1].weight)
+            if self.global_context[1].bias is not None:
+                nn.init.zeros_(self.global_context[1].bias)
         if self.local_matcher is not None and bool(local_matcher_zero_init):
             nn.init.zeros_(self.local_matcher.refine[-1].weight)
             if self.local_matcher.refine[-1].bias is not None:
@@ -939,13 +1568,27 @@ class RadioQueryStudent(nn.Module):
             nn.init.zeros_(self.local_flow_head.predict[-1].weight)
             if self.local_flow_head.predict[-1].bias is not None:
                 nn.init.zeros_(self.local_flow_head.predict[-1].bias)
-        if self.local_corr_projector is not None and bool(local_corr_projector_zero_init):
+        if (
+            self.local_corr_projector is not None
+            and bool(local_corr_projector_zero_init)
+            and hasattr(self.local_corr_projector, "refine")
+        ):
             nn.init.zeros_(self.local_corr_projector.refine[-1].weight)
             if self.local_corr_projector.refine[-1].bias is not None:
                 nn.init.zeros_(self.local_corr_projector.refine[-1].bias)
         if self.query_channel_gate is not None and self.query_channel_gate_zero_init:
             nn.init.zeros_(self.query_channel_gate.net[-1].weight)
             nn.init.zeros_(self.query_channel_gate.net[-1].bias)
+        if (
+            self.candidate_score_fusion_head is not None
+            and bool(candidate_score_fusion_zero_init)
+        ):
+            nn.init.zeros_(self.candidate_score_fusion_head.linear.weight)
+            nn.init.zeros_(self.candidate_score_fusion_head.linear.bias)
+        if self.candidate_score_fusion_head is not None:
+            apply_init = getattr(self.candidate_score_fusion_head, "apply_explicit_initialization", None)
+            if apply_init is not None:
+                apply_init()
         if self.fine_highres_zero_init and self.fine_highres_fuse is not None:
             nn.init.zeros_(self.fine_highres_fuse[-1].weight)
             if self.fine_highres_fuse[-1].bias is not None:
@@ -994,6 +1637,10 @@ class RadioQueryStudent(nn.Module):
         s2 = self.stage2(s1)
         s3 = self.stage3(s2)
         s4 = self.stage4(s3)
+        if self.global_context is not None:
+            s4 = s4 + self.global_context(s4)
+        if self.window_attention is not None:
+            s4 = self.window_attention(s4)
 
         s3_to_s4 = F.avg_pool2d(s3, kernel_size=2, stride=2)
         fine_latent = self.fine_fuse(torch.cat([s4, s3_to_s4], dim=1))
@@ -1115,13 +1762,22 @@ class RadioQueryStudent(nn.Module):
             },
             "global_pose_token": global_pose_token,
         }
+        retrieval = None
+        if self.retrieval_head is not None:
+            retrieval = self.retrieval_head(global_pose_token)
+            if self.retrieval_l2_normalize:
+                retrieval = F.normalize(retrieval, dim=1)
+            outputs["retrieval"] = retrieval
         if query_channel_weights is not None:
             outputs["query_channel_weights"] = query_channel_weights
         if self.pose_init_head is not None:
+            pose_init_token = retrieval if self.pose_init_token_source == "retrieval" else global_pose_token
+            if pose_init_token is None:
+                raise RuntimeError("pose_init_token_source='retrieval' requires retrieval_head output")
             if isinstance(self.pose_init_head, FeatureBankPoseInitHead):
-                outputs["pose_init"] = self.pose_init_head(global_pose_token, fine=fine, coarse=coarse)
+                outputs["pose_init"] = self.pose_init_head(pose_init_token, fine=fine, coarse=coarse)
             else:
-                outputs["pose_init"] = self.pose_init_head(global_pose_token)
+                outputs["pose_init"] = self.pose_init_head(pose_init_token)
         if fine_loc is not None:
             outputs["fine_loc"] = fine_loc
         if scene_coord is not None:
@@ -1131,11 +1787,5 @@ class RadioQueryStudent(nn.Module):
                 "fine": fine_mag,
                 "coarse": coarse_mag,
             }
-
-        if self.retrieval_head is not None:
-            retrieval = self.retrieval_head(global_pose_token)
-            if self.retrieval_l2_normalize:
-                retrieval = F.normalize(retrieval, dim=1)
-            outputs["retrieval"] = retrieval
 
         return outputs

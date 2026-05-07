@@ -29,6 +29,17 @@ from data.radio_loc_dataset import (
     read_colmap_images,
 )
 
+OPTIONAL_RETRIEVAL_CANDIDATE_FLOAT_KEYS = (
+    "retrieval_original_scores_candidates",
+    "retrieval_pnp_success_candidates",
+    "retrieval_pnp_num_inliers_candidates",
+    "retrieval_pnp_num_matches_candidates",
+    "retrieval_pnp_reproj_rmse_candidates",
+    "retrieval_pnp_reproj_median_candidates",
+    "retrieval_pnp_inlier_ratio_candidates",
+    "retrieval_pnp_inlier_conf_mean_candidates",
+)
+
 
 def _safe_torch_load(path: str) -> torch.Tensor:
     try:
@@ -305,29 +316,32 @@ def build_retrieval_init_entries(
 def save_retrieval_init_entries(entries: Sequence[Dict], stats: Dict, save_path: str) -> None:
     save_path = Path(save_path)
     save_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(
-        save_path,
-        query_img_ids=np.array([e["query_img_id"] for e in entries], dtype=np.int64),
-        query_image_names=np.array([e["query_image_name"] for e in entries]),
-        query_image_stems=np.array([e["query_image_stem"] for e in entries]),
-        pose_inits=np.stack([e["pose_init"] for e in entries]).astype(np.float32),
-        init_sources=np.array([e["init_source"] for e in entries]),
-        retrieval_frame_ids=np.array([e["retrieval_frame_id"] for e in entries], dtype=np.int64),
-        retrieval_image_names=np.array([e["retrieval_image_name"] for e in entries]),
-        retrieval_scores=np.array([e["retrieval_score"] for e in entries], dtype=np.float32),
-        pose_init_candidates=np.stack([e["pose_init_candidates"] for e in entries]).astype(np.float32),
-        candidate_valid_mask=np.stack([e["candidate_valid_mask"] for e in entries]).astype(bool),
-        retrieval_frame_ids_candidates=np.stack(
+    payload = {
+        "query_img_ids": np.array([e["query_img_id"] for e in entries], dtype=np.int64),
+        "query_image_names": np.array([e["query_image_name"] for e in entries]),
+        "query_image_stems": np.array([e["query_image_stem"] for e in entries]),
+        "pose_inits": np.stack([e["pose_init"] for e in entries]).astype(np.float32),
+        "init_sources": np.array([e["init_source"] for e in entries]),
+        "retrieval_frame_ids": np.array([e["retrieval_frame_id"] for e in entries], dtype=np.int64),
+        "retrieval_image_names": np.array([e["retrieval_image_name"] for e in entries]),
+        "retrieval_scores": np.array([e["retrieval_score"] for e in entries], dtype=np.float32),
+        "pose_init_candidates": np.stack([e["pose_init_candidates"] for e in entries]).astype(np.float32),
+        "candidate_valid_mask": np.stack([e["candidate_valid_mask"] for e in entries]).astype(bool),
+        "retrieval_frame_ids_candidates": np.stack(
             [e["retrieval_frame_ids_candidates"] for e in entries]
         ).astype(np.int64),
-        retrieval_image_names_candidates=np.stack(
+        "retrieval_image_names_candidates": np.stack(
             [e["retrieval_image_names_candidates"] for e in entries]
         ),
-        retrieval_scores_candidates=np.stack(
+        "retrieval_scores_candidates": np.stack(
             [e["retrieval_scores_candidates"] for e in entries]
         ).astype(np.float32),
-        stats=np.array([stats], dtype=object),
-    )
+        "stats": np.array([stats], dtype=object),
+    }
+    for key in OPTIONAL_RETRIEVAL_CANDIDATE_FLOAT_KEYS:
+        if all(key in e for e in entries):
+            payload[key] = np.stack([e[key] for e in entries]).astype(np.float32)
+    np.savez(save_path, **payload)
 
 
 def load_retrieval_init_entries(load_path: str) -> Tuple[List[Dict], Dict]:
@@ -358,6 +372,9 @@ def load_retrieval_init_entries(load_path: str) -> Tuple[List[Dict], Dict]:
             entries[-1]["retrieval_scores_candidates"] = data[
                 "retrieval_scores_candidates"
             ][idx].astype(np.float32)
+            for key in OPTIONAL_RETRIEVAL_CANDIDATE_FLOAT_KEYS:
+                if key in data.files:
+                    entries[-1][key] = data[key][idx].astype(np.float32)
         else:
             entries[-1]["pose_init_candidates"] = entries[-1]["pose_init"][None].astype(np.float32)
             entries[-1]["candidate_valid_mask"] = np.array([True], dtype=bool)
@@ -405,7 +422,7 @@ class RadioLocRetrievalDataset(RadioLocDataset):
         self.sample_topk_init = bool(sample_topk_init)
         self.sample_topk_prob = float(sample_topk_prob)
         self.init_stats: Dict = {}
-        super().__init__(*args, **kwargs)
+        super().__init__(*args, source_dir=source_dir, **kwargs)
 
         image_meta = {s["img_id"]: s for s in list_colmap_split_samples(self.colmap_dir, None)}
         for sample in self.samples:
@@ -474,6 +491,9 @@ class RadioLocRetrievalDataset(RadioLocDataset):
         item["retrieval_scores_candidates"] = torch.tensor(
             entry["retrieval_scores_candidates"].tolist(), dtype=torch.float32
         )
+        for key in OPTIONAL_RETRIEVAL_CANDIDATE_FLOAT_KEYS:
+            if key in entry:
+                item[key] = torch.tensor(entry[key].tolist(), dtype=torch.float32)
         item["retrieval_image_names_candidates"] = list(entry["retrieval_image_names_candidates"])
 
         query_rgb_path = ""

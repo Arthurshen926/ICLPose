@@ -266,6 +266,29 @@ def _restore_gaussian_state(
         return False
 
 
+def _load_gaussian_latent_compatible(
+    gaussians: HybridGaussianModel,
+    latent: torch.Tensor | None,
+    label: str,
+    *,
+    printer: Printer | None = print,
+) -> bool:
+    if latent is None:
+        return False
+    saved_latent = latent.to(gaussians._latent.device)
+    if saved_latent.shape != gaussians._latent.shape:
+        _print(
+            printer,
+            f"  WARNING: {label} shape mismatch: ckpt={saved_latent.shape} "
+            f"vs model={gaussians._latent.shape}, skipping",
+        )
+        return False
+    with torch.no_grad():
+        gaussians._latent.data.copy_(saved_latent)
+    _print(printer, f"  Loaded {label}")
+    return True
+
+
 def apply_localization_map_state(
     dcff_renderer: DeferredCascadedRenderer,
     feat_sharp: nn.Module,
@@ -499,18 +522,12 @@ def build_dcff_runtime(
             "FSM weights",
             printer=printer,
         )
-    if "latent" in checkpoint:
-        saved_latent = checkpoint["latent"].to(device)
-        if saved_latent.shape == gaussians._latent.shape:
-            with torch.no_grad():
-                gaussians._latent.data.copy_(saved_latent)
-            _print(printer, "  Restored latent embeddings from checkpoint")
-        else:
-            _print(
-                printer,
-                f"  WARNING: Latent shape mismatch: ckpt={saved_latent.shape} "
-                f"vs model={gaussians._latent.shape}, skipping",
-            )
+    _load_gaussian_latent_compatible(
+        gaussians,
+        checkpoint.get("latent"),
+        "latent embeddings from checkpoint",
+        printer=printer,
+    )
 
     if joint_ckpt_path:
         joint_ckpt = resolve_checkpoint_path(joint_ckpt_path, must_exist=True)
@@ -555,6 +572,14 @@ def build_dcff_runtime(
                 printer=printer,
             ):
                 loaded_components.append("fsm")
+        if "gaussian_latent" in joint_map_state and (allowed is None or "gaussian_latent" in allowed):
+            if _load_gaussian_latent_compatible(
+                gaussians,
+                joint_map_state["gaussian_latent"],
+                "joint gaussian_latent",
+                printer=printer,
+            ):
+                loaded_components.append("gaussian_latent")
         if loaded_components:
             _print(
                 printer,

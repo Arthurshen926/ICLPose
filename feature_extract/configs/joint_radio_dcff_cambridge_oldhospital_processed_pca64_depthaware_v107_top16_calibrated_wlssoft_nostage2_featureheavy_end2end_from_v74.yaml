@@ -1,0 +1,16 @@
+base_config: joint_radio_dcff_cambridge_oldhospital_processed_pca64_depthaware_v102_batchcandidate_corrvolume_wlssoft_calibrated_featureheavy_end2end_top8_from_v74.yaml
+exp_name: joint_radio_dcff_cambridge_oldhospital_processed_pca64_depthaware_v107_top16_calibrated_wlssoft_nostage2_featureheavy_end2end_from_v74
+
+dataset:
+  pose_candidate_topk: 16
+
+training:
+  seed: 207
+  max_steps: 640
+
+map_supervision:
+  candidate_render_score_train_map: false
+  candidate_render_score_max_candidates: 16
+  candidate_stage1_topk: 16
+  candidate_two_stage_enabled: false
+  candidate_refined_pose_weight: 0.0

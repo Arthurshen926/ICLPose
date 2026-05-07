@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from data.radio_loc_dataset import RadioLocDataset, collate_fn, read_colmap_cameras
 from feature_field import build_dcff_runtime, intrinsics_to_K, render_feature_bundle_batch
+from feature_extract.train_impl import local_correlation_feature_preprocess
 from feature_extract.students.radio_query_student import DepthAwareLocalMatcher
 from pose_refine.models.concat_pose_net import (
     ConcatPoseNet,
@@ -50,6 +51,10 @@ def pose_errors(pose_pred: torch.Tensor, pose_gt: torch.Tensor) -> tuple[torch.T
     return rot * 180.0 / math.pi, trans
 
 
+def scale_pose_delta_update(delta_xi: torch.Tensor, update_scale: float) -> torch.Tensor:
+    return delta_xi.float() * float(update_scale)
+
+
 def scale_intrinsics(base_intr: dict, orig_hw: tuple[int, int], target_hw: tuple[int, int]) -> dict:
     orig_h, orig_w = orig_hw
     h, w = target_hw
@@ -59,6 +64,21 @@ def scale_intrinsics(base_intr: dict, orig_hw: tuple[int, int], target_hw: tuple
         "cx": float(base_intr["cx"] * w / orig_w),
         "cy": float(base_intr["cy"] * h / orig_h),
     }
+
+
+def hard_argmax_flow_from_correlation(corr: torch.Tensor, radius: int) -> torch.Tensor:
+    radius = int(radius)
+    B, channels, H, W = corr.shape
+    window = 2 * radius + 1
+    expected_channels = window * window
+    if channels != expected_channels:
+        raise ValueError(f"corr has {channels} channels, expected {expected_channels} for radius={radius}")
+    offsets = torch.arange(-radius, radius + 1, device=corr.device, dtype=corr.dtype)
+    dy, dx = torch.meshgrid(offsets, offsets, indexing="ij")
+    dx = dx.reshape(1, expected_channels, 1, 1).expand(B, -1, H, W)
+    dy = dy.reshape(1, expected_channels, 1, 1).expand(B, -1, H, W)
+    best = corr.float().argmax(dim=1, keepdim=True)
+    return torch.cat([dx.gather(1, best), dy.gather(1, best)], dim=1).to(corr.dtype)
 
 
 def render_bundle(runtime, poses, K, render_h, render_w):
@@ -134,6 +154,16 @@ def correlation_wls_pose_update(
     radius: int,
     temperature: float,
     damping: float,
+    update_scale: float = 1.0,
+    irls_iters: int = 0,
+    pixel_stride: int = 1,
+    robust_kernel: str = "huber",
+    adaptive_damping: bool = False,
+    flow_source: str = "correlation",
+    flow_decode_mode: str = "softargmax",
+    feature_preprocess: str = "none",
+    highpass_kernel: int = 3,
+    highpass_scale: float = 1.0,
     valid_mask=None,
     matcher=None,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
@@ -143,18 +173,6 @@ def correlation_wls_pose_update(
         rendered = rendered_feat.float()
         if query.shape[-2:] != rendered.shape[-2:]:
             query = F.interpolate(query, rendered.shape[-2:], mode="bilinear", align_corners=False)
-        query_n = F.normalize(query, dim=1)
-        rendered_n = F.normalize(rendered, dim=1)
-        corr = local_correlation(rendered_n, query_n, radius=int(radius)).float()
-        if matcher is not None:
-            corr = matcher(corr, depth=depth, valid_mask=valid_mask).float()
-        probs = torch.softmax(corr / max(float(temperature), 1e-6), dim=1)
-        flow = soft_argmax_flow_from_correlation(
-            corr,
-            radius=int(radius),
-            temperature=float(temperature),
-        ).float()
-        conf = probs.max(dim=1, keepdim=True).values
         depth_s = depth.float()
         if depth_s.ndim == 4:
             depth_s = depth_s.squeeze(1)
@@ -174,6 +192,47 @@ def correlation_wls_pose_update(
             rendered.shape[-2:],
             intrinsics,
         )
+        source = str(flow_source or "correlation").lower()
+        if source == "gt":
+            flow = gt_flow.float()
+            conf = torch.ones_like(gt_valid).float()
+        elif source == "correlation":
+            query_corr = local_correlation_feature_preprocess(
+                query,
+                mode=feature_preprocess,
+                highpass_kernel=highpass_kernel,
+                highpass_scale=highpass_scale,
+            )
+            rendered_corr = local_correlation_feature_preprocess(
+                rendered,
+                mode=feature_preprocess,
+                highpass_kernel=highpass_kernel,
+                highpass_scale=highpass_scale,
+            )
+            query_n = F.normalize(query_corr, dim=1)
+            rendered_n = F.normalize(rendered_corr, dim=1)
+            corr = local_correlation(rendered_n, query_n, radius=int(radius)).float()
+            if matcher is not None:
+                corr = matcher(corr, depth=depth, valid_mask=valid_mask).float()
+            probs = torch.softmax(corr / max(float(temperature), 1e-6), dim=1)
+            soft_flow = soft_argmax_flow_from_correlation(
+                corr,
+                radius=int(radius),
+                temperature=float(temperature),
+            ).float()
+            decode_mode = str(flow_decode_mode or "softargmax").lower()
+            if decode_mode == "softargmax":
+                flow = soft_flow
+            elif decode_mode == "argmax":
+                flow = hard_argmax_flow_from_correlation(corr, int(radius)).float()
+            elif decode_mode == "argmax_st":
+                hard_flow = hard_argmax_flow_from_correlation(corr, int(radius)).float()
+                flow = hard_flow + (soft_flow - soft_flow.detach())
+            else:
+                raise ValueError(f"Unsupported flow_decode_mode={flow_decode_mode!r}")
+            conf = probs.max(dim=1, keepdim=True).values
+        else:
+            raise ValueError(f"Unsupported flow_source={flow_source!r}")
         in_window = (
             (gt_valid > 0.5)
             & (valid_w > 0.5)
@@ -196,15 +255,20 @@ def correlation_wls_pose_update(
             Jv,
             depth_valid,
             damping=float(damping),
+            irls_iters=int(irls_iters),
+            pixel_stride=int(pixel_stride),
+            robust_kernel=str(robust_kernel),
+            adaptive_damping=bool(adaptive_damping),
         )
-        pose_pred = apply_pose_delta(pose_ref.float(), delta_xi.float())
+        delta_update = scale_pose_delta_update(delta_xi, update_scale)
+        pose_pred = apply_pose_delta(pose_ref.float(), delta_update)
         metrics = {
             "flow_epe": epe.detach(),
             "flow_cov": cov.detach(),
             "conf_mean": ((conf * in_window).sum() / denom).detach(),
-            "delta_trans_m": torch.linalg.norm(delta_xi[:, :3], dim=1).detach(),
+            "delta_trans_m": torch.linalg.norm(delta_update[:, :3], dim=1).detach(),
         }
-        return delta_xi, pose_pred, metrics
+        return delta_update, pose_pred, metrics
 
 
 @torch.no_grad()
@@ -224,6 +288,24 @@ def main() -> None:
     parser.add_argument("--corr_radius", type=int, default=8)
     parser.add_argument("--corr_temperature", type=float, default=0.04)
     parser.add_argument("--corr_wls_damping", type=float, default=1e-3)
+    parser.add_argument("--corr_update_scale", type=float, default=1.0)
+    parser.add_argument("--corr_irls_iters", type=int, default=0)
+    parser.add_argument("--corr_pixel_stride", type=int, default=1)
+    parser.add_argument("--corr_robust_kernel", choices=["huber", "gm", "gnc_gm"], default="huber")
+    parser.add_argument("--corr_adaptive_damping", action="store_true")
+    parser.add_argument("--corr_flow_source", choices=["correlation", "gt"], default="correlation")
+    parser.add_argument(
+        "--corr_flow_decode_mode",
+        choices=["softargmax", "argmax", "argmax_st"],
+        default="softargmax",
+    )
+    parser.add_argument(
+        "--corr_feature_preprocess",
+        choices=["none", "highpass", "residual_highpass", "concat_highpass"],
+        default="none",
+    )
+    parser.add_argument("--corr_highpass_kernel", type=int, default=3)
+    parser.add_argument("--corr_highpass_scale", type=float, default=1.0)
     parser.add_argument("--no_corr_wls", action="store_true")
     parser.add_argument("--pose_checkpoint", default=None)
     parser.add_argument("--query_student_config", default=None)
@@ -410,6 +492,16 @@ def main() -> None:
                 radius=args.corr_radius,
                 temperature=args.corr_temperature,
                 damping=args.corr_wls_damping,
+                update_scale=args.corr_update_scale,
+                irls_iters=args.corr_irls_iters,
+                pixel_stride=args.corr_pixel_stride,
+                robust_kernel=args.corr_robust_kernel,
+                adaptive_damping=args.corr_adaptive_damping,
+                flow_source=args.corr_flow_source,
+                flow_decode_mode=args.corr_flow_decode_mode,
+                feature_preprocess=args.corr_feature_preprocess,
+                highpass_kernel=args.corr_highpass_kernel,
+                highpass_scale=args.corr_highpass_scale,
                 valid_mask=init_mask,
                 matcher=query_matcher,
             )
@@ -445,6 +537,10 @@ def main() -> None:
     if corr_stats["trans"]:
         print(
             f"corr_wls: r={args.corr_radius} temp={args.corr_temperature:.3f} "
+            f"scale={args.corr_update_scale:.2f} stride={args.corr_pixel_stride} "
+            f"irls={args.corr_irls_iters} robust={args.corr_robust_kernel} "
+            f"flow={args.corr_flow_source}/{args.corr_flow_decode_mode} "
+            f"prep={args.corr_feature_preprocess} "
             f"corr_med={np.median(corr_stats['rot']):.3f}deg/"
             f"{np.median(corr_stats['trans']):.1f}mm  "
             f"flow_epe={np.mean(corr_stats['epe']):.3f}px "

@@ -4,22 +4,36 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import numpy as np
 import torch
+import torch.nn.functional as F
 
 import feature_extract.train_impl as train_impl
 from feature_field.dcff.losses import infonce_contrastive_loss
 from feature_field.utils.feature_track_vis import error_to_heatmap_image
+from data.radio_loc_retrieval_dataset import save_retrieval_init_entries
 from feature_extract import build_records_from_feature_ids as facade_build_records_from_feature_ids
 from feature_extract.scripts.export_adaptive_teacher_features import make_feature_filename, resolve_camera_fid
-from feature_extract.students.radio_query_student import DepthAwareLocalFlowHead, RadioQueryStudent
+from feature_extract.students.radio_query_student import (
+    AnchorPoseInitHead,
+    CandidateScoreFusionHead,
+    CandidateScoreMapFusionHead,
+    DepthAwareLocalFlowHead,
+    FeatureBankPoseInitHead,
+    LocalCorrDomainAdapter,
+    RadioQueryStudent,
+)
 from feature_extract.train_impl import (
     TeacherFeatureStore,
+    TeacherCorrespondenceStore,
+    RetrievalTeacherStore,
     apply_model_trainable_filter,
     build_all_records,
     build_model_param_groups,
     build_radio_query_student,
     build_records_from_feature_ids,
     compute_map_supervision,
+    compute_pose_init_losses,
     compute_w2c_flow,
     depth_observability_weight,
     flow_warp_contrastive_loss,
@@ -31,21 +45,35 @@ from feature_extract.train_impl import (
     local_correlation_peak_margin_loss,
     local_correlation_soft_flow_loss,
     local_correlation_subpixel_loss,
+    load_pose_candidate_cache_index,
     local_correlation_wls_pose_loss,
     load_model_warmstart,
+    maybe_attach_pose_candidate_renders,
     normalize_scene_coord_map,
+    candidate_quality_features_from_batch,
+    candidate_score_fusion_listwise_loss,
     perturb_w2c_camera_center,
+    pose_feature_bank_from_dataset,
     pose_update_gain_loss,
     resolve_perturb_rank_margin,
     resolve_query_feature_dims,
     resolve_safe_num_workers,
     sample_query_feature_by_flow,
+    sparse_teacher_correspondence_loss,
+    sparse_teacher_local_patch_loss,
     scene_coord_flow_warp_loss,
     scene_coord_regression_loss,
     shifted_local_correlation,
     translation_observability_weight,
+    descriptor_pose_retrieval_metrics,
+    local_render_score_feature_candidates,
+    candidate_local_render_score_nce_loss,
+    render_score_candidate_listwise_loss,
+    render_score_feature_candidates,
+    select_pose_candidate_indices,
+    topk_descriptor_candidate_indices,
 )
-from feature_extract.export_impl import apply_export_feature_dims
+from feature_extract.export_impl import apply_export_feature_dims, build_model as build_export_model
 from pose_refine.models.concat_pose_net import local_correlation as reference_local_correlation
 
 
@@ -64,6 +92,702 @@ def test_radio_query_student_supports_asymmetric_fine_and_coarse_outputs():
 
     assert out["fine"].shape == (2, 96, 8, 10)
     assert out["coarse"].shape == (2, 32, 4, 5)
+
+
+def test_local_corr_domain_adapter_projects_query_and_render_with_separate_heads():
+    adapter = LocalCorrDomainAdapter(
+        feature_dim=4,
+        hidden_dim=8,
+        output_dim=6,
+        zero_init=True,
+        l2_normalize=True,
+    )
+    feat = torch.randn(2, 4, 5, 6)
+
+    query = adapter.project_query(feat)
+    render = adapter.project_render(feat)
+
+    assert query.shape == (2, 6, 5, 6)
+    assert render.shape == (2, 6, 5, 6)
+    assert adapter.query_projector is not adapter.render_projector
+    assert torch.allclose(query.norm(dim=1), torch.ones(2, 5, 6), atol=1e-5)
+    assert torch.allclose(render.norm(dim=1), torch.ones(2, 5, 6), atol=1e-5)
+
+
+def test_export_model_builds_local_corr_domain_adapter_checkpoint():
+    cfg = {
+        "dataset": {
+            "feature_hw": [4, 5],
+            "coarse_feature_hw": [2, 3],
+            "input_hw": [32, 40],
+        },
+        "model": {
+            "feature_dim": 4,
+            "fine_feature_dim": 4,
+            "coarse_feature_dim": 4,
+            "base_channels": 8,
+            "stage_dims": [8, 8, 8, 8],
+            "local_corr_projector_enabled": True,
+            "local_corr_projector_domain_adapter": True,
+            "local_corr_projector_hidden_dim": 8,
+            "local_corr_projector_output_dim": 4,
+        },
+    }
+    trained = RadioQueryStudent(
+        feature_dim=4,
+        fine_feature_dim=4,
+        coarse_feature_dim=4,
+        base_channels=8,
+        stage_dims=(8, 8, 8, 8),
+        output_hw=(4, 5),
+        coarse_output_hw=(2, 3),
+        input_hw=(32, 40),
+        local_corr_projector_enabled=True,
+        local_corr_projector_domain_adapter=True,
+        local_corr_projector_hidden_dim=8,
+        local_corr_projector_output_dim=4,
+    )
+
+    loaded = build_export_model(
+        cfg,
+        {"model_state_dict": trained.state_dict()},
+        torch.device("cpu"),
+    )
+
+    assert hasattr(loaded.local_corr_projector, "project_query")
+
+
+def test_teacher_correspondence_store_loads_and_scales_sparse_points():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        np.savez(
+            root / "seq_a.npz",
+            query_xy=np.asarray([[159.0, 79.0], [0.0, 0.0]], dtype=np.float32),
+            map_xy=np.asarray([[159.0, 79.0], [0.0, 0.0]], dtype=np.float32),
+            confidence=np.asarray([0.2, 0.9], dtype=np.float32),
+            query_hw=np.asarray([80, 160], dtype=np.int32),
+            map_hw=np.asarray([80, 160], dtype=np.int32),
+            coordinate_space=np.asarray("image"),
+        )
+        store = TeacherCorrespondenceStore(root, feature_hw=(8, 16), max_points=4)
+
+        item = store.load_record({"sample_name": "seq/a.png"})
+
+    assert item["teacher_corr_valid"].sum().item() == 2
+    assert torch.allclose(item["teacher_corr_conf"][:2], torch.tensor([0.9, 0.2]))
+    assert torch.allclose(item["teacher_corr_query_xy"][0], torch.tensor([0.0, 0.0]))
+    assert torch.allclose(item["teacher_corr_query_xy"][1], torch.tensor([15.0, 7.0]))
+
+
+def test_sparse_teacher_correspondence_loss_prefers_matching_pairs():
+    feat = torch.zeros(1, 3, 2, 3)
+    feat[0, 0, 0, 0] = 1.0
+    feat[0, 1, 1, 2] = 1.0
+    query_xy = torch.tensor([[[0.0, 0.0], [2.0, 1.0]]])
+    map_xy_good = torch.tensor([[[0.0, 0.0], [2.0, 1.0]]])
+    map_xy_bad = torch.tensor([[[2.0, 1.0], [0.0, 0.0]]])
+    conf = torch.ones(1, 2)
+    valid = torch.ones(1, 2)
+    source_hw = torch.tensor([[2.0, 3.0]])
+
+    good, good_metrics = sparse_teacher_correspondence_loss(
+        feat,
+        feat,
+        query_xy,
+        map_xy_good,
+        conf,
+        valid,
+        xy_source_hw=source_hw,
+        temperature=0.05,
+        min_points=2,
+    )
+    bad, bad_metrics = sparse_teacher_correspondence_loss(
+        feat,
+        feat,
+        query_xy,
+        map_xy_bad,
+        conf,
+        valid,
+        xy_source_hw=source_hw,
+        temperature=0.05,
+        min_points=2,
+    )
+
+    assert good.item() < bad.item()
+    assert good_metrics["map_teacher_corr_acc"].item() == 1.0
+    assert good_metrics["map_teacher_corr_skipped_no_points"].item() == 0.0
+    assert bad_metrics["map_teacher_corr_acc"].item() == 0.0
+
+
+def test_sparse_teacher_correspondence_loss_can_ignore_nearby_false_negatives():
+    query_feat = torch.zeros(1, 3, 1, 3)
+    map_feat = torch.zeros(1, 3, 1, 3)
+    query_feat[0, 0, 0, 0] = 1.0
+    query_feat[0, 0, 0, 1] = 1.0
+    query_feat[0, 1, 0, 2] = 1.0
+    map_feat.copy_(query_feat)
+    xy = torch.tensor([[[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]]])
+    conf = torch.ones(1, 3)
+    valid = torch.ones(1, 3)
+    source_hw = torch.tensor([[1.0, 3.0]])
+
+    plain, plain_metrics = sparse_teacher_correspondence_loss(
+        query_feat,
+        map_feat,
+        xy,
+        xy,
+        conf,
+        valid,
+        xy_source_hw=source_hw,
+        temperature=0.1,
+        min_points=3,
+    )
+    tolerant, tolerant_metrics = sparse_teacher_correspondence_loss(
+        query_feat,
+        map_feat,
+        xy,
+        xy,
+        conf,
+        valid,
+        xy_source_hw=source_hw,
+        temperature=0.1,
+        min_points=3,
+        negative_exclusion_px=1.1,
+        positive_weight=0.5,
+        margin_weight=0.5,
+        margin=0.1,
+    )
+
+    assert tolerant.item() < plain.item()
+    assert tolerant_metrics["map_teacher_corr_gap"].item() > plain_metrics["map_teacher_corr_gap"].item()
+
+
+def test_sparse_teacher_local_patch_loss_supervises_correct_local_peak():
+    query_feat = torch.zeros(1, 3, 5, 5)
+    map_feat = torch.zeros(1, 3, 5, 5)
+    query_feat[0, 0, 2, 2] = 1.0
+    map_feat[0, 0, 2, 2] = 1.0
+    map_feat[0, 1, 2, 3] = 1.0
+    query_xy = torch.tensor([[[2.0, 2.0]]])
+    map_xy_good = torch.tensor([[[2.0, 2.0]]])
+    map_xy_bad = torch.tensor([[[3.0, 2.0]]])
+    conf = torch.ones(1, 1)
+    valid = torch.ones(1, 1)
+    source_hw = torch.tensor([[5.0, 5.0]])
+
+    good, good_metrics = sparse_teacher_local_patch_loss(
+        query_feat,
+        map_feat,
+        query_xy,
+        map_xy_good,
+        conf,
+        valid,
+        xy_source_hw=source_hw,
+        radius=1,
+        temperature=0.05,
+        min_points=1,
+        positive_weight=0.5,
+        margin_weight=0.5,
+        margin=0.1,
+    )
+    bad, bad_metrics = sparse_teacher_local_patch_loss(
+        query_feat,
+        map_feat,
+        query_xy,
+        map_xy_bad,
+        conf,
+        valid,
+        xy_source_hw=source_hw,
+        radius=1,
+        temperature=0.05,
+        min_points=1,
+        positive_weight=0.5,
+        margin_weight=0.5,
+        margin=0.1,
+    )
+
+    assert good.item() < bad.item()
+    assert good_metrics["map_teacher_patch_acc"].item() == 1.0
+    assert good_metrics["map_teacher_patch_gap"].item() > 0.0
+    assert good_metrics["map_teacher_patch_soft_epe"].item() < bad_metrics["map_teacher_patch_soft_epe"].item()
+    assert bad_metrics["map_teacher_patch_acc"].item() == 0.0
+
+
+def test_compute_map_supervision_consumes_teacher_correspondences():
+    feat = torch.zeros(1, 3, 2, 3)
+    feat[0, 0, 0, 0] = 1.0
+    feat[0, 1, 1, 2] = 1.0
+    coarse = torch.randn(1, 2, 1, 2)
+    xy = torch.tensor([[[0.0, 0.0], [2.0, 1.0]]])
+    batch = {
+        "rgb": torch.zeros(1, 3, 8, 12),
+        "rendered_map_fine": feat.clone(),
+        "rendered_map_coarse": coarse.clone(),
+        "rendered_map_mask": torch.ones(1, 1, 2, 3),
+        "teacher_fine": feat.clone(),
+        "teacher_coarse": coarse.clone(),
+        "teacher_corr_query_xy": xy,
+        "teacher_corr_map_xy": xy,
+        "teacher_corr_conf": torch.ones(1, 2),
+        "teacher_corr_valid": torch.ones(1, 2),
+        "teacher_corr_hw": torch.tensor([[2.0, 3.0]]),
+    }
+    outputs = {"fine": feat.clone(), "coarse": coarse.clone()}
+    cfg = {
+        "loss": {},
+        "map_supervision": {
+            "enabled": True,
+            "teacher_corr_weight": 1.0,
+            "teacher_corr_local_patch_weight": 1.0,
+            "teacher_corr_local_patch_radius": 1,
+            "teacher_corr_min_points": 2,
+            "teacher_corr_temperature": 1.0,
+        },
+    }
+
+    total, metrics = compute_map_supervision(batch, outputs, cfg, torch.device("cpu"))
+
+    assert total.item() > 0.0
+    assert metrics["map_teacher_corr_missing"].item() == 0.0
+    assert metrics["map_teacher_corr_skipped_no_points"].item() == 0.0
+    assert metrics["map_teacher_corr_acc"].item() == 1.0
+    assert metrics["map_teacher_patch_skipped_no_points"].item() == 0.0
+    assert metrics["map_teacher_patch_acc"].item() == 1.0
+    assert metrics["map_teacher_patch_self_acc"].item() == 1.0
+    assert metrics["map_teacher_patch_radio_acc"].item() == 1.0
+
+
+def test_local_correlation_wls_ignores_flow_outside_search_window():
+    height, width = 4, 5
+    rendered = F.normalize(torch.randn(1, 4, height, width), dim=1)
+    query = F.normalize(torch.randn(1, 4, height, width), dim=1)
+    flow_gt = torch.full((1, 2, height, width), 5.0)
+    valid = torch.ones(1, 1, height, width)
+    depth = torch.ones(1, height, width) * 3.0
+    pose = torch.eye(4).unsqueeze(0)
+
+    result = local_correlation_joint_losses(
+        rendered,
+        query,
+        flow_gt,
+        valid,
+        radius=1,
+        temperature=0.05,
+        compute_wls_pose=True,
+        depth=depth,
+        pose_ref=pose,
+        pose_gt=pose,
+        intrinsics={
+            "fx": 40.0,
+            "fy": 40.0,
+            "cx": (width - 1) / 2.0,
+            "cy": (height - 1) / 2.0,
+        },
+    )
+
+    assert result["metrics"]["map_corr_wls_conf_cov"].item() == 0.0
+    assert result["metrics"]["map_corr_wls_delta_trans_mm"].item() == 0.0
+
+
+def test_local_correlation_wls_min_conf_cov_gates_sparse_confidence():
+    class SparseBadFlowHead(torch.nn.Module):
+        def forward(self, corr, depth=None, valid_mask=None):
+            batch, _channels, height, width = corr.shape
+            flow = torch.ones(batch, 2, height, width, device=corr.device, dtype=corr.dtype)
+            confidence = torch.zeros(batch, 1, height, width, device=corr.device, dtype=corr.dtype)
+            confidence[:, :, 0, 0] = 1.0
+            return {"flow": flow, "confidence": confidence}
+
+    height, width = 4, 5
+    rendered = F.normalize(torch.randn(1, 4, height, width), dim=1)
+    query = F.normalize(torch.randn(1, 4, height, width), dim=1)
+    flow_gt = torch.zeros(1, 2, height, width)
+    valid = torch.ones(1, 1, height, width)
+    depth = torch.ones(1, height, width) * 3.0
+    pose = torch.eye(4).unsqueeze(0)
+
+    result = local_correlation_joint_losses(
+        rendered,
+        query,
+        flow_gt,
+        valid,
+        radius=1,
+        temperature=0.05,
+        compute_wls_pose=True,
+        flow_head=SparseBadFlowHead(),
+        wls_min_conf_cov=0.5,
+        depth=depth,
+        pose_ref=pose,
+        pose_gt=pose,
+        intrinsics={
+            "fx": 40.0,
+            "fy": 40.0,
+            "cx": (width - 1) / 2.0,
+            "cy": (height - 1) / 2.0,
+        },
+    )
+
+    assert result["metrics"]["map_corr_wls_conf_cov"].item() == 0.0
+    assert result["metrics"]["map_corr_wls_delta_trans_mm"].item() == 0.0
+
+
+def test_pose_init_head_can_use_retrieval_descriptor_token():
+    model = RadioQueryStudent(
+        feature_dim=16,
+        fine_feature_dim=16,
+        coarse_feature_dim=8,
+        stage_dims=(8, 12, 16, 20),
+        output_hw=(8, 10),
+        coarse_output_hw=(4, 5),
+        input_hw=(64, 80),
+        retrieval_dim=7,
+        retrieval_hidden_dim=11,
+        pose_init_head=True,
+        pose_init_mode="anchor",
+        pose_init_token_source="retrieval",
+        pose_init_anchor_centers=torch.tensor([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]),
+        pose_init_anchor_rotmats=torch.eye(3).unsqueeze(0).repeat(2, 1, 1),
+        pose_init_hypotheses=1,
+    )
+
+    out = model(torch.randn(2, 3, 64, 80))
+
+    assert out["retrieval"].shape == (2, 7)
+    assert model.pose_init_head.trunk[0].in_features == 7
+    assert out["pose_init"]["center"].shape == (2, 1, 3)
+
+
+def test_descriptor_pose_retrieval_metrics_reports_topk_pose_errors():
+    query_desc = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+    bank_desc = torch.tensor([[1.0, 0.0], [0.0, 1.0], [0.7, 0.7]])
+    query_pose = torch.eye(4).unsqueeze(0).repeat(2, 1, 1)
+    bank_pose = torch.eye(4).unsqueeze(0).repeat(3, 1, 1)
+    query_pose[1, 0, 3] = -1.0
+    bank_pose[1, 0, 3] = -1.0
+    bank_pose[2, 0, 3] = 4.0
+
+    metrics = descriptor_pose_retrieval_metrics(
+        query_desc,
+        query_pose,
+        bank_desc,
+        bank_pose,
+        topk=(1, 2),
+    )
+
+    assert metrics["retrieval_top1_trans_mm"].item() == 0.0
+    assert metrics["retrieval_top2_best_trans_mm"].item() == 0.0
+    assert metrics["retrieval_top1_recall_5deg_1000mm"].item() == 100.0
+
+
+def test_select_pose_candidate_indices_supports_score_and_uniform_limits():
+    scores = torch.tensor([0.1, 0.9, 0.2, 0.8, 0.0])
+
+    top_idx = select_pose_candidate_indices(5, limit=2, scores=scores, strategy="score")
+    uniform_idx = select_pose_candidate_indices(5, limit=3, strategy="uniform")
+
+    assert top_idx.tolist() == [1, 3]
+    assert uniform_idx.tolist() == [0, 2, 4]
+
+
+def test_topk_descriptor_candidate_indices_uses_cosine_similarity():
+    query_desc = torch.tensor([[1.0, 0.0]])
+    bank_desc = torch.tensor([[0.0, 1.0], [1.0, 0.0], [0.8, 0.2]])
+
+    idx, scores = topk_descriptor_candidate_indices(query_desc, bank_desc, k=2)
+
+    assert idx.tolist() == [[1, 2]]
+    assert scores[0, 0] > scores[0, 1]
+
+
+def test_feature_bank_pose_init_head_can_use_retrieval_descriptor_space():
+    head = FeatureBankPoseInitHead(
+        token_dim=3,
+        anchor_centers=torch.tensor([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]),
+        anchor_rotmats=torch.eye(3).unsqueeze(0).repeat(2, 1, 1),
+        anchor_descriptors=torch.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]),
+        fine_dim=4,
+        coarse_dim=2,
+        hypotheses=1,
+        projector="identity",
+        feature_source="retrieval",
+    )
+
+    out = head(torch.tensor([[0.0, 1.0, 0.0]]), fine=None, coarse=None)
+
+    assert out["anchor_indices"].item() == 1
+
+
+def test_pose_feature_bank_from_dataset_can_use_retrieval_teacher_descriptors():
+    class RetrievalStore:
+        def load_record(self, record):
+            return torch.tensor([float(record["teacher_idx"]), 1.0])
+
+    class Dataset:
+        records = [
+            {"sample_name": "seq/a.png", "teacher_idx": 2},
+            {"sample_name": "seq/b.png", "teacher_idx": 3},
+        ]
+        retrieval_teacher_store = RetrievalStore()
+        name_to_pose = {}
+        basename_to_pose = {}
+
+    pose_a = torch.eye(4)
+    pose_b = torch.eye(4)
+    pose_b[0, 3] = -1.0
+    Dataset.name_to_pose = {"seq/a.png": pose_a, "seq/b.png": pose_b}
+
+    centers, rotmats, desc = pose_feature_bank_from_dataset(
+        Dataset(),
+        teacher_store=None,
+        num_anchors=10,
+        sampling="train_all",
+        feature_source="retrieval",
+    )
+
+    assert centers.shape == (2, 3)
+    assert rotmats.shape == (2, 3, 3)
+    assert torch.equal(desc, torch.tensor([[2.0, 1.0], [3.0, 1.0]]))
+
+
+def test_render_score_feature_candidates_selects_best_masked_match():
+    query = torch.tensor(
+        [[[[1.0, 0.0], [1.0, 0.0]], [[0.0, 1.0], [0.0, 1.0]]]]
+    )
+    candidates = torch.stack(
+        [
+            torch.tensor([[[0.0, 1.0], [0.0, 1.0]], [[1.0, 0.0], [1.0, 0.0]]]),
+            query.squeeze(0),
+            torch.tensor([[[1.0, 0.0], [0.0, 1.0]], [[0.0, 1.0], [1.0, 0.0]]]),
+        ],
+        dim=0,
+    )
+    mask = torch.ones(3, 1, 2, 2)
+
+    result = render_score_feature_candidates(query, candidates, mask=mask)
+
+    assert result["best_idx"].item() == 1
+    assert torch.allclose(result["scores"], torch.tensor([0.0, 1.0, 0.5]))
+    assert result["score_margin"].item() == 0.5
+
+
+def test_render_score_feature_candidates_can_spatial_center_before_cosine():
+    query = torch.tensor(
+        [
+            [[1.0, 2.0], [3.0, 4.0]],
+            [[4.0, 3.0], [2.0, 1.0]],
+        ]
+    )
+    good = query + torch.tensor([10.0, -5.0]).view(2, 1, 1)
+    bad = -query + torch.tensor([10.0, -5.0]).view(2, 1, 1)
+    candidates = torch.stack([bad, good], dim=0)
+
+    result = render_score_feature_candidates(query, candidates, preprocess="spatial_center")
+
+    assert result["best_idx"].item() == 1
+    assert result["scores"][1] > 0.99
+    assert result["scores"][0] < -0.99
+
+
+def test_local_render_score_feature_candidates_tolerates_small_pixel_shift():
+    query = torch.zeros(2, 3, 3)
+    query[0, 1, 1] = 1.0
+    good = torch.zeros(2, 3, 3)
+    good[0, 1, 2] = 1.0
+    bad = torch.zeros(2, 3, 3)
+    bad[1, 1, 2] = 1.0
+    candidates = torch.stack([bad, good], dim=0)
+    mask = torch.zeros(1, 3, 3)
+    mask[:, 1, 1] = 1.0
+
+    result = local_render_score_feature_candidates(query, candidates, mask=mask, radius=1)
+
+    assert result["best_idx"].item() == 1
+    assert result["scores"][1] > 0.99
+    assert result["scores"][0] < 0.01
+
+
+def test_local_render_score_feature_candidates_can_return_correlation_volume_score_map():
+    radius = 2
+    height, width = 4, 5
+    query = F.normalize(torch.randn(3, height, width), dim=0)
+    candidates = F.normalize(torch.randn(2, 3, height, width), dim=1)
+
+    result = local_render_score_feature_candidates(
+        query,
+        candidates,
+        radius=radius,
+        score_map_mode="volume",
+    )
+
+    assert result["score_map"].shape == (2, (2 * radius + 1) ** 2, height, width)
+    assert torch.allclose(result["scores"], result["score_map"].max(dim=1).values.mean(dim=(1, 2)))
+
+
+def test_local_render_score_feature_candidates_can_return_volume_plus_peak_offset():
+    radius = 1
+    height, width = 3, 4
+    query = F.normalize(torch.randn(2, height, width), dim=0)
+    candidates = F.normalize(torch.randn(2, 2, height, width), dim=1)
+
+    result = local_render_score_feature_candidates(
+        query,
+        candidates,
+        radius=radius,
+        score_map_mode="volume_plus_peak_offset",
+    )
+
+    query_n = F.normalize(query.unsqueeze(0).expand(2, -1, -1, -1), dim=1)
+    candidate_n = F.normalize(candidates, dim=1)
+    corr = shifted_local_correlation(query_n, candidate_n, radius=radius)
+    peak_offset = train_impl._local_correlation_peak_score_map(corr, radius=radius)
+    expected_channels = (2 * radius + 1) ** 2 + 3
+    assert result["score_map"].shape == (2, expected_channels, height, width)
+    assert torch.allclose(result["score_map"][:, -3:], peak_offset)
+
+
+def test_retrieval_teacher_store_supports_summary_descriptors():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        summary_dir = root / "summary"
+        summary_dir.mkdir()
+        torch.save(torch.arange(3).float(), summary_dir / "seq1_frame000_summary_3.pt")
+
+        store = RetrievalTeacherStore(root, subdir="summary")
+
+        assert store.feature_dim == 3
+        assert torch.equal(store.load("seq1/frame000.png"), torch.arange(3).float())
+
+
+def test_retrieval_teacher_store_can_fallback_to_feature_id_records():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        summary_dir = root / "summary"
+        summary_dir.mkdir()
+        torch.save(torch.arange(4).float(), summary_dir / "rgb_7_summary_4.pt")
+
+        store = RetrievalTeacherStore(root, subdir="summary")
+
+        loaded = store.load_record({"sample_name": "seq2/frame00154.png", "teacher_idx": 7})
+        assert torch.equal(loaded, torch.arange(4).float())
+
+
+def test_pose_init_metrics_report_score_selected_and_oracle_topk_recall():
+    outputs = {
+        "fine": torch.zeros(1, 1, 1, 1),
+        "pose_init": {
+            "center": torch.tensor([[[2.0, 0.0, 0.0], [0.0, 0.0, 0.0]]]),
+            "rotmat": torch.eye(3).view(1, 1, 3, 3).repeat(1, 2, 1, 1),
+            "scores": torch.tensor([[4.0, 1.0]]),
+        },
+    }
+    batch = {"pose_gt": torch.eye(4).unsqueeze(0)}
+
+    _loss, metrics = compute_pose_init_losses(
+        outputs,
+        batch,
+        {
+            "pose_init": {
+                "enabled": True,
+                "trans_weight": 1.0,
+                "rot_weight": 0.0,
+                "score_weight": 0.0,
+            }
+        },
+    )
+
+    assert metrics["pose_init_best_trans_mm"].item() == 0.0
+    assert metrics["pose_init_pred_trans_mm"].item() == 2000.0
+    assert metrics["pose_init_best_joint_5deg_1000mm"].item() == 100.0
+    assert metrics["pose_init_pred_joint_5deg_1000mm"].item() == 0.0
+
+
+def test_pose_init_anchor_metrics_accept_nearby_pose_bank_hypotheses():
+    outputs = {
+        "fine": torch.zeros(1, 1, 1, 1),
+        "pose_init": {
+            "center": torch.tensor([[[0.5, 0.0, 0.0]]]),
+            "rotmat": torch.eye(3).view(1, 1, 3, 3),
+            "scores": torch.tensor([[1.0]]),
+            "anchor_logits": torch.tensor([[4.0, 1.0]]),
+            "anchor_indices": torch.tensor([[0]]),
+            "anchor_centers": torch.tensor([[0.5, 0.0, 0.0], [0.0, 0.0, 0.0]]),
+            "anchor_rotmats": torch.eye(3).unsqueeze(0).repeat(2, 1, 1),
+        },
+    }
+    batch = {"pose_gt": torch.eye(4).unsqueeze(0)}
+
+    _loss, metrics = compute_pose_init_losses(
+        outputs,
+        batch,
+        {
+            "pose_init": {
+                "enabled": True,
+                "trans_weight": 0.0,
+                "rot_weight": 0.0,
+                "anchor_weight": 1.0,
+                "anchor_soft_sigma_m": 1.0,
+                "anchor_soft_rot_sigma_deg": 30.0,
+            }
+        },
+    )
+
+    assert metrics["pose_init_anchor_acc"].item() == 0.0
+    assert metrics["pose_init_anchor_topk_recall"].item() == 0.0
+    assert metrics["pose_init_anchor_topk_recall_5deg_1000mm"].item() == 100.0
+    assert metrics["pose_init_anchor_topk_recall_1deg_100mm"].item() == 0.0
+
+
+def test_anchor_pose_init_head_exposes_all_anchor_poses_for_teacher_forced_loss():
+    head = AnchorPoseInitHead(
+        token_dim=4,
+        hidden_dim=8,
+        hypotheses=1,
+        anchor_centers=torch.tensor([[5.0, 0.0, 0.0], [0.0, 0.0, 0.0]]),
+        anchor_rotmats=torch.eye(3).unsqueeze(0).repeat(2, 1, 1),
+        residual_scale=1.0,
+    )
+
+    out = head(torch.zeros(1, 4))
+
+    assert out["center"].shape == (1, 1, 3)
+    assert out["all_center"].shape == (1, 2, 3)
+    assert out["all_rotmat"].shape == (1, 2, 3, 3)
+
+
+def test_pose_init_all_anchor_pose_loss_can_supervise_target_outside_topk():
+    outputs = {
+        "fine": torch.zeros(1, 1, 1, 1),
+        "pose_init": {
+            "center": torch.tensor([[[5.0, 0.0, 0.0]]]),
+            "rotmat": torch.eye(3).view(1, 1, 3, 3),
+            "scores": torch.tensor([[4.0]]),
+            "all_center": torch.tensor([[[5.0, 0.0, 0.0], [0.0, 0.0, 0.0]]]),
+            "all_rotmat": torch.eye(3).view(1, 1, 3, 3).repeat(1, 2, 1, 1),
+            "anchor_logits": torch.tensor([[4.0, 1.0]]),
+            "anchor_indices": torch.tensor([[0]]),
+            "anchor_centers": torch.tensor([[5.0, 0.0, 0.0], [0.0, 0.0, 0.0]]),
+            "anchor_rotmats": torch.eye(3).unsqueeze(0).repeat(2, 1, 1),
+        },
+    }
+    batch = {"pose_gt": torch.eye(4).unsqueeze(0)}
+
+    _loss, metrics = compute_pose_init_losses(
+        outputs,
+        batch,
+        {
+            "pose_init": {
+                "enabled": True,
+                "trans_weight": 1.0,
+                "rot_weight": 0.0,
+                "score_weight": 0.0,
+                "anchor_weight": 0.0,
+                "use_all_anchor_pose_loss": True,
+            }
+        },
+    )
+
+    assert metrics["pose_init_best_trans_mm"].item() == 0.0
+    assert metrics["pose_init_pred_trans_mm"].item() == 5000.0
 
 
 def test_resolve_safe_num_workers_disables_workers_for_full_resolution_inputs():
@@ -153,6 +877,87 @@ def test_radio_query_student_fine_highres_zero_init_starts_as_residual_noop():
     loss.backward()
 
     assert model.fine_highres_fuse[-1].weight.grad is not None
+
+
+def test_radio_query_student_global_context_zero_init_starts_as_residual_noop():
+    torch.manual_seed(7)
+    baseline = RadioQueryStudent(
+        feature_dim=16,
+        fine_feature_dim=16,
+        coarse_feature_dim=8,
+        stage_dims=(8, 12, 16, 20),
+        output_hw=(8, 10),
+        coarse_output_hw=(4, 5),
+        input_hw=(64, 80),
+        l2_normalize=False,
+    )
+    model = RadioQueryStudent(
+        feature_dim=16,
+        fine_feature_dim=16,
+        coarse_feature_dim=8,
+        stage_dims=(8, 12, 16, 20),
+        output_hw=(8, 10),
+        coarse_output_hw=(4, 5),
+        input_hw=(64, 80),
+        l2_normalize=False,
+        global_context_enabled=True,
+        global_context_zero_init=True,
+    )
+    model.load_state_dict(baseline.state_dict(), strict=False)
+
+    x = torch.randn(2, 3, 64, 80)
+    baseline_out = baseline(x)
+    out = model(x)
+    loss = out["fine"].square().mean() + out["coarse"].square().mean()
+    loss.backward()
+
+    assert model.global_context is not None
+    assert torch.allclose(out["fine"], baseline_out["fine"], atol=1e-6)
+    assert torch.allclose(out["coarse"], baseline_out["coarse"], atol=1e-6)
+    assert model.global_context[1].weight.grad is not None
+    assert model.global_context[1].weight.grad.abs().sum().item() > 0
+
+
+def test_radio_query_student_window_attention_zero_init_starts_as_residual_noop():
+    torch.manual_seed(11)
+    baseline = RadioQueryStudent(
+        feature_dim=16,
+        fine_feature_dim=16,
+        coarse_feature_dim=8,
+        stage_dims=(8, 12, 16, 20),
+        output_hw=(8, 10),
+        coarse_output_hw=(4, 5),
+        input_hw=(64, 80),
+        l2_normalize=False,
+    )
+    model = RadioQueryStudent(
+        feature_dim=16,
+        fine_feature_dim=16,
+        coarse_feature_dim=8,
+        stage_dims=(8, 12, 16, 20),
+        output_hw=(8, 10),
+        coarse_output_hw=(4, 5),
+        input_hw=(64, 80),
+        l2_normalize=False,
+        window_attention_layers=2,
+        window_attention_heads=4,
+        window_attention_size=3,
+        window_attention_zero_init=True,
+    )
+    model.load_state_dict(baseline.state_dict(), strict=False)
+
+    x = torch.randn(2, 3, 64, 80)
+    baseline_out = baseline(x)
+    out = model(x)
+    loss = out["fine"].square().mean() + out["coarse"].square().mean()
+    loss.backward()
+
+    assert model.window_attention is not None
+    assert len(model.window_attention) == 2
+    assert torch.allclose(out["fine"], baseline_out["fine"], atol=1e-6)
+    assert torch.allclose(out["coarse"], baseline_out["coarse"], atol=1e-6)
+    assert model.window_attention[0].attn.out_proj.weight.grad is not None
+    assert model.window_attention[0].attn.out_proj.weight.grad.abs().sum().item() > 0
 
 
 def test_radio_query_student_fine_loc_head_starts_as_noop_and_receives_gradients():
@@ -474,6 +1279,11 @@ def test_build_radio_query_student_uses_training_config_for_eval_parity():
             "base_channels": 8,
             "stage_dims": [8, 12, 16, 20],
             "fine_loc_head": True,
+            "global_context_enabled": True,
+            "global_context_zero_init": True,
+            "window_attention_layers": 1,
+            "window_attention_heads": 4,
+            "window_attention_size": 3,
             "local_matcher_enabled": True,
             "local_matcher_radius": 2,
             "local_flow_head_enabled": True,
@@ -492,6 +1302,8 @@ def test_build_radio_query_student_uses_training_config_for_eval_parity():
 
     assert out["fine_loc"].shape == (1, 16, 8, 10)
     assert out["coarse"].shape == (1, 8, 4, 5)
+    assert model.global_context is not None
+    assert model.window_attention is not None
     assert model.local_matcher is not None
     assert model.local_matcher.radius == 2
     assert model.local_flow_head is not None
@@ -651,6 +1463,30 @@ def test_local_correlation_joint_loss_can_ignore_too_large_flow_targets():
     assert result["metrics"]["map_query_corr_ce_cov"].item() == 0.0
 
 
+def test_local_correlation_joint_loss_reports_peak_diagnostics_without_peak_loss():
+    rendered = torch.zeros(1, 2, 3, 3)
+    query = torch.zeros_like(rendered)
+    rendered[:, 0] = 1.0
+    query[:, 0] = 1.0
+    flow = torch.zeros(1, 2, 3, 3)
+    valid = torch.ones(1, 1, 3, 3)
+
+    result = local_correlation_joint_losses(
+        rendered,
+        query,
+        flow,
+        valid,
+        radius=1,
+        compute_flow=True,
+        compute_peak=False,
+        low_peak_gap_threshold=0.01,
+    )
+
+    assert "map_query_corr_peak_gap_diag" in result["metrics"]
+    assert "map_query_corr_peak_low_frac" in result["metrics"]
+    assert "map_query_corr_peak_low_threshold" in result["metrics"]
+
+
 def test_local_correlation_joint_loss_reports_flow_magnitudes():
     height, width = 5, 6
     rendered = torch.randn(1, 4, height, width)
@@ -702,6 +1538,50 @@ def test_local_correlation_joint_loss_can_penalize_wrong_flow_direction():
     assert result["losses"]["flow_cosine"].item() > 1.9
     assert result["metrics"]["map_query_corr_flow_cosine"].item() < -0.99
     assert "map_query_corr_flow_cosine_loss" in result["metrics"]
+
+
+def test_local_correlation_joint_loss_passes_intrinsics_to_context_heads():
+    class RecordingMatcher(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.seen_intrinsics = None
+
+        def forward(self, corr, depth=None, valid_mask=None, intrinsics=None):
+            self.seen_intrinsics = intrinsics
+            return corr
+
+    class RecordingFlowHead(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.seen_intrinsics = None
+
+        def forward(self, corr, depth=None, valid_mask=None, intrinsics=None):
+            self.seen_intrinsics = intrinsics
+            flow = corr.new_zeros(corr.shape[0], 2, corr.shape[2], corr.shape[3])
+            confidence = corr.new_ones(corr.shape[0], 1, corr.shape[2], corr.shape[3])
+            return {"flow": flow, "confidence": confidence}
+
+    height, width = 4, 5
+    matcher = RecordingMatcher()
+    flow_head = RecordingFlowHead()
+    intrinsics = torch.tensor([[20.0, 21.0, 2.0, 1.5]])
+
+    result = local_correlation_joint_losses(
+        torch.randn(1, 4, height, width),
+        torch.randn(1, 4, height, width),
+        torch.zeros(1, 2, height, width),
+        torch.ones(1, 1, height, width),
+        radius=1,
+        compute_flow=True,
+        matcher=matcher,
+        flow_head=flow_head,
+        depth=torch.ones(1, height, width),
+        intrinsics=intrinsics,
+    )
+
+    assert torch.isfinite(result["losses"]["flow"])
+    assert matcher.seen_intrinsics is intrinsics
+    assert flow_head.seen_intrinsics is intrinsics
 
 
 def test_flow_direction_loss_has_bounded_gradient_from_zero_flow():
@@ -1136,6 +2016,1270 @@ def test_map_supervision_coarse_pose_rank_prefers_gt_map_pose_over_perturbed_pos
     assert rendered_neg.grad is not None
 
 
+def test_map_supervision_global_coarse_pose_energy_uses_multiple_rendered_pose_negatives():
+    query_coarse = torch.tensor([[[[1.0]], [[0.0]], [[0.0]]]], requires_grad=True)
+    rendered_pos = torch.tensor([[[[1.0]], [[0.0]], [[0.0]]]], requires_grad=True)
+    rendered_neg = torch.tensor(
+        [[
+            [[[0.0]], [[1.0]], [[0.0]]],
+            [[[0.0]], [[0.0]], [[1.0]]],
+        ]],
+        requires_grad=True,
+    )
+    batch = {
+        "rendered_map_fine": torch.zeros(1, 3, 1, 1),
+        "rendered_map_fine_raw": torch.zeros(1, 3, 1, 1),
+        "rendered_map_coarse": rendered_pos,
+        "rendered_map_coarse_global_neg": rendered_neg,
+        "rendered_map_mask": torch.ones(1, 1, 1, 1),
+        "rendered_map_mask_global_neg": torch.ones(1, 2, 1, 1, 1),
+        "teacher_fine": torch.zeros(1, 3, 1, 1),
+        "teacher_coarse": torch.zeros(1, 3, 1, 1),
+    }
+    outputs = {
+        "fine": torch.zeros(1, 3, 1, 1, requires_grad=True),
+        "coarse": query_coarse,
+    }
+    cfg = {
+        "loss": {"infonce_temperature": 0.07, "infonce_samples": 8},
+        "map_supervision": {
+            "enabled": True,
+            "coarse_start_epoch": 0,
+            "coarse_pose_energy_weight": 1.0,
+            "coarse_pose_energy_temperature": 0.1,
+        },
+    }
+
+    good_loss, good_metrics = compute_map_supervision(batch, outputs, cfg, torch.device("cpu"), epoch=0)
+    good_loss.backward()
+
+    bad_batch = dict(batch)
+    bad_batch["rendered_map_coarse"] = rendered_neg[:, 0].detach()
+    bad_batch["rendered_map_coarse_global_neg"] = torch.stack(
+        [rendered_pos.detach(), rendered_neg[:, 1].detach()],
+        dim=1,
+    )
+    bad_loss, bad_metrics = compute_map_supervision(
+        bad_batch,
+        {"fine": outputs["fine"].detach(), "coarse": query_coarse.detach()},
+        cfg,
+        torch.device("cpu"),
+        epoch=0,
+    )
+
+    assert good_loss.item() < bad_loss.item()
+    assert good_metrics["map_coarse_pose_energy_acc"].item() == 1.0
+    assert bad_metrics["map_coarse_pose_energy_acc"].item() == 0.0
+    assert query_coarse.grad is not None
+    assert rendered_pos.grad is not None
+    assert rendered_neg.grad is not None
+
+
+def test_candidate_local_render_score_distinguishes_spatially_swapped_candidates_with_same_global_mean():
+    query_coarse = torch.tensor([[[[1.0, 0.0]], [[0.0, 1.0]]]], requires_grad=True)
+    rendered_pos = torch.tensor([[[[1.0, 0.0]], [[0.0, 1.0]]]], requires_grad=True)
+    rendered_neg = torch.tensor([[[[[0.0, 1.0]], [[1.0, 0.0]]]]], requires_grad=True)
+
+    loss, metrics = candidate_local_render_score_nce_loss(
+        query_coarse,
+        rendered_pos,
+        rendered_neg,
+        pos_mask=torch.ones(1, 1, 1, 2),
+        neg_mask=torch.ones(1, 1, 1, 1, 2),
+        temperature=0.1,
+        radius=0,
+    )
+    loss.backward()
+
+    assert metrics["map_coarse_pose_local_energy_acc"].item() == 1.0
+    assert metrics["map_coarse_pose_local_energy_gap"].item() > 0.9
+    assert query_coarse.grad is not None
+    assert rendered_pos.grad is not None
+    assert rendered_neg.grad is not None
+
+
+def test_map_supervision_coarse_pose_local_energy_prefers_gt_candidate_over_same_global_mean_negative():
+    query_coarse = torch.tensor([[[[1.0, 0.0]], [[0.0, 1.0]]]], requires_grad=True)
+    rendered_pos = torch.tensor([[[[1.0, 0.0]], [[0.0, 1.0]]]], requires_grad=True)
+    rendered_neg = torch.tensor([[[[[0.0, 1.0]], [[1.0, 0.0]]]]], requires_grad=True)
+    batch = {
+        "rendered_map_fine": torch.zeros(1, 2, 1, 2),
+        "rendered_map_fine_raw": torch.zeros(1, 2, 1, 2),
+        "rendered_map_coarse": rendered_pos,
+        "rendered_map_coarse_global_neg": rendered_neg,
+        "rendered_map_mask": torch.ones(1, 1, 1, 2),
+        "rendered_map_mask_global_neg": torch.ones(1, 1, 1, 1, 2),
+        "teacher_fine": torch.zeros(1, 2, 1, 2),
+        "teacher_coarse": torch.zeros(1, 2, 1, 2),
+    }
+    outputs = {
+        "fine": torch.zeros(1, 2, 1, 2, requires_grad=True),
+        "coarse": query_coarse,
+    }
+    cfg = {
+        "loss": {"infonce_temperature": 0.07, "infonce_samples": 8},
+        "map_supervision": {
+            "enabled": True,
+            "coarse_start_epoch": 0,
+            "coarse_pose_local_energy_weight": 1.0,
+            "coarse_pose_local_energy_temperature": 0.1,
+            "coarse_pose_local_energy_radius": 0,
+        },
+    }
+
+    good_loss, good_metrics = compute_map_supervision(batch, outputs, cfg, torch.device("cpu"), epoch=0)
+    good_loss.backward()
+
+    bad_batch = dict(batch)
+    bad_batch["rendered_map_coarse"] = rendered_neg[:, 0].detach()
+    bad_batch["rendered_map_coarse_global_neg"] = rendered_pos.detach().unsqueeze(1)
+    bad_loss, bad_metrics = compute_map_supervision(
+        bad_batch,
+        {"fine": outputs["fine"].detach(), "coarse": query_coarse.detach()},
+        cfg,
+        torch.device("cpu"),
+        epoch=0,
+    )
+
+    assert good_loss.item() < bad_loss.item()
+    assert good_metrics["map_coarse_pose_local_energy_acc"].item() == 1.0
+    assert bad_metrics["map_coarse_pose_local_energy_acc"].item() == 0.0
+    assert query_coarse.grad is not None
+    assert rendered_pos.grad is not None
+    assert rendered_neg.grad is not None
+
+
+def _pose_with_center(center):
+    pose = torch.eye(4)
+    pose[:3, 3] = -torch.tensor(center, dtype=torch.float32)
+    return pose
+
+
+def test_render_score_candidate_listwise_loss_targets_nearest_pose_and_scores_features():
+    query = torch.tensor(
+        [
+            [[[[1.0, 0.0]], [[0.0, 1.0]]]],
+            [[[[0.0, 1.0]], [[1.0, 0.0]]]],
+        ]
+    ).squeeze(1).clone().detach().requires_grad_(True)
+    candidates = torch.tensor(
+        [
+            [
+                [[[0.0, 1.0]], [[1.0, 0.0]]],
+                [[[1.0, 0.0]], [[0.0, 1.0]]],
+                [[[0.5, 0.5]], [[0.5, 0.5]]],
+            ],
+            [
+                [[[1.0, 0.0]], [[0.0, 1.0]]],
+                [[[0.5, 0.5]], [[0.5, 0.5]]],
+                [[[0.0, 1.0]], [[1.0, 0.0]]],
+            ],
+        ],
+        requires_grad=True,
+    )
+    candidate_pose = torch.stack(
+        [
+            torch.stack([
+                _pose_with_center([1.0, 0.0, 0.0]),
+                _pose_with_center([0.0, 0.0, 0.0]),
+                _pose_with_center([2.0, 0.0, 0.0]),
+            ]),
+            torch.stack([
+                _pose_with_center([2.0, 0.0, 0.0]),
+                _pose_with_center([1.0, 0.0, 0.0]),
+                _pose_with_center([0.0, 0.0, 0.0]),
+            ]),
+        ]
+    )
+    pose_gt = torch.stack([
+        _pose_with_center([0.0, 0.0, 0.0]),
+        _pose_with_center([0.0, 0.0, 0.0]),
+    ])
+
+    loss, metrics = render_score_candidate_listwise_loss(
+        query,
+        candidates,
+        candidate_pose,
+        pose_gt,
+        mode="global",
+        temperature=0.1,
+    )
+    loss.backward()
+
+    assert metrics["map_candidate_render_score_acc"].item() == 1.0
+    assert metrics["map_candidate_render_score_target_idx"].item() == 1.5
+    assert metrics["map_candidate_render_score_pred_idx"].item() == 1.5
+    assert query.grad is not None
+    assert candidates.grad is not None
+
+
+def test_render_score_candidate_listwise_loss_supports_local_mode_and_mask_bank():
+    query = torch.tensor([[[[1.0, 0.0, 0.0]], [[0.0, 1.0, 0.0]]]], requires_grad=True)
+    candidates = torch.tensor(
+        [[
+            [[[0.0, 1.0, 0.0]], [[0.0, 0.0, 1.0]]],
+            [[[0.0, 0.0, 1.0]], [[1.0, 0.0, 0.0]]],
+        ]],
+        requires_grad=True,
+    )
+    candidate_pose = torch.stack([
+        torch.stack([
+            _pose_with_center([0.0, 0.0, 0.0]),
+            _pose_with_center([1.0, 0.0, 0.0]),
+        ])
+    ])
+    pose_gt = _pose_with_center([0.0, 0.0, 0.0]).unsqueeze(0)
+    mask = torch.ones(1, 2, 1, 1, 3)
+
+    loss, metrics = render_score_candidate_listwise_loss(
+        query,
+        candidates,
+        candidate_pose,
+        pose_gt,
+        mask=mask,
+        mode="local",
+        radius=1,
+        temperature=0.1,
+    )
+    loss.backward()
+
+    assert metrics["map_candidate_render_score_acc"].item() == 1.0
+    assert metrics["map_candidate_render_score_pred_idx"].item() == 0.0
+    assert query.grad is not None
+    assert candidates.grad is not None
+
+
+def test_compute_map_supervision_adds_candidate_render_score_loss_when_candidates_attached():
+    query = torch.tensor([[[[1.0, 0.0]], [[0.0, 1.0]]]], requires_grad=True)
+    candidates = torch.tensor(
+        [[
+            [[[0.0, 1.0]], [[1.0, 0.0]]],
+            [[[1.0, 0.0]], [[0.0, 1.0]]],
+        ]],
+        requires_grad=True,
+    )
+    batch = {
+        "rendered_map_fine": torch.zeros(1, 2, 1, 2),
+        "rendered_map_fine_raw": torch.zeros(1, 2, 1, 2),
+        "rendered_map_coarse": torch.zeros(1, 2, 1, 2),
+        "rendered_map_mask": torch.ones(1, 1, 1, 2),
+        "teacher_fine": torch.zeros(1, 2, 1, 2),
+        "teacher_coarse": torch.zeros(1, 2, 1, 2),
+        "rendered_map_candidate_pose": torch.stack([
+            torch.stack([
+                _pose_with_center([1.0, 0.0, 0.0]),
+                _pose_with_center([0.0, 0.0, 0.0]),
+            ])
+        ]),
+        "rendered_map_candidate_coarse": candidates,
+        "rendered_map_candidate_mask": torch.ones(1, 2, 1, 1, 2),
+        "rendered_map_pose_gt": _pose_with_center([0.0, 0.0, 0.0]).unsqueeze(0),
+    }
+    outputs = {
+        "fine": torch.zeros(1, 2, 1, 2, requires_grad=True),
+        "coarse": query,
+    }
+    cfg = {
+        "loss": {"infonce_temperature": 0.07, "infonce_samples": 8},
+        "map_supervision": {
+            "enabled": True,
+            "coarse_start_epoch": 0,
+            "candidate_render_score_weight": 1.0,
+            "candidate_render_score_feature": "coarse",
+            "candidate_render_score_mode": "global",
+            "candidate_render_score_temperature": 0.1,
+        },
+    }
+
+    loss, metrics = compute_map_supervision(batch, outputs, cfg, torch.device("cpu"), epoch=0)
+    loss.backward()
+
+    skipped_loss, skipped_metrics = compute_map_supervision(
+        {k: v for k, v in batch.items() if not k.startswith("rendered_map_candidate")},
+        {"fine": outputs["fine"].detach(), "coarse": query.detach()},
+        cfg,
+        torch.device("cpu"),
+        epoch=0,
+    )
+
+    assert metrics["map_candidate_render_score_loss"].item() > 0.0
+    assert metrics["map_candidate_render_score_acc"].item() == 1.0
+    assert skipped_metrics["map_candidate_render_score_loss"].item() == 0.0
+    assert skipped_loss.item() == 0.0
+    assert query.grad is not None
+    assert candidates.grad is not None
+
+
+def test_map_feature_renderer_attach_pose_candidate_renders_shapes():
+    class FakeRenderer:
+        device = torch.device("cpu")
+        name_to_intr = {
+            "a.png": {"fx": 10.0, "fy": 11.0, "cx": 1.0, "cy": 2.0},
+            "b.png": {"fx": 12.0, "fy": 13.0, "cx": 3.0, "cy": 4.0},
+        }
+
+        def _render_pose(self, sample_name, pose, require_grad=False, feature="all"):
+            scale = float(pose[0, 3].item())
+            fine = torch.full((1, 2, 2, 3), scale)
+            coarse = torch.full((1, 3, 1, 2), scale + 1.0)
+            mask = torch.ones(1, 1, 1, 2)
+            zeros_f = torch.zeros_like(fine)
+            alpha = torch.ones(1, 1, 1, 2)
+            rgb = torch.zeros(1, 3, 1, 2)
+            depth = torch.ones(1, 1, 1, 2)
+            pos = torch.zeros(1, 3, 1, 2)
+            return zeros_f, fine, coarse, mask, alpha, rgb, depth, pos
+
+    renderer = FakeRenderer()
+    poses = torch.stack([
+        torch.stack([_pose_with_center([0.0, 0.0, 0.0]), _pose_with_center([1.0, 0.0, 0.0])]),
+        torch.stack([_pose_with_center([2.0, 0.0, 0.0]), _pose_with_center([3.0, 0.0, 0.0])]),
+    ])
+    batch = {"sample_name": ["a.png", "b.png"]}
+
+    train_impl.MapFeatureRenderer.attach_pose_candidate_renders(renderer, batch, poses, require_grad=False)
+
+    assert batch["rendered_map_candidate_pose"].shape == (2, 2, 4, 4)
+    assert batch["rendered_map_candidate_fine"].shape == (2, 2, 2, 2, 3)
+    assert batch["rendered_map_candidate_coarse"].shape == (2, 2, 3, 1, 2)
+    assert batch["rendered_map_candidate_mask"].shape == (2, 2, 1, 1, 2)
+    assert batch["rendered_map_candidate_depth"].shape == (2, 2, 1, 1, 2)
+    assert batch["rendered_map_candidate_intrinsics"].shape == (2, 2, 4)
+    assert torch.allclose(batch["rendered_map_candidate_pose"], poses)
+
+
+def test_map_feature_renderer_attach_pose_candidate_renders_supports_coarse_only():
+    class FakeRenderer:
+        device = torch.device("cpu")
+        name_to_intr = {"a.png": {"fx": 10.0, "fy": 10.0, "cx": 0.0, "cy": 0.0}}
+
+        def __init__(self):
+            self.requested_features = []
+
+        def _render_pose(self, sample_name, pose, require_grad=False, feature="all"):
+            self.requested_features.append(feature)
+            scale = float(pose[0, 3].item())
+            coarse = torch.full((1, 3, 1, 2), scale + 1.0)
+            mask = torch.ones(1, 1, 1, 2)
+            alpha = torch.ones(1, 1, 1, 2)
+            rgb = torch.zeros(1, 3, 1, 2)
+            depth = torch.ones(1, 1, 1, 2)
+            pos = torch.zeros(1, 3, 1, 2)
+            return None, None, coarse, mask, alpha, rgb, depth, pos
+
+    renderer = FakeRenderer()
+    poses = torch.stack([torch.stack([_pose_with_center([0.0, 0.0, 0.0])])])
+    batch = {"sample_name": ["a.png"]}
+
+    train_impl.MapFeatureRenderer.attach_pose_candidate_renders(
+        renderer,
+        batch,
+        poses,
+        require_grad=True,
+        feature="coarse",
+    )
+
+    assert renderer.requested_features == ["coarse"]
+    assert "rendered_map_candidate_fine" not in batch
+    assert batch["rendered_map_candidate_coarse"].shape == (1, 1, 3, 1, 2)
+    assert batch["rendered_map_candidate_depth"].shape == (1, 1, 1, 1, 2)
+
+
+def test_pose_candidate_cache_index_matches_sample_name_variants(tmp_path):
+    cache_path = tmp_path / "candidates.npz"
+    pose0 = _pose_with_center([0.0, 0.0, 0.0]).numpy().astype(np.float32)
+    pose1 = _pose_with_center([1.0, 0.0, 0.0]).numpy().astype(np.float32)
+    entries = [
+        {
+            "query_img_id": 1,
+            "query_image_name": "seq8/frame00110.png",
+            "query_image_stem": "seq8_frame00110",
+            "pose_init": pose0,
+            "init_source": "test",
+            "retrieval_frame_id": 2,
+            "retrieval_image_name": "seq1/frame00001.png",
+            "retrieval_score": 1.0,
+            "pose_init_candidates": np.stack([pose0, pose1], axis=0),
+            "candidate_valid_mask": np.asarray([True, False]),
+            "retrieval_frame_ids_candidates": np.asarray([2, 3], dtype=np.int64),
+            "retrieval_image_names_candidates": np.asarray(["a.png", "b.png"]),
+            "retrieval_scores_candidates": np.asarray([1.0, 0.5], dtype=np.float32),
+        }
+    ]
+    save_retrieval_init_entries(entries, {}, str(cache_path))
+
+    index = load_pose_candidate_cache_index(str(cache_path))
+
+    assert index["seq8/frame00110.png"]["pose_init_candidates"].shape == (2, 4, 4)
+    assert index["frame00110.png"]["candidate_valid_mask"].tolist() == [True, False]
+    assert index["seq8_frame00110"]["retrieval_scores_candidates"].tolist() == [1.0, 0.5]
+
+
+def test_joint_radio_dataset_loads_pose_candidate_quality_fields(tmp_path):
+    class FakeTeacherStore:
+        def load_pair(self, _idx):
+            return torch.zeros(2, 1, 2), torch.zeros(2, 1, 2)
+
+    cache_path = tmp_path / "candidates_quality.npz"
+    pose0 = _pose_with_center([0.0, 0.0, 0.0]).numpy().astype(np.float32)
+    pose1 = _pose_with_center([1.0, 0.0, 0.0]).numpy().astype(np.float32)
+    entries = [
+        {
+            "query_img_id": 1,
+            "query_image_name": "seq8/frame00110.png",
+            "query_image_stem": "seq8_frame00110",
+            "pose_init": pose0,
+            "init_source": "test",
+            "retrieval_frame_id": 2,
+            "retrieval_image_name": "a.png",
+            "retrieval_score": 1.0,
+            "pose_init_candidates": np.stack([pose0, pose1], axis=0),
+            "candidate_valid_mask": np.asarray([True, True]),
+            "retrieval_frame_ids_candidates": np.asarray([2, 3], dtype=np.int64),
+            "retrieval_image_names_candidates": np.asarray(["a.png", "b.png"]),
+            "retrieval_scores_candidates": np.asarray([100.0, 10.0], dtype=np.float32),
+            "retrieval_pnp_num_inliers_candidates": np.asarray([40.0, 5.0], dtype=np.float32),
+            "retrieval_pnp_reproj_median_candidates": np.asarray([0.5, 10.0], dtype=np.float32),
+            "retrieval_pnp_inlier_ratio_candidates": np.asarray([0.8, 0.1], dtype=np.float32),
+        }
+    ]
+    save_retrieval_init_entries(entries, {}, str(cache_path))
+    dataset = train_impl.JointRADIOQueryDataset(
+        [{"image_path": None, "teacher_idx": 0, "sample_name": "seq8/frame00110.png"}],
+        FakeTeacherStore(),
+        input_hw=(4, 4),
+        feature_hw=(1, 2),
+        synthetic_rgb=True,
+        pose_candidate_cache_index=load_pose_candidate_cache_index(str(cache_path)),
+        pose_candidate_topk=1,
+    )
+
+    item = dataset[0]
+
+    assert item["pose_init_candidates"].shape == (1, 4, 4)
+    assert item["retrieval_pnp_num_inliers_candidates"].tolist() == [40.0]
+    assert item["retrieval_pnp_reproj_median_candidates"].tolist() == [0.5]
+    assert torch.allclose(item["retrieval_pnp_inlier_ratio_candidates"], torch.tensor([0.8]))
+
+
+def test_candidate_quality_features_sanitize_and_normalize_priors():
+    batch = {
+        "retrieval_scores_candidates": torch.tensor([[100.0, 10.0, 1.0]]),
+        "retrieval_pnp_success_candidates": torch.tensor([[1.0, 1.0, 0.0]]),
+        "retrieval_pnp_num_inliers_candidates": torch.tensor([[40.0, 5.0, 0.0]]),
+        "retrieval_pnp_reproj_median_candidates": torch.tensor([[0.5, 10.0, float("inf")]]),
+        "retrieval_pnp_inlier_ratio_candidates": torch.tensor([[0.8, 0.1, 0.0]]),
+    }
+    valid = torch.tensor([[True, True, False]])
+
+    features, names = candidate_quality_features_from_batch(batch, valid_mask=valid)
+
+    assert features.shape[:2] == (1, 3)
+    assert "retrieval_pnp_reproj_median_quality" in names
+    assert torch.isfinite(features).all()
+    median_quality_idx = names.index("retrieval_pnp_reproj_median_quality")
+    assert features[0, 0, median_quality_idx] > features[0, 1, median_quality_idx]
+    assert torch.all(features[0, 2] == 0)
+
+
+def test_candidate_score_fusion_listwise_loss_uses_priors_and_backprops_to_features():
+    query = torch.tensor([[[[1.0]], [[0.0]]]], requires_grad=True)
+    candidates = torch.tensor(
+        [[
+            [[[0.0]], [[1.0]]],
+            [[[1.0]], [[0.0]]],
+        ]],
+        requires_grad=True,
+    )
+    candidate_pose = torch.stack([
+        torch.stack([
+            _pose_with_center([0.0, 0.0, 0.0]),
+            _pose_with_center([1.0, 0.0, 0.0]),
+        ])
+    ])
+    pose_gt = _pose_with_center([0.0, 0.0, 0.0]).unsqueeze(0)
+    batch = {
+        "retrieval_pnp_reproj_median_candidates": torch.tensor([[0.1, 20.0]]),
+        "retrieval_pnp_inlier_ratio_candidates": torch.tensor([[0.9, 0.1]]),
+    }
+    valid = torch.ones(1, 2, dtype=torch.bool)
+    prior_features, prior_names = candidate_quality_features_from_batch(batch, valid_mask=valid)
+    scorer = CandidateScoreFusionHead(input_dim=3 + prior_features.shape[-1], hidden_dim=0)
+    with torch.no_grad():
+        scorer.linear.weight.zero_()
+        scorer.linear.bias.zero_()
+        scorer.linear.weight[0, 0] = 0.25
+        scorer.linear.weight[0, 3 + prior_names.index("retrieval_pnp_reproj_median_quality")] = 1.0
+        scorer.linear.weight[0, 3 + prior_names.index("retrieval_pnp_inlier_ratio")] = 1.0
+
+    loss, metrics = candidate_score_fusion_listwise_loss(
+        query,
+        candidates,
+        candidate_pose,
+        pose_gt,
+        scorer,
+        batch=batch,
+        candidate_valid_mask=valid,
+        mode="global",
+        temperature=1.0,
+    )
+    loss.backward()
+
+    assert metrics["map_candidate_score_fusion_acc"].item() == 1.0
+    assert metrics["map_candidate_score_fusion_render_acc"].item() == 0.0
+    assert query.grad is not None and query.grad.abs().sum() > 0
+    assert candidates.grad is not None and candidates.grad.abs().sum() > 0
+    assert scorer.linear.weight.grad is not None and scorer.linear.weight.grad.abs().sum() > 0
+
+
+def test_candidate_score_fusion_soft_target_rewards_near_pose_candidates():
+    query = torch.tensor([[[[1.0]], [[0.0]]]], requires_grad=True)
+    candidates = torch.tensor(
+        [[
+            [[[1.0]], [[0.0]]],
+            [[[0.8]], [[0.2]]],
+            [[[0.0]], [[1.0]]],
+        ]],
+        requires_grad=True,
+    )
+    candidate_pose = torch.stack([
+        torch.stack([
+            _pose_with_center([0.00, 0.0, 0.0]),
+            _pose_with_center([0.08, 0.0, 0.0]),
+            _pose_with_center([1.00, 0.0, 0.0]),
+        ])
+    ])
+    pose_gt = _pose_with_center([0.0, 0.0, 0.0]).unsqueeze(0)
+    valid = torch.ones(1, 3, dtype=torch.bool)
+    scorer = CandidateScoreFusionHead(input_dim=12, hidden_dim=0)
+    with torch.no_grad():
+        scorer.linear.weight.zero_()
+        scorer.linear.bias.zero_()
+        scorer.linear.weight[0, 0] = 2.0
+
+    loss, metrics = candidate_score_fusion_listwise_loss(
+        query,
+        candidates,
+        candidate_pose,
+        pose_gt,
+        scorer,
+        batch={},
+        candidate_valid_mask=valid,
+        mode="global",
+        temperature=1.0,
+        target_mode="soft",
+        target_temperature_m=0.20,
+    )
+    loss.backward()
+
+    assert metrics["map_candidate_score_fusion_soft_target_entropy"].item() > 0.0
+    assert metrics["map_candidate_score_fusion_pred_trans_mm"].item() < 100.0
+    assert query.grad is not None and query.grad.abs().sum() > 0
+
+
+def test_candidate_score_fusion_cost_regression_rewards_full_candidate_ordering():
+    class FixedLogitScorer(torch.nn.Module):
+        def __init__(self, logits):
+            super().__init__()
+            self.logits = torch.nn.Parameter(torch.tensor(logits, dtype=torch.float32))
+
+        def forward(self, features):
+            return self.logits.unsqueeze(0).expand(features.shape[0], -1)
+
+    query = torch.tensor([[[[1.0]], [[0.0]]]])
+    candidates = torch.tensor(
+        [[
+            [[[1.0]], [[0.0]]],
+            [[[0.8]], [[0.2]]],
+            [[[0.0]], [[1.0]]],
+        ]]
+    )
+    candidate_pose = torch.stack([
+        torch.stack([
+            _pose_with_center([0.00, 0.0, 0.0]),
+            _pose_with_center([0.20, 0.0, 0.0]),
+            _pose_with_center([1.00, 0.0, 0.0]),
+        ])
+    ])
+    pose_gt = _pose_with_center([0.0, 0.0, 0.0]).unsqueeze(0)
+    valid = torch.ones(1, 3, dtype=torch.bool)
+    good_scorer = FixedLogitScorer([2.0, 0.0, -2.0])
+    bad_scorer = FixedLogitScorer([-2.0, 0.0, 2.0])
+
+    good_loss, good_metrics = candidate_score_fusion_listwise_loss(
+        query,
+        candidates,
+        candidate_pose,
+        pose_gt,
+        good_scorer,
+        candidate_valid_mask=valid,
+        mode="global",
+        temperature=1.0,
+        target_mode="soft",
+        target_temperature_m=0.20,
+        cost_regression_weight=1.0,
+        cost_regression_temperature_m=0.20,
+    )
+    bad_loss, bad_metrics = candidate_score_fusion_listwise_loss(
+        query,
+        candidates,
+        candidate_pose,
+        pose_gt,
+        bad_scorer,
+        candidate_valid_mask=valid,
+        mode="global",
+        temperature=1.0,
+        target_mode="soft",
+        target_temperature_m=0.20,
+        cost_regression_weight=1.0,
+        cost_regression_temperature_m=0.20,
+    )
+    good_loss.backward()
+
+    assert good_metrics["map_candidate_score_fusion_cost_regression_loss"] < bad_metrics[
+        "map_candidate_score_fusion_cost_regression_loss"
+    ]
+    assert good_loss.item() < bad_loss.item()
+    assert good_scorer.logits.grad is not None and good_scorer.logits.grad.abs().sum() > 0
+
+
+def test_candidate_score_fusion_pairwise_rank_rewards_cost_ordering():
+    class FixedLogitScorer(torch.nn.Module):
+        def __init__(self, logits):
+            super().__init__()
+            self.logits = torch.nn.Parameter(torch.tensor(logits, dtype=torch.float32))
+
+        def forward(self, features):
+            return self.logits.unsqueeze(0).expand(features.shape[0], -1)
+
+    query = torch.tensor([[[[1.0]], [[0.0]]]])
+    candidates = torch.tensor(
+        [[
+            [[[1.0]], [[0.0]]],
+            [[[0.7]], [[0.3]]],
+            [[[0.1]], [[0.9]]],
+        ]]
+    )
+    candidate_pose = torch.stack([
+        torch.stack([
+            _pose_with_center([0.00, 0.0, 0.0]),
+            _pose_with_center([0.15, 0.0, 0.0]),
+            _pose_with_center([0.80, 0.0, 0.0]),
+        ])
+    ])
+    pose_gt = _pose_with_center([0.0, 0.0, 0.0]).unsqueeze(0)
+    valid = torch.ones(1, 3, dtype=torch.bool)
+    good_scorer = FixedLogitScorer([2.0, 0.0, -2.0])
+    bad_scorer = FixedLogitScorer([-2.0, 0.0, 2.0])
+
+    good_loss, good_metrics = candidate_score_fusion_listwise_loss(
+        query,
+        candidates,
+        candidate_pose,
+        pose_gt,
+        good_scorer,
+        candidate_valid_mask=valid,
+        mode="global",
+        temperature=1.0,
+        target_mode="soft",
+        target_temperature_m=0.20,
+        pairwise_rank_weight=1.0,
+        pairwise_rank_temperature=1.0,
+        pairwise_rank_min_gap_m=0.05,
+    )
+    bad_loss, bad_metrics = candidate_score_fusion_listwise_loss(
+        query,
+        candidates,
+        candidate_pose,
+        pose_gt,
+        bad_scorer,
+        candidate_valid_mask=valid,
+        mode="global",
+        temperature=1.0,
+        target_mode="soft",
+        target_temperature_m=0.20,
+        pairwise_rank_weight=1.0,
+        pairwise_rank_temperature=1.0,
+        pairwise_rank_min_gap_m=0.05,
+    )
+    good_loss.backward()
+
+    assert good_metrics["map_candidate_score_fusion_pairwise_rank_loss"] < bad_metrics[
+        "map_candidate_score_fusion_pairwise_rank_loss"
+    ]
+    assert good_loss.item() < bad_loss.item()
+    assert good_scorer.logits.grad is not None and good_scorer.logits.grad.abs().sum() > 0
+
+
+def test_candidate_score_map_fusion_head_can_compare_candidates_with_context():
+    torch.manual_seed(7)
+    scorer = CandidateScoreMapFusionHead(
+        vector_dim=2,
+        score_map_channels=3,
+        map_channels=2,
+        grid_size=2,
+        hidden_dim=0,
+        context_layers=1,
+        context_heads=2,
+    )
+    score_maps = torch.randn(1, 3, 3, 5, 6)
+    vector_features = torch.randn(1, 3, 2)
+
+    logits = scorer(score_maps, vector_features)
+    changed_score_maps = score_maps.clone()
+    changed_score_maps[:, 1] = changed_score_maps[:, 1] + 2.0
+    changed_logits = scorer(changed_score_maps, vector_features)
+    logits.sum().backward()
+
+    assert logits.shape == (1, 3)
+    assert not torch.allclose(logits[:, 0], changed_logits[:, 0])
+    assert scorer.linear.weight.grad is not None and scorer.linear.weight.grad.abs().sum() > 0
+
+
+def test_candidate_score_map_fusion_context_residual_preserves_calibrated_prior():
+    torch.manual_seed(9)
+    vector_weights = [0.5, -0.25]
+    scorer = CandidateScoreMapFusionHead(
+        vector_dim=2,
+        score_map_channels=3,
+        map_channels=2,
+        grid_size=1,
+        hidden_dim=0,
+        initial_vector_weights=vector_weights,
+        initial_bias=0.1,
+        context_layers=1,
+        context_heads=1,
+        context_residual=True,
+    )
+    score_maps = torch.randn(2, 4, 3, 5, 5)
+    vector_features = torch.randn(2, 4, 2)
+
+    logits = scorer(score_maps, vector_features)
+    expected = vector_features @ torch.tensor(vector_weights, dtype=vector_features.dtype) + 0.1
+
+    assert torch.allclose(logits, expected, atol=1e-6)
+
+
+def test_candidate_score_fusion_wls_soft_target_uses_refined_pose_costs():
+    query = torch.tensor([[[[1.0, 0.0], [1.0, 0.0]], [[0.0, 1.0], [0.0, 1.0]]]], requires_grad=True)
+    candidates = torch.stack(
+        [
+            query.detach().squeeze(0),
+            torch.flip(query.detach().squeeze(0), dims=(-1,)),
+        ],
+        dim=0,
+    ).unsqueeze(0).requires_grad_()
+    candidate_pose = torch.stack([
+        torch.stack([
+            _pose_with_center([0.0, 0.0, 0.0]),
+            _pose_with_center([0.5, 0.0, 0.0]),
+        ])
+    ])
+    pose_gt = torch.stack([_pose_with_center([0.0, 0.0, 0.0])])
+    valid = torch.ones(1, 2, dtype=torch.bool)
+    batch = {
+        "rendered_map_candidate_depth": torch.ones(1, 2, 1, 2, 2),
+        "rendered_map_candidate_intrinsics": torch.tensor([[[20.0, 20.0, 0.5, 0.5], [20.0, 20.0, 0.5, 0.5]]]),
+    }
+    scorer = CandidateScoreFusionHead(input_dim=12, hidden_dim=0)
+
+    loss, metrics = candidate_score_fusion_listwise_loss(
+        query,
+        candidates,
+        candidate_pose,
+        pose_gt,
+        scorer,
+        batch=batch,
+        candidate_valid_mask=valid,
+        mode="global",
+        temperature=1.0,
+        target_mode="wls_soft",
+        target_temperature_m=0.20,
+        radius=0,
+        wls_downsample=2,
+    )
+    loss.backward()
+
+    assert metrics["map_candidate_score_fusion_wls_target_trans_mm"].item() < 1.0
+    assert "map_candidate_score_fusion_wls_pred_trans_mm" in metrics
+    assert query.grad is not None and query.grad.abs().sum() > 0
+    assert candidates.grad is not None and candidates.grad.abs().sum() > 0
+
+
+def test_masked_score_map_stats_capture_peakiness_beyond_mean():
+    score_map = torch.tensor(
+        [
+            [[[1.0, 0.0], [0.0, 0.0]]],
+            [[[0.25, 0.25], [0.25, 0.25]]],
+        ]
+    )
+
+    stats = train_impl._masked_score_map_stats(score_map)
+
+    assert torch.allclose(stats["mean"], torch.tensor([0.25, 0.25]))
+    assert stats["max"][0] > stats["max"][1]
+    assert stats["topk_mean"][0] > stats["topk_mean"][1]
+    assert stats["peakiness"][0] > stats["peakiness"][1]
+
+
+def test_candidate_score_fusion_rich_render_features_match_head_dim_and_backprop():
+    query = F.normalize(torch.randn(1, 4, 4, 4), dim=1).requires_grad_()
+    candidates = F.normalize(torch.randn(1, 2, 4, 4, 4), dim=2).requires_grad_()
+    candidate_pose = torch.stack([
+        torch.stack([
+            _pose_with_center([0.0, 0.0, 0.0]),
+            _pose_with_center([0.5, 0.0, 0.0]),
+        ])
+    ])
+    pose_gt = torch.stack([_pose_with_center([0.0, 0.0, 0.0])])
+    scorer = CandidateScoreFusionHead(input_dim=18, hidden_dim=0)
+
+    loss, metrics = candidate_score_fusion_listwise_loss(
+        query,
+        candidates,
+        candidate_pose,
+        pose_gt,
+        scorer,
+        render_feature_mode="rich",
+    )
+    loss.backward()
+
+    assert metrics["map_candidate_score_fusion_loss"].item() > 0
+    assert query.grad is not None and query.grad.abs().sum() > 0
+    assert candidates.grad is not None and candidates.grad.abs().sum() > 0
+    assert scorer.linear.weight.grad is not None and scorer.linear.weight.grad.abs().sum() > 0
+
+
+def test_candidate_score_map_fusion_head_uses_spatial_score_maps():
+    score_maps = torch.randn(2, 3, 3, 5, 7, requires_grad=True)
+    vector_features = torch.randn(2, 3, 4, requires_grad=True)
+    scorer = CandidateScoreMapFusionHead(
+        vector_dim=4,
+        score_map_channels=3,
+        map_channels=4,
+        grid_size=2,
+        hidden_dim=8,
+    )
+
+    logits = scorer(score_maps, vector_features)
+    logits.sum().backward()
+
+    assert logits.shape == (2, 3)
+    assert score_maps.grad is not None and score_maps.grad.abs().sum() > 0
+    assert vector_features.grad is not None and vector_features.grad.abs().sum() > 0
+
+
+def test_candidate_score_map_fusion_head_can_initialize_vector_prior():
+    score_maps = torch.randn(1, 2, 1, 3, 3)
+    vector_features = torch.tensor([[[2.0, 4.0], [1.0, -1.0]]])
+    scorer = CandidateScoreMapFusionHead(
+        vector_dim=2,
+        score_map_channels=1,
+        map_channels=2,
+        grid_size=1,
+        hidden_dim=0,
+        initial_vector_weights=[1.5, -0.5],
+        initial_bias=0.25,
+    )
+
+    logits = scorer(score_maps, vector_features)
+
+    assert torch.allclose(logits, torch.tensor([[[1.25], [2.25]]]).squeeze(-1))
+
+
+def test_candidate_score_fusion_listwise_loss_can_use_score_map_head():
+    query = F.normalize(torch.randn(1, 4, 4, 5), dim=1).requires_grad_()
+    candidates = F.normalize(torch.randn(1, 2, 4, 4, 5), dim=2).requires_grad_()
+    candidate_pose = torch.stack([
+        torch.stack([
+            _pose_with_center([0.0, 0.0, 0.0]),
+            _pose_with_center([0.4, 0.0, 0.0]),
+        ])
+    ])
+    pose_gt = torch.stack([_pose_with_center([0.0, 0.0, 0.0])])
+    scorer = CandidateScoreMapFusionHead(
+        vector_dim=12,
+        score_map_channels=3,
+        map_channels=4,
+        grid_size=2,
+        hidden_dim=8,
+    )
+
+    loss, metrics = candidate_score_fusion_listwise_loss(
+        query,
+        candidates,
+        candidate_pose,
+        pose_gt,
+        scorer,
+        mode="local",
+        radius=1,
+    )
+    loss.backward()
+
+    assert metrics["map_candidate_score_fusion_loss"].item() > 0
+    assert query.grad is not None and query.grad.abs().sum() > 0
+    assert candidates.grad is not None and candidates.grad.abs().sum() > 0
+
+
+def test_candidate_score_fusion_listwise_loss_can_use_correlation_volume_score_map_head():
+    query = F.normalize(torch.randn(1, 4, 4, 5), dim=1).requires_grad_()
+    candidates = F.normalize(torch.randn(1, 2, 4, 4, 5), dim=2).requires_grad_()
+    candidate_pose = torch.stack([
+        torch.stack([
+            _pose_with_center([0.0, 0.0, 0.0]),
+            _pose_with_center([0.4, 0.0, 0.0]),
+        ])
+    ])
+    pose_gt = torch.stack([_pose_with_center([0.0, 0.0, 0.0])])
+    scorer = CandidateScoreMapFusionHead(
+        vector_dim=12,
+        score_map_channels=25,
+        map_channels=4,
+        grid_size=2,
+        hidden_dim=8,
+    )
+
+    loss, metrics = candidate_score_fusion_listwise_loss(
+        query,
+        candidates,
+        candidate_pose,
+        pose_gt,
+        scorer,
+        mode="local",
+        radius=2,
+        score_map_mode="volume",
+    )
+    loss.backward()
+
+    assert metrics["map_candidate_score_fusion_loss"].item() > 0
+    assert query.grad is not None and query.grad.abs().sum() > 0
+    assert candidates.grad is not None and candidates.grad.abs().sum() > 0
+
+
+def test_radio_query_student_can_build_candidate_score_map_fusion_head():
+    model = RadioQueryStudent(
+        candidate_score_map_fusion_head=True,
+        candidate_score_fusion_input_dim=12,
+        candidate_score_map_fusion_channels=3,
+        candidate_score_map_fusion_map_channels=4,
+        candidate_score_map_fusion_grid_size=2,
+        candidate_score_map_fusion_hidden_dim=8,
+    )
+
+    assert isinstance(model.candidate_score_fusion_head, CandidateScoreMapFusionHead)
+
+
+def test_candidate_score_fusion_head_supports_explicit_linear_initialization():
+    scorer = CandidateScoreFusionHead(
+        input_dim=4,
+        hidden_dim=0,
+        initial_weights=[0.1, 0.2, 0.3, 0.4],
+        initial_bias=-0.5,
+    )
+
+    assert torch.allclose(scorer.linear.weight, torch.tensor([[0.1, 0.2, 0.3, 0.4]]))
+    assert torch.allclose(scorer.linear.bias, torch.tensor([-0.5]))
+
+
+def test_compute_map_supervision_uses_candidate_score_fusion_head():
+    query = torch.tensor([[[[1.0]], [[0.0]]]], requires_grad=True)
+    candidates = torch.tensor(
+        [[
+            [[[0.0]], [[1.0]]],
+            [[[1.0]], [[0.0]]],
+        ]],
+        requires_grad=True,
+    )
+    valid = torch.ones(1, 2, dtype=torch.bool)
+    batch = {
+        "rendered_map_fine": torch.zeros(1, 2, 1, 1),
+        "rendered_map_fine_raw": torch.zeros(1, 2, 1, 1),
+        "rendered_map_coarse": torch.zeros(1, 2, 1, 1),
+        "rendered_map_mask": torch.ones(1, 1, 1, 1),
+        "teacher_fine": torch.zeros(1, 2, 1, 1),
+        "teacher_coarse": torch.zeros(1, 2, 1, 1),
+        "rendered_map_candidate_pose": torch.stack([
+            torch.stack([
+                _pose_with_center([0.0, 0.0, 0.0]),
+                _pose_with_center([1.0, 0.0, 0.0]),
+            ])
+        ]),
+        "rendered_map_candidate_coarse": candidates,
+        "rendered_map_candidate_mask": torch.ones(1, 2, 1, 1, 1),
+        "rendered_map_candidate_valid_mask": valid,
+        "rendered_map_pose_gt": _pose_with_center([0.0, 0.0, 0.0]).unsqueeze(0),
+        "retrieval_pnp_reproj_median_candidates": torch.tensor([[0.1, 20.0]]),
+        "retrieval_pnp_inlier_ratio_candidates": torch.tensor([[0.9, 0.1]]),
+    }
+    prior_features, prior_names = candidate_quality_features_from_batch(batch, valid_mask=valid)
+    scorer = CandidateScoreFusionHead(input_dim=3 + prior_features.shape[-1], hidden_dim=0)
+    with torch.no_grad():
+        scorer.linear.weight.zero_()
+        scorer.linear.bias.zero_()
+        scorer.linear.weight[0, 0] = 0.25
+        scorer.linear.weight[0, 3 + prior_names.index("retrieval_pnp_reproj_median_quality")] = 1.0
+        scorer.linear.weight[0, 3 + prior_names.index("retrieval_pnp_inlier_ratio")] = 1.0
+    outputs = {
+        "fine": torch.zeros(1, 2, 1, 1, requires_grad=True),
+        "coarse": query,
+    }
+    cfg = {
+        "loss": {"infonce_temperature": 0.07, "infonce_samples": 8},
+        "map_supervision": {
+            "enabled": True,
+            "coarse_start_epoch": 0,
+            "candidate_score_fusion_weight": 1.0,
+            "candidate_score_fusion_feature": "coarse",
+            "candidate_score_fusion_mode": "global",
+            "candidate_score_fusion_temperature": 1.0,
+        },
+    }
+
+    loss, metrics = compute_map_supervision(
+        batch,
+        outputs,
+        cfg,
+        torch.device("cpu"),
+        epoch=0,
+        candidate_score_fusion_head=scorer,
+    )
+    loss.backward()
+
+    assert metrics["map_candidate_score_fusion_loss"].item() > 0
+    assert metrics["map_candidate_score_fusion_acc"].item() == 1.0
+    assert query.grad is not None and query.grad.abs().sum() > 0
+    assert candidates.grad is not None and candidates.grad.abs().sum() > 0
+    assert scorer.linear.weight.grad is not None and scorer.linear.weight.grad.abs().sum() > 0
+
+
+def test_gather_candidate_bank_selects_arbitrary_topm_and_mask():
+    values = torch.arange(2 * 4 * 3, dtype=torch.float32).reshape(2, 4, 3)
+    indices = torch.tensor([[2, 0], [3, 1]])
+
+    gathered = train_impl.gather_candidate_bank(values, indices)
+
+    assert torch.allclose(gathered[0, 0], values[0, 2])
+    assert torch.allclose(gathered[0, 1], values[0, 0])
+    assert torch.allclose(gathered[1, 0], values[1, 3])
+    assert torch.allclose(gathered[1, 1], values[1, 1])
+
+
+def test_select_candidate_stage2_indices_can_teacher_force_oracle_candidates():
+    valid = torch.tensor([[True, True, False, True]])
+    pose_cost = torch.tensor([[0.30, 0.10, 0.01, 0.20]])
+
+    selected = train_impl.select_candidate_stage2_indices(
+        valid=valid,
+        topm=2,
+        selection="oracle",
+        pose_cost=pose_cost,
+    )
+
+    assert selected.tolist() == [[1, 3]]
+
+
+def test_compute_map_supervision_rerenders_predicted_topm_for_refined_pose_loss():
+    class FakeRenderer:
+        def __init__(self):
+            self.selected_pose = None
+            self.selected_prefix = None
+            self.selected_require_grad = None
+
+        def attach_pose_candidate_renders(self, batch, candidate_poses, **kwargs):
+            self.selected_pose = candidate_poses.detach().clone()
+            self.selected_prefix = kwargs.get("prefix")
+            self.selected_require_grad = bool(kwargs.get("require_grad", False))
+            prefix = self.selected_prefix
+            batch[f"{prefix}_pose"] = candidate_poses
+            batch[f"{prefix}_coarse"] = batch["rerendered_candidate_coarse"]
+            batch[f"{prefix}_mask"] = torch.ones(1, candidate_poses.shape[1], 1, 2, 2)
+            batch[f"{prefix}_depth"] = torch.ones(1, candidate_poses.shape[1], 1, 2, 2)
+            batch[f"{prefix}_intrinsics"] = torch.tensor([[[20.0, 20.0, 0.5, 0.5]]])
+            batch[f"{prefix}_valid_mask"] = torch.ones(1, candidate_poses.shape[1], dtype=torch.bool)
+            return batch
+
+    query = torch.tensor(
+        [[[[1.0, 0.0], [1.0, 0.0]], [[0.0, 1.0], [0.0, 1.0]]]],
+        requires_grad=True,
+    )
+    first_stage_candidates = torch.zeros(1, 3, 2, 2, 2, requires_grad=True)
+    refine_candidate = query.detach().unsqueeze(1).clone().requires_grad_()
+    candidate_pose = torch.stack([
+        torch.stack([
+            _pose_with_center([0.0, 0.0, 0.0]),
+            _pose_with_center([0.3, 0.0, 0.0]),
+            _pose_with_center([0.6, 0.0, 0.0]),
+        ])
+    ])
+    valid = torch.ones(1, 3, dtype=torch.bool)
+    batch = {
+        "rendered_map_fine": torch.zeros(1, 2, 2, 2),
+        "rendered_map_fine_raw": torch.zeros(1, 2, 2, 2),
+        "rendered_map_coarse": torch.zeros(1, 2, 2, 2),
+        "rendered_map_mask": torch.ones(1, 1, 2, 2),
+        "teacher_fine": torch.zeros(1, 2, 2, 2),
+        "teacher_coarse": torch.zeros(1, 2, 2, 2),
+        "rendered_map_candidate_pose": candidate_pose,
+        "rendered_map_candidate_coarse": first_stage_candidates,
+        "rendered_map_candidate_mask": torch.ones(1, 3, 1, 2, 2),
+        "rendered_map_candidate_valid_mask": valid,
+        "rendered_map_pose_gt": _pose_with_center([0.0, 0.0, 0.0]).unsqueeze(0),
+        "retrieval_pnp_inlier_ratio_candidates": torch.tensor([[0.0, 0.0, 1.0]]),
+        "rerendered_candidate_coarse": refine_candidate,
+    }
+    prior_features, prior_names = candidate_quality_features_from_batch(batch, valid_mask=valid)
+    scorer = CandidateScoreFusionHead(input_dim=3 + prior_features.shape[-1], hidden_dim=0)
+    with torch.no_grad():
+        scorer.linear.weight.zero_()
+        scorer.linear.bias.zero_()
+        scorer.linear.weight[0, 3 + prior_names.index("retrieval_pnp_inlier_ratio")] = 5.0
+    outputs = {
+        "fine": torch.zeros(1, 2, 2, 2, requires_grad=True),
+        "coarse": query,
+    }
+    cfg = {
+        "loss": {"infonce_temperature": 0.07, "infonce_samples": 8},
+        "map_supervision": {
+            "enabled": True,
+            "coarse_start_epoch": 0,
+            "candidate_score_fusion_weight": 1.0,
+            "candidate_score_fusion_feature": "coarse",
+            "candidate_score_fusion_mode": "global",
+            "candidate_score_fusion_temperature": 1.0,
+            "candidate_two_stage_enabled": True,
+            "candidate_stage2_topm": 1,
+            "candidate_stage2_selection": "pred",
+            "candidate_stage2_train_map": True,
+            "candidate_refined_pose_weight": 1.0,
+            "candidate_refined_pose_feature": "coarse",
+            "candidate_refined_pose_radius": 1,
+            "candidate_refined_pose_wls_downsample": 1,
+        },
+    }
+    renderer = FakeRenderer()
+
+    loss, metrics = compute_map_supervision(
+        batch,
+        outputs,
+        cfg,
+        torch.device("cpu"),
+        epoch=0,
+        candidate_score_fusion_head=scorer,
+        map_renderer=renderer,
+    )
+    loss.backward()
+
+    assert renderer.selected_prefix == "rendered_map_candidate_refine"
+    assert renderer.selected_require_grad
+    assert torch.allclose(renderer.selected_pose, candidate_pose[:, 2:3])
+    assert metrics["map_candidate_refined_pose_loss"].item() >= 0.0
+    assert metrics["map_candidate_refined_pose_selected_init_trans_mm"].item() == 600.0
+    assert query.grad is not None and query.grad.abs().sum() > 0
+    assert refine_candidate.grad is not None and refine_candidate.grad.abs().sum() > 0
+
+
+def test_maybe_attach_pose_candidate_renders_can_use_batch_candidate_cache():
+    class FakeRenderer:
+        device = torch.device("cpu")
+
+        def attach_pose_candidate_renders(self, batch, candidate_poses, **kwargs):
+            batch["rendered_map_candidate_pose"] = candidate_poses
+            batch["rendered_map_candidate_valid_mask"] = kwargs.get("candidate_valid_mask")
+            batch["rendered_map_candidate_require_grad"] = torch.tensor(float(kwargs.get("require_grad", False)))
+            return batch
+
+    poses = torch.stack([torch.stack([_pose_with_center([0.0, 0.0, 0.0])])])
+    valid = torch.ones(1, 1, dtype=torch.bool)
+    batch = {"pose_init_candidates": poses, "candidate_valid_mask": valid}
+    cfg = {
+        "map_supervision": {
+            "enabled": True,
+            "candidate_render_score_weight": 1.0,
+            "candidate_render_pose_source": "batch",
+            "candidate_render_score_train_map": False,
+        }
+    }
+
+    out = maybe_attach_pose_candidate_renders(
+        batch,
+        outputs={},
+        cfg=cfg,
+        map_renderer=FakeRenderer(),
+        require_grad=True,
+        epoch=0,
+    )
+
+    assert torch.allclose(out["rendered_map_candidate_pose"], poses)
+    assert out["rendered_map_candidate_valid_mask"] is valid
+    assert out["rendered_map_candidate_require_grad"].item() == 0.0
+
+
+def test_maybe_attach_pose_candidate_renders_can_use_online_pose_init_scores():
+    class FakeRenderer:
+        device = torch.device("cpu")
+
+        def attach_pose_candidate_renders(self, batch, candidate_poses, **kwargs):
+            batch["rendered_map_candidate_pose"] = candidate_poses
+            batch["rendered_map_candidate_valid_mask"] = kwargs.get("candidate_valid_mask")
+            return batch
+
+    poses = torch.stack(
+        [
+            torch.stack(
+                [
+                    _pose_with_center([0.0, 0.0, 0.0]),
+                    _pose_with_center([0.2, 0.0, 0.0]),
+                ]
+            )
+        ]
+    )
+    scores = torch.tensor([[2.0, -1.0]])
+    batch = {"sample_name": ["seq/frame.png"]}
+    outputs = {"pose_init": {"pose_w2c": poses, "scores": scores}}
+    cfg = {
+        "map_supervision": {
+            "enabled": True,
+            "candidate_score_fusion_weight": 1.0,
+            "candidate_render_pose_source": "feature_bank_online",
+            "candidate_render_score_train_map": False,
+        }
+    }
+
+    out = maybe_attach_pose_candidate_renders(
+        batch,
+        outputs=outputs,
+        cfg=cfg,
+        map_renderer=FakeRenderer(),
+        require_grad=True,
+        epoch=0,
+    )
+
+    assert torch.allclose(out["rendered_map_candidate_pose"], poses)
+    assert torch.equal(out["rendered_map_candidate_valid_mask"], torch.ones(1, 2, dtype=torch.bool))
+    assert torch.allclose(out["retrieval_original_scores_candidates"], scores)
+    assert torch.allclose(out["retrieval_scores_candidates"], torch.tensor([[3.0, 0.0]]))
+
+
+def test_should_preattach_pose_candidate_renders_only_for_batch_sources():
+    cfg = {
+        "map_supervision": {
+            "enabled": True,
+            "candidate_render_pose_source": "batch",
+            "candidate_render_score_weight": 0.0,
+            "candidate_score_fusion_weight": 1.0,
+        }
+    }
+
+    assert train_impl.should_preattach_pose_candidate_renders(cfg, epoch=0)
+
+    cfg["map_supervision"]["candidate_render_pose_source"] = "pose_init"
+    assert not train_impl.should_preattach_pose_candidate_renders(cfg, epoch=0)
+
+    cfg["map_supervision"]["candidate_render_pose_source"] = "batch"
+    cfg["map_supervision"]["candidate_score_fusion_weight"] = 0.0
+    assert not train_impl.should_preattach_pose_candidate_renders(cfg, epoch=0)
+
+
 def test_query_student_can_use_higher_localization_resolution_than_teacher():
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -1474,6 +3618,44 @@ def test_map_supervision_applies_depth_aware_local_correlation_loss():
     assert torch.isfinite(loss)
     assert metrics["map_query_corr_subpx_loss"].item() > 0
     assert query.grad is not None
+
+
+def test_map_supervision_reports_query_corr_skip_when_negatives_missing():
+    h, w = 6, 6
+    query = torch.randn(1, 6, h, w, requires_grad=True)
+    batch = {
+        "rendered_map_fine": torch.randn(1, 6, h, w),
+        "rendered_map_fine_raw": torch.randn(1, 6, h, w),
+        "rendered_map_coarse": torch.randn(1, 6, 3, 3),
+        "rendered_map_mask": torch.ones(1, 1, h, w),
+        "teacher_fine": torch.randn(1, 6, h, w),
+        "teacher_coarse": torch.randn(1, 6, 3, 3),
+    }
+    outputs = {
+        "fine": query,
+        "coarse": torch.randn(1, 6, 3, 3, requires_grad=True),
+    }
+    cfg = {
+        "loss": {"infonce_temperature": 0.07, "infonce_samples": 8},
+        "map_supervision": {
+            "enabled": True,
+            "query_fine_weight": 0.0,
+            "query_coarse_weight": 0.0,
+            "rendered_teacher_fine_weight": 0.0,
+            "rendered_teacher_coarse_weight": 0.0,
+            "query_corr_subpixel_weight": 1.0,
+            "query_corr_radius": 1,
+            "query_corr_temperature": 0.05,
+            "coarse_start_epoch": 0,
+        },
+    }
+
+    loss, metrics = compute_map_supervision(batch, outputs, cfg, torch.device("cpu"), epoch=0)
+
+    assert torch.isfinite(loss)
+    assert metrics["map_query_corr_skipped_missing_negatives"].item() == 1.0
+    assert metrics["map_query_corr_missing_rendered_map_fine_neg"].item() == 1.0
+    assert metrics["map_query_corr_missing_rendered_map_flow_neg_to_gt"].item() == 1.0
 
 
 def test_map_supervision_applies_query_corr_distribution_distillation():
@@ -2659,6 +4841,87 @@ def test_map_supervision_applies_feature_metric_pose_loss():
     assert query.grad is not None
 
 
+def test_feature_metric_pose_loss_can_use_local_corr_projector():
+    class ChannelSliceProjector(torch.nn.Module):
+        def forward(self, feat):
+            return feat[:, :3] * 2.0
+
+    h, w = 8, 8
+    rendered = torch.randn(1, 6, h, w)
+    query = torch.randn(1, 6, h, w, requires_grad=True)
+    pose_gt = torch.eye(4).unsqueeze(0)
+    pose_neg = perturb_w2c_camera_center(pose_gt, torch.tensor([[0.02, 0.0, 0.0]]), frame="camera")
+    batch = {
+        "rendered_map_fine": rendered.clone(),
+        "rendered_map_fine_raw": rendered.clone(),
+        "rendered_map_coarse": torch.randn(1, 6, 4, 4),
+        "rendered_map_mask": torch.ones(1, 1, h, w),
+        "rendered_map_fine_neg": rendered.clone(),
+        "rendered_map_mask_neg": torch.ones(1, 1, h, w),
+        "rendered_map_depth_neg": torch.ones(1, 1, h, w),
+        "rendered_map_flow_valid_neg_to_gt": torch.ones(1, 1, h, w),
+        "rendered_map_intrinsics": torch.tensor([[20.0, 20.0, (w - 1) / 2.0, (h - 1) / 2.0]]),
+        "rendered_map_pose_gt": pose_gt,
+        "rendered_map_pose_neg": pose_neg,
+        "teacher_fine": rendered.clone(),
+        "teacher_coarse": torch.randn(1, 6, 4, 4),
+    }
+    outputs = {
+        "fine": query,
+        "coarse": torch.randn(1, 6, 4, 4, requires_grad=True),
+    }
+    cfg = {
+        "loss": {"infonce_temperature": 0.07, "infonce_samples": 8},
+        "map_supervision": {
+            "enabled": True,
+            "query_fine_weight": 0.0,
+            "query_coarse_weight": 0.0,
+            "rendered_teacher_fine_weight": 0.0,
+            "rendered_teacher_coarse_weight": 0.0,
+            "local_corr_projector_enabled": True,
+            "feature_metric_use_projector": True,
+            "feature_metric_pose_weight": 1.0,
+            "feature_metric_pose_trans_weight": 10.0,
+            "feature_metric_pose_rot_weight": 0.0,
+            "feature_metric_pose_normalize": False,
+            "coarse_start_epoch": 0,
+        },
+    }
+    captured_shapes = []
+    original = train_impl.feature_metric_localization_loss
+
+    def fake_feature_metric(query_feat, rendered_feat, *args, **kwargs):
+        captured_shapes.append((tuple(query_feat.shape), tuple(rendered_feat.shape)))
+        zero = query_feat.sum() * 0.0 + rendered_feat.sum() * 0.0
+        return zero + 1.0, {
+            "map_feature_metric_pose_loss": zero + 1.0,
+            "map_feature_metric_init_trans_err_mm": zero + 10.0,
+            "map_feature_metric_trans_err_mm": zero + 9.0,
+            "map_feature_metric_trans_gain_mm": zero + 1.0,
+            "map_feature_metric_delta_trans_mm": zero,
+            "map_feature_metric_rot_err_deg": zero,
+            "map_feature_metric_init_rot_err_deg": zero,
+            "map_feature_metric_residual_l1": zero,
+        }
+
+    try:
+        train_impl.feature_metric_localization_loss = fake_feature_metric
+        loss, metrics = compute_map_supervision(
+            batch,
+            outputs,
+            cfg,
+            torch.device("cpu"),
+            epoch=0,
+            local_corr_projector=ChannelSliceProjector(),
+        )
+    finally:
+        train_impl.feature_metric_localization_loss = original
+
+    assert torch.isfinite(loss)
+    assert metrics["map_feature_metric_pose_loss"].item() == 1.0
+    assert captured_shapes == [((1, 3, h, w), (1, 3, h, w))]
+
+
 def test_map_supervision_applies_map_self_feature_metric_pose_loss():
     h, w = 8, 8
     v, u = torch.meshgrid(
@@ -2825,6 +5088,8 @@ if __name__ == "__main__":
     test_radio_query_student_fine_low_level_skip_receives_gradients()
     test_radio_query_student_fine_highres_skip_receives_gradients()
     test_radio_query_student_fine_highres_zero_init_starts_as_residual_noop()
+    test_radio_query_student_global_context_zero_init_starts_as_residual_noop()
+    test_radio_query_student_window_attention_zero_init_starts_as_residual_noop()
     test_radio_query_student_fine_loc_head_starts_as_noop_and_receives_gradients()
     test_radio_query_student_fine_loc_direct_mode_is_independent_from_base_fine()
     test_radio_query_student_fine_loc_can_detach_base_descriptor()

@@ -1,0 +1,6 @@
+base_config: joint_radio_dcff_cambridge_oldhospital_processed_pca64_depthaware_v65_unified_attn_residual_spatial_alignfirst.yaml
+exp_name: joint_radio_dcff_cambridge_oldhospital_processed_pca64_depthaware_v68_unified_attn_residual_spatial_alignfirst_stop640
+
+training:
+  seed: 165
+  max_steps: 640

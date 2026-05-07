@@ -1,0 +1,8 @@
+base_config: concat_loc_cambridge_oldhospital_processed_locguided_dcff_highres_depthaware_v17_selfmap_export_corrwls_probe.yaml
+exp_name: concat_loc_cambridge_oldhospital_processed_locguided_dcff_highres_depthaware_v17_selfmap_export_corrwls_probe_extproj_scale050
+
+model:
+  pose_update_scale: 0.50
+  external_local_corr_projector:
+    sync_corr_settings: false
+    sync_pose_update_scale: false

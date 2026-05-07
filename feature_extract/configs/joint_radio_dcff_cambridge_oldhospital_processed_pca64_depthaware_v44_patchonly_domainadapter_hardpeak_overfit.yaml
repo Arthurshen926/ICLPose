@@ -1,0 +1,8 @@
+base_config: joint_radio_dcff_cambridge_oldhospital_processed_pca64_depthaware_v43_patchonly_domainadapter_overfit.yaml
+exp_name: joint_radio_dcff_cambridge_oldhospital_processed_pca64_depthaware_v44_patchonly_domainadapter_hardpeak_overfit
+
+map_supervision:
+  teacher_corr_local_patch_temperature: 0.02
+  teacher_corr_local_patch_positive_weight: 2.0
+  teacher_corr_local_patch_margin_weight: 20.0
+  teacher_corr_local_patch_margin: 0.08

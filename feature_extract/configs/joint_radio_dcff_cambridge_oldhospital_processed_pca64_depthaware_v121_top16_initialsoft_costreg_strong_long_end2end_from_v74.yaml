@@ -1,0 +1,10 @@
+base_config: joint_radio_dcff_cambridge_oldhospital_processed_pca64_depthaware_v116_top16_initialsoft_costreg_end2end_from_v74.yaml
+exp_name: joint_radio_dcff_cambridge_oldhospital_processed_pca64_depthaware_v121_top16_initialsoft_costreg_strong_long_end2end_from_v74
+
+training:
+  seed: 221
+  max_steps: 1600
+
+map_supervision:
+  candidate_score_fusion_cost_regression_weight: 2.0
+  candidate_score_fusion_cost_regression_temperature_m: 0.20

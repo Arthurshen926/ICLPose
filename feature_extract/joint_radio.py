@@ -144,11 +144,12 @@ def safe_torch_load(path: str | Path):
         return torch.load(path, map_location="cpu")
 
 
-def parse_cambridge_split(split_path: str | Path) -> set[str]:
+def parse_cambridge_split_ordered(split_path: str | Path) -> tuple[list[str], set[str]]:
+    ordered: list[str] = []
     names: set[str] = set()
     split_path = Path(split_path)
     if not split_path.is_file():
-        return names
+        return ordered, names
     with open(split_path, "r", encoding="utf-8") as handle:
         for line in handle:
             line = line.strip()
@@ -161,9 +162,15 @@ def parse_cambridge_split(split_path: str | Path) -> set[str]:
                 continue
             image_name = line.split()[0].replace("\\", "/")
             stem = str(Path(image_name).with_suffix(""))
+            ordered.append(image_name)
             names.add(image_name)
             names.add(stem + ".png")
             names.add(stem + ".jpg")
+    return ordered, names
+
+
+def parse_cambridge_split(split_path: str | Path) -> set[str]:
+    _, names = parse_cambridge_split_ordered(split_path)
     return names
 
 
@@ -407,13 +414,51 @@ def build_all_records(dataset_cfg: Dict, teacher_store: TeacherFeatureStore, all
     return records
 
 
+def _records_in_split_order(
+    all_records: list[dict],
+    split_order: list[str],
+    split_names: set[str],
+) -> list[dict]:
+    record_by_key: dict[str, dict] = {}
+    for record in all_records:
+        keys = [record["normalized_name"]]
+        keys.extend(_candidate_record_names(record["normalized_name"]))
+        for key in keys:
+            if key in split_names:
+                record_by_key.setdefault(key, record)
+
+    records: list[dict] = []
+    used: set[int] = set()
+    for split_name in split_order:
+        keys = [split_name]
+        keys.extend(_candidate_record_names(split_name))
+        for key in keys:
+            record = record_by_key.get(key)
+            if record is None:
+                continue
+            record_id = id(record)
+            if record_id not in used:
+                records.append(record)
+                used.add(record_id)
+            break
+
+    for record in all_records:
+        record_id = id(record)
+        if record_id in used:
+            continue
+        if record["normalized_name"] in split_names:
+            records.append(record)
+            used.add(record_id)
+    return records
+
+
 def split_records(all_records: list[dict], dataset_cfg: Dict) -> tuple[list[dict], list[dict]]:
-    train_split = parse_cambridge_split(dataset_cfg.get("train_split"))
-    val_split = parse_cambridge_split(dataset_cfg.get("val_split"))
+    train_order, train_split = parse_cambridge_split_ordered(dataset_cfg.get("train_split"))
+    val_order, val_split = parse_cambridge_split_ordered(dataset_cfg.get("val_split"))
 
     if train_split and val_split:
-        train_records = [record for record in all_records if record["normalized_name"] in train_split]
-        val_records = [record for record in all_records if record["normalized_name"] in val_split]
+        train_records = _records_in_split_order(all_records, train_order, train_split)
+        val_records = _records_in_split_order(all_records, val_order, val_split)
     else:
         val_ratio = float(dataset_cfg.get("fallback_val_ratio", 0.1))
         split_idx = max(1, int(round(len(all_records) * (1.0 - val_ratio))))

@@ -10,6 +10,7 @@ import numpy as np
 from feature_retrieval.render_loftr_pnp_init_export import (
     candidate_ref_entries_from_retrieval_entry,
     loftr_result_to_candidate,
+    slice_retrieval_entries,
 )
 
 
@@ -35,6 +36,14 @@ def test_candidate_ref_entries_from_retrieval_entry_respects_topk_and_valid_mask
     assert [r["retrieval_frame_id"] for r in refs] == [10, 30]
     assert [r["retrieval_image_name"] for r in refs] == ["a.png", "c.png"]
     assert np.allclose(refs[1]["fallback_pose_w2c"], np.eye(4, dtype=np.float32) * 3)
+
+
+def test_slice_retrieval_entries_applies_start_before_limit():
+    entries = [{"query_image_name": f"q{i}.png"} for i in range(6)]
+
+    sliced = slice_retrieval_entries(entries, query_start=2, max_queries=3)
+
+    assert [entry["query_image_name"] for entry in sliced] == ["q2.png", "q3.png", "q4.png"]
 
 
 def test_loftr_result_to_candidate_uses_estimated_pose_on_success():

@@ -1,0 +1,31 @@
+base_config: joint_radio_dcff_cambridge_oldhospital_processed_pca64_depthaware_v99_batchcandidate_corrvolume_wlssoft_end2end_top8_from_v74.yaml
+exp_name: joint_radio_dcff_cambridge_oldhospital_processed_pca64_depthaware_v101_batchcandidate_corrvolume_wlssoft_calibrated_end2end_top8_from_v74
+
+model:
+  candidate_score_map_fusion_hidden_dim: 0
+  # Same 18d rich prior order as v93. The map-volume pooled weights start at 0,
+  # so this run begins from the calibrated linear prior and learns spatial residuals.
+  candidate_score_fusion_initial_weights:
+    - 0.5
+    - 0.5
+    - 0.0
+    - 0.25
+    - 0.8
+    - 0.8
+    - 0.8
+    - 0.8
+    - 0.5
+    - 0.05
+    - 1.0
+    - 0.0
+    - -0.05
+    - 0.05
+    - 2.0
+    - 3.0
+    - 0.2
+    - 0.0
+  candidate_score_fusion_initial_bias: 0.0
+
+training:
+  seed: 201
+  max_steps: 640

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -23,6 +24,32 @@ from feature_extract import (
     split_records,
 )
 from data.radio_loc_dataset import read_colmap_images
+from feature_field.utils.project_config import load_yaml_config
+from feature_field.utils.project_paths import resolve_repo_path
+
+
+DEFAULT_JOINT_OVERRIDE_COMPONENTS = [
+    "fine_decoder",
+    "feat_sharp",
+    "hash_grid_mlp",
+    "gaussian_latent",
+    "fsm",
+]
+
+DCFF_MANIFEST_BASE_KEYS = (
+    "checkpoint",
+    "ply_path",
+    "feature_dim",
+    "fine_feature_dim",
+    "coarse_feature_dim",
+    "latent_dim",
+    "fine_latent_dim",
+    "coarse_latent_dim",
+    "render_width",
+    "render_height",
+    "coarse_smoothing_kernel",
+    "fine_decoder_override",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -48,11 +75,145 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="COLMAP sparse model directory used to resolve image_id filenames",
     )
+    parser.add_argument("--train-init-cache", default=None, help="Optional fixed train init cache for manifest")
+    parser.add_argument("--val-init-cache", default=None, help="Optional fixed val/test init cache for manifest")
+    parser.add_argument(
+        "--joint-override-components",
+        nargs="*",
+        default=DEFAULT_JOINT_OVERRIDE_COMPONENTS,
+        help="DCFF components overridden by this joint checkpoint in pose_refine",
+    )
+    parser.add_argument(
+        "--skip-localization-manifest",
+        action="store_true",
+        help="Do not write localization_manifest.json",
+    )
     return parser.parse_args()
 
 
 def _normalize_name(name: str) -> str:
     return Path(name).as_posix().replace("\\", "/")
+
+
+def sha256_file_or_none(path: str | os.PathLike | None) -> str | None:
+    if not path:
+        return None
+    candidate = Path(path)
+    if not candidate.is_file():
+        return None
+    digest = hashlib.sha256()
+    with open(candidate, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _cache_entry(path: str | None) -> dict | None:
+    if not path:
+        return None
+    resolved = str(Path(path).resolve())
+    entry = {"path": resolved}
+    digest = sha256_file_or_none(resolved)
+    if digest is not None:
+        entry["sha256"] = digest
+    return entry
+
+
+def _base_dcff_manifest_from_map_config(cfg: dict) -> dict:
+    map_cfg_path = cfg.get("map_supervision", {}).get("config_path")
+    if not map_cfg_path:
+        return {}
+    map_cfg = load_yaml_config(str(map_cfg_path))
+    dcff_cfg = map_cfg.get("dcff", {})
+    if not isinstance(dcff_cfg, dict):
+        return {}
+    base_dcff = {}
+    for key in DCFF_MANIFEST_BASE_KEYS:
+        if key not in dcff_cfg or dcff_cfg[key] is None:
+            continue
+        if key in {"checkpoint", "ply_path"}:
+            resolved = resolve_repo_path(dcff_cfg[key], enforce_local=False)
+            base_dcff[key] = str(resolved) if resolved is not None else str(dcff_cfg[key])
+        else:
+            base_dcff[key] = dcff_cfg[key]
+    return base_dcff
+
+
+def build_localization_manifest(
+    *,
+    config_path: str,
+    checkpoint_path: str,
+    output_dir: str,
+    cfg: dict,
+    train_init_cache: str | None = None,
+    val_init_cache: str | None = None,
+    joint_override_components: list[str] | tuple[str, ...] | None = None,
+) -> dict:
+    fine_key = (
+        cfg.get("export", {}).get("fine_key")
+        or cfg.get("model", {}).get("export_fine_key")
+        or cfg.get("map_supervision", {}).get("query_fine_key")
+        or "fine"
+    )
+    init_caches = {}
+    train_cache_entry = _cache_entry(train_init_cache)
+    val_cache_entry = _cache_entry(val_init_cache)
+    if train_cache_entry is not None:
+        init_caches["train"] = train_cache_entry
+    if val_cache_entry is not None:
+        init_caches["val"] = val_cache_entry
+    teacher_corr_entry = _cache_entry(
+        cfg.get("dataset", {}).get("teacher_correspondence_path")
+        or cfg.get("map_supervision", {}).get("teacher_correspondence_path")
+    )
+    teacher_corr_train_entry = _cache_entry(cfg.get("dataset", {}).get("teacher_correspondence_train_path"))
+    teacher_corr_val_entry = _cache_entry(cfg.get("dataset", {}).get("teacher_correspondence_val_path"))
+    resolved_config = str(Path(config_path).resolve())
+    resolved_checkpoint = str(Path(checkpoint_path).resolve())
+    base_dcff = _base_dcff_manifest_from_map_config(cfg)
+    return {
+        "schema_version": 1,
+        "method_boundary": "radio_student_dcff_multiscale_featuremetric_corr_wls",
+        "teacher_only": {
+            "netvlad_render_loftr_pnp": "init_cache_and_pseudo_label_only",
+            "loftr_pnp_sparse_correspondences": "training_supervision_only",
+        },
+        "dataset": {
+            "feature_dir": str(Path(output_dir).resolve()),
+            **({"train_init_poses_path": init_caches["train"]["path"]} if "train" in init_caches else {}),
+            **({"val_init_poses_path": init_caches["val"]["path"]} if "val" in init_caches else {}),
+            **(
+                {"teacher_correspondence_path": teacher_corr_entry["path"]}
+                if teacher_corr_entry is not None
+                else {}
+            ),
+            **(
+                {"teacher_correspondence_train_path": teacher_corr_train_entry["path"]}
+                if teacher_corr_train_entry is not None
+                else {}
+            ),
+            **(
+                {"teacher_correspondence_val_path": teacher_corr_val_entry["path"]}
+                if teacher_corr_val_entry is not None
+                else {}
+            ),
+        },
+        "dcff": {
+            **base_dcff,
+            "joint_checkpoint": resolved_checkpoint,
+            "joint_override_components": list(joint_override_components or DEFAULT_JOINT_OVERRIDE_COMPONENTS),
+        },
+        "export": {
+            "fine_key": str(fine_key),
+        },
+        "init_caches": init_caches,
+        "source": {
+            "config_path": resolved_config,
+            "config_sha256": sha256_file_or_none(resolved_config),
+            "checkpoint_path": resolved_checkpoint,
+            "checkpoint_sha256": sha256_file_or_none(resolved_checkpoint),
+        },
+    }
 
 
 def build_colmap_name_to_id(colmap_dir: str | None, records: list[dict]) -> dict[str, int]:
@@ -126,6 +287,15 @@ def build_model(cfg: dict, checkpoint: dict, device: torch.device) -> RadioQuery
         fine_highres_source=str(cfg["model"].get("fine_highres_source", "stage2")),
         fine_highres_init=float(cfg["model"].get("fine_highres_init", 0.0)),
         fine_highres_zero_init=bool(cfg["model"].get("fine_highres_zero_init", False)),
+        global_context_enabled=bool(cfg["model"].get("global_context_enabled", False)),
+        global_context_zero_init=bool(cfg["model"].get("global_context_zero_init", True)),
+        window_attention_layers=int(cfg["model"].get("window_attention_layers", 0)),
+        window_attention_heads=int(cfg["model"].get("window_attention_heads", 8)),
+        window_attention_size=int(cfg["model"].get("window_attention_size", 16)),
+        window_attention_mlp_ratio=float(cfg["model"].get("window_attention_mlp_ratio", 2.0)),
+        window_attention_dropout=float(cfg["model"].get("window_attention_dropout", 0.0)),
+        window_attention_shift=bool(cfg["model"].get("window_attention_shift", False)),
+        window_attention_zero_init=bool(cfg["model"].get("window_attention_zero_init", True)),
         fine_loc_head=bool(cfg["model"].get("fine_loc_head", False)),
         fine_loc_init=float(cfg["model"].get("fine_loc_init", 1.0)),
         fine_loc_zero_init=bool(cfg["model"].get("fine_loc_zero_init", True)),
@@ -148,6 +318,7 @@ def build_model(cfg: dict, checkpoint: dict, device: torch.device) -> RadioQuery
         local_matcher_hidden_dim=int(cfg["model"].get("local_matcher_hidden_dim", 64)),
         local_matcher_zero_init=bool(cfg["model"].get("local_matcher_zero_init", True)),
         local_matcher_residual_scale=float(cfg["model"].get("local_matcher_residual_scale", 1.0)),
+        local_matcher_context_mode=str(cfg["model"].get("local_matcher_context_mode", "basic")),
         local_flow_head_enabled=bool(cfg["model"].get("local_flow_head_enabled", False)),
         local_flow_head_radius=int(cfg["model"].get("local_flow_head_radius", cfg["model"].get("local_matcher_radius", 4))),
         local_flow_head_hidden_dim=int(cfg["model"].get("local_flow_head_hidden_dim", 64)),
@@ -155,6 +326,13 @@ def build_model(cfg: dict, checkpoint: dict, device: torch.device) -> RadioQuery
         local_flow_head_max_flow=cfg["model"].get("local_flow_head_max_flow"),
         local_flow_head_base_flow_mode=str(cfg["model"].get("local_flow_head_base_flow_mode", "none")),
         local_flow_head_base_temperature=float(cfg["model"].get("local_flow_head_base_temperature", 0.05)),
+        local_flow_head_context_mode=str(cfg["model"].get("local_flow_head_context_mode", "basic")),
+        local_corr_projector_enabled=bool(cfg["model"].get("local_corr_projector_enabled", False)),
+        local_corr_projector_hidden_dim=int(cfg["model"].get("local_corr_projector_hidden_dim", 96)),
+        local_corr_projector_output_dim=cfg["model"].get("local_corr_projector_output_dim"),
+        local_corr_projector_zero_init=bool(cfg["model"].get("local_corr_projector_zero_init", True)),
+        local_corr_projector_l2_normalize=bool(cfg["model"].get("local_corr_projector_l2_normalize", True)),
+        local_corr_projector_domain_adapter=bool(cfg["model"].get("local_corr_projector_domain_adapter", False)),
         query_channel_gate_enabled=bool(cfg["model"].get("query_channel_gate_enabled", False)),
         query_channel_gate_hidden_dim=cfg["model"].get("query_channel_gate_hidden_dim"),
         query_channel_gate_zero_init=bool(cfg["model"].get("query_channel_gate_zero_init", True)),
@@ -335,6 +513,20 @@ def main() -> None:
     ]
     (output_dir / "export_metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
     (output_dir / "export_index.json").write_text(json.dumps(export_index, indent=2) + "\n", encoding="utf-8")
+    if not args.skip_localization_manifest:
+        manifest = build_localization_manifest(
+            config_path=args.config,
+            checkpoint_path=args.checkpoint,
+            output_dir=str(output_dir),
+            cfg=cfg,
+            train_init_cache=args.train_init_cache,
+            val_init_cache=args.val_init_cache,
+            joint_override_components=args.joint_override_components,
+        )
+        (output_dir / "localization_manifest.json").write_text(
+            json.dumps(manifest, indent=2) + "\n",
+            encoding="utf-8",
+        )
 
     print(
         f"Exported {exported} samples to {output_dir} "

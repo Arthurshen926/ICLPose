@@ -1,0 +1,39 @@
+base_config: joint_radio_dcff_cambridge_oldhospital_processed_pca64_depthaware_v127_top16_initialhard_costreg_contextres_scoreonly_from_v122.yaml
+exp_name: joint_radio_dcff_cambridge_oldhospital_processed_pca64_depthaware_v128_top16_featurebankonline_hard_costreg_scoreonly_from_v127
+
+dataset:
+  pose_candidate_topk: 0
+  train_pose_candidate_cache: null
+  train_pose_candidate_caches: []
+  val_pose_candidate_cache: null
+  val_pose_candidate_caches: []
+
+model:
+  pose_init_head: true
+  pose_init_mode: feature_bank
+  pose_init_feature_bank_source: map
+  pose_init_feature_source: coarse
+  pose_init_feature_bank_projector: identity
+  pose_init_anchor_sampling: train_all
+  pose_init_num_anchors: 2048
+  pose_init_hypotheses: 16
+  pose_init_hidden_dim: 256
+  pose_init_temperature: 0.05
+  pose_init_residual_scale: 0.5
+
+pose_init:
+  enabled: false
+
+training:
+  seed: 228
+  max_steps: 640
+  freeze_model_except_prefixes:
+    - candidate_score_fusion_head.
+
+map_supervision:
+  candidate_render_pose_source: feature_bank_online
+  candidate_render_score_train_map: false
+  candidate_render_score_max_candidates: 16
+  candidate_stage1_topk: 16
+  candidate_two_stage_enabled: false
+  candidate_refined_pose_weight: 0.0

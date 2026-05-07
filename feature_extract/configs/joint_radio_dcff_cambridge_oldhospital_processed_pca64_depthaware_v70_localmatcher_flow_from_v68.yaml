@@ -1,0 +1,39 @@
+base_config: joint_radio_dcff_cambridge_oldhospital_processed_pca64_depthaware_v69_localflow_from_v68.yaml
+exp_name: joint_radio_dcff_cambridge_oldhospital_processed_pca64_depthaware_v70_localmatcher_flow_from_v68
+
+model:
+  warmstart_strict: false
+  warmstart_skip_prefixes:
+    - local_matcher.
+    - local_flow_head.
+
+  local_matcher_enabled: true
+  local_matcher_radius: 8
+  local_matcher_hidden_dim: 64
+  local_matcher_zero_init: true
+  local_matcher_residual_scale: 0.5
+  local_matcher_context_mode: basic
+
+  local_flow_head_enabled: true
+  local_flow_head_radius: 8
+  local_flow_head_hidden_dim: 128
+  local_flow_head_zero_init: true
+  local_flow_head_max_flow: 8.0
+  local_flow_head_base_flow_mode: softargmax
+  local_flow_head_base_temperature: 0.01
+  local_flow_head_context_mode: basic
+
+training:
+  seed: 170
+  lr: 1.0e-4
+  max_steps: 384
+  freeze_model_except_prefixes:
+    - local_matcher.
+    - local_flow_head.
+  model_lr_scales:
+    local_matcher.: 1.0
+    local_flow_head.: 1.0
+
+map_supervision:
+  local_matcher_enabled: true
+  local_flow_head_enabled: true

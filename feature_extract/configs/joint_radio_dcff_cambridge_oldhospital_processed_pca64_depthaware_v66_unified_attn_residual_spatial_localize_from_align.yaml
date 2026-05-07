@@ -1,0 +1,23 @@
+base_config: joint_radio_dcff_cambridge_oldhospital_processed_pca64_depthaware_v64_unified_attn_residual_spatial_fulltrain.yaml
+exp_name: joint_radio_dcff_cambridge_oldhospital_processed_pca64_depthaware_v66_unified_attn_residual_spatial_localize_from_align
+
+training:
+  seed: 166
+  lr: 3.0e-5
+  max_steps: 1800
+  freeze_model_except_prefixes: null
+
+model:
+  warmstart_strict: false
+  warmstart_skip_prefixes: []
+
+map_supervision:
+  query_fine_weight: 0.8
+  query_coarse_weight: 0.3
+  query_fine_infonce_weight: 0.03
+
+  query_corr_ce_weight: 0.5
+  query_corr_subpixel_weight: 0.8
+  query_corr_peak_margin_weight: 5.0
+  query_corr_wls_pose_weight: 0.1
+  feature_metric_pose_weight: 0.05

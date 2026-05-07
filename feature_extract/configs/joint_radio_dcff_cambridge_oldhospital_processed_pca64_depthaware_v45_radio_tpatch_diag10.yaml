@@ -1,0 +1,5 @@
+base_config: joint_radio_dcff_cambridge_oldhospital_processed_pca64_depthaware_v43_patchonly_domainadapter_overfit.yaml
+exp_name: joint_radio_dcff_cambridge_oldhospital_processed_pca64_depthaware_v45_radio_tpatch_diag10
+
+training:
+  max_steps: 10

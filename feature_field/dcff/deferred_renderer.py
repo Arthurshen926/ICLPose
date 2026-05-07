@@ -812,6 +812,7 @@ class DeferredCascadedRenderer(nn.Module):
         width: int,
         height: int,
         render_coarse: bool = True,
+        render_fine: bool = True,
         feature_height: int = None,
         feature_width: int = None,
     ):
@@ -823,6 +824,7 @@ class DeferredCascadedRenderer(nn.Module):
             K: [3, 3] camera intrinsics
             width, height: rendering resolution
             render_coarse: whether to decode coarse features (Phase 3)
+            render_fine: whether to decode fine features
             feature_height, feature_width: target resolution for features
                 (if different from rendering resolution)
 
@@ -905,12 +907,14 @@ class DeferredCascadedRenderer(nn.Module):
         needs_position_map = (
             render_coarse
             and self.coarse_mode not in {'spatial_direct', 'spatial_full_direct'}
-        ) or self.fine_decoder.use_viewdirs
+        ) or (render_fine and self.fine_decoder.use_viewdirs)
         if needs_position_map:
             position_map = self.depth_to_position_map(depth_feat, K_feat, viewmat)
 
         # Step 3: Fine features (explicit decode)
-        fine_features = self.decode_fine(z_fine_map, position_map=position_map, viewmat=viewmat)
+        fine_features = None
+        if render_fine:
+            fine_features = self.decode_fine(z_fine_map, position_map=position_map, viewmat=viewmat)
 
         # Step 4: Coarse features (implicit decode via hash grid)
         coarse_features = None

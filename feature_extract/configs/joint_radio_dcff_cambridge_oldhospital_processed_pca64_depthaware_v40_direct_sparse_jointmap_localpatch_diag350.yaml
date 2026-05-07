@@ -1,0 +1,12 @@
+base_config: joint_radio_dcff_cambridge_oldhospital_processed_pca64_depthaware_v38_direct_sparse_jointmap_tolerant_diag350.yaml
+exp_name: joint_radio_dcff_cambridge_oldhospital_processed_pca64_depthaware_v40_direct_sparse_jointmap_localpatch_diag350
+
+map_supervision:
+  map_lr_scale: 0.02
+  teacher_corr_weight: 1.0
+  teacher_corr_local_patch_weight: 8.0
+  teacher_corr_local_patch_radius: 3
+  teacher_corr_local_patch_temperature: 0.05
+  teacher_corr_local_patch_min_points: 16
+  rendered_teacher_fine_weight: 0.08
+  rendered_teacher_fine_infonce_weight: 0.02

@@ -1,0 +1,5 @@
+base_config: joint_radio_dcff_cambridge_oldhospital_processed_pca64_depthaware_v52_confthreshold_posegain_varwls.yaml
+exp_name: joint_radio_dcff_cambridge_oldhospital_processed_pca64_depthaware_v53_mincov_posegain_varwls
+
+map_supervision:
+  query_corr_wls_min_conf_cov: 0.05

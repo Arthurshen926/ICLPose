@@ -1,0 +1,97 @@
+base_config: joint_radio_dcff_cambridge_oldhospital_processed_adaptive_v7_locdriven_decoupled_corrmatcher_v24_ceonly.yaml
+exp_name: joint_radio_dcff_cambridge_oldhospital_processed_adaptive_v7_pixloc_fm_v25
+output_dir: /root/ICLPose/result/feature_extract
+
+model:
+  pose_init_head: false
+  fine_loc_head: false
+  fine_loc_highres_source: null
+  global_context_enabled: true
+  global_context_zero_init: true
+  export_fine_key: fine
+  local_corr_projector_enabled: true
+  local_corr_projector_hidden_dim: 128
+  local_corr_projector_output_dim: 64
+  local_corr_projector_zero_init: false
+  local_corr_projector_l2_normalize: true
+  warmstart_strict: false
+  warmstart_skip_prefixes:
+    - "local_flow_head."
+    - "local_corr_projector."
+    - "global_context."
+
+training:
+  seed: 973
+  lr: 0.00005
+  batch_size: 2
+  max_steps: 600
+  log_every: 10
+  freeze_model_except_prefixes:
+    - "global_context."
+    - "local_matcher."
+    - "stage3."
+    - "stage4."
+    - "fine_fuse."
+    - "fine_low_fuse."
+    - "fine_low_scale"
+    - "fine_highres_fuse."
+    - "fine_highres_scale"
+    - "fine_head."
+    - "local_corr_projector."
+  model_lr_scales:
+    global_context.: 0.25
+    local_matcher.: 4.0
+    local_corr_projector.: 8.0
+    stage3.: 0.03
+    stage4.: 0.08
+    fine_head.: 0.35
+
+loss:
+  fine_l1_weight: 0.3
+  fine_cos_weight: 0.3
+  coarse_l1_weight: 0.3
+  coarse_cos_weight: 0.3
+
+map_supervision:
+  local_matcher_enabled: true
+  local_corr_projector_enabled: true
+  local_corr_projector_apply_to_query: true
+  feature_metric_use_projector: true
+  query_fine_key: fine
+  query_local_fine_key: fine
+  feature_metric_pose_weight: 0.05
+  feature_metric_pose_damping: 0.05
+  feature_metric_pose_update_scale: 0.25
+  feature_metric_pose_rot_weight: 0.1
+  feature_metric_pose_trans_weight: 30.0
+  feature_metric_pose_normalize: true
+
+  query_corr_min_flow_px: 0.75
+  query_corr_max_flow_px: 8.0
+  query_corr_ce_weight: 0.5
+  query_corr_subpixel_weight: 0.8
+  query_corr_flow_weight: 0.0
+  query_corr_flow_cosine_weight: 0.0
+  query_corr_peak_margin_weight: 5.0
+  query_corr_ce_temperature: 0.050
+  query_corr_wls_pose_weight: 0.10
+
+  query_fine_weight: 0.10
+  query_coarse_weight: 0.08
+  query_fine_infonce_weight: 0.010
+  query_fine_grad_weight: 0.006
+  query_local_fine_weight: 0.0
+  query_local_fine_infonce_weight: 0.0
+  query_local_fine_grad_weight: 0.0
+
+  perturb_render_negatives: true
+  perturb_trans_cm_choices: [2.0, 5.0, 10.0, 20.0]
+  perturb_rot_deg: 0.5
+  query_corr_radius: 8
+
+  rendered_teacher_fine_weight: 0.01
+  rendered_teacher_fine_weight_end: 0.002
+  rendered_teacher_fine_weight_anneal_epochs: 4
+
+export:
+  fine_key: fine

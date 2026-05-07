@@ -25,7 +25,11 @@ from tqdm import tqdm
 
 from feature_field.dcff import DeferredCascadedRenderer, HybridGaussianModel, SpatialHashGrid
 from data.radio_loc_dataset import RadioLocDataset, collate_fn
-from pose_refine import load_concat_pose_checkpoint, load_concat_pose_model
+from pose_refine import (
+    load_concat_pose_checkpoint,
+    load_concat_pose_model,
+    load_external_local_corr_projector,
+)
 from pose_refine.models.concat_pose_net import ConcatPoseNet
 from pose_refine.utils.geometry_solver import pnp_ransac_solve, feature_metric_solve
 from pose_refine.utils.lie_algebra import se3_exp
@@ -35,7 +39,10 @@ from feature_field import (
     render_batch as shared_render_batch,
 )
 from feature_field.runtime import apply_localization_map_state
-from feature_field.utils.project_config import load_mainline_config
+from feature_field.utils.project_config import (
+    load_mainline_config,
+    should_restore_pose_checkpoint_map_state,
+)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1469,6 +1476,8 @@ def main():
         description='Multi-seed evaluation for concat localization model')
     parser.add_argument('--config', required=True, help='YAML config file')
     parser.add_argument('--checkpoint', required=True, help='Localization model checkpoint')
+    parser.add_argument('--localization_manifest', type=str, default=None,
+                        help='Apply exported query/DCFF/init-cache manifest overrides')
     parser.add_argument('--gpu', type=int, default=0, help='GPU index')
     parser.add_argument('--num_seeds', type=int, default=5,
                         help='Number of evaluation seeds (default: 5)')
@@ -1540,7 +1549,7 @@ def main():
     device = torch.device(f'cuda:{args.gpu}')
     torch.cuda.set_device(args.gpu)
 
-    config = load_mainline_config(args.config)
+    config = load_mainline_config(args.config, localization_manifest=args.localization_manifest)
 
     # ── Build DCFF rendering pipeline ─────────────────────────────────────
     print('Building DCFF rendering pipeline...')
@@ -1548,16 +1557,22 @@ def main():
 
     # ── Load localization model ───────────────────────────────────────────
     model, ckpt_epoch = load_model(config, args.checkpoint, device)
+    load_external_local_corr_projector(model, config, device, printer=print)
     model.pose_update_scale = resolve_eval_pose_update_scale(args.pose_update_scale, config)
-    pose_ckpt = load_concat_pose_checkpoint(args.checkpoint, device)
-    restored_map = apply_localization_map_state(
-        dcff_renderer,
-        feat_sharp,
-        pose_ckpt,
-        printer=print,
-    )
-    if restored_map:
-        print(f"Restored localization map state: {', '.join(restored_map)}")
+    restore_pose_ckpt_map = should_restore_pose_checkpoint_map_state(config)
+    pose_ckpt = None
+    if restore_pose_ckpt_map:
+        pose_ckpt = load_concat_pose_checkpoint(args.checkpoint, device)
+        restored_map = apply_localization_map_state(
+            dcff_renderer,
+            feat_sharp,
+            pose_ckpt,
+            printer=print,
+        )
+        if restored_map:
+            print(f"Restored localization map state: {', '.join(restored_map)}")
+    else:
+        print("Keeping configured DCFF joint checkpoint; skipping map state embedded in localization checkpoint.")
 
     dcff_cfg = config['dcff']
     render_h = dcff_cfg.get('render_height', 68)
@@ -1859,8 +1874,10 @@ def main():
         print(f'{"═" * 72}\n')
 
         # Load Stage 2 model
-        s2_config = load_mainline_config(args.stage2_config)
+        s2_config = load_mainline_config(args.stage2_config, localization_manifest=args.localization_manifest)
         s2_model, s2_epoch = load_model(s2_config, args.stage2_checkpoint, device)
+        load_external_local_corr_projector(s2_model, s2_config, device, printer=print)
+        restore_s2_pose_ckpt_map = should_restore_pose_checkpoint_map_state(s2_config)
         print(f'Stage 2 model loaded from epoch {s2_epoch}')
 
         for outer in args.outer_iters:
@@ -1883,23 +1900,27 @@ def main():
                         cache_in_memory=(seed == 0),
                     )
 
-                    apply_localization_map_state(
-                        dcff_renderer,
-                        feat_sharp,
-                        pose_ckpt,
-                        printer=None,
-                    )
-
-                    if use_sweep:
-                        s2_ckpt = load_concat_pose_checkpoint(args.stage2_checkpoint, device)
-                        restored_s2_map = apply_localization_map_state(
+                    if restore_pose_ckpt_map and pose_ckpt is not None:
+                        apply_localization_map_state(
                             dcff_renderer,
                             feat_sharp,
-                            s2_ckpt,
-                            printer=print if seed == 0 else None,
+                            pose_ckpt,
+                            printer=None,
                         )
-                        if restored_s2_map and seed == 0:
-                            print(f"Restored stage-2 map state: {', '.join(restored_s2_map)}")
+
+                    if use_sweep:
+                        if restore_s2_pose_ckpt_map:
+                            s2_ckpt = load_concat_pose_checkpoint(args.stage2_checkpoint, device)
+                            restored_s2_map = apply_localization_map_state(
+                                dcff_renderer,
+                                feat_sharp,
+                                s2_ckpt,
+                                printer=print if seed == 0 else None,
+                            )
+                            if restored_s2_map and seed == 0:
+                                print(f"Restored stage-2 map state: {', '.join(restored_s2_map)}")
+                        elif seed == 0:
+                            print("Keeping configured DCFF joint checkpoint; skipping stage-2 embedded map state.")
                         sweep_res = evaluate_twostage_sweep(
                             model, s2_model, gaussians, dcff_renderer, feat_sharp,
                             val_ds, device,
@@ -1918,15 +1939,18 @@ def main():
                                   f'S2: rot={m["rot_median"]:.3f}° trans={m["trans_median"]:.1f}mm  '
                                   f'<1°={m["pct_1deg"]:.1f}%')
                     else:
-                        s2_ckpt = load_concat_pose_checkpoint(args.stage2_checkpoint, device)
-                        restored_s2_map = apply_localization_map_state(
-                            dcff_renderer,
-                            feat_sharp,
-                            s2_ckpt,
-                            printer=print if seed == 0 else None,
-                        )
-                        if restored_s2_map and seed == 0:
-                            print(f"Restored stage-2 map state: {', '.join(restored_s2_map)}")
+                        if restore_s2_pose_ckpt_map:
+                            s2_ckpt = load_concat_pose_checkpoint(args.stage2_checkpoint, device)
+                            restored_s2_map = apply_localization_map_state(
+                                dcff_renderer,
+                                feat_sharp,
+                                s2_ckpt,
+                                printer=print if seed == 0 else None,
+                            )
+                            if restored_s2_map and seed == 0:
+                                print(f"Restored stage-2 map state: {', '.join(restored_s2_map)}")
+                        elif seed == 0:
+                            print("Keeping configured DCFF joint checkpoint; skipping stage-2 embedded map state.")
                         metrics = evaluate_twostage(
                             model, s2_model, gaussians, dcff_renderer, feat_sharp,
                             val_ds, device,

@@ -1,0 +1,50 @@
+base_config: joint_radio_dcff_cambridge_oldhospital_processed_pca64_depthaware_v58_stagea_queryhead_projector.yaml
+exp_name: joint_radio_dcff_cambridge_oldhospital_processed_pca64_depthaware_v59_stagea_flowhead_obs
+
+model:
+  local_flow_head_enabled: true
+  local_flow_head_radius: 8
+  local_flow_head_hidden_dim: 128
+  local_flow_head_zero_init: true
+  local_flow_head_max_flow: 8.0
+  local_flow_head_base_flow_mode: softargmax
+  local_flow_head_base_temperature: 0.02
+  local_flow_head_context_mode: observability
+
+training:
+  seed: 159
+  max_steps: 384
+  lr: 1.0e-4
+  freeze_model_except_prefixes:
+    - local_flow_head.
+  model_lr_scales:
+    local_flow_head.: 1.0
+
+map_supervision:
+  local_flow_head_enabled: true
+  query_corr_radius: 8
+  query_corr_temperature: 0.03
+  query_corr_ce_weight: 0.0
+  query_corr_subpixel_weight: 0.0
+  query_corr_peak_margin_weight: 0.0
+  query_corr_flow_weight: 20.0
+  query_corr_flow_cosine_weight: 1.0
+  query_corr_flow_head_conf_weight: 0.2
+  query_corr_min_flow_px: 0.25
+  query_corr_max_flow_px: 8.0
+  query_corr_huber_delta: 0.05
+  query_corr_wls_pose_weight: 2.0
+  query_corr_pose_gain_weight: 0.5
+  query_corr_pose_gain_trans_margin_mm: 1.0
+  query_corr_pose_gain_rot_margin_deg: 0.02
+  query_corr_wls_pose_damping: 0.02
+  query_corr_wls_pose_update_scale: 0.25
+  query_corr_wls_pose_rot_weight: 0.2
+  query_corr_wls_pose_trans_weight: 40.0
+  query_flow_warp_weight: 0.0
+  query_flow_warp_contrastive_weight: 0.0
+  teacher_corr_weight: 0.0
+  teacher_corr_local_patch_weight: 0.0
+  map_self_feature_metric_pose_weight: 0.0
+  map_self_flow_warp_weight: 0.0
+  map_self_flow_warp_contrastive_weight: 0.0

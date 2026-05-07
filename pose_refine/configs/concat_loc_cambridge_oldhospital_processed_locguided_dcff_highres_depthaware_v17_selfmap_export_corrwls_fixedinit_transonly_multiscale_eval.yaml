@@ -1,0 +1,9 @@
+base_config: concat_loc_cambridge_oldhospital_processed_locguided_dcff_highres_depthaware_v17_selfmap_export_corrwls_fixedinit_transonly_eval.yaml
+exp_name: concat_loc_cambridge_oldhospital_processed_locguided_dcff_highres_depthaware_v17_selfmap_export_corrwls_fixedinit_transonly_multiscale_eval
+
+model:
+  use_multiscale_corr: true
+  multiscale_corr_pool_factors: [4, 2]
+  multiscale_corr_coarse_radius: 6
+  local_radius: 4
+  corr_wls_temperature: 0.02

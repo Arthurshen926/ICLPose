@@ -16,6 +16,7 @@ from feature_extract.train_impl import (
     pose_feature_bank_from_map_renderer,
     pose_feature_bank_from_dataset,
     pose_anchors_from_dataset,
+    refresh_pose_init_feature_bank_from_map_renderer,
 )
 from feature_retrieval.evaluate_impl import summarize_full_pipeline_metrics
 
@@ -467,6 +468,67 @@ def test_pose_feature_bank_from_map_renderer_uses_reconstructed_map_features():
     assert rotmats.shape == (2, 3, 3)
     assert descriptors.shape == (2, 1)
     assert torch.allclose(descriptors[:, 0], torch.tensor([5.0, 6.0]))
+
+
+def test_refresh_pose_init_feature_bank_from_map_renderer_updates_feature_bank_buffers():
+    def make_pose(center_x):
+        pose = torch.eye(4)
+        pose[0, 3] = -float(center_x)
+        return pose
+
+    class TinyPoseDataset:
+        records = [
+            {"sample_name": "a.png"},
+            {"sample_name": "b.png"},
+        ]
+
+        name_to_pose = {"a.png": make_pose(0.0), "b.png": make_pose(1.0)}
+        basename_to_pose = {}
+
+    class TinyMapRenderer:
+        def _render_single(self, sample_name, require_grad=False):
+            idx = 0 if sample_name == "a.png" else 1
+            fine = torch.zeros(1, 2, 1, 1)
+            coarse = torch.tensor([[[[float(idx + 1)]], [[float(2 * (idx + 1))]]]])
+            mask = torch.ones(1, 1, 1, 1)
+            filler = torch.empty(0)
+            return fine, fine, coarse, mask, filler, filler, filler, filler
+
+    model = RadioQueryStudent(
+        feature_dim=8,
+        fine_feature_dim=4,
+        coarse_feature_dim=2,
+        stage_dims=(4, 4, 4, 4),
+        output_hw=(2, 2),
+        coarse_output_hw=(1, 1),
+        input_hw=(16, 16),
+        pose_init_head=True,
+        pose_init_mode="feature_bank",
+        pose_init_anchor_centers=torch.tensor([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]),
+        pose_init_anchor_descriptors=torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
+        pose_init_feature_source="coarse",
+        pose_init_feature_bank_projector="identity",
+        pose_init_hypotheses=1,
+    )
+
+    refreshed = refresh_pose_init_feature_bank_from_map_renderer(
+        model,
+        TinyPoseDataset(),
+        TinyMapRenderer(),
+        {
+            "model": {
+                "pose_init_mode": "feature_bank",
+                "pose_init_feature_bank_source": "map",
+                "pose_init_anchor_sampling": "train_all",
+                "pose_init_num_anchors": 2,
+                "pose_init_feature_source": "coarse",
+            }
+        },
+    )
+
+    expected = torch.nn.functional.normalize(torch.tensor([[1.0, 2.0], [2.0, 4.0]]), dim=1)
+    assert refreshed
+    assert torch.allclose(model.pose_init_head.anchor_descriptors.cpu(), expected)
 
 
 def test_full_pipeline_metrics_report_required_recalls_and_gain():

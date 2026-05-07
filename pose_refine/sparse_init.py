@@ -185,6 +185,7 @@ def _solve_pnp(
     n_iters: int = 10_000,
     min_inliers: int = 4,
     use_magsac: bool = False,
+    return_inliers: bool = False,
 ) -> Tuple[Optional[np.ndarray], int]:
     """Run PnP-RANSAC and return the query w2c pose.
 
@@ -247,10 +248,18 @@ def _solve_pnp(
                 flags=cv2.SOLVEPNP_EPNP,
             )
         except cv2.error:
+            if return_inliers:
+                return None, 0, np.zeros((len(pts_2d),), dtype=bool)
             return None, 0
 
     if not success or inliers is None or len(inliers) < min_inliers:
-        return None, 0 if inliers is None else len(inliers)
+        count = 0 if inliers is None else len(inliers)
+        if return_inliers:
+            mask = np.zeros((len(pts_2d),), dtype=bool)
+            if inliers is not None:
+                mask[inliers.flatten()] = True
+            return None, count, mask
+        return None, count
 
     num_inliers = len(inliers)
 
@@ -276,6 +285,10 @@ def _solve_pnp(
     pose_w2c = np.eye(4, dtype=np.float64)
     pose_w2c[:3, :3] = R_pnp
     pose_w2c[:3, 3] = tvec.flatten()
+    if return_inliers:
+        mask = np.zeros((len(pts_2d),), dtype=bool)
+        mask[inliers.flatten()] = True
+        return pose_w2c, num_inliers, mask
     return pose_w2c, num_inliers
 
 
@@ -445,15 +458,26 @@ class LoFTRInitializer:
 
         # --- PnP RANSAC (world-3D vs query-2D at LoFTR resolution) --------
         intr_query_loftr = intr_loftr  # same camera → same intrinsics
-        pose_w2c, num_inliers = _solve_pnp(
+        pose_w2c, num_inliers, inlier_mask = _solve_pnp(
             pts_3d_world,
             kpts0_valid,
             intr_query_loftr,
             reproj_threshold=reproj_thr,
             n_iters=self.pnp_iters,
             use_magsac=self.use_magsac,
+            return_inliers=True,
         )
         result.num_inliers = num_inliers
+        result.extra.update(
+            {
+                "query_keypoints": kpts0_valid.astype(np.float32),
+                "ref_keypoints": kpts1_valid.astype(np.float32),
+                "pts3d_world": pts_3d_world.astype(np.float32),
+                "confidence": conf[valid_mask].astype(np.float32),
+                "pnp_inlier_mask": inlier_mask.astype(bool),
+                "loftr_hw": np.asarray(loftr_hw, dtype=np.int32),
+            }
+        )
 
         if pose_w2c is None:
             result.failure_reason = f"pnp_failed (inliers={num_inliers})"

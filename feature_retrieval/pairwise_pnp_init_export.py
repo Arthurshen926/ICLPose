@@ -38,6 +38,17 @@ ImageWithPoints = collections.namedtuple(
     "ImageWithPoints", ["id", "qvec", "tvec", "camera_id", "name", "xys", "point3D_ids"]
 )
 
+PNP_CANDIDATE_QUALITY_FIELDS = (
+    ("retrieval_original_scores_candidates", "retrieval_score", 0.0),
+    ("retrieval_pnp_success_candidates", "pnp_success", 0.0),
+    ("retrieval_pnp_num_inliers_candidates", "num_inliers", 0.0),
+    ("retrieval_pnp_num_matches_candidates", "num_matches", 0.0),
+    ("retrieval_pnp_reproj_rmse_candidates", "pnp_reproj_rmse", float("inf")),
+    ("retrieval_pnp_reproj_median_candidates", "pnp_reproj_median", float("inf")),
+    ("retrieval_pnp_inlier_ratio_candidates", "pnp_inlier_ratio", 0.0),
+    ("retrieval_pnp_inlier_conf_mean_candidates", "pnp_inlier_conf_mean", 0.0),
+)
+
 
 def read_colmap_images_with_points(path: str) -> Dict[int, ImageWithPoints]:
     """Read COLMAP ``images.bin`` including 2D observations."""
@@ -262,9 +273,24 @@ def build_pairwise_pnp_entries(
 
         candidate_poses = [np.asarray(c["pose_w2c"], dtype=np.float32) for c in ordered]
         candidate_scores = [
-            float(c.get("num_inliers", 0)) if c.get("pnp_success") else float(c.get("retrieval_score", 0.0))
+            (
+                float(c.get("selection_score", c.get("num_inliers", 0)))
+                if c.get("pnp_success")
+                else float(c.get("retrieval_score", 0.0))
+            )
             for c in ordered
         ]
+        quality_arrays = {}
+        for entry_key, candidate_key, default in PNP_CANDIDATE_QUALITY_FIELDS:
+            quality_arrays[entry_key] = np.asarray(
+                [
+                    float(c.get(candidate_key, default))
+                    if candidate_key != "pnp_success"
+                    else float(bool(c.get(candidate_key, False)))
+                    for c in ordered
+                ],
+                dtype=np.float32,
+            )
         entries.append(
             {
                 "query_img_id": int(sample["img_id"]),
@@ -284,6 +310,7 @@ def build_pairwise_pnp_entries(
                     [str(c["retrieval_image_name"]) for c in ordered]
                 ),
                 "retrieval_scores_candidates": np.asarray(candidate_scores, dtype=np.float32),
+                **quality_arrays,
             }
         )
 

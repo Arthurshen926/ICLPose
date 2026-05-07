@@ -1,0 +1,33 @@
+base_config: joint_radio_dcff_cambridge_oldhospital_processed_pca64_depthaware_v76_refreshbank_poseinit_coarse_from_v74.yaml
+exp_name: joint_radio_dcff_cambridge_oldhospital_processed_pca64_depthaware_v78_refreshbank_poseinit_coarse_fixedmap_from_v74
+
+training:
+  seed: 178
+  freeze_model_except_prefixes:
+    - pose_init_head.
+    - coarse_head.
+    - coarse_refine.
+    - query_channel_gate.
+  model_lr_scales:
+    pose_init_head.: 8.0
+    coarse_head.: 1.0
+    coarse_refine.: 0.5
+    query_channel_gate.: 0.5
+
+map_supervision:
+  trainable: false
+  train_fine_decoder: false
+  train_coarse_fusion: false
+  train_feat_sharp: false
+  train_fsm: false
+  train_hash_mlp: false
+  train_latent: false
+  train_geometry: false
+  global_render_negative_count: 0
+  perturb_render_negatives: false
+  coarse_pose_energy_weight: 0.0
+  coarse_pose_rank_weight: 0.0
+  query_fine_weight: 0.0
+  query_fine_infonce_weight: 0.0
+  query_coarse_weight: 0.05
+  query_coarse_infonce_weight: 0.01

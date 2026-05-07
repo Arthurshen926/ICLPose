@@ -1,0 +1,20 @@
+base_config: joint_radio_dcff_cambridge_oldhospital_processed_pca64_depthaware_v36_direct_sparse_jointmap_splitfix_diag300.yaml
+exp_name: joint_radio_dcff_cambridge_oldhospital_processed_pca64_depthaware_v38_direct_sparse_jointmap_tolerant_diag350
+
+dataset:
+  teacher_correspondence_max_points: 256
+
+training:
+  max_steps: 350
+
+map_supervision:
+  map_lr_scale: 0.03
+  teacher_corr_weight: 4.0
+  teacher_corr_temperature: 0.10
+  teacher_corr_negative_exclusion_px: 3.0
+  teacher_corr_positive_weight: 0.5
+  teacher_corr_margin_weight: 0.5
+  teacher_corr_margin: 0.05
+  rendered_teacher_fine_weight: 0.12
+  rendered_teacher_fine_infonce_weight: 0.04
+

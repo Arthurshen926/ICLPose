@@ -75,6 +75,7 @@ from pose_refine import (
     apply_pose_delta,
     build_concat_pose_model,
     feature_metric_solve,
+    load_local_flow_head_weights,
     load_local_matcher_weights,
     run_model_refine_iteration,
 )
@@ -1642,6 +1643,10 @@ class ConcatLocTrainer:
         if local_matcher_init:
             load_local_matcher_weights(self.model, local_matcher_init, self.device)
             self.logger.info(f'  Loaded local matcher weights from {local_matcher_init}')
+        local_flow_head_init = mcfg.get('local_flow_head_init_checkpoint')
+        if local_flow_head_init:
+            load_local_flow_head_weights(self.model, local_flow_head_init, self.device)
+            self.logger.info(f'  Loaded local flow head weights from {local_flow_head_init}')
         if bool(tc.get('freeze_pose_model', False)):
             for param in self.model.parameters():
                 param.requires_grad_(False)
@@ -3748,6 +3753,8 @@ def main():
                         help='Warmstart from checkpoint (model weights only)')
     parser.add_argument('--dcff_checkpoint', type=str, default=None,
                         help='Override DCFF checkpoint path')
+    parser.add_argument('--localization_manifest', type=str, default=None,
+                        help='Apply exported query/DCFF/init-cache manifest overrides')
     parser.add_argument('--eval_only', action='store_true',
                         help='Run evaluation only (no training)')
     parser.add_argument('--eval_outer_iters', type=int, nargs='+', default=None,
@@ -3760,7 +3767,7 @@ def main():
                         help='Optional path for per-sample eval records JSON')
     args = parser.parse_args()
 
-    config = load_mainline_config(args.config)
+    config = load_mainline_config(args.config, localization_manifest=args.localization_manifest)
 
     trainer = ConcatLocTrainer(
         config=config,

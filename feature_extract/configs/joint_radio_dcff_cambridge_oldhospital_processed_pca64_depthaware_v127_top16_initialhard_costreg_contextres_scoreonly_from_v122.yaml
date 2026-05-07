@@ -1,0 +1,25 @@
+base_config: joint_radio_dcff_cambridge_oldhospital_processed_pca64_depthaware_v125_top16_initialhard_costreg_contextres_from_v122.yaml
+exp_name: joint_radio_dcff_cambridge_oldhospital_processed_pca64_depthaware_v127_top16_initialhard_costreg_contextres_scoreonly_from_v122
+
+training:
+  seed: 227
+  max_steps: 640
+  freeze_model_except_prefixes:
+    - candidate_score_fusion_head.
+
+map_supervision:
+  trainable: false
+  train_fine_decoder: false
+  train_coarse_fusion: false
+  train_feat_sharp: false
+  train_fsm: false
+  train_hash_mlp: false
+  train_latent: false
+  train_geometry: false
+  query_fine_weight: 0.0
+  query_fine_infonce_weight: 0.0
+  query_coarse_weight: 0.0
+  query_coarse_infonce_weight: 0.0
+  rendered_teacher_fine_weight: 0.0
+  rendered_teacher_coarse_weight: 0.0
+  candidate_render_score_train_map: false

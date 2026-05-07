@@ -1,0 +1,23 @@
+base_config: joint_radio_dcff_cambridge_oldhospital_processed_adaptive_v7_posebank_init_main_v25.yaml
+exp_name: joint_radio_dcff_cambridge_oldhospital_processed_adaptive_v7_posebank_init_soft_v26
+output_dir: /root/ICLPose/result/feature_extract
+
+pose_init:
+  enabled: true
+  trans_weight: 1.5
+  rot_weight: 0.4
+  score_weight: 0.15
+  uncertainty_weight: 0.02
+  rot_cost_weight: 0.05
+  anchor_weight: 8.0
+  anchor_soft_sigma_m: 1.5
+  anchor_soft_rot_sigma_deg: 20.0
+
+training:
+  seed: 991
+  lr: 0.00005
+  max_steps: 1800
+  log_every: 10
+  model_lr_scales:
+    pose_init_head: 14.0
+    query_channel_gate: 1.0
