@@ -1094,15 +1094,6 @@ class RadioQueryStudent(nn.Module):
         window_attention_dropout=0.0,
         window_attention_shift=False,
         window_attention_zero_init=True,
-        fine_loc_head=False,
-        fine_loc_mode="residual",
-        fine_loc_init=1.0,
-        fine_loc_zero_init=True,
-        fine_loc_detach_base=False,
-        fine_loc_highres_source=None,
-        fine_loc_highres_init=1.0,
-        fine_loc_highres_zero_init=True,
-        fine_loc_highres_detach=True,
         teacher_fine_condition=False,
         teacher_fine_init=1.0,
         teacher_fine_zero_init=True,
@@ -1165,6 +1156,7 @@ class RadioQueryStudent(nn.Module):
         pose_init_feature_bank_projector="mlp",
         pose_init_feature_source="fine_coarse",
         pose_init_token_source="global",
+        **kwargs,
     ):
         super().__init__()
         stage_dims = tuple(stage_dims)
@@ -1197,21 +1189,6 @@ class RadioQueryStudent(nn.Module):
         self.window_attention_size = int(window_attention_size)
         self.window_attention_shift = bool(window_attention_shift)
         self.window_attention_zero_init = bool(window_attention_zero_init)
-        self.fine_loc_highres_source = (
-            str(fine_loc_highres_source).lower()
-            if fine_loc_highres_source is not None
-            else None
-        )
-        self.fine_loc_mode = str(fine_loc_mode or "residual").lower()
-        if self.fine_loc_mode not in {"residual", "direct"}:
-            raise ValueError("fine_loc_mode must be either 'residual' or 'direct'")
-        self.use_fine_loc_head = bool(fine_loc_head or self.fine_loc_highres_source is not None)
-        self.fine_loc_init = float(fine_loc_init)
-        self.fine_loc_zero_init = bool(fine_loc_zero_init)
-        self.fine_loc_detach_base = bool(fine_loc_detach_base)
-        self.fine_loc_highres_init = float(fine_loc_highres_init)
-        self.fine_loc_highres_zero_init = bool(fine_loc_highres_zero_init)
-        self.fine_loc_highres_detach = bool(fine_loc_highres_detach)
         self.teacher_fine_condition = bool(teacher_fine_condition)
         self.teacher_fine_init = float(teacher_fine_init)
         self.teacher_fine_zero_init = bool(teacher_fine_zero_init)
@@ -1324,11 +1301,6 @@ class RadioQueryStudent(nn.Module):
                 f"fine_highres_source must be one of {sorted(highres_channels)}, "
                 f"got {self.fine_highres_source!r}"
             )
-        if self.fine_loc_highres_source is not None and self.fine_loc_highres_source not in highres_channels:
-            raise ValueError(
-                f"fine_loc_highres_source must be one of {sorted(highres_channels)}, "
-                f"got {self.fine_loc_highres_source!r}"
-            )
         if self.fine_highres_skip:
             highres_hidden = max(16, min(stage_dims[2], self.fine_feature_dim))
             self.fine_highres_fuse = nn.Sequential(
@@ -1386,36 +1358,10 @@ class RadioQueryStudent(nn.Module):
             ConvNormAct(stage_dims[3], stage_dims[2], kernel_size=3),
             nn.Conv2d(stage_dims[2], self.coarse_feature_dim, kernel_size=1),
         )
-        if self.use_fine_loc_head:
-            loc_hidden = max(16, min(stage_dims[2], self.fine_feature_dim))
-            if fine_loc_head:
-                self.fine_loc_head = nn.Sequential(
-                    ConvNormAct(self.fine_feature_dim, loc_hidden, kernel_size=3),
-                    ResidualDepthwiseBlock(loc_hidden),
-                    nn.Conv2d(loc_hidden, self.fine_feature_dim, kernel_size=1),
-                )
-            else:
-                self.fine_loc_head = None
-            if self.fine_loc_highres_source is not None:
-                self.fine_loc_highres_fuse = nn.Sequential(
-                    ConvNormAct(highres_channels[self.fine_loc_highres_source], loc_hidden, kernel_size=3),
-                    ResidualDepthwiseBlock(loc_hidden),
-                    nn.Conv2d(loc_hidden, self.fine_feature_dim, kernel_size=1),
-                )
-                self.fine_loc_highres_scale = nn.Parameter(
-                    torch.tensor(self.fine_loc_highres_init, dtype=torch.float32)
-                )
-            else:
-                self.fine_loc_highres_fuse = None
-                self.fine_loc_highres_scale = None
-            self.fine_loc_scale = nn.Parameter(
-                torch.tensor(self.fine_loc_init, dtype=torch.float32)
-            )
-        else:
-            self.fine_loc_head = None
-            self.fine_loc_scale = None
-            self.fine_loc_highres_fuse = None
-            self.fine_loc_highres_scale = None
+        self.fine_loc_head = None
+        self.fine_loc_scale = None
+        self.fine_loc_highres_fuse = None
+        self.fine_loc_highres_scale = None
         if self.predict_magnitude:
             self.fine_norm_head = nn.Conv2d(stage_dims[3], 1, kernel_size=1)
             self.coarse_norm_head = nn.Conv2d(stage_dims[3], 1, kernel_size=1)
@@ -1593,14 +1539,6 @@ class RadioQueryStudent(nn.Module):
             nn.init.zeros_(self.fine_highres_fuse[-1].weight)
             if self.fine_highres_fuse[-1].bias is not None:
                 nn.init.zeros_(self.fine_highres_fuse[-1].bias)
-        if self.fine_loc_zero_init and self.fine_loc_head is not None:
-            nn.init.zeros_(self.fine_loc_head[-1].weight)
-            if self.fine_loc_head[-1].bias is not None:
-                nn.init.zeros_(self.fine_loc_head[-1].bias)
-        if self.fine_loc_highres_zero_init and self.fine_loc_highres_fuse is not None:
-            nn.init.zeros_(self.fine_loc_highres_fuse[-1].weight)
-            if self.fine_loc_highres_fuse[-1].bias is not None:
-                nn.init.zeros_(self.fine_loc_highres_fuse[-1].bias)
         if self.teacher_fine_zero_init and self.teacher_fine_fuse is not None:
             nn.init.zeros_(self.teacher_fine_fuse[-1].weight)
             if self.teacher_fine_fuse[-1].bias is not None:
@@ -1720,37 +1658,6 @@ class RadioQueryStudent(nn.Module):
             coarse = F.normalize(coarse, dim=1)
 
         fine_loc = None
-        if self.use_fine_loc_head:
-            fine_loc_base = fine.detach() if self.fine_loc_detach_base else fine
-            loc_delta = torch.zeros_like(fine_loc_base)
-            if self.fine_loc_head is not None:
-                loc_delta = loc_delta + self.fine_loc_scale * self.fine_loc_head(fine_loc_base)
-            if self.fine_loc_highres_fuse is not None:
-                highres_sources = {
-                    "stage1": s1,
-                    "stem": s1,
-                    "stage2": s2,
-                    "stage3": s3,
-                }
-                loc_src = highres_sources[self.fine_loc_highres_source]
-                if self.fine_loc_highres_detach:
-                    loc_src = loc_src.detach()
-                loc_skip = self.fine_loc_highres_fuse(loc_src)
-                if loc_skip.shape[-2:] != fine_loc_base.shape[-2:]:
-                    loc_skip = F.interpolate(
-                        loc_skip,
-                        fine_loc_base.shape[-2:],
-                        mode="bilinear",
-                        align_corners=False,
-                    )
-                loc_delta = loc_delta + self.fine_loc_highres_scale * loc_skip
-            fine_loc = loc_delta if self.fine_loc_mode == "direct" else fine_loc_base + loc_delta
-            if self.predict_magnitude:
-                fine_loc = F.normalize(fine_loc, dim=1) * fine_mag
-            elif self.l2_normalize and not (
-                self.fine_loc_mode == "direct" and loc_delta.abs().amax().detach() <= 0
-            ):
-                fine_loc = F.normalize(fine_loc, dim=1)
 
         outputs = {
             "fine": fine,
