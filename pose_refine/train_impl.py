@@ -1720,6 +1720,8 @@ class ConcatLocTrainer:
             )
             if init_poses_path is None:
                 return RadioLocDataset(**dataset_kwargs)
+            # Noise buckets only apply to fixed-init (non-retrieval) training.
+            dataset_kwargs.pop("noise_buckets", None)
             return RadioLocRetrievalDataset(
                 init_poses_path=init_poses_path,
                 retrieval_train_split=retrieval_train_split,
