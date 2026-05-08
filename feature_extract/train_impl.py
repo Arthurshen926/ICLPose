@@ -163,15 +163,6 @@ DEFAULT_CONFIG = {
         "window_attention_dropout": 0.0,
         "window_attention_shift": False,
         "window_attention_zero_init": True,
-        "fine_loc_head": False,
-        "fine_loc_mode": "residual",
-        "fine_loc_init": 1.0,
-        "fine_loc_zero_init": True,
-        "fine_loc_detach_base": False,
-        "fine_loc_highres_source": None,
-        "fine_loc_highres_init": 1.0,
-        "fine_loc_highres_zero_init": True,
-        "fine_loc_highres_detach": True,
         "teacher_fine_condition": False,
         "teacher_fine_init": 1.0,
         "teacher_fine_zero_init": True,
@@ -207,46 +198,6 @@ DEFAULT_CONFIG = {
         "query_channel_gate_hidden_dim": None,
         "query_channel_gate_zero_init": True,
         "apply_query_channel_gate": False,
-        "candidate_score_fusion_head": False,
-        "candidate_score_fusion_input_dim": DEFAULT_CANDIDATE_SCORE_FUSION_INPUT_DIM,
-        "candidate_score_fusion_hidden_dim": 64,
-        "candidate_score_fusion_zero_init": False,
-        "candidate_score_fusion_initial_weights": None,
-        "candidate_score_fusion_initial_bias": 0.0,
-        "candidate_score_map_fusion_head": False,
-        "candidate_score_map_fusion_channels": 3,
-        "candidate_score_map_fusion_map_channels": 8,
-        "candidate_score_map_fusion_grid_size": 4,
-        "candidate_score_map_fusion_hidden_dim": 64,
-        "candidate_score_map_fusion_context_layers": 0,
-        "candidate_score_map_fusion_context_heads": 1,
-        "candidate_score_map_fusion_context_feedforward_dim": None,
-        "candidate_score_map_fusion_context_residual": False,
-        "pose_init_head": False,
-        "pose_init_hypotheses": 3,
-        "pose_init_hidden_dim": None,
-        "pose_init_mode": "direct",
-        "pose_init_anchor_centers": None,
-        "pose_init_anchor_rotmats": None,
-        "pose_init_anchor_descriptors": None,
-        "pose_init_anchor_sampling": "fps",
-        "pose_init_num_anchors": 64,
-        "pose_init_residual_scale": 1.5,
-        "pose_init_temperature": 0.05,
-        "pose_init_feature_bank_projector": "mlp",
-        "pose_init_feature_source": "fine_coarse",
-        "pose_init_feature_bank_source": "teacher",
-        "pose_init_feature_bank_refresh_on_start": True,
-        "pose_init_feature_bank_refresh_epochs": 0,
-    },
-    "pose_init": {
-        "enabled": False,
-        "trans_weight": 1.0,
-        "rot_weight": 1.0,
-        "score_weight": 0.1,
-        "uncertainty_weight": 0.0,
-        "rot_cost_weight": 0.1,
-        "anchor_weight": 0.0,
     },
     "training": {
         "device": "cuda",
@@ -4041,15 +3992,6 @@ def build_radio_query_student(
         window_attention_dropout=float(model_cfg.get("window_attention_dropout", 0.0)),
         window_attention_shift=bool(model_cfg.get("window_attention_shift", False)),
         window_attention_zero_init=bool(model_cfg.get("window_attention_zero_init", True)),
-        fine_loc_head=bool(model_cfg.get("fine_loc_head", False)),
-        fine_loc_mode=str(model_cfg.get("fine_loc_mode", "residual")),
-        fine_loc_init=float(model_cfg.get("fine_loc_init", 1.0)),
-        fine_loc_zero_init=bool(model_cfg.get("fine_loc_zero_init", True)),
-        fine_loc_detach_base=bool(model_cfg.get("fine_loc_detach_base", False)),
-        fine_loc_highres_source=model_cfg.get("fine_loc_highres_source"),
-        fine_loc_highres_init=float(model_cfg.get("fine_loc_highres_init", 1.0)),
-        fine_loc_highres_zero_init=bool(model_cfg.get("fine_loc_highres_zero_init", True)),
-        fine_loc_highres_detach=bool(model_cfg.get("fine_loc_highres_detach", True)),
         teacher_fine_condition=bool(model_cfg.get("teacher_fine_condition", False)),
         teacher_fine_init=float(model_cfg.get("teacher_fine_init", 1.0)),
         teacher_fine_zero_init=bool(model_cfg.get("teacher_fine_zero_init", True)),
@@ -4087,44 +4029,6 @@ def build_radio_query_student(
         query_channel_gate_hidden_dim=model_cfg.get("query_channel_gate_hidden_dim"),
         query_channel_gate_zero_init=bool(model_cfg.get("query_channel_gate_zero_init", True)),
         apply_query_channel_gate=bool(model_cfg.get("apply_query_channel_gate", False)),
-        candidate_score_fusion_head=bool(model_cfg.get("candidate_score_fusion_head", False)),
-        candidate_score_fusion_input_dim=int(
-            model_cfg.get("candidate_score_fusion_input_dim", DEFAULT_CANDIDATE_SCORE_FUSION_INPUT_DIM)
-            or DEFAULT_CANDIDATE_SCORE_FUSION_INPUT_DIM
-        ),
-        candidate_score_fusion_hidden_dim=int(model_cfg.get("candidate_score_fusion_hidden_dim", 64) or 0),
-        candidate_score_fusion_zero_init=bool(model_cfg.get("candidate_score_fusion_zero_init", False)),
-        candidate_score_fusion_initial_weights=model_cfg.get("candidate_score_fusion_initial_weights"),
-        candidate_score_fusion_initial_bias=float(model_cfg.get("candidate_score_fusion_initial_bias", 0.0)),
-        candidate_score_map_fusion_head=bool(model_cfg.get("candidate_score_map_fusion_head", False)),
-        candidate_score_map_fusion_channels=int(model_cfg.get("candidate_score_map_fusion_channels", 3)),
-        candidate_score_map_fusion_map_channels=int(model_cfg.get("candidate_score_map_fusion_map_channels", 8)),
-        candidate_score_map_fusion_grid_size=int(model_cfg.get("candidate_score_map_fusion_grid_size", 4)),
-        candidate_score_map_fusion_hidden_dim=int(model_cfg.get("candidate_score_map_fusion_hidden_dim", 64) or 0),
-        candidate_score_map_fusion_context_layers=int(
-            model_cfg.get("candidate_score_map_fusion_context_layers", 0) or 0
-        ),
-        candidate_score_map_fusion_context_heads=int(
-            model_cfg.get("candidate_score_map_fusion_context_heads", 1) or 1
-        ),
-        candidate_score_map_fusion_context_feedforward_dim=model_cfg.get(
-            "candidate_score_map_fusion_context_feedforward_dim"
-        ),
-        candidate_score_map_fusion_context_residual=bool(
-            model_cfg.get("candidate_score_map_fusion_context_residual", False)
-        ),
-        pose_init_head=bool(model_cfg.get("pose_init_head", False)),
-        pose_init_hypotheses=int(model_cfg.get("pose_init_hypotheses", 3)),
-        pose_init_hidden_dim=model_cfg.get("pose_init_hidden_dim"),
-        pose_init_mode=str(model_cfg.get("pose_init_mode", "direct")),
-        pose_init_anchor_centers=model_cfg.get("pose_init_anchor_centers"),
-        pose_init_anchor_rotmats=model_cfg.get("pose_init_anchor_rotmats"),
-        pose_init_anchor_descriptors=model_cfg.get("pose_init_anchor_descriptors"),
-        pose_init_residual_scale=float(model_cfg.get("pose_init_residual_scale", 1.5)),
-        pose_init_temperature=float(model_cfg.get("pose_init_temperature", 0.05)),
-        pose_init_feature_bank_projector=str(model_cfg.get("pose_init_feature_bank_projector", "mlp")),
-        pose_init_feature_source=str(model_cfg.get("pose_init_feature_source", "fine_coarse")),
-        pose_init_token_source=str(model_cfg.get("pose_init_token_source", "global")),
     )
 
 
@@ -6516,7 +6420,6 @@ def compute_map_supervision(
     local_matcher=None,
     local_flow_head=None,
     local_corr_projector=None,
-    candidate_score_fusion_head=None,
     map_renderer=None,
 ):
     map_cfg = cfg.get("map_supervision", {})
@@ -7150,69 +7053,11 @@ def compute_map_supervision(
                 "map_supervision.candidate_score_fusion_feature must be one of "
                 "{'fine', 'local_fine', 'coarse'}"
             )
-        pose_gt_for_candidates = batch.get("pose_gt", batch.get("rendered_map_pose_gt"))
-        if (
-            candidate_score_fusion_head is not None
-            and candidate_feat is not None
-            and candidate_pose is not None
-            and pose_gt_for_candidates is not None
-        ):
-            candidate_feat = _resize_feature_bank(candidate_feat, query_candidate_feat.shape[-2:])
-            candidate_mask = _resize_mask_bank(candidate_mask, query_candidate_feat.shape[-2:])
-            need_candidate_details = bool(candidate_two_stage_enabled and candidate_refined_pose_weight > 0.0)
-            candidate_score_fusion_result = candidate_score_fusion_listwise_loss(
-                query_candidate_feat,
-                candidate_feat,
-                candidate_pose,
-                pose_gt_for_candidates,
-                candidate_score_fusion_head,
-                batch=batch,
-                mask=candidate_mask,
-                candidate_valid_mask=candidate_valid_mask,
-                mode=candidate_score_fusion_mode,
-                temperature=candidate_score_fusion_temperature,
-                radius=candidate_score_fusion_radius,
-                preprocess=candidate_score_fusion_preprocess,
-                highpass_kernel=candidate_score_fusion_highpass_kernel,
-                score_map_mode=candidate_score_fusion_score_map_mode,
-                rot_cost_weight=candidate_score_fusion_rot_cost_weight,
-                target_mode=candidate_score_fusion_target_mode,
-                target_temperature_m=candidate_score_fusion_target_temperature_m,
-                render_feature_mode=candidate_score_fusion_render_feature_mode,
-                wls_radius=None if candidate_score_fusion_wls_radius is None else int(candidate_score_fusion_wls_radius),
-                wls_temperature=(
-                    None
-                    if candidate_score_fusion_wls_temperature is None
-                    else float(candidate_score_fusion_wls_temperature)
-                ),
-                wls_damping=candidate_score_fusion_wls_damping,
-                wls_update_scale=candidate_score_fusion_wls_update_scale,
-                wls_conf_mode=candidate_score_fusion_wls_conf_mode,
-                wls_conf_variance_scale=candidate_score_fusion_wls_conf_variance_scale,
-                wls_downsample=candidate_score_fusion_wls_downsample,
-                cost_regression_weight=candidate_score_fusion_cost_regression_weight,
-                cost_regression_temperature_m=(
-                    None
-                    if candidate_score_fusion_cost_regression_temperature_m is None
-                    else float(candidate_score_fusion_cost_regression_temperature_m)
-                ),
-                pairwise_rank_weight=candidate_score_fusion_pairwise_rank_weight,
-                pairwise_rank_temperature=candidate_score_fusion_pairwise_rank_temperature,
-                pairwise_rank_min_gap_m=candidate_score_fusion_pairwise_rank_min_gap_m,
-                return_details=need_candidate_details,
-            )
-            if need_candidate_details:
-                candidate_score_fusion_loss, candidate_score_fusion_metrics, candidate_score_fusion_details = (
-                    candidate_score_fusion_result
-                )
-            else:
-                candidate_score_fusion_loss, candidate_score_fusion_metrics = candidate_score_fusion_result
-        else:
-            candidate_score_fusion_metrics = {
-                "map_candidate_score_fusion_loss": zero.detach(),
-                "map_candidate_score_fusion_acc": zero.detach(),
-                "map_candidate_score_fusion_render_acc": zero.detach(),
-            }
+        candidate_score_fusion_metrics = {
+            "map_candidate_score_fusion_loss": zero.detach(),
+            "map_candidate_score_fusion_acc": zero.detach(),
+            "map_candidate_score_fusion_render_acc": zero.detach(),
+        }
     candidate_refined_pose_loss_value = zero
     candidate_refined_pose_metrics = {}
     if candidate_refined_pose_weight > 0:
@@ -8803,7 +8648,6 @@ def validate(model, loader, cfg, device, qual_dir, feature_track_root, step, log
                     local_matcher=getattr(model, "local_matcher", None),
                     local_flow_head=getattr(model, "local_flow_head", None),
                     local_corr_projector=getattr(model, "local_corr_projector", None),
-                    candidate_score_fusion_head=getattr(model, "candidate_score_fusion_head", None),
                     map_renderer=map_renderer,
                 )
                 total = main_total + map_total
@@ -8834,35 +8678,6 @@ def validate(model, loader, cfg, device, qual_dir, feature_track_root, step, log
     if "retrieval_cosine" in result:
         log_msg += " retrieval_cos=%.4f"
         log_args.append(result.get("retrieval_cosine", 0.0))
-    if "pose_init_best_trans_mm" in result:
-        log_msg += " init_pred=%.1fmm/%.3fdeg p5m=%.1f init_best=%.1fmm/%.3fdeg b5m=%.1f"
-        log_args.extend(
-            [
-                result.get("pose_init_pred_trans_mm", 0.0),
-                result.get("pose_init_pred_rot_deg", 0.0),
-                result.get("pose_init_pred_joint_5deg_1000mm", 0.0),
-                result.get("pose_init_best_trans_mm", 0.0),
-                result.get("pose_init_best_rot_deg", 0.0),
-                result.get("pose_init_best_joint_5deg_1000mm", result.get("pose_init_joint_5deg_1000mm", 0.0)),
-            ]
-        )
-        if "pose_init_anchor_topk_recall" in result:
-            log_msg += " anchor=%.1f/%.1f"
-            log_args.extend(
-                [
-                    result.get("pose_init_anchor_acc", 0.0),
-                    result.get("pose_init_anchor_topk_recall", 0.0),
-                ]
-            )
-            if "pose_init_anchor_topk_recall_5deg_1000mm" in result:
-                log_msg += " anchor_pose=%.1f/%.1f/%.1f"
-                log_args.extend(
-                    [
-                        result.get("pose_init_anchor_topk_recall_5deg_1000mm", 0.0),
-                        result.get("pose_init_anchor_topk_recall_2deg_250mm", 0.0),
-                        result.get("pose_init_anchor_topk_recall_1deg_100mm", 0.0),
-                    ]
-                )
     log_msg += " map_hook=%.4f"
     log_args.append(result.get("map_hook_active", 0.0))
     if "map_query_fine_cosine" in result:
@@ -9364,60 +9179,6 @@ def main():
         pose_candidate_topk=pose_candidate_topk,
     )
 
-    if bool(cfg["model"].get("pose_init_head", False)) and cfg["model"].get("pose_init_anchor_centers") is None:
-        pose_init_mode = str(cfg["model"].get("pose_init_mode", "direct")).lower()
-        if pose_init_mode == "anchor":
-            anchors, anchor_rotmats = pose_anchors_from_dataset(
-                train_dataset,
-                num_anchors=int(cfg["model"].get("pose_init_num_anchors", 64)),
-                sampling=str(cfg["model"].get("pose_init_anchor_sampling", "fps")),
-            )
-            cfg["model"]["pose_init_anchor_centers"] = anchors.tolist()
-            cfg["model"]["pose_init_anchor_rotmats"] = anchor_rotmats.tolist()
-            logger.info(
-                "Pose init anchors: mode=%s count=%d scene_extent=%.3fm",
-                str(cfg["model"].get("pose_init_anchor_sampling", "fps")),
-                anchors.shape[0],
-                torch.pdist(anchors).max().item() if anchors.shape[0] > 1 else 0.0,
-            )
-            with open(output_dir / "config.yaml", "w") as f:
-                yaml.safe_dump(cfg, f, sort_keys=False)
-        elif pose_init_mode == "feature_bank":
-            bank_source = str(cfg["model"].get("pose_init_feature_bank_source", "teacher")).lower()
-            if bank_source == "teacher":
-                anchors, anchor_rotmats, anchor_desc = pose_feature_bank_from_dataset(
-                    train_dataset,
-                    teacher_store,
-                    num_anchors=int(cfg["model"].get("pose_init_num_anchors", 64)),
-                    sampling=str(cfg["model"].get("pose_init_anchor_sampling", "train_all")),
-                    feature_source=str(cfg["model"].get("pose_init_feature_source", "fine_coarse")),
-                )
-            elif bank_source == "map":
-                if map_renderer is None:
-                    raise ValueError("pose_init_feature_bank_source='map' requires map_supervision.enabled=true")
-                anchors, anchor_rotmats, anchor_desc = pose_feature_bank_from_map_renderer(
-                    train_dataset,
-                    map_renderer,
-                    num_anchors=int(cfg["model"].get("pose_init_num_anchors", 64)),
-                    sampling=str(cfg["model"].get("pose_init_anchor_sampling", "train_all")),
-                    feature_source=str(cfg["model"].get("pose_init_feature_source", "fine_coarse")),
-                )
-            else:
-                raise ValueError("pose_init_feature_bank_source must be either 'teacher' or 'map'")
-            cfg["model"]["pose_init_anchor_centers"] = anchors.tolist()
-            cfg["model"]["pose_init_anchor_rotmats"] = anchor_rotmats.tolist()
-            cfg["model"]["pose_init_anchor_descriptors"] = anchor_desc.tolist()
-            logger.info(
-                "Pose init feature bank: mode=%s bank_source=%s feature_source=%s count=%d desc_dim=%d scene_extent=%.3fm",
-                str(cfg["model"].get("pose_init_anchor_sampling", "train_all")),
-                bank_source,
-                str(cfg["model"].get("pose_init_feature_source", "fine_coarse")),
-                anchors.shape[0],
-                anchor_desc.shape[1],
-                torch.pdist(anchors).max().item() if anchors.shape[0] > 1 else 0.0,
-            )
-            with open(output_dir / "config.yaml", "w") as f:
-                yaml.safe_dump(cfg, f, sort_keys=False)
 
     train_loader = DataLoader(
         train_dataset,
@@ -9521,15 +9282,6 @@ def main():
             if load_result.get("skipped_by_prefix"):
                 logger.info("Skipped warmstart tensors by prefix: %s", load_result["skipped_by_prefix"])
 
-    if bool(cfg["model"].get("pose_init_feature_bank_refresh_on_start", True)):
-        refresh_pose_init_feature_bank_from_map_renderer(
-            model,
-            train_dataset,
-            map_renderer,
-            cfg,
-            logger=logger,
-        )
-
     max_steps = cfg["training"].get("max_steps")
     use_amp = bool(cfg["training"].get("amp", True) and device.type == "cuda")
     latest_val_metrics = {}
@@ -9538,15 +9290,6 @@ def main():
         model.train()
         if map_renderer is not None:
             map_renderer.set_train_mode(True)
-        refresh_epochs = int(cfg["model"].get("pose_init_feature_bank_refresh_epochs", 0) or 0)
-        if refresh_epochs > 0 and epoch > start_epoch and (epoch - start_epoch) % refresh_epochs == 0:
-            refresh_pose_init_feature_bank_from_map_renderer(
-                model,
-                train_dataset,
-                map_renderer,
-                cfg,
-                logger=logger,
-            )
         epoch_metrics = []
 
         for batch in train_loader:
@@ -9594,7 +9337,6 @@ def main():
                     local_matcher=getattr(model, "local_matcher", None),
                     local_flow_head=getattr(model, "local_flow_head", None),
                     local_corr_projector=getattr(model, "local_corr_projector", None),
-                    candidate_score_fusion_head=getattr(model, "candidate_score_fusion_head", None),
                     map_renderer=map_renderer,
                 )
                 total_loss = main_total + map_total
@@ -9623,38 +9365,6 @@ def main():
                 if "retrieval_cosine" in mean_train:
                     log_msg += " retrieval_cos=%.4f"
                     log_args.append(mean_train.get("retrieval_cosine", 0.0))
-                if "pose_init_best_trans_mm" in mean_train:
-                    log_msg += " init_pred=%.1fmm/%.3fdeg p5m=%.1f init_best=%.1fmm/%.3fdeg b5m=%.1f"
-                    log_args.extend(
-                        [
-                            mean_train.get("pose_init_pred_trans_mm", 0.0),
-                            mean_train.get("pose_init_pred_rot_deg", 0.0),
-                            mean_train.get("pose_init_pred_joint_5deg_1000mm", 0.0),
-                            mean_train.get("pose_init_best_trans_mm", 0.0),
-                            mean_train.get("pose_init_best_rot_deg", 0.0),
-                            mean_train.get(
-                                "pose_init_best_joint_5deg_1000mm",
-                                mean_train.get("pose_init_joint_5deg_1000mm", 0.0),
-                            ),
-                        ]
-                    )
-                    if "pose_init_anchor_topk_recall" in mean_train:
-                        log_msg += " anchor=%.1f/%.1f"
-                        log_args.extend(
-                            [
-                                mean_train.get("pose_init_anchor_acc", 0.0),
-                                mean_train.get("pose_init_anchor_topk_recall", 0.0),
-                            ]
-                        )
-                        if "pose_init_anchor_topk_recall_5deg_1000mm" in mean_train:
-                            log_msg += " anchor_pose=%.1f/%.1f/%.1f"
-                            log_args.extend(
-                                [
-                                    mean_train.get("pose_init_anchor_topk_recall_5deg_1000mm", 0.0),
-                                    mean_train.get("pose_init_anchor_topk_recall_2deg_250mm", 0.0),
-                                    mean_train.get("pose_init_anchor_topk_recall_1deg_100mm", 0.0),
-                                ]
-                            )
                 if "map_query_fine_cosine" in mean_train:
                     log_msg += " map_q_f=%.4f map_q_loc=%.4f map_q_c=%.4f"
                     log_args.extend(
