@@ -2983,6 +2983,10 @@ class ConcatLocTrainer:
         all_corr_flow_epe = []
         all_fm_rot_errs, all_fm_trans_errs = [], []
         sample_records = []
+        bucket_init_rot = {}
+        bucket_init_trans = {}
+        bucket_final_rot = {}
+        bucket_final_trans = {}
         N = self.outer_iters_val
         eval_gru_iters = int(getattr(self.model, 'gru_iters', 0))
         eval_seed = int(getattr(self, '_eval_current_seed', -1))
@@ -3031,6 +3035,13 @@ class ConcatLocTrainer:
             init_rot, init_trans = compute_pose_error(pose_cur, pose_gt)
             all_init_rot_errs.extend(init_rot.cpu().tolist())
             all_init_trans_errs.extend(init_trans.cpu().tolist())
+
+            noise_bucket = batch.get('noise_bucket')
+            if noise_bucket is not None:
+                for bi, b_idx in enumerate(noise_bucket.tolist()):
+                    if b_idx >= 0:
+                        bucket_init_rot.setdefault(b_idx, []).append(init_rot[bi].item())
+                        bucket_init_trans.setdefault(b_idx, []).append(init_trans[bi].item())
 
             if self.feature_metric_eval:
                 fm_bundle = self._render_bundle_batch(
@@ -3118,6 +3129,12 @@ class ConcatLocTrainer:
 
                 all_rot_errs.extend(rot_err.cpu().tolist())
                 all_trans_errs.extend(trans_err.cpu().tolist())
+
+                if noise_bucket is not None and 'delta_xi' in pred:
+                    for bi, b_idx in enumerate(noise_bucket.tolist()):
+                        if b_idx >= 0:
+                            bucket_final_rot.setdefault(b_idx, []).append(rot_err[bi].item())
+                            bucket_final_trans.setdefault(b_idx, []).append(trans_err[bi].item())
 
                 if bool(getattr(self, '_eval_collect_samples', False)):
                     if pose_after_one is not None:
@@ -3238,6 +3255,28 @@ class ConcatLocTrainer:
 
             for k, v in val_metrics.items():
                 self.writer.add_scalar(f'val/{k}', v, epoch)
+
+            if bucket_init_rot:
+                bucket_msg_parts = []
+                for b_idx in sorted(bucket_init_rot.keys()):
+                    b_init_r = np.mean(bucket_init_rot[b_idx])
+                    b_init_t = np.mean(bucket_init_trans[b_idx])
+                    b_final_r = np.mean(bucket_final_rot.get(b_idx, [0]))
+                    b_final_t = np.mean(bucket_final_trans.get(b_idx, [0]))
+                    b_gain_t = b_init_t - b_final_t
+                    b_gain_r = b_init_r - b_final_r
+                    bucket_msg_parts.append(
+                        f"B{b_idx}:{b_init_t:.0f}->{b_final_t:.0f}mm({b_gain_t:.0f})"
+                    )
+                    # TensorBoard per-bucket
+                    if self.writer is not None:
+                        self.writer.add_scalar(f'bucket/B{b_idx}/init_trans_mm', b_init_t, self.global_step)
+                        self.writer.add_scalar(f'bucket/B{b_idx}/final_trans_mm', b_final_t, self.global_step)
+                        self.writer.add_scalar(f'bucket/B{b_idx}/gain_trans_mm', b_gain_t, self.global_step)
+                        self.writer.add_scalar(f'bucket/B{b_idx}/init_rot_deg', b_init_r, self.global_step)
+                        self.writer.add_scalar(f'bucket/B{b_idx}/final_rot_deg', b_final_r, self.global_step)
+                        self.writer.add_scalar(f'bucket/B{b_idx}/gain_rot_deg', b_gain_r, self.global_step)
+                self.logger.info(f"[Val E{epoch}] Buckets: {' | '.join(bucket_msg_parts)}")
         if bool(getattr(self, '_eval_collect_samples', False)):
             self._eval_sample_records = sample_records
 
