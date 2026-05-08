@@ -1144,18 +1144,6 @@ class RadioQueryStudent(nn.Module):
         candidate_score_map_fusion_context_heads=1,
         candidate_score_map_fusion_context_feedforward_dim=None,
         candidate_score_map_fusion_context_residual=False,
-        pose_init_head=False,
-        pose_init_hypotheses=3,
-        pose_init_hidden_dim=None,
-        pose_init_mode="direct",
-        pose_init_anchor_centers=None,
-        pose_init_anchor_rotmats=None,
-        pose_init_anchor_descriptors=None,
-        pose_init_residual_scale=1.0,
-        pose_init_temperature=0.05,
-        pose_init_feature_bank_projector="mlp",
-        pose_init_feature_source="fine_coarse",
-        pose_init_token_source="global",
         **kwargs,
     ):
         super().__init__()
@@ -1208,21 +1196,6 @@ class RadioQueryStudent(nn.Module):
         self.candidate_score_fusion_head_enabled = bool(
             candidate_score_fusion_head or self.candidate_score_map_fusion_head_enabled
         )
-        self.pose_init_head_enabled = bool(pose_init_head)
-        self.pose_init_mode = str(pose_init_mode or "direct").lower()
-        if self.pose_init_mode not in {"direct", "anchor", "feature_bank"}:
-            raise ValueError("pose_init_mode must be one of {'direct', 'anchor', 'feature_bank'}")
-        self.pose_init_feature_source = str(pose_init_feature_source or "fine_coarse").lower()
-        if self.pose_init_feature_source not in {"fine_coarse", "fine", "coarse", "retrieval"}:
-            raise ValueError(
-                "pose_init_feature_source must be one of {'fine_coarse', 'fine', 'coarse', 'retrieval'}"
-            )
-        self.pose_init_token_source = str(pose_init_token_source or "global").lower()
-        if self.pose_init_token_source not in {"global", "retrieval"}:
-            raise ValueError("pose_init_token_source must be either 'global' or 'retrieval'")
-        if self.pose_init_token_source == "retrieval" and self.retrieval_dim <= 0:
-            raise ValueError("pose_init_token_source='retrieval' requires retrieval_dim > 0")
-
         stem_dim = stage_dims[0] or base_channels
         self.stem = nn.Sequential(
             ConvNormAct(in_channels, stem_dim, kernel_size=5, stride=2),
@@ -1416,41 +1389,7 @@ class RadioQueryStudent(nn.Module):
             )
         else:
             self.candidate_score_fusion_head = None
-        pose_init_token_dim = self.retrieval_dim if self.pose_init_token_source == "retrieval" else stage_dims[3]
-        if self.pose_init_head_enabled and self.pose_init_mode == "feature_bank":
-            self.pose_init_head = FeatureBankPoseInitHead(
-                token_dim=pose_init_token_dim,
-                hidden_dim=pose_init_hidden_dim,
-                hypotheses=int(pose_init_hypotheses),
-                anchor_centers=pose_init_anchor_centers,
-                anchor_rotmats=pose_init_anchor_rotmats,
-                anchor_descriptors=pose_init_anchor_descriptors,
-                fine_dim=self.fine_feature_dim,
-                coarse_dim=self.coarse_feature_dim,
-                residual_scale=float(pose_init_residual_scale),
-                temperature=float(pose_init_temperature),
-                projector=str(pose_init_feature_bank_projector),
-                feature_source=self.pose_init_feature_source,
-            )
-        elif self.pose_init_head_enabled and self.pose_init_mode == "anchor":
-            self.pose_init_head = AnchorPoseInitHead(
-                token_dim=pose_init_token_dim,
-                hidden_dim=pose_init_hidden_dim,
-                hypotheses=int(pose_init_hypotheses),
-                anchor_centers=pose_init_anchor_centers,
-                anchor_rotmats=pose_init_anchor_rotmats,
-                residual_scale=float(pose_init_residual_scale),
-            )
-        else:
-            self.pose_init_head = (
-                AbsolutePoseInitHead(
-                    token_dim=pose_init_token_dim,
-                    hidden_dim=pose_init_hidden_dim,
-                    hypotheses=int(pose_init_hypotheses),
-                )
-                if self.pose_init_head_enabled
-                else None
-            )
+        self.pose_init_head = None
 
         self.local_matcher = (
             DepthAwareLocalMatcher(
@@ -1677,14 +1616,7 @@ class RadioQueryStudent(nn.Module):
             outputs["retrieval"] = retrieval
         if query_channel_weights is not None:
             outputs["query_channel_weights"] = query_channel_weights
-        if self.pose_init_head is not None:
-            pose_init_token = retrieval if self.pose_init_token_source == "retrieval" else global_pose_token
-            if pose_init_token is None:
-                raise RuntimeError("pose_init_token_source='retrieval' requires retrieval_head output")
-            if isinstance(self.pose_init_head, FeatureBankPoseInitHead):
-                outputs["pose_init"] = self.pose_init_head(pose_init_token, fine=fine, coarse=coarse)
-            else:
-                outputs["pose_init"] = self.pose_init_head(pose_init_token)
+        # pose_init removed — no longer generated
         if fine_loc is not None:
             outputs["fine_loc"] = fine_loc
         if scene_coord is not None:
