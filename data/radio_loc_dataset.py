@@ -396,6 +396,7 @@ class RadioLocDataset(Dataset):
         split_file: Optional[str] = None,
         noise_rot_deg: float = 5.0,
         noise_trans_m: float = 0.2,
+        noise_buckets = None,  # list of (trans_m, rot_deg) tuples for bucketed noise training
         coarse_hw: Tuple[int, int] = (17, 30),
         fine_hw: Tuple[int, int] = (68, 120),
         cache_in_memory: bool = True,
@@ -409,6 +410,7 @@ class RadioLocDataset(Dataset):
         self.split = split
         self.noise_rot_deg = noise_rot_deg
         self.noise_trans_m = noise_trans_m
+        self.noise_buckets = noise_buckets
         self.coarse_hw = tuple(coarse_hw)
         self.fine_hw = tuple(fine_hw)
         self.cache_in_memory = cache_in_memory
@@ -598,12 +600,19 @@ class RadioLocDataset(Dataset):
         # GT pose (w2c)
         pose_gt = torch.tensor(s['pose_w2c'].tolist(), dtype=torch.float32)
 
-        # Add noise for initial pose (optionally randomize noise magnitude)
-        rot_noise = self.noise_rot_deg
-        trans_noise = self.noise_trans_m
-        if getattr(self, 'noise_rot_min', None) is not None:
-            rot_noise = np.random.uniform(self.noise_rot_min, self.noise_rot_deg)
-            trans_noise = np.random.uniform(self.noise_trans_min, self.noise_trans_m)
+        # Add noise for initial pose
+        if self.noise_buckets is not None and self.split == 'train':
+            bucket_idx = torch.randint(0, len(self.noise_buckets), (1,)).item()
+            bucket_trans_m, bucket_rot_deg = self.noise_buckets[bucket_idx]
+            rot_noise = bucket_rot_deg
+            trans_noise = bucket_trans_m
+        else:
+            bucket_idx = -1
+            rot_noise = self.noise_rot_deg
+            trans_noise = self.noise_trans_m
+            if getattr(self, 'noise_rot_min', None) is not None:
+                rot_noise = np.random.uniform(self.noise_rot_min, self.noise_rot_deg)
+                trans_noise = np.random.uniform(self.noise_trans_min, self.noise_trans_m)
         pose_init = torch.tensor(
             add_pose_noise(s['pose_w2c'], rot_noise, trans_noise).tolist(),
             dtype=torch.float32,
@@ -614,6 +623,7 @@ class RadioLocDataset(Dataset):
             'query_coarse': coarse_feat,     # (64, H_c, W_c)
             'pose_gt': pose_gt,              # (4, 4)
             'pose_init': pose_init,          # (4, 4)
+            'noise_bucket': bucket_idx,
             'image_id': s['img_id'],
             'image_name': s.get('image_name', ''),
             'intrinsics': self.intrinsics,   # {fx, fy, cx, cy}
@@ -661,6 +671,8 @@ def collate_fn(batch: List[Dict]) -> Dict[str, object]:
         elif isinstance(vals[0], dict):
             # Intrinsics: all samples share the same dict
             collated[key] = vals[0]
+        elif key == 'noise_bucket':
+            collated[key] = torch.tensor(vals, dtype=torch.long)
         elif isinstance(vals[0], str):
             collated[key] = vals
         else:

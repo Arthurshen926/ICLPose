@@ -1705,6 +1705,7 @@ class ConcatLocTrainer:
             split_file: Optional[str],
             noise_rot_deg: float,
             noise_trans_m: float,
+            noise_buckets=None,
             teacher_feature_dir_override: Optional[str] = None,
             init_poses_path: Optional[str] = None,
         ):
@@ -1713,6 +1714,7 @@ class ConcatLocTrainer:
                 split_file=split_file,
                 noise_rot_deg=noise_rot_deg,
                 noise_trans_m=noise_trans_m,
+                noise_buckets=noise_buckets,
                 teacher_feature_dir=teacher_feature_dir_override,
                 **common_kwargs,
             )
@@ -1727,11 +1729,18 @@ class ConcatLocTrainer:
                 **dataset_kwargs,
             )
 
+        noise_buckets = dcfg.get("noise_buckets", None)
+        if noise_buckets is not None:
+            noise_buckets = [tuple(b) for b in noise_buckets]
+            self.logger.info(f'  Noise buckets: {len(noise_buckets)} buckets — '
+                             f'{[f"({t:.3f}m, {r:.1f}°)" for t, r in noise_buckets]}')
+
         self.train_dataset = _build_dataset(
             split='train',
             split_file=dcfg.get('train_split'),
             noise_rot_deg=self.noise_rot_start,
             noise_trans_m=self.noise_trans_start,
+            noise_buckets=noise_buckets,
             teacher_feature_dir_override=teacher_feature_dir,
             init_poses_path=train_init_poses_path,
         )
