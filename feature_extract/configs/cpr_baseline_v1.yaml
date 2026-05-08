@@ -1,0 +1,138 @@
+# Camera Pose Refinement baseline -- Phase 1
+# No fine_loc, no pose_init, no candidate scorer, no retrieval.
+# Coarse: feature-metric energy for large-basin correction.
+# Fine: dense correlation + WLS for high-precision refinement.
+
+base_config: null  # standalone, no parent
+exp_name: cpr_baseline_v1
+output_dir: /root/ICLPose/result/feature_extract
+
+model:
+  feature_dim: 64
+  fine_feature_dim: 96
+  coarse_feature_dim: 32
+  base_channels: 32
+  stage_dims: [32, 64, 96, 128]
+  dropout: 0.0
+  l2_normalize: true
+
+  global_context_enabled: true
+  global_context_zero_init: true
+  window_attention_layers: 2
+  window_attention_heads: 8
+  window_attention_size: 16
+  window_attention_mlp_ratio: 2.0
+  window_attention_shift: true
+  window_attention_zero_init: true
+
+  local_matcher_enabled: true
+  local_matcher_radius: 4
+  local_matcher_hidden_dim: 64
+  local_matcher_zero_init: true
+  local_matcher_residual_scale: 1.0
+  local_matcher_context_mode: basic
+
+  local_corr_projector_enabled: true
+  local_corr_projector_hidden_dim: 128
+  local_corr_projector_output_dim: 64
+  local_corr_projector_zero_init: false
+  local_corr_projector_l2_normalize: true
+
+  warmstart_strict: false
+  # No fine_loc_head, no pose_init_head, no candidate scorer
+
+dataset:
+  input_hw: [1088, 1920]
+  feature_hw: [68, 120]
+  coarse_feature_hw: [17, 30]
+  noise_buckets:
+    - [0.1, 2.0]
+    - [0.25, 5.0]
+    - [0.5, 10.0]
+    - [1.0, 20.0]
+    - [2.0, 30.0]
+
+training:
+  seed: 973
+  lr: 0.00005
+  batch_size: 2
+  max_steps: 600
+  log_every: 10
+  freeze_model_except_prefixes:
+    - "global_context."
+    - "window_attention."
+    - "local_matcher."
+    - "stage3."
+    - "stage4."
+    - "fine_fuse."
+    - "fine_low_fuse."
+    - "fine_low_scale"
+    - "fine_highres_fuse."
+    - "fine_highres_scale"
+    - "fine_head."
+    - "coarse_head."
+    - "coarse_refine."
+    - "local_corr_projector."
+  model_lr_scales:
+    global_context.: 0.25
+    window_attention.: 0.25
+    local_matcher.: 4.0
+    local_corr_projector.: 8.0
+    stage3.: 0.03
+    stage4.: 0.08
+    fine_head.: 0.35
+    coarse_head.: 0.35
+
+loss:
+  fine_l1_weight: 0.3
+  fine_cos_weight: 0.3
+  coarse_l1_weight: 0.3
+  coarse_cos_weight: 0.3
+
+map_supervision:
+  config_path: /root/ICLPose/configs/dcff_cambridge_oldhospital.yaml
+
+  # Direct query-map alignment
+  query_fine_key: fine
+  query_local_fine_key: fine
+  query_fine_weight: 0.10
+  query_coarse_weight: 0.08
+  query_fine_infonce_weight: 0.010
+
+  # Coarse feature-metric energy (large-basin correction)
+  coarse_feature_metric_energy_weight: 0.05
+  coarse_feature_metric_energy_radius: 8
+
+  # Fine correlation + WLS
+  query_corr_radius: 8
+  query_corr_ce_weight: 0.5
+  query_corr_subpixel_weight: 0.8
+  query_corr_peak_margin_weight: 5.0
+  query_corr_ce_temperature: 0.050
+  query_corr_wls_pose_weight: 0.10
+  perturb_render_negatives: true
+  perturb_trans_cm_choices: [2.0, 5.0, 10.0, 20.0]
+  perturb_rot_deg: 0.5
+
+  # Feature-metric pose loss (fine alignment)
+  feature_metric_pose_weight: 0.05
+  feature_metric_pose_damping: 0.05
+  feature_metric_pose_update_scale: 0.25
+  feature_metric_pose_rot_weight: 0.1
+  feature_metric_pose_trans_weight: 30.0
+  feature_metric_pose_normalize: true
+
+  # Teacher anchor (prevent collapse, low weight)
+  rendered_teacher_fine_weight: 0.01
+  rendered_teacher_fine_weight_end: 0.002
+  rendered_teacher_fine_weight_anneal_epochs: 4
+
+  # Disabled
+  candidate_render_score_weight: 0.0
+  candidate_score_fusion_weight: 0.0
+  candidate_refined_pose_weight: 0.0
+  candidate_two_stage_enabled: false
+  coarse_pose_energy_weight: 0.0
+
+export:
+  fine_key: fine
