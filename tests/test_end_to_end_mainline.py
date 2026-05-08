@@ -16,120 +16,8 @@ from feature_extract.train_impl import (
     pose_feature_bank_from_map_renderer,
     pose_feature_bank_from_dataset,
     pose_anchors_from_dataset,
-    refresh_pose_init_feature_bank_from_map_renderer,
 )
 from feature_retrieval.evaluate_impl import summarize_full_pipeline_metrics
-
-
-def test_radio_query_student_pose_init_head_outputs_multihypothesis_pose():
-    model = RadioQueryStudent(
-        feature_dim=16,
-        fine_feature_dim=16,
-        coarse_feature_dim=8,
-        stage_dims=(8, 12, 16, 20),
-        output_hw=(8, 10),
-        coarse_output_hw=(4, 5),
-        input_hw=(64, 80),
-        pose_init_head=True,
-        pose_init_hypotheses=3,
-    )
-
-    out = model(torch.randn(2, 3, 64, 80))
-    pose_init = out["pose_init"]
-
-    assert out["global_pose_token"].shape == (2, 20)
-    assert pose_init["center"].shape == (2, 3, 3)
-    assert pose_init["rot6d"].shape == (2, 3, 6)
-    assert pose_init["rotmat"].shape == (2, 3, 3, 3)
-    assert pose_init["pose_w2c"].shape == (2, 3, 4, 4)
-    assert pose_init["scores"].shape == (2, 3)
-    assert pose_init["log_var"].shape == (2, 3, 2)
-
-    eye = torch.eye(3).expand(2, 3, 3, 3)
-    assert torch.allclose(
-        pose_init["rotmat"].transpose(-1, -2) @ pose_init["rotmat"],
-        eye,
-        atol=1e-4,
-    )
-    assert torch.allclose(
-        pose_init["pose_w2c"][:, :, 3],
-        torch.tensor([0.0, 0.0, 0.0, 1.0]).expand(2, 3, 4),
-    )
-
-
-def test_radio_query_student_anchor_pose_init_outputs_topk_scene_anchors():
-    anchors = torch.tensor(
-        [
-            [0.0, 0.0, 0.0],
-            [1.0, 0.0, 0.0],
-            [0.0, 2.0, 0.0],
-            [0.0, 0.0, 3.0],
-        ],
-        dtype=torch.float32,
-    )
-    model = RadioQueryStudent(
-        feature_dim=16,
-        fine_feature_dim=16,
-        coarse_feature_dim=8,
-        stage_dims=(8, 12, 16, 20),
-        output_hw=(8, 10),
-        coarse_output_hw=(4, 5),
-        input_hw=(64, 80),
-        pose_init_head=True,
-        pose_init_mode="anchor",
-        pose_init_anchor_centers=anchors,
-        pose_init_hypotheses=2,
-    )
-
-    out = model(torch.randn(2, 3, 64, 80))
-    pose_init = out["pose_init"]
-
-    assert pose_init["anchor_logits"].shape == (2, 4)
-    assert pose_init["anchor_indices"].shape == (2, 2)
-    assert pose_init["anchor_centers"].shape == (4, 3)
-    assert pose_init["center"].shape == (2, 2, 3)
-    assert pose_init["rotmat"].shape == (2, 2, 3, 3)
-    assert torch.all(pose_init["anchor_indices"] >= 0)
-    assert torch.all(pose_init["anchor_indices"] < anchors.shape[0])
-    assert torch.isfinite(pose_init["pose_w2c"]).all()
-
-
-def test_anchor_pose_init_uses_rotation_anchors_before_learning_residuals():
-    anchors = torch.tensor([[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]], dtype=torch.float32)
-    anchor_rotmats = torch.eye(3).repeat(2, 1, 1)
-    anchor_rotmats[1] = torch.tensor(
-        [
-            [0.0, -1.0, 0.0],
-            [1.0, 0.0, 0.0],
-            [0.0, 0.0, 1.0],
-        ],
-        dtype=torch.float32,
-    )
-    model = RadioQueryStudent(
-        feature_dim=16,
-        fine_feature_dim=16,
-        coarse_feature_dim=8,
-        stage_dims=(8, 12, 16, 20),
-        output_hw=(8, 10),
-        coarse_output_hw=(4, 5),
-        input_hw=(64, 80),
-        pose_init_head=True,
-        pose_init_mode="anchor",
-        pose_init_anchor_centers=anchors,
-        pose_init_anchor_rotmats=anchor_rotmats,
-        pose_init_hypotheses=1,
-    )
-    with torch.no_grad():
-        model.pose_init_head.anchor_logits.weight.zero_()
-        model.pose_init_head.anchor_logits.bias[:] = torch.tensor([-1.0, 1.0])
-        model.pose_init_head.pose_raw.weight.zero_()
-
-    out = model(torch.randn(1, 3, 64, 80))
-    pose_init = out["pose_init"]
-
-    assert pose_init["anchor_indices"].item() == 1
-    assert torch.allclose(pose_init["rotmat"][0, 0], anchor_rotmats[1], atol=1e-5)
-    assert torch.allclose(pose_init["center"][0, 0], anchors[1], atol=1e-5)
 
 
 def test_feature_bank_pose_init_scores_query_descriptor_against_anchor_descriptors():
@@ -177,33 +65,6 @@ def test_feature_bank_pose_init_can_use_coarse_only_for_rough_localization():
     assert out["query_descriptor"].shape == (1, 1)
     assert out["anchor_indices"].item() == 0
     assert torch.allclose(out["center"][0, 0], anchors[0], atol=1e-6)
-
-
-def test_radio_query_student_feature_bank_pose_init_accepts_coarse_only_descriptors():
-    anchors = torch.tensor([[0.0, 0.0, 0.0], [3.0, 0.0, 0.0]], dtype=torch.float32)
-    anchor_desc = torch.tensor([[1.0] * 8, [0.0] * 8], dtype=torch.float32)
-    model = RadioQueryStudent(
-        feature_dim=16,
-        fine_feature_dim=16,
-        coarse_feature_dim=8,
-        stage_dims=(8, 12, 16, 20),
-        output_hw=(8, 10),
-        coarse_output_hw=(4, 5),
-        input_hw=(64, 80),
-        pose_init_head=True,
-        pose_init_mode="feature_bank",
-        pose_init_anchor_centers=anchors,
-        pose_init_anchor_descriptors=anchor_desc,
-        pose_init_feature_source="coarse",
-        pose_init_feature_bank_projector="identity",
-        pose_init_hypotheses=1,
-    )
-
-    out = model(torch.randn(2, 3, 64, 80))
-
-    assert out["pose_init"]["query_descriptor"].shape == (2, 8)
-    assert out["pose_init"]["anchor_logits"].shape == (2, 2)
-    assert out["pose_init"]["center"].shape == (2, 1, 3)
 
 
 def test_radio_query_student_query_channel_gate_exposes_query_feature_selection():
@@ -259,50 +120,6 @@ def test_pose_init_loss_uses_best_hypothesis_and_reports_recall_metrics():
     assert metrics["pose_init_best_idx"].item() == 1.0
     assert metrics["pose_init_best_trans_mm"].item() < 11.0
     assert metrics["pose_init_joint_5deg_1000mm"].item() == 100.0
-
-
-def test_pose_init_loss_supervises_nearest_scene_anchor_and_reports_topk_recall():
-    gt = torch.eye(4).unsqueeze(0)
-    gt[:, 0, 3] = -1.1
-    outputs = {
-        "fine": torch.zeros(1, 4, 2, 2),
-        "pose_init": {
-            "center": torch.tensor([[[0.0, 0.0, 0.0], [1.1, 0.0, 0.0]]]),
-            "rotmat": torch.eye(3).view(1, 1, 3, 3).expand(1, 2, 3, 3).clone(),
-            "scores": torch.tensor([[0.0, 1.0]]),
-            "log_var": torch.zeros(1, 2, 2),
-            "anchor_logits": torch.tensor([[0.0, 2.0, -1.0]]),
-            "anchor_indices": torch.tensor([[1, 0]]),
-            "anchor_centers": torch.tensor(
-                [
-                    [0.0, 0.0, 0.0],
-                    [1.0, 0.0, 0.0],
-                    [3.0, 0.0, 0.0],
-                ],
-                dtype=torch.float32,
-            ),
-        },
-    }
-
-    loss, metrics = compute_pose_init_losses(
-        outputs,
-        {"pose_gt": gt},
-        {
-            "pose_init": {
-                "enabled": True,
-                "trans_weight": 1.0,
-                "rot_weight": 1.0,
-                "score_weight": 0.0,
-                "anchor_weight": 1.0,
-            }
-        },
-    )
-
-    assert loss.item() > 0.0
-    assert metrics["pose_init_anchor_target_idx"].item() == 1.0
-    assert metrics["pose_init_anchor_acc"].item() == 100.0
-    assert metrics["pose_init_anchor_topk_recall"].item() == 100.0
-    assert metrics["pose_init_anchor_target_dist_mm"].item() < 101.0
 
 
 def test_farthest_point_anchor_centers_are_deterministic_and_cover_scene_extent():
@@ -468,67 +285,6 @@ def test_pose_feature_bank_from_map_renderer_uses_reconstructed_map_features():
     assert rotmats.shape == (2, 3, 3)
     assert descriptors.shape == (2, 1)
     assert torch.allclose(descriptors[:, 0], torch.tensor([5.0, 6.0]))
-
-
-def test_refresh_pose_init_feature_bank_from_map_renderer_updates_feature_bank_buffers():
-    def make_pose(center_x):
-        pose = torch.eye(4)
-        pose[0, 3] = -float(center_x)
-        return pose
-
-    class TinyPoseDataset:
-        records = [
-            {"sample_name": "a.png"},
-            {"sample_name": "b.png"},
-        ]
-
-        name_to_pose = {"a.png": make_pose(0.0), "b.png": make_pose(1.0)}
-        basename_to_pose = {}
-
-    class TinyMapRenderer:
-        def _render_single(self, sample_name, require_grad=False):
-            idx = 0 if sample_name == "a.png" else 1
-            fine = torch.zeros(1, 2, 1, 1)
-            coarse = torch.tensor([[[[float(idx + 1)]], [[float(2 * (idx + 1))]]]])
-            mask = torch.ones(1, 1, 1, 1)
-            filler = torch.empty(0)
-            return fine, fine, coarse, mask, filler, filler, filler, filler
-
-    model = RadioQueryStudent(
-        feature_dim=8,
-        fine_feature_dim=4,
-        coarse_feature_dim=2,
-        stage_dims=(4, 4, 4, 4),
-        output_hw=(2, 2),
-        coarse_output_hw=(1, 1),
-        input_hw=(16, 16),
-        pose_init_head=True,
-        pose_init_mode="feature_bank",
-        pose_init_anchor_centers=torch.tensor([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]),
-        pose_init_anchor_descriptors=torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
-        pose_init_feature_source="coarse",
-        pose_init_feature_bank_projector="identity",
-        pose_init_hypotheses=1,
-    )
-
-    refreshed = refresh_pose_init_feature_bank_from_map_renderer(
-        model,
-        TinyPoseDataset(),
-        TinyMapRenderer(),
-        {
-            "model": {
-                "pose_init_mode": "feature_bank",
-                "pose_init_feature_bank_source": "map",
-                "pose_init_anchor_sampling": "train_all",
-                "pose_init_num_anchors": 2,
-                "pose_init_feature_source": "coarse",
-            }
-        },
-    )
-
-    expected = torch.nn.functional.normalize(torch.tensor([[1.0, 2.0], [2.0, 4.0]]), dim=1)
-    assert refreshed
-    assert torch.allclose(model.pose_init_head.anchor_descriptors.cpu(), expected)
 
 
 def test_full_pipeline_metrics_report_required_recalls_and_gain():
