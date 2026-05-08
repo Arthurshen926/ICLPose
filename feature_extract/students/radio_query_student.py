@@ -1129,21 +1129,6 @@ class RadioQueryStudent(nn.Module):
         query_channel_gate_hidden_dim=None,
         query_channel_gate_zero_init=True,
         apply_query_channel_gate=False,
-        candidate_score_fusion_head=False,
-        candidate_score_fusion_input_dim=12,
-        candidate_score_fusion_hidden_dim=64,
-        candidate_score_fusion_zero_init=False,
-        candidate_score_fusion_initial_weights=None,
-        candidate_score_fusion_initial_bias=0.0,
-        candidate_score_map_fusion_head=False,
-        candidate_score_map_fusion_channels=3,
-        candidate_score_map_fusion_map_channels=8,
-        candidate_score_map_fusion_grid_size=4,
-        candidate_score_map_fusion_hidden_dim=64,
-        candidate_score_map_fusion_context_layers=0,
-        candidate_score_map_fusion_context_heads=1,
-        candidate_score_map_fusion_context_feedforward_dim=None,
-        candidate_score_map_fusion_context_residual=False,
         **kwargs,
     ):
         super().__init__()
@@ -1192,10 +1177,6 @@ class RadioQueryStudent(nn.Module):
         self.query_channel_gate_enabled = bool(query_channel_gate_enabled)
         self.query_channel_gate_zero_init = bool(query_channel_gate_zero_init)
         self.apply_query_channel_gate = bool(apply_query_channel_gate)
-        self.candidate_score_map_fusion_head_enabled = bool(candidate_score_map_fusion_head)
-        self.candidate_score_fusion_head_enabled = bool(
-            candidate_score_fusion_head or self.candidate_score_map_fusion_head_enabled
-        )
         stem_dim = stage_dims[0] or base_channels
         self.stem = nn.Sequential(
             ConvNormAct(in_channels, stem_dim, kernel_size=5, stride=2),
@@ -1364,31 +1345,7 @@ class RadioQueryStudent(nn.Module):
             if self.query_channel_gate_enabled
             else None
         )
-        if self.candidate_score_map_fusion_head_enabled:
-            self.candidate_score_fusion_head = CandidateScoreMapFusionHead(
-                vector_dim=int(candidate_score_fusion_input_dim),
-                score_map_channels=int(candidate_score_map_fusion_channels),
-                map_channels=int(candidate_score_map_fusion_map_channels),
-                grid_size=int(candidate_score_map_fusion_grid_size),
-                hidden_dim=int(candidate_score_map_fusion_hidden_dim or 0),
-                zero_init=bool(candidate_score_fusion_zero_init),
-                initial_vector_weights=candidate_score_fusion_initial_weights,
-                initial_bias=float(candidate_score_fusion_initial_bias),
-                context_layers=int(candidate_score_map_fusion_context_layers or 0),
-                context_heads=int(candidate_score_map_fusion_context_heads or 1),
-                context_feedforward_dim=candidate_score_map_fusion_context_feedforward_dim,
-                context_residual=bool(candidate_score_map_fusion_context_residual),
-            )
-        elif self.candidate_score_fusion_head_enabled:
-            self.candidate_score_fusion_head = CandidateScoreFusionHead(
-                input_dim=int(candidate_score_fusion_input_dim),
-                hidden_dim=int(candidate_score_fusion_hidden_dim or 0),
-                zero_init=bool(candidate_score_fusion_zero_init),
-                initial_weights=candidate_score_fusion_initial_weights,
-                initial_bias=float(candidate_score_fusion_initial_bias),
-            )
-        else:
-            self.candidate_score_fusion_head = None
+        self.candidate_score_fusion_head = None
         self.pose_init_head = None
 
         self.local_matcher = (
@@ -1464,16 +1421,6 @@ class RadioQueryStudent(nn.Module):
         if self.query_channel_gate is not None and self.query_channel_gate_zero_init:
             nn.init.zeros_(self.query_channel_gate.net[-1].weight)
             nn.init.zeros_(self.query_channel_gate.net[-1].bias)
-        if (
-            self.candidate_score_fusion_head is not None
-            and bool(candidate_score_fusion_zero_init)
-        ):
-            nn.init.zeros_(self.candidate_score_fusion_head.linear.weight)
-            nn.init.zeros_(self.candidate_score_fusion_head.linear.bias)
-        if self.candidate_score_fusion_head is not None:
-            apply_init = getattr(self.candidate_score_fusion_head, "apply_explicit_initialization", None)
-            if apply_init is not None:
-                apply_init()
         if self.fine_highres_zero_init and self.fine_highres_fuse is not None:
             nn.init.zeros_(self.fine_highres_fuse[-1].weight)
             if self.fine_highres_fuse[-1].bias is not None:
