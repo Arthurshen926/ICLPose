@@ -44,6 +44,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, help="FeatureExtract config")
     parser.add_argument("--checkpoint", required=True, help="Checkpoint containing model_state_dict")
+    parser.add_argument(
+        "--map-checkpoint",
+        default=None,
+        help="Optional checkpoint whose map_renderer_state_dict is used instead of --checkpoint",
+    )
     parser.add_argument("--split", choices=("train", "val"), default="val")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--batch-size", type=int, default=None)
@@ -66,14 +71,38 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-candidates", type=int, default=0)
     parser.add_argument("--limit-strategy", default="uniform")
+    parser.add_argument(
+        "--candidate-render-batch-size",
+        type=int,
+        default=None,
+        help="Override map_supervision.candidate_render_batch_size for evaluation",
+    )
     parser.add_argument("--fine-wls", action="store_true", help="Run one fine WLS update on selected candidates")
     parser.add_argument("--fine-topk", type=int, default=1, help="Number of scorer topK candidates to refine")
     parser.add_argument("--fine-update-scale", type=float, default=None, help="Override WLS pose update scale")
     parser.add_argument(
+        "--fine-score-stat",
+        choices=("mean", "max", "topk_mean", "peakiness"),
+        default="mean",
+        help="Local correlation statistic used by fine_score candidate selection",
+    )
+    parser.add_argument(
         "--fine-select",
-        choices=("score", "conf", "fine_score", "oracle"),
+        choices=("score", "conf", "fine_score", "fine_score_prior", "oracle"),
         default="score",
         help="Which refined candidate becomes final: scorer top1, max WLS confidence, fine corr score, or GT oracle.",
+    )
+    parser.add_argument(
+        "--fine-prior-weight",
+        type=float,
+        default=0.0,
+        help="For fine_score_prior, subtract this weight times standardized candidate motion from T0.",
+    )
+    parser.add_argument(
+        "--fine-prior-rot-weight",
+        type=float,
+        default=0.1,
+        help="Rotation cost weight for fine_score_prior candidate motion from T0.",
     )
     parser.add_argument("--out", default=None, help="Optional output JSON")
     return parser.parse_args()
@@ -97,6 +126,14 @@ def parse_float_csv(value: str | None) -> List[float] | None:
         return None
     values = [float(part) for part in value.split(",") if part.strip()]
     return values if values else None
+
+
+def apply_eval_overrides(cfg: Dict, args: argparse.Namespace) -> None:
+    if getattr(args, "candidate_render_batch_size", None) is not None:
+        cfg.setdefault("map_supervision", {})["candidate_render_batch_size"] = max(
+            0,
+            int(args.candidate_render_batch_size),
+        )
 
 
 def default_lattice(trans_cm: float, rot_deg: float) -> Tuple[List[float], List[float]]:
@@ -138,6 +175,34 @@ def gather_pose_bank(poses: torch.Tensor, indices: torch.Tensor) -> torch.Tensor
     return poses.gather(1, indices.view(view_shape).expand(-1, -1, 4, 4))
 
 
+def _row_standardize(values: torch.Tensor) -> torch.Tensor:
+    mean = values.mean(dim=1, keepdim=True)
+    std = values.std(dim=1, keepdim=True, unbiased=False).clamp(min=1e-6)
+    return (values - mean) / std
+
+
+def fine_prior_adjusted_scores(
+    fine_scores: torch.Tensor,
+    selected_pose: torch.Tensor,
+    init_pose: torch.Tensor,
+    *,
+    prior_weight: float,
+    rot_cost_weight: float,
+) -> torch.Tensor:
+    if float(prior_weight) <= 0.0:
+        return fine_scores
+    bsz, topk = selected_pose.shape[:2]
+    init_bank = init_pose[:, None].expand(-1, topk, -1, -1)
+    _rot_loss, delta_rot_deg, delta_trans_m = pose_error_tensors(
+        selected_pose.reshape(bsz * topk, 4, 4).float(),
+        init_bank.reshape(bsz * topk, 4, 4).float(),
+    )
+    delta_cost = delta_trans_m.view(bsz, topk) + float(rot_cost_weight) * (
+        delta_rot_deg.view(bsz, topk) * (math.pi / 180.0)
+    )
+    return _row_standardize(fine_scores.float()) - float(prior_weight) * _row_standardize(delta_cost.float())
+
+
 def map_pose_gt_for_batch(map_renderer: MapFeatureRenderer, batch: Dict, device: torch.device) -> torch.Tensor:
     poses = []
     for sample_name in batch["sample_name"]:
@@ -146,7 +211,15 @@ def map_pose_gt_for_batch(map_renderer: MapFeatureRenderer, batch: Dict, device:
     return torch.stack(poses, dim=0)
 
 
+def resolve_map_renderer_state(checkpoint: Dict, args: argparse.Namespace):
+    map_checkpoint_path = getattr(args, "map_checkpoint", None)
+    if map_checkpoint_path:
+        checkpoint = safe_torch_load(map_checkpoint_path)
+    return checkpoint.get("map_renderer_state_dict")
+
+
 def build_model_and_data(cfg: Dict, args: argparse.Namespace, device: torch.device):
+    apply_eval_overrides(cfg, args)
     cfg["training"]["num_workers"] = int(args.num_workers)
     if args.batch_size is not None:
         cfg["training"]["batch_size"] = int(args.batch_size)
@@ -218,7 +291,7 @@ def build_model_and_data(cfg: Dict, args: argparse.Namespace, device: torch.devi
         device=device,
         logger=logger,
     )
-    map_renderer.load_trainable_state(checkpoint.get("map_renderer_state_dict"))
+    map_renderer.load_trainable_state(resolve_map_renderer_state(checkpoint, args))
     map_renderer.set_train_mode(False)
     return model, loader, map_renderer
 
@@ -295,9 +368,13 @@ def evaluate_bucket(model, loader, map_renderer, cfg: Dict, args: argparse.Names
             feature="coarse",
             include_aux=False,
         )
+        candidate_coarse = eval_batch["eval_candidate_coarse"].float()
+        adapter = getattr(model, "candidate_basin_adapter", None)
+        if adapter is not None:
+            candidate_coarse = adapter(candidate_coarse).float()
         _loss, _metrics, details = candidate_score_fusion_listwise_loss(
             outputs["coarse"].float(),
-            eval_batch["eval_candidate_coarse"].float(),
+            candidate_coarse,
             eval_batch["eval_candidate_pose"].float(),
             pose_gt.float(),
             model.candidate_score_fusion_head,
@@ -399,16 +476,29 @@ def evaluate_bucket(model, loader, map_renderer, cfg: Dict, args: argparse.Names
                     highpass_kernel=int(map_cfg.get("candidate_score_fusion_highpass_kernel", 5)),
                     score_map_mode="peak_offset",
                 )
-                fine_score_rows.append(score_result["scores"])
+                if args.fine_score_stat == "mean":
+                    fine_score_rows.append(score_result["scores"])
+                else:
+                    fine_score_rows.append(score_result["score_stats"][args.fine_score_stat])
             fine_scores = torch.stack(fine_score_rows, dim=0)
+            fine_prior_scores = fine_prior_adjusted_scores(
+                fine_scores,
+                selected_pose,
+                init_pose,
+                prior_weight=float(args.fine_prior_weight),
+                rot_cost_weight=float(args.fine_prior_rot_weight),
+            )
             refined_cost = refined["cost"]
             oracle_refined_idx = refined_cost.argmin(dim=1)
             conf_idx = refined["conf_mean"].argmax(dim=1)
             fine_score_idx = fine_scores.argmax(dim=1)
+            fine_prior_idx = fine_prior_scores.argmax(dim=1)
             if args.fine_select == "oracle":
                 final_idx = oracle_refined_idx
             elif args.fine_select == "conf":
                 final_idx = conf_idx
+            elif args.fine_select == "fine_score_prior":
+                final_idx = fine_prior_idx
             elif args.fine_select == "fine_score":
                 final_idx = fine_score_idx
             else:

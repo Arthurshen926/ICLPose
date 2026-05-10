@@ -1,0 +1,21 @@
+# Combine the two useful Phase5 directions:
+# - warmstart the safe decoder-only map state;
+# - freeze map/query/scorer;
+# - train only the small residual candidate basin adapter.
+#
+# Selection uses top4 basin recall because top8 saturates early and can hide
+# regressions in the actual rerankable candidate set.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_clean_phase5_basin_adapter_multipos_b6.yaml
+exp_name: cpr_clean_phase5_basin_adapter_on_safemap_top4_b6
+
+training:
+  max_steps: 96
+  best_metric: map_candidate_score_fusion_top4_basin_recall
+  best_metric_mode: max
+
+map_supervision:
+  trainable: false
+  candidate_render_score_train_map: false
+  candidate_render_include_aux: false
+  candidate_render_batch_size: 32

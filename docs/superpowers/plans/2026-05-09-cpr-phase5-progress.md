@@ -119,3 +119,125 @@ The bottleneck is still selection:
    GT-align regularizer.
 5. Stop any map fine-tune if validation gain+ drops or full-lattice final mean
    regresses, even if cosine or compact-lattice pred_trans improves.
+
+## 2026-05-10 Continuation
+
+### Evaluation Infrastructure Fixes
+
+Added eval-only controls:
+
+- `--map-checkpoint` to load model/scorer from one checkpoint and map renderer
+  state from another.
+- `--candidate-render-batch-size` to override candidate render chunking at eval
+  time and avoid OOM/very slow full-lattice evaluation.
+- `fine_score_prior` plus `--fine-prior-weight` for a conservative topK
+  rerank diagnostic.
+- `--fine-score-stat` for `mean`, `max`, `topk_mean`, and `peakiness`
+  local-correlation rerank diagnostics.
+
+Regression tests were added in `tests/test_eval_cpr_buckets.py`.
+
+### Current Best Results
+
+Plan default lattice, val32, top8 fine-score rerank, `fine_update_scale=0`,
+using adapter model plus safe decoder-only map checkpoint:
+
+| bucket | final mean | final median | gain+ | top4 | top8 | fine top8 oracle mean |
+|---|---:|---:|---:|---:|---:|---:|
+| 0.1m/2deg | 143.9mm | 141.4mm | 0.312 | 1.000 | 1.000 | 59.6mm |
+| 0.25m/5deg | 164.1mm | 0.0mm | 0.625 | 0.688 | 0.844 | 80.1mm |
+| 0.5m/10deg | 105.6mm | 0.0mm | 0.844 | 0.750 | 0.938 | 46.8mm |
+| 1.0m/20deg | 337.0mm | 0.0mm | 0.750 | 0.688 | 0.719 | 227.8mm |
+
+Safe decoder-only map without the adapter is worse on the medium bucket:
+0.5m/10deg final mean is 171.9mm versus 105.6mm for adapter+safe-map.
+
+Interpretation:
+
+- Safe map-side fine decoder is useful, mainly when combined with the
+  adapter/coarse candidate path.
+- The adapter helps medium/large basin; it should not be treated as a
+  small-basin refiner.
+- Exact 0mm medians remain a fixed-lattice artifact; use means, gain+, and
+  topK/oracle-topK for decisions.
+
+### Negative/Diagnostic Results
+
+Adapter-only hard/rank fine-tunes on plan-medium and small lattices did not
+learn useful ranking. `cfrank` stayed around 0.693 and validation pred_trans
+worsened or stayed worse than the current adapter checkpoint.
+
+Training `candidate_score_fusion_head + candidate_basin_adapter` also failed to
+improve validation. First validation:
+
+- planhard: pred_trans 332.9mm, top8 0.969.
+- smallguard: pred_trans 233.1mm, top8 0.875.
+
+Fine WLS updates are not stable as a main path:
+
+| update scale | 0.25m final mean | 0.5m final mean | note |
+|---:|---:|---:|---|
+| 0.0 | 164.1mm | 105.6mm | current best mean |
+| 0.1 | 170.4mm | 117.3mm | median improves, mean worsens |
+| 0.2 | 177.1mm | 129.0mm | worse |
+| 0.5 | 199.3mm | 164.3mm | worse |
+| 1.0 | 243.6mm | 223.8mm | over-shoot |
+
+Even oracle-within-top8 worsens as update scale increases, so the issue is not
+only selection; the WLS update itself creates outliers.
+
+Hand-coded fine rerank variants did not solve selection:
+
+- `fine_score_prior` improves 0.1m/2deg to about 98-106mm, but damages
+  0.25m/0.5m/1.0m.
+- `topk_mean` and `max` local-correlation statistics are worse than the
+  original mean statistic.
+
+### Updated Bottleneck
+
+The current bottleneck is now:
+
+```text
+coarse local lattice has enough oracle coverage
+-> coarse topK is adequate for 0.25/0.5 and partly 1.0
+-> fine topK contains good candidates
+-> current fine reranker selects the wrong one
+-> WLS update is not robust enough to rescue selection
+```
+
+This is visible from oracle-top8 means: 0.25m/5deg can reach about 80mm and
+0.5m/10deg about 47mm if the system chooses correctly within top8.
+
+### Next Mainline Adjustment
+
+Stop spending cycles on:
+
+- residual adapter-only ranking;
+- scorer-head retuning on the same coarse features;
+- WLS step-size tuning;
+- hand-picked fine correlation summary statistics.
+
+Next implementation should be a trainable fine topK candidate selector:
+
+```text
+query fine + rendered candidate fine/depth/mask
+-> local correlation score maps and confidence summaries
+-> light candidate selector logits over coarse topK
+-> supervised by GT pose error within topK
+-> optionally followed by very small/gated WLS only when confidence is high
+```
+
+The selector target should be GT pose error in topK, not WLS-soft target. Map
+and query can stay frozen for the first selector probe; after it works, repeat
+with safe map-side fine-tune loaded.
+
+### Storage
+
+Removed two old implicit-retrieval feature export directories that are not used
+by the current CPR configs:
+
+- `features_radio_dual_v74_implicit_joint_pose_energy`
+- `features_radio_dual_v75_implicit_joint_pose_energy_no_teacher`
+
+This freed about 36GB; `/root/ICLPose/result` went from about 46GB free to
+about 81GB free.

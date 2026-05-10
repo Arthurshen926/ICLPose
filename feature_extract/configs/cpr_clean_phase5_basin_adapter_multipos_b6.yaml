@@ -1,0 +1,42 @@
+# Expert-v2 candidate-gradient probe.
+# Core map, query, and scorer are frozen. Candidate loss trains only a small
+# residual basin adapter on rendered coarse features.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_clean_phase4_v13_coarse_lattice_probe_medium_combo_rankhard_batch32_b6.yaml
+exp_name: cpr_clean_phase5_basin_adapter_multipos_b6
+
+model:
+  candidate_basin_adapter_enabled: true
+  candidate_basin_adapter_hidden_dim: 64
+  candidate_basin_adapter_max_scale: 0.10
+  candidate_basin_adapter_initial_logit_scale: -4.0
+  candidate_basin_adapter_detach_base: true
+
+dataset:
+  max_train_samples: 64
+  max_val_samples: 32
+
+training:
+  batch_size: 6
+  max_steps: 96
+  log_every: 2
+  lr: 0.0002
+  best_metric: map_candidate_score_fusion_top8_basin_recall
+  best_metric_mode: max
+  freeze_model_except_prefixes:
+    - "candidate_basin_adapter."
+  model_lr_scales:
+    candidate_basin_adapter.: 1.0
+
+map_supervision:
+  trainable: false
+  candidate_render_score_train_map: false
+  candidate_render_include_aux: false
+  candidate_render_batch_size: 32
+  candidate_score_fusion_weight: 0.02
+  candidate_score_fusion_target_mode: multi_positive
+  candidate_score_fusion_temperature: 0.35
+  candidate_score_fusion_cost_regression_weight: 0.0
+  candidate_score_fusion_pairwise_rank_weight: 0.02
+  candidate_score_fusion_pairwise_rank_min_gap_m: 0.05
+  candidate_score_fusion_pairwise_rank_temperature: 0.5

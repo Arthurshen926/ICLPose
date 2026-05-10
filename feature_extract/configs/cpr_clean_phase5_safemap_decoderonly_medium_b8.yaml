@@ -1,0 +1,49 @@
+# Expert-v2 safe map-side fine-tune.
+# No candidate-gradient; only the fine decoder is updated against fixed query
+# features and teacher anchors. Hash/latent/FSM/coarse fusion stay frozen.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_clean_phase4_v13_coarse_lattice_probe_medium_combo_rankhard_batch32_b6.yaml
+exp_name: cpr_clean_phase5_safemap_decoderonly_medium_b8
+
+dataset:
+  max_train_samples: 64
+  max_val_samples: 32
+
+training:
+  batch_size: 8
+  max_steps: 128
+  log_every: 2
+  lr: 0.00002
+  best_metric: map_query_fine_loss
+  best_metric_mode: min
+  freeze_model_except_prefixes:
+    - "__no_model_params__"
+
+map_supervision:
+  trainable: true
+  train_geometry: false
+  train_color: false
+  train_fine_decoder: true
+  train_coarse_fusion: false
+  train_feat_sharp: false
+  train_fsm: false
+  train_hash_mlp: false
+  train_latent: false
+  map_lr_scale: 1.0
+  detach_query_features: true
+
+  candidate_render_score_train_map: false
+  candidate_render_batch_size: 0
+  candidate_render_score_weight: 0.0
+  candidate_score_fusion_weight: 0.0
+  candidate_refined_pose_weight: 0.0
+
+  query_fine_weight: 0.10
+  query_coarse_weight: 0.05
+  query_corr_ce_weight: 0.0
+  query_corr_subpixel_weight: 0.0
+  query_corr_flow_cosine_weight: 0.0
+  query_corr_peak_margin_weight: 0.0
+  query_corr_wls_pose_weight: 0.0
+  rendered_teacher_fine_weight: 0.002
+  rendered_teacher_coarse_weight: 0.002

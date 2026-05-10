@@ -1,0 +1,38 @@
+# Phase5 CPR: train only the residual candidate basin adapter on the small
+# lattice. The goal is conservative candidate ordering when T0 is already in
+# or near the fine basin.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_clean_phase5_basin_adapter_on_safemap_top4_b6.yaml
+exp_name: cpr_clean_phase5_basin_adapter_safemap_smallguard_b2
+
+dataset:
+  max_train_samples: 64
+  max_val_samples: 32
+
+training:
+  batch_size: 2
+  max_steps: 160
+  log_every: 2
+  lr: 0.00015
+  best_metric: map_candidate_score_fusion_pred_trans_mm
+  best_metric_mode: min
+
+map_supervision:
+  perturb_trans_cm_choices: [10.0, 25.0]
+  perturb_rot_deg_choices: [2.0, 5.0]
+  coarse_pose_lattice_trans_cm: [0.0, 5.0, 10.0, 25.0]
+  coarse_pose_lattice_rot_deg: [0.0, 1.0, 2.0, 5.0]
+  coarse_pose_lattice_combine_trans_rot: true
+  coarse_pose_lattice_max_candidates: 0
+  coarse_pose_lattice_limit_strategy: head
+  candidate_render_batch_size: 32
+
+  candidate_score_fusion_weight: 0.03
+  candidate_score_fusion_target_mode: gt_pose_error_soft
+  candidate_score_fusion_temperature: 0.25
+  candidate_score_fusion_target_temperature_m: 0.04
+  candidate_score_fusion_cost_regression_weight: 0.05
+  candidate_score_fusion_cost_regression_temperature_m: 0.04
+  candidate_score_fusion_pairwise_rank_weight: 0.10
+  candidate_score_fusion_pairwise_rank_min_gap_m: 0.02
+  candidate_score_fusion_pairwise_rank_temperature: 0.25

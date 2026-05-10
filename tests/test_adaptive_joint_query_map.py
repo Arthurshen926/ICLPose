@@ -2993,6 +2993,62 @@ def test_select_candidate_stage2_indices_can_teacher_force_oracle_candidates():
     assert selected.tolist() == [[1, 3]]
 
 
+def test_candidate_basin_adapter_detaches_base_and_updates_adapter_only():
+    adapter = train_impl.CandidateBasinAdapter(
+        channels=4,
+        hidden_dim=8,
+        max_scale=0.1,
+        detach_base=True,
+    )
+    feat = torch.randn(2, 3, 4, 5, 6, requires_grad=True)
+
+    out = adapter(feat)
+    loss = out.square().mean()
+    loss.backward()
+
+    assert feat.grad is None
+    assert adapter.net[-1].weight.grad is not None
+
+
+def test_candidate_score_fusion_multi_positive_uses_all_basin_candidates():
+    class SumScorer(torch.nn.Module):
+        def forward(self, features):
+            return features[..., 0]
+
+    query = torch.zeros(1, 2, 4, 4)
+    candidate_feat = torch.zeros(1, 3, 2, 4, 4)
+    candidate_feat[:, 2] = 1.0
+    poses = torch.stack(
+        [
+            torch.stack(
+                [
+                    _pose_with_center([0.0, 0.0, 0.0]),
+                    _pose_with_center([0.1, 0.0, 0.0]),
+                    _pose_with_center([1.0, 0.0, 0.0]),
+                ]
+            )
+        ]
+    )
+    pose_gt = _pose_with_center([0.0, 0.0, 0.0]).view(1, 4, 4)
+
+    loss, metrics, details = train_impl.candidate_score_fusion_listwise_loss(
+        query,
+        candidate_feat,
+        poses,
+        pose_gt,
+        SumScorer(),
+        target_mode="multi_positive",
+        temperature=1.0,
+        basin_trans_m=0.25,
+        basin_rot_deg=5.0,
+        return_details=True,
+    )
+
+    assert torch.isfinite(loss)
+    assert metrics["map_candidate_score_fusion_positive_count"].item() == 2.0
+    assert details["target_idx"].item() == 0
+
+
 def test_maybe_attach_pose_candidate_renders_can_use_batch_candidate_cache():
     class FakeRenderer:
         device = torch.device("cpu")

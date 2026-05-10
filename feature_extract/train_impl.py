@@ -204,6 +204,11 @@ DEFAULT_CONFIG = {
         "query_channel_gate_hidden_dim": None,
         "query_channel_gate_zero_init": True,
         "apply_query_channel_gate": False,
+        "candidate_basin_adapter_enabled": False,
+        "candidate_basin_adapter_hidden_dim": 64,
+        "candidate_basin_adapter_max_scale": 0.1,
+        "candidate_basin_adapter_initial_logit_scale": -4.0,
+        "candidate_basin_adapter_detach_base": True,
     },
     "training": {
         "device": "cuda",
@@ -2089,10 +2094,27 @@ def candidate_score_fusion_listwise_loss(
         )
         pose_cost = refined_target["cost"].detach()
         target_idx = pose_cost.masked_fill(~valid, float("inf")).argmin(dim=1)
+    true_basin_mask = valid & (trans_err_m <= float(basin_trans_m)) & (rot_err_deg <= float(basin_rot_deg))
+    positive_mask = true_basin_mask
+    no_positive = ~positive_mask.any(dim=1)
+    if no_positive.any():
+        positive_mask = positive_mask.clone()
+        positive_mask[no_positive, target_idx[no_positive]] = True
     if target_mode_key in ("hard", "argmin", "ce", "gt_pose_error_hard", "pose_error_hard"):
         loss = F.cross_entropy(logits, target_idx)
     elif target_mode_key in ("wls", "wls_hard", "refined_wls"):
         loss = F.cross_entropy(logits, target_idx)
+    elif target_mode_key in (
+        "multi_positive",
+        "multi_pos",
+        "basin_multi_positive",
+        "basin_multi_pos",
+        "topk_recall",
+        "basin_recall",
+    ):
+        log_den = torch.logsumexp(logits.masked_fill(~valid, -1.0e6), dim=1)
+        log_num = torch.logsumexp(logits.masked_fill(~positive_mask, -1.0e6), dim=1)
+        loss = -(log_num - log_den).mean()
     elif target_mode_key in (
         "soft",
         "soft_pose",
@@ -2109,7 +2131,10 @@ def candidate_score_fusion_listwise_loss(
         loss = -(target_probs * log_probs).sum(dim=1).mean()
         soft_target_entropy = -(target_probs * torch.log(target_probs.clamp(min=1e-8))).sum(dim=1).mean()
     else:
-        raise ValueError("candidate score fusion target_mode must be 'hard', 'soft', 'wls_hard', or 'wls_soft'")
+        raise ValueError(
+            "candidate score fusion target_mode must be 'hard', 'soft', 'multi_positive', "
+            "'wls_hard', or 'wls_soft'"
+        )
     cost_regression_loss = torch.zeros((), device=render_scores.device, dtype=render_scores.dtype)
     if float(cost_regression_weight) > 0.0:
         cost_temp = max(
@@ -2136,7 +2161,7 @@ def candidate_score_fusion_listwise_loss(
             pairwise_rank_acc = (logit_margin[pair_valid] > 0.0).float().mean()
             loss = loss + float(pairwise_rank_weight) * pairwise_rank_loss
     pred_idx = logits.argmax(dim=1)
-    basin_mask = valid & (trans_err_m <= float(basin_trans_m)) & (rot_err_deg <= float(basin_rot_deg))
+    basin_mask = true_basin_mask
     oracle_basin = basin_mask.any(dim=1).float().mean().detach()
     target_basin = basin_mask[torch.arange(bsz, device=render_scores.device), target_idx].float().mean().detach()
     topk_basin = {}
@@ -2171,6 +2196,7 @@ def candidate_score_fusion_listwise_loss(
         "map_candidate_score_fusion_target_trans_mm": (trans_err_m[batch_idx, target_idx] * 1000.0).mean().detach(),
         "map_candidate_score_fusion_target_rot_deg": rot_err_deg[batch_idx, target_idx].mean().detach(),
         "map_candidate_score_fusion_num_candidates": torch.tensor(float(num_candidates), device=render_scores.device),
+        "map_candidate_score_fusion_positive_count": positive_mask.float().sum(dim=1).mean().detach(),
         "map_candidate_score_fusion_soft_target_entropy": soft_target_entropy.detach(),
         "map_candidate_score_fusion_cost_regression_loss": cost_regression_loss.detach(),
         "map_candidate_score_fusion_pairwise_rank_loss": pairwise_rank_loss.detach(),
@@ -4397,6 +4423,65 @@ def _candidate_fusion_vector_dim(map_cfg, model_cfg):
     return render_dim + len(CANDIDATE_QUALITY_FEATURE_NAMES)
 
 
+class CandidateBasinAdapter(nn.Module):
+    """Small residual adapter used only for candidate scoring features."""
+
+    def __init__(self, channels, hidden_dim=64, max_scale=0.1, initial_logit_scale=-4.0, detach_base=True):
+        super().__init__()
+        channels = int(channels)
+        hidden_dim = int(hidden_dim)
+        if channels <= 0:
+            raise ValueError("CandidateBasinAdapter channels must be positive")
+        if hidden_dim <= 0:
+            raise ValueError("CandidateBasinAdapter hidden_dim must be positive")
+        self.channels = channels
+        self.max_scale = float(max_scale)
+        self.detach_base = bool(detach_base)
+        self.logit_scale = nn.Parameter(torch.tensor(float(initial_logit_scale), dtype=torch.float32))
+        self.net = nn.Sequential(
+            nn.Conv2d(channels, hidden_dim, kernel_size=1),
+            nn.GELU(),
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1, groups=hidden_dim),
+            nn.GELU(),
+            nn.Conv2d(hidden_dim, channels, kernel_size=1),
+        )
+        nn.init.zeros_(self.net[-1].weight)
+        if self.net[-1].bias is not None:
+            nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, feat):
+        single_bank = feat.ndim == 4
+        if single_bank:
+            flat = feat
+            bank_shape = None
+        elif feat.ndim == 5:
+            bsz, count, channels, height, width = feat.shape
+            flat = feat.reshape(bsz * count, channels, height, width)
+            bank_shape = (bsz, count, channels, height, width)
+        else:
+            raise ValueError(f"CandidateBasinAdapter expects 4D or 5D features, got {tuple(feat.shape)}")
+        if flat.shape[1] != self.channels:
+            raise ValueError(f"CandidateBasinAdapter channels={self.channels}, got {flat.shape[1]}")
+        base = flat.detach() if self.detach_base else flat
+        scale = self.max_scale * torch.sigmoid(self.logit_scale.to(dtype=flat.dtype, device=flat.device))
+        adapted = F.normalize(base + scale * self.net(base.float()).to(dtype=flat.dtype), dim=1)
+        if single_bank:
+            return adapted
+        return adapted.reshape(bank_shape)
+
+
+def _build_candidate_basin_adapter(model_cfg, coarse_feature_dim):
+    if not bool(model_cfg.get("candidate_basin_adapter_enabled", False)):
+        return None
+    return CandidateBasinAdapter(
+        channels=int(coarse_feature_dim),
+        hidden_dim=int(model_cfg.get("candidate_basin_adapter_hidden_dim", 64)),
+        max_scale=float(model_cfg.get("candidate_basin_adapter_max_scale", 0.1)),
+        initial_logit_scale=float(model_cfg.get("candidate_basin_adapter_initial_logit_scale", -4.0)),
+        detach_base=bool(model_cfg.get("candidate_basin_adapter_detach_base", True)),
+    )
+
+
 def _build_candidate_score_fusion_head(model_cfg, map_cfg):
     if not bool(model_cfg.get("candidate_score_fusion_head", False)):
         return None
@@ -4522,6 +4607,7 @@ def build_radio_query_student(
         apply_query_channel_gate=bool(model_cfg.get("apply_query_channel_gate", False)),
     )
     model.candidate_score_fusion_head = _build_candidate_score_fusion_head(model_cfg, cfg.get("map_supervision", {}))
+    model.candidate_basin_adapter = _build_candidate_basin_adapter(model_cfg, coarse_feature_dim)
     return model
 
 
@@ -7073,6 +7159,7 @@ def compute_map_supervision(
     local_flow_head=None,
     local_corr_projector=None,
     candidate_score_fusion_head=None,
+    candidate_basin_adapter=None,
     map_renderer=None,
 ):
     map_cfg = cfg.get("map_supervision", {})
@@ -7742,6 +7829,11 @@ def compute_map_supervision(
         ):
             candidate_feat = _resize_feature_bank(candidate_feat, query_candidate_feat.shape[-2:])
             candidate_mask = _resize_mask_bank(candidate_mask, query_candidate_feat.shape[-2:])
+            if (
+                candidate_basin_adapter is not None
+                and candidate_score_fusion_feature in ("coarse", "query_coarse")
+            ):
+                candidate_feat = candidate_basin_adapter(candidate_feat)
             (
                 candidate_score_fusion_loss,
                 candidate_score_fusion_metrics,
@@ -9430,6 +9522,7 @@ def validate(model, loader, cfg, device, qual_dir, feature_track_root, step, log
                     local_flow_head=getattr(model, "local_flow_head", None),
                     local_corr_projector=getattr(model, "local_corr_projector", None),
                     candidate_score_fusion_head=getattr(model, "candidate_score_fusion_head", None),
+                    candidate_basin_adapter=getattr(model, "candidate_basin_adapter", None),
                     map_renderer=map_renderer,
                 )
                 total = main_total + map_total
@@ -10166,6 +10259,7 @@ def main():
                     local_flow_head=getattr(model, "local_flow_head", None),
                     local_corr_projector=getattr(model, "local_corr_projector", None),
                     candidate_score_fusion_head=getattr(model, "candidate_score_fusion_head", None),
+                    candidate_basin_adapter=getattr(model, "candidate_basin_adapter", None),
                     map_renderer=map_renderer,
                 )
                 total_loss = main_total + map_total
