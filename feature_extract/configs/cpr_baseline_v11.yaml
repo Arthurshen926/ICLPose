@@ -1,0 +1,183 @@
+# CPR baseline v11: frozen V4 + trainable correlation heads (projector + matcher)
+# Key insight: V6/V7/V8 all failed because unfreezing the backbone caused feature
+#   degradation (fine_cos 0.99→0.85) before correlation became useful.
+#   V9/V10 showed that directly matching feature spaces fails in both directions.
+#   The only remaining approach: keep V4 backbone FROZEN and train only the
+#   correlation-processing heads (LocalCorrProjector + DepthAwareLocalMatcher).
+#
+# Strategy:
+#   - FREEZE V4 student backbone (cos 0.99 teacher, cos 0.67 DCFF) — no drift
+#   - Train ONLY local_corr_projector and local_matcher
+#   - Projector: non-zero-init, learns to remap student/DCFF features for
+#     better dot-product similarity (residual block with L2-norm output)
+#   - Matcher: learns to refine correlation using geometric context (depth, xy)
+#   - DCFF correlation losses (CE + subpixel) at GT pose = offset (0,0)
+#   - Teacher correspondence supervision for matcher geometric training
+#   - Pure L1 loss on projected DCFF features (no cosine — avoid V9/V10 trap)
+#
+# Phase 1 (V11): Train projector+matcher for student↔DCFF correlation
+# Phase 2 (V12): Add refinement losses on top of aligned correlation
+
+base_config: null
+exp_name: cpr_baseline_v11
+output_dir: /root/ICLPose/result/feature_extract
+
+model:
+  feature_dim: 64
+  fine_feature_dim: 64
+  coarse_feature_dim: 64
+  base_channels: 32
+  stage_dims: [32, 64, 96, 128]
+  dropout: 0.0
+  l2_normalize: true
+
+  global_context_enabled: true
+  global_context_zero_init: true
+  window_attention_layers: 2
+  window_attention_heads: 8
+  window_attention_size: 16
+  window_attention_mlp_ratio: 2.0
+  window_attention_shift: true
+  window_attention_zero_init: true
+
+  local_matcher_enabled: true
+  local_matcher_radius: 4
+  local_matcher_hidden_dim: 64
+  local_matcher_zero_init: true
+  local_matcher_residual_scale: 1.0
+  local_matcher_context_mode: basic
+
+  local_corr_projector_enabled: true
+  local_corr_projector_hidden_dim: 128
+  local_corr_projector_output_dim: 64
+  local_corr_projector_zero_init: false
+  local_corr_projector_l2_normalize: true
+
+  warmstart_strict: false
+
+dataset:
+  source_dir: /hy-tmp/Cambridge_stdloc/OldHospital/processed
+  colmap_dir: /hy-tmp/Cambridge_stdloc/OldHospital/sparse/0
+  feature_dir: /root/ICLPose/result/feature_extract/features_radio_dual_v68_align_stop640/cambridge_oldhospital_processed
+  train_split: /hy-tmp/Cambridge_stdloc/OldHospital/dataset_train.txt
+  val_split: /hy-tmp/Cambridge_stdloc/OldHospital/dataset_test.txt
+  feature_id_space: colmap
+  image_patterns:
+    - seq*/*.png
+  input_hw: [1088, 1920]
+  student_feature_hw: [68, 120]
+  student_coarse_feature_hw: [17, 30]
+  feature_hw: [272, 480]
+  coarse_feature_hw: [68, 120]
+  # Teacher correspondences for matcher geometric training
+  teacher_correspondence_train_path: /root/ICLPose/result/result/feature_extract/teacher_corr/oldhospital_train_self_loftr_top1_128
+  teacher_correspondence_val_path: /root/ICLPose/result/result/feature_extract/teacher_corr/oldhospital_test_renderloftr_top1_32
+  teacher_correspondence_max_points: 256
+  teacher_correspondence_coordinate_space: auto
+  noise_buckets:
+    - [0.1, 2.0]
+    - [0.25, 5.0]
+    - [0.5, 10.0]
+    - [1.0, 20.0]
+    - [2.0, 30.0]
+
+training:
+  seed: 973
+  lr: 0.001
+  batch_size: 2
+  max_steps: 4000
+  log_every: 10
+  epochs: 20
+  # FREEZE everything except correlation-processing heads
+  freeze_model_except_prefixes:
+    - "local_matcher."
+    - "local_corr_projector."
+  model_lr_scales:
+    local_matcher.: 4.0
+    local_corr_projector.: 8.0
+
+loss:
+  # NO teacher anchoring — V4 backbone is frozen at perfection
+  fine_l1_weight: 0.0
+  fine_cos_weight: 0.0
+  coarse_l1_weight: 0.0
+  coarse_cos_weight: 0.0
+
+map_supervision:
+  enabled: true
+  config_path: /root/ICLPose/feature_field/configs/reconstruction_cambridge_oldhospital_processed_cached64_v11_residual_spatial.yaml
+
+  query_fine_key: fine
+  query_local_fine_key: fine
+
+  # Minimal DCFF trainability — keeps gradient chain alive through rendered features
+  # Only train latent embeddings at extremely low LR to avoid V10-style degradation
+  trainable: true
+  map_lr_scale: 0.001
+  latent_lr_scale: 0.001
+  train_fine_decoder: false
+  train_coarse_fusion: false
+  train_feat_sharp: false
+  train_fsm: false
+  train_hash_mlp: false
+  train_latent: true
+  train_geometry: false
+  train_color: false
+
+  # Light DCFF feature matching — provides primary gradient path
+  query_fine_weight: 0.5
+  query_coarse_weight: 0.25
+  query_fine_infonce_weight: 0.1
+
+  coarse_feature_metric_energy_weight: 0.0
+
+  # DCFF correlation: CE + subpixel at GT pose (offset = 0,0)
+  # This directly supervises the projector+matcher to produce correct correlation
+  query_corr_radius: 8
+  query_corr_ce_weight: 1.0
+  query_corr_subpixel_weight: 1.0
+  query_corr_peak_margin_weight: 3.0
+  query_corr_ce_temperature: 0.050
+  query_corr_wls_pose_weight: 0.0
+  perturb_render_negatives: true
+  perturb_trans_cm_choices: [2.0, 5.0, 10.0, 20.0]
+  perturb_rot_deg: 0.5
+
+  # Teacher correspondence supervision (student↔student via LoFTR)
+  # Helps matcher learn geometric reasoning patterns
+  teacher_corr_weight: 0.3
+  teacher_corr_temperature: 0.07
+  teacher_corr_min_confidence: 0.3
+  teacher_corr_min_points: 4
+  teacher_corr_use_projector: true
+  teacher_corr_positive_weight: 0.5
+  teacher_corr_margin_weight: 0.3
+  teacher_corr_margin: 0.1
+  teacher_corr_negative_exclusion_px: 8.0
+  teacher_corr_local_patch_weight: 0.1
+  teacher_corr_local_patch_radius: 2
+  teacher_corr_local_patch_temperature: 0.05
+  teacher_corr_local_patch_min_points: 8
+  teacher_corr_local_patch_positive_weight: 0.3
+  teacher_corr_local_patch_margin_weight: 0.2
+
+  # All refinement disabled for Phase 1
+  feature_metric_pose_weight: 0.0
+  feature_metric_pose_damping: 0.05
+  feature_metric_pose_update_scale: 0.25
+  feature_metric_pose_rot_weight: 0.1
+  feature_metric_pose_trans_weight: 30.0
+  feature_metric_pose_normalize: true
+
+  rendered_teacher_fine_weight: 0.0
+  rendered_teacher_fine_weight_end: 0.0
+  rendered_teacher_fine_weight_anneal_epochs: 1
+
+  candidate_render_score_weight: 0.0
+  candidate_score_fusion_weight: 0.0
+  candidate_refined_pose_weight: 0.0
+  candidate_two_stage_enabled: false
+  coarse_pose_energy_weight: 0.0
+
+export:
+  fine_key: fine

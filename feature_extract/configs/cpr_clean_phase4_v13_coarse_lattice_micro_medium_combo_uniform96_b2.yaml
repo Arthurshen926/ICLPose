@@ -1,0 +1,13 @@
+# Micro diagnostic for medium combined lattice with 96 uniform candidates.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_clean_phase4_v13_coarse_lattice_probe_medium_combo_uniform96_b8.yaml
+exp_name: cpr_clean_phase4_v13_coarse_lattice_micro_medium_combo_uniform96_b2
+
+dataset:
+  max_train_samples: 8
+  max_val_samples: 4
+
+training:
+  batch_size: 2
+  max_steps: 40
+  log_every: 1

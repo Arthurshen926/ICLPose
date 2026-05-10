@@ -1,0 +1,11 @@
+# Same top1-oriented small combined-lattice probe as rankhard_b6, with chunked
+# batched candidate rendering enabled and a larger batch.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_clean_phase4_v13_coarse_lattice_probe_small_combo_rankhard_b6.yaml
+exp_name: cpr_clean_phase4_v13_coarse_lattice_probe_small_combo_rankhard_batch32_b8
+
+training:
+  batch_size: 8
+
+map_supervision:
+  candidate_render_batch_size: 32

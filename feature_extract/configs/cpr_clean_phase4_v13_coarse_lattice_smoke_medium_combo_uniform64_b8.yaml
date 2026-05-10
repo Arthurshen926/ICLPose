@@ -1,0 +1,13 @@
+# Fast medium-basin smoke: combined translation x rotation lattice, 64 uniform
+# candidates, small subset for rapid topK/oracle feedback.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_clean_phase4_v13_coarse_lattice_probe_medium_combo_uniform64_b16.yaml
+exp_name: cpr_clean_phase4_v13_coarse_lattice_smoke_medium_combo_uniform64_b8
+
+dataset:
+  max_train_samples: 32
+  max_val_samples: 16
+
+training:
+  batch_size: 8
+  max_steps: 200

@@ -1,10 +1,16 @@
-# Camera Pose Refinement baseline -- Phase 1
-# No fine_loc, no pose_init, no candidate scorer, no retrieval.
-# Coarse: feature-metric energy for large-basin correction.
-# Fine: dense correlation + WLS for high-precision refinement.
+# CPR baseline v13: maximize student↔DCFF cosine similarity
+# Strategy: freeze backbone, train fine_head/coarse_head
+# with HEAVY DCFF feature alignment loss and minimal RADIO anchor.
+# Key changes from V12:
+#   - query_fine_weight: 0.5 → 2.0 (massive DCFF alignment)
+#   - RADIO teacher weights: 0.15 → 0.05 (minimal anchor)
+#   - correlation weight: 0.2 → 0.0 (remove correlation, focus on cos)
+#   - Train only fine_head, coarse_head
+# Rationale: FM-GN needs high cos(student, DCFF). V12 improved correlation
+#   but not cos. V13 directly maximizes cos with DCFF.
 
-base_config: null  # standalone, no parent
-exp_name: cpr_baseline_v1
+base_config: null
+exp_name: cpr_baseline_v13
 output_dir: /root/ICLPose/result/feature_extract
 
 model:
@@ -39,7 +45,6 @@ model:
   local_corr_projector_l2_normalize: true
 
   warmstart_strict: false
-  # No fine_loc_head, no pose_init_head, no candidate scorer
 
 dataset:
   source_dir: /hy-tmp/Cambridge_stdloc/OldHospital/processed
@@ -64,76 +69,62 @@ dataset:
 
 training:
   seed: 973
-  lr: 0.00005
+  lr: 0.0001
   batch_size: 2
-  max_steps: 2000
+  max_steps: 8000
   log_every: 10
-  epochs: 10
+  epochs: 40
   freeze_model_except_prefixes:
-    - "global_context."
-    - "window_attention."
-    - "local_matcher."
-    - "local_corr_projector."
-    - "stage3."
-    - "stage4."
+    # ONLY train the output heads
     - "fine_head."
     - "coarse_head."
   model_lr_scales:
-    global_context.: 0.25
-    window_attention.: 0.25
-    local_matcher.: 4.0
-    local_corr_projector.: 8.0
-    stage3.: 0.03
-    stage4.: 0.08
-    fine_head.: 0.35
-    coarse_head.: 0.35
+    fine_head.: 1.0
+    coarse_head.: 1.0
 
 loss:
-  fine_l1_weight: 0.3
-  fine_cos_weight: 0.3
-  coarse_l1_weight: 0.3
-  coarse_cos_weight: 0.3
+  # Minimal RADIO anchor (prevent collapse)
+  fine_l1_weight: 0.05
+  fine_cos_weight: 0.05
+  coarse_l1_weight: 0.03
+  coarse_cos_weight: 0.03
 
 map_supervision:
   enabled: true
   config_path: /root/ICLPose/feature_field/configs/reconstruction_cambridge_oldhospital_processed_cached64_v11_residual_spatial.yaml
 
-  # Direct query-map alignment
   query_fine_key: fine
   query_local_fine_key: fine
-  query_fine_weight: 0.10
-  query_coarse_weight: 0.08
-  query_fine_infonce_weight: 0.010
+  # MASSIVE DCFF feature alignment — this is the ONLY training signal that matters
+  query_fine_weight: 2.0
+  query_coarse_weight: 1.0
+  query_fine_infonce_weight: 0.0
 
-  # Coarse feature-metric energy (large-basin correction)
-  coarse_feature_metric_energy_weight: 0.05
+  coarse_feature_metric_energy_weight: 0.0
   coarse_feature_metric_energy_radius: 8
 
-  # Fine correlation + WLS
-  query_corr_radius: 8
-  query_corr_ce_weight: 0.5
-  query_corr_subpixel_weight: 0.8
-  query_corr_peak_margin_weight: 5.0
+  # Correlation DISABLED — focus entirely on cos similarity
+  query_corr_radius: 4
+  query_corr_ce_weight: 0.0
+  query_corr_subpixel_weight: 0.0
+  query_corr_peak_margin_weight: 0.0
   query_corr_ce_temperature: 0.050
-  query_corr_wls_pose_weight: 0.10
-  perturb_render_negatives: true
+  query_corr_wls_pose_weight: 0.0
+  perturb_render_negatives: false
   perturb_trans_cm_choices: [2.0, 5.0, 10.0, 20.0]
   perturb_rot_deg: 0.5
 
-  # Feature-metric pose loss (fine alignment)
-  feature_metric_pose_weight: 0.05
+  feature_metric_pose_weight: 0.0
   feature_metric_pose_damping: 0.05
   feature_metric_pose_update_scale: 0.25
   feature_metric_pose_rot_weight: 0.1
   feature_metric_pose_trans_weight: 30.0
   feature_metric_pose_normalize: true
 
-  # Teacher anchor (prevent collapse, low weight)
-  rendered_teacher_fine_weight: 0.01
-  rendered_teacher_fine_weight_end: 0.002
-  rendered_teacher_fine_weight_anneal_epochs: 4
+  rendered_teacher_fine_weight: 0.0
+  rendered_teacher_fine_weight_end: 0.0
+  rendered_teacher_fine_weight_anneal_epochs: 0
 
-  # Disabled
   candidate_render_score_weight: 0.0
   candidate_score_fusion_weight: 0.0
   candidate_refined_pose_weight: 0.0

@@ -1,0 +1,14 @@
+# Medium-basin smoke with 96 uniform candidates and larger batch.  This is the
+# current preferred Phase 4 medium setting after se3_delta protocol alignment.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_clean_phase4_v13_coarse_lattice_probe_medium_combo_uniform96_b8.yaml
+exp_name: cpr_clean_phase4_v13_coarse_lattice_smoke_medium_combo_uniform96_b8
+
+dataset:
+  max_train_samples: 32
+  max_val_samples: 16
+
+training:
+  batch_size: 8
+  max_steps: 200
+  log_every: 1

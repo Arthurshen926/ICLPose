@@ -1,0 +1,67 @@
+# CPR main Phase 4: local coarse pose-lattice scorer around T0, map frozen.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_main_phase3_fine_wls_frozenmap.yaml
+exp_name: cpr_main_phase4_coarse_lattice_frozenmap
+
+model:
+  candidate_score_fusion_head: true
+  candidate_score_fusion_use_score_map_head: true
+  candidate_score_fusion_input_dim: 12
+  candidate_score_fusion_hidden_dim: 64
+  candidate_score_fusion_zero_init: false
+  candidate_score_fusion_map_channels: 8
+  candidate_score_fusion_grid_size: 4
+  candidate_score_fusion_context_layers: 1
+  candidate_score_fusion_context_heads: 4
+  candidate_score_fusion_context_residual: true
+
+training:
+  max_steps: 12000
+  lr: 0.000075
+  best_metric: map_candidate_score_fusion_pred_trans_mm
+  best_metric_mode: min
+  freeze_model_except_prefixes:
+    - "candidate_score_fusion_head."
+    - "global_context."
+    - "window_attention."
+    - "local_matcher."
+    - "local_corr_projector."
+    - "stage4."
+    - "fine_head."
+    - "coarse_head."
+  model_lr_scales:
+    candidate_score_fusion_head.: 1.0
+    global_context.: 0.10
+    window_attention.: 0.10
+    local_matcher.: 0.50
+    local_corr_projector.: 0.50
+    stage4.: 0.03
+    fine_head.: 0.20
+    coarse_head.: 0.30
+
+map_supervision:
+  trainable: false
+  candidate_render_pose_source: coarse_pose_lattice
+  coarse_pose_lattice_base_source: rendered_map_pose_neg
+  coarse_pose_lattice_trans_cm: [0.0, 10.0, 25.0]
+  coarse_pose_lattice_rot_deg: [0.0, 2.0, 5.0]
+  coarse_pose_lattice_max_candidates: 0
+  candidate_render_score_train_map: false
+  candidate_render_score_feature: coarse
+  candidate_score_fusion_feature: coarse
+  candidate_score_fusion_weight: 1.0
+  candidate_score_fusion_mode: local
+  candidate_score_fusion_radius: 2
+  candidate_score_fusion_preprocess: spatial_center
+  candidate_score_fusion_highpass_kernel: 5
+  candidate_score_fusion_temperature: 1.0
+  candidate_score_fusion_target_mode: gt_pose_error_soft
+  candidate_score_fusion_target_temperature_m: 0.25
+  candidate_score_fusion_score_map_mode: volume_plus_peak_offset
+  candidate_score_fusion_render_feature_mode: basic
+  candidate_score_fusion_cost_regression_weight: 0.5
+  candidate_score_fusion_cost_regression_temperature_m: 0.25
+  candidate_score_fusion_pairwise_rank_weight: 0.0
+  candidate_score_fusion_basin_trans_m: 0.25
+  candidate_score_fusion_basin_rot_deg: 5.0
+  candidate_refined_pose_weight: 0.0

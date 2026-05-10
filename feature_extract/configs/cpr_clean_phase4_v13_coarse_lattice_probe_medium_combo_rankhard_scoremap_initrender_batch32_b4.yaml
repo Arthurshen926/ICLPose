@@ -1,0 +1,12 @@
+# Medium combined-lattice score-map probe initialized from the scalar render
+# score. This avoids the random score-map branch overwhelming the useful
+# coarse correlation summary at step 0.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_clean_phase4_v13_coarse_lattice_probe_medium_combo_rankhard_scoremap_batch32_b4.yaml
+exp_name: cpr_clean_phase4_v13_coarse_lattice_probe_medium_combo_rankhard_scoremap_initrender_batch32_b4
+
+model:
+  candidate_score_fusion_hidden_dim: 0
+  candidate_score_fusion_context_layers: 0
+  candidate_score_fusion_context_residual: false
+  candidate_score_fusion_initial_weights: [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]

@@ -1,0 +1,27 @@
+# CPR main Phase 3: fine dense correlation + WLS/PnP small-basin closure.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_main_phase2_query_align_frozenmap.yaml
+exp_name: cpr_main_phase3_fine_wls_frozenmap
+
+training:
+  max_steps: 10000
+  lr: 0.000075
+  best_metric: map_corr_wls_trans_err_mm
+  best_metric_mode: min
+
+map_supervision:
+  trainable: false
+  perturb_render_negatives: true
+  perturb_trans_cm_choices: [2.0, 5.0, 10.0, 25.0]
+  perturb_rot_deg: 2.0
+  query_corr_radius: 4
+  query_corr_ce_weight: 0.50
+  query_corr_subpixel_weight: 0.60
+  query_corr_peak_margin_weight: 2.0
+  query_corr_wls_pose_weight: 0.08
+  query_corr_wls_pose_damping: 0.001
+  query_corr_wls_pose_update_scale: 0.5
+  feature_metric_pose_weight: 0.0
+  feature_metric_gradient_direction_weight: 0.0
+  candidate_score_fusion_weight: 0.0
+  candidate_refined_pose_weight: 0.0

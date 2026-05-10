@@ -1,0 +1,23 @@
+# CPR Phase 2 balanced correlation probe with high GPU-memory utilization.
+# Purpose: improve local correlation while preserving frozen-map query alignment.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_main_phase2_query_align_frozenmap.yaml
+exp_name: cpr_probe_phase2_balancedcorr_b20
+
+training:
+  batch_size: 20
+  num_workers: 0
+  max_steps: 5000
+  lr: 0.00005
+  best_metric: map_query_corr_subpx_flow_epe
+  best_metric_mode: min
+
+map_supervision:
+  query_fine_weight: 1.0
+  query_coarse_weight: 0.5
+  query_fine_infonce_weight: 0.01
+  query_corr_ce_weight: 0.45
+  query_corr_subpixel_weight: 0.45
+  query_corr_peak_margin_weight: 1.5
+  query_corr_wls_pose_weight: 0.0
+

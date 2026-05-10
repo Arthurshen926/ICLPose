@@ -1,0 +1,10 @@
+# Minimal Phase 4 smoke probe with a vector-only scorer.
+# This checks whether the expensive score-map head is necessary for coarse
+# basin ranking, and gives faster feedback on candidate quality.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_clean_phase4_v13_coarse_lattice_smoke_small_b8.yaml
+exp_name: cpr_clean_phase4_v13_coarse_lattice_smoke_small_linear_b8
+
+model:
+  candidate_score_fusion_use_score_map_head: false
+  candidate_score_fusion_hidden_dim: 64

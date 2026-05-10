@@ -1,0 +1,14 @@
+# Micro diagnostic for medium combined lattice.  This is intentionally tiny and
+# logs every step to measure render/scorer throughput before scaling up.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_clean_phase4_v13_coarse_lattice_probe_medium_combo_uniform64_b16.yaml
+exp_name: cpr_clean_phase4_v13_coarse_lattice_micro_medium_combo_uniform64_b4
+
+dataset:
+  max_train_samples: 8
+  max_val_samples: 4
+
+training:
+  batch_size: 4
+  max_steps: 40
+  log_every: 1

@@ -1,0 +1,12 @@
+# Fast Phase 4 probe.  Uses a small fixed train/val subset to check whether the
+# clean coarse lattice scorer has basin-recall signal before launching a full run.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_clean_phase4_v13_coarse_lattice_frozenmap_b16.yaml
+exp_name: cpr_clean_phase4_v13_coarse_lattice_probe_b16
+
+dataset:
+  max_train_samples: 128
+  max_val_samples: 64
+
+training:
+  max_steps: 600

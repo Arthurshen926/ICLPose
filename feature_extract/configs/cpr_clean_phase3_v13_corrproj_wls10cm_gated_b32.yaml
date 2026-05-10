@@ -1,0 +1,17 @@
+# Clean CPR Phase 3: confidence-gated WLS evaluation/training.
+# The ungated WLS update is still logged, but checkpoint selection uses the
+# failure-aware gated pose: accept confident updates, otherwise keep T0.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_clean_phase3_v13_corrproj_wls10cm_conf_b32_gain.yaml
+exp_name: cpr_clean_phase3_v13_corrproj_wls10cm_gated_b32
+
+training:
+  batch_size: 32
+  max_steps: 1200
+  best_metric: map_corr_wls_gated_trans_gain_mm
+  best_metric_mode: max
+
+map_supervision:
+  query_corr_wls_accept_min_conf_mean: 0.14
+  query_corr_wls_accept_min_conf_cov: 0.50
+  query_corr_wls_accept_max_delta_mm: 150.0

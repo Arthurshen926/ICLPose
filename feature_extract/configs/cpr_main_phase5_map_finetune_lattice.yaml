@@ -1,0 +1,36 @@
+# CPR main Phase 5: localization fine-tune of map-side features with geometry frozen.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_main_phase4_coarse_lattice_frozenmap.yaml
+exp_name: cpr_main_phase5_map_finetune_lattice
+
+training:
+  max_steps: 8000
+  lr: 0.00005
+  best_metric: map_corr_wls_trans_err_mm
+  best_metric_mode: min
+  freeze_model_except_prefixes:
+    - "candidate_score_fusion_head."
+  model_lr_scales:
+    candidate_score_fusion_head.: 0.5
+
+map_supervision:
+  trainable: true
+  map_lr_scale: 0.02
+  latent_lr_scale: 0.003
+  hash_mlp_lr_scale: 0.01
+  train_fine_decoder: true
+  train_coarse_fusion: true
+  train_feat_sharp: false
+  train_fsm: true
+  train_hash_mlp: true
+  train_latent: true
+  train_geometry: false
+  train_color: false
+  candidate_render_score_train_map: true
+  query_fine_weight: 0.5
+  query_coarse_weight: 0.25
+  query_corr_wls_pose_weight: 0.04
+  candidate_score_fusion_weight: 0.5
+  rendered_teacher_fine_weight: 0.001
+  rendered_teacher_fine_weight_end: 0.0005
+  rendered_teacher_fine_weight_anneal_epochs: 4

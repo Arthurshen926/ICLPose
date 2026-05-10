@@ -1,0 +1,8 @@
+# Fast Phase 4 probe with vector-only candidate scorer on a larger subset.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_clean_phase4_v13_coarse_lattice_probe_small_b16.yaml
+exp_name: cpr_clean_phase4_v13_coarse_lattice_probe_small_linear_b16
+
+model:
+  candidate_score_fusion_use_score_map_head: false
+  candidate_score_fusion_hidden_dim: 64

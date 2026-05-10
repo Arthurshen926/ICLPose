@@ -1,0 +1,8 @@
+# Same clean Phase 4 lattice scorer as b4, with a larger batch for faster
+# validation on 24GB GPUs.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_clean_phase4_v13_coarse_lattice_frozenmap_b4.yaml
+exp_name: cpr_clean_phase4_v13_coarse_lattice_frozenmap_b16
+
+training:
+  batch_size: 16

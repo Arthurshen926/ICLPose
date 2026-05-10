@@ -1,0 +1,7 @@
+# Same as oraclesubset33, with more rendered negatives per sample.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_clean_phase5_maponly_oraclesubset33_medium_b1.yaml
+exp_name: cpr_clean_phase5_maponly_oraclesubset49_medium_b1
+
+map_supervision:
+  coarse_pose_lattice_oracle_subset_size: 49

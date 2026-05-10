@@ -1,0 +1,23 @@
+# Medium combined-lattice Phase 4 probe using the spatial score-map fusion head.
+# This follows the CPR mainline: coarse reads local query-map correlation maps,
+# not just pooled/vector summary scores.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_clean_phase4_v13_coarse_lattice_probe_medium_combo_rankhard_b4.yaml
+exp_name: cpr_clean_phase4_v13_coarse_lattice_probe_medium_combo_rankhard_scoremap_batch32_b4
+
+model:
+  candidate_score_fusion_use_score_map_head: true
+  candidate_score_fusion_input_dim: 12
+  candidate_score_fusion_hidden_dim: 64
+  candidate_score_fusion_map_channels: 8
+  candidate_score_fusion_grid_size: 4
+  candidate_score_fusion_context_layers: 1
+  candidate_score_fusion_context_heads: 4
+  candidate_score_fusion_context_residual: true
+
+training:
+  batch_size: 4
+
+map_supervision:
+  candidate_render_batch_size: 32
+  candidate_score_fusion_score_map_mode: volume_plus_peak_offset

@@ -1,0 +1,17 @@
+# Phase 4 medium-basin probe: 25-50cm / 5-10deg fixed-axis T0 noise,
+# ranked with the vector-only candidate scorer.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_clean_phase4_v13_coarse_lattice_probe_b16.yaml
+exp_name: cpr_clean_phase4_v13_coarse_lattice_probe_medium_linear_fixedrot_b16
+
+model:
+  candidate_score_fusion_use_score_map_head: false
+  candidate_score_fusion_hidden_dim: 64
+
+map_supervision:
+  perturb_trans_cm_choices: [25.0, 50.0]
+  perturb_pose_mode: se3_delta
+  perturb_rot_deg: 0.0
+  perturb_rot_deg_choices: [5.0, 10.0]
+  coarse_pose_lattice_trans_cm: [0.0, 10.0, 25.0, 50.0]
+  coarse_pose_lattice_rot_deg: [0.0, 2.0, 5.0, 10.0]

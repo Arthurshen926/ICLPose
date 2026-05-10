@@ -1,0 +1,77 @@
+# CPR main Phase 2: query-side alignment with frozen map.
+# Purpose: learn query features and local correlation against a stable DCFF map.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_baseline_v13.yaml
+exp_name: cpr_main_phase2_query_align_frozenmap
+
+model:
+  fine_feature_dim: 64
+  coarse_feature_dim: 64
+  fine_loc_head: false
+  global_context_enabled: true
+  window_attention_layers: 2
+  candidate_score_fusion_head: false
+
+dataset:
+  noise_buckets:
+    - [0.1, 2.0]
+    - [0.25, 5.0]
+    - [0.5, 10.0]
+    - [1.0, 20.0]
+
+training:
+  max_steps: 8000
+  lr: 0.0001
+  best_metric: map_query_corr_subpx_flow_epe
+  best_metric_mode: min
+  freeze_model_except_prefixes:
+    - "global_context."
+    - "window_attention."
+    - "local_matcher."
+    - "local_corr_projector."
+    - "stage4."
+    - "fine_head."
+    - "coarse_head."
+  model_lr_scales:
+    global_context.: 0.25
+    window_attention.: 0.25
+    local_matcher.: 1.0
+    local_corr_projector.: 2.0
+    stage4.: 0.05
+    fine_head.: 0.5
+    coarse_head.: 0.5
+
+loss:
+  fine_l1_weight: 0.10
+  fine_cos_weight: 0.10
+  coarse_l1_weight: 0.08
+  coarse_cos_weight: 0.08
+
+map_supervision:
+  enabled: true
+  trainable: false
+  train_geometry: false
+  query_fine_key: fine
+  query_local_fine_key: fine
+  query_fine_weight: 1.0
+  query_coarse_weight: 0.5
+  query_fine_infonce_weight: 0.01
+  query_corr_radius: 4
+  query_corr_ce_weight: 0.20
+  query_corr_subpixel_weight: 0.20
+  query_corr_peak_margin_weight: 1.0
+  query_corr_wls_pose_weight: 0.0
+  perturb_render_negatives: true
+  perturb_trans_cm_choices: [1.0, 2.0, 5.0, 10.0]
+  perturb_rot_deg: 1.0
+  feature_metric_pose_weight: 0.0
+  feature_metric_gradient_direction_weight: 0.0
+  candidate_render_score_weight: 0.0
+  candidate_score_fusion_weight: 0.0
+  candidate_refined_pose_weight: 0.0
+  rendered_teacher_fine_weight: 0.002
+  rendered_teacher_fine_weight_end: 0.001
+  rendered_teacher_fine_weight_anneal_epochs: 4
+
+export:
+  fine_key: fine

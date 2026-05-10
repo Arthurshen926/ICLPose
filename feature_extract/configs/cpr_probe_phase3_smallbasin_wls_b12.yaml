@@ -1,0 +1,27 @@
+# CPR Phase 3 small-basin curriculum with larger batch size.
+# Purpose: test WLS/PnP only after restricting perturbations to the intended fine basin.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_main_phase3_fine_wls_frozenmap.yaml
+exp_name: cpr_probe_phase3_smallbasin_wls_b12
+
+training:
+  batch_size: 12
+  num_workers: 0
+  max_steps: 6000
+  lr: 0.00005
+  best_metric: map_corr_wls_trans_err_mm
+  best_metric_mode: min
+
+map_supervision:
+  trainable: false
+  perturb_render_negatives: true
+  perturb_trans_cm_choices: [1.0, 2.0, 5.0, 10.0]
+  perturb_rot_deg: 1.0
+  query_corr_radius: 4
+  query_corr_ce_weight: 0.35
+  query_corr_subpixel_weight: 0.45
+  query_corr_peak_margin_weight: 1.5
+  query_corr_wls_pose_weight: 0.02
+  query_corr_wls_pose_damping: 0.003
+  query_corr_wls_pose_update_scale: 0.25
+

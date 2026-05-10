@@ -1,0 +1,13 @@
+# Clean CPR Phase 3: confidence-gated WLS on 5-10cm / 1deg.
+# Purpose: test whether dense correlation is good enough when the geometry
+# solver ignores low-confidence pixels instead of consuming the full image.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_clean_phase3_v13_corrproj_wls_10cm_b20.yaml
+exp_name: cpr_clean_phase3_v13_corrproj_wls_10cm_conf_b20
+
+map_supervision:
+  query_corr_wls_conf_threshold: 0.35
+  query_corr_wls_conf_power: 2.0
+  query_corr_wls_min_conf_cov: 0.03
+  query_corr_wls_pose_update_scale: 0.20
+

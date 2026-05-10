@@ -46,11 +46,13 @@ from feature_extract.train_impl import (
     load_pose_candidate_cache_index,
     local_correlation_wls_pose_loss,
     load_model_warmstart,
+    build_local_pose_lattice_candidates,
     maybe_attach_pose_candidate_renders,
     normalize_scene_coord_map,
     candidate_quality_features_from_batch,
     candidate_score_fusion_listwise_loss,
     perturb_w2c_camera_center,
+    pose_lattice_delta_templates,
     pose_feature_bank_from_dataset,
     pose_update_gain_loss,
     resolve_perturb_rank_margin,
@@ -429,6 +431,36 @@ def test_local_correlation_wls_min_conf_cov_gates_sparse_confidence():
     assert result["metrics"]["map_corr_wls_delta_trans_mm"].item() == 0.0
 
 
+def test_wls_accept_gate_falls_back_for_low_confidence_sample():
+    pose_ref = torch.eye(4).unsqueeze(0).repeat(2, 1, 1)
+    pose_pred = pose_ref.clone()
+    pose_pred[0, 0, 3] = 0.02
+    pose_pred[1, 0, 3] = 0.20
+    confidence = torch.ones(2, 1, 2, 2)
+    confidence[1] = 0.10
+    valid = torch.ones_like(confidence)
+    delta_xi = torch.tensor(
+        [
+            [0.08, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.10, 0.0, 0.0, 0.0, 0.0, 0.0],
+        ]
+    )
+
+    gated_pose, metrics = train_impl._apply_wls_accept_gate(
+        pose_pred,
+        pose_ref,
+        delta_xi,
+        confidence,
+        valid,
+        min_conf_mean=0.5,
+        min_conf_cov=0.5,
+    )
+
+    assert torch.allclose(gated_pose[0], pose_pred[0])
+    assert torch.allclose(gated_pose[1], pose_ref[1])
+    assert metrics["map_corr_wls_gated_accept_rate"].item() == 0.5
+
+
 def test_descriptor_pose_retrieval_metrics_reports_topk_pose_errors():
     query_desc = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
     bank_desc = torch.tensor([[1.0, 0.0], [0.0, 1.0], [0.7, 0.7]])
@@ -459,6 +491,80 @@ def test_select_pose_candidate_indices_supports_score_and_uniform_limits():
 
     assert top_idx.tolist() == [1, 3]
     assert uniform_idx.tolist() == [0, 2, 4]
+
+
+def test_pose_lattice_candidates_are_centered_on_initial_pose():
+    base_pose = torch.eye(4).view(1, 4, 4)
+
+    deltas = pose_lattice_delta_templates([10.0], [5.0])
+    candidates = build_local_pose_lattice_candidates(
+        base_pose,
+        trans_cm=[10.0],
+        rot_deg=[5.0],
+    )
+
+    assert deltas.shape == (13, 6)
+    assert candidates.shape == (1, 13, 4, 4)
+    torch.testing.assert_close(candidates[0, 0], base_pose[0])
+
+    centers = train_impl.camera_centers_from_w2c(candidates[0].reshape(-1, 4, 4))
+    dists = torch.linalg.norm(centers - centers[:1], dim=1)
+    assert torch.isclose(dists.max(), torch.tensor(0.10), atol=1e-5)
+
+    rot_err = train_impl._rotation_error_from_mats(
+        candidates[0, :, :3, :3],
+        base_pose[:, :3, :3].expand(candidates.shape[1], -1, -1),
+    )[1]
+    assert torch.isclose(rot_err.max(), torch.tensor(5.0), atol=1e-4)
+
+
+def test_pose_lattice_templates_can_combine_translation_and_rotation_offsets():
+    deltas = pose_lattice_delta_templates([10.0], [5.0], combine_trans_rot=True)
+
+    assert deltas.shape == (49, 6)
+    assert ((deltas[:, :3].abs().sum(dim=1) > 0) & (deltas[:, 3:].abs().sum(dim=1) > 0)).any()
+
+
+def test_pose_lattice_candidate_limit_can_sample_uniformly():
+    base_pose = torch.eye(4).view(1, 4, 4)
+
+    full = build_local_pose_lattice_candidates(
+        base_pose,
+        trans_cm=[10.0, 25.0],
+        rot_deg=[5.0, 10.0],
+        combine_trans_rot=True,
+    )
+    head = build_local_pose_lattice_candidates(
+        base_pose,
+        trans_cm=[10.0, 25.0],
+        rot_deg=[5.0, 10.0],
+        combine_trans_rot=True,
+        max_candidates=8,
+        limit_strategy="head",
+    )
+    uniform = build_local_pose_lattice_candidates(
+        base_pose,
+        trans_cm=[10.0, 25.0],
+        rot_deg=[5.0, 10.0],
+        combine_trans_rot=True,
+        max_candidates=8,
+        limit_strategy="uniform",
+    )
+
+    assert full.shape == (1, 169, 4, 4)
+    assert head.shape == (1, 8, 4, 4)
+    assert uniform.shape == (1, 8, 4, 4)
+    assert not torch.allclose(head[0, -1], uniform[0, -1])
+    torch.testing.assert_close(uniform[0, -1], full[0, -1])
+
+
+def test_axis_angle_rotation_matrix_rotates_about_selected_axis():
+    rot = train_impl.axis_angle_rotation_matrix(2, torch.tensor(np.pi / 2.0))
+    x_axis = torch.tensor([1.0, 0.0, 0.0])
+
+    rotated = rot @ x_axis
+
+    assert torch.allclose(rotated, torch.tensor([0.0, 1.0, 0.0]), atol=1e-6)
 
 
 def test_topk_descriptor_candidate_indices_uses_cosine_similarity():
@@ -2027,7 +2133,7 @@ def test_map_feature_renderer_attach_pose_candidate_renders_shapes():
             "b.png": {"fx": 12.0, "fy": 13.0, "cx": 3.0, "cy": 4.0},
         }
 
-        def _render_pose(self, sample_name, pose, require_grad=False, feature="all"):
+        def _render_pose(self, sample_name, pose, require_grad=False, feature="all", include_aux=True):
             scale = float(pose[0, 3].item())
             fine = torch.full((1, 2, 2, 3), scale)
             coarse = torch.full((1, 3, 1, 2), scale + 1.0)
@@ -2065,7 +2171,7 @@ def test_map_feature_renderer_attach_pose_candidate_renders_supports_coarse_only
         def __init__(self):
             self.requested_features = []
 
-        def _render_pose(self, sample_name, pose, require_grad=False, feature="all"):
+        def _render_pose(self, sample_name, pose, require_grad=False, feature="all", include_aux=True):
             self.requested_features.append(feature)
             scale = float(pose[0, 3].item())
             coarse = torch.full((1, 3, 1, 2), scale + 1.0)
@@ -2092,6 +2198,60 @@ def test_map_feature_renderer_attach_pose_candidate_renders_supports_coarse_only
     assert "rendered_map_candidate_fine" not in batch
     assert batch["rendered_map_candidate_coarse"].shape == (1, 1, 3, 1, 2)
     assert batch["rendered_map_candidate_depth"].shape == (1, 1, 1, 1, 2)
+
+
+def test_map_feature_renderer_attach_pose_candidate_renders_uses_batched_coarse_path():
+    class FakeRenderer:
+        device = torch.device("cpu")
+        name_to_intr = {
+            "a.png": {"fx": 10.0, "fy": 11.0, "cx": 1.0, "cy": 2.0},
+            "b.png": {"fx": 12.0, "fy": 13.0, "cx": 3.0, "cy": 4.0},
+        }
+        candidate_render_batch_size = 8
+
+        def __init__(self):
+            self.batched_calls = 0
+
+        def _render_pose(self, *args, **kwargs):
+            raise AssertionError("coarse-only candidate renders should use the batched path")
+
+        def _render_pose_bank_coarse_chunked(self, batch, pose_bank, *, require_grad=False, include_aux=False):
+            self.batched_calls += 1
+            bsz, num_candidates = pose_bank.shape[:2]
+            values = pose_bank[..., 0, 3].reshape(bsz, num_candidates, 1, 1, 1)
+            coarse = values.expand(-1, -1, 3, 1, 2).contiguous()
+            mask = torch.ones(bsz, num_candidates, 1, 1, 2)
+            depth = torch.zeros(bsz, num_candidates, 1, 1, 2)
+            intrinsics = torch.tensor(
+                [
+                    [[10.0, 11.0, 1.0, 2.0]] * num_candidates,
+                    [[12.0, 13.0, 3.0, 4.0]] * num_candidates,
+                ]
+            )[:bsz]
+            return coarse, mask, depth, intrinsics
+
+    renderer = FakeRenderer()
+    poses = torch.stack([
+        torch.stack([_pose_with_center([0.0, 0.0, 0.0]), _pose_with_center([1.0, 0.0, 0.0])]),
+        torch.stack([_pose_with_center([2.0, 0.0, 0.0]), _pose_with_center([3.0, 0.0, 0.0])]),
+    ])
+    batch = {"sample_name": ["a.png", "b.png"]}
+
+    train_impl.MapFeatureRenderer.attach_pose_candidate_renders(
+        renderer,
+        batch,
+        poses,
+        require_grad=False,
+        feature="coarse",
+        include_aux=False,
+    )
+
+    assert renderer.batched_calls == 1
+    assert batch["rendered_map_candidate_pose"].shape == (2, 2, 4, 4)
+    assert batch["rendered_map_candidate_coarse"].shape == (2, 2, 3, 1, 2)
+    assert batch["rendered_map_candidate_depth"].shape == (2, 2, 1, 1, 2)
+    assert batch["rendered_map_candidate_intrinsics"].shape == (2, 2, 4)
+    assert "rendered_map_candidate_fine" not in batch
 
 
 def test_pose_candidate_cache_index_matches_sample_name_variants(tmp_path):
@@ -2236,6 +2396,7 @@ def test_candidate_score_fusion_listwise_loss_uses_priors_and_backprops_to_featu
 
     assert metrics["map_candidate_score_fusion_acc"].item() == 1.0
     assert metrics["map_candidate_score_fusion_render_acc"].item() == 0.0
+    assert metrics["map_candidate_score_fusion_oracle_basin_recall"].item() == 1.0
     assert query.grad is not None and query.grad.abs().sum() > 0
     assert candidates.grad is not None and candidates.grad.abs().sum() > 0
     assert scorer.linear.weight.grad is not None and scorer.linear.weight.grad.abs().sum() > 0
@@ -2418,6 +2579,58 @@ def test_candidate_score_fusion_pairwise_rank_rewards_cost_ordering():
     ]
     assert good_loss.item() < bad_loss.item()
     assert good_scorer.logits.grad is not None and good_scorer.logits.grad.abs().sum() > 0
+
+
+def test_candidate_score_fusion_reports_topk_basin_recall():
+    class FixedLogitScorer(torch.nn.Module):
+        def __init__(self, logits):
+            super().__init__()
+            self.logits = torch.nn.Parameter(torch.tensor(logits, dtype=torch.float32))
+
+        def forward(self, features):
+            return self.logits.unsqueeze(0).expand(features.shape[0], -1)
+
+    query = F.normalize(torch.randn(1, 2, 1, 1), dim=1)
+    candidates = F.normalize(torch.randn(1, 5, 2, 1, 1), dim=2)
+    candidate_pose = torch.stack([
+        torch.stack([
+            _pose_with_center([1.00, 0.0, 0.0]),
+            _pose_with_center([0.60, 0.0, 0.0]),
+            _pose_with_center([0.40, 0.0, 0.0]),
+            _pose_with_center([0.20, 0.0, 0.0]),
+            _pose_with_center([0.00, 0.0, 0.0]),
+        ])
+    ])
+    pose_gt = torch.stack([_pose_with_center([0.0, 0.0, 0.0])])
+    scorer = FixedLogitScorer([5.0, 4.0, 3.0, 2.0, 1.0])
+
+    _loss, metrics = candidate_score_fusion_listwise_loss(
+        query,
+        candidates,
+        candidate_pose,
+        pose_gt,
+        scorer,
+        mode="global",
+        temperature=1.0,
+        basin_trans_m=0.25,
+        basin_rot_deg=5.0,
+    )
+
+    assert metrics["map_candidate_score_fusion_top1_basin_recall"].item() == 0.0
+    assert metrics["map_candidate_score_fusion_top4_basin_recall"].item() == 1.0
+    assert metrics["map_candidate_score_fusion_top8_basin_recall"].item() == 1.0
+
+
+def test_validation_selection_score_uses_configured_pose_metric():
+    cfg = {"training": {"best_metric": "map_corr_wls_trans_err_mm", "best_metric_mode": "min"}}
+    name, value, score = train_impl.validation_selection_score(
+        {"loss_total": 10.0, "map_corr_wls_trans_err_mm": 75.0},
+        cfg,
+    )
+
+    assert name == "map_corr_wls_trans_err_mm"
+    assert value == 75.0
+    assert score == 75.0
 
 
 def test_candidate_score_map_fusion_head_can_compare_candidates_with_context():
@@ -2677,8 +2890,82 @@ def test_candidate_score_fusion_head_supports_explicit_linear_initialization():
     assert torch.allclose(scorer.linear.bias, torch.tensor([-0.5]))
 
 
-# Removed: test_compute_map_supervision_uses_candidate_score_fusion_head
-# — candidate scorer disabled in training path for CPR Phase 1
+def test_compute_map_supervision_uses_candidate_score_fusion_head_for_pose_lattice_candidates():
+    h, w = 4, 5
+    query = torch.randn(1, 6, h, w, requires_grad=True)
+    candidate_feat = torch.randn(1, 2, 6, h, w)
+    candidate_pose = torch.eye(4).view(1, 1, 4, 4).repeat(1, 2, 1, 1)
+    candidate_pose[0, 1, 0, 3] = -0.10
+    batch = {
+        "rendered_map_fine": torch.randn(1, 6, h, w),
+        "rendered_map_fine_raw": torch.randn(1, 6, h, w),
+        "rendered_map_coarse": torch.randn(1, 6, h, w),
+        "rendered_map_mask": torch.ones(1, 1, h, w),
+        "teacher_fine": torch.randn(1, 6, h, w),
+        "teacher_coarse": torch.randn(1, 6, h, w),
+        "rendered_map_candidate_coarse": candidate_feat,
+        "rendered_map_candidate_mask": torch.ones(1, 2, 1, h, w),
+        "rendered_map_candidate_pose": candidate_pose,
+        "rendered_map_candidate_valid_mask": torch.ones(1, 2, dtype=torch.bool),
+        "pose_gt": torch.eye(4).view(1, 4, 4),
+    }
+    outputs = {
+        "fine": torch.randn(1, 6, h, w, requires_grad=True),
+        "coarse": query,
+    }
+    cfg = {
+        "loss": {"infonce_temperature": 0.07, "infonce_samples": 8},
+        "map_supervision": {
+            "enabled": True,
+            "query_fine_weight": 0.0,
+            "query_coarse_weight": 0.0,
+            "rendered_teacher_fine_weight": 0.0,
+            "rendered_teacher_coarse_weight": 0.0,
+            "candidate_score_fusion_weight": 1.0,
+            "candidate_score_fusion_feature": "coarse",
+            "candidate_score_fusion_target_mode": "hard",
+            "coarse_start_epoch": 0,
+        },
+    }
+    calls = []
+
+    class Scorer(torch.nn.Module):
+        def forward(self, features):
+            return torch.stack([features[..., 0], features[..., 0] - 1.0], dim=-1).sum(dim=-1)
+
+    original = train_impl.candidate_score_fusion_listwise_loss
+
+    def fake_fusion(query_feat, cand_feat, cand_pose, pose_gt, scorer, **kwargs):
+        calls.append((query_feat.shape, cand_feat.shape, cand_pose.shape, scorer))
+        zero = query_feat.sum() * 0.0 + cand_feat.sum() * 0.0
+        return zero + 2.0, {
+            "map_candidate_score_fusion_loss": zero + 2.0,
+            "map_candidate_score_fusion_acc": zero + 1.0,
+            "map_candidate_score_fusion_render_acc": zero,
+            "map_candidate_score_fusion_pred_trans_mm": zero + 0.0,
+        }, {
+            "valid": kwargs["candidate_valid_mask"],
+            "raw_logits": torch.zeros(1, 2),
+            "pose_cost": torch.zeros(1, 2),
+        }
+
+    try:
+        train_impl.candidate_score_fusion_listwise_loss = fake_fusion
+        loss, metrics = compute_map_supervision(
+            batch,
+            outputs,
+            cfg,
+            torch.device("cpu"),
+            epoch=0,
+            candidate_score_fusion_head=Scorer(),
+        )
+    finally:
+        train_impl.candidate_score_fusion_listwise_loss = original
+
+    assert torch.isfinite(loss)
+    assert calls and calls[0][0] == query.shape
+    assert calls[0][1] == candidate_feat.shape
+    assert metrics["map_candidate_score_fusion_acc"].item() == 1.0
 
 def test_gather_candidate_bank_selects_arbitrary_topm_and_mask():
     values = torch.arange(2 * 4 * 3, dtype=torch.float32).reshape(2, 4, 3)
@@ -2786,6 +3073,103 @@ def test_maybe_attach_pose_candidate_renders_can_use_online_pose_init_scores():
     assert torch.equal(out["rendered_map_candidate_valid_mask"], torch.ones(1, 2, dtype=torch.bool))
     assert torch.allclose(out["retrieval_original_scores_candidates"], scores)
     assert torch.allclose(out["retrieval_scores_candidates"], torch.tensor([[3.0, 0.0]]))
+
+
+def test_maybe_attach_pose_candidate_renders_can_use_local_pose_lattice():
+    captured = {}
+
+    class FakeRenderer:
+        device = torch.device("cpu")
+
+        def attach_pose_candidate_renders(self, batch, candidate_poses, **kwargs):
+            captured["poses"] = candidate_poses.clone()
+            captured["valid"] = kwargs.get("candidate_valid_mask")
+            batch["rendered_map_candidate_pose"] = candidate_poses
+            batch["rendered_map_candidate_valid_mask"] = kwargs.get("candidate_valid_mask")
+            return batch
+
+    base_pose = torch.eye(4).view(1, 4, 4)
+    batch = {
+        "sample_name": ["seq/frame.png"],
+        "rendered_map_pose_neg": base_pose.clone(),
+    }
+    cfg = {
+        "map_supervision": {
+            "enabled": True,
+            "candidate_score_fusion_weight": 1.0,
+            "candidate_render_pose_source": "coarse_pose_lattice",
+            "coarse_pose_lattice_base_source": "rendered_map_pose_neg",
+            "coarse_pose_lattice_trans_cm": [10.0],
+            "coarse_pose_lattice_rot_deg": [5.0],
+            "candidate_render_score_train_map": False,
+        }
+    }
+
+    out = maybe_attach_pose_candidate_renders(
+        batch,
+        outputs={},
+        cfg=cfg,
+        map_renderer=FakeRenderer(),
+        require_grad=True,
+        epoch=0,
+    )
+
+    assert out["rendered_map_candidate_pose"].shape == (1, 13, 4, 4)
+    assert out["rendered_map_candidate_valid_mask"].shape == (1, 13)
+    assert out["rendered_map_candidate_valid_mask"].all()
+    torch.testing.assert_close(captured["poses"][0, 0], base_pose[0])
+    assert captured["valid"].all()
+
+
+def test_maybe_attach_pose_candidate_renders_can_keep_oracle_lattice_subset():
+    class FakeRenderer:
+        device = torch.device("cpu")
+
+        def attach_pose_candidate_renders(self, batch, candidate_poses, **kwargs):
+            batch["rendered_map_candidate_pose"] = candidate_poses
+            batch["rendered_map_candidate_valid_mask"] = kwargs.get("candidate_valid_mask")
+            return batch
+
+    base_pose = torch.eye(4).view(1, 4, 4)
+    full_bank = train_impl.build_local_pose_lattice_candidates(
+        base_pose,
+        trans_cm=[10.0],
+        rot_deg=[],
+        include_identity=True,
+    )
+    pose_gt = full_bank[:, 3].clone()
+    batch = {
+        "sample_name": ["seq/frame.png"],
+        "rendered_map_pose_neg": base_pose.clone(),
+        "rendered_map_pose_gt": pose_gt,
+    }
+    cfg = {
+        "map_supervision": {
+            "enabled": True,
+            "candidate_score_fusion_weight": 1.0,
+            "candidate_render_pose_source": "coarse_pose_lattice",
+            "coarse_pose_lattice_base_source": "rendered_map_pose_neg",
+            "coarse_pose_lattice_trans_cm": [10.0],
+            "coarse_pose_lattice_rot_deg": [],
+            "coarse_pose_lattice_oracle_subset_size": 3,
+            "coarse_pose_lattice_oracle_subset_extras_strategy": "head",
+            "candidate_render_score_train_map": False,
+        }
+    }
+
+    out = maybe_attach_pose_candidate_renders(
+        batch,
+        outputs={},
+        cfg=cfg,
+        map_renderer=FakeRenderer(),
+        require_grad=True,
+        epoch=0,
+    )
+
+    assert out["rendered_map_candidate_pose"].shape == (1, 3, 4, 4)
+    torch.testing.assert_close(out["rendered_map_candidate_pose"][0, 0], pose_gt[0])
+    assert out["coarse_pose_lattice_oracle_subset_indices"].shape == (1, 3)
+    assert out["rendered_map_candidate_valid_mask"].all()
 
 
 def test_should_preattach_pose_candidate_renders_only_for_batch_sources():

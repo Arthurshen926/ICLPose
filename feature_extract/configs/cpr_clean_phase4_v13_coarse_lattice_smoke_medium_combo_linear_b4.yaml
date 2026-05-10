@@ -1,0 +1,19 @@
+# Medium-basin smoke with translation x rotation combined lattice candidates.
+# Candidate count is larger, so this uses a tiny subset to measure oracle/topK
+# coverage before any full run.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_clean_phase4_v13_coarse_lattice_smoke_medium_linear_fixedrot_b8.yaml
+exp_name: cpr_clean_phase4_v13_coarse_lattice_smoke_medium_combo_linear_b4
+
+dataset:
+  max_train_samples: 32
+  max_val_samples: 8
+
+training:
+  batch_size: 4
+  max_steps: 120
+
+map_supervision:
+  coarse_pose_lattice_trans_cm: [0.0, 25.0, 50.0]
+  coarse_pose_lattice_rot_deg: [0.0, 5.0, 10.0]
+  coarse_pose_lattice_combine_trans_rot: true

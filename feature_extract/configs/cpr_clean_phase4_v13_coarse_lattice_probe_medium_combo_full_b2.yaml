@@ -1,0 +1,14 @@
+# Medium-basin probe with the full 169-candidate combined lattice.
+# This is slower than uniform96 but currently the stable coverage baseline.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_clean_phase4_v13_coarse_lattice_micro_medium_combo_full_b2.yaml
+exp_name: cpr_clean_phase4_v13_coarse_lattice_probe_medium_combo_full_b2
+
+dataset:
+  max_train_samples: 32
+  max_val_samples: 16
+
+training:
+  batch_size: 2
+  max_steps: 200
+  log_every: 1

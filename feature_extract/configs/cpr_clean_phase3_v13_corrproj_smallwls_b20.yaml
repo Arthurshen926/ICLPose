@@ -1,0 +1,39 @@
+# Clean CPR Phase 3: small-basin WLS from the validated v13 correlation projector.
+# Principle: keep raw features fixed, refine only the correlation projection space,
+# and start WLS on perturbations that match the verified fine basin.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_clean_phase2_v13_corrproj_b20.yaml
+exp_name: cpr_clean_phase3_v13_corrproj_smallwls_b20
+
+training:
+  batch_size: 20
+  num_workers: 0
+  max_steps: 3000
+  lr: 0.00005
+  best_metric: map_corr_wls_trans_err_mm
+  best_metric_mode: min
+  freeze_model_except_prefixes:
+    - "local_corr_projector."
+  model_lr_scales:
+    local_corr_projector.: 1.0
+
+map_supervision:
+  trainable: false
+  train_geometry: false
+  local_corr_projector_enabled: true
+  local_corr_projector_apply_to_query: true
+  perturb_render_negatives: true
+  perturb_trans_cm_choices: [1.0, 2.0, 5.0]
+  perturb_rot_deg: 0.5
+  query_corr_radius: 4
+  query_corr_ce_weight: 0.25
+  query_corr_subpixel_weight: 0.25
+  query_corr_peak_margin_weight: 1.0
+  query_corr_wls_pose_weight: 0.01
+  query_corr_wls_pose_damping: 0.005
+  query_corr_wls_pose_update_scale: 0.20
+  query_corr_wls_conf_threshold: 0.0
+  query_corr_wls_conf_power: 1.0
+  query_corr_wls_conf_mode: max
+  query_corr_wls_conf_variance_scale: 0.5
+

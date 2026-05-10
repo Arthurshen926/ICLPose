@@ -1,0 +1,50 @@
+# CPR main Phase 6: low-LR coordinated convergence after stable coarse/fine CPR.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_main_phase5_map_finetune_lattice.yaml
+exp_name: cpr_main_phase6_joint_low_lr
+
+training:
+  max_steps: 6000
+  lr: 0.000025
+  best_metric: map_corr_wls_trans_err_mm
+  best_metric_mode: min
+  freeze_model_except_prefixes:
+    - "candidate_score_fusion_head."
+    - "global_context."
+    - "window_attention."
+    - "local_matcher."
+    - "local_corr_projector."
+    - "stage4."
+    - "fine_head."
+    - "coarse_head."
+  model_lr_scales:
+    candidate_score_fusion_head.: 0.5
+    global_context.: 0.05
+    window_attention.: 0.05
+    local_matcher.: 0.20
+    local_corr_projector.: 0.20
+    stage4.: 0.01
+    fine_head.: 0.10
+    coarse_head.: 0.10
+
+map_supervision:
+  trainable: true
+  map_lr_scale: 0.01
+  latent_lr_scale: 0.001
+  hash_mlp_lr_scale: 0.005
+  train_fine_decoder: true
+  train_coarse_fusion: true
+  train_feat_sharp: false
+  train_fsm: true
+  train_hash_mlp: true
+  train_latent: true
+  train_geometry: false
+  train_color: false
+  candidate_render_score_train_map: true
+  query_fine_weight: 0.35
+  query_coarse_weight: 0.20
+  query_corr_wls_pose_weight: 0.03
+  candidate_score_fusion_weight: 0.35
+  rendered_teacher_fine_weight: 0.0008
+  rendered_teacher_fine_weight_end: 0.0004
+  rendered_teacher_fine_weight_anneal_epochs: 3

@@ -1,0 +1,25 @@
+# Large-basin stretch probe: 1.0m / 20deg local lattice.
+# Uses vector scorer first; if topK recall is adequate, fine-score topK
+# selection can be evaluated without forcing WLS updates.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_clean_phase4_v13_coarse_lattice_probe_medium_combo_rankhard_batch32_b6.yaml
+exp_name: cpr_clean_phase4_v13_coarse_lattice_probe_large_combo_rankhard_batch32_b2
+
+dataset:
+  max_train_samples: 64
+  max_val_samples: 32
+
+training:
+  batch_size: 2
+  max_steps: 180
+  log_every: 2
+  best_metric: map_candidate_score_fusion_top8_basin_recall
+  best_metric_mode: max
+
+map_supervision:
+  perturb_trans_cm_choices: [50.0, 100.0]
+  perturb_rot_deg_choices: [10.0, 20.0]
+  coarse_pose_lattice_trans_cm: [0.0, 25.0, 50.0, 100.0]
+  coarse_pose_lattice_rot_deg: [0.0, 5.0, 10.0, 20.0]
+  coarse_pose_lattice_combine_trans_rot: true
+  candidate_render_batch_size: 32

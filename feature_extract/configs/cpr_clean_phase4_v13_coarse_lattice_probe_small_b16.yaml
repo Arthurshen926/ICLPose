@@ -1,0 +1,13 @@
+# Fast Phase 4 probe for the small/medium CPR basin.
+# Fewer lattice candidates make it cheaper and test whether coarse scoring works
+# before expanding to the 50cm/10deg lattice.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_clean_phase4_v13_coarse_lattice_probe_b16.yaml
+exp_name: cpr_clean_phase4_v13_coarse_lattice_probe_small_b16
+
+map_supervision:
+  perturb_trans_cm_choices: [10.0, 25.0]
+  perturb_pose_mode: se3_delta
+  perturb_rot_deg: 5.0
+  coarse_pose_lattice_trans_cm: [0.0, 10.0, 25.0]
+  coarse_pose_lattice_rot_deg: [0.0, 2.0, 5.0]

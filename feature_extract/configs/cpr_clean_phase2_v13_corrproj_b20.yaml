@@ -1,0 +1,58 @@
+# Clean CPR Phase 2 probe from the strongest frozen-map alignment checkpoint.
+# Principle: preserve v13 raw query-map alignment and train only a local
+# correlation projection space, avoiding corruption of the aligned raw features.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_baseline_v13.yaml
+exp_name: cpr_clean_phase2_v13_corrproj_b20
+
+model:
+  fine_loc_head: false
+  local_corr_projector_enabled: true
+  local_corr_projector_zero_init: false
+  local_corr_projector_l2_normalize: true
+
+training:
+  batch_size: 20
+  num_workers: 0
+  max_steps: 4000
+  lr: 0.0002
+  best_metric: map_query_corr_subpx_flow_epe
+  best_metric_mode: min
+  freeze_model_except_prefixes:
+    - "local_corr_projector."
+  model_lr_scales:
+    local_corr_projector.: 1.0
+
+loss:
+  fine_l1_weight: 0.0
+  fine_cos_weight: 0.0
+  coarse_l1_weight: 0.0
+  coarse_cos_weight: 0.0
+
+map_supervision:
+  enabled: true
+  trainable: false
+  train_geometry: false
+  query_fine_key: fine
+  query_local_fine_key: fine
+  query_fine_weight: 0.0
+  query_coarse_weight: 0.0
+  query_fine_infonce_weight: 0.0
+  local_corr_projector_enabled: true
+  local_corr_projector_apply_to_query: true
+  query_corr_radius: 4
+  query_corr_ce_weight: 0.50
+  query_corr_subpixel_weight: 0.50
+  query_corr_peak_margin_weight: 1.5
+  query_corr_wls_pose_weight: 0.0
+  perturb_render_negatives: true
+  perturb_trans_cm_choices: [1.0, 2.0, 5.0, 10.0]
+  perturb_rot_deg: 1.0
+  rendered_teacher_fine_weight: 0.0
+  rendered_teacher_fine_weight_end: 0.0
+  candidate_score_fusion_weight: 0.0
+  candidate_refined_pose_weight: 0.0
+
+export:
+  fine_key: fine
+

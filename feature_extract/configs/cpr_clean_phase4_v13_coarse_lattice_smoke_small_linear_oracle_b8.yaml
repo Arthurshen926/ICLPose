@@ -1,0 +1,4 @@
+# Same as the vector-only smoke probe, rerun after adding oracle basin metrics.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_clean_phase4_v13_coarse_lattice_smoke_small_linear_b8.yaml
+exp_name: cpr_clean_phase4_v13_coarse_lattice_smoke_small_linear_oracle_b8

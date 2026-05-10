@@ -1,0 +1,8 @@
+# Larger-subset Phase 4 probe with fixed-axis rotation perturbations.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_clean_phase4_v13_coarse_lattice_probe_small_linear_b16.yaml
+exp_name: cpr_clean_phase4_v13_coarse_lattice_probe_small_linear_fixedrot_b16
+
+map_supervision:
+  perturb_rot_deg: 0.0
+  perturb_rot_deg_choices: [2.0, 5.0]

@@ -1,0 +1,26 @@
+# Clean Phase 4 medium-basin probe with full combined K169 lattice and
+# top1-oriented hard/listwise ranking.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_clean_phase4_v13_coarse_lattice_probe_medium_combo_full_b2.yaml
+exp_name: cpr_clean_phase4_v13_coarse_lattice_probe_medium_combo_rankhard_b4
+
+dataset:
+  max_train_samples: 64
+  max_val_samples: 32
+
+training:
+  batch_size: 4
+  max_steps: 240
+  log_every: 2
+  best_metric: map_candidate_score_fusion_acc
+  best_metric_mode: max
+
+map_supervision:
+  candidate_score_fusion_temperature: 0.2
+  candidate_score_fusion_target_mode: gt_pose_error_hard
+  candidate_score_fusion_target_temperature_m: 0.05
+  candidate_score_fusion_cost_regression_weight: 0.25
+  candidate_score_fusion_cost_regression_temperature_m: 0.05
+  candidate_score_fusion_pairwise_rank_weight: 0.25
+  candidate_score_fusion_pairwise_rank_min_gap_m: 0.05
+  candidate_score_fusion_pairwise_rank_temperature: 0.25

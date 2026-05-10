@@ -441,6 +441,9 @@ def feature_metric_solve(
     intrinsics: Dict[str, float],
     damping: float = 1e-3,
     valid_mask: torch.Tensor = None,
+    rot_damping_multiplier: float = 1.0,
+    return_Jtr: bool = False,
+    solve_translation_only: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Feature-metric direct pose solver (Inverse Compositional).
 
@@ -515,19 +518,37 @@ def feature_metric_solve(
         JtJ += torch.bmm(J_c.transpose(1, 2), J_c)
         Jtr -= torch.bmm(J_c.transpose(1, 2), rc.unsqueeze(-1)).squeeze(-1)
 
-    # Damping
+    # Damping with optional rotation component scaling
     diag = JtJ.diagonal(dim1=-2, dim2=-1).clamp(min=1e-6)
-    JtJ = JtJ + damping * torch.diag_embed(diag)
+    damping_diag = damping * diag  # (B, 6)
+    if rot_damping_multiplier != 1.0:
+        per_dof = torch.tensor(
+            [1.0, 1.0, 1.0, rot_damping_multiplier, rot_damping_multiplier, rot_damping_multiplier],
+            device=device, dtype=diag.dtype,
+        )
+        damping_diag = damping_diag * per_dof.unsqueeze(0)
+    JtJ = JtJ + torch.diag_embed(damping_diag)
 
     # Solve
-    delta_xi = torch.linalg.solve(JtJ, Jtr)
+    if solve_translation_only:
+        JtJ_trans = JtJ[:, :3, :3]
+        Jtr_trans = Jtr[:, :3]
+        delta_trans = torch.linalg.solve(JtJ_trans, Jtr_trans)
+        delta_rot = torch.zeros_like(delta_trans)
+        trans_limit = 2.0
+        delta_trans = torch.tanh(delta_trans / trans_limit) * trans_limit
+        delta_xi = torch.cat([delta_trans, delta_rot], dim=1)
+    else:
+        delta_xi = torch.linalg.solve(JtJ, Jtr)
 
-    # Safety clamp
-    trans_limit, rot_limit = 2.0, 1.5708
-    delta_trans = torch.tanh(delta_xi[:, :3] / trans_limit) * trans_limit
-    delta_rot = torch.tanh(delta_xi[:, 3:] / rot_limit) * rot_limit
-    delta_xi = torch.cat([delta_trans, delta_rot], dim=1)
+        # Safety clamp
+        trans_limit, rot_limit = 2.0, 1.5708
+        delta_trans = torch.tanh(delta_xi[:, :3] / trans_limit) * trans_limit
+        delta_rot = torch.tanh(delta_xi[:, 3:] / rot_limit) * rot_limit
+        delta_xi = torch.cat([delta_trans, delta_rot], dim=1)
 
+    if return_Jtr:
+        return delta_xi, residual, Jtr
     return delta_xi, residual
 
 
