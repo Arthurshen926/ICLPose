@@ -1,0 +1,19 @@
+# Top8 fine selector as a vector-only candidate cost estimator.
+# This avoids score-map overfitting/noise and is the intended bridge toward
+# cached candidate-feature training.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_phase6_fine_lattice_selector_025_k8_selectoronly_peak_fullctx_hard_lr2e3_b4_fast.yaml
+exp_name: cpr_phase6_fine_lattice_selector_025_k8_vector_fullctx_hard_lr2e3_b6_fast
+
+model:
+  fine_candidate_selector_use_score_map_head: false
+  fine_candidate_selector_hidden_dim: 128
+
+training:
+  batch_size: 6
+  max_steps: 96
+  freeze_model_except_prefixes:
+    - "fine_candidate_selector_head."
+
+map_supervision:
+  fine_topk_selector_topk: 8

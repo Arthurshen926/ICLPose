@@ -1,0 +1,29 @@
+# Online uniform K64 fine selector with query-side fine adaptation.
+# Map geometry/features stay frozen; query fine/projector/selector adapt to pose-cost supervision.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_phase6_fine_lattice_selector_025_k64_uniform_projector_peak_corronly_soft_b2.yaml
+exp_name: cpr_phase6_fine_lattice_selector_025_k64_uniform_queryfine_peak_corronly_soft_b2
+
+training:
+  lr: 0.0005
+  max_steps: 160
+  freeze_model_except_prefixes:
+    - "fine_candidate_selector_head."
+    - "local_corr_projector."
+    - "fine_head."
+    - "fine_fuse."
+    - "window_attention."
+    - "global_context."
+  model_lr_scales:
+    fine_candidate_selector_head.: 1.0
+    local_corr_projector.: 0.2
+    fine_head.: 0.2
+    fine_fuse.: 0.1
+    window_attention.: 0.05
+    global_context.: 0.05
+
+loss:
+  fine_l1_weight: 0.0
+  fine_cos_weight: 0.01
+  coarse_l1_weight: 0.0
+  coarse_cos_weight: 0.0

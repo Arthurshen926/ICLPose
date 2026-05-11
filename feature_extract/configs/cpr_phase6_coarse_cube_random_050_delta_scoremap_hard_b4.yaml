@@ -1,0 +1,20 @@
+# Scale-specific coarse scorer for 0.5m/10deg random-direction CPR.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_phase6_coarse_cube_random_025050_delta_scoremap_peak_hard_b1.yaml
+exp_name: cpr_phase6_coarse_cube_random_050_delta_scoremap_hard_b4
+
+dataset:
+  max_train_samples: 64
+  max_val_samples: 32
+
+training:
+  batch_size: 4
+  max_steps: 80
+  log_every: 2
+
+map_supervision:
+  perturb_trans_cm_choices: [50.0]
+  perturb_rot_deg_choices: [10.0]
+  coarse_pose_lattice_trans_cm: [0.0, 50.0]
+  coarse_pose_lattice_rot_deg: [0.0, 10.0]
+  candidate_render_batch_size: 32

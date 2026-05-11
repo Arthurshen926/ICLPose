@@ -1,0 +1,43 @@
+# Direct fine selector over a 0.5m/10deg K384 lattice.
+# Fast diagnostic variant: richer local correlation volume + soft pose-error target.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_phase6_fine_lattice_selector_050_scoremap_b1.yaml
+exp_name: cpr_phase6_fine_lattice_selector_050_k384_volume_soft_b1_fast
+
+dataset:
+  max_train_samples: 32
+  max_val_samples: 4
+
+model:
+  fine_candidate_selector_use_score_map_head: true
+  fine_candidate_selector_hidden_dim: 64
+  fine_candidate_selector_map_channels: 8
+  fine_candidate_selector_grid_size: 4
+  fine_candidate_selector_context_layers: 1
+  fine_candidate_selector_context_heads: 1
+  fine_candidate_selector_context_residual: true
+  fine_candidate_selector_zero_init: false
+
+training:
+  batch_size: 1
+  max_steps: 48
+  log_every: 1
+  lr: 0.001
+  best_metric: map_fine_topk_selector_pred_trans_mm
+  best_metric_mode: min
+
+map_supervision:
+  coarse_pose_lattice_max_candidates: 384
+  coarse_pose_lattice_limit_strategy: uniform
+  fine_topk_selector_topk: 384
+  fine_topk_selector_score_map_mode: volume_plus_peak_offset
+  fine_topk_selector_projector_chunk_size: 64
+  fine_topk_selector_target_mode: gt_pose_error_soft
+  fine_topk_selector_target_temperature_m: 0.05
+  fine_topk_selector_pairwise_rank_weight: 0.1
+  fine_topk_selector_pairwise_rank_min_gap_m: 0.02
+  fine_topk_selector_pairwise_rank_temperature: 0.25
+  fine_topk_selector_use_coarse_logits: false
+  fine_topk_selector_use_candidate_delta: true
+  fine_topk_selector_use_depth: false
+  fine_topk_selector_use_mask: false

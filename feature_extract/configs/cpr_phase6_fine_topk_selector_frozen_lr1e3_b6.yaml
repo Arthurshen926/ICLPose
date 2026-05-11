@@ -1,0 +1,12 @@
+# CPR Phase 6 mixed-bucket selector with a higher LR.
+# The low-LR run learned in the right direction but too slowly; this run
+# warmstarts from its best selector and keeps the same frozen model/map setup.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_phase6_fine_topk_selector_frozen_b6.yaml
+exp_name: cpr_phase6_fine_topk_selector_frozen_lr1e3_b6
+
+training:
+  lr: 0.001
+  max_steps: 256
+  best_metric: map_fine_topk_selector_pred_trans_mm
+  best_metric_mode: min

@@ -90,6 +90,77 @@ def test_parse_args_accepts_fine_score_stat(monkeypatch):
     assert args.fine_score_stat == "topk_mean"
 
 
+def test_parse_args_accepts_jittered_eval_controls(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "eval_cpr_buckets.py",
+            "--config",
+            "config.yaml",
+            "--checkpoint",
+            "model.pth",
+            "--init-noise-mode",
+            "random",
+            "--init-jitter-seed",
+            "7",
+            "--candidate-jitter-cm",
+            "1.5",
+            "--candidate-jitter-deg",
+            "0.5",
+            "--disable-exact-inverse",
+        ],
+    )
+
+    args = eval_cpr_buckets.parse_args()
+
+    assert args.init_noise_mode == "random"
+    assert args.init_jitter_seed == 7
+    assert args.candidate_jitter_cm == 1.5
+    assert args.candidate_jitter_deg == 0.5
+    assert args.disable_exact_inverse is True
+
+
+def test_parse_args_accepts_trainable_fine_selector(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "eval_cpr_buckets.py",
+            "--config",
+            "config.yaml",
+            "--checkpoint",
+            "model.pth",
+            "--fine-select",
+            "fine_selector",
+        ],
+    )
+
+    args = eval_cpr_buckets.parse_args()
+
+    assert args.fine_select == "fine_selector"
+
+
+def test_parse_args_accepts_cube_lattice_direction_mode(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "eval_cpr_buckets.py",
+            "--config",
+            "config.yaml",
+            "--checkpoint",
+            "model.pth",
+            "--lattice-direction-mode",
+            "cube",
+        ],
+    )
+
+    args = eval_cpr_buckets.parse_args()
+
+    assert args.lattice_direction_mode == "cube"
+
+
 def test_apply_eval_overrides_sets_candidate_render_batch_size():
     cfg = {"map_supervision": {"candidate_render_batch_size": 0}}
     args = SimpleNamespace(candidate_render_batch_size=16)

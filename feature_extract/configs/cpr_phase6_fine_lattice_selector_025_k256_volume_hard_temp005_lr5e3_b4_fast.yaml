@@ -1,0 +1,15 @@
+# 0.25m/5deg K256 fine selector with stronger optimization signal.
+# Uses corr-volume features, sharper local-corr temperature, hard pose target,
+# and batch size 4 with projector chunking.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_phase6_fine_lattice_selector_025_k256_volume_soft_b2_fast.yaml
+exp_name: cpr_phase6_fine_lattice_selector_025_k256_volume_hard_temp005_lr5e3_b4_fast
+
+training:
+  batch_size: 4
+  lr: 0.005
+
+map_supervision:
+  fine_topk_selector_temperature: 0.05
+  fine_topk_selector_target_mode: gt_pose_error_hard
+  fine_topk_selector_pairwise_rank_weight: 0.2

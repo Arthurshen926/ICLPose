@@ -1,0 +1,10 @@
+# Full selector context plus SE(3) candidate delta vector and dense pose-cost regression.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_phase6_fine_lattice_selector_025_k128_projector_peak_fullctx_hard_costreg1_lr2e3_b2_fast.yaml
+exp_name: cpr_phase6_fine_lattice_selector_025_k128_projector_peak_fullctx_delta_hard_costreg1_lr2e3_b2_fast
+
+model:
+  fine_candidate_selector_use_delta_vector_features: true
+
+map_supervision:
+  fine_topk_selector_use_delta_vector: true

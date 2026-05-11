@@ -1,0 +1,10 @@
+# 0.25m/5deg K128 curriculum for selector + trainable local-corr projector.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_phase6_fine_lattice_selector_025_k256_projector_peak_hard_temp005_lr2e3_b2_fast.yaml
+exp_name: cpr_phase6_fine_lattice_selector_025_k128_projector_peak_hard_temp005_lr2e3_b2_fast
+
+map_supervision:
+  coarse_pose_lattice_max_candidates: 128
+  fine_topk_selector_topk: 128
+  fine_topk_selector_radius: 2
+  fine_topk_selector_projector_chunk_size: 32

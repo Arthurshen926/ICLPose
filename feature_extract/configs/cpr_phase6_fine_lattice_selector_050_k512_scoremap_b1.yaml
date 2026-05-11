@@ -1,0 +1,9 @@
+# Direct fine selector over a scale-specific K512 lattice for 0.5m/10deg.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_phase6_fine_lattice_selector_050_scoremap_b1.yaml
+exp_name: cpr_phase6_fine_lattice_selector_050_k512_scoremap_b1
+
+map_supervision:
+  coarse_pose_lattice_max_candidates: 512
+  coarse_pose_lattice_limit_strategy: uniform
+  fine_topk_selector_topk: 512

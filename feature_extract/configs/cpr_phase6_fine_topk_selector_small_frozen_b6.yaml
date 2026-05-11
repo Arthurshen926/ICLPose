@@ -1,0 +1,23 @@
+# CPR Phase 6 sidecar: small-basin-heavy fine topK selector.
+# This parallel run emphasizes 0.1m/2deg and 0.25m/5deg, where the current
+# hand-written fine reranker has the largest selector gap.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_phase6_fine_topk_selector_frozen_b6.yaml
+exp_name: cpr_phase6_fine_topk_selector_small_frozen_b6
+
+dataset:
+  max_train_samples: 128
+  max_val_samples: 32
+
+training:
+  batch_size: 6
+  max_steps: 384
+  best_metric: map_fine_topk_selector_pred_trans_mm
+  best_metric_mode: min
+
+map_supervision:
+  perturb_trans_cm_choices: [10.0, 25.0]
+  perturb_rot_deg_choices: [2.0, 5.0]
+  candidate_render_batch_size: 16
+  coarse_pose_lattice_trans_cm: [0.0, 5.0, 10.0, 25.0, 50.0]
+  coarse_pose_lattice_rot_deg: [0.0, 1.0, 2.0, 5.0, 10.0]

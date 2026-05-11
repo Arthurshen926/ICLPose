@@ -1,0 +1,11 @@
+# Evaluation-only override for K8 full-context fine selector checkpoints.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_phase6_fine_lattice_selector_025_k8_projector_peak_fullctx_hard_lr2e3_b4_fast.yaml
+exp_name: cpr_phase6_fine_lattice_selector_025_k8_projector_peak_fullctx_eval_val32
+
+dataset:
+  max_train_samples: 32
+  max_val_samples: 32
+
+training:
+  batch_size: 1

@@ -1,0 +1,13 @@
+# Evaluation-only override for K128 projector selector checkpoints.
+# Expands validation beyond the 4-sample fast loop to check whether early best
+# points are robust or just small-val artifacts.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_phase6_fine_lattice_selector_025_k128_projector_peak_hard_temp005_lr2e3_b2_fast.yaml
+exp_name: cpr_phase6_fine_lattice_selector_025_k128_projector_peak_hard_temp005_eval_val32
+
+dataset:
+  max_train_samples: 32
+  max_val_samples: 32
+
+training:
+  batch_size: 1

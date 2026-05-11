@@ -1,0 +1,68 @@
+# CPR Phase 6 probe: train only a topK-internal fine candidate selector.
+#
+# The coarse lattice scorer, safe map, query student, projector, and basin
+# adapter stay frozen. The new selector learns to choose the GT-nearest pose
+# inside the coarse topK using fine query/map correlation statistics.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_clean_phase5_basin_adapter_on_safemap_top4_b6.yaml
+exp_name: cpr_phase6_fine_topk_selector_frozen_b6
+
+model:
+  warmstart_strict: false
+  fine_candidate_selector_enabled: true
+  fine_candidate_selector_hidden_dim: 64
+  fine_candidate_selector_zero_init: true
+
+dataset:
+  max_train_samples: 128
+  max_val_samples: 32
+
+training:
+  batch_size: 6
+  max_steps: 512
+  log_every: 2
+  lr: 0.0001
+  best_metric: map_fine_topk_selector_pred_trans_mm
+  best_metric_mode: min
+  freeze_model_except_prefixes:
+    - "fine_candidate_selector_head."
+  model_lr_scales:
+    fine_candidate_selector_head.: 1.0
+
+loss:
+  fine_l1_weight: 0.0
+  fine_cos_weight: 0.0
+  coarse_l1_weight: 0.0
+  coarse_cos_weight: 0.0
+
+map_supervision:
+  trainable: false
+  train_geometry: false
+  candidate_render_score_train_map: false
+  candidate_render_include_aux: false
+  candidate_render_batch_size: 32
+  candidate_score_fusion_weight: 0.0
+
+  perturb_trans_cm_choices: [10.0, 25.0, 50.0, 100.0]
+  perturb_rot_deg_choices: [2.0, 5.0, 10.0, 20.0]
+
+  fine_topk_selector_weight: 1.0
+  fine_topk_selector_topk: 8
+  fine_topk_selector_temperature: 1.0
+  fine_topk_selector_mode: local
+  fine_topk_selector_radius: 4
+  fine_topk_selector_preprocess: spatial_center
+  fine_topk_selector_highpass_kernel: 5
+  fine_topk_selector_score_map_mode: peak_offset
+  fine_topk_selector_rot_cost_weight: 0.1
+  fine_topk_selector_target_mode: gt_pose_error_soft
+  fine_topk_selector_target_temperature_m: 0.05
+  fine_topk_selector_pairwise_rank_weight: 0.1
+  fine_topk_selector_pairwise_rank_min_gap_m: 0.03
+  fine_topk_selector_pairwise_rank_temperature: 1.0
+  fine_topk_selector_detach_query: true
+  fine_topk_selector_detach_render: true
+  fine_topk_selector_use_projector: true
+  fine_topk_selector_require_projector: true
+  fine_topk_selector_basin_trans_m: 0.25
+  fine_topk_selector_basin_rot_deg: 5.0

@@ -19,6 +19,7 @@ Smoke test:
 
 import argparse
 import copy
+import hashlib
 import inspect
 import json
 import logging
@@ -98,11 +99,60 @@ CANDIDATE_QUALITY_FEATURE_NAMES = (
     "retrieval_pnp_inlier_ratio",
     "retrieval_pnp_inlier_conf_mean",
 )
+CANDIDATE_MOTION_FEATURE_NAMES = (
+    "candidate_delta_trans_m",
+    "candidate_delta_trans_zscore",
+    "candidate_delta_rot_rad",
+    "candidate_delta_rot_zscore",
+)
 DEFAULT_CANDIDATE_SCORE_FUSION_INPUT_DIM = (
     len(CANDIDATE_RENDER_BASE_FEATURE_NAMES) + len(CANDIDATE_QUALITY_FEATURE_NAMES)
 )
 RICH_CANDIDATE_SCORE_FUSION_INPUT_DIM = (
     len(CANDIDATE_RENDER_RICH_FEATURE_NAMES) + len(CANDIDATE_QUALITY_FEATURE_NAMES)
+)
+FINE_CANDIDATE_SELECTOR_VECTOR_FEATURE_NAMES = (
+    "score_mean",
+    "score_centered",
+    "score_std",
+    "score_max",
+    "score_max_centered",
+    "score_topk_mean",
+    "score_topk_mean_centered",
+    "score_peakiness",
+    "score_valid_fraction",
+    "coarse_logit",
+    "coarse_logit_zscore",
+    "coarse_margin_to_top1",
+    "coarse_rank_norm",
+    "delta_trans_m",
+    "delta_trans_zscore",
+    "delta_rot_rad",
+    "delta_rot_zscore",
+    "mask_fraction",
+    "depth_valid_fraction",
+    "depth_mean_zscore",
+    "depth_std_zscore",
+    "inv_depth_mean_zscore",
+)
+FINE_CANDIDATE_SELECTOR_RGB_FEATURE_NAMES = (
+    "rgb_l1_mean",
+    "rgb_l1_zscore",
+    "rgb_valid_fraction",
+)
+FINE_CANDIDATE_SELECTOR_DELTA_VECTOR_FEATURE_NAMES = (
+    "delta_vx",
+    "delta_vy",
+    "delta_vz",
+    "delta_wx",
+    "delta_wy",
+    "delta_wz",
+    "delta_vx_zscore",
+    "delta_vy_zscore",
+    "delta_vz_zscore",
+    "delta_wx_zscore",
+    "delta_wy_zscore",
+    "delta_wz_zscore",
 )
 
 
@@ -209,6 +259,19 @@ DEFAULT_CONFIG = {
         "candidate_basin_adapter_max_scale": 0.1,
         "candidate_basin_adapter_initial_logit_scale": -4.0,
         "candidate_basin_adapter_detach_base": True,
+        "fine_candidate_selector_enabled": False,
+        "fine_candidate_selector_hidden_dim": 64,
+        "fine_candidate_selector_zero_init": True,
+        "fine_candidate_selector_initial_bias": 0.0,
+        "fine_candidate_selector_input_dim": None,
+        "fine_candidate_selector_use_score_map_head": False,
+        "fine_candidate_selector_score_map_channels": None,
+        "fine_candidate_selector_map_channels": 8,
+        "fine_candidate_selector_grid_size": 4,
+        "fine_candidate_selector_context_layers": 0,
+        "fine_candidate_selector_context_heads": 1,
+        "fine_candidate_selector_context_feedforward_dim": None,
+        "fine_candidate_selector_context_residual": False,
     },
     "training": {
         "device": "cuda",
@@ -343,6 +406,35 @@ DEFAULT_CONFIG = {
         "candidate_score_fusion_pairwise_rank_weight": 0.0,
         "candidate_score_fusion_pairwise_rank_temperature": 1.0,
         "candidate_score_fusion_pairwise_rank_min_gap_m": 0.0,
+        "candidate_score_fusion_use_candidate_delta": False,
+        "fine_topk_selector_weight": 0.0,
+        "fine_topk_selector_topk": 8,
+        "fine_topk_selector_temperature": 1.0,
+        "fine_topk_selector_radius": None,
+        "fine_topk_selector_mode": "local",
+        "fine_topk_selector_preprocess": None,
+        "fine_topk_selector_highpass_kernel": None,
+        "fine_topk_selector_score_map_mode": "peak_offset",
+        "fine_topk_selector_rot_cost_weight": 0.1,
+        "fine_topk_selector_target_mode": "gt_pose_error_soft",
+        "fine_topk_selector_target_temperature_m": 0.05,
+        "fine_topk_selector_pairwise_rank_weight": 0.0,
+        "fine_topk_selector_pairwise_rank_temperature": 1.0,
+        "fine_topk_selector_pairwise_rank_min_gap_m": 0.03,
+        "fine_topk_selector_cost_regression_weight": 0.0,
+        "fine_topk_selector_cost_regression_temperature_m": None,
+        "fine_topk_selector_detach_query": True,
+        "fine_topk_selector_detach_render": True,
+        "fine_topk_selector_use_coarse_logits": True,
+        "fine_topk_selector_use_candidate_delta": True,
+        "fine_topk_selector_use_delta_vector": False,
+        "fine_topk_selector_use_depth": True,
+        "fine_topk_selector_use_mask": True,
+        "fine_topk_selector_use_rgb": False,
+        "fine_topk_selector_use_projector": True,
+        "fine_topk_selector_require_projector": False,
+        "fine_topk_selector_basin_trans_m": 0.25,
+        "fine_topk_selector_basin_rot_deg": 5.0,
         "candidate_two_stage_enabled": False,
         "candidate_stage1_topk": 0,
         "candidate_stage2_topm": 1,
@@ -375,6 +467,7 @@ DEFAULT_CONFIG = {
         "perturb_pose_mode": "camera_center",
         "perturb_frame": "camera",
         "perturb_axes": [0, 1, 2],
+        "perturb_direction_mode": "axis",
         "global_render_negative_count": 0,
         "global_render_negative_min_trans_m": 0.0,
         "rendered_teacher_fine_weight": 0.0,
@@ -634,6 +727,46 @@ def axis_angle_rotation_matrix(axis: int, angle_rad: torch.Tensor) -> torch.Tens
     return torch.stack([torch.stack(row) for row in rows])
 
 
+def axis_angle_vector_rotation_matrix(axis_angle: torch.Tensor) -> torch.Tensor:
+    """Build a 3x3 rotation matrix from an axis-angle vector."""
+    vec = torch.as_tensor(axis_angle, dtype=torch.float32).view(3)
+    angle = torch.linalg.norm(vec)
+    if float(angle.item()) <= 1.0e-12:
+        return torch.eye(3, dtype=torch.float32)
+    axis = vec / angle.clamp(min=1.0e-12)
+    x, y, z = axis.unbind()
+    c = torch.cos(angle)
+    s = torch.sin(angle)
+    one_c = 1.0 - c
+    return torch.stack(
+        [
+            torch.stack([c + x * x * one_c, x * y * one_c - z * s, x * z * one_c + y * s]),
+            torch.stack([y * x * one_c + z * s, c + y * y * one_c, y * z * one_c - x * s]),
+            torch.stack([z * x * one_c - y * s, z * y * one_c + x * s, c + z * z * one_c]),
+        ]
+    )
+
+
+def sample_perturb_direction(direction_mode="axis", axes=None) -> torch.Tensor:
+    """Sample a signed unit direction for training-time pose perturbations."""
+    axes_valid = [int(v) for v in (axes or [0, 1, 2]) if int(v) in (0, 1, 2)]
+    if not axes_valid:
+        axes_valid = [0, 1, 2]
+    mode_key = str(direction_mode or "axis").lower()
+    if mode_key in ("axis", "axes", "canonical"):
+        direction = torch.zeros(3, dtype=torch.float32)
+        direction[random.choice(axes_valid)] = -1.0 if random.random() < 0.5 else 1.0
+        return direction
+    if mode_key in ("random", "sphere", "isotropic", "unit"):
+        for _ in range(16):
+            direction = torch.from_numpy(np.random.normal(0.0, 1.0, size=3).astype(np.float32))
+            norm = torch.linalg.norm(direction)
+            if float(norm.item()) > 1.0e-8:
+                return direction / norm
+        return torch.tensor([1.0, 0.0, 0.0], dtype=torch.float32)
+    raise ValueError("perturb_direction_mode must be 'axis' or 'random'")
+
+
 def camera_centers_from_w2c(poses_w2c: torch.Tensor) -> torch.Tensor:
     R = poses_w2c[:, :3, :3]
     t = poses_w2c[:, :3, 3]
@@ -665,12 +798,31 @@ def _as_float_sequence(value):
     return [float(v) for v in value]
 
 
+def _lattice_direction_vectors(mode="axis", *, dtype=torch.float32):
+    mode_key = str(mode or "axis").lower()
+    if mode_key in ("axis", "axes", "6", "axis6"):
+        eye = torch.eye(3, dtype=dtype)
+        return torch.cat([eye, -eye], dim=0)
+    if mode_key in ("cube", "cube26", "26", "diagonal", "diag"):
+        rows = []
+        for x in (-1.0, 0.0, 1.0):
+            for y in (-1.0, 0.0, 1.0):
+                for z in (-1.0, 0.0, 1.0):
+                    if x == 0.0 and y == 0.0 and z == 0.0:
+                        continue
+                    vec = torch.tensor([x, y, z], dtype=dtype)
+                    rows.append(vec / vec.norm().clamp(min=1e-6))
+        return torch.stack(rows, dim=0)
+    raise ValueError("coarse pose lattice direction_mode must be 'axis' or 'cube'")
+
+
 def pose_lattice_delta_templates(
     trans_cm,
     rot_deg,
     *,
     include_identity=True,
     combine_trans_rot=False,
+    direction_mode="axis",
     dtype=torch.float32,
 ):
     """Build axis-aligned local SE(3) perturbations for CPR coarse pose search."""
@@ -683,19 +835,17 @@ def pose_lattice_delta_templates(
         rows = []
     trans_values_m = [abs(v) * 0.01 for v in _as_float_sequence(trans_cm) if abs(float(v)) > 1e-12]
     rot_values_rad = [math.radians(abs(v)) for v in _as_float_sequence(rot_deg) if abs(float(v)) > 1e-12]
-    axes = torch.eye(3, dtype=dtype)
+    directions = _lattice_direction_vectors(direction_mode, dtype=dtype)
     for magnitude in trans_values_m:
-        for axis in axes:
-            for sign in (-1.0, 1.0):
-                delta = torch.zeros(6, dtype=dtype)
-                delta[:3] = axis * (sign * float(magnitude))
-                trans_rows.append(delta)
+        for direction in directions:
+            delta = torch.zeros(6, dtype=dtype)
+            delta[:3] = direction * float(magnitude)
+            trans_rows.append(delta)
     for magnitude in rot_values_rad:
-        for axis in axes:
-            for sign in (-1.0, 1.0):
-                delta = torch.zeros(6, dtype=dtype)
-                delta[3:] = axis * (sign * float(magnitude))
-                rot_rows.append(delta)
+        for direction in directions:
+            delta = torch.zeros(6, dtype=dtype)
+            delta[3:] = direction * float(magnitude)
+            rot_rows.append(delta)
     if combine_trans_rot and (trans_rows or rot_rows):
         trans_basis = [zero] + trans_rows
         rot_basis = [zero] + rot_rows
@@ -726,6 +876,7 @@ def build_local_pose_lattice_candidates(
     max_candidates=0,
     limit_strategy="head",
     combine_trans_rot=False,
+    direction_mode="axis",
 ):
     """Generate a local pose candidate bank around an initial w2c pose."""
     single = base_pose_w2c.ndim == 2
@@ -737,6 +888,7 @@ def build_local_pose_lattice_candidates(
         rot_deg,
         include_identity=bool(include_identity),
         combine_trans_rot=bool(combine_trans_rot),
+        direction_mode=direction_mode,
         dtype=torch.float32,
     ).to(device=base.device, dtype=base.dtype)
     limit = int(max_candidates or 0)
@@ -1980,6 +2132,8 @@ def candidate_score_fusion_listwise_loss(
     pairwise_rank_min_gap_m=0.0,
     basin_trans_m=0.25,
     basin_rot_deg=5.0,
+    init_pose=None,
+    use_candidate_delta=False,
     return_details=False,
 ):
     """Train a learnable scorer to rank pose candidates using render scores plus priors."""
@@ -2053,10 +2207,24 @@ def candidate_score_fusion_listwise_loss(
     elif render_feature_mode_key not in ("basic", "base", "scalar"):
         raise ValueError("candidate score fusion render_feature_mode must be 'basic' or 'rich'")
     quality_features, _quality_names = candidate_quality_features_from_batch(batch or {}, valid_mask=valid)
-    fusion_features = torch.cat(
-        [render_features.to(dtype=quality_features.dtype), quality_features.to(device=render_scores.device)],
-        dim=-1,
-    )
+    feature_parts = [render_features.to(dtype=quality_features.dtype), quality_features.to(device=render_scores.device)]
+    if bool(use_candidate_delta):
+        delta_trans, delta_rot_rad = _candidate_delta_from_init(
+            candidate_pose.to(device=render_scores.device),
+            init_pose,
+            valid,
+        )
+        motion_features = torch.stack(
+            [
+                delta_trans,
+                _masked_row_standardize(delta_trans, valid),
+                delta_rot_rad,
+                _masked_row_standardize(delta_rot_rad, valid),
+            ],
+            dim=-1,
+        )
+        feature_parts.append(motion_features.to(device=render_scores.device, dtype=quality_features.dtype))
+    fusion_features = torch.cat(feature_parts, dim=-1)
     if score_map_scorer:
         if score_maps is None:
             raise ValueError("score_map scorer requires candidate score maps")
@@ -2235,6 +2403,708 @@ def candidate_score_fusion_listwise_loss(
         }
         return loss, metrics, details
     return loss, metrics
+
+
+def _as_bank_5d(value, *, spatial_hw=None, mode="nearest"):
+    if value is None:
+        return None
+    value_t = value.float()
+    if value_t.ndim == 4:
+        value_t = value_t.unsqueeze(2)
+    if value_t.ndim != 5:
+        raise ValueError(f"candidate bank tensor must be 4D or 5D, got {tuple(value_t.shape)}")
+    if spatial_hw is not None and tuple(value_t.shape[-2:]) != tuple(spatial_hw):
+        bsz, count, channels = value_t.shape[:3]
+        flat = value_t.reshape(bsz * count, channels, value_t.shape[-2], value_t.shape[-1])
+        if mode == "nearest":
+            flat = F.interpolate(flat, size=spatial_hw, mode="nearest")
+        else:
+            flat = F.interpolate(flat, size=spatial_hw, mode="bilinear", align_corners=False)
+        value_t = flat.reshape(bsz, count, channels, int(spatial_hw[0]), int(spatial_hw[1]))
+    return value_t
+
+
+def _candidate_depth_mask_stats(depth, mask, valid, spatial_hw):
+    device = valid.device
+    dtype = torch.float32
+    bsz, num_candidates = valid.shape
+    if mask is None:
+        mask_fraction = valid.float()
+        mask_bank = torch.ones(
+            bsz,
+            num_candidates,
+            1,
+            int(spatial_hw[0]),
+            int(spatial_hw[1]),
+            device=device,
+            dtype=dtype,
+        )
+    else:
+        mask_bank = _as_bank_5d(mask.to(device=device), spatial_hw=spatial_hw, mode="nearest")
+        mask_bank = mask_bank[:, :, :1].float()
+        mask_fraction = mask_bank.mean(dim=(2, 3, 4))
+    mask_fraction = torch.where(valid, mask_fraction, torch.zeros_like(mask_fraction))
+    if depth is None:
+        zeros = torch.zeros((bsz, num_candidates), device=device, dtype=dtype)
+        return {
+            "mask_fraction": mask_fraction,
+            "depth_valid_fraction": zeros,
+            "depth_mean_zscore": zeros,
+            "depth_std_zscore": zeros,
+            "inv_depth_mean_zscore": zeros,
+        }
+    depth_bank = _as_bank_5d(depth.to(device=device), spatial_hw=spatial_hw, mode="bilinear")
+    depth_bank = depth_bank[:, :, :1].float()
+    depth_valid = (depth_bank > 0.05) & (mask_bank > 0.5) & valid[:, :, None, None, None]
+    depth_valid_f = depth_valid.float()
+    denom = depth_valid_f.sum(dim=(2, 3, 4)).clamp(min=1.0)
+    depth_clamped = depth_bank.clamp(min=0.05)
+    depth_mean = (depth_clamped * depth_valid_f).sum(dim=(2, 3, 4)) / denom
+    centered = torch.where(depth_valid, depth_clamped - depth_mean[:, :, None, None, None], torch.zeros_like(depth_clamped))
+    depth_std = ((centered.square() * depth_valid_f).sum(dim=(2, 3, 4)) / denom).sqrt()
+    inv_depth_mean = ((1.0 / depth_clamped) * depth_valid_f).sum(dim=(2, 3, 4)) / denom
+    depth_fraction = depth_valid_f.mean(dim=(2, 3, 4))
+    return {
+        "mask_fraction": mask_fraction,
+        "depth_valid_fraction": torch.where(valid, depth_fraction, torch.zeros_like(depth_fraction)),
+        "depth_mean_zscore": _masked_row_standardize(depth_mean, valid),
+        "depth_std_zscore": _masked_row_standardize(depth_std, valid),
+        "inv_depth_mean_zscore": _masked_row_standardize(inv_depth_mean, valid),
+    }
+
+
+def _candidate_rgb_stats(query_rgb, candidate_rgb, mask, valid, spatial_hw):
+    device = valid.device
+    bsz, num_candidates = valid.shape
+    zeros = torch.zeros((bsz, num_candidates), device=device, dtype=torch.float32)
+    if query_rgb is None or candidate_rgb is None:
+        return {
+            "rgb_l1_mean": zeros,
+            "rgb_l1_zscore": zeros,
+            "rgb_valid_fraction": zeros,
+        }
+    query = query_rgb.to(device=device, dtype=torch.float32)
+    if query.ndim != 4:
+        raise ValueError(f"query_rgb must have shape (B,3,H,W), got {tuple(query.shape)}")
+    if query.shape[-2:] != tuple(spatial_hw):
+        query = F.interpolate(query, size=spatial_hw, mode="bilinear", align_corners=False)
+    rgb_bank = _as_bank_5d(candidate_rgb.to(device=device), spatial_hw=spatial_hw, mode="bilinear")
+    if rgb_bank.shape[:2] != (bsz, num_candidates):
+        raise ValueError(f"candidate_rgb must have shape {(bsz, num_candidates)} in first dims, got {tuple(rgb_bank.shape)}")
+    rgb_bank = rgb_bank[:, :, :3].float()
+    if mask is None:
+        mask_bank = torch.ones(
+            bsz,
+            num_candidates,
+            1,
+            int(spatial_hw[0]),
+            int(spatial_hw[1]),
+            device=device,
+            dtype=torch.float32,
+        )
+    else:
+        mask_bank = _as_bank_5d(mask.to(device=device), spatial_hw=spatial_hw, mode="nearest")
+        mask_bank = mask_bank[:, :, :1].float()
+    rgb_valid = (mask_bank > 0.5) & valid[:, :, None, None, None]
+    rgb_valid_f = rgb_valid.float()
+    diff = (rgb_bank - query[:, None]).abs()
+    denom = (rgb_valid_f.sum(dim=(2, 3, 4)) * float(diff.shape[2])).clamp(min=1.0)
+    rgb_l1 = (diff * rgb_valid_f).sum(dim=(2, 3, 4)) / denom
+    rgb_fraction = rgb_valid_f.mean(dim=(2, 3, 4))
+    rgb_l1 = torch.where(valid, rgb_l1, zeros)
+    return {
+        "rgb_l1_mean": rgb_l1,
+        "rgb_l1_zscore": _masked_row_standardize(-rgb_l1, valid),
+        "rgb_valid_fraction": torch.where(valid, rgb_fraction, zeros),
+    }
+
+
+def _candidate_delta_from_init(candidate_pose, init_pose, valid):
+    bsz, num_candidates = candidate_pose.shape[:2]
+    device = candidate_pose.device
+    if init_pose is None:
+        zeros = torch.zeros((bsz, num_candidates), device=device, dtype=torch.float32)
+        return zeros, zeros
+    init_pose_t = init_pose.to(device=device, dtype=candidate_pose.dtype)
+    if init_pose_t.ndim == 4:
+        init_pose_t = init_pose_t[:, 0]
+    if init_pose_t.ndim != 3 or init_pose_t.shape[-2:] != (4, 4):
+        raise ValueError(f"init_pose must have shape (B,4,4), got {tuple(init_pose_t.shape)}")
+    cand_centers = camera_centers_from_w2c(candidate_pose.reshape(bsz * num_candidates, 4, 4)).reshape(
+        bsz,
+        num_candidates,
+        3,
+    )
+    init_centers = camera_centers_from_w2c(init_pose_t.float()).unsqueeze(1)
+    delta_trans = torch.linalg.norm(cand_centers.float() - init_centers.float(), dim=-1)
+    _rot_loss, delta_rot_deg = _rotation_error_from_mats(
+        candidate_pose[:, :, :3, :3].float(),
+        init_pose_t[:, None, :3, :3].float(),
+    )
+    delta_rot_rad = delta_rot_deg * (math.pi / 180.0)
+    return (
+        torch.where(valid, delta_trans, torch.zeros_like(delta_trans)),
+        torch.where(valid, delta_rot_rad, torch.zeros_like(delta_rot_rad)),
+    )
+
+
+def _candidate_delta_vector_from_init(candidate_pose, init_pose, valid):
+    bsz, num_candidates = candidate_pose.shape[:2]
+    device = candidate_pose.device
+    zeros = torch.zeros((bsz, num_candidates, 6), device=device, dtype=torch.float32)
+    if init_pose is None:
+        return zeros, zeros
+    init_pose_t = init_pose.to(device=device, dtype=candidate_pose.dtype)
+    if init_pose_t.ndim == 4:
+        init_pose_t = init_pose_t[:, 0]
+    if init_pose_t.ndim != 3 or init_pose_t.shape[-2:] != (4, 4):
+        raise ValueError(f"init_pose must have shape (B,4,4), got {tuple(init_pose_t.shape)}")
+    init_inv = torch.linalg.inv(init_pose_t.float())
+    rel = candidate_pose.float() @ init_inv[:, None]
+    delta = se3_log(rel.reshape(bsz * num_candidates, 4, 4)).reshape(bsz, num_candidates, 6)
+    delta = torch.where(valid[:, :, None], delta, zeros)
+    delta_z = torch.stack(
+        [_masked_row_standardize(delta[:, :, idx], valid) for idx in range(delta.shape[-1])],
+        dim=-1,
+    )
+    return delta, delta_z
+
+
+def fine_candidate_selector_features(
+    query_feat,
+    candidate_feat,
+    candidate_pose,
+    *,
+    init_pose=None,
+    coarse_logits=None,
+    query_rgb=None,
+    candidate_rgb=None,
+    depth=None,
+    mask=None,
+    candidate_valid_mask=None,
+    mode="local",
+    radius=4,
+    preprocess="none",
+    highpass_kernel=5,
+    score_map_mode="peak_offset",
+    return_score_maps=False,
+    use_coarse_logits=True,
+    use_candidate_delta=True,
+    use_delta_vector=False,
+    use_depth=True,
+    use_mask=True,
+    use_rgb=False,
+):
+    """Build per-candidate vector features for trainable fine top-K reranking."""
+    if query_feat.ndim != 4:
+        raise ValueError("query_feat must have shape (B,C,H,W)")
+    if candidate_feat.ndim != 5:
+        raise ValueError("candidate_feat must have shape (B,K,C,H,W)")
+    if candidate_pose.ndim != 4 or candidate_pose.shape[-2:] != (4, 4):
+        raise ValueError("candidate_pose must have shape (B,K,4,4)")
+    if query_feat.shape[0] != candidate_feat.shape[0] or candidate_feat.shape[:2] != candidate_pose.shape[:2]:
+        raise ValueError("query_feat, candidate_feat, and candidate_pose batch dimensions must match")
+    bsz, num_candidates = candidate_feat.shape[:2]
+    render_scores, render_valid_fraction, render_stats, score_maps = _candidate_render_score_rows(
+        query_feat,
+        candidate_feat,
+        mask=mask,
+        mode=mode,
+        radius=radius,
+        preprocess=preprocess,
+        highpass_kernel=highpass_kernel,
+        score_map_mode=score_map_mode,
+        return_score_maps=return_score_maps,
+    )
+    valid = torch.ones((bsz, num_candidates), device=render_scores.device, dtype=torch.bool)
+    if candidate_valid_mask is not None:
+        valid = candidate_valid_mask.to(device=render_scores.device).bool()
+        if valid.shape != (bsz, num_candidates):
+            raise ValueError(
+                f"candidate_valid_mask must have shape {(bsz, num_candidates)}, got {tuple(valid.shape)}"
+            )
+    render_scores = torch.where(valid, render_scores, torch.zeros_like(render_scores))
+    valid_f = valid.float()
+    render_mean = (render_scores * valid_f).sum(dim=1, keepdim=True) / valid_f.sum(dim=1, keepdim=True).clamp(min=1.0)
+
+    if coarse_logits is None:
+        coarse = torch.zeros_like(render_scores)
+    else:
+        coarse = coarse_logits.to(device=render_scores.device, dtype=render_scores.dtype)
+        if coarse.shape != (bsz, num_candidates):
+            raise ValueError(f"coarse_logits must have shape {(bsz, num_candidates)}, got {tuple(coarse.shape)}")
+        coarse = torch.where(valid, coarse, torch.zeros_like(coarse))
+    coarse_z = _masked_row_standardize(coarse, valid)
+    coarse_for_rank = coarse.masked_fill(~valid, -1.0e6)
+    coarse_top1 = coarse_for_rank.max(dim=1, keepdim=True).values
+    coarse_margin_to_top1 = torch.where(valid, coarse_top1 - coarse, torch.zeros_like(coarse))
+    rank_order = coarse_for_rank.argsort(dim=1, descending=True)
+    ranks = torch.zeros_like(rank_order, dtype=torch.float32)
+    rank_values = torch.arange(num_candidates, device=render_scores.device, dtype=torch.float32).view(1, -1)
+    ranks.scatter_(1, rank_order, rank_values.expand_as(ranks))
+    denom = float(max(num_candidates - 1, 1))
+    coarse_rank_norm = torch.where(valid, 1.0 - ranks / denom, torch.zeros_like(ranks))
+    if not bool(use_coarse_logits):
+        coarse = torch.zeros_like(render_scores)
+        coarse_z = torch.zeros_like(render_scores)
+        coarse_margin_to_top1 = torch.zeros_like(render_scores)
+        coarse_rank_norm = torch.zeros_like(render_scores)
+
+    delta_trans, delta_rot_rad = _candidate_delta_from_init(candidate_pose.to(device=render_scores.device), init_pose, valid)
+    if not bool(use_candidate_delta):
+        delta_trans = torch.zeros_like(render_scores)
+        delta_rot_rad = torch.zeros_like(render_scores)
+    delta_vector, delta_vector_z = _candidate_delta_vector_from_init(
+        candidate_pose.to(device=render_scores.device),
+        init_pose,
+        valid,
+    )
+    if not bool(use_delta_vector):
+        delta_vector = torch.zeros_like(delta_vector)
+        delta_vector_z = torch.zeros_like(delta_vector_z)
+    depth_stats = _candidate_depth_mask_stats(
+        depth if bool(use_depth) else None,
+        mask if bool(use_mask) else None,
+        valid,
+        candidate_feat.shape[-2:],
+    )
+    if not bool(use_mask):
+        depth_stats["mask_fraction"] = torch.zeros_like(render_scores)
+    if not bool(use_depth):
+        for key in ("depth_valid_fraction", "depth_mean_zscore", "depth_std_zscore", "inv_depth_mean_zscore"):
+            depth_stats[key] = torch.zeros_like(render_scores)
+    feature_rows = [
+        render_scores,
+        render_scores - render_mean,
+        torch.where(valid, render_stats["std"], torch.zeros_like(render_scores)),
+        torch.where(valid, render_stats["max"], torch.zeros_like(render_scores)),
+        torch.where(valid, render_stats["max"] - render_mean, torch.zeros_like(render_scores)),
+        torch.where(valid, render_stats["topk_mean"], torch.zeros_like(render_scores)),
+        torch.where(valid, render_stats["topk_mean"] - render_mean, torch.zeros_like(render_scores)),
+        torch.where(valid, render_stats["peakiness"], torch.zeros_like(render_scores)),
+        torch.where(valid, render_valid_fraction, torch.zeros_like(render_valid_fraction)),
+        coarse,
+        coarse_z,
+        coarse_margin_to_top1,
+        coarse_rank_norm,
+        delta_trans,
+        _masked_row_standardize(delta_trans, valid),
+        delta_rot_rad,
+        _masked_row_standardize(delta_rot_rad, valid),
+        depth_stats["mask_fraction"],
+        depth_stats["depth_valid_fraction"],
+        depth_stats["depth_mean_zscore"],
+        depth_stats["depth_std_zscore"],
+        depth_stats["inv_depth_mean_zscore"],
+    ]
+    if bool(use_rgb):
+        rgb_stats = _candidate_rgb_stats(query_rgb, candidate_rgb, mask, valid, candidate_feat.shape[-2:])
+        feature_rows.extend(
+            [
+                rgb_stats["rgb_l1_mean"],
+                rgb_stats["rgb_l1_zscore"],
+                rgb_stats["rgb_valid_fraction"],
+            ]
+        )
+    if bool(use_delta_vector):
+        feature_rows.extend([delta_vector[:, :, idx] for idx in range(delta_vector.shape[-1])])
+        feature_rows.extend([delta_vector_z[:, :, idx] for idx in range(delta_vector_z.shape[-1])])
+    features = torch.stack(feature_rows, dim=-1)
+    return {
+        "features": features.to(dtype=torch.float32),
+        "valid": valid,
+        "render_scores": render_scores,
+        "render_valid_fraction": render_valid_fraction,
+        "render_stats": render_stats,
+        "score_maps": score_maps,
+    }
+
+
+def fine_topk_selector_listwise_loss(
+    query_feat,
+    candidate_feat,
+    candidate_pose,
+    pose_gt,
+    selector,
+    *,
+    init_pose=None,
+    coarse_logits=None,
+    query_rgb=None,
+    candidate_rgb=None,
+    depth=None,
+    mask=None,
+    candidate_valid_mask=None,
+    mode="local",
+    temperature=1.0,
+    radius=4,
+    preprocess="none",
+    highpass_kernel=5,
+    score_map_mode="peak_offset",
+    rot_cost_weight=0.1,
+    target_mode="gt_pose_error_soft",
+    target_temperature_m=0.05,
+    cost_regression_weight=0.0,
+    cost_regression_temperature_m=None,
+    pairwise_rank_weight=0.0,
+    pairwise_rank_temperature=1.0,
+    pairwise_rank_min_gap_m=0.03,
+    basin_trans_m=0.25,
+    basin_rot_deg=5.0,
+    use_coarse_logits=True,
+    use_candidate_delta=True,
+    use_delta_vector=False,
+    use_depth=True,
+    use_mask=True,
+    use_rgb=False,
+    return_details=False,
+):
+    """Train a fine reranker to choose the GT-nearest pose inside a coarse top-K set."""
+    if selector is None:
+        raise ValueError("fine_topk_selector_listwise_loss requires a selector module")
+    score_map_selector = bool(getattr(selector, "expects_score_map", False))
+    feature_pack = fine_candidate_selector_features(
+        query_feat,
+        candidate_feat,
+        candidate_pose,
+        init_pose=init_pose,
+        coarse_logits=coarse_logits,
+        query_rgb=query_rgb,
+        candidate_rgb=candidate_rgb,
+        depth=depth,
+        mask=mask,
+        candidate_valid_mask=candidate_valid_mask,
+        mode=mode,
+        radius=radius,
+        preprocess=preprocess,
+        highpass_kernel=highpass_kernel,
+        score_map_mode=score_map_mode,
+        return_score_maps=score_map_selector,
+        use_coarse_logits=use_coarse_logits,
+        use_candidate_delta=use_candidate_delta,
+        use_delta_vector=use_delta_vector,
+        use_depth=use_depth,
+        use_mask=use_mask,
+        use_rgb=use_rgb,
+    )
+    features = feature_pack["features"]
+    valid = feature_pack["valid"]
+    bsz, num_candidates = valid.shape
+    target_idx, trans_err_m, rot_err_deg, pose_cost = _candidate_pose_target(
+        candidate_pose.to(device=features.device),
+        pose_gt.to(device=features.device),
+        valid,
+        rot_cost_weight,
+    )
+    if score_map_selector:
+        score_maps = feature_pack["score_maps"]
+        if score_maps is None:
+            raise ValueError("fine selector score-map head requires score maps")
+        raw_logits = selector(score_maps.to(device=features.device), features).to(
+            device=features.device,
+            dtype=features.dtype,
+        )
+    else:
+        raw_logits = selector(features).to(device=features.device, dtype=features.dtype)
+    logits = raw_logits.masked_fill(~valid, -1.0e6) / max(float(temperature), 1e-6)
+    target_mode_key = str(target_mode or "gt_pose_error_soft").lower()
+    target_probs = None
+    soft_target_entropy = torch.zeros((), device=features.device, dtype=features.dtype)
+    if target_mode_key in ("hard", "argmin", "ce", "gt_pose_error_hard", "pose_error_hard"):
+        loss = F.cross_entropy(logits, target_idx)
+    elif target_mode_key in ("soft", "soft_pose", "pose_softmax", "gt_pose_error_soft", "pose_error_soft"):
+        target_logits = (-pose_cost / max(float(target_temperature_m), 1e-6)).masked_fill(~valid, -1.0e6)
+        target_probs = F.softmax(target_logits, dim=1).detach()
+        log_probs = F.log_softmax(logits, dim=1)
+        loss = -(target_probs * log_probs).sum(dim=1).mean()
+        soft_target_entropy = -(target_probs * torch.log(target_probs.clamp(min=1e-8))).sum(dim=1).mean()
+    else:
+        raise ValueError("fine_topk_selector target_mode must be 'gt_pose_error_soft' or 'gt_pose_error_hard'")
+
+    cost_regression_loss = torch.zeros((), device=features.device, dtype=features.dtype)
+    if float(cost_regression_weight) > 0.0:
+        cost_temp = max(
+            float(target_temperature_m if cost_regression_temperature_m is None else cost_regression_temperature_m),
+            1e-6,
+        )
+        target_values = (-pose_cost / cost_temp).masked_fill(~valid, 0.0)
+        target_values = _masked_row_standardize(target_values, valid).detach()
+        pred_values = _masked_row_standardize(raw_logits.to(dtype=target_values.dtype), valid)
+        reg_per_candidate = F.smooth_l1_loss(pred_values, target_values, reduction="none")
+        cost_regression_loss = (reg_per_candidate * valid.float()).sum() / valid.float().sum().clamp(min=1.0)
+        loss = loss + float(cost_regression_weight) * cost_regression_loss
+
+    pairwise_rank_loss = torch.zeros((), device=features.device, dtype=features.dtype)
+    pairwise_rank_acc = torch.zeros((), device=features.device, dtype=features.dtype)
+    if float(pairwise_rank_weight) > 0.0 and num_candidates > 1:
+        cost_gap = pose_cost[:, None, :] - pose_cost[:, :, None]
+        pair_valid = valid[:, :, None] & valid[:, None, :]
+        pair_valid = pair_valid & (cost_gap > float(pairwise_rank_min_gap_m))
+        if pair_valid.any():
+            logit_margin = raw_logits[:, :, None] - raw_logits[:, None, :]
+            rank_temp = max(float(pairwise_rank_temperature), 1e-6)
+            pair_losses = F.softplus(-logit_margin / rank_temp)
+            pairwise_rank_loss = pair_losses[pair_valid].mean()
+            pairwise_rank_acc = (logit_margin[pair_valid] > 0.0).float().mean()
+            loss = loss + float(pairwise_rank_weight) * pairwise_rank_loss
+
+    batch_idx = torch.arange(bsz, device=features.device)
+    pred_idx = logits.argmax(dim=1)
+    selector_probs = F.softmax(logits, dim=1)
+    selector_entropy = -(selector_probs * torch.log(selector_probs.clamp(min=1e-8))).sum(dim=1).mean()
+    if num_candidates > 1:
+        top2_logits = raw_logits.masked_fill(~valid, -1.0e6).topk(k=2, dim=1).values
+        selector_margin = (top2_logits[:, 0] - top2_logits[:, 1]).mean()
+    else:
+        selector_margin = torch.zeros((), device=features.device, dtype=features.dtype)
+    target_trans_mm = trans_err_m[batch_idx, target_idx] * 1000.0
+    pred_trans_mm = trans_err_m[batch_idx, pred_idx] * 1000.0
+    basin_mask = valid & (trans_err_m <= float(basin_trans_m)) & (rot_err_deg <= float(basin_rot_deg))
+    topk_hit = {}
+    for topk in (1, 3, 4, 8):
+        k_eff = min(topk, num_candidates)
+        top_idx = logits.topk(k_eff, dim=1).indices
+        topk_hit[topk] = (top_idx == target_idx[:, None]).any(dim=1).float().mean().detach()
+    metrics = {
+        "map_fine_topk_selector_loss": loss.detach(),
+        "map_fine_topk_selector_acc": (pred_idx == target_idx).float().mean().detach(),
+        "map_fine_topk_selector_target_idx": target_idx.float().mean().detach(),
+        "map_fine_topk_selector_pred_idx": pred_idx.float().mean().detach(),
+        "map_fine_topk_selector_pred_trans_mm": pred_trans_mm.mean().detach(),
+        "map_fine_topk_selector_pred_rot_deg": rot_err_deg[batch_idx, pred_idx].mean().detach(),
+        "map_fine_topk_selector_target_trans_mm": target_trans_mm.mean().detach(),
+        "map_fine_topk_selector_target_rot_deg": rot_err_deg[batch_idx, target_idx].mean().detach(),
+        "map_fine_topk_selector_oracle_gap_mm": (pred_trans_mm - target_trans_mm).mean().detach(),
+        "map_fine_topk_selector_hit_best1": topk_hit[1],
+        "map_fine_topk_selector_hit_best3": topk_hit[3],
+        "map_fine_topk_selector_hit_best4": topk_hit[4],
+        "map_fine_topk_selector_hit_best8": topk_hit[8],
+        "map_fine_topk_selector_oracle_basin_recall": basin_mask.any(dim=1).float().mean().detach(),
+        "map_fine_topk_selector_pred_basin_recall": basin_mask[batch_idx, pred_idx].float().mean().detach(),
+        "map_fine_topk_selector_entropy": selector_entropy.detach(),
+        "map_fine_topk_selector_margin": selector_margin.detach(),
+        "map_fine_topk_selector_soft_target_entropy": soft_target_entropy.detach(),
+        "map_fine_topk_selector_cost_regression_loss": cost_regression_loss.detach(),
+        "map_fine_topk_selector_pairwise_rank_loss": pairwise_rank_loss.detach(),
+        "map_fine_topk_selector_pairwise_rank_acc": pairwise_rank_acc.detach(),
+        "map_fine_topk_selector_num_candidates": torch.tensor(float(num_candidates), device=features.device),
+    }
+    if return_details:
+        details = {
+            **feature_pack,
+            "raw_logits": raw_logits,
+            "logits": logits,
+            "target_idx": target_idx,
+            "target_probs": target_probs,
+            "pose_cost": pose_cost,
+            "trans_err_m": trans_err_m,
+            "rot_err_deg": rot_err_deg,
+        }
+        return loss, metrics, details
+    return loss, metrics
+
+
+def fine_topk_selector_cached_listwise_loss(
+    features,
+    valid,
+    trans_err_m,
+    rot_err_deg,
+    selector,
+    *,
+    score_maps=None,
+    rot_cost_weight=0.1,
+    temperature=1.0,
+    target_mode="gt_pose_error_soft",
+    target_temperature_m=0.05,
+    cost_regression_weight=0.0,
+    cost_regression_temperature_m=None,
+    pairwise_rank_weight=0.0,
+    pairwise_rank_temperature=1.0,
+    pairwise_rank_min_gap_m=0.03,
+    basin_trans_m=0.25,
+    basin_rot_deg=5.0,
+    return_details=False,
+):
+    """Train a vector-only fine reranker from cached top-K selector evidence."""
+    if selector is None:
+        raise ValueError("fine_topk_selector_cached_listwise_loss requires a selector module")
+    if features.ndim != 3:
+        raise ValueError("features must have shape (B,K,D)")
+    if valid.shape != features.shape[:2]:
+        raise ValueError(f"valid must have shape {tuple(features.shape[:2])}, got {tuple(valid.shape)}")
+    if trans_err_m.shape != features.shape[:2] or rot_err_deg.shape != features.shape[:2]:
+        raise ValueError("trans_err_m and rot_err_deg must have shape (B,K)")
+
+    features = features.float()
+    valid = valid.to(device=features.device).bool()
+    trans_err_m = trans_err_m.to(device=features.device, dtype=features.dtype)
+    rot_err_deg = rot_err_deg.to(device=features.device, dtype=features.dtype)
+    bsz, num_candidates = valid.shape
+    if not valid.any(dim=1).all():
+        raise ValueError("each cached selector row must contain at least one valid candidate")
+
+    pose_cost = trans_err_m + float(rot_cost_weight) * (rot_err_deg * (math.pi / 180.0))
+    pose_cost = pose_cost.masked_fill(~valid, 1.0e6)
+    target_idx = pose_cost.argmin(dim=1)
+    if bool(getattr(selector, "expects_score_map", False)):
+        if score_maps is None:
+            raise ValueError("cached score-map selector loss requires score_maps")
+        score_maps = score_maps.to(device=features.device)
+        if score_maps.shape[:2] != features.shape[:2]:
+            raise ValueError(
+                f"score_maps must have leading shape {tuple(features.shape[:2])}, got {tuple(score_maps.shape)}"
+            )
+        raw_logits = selector(score_maps, features).to(device=features.device, dtype=features.dtype)
+    else:
+        raw_logits = selector(features).to(device=features.device, dtype=features.dtype)
+    logit_temp = max(float(temperature), 1e-6)
+    logits = (raw_logits / logit_temp).masked_fill(~valid, -1.0e6)
+
+    target_mode_key = str(target_mode or "gt_pose_error_soft").lower()
+    target_probs = None
+    soft_target_entropy = torch.zeros((), device=features.device, dtype=features.dtype)
+    if target_mode_key in ("hard", "argmin", "ce", "gt_pose_error_hard", "pose_error_hard"):
+        loss = F.cross_entropy(logits, target_idx)
+    elif target_mode_key in ("soft", "soft_pose", "pose_softmax", "gt_pose_error_soft", "pose_error_soft"):
+        target_logits = (-pose_cost / max(float(target_temperature_m), 1e-6)).masked_fill(~valid, -1.0e6)
+        target_probs = F.softmax(target_logits, dim=1).detach()
+        log_probs = F.log_softmax(logits, dim=1)
+        loss = -(target_probs * log_probs).sum(dim=1).mean()
+        soft_target_entropy = -(target_probs * torch.log(target_probs.clamp(min=1e-8))).sum(dim=1).mean()
+    else:
+        raise ValueError("fine_topk_selector target_mode must be 'gt_pose_error_soft' or 'gt_pose_error_hard'")
+
+    cost_regression_loss = torch.zeros((), device=features.device, dtype=features.dtype)
+    if float(cost_regression_weight) > 0.0:
+        cost_temp = max(
+            float(target_temperature_m if cost_regression_temperature_m is None else cost_regression_temperature_m),
+            1e-6,
+        )
+        target_values = (-pose_cost / cost_temp).masked_fill(~valid, 0.0)
+        target_values = _masked_row_standardize(target_values, valid).detach()
+        pred_values = _masked_row_standardize(raw_logits.to(dtype=target_values.dtype), valid)
+        reg_per_candidate = F.smooth_l1_loss(pred_values, target_values, reduction="none")
+        cost_regression_loss = (reg_per_candidate * valid.float()).sum() / valid.float().sum().clamp(min=1.0)
+        loss = loss + float(cost_regression_weight) * cost_regression_loss
+
+    pairwise_rank_loss = torch.zeros((), device=features.device, dtype=features.dtype)
+    pairwise_rank_acc = torch.zeros((), device=features.device, dtype=features.dtype)
+    if float(pairwise_rank_weight) > 0.0 and num_candidates > 1:
+        cost_gap = pose_cost[:, None, :] - pose_cost[:, :, None]
+        pair_valid = valid[:, :, None] & valid[:, None, :]
+        pair_valid = pair_valid & (cost_gap > float(pairwise_rank_min_gap_m))
+        if pair_valid.any():
+            logit_margin = raw_logits[:, :, None] - raw_logits[:, None, :]
+            rank_temp = max(float(pairwise_rank_temperature), 1e-6)
+            pair_losses = F.softplus(-logit_margin / rank_temp)
+            pairwise_rank_loss = pair_losses[pair_valid].mean()
+            pairwise_rank_acc = (logit_margin[pair_valid] > 0.0).float().mean()
+            loss = loss + float(pairwise_rank_weight) * pairwise_rank_loss
+
+    batch_idx = torch.arange(bsz, device=features.device)
+    pred_idx = logits.argmax(dim=1)
+    selector_probs = F.softmax(logits, dim=1)
+    selector_entropy = -(selector_probs * torch.log(selector_probs.clamp(min=1e-8))).sum(dim=1).mean()
+    if num_candidates > 1:
+        top2_logits = raw_logits.masked_fill(~valid, -1.0e6).topk(k=2, dim=1).values
+        selector_margin = (top2_logits[:, 0] - top2_logits[:, 1]).mean()
+    else:
+        selector_margin = torch.zeros((), device=features.device, dtype=features.dtype)
+    target_trans_mm = trans_err_m[batch_idx, target_idx] * 1000.0
+    pred_trans_mm = trans_err_m[batch_idx, pred_idx] * 1000.0
+    basin_mask = valid & (trans_err_m <= float(basin_trans_m)) & (rot_err_deg <= float(basin_rot_deg))
+    topk_hit = {}
+    for topk in (1, 3, 4, 8):
+        k_eff = min(topk, num_candidates)
+        top_idx = logits.topk(k_eff, dim=1).indices
+        topk_hit[topk] = (top_idx == target_idx[:, None]).any(dim=1).float().mean().detach()
+
+    metrics = {
+        "map_fine_topk_selector_loss": loss.detach(),
+        "map_fine_topk_selector_acc": (pred_idx == target_idx).float().mean().detach(),
+        "map_fine_topk_selector_target_idx": target_idx.float().mean().detach(),
+        "map_fine_topk_selector_pred_idx": pred_idx.float().mean().detach(),
+        "map_fine_topk_selector_pred_trans_mm": pred_trans_mm.mean().detach(),
+        "map_fine_topk_selector_pred_rot_deg": rot_err_deg[batch_idx, pred_idx].mean().detach(),
+        "map_fine_topk_selector_target_trans_mm": target_trans_mm.mean().detach(),
+        "map_fine_topk_selector_target_rot_deg": rot_err_deg[batch_idx, target_idx].mean().detach(),
+        "map_fine_topk_selector_oracle_gap_mm": (pred_trans_mm - target_trans_mm).mean().detach(),
+        "map_fine_topk_selector_hit_best1": topk_hit[1],
+        "map_fine_topk_selector_hit_best3": topk_hit[3],
+        "map_fine_topk_selector_hit_best4": topk_hit[4],
+        "map_fine_topk_selector_hit_best8": topk_hit[8],
+        "map_fine_topk_selector_oracle_basin_recall": basin_mask.any(dim=1).float().mean().detach(),
+        "map_fine_topk_selector_pred_basin_recall": basin_mask[batch_idx, pred_idx].float().mean().detach(),
+        "map_fine_topk_selector_entropy": selector_entropy.detach(),
+        "map_fine_topk_selector_margin": selector_margin.detach(),
+        "map_fine_topk_selector_soft_target_entropy": soft_target_entropy.detach(),
+        "map_fine_topk_selector_cost_regression_loss": cost_regression_loss.detach(),
+        "map_fine_topk_selector_pairwise_rank_loss": pairwise_rank_loss.detach(),
+        "map_fine_topk_selector_pairwise_rank_acc": pairwise_rank_acc.detach(),
+        "map_fine_topk_selector_num_candidates": torch.tensor(float(num_candidates), device=features.device),
+    }
+    if return_details:
+        details = {
+            "features": features,
+            "score_maps": score_maps,
+            "valid": valid,
+            "raw_logits": raw_logits,
+            "logits": logits,
+            "target_idx": target_idx,
+            "target_probs": target_probs,
+            "pose_cost": pose_cost,
+            "trans_err_m": trans_err_m,
+            "rot_err_deg": rot_err_deg,
+        }
+        return loss, metrics, details
+    return loss, metrics
+
+
+def project_query_render_for_fine_selector(
+    projector,
+    query_feat,
+    render_feat,
+    *,
+    require_projector=False,
+    render_chunk_size=0,
+):
+    """Apply the same local-corr projection path to query and rendered fine candidates."""
+    if projector is None:
+        if require_projector:
+            raise RuntimeError("fine selector requires a local-corr projector, but none is attached")
+        return query_feat, render_feat, False
+    if render_feat.ndim not in (4, 5):
+        raise ValueError(f"render_feat must be 4D or 5D, got {tuple(render_feat.shape)}")
+    render_is_bank = render_feat.ndim == 5
+    if render_is_bank:
+        bsz, num_candidates, channels, height, width = render_feat.shape
+        render_flat = render_feat.reshape(bsz * num_candidates, channels, height, width)
+    else:
+        render_flat = render_feat
+        bsz = num_candidates = None
+    chunk_size = int(render_chunk_size or 0)
+
+    if hasattr(projector, "project_query"):
+        projected_query = projector.project_query(query_feat)
+        project_render = projector.project_render
+    else:
+        projected_query = projector(query_feat)
+        project_render = projector
+    if chunk_size > 0 and render_flat.shape[0] > chunk_size:
+        projected_chunks = []
+        for start in range(0, render_flat.shape[0], chunk_size):
+            projected_chunks.append(project_render(render_flat[start : start + chunk_size]))
+        projected_render = torch.cat(projected_chunks, dim=0)
+    else:
+        projected_render = project_render(render_flat)
+    if render_is_bank:
+        projected_render = projected_render.reshape(
+            bsz,
+            num_candidates,
+            projected_render.shape[1],
+            projected_render.shape[-2],
+            projected_render.shape[-1],
+        )
+    return projected_query, projected_render, True
 
 
 def render_score_candidate_listwise_loss(
@@ -3257,6 +4127,9 @@ class MapFeatureRenderer(nn.Module):
         self.perturb_axes = [int(v) for v in (map_cfg.get("perturb_axes") or [0, 1, 2]) if int(v) in (0, 1, 2)]
         if not self.perturb_axes:
             self.perturb_axes = [0, 1, 2]
+        self.perturb_direction_mode = str(map_cfg.get("perturb_direction_mode", "axis") or "axis").lower()
+        self.perturb_deterministic_by_name = bool(map_cfg.get("perturb_deterministic_by_name", False))
+        self.perturb_seed = int(map_cfg.get("perturb_seed", 20260510))
         self.global_render_negative_count = max(0, int(map_cfg.get("global_render_negative_count", 0)))
         self.global_render_negative_min_trans_m = max(
             0.0,
@@ -3395,46 +4268,98 @@ class MapFeatureRenderer(nn.Module):
             return random.sample(candidates, count)
         return [random.choice(candidates) for _ in range(count)]
 
-    def _sample_translation_offset(self):
+    def _stable_seed(self, key, salt=0):
+        payload = f"{self.perturb_seed}|{salt}|{key}".encode("utf-8")
+        digest = hashlib.sha1(payload).digest()
+        return int.from_bytes(digest[:8], byteorder="little", signed=False) % (2**31 - 1)
+
+    def _deterministic_choice(self, values, key, salt=0):
+        if not values:
+            raise ValueError("_deterministic_choice requires a non-empty sequence")
+        return values[self._stable_seed(key, salt=salt) % len(values)]
+
+    def _deterministic_direction(self, key, salt=0):
+        mode_key = str(self.perturb_direction_mode or "axis").lower()
+        if mode_key in ("axis", "axes", "canonical"):
+            direction = torch.zeros(3, dtype=torch.float32)
+            axis = int(self._deterministic_choice(self.perturb_axes, key, salt=salt))
+            sign = -1.0 if (self._stable_seed(key, salt=salt + 101) % 2) else 1.0
+            direction[axis] = sign
+            return direction
+        if mode_key in ("random", "sphere", "isotropic", "unit"):
+            generator = torch.Generator(device="cpu")
+            generator.manual_seed(self._stable_seed(key, salt=salt))
+            direction = torch.randn(3, generator=generator, dtype=torch.float32)
+            return direction / direction.norm().clamp(min=1.0e-8)
+        raise ValueError("perturb_direction_mode must be 'axis' or 'random'")
+
+    def _sample_direction(self, key=None, salt=0):
+        if self.perturb_deterministic_by_name and key is not None:
+            return self._deterministic_direction(key, salt=salt)
+        return sample_perturb_direction(self.perturb_direction_mode, self.perturb_axes)
+
+    def _sample_translation_offset(self, key=None):
         offset = torch.zeros(3, dtype=torch.float32)
         if self.perturb_trans_cm_choices:
-            axis = random.choice(self.perturb_axes)
-            sign = -1.0 if random.random() < 0.5 else 1.0
-            offset[axis] = sign * random.choice(self.perturb_trans_cm_choices) / 100.0
+            direction = self._sample_direction(key, salt=11)
+            if self.perturb_deterministic_by_name and key is not None:
+                trans_cm = self._deterministic_choice(self.perturb_trans_cm_choices, key, salt=17)
+            else:
+                trans_cm = random.choice(self.perturb_trans_cm_choices)
+            offset = direction * (float(trans_cm) / 100.0)
             return offset, float(torch.linalg.norm(offset).item())
         trans_sigma = max(0.0, self.perturb_trans_m)
         if trans_sigma > 0:
-            offset = torch.from_numpy(np.random.normal(0.0, trans_sigma, size=3).astype(np.float32))
+            if self.perturb_deterministic_by_name and key is not None:
+                generator = torch.Generator(device="cpu")
+                generator.manual_seed(self._stable_seed(key, salt=23))
+                offset = torch.randn(3, generator=generator, dtype=torch.float32) * float(trans_sigma)
+            else:
+                offset = torch.from_numpy(np.random.normal(0.0, trans_sigma, size=3).astype(np.float32))
             return offset, float(torch.linalg.norm(offset).item())
         return offset, 0.0
 
-    def _perturb_w2c_pose_with_distance(self, pose):
+    def _perturb_w2c_pose_with_distance(self, pose, key=None):
         pose_tensor = pose.detach().cpu().float().clone()
         center = -(pose_tensor[:3, :3].T @ pose_tensor[:3, 3])
         rot_sigma = np.deg2rad(max(0.0, self.perturb_rot_deg))
-        offset, dist_m = self._sample_translation_offset()
+        offset, dist_m = self._sample_translation_offset(key)
         if self.perturb_pose_mode in ("se3", "se3_delta", "delta", "lattice"):
             delta = torch.zeros(1, 6, dtype=torch.float32)
             delta[0, :3] = offset
             if self.perturb_rot_deg_choices:
-                axis = random.choice(self.perturb_axes)
-                sign = -1.0 if random.random() < 0.5 else 1.0
-                delta[0, 3 + axis] = math.radians(sign * random.choice(self.perturb_rot_deg_choices))
+                direction = self._sample_direction(key, salt=31)
+                if self.perturb_deterministic_by_name and key is not None:
+                    rot_deg = self._deterministic_choice(self.perturb_rot_deg_choices, key, salt=37)
+                else:
+                    rot_deg = random.choice(self.perturb_rot_deg_choices)
+                delta[0, 3:] = direction * math.radians(float(rot_deg))
             elif rot_sigma > 0:
-                delta[0, 3:] = torch.from_numpy(np.random.normal(0.0, rot_sigma, size=3).astype(np.float32))
+                if self.perturb_deterministic_by_name and key is not None:
+                    generator = torch.Generator(device="cpu")
+                    generator.manual_seed(self._stable_seed(key, salt=41))
+                    delta[0, 3:] = torch.randn(3, generator=generator, dtype=torch.float32) * float(rot_sigma)
+                else:
+                    delta[0, 3:] = torch.from_numpy(np.random.normal(0.0, rot_sigma, size=3).astype(np.float32))
             return apply_pose_delta(pose_tensor.unsqueeze(0), delta).squeeze(0), dist_m
         if self.perturb_rot_deg_choices:
-            axis = random.choice(self.perturb_axes)
-            sign = -1.0 if random.random() < 0.5 else 1.0
-            angle = torch.tensor(
-                math.radians(sign * random.choice(self.perturb_rot_deg_choices)),
-                dtype=torch.float32,
+            direction = self._sample_direction(key, salt=31)
+            if self.perturb_deterministic_by_name and key is not None:
+                rot_deg = self._deterministic_choice(self.perturb_rot_deg_choices, key, salt=37)
+            else:
+                rot_deg = random.choice(self.perturb_rot_deg_choices)
+            delta_r = axis_angle_vector_rotation_matrix(
+                direction * math.radians(float(rot_deg))
             )
-            delta_r = axis_angle_rotation_matrix(axis, angle)
             pose_tensor[:3, :3] = delta_r @ pose_tensor[:3, :3]
             pose_tensor[:3, 3] = -(pose_tensor[:3, :3] @ center)
         elif rot_sigma > 0:
-            rx, ry, rz = np.random.normal(0.0, rot_sigma, size=3).astype(np.float32)
+            if self.perturb_deterministic_by_name and key is not None:
+                generator = torch.Generator(device="cpu")
+                generator.manual_seed(self._stable_seed(key, salt=41))
+                rx, ry, rz = (torch.randn(3, generator=generator) * float(rot_sigma)).numpy().astype(np.float32)
+            else:
+                rx, ry, rz = np.random.normal(0.0, rot_sigma, size=3).astype(np.float32)
             cx, sx = np.cos(rx), np.sin(rx)
             cy, sy = np.cos(ry), np.sin(ry)
             cz, sz = np.cos(rz), np.sin(rz)
@@ -3901,6 +4826,7 @@ class MapFeatureRenderer(nn.Module):
         fine_rows = []
         coarse_rows = []
         mask_rows = []
+        rgb_rows = []
         depth_rows = []
         intrinsics_rows = []
         pose_rows = []
@@ -3910,6 +4836,7 @@ class MapFeatureRenderer(nn.Module):
                 sample_fine = []
                 sample_coarse = []
                 sample_mask = []
+                sample_rgb = []
                 sample_depth = []
                 sample_intrinsics = []
                 sample_pose = []
@@ -3926,7 +4853,7 @@ class MapFeatureRenderer(nn.Module):
                     )
                 for cand_idx in range(num_candidates):
                     pose = pose_bank[batch_idx, cand_idx]
-                    _fine_raw, fine, coarse, mask, _alpha, _rgb, depth, _position = self._render_pose(
+                    _fine_raw, fine, coarse, mask, _alpha, rgb, depth, _position = self._render_pose(
                         sample_name,
                         pose,
                         require_grad=require_grad,
@@ -3937,6 +4864,7 @@ class MapFeatureRenderer(nn.Module):
                         sample_fine.append(fine.squeeze(0))
                     sample_coarse.append(coarse.squeeze(0))
                     sample_mask.append(mask.squeeze(0))
+                    sample_rgb.append(rgb.squeeze(0))
                     sample_depth.append(depth.squeeze(0))
                     if intr_tensor is not None:
                         sample_intrinsics.append(intr_tensor)
@@ -3945,6 +4873,7 @@ class MapFeatureRenderer(nn.Module):
                     fine_rows.append(torch.stack(sample_fine, dim=0))
                 coarse_rows.append(torch.stack(sample_coarse, dim=0))
                 mask_rows.append(torch.stack(sample_mask, dim=0))
+                rgb_rows.append(torch.stack(sample_rgb, dim=0))
                 depth_rows.append(torch.stack(sample_depth, dim=0))
                 if sample_intrinsics:
                     intrinsics_rows.append(torch.stack(sample_intrinsics, dim=0))
@@ -3955,6 +4884,7 @@ class MapFeatureRenderer(nn.Module):
             batch[f"{prefix}_fine"] = torch.stack(fine_rows, dim=0)
         batch[f"{prefix}_coarse"] = torch.stack(coarse_rows, dim=0)
         batch[f"{prefix}_mask"] = torch.stack(mask_rows, dim=0)
+        batch[f"{prefix}_rgb"] = torch.stack(rgb_rows, dim=0)
         batch[f"{prefix}_depth"] = torch.stack(depth_rows, dim=0)
         if intrinsics_rows:
             batch[f"{prefix}_intrinsics"] = torch.stack(intrinsics_rows, dim=0)
@@ -4014,7 +4944,10 @@ class MapFeatureRenderer(nn.Module):
             with context():
                 for sample_name in batch["sample_name"]:
                     normalized = self._normalize_name(sample_name)
-                    neg_pose, neg_dist_m = self._perturb_w2c_pose_with_distance(self.name_to_pose[normalized])
+                    neg_pose, neg_dist_m = self._perturb_w2c_pose_with_distance(
+                        self.name_to_pose[normalized],
+                        key=normalized,
+                    )
                     fine_raw, fine, coarse, mask, alpha, _rgb, depth, position = self._render_pose(
                         sample_name,
                         neg_pose,
@@ -4128,9 +5061,12 @@ def _candidate_render_feature_request(map_cfg, *, epoch=0):
     requested = []
     render_weight = resolve_linear_weight(map_cfg, "candidate_render_score_weight", epoch)
     fusion_weight = resolve_linear_weight(map_cfg, "candidate_score_fusion_weight", epoch)
+    fine_selector_weight = resolve_linear_weight(map_cfg, "fine_topk_selector_weight", epoch)
     if render_weight > 0.0:
         requested.append(str(map_cfg.get("candidate_render_score_feature", "coarse")).lower())
     if fusion_weight > 0.0:
+        requested.append(str(map_cfg.get("candidate_score_fusion_feature", "coarse")).lower())
+    if fine_selector_weight > 0.0:
         requested.append(str(map_cfg.get("candidate_score_fusion_feature", "coarse")).lower())
     if requested and all(feature in ("coarse", "query_coarse") for feature in requested):
         return "coarse"
@@ -4144,7 +5080,8 @@ def should_preattach_pose_candidate_renders(cfg, *, epoch=0):
         return False
     render_weight = resolve_linear_weight(map_cfg, "candidate_render_score_weight", epoch)
     fusion_weight = resolve_linear_weight(map_cfg, "candidate_score_fusion_weight", epoch)
-    if render_weight <= 0.0 and fusion_weight <= 0.0:
+    fine_selector_weight = resolve_linear_weight(map_cfg, "fine_topk_selector_weight", epoch)
+    if render_weight <= 0.0 and fusion_weight <= 0.0 and fine_selector_weight <= 0.0:
         return False
     source = str(map_cfg.get("candidate_render_pose_source", "pose_init")).lower()
     return source in POSE_CANDIDATE_BATCH_SOURCES or source in POSE_CANDIDATE_LATTICE_SOURCES
@@ -4257,7 +5194,8 @@ def maybe_attach_pose_candidate_renders(batch, outputs, cfg, map_renderer, *, re
         return batch
     render_weight = resolve_linear_weight(map_cfg, "candidate_render_score_weight", epoch)
     fusion_weight = resolve_linear_weight(map_cfg, "candidate_score_fusion_weight", epoch)
-    if render_weight <= 0.0 and fusion_weight <= 0.0:
+    fine_selector_weight = resolve_linear_weight(map_cfg, "fine_topk_selector_weight", epoch)
+    if render_weight <= 0.0 and fusion_weight <= 0.0 and fine_selector_weight <= 0.0:
         return batch
     source = str(map_cfg.get("candidate_render_pose_source", "pose_init")).lower()
     candidate_valid_mask = None
@@ -4279,6 +5217,7 @@ def maybe_attach_pose_candidate_renders(batch, outputs, cfg, map_renderer, *, re
             max_candidates=int(map_cfg.get("coarse_pose_lattice_max_candidates", 0) or 0),
             limit_strategy=str(map_cfg.get("coarse_pose_lattice_limit_strategy", "head") or "head"),
             combine_trans_rot=bool(map_cfg.get("coarse_pose_lattice_combine_trans_rot", False)),
+            direction_mode=str(map_cfg.get("coarse_pose_lattice_direction_mode", "axis") or "axis"),
         )
         candidate_valid_mask = torch.ones(
             candidate_poses.shape[:2],
@@ -4420,7 +5359,21 @@ def _candidate_fusion_vector_dim(map_cfg, model_cfg):
         return int(model_cfg["candidate_score_fusion_input_dim"])
     render_mode = str(map_cfg.get("candidate_score_fusion_render_feature_mode", "basic")).lower()
     render_dim = 9 if render_mode in ("rich", "stats", "spatial_stats") else 3
-    return render_dim + len(CANDIDATE_QUALITY_FEATURE_NAMES)
+    motion_dim = len(CANDIDATE_MOTION_FEATURE_NAMES) if bool(
+        map_cfg.get("candidate_score_fusion_use_candidate_delta", False)
+    ) else 0
+    return render_dim + len(CANDIDATE_QUALITY_FEATURE_NAMES) + motion_dim
+
+
+def _fine_candidate_selector_vector_dim(model_cfg):
+    if model_cfg.get("fine_candidate_selector_input_dim") is not None:
+        return int(model_cfg["fine_candidate_selector_input_dim"])
+    dim = len(FINE_CANDIDATE_SELECTOR_VECTOR_FEATURE_NAMES)
+    if bool(model_cfg.get("fine_candidate_selector_use_rgb_features", False)):
+        dim += len(FINE_CANDIDATE_SELECTOR_RGB_FEATURE_NAMES)
+    if bool(model_cfg.get("fine_candidate_selector_use_delta_vector_features", False)):
+        dim += len(FINE_CANDIDATE_SELECTOR_DELTA_VECTOR_FEATURE_NAMES)
+    return dim
 
 
 class CandidateBasinAdapter(nn.Module):
@@ -4521,6 +5474,53 @@ def _build_candidate_score_fusion_head(model_cfg, map_cfg):
     )
 
 
+def _build_fine_candidate_selector_head(model_cfg, map_cfg):
+    if not bool(model_cfg.get("fine_candidate_selector_enabled", False)):
+        return None
+    vector_dim = _fine_candidate_selector_vector_dim(model_cfg)
+    hidden_dim = int(model_cfg.get("fine_candidate_selector_hidden_dim", 64))
+    zero_init = bool(model_cfg.get("fine_candidate_selector_zero_init", True))
+    initial_bias = float(model_cfg.get("fine_candidate_selector_initial_bias", 0.0))
+    if bool(model_cfg.get("fine_candidate_selector_use_score_map_head", False)):
+        radius = int(
+            map_cfg.get(
+                "fine_topk_selector_radius",
+                map_cfg.get("query_corr_radius", map_cfg.get("candidate_score_fusion_radius", 4)),
+            )
+            or map_cfg.get("query_corr_radius", map_cfg.get("candidate_score_fusion_radius", 4))
+        )
+        score_map_mode = str(
+            map_cfg.get(
+                "fine_topk_selector_score_map_mode",
+                map_cfg.get("candidate_score_fusion_score_map_mode", "peak_offset"),
+            )
+        )
+        score_map_channels = model_cfg.get("fine_candidate_selector_score_map_channels")
+        if score_map_channels is None:
+            score_map_channels = _candidate_score_map_channel_count(score_map_mode, radius)
+        return CandidateScoreMapFusionHead(
+            vector_dim=vector_dim,
+            score_map_channels=int(score_map_channels),
+            map_channels=int(model_cfg.get("fine_candidate_selector_map_channels", 8)),
+            grid_size=int(model_cfg.get("fine_candidate_selector_grid_size", 4)),
+            hidden_dim=hidden_dim,
+            zero_init=zero_init,
+            initial_vector_weights=model_cfg.get("fine_candidate_selector_initial_weights"),
+            initial_bias=initial_bias,
+            context_layers=int(model_cfg.get("fine_candidate_selector_context_layers", 0)),
+            context_heads=int(model_cfg.get("fine_candidate_selector_context_heads", 1)),
+            context_feedforward_dim=model_cfg.get("fine_candidate_selector_context_feedforward_dim"),
+            context_residual=bool(model_cfg.get("fine_candidate_selector_context_residual", False)),
+        )
+    return CandidateScoreFusionHead(
+        input_dim=vector_dim,
+        hidden_dim=hidden_dim,
+        zero_init=zero_init,
+        initial_weights=model_cfg.get("fine_candidate_selector_initial_weights"),
+        initial_bias=initial_bias,
+    )
+
+
 def build_radio_query_student(
     cfg,
     *,
@@ -4607,6 +5607,7 @@ def build_radio_query_student(
         apply_query_channel_gate=bool(model_cfg.get("apply_query_channel_gate", False)),
     )
     model.candidate_score_fusion_head = _build_candidate_score_fusion_head(model_cfg, cfg.get("map_supervision", {}))
+    model.fine_candidate_selector_head = _build_fine_candidate_selector_head(model_cfg, cfg.get("map_supervision", {}))
     model.candidate_basin_adapter = _build_candidate_basin_adapter(model_cfg, coarse_feature_dim)
     return model
 
@@ -7159,6 +8160,7 @@ def compute_map_supervision(
     local_flow_head=None,
     local_corr_projector=None,
     candidate_score_fusion_head=None,
+    fine_candidate_selector_head=None,
     candidate_basin_adapter=None,
     map_renderer=None,
 ):
@@ -7318,6 +8320,56 @@ def compute_map_supervision(
     candidate_score_fusion_pairwise_rank_min_gap_m = float(
         map_cfg.get("candidate_score_fusion_pairwise_rank_min_gap_m", 0.0)
     )
+    fine_topk_selector_weight = resolve_linear_weight(map_cfg, "fine_topk_selector_weight", epoch)
+    fine_topk_selector_topk = int(map_cfg.get("fine_topk_selector_topk", 8) or 8)
+    fine_topk_selector_temperature = float(map_cfg.get("fine_topk_selector_temperature", 1.0))
+    fine_topk_selector_mode = str(map_cfg.get("fine_topk_selector_mode", candidate_score_fusion_mode))
+    fine_topk_selector_radius = int(
+        map_cfg.get("fine_topk_selector_radius")
+        if map_cfg.get("fine_topk_selector_radius") is not None
+        else query_corr_radius if "query_corr_radius" in locals() else candidate_score_fusion_radius
+    )
+    fine_topk_selector_preprocess = str(
+        map_cfg.get("fine_topk_selector_preprocess")
+        if map_cfg.get("fine_topk_selector_preprocess") is not None
+        else map_cfg.get("query_corr_feature_preprocess", candidate_score_fusion_preprocess)
+    )
+    fine_topk_selector_highpass_kernel = int(
+        map_cfg.get("fine_topk_selector_highpass_kernel")
+        if map_cfg.get("fine_topk_selector_highpass_kernel") is not None
+        else map_cfg.get("query_corr_highpass_kernel", candidate_score_fusion_highpass_kernel)
+    )
+    fine_topk_selector_score_map_mode = str(
+        map_cfg.get("fine_topk_selector_score_map_mode", candidate_score_fusion_score_map_mode)
+    )
+    fine_topk_selector_rot_cost_weight = float(
+        map_cfg.get("fine_topk_selector_rot_cost_weight", candidate_score_fusion_rot_cost_weight)
+    )
+    fine_topk_selector_target_mode = str(map_cfg.get("fine_topk_selector_target_mode", "gt_pose_error_soft"))
+    fine_topk_selector_target_temperature_m = float(
+        map_cfg.get("fine_topk_selector_target_temperature_m", 0.05)
+    )
+    fine_topk_selector_pairwise_rank_weight = float(
+        map_cfg.get("fine_topk_selector_pairwise_rank_weight", 0.0)
+    )
+    fine_topk_selector_pairwise_rank_temperature = float(
+        map_cfg.get("fine_topk_selector_pairwise_rank_temperature", 1.0)
+    )
+    fine_topk_selector_pairwise_rank_min_gap_m = float(
+        map_cfg.get("fine_topk_selector_pairwise_rank_min_gap_m", 0.03)
+    )
+    fine_topk_selector_cost_regression_weight = float(
+        map_cfg.get("fine_topk_selector_cost_regression_weight", 0.0)
+    )
+    fine_topk_selector_cost_regression_temperature_m = map_cfg.get(
+        "fine_topk_selector_cost_regression_temperature_m"
+    )
+    fine_topk_selector_detach_query = bool(map_cfg.get("fine_topk_selector_detach_query", True))
+    fine_topk_selector_detach_render = bool(map_cfg.get("fine_topk_selector_detach_render", True))
+    fine_topk_selector_use_projector = bool(map_cfg.get("fine_topk_selector_use_projector", True))
+    fine_topk_selector_require_projector = bool(map_cfg.get("fine_topk_selector_require_projector", False))
+    fine_topk_selector_use_rgb = bool(map_cfg.get("fine_topk_selector_use_rgb", False))
+    fine_topk_selector_use_delta_vector = bool(map_cfg.get("fine_topk_selector_use_delta_vector", False))
     candidate_two_stage_enabled = bool(map_cfg.get("candidate_two_stage_enabled", False))
     candidate_stage2_topm = int(map_cfg.get("candidate_stage2_topm", 1) or 1)
     candidate_stage2_selection = str(map_cfg.get("candidate_stage2_selection", "pred"))
@@ -7797,7 +8849,7 @@ def compute_map_supervision(
     candidate_score_fusion_loss = zero
     candidate_score_fusion_metrics = {}
     candidate_score_fusion_details = None
-    if candidate_score_fusion_weight > 0:
+    if candidate_score_fusion_weight > 0 or fine_topk_selector_weight > 0:
         candidate_pose = batch.get("rendered_map_candidate_pose")
         candidate_mask = batch.get("rendered_map_candidate_mask")
         candidate_valid_mask = batch.get("rendered_map_candidate_valid_mask")
@@ -7871,12 +8923,142 @@ def compute_map_supervision(
                 pairwise_rank_min_gap_m=candidate_score_fusion_pairwise_rank_min_gap_m,
                 basin_trans_m=float(map_cfg.get("candidate_score_fusion_basin_trans_m", 0.25)),
                 basin_rot_deg=float(map_cfg.get("candidate_score_fusion_basin_rot_deg", 5.0)),
+                init_pose=batch.get("coarse_pose_lattice_base_pose", batch.get("rendered_map_pose_neg")),
+                use_candidate_delta=bool(map_cfg.get("candidate_score_fusion_use_candidate_delta", False)),
                 return_details=True,
             )
         elif candidate_score_fusion_head is None:
             candidate_score_fusion_metrics["map_candidate_score_fusion_missing_head"] = torch.ones(
                 (), device=device
             )
+    fine_topk_selector_loss_value = zero
+    fine_topk_selector_metrics = {}
+    if fine_topk_selector_weight > 0:
+        fine_topk_selector_metrics = {
+            "map_fine_topk_selector_loss": zero.detach(),
+            "map_fine_topk_selector_acc": zero.detach(),
+            "map_fine_topk_selector_pred_trans_mm": zero.detach(),
+        }
+        pose_gt_for_candidates = batch.get("rendered_map_pose_gt", batch.get("pose_gt"))
+        source_pose = batch.get("rendered_map_candidate_pose")
+        if fine_candidate_selector_head is None:
+            fine_topk_selector_metrics["map_fine_topk_selector_missing_head"] = torch.ones(
+                (), device=device
+            )
+        elif map_renderer is None:
+            fine_topk_selector_metrics["map_fine_topk_selector_missing_renderer"] = torch.ones(
+                (), device=device
+            )
+        elif candidate_score_fusion_details is None or source_pose is None or pose_gt_for_candidates is None:
+            fine_topk_selector_metrics["map_fine_topk_selector_missing_candidates"] = torch.ones(
+                (), device=device
+            )
+        else:
+            with torch.no_grad():
+                valid_for_topk = candidate_score_fusion_details["valid"].to(device=device).bool()
+                coarse_logits_for_topk = candidate_score_fusion_details.get(
+                    "raw_logits",
+                    candidate_score_fusion_details["logits"],
+                ).detach()
+                coarse_logits_for_topk = coarse_logits_for_topk.masked_fill(~valid_for_topk, -1.0e6)
+                topk_eff = max(1, min(int(fine_topk_selector_topk), coarse_logits_for_topk.shape[1]))
+                selected_indices = torch.topk(coarse_logits_for_topk, k=topk_eff, dim=1).indices
+                selected_pose = gather_candidate_bank(source_pose, selected_indices).detach()
+                source_valid = batch.get("rendered_map_candidate_valid_mask")
+                if source_valid is None:
+                    source_valid = valid_for_topk
+                selected_valid = gather_candidate_bank(source_valid, selected_indices).detach()
+                selected_coarse_logits = gather_candidate_bank(coarse_logits_for_topk, selected_indices).detach()
+            fine_selector_prefix = str(map_cfg.get("fine_topk_selector_prefix", "rendered_map_fine_selector"))
+            map_renderer.attach_pose_candidate_renders(
+                batch,
+                selected_pose,
+                require_grad=False,
+                prefix=fine_selector_prefix,
+                candidate_valid_mask=selected_valid,
+                max_candidates=0,
+                feature="all",
+                include_aux=True,
+            )
+            selected_fine = batch.get(f"{fine_selector_prefix}_fine")
+            selected_mask = batch.get(f"{fine_selector_prefix}_mask")
+            selected_rgb = batch.get(f"{fine_selector_prefix}_rgb")
+            selected_depth = batch.get(f"{fine_selector_prefix}_depth")
+            if selected_fine is not None:
+                query_fine_for_selector = pred_fine_target
+                if fine_topk_selector_detach_query:
+                    query_fine_for_selector = query_fine_for_selector.detach()
+                selected_fine = _resize_feature_bank(selected_fine, query_fine_for_selector.shape[-2:])
+                selected_mask = _resize_mask_bank(selected_mask, query_fine_for_selector.shape[-2:])
+                if selected_depth is not None:
+                    selected_depth = _as_bank_5d(
+                        selected_depth,
+                        spatial_hw=query_fine_for_selector.shape[-2:],
+                        mode="bilinear",
+                    )
+                if fine_topk_selector_detach_render:
+                    selected_fine = selected_fine.detach()
+                    if selected_mask is not None:
+                        selected_mask = selected_mask.detach()
+                    if selected_rgb is not None:
+                        selected_rgb = selected_rgb.detach()
+                    if selected_depth is not None:
+                        selected_depth = selected_depth.detach()
+                projector_used = False
+                if fine_topk_selector_use_projector:
+                    query_fine_for_selector, selected_fine, projector_used = project_query_render_for_fine_selector(
+                        query_local_corr_projector,
+                        query_fine_for_selector,
+                        selected_fine,
+                        require_projector=fine_topk_selector_require_projector,
+                        render_chunk_size=int(map_cfg.get("fine_topk_selector_projector_chunk_size", 0) or 0),
+                    )
+                init_pose_for_selector = batch.get("coarse_pose_lattice_base_pose", batch.get("rendered_map_pose_neg"))
+                (
+                    fine_topk_selector_loss_value,
+                    fine_topk_selector_metrics,
+                    _fine_topk_selector_details,
+                ) = fine_topk_selector_listwise_loss(
+                    query_fine_for_selector,
+                    selected_fine,
+                    selected_pose,
+                    pose_gt_for_candidates,
+                    fine_candidate_selector_head,
+                    init_pose=init_pose_for_selector,
+                    coarse_logits=selected_coarse_logits,
+                    query_rgb=batch.get("rgb"),
+                    candidate_rgb=selected_rgb,
+                    depth=selected_depth,
+                    mask=selected_mask,
+                    candidate_valid_mask=selected_valid,
+                    mode=fine_topk_selector_mode,
+                    temperature=fine_topk_selector_temperature,
+                    radius=fine_topk_selector_radius,
+                    preprocess=fine_topk_selector_preprocess,
+                    highpass_kernel=fine_topk_selector_highpass_kernel,
+                    score_map_mode=fine_topk_selector_score_map_mode,
+                    rot_cost_weight=fine_topk_selector_rot_cost_weight,
+                    target_mode=fine_topk_selector_target_mode,
+                    target_temperature_m=fine_topk_selector_target_temperature_m,
+                    cost_regression_weight=fine_topk_selector_cost_regression_weight,
+                    cost_regression_temperature_m=fine_topk_selector_cost_regression_temperature_m,
+                    pairwise_rank_weight=fine_topk_selector_pairwise_rank_weight,
+                    pairwise_rank_temperature=fine_topk_selector_pairwise_rank_temperature,
+                    pairwise_rank_min_gap_m=fine_topk_selector_pairwise_rank_min_gap_m,
+                    basin_trans_m=float(map_cfg.get("fine_topk_selector_basin_trans_m", 0.25)),
+                    basin_rot_deg=float(map_cfg.get("fine_topk_selector_basin_rot_deg", 5.0)),
+                    use_coarse_logits=bool(map_cfg.get("fine_topk_selector_use_coarse_logits", True)),
+                    use_candidate_delta=bool(map_cfg.get("fine_topk_selector_use_candidate_delta", True)),
+                    use_delta_vector=fine_topk_selector_use_delta_vector,
+                    use_depth=bool(map_cfg.get("fine_topk_selector_use_depth", True)),
+                    use_mask=bool(map_cfg.get("fine_topk_selector_use_mask", True)),
+                    use_rgb=fine_topk_selector_use_rgb,
+                    return_details=True,
+                )
+                fine_topk_selector_metrics["map_fine_topk_selector_projector_used"] = torch.tensor(
+                    1.0 if projector_used else 0.0,
+                    device=device,
+                )
     candidate_refined_pose_loss_value = zero
     candidate_refined_pose_metrics = {}
     if candidate_refined_pose_weight > 0:
@@ -9131,6 +10313,7 @@ def compute_map_supervision(
         + coarse_pose_local_energy_weight * coarse_pose_local_energy_loss
         + candidate_render_score_weight * candidate_render_score_loss
         + candidate_score_fusion_weight * candidate_score_fusion_loss
+        + fine_topk_selector_weight * fine_topk_selector_loss_value
         + candidate_refined_pose_weight * candidate_refined_pose_loss_value
         + query_fine_nce_loss
         + query_local_fine_nce_loss
@@ -9227,6 +10410,7 @@ def compute_map_supervision(
         **coarse_pose_local_energy_metrics,
         **candidate_render_score_metrics,
         **candidate_score_fusion_metrics,
+        **fine_topk_selector_metrics,
         **candidate_refined_pose_metrics,
         "map_query_fine_nce_loss": query_fine_nce_loss.detach(),
         "map_query_local_fine_nce_loss": query_local_fine_nce_loss.detach(),
@@ -9323,6 +10507,7 @@ def compute_map_supervision(
         "map_coarse_pose_local_energy_weight": torch.tensor(coarse_pose_local_energy_weight, device=device),
         "map_candidate_render_score_weight": torch.tensor(candidate_render_score_weight, device=device),
         "map_candidate_score_fusion_weight": torch.tensor(candidate_score_fusion_weight, device=device),
+        "map_fine_topk_selector_weight": torch.tensor(fine_topk_selector_weight, device=device),
         "map_candidate_refined_pose_weight": torch.tensor(candidate_refined_pose_weight, device=device),
         "map_query_fine_grad_weight": torch.tensor(query_fine_grad_weight, device=device),
         "map_query_local_fine_grad_weight": torch.tensor(query_local_fine_grad_weight, device=device),
@@ -9522,6 +10707,7 @@ def validate(model, loader, cfg, device, qual_dir, feature_track_root, step, log
                     local_flow_head=getattr(model, "local_flow_head", None),
                     local_corr_projector=getattr(model, "local_corr_projector", None),
                     candidate_score_fusion_head=getattr(model, "candidate_score_fusion_head", None),
+                    fine_candidate_selector_head=getattr(model, "fine_candidate_selector_head", None),
                     candidate_basin_adapter=getattr(model, "candidate_basin_adapter", None),
                     map_renderer=map_renderer,
                 )
@@ -9639,6 +10825,20 @@ def validate(model, loader, cfg, device, qual_dir, feature_track_root, step, log
                     result.get("map_candidate_score_fusion_pairwise_rank_acc", 0.0),
                 ]
             )
+    if "map_fine_topk_selector_acc" in result:
+        log_msg += " fsel=%.3f/%.0fmm gap=%.0fmm ent=%.3f hit@3=%.3f"
+        log_args.extend(
+            [
+                result.get("map_fine_topk_selector_acc", 0.0),
+                result.get("map_fine_topk_selector_pred_trans_mm", 0.0),
+                result.get("map_fine_topk_selector_oracle_gap_mm", 0.0),
+                result.get("map_fine_topk_selector_entropy", 0.0),
+                result.get("map_fine_topk_selector_hit_best3", 0.0),
+            ]
+        )
+        if result.get("map_fine_topk_selector_cost_regression_loss", 0.0) > 0:
+            log_msg += " fsel_reg=%.3f"
+            log_args.append(result.get("map_fine_topk_selector_cost_regression_loss", 0.0))
     if "map_candidate_refined_pose_trans_mm" in result:
         log_msg += " cref=%.0fmm init=%.0fmm"
         log_args.extend(
@@ -10259,6 +11459,7 @@ def main():
                     local_flow_head=getattr(model, "local_flow_head", None),
                     local_corr_projector=getattr(model, "local_corr_projector", None),
                     candidate_score_fusion_head=getattr(model, "candidate_score_fusion_head", None),
+                    fine_candidate_selector_head=getattr(model, "fine_candidate_selector_head", None),
                     candidate_basin_adapter=getattr(model, "candidate_basin_adapter", None),
                     map_renderer=map_renderer,
                 )
@@ -10365,6 +11566,20 @@ def main():
                                 mean_train.get("map_candidate_score_fusion_pairwise_rank_acc", 0.0),
                             ]
                         )
+                if "map_fine_topk_selector_acc" in mean_train:
+                    log_msg += " fsel=%.3f/%.0fmm gap=%.0fmm ent=%.3f hit@3=%.3f"
+                    log_args.extend(
+                        [
+                            mean_train.get("map_fine_topk_selector_acc", 0.0),
+                            mean_train.get("map_fine_topk_selector_pred_trans_mm", 0.0),
+                            mean_train.get("map_fine_topk_selector_oracle_gap_mm", 0.0),
+                            mean_train.get("map_fine_topk_selector_entropy", 0.0),
+                            mean_train.get("map_fine_topk_selector_hit_best3", 0.0),
+                        ]
+                    )
+                    if mean_train.get("map_fine_topk_selector_cost_regression_loss", 0.0) > 0:
+                        log_msg += " fsel_reg=%.3f"
+                        log_args.append(mean_train.get("map_fine_topk_selector_cost_regression_loss", 0.0))
                 if "map_candidate_refined_pose_trans_mm" in mean_train:
                     log_msg += " cref=%.0fmm init=%.0fmm"
                     log_args.extend(

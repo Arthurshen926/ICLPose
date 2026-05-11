@@ -1,10 +1,13 @@
 import tempfile
 from pathlib import Path
 import sys
+import math
+import random
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import numpy as np
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -51,6 +54,7 @@ from feature_extract.train_impl import (
     normalize_scene_coord_map,
     candidate_quality_features_from_batch,
     candidate_score_fusion_listwise_loss,
+    axis_angle_vector_rotation_matrix,
     perturb_w2c_camera_center,
     pose_lattice_delta_templates,
     pose_feature_bank_from_dataset,
@@ -59,6 +63,7 @@ from feature_extract.train_impl import (
     resolve_query_feature_dims,
     resolve_safe_num_workers,
     sample_query_feature_by_flow,
+    sample_perturb_direction,
     sparse_teacher_correspondence_loss,
     sparse_teacher_local_patch_loss,
     scene_coord_flow_warp_loss,
@@ -523,6 +528,18 @@ def test_pose_lattice_templates_can_combine_translation_and_rotation_offsets():
 
     assert deltas.shape == (49, 6)
     assert ((deltas[:, :3].abs().sum(dim=1) > 0) & (deltas[:, 3:].abs().sum(dim=1) > 0)).any()
+
+
+def test_pose_lattice_templates_support_cube_direction_coverage():
+    axis = pose_lattice_delta_templates([10.0], [5.0], direction_mode="axis")
+    cube = pose_lattice_delta_templates([10.0], [5.0], direction_mode="cube")
+
+    assert axis.shape == (13, 6)
+    assert cube.shape == (53, 6)
+    trans_norm = torch.linalg.norm(cube[:, :3], dim=1)
+    diagonal = cube[(trans_norm > 0.0) & (cube[:, :3].abs().gt(0).all(dim=1))][0, :3]
+    assert torch.isclose(torch.linalg.norm(diagonal), torch.tensor(0.10), atol=1e-6)
+    assert torch.allclose(diagonal.abs(), torch.full((3,), 0.10 / (3.0**0.5)), atol=1e-6)
 
 
 def test_pose_lattice_candidate_limit_can_sample_uniformly():
@@ -2402,6 +2419,49 @@ def test_candidate_score_fusion_listwise_loss_uses_priors_and_backprops_to_featu
     assert scorer.linear.weight.grad is not None and scorer.linear.weight.grad.abs().sum() > 0
 
 
+def test_candidate_score_fusion_listwise_loss_can_use_candidate_delta_features():
+    query = torch.tensor([[[[1.0]], [[0.0]]]], requires_grad=True)
+    candidates = torch.tensor(
+        [[
+            [[[1.0]], [[0.0]]],
+            [[[1.0]], [[0.0]]],
+        ]],
+        requires_grad=True,
+    )
+    candidate_pose = torch.stack([
+        torch.stack([
+            _pose_with_center([0.0, 0.0, 0.0]),
+            _pose_with_center([0.5, 0.0, 0.0]),
+        ])
+    ])
+    pose_gt = _pose_with_center([0.5, 0.0, 0.0]).unsqueeze(0)
+    init_pose = _pose_with_center([0.0, 0.0, 0.0]).unsqueeze(0)
+    valid = torch.ones(1, 2, dtype=torch.bool)
+    prior_features, _prior_names = candidate_quality_features_from_batch({}, valid_mask=valid)
+    scorer = CandidateScoreFusionHead(input_dim=3 + prior_features.shape[-1] + 4, hidden_dim=0)
+    with torch.no_grad():
+        scorer.linear.weight.zero_()
+        scorer.linear.bias.zero_()
+        scorer.linear.weight[0, 3 + prior_features.shape[-1]] = 1.0
+
+    loss, metrics = candidate_score_fusion_listwise_loss(
+        query,
+        candidates,
+        candidate_pose,
+        pose_gt,
+        scorer,
+        candidate_valid_mask=valid,
+        mode="global",
+        temperature=1.0,
+        init_pose=init_pose,
+        use_candidate_delta=True,
+    )
+    loss.backward()
+
+    assert metrics["map_candidate_score_fusion_acc"].item() == 1.0
+    assert scorer.linear.weight.grad is not None and scorer.linear.weight.grad.abs().sum() > 0
+
+
 def test_candidate_score_fusion_soft_target_rewards_near_pose_candidates():
     query = torch.tensor([[[[1.0]], [[0.0]]]], requires_grad=True)
     candidates = torch.tensor(
@@ -2890,6 +2950,305 @@ def test_candidate_score_fusion_head_supports_explicit_linear_initialization():
     assert torch.allclose(scorer.linear.bias, torch.tensor([-0.5]))
 
 
+def test_build_radio_query_student_attaches_fine_candidate_selector_head():
+    cfg = {
+        "dataset": {
+            "feature_hw": [4, 5],
+            "coarse_feature_hw": [2, 3],
+            "input_hw": [32, 40],
+        },
+        "model": {
+            "feature_dim": 4,
+            "fine_feature_dim": 4,
+            "coarse_feature_dim": 4,
+            "base_channels": 8,
+            "stage_dims": [8, 8, 8, 8],
+            "fine_candidate_selector_enabled": True,
+            "fine_candidate_selector_hidden_dim": 8,
+        },
+        "map_supervision": {},
+    }
+
+    model = train_impl.build_radio_query_student(cfg, fine_feature_dim=4, coarse_feature_dim=4)
+
+    assert model.fine_candidate_selector_head is not None
+    features = torch.randn(1, 2, len(train_impl.FINE_CANDIDATE_SELECTOR_VECTOR_FEATURE_NAMES))
+    assert model.fine_candidate_selector_head(features).shape == (1, 2)
+
+
+def test_build_radio_query_student_can_attach_score_map_fine_selector_head():
+    cfg = {
+        "dataset": {
+            "feature_hw": [4, 5],
+            "coarse_feature_hw": [2, 3],
+            "input_hw": [32, 40],
+        },
+        "model": {
+            "feature_dim": 4,
+            "fine_feature_dim": 4,
+            "coarse_feature_dim": 4,
+            "base_channels": 8,
+            "stage_dims": [8, 8, 8, 8],
+            "fine_candidate_selector_enabled": True,
+            "fine_candidate_selector_use_score_map_head": True,
+            "fine_candidate_selector_hidden_dim": 8,
+            "fine_candidate_selector_map_channels": 4,
+            "fine_candidate_selector_grid_size": 2,
+        },
+        "map_supervision": {
+            "fine_topk_selector_radius": 2,
+            "fine_topk_selector_score_map_mode": "peak_offset",
+        },
+    }
+
+    model = train_impl.build_radio_query_student(cfg, fine_feature_dim=4, coarse_feature_dim=4)
+
+    assert isinstance(model.fine_candidate_selector_head, CandidateScoreMapFusionHead)
+    score_maps = torch.randn(1, 2, 3, 4, 5)
+    features = torch.randn(1, 2, len(train_impl.FINE_CANDIDATE_SELECTOR_VECTOR_FEATURE_NAMES))
+    assert model.fine_candidate_selector_head(score_maps, features).shape == (1, 2)
+
+
+def test_fine_topk_selector_loss_uses_gt_pose_error_soft_target():
+    h, w = 4, 5
+    query = torch.randn(1, 4, h, w)
+    candidates = torch.randn(1, 3, 4, h, w)
+    candidate_pose = torch.eye(4).view(1, 1, 4, 4).repeat(1, 3, 1, 1)
+    candidate_pose[0, 1, 0, 3] = -0.08
+    candidate_pose[0, 2, 0, 3] = -0.20
+    pose_gt = torch.eye(4).view(1, 4, 4)
+    coarse_logits = torch.tensor([[0.1, 2.0, 1.0]])
+    selector = CandidateScoreFusionHead(
+        input_dim=len(train_impl.FINE_CANDIDATE_SELECTOR_VECTOR_FEATURE_NAMES),
+        hidden_dim=0,
+        zero_init=True,
+    )
+
+    loss, metrics, details = train_impl.fine_topk_selector_listwise_loss(
+        query,
+        candidates,
+        candidate_pose,
+        pose_gt,
+        selector,
+        coarse_logits=coarse_logits,
+        target_mode="gt_pose_error_soft",
+        target_temperature_m=0.05,
+        pairwise_rank_weight=0.1,
+        pairwise_rank_min_gap_m=0.03,
+        return_details=True,
+    )
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert metrics["map_fine_topk_selector_target_idx"].item() == 0.0
+    assert details["target_probs"][0, 0] > details["target_probs"][0, 1]
+    assert metrics["map_fine_topk_selector_pairwise_rank_loss"].item() > 0.0
+    assert selector.linear.weight.grad is not None
+    assert selector.linear.weight.grad.abs().sum().item() > 0.0
+
+
+def test_fine_topk_selector_loss_supports_score_map_head():
+    h, w = 4, 5
+    query = torch.randn(1, 4, h, w)
+    candidates = torch.randn(1, 3, 4, h, w)
+    candidate_pose = torch.eye(4).view(1, 1, 4, 4).repeat(1, 3, 1, 1)
+    candidate_pose[0, 1, 0, 3] = -0.08
+    candidate_pose[0, 2, 0, 3] = -0.20
+    pose_gt = torch.eye(4).view(1, 4, 4)
+    selector = CandidateScoreMapFusionHead(
+        vector_dim=len(train_impl.FINE_CANDIDATE_SELECTOR_VECTOR_FEATURE_NAMES),
+        score_map_channels=3,
+        map_channels=4,
+        grid_size=2,
+        hidden_dim=8,
+        zero_init=False,
+    )
+
+    loss, metrics, details = train_impl.fine_topk_selector_listwise_loss(
+        query,
+        candidates,
+        candidate_pose,
+        pose_gt,
+        selector,
+        radius=2,
+        score_map_mode="peak_offset",
+        target_mode="gt_pose_error_hard",
+        return_details=True,
+    )
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert details["score_maps"].shape == (1, 3, 3, h, w)
+    assert metrics["map_fine_topk_selector_target_idx"].item() == 0.0
+    assert selector.linear.weight.grad is not None
+    assert selector.linear.weight.grad.abs().sum().item() > 0.0
+
+
+def test_cached_fine_topk_selector_loss_trains_from_vector_evidence_only():
+    feature_dim = len(train_impl.FINE_CANDIDATE_SELECTOR_VECTOR_FEATURE_NAMES)
+    features = torch.zeros(1, 3, feature_dim)
+    features[0, :, 0] = torch.tensor([1.0, 0.2, -0.1])
+    valid = torch.tensor([[True, True, True]])
+    trans_err_m = torch.tensor([[0.02, 0.12, 0.30]])
+    rot_err_deg = torch.tensor([[0.1, 1.0, 3.0]])
+    selector = CandidateScoreFusionHead(input_dim=feature_dim, hidden_dim=0, zero_init=True)
+
+    loss, metrics, details = train_impl.fine_topk_selector_cached_listwise_loss(
+        features,
+        valid,
+        trans_err_m,
+        rot_err_deg,
+        selector,
+        target_mode="gt_pose_error_soft",
+        target_temperature_m=0.05,
+        pairwise_rank_weight=0.1,
+        pairwise_rank_min_gap_m=0.03,
+        return_details=True,
+    )
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert metrics["map_fine_topk_selector_target_idx"].item() == 0.0
+    assert details["target_probs"][0, 0] > details["target_probs"][0, 1]
+    assert selector.linear.weight.grad is not None
+    assert selector.linear.weight.grad.abs().sum().item() > 0.0
+
+
+def test_cached_fine_topk_selector_loss_trains_from_score_maps():
+    feature_dim = len(train_impl.FINE_CANDIDATE_SELECTOR_VECTOR_FEATURE_NAMES)
+    features = torch.zeros(1, 3, feature_dim)
+    score_maps = torch.zeros(1, 3, 3, 4, 4)
+    score_maps[0, 0, 0, 1, 1] = 2.0
+    score_maps[0, 1, 0, 2, 2] = 0.5
+    valid = torch.tensor([[True, True, True]])
+    trans_err_m = torch.tensor([[0.02, 0.12, 0.30]])
+    rot_err_deg = torch.tensor([[0.1, 1.0, 3.0]])
+    selector = CandidateScoreMapFusionHead(
+        vector_dim=feature_dim,
+        score_map_channels=3,
+        map_channels=2,
+        grid_size=2,
+        hidden_dim=0,
+        zero_init=True,
+    )
+
+    loss, metrics = train_impl.fine_topk_selector_cached_listwise_loss(
+        features,
+        valid,
+        trans_err_m,
+        rot_err_deg,
+        selector,
+        score_maps=score_maps,
+        target_mode="gt_pose_error_hard",
+        pairwise_rank_weight=0.1,
+        pairwise_rank_min_gap_m=0.03,
+    )
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert metrics["map_fine_topk_selector_target_idx"].item() == 0.0
+    assert selector.linear.weight.grad is not None
+    assert selector.linear.weight.grad.abs().sum().item() > 0.0
+
+
+def test_fine_candidate_selector_feature_flags_can_remove_motion_prior():
+    h, w = 3, 4
+    query = torch.randn(1, 4, h, w)
+    candidates = torch.randn(1, 2, 4, h, w)
+    candidate_pose = torch.eye(4).view(1, 1, 4, 4).repeat(1, 2, 1, 1)
+    candidate_pose[0, 1, 0, 3] = -0.25
+    init_pose = torch.eye(4).view(1, 4, 4)
+    coarse_logits = torch.tensor([[0.2, 2.0]])
+
+    features = train_impl.fine_candidate_selector_features(
+        query,
+        candidates,
+        candidate_pose,
+        init_pose=init_pose,
+        coarse_logits=coarse_logits,
+        use_coarse_logits=False,
+        use_candidate_delta=False,
+        use_depth=False,
+        use_mask=False,
+    )["features"]
+    names = train_impl.FINE_CANDIDATE_SELECTOR_VECTOR_FEATURE_NAMES
+
+    for name in (
+        "coarse_logit",
+        "coarse_logit_zscore",
+        "coarse_margin_to_top1",
+        "coarse_rank_norm",
+        "delta_trans_m",
+        "delta_trans_zscore",
+        "delta_rot_rad",
+        "delta_rot_zscore",
+        "mask_fraction",
+        "depth_valid_fraction",
+        "depth_mean_zscore",
+        "depth_std_zscore",
+        "inv_depth_mean_zscore",
+    ):
+        assert torch.allclose(features[..., names.index(name)], torch.zeros(1, 2))
+
+
+def test_project_query_render_for_fine_selector_uses_domain_adapter_and_can_require_it():
+    adapter = LocalCorrDomainAdapter(
+        feature_dim=4,
+        hidden_dim=8,
+        output_dim=6,
+        zero_init=True,
+        l2_normalize=True,
+    )
+    query = torch.randn(1, 4, 3, 4)
+    render = torch.randn(1, 2, 4, 3, 4)
+
+    projected_query, projected_render, used = train_impl.project_query_render_for_fine_selector(
+        adapter,
+        query,
+        render,
+        require_projector=True,
+    )
+
+    assert used is True
+    assert projected_query.shape == (1, 6, 3, 4)
+    assert projected_render.shape == (1, 2, 6, 3, 4)
+    assert torch.allclose(projected_query.norm(dim=1), torch.ones(1, 3, 4), atol=1e-5)
+    assert torch.allclose(projected_render.norm(dim=2), torch.ones(1, 2, 3, 4), atol=1e-5)
+    with pytest.raises(RuntimeError, match="fine selector requires"):
+        train_impl.project_query_render_for_fine_selector(None, query, render, require_projector=True)
+
+
+def test_project_query_render_for_fine_selector_chunks_render_bank_without_changing_values():
+    adapter = LocalCorrDomainAdapter(
+        feature_dim=4,
+        hidden_dim=8,
+        output_dim=6,
+        zero_init=True,
+        l2_normalize=True,
+    )
+    query = torch.randn(1, 4, 3, 4)
+    render = torch.randn(1, 5, 4, 3, 4)
+
+    full_query, full_render, full_used = train_impl.project_query_render_for_fine_selector(
+        adapter,
+        query,
+        render,
+        require_projector=True,
+    )
+    chunk_query, chunk_render, chunk_used = train_impl.project_query_render_for_fine_selector(
+        adapter,
+        query,
+        render,
+        require_projector=True,
+        render_chunk_size=2,
+    )
+
+    assert full_used is True
+    assert chunk_used is True
+    assert torch.allclose(chunk_query, full_query)
+    assert torch.allclose(chunk_render, full_render)
+
+
 def test_compute_map_supervision_uses_candidate_score_fusion_head_for_pose_lattice_candidates():
     h, w = 4, 5
     query = torch.randn(1, 6, h, w, requires_grad=True)
@@ -3362,6 +3721,46 @@ def test_perturb_w2c_camera_center_moves_center_in_camera_frame():
     expected_world = pose[:3, :3].T @ offset_cam
 
     assert torch.allclose(center, expected_world, atol=1e-6)
+
+
+def test_sample_perturb_direction_keeps_axis_mode_discrete():
+    random.seed(7)
+    direction = sample_perturb_direction("axis", axes=[0, 1, 2])
+
+    assert torch.isclose(torch.linalg.norm(direction), torch.tensor(1.0))
+    assert int(direction.abs().gt(0.0).sum().item()) == 1
+
+
+def test_sample_perturb_direction_supports_random_unit_vectors():
+    np.random.seed(3)
+    direction = sample_perturb_direction("random", axes=[0, 1, 2])
+
+    assert torch.isclose(torch.linalg.norm(direction), torch.tensor(1.0), atol=1e-6)
+    assert int(direction.abs().gt(1e-4).sum().item()) == 3
+
+
+def test_map_feature_renderer_can_sample_random_direction_choice_offsets():
+    np.random.seed(5)
+    renderer = object.__new__(train_impl.MapFeatureRenderer)
+    renderer.perturb_trans_cm_choices = [25.0]
+    renderer.perturb_trans_m = 0.0
+    renderer.perturb_axes = [0, 1, 2]
+    renderer.perturb_direction_mode = "random"
+
+    offset, dist_m = renderer._sample_translation_offset()
+
+    assert torch.isclose(torch.linalg.norm(offset), torch.tensor(0.25), atol=1e-6)
+    assert dist_m == pytest.approx(0.25, abs=1e-6)
+    assert int(offset.abs().gt(1e-4).sum().item()) == 3
+
+
+def test_axis_angle_vector_rotation_matrix_handles_non_axis_rotations():
+    axis_angle = torch.tensor([1.0, 1.0, 1.0]) / (3.0**0.5) * math.radians(5.0)
+    rot = axis_angle_vector_rotation_matrix(axis_angle)
+
+    rot_err = train_impl._rotation_error_from_mats(rot.view(1, 3, 3), torch.eye(3).view(1, 3, 3))[1]
+
+    assert torch.isclose(rot_err[0], torch.tensor(5.0), atol=1e-4)
 
 
 def test_perturb_rank_margin_scales_with_translation_distance():

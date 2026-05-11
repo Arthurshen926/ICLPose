@@ -1346,6 +1346,7 @@ class RadioQueryStudent(nn.Module):
             else None
         )
         self.candidate_score_fusion_head = None
+        self.fine_candidate_selector_head = None
         self.pose_init_head = None
 
         self.local_matcher = (

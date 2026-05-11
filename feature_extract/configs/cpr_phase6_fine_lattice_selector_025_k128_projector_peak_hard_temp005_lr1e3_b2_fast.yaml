@@ -1,0 +1,18 @@
+# 0.25m/5deg K128 selector + trainable local-corr projector.
+# Hard target retained from the only useful random-lattice signal, with lower LR.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_phase6_fine_lattice_selector_025_k128_projector_peak_hard_temp005_lr2e3_b2_fast.yaml
+exp_name: cpr_phase6_fine_lattice_selector_025_k128_projector_peak_hard_temp005_lr1e3_b2_fast
+
+training:
+  lr: 0.001
+  model_lr_scales:
+    fine_candidate_selector_head.: 1.0
+    local_corr_projector.: 0.1
+
+map_supervision:
+  fine_topk_selector_temperature: 0.05
+  fine_topk_selector_target_mode: gt_pose_error_hard
+  fine_topk_selector_pairwise_rank_weight: 0.2
+  fine_topk_selector_pairwise_rank_min_gap_m: 0.02
+  fine_topk_selector_pairwise_rank_temperature: 0.25

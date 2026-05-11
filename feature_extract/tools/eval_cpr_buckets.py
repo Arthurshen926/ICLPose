@@ -27,11 +27,13 @@ from feature_extract.train_impl import (  # noqa: E402
     build_local_pose_lattice_candidates,
     build_radio_query_student,
     candidate_score_fusion_listwise_loss,
+    fine_candidate_selector_features,
     load_config,
     load_model_warmstart,
     local_render_score_feature_candidates,
     move_batch_to_device,
     pose_error_tensors,
+    project_query_render_for_fine_selector,
     resolve_query_feature_dims,
     resolve_safe_num_workers,
     safe_torch_load,
@@ -54,6 +56,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--max-samples", type=int, default=None)
+    parser.add_argument("--skip-samples", type=int, default=0)
     parser.add_argument(
         "--buckets",
         nargs="+",
@@ -63,6 +66,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--topk", default="1,4,8", help="Comma-separated topK basin recalls")
     parser.add_argument("--lattice-trans-cm", default=None, help="Override lattice translation radii, comma-separated cm")
     parser.add_argument("--lattice-rot-deg", default=None, help="Override lattice rotation radii, comma-separated deg")
+    parser.add_argument(
+        "--lattice-direction-mode",
+        choices=("axis", "cube"),
+        default=None,
+        help="Direction set for lattice translation/rotation deltas. cube uses 26 normalized directions.",
+    )
     parser.add_argument(
         "--combine-trans-rot",
         action=argparse.BooleanOptionalAction,
@@ -78,7 +87,12 @@ def parse_args() -> argparse.Namespace:
         help="Override map_supervision.candidate_render_batch_size for evaluation",
     )
     parser.add_argument("--fine-wls", action="store_true", help="Run one fine WLS update on selected candidates")
-    parser.add_argument("--fine-topk", type=int, default=1, help="Number of scorer topK candidates to refine")
+    parser.add_argument(
+        "--fine-topk",
+        type=int,
+        default=0,
+        help="Number of scorer topK candidates to refine; default reads map_supervision.fine_topk_selector_topk",
+    )
     parser.add_argument("--fine-update-scale", type=float, default=None, help="Override WLS pose update scale")
     parser.add_argument(
         "--fine-score-stat",
@@ -88,9 +102,25 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--fine-select",
-        choices=("score", "conf", "fine_score", "fine_score_prior", "oracle"),
+        choices=("score", "conf", "fine_score", "fine_score_prior", "fine_selector", "oracle"),
         default="score",
-        help="Which refined candidate becomes final: scorer top1, max WLS confidence, fine corr score, or GT oracle.",
+        help="Which topK candidate becomes final: scorer top1, max WLS confidence, fine corr score, trainable selector, or GT oracle.",
+    )
+    parser.add_argument(
+        "--fine-pool-mode",
+        choices=("rank", "rank_uniform", "rank_delta_uniform", "rank_score_uniform"),
+        default="rank",
+        help=(
+            "How to form the fine selector/WLS candidate pool. rank preserves the original scorer topK; "
+            "rank_* modes keep --fine-pool-topm scorer candidates and fill the rest with deterministic "
+            "diverse candidates."
+        ),
+    )
+    parser.add_argument(
+        "--fine-pool-topm",
+        type=int,
+        default=16,
+        help="Number of scorer-ranked candidates to force-keep before diversity fill in non-rank fine pool modes.",
     )
     parser.add_argument(
         "--fine-prior-weight",
@@ -103,6 +133,30 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.1,
         help="Rotation cost weight for fine_score_prior candidate motion from T0.",
+    )
+    parser.add_argument(
+        "--init-noise-mode",
+        choices=("fixed", "random"),
+        default="fixed",
+        help="Use deterministic axis-aligned T0 noise or continuous random T0 noise.",
+    )
+    parser.add_argument("--init-jitter-seed", type=int, default=20260510, help="Seed for random T0/candidate jitter")
+    parser.add_argument(
+        "--candidate-jitter-cm",
+        type=float,
+        default=0.0,
+        help="Apply up to this much random translation jitter to every candidate pose.",
+    )
+    parser.add_argument(
+        "--candidate-jitter-deg",
+        type=float,
+        default=0.0,
+        help="Apply up to this much random rotation jitter to every candidate pose.",
+    )
+    parser.add_argument(
+        "--disable-exact-inverse",
+        action="store_true",
+        help="Mask candidates that exactly recover GT pose in fixed-lattice diagnostics.",
     )
     parser.add_argument("--out", default=None, help="Optional output JSON")
     return parser.parse_args()
@@ -160,6 +214,82 @@ def make_fixed_init_poses(pose_gt: torch.Tensor, trans_cm: float, rot_deg: float
     return apply_pose_delta(pose_gt.float(), delta.float()).to(dtype=pose_gt.dtype)
 
 
+def _random_unit_vectors(count: int, *, seed: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(int(seed))
+    vectors = torch.randn(count, 3, generator=generator, dtype=torch.float32)
+    vectors = vectors / vectors.norm(dim=1, keepdim=True).clamp(min=1e-6)
+    return vectors.to(device=device, dtype=dtype)
+
+
+def make_random_init_poses(
+    pose_gt: torch.Tensor,
+    trans_cm: float,
+    rot_deg: float,
+    *,
+    seed: int,
+    offset: int = 0,
+) -> torch.Tensor:
+    bsz = pose_gt.shape[0]
+    delta = pose_gt.new_zeros((bsz, 6))
+    trans_axes = _random_unit_vectors(
+        bsz,
+        seed=int(seed) + int(offset) * 2 + 17,
+        device=pose_gt.device,
+        dtype=pose_gt.dtype,
+    )
+    rot_axes = _random_unit_vectors(
+        bsz,
+        seed=int(seed) + int(offset) * 2 + 31,
+        device=pose_gt.device,
+        dtype=pose_gt.dtype,
+    )
+    delta[:, :3] = trans_axes * (float(trans_cm) / 100.0)
+    delta[:, 3:] = rot_axes * math.radians(float(rot_deg))
+    return apply_pose_delta(pose_gt.float(), delta.float()).to(dtype=pose_gt.dtype)
+
+
+def jitter_candidate_poses(
+    candidate_poses: torch.Tensor,
+    *,
+    trans_cm: float,
+    rot_deg: float,
+    seed: int,
+    offset: int = 0,
+) -> torch.Tensor:
+    if float(trans_cm) <= 0.0 and float(rot_deg) <= 0.0:
+        return candidate_poses
+    bsz, num_candidates = candidate_poses.shape[:2]
+    count = bsz * num_candidates
+    device = candidate_poses.device
+    dtype = candidate_poses.dtype
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(int(seed) + int(offset) * 2 + 101)
+    delta = torch.zeros(count, 6, device=device, dtype=dtype)
+    if float(trans_cm) > 0.0:
+        axes = _random_unit_vectors(count, seed=int(seed) + int(offset) * 2 + 151, device=device, dtype=dtype)
+        mag = torch.rand(count, 1, generator=generator, dtype=torch.float32).to(device=device, dtype=dtype)
+        delta[:, :3] = axes * mag * (float(trans_cm) / 100.0)
+    if float(rot_deg) > 0.0:
+        axes = _random_unit_vectors(count, seed=int(seed) + int(offset) * 2 + 181, device=device, dtype=dtype)
+        mag = torch.rand(count, 1, generator=generator, dtype=torch.float32).to(device=device, dtype=dtype)
+        delta[:, 3:] = axes * mag * math.radians(float(rot_deg))
+    jittered = apply_pose_delta(candidate_poses.reshape(count, 4, 4).float(), delta.float())
+    return jittered.reshape(bsz, num_candidates, 4, 4).to(dtype=dtype)
+
+
+def exact_inverse_candidate_mask(candidate_poses: torch.Tensor, pose_gt: torch.Tensor) -> torch.Tensor:
+    bsz, num_candidates = candidate_poses.shape[:2]
+    pose_gt_bank = pose_gt[:, None].expand(-1, num_candidates, -1, -1)
+    _rot_loss, rot_deg, trans_m = pose_error_tensors(
+        candidate_poses.reshape(bsz * num_candidates, 4, 4).float(),
+        pose_gt_bank.reshape(bsz * num_candidates, 4, 4).float(),
+    )
+    trans_m = trans_m.reshape(bsz, num_candidates)
+    rot_deg = rot_deg.reshape(bsz, num_candidates)
+    return (trans_m <= 1.0e-5) & (rot_deg <= 1.0e-4)
+
+
 def tensor_stats(values: List[float]) -> Dict[str, float]:
     if not values:
         return {"mean": 0.0, "median": 0.0}
@@ -173,6 +303,113 @@ def tensor_stats(values: List[float]) -> Dict[str, float]:
 def gather_pose_bank(poses: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
     view_shape = (indices.shape[0], indices.shape[1], 1, 1)
     return poses.gather(1, indices.view(view_shape).expand(-1, -1, 4, 4))
+
+
+def _take_unique_from_order(order: torch.Tensor, used: set[int], count: int) -> List[int]:
+    if count <= 0 or order.numel() == 0:
+        return []
+    values = [int(v) for v in order.detach().cpu().tolist() if int(v) not in used]
+    if len(values) <= count:
+        return values
+    if count == 1:
+        picks = [len(values) // 2]
+    else:
+        picks = torch.linspace(0, len(values) - 1, count).round().long().tolist()
+    out = []
+    seen = set()
+    for pos in picks:
+        idx = values[int(pos)]
+        if idx not in seen:
+            out.append(idx)
+            seen.add(idx)
+    if len(out) < count:
+        for idx in values:
+            if idx not in seen:
+                out.append(idx)
+                seen.add(idx)
+                if len(out) >= count:
+                    break
+    return out[:count]
+
+
+def select_fine_pool_indices(
+    logits: torch.Tensor,
+    valid: torch.Tensor,
+    fine_topk: int,
+    *,
+    mode: str = "rank",
+    rank_topm: int = 16,
+    candidate_pose: torch.Tensor | None = None,
+    init_pose: torch.Tensor | None = None,
+    rot_cost_weight: float = 0.1,
+) -> torch.Tensor:
+    """Select the K candidates passed to fine reranking.
+
+    The default exactly matches the old behavior. Diversity modes are GT-free:
+    they keep a small scorer prefix, then fill the rest from the lattice rather
+    than trusting coarse rank to preserve every good fine candidate.
+    """
+    if logits.ndim != 2 or valid.ndim != 2:
+        raise ValueError("logits and valid must have shape (B,K)")
+    if logits.shape != valid.shape:
+        raise ValueError(f"logits/valid shape mismatch: {tuple(logits.shape)} vs {tuple(valid.shape)}")
+    bsz, num_candidates = logits.shape
+    keep = max(1, min(int(fine_topk or 1), num_candidates))
+    scores = logits.float().masked_fill(~valid.bool(), -1.0e6)
+    ranked = torch.argsort(scores, dim=1, descending=True)
+    pool_mode = str(mode or "rank").lower()
+    if pool_mode == "rank":
+        return ranked[:, :keep]
+
+    delta_order = None
+    if pool_mode == "rank_delta_uniform":
+        if candidate_pose is None or init_pose is None:
+            raise ValueError("rank_delta_uniform fine pool requires candidate_pose and init_pose")
+        init_bank = init_pose[:, None].expand(-1, num_candidates, -1, -1)
+        _rot_loss, delta_rot_deg, delta_trans_m = pose_error_tensors(
+            candidate_pose.reshape(bsz * num_candidates, 4, 4).float(),
+            init_bank.reshape(bsz * num_candidates, 4, 4).float(),
+        )
+        delta_cost = delta_trans_m.reshape(bsz, num_candidates) + float(rot_cost_weight) * (
+            delta_rot_deg.reshape(bsz, num_candidates) * (math.pi / 180.0)
+        )
+        delta_cost = delta_cost.masked_fill(~valid.bool(), float("inf"))
+        delta_order = torch.argsort(delta_cost, dim=1, descending=False)
+    elif pool_mode not in ("rank_uniform", "rank_score_uniform"):
+        raise ValueError(f"unsupported fine pool mode: {mode}")
+
+    rows = []
+    prefix = max(0, min(int(rank_topm or 0), keep, num_candidates))
+    for row in range(bsz):
+        selected: List[int] = []
+        used: set[int] = set()
+        for idx in ranked[row, :prefix].detach().cpu().tolist():
+            idx_i = int(idx)
+            if bool(valid[row, idx_i]) and idx_i not in used:
+                selected.append(idx_i)
+                used.add(idx_i)
+        fill = keep - len(selected)
+        if pool_mode == "rank_score_uniform":
+            order = ranked[row]
+        elif pool_mode == "rank_delta_uniform":
+            order = delta_order[row]
+        else:
+            order = torch.nonzero(valid[row].bool(), as_tuple=False).flatten()
+        for idx_i in _take_unique_from_order(order, used, fill):
+            selected.append(idx_i)
+            used.add(idx_i)
+        if len(selected) < keep:
+            for idx in ranked[row].detach().cpu().tolist():
+                idx_i = int(idx)
+                if bool(valid[row, idx_i]) and idx_i not in used:
+                    selected.append(idx_i)
+                    used.add(idx_i)
+                    if len(selected) >= keep:
+                        break
+        if len(selected) < keep:
+            selected.extend([selected[0] if selected else 0] * (keep - len(selected)))
+        rows.append(torch.tensor(selected[:keep], device=logits.device, dtype=torch.long))
+    return torch.stack(rows, dim=0)
 
 
 def _row_standardize(values: torch.Tensor) -> torch.Tensor:
@@ -201,6 +438,31 @@ def fine_prior_adjusted_scores(
         delta_rot_deg.view(bsz, topk) * (math.pi / 180.0)
     )
     return _row_standardize(fine_scores.float()) - float(prior_weight) * _row_standardize(delta_cost.float())
+
+
+def selected_pose_error_dict(
+    selected_pose: torch.Tensor,
+    pose_gt: torch.Tensor,
+    *,
+    rot_cost_weight: float,
+) -> Dict[str, torch.Tensor]:
+    bsz, topk = selected_pose.shape[:2]
+    pose_gt_bank = pose_gt[:, None].expand(-1, topk, -1, -1)
+    _rot_loss, rot_deg, trans_m = pose_error_tensors(
+        selected_pose.reshape(bsz * topk, 4, 4).float(),
+        pose_gt_bank.reshape(bsz * topk, 4, 4).float(),
+    )
+    trans_m = trans_m.reshape(bsz, topk)
+    rot_deg = rot_deg.reshape(bsz, topk)
+    cost = trans_m + float(rot_cost_weight) * (rot_deg * (math.pi / 180.0))
+    return {
+        "trans_err_m": trans_m,
+        "rot_err_deg": rot_deg,
+        "init_trans_err_m": trans_m,
+        "init_rot_err_deg": rot_deg,
+        "cost": cost,
+        "conf_mean": torch.zeros_like(trans_m),
+    }
 
 
 def map_pose_gt_for_batch(map_renderer: MapFeatureRenderer, batch: Dict, device: torch.device) -> torch.Tensor:
@@ -248,6 +510,9 @@ def build_model_and_data(cfg: Dict, args: argparse.Namespace, device: torch.devi
     )
     train_records, val_records = split_records(all_records, cfg["dataset"])
     records = train_records if args.split == "train" else val_records
+    skip_samples = int(getattr(args, "skip_samples", 0) or 0)
+    if skip_samples > 0:
+        records = records[skip_samples:]
     if args.max_samples is not None and args.max_samples > 0:
         records = records[: int(args.max_samples)]
 
@@ -313,6 +578,7 @@ def evaluate_bucket(model, loader, map_renderer, cfg: Dict, args: argparse.Names
         if args.combine_trans_rot is not None
         else bool(map_cfg.get("coarse_pose_lattice_combine_trans_rot", False))
     )
+    direction_mode = str(args.lattice_direction_mode or map_cfg.get("coarse_pose_lattice_direction_mode", "axis"))
 
     rows = {
         "init_trans_mm": [],
@@ -334,6 +600,11 @@ def evaluate_bucket(model, loader, map_renderer, cfg: Dict, args: argparse.Names
         "fine_topk_score_rot_deg": [],
         "fine_topk_score_init_trans_mm": [],
         "fine_topk_score_init_rot_deg": [],
+        "fine_topk_selector_trans_mm": [],
+        "fine_topk_selector_rot_deg": [],
+        "fine_topk_selector_oracle_gap_mm": [],
+        "fine_topk_selector_entropy": [],
+        "fine_topk_selector_margin": [],
         "wls_conf_mean": [],
     }
     topk_hits = {k: [] for k in topk_values}
@@ -344,7 +615,17 @@ def evaluate_bucket(model, loader, map_renderer, cfg: Dict, args: argparse.Names
     for batch in loader:
         batch = move_batch_to_device(batch, next(model.parameters()).device)
         pose_gt = map_pose_gt_for_batch(map_renderer, batch, next(model.parameters()).device)
-        init_pose = make_fixed_init_poses(pose_gt, trans_cm, rot_deg, offset=sample_offset)
+        current_offset = sample_offset
+        if args.init_noise_mode == "random":
+            init_pose = make_random_init_poses(
+                pose_gt,
+                trans_cm,
+                rot_deg,
+                seed=int(args.init_jitter_seed),
+                offset=current_offset,
+            )
+        else:
+            init_pose = make_fixed_init_poses(pose_gt, trans_cm, rot_deg, offset=current_offset)
         sample_offset += pose_gt.shape[0]
         candidate_poses = build_local_pose_lattice_candidates(
             init_pose,
@@ -354,8 +635,21 @@ def evaluate_bucket(model, loader, map_renderer, cfg: Dict, args: argparse.Names
             max_candidates=max_candidates,
             limit_strategy=args.limit_strategy,
             combine_trans_rot=combine_trans_rot,
+            direction_mode=direction_mode,
+        )
+        candidate_poses = jitter_candidate_poses(
+            candidate_poses,
+            trans_cm=float(args.candidate_jitter_cm),
+            rot_deg=float(args.candidate_jitter_deg),
+            seed=int(args.init_jitter_seed),
+            offset=current_offset,
         )
         valid = torch.ones(candidate_poses.shape[:2], device=pose_gt.device, dtype=torch.bool)
+        if args.disable_exact_inverse:
+            valid = valid & ~exact_inverse_candidate_mask(candidate_poses, pose_gt)
+            empty_rows = ~valid.any(dim=1)
+            if empty_rows.any():
+                valid[empty_rows, 0] = True
 
         with torch.autocast(device_type=pose_gt.device.type, enabled=use_amp):
             outputs = model(batch["rgb"])
@@ -424,46 +718,67 @@ def evaluate_bucket(model, loader, map_renderer, cfg: Dict, args: argparse.Names
         final_rot = coarse_rot
         wls_conf = torch.zeros_like(coarse_trans)
 
-        if args.fine_wls:
-            fine_topk = max(1, min(int(args.fine_topk or 1), logits.shape[1]))
-            selected_idx = logits.topk(fine_topk, dim=1).indices
+        needs_fine_candidates = args.fine_wls or args.fine_select in {
+            "conf",
+            "fine_score",
+            "fine_score_prior",
+            "fine_selector",
+            "oracle",
+        }
+        if needs_fine_candidates:
+            fine_topk_cfg = int(map_cfg.get("fine_topk_selector_topk", 1) or 1)
+            fine_topk = max(1, min(int(args.fine_topk or fine_topk_cfg), logits.shape[1]))
+            selected_idx = select_fine_pool_indices(
+                logits,
+                details["valid"].bool(),
+                fine_topk,
+                mode=str(args.fine_pool_mode),
+                rank_topm=int(args.fine_pool_topm),
+                candidate_pose=eval_batch["eval_candidate_pose"].float(),
+                init_pose=init_pose.float(),
+                rot_cost_weight=float(map_cfg.get("candidate_score_fusion_rot_cost_weight", 0.1)),
+            )
             selected_pose = gather_pose_bank(eval_batch["eval_candidate_pose"].float(), selected_idx)
+            selected_valid = details["valid"].bool().gather(1, selected_idx)
             fine_batch = dict(batch)
             fine_batch = map_renderer.attach_pose_candidate_renders(
                 fine_batch,
                 selected_pose,
                 prefix="eval_selected",
-                candidate_valid_mask=torch.ones(
-                    (pose_gt.shape[0], fine_topk),
-                    device=pose_gt.device,
-                    dtype=torch.bool,
-                ),
+                candidate_valid_mask=selected_valid,
                 feature="all",
                 include_aux=True,
             )
             query_fine_key = str(map_cfg.get("query_fine_key", "fine"))
             query_fine = outputs.get(query_fine_key, outputs["fine"]).float()
-            refined = _candidate_wls_refined_pose_cost(
-                query_fine,
-                fine_batch["eval_selected_fine"].float(),
-                fine_batch["eval_selected_pose"].float(),
-                pose_gt.float(),
-                fine_batch["eval_selected_depth"].float(),
-                fine_batch["eval_selected_intrinsics"].float(),
-                fine_batch["eval_selected_valid_mask"].bool(),
-                radius=int(map_cfg.get("query_corr_radius", 4)),
-                temperature=float(map_cfg.get("query_corr_temperature", 0.05)),
-                damping=float(map_cfg.get("query_corr_wls_damping", 1e-3)),
-                update_scale=float(
-                    map_cfg.get("query_corr_wls_update_scale", 1.0)
-                    if args.fine_update_scale is None
-                    else args.fine_update_scale
-                ),
-                rot_cost_weight=float(map_cfg.get("candidate_score_fusion_rot_cost_weight", 0.1)),
-                wls_conf_mode=map_cfg.get("query_corr_wls_conf_mode", "max"),
-                wls_conf_variance_scale=float(map_cfg.get("query_corr_wls_conf_variance_scale", 0.5)),
-                wls_downsample=int(map_cfg.get("query_corr_wls_downsample", 1)),
-            )
+            if args.fine_wls:
+                refined = _candidate_wls_refined_pose_cost(
+                    query_fine,
+                    fine_batch["eval_selected_fine"].float(),
+                    fine_batch["eval_selected_pose"].float(),
+                    pose_gt.float(),
+                    fine_batch["eval_selected_depth"].float(),
+                    fine_batch["eval_selected_intrinsics"].float(),
+                    fine_batch["eval_selected_valid_mask"].bool(),
+                    radius=int(map_cfg.get("query_corr_radius", 4)),
+                    temperature=float(map_cfg.get("query_corr_temperature", 0.05)),
+                    damping=float(map_cfg.get("query_corr_wls_damping", 1e-3)),
+                    update_scale=float(
+                        map_cfg.get("query_corr_wls_update_scale", 1.0)
+                        if args.fine_update_scale is None
+                        else args.fine_update_scale
+                    ),
+                    rot_cost_weight=float(map_cfg.get("candidate_score_fusion_rot_cost_weight", 0.1)),
+                    wls_conf_mode=map_cfg.get("query_corr_wls_conf_mode", "max"),
+                    wls_conf_variance_scale=float(map_cfg.get("query_corr_wls_conf_variance_scale", 0.5)),
+                    wls_downsample=int(map_cfg.get("query_corr_wls_downsample", 1)),
+                )
+            else:
+                refined = selected_pose_error_dict(
+                    fine_batch["eval_selected_pose"].float(),
+                    pose_gt.float(),
+                    rot_cost_weight=float(map_cfg.get("candidate_score_fusion_rot_cost_weight", 0.1)),
+                )
             fine_score_rows = []
             fine_masks = fine_batch.get("eval_selected_mask")
             for row_idx in range(pose_gt.shape[0]):
@@ -493,6 +808,66 @@ def evaluate_bucket(model, loader, map_renderer, cfg: Dict, args: argparse.Names
             conf_idx = refined["conf_mean"].argmax(dim=1)
             fine_score_idx = fine_scores.argmax(dim=1)
             fine_prior_idx = fine_prior_scores.argmax(dim=1)
+            fine_selector_idx = None
+            fine_selector_logits = None
+            if args.fine_select == "fine_selector" or getattr(model, "fine_candidate_selector_head", None) is not None:
+                selector_head = getattr(model, "fine_candidate_selector_head", None)
+                if selector_head is None:
+                    raise RuntimeError("--fine-select fine_selector requires model.fine_candidate_selector_head")
+                selected_coarse_logits = details.get("raw_logits", details["logits"]).gather(1, selected_idx).detach()
+                selector_query = query_fine
+                selector_render = fine_batch["eval_selected_fine"].float()
+                if bool(map_cfg.get("fine_topk_selector_use_projector", True)):
+                    selector_query, selector_render, _projector_used = project_query_render_for_fine_selector(
+                        getattr(model, "local_corr_projector", None),
+                        selector_query,
+                        selector_render,
+                        require_projector=bool(map_cfg.get("fine_topk_selector_require_projector", False)),
+                        render_chunk_size=int(map_cfg.get("fine_topk_selector_projector_chunk_size", 0) or 0),
+                    )
+                score_map_selector = bool(getattr(selector_head, "expects_score_map", False))
+                feature_pack = fine_candidate_selector_features(
+                    selector_query.float(),
+                    selector_render.float(),
+                    fine_batch["eval_selected_pose"].float(),
+                    init_pose=init_pose.float(),
+                    coarse_logits=selected_coarse_logits.float(),
+                    query_rgb=batch.get("rgb"),
+                    candidate_rgb=fine_batch.get("eval_selected_rgb"),
+                    depth=fine_batch.get("eval_selected_depth"),
+                    mask=fine_masks,
+                    candidate_valid_mask=fine_batch["eval_selected_valid_mask"].bool(),
+                    mode=map_cfg.get("fine_topk_selector_mode", "local"),
+                    radius=int(map_cfg.get("fine_topk_selector_radius") or map_cfg.get("query_corr_radius", 4)),
+                    preprocess=(
+                        map_cfg.get("fine_topk_selector_preprocess")
+                        or map_cfg.get(
+                            "query_corr_feature_preprocess",
+                            map_cfg.get("candidate_score_fusion_preprocess", "spatial_center"),
+                        )
+                    ),
+                    highpass_kernel=int(
+                        map_cfg.get("fine_topk_selector_highpass_kernel")
+                        or map_cfg.get("query_corr_highpass_kernel", map_cfg.get("candidate_score_fusion_highpass_kernel", 5))
+                    ),
+                    score_map_mode=map_cfg.get("fine_topk_selector_score_map_mode", "peak_offset"),
+                    return_score_maps=score_map_selector,
+                    use_coarse_logits=bool(map_cfg.get("fine_topk_selector_use_coarse_logits", True)),
+                    use_candidate_delta=bool(map_cfg.get("fine_topk_selector_use_candidate_delta", True)),
+                    use_delta_vector=bool(map_cfg.get("fine_topk_selector_use_delta_vector", False)),
+                    use_depth=bool(map_cfg.get("fine_topk_selector_use_depth", True)),
+                    use_mask=bool(map_cfg.get("fine_topk_selector_use_mask", True)),
+                    use_rgb=bool(map_cfg.get("fine_topk_selector_use_rgb", False)),
+                )
+                if score_map_selector:
+                    fine_selector_logits = selector_head(feature_pack["score_maps"], feature_pack["features"])
+                else:
+                    fine_selector_logits = selector_head(feature_pack["features"])
+                fine_selector_logits = fine_selector_logits.masked_fill(
+                    ~feature_pack["valid"],
+                    -1.0e6,
+                )
+                fine_selector_idx = fine_selector_logits.argmax(dim=1)
             if args.fine_select == "oracle":
                 final_idx = oracle_refined_idx
             elif args.fine_select == "conf":
@@ -501,6 +876,8 @@ def evaluate_bucket(model, loader, map_renderer, cfg: Dict, args: argparse.Names
                 final_idx = fine_prior_idx
             elif args.fine_select == "fine_score":
                 final_idx = fine_score_idx
+            elif args.fine_select == "fine_selector":
+                final_idx = fine_selector_idx
             else:
                 final_idx = torch.zeros_like(pred_idx)
             final_trans = refined["trans_err_m"][batch_idx, final_idx]
@@ -527,6 +904,31 @@ def evaluate_bucket(model, loader, map_renderer, cfg: Dict, args: argparse.Names
             rows["fine_topk_score_init_rot_deg"].extend(
                 refined["init_rot_err_deg"][batch_idx, fine_score_idx].detach().cpu().tolist()
             )
+            if fine_selector_idx is not None and fine_selector_logits is not None:
+                rows["fine_topk_selector_trans_mm"].extend(
+                    (refined["trans_err_m"][batch_idx, fine_selector_idx] * 1000.0).detach().cpu().tolist()
+                )
+                rows["fine_topk_selector_rot_deg"].extend(
+                    refined["rot_err_deg"][batch_idx, fine_selector_idx].detach().cpu().tolist()
+                )
+                rows["fine_topk_selector_oracle_gap_mm"].extend(
+                    (
+                        (refined["trans_err_m"][batch_idx, fine_selector_idx] - refined["trans_err_m"][batch_idx, oracle_refined_idx])
+                        * 1000.0
+                    )
+                    .detach()
+                    .cpu()
+                    .tolist()
+                )
+                selector_probs = torch.softmax(fine_selector_logits, dim=1)
+                selector_entropy = -(selector_probs * torch.log(selector_probs.clamp(min=1e-8))).sum(dim=1)
+                if fine_selector_logits.shape[1] > 1:
+                    selector_top2 = fine_selector_logits.topk(k=2, dim=1).values
+                    selector_margin = selector_top2[:, 0] - selector_top2[:, 1]
+                else:
+                    selector_margin = torch.zeros_like(selector_entropy)
+                rows["fine_topk_selector_entropy"].extend(selector_entropy.detach().cpu().tolist())
+                rows["fine_topk_selector_margin"].extend(selector_margin.detach().cpu().tolist())
 
         rows["init_trans_mm"].extend((init_trans * 1000.0).cpu().tolist())
         rows["init_rot_deg"].extend(init_rot.cpu().tolist())
@@ -551,6 +953,8 @@ def evaluate_bucket(model, loader, map_renderer, cfg: Dict, args: argparse.Names
         "lattice_rot_deg": lattice_rot,
         "max_candidates": int(max_candidates),
         "limit_strategy": args.limit_strategy,
+        "fine_pool_mode": str(args.fine_pool_mode),
+        "fine_pool_topm": int(args.fine_pool_topm),
         "combine_trans_rot": combine_trans_rot,
         "oracle_basin_recall": float(torch.tensor(oracle_hits).mean().item()) if oracle_hits else 0.0,
         "gain_positive_frac": float((final_t < init_t).float().mean().item()) if len(init_t) else 0.0,

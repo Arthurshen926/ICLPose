@@ -1,0 +1,20 @@
+# 0.25m/5deg K256 fine selector with trainable local-corr projector.
+# Query/map/coarse remain frozen; only the selector head and projector learn.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_phase6_fine_lattice_selector_025_k256_volume_soft_b2_fast.yaml
+exp_name: cpr_phase6_fine_lattice_selector_025_k256_projector_hard_temp005_lr2e3_b2_fast
+
+training:
+  batch_size: 2
+  lr: 0.002
+  freeze_model_except_prefixes:
+    - "fine_candidate_selector_head."
+    - "local_corr_projector."
+  model_lr_scales:
+    fine_candidate_selector_head.: 1.0
+    local_corr_projector.: 0.1
+
+map_supervision:
+  fine_topk_selector_temperature: 0.05
+  fine_topk_selector_target_mode: gt_pose_error_hard
+  fine_topk_selector_pairwise_rank_weight: 0.2

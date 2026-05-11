@@ -1,0 +1,48 @@
+# Online fine selector over a uniform K64 local lattice.
+# Trains only the fine selector head and local-corr projector so the metric
+# space can adapt beyond the frozen cached evidence.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_phase6_fine_lattice_selector_025_scoremap_b1.yaml
+exp_name: cpr_phase6_fine_lattice_selector_025_k64_uniform_projector_peak_corronly_soft_b2
+
+dataset:
+  max_train_samples: 128
+  max_val_samples: 32
+
+training:
+  batch_size: 2
+  max_steps: 256
+  log_every: 1
+  lr: 0.001
+  best_metric: map_fine_topk_selector_pred_trans_mm
+  best_metric_mode: min
+  freeze_model_except_prefixes:
+    - "fine_candidate_selector_head."
+    - "local_corr_projector."
+  model_lr_scales:
+    fine_candidate_selector_head.: 1.0
+    local_corr_projector.: 0.1
+
+map_supervision:
+  coarse_pose_lattice_trans_cm: [0.0, 10.0, 25.0, 50.0]
+  coarse_pose_lattice_rot_deg: [0.0, 2.0, 5.0, 10.0]
+  coarse_pose_lattice_direction_mode: cube
+  coarse_pose_lattice_combine_trans_rot: true
+  coarse_pose_lattice_max_candidates: 64
+  coarse_pose_lattice_limit_strategy: uniform
+  candidate_render_batch_size: 16
+
+  fine_topk_selector_topk: 64
+  fine_topk_selector_radius: 4
+  fine_topk_selector_projector_chunk_size: 32
+  fine_topk_selector_score_map_mode: peak_offset
+  fine_topk_selector_target_mode: gt_pose_error_soft
+  fine_topk_selector_target_temperature_m: 0.05
+  fine_topk_selector_pairwise_rank_weight: 0.1
+  fine_topk_selector_pairwise_rank_min_gap_m: 0.03
+  fine_topk_selector_pairwise_rank_temperature: 0.25
+  fine_topk_selector_use_coarse_logits: false
+  fine_topk_selector_use_candidate_delta: false
+  fine_topk_selector_use_depth: false
+  fine_topk_selector_use_mask: false
+  fine_topk_selector_require_projector: true

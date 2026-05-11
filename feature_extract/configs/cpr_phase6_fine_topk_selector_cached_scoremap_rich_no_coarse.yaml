@@ -1,0 +1,8 @@
+# Score-map fine selector with coarse-logit evidence disabled.
+# Use with uniform candidate pools where scorer rank is not trusted for fine reranking.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_phase6_fine_topk_selector_cached_scoremap_rich.yaml
+exp_name: cpr_phase6_fine_topk_selector_cached_scoremap_rich_no_coarse
+
+map_supervision:
+  fine_topk_selector_use_coarse_logits: false

@@ -1,0 +1,7 @@
+# Same as the K384 0.5m/10deg volume selector, but with batch size 2.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_phase6_fine_lattice_selector_050_k384_volume_soft_b1_fast.yaml
+exp_name: cpr_phase6_fine_lattice_selector_050_k384_volume_soft_b2_fast
+
+training:
+  batch_size: 2

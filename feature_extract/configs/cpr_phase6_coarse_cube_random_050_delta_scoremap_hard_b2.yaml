@@ -1,0 +1,10 @@
+# Batch-2 variant for the 0.5m/10deg scale-specific scorer; batch4 OOMs.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_phase6_coarse_cube_random_050_delta_scoremap_hard_b4.yaml
+exp_name: cpr_phase6_coarse_cube_random_050_delta_scoremap_hard_b2
+
+training:
+  batch_size: 2
+
+map_supervision:
+  candidate_render_batch_size: 16
