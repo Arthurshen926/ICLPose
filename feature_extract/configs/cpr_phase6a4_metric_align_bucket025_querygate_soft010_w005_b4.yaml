@@ -1,0 +1,7 @@
+# Lower candidate-weight version of the query-gate A4 test.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_phase6a4_metric_align_bucket025_querygate_soft010_w010_b4.yaml
+exp_name: cpr_phase6a4_metric_align_bucket025_querygate_soft010_w005_b4
+
+map_supervision:
+  candidate_render_score_weight: 0.05

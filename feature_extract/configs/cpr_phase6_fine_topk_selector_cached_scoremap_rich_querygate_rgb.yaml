@@ -1,0 +1,10 @@
+# A4 query-gate export/eval config with RGB difference statistics enabled.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_phase6_fine_topk_selector_cached_scoremap_rich_querygate.yaml
+exp_name: cpr_phase6_fine_topk_selector_cached_scoremap_rich_querygate_rgb
+
+model:
+  fine_candidate_selector_use_rgb_features: true
+
+map_supervision:
+  fine_topk_selector_use_rgb: true

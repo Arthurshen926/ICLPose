@@ -10,8 +10,10 @@ import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
 
 import feature_extract.train_impl as train_impl
+from feature_extract.tools import train_fine_selector_cache
 from feature_field.dcff.losses import infonce_contrastive_loss
 from feature_field.utils.feature_track_vis import error_to_heatmap_image
 from data.radio_loc_retrieval_dataset import save_retrieval_init_entries
@@ -117,6 +119,33 @@ def test_local_corr_domain_adapter_projects_query_and_render_with_separate_heads
     assert adapter.query_projector is not adapter.render_projector
     assert torch.allclose(query.norm(dim=1), torch.ones(2, 5, 6), atol=1e-5)
     assert torch.allclose(render.norm(dim=1), torch.ones(2, 5, 6), atol=1e-5)
+
+
+def test_radio_query_student_domain_adapter_zero_init_preserves_identity_projection():
+    model = RadioQueryStudent(
+        feature_dim=4,
+        fine_feature_dim=4,
+        coarse_feature_dim=4,
+        base_channels=8,
+        stage_dims=(8, 8, 8, 8),
+        output_hw=(4, 5),
+        coarse_output_hw=(2, 3),
+        input_hw=(32, 40),
+        local_corr_projector_enabled=True,
+        local_corr_projector_domain_adapter=True,
+        local_corr_projector_hidden_dim=8,
+        local_corr_projector_output_dim=4,
+        local_corr_projector_zero_init=True,
+        local_corr_projector_l2_normalize=True,
+    )
+    feat = torch.randn(2, 4, 5, 6)
+    expected = F.normalize(feat, dim=1)
+
+    query = model.local_corr_projector.project_query(feat)
+    render = model.local_corr_projector.project_render(feat)
+
+    assert torch.allclose(query, expected, atol=1e-6)
+    assert torch.allclose(render, expected, atol=1e-6)
 
 
 def test_export_model_builds_local_corr_domain_adapter_checkpoint():
@@ -2142,6 +2171,44 @@ def test_render_score_candidate_listwise_loss_supports_local_mode_and_mask_bank(
     assert candidates.grad is not None
 
 
+def test_render_score_candidate_listwise_loss_supports_soft_pose_targets():
+    query = torch.tensor([[[[1.0, 0.0]], [[0.0, 1.0]]]], requires_grad=True)
+    candidates = torch.tensor(
+        [[
+            [[[1.0, 0.0]], [[0.0, 1.0]]],
+            [[[0.8, 0.2]], [[0.2, 0.8]]],
+            [[[0.0, 1.0]], [[1.0, 0.0]]],
+        ]],
+        requires_grad=True,
+    )
+    candidate_pose = torch.stack([
+        torch.stack([
+            _pose_with_center([0.0, 0.0, 0.0]),
+            _pose_with_center([0.05, 0.0, 0.0]),
+            _pose_with_center([0.50, 0.0, 0.0]),
+        ])
+    ])
+    pose_gt = _pose_with_center([0.0, 0.0, 0.0]).unsqueeze(0)
+
+    loss, metrics = render_score_candidate_listwise_loss(
+        query,
+        candidates,
+        candidate_pose,
+        pose_gt,
+        mode="global",
+        temperature=0.1,
+        target_mode="gt_pose_error_soft",
+        target_temperature_m=0.10,
+    )
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert metrics["map_candidate_render_score_soft_target_entropy"].item() > 0.0
+    assert metrics["map_candidate_render_score_target_idx"].item() == 0.0
+    assert query.grad is not None
+    assert candidates.grad is not None
+
+
 def test_map_feature_renderer_attach_pose_candidate_renders_shapes():
     class FakeRenderer:
         device = torch.device("cpu")
@@ -3151,6 +3218,130 @@ def test_cached_fine_topk_selector_loss_trains_from_score_maps():
     assert selector.linear.weight.grad.abs().sum().item() > 0.0
 
 
+def test_cached_fine_selector_eval_can_shuffle_score_maps_for_ablation():
+    feature_dim = len(train_impl.FINE_CANDIDATE_SELECTOR_VECTOR_FEATURE_NAMES)
+    features = torch.zeros(1, 3, feature_dim)
+    valid = torch.tensor([[True, True, True]])
+    trans_err_m = torch.tensor([[0.02, 0.20, 0.30]])
+    rot_err_deg = torch.zeros_like(trans_err_m)
+    score_maps = torch.zeros(1, 3, 1, 2, 2)
+    score_maps[0, 0] = 3.0
+    score_maps[0, 1] = 1.0
+    score_maps[0, 2] = 0.0
+    loader = DataLoader(
+        TensorDataset(features, valid, trans_err_m, rot_err_deg, score_maps),
+        batch_size=1,
+    )
+
+    class ScoreMapOnlySelector(torch.nn.Module):
+        expects_score_map = True
+
+        def forward(self, maps, vector_features=None):
+            return maps.mean(dim=(2, 3, 4))
+
+    normal = train_fine_selector_cache._evaluate(
+        ScoreMapOnlySelector(),
+        loader,
+        torch.device("cpu"),
+        {"target_mode": "gt_pose_error_hard"},
+    )
+    shuffled = train_fine_selector_cache._evaluate(
+        ScoreMapOnlySelector(),
+        loader,
+        torch.device("cpu"),
+        {"target_mode": "gt_pose_error_hard"},
+        score_map_shuffle_seed=1,
+    )
+
+    assert normal["pred_trans_mm"] == pytest.approx(20.0)
+    assert shuffled["pred_trans_mm"] > normal["pred_trans_mm"]
+
+
+def test_cached_fine_selector_eval_reports_rank_diagnostics_and_priors():
+    names = train_impl.FINE_CANDIDATE_SELECTOR_VECTOR_FEATURE_NAMES
+    feature_dim = len(names)
+    features = torch.zeros(2, 4, feature_dim)
+    valid = torch.ones(2, 4, dtype=torch.bool)
+    trans_err_m = torch.tensor(
+        [
+            [0.30, 0.02, 0.40, 0.10],
+            [0.25, 0.35, 0.04, 0.20],
+        ]
+    )
+    rot_err_deg = torch.zeros_like(trans_err_m)
+    features[..., names.index("score_mean")] = -trans_err_m
+    features[..., names.index("delta_trans_m")] = torch.tensor(
+        [
+            [0.0, 0.3, 0.2, 0.1],
+            [0.0, 0.1, 0.4, 0.2],
+        ]
+    )
+    loader = DataLoader(TensorDataset(features, valid, trans_err_m, rot_err_deg), batch_size=2)
+
+    selector = CandidateScoreFusionHead(input_dim=feature_dim, hidden_dim=0, zero_init=True)
+    with torch.no_grad():
+        selector.linear.weight.zero_()
+        selector.linear.weight[0, names.index("score_mean")] = 1.0
+
+    report = train_fine_selector_cache._evaluate(
+        selector,
+        loader,
+        torch.device("cpu"),
+        {"target_mode": "gt_pose_error_hard"},
+    )
+
+    assert report["oracle_trans_mm"] == pytest.approx(30.0)
+    assert report["candidate0_trans_mm"] == pytest.approx(275.0)
+    assert report["score_mean_pred_trans_mm"] == pytest.approx(30.0)
+    assert report["score_mean_spearman"] > 0.99
+    assert report["score_mean_good_bad_auc"] > 0.99
+    assert report["delta_min_pred_trans_mm"] == pytest.approx(275.0)
+    assert report["selector_spearman"] > 0.99
+    assert report["selector_good_bad_auc"] > 0.99
+
+    zero_selector = CandidateScoreFusionHead(input_dim=feature_dim, hidden_dim=0, zero_init=True)
+    zero_report = train_fine_selector_cache._evaluate(
+        zero_selector,
+        loader,
+        torch.device("cpu"),
+        {"target_mode": "gt_pose_error_hard"},
+    )
+    assert abs(zero_report["selector_spearman"]) < 1e-6
+    assert zero_report["selector_good_bad_auc"] == pytest.approx(0.5)
+
+
+def test_cached_fine_selector_training_can_shuffle_candidate_rows_consistently():
+    features = torch.arange(2 * 4 * 3, dtype=torch.float32).reshape(2, 4, 3)
+    valid = torch.tensor([[True, True, True, False], [True, True, False, False]])
+    trans = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    rot = trans + 100.0
+    score_maps = torch.arange(2 * 4 * 1 * 2 * 2, dtype=torch.float32).reshape(2, 4, 1, 2, 2)
+
+    shuffled = train_fine_selector_cache._shuffle_candidate_batch(
+        features,
+        valid,
+        trans,
+        rot,
+        score_maps,
+        generator=torch.Generator().manual_seed(123),
+    )
+
+    out_features, out_valid, out_trans, out_rot, out_score_maps = shuffled
+    assert out_features.shape == features.shape
+    assert out_score_maps.shape == score_maps.shape
+    for batch_idx in range(features.shape[0]):
+        original_rows = {tuple(row.tolist()): idx for idx, row in enumerate(features[batch_idx])}
+        seen = []
+        for cand_idx, row in enumerate(out_features[batch_idx]):
+            source_idx = original_rows[tuple(row.tolist())]
+            seen.append(source_idx)
+            assert out_valid[batch_idx, cand_idx] == valid[batch_idx, source_idx]
+            assert out_trans[batch_idx, cand_idx] == trans[batch_idx, source_idx]
+            assert out_rot[batch_idx, cand_idx] == rot[batch_idx, source_idx]
+            torch.testing.assert_close(out_score_maps[batch_idx, cand_idx], score_maps[batch_idx, source_idx])
+        assert sorted(seen) == list(range(features.shape[1]))
+
+
 def test_fine_candidate_selector_feature_flags_can_remove_motion_prior():
     h, w = 3, 4
     query = torch.randn(1, 4, h, w)
@@ -3325,6 +3516,84 @@ def test_compute_map_supervision_uses_candidate_score_fusion_head_for_pose_latti
     assert calls and calls[0][0] == query.shape
     assert calls[0][1] == candidate_feat.shape
     assert metrics["map_candidate_score_fusion_acc"].item() == 1.0
+
+
+def test_candidate_render_score_can_train_projected_metric_space():
+    h, w = 4, 5
+    query = torch.randn(1, 6, h, w, requires_grad=True)
+    candidate_feat = torch.randn(1, 2, 6, h, w)
+    candidate_pose = torch.eye(4).view(1, 1, 4, 4).repeat(1, 2, 1, 1)
+    candidate_pose[0, 1, 0, 3] = -0.10
+    batch = {
+        "rendered_map_fine": torch.randn(1, 6, h, w),
+        "rendered_map_fine_raw": torch.randn(1, 6, h, w),
+        "rendered_map_coarse": torch.randn(1, 6, h, w),
+        "rendered_map_mask": torch.ones(1, 1, h, w),
+        "teacher_fine": torch.randn(1, 6, h, w),
+        "teacher_coarse": torch.randn(1, 6, h, w),
+        "rendered_map_candidate_fine": candidate_feat,
+        "rendered_map_candidate_mask": torch.ones(1, 2, 1, h, w),
+        "rendered_map_candidate_pose": candidate_pose,
+        "rendered_map_candidate_valid_mask": torch.ones(1, 2, dtype=torch.bool),
+        "pose_gt": torch.eye(4).view(1, 4, 4),
+    }
+    outputs = {
+        "fine": query,
+        "coarse": torch.randn(1, 6, h, w, requires_grad=True),
+    }
+    cfg = {
+        "loss": {"infonce_temperature": 0.07, "infonce_samples": 8},
+        "map_supervision": {
+            "enabled": True,
+            "query_fine_weight": 0.0,
+            "query_coarse_weight": 0.0,
+            "rendered_teacher_fine_weight": 0.0,
+            "rendered_teacher_coarse_weight": 0.0,
+            "local_corr_projector_enabled": True,
+            "candidate_render_score_weight": 1.0,
+            "candidate_render_score_feature": "fine",
+            "candidate_render_score_use_projector": True,
+            "coarse_start_epoch": 0,
+        },
+    }
+    calls = []
+
+    class OffsetProjector(torch.nn.Module):
+        def project_query(self, feat):
+            return feat + 10.0
+
+        def project_render(self, feat):
+            return feat + 20.0
+
+    original = train_impl.render_score_candidate_listwise_loss
+
+    def fake_render_score(query_feat, cand_feat, cand_pose, pose_gt, **kwargs):
+        calls.append((query_feat.detach().clone(), cand_feat.detach().clone(), kwargs))
+        zero = query_feat.sum() * 0.0 + cand_feat.sum() * 0.0
+        return zero + 1.0, {
+            "map_candidate_render_score_loss": zero + 1.0,
+            "map_candidate_render_score_acc": zero + 1.0,
+        }
+
+    try:
+        train_impl.render_score_candidate_listwise_loss = fake_render_score
+        loss, metrics = compute_map_supervision(
+            batch,
+            outputs,
+            cfg,
+            torch.device("cpu"),
+            epoch=0,
+            local_corr_projector=OffsetProjector(),
+        )
+    finally:
+        train_impl.render_score_candidate_listwise_loss = original
+
+    assert torch.isfinite(loss)
+    assert calls
+    torch.testing.assert_close(calls[0][0], query.detach() + 10.0)
+    torch.testing.assert_close(calls[0][1], candidate_feat.detach() + 20.0)
+    assert metrics["map_candidate_render_score_projector_used"].item() == 1.0
+
 
 def test_gather_candidate_bank_selects_arbitrary_topm_and_mask():
     values = torch.arange(2 * 4 * 3, dtype=torch.float32).reshape(2, 4, 3)
@@ -4023,6 +4292,59 @@ def test_map_supervision_reports_query_corr_skip_when_negatives_missing():
     assert metrics["map_query_corr_skipped_missing_negatives"].item() == 1.0
     assert metrics["map_query_corr_missing_rendered_map_fine_neg"].item() == 1.0
     assert metrics["map_query_corr_missing_rendered_map_flow_neg_to_gt"].item() == 1.0
+
+
+def test_map_supervision_can_regularize_projected_query_features():
+    h, w = 4, 5
+    query = torch.ones(1, 4, h, w, requires_grad=True)
+    batch = {
+        "rendered_map_fine": torch.randn(1, 4, h, w),
+        "rendered_map_fine_raw": torch.randn(1, 4, h, w),
+        "rendered_map_coarse": torch.randn(1, 4, 2, 3),
+        "rendered_map_mask": torch.ones(1, 1, h, w),
+        "teacher_fine": torch.randn(1, 4, h, w),
+        "teacher_coarse": torch.randn(1, 4, 2, 3),
+    }
+    outputs = {
+        "fine": query,
+        "coarse": torch.randn(1, 4, 2, 3, requires_grad=True),
+    }
+    cfg = {
+        "loss": {"infonce_temperature": 0.07, "infonce_samples": 8},
+        "map_supervision": {
+            "enabled": True,
+            "query_fine_weight": 0.0,
+            "query_coarse_weight": 0.0,
+            "local_corr_projector_enabled": True,
+            "query_projected_variance_weight": 0.5,
+            "query_projected_covariance_weight": 0.1,
+            "variance_target_std": 0.05,
+            "coarse_start_epoch": 0,
+        },
+    }
+
+    loss, metrics = compute_map_supervision(
+        batch,
+        outputs,
+        cfg,
+        torch.device("cpu"),
+        epoch=0,
+        local_corr_projector=torch.nn.Identity(),
+    )
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert metrics["map_query_projected_variance_loss"].item() > 0.0
+    assert "map_query_projected_covariance_loss" in metrics
+    assert query.grad is not None
+
+
+def test_local_correlation_feature_preprocess_supports_spatial_centering():
+    feat = torch.randn(2, 4, 3, 5)
+    centered = local_correlation_feature_preprocess(feat, mode="spatial_center")
+
+    assert centered.shape == feat.shape
+    assert torch.allclose(centered.mean(dim=(-2, -1)), torch.zeros(2, 4), atol=1e-6)
 
 
 def test_map_supervision_applies_query_corr_distribution_distillation():

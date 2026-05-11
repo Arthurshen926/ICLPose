@@ -1,0 +1,8 @@
+# Phase6-A control: same strong metric-alignment losses as the domain adapter,
+# but with the existing shared local-correlation projector.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_phase6a_metric_align_domainproj_anchor_b48.yaml
+exp_name: cpr_phase6a_metric_align_sharedproj_anchor_v2_b48
+
+model:
+  local_corr_projector_domain_adapter: false

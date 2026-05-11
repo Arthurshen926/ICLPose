@@ -1,0 +1,15 @@
+# Quick A2 diagnostic: same candidate-level pose-aware projector training as
+# w005_b4, but with small train/val subsets and a larger batch for fast
+# evidence before committing to a full run.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_phase6a2_metric_align_candidate_poseaware_sharedproj_w005_b4.yaml
+exp_name: cpr_phase6a2_metric_align_candidate_poseaware_sharedproj_w005_quick_b6
+
+dataset:
+  max_train_samples: 96
+  max_val_samples: 32
+
+training:
+  batch_size: 6
+  validation_batch_size: 2
+  max_steps: 160

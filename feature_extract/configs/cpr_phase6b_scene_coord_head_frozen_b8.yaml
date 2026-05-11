@@ -1,0 +1,68 @@
+# Phase6-B diagnostic: train only a query-side scene-coordinate head on the
+# frozen Phase5/A2 query-map stack.  This tests whether direct 3D geometry
+# evidence is more learnable than K64 feature-correlation sorting.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_baseline_v13.yaml
+exp_name: cpr_phase6b_scene_coord_head_frozen_b8
+
+model:
+  warmstart_strict: false
+  scene_coord_head: true
+  scene_coord_zero_init: true
+  scene_coord_detach_base: true
+  scene_coord_use_pixel_grid: true
+  scene_coord_global_context: true
+
+dataset:
+  max_train_samples: 192
+  max_val_samples: 32
+
+training:
+  batch_size: 8
+  validation_batch_size: 4
+  num_workers: 0
+  pin_memory: false
+  max_steps: 192
+  lr: 0.00001
+  log_every: 16
+  best_metric: map_query_scene_coord_err_cm
+  best_metric_mode: min
+  freeze_model_except_prefixes:
+    - "scene_coord_head."
+    - "scene_context_proj."
+  model_lr_scales:
+    scene_coord_head.: 30.0
+    scene_context_proj.: 30.0
+
+loss:
+  fine_l1_weight: 0.0
+  fine_cos_weight: 0.0
+  coarse_l1_weight: 0.0
+  coarse_cos_weight: 0.0
+
+map_supervision:
+  enabled: true
+  trainable: false
+  train_geometry: false
+  query_fine_weight: 0.0
+  query_coarse_weight: 0.0
+
+  scene_coord_center: [13.28, 9.93, 0.67]
+  scene_coord_scale: 32.0
+  query_scene_coord_weight: 12.0
+  query_scene_coord_huber_beta: 0.004
+  query_scene_coord_warp_weight: 0.0
+
+  perturb_render_negatives: false
+  query_corr_ce_weight: 0.0
+  query_corr_subpixel_weight: 0.0
+  query_corr_peak_margin_weight: 0.0
+  candidate_render_score_weight: 0.0
+  candidate_score_fusion_weight: 0.0
+  fine_topk_selector_weight: 0.0
+  candidate_refined_pose_weight: 0.0
+  feature_metric_pose_weight: 0.0
+  feature_metric_gradient_direction_weight: 0.0
+
+export:
+  fine_key: fine

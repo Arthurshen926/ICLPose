@@ -1,0 +1,13 @@
+# Quick A2 diagnostic with stronger candidate-level pose-aware supervision.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_phase6a2_metric_align_candidate_poseaware_sharedproj_w020_b4.yaml
+exp_name: cpr_phase6a2_metric_align_candidate_poseaware_sharedproj_w020_quick_b4
+
+dataset:
+  max_train_samples: 96
+  max_val_samples: 32
+
+training:
+  batch_size: 4
+  validation_batch_size: 2
+  max_steps: 160

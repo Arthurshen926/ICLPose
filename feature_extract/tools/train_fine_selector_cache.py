@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Train a vector-only fine candidate selector from exported compact evidence."""
+"""Train a fine candidate selector from exported compact evidence."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -14,6 +15,9 @@ from torch.utils.data import DataLoader, TensorDataset, random_split
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from feature_extract.train_impl import (  # noqa: E402
+    FINE_CANDIDATE_SELECTOR_DELTA_VECTOR_FEATURE_NAMES,
+    FINE_CANDIDATE_SELECTOR_RGB_FEATURE_NAMES,
+    FINE_CANDIDATE_SELECTOR_VECTOR_FEATURE_NAMES,
     TeacherFeatureStore,
     build_radio_query_student,
     fine_topk_selector_cached_listwise_loss,
@@ -57,6 +61,27 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Stop after this many validation reports without best-metric improvement; 0 disables early stopping.",
+    )
+    parser.add_argument(
+        "--diagnose-score-map-ablation",
+        action="store_true",
+        help="When score maps are present, also evaluate validation with candidate score maps shuffled.",
+    )
+    parser.add_argument(
+        "--score-map-shuffle-seed",
+        type=int,
+        default=973,
+        help="Seed used by --diagnose-score-map-ablation.",
+    )
+    parser.add_argument(
+        "--shuffle-candidates",
+        action="store_true",
+        help="Randomly permute candidate order within each training row every step.",
+    )
+    parser.add_argument(
+        "--eval-only",
+        action="store_true",
+        help="Only evaluate cached selector evidence and diagnostics; do not train or save checkpoints.",
     )
     return parser.parse_args()
 
@@ -117,6 +142,18 @@ def _zero_feature_columns(dataset: TensorDataset, indices):
     return TensorDataset(features, *dataset.tensors[1:])
 
 
+def _dataset_has_score_maps(dataset) -> bool:
+    base = getattr(dataset, "dataset", dataset)
+    return bool(hasattr(base, "tensors") and len(base.tensors) > 4)
+
+
+def _dataset_score_maps_shape(dataset):
+    base = getattr(dataset, "dataset", dataset)
+    if not hasattr(base, "tensors") or len(base.tensors) <= 4:
+        return None
+    return list(base.tensors[4].shape)
+
+
 def _mean_metric(items, key):
     if not items:
         return 0.0
@@ -124,23 +161,209 @@ def _mean_metric(items, key):
     return float(sum(vals) / max(len(vals), 1))
 
 
-def _evaluate(selector, loader, device, loss_kwargs):
+def _masked_first_valid(valid):
+    if valid.ndim != 2:
+        raise ValueError(f"valid must have shape B,K, got {tuple(valid.shape)}")
+    first = valid.float().argmax(dim=1)
+    if not valid.any(dim=1).all():
+        raise ValueError("each row must contain at least one valid candidate")
+    return first
+
+
+def _selected_trans_mm(trans_err_m, index):
+    row = torch.arange(trans_err_m.shape[0], device=trans_err_m.device)
+    return trans_err_m[row, index] * 1000.0
+
+
+def _masked_best_index(values, valid, *, largest=True):
+    masked_value = -1.0e6 if largest else 1.0e6
+    masked = values.masked_fill(~valid, masked_value)
+    return masked.argmax(dim=1) if largest else masked.argmin(dim=1)
+
+
+def _rank_vector(values, *, descending=True):
+    order = torch.argsort(values, descending=descending)
+    ranks = torch.empty_like(order, dtype=torch.float32)
+    ranks[order] = torch.arange(values.numel(), device=values.device, dtype=torch.float32)
+    return ranks
+
+
+def _masked_spearman(scores, pose_cost, valid):
+    rows = []
+    for row_idx in range(scores.shape[0]):
+        row_valid = valid[row_idx]
+        if int(row_valid.sum().item()) < 2:
+            continue
+        row_scores = scores[row_idx, row_valid]
+        row_targets = -pose_cost[row_idx, row_valid]
+        if (
+            float((row_scores.max() - row_scores.min()).detach().cpu().item()) <= 1e-8
+            or float((row_targets.max() - row_targets.min()).detach().cpu().item()) <= 1e-8
+        ):
+            rows.append(torch.zeros((), device=scores.device, dtype=torch.float32))
+            continue
+        score_rank = _rank_vector(row_scores, descending=True)
+        target_rank = _rank_vector(row_targets, descending=True)
+        score_centered = score_rank - score_rank.mean()
+        target_centered = target_rank - target_rank.mean()
+        denom = score_centered.norm() * target_centered.norm()
+        if float(denom.detach().cpu().item()) <= 0.0:
+            continue
+        rows.append((score_centered * target_centered).sum() / denom)
+    if not rows:
+        return torch.zeros((), device=scores.device, dtype=torch.float32)
+    return torch.stack(rows).mean()
+
+
+def _masked_good_bad_auc(scores, pose_cost, valid):
+    rows = []
+    for row_idx in range(scores.shape[0]):
+        row_valid = valid[row_idx]
+        valid_count = int(row_valid.sum().item())
+        if valid_count < 2:
+            continue
+        row_scores = scores[row_idx, row_valid]
+        row_cost = pose_cost[row_idx, row_valid]
+        cost_order = torch.argsort(row_cost, descending=False)
+        good_count = max(1, int(math.ceil(valid_count * 0.10)))
+        bad_start = min(valid_count - 1, max(good_count, int(math.floor(valid_count * 0.50))))
+        good_scores = row_scores[cost_order[:good_count]]
+        bad_scores = row_scores[cost_order[bad_start:]]
+        if bad_scores.numel() == 0:
+            continue
+        comparisons = good_scores[:, None] - bad_scores[None, :]
+        rows.append((comparisons.gt(0).float() + 0.5 * comparisons.eq(0).float()).mean())
+    if not rows:
+        return torch.zeros((), device=scores.device, dtype=torch.float32)
+    return torch.stack(rows).mean()
+
+
+def _cached_rank_diagnostics(features, valid, trans_err_m, rot_err_deg, selector_logits, *, rot_cost_weight=0.1):
+    pose_cost = trans_err_m + float(rot_cost_weight) * (rot_err_deg * (math.pi / 180.0))
+    pose_cost = pose_cost.masked_fill(~valid, 1.0e6)
+    oracle_idx = pose_cost.argmin(dim=1)
+    candidate0_idx = torch.zeros_like(oracle_idx)
+    candidate0_idx = torch.where(valid[:, 0], candidate0_idx, _masked_first_valid(valid))
+    diagnostics = {
+        "oracle_trans_mm": _selected_trans_mm(trans_err_m, oracle_idx).mean().detach(),
+        "candidate0_trans_mm": _selected_trans_mm(trans_err_m, candidate0_idx).mean().detach(),
+        "selector_spearman": _masked_spearman(selector_logits, pose_cost, valid).detach(),
+        "selector_good_bad_auc": _masked_good_bad_auc(selector_logits, pose_cost, valid).detach(),
+    }
+    feature_names = list(FINE_CANDIDATE_SELECTOR_VECTOR_FEATURE_NAMES)
+    if features.shape[-1] >= len(feature_names) + len(FINE_CANDIDATE_SELECTOR_RGB_FEATURE_NAMES):
+        feature_names.extend(FINE_CANDIDATE_SELECTOR_RGB_FEATURE_NAMES)
+    if features.shape[-1] >= len(feature_names) + len(FINE_CANDIDATE_SELECTOR_DELTA_VECTOR_FEATURE_NAMES):
+        feature_names.extend(FINE_CANDIDATE_SELECTOR_DELTA_VECTOR_FEATURE_NAMES)
+    baseline_columns = {
+        "score_mean": ("score_mean", True),
+        "score_max": ("score_max", True),
+        "score_topk_mean": ("score_topk_mean", True),
+        "score_peakiness": ("score_peakiness", True),
+        "coarse_logit": ("coarse_logit", True),
+        "coarse_rank_norm": ("coarse_rank_norm", True),
+        "rgb_l1_mean": ("rgb_l1_mean", False),
+        "rgb_l1_zscore": ("rgb_l1_zscore", True),
+        "rgb_valid_fraction": ("rgb_valid_fraction", True),
+    }
+    for metric_prefix, (feature_name, largest) in baseline_columns.items():
+        if feature_name not in feature_names:
+            continue
+        feature_idx = feature_names.index(feature_name)
+        if feature_idx >= features.shape[-1]:
+            continue
+        scores = features[:, :, feature_idx].to(device=trans_err_m.device, dtype=trans_err_m.dtype)
+        pred_idx = _masked_best_index(scores, valid, largest=largest)
+        rank_scores = scores if largest else -scores
+        diagnostics[f"{metric_prefix}_pred_trans_mm"] = _selected_trans_mm(trans_err_m, pred_idx).mean().detach()
+        diagnostics[f"{metric_prefix}_spearman"] = _masked_spearman(rank_scores, pose_cost, valid).detach()
+        diagnostics[f"{metric_prefix}_good_bad_auc"] = _masked_good_bad_auc(rank_scores, pose_cost, valid).detach()
+    if "delta_trans_m" in feature_names:
+        feature_idx = feature_names.index("delta_trans_m")
+        if feature_idx < features.shape[-1]:
+            delta_scores = -features[:, :, feature_idx].to(device=trans_err_m.device, dtype=trans_err_m.dtype)
+            pred_idx = _masked_best_index(delta_scores, valid, largest=True)
+            diagnostics["delta_min_pred_trans_mm"] = _selected_trans_mm(trans_err_m, pred_idx).mean().detach()
+            diagnostics["delta_min_spearman"] = _masked_spearman(delta_scores, pose_cost, valid).detach()
+            diagnostics["delta_min_good_bad_auc"] = _masked_good_bad_auc(delta_scores, pose_cost, valid).detach()
+    return diagnostics
+
+
+def _shuffle_score_maps_for_ablation(score_maps, *, seed: int, batch_index: int):
+    if score_maps is None:
+        return None
+    if score_maps.ndim < 2:
+        raise ValueError(f"score_maps must have at least B,K dimensions, got {tuple(score_maps.shape)}")
+    num_candidates = int(score_maps.shape[1])
+    if num_candidates <= 1:
+        return score_maps
+    generator = torch.Generator(device="cpu").manual_seed(int(seed) + int(batch_index))
+    perm = torch.randperm(num_candidates, generator=generator).to(device=score_maps.device)
+    return score_maps[:, perm]
+
+
+def _shuffle_candidate_batch(features, valid, trans_err_m, rot_err_deg, score_maps=None, *, generator=None):
+    if features.ndim != 3:
+        raise ValueError(f"features must have shape B,K,D, got {tuple(features.shape)}")
+    bsz, num_candidates = features.shape[:2]
+    if num_candidates <= 1:
+        return features, valid, trans_err_m, rot_err_deg, score_maps
+    perm_rows = [
+        torch.randperm(num_candidates, generator=generator).to(device=features.device)
+        for _ in range(bsz)
+    ]
+    perm = torch.stack(perm_rows, dim=0)
+
+    def gather_rows(values):
+        if values is None:
+            return None
+        view_shape = (bsz, num_candidates) + (1,) * (values.ndim - 2)
+        expand_shape = (bsz, num_candidates) + tuple(values.shape[2:])
+        return values.gather(1, perm.reshape(view_shape).expand(expand_shape))
+
+    return (
+        gather_rows(features),
+        gather_rows(valid),
+        gather_rows(trans_err_m),
+        gather_rows(rot_err_deg),
+        gather_rows(score_maps),
+    )
+
+
+def _evaluate(selector, loader, device, loss_kwargs, *, score_map_shuffle_seed=None):
     selector.eval()
     metrics = []
     total_loss = 0.0
     total_count = 0
     with torch.no_grad():
-        for batch in loader:
+        for batch_index, batch in enumerate(loader):
             features, valid, trans_err_m, rot_err_deg = [item.to(device) for item in batch[:4]]
             score_maps = batch[4].to(device) if len(batch) > 4 else None
-            loss, batch_metrics = fine_topk_selector_cached_listwise_loss(
+            if score_map_shuffle_seed is not None:
+                score_maps = _shuffle_score_maps_for_ablation(
+                    score_maps,
+                    seed=int(score_map_shuffle_seed),
+                    batch_index=batch_index,
+                )
+            loss, batch_metrics, details = fine_topk_selector_cached_listwise_loss(
                 features,
                 valid,
                 trans_err_m,
                 rot_err_deg,
                 selector,
                 score_maps=score_maps,
+                return_details=True,
                 **loss_kwargs,
+            )
+            batch_metrics.update(
+                _cached_rank_diagnostics(
+                    features,
+                    valid,
+                    trans_err_m,
+                    rot_err_deg,
+                    details["raw_logits"],
+                    rot_cost_weight=float(loss_kwargs.get("rot_cost_weight", 0.1)),
+                )
             )
             metrics.append(batch_metrics)
             total_loss += float(loss.detach().cpu().item()) * int(features.shape[0])
@@ -152,6 +375,40 @@ def _evaluate(selector, loader, device, loss_kwargs):
         "oracle_gap_mm": _mean_metric(metrics, "map_fine_topk_selector_oracle_gap_mm"),
         "acc": _mean_metric(metrics, "map_fine_topk_selector_acc"),
         "entropy": _mean_metric(metrics, "map_fine_topk_selector_entropy"),
+        "oracle_trans_mm": _mean_metric(metrics, "oracle_trans_mm"),
+        "candidate0_trans_mm": _mean_metric(metrics, "candidate0_trans_mm"),
+        "selector_spearman": _mean_metric(metrics, "selector_spearman"),
+        "selector_good_bad_auc": _mean_metric(metrics, "selector_good_bad_auc"),
+        "score_mean_pred_trans_mm": _mean_metric(metrics, "score_mean_pred_trans_mm"),
+        "score_mean_spearman": _mean_metric(metrics, "score_mean_spearman"),
+        "score_mean_good_bad_auc": _mean_metric(metrics, "score_mean_good_bad_auc"),
+        "score_max_pred_trans_mm": _mean_metric(metrics, "score_max_pred_trans_mm"),
+        "score_max_spearman": _mean_metric(metrics, "score_max_spearman"),
+        "score_max_good_bad_auc": _mean_metric(metrics, "score_max_good_bad_auc"),
+        "score_topk_mean_pred_trans_mm": _mean_metric(metrics, "score_topk_mean_pred_trans_mm"),
+        "score_topk_mean_spearman": _mean_metric(metrics, "score_topk_mean_spearman"),
+        "score_topk_mean_good_bad_auc": _mean_metric(metrics, "score_topk_mean_good_bad_auc"),
+        "score_peakiness_pred_trans_mm": _mean_metric(metrics, "score_peakiness_pred_trans_mm"),
+        "score_peakiness_spearman": _mean_metric(metrics, "score_peakiness_spearman"),
+        "score_peakiness_good_bad_auc": _mean_metric(metrics, "score_peakiness_good_bad_auc"),
+        "coarse_logit_pred_trans_mm": _mean_metric(metrics, "coarse_logit_pred_trans_mm"),
+        "coarse_logit_spearman": _mean_metric(metrics, "coarse_logit_spearman"),
+        "coarse_logit_good_bad_auc": _mean_metric(metrics, "coarse_logit_good_bad_auc"),
+        "coarse_rank_norm_pred_trans_mm": _mean_metric(metrics, "coarse_rank_norm_pred_trans_mm"),
+        "coarse_rank_norm_spearman": _mean_metric(metrics, "coarse_rank_norm_spearman"),
+        "coarse_rank_norm_good_bad_auc": _mean_metric(metrics, "coarse_rank_norm_good_bad_auc"),
+        "rgb_l1_mean_pred_trans_mm": _mean_metric(metrics, "rgb_l1_mean_pred_trans_mm"),
+        "rgb_l1_mean_spearman": _mean_metric(metrics, "rgb_l1_mean_spearman"),
+        "rgb_l1_mean_good_bad_auc": _mean_metric(metrics, "rgb_l1_mean_good_bad_auc"),
+        "rgb_l1_zscore_pred_trans_mm": _mean_metric(metrics, "rgb_l1_zscore_pred_trans_mm"),
+        "rgb_l1_zscore_spearman": _mean_metric(metrics, "rgb_l1_zscore_spearman"),
+        "rgb_l1_zscore_good_bad_auc": _mean_metric(metrics, "rgb_l1_zscore_good_bad_auc"),
+        "rgb_valid_fraction_pred_trans_mm": _mean_metric(metrics, "rgb_valid_fraction_pred_trans_mm"),
+        "rgb_valid_fraction_spearman": _mean_metric(metrics, "rgb_valid_fraction_spearman"),
+        "rgb_valid_fraction_good_bad_auc": _mean_metric(metrics, "rgb_valid_fraction_good_bad_auc"),
+        "delta_min_pred_trans_mm": _mean_metric(metrics, "delta_min_pred_trans_mm"),
+        "delta_min_spearman": _mean_metric(metrics, "delta_min_spearman"),
+        "delta_min_good_bad_auc": _mean_metric(metrics, "delta_min_good_bad_auc"),
     }
 
 
@@ -197,6 +454,16 @@ def main() -> None:
         raise RuntimeError("config must enable model.fine_candidate_selector_head")
     if bool(getattr(selector, "expects_score_map", False)) and len(dataset.tensors) <= 4:
         raise RuntimeError("score-map fine selector training requires cache['score_maps']")
+    selector_info = {
+        "selector_class": selector.__class__.__name__,
+        "expects_score_map": bool(getattr(selector, "expects_score_map", False)),
+        "train_has_score_maps": len(dataset.tensors) > 4,
+        "train_score_maps_shape": None if len(dataset.tensors) <= 4 else list(dataset.tensors[4].shape),
+        "val_has_score_maps": None if val_dataset is None else len(val_dataset.tensors) > 4,
+        "val_score_maps_shape": None
+        if val_dataset is None or len(val_dataset.tensors) <= 4
+        else list(val_dataset.tensors[4].shape),
+    }
 
     for param in model.parameters():
         param.requires_grad_(False)
@@ -222,6 +489,9 @@ def main() -> None:
         if val_set is None
         else DataLoader(val_set, batch_size=int(args.batch_size), shuffle=False, drop_last=False)
     )
+    selector_info["val_has_score_maps"] = None if val_set is None else _dataset_has_score_maps(val_set)
+    selector_info["val_score_maps_shape"] = None if val_set is None else _dataset_score_maps_shape(val_set)
+    print(json.dumps({"selector_info": selector_info}, sort_keys=True))
 
     loss_kwargs = {
         "rot_cost_weight": float(
@@ -258,6 +528,26 @@ def main() -> None:
         "basin_trans_m": float(map_cfg.get("fine_topk_selector_basin_trans_m", 0.25)),
         "basin_rot_deg": float(map_cfg.get("fine_topk_selector_basin_rot_deg", 5.0)),
     }
+    if bool(args.eval_only):
+        eval_set = val_set if val_set is not None else train_set
+        eval_loader = DataLoader(eval_set, batch_size=int(args.batch_size), shuffle=False, drop_last=False)
+        eval_report = _evaluate(selector, eval_loader, device, loss_kwargs)
+        report = {"eval": eval_report, "selector_info": selector_info}
+        if (
+            bool(args.diagnose_score_map_ablation)
+            and bool(getattr(selector, "expects_score_map", False))
+            and _dataset_has_score_maps(eval_set)
+        ):
+            report["score_map_shuffle_eval"] = _evaluate(
+                selector,
+                eval_loader,
+                device,
+                loss_kwargs,
+                score_map_shuffle_seed=int(args.score_map_shuffle_seed),
+            )
+        print(json.dumps(report, sort_keys=True))
+        return
+
     optimizer = torch.optim.AdamW(selector.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
     out_dir = Path(args.out_dir or Path(cfg.get("output_dir", "result/feature_extract")) / cfg.get("exp_name", "fine_selector_cache"))
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -277,6 +567,15 @@ def main() -> None:
             batch = next(train_iter)
         features_b, valid_b, trans_b, rot_b = [item.to(device) for item in batch[:4]]
         score_maps_b = batch[4].to(device) if len(batch) > 4 else None
+        if bool(args.shuffle_candidates):
+            features_b, valid_b, trans_b, rot_b, score_maps_b = _shuffle_candidate_batch(
+                features_b,
+                valid_b,
+                trans_b,
+                rot_b,
+                score_maps_b,
+                generator=generator,
+            )
         optimizer.zero_grad(set_to_none=True)
         loss, metrics = fine_topk_selector_cached_listwise_loss(
             features_b,
@@ -301,6 +600,24 @@ def main() -> None:
             if val_loader is not None:
                 val_report = _evaluate(selector, val_loader, device, loss_kwargs)
                 report.update({f"val_{key}": value for key, value in val_report.items()})
+                if (
+                    bool(args.diagnose_score_map_ablation)
+                    and bool(getattr(selector, "expects_score_map", False))
+                    and _dataset_has_score_maps(val_set)
+                ):
+                    shuffled_val_report = _evaluate(
+                        selector,
+                        val_loader,
+                        device,
+                        loss_kwargs,
+                        score_map_shuffle_seed=int(args.score_map_shuffle_seed),
+                    )
+                    report.update(
+                        {
+                            f"val_score_map_shuffle_{key}": value
+                            for key, value in shuffled_val_report.items()
+                        }
+                    )
                 metric = float(val_report["pred_trans_mm"])
             else:
                 metric = float(report["train_pred_trans_mm"])
@@ -366,6 +683,8 @@ def main() -> None:
                 "best_val": best_metric,
                 "best_step": best_step,
                 "loss_kwargs": loss_kwargs,
+                "selector_info": selector_info,
+                "diagnose_score_map_ablation": bool(args.diagnose_score_map_ablation),
                 "zero_feature_indices": zero_feature_indices,
             },
             f,

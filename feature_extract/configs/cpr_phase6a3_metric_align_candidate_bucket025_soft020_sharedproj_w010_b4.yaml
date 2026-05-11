@@ -1,0 +1,8 @@
+# Softer A3 target.  This tests whether the metric needs a wider basin-shaped
+# energy rather than a sharp near-oracle candidate target.
+
+base_config: /root/ICLPose/feature_extract/configs/cpr_phase6a3_metric_align_candidate_bucket025_soft010_sharedproj_w010_b4.yaml
+exp_name: cpr_phase6a3_metric_align_candidate_bucket025_soft020_sharedproj_w010_b4
+
+map_supervision:
+  candidate_render_score_target_temperature_m: 0.20

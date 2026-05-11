@@ -1419,6 +1419,25 @@ class RadioQueryStudent(nn.Module):
             nn.init.zeros_(self.local_corr_projector.refine[-1].weight)
             if self.local_corr_projector.refine[-1].bias is not None:
                 nn.init.zeros_(self.local_corr_projector.refine[-1].bias)
+        if self.local_corr_projector is not None and hasattr(self.local_corr_projector, "query_projector"):
+            query_zero = (
+                bool(local_corr_query_projector_zero_init)
+                if local_corr_query_projector_zero_init is not None
+                else bool(local_corr_projector_zero_init)
+            )
+            render_zero = (
+                bool(local_corr_render_projector_zero_init)
+                if local_corr_render_projector_zero_init is not None
+                else bool(local_corr_projector_zero_init)
+            )
+            if query_zero:
+                nn.init.zeros_(self.local_corr_projector.query_projector.refine[-1].weight)
+                if self.local_corr_projector.query_projector.refine[-1].bias is not None:
+                    nn.init.zeros_(self.local_corr_projector.query_projector.refine[-1].bias)
+            if render_zero:
+                nn.init.zeros_(self.local_corr_projector.render_projector.refine[-1].weight)
+                if self.local_corr_projector.render_projector.refine[-1].bias is not None:
+                    nn.init.zeros_(self.local_corr_projector.render_projector.refine[-1].bias)
         if self.query_channel_gate is not None and self.query_channel_gate_zero_init:
             nn.init.zeros_(self.query_channel_gate.net[-1].weight)
             nn.init.zeros_(self.query_channel_gate.net[-1].bias)

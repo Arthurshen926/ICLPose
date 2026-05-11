@@ -278,7 +278,9 @@ DEFAULT_CONFIG = {
         "seed": 42,
         "epochs": 8,
         "batch_size": 2,
+        "validation_batch_size": None,
         "num_workers": 2,
+        "pin_memory": None,
         "lr": 3e-4,
         "weight_decay": 1e-5,
         "grad_clip": 1.0,
@@ -367,6 +369,11 @@ DEFAULT_CONFIG = {
         "candidate_render_score_preprocess": "none",
         "candidate_render_score_highpass_kernel": 5,
         "candidate_render_score_rot_cost_weight": 0.1,
+        "candidate_render_score_target_mode": "hard",
+        "candidate_render_score_target_temperature_m": 0.05,
+        "candidate_render_score_use_projector": False,
+        "candidate_render_score_require_projector": False,
+        "candidate_render_score_projector_chunk_size": 0,
         "candidate_render_score_max_candidates": 0,
         "candidate_render_include_aux": True,
         "candidate_render_batch_size": 0,
@@ -574,6 +581,8 @@ DEFAULT_CONFIG = {
         "teacher_corr_local_patch_margin_weight": 0.0,
         "teacher_corr_local_patch_margin": 0.05,
         "query_projected_fine_weight": 0.0,
+        "query_projected_variance_weight": 0.0,
+        "query_projected_covariance_weight": 0.0,
         "local_corr_projector_apply_to_query": True,
         "query_flow_warp_weight": 0.0,
         "query_flow_warp_contrastive_weight": 0.0,
@@ -3121,6 +3130,8 @@ def render_score_candidate_listwise_loss(
     preprocess="none",
     highpass_kernel=5,
     rot_cost_weight=0.1,
+    target_mode="hard",
+    target_temperature_m=0.05,
 ):
     """Train query/map features to score the nearest rendered pose candidate highest."""
     if query_feat.ndim != 4:
@@ -3187,7 +3198,18 @@ def render_score_candidate_listwise_loss(
     cost_for_target = cost.masked_fill(~valid, float("inf"))
     target_idx = cost_for_target.argmin(dim=1)
     logits = scores.masked_fill(~valid, -1.0e6) / max(float(temperature), 1e-6)
-    loss = F.cross_entropy(logits, target_idx)
+    target_mode_key = str(target_mode or "hard").lower()
+    soft_target_entropy = torch.zeros((), device=scores.device, dtype=scores.dtype)
+    if target_mode_key in ("hard", "argmin", "ce", "gt_pose_error_hard", "pose_error_hard"):
+        loss = F.cross_entropy(logits, target_idx)
+    elif target_mode_key in ("soft", "soft_pose", "pose_softmax", "gt_pose_error_soft", "pose_error_soft"):
+        target_logits = (-cost_for_target / max(float(target_temperature_m), 1e-6)).masked_fill(~valid, -1.0e6)
+        target_probs = F.softmax(target_logits, dim=1).detach()
+        log_probs = F.log_softmax(logits, dim=1)
+        loss = -(target_probs * log_probs).sum(dim=1).mean()
+        soft_target_entropy = -(target_probs * torch.log(target_probs.clamp(min=1e-8))).sum(dim=1).mean()
+    else:
+        raise ValueError("candidate_render_score target_mode must be 'hard' or 'gt_pose_error_soft'")
     pred_idx = logits.argmax(dim=1)
     batch_idx = torch.arange(bsz, device=scores.device)
     target_scores = scores[batch_idx, target_idx]
@@ -3208,6 +3230,7 @@ def render_score_candidate_listwise_loss(
         "map_candidate_render_score_pred_trans_mm": (trans_err_m[batch_idx, pred_idx] * 1000.0).mean().detach(),
         "map_candidate_render_score_pred_rot_deg": rot_err_deg[batch_idx, pred_idx].mean().detach(),
         "map_candidate_render_score_num_candidates": torch.tensor(float(num_candidates), device=scores.device),
+        "map_candidate_render_score_soft_target_entropy": soft_target_entropy.detach(),
     }
     return loss, metrics
 
@@ -6075,6 +6098,11 @@ def local_correlation_feature_preprocess(
     mode = str(mode or "none").lower()
     if mode in {"none", "identity", "raw"}:
         return feat
+    if mode in {"spatial_center", "center", "channel_center"}:
+        return feat - feat.mean(dim=(-2, -1), keepdim=True)
+    if mode in {"spatial_zscore", "zscore", "channel_zscore"}:
+        centered = feat - feat.mean(dim=(-2, -1), keepdim=True)
+        return centered / centered.std(dim=(-2, -1), keepdim=True).clamp(min=1e-6)
     kernel = int(highpass_kernel)
     if kernel <= 1:
         high = torch.zeros_like(feat)
@@ -6099,7 +6127,8 @@ def local_correlation_feature_preprocess(
         return torch.cat([feat, high], dim=1)
     raise ValueError(
         "local correlation feature preprocess must be one of "
-        "{'none', 'highpass', 'residual_highpass', 'concat_highpass'}, "
+        "{'none', 'spatial_center', 'spatial_zscore', 'highpass', "
+        "'residual_highpass', 'concat_highpass'}, "
         f"got {mode!r}"
     )
 
@@ -8268,6 +8297,13 @@ def compute_map_supervision(
     candidate_render_score_preprocess = str(map_cfg.get("candidate_render_score_preprocess", "none"))
     candidate_render_score_highpass_kernel = int(map_cfg.get("candidate_render_score_highpass_kernel", 5))
     candidate_render_score_rot_cost_weight = float(map_cfg.get("candidate_render_score_rot_cost_weight", 0.1))
+    candidate_render_score_use_projector = bool(map_cfg.get("candidate_render_score_use_projector", False))
+    candidate_render_score_require_projector = bool(
+        map_cfg.get("candidate_render_score_require_projector", False)
+    )
+    candidate_render_score_projector_chunk_size = int(
+        map_cfg.get("candidate_render_score_projector_chunk_size", 0) or 0
+    )
     candidate_score_fusion_weight = resolve_linear_weight(map_cfg, "candidate_score_fusion_weight", epoch)
     candidate_score_fusion_feature = str(
         map_cfg.get("candidate_score_fusion_feature", candidate_render_score_feature)
@@ -8558,6 +8594,16 @@ def compute_map_supervision(
         "query_projected_fine_weight",
         epoch,
     )
+    query_projected_variance_weight = resolve_linear_weight(
+        map_cfg,
+        "query_projected_variance_weight",
+        epoch,
+    )
+    query_projected_covariance_weight = resolve_linear_weight(
+        map_cfg,
+        "query_projected_covariance_weight",
+        epoch,
+    )
     query_corr_distill_temperature = float(
         map_cfg.get("query_corr_distill_temperature")
         if map_cfg.get("query_corr_distill_temperature") is not None
@@ -8827,6 +8873,15 @@ def compute_map_supervision(
         if candidate_feat is not None and candidate_pose is not None and pose_gt_for_candidates is not None:
             candidate_feat = _resize_feature_bank(candidate_feat, query_candidate_feat.shape[-2:])
             candidate_mask = _resize_mask_bank(candidate_mask, query_candidate_feat.shape[-2:])
+            projector_used = False
+            if candidate_render_score_use_projector:
+                query_candidate_feat, candidate_feat, projector_used = project_query_render_for_fine_selector(
+                    query_local_corr_projector,
+                    query_candidate_feat,
+                    candidate_feat,
+                    require_projector=candidate_render_score_require_projector,
+                    render_chunk_size=candidate_render_score_projector_chunk_size,
+                )
             candidate_render_score_loss, candidate_render_score_metrics = render_score_candidate_listwise_loss(
                 query_candidate_feat,
                 candidate_feat,
@@ -8840,11 +8895,18 @@ def compute_map_supervision(
                 preprocess=candidate_render_score_preprocess,
                 highpass_kernel=candidate_render_score_highpass_kernel,
                 rot_cost_weight=candidate_render_score_rot_cost_weight,
+                target_mode=map_cfg.get("candidate_render_score_target_mode", "hard"),
+                target_temperature_m=float(map_cfg.get("candidate_render_score_target_temperature_m", 0.05)),
+            )
+            candidate_render_score_metrics["map_candidate_render_score_projector_used"] = torch.tensor(
+                1.0 if projector_used else 0.0,
+                device=device,
             )
         else:
             candidate_render_score_metrics = {
                 "map_candidate_render_score_loss": zero.detach(),
                 "map_candidate_render_score_acc": zero.detach(),
+                "map_candidate_render_score_projector_used": zero.detach(),
             }
     candidate_score_fusion_loss = zero
     candidate_score_fusion_metrics = {}
@@ -9285,6 +9347,10 @@ def compute_map_supervision(
         ) * rendered_teacher_coarse_grad_weight
     query_projected_fine_loss = zero
     query_projected_fine_cos = zero
+    query_projected_variance_loss = zero
+    query_projected_covariance_loss = zero
+    projected_query_for_regularization = None
+    projected_mask_for_regularization = None
     if query_projected_fine_weight > 0:
         if query_local_corr_projector is None:
             raise KeyError(
@@ -9292,9 +9358,11 @@ def compute_map_supervision(
                 "map_supervision.local_corr_projector_enabled=true"
             )
         projected_query = _project_corr_feature(pred_local_fine_target, is_query=True)
+        projected_query_for_regularization = projected_query
         projected_map = _project_corr_feature(rendered_fine).detach()
         projected_map_query = _resize_feature(projected_map, projected_query.shape[-2:])
         projected_mask = _resize_mask(mask, projected_query.shape[-2:])
+        projected_mask_for_regularization = projected_mask
         query_projected_fine_loss = (
             l1_feature_loss(projected_query, projected_map_query, projected_mask)
             + cosine_loss(projected_query, projected_map_query, projected_mask)
@@ -9304,6 +9372,26 @@ def compute_map_supervision(
                 projected_query,
                 projected_map_query,
                 projected_mask,
+            )
+    if query_projected_variance_weight > 0 or query_projected_covariance_weight > 0:
+        if query_local_corr_projector is None:
+            raise KeyError(
+                "map_supervision.query_projected_{variance,covariance}_weight > 0 requires "
+                "map_supervision.local_corr_projector_enabled=true"
+            )
+        if projected_query_for_regularization is None:
+            projected_query_for_regularization = _project_corr_feature(pred_local_fine_target, is_query=True)
+            projected_mask_for_regularization = _resize_mask(mask, projected_query_for_regularization.shape[-2:])
+        if query_projected_variance_weight > 0:
+            query_projected_variance_loss = feature_variance_loss(
+                projected_query_for_regularization,
+                projected_mask_for_regularization,
+                variance_target_std,
+            )
+        if query_projected_covariance_weight > 0:
+            query_projected_covariance_loss = feature_covariance_loss(
+                projected_query_for_regularization,
+                projected_mask_for_regularization,
             )
     map_fine_coarse_ortho_loss = feature_orthogonality_loss(rendered_fine, rendered_coarse, mask) * fine_coarse_ortho_weight
 
@@ -10329,6 +10417,8 @@ def compute_map_supervision(
         + rendered_teacher_fine_grad_loss
         + rendered_teacher_coarse_grad_loss
         + query_projected_fine_weight * query_projected_fine_loss
+        + query_projected_variance_weight * query_projected_variance_loss
+        + query_projected_covariance_weight * query_projected_covariance_loss
         + map_fine_coarse_ortho_loss
         + variance_weight_query * query_variance_loss
         + variance_weight_map * map_variance_loss
@@ -10426,6 +10516,8 @@ def compute_map_supervision(
         "map_rendered_teacher_fine_grad_loss": rendered_teacher_fine_grad_loss.detach(),
         "map_rendered_teacher_coarse_grad_loss": rendered_teacher_coarse_grad_loss.detach(),
         "map_query_projected_fine_loss": query_projected_fine_loss.detach(),
+        "map_query_projected_variance_loss": query_projected_variance_loss.detach(),
+        "map_query_projected_covariance_loss": query_projected_covariance_loss.detach(),
         "map_fine_coarse_ortho_loss": map_fine_coarse_ortho_loss.detach(),
         "map_query_variance_loss": query_variance_loss.detach(),
         "map_variance_loss": map_variance_loss.detach(),
@@ -10525,6 +10617,14 @@ def compute_map_supervision(
             rendered_teacher_coarse_grad_weight, device=device
         ),
         "map_query_projected_fine_weight": torch.tensor(query_projected_fine_weight, device=device),
+        "map_query_projected_variance_weight": torch.tensor(
+            query_projected_variance_weight,
+            device=device,
+        ),
+        "map_query_projected_covariance_weight": torch.tensor(
+            query_projected_covariance_weight,
+            device=device,
+        ),
         "map_fine_coarse_ortho_weight": torch.tensor(fine_coarse_ortho_weight, device=device),
         "map_query_variance_weight": torch.tensor(variance_weight_query, device=device),
         "map_variance_weight": torch.tensor(variance_weight_map, device=device),
@@ -11284,14 +11384,22 @@ def main():
         batch_size=int(cfg["training"]["batch_size"]),
         shuffle=True,
         num_workers=int(cfg["training"]["num_workers"]),
-        pin_memory=device.type == "cuda",
+        pin_memory=(
+            bool(cfg["training"].get("pin_memory"))
+            if cfg["training"].get("pin_memory") is not None
+            else device.type == "cuda"
+        ),
     )
     val_loader = DataLoader(
         val_dataset,
-        batch_size=int(cfg["training"]["batch_size"]),
+        batch_size=int(cfg["training"].get("validation_batch_size") or cfg["training"]["batch_size"]),
         shuffle=False,
         num_workers=int(cfg["training"]["num_workers"]),
-        pin_memory=device.type == "cuda",
+        pin_memory=(
+            bool(cfg["training"].get("pin_memory"))
+            if cfg["training"].get("pin_memory") is not None
+            else device.type == "cuda"
+        ),
     )
 
     model = build_radio_query_student(
