@@ -1,0 +1,1005 @@
+import sys
+from pathlib import Path
+
+import torch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from feature_extract.tools.train_nvs_pose_feature_adapter import (
+    apply_config_defaults,
+    apply_pose_energy_residual_update,
+    build_nvs_candidate_bank,
+    candidate_correction_cosines,
+    candidate_identity_mask,
+    collect_trainable_parameters,
+    pose_energy_factorized_selection_metrics,
+    local_flow_nce_loss,
+    local_zero_offset_scores_from_corr,
+    local_zero_offset_correlation_scores,
+    masked_dense_alignment_loss,
+    masked_dense_cosine,
+    load_adapter_checkpoint,
+    nvs_pose_energy_vector_dim,
+    parse_args as parse_nvs_pose_feature_adapter_args,
+    pose_energy_correction_cosine_soft_label_loss,
+    score_anti_identity_loss,
+    score_pose_improvement_soft_label_loss,
+    pose_energy_direction_pairwise_loss,
+    pose_energy_score_monotonicity_loss,
+    project_world_positions_to_feature_grid,
+    rank_losses_from_scores,
+    save_checkpoint,
+    variance_floor_loss,
+    warped_candidate_alignment_loss,
+)
+from feature_extract.tools.train_pose_energy import load_pose_energy_checkpoint
+from feature_extract.tools.eval_pose_energy_buckets import build_candidate_bank as build_eval_pose_energy_candidate_bank
+from feature_extract.students.pose_energy_net import PoseEnergyNet, PoseFeatureDomainAdapter
+
+
+def _w2c_pose_from_center_and_yaw(center, yaw_deg):
+    yaw = torch.tensor(float(yaw_deg) * torch.pi / 180.0)
+    cos_y = torch.cos(yaw)
+    sin_y = torch.sin(yaw)
+    pose = torch.eye(4)
+    pose[:3, :3] = torch.tensor(
+        [
+            [cos_y, -sin_y, 0.0],
+            [sin_y, cos_y, 0.0],
+            [0.0, 0.0, 1.0],
+        ]
+    )
+    center_t = torch.tensor(center, dtype=torch.float32)
+    pose[:3, 3] = -(pose[:3, :3] @ center_t)
+    return pose
+
+
+def test_pose_energy_factorized_selection_metrics_reports_composed_pose_cost():
+    pose_gt = _w2c_pose_from_center_and_yaw([1.0, 0.0, 0.0], 30.0).view(1, 4, 4)
+    candidate_pose = torch.stack(
+        [
+            _w2c_pose_from_center_and_yaw([1.0, 0.0, 0.0], 0.0),
+            _w2c_pose_from_center_and_yaw([0.0, 0.0, 0.0], 30.0),
+            _w2c_pose_from_center_and_yaw([0.0, 0.0, 0.0], 0.0),
+        ],
+        dim=0,
+    ).view(1, 3, 4, 4)
+    outputs = {
+        "energy_logits": torch.zeros(1, 3),
+        "translation_energy_logits": torch.tensor([[3.0, 1.0, 0.0]]),
+        "rotation_energy_logits": torch.tensor([[0.0, 4.0, 1.0]]),
+    }
+
+    metrics = pose_energy_factorized_selection_metrics(
+        outputs,
+        candidate_pose,
+        pose_gt,
+        rot_cost_weight=1.0,
+    )
+
+    assert int(metrics["factorized_translation_idx"][0]) == 0
+    assert int(metrics["factorized_rotation_idx"][0]) == 1
+    assert metrics["factorized_translation_top1_acc"].item() == 1.0
+    assert metrics["factorized_rotation_top1_acc"].item() == 1.0
+    assert metrics["factorized_pred_cost_m"].item() < 1.0e-3
+
+
+def test_masked_dense_cosine_prefers_matching_candidate():
+    query = torch.zeros(1, 2, 3, 3)
+    query[:, 0] = 1.0
+    render = torch.zeros(1, 2, 2, 3, 3)
+    render[:, 0, 0] = 1.0
+    render[:, 1, 1] = 1.0
+
+    scores = masked_dense_cosine(query, render)
+
+    assert scores.shape == (1, 2)
+    assert scores[0, 0] > scores[0, 1]
+
+
+def test_alignment_loss_is_lower_for_identical_features():
+    query = torch.randn(2, 4, 5, 5)
+    same_loss, same_cos = masked_dense_alignment_loss(query, query)
+    diff_loss, diff_cos = masked_dense_alignment_loss(query, -query)
+
+    assert same_loss < diff_loss
+    assert same_cos > diff_cos
+
+
+def test_rank_losses_pick_lowest_pose_cost_when_score_matches():
+    scores = torch.tensor([[0.1, 0.8, 0.2]])
+    pose_cost = torch.tensor([[0.3, 0.05, 0.2]])
+    valid = torch.ones_like(scores, dtype=torch.bool)
+
+    losses = rank_losses_from_scores(
+        scores,
+        pose_cost,
+        valid,
+        temperature_m=0.1,
+        pairwise_weight=1.0,
+        pairwise_min_gap_m=0.05,
+        pairwise_logit_margin=0.1,
+    )
+
+    assert int(losses["pred_index"][0]) == 1
+    assert int(losses["target_index"][0]) == 1
+    assert float(losses["top1_acc"]) == 1.0
+
+
+def test_pose_energy_score_monotonicity_loss_rewards_higher_updated_score():
+    before = torch.tensor([1.0, 1.0])
+    good_after = torch.tensor([1.3, 1.4])
+    bad_after = torch.tensor([0.8, 0.7])
+    before_cost = torch.tensor([0.30, 0.20])
+    after_cost = torch.tensor([0.10, 0.25])
+
+    good = pose_energy_score_monotonicity_loss(
+        before,
+        good_after,
+        before_cost=before_cost,
+        after_cost=after_cost,
+        margin=0.05,
+        improved_only=True,
+    )
+    bad = pose_energy_score_monotonicity_loss(
+        before,
+        bad_after,
+        before_cost=before_cost,
+        after_cost=after_cost,
+        margin=0.05,
+        improved_only=True,
+    )
+
+    assert good["active"].item() == 0.5
+    assert good["loss"] < bad["loss"]
+    assert good["score_gain"].item() > 0.0
+
+
+def test_pose_energy_direction_pairwise_loss_penalizes_wrong_direction():
+    init_pose = torch.eye(4).view(1, 4, 4)
+    pose_gt = init_pose.clone()
+    pose_gt[:, 0, 3] = -0.10
+    candidate_pose = init_pose[:, None].repeat(1, 3, 1, 1)
+    candidate_pose[:, 0, 0, 3] = -0.10
+    candidate_pose[:, 1, 0, 3] = 0.10
+    candidate_pose[:, 2, 1, 3] = 0.10
+    target_index = torch.tensor([0])
+
+    bad_logits = torch.tensor([[0.0, 2.0, 1.0]])
+    good_logits = torch.tensor([[2.0, 0.0, 0.0]])
+
+    bad = pose_energy_direction_pairwise_loss(
+        bad_logits,
+        candidate_pose,
+        init_pose,
+        pose_gt,
+        target_index,
+        min_cos_gap=0.25,
+        logit_margin=0.5,
+    )
+    good = pose_energy_direction_pairwise_loss(
+        good_logits,
+        candidate_pose,
+        init_pose,
+        pose_gt,
+        target_index,
+        min_cos_gap=0.25,
+        logit_margin=0.5,
+    )
+
+    assert bad["active"].item() > 0.0
+    assert bad["loss"] > good["loss"]
+    assert bad["pred_cos"] < good["pred_cos"]
+
+
+def test_pose_energy_correction_cosine_soft_label_loss_prefers_positive_correction_direction():
+    correction_cos = torch.tensor([[0.95, -0.95, 0.05]])
+    valid = torch.ones_like(correction_cos, dtype=torch.bool)
+    bad_logits = torch.tensor([[0.0, 3.0, 1.0]])
+    good_logits = torch.tensor([[3.0, 0.0, 1.0]])
+
+    bad = pose_energy_correction_cosine_soft_label_loss(
+        bad_logits,
+        correction_cos,
+        valid_mask=valid,
+        target_temperature=0.1,
+        min_cos=0.0,
+    )
+    good = pose_energy_correction_cosine_soft_label_loss(
+        good_logits,
+        correction_cos,
+        valid_mask=valid,
+        target_temperature=0.1,
+        min_cos=0.0,
+    )
+
+    assert int(bad["target_index"][0]) == 0
+    assert bad["loss"] > good["loss"]
+    assert bad["pred_cos"] < good["pred_cos"]
+
+
+def test_score_pose_improvement_soft_label_loss_prefers_candidates_that_reduce_pose_cost():
+    init_cost = torch.tensor([[0.40]])
+    candidate_cost = torch.tensor([[0.10, 0.45, 0.32]])
+    valid = torch.ones_like(candidate_cost, dtype=torch.bool)
+    bad_logits = torch.tensor([[0.0, 3.0, 1.0]])
+    good_logits = torch.tensor([[3.0, 0.0, 1.0]])
+
+    bad = score_pose_improvement_soft_label_loss(
+        bad_logits,
+        candidate_cost,
+        init_cost,
+        valid_mask=valid,
+        target_temperature_m=0.05,
+        min_improvement_m=0.0,
+    )
+    good = score_pose_improvement_soft_label_loss(
+        good_logits,
+        candidate_cost,
+        init_cost,
+        valid_mask=valid,
+        target_temperature_m=0.05,
+        min_improvement_m=0.0,
+    )
+
+    assert int(bad["target_index"][0]) == 0
+    assert bad["loss"] > good["loss"]
+    assert bad["pred_improvement_m"] < good["pred_improvement_m"]
+
+
+def test_score_anti_identity_loss_penalizes_identity_when_better_candidate_exists():
+    candidate_cost = torch.tensor([[0.30, 0.10, 0.45]])
+    valid = torch.ones_like(candidate_cost, dtype=torch.bool)
+    bad_scores = torch.tensor([[3.0, 0.0, 1.0]])
+    good_scores = torch.tensor([[0.0, 3.0, 1.0]])
+
+    bad = score_anti_identity_loss(
+        bad_scores,
+        candidate_cost,
+        valid_mask=valid,
+        identity_index=0,
+        min_gap_m=0.03,
+        logit_margin=0.5,
+    )
+    good = score_anti_identity_loss(
+        good_scores,
+        candidate_cost,
+        valid_mask=valid,
+        identity_index=0,
+        min_gap_m=0.03,
+        logit_margin=0.5,
+    )
+
+    assert bad["active"].item() > 0.0
+    assert bad["loss"] > good["loss"]
+    assert bad["selected_identity_frac"] > good["selected_identity_frac"]
+
+
+def test_local_zero_offset_scores_can_use_continuous_reliability_weights():
+    corr = torch.tensor([[[[[10.0, 0.0]]], [[[0.0, 5.0]]]]])
+    valid = torch.ones(1, 2, 1, 1, 2, dtype=torch.bool)
+    weight = torch.tensor([[[[0.1, 1.0]], [[0.1, 1.0]]]])
+
+    unweighted, _ = local_zero_offset_scores_from_corr(
+        corr,
+        valid,
+        radius=0,
+        temperature=0.1,
+        peak_gap_weight=0.0,
+        offset_weight=0.0,
+    )
+    weighted, _ = local_zero_offset_scores_from_corr(
+        corr,
+        valid,
+        radius=0,
+        temperature=0.1,
+        peak_gap_weight=0.0,
+        offset_weight=0.0,
+        weight=weight,
+    )
+
+    assert unweighted[0, 0] > unweighted[0, 1]
+    assert weighted[0, 1] > weighted[0, 0]
+
+
+def test_nvs_best_metric_defaults_to_pose_energy_metric_when_enabled():
+    args = type(
+        "Args",
+        (),
+        {
+            "best_metric": None,
+            "best_metric_mode": None,
+        },
+    )()
+
+    resolved = apply_config_defaults(
+        args,
+        {"nvs_pose_feature_adapter": {"pose_energy_enabled": True}},
+    )
+
+    assert resolved.best_metric == "pose_energy_pred_cost_m"
+    assert resolved.best_metric_mode == "min"
+
+
+def test_variance_floor_loss_penalizes_collapse():
+    collapsed = torch.ones(2, 4, 5, 5)
+    varied = torch.randn(2, 4, 5, 5)
+
+    assert variance_floor_loss(collapsed, 0.1) > variance_floor_loss(varied, 0.1)
+
+
+def test_nvs_candidate_bank_can_prepend_gt_and_drop_identity_shortcut():
+    args = type(
+        "Args",
+        (),
+        {
+            "topk": 4,
+            "lattice_trans_cm": "5,10",
+            "lattice_rot_deg": "1",
+            "include_identity_candidate": False,
+            "limit_strategy": "first",
+            "combine_trans_rot": False,
+            "lattice_direction_mode": "axis",
+            "train_append_gt_candidate": True,
+            "eval_append_gt_candidate": False,
+            "candidate_bank_mode": "lattice",
+        },
+    )()
+    init_pose = torch.eye(4).view(1, 4, 4)
+    pose_gt = init_pose.clone()
+    pose_gt[:, 0, 3] = 0.123
+
+    train_bank = build_nvs_candidate_bank(init_pose, pose_gt, args, train=True)
+    eval_bank = build_nvs_candidate_bank(init_pose, pose_gt, args, train=False)
+
+    assert torch.allclose(train_bank[:, 0], pose_gt)
+    assert not torch.allclose(eval_bank[:, 0], pose_gt)
+
+
+def test_nvs_balanced_candidate_bank_contains_identity_trans_rot_and_joint():
+    args = type(
+        "Args",
+        (),
+        {
+            "topk": 16,
+            "lattice_trans_cm": "10",
+            "lattice_rot_deg": "5",
+            "include_identity_candidate": True,
+            "limit_strategy": "first",
+            "combine_trans_rot": False,
+            "lattice_direction_mode": "axis",
+            "train_append_gt_candidate": False,
+            "eval_append_gt_candidate": False,
+            "candidate_bank_mode": "balanced",
+        },
+    )()
+    init_pose = torch.eye(4).view(1, 4, 4)
+    pose_gt = init_pose.clone()
+
+    bank = build_nvs_candidate_bank(init_pose, pose_gt, args, train=True)
+    delta_t = torch.linalg.norm(bank[:, :, :3, 3] - init_pose[:, None, :3, 3], dim=-1)
+    rot_trace = bank[:, :, 0, 0] + bank[:, :, 1, 1] + bank[:, :, 2, 2]
+    delta_r = torch.acos(torch.clamp((rot_trace - 1.0) * 0.5, -1.0, 1.0))
+
+    identity = (delta_t < 1e-6) & (delta_r < 1e-4)
+    trans_only = (delta_t > 0.05) & (delta_r < 1e-4)
+    rot_only = (delta_t < 1e-6) & (delta_r > 0.01)
+    joint = (delta_t > 0.05) & (delta_r > 0.01)
+
+    assert bank.shape[1] <= args.topk
+    assert identity.any()
+    assert trans_only.any()
+    assert rot_only.any()
+    assert joint.any()
+
+
+def test_nvs_direction_balanced_candidate_bank_adds_gt_direction_hard_negatives_without_exact_gt():
+    args = type(
+        "Args",
+        (),
+        {
+            "topk": 16,
+            "lattice_trans_cm": "5,10",
+            "lattice_rot_deg": "1,2",
+            "include_identity_candidate": True,
+            "limit_strategy": "first",
+            "combine_trans_rot": False,
+            "lattice_direction_mode": "axis",
+            "train_append_gt_candidate": False,
+            "eval_append_gt_candidate": False,
+            "candidate_bank_mode": "direction_balanced",
+        },
+    )()
+    init_pose = torch.eye(4).view(1, 4, 4)
+    pose_gt = init_pose.clone()
+    pose_gt[:, 0, 3] = 0.20
+
+    train_bank = build_nvs_candidate_bank(init_pose, pose_gt, args, train=True)
+    eval_bank = build_nvs_candidate_bank(init_pose, pose_gt, args, train=False)
+    target_translation = pose_gt[:, 0, 3]
+    train_translation = train_bank[0, :, 0, 3]
+    eval_translation = eval_bank[0, :, 0, 3]
+
+    assert not torch.isclose(train_translation, target_translation[0], atol=1e-5).any()
+    assert torch.isclose(train_translation, target_translation[0] * 0.5, atol=1e-5).any()
+    assert (train_translation < -0.05).any()
+    assert not torch.isclose(eval_translation, target_translation[0], atol=1e-5).any()
+
+
+def test_nvs_adaptive_direction_balanced_candidate_bank_adds_same_magnitude_direction_pairs():
+    args = type(
+        "Args",
+        (),
+        {
+            "topk": 48,
+            "lattice_trans_cm": "0,2,5,10,25,50,100",
+            "lattice_rot_deg": "0,0.5,1,2,5,10,20",
+            "include_identity_candidate": True,
+            "limit_strategy": "uniform",
+            "combine_trans_rot": False,
+            "lattice_direction_mode": "cube",
+            "train_append_gt_candidate": False,
+            "eval_append_gt_candidate": False,
+            "candidate_bank_mode": "adaptive_direction_balanced",
+            "direction_fractions": "0.75,0.5,0.25",
+        },
+    )()
+    init_pose = _w2c_pose_from_center_and_yaw([0.0, 0.0, 0.0], 0.0).view(1, 4, 4)
+    pose_gt = _w2c_pose_from_center_and_yaw([0.20, 0.0, 0.0], 0.0).view(1, 4, 4)
+
+    train_bank = build_nvs_candidate_bank(init_pose, pose_gt, args, train=True)
+    correction_cos = candidate_correction_cosines(train_bank, init_pose, pose_gt)[0]
+    init_center = torch.zeros(3)
+    cand_centers = train_bank[0, :, :3, :3].transpose(-1, -2).neg() @ train_bank[0, :, :3, 3:4]
+    cand_delta_norm = torch.linalg.norm(cand_centers.squeeze(-1) - init_center, dim=-1)
+
+    assert (correction_cos > 0.99).any()
+    assert (correction_cos < -0.99).any()
+    assert torch.isclose(cand_delta_norm, torch.tensor(0.15), atol=1e-4).any()
+    assert not torch.allclose(train_bank[:, 0], pose_gt)
+
+
+def test_candidate_correction_cosines_reports_direction_relative_to_init_pose():
+    init_pose = _w2c_pose_from_center_and_yaw([0.0, 0.0, 0.0], 0.0).view(1, 4, 4)
+    pose_gt = _w2c_pose_from_center_and_yaw([1.0, 0.0, 0.0], 0.0).view(1, 4, 4)
+    candidate_pose = torch.stack(
+        [
+            _w2c_pose_from_center_and_yaw([0.5, 0.0, 0.0], 0.0),
+            _w2c_pose_from_center_and_yaw([-0.5, 0.0, 0.0], 0.0),
+            _w2c_pose_from_center_and_yaw([0.0, 0.0, 0.0], 0.0),
+        ],
+        dim=0,
+    ).view(1, 3, 4, 4)
+
+    correction_cos = candidate_correction_cosines(candidate_pose, init_pose, pose_gt)
+
+    assert correction_cos[0, 0] > 0.99
+    assert correction_cos[0, 1] < -0.99
+    assert correction_cos[0, 2].abs() < 1e-6
+
+
+def test_candidate_identity_mask_detects_identity_without_assuming_first_candidate():
+    init_pose = _w2c_pose_from_center_and_yaw([0.0, 0.0, 0.0], 0.0).view(1, 4, 4)
+    bank = torch.stack(
+        [
+            _w2c_pose_from_center_and_yaw([0.10, 0.0, 0.0], 0.0),
+            _w2c_pose_from_center_and_yaw([0.0, 0.0, 0.0], 0.0),
+            _w2c_pose_from_center_and_yaw([0.0, 0.0, 0.0], 2.0),
+        ],
+        dim=0,
+    ).view(1, 3, 4, 4)
+    identity = candidate_identity_mask(bank, init_pose)
+
+    assert identity.any()
+    assert identity.tolist() == [[False, True, False]]
+
+
+def test_nvs_adaptive_candidate_bank_scales_lattice_to_init_error_bucket():
+    args = type(
+        "Args",
+        (),
+        {
+            "topk": 128,
+            "lattice_trans_cm": "0,2,5,10,25,50,100",
+            "lattice_rot_deg": "0,0.5,1,2,5,10,20",
+            "include_identity_candidate": True,
+            "limit_strategy": "uniform",
+            "combine_trans_rot": False,
+            "lattice_direction_mode": "cube",
+            "train_append_gt_candidate": False,
+            "eval_append_gt_candidate": False,
+            "candidate_bank_mode": "adaptive_balanced",
+        },
+    )()
+    init_pose = torch.eye(4).view(1, 4, 4)
+    pose_gt_small = init_pose.clone()
+    pose_gt_small[:, 0, 3] = -0.10
+    pose_gt_medium = init_pose.clone()
+    pose_gt_medium[:, 0, 3] = -0.50
+
+    small_bank = build_nvs_candidate_bank(init_pose, pose_gt_small, args, train=True)
+    medium_bank = build_nvs_candidate_bank(init_pose, pose_gt_medium, args, train=True)
+    small_delta = torch.linalg.norm(small_bank[:, :, :3, 3] - init_pose[:, None, :3, 3], dim=-1)
+    medium_delta = torch.linalg.norm(medium_bank[:, :, :3, 3] - init_pose[:, None, :3, 3], dim=-1)
+
+    assert small_delta.max().item() <= 0.251
+    assert medium_delta.max().item() >= 0.49
+
+
+def test_nvs_train_parser_accepts_adaptive_balanced_candidate_bank(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train_nvs_pose_feature_adapter.py",
+            "--config",
+            "config.yaml",
+            "--checkpoint",
+            "checkpoint.pth",
+            "--out-dir",
+            "out",
+            "--candidate-bank-mode",
+            "adaptive_balanced",
+        ],
+    )
+
+    args = parse_nvs_pose_feature_adapter_args()
+
+    assert args.candidate_bank_mode == "adaptive_balanced"
+
+
+def test_nvs_train_parser_accepts_adaptive_direction_balanced_candidate_bank(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train_nvs_pose_feature_adapter.py",
+            "--config",
+            "config.yaml",
+            "--checkpoint",
+            "checkpoint.pth",
+            "--out-dir",
+            "out",
+            "--candidate-bank-mode",
+            "adaptive_direction_balanced",
+        ],
+    )
+
+    args = parse_nvs_pose_feature_adapter_args()
+
+    assert args.candidate_bank_mode == "adaptive_direction_balanced"
+
+
+def test_nvs_train_parser_accepts_score_correction_cosine_loss_args(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train_nvs_pose_feature_adapter.py",
+            "--config",
+            "config.yaml",
+            "--checkpoint",
+            "checkpoint.pth",
+            "--out-dir",
+            "out",
+            "--score-correction-cosine-weight",
+            "2.0",
+            "--score-correction-cosine-temperature",
+            "0.07",
+            "--score-correction-cosine-min-cos",
+            "0.2",
+            "--score-pose-improvement-weight",
+            "1.5",
+            "--score-pose-improvement-temperature-m",
+            "0.04",
+            "--score-pose-improvement-min-improvement-m",
+            "0.01",
+            "--score-anti-identity-weight",
+            "0.7",
+            "--score-anti-identity-min-gap-m",
+            "0.02",
+            "--score-anti-identity-logit-margin",
+            "0.4",
+            "--score-anti-identity-index",
+            "2",
+            "--score-use-uncertainty",
+        ],
+    )
+
+    args = parse_nvs_pose_feature_adapter_args()
+
+    assert args.score_correction_cosine_weight == 2.0
+    assert args.score_correction_cosine_temperature == 0.07
+    assert args.score_correction_cosine_min_cos == 0.2
+    assert args.score_pose_improvement_weight == 1.5
+    assert args.score_pose_improvement_temperature_m == 0.04
+    assert args.score_pose_improvement_min_improvement_m == 0.01
+    assert args.score_anti_identity_weight == 0.7
+    assert args.score_anti_identity_min_gap_m == 0.02
+    assert args.score_anti_identity_logit_margin == 0.4
+    assert args.score_anti_identity_index == 2
+    assert args.score_use_uncertainty is True
+
+
+def test_eval_pose_energy_candidate_bank_can_use_bucket_adaptive_lattice():
+    args = type(
+        "Args",
+        (),
+        {
+            "topk": 128,
+            "lattice_trans_cm": "0,2,5,10,25,50,100",
+            "lattice_rot_deg": "0,0.5,1,2,5,10,20",
+            "include_identity_candidate": True,
+            "limit_strategy": "uniform",
+            "combine_trans_rot": False,
+            "lattice_direction_mode": "cube",
+            "candidate_bank_mode": "adaptive_balanced",
+        },
+    )()
+    init_pose = torch.eye(4).view(1, 4, 4)
+
+    small_bank = build_eval_pose_energy_candidate_bank(init_pose, args, trans_cm=10.0, rot_deg=2.0)
+    medium_bank = build_eval_pose_energy_candidate_bank(init_pose, args, trans_cm=50.0, rot_deg=10.0)
+    small_delta = torch.linalg.norm(small_bank[:, :, :3, 3] - init_pose[:, None, :3, 3], dim=-1)
+    medium_delta = torch.linalg.norm(medium_bank[:, :, :3, 3] - init_pose[:, None, :3, 3], dim=-1)
+
+    assert small_delta.max().item() <= 0.251
+    assert medium_delta.max().item() >= 0.49
+
+
+def test_eval_pose_energy_balanced_candidate_bank_includes_joint_candidates():
+    args = type(
+        "Args",
+        (),
+        {
+            "topk": 16,
+            "lattice_trans_cm": "10",
+            "lattice_rot_deg": "5",
+            "limit_strategy": "first",
+            "combine_trans_rot": False,
+            "lattice_direction_mode": "axis",
+            "candidate_bank_mode": "balanced",
+        },
+    )()
+    init_pose = torch.eye(4).view(1, 4, 4)
+
+    bank = build_eval_pose_energy_candidate_bank(init_pose, args)
+    delta_t = torch.linalg.norm(bank[:, :, :3, 3] - init_pose[:, None, :3, 3], dim=-1)
+    rot_trace = bank[:, :, 0, 0] + bank[:, :, 1, 1] + bank[:, :, 2, 2]
+    delta_r = torch.acos(torch.clamp((rot_trace - 1.0) * 0.5, -1.0, 1.0))
+
+    assert ((delta_t > 0.05) & (delta_r > 0.01)).any()
+
+
+def test_project_world_positions_identity_pose_to_feature_grid():
+    position = torch.tensor(
+        [[
+            [
+                [[0.0, 1.0], [0.0, 1.0]],
+                [[0.0, 0.0], [1.0, 1.0]],
+                [[1.0, 1.0], [1.0, 1.0]],
+            ]
+        ]]
+    )
+    pose = torch.eye(4).view(1, 4, 4)
+    intrinsics = torch.tensor([[1.0, 1.0, 0.0, 0.0]])
+
+    grid, valid, depth = project_world_positions_to_feature_grid(
+        position,
+        pose,
+        intrinsics,
+        feature_hw=(2, 2),
+    )
+
+    expected_grid = torch.tensor([[[[[-1.0, -1.0], [1.0, -1.0]], [[-1.0, 1.0], [1.0, 1.0]]]]])
+    assert torch.allclose(grid, expected_grid, atol=1.0e-5)
+    assert valid.all()
+    assert torch.allclose(depth, torch.ones(1, 1, 1, 2, 2))
+
+
+def test_warped_candidate_alignment_loss_uses_projected_correspondences():
+    query = torch.tensor(
+        [[
+            [[1.0, 1.0], [1.0, 1.0]],
+            [[0.0, 1.0], [0.0, 1.0]],
+            [[0.0, 0.0], [1.0, 1.0]],
+        ]]
+    )
+    render_good = query[:, None].clone()
+    render_bad = -render_good
+    position = torch.tensor(
+        [[
+            [
+                [[0.0, 1.0], [0.0, 1.0]],
+                [[0.0, 0.0], [1.0, 1.0]],
+                [[1.0, 1.0], [1.0, 1.0]],
+            ]
+        ]]
+    )
+    pose = torch.eye(4).view(1, 4, 4)
+    intrinsics = torch.tensor([[1.0, 1.0, 0.0, 0.0]])
+    mask = torch.ones(1, 1, 1, 2, 2)
+    depth = torch.ones(1, 1, 1, 2, 2)
+
+    good_loss, good_metrics = warped_candidate_alignment_loss(
+        query,
+        render_good,
+        position,
+        pose,
+        intrinsics,
+        candidate_mask=mask,
+        target_depth=depth,
+        target_mask=depth,
+    )
+    bad_loss, _bad_metrics = warped_candidate_alignment_loss(
+        query,
+        render_bad,
+        position,
+        pose,
+        intrinsics,
+        candidate_mask=mask,
+        target_depth=depth,
+        target_mask=torch.ones_like(depth),
+    )
+
+    assert good_loss < bad_loss
+    assert good_metrics["warp_valid_frac"] > 0.99
+
+
+def test_local_zero_offset_correlation_scores_prefer_aligned_candidate():
+    torch.manual_seed(7)
+    query = torch.randn(1, 6, 5, 5)
+    aligned = query.clone()
+    shifted = torch.roll(query, shifts=1, dims=-1)
+    render = torch.stack([aligned, shifted], dim=1)
+
+    scores, stats = local_zero_offset_correlation_scores(
+        query,
+        render,
+        radius=1,
+        temperature=0.05,
+        peak_gap_weight=0.5,
+        offset_weight=0.1,
+    )
+
+    assert scores.shape == (1, 2)
+    assert scores[0, 0] > scores[0, 1]
+    assert stats["local_peak_offset_px"] >= 0.0
+
+
+def test_local_offset_only_scores_are_available():
+    torch.manual_seed(11)
+    query = torch.randn(1, 4, 4, 4)
+    render = torch.stack([query, torch.roll(query, shifts=1, dims=-1)], dim=1)
+
+    expected_scores, _ = local_zero_offset_correlation_scores(
+        query,
+        render,
+        radius=1,
+        score_mode="local_neg_expected_offset",
+    )
+    peak_scores, _ = local_zero_offset_correlation_scores(
+        query,
+        render,
+        radius=1,
+        score_mode="local_neg_peak_offset",
+    )
+
+    assert expected_scores.shape == (1, 2)
+    assert peak_scores.shape == (1, 2)
+    assert torch.isfinite(expected_scores).all()
+    assert torch.isfinite(peak_scores).all()
+
+
+def test_local_flow_nce_loss_accepts_zero_offset_identity_projection():
+    query = torch.randn(1, 5, 3, 3)
+    render = query[:, None].clone()
+    xs = torch.arange(3, dtype=torch.float32).view(1, 1, 1, 3).expand(1, 1, 3, 3)
+    ys = torch.arange(3, dtype=torch.float32).view(1, 1, 3, 1).expand(1, 1, 3, 3)
+    zs = torch.ones_like(xs)
+    position = torch.stack([xs, ys, zs], dim=2)
+    pose = torch.eye(4).view(1, 4, 4)
+    intrinsics = torch.tensor([[1.0, 1.0, 0.0, 0.0]])
+    mask = torch.ones(1, 1, 1, 3, 3)
+    depth = torch.ones(1, 1, 1, 3, 3)
+
+    loss, metrics = local_flow_nce_loss(
+        query,
+        render,
+        position,
+        pose,
+        intrinsics,
+        candidate_mask=mask,
+        target_depth=depth,
+        target_mask=depth,
+        radius=1,
+        temperature=0.05,
+    )
+
+    assert torch.isfinite(loss)
+    assert metrics["local_flow_valid_frac"] > 0.99
+    assert metrics["local_flow_target_offset_px"] < 0.01
+
+
+def test_nvs_checkpoint_roundtrips_energy_net_and_trainable_query_prefix(tmp_path):
+    class TinyQueryModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.local_corr_projector = torch.nn.Conv2d(3, 3, kernel_size=1)
+            self.fine_head = torch.nn.Conv2d(3, 3, kernel_size=1)
+            self.unrelated = torch.nn.Conv2d(3, 3, kernel_size=1)
+
+    args = type(
+        "Args",
+        (),
+        {
+            "train_projector": True,
+            "train_model_prefixes": "fine_head.",
+            "pose_energy_use_delta_vector": False,
+            "pose_energy_use_center_delta_vector": False,
+            "pose_energy_use_rgb": False,
+            "pose_energy_use_uncertainty": False,
+        },
+    )()
+    model = TinyQueryModel()
+    adapter = PoseFeatureDomainAdapter(channels=3, hidden_dim=4)
+    energy_net = PoseEnergyNet(vector_dim=nvs_pose_energy_vector_dim(args), score_map_channels=3, hidden_dim=8)
+    optimizer = torch.optim.AdamW(
+        list(adapter.parameters()) + list(energy_net.parameters()) + list(model.fine_head.parameters()),
+        lr=1.0e-3,
+    )
+    path = tmp_path / "ckpt.pth"
+
+    with torch.no_grad():
+        model.fine_head.weight.fill_(0.25)
+        model.local_corr_projector.weight.fill_(0.5)
+        model.unrelated.weight.fill_(0.75)
+        energy_net.energy_head.bias.fill_(1.25)
+
+    save_checkpoint(path, adapter, model, optimizer, 7, {"pred": 1.0}, {}, args, energy_net=energy_net)
+
+    with torch.no_grad():
+        model.fine_head.weight.zero_()
+        model.local_corr_projector.weight.zero_()
+        model.unrelated.weight.zero_()
+        energy_net.energy_head.bias.zero_()
+
+    loaded = load_adapter_checkpoint(path, adapter, model=model, optimizer=None, energy_net=energy_net)
+
+    assert loaded["step"] == 7
+    assert torch.allclose(model.fine_head.weight, torch.full_like(model.fine_head.weight, 0.25))
+    assert torch.allclose(model.local_corr_projector.weight, torch.full_like(model.local_corr_projector.weight, 0.5))
+    assert torch.allclose(model.unrelated.weight, torch.zeros_like(model.unrelated.weight))
+    assert torch.allclose(energy_net.energy_head.bias, torch.full_like(energy_net.energy_head.bias, 1.25))
+
+
+def test_pose_energy_eval_loader_accepts_nvs_checkpoint_key(tmp_path):
+    args = type(
+        "Args",
+        (),
+        {
+            "train_projector": False,
+            "train_model_prefixes": "",
+            "pose_energy_use_delta_vector": False,
+            "pose_energy_use_center_delta_vector": False,
+            "pose_energy_use_rgb": False,
+            "pose_energy_use_uncertainty": False,
+        },
+    )()
+    model = torch.nn.Conv2d(3, 3, kernel_size=1)
+    adapter = PoseFeatureDomainAdapter(channels=3, hidden_dim=4)
+    energy_net = PoseEnergyNet(vector_dim=nvs_pose_energy_vector_dim(args), score_map_channels=3, hidden_dim=8)
+    optimizer = torch.optim.AdamW(list(adapter.parameters()) + list(energy_net.parameters()), lr=1.0e-3)
+    path = tmp_path / "nvs_ckpt.pth"
+
+    with torch.no_grad():
+        energy_net.energy_head.bias.fill_(2.5)
+
+    save_checkpoint(path, adapter, model, optimizer, 11, {"pred": 1.0}, {}, args, energy_net=energy_net)
+
+    with torch.no_grad():
+        energy_net.energy_head.bias.zero_()
+
+    loaded = load_pose_energy_checkpoint(
+        str(path),
+        energy_net,
+        model,
+        optimizer=None,
+        pose_feature_adapter=adapter,
+    )
+
+    assert loaded["step"] == 11
+    assert torch.allclose(energy_net.energy_head.bias, torch.full_like(energy_net.energy_head.bias, 2.5))
+
+
+def test_collect_trainable_parameters_can_freeze_pose_feature_adapter():
+    adapter = PoseFeatureDomainAdapter(channels=3, hidden_dim=4)
+    energy_net = PoseEnergyNet(vector_dim=0, score_map_channels=3, hidden_dim=8, context_layers=0)
+    model = torch.nn.Conv2d(3, 3, kernel_size=1)
+    for param in model.parameters():
+        param.requires_grad_(False)
+
+    params = collect_trainable_parameters(adapter, energy_net, model, train_adapter=False)
+
+    assert params
+    assert all(not param.requires_grad for param in adapter.parameters())
+    assert all(param.requires_grad for param in energy_net.parameters())
+    assert all(not param.requires_grad for param in model.parameters())
+    adapter_param_ids = {id(param) for param in adapter.parameters()}
+    assert all(id(param) not in adapter_param_ids for param in params)
+
+
+def test_nvs_pose_energy_vector_dim_includes_uncertainty_features():
+    base_args = type(
+        "Args",
+        (),
+        {
+            "pose_energy_use_delta_vector": False,
+            "pose_energy_use_center_delta_vector": False,
+            "pose_energy_use_rgb": False,
+            "pose_energy_use_uncertainty": False,
+        },
+    )()
+    uncertainty_args = type(
+        "Args",
+        (),
+        {
+            "pose_energy_use_delta_vector": False,
+            "pose_energy_use_center_delta_vector": False,
+            "pose_energy_use_rgb": False,
+            "pose_energy_use_uncertainty": True,
+        },
+    )()
+
+    assert nvs_pose_energy_vector_dim(uncertainty_args) == nvs_pose_energy_vector_dim(base_args) + 3
+
+
+def test_nvs_pose_energy_vector_dim_matches_feature_builder_optional_flags():
+    args = type(
+        "Args",
+        (),
+        {
+            "pose_energy_use_delta_vector": True,
+            "pose_energy_use_center_delta_vector": False,
+            "pose_energy_use_rgb": False,
+            "pose_energy_use_uncertainty": True,
+        },
+    )()
+
+    assert nvs_pose_energy_vector_dim(args) == 37
+
+
+def test_nvs_pose_energy_vector_dim_includes_center_delta_features():
+    base_args = type(
+        "Args",
+        (),
+        {
+            "pose_energy_use_delta_vector": True,
+            "pose_energy_use_center_delta_vector": False,
+            "pose_energy_use_rgb": False,
+            "pose_energy_use_uncertainty": True,
+        },
+    )()
+    center_args = type(
+        "Args",
+        (),
+        {
+            "pose_energy_use_delta_vector": True,
+            "pose_energy_use_center_delta_vector": True,
+            "pose_energy_use_rgb": False,
+            "pose_energy_use_uncertainty": True,
+        },
+    )()
+
+    assert nvs_pose_energy_vector_dim(center_args) == nvs_pose_energy_vector_dim(base_args) + 6
+
+
+def test_pose_energy_residual_update_uses_update_scale():
+    pose = torch.eye(4).view(1, 4, 4)
+    delta = torch.tensor([[0.20, 0.0, 0.0, 0.0, 0.0, 0.0]])
+
+    half_update = apply_pose_energy_residual_update(pose, delta, update_scale=0.5)
+    full_update = apply_pose_energy_residual_update(pose, delta, update_scale=1.0)
+
+    assert torch.allclose(half_update[:, 0, 3], torch.tensor([0.10]), atol=1e-5)
+    assert torch.allclose(full_update[:, 0, 3], torch.tensor([0.20]), atol=1e-5)

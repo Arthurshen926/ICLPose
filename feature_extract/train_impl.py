@@ -134,6 +134,14 @@ FINE_CANDIDATE_SELECTOR_VECTOR_FEATURE_NAMES = (
     "depth_mean_zscore",
     "depth_std_zscore",
     "inv_depth_mean_zscore",
+    "query_uncertainty_mean",
+    "render_uncertainty_mean",
+    "uncertainty_overlap",
+)
+FINE_CANDIDATE_SELECTOR_UNCERTAINTY_FEATURE_NAMES = (
+    "query_uncertainty_mean",
+    "render_uncertainty_mean",
+    "uncertainty_overlap",
 )
 FINE_CANDIDATE_SELECTOR_RGB_FEATURE_NAMES = (
     "rgb_l1_mean",
@@ -153,6 +161,14 @@ FINE_CANDIDATE_SELECTOR_DELTA_VECTOR_FEATURE_NAMES = (
     "delta_wx_zscore",
     "delta_wy_zscore",
     "delta_wz_zscore",
+)
+FINE_CANDIDATE_SELECTOR_CENTER_DELTA_VECTOR_FEATURE_NAMES = (
+    "center_dx",
+    "center_dy",
+    "center_dz",
+    "center_dx_zscore",
+    "center_dy_zscore",
+    "center_dz_zscore",
 )
 
 
@@ -435,6 +451,7 @@ DEFAULT_CONFIG = {
         "fine_topk_selector_use_coarse_logits": True,
         "fine_topk_selector_use_candidate_delta": True,
         "fine_topk_selector_use_delta_vector": False,
+        "fine_topk_selector_use_center_delta_vector": False,
         "fine_topk_selector_use_depth": True,
         "fine_topk_selector_use_mask": True,
         "fine_topk_selector_use_rgb": False,
@@ -2528,6 +2545,52 @@ def _candidate_rgb_stats(query_rgb, candidate_rgb, mask, valid, spatial_hw):
     }
 
 
+def _candidate_uncertainty_stats(query_uncertainty, candidate_uncertainty, mask, valid, spatial_hw):
+    device = valid.device
+    bsz, num_candidates = valid.shape
+    zeros = torch.zeros((bsz, num_candidates), device=device, dtype=torch.float32)
+    if query_uncertainty is None or candidate_uncertainty is None:
+        return {
+            "query_uncertainty_mean": zeros,
+            "render_uncertainty_mean": zeros,
+            "uncertainty_overlap": zeros,
+        }
+    query_u = query_uncertainty.to(device=device, dtype=torch.float32)
+    if query_u.ndim != 4:
+        raise ValueError(f"query_uncertainty must have shape (B,1,H,W), got {tuple(query_u.shape)}")
+    if query_u.shape[-2:] != tuple(spatial_hw):
+        query_u = F.interpolate(query_u[:, :1], size=spatial_hw, mode="bilinear", align_corners=False)
+    else:
+        query_u = query_u[:, :1]
+    render_u = _as_bank_5d(candidate_uncertainty.to(device=device), spatial_hw=spatial_hw, mode="bilinear")
+    render_u = render_u[:, :, :1].float()
+    if mask is None:
+        mask_bank = torch.ones(
+            bsz,
+            num_candidates,
+            1,
+            int(spatial_hw[0]),
+            int(spatial_hw[1]),
+            device=device,
+            dtype=torch.float32,
+        )
+    else:
+        mask_bank = _as_bank_5d(mask.to(device=device), spatial_hw=spatial_hw, mode="nearest")
+        mask_bank = mask_bank[:, :, :1].float()
+    valid_px = (mask_bank > 0.5) & valid[:, :, None, None, None]
+    valid_f = valid_px.float()
+    denom = valid_f.sum(dim=(2, 3, 4)).clamp(min=1.0)
+    query_bank = query_u[:, None].expand(-1, num_candidates, -1, -1, -1)
+    query_mean = (query_bank * valid_f).sum(dim=(2, 3, 4)) / denom
+    render_mean = (render_u * valid_f).sum(dim=(2, 3, 4)) / denom
+    overlap = (query_bank * render_u * valid_f).sum(dim=(2, 3, 4)) / denom
+    return {
+        "query_uncertainty_mean": torch.where(valid, query_mean, zeros),
+        "render_uncertainty_mean": torch.where(valid, render_mean, zeros),
+        "uncertainty_overlap": torch.where(valid, overlap, zeros),
+    }
+
+
 def _candidate_delta_from_init(candidate_pose, init_pose, valid):
     bsz, num_candidates = candidate_pose.shape[:2]
     device = candidate_pose.device
@@ -2579,6 +2642,31 @@ def _candidate_delta_vector_from_init(candidate_pose, init_pose, valid):
     return delta, delta_z
 
 
+def _candidate_center_delta_vector_from_init(candidate_pose, init_pose, valid):
+    bsz, num_candidates = candidate_pose.shape[:2]
+    device = candidate_pose.device
+    zeros = torch.zeros((bsz, num_candidates, 3), device=device, dtype=torch.float32)
+    if init_pose is None:
+        return zeros, zeros
+    init_pose_t = init_pose.to(device=device, dtype=candidate_pose.dtype)
+    if init_pose_t.ndim == 4:
+        init_pose_t = init_pose_t[:, 0]
+    if init_pose_t.ndim != 3 or init_pose_t.shape[-2:] != (4, 4):
+        raise ValueError(f"init_pose must have shape (B,4,4), got {tuple(init_pose_t.shape)}")
+    cand_centers = camera_centers_from_w2c(candidate_pose.float().reshape(bsz * num_candidates, 4, 4)).reshape(
+        bsz,
+        num_candidates,
+        3,
+    )
+    init_centers = camera_centers_from_w2c(init_pose_t.float()).unsqueeze(1)
+    center_delta = torch.where(valid[:, :, None], cand_centers - init_centers, zeros)
+    center_delta_z = torch.stack(
+        [_masked_row_standardize(center_delta[:, :, idx], valid) for idx in range(center_delta.shape[-1])],
+        dim=-1,
+    )
+    return center_delta, center_delta_z
+
+
 def fine_candidate_selector_features(
     query_feat,
     candidate_feat,
@@ -2588,6 +2676,8 @@ def fine_candidate_selector_features(
     coarse_logits=None,
     query_rgb=None,
     candidate_rgb=None,
+    query_uncertainty=None,
+    candidate_uncertainty=None,
     depth=None,
     mask=None,
     candidate_valid_mask=None,
@@ -2600,9 +2690,11 @@ def fine_candidate_selector_features(
     use_coarse_logits=True,
     use_candidate_delta=True,
     use_delta_vector=False,
+    use_center_delta_vector=False,
     use_depth=True,
     use_mask=True,
     use_rgb=False,
+    use_uncertainty=False,
 ):
     """Build per-candidate vector features for trainable fine top-K reranking."""
     if query_feat.ndim != 4:
@@ -2671,6 +2763,14 @@ def fine_candidate_selector_features(
     if not bool(use_delta_vector):
         delta_vector = torch.zeros_like(delta_vector)
         delta_vector_z = torch.zeros_like(delta_vector_z)
+    center_delta_vector, center_delta_vector_z = _candidate_center_delta_vector_from_init(
+        candidate_pose.to(device=render_scores.device),
+        init_pose,
+        valid,
+    )
+    if not bool(use_center_delta_vector):
+        center_delta_vector = torch.zeros_like(center_delta_vector)
+        center_delta_vector_z = torch.zeros_like(center_delta_vector_z)
     depth_stats = _candidate_depth_mask_stats(
         depth if bool(use_depth) else None,
         mask if bool(use_mask) else None,
@@ -2715,9 +2815,27 @@ def fine_candidate_selector_features(
                 rgb_stats["rgb_valid_fraction"],
             ]
         )
+    if bool(use_uncertainty):
+        uncertainty_stats = _candidate_uncertainty_stats(
+            query_uncertainty,
+            candidate_uncertainty,
+            mask,
+            valid,
+            candidate_feat.shape[-2:],
+        )
+        feature_rows.extend(
+            [
+                uncertainty_stats["query_uncertainty_mean"],
+                uncertainty_stats["render_uncertainty_mean"],
+                uncertainty_stats["uncertainty_overlap"],
+            ]
+        )
     if bool(use_delta_vector):
         feature_rows.extend([delta_vector[:, :, idx] for idx in range(delta_vector.shape[-1])])
         feature_rows.extend([delta_vector_z[:, :, idx] for idx in range(delta_vector_z.shape[-1])])
+    if bool(use_center_delta_vector):
+        feature_rows.extend([center_delta_vector[:, :, idx] for idx in range(center_delta_vector.shape[-1])])
+        feature_rows.extend([center_delta_vector_z[:, :, idx] for idx in range(center_delta_vector_z.shape[-1])])
     features = torch.stack(feature_rows, dim=-1)
     return {
         "features": features.to(dtype=torch.float32),
@@ -2791,6 +2909,7 @@ def fine_topk_selector_listwise_loss(
         use_coarse_logits=use_coarse_logits,
         use_candidate_delta=use_candidate_delta,
         use_delta_vector=use_delta_vector,
+        use_center_delta_vector=use_center_delta_vector,
         use_depth=use_depth,
         use_mask=use_mask,
         use_rgb=use_rgb,
@@ -4851,6 +4970,7 @@ class MapFeatureRenderer(nn.Module):
         mask_rows = []
         rgb_rows = []
         depth_rows = []
+        position_rows = []
         intrinsics_rows = []
         pose_rows = []
         context = torch.enable_grad if require_grad else torch.no_grad
@@ -4861,6 +4981,7 @@ class MapFeatureRenderer(nn.Module):
                 sample_mask = []
                 sample_rgb = []
                 sample_depth = []
+                sample_position = []
                 sample_intrinsics = []
                 sample_pose = []
                 normalized = self._normalize_name(sample_name) if hasattr(self, "_normalize_name") else sample_name
@@ -4876,7 +4997,7 @@ class MapFeatureRenderer(nn.Module):
                     )
                 for cand_idx in range(num_candidates):
                     pose = pose_bank[batch_idx, cand_idx]
-                    _fine_raw, fine, coarse, mask, _alpha, rgb, depth, _position = self._render_pose(
+                    _fine_raw, fine, coarse, mask, _alpha, rgb, depth, position = self._render_pose(
                         sample_name,
                         pose,
                         require_grad=require_grad,
@@ -4889,6 +5010,7 @@ class MapFeatureRenderer(nn.Module):
                     sample_mask.append(mask.squeeze(0))
                     sample_rgb.append(rgb.squeeze(0))
                     sample_depth.append(depth.squeeze(0))
+                    sample_position.append(position.squeeze(0))
                     if intr_tensor is not None:
                         sample_intrinsics.append(intr_tensor)
                     sample_pose.append(pose)
@@ -4898,6 +5020,7 @@ class MapFeatureRenderer(nn.Module):
                 mask_rows.append(torch.stack(sample_mask, dim=0))
                 rgb_rows.append(torch.stack(sample_rgb, dim=0))
                 depth_rows.append(torch.stack(sample_depth, dim=0))
+                position_rows.append(torch.stack(sample_position, dim=0))
                 if sample_intrinsics:
                     intrinsics_rows.append(torch.stack(sample_intrinsics, dim=0))
                 pose_rows.append(torch.stack(sample_pose, dim=0))
@@ -4909,6 +5032,7 @@ class MapFeatureRenderer(nn.Module):
         batch[f"{prefix}_mask"] = torch.stack(mask_rows, dim=0)
         batch[f"{prefix}_rgb"] = torch.stack(rgb_rows, dim=0)
         batch[f"{prefix}_depth"] = torch.stack(depth_rows, dim=0)
+        batch[f"{prefix}_position"] = torch.stack(position_rows, dim=0)
         if intrinsics_rows:
             batch[f"{prefix}_intrinsics"] = torch.stack(intrinsics_rows, dim=0)
         if candidate_valid_mask is not None:
@@ -5391,11 +5515,15 @@ def _candidate_fusion_vector_dim(map_cfg, model_cfg):
 def _fine_candidate_selector_vector_dim(model_cfg):
     if model_cfg.get("fine_candidate_selector_input_dim") is not None:
         return int(model_cfg["fine_candidate_selector_input_dim"])
-    dim = len(FINE_CANDIDATE_SELECTOR_VECTOR_FEATURE_NAMES)
+    dim = len(FINE_CANDIDATE_SELECTOR_VECTOR_FEATURE_NAMES) - len(FINE_CANDIDATE_SELECTOR_UNCERTAINTY_FEATURE_NAMES)
     if bool(model_cfg.get("fine_candidate_selector_use_rgb_features", False)):
         dim += len(FINE_CANDIDATE_SELECTOR_RGB_FEATURE_NAMES)
+    if bool(model_cfg.get("fine_candidate_selector_use_uncertainty_features", False)):
+        dim += len(FINE_CANDIDATE_SELECTOR_UNCERTAINTY_FEATURE_NAMES)
     if bool(model_cfg.get("fine_candidate_selector_use_delta_vector_features", False)):
         dim += len(FINE_CANDIDATE_SELECTOR_DELTA_VECTOR_FEATURE_NAMES)
+    if bool(model_cfg.get("fine_candidate_selector_use_center_delta_vector_features", False)):
+        dim += len(FINE_CANDIDATE_SELECTOR_CENTER_DELTA_VECTOR_FEATURE_NAMES)
     return dim
 
 
@@ -8406,6 +8534,9 @@ def compute_map_supervision(
     fine_topk_selector_require_projector = bool(map_cfg.get("fine_topk_selector_require_projector", False))
     fine_topk_selector_use_rgb = bool(map_cfg.get("fine_topk_selector_use_rgb", False))
     fine_topk_selector_use_delta_vector = bool(map_cfg.get("fine_topk_selector_use_delta_vector", False))
+    fine_topk_selector_use_center_delta_vector = bool(
+        map_cfg.get("fine_topk_selector_use_center_delta_vector", False)
+    )
     candidate_two_stage_enabled = bool(map_cfg.get("candidate_two_stage_enabled", False))
     candidate_stage2_topm = int(map_cfg.get("candidate_stage2_topm", 1) or 1)
     candidate_stage2_selection = str(map_cfg.get("candidate_stage2_selection", "pred"))
@@ -9112,6 +9243,7 @@ def compute_map_supervision(
                     use_coarse_logits=bool(map_cfg.get("fine_topk_selector_use_coarse_logits", True)),
                     use_candidate_delta=bool(map_cfg.get("fine_topk_selector_use_candidate_delta", True)),
                     use_delta_vector=fine_topk_selector_use_delta_vector,
+                    use_center_delta_vector=fine_topk_selector_use_center_delta_vector,
                     use_depth=bool(map_cfg.get("fine_topk_selector_use_depth", True)),
                     use_mask=bool(map_cfg.get("fine_topk_selector_use_mask", True)),
                     use_rgb=fine_topk_selector_use_rgb,

@@ -17,12 +17,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from feature_extract.students.pose_energy_net import (  # noqa: E402
     PoseEnergyNet,
+    PoseFeatureDomainAdapter,
     pose_costs_and_residual_targets,
     pose_energy_losses,
+    pose_energy_selection_scores,
 )
 from feature_extract.tools.eval_cpr_buckets import build_model_and_data, map_pose_gt_for_batch  # noqa: E402
 from feature_extract.train_impl import (  # noqa: E402
+    FINE_CANDIDATE_SELECTOR_CENTER_DELTA_VECTOR_FEATURE_NAMES,
     FINE_CANDIDATE_SELECTOR_DELTA_VECTOR_FEATURE_NAMES,
+    FINE_CANDIDATE_SELECTOR_UNCERTAINTY_FEATURE_NAMES,
     FINE_CANDIDATE_SELECTOR_VECTOR_FEATURE_NAMES,
     build_local_pose_lattice_candidates,
     fine_candidate_selector_features,
@@ -40,6 +44,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--map-checkpoint", default=None)
     parser.add_argument("--resume-pose-energy", default=None)
+    parser.add_argument("--resume-adapter-only", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--eval-only", action="store_true")
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--device", default="cuda")
@@ -59,8 +64,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=1.0e-5)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--train-projector", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--require-projector", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--train-projector", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--require-projector", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--pose-feature-adapter-enabled", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--pose-feature-adapter-hidden-dim", type=int, default=None)
+    parser.add_argument("--pose-feature-adapter-residual-scale", type=float, default=None)
+    parser.add_argument("--pose-feature-adapter-zero-init", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--pose-feature-adapter-l2-normalize", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--pose-feature-adapter-uncertainty-enabled", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--pose-feature-adapter-after-projector", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--query-fine-key", default=None)
     parser.add_argument("--topk", type=int, default=None)
     parser.add_argument("--lattice-trans-cm", default=None)
@@ -68,28 +80,55 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lattice-direction-mode", choices=("axis", "cube"), default=None)
     parser.add_argument("--combine-trans-rot", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--limit-strategy", default=None)
+    parser.add_argument("--candidate-bank-mode", choices=("lattice", "balanced"), default=None)
     parser.add_argument("--candidate-center-mode", choices=("gt", "noisy_init"), default=None)
     parser.add_argument("--candidate-center-noise-mode", choices=("uniform", "fixed"), default=None)
     parser.add_argument("--candidate-center-trans-cm", type=float, default=None)
     parser.add_argument("--candidate-center-rot-deg", type=float, default=None)
+    parser.add_argument("--candidate-center-buckets", default=None)
     parser.add_argument("--target-temperature-m", type=float, default=None)
     parser.add_argument("--rot-cost-weight", type=float, default=None)
     parser.add_argument("--hard-ce-weight", type=float, default=None)
     parser.add_argument("--residual-weight", type=float, default=None)
     parser.add_argument("--improve-weight", type=float, default=None)
     parser.add_argument("--improve-margin-m", type=float, default=None)
+    parser.add_argument("--residual-trans-scale-m", type=float, default=None)
+    parser.add_argument("--residual-rot-scale-deg", type=float, default=None)
+    parser.add_argument("--anti-identity-weight", type=float, default=None)
+    parser.add_argument("--anti-identity-margin", type=float, default=None)
+    parser.add_argument("--anti-identity-min-gap-m", type=float, default=None)
+    parser.add_argument("--identity-index", type=int, default=None)
+    parser.add_argument("--pairwise-rank-weight", type=float, default=None)
+    parser.add_argument("--pairwise-rank-min-gap-m", type=float, default=None)
+    parser.add_argument("--pairwise-rank-logit-margin", type=float, default=None)
+    parser.add_argument("--render-score-ce-weight", type=float, default=None)
+    parser.add_argument("--render-score-pairwise-weight", type=float, default=None)
+    parser.add_argument("--render-score-temperature-m", type=float, default=None)
+    parser.add_argument("--render-score-pairwise-min-gap-m", type=float, default=None)
+    parser.add_argument("--render-score-pairwise-logit-margin", type=float, default=None)
     parser.add_argument("--auc-good-m", type=float, default=None)
     parser.add_argument("--auc-bad-m", type=float, default=None)
     parser.add_argument("--score-radius", type=int, default=None)
     parser.add_argument("--score-preprocess", default=None)
     parser.add_argument("--score-highpass-kernel", type=int, default=None)
     parser.add_argument("--score-map-mode", default=None)
+    parser.add_argument("--use-candidate-delta", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--use-delta-vector", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--use-center-delta-vector", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--use-uncertainty", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--hidden-dim", type=int, default=None)
     parser.add_argument("--map-channels", type=int, default=None)
     parser.add_argument("--grid-size", type=int, default=None)
     parser.add_argument("--context-layers", type=int, default=None)
     parser.add_argument("--context-heads", type=int, default=None)
+    parser.add_argument("--factorized-heads", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--translation-energy-weight", type=float, default=None)
+    parser.add_argument("--rotation-energy-weight", type=float, default=None)
+    parser.add_argument("--joint-energy-weight", type=float, default=None)
+    parser.add_argument("--confidence-weight", type=float, default=None)
+    parser.add_argument("--confidence-temperature-m", type=float, default=None)
+    parser.add_argument("--selection-confidence-weight", type=float, default=None)
+    parser.add_argument("--selection-residual-norm-weight", type=float, default=None)
     parser.add_argument("--synthetic-ratio", type=float, default=None)
     parser.add_argument("--eval-synthetic-ratio", type=float, default=None)
     parser.add_argument("--synthetic-trans-cm", type=float, default=None)
@@ -117,31 +156,67 @@ def apply_config_defaults(args: argparse.Namespace, cfg: Dict) -> argparse.Names
         "lattice_direction_mode": "cube",
         "combine_trans_rot": False,
         "limit_strategy": "uniform",
+        "candidate_bank_mode": "lattice",
         "candidate_center_mode": "gt",
         "candidate_center_noise_mode": "uniform",
         "candidate_center_trans_cm": 25.0,
         "candidate_center_rot_deg": 5.0,
+        "candidate_center_buckets": None,
         "target_temperature_m": 0.05,
         "rot_cost_weight": 0.1,
         "hard_ce_weight": 0.0,
         "residual_weight": 0.5,
         "improve_weight": 0.0,
         "improve_margin_m": 0.0,
+        "residual_trans_scale_m": 0.25,
+        "residual_rot_scale_deg": 5.0,
+        "anti_identity_weight": 0.0,
+        "anti_identity_margin": 0.5,
+        "anti_identity_min_gap_m": 0.03,
+        "identity_index": 0,
+        "pairwise_rank_weight": 0.0,
+        "pairwise_rank_min_gap_m": 0.03,
+        "pairwise_rank_logit_margin": 0.5,
+        "render_score_ce_weight": 0.0,
+        "render_score_pairwise_weight": 0.0,
+        "render_score_temperature_m": 0.05,
+        "render_score_pairwise_min_gap_m": 0.03,
+        "render_score_pairwise_logit_margin": 0.5,
         "auc_good_m": 0.05,
         "auc_bad_m": 0.25,
         "score_radius": 4,
         "score_preprocess": "spatial_center",
         "score_highpass_kernel": 5,
         "score_map_mode": "peak_offset",
+        "use_candidate_delta": True,
         "use_delta_vector": False,
+        "use_center_delta_vector": False,
+        "use_uncertainty": False,
         "hidden_dim": 128,
         "map_channels": 16,
         "grid_size": 4,
         "context_layers": 1,
         "context_heads": 1,
+        "factorized_heads": False,
+        "translation_energy_weight": 0.0,
+        "rotation_energy_weight": 0.0,
+        "joint_energy_weight": 0.0,
+        "confidence_weight": 0.0,
+        "confidence_temperature_m": None,
+        "selection_confidence_weight": 0.0,
+        "selection_residual_norm_weight": 0.0,
         "synthetic_ratio": 0.0,
         "synthetic_trans_cm": 25.0,
         "synthetic_rot_deg": 5.0,
+        "train_projector": True,
+        "require_projector": True,
+        "pose_feature_adapter_enabled": False,
+        "pose_feature_adapter_hidden_dim": 64,
+        "pose_feature_adapter_residual_scale": 0.1,
+        "pose_feature_adapter_zero_init": True,
+        "pose_feature_adapter_l2_normalize": True,
+        "pose_feature_adapter_uncertainty_enabled": False,
+        "pose_feature_adapter_after_projector": False,
     }
     for key, fallback in defaults.items():
         if getattr(args, key, None) is not None:
@@ -178,6 +253,37 @@ def jitter_gt_poses(pose_gt: torch.Tensor, trans_cm: float, rot_deg: float) -> t
             float(rot_deg)
         )
     return apply_pose_delta(pose_gt.float(), delta.float()).to(dtype=pose_gt.dtype)
+
+
+def parse_candidate_center_buckets(value) -> List[tuple[float, float, float]]:
+    if value is None or value == "":
+        return []
+    if isinstance(value, (list, tuple)):
+        items = value
+    else:
+        items = [part.strip() for part in str(value).split(",") if part.strip()]
+    buckets: List[tuple[float, float, float]] = []
+    for item in items:
+        if isinstance(item, dict):
+            trans_cm = float(item.get("trans_cm", item.get("trans", 0.0)))
+            rot_deg = float(item.get("rot_deg", item.get("rot", 0.0)))
+            weight = float(item.get("weight", 1.0))
+        elif isinstance(item, (list, tuple)):
+            if len(item) not in {2, 3}:
+                raise ValueError(f"Invalid candidate_center_buckets item: {item}")
+            trans_cm = float(item[0])
+            rot_deg = float(item[1])
+            weight = float(item[2]) if len(item) == 3 else 1.0
+        else:
+            parts = [part.strip() for part in str(item).split(":") if part.strip()]
+            if len(parts) not in {2, 3}:
+                raise ValueError(f"Invalid candidate_center_buckets item: {item}")
+            trans_cm = float(parts[0])
+            rot_deg = float(parts[1])
+            weight = float(parts[2]) if len(parts) == 3 else 1.0
+        if weight > 0.0:
+            buckets.append((trans_cm, rot_deg, weight))
+    return buckets
 
 
 def maybe_replace_with_synthetic_queries(batch, map_renderer, pose_gt, cfg: Dict, args: argparse.Namespace):
@@ -239,6 +345,9 @@ def augment_synthetic_rgb(rgb: torch.Tensor) -> torch.Tensor:
 
 
 def build_candidate_bank(pose_gt: torch.Tensor, args: argparse.Namespace) -> torch.Tensor:
+    combine_trans_rot = bool(args.combine_trans_rot)
+    if str(getattr(args, "candidate_bank_mode", "lattice") or "lattice").lower() == "balanced":
+        combine_trans_rot = True
     return build_local_pose_lattice_candidates(
         pose_gt,
         trans_cm=parse_float_csv(args.lattice_trans_cm),
@@ -246,7 +355,7 @@ def build_candidate_bank(pose_gt: torch.Tensor, args: argparse.Namespace) -> tor
         include_identity=True,
         max_candidates=int(args.topk),
         limit_strategy=args.limit_strategy,
-        combine_trans_rot=bool(args.combine_trans_rot),
+        combine_trans_rot=combine_trans_rot,
         direction_mode=args.lattice_direction_mode,
     )
 
@@ -257,6 +366,25 @@ def candidate_center_pose(pose_gt: torch.Tensor, args: argparse.Namespace) -> to
         return pose_gt
     if mode == "noisy_init":
         noise_mode = str(args.candidate_center_noise_mode or "uniform").lower()
+        buckets = parse_candidate_center_buckets(getattr(args, "candidate_center_buckets", None))
+        if buckets:
+            count = pose_gt.shape[0]
+            weights = pose_gt.new_tensor([bucket[2] for bucket in buckets], dtype=torch.float32)
+            bucket_idx = torch.multinomial(weights / weights.sum().clamp(min=1.0e-8), count, replacement=True)
+            trans_cm = pose_gt.new_tensor([bucket[0] for bucket in buckets], dtype=pose_gt.dtype)[bucket_idx]
+            rot_deg = pose_gt.new_tensor([bucket[1] for bucket in buckets], dtype=pose_gt.dtype)[bucket_idx]
+            delta = pose_gt.new_zeros((count, 6))
+            if bool((trans_cm > 0.0).any()):
+                trans_mag = trans_cm / 100.0
+                if noise_mode != "fixed":
+                    trans_mag = trans_mag * torch.rand(count, device=pose_gt.device, dtype=pose_gt.dtype)
+                delta[:, :3] = _random_unit_vectors(count, device=pose_gt.device, dtype=pose_gt.dtype) * trans_mag[:, None]
+            if bool((rot_deg > 0.0).any()):
+                rot_mag = torch.deg2rad(rot_deg)
+                if noise_mode != "fixed":
+                    rot_mag = rot_mag * torch.rand(count, device=pose_gt.device, dtype=pose_gt.dtype)
+                delta[:, 3:] = _random_unit_vectors(count, device=pose_gt.device, dtype=pose_gt.dtype) * rot_mag[:, None]
+            return apply_pose_delta(pose_gt.float(), delta.float()).to(dtype=pose_gt.dtype)
         if noise_mode == "fixed":
             count = pose_gt.shape[0]
             delta = pose_gt.new_zeros((count, 6))
@@ -278,10 +406,97 @@ def candidate_center_pose(pose_gt: torch.Tensor, args: argparse.Namespace) -> to
 
 
 def pose_energy_vector_dim(args: argparse.Namespace) -> int:
-    dim = len(FINE_CANDIDATE_SELECTOR_VECTOR_FEATURE_NAMES)
+    dim = len(FINE_CANDIDATE_SELECTOR_VECTOR_FEATURE_NAMES) - len(FINE_CANDIDATE_SELECTOR_UNCERTAINTY_FEATURE_NAMES)
+    if bool(getattr(args, "use_uncertainty", False)):
+        dim += len(FINE_CANDIDATE_SELECTOR_UNCERTAINTY_FEATURE_NAMES)
     if bool(args.use_delta_vector):
         dim += len(FINE_CANDIDATE_SELECTOR_DELTA_VECTOR_FEATURE_NAMES)
+    if bool(getattr(args, "use_center_delta_vector", False)):
+        dim += len(FINE_CANDIDATE_SELECTOR_CENTER_DELTA_VECTOR_FEATURE_NAMES)
     return dim
+
+
+def pose_feature_channels(model, cfg: Dict) -> int:
+    value = getattr(model, "fine_feature_dim", None)
+    if value is None:
+        value = (cfg.get("model", {}) or {}).get("fine_feature_dim")
+    if value is None:
+        value = (cfg.get("model", {}) or {}).get("feature_dim", 64)
+    return int(value)
+
+
+def build_pose_feature_adapter(args: argparse.Namespace, model, cfg: Dict, device: torch.device):
+    if not bool(args.pose_feature_adapter_enabled):
+        return None
+    return PoseFeatureDomainAdapter(
+        channels=pose_feature_channels(model, cfg),
+        hidden_dim=int(args.pose_feature_adapter_hidden_dim),
+        residual_scale=float(args.pose_feature_adapter_residual_scale),
+        zero_init=bool(args.pose_feature_adapter_zero_init),
+        l2_normalize=bool(args.pose_feature_adapter_l2_normalize),
+        uncertainty_enabled=bool(args.pose_feature_adapter_uncertainty_enabled),
+    ).to(device)
+
+
+def apply_pose_feature_adapter(
+    adapter,
+    query_feature: torch.Tensor,
+    render_feature: torch.Tensor,
+    *,
+    render_chunk_size: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor, bool]:
+    if adapter is None:
+        return query_feature, render_feature, False
+    if render_feature.ndim != 5:
+        raise ValueError("render_feature must have shape (B,K,C,H,W)")
+    query_loc = adapter.project_query(query_feature)
+    bsz, num_candidates, channels, height, width = render_feature.shape
+    render_flat = render_feature.reshape(bsz * num_candidates, channels, height, width)
+    chunk_size = int(render_chunk_size or 0)
+    if chunk_size > 0 and render_flat.shape[0] > chunk_size:
+        pieces = []
+        for start in range(0, render_flat.shape[0], chunk_size):
+            pieces.append(adapter.project_render(render_flat[start : start + chunk_size]))
+        render_loc = torch.cat(pieces, dim=0)
+    else:
+        render_loc = adapter.project_render(render_flat)
+    render_loc = render_loc.reshape(bsz, num_candidates, channels, height, width)
+    return query_loc, render_loc, True
+
+
+def apply_pose_feature_adapter_with_uncertainty(
+    adapter,
+    query_feature: torch.Tensor,
+    render_feature: torch.Tensor,
+    *,
+    render_chunk_size: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, bool]:
+    if adapter is None:
+        raise ValueError("use_uncertainty requires pose_feature_adapter_enabled=true")
+    if render_feature.ndim != 5:
+        raise ValueError("render_feature must have shape (B,K,C,H,W)")
+    query_loc, query_uncertainty = adapter.project_query_with_uncertainty(query_feature)
+    bsz, num_candidates, channels, height, width = render_feature.shape
+    render_flat = render_feature.reshape(bsz * num_candidates, channels, height, width)
+    chunk_size = int(render_chunk_size or 0)
+    if chunk_size > 0 and render_flat.shape[0] > chunk_size:
+        loc_pieces = []
+        unc_pieces = []
+        for start in range(0, render_flat.shape[0], chunk_size):
+            loc, unc = adapter.project_render_with_uncertainty(render_flat[start : start + chunk_size])
+            loc_pieces.append(loc)
+            unc_pieces.append(unc)
+        render_loc = torch.cat(loc_pieces, dim=0)
+        render_uncertainty = torch.cat(unc_pieces, dim=0)
+    else:
+        render_loc, render_uncertainty = adapter.project_render_with_uncertainty(render_flat)
+    return (
+        query_loc,
+        render_loc.reshape(bsz, num_candidates, channels, height, width),
+        query_uncertainty,
+        render_uncertainty.reshape(bsz, num_candidates, 1, height, width),
+        True,
+    )
 
 
 def _spearman_rows(scores: torch.Tensor, costs: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
@@ -329,7 +544,52 @@ def _good_bad_auc_rows(
     return torch.stack(values).mean().to(device=scores.device)
 
 
-def forward_pose_energy_batch(model, energy_net, map_renderer, batch, cfg: Dict, args: argparse.Namespace, *, train: bool):
+def score_metric_shaping_losses(
+    scores: torch.Tensor,
+    pose_cost: torch.Tensor,
+    valid: torch.Tensor,
+    *,
+    target_temperature_m: float,
+    pairwise_min_gap_m: float,
+    pairwise_logit_margin: float,
+) -> Dict[str, torch.Tensor]:
+    logits = scores.float().masked_fill(~valid, -1.0e6)
+    cost = pose_cost.float()
+    target_logits = (-cost / max(float(target_temperature_m), 1.0e-6)).masked_fill(~valid, -1.0e6)
+    target_probs = F.softmax(target_logits, dim=1).detach()
+    ce_loss = -(target_probs * F.log_softmax(logits, dim=1)).sum(dim=1).mean()
+    target_idx = cost.masked_fill(~valid, float("inf")).argmin(dim=1)
+    best_cost = cost.gather(1, target_idx[:, None])
+    best_logit = logits.gather(1, target_idx[:, None])
+    worse = valid & torch.isfinite(cost) & (cost > best_cost + float(pairwise_min_gap_m))
+    pairwise_loss = scores.new_zeros(())
+    pairwise_active = worse.float().mean()
+    if bool(worse.any()):
+        pairwise_loss = F.softplus(logits - best_logit + float(pairwise_logit_margin))[worse].mean()
+    pred_idx = logits.argmax(dim=1)
+    pred_cost = cost.gather(1, pred_idx[:, None]).squeeze(1)
+    oracle_cost = cost.gather(1, target_idx[:, None]).squeeze(1)
+    return {
+        "render_score_ce_loss": ce_loss,
+        "render_score_pairwise_loss": pairwise_loss,
+        "render_score_pairwise_active": pairwise_active,
+        "render_score_top1_acc": (pred_idx == target_idx).float().mean(),
+        "render_score_pred_cost_m": pred_cost.mean(),
+        "render_score_oracle_gap_m": (pred_cost - oracle_cost).mean(),
+    }
+
+
+def forward_pose_energy_batch(
+    model,
+    energy_net,
+    map_renderer,
+    batch,
+    cfg: Dict,
+    args: argparse.Namespace,
+    *,
+    train: bool,
+    pose_feature_adapter=None,
+):
     device = next(energy_net.parameters()).device
     batch = move_batch_to_device(batch, device)
     pose_gt = map_pose_gt_for_batch(map_renderer, batch, device)
@@ -351,13 +611,54 @@ def forward_pose_energy_batch(model, energy_net, map_renderer, batch, cfg: Dict,
     query_fine = outputs[query_fine_key].float()
     render_fine = cand_batch["pose_energy_candidate_fine"].float()
     projector = getattr(model, "local_corr_projector", None)
-    query_proj, render_proj, used_projector = project_query_render_for_fine_selector(
-        projector,
-        query_fine,
-        render_fine,
-        require_projector=bool(args.require_projector),
-        render_chunk_size=int(cfg.get("map_supervision", {}).get("candidate_render_score_projector_chunk_size", 0) or 0),
-    )
+    used_pose_feature_adapter = False
+    query_uncertainty = None
+    render_uncertainty = None
+    if pose_feature_adapter is not None:
+        query_proj = query_fine
+        render_proj = render_fine
+        used_projector = False
+        if bool(args.pose_feature_adapter_after_projector):
+            query_proj, render_proj, used_projector = project_query_render_for_fine_selector(
+                projector,
+                query_fine,
+                render_fine,
+                require_projector=bool(args.require_projector),
+                render_chunk_size=int(
+                    cfg.get("map_supervision", {}).get("candidate_render_score_projector_chunk_size", 0) or 0
+                ),
+            )
+        render_chunk_size = int(cfg.get("map_supervision", {}).get("candidate_render_score_projector_chunk_size", 0) or 0)
+        if bool(args.use_uncertainty):
+            (
+                query_proj,
+                render_proj,
+                query_uncertainty,
+                render_uncertainty,
+                used_pose_feature_adapter,
+            ) = apply_pose_feature_adapter_with_uncertainty(
+                pose_feature_adapter,
+                query_proj,
+                render_proj,
+                render_chunk_size=render_chunk_size,
+            )
+        else:
+            query_proj, render_proj, used_pose_feature_adapter = apply_pose_feature_adapter(
+                pose_feature_adapter,
+                query_proj,
+                render_proj,
+                render_chunk_size=render_chunk_size,
+            )
+    else:
+        if bool(args.use_uncertainty):
+            raise ValueError("use_uncertainty requires pose_feature_adapter_enabled=true")
+        query_proj, render_proj, used_projector = project_query_render_for_fine_selector(
+            projector,
+            query_fine,
+            render_fine,
+            require_projector=bool(args.require_projector),
+            render_chunk_size=int(cfg.get("map_supervision", {}).get("candidate_render_score_projector_chunk_size", 0) or 0),
+        )
     feature_pack = fine_candidate_selector_features(
         query_proj,
         render_proj,
@@ -372,11 +673,15 @@ def forward_pose_energy_batch(model, energy_net, map_renderer, batch, cfg: Dict,
         score_map_mode=args.score_map_mode,
         return_score_maps=True,
         use_coarse_logits=False,
-        use_candidate_delta=True,
+        use_candidate_delta=bool(args.use_candidate_delta),
         use_delta_vector=bool(args.use_delta_vector),
+        use_center_delta_vector=bool(args.use_center_delta_vector),
         use_depth=True,
         use_mask=True,
         use_rgb=False,
+        query_uncertainty=query_uncertainty,
+        candidate_uncertainty=render_uncertainty,
+        use_uncertainty=bool(args.use_uncertainty),
     )
     energy_out = energy_net(
         feature_pack["score_maps"],
@@ -394,9 +699,43 @@ def forward_pose_energy_batch(model, energy_net, map_renderer, batch, cfg: Dict,
         residual_weight=float(args.residual_weight),
         improve_weight=float(args.improve_weight),
         improve_margin_m=float(args.improve_margin_m),
+        residual_trans_scale_m=float(args.residual_trans_scale_m),
+        residual_rot_scale_rad=math.radians(float(args.residual_rot_scale_deg)),
+        anti_identity_weight=float(args.anti_identity_weight),
+        anti_identity_margin=float(args.anti_identity_margin),
+        anti_identity_min_gap_m=float(args.anti_identity_min_gap_m),
+        identity_index=int(args.identity_index),
+        pairwise_rank_weight=float(args.pairwise_rank_weight),
+        pairwise_rank_min_gap_m=float(args.pairwise_rank_min_gap_m),
+        pairwise_rank_logit_margin=float(args.pairwise_rank_logit_margin),
+        translation_energy_weight=float(args.translation_energy_weight),
+        rotation_energy_weight=float(args.rotation_energy_weight),
+        joint_energy_weight=float(args.joint_energy_weight),
+        confidence_weight=float(args.confidence_weight),
+        confidence_temperature_m=args.confidence_temperature_m,
     )
+    render_metric = score_metric_shaping_losses(
+        feature_pack["render_scores"],
+        losses["pose_cost"].detach(),
+        feature_pack["valid"],
+        target_temperature_m=float(args.render_score_temperature_m),
+        pairwise_min_gap_m=float(args.render_score_pairwise_min_gap_m),
+        pairwise_logit_margin=float(args.render_score_pairwise_logit_margin),
+    )
+    total_loss = (
+        losses["loss"]
+        + float(args.render_score_ce_weight) * render_metric["render_score_ce_loss"]
+        + float(args.render_score_pairwise_weight) * render_metric["render_score_pairwise_loss"]
+    )
+    selection_scores = pose_energy_selection_scores(
+        energy_out,
+        confidence_weight=float(args.selection_confidence_weight),
+        residual_norm_weight=float(args.selection_residual_norm_weight),
+        residual_trans_scale_m=float(args.residual_trans_scale_m),
+        residual_rot_scale_rad=math.radians(float(args.residual_rot_scale_deg)),
+    ).masked_fill(~feature_pack["valid"], -1.0e6)
     batch_idx = torch.arange(pose_gt.shape[0], device=device)
-    pred_idx = losses["pred_index"].long()
+    pred_idx = selection_scores.argmax(dim=1)
     selected_pose = cand_batch["pose_energy_candidate_pose"].float()[batch_idx, pred_idx]
     selected_delta = energy_out["residual_delta"][batch_idx, pred_idx].float()
     residual_pose = apply_pose_delta(selected_pose, selected_delta)
@@ -409,35 +748,52 @@ def forward_pose_energy_batch(model, energy_net, map_renderer, batch, cfg: Dict,
     residual_cost = residual_cost[:, 0]
     residual_trans = residual_trans[:, 0]
     residual_rot = residual_rot[:, 0]
-    spearman = _spearman_rows(energy_out["energy_logits"], losses["pose_cost"], feature_pack["valid"])
+    pred_cost = losses["pose_cost"].gather(1, pred_idx[:, None]).squeeze(1)
+    oracle_cost = losses["oracle_cost"]
+    spearman = _spearman_rows(selection_scores, losses["pose_cost"], feature_pack["valid"])
     good_bad_auc = _good_bad_auc_rows(
-        energy_out["energy_logits"],
+        selection_scores,
         losses["pose_cost"],
         feature_pack["valid"],
         good_m=float(args.auc_good_m),
         bad_m=float(args.auc_bad_m),
     )
     metrics = {
-        "loss": losses["loss"],
+        "loss": total_loss,
         "energy_loss": losses["energy_loss"].detach(),
         "hard_ce_loss": losses["hard_ce_loss"].detach(),
+        "translation_energy_loss": losses["translation_energy_loss"].detach(),
+        "rotation_energy_loss": losses["rotation_energy_loss"].detach(),
+        "joint_energy_loss": losses["joint_energy_loss"].detach(),
+        "confidence_loss": losses["confidence_loss"].detach(),
         "residual_loss": losses["residual_loss"].detach(),
+        "anti_identity_loss": losses["anti_identity_loss"].detach(),
+        "anti_identity_active": losses["anti_identity_active"].detach(),
+        "pairwise_rank_loss": losses["pairwise_rank_loss"].detach(),
+        "pairwise_rank_active": losses["pairwise_rank_active"].detach(),
+        "render_score_ce_loss": render_metric["render_score_ce_loss"].detach(),
+        "render_score_pairwise_loss": render_metric["render_score_pairwise_loss"].detach(),
+        "render_score_pairwise_active": render_metric["render_score_pairwise_active"].detach(),
+        "render_score_top1_acc": render_metric["render_score_top1_acc"].detach(),
+        "render_score_pred_cost_m": render_metric["render_score_pred_cost_m"].detach(),
+        "render_score_oracle_gap_m": render_metric["render_score_oracle_gap_m"].detach(),
         "improve_loss": losses["improve_loss"].detach(),
-        "top1_acc": losses["top1_acc"].detach(),
+        "top1_acc": (pred_idx == losses["target_index"]).float().mean().detach(),
         "spearman": spearman.detach(),
         "good_bad_auc": good_bad_auc.detach(),
-        "pred_cost_m": losses["pred_cost"].detach().mean(),
+        "pred_cost_m": pred_cost.detach().mean(),
         "residual_pred_cost_m": residual_cost.detach().mean(),
-        "residual_cost_gain_m": (losses["pred_cost"].detach() - residual_cost.detach()).mean(),
+        "residual_cost_gain_m": (pred_cost.detach() - residual_cost.detach()).mean(),
         "residual_trans_err_m": residual_trans.detach().mean(),
         "residual_rot_deg": (residual_rot.detach().mean() * (180.0 / math.pi)),
-        "oracle_cost_m": losses["oracle_cost"].detach().mean(),
-        "oracle_gap_m": (losses["pred_cost"].detach() - losses["oracle_cost"].detach()).mean(),
+        "oracle_cost_m": oracle_cost.detach().mean(),
+        "oracle_gap_m": (pred_cost.detach() - oracle_cost.detach()).mean(),
         "center_mode_noisy": torch.tensor(float(str(args.candidate_center_mode) == "noisy_init"), device=device),
         "synthetic_fraction": synthetic_mask.float().mean().detach(),
         "used_projector": torch.tensor(float(used_projector), device=device),
+        "used_pose_feature_adapter": torch.tensor(float(used_pose_feature_adapter), device=device),
     }
-    return losses["loss"], metrics
+    return total_loss, metrics
 
 
 def mean_metrics(rows: List[Dict[str, float]]) -> Dict[str, float]:
@@ -448,22 +804,53 @@ def mean_metrics(rows: List[Dict[str, float]]) -> Dict[str, float]:
 
 
 @torch.no_grad()
-def evaluate(model, energy_net, loader, map_renderer, cfg: Dict, args: argparse.Namespace) -> Dict[str, float]:
+def evaluate(
+    model,
+    energy_net,
+    loader,
+    map_renderer,
+    cfg: Dict,
+    args: argparse.Namespace,
+    *,
+    pose_feature_adapter=None,
+) -> Dict[str, float]:
     model.eval()
     energy_net.eval()
+    if pose_feature_adapter is not None:
+        pose_feature_adapter.eval()
     eval_args = argparse.Namespace(**vars(args))
     if args.eval_synthetic_ratio is not None:
         eval_args.synthetic_ratio = float(args.eval_synthetic_ratio)
     rows = []
     for batch_idx, batch in enumerate(loader):
-        _loss, metrics = forward_pose_energy_batch(model, energy_net, map_renderer, batch, cfg, eval_args, train=False)
+        _loss, metrics = forward_pose_energy_batch(
+            model,
+            energy_net,
+            map_renderer,
+            batch,
+            cfg,
+            eval_args,
+            train=False,
+            pose_feature_adapter=pose_feature_adapter,
+        )
         rows.append({key: float(value.detach().cpu()) for key, value in metrics.items()})
         if args.eval_max_samples is not None and (batch_idx + 1) * int(args.batch_size) >= int(args.eval_max_samples):
             break
     return mean_metrics(rows)
 
 
-def save_checkpoint(path: Path, energy_net, model, optimizer, step: int, metrics: Dict[str, float], cfg: Dict, args):
+def save_checkpoint(
+    path: Path,
+    energy_net,
+    model,
+    optimizer,
+    step: int,
+    metrics: Dict[str, float],
+    cfg: Dict,
+    args,
+    *,
+    pose_feature_adapter=None,
+):
     path.parent.mkdir(parents=True, exist_ok=True)
     model_state = {
         key: value.detach().cpu()
@@ -475,6 +862,9 @@ def save_checkpoint(path: Path, energy_net, model, optimizer, step: int, metrics
             "step": int(step),
             "pose_energy_state_dict": energy_net.state_dict(),
             "query_projector_state_dict": model_state,
+            "pose_feature_adapter_state_dict": (
+                pose_feature_adapter.state_dict() if pose_feature_adapter is not None else None
+            ),
             "optimizer_state_dict": optimizer.state_dict(),
             "metrics": metrics,
             "config": cfg,
@@ -484,13 +874,27 @@ def save_checkpoint(path: Path, energy_net, model, optimizer, step: int, metrics
     )
 
 
-def load_pose_energy_checkpoint(path: str, energy_net, model, optimizer=None) -> Dict:
+def load_pose_energy_checkpoint(
+    path: str,
+    energy_net,
+    model,
+    optimizer=None,
+    pose_feature_adapter=None,
+    *,
+    load_energy: bool = True,
+    load_projector: bool = True,
+    load_adapter: bool = True,
+) -> Dict:
     checkpoint = torch.load(path, map_location="cpu")
-    energy_state = checkpoint.get("pose_energy_state_dict", checkpoint)
-    energy_net.load_state_dict(energy_state, strict=True)
+    if bool(load_energy):
+        energy_state = checkpoint.get("pose_energy_state_dict") or checkpoint.get("pose_energy_net_state_dict") or checkpoint
+        energy_net.load_state_dict(energy_state, strict=True)
     projector_state = checkpoint.get("query_projector_state_dict") or {}
-    if projector_state:
+    if bool(load_projector) and projector_state:
         model.load_state_dict(projector_state, strict=False)
+    adapter_state = checkpoint.get("pose_feature_adapter_state_dict")
+    if bool(load_adapter) and pose_feature_adapter is not None and adapter_state:
+        pose_feature_adapter.load_state_dict(adapter_state, strict=True)
     if optimizer is not None and checkpoint.get("optimizer_state_dict") is not None:
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     return checkpoint
@@ -519,6 +923,9 @@ def main() -> None:
 
     _set_trainable(model, ["local_corr_projector."] if bool(args.train_projector) else [])
     trainable = list(filter(lambda p: p.requires_grad, model.parameters()))
+    pose_feature_adapter = build_pose_feature_adapter(args, model, cfg, device)
+    if pose_feature_adapter is not None:
+        trainable.extend(pose_feature_adapter.parameters())
     energy_net = PoseEnergyNet(
         vector_dim=pose_energy_vector_dim(args),
         score_map_channels=3,
@@ -527,13 +934,23 @@ def main() -> None:
         hidden_dim=int(args.hidden_dim),
         context_layers=int(args.context_layers),
         context_heads=int(args.context_heads),
+        factorized_heads=bool(args.factorized_heads),
     ).to(device)
     trainable.extend(energy_net.parameters())
     optimizer = torch.optim.AdamW(trainable, lr=float(args.lr), weight_decay=float(args.weight_decay))
     scaler = torch.cuda.amp.GradScaler(enabled=bool(args.amp and device.type == "cuda"))
 
     if args.resume_pose_energy:
-        loaded = load_pose_energy_checkpoint(args.resume_pose_energy, energy_net, model, optimizer=None)
+        loaded = load_pose_energy_checkpoint(
+            args.resume_pose_energy,
+            energy_net,
+            model,
+            optimizer=None,
+            pose_feature_adapter=pose_feature_adapter,
+            load_energy=not bool(args.resume_adapter_only),
+            load_projector=not bool(args.resume_adapter_only),
+            load_adapter=True,
+        )
         print(
             "loaded pose-energy checkpoint: {path} step={step}".format(
                 path=args.resume_pose_energy,
@@ -543,7 +960,15 @@ def main() -> None:
         )
 
     if args.eval_only:
-        eval_metrics = evaluate(model, energy_net, eval_loader, map_renderer, cfg, args)
+        eval_metrics = evaluate(
+            model,
+            energy_net,
+            eval_loader,
+            map_renderer,
+            cfg,
+            args,
+            pose_feature_adapter=pose_feature_adapter,
+        )
         summary = {
             "checkpoint": args.resume_pose_energy,
             "eval_split": args.eval_split,
@@ -566,9 +991,20 @@ def main() -> None:
             batch = next(train_iter)
         model.train(bool(args.train_projector))
         energy_net.train()
+        if pose_feature_adapter is not None:
+            pose_feature_adapter.train()
         optimizer.zero_grad(set_to_none=True)
         with torch.cuda.amp.autocast(enabled=bool(args.amp and device.type == "cuda")):
-            loss, metrics = forward_pose_energy_batch(model, energy_net, map_renderer, batch, cfg, args, train=True)
+            loss, metrics = forward_pose_energy_batch(
+                model,
+                energy_net,
+                map_renderer,
+                batch,
+                cfg,
+                args,
+                train=True,
+                pose_feature_adapter=pose_feature_adapter,
+            )
         scaler.scale(loss).backward()
         if float(args.grad_clip) > 0.0:
             scaler.unscale_(optimizer)
@@ -584,6 +1020,8 @@ def main() -> None:
         if step == 1 or step % 10 == 0:
             print(
                 "step={step} loss={loss:.4f} e={energy_loss:.4f} r={residual_loss:.4f} "
+                "anti={anti_identity_loss:.4f} pair={pairwise_rank_loss:.4f} "
+                "rs={render_score_ce_loss:.4f}/{render_score_pairwise_loss:.4f} "
                 "pred={pred_cost_m:.3f} oracle={oracle_cost_m:.3f} "
                 "gap={oracle_gap_m:.3f} sp={spearman:.3f} auc={good_bad_auc:.3f} syn={synthetic_fraction:.2f}".format(
                     **row
@@ -591,7 +1029,15 @@ def main() -> None:
                 flush=True,
             )
         if step % int(args.eval_every) == 0 or step == int(args.max_steps):
-            eval_metrics = evaluate(model, energy_net, eval_loader, map_renderer, cfg, args)
+            eval_metrics = evaluate(
+                model,
+                energy_net,
+                eval_loader,
+                map_renderer,
+                cfg,
+                args,
+                pose_feature_adapter=pose_feature_adapter,
+            )
             eval_row = {"step": step, "split": "eval"}
             eval_row.update(eval_metrics)
             with log_path.open("a", encoding="utf-8") as f:
@@ -600,9 +1046,29 @@ def main() -> None:
             metric = float(eval_metrics.get(str(args.best_metric), float("inf")))
             if metric < best_metric:
                 best_metric = metric
-                save_checkpoint(out_dir / "checkpoints" / "best.pth", energy_net, model, optimizer, step, eval_metrics, cfg, args)
+                save_checkpoint(
+                    out_dir / "checkpoints" / "best.pth",
+                    energy_net,
+                    model,
+                    optimizer,
+                    step,
+                    eval_metrics,
+                    cfg,
+                    args,
+                    pose_feature_adapter=pose_feature_adapter,
+                )
         if step % int(args.save_every) == 0:
-            save_checkpoint(out_dir / "checkpoints" / f"step_{step:06d}.pth", energy_net, model, optimizer, step, row, cfg, args)
+            save_checkpoint(
+                out_dir / "checkpoints" / f"step_{step:06d}.pth",
+                energy_net,
+                model,
+                optimizer,
+                step,
+                row,
+                cfg,
+                args,
+                pose_feature_adapter=pose_feature_adapter,
+            )
 
     summary = {"best_pred_cost_m": best_metric, "steps": step, "out_dir": str(out_dir)}
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")

@@ -14,16 +14,25 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from feature_extract.students.pose_energy_net import PoseEnergyNet, pose_costs_and_residual_targets  # noqa: E402
+from feature_extract.students.pose_energy_net import (  # noqa: E402
+    PoseEnergyNet,
+    pose_energy_factorized_selection,
+    pose_costs_and_residual_targets,
+    pose_energy_selection_scores,
+)
 from feature_extract.tools.eval_cpr_buckets import build_model_and_data, gather_pose_bank, map_pose_gt_for_batch  # noqa: E402
 from feature_extract.tools.train_pose_energy import (  # noqa: E402
     _good_bad_auc_rows,
     _spearman_rows,
+    apply_pose_feature_adapter,
+    apply_pose_feature_adapter_with_uncertainty,
     apply_config_defaults,
+    build_pose_feature_adapter,
     load_pose_energy_checkpoint,
     parse_float_csv,
     pose_energy_vector_dim,
 )
+from feature_extract.tools.train_nvs_pose_feature_adapter import adaptive_lattice_spec_for_error  # noqa: E402
 from feature_extract.train_impl import (  # noqa: E402
     build_local_pose_lattice_candidates,
     camera_centers_from_w2c,
@@ -52,28 +61,39 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=20260511)
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--query-fine-key", default=None)
-    parser.add_argument("--require-projector", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--require-projector", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--topk", type=int, default=None)
     parser.add_argument("--lattice-trans-cm", default=None)
     parser.add_argument("--lattice-rot-deg", default=None)
     parser.add_argument("--lattice-direction-mode", choices=("axis", "cube"), default=None)
     parser.add_argument("--combine-trans-rot", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--limit-strategy", default=None)
+    parser.add_argument(
+        "--candidate-bank-mode",
+        choices=("lattice", "balanced", "adaptive", "adaptive_balanced", "bucket_adaptive", "adaptive_direction_balanced"),
+        default=None,
+    )
     parser.add_argument("--score-radius", type=int, default=None)
     parser.add_argument("--score-preprocess", default=None)
     parser.add_argument("--score-highpass-kernel", type=int, default=None)
     parser.add_argument("--score-map-mode", default=None)
     parser.add_argument("--use-delta-vector", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--use-center-delta-vector", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--use-uncertainty", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--hidden-dim", type=int, default=None)
     parser.add_argument("--map-channels", type=int, default=None)
     parser.add_argument("--grid-size", type=int, default=None)
     parser.add_argument("--context-layers", type=int, default=None)
     parser.add_argument("--context-heads", type=int, default=None)
+    parser.add_argument("--factorized-heads", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--rot-cost-weight", type=float, default=None)
     parser.add_argument("--auc-good-m", type=float, default=None)
     parser.add_argument("--auc-bad-m", type=float, default=None)
     parser.add_argument("--buckets", default="10:2,25:5,50:10,100:20")
     parser.add_argument("--residual-scale", type=float, default=1.0)
+    parser.add_argument("--selection-mode", choices=("joint", "factorized"), default="joint")
+    parser.add_argument("--selection-confidence-weight", type=float, default=None)
+    parser.add_argument("--selection-residual-norm-weight", type=float, default=None)
     parser.add_argument("--basin-trans-m", type=float, default=0.25)
     parser.add_argument("--basin-rot-deg", type=float, default=5.0)
     return parser.parse_args()
@@ -107,15 +127,37 @@ def fixed_bucket_init_pose(pose_gt: torch.Tensor, trans_cm: float, rot_deg: floa
     return apply_pose_delta(pose_gt.float(), delta.float()).to(dtype=pose_gt.dtype)
 
 
-def build_candidate_bank(init_pose: torch.Tensor, args: argparse.Namespace) -> torch.Tensor:
+def build_candidate_bank(
+    init_pose: torch.Tensor,
+    args: argparse.Namespace,
+    *,
+    trans_cm: float | None = None,
+    rot_deg: float | None = None,
+) -> torch.Tensor:
+    combine_trans_rot = bool(args.combine_trans_rot)
+    bank_mode = str(getattr(args, "candidate_bank_mode", "lattice") or "lattice").lower()
+    lattice_trans = parse_float_csv(args.lattice_trans_cm)
+    lattice_rot = parse_float_csv(args.lattice_rot_deg)
+    if (
+        bank_mode in {"adaptive", "adaptive_balanced", "bucket_adaptive", "adaptive_direction_balanced"}
+        and trans_cm is not None
+        and rot_deg is not None
+    ):
+        lattice_trans, lattice_rot = adaptive_lattice_spec_for_error(
+            float(trans_cm) / 100.0,
+            math.radians(float(rot_deg)),
+        )
+        combine_trans_rot = True
+    elif bank_mode == "balanced":
+        combine_trans_rot = True
     return build_local_pose_lattice_candidates(
         init_pose,
-        trans_cm=parse_float_csv(args.lattice_trans_cm),
-        rot_deg=parse_float_csv(args.lattice_rot_deg),
+        trans_cm=lattice_trans,
+        rot_deg=lattice_rot,
         include_identity=True,
         max_candidates=int(args.topk),
         limit_strategy=args.limit_strategy,
-        combine_trans_rot=bool(args.combine_trans_rot),
+        combine_trans_rot=combine_trans_rot,
         direction_mode=args.lattice_direction_mode,
     )
 
@@ -134,7 +176,18 @@ def safe_cosine_rows(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 
 
 @torch.no_grad()
-def evaluate_bucket(model, energy_net, loader, map_renderer, cfg: Dict, args: argparse.Namespace, trans_cm: float, rot_deg: float):
+def evaluate_bucket(
+    model,
+    energy_net,
+    loader,
+    map_renderer,
+    cfg: Dict,
+    args: argparse.Namespace,
+    trans_cm: float,
+    rot_deg: float,
+    *,
+    pose_feature_adapter=None,
+):
     device = next(energy_net.parameters()).device
     rows: Dict[str, List[float]] = {
         "init_trans_m": [],
@@ -172,12 +225,14 @@ def evaluate_bucket(model, energy_net, loader, map_renderer, cfg: Dict, args: ar
     }
     model.eval()
     energy_net.eval()
+    if pose_feature_adapter is not None:
+        pose_feature_adapter.eval()
     processed = 0
     for batch in loader:
         batch = move_batch_to_device(batch, device)
         pose_gt = map_pose_gt_for_batch(map_renderer, batch, device)
         init_pose = fixed_bucket_init_pose(pose_gt, trans_cm, rot_deg)
-        candidate_poses = build_candidate_bank(init_pose, args)
+        candidate_poses = build_candidate_bank(init_pose, args, trans_cm=trans_cm, rot_deg=rot_deg)
         cand_batch = dict(batch)
         cand_batch = map_renderer.attach_pose_candidate_renders(
             cand_batch,
@@ -189,17 +244,63 @@ def evaluate_bucket(model, energy_net, loader, map_renderer, cfg: Dict, args: ar
         )
         query_fine_key = args.query_fine_key or cfg.get("map_supervision", {}).get("query_fine_key", "fine")
         with torch.autocast(device_type=device.type, enabled=bool(args.amp and device.type == "cuda")):
-            outputs = model(batch["rgb"])
+            if bool(cfg.get("model", {}).get("teacher_fine_condition", False)):
+                outputs = model(batch["rgb"], teacher_fine=batch.get("teacher_fine"))
+            else:
+                outputs = model(batch["rgb"])
         query_fine = outputs[query_fine_key].float()
         render_fine = cand_batch["pose_energy_candidate_fine"].float()
         projector = getattr(model, "local_corr_projector", None)
-        query_proj, render_proj, _used_projector = project_query_render_for_fine_selector(
-            projector,
-            query_fine,
-            render_fine,
-            require_projector=bool(args.require_projector),
-            render_chunk_size=int(cfg.get("map_supervision", {}).get("candidate_render_score_projector_chunk_size", 0) or 0),
-        )
+        query_uncertainty = None
+        render_uncertainty = None
+        if pose_feature_adapter is not None:
+            query_proj = query_fine
+            render_proj = render_fine
+            if bool(args.pose_feature_adapter_after_projector):
+                query_proj, render_proj, _used_projector = project_query_render_for_fine_selector(
+                    projector,
+                    query_fine,
+                    render_fine,
+                    require_projector=bool(args.require_projector),
+                    render_chunk_size=int(
+                        cfg.get("map_supervision", {}).get("candidate_render_score_projector_chunk_size", 0) or 0
+                    ),
+                )
+            render_chunk_size = int(
+                cfg.get("map_supervision", {}).get("candidate_render_score_projector_chunk_size", 0) or 0
+            )
+            if bool(args.use_uncertainty):
+                (
+                    query_proj,
+                    render_proj,
+                    query_uncertainty,
+                    render_uncertainty,
+                    _used_pose_feature_adapter,
+                ) = apply_pose_feature_adapter_with_uncertainty(
+                    pose_feature_adapter,
+                    query_proj,
+                    render_proj,
+                    render_chunk_size=render_chunk_size,
+                )
+            else:
+                query_proj, render_proj, _used_pose_feature_adapter = apply_pose_feature_adapter(
+                    pose_feature_adapter,
+                    query_proj,
+                    render_proj,
+                    render_chunk_size=render_chunk_size,
+                )
+        else:
+            if bool(args.use_uncertainty):
+                raise ValueError("use_uncertainty requires pose_feature_adapter_enabled=true")
+            query_proj, render_proj, _used_projector = project_query_render_for_fine_selector(
+                projector,
+                query_fine,
+                render_fine,
+                require_projector=bool(args.require_projector),
+                render_chunk_size=int(
+                    cfg.get("map_supervision", {}).get("candidate_render_score_projector_chunk_size", 0) or 0
+                ),
+            )
         feature_pack = fine_candidate_selector_features(
             query_proj,
             render_proj,
@@ -216,9 +317,13 @@ def evaluate_bucket(model, energy_net, loader, map_renderer, cfg: Dict, args: ar
             use_coarse_logits=False,
             use_candidate_delta=True,
             use_delta_vector=bool(args.use_delta_vector),
+            use_center_delta_vector=bool(args.use_center_delta_vector),
             use_depth=True,
             use_mask=True,
             use_rgb=False,
+            query_uncertainty=query_uncertainty,
+            candidate_uncertainty=render_uncertainty,
+            use_uncertainty=bool(args.use_uncertainty),
         )
         energy_out = energy_net(
             feature_pack["score_maps"],
@@ -231,13 +336,36 @@ def evaluate_bucket(model, energy_net, loader, map_renderer, cfg: Dict, args: ar
             valid_mask=feature_pack["valid"],
             rot_cost_weight=float(args.rot_cost_weight),
         )
-        logits = energy_out["energy_logits"]
-        pred_idx = logits.argmax(dim=1)
+        logits = pose_energy_selection_scores(
+            energy_out,
+            confidence_weight=float(args.selection_confidence_weight or 0.0),
+            residual_norm_weight=float(args.selection_residual_norm_weight or 0.0),
+            residual_trans_scale_m=float(getattr(args, "residual_trans_scale_m", 0.25)),
+            residual_rot_scale_rad=math.radians(float(getattr(args, "residual_rot_scale_deg", 5.0))),
+        )
+        selection_mode = str(args.selection_mode or "joint").lower()
         best_idx = costs.argmin(dim=1)
         batch_idx = torch.arange(pose_gt.shape[0], device=device)
-        selected_pose = gather_pose_bank(cand_batch["pose_energy_candidate_pose"].float(), pred_idx[:, None])[:, 0]
-        residual_delta = energy_out["residual_delta"][batch_idx, pred_idx].float() * float(args.residual_scale)
-        residual_pose = apply_pose_delta(selected_pose.float(), residual_delta)
+        if selection_mode == "factorized":
+            selected_pose, trans_idx, rot_idx = pose_energy_factorized_selection(
+                energy_out,
+                cand_batch["pose_energy_candidate_pose"].float(),
+                valid_mask=feature_pack["valid"],
+            )
+            pred_idx = trans_idx
+            residual_pose = selected_pose.float()
+            selected_cost, _selected_residual, _selected_trans_err, _selected_rot_err = pose_costs_and_residual_targets(
+                selected_pose.float()[:, None],
+                pose_gt.float(),
+                rot_cost_weight=float(args.rot_cost_weight),
+            )
+            selected_cost = selected_cost[:, 0]
+        else:
+            pred_idx = logits.argmax(dim=1)
+            selected_pose = gather_pose_bank(cand_batch["pose_energy_candidate_pose"].float(), pred_idx[:, None])[:, 0]
+            residual_delta = energy_out["residual_delta"][batch_idx, pred_idx].float() * float(args.residual_scale)
+            residual_pose = apply_pose_delta(selected_pose.float(), residual_delta)
+            selected_cost = costs[batch_idx, pred_idx]
         _init_loss, init_rot, init_trans = pose_error_tensors(init_pose.float(), pose_gt.float())
         _sel_loss, sel_rot, sel_trans = pose_error_tensors(selected_pose.float(), pose_gt.float())
         _res_loss, res_rot, res_trans = pose_error_tensors(residual_pose.float(), pose_gt.float())
@@ -249,7 +377,8 @@ def evaluate_bucket(model, energy_net, loader, map_renderer, cfg: Dict, args: ar
             cand_batch["pose_energy_candidate_pose"].float().reshape(-1, 4, 4)
         ).reshape(pose_gt.shape[0], -1, 3)
         correction_target = gt_centers - init_centers
-        selected_correction = cand_centers[batch_idx, pred_idx] - init_centers
+        selected_centers = camera_centers_from_w2c(selected_pose.float())
+        selected_correction = selected_centers - init_centers
         oracle_correction = cand_centers[batch_idx, best_idx] - init_centers
         selected_delta_trans = torch.linalg.norm(selected_correction, dim=1)
         oracle_delta_trans = torch.linalg.norm(oracle_correction, dim=1)
@@ -261,7 +390,10 @@ def evaluate_bucket(model, energy_net, loader, map_renderer, cfg: Dict, args: ar
         delta_rot_deg = delta_rot_deg_flat.reshape(pose_gt.shape[0], -1)
         delta_trans_m = delta_trans_flat.reshape(pose_gt.shape[0], -1)
         identity_idx = delta_trans_m.argmin(dim=1)
-        selected_delta_rot = delta_rot_deg[batch_idx, pred_idx]
+        _selected_delta_loss, selected_delta_rot, _selected_delta_trans_pose = pose_error_tensors(
+            selected_pose.float(),
+            init_pose.float(),
+        )
         oracle_delta_rot = delta_rot_deg[batch_idx, best_idx]
         init_trans_safe = init_trans.clamp(min=1.0e-6)
         selected_correction_cos = safe_cosine_rows(selected_correction, correction_target)
@@ -295,7 +427,7 @@ def evaluate_bucket(model, energy_net, loader, map_renderer, cfg: Dict, args: ar
                 ).cpu()
             )
         )
-        rows["pred_cost_m"].extend(costs[batch_idx, pred_idx].cpu().tolist())
+        rows["pred_cost_m"].extend(selected_cost.cpu().tolist())
         rows["oracle_cost_m"].extend(costs[batch_idx, best_idx].cpu().tolist())
         rows["selected_delta_trans_m"].extend(selected_delta_trans.cpu().tolist())
         rows["selected_delta_rot_deg"].extend(selected_delta_rot.cpu().tolist())
@@ -305,7 +437,9 @@ def evaluate_bucket(model, energy_net, loader, map_renderer, cfg: Dict, args: ar
         rows["oracle_delta_over_init"].extend((oracle_delta_trans / init_trans_safe).cpu().tolist())
         rows["selected_correction_cos"].extend(selected_correction_cos.cpu().tolist())
         rows["oracle_correction_cos"].extend(oracle_correction_cos.cpu().tolist())
-        rows["selected_identity"].extend((pred_idx == identity_idx).float().cpu().tolist())
+        rows["selected_identity"].extend(
+            ((selected_delta_trans < 0.01) & (selected_delta_rot < 0.01)).float().cpu().tolist()
+        )
         rows["selected_near_center"].extend((selected_delta_trans < 0.01).float().cpu().tolist())
         rows["oracle_identity"].extend((best_idx == identity_idx).float().cpu().tolist())
         rows["oracle_near_center"].extend((oracle_delta_trans < 0.01).float().cpu().tolist())
@@ -380,12 +514,30 @@ def main() -> None:
         hidden_dim=int(args.hidden_dim),
         context_layers=int(args.context_layers),
         context_heads=int(args.context_heads),
+        factorized_heads=bool(args.factorized_heads),
     ).to(device)
-    load_pose_energy_checkpoint(args.pose_energy_checkpoint, energy_net, model, optimizer=None)
+    pose_feature_adapter = build_pose_feature_adapter(args, model, cfg, device)
+    load_pose_energy_checkpoint(
+        args.pose_energy_checkpoint,
+        energy_net,
+        model,
+        optimizer=None,
+        pose_feature_adapter=pose_feature_adapter,
+    )
     results = {}
     for name, trans_cm, rot_deg in parse_buckets(args.buckets):
         print(f"evaluating bucket {name}", flush=True)
-        results[name] = evaluate_bucket(model, energy_net, loader, map_renderer, cfg, args, trans_cm, rot_deg)
+        results[name] = evaluate_bucket(
+            model,
+            energy_net,
+            loader,
+            map_renderer,
+            cfg,
+            args,
+            trans_cm,
+            rot_deg,
+            pose_feature_adapter=pose_feature_adapter,
+        )
         print(json.dumps({name: results[name]}, sort_keys=True), flush=True)
     summary = {
         "checkpoint": args.pose_energy_checkpoint,

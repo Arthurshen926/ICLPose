@@ -2226,7 +2226,7 @@ def test_map_feature_renderer_attach_pose_candidate_renders_shapes():
             alpha = torch.ones(1, 1, 1, 2)
             rgb = torch.zeros(1, 3, 1, 2)
             depth = torch.ones(1, 1, 1, 2)
-            pos = torch.zeros(1, 3, 1, 2)
+            pos = torch.full((1, 3, 1, 2), scale + 2.0)
             return zeros_f, fine, coarse, mask, alpha, rgb, depth, pos
 
     renderer = FakeRenderer()
@@ -2243,8 +2243,10 @@ def test_map_feature_renderer_attach_pose_candidate_renders_shapes():
     assert batch["rendered_map_candidate_coarse"].shape == (2, 2, 3, 1, 2)
     assert batch["rendered_map_candidate_mask"].shape == (2, 2, 1, 1, 2)
     assert batch["rendered_map_candidate_depth"].shape == (2, 2, 1, 1, 2)
+    assert batch["rendered_map_candidate_position"].shape == (2, 2, 3, 1, 2)
     assert batch["rendered_map_candidate_intrinsics"].shape == (2, 2, 4)
     assert torch.allclose(batch["rendered_map_candidate_pose"], poses)
+    assert torch.allclose(batch["rendered_map_candidate_position"][0, 1], torch.full((3, 1, 2), 1.0))
 
 
 def test_map_feature_renderer_attach_pose_candidate_renders_supports_coarse_only():
@@ -3380,6 +3382,60 @@ def test_fine_candidate_selector_feature_flags_can_remove_motion_prior():
         "inv_depth_mean_zscore",
     ):
         assert torch.allclose(features[..., names.index(name)], torch.zeros(1, 2))
+
+
+def test_fine_candidate_selector_features_include_uncertainty_stats():
+    h, w = 3, 3
+    query = torch.randn(1, 4, h, w)
+    candidates = torch.randn(1, 2, 4, h, w)
+    candidate_pose = torch.eye(4).view(1, 1, 4, 4).repeat(1, 2, 1, 1)
+    query_uncertainty = torch.ones(1, 1, h, w)
+    candidate_uncertainty = torch.zeros(1, 2, 1, h, w)
+    candidate_uncertainty[:, 0] = 1.0
+
+    features = train_impl.fine_candidate_selector_features(
+        query,
+        candidates,
+        candidate_pose,
+        query_uncertainty=query_uncertainty,
+        candidate_uncertainty=candidate_uncertainty,
+        use_uncertainty=True,
+    )["features"]
+    names = train_impl.FINE_CANDIDATE_SELECTOR_VECTOR_FEATURE_NAMES
+
+    assert "uncertainty_overlap" in names
+    assert features.shape[-1] == len(names)
+    assert features[0, 0, names.index("uncertainty_overlap")] > features[0, 1, names.index("uncertainty_overlap")]
+
+
+def test_fine_candidate_selector_features_can_include_center_delta_vector():
+    h, w = 3, 3
+    query = torch.randn(1, 4, h, w)
+    candidates = torch.randn(1, 2, 4, h, w)
+    query_uncertainty = torch.zeros(1, 1, h, w)
+    candidate_uncertainty = torch.zeros(1, 2, 1, h, w)
+    init_pose = torch.eye(4).view(1, 4, 4)
+    candidate_pose = torch.eye(4).view(1, 1, 4, 4).repeat(1, 2, 1, 1)
+    candidate_pose[0, 1, 0, 3] = -0.25
+
+    features = train_impl.fine_candidate_selector_features(
+        query,
+        candidates,
+        candidate_pose,
+        init_pose=init_pose,
+        query_uncertainty=query_uncertainty,
+        candidate_uncertainty=candidate_uncertainty,
+        use_uncertainty=True,
+        use_center_delta_vector=True,
+    )["features"]
+
+    names = (
+        train_impl.FINE_CANDIDATE_SELECTOR_VECTOR_FEATURE_NAMES
+        + train_impl.FINE_CANDIDATE_SELECTOR_CENTER_DELTA_VECTOR_FEATURE_NAMES
+    )
+    assert features.shape[-1] == len(names)
+    assert torch.allclose(features[0, 0, names.index("center_dx")], torch.tensor(0.0))
+    assert features[0, 1, names.index("center_dx")].abs() > 0.20
 
 
 def test_project_query_render_for_fine_selector_uses_domain_adapter_and_can_require_it():
