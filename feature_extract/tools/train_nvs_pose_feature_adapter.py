@@ -21,6 +21,7 @@ import torch.nn.functional as F
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from feature_extract.students.pose_energy_net import (  # noqa: E402
+    PairConditionedLocalMatcher,
     PoseEnergyNet,
     PoseFeatureDomainAdapter,
     pose_costs_and_residual_targets,
@@ -46,10 +47,15 @@ from feature_extract.train_impl import (  # noqa: E402
     FINE_CANDIDATE_SELECTOR_VECTOR_FEATURE_NAMES,
     build_local_pose_lattice_candidates,
     camera_centers_from_w2c,
+    candidate_quality_features_from_batch,
     fine_candidate_selector_features,
     load_config,
     move_batch_to_device,
+    sample_feature_at_xy,
     set_seed,
+    sparse_teacher_correspondence_loss,
+    sparse_teacher_local_patch_loss,
+    _scale_xy_tensor,
 )
 from pose_refine import apply_pose_delta  # noqa: E402
 from pose_refine.utils.lie_algebra import pose_inverse, se3_log  # noqa: E402
@@ -145,6 +151,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pose-feature-adapter-zero-init", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--pose-feature-adapter-l2-normalize", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--pose-feature-adapter-uncertainty-enabled", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--pose-feature-adapter-rgb-context-enabled", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--pose-feature-adapter-rgb-context-channels", type=int, default=None)
+    parser.add_argument("--pose-feature-adapter-texture-branch-enabled", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--pose-feature-adapter-texture-branch-hidden-dim", type=int, default=None)
+    parser.add_argument("--pose-feature-adapter-texture-branch-scale", type=float, default=None)
+    parser.add_argument("--pose-feature-adapter-texture-branch-zero-init", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--pose-feature-adapter-texture-fusion-mode", choices=("residual", "replace"), default=None)
+    parser.add_argument("--pose-feature-adapter-base-anchor-weight", type=float, default=None)
+    parser.add_argument("--pair-matcher-enabled", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--pair-matcher-weight", type=float, default=None)
+    parser.add_argument("--pair-matcher-hidden-dim", type=int, default=None)
+    parser.add_argument("--pair-matcher-radius", type=int, default=None)
+    parser.add_argument("--pair-matcher-temperature", type=float, default=None)
+    parser.add_argument("--pair-matcher-min-confidence", type=float, default=None)
+    parser.add_argument("--pair-matcher-min-points", type=int, default=None)
+    parser.add_argument("--pair-matcher-positive-weight", type=float, default=None)
+    parser.add_argument("--pair-matcher-margin-weight", type=float, default=None)
+    parser.add_argument("--pair-matcher-margin", type=float, default=None)
+    parser.add_argument("--pair-matcher-base-dot-weight", type=float, default=None)
+    parser.add_argument("--pair-matcher-zero-init-residual", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--pair-matcher-score-stride", type=int, default=None)
+    parser.add_argument("--pair-matcher-score-chunk-points", type=int, default=None)
+    parser.add_argument(
+        "--pair-matcher-candidate-score-mode",
+        choices=("center_logprob_margin", "center_margin"),
+        default=None,
+    )
     parser.add_argument("--query-fine-key", default=None)
     parser.add_argument("--topk", type=int, default=None)
     parser.add_argument("--lattice-trans-cm", default=None)
@@ -156,6 +189,7 @@ def parse_args() -> argparse.Namespace:
         "--candidate-bank-mode",
         choices=(
             "lattice",
+            "cache",
             "balanced",
             "direction_balanced",
             "adaptive",
@@ -166,7 +200,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
     )
     parser.add_argument("--direction-fractions", default=None)
-    parser.add_argument("--candidate-center-mode", choices=("gt", "noisy_init"), default=None)
+    parser.add_argument("--candidate-center-mode", choices=("gt", "noisy_init", "batch"), default=None)
     parser.add_argument("--candidate-center-noise-mode", choices=("uniform", "fixed"), default=None)
     parser.add_argument("--candidate-center-trans-cm", type=float, default=None)
     parser.add_argument("--candidate-center-rot-deg", type=float, default=None)
@@ -190,6 +224,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--score-anti-identity-min-gap-m", type=float, default=None)
     parser.add_argument("--score-anti-identity-logit-margin", type=float, default=None)
     parser.add_argument("--score-anti-identity-index", type=int, default=None)
+    parser.add_argument("--candidate-teacher-quality-weight", type=float, default=None)
+    parser.add_argument("--candidate-teacher-quality-target-mode", default=None)
+    parser.add_argument("--candidate-teacher-quality-temperature", type=float, default=None)
+    parser.add_argument("--candidate-teacher-quality-pairwise-weight", type=float, default=None)
+    parser.add_argument("--candidate-teacher-quality-pairwise-min-gap", type=float, default=None)
+    parser.add_argument("--candidate-teacher-quality-logit-margin", type=float, default=None)
     parser.add_argument("--align-weight", type=float, default=None)
     parser.add_argument("--align-margin", type=float, default=None)
     parser.add_argument("--warp-align-weight", type=float, default=None)
@@ -202,7 +242,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--score-use-uncertainty", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument(
         "--score-mode",
-        choices=("same_pixel", "local_zero_offset", "local_zero_only", "local_neg_expected_offset", "local_neg_peak_offset"),
+        choices=(
+            "same_pixel",
+            "local_zero_offset",
+            "local_zero_only",
+            "local_neg_expected_offset",
+            "local_neg_peak_offset",
+            "pair_matcher_local",
+        ),
         default=None,
     )
     parser.add_argument("--local-corr-radius", type=int, default=None)
@@ -210,6 +257,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--local-zero-peak-gap-weight", type=float, default=None)
     parser.add_argument("--local-zero-offset-weight", type=float, default=None)
     parser.add_argument("--local-flow-nce-weight", type=float, default=None)
+    parser.add_argument("--teacher-corr-weight", type=float, default=None)
+    parser.add_argument("--teacher-corr-temperature", type=float, default=None)
+    parser.add_argument("--teacher-corr-min-confidence", type=float, default=None)
+    parser.add_argument("--teacher-corr-min-points", type=int, default=None)
+    parser.add_argument("--teacher-corr-negative-exclusion-px", type=float, default=None)
+    parser.add_argument("--teacher-corr-positive-weight", type=float, default=None)
+    parser.add_argument("--teacher-corr-margin-weight", type=float, default=None)
+    parser.add_argument("--teacher-corr-margin", type=float, default=None)
+    parser.add_argument("--teacher-corr-local-patch-weight", type=float, default=None)
+    parser.add_argument("--teacher-corr-local-patch-radius", type=int, default=None)
+    parser.add_argument("--teacher-corr-local-patch-temperature", type=float, default=None)
+    parser.add_argument("--teacher-corr-local-patch-min-points", type=int, default=None)
+    parser.add_argument("--teacher-corr-local-patch-positive-weight", type=float, default=None)
+    parser.add_argument("--teacher-corr-local-patch-margin-weight", type=float, default=None)
+    parser.add_argument("--teacher-corr-local-patch-margin", type=float, default=None)
     parser.add_argument("--pose-energy-enabled", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--pose-energy-weight", type=float, default=None)
     parser.add_argument("--pose-energy-hidden-dim", type=int, default=None)
@@ -274,6 +336,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def apply_config_defaults(args: argparse.Namespace, cfg: Dict) -> argparse.Namespace:
+    cli_values = dict(vars(args))
     args = apply_pose_energy_defaults(args, cfg)
     nvs_cfg = dict(cfg.get("nvs_pose_feature_adapter", {}) or {})
     defaults = {
@@ -292,7 +355,19 @@ def apply_config_defaults(args: argparse.Namespace, cfg: Dict) -> argparse.Names
         "score_anti_identity_min_gap_m": 0.03,
         "score_anti_identity_logit_margin": 0.5,
         "score_anti_identity_index": 0,
+        "candidate_teacher_quality_weight": 0.0,
+        "candidate_teacher_quality_target_mode": "pnp_composite",
+        "candidate_teacher_quality_temperature": 0.5,
+        "candidate_teacher_quality_pairwise_weight": 0.1,
+        "candidate_teacher_quality_pairwise_min_gap": 0.25,
+        "candidate_teacher_quality_logit_margin": 0.5,
         "candidate_bank_mode": "lattice",
+        "topk": 64,
+        "lattice_trans_cm": "0,2,5,10,25,50",
+        "lattice_rot_deg": "0,0.5,1,2,5,10",
+        "lattice_direction_mode": "cube",
+        "combine_trans_rot": False,
+        "limit_strategy": "uniform",
         "candidate_center_buckets": None,
         "direction_fractions": "0.75,0.5,0.25",
         "include_identity_candidate": False,
@@ -314,6 +389,21 @@ def apply_config_defaults(args: argparse.Namespace, cfg: Dict) -> argparse.Names
         "local_zero_peak_gap_weight": 0.5,
         "local_zero_offset_weight": 0.05,
         "local_flow_nce_weight": 0.0,
+        "teacher_corr_weight": 0.0,
+        "teacher_corr_temperature": 0.07,
+        "teacher_corr_min_confidence": 0.0,
+        "teacher_corr_min_points": 4,
+        "teacher_corr_negative_exclusion_px": 0.0,
+        "teacher_corr_positive_weight": 0.0,
+        "teacher_corr_margin_weight": 0.0,
+        "teacher_corr_margin": 0.1,
+        "teacher_corr_local_patch_weight": 0.0,
+        "teacher_corr_local_patch_radius": 2,
+        "teacher_corr_local_patch_temperature": 0.05,
+        "teacher_corr_local_patch_min_points": 4,
+        "teacher_corr_local_patch_positive_weight": 0.0,
+        "teacher_corr_local_patch_margin_weight": 0.0,
+        "teacher_corr_local_patch_margin": 0.05,
         "pose_energy_enabled": False,
         "pose_energy_weight": 1.0,
         "pose_energy_hidden_dim": 128,
@@ -375,6 +465,29 @@ def apply_config_defaults(args: argparse.Namespace, cfg: Dict) -> argparse.Names
         "pose_feature_adapter_zero_init": True,
         "pose_feature_adapter_l2_normalize": True,
         "pose_feature_adapter_uncertainty_enabled": False,
+        "pose_feature_adapter_rgb_context_enabled": False,
+        "pose_feature_adapter_rgb_context_channels": 8,
+        "pose_feature_adapter_texture_branch_enabled": False,
+        "pose_feature_adapter_texture_branch_hidden_dim": 32,
+        "pose_feature_adapter_texture_branch_scale": 0.25,
+        "pose_feature_adapter_texture_branch_zero_init": True,
+        "pose_feature_adapter_texture_fusion_mode": "residual",
+        "pose_feature_adapter_base_anchor_weight": 1.0,
+        "pair_matcher_enabled": False,
+        "pair_matcher_weight": 0.0,
+        "pair_matcher_hidden_dim": 64,
+        "pair_matcher_radius": 3,
+        "pair_matcher_temperature": 0.05,
+        "pair_matcher_min_confidence": 0.0,
+        "pair_matcher_min_points": 4,
+        "pair_matcher_positive_weight": 0.0,
+        "pair_matcher_margin_weight": 0.0,
+        "pair_matcher_margin": 0.05,
+        "pair_matcher_base_dot_weight": 1.0,
+        "pair_matcher_zero_init_residual": True,
+        "pair_matcher_score_stride": 8,
+        "pair_matcher_score_chunk_points": 65536,
+        "pair_matcher_candidate_score_mode": "center_logprob_margin",
         "synthetic_ratio": 0.5,
         "synthetic_trans_cm": 50.0,
         "synthetic_rot_deg": 10.0,
@@ -382,9 +495,12 @@ def apply_config_defaults(args: argparse.Namespace, cfg: Dict) -> argparse.Names
         "auc_bad_m": 0.25,
     }
     for key, fallback in defaults.items():
-        if getattr(args, key, None) is not None:
+        if cli_values.get(key, None) is not None:
             continue
-        setattr(args, key, nvs_cfg.get(key, fallback))
+        if key in nvs_cfg:
+            setattr(args, key, nvs_cfg[key])
+        elif getattr(args, key, None) is None:
+            setattr(args, key, fallback)
     if getattr(args, "best_metric", None) is None:
         default_best = "pose_energy_pred_cost_m" if bool(args.pose_energy_enabled) else "pred_cost_m"
         args.best_metric = nvs_cfg.get("best_metric", default_best)
@@ -505,28 +621,63 @@ def project_render_bank_with_uncertainty(
     adapter: PoseFeatureDomainAdapter,
     render_feature: torch.Tensor,
     *,
+    render_rgb: torch.Tensor | None = None,
     render_chunk_size: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if render_feature.ndim != 5:
         raise ValueError("render_feature must have shape (B,K,C,H,W)")
     bsz, num_candidates, channels, height, width = render_feature.shape
     render_flat = render_feature.reshape(bsz * num_candidates, channels, height, width)
+    rgb_flat = None
+    if render_rgb is not None:
+        if render_rgb.ndim != 5 or render_rgb.shape[:2] != (bsz, num_candidates) or render_rgb.shape[2] != 3:
+            raise ValueError("render_rgb must have shape (B,K,3,H,W)")
+        rgb_flat = render_rgb.reshape(bsz * num_candidates, 3, render_rgb.shape[-2], render_rgb.shape[-1])
     chunk_size = int(render_chunk_size or 0)
     if chunk_size > 0 and render_flat.shape[0] > chunk_size:
         loc_pieces = []
         unc_pieces = []
         for start in range(0, render_flat.shape[0], chunk_size):
-            loc, unc = adapter.project_render_with_uncertainty(render_flat[start : start + chunk_size])
+            rgb_chunk = rgb_flat[start : start + chunk_size] if rgb_flat is not None else None
+            loc, unc = adapter.project_render_with_uncertainty(render_flat[start : start + chunk_size], rgb=rgb_chunk)
             loc_pieces.append(loc)
             unc_pieces.append(unc)
         render_loc = torch.cat(loc_pieces, dim=0)
         render_uncertainty = torch.cat(unc_pieces, dim=0)
     else:
-        render_loc, render_uncertainty = adapter.project_render_with_uncertainty(render_flat)
+        render_loc, render_uncertainty = adapter.project_render_with_uncertainty(render_flat, rgb=rgb_flat)
     return (
         render_loc.reshape(bsz, num_candidates, channels, height, width),
         render_uncertainty.reshape(bsz, num_candidates, 1, height, width),
     )
+
+
+def project_render_bank(
+    adapter: PoseFeatureDomainAdapter,
+    render_feature: torch.Tensor,
+    *,
+    render_rgb: torch.Tensor | None = None,
+    render_chunk_size: int = 0,
+) -> torch.Tensor:
+    if render_feature.ndim != 5:
+        raise ValueError("render_feature must have shape (B,K,C,H,W)")
+    bsz, num_candidates, channels, height, width = render_feature.shape
+    render_flat = render_feature.reshape(bsz * num_candidates, channels, height, width)
+    rgb_flat = None
+    if render_rgb is not None:
+        if render_rgb.ndim != 5 or render_rgb.shape[:2] != (bsz, num_candidates) or render_rgb.shape[2] != 3:
+            raise ValueError("render_rgb must have shape (B,K,3,H,W)")
+        rgb_flat = render_rgb.reshape(bsz * num_candidates, 3, render_rgb.shape[-2], render_rgb.shape[-1])
+    chunk_size = int(render_chunk_size or 0)
+    if chunk_size > 0 and render_flat.shape[0] > chunk_size:
+        pieces = []
+        for start in range(0, render_flat.shape[0], chunk_size):
+            rgb_chunk = rgb_flat[start : start + chunk_size] if rgb_flat is not None else None
+            pieces.append(adapter.project_render(render_flat[start : start + chunk_size], rgb=rgb_chunk))
+        render_loc = torch.cat(pieces, dim=0)
+    else:
+        render_loc = adapter.project_render(render_flat, rgb=rgb_flat)
+    return render_loc.reshape(bsz, num_candidates, channels, height, width)
 
 
 def _direction_fractions(args: argparse.Namespace) -> List[float]:
@@ -1051,6 +1202,148 @@ def local_zero_offset_correlation_scores(
     )
 
 
+def pair_matcher_local_candidate_scores(
+    matcher: PairConditionedLocalMatcher,
+    query_feature: torch.Tensor,
+    render_feature: torch.Tensor,
+    mask: torch.Tensor | None = None,
+    *,
+    radius: int = 3,
+    stride: int = 8,
+    temperature: float = 0.05,
+    chunk_points: int = 65536,
+    candidate_score_mode: str = "center_logprob_margin",
+) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """Score pose candidates with a pair-conditioned local heatmap decoder.
+
+    A sparse regular grid is used to keep memory bounded.  For each sampled
+    query pixel, the matcher sees the candidate render patch centered at the
+    same pixel.  Good candidates should put probability mass on the zero-offset
+    center; bad candidates should move the peak away from center.
+    """
+    if query_feature.ndim != 4 or render_feature.ndim != 5:
+        raise ValueError("expected query (B,C,H,W) and render (B,K,C,H,W)")
+    radius = max(int(radius), 0)
+    stride = max(int(stride), 1)
+    chunk_points = max(int(chunk_points), 1)
+    target_hw = tuple(render_feature.shape[-2:])
+    query = _resize_feature(query_feature.float(), target_hw)
+    render = render_feature.float()
+    channels = min(int(query.shape[1]), int(render.shape[2]))
+    query = query[:, :channels]
+    render = render[:, :, :channels]
+    bsz, num_candidates, _channels, height, width = render.shape
+    ys = torch.arange(stride // 2, height, stride, device=query.device, dtype=query.dtype)
+    xs = torch.arange(stride // 2, width, stride, device=query.device, dtype=query.dtype)
+    if ys.numel() == 0:
+        ys = torch.arange(0, height, device=query.device, dtype=query.dtype)
+    if xs.numel() == 0:
+        xs = torch.arange(0, width, device=query.device, dtype=query.dtype)
+    grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+    xy = torch.stack([grid_x.reshape(-1), grid_y.reshape(-1)], dim=-1)
+    num_points = int(xy.shape[0])
+    valid_grid = torch.ones((bsz, num_points), device=query.device, dtype=query.dtype)
+    query_xy = xy[None].expand(bsz, -1, -1)
+    query_sparse, query_in = sample_feature_at_xy(query, query_xy, valid_grid, source_hw=None)
+
+    render_flat = render.reshape(bsz * num_candidates, channels, height, width)
+    render_xy = xy[None].expand(bsz * num_candidates, -1, -1)
+    offset_axis = torch.arange(-radius, radius + 1, device=query.device, dtype=query.dtype)
+    dy, dx = torch.meshgrid(offset_axis, offset_axis, indexing="ij")
+    offsets = torch.stack([dx.reshape(-1), dy.reshape(-1)], dim=-1)
+    center_index = int(((offsets[:, 0] == 0) & (offsets[:, 1] == 0)).nonzero(as_tuple=False)[0].item())
+    patch_xy = render_xy[:, :, None, :] + offsets[None, None, :, :]
+    patch_sparse, patch_in = sample_feature_at_xy(
+        render_flat,
+        patch_xy.reshape(bsz * num_candidates, num_points * offsets.shape[0], 2),
+        torch.ones(
+            (bsz * num_candidates, num_points * offsets.shape[0]),
+            device=query.device,
+            dtype=query.dtype,
+        ),
+        source_hw=None,
+    )
+    patch_sparse = patch_sparse.reshape(bsz, num_candidates, num_points, offsets.shape[0], channels)
+    patch_in = patch_in.reshape(bsz, num_candidates, num_points, offsets.shape[0])
+
+    center_valid = query_in[:, None, :] & patch_in[:, :, :, center_index]
+    if mask is not None:
+        mask_2d = _resize_mask(mask, target_hw)
+        if mask_2d.ndim == 5:
+            mask_2d = mask_2d[:, :, 0]
+        elif mask_2d.ndim == 4:
+            if mask_2d.shape[1] == 1:
+                mask_2d = mask_2d[:, 0][:, None].expand(-1, num_candidates, -1, -1)
+            elif mask_2d.shape[1] != num_candidates:
+                raise ValueError(f"mask candidate dimension {mask_2d.shape[1]} cannot broadcast to K={num_candidates}")
+        else:
+            raise ValueError("mask must have shape (B,K,H,W), (B,K,1,H,W), or (B,1,H,W)")
+        mask_flat = mask_2d.reshape(bsz * num_candidates, 1, height, width)
+        mask_sparse, mask_in = sample_feature_at_xy(
+            mask_flat,
+            render_xy,
+            torch.ones((bsz * num_candidates, num_points), device=query.device, dtype=query.dtype),
+            source_hw=None,
+        )
+        mask_sparse = mask_sparse[..., 0].reshape(bsz, num_candidates, num_points)
+        mask_in = mask_in.reshape(bsz, num_candidates, num_points)
+        center_valid = center_valid & mask_in & (mask_sparse > 0.5)
+
+    q_all = query_sparse[:, None].expand(-1, num_candidates, -1, -1).reshape(
+        bsz * num_candidates * num_points,
+        channels,
+    )
+    patch_all = patch_sparse.reshape(bsz * num_candidates * num_points, offsets.shape[0], channels)
+    patch_valid_all = patch_in.reshape(bsz * num_candidates * num_points, offsets.shape[0])
+    logits_chunks = []
+    for start in range(0, q_all.shape[0], chunk_points):
+        logits_chunks.append(
+            matcher(
+                q_all[start : start + chunk_points],
+                patch_all[start : start + chunk_points],
+                offsets=offsets,
+                patch_valid=patch_valid_all[start : start + chunk_points],
+            )
+        )
+    logits = torch.cat(logits_chunks, dim=0).reshape(bsz, num_candidates, num_points, offsets.shape[0])
+    log_probs = F.log_softmax(logits / max(float(temperature), 1.0e-6), dim=-1)
+    center_log_prob = log_probs[:, :, :, center_index]
+    center_logit = logits[:, :, :, center_index]
+    other_mask = patch_in.clone()
+    other_mask[:, :, :, center_index] = False
+    hard_neg = logits.masked_fill(~other_mask, -1.0e4).max(dim=-1).values
+    has_neg = other_mask.any(dim=-1)
+    hard_neg = torch.where(has_neg, hard_neg, torch.zeros_like(hard_neg))
+    valid_f = center_valid.to(dtype=logits.dtype)
+    denom = valid_f.sum(dim=-1).clamp(min=1.0)
+    score_mode = str(candidate_score_mode or "center_logprob_margin").lower()
+    if score_mode == "center_margin":
+        score_map = center_logit - hard_neg
+    elif score_mode == "center_logprob_margin":
+        score_map = center_log_prob + (center_logit - hard_neg)
+    else:
+        raise ValueError(f"Unknown pair matcher candidate score mode: {candidate_score_mode}")
+    scores = (score_map * valid_f).sum(dim=-1) / denom
+    stats = {
+        "local_zero_score": ((center_logit * valid_f).sum(dim=-1) / denom).mean().detach(),
+        "local_peak_score": ((logits.max(dim=-1).values * valid_f).sum(dim=-1) / denom).mean().detach(),
+        "local_peak_gap": (((logits.max(dim=-1).values - center_logit).clamp_min(0.0) * valid_f).sum(dim=-1) / denom).mean().detach(),
+        "local_peak_offset_px": _local_offset_norms(radius, device=logits.device, dtype=logits.dtype)[
+            logits.argmax(dim=-1)
+        ].mul(valid_f).sum(dim=-1).div(denom).mean().detach(),
+        "local_expected_offset_px": (
+            (F.softmax(logits / max(float(temperature), 1.0e-6), dim=-1) @ offsets.to(logits.device, logits.dtype))
+            .norm(dim=-1)
+            .mul(valid_f)
+            .sum(dim=-1)
+            .div(denom)
+            .mean()
+            .detach()
+        ),
+    }
+    return scores, stats
+
+
 def local_flow_nce_loss_from_corr(
     corr: torch.Tensor,
     corr_valid: torch.Tensor,
@@ -1413,6 +1706,132 @@ def score_pose_improvement_soft_label_loss(
     }
 
 
+def candidate_teacher_quality_scores_from_batch(
+    batch: Dict,
+    *,
+    valid_mask: torch.Tensor,
+    target_mode: str = "pnp_composite",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return per-candidate teacher quality derived from render-LoFTR/PnP fields.
+
+    These fields are offline teacher evidence, not final evaluation labels.  A
+    high score means the query-render pair produced many confident, geometrically
+    consistent matches, which is the signal the localization feature should
+    learn to expose.
+    """
+    valid = valid_mask.bool()
+    if valid.ndim != 2:
+        raise ValueError(f"valid_mask must have shape (B,K), got {tuple(valid.shape)}")
+    has_teacher = any(
+        key in batch
+        for key in (
+            "retrieval_pnp_success_candidates",
+            "retrieval_pnp_num_inliers_candidates",
+            "retrieval_pnp_num_matches_candidates",
+            "retrieval_pnp_inlier_ratio_candidates",
+            "retrieval_pnp_inlier_conf_mean_candidates",
+        )
+    )
+    zeros = torch.zeros(valid.shape, device=valid.device, dtype=torch.float32)
+    if not has_teacher:
+        return zeros, torch.zeros_like(valid)
+
+    features, names = candidate_quality_features_from_batch(batch, valid_mask=valid)
+    features = features.to(device=valid.device, dtype=torch.float32)
+    by_name = {name: features[..., idx] for idx, name in enumerate(names)}
+    mode = str(target_mode or "pnp_composite").lower()
+    if mode in {"inliers", "num_inliers", "pnp_inliers"}:
+        quality = by_name["retrieval_pnp_num_inliers_log_z"]
+    elif mode in {"inlier_ratio", "ratio"}:
+        quality = by_name["retrieval_pnp_inlier_ratio"]
+    elif mode in {"confidence", "conf", "inlier_conf"}:
+        quality = by_name["retrieval_pnp_inlier_conf_mean"]
+    elif mode in {"reproj", "reproj_quality", "median_reproj"}:
+        quality = by_name["retrieval_pnp_reproj_median_quality"]
+    elif mode in {"pnp_composite", "composite", "render_loftr_pnp"}:
+        quality = (
+            1.25 * by_name["retrieval_pnp_num_inliers_log_z"]
+            + 0.50 * by_name["retrieval_pnp_num_matches_log_z"]
+            + 1.00 * by_name["retrieval_pnp_inlier_ratio"]
+            + 0.75 * by_name["retrieval_pnp_inlier_conf_mean"]
+            + 0.50 * by_name["retrieval_pnp_reproj_median_quality"]
+            + 0.50 * by_name["retrieval_pnp_success"]
+        )
+    else:
+        raise ValueError(f"unsupported candidate teacher quality target mode: {target_mode}")
+    quality = torch.where(torch.isfinite(quality) & valid, quality, zeros)
+    row_span = quality.masked_fill(~valid, -1.0e6).max(dim=1).values - quality.masked_fill(~valid, 1.0e6).min(dim=1).values
+    active = valid & torch.isfinite(quality) & (row_span[:, None] > 1.0e-6)
+    return quality, active
+
+
+def candidate_teacher_quality_listwise_loss(
+    logits: torch.Tensor,
+    batch: Dict,
+    *,
+    valid_mask: torch.Tensor,
+    target_mode: str = "pnp_composite",
+    temperature: float = 0.5,
+    pairwise_weight: float = 0.1,
+    pairwise_min_gap: float = 0.25,
+    logit_margin: float = 0.5,
+) -> Dict[str, torch.Tensor]:
+    """Train candidate scores to match offline render-LoFTR/PnP teacher quality."""
+    if logits.ndim != 2:
+        raise ValueError(f"logits must have shape (B,K), got {tuple(logits.shape)}")
+    valid = valid_mask.to(device=logits.device).bool()
+    if valid.shape != logits.shape:
+        raise ValueError(f"valid_mask must have shape {tuple(logits.shape)}, got {tuple(valid.shape)}")
+    quality, active = candidate_teacher_quality_scores_from_batch(batch, valid_mask=valid, target_mode=target_mode)
+    quality = quality.to(device=logits.device, dtype=logits.dtype)
+    active = active.to(device=logits.device).bool()
+    active_rows = active.any(dim=1)
+    zero = logits.new_zeros(())
+    if not bool(active_rows.any()):
+        return {
+            "loss": zero,
+            "ce_loss": zero,
+            "pairwise_loss": zero,
+            "active": zero,
+            "top1_acc": zero,
+            "pred_quality": zero,
+            "target_quality": zero,
+            "pred_index": torch.zeros(logits.shape[0], device=logits.device, dtype=torch.long),
+            "target_index": torch.zeros(logits.shape[0], device=logits.device, dtype=torch.long),
+        }
+
+    temp = max(float(temperature), 1.0e-6)
+    masked_logits = (logits.float() / temp).masked_fill(~active, -1.0e6)
+    target_logits = (quality.float() / temp).masked_fill(~active, -1.0e6)
+    target_probs = F.softmax(target_logits, dim=1).detach()
+    log_probs = F.log_softmax(masked_logits, dim=1)
+    ce_per_row = -(target_probs * log_probs).sum(dim=1)
+    ce_loss = ce_per_row[active_rows].mean()
+
+    target_idx = quality.masked_fill(~active, -1.0e6).argmax(dim=1)
+    batch_idx = torch.arange(logits.shape[0], device=logits.device)
+    target_quality = quality[batch_idx, target_idx][:, None]
+    target_logit = masked_logits[batch_idx, target_idx][:, None]
+    worse = active & (quality + float(pairwise_min_gap) < target_quality)
+    pairwise_loss = zero
+    if bool(worse.any()):
+        pairwise_loss = F.softplus(masked_logits - target_logit + float(logit_margin))[worse].mean()
+    pred_idx = masked_logits.argmax(dim=1)
+    pred_quality = quality[batch_idx, pred_idx]
+    total = ce_loss + float(pairwise_weight) * pairwise_loss
+    return {
+        "loss": total,
+        "ce_loss": ce_loss,
+        "pairwise_loss": pairwise_loss,
+        "active": active_rows.float().mean(),
+        "top1_acc": ((pred_idx == target_idx) & active_rows).float().sum() / active_rows.float().sum().clamp(min=1.0),
+        "pred_quality": pred_quality[active_rows].mean(),
+        "target_quality": quality[batch_idx, target_idx][active_rows].mean(),
+        "pred_index": pred_idx.detach(),
+        "target_index": target_idx.detach(),
+    }
+
+
 def score_anti_identity_loss(
     logits: torch.Tensor,
     candidate_cost: torch.Tensor,
@@ -1471,10 +1890,312 @@ def score_anti_identity_loss(
     }
 
 
+def _rename_teacher_metrics(metrics: Dict[str, torch.Tensor], *, source_prefix: str, target_prefix: str) -> Dict[str, torch.Tensor]:
+    renamed: Dict[str, torch.Tensor] = {}
+    for key, value in metrics.items():
+        new_key = str(key)
+        if new_key.startswith(source_prefix):
+            new_key = target_prefix + new_key[len(source_prefix) :]
+        renamed[new_key] = value
+    return renamed
+
+
+def nvs_teacher_correspondence_loss(
+    query_loc: torch.Tensor,
+    gt_render_loc: torch.Tensor,
+    batch: Dict,
+    *,
+    weight: float = 0.0,
+    patch_weight: float = 0.0,
+    temperature: float = 0.07,
+    min_confidence: float = 0.0,
+    min_points: int = 4,
+    negative_exclusion_px: float = 0.0,
+    positive_weight: float = 0.0,
+    margin_weight: float = 0.0,
+    margin: float = 0.1,
+    patch_radius: int = 2,
+    patch_temperature: float | None = None,
+    patch_min_points: int | None = None,
+    patch_positive_weight: float = 0.0,
+    patch_margin_weight: float = 0.0,
+    patch_margin: float = 0.05,
+) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """Train NVS loc features from offline matching-teacher correspondences.
+
+    The teacher supplies sparse query↔GT-render matches.  This loss supervises
+    the query/render localization adapter directly, before candidate scoring
+    compresses the evidence into scalar logits.
+    """
+    if gt_render_loc.ndim == 5:
+        if gt_render_loc.shape[1] != 1:
+            raise ValueError("gt_render_loc must have one GT render candidate when 5D")
+        gt_render_feat = gt_render_loc[:, 0]
+    elif gt_render_loc.ndim == 4:
+        gt_render_feat = gt_render_loc
+    else:
+        raise ValueError("gt_render_loc must have shape (B,C,H,W) or (B,1,C,H,W)")
+
+    required = (
+        "teacher_corr_query_xy",
+        "teacher_corr_map_xy",
+        "teacher_corr_conf",
+        "teacher_corr_valid",
+    )
+    missing = [key for key in required if key not in batch]
+    zero = query_loc.new_zeros(())
+    metrics: Dict[str, torch.Tensor] = {
+        "nvs_teacher_corr_missing": query_loc.new_tensor(1.0 if missing else 0.0),
+        "nvs_teacher_corr_loss": zero.detach(),
+        "nvs_teacher_patch_loss": zero.detach(),
+        "nvs_teacher_corr_weighted_loss": zero.detach(),
+        "nvs_teacher_patch_weighted_loss": zero.detach(),
+    }
+    if missing:
+        return zero, metrics
+
+    corr_loss = zero
+    if float(weight) > 0.0:
+        corr_loss, corr_metrics = sparse_teacher_correspondence_loss(
+            query_loc,
+            gt_render_feat,
+            batch["teacher_corr_query_xy"],
+            batch["teacher_corr_map_xy"],
+            batch["teacher_corr_conf"],
+            batch["teacher_corr_valid"],
+            xy_source_hw=batch.get("teacher_corr_hw"),
+            temperature=float(temperature),
+            min_confidence=float(min_confidence),
+            min_points=int(min_points),
+            negative_exclusion_px=float(negative_exclusion_px),
+            positive_weight=float(positive_weight),
+            margin_weight=float(margin_weight),
+            margin=float(margin),
+        )
+        metrics.update(
+            _rename_teacher_metrics(
+                corr_metrics,
+                source_prefix="map_teacher_corr",
+                target_prefix="nvs_teacher_corr",
+            )
+        )
+
+    patch_loss = zero
+    if float(patch_weight) > 0.0:
+        patch_loss, patch_metrics = sparse_teacher_local_patch_loss(
+            query_loc,
+            gt_render_feat,
+            batch["teacher_corr_query_xy"],
+            batch["teacher_corr_map_xy"],
+            batch["teacher_corr_conf"],
+            batch["teacher_corr_valid"],
+            xy_source_hw=batch.get("teacher_corr_hw"),
+            radius=int(patch_radius),
+            temperature=float(patch_temperature if patch_temperature is not None else temperature),
+            min_confidence=float(min_confidence),
+            min_points=int(patch_min_points if patch_min_points is not None else min_points),
+            positive_weight=float(patch_positive_weight),
+            margin_weight=float(patch_margin_weight),
+            margin=float(patch_margin),
+        )
+        metrics.update(
+            _rename_teacher_metrics(
+                patch_metrics,
+                source_prefix="map_teacher_patch",
+                target_prefix="nvs_teacher_patch",
+            )
+        )
+
+    total = float(weight) * corr_loss + float(patch_weight) * patch_loss
+    metrics.update(
+        {
+            "nvs_teacher_corr_loss": corr_loss.detach(),
+            "nvs_teacher_patch_loss": patch_loss.detach(),
+            "nvs_teacher_corr_weighted_loss": (float(weight) * corr_loss).detach(),
+            "nvs_teacher_patch_weighted_loss": (float(patch_weight) * patch_loss).detach(),
+        }
+    )
+    return total, metrics
+
+
+def nvs_teacher_pair_match_loss(
+    matcher: PairConditionedLocalMatcher | None,
+    query_loc: torch.Tensor,
+    gt_render_loc: torch.Tensor,
+    batch: Dict,
+    *,
+    weight: float = 0.0,
+    radius: int = 3,
+    temperature: float = 0.05,
+    min_confidence: float = 0.0,
+    min_points: int = 4,
+    positive_weight: float = 0.0,
+    margin_weight: float = 0.0,
+    margin: float = 0.05,
+) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """Teacher-supervised pair-conditioned local heatmap loss.
+
+    Unlike the scalar candidate score losses, this keeps the local matching
+    evidence structured: each teacher query point must select the center of a
+    rendered-map patch through a learned pair-conditioned matcher.
+    """
+    zero = query_loc.new_zeros(())
+    metrics: Dict[str, torch.Tensor] = {
+        "nvs_pair_match_missing": query_loc.new_tensor(0.0 if matcher is not None else 1.0),
+        "nvs_pair_match_loss": zero.detach(),
+        "nvs_pair_match_weighted_loss": zero.detach(),
+        "nvs_pair_match_acc": zero.detach(),
+        "nvs_pair_match_pos": zero.detach(),
+        "nvs_pair_match_neg": zero.detach(),
+        "nvs_pair_match_gap": zero.detach(),
+        "nvs_pair_match_soft_epe": zero.detach(),
+        "nvs_pair_match_points": zero.detach(),
+        "nvs_pair_match_cov": zero.detach(),
+        "nvs_pair_match_skipped_no_points": query_loc.new_tensor(1.0),
+    }
+    if matcher is None or float(weight) <= 0.0:
+        return zero, metrics
+    if gt_render_loc.ndim == 5:
+        if gt_render_loc.shape[1] != 1:
+            raise ValueError("gt_render_loc must have one GT render candidate when 5D")
+        map_feat = gt_render_loc[:, 0]
+    elif gt_render_loc.ndim == 4:
+        map_feat = gt_render_loc
+    else:
+        raise ValueError("gt_render_loc must have shape (B,C,H,W) or (B,1,C,H,W)")
+    required = (
+        "teacher_corr_query_xy",
+        "teacher_corr_map_xy",
+        "teacher_corr_conf",
+        "teacher_corr_valid",
+    )
+    missing = [key for key in required if key not in batch]
+    metrics["nvs_pair_match_missing"] = query_loc.new_tensor(1.0 if missing else 0.0)
+    if missing:
+        return zero, metrics
+
+    with torch.cuda.amp.autocast(enabled=False):
+        q_feat = query_loc.float()
+        m_feat = map_feat.float()
+        query_xy = batch["teacher_corr_query_xy"].to(device=q_feat.device).float()
+        map_xy = batch["teacher_corr_map_xy"].to(device=q_feat.device).float()
+        confidence = batch["teacher_corr_conf"].to(device=q_feat.device).float()
+        valid = batch["teacher_corr_valid"].to(device=q_feat.device).float()
+        if confidence.ndim == 3:
+            confidence = confidence.squeeze(-1)
+        if valid.ndim == 3:
+            valid = valid.squeeze(-1)
+        xy_source_hw = batch.get("teacher_corr_hw")
+
+        q_sparse, q_in = sample_feature_at_xy(q_feat, query_xy, valid, source_hw=xy_source_hw)
+        _, m_in = sample_feature_at_xy(m_feat, map_xy, valid, source_hw=xy_source_hw)
+        if xy_source_hw is not None:
+            map_xy_feat = _scale_xy_tensor(map_xy, xy_source_hw, m_feat.shape[-2:])
+        else:
+            map_xy_feat = map_xy
+        usable = (valid > 0) & q_in & m_in & torch.isfinite(confidence) & (confidence >= float(min_confidence))
+        usable = usable & torch.isfinite(q_sparse).all(dim=-1) & torch.isfinite(map_xy_feat).all(dim=-1)
+
+        r = max(int(radius), 0)
+        offset_axis = torch.arange(-r, r + 1, device=q_feat.device, dtype=q_feat.dtype)
+        dy, dx = torch.meshgrid(offset_axis, offset_axis, indexing="ij")
+        offsets = torch.stack([dx.reshape(-1), dy.reshape(-1)], dim=-1)
+        center_index = int(((offsets[:, 0] == 0) & (offsets[:, 1] == 0)).nonzero(as_tuple=False)[0].item())
+
+        losses = []
+        acc_values = []
+        pos_values = []
+        neg_values = []
+        gap_values = []
+        soft_epe_values = []
+        point_counts = []
+        temp = max(float(temperature), 1.0e-6)
+        for batch_idx in range(q_sparse.shape[0]):
+            mask_b = usable[batch_idx]
+            if int(mask_b.sum().item()) < int(min_points):
+                continue
+            q_b = q_sparse[batch_idx, mask_b]
+            xy_b = map_xy_feat[batch_idx, mask_b].to(device=q_feat.device, dtype=q_feat.dtype)
+            patch_xy = xy_b[:, None, :] + offsets[None, :, :]
+            flat_xy = patch_xy.reshape(1, -1, 2)
+            flat_valid = torch.ones(1, flat_xy.shape[1], device=q_feat.device, dtype=q_feat.dtype)
+            patch_sparse, patch_in = sample_feature_at_xy(
+                m_feat[batch_idx : batch_idx + 1],
+                flat_xy,
+                flat_valid,
+                source_hw=None,
+            )
+            n_points = q_b.shape[0]
+            n_offsets = offsets.shape[0]
+            patch_sparse = patch_sparse.view(n_points, n_offsets, q_b.shape[-1])
+            patch_in = patch_in.view(n_points, n_offsets)
+            center_valid = patch_in[:, center_index]
+            if int(center_valid.sum().item()) < int(min_points):
+                continue
+            q_b = q_b[center_valid]
+            patch_sparse = patch_sparse[center_valid]
+            patch_in = patch_in[center_valid]
+            w_b = confidence[batch_idx, mask_b][center_valid].clamp(min=0.0)
+            if float(w_b.sum().item()) <= 0.0:
+                w_b = torch.ones_like(w_b)
+
+            q_center_n = F.normalize(q_b, dim=-1, eps=1.0e-6)
+            patch_center_n = F.normalize(patch_sparse[:, center_index], dim=-1, eps=1.0e-6)
+            center_pos_cos = (q_center_n * patch_center_n).sum(dim=-1)
+            logits = matcher(q_b, patch_sparse, offsets=offsets, patch_valid=patch_in)
+            targets = torch.full((logits.shape[0],), center_index, device=logits.device, dtype=torch.long)
+            per_point = F.cross_entropy(logits / temp, targets, reduction="none")
+            pos = logits[:, center_index]
+            other_mask = patch_in.clone()
+            other_mask[:, center_index] = False
+            hard_neg = logits.masked_fill(~other_mask, -1.0e4).max(dim=1).values
+            has_neg = other_mask.any(dim=1)
+            hard_neg = torch.where(has_neg, hard_neg, torch.zeros_like(hard_neg))
+            if float(positive_weight) > 0.0:
+                per_point = per_point + float(positive_weight) * (1.0 - center_pos_cos)
+            if float(margin_weight) > 0.0:
+                margin_loss = F.relu(hard_neg - pos + float(margin))
+                per_point = per_point + float(margin_weight) * margin_loss * has_neg.float()
+            losses.append((per_point * w_b).sum() / w_b.sum().clamp(min=1.0e-6))
+
+            with torch.no_grad():
+                acc_values.append(((logits.argmax(dim=1) == center_index).float() * w_b).sum() / w_b.sum().clamp(min=1.0e-6))
+                pos_values.append((pos * w_b).sum() / w_b.sum().clamp(min=1.0e-6))
+                neg_values.append((hard_neg * w_b).sum() / w_b.sum().clamp(min=1.0e-6))
+                gap_values.append(((pos - hard_neg) * w_b).sum() / w_b.sum().clamp(min=1.0e-6))
+                probs = F.softmax(logits / temp, dim=1)
+                expected_offset = probs @ offsets.to(device=logits.device, dtype=logits.dtype)
+                soft_epe = torch.linalg.vector_norm(expected_offset, dim=1)
+                soft_epe_values.append((soft_epe * w_b).sum() / w_b.sum().clamp(min=1.0e-6))
+                point_counts.append(center_valid.float().sum())
+
+        if losses:
+            loss = torch.stack(losses).mean()
+            metrics.update(
+                {
+                    "nvs_pair_match_loss": loss.detach(),
+                    "nvs_pair_match_weighted_loss": (float(weight) * loss).detach(),
+                    "nvs_pair_match_acc": torch.stack(acc_values).mean().detach(),
+                    "nvs_pair_match_pos": torch.stack(pos_values).mean().detach(),
+                    "nvs_pair_match_neg": torch.stack(neg_values).mean().detach(),
+                    "nvs_pair_match_gap": torch.stack(gap_values).mean().detach(),
+                    "nvs_pair_match_soft_epe": torch.stack(soft_epe_values).mean().detach(),
+                    "nvs_pair_match_points": torch.stack(point_counts).mean().detach(),
+                    "nvs_pair_match_cov": usable.float().mean().detach(),
+                    "nvs_pair_match_skipped_no_points": q_feat.new_tensor(0.0),
+                }
+            )
+        else:
+            loss = zero
+            metrics["nvs_pair_match_cov"] = usable.float().mean().detach()
+    return float(weight) * loss, metrics
+
+
 def forward_batch(
     model,
     adapter: PoseFeatureDomainAdapter,
     energy_net: PoseEnergyNet | None,
+    pair_matcher: PairConditionedLocalMatcher | None,
     map_renderer,
     batch,
     cfg: Dict,
@@ -1486,8 +2207,24 @@ def forward_batch(
     batch = move_batch_to_device(batch, device)
     pose_gt = map_pose_gt_for_batch(map_renderer, batch, device)
     batch, pose_gt, synthetic_mask = maybe_replace_with_synthetic_queries(batch, map_renderer, pose_gt, cfg, args)
-    init_pose = candidate_center_pose(pose_gt, args)
-    candidate_poses = build_nvs_candidate_bank(init_pose, pose_gt, args, train=train)
+    external_candidate_valid = None
+    if str(getattr(args, "candidate_bank_mode", "lattice") or "lattice").lower() == "cache":
+        if "pose_init_candidates" not in batch:
+            raise KeyError("candidate_bank_mode=cache requires batch['pose_init_candidates']")
+        candidate_poses = batch["pose_init_candidates"].to(device=device, dtype=torch.float32)
+        topk = max(1, min(int(args.topk), int(candidate_poses.shape[1])))
+        candidate_poses = candidate_poses[:, :topk]
+        if "candidate_valid_mask" in batch:
+            external_candidate_valid = batch["candidate_valid_mask"].to(device=device).bool()[:, :topk]
+        else:
+            external_candidate_valid = torch.ones(candidate_poses.shape[:2], device=device, dtype=torch.bool)
+        if "pose_init" in batch:
+            init_pose = batch["pose_init"].to(device=device, dtype=torch.float32)
+        else:
+            init_pose = candidate_poses[:, 0].detach().clone()
+    else:
+        init_pose = candidate_center_pose(pose_gt, args)
+        candidate_poses = build_nvs_candidate_bank(init_pose, pose_gt, args, train=train)
 
     with torch.no_grad():
         gt_batch = map_renderer.attach_pose_candidate_renders(
@@ -1503,6 +2240,7 @@ def forward_batch(
             candidate_poses,
             prefix="nvs_candidate",
             require_grad=False,
+            candidate_valid_mask=external_candidate_valid,
             feature="all",
             include_aux=True,
         )
@@ -1524,6 +2262,8 @@ def forward_batch(
     gt_depth = gt_batch.get("nvs_gt_depth")
     cand_depth = cand_batch.get("nvs_candidate_depth")
     cand_position = cand_batch.get("nvs_candidate_position")
+    gt_rgb = gt_batch.get("nvs_gt_rgb")
+    cand_rgb = cand_batch.get("nvs_candidate_rgb")
     gt_intrinsics = gt_batch.get("nvs_gt_intrinsics", cand_batch.get("nvs_candidate_intrinsics"))
     candidate_pose = cand_batch["nvs_candidate_pose"].float().detach()
 
@@ -1531,29 +2271,42 @@ def forward_batch(
     score_use_uncertainty = bool(args.score_use_uncertainty)
     project_uncertainty = energy_use_uncertainty or score_use_uncertainty
     render_chunk_size = int(cfg.get("map_supervision", {}).get("candidate_render_score_projector_chunk_size", 0) or 0)
+    adapter_needs_rgb = bool(getattr(args, "pose_feature_adapter_rgb_context_enabled", False)) or bool(
+        getattr(args, "pose_feature_adapter_texture_branch_enabled", False)
+    )
+    query_rgb = batch.get("rgb") if adapter_needs_rgb else None
+    gt_project_rgb = gt_rgb if adapter_needs_rgb else None
+    cand_project_rgb = cand_rgb if adapter_needs_rgb else None
     if project_uncertainty:
-        query_loc, query_uncertainty = adapter.project_query_with_uncertainty(query_base)
+        query_loc, query_uncertainty = adapter.project_query_with_uncertainty(query_base, rgb=query_rgb)
         gt_render_loc, _gt_uncertainty = project_render_bank_with_uncertainty(
             adapter,
             gt_render_base,
+            render_rgb=gt_project_rgb,
             render_chunk_size=0,
         )
         cand_render_loc, cand_uncertainty = project_render_bank_with_uncertainty(
             adapter,
             cand_render_base,
+            render_rgb=cand_project_rgb,
             render_chunk_size=render_chunk_size,
         )
     else:
         query_uncertainty = None
         cand_uncertainty = None
-        query_loc = adapter.project_query(query_base)
-        gt_render_loc = apply_pose_feature_adapter(adapter, query_base, gt_render_base, render_chunk_size=0)[1]
-        cand_render_loc = apply_pose_feature_adapter(
+        query_loc = adapter.project_query(query_base, rgb=query_rgb)
+        gt_render_loc = project_render_bank(
             adapter,
-            query_base,
+            gt_render_base,
+            render_rgb=gt_project_rgb,
+            render_chunk_size=0,
+        )
+        cand_render_loc = project_render_bank(
+            adapter,
             cand_render_base,
+            render_rgb=cand_project_rgb,
             render_chunk_size=render_chunk_size,
-        )[1]
+        )
     score_weight = None
     if score_use_uncertainty and query_uncertainty is not None and cand_uncertainty is not None:
         query_weight = _resize_feature(query_uncertainty.float(), tuple(cand_render_loc.shape[-2:]))
@@ -1611,7 +2364,23 @@ def forward_batch(
     }
     score_mode = str(args.score_mode or "same_pixel")
     need_local_corr = score_mode.startswith("local_") or float(args.local_flow_nce_weight) > 0.0
-    if need_local_corr:
+    if score_mode == "pair_matcher_local":
+        if pair_matcher is None:
+            raise ValueError("score_mode=pair_matcher_local requires --pair-matcher-enabled")
+        if float(args.local_flow_nce_weight) > 0.0:
+            raise ValueError("local_flow_nce is not supported with score_mode=pair_matcher_local")
+        cand_scores, local_stats = pair_matcher_local_candidate_scores(
+            pair_matcher,
+            query_loc,
+            cand_render_loc,
+            mask=cand_mask,
+            radius=int(args.pair_matcher_radius),
+            stride=int(args.pair_matcher_score_stride),
+            temperature=float(args.pair_matcher_temperature),
+            chunk_points=int(args.pair_matcher_score_chunk_points),
+            candidate_score_mode=str(args.pair_matcher_candidate_score_mode),
+        )
+    elif need_local_corr:
         local_corr, local_valid = local_correlation_volume(
             query_loc,
             cand_render_loc,
@@ -1661,10 +2430,46 @@ def forward_batch(
             )
     else:
         cand_scores = masked_dense_cosine(query_loc, cand_render_loc, mask=score_weight if score_weight is not None else cand_mask)
+    teacher_corr_loss, teacher_corr_metrics = nvs_teacher_correspondence_loss(
+        query_loc,
+        gt_render_loc,
+        batch,
+        weight=float(args.teacher_corr_weight),
+        patch_weight=float(args.teacher_corr_local_patch_weight),
+        temperature=float(args.teacher_corr_temperature),
+        min_confidence=float(args.teacher_corr_min_confidence),
+        min_points=int(args.teacher_corr_min_points),
+        negative_exclusion_px=float(args.teacher_corr_negative_exclusion_px),
+        positive_weight=float(args.teacher_corr_positive_weight),
+        margin_weight=float(args.teacher_corr_margin_weight),
+        margin=float(args.teacher_corr_margin),
+        patch_radius=int(args.teacher_corr_local_patch_radius),
+        patch_temperature=float(args.teacher_corr_local_patch_temperature),
+        patch_min_points=int(args.teacher_corr_local_patch_min_points),
+        patch_positive_weight=float(args.teacher_corr_local_patch_positive_weight),
+        patch_margin_weight=float(args.teacher_corr_local_patch_margin_weight),
+        patch_margin=float(args.teacher_corr_local_patch_margin),
+    )
+    pair_match_loss, pair_match_metrics = nvs_teacher_pair_match_loss(
+        pair_matcher,
+        query_loc,
+        gt_render_loc,
+        batch,
+        weight=float(args.pair_matcher_weight) if bool(args.pair_matcher_enabled) else 0.0,
+        radius=int(args.pair_matcher_radius),
+        temperature=float(args.pair_matcher_temperature),
+        min_confidence=float(args.pair_matcher_min_confidence),
+        min_points=int(args.pair_matcher_min_points),
+        positive_weight=float(args.pair_matcher_positive_weight),
+        margin_weight=float(args.pair_matcher_margin_weight),
+        margin=float(args.pair_matcher_margin),
+    )
     cand_valid = torch.isfinite(cand_scores)
     if cand_mask is not None:
         valid_mask = _resize_mask(cand_mask, tuple(cand_render_loc.shape[-2:]))
         cand_valid = cand_valid & (valid_mask.flatten(2).sum(dim=2) > 1.0)
+    if external_candidate_valid is not None:
+        cand_valid = cand_valid & external_candidate_valid.to(device=cand_valid.device).bool()
     pose_cost, _residual_target, trans_err, rot_err = pose_costs_and_residual_targets(
         candidate_pose,
         pose_gt.float(),
@@ -1717,6 +2522,26 @@ def forward_batch(
             valid_mask=cand_valid,
             target_temperature_m=float(args.score_pose_improvement_temperature_m),
             min_improvement_m=float(args.score_pose_improvement_min_improvement_m),
+        )
+    candidate_teacher_quality = {
+        "loss": query_loc.new_zeros(()),
+        "ce_loss": query_loc.new_zeros(()),
+        "pairwise_loss": query_loc.new_zeros(()),
+        "active": query_loc.new_zeros(()),
+        "top1_acc": query_loc.new_zeros(()),
+        "pred_quality": query_loc.new_zeros(()),
+        "target_quality": query_loc.new_zeros(()),
+    }
+    if float(args.candidate_teacher_quality_weight) > 0.0:
+        candidate_teacher_quality = candidate_teacher_quality_listwise_loss(
+            cand_scores,
+            batch,
+            valid_mask=cand_valid,
+            target_mode=str(args.candidate_teacher_quality_target_mode),
+            temperature=float(args.candidate_teacher_quality_temperature),
+            pairwise_weight=float(args.candidate_teacher_quality_pairwise_weight),
+            pairwise_min_gap=float(args.candidate_teacher_quality_pairwise_min_gap),
+            logit_margin=float(args.candidate_teacher_quality_logit_margin),
         )
     score_anti_identity = {
         "loss": query_loc.new_zeros(()),
@@ -1787,7 +2612,7 @@ def forward_batch(
             candidate_pose,
             init_pose=init_pose,
             query_rgb=batch.get("rgb"),
-            candidate_rgb=cand_batch.get("nvs_candidate_rgb"),
+            candidate_rgb=cand_rgb,
             depth=cand_depth,
             mask=cand_mask,
             candidate_valid_mask=cand_valid,
@@ -2073,9 +2898,12 @@ def forward_batch(
         float(args.align_weight) * align_loss
         + float(args.warp_align_weight) * warp_loss
         + float(args.local_flow_nce_weight) * flow_loss
+        + teacher_corr_loss
+        + pair_match_loss
         + float(args.rank_ce_weight) * rank["rank_loss"]
         + float(args.score_correction_cosine_weight) * score_correction_cosine["loss"]
         + float(args.score_pose_improvement_weight) * score_pose_improvement["loss"]
+        + float(args.candidate_teacher_quality_weight) * candidate_teacher_quality["loss"]
         + float(args.score_anti_identity_weight) * score_anti_identity["loss"]
         + float(args.pose_energy_weight) * energy_loss
         + float(args.drift_weight) * drift
@@ -2113,6 +2941,8 @@ def forward_batch(
         "local_flow_nce_loss": flow_metrics["local_flow_nce_loss"].detach(),
         "local_flow_valid_frac": flow_metrics["local_flow_valid_frac"].detach(),
         "local_flow_target_offset_px": flow_metrics["local_flow_target_offset_px"].detach(),
+        **{key: value.detach() for key, value in teacher_corr_metrics.items()},
+        **{key: value.detach() for key, value in pair_match_metrics.items()},
         "local_zero_score": local_stats["local_zero_score"].detach(),
         "local_peak_score": local_stats["local_peak_score"].detach(),
         "local_peak_gap": local_stats["local_peak_gap"].detach(),
@@ -2132,6 +2962,13 @@ def forward_batch(
         "score_pose_improvement_target_m": score_pose_improvement["target_improvement_m"].detach(),
         "score_pose_improvement_pred_cost_m": score_pose_improvement["pred_cost_m"].detach(),
         "score_pose_improvement_target_cost_m": score_pose_improvement["target_cost_m"].detach(),
+        "candidate_teacher_quality_loss": candidate_teacher_quality["loss"].detach(),
+        "candidate_teacher_quality_ce_loss": candidate_teacher_quality["ce_loss"].detach(),
+        "candidate_teacher_quality_pairwise_loss": candidate_teacher_quality["pairwise_loss"].detach(),
+        "candidate_teacher_quality_active": candidate_teacher_quality["active"].detach(),
+        "candidate_teacher_quality_top1_acc": candidate_teacher_quality["top1_acc"].detach(),
+        "candidate_teacher_quality_pred": candidate_teacher_quality["pred_quality"].detach(),
+        "candidate_teacher_quality_target": candidate_teacher_quality["target_quality"].detach(),
         "score_anti_identity_loss": score_anti_identity["loss"].detach(),
         "score_anti_identity_active": score_anti_identity["active"].detach(),
         "score_anti_identity_better_margin": score_anti_identity["better_margin"].detach(),
@@ -2165,17 +3002,38 @@ def mean_metrics(rows: List[Dict[str, float]]) -> Dict[str, float]:
 
 
 @torch.no_grad()
-def evaluate(model, adapter, energy_net, loader, map_renderer, cfg: Dict, args: argparse.Namespace) -> Dict[str, float]:
+def evaluate(
+    model,
+    adapter,
+    energy_net,
+    pair_matcher,
+    loader,
+    map_renderer,
+    cfg: Dict,
+    args: argparse.Namespace,
+) -> Dict[str, float]:
     model.eval()
     adapter.eval()
     if energy_net is not None:
         energy_net.eval()
+    if pair_matcher is not None:
+        pair_matcher.eval()
     eval_args = argparse.Namespace(**vars(args))
     if args.eval_synthetic_ratio is not None:
         eval_args.synthetic_ratio = float(args.eval_synthetic_ratio)
     rows = []
     for batch_idx, batch in enumerate(loader):
-        _loss, metrics = forward_batch(model, adapter, energy_net, map_renderer, batch, cfg, eval_args, train=False)
+        _loss, metrics = forward_batch(
+            model,
+            adapter,
+            energy_net,
+            pair_matcher,
+            map_renderer,
+            batch,
+            cfg,
+            eval_args,
+            train=False,
+        )
         rows.append({key: float(value.detach().cpu()) for key, value in metrics.items()})
         if args.eval_max_samples is not None and (batch_idx + 1) * int(args.batch_size) >= int(args.eval_max_samples):
             break
@@ -2221,6 +3079,7 @@ def _gradient_stats(parameters: Iterable[torch.nn.Parameter]) -> Dict[str, float
 def collect_trainable_parameters(
     adapter: PoseFeatureDomainAdapter,
     energy_net: PoseEnergyNet | None,
+    pair_matcher: PairConditionedLocalMatcher | None,
     model: torch.nn.Module,
     *,
     train_adapter: bool = True,
@@ -2234,6 +3093,10 @@ def collect_trainable_parameters(
         for param in energy_net.parameters():
             param.requires_grad_(True)
         params.extend(energy_net.parameters())
+    if pair_matcher is not None:
+        for param in pair_matcher.parameters():
+            param.requires_grad_(True)
+        params.extend(pair_matcher.parameters())
     params.extend(param for param in model.parameters() if param.requires_grad)
     return params
 
@@ -2249,6 +3112,7 @@ def save_checkpoint(
     args,
     *,
     energy_net=None,
+    pair_matcher=None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     query_prefixes = []
@@ -2264,6 +3128,7 @@ def save_checkpoint(
             "query_model_state_dict": query_state,
             "query_model_prefixes": query_prefixes,
             "pose_energy_net_state_dict": energy_net.state_dict() if energy_net is not None else None,
+            "pair_matcher_state_dict": pair_matcher.state_dict() if pair_matcher is not None else None,
             "optimizer_state_dict": optimizer.state_dict(),
             "metrics": metrics,
             "config": cfg,
@@ -2273,7 +3138,7 @@ def save_checkpoint(
     )
 
 
-def load_adapter_checkpoint(path: str, adapter, model=None, optimizer=None, energy_net=None) -> Dict:
+def load_adapter_checkpoint(path: str, adapter, model=None, optimizer=None, energy_net=None, pair_matcher=None) -> Dict:
     checkpoint = torch.load(path, map_location="cpu")
     adapter_state = checkpoint.get("pose_feature_adapter_state_dict", checkpoint)
     adapter.load_state_dict(adapter_state, strict=True)
@@ -2283,6 +3148,9 @@ def load_adapter_checkpoint(path: str, adapter, model=None, optimizer=None, ener
     energy_state = checkpoint.get("pose_energy_net_state_dict") or checkpoint.get("pose_energy_state_dict")
     if energy_net is not None and energy_state:
         energy_net.load_state_dict(energy_state, strict=True)
+    pair_state = checkpoint.get("pair_matcher_state_dict")
+    if pair_matcher is not None and pair_state:
+        pair_matcher.load_state_dict(pair_state, strict=True)
     if optimizer is not None and checkpoint.get("optimizer_state_dict") is not None:
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     return checkpoint
@@ -2336,9 +3204,19 @@ def main() -> None:
             zero_init_residual_head=bool(args.pose_energy_zero_init_residual_head),
             factorized_heads=bool(args.pose_energy_factorized_heads),
         ).to(device)
+    pair_matcher = None
+    if bool(args.pair_matcher_enabled):
+        pair_matcher = PairConditionedLocalMatcher(
+            channels=int(adapter.channels),
+            hidden_dim=int(args.pair_matcher_hidden_dim),
+            offset_radius=int(args.pair_matcher_radius),
+            zero_init_residual=bool(args.pair_matcher_zero_init_residual),
+            base_dot_weight=float(args.pair_matcher_base_dot_weight),
+        ).to(device)
     trainable = collect_trainable_parameters(
         adapter,
         energy_net,
+        pair_matcher,
         model,
         train_adapter=bool(args.train_pose_feature_adapter),
     )
@@ -2348,11 +3226,18 @@ def main() -> None:
     scaler = torch.cuda.amp.GradScaler(enabled=bool(args.amp and device.type == "cuda"))
 
     if args.resume_adapter:
-        loaded = load_adapter_checkpoint(args.resume_adapter, adapter, model=model, optimizer=None, energy_net=energy_net)
+        loaded = load_adapter_checkpoint(
+            args.resume_adapter,
+            adapter,
+            model=model,
+            optimizer=None,
+            energy_net=energy_net,
+            pair_matcher=pair_matcher,
+        )
         print(f"loaded adapter checkpoint: {args.resume_adapter} step={loaded.get('step', 'unknown')}", flush=True)
 
     if args.eval_only:
-        metrics = evaluate(model, adapter, energy_net, eval_loader, map_renderer, cfg, args)
+        metrics = evaluate(model, adapter, energy_net, pair_matcher, eval_loader, map_renderer, cfg, args)
         summary = {"checkpoint": args.resume_adapter, "metrics": metrics}
         (out_dir / "eval_only_summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
         print(json.dumps(summary, indent=2), flush=True)
@@ -2373,9 +3258,11 @@ def main() -> None:
         adapter.train(bool(args.train_pose_feature_adapter))
         if energy_net is not None:
             energy_net.train()
+        if pair_matcher is not None:
+            pair_matcher.train()
         optimizer.zero_grad(set_to_none=True)
         with torch.cuda.amp.autocast(enabled=bool(args.amp and device.type == "cuda")):
-            loss, metrics = forward_batch(model, adapter, energy_net, map_renderer, batch, cfg, args, train=True)
+            loss, metrics = forward_batch(model, adapter, energy_net, pair_matcher, map_renderer, batch, cfg, args, train=True)
         scale_before = float(scaler.get_scale()) if bool(args.amp and device.type == "cuda") else 1.0
         scaler.scale(loss).backward()
         if float(args.grad_clip) > 0.0:
@@ -2431,7 +3318,7 @@ def main() -> None:
                 flush=True,
             )
         if step % int(args.eval_every) == 0 or step == int(args.max_steps):
-            eval_metrics = evaluate(model, adapter, energy_net, eval_loader, map_renderer, cfg, args)
+            eval_metrics = evaluate(model, adapter, energy_net, pair_matcher, eval_loader, map_renderer, cfg, args)
             eval_row = {"step": step, "split": "eval"}
             eval_row.update(eval_metrics)
             with log_path.open("a", encoding="utf-8") as f:
@@ -2450,6 +3337,7 @@ def main() -> None:
                     cfg,
                     args,
                     energy_net=energy_net,
+                    pair_matcher=pair_matcher,
                 )
         if step % int(args.save_every) == 0:
             save_checkpoint(
@@ -2462,6 +3350,7 @@ def main() -> None:
                 cfg,
                 args,
                 energy_net=energy_net,
+                pair_matcher=pair_matcher,
             )
 
     summary = {"best_metric": best_metric, "best_metric_name": args.best_metric, "steps": step, "out_dir": str(out_dir)}

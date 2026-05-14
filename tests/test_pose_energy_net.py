@@ -9,6 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from pose_refine.runtime import apply_pose_delta
 
 from feature_extract.students.pose_energy_net import (
+    PairConditionedLocalMatcher,
     PoseEnergyNet,
     PoseFeatureDomainAdapter,
     compose_w2c_from_center_and_rotation,
@@ -179,6 +180,96 @@ def test_pose_feature_domain_adapter_can_predict_query_and_render_uncertainty():
     assert render_unc.shape == (3, 1, 5, 6)
     assert torch.all((query_unc >= 0.0) & (query_unc <= 1.0))
     assert torch.all((render_unc >= 0.0) & (render_unc <= 1.0))
+
+
+def test_pose_feature_domain_adapter_rgb_context_changes_localization_feature():
+    torch.manual_seed(7)
+    adapter = PoseFeatureDomainAdapter(
+        channels=4,
+        hidden_dim=8,
+        zero_init=False,
+        rgb_context_enabled=True,
+    )
+    feature = torch.randn(1, 4, 5, 6)
+    dark = torch.zeros(1, 3, 20, 24)
+    bright = torch.ones(1, 3, 20, 24)
+
+    dark_loc = adapter.project_query(feature, rgb=dark)
+    bright_loc = adapter.project_query(feature, rgb=bright)
+
+    assert dark_loc.shape == feature.shape
+    assert not torch.allclose(dark_loc, bright_loc)
+
+
+def test_pose_feature_domain_adapter_texture_branch_adds_rgb_fine_features():
+    torch.manual_seed(11)
+    adapter = PoseFeatureDomainAdapter(
+        channels=4,
+        hidden_dim=8,
+        zero_init=True,
+        rgb_context_enabled=False,
+        texture_branch_enabled=True,
+        texture_branch_hidden_dim=8,
+        texture_branch_scale=0.5,
+        texture_branch_zero_init=False,
+    )
+    feature = torch.randn(1, 4, 5, 6)
+    dark = torch.zeros(1, 3, 20, 24)
+    bright = torch.ones(1, 3, 20, 24)
+
+    no_rgb_loc = adapter.project_query(feature, rgb=None)
+    dark_loc = adapter.project_query(feature, rgb=dark)
+    bright_loc = adapter.project_query(feature, rgb=bright)
+
+    assert no_rgb_loc.shape == feature.shape
+    assert dark_loc.shape == feature.shape
+    assert torch.allclose(torch.linalg.norm(dark_loc, dim=1).mean(), torch.tensor(1.0), atol=1e-4)
+    assert not torch.allclose(no_rgb_loc, dark_loc)
+    assert not torch.allclose(dark_loc, bright_loc)
+
+
+def test_pose_feature_domain_adapter_replace_texture_can_dominate_base_anchor():
+    torch.manual_seed(13)
+    adapter = PoseFeatureDomainAdapter(
+        channels=4,
+        hidden_dim=8,
+        zero_init=True,
+        texture_branch_enabled=True,
+        texture_branch_hidden_dim=8,
+        texture_branch_scale=1.0,
+        texture_branch_zero_init=False,
+        texture_fusion_mode="replace",
+        base_anchor_weight=0.0,
+    )
+    feature_a = torch.randn(1, 4, 5, 6)
+    feature_b = torch.randn(1, 4, 5, 6)
+    rgb = torch.randn(1, 3, 20, 24)
+
+    loc_a = adapter.project_query(feature_a, rgb=rgb)
+    loc_b = adapter.project_query(feature_b, rgb=rgb)
+
+    assert torch.allclose(loc_a, loc_b, atol=1e-6)
+
+
+def test_pair_conditioned_local_matcher_keeps_dot_product_match_prior():
+    matcher = PairConditionedLocalMatcher(
+        channels=3,
+        hidden_dim=8,
+        offset_radius=1,
+        zero_init_residual=True,
+        base_dot_weight=10.0,
+    )
+    query = torch.tensor([[1.0, 0.0, 0.0]])
+    good_patch = torch.tensor([[[0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]])
+    bad_patch = torch.tensor([[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]])
+    offsets = torch.tensor([[-1.0, 0.0], [0.0, 0.0], [1.0, 0.0]])
+
+    good_logits = matcher(query, good_patch, offsets=offsets)
+    bad_logits = matcher(query, bad_patch, offsets=offsets)
+
+    assert good_logits.shape == (1, 3)
+    assert int(good_logits.argmax(dim=1).item()) == 1
+    assert int(bad_logits.argmax(dim=1).item()) == 0
 
 
 def test_pose_costs_and_residual_targets_match_left_update_convention():

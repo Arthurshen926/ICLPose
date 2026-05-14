@@ -11,9 +11,12 @@ from feature_extract.tools.train_nvs_pose_feature_adapter import (
     build_nvs_candidate_bank,
     candidate_correction_cosines,
     candidate_identity_mask,
+    candidate_teacher_quality_listwise_loss,
+    candidate_teacher_quality_scores_from_batch,
     collect_trainable_parameters,
     pose_energy_factorized_selection_metrics,
     local_flow_nce_loss,
+    pair_matcher_local_candidate_scores,
     local_zero_offset_scores_from_corr,
     local_zero_offset_correlation_scores,
     masked_dense_alignment_loss,
@@ -24,6 +27,8 @@ from feature_extract.tools.train_nvs_pose_feature_adapter import (
     pose_energy_correction_cosine_soft_label_loss,
     score_anti_identity_loss,
     score_pose_improvement_soft_label_loss,
+    nvs_teacher_correspondence_loss,
+    nvs_teacher_pair_match_loss,
     pose_energy_direction_pairwise_loss,
     pose_energy_score_monotonicity_loss,
     project_world_positions_to_feature_grid,
@@ -34,7 +39,7 @@ from feature_extract.tools.train_nvs_pose_feature_adapter import (
 )
 from feature_extract.tools.train_pose_energy import load_pose_energy_checkpoint
 from feature_extract.tools.eval_pose_energy_buckets import build_candidate_bank as build_eval_pose_energy_candidate_bank
-from feature_extract.students.pose_energy_net import PoseEnergyNet, PoseFeatureDomainAdapter
+from feature_extract.students.pose_energy_net import PairConditionedLocalMatcher, PoseEnergyNet, PoseFeatureDomainAdapter
 
 
 def _w2c_pose_from_center_and_yaw(center, yaw_deg):
@@ -247,6 +252,64 @@ def test_score_pose_improvement_soft_label_loss_prefers_candidates_that_reduce_p
     assert bad["pred_improvement_m"] < good["pred_improvement_m"]
 
 
+def test_candidate_teacher_quality_scores_from_render_loftr_pnp_fields():
+    valid = torch.tensor([[True, True, True]])
+    batch = {
+        "retrieval_pnp_success_candidates": torch.tensor([[1.0, 1.0, 0.0]]),
+        "retrieval_pnp_num_inliers_candidates": torch.tensor([[120.0, 8.0, 0.0]]),
+        "retrieval_pnp_num_matches_candidates": torch.tensor([[160.0, 30.0, 5.0]]),
+        "retrieval_pnp_reproj_median_candidates": torch.tensor([[1.0, 9.0, float("inf")]]),
+        "retrieval_pnp_inlier_ratio_candidates": torch.tensor([[0.75, 0.1, 0.0]]),
+        "retrieval_pnp_inlier_conf_mean_candidates": torch.tensor([[0.8, 0.3, 0.0]]),
+    }
+
+    quality, active = candidate_teacher_quality_scores_from_batch(
+        batch,
+        valid_mask=valid,
+        target_mode="pnp_composite",
+    )
+
+    assert active.tolist() == [[True, True, True]]
+    assert quality[0, 0] > quality[0, 1] > quality[0, 2]
+
+
+def test_candidate_teacher_quality_listwise_loss_prefers_high_quality_candidate():
+    valid = torch.tensor([[True, True, True]])
+    batch = {
+        "retrieval_pnp_success_candidates": torch.tensor([[1.0, 1.0, 0.0]]),
+        "retrieval_pnp_num_inliers_candidates": torch.tensor([[4.0, 80.0, 2.0]]),
+        "retrieval_pnp_num_matches_candidates": torch.tensor([[20.0, 120.0, 10.0]]),
+        "retrieval_pnp_inlier_ratio_candidates": torch.tensor([[0.2, 0.9, 0.1]]),
+        "retrieval_pnp_inlier_conf_mean_candidates": torch.tensor([[0.3, 0.8, 0.1]]),
+    }
+    bad_logits = torch.tensor([[3.0, 0.0, 1.0]], requires_grad=True)
+    good_logits = torch.tensor([[0.0, 3.0, 1.0]], requires_grad=True)
+
+    bad = candidate_teacher_quality_listwise_loss(
+        bad_logits,
+        batch,
+        valid_mask=valid,
+        temperature=0.5,
+        pairwise_weight=0.5,
+        pairwise_min_gap=0.25,
+    )
+    good = candidate_teacher_quality_listwise_loss(
+        good_logits,
+        batch,
+        valid_mask=valid,
+        temperature=0.5,
+        pairwise_weight=0.5,
+        pairwise_min_gap=0.25,
+    )
+
+    assert int(bad["target_index"][0]) == 1
+    assert bad["loss"] > good["loss"]
+    assert bad["pred_quality"] < good["pred_quality"]
+    bad["loss"].backward()
+    assert bad_logits.grad is not None
+    assert torch.isfinite(bad_logits.grad).all()
+
+
 def test_score_anti_identity_loss_penalizes_identity_when_better_candidate_exists():
     candidate_cost = torch.tensor([[0.30, 0.10, 0.45]])
     valid = torch.ones_like(candidate_cost, dtype=torch.bool)
@@ -273,6 +336,124 @@ def test_score_anti_identity_loss_penalizes_identity_when_better_candidate_exist
     assert bad["active"].item() > 0.0
     assert bad["loss"] > good["loss"]
     assert bad["selected_identity_frac"] > good["selected_identity_frac"]
+
+
+def test_nvs_teacher_correspondence_loss_prefers_teacher_matches():
+    query = torch.zeros(1, 3, 2, 3)
+    render = torch.zeros(1, 3, 2, 3)
+    query[0, 0, 0, 0] = 1.0
+    query[0, 1, 1, 2] = 1.0
+    render.copy_(query)
+    query_xy = torch.tensor([[[0.0, 0.0], [2.0, 1.0]]])
+    map_xy_good = torch.tensor([[[0.0, 0.0], [2.0, 1.0]]])
+    map_xy_bad = torch.tensor([[[2.0, 1.0], [0.0, 0.0]]])
+    conf = torch.ones(1, 2)
+    valid = torch.ones(1, 2)
+    source_hw = torch.tensor([[2.0, 3.0]])
+
+    good_loss, good_metrics = nvs_teacher_correspondence_loss(
+        query,
+        render,
+        {
+            "teacher_corr_query_xy": query_xy,
+            "teacher_corr_map_xy": map_xy_good,
+            "teacher_corr_conf": conf,
+            "teacher_corr_valid": valid,
+            "teacher_corr_hw": source_hw,
+        },
+        weight=1.0,
+        patch_weight=1.0,
+        temperature=0.05,
+        min_points=2,
+        patch_radius=1,
+        patch_temperature=0.05,
+    )
+    bad_loss, bad_metrics = nvs_teacher_correspondence_loss(
+        query,
+        render,
+        {
+            "teacher_corr_query_xy": query_xy,
+            "teacher_corr_map_xy": map_xy_bad,
+            "teacher_corr_conf": conf,
+            "teacher_corr_valid": valid,
+            "teacher_corr_hw": source_hw,
+        },
+        weight=1.0,
+        patch_weight=1.0,
+        temperature=0.05,
+        min_points=2,
+        patch_radius=1,
+        patch_temperature=0.05,
+    )
+
+    assert good_loss < bad_loss
+    assert good_metrics["nvs_teacher_corr_missing"].item() == 0.0
+    assert good_metrics["nvs_teacher_corr_acc"].item() == 1.0
+    assert bad_metrics["nvs_teacher_corr_acc"].item() == 0.0
+
+
+def test_nvs_teacher_pair_match_loss_prefers_teacher_center_patch_and_backprops():
+    matcher = PairConditionedLocalMatcher(
+        channels=3,
+        hidden_dim=8,
+        offset_radius=1,
+        zero_init_residual=True,
+        base_dot_weight=10.0,
+    )
+    query = torch.zeros(1, 3, 3, 3)
+    render = torch.zeros(1, 3, 3, 3)
+    query[0, 0, 1, 1] = 1.0
+    render[0, 0, 1, 1] = 1.0
+    render[0, 1, 1, 0] = 1.0
+    query_xy = torch.tensor([[[1.0, 1.0]]])
+    good_map_xy = torch.tensor([[[1.0, 1.0]]])
+    bad_map_xy = torch.tensor([[[0.0, 1.0]]])
+    conf = torch.ones(1, 1)
+    valid = torch.ones(1, 1)
+    source_hw = torch.tensor([[3.0, 3.0]])
+
+    good_loss, good_metrics = nvs_teacher_pair_match_loss(
+        matcher,
+        query,
+        render,
+        {
+            "teacher_corr_query_xy": query_xy,
+            "teacher_corr_map_xy": good_map_xy,
+            "teacher_corr_conf": conf,
+            "teacher_corr_valid": valid,
+            "teacher_corr_hw": source_hw,
+        },
+        weight=1.0,
+        radius=1,
+        temperature=0.05,
+        min_points=1,
+        positive_weight=0.5,
+    )
+    bad_loss, bad_metrics = nvs_teacher_pair_match_loss(
+        matcher,
+        query,
+        render,
+        {
+            "teacher_corr_query_xy": query_xy,
+            "teacher_corr_map_xy": bad_map_xy,
+            "teacher_corr_conf": conf,
+            "teacher_corr_valid": valid,
+            "teacher_corr_hw": source_hw,
+        },
+        weight=1.0,
+        radius=1,
+        temperature=0.05,
+        min_points=1,
+        positive_weight=0.5,
+    )
+
+    good_loss.backward()
+
+    assert good_loss < bad_loss
+    assert good_loss.item() >= 0.0
+    assert good_metrics["nvs_pair_match_acc"].item() == 1.0
+    assert bad_metrics["nvs_pair_match_acc"].item() == 0.0
+    assert any(param.grad is not None for param in matcher.parameters())
 
 
 def test_local_zero_offset_scores_can_use_continuous_reliability_weights():
@@ -319,6 +500,42 @@ def test_nvs_best_metric_defaults_to_pose_energy_metric_when_enabled():
 
     assert resolved.best_metric == "pose_energy_pred_cost_m"
     assert resolved.best_metric_mode == "min"
+
+
+def test_nvs_config_overrides_pose_energy_defaults_unless_cli_set():
+    args = type(
+        "Args",
+        (),
+        {
+            "best_metric": None,
+            "best_metric_mode": None,
+            "synthetic_ratio": None,
+            "topk": None,
+            "lattice_trans_cm": None,
+            "lattice_rot_deg": None,
+            "lattice_direction_mode": None,
+        },
+    )()
+
+    resolved = apply_config_defaults(
+        args,
+        {
+            "pose_energy": {"synthetic_ratio": 0.5},
+            "nvs_pose_feature_adapter": {
+                "synthetic_ratio": 0.0,
+                "topk": 8,
+                "lattice_trans_cm": [0, 5, 10],
+                "lattice_rot_deg": [0, 1, 2],
+                "lattice_direction_mode": "axis",
+            },
+        },
+    )
+
+    assert resolved.synthetic_ratio == 0.0
+    assert resolved.topk == 8
+    assert resolved.lattice_trans_cm == [0, 5, 10]
+    assert resolved.lattice_rot_deg == [0, 1, 2]
+    assert resolved.lattice_direction_mode == "axis"
 
 
 def test_variance_floor_loss_penalizes_collapse():
@@ -791,6 +1008,35 @@ def test_local_offset_only_scores_are_available():
     assert torch.isfinite(peak_scores).all()
 
 
+def test_pair_matcher_local_candidate_scores_prefer_aligned_candidate():
+    torch.manual_seed(17)
+    query = torch.randn(1, 5, 5, 5)
+    aligned = query.clone()
+    shifted = torch.roll(query, shifts=1, dims=-1)
+    render = torch.stack([aligned, shifted], dim=1)
+    matcher = PairConditionedLocalMatcher(
+        channels=5,
+        hidden_dim=8,
+        offset_radius=1,
+        zero_init_residual=True,
+        base_dot_weight=10.0,
+    )
+
+    scores, stats = pair_matcher_local_candidate_scores(
+        matcher,
+        query,
+        render,
+        radius=1,
+        stride=1,
+        temperature=0.05,
+        chunk_points=16,
+    )
+
+    assert scores.shape == (1, 2)
+    assert scores[0, 0] > scores[0, 1]
+    assert stats["local_peak_offset_px"] >= 0.0
+
+
 def test_local_flow_nce_loss_accepts_zero_offset_identity_projection():
     query = torch.randn(1, 5, 3, 3)
     render = query[:, None].clone()
@@ -844,8 +1090,12 @@ def test_nvs_checkpoint_roundtrips_energy_net_and_trainable_query_prefix(tmp_pat
     model = TinyQueryModel()
     adapter = PoseFeatureDomainAdapter(channels=3, hidden_dim=4)
     energy_net = PoseEnergyNet(vector_dim=nvs_pose_energy_vector_dim(args), score_map_channels=3, hidden_dim=8)
+    pair_matcher = PairConditionedLocalMatcher(channels=3, hidden_dim=8, offset_radius=1)
     optimizer = torch.optim.AdamW(
-        list(adapter.parameters()) + list(energy_net.parameters()) + list(model.fine_head.parameters()),
+        list(adapter.parameters())
+        + list(energy_net.parameters())
+        + list(pair_matcher.parameters())
+        + list(model.fine_head.parameters()),
         lr=1.0e-3,
     )
     path = tmp_path / "ckpt.pth"
@@ -855,22 +1105,43 @@ def test_nvs_checkpoint_roundtrips_energy_net_and_trainable_query_prefix(tmp_pat
         model.local_corr_projector.weight.fill_(0.5)
         model.unrelated.weight.fill_(0.75)
         energy_net.energy_head.bias.fill_(1.25)
+        pair_matcher.residual[-1].bias.fill_(0.33)
 
-    save_checkpoint(path, adapter, model, optimizer, 7, {"pred": 1.0}, {}, args, energy_net=energy_net)
+    save_checkpoint(
+        path,
+        adapter,
+        model,
+        optimizer,
+        7,
+        {"pred": 1.0},
+        {},
+        args,
+        energy_net=energy_net,
+        pair_matcher=pair_matcher,
+    )
 
     with torch.no_grad():
         model.fine_head.weight.zero_()
         model.local_corr_projector.weight.zero_()
         model.unrelated.weight.zero_()
         energy_net.energy_head.bias.zero_()
+        pair_matcher.residual[-1].bias.zero_()
 
-    loaded = load_adapter_checkpoint(path, adapter, model=model, optimizer=None, energy_net=energy_net)
+    loaded = load_adapter_checkpoint(
+        path,
+        adapter,
+        model=model,
+        optimizer=None,
+        energy_net=energy_net,
+        pair_matcher=pair_matcher,
+    )
 
     assert loaded["step"] == 7
     assert torch.allclose(model.fine_head.weight, torch.full_like(model.fine_head.weight, 0.25))
     assert torch.allclose(model.local_corr_projector.weight, torch.full_like(model.local_corr_projector.weight, 0.5))
     assert torch.allclose(model.unrelated.weight, torch.zeros_like(model.unrelated.weight))
     assert torch.allclose(energy_net.energy_head.bias, torch.full_like(energy_net.energy_head.bias, 1.25))
+    assert torch.allclose(pair_matcher.residual[-1].bias, torch.full_like(pair_matcher.residual[-1].bias, 0.33))
 
 
 def test_pose_energy_eval_loader_accepts_nvs_checkpoint_key(tmp_path):
@@ -919,7 +1190,7 @@ def test_collect_trainable_parameters_can_freeze_pose_feature_adapter():
     for param in model.parameters():
         param.requires_grad_(False)
 
-    params = collect_trainable_parameters(adapter, energy_net, model, train_adapter=False)
+    params = collect_trainable_parameters(adapter, energy_net, None, model, train_adapter=False)
 
     assert params
     assert all(not param.requires_grad for param in adapter.parameters())

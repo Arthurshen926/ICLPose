@@ -4216,6 +4216,12 @@ class JointRADIOQueryDataset(Dataset):
                 scores = np.asarray(candidate_entry["retrieval_scores_candidates"], dtype=np.float32)
                 limit = self.pose_candidate_topk if self.pose_candidate_topk > 0 else len(poses)
                 limit = max(1, min(int(limit), len(poses)))
+                if "pose_init" in candidate_entry:
+                    item["pose_init"] = torch.from_numpy(
+                        np.asarray(candidate_entry["pose_init"], dtype=np.float32).copy()
+                    ).float()
+                if "init_source" in candidate_entry:
+                    item["init_source"] = str(candidate_entry["init_source"])
                 item["pose_init_candidates"] = torch.from_numpy(poses[:limit].copy()).float()
                 item["candidate_valid_mask"] = torch.from_numpy(valid[:limit].copy()).bool()
                 item["retrieval_scores_candidates"] = torch.from_numpy(scores[:limit].copy()).float()

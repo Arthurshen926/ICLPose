@@ -20,6 +20,7 @@ from feature_extract.train_impl import (  # noqa: E402
     JointRADIOQueryDataset,
     MapFeatureRenderer,
     RetrievalTeacherStore,
+    TeacherCorrespondenceStore,
     TeacherFeatureStore,
     _candidate_wls_refined_pose_cost,
     apply_pose_delta,
@@ -30,6 +31,7 @@ from feature_extract.train_impl import (  # noqa: E402
     fine_candidate_selector_features,
     load_config,
     load_model_warmstart,
+    load_pose_candidate_cache_index,
     local_render_score_feature_candidates,
     move_batch_to_device,
     pose_error_tensors,
@@ -521,6 +523,37 @@ def build_model_and_data(cfg: Dict, args: argparse.Namespace, device: torch.devi
         or cfg.get("map_supervision", {}).get("colmap_dir")
         or str(Path(cfg["dataset"]["source_dir"]) / "sparse" / "0")
     )
+    teacher_corr_path = cfg["dataset"].get("teacher_correspondence_path")
+    teacher_corr_train_path = cfg["dataset"].get("teacher_correspondence_train_path") or teacher_corr_path
+    teacher_corr_val_path = cfg["dataset"].get("teacher_correspondence_val_path") or teacher_corr_path
+    teacher_corr_selected_path = teacher_corr_train_path if args.split == "train" else teacher_corr_val_path
+    teacher_corr_store = None
+    if teacher_corr_selected_path:
+        teacher_corr_store = TeacherCorrespondenceStore(
+            teacher_corr_selected_path,
+            feature_hw=cfg["dataset"]["feature_hw"],
+            max_points=int(cfg["dataset"].get("teacher_correspondence_max_points", 512)),
+            coordinate_space=str(cfg["dataset"].get("teacher_correspondence_coordinate_space", "auto")),
+        )
+    if args.split == "train":
+        pose_candidate_cache_paths = cfg["dataset"].get("train_pose_candidate_cache") or cfg["dataset"].get(
+            "train_pose_candidate_caches"
+        )
+    else:
+        pose_candidate_cache_paths = cfg["dataset"].get("val_pose_candidate_cache") or cfg["dataset"].get(
+            "val_pose_candidate_caches"
+        )
+    pose_candidate_index = load_pose_candidate_cache_index(pose_candidate_cache_paths)
+    pose_candidate_topk = int(
+        cfg["dataset"].get(
+            "pose_candidate_topk",
+            cfg.get("map_supervision", {}).get(
+                "candidate_stage1_topk",
+                cfg.get("map_supervision", {}).get("candidate_render_score_max_candidates", 0),
+            ),
+        )
+        or 0
+    )
     dataset = JointRADIOQueryDataset(
         records,
         teacher_store,
@@ -528,7 +561,10 @@ def build_model_and_data(cfg: Dict, args: argparse.Namespace, device: torch.devi
         feature_hw=cfg["dataset"]["feature_hw"],
         synthetic_rgb=bool(cfg["dataset"].get("synthetic_if_missing", False)),
         retrieval_teacher_store=retrieval_store,
+        teacher_correspondence_store=teacher_corr_store,
         colmap_dir=colmap_dir,
+        pose_candidate_cache_index=pose_candidate_index,
+        pose_candidate_topk=pose_candidate_topk,
     )
     loader = DataLoader(
         dataset,

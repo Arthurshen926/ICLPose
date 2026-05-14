@@ -435,6 +435,14 @@ def build_pose_feature_adapter(args: argparse.Namespace, model, cfg: Dict, devic
         zero_init=bool(args.pose_feature_adapter_zero_init),
         l2_normalize=bool(args.pose_feature_adapter_l2_normalize),
         uncertainty_enabled=bool(args.pose_feature_adapter_uncertainty_enabled),
+        rgb_context_enabled=bool(getattr(args, "pose_feature_adapter_rgb_context_enabled", False)),
+        rgb_context_channels=int(getattr(args, "pose_feature_adapter_rgb_context_channels", 8)),
+        texture_branch_enabled=bool(getattr(args, "pose_feature_adapter_texture_branch_enabled", False)),
+        texture_branch_hidden_dim=int(getattr(args, "pose_feature_adapter_texture_branch_hidden_dim", 32)),
+        texture_branch_scale=float(getattr(args, "pose_feature_adapter_texture_branch_scale", 0.25)),
+        texture_branch_zero_init=bool(getattr(args, "pose_feature_adapter_texture_branch_zero_init", True)),
+        texture_fusion_mode=str(getattr(args, "pose_feature_adapter_texture_fusion_mode", "residual")),
+        base_anchor_weight=float(getattr(args, "pose_feature_adapter_base_anchor_weight", 1.0)),
     ).to(device)
 
 

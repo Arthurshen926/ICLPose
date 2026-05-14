@@ -1,0 +1,80 @@
+# Stage 1A: feature adaptability before candidate-energy tuning.
+# RADIO/DCFF stay frozen as base anchors.  The only promoted signal here is
+# LoFTR/render-PnP teacher correspondence supervision on Q_loc <-> M_loc(T*),
+# so the adapter first learns localizable matching features instead of another
+# scalar candidate selector.
+
+base_config: /root/ICLPose/feature_extract/configs/nvs_pose_feature_adapter_stage1.yaml
+exp_name: nvs_pose_feature_adapter_stage1_teacherloc
+
+dataset:
+  teacher_correspondence_train_path: /root/ICLPose/result/result/feature_extract/teacher_corr/oldhospital_train_self_loftr_top1_128
+  teacher_correspondence_val_path: /root/ICLPose/result/result/feature_extract/teacher_corr/oldhospital_test_renderloftr_top1_32
+  teacher_correspondence_max_points: 256
+  teacher_correspondence_coordinate_space: auto
+
+training:
+  batch_size: 12
+  validation_batch_size: 12
+  max_steps: 800
+  eval_every: 50
+
+nvs_pose_feature_adapter:
+  best_metric: nvs_pair_match_gap
+  best_metric_mode: max
+
+  # First solve feature adaptability; keep candidate scoring diagnostic only.
+  pose_energy_enabled: false
+  pose_energy_weight: 0.0
+  rank_ce_weight: 0.0
+  rank_pairwise_weight: 0.0
+  score_correction_cosine_weight: 0.0
+  score_pose_improvement_weight: 0.0
+  score_anti_identity_weight: 0.0
+
+  # Teacher correspondence is the main localization-feature signal.
+  pose_feature_adapter_rgb_context_enabled: true
+  pose_feature_adapter_rgb_context_channels: 8
+  pair_matcher_enabled: true
+  pair_matcher_weight: 2.0
+  pair_matcher_hidden_dim: 96
+  pair_matcher_radius: 3
+  pair_matcher_temperature: 0.04
+  pair_matcher_min_confidence: 0.3
+  pair_matcher_min_points: 8
+  pair_matcher_positive_weight: 0.5
+  pair_matcher_margin_weight: 0.5
+  pair_matcher_margin: 0.05
+  pair_matcher_base_dot_weight: 1.0
+  pair_matcher_zero_init_residual: true
+  teacher_corr_weight: 1.0
+  teacher_corr_temperature: 0.05
+  teacher_corr_min_confidence: 0.3
+  teacher_corr_min_points: 8
+  teacher_corr_negative_exclusion_px: 8.0
+  teacher_corr_positive_weight: 0.5
+  teacher_corr_margin_weight: 0.5
+  teacher_corr_margin: 0.08
+  teacher_corr_local_patch_weight: 2.0
+  teacher_corr_local_patch_radius: 3
+  teacher_corr_local_patch_temperature: 0.04
+  teacher_corr_local_patch_min_points: 8
+  teacher_corr_local_patch_positive_weight: 0.5
+  teacher_corr_local_patch_margin_weight: 0.5
+  teacher_corr_local_patch_margin: 0.05
+
+  # Keep weak dense anchors, but prevent synthetic render-to-render shortcuts.
+  align_weight: 0.5
+  warp_align_weight: 0.0
+  local_flow_nce_weight: 0.0
+  drift_weight: 0.05
+  variance_weight: 0.02
+  synthetic_ratio: 0.0
+
+  # Candidate rendering is only for diagnostics in this stage, so keep it light.
+  topk: 8
+  lattice_trans_cm: [0, 5, 10, 25]
+  lattice_rot_deg: [0, 1, 2, 5]
+  include_identity_candidate: true
+  train_append_gt_candidate: false
+  eval_append_gt_candidate: false

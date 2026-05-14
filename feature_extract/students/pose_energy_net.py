@@ -22,18 +22,22 @@ class PoseFeatureAdapter(nn.Module):
         residual_scale: float = 0.1,
         zero_init: bool = True,
         l2_normalize: bool = True,
+        extra_channels: int = 0,
     ):
         super().__init__()
         self.channels = int(channels)
         self.hidden_dim = int(hidden_dim)
         self.residual_scale = float(residual_scale)
         self.l2_normalize = bool(l2_normalize)
+        self.extra_channels = int(extra_channels)
         if self.channels <= 0:
             raise ValueError("channels must be positive")
         if self.hidden_dim <= 0:
             raise ValueError("hidden_dim must be positive")
+        if self.extra_channels < 0:
+            raise ValueError("extra_channels must be non-negative")
         self.net = nn.Sequential(
-            nn.Conv2d(self.channels, self.hidden_dim, kernel_size=1),
+            nn.Conv2d(self.channels + self.extra_channels, self.hidden_dim, kernel_size=1),
             nn.GELU(),
             nn.Conv2d(self.hidden_dim, self.hidden_dim, kernel_size=3, padding=1),
             nn.GELU(),
@@ -44,15 +48,64 @@ class PoseFeatureAdapter(nn.Module):
             nn.init.zeros_(last.weight)
             nn.init.zeros_(last.bias)
 
-    def forward(self, feature: torch.Tensor) -> torch.Tensor:
+    def forward(self, feature: torch.Tensor, extra: torch.Tensor | None = None) -> torch.Tensor:
         if feature.ndim != 4:
             raise ValueError("feature must have shape (B,C,H,W)")
         if feature.shape[1] != self.channels:
             raise ValueError(f"expected channels={self.channels}, got {feature.shape[1]}")
-        adapted = feature + self.net(feature) * self.residual_scale
+        if self.extra_channels > 0:
+            if extra is None:
+                extra = feature.new_zeros((feature.shape[0], self.extra_channels, feature.shape[-2], feature.shape[-1]))
+            if extra.ndim != 4 or extra.shape[0] != feature.shape[0] or extra.shape[1] != self.extra_channels:
+                raise ValueError(
+                    f"extra must have shape (B,{self.extra_channels},H,W), got {tuple(extra.shape)}"
+                )
+            if extra.shape[-2:] != feature.shape[-2:]:
+                extra = F.interpolate(extra.float(), size=feature.shape[-2:], mode="bilinear", align_corners=False)
+            net_input = torch.cat([feature, extra.to(device=feature.device, dtype=feature.dtype)], dim=1)
+        else:
+            net_input = feature
+        adapted = feature + self.net(net_input) * self.residual_scale
         if self.l2_normalize:
             adapted = F.normalize(adapted.float(), dim=1, eps=1.0e-6).to(dtype=adapted.dtype)
         return adapted
+
+
+class RGBTextureFeatureBranch(nn.Module):
+    """Small ConvNet branch for localizable RGB texture evidence."""
+
+    def __init__(
+        self,
+        channels: int,
+        hidden_dim: int = 32,
+        zero_init: bool = True,
+    ):
+        super().__init__()
+        self.channels = int(channels)
+        self.hidden_dim = int(hidden_dim)
+        if self.channels <= 0:
+            raise ValueError("channels must be positive")
+        if self.hidden_dim <= 0:
+            raise ValueError("hidden_dim must be positive")
+        self.net = nn.Sequential(
+            nn.Conv2d(3, self.hidden_dim, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(self.hidden_dim, self.hidden_dim, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(self.hidden_dim, self.channels, kernel_size=1),
+        )
+        if bool(zero_init):
+            last = self.net[-1]
+            nn.init.zeros_(last.weight)
+            nn.init.zeros_(last.bias)
+
+    def forward(self, rgb: torch.Tensor, *, size: tuple[int, int], dtype: torch.dtype) -> torch.Tensor:
+        if rgb.ndim != 4 or rgb.shape[1] != 3:
+            raise ValueError(f"rgb must have shape (B,3,H,W), got {tuple(rgb.shape)}")
+        rgb_f = rgb.float()
+        if rgb_f.shape[-2:] != size:
+            rgb_f = F.interpolate(rgb_f, size=size, mode="bilinear", align_corners=False)
+        return self.net(rgb_f).to(dtype=dtype)
 
 
 class PoseFeatureDomainAdapter(nn.Module):
@@ -66,16 +119,61 @@ class PoseFeatureDomainAdapter(nn.Module):
         zero_init: bool = True,
         l2_normalize: bool = True,
         uncertainty_enabled: bool = False,
+        rgb_context_enabled: bool = False,
+        rgb_context_channels: int = 8,
+        texture_branch_enabled: bool = False,
+        texture_branch_hidden_dim: int = 32,
+        texture_branch_scale: float = 0.25,
+        texture_branch_zero_init: bool = True,
+        texture_fusion_mode: str = "residual",
+        base_anchor_weight: float = 1.0,
     ):
         super().__init__()
         self.channels = int(channels)
         self.uncertainty_enabled = bool(uncertainty_enabled)
+        self.rgb_context_enabled = bool(rgb_context_enabled)
+        self.rgb_context_channels = int(rgb_context_channels) if self.rgb_context_enabled else 0
+        self.texture_branch_enabled = bool(texture_branch_enabled)
+        self.texture_branch_scale = float(texture_branch_scale)
+        self.texture_fusion_mode = str(texture_fusion_mode or "residual").lower()
+        self.base_anchor_weight = float(base_anchor_weight)
+        if self.rgb_context_channels < 0:
+            raise ValueError("rgb_context_channels must be non-negative")
+        if self.rgb_context_enabled and self.rgb_context_channels <= 0:
+            raise ValueError("rgb_context_channels must be positive when RGB context is enabled")
+        if self.texture_branch_scale < 0.0:
+            raise ValueError("texture_branch_scale must be non-negative")
+        if self.base_anchor_weight < 0.0:
+            raise ValueError("base_anchor_weight must be non-negative")
+        if self.texture_fusion_mode not in {"residual", "replace"}:
+            raise ValueError("texture_fusion_mode must be 'residual' or 'replace'")
+        self.query_rgb_stem = (
+            nn.Sequential(
+                nn.Conv2d(3, self.rgb_context_channels, kernel_size=3, padding=1),
+                nn.GELU(),
+                nn.Conv2d(self.rgb_context_channels, self.rgb_context_channels, kernel_size=3, padding=1),
+                nn.GELU(),
+            )
+            if self.rgb_context_enabled
+            else None
+        )
+        self.render_rgb_stem = (
+            nn.Sequential(
+                nn.Conv2d(3, self.rgb_context_channels, kernel_size=3, padding=1),
+                nn.GELU(),
+                nn.Conv2d(self.rgb_context_channels, self.rgb_context_channels, kernel_size=3, padding=1),
+                nn.GELU(),
+            )
+            if self.rgb_context_enabled
+            else None
+        )
         self.query_adapter = PoseFeatureAdapter(
             channels=channels,
             hidden_dim=hidden_dim,
             residual_scale=residual_scale,
             zero_init=zero_init,
             l2_normalize=l2_normalize,
+            extra_channels=self.rgb_context_channels,
         )
         self.render_adapter = PoseFeatureAdapter(
             channels=channels,
@@ -83,6 +181,7 @@ class PoseFeatureDomainAdapter(nn.Module):
             residual_scale=residual_scale,
             zero_init=zero_init,
             l2_normalize=l2_normalize,
+            extra_channels=self.rgb_context_channels,
         )
         if self.uncertainty_enabled:
             self.query_uncertainty = nn.Sequential(
@@ -98,12 +197,62 @@ class PoseFeatureDomainAdapter(nn.Module):
         else:
             self.query_uncertainty = None
             self.render_uncertainty = None
+        self.query_texture_branch = (
+            RGBTextureFeatureBranch(
+                channels=self.channels,
+                hidden_dim=int(texture_branch_hidden_dim),
+                zero_init=bool(texture_branch_zero_init),
+            )
+            if self.texture_branch_enabled
+            else None
+        )
+        self.render_texture_branch = (
+            RGBTextureFeatureBranch(
+                channels=self.channels,
+                hidden_dim=int(texture_branch_hidden_dim),
+                zero_init=bool(texture_branch_zero_init),
+            )
+            if self.texture_branch_enabled
+            else None
+        )
 
-    def project_query(self, feature: torch.Tensor) -> torch.Tensor:
-        return self.query_adapter(feature)
+    def _rgb_context(self, rgb: torch.Tensor | None, feature: torch.Tensor, *, domain: str) -> torch.Tensor | None:
+        if not self.rgb_context_enabled:
+            return None
+        if rgb is None:
+            return feature.new_zeros(
+                (feature.shape[0], self.rgb_context_channels, feature.shape[-2], feature.shape[-1])
+            )
+        if rgb.ndim != 4 or rgb.shape[0] != feature.shape[0] or rgb.shape[1] != 3:
+            raise ValueError(f"{domain} rgb must have shape (B,3,H,W), got {tuple(rgb.shape)}")
+        rgb_f = rgb.to(device=feature.device).float()
+        if rgb_f.shape[-2:] != feature.shape[-2:]:
+            rgb_f = F.interpolate(rgb_f, size=feature.shape[-2:], mode="bilinear", align_corners=False)
+        stem = self.query_rgb_stem if domain == "query" else self.render_rgb_stem
+        if stem is None:
+            return None
+        return stem(rgb_f).to(dtype=feature.dtype)
 
-    def project_render(self, feature: torch.Tensor) -> torch.Tensor:
-        return self.render_adapter(feature)
+    def project_query(self, feature: torch.Tensor, rgb: torch.Tensor | None = None) -> torch.Tensor:
+        loc = self.query_adapter(feature, extra=self._rgb_context(rgb, feature, domain="query"))
+        return self._add_texture_branch(loc, rgb, domain="query")
+
+    def project_render(self, feature: torch.Tensor, rgb: torch.Tensor | None = None) -> torch.Tensor:
+        loc = self.render_adapter(feature, extra=self._rgb_context(rgb, feature, domain="render"))
+        return self._add_texture_branch(loc, rgb, domain="render")
+
+    def _add_texture_branch(self, loc: torch.Tensor, rgb: torch.Tensor | None, *, domain: str) -> torch.Tensor:
+        if not self.texture_branch_enabled or rgb is None or self.texture_branch_scale <= 0.0:
+            return loc
+        branch = self.query_texture_branch if domain == "query" else self.render_texture_branch
+        if branch is None:
+            return loc
+        texture = branch(rgb.to(device=loc.device), size=loc.shape[-2:], dtype=loc.dtype)
+        if self.texture_fusion_mode == "replace":
+            mixed = float(self.base_anchor_weight) * loc.float() + float(self.texture_branch_scale) * texture.float()
+        else:
+            mixed = loc.float() + float(self.texture_branch_scale) * texture.float()
+        return F.normalize(mixed, dim=1, eps=1.0e-6).to(dtype=loc.dtype)
 
     def _default_uncertainty(self, feature: torch.Tensor) -> torch.Tensor:
         return torch.ones(
@@ -112,25 +261,143 @@ class PoseFeatureDomainAdapter(nn.Module):
             dtype=feature.dtype,
         )
 
-    def project_query_with_uncertainty(self, feature: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        loc = self.project_query(feature)
+    def project_query_with_uncertainty(
+        self,
+        feature: torch.Tensor,
+        rgb: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        loc = self.project_query(feature, rgb=rgb)
         if self.query_uncertainty is None:
             return loc, self._default_uncertainty(feature)
         return loc, torch.sigmoid(self.query_uncertainty(feature.float())).to(dtype=loc.dtype)
 
-    def project_render_with_uncertainty(self, feature: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        loc = self.project_render(feature)
+    def project_render_with_uncertainty(
+        self,
+        feature: torch.Tensor,
+        rgb: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        loc = self.project_render(feature, rgb=rgb)
         if self.render_uncertainty is None:
             return loc, self._default_uncertainty(feature)
         return loc, torch.sigmoid(self.render_uncertainty(feature.float())).to(dtype=loc.dtype)
 
-    def forward(self, feature: torch.Tensor, domain: str = "query") -> torch.Tensor:
+    def forward(self, feature: torch.Tensor, domain: str = "query", rgb: torch.Tensor | None = None) -> torch.Tensor:
         domain = str(domain).lower()
         if domain == "query":
-            return self.project_query(feature)
+            return self.project_query(feature, rgb=rgb)
         if domain in {"render", "map"}:
-            return self.project_render(feature)
+            return self.project_render(feature, rgb=rgb)
         raise ValueError(f"Unknown pose feature adapter domain: {domain}")
+
+
+class PairConditionedLocalMatcher(nn.Module):
+    """Point-wise query/render matcher for teacher-supervised local heatmaps.
+
+    RADIO/DCFF features remain the base input, but this module learns the
+    pair-conditioned local matching evidence that scalar cosine statistics do
+    not reliably expose.  It starts from a normalized dot-product prior and
+    adds a learned residual over query, render-patch, relative offset, and
+    pair-difference features.
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        hidden_dim: int = 64,
+        offset_radius: int = 3,
+        dropout: float = 0.0,
+        zero_init_residual: bool = True,
+        base_dot_weight: float = 1.0,
+    ):
+        super().__init__()
+        self.channels = int(channels)
+        self.hidden_dim = int(hidden_dim)
+        self.offset_radius = int(offset_radius)
+        self.base_dot_weight = float(base_dot_weight)
+        if self.channels <= 0:
+            raise ValueError("channels must be positive")
+        if self.hidden_dim <= 0:
+            raise ValueError("hidden_dim must be positive")
+        if self.offset_radius < 0:
+            raise ValueError("offset_radius must be non-negative")
+        self.query_proj = nn.Linear(self.channels, self.hidden_dim)
+        self.render_proj = nn.Linear(self.channels, self.hidden_dim)
+        self.offset_proj = nn.Linear(2, self.hidden_dim)
+        self.score_context_proj = nn.Linear(4, self.hidden_dim)
+        residual_in_dim = self.hidden_dim * 6
+        self.residual = nn.Sequential(
+            nn.Linear(residual_in_dim, self.hidden_dim),
+            nn.GELU(),
+            nn.Dropout(float(dropout)) if float(dropout) > 0.0 else nn.Identity(),
+            nn.Linear(self.hidden_dim, 1),
+        )
+        if bool(zero_init_residual):
+            last = self.residual[-1]
+            nn.init.zeros_(last.weight)
+            nn.init.zeros_(last.bias)
+
+    def forward(
+        self,
+        query_vectors: torch.Tensor,
+        patch_vectors: torch.Tensor,
+        *,
+        offsets: torch.Tensor | None = None,
+        patch_valid: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if query_vectors.ndim != 2 or query_vectors.shape[-1] != self.channels:
+            raise ValueError(f"query_vectors must have shape (N,{self.channels})")
+        if patch_vectors.ndim != 3 or patch_vectors.shape[-1] != self.channels:
+            raise ValueError(f"patch_vectors must have shape (N,L,{self.channels})")
+        if patch_vectors.shape[0] != query_vectors.shape[0]:
+            raise ValueError("query_vectors and patch_vectors batch dimensions must match")
+        num_points, num_offsets = patch_vectors.shape[:2]
+        q = query_vectors.float()
+        p = patch_vectors.float()
+        q_norm = F.normalize(q, dim=-1, eps=1.0e-6)
+        p_norm = F.normalize(p, dim=-1, eps=1.0e-6)
+        base_cos = (q_norm[:, None, :] * p_norm).sum(dim=-1)
+        base_logits = base_cos * self.base_dot_weight
+
+        q_proj = self.query_proj(q_norm)[:, None, :].expand(-1, num_offsets, -1)
+        p_proj = self.render_proj(p_norm)
+        if offsets is None:
+            side = int(round(math.sqrt(num_offsets)))
+            if side * side == num_offsets:
+                radius = (side - 1) // 2
+                axis = torch.arange(-radius, radius + 1, device=q.device, dtype=q.dtype)
+                dy, dx = torch.meshgrid(axis, axis, indexing="ij")
+                offsets = torch.stack([dx.reshape(-1), dy.reshape(-1)], dim=-1)
+            else:
+                offsets = torch.zeros(num_offsets, 2, device=q.device, dtype=q.dtype)
+        offsets = offsets.to(device=q.device, dtype=q.dtype)
+        if offsets.ndim != 2 or offsets.shape != (num_offsets, 2):
+            raise ValueError(f"offsets must have shape {(num_offsets, 2)}")
+        radius = max(float(self.offset_radius), float(offsets.abs().max().detach().cpu().item()), 1.0)
+        offset_norm = offsets / radius
+        off_proj = self.offset_proj(offset_norm)[None].expand(num_points, -1, -1)
+        row_mean = base_cos.mean(dim=1, keepdim=True)
+        if num_offsets > 1:
+            row_max = base_cos.max(dim=1, keepdim=True).values
+        else:
+            row_max = base_cos
+        offset_mag = torch.linalg.vector_norm(offset_norm, dim=-1)[None].expand(num_points, -1)
+        score_context = torch.stack(
+            [base_cos, base_cos - row_mean, base_cos - row_max, offset_mag],
+            dim=-1,
+        )
+        score_proj = self.score_context_proj(score_context)
+        residual_input = torch.cat(
+            [q_proj, p_proj, q_proj * p_proj, torch.abs(q_proj - p_proj), off_proj, score_proj],
+            dim=-1,
+        )
+        residual_logits = self.residual(residual_input).squeeze(-1)
+        logits = base_logits + residual_logits
+        if patch_valid is not None:
+            valid = patch_valid.to(device=logits.device).bool()
+            if valid.shape != logits.shape:
+                raise ValueError(f"patch_valid must have shape {tuple(logits.shape)}")
+            logits = logits.masked_fill(~valid, -1.0e4)
+        return logits
 
 
 class PoseEnergyNet(nn.Module):
