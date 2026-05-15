@@ -42,6 +42,7 @@ from feature_extract.train_impl import (  # noqa: E402
     set_seed,
     split_records,
 )
+from feature_extract.students.pose_energy_net import pose_energy_selection_scores  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -104,13 +105,35 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--fine-select",
-        choices=("score", "conf", "fine_score", "fine_score_prior", "fine_selector", "oracle"),
+        choices=("score", "conf", "fine_score", "fine_score_prior", "fine_selector", "pose_energy", "oracle"),
         default="score",
-        help="Which topK candidate becomes final: scorer top1, max WLS confidence, fine corr score, trainable selector, or GT oracle.",
+        help=(
+            "Which topK candidate becomes final: scorer top1, max WLS confidence, fine corr score, "
+            "trainable selector, PoseEnergy selector, or GT oracle."
+        ),
+    )
+    parser.add_argument(
+        "--pose-energy-checkpoint",
+        default=None,
+        help="Optional Stage2 NVS pose-feature checkpoint used when --fine-select pose_energy.",
+    )
+    parser.add_argument(
+        "--fine-selector-adapter-checkpoint",
+        default=None,
+        help=(
+            "Optional NVS pose-feature adapter checkpoint used to project query/render fine "
+            "features before --fine-select fine_selector."
+        ),
+    )
+    parser.add_argument(
+        "--fine-selector-score-source",
+        choices=("local_corr", "pair_matcher_heatmap"),
+        default="local_corr",
+        help="Score-map source for --fine-select fine_selector.",
     )
     parser.add_argument(
         "--fine-pool-mode",
-        choices=("rank", "rank_uniform", "rank_delta_uniform", "rank_score_uniform"),
+        choices=("rank", "rank_uniform", "rank_delta_uniform", "rank_score_uniform", "rank_pose_hard"),
         default="rank",
         help=(
             "How to form the fine selector/WLS candidate pool. rank preserves the original scorer topK; "
@@ -162,6 +185,37 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--out", default=None, help="Optional output JSON")
     return parser.parse_args()
+
+
+def pose_energy_candidate_selection(
+    outputs: Dict[str, torch.Tensor],
+    valid: torch.Tensor,
+    *,
+    confidence_weight: float = 0.0,
+    residual_norm_weight: float = 0.0,
+    residual_trans_scale_m: float = 1.0,
+    residual_rot_scale_rad: float = 1.0,
+) -> Dict[str, torch.Tensor]:
+    """Select a candidate from PoseEnergy outputs with invalid rows masked."""
+    scores = pose_energy_selection_scores(
+        outputs,
+        confidence_weight=float(confidence_weight),
+        residual_norm_weight=float(residual_norm_weight),
+        residual_trans_scale_m=float(residual_trans_scale_m),
+        residual_rot_scale_rad=float(residual_rot_scale_rad),
+    )
+    if scores.shape != valid.shape:
+        raise ValueError(f"score/valid shape mismatch: {tuple(scores.shape)} vs {tuple(valid.shape)}")
+    masked = scores.float().masked_fill(~valid.bool(), -1.0e6)
+    idx = masked.argmax(dim=1)
+    probs = torch.softmax(masked, dim=1)
+    entropy = -(probs * torch.log(probs.clamp(min=1.0e-8))).sum(dim=1)
+    if masked.shape[1] > 1:
+        top2 = masked.topk(k=2, dim=1).values
+        margin = top2[:, 0] - top2[:, 1]
+    else:
+        margin = torch.zeros_like(entropy)
+    return {"idx": idx, "scores": masked, "entropy": entropy, "margin": margin}
 
 
 def parse_bucket_specs(values: Iterable[str]) -> List[Tuple[str, float, float]]:
@@ -334,6 +388,14 @@ def _take_unique_from_order(order: torch.Tensor, used: set[int], count: int) -> 
     return out[:count]
 
 
+def _take_first_unique_from_order(order: torch.Tensor, used: set[int]) -> List[int]:
+    for value in order.detach().cpu().tolist():
+        idx = int(value)
+        if idx not in used:
+            return [idx]
+    return []
+
+
 def select_fine_pool_indices(
     logits: torch.Tensor,
     valid: torch.Tensor,
@@ -343,13 +405,15 @@ def select_fine_pool_indices(
     rank_topm: int = 16,
     candidate_pose: torch.Tensor | None = None,
     init_pose: torch.Tensor | None = None,
+    pose_gt: torch.Tensor | None = None,
     rot_cost_weight: float = 0.1,
 ) -> torch.Tensor:
     """Select the K candidates passed to fine reranking.
 
-    The default exactly matches the old behavior. Diversity modes are GT-free:
-    they keep a small scorer prefix, then fill the rest from the lattice rather
-    than trusting coarse rank to preserve every good fine candidate.
+    The default exactly matches the old behavior. GT-free diversity modes keep
+    a small scorer prefix, then fill the rest from the lattice.  The
+    rank_pose_hard mode is only for supervised cache construction: it also
+    forces in GT-near, identity, and opposite-direction examples.
     """
     if logits.ndim != 2 or valid.ndim != 2:
         raise ValueError("logits and valid must have shape (B,K)")
@@ -364,9 +428,9 @@ def select_fine_pool_indices(
         return ranked[:, :keep]
 
     delta_order = None
-    if pool_mode == "rank_delta_uniform":
+    if pool_mode in ("rank_delta_uniform", "rank_pose_hard"):
         if candidate_pose is None or init_pose is None:
-            raise ValueError("rank_delta_uniform fine pool requires candidate_pose and init_pose")
+            raise ValueError(f"{pool_mode} fine pool requires candidate_pose and init_pose")
         init_bank = init_pose[:, None].expand(-1, num_candidates, -1, -1)
         _rot_loss, delta_rot_deg, delta_trans_m = pose_error_tensors(
             candidate_pose.reshape(bsz * num_candidates, 4, 4).float(),
@@ -379,6 +443,38 @@ def select_fine_pool_indices(
         delta_order = torch.argsort(delta_cost, dim=1, descending=False)
     elif pool_mode not in ("rank_uniform", "rank_score_uniform"):
         raise ValueError(f"unsupported fine pool mode: {mode}")
+
+    gt_cost = None
+    gt_order = None
+    opposite_order = None
+    if pool_mode == "rank_pose_hard":
+        if pose_gt is None:
+            raise ValueError("rank_pose_hard fine pool requires pose_gt")
+        gt_bank = pose_gt[:, None].expand(-1, num_candidates, -1, -1)
+        _rot_loss, gt_rot_deg, gt_trans_m = pose_error_tensors(
+            candidate_pose.reshape(bsz * num_candidates, 4, 4).float(),
+            gt_bank.reshape(bsz * num_candidates, 4, 4).float(),
+        )
+        gt_cost = gt_trans_m.reshape(bsz, num_candidates) + float(rot_cost_weight) * (
+            gt_rot_deg.reshape(bsz, num_candidates) * (math.pi / 180.0)
+        )
+        gt_cost = gt_cost.masked_fill(~valid.bool(), float("inf"))
+        gt_order = torch.argsort(gt_cost, dim=1, descending=False)
+
+        def camera_centers(poses: torch.Tensor) -> torch.Tensor:
+            rot = poses[..., :3, :3].float()
+            trans = poses[..., :3, 3].float()
+            return -(rot.transpose(-1, -2) @ trans.unsqueeze(-1)).squeeze(-1)
+
+        init_center = camera_centers(init_pose)[:, None, :]
+        gt_center = camera_centers(pose_gt)[:, None, :]
+        cand_center = camera_centers(candidate_pose)
+        candidate_delta = cand_center - init_center
+        target_delta = gt_center - init_center
+        denom = torch.linalg.norm(candidate_delta, dim=-1) * torch.linalg.norm(target_delta, dim=-1).clamp_min(1e-6)
+        correction_cos = (candidate_delta * target_delta).sum(dim=-1) / denom.clamp_min(1e-6)
+        correction_cos = correction_cos.masked_fill((denom <= 1e-8) | ~valid.bool(), float("inf"))
+        opposite_order = torch.argsort(correction_cos, dim=1, descending=False)
 
     rows = []
     prefix = max(0, min(int(rank_topm or 0), keep, num_candidates))
@@ -395,6 +491,29 @@ def select_fine_pool_indices(
             order = ranked[row]
         elif pool_mode == "rank_delta_uniform":
             order = delta_order[row]
+        elif pool_mode == "rank_pose_hard":
+            for order in (gt_order[row], delta_order[row], opposite_order[row]):
+                for idx_i in _take_first_unique_from_order(order, used):
+                    selected.append(idx_i)
+                    used.add(idx_i)
+            if gt_cost is not None:
+                finite_cost = gt_cost[row][torch.isfinite(gt_cost[row])]
+                if finite_cost.numel() > 0:
+                    hard_threshold = finite_cost.median()
+                    hard_order = torch.tensor(
+                        [
+                            int(idx)
+                            for idx in ranked[row].detach().cpu().tolist()
+                            if bool(valid[row, int(idx)]) and float(gt_cost[row, int(idx)].item()) >= float(hard_threshold.item())
+                        ],
+                        device=logits.device,
+                        dtype=torch.long,
+                    )
+                    for idx_i in _take_first_unique_from_order(hard_order, used):
+                        selected.append(idx_i)
+                        used.add(idx_i)
+            fill = keep - len(selected)
+            order = gt_order[row]
         else:
             order = torch.nonzero(valid[row].bool(), as_tuple=False).flatten()
         for idx_i in _take_unique_from_order(order, used, fill):
@@ -482,6 +601,139 @@ def resolve_map_renderer_state(checkpoint: Dict, args: argparse.Namespace):
     return checkpoint.get("map_renderer_state_dict")
 
 
+def load_pose_energy_selector_bundle(path: str, model, cfg: Dict, device: torch.device) -> Dict:
+    """Load the Stage2 NVS adapter, pair matcher, and PoseEnergy head for CPR eval."""
+    if not path:
+        raise ValueError("--pose-energy-checkpoint is required for --fine-select pose_energy")
+    from feature_extract.students.pose_energy_net import PairConditionedLocalMatcher, PoseEnergyNet
+    from feature_extract.tools.train_nvs_pose_feature_adapter import (
+        load_adapter_checkpoint,
+        nvs_pose_energy_vector_dim,
+    )
+    from feature_extract.tools.train_pose_energy import build_pose_feature_adapter
+
+    checkpoint = safe_torch_load(path)
+    saved_args = checkpoint.get("args")
+    if not isinstance(saved_args, dict):
+        raise RuntimeError(f"PoseEnergy checkpoint {path} does not contain saved args")
+    nvs_args = argparse.Namespace(**saved_args)
+    adapter = build_pose_feature_adapter(nvs_args, model, cfg, device)
+    if adapter is None:
+        raise RuntimeError("PoseEnergy checkpoint requires pose_feature_adapter_enabled=true")
+    energy_net = PoseEnergyNet(
+        vector_dim=nvs_pose_energy_vector_dim(nvs_args),
+        score_map_channels=3,
+        map_channels=int(getattr(nvs_args, "pose_energy_map_channels", 16)),
+        grid_size=int(getattr(nvs_args, "pose_energy_grid_size", 4)),
+        hidden_dim=int(getattr(nvs_args, "pose_energy_hidden_dim", 128)),
+        context_layers=int(getattr(nvs_args, "pose_energy_context_layers", 1)),
+        context_heads=int(getattr(nvs_args, "pose_energy_context_heads", 1)),
+        zero_init_heads=bool(getattr(nvs_args, "pose_energy_zero_init_heads", False)),
+        zero_init_residual_head=bool(getattr(nvs_args, "pose_energy_zero_init_residual_head", True)),
+        factorized_heads=bool(getattr(nvs_args, "pose_energy_factorized_heads", False)),
+    ).to(device)
+    pair_matcher = None
+    if bool(getattr(nvs_args, "pair_matcher_enabled", False)):
+        pair_matcher = PairConditionedLocalMatcher(
+            channels=int(adapter.channels),
+            hidden_dim=int(getattr(nvs_args, "pair_matcher_hidden_dim", 64)),
+            offset_radius=int(getattr(nvs_args, "pair_matcher_radius", 3)),
+            zero_init_residual=bool(getattr(nvs_args, "pair_matcher_zero_init_residual", True)),
+            base_dot_weight=float(getattr(nvs_args, "pair_matcher_base_dot_weight", 1.0)),
+        ).to(device)
+    load_adapter_checkpoint(
+        path,
+        adapter,
+        model=model,
+        optimizer=None,
+        energy_net=energy_net,
+        pair_matcher=pair_matcher,
+    )
+    adapter.eval()
+    energy_net.eval()
+    if pair_matcher is not None:
+        pair_matcher.eval()
+    return {"args": nvs_args, "adapter": adapter, "energy_net": energy_net, "pair_matcher": pair_matcher}
+
+
+def load_pose_feature_adapter_bundle(path: str, model, cfg: Dict, device: torch.device) -> Dict:
+    """Load only the NVS pose-feature adapter for CPR fine-selector features."""
+    if not path:
+        raise ValueError("pose feature adapter checkpoint path is required")
+    from feature_extract.tools.train_nvs_pose_feature_adapter import load_adapter_checkpoint
+    from feature_extract.students.pose_energy_net import PairConditionedLocalMatcher
+    from feature_extract.tools.train_pose_energy import build_pose_feature_adapter
+
+    checkpoint = safe_torch_load(path)
+    saved_args = checkpoint.get("args")
+    if not isinstance(saved_args, dict):
+        raise RuntimeError(f"Pose-feature adapter checkpoint {path} does not contain saved args")
+    nvs_args = argparse.Namespace(**saved_args)
+    adapter = build_pose_feature_adapter(nvs_args, model, cfg, device)
+    if adapter is None:
+        raise RuntimeError("Pose-feature adapter checkpoint requires pose_feature_adapter_enabled=true")
+    pair_matcher = None
+    if bool(getattr(nvs_args, "pair_matcher_enabled", False)):
+        pair_matcher = PairConditionedLocalMatcher(
+            channels=int(adapter.channels),
+            hidden_dim=int(getattr(nvs_args, "pair_matcher_hidden_dim", 64)),
+            offset_radius=int(getattr(nvs_args, "pair_matcher_radius", 3)),
+            zero_init_residual=bool(getattr(nvs_args, "pair_matcher_zero_init_residual", True)),
+            base_dot_weight=float(getattr(nvs_args, "pair_matcher_base_dot_weight", 1.0)),
+        ).to(device)
+    load_adapter_checkpoint(path, adapter, model=model, optimizer=None, energy_net=None, pair_matcher=pair_matcher)
+    adapter.eval()
+    if pair_matcher is not None:
+        pair_matcher.eval()
+    return {"args": nvs_args, "adapter": adapter, "pair_matcher": pair_matcher}
+
+
+def project_query_render_with_pose_feature_adapter(
+    adapter,
+    query_fine: torch.Tensor,
+    render_fine: torch.Tensor,
+    *,
+    query_rgb: torch.Tensor | None = None,
+    render_rgb: torch.Tensor | None = None,
+    use_uncertainty: bool = False,
+    render_chunk_size: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    """Project query and candidate render features through an NVS pose adapter."""
+    if render_fine.ndim != 5:
+        raise ValueError(f"render_fine must have shape B,K,C,H,W, got {tuple(render_fine.shape)}")
+    bsz, num_candidates, channels, height, width = render_fine.shape
+    flat_render = render_fine.reshape(bsz * num_candidates, channels, height, width)
+    flat_rgb = None
+    if render_rgb is not None:
+        if render_rgb.ndim != 5 or render_rgb.shape[:2] != (bsz, num_candidates):
+            raise ValueError(f"render_rgb must have shape B,K,3,H,W, got {tuple(render_rgb.shape)}")
+        flat_rgb = render_rgb.reshape(bsz * num_candidates, render_rgb.shape[2], render_rgb.shape[3], render_rgb.shape[4])
+
+    if bool(use_uncertainty):
+        query_loc, query_uncertainty = adapter.project_query_with_uncertainty(query_fine, rgb=query_rgb)
+    else:
+        query_loc = adapter.project_query(query_fine, rgb=query_rgb)
+        query_uncertainty = None
+
+    chunk_size = int(render_chunk_size or 0)
+    loc_chunks = []
+    unc_chunks = []
+    for start in range(0, flat_render.shape[0], chunk_size if chunk_size > 0 else flat_render.shape[0]):
+        rgb_chunk = flat_rgb[start : start + (chunk_size if chunk_size > 0 else flat_render.shape[0])] if flat_rgb is not None else None
+        render_chunk = flat_render[start : start + (chunk_size if chunk_size > 0 else flat_render.shape[0])]
+        if bool(use_uncertainty):
+            loc, unc = adapter.project_render_with_uncertainty(render_chunk, rgb=rgb_chunk)
+            loc_chunks.append(loc)
+            unc_chunks.append(unc)
+        else:
+            loc_chunks.append(adapter.project_render(render_chunk, rgb=rgb_chunk))
+    render_loc = torch.cat(loc_chunks, dim=0).reshape(bsz, num_candidates, channels, height, width)
+    render_uncertainty = None
+    if bool(use_uncertainty):
+        render_uncertainty = torch.cat(unc_chunks, dim=0).reshape(bsz, num_candidates, 1, height, width)
+    return query_loc, render_loc, query_uncertainty, render_uncertainty
+
+
 def build_model_and_data(cfg: Dict, args: argparse.Namespace, device: torch.device):
     apply_eval_overrides(cfg, args)
     cfg["training"]["num_workers"] = int(args.num_workers)
@@ -536,14 +788,25 @@ def build_model_and_data(cfg: Dict, args: argparse.Namespace, device: torch.devi
             coordinate_space=str(cfg["dataset"].get("teacher_correspondence_coordinate_space", "auto")),
         )
     if args.split == "train":
-        pose_candidate_cache_paths = cfg["dataset"].get("train_pose_candidate_cache") or cfg["dataset"].get(
-            "train_pose_candidate_caches"
+        pose_candidate_cache_paths = cfg["dataset"].get("train_pose_candidate_caches") or cfg["dataset"].get(
+            "train_pose_candidate_cache"
+        )
+        pose_candidate_sampling = cfg["dataset"].get(
+            "train_pose_candidate_cache_sampling",
+            cfg["dataset"].get("pose_candidate_cache_sampling", "first"),
         )
     else:
-        pose_candidate_cache_paths = cfg["dataset"].get("val_pose_candidate_cache") or cfg["dataset"].get(
-            "val_pose_candidate_caches"
+        pose_candidate_cache_paths = cfg["dataset"].get("val_pose_candidate_caches") or cfg["dataset"].get(
+            "val_pose_candidate_cache"
         )
-    pose_candidate_index = load_pose_candidate_cache_index(pose_candidate_cache_paths)
+        pose_candidate_sampling = cfg["dataset"].get(
+            "val_pose_candidate_cache_sampling",
+            cfg["dataset"].get("pose_candidate_cache_sampling", "first"),
+        )
+    keep_variants = bool(cfg["dataset"].get("pose_candidate_cache_keep_variants", False)) or str(
+        pose_candidate_sampling or "first"
+    ).lower() != "first"
+    pose_candidate_index = load_pose_candidate_cache_index(pose_candidate_cache_paths, keep_variants=keep_variants)
     pose_candidate_topk = int(
         cfg["dataset"].get(
             "pose_candidate_topk",
@@ -565,13 +828,18 @@ def build_model_and_data(cfg: Dict, args: argparse.Namespace, device: torch.devi
         colmap_dir=colmap_dir,
         pose_candidate_cache_index=pose_candidate_index,
         pose_candidate_topk=pose_candidate_topk,
+        pose_candidate_cache_sampling=pose_candidate_sampling,
     )
     loader = DataLoader(
         dataset,
         batch_size=int(cfg["training"]["batch_size"]),
         shuffle=False,
         num_workers=resolve_safe_num_workers(cfg["training"], cfg["dataset"]),
-        pin_memory=device.type == "cuda",
+        pin_memory=(
+            bool(cfg["training"].get("pin_memory"))
+            if cfg["training"].get("pin_memory") is not None
+            else device.type == "cuda"
+        ),
     )
     model = build_radio_query_student(
         cfg,
@@ -598,7 +866,16 @@ def build_model_and_data(cfg: Dict, args: argparse.Namespace, device: torch.devi
 
 
 @torch.no_grad()
-def evaluate_bucket(model, loader, map_renderer, cfg: Dict, args: argparse.Namespace, bucket):
+def evaluate_bucket(
+    model,
+    loader,
+    map_renderer,
+    cfg: Dict,
+    args: argparse.Namespace,
+    bucket,
+    pose_energy_bundle: Dict | None = None,
+    fine_selector_adapter_bundle: Dict | None = None,
+):
     name, trans_cm, rot_deg = bucket
     map_cfg = cfg.get("map_supervision", {})
     topk_values = [int(v) for v in args.topk.split(",") if v.strip()]
@@ -641,6 +918,11 @@ def evaluate_bucket(model, loader, map_renderer, cfg: Dict, args: argparse.Names
         "fine_topk_selector_oracle_gap_mm": [],
         "fine_topk_selector_entropy": [],
         "fine_topk_selector_margin": [],
+        "fine_topk_pose_energy_trans_mm": [],
+        "fine_topk_pose_energy_rot_deg": [],
+        "fine_topk_pose_energy_oracle_gap_mm": [],
+        "fine_topk_pose_energy_entropy": [],
+        "fine_topk_pose_energy_margin": [],
         "wls_conf_mean": [],
     }
     topk_hits = {k: [] for k in topk_values}
@@ -759,6 +1041,7 @@ def evaluate_bucket(model, loader, map_renderer, cfg: Dict, args: argparse.Names
             "fine_score",
             "fine_score_prior",
             "fine_selector",
+            "pose_energy",
             "oracle",
         }
         if needs_fine_candidates:
@@ -772,6 +1055,7 @@ def evaluate_bucket(model, loader, map_renderer, cfg: Dict, args: argparse.Names
                 rank_topm=int(args.fine_pool_topm),
                 candidate_pose=eval_batch["eval_candidate_pose"].float(),
                 init_pose=init_pose.float(),
+                pose_gt=pose_gt.float(),
                 rot_cost_weight=float(map_cfg.get("candidate_score_fusion_rot_cost_weight", 0.1)),
             )
             selected_pose = gather_pose_bank(eval_batch["eval_candidate_pose"].float(), selected_idx)
@@ -846,6 +1130,8 @@ def evaluate_bucket(model, loader, map_renderer, cfg: Dict, args: argparse.Names
             fine_prior_idx = fine_prior_scores.argmax(dim=1)
             fine_selector_idx = None
             fine_selector_logits = None
+            pose_energy_idx = None
+            pose_energy_selection = None
             if args.fine_select == "fine_selector" or getattr(model, "fine_candidate_selector_head", None) is not None:
                 selector_head = getattr(model, "fine_candidate_selector_head", None)
                 if selector_head is None:
@@ -853,7 +1139,25 @@ def evaluate_bucket(model, loader, map_renderer, cfg: Dict, args: argparse.Names
                 selected_coarse_logits = details.get("raw_logits", details["logits"]).gather(1, selected_idx).detach()
                 selector_query = query_fine
                 selector_render = fine_batch["eval_selected_fine"].float()
-                if bool(map_cfg.get("fine_topk_selector_use_projector", True)):
+                selector_query_uncertainty = None
+                selector_render_uncertainty = None
+                if fine_selector_adapter_bundle is not None:
+                    nvs_args = fine_selector_adapter_bundle["args"]
+                    adapter_needs_rgb = bool(getattr(nvs_args, "pose_feature_adapter_rgb_context_enabled", False)) or bool(
+                        getattr(nvs_args, "pose_feature_adapter_texture_branch_enabled", False)
+                    )
+                    selector_query, selector_render, selector_query_uncertainty, selector_render_uncertainty = (
+                        project_query_render_with_pose_feature_adapter(
+                            fine_selector_adapter_bundle["adapter"],
+                            selector_query,
+                            selector_render,
+                            query_rgb=batch.get("rgb") if adapter_needs_rgb else None,
+                            render_rgb=fine_batch.get("eval_selected_rgb") if adapter_needs_rgb else None,
+                            use_uncertainty=bool(getattr(nvs_args, "pose_feature_adapter_uncertainty_enabled", False)),
+                            render_chunk_size=int(map_cfg.get("fine_topk_selector_projector_chunk_size", 0) or 0),
+                        )
+                    )
+                elif bool(map_cfg.get("fine_topk_selector_use_projector", True)):
                     selector_query, selector_render, _projector_used = project_query_render_for_fine_selector(
                         getattr(model, "local_corr_projector", None),
                         selector_query,
@@ -894,7 +1198,37 @@ def evaluate_bucket(model, loader, map_renderer, cfg: Dict, args: argparse.Names
                     use_depth=bool(map_cfg.get("fine_topk_selector_use_depth", True)),
                     use_mask=bool(map_cfg.get("fine_topk_selector_use_mask", True)),
                     use_rgb=bool(map_cfg.get("fine_topk_selector_use_rgb", False)),
+                    query_uncertainty=selector_query_uncertainty,
+                    candidate_uncertainty=selector_render_uncertainty,
+                    use_uncertainty=bool(map_cfg.get("fine_topk_selector_use_uncertainty", False)),
                 )
+                score_source = str(args.fine_selector_score_source or "local_corr").lower()
+                if score_source == "pair_matcher_heatmap":
+                    if fine_selector_adapter_bundle is None:
+                        raise RuntimeError("--fine-selector-score-source pair_matcher_heatmap requires --fine-selector-adapter-checkpoint")
+                    pair_matcher = fine_selector_adapter_bundle.get("pair_matcher")
+                    if pair_matcher is None:
+                        raise RuntimeError("fine selector adapter checkpoint does not contain a pair matcher")
+                    from feature_extract.tools.train_nvs_pose_feature_adapter import pair_matcher_local_candidate_score_maps
+
+                    nvs_args = fine_selector_adapter_bundle["args"]
+                    pair_score_maps, pair_valid_map = pair_matcher_local_candidate_score_maps(
+                        pair_matcher,
+                        selector_query.float(),
+                        selector_render.float(),
+                        mask=fine_masks,
+                        radius=int(getattr(nvs_args, "pair_matcher_radius", 3)),
+                        stride=int(getattr(nvs_args, "pair_matcher_score_stride", 8)),
+                        temperature=float(getattr(nvs_args, "pair_matcher_temperature", 0.05)),
+                        chunk_points=int(getattr(nvs_args, "pair_matcher_score_chunk_points", 65536)),
+                        candidate_score_mode=str(
+                            getattr(nvs_args, "pair_matcher_candidate_score_mode", "center_logprob_margin")
+                        ),
+                    )
+                    feature_pack["score_maps"] = pair_score_maps
+                    feature_pack["valid"] = feature_pack["valid"] & pair_valid_map.flatten(2).any(dim=2)
+                elif score_source != "local_corr":
+                    raise RuntimeError(f"Unknown fine selector score source: {score_source}")
                 if score_map_selector:
                     fine_selector_logits = selector_head(feature_pack["score_maps"], feature_pack["features"])
                 else:
@@ -904,6 +1238,109 @@ def evaluate_bucket(model, loader, map_renderer, cfg: Dict, args: argparse.Names
                     -1.0e6,
                 )
                 fine_selector_idx = fine_selector_logits.argmax(dim=1)
+            if args.fine_select == "pose_energy" or pose_energy_bundle is not None:
+                if pose_energy_bundle is None:
+                    raise RuntimeError("--fine-select pose_energy requires --pose-energy-checkpoint")
+                from feature_extract.tools.train_nvs_pose_feature_adapter import (
+                    pair_matcher_local_candidate_score_maps,
+                    project_render_bank,
+                    project_render_bank_with_uncertainty,
+                )
+
+                nvs_args = pose_energy_bundle["args"]
+                pose_adapter = pose_energy_bundle["adapter"]
+                energy_net = pose_energy_bundle["energy_net"]
+                pair_matcher = pose_energy_bundle["pair_matcher"]
+                render_chunk_size = int(map_cfg.get("candidate_render_score_projector_chunk_size", 0) or 0)
+                adapter_needs_rgb = bool(getattr(nvs_args, "pose_feature_adapter_rgb_context_enabled", False)) or bool(
+                    getattr(nvs_args, "pose_feature_adapter_texture_branch_enabled", False)
+                )
+                adapter_query_rgb = batch.get("rgb") if adapter_needs_rgb else None
+                adapter_render_rgb = fine_batch.get("eval_selected_rgb") if adapter_needs_rgb else None
+                energy_use_uncertainty = bool(getattr(nvs_args, "pose_energy_use_uncertainty", False))
+                if energy_use_uncertainty:
+                    query_loc, query_uncertainty = pose_adapter.project_query_with_uncertainty(
+                        query_fine,
+                        rgb=adapter_query_rgb,
+                    )
+                    render_loc, render_uncertainty = project_render_bank_with_uncertainty(
+                        pose_adapter,
+                        fine_batch["eval_selected_fine"].float(),
+                        render_rgb=adapter_render_rgb,
+                        render_chunk_size=render_chunk_size,
+                    )
+                else:
+                    query_loc = pose_adapter.project_query(query_fine, rgb=adapter_query_rgb)
+                    query_uncertainty = None
+                    render_uncertainty = None
+                    render_loc = project_render_bank(
+                        pose_adapter,
+                        fine_batch["eval_selected_fine"].float(),
+                        render_rgb=adapter_render_rgb,
+                        render_chunk_size=render_chunk_size,
+                    )
+                energy_feature_pack = fine_candidate_selector_features(
+                    query_loc.float(),
+                    render_loc.float(),
+                    fine_batch["eval_selected_pose"].float(),
+                    init_pose=init_pose.float(),
+                    query_rgb=batch.get("rgb"),
+                    candidate_rgb=fine_batch.get("eval_selected_rgb"),
+                    depth=fine_batch.get("eval_selected_depth"),
+                    mask=fine_masks,
+                    candidate_valid_mask=fine_batch["eval_selected_valid_mask"].bool(),
+                    mode="local",
+                    radius=int(getattr(nvs_args, "local_corr_radius", map_cfg.get("query_corr_radius", 4))),
+                    preprocess=str(getattr(nvs_args, "pose_energy_score_preprocess", "spatial_center")),
+                    highpass_kernel=int(getattr(nvs_args, "pose_energy_score_highpass_kernel", 5)),
+                    score_map_mode=str(getattr(nvs_args, "pose_energy_score_map_mode", "peak_offset")),
+                    return_score_maps=True,
+                    use_coarse_logits=False,
+                    use_candidate_delta=bool(getattr(nvs_args, "pose_energy_use_candidate_delta", True)),
+                    use_delta_vector=bool(getattr(nvs_args, "pose_energy_use_delta_vector", False)),
+                    use_center_delta_vector=bool(getattr(nvs_args, "pose_energy_use_center_delta_vector", False)),
+                    use_depth=True,
+                    use_mask=True,
+                    use_rgb=bool(getattr(nvs_args, "pose_energy_use_rgb", False)),
+                    query_uncertainty=query_uncertainty,
+                    candidate_uncertainty=render_uncertainty,
+                    use_uncertainty=energy_use_uncertainty,
+                )
+                score_source = str(getattr(nvs_args, "pose_energy_score_source", "local_corr") or "local_corr").lower()
+                if score_source == "pair_matcher_heatmap":
+                    if pair_matcher is None:
+                        raise RuntimeError("pose_energy_score_source=pair_matcher_heatmap requires pair matcher state")
+                    pair_score_maps, pair_valid_map = pair_matcher_local_candidate_score_maps(
+                        pair_matcher,
+                        query_loc.float(),
+                        render_loc.float(),
+                        mask=fine_masks,
+                        radius=int(getattr(nvs_args, "pair_matcher_radius", 3)),
+                        stride=int(getattr(nvs_args, "pair_matcher_score_stride", 8)),
+                        temperature=float(getattr(nvs_args, "pair_matcher_temperature", 0.05)),
+                        chunk_points=int(getattr(nvs_args, "pair_matcher_score_chunk_points", 65536)),
+                        candidate_score_mode=str(
+                            getattr(nvs_args, "pair_matcher_candidate_score_mode", "center_logprob_margin")
+                        ),
+                    )
+                    energy_feature_pack["score_maps"] = pair_score_maps
+                    energy_feature_pack["valid"] = energy_feature_pack["valid"] & pair_valid_map.flatten(2).any(dim=2)
+                elif score_source != "local_corr":
+                    raise RuntimeError(f"Unknown pose_energy_score_source: {score_source}")
+                energy_out = energy_net(
+                    energy_feature_pack["score_maps"],
+                    energy_feature_pack["features"],
+                    valid_mask=energy_feature_pack["valid"],
+                )
+                pose_energy_selection = pose_energy_candidate_selection(
+                    energy_out,
+                    energy_feature_pack["valid"],
+                    confidence_weight=float(getattr(nvs_args, "pose_energy_selection_confidence_weight", 0.0)),
+                    residual_norm_weight=float(getattr(nvs_args, "pose_energy_selection_residual_norm_weight", 0.0)),
+                    residual_trans_scale_m=float(getattr(nvs_args, "pose_energy_residual_trans_scale_m", 0.25)),
+                    residual_rot_scale_rad=math.radians(float(getattr(nvs_args, "pose_energy_residual_rot_scale_deg", 5.0))),
+                )
+                pose_energy_idx = pose_energy_selection["idx"]
             if args.fine_select == "oracle":
                 final_idx = oracle_refined_idx
             elif args.fine_select == "conf":
@@ -914,6 +1351,8 @@ def evaluate_bucket(model, loader, map_renderer, cfg: Dict, args: argparse.Names
                 final_idx = fine_score_idx
             elif args.fine_select == "fine_selector":
                 final_idx = fine_selector_idx
+            elif args.fine_select == "pose_energy":
+                final_idx = pose_energy_idx
             else:
                 final_idx = torch.zeros_like(pred_idx)
             final_trans = refined["trans_err_m"][batch_idx, final_idx]
@@ -965,6 +1404,24 @@ def evaluate_bucket(model, loader, map_renderer, cfg: Dict, args: argparse.Names
                     selector_margin = torch.zeros_like(selector_entropy)
                 rows["fine_topk_selector_entropy"].extend(selector_entropy.detach().cpu().tolist())
                 rows["fine_topk_selector_margin"].extend(selector_margin.detach().cpu().tolist())
+            if pose_energy_idx is not None and pose_energy_selection is not None:
+                rows["fine_topk_pose_energy_trans_mm"].extend(
+                    (refined["trans_err_m"][batch_idx, pose_energy_idx] * 1000.0).detach().cpu().tolist()
+                )
+                rows["fine_topk_pose_energy_rot_deg"].extend(
+                    refined["rot_err_deg"][batch_idx, pose_energy_idx].detach().cpu().tolist()
+                )
+                rows["fine_topk_pose_energy_oracle_gap_mm"].extend(
+                    (
+                        (refined["trans_err_m"][batch_idx, pose_energy_idx] - refined["trans_err_m"][batch_idx, oracle_refined_idx])
+                        * 1000.0
+                    )
+                    .detach()
+                    .cpu()
+                    .tolist()
+                )
+                rows["fine_topk_pose_energy_entropy"].extend(pose_energy_selection["entropy"].detach().cpu().tolist())
+                rows["fine_topk_pose_energy_margin"].extend(pose_energy_selection["margin"].detach().cpu().tolist())
 
         rows["init_trans_mm"].extend((init_trans * 1000.0).cpu().tolist())
         rows["init_rot_deg"].extend(init_rot.cpu().tolist())
@@ -1013,9 +1470,29 @@ def main() -> None:
     requested_device = args.device
     device = torch.device(requested_device if requested_device == "cpu" or torch.cuda.is_available() else "cpu")
     model, loader, map_renderer = build_model_and_data(cfg, args, device)
+    pose_energy_bundle = None
+    if args.fine_select == "pose_energy" or args.pose_energy_checkpoint:
+        pose_energy_bundle = load_pose_energy_selector_bundle(args.pose_energy_checkpoint, model, cfg, device)
+    fine_selector_adapter_bundle = None
+    if args.fine_selector_adapter_checkpoint:
+        fine_selector_adapter_bundle = load_pose_feature_adapter_bundle(
+            args.fine_selector_adapter_checkpoint,
+            model,
+            cfg,
+            device,
+        )
     results = {}
     for bucket in parse_bucket_specs(args.buckets):
-        name, summary = evaluate_bucket(model, loader, map_renderer, cfg, args, bucket)
+        name, summary = evaluate_bucket(
+            model,
+            loader,
+            map_renderer,
+            cfg,
+            args,
+            bucket,
+            pose_energy_bundle=pose_energy_bundle,
+            fine_selector_adapter_bundle=fine_selector_adapter_bundle,
+        )
         results[name] = summary
         print(
             f"{name}: init={summary['init_trans_mm_median']:.1f}mm "

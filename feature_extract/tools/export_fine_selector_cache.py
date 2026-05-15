@@ -20,11 +20,13 @@ from feature_extract.tools.eval_cpr_buckets import (  # noqa: E402
     fine_candidate_selector_features,
     gather_pose_bank,
     jitter_candidate_poses,
+    load_pose_feature_adapter_bundle,
     make_fixed_init_poses,
     make_random_init_poses,
     parse_bucket_specs,
     parse_float_csv,
     pose_error_tensors,
+    project_query_render_with_pose_feature_adapter,
     project_query_render_for_fine_selector,
     select_fine_pool_indices,
     selected_pose_error_dict,
@@ -42,6 +44,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", required=True)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--map-checkpoint", default=None)
+    parser.add_argument(
+        "--fine-selector-adapter-checkpoint",
+        default=None,
+        help="Optional NVS pose-feature adapter checkpoint used before cache feature extraction.",
+    )
+    parser.add_argument(
+        "--fine-selector-score-source",
+        choices=("local_corr", "pair_matcher_heatmap"),
+        default="local_corr",
+        help="Score-map source stored in the cache.",
+    )
     parser.add_argument("--out", required=True)
     parser.add_argument("--split", choices=("train", "val"), default="train")
     parser.add_argument("--device", default="cuda")
@@ -53,7 +66,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fine-topk", type=int, default=8)
     parser.add_argument(
         "--fine-pool-mode",
-        choices=("rank", "rank_uniform", "rank_delta_uniform", "rank_score_uniform"),
+        choices=("rank", "rank_uniform", "rank_delta_uniform", "rank_score_uniform", "rank_pose_hard"),
         default="rank",
         help="How to form the fine selector candidate pool before export.",
     )
@@ -95,6 +108,14 @@ def export_cache(args: argparse.Namespace):
     device = torch.device(args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu")
     model, loader, map_renderer = build_model_and_data(cfg, args, device)
     map_cfg = cfg.get("map_supervision", {})
+    fine_selector_adapter_bundle = None
+    if args.fine_selector_adapter_checkpoint:
+        fine_selector_adapter_bundle = load_pose_feature_adapter_bundle(
+            args.fine_selector_adapter_checkpoint,
+            model,
+            cfg,
+            device,
+        )
     rows = {
         "features": [],
         "valid": [],
@@ -210,6 +231,7 @@ def export_cache(args: argparse.Namespace):
                 rank_topm=int(args.fine_pool_topm),
                 candidate_pose=coarse_batch["cache_candidate_pose"].float(),
                 init_pose=init_pose.float(),
+                pose_gt=pose_gt.float(),
                 rot_cost_weight=float(map_cfg.get("candidate_score_fusion_rot_cost_weight", 0.1)),
             )
             selected_pose = gather_pose_bank(coarse_batch["cache_candidate_pose"].float(), selected_idx)
@@ -227,7 +249,25 @@ def export_cache(args: argparse.Namespace):
             query_key = str(map_cfg.get("query_fine_key", "fine"))
             query_fine = outputs.get(query_key, outputs["fine"]).float()
             render_fine = fine_batch["cache_selected_fine"].float()
-            if bool(map_cfg.get("fine_topk_selector_use_projector", True)):
+            query_uncertainty = None
+            render_uncertainty = None
+            if fine_selector_adapter_bundle is not None:
+                nvs_args = fine_selector_adapter_bundle["args"]
+                adapter_needs_rgb = bool(getattr(nvs_args, "pose_feature_adapter_rgb_context_enabled", False)) or bool(
+                    getattr(nvs_args, "pose_feature_adapter_texture_branch_enabled", False)
+                )
+                query_fine, render_fine, query_uncertainty, render_uncertainty = (
+                    project_query_render_with_pose_feature_adapter(
+                        fine_selector_adapter_bundle["adapter"],
+                        query_fine,
+                        render_fine,
+                        query_rgb=batch.get("rgb") if adapter_needs_rgb else None,
+                        render_rgb=fine_batch.get("cache_selected_rgb") if adapter_needs_rgb else None,
+                        use_uncertainty=bool(getattr(nvs_args, "pose_feature_adapter_uncertainty_enabled", False)),
+                        render_chunk_size=int(map_cfg.get("fine_topk_selector_projector_chunk_size", 0) or 0),
+                    )
+                )
+            elif bool(map_cfg.get("fine_topk_selector_use_projector", True)):
                 query_fine, render_fine, _used = project_query_render_for_fine_selector(
                     getattr(model, "local_corr_projector", None),
                     query_fine,
@@ -267,7 +307,37 @@ def export_cache(args: argparse.Namespace):
                 use_depth=bool(map_cfg.get("fine_topk_selector_use_depth", True)),
                 use_mask=bool(map_cfg.get("fine_topk_selector_use_mask", True)),
                 use_rgb=bool(map_cfg.get("fine_topk_selector_use_rgb", False)),
+                query_uncertainty=query_uncertainty,
+                candidate_uncertainty=render_uncertainty,
+                use_uncertainty=bool(map_cfg.get("fine_topk_selector_use_uncertainty", False)),
             )
+            score_source = str(args.fine_selector_score_source or "local_corr").lower()
+            if score_source == "pair_matcher_heatmap":
+                if fine_selector_adapter_bundle is None:
+                    raise RuntimeError("--fine-selector-score-source pair_matcher_heatmap requires --fine-selector-adapter-checkpoint")
+                pair_matcher = fine_selector_adapter_bundle.get("pair_matcher")
+                if pair_matcher is None:
+                    raise RuntimeError("fine selector adapter checkpoint does not contain a pair matcher")
+                from feature_extract.tools.train_nvs_pose_feature_adapter import pair_matcher_local_candidate_score_maps
+
+                nvs_args = fine_selector_adapter_bundle["args"]
+                pair_score_maps, pair_valid_map = pair_matcher_local_candidate_score_maps(
+                    pair_matcher,
+                    query_fine.float(),
+                    render_fine.float(),
+                    mask=fine_batch.get("cache_selected_mask"),
+                    radius=int(getattr(nvs_args, "pair_matcher_radius", 3)),
+                    stride=int(getattr(nvs_args, "pair_matcher_score_stride", 8)),
+                    temperature=float(getattr(nvs_args, "pair_matcher_temperature", 0.05)),
+                    chunk_points=int(getattr(nvs_args, "pair_matcher_score_chunk_points", 65536)),
+                    candidate_score_mode=str(
+                        getattr(nvs_args, "pair_matcher_candidate_score_mode", "center_logprob_margin")
+                    ),
+                )
+                feature_pack["score_maps"] = pair_score_maps
+                feature_pack["valid"] = feature_pack["valid"] & pair_valid_map.flatten(2).any(dim=2)
+            elif score_source != "local_corr":
+                raise RuntimeError(f"Unknown fine selector score source: {score_source}")
             pose_errors = selected_pose_error_dict(
                 fine_batch["cache_selected_pose"].float(),
                 pose_gt.float(),
@@ -306,6 +376,10 @@ def export_cache(args: argparse.Namespace):
         "config": str(args.config),
         "checkpoint": str(args.checkpoint),
         "map_checkpoint": None if args.map_checkpoint is None else str(args.map_checkpoint),
+        "fine_selector_adapter_checkpoint": (
+            None if args.fine_selector_adapter_checkpoint is None else str(args.fine_selector_adapter_checkpoint)
+        ),
+        "fine_selector_score_source": str(args.fine_selector_score_source),
         "split": args.split,
         "fine_topk": int(args.fine_topk),
         "fine_pool_mode": str(args.fine_pool_mode),

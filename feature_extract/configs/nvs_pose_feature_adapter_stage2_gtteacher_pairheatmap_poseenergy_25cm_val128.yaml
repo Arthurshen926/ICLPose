@@ -1,0 +1,20 @@
+# Larger 25cm/5deg validation profile for GT-teacher Stage2.
+
+base_config: /root/ICLPose/feature_extract/configs/nvs_pose_feature_adapter_stage2_gtteacher_pairheatmap_poseenergy.yaml
+exp_name: nvs_pose_feature_adapter_stage2_gtteacher_pairheatmap_poseenergy_25cm_val128
+
+dataset:
+  max_train_samples: 256
+  max_val_samples: 128
+  pose_candidate_topk: 16
+  pose_candidate_cache_keep_variants: false
+  train_pose_candidate_cache_sampling: first
+  val_pose_candidate_cache_sampling: first
+  train_pose_candidate_cache: /root/ICLPose/result/result/feature_extract/pose_init_exports/oldhospital_local_lattice_renderloftr_q25cm5deg_top16_noexact_train256.npz
+  val_pose_candidate_cache: /root/ICLPose/result/result/feature_extract/pose_init_exports/oldhospital_local_lattice_renderloftr_q25cm5deg_top16_noexact_val128.npz
+
+training:
+  batch_size: 8
+  validation_batch_size: 8
+  max_steps: 180
+  eval_every: 30

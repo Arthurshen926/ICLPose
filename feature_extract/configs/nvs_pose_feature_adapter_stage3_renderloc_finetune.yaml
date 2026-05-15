@@ -1,0 +1,32 @@
+# Stage 3: map-side localization adapter fine-tune.
+#
+# Query adapter, pair matcher, and PoseEnergy selector are frozen.  Only the
+# render/map-side localization adapter moves at low LR, so any improvement is
+# attributable to map-side localization adaptation rather than selector drift.
+
+base_config: /root/ICLPose/feature_extract/configs/nvs_pose_feature_adapter_stage2_pairheatmap_poseenergy.yaml
+exp_name: nvs_pose_feature_adapter_stage3_renderloc_finetune
+
+training:
+  batch_size: 12
+  validation_batch_size: 12
+  max_steps: 120
+  eval_every: 20
+  lr: 0.00005
+
+nvs_pose_feature_adapter:
+  best_metric: pose_energy_pred_cost_m
+  best_metric_mode: min
+
+  train_pose_feature_adapter_domains: render
+  train_pair_matcher: false
+  train_pose_energy_net: false
+
+  pose_energy_enabled: true
+  pose_energy_weight: 1.0
+  pose_energy_score_source: pair_matcher_heatmap
+
+  candidate_teacher_quality_weight: 0.25
+  candidate_teacher_quality_start_step: 0
+  candidate_teacher_quality_warmup_steps: 40
+

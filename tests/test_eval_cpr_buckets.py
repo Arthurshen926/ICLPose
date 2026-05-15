@@ -141,6 +141,114 @@ def test_parse_args_accepts_trainable_fine_selector(monkeypatch):
     assert args.fine_select == "fine_selector"
 
 
+def test_parse_args_accepts_pose_energy_selector_checkpoint(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "eval_cpr_buckets.py",
+            "--config",
+            "config.yaml",
+            "--checkpoint",
+            "model.pth",
+            "--fine-select",
+            "pose_energy",
+            "--pose-energy-checkpoint",
+            "stage2.pth",
+        ],
+    )
+
+    args = eval_cpr_buckets.parse_args()
+
+    assert args.fine_select == "pose_energy"
+    assert args.pose_energy_checkpoint == "stage2.pth"
+
+
+def test_parse_args_accepts_fine_selector_adapter_checkpoint(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "eval_cpr_buckets.py",
+            "--config",
+            "config.yaml",
+            "--checkpoint",
+            "model.pth",
+            "--fine-select",
+            "fine_selector",
+            "--fine-selector-adapter-checkpoint",
+            "stage1_adapter.pth",
+        ],
+    )
+
+    args = eval_cpr_buckets.parse_args()
+
+    assert args.fine_selector_adapter_checkpoint == "stage1_adapter.pth"
+
+
+def test_parse_args_accepts_fine_selector_pair_matcher_score_source(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "eval_cpr_buckets.py",
+            "--config",
+            "config.yaml",
+            "--checkpoint",
+            "model.pth",
+            "--fine-select",
+            "fine_selector",
+            "--fine-selector-score-source",
+            "pair_matcher_heatmap",
+        ],
+    )
+
+    args = eval_cpr_buckets.parse_args()
+
+    assert args.fine_selector_score_source == "pair_matcher_heatmap"
+
+
+def test_pose_feature_adapter_projection_applies_query_and_render_domains():
+    class DummyAdapter:
+        def project_query(self, feat, rgb=None):
+            return feat + 1.0
+
+        def project_render(self, feat, rgb=None):
+            return feat + 2.0
+
+    query = torch.zeros(1, 2, 3, 4)
+    render = torch.zeros(1, 3, 2, 3, 4)
+
+    project = getattr(eval_cpr_buckets, "project_query_render_with_pose_feature_adapter", None)
+    assert project is not None, "eval_cpr_buckets should expose pose-feature adapter projection"
+
+    query_out, render_out, query_unc, render_unc = project(DummyAdapter(), query, render)
+
+    assert query_unc is None
+    assert render_unc is None
+    assert torch.allclose(query_out, torch.ones_like(query))
+    assert torch.allclose(render_out, torch.full_like(render, 2.0))
+
+
+def test_pose_energy_candidate_selection_masks_invalid_candidates():
+    outputs = {
+        "energy_logits": torch.tensor([[0.1, 3.0, 0.4]]),
+        "confidence_logits": torch.zeros(1, 3),
+        "residual_delta": torch.zeros(1, 3, 6),
+    }
+    valid = torch.tensor([[True, False, True]])
+
+    select = getattr(eval_cpr_buckets, "pose_energy_candidate_selection", None)
+    assert select is not None, "eval_cpr_buckets should expose pose_energy_candidate_selection"
+
+    result = select(outputs, valid)
+
+    assert int(result["idx"][0]) == 2
+    assert result["scores"][0, 1] < -1.0e5
+    assert torch.isfinite(result["entropy"]).all()
+    assert result["margin"][0] > 0.0
+
+
 def test_parse_args_accepts_cube_lattice_direction_mode(monkeypatch):
     monkeypatch.setattr(
         sys,
@@ -205,3 +313,52 @@ def test_fine_prior_adjusted_scores_is_noop_when_weight_zero():
     )
 
     assert torch.allclose(adjusted, fine_scores)
+
+
+def test_select_fine_pool_indices_rank_uniform_has_no_duplicates_when_enough_valid():
+    logits = torch.tensor([[0.9, 0.8, 0.7, 0.6, 0.5, 0.4]])
+    valid = torch.ones_like(logits, dtype=torch.bool)
+
+    selected = eval_cpr_buckets.select_fine_pool_indices(
+        logits,
+        valid,
+        fine_topk=4,
+        mode="rank_uniform",
+        rank_topm=1,
+    )
+
+    assert selected.shape == (1, 4)
+    assert selected[0].unique().numel() == 4
+
+
+def test_select_fine_pool_indices_rank_pose_hard_keeps_pose_direction_examples():
+    logits = torch.tensor([[0.90, 0.10, 0.20, 0.95, 0.05]])
+    valid = torch.ones_like(logits, dtype=torch.bool)
+    init_pose = torch.eye(4).view(1, 4, 4)
+    pose_gt = torch.eye(4).view(1, 4, 4)
+    pose_gt[0, 0, 3] = -1.0
+    candidate_pose = torch.eye(4).view(1, 1, 4, 4).repeat(1, 5, 1, 1)
+    candidate_pose[0, 0, 0, 3] = 0.0
+    candidate_pose[0, 1, 0, 3] = -1.0
+    candidate_pose[0, 2, 0, 3] = 1.0
+    candidate_pose[0, 3, 0, 3] = 2.0
+    candidate_pose[0, 4, 1, 3] = -0.5
+
+    selected = eval_cpr_buckets.select_fine_pool_indices(
+        logits,
+        valid,
+        fine_topk=4,
+        mode="rank_pose_hard",
+        rank_topm=1,
+        candidate_pose=candidate_pose,
+        init_pose=init_pose,
+        pose_gt=pose_gt,
+    )
+
+    selected_set = set(selected[0].tolist())
+    assert selected.shape == (1, 4)
+    assert selected[0].unique().numel() == 4
+    assert selected[0, 0].item() == 3
+    assert 0 in selected_set
+    assert 1 in selected_set
+    assert 2 in selected_set

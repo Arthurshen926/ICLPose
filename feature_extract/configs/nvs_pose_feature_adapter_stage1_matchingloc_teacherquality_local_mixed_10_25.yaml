@@ -1,0 +1,29 @@
+# Mixed 10cm/2deg + 25cm/5deg local CPR teacher-quality curriculum.
+#
+# Uses the successful local no-exact teacher-quality objective but mixes small
+# and medium basins.  This is meant to improve feature generalization before any
+# map-side fine-tune or PoseEnergy residual stage.
+
+base_config: /root/ICLPose/feature_extract/configs/nvs_pose_feature_adapter_stage1_matchingloc_teacherquality_local_noexact.yaml
+exp_name: nvs_pose_feature_adapter_stage1_matchingloc_teacherquality_local_mixed_10_25
+
+dataset:
+  pose_candidate_topk: 16
+  train_pose_candidate_cache:
+  val_pose_candidate_cache:
+  pose_candidate_cache_keep_variants: true
+  train_pose_candidate_cache_sampling: random
+  val_pose_candidate_cache_sampling: cycle
+  train_pose_candidate_caches:
+    - /root/ICLPose/result/result/feature_extract/pose_init_exports/oldhospital_local_lattice_renderloftr_q10cm2deg_top16_noexact_train256.npz
+    - /root/ICLPose/result/result/feature_extract/pose_init_exports/oldhospital_local_lattice_renderloftr_q25cm5deg_top16_noexact_train256.npz
+  val_pose_candidate_caches:
+    - /root/ICLPose/result/result/feature_extract/pose_init_exports/oldhospital_local_lattice_renderloftr_q10cm2deg_top16_noexact_val128.npz
+    - /root/ICLPose/result/result/feature_extract/pose_init_exports/oldhospital_local_lattice_renderloftr_q25cm5deg_top16_noexact_val128.npz
+
+training:
+  batch_size: 10
+  validation_batch_size: 10
+  pin_memory: false
+  max_steps: 120
+  eval_every: 30

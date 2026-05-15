@@ -265,3 +265,103 @@ The next useful experiments are:
    scalar pair-matcher score for all objectives.
 4. Only after selector reliably reaches <100mm on 25cm/5deg should map-side
    loc-adapter fine-tuning resume.
+
+## 2026-05-14 Three-Stage CPR Reset
+
+Implemented a cleaner three-stage route from the latest expert response:
+
+1. Stage 1 trains pose-conditioned localization features/adapters on mixed
+   local no-exact candidate buckets, with GT pose ranking as the primary
+   signal.
+2. Stage 2 freezes the localization feature and trains a pair-heatmap
+   PoseEnergy selector over the topK candidates.
+3. Stage 3 freezes the query/selector and only allows the render/map-side
+   localization adapter to move at low LR.
+
+Code changes:
+
+- `train_impl.py` now supports keeping multiple pose-candidate cache variants
+  per query and sampling them by `first/cycle/random`. This fixes the previous
+  silent failure mode where a mixed 10cm + 25cm cache list only used the first
+  cache for each query.
+- `train_nvs_pose_feature_adapter.py` now supports delayed/warmup teacher
+  quality weight, pair-matcher heatmap score maps as PoseEnergy input, and
+  separate train/freeze controls for query adapter, render adapter, pair
+  matcher, and PoseEnergy.
+- Added staged configs:
+  - `nvs_pose_feature_adapter_stage1_locfeature_bucketmix.yaml`
+  - `nvs_pose_feature_adapter_stage2_pairheatmap_poseenergy.yaml`
+  - `nvs_pose_feature_adapter_stage2_pairheatmap_poseenergy_25cm_val128.yaml`
+  - `nvs_pose_feature_adapter_stage3_renderloc_finetune.yaml`
+
+Generated missing local no-exact 10cm/2deg teacher caches:
+
+| Cache | Queries | Candidates | LoFTR/PnP success | Oracle median |
+|---|---:|---:|---:|---:|
+| 10cm/2deg train64 | 64 | 1024 | 100% | 75.0mm / 0.50deg |
+| 10cm/2deg val32 | 32 | 512 | 100% | 75.0mm / 0.50deg |
+
+Short verification runs:
+
+| Stage/run | Eval step | Main selector | selected cos | Spearman | top1 | pred cost | oracle gap | Conclusion |
+|---|---:|---|---:|---:|---:|---:|---:|---|
+| Stage1 bucketmix pose-only b6 | 40 | local-score | 0.6795 | 0.3319 | 0.722 | 118.9mm | 54.2mm | Pass Stage1 gate |
+| Stage2 pair-heatmap PoseEnergy b4 | 10 | PoseEnergy | 0.9999 | 0.5635 | 1.000 | 64.7mm | 0.0mm | Strong positive result |
+| Stage2 pair-heatmap PoseEnergy b4 | 30 | PoseEnergy | 0.9999 | 0.7111 | 0.969 | 64.9mm | 0.2mm | Stable selector gain |
+| Stage2 eval-only on 25cm val128 | n/a | PoseEnergy | 0.9843 | 0.4346 | 0.984 | 68.2mm | 3.5mm | Generalizes beyond val32 |
+| Stage3 render-loc b4 | 30 | frozen PoseEnergy | 0.9999 | 0.5654 | 1.000 | 64.7mm | 0.0mm | Does not break selector; no extra gain yet |
+| Stage1 teacher-active b6 | 100 | local-score | 0.5579 | 0.3755 | 0.528 | 148.6mm | 84.0mm | Reject as main setting |
+
+The 25cm val128 check is important because the default base config limited
+validation to 32 samples. After explicitly overriding `max_val_samples: 128`,
+the hand-crafted local-score selector had:
+
+```text
+selected_cos=0.4907, top1=0.5234, pred_cost=154.9mm, oracle_gap=90.3mm
+```
+
+while the trained pair-heatmap PoseEnergy selector had:
+
+```text
+selected_cos=0.9843, top1=0.9844, pred_cost=68.2mm, oracle_gap=3.5mm
+```
+
+This confirms the current bottleneck was topK selection, not map coverage or
+WLS step size.
+
+Important negative result:
+
+```text
+Teacher-quality auxiliary improves feature/teacher alignment:
+  align_cos 0.3826 at step40 -> 0.6194 at step100
+
+but hurts pose selection:
+  pred_cost 118.9mm at step40 -> 148.6mm at step100
+  oracle_gap 54.2mm at step40 -> 84.0mm at step100
+  top1 0.722 at step40 -> 0.528 at step100
+```
+
+Therefore teacher quality must stay weak/delayed or diagnostic. It should not
+be promoted above GT pose ranking for Stage 1.
+
+Current accepted route:
+
+```text
+Stage1 pose-only/bucketmix checkpoint
+  -> Stage2 pair-heatmap PoseEnergy selector
+  -> Stage3 render-side adapter only after a larger Stage2 validation gate
+```
+
+Current rejected route:
+
+```text
+Directly increasing teacher-quality/RADIO-like alignment in Stage1
+```
+
+Operational notes:
+
+- Batch 12 OOMs on this path. Batch 6 is stable for Stage1 on RTX 3090.
+- Direct `--device cuda:1` can trigger gsplat illegal memory access on this
+  machine. Use `CUDA_VISIBLE_DEVICES=1 --device cuda:0` for physical GPU1.
+- Output size for these runs is small. Root filesystem remains tight but
+  stable at about 73GB free.

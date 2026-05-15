@@ -1,0 +1,16 @@
+# 50cm/10deg local CPR lattice teacher-quality evaluation/training config.
+
+base_config: /root/ICLPose/feature_extract/configs/nvs_pose_feature_adapter_stage1_matchingloc_teacherquality_local_noexact.yaml
+exp_name: nvs_pose_feature_adapter_stage1_matchingloc_teacherquality_local_50cm_noexact
+
+dataset:
+  pose_candidate_topk: 16
+  train_pose_candidate_cache: /root/ICLPose/result/result/feature_extract/pose_init_exports/oldhospital_local_lattice_renderloftr_q50cm10deg_top16_noexact_train256.npz
+  val_pose_candidate_cache: /root/ICLPose/result/result/feature_extract/pose_init_exports/oldhospital_local_lattice_renderloftr_q50cm10deg_top16_noexact_val128.npz
+
+training:
+  batch_size: 10
+  validation_batch_size: 10
+  pin_memory: false
+  max_steps: 80
+  eval_every: 20

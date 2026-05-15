@@ -1,0 +1,43 @@
+# 25cm/5deg local CPR teacher-quality training with GT-render correspondence supervision.
+
+base_config: /root/ICLPose/feature_extract/configs/nvs_pose_feature_adapter_stage1_matchingloc_teacherquality_local_noexact_256.yaml
+exp_name: nvs_pose_feature_adapter_stage1_matchingloc_teacherquality_q25_paircorr
+
+dataset:
+  teacher_correspondence_train_path: /root/ICLPose/result/result/feature_extract/teacher_corr/oldhospital_train_gt_render_loftr_128_20260515
+  teacher_correspondence_val_path: /root/ICLPose/result/result/feature_extract/teacher_corr/oldhospital_test_gt_render_loftr_32_20260515
+  teacher_correspondence_max_points: 512
+  teacher_correspondence_coordinate_space: image
+
+training:
+  batch_size: 6
+  validation_batch_size: 6
+  pin_memory: false
+  max_steps: 40
+  eval_every: 10
+
+nvs_pose_feature_adapter:
+  best_metric: selected_correction_cos
+  best_metric_mode: max
+
+  pair_matcher_enabled: true
+  pair_matcher_weight: 1.0
+  pair_matcher_hidden_dim: 128
+  pair_matcher_radius: 3
+  pair_matcher_temperature: 0.04
+  pair_matcher_min_confidence: 0.3
+  pair_matcher_min_points: 16
+  pair_matcher_positive_weight: 0.5
+  pair_matcher_margin_weight: 0.5
+  pair_matcher_margin: 0.05
+  pair_matcher_base_dot_weight: 1.0
+  pair_matcher_zero_init_residual: true
+  pair_matcher_score_stride: 8
+  pair_matcher_score_chunk_points: 32768
+  score_mode: pair_matcher_local
+
+  teacher_corr_weight: 0.5
+  teacher_corr_local_patch_weight: 1.0
+  teacher_corr_min_confidence: 0.3
+  teacher_corr_min_points: 16
+  teacher_corr_local_patch_min_points: 16

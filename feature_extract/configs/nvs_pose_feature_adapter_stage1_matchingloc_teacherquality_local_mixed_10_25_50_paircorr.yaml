@@ -1,0 +1,27 @@
+# Mixed 10cm/2deg + 25cm/5deg + 50cm/10deg local CPR paircorr curriculum.
+
+base_config: /root/ICLPose/feature_extract/configs/nvs_pose_feature_adapter_stage1_matchingloc_teacherquality_local_mixed_10_25_paircorr.yaml
+exp_name: nvs_pose_feature_adapter_stage1_matchingloc_teacherquality_local_mixed_10_25_50_paircorr
+
+dataset:
+  pose_candidate_topk: 16
+  train_pose_candidate_cache:
+  val_pose_candidate_cache:
+  pose_candidate_cache_keep_variants: true
+  train_pose_candidate_cache_sampling: random
+  val_pose_candidate_cache_sampling: cycle
+  train_pose_candidate_caches:
+    - /root/ICLPose/result/result/feature_extract/pose_init_exports/oldhospital_local_lattice_renderloftr_q10cm2deg_top16_noexact_train256.npz
+    - /root/ICLPose/result/result/feature_extract/pose_init_exports/oldhospital_local_lattice_renderloftr_q25cm5deg_top16_noexact_train256.npz
+    - /root/ICLPose/result/result/feature_extract/pose_init_exports/oldhospital_local_lattice_renderloftr_q50cm10deg_top16_noexact_train256.npz
+  val_pose_candidate_caches:
+    - /root/ICLPose/result/result/feature_extract/pose_init_exports/oldhospital_local_lattice_renderloftr_q10cm2deg_top16_noexact_val128.npz
+    - /root/ICLPose/result/result/feature_extract/pose_init_exports/oldhospital_local_lattice_renderloftr_q25cm5deg_top16_noexact_val128.npz
+    - /root/ICLPose/result/result/feature_extract/pose_init_exports/oldhospital_local_lattice_renderloftr_q50cm10deg_top16_noexact_val128.npz
+
+training:
+  batch_size: 6
+  validation_batch_size: 6
+  pin_memory: false
+  max_steps: 60
+  eval_every: 20

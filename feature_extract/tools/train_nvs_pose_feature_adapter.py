@@ -145,6 +145,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-projector", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--train-model-prefixes", default=None)
     parser.add_argument("--train-pose-feature-adapter", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--train-pose-feature-adapter-domains",
+        choices=("all", "query", "render", "none"),
+        default=None,
+    )
+    parser.add_argument("--train-pose-energy-net", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--train-pair-matcher", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--pose-feature-adapter-enabled", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--pose-feature-adapter-hidden-dim", type=int, default=None)
     parser.add_argument("--pose-feature-adapter-residual-scale", type=float, default=None)
@@ -173,6 +180,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pair-matcher-zero-init-residual", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--pair-matcher-score-stride", type=int, default=None)
     parser.add_argument("--pair-matcher-score-chunk-points", type=int, default=None)
+    parser.add_argument("--pair-matcher-score-candidate-chunk-size", type=int, default=None)
     parser.add_argument(
         "--pair-matcher-candidate-score-mode",
         choices=("center_logprob_margin", "center_margin"),
@@ -230,6 +238,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--candidate-teacher-quality-pairwise-weight", type=float, default=None)
     parser.add_argument("--candidate-teacher-quality-pairwise-min-gap", type=float, default=None)
     parser.add_argument("--candidate-teacher-quality-logit-margin", type=float, default=None)
+    parser.add_argument("--candidate-teacher-quality-start-step", type=int, default=None)
+    parser.add_argument("--candidate-teacher-quality-warmup-steps", type=int, default=None)
     parser.add_argument("--align-weight", type=float, default=None)
     parser.add_argument("--align-margin", type=float, default=None)
     parser.add_argument("--warp-align-weight", type=float, default=None)
@@ -292,6 +302,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pose-energy-score-preprocess", default=None)
     parser.add_argument("--pose-energy-score-highpass-kernel", type=int, default=None)
     parser.add_argument("--pose-energy-score-map-mode", default=None)
+    parser.add_argument(
+        "--pose-energy-score-source",
+        choices=("local_corr", "pair_matcher_heatmap"),
+        default=None,
+    )
     parser.add_argument("--pose-energy-use-candidate-delta", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--pose-energy-use-delta-vector", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--pose-energy-use-center-delta-vector", action=argparse.BooleanOptionalAction, default=None)
@@ -361,6 +376,8 @@ def apply_config_defaults(args: argparse.Namespace, cfg: Dict) -> argparse.Names
         "candidate_teacher_quality_pairwise_weight": 0.1,
         "candidate_teacher_quality_pairwise_min_gap": 0.25,
         "candidate_teacher_quality_logit_margin": 0.5,
+        "candidate_teacher_quality_start_step": 0,
+        "candidate_teacher_quality_warmup_steps": 0,
         "candidate_bank_mode": "lattice",
         "topk": 64,
         "lattice_trans_cm": "0,2,5,10,25,50",
@@ -424,6 +441,7 @@ def apply_config_defaults(args: argparse.Namespace, cfg: Dict) -> argparse.Names
         "pose_energy_score_preprocess": "spatial_center",
         "pose_energy_score_highpass_kernel": 5,
         "pose_energy_score_map_mode": "peak_offset",
+        "pose_energy_score_source": "local_corr",
         "pose_energy_use_candidate_delta": True,
         "pose_energy_use_delta_vector": False,
         "pose_energy_use_center_delta_vector": False,
@@ -459,6 +477,9 @@ def apply_config_defaults(args: argparse.Namespace, cfg: Dict) -> argparse.Names
         "pose_energy_select_for_metric": False,
         "train_projector": False,
         "train_model_prefixes": "",
+        "train_pose_feature_adapter_domains": "all",
+        "train_pose_energy_net": True,
+        "train_pair_matcher": True,
         "pose_feature_adapter_enabled": True,
         "pose_feature_adapter_hidden_dim": 96,
         "pose_feature_adapter_residual_scale": 0.2,
@@ -487,6 +508,7 @@ def apply_config_defaults(args: argparse.Namespace, cfg: Dict) -> argparse.Names
         "pair_matcher_zero_init_residual": True,
         "pair_matcher_score_stride": 8,
         "pair_matcher_score_chunk_points": 65536,
+        "pair_matcher_score_candidate_chunk_size": 0,
         "pair_matcher_candidate_score_mode": "center_logprob_margin",
         "synthetic_ratio": 0.5,
         "synthetic_trans_cm": 50.0,
@@ -1202,7 +1224,7 @@ def local_zero_offset_correlation_scores(
     )
 
 
-def pair_matcher_local_candidate_scores(
+def pair_matcher_local_candidate_score_maps(
     matcher: PairConditionedLocalMatcher,
     query_feature: torch.Tensor,
     render_feature: torch.Tensor,
@@ -1212,14 +1234,20 @@ def pair_matcher_local_candidate_scores(
     stride: int = 8,
     temperature: float = 0.05,
     chunk_points: int = 65536,
+    candidate_chunk_size: int = 0,
     candidate_score_mode: str = "center_logprob_margin",
-) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    """Score pose candidates with a pair-conditioned local heatmap decoder.
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return sparse pair-matcher heatmap evidence for pose candidates.
 
     A sparse regular grid is used to keep memory bounded.  For each sampled
     query pixel, the matcher sees the candidate render patch centered at the
     same pixel.  Good candidates should put probability mass on the zero-offset
     center; bad candidates should move the peak away from center.
+
+    The output channels are:
+      0. selected candidate evidence score map;
+      1. center log probability;
+      2. center-vs-hard-negative margin.
     """
     if query_feature.ndim != 4 or render_feature.ndim != 5:
         raise ValueError("expected query (B,C,H,W) and render (B,K,C,H,W)")
@@ -1233,6 +1261,9 @@ def pair_matcher_local_candidate_scores(
     query = query[:, :channels]
     render = render[:, :, :channels]
     bsz, num_candidates, _channels, height, width = render.shape
+    candidate_chunk_size = int(candidate_chunk_size or 0)
+    if candidate_chunk_size <= 0 or candidate_chunk_size > num_candidates:
+        candidate_chunk_size = num_candidates
     ys = torch.arange(stride // 2, height, stride, device=query.device, dtype=query.dtype)
     xs = torch.arange(stride // 2, width, stride, device=query.device, dtype=query.dtype)
     if ys.numel() == 0:
@@ -1240,6 +1271,7 @@ def pair_matcher_local_candidate_scores(
     if xs.numel() == 0:
         xs = torch.arange(0, width, device=query.device, dtype=query.dtype)
     grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+    grid_h, grid_w = int(grid_y.shape[0]), int(grid_y.shape[1])
     xy = torch.stack([grid_x.reshape(-1), grid_y.reshape(-1)], dim=-1)
     num_points = int(xy.shape[0])
     valid_grid = torch.ones((bsz, num_points), device=query.device, dtype=query.dtype)
@@ -1252,21 +1284,8 @@ def pair_matcher_local_candidate_scores(
     dy, dx = torch.meshgrid(offset_axis, offset_axis, indexing="ij")
     offsets = torch.stack([dx.reshape(-1), dy.reshape(-1)], dim=-1)
     center_index = int(((offsets[:, 0] == 0) & (offsets[:, 1] == 0)).nonzero(as_tuple=False)[0].item())
-    patch_xy = render_xy[:, :, None, :] + offsets[None, None, :, :]
-    patch_sparse, patch_in = sample_feature_at_xy(
-        render_flat,
-        patch_xy.reshape(bsz * num_candidates, num_points * offsets.shape[0], 2),
-        torch.ones(
-            (bsz * num_candidates, num_points * offsets.shape[0]),
-            device=query.device,
-            dtype=query.dtype,
-        ),
-        source_hw=None,
-    )
-    patch_sparse = patch_sparse.reshape(bsz, num_candidates, num_points, offsets.shape[0], channels)
-    patch_in = patch_in.reshape(bsz, num_candidates, num_points, offsets.shape[0])
 
-    center_valid = query_in[:, None, :] & patch_in[:, :, :, center_index]
+    mask_2d = None
     if mask is not None:
         mask_2d = _resize_mask(mask, target_hw)
         if mask_2d.ndim == 5:
@@ -1278,68 +1297,127 @@ def pair_matcher_local_candidate_scores(
                 raise ValueError(f"mask candidate dimension {mask_2d.shape[1]} cannot broadcast to K={num_candidates}")
         else:
             raise ValueError("mask must have shape (B,K,H,W), (B,K,1,H,W), or (B,1,H,W)")
-        mask_flat = mask_2d.reshape(bsz * num_candidates, 1, height, width)
-        mask_sparse, mask_in = sample_feature_at_xy(
-            mask_flat,
-            render_xy,
-            torch.ones((bsz * num_candidates, num_points), device=query.device, dtype=query.dtype),
+
+    score_map_chunks = []
+    valid_chunks = []
+    for cand_start in range(0, num_candidates, candidate_chunk_size):
+        cand_end = min(num_candidates, cand_start + candidate_chunk_size)
+        chunk_k = cand_end - cand_start
+        render_chunk = render[:, cand_start:cand_end].contiguous()
+        render_flat = render_chunk.reshape(bsz * chunk_k, channels, height, width)
+        render_xy = xy[None].expand(bsz * chunk_k, -1, -1)
+        patch_xy = render_xy[:, :, None, :] + offsets[None, None, :, :]
+        patch_sparse, patch_in = sample_feature_at_xy(
+            render_flat,
+            patch_xy.reshape(bsz * chunk_k, num_points * offsets.shape[0], 2),
+            torch.ones(
+                (bsz * chunk_k, num_points * offsets.shape[0]),
+                device=query.device,
+                dtype=query.dtype,
+            ),
             source_hw=None,
         )
-        mask_sparse = mask_sparse[..., 0].reshape(bsz, num_candidates, num_points)
-        mask_in = mask_in.reshape(bsz, num_candidates, num_points)
-        center_valid = center_valid & mask_in & (mask_sparse > 0.5)
+        patch_sparse = patch_sparse.reshape(bsz, chunk_k, num_points, offsets.shape[0], channels)
+        patch_in = patch_in.reshape(bsz, chunk_k, num_points, offsets.shape[0])
 
-    q_all = query_sparse[:, None].expand(-1, num_candidates, -1, -1).reshape(
-        bsz * num_candidates * num_points,
-        channels,
-    )
-    patch_all = patch_sparse.reshape(bsz * num_candidates * num_points, offsets.shape[0], channels)
-    patch_valid_all = patch_in.reshape(bsz * num_candidates * num_points, offsets.shape[0])
-    logits_chunks = []
-    for start in range(0, q_all.shape[0], chunk_points):
-        logits_chunks.append(
-            matcher(
-                q_all[start : start + chunk_points],
-                patch_all[start : start + chunk_points],
-                offsets=offsets,
-                patch_valid=patch_valid_all[start : start + chunk_points],
+        center_valid = query_in[:, None, :] & patch_in[:, :, :, center_index]
+        if mask_2d is not None:
+            mask_flat = mask_2d[:, cand_start:cand_end].contiguous().reshape(bsz * chunk_k, 1, height, width)
+            mask_sparse, mask_in = sample_feature_at_xy(
+                mask_flat,
+                render_xy,
+                torch.ones((bsz * chunk_k, num_points), device=query.device, dtype=query.dtype),
+                source_hw=None,
+            )
+            mask_sparse = mask_sparse[..., 0].reshape(bsz, chunk_k, num_points)
+            mask_in = mask_in.reshape(bsz, chunk_k, num_points)
+            center_valid = center_valid & mask_in & (mask_sparse > 0.5)
+
+        q_all = query_sparse[:, None].expand(-1, chunk_k, -1, -1).reshape(
+            bsz * chunk_k * num_points,
+            channels,
+        )
+        patch_all = patch_sparse.reshape(bsz * chunk_k * num_points, offsets.shape[0], channels)
+        patch_valid_all = patch_in.reshape(bsz * chunk_k * num_points, offsets.shape[0])
+        logits_chunks = []
+        for start in range(0, q_all.shape[0], chunk_points):
+            logits_chunks.append(
+                matcher(
+                    q_all[start : start + chunk_points],
+                    patch_all[start : start + chunk_points],
+                    offsets=offsets,
+                    patch_valid=patch_valid_all[start : start + chunk_points],
+                )
+            )
+        logits = torch.cat(logits_chunks, dim=0).reshape(bsz, chunk_k, num_points, offsets.shape[0])
+        log_probs = F.log_softmax(logits / max(float(temperature), 1.0e-6), dim=-1)
+        center_log_prob = log_probs[:, :, :, center_index]
+        center_logit = logits[:, :, :, center_index]
+        other_mask = patch_in.clone()
+        other_mask[:, :, :, center_index] = False
+        hard_neg = logits.masked_fill(~other_mask, -1.0e4).max(dim=-1).values
+        has_neg = other_mask.any(dim=-1)
+        hard_neg = torch.where(has_neg, hard_neg, torch.zeros_like(hard_neg))
+        score_mode = str(candidate_score_mode or "center_logprob_margin").lower()
+        center_margin = center_logit - hard_neg
+        if score_mode == "center_margin":
+            score_map = center_margin
+        elif score_mode == "center_logprob_margin":
+            score_map = center_log_prob + center_margin
+        else:
+            raise ValueError(f"Unknown pair matcher candidate score mode: {candidate_score_mode}")
+        score_map_chunks.append(
+            torch.stack([score_map, center_log_prob, center_margin], dim=2).reshape(
+                bsz,
+                chunk_k,
+                3,
+                grid_h,
+                grid_w,
             )
         )
-    logits = torch.cat(logits_chunks, dim=0).reshape(bsz, num_candidates, num_points, offsets.shape[0])
-    log_probs = F.log_softmax(logits / max(float(temperature), 1.0e-6), dim=-1)
-    center_log_prob = log_probs[:, :, :, center_index]
-    center_logit = logits[:, :, :, center_index]
-    other_mask = patch_in.clone()
-    other_mask[:, :, :, center_index] = False
-    hard_neg = logits.masked_fill(~other_mask, -1.0e4).max(dim=-1).values
-    has_neg = other_mask.any(dim=-1)
-    hard_neg = torch.where(has_neg, hard_neg, torch.zeros_like(hard_neg))
-    valid_f = center_valid.to(dtype=logits.dtype)
-    denom = valid_f.sum(dim=-1).clamp(min=1.0)
-    score_mode = str(candidate_score_mode or "center_logprob_margin").lower()
-    if score_mode == "center_margin":
-        score_map = center_logit - hard_neg
-    elif score_mode == "center_logprob_margin":
-        score_map = center_log_prob + (center_logit - hard_neg)
-    else:
-        raise ValueError(f"Unknown pair matcher candidate score mode: {candidate_score_mode}")
-    scores = (score_map * valid_f).sum(dim=-1) / denom
+        valid_chunks.append(center_valid.reshape(bsz, chunk_k, grid_h, grid_w))
+
+    return torch.cat(score_map_chunks, dim=1), torch.cat(valid_chunks, dim=1)
+
+
+def pair_matcher_local_candidate_scores(
+    matcher: PairConditionedLocalMatcher,
+    query_feature: torch.Tensor,
+    render_feature: torch.Tensor,
+    mask: torch.Tensor | None = None,
+    *,
+    radius: int = 3,
+    stride: int = 8,
+    temperature: float = 0.05,
+    chunk_points: int = 65536,
+    candidate_chunk_size: int = 0,
+    candidate_score_mode: str = "center_logprob_margin",
+) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """Score pose candidates with pair-conditioned local heatmap evidence."""
+    score_maps, valid_map = pair_matcher_local_candidate_score_maps(
+        matcher,
+        query_feature,
+        render_feature,
+        mask=mask,
+        radius=radius,
+        stride=stride,
+        temperature=temperature,
+        chunk_points=chunk_points,
+        candidate_chunk_size=candidate_chunk_size,
+        candidate_score_mode=candidate_score_mode,
+    )
+    valid_f = valid_map.to(dtype=score_maps.dtype)
+    denom = valid_f.flatten(2).sum(dim=-1).clamp(min=1.0)
+    score_map = score_maps[:, :, 0]
+    center_log_prob = score_maps[:, :, 1]
+    center_margin = score_maps[:, :, 2]
+    scores = (score_map * valid_f).flatten(2).sum(dim=-1) / denom
     stats = {
-        "local_zero_score": ((center_logit * valid_f).sum(dim=-1) / denom).mean().detach(),
-        "local_peak_score": ((logits.max(dim=-1).values * valid_f).sum(dim=-1) / denom).mean().detach(),
-        "local_peak_gap": (((logits.max(dim=-1).values - center_logit).clamp_min(0.0) * valid_f).sum(dim=-1) / denom).mean().detach(),
-        "local_peak_offset_px": _local_offset_norms(radius, device=logits.device, dtype=logits.dtype)[
-            logits.argmax(dim=-1)
-        ].mul(valid_f).sum(dim=-1).div(denom).mean().detach(),
-        "local_expected_offset_px": (
-            (F.softmax(logits / max(float(temperature), 1.0e-6), dim=-1) @ offsets.to(logits.device, logits.dtype))
-            .norm(dim=-1)
-            .mul(valid_f)
-            .sum(dim=-1)
-            .div(denom)
-            .mean()
-            .detach()
-        ),
+        "local_zero_score": ((center_log_prob * valid_f).flatten(2).sum(dim=-1) / denom).mean().detach(),
+        "local_peak_score": ((score_map * valid_f).flatten(2).sum(dim=-1) / denom).mean().detach(),
+        "local_peak_gap": ((-center_margin * valid_f).flatten(2).sum(dim=-1) / denom).mean().detach(),
+        "local_peak_offset_px": score_maps.new_zeros(()).detach(),
+        "local_expected_offset_px": score_maps.new_zeros(()).detach(),
     }
     return scores, stats
 
@@ -1830,6 +1908,27 @@ def candidate_teacher_quality_listwise_loss(
         "pred_index": pred_idx.detach(),
         "target_index": target_idx.detach(),
     }
+
+
+def effective_candidate_teacher_quality_weight(args: argparse.Namespace) -> float:
+    """Return the current teacher-quality auxiliary weight.
+
+    Stage 1/2 should learn pose/correction ordering first and only then let
+    LoFTR/PnP quality act as reliability evidence.  This avoids letting a
+    noisy matching teacher dominate the pose-cost target from step 0.
+    """
+    base = float(getattr(args, "candidate_teacher_quality_weight", 0.0) or 0.0)
+    if base <= 0.0:
+        return 0.0
+    step = int(getattr(args, "current_step", 0) or 0)
+    start = int(getattr(args, "candidate_teacher_quality_start_step", 0) or 0)
+    warmup = int(getattr(args, "candidate_teacher_quality_warmup_steps", 0) or 0)
+    if step < start:
+        return 0.0
+    if warmup <= 0:
+        return base
+    progress = min(max((step - start) / float(warmup), 0.0), 1.0)
+    return base * progress
 
 
 def score_anti_identity_loss(
@@ -2378,6 +2477,7 @@ def forward_batch(
             stride=int(args.pair_matcher_score_stride),
             temperature=float(args.pair_matcher_temperature),
             chunk_points=int(args.pair_matcher_score_chunk_points),
+            candidate_chunk_size=int(args.pair_matcher_score_candidate_chunk_size),
             candidate_score_mode=str(args.pair_matcher_candidate_score_mode),
         )
     elif need_local_corr:
@@ -2532,7 +2632,8 @@ def forward_batch(
         "pred_quality": query_loc.new_zeros(()),
         "target_quality": query_loc.new_zeros(()),
     }
-    if float(args.candidate_teacher_quality_weight) > 0.0:
+    candidate_teacher_quality_weight = effective_candidate_teacher_quality_weight(args)
+    if candidate_teacher_quality_weight > 0.0:
         candidate_teacher_quality = candidate_teacher_quality_listwise_loss(
             cand_scores,
             batch,
@@ -2606,6 +2707,7 @@ def forward_batch(
     }
     energy_pred_idx = None
     if energy_net is not None and bool(args.pose_energy_enabled):
+        score_source = str(getattr(args, "pose_energy_score_source", "local_corr") or "local_corr").lower()
         feature_pack = fine_candidate_selector_features(
             query_loc,
             cand_render_loc,
@@ -2633,6 +2735,25 @@ def forward_batch(
             candidate_uncertainty=cand_uncertainty,
             use_uncertainty=energy_use_uncertainty,
         )
+        if score_source == "pair_matcher_heatmap":
+            if pair_matcher is None:
+                raise ValueError("pose_energy_score_source=pair_matcher_heatmap requires --pair-matcher-enabled")
+            pair_score_maps, pair_valid_map = pair_matcher_local_candidate_score_maps(
+                pair_matcher,
+                query_loc,
+                cand_render_loc,
+                mask=cand_mask,
+                radius=int(args.pair_matcher_radius),
+                stride=int(args.pair_matcher_score_stride),
+                temperature=float(args.pair_matcher_temperature),
+                chunk_points=int(args.pair_matcher_score_chunk_points),
+                candidate_chunk_size=int(args.pair_matcher_score_candidate_chunk_size),
+                candidate_score_mode=str(args.pair_matcher_candidate_score_mode),
+            )
+            feature_pack["score_maps"] = pair_score_maps
+            feature_pack["valid"] = feature_pack["valid"] & pair_valid_map.flatten(2).any(dim=2)
+        elif score_source != "local_corr":
+            raise ValueError(f"Unknown pose_energy_score_source: {args.pose_energy_score_source}")
         energy_out = energy_net(
             feature_pack["score_maps"],
             feature_pack["features"],
@@ -2903,7 +3024,7 @@ def forward_batch(
         + float(args.rank_ce_weight) * rank["rank_loss"]
         + float(args.score_correction_cosine_weight) * score_correction_cosine["loss"]
         + float(args.score_pose_improvement_weight) * score_pose_improvement["loss"]
-        + float(args.candidate_teacher_quality_weight) * candidate_teacher_quality["loss"]
+        + candidate_teacher_quality_weight * candidate_teacher_quality["loss"]
         + float(args.score_anti_identity_weight) * score_anti_identity["loss"]
         + float(args.pose_energy_weight) * energy_loss
         + float(args.drift_weight) * drift
@@ -2963,6 +3084,7 @@ def forward_batch(
         "score_pose_improvement_pred_cost_m": score_pose_improvement["pred_cost_m"].detach(),
         "score_pose_improvement_target_cost_m": score_pose_improvement["target_cost_m"].detach(),
         "candidate_teacher_quality_loss": candidate_teacher_quality["loss"].detach(),
+        "candidate_teacher_quality_weight": query_loc.new_tensor(candidate_teacher_quality_weight).detach(),
         "candidate_teacher_quality_ce_loss": candidate_teacher_quality["ce_loss"].detach(),
         "candidate_teacher_quality_pairwise_loss": candidate_teacher_quality["pairwise_loss"].detach(),
         "candidate_teacher_quality_active": candidate_teacher_quality["active"].detach(),
@@ -3083,20 +3205,36 @@ def collect_trainable_parameters(
     model: torch.nn.Module,
     *,
     train_adapter: bool = True,
+    adapter_domains: str = "all",
+    train_energy_net: bool = True,
+    train_pair_matcher: bool = True,
 ) -> List[torch.nn.Parameter]:
-    for param in adapter.parameters():
-        param.requires_grad_(bool(train_adapter))
+    domains = str(adapter_domains or "all").lower()
+    if domains not in {"all", "query", "render", "none"}:
+        raise ValueError("adapter_domains must be all, query, render, or none")
+    for _name, param in adapter.named_parameters():
+        param.requires_grad_(False)
+    if bool(train_adapter) and domains != "none":
+        for name, param in adapter.named_parameters():
+            if domains == "all":
+                param.requires_grad_(True)
+            elif domains == "query" and name.startswith("query_"):
+                param.requires_grad_(True)
+            elif domains == "render" and name.startswith("render_"):
+                param.requires_grad_(True)
     params: List[torch.nn.Parameter] = []
     if bool(train_adapter):
-        params.extend(adapter.parameters())
+        params.extend(param for param in adapter.parameters() if param.requires_grad)
     if energy_net is not None:
         for param in energy_net.parameters():
-            param.requires_grad_(True)
-        params.extend(energy_net.parameters())
+            param.requires_grad_(bool(train_energy_net))
+        if bool(train_energy_net):
+            params.extend(energy_net.parameters())
     if pair_matcher is not None:
         for param in pair_matcher.parameters():
-            param.requires_grad_(True)
-        params.extend(pair_matcher.parameters())
+            param.requires_grad_(bool(train_pair_matcher))
+        if bool(train_pair_matcher):
+            params.extend(pair_matcher.parameters())
     params.extend(param for param in model.parameters() if param.requires_grad)
     return params
 
@@ -3219,6 +3357,9 @@ def main() -> None:
         pair_matcher,
         model,
         train_adapter=bool(args.train_pose_feature_adapter),
+        adapter_domains=str(args.train_pose_feature_adapter_domains),
+        train_energy_net=bool(args.train_pose_energy_net),
+        train_pair_matcher=bool(args.train_pair_matcher),
     )
     if not trainable:
         raise ValueError("No trainable parameters selected for NVS pose feature adapter training")
@@ -3257,10 +3398,11 @@ def main() -> None:
         model.train(bool(train_prefixes))
         adapter.train(bool(args.train_pose_feature_adapter))
         if energy_net is not None:
-            energy_net.train()
+            energy_net.train(bool(args.train_pose_energy_net))
         if pair_matcher is not None:
-            pair_matcher.train()
+            pair_matcher.train(bool(args.train_pair_matcher))
         optimizer.zero_grad(set_to_none=True)
+        args.current_step = step
         with torch.cuda.amp.autocast(enabled=bool(args.amp and device.type == "cuda")):
             loss, metrics = forward_batch(model, adapter, energy_net, pair_matcher, map_renderer, batch, cfg, args, train=True)
         scale_before = float(scaler.get_scale()) if bool(args.amp and device.type == "cuda") else 1.0
@@ -3318,6 +3460,7 @@ def main() -> None:
                 flush=True,
             )
         if step % int(args.eval_every) == 0 or step == int(args.max_steps):
+            args.current_step = step
             eval_metrics = evaluate(model, adapter, energy_net, pair_matcher, eval_loader, map_renderer, cfg, args)
             eval_row = {"step": step, "split": "eval"}
             eval_row.update(eval_metrics)

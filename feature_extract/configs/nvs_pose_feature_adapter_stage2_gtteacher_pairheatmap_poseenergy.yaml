@@ -1,0 +1,76 @@
+# Stage 2 for GT-teacher localization features.
+#
+# This keeps the PoseFeatureDomainAdapter architecture identical to the
+# GT-render LoFTR Stage1/Stage1B checkpoints, then freezes it and trains only
+# PoseEnergyNet over pair-conditioned heatmaps.
+
+base_config: /root/ICLPose/feature_extract/configs/nvs_pose_feature_adapter_stage1_gtteacherloc_pairscore_128.yaml
+exp_name: nvs_pose_feature_adapter_stage2_gtteacher_pairheatmap_poseenergy
+
+dataset:
+  pose_candidate_topk: 16
+  pose_candidate_cache_keep_variants: true
+  train_pose_candidate_cache_sampling: random
+  val_pose_candidate_cache_sampling: first
+  train_pose_candidate_caches:
+    - /root/ICLPose/result/result/feature_extract/pose_init_exports/oldhospital_local_lattice_renderloftr_q10cm2deg_top16_noexact_train64.npz
+    - /root/ICLPose/result/result/feature_extract/pose_init_exports/oldhospital_local_lattice_renderloftr_q25cm5deg_top16_noexact_train64.npz
+  val_pose_candidate_caches:
+    - /root/ICLPose/result/result/feature_extract/pose_init_exports/oldhospital_local_lattice_renderloftr_q10cm2deg_top16_noexact_val32.npz
+    - /root/ICLPose/result/result/feature_extract/pose_init_exports/oldhospital_local_lattice_renderloftr_q25cm5deg_top16_noexact_val32.npz
+
+training:
+  batch_size: 12
+  validation_batch_size: 12
+  max_steps: 180
+  eval_every: 30
+
+nvs_pose_feature_adapter:
+  best_metric: pose_energy_pred_cost_m
+  best_metric_mode: min
+
+  train_pose_feature_adapter_domains: none
+  train_pair_matcher: false
+  train_pose_energy_net: true
+
+  # Freeze feature/matcher losses in Stage2; the frozen pair matcher only
+  # produces score maps for PoseEnergyNet.
+  pair_matcher_weight: 0.0
+  teacher_corr_weight: 0.0
+  teacher_corr_local_patch_weight: 0.0
+  rank_ce_weight: 0.0
+  rank_pairwise_weight: 0.0
+  score_correction_cosine_weight: 0.0
+  score_pose_improvement_weight: 0.0
+  score_anti_identity_weight: 0.0
+
+  pose_energy_enabled: true
+  pose_energy_weight: 1.0
+  pose_energy_score_source: pair_matcher_heatmap
+  pose_energy_factorized_heads: true
+  pose_energy_translation_weight: 0.35
+  pose_energy_rotation_weight: 0.25
+  pose_energy_joint_weight: 0.40
+  pose_energy_hard_ce_weight: 0.5
+  pose_energy_component_hard_ce_weight: 0.25
+  pose_energy_pairwise_rank_weight: 0.5
+  pose_energy_pairwise_rank_min_gap_m: 0.03
+  pose_energy_pairwise_rank_logit_margin: 0.5
+  pose_energy_direction_weight: 0.75
+  pose_energy_correction_cosine_weight: 0.5
+  pose_energy_correction_cosine_temperature: 0.08
+  pose_energy_anti_identity_weight: 0.75
+  pose_energy_residual_weight: 0.0
+  pose_energy_improve_weight: 0.0
+  pose_energy_select_for_metric: true
+  pose_energy_use_delta_vector: true
+  pose_energy_use_center_delta_vector: true
+  pose_energy_use_uncertainty: true
+  pose_energy_use_rgb: true
+
+  # Stage2 only trains PoseEnergyNet over the selected pair heatmaps.  The
+  # teacher-quality auxiliary target lives on the pre-selection candidate bank
+  # and can have a different K than the selected pairheatmap pool.
+  candidate_teacher_quality_weight: 0.0
+  candidate_teacher_quality_start_step: 0
+  candidate_teacher_quality_warmup_steps: 0

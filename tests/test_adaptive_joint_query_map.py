@@ -2370,6 +2370,59 @@ def test_pose_candidate_cache_index_matches_sample_name_variants(tmp_path):
     assert index["seq8_frame00110"]["retrieval_scores_candidates"].tolist() == [1.0, 0.5]
 
 
+def test_pose_candidate_cache_index_can_keep_multiple_bucket_variants(tmp_path):
+    cache_10 = tmp_path / "candidates_10cm.npz"
+    cache_25 = tmp_path / "candidates_25cm.npz"
+    pose0 = _pose_with_center([0.0, 0.0, 0.0]).numpy().astype(np.float32)
+    pose10 = _pose_with_center([0.10, 0.0, 0.0]).numpy().astype(np.float32)
+    pose25 = _pose_with_center([0.25, 0.0, 0.0]).numpy().astype(np.float32)
+
+    base = {
+        "query_img_id": 1,
+        "query_image_name": "seq8/frame00110.png",
+        "query_image_stem": "seq8_frame00110",
+        "init_source": "test",
+        "retrieval_frame_id": 2,
+        "retrieval_image_name": "a.png",
+        "retrieval_score": 1.0,
+        "candidate_valid_mask": np.asarray([True, True]),
+        "retrieval_frame_ids_candidates": np.asarray([2, 3], dtype=np.int64),
+        "retrieval_image_names_candidates": np.asarray(["a.png", "b.png"]),
+    }
+    save_retrieval_init_entries(
+        [
+            {
+                **base,
+                "pose_init": pose10,
+                "pose_init_candidates": np.stack([pose10, pose0], axis=0),
+                "retrieval_scores_candidates": np.asarray([10.0, 1.0], dtype=np.float32),
+            }
+        ],
+        {},
+        str(cache_10),
+    )
+    save_retrieval_init_entries(
+        [
+            {
+                **base,
+                "pose_init": pose25,
+                "pose_init_candidates": np.stack([pose25, pose0], axis=0),
+                "retrieval_scores_candidates": np.asarray([25.0, 1.0], dtype=np.float32),
+            }
+        ],
+        {},
+        str(cache_25),
+    )
+
+    index = load_pose_candidate_cache_index([str(cache_10), str(cache_25)], keep_variants=True)
+
+    variants = index["seq8/frame00110.png"]
+    assert isinstance(variants, list)
+    assert len(variants) == 2
+    assert np.isclose(variants[0]["retrieval_scores_candidates"][0], 10.0)
+    assert np.isclose(variants[1]["retrieval_scores_candidates"][0], 25.0)
+
+
 def test_joint_radio_dataset_loads_pose_candidate_quality_fields(tmp_path):
     class FakeTeacherStore:
         def load_pair(self, _idx):

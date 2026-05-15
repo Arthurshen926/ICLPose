@@ -1,0 +1,19 @@
+# 10cm/2deg local CPR teacher-quality training.
+#
+# This isolates the small-basin stage of the expert reset: RADIO/DCFF are
+# context anchors, while the localization adapter is supervised by local
+# render-LoFTR/PnP candidate quality plus GT pose/correction ranking.
+
+base_config: /root/ICLPose/feature_extract/configs/nvs_pose_feature_adapter_stage1_matchingloc_teacherquality_local_noexact.yaml
+exp_name: nvs_pose_feature_adapter_stage1_matchingloc_teacherquality_local_10cm_noexact
+
+dataset:
+  pose_candidate_topk: 16
+  train_pose_candidate_cache: /root/ICLPose/result/result/feature_extract/pose_init_exports/oldhospital_local_lattice_renderloftr_q10cm2deg_top16_noexact_train64.npz
+  val_pose_candidate_cache: /root/ICLPose/result/result/feature_extract/pose_init_exports/oldhospital_local_lattice_renderloftr_q10cm2deg_top16_noexact_val32.npz
+
+training:
+  batch_size: 10
+  validation_batch_size: 10
+  max_steps: 100
+  eval_every: 20

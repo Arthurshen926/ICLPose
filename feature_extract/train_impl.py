@@ -4071,7 +4071,7 @@ def split_records(all_records, dataset_cfg):
     return train_records, val_records
 
 
-def load_pose_candidate_cache_index(cache_paths):
+def load_pose_candidate_cache_index(cache_paths, *, keep_variants=False):
     if not cache_paths:
         return {}
     if isinstance(cache_paths, (str, os.PathLike)):
@@ -4087,7 +4087,10 @@ def load_pose_candidate_cache_index(cache_paths):
             keys = _candidate_record_names(entry["query_image_name"])
             keys.extend(_candidate_record_names(entry.get("query_image_stem", "")))
             for key in keys:
-                index.setdefault(key, entry)
+                if keep_variants:
+                    index.setdefault(key, []).append(entry)
+                else:
+                    index.setdefault(key, entry)
     return index
 
 
@@ -4106,6 +4109,7 @@ class JointRADIOQueryDataset(Dataset):
         colmap_dir=None,
         pose_candidate_cache_index=None,
         pose_candidate_topk=0,
+        pose_candidate_cache_sampling="first",
     ):
         self.records = records
         self.teacher_store = teacher_store
@@ -4116,6 +4120,9 @@ class JointRADIOQueryDataset(Dataset):
         self.teacher_correspondence_store = teacher_correspondence_store
         self.pose_candidate_cache_index = pose_candidate_cache_index or {}
         self.pose_candidate_topk = max(0, int(pose_candidate_topk or 0))
+        self.pose_candidate_cache_sampling = str(pose_candidate_cache_sampling or "first").lower()
+        if self.pose_candidate_cache_sampling not in {"first", "cycle", "random"}:
+            raise ValueError("pose_candidate_cache_sampling must be first, cycle, or random")
         self.prior_masks = None
         self.name_to_pose = {}
         self.basename_to_pose = {}
@@ -4210,6 +4217,16 @@ class JointRADIOQueryDataset(Dataset):
                 candidate_entry = self.pose_candidate_cache_index.get(key)
                 if candidate_entry is not None:
                     break
+            if candidate_entry is not None:
+                if isinstance(candidate_entry, (list, tuple)):
+                    if not candidate_entry:
+                        candidate_entry = None
+                    elif self.pose_candidate_cache_sampling == "random":
+                        candidate_entry = random.choice(list(candidate_entry))
+                    elif self.pose_candidate_cache_sampling == "cycle":
+                        candidate_entry = candidate_entry[int(idx) % len(candidate_entry)]
+                    else:
+                        candidate_entry = candidate_entry[0]
             if candidate_entry is not None:
                 poses = np.asarray(candidate_entry["pose_init_candidates"], dtype=np.float32)
                 valid = np.asarray(candidate_entry["candidate_valid_mask"], dtype=bool)
@@ -11464,13 +11481,31 @@ def main():
         or cfg.get("map_supervision", {}).get("colmap_dir")
         or str(Path(cfg["dataset"]["source_dir"]) / "sparse" / "0")
     )
+    train_candidate_sampling = str(
+        cfg["dataset"].get(
+            "train_pose_candidate_cache_sampling",
+            cfg["dataset"].get("pose_candidate_cache_sampling", "first"),
+        )
+        or "first"
+    ).lower()
+    val_candidate_sampling = str(
+        cfg["dataset"].get(
+            "val_pose_candidate_cache_sampling",
+            cfg["dataset"].get("pose_candidate_cache_sampling", "first"),
+        )
+        or "first"
+    ).lower()
+    train_keep_variants = bool(cfg["dataset"].get("pose_candidate_cache_keep_variants", False)) or train_candidate_sampling != "first"
+    val_keep_variants = bool(cfg["dataset"].get("pose_candidate_cache_keep_variants", False)) or val_candidate_sampling != "first"
     train_pose_candidate_index = load_pose_candidate_cache_index(
-        cfg["dataset"].get("train_pose_candidate_cache")
-        or cfg["dataset"].get("train_pose_candidate_caches")
+        cfg["dataset"].get("train_pose_candidate_caches")
+        or cfg["dataset"].get("train_pose_candidate_cache"),
+        keep_variants=train_keep_variants,
     )
     val_pose_candidate_index = load_pose_candidate_cache_index(
-        cfg["dataset"].get("val_pose_candidate_cache")
-        or cfg["dataset"].get("val_pose_candidate_caches")
+        cfg["dataset"].get("val_pose_candidate_caches")
+        or cfg["dataset"].get("val_pose_candidate_cache"),
+        keep_variants=val_keep_variants,
     )
     if train_pose_candidate_index:
         logger.info("Train pose candidate cache enabled: records=%d", len(train_pose_candidate_index))
@@ -11500,6 +11535,7 @@ def main():
         colmap_dir=colmap_dir,
         pose_candidate_cache_index=train_pose_candidate_index,
         pose_candidate_topk=pose_candidate_topk,
+        pose_candidate_cache_sampling=train_candidate_sampling,
     )
     val_dataset = JointRADIOQueryDataset(
         val_records,
@@ -11514,6 +11550,7 @@ def main():
         colmap_dir=colmap_dir,
         pose_candidate_cache_index=val_pose_candidate_index,
         pose_candidate_topk=pose_candidate_topk,
+        pose_candidate_cache_sampling=val_candidate_sampling,
     )
 
 

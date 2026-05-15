@@ -13,9 +13,11 @@ from feature_extract.tools.train_nvs_pose_feature_adapter import (
     candidate_identity_mask,
     candidate_teacher_quality_listwise_loss,
     candidate_teacher_quality_scores_from_batch,
+    effective_candidate_teacher_quality_weight,
     collect_trainable_parameters,
     pose_energy_factorized_selection_metrics,
     local_flow_nce_loss,
+    pair_matcher_local_candidate_score_maps,
     pair_matcher_local_candidate_scores,
     local_zero_offset_scores_from_corr,
     local_zero_offset_correlation_scores,
@@ -310,6 +312,25 @@ def test_candidate_teacher_quality_listwise_loss_prefers_high_quality_candidate(
     assert torch.isfinite(bad_logits.grad).all()
 
 
+def test_effective_candidate_teacher_quality_weight_supports_delayed_warmup():
+    args = type(
+        "Args",
+        (),
+        {
+            "candidate_teacher_quality_weight": 2.0,
+            "candidate_teacher_quality_start_step": 10,
+            "candidate_teacher_quality_warmup_steps": 20,
+            "current_step": 0,
+        },
+    )()
+
+    assert effective_candidate_teacher_quality_weight(args) == 0.0
+    args.current_step = 20
+    assert effective_candidate_teacher_quality_weight(args) == 1.0
+    args.current_step = 40
+    assert effective_candidate_teacher_quality_weight(args) == 2.0
+
+
 def test_score_anti_identity_loss_penalizes_identity_when_better_candidate_exists():
     candidate_cost = torch.tensor([[0.30, 0.10, 0.45]])
     valid = torch.ones_like(candidate_cost, dtype=torch.bool)
@@ -481,6 +502,78 @@ def test_local_zero_offset_scores_can_use_continuous_reliability_weights():
 
     assert unweighted[0, 0] > unweighted[0, 1]
     assert weighted[0, 1] > weighted[0, 0]
+
+
+def test_pair_matcher_heatmap_score_maps_prefer_aligned_candidate():
+    matcher = PairConditionedLocalMatcher(
+        channels=3,
+        hidden_dim=8,
+        offset_radius=1,
+        zero_init_residual=True,
+        base_dot_weight=10.0,
+    )
+    query = torch.zeros(1, 3, 5, 5)
+    query[0, 0, 1:4, 1:4] = 1.0
+    query[0, 1, 2, 2] = 1.0
+    query[0, 2, 0, 4] = 1.0
+    aligned = query.clone()
+    shifted = torch.roll(query, shifts=1, dims=-1)
+    render = torch.stack([aligned, shifted], dim=1)
+
+    score_maps, valid = pair_matcher_local_candidate_score_maps(
+        matcher,
+        query,
+        render,
+        radius=1,
+        stride=1,
+        temperature=0.05,
+        chunk_points=64,
+        candidate_score_mode="center_logprob_margin",
+    )
+
+    assert score_maps.shape == (1, 2, 3, 5, 5)
+    assert valid.shape == (1, 2, 5, 5)
+    scores = (score_maps[:, :, 0] * valid.float()).flatten(2).sum(dim=2) / valid.float().flatten(2).sum(dim=2)
+    assert scores[0, 0] > scores[0, 1]
+
+
+def test_pair_matcher_heatmap_candidate_chunking_matches_full_result():
+    matcher = PairConditionedLocalMatcher(
+        channels=3,
+        hidden_dim=8,
+        offset_radius=1,
+        zero_init_residual=False,
+        base_dot_weight=2.0,
+    )
+    query = torch.randn(2, 3, 5, 5)
+    render = torch.randn(2, 5, 3, 5, 5)
+    mask = torch.ones(2, 5, 5, 5, dtype=torch.bool)
+
+    full_maps, full_valid = pair_matcher_local_candidate_score_maps(
+        matcher,
+        query,
+        render,
+        mask=mask,
+        radius=1,
+        stride=1,
+        temperature=0.05,
+        chunk_points=512,
+        candidate_chunk_size=0,
+    )
+    chunked_maps, chunked_valid = pair_matcher_local_candidate_score_maps(
+        matcher,
+        query,
+        render,
+        mask=mask,
+        radius=1,
+        stride=1,
+        temperature=0.05,
+        chunk_points=512,
+        candidate_chunk_size=2,
+    )
+
+    assert torch.equal(chunked_valid, full_valid)
+    assert torch.allclose(chunked_maps, full_maps, atol=1.0e-6)
 
 
 def test_nvs_best_metric_defaults_to_pose_energy_metric_when_enabled():
@@ -1198,6 +1291,58 @@ def test_collect_trainable_parameters_can_freeze_pose_feature_adapter():
     assert all(not param.requires_grad for param in model.parameters())
     adapter_param_ids = {id(param) for param in adapter.parameters()}
     assert all(id(param) not in adapter_param_ids for param in params)
+
+
+def test_collect_trainable_parameters_can_train_only_render_adapter_domain():
+    adapter = PoseFeatureDomainAdapter(
+        channels=3,
+        hidden_dim=4,
+        rgb_context_enabled=True,
+        texture_branch_enabled=True,
+    )
+    model = torch.nn.Conv2d(3, 3, kernel_size=1)
+    for param in model.parameters():
+        param.requires_grad_(False)
+
+    params = collect_trainable_parameters(
+        adapter,
+        None,
+        None,
+        model,
+        train_adapter=True,
+        adapter_domains="render",
+    )
+
+    named = dict(adapter.named_parameters())
+    assert params
+    assert any(name.startswith("render_") for name, param in named.items() if param.requires_grad)
+    assert all(not param.requires_grad for name, param in named.items() if name.startswith("query_"))
+    assert all(param.requires_grad for name, param in named.items() if name.startswith("render_"))
+
+
+def test_collect_trainable_parameters_can_freeze_energy_and_pair_matcher():
+    adapter = PoseFeatureDomainAdapter(channels=3, hidden_dim=4)
+    energy_net = PoseEnergyNet(vector_dim=0, score_map_channels=3, hidden_dim=8, context_layers=0)
+    pair_matcher = PairConditionedLocalMatcher(channels=3, hidden_dim=4, offset_radius=1)
+    model = torch.nn.Conv2d(3, 3, kernel_size=1)
+    for param in model.parameters():
+        param.requires_grad_(False)
+
+    params = collect_trainable_parameters(
+        adapter,
+        energy_net,
+        pair_matcher,
+        model,
+        train_adapter=True,
+        adapter_domains="render",
+        train_energy_net=False,
+        train_pair_matcher=False,
+    )
+
+    assert params
+    assert all(not param.requires_grad for param in energy_net.parameters())
+    assert all(not param.requires_grad for param in pair_matcher.parameters())
+    assert all(param.requires_grad for name, param in adapter.named_parameters() if name.startswith("render_"))
 
 
 def test_nvs_pose_energy_vector_dim_includes_uncertainty_features():
