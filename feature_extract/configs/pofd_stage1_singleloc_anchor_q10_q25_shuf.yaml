@@ -1,0 +1,51 @@
+# POFD Stage 1: single localization feature anchor/correspondence training.
+#
+# This is the clean 2026-05-16 reset path from ChatGPT-ICLPose.md:
+# keep one pose-observable localization feature family, freeze map geometry and
+# base query/map features, and train only lightweight query/render adapters plus
+# the pair-conditioned matcher.  Candidate ranking and pose-energy heads are
+# intentionally off here; this stage answers whether adapted RADIO/DCFF features
+# become matchable under GT-render NVS supervision.
+
+base_config: /root/ICLPose/feature_extract/configs/nvs_pose_feature_adapter_stage1_matchingloc_teacherquality_local_mixed_10_25_paircorr.yaml
+exp_name: pofd_stage1_singleloc_anchor_q10_q25_shuf
+
+dataset:
+  pose_candidate_topk: 16
+  train_pose_candidate_cache:
+  val_pose_candidate_cache:
+  pose_candidate_cache_keep_variants: true
+  train_pose_candidate_cache_sampling: random
+  val_pose_candidate_cache_sampling: cycle
+  train_pose_candidate_caches:
+    - /root/ICLPose/result/result/feature_extract/pose_init_exports/oldhospital_local_lattice_renderloftr_q10cm2deg_top16_noexact_train256_shuf20260515.npz
+    - /root/ICLPose/result/result/feature_extract/pose_init_exports/oldhospital_local_lattice_renderloftr_q25cm5deg_top16_noexact_train256_shuf20260515.npz
+  val_pose_candidate_caches:
+    - /root/ICLPose/result/result/feature_extract/pose_init_exports/oldhospital_local_lattice_renderloftr_q10cm2deg_top16_noexact_val128_shuf20260515.npz
+    - /root/ICLPose/result/result/feature_extract/pose_init_exports/oldhospital_local_lattice_renderloftr_q25cm5deg_top16_noexact_val128_shuf20260515.npz
+
+training:
+  batch_size: 8
+  validation_batch_size: 8
+  pin_memory: false
+  max_steps: 80
+  eval_every: 20
+
+nvs_pose_feature_adapter:
+  best_metric: align_cos
+  best_metric_mode: max
+
+  candidate_teacher_quality_weight: 0.0
+  rank_ce_weight: 0.0
+  rank_pairwise_weight: 0.0
+  score_correction_cosine_weight: 0.0
+  score_pose_improvement_weight: 0.0
+  score_anti_identity_weight: 0.0
+  observability_contrast_weight: 0.0
+  pose_energy_enabled: false
+
+  align_weight: 2.0
+  warp_align_weight: 1.0
+  drift_weight: 0.05
+  variance_weight: 0.02
+

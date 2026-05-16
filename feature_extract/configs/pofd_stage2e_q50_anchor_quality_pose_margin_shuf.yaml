@@ -1,0 +1,25 @@
+# POFD Stage 2e-A: q50 teacher-quality + pose margin with stronger anchors.
+#
+# Stage2d improved q50 selected cost but degraded query/map alignment.  This
+# probe keeps the useful NVS teacher-quality signal while increasing anchor and
+# drift regularization, testing whether q50 needs a less drifting localization
+# feature rather than another selector.
+
+base_config: /root/ICLPose/feature_extract/configs/pofd_stage2d_nvs_quality_pose_margin_q50_shuf.yaml
+exp_name: pofd_stage2e_q50_anchor_quality_pose_margin_shuf
+
+training:
+  batch_size: 16
+  validation_batch_size: 16
+  max_steps: 40
+  eval_every: 20
+
+nvs_pose_feature_adapter:
+  pose_feature_adapter_base_anchor_weight: 0.75
+  align_weight: 0.3
+  drift_weight: 0.05
+  variance_weight: 0.02
+
+  candidate_teacher_quality_weight: 0.75
+  candidate_observability_weight: 0.25
+  score_anti_identity_weight: 0.25

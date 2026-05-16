@@ -192,6 +192,30 @@ def _find_k_nearest(
     return list(np.argsort(dists)[:K])
 
 
+def _resolve_eval_mode_metadata(eval_mode: Optional[str], init_method: str) -> Dict[str, Any]:
+    """Resolve oracle/deploy labels and reject known mode mixing."""
+    init_method = str(init_method or "loftr")
+    if eval_mode is None:
+        eval_mode = "oracle" if init_method == "loftr" else "deploy"
+    eval_mode = str(eval_mode).lower()
+    if eval_mode not in {"oracle", "deploy", "ablation"}:
+        raise ValueError(f"Unsupported eval_mode={eval_mode!r}")
+    uses_gt_query_center = init_method == "loftr"
+    if eval_mode == "deploy" and uses_gt_query_center:
+        raise ValueError(
+            "eval_mode=deploy cannot be used with init_method=loftr because that path uses oracle "
+            "GT query camera centers for nearest-neighbor retrieval. Use init_method=regression or "
+            "regression_loftr, or mark the run as eval_mode=oracle/ablation."
+        )
+    return {
+        "eval_mode": eval_mode,
+        "init_method": init_method,
+        "uses_gt_query_center": bool(uses_gt_query_center),
+        "uses_gt_query_pose": bool(uses_gt_query_center),
+        "deployable": bool(eval_mode == "deploy" and not uses_gt_query_center),
+    }
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Pose error computation
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -276,10 +300,20 @@ def run_pipeline(args: argparse.Namespace) -> None:
     from torch.cuda.amp import autocast
     from scipy.spatial.transform import Rotation as R_scipy
 
+    eval_mode_meta = _resolve_eval_mode_metadata(
+        getattr(args, "eval_mode", None),
+        getattr(args, "init_method", "loftr"),
+    )
+    args.eval_mode = eval_mode_meta["eval_mode"]
     device = torch.device("cuda:0")
     torch.cuda.set_device(0)
 
     logger = logging.getLogger("pipeline_eval")
+    if eval_mode_meta["uses_gt_query_center"]:
+        logger.warning(
+            "EVAL_MODE=%s uses GT query camera centers for retrieval; report this run as ORACLE/ABLATION, not deployable.",
+            eval_mode_meta["eval_mode"].upper(),
+        )
 
     def _perturb_pose(pose_w2c: np.ndarray, noise_deg: float, noise_m: float,
                       rng: np.random.RandomState) -> np.ndarray:
@@ -1450,6 +1484,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
         "checkpoint": args.checkpoint,
         "output_dir": out_dir,
         "epoch": str(ckpt_epoch),
+        "eval_mode": eval_mode_meta,
         "init_method": getattr(args, "init_method", "loftr"),
         "regression_npz": getattr(args, "regression_npz", None),
         "num_neighbors": args.num_neighbors,
@@ -1528,6 +1563,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
         json.dump(results_json, f, indent=2)
 
     summary_lines = [
+        f"eval_mode={eval_mode_meta['eval_mode']} deployable={eval_mode_meta['deployable']}",
         f"init={getattr(args, 'init_method', 'loftr')} K={args.num_neighbors}",
         "LoFTR init: {:.3f}deg / {:.1f}mm".format(
             float(np.median(lof_r)),
@@ -1557,6 +1593,9 @@ def run_pipeline(args: argparse.Namespace) -> None:
         f"rematch_iters={args.rematch_iters}",
         f"rematch_cumulative={getattr(args, 'rematch_cumulative', False)}",
         f"solver={args.solver}",
+        f"eval_mode={eval_mode_meta['eval_mode']}",
+        f"uses_gt_query_center={eval_mode_meta['uses_gt_query_center']}",
+        f"deployable={eval_mode_meta['deployable']}",
     ]
     artifact_paths = [json_path]
     save_experiment_bundle(
@@ -1633,6 +1672,9 @@ def main() -> None:
     parser.add_argument("--max_test", type=int, default=None,
                         help="Limit test images (for debugging)")
     # Initialisation method
+    parser.add_argument("--eval_mode", type=str, default=None,
+                        choices=["oracle", "deploy", "ablation"],
+                        help="Explicit evaluation label. Default is oracle for init_method=loftr and deploy otherwise.")
     parser.add_argument("--init_method", type=str, default="loftr",
                         choices=["loftr", "regression", "regression_loftr"],
                         help="How to initialise poses before refinement: "

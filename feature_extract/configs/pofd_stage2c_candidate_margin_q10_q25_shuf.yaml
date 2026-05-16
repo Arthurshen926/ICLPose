@@ -1,0 +1,34 @@
+# POFD Stage 2c companion: candidate-internal observability margin on q10/q25.
+
+base_config: /root/ICLPose/feature_extract/configs/pofd_stage2_poseobs_q10_q25_shuf.yaml
+exp_name: pofd_stage2c_candidate_margin_q10_q25_shuf
+
+training:
+  batch_size: 12
+  validation_batch_size: 12
+  max_steps: 80
+  eval_every: 20
+
+nvs_pose_feature_adapter:
+  best_metric: pred_cost_m
+  best_metric_mode: min
+  resume_adapter_strict: false
+
+  pose_feature_adapter_uncertainty_enabled: false
+  score_use_uncertainty: false
+
+  candidate_observability_weight: 1.0
+  candidate_observability_margin: 0.05
+  candidate_observability_min_cost_gap_m: 0.08
+  observability_contrast_weight: 0.0
+
+  rank_ce_weight: 1.0
+  rank_pairwise_weight: 0.5
+  score_correction_cosine_weight: 0.5
+  score_pose_improvement_weight: 0.5
+  score_anti_identity_weight: 0.5
+
+  pose_energy_enabled: false
+  train_pose_energy_net: false
+  train_pair_matcher: true
+  train_pose_feature_adapter: true

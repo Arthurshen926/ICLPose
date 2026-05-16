@@ -29,6 +29,7 @@ from feature_extract.students.pose_energy_net import (  # noqa: E402
     pose_energy_losses,
     pose_energy_selection_scores,
 )
+from feature_extract.pose_observability import feature_pose_fisher_stats  # noqa: E402
 from feature_extract.tools.eval_cpr_buckets import build_model_and_data, map_pose_gt_for_batch  # noqa: E402
 from feature_extract.tools.train_pose_energy import (  # noqa: E402
     _good_bad_auc_rows,
@@ -121,27 +122,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--map-checkpoint", default=None)
     parser.add_argument("--resume-adapter", default=None)
+    parser.add_argument("--resume-adapter-strict", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--eval-only", action="store_true")
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--train-split", choices=("train", "val"), default="train")
     parser.add_argument("--eval-split", choices=("train", "val"), default="val")
-    parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--max-samples", type=int, default=None)
-    parser.add_argument("--eval-max-samples", type=int, default=64)
+    parser.add_argument("--eval-max-samples", type=int, default=None)
     parser.add_argument("--skip-samples", type=int, default=0)
     parser.add_argument("--candidate-render-batch-size", type=int, default=None)
-    parser.add_argument("--max-steps", type=int, default=500)
-    parser.add_argument("--eval-every", type=int, default=50)
-    parser.add_argument("--save-every", type=int, default=250)
+    parser.add_argument("--pose-observability-diagnostic-enabled", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--max-steps", type=int, default=None)
+    parser.add_argument("--eval-every", type=int, default=None)
+    parser.add_argument("--save-every", type=int, default=None)
     parser.add_argument("--best-metric", default=None)
     parser.add_argument("--best-metric-mode", choices=("min", "max"), default=None)
-    parser.add_argument("--lr", type=float, default=2.0e-4)
-    parser.add_argument("--weight-decay", type=float, default=1.0e-5)
-    parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--weight-decay", type=float, default=None)
+    parser.add_argument("--grad-clip", type=float, default=None)
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--max-skipped-optimizer-steps", type=int, default=5)
+    parser.add_argument("--max-skipped-optimizer-steps", type=int, default=None)
     parser.add_argument("--train-projector", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--train-model-prefixes", default=None)
     parser.add_argument("--train-pose-feature-adapter", action=argparse.BooleanOptionalAction, default=True)
@@ -232,6 +235,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--score-anti-identity-min-gap-m", type=float, default=None)
     parser.add_argument("--score-anti-identity-logit-margin", type=float, default=None)
     parser.add_argument("--score-anti-identity-index", type=int, default=None)
+    parser.add_argument("--observability-contrast-weight", type=float, default=None)
+    parser.add_argument("--observability-contrast-margin", type=float, default=None)
+    parser.add_argument("--observability-negative-min-cost-m", type=float, default=None)
+    parser.add_argument("--candidate-observability-weight", type=float, default=None)
+    parser.add_argument("--candidate-observability-margin", type=float, default=None)
+    parser.add_argument("--candidate-observability-min-cost-gap-m", type=float, default=None)
+    parser.add_argument(
+        "--observability-contrast-score-source",
+        choices=("dense", "selection_score"),
+        default=None,
+    )
     parser.add_argument("--candidate-teacher-quality-weight", type=float, default=None)
     parser.add_argument("--candidate-teacher-quality-target-mode", default=None)
     parser.add_argument("--candidate-teacher-quality-temperature", type=float, default=None)
@@ -297,6 +311,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pose-energy-confidence-temperature-m", type=float, default=None)
     parser.add_argument("--pose-energy-selection-confidence-weight", type=float, default=None)
     parser.add_argument("--pose-energy-selection-residual-norm-weight", type=float, default=None)
+    parser.add_argument("--pose-energy-base-score-prior-weight", type=float, default=None)
+    parser.add_argument(
+        "--pose-energy-base-score-prior-mode",
+        choices=("raw", "centered", "zscore"),
+        default=None,
+    )
     parser.add_argument("--pose-energy-zero-init-heads", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--pose-energy-zero-init-residual-head", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--pose-energy-score-preprocess", default=None)
@@ -353,6 +373,24 @@ def parse_args() -> argparse.Namespace:
 def apply_config_defaults(args: argparse.Namespace, cfg: Dict) -> argparse.Namespace:
     cli_values = dict(vars(args))
     args = apply_pose_energy_defaults(args, cfg)
+    train_cfg = dict(cfg.get("training", {}) or {})
+    training_defaults = {
+        "batch_size": 8,
+        "num_workers": 0,
+        "eval_max_samples": 64,
+        "max_steps": 500,
+        "eval_every": 50,
+        "save_every": 250,
+        "lr": 2.0e-4,
+        "weight_decay": 1.0e-5,
+        "grad_clip": 1.0,
+        "max_skipped_optimizer_steps": 5,
+    }
+    for key, fallback in training_defaults.items():
+        if cli_values.get(key, None) is not None:
+            continue
+        if getattr(args, key, None) is None:
+            setattr(args, key, train_cfg.get(key, fallback))
     nvs_cfg = dict(cfg.get("nvs_pose_feature_adapter", {}) or {})
     defaults = {
         "rank_temperature_m": 0.05,
@@ -370,6 +408,13 @@ def apply_config_defaults(args: argparse.Namespace, cfg: Dict) -> argparse.Names
         "score_anti_identity_min_gap_m": 0.03,
         "score_anti_identity_logit_margin": 0.5,
         "score_anti_identity_index": 0,
+        "observability_contrast_weight": 0.0,
+        "observability_contrast_margin": 0.05,
+        "observability_negative_min_cost_m": 0.05,
+        "candidate_observability_weight": 0.0,
+        "candidate_observability_margin": 0.05,
+        "candidate_observability_min_cost_gap_m": 0.05,
+        "observability_contrast_score_source": "dense",
         "candidate_teacher_quality_weight": 0.0,
         "candidate_teacher_quality_target_mode": "pnp_composite",
         "candidate_teacher_quality_temperature": 0.5,
@@ -436,6 +481,8 @@ def apply_config_defaults(args: argparse.Namespace, cfg: Dict) -> argparse.Names
         "pose_energy_confidence_temperature_m": None,
         "pose_energy_selection_confidence_weight": 0.0,
         "pose_energy_selection_residual_norm_weight": 0.0,
+        "pose_energy_base_score_prior_weight": 0.0,
+        "pose_energy_base_score_prior_mode": "zscore",
         "pose_energy_zero_init_heads": False,
         "pose_energy_zero_init_residual_head": True,
         "pose_energy_score_preprocess": "spatial_center",
@@ -480,6 +527,7 @@ def apply_config_defaults(args: argparse.Namespace, cfg: Dict) -> argparse.Names
         "train_pose_feature_adapter_domains": "all",
         "train_pose_energy_net": True,
         "train_pair_matcher": True,
+        "resume_adapter_strict": True,
         "pose_feature_adapter_enabled": True,
         "pose_feature_adapter_hidden_dim": 96,
         "pose_feature_adapter_residual_scale": 0.2,
@@ -494,6 +542,7 @@ def apply_config_defaults(args: argparse.Namespace, cfg: Dict) -> argparse.Names
         "pose_feature_adapter_texture_branch_zero_init": True,
         "pose_feature_adapter_texture_fusion_mode": "residual",
         "pose_feature_adapter_base_anchor_weight": 1.0,
+        "pose_observability_diagnostic_enabled": False,
         "pair_matcher_enabled": False,
         "pair_matcher_weight": 0.0,
         "pair_matcher_hidden_dim": 64,
@@ -702,6 +751,83 @@ def project_render_bank(
     return render_loc.reshape(bsz, num_candidates, channels, height, width)
 
 
+def _first_candidate_tensor(tensor: torch.Tensor | None) -> torch.Tensor | None:
+    if tensor is None:
+        return None
+    if tensor.ndim == 5:
+        return tensor[:, 0]
+    if tensor.ndim == 4 and tensor.shape[1] == 1:
+        return tensor[:, 0]
+    return tensor
+
+
+def pose_observability_diagnostic_metrics(
+    query_feature: torch.Tensor,
+    map_feature: torch.Tensor,
+    depth: torch.Tensor | None,
+    intrinsics: torch.Tensor | None,
+    *,
+    mask: torch.Tensor | None = None,
+) -> Dict[str, torch.Tensor]:
+    zero = query_feature.new_zeros(())
+    metrics = {
+        "query_pose_obs_logdet": zero,
+        "query_pose_obs_trace": zero,
+        "query_pose_obs_trace_inv": zero,
+        "query_pose_obs_condition": zero,
+        "query_pose_obs_valid_frac": zero,
+        "map_pose_obs_logdet": zero,
+        "map_pose_obs_trace": zero,
+        "map_pose_obs_trace_inv": zero,
+        "map_pose_obs_condition": zero,
+        "map_pose_obs_valid_frac": zero,
+        "query_pose_obs_unit_logdet": zero,
+        "query_pose_obs_unit_trace": zero,
+        "query_pose_obs_unit_trace_inv": zero,
+        "query_pose_obs_unit_condition": zero,
+        "map_pose_obs_unit_logdet": zero,
+        "map_pose_obs_unit_trace": zero,
+        "map_pose_obs_unit_trace_inv": zero,
+        "map_pose_obs_unit_condition": zero,
+        "pose_obs_diagnostic_missing": query_feature.new_ones(()),
+    }
+    if depth is None or intrinsics is None:
+        return metrics
+    map_feature = _first_candidate_tensor(map_feature)
+    depth = _first_candidate_tensor(depth)
+    mask = _first_candidate_tensor(mask)
+    query_stats = feature_pose_fisher_stats(query_feature.detach().float(), depth.detach().float(), intrinsics, mask=mask)
+    map_stats = feature_pose_fisher_stats(map_feature.detach().float(), depth.detach().float(), intrinsics, mask=mask)
+    query_unit_stats = feature_pose_fisher_stats(
+        query_feature.detach().float(),
+        depth.detach().float(),
+        intrinsics,
+        mask=mask,
+        normalize_channels=True,
+    )
+    map_unit_stats = feature_pose_fisher_stats(
+        map_feature.detach().float(),
+        depth.detach().float(),
+        intrinsics,
+        mask=mask,
+        normalize_channels=True,
+    )
+    for key, value in query_stats.items():
+        metrics[f"query_pose_obs_{key}"] = value.to(device=query_feature.device, dtype=query_feature.dtype)
+    for key, value in map_stats.items():
+        metrics[f"map_pose_obs_{key}"] = value.to(device=query_feature.device, dtype=query_feature.dtype)
+    for key, value in query_unit_stats.items():
+        if key == "valid_frac":
+            continue
+        metrics[f"query_pose_obs_unit_{key}"] = value.to(device=query_feature.device, dtype=query_feature.dtype)
+    for key, value in map_unit_stats.items():
+        if key == "valid_frac":
+            continue
+        metrics[f"map_pose_obs_unit_{key}"] = value.to(device=query_feature.device, dtype=query_feature.dtype)
+    metrics["pose_obs_diagnostic_missing"] = zero
+    return metrics
+
+
 def _direction_fractions(args: argparse.Namespace) -> List[float]:
     raw = getattr(args, "direction_fractions", None)
     if raw is None:
@@ -889,6 +1015,228 @@ def masked_dense_alignment_loss(
     cosine = masked_dense_cosine(query_feature, render_feature, mask=mask)
     loss = F.relu(float(margin) + 1.0 - cosine).mean()
     return loss, cosine.mean()
+
+
+def observability_contrast_loss(
+    query_feature: torch.Tensor,
+    gt_render_feature: torch.Tensor,
+    candidate_render_feature: torch.Tensor,
+    pose_cost: torch.Tensor,
+    valid_mask: torch.Tensor,
+    *,
+    gt_mask: torch.Tensor | None = None,
+    candidate_mask: torch.Tensor | None = None,
+    margin: float = 0.05,
+    min_negative_cost_m: float = 0.05,
+) -> Dict[str, torch.Tensor]:
+    """Surrogate pose-observability loss for localization features.
+
+    The GT render is the positive pose-energy sample.  Nearby but wrong
+    candidate renders are negatives.  This directly encourages the adapted
+    feature space to form a sharp local pose energy instead of merely matching
+    RADIO/DCFF teacher features in isolation.
+    """
+    if pose_cost.ndim != 2 or valid_mask.shape != pose_cost.shape:
+        raise ValueError("pose_cost and valid_mask must have shape (B,K)")
+    gt_score = masked_dense_cosine(query_feature, gt_render_feature, mask=gt_mask)
+    if gt_score.ndim == 2:
+        if gt_score.shape[1] != 1:
+            raise ValueError("gt_render_feature must contain exactly one positive render")
+        gt_score = gt_score[:, 0]
+    negative_scores = masked_dense_cosine(query_feature, candidate_render_feature, mask=candidate_mask)
+    return observability_score_contrast_loss(
+        gt_score,
+        negative_scores,
+        pose_cost,
+        valid_mask,
+        margin=margin,
+        min_negative_cost_m=min_negative_cost_m,
+    )
+
+
+def observability_score_contrast_loss(
+    gt_score: torch.Tensor,
+    negative_scores: torch.Tensor,
+    pose_cost: torch.Tensor,
+    valid_mask: torch.Tensor,
+    *,
+    margin: float = 0.05,
+    min_negative_cost_m: float = 0.05,
+) -> Dict[str, torch.Tensor]:
+    """Surrogate observability loss directly on candidate selection scores."""
+    if gt_score.ndim == 2:
+        if gt_score.shape[1] != 1:
+            raise ValueError("gt_score with shape (B,K) must have K=1")
+        gt_score = gt_score[:, 0]
+    if gt_score.ndim != 1:
+        raise ValueError("gt_score must have shape (B,) or (B,1)")
+    if negative_scores.ndim != 2:
+        raise ValueError("negative_scores must have shape (B,K)")
+    if negative_scores.shape != pose_cost.shape:
+        raise ValueError(
+            f"candidate scores shape {tuple(negative_scores.shape)} does not match pose cost {tuple(pose_cost.shape)}"
+        )
+    if gt_score.shape[0] != negative_scores.shape[0]:
+        raise ValueError("gt_score batch size must match negative_scores")
+    valid_negative = (
+        valid_mask.to(device=negative_scores.device).bool()
+        & torch.isfinite(pose_cost.to(device=negative_scores.device))
+        & (pose_cost.to(device=negative_scores.device, dtype=negative_scores.dtype) >= float(min_negative_cost_m))
+    )
+    masked_negatives = negative_scores.float().masked_fill(~valid_negative, -1.0e6)
+    hard_negative_score = masked_negatives.max(dim=1).values
+    has_negative = valid_negative.any(dim=1)
+    per_row = F.relu(float(margin) + hard_negative_score - gt_score.float())
+    if bool(has_negative.any()):
+        loss = per_row[has_negative].mean()
+        active = has_negative.float().mean()
+        hard_mean = hard_negative_score[has_negative].mean()
+        gap = (gt_score.float()[has_negative] - hard_negative_score[has_negative]).mean()
+    else:
+        loss = negative_scores.new_zeros(())
+        active = negative_scores.new_zeros(())
+        hard_mean = negative_scores.new_zeros(())
+        gap = negative_scores.new_zeros(())
+    return {
+        "loss": loss,
+        "active": active,
+        "gt_score": gt_score.float().mean().detach(),
+        "hard_negative_score": hard_mean.detach(),
+        "gap": gap.detach(),
+    }
+
+
+def candidate_observability_margin_loss(
+    candidate_scores: torch.Tensor,
+    pose_cost: torch.Tensor,
+    valid_mask: torch.Tensor,
+    *,
+    margin: float = 0.05,
+    min_cost_gap_m: float = 0.05,
+) -> Dict[str, torch.Tensor]:
+    """Hard candidate-internal pose-observability margin.
+
+    The positive is the best valid pose candidate in the local bank.  Negatives
+    are candidates that are clearly worse in GT pose cost.  This optimizes the
+    same score surface used at evaluation time, unlike the GT-render contrast
+    which can improve a side objective without improving topK reranking.
+    """
+    if candidate_scores.ndim != 2 or pose_cost.shape != candidate_scores.shape:
+        raise ValueError("candidate_scores and pose_cost must have shape (B,K)")
+    if valid_mask.shape != candidate_scores.shape:
+        raise ValueError("valid_mask must match candidate_scores")
+    valid = valid_mask.to(device=candidate_scores.device).bool() & torch.isfinite(pose_cost)
+    cost = pose_cost.to(device=candidate_scores.device, dtype=candidate_scores.dtype)
+    scores = candidate_scores.float().masked_fill(~valid, -1.0e6)
+    masked_cost = cost.masked_fill(~valid, float("inf"))
+    best_idx = masked_cost.argmin(dim=1)
+    batch_idx = torch.arange(candidate_scores.shape[0], device=candidate_scores.device)
+    best_cost = masked_cost[batch_idx, best_idx]
+    best_score = scores[batch_idx, best_idx]
+    hard_negative = valid & torch.isfinite(cost) & (cost >= best_cost[:, None] + float(min_cost_gap_m))
+    hard_scores = scores.masked_fill(~hard_negative, -1.0e6)
+    hard_score = hard_scores.max(dim=1).values
+    has_negative = hard_negative.any(dim=1)
+    per_row = F.relu(float(margin) + hard_score - best_score)
+    if bool(has_negative.any()):
+        loss = per_row[has_negative].mean()
+        active = has_negative.float().mean()
+        gap = (best_score[has_negative] - hard_score[has_negative]).mean()
+        hard_mean = hard_score[has_negative].mean()
+    else:
+        loss = candidate_scores.new_zeros(())
+        active = candidate_scores.new_zeros(())
+        gap = candidate_scores.new_zeros(())
+        hard_mean = candidate_scores.new_zeros(())
+    return {
+        "loss": loss,
+        "active": active,
+        "gap": gap.detach(),
+        "best_score": best_score.detach().mean(),
+        "hard_negative_score": hard_mean.detach(),
+        "best_index": best_idx.detach(),
+    }
+
+
+def pose_threshold_success_metrics(
+    trans_err_m: torch.Tensor,
+    rot_err_rad: torch.Tensor,
+    *,
+    prefix: str = "",
+) -> Dict[str, torch.Tensor]:
+    """Return CPR-style success fractions for common local-refinement thresholds."""
+    trans = trans_err_m.float()
+    rot_deg = rot_err_rad.float() * (180.0 / math.pi)
+    if trans.shape != rot_deg.shape:
+        raise ValueError("translation and rotation error tensors must have the same shape")
+    return {
+        f"{prefix}success_5cm_2deg": ((trans <= 0.05) & (rot_deg <= 2.0)).float().mean(),
+        f"{prefix}success_10cm_5deg": ((trans <= 0.10) & (rot_deg <= 5.0)).float().mean(),
+        f"{prefix}success_25cm_10deg": ((trans <= 0.25) & (rot_deg <= 10.0)).float().mean(),
+        f"{prefix}success_50cm_10deg": ((trans <= 0.50) & (rot_deg <= 10.0)).float().mean(),
+    }
+
+
+def selected_candidate_pose_metrics(
+    pose_cost: torch.Tensor,
+    trans_err: torch.Tensor,
+    rot_err: torch.Tensor,
+    oracle_cost: torch.Tensor,
+    selected_idx: torch.Tensor,
+) -> Dict[str, torch.Tensor]:
+    """Gather pose metrics for the candidate chosen by the active selector."""
+    if pose_cost.ndim != 2:
+        raise ValueError("pose_cost must have shape (B,K)")
+    if trans_err.shape != pose_cost.shape or rot_err.shape != pose_cost.shape:
+        raise ValueError("trans_err and rot_err must match pose_cost shape")
+    if oracle_cost.ndim != 1 or oracle_cost.shape[0] != pose_cost.shape[0]:
+        raise ValueError("oracle_cost must have shape (B,)")
+    if selected_idx.ndim != 1 or selected_idx.shape[0] != pose_cost.shape[0]:
+        raise ValueError("selected_idx must have shape (B,)")
+    gather_idx = selected_idx.to(device=pose_cost.device, dtype=torch.long)[:, None]
+    selected_cost = pose_cost.gather(1, gather_idx).squeeze(1)
+    selected_trans = trans_err.gather(1, gather_idx).squeeze(1)
+    selected_rot = rot_err.gather(1, gather_idx).squeeze(1)
+    return {
+        "selected_cost": selected_cost,
+        "selected_trans": selected_trans,
+        "selected_rot": selected_rot,
+        "selected_oracle_gap": selected_cost - oracle_cost.to(device=pose_cost.device, dtype=pose_cost.dtype),
+    }
+
+
+def pose_energy_logits_with_base_prior(
+    logits: torch.Tensor,
+    base_scores: torch.Tensor,
+    valid_mask: torch.Tensor | None,
+    *,
+    weight: float,
+    mode: str = "zscore",
+) -> torch.Tensor:
+    """Add a frozen candidate-score prior so PoseEnergyNet learns a residual ranker."""
+    if logits.shape != base_scores.shape:
+        raise ValueError("logits and base_scores must have the same shape")
+    valid = torch.ones_like(logits, dtype=torch.bool) if valid_mask is None else valid_mask.to(device=logits.device).bool()
+    if valid.shape != logits.shape:
+        raise ValueError("valid_mask must match logits shape")
+    base = base_scores.to(device=logits.device, dtype=logits.dtype).detach()
+    base = torch.where(valid, base, torch.zeros_like(base))
+    mode_key = str(mode or "zscore").lower()
+    if mode_key == "raw":
+        prior = base
+    else:
+        count = valid.to(dtype=base.dtype).sum(dim=1, keepdim=True).clamp(min=1.0)
+        mean = (base * valid.to(dtype=base.dtype)).sum(dim=1, keepdim=True) / count
+        centered = torch.where(valid, base - mean, torch.zeros_like(base))
+        if mode_key == "centered":
+            prior = centered
+        elif mode_key == "zscore":
+            var = (centered.square() * valid.to(dtype=base.dtype)).sum(dim=1, keepdim=True) / count
+            prior = centered / var.clamp(min=1.0e-6).sqrt()
+        else:
+            raise ValueError(f"Unknown pose energy base prior mode: {mode}")
+    combined = logits.float() + float(weight) * prior.float()
+    return combined.masked_fill(~valid, -1.0e6).to(dtype=logits.dtype)
 
 
 def _candidate_feature_to_hw(feature: torch.Tensor, hw: tuple[int, int]) -> torch.Tensor:
@@ -2576,7 +2924,7 @@ def forward_batch(
         valid_mask=cand_valid,
         rot_cost_weight=float(args.rot_cost_weight),
     )
-    init_pose_cost, _init_residual, _init_trans, _init_rot = pose_costs_and_residual_targets(
+    init_pose_cost, _init_residual, init_trans, init_rot = pose_costs_and_residual_targets(
         init_pose[:, None].float(),
         pose_gt.float(),
         rot_cost_weight=float(args.rot_cost_weight),
@@ -2660,6 +3008,67 @@ def forward_batch(
             min_gap_m=float(args.score_anti_identity_min_gap_m),
             logit_margin=float(args.score_anti_identity_logit_margin),
         )
+    candidate_observability = {
+        "loss": query_loc.new_zeros(()),
+        "active": query_loc.new_zeros(()),
+        "gap": query_loc.new_zeros(()),
+        "best_score": query_loc.new_zeros(()),
+        "hard_negative_score": query_loc.new_zeros(()),
+    }
+    if float(args.candidate_observability_weight) > 0.0:
+        candidate_observability = candidate_observability_margin_loss(
+            cand_scores,
+            pose_cost.detach(),
+            cand_valid,
+            margin=float(args.candidate_observability_margin),
+            min_cost_gap_m=float(args.candidate_observability_min_cost_gap_m),
+        )
+    observability = {
+        "loss": query_loc.new_zeros(()),
+        "active": query_loc.new_zeros(()),
+        "gt_score": query_loc.new_zeros(()),
+        "hard_negative_score": query_loc.new_zeros(()),
+        "gap": query_loc.new_zeros(()),
+    }
+    if float(args.observability_contrast_weight) > 0.0:
+        obs_source = str(getattr(args, "observability_contrast_score_source", "dense") or "dense").lower()
+        if obs_source == "selection_score" and score_mode == "pair_matcher_local":
+            if pair_matcher is None:
+                raise ValueError("selection_score observability with pair_matcher_local requires pair_matcher")
+            gt_scores, _gt_local_stats = pair_matcher_local_candidate_scores(
+                pair_matcher,
+                query_loc,
+                gt_render_loc,
+                mask=gt_mask,
+                radius=int(args.pair_matcher_radius),
+                stride=int(args.pair_matcher_score_stride),
+                temperature=float(args.pair_matcher_temperature),
+                chunk_points=int(args.pair_matcher_score_chunk_points),
+                candidate_chunk_size=1,
+                candidate_score_mode=str(args.pair_matcher_candidate_score_mode),
+            )
+            observability = observability_score_contrast_loss(
+                gt_scores,
+                cand_scores,
+                pose_cost.detach(),
+                cand_valid,
+                margin=float(args.observability_contrast_margin),
+                min_negative_cost_m=float(args.observability_negative_min_cost_m),
+            )
+        elif obs_source == "dense":
+            observability = observability_contrast_loss(
+                query_loc,
+                gt_render_loc,
+                cand_render_loc,
+                pose_cost.detach(),
+                cand_valid,
+                gt_mask=gt_mask,
+                candidate_mask=cand_mask,
+                margin=float(args.observability_contrast_margin),
+                min_negative_cost_m=float(args.observability_negative_min_cost_m),
+            )
+        else:
+            raise ValueError(f"Unsupported observability_contrast_score_source={obs_source!r} for score_mode={score_mode!r}")
     energy_loss = query_loc.new_zeros(())
     pose_energy_metrics = {
         "pose_energy_loss": energy_loss.detach(),
@@ -2708,11 +3117,13 @@ def forward_batch(
     energy_pred_idx = None
     if energy_net is not None and bool(args.pose_energy_enabled):
         score_source = str(getattr(args, "pose_energy_score_source", "local_corr") or "local_corr").lower()
+        use_score_prior = float(getattr(args, "pose_energy_base_score_prior_weight", 0.0) or 0.0) > 0.0
         feature_pack = fine_candidate_selector_features(
             query_loc,
             cand_render_loc,
             candidate_pose,
             init_pose=init_pose,
+            coarse_logits=cand_scores.detach() if use_score_prior else None,
             query_rgb=batch.get("rgb"),
             candidate_rgb=cand_rgb,
             depth=cand_depth,
@@ -2724,7 +3135,7 @@ def forward_batch(
             highpass_kernel=int(args.pose_energy_score_highpass_kernel),
             score_map_mode=str(args.pose_energy_score_map_mode),
             return_score_maps=True,
-            use_coarse_logits=False,
+            use_coarse_logits=use_score_prior,
             use_candidate_delta=bool(args.pose_energy_use_candidate_delta),
             use_delta_vector=bool(args.pose_energy_use_delta_vector),
             use_center_delta_vector=bool(args.pose_energy_use_center_delta_vector),
@@ -2759,6 +3170,19 @@ def forward_batch(
             feature_pack["features"],
             valid_mask=feature_pack["valid"],
         )
+        base_prior_weight = float(getattr(args, "pose_energy_base_score_prior_weight", 0.0) or 0.0)
+        if base_prior_weight != 0.0:
+            energy_out = dict(energy_out)
+            combined_logits = pose_energy_logits_with_base_prior(
+                energy_out["energy_logits"],
+                cand_scores.detach(),
+                feature_pack["valid"],
+                weight=base_prior_weight,
+                mode=str(getattr(args, "pose_energy_base_score_prior_mode", "zscore") or "zscore"),
+            )
+            energy_out["energy_logits"] = combined_logits
+            if "joint_energy_logits" in energy_out:
+                energy_out["joint_energy_logits"] = combined_logits
         energy_pack = pose_energy_losses(
             energy_out,
             candidate_pose,
@@ -3026,19 +3450,30 @@ def forward_batch(
         + float(args.score_pose_improvement_weight) * score_pose_improvement["loss"]
         + candidate_teacher_quality_weight * candidate_teacher_quality["loss"]
         + float(args.score_anti_identity_weight) * score_anti_identity["loss"]
+        + float(args.candidate_observability_weight) * candidate_observability["loss"]
+        + float(args.observability_contrast_weight) * observability["loss"]
         + float(args.pose_energy_weight) * energy_loss
         + float(args.drift_weight) * drift
         + float(args.variance_weight) * var_loss
     )
     pred_idx = energy_pred_idx if bool(args.pose_energy_select_for_metric) and energy_pred_idx is not None else rank["pred_index"].long()
     batch_idx = torch.arange(pose_gt.shape[0], device=device)
-    pred_trans = trans_err[batch_idx, pred_idx]
-    pred_rot = rot_err[batch_idx, pred_idx]
     rank_pred_idx = rank["pred_index"].long()
     rank_target_idx = rank["target_index"].long()
+    selected_metrics = selected_candidate_pose_metrics(
+        pose_cost,
+        trans_err,
+        rot_err,
+        rank["oracle_cost"].detach(),
+        pred_idx.long(),
+    )
+    pred_trans = selected_metrics["selected_trans"]
+    pred_rot = selected_metrics["selected_rot"]
+    oracle_trans = trans_err[batch_idx, rank_target_idx]
+    oracle_rot = rot_err[batch_idx, rank_target_idx]
     identity_idx = int(args.score_anti_identity_index)
     if bool(identity_mask.any()):
-        selected_identity_frac = identity_mask.gather(1, rank_pred_idx[:, None]).squeeze(1).float().mean()
+        selected_identity_frac = identity_mask.gather(1, pred_idx.long()[:, None]).squeeze(1).float().mean()
         oracle_identity_frac = identity_mask.gather(1, rank_target_idx[:, None]).squeeze(1).float().mean()
     else:
         selected_identity_frac = query_loc.new_zeros(())
@@ -3051,6 +3486,33 @@ def forward_batch(
         good_m=float(args.auc_good_m),
         bad_m=float(args.auc_bad_m),
     )
+    pose_obs_metrics = pose_observability_diagnostic_metrics(
+        query_loc,
+        gt_render_loc,
+        gt_depth,
+        target_intrinsics,
+        mask=gt_mask,
+    ) if bool(args.pose_observability_diagnostic_enabled) else {
+        "query_pose_obs_logdet": query_loc.new_zeros(()),
+        "query_pose_obs_trace": query_loc.new_zeros(()),
+        "query_pose_obs_trace_inv": query_loc.new_zeros(()),
+        "query_pose_obs_condition": query_loc.new_zeros(()),
+        "query_pose_obs_valid_frac": query_loc.new_zeros(()),
+        "map_pose_obs_logdet": query_loc.new_zeros(()),
+        "map_pose_obs_trace": query_loc.new_zeros(()),
+        "map_pose_obs_trace_inv": query_loc.new_zeros(()),
+        "map_pose_obs_condition": query_loc.new_zeros(()),
+        "map_pose_obs_valid_frac": query_loc.new_zeros(()),
+        "query_pose_obs_unit_logdet": query_loc.new_zeros(()),
+        "query_pose_obs_unit_trace": query_loc.new_zeros(()),
+        "query_pose_obs_unit_trace_inv": query_loc.new_zeros(()),
+        "query_pose_obs_unit_condition": query_loc.new_zeros(()),
+        "map_pose_obs_unit_logdet": query_loc.new_zeros(()),
+        "map_pose_obs_unit_trace": query_loc.new_zeros(()),
+        "map_pose_obs_unit_trace_inv": query_loc.new_zeros(()),
+        "map_pose_obs_unit_condition": query_loc.new_zeros(()),
+        "pose_obs_diagnostic_missing": query_loc.new_ones(()),
+    }
     metrics = {
         "loss": loss.detach(),
         "align_loss": align_loss.detach(),
@@ -3094,24 +3556,48 @@ def forward_batch(
         "score_anti_identity_loss": score_anti_identity["loss"].detach(),
         "score_anti_identity_active": score_anti_identity["active"].detach(),
         "score_anti_identity_better_margin": score_anti_identity["better_margin"].detach(),
+        "candidate_observability_loss": candidate_observability["loss"].detach(),
+        "candidate_observability_active": candidate_observability["active"].detach(),
+        "candidate_observability_gap": candidate_observability["gap"].detach(),
+        "candidate_observability_best_score": candidate_observability["best_score"].detach(),
+        "candidate_observability_hard_negative_score": candidate_observability["hard_negative_score"].detach(),
         "selected_identity_frac": selected_identity_frac.detach(),
         "oracle_identity_frac": oracle_identity_frac.detach(),
         "candidate_identity_frac": identity_mask.float().mean().detach(),
+        "observability_contrast_loss": observability["loss"].detach(),
+        "observability_active": observability["active"].detach(),
+        "observability_gt_score": observability["gt_score"].detach(),
+        "observability_hard_negative_score": observability["hard_negative_score"].detach(),
+        "observability_gap": observability["gap"].detach(),
         "drift_loss": drift.detach(),
         "variance_loss": var_loss.detach(),
-        "top1_acc": rank["top1_acc"].detach(),
+        "rank_top1_acc": rank["top1_acc"].detach(),
+        "top1_acc": (pred_idx.long() == rank_target_idx).float().mean().detach(),
         "spearman": spearman.detach(),
         "good_bad_auc": auc.detach(),
-        "pred_cost_m": rank["pred_cost"].detach().mean(),
+        "rank_pred_cost_m": rank["pred_cost"].detach().mean(),
+        "pred_cost_m": selected_metrics["selected_cost"].detach().mean(),
         "oracle_cost_m": rank["oracle_cost"].detach().mean(),
-        "oracle_gap_m": rank["oracle_gap"].detach().mean(),
+        "rank_oracle_gap_m": rank["oracle_gap"].detach().mean(),
+        "oracle_gap_m": selected_metrics["selected_oracle_gap"].detach().mean(),
         "pred_trans_m": pred_trans.detach().mean(),
         "pred_rot_deg": (pred_rot.detach().mean() * (180.0 / math.pi)),
-        "selected_correction_cos": correction_cos[batch_idx, rank_pred_idx].detach().mean(),
+        **{key: value.detach() for key, value in pose_threshold_success_metrics(pred_trans, pred_rot, prefix="pred_").items()},
+        **{
+            key: value.detach()
+            for key, value in pose_threshold_success_metrics(oracle_trans, oracle_rot, prefix="oracle_").items()
+        },
+        **{
+            key: value.detach()
+            for key, value in pose_threshold_success_metrics(init_trans[:, 0], init_rot[:, 0], prefix="init_").items()
+        },
+        "rank_selected_correction_cos": correction_cos[batch_idx, rank_pred_idx].detach().mean(),
+        "selected_correction_cos": correction_cos[batch_idx, pred_idx.long()].detach().mean(),
         "oracle_correction_cos": correction_cos[batch_idx, rank_target_idx].detach().mean(),
         "candidate_score_mean": cand_scores.detach().mean(),
         "candidate_score_std": cand_scores.detach().std(),
         "synthetic_fraction": synthetic_mask.float().mean().detach(),
+        **{key: value.detach() for key, value in pose_obs_metrics.items()},
     }
     metrics.update(pose_energy_metrics)
     return loss, metrics
@@ -3276,10 +3762,21 @@ def save_checkpoint(
     )
 
 
-def load_adapter_checkpoint(path: str, adapter, model=None, optimizer=None, energy_net=None, pair_matcher=None) -> Dict:
+def load_adapter_checkpoint(
+    path: str,
+    adapter,
+    model=None,
+    optimizer=None,
+    energy_net=None,
+    pair_matcher=None,
+    *,
+    strict_adapter: bool = True,
+) -> Dict:
     checkpoint = torch.load(path, map_location="cpu")
     adapter_state = checkpoint.get("pose_feature_adapter_state_dict", checkpoint)
-    adapter.load_state_dict(adapter_state, strict=True)
+    adapter_load = adapter.load_state_dict(adapter_state, strict=bool(strict_adapter))
+    checkpoint["missing_adapter_keys"] = list(adapter_load.missing_keys)
+    checkpoint["unexpected_adapter_keys"] = list(adapter_load.unexpected_keys)
     query_state = checkpoint.get("query_model_state_dict") or checkpoint.get("query_projector_state_dict") or {}
     if model is not None and query_state:
         model.load_state_dict(query_state, strict=False)
@@ -3374,8 +3871,16 @@ def main() -> None:
             optimizer=None,
             energy_net=energy_net,
             pair_matcher=pair_matcher,
+            strict_adapter=bool(args.resume_adapter_strict),
         )
         print(f"loaded adapter checkpoint: {args.resume_adapter} step={loaded.get('step', 'unknown')}", flush=True)
+        if loaded.get("missing_adapter_keys") or loaded.get("unexpected_adapter_keys"):
+            print(
+                "adapter checkpoint loaded non-strict: "
+                f"missing={loaded.get('missing_adapter_keys', [])} "
+                f"unexpected={loaded.get('unexpected_adapter_keys', [])}",
+                flush=True,
+            )
 
     if args.eval_only:
         metrics = evaluate(model, adapter, energy_net, pair_matcher, eval_loader, map_renderer, cfg, args)

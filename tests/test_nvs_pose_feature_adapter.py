@@ -16,6 +16,7 @@ from feature_extract.tools.train_nvs_pose_feature_adapter import (
     effective_candidate_teacher_quality_weight,
     collect_trainable_parameters,
     pose_energy_factorized_selection_metrics,
+    pose_energy_logits_with_base_prior,
     local_flow_nce_loss,
     pair_matcher_local_candidate_score_maps,
     pair_matcher_local_candidate_scores,
@@ -31,6 +32,11 @@ from feature_extract.tools.train_nvs_pose_feature_adapter import (
     score_pose_improvement_soft_label_loss,
     nvs_teacher_correspondence_loss,
     nvs_teacher_pair_match_loss,
+    observability_contrast_loss,
+    candidate_observability_margin_loss,
+    observability_score_contrast_loss,
+    pose_threshold_success_metrics,
+    selected_candidate_pose_metrics,
     pose_energy_direction_pairwise_loss,
     pose_energy_score_monotonicity_loss,
     project_world_positions_to_feature_grid,
@@ -91,6 +97,49 @@ def test_pose_energy_factorized_selection_metrics_reports_composed_pose_cost():
     assert metrics["factorized_pred_cost_m"].item() < 1.0e-3
 
 
+def test_pose_energy_logits_with_base_prior_preserves_rank_prior_with_zero_residual():
+    logits = torch.zeros(1, 3)
+    base_scores = torch.tensor([[0.1, 0.9, 0.2]])
+    valid = torch.tensor([[True, True, False]])
+
+    combined = pose_energy_logits_with_base_prior(
+        logits,
+        base_scores,
+        valid,
+        weight=1.0,
+        mode="zscore",
+    )
+
+    assert combined[0, 1] > combined[0, 0]
+    assert combined[0, 2] < -1.0e5
+
+
+def test_load_adapter_checkpoint_can_extend_with_new_uncertainty_heads(tmp_path):
+    old_adapter = PoseFeatureDomainAdapter(channels=4, uncertainty_enabled=False)
+    checkpoint_path = tmp_path / "adapter.pth"
+    torch.save({"pose_feature_adapter_state_dict": old_adapter.state_dict()}, checkpoint_path)
+    new_adapter = PoseFeatureDomainAdapter(channels=4, uncertainty_enabled=True)
+
+    info = load_adapter_checkpoint(checkpoint_path, new_adapter, strict_adapter=False)
+
+    assert "missing_adapter_keys" in info
+    assert any(key.startswith("query_uncertainty.") for key in info["missing_adapter_keys"])
+    assert any(key.startswith("render_uncertainty.") for key in info["missing_adapter_keys"])
+
+
+def test_load_adapter_checkpoint_can_drop_old_uncertainty_heads(tmp_path):
+    old_adapter = PoseFeatureDomainAdapter(channels=4, uncertainty_enabled=True)
+    checkpoint_path = tmp_path / "adapter_with_uncertainty.pth"
+    torch.save({"pose_feature_adapter_state_dict": old_adapter.state_dict()}, checkpoint_path)
+    new_adapter = PoseFeatureDomainAdapter(channels=4, uncertainty_enabled=False)
+
+    info = load_adapter_checkpoint(checkpoint_path, new_adapter, strict_adapter=False)
+
+    assert "unexpected_adapter_keys" in info
+    assert any(key.startswith("query_uncertainty.") for key in info["unexpected_adapter_keys"])
+    assert any(key.startswith("render_uncertainty.") for key in info["unexpected_adapter_keys"])
+
+
 def test_masked_dense_cosine_prefers_matching_candidate():
     query = torch.zeros(1, 2, 3, 3)
     query[:, 0] = 1.0
@@ -111,6 +160,139 @@ def test_alignment_loss_is_lower_for_identical_features():
 
     assert same_loss < diff_loss
     assert same_cos > diff_cos
+
+
+def test_observability_contrast_loss_prefers_gt_render_over_wrong_pose():
+    query = torch.zeros(1, 2, 2, 2)
+    query[:, 0] = 1.0
+    gt_render = query.clone()
+    bad_render = torch.zeros(1, 2, 2, 2, 2)
+    bad_render[:, 0, 1] = 1.0
+    bad_render[:, 1, 0] = 1.0
+    pose_cost = torch.tensor([[0.30, 0.02]])
+    valid = torch.ones_like(pose_cost, dtype=torch.bool)
+
+    good = observability_contrast_loss(
+        query,
+        gt_render,
+        bad_render,
+        pose_cost,
+        valid,
+        margin=0.05,
+        min_negative_cost_m=0.10,
+    )
+    bad = observability_contrast_loss(
+        -query,
+        gt_render,
+        bad_render,
+        pose_cost,
+        valid,
+        margin=0.05,
+        min_negative_cost_m=0.10,
+    )
+
+    assert good["active"].item() == 1.0
+    assert good["loss"] < bad["loss"]
+    assert good["gt_score"] > good["hard_negative_score"]
+    assert bad["gt_score"] < bad["hard_negative_score"]
+
+
+def test_observability_score_contrast_loss_uses_selector_scores_directly():
+    pose_cost = torch.tensor([[0.30, 0.02, 0.45]])
+    valid = torch.ones_like(pose_cost, dtype=torch.bool)
+    good = observability_score_contrast_loss(
+        torch.tensor([2.0]),
+        torch.tensor([[0.0, 3.0, 1.0]]),
+        pose_cost,
+        valid,
+        margin=0.1,
+        min_negative_cost_m=0.10,
+    )
+    bad = observability_score_contrast_loss(
+        torch.tensor([0.0]),
+        torch.tensor([[2.0, 3.0, 1.0]]),
+        pose_cost,
+        valid,
+        margin=0.1,
+        min_negative_cost_m=0.10,
+    )
+
+    assert good["loss"] < bad["loss"]
+    assert good["hard_negative_score"].item() == 1.0
+    assert good["gap"].item() == 1.0
+
+
+def test_observability_score_contrast_loss_handles_rows_without_hard_negatives():
+    out = observability_score_contrast_loss(
+        torch.tensor([1.0]),
+        torch.tensor([[0.0, 0.5]]),
+        torch.tensor([[0.01, 0.02]]),
+        torch.ones(1, 2, dtype=torch.bool),
+        margin=0.1,
+        min_negative_cost_m=0.10,
+    )
+
+    assert out["active"].item() == 0.0
+    assert out["loss"].item() == 0.0
+
+
+def test_candidate_observability_margin_loss_separates_best_candidate_from_hard_negatives():
+    scores_good = torch.tensor([[3.0, 1.0, 0.0]])
+    scores_bad = torch.tensor([[0.0, 3.0, 1.0]])
+    pose_cost = torch.tensor([[0.04, 0.30, 0.08]])
+    valid = torch.ones_like(pose_cost, dtype=torch.bool)
+
+    good = candidate_observability_margin_loss(
+        scores_good,
+        pose_cost,
+        valid,
+        margin=0.1,
+        min_cost_gap_m=0.10,
+    )
+    bad = candidate_observability_margin_loss(
+        scores_bad,
+        pose_cost,
+        valid,
+        margin=0.1,
+        min_cost_gap_m=0.10,
+    )
+
+    assert good["active"].item() == 1.0
+    assert good["loss"] < bad["loss"]
+    assert good["gap"] > bad["gap"]
+
+
+def test_pose_threshold_success_metrics_reports_refinement_buckets():
+    trans_err = torch.tensor([0.04, 0.12, 0.30])
+    rot_err = torch.tensor([1.0, 4.0, 12.0]) * torch.pi / 180.0
+
+    metrics = pose_threshold_success_metrics(trans_err, rot_err, prefix="pred_")
+
+    assert torch.isclose(metrics["pred_success_5cm_2deg"], torch.tensor(1.0 / 3.0))
+    assert torch.isclose(metrics["pred_success_10cm_5deg"], torch.tensor(1.0 / 3.0))
+    assert torch.isclose(metrics["pred_success_25cm_10deg"], torch.tensor(2.0 / 3.0))
+    assert torch.isclose(metrics["pred_success_50cm_10deg"], torch.tensor(2.0 / 3.0))
+
+
+def test_selected_candidate_pose_metrics_follow_actual_selector_index():
+    pose_cost = torch.tensor([[0.10, 0.30], [0.40, 0.20]])
+    trans_err = torch.tensor([[0.09, 0.29], [0.39, 0.19]])
+    rot_err = torch.tensor([[0.01, 0.02], [0.03, 0.04]])
+    oracle_cost = torch.tensor([0.10, 0.20])
+    selected_idx = torch.tensor([1, 1])
+
+    metrics = selected_candidate_pose_metrics(
+        pose_cost,
+        trans_err,
+        rot_err,
+        oracle_cost,
+        selected_idx,
+    )
+
+    assert torch.allclose(metrics["selected_cost"], torch.tensor([0.30, 0.20]))
+    assert torch.allclose(metrics["selected_trans"], torch.tensor([0.29, 0.19]))
+    assert torch.allclose(metrics["selected_rot"], torch.tensor([0.02, 0.04]))
+    assert torch.allclose(metrics["selected_oracle_gap"], torch.tensor([0.20, 0.00]))
 
 
 def test_rank_losses_pick_lowest_pose_cost_when_score_matches():
@@ -631,6 +813,36 @@ def test_nvs_config_overrides_pose_energy_defaults_unless_cli_set():
     assert resolved.lattice_direction_mode == "axis"
 
 
+def test_nvs_config_enables_pose_observability_diagnostics():
+    args = type("Args", (), {})()
+
+    resolved = apply_config_defaults(
+        args,
+        {"nvs_pose_feature_adapter": {"pose_observability_diagnostic_enabled": True}},
+    )
+
+    assert resolved.pose_observability_diagnostic_enabled is True
+
+
+def test_nvs_parser_defers_training_defaults_to_config(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["prog", "--config", "config.yaml", "--checkpoint", "model.pth", "--out-dir", "out"],
+    )
+
+    args = parse_nvs_pose_feature_adapter_args()
+    resolved = apply_config_defaults(
+        args,
+        {"training": {"batch_size": 6, "max_steps": 7, "eval_every": 2, "save_every": 3}},
+    )
+
+    assert resolved.batch_size == 6
+    assert resolved.max_steps == 7
+    assert resolved.eval_every == 2
+    assert resolved.save_every == 3
+
+
 def test_variance_floor_loss_penalizes_collapse():
     collapsed = torch.ones(2, 4, 5, 5)
     varied = torch.randn(2, 4, 5, 5)
@@ -929,6 +1141,37 @@ def test_nvs_train_parser_accepts_score_correction_cosine_loss_args(monkeypatch)
     assert args.score_anti_identity_logit_margin == 0.4
     assert args.score_anti_identity_index == 2
     assert args.score_use_uncertainty is True
+
+
+def test_nvs_train_parser_accepts_pofd_observability_args(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train_nvs_pose_feature_adapter.py",
+            "--config",
+            "config.yaml",
+            "--checkpoint",
+            "checkpoint.pth",
+            "--out-dir",
+            "out",
+            "--observability-contrast-weight",
+            "1.5",
+            "--observability-contrast-margin",
+            "0.07",
+            "--observability-negative-min-cost-m",
+            "0.12",
+            "--observability-contrast-score-source",
+            "selection_score",
+        ],
+    )
+
+    args = parse_nvs_pose_feature_adapter_args()
+
+    assert args.observability_contrast_weight == 1.5
+    assert args.observability_contrast_margin == 0.07
+    assert args.observability_negative_min_cost_m == 0.12
+    assert args.observability_contrast_score_source == "selection_score"
 
 
 def test_eval_pose_energy_candidate_bank_can_use_bucket_adaptive_lattice():
