@@ -31,6 +31,15 @@ METRIC_COLUMNS = [
     "observability_gap",
     "nvs_pair_match_gap",
     "candidate_teacher_quality_top1_acc",
+    "selected_identity_frac",
+    "oracle_identity_frac",
+    "candidate_identity_frac",
+    "selected_delta_trans_m",
+    "selected_delta_rot_deg",
+    "oracle_delta_trans_m",
+    "oracle_delta_rot_deg",
+    "score_best_minus_score_identity",
+    "score_best_minus_score_selected",
 ]
 
 
@@ -52,6 +61,13 @@ DISPLAY_COLUMNS = [
     ("candidate_observability_gap", "cand_obs_gap"),
     ("observability_gap", "gt_obs_gap"),
     ("nvs_pair_match_gap", "pair_gap"),
+    ("selected_identity_frac", "sel_id"),
+    ("oracle_identity_frac", "orc_id"),
+    ("candidate_identity_frac", "cand_id"),
+    ("selected_delta_trans_m", "sel_dT"),
+    ("selected_delta_rot_deg", "sel_dR"),
+    ("score_best_minus_score_identity", "best-id"),
+    ("score_best_minus_score_selected", "best-sel"),
 ]
 
 

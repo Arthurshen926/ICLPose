@@ -52,6 +52,7 @@ from feature_extract.train_impl import (  # noqa: E402
     fine_candidate_selector_features,
     load_config,
     move_batch_to_device,
+    pose_error_tensors,
     sample_feature_at_xy,
     set_seed,
     sparse_teacher_correspondence_loss,
@@ -184,6 +185,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pair-matcher-score-stride", type=int, default=None)
     parser.add_argument("--pair-matcher-score-chunk-points", type=int, default=None)
     parser.add_argument("--pair-matcher-score-candidate-chunk-size", type=int, default=None)
+    parser.add_argument("--pair-matcher-score-offset-chunk-size", type=int, default=None)
     parser.add_argument(
         "--pair-matcher-candidate-score-mode",
         choices=("center_logprob_margin", "center_margin"),
@@ -264,6 +266,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--variance-min-std", type=float, default=None)
     parser.add_argument("--score-temperature", type=float, default=None)
     parser.add_argument("--score-use-uncertainty", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--score-feature-hw", default=None)
     parser.add_argument(
         "--score-mode",
         choices=(
@@ -281,6 +284,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--local-zero-peak-gap-weight", type=float, default=None)
     parser.add_argument("--local-zero-offset-weight", type=float, default=None)
     parser.add_argument("--local-flow-nce-weight", type=float, default=None)
+    parser.add_argument(
+        "--local-flow-nce-candidate-mode",
+        choices=("all", "best", "best_only", "best_and_hard_negative", "hard_negative", "hard"),
+        default=None,
+    )
+    parser.add_argument("--local-flow-nce-hard-negative-min-cost-gap-m", type=float, default=None)
     parser.add_argument("--teacher-corr-weight", type=float, default=None)
     parser.add_argument("--teacher-corr-temperature", type=float, default=None)
     parser.add_argument("--teacher-corr-min-confidence", type=float, default=None)
@@ -446,11 +455,14 @@ def apply_config_defaults(args: argparse.Namespace, cfg: Dict) -> argparse.Names
         "score_temperature": 0.1,
         "score_use_uncertainty": False,
         "score_mode": "same_pixel",
+        "score_feature_hw": None,
         "local_corr_radius": 3,
         "local_corr_temperature": 0.07,
         "local_zero_peak_gap_weight": 0.5,
         "local_zero_offset_weight": 0.05,
         "local_flow_nce_weight": 0.0,
+        "local_flow_nce_candidate_mode": "all",
+        "local_flow_nce_hard_negative_min_cost_gap_m": 0.10,
         "teacher_corr_weight": 0.0,
         "teacher_corr_temperature": 0.07,
         "teacher_corr_min_confidence": 0.0,
@@ -558,6 +570,7 @@ def apply_config_defaults(args: argparse.Namespace, cfg: Dict) -> argparse.Names
         "pair_matcher_score_stride": 8,
         "pair_matcher_score_chunk_points": 65536,
         "pair_matcher_score_candidate_chunk_size": 0,
+        "pair_matcher_score_offset_chunk_size": 0,
         "pair_matcher_candidate_score_mode": "center_logprob_margin",
         "synthetic_ratio": 0.5,
         "synthetic_trans_cm": 50.0,
@@ -588,6 +601,24 @@ def _csv_or_list(value) -> str:
 
 def parse_float_csv(value) -> List[float]:
     return [float(part) for part in _csv_or_list(value).split(",") if part.strip()]
+
+
+def parse_score_feature_hw(value) -> tuple[int, int] | None:
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        parts = [int(part) for part in value]
+    else:
+        raw = str(value).strip()
+        if not raw:
+            return None
+        parts = [int(part) for part in raw.replace("x", ",").split(",") if part.strip()]
+    if len(parts) != 2:
+        raise ValueError("score_feature_hw must be formatted as H,W")
+    height, width = int(parts[0]), int(parts[1])
+    if height <= 0 or width <= 0:
+        raise ValueError("score_feature_hw values must be positive")
+    return height, width
 
 
 def parse_str_csv(value) -> List[str]:
@@ -969,6 +1000,36 @@ def _resize_mask(mask: torch.Tensor | None, hw: tuple[int, int]) -> torch.Tensor
     return mask.float()
 
 
+def _resize_feature_bank(feature: torch.Tensor, hw: tuple[int, int]) -> torch.Tensor:
+    if tuple(feature.shape[-2:]) == tuple(hw):
+        return feature
+    if feature.ndim == 4:
+        return F.interpolate(feature.float(), size=hw, mode="bilinear", align_corners=False)
+    if feature.ndim == 5:
+        bsz, count, channels, height, width = feature.shape
+        flat = feature.reshape(bsz * count, channels, height, width)
+        flat = F.interpolate(flat.float(), size=hw, mode="bilinear", align_corners=False)
+        return flat.reshape(bsz, count, channels, *hw)
+    raise ValueError(f"feature must be 4D or 5D, got {tuple(feature.shape)}")
+
+
+def resize_score_candidate_tensors(
+    query_feature: torch.Tensor,
+    render_feature: torch.Tensor,
+    mask: torch.Tensor | None,
+    score_weight: torch.Tensor | None,
+    *,
+    score_hw: tuple[int, int] | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    """Resize candidate-side tensors for the pose scoring path only."""
+    if score_hw is None:
+        return query_feature, render_feature, mask, score_weight
+    render_feature = _resize_feature_bank(render_feature, score_hw)
+    mask = _resize_mask(mask, score_hw) if mask is not None else None
+    score_weight = _resize_mask(score_weight, score_hw) if score_weight is not None else None
+    return query_feature, render_feature, mask, score_weight
+
+
 def masked_dense_cosine(
     query_feature: torch.Tensor,
     render_feature: torch.Tensor,
@@ -1158,6 +1219,67 @@ def candidate_observability_margin_loss(
     }
 
 
+def hard_flow_candidate_selection_mask(
+    candidate_scores: torch.Tensor,
+    pose_cost: torch.Tensor,
+    valid_mask: torch.Tensor,
+    *,
+    mode: str = "best_and_hard_negative",
+    min_cost_gap_m: float = 0.10,
+) -> Dict[str, torch.Tensor]:
+    """Select candidates for geometry flow supervision.
+
+    `all` preserves the original behavior.  `best` only supervises the oracle
+    candidate.  `best_and_hard_negative` adds the currently high-score wrong
+    candidate whose GT pose cost is sufficiently worse than the oracle.
+    """
+    if candidate_scores.ndim != 2 or pose_cost.shape != candidate_scores.shape:
+        raise ValueError("candidate_scores and pose_cost must have shape (B,K)")
+    if valid_mask.shape != candidate_scores.shape:
+        raise ValueError("valid_mask must match candidate_scores")
+    mode = str(mode or "all").lower()
+    valid = valid_mask.to(device=candidate_scores.device).bool() & torch.isfinite(
+        pose_cost.to(device=candidate_scores.device)
+    )
+    cost = pose_cost.to(device=candidate_scores.device, dtype=candidate_scores.dtype)
+    scores = candidate_scores.float().masked_fill(~valid, -1.0e6)
+    masked_cost = cost.masked_fill(~valid, float("inf"))
+    best_idx = masked_cost.argmin(dim=1)
+    batch_idx = torch.arange(candidate_scores.shape[0], device=candidate_scores.device)
+    best_cost = masked_cost[batch_idx, best_idx]
+    best_valid = torch.isfinite(best_cost)
+
+    if mode == "all":
+        selection = valid.clone()
+        hard_idx = best_idx
+        has_hard = torch.zeros_like(best_valid)
+    elif mode in ("best", "best_only"):
+        selection = torch.zeros_like(valid)
+        selection[batch_idx, best_idx] = best_valid
+        hard_idx = best_idx
+        has_hard = torch.zeros_like(best_valid)
+    elif mode in ("best_and_hard_negative", "hard_negative", "hard"):
+        selection = torch.zeros_like(valid)
+        selection[batch_idx, best_idx] = best_valid
+        hard_mask = valid & torch.isfinite(cost) & (cost >= best_cost[:, None] + float(min_cost_gap_m))
+        hard_scores = scores.masked_fill(~hard_mask, -1.0e6)
+        hard_idx = hard_scores.argmax(dim=1)
+        has_hard = hard_mask.any(dim=1)
+        selection[batch_idx, hard_idx] = selection[batch_idx, hard_idx] | has_hard
+        hard_idx = torch.where(has_hard, hard_idx, best_idx)
+    else:
+        raise ValueError(f"Unknown local_flow_nce_candidate_mode: {mode}")
+
+    return {
+        "selection_mask": selection,
+        "best_index": best_idx.detach(),
+        "hard_negative_index": hard_idx.detach(),
+        "best_active": best_valid.float().mean().detach(),
+        "hard_negative_active": has_hard.float().mean().detach(),
+        "selected_fraction": selection.float().mean().detach(),
+    }
+
+
 def pose_threshold_success_metrics(
     trans_err_m: torch.Tensor,
     rot_err_rad: torch.Tensor,
@@ -1202,6 +1324,51 @@ def selected_candidate_pose_metrics(
         "selected_trans": selected_trans,
         "selected_rot": selected_rot,
         "selected_oracle_gap": selected_cost - oracle_cost.to(device=pose_cost.device, dtype=pose_cost.dtype),
+    }
+
+
+def candidate_selection_bias_metrics(
+    candidate_scores: torch.Tensor,
+    pose_cost: torch.Tensor,
+    valid_mask: torch.Tensor,
+    selected_idx: torch.Tensor,
+    *,
+    identity_mask: torch.Tensor | None = None,
+) -> Dict[str, torch.Tensor]:
+    """Measure whether selection is biased toward identity or score-high wrong poses."""
+    if candidate_scores.ndim != 2 or pose_cost.shape != candidate_scores.shape:
+        raise ValueError("candidate_scores and pose_cost must have shape (B,K)")
+    if valid_mask.shape != candidate_scores.shape:
+        raise ValueError("valid_mask must match candidate_scores")
+    if selected_idx.ndim != 1 or selected_idx.shape[0] != candidate_scores.shape[0]:
+        raise ValueError("selected_idx must have shape (B,)")
+    device = candidate_scores.device
+    valid = valid_mask.to(device=device).bool() & torch.isfinite(pose_cost.to(device=device))
+    scores = candidate_scores.float().masked_fill(~valid, -1.0e6)
+    costs = pose_cost.to(device=device, dtype=torch.float32).masked_fill(~valid, float("inf"))
+    best_idx = costs.argmin(dim=1)
+    batch_idx = torch.arange(candidate_scores.shape[0], device=device)
+    best_score = scores[batch_idx, best_idx]
+    selected_score = scores[batch_idx, selected_idx.to(device=device, dtype=torch.long)]
+
+    if identity_mask is None:
+        selected_identity_frac = candidate_scores.new_zeros(())
+        best_minus_identity = candidate_scores.new_zeros(())
+    else:
+        identity = identity_mask.to(device=device).bool() & valid
+        has_identity = identity.any(dim=1)
+        identity_score = scores.masked_fill(~identity, -1.0e6).max(dim=1).values
+        selected_identity = identity.gather(1, selected_idx.to(device=device, dtype=torch.long)[:, None]).squeeze(1)
+        selected_identity_frac = selected_identity.float().mean()
+        if bool(has_identity.any()):
+            best_minus_identity = (best_score[has_identity] - identity_score[has_identity]).mean()
+        else:
+            best_minus_identity = candidate_scores.new_zeros(())
+
+    return {
+        "selected_identity_frac": selected_identity_frac.detach(),
+        "score_best_minus_score_identity": best_minus_identity.detach(),
+        "score_best_minus_score_selected": (best_score - selected_score).mean().detach(),
     }
 
 
@@ -1283,6 +1450,48 @@ def _intrinsics_to_components(
         cx[..., None, None],
         cy[..., None, None],
     )
+
+
+def _scale_intrinsics_between_hw(
+    intrinsics: torch.Tensor,
+    source_hw: tuple[int, int],
+    target_hw: tuple[int, int],
+) -> torch.Tensor:
+    """Scale intrinsics when the scoring feature grid is resized."""
+    source_h, source_w = int(source_hw[0]), int(source_hw[1])
+    target_h, target_w = int(target_hw[0]), int(target_hw[1])
+    if (source_h, source_w) == (target_h, target_w):
+        return intrinsics
+    if source_h <= 0 or source_w <= 0 or target_h <= 0 or target_w <= 0:
+        raise ValueError("source_hw and target_hw must be positive")
+    sx = float(target_w) / float(source_w)
+    sy = float(target_h) / float(source_h)
+    scaled = intrinsics.clone()
+    if scaled.shape[-1] == 4:
+        scaled[..., 0] = scaled[..., 0] * sx
+        scaled[..., 1] = scaled[..., 1] * sy
+        scaled[..., 2] = scaled[..., 2] * sx
+        scaled[..., 3] = scaled[..., 3] * sy
+    elif scaled.shape[-2:] == (3, 3):
+        scaled[..., 0, 0] = scaled[..., 0, 0] * sx
+        scaled[..., 1, 1] = scaled[..., 1, 1] * sy
+        scaled[..., 0, 2] = scaled[..., 0, 2] * sx
+        scaled[..., 1, 2] = scaled[..., 1, 2] * sy
+    else:
+        raise ValueError(f"unsupported intrinsics shape {tuple(intrinsics.shape)}")
+    return scaled
+
+
+def _flow_geometry_for_score_hw(
+    render_position: torch.Tensor,
+    intrinsics: torch.Tensor,
+    *,
+    source_hw: tuple[int, int],
+    score_hw: tuple[int, int],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    position = _candidate_feature_to_hw(render_position.float(), score_hw)
+    scaled_intrinsics = _scale_intrinsics_between_hw(intrinsics, source_hw, score_hw)
+    return position, scaled_intrinsics
 
 
 def _sample_target_map_at_grid(target: torch.Tensor, grid: torch.Tensor, *, mode: str) -> torch.Tensor:
@@ -1583,6 +1792,7 @@ def pair_matcher_local_candidate_score_maps(
     temperature: float = 0.05,
     chunk_points: int = 65536,
     candidate_chunk_size: int = 0,
+    offset_chunk_size: int = 0,
     candidate_score_mode: str = "center_logprob_margin",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return sparse pair-matcher heatmap evidence for pose candidates.
@@ -1612,6 +1822,7 @@ def pair_matcher_local_candidate_score_maps(
     candidate_chunk_size = int(candidate_chunk_size or 0)
     if candidate_chunk_size <= 0 or candidate_chunk_size > num_candidates:
         candidate_chunk_size = num_candidates
+    offset_chunk_size = int(offset_chunk_size or 0)
     ys = torch.arange(stride // 2, height, stride, device=query.device, dtype=query.dtype)
     xs = torch.arange(stride // 2, width, stride, device=query.device, dtype=query.dtype)
     if ys.numel() == 0:
@@ -1687,24 +1898,75 @@ def pair_matcher_local_candidate_score_maps(
         )
         patch_all = patch_sparse.reshape(bsz * chunk_k * num_points, offsets.shape[0], channels)
         patch_valid_all = patch_in.reshape(bsz * chunk_k * num_points, offsets.shape[0])
-        logits_chunks = []
-        for start in range(0, q_all.shape[0], chunk_points):
-            logits_chunks.append(
-                matcher(
-                    q_all[start : start + chunk_points],
-                    patch_all[start : start + chunk_points],
-                    offsets=offsets,
-                    patch_valid=patch_valid_all[start : start + chunk_points],
+        if 0 < offset_chunk_size < int(offsets.shape[0]):
+            temp = max(float(temperature), 1.0e-6)
+            with torch.no_grad():
+                q_norm = F.normalize(q_all.float(), dim=-1, eps=1.0e-6)
+                patch_norm = F.normalize(patch_all.float(), dim=-1, eps=1.0e-6)
+                full_base_cos = (q_norm[:, None, :] * patch_norm).sum(dim=-1)
+                full_row_mean = full_base_cos.mean(dim=1, keepdim=True)
+                full_row_max = full_base_cos.max(dim=1, keepdim=True).values
+                del q_norm, patch_norm, full_base_cos
+            center_logit_flat = None
+            logsumexp_flat = None
+            hard_neg_flat = None
+            for offset_start in range(0, int(offsets.shape[0]), offset_chunk_size):
+                offset_end = min(int(offsets.shape[0]), offset_start + offset_chunk_size)
+                logits_chunks = []
+                for start in range(0, q_all.shape[0], chunk_points):
+                    logits_chunks.append(
+                        matcher(
+                            q_all[start : start + chunk_points],
+                            patch_all[start : start + chunk_points, offset_start:offset_end],
+                            offsets=offsets[offset_start:offset_end],
+                            patch_valid=patch_valid_all[start : start + chunk_points, offset_start:offset_end],
+                            row_mean=full_row_mean[start : start + chunk_points],
+                            row_max=full_row_max[start : start + chunk_points],
+                        )
+                    )
+                logits_chunk = torch.cat(logits_chunks, dim=0)
+                chunk_logsumexp = torch.logsumexp(logits_chunk / temp, dim=1)
+                logsumexp_flat = (
+                    chunk_logsumexp
+                    if logsumexp_flat is None
+                    else torch.logaddexp(logsumexp_flat, chunk_logsumexp)
                 )
-            )
-        logits = torch.cat(logits_chunks, dim=0).reshape(bsz, chunk_k, num_points, offsets.shape[0])
-        log_probs = F.log_softmax(logits / max(float(temperature), 1.0e-6), dim=-1)
-        center_log_prob = log_probs[:, :, :, center_index]
-        center_logit = logits[:, :, :, center_index]
-        other_mask = patch_in.clone()
-        other_mask[:, :, :, center_index] = False
-        hard_neg = logits.masked_fill(~other_mask, -1.0e4).max(dim=-1).values
-        has_neg = other_mask.any(dim=-1)
+                if offset_start <= center_index < offset_end:
+                    center_local = int(center_index - offset_start)
+                    center_logit_flat = logits_chunk[:, center_local]
+                    logits_for_hard = logits_chunk.clone()
+                    logits_for_hard[:, center_local] = -1.0e4
+                else:
+                    logits_for_hard = logits_chunk
+                chunk_hard = logits_for_hard.max(dim=1).values
+                hard_neg_flat = chunk_hard if hard_neg_flat is None else torch.maximum(hard_neg_flat, chunk_hard)
+            if center_logit_flat is None or logsumexp_flat is None or hard_neg_flat is None:
+                raise RuntimeError("pair matcher offset chunking failed to cover center offset")
+            center_logit = center_logit_flat.reshape(bsz, chunk_k, num_points)
+            center_log_prob = (center_logit_flat / temp - logsumexp_flat).reshape(bsz, chunk_k, num_points)
+            has_neg = patch_valid_all.clone()
+            has_neg[:, center_index] = False
+            hard_neg = hard_neg_flat.reshape(bsz, chunk_k, num_points)
+            has_neg = has_neg.any(dim=1).reshape(bsz, chunk_k, num_points)
+        else:
+            logits_chunks = []
+            for start in range(0, q_all.shape[0], chunk_points):
+                logits_chunks.append(
+                    matcher(
+                        q_all[start : start + chunk_points],
+                        patch_all[start : start + chunk_points],
+                        offsets=offsets,
+                        patch_valid=patch_valid_all[start : start + chunk_points],
+                    )
+                )
+            logits = torch.cat(logits_chunks, dim=0).reshape(bsz, chunk_k, num_points, offsets.shape[0])
+            log_probs = F.log_softmax(logits / max(float(temperature), 1.0e-6), dim=-1)
+            center_log_prob = log_probs[:, :, :, center_index]
+            center_logit = logits[:, :, :, center_index]
+            other_mask = patch_in.clone()
+            other_mask[:, :, :, center_index] = False
+            hard_neg = logits.masked_fill(~other_mask, -1.0e4).max(dim=-1).values
+            has_neg = other_mask.any(dim=-1)
         hard_neg = torch.where(has_neg, hard_neg, torch.zeros_like(hard_neg))
         score_mode = str(candidate_score_mode or "center_logprob_margin").lower()
         center_margin = center_logit - hard_neg
@@ -1739,6 +2001,7 @@ def pair_matcher_local_candidate_scores(
     temperature: float = 0.05,
     chunk_points: int = 65536,
     candidate_chunk_size: int = 0,
+    offset_chunk_size: int = 0,
     candidate_score_mode: str = "center_logprob_margin",
 ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Score pose candidates with pair-conditioned local heatmap evidence."""
@@ -1752,6 +2015,7 @@ def pair_matcher_local_candidate_scores(
         temperature=temperature,
         chunk_points=chunk_points,
         candidate_chunk_size=candidate_chunk_size,
+        offset_chunk_size=offset_chunk_size,
         candidate_score_mode=candidate_score_mode,
     )
     valid_f = valid_map.to(dtype=score_maps.dtype)
@@ -1778,6 +2042,7 @@ def local_flow_nce_loss_from_corr(
     intrinsics: torch.Tensor,
     *,
     candidate_mask: torch.Tensor | None = None,
+    candidate_selection_mask: torch.Tensor | None = None,
     target_depth: torch.Tensor | None = None,
     target_mask: torch.Tensor | None = None,
     radius: int = 3,
@@ -1817,6 +2082,15 @@ def local_flow_nce_loss_from_corr(
         if cand_valid.ndim == 4:
             cand_valid = cand_valid[:, None]
         valid = valid & (cand_valid.to(device=device) > 0.5)
+    selected_frac = corr.new_tensor(1.0)
+    if candidate_selection_mask is not None:
+        if candidate_selection_mask.shape != (bsz, num):
+            raise ValueError(
+                f"candidate_selection_mask must have shape {(bsz, num)}, got {tuple(candidate_selection_mask.shape)}"
+            )
+        selection = candidate_selection_mask.to(device=device).bool()
+        valid = valid & selection[:, :, None, None, None]
+        selected_frac = selection.float().mean().to(device=device, dtype=corr.dtype)
     valid = valid[:, :, 0] & in_window
     logits = (corr / max(float(temperature), 1.0e-6)).permute(0, 1, 3, 4, 2).reshape(-1, corr.shape[2])
     targets = target_index.reshape(-1).clamp(min=0, max=corr.shape[2] - 1)
@@ -1832,6 +2106,7 @@ def local_flow_nce_loss_from_corr(
         "local_flow_nce_loss": loss.detach(),
         "local_flow_valid_frac": valid.float().mean().detach(),
         "local_flow_target_offset_px": target_offset.detach(),
+        "local_flow_candidate_selected_frac": selected_frac.detach(),
     }
     return loss, metrics
 
@@ -1844,6 +2119,7 @@ def local_flow_nce_loss(
     intrinsics: torch.Tensor,
     *,
     candidate_mask: torch.Tensor | None = None,
+    candidate_selection_mask: torch.Tensor | None = None,
     target_depth: torch.Tensor | None = None,
     target_mask: torch.Tensor | None = None,
     radius: int = 3,
@@ -1859,6 +2135,7 @@ def local_flow_nce_loss(
         target_pose,
         intrinsics,
         candidate_mask=candidate_mask,
+        candidate_selection_mask=candidate_selection_mask,
         target_depth=target_depth,
         target_mask=target_mask,
         radius=radius,
@@ -2763,6 +3040,14 @@ def forward_batch(
             if cand_weight.ndim == 4:
                 cand_weight = cand_weight[:, :, None] if cand_weight.shape[1] == cand_render_loc.shape[1] else cand_weight[:, None]
             score_weight = score_weight * cand_weight.to(device=score_weight.device, dtype=score_weight.dtype)
+    score_feature_hw = parse_score_feature_hw(getattr(args, "score_feature_hw", None))
+    score_query_loc, score_cand_render_loc, score_cand_mask, score_weight = resize_score_candidate_tensors(
+        query_loc,
+        cand_render_loc,
+        cand_mask,
+        score_weight,
+        score_hw=score_feature_hw,
+    )
 
     align_loss, align_cos = masked_dense_alignment_loss(
         query_loc,
@@ -2808,31 +3093,50 @@ def forward_batch(
         "local_flow_nce_loss": flow_loss.detach(),
         "local_flow_valid_frac": flow_loss.detach(),
         "local_flow_target_offset_px": flow_loss.detach(),
+        "local_flow_candidate_selected_frac": flow_loss.detach(),
+        "local_flow_best_active": flow_loss.detach(),
+        "local_flow_hard_negative_active": flow_loss.detach(),
     }
+    flow_inputs = None
     score_mode = str(args.score_mode or "same_pixel")
     need_local_corr = score_mode.startswith("local_") or float(args.local_flow_nce_weight) > 0.0
     if score_mode == "pair_matcher_local":
         if pair_matcher is None:
             raise ValueError("score_mode=pair_matcher_local requires --pair-matcher-enabled")
-        if float(args.local_flow_nce_weight) > 0.0:
-            raise ValueError("local_flow_nce is not supported with score_mode=pair_matcher_local")
         cand_scores, local_stats = pair_matcher_local_candidate_scores(
             pair_matcher,
-            query_loc,
-            cand_render_loc,
-            mask=cand_mask,
+            score_query_loc,
+            score_cand_render_loc,
+            mask=score_cand_mask,
             radius=int(args.pair_matcher_radius),
             stride=int(args.pair_matcher_score_stride),
             temperature=float(args.pair_matcher_temperature),
             chunk_points=int(args.pair_matcher_score_chunk_points),
             candidate_chunk_size=int(args.pair_matcher_score_candidate_chunk_size),
+            offset_chunk_size=int(args.pair_matcher_score_offset_chunk_size),
             candidate_score_mode=str(args.pair_matcher_candidate_score_mode),
         )
+        if float(args.local_flow_nce_weight) > 0.0:
+            if cand_position is None or gt_intrinsics is None:
+                raise KeyError("local flow NCE requires nvs_candidate_position and nvs_gt_intrinsics")
+            local_corr, local_valid = local_correlation_volume(
+                score_query_loc,
+                score_cand_render_loc,
+                mask=score_cand_mask,
+                radius=int(args.local_corr_radius),
+            )
+            flow_position, flow_intrinsics = _flow_geometry_for_score_hw(
+                cand_position.float().detach(),
+                target_intrinsics,
+                source_hw=tuple(query_loc.shape[-2:]),
+                score_hw=tuple(score_cand_render_loc.shape[-2:]),
+            )
+            flow_inputs = (local_corr, local_valid, flow_position, flow_intrinsics, score_cand_mask)
     elif need_local_corr:
         local_corr, local_valid = local_correlation_volume(
-            query_loc,
-            cand_render_loc,
-            mask=cand_mask,
+            score_query_loc,
+            score_cand_render_loc,
+            mask=score_cand_mask,
             radius=int(args.local_corr_radius),
         )
         if score_mode == "local_zero_offset":
@@ -2858,26 +3162,27 @@ def forward_batch(
                 weight=score_weight,
             )
         else:
-            cand_scores = masked_dense_cosine(query_loc, cand_render_loc, mask=score_weight if score_weight is not None else cand_mask)
+            cand_scores = masked_dense_cosine(
+                score_query_loc,
+                score_cand_render_loc,
+                mask=score_weight if score_weight is not None else score_cand_mask,
+            )
         if float(args.local_flow_nce_weight) > 0.0:
             if cand_position is None or gt_intrinsics is None:
                 raise KeyError("local flow NCE requires nvs_candidate_position and nvs_gt_intrinsics")
-            flow_loss, flow_metrics = local_flow_nce_loss_from_corr(
-                local_corr,
-                local_valid,
+            flow_position, flow_intrinsics = _flow_geometry_for_score_hw(
                 cand_position.float().detach(),
-                pose_gt.float(),
                 target_intrinsics,
-                candidate_mask=cand_mask,
-                target_depth=gt_depth,
-                target_mask=gt_mask,
-                radius=int(args.local_corr_radius),
-                temperature=float(args.local_corr_temperature),
-                depth_abs_tolerance_m=float(args.warp_depth_tolerance_m),
-                depth_rel_tolerance=float(args.warp_depth_tolerance_rel),
+                source_hw=tuple(query_loc.shape[-2:]),
+                score_hw=tuple(score_cand_render_loc.shape[-2:]),
             )
+            flow_inputs = (local_corr, local_valid, flow_position, flow_intrinsics, score_cand_mask)
     else:
-        cand_scores = masked_dense_cosine(query_loc, cand_render_loc, mask=score_weight if score_weight is not None else cand_mask)
+        cand_scores = masked_dense_cosine(
+            score_query_loc,
+            score_cand_render_loc,
+            mask=score_weight if score_weight is not None else score_cand_mask,
+        )
     teacher_corr_loss, teacher_corr_metrics = nvs_teacher_correspondence_loss(
         query_loc,
         gt_render_loc,
@@ -2914,7 +3219,7 @@ def forward_batch(
     )
     cand_valid = torch.isfinite(cand_scores)
     if cand_mask is not None:
-        valid_mask = _resize_mask(cand_mask, tuple(cand_render_loc.shape[-2:]))
+        valid_mask = _resize_mask(score_cand_mask, tuple(score_cand_render_loc.shape[-2:]))
         cand_valid = cand_valid & (valid_mask.flatten(2).sum(dim=2) > 1.0)
     if external_candidate_valid is not None:
         cand_valid = cand_valid & external_candidate_valid.to(device=cand_valid.device).bool()
@@ -2929,6 +3234,41 @@ def forward_batch(
         pose_gt.float(),
         rot_cost_weight=float(args.rot_cost_weight),
     )
+    if flow_inputs is not None:
+        flow_selection = None
+        candidate_selection_mask = None
+        flow_candidate_mode = str(getattr(args, "local_flow_nce_candidate_mode", "all") or "all").lower()
+        if flow_candidate_mode != "all":
+            flow_selection = hard_flow_candidate_selection_mask(
+                cand_scores.detach(),
+                pose_cost.detach(),
+                cand_valid,
+                mode=flow_candidate_mode,
+                min_cost_gap_m=float(args.local_flow_nce_hard_negative_min_cost_gap_m),
+            )
+            candidate_selection_mask = flow_selection["selection_mask"]
+        local_corr, local_valid, flow_position, flow_intrinsics, flow_candidate_mask = flow_inputs
+        flow_loss, flow_metrics = local_flow_nce_loss_from_corr(
+            local_corr,
+            local_valid,
+            flow_position,
+            pose_gt.float(),
+            flow_intrinsics,
+            candidate_mask=flow_candidate_mask,
+            candidate_selection_mask=candidate_selection_mask,
+            target_depth=gt_depth,
+            target_mask=gt_mask,
+            radius=int(args.local_corr_radius),
+            temperature=float(args.local_corr_temperature),
+            depth_abs_tolerance_m=float(args.warp_depth_tolerance_m),
+            depth_rel_tolerance=float(args.warp_depth_tolerance_rel),
+        )
+        if flow_selection is None:
+            flow_metrics["local_flow_best_active"] = cand_valid.any(dim=1).float().mean().detach()
+            flow_metrics["local_flow_hard_negative_active"] = flow_loss.new_zeros(()).detach()
+        else:
+            flow_metrics["local_flow_best_active"] = flow_selection["best_active"].detach()
+            flow_metrics["local_flow_hard_negative_active"] = flow_selection["hard_negative_active"].detach()
     correction_cos = candidate_correction_cosines(candidate_pose, init_pose, pose_gt.float()).to(device=device)
     identity_mask = candidate_identity_mask(candidate_pose, init_pose).to(device=device)
     rank = rank_losses_from_scores(
@@ -3045,6 +3385,7 @@ def forward_batch(
                 temperature=float(args.pair_matcher_temperature),
                 chunk_points=int(args.pair_matcher_score_chunk_points),
                 candidate_chunk_size=1,
+                offset_chunk_size=int(args.pair_matcher_score_offset_chunk_size),
                 candidate_score_mode=str(args.pair_matcher_candidate_score_mode),
             )
             observability = observability_score_contrast_loss(
@@ -3159,6 +3500,7 @@ def forward_batch(
                 temperature=float(args.pair_matcher_temperature),
                 chunk_points=int(args.pair_matcher_score_chunk_points),
                 candidate_chunk_size=int(args.pair_matcher_score_candidate_chunk_size),
+                offset_chunk_size=int(args.pair_matcher_score_offset_chunk_size),
                 candidate_score_mode=str(args.pair_matcher_candidate_score_mode),
             )
             feature_pack["score_maps"] = pair_score_maps
@@ -3478,6 +3820,23 @@ def forward_batch(
     else:
         selected_identity_frac = query_loc.new_zeros(())
         oracle_identity_frac = query_loc.new_zeros(())
+    selection_bias = candidate_selection_bias_metrics(
+        cand_scores.detach(),
+        pose_cost.detach(),
+        cand_valid,
+        pred_idx.long(),
+        identity_mask=identity_mask,
+    )
+    selected_pose_for_delta = candidate_pose[batch_idx, pred_idx.long()]
+    oracle_pose_for_delta = candidate_pose[batch_idx, rank_target_idx]
+    _selected_delta_loss, selected_delta_rot, selected_delta_trans = pose_error_tensors(
+        selected_pose_for_delta.float(),
+        init_pose.float(),
+    )
+    _oracle_delta_loss, oracle_delta_rot, oracle_delta_trans = pose_error_tensors(
+        oracle_pose_for_delta.float(),
+        init_pose.float(),
+    )
     spearman = _spearman_rows(cand_scores, pose_cost, cand_valid)
     auc = _good_bad_auc_rows(
         cand_scores,
@@ -3524,6 +3883,9 @@ def forward_batch(
         "local_flow_nce_loss": flow_metrics["local_flow_nce_loss"].detach(),
         "local_flow_valid_frac": flow_metrics["local_flow_valid_frac"].detach(),
         "local_flow_target_offset_px": flow_metrics["local_flow_target_offset_px"].detach(),
+        "local_flow_candidate_selected_frac": flow_metrics["local_flow_candidate_selected_frac"].detach(),
+        "local_flow_best_active": flow_metrics["local_flow_best_active"].detach(),
+        "local_flow_hard_negative_active": flow_metrics["local_flow_hard_negative_active"].detach(),
         **{key: value.detach() for key, value in teacher_corr_metrics.items()},
         **{key: value.detach() for key, value in pair_match_metrics.items()},
         "local_zero_score": local_stats["local_zero_score"].detach(),
@@ -3564,6 +3926,12 @@ def forward_batch(
         "selected_identity_frac": selected_identity_frac.detach(),
         "oracle_identity_frac": oracle_identity_frac.detach(),
         "candidate_identity_frac": identity_mask.float().mean().detach(),
+        "selected_delta_trans_m": selected_delta_trans.detach().mean(),
+        "selected_delta_rot_deg": selected_delta_rot.detach().mean(),
+        "oracle_delta_trans_m": oracle_delta_trans.detach().mean(),
+        "oracle_delta_rot_deg": oracle_delta_rot.detach().mean(),
+        "score_best_minus_score_identity": selection_bias["score_best_minus_score_identity"].detach(),
+        "score_best_minus_score_selected": selection_bias["score_best_minus_score_selected"].detach(),
         "observability_contrast_loss": observability["loss"].detach(),
         "observability_active": observability["active"].detach(),
         "observability_gt_score": observability["gt_score"].detach(),
@@ -3596,6 +3964,8 @@ def forward_batch(
         "oracle_correction_cos": correction_cos[batch_idx, rank_target_idx].detach().mean(),
         "candidate_score_mean": cand_scores.detach().mean(),
         "candidate_score_std": cand_scores.detach().std(),
+        "score_feature_h": query_loc.new_tensor(float(score_feature_hw[0] if score_feature_hw is not None else 0)),
+        "score_feature_w": query_loc.new_tensor(float(score_feature_hw[1] if score_feature_hw is not None else 0)),
         "synthetic_fraction": synthetic_mask.float().mean().detach(),
         **{key: value.detach() for key, value in pose_obs_metrics.items()},
     }

@@ -1,0 +1,12 @@
+# Eval-only companion for POFD Stage3a.
+#
+# Keeps the Stage3a low-res/larger-radius score surface and lifts the inherited
+# validation cap from 32 to the full q50 val128 cache.
+
+base_config: /root/ICLPose/feature_extract/configs/pofd_stage3a_multiscale_score_q50_shuf.yaml
+exp_name: pofd_stage3a_multiscale_score_q50_val128_eval
+
+dataset:
+  max_val_samples: 128
+  teacher_correspondence_val_path:
+

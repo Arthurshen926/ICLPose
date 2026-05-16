@@ -86,3 +86,36 @@ def test_format_markdown_table_emits_basin_columns(tmp_path):
     assert "succ@5cm/2deg" in markdown
     assert "succ@50cm/10deg" in markdown
     assert "pofd_probe" in markdown
+
+
+def test_report_includes_identity_bias_fields(tmp_path):
+    run_dir = tmp_path / "pofd_identity_probe"
+    run_dir.mkdir()
+    log_path = run_dir / "train_log.jsonl"
+    _write_jsonl(
+        log_path,
+        [
+            {
+                "step": 20,
+                "split": "eval",
+                "pred_cost_m": 0.20,
+                "oracle_cost_m": 0.10,
+                "selected_identity_frac": 0.25,
+                "oracle_identity_frac": 0.0,
+                "candidate_identity_frac": 0.0625,
+                "score_best_minus_score_identity": 0.4,
+                "score_best_minus_score_selected": 0.1,
+            }
+        ],
+    )
+
+    row = summarize_log(log_path)
+    markdown = format_markdown_table([row])
+
+    assert row["selected_identity_frac"] == 0.25
+    assert row["oracle_identity_frac"] == 0.0
+    assert row["candidate_identity_frac"] == 0.0625
+    assert row["score_best_minus_score_identity"] == 0.4
+    assert row["score_best_minus_score_selected"] == 0.1
+    assert "sel_id" in markdown
+    assert "best-id" in markdown

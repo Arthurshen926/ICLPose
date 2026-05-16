@@ -12,12 +12,14 @@ from feature_extract.tools.train_nvs_pose_feature_adapter import (
     candidate_correction_cosines,
     candidate_identity_mask,
     candidate_teacher_quality_listwise_loss,
+    candidate_selection_bias_metrics,
     candidate_teacher_quality_scores_from_batch,
     effective_candidate_teacher_quality_weight,
     collect_trainable_parameters,
     pose_energy_factorized_selection_metrics,
     pose_energy_logits_with_base_prior,
     local_flow_nce_loss,
+    local_flow_nce_loss_from_corr,
     pair_matcher_local_candidate_score_maps,
     pair_matcher_local_candidate_scores,
     local_zero_offset_scores_from_corr,
@@ -35,13 +37,18 @@ from feature_extract.tools.train_nvs_pose_feature_adapter import (
     observability_contrast_loss,
     candidate_observability_margin_loss,
     observability_score_contrast_loss,
+    hard_flow_candidate_selection_mask,
     pose_threshold_success_metrics,
+    parse_score_feature_hw,
     selected_candidate_pose_metrics,
     pose_energy_direction_pairwise_loss,
     pose_energy_score_monotonicity_loss,
     project_world_positions_to_feature_grid,
     rank_losses_from_scores,
+    resize_score_candidate_tensors,
     save_checkpoint,
+    _flow_geometry_for_score_hw,
+    _scale_intrinsics_between_hw,
     variance_floor_loss,
     warped_candidate_alignment_loss,
 )
@@ -262,6 +269,31 @@ def test_candidate_observability_margin_loss_separates_best_candidate_from_hard_
     assert good["gap"] > bad["gap"]
 
 
+def test_hard_flow_candidate_selection_mask_keeps_best_and_score_hard_negative():
+    scores = torch.tensor([[0.0, 5.0, 4.0, 1.0], [3.0, 2.0, 1.0, 0.0]])
+    pose_cost = torch.tensor([[0.05, 0.30, 0.40, 0.07], [0.20, 0.21, 0.22, 0.23]])
+    valid = torch.ones_like(scores, dtype=torch.bool)
+
+    out = hard_flow_candidate_selection_mask(
+        scores,
+        pose_cost,
+        valid,
+        mode="best_and_hard_negative",
+        min_cost_gap_m=0.10,
+    )
+
+    expected = torch.tensor(
+        [
+            [True, True, False, False],
+            [True, False, False, False],
+        ]
+    )
+    assert torch.equal(out["selection_mask"], expected)
+    assert torch.equal(out["best_index"], torch.tensor([0, 0]))
+    assert torch.equal(out["hard_negative_index"], torch.tensor([1, 0]))
+    assert torch.isclose(out["hard_negative_active"], torch.tensor(0.5))
+
+
 def test_pose_threshold_success_metrics_reports_refinement_buckets():
     trans_err = torch.tensor([0.04, 0.12, 0.30])
     rot_err = torch.tensor([1.0, 4.0, 12.0]) * torch.pi / 180.0
@@ -293,6 +325,88 @@ def test_selected_candidate_pose_metrics_follow_actual_selector_index():
     assert torch.allclose(metrics["selected_trans"], torch.tensor([0.29, 0.19]))
     assert torch.allclose(metrics["selected_rot"], torch.tensor([0.02, 0.04]))
     assert torch.allclose(metrics["selected_oracle_gap"], torch.tensor([0.20, 0.00]))
+
+
+def test_candidate_selection_bias_metrics_reports_identity_and_selected_margins():
+    scores = torch.tensor([[0.0, 2.0, 1.5], [1.0, 0.0, 3.0]])
+    pose_cost = torch.tensor([[0.30, 0.10, 0.40], [0.40, 0.20, 0.10]])
+    valid = torch.ones_like(scores, dtype=torch.bool)
+    selected_idx = torch.tensor([2, 0])
+    identity_mask = torch.tensor([[True, False, False], [True, False, False]])
+
+    metrics = candidate_selection_bias_metrics(
+        scores,
+        pose_cost,
+        valid,
+        selected_idx,
+        identity_mask=identity_mask,
+    )
+
+    assert torch.isclose(metrics["score_best_minus_score_identity"], torch.tensor(2.0))
+    assert torch.isclose(metrics["score_best_minus_score_selected"], torch.tensor(1.25))
+    assert torch.isclose(metrics["selected_identity_frac"], torch.tensor(0.5))
+
+
+def test_parse_score_feature_hw_accepts_config_list_and_empty_values():
+    assert parse_score_feature_hw([34, 60]) == (34, 60)
+    assert parse_score_feature_hw("34,60") == (34, 60)
+    assert parse_score_feature_hw("34x60") == (34, 60)
+    assert parse_score_feature_hw(None) is None
+    assert parse_score_feature_hw("") is None
+
+
+def test_resize_score_candidate_tensors_downsamples_render_mask_and_weight():
+    query = torch.randn(2, 3, 8, 10)
+    render = torch.randn(2, 4, 3, 8, 10)
+    mask = torch.ones(2, 4, 1, 8, 10)
+    weight = torch.ones(2, 4, 1, 8, 10)
+
+    q_out, r_out, m_out, w_out = resize_score_candidate_tensors(
+        query,
+        render,
+        mask,
+        weight,
+        score_hw=(4, 5),
+    )
+
+    assert q_out.shape[-2:] == (8, 10)
+    assert r_out.shape[-2:] == (4, 5)
+    assert m_out.shape[-2:] == (4, 5)
+    assert w_out.shape[-2:] == (4, 5)
+
+
+def test_flow_geometry_for_score_hw_resizes_positions_and_scales_intrinsics():
+    position = torch.randn(2, 3, 3, 8, 10)
+    intrinsics = torch.tensor([[100.0, 80.0, 50.0, 40.0], [120.0, 90.0, 60.0, 45.0]])
+
+    scaled_position, scaled_intrinsics = _flow_geometry_for_score_hw(
+        position,
+        intrinsics,
+        source_hw=(8, 10),
+        score_hw=(4, 5),
+    )
+
+    assert scaled_position.shape == (2, 3, 3, 4, 5)
+    assert torch.allclose(scaled_intrinsics[:, 0], intrinsics[:, 0] * 0.5)
+    assert torch.allclose(scaled_intrinsics[:, 1], intrinsics[:, 1] * 0.5)
+    assert torch.allclose(scaled_intrinsics[:, 2], intrinsics[:, 2] * 0.5)
+    assert torch.allclose(scaled_intrinsics[:, 3], intrinsics[:, 3] * 0.5)
+    assert scaled_intrinsics.data_ptr() != intrinsics.data_ptr()
+
+
+def test_scale_intrinsics_between_hw_supports_matrix_form():
+    intrinsics = torch.eye(3).repeat(2, 1, 1)
+    intrinsics[:, 0, 0] = 100.0
+    intrinsics[:, 1, 1] = 80.0
+    intrinsics[:, 0, 2] = 50.0
+    intrinsics[:, 1, 2] = 40.0
+
+    scaled = _scale_intrinsics_between_hw(intrinsics, (8, 10), (4, 5))
+
+    assert torch.allclose(scaled[:, 0, 0], torch.full((2,), 50.0))
+    assert torch.allclose(scaled[:, 1, 1], torch.full((2,), 40.0))
+    assert torch.allclose(scaled[:, 0, 2], torch.full((2,), 25.0))
+    assert torch.allclose(scaled[:, 1, 2], torch.full((2,), 20.0))
 
 
 def test_rank_losses_pick_lowest_pose_cost_when_score_matches():
@@ -1373,6 +1487,48 @@ def test_pair_matcher_local_candidate_scores_prefer_aligned_candidate():
     assert stats["local_peak_offset_px"] >= 0.0
 
 
+def test_pair_matcher_local_candidate_scores_offset_chunk_matches_full():
+    torch.manual_seed(19)
+    query = torch.randn(1, 5, 5, 6)
+    render = torch.stack([query.clone(), torch.roll(query, shifts=1, dims=-1)], dim=1)
+    matcher = PairConditionedLocalMatcher(
+        channels=5,
+        hidden_dim=8,
+        offset_radius=2,
+        zero_init_residual=False,
+        base_dot_weight=3.0,
+    )
+
+    full_scores, full_stats = pair_matcher_local_candidate_scores(
+        matcher,
+        query,
+        render,
+        radius=2,
+        stride=1,
+        temperature=0.07,
+        chunk_points=8,
+        offset_chunk_size=0,
+    )
+    chunked_scores, chunked_stats = pair_matcher_local_candidate_scores(
+        matcher,
+        query,
+        render,
+        radius=2,
+        stride=1,
+        temperature=0.07,
+        chunk_points=8,
+        offset_chunk_size=5,
+    )
+
+    assert torch.allclose(chunked_scores, full_scores, atol=1.0e-5, rtol=1.0e-5)
+    assert torch.allclose(
+        chunked_stats["local_peak_gap"],
+        full_stats["local_peak_gap"],
+        atol=1.0e-5,
+        rtol=1.0e-5,
+    )
+
+
 def test_local_flow_nce_loss_accepts_zero_offset_identity_projection():
     query = torch.randn(1, 5, 3, 3)
     render = query[:, None].clone()
@@ -1401,6 +1557,35 @@ def test_local_flow_nce_loss_accepts_zero_offset_identity_projection():
     assert torch.isfinite(loss)
     assert metrics["local_flow_valid_frac"] > 0.99
     assert metrics["local_flow_target_offset_px"] < 0.01
+
+
+def test_local_flow_nce_loss_from_corr_filters_selected_candidates():
+    corr = torch.zeros(1, 2, 9, 2, 2)
+    xs = torch.arange(2, dtype=torch.float32).view(1, 1, 1, 2).expand(1, 2, 2, 2)
+    ys = torch.arange(2, dtype=torch.float32).view(1, 1, 2, 1).expand(1, 2, 2, 2)
+    zs = torch.ones_like(xs)
+    position = torch.stack([xs, ys, zs], dim=2)
+    pose = torch.eye(4).view(1, 4, 4)
+    intrinsics = torch.tensor([[1.0, 1.0, 0.0, 0.0]])
+    mask = torch.ones(1, 2, 1, 2, 2)
+    depth = torch.ones(1, 1, 1, 2, 2)
+
+    _loss, metrics = local_flow_nce_loss_from_corr(
+        corr,
+        torch.ones_like(corr, dtype=torch.bool),
+        position,
+        pose,
+        intrinsics,
+        candidate_mask=mask,
+        target_depth=depth,
+        target_mask=depth,
+        candidate_selection_mask=torch.tensor([[True, False]]),
+        radius=1,
+        temperature=0.05,
+    )
+
+    assert torch.isclose(metrics["local_flow_valid_frac"], torch.tensor(0.5))
+    assert torch.isclose(metrics["local_flow_candidate_selected_frac"], torch.tensor(0.5))
 
 
 def test_nvs_checkpoint_roundtrips_energy_net_and_trainable_query_prefix(tmp_path):

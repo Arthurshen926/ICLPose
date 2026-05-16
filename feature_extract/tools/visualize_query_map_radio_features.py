@@ -45,6 +45,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--query-fine-key", default=None)
     parser.add_argument("--no-amp", action="store_true")
     parser.add_argument("--panel-scale", type=int, default=4)
+    parser.add_argument(
+        "--uniform-panel-size",
+        default=None,
+        help="Optional WIDTHxHEIGHT used to resize every feature/RGB panel before adding labels.",
+    )
     parser.add_argument("--save-pairwise", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--contact-sheet-cols", type=int, default=2)
     parser.add_argument(
@@ -54,6 +59,19 @@ def parse_args() -> argparse.Namespace:
         help="Kept for compatibility with eval_cpr_buckets build_model_and_data.",
     )
     return parser.parse_args()
+
+
+def _parse_panel_size(value: str | None) -> tuple[int, int] | None:
+    if value is None or str(value).strip() == "":
+        return None
+    text = str(value).lower().replace(",", "x")
+    parts = [part for part in text.split("x") if part]
+    if len(parts) != 2:
+        raise ValueError("--uniform-panel-size must be formatted as WIDTHxHEIGHT")
+    width, height = int(parts[0]), int(parts[1])
+    if width <= 0 or height <= 0:
+        raise ValueError("--uniform-panel-size values must be positive")
+    return width, height
 
 
 def _resize_feature(feature: torch.Tensor, hw: tuple[int, int]) -> torch.Tensor:
@@ -153,7 +171,14 @@ def _make_contact_sheet(image_paths: List[Path], output_path: Path, cols: int) -
     sheet.save(output_path)
 
 
-def _annotate_and_scale(image: Image.Image, title: str, scale: int) -> Image.Image:
+def _annotate_and_scale(
+    image: Image.Image,
+    title: str,
+    scale: int,
+    panel_size: tuple[int, int] | None = None,
+) -> Image.Image:
+    if panel_size is not None:
+        image = image.resize(panel_size, Image.BILINEAR)
     scale = max(1, int(scale))
     if scale != 1:
         image = image.resize((image.width * scale, image.height * scale), Image.NEAREST)
@@ -191,6 +216,7 @@ def save_pairwise_comparison(
     rendered_map_mask: torch.Tensor | None,
     rendered_map_alpha: torch.Tensor | None,
     scale: int,
+    panel_size: tuple[int, int] | None = None,
     projected_query_fine: torch.Tensor | None = None,
     projected_map_fine: torch.Tensor | None = None,
 ) -> None:
@@ -229,28 +255,39 @@ def save_pairwise_comparison(
         )
 
     panels = [
-        _annotate_and_scale(tensor_to_display_rgb(query_rgb_small), "query_rgb", scale),
-        _annotate_and_scale(student_teacher[0], "student_fine_pairPCA", scale),
-        _annotate_and_scale(student_teacher[1], "teacher_fine_pairPCA", scale),
-        _annotate_and_scale(tensor_to_display_rgb(rendered_map_alpha if rendered_map_alpha is not None else rendered_map_mask), "map_alpha_or_mask", scale),
-        _annotate_and_scale(map_internal[0] if map_internal[0] is not None else map_internal[1], "map_fine_raw_internalPCA", scale),
-        _annotate_and_scale(map_internal[1], "map_fine_internalPCA", scale),
-        _annotate_and_scale(map_teacher_cross[0], "map_fine_vs_teacherPCA", scale),
-        _annotate_and_scale(map_teacher_cross[1], "teacher_for_mapPCA", scale),
-        _annotate_and_scale(coarse_student_teacher[0], "student_coarse_pairPCA", scale),
-        _annotate_and_scale(coarse_student_teacher[1], "teacher_coarse_pairPCA", scale),
-        _annotate_and_scale(coarse_map_teacher[0], "map_coarse_vs_teacherPCA", scale),
-        _annotate_and_scale(coarse_map_teacher[1], "teacher_coarse_for_mapPCA", scale),
+        _annotate_and_scale(tensor_to_display_rgb(query_rgb_small), "query_rgb", scale, panel_size),
+        _annotate_and_scale(student_teacher[0], "student_fine_pairPCA", scale, panel_size),
+        _annotate_and_scale(student_teacher[1], "teacher_fine_pairPCA", scale, panel_size),
+        _annotate_and_scale(
+            tensor_to_display_rgb(rendered_map_alpha if rendered_map_alpha is not None else rendered_map_mask),
+            "map_alpha_or_mask",
+            scale,
+            panel_size,
+        ),
+        _annotate_and_scale(
+            map_internal[0] if map_internal[0] is not None else map_internal[1],
+            "map_fine_raw_internalPCA",
+            scale,
+            panel_size,
+        ),
+        _annotate_and_scale(map_internal[1], "map_fine_internalPCA", scale, panel_size),
+        _annotate_and_scale(map_teacher_cross[0], "map_fine_vs_teacherPCA", scale, panel_size),
+        _annotate_and_scale(map_teacher_cross[1], "teacher_for_mapPCA", scale, panel_size),
+        _annotate_and_scale(coarse_student_teacher[0], "student_coarse_pairPCA", scale, panel_size),
+        _annotate_and_scale(coarse_student_teacher[1], "teacher_coarse_pairPCA", scale, panel_size),
+        _annotate_and_scale(coarse_map_teacher[0], "map_coarse_vs_teacherPCA", scale, panel_size),
+        _annotate_and_scale(coarse_map_teacher[1], "teacher_coarse_for_mapPCA", scale, panel_size),
     ]
     if projected_pair is not None:
         panels.extend(
             [
-                _annotate_and_scale(projected_pair[0], "projected_query_fine", scale),
-                _annotate_and_scale(projected_pair[1], "projected_map_fine", scale),
+                _annotate_and_scale(projected_pair[0], "projected_query_fine", scale, panel_size),
+                _annotate_and_scale(projected_pair[1], "projected_map_fine", scale, panel_size),
                 _annotate_and_scale(
                     error_to_heatmap_image(projected_map_fine, projected_query_fine, mask=rendered_map_mask),
                     "projected_map_vs_query_err",
                     scale,
+                    panel_size,
                 ),
             ]
         )
@@ -271,6 +308,7 @@ def save_highres_comparison(
     rendered_map_mask: torch.Tensor | None,
     rendered_map_alpha: torch.Tensor | None,
     scale: int,
+    panel_size: tuple[int, int] | None = None,
 ) -> None:
     feature_hw = tuple(teacher_fine.shape[-2:])
     query_rgb_small = query_rgb.detach().float()
@@ -294,31 +332,34 @@ def save_highres_comparison(
     )
 
     fine_panels = [
-        _annotate_and_scale(tensor_to_display_rgb(query_rgb_small), "query_rgb", scale),
-        _annotate_and_scale(fine_rgb[0], "RADIO_teacher_fine", scale),
-        _annotate_and_scale(fine_rgb[1], "query_student_fine", scale),
-        _annotate_and_scale(fine_rgb[2] if fine_rgb[2] is not None else fine_rgb[3], "map_fine_raw", scale),
-        _annotate_and_scale(fine_rgb[3], "map_fine", scale),
-        _annotate_and_scale(error_to_heatmap_image(student_fine, teacher_fine), "student_vs_RADIO_err", scale),
+        _annotate_and_scale(tensor_to_display_rgb(query_rgb_small), "query_rgb", scale, panel_size),
+        _annotate_and_scale(fine_rgb[0], "RADIO_teacher_fine", scale, panel_size),
+        _annotate_and_scale(fine_rgb[1], "query_student_fine", scale, panel_size),
+        _annotate_and_scale(fine_rgb[2] if fine_rgb[2] is not None else fine_rgb[3], "map_fine_raw", scale, panel_size),
+        _annotate_and_scale(fine_rgb[3], "map_fine", scale, panel_size),
+        _annotate_and_scale(error_to_heatmap_image(student_fine, teacher_fine), "student_vs_RADIO_err", scale, panel_size),
         _annotate_and_scale(
             error_to_heatmap_image(rendered_map_fine, teacher_fine, mask=rendered_map_mask),
             "map_vs_RADIO_err",
             scale,
+            panel_size,
         ),
         _annotate_and_scale(
             tensor_to_display_rgb(rendered_map_alpha if rendered_map_alpha is not None else rendered_map_mask),
             "map_alpha_or_mask",
             scale,
+            panel_size,
         ),
     ]
     coarse_panels = [
-        _annotate_and_scale(coarse_rgb[0], "RADIO_teacher_coarse", scale),
-        _annotate_and_scale(coarse_rgb[1], "query_student_coarse", scale),
-        _annotate_and_scale(coarse_rgb[2], "map_coarse", scale),
+        _annotate_and_scale(coarse_rgb[0], "RADIO_teacher_coarse", scale, panel_size),
+        _annotate_and_scale(coarse_rgb[1], "query_student_coarse", scale, panel_size),
+        _annotate_and_scale(coarse_rgb[2], "map_coarse", scale, panel_size),
         _annotate_and_scale(
             error_to_heatmap_image(rendered_map_coarse, teacher_coarse, mask=rendered_map_mask),
             "coarse_map_vs_RADIO_err",
             scale,
+            panel_size,
         ),
     ]
     _panel_grid(fine_panels + coarse_panels, output_path, cols=4)
@@ -327,6 +368,7 @@ def save_highres_comparison(
 def main() -> None:
     args = parse_args()
     cfg = load_config(args.config)
+    uniform_panel_size = _parse_panel_size(args.uniform_panel_size)
     device = torch.device(args.device if torch.cuda.is_available() or not args.device.startswith("cuda") else "cpu")
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -426,6 +468,7 @@ def main() -> None:
                     rendered_map_mask=_tensor_or_none(batch, "rendered_map_mask", idx),
                     rendered_map_alpha=_tensor_or_none(batch, "rendered_map_alpha", idx),
                     scale=int(args.panel_scale),
+                    panel_size=uniform_panel_size,
                 )
                 pairwise_path = None
                 if bool(args.save_pairwise):
@@ -449,6 +492,7 @@ def main() -> None:
                         if projected_map_fine is not None
                         else None,
                         scale=int(args.panel_scale),
+                        panel_size=uniform_panel_size,
                     )
                 image_paths.append(pairwise_path if pairwise_path is not None else highres_path)
                 rows.append(

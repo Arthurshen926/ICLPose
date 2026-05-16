@@ -1,0 +1,13 @@
+# POFD Stage 3c-v2: apply NVS/GeoNCE only to the oracle candidate and the
+# current score-hard wrong candidate.  This avoids the failed Stage3c-v1
+# behavior where uniform flow-NCE spent capacity on every candidate equally.
+
+base_config: /root/ICLPose/feature_extract/configs/pofd_stage3a_multiscale_score_q50_val128_eval.yaml
+exp_name: pofd_stage3c_hard_flow_nce_q50_val128
+
+nvs_pose_feature_adapter:
+  local_flow_nce_weight: 0.05
+  local_flow_nce_candidate_mode: best_and_hard_negative
+  local_flow_nce_hard_negative_min_cost_gap_m: 0.12
+  local_corr_radius: 12
+  local_corr_temperature: 0.07

@@ -1,0 +1,13 @@
+# Eval-only companion for the Stage2d q50 baseline.
+#
+# The training config intentionally caps validation at 32 samples for speed.
+# This companion lifts only that cap so Stage3a can be compared on the full
+# q50 val128 candidate cache without changing the trained model.
+
+base_config: /root/ICLPose/feature_extract/configs/pofd_stage2d_nvs_quality_pose_margin_q50_shuf.yaml
+exp_name: pofd_stage2d_nvs_quality_pose_margin_q50_val128_eval
+
+dataset:
+  max_val_samples: 128
+  teacher_correspondence_val_path:
+

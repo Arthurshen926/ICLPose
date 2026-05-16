@@ -343,6 +343,8 @@ class PairConditionedLocalMatcher(nn.Module):
         *,
         offsets: torch.Tensor | None = None,
         patch_valid: torch.Tensor | None = None,
+        row_mean: torch.Tensor | None = None,
+        row_max: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if query_vectors.ndim != 2 or query_vectors.shape[-1] != self.channels:
             raise ValueError(f"query_vectors must have shape (N,{self.channels})")
@@ -375,11 +377,32 @@ class PairConditionedLocalMatcher(nn.Module):
         radius = max(float(self.offset_radius), float(offsets.abs().max().detach().cpu().item()), 1.0)
         offset_norm = offsets / radius
         off_proj = self.offset_proj(offset_norm)[None].expand(num_points, -1, -1)
-        row_mean = base_cos.mean(dim=1, keepdim=True)
-        if num_offsets > 1:
-            row_max = base_cos.max(dim=1, keepdim=True).values
+        if row_mean is None:
+            row_mean = base_cos.mean(dim=1, keepdim=True)
         else:
-            row_max = base_cos
+            row_mean = row_mean.to(device=base_cos.device, dtype=base_cos.dtype)
+            if row_mean.ndim == 1:
+                row_mean = row_mean[:, None]
+            if row_mean.shape != (num_points, 1):
+                raise ValueError(f"row_mean must have shape {(num_points, 1)}")
+        if num_offsets > 1:
+            if row_max is None:
+                row_max = base_cos.max(dim=1, keepdim=True).values
+            else:
+                row_max = row_max.to(device=base_cos.device, dtype=base_cos.dtype)
+                if row_max.ndim == 1:
+                    row_max = row_max[:, None]
+                if row_max.shape != (num_points, 1):
+                    raise ValueError(f"row_max must have shape {(num_points, 1)}")
+        else:
+            if row_max is None:
+                row_max = base_cos
+            else:
+                row_max = row_max.to(device=base_cos.device, dtype=base_cos.dtype)
+                if row_max.ndim == 1:
+                    row_max = row_max[:, None]
+                if row_max.shape != (num_points, 1):
+                    raise ValueError(f"row_max must have shape {(num_points, 1)}")
         offset_mag = torch.linalg.vector_norm(offset_norm, dim=-1)[None].expand(num_points, -1)
         score_context = torch.stack(
             [base_cos, base_cos - row_mean, base_cos - row_max, offset_mag],
