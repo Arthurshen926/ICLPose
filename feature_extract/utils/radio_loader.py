@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from pathlib import Path
 from typing import Callable, Tuple
 
@@ -9,6 +10,21 @@ import torch
 
 
 OFFICIAL_RADIO_REPO = "NVlabs/RADIO"
+
+
+def ensure_load_state_dict_from_url_weights_only_compatible() -> None:
+    """Allow RADIO hubconf to run on torch versions without weights_only support."""
+    load_fn = torch.hub.load_state_dict_from_url
+    if getattr(load_fn, "_iclp_accepts_weights_only", False):
+        return
+    if "weights_only" in inspect.signature(load_fn).parameters:
+        return
+
+    def compatible_load_state_dict_from_url(*args, weights_only=None, **kwargs):
+        return load_fn(*args, **kwargs)
+
+    compatible_load_state_dict_from_url._iclp_accepts_weights_only = True  # type: ignore[attr-defined]
+    torch.hub.load_state_dict_from_url = compatible_load_state_dict_from_url
 
 
 def resolve_radio_repo(radio_repo: str | None) -> Tuple[str, str]:
@@ -38,6 +54,7 @@ def load_radio_model(
     if printer is not None:
         printer(f"  RADIO hub source: {source} ({repo_or_dir})")
 
+    ensure_load_state_dict_from_url_weights_only_compatible()
     try:
         load_kwargs = {
             "repo_or_dir": repo_or_dir,

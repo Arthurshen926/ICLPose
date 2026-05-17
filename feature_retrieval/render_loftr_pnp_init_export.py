@@ -187,9 +187,15 @@ def _teacher_correspondence_payload(
     query_xy = query_xy[:n]
     pts3d_world = pts3d_world[:n]
     conf = conf[:n]
+    inlier_mask = np.ones((n,), dtype=bool)
+    if "pnp_inlier_mask" in extra:
+        raw_inliers = np.asarray(extra["pnp_inlier_mask"], dtype=bool).reshape(-1)
+        mask_count = min(n, len(raw_inliers))
+        inlier_mask[:] = False
+        inlier_mask[:mask_count] = raw_inliers[:mask_count]
     valid = np.ones((n,), dtype=bool)
-    if inliers_only and "pnp_inlier_mask" in extra:
-        valid &= np.asarray(extra["pnp_inlier_mask"], dtype=bool).reshape(-1)[:n]
+    if inliers_only:
+        valid &= inlier_mask
     map_xy, proj_valid = _project_world_points(pts3d_world, query_pose_w2c, intrinsics_loftr)
     valid &= proj_valid
     h, w = int(loftr_hw[0]), int(loftr_hw[1])
@@ -209,12 +215,14 @@ def _teacher_correspondence_payload(
     map_xy = map_xy[valid]
     pts3d_world = pts3d_world[valid]
     conf = conf[valid]
+    inlier_mask = inlier_mask[valid]
     order = np.argsort(-conf)[: int(max_points)]
     return {
         "query_xy": query_xy[order].astype(np.float32),
         "map_xy": map_xy[order].astype(np.float32),
         "pts3d_world": pts3d_world[order].astype(np.float32),
         "confidence": conf[order].astype(np.float32),
+        "pnp_inlier_mask": inlier_mask[order].astype(bool),
         "query_hw": np.asarray(loftr_hw, dtype=np.int32),
         "map_hw": np.asarray(loftr_hw, dtype=np.int32),
         "coordinate_space": np.asarray("image"),

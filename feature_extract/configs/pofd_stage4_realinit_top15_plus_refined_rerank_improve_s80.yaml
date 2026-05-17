@@ -1,0 +1,16 @@
+# Compact reranker probe with stronger direct improvement supervision.
+
+base_config: /root/ICLPose/feature_extract/configs/pofd_stage4_realinit_top15_plus_refined_rerank_rank_s20.yaml
+exp_name: pofd_stage4_realinit_top15_plus_refined_rerank_improve_s80
+
+training:
+  max_steps: 80
+  eval_every: 40
+
+nvs_pose_feature_adapter:
+  rank_ce_weight: 0.75
+  rank_pairwise_weight: 0.5
+  candidate_teacher_quality_weight: 1.5
+  candidate_teacher_quality_pairwise_weight: 0.25
+  candidate_observability_weight: 0.25
+  score_pose_improvement_weight: 1.0

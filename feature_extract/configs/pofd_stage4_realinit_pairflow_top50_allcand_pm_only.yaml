@@ -1,0 +1,21 @@
+# Stage4 real-init pair-flow training on the deploy-style NetVLAD+render-LoFTR
+# top50 cache, using all cached candidates for offset supervision.  This tests
+# whether the top1-only run is capped by near-identity flow targets.
+
+base_config: /root/ICLPose/feature_extract/configs/pofd_stage4_realinit_pairflow_top50_top1_pm_only.yaml
+exp_name: pofd_stage4_realinit_pairflow_top50_allcand_pm_only
+
+training:
+  batch_size: 1
+  validation_batch_size: 1
+  pin_memory: false
+  max_steps: 80
+  eval_every: 20
+
+nvs_pose_feature_adapter:
+  topk: 50
+
+  pair_matcher_score_candidate_chunk_size: 1
+  pair_matcher_score_offset_chunk_size: 1
+
+  stage4_pair_match_flow_weight: 1.0

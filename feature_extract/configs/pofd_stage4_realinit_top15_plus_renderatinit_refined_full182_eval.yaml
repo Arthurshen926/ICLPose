@@ -1,0 +1,15 @@
+# Compact pivot diagnostic:
+# keep the strongest 15 NetVLAD+render-LoFTR PnP candidates and append the
+# render-at-init LoFTR refined pose as candidate 16. This preserves the
+# historical top16 memory footprint while testing the external correspondence
+# proposal inside POFD reranking.
+
+base_config: /root/ICLPose/feature_extract/configs/pofd_stage4_single_render_realinit_netvlad_renderloftr_top50_full182_eval.yaml
+exp_name: pofd_stage4_realinit_top15_plus_renderatinit_refined_full182_eval
+
+dataset:
+  val_pose_candidate_cache: /root/ICLPose/result/result/feature_extract/pose_init_exports/oldhospital_netvlad_renderloftr_top15_plus_renderatinit_loftr_refined_full182_20260517.npz
+  pose_candidate_topk: 16
+
+nvs_pose_feature_adapter:
+  topk: 16

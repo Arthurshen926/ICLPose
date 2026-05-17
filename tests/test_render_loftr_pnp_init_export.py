@@ -8,6 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import numpy as np
 
 from feature_retrieval.render_loftr_pnp_init_export import (
+    _teacher_correspondence_payload,
     candidate_ref_entries_from_retrieval_entry,
     loftr_result_to_candidate,
     slice_retrieval_entries,
@@ -20,6 +21,17 @@ class _Result:
         self.pose_w2c = pose_w2c
         self.num_inliers = num_inliers
         self.failure_reason = failure_reason
+        self.extra = {}
+
+
+class _TeacherResult:
+    def __init__(self):
+        self.extra = {
+            "query_keypoints": np.array([[1.0, 1.0], [2.0, 2.0], [3.0, 3.0]], dtype=np.float32),
+            "pts3d_world": np.array([[1.0, 1.0, 5.0], [2.0, 2.0, 5.0], [3.0, 3.0, 5.0]], dtype=np.float32),
+            "confidence": np.array([0.2, 0.9, 0.8], dtype=np.float32),
+            "pnp_inlier_mask": np.array([True, False, True]),
+        }
 
 
 def test_candidate_ref_entries_from_retrieval_entry_respects_topk_and_valid_mask():
@@ -79,3 +91,33 @@ def test_loftr_result_to_candidate_falls_back_to_retrieval_pose_on_failure():
     assert candidate["num_inliers"] == 3
     assert candidate["failure_reason"] == "too_few_matches"
     assert np.allclose(candidate["pose_w2c"], fallback)
+
+
+def test_teacher_correspondence_payload_preserves_inlier_mask_for_all_depth_valid_matches():
+    payload = _teacher_correspondence_payload(
+        _TeacherResult(),
+        query_pose_w2c=np.eye(4, dtype=np.float32),
+        intrinsics_loftr={"fx": 1.0, "fy": 1.0, "cx": 0.0, "cy": 0.0},
+        loftr_hw=(10, 10),
+        max_points=3,
+        inliers_only=False,
+    )
+
+    assert payload is not None
+    assert np.allclose(payload["confidence"], [0.9, 0.8, 0.2])
+    assert payload["pnp_inlier_mask"].tolist() == [False, True, True]
+
+
+def test_teacher_correspondence_payload_marks_filtered_inlier_only_matches_as_inliers():
+    payload = _teacher_correspondence_payload(
+        _TeacherResult(),
+        query_pose_w2c=np.eye(4, dtype=np.float32),
+        intrinsics_loftr={"fx": 1.0, "fy": 1.0, "cx": 0.0, "cy": 0.0},
+        loftr_hw=(10, 10),
+        max_points=3,
+        inliers_only=True,
+    )
+
+    assert payload is not None
+    assert np.allclose(payload["confidence"], [0.8, 0.2])
+    assert payload["pnp_inlier_mask"].tolist() == [True, True]

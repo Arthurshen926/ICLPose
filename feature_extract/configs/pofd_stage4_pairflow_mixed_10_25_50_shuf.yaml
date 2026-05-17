@@ -1,0 +1,43 @@
+# POFD Stage4: query-centered pair-flow supervision for single-render CPR.
+#
+# This continues the mixed q10/q25/q50 pair-correlation curriculum but adds a
+# geometry-derived nonzero-offset target matching the Stage4 inference path:
+# render one current pose, project candidate-render world points into the GT
+# query view, and train the pair matcher to recover query->render offsets.
+
+base_config: /root/ICLPose/feature_extract/configs/nvs_pose_feature_adapter_stage1_matchingloc_teacherquality_local_mixed_10_25_50_paircorr_shuf.yaml
+exp_name: pofd_stage4_pairflow_mixed_10_25_50_shuf
+
+training:
+  batch_size: 4
+  validation_batch_size: 4
+  pin_memory: false
+  max_steps: 80
+  eval_every: 20
+
+nvs_pose_feature_adapter:
+  best_metric: pred_cost_m
+  best_metric_mode: min
+  resume_adapter_strict: false
+
+  score_mode: pair_matcher_local
+  score_feature_hw: [34, 60]
+  pair_matcher_radius: 12
+  pair_matcher_score_stride: 4
+  pair_matcher_score_chunk_points: 512
+  pair_matcher_score_candidate_chunk_size: 1
+  pair_matcher_score_offset_chunk_size: 0
+
+  pair_matcher_weight: 0.25
+  stage4_pair_match_flow_weight: 1.0
+  stage4_pair_match_flow_margin_weight: 0.5
+  stage4_pair_match_flow_margin: 0.2
+  stage4_pair_match_flow_cross_candidate_margin_weight: 0.0
+  stage4_pair_match_flow_cross_candidate_margin: 0.2
+  stage4_pair_match_flow_candidate_mode: all
+  stage4_pair_match_flow_hard_negative_min_cost_gap_m: 0.12
+
+  candidate_teacher_quality_weight: 1.0
+  candidate_observability_weight: 0.5
+  rank_ce_weight: 1.0
+  rank_pairwise_weight: 0.5

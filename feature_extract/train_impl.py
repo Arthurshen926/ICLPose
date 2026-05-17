@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 """
 Minimal joint RADIO-DCFF feature-learning scaffold.
 
@@ -656,6 +658,8 @@ def safe_torch_load(path):
         return torch.load(path, map_location="cpu", weights_only=True)
     except TypeError:
         return torch.load(path, map_location="cpu")
+    except pickle.UnpicklingError:
+        return torch.load(path, map_location="cpu", weights_only=False)
 
 
 def load_model_warmstart(model, checkpoint, strict=True, skip_prefixes=None):

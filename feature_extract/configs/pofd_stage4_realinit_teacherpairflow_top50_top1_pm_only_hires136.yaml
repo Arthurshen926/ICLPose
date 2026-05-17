@@ -1,0 +1,22 @@
+# High-resolution companion for render-at-init LoFTR teacher pair-flow.
+#
+# At the Stage3a 34x60 score grid, almost every real-init LoFTR match rounds to
+# a zero offset.  This branch upsamples the POFD score feature grid to 136x240
+# and uses a smaller radius so the teacher correction signal remains visible
+# without moving to the full 272x480 feature grid.
+
+base_config: /root/ICLPose/feature_extract/configs/pofd_stage4_realinit_teacherpairflow_top50_top1_pm_only.yaml
+exp_name: pofd_stage4_realinit_teacherpairflow_top50_top1_pm_only_hires136
+
+nvs_pose_feature_adapter:
+  score_feature_hw: [136, 240]
+  pair_matcher_radius: 6
+  pair_matcher_score_stride: 8
+  pair_matcher_score_chunk_points: 512
+  pair_matcher_score_candidate_chunk_size: 1
+  pair_matcher_score_offset_chunk_size: 0
+
+  teacher_pair_flow_radius: 6
+  teacher_pair_flow_min_points: 4
+  teacher_pair_flow_min_target_offset_px: 0.5
+  teacher_pair_flow_chunk_points: 256

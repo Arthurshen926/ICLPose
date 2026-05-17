@@ -1,0 +1,7 @@
+# POFD-DenseFlow Stage4 deploy-style real-init full182 eval.
+
+base_config: /root/ICLPose/feature_extract/configs/pofd_denseflow_realinit_renderloftr_top50_val128_eval.yaml
+exp_name: pofd_denseflow_realinit_renderloftr_top50_full182_eval
+
+dataset:
+  max_val_samples:

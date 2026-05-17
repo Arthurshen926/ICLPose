@@ -346,18 +346,51 @@ def save_retrieval_init_entries(entries: Sequence[Dict], stats: Dict, save_path:
 
 def load_retrieval_init_entries(load_path: str) -> Tuple[List[Dict], Dict]:
     data = np.load(load_path, allow_pickle=True)
+    files = set(data.files)
+    if "query_img_ids" in files:
+        num_entries = len(data["query_img_ids"])
+        query_img_ids = data["query_img_ids"]
+    else:
+        num_entries = len(data["pose_inits"])
+        query_img_ids = np.arange(num_entries, dtype=np.int64)
+    query_image_names = data["query_image_names"]
+    query_image_stems = (
+        data["query_image_stems"]
+        if "query_image_stems" in files
+        else np.array([Path(str(name)).stem for name in query_image_names])
+    )
+    init_sources = (
+        data["init_sources"]
+        if "init_sources" in files
+        else np.array(["pose_init_cache"] * num_entries)
+    )
+    retrieval_frame_ids = (
+        data["retrieval_frame_ids"]
+        if "retrieval_frame_ids" in files
+        else np.full((num_entries,), -1, dtype=np.int64)
+    )
+    retrieval_image_names = (
+        data["retrieval_image_names"]
+        if "retrieval_image_names" in files
+        else query_image_names
+    )
+    retrieval_scores = (
+        data["retrieval_scores"]
+        if "retrieval_scores" in files
+        else np.zeros((num_entries,), dtype=np.float32)
+    )
     entries: List[Dict] = []
-    for idx in range(len(data["query_img_ids"])):
+    for idx in range(num_entries):
         entries.append(
             {
-                "query_img_id": int(data["query_img_ids"][idx]),
-                "query_image_name": str(data["query_image_names"][idx]),
-                "query_image_stem": str(data["query_image_stems"][idx]),
+                "query_img_id": int(query_img_ids[idx]),
+                "query_image_name": str(query_image_names[idx]),
+                "query_image_stem": str(query_image_stems[idx]),
                 "pose_init": data["pose_inits"][idx].astype(np.float32),
-                "init_source": str(data["init_sources"][idx]),
-                "retrieval_frame_id": int(data["retrieval_frame_ids"][idx]),
-                "retrieval_image_name": str(data["retrieval_image_names"][idx]),
-                "retrieval_score": float(data["retrieval_scores"][idx]),
+                "init_source": str(init_sources[idx]),
+                "retrieval_frame_id": int(retrieval_frame_ids[idx]),
+                "retrieval_image_name": str(retrieval_image_names[idx]),
+                "retrieval_score": float(retrieval_scores[idx]),
             }
         )
         if "pose_init_candidates" in data.files:

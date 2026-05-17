@@ -1,0 +1,8 @@
+# POFD Stage4 deploy-style real-init eval with the stronger NetVLAD+render-LoFTR
+# top50 PnP cache used by the feature_retrieval full182 baselines.
+
+base_config: /root/ICLPose/feature_extract/configs/pofd_stage4_single_render_realinit_netvlad_eval.yaml
+exp_name: pofd_stage4_single_render_realinit_netvlad_renderloftr_top50_eval
+
+dataset:
+  val_pose_candidate_cache: /root/ICLPose/result/result/feature_extract/pose_init_exports/oldhospital_netvlad_renderloftr_top50_quality_fields_test.npz

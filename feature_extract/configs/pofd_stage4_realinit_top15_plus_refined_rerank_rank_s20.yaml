@@ -1,0 +1,37 @@
+# Compact pivot probe: train the current POFD pair-matcher scorer on the
+# strongest 15 real-init candidates plus the appended render-at-init LoFTR
+# refined candidate. This keeps training at 16 candidates to avoid the top51
+# score-map OOM observed on 24GB GPUs.
+
+base_config: /root/ICLPose/feature_extract/configs/pofd_stage4_realinit_top15_plus_renderatinit_refined_full182_eval.yaml
+exp_name: pofd_stage4_realinit_top15_plus_refined_rerank_rank_s20
+
+training:
+  batch_size: 1
+  validation_batch_size: 1
+  max_steps: 20
+  eval_every: 20
+
+dataset:
+  train_pose_candidate_caches:
+    - /root/ICLPose/result/result/feature_extract/pose_init_exports/oldhospital_netvlad_renderloftr_top15_plus_renderatinit_loftr_refined_train_shard000_448_20260517.npz
+    - /root/ICLPose/result/result/feature_extract/pose_init_exports/oldhospital_netvlad_renderloftr_top15_plus_renderatinit_loftr_refined_train_shard448_895_20260517.npz
+  val_pose_candidate_cache: /root/ICLPose/result/result/feature_extract/pose_init_exports/oldhospital_netvlad_renderloftr_top15_plus_renderatinit_loftr_refined_full182_20260517.npz
+  max_val_samples: 64
+  pose_candidate_topk: 16
+
+nvs_pose_feature_adapter:
+  topk: 16
+  best_metric: pred_cost_m
+  best_metric_mode: min
+
+  rank_ce_weight: 1.0
+  rank_pairwise_weight: 0.5
+  candidate_teacher_quality_weight: 1.0
+  candidate_observability_weight: 0.5
+  score_pose_improvement_weight: 0.25
+
+  train_pose_feature_adapter: true
+  train_pair_matcher: true
+  train_pose_energy_net: false
+  pose_energy_enabled: false

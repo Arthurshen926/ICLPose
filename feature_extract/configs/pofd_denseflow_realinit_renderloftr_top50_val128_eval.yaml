@@ -1,0 +1,14 @@
+# POFD-DenseFlow Stage4 deploy-style real-init val128 eval using the
+# NetVLAD+render-LoFTR top50 PnP cache.
+
+base_config: /root/ICLPose/feature_extract/configs/pofd_stage4_single_render_realinit_netvlad_renderloftr_top50_eval.yaml
+exp_name: pofd_denseflow_realinit_renderloftr_top50_val128_eval
+
+nvs_pose_feature_adapter:
+  denseflow_enabled: true
+  stage4_match_source: denseflow
+  stage4_iterations: 1
+  stage4_max_update_trans_m: 0.25
+  stage4_max_update_rot_deg: 8.0
+  stage4_eval_dump_path: stage4_denseflow_update_dump.jsonl
+  stage4_eval_dump_max_rows: 512

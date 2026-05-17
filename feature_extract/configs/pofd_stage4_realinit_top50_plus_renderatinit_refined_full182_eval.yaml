@@ -1,0 +1,15 @@
+# Diagnostic for the stop/pivot branch:
+# keep the original NetVLAD+render-LoFTR top50 PnP candidate bank and append the
+# external render-at-init LoFTR refined pose as candidate 51. This tests whether
+# the current POFD scorer can rerank/fallback around an external correspondence
+# proposal before adding a new POFD uncertainty head.
+
+base_config: /root/ICLPose/feature_extract/configs/pofd_stage4_single_render_realinit_netvlad_renderloftr_top50_full182_eval.yaml
+exp_name: pofd_stage4_realinit_top50_plus_renderatinit_refined_full182_eval
+
+dataset:
+  val_pose_candidate_cache: /root/ICLPose/result/result/feature_extract/pose_init_exports/oldhospital_netvlad_renderloftr_top50_plus_renderatinit_loftr_refined_full182_20260517.npz
+  pose_candidate_topk: 51
+
+nvs_pose_feature_adapter:
+  topk: 51

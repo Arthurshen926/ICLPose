@@ -1,0 +1,46 @@
+# Stage4 real-init pair-flow training on the deploy-style NetVLAD+render-LoFTR
+# top50 cache.  Use only the first cached pose as the single-render init and
+# train the pair matcher offsets directly; keep the adapter frozen so this tests
+# update-direction supervision rather than another feature-space retune.
+
+base_config: /root/ICLPose/feature_extract/configs/pofd_stage4_pairflow_q50_shuf.yaml
+exp_name: pofd_stage4_realinit_pairflow_top50_top1_pm_only
+
+dataset:
+  train_pose_candidate_cache:
+  train_pose_candidate_caches:
+    - /root/ICLPose/result/result/feature_extract/pose_init_exports/oldhospital_netvlad_renderloftr_top50_quality_fields_train_excl_shard000_448.npz
+    - /root/ICLPose/result/result/feature_extract/pose_init_exports/oldhospital_netvlad_renderloftr_top50_quality_fields_train_excl_shard448_895.npz
+  train_pose_candidate_cache_sampling: random
+  val_pose_candidate_cache: /root/ICLPose/result/result/feature_extract/pose_init_exports/oldhospital_netvlad_renderloftr_top50_quality_fields_test.npz
+  val_pose_candidate_cache_sampling: first
+
+training:
+  batch_size: 2
+  validation_batch_size: 2
+  pin_memory: false
+  max_steps: 80
+  eval_every: 20
+
+nvs_pose_feature_adapter:
+  best_metric: stage4_pair_match_flow_acc
+  best_metric_mode: max
+
+  candidate_bank_mode: cache
+  topk: 1
+
+  train_pose_feature_adapter: false
+  train_pair_matcher: true
+  train_pose_energy_net: false
+
+  rank_ce_weight: 0.0
+  rank_pairwise_weight: 0.0
+  candidate_teacher_quality_weight: 0.0
+  candidate_observability_weight: 0.0
+  observability_contrast_weight: 0.0
+  pair_matcher_weight: 0.0
+
+  stage4_pair_match_flow_weight: 1.0
+  stage4_pair_match_flow_margin_weight: 0.5
+  stage4_pair_match_flow_margin: 0.2
+  stage4_pair_match_flow_candidate_mode: all

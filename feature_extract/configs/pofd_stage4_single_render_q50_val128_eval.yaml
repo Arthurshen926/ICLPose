@@ -1,0 +1,34 @@
+# POFD Stage4: single-render continuous CPR on the q50 controlled basin.
+#
+# This keeps the Stage3a POFD feature/pair-matcher checkpoint protocol but
+# removes K-candidate rendering from the final inference path.  Evaluation uses
+# one render per iteration, pair-matcher query->render correspondences, and a
+# robust 2D-3D pose solve.
+
+base_config: /root/ICLPose/feature_extract/configs/pofd_stage3a_multiscale_score_q50_val128_eval.yaml
+exp_name: pofd_stage4_single_render_q50_val128_eval
+
+dataset:
+  max_val_samples: 128
+  teacher_correspondence_val_path:
+  val_pose_candidate_cache: /root/ICLPose/result/result/feature_extract/pose_init_exports/oldhospital_local_lattice_renderloftr_q50cm10deg_top16_noexact_val128_shuf20260515.npz
+
+nvs_pose_feature_adapter:
+  pair_matcher_enabled: true
+  score_mode: pair_matcher_local
+  score_feature_hw: [34, 60]
+  pair_matcher_radius: 12
+  pair_matcher_score_stride: 4
+  pair_matcher_score_chunk_points: 1024
+
+  stage4_iterations: 3
+  stage4_offset_mode: argmax
+  stage4_solver_iterations: 5
+  stage4_solver_damping: 0.001
+  stage4_huber_delta_px: 3.0
+  stage4_max_accept_reproj_px: 3.0
+  stage4_min_confidence: 0.2
+  stage4_max_correspondences: 64
+  stage4_min_points: 64
+  stage4_max_update_trans_m: 0.25
+  stage4_max_update_rot_deg: 8.0

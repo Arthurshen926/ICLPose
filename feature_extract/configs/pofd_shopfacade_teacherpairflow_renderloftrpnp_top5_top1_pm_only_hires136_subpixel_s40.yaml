@@ -1,0 +1,33 @@
+# Continuous-offset companion for the ShopFacade teacher pair-flow probe.
+#
+# The real-image LoFTR + rendered-depth PnP teacher offsets are often below one
+# low-resolution score-grid pixel, so this uses a 136x240 score grid and trains
+# the subpixel objective instead of integer CE.
+
+base_config: /root/ICLPose/feature_extract/configs/pofd_shopfacade_teacherpairflow_renderloftrpnp_top5_top1_pm_only_s40.yaml
+exp_name: pofd_shopfacade_teacherpairflow_renderloftrpnp_top5_top1_pm_only_hires136_subpixel_s40
+
+dataset:
+  teacher_correspondence_max_points: 256
+
+nvs_pose_feature_adapter:
+  best_metric: nvs_teacher_pair_flow_subpixel_epe
+  best_metric_mode: min
+
+  score_feature_hw: [136, 240]
+  pair_matcher_radius: 6
+  pair_matcher_temperature: 0.2
+  pair_matcher_score_stride: 8
+  pair_matcher_score_chunk_points: 256
+  pair_matcher_score_candidate_chunk_size: 1
+  pair_matcher_score_offset_chunk_size: 0
+
+  teacher_pair_flow_radius: 6
+  teacher_pair_flow_temperature: 0.2
+  teacher_pair_flow_min_points: 4
+  teacher_pair_flow_min_target_offset_px: 0.25
+  teacher_pair_flow_ce_weight: 0.0
+  teacher_pair_flow_margin_weight: 0.0
+  teacher_pair_flow_subpixel_weight: 5.0
+  teacher_pair_flow_subpixel_beta: 0.5
+  teacher_pair_flow_chunk_points: 256

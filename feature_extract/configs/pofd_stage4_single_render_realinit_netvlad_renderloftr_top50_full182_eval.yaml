@@ -1,0 +1,12 @@
+# POFD Stage4 deploy-style real-init full182 eval with the stronger
+# NetVLAD+render-LoFTR top50 PnP cache.
+#
+# The base top50 config inherits the q50 val128 eval cap. This companion keeps
+# the same cache and Stage4 settings but removes the validation sample cap for
+# full OldHospital test-set evidence.
+
+base_config: /root/ICLPose/feature_extract/configs/pofd_stage4_single_render_realinit_netvlad_renderloftr_top50_eval.yaml
+exp_name: pofd_stage4_single_render_realinit_netvlad_renderloftr_top50_full182_eval
+
+dataset:
+  max_val_samples:

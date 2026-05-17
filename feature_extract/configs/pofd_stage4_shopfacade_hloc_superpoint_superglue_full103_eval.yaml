@@ -1,0 +1,9 @@
+# POFD Stage4 deploy-style eval from the public HLoc SuperPoint+SuperGlue
+# initializer cache on ShopFacade. This reuses the prepared ShopFacade scene
+# field and swaps only the validation pose cache.
+
+base_config: /root/ICLPose/feature_extract/configs/pofd_stage4_shopfacade_realinit_renderloftrpnp_top5_reprojmedian_full103_eval.yaml
+exp_name: pofd_stage4_shopfacade_hloc_superpoint_superglue_full103_eval
+
+dataset:
+  val_pose_candidate_cache: /root/ICLPose/result/result/feature_extract/pose_init_exports/shopfacade_hloc_superpoint_superglue_test_20260517.npz

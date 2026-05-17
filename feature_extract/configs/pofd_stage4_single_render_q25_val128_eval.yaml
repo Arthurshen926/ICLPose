@@ -1,0 +1,10 @@
+# POFD Stage4 q25 controlled-basin regression eval.
+
+base_config: /root/ICLPose/feature_extract/configs/pofd_stage4_single_render_q50_val128_eval.yaml
+exp_name: pofd_stage4_single_render_q25_val128_eval
+
+dataset:
+  max_val_samples: 128
+  teacher_correspondence_val_path:
+  train_pose_candidate_cache: /root/ICLPose/result/result/feature_extract/pose_init_exports/oldhospital_local_lattice_renderloftr_q25cm5deg_top16_noexact_train256_shuf20260515.npz
+  val_pose_candidate_cache: /root/ICLPose/result/result/feature_extract/pose_init_exports/oldhospital_local_lattice_renderloftr_q25cm5deg_top16_noexact_val128_shuf20260515.npz

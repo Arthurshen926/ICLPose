@@ -1,0 +1,16 @@
+# ShopFacade Stage4 eval for the low-resolution teacher-pair-flow checkpoint.
+#
+# The pair matcher was trained only on candidate-0 teacher correspondences.
+# This evaluation keeps the strongest no-GT external initializer
+# (NetVLAD+real-LoFTR/rendered-depth PnP selected by PnP median reprojection)
+# and asks whether the learned single-render pair matcher can propose accepted
+# pose updates.
+
+base_config: /root/ICLPose/feature_extract/configs/pofd_stage4_shopfacade_realinit_renderloftrpnp_top5_reprojmedian_full103_eval.yaml
+exp_name: pofd_stage4_shopfacade_teacherpairflow_renderloftrpnp_top5_reprojmedian_full103_eval
+
+nvs_pose_feature_adapter:
+  stage4_offset_mode: argmax
+  stage4_min_confidence: 0.0
+  stage4_max_correspondences: 128
+  stage4_min_points: 32

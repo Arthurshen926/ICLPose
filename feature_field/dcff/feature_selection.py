@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 Feature Selection Module (FSM) — learns to select and refine fine/coarse features.
 

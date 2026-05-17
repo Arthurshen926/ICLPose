@@ -27,6 +27,7 @@ import math
 import time
 import yaml
 import argparse
+import inspect
 import numpy as np
 import torch
 import torch.nn as nn
@@ -185,10 +186,10 @@ def _init_distributed():
     is_distributed = world_size > 1
     if is_distributed:
         torch.cuda.set_device(local_rank)
-        dist.init_process_group(
-            backend="nccl",
-            device_id=torch.device("cuda", local_rank),
-        )
+        init_kwargs = {"backend": "nccl"}
+        if "device_id" in inspect.signature(dist.init_process_group).parameters:
+            init_kwargs["device_id"] = torch.device("cuda", local_rank)
+        dist.init_process_group(**init_kwargs)
     return is_distributed, rank, local_rank, world_size
 
 

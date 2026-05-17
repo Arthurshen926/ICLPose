@@ -1,0 +1,49 @@
+# ShopFacade POFD teacher pair-flow probe.
+#
+# Uses real-image LoFTR + rendered-depth PnP teacher correspondences, but only
+# trains the query-centered pair matcher on candidate 0.  This keeps the frozen
+# localization adapter out of the experiment and tests whether the ShopFacade
+# teacher store can teach a POFD-owned single-render update direction.
+
+base_config: /root/ICLPose/feature_extract/configs/pofd_stage4_realinit_teacherpairflow_top50_top1_pm_only.yaml
+exp_name: pofd_shopfacade_teacherpairflow_renderloftrpnp_top5_top1_pm_only_s40
+
+dataset:
+  source_dir: /hy-tmp/Cambridge_stdloc/ShopFacade
+  colmap_dir: /hy-tmp/Cambridge_stdloc/ShopFacade/sparse/0
+  feature_dir: /root/ICLPose/result/result/feature_extract/features_radio_dual_v68_align_stop640/cambridge_shopfacade
+  train_split: /hy-tmp/Cambridge_stdloc/ShopFacade/dataset_train.txt
+  val_split: /hy-tmp/Cambridge_stdloc/ShopFacade/dataset_test.txt
+  image_patterns:
+    - seq*/*.png
+  input_hw: [1088, 1920]
+  student_feature_hw: [68, 120]
+  student_coarse_feature_hw: [17, 30]
+  pose_candidate_topk: 1
+  train_pose_candidate_cache: /root/ICLPose/result/result/feature_extract/pose_init_exports/shopfacade_netvlad_renderloftrpnp_top5_train_excl_20260517.npz
+  train_pose_candidate_caches:
+  val_pose_candidate_cache: /root/ICLPose/result/result/feature_extract/pose_init_exports/shopfacade_netvlad_renderloftrpnp_top5_test_corr_20260517.npz
+  val_pose_candidate_caches:
+  teacher_correspondence_train_path: /root/ICLPose/result/result/feature_extract/teacher_corr/shopfacade_train_netvlad_renderloftrpnp_top5_20260517
+  teacher_correspondence_val_path: /root/ICLPose/result/result/feature_extract/teacher_corr/shopfacade_test_netvlad_renderloftrpnp_top5_20260517
+  teacher_correspondence_max_points: 512
+  teacher_correspondence_coordinate_space: auto
+  max_train_samples:
+  max_val_samples:
+
+map_supervision:
+  config_path: /root/ICLPose/feature_field/configs/reconstruction_cambridge_shopfacade_processed_cached64_v11_residual_spatial_v68.yaml
+  colmap_dir: /hy-tmp/Cambridge_stdloc/ShopFacade/sparse/0
+
+training:
+  batch_size: 2
+  validation_batch_size: 2
+  max_steps: 40
+  eval_every: 20
+  num_workers: 0
+  amp: false
+
+nvs_pose_feature_adapter:
+  topk: 1
+  pair_matcher_score_candidate_chunk_size: 1
+  teacher_pair_flow_chunk_points: 256

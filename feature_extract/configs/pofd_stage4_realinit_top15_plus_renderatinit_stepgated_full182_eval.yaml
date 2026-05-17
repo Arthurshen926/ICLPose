@@ -1,0 +1,9 @@
+# Compact pivot diagnostic with the no-GT pose-step-gated external LoFTR pose
+# appended as candidate 16. This keeps the old top16 memory footprint while
+# testing whether POFD/reranking can exploit the stronger external proposal.
+
+base_config: /root/ICLPose/feature_extract/configs/pofd_stage4_realinit_top15_plus_renderatinit_refined_full182_eval.yaml
+exp_name: pofd_stage4_realinit_top15_plus_renderatinit_stepgated_full182_eval
+
+dataset:
+  val_pose_candidate_cache: /root/ICLPose/result/result/feature_extract/pose_init_exports/oldhospital_netvlad_renderloftr_top15_plus_renderatinit_loftr_stepgated_full182_20260517.npz

@@ -1,0 +1,11 @@
+# Eval-only POFD Stage4 q50 with explicit correction-magnitude score reward.
+#
+# The reward counteracts the q50 failure mode where pair-matcher candidate scores
+# under-correct toward the cached init pose.
+
+base_config: /root/ICLPose/feature_extract/configs/pofd_stage4_pairflow_q50_val128_eval.yaml
+exp_name: pofd_stage4_pairflow_delta_reward_q50_val128_eval
+
+nvs_pose_feature_adapter:
+  candidate_delta_trans_score_reward: 2.0
+

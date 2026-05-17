@@ -53,23 +53,25 @@ def payload_from_loftr_result(
     map_xy = np.asarray(extra.get("ref_keypoints", np.zeros((0, 2))), dtype=np.float32)
     confidence = np.asarray(extra.get("confidence", np.zeros((0,))), dtype=np.float32)
     pts3d = np.asarray(extra.get("pts3d_world", np.zeros((len(query_xy), 3))), dtype=np.float32)
+    inlier_mask = np.asarray(extra.get("pnp_inlier_mask", np.ones((len(query_xy),), dtype=bool)), dtype=bool)
     if query_xy.ndim != 2 or query_xy.shape[-1] != 2:
         query_xy = np.zeros((0, 2), dtype=np.float32)
     if map_xy.ndim != 2 or map_xy.shape[-1] != 2:
         map_xy = np.zeros((0, 2), dtype=np.float32)
-    count = min(len(query_xy), len(map_xy), len(confidence), len(pts3d))
+    count = min(len(query_xy), len(map_xy), len(confidence), len(pts3d), len(inlier_mask))
     query_xy = query_xy[:count]
     map_xy = map_xy[:count]
     confidence = confidence[:count]
     pts3d = pts3d[:count]
+    inlier_mask = inlier_mask[:count]
 
     if bool(inlier_only) and count > 0:
-        inliers = np.asarray(extra.get("pnp_inlier_mask", np.ones((count,), dtype=bool)), dtype=bool)[:count]
-        if int(inliers.sum()) > 0:
-            query_xy = query_xy[inliers]
-            map_xy = map_xy[inliers]
-            confidence = confidence[inliers]
-            pts3d = pts3d[inliers]
+        if int(inlier_mask.sum()) > 0:
+            query_xy = query_xy[inlier_mask]
+            map_xy = map_xy[inlier_mask]
+            confidence = confidence[inlier_mask]
+            pts3d = pts3d[inlier_mask]
+            inlier_mask = inlier_mask[inlier_mask]
 
     if len(confidence) > 0:
         order = np.argsort(-confidence)
@@ -79,6 +81,7 @@ def payload_from_loftr_result(
         map_xy = map_xy[order]
         confidence = confidence[order]
         pts3d = pts3d[order]
+        inlier_mask = inlier_mask[order]
 
     loftr_hw = np.asarray(extra.get("loftr_hw", [0, 0]), dtype=np.int32).reshape(-1)
     if loftr_hw.size < 2:
@@ -90,6 +93,7 @@ def payload_from_loftr_result(
         "map_xy": map_xy.astype(np.float32),
         "pts3d_world": pts3d.astype(np.float32),
         "confidence": confidence.astype(np.float32),
+        "pnp_inlier_mask": inlier_mask.astype(bool),
         "query_hw": loftr_hw.astype(np.int32),
         "map_hw": loftr_hw.astype(np.int32),
         "coordinate_space": np.asarray("image"),
@@ -255,4 +259,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

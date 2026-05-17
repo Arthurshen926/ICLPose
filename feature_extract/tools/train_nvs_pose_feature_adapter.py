@@ -13,12 +13,29 @@ import json
 import math
 import sys
 from pathlib import Path
-from typing import Dict, Iterable, List
+from typing import Any, Dict, Iterable, List
 
 import torch
 import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+
+if not hasattr(argparse, "BooleanOptionalAction"):
+    class _BooleanOptionalAction(argparse.Action):
+        def __init__(self, option_strings, dest, default=None, **kwargs):
+            options = []
+            for option in option_strings:
+                options.append(option)
+                if option.startswith("--"):
+                    options.append("--no-" + option[2:])
+            super().__init__(option_strings=options, dest=dest, nargs=0, default=default, **kwargs)
+
+        def __call__(self, parser, namespace, values, option_string=None):
+            setattr(namespace, self.dest, not str(option_string).startswith("--no-"))
+
+    argparse.BooleanOptionalAction = _BooleanOptionalAction
+
 
 from feature_extract.students.pose_energy_net import (  # noqa: E402
     PairConditionedLocalMatcher,
@@ -28,6 +45,11 @@ from feature_extract.students.pose_energy_net import (  # noqa: E402
     pose_energy_factorized_selection,
     pose_energy_losses,
     pose_energy_selection_scores,
+)
+from feature_extract.denseflow_proposal import (  # noqa: E402
+    PofdDenseFlowHead,
+    denseflow_gt_flow_from_render_depth,
+    denseflow_supervision_loss,
 )
 from feature_extract.pose_observability import feature_pose_fisher_stats  # noqa: E402
 from feature_extract.tools.eval_cpr_buckets import build_model_and_data, map_pose_gt_for_batch  # noqa: E402
@@ -125,6 +147,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume-adapter", default=None)
     parser.add_argument("--resume-adapter-strict", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--eval-only", action="store_true")
+    parser.add_argument("--stage4-eval-only", action="store_true")
+    parser.add_argument("--eval-failure-dump-path", default=None)
+    parser.add_argument("--eval-failure-dump-max-rows", type=int, default=None)
+    parser.add_argument("--eval-failure-dump-min-gap-m", type=float, default=None)
+    parser.add_argument("--eval-failure-dump-top-n", type=int, default=None)
+    parser.add_argument("--eval-failure-dump-include-correct", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--stage4-eval-dump-path", default=None)
+    parser.add_argument("--stage4-eval-dump-max-rows", type=int, default=None)
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--train-split", choices=("train", "val"), default="train")
@@ -186,11 +216,73 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pair-matcher-score-chunk-points", type=int, default=None)
     parser.add_argument("--pair-matcher-score-candidate-chunk-size", type=int, default=None)
     parser.add_argument("--pair-matcher-score-offset-chunk-size", type=int, default=None)
+    parser.add_argument("--pair-matcher-score-pooling", choices=("mean", "topk_mean"), default=None)
+    parser.add_argument("--pair-matcher-score-topk-fraction", type=float, default=None)
     parser.add_argument(
         "--pair-matcher-candidate-score-mode",
         choices=("center_logprob_margin", "center_margin"),
         default=None,
     )
+    parser.add_argument("--teacher-pair-flow-weight", type=float, default=None)
+    parser.add_argument("--teacher-pair-flow-radius", type=int, default=None)
+    parser.add_argument("--teacher-pair-flow-temperature", type=float, default=None)
+    parser.add_argument("--teacher-pair-flow-min-confidence", type=float, default=None)
+    parser.add_argument("--teacher-pair-flow-min-points", type=int, default=None)
+    parser.add_argument("--teacher-pair-flow-min-target-offset-px", type=float, default=None)
+    parser.add_argument("--teacher-pair-flow-ce-weight", type=float, default=None)
+    parser.add_argument("--teacher-pair-flow-subpixel-weight", type=float, default=None)
+    parser.add_argument("--teacher-pair-flow-subpixel-beta", type=float, default=None)
+    parser.add_argument("--teacher-pair-flow-margin-weight", type=float, default=None)
+    parser.add_argument("--teacher-pair-flow-margin", type=float, default=None)
+    parser.add_argument("--teacher-pair-flow-candidate-index", type=int, default=None)
+    parser.add_argument("--teacher-pair-flow-chunk-points", type=int, default=None)
+    parser.add_argument("--denseflow-enabled", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--denseflow-weight", type=float, default=None)
+    parser.add_argument("--denseflow-flow-weight", type=float, default=None)
+    parser.add_argument("--denseflow-confidence-weight", type=float, default=None)
+    parser.add_argument("--denseflow-hidden-dim", type=int, default=None)
+    parser.add_argument("--denseflow-radius", type=int, default=None)
+    parser.add_argument("--denseflow-max-flow-px", type=float, default=None)
+    parser.add_argument("--candidate-delta-trans-score-penalty", type=float, default=None)
+    parser.add_argument("--candidate-delta-rot-score-penalty", type=float, default=None)
+    parser.add_argument("--candidate-delta-trans-score-reward", type=float, default=None)
+    parser.add_argument("--candidate-delta-rot-score-reward", type=float, default=None)
+    parser.add_argument("--stage4-iterations", type=int, default=None)
+    parser.add_argument("--stage4-match-source", choices=("pair_matcher", "local_corr", "denseflow"), default=None)
+    parser.add_argument("--stage4-offset-mode", choices=("expected", "argmax"), default=None)
+    parser.add_argument("--stage4-solver-iterations", type=int, default=None)
+    parser.add_argument("--stage4-solver-damping", type=float, default=None)
+    parser.add_argument("--stage4-huber-delta-px", type=float, default=None)
+    parser.add_argument("--stage4-max-accept-reproj-px", type=float, default=None)
+    parser.add_argument("--stage4-max-accept-update-trans-m", type=float, default=None)
+    parser.add_argument("--stage4-max-accept-update-rot-deg", type=float, default=None)
+    parser.add_argument("--stage4-proposal-virtual-gate-enabled", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--stage4-proposal-virtual-min-score-gap", type=float, default=None)
+    parser.add_argument("--stage4-proposal-virtual-min-valid-frac", type=float, default=None)
+    parser.add_argument("--stage4-min-confidence", type=float, default=None)
+    parser.add_argument("--stage4-max-correspondences", type=int, default=None)
+    parser.add_argument("--stage4-min-points", type=int, default=None)
+    parser.add_argument("--stage4-max-update-trans-m", type=float, default=None)
+    parser.add_argument("--stage4-max-update-rot-deg", type=float, default=None)
+    parser.add_argument("--stage4-virtual-trust-region-enabled", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--stage4-virtual-trust-region-trans-cm", default=None)
+    parser.add_argument("--stage4-virtual-trust-region-rot-deg", default=None)
+    parser.add_argument("--stage4-virtual-trust-region-max-candidates", type=int, default=None)
+    parser.add_argument("--stage4-virtual-trust-region-min-score-gap", type=float, default=None)
+    parser.add_argument("--stage4-virtual-trust-region-combine-trans-rot", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--stage4-virtual-trust-region-limit-strategy", default=None)
+    parser.add_argument("--stage4-pair-match-flow-weight", type=float, default=None)
+    parser.add_argument("--stage4-pair-match-flow-margin-weight", type=float, default=None)
+    parser.add_argument("--stage4-pair-match-flow-margin", type=float, default=None)
+    parser.add_argument("--stage4-pair-match-flow-cross-candidate-margin-weight", type=float, default=None)
+    parser.add_argument("--stage4-pair-match-flow-cross-candidate-margin", type=float, default=None)
+    parser.add_argument("--stage4-pair-match-flow-positive-only-ce", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument(
+        "--stage4-pair-match-flow-candidate-mode",
+        choices=("all", "best", "best_only", "best_and_hard_negative", "hard_negative", "hard"),
+        default=None,
+    )
+    parser.add_argument("--stage4-pair-match-flow-hard-negative-min-cost-gap-m", type=float, default=None)
     parser.add_argument("--query-fine-key", default=None)
     parser.add_argument("--topk", type=int, default=None)
     parser.add_argument("--lattice-trans-cm", default=None)
@@ -256,6 +348,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--candidate-teacher-quality-logit-margin", type=float, default=None)
     parser.add_argument("--candidate-teacher-quality-start-step", type=int, default=None)
     parser.add_argument("--candidate-teacher-quality-warmup-steps", type=int, default=None)
+    parser.add_argument("--candidate-teacher-quality-score-prior-weight", type=float, default=None)
+    parser.add_argument("--candidate-identity-fallback-min-score-gap", type=float, default=None)
     parser.add_argument("--align-weight", type=float, default=None)
     parser.add_argument("--align-margin", type=float, default=None)
     parser.add_argument("--warp-align-weight", type=float, default=None)
@@ -432,6 +526,8 @@ def apply_config_defaults(args: argparse.Namespace, cfg: Dict) -> argparse.Names
         "candidate_teacher_quality_logit_margin": 0.5,
         "candidate_teacher_quality_start_step": 0,
         "candidate_teacher_quality_warmup_steps": 0,
+        "candidate_teacher_quality_score_prior_weight": 0.0,
+        "candidate_identity_fallback_min_score_gap": 0.0,
         "candidate_bank_mode": "lattice",
         "topk": 64,
         "lattice_trans_cm": "0,2,5,10,25,50",
@@ -555,6 +651,13 @@ def apply_config_defaults(args: argparse.Namespace, cfg: Dict) -> argparse.Names
         "pose_feature_adapter_texture_fusion_mode": "residual",
         "pose_feature_adapter_base_anchor_weight": 1.0,
         "pose_observability_diagnostic_enabled": False,
+        "eval_failure_dump_path": None,
+        "eval_failure_dump_max_rows": 256,
+        "eval_failure_dump_min_gap_m": 0.0,
+        "eval_failure_dump_top_n": 5,
+        "eval_failure_dump_include_correct": False,
+        "stage4_eval_dump_path": None,
+        "stage4_eval_dump_max_rows": 0,
         "pair_matcher_enabled": False,
         "pair_matcher_weight": 0.0,
         "pair_matcher_hidden_dim": 64,
@@ -571,7 +674,65 @@ def apply_config_defaults(args: argparse.Namespace, cfg: Dict) -> argparse.Names
         "pair_matcher_score_chunk_points": 65536,
         "pair_matcher_score_candidate_chunk_size": 0,
         "pair_matcher_score_offset_chunk_size": 0,
+        "pair_matcher_score_pooling": "mean",
+        "pair_matcher_score_topk_fraction": 0.25,
         "pair_matcher_candidate_score_mode": "center_logprob_margin",
+        "teacher_pair_flow_weight": 0.0,
+        "teacher_pair_flow_radius": 3,
+        "teacher_pair_flow_temperature": 0.05,
+        "teacher_pair_flow_min_confidence": 0.0,
+        "teacher_pair_flow_min_points": 4,
+        "teacher_pair_flow_min_target_offset_px": 0.0,
+        "teacher_pair_flow_ce_weight": 1.0,
+        "teacher_pair_flow_subpixel_weight": 0.0,
+        "teacher_pair_flow_subpixel_beta": 0.25,
+        "teacher_pair_flow_margin_weight": 0.0,
+        "teacher_pair_flow_margin": 0.05,
+        "teacher_pair_flow_candidate_index": 0,
+        "teacher_pair_flow_chunk_points": 1024,
+        "denseflow_enabled": False,
+        "denseflow_weight": 0.0,
+        "denseflow_flow_weight": 1.0,
+        "denseflow_confidence_weight": 0.0,
+        "denseflow_hidden_dim": 64,
+        "denseflow_radius": 8,
+        "denseflow_max_flow_px": 8.0,
+        "candidate_delta_trans_score_penalty": 0.0,
+        "candidate_delta_rot_score_penalty": 0.0,
+        "candidate_delta_trans_score_reward": 0.0,
+        "candidate_delta_rot_score_reward": 0.0,
+        "stage4_iterations": 3,
+        "stage4_match_source": "pair_matcher",
+        "stage4_offset_mode": "argmax",
+        "stage4_solver_iterations": 5,
+        "stage4_solver_damping": 1.0e-3,
+        "stage4_huber_delta_px": 3.0,
+        "stage4_max_accept_reproj_px": 3.0,
+        "stage4_max_accept_update_trans_m": 0.0,
+        "stage4_max_accept_update_rot_deg": 0.0,
+        "stage4_proposal_virtual_gate_enabled": False,
+        "stage4_proposal_virtual_min_score_gap": 0.0,
+        "stage4_proposal_virtual_min_valid_frac": 0.0,
+        "stage4_min_confidence": 0.0,
+        "stage4_max_correspondences": 0,
+        "stage4_min_points": 64,
+        "stage4_max_update_trans_m": 0.25,
+        "stage4_max_update_rot_deg": 8.0,
+        "stage4_virtual_trust_region_enabled": False,
+        "stage4_virtual_trust_region_trans_cm": "5,10,20",
+        "stage4_virtual_trust_region_rot_deg": "1,3,5",
+        "stage4_virtual_trust_region_max_candidates": 25,
+        "stage4_virtual_trust_region_min_score_gap": 0.0,
+        "stage4_virtual_trust_region_combine_trans_rot": False,
+        "stage4_virtual_trust_region_limit_strategy": "head",
+        "stage4_pair_match_flow_weight": 0.0,
+        "stage4_pair_match_flow_margin_weight": 0.0,
+        "stage4_pair_match_flow_margin": 0.05,
+        "stage4_pair_match_flow_cross_candidate_margin_weight": 0.0,
+        "stage4_pair_match_flow_cross_candidate_margin": 0.10,
+        "stage4_pair_match_flow_positive_only_ce": False,
+        "stage4_pair_match_flow_candidate_mode": "all",
+        "stage4_pair_match_flow_hard_negative_min_cost_gap_m": 0.10,
         "synthetic_ratio": 0.5,
         "synthetic_trans_cm": 50.0,
         "synthetic_rot_deg": 10.0,
@@ -687,6 +848,125 @@ def candidate_identity_mask(
     trace = rel_rot[:, :, 0, 0] + rel_rot[:, :, 1, 1] + rel_rot[:, :, 2, 2]
     rot_delta = torch.acos(torch.clamp((trace - 1.0) * 0.5, -1.0, 1.0))
     return (trans_delta <= float(trans_eps_m)) & (rot_delta <= float(rot_eps_rad))
+
+
+def apply_candidate_identity_fallback_score_gate(
+    candidate_scores: torch.Tensor,
+    identity_mask: torch.Tensor,
+    *,
+    valid_mask: torch.Tensor,
+    min_score_gap: float = 0.0,
+) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """Force init/identity selection when the best alternative is not decisive."""
+    if candidate_scores.ndim != 2:
+        raise ValueError(f"candidate_scores must have shape (B,K), got {tuple(candidate_scores.shape)}")
+    valid = valid_mask.to(device=candidate_scores.device).bool()
+    if valid.shape != candidate_scores.shape:
+        raise ValueError(f"valid_mask must have shape {tuple(candidate_scores.shape)}, got {tuple(valid.shape)}")
+    identity_raw = identity_mask.to(device=candidate_scores.device).bool()
+    if identity_raw.shape != candidate_scores.shape:
+        raise ValueError(f"identity_mask must have shape {tuple(candidate_scores.shape)}, got {tuple(identity_raw.shape)}")
+    identity = identity_raw & valid
+
+    margin = float(min_score_gap)
+    zero = candidate_scores.new_zeros(())
+    metrics = {
+        "candidate_identity_fallback_min_score_gap": candidate_scores.new_tensor(margin),
+        "candidate_identity_fallback_active": zero.detach(),
+        "candidate_identity_fallback_score_gap": zero.detach(),
+    }
+    if margin <= 0.0:
+        return candidate_scores, metrics
+
+    neg_inf = torch.finfo(candidate_scores.dtype).min
+    valid_scores = candidate_scores.masked_fill(~valid, neg_inf)
+    identity_scores = candidate_scores.masked_fill(~identity, neg_inf)
+    non_identity_scores = candidate_scores.masked_fill(~(valid & ~identity), neg_inf)
+    has_identity = identity.any(dim=1)
+    has_non_identity = (valid & ~identity).any(dim=1)
+    identity_score = identity_scores.max(dim=1).values
+    non_identity_score = non_identity_scores.max(dim=1).values
+    score_gap = non_identity_score - identity_score
+    fallback = has_identity & has_non_identity & (score_gap < margin)
+    if not bool(fallback.any()):
+        metrics["candidate_identity_fallback_score_gap"] = score_gap[has_identity & has_non_identity].mean().detach()
+        return candidate_scores, metrics
+
+    adjusted = candidate_scores.clone()
+    row_max = valid_scores.max(dim=1, keepdim=True).values
+    boost_value = row_max + abs(margin) + 1.0e-3
+    adjusted = torch.where(fallback[:, None] & identity, boost_value, adjusted)
+    active_rows = has_identity & has_non_identity
+    metrics.update(
+        {
+            "candidate_identity_fallback_active": fallback.float().mean().detach(),
+            "candidate_identity_fallback_score_gap": score_gap[active_rows].mean().detach()
+            if bool(active_rows.any())
+            else zero.detach(),
+        }
+    )
+    return adjusted, metrics
+
+
+def apply_candidate_delta_score_prior(
+    candidate_scores: torch.Tensor,
+    candidate_pose: torch.Tensor,
+    init_pose: torch.Tensor,
+    *,
+    trans_weight: float = 0.0,
+    rot_weight: float = 0.0,
+    trans_reward: float = 0.0,
+    rot_reward: float = 0.0,
+) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """Optionally adjust candidate scores by their step size from init pose."""
+    if candidate_scores.ndim != 2:
+        raise ValueError("candidate_scores must have shape (B,K)")
+    if candidate_pose.ndim != 4 or candidate_pose.shape[-2:] != (4, 4):
+        raise ValueError("candidate_pose must have shape (B,K,4,4)")
+    if init_pose.ndim != 3 or init_pose.shape[-2:] != (4, 4):
+        raise ValueError("init_pose must have shape (B,4,4)")
+    if tuple(candidate_pose.shape[:2]) != tuple(candidate_scores.shape):
+        raise ValueError("candidate_pose and candidate_scores must share B,K")
+    if init_pose.shape[0] != candidate_scores.shape[0]:
+        raise ValueError("init_pose batch size must match candidate_scores")
+
+    device = candidate_scores.device
+    dtype = candidate_scores.dtype
+    trans_w = float(trans_weight)
+    rot_w = float(rot_weight)
+    trans_r = float(trans_reward)
+    rot_r = float(rot_reward)
+    zero = candidate_scores.new_zeros(())
+    metrics: Dict[str, torch.Tensor] = {
+        "candidate_delta_score_prior_trans_weight": candidate_scores.new_tensor(trans_w),
+        "candidate_delta_score_prior_rot_weight": candidate_scores.new_tensor(rot_w),
+        "candidate_delta_score_prior_trans_reward": candidate_scores.new_tensor(trans_r),
+        "candidate_delta_score_prior_rot_reward": candidate_scores.new_tensor(rot_r),
+        "candidate_delta_score_prior_trans_m": zero.detach(),
+        "candidate_delta_score_prior_rot_deg": zero.detach(),
+        "candidate_delta_score_prior_shift_mean": zero.detach(),
+    }
+    if trans_w == 0.0 and rot_w == 0.0 and trans_r == 0.0 and rot_r == 0.0:
+        return candidate_scores, metrics
+
+    bsz, num_candidates = candidate_scores.shape
+    init_expanded = init_pose.to(device=device).float()[:, None].expand(-1, num_candidates, -1, -1)
+    _delta_loss, delta_rot_deg, delta_trans = pose_error_tensors(
+        candidate_pose.to(device=device).float().reshape(-1, 4, 4),
+        init_expanded.reshape(-1, 4, 4),
+    )
+    delta_trans = delta_trans.reshape(bsz, num_candidates).to(device=device, dtype=dtype)
+    delta_rot_deg = delta_rot_deg.reshape(bsz, num_candidates).to(device=device, dtype=dtype)
+    shift = (trans_r - trans_w) * delta_trans + (rot_r - rot_w) * delta_rot_deg
+    adjusted = candidate_scores + shift
+    metrics.update(
+        {
+            "candidate_delta_score_prior_trans_m": delta_trans.detach().mean(),
+            "candidate_delta_score_prior_rot_deg": delta_rot_deg.detach().mean(),
+            "candidate_delta_score_prior_shift_mean": shift.detach().mean(),
+        }
+    )
+    return adjusted, metrics
 
 
 def adaptive_lattice_spec_for_error(trans_m: float, rot_rad: float) -> tuple[List[float], List[float]]:
@@ -1272,6 +1552,10 @@ def hard_flow_candidate_selection_mask(
 
     return {
         "selection_mask": selection,
+        "best_mask": F.one_hot(best_idx.clamp(min=0), num_classes=valid.shape[1]).to(device=valid.device).bool()
+        & best_valid[:, None],
+        "hard_negative_mask": F.one_hot(hard_idx.clamp(min=0), num_classes=valid.shape[1]).to(device=valid.device).bool()
+        & has_hard[:, None],
         "best_index": best_idx.detach(),
         "hard_negative_index": hard_idx.detach(),
         "best_active": best_valid.float().mean().detach(),
@@ -1589,6 +1873,84 @@ def project_world_positions_to_feature_grid(
     if squeeze_candidate:
         return grid[:, 0], valid[:, 0], z_map[:, 0]
     return grid, valid, z_map
+
+
+def stage4_virtual_pose_energy_scores(
+    query_feature: torch.Tensor,
+    render_feature: torch.Tensor,
+    render_position: torch.Tensor,
+    candidate_poses: torch.Tensor,
+    intrinsics: torch.Tensor,
+    mask: torch.Tensor | None = None,
+    *,
+    score_feature_hw: tuple[int, int] | None = None,
+    source_hw: tuple[int, int] | None = None,
+) -> Dict[str, torch.Tensor]:
+    """Score virtual SE(3) candidates from one render via projective sampling."""
+    if query_feature.ndim != 4 or render_feature.ndim != 4:
+        raise ValueError("query_feature and render_feature must have shape (B,C,H,W)")
+    if render_position.ndim != 4 or render_position.shape[1] != 3:
+        raise ValueError("render_position must have shape (B,3,H,W)")
+    if candidate_poses.ndim != 4 or candidate_poses.shape[-2:] != (4, 4):
+        raise ValueError("candidate_poses must have shape (B,K,4,4)")
+    bsz, num_candidates = candidate_poses.shape[:2]
+    if query_feature.shape[0] != bsz or render_feature.shape[0] != bsz or render_position.shape[0] != bsz:
+        raise ValueError("query/render/position/candidate batch sizes must match")
+    target_hw = tuple(score_feature_hw or render_feature.shape[-2:])
+    source_hw = tuple(source_hw or query_feature.shape[-2:])
+    query = _resize_feature(query_feature.float(), target_hw)
+    render = _resize_feature(render_feature.float(), target_hw)
+    position = render_position.float()
+    if tuple(position.shape[-2:]) != target_hw:
+        position = F.interpolate(position, size=target_hw, mode="bilinear", align_corners=False)
+    scaled_intrinsics = _scale_intrinsics_between_hw(intrinsics.float(), source_hw, target_hw)
+    valid_base = torch.ones((bsz, 1, *target_hw), device=query.device, dtype=torch.bool)
+    if mask is not None:
+        valid_base = _resize_mask(mask, target_hw).to(device=query.device) > 0.5
+        if valid_base.ndim == 3:
+            valid_base = valid_base[:, None]
+        if valid_base.ndim == 5 and valid_base.shape[1] == 1:
+            valid_base = valid_base[:, 0]
+        if valid_base.ndim != 4:
+            raise ValueError("mask must broadcast to shape (B,1,H,W)")
+    channels = min(int(query.shape[1]), int(render.shape[1]))
+    query = F.normalize(query[:, :channels], dim=1, eps=1.0e-6)
+    render = F.normalize(render[:, :channels], dim=1, eps=1.0e-6)
+    score_rows = []
+    valid_rows = []
+    for cand_idx in range(num_candidates):
+        grid, projected_valid, _depth = project_world_positions_to_feature_grid(
+            position,
+            candidate_poses[:, cand_idx].float(),
+            scaled_intrinsics,
+            feature_hw=target_hw,
+        )
+        sampled_query = F.grid_sample(
+            query,
+            grid,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=True,
+        )
+        valid = projected_valid & valid_base
+        cosine = (sampled_query * render).sum(dim=1, keepdim=True)
+        valid_f = valid.to(device=cosine.device, dtype=cosine.dtype)
+        denom = valid_f.flatten(1).sum(dim=1).clamp(min=1.0)
+        score = (cosine * valid_f).flatten(1).sum(dim=1) / denom
+        score_rows.append(score)
+        valid_rows.append(valid_f.flatten(1).mean(dim=1))
+    scores = torch.stack(score_rows, dim=1)
+    valid_frac = torch.stack(valid_rows, dim=1)
+    best_score, best_index = scores.max(dim=1)
+    identity_score = scores[:, 0]
+    return {
+        "scores": scores,
+        "valid_frac": valid_frac,
+        "best_index": best_index.detach(),
+        "best_score": best_score,
+        "identity_score": identity_score,
+        "score_gap": best_score - identity_score,
+    }
 
 
 def warped_candidate_alignment_loss(
@@ -1990,6 +2352,55 @@ def pair_matcher_local_candidate_score_maps(
     return torch.cat(score_map_chunks, dim=1), torch.cat(valid_chunks, dim=1)
 
 
+def aggregate_pair_matcher_score_maps(
+    score_maps: torch.Tensor,
+    valid_map: torch.Tensor,
+    *,
+    pooling: str = "mean",
+    topk_fraction: float = 0.25,
+) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """Aggregate sparse pair-matcher evidence maps into candidate scores."""
+    if score_maps.ndim != 5 or score_maps.shape[2] < 3:
+        raise ValueError("score_maps must have shape (B,K,C,H,W) with C>=3")
+    if valid_map.shape != score_maps[:, :, 0].shape:
+        raise ValueError("valid_map must have shape (B,K,H,W)")
+    valid_f = valid_map.to(dtype=score_maps.dtype)
+    denom = valid_f.flatten(2).sum(dim=-1).clamp(min=1.0)
+    score_map = score_maps[:, :, 0]
+    center_log_prob = score_maps[:, :, 1]
+    center_margin = score_maps[:, :, 2]
+    mode = str(pooling or "mean").lower()
+    if mode == "mean":
+        scores = (score_map * valid_f).flatten(2).sum(dim=-1) / denom
+        pooling_frac = score_maps.new_zeros(())
+    elif mode == "topk_mean":
+        flat_score = score_map.flatten(2)
+        flat_valid = valid_map.flatten(2).bool()
+        valid_count = flat_valid.sum(dim=-1)
+        frac = min(max(float(topk_fraction), 1.0e-6), 1.0)
+        k = torch.ceil(valid_count.float() * frac).long().clamp(min=1, max=flat_score.shape[-1])
+        masked = flat_score.masked_fill(~flat_valid, -1.0e6)
+        sorted_score = torch.sort(masked, dim=-1, descending=True).values
+        rank = torch.arange(flat_score.shape[-1], device=flat_score.device).view(1, 1, -1)
+        top_mask = rank < k[:, :, None]
+        scores = (sorted_score * top_mask.to(dtype=sorted_score.dtype)).sum(dim=-1) / k.to(
+            dtype=sorted_score.dtype
+        ).clamp(min=1.0)
+        scores = torch.where(valid_count > 0, scores, score_maps.new_zeros(scores.shape))
+        pooling_frac = score_maps.new_tensor(frac)
+    else:
+        raise ValueError(f"Unknown pair matcher score pooling: {pooling}")
+    stats = {
+        "local_zero_score": ((center_log_prob * valid_f).flatten(2).sum(dim=-1) / denom).mean().detach(),
+        "local_peak_score": ((score_map * valid_f).flatten(2).sum(dim=-1) / denom).mean().detach(),
+        "local_peak_gap": ((-center_margin * valid_f).flatten(2).sum(dim=-1) / denom).mean().detach(),
+        "local_peak_offset_px": score_maps.new_zeros(()).detach(),
+        "local_expected_offset_px": score_maps.new_zeros(()).detach(),
+        "local_score_pooling_topk_frac": pooling_frac.detach(),
+    }
+    return scores, stats
+
+
 def pair_matcher_local_candidate_scores(
     matcher: PairConditionedLocalMatcher,
     query_feature: torch.Tensor,
@@ -2003,6 +2414,8 @@ def pair_matcher_local_candidate_scores(
     candidate_chunk_size: int = 0,
     offset_chunk_size: int = 0,
     candidate_score_mode: str = "center_logprob_margin",
+    score_pooling: str = "mean",
+    score_topk_fraction: float = 0.25,
 ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Score pose candidates with pair-conditioned local heatmap evidence."""
     score_maps, valid_map = pair_matcher_local_candidate_score_maps(
@@ -2018,20 +2431,492 @@ def pair_matcher_local_candidate_scores(
         offset_chunk_size=offset_chunk_size,
         candidate_score_mode=candidate_score_mode,
     )
-    valid_f = valid_map.to(dtype=score_maps.dtype)
-    denom = valid_f.flatten(2).sum(dim=-1).clamp(min=1.0)
-    score_map = score_maps[:, :, 0]
-    center_log_prob = score_maps[:, :, 1]
-    center_margin = score_maps[:, :, 2]
-    scores = (score_map * valid_f).flatten(2).sum(dim=-1) / denom
-    stats = {
-        "local_zero_score": ((center_log_prob * valid_f).flatten(2).sum(dim=-1) / denom).mean().detach(),
-        "local_peak_score": ((score_map * valid_f).flatten(2).sum(dim=-1) / denom).mean().detach(),
-        "local_peak_gap": ((-center_margin * valid_f).flatten(2).sum(dim=-1) / denom).mean().detach(),
-        "local_peak_offset_px": score_maps.new_zeros(()).detach(),
-        "local_expected_offset_px": score_maps.new_zeros(()).detach(),
+    return aggregate_pair_matcher_score_maps(
+        score_maps,
+        valid_map,
+        pooling=score_pooling,
+        topk_fraction=score_topk_fraction,
+    )
+
+
+def pair_matcher_single_render_correspondences(
+    matcher: PairConditionedLocalMatcher,
+    query_feature: torch.Tensor,
+    render_feature: torch.Tensor,
+    render_position: torch.Tensor | None = None,
+    mask: torch.Tensor | None = None,
+    *,
+    radius: int = 3,
+    stride: int = 8,
+    temperature: float = 0.05,
+    chunk_points: int = 65536,
+    score_feature_hw: tuple[int, int] | None = None,
+    offset_mode: str = "expected",
+    min_feature_norm: float = 1.0e-6,
+) -> Dict[str, torch.Tensor]:
+    """Extract query-centered 2D-3D correspondences from one rendered pose.
+
+    The existing pair matcher is asymmetric: it receives one query vector and a
+    local rendered patch.  Stage4 therefore forms correspondences as
+    ``render_xy = query_xy + offset`` and pairs the sampled rendered world point
+    with ``query_xy`` for a downstream absolute pose solve.
+    """
+    if query_feature.ndim != 4 or render_feature.ndim != 4:
+        raise ValueError("expected query_feature and render_feature with shape (B,C,H,W)")
+    if query_feature.shape[0] != render_feature.shape[0]:
+        raise ValueError("query_feature and render_feature batch dimensions must match")
+    radius = max(int(radius), 0)
+    stride = max(int(stride), 1)
+    chunk_points = max(int(chunk_points), 1)
+    target_hw = tuple(score_feature_hw or render_feature.shape[-2:])
+    query = _resize_feature(query_feature.float(), target_hw)
+    render = _resize_feature(render_feature.float(), target_hw)
+    channels = min(int(query.shape[1]), int(render.shape[1]), int(matcher.channels))
+    query = query[:, :channels]
+    render = render[:, :channels]
+    bsz, _channels, height, width = render.shape
+
+    ys = torch.arange(stride // 2, height, stride, device=query.device, dtype=query.dtype)
+    xs = torch.arange(stride // 2, width, stride, device=query.device, dtype=query.dtype)
+    if ys.numel() == 0:
+        ys = torch.arange(0, height, device=query.device, dtype=query.dtype)
+    if xs.numel() == 0:
+        xs = torch.arange(0, width, device=query.device, dtype=query.dtype)
+    grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+    xy = torch.stack([grid_x.reshape(-1), grid_y.reshape(-1)], dim=-1)
+    num_points = int(xy.shape[0])
+    query_xy = xy[None].expand(bsz, -1, -1).contiguous()
+    seed_valid = torch.ones((bsz, num_points), device=query.device, dtype=query.dtype)
+    query_sparse, query_in = sample_feature_at_xy(query, query_xy, seed_valid, source_hw=None)
+    query_nonzero = torch.linalg.vector_norm(query_sparse.float(), dim=-1) > float(min_feature_norm)
+
+    offset_axis = torch.arange(-radius, radius + 1, device=query.device, dtype=query.dtype)
+    dy, dx = torch.meshgrid(offset_axis, offset_axis, indexing="ij")
+    offsets = torch.stack([dx.reshape(-1), dy.reshape(-1)], dim=-1)
+    num_offsets = int(offsets.shape[0])
+    patch_xy = query_xy[:, :, None, :] + offsets[None, None, :, :]
+    patch_sparse, patch_in = sample_feature_at_xy(
+        render,
+        patch_xy.reshape(bsz, num_points * num_offsets, 2),
+        torch.ones((bsz, num_points * num_offsets), device=query.device, dtype=query.dtype),
+        source_hw=None,
+    )
+    patch_sparse = patch_sparse.reshape(bsz, num_points, num_offsets, channels)
+    patch_valid = patch_in.reshape(bsz, num_points, num_offsets)
+    if mask is not None:
+        mask_2d = _resize_mask(mask, target_hw)
+        if mask_2d.ndim == 5:
+            if mask_2d.shape[1] != 1:
+                raise ValueError("single-render correspondence mask must not have multiple candidates")
+            mask_2d = mask_2d[:, 0]
+        if mask_2d.ndim == 3:
+            mask_2d = mask_2d[:, None]
+        if mask_2d.ndim != 4 or mask_2d.shape[1] != 1:
+            raise ValueError("mask must have shape (B,1,H,W), (B,H,W), or (B,1,1,H,W)")
+        mask_sparse, mask_in = sample_feature_at_xy(
+            mask_2d.float(),
+            patch_xy.reshape(bsz, num_points * num_offsets, 2),
+            torch.ones((bsz, num_points * num_offsets), device=query.device, dtype=query.dtype),
+            source_hw=None,
+        )
+        mask_sparse = mask_sparse[..., 0].reshape(bsz, num_points, num_offsets)
+        patch_valid = patch_valid & mask_in.reshape(bsz, num_points, num_offsets) & (mask_sparse > 0.5)
+
+    q_all = query_sparse.reshape(bsz * num_points, channels)
+    patch_all = patch_sparse.reshape(bsz * num_points, num_offsets, channels)
+    patch_valid_all = patch_valid.reshape(bsz * num_points, num_offsets)
+    logits_chunks = []
+    for start in range(0, q_all.shape[0], chunk_points):
+        logits_chunks.append(
+            matcher(
+                q_all[start : start + chunk_points],
+                patch_all[start : start + chunk_points],
+                offsets=offsets,
+                patch_valid=patch_valid_all[start : start + chunk_points],
+            )
+        )
+    offset_logits = torch.cat(logits_chunks, dim=0).reshape(bsz, num_points, num_offsets)
+    probs = F.softmax(offset_logits / max(float(temperature), 1.0e-6), dim=-1)
+    expected_offset = torch.einsum("bno,od->bnd", probs, offsets.to(device=probs.device, dtype=probs.dtype))
+    argmax_idx = offset_logits.argmax(dim=-1)
+    argmax_offset = offsets[argmax_idx.reshape(-1)].reshape(bsz, num_points, 2).to(dtype=query.dtype)
+    mode = str(offset_mode or "expected").lower()
+    if mode == "argmax":
+        selected_offset = argmax_offset
+    elif mode == "expected":
+        selected_offset = expected_offset.to(dtype=query.dtype)
+    else:
+        raise ValueError("offset_mode must be 'expected' or 'argmax'")
+    render_xy = query_xy + selected_offset.to(device=query_xy.device, dtype=query_xy.dtype)
+    selected_in = (
+        (render_xy[..., 0] >= 0.0)
+        & (render_xy[..., 0] <= max(width - 1, 1))
+        & (render_xy[..., 1] >= 0.0)
+        & (render_xy[..., 1] <= max(height - 1, 1))
+    )
+    selected_patch_valid = patch_valid.gather(2, argmax_idx[..., None]).squeeze(-1)
+    top2 = torch.topk(probs, k=min(2, num_offsets), dim=-1).values
+    confidence = top2[..., 0] if top2.shape[-1] == 1 else (top2[..., 0] - top2[..., 1]).clamp_min(0.0)
+    valid_mask = query_in & query_nonzero & selected_in & selected_patch_valid
+
+    result: Dict[str, torch.Tensor] = {
+        "query_xy": query_xy,
+        "render_xy": render_xy,
+        "offset_logits": offset_logits,
+        "offset_grid": offsets,
+        "expected_offset": expected_offset,
+        "argmax_offset": argmax_offset,
+        "confidence": confidence,
+        "valid_mask": valid_mask,
     }
-    return scores, stats
+    if render_position is not None:
+        if render_position.ndim != 4 or render_position.shape[1] != 3:
+            raise ValueError("render_position must have shape (B,3,H,W)")
+        position = _resize_feature(render_position.float(), target_hw)
+        world_points, world_in = sample_feature_at_xy(
+            position,
+            render_xy,
+            valid_mask.to(dtype=position.dtype),
+            source_hw=None,
+        )
+        finite_world = torch.isfinite(world_points).all(dim=-1)
+        result["world_points"] = world_points
+        result["valid_mask"] = valid_mask & world_in & finite_world
+    return result
+
+
+def local_corr_single_render_correspondences(
+    query_feature: torch.Tensor,
+    render_feature: torch.Tensor,
+    render_position: torch.Tensor | None = None,
+    mask: torch.Tensor | None = None,
+    *,
+    radius: int = 3,
+    stride: int = 8,
+    temperature: float = 0.05,
+    score_feature_hw: tuple[int, int] | None = None,
+    offset_mode: str = "expected",
+    min_feature_norm: float = 1.0e-6,
+) -> Dict[str, torch.Tensor]:
+    """Extract render-centered correspondences from a raw local correlation volume."""
+    if query_feature.ndim != 4 or render_feature.ndim != 4:
+        raise ValueError("expected query_feature and render_feature with shape (B,C,H,W)")
+    target_hw = tuple(score_feature_hw or render_feature.shape[-2:])
+    query = _resize_feature(query_feature.float(), target_hw)
+    render = _resize_feature(render_feature.float(), target_hw)
+    bsz, _channels, height, width = render.shape
+    corr, corr_valid = local_correlation_volume(query, render[:, None], mask=mask, radius=radius)
+    logits_dense = corr[:, 0].permute(0, 2, 3, 1).reshape(bsz, height * width, corr.shape[2])
+    center_valid_dense = corr_valid[:, 0, 0].reshape(bsz, height * width)
+
+    stride = max(int(stride), 1)
+    ys = torch.arange(stride // 2, height, stride, device=query.device, dtype=query.dtype)
+    xs = torch.arange(stride // 2, width, stride, device=query.device, dtype=query.dtype)
+    if ys.numel() == 0:
+        ys = torch.arange(0, height, device=query.device, dtype=query.dtype)
+    if xs.numel() == 0:
+        xs = torch.arange(0, width, device=query.device, dtype=query.dtype)
+    grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+    xy = torch.stack([grid_x.reshape(-1), grid_y.reshape(-1)], dim=-1)
+    flat_idx = (xy[:, 1].long() * int(width) + xy[:, 0].long()).clamp(min=0, max=height * width - 1)
+    num_points = int(xy.shape[0])
+    render_xy = xy[None].expand(bsz, -1, -1).contiguous()
+    offset_axis = torch.arange(-int(radius), int(radius) + 1, device=query.device, dtype=query.dtype)
+    dy, dx = torch.meshgrid(offset_axis, offset_axis, indexing="ij")
+    offsets = torch.stack([dx.reshape(-1), dy.reshape(-1)], dim=-1)
+    offset_logits = logits_dense[:, flat_idx]
+    probs = F.softmax(offset_logits / max(float(temperature), 1.0e-6), dim=-1)
+    expected_offset = torch.einsum("bno,od->bnd", probs, offsets.to(device=probs.device, dtype=probs.dtype))
+    argmax_idx = offset_logits.argmax(dim=-1)
+    argmax_offset = offsets[argmax_idx.reshape(-1)].reshape(bsz, num_points, 2).to(dtype=query.dtype)
+    mode = str(offset_mode or "expected").lower()
+    if mode == "argmax":
+        selected_offset = argmax_offset
+    elif mode == "expected":
+        selected_offset = expected_offset.to(dtype=query.dtype)
+    else:
+        raise ValueError("offset_mode must be 'expected' or 'argmax'")
+    query_xy = render_xy + selected_offset.to(device=render_xy.device, dtype=render_xy.dtype)
+    selected_in = (
+        (query_xy[..., 0] >= 0.0)
+        & (query_xy[..., 0] <= max(width - 1, 1))
+        & (query_xy[..., 1] >= 0.0)
+        & (query_xy[..., 1] <= max(height - 1, 1))
+    )
+    seed_valid = torch.ones((bsz, num_points), device=query.device, dtype=query.dtype)
+    render_sparse, render_in = sample_feature_at_xy(render, render_xy, seed_valid, source_hw=None)
+    query_sparse, query_in = sample_feature_at_xy(query, query_xy, selected_in.to(dtype=query.dtype), source_hw=None)
+    render_nonzero = torch.linalg.vector_norm(render_sparse.float(), dim=-1) > float(min_feature_norm)
+    query_nonzero = torch.linalg.vector_norm(query_sparse.float(), dim=-1) > float(min_feature_norm)
+    center_valid = center_valid_dense[:, flat_idx]
+    top2 = torch.topk(probs, k=min(2, int(offsets.shape[0])), dim=-1).values
+    confidence = top2[..., 0] if top2.shape[-1] == 1 else (top2[..., 0] - top2[..., 1]).clamp_min(0.0)
+    valid_mask = center_valid & render_in & query_in & render_nonzero & query_nonzero
+    result: Dict[str, torch.Tensor] = {
+        "query_xy": query_xy,
+        "render_xy": render_xy,
+        "offset_logits": offset_logits,
+        "offset_grid": offsets,
+        "expected_offset": expected_offset,
+        "argmax_offset": argmax_offset,
+        "confidence": confidence,
+        "valid_mask": valid_mask,
+    }
+    if render_position is not None:
+        if render_position.ndim != 4 or render_position.shape[1] != 3:
+            raise ValueError("render_position must have shape (B,3,H,W)")
+        position = _resize_feature(render_position.float(), target_hw)
+        world_points, world_in = sample_feature_at_xy(
+            position,
+            render_xy,
+            valid_mask.to(dtype=position.dtype),
+            source_hw=None,
+        )
+        result["world_points"] = world_points
+        result["valid_mask"] = valid_mask & world_in & torch.isfinite(world_points).all(dim=-1)
+    return result
+
+
+def _single_intrinsics_components(
+    intrinsics: torch.Tensor,
+    *,
+    batch_size: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    intr = intrinsics.to(device=device, dtype=dtype)
+    if intr.ndim == 1:
+        intr = intr.view(1, -1)
+    if intr.ndim == 2 and intr.shape[-1] == 4:
+        if intr.shape[0] == 1 and batch_size > 1:
+            intr = intr.expand(batch_size, -1)
+        if intr.shape[0] != batch_size:
+            raise ValueError(f"intrinsics batch {intr.shape[0]} does not match B={batch_size}")
+        return intr[:, 0], intr[:, 1], intr[:, 2], intr[:, 3]
+    if intr.ndim == 2 and intr.shape == (3, 3):
+        intr = intr.view(1, 3, 3).expand(batch_size, -1, -1)
+    if intr.ndim == 3 and intr.shape[-2:] == (3, 3):
+        if intr.shape[0] == 1 and batch_size > 1:
+            intr = intr.expand(batch_size, -1, -1)
+        if intr.shape[0] != batch_size:
+            raise ValueError(f"intrinsics batch {intr.shape[0]} does not match B={batch_size}")
+        return intr[:, 0, 0], intr[:, 1, 1], intr[:, 0, 2], intr[:, 1, 2]
+    raise ValueError("intrinsics must have shape (4,), (B,4), (3,3), or (B,3,3)")
+
+
+def _project_world_points(
+    world_points: torch.Tensor,
+    pose_w2c: torch.Tensor,
+    intrinsics: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    bsz = int(world_points.shape[0])
+    device = world_points.device
+    dtype = world_points.dtype
+    fx, fy, cx, cy = _single_intrinsics_components(intrinsics, batch_size=bsz, device=device, dtype=dtype)
+    cam = torch.einsum("bij,bnj->bni", pose_w2c[:, :3, :3].to(dtype=dtype), world_points) + pose_w2c[
+        :, None, :3, 3
+    ].to(dtype=dtype)
+    z = cam[..., 2].clamp(min=1.0e-6)
+    xy = torch.stack(
+        [
+            fx[:, None] * (cam[..., 0] / z) + cx[:, None],
+            fy[:, None] * (cam[..., 1] / z) + cy[:, None],
+        ],
+        dim=-1,
+    )
+    return xy, cam
+
+
+def robust_pose_update_from_correspondences(
+    world_points: torch.Tensor,
+    query_xy: torch.Tensor,
+    intrinsics: torch.Tensor,
+    current_pose: torch.Tensor,
+    *,
+    weights: torch.Tensor | None = None,
+    valid_mask: torch.Tensor | None = None,
+    iterations: int = 5,
+    damping: float = 1.0e-3,
+    huber_delta_px: float = 3.0,
+    min_points: int = 16,
+    max_update_trans_m: float = 0.25,
+    max_update_rot_deg: float = 10.0,
+) -> Dict[str, torch.Tensor]:
+    """Robust left-update pose solve from sparse 2D-3D correspondences.
+
+    This is the non-rendering Stage4 solver core.  It estimates an absolute
+    query pose by iteratively solving the SE(3) reprojection normal equations
+    around ``current_pose`` with Huber reweighting and update clamps.
+    """
+    if world_points.ndim != 3 or world_points.shape[-1] != 3:
+        raise ValueError("world_points must have shape (B,N,3)")
+    if query_xy.shape != world_points.shape[:2] + (2,):
+        raise ValueError("query_xy must have shape (B,N,2)")
+    if current_pose.ndim != 3 or current_pose.shape[-2:] != (4, 4) or current_pose.shape[0] != world_points.shape[0]:
+        raise ValueError("current_pose must have shape (B,4,4)")
+    bsz, num_points, _ = world_points.shape
+    device = world_points.device
+    dtype = world_points.dtype
+    pose = current_pose.to(device=device, dtype=dtype).clone()
+    base_valid = torch.isfinite(world_points).all(dim=-1) & torch.isfinite(query_xy).all(dim=-1)
+    if valid_mask is not None:
+        base_valid = base_valid & valid_mask.to(device=device).bool()
+    if weights is None:
+        base_weight = torch.ones((bsz, num_points), device=device, dtype=dtype)
+    else:
+        base_weight = weights.to(device=device, dtype=dtype)
+        if base_weight.shape != (bsz, num_points):
+            raise ValueError(f"weights must have shape {(bsz, num_points)}")
+        base_weight = base_weight.clamp_min(0.0)
+    fx, fy, _cx, _cy = _single_intrinsics_components(intrinsics, batch_size=bsz, device=device, dtype=dtype)
+    last_delta = torch.zeros((bsz, 6), device=device, dtype=dtype)
+    last_cond = torch.zeros((bsz,), device=device, dtype=dtype)
+    success = base_valid.sum(dim=1) >= int(min_points)
+    eye = torch.eye(6, device=device, dtype=dtype).expand(bsz, -1, -1)
+    max_rot = math.radians(float(max_update_rot_deg))
+    for _iter in range(max(int(iterations), 0)):
+        pred_xy, cam = _project_world_points(world_points, pose, intrinsics)
+        z = cam[..., 2]
+        iter_valid = base_valid & (z > 1.0e-6)
+        residual = query_xy.to(device=device, dtype=dtype) - pred_xy
+        res_norm = torch.linalg.vector_norm(residual, dim=-1)
+        robust = torch.where(
+            res_norm <= float(huber_delta_px),
+            torch.ones_like(res_norm),
+            float(huber_delta_px) / res_norm.clamp(min=1.0e-6),
+        )
+        weight = base_weight * robust * iter_valid.to(dtype=dtype)
+        x = cam[..., 0]
+        y = cam[..., 1]
+        z_safe = z.clamp(min=1.0e-6)
+        xn = x / z_safe
+        yn = y / z_safe
+        ju = torch.stack(
+            [
+                fx[:, None] / z_safe,
+                torch.zeros_like(z_safe),
+                -fx[:, None] * xn / z_safe,
+                -fx[:, None] * xn * yn,
+                fx[:, None] * (1.0 + xn * xn),
+                -fx[:, None] * yn,
+            ],
+            dim=-1,
+        )
+        jv = torch.stack(
+            [
+                torch.zeros_like(z_safe),
+                fy[:, None] / z_safe,
+                -fy[:, None] * yn / z_safe,
+                -fy[:, None] * (1.0 + yn * yn),
+                fy[:, None] * xn * yn,
+                fy[:, None] * xn,
+            ],
+            dim=-1,
+        )
+        wj_u = ju * weight[..., None]
+        wj_v = jv * weight[..., None]
+        jtj = torch.bmm(ju.transpose(1, 2), wj_u) + torch.bmm(jv.transpose(1, 2), wj_v)
+        rhs = torch.bmm(ju.transpose(1, 2), (weight * residual[..., 0]).unsqueeze(-1)).squeeze(-1) + torch.bmm(
+            jv.transpose(1, 2),
+            (weight * residual[..., 1]).unsqueeze(-1),
+        ).squeeze(-1)
+        diag = torch.diagonal(jtj, dim1=-2, dim2=-1).clamp(min=1.0e-6)
+        last_cond = diag.max(dim=1).values / diag.min(dim=1).values
+        system = jtj + torch.diag_embed(float(damping) * diag) + (float(damping) * 1.0e-3) * eye
+        try:
+            delta = torch.linalg.solve(system, rhs)
+        except RuntimeError:
+            delta = torch.linalg.pinv(system) @ rhs.unsqueeze(-1)
+            delta = delta.squeeze(-1)
+        enough = (iter_valid & (weight > 0.0)).sum(dim=1) >= int(min_points)
+        delta = torch.where(enough[:, None], delta, torch.zeros_like(delta))
+        trans_norm = torch.linalg.vector_norm(delta[:, :3], dim=1, keepdim=True).clamp(min=1.0e-9)
+        rot_norm = torch.linalg.vector_norm(delta[:, 3:], dim=1, keepdim=True).clamp(min=1.0e-9)
+        trans_scale = torch.clamp(float(max_update_trans_m) / trans_norm, max=1.0)
+        rot_scale = torch.clamp(max_rot / rot_norm, max=1.0)
+        delta = torch.cat([delta[:, :3] * trans_scale, delta[:, 3:] * rot_scale], dim=1)
+        pose = apply_pose_delta(pose, delta)
+        last_delta = delta
+        success = success & enough
+
+    final_xy, final_cam = _project_world_points(world_points, pose, intrinsics)
+    final_valid = base_valid & (final_cam[..., 2] > 1.0e-6)
+    final_res = torch.linalg.vector_norm(query_xy.to(device=device, dtype=dtype) - final_xy, dim=-1)
+    final_weight = final_valid.to(dtype=dtype)
+    denom = final_weight.sum(dim=1).clamp(min=1.0)
+    mean_error = (final_res * final_weight).sum(dim=1) / denom
+    inlier_count = final_valid.sum(dim=1)
+    delta_total = se3_log(torch.bmm(pose, pose_inverse(current_pose.to(device=device, dtype=dtype))))
+    return {
+        "pose": pose,
+        "delta_xi": delta_total,
+        "last_delta_xi": last_delta,
+        "success": success,
+        "inlier_count": inlier_count,
+        "mean_reprojection_error_px": mean_error,
+        "condition_approx": last_cond,
+    }
+
+
+def denseflow_pose_update_from_render(
+    *,
+    flow: torch.Tensor,
+    confidence: torch.Tensor,
+    render_position: torch.Tensor,
+    render_mask: torch.Tensor | None,
+    intrinsics: torch.Tensor,
+    current_pose: torch.Tensor,
+    min_points: int,
+    max_update_trans_m: float,
+    max_update_rot_deg: float,
+    iterations: int = 5,
+    damping: float = 1.0e-3,
+    huber_delta_px: float = 3.0,
+) -> Dict[str, torch.Tensor]:
+    if flow.ndim != 4 or flow.shape[1] != 2:
+        raise ValueError("flow must have shape (B,2,H,W)")
+    if confidence.ndim == 3:
+        confidence = confidence[:, None]
+    if confidence.ndim != 4 or confidence.shape[1] != 1:
+        raise ValueError("confidence must have shape (B,1,H,W) or (B,H,W)")
+    if render_position.ndim != 4 or render_position.shape[1] != 3:
+        raise ValueError("render_position must have shape (B,3,H,W)")
+    bsz, _two, height, width = flow.shape
+    position = render_position.float()
+    if position.shape[-2:] != (height, width):
+        position = F.interpolate(position, size=(height, width), mode="bilinear", align_corners=False)
+    conf = confidence.float()
+    if conf.shape[-2:] != (height, width):
+        conf = F.interpolate(conf, size=(height, width), mode="bilinear", align_corners=False)
+    yy, xx = torch.meshgrid(
+        torch.arange(height, device=flow.device, dtype=flow.dtype),
+        torch.arange(width, device=flow.device, dtype=flow.dtype),
+        indexing="ij",
+    )
+    base_xy = torch.stack([xx, yy], dim=-1).view(1, height, width, 2).expand(bsz, -1, -1, -1)
+    query_xy = base_xy + flow.permute(0, 2, 3, 1).float()
+    valid = torch.isfinite(position).all(dim=1) & torch.isfinite(query_xy).all(dim=-1)
+    if render_mask is not None:
+        mask = render_mask
+        if mask.ndim == 3:
+            mask = mask[:, None]
+        if mask.shape[-2:] != (height, width):
+            mask = F.interpolate(mask.float(), size=(height, width), mode="nearest") > 0.5
+        valid = valid & mask[:, 0].bool()
+    return robust_pose_update_from_correspondences(
+        position.permute(0, 2, 3, 1).reshape(bsz, height * width, 3),
+        query_xy.reshape(bsz, height * width, 2),
+        intrinsics,
+        current_pose,
+        weights=conf[:, 0].reshape(bsz, height * width),
+        valid_mask=valid.reshape(bsz, height * width),
+        iterations=iterations,
+        damping=damping,
+        huber_delta_px=huber_delta_px,
+        min_points=min_points,
+        max_update_trans_m=max_update_trans_m,
+        max_update_rot_deg=max_update_rot_deg,
+    )
 
 
 def local_flow_nce_loss_from_corr(
@@ -2466,6 +3351,58 @@ def candidate_teacher_quality_scores_from_batch(
     row_span = quality.masked_fill(~valid, -1.0e6).max(dim=1).values - quality.masked_fill(~valid, 1.0e6).min(dim=1).values
     active = valid & torch.isfinite(quality) & (row_span[:, None] > 1.0e-6)
     return quality, active
+
+
+def apply_candidate_teacher_quality_score_prior(
+    candidate_scores: torch.Tensor,
+    batch: Dict,
+    *,
+    valid_mask: torch.Tensor,
+    weight: float = 0.0,
+    target_mode: str = "pnp_composite",
+) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """Optionally bias candidate selection toward external correspondence quality."""
+    if candidate_scores.ndim != 2:
+        raise ValueError(f"candidate_scores must have shape (B,K), got {tuple(candidate_scores.shape)}")
+    valid = valid_mask.to(device=candidate_scores.device).bool()
+    if valid.shape != candidate_scores.shape:
+        raise ValueError(f"valid_mask must have shape {tuple(candidate_scores.shape)}, got {tuple(valid.shape)}")
+    prior_weight = float(weight)
+    zero = candidate_scores.new_zeros(())
+    metrics = {
+        "candidate_teacher_quality_score_prior_weight": candidate_scores.new_tensor(prior_weight),
+        "candidate_teacher_quality_score_prior_active": zero.detach(),
+        "candidate_teacher_quality_score_prior_shift_mean": zero.detach(),
+        "candidate_teacher_quality_score_prior_shift_abs_mean": zero.detach(),
+    }
+    if prior_weight == 0.0:
+        return candidate_scores, metrics
+
+    quality, active = candidate_teacher_quality_scores_from_batch(
+        batch,
+        valid_mask=valid,
+        target_mode=target_mode,
+    )
+    active = active.to(device=candidate_scores.device).bool()
+    active_rows = active.any(dim=1, keepdim=True)
+    if not bool(active_rows.any()):
+        return candidate_scores, metrics
+
+    quality = quality.to(device=candidate_scores.device, dtype=candidate_scores.dtype)
+    active_f = active.to(dtype=candidate_scores.dtype)
+    denom = active_f.sum(dim=1, keepdim=True).clamp(min=1.0)
+    mean = (quality * active_f).sum(dim=1, keepdim=True) / denom
+    centered_quality = torch.where(active, quality - mean, torch.zeros_like(quality))
+    shift = prior_weight * centered_quality
+    adjusted = candidate_scores + shift
+    metrics.update(
+        {
+            "candidate_teacher_quality_score_prior_active": active_rows.float().mean().detach(),
+            "candidate_teacher_quality_score_prior_shift_mean": shift.detach().mean(),
+            "candidate_teacher_quality_score_prior_shift_abs_mean": shift.detach().abs().mean(),
+        }
+    )
+    return adjusted, metrics
 
 
 def candidate_teacher_quality_listwise_loss(
@@ -2915,11 +3852,567 @@ def nvs_teacher_pair_match_loss(
     return float(weight) * loss, metrics
 
 
+def nvs_teacher_pair_flow_loss(
+    matcher: PairConditionedLocalMatcher | None,
+    query_loc: torch.Tensor,
+    render_loc: torch.Tensor,
+    batch: Dict,
+    *,
+    render_mask: torch.Tensor | None = None,
+    weight: float = 0.0,
+    radius: int = 3,
+    temperature: float = 0.05,
+    min_confidence: float = 0.0,
+    min_points: int = 4,
+    min_target_offset_px: float = 0.0,
+    ce_weight: float = 1.0,
+    subpixel_weight: float = 0.0,
+    subpixel_beta: float = 0.25,
+    margin_weight: float = 0.0,
+    margin: float = 0.05,
+    candidate_index: int = 0,
+    chunk_points: int = 1024,
+) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """Distill teacher query->render matches into Stage4-style offset logits.
+
+    Existing sparse teacher correspondence loss centers the render patch on
+    the teacher render point and trains the center offset.  Stage4 inference
+    instead centers the render patch at the query pixel and predicts the
+    query-to-render offset.  This loss aligns offline render-at-init LoFTR
+    matches with that inference path.
+    """
+    zero = query_loc.new_zeros(())
+    metrics: Dict[str, torch.Tensor] = {
+        "nvs_teacher_pair_flow_missing": query_loc.new_tensor(0.0 if matcher is not None else 1.0),
+        "nvs_teacher_pair_flow_loss": zero.detach(),
+        "nvs_teacher_pair_flow_weighted_loss": zero.detach(),
+        "nvs_teacher_pair_flow_acc": zero.detach(),
+        "nvs_teacher_pair_flow_soft_epe": zero.detach(),
+        "nvs_teacher_pair_flow_points": zero.detach(),
+        "nvs_teacher_pair_flow_valid_frac": zero.detach(),
+        "nvs_teacher_pair_flow_nonzero_frac": zero.detach(),
+        "nvs_teacher_pair_flow_target_offset_px": zero.detach(),
+        "nvs_teacher_pair_flow_continuous_target_offset_px": zero.detach(),
+        "nvs_teacher_pair_flow_ce_loss": zero.detach(),
+        "nvs_teacher_pair_flow_subpixel_loss": zero.detach(),
+        "nvs_teacher_pair_flow_subpixel_epe": zero.detach(),
+        "nvs_teacher_pair_flow_margin_loss": zero.detach(),
+        "nvs_teacher_pair_flow_target_gap": zero.detach(),
+        "nvs_teacher_pair_flow_target_prob": zero.detach(),
+        "nvs_teacher_pair_flow_skipped_no_points": query_loc.new_tensor(1.0),
+    }
+    if matcher is None or float(weight) <= 0.0:
+        return zero, metrics
+    required = (
+        "teacher_corr_query_xy",
+        "teacher_corr_map_xy",
+        "teacher_corr_conf",
+        "teacher_corr_valid",
+    )
+    missing = [key for key in required if key not in batch]
+    metrics["nvs_teacher_pair_flow_missing"] = query_loc.new_tensor(1.0 if missing else 0.0)
+    if missing:
+        return zero, metrics
+    if query_loc.ndim != 4:
+        raise ValueError("query_loc must have shape (B,C,H,W)")
+    if render_loc.ndim == 4:
+        render_feat = render_loc
+    elif render_loc.ndim == 5:
+        idx = int(candidate_index)
+        if idx < 0 or idx >= int(render_loc.shape[1]):
+            raise ValueError(f"candidate_index={idx} out of range for K={int(render_loc.shape[1])}")
+        render_feat = render_loc[:, idx]
+    else:
+        raise ValueError("render_loc must have shape (B,C,H,W) or (B,K,C,H,W)")
+    if query_loc.shape[0] != render_feat.shape[0]:
+        raise ValueError("query_loc and render_loc batch dimensions must match")
+
+    with torch.cuda.amp.autocast(enabled=False):
+        r_feat = render_feat.float()
+        q_feat = _resize_feature(query_loc.float(), tuple(r_feat.shape[-2:]))
+        bsz, _channels, height, width = r_feat.shape
+        device = q_feat.device
+        dtype = q_feat.dtype
+        query_xy = batch["teacher_corr_query_xy"].to(device=device, dtype=dtype)
+        map_xy = batch["teacher_corr_map_xy"].to(device=device, dtype=dtype)
+        confidence = batch["teacher_corr_conf"].to(device=device, dtype=dtype)
+        valid = batch["teacher_corr_valid"].to(device=device, dtype=dtype)
+        if confidence.ndim == 3:
+            confidence = confidence.squeeze(-1)
+        if valid.ndim == 3:
+            valid = valid.squeeze(-1)
+        xy_source_hw = batch.get("teacher_corr_hw")
+        if xy_source_hw is not None:
+            query_xy_feat = _scale_xy_tensor(query_xy, xy_source_hw, (height, width))
+            map_xy_feat = _scale_xy_tensor(map_xy, xy_source_hw, (height, width))
+        else:
+            query_xy_feat = query_xy
+            map_xy_feat = map_xy
+
+        teacher_mask = (valid > 0) & torch.isfinite(confidence) & (confidence >= float(min_confidence))
+        teacher_mask = teacher_mask & torch.isfinite(query_xy_feat).all(dim=-1) & torch.isfinite(map_xy_feat).all(dim=-1)
+
+        mask_ok = None
+        if render_mask is not None:
+            mask_resized = _resize_mask(render_mask, (height, width))
+            if mask_resized is not None:
+                if mask_resized.ndim == 5:
+                    idx = int(candidate_index)
+                    if idx < 0 or idx >= int(mask_resized.shape[1]):
+                        raise ValueError(f"candidate_index={idx} out of range for render_mask K={int(mask_resized.shape[1])}")
+                    mask_2d = mask_resized[:, idx, 0]
+                elif mask_resized.ndim == 4:
+                    mask_2d = mask_resized[:, 0] if mask_resized.shape[1] == 1 else mask_resized[:, int(candidate_index)]
+                elif mask_resized.ndim == 3:
+                    mask_2d = mask_resized
+                else:
+                    raise ValueError("render_mask must have shape (B,K,1,H,W), (B,K,H,W), (B,1,H,W), or (B,H,W)")
+                mask_values, mask_in = sample_feature_at_xy(
+                    mask_2d[:, None].to(device=device, dtype=dtype),
+                    map_xy_feat,
+                    valid,
+                    source_hw=None,
+                )
+                mask_ok = mask_in & (mask_values[..., 0] > 0.5)
+
+        r = max(int(radius), 0)
+        offset_axis = torch.arange(-r, r + 1, device=device, dtype=dtype)
+        dy, dx_axis = torch.meshgrid(offset_axis, offset_axis, indexing="ij")
+        offsets = torch.stack([dx_axis.reshape(-1), dy.reshape(-1)], dim=-1)
+        target_offset = map_xy_feat - query_xy_feat
+        target_dx = torch.round(target_offset[..., 0]).long()
+        target_dy = torch.round(target_offset[..., 1]).long()
+        rounded_offset_norm = torch.sqrt(target_dx.float().square() + target_dy.float().square())
+        continuous_offset_norm = torch.linalg.vector_norm(target_offset, dim=-1)
+        in_window = (
+            (target_offset[..., 0] >= -float(r))
+            & (target_offset[..., 0] <= float(r))
+            & (target_offset[..., 1] >= -float(r))
+            & (target_offset[..., 1] <= float(r))
+            & (target_dx >= -r)
+            & (target_dx <= r)
+            & (target_dy >= -r)
+            & (target_dy <= r)
+        )
+        target_index = (target_dy + r) * (2 * r + 1) + (target_dx + r)
+        usable = teacher_mask & in_window & (continuous_offset_norm >= float(min_target_offset_px))
+        if mask_ok is not None:
+            usable = usable & mask_ok
+
+        loss_sum = zero.clone()
+        weight_sum = zero.clone()
+        ce_sum = zero.clone()
+        subpixel_sum = zero.clone()
+        subpixel_epe_sum = zero.clone()
+        acc_sum = zero.clone()
+        epe_sum = zero.clone()
+        offset_sum = zero.clone()
+        continuous_offset_sum = zero.clone()
+        margin_sum = zero.clone()
+        gap_sum = zero.clone()
+        prob_sum = zero.clone()
+        neg_weight_sum = zero.clone()
+        point_count = zero.clone()
+        temp = max(float(temperature), 1.0e-6)
+        chunk = max(int(chunk_points), 1)
+        for batch_idx in range(bsz):
+            mask_b = usable[batch_idx]
+            if int(mask_b.sum().item()) < int(min_points):
+                continue
+            q_xy_b = query_xy_feat[batch_idx, mask_b]
+            targets_b = target_index[batch_idx, mask_b].clamp(min=0, max=offsets.shape[0] - 1)
+            target_offsets_b = offsets[targets_b]
+            continuous_target_offsets_b = target_offset[batch_idx, mask_b]
+            conf_b = confidence[batch_idx, mask_b].clamp(min=0.0)
+            query_b = q_feat[batch_idx : batch_idx + 1]
+            render_b = r_feat[batch_idx : batch_idx + 1]
+            for start in range(0, q_xy_b.shape[0], chunk):
+                end = min(start + chunk, q_xy_b.shape[0])
+                q_xy_c = q_xy_b[start:end]
+                targets_c = targets_b[start:end]
+                target_offsets_c = target_offsets_b[start:end]
+                continuous_target_offsets_c = continuous_target_offsets_b[start:end]
+                w_c = conf_b[start:end]
+                q_valid = torch.ones(1, q_xy_c.shape[0], device=device, dtype=dtype)
+                q_sparse, q_in = sample_feature_at_xy(query_b, q_xy_c[None], q_valid, source_hw=None)
+                patch_xy = q_xy_c[:, None, :] + offsets[None]
+                flat_xy = patch_xy.reshape(1, -1, 2)
+                flat_valid = torch.ones(1, flat_xy.shape[1], device=device, dtype=dtype)
+                patch_sparse, patch_in = sample_feature_at_xy(render_b, flat_xy, flat_valid, source_hw=None)
+                n_points = q_xy_c.shape[0]
+                n_offsets = offsets.shape[0]
+                patch_sparse = patch_sparse.view(n_points, n_offsets, q_sparse.shape[-1])
+                patch_in = patch_in.view(n_points, n_offsets)
+                row = torch.arange(n_points, device=device)
+                selected = q_in[0].bool() & patch_in[row, targets_c]
+                if int(selected.sum().item()) < 1:
+                    continue
+                q_sel = q_sparse[0, selected]
+                patch_sel = patch_sparse[selected]
+                patch_valid_sel = patch_in[selected]
+                targets_sel = targets_c[selected]
+                target_offsets_sel = target_offsets_c[selected].to(device=device, dtype=dtype)
+                continuous_target_offsets_sel = continuous_target_offsets_c[selected].to(device=device, dtype=dtype)
+                w_sel = w_c[selected]
+                if float(w_sel.sum().item()) <= 0.0:
+                    w_sel = torch.ones_like(w_sel)
+                logits = matcher(q_sel, patch_sel, offsets=offsets, patch_valid=patch_valid_sel)
+                ce_per_point = F.cross_entropy(logits / temp, targets_sel, reduction="none")
+                pos = logits.gather(1, targets_sel[:, None]).squeeze(1)
+                other_mask = patch_valid_sel.bool()
+                other_mask.scatter_(1, targets_sel[:, None], False)
+                hard_neg = logits.masked_fill(~other_mask, -1.0e4).max(dim=1).values
+                has_neg = other_mask.any(dim=1)
+                margin_per_point = F.relu(hard_neg - pos + float(margin)) * has_neg.float()
+                if float(margin_weight) > 0.0:
+                    margin_component = float(margin_weight) * margin_per_point
+                else:
+                    margin_component = torch.zeros_like(margin_per_point)
+                probs = F.softmax(logits / temp, dim=1)
+                target_prob = probs.gather(1, targets_sel[:, None]).squeeze(1)
+                expected_offset = probs @ offsets.to(device=logits.device, dtype=logits.dtype)
+                epe = torch.linalg.vector_norm(expected_offset - target_offsets_sel, dim=1)
+                subpixel_per_point = F.smooth_l1_loss(
+                    expected_offset,
+                    continuous_target_offsets_sel,
+                    reduction="none",
+                    beta=max(float(subpixel_beta), 1.0e-6),
+                ).sum(dim=1)
+                subpixel_epe = torch.linalg.vector_norm(expected_offset - continuous_target_offsets_sel, dim=1)
+                per_point = (
+                    float(ce_weight) * ce_per_point
+                    + margin_component
+                    + float(subpixel_weight) * subpixel_per_point
+                )
+
+                loss_sum = loss_sum + (per_point * w_sel).sum()
+                weight_sum = weight_sum + w_sel.sum()
+                ce_sum = ce_sum + (ce_per_point * w_sel).sum()
+                subpixel_sum = subpixel_sum + (subpixel_per_point * w_sel).sum()
+                subpixel_epe_sum = subpixel_epe_sum + (subpixel_epe * w_sel).sum()
+                acc_sum = acc_sum + ((logits.argmax(dim=1) == targets_sel).float() * w_sel).sum()
+                epe_sum = epe_sum + (epe * w_sel).sum()
+                offset_sum = offset_sum + (torch.linalg.vector_norm(target_offsets_sel, dim=1) * w_sel).sum()
+                continuous_offset_sum = continuous_offset_sum + (
+                    torch.linalg.vector_norm(continuous_target_offsets_sel, dim=1) * w_sel
+                ).sum()
+                margin_sum = margin_sum + (margin_per_point * w_sel).sum()
+                gap_sum = gap_sum + ((pos - hard_neg) * has_neg.float() * w_sel).sum()
+                prob_sum = prob_sum + (target_prob * w_sel).sum()
+                neg_weight_sum = neg_weight_sum + (has_neg.float() * w_sel).sum()
+                point_count = point_count + q_sel.new_tensor(float(q_sel.shape[0]))
+
+        metrics["nvs_teacher_pair_flow_valid_frac"] = usable.float().mean().detach()
+        metrics["nvs_teacher_pair_flow_nonzero_frac"] = (
+            teacher_mask & in_window & (rounded_offset_norm > 0.0)
+        ).float().mean().detach()
+        if float(point_count.detach().cpu().item()) > 0.0:
+            denom = weight_sum.clamp(min=1.0e-6)
+            loss = loss_sum / denom
+            metrics.update(
+                {
+                    "nvs_teacher_pair_flow_loss": loss.detach(),
+                    "nvs_teacher_pair_flow_weighted_loss": (float(weight) * loss).detach(),
+                    "nvs_teacher_pair_flow_acc": (acc_sum / denom).detach(),
+                    "nvs_teacher_pair_flow_soft_epe": (epe_sum / denom).detach(),
+                    "nvs_teacher_pair_flow_points": point_count.detach(),
+                    "nvs_teacher_pair_flow_target_offset_px": (offset_sum / denom).detach(),
+                    "nvs_teacher_pair_flow_continuous_target_offset_px": (continuous_offset_sum / denom).detach(),
+                    "nvs_teacher_pair_flow_ce_loss": (ce_sum / denom).detach(),
+                    "nvs_teacher_pair_flow_subpixel_loss": (subpixel_sum / denom).detach(),
+                    "nvs_teacher_pair_flow_subpixel_epe": (subpixel_epe_sum / denom).detach(),
+                    "nvs_teacher_pair_flow_margin_loss": (margin_sum / denom).detach(),
+                    "nvs_teacher_pair_flow_target_gap": (gap_sum / neg_weight_sum.clamp(min=1.0e-6)).detach(),
+                    "nvs_teacher_pair_flow_target_prob": (prob_sum / denom).detach(),
+                    "nvs_teacher_pair_flow_skipped_no_points": q_feat.new_tensor(0.0),
+                }
+            )
+        else:
+            loss = zero
+    return float(weight) * loss, metrics
+
+
+def stage4_pair_match_flow_loss(
+    matcher: PairConditionedLocalMatcher | None,
+    query_loc: torch.Tensor,
+    render_loc: torch.Tensor,
+    render_position: torch.Tensor,
+    target_pose: torch.Tensor,
+    intrinsics: torch.Tensor,
+    *,
+    candidate_mask: torch.Tensor | None = None,
+    candidate_selection_mask: torch.Tensor | None = None,
+    positive_candidate_mask: torch.Tensor | None = None,
+    hard_negative_candidate_mask: torch.Tensor | None = None,
+    target_depth: torch.Tensor | None = None,
+    target_mask: torch.Tensor | None = None,
+    weight: float = 0.0,
+    radius: int = 3,
+    stride: int = 4,
+    temperature: float = 0.05,
+    min_points: int = 16,
+    chunk_points: int = 1024,
+    depth_abs_tolerance_m: float = 0.08,
+    depth_rel_tolerance: float = 0.08,
+    margin_weight: float = 0.0,
+    margin: float = 0.05,
+    cross_candidate_margin_weight: float = 0.0,
+    cross_candidate_margin: float = 0.10,
+    positive_only_ce: bool = False,
+) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """Train pair matcher with Stage4 query-centered nonzero offsets.
+
+    Candidate render pixels are projected into the GT query view.  The matcher
+    sees the query feature at that projected query coordinate and a render patch
+    centered at the same coordinate; its target is the offset from query pixel
+    to the candidate-render pixel.
+    """
+    zero = query_loc.new_zeros(())
+    metrics: Dict[str, torch.Tensor] = {
+        "stage4_pair_match_flow_missing": query_loc.new_tensor(0.0 if matcher is not None else 1.0),
+        "stage4_pair_match_flow_loss": zero.detach(),
+        "stage4_pair_match_flow_weighted_loss": zero.detach(),
+        "stage4_pair_match_flow_acc": zero.detach(),
+        "stage4_pair_match_flow_soft_epe": zero.detach(),
+        "stage4_pair_match_flow_points": zero.detach(),
+        "stage4_pair_match_flow_valid_frac": zero.detach(),
+        "stage4_pair_match_flow_candidate_selected_frac": zero.detach(),
+        "stage4_pair_match_flow_target_offset_px": zero.detach(),
+        "stage4_pair_match_flow_margin_loss": zero.detach(),
+        "stage4_pair_match_flow_target_gap": zero.detach(),
+        "stage4_pair_match_flow_target_prob": zero.detach(),
+        "stage4_pair_match_flow_cross_candidate_margin_loss": zero.detach(),
+        "stage4_pair_match_flow_cross_candidate_gap": zero.detach(),
+        "stage4_pair_match_flow_pos_target_logit": zero.detach(),
+        "stage4_pair_match_flow_hard_negative_logit": zero.detach(),
+        "stage4_pair_match_flow_positive_only_ce": query_loc.new_tensor(float(bool(positive_only_ce))).detach(),
+        "stage4_pair_match_flow_skipped_no_points": query_loc.new_tensor(1.0),
+    }
+    if matcher is None or float(weight) <= 0.0:
+        return zero, metrics
+    if query_loc.ndim != 4:
+        raise ValueError("query_loc must have shape (B,C,H,W)")
+    if render_loc.ndim == 4:
+        render_loc = render_loc[:, None]
+    if render_loc.ndim != 5:
+        raise ValueError("render_loc must have shape (B,K,C,H,W) or (B,C,H,W)")
+    if render_position.ndim == 4:
+        render_position = render_position[:, None]
+    if render_position.ndim != 5 or render_position.shape[2] != 3:
+        raise ValueError("render_position must have shape (B,K,3,H,W) or (B,3,H,W)")
+    if query_loc.shape[0] != render_loc.shape[0] or render_loc.shape[:2] != render_position.shape[:2]:
+        raise ValueError("query, render, and render_position batch/candidate dimensions must match")
+    if tuple(render_loc.shape[-2:]) != tuple(render_position.shape[-2:]):
+        raise ValueError(
+            "render_loc and render_position must share feature resolution, "
+            f"got render={tuple(render_loc.shape)} position={tuple(render_position.shape)}"
+        )
+
+    with torch.cuda.amp.autocast(enabled=False):
+        q_feat = _resize_feature(query_loc.float(), tuple(render_loc.shape[-2:]))
+        r_feat = render_loc.float()
+        position = render_position.float()
+        bsz, num, _channels, height, width = r_feat.shape
+        grid, projected_valid, _depth = project_world_positions_to_feature_grid(
+            position,
+            target_pose.float(),
+            intrinsics,
+            feature_hw=(height, width),
+            target_depth=target_depth,
+            target_mask=target_mask,
+            depth_abs_tolerance_m=float(depth_abs_tolerance_m),
+            depth_rel_tolerance=float(depth_rel_tolerance),
+        )
+        device = q_feat.device
+        dtype = q_feat.dtype
+        x_coords = torch.arange(width, device=device, dtype=dtype).view(1, 1, 1, width).expand(bsz, num, height, width)
+        y_coords = torch.arange(height, device=device, dtype=dtype).view(1, 1, height, 1).expand(bsz, num, height, width)
+        u = (grid[..., 0].to(device=device, dtype=dtype) + 1.0) * 0.5 * float(max(width - 1, 1))
+        v = (grid[..., 1].to(device=device, dtype=dtype) + 1.0) * 0.5 * float(max(height - 1, 1))
+
+        r = max(int(radius), 0)
+        offset_axis = torch.arange(-r, r + 1, device=device, dtype=dtype)
+        dy, dx_axis = torch.meshgrid(offset_axis, offset_axis, indexing="ij")
+        offsets = torch.stack([dx_axis.reshape(-1), dy.reshape(-1)], dim=-1)
+        dx = torch.round(x_coords - u).long()
+        dy_i = torch.round(y_coords - v).long()
+        in_window = (dx >= -r) & (dx <= r) & (dy_i >= -r) & (dy_i <= r)
+        target_index = (dy_i + r) * (2 * r + 1) + (dx + r)
+        valid = projected_valid[:, :, 0].to(device=device).bool() & in_window & torch.isfinite(u) & torch.isfinite(v)
+
+        mask = _resize_mask(candidate_mask, (height, width))
+        if mask is not None:
+            if mask.ndim == 4:
+                mask = mask[:, None] if mask.shape[1] != num else mask[:, :, None]
+            valid = valid & (mask.to(device=device)[:, :, 0] > 0.5)
+        selected_frac = q_feat.new_tensor(1.0)
+        if candidate_selection_mask is not None:
+            if candidate_selection_mask.shape != (bsz, num):
+                raise ValueError(
+                    f"candidate_selection_mask must have shape {(bsz, num)}, got {tuple(candidate_selection_mask.shape)}"
+                )
+            selection = candidate_selection_mask.to(device=device).bool()
+            valid = valid & selection[:, :, None, None]
+            selected_frac = selection.float().mean().to(device=device, dtype=dtype)
+        positive_selection = None
+        hard_negative_selection = None
+        if positive_candidate_mask is not None:
+            if positive_candidate_mask.shape != (bsz, num):
+                raise ValueError(
+                    f"positive_candidate_mask must have shape {(bsz, num)}, got {tuple(positive_candidate_mask.shape)}"
+                )
+            positive_selection = positive_candidate_mask.to(device=device).bool()
+        if hard_negative_candidate_mask is not None:
+            if hard_negative_candidate_mask.shape != (bsz, num):
+                raise ValueError(
+                    "hard_negative_candidate_mask must have shape "
+                    f"{(bsz, num)}, got {tuple(hard_negative_candidate_mask.shape)}"
+                )
+            hard_negative_selection = hard_negative_candidate_mask.to(device=device).bool()
+        step = max(int(stride), 1)
+        if step > 1:
+            stride_mask = ((x_coords.long() % step) == 0) & ((y_coords.long() % step) == 0)
+            valid = valid & stride_mask
+
+        loss_sum = q_feat.new_zeros(())
+        acc_sum = q_feat.new_zeros(())
+        epe_sum = q_feat.new_zeros(())
+        offset_sum = q_feat.new_zeros(())
+        margin_sum = q_feat.new_zeros(())
+        gap_sum = q_feat.new_zeros(())
+        prob_sum = q_feat.new_zeros(())
+        point_count = q_feat.new_zeros(())
+        neg_count = q_feat.new_zeros(())
+        pos_logit_sum = q_feat.new_zeros((bsz,))
+        pos_logit_count = q_feat.new_zeros((bsz,))
+        hard_logit_sum = q_feat.new_zeros((bsz,))
+        hard_logit_count = q_feat.new_zeros((bsz,))
+        temp = max(float(temperature), 1.0e-6)
+        chunk = max(int(chunk_points), 1)
+        for batch_idx in range(bsz):
+            query_b = q_feat[batch_idx : batch_idx + 1]
+            for cand_idx in range(num):
+                is_positive_candidate = positive_selection is None or bool(positive_selection[batch_idx, cand_idx].item())
+                is_hard_negative_candidate = hard_negative_selection is not None and bool(
+                    hard_negative_selection[batch_idx, cand_idx].item()
+                )
+                mask_b = valid[batch_idx, cand_idx]
+                if int(mask_b.sum().item()) < int(min_points):
+                    continue
+                q_xy = torch.stack([u[batch_idx, cand_idx][mask_b], v[batch_idx, cand_idx][mask_b]], dim=-1)
+                targets = target_index[batch_idx, cand_idx][mask_b].clamp(min=0, max=offsets.shape[0] - 1)
+                target_offsets = offsets[targets]
+                render_b = r_feat[batch_idx, cand_idx : cand_idx + 1]
+                for start in range(0, q_xy.shape[0], chunk):
+                    end = min(start + chunk, q_xy.shape[0])
+                    q_xy_c = q_xy[start:end]
+                    targets_c = targets[start:end]
+                    target_offsets_c = target_offsets[start:end]
+                    q_valid = torch.ones(1, q_xy_c.shape[0], device=device, dtype=dtype)
+                    q_sparse, q_in = sample_feature_at_xy(query_b, q_xy_c[None], q_valid)
+                    patch_xy = q_xy_c[:, None, :] + offsets[None]
+                    flat_xy = patch_xy.reshape(1, -1, 2)
+                    flat_valid = torch.ones(1, flat_xy.shape[1], device=device, dtype=dtype)
+                    patch_sparse, patch_in = sample_feature_at_xy(render_b, flat_xy, flat_valid)
+                    n_points = q_xy_c.shape[0]
+                    n_offsets = offsets.shape[0]
+                    patch_sparse = patch_sparse.view(n_points, n_offsets, q_sparse.shape[-1])
+                    patch_in = patch_in.view(n_points, n_offsets)
+                    row = torch.arange(n_points, device=device)
+                    usable = q_in[0].bool() & patch_in[row, targets_c]
+                    if int(usable.sum().item()) < 1:
+                        continue
+                    logits = matcher(
+                        q_sparse[0, usable],
+                        patch_sparse[usable],
+                        offsets=offsets,
+                        patch_valid=patch_in[usable],
+                    )
+                    targets_u = targets_c[usable]
+                    per_point = F.cross_entropy(logits / temp, targets_u, reduction="none")
+                    pos = logits.gather(1, targets_u[:, None]).squeeze(1)
+                    patch_valid_u = patch_in[usable].bool()
+                    other_mask = patch_valid_u.clone()
+                    other_mask.scatter_(1, targets_u[:, None], False)
+                    hard_neg = logits.masked_fill(~other_mask, -1.0e4).max(dim=1).values
+                    has_neg = other_mask.any(dim=1)
+                    margin_per_point = F.relu(hard_neg - pos + float(margin)) * has_neg.float()
+                    if float(margin_weight) > 0.0:
+                        per_point = per_point + float(margin_weight) * margin_per_point
+                    count = per_point.new_tensor(float(per_point.numel()))
+                    probs = F.softmax(logits / temp, dim=1)
+                    target_prob = probs.gather(1, targets_u[:, None]).squeeze(1)
+                    expected_offset = probs @ offsets.to(device=logits.device, dtype=logits.dtype)
+                    epe = torch.linalg.vector_norm(
+                        expected_offset - target_offsets_c[usable].to(device=logits.device, dtype=logits.dtype),
+                        dim=1,
+                    )
+                    use_ce = (not bool(positive_only_ce)) or is_positive_candidate
+                    if use_ce:
+                        loss_sum = loss_sum + per_point.sum()
+                        acc_sum = acc_sum + (logits.argmax(dim=1) == targets_u).float().sum()
+                        epe_sum = epe_sum + epe.sum()
+                        offset_sum = offset_sum + torch.linalg.vector_norm(target_offsets_c[usable].float(), dim=1).sum()
+                        margin_sum = margin_sum + margin_per_point.sum()
+                        gap_sum = gap_sum + ((pos - hard_neg) * has_neg.float()).sum()
+                        prob_sum = prob_sum + target_prob.sum()
+                        point_count = point_count + count
+                        neg_count = neg_count + has_neg.float().sum()
+                    if positive_selection is not None and is_positive_candidate:
+                        pos_logit_sum[batch_idx] = pos_logit_sum[batch_idx] + pos.sum()
+                        pos_logit_count[batch_idx] = pos_logit_count[batch_idx] + count
+                    if is_hard_negative_candidate:
+                        hard_any = logits.masked_fill(~patch_valid_u, -1.0e4).max(dim=1).values
+                        hard_logit_sum[batch_idx] = hard_logit_sum[batch_idx] + hard_any.sum()
+                        hard_logit_count[batch_idx] = hard_logit_count[batch_idx] + count
+
+        metrics["stage4_pair_match_flow_valid_frac"] = valid.float().mean().detach()
+        metrics["stage4_pair_match_flow_candidate_selected_frac"] = selected_frac.detach()
+        if float(point_count.detach().cpu().item()) > 0.0:
+            loss = loss_sum / point_count.clamp(min=1.0)
+            cross_active = (pos_logit_count > 0.0) & (hard_logit_count > 0.0)
+            cross_margin_loss = q_feat.new_zeros(())
+            cross_gap = q_feat.new_zeros(())
+            pos_logit_mean = q_feat.new_zeros(())
+            hard_logit_mean = q_feat.new_zeros(())
+            if bool(cross_active.any()):
+                pos_per_batch = pos_logit_sum[cross_active] / pos_logit_count[cross_active].clamp(min=1.0)
+                hard_per_batch = hard_logit_sum[cross_active] / hard_logit_count[cross_active].clamp(min=1.0)
+                cross_margin_loss = F.relu(hard_per_batch - pos_per_batch + float(cross_candidate_margin)).mean()
+                cross_gap = (pos_per_batch - hard_per_batch).mean()
+                pos_logit_mean = pos_per_batch.mean()
+                hard_logit_mean = hard_per_batch.mean()
+                if float(cross_candidate_margin_weight) > 0.0:
+                    loss = loss + float(cross_candidate_margin_weight) * cross_margin_loss
+            metrics.update(
+                {
+                    "stage4_pair_match_flow_loss": loss.detach(),
+                    "stage4_pair_match_flow_weighted_loss": (float(weight) * loss).detach(),
+                    "stage4_pair_match_flow_acc": (acc_sum / point_count.clamp(min=1.0)).detach(),
+                    "stage4_pair_match_flow_soft_epe": (epe_sum / point_count.clamp(min=1.0)).detach(),
+                    "stage4_pair_match_flow_points": point_count.detach(),
+                    "stage4_pair_match_flow_target_offset_px": (offset_sum / point_count.clamp(min=1.0)).detach(),
+                    "stage4_pair_match_flow_margin_loss": (margin_sum / neg_count.clamp(min=1.0)).detach(),
+                    "stage4_pair_match_flow_target_gap": (gap_sum / neg_count.clamp(min=1.0)).detach(),
+                    "stage4_pair_match_flow_target_prob": (prob_sum / point_count.clamp(min=1.0)).detach(),
+                    "stage4_pair_match_flow_cross_candidate_margin_loss": cross_margin_loss.detach(),
+                    "stage4_pair_match_flow_cross_candidate_gap": cross_gap.detach(),
+                    "stage4_pair_match_flow_pos_target_logit": pos_logit_mean.detach(),
+                    "stage4_pair_match_flow_hard_negative_logit": hard_logit_mean.detach(),
+                    "stage4_pair_match_flow_skipped_no_points": q_feat.new_tensor(0.0),
+                }
+            )
+        else:
+            loss = zero
+    return float(weight) * loss, metrics
+
+
 def forward_batch(
     model,
     adapter: PoseFeatureDomainAdapter,
     energy_net: PoseEnergyNet | None,
     pair_matcher: PairConditionedLocalMatcher | None,
+    denseflow_head: PofdDenseFlowHead | None,
     map_renderer,
     batch,
     cfg: Dict,
@@ -2947,7 +4440,10 @@ def forward_batch(
         else:
             init_pose = candidate_poses[:, 0].detach().clone()
     else:
-        init_pose = candidate_center_pose(pose_gt, args)
+        if str(getattr(args, "candidate_bank_mode", "lattice") or "lattice").lower() == "cache" and "pose_init" in batch:
+            init_pose = batch["pose_init"].to(device=device, dtype=torch.float32)
+        else:
+            init_pose = candidate_center_pose(pose_gt, args)
         candidate_poses = build_nvs_candidate_bank(init_pose, pose_gt, args, train=train)
 
     with torch.no_grad():
@@ -3081,6 +4577,85 @@ def forward_batch(
         }
         target_intrinsics = gt_intrinsics[:, 0] if gt_intrinsics is not None and gt_intrinsics.ndim == 3 and gt_intrinsics.shape[-1] == 4 else gt_intrinsics
 
+    denseflow_loss = query_loc.new_zeros(())
+    denseflow_metrics = {
+        "denseflow_missing": query_loc.new_tensor(0.0 if denseflow_head is not None else 1.0),
+        "denseflow_loss": denseflow_loss.detach(),
+        "denseflow_weighted_loss": denseflow_loss.detach(),
+        "denseflow_flow_loss": denseflow_loss.detach(),
+        "denseflow_conf_loss": denseflow_loss.detach(),
+        "denseflow_flow_epe_px": denseflow_loss.detach(),
+        "denseflow_valid_frac": denseflow_loss.detach(),
+        "denseflow_conf_mean": denseflow_loss.detach(),
+    }
+    denseflow_enabled = bool(getattr(args, "denseflow_enabled", False)) or (
+        float(getattr(args, "denseflow_weight", 0.0) or 0.0) > 0.0
+    )
+    if denseflow_enabled:
+        if denseflow_head is None:
+            raise ValueError("denseflow_enabled requires denseflow_head")
+        if target_intrinsics is None:
+            raise KeyError("denseflow supervision requires render intrinsics")
+        with torch.no_grad():
+            dense_batch = map_renderer.attach_pose_candidate_renders(
+                dict(batch),
+                init_pose[:, None].detach(),
+                prefix="denseflow",
+                require_grad=False,
+                feature="all",
+                include_aux=True,
+            )
+        dense_render_base = _single_candidate_tensor(dense_batch.get("denseflow_fine"), name="denseflow_fine").float().detach()
+        dense_depth = _single_candidate_tensor(dense_batch.get("denseflow_depth"), name="denseflow_depth").float().detach()
+        dense_intrinsics = dense_batch.get("denseflow_intrinsics")
+        if dense_intrinsics is None:
+            raise KeyError("denseflow supervision requires denseflow_intrinsics from map renderer")
+        dense_intrinsics = _single_candidate_tensor(dense_intrinsics, name="denseflow_intrinsics").float()
+        dense_mask_raw = dense_batch.get("denseflow_mask")
+        dense_mask = _single_candidate_tensor(dense_mask_raw, name="denseflow_mask") if dense_mask_raw is not None else None
+        dense_rgb_raw = dense_batch.get("denseflow_rgb")
+        dense_rgb = _single_candidate_tensor(dense_rgb_raw, name="denseflow_rgb") if dense_rgb_raw is not None else None
+        dense_project_rgb = dense_rgb if adapter_needs_rgb else None
+        dense_render_loc = adapter.project_render(dense_render_base, rgb=dense_project_rgb)
+        dense_hw = tuple(dense_render_loc.shape[-2:])
+        dense_query_loc = _resize_feature(query_loc, dense_hw)
+        dense_intrinsics_hw = _scale_intrinsics_between_hw(
+            dense_intrinsics,
+            tuple(query_loc.shape[-2:]),
+            dense_hw,
+        )
+        dense_pred = denseflow_head(
+            dense_query_loc,
+            dense_render_loc,
+            depth=dense_depth,
+            intrinsics=dense_intrinsics_hw,
+        )
+        dense_gt = denseflow_gt_flow_from_render_depth(
+            pose_init=init_pose.float(),
+            pose_gt=pose_gt.float(),
+            render_depth=dense_depth,
+            intrinsics=dense_intrinsics_hw,
+            target_hw=tuple(dense_pred["flow"].shape[-2:]),
+        )
+        dense_valid = dense_gt["valid"]
+        if dense_mask is not None:
+            dense_mask_resized = _resize_mask(dense_mask, tuple(dense_pred["flow"].shape[-2:]))
+            if dense_mask_resized.ndim == 3:
+                dense_mask_resized = dense_mask_resized[:, None]
+            dense_valid = dense_valid & (dense_mask_resized[:, :1].to(device=dense_valid.device) > 0.5)
+        denseflow_loss, denseflow_metrics = denseflow_supervision_loss(
+            pred_flow=dense_pred["flow"],
+            pred_confidence=dense_pred["confidence"],
+            gt_flow=dense_gt["flow"],
+            valid=dense_valid,
+            flow_weight=float(args.denseflow_flow_weight),
+            confidence_weight=float(args.denseflow_confidence_weight),
+        )
+        denseflow_metrics["denseflow_missing"] = denseflow_loss.new_tensor(0.0).detach()
+        denseflow_metrics["denseflow_weighted_loss"] = (
+            float(args.denseflow_weight) * denseflow_loss
+        ).detach()
+
     local_stats = {
         "local_zero_score": query_loc.new_zeros(()),
         "local_peak_score": query_loc.new_zeros(()),
@@ -3115,6 +4690,8 @@ def forward_batch(
             candidate_chunk_size=int(args.pair_matcher_score_candidate_chunk_size),
             offset_chunk_size=int(args.pair_matcher_score_offset_chunk_size),
             candidate_score_mode=str(args.pair_matcher_candidate_score_mode),
+            score_pooling=str(args.pair_matcher_score_pooling),
+            score_topk_fraction=float(args.pair_matcher_score_topk_fraction),
         )
         if float(args.local_flow_nce_weight) > 0.0:
             if cand_position is None or gt_intrinsics is None:
@@ -3217,6 +4794,49 @@ def forward_batch(
         margin_weight=float(args.pair_matcher_margin_weight),
         margin=float(args.pair_matcher_margin),
     )
+    teacher_pair_flow_loss, teacher_pair_flow_metrics = nvs_teacher_pair_flow_loss(
+        pair_matcher,
+        score_query_loc,
+        score_cand_render_loc,
+        batch,
+        render_mask=score_cand_mask,
+        weight=float(args.teacher_pair_flow_weight) if bool(args.pair_matcher_enabled) else 0.0,
+        radius=int(args.teacher_pair_flow_radius),
+        temperature=float(args.teacher_pair_flow_temperature),
+        min_confidence=float(args.teacher_pair_flow_min_confidence),
+        min_points=int(args.teacher_pair_flow_min_points),
+        min_target_offset_px=float(args.teacher_pair_flow_min_target_offset_px),
+        ce_weight=float(args.teacher_pair_flow_ce_weight),
+        subpixel_weight=float(args.teacher_pair_flow_subpixel_weight),
+        subpixel_beta=float(args.teacher_pair_flow_subpixel_beta),
+        margin_weight=float(args.teacher_pair_flow_margin_weight),
+        margin=float(args.teacher_pair_flow_margin),
+        candidate_index=int(args.teacher_pair_flow_candidate_index),
+        chunk_points=int(args.teacher_pair_flow_chunk_points),
+    )
+    stage4_pair_flow_loss = query_loc.new_zeros(())
+    stage4_pair_flow_metrics = {
+        "stage4_pair_match_flow_missing": query_loc.new_tensor(0.0 if pair_matcher is not None else 1.0),
+        "stage4_pair_match_flow_loss": stage4_pair_flow_loss.detach(),
+        "stage4_pair_match_flow_weighted_loss": stage4_pair_flow_loss.detach(),
+        "stage4_pair_match_flow_acc": stage4_pair_flow_loss.detach(),
+        "stage4_pair_match_flow_soft_epe": stage4_pair_flow_loss.detach(),
+        "stage4_pair_match_flow_points": stage4_pair_flow_loss.detach(),
+        "stage4_pair_match_flow_valid_frac": stage4_pair_flow_loss.detach(),
+        "stage4_pair_match_flow_candidate_selected_frac": stage4_pair_flow_loss.detach(),
+        "stage4_pair_match_flow_target_offset_px": stage4_pair_flow_loss.detach(),
+        "stage4_pair_match_flow_margin_loss": stage4_pair_flow_loss.detach(),
+        "stage4_pair_match_flow_target_gap": stage4_pair_flow_loss.detach(),
+        "stage4_pair_match_flow_target_prob": stage4_pair_flow_loss.detach(),
+        "stage4_pair_match_flow_cross_candidate_margin_loss": stage4_pair_flow_loss.detach(),
+        "stage4_pair_match_flow_cross_candidate_gap": stage4_pair_flow_loss.detach(),
+        "stage4_pair_match_flow_pos_target_logit": stage4_pair_flow_loss.detach(),
+        "stage4_pair_match_flow_hard_negative_logit": stage4_pair_flow_loss.detach(),
+        "stage4_pair_match_flow_positive_only_ce": stage4_pair_flow_loss.detach(),
+        "stage4_pair_match_flow_best_active": stage4_pair_flow_loss.detach(),
+        "stage4_pair_match_flow_hard_negative_active": stage4_pair_flow_loss.detach(),
+        "stage4_pair_match_flow_skipped_no_points": query_loc.new_tensor(1.0),
+    }
     cand_valid = torch.isfinite(cand_scores)
     if cand_mask is not None:
         valid_mask = _resize_mask(score_cand_mask, tuple(score_cand_render_loc.shape[-2:]))
@@ -3234,6 +4854,88 @@ def forward_batch(
         pose_gt.float(),
         rot_cost_weight=float(args.rot_cost_weight),
     )
+    cand_scores, candidate_delta_prior_metrics = apply_candidate_delta_score_prior(
+        cand_scores,
+        candidate_pose,
+        init_pose,
+        trans_weight=float(args.candidate_delta_trans_score_penalty),
+        rot_weight=float(args.candidate_delta_rot_score_penalty),
+        trans_reward=float(args.candidate_delta_trans_score_reward),
+        rot_reward=float(args.candidate_delta_rot_score_reward),
+    )
+    cand_scores, candidate_quality_prior_metrics = apply_candidate_teacher_quality_score_prior(
+        cand_scores,
+        batch,
+        valid_mask=cand_valid,
+        weight=float(args.candidate_teacher_quality_score_prior_weight),
+        target_mode=str(args.candidate_teacher_quality_target_mode),
+    )
+    if float(getattr(args, "stage4_pair_match_flow_weight", 0.0) or 0.0) > 0.0:
+        if pair_matcher is None:
+            raise ValueError("stage4_pair_match_flow_weight requires --pair-matcher-enabled")
+        if cand_position is None or gt_intrinsics is None:
+            raise KeyError("Stage4 pair-match flow requires nvs_candidate_position and nvs_gt_intrinsics")
+        stage4_flow_selection = None
+        stage4_candidate_selection_mask = None
+        stage4_positive_candidate_mask = None
+        stage4_hard_negative_candidate_mask = None
+        stage4_candidate_mode = str(getattr(args, "stage4_pair_match_flow_candidate_mode", "all") or "all").lower()
+        if stage4_candidate_mode != "all":
+            stage4_flow_selection = hard_flow_candidate_selection_mask(
+                cand_scores.detach(),
+                pose_cost.detach(),
+                cand_valid,
+                mode=stage4_candidate_mode,
+                min_cost_gap_m=float(args.stage4_pair_match_flow_hard_negative_min_cost_gap_m),
+            )
+            stage4_candidate_selection_mask = stage4_flow_selection["selection_mask"]
+            stage4_positive_candidate_mask = stage4_flow_selection["best_mask"]
+            stage4_hard_negative_candidate_mask = stage4_flow_selection["hard_negative_mask"]
+        stage4_flow_position, stage4_flow_intrinsics = _flow_geometry_for_score_hw(
+            cand_position.float().detach(),
+            target_intrinsics,
+            source_hw=tuple(query_loc.shape[-2:]),
+            score_hw=tuple(score_cand_render_loc.shape[-2:]),
+        )
+        stage4_pair_flow_loss, stage4_pair_flow_metrics = stage4_pair_match_flow_loss(
+            pair_matcher,
+            score_query_loc,
+            score_cand_render_loc,
+            stage4_flow_position,
+            pose_gt.float(),
+            stage4_flow_intrinsics,
+            candidate_mask=score_cand_mask,
+            candidate_selection_mask=stage4_candidate_selection_mask,
+            positive_candidate_mask=stage4_positive_candidate_mask,
+            hard_negative_candidate_mask=stage4_hard_negative_candidate_mask,
+            target_depth=gt_depth,
+            target_mask=gt_mask,
+            weight=float(args.stage4_pair_match_flow_weight),
+            radius=int(args.pair_matcher_radius),
+            stride=int(args.pair_matcher_score_stride),
+            temperature=float(args.pair_matcher_temperature),
+            min_points=int(args.pair_matcher_min_points),
+            chunk_points=int(args.pair_matcher_score_chunk_points),
+            depth_abs_tolerance_m=float(args.warp_depth_tolerance_m),
+            depth_rel_tolerance=float(args.warp_depth_tolerance_rel),
+            margin_weight=float(args.stage4_pair_match_flow_margin_weight),
+            margin=float(args.stage4_pair_match_flow_margin),
+            cross_candidate_margin_weight=float(args.stage4_pair_match_flow_cross_candidate_margin_weight),
+            cross_candidate_margin=float(args.stage4_pair_match_flow_cross_candidate_margin),
+            positive_only_ce=bool(args.stage4_pair_match_flow_positive_only_ce),
+        )
+        if stage4_flow_selection is None:
+            stage4_pair_flow_metrics["stage4_pair_match_flow_best_active"] = cand_valid.any(dim=1).float().mean().detach()
+            stage4_pair_flow_metrics["stage4_pair_match_flow_hard_negative_active"] = stage4_pair_flow_loss.new_zeros(
+                ()
+            ).detach()
+        else:
+            stage4_pair_flow_metrics["stage4_pair_match_flow_best_active"] = stage4_flow_selection[
+                "best_active"
+            ].detach()
+            stage4_pair_flow_metrics["stage4_pair_match_flow_hard_negative_active"] = stage4_flow_selection[
+                "hard_negative_active"
+            ].detach()
     if flow_inputs is not None:
         flow_selection = None
         candidate_selection_mask = None
@@ -3271,6 +4973,12 @@ def forward_batch(
             flow_metrics["local_flow_hard_negative_active"] = flow_selection["hard_negative_active"].detach()
     correction_cos = candidate_correction_cosines(candidate_pose, init_pose, pose_gt.float()).to(device=device)
     identity_mask = candidate_identity_mask(candidate_pose, init_pose).to(device=device)
+    cand_scores, candidate_identity_fallback_metrics = apply_candidate_identity_fallback_score_gate(
+        cand_scores,
+        identity_mask,
+        valid_mask=cand_valid,
+        min_score_gap=float(args.candidate_identity_fallback_min_score_gap),
+    )
     rank = rank_losses_from_scores(
         cand_scores,
         pose_cost.detach(),
@@ -3387,6 +5095,8 @@ def forward_batch(
                 candidate_chunk_size=1,
                 offset_chunk_size=int(args.pair_matcher_score_offset_chunk_size),
                 candidate_score_mode=str(args.pair_matcher_candidate_score_mode),
+                score_pooling=str(args.pair_matcher_score_pooling),
+                score_topk_fraction=float(args.pair_matcher_score_topk_fraction),
             )
             observability = observability_score_contrast_loss(
                 gt_scores,
@@ -3787,6 +5497,9 @@ def forward_batch(
         + float(args.local_flow_nce_weight) * flow_loss
         + teacher_corr_loss
         + pair_match_loss
+        + teacher_pair_flow_loss
+        + stage4_pair_flow_loss
+        + float(args.denseflow_weight) * denseflow_loss
         + float(args.rank_ce_weight) * rank["rank_loss"]
         + float(args.score_correction_cosine_weight) * score_correction_cosine["loss"]
         + float(args.score_pose_improvement_weight) * score_pose_improvement["loss"]
@@ -3888,6 +5601,9 @@ def forward_batch(
         "local_flow_hard_negative_active": flow_metrics["local_flow_hard_negative_active"].detach(),
         **{key: value.detach() for key, value in teacher_corr_metrics.items()},
         **{key: value.detach() for key, value in pair_match_metrics.items()},
+        **{key: value.detach() for key, value in teacher_pair_flow_metrics.items()},
+        **{key: value.detach() for key, value in stage4_pair_flow_metrics.items()},
+        **{key: value.detach() for key, value in denseflow_metrics.items()},
         "local_zero_score": local_stats["local_zero_score"].detach(),
         "local_peak_score": local_stats["local_peak_score"].detach(),
         "local_peak_gap": local_stats["local_peak_gap"].detach(),
@@ -3926,6 +5642,9 @@ def forward_batch(
         "selected_identity_frac": selected_identity_frac.detach(),
         "oracle_identity_frac": oracle_identity_frac.detach(),
         "candidate_identity_frac": identity_mask.float().mean().detach(),
+        **{key: value.detach() for key, value in candidate_delta_prior_metrics.items()},
+        **{key: value.detach() for key, value in candidate_quality_prior_metrics.items()},
+        **{key: value.detach() for key, value in candidate_identity_fallback_metrics.items()},
         "selected_delta_trans_m": selected_delta_trans.detach().mean(),
         "selected_delta_rot_deg": selected_delta_rot.detach().mean(),
         "oracle_delta_trans_m": oracle_delta_trans.detach().mean(),
@@ -3970,6 +5689,29 @@ def forward_batch(
         **{key: value.detach() for key, value in pose_obs_metrics.items()},
     }
     metrics.update(pose_energy_metrics)
+    if getattr(args, "eval_failure_dump_path", None):
+        dump_init_expanded = init_pose.float()[:, None].expand(-1, candidate_pose.shape[1], -1, -1)
+        _dump_delta_loss, dump_delta_rot, dump_delta_trans = pose_error_tensors(
+            candidate_pose.float().reshape(-1, 4, 4),
+            dump_init_expanded.reshape(-1, 4, 4),
+        )
+        dump_delta_trans = dump_delta_trans.reshape(candidate_pose.shape[:2])
+        dump_delta_rot = dump_delta_rot.reshape(candidate_pose.shape[:2])
+        metrics.update(
+            {
+                "_dump_candidate_scores": cand_scores.detach(),
+                "_dump_pose_cost": pose_cost.detach(),
+                "_dump_trans_err": trans_err.detach(),
+                "_dump_rot_err": rot_err.detach(),
+                "_dump_candidate_delta_trans": dump_delta_trans.detach(),
+                "_dump_candidate_delta_rot": dump_delta_rot.detach(),
+                "_dump_valid_mask": cand_valid.detach(),
+                "_dump_pred_idx": pred_idx.long().detach(),
+                "_dump_oracle_idx": rank_target_idx.long().detach(),
+                "_dump_rank_pred_idx": rank_pred_idx.long().detach(),
+                "_dump_init_cost": init_pose_cost.detach().reshape(-1),
+            }
+        )
     return loss, metrics
 
 
@@ -3979,12 +5721,182 @@ def mean_metrics(rows: List[Dict[str, float]]) -> Dict[str, float]:
     return {key: sum(float(row[key]) for row in rows) / len(rows) for key in rows[0].keys()}
 
 
+def _rounded_float(value: torch.Tensor | float | int, ndigits: int = 6) -> float:
+    if isinstance(value, torch.Tensor):
+        value = value.detach().cpu().item()
+    return round(float(value), int(ndigits))
+
+
+def _batch_item_value(batch: Dict[str, Any], key: str, row_idx: int) -> Any:
+    if key not in batch:
+        return None
+    value = batch[key]
+    if isinstance(value, torch.Tensor):
+        if value.ndim == 0:
+            return value.detach().cpu().item()
+        item = value[row_idx].detach().cpu()
+        return item.item() if item.numel() == 1 else item.tolist()
+    if isinstance(value, (list, tuple)):
+        return value[row_idx] if row_idx < len(value) else None
+    return value
+
+
+def _candidate_rank_records(
+    candidate_indices: torch.Tensor,
+    *,
+    candidate_scores: torch.Tensor,
+    pose_cost: torch.Tensor,
+    trans_err: torch.Tensor,
+    rot_err: torch.Tensor,
+    candidate_delta_trans: torch.Tensor | None = None,
+    candidate_delta_rot: torch.Tensor | None = None,
+) -> List[Dict[str, float | int]]:
+    records = []
+    for idx_tensor in candidate_indices:
+        idx = int(idx_tensor.item())
+        record = {
+            "idx": idx,
+            "score": _rounded_float(candidate_scores[idx]),
+            "cost_m": _rounded_float(pose_cost[idx]),
+            "trans_m": _rounded_float(trans_err[idx]),
+            "rot_deg": _rounded_float(rot_err[idx] * (180.0 / math.pi)),
+        }
+        if candidate_delta_trans is not None:
+            record["delta_trans_m"] = _rounded_float(candidate_delta_trans[idx])
+        if candidate_delta_rot is not None:
+            record["delta_rot_deg"] = _rounded_float(candidate_delta_rot[idx])
+        records.append(record)
+    return records
+
+
+def build_candidate_failure_dump_rows(
+    *,
+    batch: Dict[str, Any],
+    batch_index: int,
+    first_global_index: int,
+    candidate_scores: torch.Tensor,
+    pose_cost: torch.Tensor,
+    trans_err: torch.Tensor,
+    rot_err: torch.Tensor,
+    valid_mask: torch.Tensor,
+    pred_idx: torch.Tensor,
+    oracle_idx: torch.Tensor,
+    rank_pred_idx: torch.Tensor,
+    init_cost: torch.Tensor,
+    candidate_delta_trans: torch.Tensor | None = None,
+    candidate_delta_rot: torch.Tensor | None = None,
+    include_correct: bool = False,
+    min_gap_m: float = 0.0,
+    top_n: int = 5,
+) -> List[Dict[str, Any]]:
+    if candidate_scores.ndim != 2:
+        raise ValueError("candidate_scores must have shape (B,K)")
+    if pose_cost.shape != candidate_scores.shape or trans_err.shape != candidate_scores.shape:
+        raise ValueError("pose_cost/trans_err must match candidate_scores")
+    if rot_err.shape != candidate_scores.shape or valid_mask.shape != candidate_scores.shape:
+        raise ValueError("rot_err/valid_mask must match candidate_scores")
+    if candidate_delta_trans is not None and candidate_delta_trans.shape != candidate_scores.shape:
+        raise ValueError("candidate_delta_trans must match candidate_scores")
+    if candidate_delta_rot is not None and candidate_delta_rot.shape != candidate_scores.shape:
+        raise ValueError("candidate_delta_rot must match candidate_scores")
+    bsz, num_candidates = candidate_scores.shape
+    rows: List[Dict[str, Any]] = []
+    init_flat = init_cost.detach().cpu().reshape(-1)
+    for row_idx in range(bsz):
+        valid_indices = torch.nonzero(valid_mask[row_idx].detach().cpu().bool(), as_tuple=False).flatten()
+        if valid_indices.numel() == 0:
+            continue
+        pred = int(pred_idx[row_idx].detach().cpu().item())
+        oracle = int(oracle_idx[row_idx].detach().cpu().item())
+        rank_pred = int(rank_pred_idx[row_idx].detach().cpu().item())
+        if not (0 <= pred < num_candidates and 0 <= oracle < num_candidates):
+            continue
+        scores_row = candidate_scores[row_idx].detach().cpu().float()
+        cost_row = pose_cost[row_idx].detach().cpu().float()
+        trans_row = trans_err[row_idx].detach().cpu().float()
+        rot_row = rot_err[row_idx].detach().cpu().float()
+        delta_trans_row = (
+            candidate_delta_trans[row_idx].detach().cpu().float() if candidate_delta_trans is not None else None
+        )
+        delta_rot_row = candidate_delta_rot[row_idx].detach().cpu().float() if candidate_delta_rot is not None else None
+        selected_cost = float(cost_row[pred].item())
+        oracle_cost = float(cost_row[oracle].item())
+        oracle_gap = selected_cost - oracle_cost
+        is_correct = pred == oracle or oracle_gap <= float(min_gap_m)
+        if is_correct and not include_correct:
+            continue
+        valid_scores = scores_row[valid_indices]
+        valid_costs = cost_row[valid_indices]
+        score_order = valid_indices[torch.argsort(valid_scores, descending=True)[: max(1, int(top_n))]]
+        cost_order = valid_indices[torch.argsort(valid_costs, descending=False)[: max(1, int(top_n))]]
+        best_score_idx = int(score_order[0].item())
+        sample_name = _batch_item_value(batch, "sample_name", row_idx)
+        init_source = _batch_item_value(batch, "init_source", row_idx)
+        teacher_idx = _batch_item_value(batch, "teacher_idx", row_idx)
+        row = {
+            "batch_index": int(batch_index),
+            "row_in_batch": int(row_idx),
+            "global_index": int(first_global_index + row_idx),
+            "sample_name": None if sample_name is None else str(sample_name),
+            "teacher_idx": None if teacher_idx is None else int(teacher_idx),
+            "init_source": None if init_source is None else str(init_source),
+            "pred_idx": pred,
+            "rank_pred_idx": rank_pred,
+            "oracle_idx": oracle,
+            "best_score_idx": best_score_idx,
+            "init_cost_m": _rounded_float(init_flat[min(row_idx, init_flat.numel() - 1)]),
+            "selected_cost_m": _rounded_float(cost_row[pred]),
+            "oracle_cost_m": _rounded_float(cost_row[oracle]),
+            "oracle_gap_m": _rounded_float(oracle_gap),
+            "selected_trans_m": _rounded_float(trans_row[pred]),
+            "selected_rot_deg": _rounded_float(rot_row[pred] * (180.0 / math.pi)),
+            "oracle_trans_m": _rounded_float(trans_row[oracle]),
+            "oracle_rot_deg": _rounded_float(rot_row[oracle] * (180.0 / math.pi)),
+            "selected_score": _rounded_float(scores_row[pred]),
+            "oracle_score": _rounded_float(scores_row[oracle]),
+            "score_gap_selected_minus_oracle": _rounded_float(scores_row[pred] - scores_row[oracle]),
+            "best_score": _rounded_float(scores_row[best_score_idx]),
+            "best_score_cost_m": _rounded_float(cost_row[best_score_idx]),
+            "score_best_minus_selected": _rounded_float(scores_row[best_score_idx] - scores_row[pred]),
+            "top_score_candidates": _candidate_rank_records(
+                score_order,
+                candidate_scores=scores_row,
+                pose_cost=cost_row,
+                trans_err=trans_row,
+                rot_err=rot_row,
+                candidate_delta_trans=delta_trans_row,
+                candidate_delta_rot=delta_rot_row,
+            ),
+            "top_cost_candidates": _candidate_rank_records(
+                cost_order,
+                candidate_scores=scores_row,
+                pose_cost=cost_row,
+                trans_err=trans_row,
+                rot_err=rot_row,
+                candidate_delta_trans=delta_trans_row,
+                candidate_delta_rot=delta_rot_row,
+            ),
+        }
+        rows.append(row)
+    return rows
+
+
+def _batch_size_from_batch(batch: Dict[str, Any]) -> int:
+    for value in batch.values():
+        if isinstance(value, torch.Tensor) and value.ndim > 0:
+            return int(value.shape[0])
+        if isinstance(value, (list, tuple)):
+            return len(value)
+    return 0
+
+
 @torch.no_grad()
 def evaluate(
     model,
     adapter,
     energy_net,
     pair_matcher,
+    denseflow_head,
     loader,
     map_renderer,
     cfg: Dict,
@@ -3996,25 +5908,732 @@ def evaluate(
         energy_net.eval()
     if pair_matcher is not None:
         pair_matcher.eval()
+    if denseflow_head is not None:
+        denseflow_head.eval()
     eval_args = argparse.Namespace(**vars(args))
     if args.eval_synthetic_ratio is not None:
         eval_args.synthetic_ratio = float(args.eval_synthetic_ratio)
     rows = []
+    dump_rows: List[Dict[str, Any]] = []
+    dump_enabled = bool(getattr(args, "eval_failure_dump_path", None))
+    seen_samples = int(getattr(args, "skip_samples", 0) or 0)
     for batch_idx, batch in enumerate(loader):
         _loss, metrics = forward_batch(
             model,
             adapter,
             energy_net,
             pair_matcher,
+            denseflow_head,
             map_renderer,
             batch,
             cfg,
             eval_args,
             train=False,
         )
-        rows.append({key: float(value.detach().cpu()) for key, value in metrics.items()})
+        if dump_enabled:
+            dump_tensors = {key[len("_dump_") :]: value for key, value in metrics.items() if key.startswith("_dump_")}
+            required_dump_keys = {
+                "candidate_scores",
+                "pose_cost",
+                "trans_err",
+                "rot_err",
+                "valid_mask",
+                "pred_idx",
+                "oracle_idx",
+                "rank_pred_idx",
+                "init_cost",
+            }
+            if required_dump_keys <= set(dump_tensors):
+                dump_rows.extend(
+                    build_candidate_failure_dump_rows(
+                        batch=batch,
+                        batch_index=batch_idx,
+                        first_global_index=seen_samples,
+                        candidate_scores=dump_tensors["candidate_scores"],
+                        pose_cost=dump_tensors["pose_cost"],
+                        trans_err=dump_tensors["trans_err"],
+                        rot_err=dump_tensors["rot_err"],
+                        valid_mask=dump_tensors["valid_mask"],
+                        pred_idx=dump_tensors["pred_idx"],
+                        oracle_idx=dump_tensors["oracle_idx"],
+                        rank_pred_idx=dump_tensors["rank_pred_idx"],
+                        init_cost=dump_tensors["init_cost"],
+                        candidate_delta_trans=dump_tensors.get("candidate_delta_trans"),
+                        candidate_delta_rot=dump_tensors.get("candidate_delta_rot"),
+                        include_correct=bool(args.eval_failure_dump_include_correct),
+                        min_gap_m=float(args.eval_failure_dump_min_gap_m),
+                        top_n=int(args.eval_failure_dump_top_n),
+                    )
+                )
+        rows.append(
+            {
+                key: float(value.detach().cpu())
+                for key, value in metrics.items()
+                if not key.startswith("_dump_")
+            }
+        )
+        seen_samples += _batch_size_from_batch(batch)
         if args.eval_max_samples is not None and (batch_idx + 1) * int(args.batch_size) >= int(args.eval_max_samples):
             break
+    if dump_enabled:
+        dump_rows.sort(key=lambda row: float(row.get("oracle_gap_m", 0.0)), reverse=True)
+        max_rows = int(args.eval_failure_dump_max_rows)
+        if max_rows > 0:
+            dump_rows = dump_rows[:max_rows]
+        dump_path = Path(str(args.eval_failure_dump_path))
+        if not dump_path.is_absolute():
+            dump_path = Path(str(args.out_dir)) / dump_path
+        dump_path.parent.mkdir(parents=True, exist_ok=True)
+        with dump_path.open("w", encoding="utf-8") as f:
+            for row in dump_rows:
+                f.write(json.dumps(row, sort_keys=True) + "\n")
+    return mean_metrics(rows)
+
+
+def _single_candidate_tensor(value: torch.Tensor | None, *, name: str) -> torch.Tensor:
+    if value is None:
+        raise KeyError(f"Stage4 evaluation requires {name}")
+    if value.ndim >= 2 and value.shape[1] == 1:
+        return value[:, 0]
+    return value
+
+
+def stage4_initial_pose_from_batch(
+    batch: Dict,
+    pose_gt: torch.Tensor,
+    args: argparse.Namespace,
+    *,
+    device: torch.device,
+) -> torch.Tensor:
+    bank_mode = str(getattr(args, "candidate_bank_mode", "lattice") or "lattice").lower()
+    if bank_mode != "cache":
+        return candidate_center_pose(pose_gt, args)
+    if "pose_init" in batch:
+        return batch["pose_init"].to(device=device, dtype=torch.float32)
+    if "pose_init_candidates" not in batch:
+        raise KeyError("candidate_bank_mode=cache requires batch['pose_init'] or batch['pose_init_candidates']")
+    candidate_poses = batch["pose_init_candidates"].to(device=device, dtype=torch.float32)
+    if candidate_poses.ndim != 4 or candidate_poses.shape[-2:] != (4, 4) or candidate_poses.shape[1] < 1:
+        raise ValueError("pose_init_candidates must have shape (B,K,4,4) with K >= 1")
+    return candidate_poses[:, 0].detach().clone()
+
+
+def stage4_update_step_metrics(before_pose: torch.Tensor, update_pose: torch.Tensor) -> Dict[str, torch.Tensor]:
+    if before_pose.ndim != 3 or update_pose.ndim != 3:
+        raise ValueError("before_pose and update_pose must have shape (B,4,4)")
+    if before_pose.shape != update_pose.shape or before_pose.shape[-2:] != (4, 4):
+        raise ValueError("before_pose and update_pose must share shape (B,4,4)")
+    _delta_loss, delta_rot_deg, delta_trans_m = pose_error_tensors(update_pose.float(), before_pose.float())
+    return {
+        "update_trans_m": delta_trans_m,
+        "update_rot_deg": delta_rot_deg,
+    }
+
+
+def stage4_pose_update_diagnostics(
+    before_pose: torch.Tensor,
+    update_pose: torch.Tensor,
+    pose_gt: torch.Tensor,
+    *,
+    rot_cost_weight: float,
+) -> Dict[str, torch.Tensor]:
+    if before_pose.ndim != 3 or update_pose.ndim != 3 or pose_gt.ndim != 3:
+        raise ValueError("before_pose, update_pose, and pose_gt must have shape (B,4,4)")
+    before_cost, _before_residual, _before_trans, _before_rot = pose_costs_and_residual_targets(
+        before_pose[:, None].float(),
+        pose_gt.float(),
+        rot_cost_weight=float(rot_cost_weight),
+    )
+    update_cost, _update_residual, _update_trans, _update_rot = pose_costs_and_residual_targets(
+        update_pose[:, None].float(),
+        pose_gt.float(),
+        rot_cost_weight=float(rot_cost_weight),
+    )
+    step = stage4_update_step_metrics(before_pose, update_pose)
+    correction_cos = candidate_correction_cosines(update_pose[:, None].float(), before_pose.float(), pose_gt.float())[:, 0]
+    return {
+        "before_cost_m": before_cost[:, 0],
+        "update_cost_m": update_cost[:, 0],
+        "before_trans_m": _before_trans[:, 0],
+        "before_rot_deg": _before_rot[:, 0] * (180.0 / math.pi),
+        "update_trans_err_m": _update_trans[:, 0],
+        "update_rot_err_deg": _update_rot[:, 0] * (180.0 / math.pi),
+        "update_cost_gain_m": before_cost[:, 0] - update_cost[:, 0],
+        "update_correction_cos": correction_cos,
+        "update_trans_m": step["update_trans_m"],
+        "update_rot_deg": step["update_rot_deg"],
+    }
+
+
+def build_stage4_update_dump_rows(
+    *,
+    batch: Dict[str, Any],
+    batch_index: int,
+    first_global_index: int,
+    iter_index: int,
+    accepted: torch.Tensor,
+    solver_result: Dict[str, torch.Tensor],
+    update_diagnostics: Dict[str, torch.Tensor],
+    match_valid_frac: torch.Tensor,
+    match_confidence: torch.Tensor,
+    match_offset_px: torch.Tensor,
+) -> List[Dict[str, Any]]:
+    """Build JSON-serializable per-update Stage4 diagnostics rows."""
+    bsz = int(accepted.reshape(-1).shape[0])
+    rows: List[Dict[str, Any]] = []
+
+    def flat(name: str, source: Dict[str, torch.Tensor], default: float = 0.0) -> torch.Tensor:
+        value = source.get(name)
+        if value is None:
+            return torch.full((bsz,), float(default), dtype=torch.float32)
+        return value.detach().cpu().reshape(-1).float()
+
+    accepted_cpu = accepted.detach().cpu().reshape(-1).bool()
+    success_cpu = solver_result["success"].detach().cpu().reshape(-1).bool()
+    inlier_count = flat("inlier_count", solver_result)
+    reproj = flat("mean_reprojection_error_px", solver_result)
+    condition = flat("condition_approx", solver_result)
+    virtual_gap = flat("virtual_score_gap", solver_result)
+    virtual_valid = flat("virtual_valid_frac", solver_result)
+    match_valid = match_valid_frac.detach().cpu().reshape(-1).float()
+    match_conf = match_confidence.detach().cpu().reshape(-1).float()
+    match_offset = match_offset_px.detach().cpu().reshape(-1).float()
+    before_cost = flat("before_cost_m", update_diagnostics)
+    update_cost = flat("update_cost_m", update_diagnostics)
+    before_trans = flat("before_trans_m", update_diagnostics)
+    before_rot = flat("before_rot_deg", update_diagnostics)
+    update_trans_err = flat("update_trans_err_m", update_diagnostics)
+    update_rot_err = flat("update_rot_err_deg", update_diagnostics)
+    cost_gain = flat("update_cost_gain_m", update_diagnostics)
+    correction_cos = flat("update_correction_cos", update_diagnostics)
+    update_trans = flat("update_trans_m", update_diagnostics)
+    update_rot = flat("update_rot_deg", update_diagnostics)
+
+    for row_idx in range(bsz):
+        sample_name = _batch_item_value(batch, "sample_name", row_idx)
+        init_source = _batch_item_value(batch, "init_source", row_idx)
+        teacher_idx = _batch_item_value(batch, "teacher_idx", row_idx)
+        rows.append(
+            {
+                "batch_index": int(batch_index),
+                "row_in_batch": int(row_idx),
+                "global_index": int(first_global_index + row_idx),
+                "iter_index": int(iter_index),
+                "sample_name": None if sample_name is None else str(sample_name),
+                "teacher_idx": None if teacher_idx is None else int(teacher_idx),
+                "init_source": None if init_source is None else str(init_source),
+                "accepted": bool(accepted_cpu[row_idx].item()),
+                "solver_success": bool(success_cpu[row_idx].item()),
+                "solver_inliers": _rounded_float(inlier_count[min(row_idx, inlier_count.numel() - 1)]),
+                "reproj_error_px": _rounded_float(reproj[min(row_idx, reproj.numel() - 1)]),
+                "condition_approx": _rounded_float(condition[min(row_idx, condition.numel() - 1)]),
+                "match_valid_frac": _rounded_float(match_valid[min(row_idx, match_valid.numel() - 1)]),
+                "match_confidence": _rounded_float(match_conf[min(row_idx, match_conf.numel() - 1)]),
+                "match_offset_px": _rounded_float(match_offset[min(row_idx, match_offset.numel() - 1)]),
+                "before_cost_m": _rounded_float(before_cost[min(row_idx, before_cost.numel() - 1)]),
+                "update_cost_m": _rounded_float(update_cost[min(row_idx, update_cost.numel() - 1)]),
+                "update_cost_gain_m": _rounded_float(cost_gain[min(row_idx, cost_gain.numel() - 1)]),
+                "before_trans_m": _rounded_float(before_trans[min(row_idx, before_trans.numel() - 1)]),
+                "before_rot_deg": _rounded_float(before_rot[min(row_idx, before_rot.numel() - 1)]),
+                "update_trans_err_m": _rounded_float(update_trans_err[min(row_idx, update_trans_err.numel() - 1)]),
+                "update_rot_err_deg": _rounded_float(update_rot_err[min(row_idx, update_rot_err.numel() - 1)]),
+                "update_correction_cos": _rounded_float(correction_cos[min(row_idx, correction_cos.numel() - 1)]),
+                "update_trans_m": _rounded_float(update_trans[min(row_idx, update_trans.numel() - 1)]),
+                "update_rot_deg": _rounded_float(update_rot[min(row_idx, update_rot.numel() - 1)]),
+                "proposal_virtual_score_gap": _rounded_float(virtual_gap[min(row_idx, virtual_gap.numel() - 1)]),
+                "proposal_virtual_valid_frac": _rounded_float(virtual_valid[min(row_idx, virtual_valid.numel() - 1)]),
+            }
+        )
+    return rows
+
+
+def stage4_accept_pose_updates(
+    solver_result: Dict[str, torch.Tensor],
+    before_pose: torch.Tensor,
+    args: argparse.Namespace,
+) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """Apply deployable Stage4 accept gates without using ground-truth pose."""
+    if "success" not in solver_result or "pose" not in solver_result:
+        raise KeyError("solver_result must contain success and pose")
+    accepted = solver_result["success"].bool().clone()
+    accept_thresh = float(getattr(args, "stage4_max_accept_reproj_px", 0.0) or 0.0)
+    if accept_thresh > 0.0:
+        if "mean_reprojection_error_px" not in solver_result:
+            raise KeyError("solver_result must contain mean_reprojection_error_px for reprojection accept gating")
+        accepted = accepted & (solver_result["mean_reprojection_error_px"] <= accept_thresh)
+    step = stage4_update_step_metrics(before_pose.detach(), solver_result["pose"].detach())
+    trans_thresh = float(getattr(args, "stage4_max_accept_update_trans_m", 0.0) or 0.0)
+    if trans_thresh > 0.0:
+        accepted = accepted & (step["update_trans_m"] <= trans_thresh)
+    rot_thresh = float(getattr(args, "stage4_max_accept_update_rot_deg", 0.0) or 0.0)
+    if rot_thresh > 0.0:
+        accepted = accepted & (step["update_rot_deg"] <= rot_thresh)
+    if bool(getattr(args, "stage4_proposal_virtual_gate_enabled", False)):
+        min_gap = float(getattr(args, "stage4_proposal_virtual_min_score_gap", 0.0) or 0.0)
+        min_valid = float(getattr(args, "stage4_proposal_virtual_min_valid_frac", 0.0) or 0.0)
+        if "virtual_score_gap" not in solver_result:
+            raise KeyError("solver_result must contain virtual_score_gap for proposal virtual accept gating")
+        virtual_gap = solver_result["virtual_score_gap"].to(device=accepted.device)
+        accepted = accepted & torch.isfinite(virtual_gap) & (virtual_gap >= min_gap)
+        if min_valid > 0.0:
+            if "virtual_valid_frac" not in solver_result:
+                raise KeyError("solver_result must contain virtual_valid_frac for proposal virtual valid gating")
+            virtual_valid = solver_result["virtual_valid_frac"].to(device=accepted.device)
+            accepted = accepted & torch.isfinite(virtual_valid) & (virtual_valid >= min_valid)
+    return accepted, step
+
+
+def stage4_acceptance_metrics(
+    accept_history: list[torch.Tensor],
+    *,
+    device: torch.device,
+) -> Dict[str, torch.Tensor]:
+    if not accept_history:
+        zero = torch.zeros((), device=device)
+        return {
+            "stage4_update_accept_frac": zero,
+            "stage4_any_update_accept_frac": zero,
+            "stage4_last_update_accept_frac": zero,
+        }
+    history = torch.stack([accepted.to(device=device).bool() for accepted in accept_history], dim=0)
+    return {
+        "stage4_update_accept_frac": history.float().mean(),
+        "stage4_any_update_accept_frac": history.any(dim=0).float().mean(),
+        "stage4_last_update_accept_frac": history[-1].float().mean(),
+    }
+
+
+@torch.no_grad()
+def evaluate_stage4_single_render(
+    model,
+    adapter: PoseFeatureDomainAdapter,
+    pair_matcher: PairConditionedLocalMatcher | None,
+    denseflow_head: PofdDenseFlowHead | None,
+    loader,
+    map_renderer,
+    cfg: Dict,
+    args: argparse.Namespace,
+) -> Dict[str, float]:
+    """Evaluate Stage4 render-once/match/solve continuous refinement."""
+    model.eval()
+    adapter.eval()
+    if pair_matcher is not None:
+        pair_matcher.eval()
+    if denseflow_head is not None:
+        denseflow_head.eval()
+    device = next(adapter.parameters()).device
+    query_fine_key = args.query_fine_key or cfg.get("map_supervision", {}).get("query_fine_key", "fine")
+    score_feature_hw = parse_score_feature_hw(getattr(args, "score_feature_hw", None))
+    adapter_needs_rgb = bool(getattr(args, "pose_feature_adapter_rgb_context_enabled", False)) or bool(
+        getattr(args, "pose_feature_adapter_texture_branch_enabled", False)
+    )
+    rows = []
+    stage4_dump_rows: List[Dict[str, Any]] = []
+    dump_enabled = bool(getattr(args, "stage4_eval_dump_path", None))
+    for batch_idx, batch in enumerate(loader):
+        print(f"stage4 eval batch={batch_idx} start", flush=True)
+        batch = move_batch_to_device(batch, device)
+        pose_gt = map_pose_gt_for_batch(map_renderer, batch, device)
+        init_pose = stage4_initial_pose_from_batch(batch, pose_gt, args, device=device)
+        pose_cur = init_pose.clone()
+        if bool(cfg.get("model", {}).get("teacher_fine_condition", False)):
+            outputs = model(batch["rgb"], teacher_fine=batch.get("teacher_fine"))
+        else:
+            outputs = model(batch["rgb"])
+        query_base = outputs[query_fine_key].float()
+        query_rgb = batch.get("rgb") if adapter_needs_rgb else None
+        query_loc = adapter.project_query(query_base, rgb=query_rgb)
+        last_solver = None
+        last_match_valid_frac = query_loc.new_zeros(())
+        last_match_conf = query_loc.new_zeros(())
+        last_match_offset = query_loc.new_zeros(())
+        last_virtual_accept_frac = query_loc.new_zeros(())
+        last_virtual_score_gap = query_loc.new_zeros(())
+        last_virtual_best_score = query_loc.new_zeros(())
+        last_virtual_identity_score = query_loc.new_zeros(())
+        last_virtual_valid_frac = query_loc.new_zeros(())
+        last_proposal_virtual_score_gap = query_loc.new_zeros(())
+        last_proposal_virtual_proposal_score = query_loc.new_zeros(())
+        last_proposal_virtual_identity_score = query_loc.new_zeros(())
+        last_proposal_virtual_valid_frac = query_loc.new_zeros(())
+        last_accept = query_loc.new_zeros((pose_cur.shape[0],), dtype=torch.bool)
+        accept_history: list[torch.Tensor] = []
+        update_diagnostic_history: list[Dict[str, torch.Tensor]] = []
+        render_count = 0
+        for _iter in range(max(int(args.stage4_iterations), 0)):
+            print(f"stage4 eval batch={batch_idx} iter={_iter} render", flush=True)
+            render_batch = map_renderer.attach_pose_candidate_renders(
+                dict(batch),
+                pose_cur[:, None].detach(),
+                prefix="stage4",
+                require_grad=False,
+                feature="all",
+                include_aux=True,
+            )
+            render_count += 1
+            render_base = _single_candidate_tensor(render_batch.get("stage4_fine"), name="stage4_fine").float()
+            render_position = _single_candidate_tensor(
+                render_batch.get("stage4_position"),
+                name="stage4_position",
+            ).float()
+            render_mask = _single_candidate_tensor(render_batch.get("stage4_mask"), name="stage4_mask")
+            render_rgb = render_batch.get("stage4_rgb")
+            render_rgb_single = _single_candidate_tensor(render_rgb, name="stage4_rgb") if render_rgb is not None else None
+            render_project_rgb = render_rgb_single if adapter_needs_rgb else None
+            render_loc = adapter.project_render(render_base, rgb=render_project_rgb)
+            intrinsics = render_batch.get("stage4_intrinsics")
+            if intrinsics is None:
+                raise KeyError("Stage4 evaluation requires stage4_intrinsics from map renderer")
+            intrinsics = _single_candidate_tensor(intrinsics, name="stage4_intrinsics").float()
+            solver_intrinsics = _scale_intrinsics_between_hw(
+                intrinsics,
+                tuple(query_loc.shape[-2:]),
+                score_feature_hw or tuple(render_loc.shape[-2:]),
+            )
+            if bool(getattr(args, "stage4_virtual_trust_region_enabled", False)) and _iter == 0:
+                virtual_poses = build_local_pose_lattice_candidates(
+                    pose_cur,
+                    trans_cm=parse_float_csv(args.stage4_virtual_trust_region_trans_cm),
+                    rot_deg=parse_float_csv(args.stage4_virtual_trust_region_rot_deg),
+                    include_identity=True,
+                    max_candidates=int(args.stage4_virtual_trust_region_max_candidates),
+                    limit_strategy=str(args.stage4_virtual_trust_region_limit_strategy),
+                    combine_trans_rot=bool(args.stage4_virtual_trust_region_combine_trans_rot),
+                    direction_mode="axis",
+                )
+                virtual = stage4_virtual_pose_energy_scores(
+                    query_loc,
+                    render_loc,
+                    render_position,
+                    virtual_poses,
+                    intrinsics,
+                    mask=render_mask,
+                    score_feature_hw=score_feature_hw,
+                    source_hw=tuple(query_loc.shape[-2:]),
+                )
+                virtual_best_idx = virtual["best_index"].long()
+                virtual_batch_idx = torch.arange(pose_cur.shape[0], device=pose_cur.device)
+                virtual_score_gap = virtual["score_gap"]
+                virtual_accepted = (
+                    (virtual_best_idx != 0)
+                    & torch.isfinite(virtual["best_score"])
+                    & (virtual_score_gap >= float(args.stage4_virtual_trust_region_min_score_gap))
+                )
+                selected_virtual_pose = virtual_poses[virtual_batch_idx, virtual_best_idx].detach()
+                pose_cur = torch.where(virtual_accepted[:, None, None], selected_virtual_pose, pose_cur)
+                last_virtual_accept_frac = virtual_accepted.float().mean().detach()
+                last_virtual_score_gap = virtual_score_gap.detach().mean()
+                last_virtual_best_score = virtual["best_score"].detach().mean()
+                last_virtual_identity_score = virtual["identity_score"].detach().mean()
+                last_virtual_valid_frac = virtual["valid_frac"].gather(1, virtual_best_idx[:, None]).detach().mean()
+                print(
+                    f"stage4 eval batch={batch_idx} iter={_iter} virtual "
+                    f"accepted={float(last_virtual_accept_frac.detach().cpu()):.3f} "
+                    f"gap={float(last_virtual_score_gap.detach().cpu()):.4f} "
+                    f"valid={float(last_virtual_valid_frac.detach().cpu()):.4f}",
+                    flush=True,
+                )
+                if bool(virtual_accepted.any()):
+                    continue
+            match_source = str(getattr(args, "stage4_match_source", "pair_matcher") or "pair_matcher").lower()
+            if match_source == "denseflow":
+                if denseflow_head is None:
+                    raise ValueError("stage4_match_source=denseflow requires --denseflow-enabled")
+                dense_hw = tuple(score_feature_hw or render_loc.shape[-2:])
+                dense_query_loc = _resize_feature(query_loc, dense_hw)
+                dense_render_loc = _resize_feature(render_loc, dense_hw)
+                dense_depth_raw = render_batch.get("stage4_depth")
+                dense_depth = _single_candidate_tensor(dense_depth_raw, name="stage4_depth") if dense_depth_raw is not None else None
+                dense_out = denseflow_head(
+                    dense_query_loc,
+                    dense_render_loc,
+                    depth=dense_depth,
+                    intrinsics=solver_intrinsics,
+                )
+                flow = dense_out["flow"]
+                confidence = dense_out["confidence"]
+                if confidence.ndim == 3:
+                    confidence = confidence[:, None]
+                flow_hw = tuple(flow.shape[-2:])
+                dense_position = render_position.float()
+                if tuple(dense_position.shape[-2:]) != flow_hw:
+                    dense_position = F.interpolate(dense_position, size=flow_hw, mode="bilinear", align_corners=False)
+                solver_valid_map = torch.isfinite(dense_position).all(dim=1, keepdim=True) & torch.isfinite(flow).all(
+                    dim=1,
+                    keepdim=True,
+                )
+                if render_mask is not None:
+                    resized_render_mask = _resize_mask(render_mask, flow_hw)
+                    if resized_render_mask.ndim == 3:
+                        resized_render_mask = resized_render_mask[:, None]
+                    solver_valid_map = solver_valid_map & (resized_render_mask[:, :1].to(device=flow.device) > 0.5)
+                solver_valid_map = solver_valid_map & (confidence >= float(args.stage4_min_confidence))
+                max_corr = int(getattr(args, "stage4_max_correspondences", 0) or 0)
+                if max_corr > 0 and solver_valid_map.flatten(1).shape[1] > max_corr:
+                    valid_flat = solver_valid_map.flatten(1)
+                    conf_flat = confidence.flatten(1).masked_fill(~valid_flat, -1.0)
+                    keep = min(max_corr, int(conf_flat.shape[1]))
+                    top_idx = conf_flat.topk(k=keep, dim=1).indices
+                    top_mask = torch.zeros_like(valid_flat)
+                    top_mask.scatter_(1, top_idx, True)
+                    solver_valid_map = (valid_flat & top_mask).view_as(solver_valid_map)
+                valid_f = solver_valid_map[:, 0].float()
+                valid_denom = valid_f.flatten(1).sum(dim=1).clamp(min=1.0)
+                match_valid_by_sample = valid_f.flatten(1).mean(dim=1)
+                match_conf_by_sample = (confidence[:, 0] * valid_f).flatten(1).sum(dim=1) / valid_denom
+                offset_norm = torch.linalg.vector_norm(flow.float(), dim=1)
+                match_offset_by_sample = (offset_norm * valid_f).flatten(1).sum(dim=1) / valid_denom
+                last_match_valid_frac = match_valid_by_sample.mean()
+                last_match_conf = match_conf_by_sample.mean()
+                last_match_offset = match_offset_by_sample.mean()
+                print(
+                    f"stage4 eval batch={batch_idx} iter={_iter} denseflow "
+                    f"valid={float(solver_valid_map.float().mean().detach().cpu()):.4f} "
+                    f"conf={float(last_match_conf.detach().cpu()):.4f} "
+                    f"offset={float(last_match_offset.detach().cpu()):.2f}",
+                    flush=True,
+                )
+                last_solver = denseflow_pose_update_from_render(
+                    flow=flow,
+                    confidence=confidence,
+                    render_position=render_position,
+                    render_mask=solver_valid_map,
+                    intrinsics=solver_intrinsics,
+                    current_pose=pose_cur,
+                    min_points=int(args.stage4_min_points),
+                    max_update_trans_m=float(args.stage4_max_update_trans_m),
+                    max_update_rot_deg=float(args.stage4_max_update_rot_deg),
+                    iterations=int(args.stage4_solver_iterations),
+                    damping=float(args.stage4_solver_damping),
+                    huber_delta_px=float(args.stage4_huber_delta_px),
+                )
+            else:
+                if match_source == "local_corr":
+                    corr = local_corr_single_render_correspondences(
+                        query_loc,
+                        render_loc,
+                        render_position,
+                        mask=render_mask,
+                        radius=int(args.pair_matcher_radius),
+                        stride=int(args.pair_matcher_score_stride),
+                        temperature=float(args.pair_matcher_temperature),
+                        score_feature_hw=score_feature_hw,
+                        offset_mode=str(args.stage4_offset_mode),
+                    )
+                elif match_source == "pair_matcher":
+                    if pair_matcher is None:
+                        raise ValueError("stage4_match_source=pair_matcher requires --pair-matcher-enabled")
+                    corr = pair_matcher_single_render_correspondences(
+                        pair_matcher,
+                        query_loc,
+                        render_loc,
+                        render_position,
+                        mask=render_mask,
+                        radius=int(args.pair_matcher_radius),
+                        stride=int(args.pair_matcher_score_stride),
+                        temperature=float(args.pair_matcher_temperature),
+                        chunk_points=int(args.pair_matcher_score_chunk_points),
+                        score_feature_hw=score_feature_hw,
+                        offset_mode=str(args.stage4_offset_mode),
+                    )
+                else:
+                    raise ValueError(f"Unknown stage4_match_source={match_source!r}")
+                solver_valid = corr["valid_mask"] & (corr["confidence"] >= float(args.stage4_min_confidence))
+                max_corr = int(getattr(args, "stage4_max_correspondences", 0) or 0)
+                if max_corr > 0 and solver_valid.shape[1] > max_corr:
+                    conf_for_topk = corr["confidence"].masked_fill(~solver_valid, -1.0)
+                    keep = min(max_corr, int(conf_for_topk.shape[1]))
+                    top_idx = conf_for_topk.topk(k=keep, dim=1).indices
+                    top_mask = torch.zeros_like(solver_valid)
+                    top_mask.scatter_(1, top_idx, True)
+                    solver_valid = solver_valid & top_mask
+                valid_f = solver_valid.float()
+                valid_denom = valid_f.sum(dim=1).clamp(min=1.0)
+                match_valid_by_sample = valid_f.mean(dim=1)
+                match_conf_by_sample = (corr["confidence"] * valid_f).sum(dim=1) / valid_denom
+                offset_norm = torch.linalg.vector_norm(corr["argmax_offset"].float(), dim=-1)
+                match_offset_by_sample = (offset_norm * valid_f).sum(dim=1) / valid_denom
+                last_match_valid_frac = match_valid_by_sample.mean()
+                last_match_conf = match_conf_by_sample.mean()
+                last_match_offset = match_offset_by_sample.mean()
+                print(
+                    f"stage4 eval batch={batch_idx} iter={_iter} match "
+                    f"valid={float(solver_valid.float().mean().detach().cpu()):.4f} "
+                    f"conf={float(last_match_conf.detach().cpu()):.4f} "
+                    f"offset={float(last_match_offset.detach().cpu()):.2f}",
+                    flush=True,
+                )
+                last_solver = robust_pose_update_from_correspondences(
+                    corr["world_points"],
+                    corr["query_xy"],
+                    solver_intrinsics,
+                    pose_cur,
+                    weights=corr["confidence"],
+                    valid_mask=solver_valid,
+                    iterations=int(args.stage4_solver_iterations),
+                    damping=float(args.stage4_solver_damping),
+                    huber_delta_px=float(args.stage4_huber_delta_px),
+                    min_points=int(args.stage4_min_points),
+                    max_update_trans_m=float(args.stage4_max_update_trans_m),
+                    max_update_rot_deg=float(args.stage4_max_update_rot_deg),
+                )
+            pose_candidate = last_solver["pose"].detach()
+            if bool(getattr(args, "stage4_proposal_virtual_gate_enabled", False)) or dump_enabled:
+                proposal_poses = torch.stack([pose_cur.detach(), pose_candidate], dim=1)
+                proposal_virtual = stage4_virtual_pose_energy_scores(
+                    query_loc,
+                    render_loc,
+                    render_position,
+                    proposal_poses,
+                    intrinsics,
+                    mask=render_mask,
+                    score_feature_hw=score_feature_hw,
+                    source_hw=tuple(query_loc.shape[-2:]),
+                )
+                proposal_scores = proposal_virtual["scores"]
+                proposal_valid = proposal_virtual["valid_frac"]
+                last_solver["virtual_score_gap"] = (proposal_scores[:, 1] - proposal_scores[:, 0]).detach()
+                last_solver["virtual_valid_frac"] = proposal_valid[:, 1].detach()
+                last_proposal_virtual_score_gap = last_solver["virtual_score_gap"].detach().mean()
+                last_proposal_virtual_proposal_score = proposal_scores[:, 1].detach().mean()
+                last_proposal_virtual_identity_score = proposal_scores[:, 0].detach().mean()
+                last_proposal_virtual_valid_frac = proposal_valid[:, 1].detach().mean()
+            accepted, step_metrics = stage4_accept_pose_updates(last_solver, pose_cur.detach(), args)
+            update_diagnostics = stage4_pose_update_diagnostics(
+                pose_cur.detach(),
+                pose_candidate,
+                pose_gt.detach(),
+                rot_cost_weight=float(args.rot_cost_weight),
+            )
+            update_diagnostic_history.append(update_diagnostics)
+            if dump_enabled:
+                stage4_dump_rows.extend(
+                    build_stage4_update_dump_rows(
+                        batch=batch,
+                        batch_index=batch_idx,
+                        first_global_index=batch_idx * int(args.batch_size),
+                        iter_index=_iter,
+                        accepted=accepted.detach(),
+                        solver_result=last_solver,
+                        update_diagnostics=update_diagnostics,
+                        match_valid_frac=match_valid_by_sample.detach(),
+                        match_confidence=match_conf_by_sample.detach(),
+                        match_offset_px=match_offset_by_sample.detach(),
+                    )
+                )
+            pose_cur = torch.where(accepted[:, None, None], pose_candidate, pose_cur)
+            last_accept = accepted.detach()
+            accept_history.append(last_accept)
+            print(
+                f"stage4 eval batch={batch_idx} iter={_iter} solve "
+                f"success={float(last_solver['success'].float().mean().detach().cpu()):.3f} "
+                f"accepted={float(accepted.float().mean().detach().cpu()):.3f} "
+                f"reproj={float(last_solver['mean_reprojection_error_px'].mean().detach().cpu()):.3f} "
+                f"step={float(step_metrics['update_trans_m'].mean().detach().cpu()):.3f}m/"
+                f"{float(step_metrics['update_rot_deg'].mean().detach().cpu()):.2f}deg",
+                flush=True,
+            )
+
+        init_cost, _init_residual, init_trans, init_rot = pose_costs_and_residual_targets(
+            init_pose[:, None].float(),
+            pose_gt.float(),
+            rot_cost_weight=float(args.rot_cost_weight),
+        )
+        pred_cost, _pred_residual, pred_trans, pred_rot = pose_costs_and_residual_targets(
+            pose_cur[:, None].float(),
+            pose_gt.float(),
+            rot_cost_weight=float(args.rot_cost_weight),
+        )
+        init_cost = init_cost[:, 0]
+        init_trans = init_trans[:, 0]
+        init_rot = init_rot[:, 0]
+        pred_cost = pred_cost[:, 0]
+        pred_trans = pred_trans[:, 0]
+        pred_rot = pred_rot[:, 0]
+        if last_solver is None:
+            solver_success = torch.zeros_like(pred_cost, dtype=torch.bool)
+            inlier_count = torch.zeros_like(pred_cost)
+            reproj = torch.zeros_like(pred_cost)
+            cond = torch.zeros_like(pred_cost)
+        else:
+            solver_success = last_solver["success"]
+            inlier_count = last_solver["inlier_count"].to(dtype=pred_cost.dtype)
+            reproj = last_solver["mean_reprojection_error_px"].to(dtype=pred_cost.dtype)
+            cond = last_solver["condition_approx"].to(dtype=pred_cost.dtype)
+        if update_diagnostic_history:
+            proposed_update_cost_gain = torch.cat(
+                [row["update_cost_gain_m"].to(device=pred_cost.device, dtype=pred_cost.dtype) for row in update_diagnostic_history],
+                dim=0,
+            ).mean()
+            proposed_update_correction_cos = torch.cat(
+                [row["update_correction_cos"].to(device=pred_cost.device, dtype=pred_cost.dtype) for row in update_diagnostic_history],
+                dim=0,
+            ).mean()
+            proposed_update_trans = torch.cat(
+                [row["update_trans_m"].to(device=pred_cost.device, dtype=pred_cost.dtype) for row in update_diagnostic_history],
+                dim=0,
+            ).mean()
+            proposed_update_rot = torch.cat(
+                [row["update_rot_deg"].to(device=pred_cost.device, dtype=pred_cost.dtype) for row in update_diagnostic_history],
+                dim=0,
+            ).mean()
+        else:
+            proposed_update_cost_gain = pred_cost.new_zeros(())
+            proposed_update_correction_cos = pred_cost.new_zeros(())
+            proposed_update_trans = pred_cost.new_zeros(())
+            proposed_update_rot = pred_cost.new_zeros(())
+        accept_metrics = stage4_acceptance_metrics(accept_history, device=pred_cost.device)
+        metrics = {
+            "stage4_pred_cost_m": pred_cost.detach().mean(),
+            "stage4_init_cost_m": init_cost.detach().mean(),
+            "stage4_cost_gain_m": (init_cost.detach() - pred_cost.detach()).mean(),
+            "stage4_pred_trans_m": pred_trans.detach().mean(),
+            "stage4_pred_rot_deg": pred_rot.detach().mean() * (180.0 / math.pi),
+            "stage4_init_trans_m": init_trans.detach().mean(),
+            "stage4_init_rot_deg": init_rot.detach().mean() * (180.0 / math.pi),
+            "stage4_solver_success": solver_success.float().mean().detach(),
+            **{key: value.detach() for key, value in accept_metrics.items()},
+            "stage4_solver_inliers": inlier_count.detach().mean(),
+            "stage4_reproj_error_px": reproj.detach().mean(),
+            "stage4_condition_approx": cond.detach().mean(),
+            "stage4_match_valid_frac": last_match_valid_frac.detach(),
+            "stage4_match_confidence": last_match_conf.detach(),
+            "stage4_match_offset_px": last_match_offset.detach(),
+            "stage4_render_count": pred_cost.new_tensor(float(render_count)),
+            "stage4_proposed_update_cost_gain_m": proposed_update_cost_gain.detach(),
+            "stage4_proposed_update_correction_cos": proposed_update_correction_cos.detach(),
+            "stage4_proposed_update_trans_m": proposed_update_trans.detach(),
+            "stage4_proposed_update_rot_deg": proposed_update_rot.detach(),
+            "stage4_virtual_update_accept_frac": last_virtual_accept_frac.detach(),
+            "stage4_virtual_score_gap": last_virtual_score_gap.detach(),
+            "stage4_virtual_best_score": last_virtual_best_score.detach(),
+            "stage4_virtual_identity_score": last_virtual_identity_score.detach(),
+            "stage4_virtual_valid_frac": last_virtual_valid_frac.detach(),
+            "stage4_proposal_virtual_score_gap": last_proposal_virtual_score_gap.detach(),
+            "stage4_proposal_virtual_proposal_score": last_proposal_virtual_proposal_score.detach(),
+            "stage4_proposal_virtual_identity_score": last_proposal_virtual_identity_score.detach(),
+            "stage4_proposal_virtual_valid_frac": last_proposal_virtual_valid_frac.detach(),
+            **{key: value.detach() for key, value in pose_threshold_success_metrics(pred_trans, pred_rot, prefix="stage4_pred_").items()},
+            **{key: value.detach() for key, value in pose_threshold_success_metrics(init_trans, init_rot, prefix="stage4_init_").items()},
+        }
+        rows.append({key: float(value.detach().cpu()) for key, value in metrics.items()})
+        print(
+            f"stage4 eval batch={batch_idx} done "
+            f"pred={float(metrics['stage4_pred_cost_m'].detach().cpu()):.4f} "
+            f"init={float(metrics['stage4_init_cost_m'].detach().cpu()):.4f}",
+            flush=True,
+        )
+        if args.eval_max_samples is not None and (batch_idx + 1) * int(args.batch_size) >= int(args.eval_max_samples):
+            break
+    dump_path = getattr(args, "stage4_eval_dump_path", None)
+    if dump_path:
+        max_rows = int(getattr(args, "stage4_eval_dump_max_rows", 0) or 0)
+        rows_to_write = stage4_dump_rows[:max_rows] if max_rows > 0 else stage4_dump_rows
+        path = Path(str(dump_path))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as handle:
+            for row in rows_to_write:
+                handle.write(json.dumps(row, sort_keys=True) + "\n")
     return mean_metrics(rows)
 
 
@@ -4107,6 +6726,7 @@ def save_checkpoint(
     *,
     energy_net=None,
     pair_matcher=None,
+    denseflow_head=None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     query_prefixes = []
@@ -4123,6 +6743,7 @@ def save_checkpoint(
             "query_model_prefixes": query_prefixes,
             "pose_energy_net_state_dict": energy_net.state_dict() if energy_net is not None else None,
             "pair_matcher_state_dict": pair_matcher.state_dict() if pair_matcher is not None else None,
+            "denseflow_head_state_dict": denseflow_head.state_dict() if denseflow_head is not None else None,
             "optimizer_state_dict": optimizer.state_dict(),
             "metrics": metrics,
             "config": cfg,
@@ -4139,6 +6760,7 @@ def load_adapter_checkpoint(
     optimizer=None,
     energy_net=None,
     pair_matcher=None,
+    denseflow_head=None,
     *,
     strict_adapter: bool = True,
 ) -> Dict:
@@ -4156,6 +6778,9 @@ def load_adapter_checkpoint(
     pair_state = checkpoint.get("pair_matcher_state_dict")
     if pair_matcher is not None and pair_state:
         pair_matcher.load_state_dict(pair_state, strict=True)
+    denseflow_state = checkpoint.get("denseflow_head_state_dict")
+    if denseflow_head is not None and denseflow_state:
+        denseflow_head.load_state_dict(denseflow_state, strict=True)
     if optimizer is not None and checkpoint.get("optimizer_state_dict") is not None:
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     return checkpoint
@@ -4218,6 +6843,19 @@ def main() -> None:
             zero_init_residual=bool(args.pair_matcher_zero_init_residual),
             base_dot_weight=float(args.pair_matcher_base_dot_weight),
         ).to(device)
+    stage4_match_source = str(getattr(args, "stage4_match_source", "pair_matcher") or "pair_matcher").lower()
+    denseflow_head = None
+    if (
+        bool(args.denseflow_enabled)
+        or float(args.denseflow_weight) > 0.0
+        or stage4_match_source == "denseflow"
+    ):
+        denseflow_head = PofdDenseFlowHead(
+            channels=int(adapter.channels),
+            radius=int(args.denseflow_radius),
+            hidden_dim=int(args.denseflow_hidden_dim),
+            max_flow_px=float(args.denseflow_max_flow_px),
+        ).to(device)
     trainable = collect_trainable_parameters(
         adapter,
         energy_net,
@@ -4228,6 +6866,8 @@ def main() -> None:
         train_energy_net=bool(args.train_pose_energy_net),
         train_pair_matcher=bool(args.train_pair_matcher),
     )
+    if denseflow_head is not None:
+        trainable.extend(denseflow_head.parameters())
     if not trainable:
         raise ValueError("No trainable parameters selected for NVS pose feature adapter training")
     optimizer = torch.optim.AdamW(trainable, lr=float(args.lr), weight_decay=float(args.weight_decay))
@@ -4241,6 +6881,7 @@ def main() -> None:
             optimizer=None,
             energy_net=energy_net,
             pair_matcher=pair_matcher,
+            denseflow_head=denseflow_head,
             strict_adapter=bool(args.resume_adapter_strict),
         )
         print(f"loaded adapter checkpoint: {args.resume_adapter} step={loaded.get('step', 'unknown')}", flush=True)
@@ -4252,8 +6893,28 @@ def main() -> None:
                 flush=True,
             )
 
+    if args.stage4_eval_only:
+        if stage4_match_source == "pair_matcher" and pair_matcher is None:
+            raise ValueError("--stage4-eval-only requires pair_matcher_enabled=true")
+        if stage4_match_source == "denseflow" and denseflow_head is None:
+            raise ValueError("--stage4-eval-only with stage4_match_source=denseflow requires denseflow_head")
+        metrics = evaluate_stage4_single_render(
+            model,
+            adapter,
+            pair_matcher,
+            denseflow_head,
+            eval_loader,
+            map_renderer,
+            cfg,
+            args,
+        )
+        summary = {"checkpoint": args.resume_adapter, "metrics": metrics, "stage": "stage4_single_render"}
+        (out_dir / "stage4_eval_summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+        print(json.dumps(summary, indent=2), flush=True)
+        return
+
     if args.eval_only:
-        metrics = evaluate(model, adapter, energy_net, pair_matcher, eval_loader, map_renderer, cfg, args)
+        metrics = evaluate(model, adapter, energy_net, pair_matcher, denseflow_head, eval_loader, map_renderer, cfg, args)
         summary = {"checkpoint": args.resume_adapter, "metrics": metrics}
         (out_dir / "eval_only_summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
         print(json.dumps(summary, indent=2), flush=True)
@@ -4276,10 +6937,23 @@ def main() -> None:
             energy_net.train(bool(args.train_pose_energy_net))
         if pair_matcher is not None:
             pair_matcher.train(bool(args.train_pair_matcher))
+        if denseflow_head is not None:
+            denseflow_head.train(True)
         optimizer.zero_grad(set_to_none=True)
         args.current_step = step
         with torch.cuda.amp.autocast(enabled=bool(args.amp and device.type == "cuda")):
-            loss, metrics = forward_batch(model, adapter, energy_net, pair_matcher, map_renderer, batch, cfg, args, train=True)
+            loss, metrics = forward_batch(
+                model,
+                adapter,
+                energy_net,
+                pair_matcher,
+                denseflow_head,
+                map_renderer,
+                batch,
+                cfg,
+                args,
+                train=True,
+            )
         scale_before = float(scaler.get_scale()) if bool(args.amp and device.type == "cuda") else 1.0
         scaler.scale(loss).backward()
         if float(args.grad_clip) > 0.0:
@@ -4336,7 +7010,7 @@ def main() -> None:
             )
         if step % int(args.eval_every) == 0 or step == int(args.max_steps):
             args.current_step = step
-            eval_metrics = evaluate(model, adapter, energy_net, pair_matcher, eval_loader, map_renderer, cfg, args)
+            eval_metrics = evaluate(model, adapter, energy_net, pair_matcher, denseflow_head, eval_loader, map_renderer, cfg, args)
             eval_row = {"step": step, "split": "eval"}
             eval_row.update(eval_metrics)
             with log_path.open("a", encoding="utf-8") as f:
@@ -4356,6 +7030,7 @@ def main() -> None:
                     args,
                     energy_net=energy_net,
                     pair_matcher=pair_matcher,
+                    denseflow_head=denseflow_head,
                 )
         if step % int(args.save_every) == 0:
             save_checkpoint(
@@ -4369,6 +7044,7 @@ def main() -> None:
                 args,
                 energy_net=energy_net,
                 pair_matcher=pair_matcher,
+                denseflow_head=denseflow_head,
             )
 
     summary = {"best_metric": best_metric, "best_metric_name": args.best_metric, "steps": step, "out_dir": str(out_dir)}
