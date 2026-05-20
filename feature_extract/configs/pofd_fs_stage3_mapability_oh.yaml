@@ -1,0 +1,21 @@
+experiment: pofd_fs_stage3_mapability_oh
+scene: OldHospital
+
+mapability:
+  geometry_frozen: true
+  radio_backbone_frozen: true
+  metric: track_feature_variance
+  compare_to:
+    - raw_radio
+    - teacher_reconstruction
+    - pofd_fs_selector
+
+losses:
+  mapability_variance_weight: 0.5
+  rank_weight: 1.0
+  online_hard_weight: 0.5
+
+candidate_banks:
+  val:
+    - /root/ICLPose/result/result/feature_extract/localizability_banks/oldhospital_q25_val128_standard.npz
+    - /root/ICLPose/result/result/feature_extract/localizability_banks/oldhospital_q50_val128_standard.npz

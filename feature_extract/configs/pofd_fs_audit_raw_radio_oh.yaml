@@ -1,0 +1,27 @@
+# POFD-FS Phase 0 audit config.
+# This file intentionally keeps RADIO/DCFF frozen and uses standardized
+# candidate-bank tooling instead of continuous CPR.
+
+experiment: pofd_fs_audit_raw_radio_oh
+scene: OldHospital
+
+foundation:
+  backbone: RADIO
+  frozen: true
+  feature_dir: /root/ICLPose/result/feature_extract/features_radio_dual_v68_align_stop640/cambridge_oldhospital_processed
+
+candidate_banks:
+  q10_val: /root/ICLPose/result/result/feature_extract/localizability_banks/oldhospital_q10_val128_standard.npz
+  q25_val: /root/ICLPose/result/result/feature_extract/localizability_banks/oldhospital_q25_val128_standard.npz
+  q50_val: /root/ICLPose/result/result/feature_extract/localizability_banks/oldhospital_q50_val128_standard.npz
+
+audit:
+  metrics:
+    - top1
+    - top5
+    - oracle_cost
+    - oracle_gap
+    - spearman
+    - ndcg
+    - basin_recall@5
+  no_external_score_labels: true

@@ -1,0 +1,37 @@
+experiment: pofd_fs_stage2_pose_rank_q50_oh
+scene: OldHospital
+
+selector:
+  in_channels: 64
+  out_channels: 64
+  group_size: 8
+  spatial_utility: true
+  uncertainty: true
+  l2_normalize: true
+
+scorer:
+  mode: pair_matcher_local
+  score_feature_hw: [34, 60]
+  radius: 12
+  eval_radius_stretch: 16
+  temperature: 0.04
+
+losses:
+  rank_weight: 1.0
+  online_hard_weight: 1.0
+  basin_bce_weight: 0.5
+  weak_teacher_anchor_weight: 0.03
+  channel_sparsity_weight: 0.01
+  utility_entropy_weight: 0.01
+
+targets:
+  q50_pred_cost_m: 0.21
+  q50_top1: 0.75
+  q50_spearman: 0.55
+  q50_oracle_gap_m: 0.09
+
+candidate_banks:
+  train:
+    - /root/ICLPose/result/result/feature_extract/localizability_banks/oldhospital_q50_train256_standard.npz
+  val:
+    - /root/ICLPose/result/result/feature_extract/localizability_banks/oldhospital_q50_val128_standard.npz

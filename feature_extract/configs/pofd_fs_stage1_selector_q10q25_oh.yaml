@@ -1,0 +1,39 @@
+experiment: pofd_fs_stage1_selector_q10q25_oh
+scene: OldHospital
+
+selector:
+  in_channels: 64
+  out_channels: 64
+  group_size: 8
+  spatial_utility: true
+  uncertainty: true
+  l2_normalize: true
+
+scorer:
+  mode: local_corr
+  score_feature_hw: [34, 60]
+  radius: 8
+  temperature: 0.05
+
+losses:
+  rank_weight: 1.0
+  online_hard_weight: 0.5
+  basin_bce_weight: 0.5
+  weak_teacher_anchor_weight: 0.05
+  channel_sparsity_weight: 0.01
+  utility_entropy_weight: 0.01
+
+training:
+  batch_size: 16
+  max_steps: 1000
+  lr: 2.0e-4
+  best_metric: pred_cost_m
+  best_metric_mode: min
+
+candidate_banks:
+  train:
+    - /root/ICLPose/result/result/feature_extract/localizability_banks/oldhospital_q10_train256_standard.npz
+    - /root/ICLPose/result/result/feature_extract/localizability_banks/oldhospital_q25_train256_standard.npz
+  val:
+    - /root/ICLPose/result/result/feature_extract/localizability_banks/oldhospital_q10_val128_standard.npz
+    - /root/ICLPose/result/result/feature_extract/localizability_banks/oldhospital_q25_val128_standard.npz
