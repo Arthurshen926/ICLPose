@@ -13,7 +13,11 @@ import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from feature_extract.localizability.metrics import ranking_metrics, ranking_row_diagnostics  # noqa: E402
+from feature_extract.localizability.metrics import (  # noqa: E402
+    candidate_score_table_rows,
+    ranking_metrics,
+    ranking_row_diagnostics,
+)
 from feature_extract.localizability.scorer import PoseHypothesisScorer  # noqa: E402
 from feature_extract.students.pose_energy_net import PairConditionedLocalMatcher, PoseFeatureDomainAdapter  # noqa: E402
 from feature_extract.tools.eval_cpr_buckets import build_model_and_data, map_pose_gt_for_batch  # noqa: E402
@@ -23,6 +27,18 @@ from feature_extract.train_impl import (  # noqa: E402
     move_batch_to_device,
     pose_error_tensors,
     project_query_render_for_fine_selector,
+)
+
+OPTIONAL_CANDIDATE_TABLE_FIELDS = (
+    "retrieval_scores_candidates",
+    "retrieval_original_scores_candidates",
+    "retrieval_pnp_success_candidates",
+    "retrieval_pnp_num_inliers_candidates",
+    "retrieval_pnp_num_matches_candidates",
+    "retrieval_pnp_reproj_rmse_candidates",
+    "retrieval_pnp_reproj_median_candidates",
+    "retrieval_pnp_inlier_ratio_candidates",
+    "retrieval_pnp_inlier_conf_mean_candidates",
 )
 
 
@@ -62,6 +78,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--basin-rot-deg", type=float, default=10.0)
     parser.add_argument("--topk", default="1,5")
     parser.add_argument("--dump-rows", action="store_true")
+    parser.add_argument("--dump-candidate-table", action="store_true")
     parser.add_argument("--out-dir", required=True)
     return parser.parse_args()
 
@@ -198,6 +215,7 @@ def main() -> None:
     topk = tuple(int(part) for part in str(args.topk).split(",") if part.strip())
     rows = []
     row_diagnostics = []
+    candidate_table = []
     sample_count = 0
     with torch.no_grad():
         for batch in loader:
@@ -265,12 +283,35 @@ def main() -> None:
             trans_err_m = trans_err_m.reshape(bsz, num_candidates)
             rot_err_deg = rot_err_deg.reshape(bsz, num_candidates)
             pose_cost = trans_err_m + float(args.rot_cost_weight) * torch.deg2rad(rot_err_deg)
+            extra_candidate_fields = {}
+            if "pose_init" in batch:
+                pose_init = batch["pose_init"].float()
+                pose_init_flat = pose_init[:, None].expand(-1, num_candidates, -1, -1).reshape(-1, 4, 4)
+                _, delta_rot_deg, delta_trans_m = pose_error_tensors(candidates.reshape(-1, 4, 4), pose_init_flat)
+                extra_candidate_fields["delta_trans_m"] = delta_trans_m.reshape(bsz, num_candidates)
+                extra_candidate_fields["delta_rot_deg"] = delta_rot_deg.reshape(bsz, num_candidates)
+            for key in OPTIONAL_CANDIDATE_TABLE_FIELDS:
+                if key in batch and tuple(batch[key].shape[:2]) == (bsz, num_candidates):
+                    extra_candidate_fields[key] = batch[key].float()
             basin = (trans_err_m <= float(args.basin_trans_m)) & (rot_err_deg <= float(args.basin_rot_deg))
             valid = batch.get("candidate_valid_mask")
             metrics = ranking_metrics(scores, pose_cost, valid_mask=valid, basin_label=basin, topk=topk)
             rows.append(metrics)
+            names = [str(name) for name in batch.get("sample_name", [str(i) for i in range(bsz)])]
+            if bool(args.dump_candidate_table):
+                for item in candidate_score_table_rows(
+                    scores,
+                    pose_cost,
+                    trans_err_m=trans_err_m,
+                    rot_err_deg=rot_err_deg,
+                    valid_mask=valid,
+                    basin_label=basin,
+                    sample_names=names,
+                    extra_fields=extra_candidate_fields,
+                ):
+                    item["global_row"] = int(sample_count + int(item["row"]))
+                    candidate_table.append(item)
             if bool(args.dump_rows):
-                names = [str(name) for name in batch.get("sample_name", [str(i) for i in range(bsz)])]
                 diag = ranking_row_diagnostics(scores, pose_cost, valid_mask=valid, basin_label=basin, sample_names=names)
                 for item in diag:
                     local_row = int(item["row"])
@@ -300,6 +341,10 @@ def main() -> None:
     if bool(args.dump_rows):
         with (out_dir / "rows.jsonl").open("w", encoding="utf-8") as handle:
             for item in row_diagnostics:
+                handle.write(json.dumps(item) + "\n")
+    if bool(args.dump_candidate_table):
+        with (out_dir / "candidate_table.jsonl").open("w", encoding="utf-8") as handle:
+            for item in candidate_table:
                 handle.write(json.dumps(item) + "\n")
     print(json.dumps(row, indent=2))
 

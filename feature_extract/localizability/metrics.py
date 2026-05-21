@@ -133,3 +133,56 @@ def ranking_row_diagnostics(
             row["oracle_in_basin"] = bool(basin[batch_idx, oracle].detach().cpu())
         rows.append(row)
     return rows
+
+
+def candidate_score_table_rows(
+    scores: torch.Tensor,
+    pose_cost_m: torch.Tensor,
+    *,
+    trans_err_m: torch.Tensor | None = None,
+    rot_err_deg: torch.Tensor | None = None,
+    valid_mask: torch.Tensor | None = None,
+    basin_label: torch.Tensor | None = None,
+    sample_names: list[str] | tuple[str, ...] | None = None,
+    extra_fields: dict[str, torch.Tensor] | None = None,
+) -> list[dict]:
+    """Return one JSON-serializable row per candidate for light calibrators."""
+    if scores.shape != pose_cost_m.shape:
+        raise ValueError("scores and pose_cost_m must have the same shape")
+    if trans_err_m is not None and trans_err_m.shape != scores.shape:
+        raise ValueError("trans_err_m must match scores shape")
+    if rot_err_deg is not None and rot_err_deg.shape != scores.shape:
+        raise ValueError("rot_err_deg must match scores shape")
+    extras = extra_fields or {}
+    for name, values in extras.items():
+        if values.shape != scores.shape:
+            raise ValueError(f"extra field {name!r} must match scores shape")
+    valid = valid_mask.bool() if valid_mask is not None else torch.ones_like(scores, dtype=torch.bool)
+    basin = basin_label.bool() if basin_label is not None else torch.zeros_like(scores, dtype=torch.bool)
+    masked_cost = pose_cost_m.float().masked_fill(~valid, float("inf"))
+    oracle_idx = masked_cost.argmin(dim=1)
+    rows: list[dict] = []
+    for batch_idx in range(scores.shape[0]):
+        score_order = torch.argsort(scores[batch_idx].float(), descending=True)
+        score_rank = torch.empty_like(score_order)
+        score_rank[score_order] = torch.arange(score_order.numel(), device=score_order.device)
+        for candidate_idx in range(scores.shape[1]):
+            row = {
+                "row": int(batch_idx),
+                "sample_name": str(sample_names[batch_idx]) if sample_names is not None else str(batch_idx),
+                "candidate_idx": int(candidate_idx),
+                "score": float(scores[batch_idx, candidate_idx].detach().cpu()),
+                "pose_cost_m": float(pose_cost_m[batch_idx, candidate_idx].detach().cpu()),
+                "score_rank": int(score_rank[candidate_idx].detach().cpu()),
+                "is_oracle": bool(candidate_idx == int(oracle_idx[batch_idx].detach().cpu())),
+                "valid": bool(valid[batch_idx, candidate_idx].detach().cpu()),
+                "in_basin": bool(basin[batch_idx, candidate_idx].detach().cpu()),
+            }
+            if trans_err_m is not None:
+                row["trans_err_m"] = float(trans_err_m[batch_idx, candidate_idx].detach().cpu())
+            if rot_err_deg is not None:
+                row["rot_err_deg"] = float(rot_err_deg[batch_idx, candidate_idx].detach().cpu())
+            for name, values in extras.items():
+                row[name] = float(values[batch_idx, candidate_idx].detach().cpu())
+            rows.append(row)
+    return rows

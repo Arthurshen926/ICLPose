@@ -1,0 +1,27 @@
+# POFD-FS handoff/refinement evaluation config.
+#
+# This is intentionally solver-facing only: it provides the OldHospital RGB
+# split and frozen DCFF/3DGS geometry for render-at-init RGB/depth refinement.
+
+dataset:
+  source_dir: /hy-tmp/Cambridge_stdloc/OldHospital/processed
+  colmap_dir: /hy-tmp/Cambridge_stdloc/OldHospital/sparse/0
+  train_split: /hy-tmp/Cambridge_stdloc/OldHospital/dataset_train.txt
+  test_split: /hy-tmp/Cambridge_stdloc/OldHospital/dataset_test.txt
+
+dcff:
+  checkpoint: /root/ICLPose/result/feature_field/dcff_cambridge_oldhospital_processed_cached64_v11_residual_spatial_4gpu/checkpoints/best.pth
+  ply_path: /root/ICLPose/result/feature_field/dcff_cambridge_oldhospital_processed_cached64_v11_residual_spatial_4gpu/checkpoints/best.ply
+  feature_dim: 64
+  fine_feature_dim: 64
+  coarse_feature_dim: 64
+  latent_dim: 64
+  fine_latent_dim: 40
+  coarse_latent_dim: 24
+  render_width: 120
+  render_height: 68
+  fine_decoder_override:
+    type: residual_spatial
+    hidden_dim: 224
+    num_layers: 5
+    use_viewdirs: false

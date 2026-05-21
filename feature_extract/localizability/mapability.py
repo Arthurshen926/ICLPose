@@ -40,3 +40,44 @@ def track_feature_variance(
         variance = point_features.sum() * 0.0
         num_tracks = point_features.new_tensor(0.0)
     return variance, {"num_tracks": num_tracks}
+
+
+def observation_track_feature_variance(
+    features: torch.Tensor,
+    track_ids: torch.Tensor,
+    *,
+    valid_mask: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Measure feature consistency across observations of the same 3D track.
+
+    Unlike :func:`track_feature_variance`, this function expects every row in
+    ``features`` to be one observation of a 3D primitive/track.  It computes the
+    within-track variance across observations and averages over tracks with at
+    least two valid observations.
+    """
+    if features.ndim != 2:
+        raise ValueError("features must have shape (N,C)")
+    if track_ids.numel() != features.shape[0]:
+        raise ValueError("track_ids length must match number of observations")
+    point_features = features.float()
+    track_ids = track_ids.to(device=point_features.device)
+    valid = (
+        valid_mask.to(device=point_features.device).bool()
+        if valid_mask is not None
+        else torch.ones_like(track_ids, dtype=torch.bool)
+    )
+    variances = []
+    num_observations = point_features.new_tensor(float(valid.sum().item()))
+    for track_id in torch.unique(track_ids[valid]):
+        mask = valid & (track_ids == track_id)
+        if int(mask.sum()) < 2:
+            continue
+        vals = point_features[mask]
+        variances.append(vals.var(dim=0, unbiased=False).mean())
+    if variances:
+        variance = torch.stack(variances).mean()
+        num_tracks = point_features.new_tensor(float(len(variances)))
+    else:
+        variance = point_features.sum() * 0.0
+        num_tracks = point_features.new_tensor(0.0)
+    return variance, {"num_tracks": num_tracks, "num_observations": num_observations}

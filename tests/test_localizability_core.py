@@ -1,6 +1,7 @@
 import sys
 from pathlib import Path
 
+import pytest
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -16,10 +17,31 @@ from feature_extract.localizability.losses import (
     online_score_hard_negative_loss,
     pose_distance_soft_rank_loss,
 )
-from feature_extract.localizability.mapability import track_feature_variance
-from feature_extract.localizability.metrics import ranking_metrics, ranking_row_diagnostics
+from feature_extract.localizability.interpretability import (
+    channel_group_counterfactual_drop,
+    spatial_utility_counterfactual_drop,
+)
+from feature_extract.localizability.mapability import observation_track_feature_variance, track_feature_variance
+from feature_extract.localizability.metrics import (
+    candidate_score_table_rows,
+    ranking_metrics,
+    ranking_row_diagnostics,
+)
+from feature_extract.localizability.reference_pose_bank import (
+    build_reference_pose_bank,
+    parse_hloc_pairs_lines,
+)
+from feature_extract.localizability.reference_pose_scoring import (
+    descriptor_from_dense_feature,
+    load_descriptor_bank,
+    retrieval_order_scores,
+    save_descriptor_bank,
+    score_reference_pose_descriptors,
+)
 from feature_extract.localizability.scorer import PoseHypothesisScorer
+from feature_extract.localizability.score_calibrator import HypothesisScoreCalibrator, group_candidate_table_rows
 from feature_extract.localizability.selector import LocalizationFeatureSelector
+from feature_extract.localizability.solver_handoff import evaluate_handoff_rows
 from feature_extract.students.pose_energy_net import PairConditionedLocalMatcher, PoseFeatureDomainAdapter
 
 
@@ -189,6 +211,143 @@ def test_ranking_row_diagnostics_keeps_selected_oracle_and_basin_fields():
     assert abs(rows[1]["oracle_gap_m"] - 0.3) < 1.0e-6
 
 
+def test_candidate_score_table_rows_exports_one_row_per_candidate():
+    scores = torch.tensor([[0.2, 0.7, -1.0]])
+    costs = torch.tensor([[0.3, 0.1, 0.5]])
+    trans_err = torch.tensor([[0.29, 0.08, 0.50]])
+    rot_err = torch.tensor([[1.0, 2.0, 20.0]])
+    valid = torch.tensor([[True, True, False]])
+    basin = torch.tensor([[False, True, False]])
+
+    rows = candidate_score_table_rows(
+        scores,
+        costs,
+        trans_err_m=trans_err,
+        rot_err_deg=rot_err,
+        valid_mask=valid,
+        basin_label=basin,
+        sample_names=["seq/frame.png"],
+        extra_fields={"delta_trans_m": torch.tensor([[0.0, 0.1, 0.2]])},
+    )
+
+    assert len(rows) == 3
+    assert rows[0]["sample_name"] == "seq/frame.png"
+    assert rows[1]["candidate_idx"] == 1
+    assert rows[1]["is_oracle"] is True
+    assert rows[1]["score_rank"] == 0
+    assert abs(rows[1]["delta_trans_m"] - 0.1) < 1.0e-6
+    assert rows[2]["valid"] is False
+
+
+def test_group_candidate_table_rows_stacks_samples_by_candidate_index():
+    rows = [
+        {"sample_name": "b", "candidate_idx": 1, "score": 0.2, "pose_cost_m": 0.5, "valid": True},
+        {"sample_name": "a", "candidate_idx": 0, "score": 0.7, "pose_cost_m": 0.1, "valid": True},
+        {"sample_name": "b", "candidate_idx": 0, "score": 0.4, "pose_cost_m": 0.2, "valid": False},
+        {"sample_name": "a", "candidate_idx": 1, "score": 0.3, "pose_cost_m": 0.4, "valid": True},
+    ]
+
+    table = group_candidate_table_rows(rows, feature_keys=("score",))
+
+    assert table.sample_names == ["b", "a"]
+    assert table.features.shape == (2, 2, 1)
+    assert torch.allclose(table.features[0, :, 0], torch.tensor([0.4, 0.2]))
+    assert torch.allclose(table.pose_cost_m[1], torch.tensor([0.1, 0.4]))
+    assert table.valid_mask.tolist() == [[False, True], [True, True]]
+
+
+def test_group_candidate_table_rows_computes_score_relative_features():
+    rows = [
+        {"sample_name": "a", "candidate_idx": 0, "score": 1.0, "score_rank": 1, "pose_cost_m": 0.2, "valid": True},
+        {"sample_name": "a", "candidate_idx": 1, "score": 3.0, "score_rank": 0, "pose_cost_m": 0.1, "valid": True},
+        {"sample_name": "a", "candidate_idx": 2, "score": -5.0, "score_rank": 2, "pose_cost_m": 0.5, "valid": False},
+    ]
+
+    table = group_candidate_table_rows(
+        rows,
+        feature_keys=("score_margin_to_top1", "score_rank_norm", "score_zscore"),
+    )
+
+    assert torch.allclose(table.features[0, :, 0], torch.tensor([-2.0, 0.0, 0.0]), atol=1.0e-6)
+    assert torch.allclose(table.features[0, :, 1], torch.tensor([0.5, 0.0, 1.0]), atol=1.0e-6)
+    assert abs(float(table.features[0, :2, 2].mean())) < 1.0e-6
+    assert table.features[0, 2, 2].item() == 0.0
+
+
+def test_hypothesis_score_calibrator_supports_linear_and_mlp_outputs():
+    features = torch.randn(2, 3, 4)
+
+    linear = HypothesisScoreCalibrator(feature_dim=4, model_type="linear")
+    mlp = HypothesisScoreCalibrator(
+        feature_dim=4,
+        model_type="mlp",
+        hidden_dim=8,
+        num_layers=2,
+        score_residual_weight=0.5,
+        score_feature_index=0,
+    )
+
+    assert linear(features).shape == (2, 3)
+    assert mlp(features).shape == (2, 3)
+
+
+def test_solver_handoff_can_select_topk_by_external_solver_quality():
+    rows = [
+        {
+            "sample_name": "q0",
+            "candidate_idx": 0,
+            "score": 10.0,
+            "pose_cost_m": 0.40,
+            "trans_err_m": 0.40,
+            "rot_err_deg": 3.0,
+            "valid": True,
+            "retrieval_pnp_success_candidates": 1.0,
+            "retrieval_pnp_num_inliers_candidates": 20.0,
+        },
+        {
+            "sample_name": "q0",
+            "candidate_idx": 1,
+            "score": 5.0,
+            "pose_cost_m": 0.10,
+            "trans_err_m": 0.10,
+            "rot_err_deg": 1.0,
+            "valid": True,
+            "retrieval_pnp_success_candidates": 1.0,
+            "retrieval_pnp_num_inliers_candidates": 80.0,
+        },
+        {
+            "sample_name": "q1",
+            "candidate_idx": 0,
+            "score": 9.0,
+            "pose_cost_m": 0.20,
+            "trans_err_m": 0.20,
+            "rot_err_deg": 2.0,
+            "valid": True,
+            "retrieval_pnp_success_candidates": 1.0,
+            "retrieval_pnp_num_inliers_candidates": 30.0,
+        },
+        {
+            "sample_name": "q1",
+            "candidate_idx": 1,
+            "score": 8.0,
+            "pose_cost_m": 0.50,
+            "trans_err_m": 0.50,
+            "rot_err_deg": 5.0,
+            "valid": True,
+            "retrieval_pnp_success_candidates": 1.0,
+            "retrieval_pnp_num_inliers_candidates": 90.0,
+        },
+    ]
+
+    top1 = evaluate_handoff_rows(rows, topk=1, selection_mode="pofd_score")
+    inliers = evaluate_handoff_rows(rows, topk=2, selection_mode="pnp_inliers")
+
+    assert abs(top1["trans_mean_m"] - 0.30) < 1.0e-6
+    assert abs(inliers["trans_mean_m"] - 0.30) < 1.0e-6
+    assert inliers["selected_candidate_indices"] == [1, 1]
+    assert inliers["success_25cm_10deg"] == 0.5
+
+
 def test_candidate_bank_from_npz_normalizes_required_fields(tmp_path):
     path = tmp_path / "bank.npz"
     pose_gt = torch.eye(4).view(1, 4, 4).numpy()
@@ -213,6 +372,98 @@ def test_candidate_bank_from_npz_normalizes_required_fields(tmp_path):
     assert bank.basin_label(0.25, 5.0).tolist() == [[True, False]]
 
 
+def test_reference_pose_bank_from_hloc_pairs_computes_pose_errors_and_valid_mask():
+    def pose_at(x: float) -> torch.Tensor:
+        pose = torch.eye(4)
+        pose[0, 3] = x
+        return pose
+
+    pairs = parse_hloc_pairs_lines(
+        [
+            "query/a.png ref/near.png",
+            "query/a.png ref/far.png",
+            "query/b.png ref/missing.png",
+        ]
+    )
+    bank = build_reference_pose_bank(
+        query_poses={
+            "query/a.png": pose_at(0.0).numpy(),
+            "query/b.png": pose_at(2.0).numpy(),
+        },
+        reference_poses={
+            "ref/near.png": pose_at(0.1).numpy(),
+            "ref/far.png": pose_at(1.0).numpy(),
+        },
+        query_to_refs=pairs,
+        topk=2,
+        scene="TinyScene",
+    )
+
+    assert isinstance(bank, CandidateBank)
+    assert bank.sample_names == ["query/a.png", "query/b.png"]
+    assert bank.candidate_pose.shape == (2, 2, 4, 4)
+    assert bank.valid_mask.tolist() == [[True, True], [False, False]]
+    assert torch.allclose(bank.trans_err_m[0], torch.tensor([0.1, 1.0]), atol=1.0e-6)
+    assert torch.isinf(bank.pose_cost_m[1]).all()
+    assert bank.metadata.scene == "TinyScene"
+    assert bank.metadata.candidate_source == "reference_pose_pairs"
+
+
+def test_reference_pose_descriptor_scoring_prefers_matching_reference():
+    feature = torch.zeros(4, 3, 5)
+    feature[0] = 1.0
+    desc = descriptor_from_dense_feature(feature)
+    assert desc.shape == (4,)
+    assert torch.allclose(desc.norm(), torch.tensor(1.0), atol=1.0e-6)
+
+    scores, valid = score_reference_pose_descriptors(
+        sample_names=["q/a.png"],
+        reference_names=[["r/good.png", "r/bad.png"]],
+        descriptors={
+            "q/a.png": torch.tensor([1.0, 0.0, 0.0]),
+            "r/good.png": torch.tensor([0.9, 0.1, 0.0]),
+            "r/bad.png": torch.tensor([0.0, 1.0, 0.0]),
+        },
+    )
+
+    assert scores.shape == (1, 2)
+    assert valid.tolist() == [[True, True]]
+    assert int(scores.argmax(dim=1)[0]) == 0
+
+
+def test_retrieval_order_scores_keep_first_valid_reference_on_top():
+    valid_mask = torch.tensor([[True, True, False], [False, True, True]])
+
+    scores = retrieval_order_scores(valid_mask)
+
+    assert scores.shape == (2, 3)
+    assert int(scores[0].argmax()) == 0
+    assert int(scores[1].argmax()) == 1
+    assert scores[0, 0] > scores[0, 1] > scores[0, 2]
+
+
+def test_descriptor_bank_roundtrip_preserves_names_and_normalized_vectors(tmp_path):
+    path = tmp_path / "descriptors.pt"
+    descriptors = {
+        "q/a.png": torch.tensor([3.0, 4.0]),
+        "r/b.png": torch.tensor([0.0, 2.0]),
+    }
+
+    save_descriptor_bank(path, descriptors, metadata={"feature_key": "fine"})
+    loaded, metadata = load_descriptor_bank(path)
+
+    assert metadata["feature_key"] == "fine"
+    assert sorted(loaded) == ["q/a.png", "r/b.png"]
+    assert torch.allclose(loaded["q/a.png"].norm(), torch.tensor(1.0), atol=1.0e-6)
+    scores, valid = score_reference_pose_descriptors(
+        sample_names=["q/a.png"],
+        reference_names=[["r/b.png"]],
+        descriptors=loaded,
+    )
+    assert valid.tolist() == [[True]]
+    assert scores.shape == (1, 1)
+
+
 def test_track_feature_variance_ignores_invalid_observations():
     features = torch.tensor(
         [
@@ -227,3 +478,59 @@ def test_track_feature_variance_ignores_invalid_observations():
 
     assert variance.item() < 1.0e-6
     assert stats["num_tracks"].item() == 1
+
+
+def test_observation_track_feature_variance_measures_multi_view_consistency():
+    features = torch.tensor(
+        [
+            [1.0, 0.0],
+            [1.2, 0.0],
+            [0.0, 1.0],
+            [0.0, 1.4],
+            [9.0, 9.0],
+        ]
+    )
+    track_ids = torch.tensor([10, 10, 20, 20, 30])
+    valid = torch.tensor([True, True, True, True, False])
+
+    variance, stats = observation_track_feature_variance(features, track_ids, valid_mask=valid)
+
+    assert stats["num_tracks"].item() == 2
+    assert stats["num_observations"].item() == 4
+    assert variance.item() > 0.0
+    assert variance.item() < 0.05
+
+
+def test_channel_group_counterfactual_drop_reports_high_utility_groups_as_more_important():
+    scores = torch.tensor([[3.0, 1.0, 0.0], [1.5, 2.0, 0.1]])
+    costs = torch.tensor([[0.1, 0.4, 0.8], [0.2, 0.1, 0.7]])
+    group_scores = torch.stack(
+        [
+            scores - torch.tensor([[3.0, 0.0, 0.0], [0.0, 2.0, 0.0]]),
+            scores - torch.tensor([[0.0, 0.1, 0.0], [0.0, 0.0, 0.1]]),
+        ],
+        dim=0,
+    )
+
+    report = channel_group_counterfactual_drop(scores, group_scores, costs)
+
+    assert report["base_pred_cost_m"].item() == pytest.approx(0.1)
+    assert int(report["worst_group_idx"].item()) == 0
+    assert report["group_pred_cost_drop_m"][0] > report["group_pred_cost_drop_m"][1]
+
+
+def test_spatial_utility_counterfactual_drop_masks_high_utility_regions():
+    score_maps = torch.zeros(1, 2, 4, 4)
+    score_maps[:, 0, 0, 0] = 5.0
+    score_maps[:, 1, 3, 3] = 4.0
+    utility = torch.zeros(1, 1, 4, 4)
+    utility[:, :, 0, 0] = 1.0
+    utility[:, :, 3, 3] = 0.1
+    costs = torch.tensor([[0.1, 0.5]])
+
+    report = spatial_utility_counterfactual_drop(score_maps, utility, costs, drop_fraction=1.0 / 16.0)
+
+    assert report["base_selected_idx"].tolist() == [0]
+    assert report["drop_high_selected_idx"].tolist() == [1]
+    assert report["drop_low_selected_idx"].tolist() == [0]
+    assert report["drop_high_pred_cost_m"] > report["base_pred_cost_m"]

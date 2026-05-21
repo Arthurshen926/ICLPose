@@ -18,6 +18,11 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from feature_extract.localizability.adapter_bundle import collect_pose_adapter_trainable_parameters  # noqa: E402
+from feature_extract.localizability.failure_replay import (  # noqa: E402
+    batch_failure_pairs,
+    cached_failure_pair_margin_loss,
+    load_failure_replay_rows,
+)
 from feature_extract.localizability.losses import (  # noqa: E402
     basin_bce_loss,
     online_score_hard_negative_loss,
@@ -85,6 +90,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hard-cost-gap-m", type=float, default=0.12)
     parser.add_argument("--hard-margin", type=float, default=0.08)
     parser.add_argument("--basin-weight", type=float, default=0.5)
+    parser.add_argument("--failure-replay-rows", default=None)
+    parser.add_argument("--failure-replay-mode", choices=("all", "failure_only"), default="all")
+    parser.add_argument("--failure-min-gap-m", type=float, default=0.05)
+    parser.add_argument("--failure-pair-weight", type=float, default=0.0)
+    parser.add_argument("--failure-pair-margin", type=float, default=0.08)
     parser.add_argument("--train-query-adapter", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--train-render-adapter", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--train-rgb-context", action=argparse.BooleanOptionalAction, default=False)
@@ -129,6 +139,31 @@ def _pose_costs(
 def _adapter_needs_rgb(adapter_args: dict) -> bool:
     return bool(adapter_args.get("pose_feature_adapter_rgb_context_enabled", False)) or bool(
         adapter_args.get("pose_feature_adapter_texture_branch_enabled", False)
+    )
+
+
+def _failure_only_loader(loader, replay_rows, *, batch_size: int, num_workers: int):
+    dataset = loader.dataset
+    records = getattr(dataset, "records", None)
+    if records is None:
+        raise ValueError("failure_only replay requires a dataset with records")
+    indices = []
+    for idx, record in enumerate(records):
+        sample_name = str(record.get("sample_name", ""))
+        active, _positive, _negative = batch_failure_pairs([sample_name], replay_rows, device="cpu")
+        if bool(active[0]):
+            indices.append(idx)
+    if not indices:
+        raise ValueError("failure replay rows did not match any training records")
+    subset = torch.utils.data.Subset(dataset, indices)
+    return torch.utils.data.DataLoader(
+        subset,
+        batch_size=int(batch_size),
+        shuffle=True,
+        num_workers=int(num_workers),
+        collate_fn=loader.collate_fn,
+        pin_memory=getattr(loader, "pin_memory", False),
+        drop_last=False,
     )
 
 
@@ -238,6 +273,22 @@ def main() -> None:
     for param in model.parameters():
         param.requires_grad_(False)
 
+    failure_replay = None
+    if args.failure_replay_rows:
+        failure_replay = load_failure_replay_rows(
+            args.failure_replay_rows,
+            min_gap_m=float(args.failure_min_gap_m),
+        )
+        if not failure_replay:
+            raise ValueError("No failure replay rows were loaded; lower --failure-min-gap-m or check rows.jsonl")
+        if args.failure_replay_mode == "failure_only":
+            train_loader = _failure_only_loader(
+                train_loader,
+                failure_replay,
+                batch_size=int(args.batch_size),
+                num_workers=int(args.num_workers),
+            )
+
     channels = int(getattr(model, "fine_feature_dim", 64))
     if args.pose_adapter_checkpoint:
         adapter, pair_matcher, adapter_args = _load_pose_adapter_bundle(
@@ -312,10 +363,27 @@ def main() -> None:
                 cost_gap_m=float(args.hard_cost_gap_m),
                 margin=float(args.hard_margin),
             )
+            failure_pair_loss = scores.sum() * 0.0
+            failure_pair_stats = {"failure_pair_active_frac": scores.new_zeros(())}
+            if failure_replay is not None and float(args.failure_pair_weight) > 0.0:
+                sample_names = [str(name) for name in batch.get("sample_name", [])]
+                active, positive_idx, negative_idx = batch_failure_pairs(
+                    sample_names,
+                    failure_replay,
+                    device=scores.device,
+                )
+                failure_pair_loss, failure_pair_stats = cached_failure_pair_margin_loss(
+                    scores,
+                    positive_idx=positive_idx,
+                    negative_idx=negative_idx,
+                    active_mask=active,
+                    margin=float(args.failure_pair_margin),
+                )
             loss = (
                 float(args.rank_weight) * rank_loss
                 + float(args.hard_weight) * hard_loss
                 + float(args.basin_weight) * basin_bce_loss(scores, basin, valid_mask=valid)
+                + float(args.failure_pair_weight) * failure_pair_loss
             )
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -335,6 +403,10 @@ def main() -> None:
                     step=step,
                 )
                 row["loss"] = float(loss.detach().cpu())
+                row["failure_pair_loss"] = float(failure_pair_loss.detach().cpu())
+                row["failure_pair_active_frac"] = float(
+                    failure_pair_stats["failure_pair_active_frac"].detach().cpu()
+                )
                 log.write(json.dumps(row) + "\n")
                 log.flush()
                 print(json.dumps(row), flush=True)
