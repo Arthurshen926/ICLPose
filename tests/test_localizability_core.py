@@ -12,6 +12,11 @@ from feature_extract.localizability.candidate_bank import (
     candidate_bank_from_npz,
 )
 from feature_extract.localizability.adapter_bundle import collect_pose_adapter_trainable_parameters
+from feature_extract.localizability.bank_schema import (
+    CandidateRow,
+    candidate_rows_from_jsonl,
+    validate_no_forbidden_training_inputs,
+)
 from feature_extract.localizability.losses import (
     basin_bce_loss,
     online_score_hard_negative_loss,
@@ -22,10 +27,15 @@ from feature_extract.localizability.interpretability import (
     spatial_utility_counterfactual_drop,
 )
 from feature_extract.localizability.mapability import observation_track_feature_variance, track_feature_variance
+from feature_extract.localizability.mapability import (
+    render_query_feature_consistency,
+    observation_track_feature_separability,
+)
 from feature_extract.localizability.metrics import (
     candidate_score_table_rows,
     ranking_metrics,
     ranking_row_diagnostics,
+    risk_coverage_metrics,
 )
 from feature_extract.localizability.reference_pose_bank import (
     build_reference_pose_bank,
@@ -33,9 +43,14 @@ from feature_extract.localizability.reference_pose_bank import (
 )
 from feature_extract.localizability.reference_pose_scoring import (
     descriptor_from_dense_feature,
+    project_descriptor_bank_pca,
     load_descriptor_bank,
+    load_patch_descriptor_bank,
+    patch_descriptors_from_dense_feature,
     retrieval_order_scores,
     save_descriptor_bank,
+    save_patch_descriptor_bank,
+    score_reference_pose_patch_descriptors,
     score_reference_pose_descriptors,
 )
 from feature_extract.localizability.scorer import PoseHypothesisScorer
@@ -138,6 +153,35 @@ def test_pair_matcher_local_uses_center_offset_evidence_not_shift_invariant_max(
     assert aux["score_maps"].shape[:3] == (1, 2, 3)
 
 
+@pytest.mark.parametrize("mode", ["same_pixel", "local_corr", "pair_matcher_local"])
+def test_pose_hypothesis_scorer_marks_zero_render_mask_candidates_invalid(mode):
+    query = torch.randn(1, 4, 7, 7)
+    render = torch.randn(1, 2, 4, 7, 7)
+    render_mask = torch.zeros(1, 2, 1, 7, 7)
+    pair_matcher = None
+    if mode == "pair_matcher_local":
+        pair_matcher = PairConditionedLocalMatcher(
+            channels=4,
+            hidden_dim=8,
+            offset_radius=1,
+            zero_init_residual=True,
+            base_dot_weight=1.0,
+        )
+
+    scorer = PoseHypothesisScorer(
+        mode=mode,
+        radius=1,
+        pair_matcher=pair_matcher,
+        pair_matcher_stride=1,
+        pair_matcher_score_channel=1,
+    )
+    scores, aux = scorer(query, render, render_valid_mask=render_mask)
+
+    assert torch.allclose(scores, torch.zeros_like(scores))
+    assert aux["valid_mask"].tolist() == [[False, False]]
+    assert aux["weight_sum"].tolist() == [[0.0, 0.0]]
+
+
 def test_collect_pose_adapter_trainable_parameters_keeps_backbone_boundaries_explicit():
     adapter = PoseFeatureDomainAdapter(channels=4, hidden_dim=8, rgb_context_enabled=True, rgb_context_channels=2)
     matcher = PairConditionedLocalMatcher(channels=4, hidden_dim=8, offset_radius=1)
@@ -193,6 +237,52 @@ def test_ranking_metrics_report_oracle_gap_spearman_and_basin_recall():
     assert abs(metrics["oracle_gap_m"].item() - 0.15) < 1.0e-6
     assert metrics["basin_recall@2"].item() == 1.0
     assert -1.0 <= metrics["spearman"].item() <= 1.0
+
+
+def test_risk_coverage_metrics_reports_high_confidence_false_accepts():
+    confidence = torch.tensor([0.9, 0.8, 0.2, 0.1])
+    success = torch.tensor([True, False, True, False])
+
+    metrics = risk_coverage_metrics(confidence, success, coverages=(0.25, 0.5, 1.0))
+
+    assert metrics["success_rate"].item() == 0.5
+    assert metrics["risk@25"].item() == 0.0
+    assert metrics["risk@50"].item() == 0.5
+    assert metrics["risk@100"].item() == 0.5
+    assert metrics["high_conf_false_accept@25"].item() == 0.0
+    assert metrics["high_conf_false_accept@50"].item() == 0.5
+    assert 0.0 <= metrics["risk_coverage_auc"].item() <= 1.0
+
+
+def test_patch_reference_pose_scorer_prefers_local_patch_alignment(tmp_path):
+    query = torch.zeros(4, 4, 4)
+    query[:, :2, :2] = torch.tensor([1.0, 0.0, 0.0, 0.0]).view(4, 1, 1)
+    query[:, 2:, 2:] = torch.tensor([0.0, 1.0, 0.0, 0.0]).view(4, 1, 1)
+    aligned = query.clone()
+    wrong = torch.zeros_like(query)
+    wrong[:, :2, :2] = torch.tensor([0.0, 0.0, 1.0, 0.0]).view(4, 1, 1)
+    wrong[:, 2:, 2:] = torch.tensor([0.0, 0.0, 0.0, 1.0]).view(4, 1, 1)
+
+    patch_bank = {
+        "q.png": patch_descriptors_from_dense_feature(query, grid_hw=(2, 2)),
+        "aligned.png": patch_descriptors_from_dense_feature(aligned, grid_hw=(2, 2)),
+        "wrong.png": patch_descriptors_from_dense_feature(wrong, grid_hw=(2, 2)),
+    }
+    path = tmp_path / "patch_bank.pt"
+    save_patch_descriptor_bank(path, patch_bank, metadata={"grid_hw": [2, 2]})
+    loaded, metadata = load_patch_descriptor_bank(path)
+
+    scores, valid = score_reference_pose_patch_descriptors(
+        sample_names=["q.png"],
+        reference_names=[["wrong.png", "aligned.png"]],
+        patch_descriptors=loaded,
+        topk=2,
+    )
+
+    assert metadata["grid_hw"] == [2, 2]
+    assert valid.tolist() == [[True, True]]
+    assert int(scores.argmax(dim=1)[0]) == 1
+    assert scores[0, 1] > scores[0, 0]
 
 
 def test_ranking_row_diagnostics_keeps_selected_oracle_and_basin_fields():
@@ -372,6 +462,29 @@ def test_candidate_bank_from_npz_normalizes_required_fields(tmp_path):
     assert bank.basin_label(0.25, 5.0).tolist() == [[True, False]]
 
 
+def test_bank_schema_loads_candidate_rows_and_rejects_training_leakage(tmp_path):
+    rows_path = tmp_path / "candidate_rows.jsonl"
+    rows_path.write_text(
+        "\n".join(
+            [
+                '{"sample_name":"q1","candidate_idx":0,"score":0.4,"pose_cost_m":0.1,"valid":true}',
+                '{"sample_name":"q1","candidate_idx":1,"score":0.9,"pose_cost_m":0.5,"valid":true}',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    rows = candidate_rows_from_jsonl(rows_path)
+
+    assert rows == [
+        CandidateRow(sample_name="q1", candidate_idx=0, score=0.4, pose_cost_m=0.1, valid=True),
+        CandidateRow(sample_name="q1", candidate_idx=1, score=0.9, pose_cost_m=0.5, valid=True),
+    ]
+    with pytest.raises(ValueError, match="retrieval_scores_candidates"):
+        validate_no_forbidden_training_inputs(["score", "retrieval_scores_candidates"])
+
+
 def test_reference_pose_bank_from_hloc_pairs_computes_pose_errors_and_valid_mask():
     def pose_at(x: float) -> torch.Tensor:
         pose = torch.eye(4)
@@ -464,6 +577,30 @@ def test_descriptor_bank_roundtrip_preserves_names_and_normalized_vectors(tmp_pa
     assert scores.shape == (1, 1)
 
 
+def test_project_descriptor_bank_pca_keeps_descriptor_api_and_compacts_dim():
+    descriptors = {
+        "q/a.png": torch.tensor([1.0, 0.0, 0.0, 0.0]),
+        "r/good.png": torch.tensor([0.9, 0.1, 0.0, 0.0]),
+        "r/bad.png": torch.tensor([0.0, 0.0, 1.0, 0.0]),
+    }
+
+    projected, metadata = project_descriptor_bank_pca(descriptors, out_dim=2)
+    scores, valid = score_reference_pose_descriptors(
+        sample_names=["q/a.png"],
+        reference_names=[["r/good.png", "r/bad.png"]],
+        descriptors=projected,
+    )
+
+    assert metadata["method"] == "pca"
+    assert metadata["input_dim"] == 4
+    assert metadata["output_dim"] == 2
+    assert sorted(projected) == ["q/a.png", "r/bad.png", "r/good.png"]
+    assert all(vec.shape == (2,) for vec in projected.values())
+    assert all(torch.allclose(vec.norm(), torch.tensor(1.0), atol=1.0e-6) for vec in projected.values())
+    assert valid.tolist() == [[True, True]]
+    assert int(scores.argmax(dim=1)[0]) == 0
+
+
 def test_track_feature_variance_ignores_invalid_observations():
     features = torch.tensor(
         [
@@ -499,6 +636,43 @@ def test_observation_track_feature_variance_measures_multi_view_consistency():
     assert stats["num_observations"].item() == 4
     assert variance.item() > 0.0
     assert variance.item() < 0.05
+
+
+def test_observation_track_feature_separability_reports_between_over_within_ratio():
+    features = torch.tensor(
+        [
+            [1.0, 0.0],
+            [1.1, 0.0],
+            [0.0, 1.0],
+            [0.0, 1.1],
+        ]
+    )
+    track_ids = torch.tensor([10, 10, 20, 20])
+
+    ratio, stats = observation_track_feature_separability(features, track_ids)
+
+    assert stats["num_tracks"].item() == 2
+    assert stats["within_track_variance"].item() > 0.0
+    assert stats["between_track_distance"].item() > stats["within_track_variance"].item()
+    assert ratio.item() > 10.0
+
+
+def test_render_query_feature_consistency_averages_valid_dense_cosine_matches():
+    query = torch.tensor([[[[1.0, 0.0]], [[0.0, 1.0]]]])
+    render = torch.tensor(
+        [
+            [
+                [[[1.0, 0.0]], [[0.0, 1.0]]],
+                [[[0.0, 1.0]], [[1.0, 0.0]]],
+            ]
+        ]
+    )
+    valid = torch.tensor([[[[True, True]], [[True, False]]]])
+
+    consistency, stats = render_query_feature_consistency(query, render, valid_mask=valid)
+
+    assert stats["num_valid"].item() == 3
+    assert torch.allclose(consistency, torch.tensor(2.0 / 3.0), atol=1.0e-6)
 
 
 def test_channel_group_counterfactual_drop_reports_high_utility_groups_as_more_important():

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import pickle
 import sys
 from pathlib import Path
 
@@ -22,7 +23,13 @@ from feature_extract import (  # noqa: E402
 )
 from feature_extract.export_impl import build_model  # noqa: E402
 from feature_extract.joint_radio import discover_images, parse_cambridge_split_ordered  # noqa: E402
-from feature_extract.localizability.reference_pose_scoring import descriptor_from_dense_feature, save_descriptor_bank  # noqa: E402
+from feature_extract.localizability.reference_pose_scoring import (  # noqa: E402
+    descriptor_from_dense_feature,
+    patch_descriptors_from_dense_feature,
+    save_descriptor_bank,
+    save_patch_descriptor_bank,
+)
+from data.radio_loc_dataset import read_colmap_images  # noqa: E402
 
 
 def _normalize_name(name: str | Path) -> str:
@@ -73,6 +80,24 @@ def apply_student_feature_hw_defaults(cfg: dict) -> None:
         dataset_cfg["coarse_feature_hw"] = list(dataset_cfg["student_coarse_feature_hw"])
 
 
+def apply_dataset_overrides(cfg: dict, args: argparse.Namespace) -> None:
+    dataset_cfg = cfg.setdefault("dataset", {})
+    overrides = {
+        "source_dir": getattr(args, "source_dir", None),
+        "colmap_dir": getattr(args, "colmap_dir", None),
+        "train_split": getattr(args, "train_split", None),
+        "val_split": getattr(args, "val_split", None),
+    }
+    for key, value in overrides.items():
+        if value:
+            dataset_cfg[key] = str(value)
+    image_patterns = getattr(args, "image_patterns", None)
+    if image_patterns:
+        dataset_cfg["image_patterns"] = [
+            part.strip() for part in str(image_patterns).replace(";", ",").split(",") if part.strip()
+        ]
+
+
 def prepare_checkpoint_for_rgb_export(checkpoint: dict) -> tuple[dict, list[str]]:
     state_dict = checkpoint.get("model_state_dict", {})
     legacy_prefixes = ("fine_loc_head.", "fine_loc_highres_fuse.")
@@ -89,6 +114,15 @@ def prepare_checkpoint_for_rgb_export(checkpoint: dict) -> tuple[dict, list[str]
         key: value for key, value in state_dict.items() if key not in set(dropped)
     }
     return cleaned, dropped
+
+
+def load_checkpoint_for_rgb_export(path: str | Path):
+    try:
+        return safe_torch_load(path)
+    except pickle.UnpicklingError as exc:
+        if "Weights only load failed" not in str(exc):
+            raise
+        return torch.load(path, map_location="cpu", weights_only=False)
 
 
 def resolve_descriptor_key(descriptor_key: str, *, fine_key: str) -> str:
@@ -141,7 +175,29 @@ def build_rgb_records(dataset_cfg: dict, split: str, limit: int | None) -> list[
         records = _records_from_split_order(records, split_order, split_names) if split_names else []
     if limit is not None:
         records = records[:limit]
+    attach_colmap_image_ids(records, dataset_cfg.get("colmap_dir"))
     return records
+
+
+def attach_colmap_image_ids(records: list[dict], colmap_dir: str | None) -> None:
+    if not colmap_dir:
+        return
+    images_path = Path(colmap_dir) / "images.bin"
+    if not images_path.is_file():
+        return
+    try:
+        images = read_colmap_images(str(images_path))
+    except Exception:
+        return
+    by_name = {meta.name: int(image_id) for image_id, meta in images.items()}
+    by_stem = {Path(meta.name).with_suffix("").as_posix(): int(image_id) for image_id, meta in images.items()}
+    for record in records:
+        sample_name = str(record["sample_name"])
+        image_id = by_name.get(sample_name)
+        if image_id is None:
+            image_id = by_stem.get(Path(sample_name).with_suffix("").as_posix())
+        if image_id is not None:
+            record["image_id"] = int(image_id)
 
 
 class RGBOnlyQueryDataset(Dataset):
@@ -174,19 +230,75 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", required=True)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--output-path", required=True)
+    parser.add_argument("--source-dir", default=None)
+    parser.add_argument("--colmap-dir", default=None)
+    parser.add_argument("--train-split", default=None)
+    parser.add_argument("--val-split", default=None)
+    parser.add_argument("--image-patterns", default=None)
     parser.add_argument("--split", choices=("all", "train", "val"), default="all")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--descriptor-key", default="fine")
+    parser.add_argument("--patch-output-path", default=None)
+    parser.add_argument("--patch-grid-hw", default="4,4")
+    parser.add_argument("--dense-output-root", default=None)
+    parser.add_argument("--dense-subdir", default=None)
+    parser.add_argument("--dense-resize-hw", default=None, help="Optional H,W for exported dense maps")
+    parser.add_argument("--dense-dtype", choices=("float16", "float32"), default="float16")
     return parser.parse_args()
+
+
+def _parse_hw(value: str | None) -> tuple[int, int] | None:
+    if not value:
+        return None
+    parts = [part.strip() for part in str(value).replace("x", ",").split(",") if part.strip()]
+    if len(parts) != 2:
+        raise ValueError(f"Expected H,W for dense resize, got: {value}")
+    return int(parts[0]), int(parts[1])
+
+
+def save_dense_feature_map(
+    feature: torch.Tensor,
+    *,
+    output_root: str | Path,
+    subdir: str,
+    record: dict,
+    feature_key: str,
+    resize_hw: tuple[int, int] | None = None,
+    dtype: str = "float16",
+) -> Path:
+    dense = feature.detach().float().cpu()
+    if dense.ndim != 3:
+        raise ValueError("feature must have shape C,H,W")
+    if resize_hw is not None and tuple(dense.shape[-2:]) != tuple(resize_hw):
+        dense = torch.nn.functional.interpolate(
+            dense[None],
+            size=tuple(resize_hw),
+            mode="bilinear",
+            align_corners=False,
+        )[0]
+    if dtype == "float16":
+        dense = dense.half()
+    elif dtype == "float32":
+        dense = dense.float()
+    else:
+        raise ValueError(f"Unsupported dense dtype: {dtype}")
+    image_id = int(record.get("image_id", record.get("record_idx", 0)))
+    channels, height, width = dense.shape
+    output_dir = Path(output_root) / str(subdir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / f"rgb_{image_id}_{feature_key}_{channels}x{height}x{width}.pt"
+    torch.save(dense.contiguous(), output_path)
+    return output_path
 
 
 @torch.no_grad()
 def main() -> None:
     args = parse_args()
     cfg = load_config(args.config)
+    apply_dataset_overrides(cfg, args)
     device = torch.device(args.device if args.device == "cpu" or torch.cuda.is_available() else "cpu")
     if bool(cfg.get("model", {}).get("teacher_fine_condition", False)):
         feature_dir = resolve_feature_dir(cfg["dataset"]["feature_dir"])
@@ -210,7 +322,7 @@ def main() -> None:
         num_workers=int(args.num_workers),
         pin_memory=device.type == "cuda",
     )
-    checkpoint, dropped_keys = prepare_checkpoint_for_rgb_export(safe_torch_load(args.checkpoint))
+    checkpoint, dropped_keys = prepare_checkpoint_for_rgb_export(load_checkpoint_for_rgb_export(args.checkpoint))
     model = build_model(cfg, checkpoint, device)
     fine_key = str(
         cfg.get("export", {}).get(
@@ -219,7 +331,13 @@ def main() -> None:
         )
     )
     descriptor_key = resolve_descriptor_key(args.descriptor_key, fine_key=fine_key)
+    dense_resize_hw = _parse_hw(args.dense_resize_hw)
+    patch_grid_hw = _parse_hw(args.patch_grid_hw)
+    dense_subdir = str(args.dense_subdir or descriptor_key)
+    dense_written = 0
     descriptors: dict[str, torch.Tensor] = {}
+    patch_descriptors: dict[str, torch.Tensor] = {}
+    records_by_record_idx = {int(record["record_idx"]): record for record in records}
     use_amp = device.type == "cuda"
     for batch in loader:
         rgb = batch["rgb"].to(device, non_blocking=True)
@@ -230,6 +348,23 @@ def main() -> None:
         feature = pred[descriptor_key].detach().float().cpu()
         for idx, sample_name in enumerate(batch["sample_name"]):
             descriptors[str(sample_name)] = descriptor_from_dense_feature(feature[idx])
+            if args.patch_output_path:
+                patch_descriptors[str(sample_name)] = patch_descriptors_from_dense_feature(
+                    feature[idx],
+                    grid_hw=patch_grid_hw or (4, 4),
+                )
+            if args.dense_output_root:
+                record = records_by_record_idx[int(batch["record_idx"][idx])]
+                save_dense_feature_map(
+                    feature[idx],
+                    output_root=args.dense_output_root,
+                    subdir=dense_subdir,
+                    record=record,
+                    feature_key=dense_subdir,
+                    resize_hw=dense_resize_hw,
+                    dtype=args.dense_dtype,
+                )
+                dense_written += 1
 
     metadata = {
         "config": str(Path(args.config).resolve()),
@@ -242,8 +377,17 @@ def main() -> None:
         "descriptor_dim": int(next(iter(descriptors.values())).numel()) if descriptors else 0,
         "batch_size": int(args.batch_size),
         "dropped_legacy_checkpoint_keys": dropped_keys,
+        "dense_output_root": str(args.dense_output_root) if args.dense_output_root else None,
+        "dense_subdir": dense_subdir if args.dense_output_root else None,
+        "dense_resize_hw": list(dense_resize_hw) if dense_resize_hw else None,
+        "dense_dtype": str(args.dense_dtype),
+        "dense_written": int(dense_written),
+        "patch_output_path": str(args.patch_output_path) if args.patch_output_path else None,
+        "patch_grid_hw": list(patch_grid_hw or (4, 4)) if args.patch_output_path else None,
     }
     save_descriptor_bank(args.output_path, descriptors, metadata=metadata)
+    if args.patch_output_path:
+        save_patch_descriptor_bank(args.patch_output_path, patch_descriptors, metadata=metadata)
     sidecar = Path(args.output_path).with_suffix(".json")
     sidecar.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
     print(json.dumps({**metadata, "output_path": str(args.output_path)}, indent=2))

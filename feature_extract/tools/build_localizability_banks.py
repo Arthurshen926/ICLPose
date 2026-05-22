@@ -30,6 +30,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-samples", type=int, default=0)
     parser.add_argument("--candidate-render-batch-size", type=int, default=4)
     parser.add_argument(
+        "--include-retrieval-scores",
+        action="store_true",
+        help="Include retrieval_scores_candidates in the exported bank. Off by default to avoid leakage in training banks.",
+    )
+    parser.add_argument(
         "--pose-candidate-cache",
         default=None,
         help="Optional override for dataset.<split>_pose_candidate_cache before building the loader.",
@@ -45,7 +50,9 @@ def main() -> None:
     args = parse_args()
     cfg = load_config(args.config)
     if args.pose_candidate_cache:
-        cfg.setdefault("dataset", {})[f"{args.split}_pose_candidate_cache"] = str(args.pose_candidate_cache)
+        dataset_cfg = cfg.setdefault("dataset", {})
+        dataset_cfg[f"{args.split}_pose_candidate_cache"] = str(args.pose_candidate_cache)
+        dataset_cfg[f"{args.split}_pose_candidate_caches"] = None
     device = torch.device(args.device if torch.cuda.is_available() or not args.device.startswith("cuda") else "cpu")
     _model, loader, map_renderer = build_model_and_data(cfg, args, device)
     sample_names = []
@@ -84,30 +91,32 @@ def main() -> None:
     pose_cost = trans_all + float(args.rot_cost_weight) * torch.deg2rad(rot_all)
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(
-        out,
-        sample_names=np.asarray(sample_names),
-        pose_gt=pose_gt_all.numpy().astype(np.float32),
-        candidates=candidates_all.numpy().astype(np.float32),
-        valid_mask=valid_all.numpy().astype(bool),
-        pose_cost_m=pose_cost.numpy().astype(np.float32),
-        trans_err_m=trans_all.numpy().astype(np.float32),
-        rot_err_deg=rot_all.numpy().astype(np.float32),
-        retrieval_scores_candidates=retrieval_scores.numpy().astype(np.float32),
-        scene=np.asarray(args.scene or cfg.get("dataset", {}).get("scene", "")),
-        candidate_source=np.asarray(args.candidate_source),
-        metadata=np.asarray(
+    payload = {
+        "sample_names": np.asarray(sample_names),
+        "pose_gt": pose_gt_all.numpy().astype(np.float32),
+        "candidates": candidates_all.numpy().astype(np.float32),
+        "valid_mask": valid_all.numpy().astype(bool),
+        "pose_cost_m": pose_cost.numpy().astype(np.float32),
+        "trans_err_m": trans_all.numpy().astype(np.float32),
+        "rot_err_deg": rot_all.numpy().astype(np.float32),
+        "scene": np.asarray(args.scene or cfg.get("dataset", {}).get("scene", "")),
+        "candidate_source": np.asarray(args.candidate_source),
+        "metadata": np.asarray(
             [
                 {
                     "config": str(Path(args.config).resolve()),
                     "split": args.split,
                     "rot_cost_weight": float(args.rot_cost_weight),
                     "num_samples": len(sample_names),
+                    "include_retrieval_scores": bool(args.include_retrieval_scores),
                 }
             ],
             dtype=object,
         ),
-    )
+    }
+    if bool(args.include_retrieval_scores):
+        payload["retrieval_scores_candidates"] = retrieval_scores.numpy().astype(np.float32)
+    np.savez(out, **payload)
     print(json.dumps({"out": str(out), "num_samples": len(sample_names), "num_candidates": int(candidates_all.shape[1])}))
 
 

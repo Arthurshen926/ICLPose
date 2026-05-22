@@ -15,7 +15,10 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from data.radio_loc_dataset import colmap_to_w2c, read_colmap_cameras, read_colmap_images  # noqa: E402
-from feature_extract.localizability.mapability import observation_track_feature_variance  # noqa: E402
+from feature_extract.localizability.mapability import (  # noqa: E402
+    observation_track_feature_separability,
+    observation_track_feature_variance,
+)
 from feature_extract.localizability.reference_pose_scoring import find_feature_path  # noqa: E402
 
 
@@ -231,10 +234,16 @@ def main() -> None:
         keep_ids = unique_ids[counts >= int(args.min_track_observations)]
         keep = torch.isin(track_ids, keep_ids)
         variance, stats = observation_track_feature_variance(features, track_ids, valid_mask=keep)
+        separability, separability_stats = observation_track_feature_separability(features, track_ids, valid_mask=keep)
         feature_dim = int(features.shape[1])
     else:
         variance = torch.tensor(0.0)
         stats = {"num_tracks": torch.tensor(0.0), "num_observations": torch.tensor(0.0)}
+        separability = torch.tensor(0.0)
+        separability_stats = {
+            "between_track_distance": torch.tensor(0.0),
+            "within_track_variance": torch.tensor(0.0),
+        }
         feature_dim = 0
         keep = torch.zeros(0, dtype=torch.bool)
     summary = {
@@ -249,6 +258,10 @@ def main() -> None:
         "num_observations": int(keep.sum().item()) if all_features else 0,
         "num_tracks": float(stats["num_tracks"].item()),
         "track_variance": float(variance.item()),
+        "within_track_variance": float(separability_stats["within_track_variance"].item()),
+        "between_track_distance": float(separability_stats["between_track_distance"].item()),
+        "track_separability_ratio": float(separability.item()),
+        "mapability_valid": bool((int(keep.sum().item()) if all_features else 0) > 0 and float(stats["num_tracks"].item()) > 0.0),
     }
     out_path = Path(args.out_json)
     out_path.parent.mkdir(parents=True, exist_ok=True)

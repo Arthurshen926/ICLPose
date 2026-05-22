@@ -1,0 +1,9 @@
+# Eval-only companion for q50 caches with larger randomized/jittered candidate pools.
+
+base_config: /root/ICLPose/feature_extract/configs/pofd_stage3a_multiscale_score_q50_val128_eval.yaml
+exp_name: pofd_stage3a_multiscale_score_q50_val128_top65_eval
+
+dataset:
+  pose_candidate_topk: 65
+  train_pose_candidate_caches:
+  val_pose_candidate_caches:

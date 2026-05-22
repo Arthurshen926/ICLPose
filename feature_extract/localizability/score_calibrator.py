@@ -11,6 +11,8 @@ from typing import Iterable, Sequence
 import torch
 from torch import nn
 
+from feature_extract.localizability.bank_schema import validate_no_forbidden_training_inputs
+
 
 @dataclass
 class CandidateScoreTable:
@@ -100,6 +102,7 @@ def group_candidate_table_rows(
     keys = tuple(str(key) for key in feature_keys)
     if not keys:
         raise ValueError("feature_keys must not be empty")
+    validate_no_forbidden_training_inputs(keys)
 
     bsz = len(sample_names)
     features = torch.zeros(bsz, num_candidates, len(keys), dtype=torch.float32)

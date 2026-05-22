@@ -156,12 +156,13 @@ class PoseHypothesisScorer(nn.Module):
                 weight = weight.to(device=score_maps_5d.device, dtype=score_maps_5d.dtype).clamp_min(0.0)
             valid_weight = valid_grid.to(device=score_maps_5d.device, dtype=score_maps_5d.dtype).clamp(0.0, 1.0)
             combined_weight = weight[:, None, 0] * valid_weight
-            denom = combined_weight.flatten(2).sum(dim=-1).clamp_min(1.0)
+            raw_weight_sum = combined_weight.flatten(2).sum(dim=-1)
+            denom = raw_weight_sum.clamp_min(1.0)
             scores = (score_maps_5d[:, :, score_channel] * combined_weight).flatten(2).sum(dim=-1) / denom
             return scores, {
                 "score_maps": score_maps_5d,
-                "valid_mask": denom > 0.0,
-                "weight_sum": denom,
+                "valid_mask": raw_weight_sum > 0.0,
+                "weight_sum": raw_weight_sum,
             }
 
         bsz, num_candidates, height, width = score_maps.shape
@@ -180,11 +181,12 @@ class PoseHypothesisScorer(nn.Module):
                 valid = valid[:, None, 0].expand(-1, num_candidates, -1, -1)
             valid_weight = valid.to(device=score_maps.device, dtype=score_maps.dtype).clamp(0.0, 1.0)
         combined_weight = weight[:, None, 0] * valid_weight
-        denom = combined_weight.flatten(2).sum(dim=-1).clamp_min(1.0)
+        raw_weight_sum = combined_weight.flatten(2).sum(dim=-1)
+        denom = raw_weight_sum.clamp_min(1.0)
         scores = (score_maps * combined_weight).flatten(2).sum(dim=-1) / denom
-        valid_mask = denom > 0.0
+        valid_mask = raw_weight_sum > 0.0
         return scores, {
             "score_maps": score_maps,
             "valid_mask": valid_mask,
-            "weight_sum": denom,
+            "weight_sum": raw_weight_sum,
         }

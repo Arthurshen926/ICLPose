@@ -23,13 +23,24 @@ from feature_extract.tools.eval_feature_track_mapability import project_points_t
 from feature_extract.tools.augment_pose_candidate_cache import (
     append_near_identity_candidate_arrays,
     build_near_identity_pose_candidates,
+    parse_args as parse_augment_pose_candidate_args,
 )
 from feature_extract.tools.export_query_student_descriptors import (
     apply_student_feature_hw_defaults,
+    apply_dataset_overrides,
     build_rgb_records,
+    load_checkpoint_for_rgb_export,
     prepare_checkpoint_for_rgb_export,
     resolve_descriptor_key,
     resolve_feature_dir,
+    save_dense_feature_map,
+)
+from feature_extract.tools.select_score_hard_candidate_cache import select_score_hard_candidate_arrays
+from feature_extract.tools.select_score_hard_candidate_cache import parse_args as parse_score_hard_candidate_args
+from feature_extract.tools.train_localizability_score_calibrator import (
+    _row_with_selection_eligibility,
+    _selection_eligible,
+    parse_args as parse_score_calibrator_args,
 )
 
 
@@ -37,6 +48,47 @@ def _pose_at(value: float) -> np.ndarray:
     pose = np.eye(4, dtype=np.float32)
     pose[0, 3] = float(value)
     return pose
+
+
+def test_score_calibrator_cli_accepts_selection_spearman_min(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train_localizability_score_calibrator.py",
+            "--train-table",
+            "train.jsonl",
+            "--val-table",
+            "val.jsonl",
+            "--out-dir",
+            "out",
+            "--selection-spearman-min",
+            "0.55",
+        ],
+    )
+
+    args = parse_score_calibrator_args()
+
+    assert args.selection_spearman_min == 0.55
+
+
+def test_score_calibrator_selection_gate_rejects_low_spearman_checkpoint():
+    best = {"pred_cost_m": 0.23}
+    low_spearman = {"pred_cost_m": 0.20, "spearman": 0.50}
+    stable = {"pred_cost_m": 0.22, "spearman": 0.56}
+
+    assert _selection_eligible(low_spearman, best, selection_spearman_min=None) is True
+    assert _selection_eligible(low_spearman, best, selection_spearman_min=0.55) is False
+    assert _selection_eligible(stable, best, selection_spearman_min=0.55) is True
+
+
+def test_score_calibrator_eval_row_marks_selection_eligibility_before_logging():
+    row = {"val": {"pred_cost_m": 0.21, "spearman": 0.50}}
+
+    marked = _row_with_selection_eligibility(row, {"pred_cost_m": 0.23}, selection_spearman_min=0.55)
+
+    assert marked is row
+    assert marked["selection_eligible"] is False
 
 
 def test_resolve_feature_dir_falls_back_to_nested_result_root(tmp_path):
@@ -64,6 +116,29 @@ def test_apply_student_feature_hw_defaults_prefers_student_export_resolution():
 
     assert cfg["dataset"]["feature_hw"] == [272, 480]
     assert cfg["dataset"]["coarse_feature_hw"] == [34, 60]
+
+
+def test_apply_dataset_overrides_updates_scene_paths():
+    cfg = {"dataset": {"source_dir": "old", "image_patterns": ["*.png"]}}
+    args = type(
+        "Args",
+        (),
+        {
+            "source_dir": "/data/scene",
+            "colmap_dir": "/data/scene/sparse/0",
+            "train_split": "/data/scene/train.txt",
+            "val_split": "/data/scene/test.txt",
+            "image_patterns": "seq*/*.png,images/*.jpg",
+        },
+    )()
+
+    apply_dataset_overrides(cfg, args)
+
+    assert cfg["dataset"]["source_dir"] == "/data/scene"
+    assert cfg["dataset"]["colmap_dir"] == "/data/scene/sparse/0"
+    assert cfg["dataset"]["train_split"] == "/data/scene/train.txt"
+    assert cfg["dataset"]["val_split"] == "/data/scene/test.txt"
+    assert cfg["dataset"]["image_patterns"] == ["seq*/*.png", "images/*.jpg"]
 
 
 def test_build_rgb_records_uses_cambridge_split_order_without_teacher_cache(tmp_path):
@@ -106,9 +181,49 @@ def test_prepare_checkpoint_for_rgb_export_drops_legacy_fine_loc_keys():
     assert "fine_loc_head.0.weight" in checkpoint["model_state_dict"]
 
 
+def test_load_checkpoint_for_rgb_export_falls_back_for_trusted_legacy_checkpoint(monkeypatch):
+    import pickle
+    import feature_extract.tools.export_query_student_descriptors as exporter
+
+    expected = {"model_state_dict": {"fine_head.weight": torch.tensor([1.0])}}
+
+    def fake_safe_load(path):
+        raise pickle.UnpicklingError("Weights only load failed")
+
+    def fake_torch_load(path, map_location=None, weights_only=None):
+        assert str(path) == "legacy.pth"
+        assert map_location == "cpu"
+        assert weights_only is False
+        return expected
+
+    monkeypatch.setattr(exporter, "safe_torch_load", fake_safe_load)
+    monkeypatch.setattr(exporter.torch, "load", fake_torch_load)
+
+    assert load_checkpoint_for_rgb_export("legacy.pth") is expected
+
+
 def test_resolve_descriptor_key_keeps_model_fine_explicit():
     assert resolve_descriptor_key("fine", fine_key="fine_loc") == "fine"
     assert resolve_descriptor_key("export_fine", fine_key="fine_loc") == "fine_loc"
+
+
+def test_save_dense_feature_map_uses_colmap_image_id_and_requested_resolution(tmp_path):
+    feature = torch.randn(4, 8, 10)
+
+    path = save_dense_feature_map(
+        feature,
+        output_root=tmp_path,
+        subdir="fine_geo",
+        record={"image_id": 7, "sample_name": "seq/frame.png"},
+        feature_key="fine_geo",
+        resize_hw=(2, 3),
+        dtype="float16",
+    )
+
+    assert path.name == "rgb_7_fine_geo_4x2x3.pt"
+    saved = torch.load(path, map_location="cpu", weights_only=True)
+    assert saved.shape == (4, 2, 3)
+    assert saved.dtype == torch.float16
 
 
 def test_append_near_identity_candidate_arrays_extends_candidate_axis():
@@ -142,6 +257,40 @@ def test_append_near_identity_candidate_arrays_extends_candidate_axis():
     assert metadata["num_added_candidates"] == 3
 
 
+def test_argparse_boolean_optional_compat_supports_no_include_flags(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "augment_pose_candidate_cache.py",
+            "--input",
+            "in.npz",
+            "--output",
+            "out.npz",
+            "--no-include-identity",
+        ],
+    )
+    augment_args = parse_augment_pose_candidate_args()
+    assert augment_args.include_identity is False
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "select_score_hard_candidate_cache.py",
+            "--input",
+            "in.npz",
+            "--candidate-table",
+            "rows.jsonl",
+            "--output",
+            "out.npz",
+            "--no-include-oracle",
+        ],
+    )
+    select_args = parse_score_hard_candidate_args()
+    assert select_args.include_oracle is False
+
+
 def test_build_near_identity_pose_candidates_is_deterministic_for_seed():
     pose_inits = np.tile(np.eye(4, dtype=np.float32), (1, 1, 1))
 
@@ -165,6 +314,44 @@ def test_build_near_identity_pose_candidates_is_deterministic_for_seed():
     assert first.shape == (1, 4, 4, 4)
     assert np.allclose(first, second)
     assert np.allclose(first[:, 0], pose_inits)
+
+
+def test_select_score_hard_candidate_arrays_keeps_oracle_and_score_high_wrong():
+    poses = np.zeros((2, 4, 4, 4), dtype=np.float32)
+    for row in range(2):
+        for cand in range(4):
+            poses[row, cand] = np.eye(4, dtype=np.float32)
+            poses[row, cand, 0, 3] = row * 10 + cand
+    cache = {
+        "pose_init_candidates": poses,
+        "candidate_valid_mask": np.ones((2, 4), dtype=bool),
+        "retrieval_scores_candidates": np.arange(8, dtype=np.float32).reshape(2, 4),
+        "pose_inits": np.tile(np.eye(4, dtype=np.float32), (2, 1, 1)),
+    }
+    rows = [
+        {"global_row": 0, "candidate_idx": 0, "pose_cost_m": 0.10, "score": 0.2, "valid": True},
+        {"global_row": 0, "candidate_idx": 1, "pose_cost_m": 0.15, "score": 0.9, "valid": True},
+        {"global_row": 0, "candidate_idx": 2, "pose_cost_m": 0.35, "score": 0.8, "valid": True},
+        {"global_row": 1, "candidate_idx": 0, "pose_cost_m": 0.50, "score": 0.7, "valid": True},
+        {"global_row": 1, "candidate_idx": 1, "pose_cost_m": 0.05, "score": 0.1, "valid": True},
+        {"global_row": 1, "candidate_idx": 3, "pose_cost_m": 0.30, "score": 0.9, "valid": True},
+    ]
+
+    selected, metadata = select_score_hard_candidate_arrays(
+        cache,
+        rows,
+        hard_count=1,
+        cost_gap_m=0.12,
+        include_oracle=True,
+    )
+
+    assert selected["pose_init_candidates"].shape == (2, 2, 4, 4)
+    assert selected["candidate_valid_mask"].all()
+    assert selected["pose_init_candidates"][0, 0, 0, 3] == 0.0
+    assert selected["pose_init_candidates"][0, 1, 0, 3] == 2.0
+    assert selected["pose_init_candidates"][1, 0, 0, 3] == 11.0
+    assert selected["pose_init_candidates"][1, 1, 0, 3] == 13.0
+    assert metadata["selected_indices"] == [[0, 2], [1, 3]]
 
 
 def test_mine_score_hard_candidate_pairs_selects_score_high_wrong_candidate():

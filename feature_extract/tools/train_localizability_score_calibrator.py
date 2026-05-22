@@ -7,6 +7,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import Optional
 
 import torch
 
@@ -56,6 +57,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--replay-weight", type=float, default=0.0)
     parser.add_argument("--replay-margin", type=float, default=0.08)
     parser.add_argument("--seed", type=int, default=20260521)
+    parser.add_argument("--selection-spearman-min", type=float, default=None)
     return parser.parse_args()
 
 
@@ -75,6 +77,35 @@ def _eval_scores(scores: torch.Tensor, table) -> dict:
         topk=(1, 5),
     )
     return {key: float(value.detach().cpu()) for key, value in metrics.items()}
+
+
+def _selection_eligible(
+    val_metrics: dict,
+    best_metrics: Optional[dict],
+    *,
+    selection_spearman_min: Optional[float],
+) -> bool:
+    pred_cost = float(val_metrics.get("pred_cost_m", float("inf")))
+    best_pred_cost = float((best_metrics or {}).get("pred_cost_m", float("inf")))
+    if pred_cost >= best_pred_cost:
+        return False
+    if selection_spearman_min is None:
+        return True
+    return float(val_metrics.get("spearman", float("-inf"))) >= float(selection_spearman_min)
+
+
+def _row_with_selection_eligibility(
+    row: dict,
+    best_metrics: Optional[dict],
+    *,
+    selection_spearman_min: Optional[float],
+) -> dict:
+    row["selection_eligible"] = _selection_eligible(
+        row["val"],
+        best_metrics,
+        selection_spearman_min=selection_spearman_min,
+    )
+    return row
 
 
 def main() -> None:
@@ -105,7 +136,8 @@ def main() -> None:
     if args.replay_pairs and float(args.replay_weight) > 0.0:
         replay_rows = load_mined_score_hard_pairs(args.replay_pairs)
         replay_active, replay_positive, replay_negative = batch_failure_pairs(train.sample_names, replay_rows)
-    best = {"pred_cost_m": float("inf")}
+    best = None
+    best_step = None
     log_path = out_dir / "train_log.jsonl"
     with log_path.open("w", encoding="utf-8") as log:
         raw_row = {
@@ -163,11 +195,17 @@ def main() -> None:
                         "train": _eval_scores(train_scores, train),
                         "val": _eval_scores(val_scores, val),
                     }
+                    row = _row_with_selection_eligibility(
+                        row,
+                        best,
+                        selection_spearman_min=args.selection_spearman_min,
+                    )
                 log.write(json.dumps(row) + "\n")
                 log.flush()
                 print(json.dumps(row), flush=True)
-                if row["val"]["pred_cost_m"] < best["pred_cost_m"]:
+                if bool(row["selection_eligible"]):
                     best = row["val"]
+                    best_step = int(step)
                     torch.save(
                         {
                             "state_dict": model.state_dict(),
@@ -179,12 +217,20 @@ def main() -> None:
                             "num_layers": int(args.num_layers),
                             "dropout": float(args.dropout),
                             "score_residual_weight": float(args.score_residual_weight),
+                            "selection_spearman_min": args.selection_spearman_min,
                             "step": int(step),
                             "metrics": row,
                         },
                         out_dir / "best.pth",
                     )
-    summary = {"best_val": best, "feature_keys": list(keys), "raw_val": raw_row["val"], "raw_train": raw_row["train"]}
+    summary = {
+        "best_val": best,
+        "best_step": best_step,
+        "selection_spearman_min": args.selection_spearman_min,
+        "feature_keys": list(keys),
+        "raw_val": raw_row["val"],
+        "raw_train": raw_row["train"],
+    }
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
 
 

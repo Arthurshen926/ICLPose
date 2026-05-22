@@ -91,6 +91,65 @@ def ranking_metrics(
     return metrics
 
 
+def risk_coverage_metrics(
+    confidence: torch.Tensor,
+    success: torch.Tensor,
+    *,
+    valid_mask: torch.Tensor | None = None,
+    coverages: tuple[float, ...] = (0.25, 0.50, 0.75, 1.0),
+) -> dict[str, torch.Tensor]:
+    """Report failure risk as increasingly uncertain predictions are accepted.
+
+    Higher ``confidence`` means a prediction is trusted earlier.  ``success`` is
+    a binary final-outcome label, for example selected candidate in basin or
+    downstream solver final pose within threshold.  Lower risk is better.
+    """
+    conf = confidence.float().reshape(-1)
+    ok = success.to(device=conf.device).bool().reshape(-1)
+    if conf.shape != ok.shape:
+        raise ValueError("confidence and success must have the same number of elements")
+    valid = (
+        valid_mask.to(device=conf.device).bool().reshape(-1)
+        if valid_mask is not None
+        else torch.ones_like(ok, dtype=torch.bool)
+    )
+    if valid.shape != conf.shape:
+        raise ValueError("valid_mask must match confidence shape")
+    conf = conf[valid]
+    ok = ok[valid]
+    if conf.numel() == 0:
+        zero = confidence.new_zeros(())
+        out = {
+            "num_predictions": zero,
+            "success_rate": zero,
+            "risk_coverage_auc": zero,
+        }
+        for coverage in coverages:
+            pct = int(round(float(coverage) * 100.0))
+            out[f"risk@{pct}"] = zero
+            out[f"high_conf_false_accept@{pct}"] = zero
+        return out
+
+    order = torch.argsort(conf, descending=True)
+    ok_sorted = ok[order].float()
+    prefix_count = torch.arange(1, ok_sorted.numel() + 1, device=conf.device, dtype=torch.float32)
+    prefix_success = torch.cumsum(ok_sorted, dim=0) / prefix_count
+    prefix_risk = 1.0 - prefix_success
+    out = {
+        "num_predictions": conf.new_tensor(float(conf.numel())),
+        "success_rate": ok.float().mean(),
+        "risk_coverage_auc": prefix_risk.mean(),
+    }
+    for coverage in coverages:
+        frac = max(0.0, min(1.0, float(coverage)))
+        count = max(1, min(int(conf.numel()), int(torch.ceil(conf.new_tensor(frac * conf.numel())).item())))
+        risk = prefix_risk[count - 1]
+        pct = int(round(frac * 100.0))
+        out[f"risk@{pct}"] = risk
+        out[f"high_conf_false_accept@{pct}"] = risk
+    return out
+
+
 def ranking_row_diagnostics(
     scores: torch.Tensor,
     pose_cost_m: torch.Tensor,

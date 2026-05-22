@@ -491,22 +491,28 @@ OldHospital sparse model has zero stored 2D point observations in `images.bin`,
 so the evaluator falls back to projecting `points3D.bin` into cameras and
 sampling the feature maps.
 
-Raw RADIO projected-track baseline:
+Raw RADIO projected-track baseline and query-adaptive dense export:
 
 | feature | images | observations | tracks | dim | variance |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| coarse_sem | 40 | 1236 | 567 | 64 | 1.4404 |
-| fine_geo | 24 | 163 | 59 | 64 | 0.0033 |
+| raw RADIO coarse_sem | 80 | 13912 | 6354 | 64 | 1.8445 |
+| raw RADIO fine_geo | 80 | 13912 | 6354 | 64 | 0.0062 |
+| query-student coarse, RGB-only export | 80 | 15400 | 6969 | 32 | 0.0039 |
+| query-student fine, RGB-only export | 80 | 15400 | 6969 | 96 | 0.0019 |
 
 Interpretation:
 
 - The mapability protocol is now executable and records feature dimension,
   track count, observation count, and within-track variance.
-- This is only a raw RADIO baseline.  It does not yet prove selected POFD-FS
-  mapability because full selected/query-adaptive dense caches are not exported.
-- The next efficient step is descriptor/track-observation export for selected
-  features rather than writing full dense feature maps for every Cambridge
-  image.
+- Query-adaptive dense features have lower projected-track variance than raw
+  RADIO fine features on OldHospital.  The 96D fine feature reaches `0.0019`;
+  the compact 32D coarse feature reaches `0.0039`, still below raw RADIO
+  fine's `0.0062`.
+- This is a **partial** mapability positive for learned query features,
+  including a <=64D compact feature.  It is not yet the final POFD-FS selector
+  output and only covers OldHospital.  The next mapability step is to export
+  the actual compact POFD-FS selector output and repeat this table on a second
+  scene.
 
 ## 2026-05-21 Interpretability Interface
 
@@ -577,6 +583,89 @@ Conclusion:
 - Next reference-pose work should not rely on simple global average pooling.
   It needs a learned localizability selector/scorer or patch-level evidence,
   otherwise retrieval-order is stronger.
+
+Extended descriptor-only export to all Cambridge reference-pose scenes using
+the same frozen OldHospital query-student checkpoint:
+
+```text
+GreatCourt:     2291 descriptors
+KingsCollege:   1565 descriptors
+ShopFacade:      334 descriptors
+StMarysChurch:  2017 descriptors
+OldHospital:    1077 descriptors
+```
+
+Five-scene result, query-student pooled descriptor vs retrieval order:
+
+| scene | retrieval pred | retrieval top1 | retrieval Spearman | query pred | query top1 | query Spearman |
+|---|---:|---:|---:|---:|---:|---:|
+| GreatCourt | 14.089 | 0.121 | 0.166 | 18.441 | 0.071 | -0.134 |
+| KingsCollege | 3.444 | 0.149 | 0.321 | 5.208 | 0.067 | -0.111 |
+| OldHospital | 4.186 | 0.181 | 0.316 | 5.195 | 0.093 | 0.065 |
+| ShopFacade | 1.649 | 0.320 | 0.399 | 2.272 | 0.155 | 0.090 |
+| StMarysChurch | 3.746 | 0.174 | 0.269 | 5.158 | 0.081 | -0.058 |
+
+Conclusion:
+
+- This fully verifies the simple descriptor route and it is negative across
+  the public Cambridge reference-pose protocol.
+- Therefore the expert condition "3/5 scenes show nontrivial improvement" is
+  **not satisfied** by pooled query-student descriptors.
+- The next public-scene path must use patch-level localizability evidence or a
+  learned reference-pose scorer.  Reusing the OldHospital query feature as a
+  global average descriptor is not a viable paper claim.
+
+Polarity diagnostic:
+
+- Negating query-student cosine improves GreatCourt, KingsCollege, and
+  StMarysChurch relative to the raw cosine, but still does not produce a clean
+  3/5-scene positive over retrieval order.  This suggests the descriptor has
+  scene-dependent anti-correlation artifacts rather than a stable global
+  localizability signal.
+
+## 2026-05-22 Patch-Level Reference-Pose Scoring
+
+Implemented compact patch descriptor scoring:
+
+```text
+feature_extract/localizability/reference_pose_scoring.py
+  patch_descriptors_from_dense_feature
+  save_patch_descriptor_bank / load_patch_descriptor_bank
+  score_reference_pose_patch_descriptors
+
+feature_extract/tools/export_query_student_descriptors.py
+  --patch-output-path
+  --patch-grid-hw
+
+feature_extract/tools/eval_reference_pose_feature_ranking.py
+  --score-mode patch_feature
+```
+
+The patch descriptor is a 4x4 grid of normalized local descriptors.  Candidate
+score is mutual top-k patch similarity, so it is less destructive than global
+average pooling while staying compact enough for five Cambridge scenes.
+
+Five-scene query-student patch4 result:
+
+| scene | retrieval pred | retrieval top1 | retrieval Spearman | global pred | global top1 | patch pred | patch top1 | patch Spearman |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| GreatCourt | 14.089 | 0.121 | 0.166 | 18.441 | 0.071 | 17.772 | 0.076 | -0.101 |
+| KingsCollege | 3.444 | 0.149 | 0.321 | 5.208 | 0.067 | 4.965 | 0.082 | -0.106 |
+| OldHospital | 4.186 | 0.181 | 0.316 | 5.195 | 0.093 | 5.040 | 0.115 | 0.067 |
+| ShopFacade | 1.649 | 0.320 | 0.399 | 2.272 | 0.155 | 2.427 | 0.155 | 0.079 |
+| StMarysChurch | 3.746 | 0.174 | 0.269 | 5.158 | 0.081 | 4.686 | 0.108 | 0.004 |
+
+Conclusion:
+
+- Patch-level evidence is a little better than global average pooling on four
+  scenes, but it still does not beat retrieval order on any scene.
+- This verifies the expert concern: simply reusing the OldHospital-trained
+  query-student feature as an image-level public reference scorer is not a
+  viable route, even with patch-level mutual matching.
+- The next public benchmark path must train a reference-pose localizability
+  scorer with geometric pose-distance labels, or use rendered-map hypothesis
+  evidence.  Off-the-shelf pooled/patch query-student similarity should remain
+  a negative baseline.
 
 ## 2026-05-21 Q50 Calibrator Stability Check
 
@@ -736,6 +825,166 @@ Conclusion:
   q50 train cache by **mining candidates that the frozen scorer scores highly**
   from a larger random/jittered candidate pool, then train against those mined
   candidates.
+
+## 2026-05-22 Score-Hard Candidate Cache Interface
+
+Implemented a score-hard cache selector:
+
+```text
+feature_extract/tools/select_score_hard_candidate_cache.py
+```
+
+It consumes:
+
+```text
+1. a pose candidate cache with pose_init_candidates;
+2. a candidate_table.jsonl produced by the frozen/validated scorer;
+```
+
+and writes a compact training cache containing:
+
+```text
+oracle candidate + score-high wrong candidates with cost >= oracle + gap.
+```
+
+This is the missing bridge for the expert-recommended loop:
+
+```text
+large randomized q50 pool
+  -> frozen scorer evaluates all candidates
+  -> select score-high wrong candidates
+  -> train rank/hard-negative score surface
+```
+
+Validation on the existing top25 near-init train table:
+
+```text
+input cache:
+  oldhospital_local_lattice_renderloftr_q50cm10deg_top16_plus_nearinit9_train256_shuf20260521.npz
+candidate table:
+  pofd_fs_scoretable_pose_adapter_pairmatcher_r16_q50_train_aug_nearinit25_top25_20260521/candidate_table.jsonl
+output:
+  oldhospital_q50_train_scorehard_oracle1_hard3_from_top25_20260522.npz
+shape:
+  96 x 4 candidates
+valid fraction:
+  1.0
+```
+
+Short pair-matcher training with this oracle+hard3 cache:
+
+| train cache | steps | val pred | val top1 | val gap | val Spearman | conclusion |
+|---|---:|---:|---:|---:|---:|---|
+| top25 oracle+hard3 | 40 | 0.2227 | 0.7188 | 0.0933 | 0.584 | no improvement |
+
+Interpretation:
+
+- The interface works, but the current top25 near-init pool still does not
+  contain the validation-style score-hard near-identity traps needed to move
+  q50.
+- This confirms the previous diagnosis: the next q50 experiment must generate
+  a **larger randomized/jittered candidate pool**, score all candidates with
+  the frozen pair-matcher, then run this selector.  Compressing the existing
+  top25 pool is not sufficient.
+
+## 2026-05-21 Solver Handoff Real Pose Evaluation
+
+Implemented a reusable report path:
+
+```text
+feature_extract/localizability/pose_cache_report.py
+feature_extract/tools/report_solver_handoff_localization.py
+```
+
+Purpose:
+
+- Convert POFD-FS ranking outputs into standard pose-init/refined caches.
+- Compare those caches with ordinary localization outputs on the exact same
+  query subset.
+- Report real pose error after a fixed, no-training solver handoff instead of
+  only ranking/self-evaluation metrics.
+
+No-training solver used here:
+
+```text
+selected pose/init
+  -> render RGB/depth from frozen DCFF/3DGS map
+  -> LoFTR correspondences
+  -> PnP/RANSAC pose
+```
+
+This is a practical render-RGB solver-handoff baseline in the same family of
+training-free render-and-match refiners.  It is not claimed as GS-SMC; GS-SMC
+can be added later as a second external solver baseline if needed.
+
+OldHospital q50 val128 subset, same 128 query images:
+
+| Method | rot median | trans median | trans mean | R@1deg/100mm | R@5deg/250mm | solver success |
+|---|---:|---:|---:|---:|---:|---:|
+| POFD-rank top1 init | 2.500deg | 125.0mm | 217.6mm | 0.0 | 73.4 | - |
+| POFD top4 PnP-quality init | 2.500deg | 125.0mm | 294.6mm | 0.0 | 54.7 | - |
+| POFD oracle top8 init | 2.500deg | 125.0mm | 125.0mm | 0.0 | 100.0 | - |
+| POFD-rank top1 + render-LoFTR-PnP | 0.188deg | 146.0mm | 219.0mm | 24.2 | 72.7 | 100.0% |
+| POFD top4 PnP-quality + render-LoFTR-PnP | 0.190deg | 146.0mm | 218.7mm | 20.3 | 75.8 | 100.0% |
+| POFD oracle top8 + render-LoFTR-PnP | 0.187deg | 143.7mm | 207.1mm | 23.4 | 75.0 | 100.0% |
+| HLoc SP+SG | 0.274deg | 124.0mm | 254.2mm | 37.5 | 65.6 | - |
+| HLoc + render-LoFTR-PnP | 0.205deg | 157.6mm | 228.2mm | 35.9 | 68.0 | 100.0% |
+| NetVLAD top5 + render-LoFTR-PnP | 0.299deg | 173.8mm | 359.1mm | 35.2 | 62.5 | - |
+
+Artifacts:
+
+```text
+result/result/feature_extract/pofd_fs_solver_handoff_report_20260521/summary_tool.json
+result/result/feature_extract/pofd_fs_solver_handoff_report_20260521/report_tool.md
+```
+
+Key conclusion:
+
+- POFD-FS ranking is now connected to a real no-training localization solver.
+- The render-LoFTR-PnP handoff greatly improves rotation
+  (`2.50deg -> 0.19deg`) but does not improve median translation on q50
+  (`125mm -> 146mm` for POFD top1).
+- Even oracle top8 followed by the same solver lands at `143.7mm`, so the
+  current no-training render-LoFTR-PnP solver is itself a limiting factor for
+  translation on this controlled q50 setup.
+- Against ordinary localization on the same subset, POFD+solver is comparable
+  to HLoc in rotation and mean translation, but HLoc still has better
+  `R@1deg/100mm`; therefore POFD-FS should still be presented as a
+  hypothesis-ranking / candidate-selection feature, not as a finished SOTA
+  localization pipeline.
+
+Basin definition update:
+
+- Ranking-only basin remains a proxy, e.g. candidate within
+  `25cm / 10deg`, for feature localizability analysis.
+- Solver-conditioned basin must be reported against the fixed downstream
+  solver: a selected hypothesis is useful only if the solver handoff reaches
+  the final pose threshold.  Future tables should report both
+  candidate-basin recall and final solver pose accuracy.
+
+## 2026-05-21 Risk-Coverage / Failure Prediction
+
+Implemented candidate-table risk coverage:
+
+```text
+feature_extract/localizability/risk_report.py
+feature_extract/tools/report_candidate_risk_coverage.py
+```
+
+OldHospital q50 val128, POFD-FS top1 selected pose:
+
+| confidence | risk-coverage AUC | risk@25% coverage | risk@50% coverage | risk@100% coverage |
+|---|---:|---:|---:|---:|
+| top1 score margin | 0.158 | 0.094 | 0.172 | 0.258 |
+| raw top1 score | 0.206 | 0.219 | 0.156 | 0.258 |
+
+Interpretation:
+
+- Top1 score margin is a useful failure-prediction signal: the most confident
+  25% of q50 predictions have only 9.4% failure under the 25cm/10deg proxy,
+  compared with 25.8% failure over all predictions.
+- This supports a real-init stress claim around risk coverage / failure
+  prediction, but it is not a replacement for improving final pose accuracy.
 
 ## Next Mainline Steps
 
