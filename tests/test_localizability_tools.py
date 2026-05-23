@@ -1,4 +1,5 @@
 import json
+import argparse
 import sys
 from pathlib import Path
 
@@ -18,8 +19,17 @@ from feature_extract.localizability.failure_replay import (
     load_failure_replay_rows,
 )
 from feature_extract.localizability.handoff_cache import export_selected_init_cache
+from feature_extract.localizability.pose_cache_report import (
+    query_names_from_candidate_table,
+    summarize_pose_candidate_cache_geometry,
+)
 from feature_extract.tools.report_localizability import format_markdown_table, summarize_jsonl
-from feature_extract.tools.eval_feature_track_mapability import project_points_to_image, sample_feature_at_pixels
+from feature_extract.tools.eval_feature_track_mapability import (
+    lookup_point_xyz,
+    project_points_to_image,
+    sample_feature_at_pixels,
+)
+from feature_extract.tools.train_localizability_selector_stream import _build_selector_stream_scorer
 from feature_extract.tools.augment_pose_candidate_cache import (
     append_near_identity_candidate_arrays,
     build_near_identity_pose_candidates,
@@ -37,6 +47,7 @@ from feature_extract.tools.export_query_student_descriptors import (
 )
 from feature_extract.tools.select_score_hard_candidate_cache import select_score_hard_candidate_arrays
 from feature_extract.tools.select_score_hard_candidate_cache import parse_args as parse_score_hard_candidate_args
+from feature_extract.tools.shuffle_pose_candidate_cache import permute_pose_candidate_cache_arrays
 from feature_extract.tools.train_localizability_score_calibrator import (
     _row_with_selection_eligibility,
     _selection_eligible,
@@ -255,6 +266,89 @@ def test_append_near_identity_candidate_arrays_extends_candidate_axis():
     assert np.allclose(augmented["retrieval_scores_candidates"][:, 1], cache["retrieval_scores"])
     assert metadata["num_existing_candidates"] == 1
     assert metadata["num_added_candidates"] == 3
+
+
+def test_summarize_pose_candidate_cache_geometry_reports_oracle_basin(tmp_path):
+    cache_path = tmp_path / "toy_candidates.npz"
+    candidates = np.tile(np.eye(4, dtype=np.float32), (2, 3, 1, 1))
+    candidates[0, 0, 0, 3] = 0.40
+    candidates[0, 1, 0, 3] = 0.10
+    candidates[0, 2, 0, 3] = 0.60
+    candidates[1, 0, 0, 3] = 0.30
+    candidates[1, 1, 0, 3] = 0.35
+    candidates[1, 2, 0, 3] = 0.05
+    np.savez(
+        cache_path,
+        query_image_names=np.array(["q0.png", "q1.png"]),
+        pose_init_candidates=candidates,
+        candidate_valid_mask=np.ones((2, 3), dtype=bool),
+    )
+
+    report = summarize_pose_candidate_cache_geometry(
+        cache_path=cache_path,
+        label="toy",
+        gt_poses_by_name={"q0.png": np.eye(4, dtype=np.float32), "q1.png": np.eye(4, dtype=np.float32)},
+        basin_trans_m=0.25,
+        basin_rot_deg=10.0,
+        topk=(1, 2, 3),
+    )
+
+    assert report["num_samples"] == 2
+    assert report["num_candidates"] == 3
+    assert report["basin_recall_by_order"]["@1"] == pytest.approx(0.0)
+    assert report["basin_recall_by_order"]["@2"] == pytest.approx(0.5)
+    assert report["basin_recall_by_order"]["@3"] == pytest.approx(1.0)
+    assert report["oracle"]["trans_m_quantiles"]["q50"] == pytest.approx(0.075)
+
+
+def test_permute_pose_candidate_cache_arrays_keeps_candidate_metadata_aligned():
+    poses = np.zeros((2, 4, 4, 4), dtype=np.float32)
+    for row in range(2):
+        for cand in range(4):
+            poses[row, cand] = np.eye(4, dtype=np.float32)
+            poses[row, cand, 0, 3] = row * 10 + cand
+    cache = {
+        "query_image_names": np.array(["q0.png", "q1.png"]),
+        "pose_init_candidates": poses,
+        "candidate_valid_mask": np.array([[True, False, True, True], [True, True, False, True]]),
+        "retrieval_scores_candidates": np.array([[0.0, 0.1, 0.2, 0.3], [1.0, 1.1, 1.2, 1.3]], dtype=np.float32),
+        "retrieval_image_names_candidates": np.array([["a", "b", "c", "d"], ["e", "f", "g", "h"]]),
+        "pose_inits": np.tile(np.eye(4, dtype=np.float32), (2, 1, 1)),
+    }
+    permutations = np.array([[2, 0, 3, 1], [3, 1, 0, 2]], dtype=np.int64)
+
+    shuffled, metadata = permute_pose_candidate_cache_arrays(cache, permutations=permutations, seed=123)
+
+    assert np.allclose(shuffled["pose_init_candidates"][0, :, 0, 3], [2, 0, 3, 1])
+    assert np.allclose(shuffled["pose_init_candidates"][1, :, 0, 3], [13, 11, 10, 12])
+    assert shuffled["candidate_valid_mask"].tolist() == [[True, True, True, False], [True, True, True, False]]
+    assert np.allclose(shuffled["retrieval_scores_candidates"], [[0.2, 0.0, 0.3, 0.1], [1.3, 1.1, 1.0, 1.2]])
+    assert shuffled["retrieval_image_names_candidates"].tolist() == [["c", "a", "d", "b"], ["h", "f", "e", "g"]]
+    assert shuffled["candidate_permutation"].tolist() == permutations.tolist()
+    assert metadata["num_rows"] == 2
+    assert metadata["num_candidates"] == 4
+    assert metadata["seed"] == 123
+
+
+def test_permute_pose_candidate_cache_arrays_balances_generated_candidate_positions():
+    poses = np.zeros((8, 4, 4, 4), dtype=np.float32)
+    old_permutation = np.tile(np.array([10, 11, 12, 13], dtype=np.int64), (8, 1))
+    cache = {
+        "pose_init_candidates": poses,
+        "candidate_valid_mask": np.ones((8, 4), dtype=bool),
+        "candidate_permutation": old_permutation,
+    }
+
+    shuffled, metadata = permute_pose_candidate_cache_arrays(cache, seed=5)
+    permutation = shuffled["candidate_permutation"]
+
+    assert metadata["shuffle_mode"] == "balanced_cyclic_random_base"
+    counts = np.zeros((4, 4), dtype=np.int64)
+    for row in permutation:
+        for rank, old_idx in enumerate(row - 10):
+            counts[rank, old_idx] += 1
+    assert counts.min() == counts.max()
+    assert np.all(np.sort(permutation, axis=1) == old_permutation)
 
 
 def test_argparse_boolean_optional_compat_supports_no_include_flags(monkeypatch):
@@ -722,3 +816,54 @@ def test_project_points_to_image_keeps_points_in_front_and_inside():
 
     assert valid.tolist() == [True, False, False]
     assert torch.allclose(xy[0], torch.tensor([5.0, 5.0]))
+
+
+def test_lookup_point_xyz_aligns_observation_tracks_to_colmap_points():
+    point_ids = torch.tensor([10, 42, 99])
+    point_xyz = torch.tensor([[1.0, 0.0, 0.0], [4.0, 2.0, 1.0], [9.0, 9.0, 9.0]])
+    obs_point_ids = torch.tensor([42, 10, 42])
+
+    xyz = lookup_point_xyz(point_ids, point_xyz, obs_point_ids)
+
+    assert torch.allclose(xyz, torch.tensor([[4.0, 2.0, 1.0], [1.0, 0.0, 0.0], [4.0, 2.0, 1.0]]))
+
+
+def test_query_names_from_candidate_table_deduplicates_in_order(tmp_path):
+    table = tmp_path / "hard_case.jsonl"
+    table.write_text(
+        "\n".join(
+            [
+                json.dumps({"sample_name": "a", "candidate_idx": 0}),
+                json.dumps({"sample_name": "a", "candidate_idx": 1}),
+                json.dumps({"sample_name": "b", "candidate_idx": 0}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert query_names_from_candidate_table(table) == ["a", "b"]
+
+
+def test_selector_stream_pair_matcher_mode_requires_loaded_pair_matcher():
+    args = argparse.Namespace(
+        score_mode="pair_matcher_local",
+        score_radius=16,
+        score_temperature=0.04,
+        pair_matcher_stride=4,
+        pair_matcher_chunk_points=256,
+        pair_matcher_candidate_chunk_size=1,
+        pair_matcher_offset_chunk_size=32,
+        pair_matcher_candidate_score_mode="center_logprob_margin",
+        pair_matcher_score_channel=0,
+    )
+
+    with pytest.raises(ValueError, match="requires --pose-adapter-checkpoint"):
+        _build_selector_stream_scorer(args, pair_matcher=None)
+
+    matcher = torch.nn.Identity()
+    scorer = _build_selector_stream_scorer(args, pair_matcher=matcher)
+
+    assert scorer.mode == "pair_matcher_local"
+    assert scorer.pair_matcher is matcher
+    assert scorer.pair_matcher_stride == 4

@@ -25,7 +25,12 @@ from feature_extract.localizability.metrics import ranking_metrics  # noqa: E402
 from feature_extract.localizability.scorer import PoseHypothesisScorer  # noqa: E402
 from feature_extract.localizability.selector import LocalizationFeatureSelector  # noqa: E402
 from feature_extract.tools.eval_cpr_buckets import build_model_and_data, map_pose_gt_for_batch  # noqa: E402
-from feature_extract.tools.eval_localizability_feature_score import _parse_hw, _resize_feature, _resize_mask  # noqa: E402
+from feature_extract.tools.eval_localizability_feature_score import (  # noqa: E402
+    _load_pose_adapter_bundle,
+    _parse_hw,
+    _resize_feature,
+    _resize_mask,
+)
 from feature_extract.train_impl import (  # noqa: E402
     load_config,
     move_batch_to_device,
@@ -56,6 +61,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", required=True)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--map-checkpoint", default=None)
+    parser.add_argument("--pose-adapter-checkpoint", default=None)
+    parser.add_argument("--pose-adapter-strict", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--train-pose-candidate-cache", required=True)
     parser.add_argument("--eval-pose-candidate-cache", required=True)
     parser.add_argument("--out-dir", required=True)
@@ -89,6 +96,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--score-radius", type=int, default=4)
     parser.add_argument("--score-temperature", type=float, default=0.05)
     parser.add_argument("--score-feature-hw", default="34,60")
+    parser.add_argument("--pair-matcher-stride", type=int, default=4)
+    parser.add_argument("--pair-matcher-chunk-points", type=int, default=1024)
+    parser.add_argument("--pair-matcher-candidate-chunk-size", type=int, default=4)
+    parser.add_argument("--pair-matcher-offset-chunk-size", type=int, default=0)
+    parser.add_argument("--pair-matcher-candidate-score-mode", default="center_logprob_margin")
+    parser.add_argument("--pair-matcher-score-channel", type=int, default=0)
     parser.add_argument("--rot-cost-weight", type=float, default=0.1)
     parser.add_argument("--basin-trans-m", type=float, default=0.25)
     parser.add_argument("--basin-rot-deg", type=float, default=10.0)
@@ -119,6 +132,27 @@ def _set_selector_trainable(selector: LocalizationFeatureSelector, args: argpars
     if not params:
         raise ValueError("No selector parameters are trainable")
     return params
+
+
+def _build_selector_stream_scorer(
+    args: argparse.Namespace,
+    *,
+    pair_matcher: torch.nn.Module | None,
+) -> PoseHypothesisScorer:
+    if str(args.score_mode) == "pair_matcher_local" and pair_matcher is None:
+        raise ValueError("--score-mode=pair_matcher_local requires --pose-adapter-checkpoint with pair_matcher_state_dict")
+    return PoseHypothesisScorer(
+        mode=args.score_mode,
+        radius=int(args.score_radius),
+        temperature=float(args.score_temperature),
+        pair_matcher=pair_matcher,
+        pair_matcher_stride=int(args.pair_matcher_stride),
+        pair_matcher_chunk_points=int(args.pair_matcher_chunk_points),
+        pair_matcher_candidate_chunk_size=int(args.pair_matcher_candidate_chunk_size),
+        pair_matcher_offset_chunk_size=int(args.pair_matcher_offset_chunk_size),
+        pair_matcher_candidate_score_mode=str(args.pair_matcher_candidate_score_mode),
+        pair_matcher_score_channel=int(args.pair_matcher_score_channel),
+    )
 
 
 def _loader_args(args: argparse.Namespace, *, split: str, max_samples: int | None, cache: str) -> argparse.Namespace:
@@ -165,6 +199,7 @@ def _forward_scores(
     batch: dict,
     device: torch.device,
     score_hw: tuple[int, int] | None,
+    return_selected_features: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
     pose_gt = map_pose_gt_for_batch(map_renderer, batch, device)
     candidates = batch["pose_init_candidates"].float()
@@ -202,11 +237,20 @@ def _forward_scores(
     render_z = r_out["z"].reshape(bsz, num_candidates, args.selector_out_dim, height, width)
     scores, aux = scorer(q_out["z"], render_z, query_utility=q_out["utility"], render_valid_mask=render_mask)
     pose_cost, trans_err_m, rot_err_deg = _pose_costs(args, candidates, pose_gt)
-    return scores, pose_cost, trans_err_m, rot_err_deg, batch.get("candidate_valid_mask"), {
+    aux_out = {
         "query_channel_gate": q_out["channel_gate"],
         "query_utility": q_out["utility"],
         **aux,
     }
+    if return_selected_features:
+        aux_out.update(
+            {
+                "query_z": q_out["z"],
+                "render_z": render_z,
+                "render_mask": render_mask,
+            }
+        )
+    return scores, pose_cost, trans_err_m, rot_err_deg, batch.get("candidate_valid_mask"), aux_out
 
 
 def _evaluate(
@@ -273,7 +317,16 @@ def main() -> None:
         out_channels=int(args.selector_out_dim),
         group_size=int(args.selector_group_size),
     ).to(device)
-    scorer = PoseHypothesisScorer(mode=args.score_mode, radius=args.score_radius, temperature=args.score_temperature).to(device)
+    pair_matcher = None
+    if args.pose_adapter_checkpoint:
+        _adapter, pair_matcher, _adapter_args = _load_pose_adapter_bundle(
+            args.pose_adapter_checkpoint,
+            channels=int(args.selector_out_dim),
+            device=device,
+            strict_adapter=bool(args.pose_adapter_strict),
+        )
+        del _adapter, _adapter_args
+    scorer = _build_selector_stream_scorer(args, pair_matcher=pair_matcher).to(device)
     trainable_params = _set_selector_trainable(selector, args)
     optimizer = torch.optim.AdamW(trainable_params, lr=float(args.lr), weight_decay=float(args.weight_decay))
     score_hw = _parse_hw(args.score_feature_hw)

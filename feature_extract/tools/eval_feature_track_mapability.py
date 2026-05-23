@@ -20,6 +20,11 @@ from feature_extract.localizability.mapability import (  # noqa: E402
     observation_track_feature_variance,
 )
 from feature_extract.localizability.reference_pose_scoring import find_feature_path  # noqa: E402
+from feature_extract.localizability.selected_feature_map import (  # noqa: E402
+    aggregate_selected_track_features,
+    save_selected_track_feature_bank,
+)
+from feature_extract.localizability.selector import LocalizationFeatureSelector  # noqa: E402
 
 
 @dataclass
@@ -47,6 +52,26 @@ def read_colmap_points3d_xyz(path: str | Path) -> tuple[torch.Tensor, torch.Tens
             point_ids.append(int(point_id))
             xyzs.append((float(xyz[0]), float(xyz[1]), float(xyz[2])))
     return torch.as_tensor(point_ids, dtype=torch.long), torch.as_tensor(xyzs, dtype=torch.float32)
+
+
+def lookup_point_xyz(point_ids: torch.Tensor, point_xyz: torch.Tensor, obs_point_ids: torch.Tensor) -> torch.Tensor:
+    """Return XYZ rows aligned to observed COLMAP point3D ids."""
+    if point_ids.ndim != 1:
+        raise ValueError("point_ids must have shape (N,)")
+    if point_xyz.ndim != 2 or point_xyz.shape[1] != 3 or point_xyz.shape[0] != point_ids.numel():
+        raise ValueError("point_xyz must have shape (N,3) matching point_ids")
+    obs_ids = obs_point_ids.long().view(-1)
+    order = torch.argsort(point_ids.long())
+    sorted_ids = point_ids.long().index_select(0, order)
+    positions = torch.searchsorted(sorted_ids, obs_ids)
+    in_bounds = positions < sorted_ids.numel()
+    matched = torch.zeros_like(in_bounds)
+    if in_bounds.any():
+        matched[in_bounds] = sorted_ids.index_select(0, positions[in_bounds]) == obs_ids[in_bounds]
+    if not bool(matched.all().item()):
+        missing = obs_ids[~matched][:8].detach().cpu().tolist()
+        raise KeyError(f"Observed point3D ids are missing from points3D.bin: {missing}")
+    return point_xyz.float().index_select(0, order.index_select(0, positions))
 
 
 def read_colmap_image_track_observations(path: str | Path) -> dict[int, ImageTrackObservations]:
@@ -104,6 +129,44 @@ def sample_feature_at_pixels(
     fx = torch.round(x / float(image_width - 1) * float(width - 1)).long().clamp(0, width - 1)
     fy = torch.round(y / float(image_height - 1) * float(height - 1)).long().clamp(0, height - 1)
     return feature.float().reshape(channels, height, width)[:, fy, fx].transpose(0, 1).contiguous()
+
+
+def _safe_torch_load(path: str | Path):
+    try:
+        return torch.load(path, map_location="cpu", weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+    except Exception as exc:
+        if "Weights only load failed" not in str(exc):
+            raise
+        return torch.load(path, map_location="cpu")
+
+
+def _extract_selector_state(checkpoint) -> dict:
+    if isinstance(checkpoint, dict):
+        if "selector_state_dict" in checkpoint:
+            return checkpoint["selector_state_dict"]
+        if "state_dict" in checkpoint:
+            return checkpoint["state_dict"]
+    if isinstance(checkpoint, dict) and all(torch.is_tensor(value) for value in checkpoint.values()):
+        return checkpoint
+    raise ValueError("selector checkpoint must contain selector_state_dict or state_dict")
+
+
+def _load_selector_for_feature(args: argparse.Namespace, in_channels: int) -> LocalizationFeatureSelector:
+    state = _extract_selector_state(_safe_torch_load(args.selector_checkpoint))
+    selector = LocalizationFeatureSelector(
+        in_channels=int(in_channels),
+        out_channels=int(args.selector_out_channels),
+        group_size=int(args.selector_group_size),
+        hidden_dim=int(args.selector_hidden_dim),
+        spatial_utility=any(str(key).startswith("utility_head.") for key in state),
+        uncertainty=any(str(key).startswith("uncertainty_head.") for key in state),
+    )
+    selector.load_state_dict(state)
+    selector.to(torch.device(args.selector_device))
+    selector.eval()
+    return selector
 
 
 def project_points_to_image(
@@ -164,6 +227,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-images", type=int, default=80)
     parser.add_argument("--max-points-per-image", type=int, default=512)
     parser.add_argument("--min-track-observations", type=int, default=2)
+    parser.add_argument("--selector-checkpoint", default=None)
+    parser.add_argument("--selector-out-channels", type=int, default=64)
+    parser.add_argument("--selector-group-size", type=int, default=8)
+    parser.add_argument("--selector-hidden-dim", type=int, default=128)
+    parser.add_argument("--selector-device", default="cpu")
+    parser.add_argument("--selected-bank-out", default=None)
     return parser.parse_args()
 
 
@@ -177,8 +246,11 @@ def main() -> None:
     use_projection_fallback = all(obs.xy.shape[0] == 0 for obs in observations.values())
     all_features: list[torch.Tensor] = []
     all_track_ids: list[torch.Tensor] = []
+    all_xyz: list[torch.Tensor] = []
+    all_utilities: list[torch.Tensor] = []
     used_images = 0
     missing_features = 0
+    selector: LocalizationFeatureSelector | None = None
     for image_id, image_obs in sorted(observations.items()):
         if used_images >= int(args.max_images):
             break
@@ -186,10 +258,17 @@ def main() -> None:
         if feature_path is None:
             missing_features += 1
             continue
-        try:
-            feature = torch.load(feature_path, map_location="cpu", weights_only=True)
-        except TypeError:
-            feature = torch.load(feature_path, map_location="cpu")
+        feature = _safe_torch_load(feature_path)
+        feature = feature.float()
+        feature_for_sampling = feature
+        utility_for_sampling = None
+        if args.selector_checkpoint:
+            if selector is None:
+                selector = _load_selector_for_feature(args, int(feature.shape[0]))
+            with torch.no_grad():
+                selected = selector(feature.to(torch.device(args.selector_device))[None])
+            feature_for_sampling = selected["z"][0].detach().cpu()
+            utility_for_sampling = selected["utility"][0].detach().cpu()
         if use_projection_fallback:
             meta = images_meta[int(image_id)]
             w2c = torch.as_tensor(colmap_to_w2c(meta.qvec, meta.tvec), dtype=torch.float32)
@@ -216,26 +295,50 @@ def main() -> None:
             order = torch.linspace(0, xy.shape[0] - 1, steps=int(args.max_points_per_image)).round().long()
             xy = xy[order]
             obs_point_ids = obs_point_ids[order]
+        obs_xyz = lookup_point_xyz(point_ids, point_xyz, obs_point_ids)
         camera = cameras[int(image_obs.camera_id)]
         sampled = sample_feature_at_pixels(
-            feature,
+            feature_for_sampling,
             xy,
             image_width=int(camera.width),
             image_height=int(camera.height),
         )
         all_features.append(sampled)
         all_track_ids.append(obs_point_ids)
+        all_xyz.append(obs_xyz)
+        if utility_for_sampling is not None:
+            sampled_utility = sample_feature_at_pixels(
+                utility_for_sampling,
+                xy,
+                image_width=int(camera.width),
+                image_height=int(camera.height),
+            ).reshape(-1)
+            all_utilities.append(sampled_utility)
         used_images += 1
 
     if all_features:
         features = torch.cat(all_features, dim=0)
         track_ids = torch.cat(all_track_ids, dim=0)
+        xyz = torch.cat(all_xyz, dim=0)
+        utilities = torch.cat(all_utilities, dim=0) if all_utilities else None
         unique_ids, counts = torch.unique(track_ids, return_counts=True)
         keep_ids = unique_ids[counts >= int(args.min_track_observations)]
         keep = torch.isin(track_ids, keep_ids)
         variance, stats = observation_track_feature_variance(features, track_ids, valid_mask=keep)
         separability, separability_stats = observation_track_feature_separability(features, track_ids, valid_mask=keep)
         feature_dim = int(features.shape[1])
+        selected_bank = (
+            aggregate_selected_track_features(
+                features,
+                track_ids,
+                utility=utilities,
+                geometry_valid=keep,
+                xyz=xyz,
+                min_observations=int(args.min_track_observations),
+            )
+            if args.selected_bank_out
+            else None
+        )
     else:
         variance = torch.tensor(0.0)
         stats = {"num_tracks": torch.tensor(0.0), "num_observations": torch.tensor(0.0)}
@@ -246,10 +349,12 @@ def main() -> None:
         }
         feature_dim = 0
         keep = torch.zeros(0, dtype=torch.bool)
+        selected_bank = None
     summary = {
         "colmap_dir": str(colmap_dir),
         "feature_root": str(args.feature_root),
         "feature_subdir": str(args.feature_subdir),
+        "selector_checkpoint": str(args.selector_checkpoint) if args.selector_checkpoint else None,
         "used_images": int(used_images),
         "missing_features": int(missing_features),
         "projection_fallback": bool(use_projection_fallback),
@@ -263,6 +368,25 @@ def main() -> None:
         "track_separability_ratio": float(separability.item()),
         "mapability_valid": bool((int(keep.sum().item()) if all_features else 0) > 0 and float(stats["num_tracks"].item()) > 0.0),
     }
+    if selected_bank is not None:
+        save_selected_track_feature_bank(
+            selected_bank,
+            args.selected_bank_out,
+            metadata={
+                "colmap_dir": str(colmap_dir),
+                "feature_root": str(args.feature_root),
+                "feature_subdir": str(args.feature_subdir),
+                "selector_checkpoint": str(args.selector_checkpoint) if args.selector_checkpoint else None,
+                "min_track_observations": int(args.min_track_observations),
+            },
+        )
+        summary["selected_bank_out"] = str(args.selected_bank_out)
+        summary["selected_bank_num_tracks"] = int(selected_bank.track_ids.numel())
+        summary["selected_bank_feature_dim"] = int(selected_bank.features.shape[1]) if selected_bank.features.ndim == 2 else 0
+        summary["selected_bank_has_xyz"] = bool(selected_bank.xyz is not None)
+        summary["selected_bank_mean_track_variance"] = (
+            float(selected_bank.feature_variance.mean().item()) if selected_bank.feature_variance.numel() else 0.0
+        )
     out_path = Path(args.out_json)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")

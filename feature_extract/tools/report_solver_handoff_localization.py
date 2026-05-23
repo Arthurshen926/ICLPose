@@ -16,6 +16,7 @@ from data.radio_loc_retrieval_dataset import list_colmap_split_samples  # noqa: 
 from feature_extract.localizability.pose_cache_report import (  # noqa: E402
     build_pose_cache_comparison,
     pose_cache_comparison_to_markdown,
+    query_names_from_candidate_table,
     query_names_from_cache,
 )
 
@@ -32,6 +33,11 @@ def parse_args() -> argparse.Namespace:
         "--reference-cache",
         default=None,
         help="Optional cache whose query order defines the comparison subset.",
+    )
+    parser.add_argument(
+        "--query-table",
+        default=None,
+        help="Optional candidate-table JSONL whose unique sample_name order defines the comparison subset.",
     )
     parser.add_argument("--colmap-dir", required=True)
     parser.add_argument("--query-split", required=True)
@@ -59,7 +65,12 @@ def main() -> None:
         str(sample["image_name"]): np.asarray(sample["pose_w2c"], dtype=np.float32)
         for sample in samples
     }
-    query_names = query_names_from_cache(args.reference_cache) if args.reference_cache else None
+    if args.reference_cache and args.query_table:
+        raise ValueError("--reference-cache and --query-table are mutually exclusive")
+    if args.query_table:
+        query_names = query_names_from_candidate_table(args.query_table)
+    else:
+        query_names = query_names_from_cache(args.reference_cache) if args.reference_cache else None
     caches = [_parse_cache_spec(spec) for spec in args.cache]
     report = build_pose_cache_comparison(
         caches=caches,
@@ -70,6 +81,7 @@ def main() -> None:
     report["colmap_dir"] = str(args.colmap_dir)
     report["query_split"] = str(args.query_split)
     report["reference_cache"] = str(args.reference_cache) if args.reference_cache else None
+    report["query_table"] = str(args.query_table) if args.query_table else None
 
     output_json = Path(args.output_json)
     output_json.parent.mkdir(parents=True, exist_ok=True)
