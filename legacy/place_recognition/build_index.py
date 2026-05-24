@@ -1,1 +1,0 @@
-../feature_retrieval/retrievers/build_index.py

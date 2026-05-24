@@ -1,1 +1,0 @@
-../feature_extract/extractors/extractor_sd.py

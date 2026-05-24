@@ -1,0 +1,33 @@
+protocol:
+  name: hard_case_handoff
+  kind: real_retrieval
+  split: test
+  candidate_generator: fixed_retrieval_top50
+  candidate_uses_gt: false
+  solver_conditioned: false
+  allowed_training_inputs:
+    - query_tokens
+    - rendered_selected_map_features
+    - visibility
+    - geometry_validity
+    - candidate_prior
+hard_cases:
+  - retrieval_top1_wrong_topk_good
+  - repeated_structure
+  - weak_texture
+  - photometric_ambiguity
+  - near_identity_false_positive
+  - high_pnp_inlier_wrong_pose
+handoff:
+  fixed_solvers:
+    - hloc_sp_sg
+    - pnp_ransac_lm
+    - render_loftr_fixed
+    - photometric_alignment_fixed
+  report_identity_verifier_top1: true
+metrics:
+  - hard_false_accept_rate
+  - hard_top1_acc
+  - hard_basin_recall_at_5
+  - catastrophic_failure_rate
+  - risk_coverage_auc

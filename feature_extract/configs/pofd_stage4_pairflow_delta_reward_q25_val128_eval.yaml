@@ -1,8 +1,0 @@
-# Eval-only POFD Stage4 q25 controlled-basin check with correction reward.
-
-base_config: /root/ICLPose/feature_extract/configs/pofd_stage4_single_render_q25_val128_eval.yaml
-exp_name: pofd_stage4_pairflow_delta_reward_q25_val128_eval
-
-nvs_pose_feature_adapter:
-  candidate_delta_trans_score_reward: 2.0
-

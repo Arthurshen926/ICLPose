@@ -1,9 +1,0 @@
-base_config: joint_radio_dcff_cambridge_oldhospital_processed_adaptive_v7_stagea_locaware_flowhead_v73_directloc_maponly_projected.yaml
-exp_name: joint_radio_dcff_cambridge_oldhospital_processed_adaptive_v7_stagea_locaware_flowhead_v74_directloc_maponly_softdistill
-
-training:
-  seed: 787
-
-map_supervision:
-  query_projected_fine_weight: 6.0
-  query_identity_corr_distill_weight: 2.0

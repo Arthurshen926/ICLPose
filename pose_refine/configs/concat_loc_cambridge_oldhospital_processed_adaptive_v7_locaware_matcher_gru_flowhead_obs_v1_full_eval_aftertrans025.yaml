@@ -1,9 +1,0 @@
-base_config: concat_loc_cambridge_oldhospital_processed_adaptive_v7_locaware_matcher_gru_flowhead_obs_v1_full_eval.yaml
-exp_name: concat_loc_cambridge_oldhospital_processed_adaptive_v7_locaware_matcher_gru_flowhead_obs_v1_full_eval_aftertrans025
-
-model:
-  pose_update_scale: 1.0
-  pose_update_trans_scale: 1.0
-  pose_update_rot_scale: 1.0
-  pose_update_trans_scale_after_first: 0.25
-  pose_update_rot_scale_after_first: 1.0

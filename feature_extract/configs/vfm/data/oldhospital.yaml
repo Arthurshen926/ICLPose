@@ -1,0 +1,22 @@
+scene: OldHospital
+dataset_family: CambridgeLandmarks
+image_root: dataset/OldHospital
+map_root: output/maps/OldHospital
+splits:
+  train: dataset/OldHospital/splits/train.txt
+  val: dataset/OldHospital/splits/val.txt
+  test: dataset/OldHospital/splits/test.txt
+raw_vfm_tokens:
+  output_root: output/vfm_tokens/OldHospital
+  models:
+    - name: c-radio_v4-h
+      layers: [final]
+      stride: 16
+      save_summary: true
+    - name: dinov2
+      layers: [final]
+      stride: 14
+      save_summary: false
+normalization:
+  mode: per_layer_l2
+  whitening: optional_unsupervised_train_split_only

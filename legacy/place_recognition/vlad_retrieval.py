@@ -1,1 +1,0 @@
-../feature_retrieval/retrievers/vlad_retrieval.py

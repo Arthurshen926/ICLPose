@@ -1,1 +1,0 @@
-"""SceneFeatureField evaluation package."""

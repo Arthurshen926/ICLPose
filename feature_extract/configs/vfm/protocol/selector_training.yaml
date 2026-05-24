@@ -1,0 +1,34 @@
+protocol:
+  name: selector_training
+  kind: reference_pose
+  split: train
+  candidate_generator: fixed_reference_pose_candidates
+  candidate_uses_gt: false
+  solver_conditioned: false
+  allowed_training_inputs:
+    - query_tokens
+    - candidate_tokens
+    - candidate_prior
+selector:
+  input_models:
+    - c-radio_v4-h
+    - dinov2
+  output_dim: 64
+  group_size: 16
+  heads:
+    spatial_utility: true
+    uncertainty: true
+losses:
+  track_consistency: 1.0
+  hard_negative_contrast: 1.0
+  listwise_pose_rank: 1.0
+  basin_bce: 0.5
+  sparsity: 0.02
+  calibration: 0.1
+training:
+  seeds: [0, 1, 2, 3, 4]
+  batch_size: auto_max_gpu
+  precision: bf16
+  checkpoint_gate:
+    spearman_min: 0.55
+    oracle_gap_m_max: 0.09

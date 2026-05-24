@@ -1,1 +1,0 @@
-"""FeatureRetrieval evaluation package."""

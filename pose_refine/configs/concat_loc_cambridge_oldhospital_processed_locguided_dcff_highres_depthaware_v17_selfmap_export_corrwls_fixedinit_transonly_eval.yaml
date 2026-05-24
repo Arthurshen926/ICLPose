@@ -1,9 +1,0 @@
-base_config: concat_loc_cambridge_oldhospital_processed_locguided_dcff_highres_depthaware_v17_selfmap_export_corrwls_probe.yaml
-exp_name: concat_loc_cambridge_oldhospital_processed_locguided_dcff_highres_depthaware_v17_selfmap_export_corrwls_fixedinit_transonly_eval
-
-model:
-  pose_update_scale: 1.0
-  pose_update_trans_scale: 1.0
-  pose_update_rot_scale: 0.0
-  pose_update_trans_scale_after_first: 0.0
-  pose_update_rot_scale_after_first: 0.0

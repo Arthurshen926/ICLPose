@@ -1,9 +1,0 @@
-base_config: joint_radio_dcff_cambridge_oldhospital_processed_pca64_depthaware_v86_batchcandidate_linear_fusion_init_r4_top16_from_v74.yaml
-exp_name: joint_radio_dcff_cambridge_oldhospital_processed_pca64_depthaware_v88_batchcandidate_linear_fusion_soft_r4_top16_from_v74
-
-training:
-  seed: 188
-
-map_supervision:
-  candidate_score_fusion_target_mode: soft
-  candidate_score_fusion_target_temperature_m: 0.25

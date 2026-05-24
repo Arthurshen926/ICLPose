@@ -1,9 +1,0 @@
-base_config: joint_radio_dcff_cambridge_oldhospital_processed_pca64_depthaware_v63_unified_attn_residual_spatial_decoderfix.yaml
-exp_name: joint_radio_dcff_cambridge_oldhospital_processed_pca64_depthaware_v64_unified_attn_residual_spatial_fulltrain
-
-training:
-  seed: 164
-  lr: 8.0e-5
-  max_steps: 3000
-  freeze_model_except_prefixes: null
-

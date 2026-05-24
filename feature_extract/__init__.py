@@ -1,32 +1,8 @@
-"""FeatureExtract system facade."""
+"""Feature extraction package for the VFM-MapLoc mainline.
 
-from feature_extract.joint_radio import (
-    DEFAULT_JOINT_RADIO_CONFIG,
-    JointRADIOQueryDataset,
-    RetrievalTeacherStore,
-    TeacherFeatureStore,
-    build_records_from_feature_ids,
-    build_all_records,
-    load_config,
-    safe_torch_load,
-    sample_name_to_feature_stem,
-    split_records,
-)
-from feature_extract.extractors.fused_feature_extractor import FusedFeatureExtractor
-from feature_extract.students.radio_query_student import RadioQueryStudent
+The active research path is under :mod:`feature_extract.vfm`. Legacy
+RADIO/DCFF/CPR facades were removed from this branch so imports do not
+silently enter the old pipeline.
+"""
 
-
-__all__ = [
-    "DEFAULT_JOINT_RADIO_CONFIG",
-    "FusedFeatureExtractor",
-    "JointRADIOQueryDataset",
-    "RadioQueryStudent",
-    "RetrievalTeacherStore",
-    "TeacherFeatureStore",
-    "build_records_from_feature_ids",
-    "build_all_records",
-    "load_config",
-    "safe_torch_load",
-    "sample_name_to_feature_stem",
-    "split_records",
-]
+__all__ = ["vfm"]

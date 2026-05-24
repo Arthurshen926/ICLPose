@@ -1,8 +1,0 @@
-base_config: joint_radio_dcff_cambridge_oldhospital_processed_pca64_depthaware_v127_top16_initialhard_costreg_contextres_scoreonly_from_v122.yaml
-exp_name: joint_radio_dcff_cambridge_oldhospital_processed_pca64_depthaware_v129_top16_initialhard_costreg_contextres_scoreonly_continue_from_v127
-
-training:
-  seed: 229
-  max_steps: 960
-  freeze_model_except_prefixes:
-    - candidate_score_fusion_head.

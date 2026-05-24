@@ -1,5 +1,0 @@
-base_config: concat_loc_cambridge_oldhospital_processed_adaptive_v7_locaware_matcher_gru_flowhead_obs_v1_probe.yaml
-exp_name: concat_loc_cambridge_oldhospital_processed_adaptive_v7_locaware_matcher_gru_flowhead_obs_v1_full_eval
-
-training:
-  max_val_batches: 0

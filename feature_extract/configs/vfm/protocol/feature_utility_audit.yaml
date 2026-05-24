@@ -1,0 +1,36 @@
+protocol:
+  name: feature_utility_audit
+  kind: controlled_lattice
+  split: val
+  candidate_generator: gt_centered_rendered_pose_lattice
+  candidate_uses_gt: true
+  solver_conditioned: false
+  allowed_training_inputs:
+    - query_tokens
+    - candidate_tokens
+    - rendered_selected_map_features
+    - visibility
+    - geometry_validity
+baselines:
+  - retrieval_order
+  - metadata_only
+  - raw_radio
+  - raw_dinov2
+  - pca_64
+  - random_64
+  - selected_feature
+metrics:
+  - pred_cost_m
+  - oracle_gap_m
+  - top1_acc
+  - spearman
+  - kendall
+  - ndcg_at_10
+  - basin_recall_at_1
+  - basin_recall_at_5
+  - basin_recall_at_10
+promotion_gate:
+  pred_cost_m_max: 0.21
+  top1_acc_min: 0.75
+  oracle_gap_m_max: 0.09
+  spearman_min: 0.55

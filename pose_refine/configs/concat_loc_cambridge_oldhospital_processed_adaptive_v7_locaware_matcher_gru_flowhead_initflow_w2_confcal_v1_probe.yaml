@@ -1,9 +1,0 @@
-base_config: concat_loc_cambridge_oldhospital_processed_adaptive_v7_locaware_matcher_gru_flowhead_obs_v1_probe.yaml
-exp_name: concat_loc_cambridge_oldhospital_processed_adaptive_v7_locaware_matcher_gru_flowhead_initflow_w2_confcal_v1_probe
-
-training:
-  loss:
-    init_flow_weight: 2.0
-    conf_epe_bce_weight: 0.25
-    conf_epe_good_px: 1.0
-    conf_epe_bad_px: 5.0

@@ -1,9 +1,0 @@
-# Same Phase6-A2 candidate-level projector training as w005, with a stronger
-# pose-aware listwise term. Run as a parallel ablation; keep only if selector
-# evidence ranking improves without hurting GT projected alignment.
-
-base_config: /root/ICLPose/feature_extract/configs/cpr_phase6a2_metric_align_candidate_poseaware_sharedproj_w005_b4.yaml
-exp_name: cpr_phase6a2_metric_align_candidate_poseaware_sharedproj_w020_b4
-
-map_supervision:
-  candidate_render_score_weight: 0.20

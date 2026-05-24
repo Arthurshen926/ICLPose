@@ -1,1 +1,0 @@
-../feature_retrieval/retrievers/eval_self_retrieval.py

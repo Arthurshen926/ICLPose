@@ -1,7 +1,0 @@
-# Same vector-only top8 selector with a moderately higher LR.
-
-base_config: /root/ICLPose/feature_extract/configs/cpr_phase6_fine_lattice_selector_025_k8_vector_fullctx_hard_lr2e3_b6_fast.yaml
-exp_name: cpr_phase6_fine_lattice_selector_025_k8_vector_fullctx_hard_lr5e3_b6_fast
-
-training:
-  lr: 0.005

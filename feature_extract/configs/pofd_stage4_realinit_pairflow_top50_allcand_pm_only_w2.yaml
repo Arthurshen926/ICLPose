@@ -1,7 +1,0 @@
-# Same all-candidate real-init pair-flow setup with stronger CE weight.
-
-base_config: /root/ICLPose/feature_extract/configs/pofd_stage4_realinit_pairflow_top50_allcand_pm_only.yaml
-exp_name: pofd_stage4_realinit_pairflow_top50_allcand_pm_only_w2
-
-nvs_pose_feature_adapter:
-  stage4_pair_match_flow_weight: 2.0

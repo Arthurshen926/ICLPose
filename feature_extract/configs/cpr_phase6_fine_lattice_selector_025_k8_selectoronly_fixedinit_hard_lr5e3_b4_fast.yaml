@@ -1,8 +1,0 @@
-# Same fixed-init top8 selector diagnostic with a moderately higher LR for the
-# selector head only.
-
-base_config: /root/ICLPose/feature_extract/configs/cpr_phase6_fine_lattice_selector_025_k8_selectoronly_fixedinit_hard_lr2e3_b4_fast.yaml
-exp_name: cpr_phase6_fine_lattice_selector_025_k8_selectoronly_fixedinit_hard_lr5e3_b4_fast
-
-training:
-  lr: 0.005

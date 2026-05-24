@@ -1,9 +1,0 @@
-# Same real-init top50 single-render pair-flow setup as the base pm-only
-# config, but with stronger offset CE weight to test whether the weak update
-# direction is under-supervised rather than data-limited.
-
-base_config: /root/ICLPose/feature_extract/configs/pofd_stage4_realinit_pairflow_top50_top1_pm_only.yaml
-exp_name: pofd_stage4_realinit_pairflow_top50_top1_pm_only_w2
-
-nvs_pose_feature_adapter:
-  stage4_pair_match_flow_weight: 2.0

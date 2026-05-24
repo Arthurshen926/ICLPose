@@ -1,5 +1,0 @@
-base_config: joint_radio_dcff_cambridge_oldhospital_processed_pca64_depthaware_v44_patchonly_domainadapter_hardpeak_overfit.yaml
-exp_name: joint_radio_dcff_cambridge_oldhospital_processed_pca64_depthaware_v46_hardpeak_softdiag10
-
-training:
-  max_steps: 10

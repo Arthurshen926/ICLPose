@@ -1,9 +1,0 @@
-# 0.25m/5deg K128 selector + projector with stronger dense GT pose-cost regression.
-
-base_config: /root/ICLPose/feature_extract/configs/cpr_phase6_fine_lattice_selector_025_k128_projector_peak_hard_temp005_lr2e3_b2_fast.yaml
-exp_name: cpr_phase6_fine_lattice_selector_025_k128_projector_peak_hard_costreg3_lr2e3_b2_fast
-
-map_supervision:
-  fine_topk_selector_target_mode: gt_pose_error_hard
-  fine_topk_selector_cost_regression_weight: 3.0
-  fine_topk_selector_cost_regression_temperature_m: 0.05

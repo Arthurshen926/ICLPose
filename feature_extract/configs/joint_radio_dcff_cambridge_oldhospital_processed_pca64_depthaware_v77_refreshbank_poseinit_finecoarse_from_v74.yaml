@@ -1,9 +1,0 @@
-base_config: joint_radio_dcff_cambridge_oldhospital_processed_pca64_depthaware_v76_refreshbank_poseinit_coarse_from_v74.yaml
-exp_name: joint_radio_dcff_cambridge_oldhospital_processed_pca64_depthaware_v77_refreshbank_poseinit_finecoarse_from_v74
-
-model:
-  pose_init_feature_source: fine_coarse
-  pose_init_feature_bank_projector: identity
-
-training:
-  seed: 177

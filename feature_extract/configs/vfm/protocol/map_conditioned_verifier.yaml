@@ -1,0 +1,43 @@
+protocol:
+  name: map_conditioned_verifier
+  kind: real_retrieval
+  split: test
+  candidate_generator: fixed_retrieval_topk
+  candidate_uses_gt: false
+  solver_conditioned: false
+  allowed_training_inputs:
+    - query_tokens
+    - rendered_selected_map_features
+    - visibility
+    - geometry_validity
+    - candidate_prior
+map:
+  representation: selected_track_feature_bank
+  min_track_observations: 2
+  store:
+    - mean_feature
+    - variance
+    - observation_count
+    - mean_utility
+verifier:
+  evidence:
+    - selected_feature_similarity
+    - feature_inlier_ratio
+    - visibility_fraction
+    - geometry_consistency
+    - uncertainty
+    - candidate_prior
+controls:
+  - metadata_only
+  - query_feature_shuffle
+  - rendered_map_feature_shuffle
+  - wrong_scene_map_feature
+  - high_utility_channel_removed
+  - low_utility_channel_removed
+metrics:
+  - pred_cost_m
+  - oracle_gap_m
+  - spearman
+  - hard_false_accept_rate
+  - risk_coverage_auc
+  - ece

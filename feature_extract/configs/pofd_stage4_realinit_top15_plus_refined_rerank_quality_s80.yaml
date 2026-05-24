@@ -1,8 +1,0 @@
-# Longer compact external-correspondence reranker probe.
-
-base_config: /root/ICLPose/feature_extract/configs/pofd_stage4_realinit_top15_plus_refined_rerank_quality_s20.yaml
-exp_name: pofd_stage4_realinit_top15_plus_refined_rerank_quality_s80
-
-training:
-  max_steps: 80
-  eval_every: 40

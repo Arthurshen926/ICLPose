@@ -1,1 +1,0 @@
-"""PoseRefine evaluation package."""

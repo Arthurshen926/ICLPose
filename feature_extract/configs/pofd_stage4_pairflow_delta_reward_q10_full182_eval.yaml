@@ -1,8 +1,0 @@
-# Eval-only full OldHospital test split for the q10 correction-magnitude reward.
-
-base_config: /root/ICLPose/feature_extract/configs/pofd_stage4_pairflow_delta_reward_q10_val128_eval.yaml
-exp_name: pofd_stage4_pairflow_delta_reward_q10_full182_eval
-
-dataset:
-  max_val_samples:
-  val_pose_candidate_cache: /root/ICLPose/result/result/feature_extract/pose_init_exports/oldhospital_local_lattice_renderloftr_q10cm2deg_top16_noexact_val182_shuf20260517.npz

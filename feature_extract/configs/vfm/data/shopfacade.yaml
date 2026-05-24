@@ -1,0 +1,22 @@
+scene: ShopFacade
+dataset_family: CambridgeLandmarks
+image_root: dataset/ShopFacade
+map_root: output/maps/ShopFacade
+splits:
+  train: dataset/ShopFacade/splits/train.txt
+  val: dataset/ShopFacade/splits/val.txt
+  test: dataset/ShopFacade/splits/test.txt
+raw_vfm_tokens:
+  output_root: output/vfm_tokens/ShopFacade
+  models:
+    - name: c-radio_v4-h
+      layers: [final]
+      stride: 16
+      save_summary: true
+    - name: dinov2
+      layers: [final]
+      stride: 14
+      save_summary: false
+normalization:
+  mode: per_layer_l2
+  whitening: optional_unsupervised_train_split_only

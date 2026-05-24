@@ -1,7 +1,0 @@
-# 0.25m/5deg K256 selector + trainable local-corr projector using lightweight peak/offset maps.
-
-base_config: /root/ICLPose/feature_extract/configs/cpr_phase6_fine_lattice_selector_025_k256_projector_hard_temp005_lr2e3_b2_fast.yaml
-exp_name: cpr_phase6_fine_lattice_selector_025_k256_projector_peak_hard_temp005_lr2e3_b2_fast
-
-map_supervision:
-  fine_topk_selector_score_map_mode: peak_offset
