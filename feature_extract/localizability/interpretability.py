@@ -62,6 +62,7 @@ def spatial_utility_counterfactual_drop(
     costs: torch.Tensor,
     *,
     drop_fraction: float = 0.2,
+    base_weight: torch.Tensor | None = None,
     valid_mask: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """Compare ranking after masking highest-utility vs lowest-utility pixels."""
@@ -78,9 +79,17 @@ def spatial_utility_counterfactual_drop(
     high_idx = util_flat.topk(drop_count, dim=1, largest=True).indices
     low_idx = util_flat.topk(drop_count, dim=1, largest=False).indices
 
-    base_weight = torch.ones((bsz, num_pixels), device=score_maps.device, dtype=score_maps.dtype)
-    high_weight = base_weight.clone()
-    low_weight = base_weight.clone()
+    if base_weight is None:
+        base_weight_flat = torch.ones((bsz, num_pixels), device=score_maps.device, dtype=score_maps.dtype)
+    else:
+        if base_weight.ndim != 4 or base_weight.shape[0] != bsz or base_weight.shape[1] != 1:
+            raise ValueError("base_weight must have shape (B,1,H,W)")
+        if base_weight.shape[-2:] != (height, width):
+            raise ValueError("base_weight must share spatial dimensions with score_maps")
+        base_weight_flat = base_weight[:, 0].to(device=score_maps.device, dtype=score_maps.dtype).reshape(bsz, num_pixels)
+        base_weight_flat = base_weight_flat.clamp_min(0.0)
+    high_weight = base_weight_flat.clone()
+    low_weight = base_weight_flat.clone()
     high_weight.scatter_(1, high_idx.to(device=score_maps.device), 0.0)
     low_weight.scatter_(1, low_idx.to(device=score_maps.device), 0.0)
 
@@ -90,7 +99,7 @@ def spatial_utility_counterfactual_drop(
         denom = weight.sum(dim=1).clamp_min(1.0)
         return (flat_maps * weight[:, None]).sum(dim=-1) / denom[:, None]
 
-    base_scores = weighted_scores(base_weight)
+    base_scores = weighted_scores(base_weight_flat)
     high_scores = weighted_scores(high_weight)
     low_scores = weighted_scores(low_weight)
     base_selected, base_cost = _selected_cost(base_scores, costs, valid_mask=valid_mask)

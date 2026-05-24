@@ -273,6 +273,9 @@ def test_protocol_controls_summary_compares_pofd_to_available_metadata_baselines
     assert summary["metadata_baselines"]["pnp_inliers"]["top1_acc"] == 0.0
     assert summary["metadata_baselines"]["reproj_median"]["top1_acc"] == 0.0
     assert summary["hard_cases"]["score_top1_false_accept"]["count"] == 1
+    assert summary["paired_statistics"]["candidate_rank"]["pred_cost_delta_m"]["num_samples"] == 1
+    assert summary["paired_statistics"]["candidate_rank"]["mcnemar"]["method_only"] == 0
+    assert "wilcoxon_cost" in summary["paired_statistics"]["candidate_rank"]
 
 
 def test_protocol_controls_candidate_rank_uses_candidate_idx_not_model_score_rank():

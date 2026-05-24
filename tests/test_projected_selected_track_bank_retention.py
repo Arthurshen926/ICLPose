@@ -10,7 +10,12 @@ import torch.nn as nn
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from feature_extract.localizability.scorer import PoseHypothesisScorer
-from feature_extract.localizability.rendered_map_scoring import densify_projected_feature_maps, render_selected_track_feature_maps
+from feature_extract.localizability.rendered_map_scoring import (
+    bank_quality_weights,
+    densify_projected_feature_maps,
+    render_selected_track_feature_maps,
+    render_selected_track_quality_maps,
+)
 from feature_extract.localizability.selected_feature_map import SelectedTrackFeatureBank
 from feature_extract.tools.eval_projected_selected_track_bank_retention import (
     intrinsics_dicts_to_scaled_k,
@@ -70,6 +75,39 @@ def test_score_selected_query_against_projected_bank_does_not_reselect_bank_feat
     assert aux["rendered_selected_map_feature"].shape == (1, 1, 2, 5, 5)
 
 
+def test_score_projected_bank_can_apply_saved_query_transform_without_selector():
+    query = torch.zeros(1, 3, 5, 5)
+    query[:, 0, 2, 2] = 1.0
+    query[:, 2, 2, 2] = 9.0
+    bank = SelectedTrackFeatureBank(
+        track_ids=torch.tensor([1]),
+        features=torch.tensor([[1.0, 0.0]]),
+        visibility_count=torch.tensor([2]),
+        feature_variance=torch.tensor([0.0]),
+        utility_mean=torch.tensor([1.0]),
+        xyz=torch.tensor([[0.0, 0.0, 1.0]]),
+    )
+    candidate = torch.eye(4).view(1, 1, 4, 4)
+    intrinsics = torch.tensor([[[1.0, 0.0, 2.0], [0.0, 1.0, 2.0], [0.0, 0.0, 1.0]]])
+    scorer = PoseHypothesisScorer(mode="same_pixel", temperature=0.1)
+    transform_state = {"method": "first_channels", "input_dim": 3, "output_dim": 2}
+
+    scores, aux = score_selected_query_against_projected_bank(
+        query,
+        bank,
+        candidate,
+        intrinsics,
+        image_hw=(5, 5),
+        selector=None,
+        scorer=scorer,
+        query_transform_state=transform_state,
+    )
+
+    assert scores.shape == (1, 1)
+    assert scores[0, 0].item() > 0.0
+    assert aux["query_selected"]["z"].shape == (1, 2, 5, 5)
+
+
 def test_projected_valid_coverage_accepts_boolean_masks():
     mask = torch.tensor([[[[[True, False], [True, True]]]]])
 
@@ -114,3 +152,53 @@ def test_densify_projected_feature_maps_expands_sparse_projection_by_average_poo
     assert int(dense_valid.sum().item()) == 9
     assert dense[0, 0, 0, 1, 1].item() == pytest.approx(2.0)
     assert dense[0, 0, 1, 3, 3].item() == pytest.approx(4.0)
+
+
+def test_densify_projected_feature_maps_uses_confidence_weights():
+    rendered = torch.zeros(1, 1, 2, 5, 5)
+    rendered[:, :, 0, 2, 2] = 1.0
+    rendered[:, :, 1, 2, 3] = 1.0
+    valid = torch.zeros(1, 1, 1, 5, 5, dtype=torch.bool)
+    valid[:, :, :, 2, 2] = True
+    valid[:, :, :, 2, 3] = True
+    confidence = torch.zeros(1, 1, 1, 5, 5)
+    confidence[:, :, :, 2, 2] = 1.0
+    confidence[:, :, :, 2, 3] = 9.0
+
+    dense, _dense_valid = densify_projected_feature_maps(rendered, valid, radius=1, confidence=confidence)
+
+    assert dense[0, 0, 0, 2, 2].item() == pytest.approx(0.1)
+    assert dense[0, 0, 1, 2, 2].item() == pytest.approx(0.9)
+
+
+def test_bank_quality_weights_favor_high_utility_low_variance_tracks():
+    bank = SelectedTrackFeatureBank(
+        track_ids=torch.tensor([1, 2]),
+        features=torch.eye(2),
+        visibility_count=torch.tensor([2, 2]),
+        feature_variance=torch.tensor([0.0, 9.0]),
+        utility_mean=torch.tensor([1.0, 1.0]),
+        xyz=torch.tensor([[0.0, 0.0, 1.0], [1.0, 0.0, 1.0]]),
+    )
+
+    weights = bank_quality_weights(bank)
+
+    assert weights[0].item() > weights[1].item() * 9.0
+
+
+def test_render_selected_track_quality_maps_projects_bank_quality():
+    bank = SelectedTrackFeatureBank(
+        track_ids=torch.tensor([1, 2]),
+        features=torch.eye(2),
+        visibility_count=torch.tensor([2, 2]),
+        feature_variance=torch.tensor([0.0, 0.0]),
+        utility_mean=torch.tensor([1.0, 9.0]),
+        xyz=torch.tensor([[0.0, 0.0, 1.0], [1.0, 0.0, 1.0]]),
+    )
+    candidate = torch.eye(4).view(1, 1, 4, 4)
+    intrinsics = torch.tensor([[[1.0, 0.0, 2.0], [0.0, 1.0, 2.0], [0.0, 0.0, 1.0]]])
+
+    confidence = render_selected_track_quality_maps(bank, candidate, intrinsics, image_hw=(5, 5))
+
+    assert confidence.shape == (1, 1, 1, 5, 5)
+    assert confidence[0, 0, 0, 2, 3] > confidence[0, 0, 0, 2, 2]

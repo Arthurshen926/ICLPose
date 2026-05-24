@@ -14,6 +14,10 @@ import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from feature_extract.localizability.controls import (  # noqa: E402
+    feature_batch_shuffle_control,
+    wrong_scene_feature_control,
+)
 from feature_extract.localizability.interpretability import (  # noqa: E402
     channel_group_counterfactual_drop,
     spatial_utility_counterfactual_drop,
@@ -55,16 +59,20 @@ def spatial_counterfactual_report(
     valid_mask: torch.Tensor | None = None,
     basin_label: torch.Tensor | None = None,
     drop_fraction: float = 0.2,
+    base_weight: torch.Tensor | None = None,
 ) -> dict[str, object]:
     """Summarize ranking damage after high-/low-utility spatial removal."""
 
     if utility.shape[-2:] != score_maps.shape[-2:]:
         utility = F.interpolate(utility.float(), size=score_maps.shape[-2:], mode="bilinear", align_corners=False)
+    if base_weight is not None and base_weight.shape[-2:] != score_maps.shape[-2:]:
+        base_weight = F.interpolate(base_weight.float(), size=score_maps.shape[-2:], mode="bilinear", align_corners=False)
     counterfactual = spatial_utility_counterfactual_drop(
         score_maps,
         utility,
         costs,
         drop_fraction=float(drop_fraction),
+        base_weight=base_weight,
         valid_mask=valid_mask,
     )
     topk = (1, 5) if costs.shape[1] >= 5 else (1,)
@@ -112,6 +120,7 @@ def channel_counterfactual_report(
     *,
     valid_mask: torch.Tensor | None = None,
     basin_label: torch.Tensor | None = None,
+    importance_mode: str = "provided",
 ) -> dict[str, object]:
     """Summarize ranking damage after high-/low-importance channel removal."""
 
@@ -121,6 +130,16 @@ def channel_counterfactual_report(
         raise ValueError("group_importance must have shape (G,) or (B,G)")
     if ablated_group_scores.ndim != 3 or ablated_group_scores.shape[0] != group_importance.shape[0]:
         raise ValueError("ablated_group_scores must have shape (G,B,K) matching group_importance")
+    if importance_mode not in {"provided", "leave_one_group_out"}:
+        raise ValueError("importance_mode must be 'provided' or 'leave_one_group_out'")
+    group_report = channel_group_counterfactual_drop(
+        base_scores,
+        ablated_group_scores,
+        costs,
+        valid_mask=valid_mask,
+    )
+    if importance_mode == "leave_one_group_out":
+        group_importance = group_report["group_pred_cost_drop_m"].detach()
     topk = (1, 5) if costs.shape[1] >= 5 else (1,)
     high_idx = int(group_importance.argmax().detach().cpu())
     low_idx = int(group_importance.argmin().detach().cpu())
@@ -151,13 +170,8 @@ def channel_counterfactual_report(
             topk=topk,
         )
     )
-    group_report = channel_group_counterfactual_drop(
-        base_scores,
-        ablated_group_scores,
-        costs,
-        valid_mask=valid_mask,
-    )
     return {
+        "importance_mode": importance_mode,
         "base": base,
         "drop_high": drop_high,
         "drop_low": drop_low,
@@ -170,6 +184,98 @@ def channel_counterfactual_report(
             float(value) for value in group_report["group_pred_cost_drop_m"].detach().cpu()
         ],
     }
+
+
+def _ranking_report(
+    scores: torch.Tensor,
+    costs: torch.Tensor,
+    *,
+    valid_mask: torch.Tensor | None,
+    basin_label: torch.Tensor | None,
+) -> dict[str, float]:
+    topk = (1, 5) if costs.shape[1] >= 5 else (1,)
+    return _metrics_to_float(ranking_metrics(scores, costs, valid_mask=valid_mask, basin_label=basin_label, topk=topk))
+
+
+def _skip_report(reason: str) -> dict[str, object]:
+    return {"skipped": True, "reason": str(reason)}
+
+
+def feature_shuffle_control_report(
+    scorer,
+    query_z: torch.Tensor,
+    render_z: torch.Tensor,
+    costs: torch.Tensor,
+    *,
+    valid_mask: torch.Tensor | None = None,
+    basin_label: torch.Tensor | None = None,
+    query_utility: torch.Tensor | None = None,
+    render_mask: torch.Tensor | None = None,
+) -> dict[str, object]:
+    """Run query/candidate/wrong-scene feature-shuffle negative controls."""
+
+    if query_z.ndim != 4 or render_z.ndim != 5:
+        raise ValueError("query_z must be (B,C,H,W) and render_z must be (B,K,C,H,W)")
+    if query_z.shape[0] != render_z.shape[0] or costs.shape != render_z.shape[:2]:
+        raise ValueError("query/render/cost batch and candidate dimensions must match")
+    with torch.no_grad():
+        base_scores, _base_aux = scorer(query_z, render_z, query_utility=query_utility, render_valid_mask=render_mask)
+        out: dict[str, object] = {
+            "base": _ranking_report(base_scores, costs, valid_mask=valid_mask, basin_label=basin_label)
+        }
+        if render_z.shape[1] < 2:
+            out["candidate_render_shuffle"] = _skip_report("need at least two candidates")
+        else:
+            shuffled_render = torch.roll(render_z, shifts=1, dims=1)
+            shuffled_mask = torch.roll(render_mask, shifts=1, dims=1) if render_mask is not None else None
+            candidate_scores, _candidate_aux = scorer(
+                query_z,
+                shuffled_render,
+                query_utility=query_utility,
+                render_valid_mask=shuffled_mask,
+            )
+            out["candidate_render_shuffle"] = _ranking_report(
+                candidate_scores,
+                costs,
+                valid_mask=valid_mask,
+                basin_label=basin_label,
+            )
+        if query_z.shape[0] < 2:
+            out["query_batch_shuffle"] = _skip_report("need batch size at least two")
+            out["wrong_scene_render_shuffle"] = _skip_report("need batch size at least two")
+        else:
+            permutation = torch.roll(torch.arange(query_z.shape[0], device=query_z.device), shifts=1)
+            shuffled_query, permutation = feature_batch_shuffle_control(query_z, permutation=permutation)
+            shuffled_utility = None
+            if query_utility is not None:
+                shuffled_utility = query_utility.index_select(0, permutation.to(device=query_utility.device))
+            query_scores, _query_aux = scorer(
+                shuffled_query,
+                render_z,
+                query_utility=shuffled_utility,
+                render_valid_mask=render_mask,
+            )
+            out["query_batch_shuffle"] = _ranking_report(
+                query_scores,
+                costs,
+                valid_mask=valid_mask,
+                basin_label=basin_label,
+            )
+            wrong_render = wrong_scene_feature_control(render_z, render_z.index_select(0, permutation))
+            wrong_mask = render_mask.index_select(0, permutation.to(device=render_mask.device)) if render_mask is not None else None
+            wrong_scores, _wrong_aux = scorer(
+                query_z,
+                wrong_render,
+                query_utility=query_utility,
+                render_valid_mask=wrong_mask,
+            )
+            out["wrong_scene_render_shuffle"] = _ranking_report(
+                wrong_scores,
+                costs,
+                valid_mask=valid_mask,
+                basin_label=basin_label,
+            )
+        return out
 
 
 def _channel_group_importance(
@@ -236,6 +342,27 @@ def _mean_nested_reports(rows: Sequence[Mapping[str, object]]) -> dict[str, obje
     return out
 
 
+def _mean_feature_shuffle_reports(rows: Sequence[Mapping[str, object]]) -> dict[str, object]:
+    if not rows:
+        raise ValueError("No feature-shuffle rows to summarize")
+    out: dict[str, object] = {"num_batches": int(len(rows))}
+    sections = ("base", "candidate_render_shuffle", "query_batch_shuffle", "wrong_scene_render_shuffle")
+    for section in sections:
+        section_rows = [dict(row[section]) for row in rows if section in row]  # type: ignore[index]
+        if not section_rows:
+            continue
+        if all(row.get("skipped") for row in section_rows):
+            out[section] = dict(section_rows[0])
+            continue
+        metric_rows = [row for row in section_rows if not row.get("skipped")]
+        out[section] = {
+            key: float(sum(float(row[key]) for row in metric_rows if key in row) / max(sum(1 for row in metric_rows if key in row), 1))
+            for key in METRIC_KEYS
+            if any(key in row for row in metric_rows)
+        }
+    return out
+
+
 def _load_selector(path: str | Path, *, in_channels: int, out_channels: int, group_size: int, device: torch.device) -> LocalizationFeatureSelector:
     selector = LocalizationFeatureSelector(
         in_channels=int(in_channels),
@@ -286,6 +413,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--drop-fraction", type=float, default=0.2)
     parser.add_argument("--channel-counterfactual", action="store_true")
     parser.add_argument("--channel-ablation-group-size", type=int, default=8)
+    parser.add_argument(
+        "--channel-importance-mode",
+        choices=("provided", "leave_one_group_out"),
+        default="leave_one_group_out",
+        help="How to rank high/low channel groups for the channel counterfactual table.",
+    )
+    parser.add_argument("--feature-shuffle-controls", action="store_true")
     return parser.parse_args()
 
 
@@ -323,6 +457,7 @@ def main() -> None:
     score_hw = _parse_hw(args.score_feature_hw)
     spatial_reports = []
     channel_reports = []
+    feature_shuffle_reports = []
     with torch.no_grad():
         for batch in loader:
             batch = move_batch_to_device(batch, device)
@@ -335,7 +470,7 @@ def main() -> None:
                 batch=batch,
                 device=device,
                 score_hw=score_hw,
-                return_selected_features=bool(args.channel_counterfactual),
+                return_selected_features=bool(args.channel_counterfactual or args.feature_shuffle_controls),
             )
             score_maps = aux["score_maps"]
             if score_maps.ndim == 5:
@@ -349,8 +484,22 @@ def main() -> None:
                     valid_mask=valid,
                     basin_label=basin,
                     drop_fraction=float(args.drop_fraction),
+                    base_weight=aux["query_utility"],
                 )
             )
+            if args.feature_shuffle_controls:
+                feature_shuffle_reports.append(
+                    feature_shuffle_control_report(
+                        scorer,
+                        aux["query_z"],
+                        aux["render_z"],
+                        pose_cost,
+                        valid_mask=valid,
+                        basin_label=basin,
+                        query_utility=aux.get("query_utility"),
+                        render_mask=aux.get("render_mask"),
+                    )
+                )
             if args.channel_counterfactual:
                 group_importance = _channel_group_importance(
                     aux["query_z"],
@@ -373,6 +522,7 @@ def main() -> None:
                         group_importance,
                         valid_mask=valid,
                         basin_label=basin,
+                        importance_mode=str(args.channel_importance_mode),
                     )
                 )
     summary = {
@@ -383,6 +533,8 @@ def main() -> None:
     }
     if channel_reports:
         summary["channel_counterfactual"] = _mean_nested_reports(channel_reports)
+    if feature_shuffle_reports:
+        summary["feature_shuffle_controls"] = _mean_feature_shuffle_reports(feature_shuffle_reports)
     out_json = Path(args.out_json)
     out_json.parent.mkdir(parents=True, exist_ok=True)
     out_json.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")

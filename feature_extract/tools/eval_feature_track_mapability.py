@@ -131,6 +131,129 @@ def sample_feature_at_pixels(
     return feature.float().reshape(channels, height, width)[:, fy, fx].transpose(0, 1).contiguous()
 
 
+def _tensor_to_json_list(value: torch.Tensor) -> list:
+    return value.detach().cpu().float().tolist()
+
+
+def fit_observation_feature_transform(
+    features: torch.Tensor,
+    *,
+    method: str = "identity",
+    out_dim: int | None = None,
+    seed: int = 0,
+) -> tuple[torch.Tensor, dict]:
+    """Fit/apply a same-dim baseline transform to sampled track observations."""
+
+    if features.ndim != 2:
+        raise ValueError("features must have shape (N,C)")
+    method = str(method)
+    input_dim = int(features.shape[1])
+    output_dim = int(out_dim) if out_dim is not None else input_dim
+    if output_dim <= 0:
+        raise ValueError("out_dim must be positive")
+    if method in {"identity", "raw"}:
+        if output_dim != input_dim:
+            raise ValueError("identity/raw transform requires out_dim to match input dim")
+        return features.float(), {"method": "identity", "input_dim": input_dim, "output_dim": input_dim}
+    if method == "first_channels":
+        if output_dim > input_dim:
+            raise ValueError("first_channels out_dim cannot exceed input dim")
+        return features.float()[:, :output_dim], {
+            "method": "first_channels",
+            "input_dim": input_dim,
+            "output_dim": output_dim,
+        }
+    if method == "random_projection":
+        generator = torch.Generator(device="cpu").manual_seed(int(seed))
+        matrix = torch.randn(input_dim, output_dim, generator=generator, dtype=torch.float32) / max(float(output_dim), 1.0) ** 0.5
+        transformed = features.float() @ matrix.to(device=features.device)
+        return transformed, {
+            "method": "random_projection",
+            "input_dim": input_dim,
+            "output_dim": output_dim,
+            "seed": int(seed),
+            "matrix": _tensor_to_json_list(matrix),
+        }
+    if method == "pca":
+        if output_dim > input_dim:
+            raise ValueError("pca out_dim cannot exceed input dim")
+        centered = features.float() - features.float().mean(dim=0, keepdim=True)
+        mean = features.float().mean(dim=0)
+        # torch.linalg.svd is deterministic on CPU for these compact sampled observation matrices.
+        _u, _s, vh = torch.linalg.svd(centered.detach().cpu(), full_matrices=False)
+        matrix = vh[:output_dim].t().contiguous()
+        transformed = centered @ matrix.to(device=features.device)
+        return transformed, {
+            "method": "pca",
+            "input_dim": input_dim,
+            "output_dim": output_dim,
+            "mean": _tensor_to_json_list(mean),
+            "matrix": _tensor_to_json_list(matrix),
+        }
+    raise ValueError(f"Unsupported feature transform: {method}")
+
+
+def apply_feature_transform_state_to_dense(feature: torch.Tensor, state: Mapping[str, object]) -> torch.Tensor:
+    """Apply a saved observation transform state to dense query features."""
+
+    if feature.ndim not in {3, 4}:
+        raise ValueError("feature must have shape (C,H,W) or (B,C,H,W)")
+    added_batch = feature.ndim == 3
+    x = feature[None] if added_batch else feature
+    bsz, channels, height, width = x.shape
+    method = str(state.get("method", "identity"))
+    output_dim = int(state.get("output_dim", channels))
+    if method in {"identity", "raw"}:
+        if output_dim != channels:
+            raise ValueError("identity/raw transform requires matching input/output dim")
+        out = x.float()
+    elif method == "first_channels":
+        if output_dim > channels:
+            raise ValueError("first_channels output dim cannot exceed feature channels")
+        out = x.float()[:, :output_dim]
+    elif method in {"random_projection", "pca"}:
+        matrix = torch.as_tensor(state["matrix"], dtype=x.dtype, device=x.device)
+        if matrix.ndim != 2 or matrix.shape[0] != channels or matrix.shape[1] != output_dim:
+            raise ValueError("transform matrix shape does not match dense feature channels")
+        flat = x.float().permute(0, 2, 3, 1).reshape(-1, channels)
+        if method == "pca":
+            mean = torch.as_tensor(state.get("mean", [0.0] * channels), dtype=flat.dtype, device=flat.device)
+            flat = flat - mean.view(1, -1)
+        projected = flat @ matrix.to(device=flat.device, dtype=flat.dtype)
+        out = projected.reshape(bsz, height, width, output_dim).permute(0, 3, 1, 2).contiguous()
+    else:
+        raise ValueError(f"Unsupported feature transform state: {method}")
+    return out[0] if added_batch else out
+
+
+def apply_feature_transform_state_to_observations(features: torch.Tensor, state: Mapping[str, object]) -> torch.Tensor:
+    """Apply a saved transform state to an ``(N,C)`` observation matrix."""
+
+    if features.ndim != 2:
+        raise ValueError("features must have shape (N,C)")
+    method = str(state.get("method", "identity"))
+    channels = int(features.shape[1])
+    output_dim = int(state.get("output_dim", channels))
+    if method in {"identity", "raw"}:
+        if output_dim != channels:
+            raise ValueError("identity/raw transform requires matching input/output dim")
+        return features.float()
+    if method == "first_channels":
+        if output_dim > channels:
+            raise ValueError("first_channels output dim cannot exceed feature channels")
+        return features.float()[:, :output_dim]
+    if method in {"random_projection", "pca"}:
+        matrix = torch.as_tensor(state["matrix"], dtype=features.dtype, device=features.device)
+        if matrix.ndim != 2 or matrix.shape[0] != channels or matrix.shape[1] != output_dim:
+            raise ValueError("transform matrix shape does not match observation feature dim")
+        x = features.float()
+        if method == "pca":
+            mean = torch.as_tensor(state.get("mean", [0.0] * channels), dtype=x.dtype, device=x.device)
+            x = x - mean.view(1, -1)
+        return x @ matrix.to(device=x.device, dtype=x.dtype)
+    raise ValueError(f"Unsupported feature transform state: {method}")
+
+
 def _safe_torch_load(path: str | Path):
     try:
         return torch.load(path, map_location="cpu", weights_only=True)
@@ -232,6 +355,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--selector-group-size", type=int, default=8)
     parser.add_argument("--selector-hidden-dim", type=int, default=128)
     parser.add_argument("--selector-device", default="cpu")
+    parser.add_argument(
+        "--feature-transform",
+        choices=("identity", "raw", "first_channels", "random_projection", "pca"),
+        default="identity",
+        help="Same-track baseline transform applied after observation sampling.",
+    )
+    parser.add_argument("--transform-out-dim", type=int, default=None)
+    parser.add_argument("--transform-seed", type=int, default=0)
     parser.add_argument("--selected-bank-out", default=None)
     return parser.parse_args()
 
@@ -324,6 +455,16 @@ def main() -> None:
         unique_ids, counts = torch.unique(track_ids, return_counts=True)
         keep_ids = unique_ids[counts >= int(args.min_track_observations)]
         keep = torch.isin(track_ids, keep_ids)
+        transform_state: dict | None = None
+        if str(args.feature_transform) not in {"identity", "raw"} or args.transform_out_dim is not None:
+            fit_features = features[keep] if bool(keep.any().item()) else features
+            _fit_transformed, transform_state = fit_observation_feature_transform(
+                fit_features,
+                method=str(args.feature_transform),
+                out_dim=args.transform_out_dim,
+                seed=int(args.transform_seed),
+            )
+            features = apply_feature_transform_state_to_observations(features, transform_state)
         variance, stats = observation_track_feature_variance(features, track_ids, valid_mask=keep)
         separability, separability_stats = observation_track_feature_separability(features, track_ids, valid_mask=keep)
         feature_dim = int(features.shape[1])
@@ -350,11 +491,15 @@ def main() -> None:
         feature_dim = 0
         keep = torch.zeros(0, dtype=torch.bool)
         selected_bank = None
+        transform_state = None
     summary = {
         "colmap_dir": str(colmap_dir),
         "feature_root": str(args.feature_root),
         "feature_subdir": str(args.feature_subdir),
         "selector_checkpoint": str(args.selector_checkpoint) if args.selector_checkpoint else None,
+        "feature_transform": str(args.feature_transform),
+        "transform_out_dim": args.transform_out_dim,
+        "transform_seed": int(args.transform_seed),
         "used_images": int(used_images),
         "missing_features": int(missing_features),
         "projection_fallback": bool(use_projection_fallback),
@@ -369,16 +514,22 @@ def main() -> None:
         "mapability_valid": bool((int(keep.sum().item()) if all_features else 0) > 0 and float(stats["num_tracks"].item()) > 0.0),
     }
     if selected_bank is not None:
+        bank_metadata = {
+            "colmap_dir": str(colmap_dir),
+            "feature_root": str(args.feature_root),
+            "feature_subdir": str(args.feature_subdir),
+            "selector_checkpoint": str(args.selector_checkpoint) if args.selector_checkpoint else None,
+            "feature_transform": str(args.feature_transform),
+            "transform_out_dim": args.transform_out_dim,
+            "transform_seed": int(args.transform_seed),
+            "min_track_observations": int(args.min_track_observations),
+        }
+        if transform_state is not None:
+            bank_metadata["feature_transform_state"] = transform_state
         save_selected_track_feature_bank(
             selected_bank,
             args.selected_bank_out,
-            metadata={
-                "colmap_dir": str(colmap_dir),
-                "feature_root": str(args.feature_root),
-                "feature_subdir": str(args.feature_subdir),
-                "selector_checkpoint": str(args.selector_checkpoint) if args.selector_checkpoint else None,
-                "min_track_observations": int(args.min_track_observations),
-            },
+            metadata=bank_metadata,
         )
         summary["selected_bank_out"] = str(args.selected_bank_out)
         summary["selected_bank_num_tracks"] = int(selected_bank.track_ids.numel())

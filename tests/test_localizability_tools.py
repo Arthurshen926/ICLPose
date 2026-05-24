@@ -23,13 +23,25 @@ from feature_extract.localizability.pose_cache_report import (
     query_names_from_candidate_table,
     summarize_pose_candidate_cache_geometry,
 )
+from feature_extract.localizability.scorer import PoseHypothesisScorer
+from feature_extract.tools.eval_localizability_selector_audits import feature_shuffle_control_report
+from feature_extract.tools.eval_localizability_selector_audits import channel_counterfactual_report
 from feature_extract.tools.report_localizability import format_markdown_table, summarize_jsonl
+from feature_extract.tools.report_localization_evidence_gates import build_gate_report, format_gate_report_markdown
 from feature_extract.tools.eval_feature_track_mapability import (
+    apply_feature_transform_state_to_dense,
+    fit_observation_feature_transform,
     lookup_point_xyz,
     project_points_to_image,
     sample_feature_at_pixels,
 )
-from feature_extract.tools.train_localizability_selector_stream import _build_selector_stream_scorer
+from feature_extract.tools.train_localizability_selector_stream import (
+    _build_selector_stream_scorer,
+    _is_better_selector_checkpoint,
+    _selector_utility_evidence_loss,
+    _selector_checkpoint_payload,
+    parse_args as parse_selector_stream_args,
+)
 from feature_extract.tools.augment_pose_candidate_cache import (
     append_near_identity_candidate_arrays,
     build_near_identity_pose_candidates,
@@ -81,6 +93,190 @@ def test_score_calibrator_cli_accepts_selection_spearman_min(monkeypatch):
     args = parse_score_calibrator_args()
 
     assert args.selection_spearman_min == 0.55
+
+
+def test_selector_stream_cli_accepts_utility_evidence_loss(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train_localizability_selector_stream.py",
+            "--config",
+            "cfg.yaml",
+            "--checkpoint",
+            "model.pth",
+            "--train-pose-candidate-cache",
+            "train.npz",
+            "--eval-pose-candidate-cache",
+            "val.npz",
+            "--out-dir",
+            "out",
+            "--utility-evidence-weight",
+            "0.25",
+            "--utility-evidence-score-channel",
+            "1",
+        ],
+    )
+
+    args = parse_selector_stream_args()
+
+    assert args.utility_evidence_weight == 0.25
+    assert args.utility_evidence_score_channel == 1
+
+
+def test_selector_stream_checkpoint_payload_records_metrics_and_args():
+    module = torch.nn.Conv2d(1, 1, kernel_size=1)
+    args = argparse.Namespace(out_dir="out", utility_evidence_weight=0.5)
+    metrics = {"pred_cost_m": 0.2, "utility_evidence_loss": 0.4}
+
+    payload = _selector_checkpoint_payload(module, step=3, metrics=metrics, args=args)
+
+    assert payload["step"] == 3
+    assert payload["metrics"] == metrics
+    assert payload["args"]["utility_evidence_weight"] == 0.5
+    assert "weight" in payload["selector_state_dict"]
+
+
+def test_selector_stream_checkpoint_selection_can_tiebreak_on_evidence_loss():
+    args = argparse.Namespace(
+        selection_pred_tie_tol=1.0e-4,
+        selection_tie_metric="utility_evidence_loss",
+    )
+    best = {"pred_cost_m": 0.2, "utility_evidence_loss": 0.6}
+    same_pred_better_evidence = {"pred_cost_m": 0.20005, "utility_evidence_loss": 0.4}
+    same_pred_worse_evidence = {"pred_cost_m": 0.20005, "utility_evidence_loss": 0.8}
+    better_pred = {"pred_cost_m": 0.19, "utility_evidence_loss": 0.9}
+
+    assert _is_better_selector_checkpoint(better_pred, best, args) is True
+    assert _is_better_selector_checkpoint(same_pred_better_evidence, best, args) is True
+    assert _is_better_selector_checkpoint(same_pred_worse_evidence, best, args) is False
+
+
+def test_selector_stream_checkpoint_selection_can_tiebreak_on_eval_evidence_loss():
+    args = argparse.Namespace(
+        selection_pred_tie_tol=1.0e-4,
+        selection_tie_metric="eval_utility_evidence_loss",
+    )
+    best = {"pred_cost_m": 0.2, "eval_utility_evidence_loss": 0.6}
+    row = {"pred_cost_m": 0.2, "eval_utility_evidence_loss": 0.4}
+
+    assert _is_better_selector_checkpoint(row, best, args) is True
+
+
+def test_selector_stream_utility_evidence_loss_runs_when_eval_tiebreak_requests_it():
+    args = argparse.Namespace(
+        utility_evidence_weight=0.0,
+        selection_tie_metric="eval_utility_evidence_loss",
+        utility_evidence_score_channel=0,
+    )
+    aux = {
+        "score_maps": torch.tensor([[[[0.0, 2.0, 0.0]], [[1.0, 0.0, 0.0]]]]),
+        "query_utility": torch.tensor([[[[0.05, 0.95, 0.35]]]]),
+    }
+    costs = torch.tensor([[0.1, 0.5]])
+
+    loss, metrics = _selector_utility_evidence_loss(args, aux, costs, valid_mask=None)
+
+    assert loss.item() < 0.4
+    assert metrics["utility_evidence_active"].item() == pytest.approx(1.0)
+
+
+def test_feature_shuffle_control_report_detects_query_candidate_and_wrong_scene_shortcuts():
+    query = torch.tensor([[[[1.0]], [[0.0]]], [[[0.0]], [[1.0]]]])
+    render = torch.tensor(
+        [
+            [[[[1.0]], [[0.0]]], [[[0.0]], [[1.0]]]],
+            [[[[0.0]], [[1.0]]], [[[1.0]], [[0.0]]]],
+        ]
+    )
+    costs = torch.tensor([[0.1, 0.5], [0.1, 0.5]])
+    valid = torch.ones(2, 2, dtype=torch.bool)
+    basin = costs <= 0.2
+    scorer = PoseHypothesisScorer(mode="same_pixel", temperature=1.0)
+
+    report = feature_shuffle_control_report(
+        scorer,
+        query,
+        render,
+        costs,
+        valid_mask=valid,
+        basin_label=basin,
+        query_utility=torch.ones(2, 1, 1, 1),
+        render_mask=torch.ones(2, 2, 1, 1, 1, dtype=torch.bool),
+    )
+
+    assert report["base"]["top1_acc"] == pytest.approx(1.0)
+    assert report["candidate_render_shuffle"]["top1_acc"] == pytest.approx(0.0)
+    assert report["query_batch_shuffle"]["top1_acc"] == pytest.approx(0.0)
+    assert report["wrong_scene_render_shuffle"]["top1_acc"] == pytest.approx(0.0)
+
+
+def test_channel_counterfactual_report_can_rank_groups_by_leave_one_out_damage():
+    base_scores = torch.tensor([[3.0, 1.0, 0.0], [1.5, 2.0, 0.1]])
+    costs = torch.tensor([[0.1, 0.4, 0.8], [0.2, 0.1, 0.7]])
+    ablated_group_scores = torch.stack(
+        [
+            base_scores - torch.tensor([[3.0, 0.0, 0.0], [0.0, 2.0, 0.0]]),
+            base_scores - torch.tensor([[0.0, 0.1, 0.0], [0.0, 0.0, 0.1]]),
+        ],
+        dim=0,
+    )
+    misleading_gate_importance = torch.tensor([0.1, 1.0])
+
+    report = channel_counterfactual_report(
+        base_scores,
+        ablated_group_scores,
+        costs,
+        misleading_gate_importance,
+        importance_mode="leave_one_group_out",
+    )
+
+    assert report["importance_mode"] == "leave_one_group_out"
+    assert report["drop_high_group_idx"] == 0
+    assert report["drop_low_group_idx"] == 1
+    assert report["drop_high_cost_delta_m"] > report["drop_low_cost_delta_m"]
+
+
+def test_observation_feature_transform_state_applies_to_dense_query_features():
+    observations = torch.tensor(
+        [
+            [1.0, 0.0, 2.0],
+            [0.0, 1.0, 2.0],
+            [1.0, 1.0, 2.0],
+        ]
+    )
+
+    projected, state = fit_observation_feature_transform(
+        observations,
+        method="random_projection",
+        out_dim=2,
+        seed=3,
+    )
+    dense = observations.t().reshape(1, 3, 1, 3)
+    dense_projected = apply_feature_transform_state_to_dense(dense, state)
+
+    assert projected.shape == (3, 2)
+    assert state["method"] == "random_projection"
+    assert dense_projected.shape == (1, 2, 1, 3)
+    assert torch.allclose(dense_projected[0, :, 0].t(), projected, atol=1.0e-6)
+
+
+def test_observation_feature_transform_supports_pca_same_dim_baseline():
+    observations = torch.tensor(
+        [
+            [1.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 2.0, 0.0],
+        ]
+    )
+
+    projected, state = fit_observation_feature_transform(observations, method="pca", out_dim=2, seed=0)
+
+    assert projected.shape == (4, 2)
+    assert state["method"] == "pca"
+    assert state["input_dim"] == 3
+    assert state["output_dim"] == 2
 
 
 def test_score_calibrator_selection_gate_rejects_low_spearman_checkpoint():
@@ -867,3 +1063,113 @@ def test_selector_stream_pair_matcher_mode_requires_loaded_pair_matcher():
     assert scorer.mode == "pair_matcher_local"
     assert scorer.pair_matcher is matcher
     assert scorer.pair_matcher_stride == 4
+
+
+def test_gate_report_merges_protocol_shuffle_counterfactual_and_mapability_artifacts(tmp_path):
+    protocol_path = tmp_path / "controls.json"
+    protocol_path.write_text(
+        json.dumps(
+            {
+                "label": "oldhospital_q50",
+                "protocol": {
+                    "protocol": "controlled_lattice",
+                    "candidate_generator": "q50",
+                    "split": "val128",
+                    "deployment_claim_allowed": False,
+                },
+                "pofd": {"pred_cost_m": 0.23, "top1_acc": 0.68, "spearman": 0.59, "basin_recall@5": 0.99},
+                "metadata_baselines": {
+                    "candidate_rank": {"pred_cost_m": 0.50, "top1_acc": 0.10, "spearman": 0.01, "basin_recall@5": 0.50},
+                    "retrieval_score": {"pred_cost_m": 0.10, "top1_acc": 1.00, "spearman": 1.00, "basin_recall@5": 1.00},
+                },
+                "control_warnings": ["retrieval_score is oracle-like under a GT-centered protocol"],
+                "paired_statistics": {"candidate_rank": {"mcnemar": {"p_value": 0.5}}},
+                "hard_cases": {"score_top1_false_accept": {"count": 4, "fraction": 0.25}},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    audit_path = tmp_path / "audit.json"
+    audit_path.write_text(
+        json.dumps(
+            {
+                "feature_shuffle_controls": {
+                    "base": {"pred_cost_m": 0.23, "top1_acc": 0.68, "spearman": 0.59, "basin_recall@5": 0.99},
+                    "candidate_render_shuffle": {"pred_cost_m": 0.53, "top1_acc": 0.02, "spearman": -0.03, "basin_recall@5": 0.49},
+                    "wrong_scene_render_shuffle": {"pred_cost_m": 0.51, "top1_acc": 0.06, "spearman": 0.02, "basin_recall@5": 0.53},
+                },
+                "spatial_counterfactual": {
+                    "base": {"pred_cost_m": 0.23, "top1_acc": 0.68, "spearman": 0.59, "basin_recall@5": 0.99},
+                    "drop_high": {"pred_cost_m": 0.26, "top1_acc": 0.64, "spearman": 0.56, "basin_recall@5": 0.98},
+                    "drop_low": {"pred_cost_m": 0.22, "top1_acc": 0.72, "spearman": 0.59, "basin_recall@5": 0.99},
+                    "drop_high_cost_delta_m": 0.03,
+                    "drop_low_cost_delta_m": -0.01,
+                },
+                "channel_counterfactual": {
+                    "drop_high": {"pred_cost_m": 0.45, "top1_acc": 0.25, "spearman": 0.20, "basin_recall@5": 0.60},
+                    "drop_low": {"pred_cost_m": 0.22, "top1_acc": 0.48, "spearman": 0.58, "basin_recall@5": 0.88},
+                    "drop_high_cost_delta_m": 0.22,
+                    "drop_low_cost_delta_m": -0.01,
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    map_path = tmp_path / "map.json"
+    map_path.write_text(
+        json.dumps(
+            {
+                "selected_bank_tracks": 123,
+                "metrics": {"pred_cost_m": 0.34, "top1_acc": 0.12, "spearman": 0.36, "basin_recall@5": 0.75},
+                "coverage": {"projected_valid_pixel_frac": 0.036},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    hard_pose_path = tmp_path / "hard_pose.json"
+    hard_pose_path.write_text(
+        json.dumps(
+            {
+                "cases": [
+                    {
+                        "case": "false_accept",
+                        "rows": [
+                            {
+                                "label": "identity",
+                                "num_samples": 2,
+                                "metrics": {"trans_median": 200.0, "joint_5deg_250mm": 50.0},
+                                "solver_success_frac": None,
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    report = build_gate_report(
+        protocol_controls=[protocol_path],
+        selector_audits=[audit_path],
+        mapability_reports=[map_path],
+        hard_case_final_pose_reports=[hard_pose_path],
+    )
+    markdown = format_gate_report_markdown(report)
+
+    assert report["gate1_predictive_utility"][0]["pofd"]["pred_cost_m"] == 0.23
+    assert report["gate1_predictive_utility"][0]["metadata_baselines"]["candidate_rank"]["top1_acc"] == 0.10
+    assert report["gate1_predictive_utility"][0]["best_clean_metadata"]["top1_acc"] == 0.10
+    assert report["gate1_predictive_utility"][0]["paired_statistics"]["candidate_rank"]["mcnemar"]["p_value"] == 0.5
+    assert report["gate2_causality"][0]["feature_shuffle_controls"]["candidate_render_shuffle"]["top1_acc"] == 0.02
+    assert report["gate2_causality"][0]["channel_counterfactual"]["drop_high"]["pred_cost_m"] == 0.45
+    assert report["gate2_mapability"][0]["selected_bank_tracks"] == 123
+    assert report["gate3_downstream"][0]["cases"][0]["rows"][0]["label"] == "identity"
+    assert "controlled_lattice" in markdown
+    assert "candidate_render_shuffle" in markdown
+    assert "channel_drop_high" in markdown
+    assert "selected_bank_tracks" in markdown
+    assert "false_accept" in markdown

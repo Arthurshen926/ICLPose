@@ -18,6 +18,7 @@ from feature_extract.localizability.metrics import ranking_metrics  # noqa: E402
 from feature_extract.localizability.rendered_map_scoring import (  # noqa: E402
     densify_projected_feature_maps,
     render_selected_track_feature_maps,
+    render_selected_track_quality_maps,
 )
 from feature_extract.localizability.selected_feature_map import (  # noqa: E402
     SelectedTrackFeatureBank,
@@ -26,6 +27,7 @@ from feature_extract.localizability.selected_feature_map import (  # noqa: E402
 from feature_extract.localizability.selector import LocalizationFeatureSelector  # noqa: E402
 from feature_extract.tools.eval_cpr_buckets import build_model_and_data, map_pose_gt_for_batch  # noqa: E402
 from feature_extract.tools.eval_feature_track_mapability import _extract_selector_state, _safe_torch_load  # noqa: E402
+from feature_extract.tools.eval_feature_track_mapability import apply_feature_transform_state_to_dense  # noqa: E402
 from feature_extract.tools.eval_localizability_feature_score import _load_pose_adapter_bundle, _parse_hw  # noqa: E402
 from feature_extract.tools.train_localizability_selector_stream import (  # noqa: E402
     _apply_cache_override,
@@ -100,10 +102,12 @@ def score_selected_query_against_projected_bank(
     intrinsics: torch.Tensor,
     *,
     image_hw: tuple[int, int],
-    selector: torch.nn.Module,
+    selector: torch.nn.Module | None,
     scorer: torch.nn.Module,
     splat_radius: int = 0,
     densify_radius: int = 0,
+    densify_weighting: str = "uniform",
+    query_transform_state: Mapping[str, object] | None = None,
 ) -> tuple[torch.Tensor, dict[str, object]]:
     """Score query selected features against an already-selected projected bank."""
 
@@ -114,10 +118,34 @@ def score_selected_query_against_projected_bank(
         image_hw=image_hw,
         splat_radius=int(splat_radius),
     )
-    rendered, render_valid = densify_projected_feature_maps(rendered, render_valid, radius=int(densify_radius))
+    confidence = None
+    if str(densify_weighting) == "bank_quality":
+        confidence = render_selected_track_quality_maps(
+            bank,
+            candidate_w2c,
+            intrinsics,
+            image_hw=image_hw,
+            splat_radius=int(splat_radius),
+        )
+    elif str(densify_weighting) != "uniform":
+        raise ValueError("densify_weighting must be 'uniform' or 'bank_quality'")
+    rendered, render_valid = densify_projected_feature_maps(
+        rendered,
+        render_valid,
+        radius=int(densify_radius),
+        confidence=confidence,
+    )
     rendered = rendered.to(device=query_feature.device, dtype=query_feature.dtype)
     render_valid = render_valid.to(device=query_feature.device)
-    q_out = selector(query_feature)
+    if query_transform_state is not None:
+        query_feature = apply_feature_transform_state_to_dense(query_feature, query_transform_state)
+    if selector is None:
+        q_out = {
+            "z": query_feature,
+            "utility": None,
+        }
+    else:
+        q_out = selector(query_feature)
     scores, scorer_aux = scorer(
         q_out["z"],
         rendered,
@@ -176,7 +204,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--map-checkpoint", default=None)
     parser.add_argument("--pose-candidate-cache", required=True)
     parser.add_argument("--selected-bank", required=True)
-    parser.add_argument("--selector-checkpoint", required=True)
+    parser.add_argument("--selector-checkpoint", default=None)
+    parser.add_argument(
+        "--query-transform",
+        choices=("selector", "bank_metadata", "identity"),
+        default="selector",
+        help="How query features are mapped into the bank feature space.",
+    )
     parser.add_argument("--pose-adapter-checkpoint", default=None)
     parser.add_argument("--pose-adapter-strict", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--out-dir", required=True)
@@ -198,6 +232,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--score-feature-hw", default="34,60")
     parser.add_argument("--splat-radius", type=int, default=0)
     parser.add_argument("--densify-radius", type=int, default=0)
+    parser.add_argument("--densify-weighting", choices=("uniform", "bank_quality"), default="uniform")
     parser.add_argument("--pair-matcher-stride", type=int, default=4)
     parser.add_argument("--pair-matcher-chunk-points", type=int, default=256)
     parser.add_argument("--pair-matcher-candidate-chunk-size", type=int, default=1)
@@ -233,13 +268,24 @@ def main() -> None:
         utility_mean=bank.utility_mean.to(device),
         xyz=bank.xyz.to(device),
     )
-    selector = _load_selector(
-        args.selector_checkpoint,
-        in_channels=int(bank.features.shape[1]),
-        out_channels=int(args.selector_out_dim),
-        group_size=int(args.selector_group_size),
-        device=device,
-    )
+    query_transform_state = None
+    if str(args.query_transform) == "selector":
+        if not args.selector_checkpoint:
+            raise ValueError("--selector-checkpoint is required when --query-transform=selector")
+        selector = _load_selector(
+            args.selector_checkpoint,
+            in_channels=int(bank.features.shape[1]),
+            out_channels=int(args.selector_out_dim),
+            group_size=int(args.selector_group_size),
+            device=device,
+        )
+    elif str(args.query_transform) == "bank_metadata":
+        selector = None
+        query_transform_state = dict(bank_metadata.get("feature_transform_state", {}))
+        if not query_transform_state:
+            raise ValueError("selected bank metadata does not contain feature_transform_state")
+    else:
+        selector = None
     pair_matcher = None
     if args.pose_adapter_checkpoint:
         _adapter, pair_matcher, _adapter_args = _load_pose_adapter_bundle(
@@ -273,6 +319,8 @@ def main() -> None:
                 scorer=scorer,
                 splat_radius=int(args.splat_radius),
                 densify_radius=int(args.densify_radius),
+                densify_weighting=str(args.densify_weighting),
+                query_transform_state=query_transform_state,
             )
             pose_gt = map_pose_gt_for_batch(map_renderer, batch, device)
             pose_cost, trans_err_m, rot_err_deg = _pose_costs(args, candidates, pose_gt)
@@ -301,6 +349,8 @@ def main() -> None:
         "score_feature_hw": [int(score_hw[0]), int(score_hw[1])],
         "splat_radius": int(args.splat_radius),
         "densify_radius": int(args.densify_radius),
+        "densify_weighting": str(args.densify_weighting),
+        "query_transform": str(args.query_transform),
         "metrics": _mean_metric_rows(metric_rows),
         "coverage": _mean_metric_rows(coverage_rows),
     }

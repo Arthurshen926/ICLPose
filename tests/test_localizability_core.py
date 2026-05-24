@@ -21,6 +21,7 @@ from feature_extract.localizability.losses import (
     basin_bce_loss,
     online_score_hard_negative_loss,
     pose_distance_soft_rank_loss,
+    spatial_utility_evidence_loss,
 )
 from feature_extract.localizability.interpretability import (
     channel_group_counterfactual_drop,
@@ -57,6 +58,11 @@ from feature_extract.localizability.scorer import PoseHypothesisScorer
 from feature_extract.localizability.score_calibrator import HypothesisScoreCalibrator, group_candidate_table_rows
 from feature_extract.localizability.selector import LocalizationFeatureSelector
 from feature_extract.localizability.solver_handoff import evaluate_handoff_rows
+from feature_extract.localizability.statistics import (
+    mcnemar_test,
+    paired_bootstrap_mean_ci,
+    wilcoxon_signed_rank_test,
+)
 from feature_extract.students.pose_energy_net import PairConditionedLocalMatcher, PoseFeatureDomainAdapter
 
 
@@ -116,6 +122,33 @@ def test_pose_hypothesis_scorer_prefers_aligned_candidate_with_utility_weight():
     assert int(scores.argmax(dim=1)[0]) == 0
     assert aux["score_maps"].shape[:2] == (1, 3)
     assert aux["valid_mask"].all()
+
+
+def test_paired_bootstrap_mean_ci_is_deterministic_and_contains_mean():
+    values = torch.tensor([1.0, 2.0, 3.0, 4.0])
+
+    report = paired_bootstrap_mean_ci(values, num_bootstrap=200, seed=7, ci=0.95)
+
+    assert report["mean"] == pytest.approx(2.5)
+    assert report["ci_low"] <= report["mean"] <= report["ci_high"]
+    assert report == paired_bootstrap_mean_ci(values, num_bootstrap=200, seed=7, ci=0.95)
+
+
+def test_mcnemar_and_wilcoxon_paired_tests_report_directional_improvement():
+    baseline_success = torch.tensor([True, False, False, True, False])
+    method_success = torch.tensor([True, True, True, True, False])
+    baseline_error = torch.tensor([0.5, 0.4, 0.3, 0.2, 0.6])
+    method_error = torch.tensor([0.4, 0.2, 0.1, 0.2, 0.5])
+
+    mcnemar = mcnemar_test(method_success, baseline_success)
+    wilcoxon = wilcoxon_signed_rank_test(method_error, baseline_error)
+
+    assert mcnemar["method_only"] == 2
+    assert mcnemar["baseline_only"] == 0
+    assert 0.0 <= mcnemar["p_value"] <= 1.0
+    assert wilcoxon["n_nonzero"] == 4
+    assert wilcoxon["median_delta"] < 0.0
+    assert 0.0 <= wilcoxon["p_value"] <= 1.0
 
 
 def test_pair_matcher_local_uses_center_offset_evidence_not_shift_invariant_max():
@@ -222,6 +255,19 @@ def test_pose_rank_losses_focus_on_geometry_and_online_hard_negative():
     assert rank_metrics["rank_target_entropy"].item() < 1.1
     assert hard_metrics["online_hard_active"].item() == 1.0
     assert scores.grad is not None
+
+
+def test_spatial_utility_evidence_loss_prefers_oracle_discriminative_pixels():
+    score_maps = torch.tensor([[[[0.0, 2.0, 0.0]], [[1.0, 0.0, 0.0]]]])
+    costs = torch.tensor([[0.1, 0.5]])
+    good_utility = torch.tensor([[[[0.05, 0.95, 0.35]]]])
+    bad_utility = torch.tensor([[[[0.95, 0.05, 0.35]]]])
+
+    good_loss, metrics = spatial_utility_evidence_loss(score_maps, good_utility, costs)
+    bad_loss, _ = spatial_utility_evidence_loss(score_maps, bad_utility, costs)
+
+    assert good_loss < bad_loss
+    assert metrics["utility_evidence_active"].item() == pytest.approx(1.0)
 
 
 def test_ranking_metrics_report_oracle_gap_spearman_and_basin_recall():
@@ -708,3 +754,25 @@ def test_spatial_utility_counterfactual_drop_masks_high_utility_regions():
     assert report["drop_high_selected_idx"].tolist() == [1]
     assert report["drop_low_selected_idx"].tolist() == [0]
     assert report["drop_high_pred_cost_m"] > report["base_pred_cost_m"]
+
+
+def test_spatial_utility_counterfactual_drop_can_use_utility_as_base_weight():
+    score_maps = torch.zeros(1, 2, 2, 2)
+    score_maps[:, 0, 0, 0] = 4.0
+    score_maps[:, 1, 0, 1:] = 2.0
+    score_maps[:, 1, 1, :] = 2.0
+    utility = torch.full((1, 1, 2, 2), 0.1)
+    utility[:, :, 0, 0] = 1.0
+    costs = torch.tensor([[0.1, 0.5]])
+
+    report = spatial_utility_counterfactual_drop(
+        score_maps,
+        utility,
+        costs,
+        drop_fraction=0.25,
+        base_weight=utility,
+    )
+
+    assert report["base_selected_idx"].tolist() == [0]
+    assert report["drop_high_selected_idx"].tolist() == [1]
+    assert report["drop_low_selected_idx"].tolist() == [0]

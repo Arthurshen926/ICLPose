@@ -1301,3 +1301,779 @@ Interpretation:
 3. Build balanced ShopFacade selected-score tables and metadata controls.
 4. Add explicit evidence-map utility supervision so utility/gate
    counterfactuals can become causal rather than diagnostic.
+
+## Round 13 - Utility-Evidence Selector and Weighted Map/Audit Controls
+
+### Code Delivered
+
+Projected selected-map scoring now has an opt-in quality-weighted densifier:
+
+- `feature_extract/localizability/rendered_map_scoring.py`
+  - added `bank_quality_weights`,
+  - added `render_selected_track_quality_maps`,
+  - added optional `confidence=` weighting to
+    `densify_projected_feature_maps`,
+  - added `densify_weighting="bank_quality"` to projected-bank scoring.
+- `feature_extract/tools/eval_projected_selected_track_bank_retention.py`
+  - added `--densify-weighting {uniform,bank_quality}`.
+- `tests/test_projected_selected_track_bank_retention.py`
+  - added confidence-weighted densification and bank-quality projection tests.
+
+Selector training now has explicit spatial utility-evidence supervision:
+
+- `feature_extract/localizability/losses.py`
+  - added `spatial_utility_evidence_loss`, aligning query utility with pixels
+    where the oracle hypothesis beats hard alternatives.
+- `feature_extract/tools/train_localizability_selector_stream.py`
+  - added `--utility-evidence-weight`,
+    `--utility-evidence-score-channel`,
+  - logs `utility_evidence_loss` / `utility_evidence_active`,
+  - saves `last.pth` as well as `best.pth` so utility-only improvements are
+    not hidden by tied ranking metrics.
+- `feature_extract/localizability/interpretability.py`
+  - added optional `base_weight` to spatial counterfactuals.
+- `feature_extract/tools/eval_localizability_selector_audits.py`
+  - spatial audits now remove high/low utility regions under the same
+    query-utility weighting used by the scorer.
+- `tests/test_localizability_core.py` and
+  `tests/test_localizability_tools.py`
+  - added TDD coverage for utility-evidence loss, weighted spatial
+    counterfactuals, CLI flags, and checkpoint payloads.
+
+### OldHospital Projected Selected-Map Weighted Densification
+
+Artifact:
+
+- `result/result/feature_extract/projected_selected_bank_retention/oldhospital_pm_r16_bank_localcorr_densify4_quality_max8_20260523/metrics.json`
+
+OldHospital q50 max8, selected r16 track bank, `densify_radius=4`,
+`densify_weighting=bank_quality`:
+
+| pred | top1 | gap | Spearman | basin@1 | basin@5 | valid px frac | valid px/cand |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0.3411 | 0.125 | 0.2117 | 0.3625 | 0.375 | 0.750 | 0.0364 | 74.2 |
+
+Interpretation:
+
+- Quality weighting is implemented and tested, but on this selected track bank
+  it was numerically identical to uniform `densify_radius=4` in the max8 smoke.
+- The positive projected-map retention signal from Round 12 remains, but
+  quality weighting is not yet an improvement. This should be treated as a
+  diagnostic branch until depth/visibility-aware confidence is added.
+
+### Balanced ShopFacade Controlled Controls
+
+Artifacts:
+
+- `result/result/feature_extract/pofd_fs_scoretable_shopfacade_pairmatcher_r16_q50_val103_balancedshuf_20260523/metrics.json`
+- `result/result/feature_extract/pofd_fs_protocol_controls_20260523/shopfacade_q50_val103_balancedshuf_controls.json`
+
+Balanced ShopFacade q50 val103, controlled lattice, pair-matcher local r16:
+
+| method | pred | top1 | gap | Spearman | basin@1 | basin@5 |
+|---|---:|---:|---:|---:|---:|---:|
+| POFD scorer | 0.4471 | 0.233 | 0.3178 | 0.160 | 0.291 | 0.748 |
+| candidate rank | 0.5083 | 0.068 | 0.3789 | 0.006 | 0.126 | 0.583 |
+| PnP inliers | 0.4894 | 0.058 | 0.3600 | 0.054 | 0.155 | 0.553 |
+| reproj median | 0.5024 | 0.029 | 0.3731 | 0.036 | 0.097 | 0.583 |
+| delta pose | 0.5168 | 0.000 | 0.3875 | -0.014 | 0.000 | 0.000 |
+| retrieval score | 0.1294 | 1.000 | 0.0000 | 1.000 | 1.000 | 1.000 |
+
+Interpretation:
+
+- POFD beats clean metadata controls on balanced ShopFacade, but remains weak in
+  absolute ranking quality.
+- `retrieval_score` is oracle-like under this GT-centered controlled protocol
+  and is flagged by the protocol report as a candidate-generator shortcut, not
+  a deployable metadata-only baseline.
+- This result is controlled-lattice evidence only. It must not be mixed with
+  real-retrieval deployment claims.
+
+### Utility-Evidence Selector Smoke
+
+Artifacts:
+
+- `result/result/feature_extract/pofd_fs_phase2_selector_pm_r16_oh_utility_evidence_w100_s60_20260523/train_log.jsonl`
+- `result/result/feature_extract/pofd_fs_phase2_selector_pm_r16_oh_utility_evidence_w100_s60_20260523/last.pth`
+- `result/result/feature_extract/pofd_fs_selector_audits_20260523/oldhospital_q50_w100_utility_evidence_last_weighted_spatial_drop20_max32.json`
+- `result/result/feature_extract/pofd_fs_selector_audits_20260523/oldhospital_q50_w100_utility_evidence_last_weighted_spatial_drop40_max32.json`
+
+OldHospital q50 eval32, utility-only training with frozen projection/channel
+gate and `utility_evidence_weight=1.0`:
+
+| step | pred | top1 | gap | Spearman | basin@1 | basin@5 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 20 | 0.1878 | 0.844 | 0.0585 | 0.573 | 0.844 | 1.000 |
+| 40 | 0.1878 | 0.844 | 0.0585 | 0.573 | 0.844 | 1.000 |
+| 60 | 0.1878 | 0.844 | 0.0585 | 0.573 | 0.844 | 1.000 |
+
+Weighted spatial counterfactual on `last.pth`, max32:
+
+| drop | pred | top1 | gap | Spearman | basin@1 | basin@5 | pred delta |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| base | 0.1878 | 0.844 | 0.0585 | 0.584 | 0.844 | 1.000 | 0.0000 |
+| high 20% | 0.1922 | 0.812 | 0.0629 | 0.543 | 0.812 | 1.000 | +0.0044 |
+| low 20% | 0.1645 | 0.906 | 0.0351 | 0.612 | 0.906 | 1.000 | -0.0234 |
+| high 40% | 0.2162 | 0.719 | 0.0868 | 0.491 | 0.719 | 0.969 | +0.0283 |
+| low 40% | 0.1995 | 0.812 | 0.0702 | 0.627 | 0.812 | 1.000 | +0.0117 |
+
+Interpretation:
+
+- This is the first cleaner Gate 2 positive signal in this branch: removing
+  high-utility spatial evidence is consistently worse than removing low-utility
+  evidence under scorer-style query-utility weighting.
+- The effect is still small at 20% but clearer at 40%, and it is measured on
+  OldHospital q50 max32 only. It is not yet a paper-level causality result.
+- The current training objective can preserve ranking while changing utility
+  maps, but training-batch evidence loss is noisy. The next selector run should
+  select checkpoints using counterfactual/evidence gates, not only
+  `pred_cost_m`.
+
+### Verification
+
+- `pytest -q tests/test_projected_selected_track_bank_retention.py`
+- `pytest -q tests/test_localizability_tools.py::test_selector_stream_cli_accepts_utility_evidence_loss tests/test_localizability_core.py::test_spatial_utility_evidence_loss_prefers_oracle_discriminative_pixels`
+- `pytest -q tests/test_localizability_core.py::test_spatial_utility_counterfactual_drop_can_use_utility_as_base_weight tests/test_localizability_core.py::test_spatial_utility_counterfactual_drop_masks_high_utility_regions`
+- `pytest -q tests/test_localizability_tools.py::test_selector_stream_checkpoint_payload_records_metrics_and_args tests/test_localizability_tools.py::test_selector_stream_cli_accepts_utility_evidence_loss`
+
+## Next Automatic Task Allocation After Round 13
+
+1. Add selector checkpoint selection gates that can prefer lower
+   `utility_evidence_loss` or stronger high-vs-low counterfactual separation
+   when ranking metrics tie.
+2. Expand the `utility_evidence_weight=1.0` run to full OldHospital val128 and
+   ShopFacade controlled val103, then report mean/CI instead of max32.
+3. Add depth/visibility-aware confidence to projected selected-map
+   densification; current bank-quality weights alone did not improve over
+   uniform densification.
+4. Run real-retrieval hard-case audits for the utility-evidence selector and
+   keep identity POFD top1 separate from render-LoFTR / guarded solver handoff.
+
+## Round 14 - Selector Checkpoint Tie-Break Gate
+
+### Code Delivered
+
+- `feature_extract/tools/train_localizability_selector_stream.py`
+  - added `--selection-pred-tie-tol`,
+  - added `--selection-tie-metric {none,utility_evidence_loss}`,
+  - added `_is_better_selector_checkpoint`,
+  - changed best-checkpoint selection from raw `pred_cost_m < best` to the new
+    gate.
+- `tests/test_localizability_tools.py`
+  - added coverage for evidence-loss tie-breaking.
+
+Default behavior remains unchanged because `--selection-tie-metric none` is
+the default. For utility-only selector runs where `pred_cost_m` ties across
+steps, use:
+
+```bash
+--selection-pred-tie-tol 1e-4 \
+--selection-tie-metric utility_evidence_loss
+```
+
+### Verification
+
+- `pytest -q tests/test_localizability_tools.py::test_selector_stream_checkpoint_selection_can_tiebreak_on_evidence_loss tests/test_localizability_tools.py::test_selector_stream_checkpoint_payload_records_metrics_and_args tests/test_localizability_tools.py::test_selector_stream_cli_accepts_utility_evidence_loss`
+
+### Post-Hoc Gate Check
+
+Artifacts:
+
+- `result/result/feature_extract/pofd_fs_selector_audits_20260523/oldhospital_q50_w100_utility_evidence_best_weighted_spatial_drop20_max32.json`
+- `result/result/feature_extract/pofd_fs_selector_audits_20260523/oldhospital_q50_w100_utility_evidence_best_weighted_spatial_drop40_max32.json`
+
+The existing `w100_s60/best.pth` is equivalent to the low-evidence-loss
+checkpoint the new tie-break gate would prefer under tied `pred_cost_m`.
+
+| drop | pred | top1 | gap | Spearman | basin@1 | basin@5 | pred delta |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| base | 0.1878 | 0.844 | 0.0585 | 0.584 | 0.844 | 1.000 | 0.0000 |
+| high 20% | 0.2156 | 0.750 | 0.0862 | 0.542 | 0.750 | 0.969 | +0.0278 |
+| low 20% | 0.1878 | 0.844 | 0.0585 | 0.590 | 0.844 | 1.000 | 0.0000 |
+| high 40% | 0.2317 | 0.719 | 0.1024 | 0.501 | 0.719 | 0.969 | +0.0439 |
+| low 40% | 0.2112 | 0.781 | 0.0819 | 0.621 | 0.781 | 1.000 | +0.0234 |
+
+This strengthens the Round 13 Gate 2 diagnostic: the lower evidence-loss
+checkpoint has clearer high-vs-low utility separation than the final
+`last.pth`, so tie-breaking by evidence loss is a useful near-term selection
+rule.
+
+## Next Automatic Task Allocation After Round 14
+
+1. Add an optional validation-time evidence/counterfactual summary row so
+   checkpoint selection can be audited without a separate post-hoc script.
+2. Scale utility-evidence evaluation from OldHospital max32 to full val128 and
+   ShopFacade val103 under controlled-lattice labels.
+3. Re-run the `utility_evidence_weight=1.0` selector with the new tie-break gate
+   only after validation-time evidence metrics are available in the training
+   loop.
+
+## Round 15 - Eval-Time Utility Evidence Summary
+
+### Code Delivered
+
+- `feature_extract/tools/train_localizability_selector_stream.py`
+  - added `_selector_utility_evidence_loss`,
+  - `_evaluate` now emits `eval_utility_evidence_loss` and
+    `eval_utility_evidence_active`,
+  - `--selection-tie-metric` now accepts
+    `eval_utility_evidence_loss`.
+- `tests/test_localizability_tools.py`
+  - added coverage for eval evidence tie-breaking and for computing evidence
+    loss when eval tie-breaking requests it.
+
+Smoke artifact:
+
+- `result/result/feature_extract/pofd_fs_phase2_selector_pm_r16_oh_utility_evidence_evalgate_smoke_20260523/train_log.jsonl`
+
+1-step OldHospital q50 smoke wrote both train and eval evidence fields:
+
+```json
+{
+  "eval_utility_evidence_loss": 0.8129827976226807,
+  "eval_utility_evidence_active": 1.0,
+  "utility_evidence_loss": 0.8007336854934692,
+  "utility_evidence_active": 1.0
+}
+```
+
+### Verification
+
+- `pytest -q tests/test_localizability_tools.py::test_selector_stream_utility_evidence_loss_runs_when_eval_tiebreak_requests_it tests/test_localizability_tools.py::test_selector_stream_checkpoint_selection_can_tiebreak_on_eval_evidence_loss tests/test_localizability_tools.py::test_selector_stream_checkpoint_selection_can_tiebreak_on_evidence_loss`
+- 1-step GPU smoke with
+  `--selection-tie-metric eval_utility_evidence_loss`
+
+## Next Automatic Task Allocation After Round 15
+
+1. Re-run the `utility_evidence_weight=1.0` selector with
+   `--selection-tie-metric eval_utility_evidence_loss` on OldHospital val128.
+2. Add the same eval evidence/counterfactual audit to ShopFacade val103.
+3. Promote a checkpoint only when ranking metrics pass the controlled gate and
+   weighted high-vs-low counterfactual separation remains positive.
+
+## Round 16 - ChatGPT-21 Coverage Check and Feature-Shuffle Controls
+
+### ChatGPT-21 Implementation Status
+
+`ChatGPT-21.md` is not fully implemented yet. Current coverage:
+
+| Requirement | Status | Evidence / gap |
+|---|---|---|
+| Fixed protocol labels and anti-mixing reports | implemented | `ArtifactProtocol`, protocol controls, controlled vs real report separation |
+| Metadata-only baselines | implemented | candidate rank, retrieval score, PnP inliers, reproj median, delta pose, score margin |
+| Hard-case masks | implemented | score false accept, retrieval-top1-wrong, near-identity, PnP-high-score-wrong |
+| Feature-shuffle negative controls | implemented this round | query batch shuffle, candidate render shuffle, wrong-scene render shuffle in selector audit |
+| Causal spatial utility removal | partially positive | OldHospital q50 evidence selector has high-vs-low separation; full multi-scene evidence missing |
+| Channel causal removal | interface only / partial | channel counterfactual exists, but not yet full reported table |
+| Candidate-generator transfer | partial | q50, real retrieval, ShopFacade controlled have separate artifacts; no unified transfer table |
+| Scene transfer | partial | ShopFacade controlled metadata controls exist, but selected utility-evidence transfer is not positive yet |
+| Selected 3D mapability | partial | track bank and projected scoring work; rendered retention still weak/unstable |
+| Downstream hard-case utility | partial | real retrieval rerank and handoff diagnostics exist; no stable final-pose claim |
+| Paper-level statistics | not done | 5 seeds, bootstrap CI, McNemar/Wilcoxon still missing |
+
+So the correct claim is: the core anti-leakage/evidence-selection
+infrastructure is now substantially implemented, but the full
+ChatGPT-21 paper-level plan is not complete.
+
+### Code Delivered
+
+- `feature_extract/tools/eval_localizability_selector_audits.py`
+  - added `feature_shuffle_control_report`,
+  - added `--feature-shuffle-controls`,
+  - reports:
+    - `candidate_render_shuffle`,
+    - `query_batch_shuffle`,
+    - `wrong_scene_render_shuffle`.
+- `tests/test_localizability_tools.py`
+  - added a toy query/render scorer test where all three shuffles destroy the
+    only valid feature evidence.
+
+The new controls use selected query/render features after the selector, not
+candidate metadata. Candidate-render shuffle works with batch size 1; query
+and wrong-scene shuffle require batch size at least 2.
+
+### OldHospital q50 Feature-Shuffle Control
+
+Artifacts:
+
+- `result/result/feature_extract/pofd_fs_selector_audits_20260524/oldhospital_q50_w100_best_feature_shuffle_max16_b2.json`
+- `result/result/feature_extract/pofd_fs_selector_audits_20260524/oldhospital_q50_w100_best_feature_shuffle_val128_b2.json`
+
+OldHospital q50 val128, `w100_s60/best.pth`, batch size 2:
+
+| control | pred | top1 | gap | Spearman | basin@1 | basin@5 |
+|---|---:|---:|---:|---:|---:|---:|
+| base | 0.2319 | 0.680 | 0.1026 | 0.588 | 0.703 | 0.992 |
+| candidate render shuffle | 0.5354 | 0.023 | 0.4061 | -0.035 | 0.094 | 0.492 |
+| query batch shuffle | 0.3710 | 0.352 | 0.2416 | 0.469 | 0.414 | 0.875 |
+| wrong-scene render shuffle | 0.5123 | 0.063 | 0.3830 | 0.024 | 0.117 | 0.531 |
+
+Interpretation:
+
+- Candidate/render feature correspondence is essential: shuffling rendered
+  candidate evidence almost destroys ranking.
+- Wrong-scene render evidence also destroys ranking, which is the strongest
+  new anti-shortcut signal in this round.
+- Query shuffle degrades less than render shuffle but still causes a large
+  drop; some residual correlation likely remains from candidate geometry and
+  batch-local scene similarity.
+- This supports a stronger Gate 1/Gate 2 claim for OldHospital controlled q50:
+  the scorer is using query-map feature evidence, not only candidate-table
+  metadata. It remains controlled-lattice evidence, not deployment accuracy.
+
+### Verification
+
+- `pytest -q tests/test_localizability_tools.py::test_feature_shuffle_control_report_detects_query_candidate_and_wrong_scene_shortcuts`
+- OldHospital q50 val128 GPU audit with `--feature-shuffle-controls`
+
+## Next Automatic Task Allocation After Round 16
+
+1. Add the feature-shuffle controls to real-retrieval candidate tables or
+   selector audits, so the anti-shortcut evidence is not limited to q50
+   controlled lattice.
+2. Run selected utility-evidence scorer on full OldHospital val128 with
+   `--selection-tie-metric eval_utility_evidence_loss` and compare against the
+   current `w100_s60/best.pth`.
+3. Add a compact report generator that merges metadata controls,
+   feature-shuffle controls, spatial/channel counterfactuals, and mapability
+   retention into one Gate 1/2 table.
+
+## Round 17 - Gate Report, Paired Statistics, and Real-Retrieval Shuffle Controls
+
+### Code Delivered
+
+- `feature_extract/localizability/statistics.py`
+  - added deterministic paired bootstrap CI for mean deltas,
+  - added exact two-sided McNemar test for paired success rates,
+  - added Wilcoxon signed-rank test for paired continuous errors.
+- `feature_extract/tools/eval_localizability_protocol_controls.py`
+  - now reports paired POFD-vs-baseline statistics for every metadata
+    baseline:
+    - `pred_cost_delta_m` bootstrap mean and 95% CI,
+    - McNemar paired basin-success test,
+    - Wilcoxon selected-cost test.
+- `feature_extract/tools/report_localization_evidence_gates.py`
+  - new compact Gate 1/Gate 2 report builder merging:
+    - protocol-control artifacts,
+    - metadata-only baselines,
+    - paired statistics,
+    - feature-shuffle and spatial counterfactual audits,
+    - selected-map retention/mapability reports.
+- Tests added for the new statistics module, protocol paired stats, and the
+  Gate report merger.
+
+### Protocol Controls with Paired Statistics
+
+Artifacts regenerated under:
+
+- `result/result/feature_extract/pofd_fs_protocol_controls_20260524/`
+
+Key paired statistics:
+
+| setting | baseline | pred delta mean | 95% CI | McNemar p | Wilcoxon p |
+|---|---|---:|---:|---:|---:|
+| OldHospital q50 val128 | candidate rank | -0.2940 | [-0.3419, -0.2450] | 3.80e-22 | 0 |
+| OldHospital q50 val128 | PnP inliers | -0.0685 | [-0.1097, -0.0266] | 9.21e-3 | 3.65e-3 |
+| OldHospital real top20 full182 | candidate rank | -0.0943 | [-0.1616, -0.0331] | 7.84e-2 | 3.92e-3 |
+| OldHospital real top20 full182 | retrieval score | -0.0647 | [-0.1289, -0.0056] | 3.32e-1 | 1.01e-2 |
+| ShopFacade q50 val103 | candidate rank | -0.0612 | [-0.1307, 0.0078] | 9.48e-3 | 1.10e-1 |
+| ShopFacade q50 val103 | delta pose | -0.0697 | [-0.1165, -0.0225] | 1.86e-9 | 2.82e-3 |
+
+Interpretation:
+
+- OldHospital controlled and OldHospital real retrieval both show a paired
+  selected-cost advantage over clean metadata priors.
+- ShopFacade remains weaker: success-rate paired tests improve over simple
+  priors, but selected-cost CI against candidate rank crosses zero.
+- GT-centered `retrieval_score` is still flagged as oracle-like and excluded
+  from "best clean metadata" in the unified Gate report.
+
+### Real-Retrieval Feature-Shuffle Control
+
+Artifact:
+
+- `result/result/feature_extract/pofd_fs_selector_audits_20260524/oldhospital_real_top20_w100_best_feature_shuffle_full182_b2.json`
+
+OldHospital full182 real retrieval top20, `w100_s60/best.pth`, batch size 2:
+
+| control | pred | top1 | Spearman | basin@5 |
+|---|---:|---:|---:|---:|
+| base | 0.3558 | 0.154 | 0.485 | 0.824 |
+| candidate render shuffle | 0.8230 | 0.077 | 0.054 | 0.802 |
+| query batch shuffle | 0.5681 | 0.033 | 0.090 | 0.742 |
+| wrong-scene render shuffle | 1.2775 | 0.022 | -0.007 | 0.769 |
+| spatial drop high | 0.3630 | 0.159 | 0.464 | 0.819 |
+| spatial drop low | 0.3797 | 0.137 | 0.426 | 0.808 |
+
+Interpretation:
+
+- Real-retrieval feature shuffles provide strong anti-shortcut evidence:
+  candidate/render shuffle, query shuffle, and wrong-scene render evidence all
+  substantially degrade ranking.
+- The real-retrieval spatial high-vs-low utility counterfactual is not yet
+  clean: low-region removal hurts at least as much as high-region removal on
+  selected-cost. This keeps the causal spatial-utility claim partial.
+
+### Unified Gate 1 / Gate 2 Report
+
+Artifacts:
+
+- `result/result/feature_extract/pofd_fs_gate_reports_20260524/gate1_gate2_current.json`
+- `result/result/feature_extract/pofd_fs_gate_reports_20260524/gate1_gate2_current.md`
+
+Current Gate 1 summary:
+
+| label | protocol | pred | top1 | Spearman | basin@5 | best clean metadata top1 |
+|---|---|---:|---:|---:|---:|---:|
+| ShopFacade q50 val103 | controlled_lattice | 0.4471 | 0.233 | 0.160 | 0.748 | 0.068 |
+| OldHospital q50 val128 | controlled_lattice | 0.2227 | 0.719 | 0.586 | 0.984 | 0.508 |
+| OldHospital real top20 full182 | real_retrieval | 0.3360 | 0.203 | 0.506 | 0.927 | 0.115 |
+
+Current Gate 2 mapability summary:
+
+| artifact | tracks | dim | pred | top1 | Spearman | basin@5 | valid px frac |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| projected selected-map retention | 6350 | 64 | 0.3411 | 0.125 | 0.363 | 0.750 | 0.0364 |
+
+Interpretation:
+
+- Gate 1 is stronger than before because protocol-separated reports now carry
+  paired uncertainty and paired tests.
+- Gate 2 anti-shortcut controls are positive on OldHospital controlled and real
+  retrieval.
+- Gate 2 selected 3D mapability remains partial: the projected selected-map
+  bank builds and scores, but retention is still too weak for a final
+  mapability claim.
+
+### ChatGPT-21 Coverage After Round 17
+
+`ChatGPT-21.md` is still not fully implemented. Updated status:
+
+| Requirement | Status | Evidence / gap |
+|---|---|---|
+| Fixed protocol labels and anti-mixing reports | implemented | protocol controls plus unified Gate report |
+| Metadata-only baselines | implemented | clean-baseline selection and oracle-like warnings |
+| Hard-case masks | implemented | included in protocol controls |
+| Feature-shuffle negative controls | implemented for OldHospital q50 and real retrieval | ShopFacade feature-shuffle audit still missing |
+| Paired statistics | partially implemented | bootstrap/McNemar/Wilcoxon in protocol controls; not yet 5-seed training or 10k query-level final tables |
+| Causal spatial utility removal | partial | controlled q50 positive, real retrieval inconclusive |
+| Channel causal removal | partial | interface exists, not yet in unified report matrix |
+| Candidate-generator transfer | partial | separate q50/real/ShopFacade artifacts, no full transfer training matrix |
+| Scene transfer | partial | ShopFacade controls exist; selected utility evidence not yet positive enough |
+| Selected 3D mapability | partial | selected bank and projected scoring work; retention remains weak |
+| Downstream hard-case utility | partial | real retrieval rerank and handoff diagnostics exist; hard-case final pose table not frozen |
+| Paper-level statistics | partial | paired tests implemented; multi-seed selector training and final CI tables not done |
+
+### Verification
+
+- `pytest -q tests/test_localizability_core.py::test_paired_bootstrap_mean_ci_is_deterministic_and_contains_mean tests/test_localizability_core.py::test_mcnemar_and_wilcoxon_paired_tests_report_directional_improvement`
+- `pytest -q tests/test_localizability_protocol_controls.py::test_protocol_controls_summary_compares_pofd_to_available_metadata_baselines`
+- `pytest -q tests/test_localizability_tools.py::test_gate_report_merges_protocol_shuffle_counterfactual_and_mapability_artifacts`
+- OldHospital q50, ShopFacade q50, and OldHospital real retrieval protocol
+  controls regenerated with paired stats.
+- OldHospital real retrieval full182 feature-shuffle audit regenerated with the
+  full182 real-init config.
+
+## Next Automatic Task Allocation After Round 17
+
+1. Add ShopFacade feature-shuffle and spatial utility audits so Gate 2 is not
+   OldHospital-only.
+2. Add channel-level counterfactual rows to the unified Gate report and run the
+   corresponding OldHospital/ShopFacade audits.
+3. Improve selected-map retention by testing denser visibility/projection
+   settings and reporting track variance/separability against raw/PCA.
+4. Build the downstream hard-case final-pose table from identity POFD,
+   guarded refinement, HLoc, and fixed external solver handoff artifacts.
+
+## Round 18 - Cross-Scene Shuffle Audit and Channel Counterfactuals
+
+### ShopFacade Feature-Shuffle Audit
+
+Artifact:
+
+- `result/result/feature_extract/pofd_fs_selector_audits_20260524/shopfacade_q50_pairflow_balancedshuf_feature_shuffle_val103_b2.json`
+
+ShopFacade q50 balanced-shuffle val103, `pairflow_balancedshuf_s20/best.pth`:
+
+| control | pred | top1 | Spearman | basin@5 |
+|---|---:|---:|---:|---:|
+| base | 0.4051 | 0.240 | 0.248 | 0.750 |
+| candidate render shuffle | 0.5815 | 0.067 | -0.109 | 0.404 |
+| query batch shuffle | 0.4556 | 0.245 | 0.189 | 0.716 |
+| wrong-scene render shuffle | 0.4770 | 0.049 | 0.026 | 0.539 |
+| spatial drop high | 0.5307 | 0.125 | -0.065 | 0.442 |
+| spatial drop low | 0.3521 | 0.365 | 0.251 | 0.760 |
+
+Interpretation:
+
+- ShopFacade now has positive cross-scene anti-shortcut evidence:
+  candidate-render shuffle and wrong-scene render shuffle clearly degrade
+  ranking.
+- Spatial utility is positive on ShopFacade: high-utility removal hurts
+  strongly, while low-utility removal improves or preserves ranking.
+- Query-batch shuffle is weaker than render shuffle; it degrades selected cost
+  and Spearman but not top1. This remains a partial control rather than a clean
+  failure mode.
+
+### Channel Counterfactual Audits
+
+Artifacts:
+
+- `result/result/feature_extract/pofd_fs_selector_audits_20260524/oldhospital_q50_w100_best_channel_counterfactual_val128_q50cache_b2.json`
+- `result/result/feature_extract/pofd_fs_selector_audits_20260524/shopfacade_q50_pairflow_balancedshuf_channel_counterfactual_val103_b2.json`
+- `result/result/feature_extract/pofd_fs_selector_audits_20260524/oldhospital_real_top20_w100_best_channel_counterfactual_max128_b2.json`
+
+OldHospital q50 controlled channel result:
+
+| control | pred | top1 | Spearman | basin@5 |
+|---|---:|---:|---:|---:|
+| base | 0.2319 | 0.680 | 0.588 | 0.992 |
+| channel drop high | 0.2168 | 0.734 | 0.655 | 1.000 |
+| channel drop low | 0.2168 | 0.734 | 0.655 | 1.000 |
+
+ShopFacade q50 channel result:
+
+| control | pred | top1 | Spearman | basin@5 |
+|---|---:|---:|---:|---:|
+| base | 0.4051 | 0.240 | 0.248 | 0.750 |
+| channel drop high | 0.4141 | 0.231 | 0.239 | 0.760 |
+| channel drop low | 0.5028 | 0.096 | 0.005 | 0.548 |
+
+OldHospital real top20 max128 diagnostic:
+
+| control | pred | top1 | Spearman | basin@5 |
+|---|---:|---:|---:|---:|
+| base | 0.3367 | 0.148 | 0.451 | 0.797 |
+| channel drop high | 0.3318 | 0.148 | 0.417 | 0.836 |
+| channel drop low | 0.3318 | 0.148 | 0.417 | 0.836 |
+
+Interpretation:
+
+- Channel counterfactuals are now implemented and reported, but the result is
+  not a positive causal-selection claim.
+- OldHospital q50 high/low channel removal both improve metrics; ShopFacade
+  low removal hurts more than high removal.
+- The current group-importance proxy is therefore unreliable. The channel
+  causal claim should be downgraded until channel utility is learned or
+  estimated from gradients/leave-one-group-out evidence rather than plain gate
+  magnitude.
+
+### Gate Report Updated
+
+Artifact updated:
+
+- `result/result/feature_extract/pofd_fs_gate_reports_20260524/gate1_gate2_current.md`
+- `result/result/feature_extract/pofd_fs_gate_reports_20260524/gate1_gate2_current.json`
+
+Coverage is now:
+
+- protocol controls: 3
+- selector audits: 7
+- mapability reports: 1
+
+### ChatGPT-21 Coverage After Round 18
+
+Updated status:
+
+| Requirement | Status | Evidence / gap |
+|---|---|---|
+| Feature-shuffle negative controls | implemented for OldHospital q50, OldHospital real top20, and ShopFacade q50 | positive anti-shortcut evidence |
+| Spatial causal removal | partially positive | OldHospital q50 and ShopFacade q50 positive; OldHospital real top20 inconclusive |
+| Channel causal removal | implemented but negative | current group importance is not valid causal evidence |
+| Unified Gate report | implemented | channel rows now included |
+| Selected 3D mapability | still partial | retention remains weak |
+| Downstream hard-case final-pose utility | still partial | hard-case final-pose table not frozen |
+| Paper-level statistics | still partial | paired tests exist; multi-seed selector training still missing |
+
+## Next Automatic Task Allocation After Round 18
+
+1. Replace channel-importance proxy with explicit leave-one-group-out utility
+   or gradient-based channel utility, then rerun channel counterfactuals.
+2. Add raw/PCA/random same-dim selected-map retention baselines, because
+   selected-map retention is still too weak for Gate 2 mapability.
+3. Build the downstream hard-case final-pose report with identity POFD,
+   guarded refinement, HLoc, and fixed external solver handoff.
+
+## Round 19 - Remaining Gap Closure: LOO Channel Utility, Map Baselines, Gate 3, Seed Stats
+
+### Code Delivered
+
+- `feature_extract/tools/eval_localizability_selector_audits.py`
+  - added `--channel-importance-mode {provided,leave_one_group_out}`;
+  - default is now `leave_one_group_out`;
+  - channel high/low removal can now be ranked by actual selected-cost damage,
+    not by gate magnitude.
+- `feature_extract/tools/report_hard_case_final_pose_table.py`
+  - new hard-case final-pose report;
+  - consumes `--hard-case NAME=path.jsonl` and `--cache METHOD=cache.npz`;
+  - outputs hard-case x method pose metrics without rerunning solvers.
+- `feature_extract/tools/eval_feature_track_mapability.py`
+  - added same-track baseline transforms:
+    - `first_channels`,
+    - `random_projection`,
+    - `pca`;
+  - saves transform state in selected-track bank metadata so query and bank can
+    use the same projection.
+- `feature_extract/tools/eval_projected_selected_track_bank_retention.py`
+  - added `--query-transform {selector,bank_metadata,identity}`;
+  - projected retention can now score raw/PCA/random same-dim banks by applying
+    the bank metadata transform to query features.
+- `feature_extract/tools/report_training_seed_statistics.py`
+  - new multi-seed train-log summary with bootstrap CI;
+  - explicitly marks groups incomplete when fewer than expected seeds exist.
+- `feature_extract/tools/report_localization_evidence_gates.py`
+  - unified report now includes Gate 3 hard-case final-pose rows.
+
+### Leave-One-Group-Out Channel Counterfactuals
+
+Artifacts:
+
+- `result/result/feature_extract/pofd_fs_selector_audits_20260524/oldhospital_q50_w100_best_channel_loo_val128_b2.json`
+- `result/result/feature_extract/pofd_fs_selector_audits_20260524/shopfacade_q50_pairflow_balancedshuf_channel_loo_val103_b2.json`
+
+OldHospital q50 controlled:
+
+| control | pred | top1 | Spearman | basin@5 |
+|---|---:|---:|---:|---:|
+| base | 0.2319 | 0.680 | 0.588 | 0.992 |
+| channel drop high | 0.2679 | 0.602 | 0.639 | 0.992 |
+| channel drop low | 0.1858 | 0.805 | 0.619 | 0.992 |
+
+ShopFacade q50:
+
+| control | pred | top1 | Spearman | basin@5 |
+|---|---:|---:|---:|---:|
+| base | 0.4051 | 0.240 | 0.248 | 0.750 |
+| channel drop high | 0.5842 | 0.038 | 0.005 | 0.567 |
+| channel drop low | 0.3105 | 0.365 | 0.273 | 0.788 |
+
+Interpretation:
+
+- The previous gate-magnitude channel proxy failed.
+- Leave-one-group-out channel utility gives positive high-vs-low degradation on
+  OldHospital q50 and ShopFacade q50.
+- This is still an audit-time utility estimate, not a learned channel-utility
+  head. The next training iteration should supervise channel utility directly
+  from this LOO signal or approximate it with gradients.
+
+### Same-Dim Mapability and Projected Retention Baselines
+
+Track-bank artifacts:
+
+- `result/result/feature_extract/pofd_fs_mapability/oldhospital_first64_track_bank_tracks80_20260524.npz`
+- `result/result/feature_extract/pofd_fs_mapability/oldhospital_random64_track_bank_tracks80_20260524.npz`
+- `result/result/feature_extract/pofd_fs_mapability/oldhospital_pca64_track_bank_tracks80_20260524.npz`
+
+Retention artifacts:
+
+- `result/result/feature_extract/projected_selected_bank_retention/oldhospital_first64_bank_localcorr_densify4_quality_max8_20260524/metrics.json`
+- `result/result/feature_extract/projected_selected_bank_retention/oldhospital_random64_bank_localcorr_densify4_quality_max8_20260524/metrics.json`
+- `result/result/feature_extract/projected_selected_bank_retention/oldhospital_pca64_bank_localcorr_densify4_quality_max8_20260524/metrics.json`
+
+Projected retention comparison, OldHospital q50 max8:
+
+| bank | tracks | pred | top1 | Spearman | basin@5 | valid px frac |
+|---|---:|---:|---:|---:|---:|---:|
+| selected pm-r16 | 6350 | 0.3411 | 0.125 | 0.3625 | 0.750 | 0.0364 |
+| first64 | 6350 | 0.3411 | 0.125 | 0.3625 | 0.750 | 0.0364 |
+| random64 | 6350 | 0.3738 | 0.250 | 0.3607 | 0.625 | 0.0364 |
+| PCA64 | 6350 | 0.4543 | 0.000 | 0.2390 | 0.875 | 0.0364 |
+
+Interpretation:
+
+- Same-dim baselines are now implemented and runnable with the same query-bank
+  transform.
+- The current selected mapability claim remains weak: selected pm-r16 does not
+  beat first64 on this max8 retention smoke.
+- PCA64 is worse on pred/Spearman/top1 but has high basin@5 on this tiny max8
+  subset, so it should not be overinterpreted.
+
+### Gate 3 Hard-Case Final-Pose Report
+
+Artifacts:
+
+- `result/result/feature_extract/pofd_fs_hard_case_final_pose_20260524/oldhospital_real_top20_summary.json`
+- `result/result/feature_extract/pofd_fs_hard_case_final_pose_20260524/oldhospital_real_top20_summary.md`
+
+OldHospital real top20 hard cases:
+
+| case | method | n | trans med mm | R@5deg/250mm |
+|---|---|---:|---:|---:|
+| score false accept | POFD identity | 45 | 386.6 | 0.0 |
+| score false accept | POFD top1 render-LoFTR | 45 | 300.4 | 35.6 |
+| score false accept | POFD top4PnP render-LoFTR | 45 | 333.9 | 37.8 |
+| score false accept | HLoc SP+SG | 45 | 262.9 | 48.9 |
+| retrieval top1 wrong | POFD identity | 50 | 309.2 | 28.0 |
+| retrieval top1 wrong | POFD top4PnP render-LoFTR | 50 | 272.4 | 48.0 |
+| retrieval top1 wrong | HLoc SP+SG | 50 | 231.8 | 54.0 |
+| PnP high-score wrong | POFD identity | 54 | 311.9 | 27.8 |
+| PnP high-score wrong | POFD top4PnP render-LoFTR | 54 | 273.5 | 46.3 |
+| PnP high-score wrong | HLoc SP+SG | 54 | 239.1 | 53.7 |
+
+Interpretation:
+
+- POFD identity is a clean solver-free baseline and is worse than refined
+  variants on hard cases.
+- POFD render-LoFTR handoff improves hard-case final pose over identity.
+- HLoc SP+SG remains stronger on these hard-case final-pose metrics, so the
+  downstream claim should stay "evidence/risk/verification signal", not SOTA
+  final localization.
+
+### Training Seed Statistics
+
+Artifacts:
+
+- `result/result/feature_extract/pofd_fs_training_seed_stats_20260524/selector_existing_seed_stats.json`
+- `result/result/feature_extract/pofd_fs_training_seed_stats_20260524/selector_existing_seed_stats.md`
+
+Current available selector seed summary:
+
+| group | seeds | complete | pred mean | top1 mean | Spearman mean | basin@5 mean |
+|---|---:|---|---:|---:|---:|---:|
+| OldHospital pairmatcher | 3/5 | no | 0.2180 | 0.7292 | 0.5963 | 0.9948 |
+| ShopFacade pairmatcher | 3/5 | no | 0.3886 | 0.2344 | 0.2615 | 0.7188 |
+
+Interpretation:
+
+- The paper-statistics interface is implemented.
+- Existing selector training artifacts are still incomplete for the required
+  5-seed protocol.
+- Remaining work is computational rather than interface work: run two more
+  seeds per final config, then regenerate this report.
+
+### Unified Gate Report
+
+Artifact:
+
+- `result/result/feature_extract/pofd_fs_gate_reports_20260524/gate1_gate2_gate3_current.md`
+- `result/result/feature_extract/pofd_fs_gate_reports_20260524/gate1_gate2_gate3_current.json`
+
+Coverage:
+
+- protocol controls: 3
+- selector audits: 6
+- mapability reports: 4
+- hard-case final-pose reports: 1
+
+### ChatGPT-21 Coverage After Round 19
+
+| Requirement | Status | Evidence / gap |
+|---|---|---|
+| Protocol separation / anti-leak reporting | implemented | unified Gate 1/2/3 report |
+| Metadata-only baselines and paired stats | implemented | protocol controls with bootstrap/McNemar/Wilcoxon |
+| Feature shuffle controls | implemented | OldHospital controlled, real retrieval, ShopFacade |
+| Spatial counterfactuals | partially positive | controlled OldHospital and ShopFacade positive; real retrieval mixed |
+| Channel counterfactuals | implemented and positive with LOO utility | not yet learned as a train-time channel utility head |
+| Same-dim mapability baselines | implemented | first64/random64/PCA64 track banks and projected retention |
+| Selected 3D mapability claim | still weak | selected does not outperform first64 on max8 retention |
+| Downstream hard-case final-pose | implemented | POFD improves over identity but not HLoc SP+SG |
+| Paper-level statistics | interface implemented, data incomplete | only 3/5 selector seeds available |
+
+## Next Automatic Task Allocation After Round 19
+
+1. Launch the missing two selector seeds per final OldHospital/ShopFacade config
+   and regenerate seed statistics.
+2. Train a channel-utility head using LOO or gradient-derived targets so channel
+   causality is not audit-only.
+3. Improve selected 3D map retention beyond first64, or downgrade the mapability
+   claim in the paper narrative.

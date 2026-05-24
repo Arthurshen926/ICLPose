@@ -20,6 +20,11 @@ from feature_extract.localizability.metrics import ranking_metrics  # noqa: E402
 from feature_extract.localizability.protocol import ArtifactProtocol, validate_protocol_metadata  # noqa: E402
 from feature_extract.localizability.reporting import ProtocolResult, format_protocol_summary_markdown  # noqa: E402
 from feature_extract.localizability.score_calibrator import load_candidate_table_jsonl  # noqa: E402
+from feature_extract.localizability.statistics import (  # noqa: E402
+    mcnemar_test,
+    paired_bootstrap_mean_ci,
+    wilcoxon_signed_rank_test,
+)
 
 
 BASELINE_REQUIRED_FIELDS = {
@@ -113,6 +118,39 @@ def _metrics_to_float(metrics: Mapping[str, torch.Tensor]) -> dict[str, float]:
     return {str(key): float(value.detach().cpu()) for key, value in metrics.items()}
 
 
+def _selected_cost_and_success(
+    scores: torch.Tensor,
+    costs: torch.Tensor,
+    basin: torch.Tensor,
+    valid: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    masked_scores = scores.float().masked_fill(~valid.bool(), torch.finfo(scores.float().dtype).min)
+    selected = masked_scores.argmax(dim=1)
+    batch = torch.arange(scores.shape[0], device=scores.device)
+    return costs.float()[batch, selected], basin.bool()[batch, selected]
+
+
+def _paired_stats_against_baselines(
+    pofd_scores: torch.Tensor,
+    baseline_scores: Mapping[str, torch.Tensor],
+    *,
+    costs: torch.Tensor,
+    basin: torch.Tensor,
+    valid: torch.Tensor,
+) -> dict[str, dict]:
+    pofd_cost, pofd_success = _selected_cost_and_success(pofd_scores, costs, basin, valid)
+    out: dict[str, dict] = {}
+    for mode, scores in baseline_scores.items():
+        baseline_cost, baseline_success = _selected_cost_and_success(scores, costs, basin, valid)
+        delta = pofd_cost - baseline_cost
+        out[str(mode)] = {
+            "pred_cost_delta_m": paired_bootstrap_mean_ci(delta, num_bootstrap=10000, seed=20260524),
+            "mcnemar": mcnemar_test(pofd_success, baseline_success),
+            "wilcoxon_cost": wilcoxon_signed_rank_test(pofd_cost, baseline_cost),
+        }
+    return out
+
+
 def _control_warnings(
     protocol_meta: ArtifactProtocol,
     metadata_results: Mapping[str, Mapping[str, float]],
@@ -190,6 +228,7 @@ def summarize_protocol_controls(
     fields = _field_aliases(tensors)
     modes = list(baseline_modes) if baseline_modes is not None else available_metadata_baselines(rows)
     metadata_results: dict[str, dict[str, float]] = {}
+    baseline_score_tensors: dict[str, torch.Tensor] = {}
     for mode in modes:
         if mode == "pofd_score":
             continue
@@ -197,6 +236,7 @@ def summarize_protocol_controls(
             baseline_scores = metadata_baseline_scores(fields, mode=mode, valid_mask=valid)
         except (KeyError, ValueError):
             continue
+        baseline_score_tensors[mode] = baseline_scores
         metadata_results[mode] = _metrics_to_float(
             ranking_metrics(baseline_scores, costs, valid_mask=valid, basin_label=basin, topk=topk_tuple)
         )
@@ -220,6 +260,13 @@ def summarize_protocol_controls(
         "control_warnings": _control_warnings(protocol_meta, metadata_results, tensors),
         "pofd": pofd_metrics,
         "metadata_baselines": metadata_results,
+        "paired_statistics": _paired_stats_against_baselines(
+            tensors["score"].float(),
+            baseline_score_tensors,
+            costs=costs,
+            basin=basin,
+            valid=valid,
+        ),
         "hard_cases": summarize_hard_case_masks(hard_masks),
     }
 

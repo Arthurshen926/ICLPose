@@ -88,11 +88,53 @@ def render_selected_track_feature_maps(
     return rendered, valid
 
 
+def bank_quality_weights(bank: SelectedTrackFeatureBank) -> torch.Tensor:
+    """Return normalized utility/variance quality weights for selected tracks."""
+
+    quality = bank.utility_mean.float().clamp_min(0.0) / (1.0 + bank.feature_variance.float().clamp_min(0.0))
+    finite_positive = torch.isfinite(quality) & (quality > 0.0)
+    if bool(finite_positive.any()):
+        quality = quality / quality[finite_positive].mean().clamp_min(1.0e-12)
+    return quality.clamp_min(0.0)
+
+
+def render_selected_track_quality_maps(
+    bank: SelectedTrackFeatureBank,
+    candidate_w2c: torch.Tensor,
+    intrinsics: torch.Tensor,
+    *,
+    image_hw: tuple[int, int],
+    splat_radius: int = 0,
+    z_eps: float = 1.0e-6,
+) -> torch.Tensor:
+    """Project selected-track quality weights with the same z-buffer as features."""
+
+    quality = bank_quality_weights(bank).to(dtype=bank.features.dtype, device=bank.features.device)[:, None]
+    quality_bank = SelectedTrackFeatureBank(
+        track_ids=bank.track_ids,
+        features=quality,
+        visibility_count=bank.visibility_count,
+        feature_variance=bank.feature_variance,
+        utility_mean=bank.utility_mean,
+        xyz=bank.xyz,
+    )
+    rendered_quality, _valid = render_selected_track_feature_maps(
+        quality_bank,
+        candidate_w2c,
+        intrinsics,
+        image_hw=image_hw,
+        splat_radius=int(splat_radius),
+        z_eps=float(z_eps),
+    )
+    return rendered_quality
+
+
 def densify_projected_feature_maps(
     rendered: torch.Tensor,
     valid: torch.Tensor,
     *,
     radius: int,
+    confidence: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Densify sparse projected feature maps by local valid-neighbor averaging."""
 
@@ -106,10 +148,21 @@ def densify_projected_feature_maps(
     bsz, num_candidates, channels, height, width = rendered.shape
     kernel = 2 * radius + 1
     valid_f = valid.to(device=rendered.device, dtype=rendered.dtype).reshape(bsz * num_candidates, 1, height, width)
-    feat = rendered.reshape(bsz * num_candidates, channels, height, width) * valid_f
+    if confidence is None:
+        weight = valid_f
+    else:
+        if confidence.shape != valid.shape:
+            raise ValueError("confidence must have the same shape as valid")
+        weight = confidence.to(device=rendered.device, dtype=rendered.dtype).clamp_min(0.0).reshape(
+            bsz * num_candidates,
+            1,
+            height,
+            width,
+        ) * valid_f
+    feat = rendered.reshape(bsz * num_candidates, channels, height, width) * weight
     scale = float(kernel * kernel)
     numerator = F.avg_pool2d(feat, kernel_size=kernel, stride=1, padding=radius) * scale
-    denominator = F.avg_pool2d(valid_f, kernel_size=kernel, stride=1, padding=radius) * scale
+    denominator = F.avg_pool2d(weight, kernel_size=kernel, stride=1, padding=radius) * scale
     dense = numerator / denominator.clamp_min(1.0)
     dense_valid = denominator > 0.0
     return (
@@ -131,6 +184,7 @@ def score_projected_selected_track_bank(
     query_rgb: torch.Tensor | None = None,
     render_rgb: torch.Tensor | None = None,
     densify_radius: int = 0,
+    densify_weighting: str = "uniform",
 ) -> tuple[torch.Tensor, dict[str, object]]:
     """Render/project a selected track bank and score it with the shared selector path."""
 
@@ -140,7 +194,22 @@ def score_projected_selected_track_bank(
         intrinsics,
         image_hw=image_hw,
     )
-    rendered, render_valid = densify_projected_feature_maps(rendered, render_valid, radius=int(densify_radius))
+    confidence = None
+    if str(densify_weighting) == "bank_quality":
+        confidence = render_selected_track_quality_maps(
+            bank,
+            candidate_w2c,
+            intrinsics,
+            image_hw=image_hw,
+        )
+    elif str(densify_weighting) != "uniform":
+        raise ValueError("densify_weighting must be 'uniform' or 'bank_quality'")
+    rendered, render_valid = densify_projected_feature_maps(
+        rendered,
+        render_valid,
+        radius=int(densify_radius),
+        confidence=confidence,
+    )
     scores, aux = score_query_with_selected_map_features(
         query_feature,
         rendered.to(device=query_feature.device, dtype=query_feature.dtype),
@@ -157,4 +226,10 @@ def score_projected_selected_track_bank(
     return scores, aux
 
 
-__all__ = ["densify_projected_feature_maps", "render_selected_track_feature_maps", "score_projected_selected_track_bank"]
+__all__ = [
+    "bank_quality_weights",
+    "densify_projected_feature_maps",
+    "render_selected_track_feature_maps",
+    "render_selected_track_quality_maps",
+    "score_projected_selected_track_bank",
+]

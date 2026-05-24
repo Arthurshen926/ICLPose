@@ -19,6 +19,7 @@ from feature_extract.localizability.losses import (  # noqa: E402
     channel_sparsity_loss,
     online_score_hard_negative_loss,
     pose_distance_soft_rank_loss,
+    spatial_utility_evidence_loss,
     spatial_utility_entropy_loss,
 )
 from feature_extract.localizability.metrics import ranking_metrics  # noqa: E402
@@ -110,7 +111,70 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--basin-weight", type=float, default=0.5)
     parser.add_argument("--sparsity-weight", type=float, default=0.01)
     parser.add_argument("--utility-entropy-weight", type=float, default=0.01)
+    parser.add_argument("--utility-evidence-weight", type=float, default=0.0)
+    parser.add_argument("--utility-evidence-score-channel", type=int, default=0)
+    parser.add_argument("--selection-pred-tie-tol", type=float, default=0.0)
+    parser.add_argument(
+        "--selection-tie-metric",
+        choices=("none", "utility_evidence_loss", "eval_utility_evidence_loss"),
+        default="none",
+    )
     return parser.parse_args()
+
+
+def _selector_checkpoint_payload(
+    selector: torch.nn.Module,
+    *,
+    step: int,
+    metrics: dict,
+    args: argparse.Namespace,
+) -> dict:
+    return {
+        "selector_state_dict": selector.state_dict(),
+        "step": int(step),
+        "metrics": dict(metrics),
+        "args": vars(args),
+    }
+
+
+def _is_better_selector_checkpoint(row: dict, best_row: dict | None, args: argparse.Namespace) -> bool:
+    if best_row is None:
+        return True
+    pred = float(row["pred_cost_m"])
+    best_pred = float(best_row["pred_cost_m"])
+    tie_tol = max(0.0, float(getattr(args, "selection_pred_tie_tol", 0.0)))
+    if pred < best_pred - tie_tol:
+        return True
+    if abs(pred - best_pred) <= tie_tol:
+        tie_metric = str(getattr(args, "selection_tie_metric", "none"))
+        if tie_metric != "none" and tie_metric in row and tie_metric in best_row:
+            return float(row[tie_metric]) < float(best_row[tie_metric])
+    return False
+
+
+def _selector_utility_evidence_loss(
+    args: argparse.Namespace,
+    aux: dict[str, torch.Tensor],
+    pose_cost: torch.Tensor,
+    *,
+    valid_mask: torch.Tensor | None,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    zero = pose_cost.sum() * 0.0
+    metrics = {"utility_evidence_active": pose_cost.new_zeros(())}
+    tie_metric = str(getattr(args, "selection_tie_metric", "none"))
+    enabled = (
+        float(getattr(args, "utility_evidence_weight", 0.0)) != 0.0
+        or tie_metric in {"utility_evidence_loss", "eval_utility_evidence_loss"}
+    )
+    if not enabled or "score_maps" not in aux or "query_utility" not in aux:
+        return zero, metrics
+    return spatial_utility_evidence_loss(
+        aux["score_maps"],
+        aux["query_utility"],
+        pose_cost,
+        valid_mask=valid_mask,
+        score_channel=int(getattr(args, "utility_evidence_score_channel", 0)),
+    )
 
 
 def _set_selector_trainable(selector: LocalizationFeatureSelector, args: argparse.Namespace) -> list[torch.nn.Parameter]:
@@ -270,7 +334,7 @@ def _evaluate(
     with torch.no_grad():
         for batch in loader:
             batch = move_batch_to_device(batch, device)
-            scores, pose_cost, trans_err, rot_err, valid, _aux = _forward_scores(
+            scores, pose_cost, trans_err, rot_err, valid, aux = _forward_scores(
                 args,
                 model=model,
                 map_renderer=map_renderer,
@@ -281,7 +345,11 @@ def _evaluate(
                 score_hw=score_hw,
             )
             basin = (trans_err <= float(args.basin_trans_m)) & (rot_err <= float(args.basin_rot_deg))
-            rows.append(ranking_metrics(scores, pose_cost, valid_mask=valid, basin_label=basin, topk=(1, 5)))
+            row = ranking_metrics(scores, pose_cost, valid_mask=valid, basin_label=basin, topk=(1, 5))
+            evidence_loss, evidence_metrics = _selector_utility_evidence_loss(args, aux, pose_cost, valid_mask=valid)
+            row["eval_utility_evidence_loss"] = evidence_loss.detach()
+            row["eval_utility_evidence_active"] = evidence_metrics["utility_evidence_active"].detach()
+            rows.append(row)
     selector.train()
     out = {"split": "eval", "step": int(step)}
     for key in rows[0]:
@@ -330,7 +398,7 @@ def main() -> None:
     trainable_params = _set_selector_trainable(selector, args)
     optimizer = torch.optim.AdamW(trainable_params, lr=float(args.lr), weight_decay=float(args.weight_decay))
     score_hw = _parse_hw(args.score_feature_hw)
-    best = float("inf")
+    best_row = None
     train_iter = iter(train_loader)
     log_path = out_dir / "train_log.jsonl"
     with log_path.open("w", encoding="utf-8") as log:
@@ -355,12 +423,14 @@ def main() -> None:
             basin = (trans_err <= float(args.basin_trans_m)) & (rot_err <= float(args.basin_rot_deg))
             rank_loss, _rank = pose_distance_soft_rank_loss(scores, pose_cost, valid_mask=valid)
             hard_loss, _hard = online_score_hard_negative_loss(scores, pose_cost, valid_mask=valid)
+            evidence_loss, evidence_metrics = _selector_utility_evidence_loss(args, aux, pose_cost, valid_mask=valid)
             loss = (
                 float(args.rank_weight) * rank_loss
                 + float(args.hard_weight) * hard_loss
                 + float(args.basin_weight) * basin_bce_loss(scores, basin, valid_mask=valid)
                 + float(args.sparsity_weight) * channel_sparsity_loss(aux["query_channel_gate"])
                 + float(args.utility_entropy_weight) * spatial_utility_entropy_loss(aux["query_utility"])
+                + float(args.utility_evidence_weight) * evidence_loss
             )
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -379,20 +449,16 @@ def main() -> None:
                     step=step,
                 )
                 row["loss"] = float(loss.detach().cpu())
+                row["utility_evidence_loss"] = float(evidence_loss.detach().cpu())
+                row["utility_evidence_active"] = float(evidence_metrics["utility_evidence_active"].detach().cpu())
                 log.write(json.dumps(row) + "\n")
                 log.flush()
                 print(json.dumps(row), flush=True)
-                if row["pred_cost_m"] < best:
-                    best = row["pred_cost_m"]
-                    torch.save(
-                        {
-                            "selector_state_dict": selector.state_dict(),
-                            "step": int(step),
-                            "metrics": row,
-                            "args": vars(args),
-                        },
-                        out_dir / "best.pth",
-                    )
+                payload = _selector_checkpoint_payload(selector, step=step, metrics=row, args=args)
+                torch.save(payload, out_dir / "last.pth")
+                if _is_better_selector_checkpoint(row, best_row, args):
+                    best_row = dict(row)
+                    torch.save(payload, out_dir / "best.pth")
 
 
 if __name__ == "__main__":

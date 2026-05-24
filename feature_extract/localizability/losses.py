@@ -101,3 +101,64 @@ def spatial_utility_entropy_loss(utility: torch.Tensor) -> torch.Tensor:
     utility = utility.float().clamp(1.0e-6, 1.0 - 1.0e-6)
     entropy = -(utility * utility.log() + (1.0 - utility) * (1.0 - utility).log())
     return entropy.mean()
+
+
+def spatial_utility_evidence_loss(
+    score_maps: torch.Tensor,
+    utility: torch.Tensor,
+    pose_cost_m: torch.Tensor,
+    *,
+    valid_mask: torch.Tensor | None = None,
+    score_channel: int = 0,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Align utility with pixels where the oracle candidate beats hard alternatives."""
+
+    if score_maps.ndim == 5:
+        channels = int(score_maps.shape[2])
+        channel = int(score_channel)
+        if channel < 0:
+            channel = channels + channel
+        if channel < 0 or channel >= channels:
+            raise ValueError("score_channel outside score_maps channel range")
+        score_maps = score_maps[:, :, channel]
+    if score_maps.ndim != 4:
+        raise ValueError("score_maps must have shape (B,K,H,W) or (B,K,C,H,W)")
+    if pose_cost_m.ndim != 2 or pose_cost_m.shape != score_maps.shape[:2]:
+        raise ValueError("pose_cost_m must have shape (B,K) matching score_maps")
+    if utility.ndim != 4 or utility.shape[0] != score_maps.shape[0] or utility.shape[1] != 1:
+        raise ValueError("utility must have shape (B,1,H,W)")
+    if utility.shape[-2:] != score_maps.shape[-2:]:
+        utility = F.interpolate(utility.float(), size=score_maps.shape[-2:], mode="bilinear", align_corners=False)
+
+    valid = valid_mask.bool().to(device=score_maps.device) if valid_mask is not None else torch.ones_like(pose_cost_m, dtype=torch.bool)
+    rows = []
+    targets = []
+    for bidx in range(score_maps.shape[0]):
+        row_valid = valid[bidx]
+        if not bool(row_valid.any()):
+            continue
+        row_cost = pose_cost_m[bidx].float().to(device=score_maps.device).masked_fill(~row_valid, float("inf"))
+        oracle_idx = int(row_cost.argmin())
+        non_oracle = row_valid.clone()
+        non_oracle[oracle_idx] = False
+        oracle_map = score_maps[bidx, oracle_idx].float()
+        if bool(non_oracle.any()):
+            competitor = score_maps[bidx, non_oracle].float().amax(dim=0)
+            evidence = oracle_map - competitor
+        else:
+            evidence = oracle_map
+        finite = torch.isfinite(evidence)
+        if not bool(finite.any()):
+            continue
+        evidence = evidence.masked_fill(~finite, 0.0)
+        ev_min = evidence.amin()
+        ev_max = evidence.amax()
+        target = (evidence - ev_min) / (ev_max - ev_min).clamp_min(1.0e-6)
+        rows.append(utility[bidx, 0].float().clamp(1.0e-6, 1.0 - 1.0e-6))
+        targets.append(target.detach())
+    if not rows:
+        return utility.sum() * 0.0, {"utility_evidence_active": utility.new_zeros(())}
+    pred = torch.stack(rows, dim=0)
+    target = torch.stack(targets, dim=0)
+    loss = F.binary_cross_entropy(pred, target)
+    return loss, {"utility_evidence_active": utility.new_tensor(float(len(rows)) / float(score_maps.shape[0]))}
