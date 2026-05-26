@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Iterable, Tuple
@@ -50,6 +52,24 @@ class EvaluationProtocol:
     @property
     def deployment_like(self) -> bool:
         return self.kind == ProtocolKind.REAL_RETRIEVAL and not self.candidate_uses_gt
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "name": self.name,
+            "kind": self.kind.value,
+            "split": self.split,
+            "candidate_generator": self.candidate_generator,
+            "allowed_training_inputs": list(self.allowed_training_inputs),
+            "candidate_uses_gt": self.candidate_uses_gt,
+            "solver_conditioned": self.solver_conditioned,
+            "notes": self.notes,
+            "gate": self.gate,
+            "metadata_fields": list(self.metadata_fields),
+        }
+
+    def fingerprint(self) -> str:
+        payload = json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
 def validate_no_leakage(

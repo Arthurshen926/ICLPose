@@ -1,11 +1,14 @@
 scene: ShopFacade
 dataset_family: CambridgeLandmarks
-image_root: dataset/ShopFacade
-map_root: output/maps/ShopFacade
+image_root: /hy-tmp/Cambridge_stdloc/ShopFacade
+map_root: /hy-tmp/Cambridge_stdloc/CambridgeLandmarks_Colmap_Retriangulated_1024px/ShopFacade/model_train
+sparse_root: /hy-tmp/Cambridge_stdloc/ShopFacade/sparse/0
 splits:
-  train: dataset/ShopFacade/splits/train.txt
-  val: dataset/ShopFacade/splits/val.txt
-  test: dataset/ShopFacade/splits/test.txt
+  train: /hy-tmp/Cambridge_stdloc/ShopFacade/dataset_train.txt
+  val: /hy-tmp/Cambridge_stdloc/ShopFacade/dataset_test.txt
+  test: /hy-tmp/Cambridge_stdloc/ShopFacade/dataset_test.txt
+  db: /hy-tmp/Cambridge_stdloc/CambridgeLandmarks_Colmap_Retriangulated_1024px/ShopFacade/list_db.txt
+  query: /hy-tmp/Cambridge_stdloc/CambridgeLandmarks_Colmap_Retriangulated_1024px/ShopFacade/list_query.txt
 raw_vfm_tokens:
   output_root: output/vfm_tokens/ShopFacade
   models:
@@ -13,6 +16,7 @@ raw_vfm_tokens:
       layers: [final]
       stride: 16
       save_summary: true
+  optional_models:
     - name: dinov2
       layers: [final]
       stride: 14

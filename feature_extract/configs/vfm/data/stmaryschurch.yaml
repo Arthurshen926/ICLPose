@@ -1,0 +1,26 @@
+scene: StMarysChurch
+dataset_family: CambridgeLandmarks
+image_root: /hy-tmp/Cambridge_stdloc/StMarysChurch
+map_root: /hy-tmp/Cambridge_stdloc/CambridgeLandmarks_Colmap_Retriangulated_1024px/StMarysChurch/model_train
+sparse_root: /hy-tmp/Cambridge_stdloc/StMarysChurch/sparse/0
+splits:
+  train: /hy-tmp/Cambridge_stdloc/StMarysChurch/dataset_train.txt
+  val: /hy-tmp/Cambridge_stdloc/StMarysChurch/dataset_test.txt
+  test: /hy-tmp/Cambridge_stdloc/StMarysChurch/dataset_test.txt
+  db: /hy-tmp/Cambridge_stdloc/CambridgeLandmarks_Colmap_Retriangulated_1024px/StMarysChurch/list_db.txt
+  query: /hy-tmp/Cambridge_stdloc/CambridgeLandmarks_Colmap_Retriangulated_1024px/StMarysChurch/list_query.txt
+raw_vfm_tokens:
+  output_root: output/vfm_tokens/StMarysChurch
+  models:
+    - name: c-radio_v4-h
+      layers: [final]
+      stride: 16
+      save_summary: true
+  optional_models:
+    - name: dinov2
+      layers: [final]
+      stride: 14
+      save_summary: false
+normalization:
+  mode: per_layer_l2
+  whitening: optional_unsupervised_train_split_only

@@ -1,0 +1,26 @@
+scene: GreatCourt
+dataset_family: CambridgeLandmarks
+image_root: /hy-tmp/Cambridge_stdloc/GreatCourt
+map_root: /hy-tmp/Cambridge_stdloc/CambridgeLandmarks_Colmap_Retriangulated_1024px/GreatCourt/model_train
+sparse_root: /hy-tmp/Cambridge_stdloc/GreatCourt/sparse/0
+splits:
+  train: /hy-tmp/Cambridge_stdloc/GreatCourt/dataset_train.txt
+  val: /hy-tmp/Cambridge_stdloc/GreatCourt/dataset_test.txt
+  test: /hy-tmp/Cambridge_stdloc/GreatCourt/dataset_test.txt
+  db: /hy-tmp/Cambridge_stdloc/CambridgeLandmarks_Colmap_Retriangulated_1024px/GreatCourt/list_db.txt
+  query: /hy-tmp/Cambridge_stdloc/CambridgeLandmarks_Colmap_Retriangulated_1024px/GreatCourt/list_query.txt
+raw_vfm_tokens:
+  output_root: output/vfm_tokens/GreatCourt
+  models:
+    - name: c-radio_v4-h
+      layers: [final]
+      stride: 16
+      save_summary: true
+  optional_models:
+    - name: dinov2
+      layers: [final]
+      stride: 14
+      save_summary: false
+normalization:
+  mode: per_layer_l2
+  whitening: optional_unsupervised_train_split_only

@@ -1,11 +1,14 @@
 scene: OldHospital
 dataset_family: CambridgeLandmarks
-image_root: dataset/OldHospital
-map_root: output/maps/OldHospital
+image_root: /hy-tmp/Cambridge_stdloc/OldHospital
+map_root: /hy-tmp/Cambridge_stdloc/CambridgeLandmarks_Colmap_Retriangulated_1024px/OldHospital/model_train
+sparse_root: /hy-tmp/Cambridge_stdloc/OldHospital/sparse/0
 splits:
-  train: dataset/OldHospital/splits/train.txt
-  val: dataset/OldHospital/splits/val.txt
-  test: dataset/OldHospital/splits/test.txt
+  train: /hy-tmp/Cambridge_stdloc/OldHospital/dataset_train.txt
+  val: /hy-tmp/Cambridge_stdloc/OldHospital/dataset_test.txt
+  test: /hy-tmp/Cambridge_stdloc/OldHospital/dataset_test.txt
+  db: /hy-tmp/Cambridge_stdloc/CambridgeLandmarks_Colmap_Retriangulated_1024px/OldHospital/list_db.txt
+  query: /hy-tmp/Cambridge_stdloc/CambridgeLandmarks_Colmap_Retriangulated_1024px/OldHospital/list_query.txt
 raw_vfm_tokens:
   output_root: output/vfm_tokens/OldHospital
   models:
@@ -13,6 +16,7 @@ raw_vfm_tokens:
       layers: [final]
       stride: 16
       save_summary: true
+  optional_models:
     - name: dinov2
       layers: [final]
       stride: 14

@@ -33,16 +33,19 @@ class CandidateHypothesis:
 
     candidate_id: str
     candidate_type: str
-    pose_error: PoseCost
+    pose_error: Optional[PoseCost] = None
     prior_score: Optional[float] = None
     pose: Optional[object] = None
     reference_image: Optional[str] = None
     submap_id: Optional[str] = None
     solver_success: Optional[bool] = None
     hard_case_type: Optional[str] = None
+    query_id: Optional[str] = None
     metadata: Mapping[str, object] = field(default_factory=dict)
 
     def basin_label(self, translation_threshold_m: float, rotation_threshold_deg: float) -> bool:
+        if self.pose_error is None:
+            raise ValueError("pose_error is required to compute a basin label")
         return self.pose_error.in_basin(translation_threshold_m, rotation_threshold_deg)
 
 
@@ -53,7 +56,7 @@ def assign_basin_labels(
 ) -> Dict[str, bool]:
     """Return solver-basin labels keyed by candidate id."""
 
-    return {
-        h.candidate_id: h.basin_label(translation_threshold_m, rotation_threshold_deg)
-        for h in hypotheses
-    }
+    labels: Dict[str, bool] = {}
+    for h in hypotheses:
+        labels[h.candidate_id] = h.basin_label(translation_threshold_m, rotation_threshold_deg)
+    return labels

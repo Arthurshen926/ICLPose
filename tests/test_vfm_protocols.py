@@ -27,13 +27,35 @@ def test_protocol_rejects_training_input_leakage():
         )
 
 
+def test_protocol_fingerprint_is_stable_and_sensitive():
+    protocol = EvaluationProtocol(
+        name="oldhospital_real_top20",
+        kind=ProtocolKind.REAL_RETRIEVAL,
+        split="test",
+        candidate_generator="hloc_retrieval_top20",
+        allowed_training_inputs=("query_tokens", "candidate_tokens"),
+        candidate_uses_gt=False,
+        solver_conditioned=False,
+    )
+    same = EvaluationProtocol(**protocol.to_dict())
+    changed = EvaluationProtocol(
+        **{
+            **protocol.to_dict(),
+            "candidate_generator": "different_generator",
+        }
+    )
+
+    assert protocol.fingerprint() == same.fingerprint()
+    assert protocol.fingerprint() != changed.fingerprint()
+
+
 def test_controlled_lattice_protocol_must_disclose_gt_candidate_generation():
     with pytest.raises(ValueError, match="GT-centered"):
         EvaluationProtocol(
-            name="oldhospital_q50",
+            name="oldhospital_controlled_lattice",
             kind=ProtocolKind.CONTROLLED_LATTICE,
             split="val",
-            candidate_generator="local_lattice_q50",
+            candidate_generator="gt_centered_local_lattice",
             allowed_training_inputs=("query_tokens", "candidate_tokens"),
             candidate_uses_gt=False,
             solver_conditioned=False,

@@ -23,10 +23,10 @@ def test_selector_outputs_compact_feature_utility_and_uncertainty():
 
 def test_reporting_refuses_to_merge_controlled_and_real_protocols():
     controlled = EvaluationProtocol(
-        name="oldhospital_q50_val",
+        name="oldhospital_controlled_lattice_val",
         kind=ProtocolKind.CONTROLLED_LATTICE,
         split="val",
-        candidate_generator="gt_centered_q50_lattice",
+        candidate_generator="gt_centered_local_lattice",
         allowed_training_inputs=("query_tokens", "candidate_tokens"),
         candidate_uses_gt=True,
         solver_conditioned=False,

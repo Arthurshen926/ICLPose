@@ -65,6 +65,29 @@ def spearman_rank(x: Sequence[float], y: Sequence[float]) -> float:
     return float(np.dot(rx, ry) / denom)
 
 
+def kendall_tau(x: Sequence[float], y: Sequence[float]) -> float:
+    x_array = _as_1d(x, "x")
+    y_array = _as_1d(y, "y")
+    if x_array.size != y_array.size:
+        raise ValueError("x and y must have the same length")
+    concordant = 0
+    discordant = 0
+    for i in range(x_array.size):
+        for j in range(i + 1, x_array.size):
+            dx = np.sign(x_array[i] - x_array[j])
+            dy = np.sign(y_array[i] - y_array[j])
+            if dx == 0 or dy == 0:
+                continue
+            if dx == dy:
+                concordant += 1
+            else:
+                discordant += 1
+    total = concordant + discordant
+    if total == 0:
+        return 0.0
+    return float((concordant - discordant) / total)
+
+
 def ndcg_at_k(scores: Sequence[float], relevance: Sequence[float], k: int) -> float:
     score_array = _as_1d(scores, "scores")
     rel = _as_1d(relevance, "relevance")
@@ -116,6 +139,51 @@ def hard_false_accept_rate(
     if not np.any(accepted):
         return 0.0
     return float(np.mean(~labels[accepted]))
+
+
+def calibration_ece(
+    probabilities: Sequence[float],
+    success_labels: Sequence[bool],
+    bins: int = 10,
+) -> float:
+    probs = np.clip(_as_1d(probabilities, "probabilities"), 0.0, 1.0)
+    labels = np.asarray(success_labels, dtype=np.float64).reshape(-1)
+    if probs.size != labels.size:
+        raise ValueError("probabilities and success_labels must have the same length")
+    if bins <= 0:
+        raise ValueError("bins must be positive")
+    edges = np.linspace(0.0, 1.0, bins + 1)
+    ece = 0.0
+    for idx in range(bins):
+        if idx == bins - 1:
+            mask = (probs >= edges[idx]) & (probs <= edges[idx + 1])
+        else:
+            mask = (probs >= edges[idx]) & (probs < edges[idx + 1])
+        if not np.any(mask):
+            continue
+        confidence = float(np.mean(probs[mask]))
+        accuracy = float(np.mean(labels[mask]))
+        ece += float(np.mean(mask)) * abs(confidence - accuracy)
+    return ece
+
+
+def risk_coverage_auc(risks: Sequence[float], success_labels: Sequence[bool]) -> float:
+    risk_array = _as_1d(risks, "risks")
+    labels = np.asarray(success_labels, dtype=bool).reshape(-1)
+    if risk_array.size != labels.size:
+        raise ValueError("risks and success_labels must have the same length")
+    order = np.argsort(risk_array, kind="mergesort")
+    sorted_success = labels[order].astype(np.float64)
+    coverage = np.arange(1, sorted_success.size + 1, dtype=np.float64) / sorted_success.size
+    selective_accuracy = np.cumsum(sorted_success) / np.arange(1, sorted_success.size + 1)
+    return float(np.trapz(selective_accuracy, coverage) + selective_accuracy[0] * coverage[0])
+
+
+def catastrophic_failure_rate(costs_m: Sequence[float], threshold_m: float) -> float:
+    costs = _as_1d(costs_m, "costs_m")
+    if threshold_m < 0.0:
+        raise ValueError("threshold_m must be non-negative")
+    return float(np.mean(costs > threshold_m))
 
 
 def ranking_summary(

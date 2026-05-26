@@ -1,7 +1,13 @@
 import numpy as np
 import pytest
 
-from feature_extract.vfm.map_lifting import TrackObservation, aggregate_selected_tracks
+from feature_extract.vfm.map_lifting import (
+    TrackObservation,
+    aggregate_selected_tracks,
+    load_selected_track_bank_npz,
+    mapability_summary,
+    save_selected_track_bank_npz,
+)
 from feature_extract.vfm.metrics import (
     basin_recall_at_k,
     hard_false_accept_rate,
@@ -74,3 +80,24 @@ def test_selected_track_aggregation_filters_visibility_and_geometry():
     np.testing.assert_allclose(bank.tracks[7].mean_feature, np.array([2.0, 3.0], dtype=np.float32))
     assert bank.tracks[7].observation_count == 2
     assert bank.tracks[7].mean_variance > 0.0
+
+
+def test_selected_track_bank_round_trip_and_summary(tmp_path):
+    observations = [
+        TrackObservation(1, "a", np.array([1.0, 0.0], dtype=np.float32), True, True, utility=0.8),
+        TrackObservation(1, "b", np.array([0.8, 0.2], dtype=np.float32), True, True, utility=0.6),
+        TrackObservation(2, "a", np.array([0.0, 1.0], dtype=np.float32), True, True, utility=0.4),
+        TrackObservation(2, "b", np.array([0.1, 0.9], dtype=np.float32), True, True, utility=0.5),
+    ]
+    bank = aggregate_selected_tracks(observations, min_observations=2)
+    path = tmp_path / "selected_tracks.npz"
+
+    save_selected_track_bank_npz(bank, path)
+    loaded = load_selected_track_bank_npz(path)
+    summary = mapability_summary(loaded)
+
+    assert set(loaded.tracks) == {1, 2}
+    assert loaded.feature_dim == 2
+    assert summary.track_count == 2
+    assert summary.mean_observation_count == pytest.approx(2.0)
+    assert summary.mean_track_variance > 0.0

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
-from typing import Dict, Iterable, Mapping
+from pathlib import Path
+from typing import Dict, Iterable, Mapping, Tuple
 
 import numpy as np
 
@@ -25,6 +27,7 @@ class TrackFeature:
     variance: np.ndarray
     observation_count: int
     mean_utility: float
+    observation_image_ids: Tuple[str, ...] = ()
 
     @property
     def mean_variance(self) -> float:
@@ -38,6 +41,15 @@ class SelectedTrackFeatureBank:
 
     def __len__(self) -> int:
         return len(self.tracks)
+
+
+@dataclass(frozen=True)
+class TrackBankMapabilitySummary:
+    track_count: int
+    feature_dim: int
+    mean_observation_count: float
+    mean_track_variance: float
+    mean_utility: float
 
 
 def aggregate_selected_tracks(
@@ -81,6 +93,86 @@ def aggregate_selected_tracks(
             variance=matrix.var(axis=0),
             observation_count=int(matrix.shape[0]),
             mean_utility=float(utilities.mean()),
+            observation_image_ids=tuple(sorted({obs.image_id for obs in track_obs})),
         )
 
     return SelectedTrackFeatureBank(tracks=tracks, feature_dim=int(feature_dim or 0))
+
+
+def save_selected_track_bank_npz(bank: SelectedTrackFeatureBank, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    track_ids = np.asarray(sorted(bank.tracks), dtype=np.int64)
+    if len(track_ids) == 0:
+        mean_features = np.zeros((0, bank.feature_dim), dtype=np.float32)
+        variances = np.zeros((0, bank.feature_dim), dtype=np.float32)
+        observation_counts = np.zeros((0,), dtype=np.int64)
+        mean_utilities = np.zeros((0,), dtype=np.float32)
+        observation_image_ids = np.zeros((0,), dtype=str)
+    else:
+        ordered = [bank.tracks[int(track_id)] for track_id in track_ids]
+        mean_features = np.stack([track.mean_feature for track in ordered], axis=0).astype(np.float32)
+        variances = np.stack([track.variance for track in ordered], axis=0).astype(np.float32)
+        observation_counts = np.asarray([track.observation_count for track in ordered], dtype=np.int64)
+        mean_utilities = np.asarray([track.mean_utility for track in ordered], dtype=np.float32)
+        observation_image_ids = np.asarray(
+            [json.dumps(list(track.observation_image_ids), sort_keys=True) for track in ordered],
+            dtype=str,
+        )
+    np.savez_compressed(
+        path,
+        track_ids=track_ids,
+        mean_features=mean_features,
+        variances=variances,
+        observation_counts=observation_counts,
+        mean_utilities=mean_utilities,
+        observation_image_ids=observation_image_ids,
+        feature_dim=np.asarray(bank.feature_dim, dtype=np.int64),
+    )
+
+
+def load_selected_track_bank_npz(path: Path) -> SelectedTrackFeatureBank:
+    with np.load(path) as data:
+        track_ids = data["track_ids"].astype(np.int64)
+        mean_features = data["mean_features"].astype(np.float32)
+        variances = data["variances"].astype(np.float32)
+        observation_counts = data["observation_counts"].astype(np.int64)
+        mean_utilities = data["mean_utilities"].astype(np.float32)
+        if "observation_image_ids" in data:
+            observation_image_ids = tuple(str(item) for item in data["observation_image_ids"].tolist())
+        else:
+            observation_image_ids = tuple("" for _ in track_ids)
+        feature_dim = int(data["feature_dim"])
+    tracks: Dict[int, TrackFeature] = {}
+    for idx, track_id in enumerate(track_ids):
+        if observation_image_ids[idx]:
+            track_observation_image_ids = tuple(str(item) for item in json.loads(observation_image_ids[idx]))
+        else:
+            track_observation_image_ids = ()
+        tracks[int(track_id)] = TrackFeature(
+            track_id=int(track_id),
+            mean_feature=mean_features[idx],
+            variance=variances[idx],
+            observation_count=int(observation_counts[idx]),
+            mean_utility=float(mean_utilities[idx]),
+            observation_image_ids=track_observation_image_ids,
+        )
+    return SelectedTrackFeatureBank(tracks=tracks, feature_dim=feature_dim)
+
+
+def mapability_summary(bank: SelectedTrackFeatureBank) -> TrackBankMapabilitySummary:
+    if not bank.tracks:
+        return TrackBankMapabilitySummary(
+            track_count=0,
+            feature_dim=bank.feature_dim,
+            mean_observation_count=0.0,
+            mean_track_variance=0.0,
+            mean_utility=0.0,
+        )
+    tracks = list(bank.tracks.values())
+    return TrackBankMapabilitySummary(
+        track_count=len(tracks),
+        feature_dim=bank.feature_dim,
+        mean_observation_count=float(np.mean([track.observation_count for track in tracks])),
+        mean_track_variance=float(np.mean([track.mean_variance for track in tracks])),
+        mean_utility=float(np.mean([track.mean_utility for track in tracks])),
+    )

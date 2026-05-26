@@ -12,6 +12,7 @@ Model: C-RADIOv4-H (ViT-H/16, 653M params)
 """
 
 import sys
+from contextlib import nullcontext
 import torch
 import torch.nn.functional as F
 from pathlib import Path
@@ -60,7 +61,12 @@ class RADIOFeatureExtractor:
 
         image_tensor = image_tensor.to(self.device)
 
-        with torch.autocast('cuda', dtype=torch.bfloat16):
+        autocast_context = (
+            torch.autocast('cuda', dtype=torch.bfloat16)
+            if self.device.type == 'cuda'
+            else nullcontext()
+        )
+        with autocast_context:
             summary, features = self.model(image_tensor, feature_fmt='NCHW')
 
         # features: (1, 1280, Hp, Wp), summary: (1, 2560)
@@ -97,7 +103,12 @@ class RADIOFeatureExtractor:
 
         image_tensors = image_tensors.to(self.device)
 
-        with torch.autocast('cuda', dtype=torch.bfloat16):
+        autocast_context = (
+            torch.autocast('cuda', dtype=torch.bfloat16)
+            if self.device.type == 'cuda'
+            else nullcontext()
+        )
+        with autocast_context:
             summary, features = self.model(image_tensors, feature_fmt='NCHW')
 
         return {
