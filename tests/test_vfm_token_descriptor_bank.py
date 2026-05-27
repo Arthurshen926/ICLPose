@@ -57,6 +57,70 @@ def test_build_token_descriptor_bank_mean_pools_and_round_trips(tmp_path):
     np.testing.assert_allclose(loaded.descriptors, bank.descriptors)
 
 
+def test_build_token_descriptor_bank_signed_gem_handles_negative_features(tmp_path):
+    manifest = TokenBankManifest(
+        records=(
+            _record(
+                tmp_path,
+                "a.png",
+                np.array(
+                    [
+                        [[1.0, 8.0]],
+                        [[-1.0, -8.0]],
+                    ]
+                ),
+            ),
+        )
+    )
+
+    bank = build_token_descriptor_bank(
+        manifest,
+        layer_name="radio_final",
+        pooling="gem",
+        gem_power=3.0,
+        normalize=False,
+    )
+
+    expected = ((np.array([1.0, 512.0], dtype=np.float32).mean()) ** (1.0 / 3.0))
+    assert bank.pooling == "gem"
+    assert bank.metadata["gem_power"] == 3.0
+    np.testing.assert_allclose(
+        bank.descriptors,
+        np.asarray([[expected, -expected]], dtype=np.float32),
+    )
+
+
+def test_build_token_descriptor_bank_can_normalize_tokens_before_pooling(tmp_path):
+    manifest = TokenBankManifest(
+        records=(
+            _record(
+                tmp_path,
+                "a.png",
+                np.array(
+                    [
+                        [[3.0, 0.0]],
+                        [[4.0, 2.0]],
+                    ]
+                ),
+            ),
+        )
+    )
+
+    bank = build_token_descriptor_bank(
+        manifest,
+        layer_name="radio_final",
+        pooling="mean",
+        normalize_tokens=True,
+        normalize=False,
+    )
+
+    np.testing.assert_allclose(
+        bank.descriptors,
+        np.asarray([[(3.0 / 5.0 + 0.0) / 2.0, (4.0 / 5.0 + 1.0) / 2.0]], dtype=np.float32),
+    )
+    assert bank.metadata["normalize_tokens"] is True
+
+
 def test_score_candidate_bank_by_descriptor_cosine_prefers_matching_reference(tmp_path):
     query_bank = TokenDescriptorBank(
         image_ids=("q.png",),

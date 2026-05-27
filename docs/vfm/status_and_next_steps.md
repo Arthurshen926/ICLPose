@@ -1063,6 +1063,316 @@ track mapability without losing solver-free evidence. It is not yet a promotion
 result because PCA64 remains stronger on mapability and ShopFacade loses
 pred/gap/Spearman while improving top1 and track variance.
 
+## Raw VFM 3D Landmark Feature Aggregation Reset
+
+We paused the selector/rendered-map/refinement branch and implemented a simpler
+first-stage protocol: raw high-dimensional VFM token observations are sampled at
+COLMAP track coordinates and aggregated directly into explicit 3D landmark
+features. This follows the ULF-Loc/OpenGaFF-style premise that the first
+artifact should be an unbiased 3D VFM landmark bank before any learned selector
+or feature field is introduced.
+
+Implemented artifacts:
+
+- `feature_extract/vfm/landmark_feature_aggregation.py`
+- `feature_extract/tools/vfm/build_raw_vfm_landmark_bank.py`
+- `tests/test_vfm_landmark_feature_aggregation.py`
+
+Supported aggregation methods:
+
+- `mean`
+- `random_observation`
+- `geometry_weighted`
+- `robust_trimmed_mean`
+- `view_consistent`
+
+The first real 20k-observation banks were generated for OldHospital and
+ShopFacade under `output/vfm/raw_landmark_banks/`. Features are raw RADIO token
+vectors with per-observation L2 normalization before aggregation.
+
+| scene | method | utility mode | tracks | obs/track | variance | split cos | heldout R@1 | heldout R@5 | mean rank |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| OldHospital | mean | uniform | 3244 | 6.17 | 0.0000916 | 0.9460 | 0.269 | 0.652 | 9.14 |
+| OldHospital | geometry_weighted | inv-reproj + center | 3244 | 6.17 | 0.0000876 | 0.9458 | 0.267 | 0.651 | 9.23 |
+| OldHospital | robust_trimmed_mean | uniform | 3244 | 5.38 | 0.0000802 | 0.9434 | 0.260 | 0.629 | 9.86 |
+| OldHospital | view_consistent | utility-weighted top views | 3244 | 3.72 | 0.0000646 | 0.9397 | 0.246 | 0.610 | 11.57 |
+| ShopFacade | mean | uniform | 2877 | 6.95 | 0.0001090 | 0.9403 | 0.386 | 0.799 | 5.21 |
+| ShopFacade | geometry_weighted | inv-reproj + center | 2877 | 6.95 | 0.0001046 | 0.9405 | 0.386 | 0.795 | 5.19 |
+| ShopFacade | robust_trimmed_mean | uniform | 2877 | 6.01 | 0.0000954 | 0.9365 | 0.380 | 0.788 | 5.45 |
+| ShopFacade | view_consistent | utility-weighted top views | 2877 | 3.63 | 0.0000743 | 0.9283 | 0.357 | 0.753 | 5.97 |
+
+Immediate conclusion: the raw 3D VFM landmark feature bank is now buildable and
+diagnosable. Mean aggregation is the strongest held-out observation retrieval
+baseline on the current head20k tracks. Robust/view-consistent aggregation lowers
+within-track variance, but it also drops held-out retrieval, so the first-stage
+metric must report both stability/variance and retrieval retention. The original
+`inverse_reprojection` utility was point-level in the exported COLMAP JSONL and
+therefore degenerated to mean inside each track; the builder now exposes
+`inverse_reprojection_center` as an explicit observation-level geometry proxy.
+
+Next first-stage work:
+
+1. Cache sampled raw VFM track observations so multiple aggregation methods do
+   not repeatedly scan token NPZ files.
+2. Add true camera-pose geometry weights from COLMAP image extrinsics: viewing
+   angle, depth, and baseline diversity. The current center prior is only a
+   deterministic geometry proxy.
+3. Run 100k-observation banks after the sampled-observation cache exists.
+4. Add query-image-to-3D-landmark retrieval as the next bridge toward
+   localization, still without selector or refinement.
+
+### Stage A v1: Bilinear Sampling + Camera View Metadata
+
+We then upgraded the raw landmark bank builder toward the full Stage A design:
+
+- COLMAP export now records per-observation `camera_center` and `viewing_ray`.
+- raw VFM sampling supports `sample_mode=bilinear`.
+- observation utility supports `view_consistency` and
+  `inverse_reprojection_center_view`.
+- aggregation supports `cosine_weighted_mean`, `geometric_median`, and `medoid`.
+
+ULF-Loc reference point: their public implementation builds normalized dense
+feature maps with bilinear interpolation and uses geometry/view consistency when
+matching/fusing features. We adapt that idea to sparse SfM landmarks instead of
+Gaussian landmarks.
+
+Head20k Stage A v1 results:
+
+| scene | method | sample | utility | tracks | variance | split cos | heldout R@1 | heldout R@5 | mean rank |
+| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| OldHospital | mean | bilinear | inv-reproj + center + view | 3244 | 0.0000660 | 0.9626 | 0.351 | 0.737 | 7.08 |
+| OldHospital | geometry_weighted | bilinear | inv-reproj + center + view | 3244 | 0.0000617 | 0.9638 | 0.351 | 0.737 | 7.02 |
+| OldHospital | geometric_median | bilinear | inv-reproj + center + view | 3244 | 0.0000782 | 0.9503 | 0.330 | 0.692 | 8.80 |
+| OldHospital | medoid | bilinear | inv-reproj + center + view | 3244 | 0.0001099 | 0.9250 | 0.288 | 0.636 | 11.36 |
+| ShopFacade | mean | bilinear | inv-reproj + center + view | 2877 | 0.0000807 | 0.9578 | 0.476 | 0.865 | 3.73 |
+| ShopFacade | geometry_weighted | bilinear | inv-reproj + center + view | 2877 | 0.0000757 | 0.9590 | 0.479 | 0.869 | 3.64 |
+| ShopFacade | geometric_median | bilinear | inv-reproj + center + view | 2877 | 0.0000958 | 0.9450 | 0.448 | 0.837 | 4.48 |
+| ShopFacade | medoid | bilinear | inv-reproj + center + view | 2877 | 0.0001363 | 0.9104 | 0.406 | 0.793 | 5.25 |
+
+Interpretation: Stage A v1 is a clear improvement over the nearest-token v0
+bank. The main gain comes from bilinear VFM sampling, with small additional
+benefit from geometry/view weighting. Weighted mean/cosine-space mean is the
+current best baseline. Geometric median and medoid are not better on head20k;
+they are retained as robustness controls, not the default.
+
+### Sampled Observation Cache
+
+The Stage A builder now supports a reusable sampled-observation cache:
+
+- `--write_sampled_observation_cache path.npz` writes sampled raw VFM
+  observations after COLMAP-to-token bilinear sampling.
+- `--sampled_observation_cache path.npz` builds landmark banks directly from the
+  cached observations, without rescanning token NPZ files.
+
+OldHospital head20k validation:
+
+- direct mean bank vs cached mean bank: max feature diff `0.0`
+- direct geometry-weighted bank vs cached geometry-weighted bank: max feature
+  diff `0.0`
+- cached geometry-weighted metrics match the direct Stage A v1 result:
+  R@1 `0.350654`, R@5 `0.737255`, split cosine `0.963793`
+
+This removes the main CPU/IO blocker for sweeping aggregation methods and for
+running 100k-observation banks.
+
+### Head100k Stage A v1 Banks
+
+Using the sampled-observation cache, we generated head100k bilinear-view raw
+landmark banks for OldHospital and ShopFacade:
+
+| scene | method | sampled obs | tracks | obs/track | variance | split cos | heldout R@1 | heldout R@5 | mean rank |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| OldHospital | mean | 100000 | 21337 | 4.69 | 0.0000808 | 0.9494 | 0.373 | 0.713 | 12.75 |
+| OldHospital | geometry_weighted | 100000 | 21337 | 4.69 | 0.0000767 | 0.9490 | 0.370 | 0.710 | 13.09 |
+| ShopFacade | mean | 100000 | 20577 | 4.86 | 0.0000843 | 0.9426 | 0.294 | 0.676 | 13.67 |
+| ShopFacade | geometry_weighted | 100000 | 20577 | 4.86 | 0.0000791 | 0.9433 | 0.292 | 0.679 | 13.71 |
+
+Interpretation: head100k substantially improves 3D landmark coverage while
+keeping split stability high. Geometry-weighting consistently lowers
+within-track variance, but the retrieval difference is small and not uniformly
+positive. For now, the default unbiased Stage A bank should remain bilinear
+mean/cosine mean, with geometry-weighted reported as a variance-oriented
+alternative rather than the primary retrieval baseline.
+
+### Stage A v1 Visual Validation and Cleanup
+
+The current Stage A raw VFM landmark bank now has qualitative artifacts in
+`output/vfm/visualizations/raw_landmark_banks/`:
+
+- `oldhospital_head100k_mean_pca_color.ply`
+- `oldhospital_head100k_mean_variance_color.ply`
+- `oldhospital_head100k_mean_pca_topdown.png`
+- `shopfacade_head100k_mean_pca_color.ply`
+- `shopfacade_head100k_mean_variance_color.ply`
+- `shopfacade_head100k_mean_pca_topdown.png`
+
+The PCA-color point clouds are non-empty and spatially structured. ShopFacade
+forms a cleaner elongated facade-like geometry, while OldHospital contains a
+dense central structure plus sparse far/outlier tracks. This is acceptable for a
+first unbiased SfM-landmark VFM bank, but the OldHospital tail should be pruned
+or down-weighted before using the bank as a final localization map.
+
+Compared with the ULF-Loc-style first-stage target, the current implementation
+matches the core requirements: clean SfM 2D-3D associations, bilinear dense VFM
+sampling, L2-normalized features, multi-view aggregation, view/camera metadata,
+and robust aggregation alternatives. It does not yet implement a full
+ULF-Loc-equivalent local geometry verifier or learned localization model, so the
+claim should remain "Stage A raw 3D VFM landmark feature bank is ready for
+downstream query-to-3D evaluation", not "localization solved".
+
+Old unused outputs from previous mainlines and non-current token banks were
+removed. Current retained output footprint is approximately:
+
+| path | size |
+| --- | ---: |
+| `output/` | 27G |
+| `output/vfm_tokens_radio/` | 26G |
+| `output/vfm/` | 1.9G |
+| `output/vfm/raw_landmark_banks/` | 1.6G |
+
+Disk headroom increased from about 24G available to about 104G available.
+
+## Stage B: Query-to-3D Raw VFM Matching Baseline
+
+The next validation step is now implemented as a solver-free descriptor
+baseline followed by fixed PnP-RANSAC:
+
+1. load query dense VFM token grid
+2. restrict the 3D landmark map to a coarse reference-image visibility submap
+3. match query tokens to raw 3D landmark VFM features with cosine top-K
+4. apply ratio test, optional mutual-nearest filtering, and optional landmark
+   variance filtering
+5. estimate pose with PnP-RANSAC
+6. report feature precision, hard false-match rate, PnP inlier ratio, and pose
+   success thresholds
+
+Code:
+
+- `feature_extract/vfm/query_to_3d_matching.py`
+- `feature_extract/tools/vfm/eval_query_to_3d_vfm_matching.py`
+
+Current full-test results using head100k bilinear-mean raw landmark banks:
+
+| scene | submap | filter | precision | false match | PnP success | 10cm/5deg | 25cm/10deg | med t | med r |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| OldHospital | ref top10 | ratio 0.95 | 0.215 | 0.785 | 0.956 | 0.000 | 0.088 | 1.613m | 2.439deg |
+| OldHospital | ref top10 | mutual + ratio 0.80 | 0.414 | 0.586 | 0.934 | 0.022 | 0.088 | 1.480m | 2.302deg |
+| ShopFacade | ref top5 | ratio 0.95 | 0.282 | 0.718 | 1.000 | 0.126 | 0.456 | 0.281m | 1.056deg |
+| ShopFacade | ref top5 | mutual + ratio 0.80 | 0.534 | 0.466 | 1.000 | 0.117 | 0.485 | 0.260m | 0.981deg |
+
+OldHospital is strongly split-dependent. With ref top10 + ratio 0.95:
+
+| subset | queries | precision | 25cm/10deg | med t |
+| --- | ---: | ---: | ---: | ---: |
+| seq4 | 56 | 0.046 | 0.000 | 5.741m |
+| seq8 | 126 | 0.290 | 0.127 | 1.014m |
+
+Interpretation: raw VFM landmark features do produce a real query-to-3D
+localization signal under a coarse submap, especially on ShopFacade. However,
+false matches are still high. Mutual-nearest and stricter ratio filtering
+improve feature precision but do not reliably solve OldHospital, so the next
+step should focus on local geometry/visibility filtering and descriptor
+selection, not only PnP tuning.
+
+### OldHospital Coverage-Balanced Stage A/B Update
+
+The initial OldHospital head100k bank had a severe coverage bias: `seq4`
+queries often had only tens of bank landmarks visible from their top10
+reference images, even though full COLMAP visibility contained thousands of
+tracks. This was caused by prefix-limited sampled observations being reused as
+the visibility source.
+
+Fixes now in place:
+
+- exported full COLMAP visibility to
+  `output/vfm/colmap_tracks/OldHospital/model_train_full_visibility_min2_v1.npz`
+- added coverage-balanced COLMAP observation sampling
+- rebuilt OldHospital balanced300k raw VFM landmark bank
+- Stage B now reports `full_visible_tracks`, `bank_visible_tracks`,
+  `bank_visibility_coverage`, and `projected_landmarks` per query
+- Stage B submaps can use full visibility rather than sampled-bank visibility
+
+OldHospital full-test comparison:
+
+| bank | filter | landmarks | bank coverage | projected | precision | false match | PnP success | 10cm/5deg | 25cm/10deg | med t | med r |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| head100k | ratio 0.95 | 21337 | n/a | n/a | 0.215 | 0.785 | 0.956 | 0.000 | 0.088 | 1.613m | 2.439deg |
+| balanced300k | ratio 0.95 | 108561 | 0.692 | 6049 | 0.282 | 0.718 | 1.000 | 0.005 | 0.060 | 0.809m | 1.528deg |
+| balanced300k | mutual + ratio 0.80 | 108561 | 0.692 | 6049 | 0.488 | 0.512 | 0.995 | 0.011 | 0.093 | 0.829m | 1.438deg |
+
+The balanced bank fixes the sparse-render failure. For example,
+`seq4/frame00019.png` now has 8847 submap landmarks and 6719 projected
+landmarks, with PnP success and 0.625m translation error. This is much better
+than the previous PnP failure, but still not accurate localization. The
+remaining bottleneck is now descriptor ambiguity / local geometric consistency,
+not missing 3D map coverage.
+
+New visualizations:
+
+- `output/vfm/visualizations/query_to_3d_matches/oldhospital_balanced300k_projection_rgb_draw60_contact_sheet.png`
+- `output/vfm/visualizations/query_to_3d_matches/oldhospital_balanced300k_projection_feature_draw60_contact_sheet.png`
+
+### Raw VFM Retrieval Full Validation
+
+We also tested whether raw VFM features can provide the coarse sparse retrieval
+stage, so Stage B does not depend on a GT-centered or manually provided initial
+pose. This protocol uses only query/reference `radio_final` token banks to build
+global descriptors and retrieve reference images. Cambridge poses are attached
+after retrieval only to report pose recall; they are not used to generate the
+candidate order.
+
+New retrieval utilities:
+
+- `feature_extract/vfm/retrieval_report.py`
+- `feature_extract/tools/vfm/report_descriptor_retrieval.py`
+- `feature_extract/tools/vfm/build_token_descriptor_bank.py`
+  now supports `mean`, signed `gem`, and optional per-token L2 before pooling.
+
+Raw VFM retrieval artifacts:
+
+- descriptors: `output/vfm/raw_vfm_retrieval/descriptors/`
+- candidate banks: `output/vfm/raw_vfm_retrieval/candidates/`
+- retrieval reports: `output/vfm/raw_vfm_retrieval/reports/`
+
+Retrieval-only full-test results:
+
+| scene | descriptor | topK | top1 med t | oracle med t | R@1 1m/10deg | R@20 1m/10deg | R@50 1m/10deg | R@50 2m/20deg |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| OldHospital | mean | 20 | 4.350m | 2.488m | 0.060 | 0.159 | n/a | n/a |
+| OldHospital | signed-GeM | 20 | 4.346m | 2.547m | 0.082 | 0.159 | n/a | n/a |
+| OldHospital | tokenL2+mean | 20 | 4.426m | 2.488m | 0.060 | 0.159 | n/a | n/a |
+| OldHospital | mean | 50 | 4.350m | 2.061m | 0.060 | 0.159 | 0.181 | 0.478 |
+| ShopFacade | mean | 20 | 2.019m | 0.736m | 0.175 | 0.369 | n/a | n/a |
+| ShopFacade | signed-GeM | 20 | 2.036m | 0.779m | 0.204 | 0.359 | n/a | n/a |
+| ShopFacade | tokenL2+mean | 20 | 2.019m | 0.740m | 0.175 | 0.369 | n/a | n/a |
+| ShopFacade | mean | 50 | 2.019m | 0.655m | 0.175 | 0.369 | 0.379 | 0.874 |
+
+Interpretation: raw global VFM retrieval is a weak replacement for a standard
+image retrieval frontend. Mean, signed-GeM, and token-normalized mean are nearly
+identical on these two scenes, so the bottleneck is not a simple pooling choice.
+OldHospital remains especially weak: only 18.1% of queries have a 1m/10deg
+reference within top50. ShopFacade has poor fine recall but usable broad
+2m/20deg coverage in top50.
+
+We then used the best mean raw-VFM retrieval candidate banks as Stage B submaps:
+
+| scene | raw retrieval submap | bank coverage | projected | precision | PnP success | 10cm/5deg | 25cm/10deg | med t | med r |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| OldHospital | top20 | 0.665 | 9074.7 | 0.293 | 1.000 | 0.011 | 0.088 | 0.787m | 1.446deg |
+| OldHospital | top50 | 0.647 | 16111.3 | 0.301 | 1.000 | 0.016 | 0.104 | 0.789m | 1.308deg |
+| ShopFacade | top20 | 0.437 | 6403.6 | 0.317 | 1.000 | 0.165 | 0.544 | 0.226m | 0.896deg |
+| ShopFacade | top50 | 0.460 | 11145.6 | 0.331 | 1.000 | 0.165 | 0.524 | 0.222m | 0.676deg |
+
+Conclusion: raw VFM features can drive a complete sparse-retrieval + 2D-3D PnP
+baseline without a pose init, but not at a competitive Cambridge localization
+level. The positive signal is clearest on ShopFacade, where raw retrieval top20
+plus raw 3D VFM matching reaches `54.4%` at `25cm/10deg` and `0.226m` median
+translation. OldHospital still fails the expected fine-localization bar even
+after coverage-balanced map construction. The next retrieval direction should be
+regional/local aggregation or a standard retrieval frontend for coarse submaps,
+while raw VFM 3D matching remains a downstream verifier rather than the sole
+place-recognition engine.
+
 ## Remaining Paper-Critical Gaps
 
 1. Real raw VFM token extraction:

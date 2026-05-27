@@ -76,12 +76,34 @@ class TokenDescriptorBank:
         )
 
 
-def _pool_feature(feature: np.ndarray, pooling: str) -> np.ndarray:
+def _signed_gem_pool(feature: np.ndarray, gem_power: float) -> np.ndarray:
+    if gem_power <= 0:
+        raise ValueError("gem_power must be positive")
+    flat = feature.reshape(feature.shape[0], -1)
+    if np.isclose(gem_power, 3.0):
+        signed_power = flat * flat
+        signed_power *= flat
+    else:
+        signed_power = np.sign(flat) * np.power(np.abs(flat), gem_power)
+    mean_power = signed_power.mean(axis=1)
+    return np.sign(mean_power) * np.power(np.abs(mean_power), 1.0 / gem_power)
+
+
+def _pool_feature(feature: np.ndarray, pooling: str, gem_power: float = 3.0) -> np.ndarray:
     if feature.ndim < 2:
         raise ValueError("token feature must have at least channel and spatial dimensions")
-    if pooling != "mean":
-        raise ValueError(f"unsupported descriptor pooling: {pooling}")
-    return feature.reshape(feature.shape[0], -1).mean(axis=1)
+    if pooling == "mean":
+        return feature.reshape(feature.shape[0], -1).mean(axis=1)
+    if pooling == "gem":
+        return _signed_gem_pool(feature, gem_power=gem_power)
+    raise ValueError(f"unsupported descriptor pooling: {pooling}")
+
+
+def _normalize_tokens(feature: np.ndarray) -> np.ndarray:
+    flat = feature.reshape(feature.shape[0], -1)
+    norms = np.linalg.norm(flat, axis=0, keepdims=True)
+    normalized = flat / np.maximum(norms, 1e-6)
+    return normalized.reshape(feature.shape)
 
 
 def _normalize_rows(descriptors: np.ndarray) -> np.ndarray:
@@ -93,6 +115,8 @@ def build_token_descriptor_bank(
     manifest: TokenBankManifest,
     layer_name: str,
     pooling: str = "mean",
+    gem_power: float = 3.0,
+    normalize_tokens: bool = False,
     normalize: bool = True,
     metadata: Mapping[str, object] | None = None,
 ) -> TokenDescriptorBank:
@@ -106,18 +130,25 @@ def build_token_descriptor_bank(
             if layer_name not in data:
                 raise ValueError(f"layer {layer_name!r} not found in {record.token_path}")
             feature = np.asarray(data[layer_name], dtype=np.float32)
+        if normalize_tokens:
+            feature = _normalize_tokens(feature)
         image_ids.append(record.image_id)
-        descriptors.append(_pool_feature(feature, pooling))
+        descriptors.append(_pool_feature(feature, pooling, gem_power=gem_power))
     descriptor_array = np.stack(descriptors, axis=0).astype(np.float32, copy=False)
     if normalize:
         descriptor_array = _normalize_rows(descriptor_array)
+    descriptor_metadata = dict(metadata or {})
+    if pooling == "gem":
+        descriptor_metadata["gem_power"] = float(gem_power)
+    if normalize_tokens:
+        descriptor_metadata["normalize_tokens"] = True
     return TokenDescriptorBank(
         image_ids=tuple(image_ids),
         descriptors=descriptor_array,
         layer_name=layer_name,
         pooling=pooling,
         normalized=normalize,
-        metadata=dict(metadata or {}),
+        metadata=descriptor_metadata,
     )
 
 

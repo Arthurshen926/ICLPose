@@ -15,7 +15,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Build pooled token descriptors")
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--layer_name", default="radio_final")
-    parser.add_argument("--pooling", default="mean", choices=["mean"])
+    parser.add_argument("--pooling", default="mean", choices=["mean", "gem"])
+    parser.add_argument("--gem_power", type=float, default=3.0)
+    parser.add_argument("--normalize_tokens", action="store_true")
     parser.add_argument("--no_normalize", action="store_true")
     parser.add_argument("--metadata_json", default=None)
     parser.add_argument("--output", required=True)
@@ -33,6 +35,8 @@ def main() -> None:
         manifest=TokenBankManifest.from_json(Path(args.manifest)),
         layer_name=args.layer_name,
         pooling=args.pooling,
+        gem_power=args.gem_power,
+        normalize_tokens=bool(args.normalize_tokens),
         normalize=not args.no_normalize,
         metadata=metadata,
     )

@@ -24,6 +24,8 @@ class ColmapImageObservation:
     image_id: int
     image_name: str
     camera_id: int
+    qvec: np.ndarray
+    tvec: np.ndarray
     xys: np.ndarray
     point3d_ids: np.ndarray
 
@@ -52,6 +54,34 @@ class ColmapTrackObservation:
     camera_id: int | None = None
     image_width: int | None = None
     image_height: int | None = None
+    camera_center: np.ndarray | None = None
+    viewing_ray: np.ndarray | None = None
+
+
+def qvec_to_rotmat(qvec: np.ndarray) -> np.ndarray:
+    q = np.asarray(qvec, dtype=np.float64).reshape(4)
+    norm = max(float(np.linalg.norm(q)), 1e-12)
+    qw, qx, qy, qz = q / norm
+    return np.asarray(
+        [
+            [1.0 - 2.0 * qy * qy - 2.0 * qz * qz, 2.0 * qx * qy - 2.0 * qz * qw, 2.0 * qx * qz + 2.0 * qy * qw],
+            [2.0 * qx * qy + 2.0 * qz * qw, 1.0 - 2.0 * qx * qx - 2.0 * qz * qz, 2.0 * qy * qz - 2.0 * qx * qw],
+            [2.0 * qx * qz - 2.0 * qy * qw, 2.0 * qy * qz + 2.0 * qx * qw, 1.0 - 2.0 * qx * qx - 2.0 * qy * qy],
+        ],
+        dtype=np.float64,
+    )
+
+
+def camera_center_from_qvec_tvec(qvec: np.ndarray, tvec: np.ndarray) -> np.ndarray:
+    rotation = qvec_to_rotmat(qvec)
+    translation = np.asarray(tvec, dtype=np.float64).reshape(3)
+    return (-rotation.T @ translation).astype(np.float64)
+
+
+def viewing_ray_from_camera_center(point_xyz: np.ndarray, camera_center: np.ndarray) -> np.ndarray:
+    ray = np.asarray(point_xyz, dtype=np.float64).reshape(3) - np.asarray(camera_center, dtype=np.float64).reshape(3)
+    norm = max(float(np.linalg.norm(ray)), 1e-12)
+    return (ray / norm).astype(np.float64)
 
 
 def _read_exact(handle: BinaryIO, num_bytes: int) -> bytes:
@@ -115,8 +145,8 @@ def read_colmap_images_binary(path: Path) -> Dict[int, ColmapImageObservation]:
         (image_count,) = struct.unpack("<Q", _read_exact(handle, 8))
         for _ in range(image_count):
             (image_id,) = struct.unpack("<i", _read_exact(handle, 4))
-            _read_exact(handle, 8 * 4)  # qvec
-            _read_exact(handle, 8 * 3)  # tvec
+            qvec = np.asarray(struct.unpack("<dddd", _read_exact(handle, 8 * 4)), dtype=np.float64)
+            tvec = np.asarray(struct.unpack("<ddd", _read_exact(handle, 8 * 3)), dtype=np.float64)
             (camera_id,) = struct.unpack("<i", _read_exact(handle, 4))
             image_name = _read_c_string(handle)
             (point2d_count,) = struct.unpack("<Q", _read_exact(handle, 8))
@@ -130,6 +160,8 @@ def read_colmap_images_binary(path: Path) -> Dict[int, ColmapImageObservation]:
                 image_id=int(image_id),
                 image_name=image_name,
                 camera_id=int(camera_id),
+                qvec=qvec,
+                tvec=tvec,
                 xys=xys,
                 point3d_ids=point3d_ids,
             )
@@ -189,6 +221,8 @@ def load_colmap_track_observations(
                 continue
             xy = image.xys[point2d_idx]
             camera = cameras.get(image.camera_id)
+            camera_center = camera_center_from_qvec_tvec(image.qvec, image.tvec)
+            viewing_ray = viewing_ray_from_camera_center(point.xyz, camera_center)
             observations.append(
                 ColmapTrackObservation(
                     track_id=point.point3d_id,
@@ -201,6 +235,8 @@ def load_colmap_track_observations(
                     camera_id=image.camera_id,
                     image_width=None if camera is None else camera.width,
                     image_height=None if camera is None else camera.height,
+                    camera_center=camera_center,
+                    viewing_ray=viewing_ray,
                 )
             )
     observations.sort(key=lambda item: (item.track_id, item.image_id, item.point2d_idx))
