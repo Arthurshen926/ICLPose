@@ -1373,6 +1373,250 @@ regional/local aggregation or a standard retrieval frontend for coarse submaps,
 while raw VFM 3D matching remains a downstream verifier rather than the sole
 place-recognition engine.
 
+### Gaussian VFM Field From 3D Landmark Features
+
+We implemented a first Gaussian VFM field path whose purpose is to render dense
+VFM feature maps from already-aggregated 3D VFM landmarks. This is deliberately
+not a learned feature-Gaussian optimization and not full ray-contribution
+attribution. It is the conservative ULF-Loc-style first step:
+
+1. load a trained 3DGS/2DGS Gaussian PLY
+2. load the raw 3D VFM landmark bank plus COLMAP track xyz
+3. associate each Gaussian to nearby 3D VFM landmarks with KDTree radius search
+4. keep only feature-bearing Gaussians with enough landmark support
+5. render a dense feature map using a deterministic soft z-buffer splat renderer
+
+Code:
+
+- `feature_extract/vfm/gaussian_vfm_field.py`
+- `feature_extract/tools/vfm/build_gaussian_vfm_field.py`
+- `feature_extract/tools/vfm/render_gaussian_vfm_feature_map.py`
+- `feature_extract/tools/vfm/visualize_gaussian_vfm_render.py`
+
+OldHospital smoke artifacts:
+
+- field:
+  `output/vfm/gaussian_vfm_fields/OldHospital/oldhospital_gaussian_vfm_field_landmark_assoc_80k_r010.npz`
+- render:
+  `output/vfm/gaussian_vfm_fields/OldHospital/renders/seq9_frame00001_vfm_160x90.npz`
+- PCA visualization:
+  `output/vfm/gaussian_vfm_fields/OldHospital/renders/seq9_frame00001_vfm_160x90_pca.png`
+
+Smoke metrics:
+
+| input | value |
+| --- | ---: |
+| source Gaussians | 80,000 |
+| feature-bearing Gaussians | 44,100 |
+| coverage | 0.551 |
+| feature dim | 1280 |
+| mean landmark support | 2.49 |
+| mean association distance | 0.071m |
+| render size | 160x90 |
+| visible rendered pixels | 7,822 |
+| visible fraction | 0.543 |
+
+The rendered feature map has shape `[1280, 90, 160]`; visible pixels are
+L2-normalized. This gives the project a concrete dense-rendered VFM feature
+artifact for later query-vs-rendered-feature matching. The next engineering step
+is to replace the simplified splat renderer with a gsplat contribution-aware
+renderer or export `_loc_feature` into the existing Gaussian renderer, then
+evaluate query/render feature consistency against raw query VFM maps.
+
+Follow-up implementation:
+
+- added `export_gaussian_vfm_field_to_ply`
+- added `feature_extract/tools/vfm/export_gaussian_vfm_field_ply.py`
+- added gsplat-backed rendering via `render_gaussian_vfm_feature_map_gsplat`
+- `render_gaussian_vfm_feature_map.py` now supports `--renderer soft|gsplat`
+
+Exported OldHospital feature PLY:
+
+- `output/vfm/gaussian_vfm_fields/OldHospital/oldhospital_gaussian_vfm_field_landmark_assoc_80k_r010_loc.ply`
+
+The exported PLY keeps all `504,352` source Gaussian rows and appends
+`loc_0 ... loc_1279`. Unassigned Gaussians receive zero features; the `44,100`
+feature-bearing rows keep their associated VFM features. It is loadable by the
+existing `GaussianFeatureModel.load_ply_with_features` path:
+
+| field | value |
+| --- | ---: |
+| Gaussians | 504,352 |
+| feature dim | 1280 |
+| loc tensor shape | `[504352, 1280]` |
+| detected geometry | 2DGS |
+
+gsplat render smoke:
+
+| renderer | size | visible pixels | visible fraction | mean alpha/weight |
+| --- | --- | ---: | ---: | ---: |
+| soft z-buffer splat | 160x90 | 7,822 | 0.543 | 0.195 |
+| gsplat | 160x90 | 9,275 | 0.644 | 0.685 |
+
+New gsplat artifacts:
+
+- `output/vfm/gaussian_vfm_fields/OldHospital/renders/seq9_frame00001_vfm_160x90_gsplat.npz`
+- `output/vfm/gaussian_vfm_fields/OldHospital/renders/seq9_frame00001_vfm_160x90_gsplat_pca.png`
+
+The field can now be consumed in two ways: directly through the project NPZ
+field renderer, or through an existing Gaussian PLY loader that expects per-row
+`loc_*` attributes. The remaining limitation is that association is still
+nearest-landmark based, not ray-contribution based; this should be treated as
+the first reliable feature-bearing Gaussian baseline.
+
+Hole diagnosis and full-radius sweep:
+
+| source | visible fraction on `seq9/frame00001` |
+| --- | ---: |
+| feature field, first 80k, r=0.10 | 0.644 |
+| all source Gaussian alpha, first 80k | 0.809 |
+| all source Gaussian alpha, full 504k | 1.000 |
+
+The holes are therefore primarily feature-assignment holes, not 3DGS geometry
+holes. The initial field covered only 44,100 / 80,000 Gaussians.
+
+We then ran full 504k landmark-to-Gaussian association with wider radii:
+
+| radius | feature Gaussians | coverage | mean support | mean distance | gsplat visible fraction |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 0.10m | 241,352 | 0.479 | 2.34 | 0.072m | 0.743 |
+| 0.15m | 342,441 | 0.679 | 3.01 | 0.099m | 0.774 |
+| 0.20m | 395,775 | 0.785 | 3.38 | 0.118m | 0.795 |
+
+Wider radius clearly improves feature-bearing coverage, but the rendered visible
+fraction saturates near 0.80 on this view. `r=0.20m` is the best current
+landmark-association field for dense rendering, but it may mix features across
+nearby surfaces more than `r=0.10m`; downstream query/render matching should
+compare both coverage and descriptor precision.
+
+Ray-contribution aggregation first version:
+
+- added `GaussianVFMRayContributionConfig`
+- added `GaussianVFMFeatureView`
+- added `aggregate_ray_contributed_gaussian_vfm_features`
+- added `feature_extract/tools/vfm/build_ray_contributed_gaussian_vfm_field.py`
+
+This first version works on the VFM token grid. It projects Gaussians into each
+reference feature map, assigns each token to a dominant near-depth Gaussian
+within a pixel radius, and averages the token features per Gaussian.
+
+OldHospital ray-contribution smoke on first 80k Gaussians:
+
+| views | selection | radius | min samples | feature Gaussians | coverage | mean samples | gsplat visible fraction |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 32 | prefix | 1px | 2 | 15,934 | 0.199 | 11.26 | n/a |
+| 64 | prefix | 2px | 1 | 16,910 | 0.211 | 23.46 | n/a |
+| 64 | uniform | 2px | 1 | 25,400 | 0.318 | 18.38 | 0.803 |
+
+The ray-contribution field has lower global Gaussian coverage than landmark
+association on the same first 80k Gaussians, but its rendered coverage on the
+tested view is slightly higher than the full 504k landmark field at `r=0.20m`
+(`0.803` vs `0.795`). Interpretation: ray contribution is a useful
+view-conditioned hole-filling mechanism, but the current token-grid CPU
+implementation is not yet a replacement for global landmark association. The
+next version should combine both fields and move the dominant-contribution pass
+to GPU / gsplat metadata rather than manual token-grid splatting.
+
+Hybrid Gaussian VFM field:
+
+- added `merge_gaussian_vfm_fields`
+- added `feature_extract/tools/vfm/build_hybrid_gaussian_vfm_field.py`
+- merge policy: landmark-associated field is primary; ray-contribution field
+  only fills Gaussian indices missing from the primary field
+
+OldHospital hybrid artifact:
+
+- `output/vfm/gaussian_vfm_fields/OldHospital/hybrid/oldhospital_gaussian_vfm_hybrid_fullr020_ray80k_uniform64.npz`
+- PCA render visualization:
+  `output/vfm/gaussian_vfm_fields/OldHospital/hybrid/seq9_frame00001_vfm_160x90_hybrid_fullr020_ray80k_uniform64_gsplat_pca.png`
+
+Hybrid composition:
+
+| component | count |
+| --- | ---: |
+| primary landmark field, full r=0.20 | 395,775 |
+| fallback ray field, 80k uniform64 | 25,400 |
+| overlap | 21,641 |
+| fallback added | 3,759 |
+| hybrid total | 399,534 |
+
+Render coverage on `seq9/frame00001`, `160x90`, gsplat:
+
+| field | visible fraction | visible pixels | mean alpha/weight |
+| --- | ---: | ---: | ---: |
+| landmark full r=0.10 | 0.743 | 10,701 | n/a |
+| landmark full r=0.15 | 0.774 | 11,141 | n/a |
+| landmark full r=0.20 | 0.795 | 11,453 | n/a |
+| ray 80k uniform64 | 0.803 | 11,561 | n/a |
+| hybrid full r=0.20 + ray fill | 0.839 | 12,075 | 0.891 |
+
+This validates the intended behavior: the ray field adds relatively few global
+Gaussians, but they sit in view-critical holes and raise rendered dense feature
+coverage. The next evaluation should measure query-vs-rendered VFM matching
+precision, not only coverage, because `r=0.20m` and ray fill can both introduce
+feature contamination if they bridge nearby but distinct surfaces.
+
+### Query-to-Map Correspondence Audit
+
+We then tested the direct question: after aggregating raw VFM features into a
+3D map, do query VFM tokens form geometrically meaningful correspondences to
+the map?
+
+New code:
+
+- `feature_extract/vfm/query_to_render_matching.py`
+- `feature_extract/tools/vfm/eval_query_to_render_vfm_matching.py`
+- `feature_extract/tools/vfm/visualize_query_to_render_vfm_matches.py`
+- `reprojection_error_stats` in `feature_extract/vfm/query_to_3d_matching.py`
+
+The evaluator now reports correspondence quality separately from final PnP:
+
+- GT reprojection precision at 5/10/16/32 px
+- mean/median/p90/p95 GT reprojection error
+- PnP-inlier GT precision at 16 px
+- final pose error after PnP-RANSAC
+
+OldHospital reference-pose top1, first 20 test queries, `query_token_step=8`:
+
+| method | mean matches | GT precision@5px | GT precision@16px | median match reproj | PnP-inlier GT@16px | med t | med r |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| sparse 3D landmarks | 95.95 | 0.055 | 0.240 | 49.56px | 0.812 | 0.625m | 1.659deg |
+| hybrid dense render | 28.75 | 0.083 | 0.357 | 32.47px | 0.707 | 1.261m | 2.324deg |
+
+Interpretation:
+
+- The user's visual concern is correct. Most accepted raw VFM query-to-map
+  correspondences are not geometrically correct at normal local-feature
+  thresholds.
+- Dense rendered matching is cleaner than sparse landmark matching by
+  correspondence precision, but still has a large median correspondence error.
+- PnP can still produce a plausible pose because RANSAC selects a smaller,
+  more geometrically consistent subset from many bad matches. Therefore final
+  pose accuracy alone is not sufficient evidence that the VFM correspondences
+  are meaningful.
+- The current raw VFM query-to-map path should be treated as a diagnostic
+  verifier, not as a validated correspondence engine.
+
+RGB-render visualizations were added to avoid misleading interpretation from
+VFM PCA colors. The right panel is now a 3DGS RGB render at the same candidate
+pose, while the lines still show the accepted VFM query-to-render matches:
+
+- good case:
+  `output/vfm/visualizations/query_to_render_matches/hybrid_refpose_top1_q20_good_bad_rgb_render/seq8__frame00123.png_query_to_hybrid_render.png`
+- bad case:
+  `output/vfm/visualizations/query_to_render_matches/hybrid_refpose_top1_q20_good_bad_rgb_render/seq8__frame00119.png_query_to_hybrid_render.png`
+
+Immediate implication for the next method step:
+
+1. Do not optimize or claim only final PnP pose.
+2. Add local geometric consistency before PnP, such as Hough voting over
+   reprojection displacement, neighborhood-consistent match filtering, or
+   rendered depth/normal-aware gating.
+3. Evaluate any selector/refinement by correspondence precision and
+   PnP-inlier GT precision, not only translation/rotation error.
+4. Treat VFM descriptors as coarse semantic/geometric evidence unless a method
+   explicitly proves sub-token correspondence quality.
+
 ## Remaining Paper-Critical Gaps
 
 1. Real raw VFM token extraction:

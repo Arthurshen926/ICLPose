@@ -24,6 +24,7 @@ from feature_extract.vfm.query_to_3d_matching import (
     filter_landmarks_by_reference_images,
     match_query_tokens_to_landmarks,
     pnp_pose_error,
+    reprojection_error_stats,
     reprojection_precision,
 )
 from feature_extract.vfm.tokens import TokenBankManifest
@@ -215,12 +216,20 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         )
         precision = None
         false_match_rate = None
+        geometry_stats = {}
         if gt_pose is not None and matches:
             precision, false_match_rate = reprojection_precision(
                 matches,
                 gt_pose.pose_w2c,
                 camera,
                 threshold_px=args.precision_reprojection_threshold_px,
+            )
+            geometry_stats = reprojection_error_stats(
+                matches,
+                gt_pose.pose_w2c,
+                camera,
+                thresholds_px=(5.0, 10.0, 16.0, 32.0),
+                pnp_inlier_mask=pnp.inlier_mask,
             )
         translation_error = None if pose_error is None else float(pose_error.translation_m)
         rotation_error = None if pose_error is None else float(pose_error.rotation_deg)
@@ -238,6 +247,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             "mean_similarity": _mean([match.similarity for match in matches]),
             "feature_precision_at_px": precision,
             "hard_false_match_rate": false_match_rate,
+            "match_geometry": geometry_stats,
             "pnp_success": bool(pnp.success),
             "pnp_inlier_count": int(pnp.inlier_count),
             "pnp_inlier_ratio": float(pnp.inlier_ratio),
@@ -304,6 +314,38 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         ),
         "mean_hard_false_match_rate": _mean(
             [float(row["hard_false_match_rate"]) for row in rows if row["hard_false_match_rate"] is not None]
+        ),
+        "mean_gt_precision_5px": _mean(
+            [
+                float(row["match_geometry"]["gt_precision_5px"])
+                for row in rows
+                if row["match_geometry"].get("gt_precision_5px") is not None
+            ]
+        ),
+        "mean_gt_precision_16px": _mean(
+            [
+                float(row["match_geometry"]["gt_precision_16px"])
+                for row in rows
+                if row["match_geometry"].get("gt_precision_16px") is not None
+            ]
+        ),
+        "median_gt_reproj_median_px": None
+        if not [row for row in rows if row["match_geometry"].get("gt_reproj_median_px") is not None]
+        else float(
+            np.median(
+                [
+                    float(row["match_geometry"]["gt_reproj_median_px"])
+                    for row in rows
+                    if row["match_geometry"].get("gt_reproj_median_px") is not None
+                ]
+            )
+        ),
+        "mean_pnp_inlier_gt_precision_16px": _mean(
+            [
+                float(row["match_geometry"]["pnp_inlier_gt_precision_16px"])
+                for row in rows
+                if row["match_geometry"].get("pnp_inlier_gt_precision_16px") is not None
+            ]
         ),
         "pnp_success_rate": _mean([1.0 if row["pnp_success"] else 0.0 for row in rows]),
         "success_10cm_5deg": _mean([1.0 if row["success_10cm_5deg"] else 0.0 for row in labeled_rows]),

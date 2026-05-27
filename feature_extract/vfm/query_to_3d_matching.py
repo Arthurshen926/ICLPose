@@ -458,3 +458,57 @@ def reprojection_precision(
     errors = np.linalg.norm(projected.reshape(-1, 2) - xy, axis=1)
     precision = float(np.mean(errors <= float(threshold_px)))
     return precision, float(1.0 - precision)
+
+
+def reprojection_error_stats(
+    matches: Sequence[QueryTo3DMatch],
+    pose_w2c: np.ndarray,
+    camera: ColmapCamera,
+    thresholds_px: Sequence[float] = (5.0, 10.0, 16.0, 32.0),
+    pnp_inlier_mask: np.ndarray | None = None,
+) -> dict[str, float | int | None]:
+    """Measure whether accepted 2D-3D correspondences are geometrically correct."""
+
+    stats: dict[str, float | int | None] = {"match_count": int(len(matches))}
+    for threshold in thresholds_px:
+        stats[f"gt_precision_{float(threshold):g}px"] = 0.0
+    stats.update(
+        {
+            "gt_reproj_mean_px": None,
+            "gt_reproj_median_px": None,
+            "gt_reproj_p90_px": None,
+            "gt_reproj_p95_px": None,
+            "pnp_inlier_count": 0,
+            "pnp_inlier_gt_precision_16px": None,
+            "pnp_inlier_gt_reproj_median_px": None,
+        }
+    )
+    if not matches:
+        return stats
+    points = np.stack([match.xyz for match in matches], axis=0).astype(np.float64)
+    xy = np.stack([match.xy for match in matches], axis=0).astype(np.float64)
+    camera_matrix, distortion = camera_matrix_and_distortion(camera)
+    try:
+        import cv2
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError("OpenCV is required for reprojection error stats") from exc
+    pose = np.asarray(pose_w2c, dtype=np.float64).reshape(4, 4)
+    rvec, _jacobian = cv2.Rodrigues(pose[:3, :3])
+    projected, _jacobian = cv2.projectPoints(points, rvec, pose[:3, 3], camera_matrix, distortion)
+    errors = np.linalg.norm(projected.reshape(-1, 2) - xy, axis=1)
+    for threshold in thresholds_px:
+        stats[f"gt_precision_{float(threshold):g}px"] = float(np.mean(errors <= float(threshold)))
+    stats["gt_reproj_mean_px"] = float(np.mean(errors))
+    stats["gt_reproj_median_px"] = float(np.median(errors))
+    stats["gt_reproj_p90_px"] = float(np.percentile(errors, 90.0))
+    stats["gt_reproj_p95_px"] = float(np.percentile(errors, 95.0))
+    if pnp_inlier_mask is not None:
+        mask = np.asarray(pnp_inlier_mask, dtype=bool).reshape(-1)
+        if mask.shape[0] != len(matches):
+            raise ValueError("pnp_inlier_mask must have one value per match")
+        stats["pnp_inlier_count"] = int(np.sum(mask))
+        if np.any(mask):
+            inlier_errors = errors[mask]
+            stats["pnp_inlier_gt_precision_16px"] = float(np.mean(inlier_errors <= 16.0))
+            stats["pnp_inlier_gt_reproj_median_px"] = float(np.median(inlier_errors))
+    return stats

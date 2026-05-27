@@ -9,6 +9,7 @@ from feature_extract.vfm.query_to_3d_matching import (
     filter_landmarks_by_reference_images,
     match_query_tokens_to_landmarks,
     pnp_pose_error,
+    reprojection_error_stats,
     token_grid_xy,
 )
 
@@ -131,3 +132,47 @@ def test_reference_visibility_submap_keeps_only_tracks_observed_by_references() 
 
     assert subset.track_ids.tolist() == [2]
     assert subset.xyz.tolist() == [[1.0, 1.0, 1.0]]
+
+
+def test_reprojection_error_stats_reports_distribution_and_pnp_inlier_quality() -> None:
+    grid_xy = np.asarray(
+        [
+            [20.0, 20.0],
+            [80.0, 20.0],
+            [20.0, 80.0],
+            [80.0, 80.0],
+        ],
+        dtype=np.float64,
+    )
+    xyz = _xyz_from_xy(grid_xy, np.full((4,), 5.0, dtype=np.float64))
+    matches = []
+    for idx in range(4):
+        xy = grid_xy[idx].copy()
+        if idx == 3:
+            xy += np.asarray([30.0, 0.0], dtype=np.float64)
+        matches.append(
+            type(
+                "Match",
+                (),
+                {
+                    "xyz": xyz[idx],
+                    "xy": xy,
+                },
+            )()
+        )
+
+    stats = reprojection_error_stats(
+        matches,
+        pose_w2c=np.eye(4, dtype=np.float64),
+        camera=_camera(),
+        thresholds_px=(5.0, 16.0, 32.0),
+        pnp_inlier_mask=np.asarray([True, True, False, True], dtype=bool),
+    )
+
+    assert stats["match_count"] == 4
+    assert stats["gt_precision_5px"] == 0.75
+    assert stats["gt_precision_16px"] == 0.75
+    assert stats["gt_precision_32px"] == 1.0
+    assert stats["gt_reproj_median_px"] == 0.0
+    assert stats["pnp_inlier_count"] == 3
+    assert stats["pnp_inlier_gt_precision_16px"] == 2.0 / 3.0
