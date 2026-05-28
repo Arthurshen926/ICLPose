@@ -1567,35 +1567,190 @@ New code:
 - `feature_extract/vfm/query_to_render_matching.py`
 - `feature_extract/tools/vfm/eval_query_to_render_vfm_matching.py`
 - `feature_extract/tools/vfm/visualize_query_to_render_vfm_matches.py`
-- `reprojection_error_stats` in `feature_extract/vfm/query_to_3d_matching.py`
+- sparse landmark matching, reprojection audit, spatial degeneracy audit, and
+  quality filtering in `feature_extract/vfm/query_to_3d_matching.py`
+- sparse evaluation/visualization CLIs now auto-load COLMAP intrinsics from
+  `<scene>/sparse/0/cameras.bin` when `--camera_model_dir` is not specified.
 
 The evaluator now reports correspondence quality separately from final PnP:
 
 - GT reprojection precision at 5/10/16/32 px
 - mean/median/p90/p95 GT reprojection error
 - PnP-inlier GT precision at 16 px
+- all-match and PnP-inlier spatial distribution/degeneracy
+- PnP reprojection residual
+- per-match source/quality fields for bucket analysis
 - final pose error after PnP-RANSAC
 
-OldHospital reference-pose top1, first 20 test queries, `query_token_step=8`:
+Current main path:
+
+Dense render is no longer the main Stage B path. It remains only as an earlier
+diagnostic artifact. The current baseline is sparse SfM landmark features:
+query VFM token -> sparse 3D VFM landmark -> PnP-RANSAC.
+
+Important protocol correction:
+
+The initial audit accidentally used the fallback camera
+`SIMPLE_RADIAL 1024x576 f=883 cx=512 cy=288`, while OldHospital raw images and
+COLMAP cameras are `1920x1080` with `f ~= 1660-1673`, `cx=960`, `cy=540`. The
+RADIO token grid is `[68,120]`, so the correct token-to-image scale is about
+`16.1px`, not `8.6px`. The earlier numbers are kept only as a legacy diagnostic
+because they explain why the visual correspondence looked worse than the
+reported GT@16 suggested.
+
+OldHospital reference-pose top1, first 20 test queries, `query_token_step=8`,
+using the legacy fallback camera:
 
 | method | mean matches | GT precision@5px | GT precision@16px | median match reproj | PnP-inlier GT@16px | med t | med r |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | sparse 3D landmarks | 95.95 | 0.055 | 0.240 | 49.56px | 0.812 | 0.625m | 1.659deg |
 | hybrid dense render | 28.75 | 0.083 | 0.357 | 32.47px | 0.707 | 1.261m | 2.324deg |
 
+The same audit using COLMAP camera intrinsics from
+`/hy-tmp/Cambridge_stdloc/OldHospital/sparse/0`:
+
+| method | mean matches | GT precision@5px | GT precision@16px | GT precision@32px | median match reproj | PnP-inlier GT@16px | med t | med r |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| sparse 3D landmarks | 95.95 | 0.028 | 0.137 | 0.249 | 91.99px | 0.495 | 1.261m | 3.019deg |
+| hybrid dense render | 30.25 | 0.023 | 0.175 | 0.341 | 58.51px | 0.381 | 2.069m | 5.617deg |
+
+Sparse landmark filtering:
+
+The sparse matcher now supports an interpretable landmark quality path:
+
+`Q_X = w_track log(N_X) - w_var Var_X - w_reproj reproj_err_X + w_idf IDF_X - w_amb ambiguity_X`
+
+where `ambiguity_X` is estimated as scene-level nearest-neighbor feature
+ambiguity and is precomputed on the full landmark index before submap slicing.
+The matcher can use:
+
+- hard thresholds on track length, feature variance, reprojection error,
+  scene-level ambiguity, boundary distance, and similarity margin
+- optional `similarity * Q_X` weighted ranking
+- optional MNN
+- per-match logging of `landmark_quality`, `landmark_ambiguity`,
+  `quality_weighted_similarity`, `landmark_reprojection_error`, and margin
+
+OldHospital reference-pose top1, sparse only, COLMAP intrinsics:
+
+| split/config | mean matches | GT@5 | GT@16 | GT@32 | median match reproj | PnP-inlier GT@16 | PnP success | med t | med r |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| q20 baseline | 95.95 | 0.028 | 0.137 | 0.249 | 91.99px | 0.495 | 1.000 | 1.261m | 3.019deg |
+| q20 balanced filters | 32.90 | 0.053 | 0.251 | 0.433 | 36.34px | 0.513 | 1.000 | 1.251m | 2.835deg |
+| q20 strict filters | 20.40 | 0.063 | 0.327 | 0.504 | 32.37px | 0.596 | 0.950 | 1.247m | 2.486deg |
+| full182 baseline | 93.16 | 0.018 | 0.104 | 0.210 | 109.85px | 0.469 | 0.852 | 3.616m | 6.307deg |
+| full182 balanced filters | 23.62 | 0.039 | 0.218 | 0.409 | 41.65px | 0.445 | 0.890 | 4.266m | 7.383deg |
+
+Patch-level sparse matching:
+
+The new Stage B sparse baseline treats each VFM token as a patch-level proposal
+instead of a pixel-accurate keypoint. For evaluation, a query token is correct
+if the predicted 3D landmark belongs to the visible landmark set whose GT
+projection falls inside that token patch:
+
+`P(q) = {X_j | pi(T_gt X_j) in patch(q), visible(X_j)=1}`
+
+New code:
+
+- `feature_extract/vfm/patch_to_3d_matching.py`
+- `feature_extract/tools/vfm/eval_patch_to_3d_vfm_matching.py`
+
+The patch evaluator reports:
+
+- `Patch@1`, `Patch@K`
+- `GT@stride`, `GT@2stride`
+- legacy `GT@5px`, `GT@16px`, and median reprojection error
+- PnP-inlier `Patch@1` and PnP-inlier `GT@stride`
+- final pose using a stride-aware PnP-RANSAC threshold
+
+OldHospital reference-pose top1, sparse patch baseline, balanced landmark
+filters, COLMAP intrinsics:
+
+| split/config | matches | Patch@1 | Patch@5 | GT@5 | GT@16 | GT@stride | GT@2stride | PnP success | med t | med r |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| q20 patch NN, 1.5 stride PnP | 32.90 | 0.113 | 0.113 | 0.053 | 0.251 | 0.251 | 0.435 | 1.000 | 0.847m | 2.042deg |
+| q20 patch MNN, 1.5 stride PnP | 31.25 | 0.118 | 0.118 | 0.055 | 0.262 | 0.262 | 0.447 | 1.000 | 1.191m | 2.680deg |
+| q20 soft mutual top5, no margin | 196.20 | 0.052 | 0.148 | 0.020 | 0.142 | 0.142 | 0.314 | 1.000 | 0.785m | 1.989deg |
+| full182 patch NN, 1.5 stride PnP | 23.62 | 0.100 | 0.100 | 0.039 | 0.218 | 0.219 | 0.410 | 0.945 | 2.954m | 5.903deg |
+| full182 soft mutual top5, no margin | 116.06 | 0.066 | 0.150 | 0.027 | 0.161 | 0.162 | 0.343 | 0.989 | 2.506m | 4.686deg |
+
+Interpretation:
+
+- Patch-level metrics expose signal that point-level `GT@5px` hides. On
+  full182 patch NN, `Patch@1=0.100` while `GT@5=0.039`, and `GT@2stride=0.410`
+  while `GT@16=0.218`.
+- The stride-aware PnP threshold gives a clear downstream improvement on the
+  full182 balanced sparse path: median pose improves from `4.266m/7.383deg`
+  for point-level PnP to `2.954m/5.903deg` with patch NN and to
+  `2.506m/4.686deg` with soft mutual top5.
+- Strict one-to-one MNN is still not the best default. It marginally improves
+  correspondence precision on q20 but gives worse pose than NN and soft mutual.
+- Soft mutual top5 without margin returns many more patch-level candidates,
+  lowering all-match precision but improving pose, likely because PnP gets
+  better spatial coverage and RANSAC can select a useful subset.
+- This supports the claim that raw VFM is better modeled as patch-level
+  localization evidence than as pixel-level 2D-3D correspondence.
+
+Spatial/PnP diagnostics with the corrected camera:
+
+| method | PnP residual median | inlier bbox area | inlier 4x4 grid occupancy | inlier xy PCA minor/major | inlier xyz planarity |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| sparse 3D landmarks | 5.83px | 0.356 | 0.353 | 0.286 | 0.00229 |
+| hybrid dense render | 5.65px | 0.259 | 0.299 | 0.359 | 0.00084 |
+
 Interpretation:
 
 - The user's visual concern is correct. Most accepted raw VFM query-to-map
   correspondences are not geometrically correct at normal local-feature
   thresholds.
-- Dense rendered matching is cleaner than sparse landmark matching by
-  correspondence precision, but still has a large median correspondence error.
+- The legacy fallback camera made the correspondence metrics look too
+  optimistic. With the correct COLMAP camera, the all-match GT precision and
+  PnP-inlier GT precision both drop sharply.
+- Dense rendered matching has lower median correspondence error than sparse
+  landmark matching, but its PnP inliers are less spatially spread and more
+  planar, which explains why final pose can be worse despite some cleaner
+  all-match statistics.
 - PnP can still produce a plausible pose because RANSAC selects a smaller,
   more geometrically consistent subset from many bad matches. Therefore final
   pose accuracy alone is not sufficient evidence that the VFM correspondences
   are meaningful.
 - The current raw VFM query-to-map path should be treated as a diagnostic
   verifier, not as a validated correspondence engine.
+- Sparse landmark filtering is effective for correspondence quality: on
+  full182, balanced filters roughly double `GT@16` and reduce median GT
+  reprojection error from `109.85px` to `41.65px`.
+- That improvement does not automatically solve pose. The full182 balanced
+  filters slightly increase PnP success but worsen median final pose. This
+  indicates that PnP still accepts spatially biased or geometrically weak
+  match subsets, so local geometric consistency is the next sparse-stage
+  requirement.
+- In q20 experiments, direct `similarity * Q_X` re-ranking plus MNN was too
+  brittle: it improved some all-match statistics but reduced usable match
+  count and PnP success. For now, quality is better used as conservative hard
+  filtering and reporting, not as the only ranking signal.
+- Patch-level matching changes the downstream picture: using token-stride
+  uncertainty in PnP gives positive full182 pose movement even without training
+  a selector.
+
+Bucket analysis with the corrected camera:
+
+- Sparse landmark matches are strongly driven by descriptor similarity and
+  track quality. The lowest-similarity quartile has `GT@16=0.000`, while the
+  highest-similarity quartile reaches `GT@16=0.323`. The lowest feature-variance
+  quartile reaches `GT@16=0.190`, compared with `0.092` for the highest
+  variance quartile.
+- Dense rendered matches are also similarity- and boundary-sensitive. The
+  lowest-similarity quartile has `GT@16=0.079`, and middle/high similarity
+  buckets reach about `0.22-0.25`. Near-boundary matches are worse
+  (`GT@16=0.119`) than central matches (`0.18-0.20`).
+- The current approximate alpha-entropy/top1-contribution diagnostics do not
+  behave as a reliable rejection rule. Higher entropy and lower top1
+  contribution can correlate with better matches, likely because the current
+  implementation measures projected Gaussian neighborhood density rather than
+  the exact renderer contribution for that pixel.
+- Dense depth variance has a weak useful signal: very high ray-depth variance
+  reduces PnP-inlier rate and GT@16, but it is not enough as a standalone
+  filter.
 
 RGB-render visualizations were added to avoid misleading interpretation from
 VFM PCA colors. The right panel is now a 3DGS RGB render at the same candidate
@@ -1609,13 +1764,18 @@ pose, while the lines still show the accepted VFM query-to-render matches:
 Immediate implication for the next method step:
 
 1. Do not optimize or claim only final PnP pose.
-2. Add local geometric consistency before PnP, such as Hough voting over
-   reprojection displacement, neighborhood-consistent match filtering, or
-   rendered depth/normal-aware gating.
+2. Add sparse patch-level local geometric consistency before PnP, such as Hough
+   voting over token-cell displacement, image-neighborhood-consistent match
+   filtering, or submap-relative pose voting.
 3. Evaluate any selector/refinement by correspondence precision and
    PnP-inlier GT precision, not only translation/rotation error.
-4. Treat VFM descriptors as coarse semantic/geometric evidence unless a method
-   explicitly proves sub-token correspondence quality.
+4. Treat VFM descriptors as patch-level semantic/geometric evidence unless a
+   method explicitly proves sub-token correspondence quality.
+5. Before changing the network, fix protocol plumbing so every OldHospital
+   evaluator loads COLMAP camera intrinsics by default and logs token/render
+   scale. The default fallback camera should only be used in toy tests.
+6. Keep dense render out of the main path until sparse landmark matching has a
+   reliable geometric verifier.
 
 ## Remaining Paper-Critical Gaps
 

@@ -3,14 +3,18 @@ import numpy as np
 from feature_extract.vfm.colmap_tracks import ColmapCamera
 from feature_extract.vfm.map_lifting import SelectedTrackFeatureBank, TrackFeature
 from feature_extract.vfm.query_to_3d_matching import (
+    LandmarkQualityConfig,
     LandmarkMapIndex,
     QueryTo3DMatchingConfig,
     estimate_pose_pnp_ransac,
     filter_landmarks_by_reference_images,
     match_query_tokens_to_landmarks,
     pnp_pose_error,
+    pnp_reprojection_residual_stats,
     reprojection_error_stats,
+    match_spatial_distribution_stats,
     token_grid_xy,
+    with_landmark_ambiguity_scores,
 )
 
 
@@ -114,6 +118,115 @@ def test_matching_filters_by_ratio_mutual_and_landmark_variance() -> None:
     assert [match.track_id for match in matches] == [3]
 
 
+def test_landmark_quality_can_reweight_candidate_selection() -> None:
+    query_map = np.zeros((2, 1, 1), dtype=np.float32)
+    query_map[:, 0, 0] = np.asarray([1.0, 0.0], dtype=np.float32)
+    index = LandmarkMapIndex(
+        track_ids=np.asarray([1, 2], dtype=np.int64),
+        xyz=np.zeros((2, 3), dtype=np.float64),
+        features=np.asarray([[1.0, 0.0], [0.90, 0.4358899]], dtype=np.float32),
+        mean_variances=np.asarray([1.0, 0.0], dtype=np.float32),
+        observation_counts=np.asarray([1, 8], dtype=np.int64),
+        observation_image_ids=(("a",), ("a",) * 8),
+        reprojection_errors=np.asarray([4.0, 0.1], dtype=np.float32),
+    )
+
+    matches = match_query_tokens_to_landmarks(
+        query_map,
+        index,
+        QueryTo3DMatchingConfig(
+            top_k=2,
+            min_similarity=0.1,
+            ratio_threshold=None,
+            landmark_quality=LandmarkQualityConfig(enabled=True, min_score=0.0),
+        ),
+        image_width=10,
+        image_height=10,
+    )
+
+    assert [match.track_id for match in matches] == [2]
+    assert matches[0].landmark_quality is not None
+    assert matches[0].quality_weighted_similarity is not None
+    assert matches[0].landmark_quality > 0.75
+
+
+def test_min_similarity_margin_rejects_ambiguous_matches() -> None:
+    query_map = np.zeros((2, 1, 1), dtype=np.float32)
+    query_map[:, 0, 0] = np.asarray([1.0, 0.0], dtype=np.float32)
+    index = LandmarkMapIndex(
+        track_ids=np.asarray([1, 2], dtype=np.int64),
+        xyz=np.zeros((2, 3), dtype=np.float64),
+        features=np.asarray([[1.0, 0.0], [0.99995, 0.01]], dtype=np.float32),
+        mean_variances=np.zeros((2,), dtype=np.float32),
+        observation_counts=np.ones((2,), dtype=np.int64),
+        observation_image_ids=(("a",), ("a",)),
+    )
+
+    matches = match_query_tokens_to_landmarks(
+        query_map,
+        index,
+        QueryTo3DMatchingConfig(
+            top_k=2,
+            min_similarity=0.1,
+            ratio_threshold=None,
+            min_similarity_margin=0.01,
+        ),
+        image_width=10,
+        image_height=10,
+    )
+
+    assert matches == []
+
+
+def test_landmark_filters_use_reprojection_ambiguity_and_boundary() -> None:
+    query_map = np.zeros((3, 1, 3), dtype=np.float32)
+    query_map[:, 0, 0] = np.asarray([1.0, 0.0, 0.0], dtype=np.float32)
+    query_map[:, 0, 1] = np.asarray([0.0, 1.0, 0.0], dtype=np.float32)
+    query_map[:, 0, 2] = np.asarray([0.0, 0.0, 1.0], dtype=np.float32)
+    index = LandmarkMapIndex(
+        track_ids=np.asarray([1, 2, 3], dtype=np.int64),
+        xyz=np.zeros((3, 3), dtype=np.float64),
+        features=np.eye(3, dtype=np.float32),
+        mean_variances=np.zeros((3,), dtype=np.float32),
+        observation_counts=np.ones((3,), dtype=np.int64) * 3,
+        observation_image_ids=(("a",), ("a",), ("a",)),
+        reprojection_errors=np.asarray([0.1, 4.0, 0.1], dtype=np.float32),
+        feature_ambiguities=np.asarray([0.1, 0.1, 0.95], dtype=np.float32),
+    )
+
+    matches = match_query_tokens_to_landmarks(
+        query_map,
+        index,
+        QueryTo3DMatchingConfig(
+            top_k=1,
+            min_similarity=0.5,
+            max_landmark_reprojection_error=1.0,
+            max_landmark_ambiguity=0.5,
+            min_distance_to_boundary_px=1.0,
+        ),
+        image_width=30,
+        image_height=10,
+    )
+
+    assert matches == []
+
+
+def test_scene_level_ambiguity_scores_survive_subsetting() -> None:
+    index = LandmarkMapIndex(
+        track_ids=np.asarray([1, 2, 3], dtype=np.int64),
+        xyz=np.zeros((3, 3), dtype=np.float64),
+        features=np.asarray([[1.0, 0.0], [0.99, 0.01], [0.0, 1.0]], dtype=np.float32),
+        mean_variances=np.zeros((3,), dtype=np.float32),
+        observation_counts=np.ones((3,), dtype=np.int64),
+        observation_image_ids=(("a",), ("a",), ("a",)),
+    )
+
+    scored = with_landmark_ambiguity_scores(index, reference_size=3, block_size=2)
+    subset = scored.subset([0, 2])
+
+    assert subset.feature_ambiguities[0] > subset.feature_ambiguities[1]
+
+
 def test_reference_visibility_submap_keeps_only_tracks_observed_by_references() -> None:
     bank = SelectedTrackFeatureBank(
         tracks={
@@ -175,4 +288,35 @@ def test_reprojection_error_stats_reports_distribution_and_pnp_inlier_quality() 
     assert stats["gt_precision_32px"] == 1.0
     assert stats["gt_reproj_median_px"] == 0.0
     assert stats["pnp_inlier_count"] == 3
+    assert stats["pnp_inlier_gt_precision_5px"] == 2.0 / 3.0
     assert stats["pnp_inlier_gt_precision_16px"] == 2.0 / 3.0
+    assert stats["pnp_inlier_gt_precision_32px"] == 1.0
+
+
+def test_pnp_residual_and_spatial_distribution_stats_expose_degeneracy() -> None:
+    grid_xy = np.asarray(
+        [
+            [10.0, 10.0],
+            [12.0, 12.0],
+            [14.0, 14.0],
+            [16.0, 16.0],
+            [80.0, 80.0],
+        ],
+        dtype=np.float64,
+    )
+    xyz = _xyz_from_xy(grid_xy, np.full((5,), 5.0, dtype=np.float64))
+    matches = [
+        type("Match", (), {"xyz": xyz[idx], "xy": grid_xy[idx]})()
+        for idx in range(grid_xy.shape[0])
+    ]
+    inlier_mask = np.asarray([True, True, True, True, False], dtype=bool)
+
+    residual = pnp_reprojection_residual_stats(matches, np.eye(4, dtype=np.float64), _camera(), inlier_mask)
+    spatial = match_spatial_distribution_stats(matches, 100, 100, inlier_mask)
+
+    assert residual["pnp_reproj_inlier_count"] == 4
+    assert residual["pnp_reproj_inlier_median_px"] < 1e-6
+    assert spatial["count"] == 4
+    assert spatial["bbox_area_frac"] < 0.01
+    assert spatial["grid_4x4_occupancy_frac"] == 1.0 / 16.0
+    assert spatial["xy_pca_minor_major_ratio"] < 1e-6

@@ -913,6 +913,12 @@ def render_gaussian_vfm_feature_map_gsplat(
     if np.any(visible):
         xyz_map[visible] = xyz_map[visible] / np.maximum(weight_sum[visible, None], 1e-8)
     xyz_map[~visible] = 0.0
+    depth = np.zeros((config.height, config.width), dtype=np.float32)
+    if np.any(visible):
+        pose_np = np.asarray(pose_w2c, dtype=np.float64).reshape(4, 4)
+        visible_xyz = xyz_map[visible].astype(np.float64)
+        visible_xyz_h = np.concatenate([visible_xyz, np.ones((visible_xyz.shape[0], 1), dtype=np.float64)], axis=1)
+        depth[visible] = (pose_np @ visible_xyz_h.T).T[:, 2].astype(np.float32)
     if config.l2_normalize_pixels and np.any(visible):
         pixels = feature_map[:, visible].T
         pixels, _valid = normalize_rows(pixels)
@@ -921,7 +927,7 @@ def render_gaussian_vfm_feature_map_gsplat(
         feature_map=feature_map,
         xyz_map=xyz_map,
         visibility_mask=visible,
-        depth=np.zeros((config.height, config.width), dtype=np.float32),
+        depth=depth,
         weight_sum=weight_sum,
         dominant_gaussian_index=np.full((config.height, config.width), -1, dtype=np.int64),
     )

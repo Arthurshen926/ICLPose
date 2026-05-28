@@ -52,6 +52,9 @@ def match_query_tokens_to_rendered_map(
     config: QueryToRenderMatchingConfig | None = None,
     image_width: int = 1024,
     image_height: int = 576,
+    *,
+    alpha_map: np.ndarray | None = None,
+    depth_map: np.ndarray | None = None,
 ) -> list[QueryTo3DMatch]:
     """Match query VFM tokens to visible rendered map pixels.
 
@@ -64,6 +67,8 @@ def match_query_tokens_to_rendered_map(
     rendered_feature_map = np.asarray(rendered_feature_map, dtype=np.float32)
     rendered_xyz_map = np.asarray(rendered_xyz_map, dtype=np.float32)
     visibility_mask = np.asarray(visibility_mask, dtype=bool)
+    alpha_values = None if alpha_map is None else np.asarray(alpha_map, dtype=np.float32).reshape(-1)
+    depth_values = None if depth_map is None else np.asarray(depth_map, dtype=np.float32).reshape(-1)
     if rendered_feature_map.ndim != 3:
         raise ValueError("rendered_feature_map must have shape (C, H, W)")
     channels, render_height, render_width = rendered_feature_map.shape
@@ -83,6 +88,8 @@ def match_query_tokens_to_rendered_map(
     render_features = rendered_feature_map.reshape(channels, -1).T[visible_flat]
     render_xyz = rendered_xyz_map.reshape(-1, 3)[visible_flat].astype(np.float64)
     render_pixel_indices = np.flatnonzero(visible_flat).astype(np.int64)
+    render_alpha = None if alpha_values is None else alpha_values[visible_flat]
+    render_depth = None if depth_values is None else depth_values[visible_flat]
     if render_features.size == 0:
         return []
     render_features, valid_render = normalize_rows(render_features)
@@ -90,6 +97,10 @@ def match_query_tokens_to_rendered_map(
         render_features = render_features[valid_render]
         render_xyz = render_xyz[valid_render]
         render_pixel_indices = render_pixel_indices[valid_render]
+        if render_alpha is not None:
+            render_alpha = render_alpha[valid_render]
+        if render_depth is not None:
+            render_depth = render_depth[valid_render]
 
     valid_query_indices = np.flatnonzero(valid_query)
     if valid_query_indices.size == 0 or render_features.shape[0] == 0:
@@ -114,22 +125,42 @@ def match_query_tokens_to_rendered_map(
             continue
         ratio = 0.0
         if top_scores.shape[1] >= 2:
+            second_similarity = float(top_scores[query_idx, 1])
             best_distance = max(0.0, 1.0 - similarity)
-            second_distance = max(1e-6, 1.0 - float(top_scores[query_idx, 1]))
+            second_distance = max(1e-6, 1.0 - second_similarity)
             ratio = float(best_distance / second_distance)
             if cfg.ratio_threshold is not None and ratio > float(cfg.ratio_threshold):
                 continue
+        else:
+            second_similarity = None
         if cfg.mutual and int(render_best_query[render_idx]) != query_idx:
             continue
+        xy = query_xy[query_idx].astype(np.float64, copy=True)
+        boundary = min(
+            float(xy[0]),
+            float(xy[1]),
+            float(image_width - 1) - float(xy[0]),
+            float(image_height - 1) - float(xy[1]),
+        )
         matches.append(
             QueryTo3DMatch(
                 token_index=int(token_indices[query_idx]),
-                xy=query_xy[query_idx].astype(np.float64, copy=True),
+                xy=xy,
                 track_id=int(render_pixel_indices[render_idx]),
                 xyz=render_xyz[render_idx].astype(np.float64, copy=True),
                 similarity=similarity,
                 ratio=ratio,
                 landmark_variance=0.0,
+                source="dense_render",
+                observation_count=None,
+                visibility_count=None,
+                similarity_margin=None if second_similarity is None else float(similarity - second_similarity),
+                distance_to_boundary_px=float(boundary),
+                render_alpha=None if render_alpha is None else float(render_alpha[render_idx]),
+                render_depth=None if render_depth is None else float(render_depth[render_idx]),
+                alpha_entropy=None,
+                top1_alpha_contribution=None,
+                depth_variance_along_ray=None,
             )
         )
     matches.sort(key=lambda item: item.similarity, reverse=True)

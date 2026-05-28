@@ -11,22 +11,25 @@ import numpy as np
 
 from feature_extract.tools.vfm.eval_query_to_3d_vfm_matching import (
     _limit_submap,
-    _load_default_camera,
+    _infer_camera_model_dir,
+    _load_camera_with_source,
     _load_query_feature,
     _load_reference_submaps,
-    _load_xyz_by_track,
+    _load_track_stats,
     _parse_default_camera,
 )
 from feature_extract.vfm.cambridge_pose_lattice import parse_cambridge_pose_file
 from feature_extract.vfm.landmark_visibility import LandmarkVisibilityIndex, filter_landmarks_by_visibility
 from feature_extract.vfm.map_lifting import load_selected_track_bank_npz
 from feature_extract.vfm.query_to_3d_matching import (
+    LandmarkQualityConfig,
     LandmarkMapIndex,
     QueryTo3DMatchingConfig,
     estimate_pose_pnp_ransac,
     filter_landmarks_by_reference_images,
     match_query_tokens_to_landmarks,
     pnp_pose_error,
+    with_landmark_ambiguity_scores,
 )
 from feature_extract.vfm.query_to_3d_visualization import (
     render_query_to_3d_match_overlay,
@@ -86,10 +89,24 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     parser.add_argument("--top_k", type=int, default=2)
     parser.add_argument("--ratio_threshold", type=float, default=0.95)
     parser.add_argument("--disable_ratio_test", action="store_true")
+    parser.add_argument("--min_similarity_margin", type=float, default=None)
     parser.add_argument("--min_similarity", type=float, default=0.2)
     parser.add_argument("--mutual", action="store_true")
     parser.add_argument("--max_landmark_variance", type=float, default=None)
+    parser.add_argument("--max_landmark_reprojection_error", type=float, default=None)
+    parser.add_argument("--max_landmark_ambiguity", type=float, default=None)
+    parser.add_argument("--min_distance_to_boundary_px", type=float, default=None)
+    parser.add_argument("--min_quality_weighted_similarity", type=float, default=None)
     parser.add_argument("--min_observation_count", type=int, default=2)
+    parser.add_argument("--enable_landmark_quality", action="store_true")
+    parser.add_argument("--quality_min_score", type=float, default=None)
+    parser.add_argument("--quality_min_track_length", type=int, default=None)
+    parser.add_argument("--quality_track_weight", type=float, default=1.0)
+    parser.add_argument("--quality_variance_weight", type=float, default=1.0)
+    parser.add_argument("--quality_reprojection_weight", type=float, default=1.0)
+    parser.add_argument("--quality_idf_weight", type=float, default=0.0)
+    parser.add_argument("--quality_ambiguity_weight", type=float, default=0.5)
+    parser.add_argument("--quality_ambiguity_reference_size", type=int, default=4096)
     parser.add_argument("--max_matches", type=int, default=1000)
     parser.add_argument("--match_block_size", type=int, default=128)
     parser.add_argument("--pnp_reprojection_error_px", type=float, default=12.0)
@@ -107,22 +124,46 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         raise ValueError(f"query_id not found in manifest: {missing_queries}")
     gt_by_query = {record.image_id: record for record in parse_cambridge_pose_file(Path(args.query_pose_file))}
     bank = load_selected_track_bank_npz(Path(args.landmark_bank))
-    landmark_index = LandmarkMapIndex.from_track_bank(bank, _load_xyz_by_track(Path(args.track_observations)))
+    xyz_by_track, reprojection_error_by_track = _load_track_stats(Path(args.track_observations))
+    landmark_index = LandmarkMapIndex.from_track_bank(bank, xyz_by_track, reprojection_error_by_track)
+    if args.max_landmark_ambiguity is not None or args.enable_landmark_quality:
+        landmark_index = with_landmark_ambiguity_scores(
+            landmark_index,
+            reference_size=args.quality_ambiguity_reference_size,
+            block_size=args.match_block_size,
+        )
     visibility_index = None
     if args.visibility_index:
         visibility_index = LandmarkVisibilityIndex.load_npz(Path(args.visibility_index))
-    camera = _load_default_camera(args.camera_model_dir, _parse_default_camera(args.default_camera))
+    camera_model_dir = _infer_camera_model_dir(args.query_pose_file, args.camera_model_dir)
+    camera, camera_source = _load_camera_with_source(camera_model_dir, _parse_default_camera(args.default_camera))
     reference_submaps = _load_reference_submaps(args.candidate_bank, args.submap_top_n)
     config = QueryTo3DMatchingConfig(
         top_k=args.top_k,
         ratio_threshold=None if args.disable_ratio_test else args.ratio_threshold,
+        min_similarity_margin=args.min_similarity_margin,
         min_similarity=args.min_similarity,
         mutual=bool(args.mutual),
         max_landmark_variance=args.max_landmark_variance,
+        max_landmark_reprojection_error=args.max_landmark_reprojection_error,
+        max_landmark_ambiguity=args.max_landmark_ambiguity,
+        min_distance_to_boundary_px=args.min_distance_to_boundary_px,
+        min_quality_weighted_similarity=args.min_quality_weighted_similarity,
         min_observation_count=args.min_observation_count,
         query_token_step=args.query_token_step,
         max_matches=args.max_matches,
         block_size=args.match_block_size,
+        landmark_quality=LandmarkQualityConfig(
+            enabled=bool(args.enable_landmark_quality),
+            track_weight=args.quality_track_weight,
+            variance_weight=args.quality_variance_weight,
+            reprojection_weight=args.quality_reprojection_weight,
+            idf_weight=args.quality_idf_weight,
+            ambiguity_weight=args.quality_ambiguity_weight,
+            ambiguity_reference_size=args.quality_ambiguity_reference_size,
+            min_score=args.quality_min_score,
+            min_track_length=args.quality_min_track_length,
+        ),
     )
 
     output_dir = Path(args.output_dir)
@@ -203,6 +244,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             "projection_feature_png": str(projection_feature_path),
             "submap_reference_count": len(references),
             "submap_landmark_count": len(submap),
+            "camera_source": camera_source,
             "pnp_success": bool(pnp.success),
             "pnp_inlier_count": int(pnp.inlier_count),
             "pnp_inlier_ratio": float(pnp.inlier_ratio),

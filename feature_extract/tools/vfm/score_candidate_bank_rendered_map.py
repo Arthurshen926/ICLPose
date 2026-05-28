@@ -74,6 +74,22 @@ def _validate_camera_track_model_match(track_observations: Path, camera_model_di
         )
 
 
+def _infer_camera_model_dir(track_observations: Path, camera_model_dir: Optional[str]) -> Optional[str]:
+    if camera_model_dir:
+        return camera_model_dir
+    summary_path = _track_summary_path(Path(track_observations))
+    if not summary_path.exists():
+        return None
+    summary = json.loads(summary_path.read_text())
+    model_dir = summary.get("model_dir")
+    if not model_dir:
+        return None
+    model_path = Path(str(model_dir))
+    if (model_path / "cameras.bin").exists() and (model_path / "images.bin").exists():
+        return str(model_path)
+    return None
+
+
 def _parse_default_camera(text: str) -> ColmapCamera:
     parts = [float(item) for item in text.split(",") if item.strip()]
     if len(parts) < 6:
@@ -134,8 +150,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     parser.add_argument("--output_md", default=None)
     args = parser.parse_args(argv)
 
+    effective_camera_model_dir = args.camera_model_dir
     if args.mode == "projected_grid":
-        _validate_camera_track_model_match(Path(args.track_observations), args.camera_model_dir)
+        effective_camera_model_dir = _infer_camera_model_dir(Path(args.track_observations), args.camera_model_dir)
+        _validate_camera_track_model_match(Path(args.track_observations), effective_camera_model_dir)
 
     selector = load_selector_from_checkpoint(Path(args.selector_checkpoint), device=args.device)
     bank = CandidateHypothesisBank.from_jsonl(Path(args.bank))
@@ -159,7 +177,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             risk_from_inliers=args.risk_from_inliers,
         )
     elif args.mode == "projected_grid":
-        camera_by_image, default_camera = _load_cameras(args.camera_model_dir, args.default_camera)
+        camera_by_image, default_camera = _load_cameras(effective_camera_model_dir, args.default_camera)
         visibility_index = None
         if args.projected_visibility_filter == "reference_image":
             visibility_index = build_track_visibility_index(Path(args.track_observations))
@@ -228,6 +246,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         "risk_from_inliers": bool(args.risk_from_inliers),
         "projected_visibility_filter": args.projected_visibility_filter,
         "camera_model_dir": args.camera_model_dir,
+        "effective_camera_model_dir": effective_camera_model_dir,
         "default_camera": args.default_camera,
         "translation_threshold_m": float(args.translation_threshold_m),
         "rotation_threshold_deg": float(args.rotation_threshold_deg),

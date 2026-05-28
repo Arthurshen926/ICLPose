@@ -10,8 +10,9 @@ from typing import Optional, Sequence
 import numpy as np
 
 from feature_extract.tools.vfm.eval_query_to_render_vfm_matching import (
+    _infer_camera_model_dir,
+    _load_camera_with_source,
     _load_candidate_poses,
-    _load_default_camera,
     _load_query_feature,
     _parse_default_camera,
 )
@@ -193,7 +194,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     records = {record.image_id: record for record in manifest.records}
     field = GaussianVFMField.load_npz(Path(args.field))
     rgb_source = load_gaussian_rgb_source_from_ply(Path(args.rgb_gaussian_ply)) if args.rgb_gaussian_ply else None
-    camera = _load_default_camera(args.camera_model_dir, _parse_default_camera(args.default_camera))
+    camera_model_dir = _infer_camera_model_dir(args.query_pose_file, args.camera_model_dir)
+    camera, camera_source = _load_camera_with_source(camera_model_dir, _parse_default_camera(args.default_camera))
     gt_by_query = {record.image_id: record for record in parse_cambridge_pose_file(Path(args.query_pose_file))}
     candidates_by_query = _load_candidate_poses(args.candidate_bank, args.candidate_top_n)
     render_config = GaussianVFMRenderConfig(
@@ -279,6 +281,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             "candidate_id": candidate["candidate_id"],
             "reference_image": candidate["reference_image"],
             "selected_candidate_rank": candidate["rank"],
+            "camera_source": camera_source,
             "output_png": str(png_path),
             "right_panel_kind": right_panel_kind,
             "render_visible_fraction": float(np.mean(rendered.visibility_mask)),
@@ -300,6 +303,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 "stage": "query_to_render_vfm_match_visualization",
                 "query_count": len(summaries),
                 "queries": summaries,
+                "camera_source": camera_source,
                 "matching_config": match_config.__dict__,
             },
             indent=2,
