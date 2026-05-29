@@ -214,6 +214,82 @@ def test_patch_matching_can_rank_by_landmark_quality_weighted_similarity() -> No
     assert matches[0].quality_weighted_similarity is not None
 
 
+def test_patch_matching_can_rank_by_similarity_even_when_quality_is_enabled() -> None:
+    query_map = np.zeros((2, 1, 1), dtype=np.float32)
+    query_map[:, 0, 0] = np.asarray([1.0, 0.0], dtype=np.float32)
+    index = LandmarkMapIndex(
+        track_ids=np.asarray([1, 2], dtype=np.int64),
+        xyz=np.asarray([[0.0, 0.0, 5.0], [0.0, 0.0, 6.0]], dtype=np.float64),
+        features=np.asarray([[1.0, 0.0], [0.92, 0.39]], dtype=np.float32),
+        mean_variances=np.zeros((2,), dtype=np.float32),
+        observation_counts=np.asarray([1, 20], dtype=np.int64),
+        observation_image_ids=(("ref.png",), tuple(f"ref_{idx}.png" for idx in range(20))),
+    )
+
+    matches = match_query_patches_to_landmarks(
+        query_map,
+        index,
+        PatchTo3DMatchingConfig(
+            top_k=2,
+            match_mode="nn",
+            min_similarity=0.0,
+            ratio_threshold=None,
+            match_score_mode="similarity",
+            landmark_quality=LandmarkQualityConfig(
+                enabled=True,
+                track_weight=1.0,
+                variance_weight=0.0,
+                reprojection_weight=0.0,
+                idf_weight=0.0,
+                ambiguity_weight=0.0,
+            ),
+        ),
+        image_width=100,
+        image_height=100,
+    )
+
+    assert len(matches) == 1
+    assert matches[0].track_id == 1
+
+
+def test_patch_matching_can_rank_by_landmark_quality_only() -> None:
+    query_map = np.zeros((2, 1, 1), dtype=np.float32)
+    query_map[:, 0, 0] = np.asarray([1.0, 0.0], dtype=np.float32)
+    index = LandmarkMapIndex(
+        track_ids=np.asarray([1, 2], dtype=np.int64),
+        xyz=np.asarray([[0.0, 0.0, 5.0], [0.0, 0.0, 6.0]], dtype=np.float64),
+        features=np.asarray([[1.0, 0.0], [0.7, 0.71]], dtype=np.float32),
+        mean_variances=np.zeros((2,), dtype=np.float32),
+        observation_counts=np.asarray([1, 20], dtype=np.int64),
+        observation_image_ids=(("ref.png",), tuple(f"ref_{idx}.png" for idx in range(20))),
+    )
+
+    matches = match_query_patches_to_landmarks(
+        query_map,
+        index,
+        PatchTo3DMatchingConfig(
+            top_k=2,
+            match_mode="nn",
+            min_similarity=0.0,
+            ratio_threshold=None,
+            match_score_mode="landmark_quality",
+            landmark_quality=LandmarkQualityConfig(
+                enabled=True,
+                track_weight=1.0,
+                variance_weight=0.0,
+                reprojection_weight=0.0,
+                idf_weight=0.0,
+                ambiguity_weight=0.0,
+            ),
+        ),
+        image_width=100,
+        image_height=100,
+    )
+
+    assert len(matches) == 1
+    assert matches[0].track_id == 2
+
+
 def test_token_patch_boxes_cover_stride_sized_regions() -> None:
     boxes = token_patch_boxes(token_width=3, token_height=3, image_width=100, image_height=100)
 

@@ -34,7 +34,10 @@ GROUP_FIELDS = (
     "mean_pnp_inlier_patch_at_5_mean",
     "mean_pnp_inlier_patch_at_5_std",
     "mean_pnp_inlier_patch_at_5_best",
+    "mean_match_count_mean",
+    "mean_pnp_inlier_count_mean",
     "total_storage_bytes_mean",
+    "storage_ratio_vs_raw_mean",
     "total_elapsed_sec_mean",
     "train_eval_top1_acc_mean",
     "train_final_loss_mean",
@@ -52,6 +55,15 @@ def _load_json(path: Path) -> dict:
     if str(path) == "-":
         return {}
     return json.loads(Path(path).read_text())
+
+
+def _storage_bytes_from_payload(payload: dict) -> tuple[int, int, int]:
+    storage = dict(payload.get("storage_bytes") or {})
+    return (
+        int(storage.get("query_tokens", 0) or 0),
+        int(storage.get("landmark_bank", 0) or 0),
+        int(storage.get("transform", 0) or 0),
+    )
 
 
 def _metric(row: dict[str, object], key: str) -> float | None:
@@ -93,10 +105,10 @@ def _run_row(
     train = _load_json(train_path)
     compression = _load_json(compression_path)
     evaluation = _load_json(evaluation_path)
-    storage = dict(compression.get("storage_bytes") or {})
-    query_storage = int(storage.get("query_tokens", 0) or 0)
-    landmark_storage = int(storage.get("landmark_bank", 0) or 0)
-    transform_storage = int(storage.get("transform", 0) or 0)
+    if compression:
+        query_storage, landmark_storage, transform_storage = _storage_bytes_from_payload(compression)
+    else:
+        query_storage, landmark_storage, transform_storage = _storage_bytes_from_payload(evaluation)
     training = dict(train.get("training") or {})
     return {
         "scene": scene,
@@ -153,6 +165,8 @@ def _group_rows(rows: Sequence[dict[str, object]]) -> list[dict[str, object]]:
             "median_rotation_error_deg",
             "mean_pnp_inlier_patch_at_1",
             "mean_pnp_inlier_patch_at_5",
+            "mean_match_count",
+            "mean_pnp_inlier_count",
             "total_storage_bytes",
             "total_elapsed_sec",
             "train_eval_top1_acc",
@@ -175,6 +189,19 @@ def _group_rows(rows: Sequence[dict[str, object]]) -> list[dict[str, object]]:
                     lower_is_better=key in {"median_translation_error_m", "median_rotation_error_deg"},
                 )
         summaries.append(summary)
+    raw_storage_by_scene = {
+        str(row["scene"]): float(row["total_storage_bytes_mean"])
+        for row in summaries
+        if str(row["method"]) == "raw" and int(row["output_dim"]) == 1280 and row.get("total_storage_bytes_mean")
+    }
+    for summary in summaries:
+        raw_storage = raw_storage_by_scene.get(str(summary["scene"]))
+        storage = summary.get("total_storage_bytes_mean")
+        summary["storage_ratio_vs_raw_mean"] = (
+            None
+            if not raw_storage or storage is None
+            else float(float(storage) / max(float(raw_storage), 1.0))
+        )
     return summaries
 
 
@@ -209,6 +236,9 @@ def _write_markdown(rows: Sequence[dict[str, object]], path: Path) -> None:
         "median_translation_error_m_mean",
         "median_translation_error_m_best",
         "mean_pnp_inlier_patch_at_1_mean",
+        "mean_match_count_mean",
+        "mean_pnp_inlier_count_mean",
+        "storage_ratio_vs_raw_mean",
     )
     lines = ["| " + " | ".join(fields) + " |", "| " + " | ".join(["---"] * len(fields)) + " |"]
     for row in rows:

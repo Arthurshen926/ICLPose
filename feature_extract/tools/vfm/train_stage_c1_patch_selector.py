@@ -100,6 +100,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     parser.add_argument("--temperature", type=float, default=0.07)
     parser.add_argument("--eval_split_fraction", type=float, default=0.1)
     parser.add_argument("--center_inputs", action="store_true")
+    parser.add_argument("--group_size", type=int, default=0)
+    parser.add_argument("--group_lasso_weight", type=float, default=0.0)
+    parser.add_argument("--hard_gate_keep_fraction", type=float, default=1.0)
+    parser.add_argument("--hard_gate_min_groups", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--output_transform", required=True)
@@ -211,6 +215,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             device=args.device,
             eval_split_fraction=float(args.eval_split_fraction),
             center_inputs=bool(args.center_inputs),
+            group_size=int(args.group_size),
+            group_lasso_weight=float(args.group_lasso_weight),
+            hard_gate_keep_fraction=float(args.hard_gate_keep_fraction),
+            hard_gate_min_groups=int(args.hard_gate_min_groups),
         ),
     )
     run.transform.to_npz(

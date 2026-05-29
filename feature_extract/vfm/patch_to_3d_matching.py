@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Mapping, Sequence
+from typing import Mapping, Protocol, Sequence
 
 import numpy as np
 
@@ -21,6 +21,11 @@ from feature_extract.vfm.query_to_3d_matching import (
     normalize_rows,
     token_grid_xy,
 )
+
+
+class PairwiseInlierScorer(Protocol):
+    def score_pairs(self, query_descriptors: np.ndarray, landmark_descriptors: np.ndarray) -> np.ndarray:
+        ...
 
 
 @dataclass(frozen=True)
@@ -73,6 +78,8 @@ class PatchTo3DMatchingConfig:
     query_token_step: int = 1
     max_matches: int | None = None
     block_size: int = 512
+    similarity_device: str = "cpu"
+    match_score_mode: str = "similarity_quality"
     landmark_quality: LandmarkQualityConfig = LandmarkQualityConfig()
 
     def __post_init__(self) -> None:
@@ -82,6 +89,10 @@ class PatchTo3DMatchingConfig:
             raise ValueError("mutual_top_k must be positive")
         if self.match_mode not in {"nn", "mnn", "soft_mutual"}:
             raise ValueError("match_mode must be one of: nn, mnn, soft_mutual")
+        if self.match_score_mode not in {"similarity", "landmark_quality", "similarity_quality", "similarity_pairwise"}:
+            raise ValueError(
+                "match_score_mode must be one of: similarity, landmark_quality, similarity_quality, similarity_pairwise"
+            )
         if self.ratio_threshold is not None and not 0.0 < float(self.ratio_threshold) <= 1.0:
             raise ValueError("ratio_threshold must be in (0, 1]")
         if self.min_quality_weighted_similarity is not None and float(self.min_quality_weighted_similarity) < -1.0:
@@ -230,12 +241,32 @@ def _query_landmark_topk(
     landmark_features: np.ndarray,
     top_k: int,
     block_size: int,
+    device: str = "cpu",
 ) -> tuple[np.ndarray, np.ndarray]:
     query_count = int(query_features.shape[0])
     landmark_count = int(landmark_features.shape[0])
     effective_top_k = min(int(top_k), landmark_count)
     top_indices = np.full((query_count, effective_top_k), -1, dtype=np.int64)
     top_scores = np.full((query_count, effective_top_k), -np.inf, dtype=np.float32)
+    if str(device).lower() != "cpu":
+        try:
+            import torch
+        except Exception as exc:  # pragma: no cover
+            raise RuntimeError("Torch is required for non-CPU patch matching similarity") from exc
+        requested = str(device).lower()
+        if requested == "auto":
+            requested = "cuda" if torch.cuda.is_available() else "cpu"
+        if requested != "cpu":
+            torch_device = torch.device(requested)
+            landmark_tensor = torch.as_tensor(landmark_features, dtype=torch.float32, device=torch_device).T.contiguous()
+            for start in range(0, query_count, block_size):
+                end = min(start + block_size, query_count)
+                query_tensor = torch.as_tensor(query_features[start:end], dtype=torch.float32, device=torch_device)
+                scores = torch.matmul(query_tensor, landmark_tensor)
+                local_scores, local_indices = torch.topk(scores, k=effective_top_k, dim=1, largest=True, sorted=True)
+                top_indices[start:end] = local_indices.detach().cpu().numpy().astype(np.int64)
+                top_scores[start:end] = local_scores.detach().cpu().numpy().astype(np.float32)
+            return top_indices, top_scores
     for start in range(0, query_count, block_size):
         end = min(start + block_size, query_count)
         scores = query_features[start:end] @ landmark_features.T
@@ -279,12 +310,75 @@ def _valid_subset(index: LandmarkMapIndex, config: PatchTo3DMatchingConfig) -> L
     return index.subset(mask)
 
 
+def _match_score(match: QueryTo3DMatch, mode: str) -> float:
+    if mode == "similarity":
+        return float(match.similarity)
+    if mode == "landmark_quality":
+        return float(match.landmark_quality if match.landmark_quality is not None else 1.0)
+    if mode == "similarity_quality":
+        return float(match.quality_weighted_similarity if match.quality_weighted_similarity is not None else match.similarity)
+    if mode == "similarity_pairwise":
+        return float(match.pairwise_weighted_similarity if match.pairwise_weighted_similarity is not None else match.similarity)
+    raise ValueError("unsupported match_score_mode")
+
+
+def _log_sigmoid(values: np.ndarray) -> np.ndarray:
+    logits = np.asarray(values, dtype=np.float32)
+    return (-np.logaddexp(0.0, -logits)).astype(np.float32)
+
+
+def _pairwise_inlier_logits_for_topk(
+    scorer: PairwiseInlierScorer | None,
+    query_features: np.ndarray,
+    landmark_features: np.ndarray,
+    top_indices: np.ndarray,
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    if scorer is None:
+        return None, None
+    if top_indices.size == 0:
+        return (
+            np.zeros(top_indices.shape, dtype=np.float32),
+            np.zeros(top_indices.shape, dtype=np.float32),
+        )
+    query_rows = []
+    landmark_rows = []
+    pair_positions = []
+    for query_row in range(top_indices.shape[0]):
+        for rank in range(top_indices.shape[1]):
+            landmark_idx = int(top_indices[query_row, rank])
+            if landmark_idx < 0:
+                continue
+            query_rows.append(query_features[query_row])
+            landmark_rows.append(landmark_features[landmark_idx])
+            pair_positions.append((query_row, rank))
+    logits = np.full(top_indices.shape, -np.inf, dtype=np.float32)
+    logprobs = np.full(top_indices.shape, -np.inf, dtype=np.float32)
+    if not pair_positions:
+        return logits, logprobs
+    pair_logits = np.asarray(
+        scorer.score_pairs(
+            np.stack(query_rows, axis=0).astype(np.float32, copy=False),
+            np.stack(landmark_rows, axis=0).astype(np.float32, copy=False),
+        ),
+        dtype=np.float32,
+    ).reshape(-1)
+    if pair_logits.shape[0] != len(pair_positions):
+        raise ValueError("pairwise scorer must return one logit per query-landmark pair")
+    pair_logprobs = _log_sigmoid(pair_logits)
+    for (query_row, rank), logit, logprob in zip(pair_positions, pair_logits, pair_logprobs):
+        logits[query_row, rank] = float(logit)
+        logprobs[query_row, rank] = float(logprob)
+    return logits, logprobs
+
+
 def match_query_patches_to_landmarks(
     query_feature_map: np.ndarray,
     landmark_index: LandmarkMapIndex,
     config: PatchTo3DMatchingConfig | None = None,
     image_width: int = 1024,
     image_height: int = 576,
+    pairwise_inlier_scorer: PairwiseInlierScorer | None = None,
+    pairwise_inlier_weight: float = 0.0,
 ) -> list[QueryTo3DMatch]:
     config = config or PatchTo3DMatchingConfig()
     index = _valid_subset(landmark_index, config)
@@ -333,6 +427,13 @@ def match_query_patches_to_landmarks(
         landmark_features,
         top_k=config.top_k,
         block_size=config.block_size,
+        device=config.similarity_device,
+    )
+    pairwise_logits, pairwise_logprobs = _pairwise_inlier_logits_for_topk(
+        pairwise_inlier_scorer,
+        query_features,
+        landmark_features,
+        query_top_indices,
     )
     if config.match_mode in {"mnn", "soft_mutual"}:
         landmark_top_indices, _landmark_top_scores = _query_landmark_topk(
@@ -340,6 +441,7 @@ def match_query_patches_to_landmarks(
             query_features,
             top_k=config.mutual_top_k,
             block_size=config.block_size,
+            device=config.similarity_device,
         )
         reciprocal = [set(row.tolist()) for row in landmark_top_indices]
     else:
@@ -352,7 +454,8 @@ def match_query_patches_to_landmarks(
             landmark_idx = int(query_top_indices[query_row, rank])
             if landmark_idx < 0:
                 continue
-            if config.match_mode == "nn" and rank > 0 and not config.landmark_quality.enabled:
+            allow_multi_candidate_nn = config.landmark_quality.enabled or config.match_score_mode in {"similarity_pairwise"}
+            if config.match_mode == "nn" and rank > 0 and not allow_multi_candidate_nn:
                 continue
             if config.match_mode == "mnn" and (rank > 0 or query_row not in reciprocal[landmark_idx]):
                 continue
@@ -375,6 +478,11 @@ def match_query_patches_to_landmarks(
                 continue
             quality = float(quality_scores[landmark_idx])
             quality_weighted_similarity = float(similarity * quality)
+            pairwise_logit = None if pairwise_logits is None else float(pairwise_logits[query_row, rank])
+            pairwise_logprob = None if pairwise_logprobs is None else float(pairwise_logprobs[query_row, rank])
+            pairwise_weighted_similarity = None
+            if pairwise_logprob is not None:
+                pairwise_weighted_similarity = float(similarity + float(pairwise_inlier_weight) * pairwise_logprob)
             if (
                 config.min_quality_weighted_similarity is not None
                 and quality_weighted_similarity < float(config.min_quality_weighted_similarity)
@@ -401,27 +509,18 @@ def match_query_patches_to_landmarks(
                     landmark_quality=quality,
                     landmark_ambiguity=float(landmark_ambiguity[landmark_idx]),
                     quality_weighted_similarity=quality_weighted_similarity,
+                    pairwise_inlier_logit=pairwise_logit,
+                    pairwise_inlier_logprob=pairwise_logprob,
+                    pairwise_weighted_similarity=pairwise_weighted_similarity,
                     similarity_margin=margin,
                     distance_to_boundary_px=float(boundary),
                 )
             )
-        if config.match_mode == "nn" and config.landmark_quality.enabled and candidate_matches:
-            matches.append(
-                max(
-                    candidate_matches,
-                    key=lambda item: item.quality_weighted_similarity
-                    if item.quality_weighted_similarity is not None
-                    else item.similarity,
-                )
-            )
+        if config.match_mode == "nn" and allow_multi_candidate_nn and candidate_matches:
+            matches.append(max(candidate_matches, key=lambda item: _match_score(item, config.match_score_mode)))
         else:
             matches.extend(candidate_matches)
-    matches.sort(
-        key=lambda item: item.quality_weighted_similarity
-        if item.quality_weighted_similarity is not None
-        else item.similarity,
-        reverse=True,
-    )
+    matches.sort(key=lambda item: _match_score(item, config.match_score_mode), reverse=True)
     if config.max_matches is not None:
         matches = matches[: int(config.max_matches)]
     return matches

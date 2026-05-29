@@ -2055,6 +2055,23 @@ Implemented files:
   - optionally exports compressed query tokens and a compressed landmark bank
 - `feature_extract/tools/vfm/summarize_stage_c1_patch_selector.py`
   - aggregates learned/random/PCA/raw runs into seed mean/std/best tables
+- `feature_extract/tools/vfm/summarize_patch_topk_diagnostics.py`
+  - aggregates soft-mutual topK ranking diagnostics into scene/method/K tables
+- `feature_extract/tools/vfm/summarize_patch_hard_cases.py`
+  - builds patch-to-3D hard-case tables and rescue/worsen counts
+- `feature_extract/tools/vfm/make_linear_selector_ablation.py`
+  - creates top/bottom/random learned-linear channel-group ablations
+- `feature_extract/tools/vfm/summarize_patch_map_quality_modes.py`
+  - compares feature-only, stats-only, and feature+stats matching modes
+- `feature_extract/tools/vfm/summarize_patch_mode_guard.py`
+  - evaluates no-GT per-query guarded mode selection policies
+- `feature_extract/vfm/patch_to_3d_matching.py`
+  - optional `similarity_device=cuda:*` backend for the topK similarity search
+    while keeping the same matcher and PnP protocol
+  - explicit `match_score_mode` for `similarity`, `landmark_quality`, and
+    `similarity_quality`
+- `feature_extract/vfm/patch_selector_training.py`
+  - optional input-channel group lasso and hard group-gate export
 - `tests/test_vfm_stage_c1_patch_selector.py`
   - supervised toy convergence
   - patch-positive/hard-negative sample construction
@@ -2064,6 +2081,8 @@ Implemented files:
 - `tests/test_vfm_stage_c1_summary.py`
   - learned multi-seed summary
   - untrained control summary
+- `tests/test_vfm_patch_topk_summary.py`
+  - soft-mutual topK diagnostic table smoke
 
 Protocol used for the full C1 held-out check:
 
@@ -2102,6 +2121,409 @@ Full tables:
 - `output/vfm/stage_c1_patch_selector_final/stage_c1_summary.csv`
 - `output/vfm/stage_c1_patch_selector_final/stage_c1_summary.json`
 
+Soft-mutual topK diagnostic:
+
+- Same held-out test split and `reference top10` submap protocol.
+- Same sparse landmark path; no dense render.
+- Representative seed0 runs for `random128`, `learned128`, and `learned64`.
+- `top_k == mutual_top_k`, no ratio test, `min_similarity=0.2`,
+  `max_matches=2000`, stride-aware PnP.
+- The diagnostic measures whether the learned descriptor improves ranking
+  distribution, not only MNN nearest-neighbor sharpness.
+
+| Scene | Method | topK | Patch@5 | GT@2stride | PnP-inlier Patch@5 | S@25 | S@50 | Median t |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| OldHospital | raw1280 | 2 | 0.251 | 0.611 | 0.422 | 0.170 | 0.566 | 0.448m |
+| OldHospital | random128 | 2 | 0.224 | 0.563 | 0.407 | 0.165 | 0.511 | 0.492m |
+| OldHospital | learned128 | 2 | 0.419 | 0.801 | 0.524 | 0.269 | 0.626 | 0.371m |
+| OldHospital | learned64 | 2 | 0.410 | 0.795 | 0.516 | 0.291 | 0.621 | 0.388m |
+| OldHospital | raw1280 | 3 | 0.264 | 0.601 | 0.429 | 0.198 | 0.549 | 0.472m |
+| OldHospital | random128 | 3 | 0.237 | 0.543 | 0.412 | 0.170 | 0.511 | 0.489m |
+| OldHospital | learned128 | 3 | 0.437 | 0.795 | 0.538 | 0.286 | 0.599 | 0.419m |
+| OldHospital | learned64 | 3 | 0.430 | 0.794 | 0.532 | 0.264 | 0.615 | 0.368m |
+| OldHospital | raw1280 | 5 | 0.267 | 0.570 | 0.429 | 0.176 | 0.505 | 0.498m |
+| OldHospital | random128 | 5 | 0.244 | 0.502 | 0.418 | 0.143 | 0.440 | 0.571m |
+| OldHospital | learned128 | 5 | 0.444 | 0.777 | 0.548 | 0.291 | 0.549 | 0.435m |
+| OldHospital | learned64 | 5 | 0.438 | 0.780 | 0.541 | 0.231 | 0.621 | 0.404m |
+| ShopFacade | raw1280 | 2 | 0.238 | 0.657 | 0.386 | 0.757 | 0.951 | 0.166m |
+| ShopFacade | random128 | 2 | 0.217 | 0.620 | 0.372 | 0.689 | 0.893 | 0.188m |
+| ShopFacade | learned128 | 2 | 0.295 | 0.710 | 0.433 | 0.816 | 0.951 | 0.147m |
+| ShopFacade | learned64 | 2 | 0.281 | 0.684 | 0.427 | 0.806 | 0.922 | 0.153m |
+| ShopFacade | raw1280 | 3 | 0.231 | 0.625 | 0.376 | 0.748 | 0.893 | 0.184m |
+| ShopFacade | random128 | 3 | 0.212 | 0.591 | 0.364 | 0.709 | 0.913 | 0.176m |
+| ShopFacade | learned128 | 3 | 0.298 | 0.705 | 0.427 | 0.796 | 0.922 | 0.155m |
+| ShopFacade | learned64 | 3 | 0.286 | 0.683 | 0.425 | 0.806 | 0.922 | 0.172m |
+| ShopFacade | raw1280 | 5 | 0.222 | 0.582 | 0.355 | 0.709 | 0.874 | 0.170m |
+| ShopFacade | random128 | 5 | 0.206 | 0.547 | 0.346 | 0.641 | 0.864 | 0.207m |
+| ShopFacade | learned128 | 5 | 0.297 | 0.692 | 0.418 | 0.748 | 0.932 | 0.164m |
+| ShopFacade | learned64 | 5 | 0.286 | 0.672 | 0.415 | 0.748 | 0.922 | 0.169m |
+
+TopK artifacts:
+
+- `output/vfm/stage_c1_topk_diagnostics/topk_summary.md`
+- `output/vfm/stage_c1_topk_diagnostics/topk_summary.json`
+
+TopK conclusion:
+
+- Learned128/64 improve Patch@5, GT@2stride, and PnP-inlier Patch@5 over
+  raw1280 and random128 for every reported topK on both scenes. This supports
+  the interpretation that C1 improves the descriptor ranking distribution, not
+  only the MNN top1 decision.
+- Larger K is not uniformly better for final pose. OldHospital learned128 keeps
+  S@25 near `0.29` at K=5, but ShopFacade learned128 drops from `0.816` at K=2
+  to `0.748` at K=5. The extra matches improve recall-style patch metrics but
+  also add outliers; the main protocol should stay conservative until map-side
+  quality scoring is added.
+
+Hard-case diagnostic:
+
+- Uses the conservative MNN top1 main protocol.
+- Uses representative seed0 for learned/random controls, so it is a diagnostic
+  split rather than the final statistical table.
+- Subsets are built from the `random128` anchor plus raw rows:
+  random failure, raw failure, top1-reference far, weak top10 coverage, low
+  visible-landmark count, low random-inlier count, and large random pose error.
+
+Key hard-case rows:
+
+| Scene | Subset | Method | queries | S@25 | S@50 | median t | inlier Patch@1 |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
+| OldHospital | random128_fail_s25 | random128 | 139 | 0.000 | 0.403 | 0.543m | 0.406 |
+| OldHospital | random128_fail_s25 | raw1280 | 139 | 0.079 | 0.482 | 0.520m | 0.428 |
+| OldHospital | random128_fail_s25 | learned128 | 139 | 0.209 | 0.525 | 0.484m | 0.505 |
+| OldHospital | random128_fail_s25 | learned64 | 139 | 0.173 | 0.518 | 0.487m | 0.497 |
+| ShopFacade | random128_fail_s25 | random128 | 25 | 0.000 | 0.760 | 0.371m | 0.377 |
+| ShopFacade | random128_fail_s25 | raw1280 | 25 | 0.320 | 0.720 | 0.296m | 0.401 |
+| ShopFacade | random128_fail_s25 | learned128 | 25 | 0.200 | 0.720 | 0.338m | 0.444 |
+| ShopFacade | random128_fail_s25 | learned64 | 25 | 0.480 | 0.720 | 0.258m | 0.452 |
+
+Random128 failure rescue summary:
+
+| Scene | Method | rescued / random-fail | worsened / random-success |
+| --- | --- | ---: | ---: |
+| OldHospital | learned128 | 29 / 139 | 20 / 43 |
+| OldHospital | learned64 | 24 / 139 | 21 / 43 |
+| ShopFacade | learned128 | 5 / 25 | 2 / 78 |
+| ShopFacade | learned64 | 12 / 25 | 5 / 78 |
+
+Hard-case conclusion:
+
+- Learned selectors do rescue random128 failures, especially ShopFacade
+  learned64 (`12/25`) and OldHospital learned128 (`29/139`).
+- The rescue is not free on OldHospital seed0: learned128 worsens `20/43`
+  random-success queries. This points to the next required step: add map-side
+  quality/statistics scoring and calibrated guarding instead of using feature
+  similarity alone for all cases.
+
+Hard-case artifacts:
+
+- `output/vfm/stage_c1_hard_cases/hard_case_summary.md`
+- `output/vfm/stage_c1_hard_cases/hard_case_summary.json`
+
+Channel-group causality smoke:
+
+- Selector: `learned128_seed0`.
+- Grouping: consecutive raw VFM channel groups of 64 dimensions.
+- Ablation: zero 25% of input-channel groups in the learned linear projection,
+  then re-export query tokens and landmark bank and run the same MNN top1
+  patch-to-3D evaluator.
+- Policies: highest weight-energy groups, lowest weight-energy groups, random
+  groups.
+
+| Scene | Method | removed energy | S@25 | S@50 | median t | inlier Patch@1 | inliers |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| OldHospital | learned128 base |  | 0.286 | 0.626 | 0.412m | 0.512 | 782.5 |
+| OldHospital | top-drop25 | 0.274 | 0.258 | 0.599 | 0.404m | 0.480 | 702.7 |
+| OldHospital | bottom-drop25 | 0.228 | 0.253 | 0.610 | 0.396m | 0.485 | 709.7 |
+| OldHospital | random-drop25 | 0.249 | 0.291 | 0.610 | 0.381m | 0.488 | 693.7 |
+| ShopFacade | learned128 base |  | 0.786 | 0.932 | 0.144m | 0.449 | 565.3 |
+| ShopFacade | top-drop25 | 0.267 | 0.777 | 0.932 | 0.165m | 0.418 | 509.4 |
+| ShopFacade | bottom-drop25 | 0.237 | 0.845 | 0.951 | 0.147m | 0.424 | 519.0 |
+| ShopFacade | random-drop25 | 0.244 | 0.796 | 0.922 | 0.165m | 0.422 | 513.0 |
+
+Causality conclusion:
+
+- Removing high-energy groups consistently hurts correspondence diagnostics
+  and inlier count versus the base selector, which is weak positive evidence
+  that the learned projection concentrates useful descriptor signal.
+- The evidence is not yet strong enough to claim sparse channel selection:
+  bottom/random removal also hurts inlier Patch@1, and final pose is not
+  monotonic with energy removal. The learned128 linear weights are relatively
+  distributed (`top 25%` groups contain only about `27%` of weight energy), so a
+  stronger selection claim needs explicit group sparsity or hard gates.
+
+Causality artifacts:
+
+- `output/vfm/stage_c1_causality/causality_summary.md`
+- `output/vfm/stage_c1_causality/causality_summary.json`
+- `feature_extract/tools/vfm/make_linear_selector_ablation.py`
+
+Map-side quality smoke:
+
+- Selector: `learned128_seed0`.
+- Main protocol: MNN top1, `reference top10`, sparse landmarks only.
+- Quality terms: track length, feature variance, and COLMAP reprojection error.
+- No scene-level ambiguity/IDF in this smoke, to keep the diagnostic cheap.
+- Effect: `similarity * Q_X` controls match ordering before the fixed PnP
+  handoff.
+
+| Scene | Method | S@25 | S@50 | median t | inlier Patch@1 | inliers |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| OldHospital | feature only | 0.286 | 0.626 | 0.412m | 0.512 | 782.5 |
+| OldHospital | feature + quality | 0.286 | 0.632 | 0.352m | 0.507 | 758.6 |
+| ShopFacade | feature only | 0.786 | 0.932 | 0.144m | 0.449 | 565.3 |
+| ShopFacade | feature + quality | 0.806 | 0.942 | 0.158m | 0.443 | 536.1 |
+
+Map-quality conclusion:
+
+- Lightweight map statistics improve broad success on both scenes and reduce
+  OldHospital median translation, but they slightly reduce inlier Patch@1 and
+  inlier count. This is useful as a guarded scorer feature, not yet a replacement
+  for descriptor similarity.
+- Next implementation should separate `feature-only`, `stats-only`, and
+  calibrated `feature+stats` scoring, then evaluate it on the hard-case splits
+  above.
+
+Map-quality artifacts:
+
+- `output/vfm/stage_c1_map_quality/map_quality_summary.md`
+- `output/vfm/stage_c1_map_quality/map_quality_summary.json`
+
+Map-quality formal mode sweep:
+
+- Protocol: learned128 seed0, sparse landmarks only, `reference top10`.
+- Candidate pool: soft-mutual top3, `max_matches=1000`.
+- Modes:
+  - `feature_only`: rank by descriptor similarity.
+  - `stats_only`: rank by landmark quality from track length, feature variance,
+    and reprojection error.
+  - `feature_stats`: rank by descriptor similarity times landmark quality.
+
+| Scene | Mode | S@25 | S@50 | median t | inlier Patch@1 | inliers |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| OldHospital | feature_only | 0.242 | 0.593 | 0.396m | 0.470 | 771.7 |
+| OldHospital | feature_stats | 0.253 | 0.577 | 0.421m | 0.431 | 698.2 |
+| OldHospital | stats_only | 0.225 | 0.549 | 0.445m | 0.381 | 570.5 |
+| ShopFacade | feature_only | 0.767 | 0.932 | 0.172m | 0.373 | 650.4 |
+| ShopFacade | feature_stats | 0.738 | 0.913 | 0.164m | 0.353 | 586.0 |
+| ShopFacade | stats_only | 0.796 | 0.922 | 0.151m | 0.322 | 441.5 |
+
+Guarded mode-selection diagnostic:
+
+- No-GT policies: choose per query by PnP inlier count, inlier ratio, or lowest
+  PnP inlier median residual.
+- `oracle_pose` is diagnostic only and uses GT pose error.
+
+| Scene | Policy | chosen modes | S@25 | S@50 | median t |
+| --- | --- | --- | ---: | ---: | ---: |
+| OldHospital | inlier_count | feature_only:175,feature_stats:4,stats_only:3 | 0.236 | 0.593 | 0.400m |
+| OldHospital | low_residual | feature_only:168,feature_stats:14 | 0.247 | 0.599 | 0.394m |
+| OldHospital | oracle_pose | feature_only:69,feature_stats:54,stats_only:59 | 0.396 | 0.720 | 0.301m |
+| ShopFacade | inlier_count | feature_only:89,feature_stats:8,stats_only:6 | 0.767 | 0.942 | 0.169m |
+| ShopFacade | low_residual | feature_only:64,feature_stats:23,stats_only:16 | 0.835 | 0.961 | 0.158m |
+| ShopFacade | oracle_pose | feature_only:29,feature_stats:33,stats_only:41 | 0.903 | 0.961 | 0.104m |
+
+Formal map-quality conclusion:
+
+- A global `feature+stats` ranker is not consistently better. OldHospital mostly
+  prefers feature-only, while ShopFacade benefits from stats-only in S@25 and
+  median translation.
+- The residual-based no-GT guard is promising on ShopFacade (`0.835` S@25) but
+  only marginal on OldHospital (`0.247` S@25). The oracle gap is large on both
+  scenes, so the next useful model is a calibrated per-query guard, not another
+  descriptor-only selector.
+
+Formal map-quality artifacts:
+
+- `output/vfm/stage_c1_map_quality_modes/map_quality_modes_summary.md`
+- `output/vfm/stage_c1_map_quality_modes/map_quality_hard_cases.md`
+- `output/vfm/stage_c1_map_quality_modes/mode_guard_summary.md`
+- `feature_extract/tools/vfm/summarize_patch_map_quality_modes.py`
+- `feature_extract/tools/vfm/summarize_patch_mode_guard.py`
+
+## Stage C2 Safe Localizable Descriptor Selection
+
+Implemented C2 infrastructure:
+
+- `feature_extract/vfm/patch_selector_training.py`
+  - `ResidualGatedPatchSelector`: LayerNorm -> input-channel group gate ->
+    linear projection -> residual bottleneck MLP -> L2 descriptor.
+  - query matchability, landmark reliability, and pairwise inlier head.
+  - auxiliary pairwise BCE on patch-positive vs hard-negative pairs.
+  - hard group-gate export mask for active-group Pareto diagnostics.
+  - checkpoint save/load and batched descriptor encoding.
+- `feature_extract/tools/vfm/train_stage_c2_safe_selector.py`
+  - trains from the existing C1 patch-positive sample cache.
+  - exports C2 query token descriptors and C2 landmark bank in the same format
+    consumed by the patch-to-3D evaluator.
+  - nonlinear landmark-bank variance is currently exported as zero, so
+    map-quality variance terms should not be used for this smoke.
+- `tests/test_vfm_stage_c2_safe_selector.py`
+  - residual-gated descriptor shape/normalization and pairwise head smoke.
+  - C2 training loss/top1/inlier-head smoke.
+  - checkpoint round-trip.
+  - CLI train/export smoke.
+
+Current C2 smoke protocol:
+
+- Sample cache:
+  - ShopFacade: `output/vfm/stage_c1_patch_selector_final/shopfacade/samples_ref10_12k_seed0.npz`
+  - OldHospital: `output/vfm/stage_c1_patch_selector_final/oldhospital/samples_ref10_24k_seed0.npz`
+- Test protocol: same sparse patch-to-3D MNN top1, reference top10, stride-aware
+  PnP as the C1 main table.
+- C2 runs:
+  - `c2_safe128_full_seed0`: residual-gated selector, pairwise auxiliary head,
+    100% active groups.
+  - `c2_safe128_keep60_seed0`: same model but hard-gated to 60% active channel
+    groups at export.
+
+| Scene | Method | S@25 | S@50 | median t | median r | Patch@1 | Inlier Patch@1 | matches | inliers |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| ShopFacade | random128 | 0.757 | 0.942 | 0.173m | 0.477deg | 0.230 | 0.386 | 671.3 | 436.6 |
+| ShopFacade | C1 learned128 | 0.786 | 0.932 | 0.144m | 0.401deg | 0.316 | 0.449 | 762.2 | 565.3 |
+| ShopFacade | C2 full128 | 0.816 | 0.913 | 0.151m | 0.449deg | 0.293 | 0.438 | 758.8 | 540.9 |
+| ShopFacade | C2 keep60 | 0.757 | 0.951 | 0.173m | 0.438deg | 0.256 | 0.402 | 706.0 | 481.8 |
+| OldHospital | random128 | 0.236 | 0.544 | 0.468m | 0.687deg | 0.226 | 0.414 | 901.8 | 483.7 |
+| OldHospital | C1 learned128 | 0.286 | 0.626 | 0.412m | 0.559deg | 0.411 | 0.512 | 1000.0 | 782.5 |
+| OldHospital | C2 full128 | 0.253 | 0.632 | 0.384m | 0.605deg | 0.423 | 0.517 | 1000.0 | 798.1 |
+| OldHospital | C2 keep60 | 0.231 | 0.621 | 0.387m | 0.566deg | 0.340 | 0.470 | 994.9 | 701.5 |
+
+Hard-case rescue/break versus random128:
+
+| Scene | Method | random-fail queries | rescued | rescue rate | random-success worsened | worsen rate |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| ShopFacade | C1 learned128 | 25 | 5 | 0.200 | 2 | 0.026 |
+| ShopFacade | C2 full128 | 25 | 13 | 0.520 | 7 | 0.090 |
+| ShopFacade | C2 keep60 | 25 | 11 | 0.440 | 11 | 0.141 |
+| OldHospital | C1 learned128 | 139 | 29 | 0.209 | 20 | 0.465 |
+| OldHospital | C2 full128 | 139 | 21 | 0.151 | 18 | 0.419 |
+| OldHospital | C2 keep60 | 139 | 15 | 0.108 | 16 | 0.372 |
+
+C2 interpretation:
+
+- C2 full128 is useful but not yet a drop-in replacement for C1 learned128.
+  It improves ShopFacade S@25 and rescues many more ShopFacade random failures,
+  and on OldHospital it improves broad S@50, median translation, Patch@1, and
+  PnP-inlier Patch@1. However, OldHospital S@25 drops from `0.286` to `0.253`.
+- The 60% active-group hard gate does not pass the proposed C2 Pareto target.
+  It can retain broad S@50 on OldHospital and improve ShopFacade S@50, but it
+  loses too much S@25 and correspondence precision.
+- The pairwise inlier head is currently an auxiliary training signal and stored
+  in the checkpoint; the exported patch-to-3D evaluator still ranks matches by
+  descriptor cosine. The next C2 step is to use
+  `cos(z_q, z_X) + alpha log p_inlier(q, X)` in candidate matching instead of
+  only using the head as an auxiliary loss.
+
+C2 artifacts:
+
+- `output/vfm/stage_c2_safe_selector_smoke/shopfacade/c2_safe128_full_seed0/`
+- `output/vfm/stage_c2_safe_selector_smoke/shopfacade/c2_safe128_keep60_seed0/`
+- `output/vfm/stage_c2_safe_selector_smoke/oldhospital/c2_safe128_full_seed0/`
+- `output/vfm/stage_c2_safe_selector_smoke/oldhospital/c2_safe128_keep60_seed0/`
+- `output/vfm/stage_c2_safe_selector_smoke/c2_hard_case_summary.md`
+
+Additional C2 completion work:
+
+- Pairwise head scoring is now connected to the patch matcher through
+  `match_score_mode=similarity_pairwise`.
+  - Candidate generation remains cosine top-K.
+  - Candidate score is `cos(z_q, z_X) + alpha * log sigmoid(h(q, X))`.
+  - The evaluator accepts `--safe_pairwise_checkpoint`,
+    `--pairwise_inlier_weight`, `--pairwise_device`, and
+    `--pairwise_batch_size`.
+- Added `feature_extract/tools/vfm/export_stage_c2_safe_selector.py`.
+  - Re-exports descriptors from one trained C2 checkpoint at arbitrary
+    active-group fractions.
+  - This makes C2.4 Pareto sweeps cheaper and avoids retraining for every
+    sparsity point.
+
+Pairwise scorer alpha sweep:
+
+- Model: C2 full128 seed0.
+- Candidate protocol: cosine top3 candidate generation, per-token NN selection
+  by `cos + alpha log p_inlier`, sparse patch-to-3D, reference top10.
+- This is a scorer diagnostic, not the main protocol, because it changes MNN
+  top1 into top3 rescoring.
+
+| Scene | alpha | S@25 | S@50 | median t | median r | Patch@1 | Inlier Patch@1 | matches | inliers |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| ShopFacade | 0.05 | 0.806 | 0.932 | 0.157m | 0.432deg | 0.220 | 0.350 | 1000.0 | 587.7 |
+| ShopFacade | 0.10 | 0.738 | 0.932 | 0.172m | 0.424deg | 0.220 | 0.351 | 1000.0 | 585.4 |
+| ShopFacade | 0.20 | 0.699 | 0.903 | 0.159m | 0.399deg | 0.221 | 0.351 | 1000.0 | 587.3 |
+| OldHospital | 0.05 | 0.231 | 0.621 | 0.397m | 0.667deg | 0.369 | 0.478 | 1000.0 | 753.9 |
+| OldHospital | 0.10 | 0.258 | 0.615 | 0.393m | 0.605deg | 0.371 | 0.479 | 1000.0 | 755.4 |
+| OldHospital | 0.20 | 0.264 | 0.599 | 0.392m | 0.591deg | 0.374 | 0.483 | 1000.0 | 758.4 |
+
+Pairwise scorer conclusion:
+
+- Direct top3 pairwise rescoring is not yet safe enough for the default C2
+  protocol. It raises some recall-style behavior but sharply lowers Patch@1 on
+  ShopFacade, and does not beat the C2 full128 MNN baseline on the main
+  success metrics.
+- The pairwise head should next be calibrated as a guard/risk feature or used
+  with stricter mutual/topK filtering, not simply dropped into every token's
+  top3 candidate set.
+
+C2 group-sparsity Pareto from one full checkpoint:
+
+- Model: C2 full128 seed0.
+- Export: same checkpoint re-exported at 80%, 60%, and 40% active input-channel
+  groups.
+- Eval: original MNN top1 protocol, sparse patch-to-3D, reference top10.
+
+| Scene | active groups | S@25 | S@50 | median t | median r | Patch@1 | Inlier Patch@1 | matches | inliers |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| ShopFacade | 16/20 | 0.816 | 0.903 | 0.146m | 0.437deg | 0.284 | 0.421 | 724.4 | 521.0 |
+| ShopFacade | 12/20 | 0.777 | 0.951 | 0.170m | 0.443deg | 0.256 | 0.402 | 706.0 | 482.0 |
+| ShopFacade | 8/20 | 0.786 | 0.913 | 0.158m | 0.432deg | 0.244 | 0.402 | 699.7 | 459.3 |
+| OldHospital | 16/20 | 0.275 | 0.654 | 0.363m | 0.550deg | 0.394 | 0.498 | 997.9 | 769.1 |
+| OldHospital | 12/20 | 0.214 | 0.632 | 0.387m | 0.568deg | 0.340 | 0.470 | 994.9 | 701.4 |
+| OldHospital | 8/20 | 0.247 | 0.637 | 0.415m | 0.573deg | 0.293 | 0.451 | 989.5 | 623.8 |
+
+Pareto conclusion:
+
+- 80% active groups is currently the best C2 sparse operating point. It matches
+  ShopFacade C2 full128 S@25 and improves OldHospital over full128 on S@25,
+  S@50, median translation, and median rotation.
+- 60% active groups does not pass the proposed C2 target across scenes. It is
+  acceptable on ShopFacade S@25 but loses too much on OldHospital S@25 and
+  correspondence precision.
+- 40% active groups is a diagnostic compression point, not a paper-ready
+  default.
+
+C2 pairwise/Pareto artifacts:
+
+- `output/vfm/stage_c2_pairwise_scoring/`
+- `output/vfm/stage_c2_group_pareto/`
+
+Group-gated selector smoke:
+
+- Training entry now supports input-channel group lasso plus hard group pruning.
+- Smoke config: learned128, `group_size=64`, keep 50% of groups, lasso `1e-4`,
+  seed0, same MNN top1 held-out evaluator.
+
+| Scene | Method | active groups | active channels | gated eval top1 | S@25 | S@50 | median t | inlier Patch@1 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| OldHospital | learned128 base |  |  | 0.420 | 0.286 | 0.626 | 0.412m | 0.512 |
+| OldHospital | learned128 group-gated | 10 / 20 | 640 / 1280 | 0.290 | 0.253 | 0.604 | 0.389m | 0.462 |
+| ShopFacade | learned128 base |  |  | 0.530 | 0.786 | 0.932 | 0.144m | 0.449 |
+| ShopFacade | learned128 group-gated | 10 / 20 | 640 / 1280 | 0.436 | 0.777 | 0.893 | 0.169m | 0.414 |
+
+Group-gated conclusion:
+
+- Keeping only half of the raw VFM channel groups preserves a large fraction of
+  downstream localization performance, but it clearly drops training-set
+  discriminability and PnP-inlier correctness.
+- This is now an explicit feature-selection mechanism, but the first smoke is a
+  compression/selection tradeoff, not yet a positive causality claim. It should
+  be swept over keep ratios and group-lasso weights before being presented as a
+  main result.
+
+Group-gated artifacts:
+
+- `output/vfm/stage_c1_group_gate/group_gate_summary.md`
+- `output/vfm/stage_c1_group_gate/group_gate_summary.json`
+
 Artifacts:
 
 - `output/vfm/stage_c1_patch_selector_final/shopfacade/learned64_seed{0..4}/`
@@ -2118,10 +2540,9 @@ Important caveats:
 - This completes C1 for OldHospital and ShopFacade, not for all Cambridge
   scenes. Kings/Great/StMary still require matching raw token/landmark banks
   before they can enter this table.
-- Patch@5 is logged, but the fixed default matching protocol is MNN top1, so
-  Patch@5 collapses to Patch@1 for the main pose table. A separate soft-mutual
-  topK diagnostic is still needed if Patch@5 is used as a ranking-quality
-  metric.
+- Patch@5 in the main pose table still collapses to Patch@1 because the fixed
+  default matching protocol is MNN top1. Use the soft-mutual diagnostic table
+  above when discussing ranking-quality metrics.
 - Training and eval use different fixed candidate-submap sources:
   train uses `*_train_pose_neighbors_top10.jsonl`, held-out eval uses
   `*_reference_pose_top10_fixed.jsonl`. This should be reported explicitly in
@@ -2133,6 +2554,48 @@ Important caveats:
 - Learned64/128 beating random mean and improving PnP-inlier Patch@1 on both
   scenes is now the strongest evidence that supervised patch-level selector
   training is solving a descriptor problem rather than only compressing.
+
+## Stage C1 Qualitative Comparisons
+
+Added a reproducible qualitative visualizer:
+
+```bash
+PYTHONPATH=. python feature_extract/tools/vfm/visualize_stage_c1_selection_qualitative.py \
+  --scene shopfacade \
+  --query_id seq3/frame00045.png \
+  --query_id seq1/frame00036.png \
+  --output_dir output/vfm/stage_c1_qualitative/shopfacade \
+  --similarity_device cuda:0
+```
+
+The same preset works for `--scene oldhospital`. The generated artifacts cover
+three qualitative checks:
+
+- `*_match_comparison_contact_sheet.png`: four-column raw1280 / random128 /
+  learned128 / group-gated128 patch-match overlays. Green marks patch-positive
+  matches, red marks patch-false matches, yellow rings mark PnP inliers.
+- `*_margin_heatmap_contact_sheet.png`: top1-top2 cosine similarity margin
+  heatmaps over the RGB query. These expose descriptor sharpness and repeated
+  region ambiguity without comparing incompatible PCA color spaces.
+- `group_energy_heatmap.png`: raw-channel group energy for learned128 and
+  group-gated128 transforms. This makes the selector/gate behavior visible at
+  the input-channel-group level.
+
+Current generated examples:
+
+- ShopFacade:
+  `output/vfm/stage_c1_qualitative/shopfacade/seq3__frame00045_match_comparison_contact_sheet.png`
+  and
+  `output/vfm/stage_c1_qualitative/shopfacade/seq1__frame00036_match_comparison_contact_sheet.png`.
+- OldHospital:
+  `output/vfm/stage_c1_qualitative/oldhospital/seq4__frame00020_match_comparison_contact_sheet.png`
+  and
+  `output/vfm/stage_c1_qualitative/oldhospital/seq8__frame00027_match_comparison_contact_sheet.png`.
+
+The qualitative examples match the quantitative diagnosis: learned128 often
+raises descriptor margin and PnP inlier count on good cases, while hard cases
+can still fail despite higher patch precision, so geometry degeneracy and
+candidate-submap quality remain active bottlenecks.
 
 ## Remaining Paper-Critical Gaps
 

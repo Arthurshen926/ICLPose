@@ -47,6 +47,8 @@ def test_summarize_stage_c1_patch_selector_groups_seed_statistics(tmp_path: Path
                 "median_rotation_error_deg": 1.0,
                 "mean_pnp_inlier_patch_at_1": 0.7,
                 "mean_pnp_inlier_patch_at_5": 0.9,
+                "mean_match_count": 10 + seed,
+                "mean_pnp_inlier_count": 5 + seed,
             },
         )
         runs.extend(["--run", f"OldHospital,learned,64,{seed},{train},{compression},{eval_summary}"])
@@ -66,6 +68,8 @@ def test_summarize_stage_c1_patch_selector_groups_seed_statistics(tmp_path: Path
     assert row["success_25cm_10deg_mean"] == 0.5
     assert row["success_25cm_10deg_best"] == 0.6
     assert row["median_translation_error_m_best"] == 0.19999999999999998
+    assert row["mean_match_count_mean"] == 10.5
+    assert row["mean_pnp_inlier_count_mean"] == 5.5
     csv_rows = list(csv.DictReader(output_csv.open()))
     assert csv_rows[0]["method"] == "learned"
     assert "learned" in output_md.read_text()
@@ -110,3 +114,58 @@ def test_summarize_stage_c1_patch_selector_accepts_untrained_controls(tmp_path: 
     report = json.loads(output_json.read_text())
     assert report["rows"][0]["train_summary_path"] == ""
     assert report["groups"][0]["train_eval_top1_acc_mean"] is None
+
+
+def test_summarize_stage_c1_patch_selector_computes_storage_ratio_from_raw(tmp_path: Path) -> None:
+    raw_eval = tmp_path / "raw_eval.json"
+    learned_compression = tmp_path / "learned" / "compression.json"
+    learned_eval = tmp_path / "learned" / "eval.json"
+    _write_json(
+        raw_eval,
+        {
+            "query_count": 2,
+            "success_25cm_10deg": 0.1,
+            "success_50cm_10deg": 0.2,
+            "median_translation_error_m": 1.0,
+            "median_rotation_error_deg": 2.0,
+            "mean_pnp_inlier_patch_at_1": 0.1,
+            "mean_pnp_inlier_patch_at_5": 0.1,
+            "storage_bytes": {"query_tokens": 700, "landmark_bank": 300, "transform": 0},
+        },
+    )
+    _write_json(
+        learned_compression,
+        {
+            "method": "learned",
+            "output_dim": 64,
+            "storage_bytes": {"query_tokens": 70, "landmark_bank": 30, "transform": 1},
+        },
+    )
+    _write_json(
+        learned_eval,
+        {
+            "query_count": 2,
+            "success_25cm_10deg": 0.3,
+            "success_50cm_10deg": 0.4,
+            "median_translation_error_m": 0.5,
+            "median_rotation_error_deg": 1.0,
+            "mean_pnp_inlier_patch_at_1": 0.2,
+            "mean_pnp_inlier_patch_at_5": 0.2,
+        },
+    )
+
+    output_json = tmp_path / "summary.json"
+    main(
+        [
+            "--run",
+            f"SceneA,raw,1280,0,-,-,{raw_eval}",
+            "--run",
+            f"SceneA,learned,64,0,-,{learned_compression},{learned_eval}",
+            "--output_json",
+            str(output_json),
+        ]
+    )
+
+    groups = {(row["method"], row["output_dim"]): row for row in json.loads(output_json.read_text())["groups"]}
+    assert groups[("raw", 1280)]["storage_ratio_vs_raw_mean"] == 1.0
+    assert groups[("learned", 64)]["storage_ratio_vs_raw_mean"] == 0.101

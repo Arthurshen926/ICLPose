@@ -77,6 +77,62 @@ def test_patch_selector_training_learns_linear_transform_on_hard_negative_toy():
     np.testing.assert_allclose(np.linalg.norm(projected, axis=1), np.ones(4), atol=1e-5)
 
 
+def test_patch_selector_training_can_hard_gate_low_energy_channel_groups():
+    from feature_extract.vfm.patch_selector_training import (
+        PatchSelectorTrainingConfig,
+        PatchSelectorTrainingSet,
+        train_linear_patch_selector,
+    )
+
+    queries = np.asarray(
+        [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    positives = queries[:, None, :].copy()
+    negatives = np.asarray(
+        [
+            [[0.0, 1.0, 0.0, 0.0]],
+            [[1.0, 0.0, 0.0, 0.0]],
+            [[0.0, 1.0, 0.0, 0.0]],
+            [[1.0, 0.0, 0.0, 0.0]],
+        ],
+        dtype=np.float32,
+    )
+    samples = PatchSelectorTrainingSet(
+        query_features=queries,
+        positive_features=positives,
+        positive_mask=np.ones((4, 1), dtype=bool),
+        negative_features=negatives,
+    )
+
+    run = train_linear_patch_selector(
+        samples,
+        PatchSelectorTrainingConfig(
+            output_dim=2,
+            steps=30,
+            batch_size=4,
+            lr=0.05,
+            seed=2,
+            device="cpu",
+            eval_split_fraction=0.0,
+            group_size=2,
+            hard_gate_keep_fraction=0.5,
+        ),
+    )
+
+    group_energy = run.transform.channel_scores.reshape(2, 2).sum(axis=1)
+    assert run.summary.group_count == 2
+    assert run.summary.active_group_count == 1
+    assert 0.0 <= run.summary.gated_train_top1_acc <= 1.0
+    assert np.count_nonzero(group_energy > 0.0) == 1
+    assert np.allclose(run.transform.matrix[2:4], 0.0) or np.allclose(run.transform.matrix[0:2], 0.0)
+
+
 def test_stage_c1_sample_builder_uses_patch_positives_and_hard_raw_negatives():
     from feature_extract.vfm.patch_selector_training import (
         PatchSelectorSampleConfig,
@@ -257,6 +313,10 @@ def test_stage_c1_cli_trains_and_exports_transform_and_compressed_banks(tmp_path
             "5",
             "--batch_size",
             "1",
+            "--group_size",
+            "2",
+            "--hard_gate_keep_fraction",
+            "0.5",
             "--max_train_samples",
             "4",
             "--max_tokens_per_query",
@@ -286,6 +346,8 @@ def test_stage_c1_cli_trains_and_exports_transform_and_compressed_banks(tmp_path
     summary = json.loads((output_dir / "summary.json").read_text())
     assert summary["sample_summary"]["sample_count"] >= 1
     assert summary["training"]["output_dim"] == 2
+    assert summary["training"]["group_size"] == 2
+    assert summary["training"]["active_group_count"] == 1
 
 
 def test_stage_c1_training_set_npz_round_trip(tmp_path: Path):

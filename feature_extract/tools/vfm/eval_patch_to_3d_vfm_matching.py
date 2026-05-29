@@ -23,6 +23,7 @@ from feature_extract.tools.vfm.eval_query_to_3d_vfm_matching import (
 from feature_extract.vfm.cambridge_pose_lattice import parse_cambridge_pose_file
 from feature_extract.vfm.landmark_visibility import LandmarkVisibilityIndex, count_projected_landmarks, filter_landmarks_by_visibility
 from feature_extract.vfm.map_lifting import load_selected_track_bank_npz
+from feature_extract.vfm.patch_selector_training import SafePairwiseInlierScorer
 from feature_extract.vfm.patch_to_3d_matching import (
     PatchTo3DMatchingConfig,
     build_patch_positive_sets,
@@ -223,6 +224,16 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     parser.add_argument("--quality_ambiguity_reference_size", type=int, default=4096)
     parser.add_argument("--max_matches", type=int, default=1000)
     parser.add_argument("--match_block_size", type=int, default=256)
+    parser.add_argument("--similarity_device", default="cpu")
+    parser.add_argument(
+        "--match_score_mode",
+        default="similarity_quality",
+        choices=("similarity", "landmark_quality", "similarity_quality", "similarity_pairwise"),
+    )
+    parser.add_argument("--safe_pairwise_checkpoint", default="")
+    parser.add_argument("--pairwise_inlier_weight", type=float, default=0.0)
+    parser.add_argument("--pairwise_device", default="")
+    parser.add_argument("--pairwise_batch_size", type=int, default=65536)
     parser.add_argument("--patch_scale", type=float, default=1.0)
     parser.add_argument("--patch_at_k", type=int, default=5)
     parser.add_argument("--pnp_threshold_stride_multiplier", type=float, default=1.5)
@@ -272,6 +283,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         query_token_step=args.query_token_step,
         max_matches=args.max_matches,
         block_size=args.match_block_size,
+        similarity_device=args.similarity_device,
+        match_score_mode=args.match_score_mode,
         landmark_quality=LandmarkQualityConfig(
             enabled=bool(args.enable_landmark_quality),
             track_weight=args.quality_track_weight,
@@ -284,6 +297,13 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             min_track_length=args.quality_min_track_length,
         ),
     )
+    pairwise_scorer = None
+    if args.safe_pairwise_checkpoint:
+        pairwise_scorer = SafePairwiseInlierScorer.from_checkpoint(
+            Path(args.safe_pairwise_checkpoint),
+            device=args.pairwise_device or args.similarity_device,
+            batch_size=int(args.pairwise_batch_size),
+        )
 
     rows = []
     match_rows = []
@@ -336,7 +356,15 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         stride_x = float(camera.width - 1) / max(float(token_width - 1), 1.0)
         stride_y = float(camera.height - 1) / max(float(token_height - 1), 1.0)
         stride = float(max(stride_x, stride_y))
-        matches = match_query_patches_to_landmarks(query_feature, submap, config, int(camera.width), int(camera.height))
+        matches = match_query_patches_to_landmarks(
+            query_feature,
+            submap,
+            config,
+            int(camera.width),
+            int(camera.height),
+            pairwise_inlier_scorer=pairwise_scorer,
+            pairwise_inlier_weight=float(args.pairwise_inlier_weight),
+        )
         pnp = estimate_pose_pnp_ransac(
             matches,
             camera,
@@ -385,6 +413,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                         "landmark_ambiguity": match.landmark_ambiguity,
                         "landmark_quality": match.landmark_quality,
                         "quality_weighted_similarity": match.quality_weighted_similarity,
+                        "pairwise_inlier_logit": match.pairwise_inlier_logit,
+                        "pairwise_inlier_logprob": match.pairwise_inlier_logprob,
+                        "pairwise_weighted_similarity": match.pairwise_weighted_similarity,
                         "patch_correct": bool(positive is not None and int(match.track_id) in positive.track_ids),
                         "positive_count": 0 if positive is None else int(positive.count),
                         "pnp_inlier": bool(pnp.inlier_mask.shape[0] > match_idx and pnp.inlier_mask[match_idx]),
@@ -487,6 +518,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             "pnp_threshold_stride_multiplier": float(args.pnp_threshold_stride_multiplier),
             "patch_scale": float(args.patch_scale),
             "patch_at_k": int(args.patch_at_k),
+            "safe_pairwise_checkpoint": args.safe_pairwise_checkpoint,
+            "pairwise_inlier_weight": float(args.pairwise_inlier_weight),
+            "pairwise_device": args.pairwise_device or args.similarity_device,
+            "pairwise_batch_size": int(args.pairwise_batch_size),
         },
         "submap": {
             "mode": args.submap_mode,

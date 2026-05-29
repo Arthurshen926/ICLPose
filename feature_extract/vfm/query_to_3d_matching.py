@@ -226,6 +226,9 @@ class QueryTo3DMatch:
     landmark_quality: float | None = None
     landmark_ambiguity: float | None = None
     quality_weighted_similarity: float | None = None
+    pairwise_inlier_logit: float | None = None
+    pairwise_inlier_logprob: float | None = None
+    pairwise_weighted_similarity: float | None = None
     similarity_margin: float | None = None
     distance_to_boundary_px: float | None = None
     render_alpha: float | None = None
