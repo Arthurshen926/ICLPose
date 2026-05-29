@@ -1661,35 +1661,283 @@ The patch evaluator reports:
 - `GT@stride`, `GT@2stride`
 - legacy `GT@5px`, `GT@16px`, and median reprojection error
 - PnP-inlier `Patch@1` and PnP-inlier `GT@stride`
+- positive-set difficulty: visible landmark count, positives per token,
+  non-empty patch fraction, and zero-positive token ratio
+- PnP solve rate separated from localization success at `10cm/5deg`,
+  `25cm/10deg`, `50cm/10deg`, and `1m/10deg`
+- PnP-inlier count, inlier ratio, spatial coverage, depth range, and 3D
+  degeneracy statistics
 - final pose using a stride-aware PnP-RANSAC threshold
 
 OldHospital reference-pose top1, sparse patch baseline, balanced landmark
 filters, COLMAP intrinsics:
 
-| split/config | matches | Patch@1 | Patch@5 | GT@5 | GT@16 | GT@stride | GT@2stride | PnP success | med t | med r |
+Legacy q20 ablation:
+
+| split/config | matches | Patch@1 | Patch@5 | GT@5 | GT@16 | GT@stride | GT@2stride | solve rate | med t | med r |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | q20 patch NN, 1.5 stride PnP | 32.90 | 0.113 | 0.113 | 0.053 | 0.251 | 0.251 | 0.435 | 1.000 | 0.847m | 2.042deg |
 | q20 patch MNN, 1.5 stride PnP | 31.25 | 0.118 | 0.118 | 0.055 | 0.262 | 0.262 | 0.447 | 1.000 | 1.191m | 2.680deg |
-| q20 soft mutual top5, no margin | 196.20 | 0.052 | 0.148 | 0.020 | 0.142 | 0.142 | 0.314 | 1.000 | 0.785m | 1.989deg |
-| full182 patch NN, 1.5 stride PnP | 23.62 | 0.100 | 0.100 | 0.039 | 0.218 | 0.219 | 0.410 | 0.945 | 2.954m | 5.903deg |
-| full182 soft mutual top5, no margin | 116.06 | 0.066 | 0.150 | 0.027 | 0.161 | 0.162 | 0.343 | 0.989 | 2.506m | 4.686deg |
+
+Updated soft-mutual top5 no-margin protocol with `max_matches=1000`:
+
+| split/submap | landmarks | visible | Patch@1 | Patch@5 | GT@5 | GT@stride | GT@2stride | inliers | inlier Patch@1 | solve | S@10cm/5deg | S@25cm/10deg | S@50cm/10deg | med t | med r |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| q20 GT-visible oracle | 20000 | 20000 | 0.180 | 0.246 | 0.067 | 0.367 | 0.629 | 518.7 | 0.345 | 1.000 | 0.000 | 0.500 | 1.000 | 0.241m | 0.428deg |
+| q20 reference top1 | 1813 | 1578 | 0.169 | 0.221 | 0.063 | 0.352 | 0.608 | 504.0 | 0.331 | 1.000 | 0.100 | 0.500 | 0.900 | 0.247m | 0.530deg |
+| q20 reference top5 | 3386 | 2942 | 0.191 | 0.250 | 0.074 | 0.380 | 0.633 | 532.4 | 0.353 | 1.000 | 0.100 | 0.450 | 1.000 | 0.259m | 0.438deg |
+| q20 reference top10 | 5158 | 4455 | 0.197 | 0.260 | 0.076 | 0.389 | 0.640 | 543.5 | 0.362 | 1.000 | 0.050 | 0.550 | 1.000 | 0.242m | 0.523deg |
+| full182 GT-visible oracle | 20000 | 20000 | 0.160 | 0.242 | 0.059 | 0.326 | 0.539 | 447.7 | 0.335 | 1.000 | 0.000 | 0.154 | 0.429 | 0.579m | 0.966deg |
+| full182 reference top1 | 1564 | 1407 | 0.162 | 0.223 | 0.059 | 0.339 | 0.559 | 467.4 | 0.329 | 1.000 | 0.016 | 0.165 | 0.478 | 0.530m | 0.904deg |
+| full182 reference top5 | 4417 | 3849 | 0.188 | 0.263 | 0.071 | 0.374 | 0.590 | 503.9 | 0.357 | 1.000 | 0.016 | 0.137 | 0.484 | 0.522m | 0.875deg |
+| full182 reference top10 | 7000 | 6003 | 0.194 | 0.275 | 0.075 | 0.381 | 0.592 | 508.0 | 0.367 | 1.000 | 0.005 | 0.159 | 0.500 | 0.499m | 0.892deg |
 
 Interpretation:
 
 - Patch-level metrics expose signal that point-level `GT@5px` hides. On
-  full182 patch NN, `Patch@1=0.100` while `GT@5=0.039`, and `GT@2stride=0.410`
-  while `GT@16=0.218`.
-- The stride-aware PnP threshold gives a clear downstream improvement on the
-  full182 balanced sparse path: median pose improves from `4.266m/7.383deg`
-  for point-level PnP to `2.954m/5.903deg` with patch NN and to
-  `2.506m/4.686deg` with soft mutual top5.
+  full182 reference top10, `Patch@1=0.194` and `GT@stride=0.381`, while
+  strict pixel-level `GT@5=0.075`.
+- `pnp_solve_rate` must not be called localization success. The solver returns
+  a pose for every full182 query in the updated soft-mutual protocol, but
+  actual `success@25cm/10deg` is only `13.7-16.5%`, and
+  `success@10cm/5deg` is below `2%`.
+- The stride-aware PnP threshold gives a clear downstream improvement compared
+  with the old point-level balanced sparse path (`4.266m/7.383deg` median), but
+  the result remains a coarse localization signal rather than a precise local
+  feature matcher.
 - Strict one-to-one MNN is still not the best default. It marginally improves
   correspondence precision on q20 but gives worse pose than NN and soft mutual.
-- Soft mutual top5 without margin returns many more patch-level candidates,
-  lowering all-match precision but improving pose, likely because PnP gets
-  better spatial coverage and RANSAC can select a useful subset.
+- Soft mutual top5 without margin and a fixed top-1000 match cap lowers
+  all-match precision but improves pose, likely because PnP gets better spatial
+  coverage and RANSAC can select a useful subset.
+- GT-visible oracle is not automatically an upper bound. With a 20k visible
+  landmark cap it introduces more true-visible but repetitive/ambiguous
+  landmarks; full182 reference top10 is slightly better than full182
+  GT-visible in median pose (`0.499m` vs `0.579m`).
 - This supports the claim that raw VFM is better modeled as patch-level
   localization evidence than as pixel-level 2D-3D correspondence.
+
+Follow-up ablations before feature selection:
+
+The evaluator now supports `LandmarkQualityConfig` in the patch matcher, so
+`similarity * Q_X` can be used as a quality-weighted matching score. It also
+has a summary tool:
+
+```text
+python -m feature_extract.tools.vfm.summarize_patch_to_3d_ablation
+```
+
+which writes JSON/CSV/Markdown comparison tables from per-run summary JSON
+files. This keeps Step 2/3/4 reporting reproducible instead of manually
+copying metrics.
+
+OldHospital q20 submap split with the same default candidate matcher
+`MNN + reference/visible submap + stride-aware PnP`:
+
+| submap | Patch@1 | inlier Patch@1 | S@25cm/10deg | S@50cm/10deg | med t | med r |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| GT-visible oracle | 0.227 | 0.426 | 0.850 | 1.000 | 0.166m | 0.364deg |
+| reference top1 | 0.281 | 0.452 | 0.650 | 1.000 | 0.224m | 0.346deg |
+| reference top5 | 0.285 | 0.462 | 0.500 | 1.000 | 0.221m | 0.292deg |
+| reference top10 | 0.280 | 0.466 | 0.800 | 0.950 | 0.176m | 0.429deg |
+| all-map, capped 20k | 0.201 | 0.423 | 0.800 | 1.000 | 0.196m | 0.411deg |
+
+Interpretation: in the q20 slice, the descriptor/matcher is not the only
+bottleneck. Coarse submap choice affects success, but the oracle-visible
+submap is not overwhelmingly better than top10 because the 20k visible cap
+adds many ambiguous landmarks.
+
+OldHospital full182 matching-rule ablation on reference top10:
+
+| matcher | Patch@1 | inlier Patch@1 | S@25cm/10deg | S@50cm/10deg | med t | med r |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| MNN | 0.258 | 0.437 | 0.209 | 0.577 | 0.435m | 0.664deg |
+| soft mutual top3 + margin 0.02 + quality | 0.182 | 0.359 | 0.176 | 0.555 | 0.436m | 0.734deg |
+| soft mutual top3 + margin 0.02 | 0.183 | 0.360 | 0.170 | 0.511 | 0.475m | 0.764deg |
+| soft mutual top5, no margin | 0.194 | 0.367 | 0.159 | 0.500 | 0.499m | 0.892deg |
+
+ShopFacade full103 matching-rule ablation on reference top10:
+
+| matcher | Patch@1 | inlier Patch@1 | S@25cm/10deg | S@50cm/10deg | med t | med r |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| MNN | 0.259 | 0.407 | 0.786 | 0.932 | 0.170m | 0.445deg |
+| soft mutual top3 + margin 0.02 | 0.190 | 0.330 | 0.786 | 0.942 | 0.172m | 0.552deg |
+| soft mutual top5, no margin | 0.157 | 0.287 | 0.631 | 0.854 | 0.205m | 0.570deg |
+
+Current default baseline before feature selection:
+
+```text
+reference top10 submap
++ sparse landmark raw VFM map
++ patch-level MNN
++ token-stride-aware PnP-RANSAC
+```
+
+This is deliberately conservative. It gives fewer correspondences than soft
+mutual topK, but higher patch correctness and better full-split pose on both
+OldHospital and ShopFacade.
+
+Top-K reference pool and candidate-prior audit:
+
+The patch evaluator now writes per-query and summary-level candidate-pool
+diagnostics:
+
+- `gt_visible_bank_tracks`, `submap_gt_visible_tracks`, and
+  `visible_landmark_recall`
+- `reference_prior.top1` and `reference_prior.oracle` pose errors from the
+  fixed candidate bank
+- PnP-inlier patch correctness, inlier count, spatial coverage, depth range,
+  and degeneracy metrics in the same summary rows
+
+The same-source HLoc/NetVLAD reference-pose bank only contains top10
+candidates, so the clean deployment-like sweep is top1/top3/top5/top10 plus
+GT-visible and all-map-capped20k stress tests. A separately generated
+`pose_nearest_reference_top20_oracle` bank is included only as an oracle-like
+top20 coverage upper bound; it must not be mixed into the same-source curve.
+
+OldHospital full182, sparse raw VFM patch MNN, balanced300k mean bank:
+
+| pool | visible recall med | ref top1 med t | ref oracle med t | matches | inliers | inlier Patch@1 | S@25cm/10deg | S@50cm/10deg | med t | med r |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| HLoc-ref top1 | 0.017 | 4.002m | 4.002m | 497.5 | 302.2 | 0.427 | 0.198 | 0.511 | 0.459m | 0.759deg |
+| HLoc-ref top3 | 0.031 | 4.002m | 3.173m | 717.0 | 427.4 | 0.435 | 0.214 | 0.566 | 0.445m | 0.646deg |
+| HLoc-ref top5 | 0.045 | 4.002m | 2.869m | 814.5 | 482.9 | 0.435 | 0.198 | 0.626 | 0.414m | 0.617deg |
+| HLoc-ref top10 | 0.067 | 4.002m | 2.322m | 914.3 | 531.3 | 0.437 | 0.209 | 0.577 | 0.435m | 0.664deg |
+| pose-nearest top20 oracle | 0.085 | 1.505m | 1.505m | 948.9 | 558.2 | 0.442 | 0.253 | 0.566 | 0.429m | 0.613deg |
+| all-map capped20k | 0.182 | 4.002m | 2.322m | 889.8 | 362.3 | 0.380 | 0.214 | 0.522 | 0.486m | 0.817deg |
+| GT-visible capped20k | 0.222 | 4.002m | 2.322m | 901.9 | 422.8 | 0.391 | 0.203 | 0.484 | 0.512m | 0.719deg |
+
+ShopFacade full103, sparse raw VFM patch MNN, head100k mean bank:
+
+| pool | visible recall med | ref top1 med t | ref oracle med t | matches | inliers | inlier Patch@1 | S@25cm/10deg | S@50cm/10deg | med t | med r |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| HLoc-ref top1 | 0.057 | 1.377m | 1.377m | 385.2 | 268.3 | 0.400 | 0.670 | 0.825 | 0.194m | 0.585deg |
+| HLoc-ref top3 | 0.131 | 1.377m | 0.972m | 565.3 | 394.5 | 0.409 | 0.709 | 0.903 | 0.191m | 0.499deg |
+| HLoc-ref top5 | 0.181 | 1.377m | 0.785m | 616.9 | 431.0 | 0.408 | 0.738 | 0.913 | 0.182m | 0.512deg |
+| HLoc-ref top10 | 0.285 | 1.377m | 0.736m | 678.4 | 467.9 | 0.407 | 0.786 | 0.932 | 0.170m | 0.445deg |
+| pose-nearest top20 oracle | 0.422 | 0.746m | 0.746m | 698.2 | 481.7 | 0.406 | 0.767 | 0.932 | 0.159m | 0.439deg |
+| all-map capped20k | 0.971 | 1.377m | 0.736m | 859.1 | 486.1 | 0.380 | 0.650 | 0.835 | 0.190m | 0.452deg |
+| GT-visible | 1.000 | 1.377m | 0.736m | 840.0 | 500.3 | 0.387 | 0.621 | 0.816 | 0.185m | 0.438deg |
+
+Interpretation:
+
+- VFM+PnP is not merely copying reference top1 pose. On OldHospital, HLoc-ref
+  top1 prior has median `4.002m`, while VFM+PnP reaches `0.459m`; on
+  ShopFacade, `1.377m` becomes `0.194m`.
+- Increasing K improves visible-landmark recall, but the pose curve saturates
+  early. OldHospital top5 has the best median translation among same-source
+  pools, while ShopFacade keeps improving through top10.
+- All-map and GT-visible pools do not dominate despite higher coverage; they
+  add many ambiguous landmarks and lower PnP-inlier patch correctness. This
+  confirms that a coarse candidate pool is still necessary.
+- The top20 pose-nearest result is an oracle-like coverage diagnostic, not a
+  deployment claim. Its limited gain over top10 shows that raw VFM patch MNN is
+  now partly matcher/outlier-limited, not only coverage-limited.
+
+Map feature representation ablation with the fixed MNN baseline, head100k
+landmark banks:
+
+| scene | representation | Patch@1 | inlier Patch@1 | S@25cm/10deg | S@50cm/10deg | med t | med r |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| OldHospital full182 | geometry weighted mean | 0.191 | 0.347 | 0.121 | 0.385 | 0.668m | 1.033deg |
+| OldHospital full182 | mean | 0.189 | 0.345 | 0.133 | 0.403 | 0.701m | 0.900deg |
+| OldHospital full182 | geometric median | 0.188 | 0.349 | 0.110 | 0.387 | 0.744m | 1.028deg |
+| OldHospital full182 | medoid | 0.159 | 0.320 | 0.089 | 0.335 | 0.758m | 1.199deg |
+| ShopFacade full103 | geometric median | 0.256 | 0.407 | 0.748 | 0.932 | 0.165m | 0.471deg |
+| ShopFacade full103 | mean | 0.259 | 0.407 | 0.786 | 0.932 | 0.170m | 0.445deg |
+| ShopFacade full103 | medoid | 0.221 | 0.381 | 0.689 | 0.903 | 0.181m | 0.443deg |
+| ShopFacade full103 | geometry weighted mean | 0.262 | 0.410 | 0.777 | 0.922 | 0.185m | 0.463deg |
+
+The robust representations do not provide a clear universal win yet. Mean or
+geometry-weighted mean remain the safest default for OldHospital, while
+ShopFacade shows a small median-translation gain for geometric median but not a
+success-rate gain. Medoid is now evaluated correctly after fixing its
+observation-count metadata, but it is not competitive as a default.
+
+Selector-entry gate update:
+
+- enter feature selection only on top of the fixed MNN patch baseline above;
+- report MNN and soft-mutual top3+margin as non-selector baselines;
+- require selector improvements in at least one of `Patch@1`, PnP-inlier
+  Patch@1, `success@25cm/10deg`, or hard-case failure rate without degrading
+  `success@50cm/10deg`;
+- keep OldHospital and ShopFacade in the baseline table before adding any
+  learned selector claim.
+
+Stage C0 non-learned compression baseline:
+
+Stage C0 is now implemented as a leakage-controlled preprocessing step: a
+single transform is fit from 3D landmark mean features, then applied to both the
+3D landmark bank and the query token bank before running the same sparse
+patch-to-3D MNN evaluator. Code:
+
+- `feature_extract/vfm/feature_compression.py`
+- `feature_extract/tools/vfm/build_stage_c0_compressed_features.py`
+- `feature_extract/tools/vfm/summarize_stage_c0_compression.py`
+
+Implemented methods:
+
+- raw high-D identity baseline
+- PCA projection
+- seeded Gaussian random projection
+- first-channel control
+- channel-variance selection
+- IDF channel selection
+- Fisher channel selection when a supervised label `.npy` is provided
+
+Full artifacts are under `output/vfm/stage_c0_compression/`. The fixed
+evaluator protocol is:
+
+```text
+reference top10 submap
++ sparse raw VFM landmark map or compressed map
++ patch-level MNN
++ token-stride-aware PnP-RANSAC
+```
+
+OldHospital full182, balanced300k mean landmark bank:
+
+| method | dim | S@25cm/10deg | S@50cm/10deg | med t | med r | inlier Patch@1 | storage |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| raw | 1280 | 0.209 | 0.577 | 0.435m | 0.664deg | 0.437 | 4.19G |
+| PCA | 512 | 0.209 | 0.522 | 0.469m | 0.725deg | 0.414 | 2.98G |
+| PCA | 256 | 0.176 | 0.516 | 0.490m | 0.756deg | 0.406 | 1.50G |
+| PCA | 128 | 0.170 | 0.549 | 0.468m | 0.793deg | 0.388 | 0.75G |
+| PCA | 64 | 0.209 | 0.462 | 0.547m | 0.826deg | 0.363 | 0.38G |
+| random | 128 | 0.236 | 0.544 | 0.468m | 0.687deg | 0.414 | 0.75G |
+| random | 64 | 0.209 | 0.533 | 0.479m | 0.695deg | 0.401 | 0.37G |
+| variance | 128 | 0.165 | 0.440 | 0.593m | 0.905deg | 0.367 | 0.51G |
+| IDF | 128 | 0.214 | 0.516 | 0.460m | 0.724deg | 0.394 | 0.51G |
+
+ShopFacade full103, head100k mean landmark bank:
+
+| method | dim | S@25cm/10deg | S@50cm/10deg | med t | med r | inlier Patch@1 | storage |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| raw | 1280 | 0.786 | 0.932 | 0.170m | 0.445deg | 0.407 | 2.01G |
+| PCA | 512 | 0.767 | 0.922 | 0.168m | 0.449deg | 0.386 | 1.55G |
+| PCA | 256 | 0.738 | 0.932 | 0.180m | 0.462deg | 0.364 | 0.78G |
+| PCA | 128 | 0.641 | 0.874 | 0.195m | 0.541deg | 0.342 | 0.39G |
+| PCA | 64 | 0.553 | 0.806 | 0.221m | 0.589deg | 0.306 | 0.19G |
+| random | 128 | 0.757 | 0.942 | 0.173m | 0.477deg | 0.386 | 0.39G |
+| random | 64 | 0.748 | 0.883 | 0.164m | 0.502deg | 0.372 | 0.19G |
+| variance | 128 | 0.680 | 0.835 | 0.204m | 0.558deg | 0.348 | 0.25G |
+| IDF | 128 | 0.748 | 0.883 | 0.174m | 0.518deg | 0.363 | 0.25G |
+
+Interpretation:
+
+- PCA-512 is the safest non-learned compression if the goal is minimal quality
+  loss, but it still reduces PnP-inlier patch correctness and broad recall on
+  OldHospital.
+- Random projection is a surprisingly strong low-dimensional baseline:
+  random-128 improves OldHospital `S@25cm/10deg` over raw and nearly preserves
+  ShopFacade, while using about 18-19% of raw storage.
+- Simple channel-variance selection is not competitive. IDF selection is better
+  than variance but does not dominate random projection.
+- PCA-64 and channel-selection-64 are too aggressive for this matcher. They
+  may still be useful as storage/risk controls, but not as default baselines.
+- Selector claims must beat random-128 and PCA-512, not only raw or variance
+  selection. A good next selector target is random-128 storage with at least
+  raw-level `S@50cm/10deg` and improved inlier Patch@1.
 
 Spatial/PnP diagnostics with the corrected camera:
 

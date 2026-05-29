@@ -1,8 +1,10 @@
 import numpy as np
 
 from feature_extract.vfm.colmap_tracks import ColmapCamera
+from feature_extract.vfm.patch_to_3d_matching import PatchPositiveSet, PatchPositiveSets, TokenPatchBox
 from feature_extract.vfm.query_to_3d_matching import LandmarkMapIndex, QueryTo3DMatch
 from feature_extract.vfm.query_to_3d_visualization import (
+    render_patch_to_3d_match_overlay,
     render_query_to_3d_match_overlay,
     render_query_to_projected_map_correspondence,
 )
@@ -114,3 +116,60 @@ def test_render_query_to_projected_map_correspondence_builds_side_by_side_view()
     assert rgb_summary["projected_landmark_count"] == 2
     assert rgb_summary["drawn_match_count"] == 2
     assert feature_summary["mode"] == "feature"
+
+
+def test_render_patch_to_3d_match_overlay_uses_patch_positive_sets() -> None:
+    camera = ColmapCamera(camera_id=1, model_id=1, width=100, height=100, params=(80.0, 80.0, 50.0, 50.0))
+    image = np.zeros((100, 100, 3), dtype=np.uint8)
+    matches = [
+        QueryTo3DMatch(
+            token_index=0,
+            xy=np.asarray([50.0, 50.0], dtype=np.float64),
+            track_id=1,
+            xyz=np.asarray([0.0, 0.0, 5.0], dtype=np.float64),
+            similarity=0.9,
+            ratio=0.1,
+            landmark_variance=0.0,
+        ),
+        QueryTo3DMatch(
+            token_index=1,
+            xy=np.asarray([10.0, 10.0], dtype=np.float64),
+            track_id=2,
+            xyz=np.asarray([0.0, 0.0, 5.0], dtype=np.float64),
+            similarity=0.8,
+            ratio=0.2,
+            landmark_variance=0.0,
+        ),
+    ]
+    positives = PatchPositiveSets(
+        by_token={
+            0: PatchPositiveSet(
+                token_index=0,
+                patch_box=TokenPatchBox(0, np.asarray([50.0, 50.0]), 40.0, 40.0, 60.0, 60.0),
+                track_ids={1},
+            ),
+            1: PatchPositiveSet(
+                token_index=1,
+                patch_box=TokenPatchBox(1, np.asarray([10.0, 10.0]), 0.0, 0.0, 20.0, 20.0),
+                track_ids=set(),
+            ),
+        },
+        stride_x_px=20.0,
+        stride_y_px=20.0,
+    )
+
+    overlay, summary = render_patch_to_3d_match_overlay(
+        image,
+        matches,
+        positives,
+        pose_w2c=np.eye(4, dtype=np.float64),
+        camera=camera,
+        inlier_mask=np.asarray([True, False]),
+        max_draw=10,
+    )
+
+    assert overlay.shape == image.shape
+    assert int(overlay.sum()) > 0
+    assert summary["patch_correct_count"] == 1
+    assert summary["patch_precision"] == 0.5
+    assert summary["pnp_inlier_count"] == 1

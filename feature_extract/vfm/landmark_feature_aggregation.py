@@ -196,6 +196,7 @@ def _aggregate_one_track(
     utilities = np.asarray([float(obs.utility) for obs in observations], dtype=np.float32)
     selected_features = features
     selected_utilities = utilities
+    output_observation_count = int(features.shape[0])
 
     if config.method == "mean":
         mean, variance = _weighted_mean_and_variance(features, None)
@@ -212,6 +213,7 @@ def _aggregate_one_track(
         variance = ((features - mean[None, :]) ** 2).mean(axis=0).astype(np.float32)
         selected_features = features[selected_idx : selected_idx + 1]
         selected_utilities = utilities[selected_idx : selected_idx + 1]
+        output_observation_count = int(features.shape[0])
     elif config.method == "robust_trimmed_mean":
         center = features.mean(axis=0, keepdims=True)
         distances = np.linalg.norm(features - center, axis=1)
@@ -242,6 +244,7 @@ def _aggregate_one_track(
         variance = np.mean((features - mean[None, :]) ** 2, axis=0).astype(np.float32)
         selected_features = features[selected_idx : selected_idx + 1]
         selected_utilities = utilities[selected_idx : selected_idx + 1]
+        output_observation_count = int(features.shape[0])
     else:
         raise ValueError(f"unsupported landmark aggregation method: {config.method}")
 
@@ -249,7 +252,9 @@ def _aggregate_one_track(
         track_id=int(track_id),
         mean_feature=mean.astype(np.float32, copy=False),
         variance=variance.astype(np.float32, copy=False),
-        observation_count=int(selected_features.shape[0]),
+        observation_count=output_observation_count
+        if config.method in {"random_observation", "medoid"}
+        else int(selected_features.shape[0]),
         mean_utility=float(np.mean(selected_utilities)) if selected_utilities.size else 0.0,
         observation_image_ids=tuple(sorted({obs.image_id for obs in observations})),
     )

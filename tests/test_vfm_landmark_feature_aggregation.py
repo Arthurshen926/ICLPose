@@ -130,6 +130,7 @@ def test_geometric_median_and_medoid_are_robust_to_outlier():
 
     assert median_bank.tracks[8].mean_feature[0] == pytest.approx(1.2, abs=0.25)
     assert min(abs(float(medoid_bank.tracks[8].mean_feature[0]) - 1.0), abs(float(medoid_bank.tracks[8].mean_feature[0]) - 1.2)) < 1e-6
+    assert medoid_bank.tracks[8].observation_count == 3
 
 
 def test_random_observation_aggregation_is_seeded_and_deterministic():
@@ -144,6 +145,7 @@ def test_random_observation_aggregation_is_seeded_and_deterministic():
     bank_b = aggregate_landmark_features(observations, config)
 
     np.testing.assert_array_equal(bank_a.tracks[9].mean_feature, bank_b.tracks[9].mean_feature)
+    assert bank_a.tracks[9].observation_count == 3
 
 
 def test_landmark_feature_diagnostics_report_split_stability_and_retrieval():

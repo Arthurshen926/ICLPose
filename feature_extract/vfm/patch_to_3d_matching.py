@@ -9,11 +9,13 @@ import numpy as np
 
 from feature_extract.vfm.colmap_tracks import ColmapCamera
 from feature_extract.vfm.query_to_3d_matching import (
+    LandmarkQualityConfig,
     LandmarkMapIndex,
     QueryTo3DMatchingConfig,
     QueryTo3DMatch,
     camera_matrix_and_distortion,
     estimate_pose_pnp_ransac,
+    landmark_quality_scores,
     match_reprojection_errors,
     match_query_tokens_to_landmarks,
     normalize_rows,
@@ -51,6 +53,7 @@ class PatchPositiveSets:
     by_token: Mapping[int, PatchPositiveSet]
     stride_x_px: float
     stride_y_px: float
+    visible_track_ids: set[int] | None = None
 
 
 @dataclass(frozen=True)
@@ -66,9 +69,11 @@ class PatchTo3DMatchingConfig:
     max_landmark_reprojection_error: float | None = None
     max_landmark_ambiguity: float | None = None
     min_distance_to_boundary_px: float | None = None
+    min_quality_weighted_similarity: float | None = None
     query_token_step: int = 1
     max_matches: int | None = None
     block_size: int = 512
+    landmark_quality: LandmarkQualityConfig = LandmarkQualityConfig()
 
     def __post_init__(self) -> None:
         if self.top_k <= 0:
@@ -79,6 +84,8 @@ class PatchTo3DMatchingConfig:
             raise ValueError("match_mode must be one of: nn, mnn, soft_mutual")
         if self.ratio_threshold is not None and not 0.0 < float(self.ratio_threshold) <= 1.0:
             raise ValueError("ratio_threshold must be in (0, 1]")
+        if self.min_quality_weighted_similarity is not None and float(self.min_quality_weighted_similarity) < -1.0:
+            raise ValueError("min_quality_weighted_similarity must be >= -1")
 
 
 def token_patch_boxes(
@@ -146,11 +153,18 @@ def build_patch_positive_sets(
         int(box.token_index): PatchPositiveSet(token_index=int(box.token_index), patch_box=box, track_ids=set())
         for box in boxes
     }
+    visible_track_ids: set[int] = set()
     if len(index) == 0:
-        return PatchPositiveSets(by_token=by_token, stride_x_px=stride_x, stride_y_px=stride_y)
+        return PatchPositiveSets(
+            by_token=by_token,
+            stride_x_px=stride_x,
+            stride_y_px=stride_y,
+            visible_track_ids=visible_track_ids,
+        )
     for landmark_idx, is_visible in enumerate(visible):
         if not bool(is_visible):
             continue
+        visible_track_ids.add(int(index.track_ids[landmark_idx]))
         xy = projected_xy[landmark_idx]
         x_idx = int(round(np.clip(xy[0] / max(float(camera.width - 1), 1.0), 0.0, 1.0) * max(token_width - 1, 0)))
         y_idx = int(round(np.clip(xy[1] / max(float(camera.height - 1), 1.0), 0.0, 1.0) * max(token_height - 1, 0)))
@@ -160,7 +174,55 @@ def build_patch_positive_sets(
                 positive = by_token[token_index]
                 if positive.patch_box.contains(xy):
                     positive.track_ids.add(int(index.track_ids[landmark_idx]))
-    return PatchPositiveSets(by_token=by_token, stride_x_px=stride_x, stride_y_px=stride_y)
+    return PatchPositiveSets(
+        by_token=by_token,
+        stride_x_px=stride_x,
+        stride_y_px=stride_y,
+        visible_track_ids=visible_track_ids,
+    )
+
+
+def patch_positive_set_stats(positives: PatchPositiveSets) -> dict[str, float | int]:
+    counts = np.asarray([item.count for item in positives.by_token.values()], dtype=np.float64)
+    if counts.size == 0:
+        return {
+            "token_count": 0,
+            "visible_landmark_count": 0,
+            "positive_landmark_count": 0,
+            "mean_positives_per_token": 0.0,
+            "median_positives_per_token": 0.0,
+            "mean_positives_per_nonempty_token": 0.0,
+            "max_positives_per_token": 0,
+            "zero_positive_token_ratio": 1.0,
+            "nonempty_patch_fraction": 0.0,
+            "positive_landmark_density_per_token": 0.0,
+        }
+    positive_ids: set[int] = set()
+    for item in positives.by_token.values():
+        positive_ids.update(int(track_id) for track_id in item.track_ids)
+    nonempty = counts[counts > 0.0]
+    token_count = int(counts.size)
+    return {
+        "token_count": token_count,
+        "visible_landmark_count": 0 if positives.visible_track_ids is None else int(len(positives.visible_track_ids)),
+        "positive_landmark_count": int(len(positive_ids)),
+        "mean_positives_per_token": float(np.mean(counts)),
+        "median_positives_per_token": float(np.median(counts)),
+        "mean_positives_per_nonempty_token": 0.0 if nonempty.size == 0 else float(np.mean(nonempty)),
+        "max_positives_per_token": int(np.max(counts)),
+        "zero_positive_token_ratio": float(np.mean(counts == 0.0)),
+        "nonempty_patch_fraction": float(np.mean(counts > 0.0)),
+        "positive_landmark_density_per_token": float(len(positive_ids) / max(token_count, 1)),
+    }
+
+
+def filter_landmarks_by_projected_visibility(
+    index: LandmarkMapIndex,
+    pose_w2c: np.ndarray,
+    camera: ColmapCamera,
+) -> LandmarkMapIndex:
+    _projected_xy, visible = _project_landmarks(index, pose_w2c, camera)
+    return index.subset(visible)
 
 
 def _query_landmark_topk(
@@ -237,6 +299,29 @@ def match_query_patches_to_landmarks(
     valid_query_indices = np.flatnonzero(valid_query)
     if valid_query_indices.size == 0 or len(index) == 0:
         return []
+    quality_scores, landmark_ambiguity = landmark_quality_scores(
+        index,
+        landmark_features,
+        config.landmark_quality,
+        block_size=config.block_size,
+        force_ambiguity=config.max_landmark_ambiguity is not None,
+    )
+    if config.landmark_quality.enabled and config.landmark_quality.min_score is not None:
+        keep_quality = quality_scores >= float(config.landmark_quality.min_score)
+        if not np.any(keep_quality):
+            return []
+        index = index.subset(keep_quality)
+        landmark_features = landmark_features[keep_quality]
+        quality_scores = quality_scores[keep_quality]
+        landmark_ambiguity = landmark_ambiguity[keep_quality]
+    if config.max_landmark_ambiguity is not None:
+        keep_ambiguity = landmark_ambiguity <= float(config.max_landmark_ambiguity)
+        if not np.any(keep_ambiguity):
+            return []
+        index = index.subset(keep_ambiguity)
+        landmark_features = landmark_features[keep_ambiguity]
+        quality_scores = quality_scores[keep_ambiguity]
+        landmark_ambiguity = landmark_ambiguity[keep_ambiguity]
     query_features = query_features[valid_query_indices]
     token_indices = token_indices[valid_query_indices]
 
@@ -262,11 +347,12 @@ def match_query_patches_to_landmarks(
 
     matches: list[QueryTo3DMatch] = []
     for query_row in range(query_features.shape[0]):
+        candidate_matches: list[QueryTo3DMatch] = []
         for rank in range(query_top_indices.shape[1]):
             landmark_idx = int(query_top_indices[query_row, rank])
             if landmark_idx < 0:
                 continue
-            if config.match_mode == "nn" and rank > 0:
+            if config.match_mode == "nn" and rank > 0 and not config.landmark_quality.enabled:
                 continue
             if config.match_mode == "mnn" and (rank > 0 or query_row not in reciprocal[landmark_idx]):
                 continue
@@ -287,12 +373,19 @@ def match_query_patches_to_landmarks(
             margin = None if second_similarity is None else float(similarity - second_similarity)
             if config.min_similarity_margin is not None and (margin is None or margin < float(config.min_similarity_margin)):
                 continue
+            quality = float(quality_scores[landmark_idx])
+            quality_weighted_similarity = float(similarity * quality)
+            if (
+                config.min_quality_weighted_similarity is not None
+                and quality_weighted_similarity < float(config.min_quality_weighted_similarity)
+            ):
+                continue
             token_index = int(token_indices[query_row])
             xy = centers[token_index].astype(np.float64, copy=True)
             boundary = min(float(xy[0]), float(xy[1]), float(image_width - 1) - float(xy[0]), float(image_height - 1) - float(xy[1]))
             if config.min_distance_to_boundary_px is not None and boundary < float(config.min_distance_to_boundary_px):
                 continue
-            matches.append(
+            candidate_matches.append(
                 QueryTo3DMatch(
                     token_index=token_index,
                     xy=xy,
@@ -305,12 +398,30 @@ def match_query_patches_to_landmarks(
                     observation_count=int(index.observation_counts[landmark_idx]),
                     visibility_count=len(index.observation_image_ids[landmark_idx]),
                     landmark_reprojection_error=float(index.reprojection_errors[landmark_idx]),
-                    landmark_ambiguity=float(index.feature_ambiguities[landmark_idx]),
+                    landmark_quality=quality,
+                    landmark_ambiguity=float(landmark_ambiguity[landmark_idx]),
+                    quality_weighted_similarity=quality_weighted_similarity,
                     similarity_margin=margin,
                     distance_to_boundary_px=float(boundary),
                 )
             )
-    matches.sort(key=lambda item: item.similarity, reverse=True)
+        if config.match_mode == "nn" and config.landmark_quality.enabled and candidate_matches:
+            matches.append(
+                max(
+                    candidate_matches,
+                    key=lambda item: item.quality_weighted_similarity
+                    if item.quality_weighted_similarity is not None
+                    else item.similarity,
+                )
+            )
+        else:
+            matches.extend(candidate_matches)
+    matches.sort(
+        key=lambda item: item.quality_weighted_similarity
+        if item.quality_weighted_similarity is not None
+        else item.similarity,
+        reverse=True,
+    )
     if config.max_matches is not None:
         matches = matches[: int(config.max_matches)]
     return matches
@@ -336,6 +447,7 @@ def evaluate_patch_matches(
         "gt_reproj_median_px": None,
         "gt_reproj_median_stride": None,
         "pnp_inlier_patch_at_1": None,
+        f"pnp_inlier_patch_at_{int(top_k)}": None,
         "pnp_inlier_gt_precision_stride": None,
     }
     if not matches:
@@ -363,6 +475,15 @@ def evaluate_patch_matches(
             raise ValueError("pnp_inlier_mask must have one value per match")
         if np.any(mask):
             stats["pnp_inlier_patch_at_1"] = float(np.mean(patch_correct[mask]))
+            inlier_by_token: dict[int, list[bool]] = {}
+            for match, correct, is_inlier in zip(matches, patch_correct, mask):
+                if bool(is_inlier):
+                    inlier_by_token.setdefault(int(match.token_index), []).append(bool(correct))
+            stats[f"pnp_inlier_patch_at_{int(top_k)}"] = (
+                0.0
+                if not inlier_by_token
+                else float(np.mean([any(values[: int(top_k)]) for values in inlier_by_token.values()]))
+            )
             stats["pnp_inlier_gt_precision_stride"] = float(np.mean(errors[mask] <= float(stride_px)))
     return stats
 

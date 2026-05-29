@@ -7,6 +7,7 @@ from typing import Sequence
 import numpy as np
 
 from feature_extract.vfm.colmap_tracks import ColmapCamera
+from feature_extract.vfm.patch_to_3d_matching import PatchPositiveSet, PatchPositiveSets, TokenPatchBox
 from feature_extract.vfm.query_to_3d_matching import (
     LandmarkMapIndex,
     QueryTo3DMatch,
@@ -167,6 +168,8 @@ def render_query_to_projected_map_correspondence(
     camera: ColmapCamera,
     mode: str = "rgb",
     inlier_mask: np.ndarray | None = None,
+    match_correct_mask: np.ndarray | None = None,
+    correct_label: str = "GT precision",
     reprojection_threshold_px: float = 16.0,
     max_draw: int = 160,
 ) -> tuple[np.ndarray, dict[str, object]]:
@@ -249,6 +252,14 @@ def render_query_to_projected_map_correspondence(
     query_xy = np.stack([match.xy for match in valid_matches], axis=0).astype(np.float64)
     errors = np.linalg.norm(query_xy - match_projected_array, axis=1)
     gt_inlier_mask = errors <= float(reprojection_threshold_px)
+    if match_correct_mask is None:
+        correct_mask = gt_inlier_mask
+    else:
+        correct_mask = np.asarray(match_correct_mask, dtype=bool).reshape(-1)
+        if correct_mask.shape[0] == len(matches):
+            correct_mask = correct_mask[: len(valid_matches)]
+        elif correct_mask.shape[0] != len(valid_matches):
+            raise ValueError("match_correct_mask must have one value per match")
     draw_count = min(int(max_draw), len(valid_matches))
     pnp_mask = None
     if inlier_mask is not None:
@@ -262,8 +273,8 @@ def render_query_to_projected_map_correspondence(
     for local_idx in range(draw_count):
         qx, qy = _clip_xy(query_xy[local_idx], width, height)
         px, py = _clip_xy(match_projected_array[local_idx], width, height)
-        is_gt_inlier = bool(gt_inlier_mask[local_idx])
-        color = (30, 210, 70) if is_gt_inlier else (235, 45, 45)
+        is_correct = bool(correct_mask[local_idx])
+        color = (30, 210, 70) if is_correct else (235, 45, 45)
         right_point = (width + gap + px, py)
         cv2.line(canvas, (qx, qy), right_point, color, 1, lineType=cv2.LINE_AA)
         cv2.circle(canvas, (qx, qy), 3, color, -1, lineType=cv2.LINE_AA)
@@ -278,6 +289,7 @@ def render_query_to_projected_map_correspondence(
     pnp_inliers = 0 if pnp_mask is None else int(np.sum(pnp_mask))
     info_lines = [
         f"matches: {len(matches)} drawn: {draw_count} projected landmarks: {projected_count}",
+        f"{correct_label}: {float(np.mean(correct_mask)):.3f}",
         f"GT precision@{reprojection_threshold_px:g}px: {float(np.mean(gt_inlier_mask)):.3f}",
         f"mean reproj error: {float(np.mean(errors)):.1f}px",
         f"yellow rings: PnP inliers {pnp_inliers}",
@@ -294,6 +306,8 @@ def render_query_to_projected_map_correspondence(
         "projected_landmark_count": int(projected_count),
         "gt_inlier_count": int(np.sum(gt_inlier_mask)),
         "gt_precision": float(np.mean(gt_inlier_mask)),
+        "match_correct_count": int(np.sum(correct_mask)),
+        "match_correct_precision": float(np.mean(correct_mask)),
         "pnp_inlier_count": int(pnp_inliers),
         "mean_reprojection_error_px": float(np.mean(errors)),
         "median_reprojection_error_px": float(np.median(errors)),
@@ -385,5 +399,110 @@ def render_query_to_3d_match_overlay(
         "pnp_inlier_count": int(pnp_inliers),
         "mean_reprojection_error_px": float(np.mean(errors)),
         "median_reprojection_error_px": float(np.median(errors)),
+    }
+    return overlay, summary
+
+
+def _match_patch_correct_mask(
+    matches: Sequence[QueryTo3DMatch],
+    positives: PatchPositiveSets,
+) -> np.ndarray:
+    empty = PatchPositiveSet(
+        token_index=-1,
+        patch_box=TokenPatchBox(-1, np.zeros((2,), dtype=np.float64), 0.0, 0.0, 0.0, 0.0),
+        track_ids=set(),
+    )
+    return np.asarray(
+        [
+            int(match.track_id)
+            in positives.by_token.get(int(match.token_index), empty).track_ids
+            for match in matches
+        ],
+        dtype=bool,
+    )
+
+
+def render_patch_to_3d_match_overlay(
+    image_rgb: np.ndarray,
+    matches: Sequence[QueryTo3DMatch],
+    positives: PatchPositiveSets,
+    pose_w2c: np.ndarray,
+    camera: ColmapCamera,
+    inlier_mask: np.ndarray | None = None,
+    max_draw: int = 250,
+) -> tuple[np.ndarray, dict[str, object]]:
+    """Render patch-level query-to-3D matches on the query image.
+
+    Green means the predicted landmark belongs to the GT-visible landmark set
+    for that token patch. Red means the descriptor match is outside the patch
+    positive set. Yellow rings mark PnP inliers.
+    """
+
+    try:
+        import cv2
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError("OpenCV is required for patch match visualization") from exc
+    image = np.asarray(image_rgb, dtype=np.uint8)
+    if image.ndim != 3 or image.shape[2] != 3:
+        raise ValueError("image_rgb must have shape (H, W, 3)")
+    overlay = image.copy()
+    if not matches:
+        return overlay, {
+            "match_count": 0,
+            "drawn_match_count": 0,
+            "patch_correct_count": 0,
+            "patch_precision": 0.0,
+            "pnp_inlier_count": 0,
+        }
+
+    projected = project_match_landmarks(matches, pose_w2c=pose_w2c, camera=camera)
+    query_xy = np.stack([match.xy for match in matches], axis=0).astype(np.float64)
+    patch_correct = _match_patch_correct_mask(matches, positives)
+    draw_count = min(int(max_draw), len(matches))
+    pnp_mask = None
+    if inlier_mask is not None:
+        pnp_mask = np.asarray(inlier_mask, dtype=bool).reshape(-1)
+        if pnp_mask.shape[0] != len(matches):
+            raise ValueError("inlier_mask must have one value per match")
+
+    height, width = overlay.shape[:2]
+    for idx in range(draw_count):
+        qx, qy = _clip_xy(query_xy[idx], width, height)
+        px, py = _clip_xy(projected[idx], width, height)
+        correct = bool(patch_correct[idx])
+        color = (30, 180, 60) if correct else (220, 40, 40)
+        positive = positives.by_token.get(int(matches[idx].token_index))
+        if positive is not None:
+            x0, y0 = _clip_xy(np.asarray([positive.patch_box.x0, positive.patch_box.y0]), width, height)
+            x1, y1 = _clip_xy(np.asarray([positive.patch_box.x1, positive.patch_box.y1]), width, height)
+            cv2.rectangle(overlay, (x0, y0), (x1, y1), color, 1, lineType=cv2.LINE_AA)
+        cv2.line(overlay, (qx, qy), (px, py), color, 1, lineType=cv2.LINE_AA)
+        cv2.circle(overlay, (qx, qy), 3, color, -1, lineType=cv2.LINE_AA)
+        _draw_cross(overlay, px, py, color, radius=4)
+        if pnp_mask is not None and bool(pnp_mask[idx]):
+            cv2.circle(overlay, (qx, qy), 7, (255, 210, 40), 1, lineType=cv2.LINE_AA)
+
+    panel = overlay.copy()
+    cv2.rectangle(panel, (8, 8), (500, 112), (0, 0, 0), -1)
+    overlay = cv2.addWeighted(panel, 0.45, overlay, 0.55, 0.0)
+    pnp_inliers = 0 if pnp_mask is None else int(np.sum(pnp_mask))
+    lines = [
+        f"patch matches: {len(matches)}   drawn: {draw_count}",
+        f"Patch precision: {float(np.mean(patch_correct)):.3f}",
+        f"PnP inliers: {pnp_inliers}",
+        "green: patch-positive   red: false   box: query patch",
+        "yellow ring: PnP inlier",
+    ]
+    y = 28
+    for line in lines:
+        cv2.putText(overlay, line, (18, y), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1, cv2.LINE_AA)
+        y += 18
+
+    summary = {
+        "match_count": int(len(matches)),
+        "drawn_match_count": int(draw_count),
+        "patch_correct_count": int(np.sum(patch_correct)),
+        "patch_precision": float(np.mean(patch_correct)),
+        "pnp_inlier_count": int(pnp_inliers),
     }
     return overlay, summary

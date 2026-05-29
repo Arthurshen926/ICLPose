@@ -9,10 +9,20 @@ from feature_extract.vfm.patch_to_3d_matching import (
     PatchTo3DMatchingConfig,
     build_patch_positive_sets,
     evaluate_patch_matches,
+    filter_landmarks_by_projected_visibility,
     match_query_patches_to_landmarks,
+    patch_positive_set_stats,
     token_patch_boxes,
 )
-from feature_extract.vfm.query_to_3d_matching import LandmarkMapIndex, token_grid_xy
+from feature_extract.vfm.query_to_3d_matching import LandmarkMapIndex, LandmarkQualityConfig, token_grid_xy
+
+
+def test_patch_level_helpers_are_exported_from_vfm_package() -> None:
+    from feature_extract.vfm import filter_landmarks_by_projected_visibility as exported_filter
+    from feature_extract.vfm import patch_positive_set_stats as exported_stats
+
+    assert exported_filter is filter_landmarks_by_projected_visibility
+    assert exported_stats is patch_positive_set_stats
 
 
 def _camera() -> ColmapCamera:
@@ -51,6 +61,31 @@ def test_patch_positive_sets_count_any_visible_landmark_inside_token_patch() -> 
     assert positives.by_token[center_token].count == 1
 
 
+def test_patch_positive_set_stats_report_density_and_empty_ratio() -> None:
+    token_xy = token_grid_xy(3, 3, image_width=100, image_height=100)
+    xyz = _xyz_from_xy(
+        np.stack([token_xy[4], token_xy[4] + np.asarray([10.0, 0.0]), token_xy[0]], axis=0),
+        np.asarray([5.0, 5.0, 5.0], dtype=np.float64),
+    )
+    index = LandmarkMapIndex(
+        track_ids=np.asarray([10, 11, 12], dtype=np.int64),
+        xyz=xyz,
+        features=np.ones((3, 4), dtype=np.float32),
+        mean_variances=np.zeros((3,), dtype=np.float32),
+        observation_counts=np.ones((3,), dtype=np.int64),
+        observation_image_ids=(("ref.png",), ("ref.png",), ("ref.png",)),
+    )
+
+    positives = build_patch_positive_sets(index, np.eye(4, dtype=np.float64), _camera(), 3, 3)
+    stats = patch_positive_set_stats(positives)
+
+    assert stats["token_count"] == 9
+    assert stats["positive_landmark_count"] == 3
+    assert stats["max_positives_per_token"] >= 2
+    assert stats["zero_positive_token_ratio"] > 0.0
+    assert stats["mean_positives_per_nonempty_token"] >= 1.0
+
+
 def test_patch_evaluator_counts_patch_correct_when_pixel_gt5_fails() -> None:
     query_map = np.zeros((2, 3, 3), dtype=np.float32)
     query_map[:, 1, 1] = np.asarray([1.0, 0.0], dtype=np.float32)
@@ -80,6 +115,42 @@ def test_patch_evaluator_counts_patch_correct_when_pixel_gt5_fails() -> None:
     assert stats["gt_precision_stride"] == 1.0
 
 
+def test_patch_evaluator_reports_pnp_inlier_patch_at_k() -> None:
+    query_map = np.zeros((2, 1, 2), dtype=np.float32)
+    query_map[:, 0, 0] = np.asarray([1.0, 0.0], dtype=np.float32)
+    query_map[:, 0, 1] = np.asarray([0.0, 1.0], dtype=np.float32)
+    xy = token_grid_xy(2, 1, image_width=100, image_height=100)
+    index = LandmarkMapIndex(
+        track_ids=np.asarray([1, 2], dtype=np.int64),
+        xyz=_xyz_from_xy(xy, np.asarray([5.0, 5.0], dtype=np.float64)),
+        features=np.eye(2, dtype=np.float32),
+        mean_variances=np.zeros((2,), dtype=np.float32),
+        observation_counts=np.ones((2,), dtype=np.int64),
+        observation_image_ids=(("ref.png",), ("ref.png",)),
+    )
+    matches = match_query_patches_to_landmarks(
+        query_map,
+        index,
+        PatchTo3DMatchingConfig(top_k=1, min_similarity=0.5, match_mode="nn"),
+        image_width=100,
+        image_height=100,
+    )
+    positives = build_patch_positive_sets(index, np.eye(4, dtype=np.float64), _camera(), 2, 1)
+
+    stats = evaluate_patch_matches(
+        matches,
+        positives,
+        np.eye(4, dtype=np.float64),
+        _camera(),
+        stride_px=99.0,
+        pnp_inlier_mask=np.asarray([True, False]),
+        top_k=5,
+    )
+
+    assert stats["pnp_inlier_patch_at_1"] == 1.0
+    assert stats["pnp_inlier_patch_at_5"] == 1.0
+
+
 def test_soft_mutual_topk_keeps_patch_level_many_to_one_candidates() -> None:
     query_map = np.zeros((2, 1, 2), dtype=np.float32)
     query_map[:, 0, 0] = np.asarray([1.0, 0.0], dtype=np.float32)
@@ -104,6 +175,45 @@ def test_soft_mutual_topk_keeps_patch_level_many_to_one_candidates() -> None:
     assert [(match.token_index, match.track_id) for match in matches] == [(0, 1), (1, 1)]
 
 
+def test_patch_matching_can_rank_by_landmark_quality_weighted_similarity() -> None:
+    query_map = np.zeros((2, 1, 1), dtype=np.float32)
+    query_map[:, 0, 0] = np.asarray([1.0, 0.0], dtype=np.float32)
+    index = LandmarkMapIndex(
+        track_ids=np.asarray([1, 2], dtype=np.int64),
+        xyz=np.asarray([[0.0, 0.0, 5.0], [0.0, 0.0, 6.0]], dtype=np.float64),
+        features=np.asarray([[1.0, 0.0], [0.92, 0.39]], dtype=np.float32),
+        mean_variances=np.zeros((2,), dtype=np.float32),
+        observation_counts=np.asarray([1, 20], dtype=np.int64),
+        observation_image_ids=(("ref.png",), tuple(f"ref_{idx}.png" for idx in range(20))),
+    )
+
+    matches = match_query_patches_to_landmarks(
+        query_map,
+        index,
+        PatchTo3DMatchingConfig(
+            top_k=2,
+            match_mode="nn",
+            min_similarity=0.0,
+            ratio_threshold=None,
+            landmark_quality=LandmarkQualityConfig(
+                enabled=True,
+                track_weight=1.0,
+                variance_weight=0.0,
+                reprojection_weight=0.0,
+                idf_weight=0.0,
+                ambiguity_weight=0.0,
+            ),
+        ),
+        image_width=100,
+        image_height=100,
+    )
+
+    assert len(matches) == 1
+    assert matches[0].track_id == 2
+    assert matches[0].landmark_quality is not None
+    assert matches[0].quality_weighted_similarity is not None
+
+
 def test_token_patch_boxes_cover_stride_sized_regions() -> None:
     boxes = token_patch_boxes(token_width=3, token_height=3, image_width=100, image_height=100)
 
@@ -111,3 +221,18 @@ def test_token_patch_boxes_cover_stride_sized_regions() -> None:
     assert center.center.tolist() == [49.5, 49.5]
     assert center.x0 < 49.5 < center.x1
     assert center.y0 < 49.5 < center.y1
+
+
+def test_filter_landmarks_by_projected_visibility_keeps_only_gt_visible_points() -> None:
+    index = LandmarkMapIndex(
+        track_ids=np.asarray([1, 2, 3], dtype=np.int64),
+        xyz=np.asarray([[0.0, 0.0, 5.0], [0.0, 0.0, -5.0], [10.0, 0.0, 5.0]], dtype=np.float64),
+        features=np.ones((3, 2), dtype=np.float32),
+        mean_variances=np.zeros((3,), dtype=np.float32),
+        observation_counts=np.ones((3,), dtype=np.int64),
+        observation_image_ids=(("a",), ("a",), ("a",)),
+    )
+
+    visible = filter_landmarks_by_projected_visibility(index, np.eye(4, dtype=np.float64), _camera())
+
+    assert visible.track_ids.tolist() == [1]

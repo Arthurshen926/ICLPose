@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -26,10 +27,13 @@ from feature_extract.vfm.patch_to_3d_matching import (
     PatchTo3DMatchingConfig,
     build_patch_positive_sets,
     evaluate_patch_matches,
+    filter_landmarks_by_projected_visibility,
     match_query_patches_to_landmarks,
     patch_uncertainty_pnp_threshold,
+    patch_positive_set_stats,
 )
 from feature_extract.vfm.query_to_3d_matching import (
+    LandmarkQualityConfig,
     LandmarkMapIndex,
     estimate_pose_pnp_ransac,
     filter_landmarks_by_reference_images,
@@ -45,7 +49,142 @@ def _none_to_float(value):
     return None if value is None else float(value)
 
 
+def _median_present(values: list[float | None]) -> float | None:
+    present = [float(value) for value in values if value is not None and np.isfinite(float(value))]
+    return None if not present else float(np.median(present))
+
+
+def _quantile_present(values: list[float | None], q: float) -> float | None:
+    present = [float(value) for value in values if value is not None and np.isfinite(float(value))]
+    return None if not present else float(np.quantile(present, float(q)))
+
+
+def _rate_present(values: list[bool]) -> float | None:
+    return None if not values else float(np.mean([1.0 if value else 0.0 for value in values]))
+
+
+def _safe_float(value) -> float | None:
+    if value is None:
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if np.isfinite(result) else None
+
+
+def _success(row: dict[str, object], translation_m: float, rotation_deg: float) -> bool:
+    return bool(
+        row["translation_error_m"] is not None
+        and float(row["translation_error_m"]) <= float(translation_m)
+        and row["rotation_error_deg"] is not None
+        and float(row["rotation_error_deg"]) <= float(rotation_deg)
+    )
+
+
+def _matching_config_dict(config: PatchTo3DMatchingConfig) -> dict[str, object]:
+    values = dict(config.__dict__)
+    quality = values.get("landmark_quality")
+    if isinstance(quality, LandmarkQualityConfig):
+        values["landmark_quality"] = dict(quality.__dict__)
+    return values
+
+
+def _track_id_set(index: LandmarkMapIndex) -> set[int]:
+    return {int(track_id) for track_id in np.asarray(index.track_ids).tolist()}
+
+
+def _load_reference_pose_priors(candidate_bank: str, submap_top_n: int) -> dict[str, list[dict[str, object]]]:
+    if not candidate_bank:
+        return {}
+    if submap_top_n <= 0:
+        raise ValueError("submap_top_n must be positive")
+    by_query: dict[str, list[dict[str, object]]] = {}
+    order = 0
+    for line in Path(candidate_bank).read_text().splitlines():
+        if not line.strip():
+            continue
+        item = json.loads(line)
+        if item.get("record_type") == "header":
+            continue
+        if item.get("record_type", "candidate") != "candidate":
+            continue
+        query_id = item.get("query_id")
+        reference_image = item.get("reference_image")
+        if query_id is None or reference_image is None:
+            continue
+        metadata = dict(item.get("metadata") or {})
+        pose_error = dict(item.get("pose_error") or {})
+        rank = int(metadata.get("retrieval_rank", len(by_query.get(str(query_id), [])) + 1))
+        by_query.setdefault(str(query_id), []).append(
+            {
+                "rank": rank,
+                "order": order,
+                "reference_image": str(reference_image),
+                "translation_error_m": _safe_float(pose_error.get("translation_m")),
+                "rotation_error_deg": _safe_float(pose_error.get("rotation_deg")),
+                "pose_cost_m": _safe_float(metadata.get("pose_cost_m")),
+            }
+        )
+        order += 1
+    return {
+        query_id: sorted(rows, key=lambda item: (int(item["rank"]), int(item["order"])))[:submap_top_n]
+        for query_id, rows in by_query.items()
+    }
+
+
+def _reference_prior_summary(candidates: list[dict[str, object]]) -> dict[str, object]:
+    if not candidates:
+        return {
+            "candidate_count": 0,
+            "top1_reference_image": None,
+            "top1_rank": None,
+            "top1_translation_error_m": None,
+            "top1_rotation_error_deg": None,
+            "top1_pose_cost_m": None,
+            "oracle_reference_image": None,
+            "oracle_rank": None,
+            "oracle_translation_error_m": None,
+            "oracle_rotation_error_deg": None,
+            "oracle_pose_cost_m": None,
+        }
+    top1 = candidates[0]
+
+    def oracle_key(item: dict[str, object]) -> tuple[float, float, int]:
+        pose_cost = item.get("pose_cost_m")
+        translation = item.get("translation_error_m")
+        return (
+            float(pose_cost) if pose_cost is not None else float("inf"),
+            float(translation) if translation is not None else float("inf"),
+            int(item["rank"]),
+        )
+
+    oracle = min(candidates, key=oracle_key)
+    return {
+        "candidate_count": len(candidates),
+        "top1_reference_image": top1["reference_image"],
+        "top1_rank": int(top1["rank"]),
+        "top1_translation_error_m": top1.get("translation_error_m"),
+        "top1_rotation_error_deg": top1.get("rotation_error_deg"),
+        "top1_pose_cost_m": top1.get("pose_cost_m"),
+        "oracle_reference_image": oracle["reference_image"],
+        "oracle_rank": int(oracle["rank"]),
+        "oracle_translation_error_m": oracle.get("translation_error_m"),
+        "oracle_rotation_error_deg": oracle.get("rotation_error_deg"),
+        "oracle_pose_cost_m": oracle.get("pose_cost_m"),
+    }
+
+
+def _prior_success(prior: dict[str, object], prefix: str, translation_m: float, rotation_deg: float) -> bool | None:
+    translation = prior.get(f"{prefix}_translation_error_m")
+    rotation = prior.get(f"{prefix}_rotation_error_deg")
+    if translation is None or rotation is None:
+        return None
+    return bool(float(translation) <= float(translation_m) and float(rotation) <= float(rotation_deg))
+
+
 def main(argv: Optional[Sequence[str]] = None) -> None:
+    started = time.perf_counter()
     parser = argparse.ArgumentParser(description="Evaluate patch-level query VFM token to sparse 3D landmark matching")
     parser.add_argument("--query_manifest", required=True)
     parser.add_argument("--landmark_bank", required=True)
@@ -53,7 +192,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     parser.add_argument("--visibility_index", default="")
     parser.add_argument("--query_pose_file", required=True)
     parser.add_argument("--candidate_bank", default="")
-    parser.add_argument("--submap_mode", default="reference_visibility", choices=("reference_visibility", "none"))
+    parser.add_argument("--submap_mode", default="reference_visibility", choices=("reference_visibility", "gt_visible", "none"))
     parser.add_argument("--submap_top_n", type=int, default=5)
     parser.add_argument("--max_submap_landmarks", type=int, default=20000)
     parser.add_argument("--layer_name", default="radio_final")
@@ -71,7 +210,16 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     parser.add_argument("--max_landmark_reprojection_error", type=float, default=None)
     parser.add_argument("--max_landmark_ambiguity", type=float, default=None)
     parser.add_argument("--min_distance_to_boundary_px", type=float, default=None)
+    parser.add_argument("--min_quality_weighted_similarity", type=float, default=None)
     parser.add_argument("--min_observation_count", type=int, default=2)
+    parser.add_argument("--enable_landmark_quality", action="store_true")
+    parser.add_argument("--quality_min_score", type=float, default=None)
+    parser.add_argument("--quality_min_track_length", type=int, default=None)
+    parser.add_argument("--quality_track_weight", type=float, default=1.0)
+    parser.add_argument("--quality_variance_weight", type=float, default=1.0)
+    parser.add_argument("--quality_reprojection_weight", type=float, default=1.0)
+    parser.add_argument("--quality_idf_weight", type=float, default=0.0)
+    parser.add_argument("--quality_ambiguity_weight", type=float, default=0.5)
     parser.add_argument("--quality_ambiguity_reference_size", type=int, default=4096)
     parser.add_argument("--max_matches", type=int, default=1000)
     parser.add_argument("--match_block_size", type=int, default=256)
@@ -90,7 +238,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     bank = load_selected_track_bank_npz(Path(args.landmark_bank))
     xyz_by_track, reprojection_error_by_track = _load_track_stats(Path(args.track_observations))
     landmark_index = LandmarkMapIndex.from_track_bank(bank, xyz_by_track, reprojection_error_by_track)
-    if args.max_landmark_ambiguity is not None:
+    needs_scene_ambiguity = bool(
+        args.max_landmark_ambiguity is not None
+        or (args.enable_landmark_quality and (args.quality_idf_weight > 0.0 or args.quality_ambiguity_weight > 0.0))
+    )
+    if needs_scene_ambiguity:
         landmark_index = with_landmark_ambiguity_scores(
             landmark_index,
             reference_size=args.quality_ambiguity_reference_size,
@@ -102,6 +254,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     camera_model_dir = _infer_camera_model_dir(args.query_pose_file, args.camera_model_dir)
     camera, camera_source = _load_camera_with_source(camera_model_dir, _parse_default_camera(args.default_camera))
     reference_submaps = _load_reference_submaps(args.candidate_bank, args.submap_top_n)
+    reference_pose_priors = _load_reference_pose_priors(args.candidate_bank, args.submap_top_n)
     gt_by_query = {record.image_id: record for record in parse_cambridge_pose_file(Path(args.query_pose_file))}
     config = PatchTo3DMatchingConfig(
         top_k=args.top_k,
@@ -114,10 +267,22 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         max_landmark_reprojection_error=args.max_landmark_reprojection_error,
         max_landmark_ambiguity=args.max_landmark_ambiguity,
         min_distance_to_boundary_px=args.min_distance_to_boundary_px,
+        min_quality_weighted_similarity=args.min_quality_weighted_similarity,
         min_observation_count=args.min_observation_count,
         query_token_step=args.query_token_step,
         max_matches=args.max_matches,
         block_size=args.match_block_size,
+        landmark_quality=LandmarkQualityConfig(
+            enabled=bool(args.enable_landmark_quality),
+            track_weight=args.quality_track_weight,
+            variance_weight=args.quality_variance_weight,
+            reprojection_weight=args.quality_reprojection_weight,
+            idf_weight=args.quality_idf_weight,
+            ambiguity_weight=args.quality_ambiguity_weight,
+            ambiguity_reference_size=args.quality_ambiguity_reference_size,
+            min_score=args.quality_min_score,
+            min_track_length=args.quality_min_track_length,
+        ),
     )
 
     rows = []
@@ -127,10 +292,23 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         records = records[: args.max_queries]
     for record in records:
         query_id = record.image_id
+        gt_pose = gt_by_query.get(query_id)
+        if gt_pose is None:
+            raise ValueError(f"query pose not found for {query_id}")
+        gt_visible_submap = filter_landmarks_by_projected_visibility(landmark_index, gt_pose.pose_w2c, camera)
+        gt_visible_track_ids = _track_id_set(gt_visible_submap)
         submap = landmark_index
         references = reference_submaps.get(query_id, [])
+        reference_prior = _reference_prior_summary(reference_pose_priors.get(query_id, []))
         visibility_gate = {"full_visible_tracks": None, "bank_visible_tracks": None, "bank_visibility_coverage": None}
-        if args.submap_mode == "reference_visibility":
+        if args.submap_mode == "gt_visible":
+            submap = gt_visible_submap
+            visibility_gate = {
+                "full_visible_tracks": len(submap),
+                "bank_visible_tracks": len(submap),
+                "bank_visibility_coverage": 1.0 if len(submap) else 0.0,
+            }
+        elif args.submap_mode == "reference_visibility":
             if visibility_index is None:
                 submap = filter_landmarks_by_reference_images(landmark_index, references)
                 visibility_gate = {
@@ -141,7 +319,18 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             else:
                 submap, visibility_gate = filter_landmarks_by_visibility(landmark_index, visibility_index, references)
         pre_limit_submap_count = len(submap)
+        pre_limit_submap_track_ids = _track_id_set(submap)
+        pre_limit_gt_visible_count = len(pre_limit_submap_track_ids.intersection(gt_visible_track_ids))
         submap = _limit_submap(submap, int(args.max_submap_landmarks))
+        submap_track_ids = _track_id_set(submap)
+        submap_gt_visible_count = len(submap_track_ids.intersection(gt_visible_track_ids))
+        gt_visible_count = len(gt_visible_track_ids)
+        visible_landmark_recall = (
+            float(submap_gt_visible_count / max(gt_visible_count, 1)) if gt_visible_count else None
+        )
+        pre_limit_visible_landmark_recall = (
+            float(pre_limit_gt_visible_count / max(gt_visible_count, 1)) if gt_visible_count else None
+        )
         query_feature = _load_query_feature(record.token_path, args.layer_name)
         _channels, token_height, token_width = query_feature.shape
         stride_x = float(camera.width - 1) / max(float(token_width - 1), 1.0)
@@ -154,9 +343,6 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             reprojection_error_px=patch_uncertainty_pnp_threshold(stride, args.pnp_threshold_stride_multiplier),
             iterations=args.pnp_iterations,
         )
-        gt_pose = gt_by_query.get(query_id)
-        if gt_pose is None:
-            raise ValueError(f"query pose not found for {query_id}")
         positives = build_patch_positive_sets(
             submap,
             gt_pose.pose_w2c,
@@ -174,6 +360,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             pnp_inlier_mask=pnp.inlier_mask,
             top_k=args.patch_at_k,
         )
+        positive_stats = patch_positive_set_stats(positives)
         pose_error = pnp_pose_error(pnp.pose_w2c, gt_pose.pose_w2c)
         all_spatial_stats = match_spatial_distribution_stats(matches, int(camera.width), int(camera.height))
         inlier_spatial_stats = match_spatial_distribution_stats(matches, int(camera.width), int(camera.height), pnp.inlier_mask)
@@ -196,6 +383,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                         "landmark_variance": float(match.landmark_variance),
                         "landmark_reprojection_error": match.landmark_reprojection_error,
                         "landmark_ambiguity": match.landmark_ambiguity,
+                        "landmark_quality": match.landmark_quality,
+                        "quality_weighted_similarity": match.quality_weighted_similarity,
                         "patch_correct": bool(positive is not None and int(match.track_id) in positive.track_ids),
                         "positive_count": 0 if positive is None else int(positive.count),
                         "pnp_inlier": bool(pnp.inlier_mask.shape[0] > match_idx and pnp.inlier_mask[match_idx]),
@@ -208,6 +397,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             "full_visible_tracks": visibility_gate["full_visible_tracks"],
             "bank_visible_tracks": visibility_gate["bank_visible_tracks"],
             "bank_visibility_coverage": visibility_gate["bank_visibility_coverage"],
+            "gt_visible_bank_tracks": gt_visible_count,
+            "pre_limit_submap_gt_visible_tracks": pre_limit_gt_visible_count,
+            "submap_gt_visible_tracks": submap_gt_visible_count,
+            "pre_limit_visible_landmark_recall": pre_limit_visible_landmark_recall,
+            "visible_landmark_recall": visible_landmark_recall,
+            "reference_prior": reference_prior,
             "pre_limit_submap_landmark_count": pre_limit_submap_count,
             "submap_landmark_count": len(submap),
             "projected_landmarks": projected_landmarks,
@@ -225,16 +420,22 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             "mean_similarity": _mean([float(match.similarity) for match in matches]),
             "mean_positive_count": _mean([float(item.count) for item in positives.by_token.values()]),
             "nonempty_patch_fraction": _mean([1.0 if item.count > 0 else 0.0 for item in positives.by_token.values()]),
+            "positive_set_stats": positive_stats,
             "patch_geometry": patch_stats,
             "all_match_spatial": all_spatial_stats,
             "pnp_inlier_spatial": inlier_spatial_stats,
             "pnp_reprojection": pnp_residual_stats,
+            "pnp_solve": bool(pnp.success),
             "pnp_success": bool(pnp.success),
             "pnp_inlier_count": int(pnp.inlier_count),
             "pnp_inlier_ratio": float(pnp.inlier_ratio),
             "translation_error_m": None if not np.isfinite(pose_error.translation_m) else float(pose_error.translation_m),
             "rotation_error_deg": None if not np.isfinite(pose_error.rotation_deg) else float(pose_error.rotation_deg),
         }
+        row["success_10cm_5deg"] = _success(row, 0.10, 5.0)
+        row["success_25cm_10deg"] = _success(row, 0.25, 10.0)
+        row["success_50cm_10deg"] = _success(row, 0.50, 10.0)
+        row["success_1m_10deg"] = _success(row, 1.0, 10.0)
         rows.append(row)
 
     output_jsonl = Path(args.output_jsonl)
@@ -246,8 +447,31 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         matches_path.write_text("\n".join(json.dumps(row, sort_keys=True) for row in match_rows) + ("\n" if match_rows else ""))
 
     labeled_rows = [row for row in rows if row["translation_error_m"] is not None]
+    visible_recall_values = [row["visible_landmark_recall"] for row in rows if row["visible_landmark_recall"] is not None]
+    reference_prior_rows = [dict(row["reference_prior"]) for row in rows]
+    top1_prior_flags_25 = [
+        flag
+        for flag in (_prior_success(row, "top1", 0.25, 10.0) for row in reference_prior_rows)
+        if flag is not None
+    ]
+    top1_prior_flags_50 = [
+        flag
+        for flag in (_prior_success(row, "top1", 0.50, 10.0) for row in reference_prior_rows)
+        if flag is not None
+    ]
+    oracle_prior_flags_25 = [
+        flag
+        for flag in (_prior_success(row, "oracle", 0.25, 10.0) for row in reference_prior_rows)
+        if flag is not None
+    ]
+    oracle_prior_flags_50 = [
+        flag
+        for flag in (_prior_success(row, "oracle", 0.50, 10.0) for row in reference_prior_rows)
+        if flag is not None
+    ]
     summary = {
         "stage": "patch_to_3d_vfm_matching_baseline",
+        "elapsed_sec": float(time.perf_counter() - started),
         "query_count": len(rows),
         "labeled_query_count": len(labeled_rows),
         "landmark_count": len(landmark_index),
@@ -259,7 +483,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             "params": [float(value) for value in camera.params],
         },
         "matching_config": {
-            **config.__dict__,
+            **_matching_config_dict(config),
             "pnp_threshold_stride_multiplier": float(args.pnp_threshold_stride_multiplier),
             "patch_scale": float(args.patch_scale),
             "patch_at_k": int(args.patch_at_k),
@@ -268,8 +492,70 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             "mode": args.submap_mode,
             "top_n": args.submap_top_n,
             "max_landmarks": args.max_submap_landmarks,
+            "mean_reference_count": _mean([float(row["submap_reference_count"]) for row in rows]),
             "mean_landmark_count": _mean([float(row["submap_landmark_count"]) for row in rows]),
             "mean_projected_landmarks": _mean([float(row["projected_landmarks"]) for row in rows]),
+        },
+        "visible_landmark_recall": {
+            "mean": _mean([float(value) for value in visible_recall_values]),
+            "median": _median_present([float(value) for value in visible_recall_values]),
+            "p25": _quantile_present([float(value) for value in visible_recall_values], 0.25),
+            "p75": _quantile_present([float(value) for value in visible_recall_values], 0.75),
+            "mean_gt_visible_bank_tracks": _mean([float(row["gt_visible_bank_tracks"]) for row in rows]),
+            "mean_submap_gt_visible_tracks": _mean([float(row["submap_gt_visible_tracks"]) for row in rows]),
+            "mean_pre_limit_submap_gt_visible_tracks": _mean(
+                [float(row["pre_limit_submap_gt_visible_tracks"]) for row in rows]
+            ),
+            "mean_pre_limit_recall": _mean(
+                [
+                    float(row["pre_limit_visible_landmark_recall"])
+                    for row in rows
+                    if row["pre_limit_visible_landmark_recall"] is not None
+                ]
+            ),
+        },
+        "reference_prior": {
+            "mean_candidate_count": _mean([float(row["candidate_count"]) for row in reference_prior_rows]),
+            "top1": {
+                "median_translation_error_m": _median_present(
+                    [row["top1_translation_error_m"] for row in reference_prior_rows]
+                ),
+                "median_rotation_error_deg": _median_present(
+                    [row["top1_rotation_error_deg"] for row in reference_prior_rows]
+                ),
+                "success_25cm_10deg": _rate_present(top1_prior_flags_25),
+                "success_50cm_10deg": _rate_present(top1_prior_flags_50),
+            },
+            "oracle": {
+                "median_translation_error_m": _median_present(
+                    [row["oracle_translation_error_m"] for row in reference_prior_rows]
+                ),
+                "median_rotation_error_deg": _median_present(
+                    [row["oracle_rotation_error_deg"] for row in reference_prior_rows]
+                ),
+                "success_25cm_10deg": _rate_present(oracle_prior_flags_25),
+                "success_50cm_10deg": _rate_present(oracle_prior_flags_50),
+            },
+        },
+        "positive_set_summary": {
+            "mean_visible_landmark_count": _mean([float(row["positive_set_stats"]["visible_landmark_count"]) for row in rows]),
+            "mean_positive_landmark_count": _mean([float(row["positive_set_stats"]["positive_landmark_count"]) for row in rows]),
+            "mean_positives_per_token": _mean([float(row["positive_set_stats"]["mean_positives_per_token"]) for row in rows]),
+            "median_positives_per_token": _median_present(
+                [float(row["positive_set_stats"]["median_positives_per_token"]) for row in rows]
+            ),
+            "mean_positives_per_nonempty_token": _mean(
+                [float(row["positive_set_stats"]["mean_positives_per_nonempty_token"]) for row in rows]
+            ),
+            "mean_zero_positive_token_ratio": _mean(
+                [float(row["positive_set_stats"]["zero_positive_token_ratio"]) for row in rows]
+            ),
+            "mean_nonempty_patch_fraction": _mean(
+                [float(row["positive_set_stats"]["nonempty_patch_fraction"]) for row in rows]
+            ),
+            "mean_positive_landmark_density_per_token": _mean(
+                [float(row["positive_set_stats"]["positive_landmark_density_per_token"]) for row in rows]
+            ),
         },
         "mean_match_count": _mean([float(row["match_count"]) for row in rows]),
         "mean_patch_at_1": _mean([float(row["patch_geometry"]["patch_at_1"]) for row in rows]),
@@ -278,14 +564,21 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         "mean_gt_precision_16px": _mean([float(row["patch_geometry"]["gt_precision_16px"]) for row in rows]),
         "mean_gt_precision_stride": _mean([float(row["patch_geometry"]["gt_precision_stride"]) for row in rows]),
         "mean_gt_precision_2stride": _mean([float(row["patch_geometry"]["gt_precision_2stride"]) for row in rows]),
-        "median_gt_reproj_median_px": None
-        if not rows
-        else float(np.median([float(row["patch_geometry"]["gt_reproj_median_px"]) for row in rows if row["patch_geometry"]["gt_reproj_median_px"] is not None])),
+        "median_gt_reproj_median_px": _median_present(
+            [row["patch_geometry"]["gt_reproj_median_px"] for row in rows]
+        ),
         "mean_pnp_inlier_patch_at_1": _mean(
             [
                 float(row["patch_geometry"]["pnp_inlier_patch_at_1"])
                 for row in rows
                 if row["patch_geometry"]["pnp_inlier_patch_at_1"] is not None
+            ]
+        ),
+        f"mean_pnp_inlier_patch_at_{int(args.patch_at_k)}": _mean(
+            [
+                float(row["patch_geometry"][f"pnp_inlier_patch_at_{int(args.patch_at_k)}"])
+                for row in rows
+                if row["patch_geometry"].get(f"pnp_inlier_patch_at_{int(args.patch_at_k)}") is not None
             ]
         ),
         "mean_pnp_inlier_gt_precision_stride": _mean(
@@ -295,6 +588,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 if row["patch_geometry"]["pnp_inlier_gt_precision_stride"] is not None
             ]
         ),
+        "mean_pnp_inlier_count": _mean([float(row["pnp_inlier_count"]) for row in rows]),
+        "mean_pnp_inlier_ratio": _mean([float(row["pnp_inlier_ratio"]) for row in rows]),
         "mean_pnp_reproj_inlier_median_px": _mean(
             [
                 float(row["pnp_reprojection"]["pnp_reproj_inlier_median_px"])
@@ -316,18 +611,40 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 if row["pnp_inlier_spatial"].get("grid_4x4_occupancy_frac") is not None
             ]
         ),
-        "pnp_success_rate": _mean([1.0 if row["pnp_success"] else 0.0 for row in rows]),
-        "success_25cm_10deg": _mean(
+        "mean_pnp_inlier_convex_hull_area_frac": _mean(
             [
-                1.0
-                if row["translation_error_m"] is not None
-                and row["translation_error_m"] <= 0.25
-                and row["rotation_error_deg"] is not None
-                and row["rotation_error_deg"] <= 10.0
-                else 0.0
-                for row in labeled_rows
+                float(row["pnp_inlier_spatial"]["convex_hull_area_frac"])
+                for row in rows
+                if row["pnp_inlier_spatial"].get("convex_hull_area_frac") is not None
             ]
         ),
+        "mean_pnp_inlier_depth_range_m": _mean(
+            [
+                float(row["pnp_inlier_spatial"]["depth_range_m"])
+                for row in rows
+                if row["pnp_inlier_spatial"].get("depth_range_m") is not None
+            ]
+        ),
+        "mean_pnp_inlier_xyz_planarity_ratio": _mean(
+            [
+                float(row["pnp_inlier_spatial"]["xyz_planarity_ratio"])
+                for row in rows
+                if row["pnp_inlier_spatial"].get("xyz_planarity_ratio") is not None
+            ]
+        ),
+        "mean_pnp_inlier_xyz_linearity_ratio": _mean(
+            [
+                float(row["pnp_inlier_spatial"]["xyz_linearity_ratio"])
+                for row in rows
+                if row["pnp_inlier_spatial"].get("xyz_linearity_ratio") is not None
+            ]
+        ),
+        "pnp_solve_rate": _mean([1.0 if row["pnp_solve"] else 0.0 for row in rows]),
+        "pnp_success_rate": _mean([1.0 if row["pnp_success"] else 0.0 for row in rows]),
+        "success_10cm_5deg": _mean([1.0 if row["success_10cm_5deg"] else 0.0 for row in labeled_rows]),
+        "success_25cm_10deg": _mean([1.0 if row["success_25cm_10deg"] else 0.0 for row in labeled_rows]),
+        "success_50cm_10deg": _mean([1.0 if row["success_50cm_10deg"] else 0.0 for row in labeled_rows]),
+        "success_1m_10deg": _mean([1.0 if row["success_1m_10deg"] else 0.0 for row in labeled_rows]),
         "median_translation_error_m": None
         if not labeled_rows
         else float(np.median([float(row["translation_error_m"]) for row in labeled_rows])),
