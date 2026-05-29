@@ -2025,6 +2025,115 @@ Immediate implication for the next method step:
 6. Keep dense render out of the main path until sparse landmark matching has a
    reliable geometric verifier.
 
+## Stage C1: Supervised Linear Patch Selector
+
+Stage C1 is now implemented as the deliberately small learned selector baseline:
+
+```text
+raw VFM token / landmark feature
+-> bias-free shared Linear(C, D)
+-> L2-normalized descriptor
+```
+
+The training signal is patch-to-landmark-set supervision, not reference-pose
+reranking. For each query token, positives are the GT-visible landmarks whose
+projection falls inside the token patch. Negatives are hard same-submap
+landmarks selected by raw VFM false-nearest similarity after excluding all
+landmarks positive for that patch.
+
+Implemented files:
+
+- `feature_extract/vfm/patch_selector_training.py`
+  - multi-positive patch InfoNCE
+  - linear selector training and export as `FeatureCompressionTransform`
+  - token-limited batched hard-negative mining
+  - NPZ sample cache round-trip for repeated seeds without repeated mining
+- `feature_extract/tools/vfm/train_stage_c1_patch_selector.py`
+  - trains from train query tokens, COLMAP/SfM landmarks, GT train poses,
+    fixed candidate submaps and optional visibility index
+  - writes a learned transform
+  - optionally exports compressed query tokens and a compressed landmark bank
+- `feature_extract/tools/vfm/summarize_stage_c1_patch_selector.py`
+  - aggregates learned/random/PCA/raw runs into seed mean/std/best tables
+- `tests/test_vfm_stage_c1_patch_selector.py`
+  - supervised toy convergence
+  - patch-positive/hard-negative sample construction
+  - token limit before hard-negative search
+  - sample cache reuse
+  - CLI transform/bank export smoke
+- `tests/test_vfm_stage_c1_summary.py`
+  - learned multi-seed summary
+  - untrained control summary
+
+Protocol used for the full C1 held-out check:
+
+- Train split only for selector fitting.
+- Held-out test split for patch-to-3D localization evaluation.
+- Same Stage C0 evaluator and same fixed `reference top10` submap protocol.
+- Same sparse landmark path; no dense render.
+- Same matching default: `MNN`, `top_k=1`, `mutual_top_k=1`,
+  `min_similarity=0.2`, stride-aware PnP.
+- Random controls use seeds `0..4`; seed0 is the Stage C0 run and seeds
+  `1..4` are in the C1 final directory.
+- Learned controls use seeds `0..4`.
+- OldHospital now uses all 895 train-query records to build the sample cache,
+  capped at `24000` sampled patch examples.
+- ShopFacade uses all available train-query records to build the sample cache,
+  capped at `12000` sampled patch examples.
+
+Five-seed C1 summary:
+
+| Scene | Method | Dim | Seeds | S@25 mean/std/best | S@50 mean | Median t mean/best | PnP-inlier Patch@1 mean |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| OldHospital | raw | 1280 | 1 | 0.209 / 0.000 / 0.209 | 0.577 | 0.435m / 0.435m | 0.437 |
+| OldHospital | random | 128 | 5 | 0.199 / 0.029 / 0.236 | 0.551 | 0.457m / 0.427m | 0.414 |
+| OldHospital | random | 64 | 5 | 0.195 / 0.019 / 0.214 | 0.519 | 0.478m / 0.447m | 0.400 |
+| OldHospital | learned | 128 | 5 | 0.290 / 0.012 / 0.302 | 0.652 | 0.367m / 0.341m | 0.511 |
+| OldHospital | learned | 64 | 5 | 0.279 / 0.029 / 0.324 | 0.638 | 0.377m / 0.360m | 0.507 |
+| ShopFacade | raw | 1280 | 1 | 0.786 / 0.000 / 0.786 | 0.932 | 0.170m / 0.170m | 0.407 |
+| ShopFacade | random | 128 | 5 | 0.728 / 0.031 / 0.767 | 0.936 | 0.177m / 0.168m | 0.387 |
+| ShopFacade | random | 64 | 5 | 0.724 / 0.029 / 0.767 | 0.909 | 0.166m / 0.159m | 0.371 |
+| ShopFacade | learned | 128 | 5 | 0.806 / 0.012 / 0.816 | 0.932 | 0.147m / 0.143m | 0.451 |
+| ShopFacade | learned | 64 | 5 | 0.814 / 0.029 / 0.835 | 0.932 | 0.149m / 0.135m | 0.444 |
+
+Full tables:
+
+- `output/vfm/stage_c1_patch_selector_final/stage_c1_summary.md`
+- `output/vfm/stage_c1_patch_selector_final/stage_c1_summary.csv`
+- `output/vfm/stage_c1_patch_selector_final/stage_c1_summary.json`
+
+Artifacts:
+
+- `output/vfm/stage_c1_patch_selector_final/shopfacade/learned64_seed{0..4}/`
+- `output/vfm/stage_c1_patch_selector_final/shopfacade/learned128_seed{0..4}/`
+- `output/vfm/stage_c1_patch_selector_final/shopfacade/random64_seed{1..4}/`
+- `output/vfm/stage_c1_patch_selector_final/shopfacade/random128_seed{1..4}/`
+- `output/vfm/stage_c1_patch_selector_final/oldhospital/learned64_seed{0..4}/`
+- `output/vfm/stage_c1_patch_selector_final/oldhospital/learned128_seed{0..4}/`
+- `output/vfm/stage_c1_patch_selector_final/oldhospital/random64_seed{1..4}/`
+- `output/vfm/stage_c1_patch_selector_final/oldhospital/random128_seed{1..4}/`
+
+Important caveats:
+
+- This completes C1 for OldHospital and ShopFacade, not for all Cambridge
+  scenes. Kings/Great/StMary still require matching raw token/landmark banks
+  before they can enter this table.
+- Patch@5 is logged, but the fixed default matching protocol is MNN top1, so
+  Patch@5 collapses to Patch@1 for the main pose table. A separate soft-mutual
+  topK diagnostic is still needed if Patch@5 is used as a ranking-quality
+  metric.
+- Training and eval use different fixed candidate-submap sources:
+  train uses `*_train_pose_neighbors_top10.jsonl`, held-out eval uses
+  `*_reference_pose_top10_fixed.jsonl`. This should be reported explicitly in
+  any paper table.
+- The C1 compression/export summaries still reuse the Stage C0 export tool, so
+  the JSON `stage` field can say `stage_c0_nonlearned_feature_compression` even
+  when the input transform is learned. The surrounding C1 train/eval paths are
+  the authoritative provenance.
+- Learned64/128 beating random mean and improving PnP-inlier Patch@1 on both
+  scenes is now the strongest evidence that supervised patch-level selector
+  training is solving a descriptor problem rather than only compressing.
+
 ## Remaining Paper-Critical Gaps
 
 1. Real raw VFM token extraction:
