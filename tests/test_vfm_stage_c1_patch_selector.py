@@ -182,6 +182,61 @@ def test_stage_c1_sample_builder_uses_patch_positives_and_hard_raw_negatives():
     assert samples.metadata["raw_false_nearest_negative_count"] == 1
 
 
+def test_stage_c1_sample_builder_can_mine_negatives_with_alternate_descriptor_space():
+    from feature_extract.vfm.patch_selector_training import (
+        PatchSelectorSampleConfig,
+        build_patch_selector_samples_for_query,
+    )
+
+    camera = ColmapCamera(camera_id=1, model_id=0, width=5, height=5, params=(4.0, 2.0, 2.0))
+    landmark_index = LandmarkMapIndex(
+        track_ids=np.asarray([10, 20, 30], dtype=np.int64),
+        xyz=np.asarray([[0.0, 0.0, 4.0], [-0.6, 0.0, 4.0], [-0.8, 0.0, 4.0]], dtype=np.float64),
+        features=np.asarray(
+            [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.95, 0.05, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+            ],
+            dtype=np.float32,
+        ),
+        mean_variances=np.zeros((3,), dtype=np.float32),
+        observation_counts=np.ones((3,), dtype=np.int64) * 3,
+        observation_image_ids=(("ref_a.png",), ("ref_b.png",), ("ref_c.png",)),
+    )
+    query_feature = np.zeros((4, 2, 2), dtype=np.float32)
+    query_feature[:, 1, 1] = np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    mining_query_feature = np.zeros((2, 2, 2), dtype=np.float32)
+    mining_query_feature[:, 1, 1] = np.asarray([0.0, 1.0], dtype=np.float32)
+    mining_landmark_features = np.asarray(
+        [
+            [1.0, 0.0],
+            [0.2, 0.8],
+            [0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    positives = build_patch_positive_sets(landmark_index, np.eye(4, dtype=np.float64), camera, token_width=2, token_height=2)
+
+    samples = build_patch_selector_samples_for_query(
+        query_feature,
+        landmark_index,
+        positives,
+        PatchSelectorSampleConfig(
+            max_tokens_per_query=1,
+            max_positives_per_token=1,
+            hard_negatives_per_token=1,
+            query_token_step=1,
+            seed=3,
+        ),
+        negative_mining_query_feature_map=mining_query_feature,
+        negative_mining_landmark_features=mining_landmark_features,
+    )
+
+    np.testing.assert_allclose(samples.negative_features[0, 0], landmark_index.features[2])
+    assert samples.metadata["negative_mining_descriptor"] == "alternate"
+
+
 def test_stage_c1_sample_builder_batches_hard_negative_search_after_token_limit(monkeypatch):
     import feature_extract.vfm.patch_selector_training as training
     from feature_extract.vfm.patch_to_3d_matching import PatchPositiveSet, PatchPositiveSets, TokenPatchBox
@@ -375,6 +430,100 @@ def test_stage_c1_training_set_npz_round_trip(tmp_path: Path):
     np.testing.assert_allclose(loaded.negative_features, samples.negative_features)
     assert metadata["scene"] == "toy"
     assert metadata["seed"] == 3
+
+
+def test_stage_c1_incremental_sample_merge_caps_and_preserves_distances():
+    from feature_extract.vfm.patch_selector_training import (
+        PatchSelectorTrainingSet,
+        append_patch_selector_training_set_capped,
+    )
+
+    def make_samples(offset: int, count: int) -> PatchSelectorTrainingSet:
+        query = np.arange(offset, offset + count * 2, dtype=np.float32).reshape(count, 2)
+        positives = np.repeat(query[:, None, :], repeats=1, axis=1)
+        negatives = np.repeat(query[:, None, :], repeats=2, axis=1) * -1.0
+        return PatchSelectorTrainingSet(
+            query_features=query,
+            positive_features=positives,
+            positive_mask=np.ones((count, 1), dtype=bool),
+            negative_features=negatives,
+            positive_reprojection_distances=np.full((count, 1), float(offset), dtype=np.float32),
+            negative_reprojection_distances=np.full((count, 2), float(offset + 1), dtype=np.float32),
+            metadata={"sample_count": count},
+        )
+
+    merged = append_patch_selector_training_set_capped(None, make_samples(0, 3), max_samples=5, seed=7)
+    merged = append_patch_selector_training_set_capped(merged, make_samples(100, 4), max_samples=5, seed=7)
+
+    assert merged.sample_count == 5
+    assert merged.metadata["source_set_count"] == 2
+    assert merged.metadata["has_reprojection_distances"] is True
+    assert merged.positive_reprojection_distances is not None
+    assert merged.negative_reprojection_distances is not None
+    assert merged.positive_reprojection_distances.shape == (5, 1)
+    assert merged.negative_reprojection_distances.shape == (5, 2)
+
+
+def test_stage_c1_cli_can_build_sample_cache_only_without_training(tmp_path: Path, monkeypatch):
+    import feature_extract.tools.vfm.train_stage_c1_patch_selector as cli
+    from feature_extract.vfm.patch_selector_training import (
+        PatchSelectorTrainingSet,
+        load_patch_selector_training_set_npz,
+        save_patch_selector_training_set_npz,
+    )
+
+    samples = PatchSelectorTrainingSet(
+        query_features=np.eye(4, dtype=np.float32),
+        positive_features=np.eye(4, dtype=np.float32)[:, None, :],
+        positive_mask=np.ones((4, 1), dtype=bool),
+        negative_features=np.flipud(np.eye(4, dtype=np.float32))[:, None, :],
+        metadata={"source": "cached"},
+    )
+    sample_cache = tmp_path / "samples.npz"
+    save_patch_selector_training_set_npz(samples, sample_cache)
+
+    def fail_if_training_runs(*_args, **_kwargs):
+        raise AssertionError("training should not run in --build_sample_cache_only mode")
+
+    monkeypatch.setattr(cli, "train_linear_patch_selector", fail_if_training_runs)
+    output_dir = tmp_path / "out"
+    written_cache = output_dir / "limited_samples.npz"
+    cli.main(
+        [
+            "--query_manifest",
+            str(tmp_path / "unused_manifest.json"),
+            "--landmark_bank",
+            str(tmp_path / "unused_bank.npz"),
+            "--track_observations",
+            str(tmp_path / "unused_tracks.jsonl"),
+            "--query_pose_file",
+            str(tmp_path / "unused_poses.txt"),
+            "--sample_cache",
+            str(sample_cache),
+            "--write_sample_cache",
+            str(written_cache),
+            "--build_sample_cache_only",
+            "--max_train_samples",
+            "2",
+            "--output_dim",
+            "2",
+            "--steps",
+            "2",
+            "--batch_size",
+            "1",
+            "--output_transform",
+            str(output_dir / "transform.npz"),
+            "--summary_json",
+            str(output_dir / "summary.json"),
+        ]
+    )
+
+    limited, _metadata = load_patch_selector_training_set_npz(written_cache)
+    assert limited.sample_count == 2
+    assert not (output_dir / "transform.npz").exists()
+    summary = json.loads((output_dir / "summary.json").read_text())
+    assert summary["cache_only"] is True
+    assert summary["sample_summary"]["sample_count"] == 2
 
 
 def test_stage_c1_cli_reuses_sample_cache(tmp_path: Path, monkeypatch):

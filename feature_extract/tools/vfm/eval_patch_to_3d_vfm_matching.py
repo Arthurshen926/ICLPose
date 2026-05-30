@@ -36,11 +36,14 @@ from feature_extract.vfm.patch_to_3d_matching import (
 from feature_extract.vfm.query_to_3d_matching import (
     LandmarkQualityConfig,
     LandmarkMapIndex,
+    LocalGeometricConsistencyConfig,
+    MapReliabilityConfig,
     estimate_pose_pnp_ransac,
     filter_landmarks_by_reference_images,
     match_spatial_distribution_stats,
     pnp_pose_error,
     pnp_reprojection_residual_stats,
+    select_pnp_matches_by_map_reliability,
     with_landmark_ambiguity_scores,
 )
 from feature_extract.vfm.tokens import TokenBankManifest
@@ -88,11 +91,104 @@ def _matching_config_dict(config: PatchTo3DMatchingConfig) -> dict[str, object]:
     quality = values.get("landmark_quality")
     if isinstance(quality, LandmarkQualityConfig):
         values["landmark_quality"] = dict(quality.__dict__)
+    reliability = values.get("map_reliability")
+    if isinstance(reliability, MapReliabilityConfig):
+        values["map_reliability"] = dict(reliability.__dict__)
+    local = values.get("local_geometric_consistency")
+    if isinstance(local, LocalGeometricConsistencyConfig):
+        values["local_geometric_consistency"] = dict(local.__dict__)
     return values
 
 
 def _track_id_set(index: LandmarkMapIndex) -> set[int]:
     return {int(track_id) for track_id in np.asarray(index.track_ids).tolist()}
+
+
+def _map_reliability_stats(matches, mask: np.ndarray | None = None) -> dict[str, float | int | None]:
+    if mask is None:
+        selected = np.ones((len(matches),), dtype=bool)
+    else:
+        selected = np.asarray(mask, dtype=bool).reshape(-1)
+        if selected.shape[0] != len(matches):
+            raise ValueError("map reliability mask must have one value per match")
+    values = [
+        float(match.map_reliability)
+        for match, keep in zip(matches, selected)
+        if bool(keep) and match.map_reliability is not None
+    ]
+    scales = [
+        float(match.pnp_uncertainty_scale)
+        for match, keep in zip(matches, selected)
+        if bool(keep) and match.pnp_uncertainty_scale is not None
+    ]
+    if not values:
+        return {
+            "count": 0,
+            "mean": None,
+            "median": None,
+            "p10": None,
+            "p90": None,
+            "mean_uncertainty_scale": None,
+            "median_uncertainty_scale": None,
+        }
+    return {
+        "count": int(len(values)),
+        "mean": float(np.mean(values)),
+        "median": float(np.median(values)),
+        "p10": float(np.quantile(values, 0.10)),
+        "p90": float(np.quantile(values, 0.90)),
+        "mean_uncertainty_scale": None if not scales else float(np.mean(scales)),
+        "median_uncertainty_scale": None if not scales else float(np.median(scales)),
+    }
+
+
+def _local_consistency_stats(matches, mask: np.ndarray | None = None) -> dict[str, float | int | None]:
+    if mask is None:
+        selected = np.ones((len(matches),), dtype=bool)
+    else:
+        selected = np.asarray(mask, dtype=bool).reshape(-1)
+        if selected.shape[0] != len(matches):
+            raise ValueError("local consistency mask must have one value per match")
+    supports = [
+        int(match.local_consistency_support)
+        for match, keep in zip(matches, selected)
+        if bool(keep) and match.local_consistency_support is not None
+    ]
+    scores = [
+        float(match.local_consistency_score)
+        for match, keep in zip(matches, selected)
+        if bool(keep) and match.local_consistency_score is not None
+    ]
+    if not supports:
+        return {
+            "count": 0,
+            "mean_support": None,
+            "median_support": None,
+            "mean_score": None,
+            "median_score": None,
+        }
+    return {
+        "count": int(len(supports)),
+        "mean_support": float(np.mean(supports)),
+        "median_support": float(np.median(supports)),
+        "mean_score": None if not scores else float(np.mean(scores)),
+        "median_score": None if not scores else float(np.median(scores)),
+    }
+
+
+def _full_inlier_mask(matches, pnp_matches, pnp_mask: np.ndarray) -> np.ndarray:
+    full = np.zeros((len(matches),), dtype=bool)
+    if not matches or not pnp_matches:
+        return full
+    positions = {id(match): idx for idx, match in enumerate(matches)}
+    local_mask = np.asarray(pnp_mask, dtype=bool).reshape(-1)
+    for local_idx, pnp_match in enumerate(pnp_matches):
+        if local_idx >= local_mask.shape[0] or not bool(local_mask[local_idx]):
+            continue
+        match_idx = positions.get(id(pnp_match))
+        if match_idx is not None:
+            full[match_idx] = True
+    return full
 
 
 def _load_reference_pose_priors(candidate_bank: str, submap_top_n: int) -> dict[str, list[dict[str, object]]]:
@@ -222,6 +318,26 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     parser.add_argument("--quality_idf_weight", type=float, default=0.0)
     parser.add_argument("--quality_ambiguity_weight", type=float, default=0.5)
     parser.add_argument("--quality_ambiguity_reference_size", type=int, default=4096)
+    parser.add_argument("--enable_map_reliability_prior", action="store_true")
+    parser.add_argument("--map_reliability_min_score", type=float, default=None)
+    parser.add_argument("--map_reliability_filter_keep_fraction", type=float, default=None)
+    parser.add_argument("--map_reliability_pnp_keep_fraction", type=float, default=None)
+    parser.add_argument("--map_reliability_track_weight", type=float, default=1.0)
+    parser.add_argument("--map_reliability_variance_weight", type=float, default=1.0)
+    parser.add_argument("--map_reliability_reprojection_weight", type=float, default=1.0)
+    parser.add_argument("--map_reliability_idf_weight", type=float, default=0.0)
+    parser.add_argument("--map_reliability_ambiguity_weight", type=float, default=0.5)
+    parser.add_argument("--map_reliability_view_angle_weight", type=float, default=0.0)
+    parser.add_argument("--map_reliability_ambiguity_reference_size", type=int, default=4096)
+    parser.add_argument("--map_reliability_uncertainty_min_scale", type=float, default=0.75)
+    parser.add_argument("--map_reliability_uncertainty_max_scale", type=float, default=2.0)
+    parser.add_argument("--enable_local_geometric_consistency", action="store_true")
+    parser.add_argument("--local_consistency_image_radius_px", type=float, default=96.0)
+    parser.add_argument("--local_consistency_xyz_radius_m", type=float, default=2.0)
+    parser.add_argument("--local_consistency_min_support", type=int, default=1)
+    parser.add_argument("--local_consistency_min_score", type=float, default=None)
+    parser.add_argument("--local_consistency_keep_fraction", type=float, default=None)
+    parser.add_argument("--local_consistency_max_input_matches", type=int, default=None)
     parser.add_argument("--max_matches", type=int, default=1000)
     parser.add_argument("--match_block_size", type=int, default=256)
     parser.add_argument("--similarity_device", default="cpu")
@@ -232,11 +348,15 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     )
     parser.add_argument("--safe_pairwise_checkpoint", default="")
     parser.add_argument("--pairwise_inlier_weight", type=float, default=0.0)
+    parser.add_argument("--pairwise_filter_keep_fraction", type=float, default=None)
+    parser.add_argument("--pairwise_filter_min_logit", type=float, default=None)
+    parser.add_argument("--pairwise_filter_min_logprob", type=float, default=None)
     parser.add_argument("--pairwise_device", default="")
     parser.add_argument("--pairwise_batch_size", type=int, default=65536)
     parser.add_argument("--patch_scale", type=float, default=1.0)
     parser.add_argument("--patch_at_k", type=int, default=5)
     parser.add_argument("--pnp_threshold_stride_multiplier", type=float, default=1.5)
+    parser.add_argument("--pnp_min_inliers", type=int, default=0)
     parser.add_argument("--pnp_iterations", type=int, default=1000)
     parser.add_argument("--max_queries", type=int, default=0)
     parser.add_argument("--output_jsonl", required=True)
@@ -252,11 +372,15 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     needs_scene_ambiguity = bool(
         args.max_landmark_ambiguity is not None
         or (args.enable_landmark_quality and (args.quality_idf_weight > 0.0 or args.quality_ambiguity_weight > 0.0))
+        or (
+            args.enable_map_reliability_prior
+            and (args.map_reliability_idf_weight > 0.0 or args.map_reliability_ambiguity_weight > 0.0)
+        )
     )
     if needs_scene_ambiguity:
         landmark_index = with_landmark_ambiguity_scores(
             landmark_index,
-            reference_size=args.quality_ambiguity_reference_size,
+            reference_size=max(args.quality_ambiguity_reference_size, args.map_reliability_ambiguity_reference_size),
             block_size=args.match_block_size,
         )
     visibility_index = None
@@ -285,6 +409,33 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         block_size=args.match_block_size,
         similarity_device=args.similarity_device,
         match_score_mode=args.match_score_mode,
+        pairwise_filter_keep_fraction=args.pairwise_filter_keep_fraction,
+        pairwise_filter_min_logit=args.pairwise_filter_min_logit,
+        pairwise_filter_min_logprob=args.pairwise_filter_min_logprob,
+        map_reliability=MapReliabilityConfig(
+            enabled=bool(args.enable_map_reliability_prior),
+            track_weight=float(args.map_reliability_track_weight),
+            variance_weight=float(args.map_reliability_variance_weight),
+            reprojection_weight=float(args.map_reliability_reprojection_weight),
+            idf_weight=float(args.map_reliability_idf_weight),
+            ambiguity_weight=float(args.map_reliability_ambiguity_weight),
+            view_angle_weight=float(args.map_reliability_view_angle_weight),
+            ambiguity_reference_size=int(args.map_reliability_ambiguity_reference_size),
+            min_score=args.map_reliability_min_score,
+            filter_keep_fraction=args.map_reliability_filter_keep_fraction,
+            pnp_keep_fraction=args.map_reliability_pnp_keep_fraction,
+            uncertainty_min_scale=float(args.map_reliability_uncertainty_min_scale),
+            uncertainty_max_scale=float(args.map_reliability_uncertainty_max_scale),
+        ),
+        local_geometric_consistency=LocalGeometricConsistencyConfig(
+            enabled=bool(args.enable_local_geometric_consistency),
+            image_radius_px=float(args.local_consistency_image_radius_px),
+            xyz_radius_m=float(args.local_consistency_xyz_radius_m),
+            min_support=args.local_consistency_min_support,
+            min_score=args.local_consistency_min_score,
+            keep_fraction=args.local_consistency_keep_fraction,
+            max_input_matches=args.local_consistency_max_input_matches,
+        ),
         landmark_quality=LandmarkQualityConfig(
             enabled=bool(args.enable_landmark_quality),
             track_weight=args.quality_track_weight,
@@ -365,12 +516,21 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             pairwise_inlier_scorer=pairwise_scorer,
             pairwise_inlier_weight=float(args.pairwise_inlier_weight),
         )
-        pnp = estimate_pose_pnp_ransac(
+        pnp_matches = select_pnp_matches_by_map_reliability(
             matches,
+            keep_fraction=config.map_reliability.pnp_keep_fraction if config.map_reliability.enabled else None,
+            min_score=None,
+        )
+        pnp = estimate_pose_pnp_ransac(
+            pnp_matches,
             camera,
             reprojection_error_px=patch_uncertainty_pnp_threshold(stride, args.pnp_threshold_stride_multiplier),
             iterations=args.pnp_iterations,
+            min_inliers=int(args.pnp_min_inliers),
         )
+        full_pnp_inlier_mask = _full_inlier_mask(matches, pnp_matches, pnp.inlier_mask)
+        pnp_match_ids = {id(match) for match in pnp_matches}
+        pnp_selected_mask = np.asarray([id(match) in pnp_match_ids for match in matches], dtype=bool)
         positives = build_patch_positive_sets(
             submap,
             gt_pose.pose_w2c,
@@ -385,14 +545,30 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             gt_pose.pose_w2c,
             camera,
             stride_px=stride,
-            pnp_inlier_mask=pnp.inlier_mask,
+            pnp_inlier_mask=full_pnp_inlier_mask,
             top_k=args.patch_at_k,
         )
         positive_stats = patch_positive_set_stats(positives)
         pose_error = pnp_pose_error(pnp.pose_w2c, gt_pose.pose_w2c)
         all_spatial_stats = match_spatial_distribution_stats(matches, int(camera.width), int(camera.height))
-        inlier_spatial_stats = match_spatial_distribution_stats(matches, int(camera.width), int(camera.height), pnp.inlier_mask)
-        pnp_residual_stats = pnp_reprojection_residual_stats(matches, pnp.pose_w2c, camera, inlier_mask=pnp.inlier_mask)
+        inlier_spatial_stats = match_spatial_distribution_stats(
+            matches,
+            int(camera.width),
+            int(camera.height),
+            full_pnp_inlier_mask,
+        )
+        pnp_residual_stats = pnp_reprojection_residual_stats(
+            matches,
+            pnp.pose_w2c,
+            camera,
+            inlier_mask=full_pnp_inlier_mask,
+        )
+        reliability_all_stats = _map_reliability_stats(matches)
+        reliability_pnp_stats = _map_reliability_stats(matches, pnp_selected_mask)
+        reliability_inlier_stats = _map_reliability_stats(matches, full_pnp_inlier_mask)
+        local_all_stats = _local_consistency_stats(matches)
+        local_pnp_stats = _local_consistency_stats(matches, pnp_selected_mask)
+        local_inlier_stats = _local_consistency_stats(matches, full_pnp_inlier_mask)
         projected_landmarks = count_projected_landmarks(submap, gt_pose.pose_w2c, camera)
         if args.output_matches_jsonl:
             positive_by_token = positives.by_token
@@ -416,9 +592,16 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                         "pairwise_inlier_logit": match.pairwise_inlier_logit,
                         "pairwise_inlier_logprob": match.pairwise_inlier_logprob,
                         "pairwise_weighted_similarity": match.pairwise_weighted_similarity,
+                        "map_reliability": match.map_reliability,
+                        "pnp_uncertainty_scale": match.pnp_uncertainty_scale,
+                        "local_consistency_support": match.local_consistency_support,
+                        "local_consistency_score": match.local_consistency_score,
                         "patch_correct": bool(positive is not None and int(match.track_id) in positive.track_ids),
                         "positive_count": 0 if positive is None else int(positive.count),
-                        "pnp_inlier": bool(pnp.inlier_mask.shape[0] > match_idx and pnp.inlier_mask[match_idx]),
+                        "pnp_inlier": bool(
+                            full_pnp_inlier_mask.shape[0] > match_idx and full_pnp_inlier_mask[match_idx]
+                        ),
+                        "pnp_selected": bool(pnp_selected_mask.shape[0] > match_idx and pnp_selected_mask[match_idx]),
                     }
                 )
         row = {
@@ -448,7 +631,18 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 "patch_scale": float(args.patch_scale),
             },
             "match_count": len(matches),
+            "pnp_match_count": int(pnp.match_count),
             "mean_similarity": _mean([float(match.similarity) for match in matches]),
+            "map_reliability": {
+                "all_matches": reliability_all_stats,
+                "pnp_selected": reliability_pnp_stats,
+                "pnp_inliers": reliability_inlier_stats,
+            },
+            "local_geometric_consistency": {
+                "all_matches": local_all_stats,
+                "pnp_selected": local_pnp_stats,
+                "pnp_inliers": local_inlier_stats,
+            },
             "mean_positive_count": _mean([float(item.count) for item in positives.by_token.values()]),
             "nonempty_patch_fraction": _mean([1.0 if item.count > 0 else 0.0 for item in positives.by_token.values()]),
             "positive_set_stats": positive_stats,
@@ -520,8 +714,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             "patch_at_k": int(args.patch_at_k),
             "safe_pairwise_checkpoint": args.safe_pairwise_checkpoint,
             "pairwise_inlier_weight": float(args.pairwise_inlier_weight),
+            "pairwise_filter_keep_fraction": args.pairwise_filter_keep_fraction,
+            "pairwise_filter_min_logit": args.pairwise_filter_min_logit,
+            "pairwise_filter_min_logprob": args.pairwise_filter_min_logprob,
             "pairwise_device": args.pairwise_device or args.similarity_device,
             "pairwise_batch_size": int(args.pairwise_batch_size),
+            "pnp_min_inliers": int(args.pnp_min_inliers),
         },
         "submap": {
             "mode": args.submap_mode,
@@ -593,6 +791,67 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             ),
         },
         "mean_match_count": _mean([float(row["match_count"]) for row in rows]),
+        "mean_pnp_match_count": _mean([float(row["pnp_match_count"]) for row in rows]),
+        "map_reliability_summary": {
+            "mean_all_match_reliability": _mean(
+                [
+                    float(row["map_reliability"]["all_matches"]["mean"])
+                    for row in rows
+                    if row["map_reliability"]["all_matches"]["mean"] is not None
+                ]
+            ),
+            "mean_pnp_selected_reliability": _mean(
+                [
+                    float(row["map_reliability"]["pnp_selected"]["mean"])
+                    for row in rows
+                    if row["map_reliability"]["pnp_selected"]["mean"] is not None
+                ]
+            ),
+            "mean_pnp_inlier_reliability": _mean(
+                [
+                    float(row["map_reliability"]["pnp_inliers"]["mean"])
+                    for row in rows
+                    if row["map_reliability"]["pnp_inliers"]["mean"] is not None
+                ]
+            ),
+            "mean_uncertainty_scale": _mean(
+                [
+                    float(row["map_reliability"]["all_matches"]["mean_uncertainty_scale"])
+                    for row in rows
+                    if row["map_reliability"]["all_matches"]["mean_uncertainty_scale"] is not None
+                ]
+            ),
+        },
+        "local_geometric_consistency_summary": {
+            "mean_all_match_support": _mean(
+                [
+                    float(row["local_geometric_consistency"]["all_matches"]["mean_support"])
+                    for row in rows
+                    if row["local_geometric_consistency"]["all_matches"]["mean_support"] is not None
+                ]
+            ),
+            "mean_all_match_score": _mean(
+                [
+                    float(row["local_geometric_consistency"]["all_matches"]["mean_score"])
+                    for row in rows
+                    if row["local_geometric_consistency"]["all_matches"]["mean_score"] is not None
+                ]
+            ),
+            "mean_pnp_inlier_support": _mean(
+                [
+                    float(row["local_geometric_consistency"]["pnp_inliers"]["mean_support"])
+                    for row in rows
+                    if row["local_geometric_consistency"]["pnp_inliers"]["mean_support"] is not None
+                ]
+            ),
+            "mean_pnp_inlier_score": _mean(
+                [
+                    float(row["local_geometric_consistency"]["pnp_inliers"]["mean_score"])
+                    for row in rows
+                    if row["local_geometric_consistency"]["pnp_inliers"]["mean_score"] is not None
+                ]
+            ),
+        },
         "mean_patch_at_1": _mean([float(row["patch_geometry"]["patch_at_1"]) for row in rows]),
         f"mean_patch_at_{int(args.patch_at_k)}": _mean([float(row["patch_geometry"][f"patch_at_{int(args.patch_at_k)}"]) for row in rows]),
         "mean_gt_precision_5px": _mean([float(row["patch_geometry"]["gt_precision_5px"]) for row in rows]),

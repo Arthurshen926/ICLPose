@@ -32,7 +32,9 @@ from feature_extract.vfm.map_lifting import load_selected_track_bank_npz
 from feature_extract.vfm.patch_selector_training import (
     PatchSelectorSampleConfig,
     PatchSelectorTrainingConfig,
+    append_patch_selector_training_set_capped,
     build_patch_selector_samples_for_query,
+    load_safe_patch_selector_checkpoint,
     load_patch_selector_training_set_npz,
     merge_patch_selector_training_sets,
     save_patch_selector_training_set_npz,
@@ -93,6 +95,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     parser.add_argument("--max_queries", type=int, default=0)
     parser.add_argument("--sample_cache", default="")
     parser.add_argument("--write_sample_cache", default="")
+    parser.add_argument("--build_sample_cache_only", action="store_true")
+    parser.add_argument("--negative_mining_safe_checkpoint", default="")
+    parser.add_argument("--negative_mining_device", default="")
     parser.add_argument("--output_dim", type=int, default=128)
     parser.add_argument("--steps", type=int, default=1000)
     parser.add_argument("--batch_size", type=int, default=512)
@@ -120,7 +125,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     manifest = None
     records = []
     camera_source = "not_loaded_sample_cache"
-    sample_sets = []
+    merged_samples = None
+    sampled_query_count = 0
     query_sample_counts = []
     query_positive_counts = []
     skipped_missing_pose = 0
@@ -144,6 +150,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         gt_by_query = {record.image_id: record for record in parse_cambridge_pose_file(Path(args.query_pose_file))}
         camera_model_dir = _infer_camera_model_dir(args.query_pose_file, args.camera_model_dir)
         camera, camera_source = _load_camera_with_source(camera_model_dir, _parse_default_camera(args.default_camera))
+        negative_mining_run = (
+            load_safe_patch_selector_checkpoint(Path(args.negative_mining_safe_checkpoint), device=args.negative_mining_device or args.device)
+            if args.negative_mining_safe_checkpoint
+            else None
+        )
 
         records = list(manifest.records)
         if args.max_queries > 0:
@@ -178,6 +189,22 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 token_height=token_height,
                 patch_scale=float(args.patch_scale),
             )
+            negative_mining_query_feature = None
+            negative_mining_landmark_features = None
+            if negative_mining_run is not None:
+                channels, height, width = query_feature.shape
+                query_rows = query_feature.reshape(channels, height * width).T
+                encoded_query = negative_mining_run.encode_rows(
+                    query_rows,
+                    device=args.negative_mining_device or args.device,
+                    batch_size=int(args.batch_tokens),
+                )
+                negative_mining_query_feature = encoded_query.T.reshape(negative_mining_run.summary.output_dim, height, width)
+                negative_mining_landmark_features = negative_mining_run.encode_rows(
+                    submap.features,
+                    device=args.negative_mining_device or args.device,
+                    batch_size=int(args.batch_rows),
+                )
             sample_config = PatchSelectorSampleConfig(
                 max_tokens_per_query=int(args.max_tokens_per_query),
                 max_positives_per_token=int(args.max_positives_per_token),
@@ -187,22 +214,93 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 min_positive_count=int(args.min_positive_count),
                 seed=_stable_query_seed(args.seed, record_idx, record.image_id),
             )
-            samples = build_patch_selector_samples_for_query(query_feature, submap, positives, sample_config)
+            samples = build_patch_selector_samples_for_query(
+                query_feature,
+                submap,
+                positives,
+                sample_config,
+                negative_mining_query_feature_map=negative_mining_query_feature,
+                negative_mining_landmark_features=negative_mining_landmark_features,
+            )
             if samples.sample_count > 0:
-                sample_sets.append(samples)
+                sampled_query_count += 1
                 query_sample_counts.append(float(samples.sample_count))
                 query_positive_counts.append(float(sum(item.count for item in positives.by_token.values())))
-
-        merged_samples = merge_patch_selector_training_sets(
-            sample_sets,
-            max_samples=int(args.max_train_samples),
-            seed=int(args.seed),
+                merged_samples = append_patch_selector_training_set_capped(
+                    merged_samples,
+                    samples,
+                    max_samples=int(args.max_train_samples),
+                    seed=_stable_query_seed(args.seed, record_idx, record.image_id),
+                )
+        if merged_samples is None:
+            raise ValueError("no patch selector training samples were built")
+    if args.write_sample_cache:
+        save_patch_selector_training_set_npz(
+            merged_samples,
+            Path(args.write_sample_cache),
         )
-        if args.write_sample_cache:
-            save_patch_selector_training_set_npz(
-                merged_samples,
-                Path(args.write_sample_cache),
-            )
+    camera_summary = (
+        {"source": camera_source, "model_id": None, "width": None, "height": None, "params": []}
+        if args.sample_cache
+        else {
+            "source": camera_source,
+            "model_id": int(camera.model_id),
+            "width": int(camera.width),
+            "height": int(camera.height),
+            "params": [float(value) for value in camera.params],
+        }
+    )
+    if args.build_sample_cache_only:
+        if not args.write_sample_cache:
+            raise ValueError("--build_sample_cache_only requires --write_sample_cache")
+        summary = {
+            "stage": "stage_c1_supervised_linear_patch_selector",
+            "cache_only": True,
+            "elapsed_sec": float(time.perf_counter() - started),
+            "query_count": len(records),
+            "sampled_query_count": int(sampled_query_count),
+            "skipped_missing_pose": int(skipped_missing_pose),
+            "skipped_empty_submap": int(skipped_empty_submap),
+            "camera": camera_summary,
+            "sample_config": {
+                "submap_mode": args.submap_mode,
+                "submap_top_n": int(args.submap_top_n),
+                "max_submap_landmarks": int(args.max_submap_landmarks),
+                "patch_scale": float(args.patch_scale),
+                "query_token_step": int(args.query_token_step),
+                "max_tokens_per_query": int(args.max_tokens_per_query),
+                "max_positives_per_token": int(args.max_positives_per_token),
+                "hard_negatives_per_token": int(args.hard_negatives_per_token),
+                "hard_negative_pool": int(args.hard_negative_pool),
+                "min_positive_count": int(args.min_positive_count),
+                "max_train_samples": int(args.max_train_samples),
+            },
+            "sample_summary": {
+                "sample_count": int(merged_samples.sample_count),
+                "sample_cache": str(args.sample_cache) if args.sample_cache else "",
+                "written_sample_cache": str(args.write_sample_cache),
+                "per_query_samples": _summary_stats(query_sample_counts),
+                "per_query_positive_assignments": _summary_stats(query_positive_counts),
+            },
+            "inputs": {
+                "query_manifest": {
+                    "path": str(args.query_manifest),
+                    "sha256": _path_sha_or_empty(args.query_manifest),
+                },
+                "landmark_bank": {
+                    "path": str(args.landmark_bank),
+                    "sha256": _path_sha_or_empty(args.landmark_bank),
+                },
+                "track_observations": str(args.track_observations),
+                "query_pose_file": str(args.query_pose_file),
+                "candidate_bank": str(args.candidate_bank),
+                "visibility_index": str(args.visibility_index),
+            },
+        }
+        output = Path(args.summary_json)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+        return
     run = train_linear_patch_selector(
         merged_samples,
         PatchSelectorTrainingConfig(
@@ -283,20 +381,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         "stage": "stage_c1_supervised_linear_patch_selector",
         "elapsed_sec": float(time.perf_counter() - started),
         "query_count": len(records),
-        "sampled_query_count": len(sample_sets),
+        "sampled_query_count": int(sampled_query_count),
         "skipped_missing_pose": int(skipped_missing_pose),
         "skipped_empty_submap": int(skipped_empty_submap),
-        "camera": (
-            {"source": camera_source, "model_id": None, "width": None, "height": None, "params": []}
-            if args.sample_cache
-            else {
-                "source": camera_source,
-                "model_id": int(camera.model_id),
-                "width": int(camera.width),
-                "height": int(camera.height),
-                "params": [float(value) for value in camera.params],
-            }
-        ),
+        "camera": camera_summary,
         "sample_config": {
             "submap_mode": args.submap_mode,
             "submap_top_n": int(args.submap_top_n),

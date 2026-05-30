@@ -17,10 +17,12 @@ from feature_extract.tools.vfm.build_stage_c0_compressed_features import (
     _safe_token_filename,
 )
 from feature_extract.vfm.artifacts import file_sha256_short
+from feature_extract.vfm.feature_compression import FeatureCompressionTransform
 from feature_extract.vfm.patch_selector_training import (
     SafePatchSelectorTrainingConfig,
     encode_rows_with_safe_selector,
     load_patch_selector_training_set_npz,
+    load_safe_patch_selector_checkpoint,
     save_safe_patch_selector_checkpoint,
     train_safe_patch_selector,
 )
@@ -143,19 +145,38 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     parser.add_argument("--landmark_bank", required=True)
     parser.add_argument("--layer_name", default="radio_final")
     parser.add_argument("--output_layer_name", default="")
+    parser.add_argument("--selector_arch", choices=("residual_gated", "transformer_group_token"), default="residual_gated")
     parser.add_argument("--output_dim", type=int, default=128)
     parser.add_argument("--residual_hidden_dim", type=int, default=256)
+    parser.add_argument("--transformer_dim", type=int, default=128)
+    parser.add_argument("--transformer_layers", type=int, default=1)
+    parser.add_argument("--transformer_heads", type=int, default=4)
+    parser.add_argument("--transformer_ff_dim", type=int, default=256)
+    parser.add_argument("--transformer_dropout", type=float, default=0.0)
     parser.add_argument("--steps", type=int, default=800)
     parser.add_argument("--batch_size", type=int, default=512)
     parser.add_argument("--lr", type=float, default=5e-4)
+    parser.add_argument("--projection_lr", type=float, default=None)
+    parser.add_argument("--residual_lr", type=float, default=None)
+    parser.add_argument("--pairwise_lr", type=float, default=None)
+    parser.add_argument("--gate_lr", type=float, default=None)
     parser.add_argument("--temperature", type=float, default=0.07)
     parser.add_argument("--inlier_loss_weight", type=float, default=0.2)
+    parser.add_argument("--anchor_loss_weight", type=float, default=0.0)
+    parser.add_argument("--reprojection_margin_loss_weight", type=float, default=0.0)
+    parser.add_argument("--reprojection_margin_max", type=float, default=2.0)
     parser.add_argument("--group_lasso_weight", type=float, default=0.0)
     parser.add_argument("--eval_split_fraction", type=float, default=0.1)
     parser.add_argument("--center_inputs", action="store_true")
     parser.add_argument("--group_size", type=int, default=64)
+    parser.add_argument("--input_norm_mode", choices=("layernorm", "identity"), default="layernorm")
+    parser.add_argument("--gate_mode", choices=("sigmoid", "residual"), default="sigmoid")
+    parser.add_argument("--residual_gate_scale", type=float, default=0.1)
     parser.add_argument("--hard_gate_keep_fraction", type=float, default=1.0)
     parser.add_argument("--hard_gate_min_groups", type=int, default=1)
+    parser.add_argument("--init_transform", default="")
+    parser.add_argument("--anchor_transform", default="")
+    parser.add_argument("--init_safe_checkpoint", default="")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--output_model", required=True)
@@ -170,25 +191,47 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     started = time.perf_counter()
     samples, sample_metadata = load_patch_selector_training_set_npz(Path(args.sample_cache))
+    init_transform = FeatureCompressionTransform.from_npz(Path(args.init_transform)) if args.init_transform else None
+    anchor_transform = FeatureCompressionTransform.from_npz(Path(args.anchor_transform)) if args.anchor_transform else None
+    init_run = load_safe_patch_selector_checkpoint(Path(args.init_safe_checkpoint), device=args.device) if args.init_safe_checkpoint else None
     run = train_safe_patch_selector(
         samples,
         SafePatchSelectorTrainingConfig(
+            selector_arch=str(args.selector_arch),
             output_dim=int(args.output_dim),
             residual_hidden_dim=int(args.residual_hidden_dim),
+            transformer_dim=int(args.transformer_dim),
+            transformer_layers=int(args.transformer_layers),
+            transformer_heads=int(args.transformer_heads),
+            transformer_ff_dim=int(args.transformer_ff_dim),
+            transformer_dropout=float(args.transformer_dropout),
             steps=int(args.steps),
             batch_size=int(args.batch_size),
             lr=float(args.lr),
+            projection_lr=None if args.projection_lr is None else float(args.projection_lr),
+            residual_lr=None if args.residual_lr is None else float(args.residual_lr),
+            pairwise_lr=None if args.pairwise_lr is None else float(args.pairwise_lr),
+            gate_lr=None if args.gate_lr is None else float(args.gate_lr),
             temperature=float(args.temperature),
             inlier_loss_weight=float(args.inlier_loss_weight),
+            anchor_loss_weight=float(args.anchor_loss_weight),
+            reprojection_margin_loss_weight=float(args.reprojection_margin_loss_weight),
+            reprojection_margin_max=float(args.reprojection_margin_max),
             group_lasso_weight=float(args.group_lasso_weight),
             seed=int(args.seed),
             device=str(args.device),
             eval_split_fraction=float(args.eval_split_fraction),
             center_inputs=bool(args.center_inputs),
             group_size=int(args.group_size),
+            input_norm_mode=str(args.input_norm_mode),
+            gate_mode=str(args.gate_mode),
+            residual_gate_scale=float(args.residual_gate_scale),
             hard_gate_keep_fraction=float(args.hard_gate_keep_fraction),
             hard_gate_min_groups=int(args.hard_gate_min_groups),
         ),
+        init_transform=init_transform,
+        anchor_transform=anchor_transform,
+        init_run=init_run,
     )
     save_safe_patch_selector_checkpoint(run, Path(args.output_model))
 
@@ -236,7 +279,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         }
 
     summary = {
-        "stage": "stage_c2_safe_localizable_descriptor_selection",
+        "stage": "stage_c3_transformer_group_selector"
+        if str(args.selector_arch) == "transformer_group_token"
+        else "stage_c2_safe_localizable_descriptor_selection",
         "elapsed_sec": float(time.perf_counter() - started),
         "sample_summary": {
             "sample_cache": str(args.sample_cache),

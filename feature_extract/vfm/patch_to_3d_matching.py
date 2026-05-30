@@ -11,14 +11,20 @@ from feature_extract.vfm.colmap_tracks import ColmapCamera
 from feature_extract.vfm.query_to_3d_matching import (
     LandmarkQualityConfig,
     LandmarkMapIndex,
+    LocalGeometricConsistencyConfig,
+    MapReliabilityConfig,
     QueryTo3DMatchingConfig,
     QueryTo3DMatch,
     camera_matrix_and_distortion,
     estimate_pose_pnp_ransac,
+    filter_matches_by_local_geometric_consistency,
     landmark_quality_scores,
+    map_reliability_scores,
+    map_reliability_uncertainty_scale,
     match_reprojection_errors,
     match_query_tokens_to_landmarks,
     normalize_rows,
+    select_pnp_matches_by_map_reliability,
     token_grid_xy,
 )
 
@@ -59,6 +65,7 @@ class PatchPositiveSets:
     stride_x_px: float
     stride_y_px: float
     visible_track_ids: set[int] | None = None
+    projected_xy_by_track: Mapping[int, np.ndarray] | None = None
 
 
 @dataclass(frozen=True)
@@ -81,6 +88,11 @@ class PatchTo3DMatchingConfig:
     similarity_device: str = "cpu"
     match_score_mode: str = "similarity_quality"
     landmark_quality: LandmarkQualityConfig = LandmarkQualityConfig()
+    pairwise_filter_keep_fraction: float | None = None
+    pairwise_filter_min_logit: float | None = None
+    pairwise_filter_min_logprob: float | None = None
+    map_reliability: MapReliabilityConfig = MapReliabilityConfig()
+    local_geometric_consistency: LocalGeometricConsistencyConfig = LocalGeometricConsistencyConfig()
 
     def __post_init__(self) -> None:
         if self.top_k <= 0:
@@ -97,6 +109,8 @@ class PatchTo3DMatchingConfig:
             raise ValueError("ratio_threshold must be in (0, 1]")
         if self.min_quality_weighted_similarity is not None and float(self.min_quality_weighted_similarity) < -1.0:
             raise ValueError("min_quality_weighted_similarity must be >= -1")
+        if self.pairwise_filter_keep_fraction is not None and not 0.0 < float(self.pairwise_filter_keep_fraction) <= 1.0:
+            raise ValueError("pairwise_filter_keep_fraction must be in (0, 1]")
 
 
 def token_patch_boxes(
@@ -171,12 +185,16 @@ def build_patch_positive_sets(
             stride_x_px=stride_x,
             stride_y_px=stride_y,
             visible_track_ids=visible_track_ids,
+            projected_xy_by_track={},
         )
+    projected_xy_by_track: dict[int, np.ndarray] = {}
     for landmark_idx, is_visible in enumerate(visible):
         if not bool(is_visible):
             continue
-        visible_track_ids.add(int(index.track_ids[landmark_idx]))
+        track_id = int(index.track_ids[landmark_idx])
+        visible_track_ids.add(track_id)
         xy = projected_xy[landmark_idx]
+        projected_xy_by_track[track_id] = xy.astype(np.float64, copy=True)
         x_idx = int(round(np.clip(xy[0] / max(float(camera.width - 1), 1.0), 0.0, 1.0) * max(token_width - 1, 0)))
         y_idx = int(round(np.clip(xy[1] / max(float(camera.height - 1), 1.0), 0.0, 1.0) * max(token_height - 1, 0)))
         for yy in range(max(0, y_idx - 1), min(token_height, y_idx + 2)):
@@ -184,12 +202,13 @@ def build_patch_positive_sets(
                 token_index = yy * token_width + xx
                 positive = by_token[token_index]
                 if positive.patch_box.contains(xy):
-                    positive.track_ids.add(int(index.track_ids[landmark_idx]))
+                    positive.track_ids.add(track_id)
     return PatchPositiveSets(
         by_token=by_token,
         stride_x_px=stride_x,
         stride_y_px=stride_y,
         visible_track_ids=visible_track_ids,
+        projected_xy_by_track=projected_xy_by_track,
     )
 
 
@@ -371,6 +390,55 @@ def _pairwise_inlier_logits_for_topk(
     return logits, logprobs
 
 
+def _filter_matches_by_pairwise_score(
+    matches: list[QueryTo3DMatch],
+    keep_fraction: float | None,
+    min_logit: float | None,
+    min_logprob: float | None,
+) -> list[QueryTo3DMatch]:
+    if not matches:
+        return matches
+    if keep_fraction is None and min_logit is None and min_logprob is None:
+        return matches
+    scored = [match for match in matches if match.pairwise_inlier_logit is not None]
+    if not scored:
+        return matches
+    keep_ids: set[int] = set()
+    if keep_fraction is not None:
+        keep_count = max(1, int(np.ceil(len(scored) * float(keep_fraction))))
+        order = np.argsort([-float(match.pairwise_inlier_logit) for match in scored], kind="mergesort")
+        keep_ids.update(id(scored[int(idx)]) for idx in order[:keep_count])
+    else:
+        keep_ids.update(id(match) for match in scored)
+    output = []
+    for match in matches:
+        if match.pairwise_inlier_logit is None:
+            continue
+        if id(match) not in keep_ids:
+            continue
+        if min_logit is not None and float(match.pairwise_inlier_logit) < float(min_logit):
+            continue
+        if min_logprob is not None and (
+            match.pairwise_inlier_logprob is None or float(match.pairwise_inlier_logprob) < float(min_logprob)
+        ):
+            continue
+        output.append(match)
+    return output
+
+
+def _filter_matches_by_map_reliability(
+    matches: list[QueryTo3DMatch],
+    config: MapReliabilityConfig,
+) -> list[QueryTo3DMatch]:
+    if not config.enabled:
+        return matches
+    return select_pnp_matches_by_map_reliability(
+        matches,
+        keep_fraction=config.filter_keep_fraction,
+        min_score=config.min_score,
+    )
+
+
 def match_query_patches_to_landmarks(
     query_feature_map: np.ndarray,
     landmark_index: LandmarkMapIndex,
@@ -400,6 +468,12 @@ def match_query_patches_to_landmarks(
         block_size=config.block_size,
         force_ambiguity=config.max_landmark_ambiguity is not None,
     )
+    reliability_scores = map_reliability_scores(
+        index,
+        landmark_features,
+        config.map_reliability,
+        block_size=config.block_size,
+    )
     if config.landmark_quality.enabled and config.landmark_quality.min_score is not None:
         keep_quality = quality_scores >= float(config.landmark_quality.min_score)
         if not np.any(keep_quality):
@@ -408,6 +482,7 @@ def match_query_patches_to_landmarks(
         landmark_features = landmark_features[keep_quality]
         quality_scores = quality_scores[keep_quality]
         landmark_ambiguity = landmark_ambiguity[keep_quality]
+        reliability_scores = reliability_scores[keep_quality]
     if config.max_landmark_ambiguity is not None:
         keep_ambiguity = landmark_ambiguity <= float(config.max_landmark_ambiguity)
         if not np.any(keep_ambiguity):
@@ -416,6 +491,7 @@ def match_query_patches_to_landmarks(
         landmark_features = landmark_features[keep_ambiguity]
         quality_scores = quality_scores[keep_ambiguity]
         landmark_ambiguity = landmark_ambiguity[keep_ambiguity]
+        reliability_scores = reliability_scores[keep_ambiguity]
     query_features = query_features[valid_query_indices]
     token_indices = token_indices[valid_query_indices]
 
@@ -477,6 +553,11 @@ def match_query_patches_to_landmarks(
             if config.min_similarity_margin is not None and (margin is None or margin < float(config.min_similarity_margin)):
                 continue
             quality = float(quality_scores[landmark_idx])
+            map_reliability = None
+            pnp_uncertainty_scale = None
+            if config.map_reliability.enabled:
+                map_reliability = float(reliability_scores[landmark_idx])
+                pnp_uncertainty_scale = map_reliability_uncertainty_scale(map_reliability, config.map_reliability)
             quality_weighted_similarity = float(similarity * quality)
             pairwise_logit = None if pairwise_logits is None else float(pairwise_logits[query_row, rank])
             pairwise_logprob = None if pairwise_logprobs is None else float(pairwise_logprobs[query_row, rank])
@@ -514,6 +595,8 @@ def match_query_patches_to_landmarks(
                     pairwise_weighted_similarity=pairwise_weighted_similarity,
                     similarity_margin=margin,
                     distance_to_boundary_px=float(boundary),
+                    map_reliability=map_reliability,
+                    pnp_uncertainty_scale=pnp_uncertainty_scale,
                 )
             )
         if config.match_mode == "nn" and allow_multi_candidate_nn and candidate_matches:
@@ -521,6 +604,14 @@ def match_query_patches_to_landmarks(
         else:
             matches.extend(candidate_matches)
     matches.sort(key=lambda item: _match_score(item, config.match_score_mode), reverse=True)
+    matches = _filter_matches_by_pairwise_score(
+        matches,
+        keep_fraction=config.pairwise_filter_keep_fraction,
+        min_logit=config.pairwise_filter_min_logit,
+        min_logprob=config.pairwise_filter_min_logprob,
+    )
+    matches = _filter_matches_by_map_reliability(matches, config.map_reliability)
+    matches = filter_matches_by_local_geometric_consistency(matches, config.local_geometric_consistency)
     if config.max_matches is not None:
         matches = matches[: int(config.max_matches)]
     return matches

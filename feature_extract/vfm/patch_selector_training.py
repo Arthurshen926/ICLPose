@@ -53,6 +53,8 @@ class PatchSelectorTrainingSet:
     positive_features: np.ndarray
     positive_mask: np.ndarray
     negative_features: np.ndarray
+    positive_reprojection_distances: np.ndarray | None = None
+    negative_reprojection_distances: np.ndarray | None = None
     metadata: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
@@ -60,6 +62,12 @@ class PatchSelectorTrainingSet:
         positives = np.asarray(self.positive_features, dtype=np.float32)
         mask = np.asarray(self.positive_mask, dtype=bool)
         negatives = np.asarray(self.negative_features, dtype=np.float32)
+        positive_distances = (
+            None if self.positive_reprojection_distances is None else np.asarray(self.positive_reprojection_distances, dtype=np.float32)
+        )
+        negative_distances = (
+            None if self.negative_reprojection_distances is None else np.asarray(self.negative_reprojection_distances, dtype=np.float32)
+        )
         if query.ndim != 2:
             raise ValueError("query_features must have shape (N, C)")
         if positives.ndim != 3:
@@ -72,12 +80,20 @@ class PatchSelectorTrainingSet:
             raise ValueError("query, positive and negative feature dimensions must match")
         if mask.shape != positives.shape[:2]:
             raise ValueError("positive_mask must have shape (N, P)")
+        if positive_distances is not None and positive_distances.shape != positives.shape[:2]:
+            raise ValueError("positive_reprojection_distances must have shape (N, P)")
+        if negative_distances is not None and negative_distances.shape != negatives.shape[:2]:
+            raise ValueError("negative_reprojection_distances must have shape (N, K)")
+        if (positive_distances is None) != (negative_distances is None):
+            raise ValueError("positive and negative reprojection distances must be provided together")
         if query.shape[0] and not np.all(mask.any(axis=1)):
             raise ValueError("each sample must have at least one positive")
         object.__setattr__(self, "query_features", query)
         object.__setattr__(self, "positive_features", positives)
         object.__setattr__(self, "positive_mask", mask)
         object.__setattr__(self, "negative_features", negatives)
+        object.__setattr__(self, "positive_reprojection_distances", positive_distances)
+        object.__setattr__(self, "negative_reprojection_distances", negative_distances)
         object.__setattr__(self, "metadata", dict(self.metadata or {}))
 
     @property
@@ -179,43 +195,89 @@ class LinearPatchSelector(nn.Module):
 
 @dataclass(frozen=True)
 class SafePatchSelectorTrainingConfig:
+    selector_arch: str = "residual_gated"
     output_dim: int = 128
     residual_hidden_dim: int = 256
+    transformer_dim: int = 128
+    transformer_layers: int = 1
+    transformer_heads: int = 4
+    transformer_ff_dim: int = 256
+    transformer_dropout: float = 0.0
     steps: int = 800
     batch_size: int = 512
     lr: float = 5e-4
+    projection_lr: float | None = None
+    residual_lr: float | None = None
+    pairwise_lr: float | None = None
+    gate_lr: float | None = None
     temperature: float = 0.07
     inlier_loss_weight: float = 0.2
+    anchor_loss_weight: float = 0.0
+    reprojection_margin_loss_weight: float = 0.0
+    reprojection_margin_max: float = 2.0
     group_lasso_weight: float = 0.0
     seed: int = 0
     device: str = "cpu"
     eval_split_fraction: float = 0.1
     center_inputs: bool = False
     group_size: int = 64
+    input_norm_mode: str = "layernorm"
+    gate_mode: str = "sigmoid"
+    residual_gate_scale: float = 0.1
     hard_gate_keep_fraction: float = 1.0
     hard_gate_min_groups: int = 1
 
     def __post_init__(self) -> None:
+        if str(self.selector_arch) not in {"residual_gated", "transformer_group_token"}:
+            raise ValueError("selector_arch must be 'residual_gated' or 'transformer_group_token'")
         if self.output_dim <= 0:
             raise ValueError("output_dim must be positive")
         if self.residual_hidden_dim <= 0:
             raise ValueError("residual_hidden_dim must be positive")
+        if self.transformer_dim <= 0:
+            raise ValueError("transformer_dim must be positive")
+        if self.transformer_layers <= 0:
+            raise ValueError("transformer_layers must be positive")
+        if self.transformer_heads <= 0:
+            raise ValueError("transformer_heads must be positive")
+        if self.transformer_dim % self.transformer_heads != 0:
+            raise ValueError("transformer_dim must be divisible by transformer_heads")
+        if self.transformer_ff_dim <= 0:
+            raise ValueError("transformer_ff_dim must be positive")
+        if not 0.0 <= float(self.transformer_dropout) < 1.0:
+            raise ValueError("transformer_dropout must be in [0, 1)")
         if self.steps <= 0:
             raise ValueError("steps must be positive")
         if self.batch_size <= 0:
             raise ValueError("batch_size must be positive")
         if self.lr <= 0.0:
             raise ValueError("lr must be positive")
+        for name in ("projection_lr", "residual_lr", "pairwise_lr", "gate_lr"):
+            value = getattr(self, name)
+            if value is not None and float(value) < 0.0:
+                raise ValueError(f"{name} must be non-negative")
         if self.temperature <= 0.0:
             raise ValueError("temperature must be positive")
         if float(self.inlier_loss_weight) < 0.0:
             raise ValueError("inlier_loss_weight must be non-negative")
+        if float(self.anchor_loss_weight) < 0.0:
+            raise ValueError("anchor_loss_weight must be non-negative")
+        if float(self.reprojection_margin_loss_weight) < 0.0:
+            raise ValueError("reprojection_margin_loss_weight must be non-negative")
+        if float(self.reprojection_margin_max) <= 0.0:
+            raise ValueError("reprojection_margin_max must be positive")
         if float(self.group_lasso_weight) < 0.0:
             raise ValueError("group_lasso_weight must be non-negative")
         if not 0.0 <= float(self.eval_split_fraction) < 1.0:
             raise ValueError("eval_split_fraction must be in [0, 1)")
         if int(self.group_size) < 0:
             raise ValueError("group_size must be non-negative")
+        if str(self.input_norm_mode) not in {"layernorm", "identity"}:
+            raise ValueError("input_norm_mode must be 'layernorm' or 'identity'")
+        if str(self.gate_mode) not in {"sigmoid", "residual"}:
+            raise ValueError("gate_mode must be 'sigmoid' or 'residual'")
+        if not 0.0 <= float(self.residual_gate_scale) < 1.0:
+            raise ValueError("residual_gate_scale must be in [0, 1)")
         if not 0.0 < float(self.hard_gate_keep_fraction) <= 1.0:
             raise ValueError("hard_gate_keep_fraction must be in (0, 1]")
         if int(self.hard_gate_min_groups) <= 0:
@@ -224,6 +286,7 @@ class SafePatchSelectorTrainingConfig:
 
 @dataclass(frozen=True)
 class SafePatchSelectorTrainingSummary:
+    selector_arch: str
     initial_loss: float
     final_loss: float
     raw_train_top1_acc: float
@@ -238,6 +301,11 @@ class SafePatchSelectorTrainingSummary:
     input_dim: int
     output_dim: int
     residual_hidden_dim: int
+    transformer_dim: int
+    transformer_layers: int
+    transformer_heads: int
+    transformer_ff_dim: int
+    transformer_dropout: float
     steps: int
     batch_size: int
     group_size: int
@@ -252,6 +320,17 @@ class SafePatchSelectorTrainingSummary:
     inlier_loss_weight: float
     group_lasso_weight: float
     hard_gate_keep_fraction: float
+    projection_lr: float = 5e-4
+    residual_lr: float = 5e-4
+    pairwise_lr: float = 5e-4
+    gate_lr: float = 5e-4
+    anchor_loss_weight: float = 0.0
+    reprojection_margin_loss_weight: float = 0.0
+    reprojection_margin_max: float = 2.0
+    input_norm_mode: str = "layernorm"
+    gate_mode: str = "sigmoid"
+    residual_gate_scale: float = 0.1
+    initialized_from_safe_checkpoint: bool = False
 
 
 @dataclass(frozen=True)
@@ -280,18 +359,30 @@ class ResidualGatedPatchSelector(nn.Module):
         residual_hidden_dim: int = 256,
         group_size: int = 64,
         input_mean: np.ndarray | None = None,
+        input_norm_mode: str = "layernorm",
+        gate_mode: str = "sigmoid",
+        residual_gate_scale: float = 0.1,
     ) -> None:
         super().__init__()
         if int(output_dim) > int(input_dim):
             raise ValueError("output_dim must be <= input_dim")
         if int(residual_hidden_dim) <= 0:
             raise ValueError("residual_hidden_dim must be positive")
+        if str(input_norm_mode) not in {"layernorm", "identity"}:
+            raise ValueError("input_norm_mode must be 'layernorm' or 'identity'")
+        if str(gate_mode) not in {"sigmoid", "residual"}:
+            raise ValueError("gate_mode must be 'sigmoid' or 'residual'")
+        if not 0.0 <= float(residual_gate_scale) < 1.0:
+            raise ValueError("residual_gate_scale must be in [0, 1)")
         self.input_dim = int(input_dim)
         self.output_dim = int(output_dim)
         self.residual_hidden_dim = int(residual_hidden_dim)
         self.group_size = int(group_size)
+        self.input_norm_mode = str(input_norm_mode)
+        self.gate_mode = str(gate_mode)
+        self.residual_gate_scale = float(residual_gate_scale)
         group_count = len(_group_slices(self.input_dim, self.group_size))
-        self.input_norm = nn.LayerNorm(self.input_dim)
+        self.input_norm = nn.LayerNorm(self.input_dim) if self.input_norm_mode == "layernorm" else nn.Identity()
         self.projection = nn.Linear(self.input_dim, self.output_dim, bias=False)
         self.residual = nn.Sequential(
             nn.LayerNorm(self.output_dim),
@@ -306,7 +397,8 @@ class ResidualGatedPatchSelector(nn.Module):
             nn.GELU(),
             nn.Linear(self.residual_hidden_dim, 1),
         )
-        self.group_logits = nn.Parameter(torch.full((group_count,), 2.0, dtype=torch.float32))
+        gate_init = 2.0 if self.gate_mode == "sigmoid" else 0.0
+        self.group_logits = nn.Parameter(torch.full((group_count,), gate_init, dtype=torch.float32))
         mean = np.zeros((self.input_dim,), dtype=np.float32) if input_mean is None else np.asarray(input_mean, dtype=np.float32)
         self.register_buffer("input_mean", torch.as_tensor(mean.reshape(1, -1), dtype=torch.float32))
         nn.init.orthogonal_(self.projection.weight)
@@ -314,7 +406,9 @@ class ResidualGatedPatchSelector(nn.Module):
         nn.init.zeros_(self.residual[-1].bias)
 
     def group_gates(self) -> torch.Tensor:
-        return torch.sigmoid(self.group_logits)
+        if self.gate_mode == "sigmoid":
+            return torch.sigmoid(self.group_logits)
+        return 1.0 + float(self.residual_gate_scale) * torch.tanh(self.group_logits)
 
     def _channel_gates(self, active_group_mask: torch.Tensor | None = None) -> torch.Tensor:
         gates = self.group_gates()
@@ -342,6 +436,166 @@ class ResidualGatedPatchSelector(nn.Module):
         return logits.squeeze(-1)
 
 
+class TransformerGroupPatchSelector(nn.Module):
+    """Candidate-independent group-token Transformer descriptor selector."""
+
+    selector_arch = "transformer_group_token"
+
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        group_size: int = 64,
+        transformer_dim: int = 128,
+        transformer_layers: int = 1,
+        transformer_heads: int = 4,
+        transformer_ff_dim: int = 256,
+        transformer_dropout: float = 0.0,
+        pairwise_hidden_dim: int = 256,
+        input_mean: np.ndarray | None = None,
+        input_norm_mode: str = "layernorm",
+        gate_mode: str = "residual",
+        residual_gate_scale: float = 0.1,
+    ) -> None:
+        super().__init__()
+        if int(output_dim) > int(input_dim):
+            raise ValueError("output_dim must be <= input_dim")
+        if int(group_size) <= 0:
+            raise ValueError("group_size must be positive for transformer selector")
+        if int(transformer_dim) <= 0:
+            raise ValueError("transformer_dim must be positive")
+        if int(transformer_layers) <= 0:
+            raise ValueError("transformer_layers must be positive")
+        if int(transformer_heads) <= 0 or int(transformer_dim) % int(transformer_heads) != 0:
+            raise ValueError("transformer_dim must be divisible by transformer_heads")
+        if int(transformer_ff_dim) <= 0:
+            raise ValueError("transformer_ff_dim must be positive")
+        if int(pairwise_hidden_dim) <= 0:
+            raise ValueError("pairwise_hidden_dim must be positive")
+        if str(input_norm_mode) not in {"layernorm", "identity"}:
+            raise ValueError("input_norm_mode must be 'layernorm' or 'identity'")
+        if str(gate_mode) not in {"sigmoid", "residual"}:
+            raise ValueError("gate_mode must be 'sigmoid' or 'residual'")
+        if not 0.0 <= float(residual_gate_scale) < 1.0:
+            raise ValueError("residual_gate_scale must be in [0, 1)")
+        if not 0.0 <= float(transformer_dropout) < 1.0:
+            raise ValueError("transformer_dropout must be in [0, 1)")
+        self.input_dim = int(input_dim)
+        self.output_dim = int(output_dim)
+        self.residual_hidden_dim = int(pairwise_hidden_dim)
+        self.group_size = int(group_size)
+        self.transformer_dim = int(transformer_dim)
+        self.transformer_layers = int(transformer_layers)
+        self.transformer_heads = int(transformer_heads)
+        self.transformer_ff_dim = int(transformer_ff_dim)
+        self.transformer_dropout = float(transformer_dropout)
+        self.input_norm_mode = str(input_norm_mode)
+        self.gate_mode = str(gate_mode)
+        self.residual_gate_scale = float(residual_gate_scale)
+        group_count = len(_group_slices(self.input_dim, self.group_size))
+        padded_dim = group_count * self.group_size
+        self.group_count = int(group_count)
+        self.padded_dim = int(padded_dim)
+        self.input_norm = nn.LayerNorm(self.input_dim) if self.input_norm_mode == "layernorm" else nn.Identity()
+        self.group_projection = nn.Linear(self.group_size, self.transformer_dim)
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, self.transformer_dim))
+        self.position_embedding = nn.Parameter(torch.zeros(1, self.group_count + 1, self.transformer_dim))
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.transformer_dim,
+            nhead=self.transformer_heads,
+            dim_feedforward=self.transformer_ff_dim,
+            dropout=self.transformer_dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=self.transformer_layers)
+        self.output_norm = nn.LayerNorm(self.transformer_dim)
+        self.projection = nn.Linear(self.transformer_dim, self.output_dim, bias=False)
+        self.query_matchability = nn.Linear(self.output_dim, 1)
+        self.landmark_reliability = nn.Linear(self.output_dim, 1)
+        self.pairwise_inlier = nn.Sequential(
+            nn.Linear(self.output_dim * 4, self.residual_hidden_dim),
+            nn.GELU(),
+            nn.Linear(self.residual_hidden_dim, 1),
+        )
+        gate_init = 2.0 if self.gate_mode == "sigmoid" else 0.0
+        self.group_logits = nn.Parameter(torch.full((self.group_count,), gate_init, dtype=torch.float32))
+        mean = np.zeros((self.input_dim,), dtype=np.float32) if input_mean is None else np.asarray(input_mean, dtype=np.float32)
+        self.register_buffer("input_mean", torch.as_tensor(mean.reshape(1, -1), dtype=torch.float32))
+        nn.init.normal_(self.cls_token, std=0.02)
+        nn.init.normal_(self.position_embedding, std=0.02)
+        nn.init.xavier_uniform_(self.group_projection.weight)
+        nn.init.zeros_(self.group_projection.bias)
+        nn.init.xavier_uniform_(self.projection.weight)
+
+    def group_gates(self) -> torch.Tensor:
+        if self.gate_mode == "sigmoid":
+            return torch.sigmoid(self.group_logits)
+        return 1.0 + float(self.residual_gate_scale) * torch.tanh(self.group_logits)
+
+    def _channel_gates(self, active_group_mask: torch.Tensor | None = None) -> torch.Tensor:
+        gates = self.group_gates()
+        if active_group_mask is not None:
+            gates = gates * active_group_mask.to(gates.device, dtype=gates.dtype)
+        chunks = []
+        for group_idx, group in enumerate(_group_slices(self.input_dim, self.group_size)):
+            chunks.append(gates[group_idx].expand(group.stop - group.start))
+        return torch.cat(chunks, dim=0).reshape(1, -1)
+
+    def group_score_estimates(self) -> np.ndarray:
+        return self.group_gates().detach().cpu().numpy().astype(np.float32)
+
+    def forward(self, features: torch.Tensor, active_group_mask: torch.Tensor | None = None) -> torch.Tensor:
+        centered = features - self.input_mean.to(features.device)
+        normalized = self.input_norm(centered)
+        gated = normalized * self._channel_gates(active_group_mask).to(features.device)
+        if self.padded_dim > self.input_dim:
+            gated = F.pad(gated, (0, self.padded_dim - self.input_dim))
+        tokens = gated.reshape(gated.shape[0], self.group_count, self.group_size)
+        tokens = self.group_projection(tokens)
+        cls = self.cls_token.expand(tokens.shape[0], -1, -1)
+        encoded = torch.cat([cls, tokens], dim=1) + self.position_embedding
+        encoded = self.encoder(encoded)
+        descriptor = self.projection(self.output_norm(encoded[:, 0, :]))
+        return F.normalize(descriptor, dim=-1, eps=1e-8)
+
+    def pairwise_inlier_logit(self, query_z: torch.Tensor, landmark_z: torch.Tensor) -> torch.Tensor:
+        if query_z.shape != landmark_z.shape:
+            raise ValueError("query_z and landmark_z must have the same shape")
+        pair = torch.cat([query_z, landmark_z, torch.abs(query_z - landmark_z), query_z * landmark_z], dim=-1)
+        logits = self.pairwise_inlier(pair)
+        logits = logits + self.query_matchability(query_z) + self.landmark_reliability(landmark_z)
+        return logits.squeeze(-1)
+
+
+def initialize_safe_selector_from_linear_transform(
+    selector: ResidualGatedPatchSelector,
+    transform: FeatureCompressionTransform,
+) -> None:
+    """Initialize the C2 selector so its descriptor starts as a C1 linear transform."""
+
+    if transform.matrix is None:
+        raise ValueError("init transform must contain a projection matrix")
+    if int(transform.input_dim) != int(selector.input_dim):
+        raise ValueError("init transform input_dim must match selector input_dim")
+    if int(transform.output_dim) != int(selector.output_dim):
+        raise ValueError("init transform output_dim must match selector output_dim")
+    if not bool(transform.l2_normalize):
+        raise ValueError("init transform must use L2 normalization")
+    with torch.no_grad():
+        selector.input_mean.copy_(torch.as_tensor(transform.mean.reshape(1, -1), dtype=torch.float32, device=selector.input_mean.device))
+        selector.projection.weight.copy_(
+            torch.as_tensor(transform.matrix.T, dtype=selector.projection.weight.dtype, device=selector.projection.weight.device)
+        )
+        nn.init.zeros_(selector.residual[-1].weight)
+        nn.init.zeros_(selector.residual[-1].bias)
+        if selector.gate_mode == "residual":
+            selector.group_logits.zero_()
+        else:
+            selector.group_logits.fill_(8.0)
+
+
 def _token_rows(feature_map: np.ndarray, step: int) -> tuple[np.ndarray, np.ndarray]:
     values = np.asarray(feature_map, dtype=np.float32)
     if values.ndim != 3:
@@ -366,6 +620,22 @@ def _empty_training_set(input_dim: int, config: PatchSelectorSampleConfig, metad
         negative_features=np.zeros((0, config.hard_negatives_per_token, input_dim), dtype=np.float32),
         metadata=metadata,
     )
+
+
+def _distance_to_patch_center_strides(
+    token_index: int,
+    track_index: int,
+    track_ids: np.ndarray,
+    positives: PatchPositiveSets,
+) -> float:
+    positive = positives.by_token.get(int(token_index))
+    if positive is None:
+        return float("inf")
+    projected = None if positives.projected_xy_by_track is None else positives.projected_xy_by_track.get(int(track_ids[int(track_index)]))
+    if projected is None:
+        return float("inf")
+    stride = max(float(positives.stride_x_px), float(positives.stride_y_px), 1.0)
+    return float(np.linalg.norm(np.asarray(projected, dtype=np.float64).reshape(2) - positive.patch_box.center) / stride)
 
 
 def _sample_positive_indices(
@@ -454,6 +724,8 @@ def build_patch_selector_samples_for_query(
     landmark_index: LandmarkMapIndex,
     positives: PatchPositiveSets,
     config: PatchSelectorSampleConfig | None = None,
+    negative_mining_query_feature_map: np.ndarray | None = None,
+    negative_mining_landmark_features: np.ndarray | None = None,
 ) -> PatchSelectorTrainingSet:
     config = config or PatchSelectorSampleConfig()
     feature_map = np.asarray(query_feature_map, dtype=np.float32)
@@ -463,11 +735,28 @@ def build_patch_selector_samples_for_query(
         raise ValueError("landmark feature dimension must match query feature dimension")
     rng = np.random.default_rng(int(config.seed))
     query_features, token_indices = _token_rows(feature_map, config.query_token_step)
+    mining_query_features = query_features
+    if negative_mining_query_feature_map is not None:
+        mining_map = np.asarray(negative_mining_query_feature_map, dtype=np.float32)
+        if mining_map.ndim != 3 or mining_map.shape[1:] != feature_map.shape[1:]:
+            raise ValueError("negative_mining_query_feature_map must have shape (C2, H, W)")
+        mining_query_features, mining_token_indices = _token_rows(mining_map, config.query_token_step)
+        if not np.array_equal(mining_token_indices, token_indices):
+            raise ValueError("negative mining token grid must match query token grid")
+    mining_landmark_features = landmark_index.features
+    negative_mining_descriptor = "raw"
+    if negative_mining_landmark_features is not None:
+        mining_landmark_features = np.asarray(negative_mining_landmark_features, dtype=np.float32)
+        if mining_landmark_features.ndim != 2 or mining_landmark_features.shape[0] != len(landmark_index):
+            raise ValueError("negative_mining_landmark_features must have shape (landmark_count, C2)")
+        if mining_landmark_features.shape[1] != mining_query_features.shape[1]:
+            raise ValueError("negative mining query and landmark feature dimensions must match")
+        negative_mining_descriptor = "alternate"
     if query_features.size == 0 or len(landmark_index) == 0:
         return _empty_training_set(int(feature_map.shape[0]), config, {"sample_count": 0})
 
     row_by_track = {int(track_id): idx for idx, track_id in enumerate(landmark_index.track_ids.tolist())}
-    token_candidates: list[tuple[int, np.ndarray, list[int], list[int]]] = []
+    token_candidates: list[tuple[int, np.ndarray, np.ndarray, list[int], list[int]]] = []
     for row_idx, token_index in enumerate(token_indices.tolist()):
         if float(np.linalg.norm(query_features[row_idx])) <= _EPS:
             continue
@@ -482,7 +771,9 @@ def build_patch_selector_samples_for_query(
         if len(all_positive_indices) < int(config.min_positive_count):
             continue
         positive_indices = _sample_positive_indices(all_positive_indices, config.max_positives_per_token, rng)
-        token_candidates.append((int(token_index), query_features[row_idx], all_positive_indices, positive_indices))
+        token_candidates.append(
+            (int(token_index), query_features[row_idx], mining_query_features[row_idx], all_positive_indices, positive_indices)
+        )
 
     if len(token_candidates) > int(config.max_tokens_per_query):
         selected = rng.choice(len(token_candidates), size=int(config.max_tokens_per_query), replace=False)
@@ -499,18 +790,18 @@ def build_patch_selector_samples_for_query(
             },
         )
 
-    selected_query_features = np.stack([item[1] for item in token_candidates], axis=0).astype(np.float32)
-    all_positive_sets = [set(item[2]) for item in token_candidates]
+    selected_mining_query_features = np.stack([item[2] for item in token_candidates], axis=0).astype(np.float32)
+    all_positive_sets = [set(item[3]) for item in token_candidates]
     negative_lists = _sample_negative_indices_batch(
-        selected_query_features,
-        landmark_index.features,
+        selected_mining_query_features,
+        mining_landmark_features,
         positive_row_indices=all_positive_sets,
         count=config.hard_negatives_per_token,
         pool=config.hard_negative_pool,
     )
 
     candidate_rows: list[tuple[int, np.ndarray, list[int], list[int]]] = []
-    for (token_index, query_feature, _all_positive_indices, positive_indices), negative_indices in zip(
+    for (token_index, query_feature, _mining_query_feature, _all_positive_indices, positive_indices), negative_indices in zip(
         token_candidates,
         negative_lists,
     ):
@@ -533,29 +824,46 @@ def build_patch_selector_samples_for_query(
     pos = []
     pos_mask = []
     neg = []
+    pos_distances = []
+    neg_distances = []
     for _token_index, query_feature, positive_indices, negative_indices in candidate_rows:
         positive_array = np.zeros((config.max_positives_per_token, landmark_index.feature_dim), dtype=np.float32)
         mask_array = np.zeros((config.max_positives_per_token,), dtype=bool)
+        positive_distance_array = np.zeros((config.max_positives_per_token,), dtype=np.float32)
         for dst, landmark_idx in enumerate(positive_indices[: config.max_positives_per_token]):
             positive_array[dst] = landmark_index.features[int(landmark_idx)]
             mask_array[dst] = True
+            positive_distance_array[dst] = _distance_to_patch_center_strides(_token_index, int(landmark_idx), landmark_index.track_ids, positives)
         negative_array = landmark_index.features[np.asarray(negative_indices[: config.hard_negatives_per_token], dtype=np.int64)]
+        negative_distance_array = np.asarray(
+            [
+                _distance_to_patch_center_strides(_token_index, int(landmark_idx), landmark_index.track_ids, positives)
+                for landmark_idx in negative_indices[: config.hard_negatives_per_token]
+            ],
+            dtype=np.float32,
+        )
         queries.append(query_feature.astype(np.float32, copy=True))
         pos.append(positive_array)
         pos_mask.append(mask_array)
         neg.append(negative_array.astype(np.float32, copy=True))
+        pos_distances.append(positive_distance_array)
+        neg_distances.append(negative_distance_array)
 
     return PatchSelectorTrainingSet(
         query_features=np.stack(queries, axis=0),
         positive_features=np.stack(pos, axis=0),
         positive_mask=np.stack(pos_mask, axis=0),
         negative_features=np.stack(neg, axis=0),
+        positive_reprojection_distances=np.stack(pos_distances, axis=0),
+        negative_reprojection_distances=np.stack(neg_distances, axis=0),
         metadata={
             "sample_count": len(queries),
             "candidate_token_count": len(candidate_rows),
             "raw_false_nearest_negative_count": len(queries) * int(config.hard_negatives_per_token),
             "max_positives_per_token": int(config.max_positives_per_token),
             "hard_negatives_per_token": int(config.hard_negatives_per_token),
+            "has_reprojection_distances": True,
+            "negative_mining_descriptor": negative_mining_descriptor,
         },
     )
 
@@ -579,6 +887,17 @@ def merge_patch_selector_training_sets(
     positive = np.concatenate([samples.positive_features for samples in present], axis=0)
     positive_mask = np.concatenate([samples.positive_mask for samples in present], axis=0)
     negative = np.concatenate([samples.negative_features for samples in present], axis=0)
+    has_distances = all(samples.positive_reprojection_distances is not None for samples in present)
+    positive_distances = (
+        np.concatenate([samples.positive_reprojection_distances for samples in present if samples.positive_reprojection_distances is not None], axis=0)
+        if has_distances
+        else None
+    )
+    negative_distances = (
+        np.concatenate([samples.negative_reprojection_distances for samples in present if samples.negative_reprojection_distances is not None], axis=0)
+        if has_distances
+        else None
+    )
     if max_samples > 0 and query.shape[0] > int(max_samples):
         rng = np.random.default_rng(int(seed))
         indices = np.sort(rng.choice(query.shape[0], size=int(max_samples), replace=False))
@@ -586,13 +905,61 @@ def merge_patch_selector_training_sets(
         positive = positive[indices]
         positive_mask = positive_mask[indices]
         negative = negative[indices]
+        if positive_distances is not None:
+            positive_distances = positive_distances[indices]
+        if negative_distances is not None:
+            negative_distances = negative_distances[indices]
     return PatchSelectorTrainingSet(
         query_features=query,
         positive_features=positive,
         positive_mask=positive_mask,
         negative_features=negative,
-        metadata={"sample_count": int(query.shape[0]), "source_set_count": len(present)},
+        positive_reprojection_distances=positive_distances,
+        negative_reprojection_distances=negative_distances,
+        metadata={"sample_count": int(query.shape[0]), "source_set_count": len(present), "has_reprojection_distances": bool(has_distances)},
     )
+
+
+def _with_training_set_metadata(samples: PatchSelectorTrainingSet, metadata: Mapping[str, object]) -> PatchSelectorTrainingSet:
+    return PatchSelectorTrainingSet(
+        query_features=samples.query_features,
+        positive_features=samples.positive_features,
+        positive_mask=samples.positive_mask,
+        negative_features=samples.negative_features,
+        positive_reprojection_distances=samples.positive_reprojection_distances,
+        negative_reprojection_distances=samples.negative_reprojection_distances,
+        metadata=metadata,
+    )
+
+
+def append_patch_selector_training_set_capped(
+    existing: PatchSelectorTrainingSet | None,
+    incoming: PatchSelectorTrainingSet,
+    max_samples: int = 0,
+    seed: int = 0,
+) -> PatchSelectorTrainingSet:
+    """Append one query's samples while keeping the merged cache bounded."""
+
+    if incoming.sample_count <= 0:
+        if existing is None:
+            return incoming
+        return existing
+    existing_source_count = 0
+    if existing is not None:
+        existing_source_count = int(existing.metadata.get("source_set_count", 1 if existing.sample_count > 0 else 0))
+    incoming_source_count = 1
+    merged = merge_patch_selector_training_sets(
+        [incoming] if existing is None else [existing, incoming],
+        max_samples=int(max_samples),
+        seed=int(seed),
+    )
+    metadata = {
+        **dict(merged.metadata or {}),
+        "sample_count": int(merged.sample_count),
+        "source_set_count": int(existing_source_count + incoming_source_count),
+        "has_reprojection_distances": bool(merged.positive_reprojection_distances is not None),
+    }
+    return _with_training_set_metadata(merged, metadata)
 
 
 def save_patch_selector_training_set_npz(samples: PatchSelectorTrainingSet, path: Path) -> None:
@@ -604,16 +971,22 @@ def save_patch_selector_training_set_npz(samples: PatchSelectorTrainingSet, path
         "input_dim": int(samples.input_dim),
         "positive_count": int(samples.positive_features.shape[1]),
         "negative_count": int(samples.negative_features.shape[1]),
-        "metadata": dict(samples.metadata or {}),
+        "metadata": {
+            **dict(samples.metadata or {}),
+            "has_reprojection_distances": bool(samples.positive_reprojection_distances is not None),
+        },
     }
-    np.savez_compressed(
-        output,
+    arrays = dict(
         metadata=np.asarray(json.dumps(payload, sort_keys=True)),
         query_features=samples.query_features.astype(np.float32, copy=False),
         positive_features=samples.positive_features.astype(np.float32, copy=False),
         positive_mask=samples.positive_mask.astype(bool, copy=False),
         negative_features=samples.negative_features.astype(np.float32, copy=False),
     )
+    if samples.positive_reprojection_distances is not None:
+        arrays["positive_reprojection_distances"] = samples.positive_reprojection_distances.astype(np.float32, copy=False)
+        arrays["negative_reprojection_distances"] = samples.negative_reprojection_distances.astype(np.float32, copy=False)
+    np.savez_compressed(output, **arrays)
 
 
 def load_patch_selector_training_set_npz(path: Path) -> tuple[PatchSelectorTrainingSet, dict[str, object]]:
@@ -629,6 +1002,12 @@ def load_patch_selector_training_set_npz(path: Path) -> tuple[PatchSelectorTrain
             positive_features=np.asarray(data["positive_features"], dtype=np.float32),
             positive_mask=np.asarray(data["positive_mask"], dtype=bool),
             negative_features=np.asarray(data["negative_features"], dtype=np.float32),
+            positive_reprojection_distances=np.asarray(data["positive_reprojection_distances"], dtype=np.float32)
+            if "positive_reprojection_distances" in data
+            else None,
+            negative_reprojection_distances=np.asarray(data["negative_reprojection_distances"], dtype=np.float32)
+            if "negative_reprojection_distances" in data
+            else None,
             metadata=dict(payload.get("metadata", {})),
         )
     return samples, dict(payload.get("metadata", {}))
@@ -651,6 +1030,12 @@ def _subset_samples(samples: PatchSelectorTrainingSet, indices: np.ndarray) -> P
         positive_features=samples.positive_features[indices],
         positive_mask=samples.positive_mask[indices],
         negative_features=samples.negative_features[indices],
+        positive_reprojection_distances=None
+        if samples.positive_reprojection_distances is None
+        else samples.positive_reprojection_distances[indices],
+        negative_reprojection_distances=None
+        if samples.negative_reprojection_distances is None
+        else samples.negative_reprojection_distances[indices],
         metadata=samples.metadata,
     )
 
@@ -788,6 +1173,70 @@ def _transform_top1_acc(transform: FeatureCompressionTransform, samples: PatchSe
     return float(np.mean(np.max(pos_scores, axis=1) > np.max(neg_scores, axis=1)))
 
 
+def _anchor_tensors(
+    transform: FeatureCompressionTransform | None,
+    device: torch.device,
+    input_dim: int,
+    output_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    if transform is None:
+        return None
+    if transform.matrix is None:
+        raise ValueError("anchor transform must contain a projection matrix")
+    if int(transform.input_dim) != int(input_dim):
+        raise ValueError("anchor transform input_dim must match sample input_dim")
+    if int(transform.output_dim) != int(output_dim):
+        raise ValueError("anchor transform output_dim must match selector output_dim")
+    if not bool(transform.l2_normalize):
+        raise ValueError("anchor transform must use L2 normalization")
+    mean = torch.as_tensor(transform.mean.reshape(1, -1), dtype=torch.float32, device=device)
+    matrix = torch.as_tensor(transform.matrix, dtype=torch.float32, device=device)
+    return mean, matrix
+
+
+def _apply_anchor_transform(features: torch.Tensor, anchor: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+    mean, matrix = anchor
+    return F.normalize((features - mean.to(features.device)) @ matrix.to(features.device), dim=-1, eps=1e-8)
+
+
+def _effective_lr(value: float | None, fallback: float) -> float:
+    return float(fallback if value is None else value)
+
+
+def _safe_selector_optimizer(selector: ResidualGatedPatchSelector | TransformerGroupPatchSelector, config: SafePatchSelectorTrainingConfig) -> torch.optim.Optimizer:
+    projection_lr = _effective_lr(config.projection_lr, config.lr)
+    residual_lr = _effective_lr(config.residual_lr, config.lr)
+    pairwise_lr = _effective_lr(config.pairwise_lr, config.lr)
+    gate_lr = _effective_lr(config.gate_lr, config.lr)
+    param_groups = []
+    if isinstance(selector, TransformerGroupPatchSelector):
+        projection_params = (
+            list(selector.input_norm.parameters())
+            + list(selector.group_projection.parameters())
+            + [selector.cls_token, selector.position_embedding]
+            + list(selector.encoder.parameters())
+            + list(selector.output_norm.parameters())
+            + list(selector.projection.parameters())
+        )
+        residual_params = []
+    else:
+        projection_params = list(selector.input_norm.parameters()) + list(selector.projection.parameters())
+        residual_params = list(selector.residual.parameters())
+    if projection_params:
+        param_groups.append({"params": projection_params, "lr": projection_lr, "weight_decay": 0.0 if projection_lr == 0.0 else 1e-4})
+    if residual_params:
+        param_groups.append({"params": residual_params, "lr": residual_lr, "weight_decay": 0.0 if residual_lr == 0.0 else 1e-4})
+    pairwise_params = (
+        list(selector.query_matchability.parameters())
+        + list(selector.landmark_reliability.parameters())
+        + list(selector.pairwise_inlier.parameters())
+    )
+    if pairwise_params:
+        param_groups.append({"params": pairwise_params, "lr": pairwise_lr, "weight_decay": 0.0 if pairwise_lr == 0.0 else 1e-4})
+    param_groups.append({"params": [selector.group_logits], "lr": gate_lr, "weight_decay": 0.0})
+    return torch.optim.AdamW(param_groups)
+
+
 def train_linear_patch_selector(
     samples: PatchSelectorTrainingSet,
     config: PatchSelectorTrainingConfig | None = None,
@@ -903,6 +1352,12 @@ def _safe_selector_loss(
     negatives: torch.Tensor,
     temperature: float,
     inlier_loss_weight: float,
+    anchor: tuple[torch.Tensor, torch.Tensor] | None = None,
+    anchor_loss_weight: float = 0.0,
+    positive_reprojection_distances: torch.Tensor | None = None,
+    negative_reprojection_distances: torch.Tensor | None = None,
+    reprojection_margin_loss_weight: float = 0.0,
+    reprojection_margin_max: float = 2.0,
 ) -> torch.Tensor:
     query_z = selector(query)
     positive_z = selector(positives.reshape(-1, positives.shape[-1])).reshape(positives.shape[0], positives.shape[1], -1)
@@ -913,6 +1368,36 @@ def _safe_selector_loss(
     numerator = torch.logsumexp(pos_logits, dim=1)
     denominator = torch.logsumexp(torch.cat([pos_logits, neg_logits], dim=1), dim=1)
     loss = torch.mean(denominator - numerator)
+    if float(reprojection_margin_loss_weight) > 0.0:
+        if positive_reprojection_distances is None or negative_reprojection_distances is None:
+            raise ValueError("reprojection margin loss requires positive and negative reprojection distances")
+        pos_scores = torch.einsum("bd,bpd->bp", query_z, positive_z)
+        neg_scores = torch.einsum("bd,bkd->bk", query_z, negative_z)
+        pos_dist = torch.nan_to_num(positive_reprojection_distances.to(pos_scores.device), nan=0.0, posinf=float(reprojection_margin_max))
+        neg_dist = torch.nan_to_num(negative_reprojection_distances.to(neg_scores.device), nan=float(reprojection_margin_max), posinf=float(reprojection_margin_max))
+        margins = torch.clamp(neg_dist[:, None, :] - pos_dist[:, :, None], min=0.0, max=float(reprojection_margin_max))
+        pair_losses = F.relu(neg_scores[:, None, :] - pos_scores[:, :, None] + margins)
+        valid = positive_mask[:, :, None].expand_as(pair_losses)
+        if bool(valid.any().item()):
+            loss = loss + float(reprojection_margin_loss_weight) * pair_losses[valid].mean()
+    if anchor is not None and float(anchor_loss_weight) > 0.0:
+        anchor_query = _apply_anchor_transform(query, anchor)
+        anchor_positive = _apply_anchor_transform(positives.reshape(-1, positives.shape[-1]), anchor).reshape(
+            positives.shape[0],
+            positives.shape[1],
+            -1,
+        )
+        anchor_negative = _apply_anchor_transform(negatives.reshape(-1, negatives.shape[-1]), anchor).reshape(
+            negatives.shape[0],
+            negatives.shape[1],
+            -1,
+        )
+        anchor_terms = [1.0 - torch.sum(query_z * anchor_query, dim=-1)]
+        valid_positive = positive_mask.reshape(-1)
+        if bool(valid_positive.any().item()):
+            anchor_terms.append(1.0 - torch.sum(positive_z.reshape(-1, query_z.shape[-1])[valid_positive] * anchor_positive.reshape(-1, query_z.shape[-1])[valid_positive], dim=-1))
+        anchor_terms.append(1.0 - torch.sum(negative_z.reshape(-1, query_z.shape[-1]) * anchor_negative.reshape(-1, query_z.shape[-1]), dim=-1))
+        loss = loss + float(anchor_loss_weight) * torch.cat([term.reshape(-1) for term in anchor_terms], dim=0).mean()
     if float(inlier_loss_weight) <= 0.0:
         return loss
 
@@ -940,14 +1425,17 @@ def _safe_group_gate_penalty(selector: ResidualGatedPatchSelector) -> torch.Tens
 
 
 def _safe_active_group_mask(
-    selector: ResidualGatedPatchSelector,
+    selector: ResidualGatedPatchSelector | TransformerGroupPatchSelector,
     keep_fraction: float,
     min_groups: int,
 ) -> np.ndarray:
     gates = selector.group_gates().detach().cpu().numpy().astype(np.float32)
-    weights = selector.projection.weight.detach().cpu().numpy().astype(np.float32).T
-    energy = _projection_group_energy(weights, selector.group_size)
-    scores = gates * energy
+    if hasattr(selector, "group_score_estimates"):
+        scores = np.asarray(selector.group_score_estimates(), dtype=np.float32)
+    else:
+        weights = selector.projection.weight.detach().cpu().numpy().astype(np.float32).T
+        energy = _projection_group_energy(weights, selector.group_size)
+        scores = gates * energy
     group_count = int(scores.shape[0])
     if group_count == 0:
         return np.zeros((0,), dtype=np.float32)
@@ -1069,12 +1557,49 @@ def encode_rows_with_safe_selector(
 def train_safe_patch_selector(
     samples: PatchSelectorTrainingSet,
     config: SafePatchSelectorTrainingConfig | None = None,
+    *,
+    init_transform: FeatureCompressionTransform | None = None,
+    anchor_transform: FeatureCompressionTransform | None = None,
+    init_run: SafePatchSelectorTrainingRun | None = None,
 ) -> SafePatchSelectorTrainingRun:
     config = config or SafePatchSelectorTrainingConfig()
     if samples.sample_count == 0:
         raise ValueError("at least one training sample is required")
     if config.output_dim > samples.input_dim:
         raise ValueError("output_dim must be <= sample input_dim")
+    if init_transform is not None:
+        if str(config.selector_arch) != "residual_gated":
+            raise ValueError("init_transform is only supported by residual_gated selector")
+        if init_transform.matrix is None:
+            raise ValueError("init transform must contain a projection matrix")
+        if int(init_transform.input_dim) != samples.input_dim:
+            raise ValueError("init transform input_dim must match sample input_dim")
+        if int(init_transform.output_dim) != int(config.output_dim):
+            raise ValueError("init transform output_dim must match config output_dim")
+    if init_run is not None:
+        if int(init_run.summary.input_dim) != samples.input_dim:
+            raise ValueError("init_run input_dim must match sample input_dim")
+        if int(init_run.summary.output_dim) != int(config.output_dim):
+            raise ValueError("init_run output_dim must match config output_dim")
+        if str(init_run.summary.selector_arch) != str(config.selector_arch):
+            raise ValueError("init_run selector_arch must match config selector_arch")
+        if int(init_run.summary.residual_hidden_dim) != int(config.residual_hidden_dim):
+            raise ValueError("init_run residual_hidden_dim must match config residual_hidden_dim")
+        if str(config.selector_arch) == "transformer_group_token":
+            if int(init_run.summary.transformer_dim) != int(config.transformer_dim):
+                raise ValueError("init_run transformer_dim must match config transformer_dim")
+            if int(init_run.summary.transformer_layers) != int(config.transformer_layers):
+                raise ValueError("init_run transformer_layers must match config transformer_layers")
+            if int(init_run.summary.transformer_heads) != int(config.transformer_heads):
+                raise ValueError("init_run transformer_heads must match config transformer_heads")
+            if int(init_run.summary.transformer_ff_dim) != int(config.transformer_ff_dim):
+                raise ValueError("init_run transformer_ff_dim must match config transformer_ff_dim")
+    if anchor_transform is None and float(config.anchor_loss_weight) > 0.0:
+        anchor_transform = init_transform
+    if float(config.reprojection_margin_loss_weight) > 0.0 and (
+        samples.positive_reprojection_distances is None or samples.negative_reprojection_distances is None
+    ):
+        raise ValueError("reprojection_margin_loss_weight requires sample reprojection distances")
     torch.manual_seed(int(config.seed))
     random.seed(int(config.seed))
     np.random.seed(int(config.seed))
@@ -1082,27 +1607,69 @@ def train_safe_patch_selector(
     train_idx, eval_idx = _split_indices(samples.sample_count, config.eval_split_fraction, config.seed)
     train_samples = _subset_samples(samples, train_idx)
     eval_samples = _subset_samples(samples, eval_idx) if eval_idx.size else _subset_samples(samples, train_idx[:0])
-    input_mean = train_samples.query_features.mean(axis=0) if config.center_inputs else np.zeros((samples.input_dim,), dtype=np.float32)
-    selector = ResidualGatedPatchSelector(
-        samples.input_dim,
-        config.output_dim,
-        residual_hidden_dim=int(config.residual_hidden_dim),
-        group_size=int(config.group_size),
-        input_mean=input_mean,
-    ).to(device)
-    optimizer = torch.optim.AdamW(selector.parameters(), lr=float(config.lr), weight_decay=1e-4)
+    if init_transform is not None:
+        input_mean = init_transform.mean.astype(np.float32, copy=False)
+    else:
+        input_mean = train_samples.query_features.mean(axis=0) if config.center_inputs else np.zeros((samples.input_dim,), dtype=np.float32)
+    if str(config.selector_arch) == "transformer_group_token":
+        selector = TransformerGroupPatchSelector(
+            samples.input_dim,
+            config.output_dim,
+            group_size=int(config.group_size),
+            transformer_dim=int(config.transformer_dim),
+            transformer_layers=int(config.transformer_layers),
+            transformer_heads=int(config.transformer_heads),
+            transformer_ff_dim=int(config.transformer_ff_dim),
+            transformer_dropout=float(config.transformer_dropout),
+            pairwise_hidden_dim=int(config.residual_hidden_dim),
+            input_mean=input_mean,
+            input_norm_mode=str(config.input_norm_mode),
+            gate_mode=str(config.gate_mode),
+            residual_gate_scale=float(config.residual_gate_scale),
+        ).to(device)
+    else:
+        selector = ResidualGatedPatchSelector(
+            samples.input_dim,
+            config.output_dim,
+            residual_hidden_dim=int(config.residual_hidden_dim),
+            group_size=int(config.group_size),
+            input_mean=input_mean,
+            input_norm_mode=str(config.input_norm_mode),
+            gate_mode=str(config.gate_mode),
+            residual_gate_scale=float(config.residual_gate_scale),
+        ).to(device)
+    if init_run is not None:
+        selector.load_state_dict(init_run.model.state_dict())
+    elif init_transform is not None:
+        initialize_safe_selector_from_linear_transform(selector, init_transform)
+    optimizer = _safe_selector_optimizer(selector, config)
+    anchor = _anchor_tensors(anchor_transform, device, samples.input_dim, config.output_dim)
     rng = np.random.default_rng(int(config.seed))
 
     def loss_for_subset(subset: PatchSelectorTrainingSet) -> float:
         if subset.sample_count == 0:
             return 0.0
+        total_loss = 0.0
+        total_count = 0
+        eval_batch_size = min(max(int(config.batch_size), 1), 1024)
         with torch.no_grad():
-            query = torch.as_tensor(subset.query_features, dtype=torch.float32, device=device)
-            positives = torch.as_tensor(subset.positive_features, dtype=torch.float32, device=device)
-            mask = torch.as_tensor(subset.positive_mask, dtype=torch.bool, device=device)
-            negatives = torch.as_tensor(subset.negative_features, dtype=torch.float32, device=device)
-            return float(
-                _safe_selector_loss(
+            for start in range(0, subset.sample_count, eval_batch_size):
+                end = min(start + eval_batch_size, subset.sample_count)
+                query = torch.as_tensor(subset.query_features[start:end], dtype=torch.float32, device=device)
+                positives = torch.as_tensor(subset.positive_features[start:end], dtype=torch.float32, device=device)
+                mask = torch.as_tensor(subset.positive_mask[start:end], dtype=torch.bool, device=device)
+                negatives = torch.as_tensor(subset.negative_features[start:end], dtype=torch.float32, device=device)
+                pos_distances = (
+                    None
+                    if subset.positive_reprojection_distances is None
+                    else torch.as_tensor(subset.positive_reprojection_distances[start:end], dtype=torch.float32, device=device)
+                )
+                neg_distances = (
+                    None
+                    if subset.negative_reprojection_distances is None
+                    else torch.as_tensor(subset.negative_reprojection_distances[start:end], dtype=torch.float32, device=device)
+                )
+                batch_loss = _safe_selector_loss(
                     selector,
                     query,
                     positives,
@@ -1110,10 +1677,17 @@ def train_safe_patch_selector(
                     negatives,
                     config.temperature,
                     config.inlier_loss_weight,
+                    anchor=anchor,
+                    anchor_loss_weight=config.anchor_loss_weight,
+                    positive_reprojection_distances=pos_distances,
+                    negative_reprojection_distances=neg_distances,
+                    reprojection_margin_loss_weight=config.reprojection_margin_loss_weight,
+                    reprojection_margin_max=config.reprojection_margin_max,
                 )
-                .detach()
-                .cpu()
-            )
+                batch_count = int(end - start)
+                total_loss += float(batch_loss.detach().cpu()) * batch_count
+                total_count += batch_count
+        return float(total_loss / max(total_count, 1))
 
     initial_loss = loss_for_subset(train_samples)
     for _step in range(int(config.steps)):
@@ -1123,6 +1697,16 @@ def train_safe_patch_selector(
         positives = torch.as_tensor(train_samples.positive_features[batch_idx], dtype=torch.float32, device=device)
         mask = torch.as_tensor(train_samples.positive_mask[batch_idx], dtype=torch.bool, device=device)
         negatives = torch.as_tensor(train_samples.negative_features[batch_idx], dtype=torch.float32, device=device)
+        pos_distances = (
+            None
+            if train_samples.positive_reprojection_distances is None
+            else torch.as_tensor(train_samples.positive_reprojection_distances[batch_idx], dtype=torch.float32, device=device)
+        )
+        neg_distances = (
+            None
+            if train_samples.negative_reprojection_distances is None
+            else torch.as_tensor(train_samples.negative_reprojection_distances[batch_idx], dtype=torch.float32, device=device)
+        )
         loss = _safe_selector_loss(
             selector,
             query,
@@ -1131,6 +1715,12 @@ def train_safe_patch_selector(
             negatives,
             config.temperature,
             config.inlier_loss_weight,
+            anchor=anchor,
+            anchor_loss_weight=config.anchor_loss_weight,
+            positive_reprojection_distances=pos_distances,
+            negative_reprojection_distances=neg_distances,
+            reprojection_margin_loss_weight=config.reprojection_margin_loss_weight,
+            reprojection_margin_max=config.reprojection_margin_max,
         )
         if config.group_lasso_weight > 0.0 and config.group_size > 0:
             loss = loss + float(config.group_lasso_weight) * _safe_group_gate_penalty(selector)
@@ -1158,6 +1748,7 @@ def train_safe_patch_selector(
         model=selector.cpu(),
         summary=SafePatchSelectorTrainingSummary(
             initial_loss=initial_loss,
+            selector_arch=str(config.selector_arch),
             final_loss=final_loss,
             raw_train_top1_acc=raw_train_top1,
             raw_eval_top1_acc=raw_eval_top1,
@@ -1171,6 +1762,11 @@ def train_safe_patch_selector(
             input_dim=samples.input_dim,
             output_dim=int(config.output_dim),
             residual_hidden_dim=int(config.residual_hidden_dim),
+            transformer_dim=int(config.transformer_dim) if str(config.selector_arch) == "transformer_group_token" else 0,
+            transformer_layers=int(config.transformer_layers) if str(config.selector_arch) == "transformer_group_token" else 0,
+            transformer_heads=int(config.transformer_heads) if str(config.selector_arch) == "transformer_group_token" else 0,
+            transformer_ff_dim=int(config.transformer_ff_dim) if str(config.selector_arch) == "transformer_group_token" else 0,
+            transformer_dropout=float(config.transformer_dropout) if str(config.selector_arch) == "transformer_group_token" else 0.0,
             steps=int(config.steps),
             batch_size=int(config.batch_size),
             group_size=int(config.group_size),
@@ -1185,6 +1781,17 @@ def train_safe_patch_selector(
             inlier_loss_weight=float(config.inlier_loss_weight),
             group_lasso_weight=float(config.group_lasso_weight),
             hard_gate_keep_fraction=float(config.hard_gate_keep_fraction),
+            projection_lr=_effective_lr(config.projection_lr, config.lr),
+            residual_lr=_effective_lr(config.residual_lr, config.lr),
+            pairwise_lr=_effective_lr(config.pairwise_lr, config.lr),
+            gate_lr=_effective_lr(config.gate_lr, config.lr),
+            anchor_loss_weight=float(config.anchor_loss_weight),
+            reprojection_margin_loss_weight=float(config.reprojection_margin_loss_weight),
+            reprojection_margin_max=float(config.reprojection_margin_max),
+            input_norm_mode=str(config.input_norm_mode),
+            gate_mode=str(config.gate_mode),
+            residual_gate_scale=float(config.residual_gate_scale),
+            initialized_from_safe_checkpoint=bool(init_run is not None),
         ),
         active_group_mask=active_group_mask.astype(np.float32, copy=False),
     )
@@ -1197,16 +1804,30 @@ def save_safe_patch_selector_checkpoint(run: SafePatchSelectorTrainingRun, path:
     payload = {
         "format": "vfm_stage_c2_safe_patch_selector_v1",
         "model_config": {
+            "selector_arch": str(getattr(model, "selector_arch", "residual_gated")),
             "input_dim": int(model.input_dim),
             "output_dim": int(model.output_dim),
             "residual_hidden_dim": int(model.residual_hidden_dim),
             "group_size": int(model.group_size),
             "input_mean": model.input_mean.detach().cpu().numpy().reshape(-1),
+            "input_norm_mode": str(model.input_norm_mode),
+            "gate_mode": str(model.gate_mode),
+            "residual_gate_scale": float(model.residual_gate_scale),
         },
         "state_dict": model.state_dict(),
         "summary": asdict(run.summary),
         "active_group_mask": np.asarray(run.active_group_mask, dtype=np.float32),
     }
+    if isinstance(model, TransformerGroupPatchSelector):
+        payload["model_config"].update(
+            {
+                "transformer_dim": int(model.transformer_dim),
+                "transformer_layers": int(model.transformer_layers),
+                "transformer_heads": int(model.transformer_heads),
+                "transformer_ff_dim": int(model.transformer_ff_dim),
+                "transformer_dropout": float(model.transformer_dropout),
+            }
+        )
     torch.save(payload, output)
 
 
@@ -1215,16 +1836,55 @@ def load_safe_patch_selector_checkpoint(path: Path, device: str = "cpu") -> Safe
     if payload.get("format") != "vfm_stage_c2_safe_patch_selector_v1":
         raise ValueError(f"unsupported safe patch selector checkpoint format in {path}")
     config = dict(payload["model_config"])
-    model = ResidualGatedPatchSelector(
-        input_dim=int(config["input_dim"]),
-        output_dim=int(config["output_dim"]),
-        residual_hidden_dim=int(config["residual_hidden_dim"]),
-        group_size=int(config["group_size"]),
-        input_mean=np.asarray(config["input_mean"], dtype=np.float32),
-    )
+    selector_arch = str(config.get("selector_arch", "residual_gated"))
+    if selector_arch == "transformer_group_token":
+        model = TransformerGroupPatchSelector(
+            input_dim=int(config["input_dim"]),
+            output_dim=int(config["output_dim"]),
+            group_size=int(config["group_size"]),
+            transformer_dim=int(config["transformer_dim"]),
+            transformer_layers=int(config["transformer_layers"]),
+            transformer_heads=int(config["transformer_heads"]),
+            transformer_ff_dim=int(config["transformer_ff_dim"]),
+            transformer_dropout=float(config.get("transformer_dropout", 0.0)),
+            pairwise_hidden_dim=int(config["residual_hidden_dim"]),
+            input_mean=np.asarray(config["input_mean"], dtype=np.float32),
+            input_norm_mode=str(config.get("input_norm_mode", "layernorm")),
+            gate_mode=str(config.get("gate_mode", "sigmoid")),
+            residual_gate_scale=float(config.get("residual_gate_scale", 0.1)),
+        )
+    else:
+        model = ResidualGatedPatchSelector(
+            input_dim=int(config["input_dim"]),
+            output_dim=int(config["output_dim"]),
+            residual_hidden_dim=int(config["residual_hidden_dim"]),
+            group_size=int(config["group_size"]),
+            input_mean=np.asarray(config["input_mean"], dtype=np.float32),
+            input_norm_mode=str(config.get("input_norm_mode", "layernorm")),
+            gate_mode=str(config.get("gate_mode", "sigmoid")),
+            residual_gate_scale=float(config.get("residual_gate_scale", 0.1)),
+        )
     model.load_state_dict(payload["state_dict"])
     model = model.to(torch.device(device)).eval()
-    summary = SafePatchSelectorTrainingSummary(**dict(payload["summary"]))
+    summary_payload = dict(payload["summary"])
+    summary_payload.setdefault("selector_arch", selector_arch)
+    summary_payload.setdefault("projection_lr", 5e-4)
+    summary_payload.setdefault("residual_lr", 5e-4)
+    summary_payload.setdefault("pairwise_lr", 5e-4)
+    summary_payload.setdefault("gate_lr", 5e-4)
+    summary_payload.setdefault("anchor_loss_weight", 0.0)
+    summary_payload.setdefault("reprojection_margin_loss_weight", 0.0)
+    summary_payload.setdefault("reprojection_margin_max", 2.0)
+    summary_payload.setdefault("input_norm_mode", str(config.get("input_norm_mode", "layernorm")))
+    summary_payload.setdefault("gate_mode", str(config.get("gate_mode", "sigmoid")))
+    summary_payload.setdefault("residual_gate_scale", float(config.get("residual_gate_scale", 0.1)))
+    summary_payload.setdefault("initialized_from_safe_checkpoint", False)
+    summary_payload.setdefault("transformer_dim", int(config.get("transformer_dim", 0)))
+    summary_payload.setdefault("transformer_layers", int(config.get("transformer_layers", 0)))
+    summary_payload.setdefault("transformer_heads", int(config.get("transformer_heads", 0)))
+    summary_payload.setdefault("transformer_ff_dim", int(config.get("transformer_ff_dim", 0)))
+    summary_payload.setdefault("transformer_dropout", float(config.get("transformer_dropout", 0.0)))
+    summary = SafePatchSelectorTrainingSummary(**summary_payload)
     active_group_mask = np.asarray(payload["active_group_mask"], dtype=np.float32)
     return SafePatchSelectorTrainingRun(model=model.cpu(), summary=summary, active_group_mask=active_group_mask)
 

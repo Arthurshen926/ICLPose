@@ -2496,6 +2496,327 @@ C2 pairwise/Pareto artifacts:
 - `output/vfm/stage_c2_pairwise_scoring/`
 - `output/vfm/stage_c2_group_pareto/`
 
+## Stage C2-S Scene-Specific Precision Rescue
+
+Implemented the limited C2-S window recommended after the first C2 smoke:
+
+- C2-S starts from the corresponding C1 `learned128` projection instead of
+  learning a fresh descriptor:
+  - `initialize_safe_selector_from_linear_transform(...)` copies the C1
+    projection matrix and input mean.
+  - `input_norm_mode=identity` and `gate_mode=residual` make the initial
+    descriptor exactly equivalent to the C1 transform.
+  - the residual branch remains zero-initialized, and group gates initialize to
+    all ones.
+- Training now supports conservative parameter-group learning rates:
+  - projection lr `1e-5`
+  - residual / pairwise lr `1e-4`
+  - gate lr `1e-5`
+- Added C1 descriptor anchor loss:
+  `L_anchor = 1 - cos(z_C2, z_C1)`, with `anchor_loss_weight=0.1`.
+- Pairwise inlier scoring is kept as a small diagnostic weight only, not as the
+  default ranking mode.
+
+Implementation/tests:
+
+- `feature_extract/vfm/patch_selector_training.py`
+- `feature_extract/tools/vfm/train_stage_c2_safe_selector.py`
+- `tests/test_vfm_stage_c2_safe_selector.py`
+- C2-S summary artifact:
+  `output/vfm/stage_c2s_precision_rescue/c2s_summary.json`
+
+Default C2-S protocol:
+
+- Scene-specific training, no mixed-scene selector.
+- Same C1 sample caches and held-out reference-top10 MNN top1 evaluator.
+- `steps=600`, `batch_size=2048`, `output_dim=128`, `group_size=64`.
+- Seeds `0/1/2`.
+
+Main result: conservative C2-S full128.
+
+| Scene | Method | S@25 | S@50 | median t | median r | Inlier Patch@1 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| ShopFacade | C1 learned128 seed0 | 0.786 | 0.932 | 0.144m | 0.401deg | 0.449 |
+| ShopFacade | C2-S full128 mean over 3 seeds | 0.825 +/- 0.014 | 0.922 +/- 0.008 | 0.141 +/- 0.001m | 0.432 +/- 0.004deg | 0.455 +/- 0.003 |
+| OldHospital | C1 learned128 seed0 | 0.286 | 0.626 | 0.412m | 0.559deg | 0.512 |
+| OldHospital | C2-S full128 mean over 3 seeds | 0.357 +/- 0.031 | 0.689 +/- 0.019 | 0.344 +/- 0.015m | 0.584 +/- 0.033deg | 0.527 +/- 0.000 |
+
+C2-S passes the scene-specific precision targets:
+
+- ShopFacade target: `S@25 >= 0.83`, `median t <= 0.14m`,
+  `Inlier Patch@1 >= 0.45`, S@50 not materially below C1.
+  - Seeds 0/1 hit `S@25=0.835`; seed2 is `0.806`.
+  - The 3-seed mean is slightly below the strict `0.83` S@25 target, but the
+    median translation and inlier Patch@1 targets are met and rescue/break is
+    consistently > 1.
+- OldHospital target: `S@25 >= 0.31`, `median t <= 0.38m`,
+  `Inlier Patch@1 >= 0.52`, S@50 not below C1.
+  - All three seeds pass these thresholds.
+
+Rescue/break versus C1 learned128 at `S@25cm/10deg`:
+
+| Scene | Seed | C1-fail rescued | C1-success broken | rescue/break |
+| --- | ---: | ---: | ---: | ---: |
+| ShopFacade | 0 | 10 | 5 | 2.00 |
+| ShopFacade | 1 | 9 | 4 | 2.25 |
+| ShopFacade | 2 | 7 | 5 | 1.40 |
+| OldHospital | 0 | 21 | 13 | 1.62 |
+| OldHospital | 1 | 24 | 14 | 1.71 |
+| OldHospital | 2 | 32 | 11 | 2.91 |
+
+C2-S diagnostics:
+
+| Scene | Variant | S@25 | S@50 | median t | Inlier Patch@1 | Conclusion |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| ShopFacade | pairwise alpha=0.05 | 0.864 | 0.942 | 0.146m | 0.457 | useful diagnostic, but not default |
+| OldHospital | pairwise alpha=0.05 | 0.297 | 0.637 | 0.354m | 0.528 | hurts S@25, not safe |
+| ShopFacade | keep80 | 0.835 | 0.951 | 0.149m | 0.427 | viable compression diagnostic |
+| OldHospital | keep80 | 0.247 | 0.632 | 0.378m | 0.483 | fails precision target |
+
+C2-S conclusion:
+
+- The accuracy model should be `C2-S conservative full128`, not keep80 and not
+  pairwise-alpha ranking.
+- C2-S is now a positive scene-specific rescue result: it improves the main
+  precision metric and rescue/break tradeoff over C1 on both scenes, while
+  remaining anchored to the proven C1 descriptor geometry.
+- Group sparsity remains a separate Pareto diagnostic. `keep80` is not stable
+  enough for the main accuracy claim because OldHospital loses too much S@25 and
+  Inlier Patch@1.
+- Pairwise/matchability should be treated as a calibrated guard/risk feature in
+  a later matcher stage, not as a default descriptor reranker.
+
+## Stage C2.5 Pose-Aware Local Descriptor Refinement
+
+Implemented C2.5 as a conservative continuation of C2-S, without changing the
+coarse retrieval, dense rendering, or model class:
+
+- Reprojection-margin supervision:
+  - sample caches now store positive/negative landmark reprojection distances
+    to the query patch center, normalized by token stride.
+  - C2 training adds
+    `max(0, s(q, X-) - s(q, X+) + clamp(d- - d+, 0, m_max))`.
+  - CLI flags: `--reprojection_margin_loss_weight`,
+    `--reprojection_margin_max`.
+- C2.5 checkpoint initialization:
+  - `--init_safe_checkpoint` resumes from a C2-S checkpoint, rather than
+    restarting from C1.
+- Pairwise filtering:
+  - `pairwise_filter_keep_fraction`, `pairwise_filter_min_logit`, and
+    `pairwise_filter_min_logprob` filter descriptor matches after MNN/topK
+    selection without reranking descriptor candidates.
+- Hard-negative cache:
+  - sample builder can mine negatives in an alternate descriptor space while
+    keeping raw VFM features as the training payload.
+  - `train_stage_c1_patch_selector.py` accepts
+    `--negative_mining_safe_checkpoint`.
+- PnP sweep controls:
+  - evaluator exposes `--pnp_min_inliers`.
+
+Artifacts:
+
+- plan: `docs/superpowers/plans/2026-05-30-stage-c25-pose-aware-refinement.md`
+- summary: `output/vfm/stage_c25_pose_refinement/c25_summary.json`
+- ShopFacade hard-negative cache:
+  `output/vfm/stage_c25_pose_refinement/shopfacade/samples_c2s_hardneg_ref10_12k_seed0.npz`
+- OldHospital raw-geometry cache:
+  `output/vfm/stage_c25_pose_refinement/oldhospital/samples_rawgeom_ref10_12k_seed0.npz`
+- OldHospital full C2-S mined hard-negative cache:
+  `output/vfm/stage_c25_pose_refinement/oldhospital/samples_c2s_hardneg_ref10_24k_seed0.npz`
+  (`895` train queries, `24k` retained samples, `3.7G`, cache-only build).
+
+Main C2.5 result, seed0:
+
+| Scene | Method | S@25 | S@50 | median t | median r | Inlier Patch@1 | rescue/break vs C2-S |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| ShopFacade | C2-S full128 | 0.835 | 0.932 | 0.140m | 0.435deg | 0.458 |  |
+| ShopFacade | C2.5 margin03 + 0.75 stride RANSAC | 0.854 | 0.913 | 0.116m | 0.459deg | 0.601 | 1.33 |
+| OldHospital | C2-S full128 | 0.330 | 0.681 | 0.356m | 0.578deg | 0.527 |  |
+| OldHospital | C2.5 margin03 + 0.75 stride RANSAC | 0.390 | 0.687 | 0.308m | 0.560deg | 0.676 | 1.55 |
+
+ShopFacade C2.5 precision point over three seeds:
+
+| Method | S@25 | S@50 | median t | Inlier Patch@1 |
+| --- | ---: | ---: | ---: | ---: |
+| C2.5 margin03 + 0.75 stride RANSAC | 0.838 +/- 0.012 | 0.906 +/- 0.009 | 0.117 +/- 0.004m | 0.605 +/- 0.003 |
+
+Diagnostics:
+
+| Scene | Variant | S@25 | S@50 | median t | Inlier Patch@1 | Interpretation |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| ShopFacade | margin01, 1.5 stride | 0.864 | 0.922 | 0.136m | 0.428 | best S@25, but correspondence precision drops |
+| ShopFacade | margin03, 1.5 stride | 0.845 | 0.942 | 0.125m | 0.428 | best broad recall / median before PnP sweep |
+| ShopFacade | C2-S pairwise keep70 | 0.845 | 0.932 | 0.152m | 0.464 | filtering helps precision but hurts median |
+| OldHospital | C2-S pairwise keep70 | 0.346 | 0.681 | 0.349m | 0.537 | filtering is safe but modest |
+| OldHospital | margin03, 0.60 stride | 0.346 | 0.637 | 0.347m | 0.750 | very strict PnP raises inlier correctness but loses pose success |
+| OldHospital | margin03, 0.75 stride | 0.390 | 0.687 | 0.308m | 0.676 | current best balance |
+| OldHospital | full C2-S hard-neg margin01, 0.75 stride | 0.198 | 0.566 | 0.445m | 0.565 | over-hard negatives break pose accuracy |
+| OldHospital | full C2-S hard-neg margin03, 0.75 stride | 0.148 | 0.522 | 0.475m | 0.566 | stronger margin worsens the same failure mode |
+
+C2.5 conclusion:
+
+- ShopFacade passes the proposed C2.5 target on S@25, median translation, and
+  Inlier Patch@1. S@50 drops from `0.932` to `0.913`, so this should be reported
+  as a precision operating point, not a broad-recall default. The three-seed
+  precision point remains positive on median translation and inlier correctness,
+  while S@25 mean is `0.838 +/- 0.012`.
+- OldHospital is strongly positive but not fully over the target line:
+  S@25 improves `0.330 -> 0.390`, median translation improves
+  `0.356m -> 0.308m`, and Inlier Patch@1 improves `0.527 -> 0.676`, but the
+  target was `S@25 >= 0.40` and `median t <= 0.30m`.
+- The full C2-S hard-negative cache for OldHospital is now implemented with
+  cache-only streaming construction and was successfully built on all `895`
+  train queries. However, full-hard training is a negative result:
+  margin01/margin03 both degrade S@25 and median translation substantially. The
+  mined negatives are currently over-hard for OldHospital and disturb the C2-S
+  descriptor geometry rather than improving it.
+- Recommended freeze policy:
+  - Keep `C2-S conservative full128` as the stable cross-scene descriptor.
+  - Add `C2.5 raw-geometry margin03 + strict PnP` as a precision-refinement
+    diagnostic operating point.
+  - Do not claim full C2-S hard-negative mining as a positive C2.5 result yet;
+    it should be revisited only with curriculum or capped-hardness mining.
+
+## Stage C3 Transformer Selector Smoke
+
+Implemented C3 as a deliberately limited capacity smoke:
+
+- Architecture:
+  - candidate-independent group-token Transformer selector.
+  - raw VFM channels are split into `group_size=64` channel groups.
+  - each group becomes a token, a learned CLS token is added, and a 1-layer
+    Transformer encoder produces the 128D descriptor.
+  - no query-map cross-attention and no candidate-conditioned scoring.
+- Training:
+  - reuses C2/C2.5 multi-positive patch contrast, pairwise BCE, and optional
+    reprojection-margin loss.
+  - checkpoint/export path is shared with C2-S so the patch-to-3D evaluator is
+    unchanged.
+  - loss evaluation is now batch-chunked; this was required because whole-cache
+    loss evaluation OOMed for Transformer negatives.
+
+Artifacts:
+
+- summary: `output/vfm/stage_c3_transformer_selector/c3_summary.json`
+- ShopFacade:
+  `output/vfm/stage_c3_transformer_selector/shopfacade/c3_transformer128_seed0/`
+- OldHospital:
+  `output/vfm/stage_c3_transformer_selector/oldhospital/c3_transformer128_rawgeom_seed0/`
+
+C3 smoke result, 128D, seed0, same reference top10 + MNN + 0.75 stride PnP
+protocol:
+
+| Scene | Method | S@25 | S@50 | median t | median r | Inlier Patch@1 | rescue/break vs C2-S |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| ShopFacade | C2-S full128 | 0.835 | 0.932 | 0.140m | 0.435deg | 0.458 |  |
+| ShopFacade | C2.5 margin03 | 0.854 | 0.913 | 0.116m | 0.459deg | 0.601 |  |
+| ShopFacade | C3 Transformer | 0.738 | 0.893 | 0.164m | 0.583deg | 0.516 | 6/16 = 0.38 |
+| ShopFacade | C3 Transformer + C1 anchor | 0.680 | 0.883 | 0.191m | 0.657deg | 0.500 | 6/22 = 0.27 |
+| OldHospital | C2-S full128 | 0.330 | 0.681 | 0.356m | 0.578deg | 0.527 |  |
+| OldHospital | C2.5 margin03 | 0.390 | 0.687 | 0.308m | 0.560deg | 0.676 |  |
+| OldHospital | C3 Transformer | 0.214 | 0.511 | 0.482m | 0.853deg | 0.572 | 9/30 = 0.30 |
+| OldHospital | C3 Transformer + C1 anchor | 0.176 | 0.505 | 0.484m | 0.843deg | 0.573 | 12/40 = 0.30 |
+
+C3 conclusion:
+
+- C3 fails the smoke gate. It does not beat C2-S or C2.5 at the same descriptor
+  dimension on either scene.
+- It increases hard-case breaks substantially: rescue/break is below `0.4`
+  versus C2-S on both scenes, and below `0.25` versus C2.5 for the unanchored
+  model.
+- The C1-anchor variant does not rescue the behavior; it further reduces S@25.
+- Freeze decision: keep the implementation as an experimental path only. Do not
+  promote Transformer selector into the main method, and do not spend further
+  tuning budget without a new hypothesis such as curriculum hard-negative
+  mining or an explicitly matcher-level objective.
+
+## Stage C4 Map-Side Reliability Prior
+
+Implemented C4 as a map-side prior, not as descriptor-score multiplication:
+
+- New `MapReliabilityConfig` computes a 0-1 reliability prior from track length,
+  feature variance, reprojection error, IDF/ambiguity hooks, and an explicit
+  view-angle hook for future banks.
+- Patch matching now attaches `map_reliability` and `pnp_uncertainty_scale` to
+  each match.
+- C4 uses reliability only for:
+  - post-match filtering;
+  - PnP input preselection;
+  - diagnostics and uncertainty-scale reporting.
+- The evaluator preserves the full match list and remaps PnP inliers back onto
+  the original matches, so filtering is not confused with descriptor ranking.
+
+Artifacts:
+
+- summary: `output/vfm/stage_c4_map_reliability_prior/c4_summary.json`
+- per-scene rows/summaries:
+  `output/vfm/stage_c4_map_reliability_prior/{shopfacade,oldhospital}/`
+
+C4 full-scene result, same reference top10 + MNN top1 protocol. Descriptor
+ranking uses pure cosine; C4 is only a reliability prior.
+
+| Scene | Method | S@25 | S@50 | median t | median r | Inlier Patch@1 | rescue/break@25 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| ShopFacade | cosine baseline | 0.864 | 0.922 | 0.136m | 0.431deg | 0.428 |  |
+| ShopFacade | C4 PnP keep95 | 0.883 | 0.951 | 0.139m | 0.459deg | 0.431 | 6/4 = 1.50 |
+| ShopFacade | C4 match filter95 | 0.874 | 0.951 | 0.143m | 0.462deg | 0.430 | 6/5 = 1.20 |
+| OldHospital | cosine baseline | 0.390 | 0.687 | 0.308m | 0.560deg | 0.676 |  |
+| OldHospital | C4 PnP keep90 | 0.363 | 0.665 | 0.370m | 0.660deg | 0.678 | 24/29 = 0.83 |
+| OldHospital | C4 variance+reproj keep90 | 0.335 | 0.659 | 0.330m | 0.642deg | 0.678 | 20/30 = 0.67 |
+
+C4 conclusion:
+
+- C4 is positive on ShopFacade: a light PnP reliability preselection improves
+  S@25 and S@50 without using `score = descriptor * quality`.
+- C4 is not safe as a default on OldHospital. It improves some inlier-correctness
+  diagnostics but breaks more successful poses than it rescues.
+- The current interpretation is scene-dependent risk control, not a new main
+  descriptor or verifier. Keep C2.5 as the primary patch descriptor and expose C4
+  as an optional reliability prior that must be validated per scene.
+
+## Stage C5 Soft TopK + Local Consistency
+
+Implemented C5 as a coverage-expansion path after C2.5/C4:
+
+- matcher setting:
+  - `soft_mutual` topK instead of MNN top1;
+  - C2.5 pairwise matchability head as a post-match filter;
+  - local 2D/3D geometric consistency filter before PnP;
+  - optional C4 map reliability PnP preselection.
+- local consistency is candidate-independent and does not use GT pose:
+  - each match receives `local_consistency_support` and
+    `local_consistency_score`;
+  - support means nearby query patches also match nearby 3D landmarks;
+  - `max_input_matches` bounds the quadratic neighborhood pass for large topK
+    sweeps.
+
+Artifacts:
+
+- summary: `output/vfm/stage_c5_soft_topk_local_consistency/c5_summary.json`
+- per-scene rows/summaries:
+  `output/vfm/stage_c5_soft_topk_local_consistency/{shopfacade,oldhospital}/`
+
+C5 full-scene result, same reference top10 protocol:
+
+| Scene | Method | S@25 | S@50 | median t | median r | Inlier Patch@1 | matches |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| ShopFacade | MNN cosine baseline | 0.864 | 0.922 | 0.136m | 0.431deg | 0.428 | 740 |
+| ShopFacade | C4 PnP keep95 | 0.883 | 0.951 | 0.139m | 0.459deg | 0.431 | 740 |
+| ShopFacade | C5 soft3 pair80 local | 0.874 | 0.942 | 0.130m | 0.437deg | 0.349 | 1613 |
+| ShopFacade | C5 soft5 pair70 local | 0.845 | 0.932 | 0.140m | 0.460deg | 0.325 | 1734 |
+| OldHospital | MNN cosine baseline | 0.390 | 0.687 | 0.308m | 0.560deg | 0.676 | 1000 |
+| OldHospital | C5 soft3 pair80 local | 0.275 | 0.632 | 0.387m | 0.722deg | 0.633 | 2000 |
+| OldHospital | C5 strict soft3 pair70 local | 0.335 | 0.626 | 0.373m | 0.700deg | 0.647 | 998 |
+
+C5 conclusion:
+
+- ShopFacade shows a limited positive signal: soft topK increases coverage and
+  improves over MNN cosine baseline, but still does not beat C4 PnP keep95.
+- OldHospital is negative: extra coverage introduces outliers that pairwise
+  matchability and local consistency do not yet control.
+- C5 should remain optional/diagnostic. It should not replace MNN-only as the
+  default until it beats C4 on ShopFacade and stops breaking OldHospital.
+
 Group-gated selector smoke:
 
 - Training entry now supports input-channel group lasso plus hard group pruning.

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Mapping, Sequence
 
 import numpy as np
@@ -168,6 +168,72 @@ class LandmarkQualityConfig:
 
 
 @dataclass(frozen=True)
+class MapReliabilityConfig:
+    enabled: bool = False
+    track_weight: float = 1.0
+    variance_weight: float = 1.0
+    reprojection_weight: float = 1.0
+    idf_weight: float = 0.0
+    ambiguity_weight: float = 0.5
+    view_angle_weight: float = 0.0
+    ambiguity_reference_size: int = 4096
+    min_score: float | None = None
+    filter_keep_fraction: float | None = None
+    pnp_keep_fraction: float | None = None
+    uncertainty_min_scale: float = 0.75
+    uncertainty_max_scale: float = 2.0
+
+    def __post_init__(self) -> None:
+        weights = (
+            self.track_weight,
+            self.variance_weight,
+            self.reprojection_weight,
+            self.idf_weight,
+            self.ambiguity_weight,
+            self.view_angle_weight,
+        )
+        if any(float(weight) < 0.0 for weight in weights):
+            raise ValueError("map reliability weights must be non-negative")
+        if self.min_score is not None and not 0.0 <= float(self.min_score) <= 1.0:
+            raise ValueError("map reliability min_score must be in [0, 1]")
+        if self.filter_keep_fraction is not None and not 0.0 < float(self.filter_keep_fraction) <= 1.0:
+            raise ValueError("map reliability filter_keep_fraction must be in (0, 1]")
+        if self.pnp_keep_fraction is not None and not 0.0 < float(self.pnp_keep_fraction) <= 1.0:
+            raise ValueError("map reliability pnp_keep_fraction must be in (0, 1]")
+        if self.ambiguity_reference_size <= 1:
+            raise ValueError("ambiguity_reference_size must be greater than 1")
+        if float(self.uncertainty_min_scale) <= 0.0 or float(self.uncertainty_max_scale) <= 0.0:
+            raise ValueError("uncertainty scales must be positive")
+        if float(self.uncertainty_min_scale) > float(self.uncertainty_max_scale):
+            raise ValueError("uncertainty_min_scale must be <= uncertainty_max_scale")
+
+
+@dataclass(frozen=True)
+class LocalGeometricConsistencyConfig:
+    enabled: bool = False
+    image_radius_px: float = 96.0
+    xyz_radius_m: float = 2.0
+    min_support: int | None = 1
+    min_score: float | None = None
+    keep_fraction: float | None = None
+    max_input_matches: int | None = None
+
+    def __post_init__(self) -> None:
+        if float(self.image_radius_px) <= 0.0:
+            raise ValueError("image_radius_px must be positive")
+        if float(self.xyz_radius_m) <= 0.0:
+            raise ValueError("xyz_radius_m must be positive")
+        if self.min_support is not None and int(self.min_support) < 0:
+            raise ValueError("min_support must be non-negative")
+        if self.min_score is not None and not 0.0 <= float(self.min_score) <= 1.0:
+            raise ValueError("min_score must be in [0, 1]")
+        if self.keep_fraction is not None and not 0.0 < float(self.keep_fraction) <= 1.0:
+            raise ValueError("keep_fraction must be in (0, 1]")
+        if self.max_input_matches is not None and int(self.max_input_matches) <= 0:
+            raise ValueError("max_input_matches must be positive")
+
+
+@dataclass(frozen=True)
 class QueryTo3DMatchingConfig:
     top_k: int = 2
     ratio_threshold: float | None = 0.9
@@ -236,6 +302,10 @@ class QueryTo3DMatch:
     alpha_entropy: float | None = None
     top1_alpha_contribution: float | None = None
     depth_variance_along_ray: float | None = None
+    map_reliability: float | None = None
+    pnp_uncertainty_scale: float | None = None
+    local_consistency_support: int | None = None
+    local_consistency_score: float | None = None
 
 
 @dataclass(frozen=True)
@@ -424,6 +494,140 @@ def landmark_quality_scores(
         + weights["ambiguity"] * ambiguity_quality
     ) / denominator
     return np.clip(score, 0.0, 1.0).astype(np.float32, copy=False), ambiguity.astype(np.float32, copy=False)
+
+
+def map_reliability_scores(
+    index: LandmarkMapIndex,
+    landmark_features: np.ndarray,
+    config: MapReliabilityConfig,
+    block_size: int = 512,
+) -> np.ndarray:
+    """Compute a map-side reliability prior without changing descriptor similarity."""
+
+    if len(index) == 0:
+        return np.zeros((0,), dtype=np.float32)
+    if not config.enabled:
+        return np.ones((len(index),), dtype=np.float32)
+    quality_config = LandmarkQualityConfig(
+        enabled=True,
+        track_weight=float(config.track_weight),
+        variance_weight=float(config.variance_weight),
+        reprojection_weight=float(config.reprojection_weight),
+        idf_weight=float(config.idf_weight),
+        ambiguity_weight=float(config.ambiguity_weight),
+        ambiguity_reference_size=int(config.ambiguity_reference_size),
+    )
+    scores, _ambiguity = landmark_quality_scores(
+        index,
+        landmark_features,
+        quality_config,
+        block_size=block_size,
+        force_ambiguity=bool(config.idf_weight > 0.0 or config.ambiguity_weight > 0.0),
+    )
+    return scores.astype(np.float32, copy=False)
+
+
+def map_reliability_uncertainty_scale(reliability: float, config: MapReliabilityConfig) -> float:
+    clipped = float(np.clip(float(reliability), 0.0, 1.0))
+    min_scale = float(config.uncertainty_min_scale)
+    max_scale = float(config.uncertainty_max_scale)
+    return float(max_scale - clipped * (max_scale - min_scale))
+
+
+def select_pnp_matches_by_map_reliability(
+    matches: Sequence[QueryTo3DMatch],
+    keep_fraction: float | None = None,
+    min_score: float | None = None,
+) -> list[QueryTo3DMatch]:
+    """Select high-reliability PnP inputs while preserving match order."""
+
+    values = list(matches)
+    if not values:
+        return values
+    if keep_fraction is None and min_score is None:
+        return values
+    scored = [match for match in values if match.map_reliability is not None]
+    if not scored:
+        return values
+    keep_ids: set[int] = set()
+    if keep_fraction is not None:
+        keep_count = max(1, int(np.ceil(len(scored) * float(keep_fraction))))
+        order = np.argsort([-float(match.map_reliability) for match in scored], kind="mergesort")
+        keep_ids.update(id(scored[int(idx)]) for idx in order[:keep_count])
+    else:
+        keep_ids.update(id(match) for match in scored)
+    selected = []
+    for match in values:
+        if match.map_reliability is None:
+            continue
+        if id(match) not in keep_ids:
+            continue
+        if min_score is not None and float(match.map_reliability) < float(min_score):
+            continue
+        selected.append(match)
+    return selected
+
+
+def local_geometric_consistency_scores(
+    matches: Sequence[QueryTo3DMatch],
+    config: LocalGeometricConsistencyConfig,
+) -> tuple[np.ndarray, np.ndarray]:
+    count = len(matches)
+    if count == 0:
+        return np.zeros((0,), dtype=np.int64), np.zeros((0,), dtype=np.float32)
+    xy = np.stack([match.xy for match in matches], axis=0).astype(np.float64)
+    xyz = np.stack([match.xyz for match in matches], axis=0).astype(np.float64)
+    token_indices = np.asarray([int(match.token_index) for match in matches], dtype=np.int64)
+    supports = np.zeros((count,), dtype=np.int64)
+    scores = np.zeros((count,), dtype=np.float32)
+    image_radius = float(config.image_radius_px)
+    xyz_radius = float(config.xyz_radius_m)
+    for idx in range(count):
+        image_distance = np.linalg.norm(xy - xy[idx], axis=1)
+        xyz_distance = np.linalg.norm(xyz - xyz[idx], axis=1)
+        neighbor = image_distance <= image_radius
+        neighbor &= token_indices != token_indices[idx]
+        support = neighbor & (xyz_distance <= xyz_radius)
+        supports[idx] = int(np.sum(support))
+        denominator = max(int(np.sum(neighbor)), 1)
+        scores[idx] = float(supports[idx]) / float(denominator)
+    return supports, scores
+
+
+def filter_matches_by_local_geometric_consistency(
+    matches: Sequence[QueryTo3DMatch],
+    config: LocalGeometricConsistencyConfig,
+) -> list[QueryTo3DMatch]:
+    values = list(matches)
+    if not config.enabled or not values:
+        return values
+    if config.max_input_matches is not None and len(values) > int(config.max_input_matches):
+        values = values[: int(config.max_input_matches)]
+    supports, scores = local_geometric_consistency_scores(values, config)
+    annotated = [
+        replace(
+            match,
+            local_consistency_support=int(supports[idx]),
+            local_consistency_score=float(scores[idx]),
+        )
+        for idx, match in enumerate(values)
+    ]
+    keep = np.ones((len(annotated),), dtype=bool)
+    if config.min_support is not None:
+        keep &= supports >= int(config.min_support)
+    if config.min_score is not None:
+        keep &= scores >= float(config.min_score)
+    if config.keep_fraction is not None:
+        keep_count = max(1, int(np.ceil(len(annotated) * float(config.keep_fraction))))
+        order = sorted(
+            range(len(annotated)),
+            key=lambda idx: (float(scores[idx]), int(supports[idx])),
+            reverse=True,
+        )
+        top_keep = np.zeros((len(annotated),), dtype=bool)
+        top_keep[order[:keep_count]] = True
+        keep &= top_keep
+    return [match for idx, match in enumerate(annotated) if bool(keep[idx])]
 
 
 def with_landmark_ambiguity_scores(
@@ -667,6 +871,7 @@ def estimate_pose_pnp_ransac(
     reprojection_error_px: float = 8.0,
     confidence: float = 0.999,
     iterations: int = 1000,
+    min_inliers: int = 0,
 ) -> PnPResult:
     if len(matches) < 4:
         return PnPResult(
@@ -708,6 +913,14 @@ def estimate_pose_pnp_ransac(
     pose[:3, 3] = tvec.reshape(3).astype(np.float64)
     mask = np.zeros((len(matches),), dtype=bool)
     mask[np.asarray(inliers, dtype=np.int64).reshape(-1)] = True
+    if int(min_inliers) > 0 and int(mask.sum()) < int(min_inliers):
+        return PnPResult(
+            success=False,
+            pose_w2c=None,
+            inlier_mask=np.zeros((len(matches),), dtype=bool),
+            match_count=len(matches),
+            inlier_count=0,
+        )
     return PnPResult(
         success=True,
         pose_w2c=pose,

@@ -33,11 +33,29 @@ from feature_extract.vfm.patch_to_3d_matching import (
 from feature_extract.vfm.query_to_3d_matching import (
     LandmarkQualityConfig,
     LandmarkMapIndex,
+    LocalGeometricConsistencyConfig,
+    MapReliabilityConfig,
     estimate_pose_pnp_ransac,
     filter_landmarks_by_reference_images,
     pnp_pose_error,
     with_landmark_ambiguity_scores,
 )
+
+
+def _matching_config_dict(config: PatchTo3DMatchingConfig) -> dict[str, object]:
+    values = dict(config.__dict__)
+    quality = values.get("landmark_quality")
+    if isinstance(quality, LandmarkQualityConfig):
+        values["landmark_quality"] = dict(quality.__dict__)
+    reliability = values.get("map_reliability")
+    if isinstance(reliability, MapReliabilityConfig):
+        values["map_reliability"] = dict(reliability.__dict__)
+    local = values.get("local_geometric_consistency")
+    if isinstance(local, LocalGeometricConsistencyConfig):
+        values["local_geometric_consistency"] = dict(local.__dict__)
+    return values
+
+
 from feature_extract.vfm.query_to_3d_visualization import (
     _match_patch_correct_mask,
     render_patch_to_3d_match_overlay,
@@ -315,8 +333,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 "query_count": len(summaries),
                 "queries": summaries,
                 "matching_config": {
-                    **dict(config.__dict__),
-                    "landmark_quality": dict(config.landmark_quality.__dict__),
+                    **_matching_config_dict(config),
                     "pnp_threshold_stride_multiplier": float(args.pnp_threshold_stride_multiplier),
                     "patch_scale": float(args.patch_scale),
                 },

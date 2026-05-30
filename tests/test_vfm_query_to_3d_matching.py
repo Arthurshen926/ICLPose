@@ -5,9 +5,15 @@ from feature_extract.vfm.map_lifting import SelectedTrackFeatureBank, TrackFeatu
 from feature_extract.vfm.query_to_3d_matching import (
     LandmarkQualityConfig,
     LandmarkMapIndex,
+    LocalGeometricConsistencyConfig,
+    MapReliabilityConfig,
+    QueryTo3DMatch,
     QueryTo3DMatchingConfig,
     estimate_pose_pnp_ransac,
+    filter_matches_by_local_geometric_consistency,
     filter_landmarks_by_reference_images,
+    map_reliability_scores,
+    select_pnp_matches_by_map_reliability,
     match_query_tokens_to_landmarks,
     pnp_pose_error,
     pnp_reprojection_residual_stats,
@@ -77,6 +83,11 @@ def test_query_tokens_match_landmarks_and_support_pnp() -> None:
     error = pnp_pose_error(result.pose_w2c, np.eye(4, dtype=np.float64))
     assert error.translation_m < 1e-4
     assert error.rotation_deg < 1e-3
+
+    strict_result = estimate_pose_pnp_ransac(matches, _camera(), reprojection_error_px=2.0, iterations=200, min_inliers=7)
+    assert not strict_result.success
+    assert strict_result.pose_w2c is None
+    assert strict_result.inlier_count == 0
 
 
 def test_matching_filters_by_ratio_mutual_and_landmark_variance() -> None:
@@ -320,3 +331,137 @@ def test_pnp_residual_and_spatial_distribution_stats_expose_degeneracy() -> None
     assert spatial["bbox_area_frac"] < 0.01
     assert spatial["grid_4x4_occupancy_frac"] == 1.0 / 16.0
     assert spatial["xy_pca_minor_major_ratio"] < 1e-6
+
+
+def test_map_reliability_scores_rank_stable_distinctive_tracks() -> None:
+    index = LandmarkMapIndex(
+        track_ids=np.asarray([1, 2, 3], dtype=np.int64),
+        xyz=np.zeros((3, 3), dtype=np.float64),
+        features=np.asarray([[1.0, 0.0], [0.95, 0.05], [0.0, 1.0]], dtype=np.float32),
+        mean_variances=np.asarray([0.8, 0.05, 0.02], dtype=np.float32),
+        observation_counts=np.asarray([1, 8, 12], dtype=np.int64),
+        observation_image_ids=(("a",), tuple("abcdefgh"), tuple("abcdefghijkl")),
+        reprojection_errors=np.asarray([4.0, 0.5, 0.1], dtype=np.float32),
+        feature_ambiguities=np.asarray([0.9, 0.6, 0.05], dtype=np.float32),
+    )
+
+    scores = map_reliability_scores(
+        index,
+        index.features,
+        MapReliabilityConfig(
+            enabled=True,
+            track_weight=1.0,
+            variance_weight=1.0,
+            reprojection_weight=1.0,
+            idf_weight=1.0,
+            ambiguity_weight=1.0,
+        ),
+    )
+
+    assert scores.shape == (3,)
+    assert 0.0 <= float(np.min(scores)) <= float(np.max(scores)) <= 1.0
+    assert int(index.track_ids[int(np.argmax(scores))]) == 3
+    assert scores[2] > scores[1] > scores[0]
+
+
+def test_select_pnp_matches_by_map_reliability_keeps_descriptor_order() -> None:
+    matches = [
+        QueryTo3DMatch(
+            token_index=idx,
+            xy=np.asarray([float(idx), 0.0], dtype=np.float64),
+            track_id=idx,
+            xyz=np.asarray([0.0, 0.0, 5.0 + idx], dtype=np.float64),
+            similarity=1.0 - idx * 0.1,
+            ratio=0.0,
+            landmark_variance=0.0,
+            map_reliability=reliability,
+        )
+        for idx, reliability in [(1, 0.2), (2, 0.9), (3, 0.8), (4, 0.1)]
+    ]
+
+    selected = select_pnp_matches_by_map_reliability(matches, keep_fraction=0.5)
+
+    assert [match.track_id for match in selected] == [2, 3]
+
+
+def test_local_geometric_consistency_filters_isolated_3d_outlier_without_reranking() -> None:
+    matches = [
+        QueryTo3DMatch(
+            token_index=1,
+            xy=np.asarray([10.0, 10.0], dtype=np.float64),
+            track_id=1,
+            xyz=np.asarray([0.0, 0.0, 5.0], dtype=np.float64),
+            similarity=0.99,
+            ratio=0.0,
+            landmark_variance=0.0,
+        ),
+        QueryTo3DMatch(
+            token_index=2,
+            xy=np.asarray([25.0, 12.0], dtype=np.float64),
+            track_id=2,
+            xyz=np.asarray([0.2, 0.0, 5.1], dtype=np.float64),
+            similarity=0.95,
+            ratio=0.0,
+            landmark_variance=0.0,
+        ),
+        QueryTo3DMatch(
+            token_index=3,
+            xy=np.asarray([18.0, 24.0], dtype=np.float64),
+            track_id=3,
+            xyz=np.asarray([0.1, 0.2, 5.0], dtype=np.float64),
+            similarity=0.90,
+            ratio=0.0,
+            landmark_variance=0.0,
+        ),
+        QueryTo3DMatch(
+            token_index=4,
+            xy=np.asarray([16.0, 18.0], dtype=np.float64),
+            track_id=99,
+            xyz=np.asarray([20.0, 0.0, 5.0], dtype=np.float64),
+            similarity=0.89,
+            ratio=0.0,
+            landmark_variance=0.0,
+        ),
+    ]
+
+    filtered = filter_matches_by_local_geometric_consistency(
+        matches,
+        LocalGeometricConsistencyConfig(
+            enabled=True,
+            image_radius_px=32.0,
+            xyz_radius_m=1.0,
+            min_support=1,
+        ),
+    )
+
+    assert [match.track_id for match in filtered] == [1, 2, 3]
+    assert [match.local_consistency_support for match in filtered] == [2, 2, 2]
+    assert all(match.local_consistency_score is not None for match in filtered)
+
+
+def test_local_geometric_consistency_can_cap_input_matches_before_quadratic_filter() -> None:
+    matches = [
+        QueryTo3DMatch(
+            token_index=idx,
+            xy=np.asarray([float(idx), 0.0], dtype=np.float64),
+            track_id=idx,
+            xyz=np.asarray([float(idx) * 0.1, 0.0, 5.0], dtype=np.float64),
+            similarity=1.0 - idx * 0.01,
+            ratio=0.0,
+            landmark_variance=0.0,
+        )
+        for idx in range(6)
+    ]
+
+    filtered = filter_matches_by_local_geometric_consistency(
+        matches,
+        LocalGeometricConsistencyConfig(
+            enabled=True,
+            image_radius_px=10.0,
+            xyz_radius_m=1.0,
+            min_support=None,
+            max_input_matches=3,
+        ),
+    )
+
+    assert [match.track_id for match in filtered] == [0, 1, 2]
