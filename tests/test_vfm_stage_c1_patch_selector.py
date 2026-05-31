@@ -237,6 +237,77 @@ def test_stage_c1_sample_builder_can_mine_negatives_with_alternate_descriptor_sp
     assert samples.metadata["negative_mining_descriptor"] == "alternate"
 
 
+def test_stage_c1_sample_builder_can_use_semi_hard_reprojection_curriculum():
+    from feature_extract.vfm.patch_selector_training import (
+        PatchSelectorSampleConfig,
+        build_patch_selector_samples_for_query,
+    )
+
+    camera = ColmapCamera(camera_id=1, model_id=0, width=101, height=101, params=(80.0, 50.0, 50.0))
+    token_width = token_height = 5
+    center_xy = np.asarray([50.0, 50.0], dtype=np.float64)
+    stride = 25.0
+
+    def xyz_from_xy(xy):
+        z = 5.0
+        return np.asarray([(xy[0] - 50.0) / 80.0 * z, (xy[1] - 50.0) / 80.0 * z, z], dtype=np.float64)
+
+    xy = np.stack(
+        [
+            center_xy,
+            center_xy + np.asarray([1.0 * stride, 0.0]),
+            center_xy + np.asarray([2.0 * stride, 0.0]),
+            center_xy + np.asarray([-2.0 * stride, 0.0]),
+        ],
+        axis=0,
+    )
+    landmark_index = LandmarkMapIndex(
+        track_ids=np.asarray([10, 20, 30, 40], dtype=np.int64),
+        xyz=np.stack([xyz_from_xy(item) for item in xy], axis=0),
+        features=np.asarray(
+            [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.99, 0.01, 0.0, 0.0],
+                [0.98, 0.02, 0.0, 0.0],
+                [0.97, 0.03, 0.0, 0.0],
+            ],
+            dtype=np.float32,
+        ),
+        mean_variances=np.zeros((4,), dtype=np.float32),
+        observation_counts=np.ones((4,), dtype=np.int64) * 3,
+        observation_image_ids=(("a",), ("b",), ("c",), ("d",)),
+    )
+    query_feature = np.zeros((4, token_height, token_width), dtype=np.float32)
+    query_feature[:, 2, 2] = np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    positives = build_patch_positive_sets(
+        landmark_index,
+        np.eye(4, dtype=np.float64),
+        camera,
+        token_width=token_width,
+        token_height=token_height,
+    )
+
+    samples = build_patch_selector_samples_for_query(
+        query_feature,
+        landmark_index,
+        positives,
+        PatchSelectorSampleConfig(
+            max_tokens_per_query=1,
+            max_positives_per_token=1,
+            hard_negatives_per_token=1,
+            hard_negative_pool=3,
+            query_token_step=1,
+            seed=3,
+            negative_curriculum="semi_hard",
+            semi_hard_min_stride=2.0,
+            semi_hard_max_stride=4.0,
+        ),
+    )
+
+    np.testing.assert_allclose(samples.negative_features[0, 0], landmark_index.features[2])
+    assert samples.metadata["negative_curriculum"] == "semi_hard"
+
+
 def test_stage_c1_sample_builder_batches_hard_negative_search_after_token_limit(monkeypatch):
     import feature_extract.vfm.patch_selector_training as training
     from feature_extract.vfm.patch_to_3d_matching import PatchPositiveSet, PatchPositiveSets, TokenPatchBox
@@ -505,6 +576,16 @@ def test_stage_c1_cli_can_build_sample_cache_only_without_training(tmp_path: Pat
             "--build_sample_cache_only",
             "--max_train_samples",
             "2",
+            "--negative_curriculum",
+            "semi_hard",
+            "--medium_min_stride",
+            "5.0",
+            "--semi_hard_min_stride",
+            "1.5",
+            "--semi_hard_max_stride",
+            "3.5",
+            "--mixed_hard_fraction",
+            "0.25",
             "--output_dim",
             "2",
             "--steps",
@@ -524,6 +605,11 @@ def test_stage_c1_cli_can_build_sample_cache_only_without_training(tmp_path: Pat
     summary = json.loads((output_dir / "summary.json").read_text())
     assert summary["cache_only"] is True
     assert summary["sample_summary"]["sample_count"] == 2
+    assert summary["sample_config"]["negative_curriculum"] == "semi_hard"
+    assert summary["sample_config"]["medium_min_stride"] == 5.0
+    assert summary["sample_config"]["semi_hard_min_stride"] == 1.5
+    assert summary["sample_config"]["semi_hard_max_stride"] == 3.5
+    assert summary["sample_config"]["mixed_hard_fraction"] == 0.25
 
 
 def test_stage_c1_cli_reuses_sample_cache(tmp_path: Path, monkeypatch):

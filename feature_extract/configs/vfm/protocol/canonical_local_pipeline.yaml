@@ -1,0 +1,51 @@
+protocol_name: canonical_patch_to_3d_local_pipeline
+protocol_kind: reference_pose
+description: >
+  Canonical sparse VFM patch-to-3D localization protocol for C2.5+ evaluation.
+
+fixed_components:
+  descriptor: C2.5 best scene-specific checkpoint
+  submap: reference_pose_top10_landmark_pool
+  matching: patch_level_mnn_top1
+  pnp_threshold: 0.75_token_stride
+  pnp_method: EPNP
+  pnp_confidence: 0.999
+  pnp_min_inliers: 0
+  refine: solvePnPRefineLM_on_ransac_inliers
+  soft_pnp_ordering: disabled
+  landmark_filters:
+    min_observation_count: 2
+    max_matches: 1000
+    score_mode: similarity
+
+reported_methods:
+  - raw1280
+  - random128
+  - PCA512
+  - C1_learned128
+  - C2_S
+  - C2_5
+  - C2_5_plus_LM
+
+metrics:
+  - success_10cm_5deg
+  - success_25cm_10deg
+  - success_50cm_10deg
+  - median_translation_error_m
+  - median_rotation_error_deg
+  - mean_pnp_inlier_patch_at_1
+  - mean_pnp_inlier_count
+  - pnp_solve_rate
+  - runtime_sec_per_query
+
+scenes:
+  OldHospital:
+    query_pose_file: /hy-tmp/Cambridge_stdloc/OldHospital/dataset_test.txt
+    camera_model_dir: /hy-tmp/Cambridge_stdloc/OldHospital/sparse/0
+    candidate_bank: output/vfm/candidate_banks/oldhospital_reference_pose_top10_fixed.jsonl
+    visibility_index: output/vfm/colmap_tracks/OldHospital/model_train_full_visibility_min2_v1.npz
+  ShopFacade:
+    query_pose_file: /hy-tmp/Cambridge_stdloc/ShopFacade/dataset_test.txt
+    camera_model_dir: /hy-tmp/Cambridge_stdloc/ShopFacade/sparse/0
+    candidate_bank: output/vfm/candidate_banks/shopfacade_reference_pose_top10_fixed.jsonl
+    visibility_index: output/vfm/colmap_tracks/ShopFacade/model_train_full_visibility_min2_v1.npz

@@ -28,22 +28,39 @@ from feature_extract.vfm.patch_to_3d_matching import (
     PatchTo3DMatchingConfig,
     build_patch_positive_sets,
     evaluate_patch_matches,
+    filter_patch_correct_matches,
     filter_landmarks_by_projected_visibility,
     match_query_patches_to_landmarks,
+    oracle_patch_positive_matches,
     patch_uncertainty_pnp_threshold,
     patch_positive_set_stats,
 )
+from feature_extract.vfm.patch_offset_refiner import (
+    apply_predicted_patch_offsets,
+    load_patch_offset_refiner_checkpoint,
+    predict_patch_offsets_for_matches,
+    refine_matches_with_oracle_offsets,
+)
 from feature_extract.vfm.query_to_3d_matching import (
+    LandmarkAmbiguityPruningConfig,
     LandmarkQualityConfig,
     LandmarkMapIndex,
     LocalGeometricConsistencyConfig,
     MapReliabilityConfig,
+    PoseRiskConfig,
+    SpatialDiversityPnPConfig,
     estimate_pose_pnp_ransac,
+    estimate_pose_pnp_fixed,
     filter_landmarks_by_reference_images,
+    match_reprojection_errors,
     match_spatial_distribution_stats,
     pnp_pose_error,
     pnp_reprojection_residual_stats,
+    pose_risk_score,
+    selective_localization_summary,
+    select_pnp_matches_by_spatial_diversity,
     select_pnp_matches_by_map_reliability,
+    soft_order_pnp_matches,
     with_landmark_ambiguity_scores,
 )
 from feature_extract.vfm.tokens import TokenBankManifest
@@ -97,6 +114,9 @@ def _matching_config_dict(config: PatchTo3DMatchingConfig) -> dict[str, object]:
     local = values.get("local_geometric_consistency")
     if isinstance(local, LocalGeometricConsistencyConfig):
         values["local_geometric_consistency"] = dict(local.__dict__)
+    ambiguity = values.get("landmark_ambiguity_pruning")
+    if isinstance(ambiguity, LandmarkAmbiguityPruningConfig):
+        values["landmark_ambiguity_pruning"] = dict(ambiguity.__dict__)
     return values
 
 
@@ -189,6 +209,16 @@ def _full_inlier_mask(matches, pnp_matches, pnp_mask: np.ndarray) -> np.ndarray:
         if match_idx is not None:
             full[match_idx] = True
     return full
+
+
+def _selected_match_indices(matches, pnp_matches) -> list[int]:
+    positions = {id(match): idx for idx, match in enumerate(matches)}
+    indices = []
+    for match in pnp_matches:
+        idx = positions.get(id(match))
+        if idx is not None:
+            indices.append(int(idx))
+    return indices
 
 
 def _load_reference_pose_priors(candidate_bank: str, submap_top_n: int) -> dict[str, list[dict[str, object]]]:
@@ -306,6 +336,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     parser.add_argument("--max_landmark_variance", type=float, default=None)
     parser.add_argument("--max_landmark_reprojection_error", type=float, default=None)
     parser.add_argument("--max_landmark_ambiguity", type=float, default=None)
+    parser.add_argument("--enable_landmark_ambiguity_pruning", action="store_true")
+    parser.add_argument("--ambiguity_prune_drop_fraction", type=float, default=None)
+    parser.add_argument("--ambiguity_prune_max_score", type=float, default=None)
+    parser.add_argument("--ambiguity_prune_close_similarity", type=float, default=0.9)
+    parser.add_argument("--ambiguity_prune_reference_size", type=int, default=4096)
     parser.add_argument("--min_distance_to_boundary_px", type=float, default=None)
     parser.add_argument("--min_quality_weighted_similarity", type=float, default=None)
     parser.add_argument("--min_observation_count", type=int, default=2)
@@ -338,6 +373,24 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     parser.add_argument("--local_consistency_min_score", type=float, default=None)
     parser.add_argument("--local_consistency_keep_fraction", type=float, default=None)
     parser.add_argument("--local_consistency_max_input_matches", type=int, default=None)
+    parser.add_argument("--enable_spatial_diversity_pnp", action="store_true")
+    parser.add_argument("--spatial_diversity_grid_rows", type=int, default=4)
+    parser.add_argument("--spatial_diversity_grid_cols", type=int, default=4)
+    parser.add_argument("--spatial_diversity_max_per_cell", type=int, default=2)
+    parser.add_argument("--spatial_diversity_max_matches", type=int, default=None)
+    parser.add_argument("--spatial_diversity_min_depth_range_m", type=float, default=None)
+    parser.add_argument("--spatial_diversity_min_planarity_ratio", type=float, default=None)
+    parser.add_argument(
+        "--spatial_diversity_score_mode",
+        default="margin",
+        choices=("margin", "pairwise", "reliability", "similarity"),
+    )
+    parser.add_argument(
+        "--pnp_soft_order_mode",
+        default="none",
+        choices=("none", "similarity", "margin", "reliability", "confidence", "composite"),
+    )
+    parser.add_argument("--pnp_soft_order_top_n", type=int, default=0)
     parser.add_argument("--max_matches", type=int, default=1000)
     parser.add_argument("--match_block_size", type=int, default=256)
     parser.add_argument("--similarity_device", default="cpu")
@@ -358,11 +411,51 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     parser.add_argument("--pnp_threshold_stride_multiplier", type=float, default=1.5)
     parser.add_argument("--pnp_min_inliers", type=int, default=0)
     parser.add_argument("--pnp_iterations", type=int, default=1000)
+    parser.add_argument("--pnp_confidence", type=float, default=0.999)
+    parser.add_argument("--pnp_method", default="EPNP", choices=("AP3P", "EPNP", "ITERATIVE", "P3P", "SQPNP"))
+    parser.add_argument("--pnp_refine_method", default="none", choices=("none", "LM", "VVS"))
+    parser.add_argument("--pnp_refine_lm", action="store_true")
+    parser.add_argument(
+        "--patch_offset_mode",
+        default="none",
+        choices=(
+            "none",
+            "oracle_all",
+            "oracle_patch_positive",
+            "oracle_two_pass_inliers",
+            "oracle_two_pass_inliers_patch_positive",
+            "oracle_same_inlier_fixed",
+            "oracle_same_inlier_fixed_patch_positive",
+            "learned_confidence",
+            "learned_two_pass_inliers",
+            "learned_same_inlier_fixed",
+        ),
+    )
+    parser.add_argument("--patch_offset_checkpoint", default="")
+    parser.add_argument("--patch_offset_device", default="")
+    parser.add_argument("--patch_offset_batch_size", type=int, default=4096)
+    parser.add_argument("--patch_offset_confidence_threshold", type=float, default=0.5)
+    parser.add_argument("--patch_offset_max_stride", type=float, default=0.5)
+    parser.add_argument("--patch_offset_max_sigma", type=float, default=None)
+    parser.add_argument("--patch_offset_free_oracle", action="store_true")
+    parser.add_argument("--patch_offset_bound_metric", default="l2", choices=("l2", "linf"))
+    parser.add_argument("--patch_offset_oracle_noise_px", type=float, default=0.0)
+    parser.add_argument("--patch_offset_oracle_seed", type=int, default=0)
+    parser.add_argument("--risk_coverages", default="0.8,0.9,1.0")
+    parser.add_argument(
+        "--oracle_match_mode",
+        default="none",
+        choices=("none", "patch_positives", "filter_gt_correct"),
+    )
+    parser.add_argument("--oracle_max_positives_per_token", type=int, default=1)
     parser.add_argument("--max_queries", type=int, default=0)
     parser.add_argument("--output_jsonl", required=True)
     parser.add_argument("--output_matches_jsonl", default="")
     parser.add_argument("--summary_json", required=True)
     args = parser.parse_args(argv)
+
+    if args.submap_mode == "reference_visibility" and not args.candidate_bank:
+        raise ValueError("candidate_bank is required when submap_mode=reference_visibility")
 
     manifest = TokenBankManifest.from_json(Path(args.query_manifest))
     manifest.validate(verify_checksums=False)
@@ -436,6 +529,14 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             keep_fraction=args.local_consistency_keep_fraction,
             max_input_matches=args.local_consistency_max_input_matches,
         ),
+        landmark_ambiguity_pruning=LandmarkAmbiguityPruningConfig(
+            enabled=bool(args.enable_landmark_ambiguity_pruning),
+            drop_fraction=args.ambiguity_prune_drop_fraction,
+            max_score=args.ambiguity_prune_max_score,
+            close_similarity_threshold=float(args.ambiguity_prune_close_similarity),
+            reference_size=int(args.ambiguity_prune_reference_size),
+            block_size=int(args.match_block_size),
+        ),
         landmark_quality=LandmarkQualityConfig(
             enabled=bool(args.enable_landmark_quality),
             track_weight=args.quality_track_weight,
@@ -455,6 +556,14 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             device=args.pairwise_device or args.similarity_device,
             batch_size=int(args.pairwise_batch_size),
         )
+    offset_run = None
+    if args.patch_offset_mode.startswith("learned"):
+        if not args.patch_offset_checkpoint:
+            raise ValueError("patch_offset_checkpoint is required for learned patch offset modes")
+        offset_run = load_patch_offset_refiner_checkpoint(
+            Path(args.patch_offset_checkpoint),
+            device=args.patch_offset_device or args.similarity_device,
+        )
 
     rows = []
     match_rows = []
@@ -470,6 +579,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         gt_visible_track_ids = _track_id_set(gt_visible_submap)
         submap = landmark_index
         references = reference_submaps.get(query_id, [])
+        if args.submap_mode == "reference_visibility" and not references:
+            raise ValueError(f"no reference_visibility candidates found for query_id={query_id}")
         reference_prior = _reference_prior_summary(reference_pose_priors.get(query_id, []))
         visibility_gate = {"full_visible_tracks": None, "bank_visible_tracks": None, "bank_visibility_coverage": None}
         if args.submap_mode == "gt_visible":
@@ -507,30 +618,6 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         stride_x = float(camera.width - 1) / max(float(token_width - 1), 1.0)
         stride_y = float(camera.height - 1) / max(float(token_height - 1), 1.0)
         stride = float(max(stride_x, stride_y))
-        matches = match_query_patches_to_landmarks(
-            query_feature,
-            submap,
-            config,
-            int(camera.width),
-            int(camera.height),
-            pairwise_inlier_scorer=pairwise_scorer,
-            pairwise_inlier_weight=float(args.pairwise_inlier_weight),
-        )
-        pnp_matches = select_pnp_matches_by_map_reliability(
-            matches,
-            keep_fraction=config.map_reliability.pnp_keep_fraction if config.map_reliability.enabled else None,
-            min_score=None,
-        )
-        pnp = estimate_pose_pnp_ransac(
-            pnp_matches,
-            camera,
-            reprojection_error_px=patch_uncertainty_pnp_threshold(stride, args.pnp_threshold_stride_multiplier),
-            iterations=args.pnp_iterations,
-            min_inliers=int(args.pnp_min_inliers),
-        )
-        full_pnp_inlier_mask = _full_inlier_mask(matches, pnp_matches, pnp.inlier_mask)
-        pnp_match_ids = {id(match) for match in pnp_matches}
-        pnp_selected_mask = np.asarray([id(match) in pnp_match_ids for match in matches], dtype=bool)
         positives = build_patch_positive_sets(
             submap,
             gt_pose.pose_w2c,
@@ -539,6 +626,184 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             token_height,
             patch_scale=args.patch_scale,
         )
+        if args.oracle_match_mode == "patch_positives":
+            matches = oracle_patch_positive_matches(
+                submap,
+                positives,
+                max_per_token=int(args.oracle_max_positives_per_token),
+            )
+        else:
+            matches = match_query_patches_to_landmarks(
+                query_feature,
+                submap,
+                config,
+                int(camera.width),
+                int(camera.height),
+                pairwise_inlier_scorer=pairwise_scorer,
+                pairwise_inlier_weight=float(args.pairwise_inlier_weight),
+            )
+            if args.oracle_match_mode == "filter_gt_correct":
+                matches = filter_patch_correct_matches(matches, positives)
+        if args.pnp_soft_order_mode != "none":
+            matches = soft_order_pnp_matches(matches, mode=args.pnp_soft_order_mode)
+        pnp_matches = select_pnp_matches_by_map_reliability(
+            matches,
+            keep_fraction=config.map_reliability.pnp_keep_fraction if config.map_reliability.enabled else None,
+            min_score=None,
+        )
+        if args.pnp_soft_order_mode != "none" and args.pnp_soft_order_top_n > 0:
+            pnp_matches = pnp_matches[: int(args.pnp_soft_order_top_n)]
+        pnp_matches = select_pnp_matches_by_spatial_diversity(
+            pnp_matches,
+            image_width=int(camera.width),
+            image_height=int(camera.height),
+            config=SpatialDiversityPnPConfig(
+                enabled=bool(args.enable_spatial_diversity_pnp),
+                grid_rows=int(args.spatial_diversity_grid_rows),
+                grid_cols=int(args.spatial_diversity_grid_cols),
+                max_per_cell=int(args.spatial_diversity_max_per_cell),
+                max_matches=args.spatial_diversity_max_matches,
+                score_mode=args.spatial_diversity_score_mode,
+                min_depth_range_m=args.spatial_diversity_min_depth_range_m,
+                min_planarity_ratio=args.spatial_diversity_min_planarity_ratio,
+            ),
+        )
+        selected_indices = _selected_match_indices(matches, pnp_matches)
+        pnp_threshold = patch_uncertainty_pnp_threshold(stride, args.pnp_threshold_stride_multiplier)
+
+        def run_pnp(current_pnp_matches):
+            return estimate_pose_pnp_ransac(
+                current_pnp_matches,
+                camera,
+                reprojection_error_px=pnp_threshold,
+                confidence=float(args.pnp_confidence),
+                iterations=args.pnp_iterations,
+                min_inliers=int(args.pnp_min_inliers),
+                refine_lm=bool(args.pnp_refine_lm),
+                pnp_method=args.pnp_method,
+                refine_method=args.pnp_refine_method,
+            )
+
+        offset_summary = {"mode": args.patch_offset_mode, "refined_count": 0}
+        oracle_max_stride = None if bool(args.patch_offset_free_oracle) else float(args.patch_offset_max_stride)
+        patch_positive_by_token = {
+            int(token_idx): {int(track_id) for track_id in positive.track_ids}
+            for token_idx, positive in positives.by_token.items()
+        }
+        if args.patch_offset_mode in {"oracle_all", "oracle_patch_positive"}:
+            matches, offset_summary = refine_matches_with_oracle_offsets(
+                matches,
+                pose_w2c=gt_pose.pose_w2c,
+                camera=camera,
+                stride_px=stride,
+                inlier_mask=None,
+                max_offset_stride=oracle_max_stride,
+                bound_metric=args.patch_offset_bound_metric,
+                patch_positive_by_token=patch_positive_by_token,
+                require_patch_positive=args.patch_offset_mode == "oracle_patch_positive",
+                noise_sigma_px=float(args.patch_offset_oracle_noise_px),
+                rng_seed=int(args.patch_offset_oracle_seed),
+            )
+            pnp_matches = [matches[idx] for idx in selected_indices]
+            pnp = run_pnp(pnp_matches)
+        elif args.patch_offset_mode == "learned_confidence":
+            assert offset_run is not None
+            offsets, confidences, sigmas = predict_patch_offsets_for_matches(
+                query_feature,
+                submap,
+                matches,
+                offset_run.model,
+                device=args.patch_offset_device or args.similarity_device,
+                batch_size=int(args.patch_offset_batch_size),
+            )
+            matches, offset_summary = apply_predicted_patch_offsets(
+                matches,
+                offsets,
+                confidences,
+                stride_px=stride,
+                confidence_threshold=float(args.patch_offset_confidence_threshold),
+                inlier_mask=None,
+                max_offset_stride=float(args.patch_offset_max_stride),
+                sigmas=sigmas,
+                max_sigma=args.patch_offset_max_sigma,
+            )
+            pnp_matches = [matches[idx] for idx in selected_indices]
+            pnp = run_pnp(pnp_matches)
+        elif args.patch_offset_mode in {
+            "oracle_two_pass_inliers",
+            "oracle_two_pass_inliers_patch_positive",
+            "oracle_same_inlier_fixed",
+            "oracle_same_inlier_fixed_patch_positive",
+            "learned_two_pass_inliers",
+            "learned_same_inlier_fixed",
+        }:
+            initial_pnp = run_pnp(pnp_matches)
+            initial_full_inlier_mask = _full_inlier_mask(matches, pnp_matches, initial_pnp.inlier_mask)
+            if args.patch_offset_mode in {
+                "oracle_two_pass_inliers",
+                "oracle_two_pass_inliers_patch_positive",
+                "oracle_same_inlier_fixed",
+                "oracle_same_inlier_fixed_patch_positive",
+            }:
+                matches, offset_summary = refine_matches_with_oracle_offsets(
+                    matches,
+                    pose_w2c=gt_pose.pose_w2c,
+                    camera=camera,
+                    stride_px=stride,
+                    inlier_mask=initial_full_inlier_mask,
+                    max_offset_stride=oracle_max_stride,
+                    bound_metric=args.patch_offset_bound_metric,
+                    patch_positive_by_token=patch_positive_by_token,
+                    require_patch_positive=args.patch_offset_mode
+                    in {"oracle_two_pass_inliers_patch_positive", "oracle_same_inlier_fixed_patch_positive"},
+                    noise_sigma_px=float(args.patch_offset_oracle_noise_px),
+                    rng_seed=int(args.patch_offset_oracle_seed),
+                )
+            else:
+                assert offset_run is not None
+                offsets, confidences, sigmas = predict_patch_offsets_for_matches(
+                    query_feature,
+                    submap,
+                    matches,
+                    offset_run.model,
+                    device=args.patch_offset_device or args.similarity_device,
+                    batch_size=int(args.patch_offset_batch_size),
+                )
+                matches, offset_summary = apply_predicted_patch_offsets(
+                    matches,
+                    offsets,
+                    confidences,
+                    stride_px=stride,
+                    confidence_threshold=float(args.patch_offset_confidence_threshold),
+                    inlier_mask=initial_full_inlier_mask,
+                    max_offset_stride=float(args.patch_offset_max_stride),
+                    sigmas=sigmas,
+                    max_sigma=args.patch_offset_max_sigma,
+                )
+            offset_summary = {**offset_summary, "initial_inlier_count": int(initial_pnp.inlier_count)}
+            if args.patch_offset_mode in {
+                "oracle_same_inlier_fixed",
+                "oracle_same_inlier_fixed_patch_positive",
+                "learned_same_inlier_fixed",
+            }:
+                fixed_indices = np.flatnonzero(initial_full_inlier_mask).astype(np.int64).tolist()
+                pnp_matches = [matches[int(idx)] for idx in fixed_indices]
+                pnp = estimate_pose_pnp_fixed(
+                    pnp_matches,
+                    camera,
+                    min_inliers=max(4, int(args.pnp_min_inliers)),
+                    pnp_method=args.pnp_method,
+                    refine_method=args.pnp_refine_method if args.pnp_refine_method != "none" else "LM",
+                )
+                offset_summary = {**offset_summary, "fixed_same_inlier_count": int(len(fixed_indices))}
+            else:
+                pnp_matches = [matches[idx] for idx in selected_indices]
+                pnp = run_pnp(pnp_matches)
+        else:
+            pnp = run_pnp(pnp_matches)
+        full_pnp_inlier_mask = _full_inlier_mask(matches, pnp_matches, pnp.inlier_mask)
+        pnp_match_ids = {id(match) for match in pnp_matches}
+        pnp_selected_mask = np.asarray([id(match) in pnp_match_ids for match in matches], dtype=bool)
         patch_stats = evaluate_patch_matches(
             matches,
             positives,
@@ -563,6 +828,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             camera,
             inlier_mask=full_pnp_inlier_mask,
         )
+        gt_match_errors = match_reprojection_errors(matches, gt_pose.pose_w2c, camera)
+        baseline_match_errors = (
+            None
+            if pnp.pose_w2c is None
+            else match_reprojection_errors(matches, pnp.pose_w2c, camera)
+        )
         reliability_all_stats = _map_reliability_stats(matches)
         reliability_pnp_stats = _map_reliability_stats(matches, pnp_selected_mask)
         reliability_inlier_stats = _map_reliability_stats(matches, full_pnp_inlier_mask)
@@ -572,18 +843,34 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         projected_landmarks = count_projected_landmarks(submap, gt_pose.pose_w2c, camera)
         if args.output_matches_jsonl:
             positive_by_token = positives.by_token
+            per_token_seen: dict[int, int] = {}
             for match_idx, match in enumerate(matches):
                 positive = positive_by_token.get(int(match.token_index))
+                token_rank = per_token_seen.get(int(match.token_index), 0)
+                per_token_seen[int(match.token_index)] = token_rank + 1
+                gt_error_px = float(gt_match_errors[match_idx])
+                gt_error_stride = float(gt_error_px / max(stride, 1e-6))
+                patch_correct = bool(positive is not None and int(match.track_id) in positive.track_ids)
+                stride_positive = bool(gt_error_px <= stride)
+                weak_positive = bool(not (patch_correct or stride_positive) and gt_error_px <= 2.0 * stride)
+                pnp_inlier = bool(
+                    full_pnp_inlier_mask.shape[0] > match_idx and full_pnp_inlier_mask[match_idx]
+                )
                 match_rows.append(
                     {
                         "query_id": query_id,
                         "match_index": int(match_idx),
+                        "match_rank": int(match_idx),
+                        "token_match_rank": int(token_rank),
                         "token_index": int(match.token_index),
                         "track_id": int(match.track_id),
                         "source": match.source,
                         "xy": [float(match.xy[0]), float(match.xy[1])],
+                        "xyz": [float(value) for value in np.asarray(match.xyz, dtype=np.float64).reshape(3)],
                         "similarity": float(match.similarity),
                         "similarity_margin": match.similarity_margin,
+                        "observation_count": match.observation_count,
+                        "visibility_count": match.visibility_count,
                         "landmark_variance": float(match.landmark_variance),
                         "landmark_reprojection_error": match.landmark_reprojection_error,
                         "landmark_ambiguity": match.landmark_ambiguity,
@@ -596,11 +883,28 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                         "pnp_uncertainty_scale": match.pnp_uncertainty_scale,
                         "local_consistency_support": match.local_consistency_support,
                         "local_consistency_score": match.local_consistency_score,
-                        "patch_correct": bool(positive is not None and int(match.track_id) in positive.track_ids),
+                        "pnp_soft_score": match.pnp_soft_score,
+                        "distance_to_boundary_px": match.distance_to_boundary_px,
+                        "gt_reproj_error_px": gt_error_px,
+                        "gt_reproj_error_stride": gt_error_stride,
+                        "baseline_reproj_residual_px": None
+                        if baseline_match_errors is None
+                        else float(baseline_match_errors[match_idx]),
+                        "final_translation_error_m": None
+                        if not np.isfinite(pose_error.translation_m)
+                        else float(pose_error.translation_m),
+                        "final_rotation_error_deg": None
+                        if not np.isfinite(pose_error.rotation_deg)
+                        else float(pose_error.rotation_deg),
+                        "patch_correct": patch_correct,
+                        "patch_positive_label": patch_correct,
+                        "stride_positive_label": stride_positive,
+                        "strong_positive_label": bool(patch_correct or stride_positive),
+                        "weak_positive_label": weak_positive,
+                        "ignore_label": weak_positive,
+                        "hard_negative_label": bool((gt_error_px > 2.0 * stride) and pnp_inlier),
                         "positive_count": 0 if positive is None else int(positive.count),
-                        "pnp_inlier": bool(
-                            full_pnp_inlier_mask.shape[0] > match_idx and full_pnp_inlier_mask[match_idx]
-                        ),
+                        "pnp_inlier": pnp_inlier,
                         "pnp_selected": bool(pnp_selected_mask.shape[0] > match_idx and pnp_selected_mask[match_idx]),
                     }
                 )
@@ -650,6 +954,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             "all_match_spatial": all_spatial_stats,
             "pnp_inlier_spatial": inlier_spatial_stats,
             "pnp_reprojection": pnp_residual_stats,
+            "patch_offset_refinement": offset_summary,
             "pnp_solve": bool(pnp.success),
             "pnp_success": bool(pnp.success),
             "pnp_inlier_count": int(pnp.inlier_count),
@@ -661,6 +966,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         row["success_25cm_10deg"] = _success(row, 0.25, 10.0)
         row["success_50cm_10deg"] = _success(row, 0.50, 10.0)
         row["success_1m_10deg"] = _success(row, 1.0, 10.0)
+        row["pose_risk"] = pose_risk_score(row, PoseRiskConfig())
         rows.append(row)
 
     output_jsonl = Path(args.output_jsonl)
@@ -694,6 +1000,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         for flag in (_prior_success(row, "oracle", 0.50, 10.0) for row in reference_prior_rows)
         if flag is not None
     ]
+    risk_coverages = tuple(
+        float(item.strip())
+        for item in str(args.risk_coverages).split(",")
+        if item.strip()
+    )
     summary = {
         "stage": "patch_to_3d_vfm_matching_baseline",
         "elapsed_sec": float(time.perf_counter() - started),
@@ -720,6 +1031,42 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             "pairwise_device": args.pairwise_device or args.similarity_device,
             "pairwise_batch_size": int(args.pairwise_batch_size),
             "pnp_min_inliers": int(args.pnp_min_inliers),
+            "pnp_confidence": float(args.pnp_confidence),
+            "pnp_method": args.pnp_method,
+            "pnp_refine_method": args.pnp_refine_method,
+            "pnp_refine_lm": bool(args.pnp_refine_lm),
+            "pnp_soft_order": {
+                "mode": args.pnp_soft_order_mode,
+                "top_n": None if args.pnp_soft_order_top_n <= 0 else int(args.pnp_soft_order_top_n),
+            },
+            "patch_offset_refinement": {
+                "mode": args.patch_offset_mode,
+                "checkpoint": args.patch_offset_checkpoint,
+                "confidence_threshold": float(args.patch_offset_confidence_threshold),
+                "max_stride": float(args.patch_offset_max_stride),
+                "max_sigma": args.patch_offset_max_sigma,
+                "free_oracle": bool(args.patch_offset_free_oracle),
+                "bound_metric": args.patch_offset_bound_metric,
+                "oracle_noise_px": float(args.patch_offset_oracle_noise_px),
+                "device": args.patch_offset_device or args.similarity_device,
+                "batch_size": int(args.patch_offset_batch_size),
+                "mean_refined_count": _mean([
+                    float(row.get("patch_offset_refinement", {}).get("refined_count", 0))
+                    for row in rows
+                ]),
+            },
+            "oracle_match_mode": args.oracle_match_mode,
+            "oracle_max_positives_per_token": int(args.oracle_max_positives_per_token),
+            "spatial_diversity_pnp": {
+                "enabled": bool(args.enable_spatial_diversity_pnp),
+                "grid_rows": int(args.spatial_diversity_grid_rows),
+                "grid_cols": int(args.spatial_diversity_grid_cols),
+                "max_per_cell": int(args.spatial_diversity_max_per_cell),
+                "max_matches": args.spatial_diversity_max_matches,
+                "score_mode": args.spatial_diversity_score_mode,
+                "min_depth_range_m": args.spatial_diversity_min_depth_range_m,
+                "min_planarity_ratio": args.spatial_diversity_min_planarity_ratio,
+            },
         },
         "submap": {
             "mode": args.submap_mode,
@@ -934,6 +1281,19 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             ]
         ),
         "pnp_solve_rate": _mean([1.0 if row["pnp_solve"] else 0.0 for row in rows]),
+        "mean_pose_risk": _mean([float(row["pose_risk"]) for row in rows]),
+        "selective_localization": {
+            "success_25cm_10deg": selective_localization_summary(
+                rows,
+                coverages=risk_coverages,
+                success_key="success_25cm_10deg",
+            ),
+            "success_50cm_10deg": selective_localization_summary(
+                rows,
+                coverages=risk_coverages,
+                success_key="success_50cm_10deg",
+            ),
+        },
         "pnp_success_rate": _mean([1.0 if row["pnp_success"] else 0.0 for row in rows]),
         "success_10cm_5deg": _mean([1.0 if row["success_10cm_5deg"] else 0.0 for row in labeled_rows]),
         "success_25cm_10deg": _mean([1.0 if row["success_25cm_10deg"] else 0.0 for row in labeled_rows]),

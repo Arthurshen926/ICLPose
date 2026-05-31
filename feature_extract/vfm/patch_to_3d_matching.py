@@ -9,6 +9,7 @@ import numpy as np
 
 from feature_extract.vfm.colmap_tracks import ColmapCamera
 from feature_extract.vfm.query_to_3d_matching import (
+    LandmarkAmbiguityPruningConfig,
     LandmarkQualityConfig,
     LandmarkMapIndex,
     LocalGeometricConsistencyConfig,
@@ -24,6 +25,7 @@ from feature_extract.vfm.query_to_3d_matching import (
     match_reprojection_errors,
     match_query_tokens_to_landmarks,
     normalize_rows,
+    prune_ambiguous_landmarks,
     select_pnp_matches_by_map_reliability,
     token_grid_xy,
 )
@@ -93,6 +95,7 @@ class PatchTo3DMatchingConfig:
     pairwise_filter_min_logprob: float | None = None
     map_reliability: MapReliabilityConfig = MapReliabilityConfig()
     local_geometric_consistency: LocalGeometricConsistencyConfig = LocalGeometricConsistencyConfig()
+    landmark_ambiguity_pruning: LandmarkAmbiguityPruningConfig = LandmarkAmbiguityPruningConfig()
 
     def __post_init__(self) -> None:
         if self.top_k <= 0:
@@ -119,12 +122,19 @@ def token_patch_boxes(
     image_width: int,
     image_height: int,
     scale: float = 1.0,
+    coordinate_mode: str = "edge",
 ) -> list[TokenPatchBox]:
     if scale <= 0.0:
         raise ValueError("scale must be positive")
-    centers = token_grid_xy(token_width, token_height, image_width, image_height, step=1)
-    stride_x = float(image_width - 1) / max(float(token_width - 1), 1.0)
-    stride_y = float(image_height - 1) / max(float(token_height - 1), 1.0)
+    centers = token_grid_xy(token_width, token_height, image_width, image_height, step=1, coordinate_mode=coordinate_mode)
+    if coordinate_mode == "edge":
+        stride_x = float(image_width - 1) / max(float(token_width - 1), 1.0)
+        stride_y = float(image_height - 1) / max(float(token_height - 1), 1.0)
+    elif coordinate_mode == "center":
+        stride_x = float(image_width) / float(token_width)
+        stride_y = float(image_height) / float(token_height)
+    else:
+        raise ValueError("coordinate_mode must be one of: edge, center")
     half_x = 0.5 * stride_x * float(scale)
     half_y = 0.5 * stride_y * float(scale)
     boxes = []
@@ -246,6 +256,75 @@ def patch_positive_set_stats(positives: PatchPositiveSets) -> dict[str, float | 
     }
 
 
+def oracle_patch_positive_matches(
+    index: LandmarkMapIndex,
+    positives: PatchPositiveSets,
+    max_per_token: int = 1,
+) -> list[QueryTo3DMatch]:
+    """Build GT-correct patch-center to landmark matches for upper-bound PnP."""
+
+    if int(max_per_token) <= 0:
+        raise ValueError("max_per_token must be positive")
+    if len(index) == 0:
+        return []
+    landmark_index_by_track = {int(track_id): idx for idx, track_id in enumerate(index.track_ids.tolist())}
+    matches: list[QueryTo3DMatch] = []
+    projected = positives.projected_xy_by_track or {}
+    for token_index in sorted(positives.by_token):
+        positive = positives.by_token[int(token_index)]
+        if not positive.track_ids:
+            continue
+
+        def distance_to_center(track_id: int) -> float:
+            xy = projected.get(int(track_id))
+            if xy is None:
+                return 0.0
+            return float(np.linalg.norm(np.asarray(xy, dtype=np.float64).reshape(2) - positive.patch_box.center))
+
+        ordered_tracks = sorted((int(track_id) for track_id in positive.track_ids), key=distance_to_center)
+        for track_id in ordered_tracks[: int(max_per_token)]:
+            landmark_idx = landmark_index_by_track.get(int(track_id))
+            if landmark_idx is None:
+                continue
+            matches.append(
+                QueryTo3DMatch(
+                    token_index=int(token_index),
+                    xy=np.asarray(positive.patch_box.center, dtype=np.float64).reshape(2),
+                    track_id=int(track_id),
+                    xyz=np.asarray(index.xyz[landmark_idx], dtype=np.float64).reshape(3),
+                    similarity=1.0,
+                    ratio=0.0,
+                    landmark_variance=float(index.mean_variances[landmark_idx]),
+                    source="oracle_patch_positive",
+                    observation_count=int(index.observation_counts[landmark_idx]),
+                    landmark_reprojection_error=None
+                    if index.reprojection_errors is None
+                    else float(index.reprojection_errors[landmark_idx]),
+                    landmark_ambiguity=None
+                    if index.feature_ambiguities is None
+                    else float(index.feature_ambiguities[landmark_idx]),
+                    similarity_margin=1.0,
+                )
+            )
+    return matches
+
+
+def filter_patch_correct_matches(
+    matches: Sequence[QueryTo3DMatch],
+    positives: PatchPositiveSets,
+) -> list[QueryTo3DMatch]:
+    """Keep current matches whose landmark is in that token's GT patch-positive set."""
+
+    filtered: list[QueryTo3DMatch] = []
+    for match in matches:
+        positive = positives.by_token.get(int(match.token_index))
+        if positive is None:
+            continue
+        if int(match.track_id) in positive.track_ids:
+            filtered.append(match)
+    return filtered
+
+
 def filter_landmarks_by_projected_visibility(
     index: LandmarkMapIndex,
     pose_w2c: np.ndarray,
@@ -326,7 +405,8 @@ def _valid_subset(index: LandmarkMapIndex, config: PatchTo3DMatchingConfig) -> L
         mask &= index.reprojection_errors <= float(config.max_landmark_reprojection_error)
     if config.max_landmark_ambiguity is not None:
         mask &= index.feature_ambiguities <= float(config.max_landmark_ambiguity)
-    return index.subset(mask)
+    subset = index.subset(mask)
+    return prune_ambiguous_landmarks(subset, config.landmark_ambiguity_pruning)
 
 
 def _match_score(match: QueryTo3DMatch, mode: str) -> float:

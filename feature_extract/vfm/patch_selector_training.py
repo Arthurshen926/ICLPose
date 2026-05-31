@@ -31,6 +31,11 @@ class PatchSelectorSampleConfig:
     query_token_step: int = 1
     min_positive_count: int = 1
     seed: int = 0
+    negative_curriculum: str = "hard"
+    medium_min_stride: float = 4.0
+    semi_hard_min_stride: float = 2.0
+    semi_hard_max_stride: float = 4.0
+    mixed_hard_fraction: float = 0.1
 
     def __post_init__(self) -> None:
         if self.max_tokens_per_query <= 0:
@@ -45,6 +50,14 @@ class PatchSelectorSampleConfig:
             raise ValueError("query_token_step must be positive")
         if self.min_positive_count <= 0:
             raise ValueError("min_positive_count must be positive")
+        if self.negative_curriculum not in {"hard", "medium", "semi_hard", "mixed"}:
+            raise ValueError("negative_curriculum must be one of: hard, medium, semi_hard, mixed")
+        if self.medium_min_stride < 0.0:
+            raise ValueError("medium_min_stride must be non-negative")
+        if self.semi_hard_min_stride < 0.0 or self.semi_hard_max_stride < self.semi_hard_min_stride:
+            raise ValueError("semi-hard stride bounds are invalid")
+        if not 0.0 <= float(self.mixed_hard_fraction) <= 1.0:
+            raise ValueError("mixed_hard_fraction must be in [0, 1]")
 
 
 @dataclass(frozen=True)
@@ -719,6 +732,67 @@ def _sample_negative_indices_batch(
     return output
 
 
+def _select_negative_indices_by_curriculum(
+    token_index: int,
+    ordered_candidates: list[int],
+    landmark_index: LandmarkMapIndex,
+    positives: PatchPositiveSets,
+    config: PatchSelectorSampleConfig,
+) -> list[int]:
+    count = int(config.hard_negatives_per_token)
+    if config.negative_curriculum == "hard":
+        return ordered_candidates[:count]
+
+    by_distance = [
+        (
+            int(idx),
+            _distance_to_patch_center_strides(
+                int(token_index),
+                int(idx),
+                landmark_index.track_ids,
+                positives,
+            ),
+        )
+        for idx in ordered_candidates
+    ]
+
+    def medium() -> list[int]:
+        return [
+            idx
+            for idx, distance in by_distance
+            if (not np.isfinite(float(distance))) or float(distance) >= float(config.medium_min_stride)
+        ]
+
+    def semi_hard() -> list[int]:
+        return [
+            idx
+            for idx, distance in by_distance
+            if np.isfinite(float(distance))
+            and float(config.semi_hard_min_stride) <= float(distance) <= float(config.semi_hard_max_stride)
+        ]
+
+    if config.negative_curriculum == "medium":
+        preferred = medium()
+    elif config.negative_curriculum == "semi_hard":
+        preferred = semi_hard()
+    else:
+        hard_count = int(round(count * float(config.mixed_hard_fraction)))
+        remaining = max(count - hard_count, 0)
+        preferred = semi_hard()[:remaining] + medium()
+        preferred.extend(ordered_candidates[:hard_count])
+
+    selected: list[int] = []
+    seen: set[int] = set()
+    for idx in preferred + ordered_candidates:
+        if int(idx) in seen:
+            continue
+        selected.append(int(idx))
+        seen.add(int(idx))
+        if len(selected) >= count:
+            break
+    return selected
+
+
 def build_patch_selector_samples_for_query(
     query_feature_map: np.ndarray,
     landmark_index: LandmarkMapIndex,
@@ -792,11 +866,16 @@ def build_patch_selector_samples_for_query(
 
     selected_mining_query_features = np.stack([item[2] for item in token_candidates], axis=0).astype(np.float32)
     all_positive_sets = [set(item[3]) for item in token_candidates]
+    negative_search_count = (
+        int(config.hard_negatives_per_token)
+        if config.negative_curriculum == "hard"
+        else int(config.hard_negative_pool)
+    )
     negative_lists = _sample_negative_indices_batch(
         selected_mining_query_features,
         mining_landmark_features,
         positive_row_indices=all_positive_sets,
-        count=config.hard_negatives_per_token,
+        count=negative_search_count,
         pool=config.hard_negative_pool,
     )
 
@@ -805,6 +884,13 @@ def build_patch_selector_samples_for_query(
         token_candidates,
         negative_lists,
     ):
+        negative_indices = _select_negative_indices_by_curriculum(
+            int(token_index),
+            negative_indices,
+            landmark_index,
+            positives,
+            config,
+        )
         if len(negative_indices) < int(config.hard_negatives_per_token):
             continue
         candidate_rows.append((int(token_index), query_feature, positive_indices, negative_indices))
@@ -864,6 +950,7 @@ def build_patch_selector_samples_for_query(
             "hard_negatives_per_token": int(config.hard_negatives_per_token),
             "has_reprojection_distances": True,
             "negative_mining_descriptor": negative_mining_descriptor,
+            "negative_curriculum": config.negative_curriculum,
         },
     )
 

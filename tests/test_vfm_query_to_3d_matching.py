@@ -1,20 +1,32 @@
 import numpy as np
+import pytest
 
 from feature_extract.vfm.colmap_tracks import ColmapCamera
 from feature_extract.vfm.map_lifting import SelectedTrackFeatureBank, TrackFeature
 from feature_extract.vfm.query_to_3d_matching import (
     LandmarkQualityConfig,
+    LandmarkAmbiguityPruningConfig,
     LandmarkMapIndex,
     LocalGeometricConsistencyConfig,
     MapReliabilityConfig,
+    PoseRiskConfig,
     QueryTo3DMatch,
     QueryTo3DMatchingConfig,
+    SpatialDiversityPnPConfig,
+    deduplicate_pnp_matches,
+    estimate_pose_pnp_fixed,
     estimate_pose_pnp_ransac,
     filter_matches_by_local_geometric_consistency,
     filter_landmarks_by_reference_images,
+    landmark_submap_ambiguity_scores,
     map_reliability_scores,
+    pose_risk_score,
+    prune_ambiguous_landmarks,
+    select_pnp_matches_by_spatial_diversity,
+    selective_localization_summary,
     select_pnp_matches_by_map_reliability,
     match_query_tokens_to_landmarks,
+    soft_order_pnp_matches,
     pnp_pose_error,
     pnp_reprojection_residual_stats,
     reprojection_error_stats,
@@ -38,6 +50,61 @@ def _feature(dim: int, idx: int) -> np.ndarray:
     value = np.zeros((dim,), dtype=np.float32)
     value[idx] = 1.0
     return value
+
+
+def test_token_grid_xy_supports_patch_center_coordinates() -> None:
+    grid_xy = token_grid_xy(token_width=4, token_height=2, image_width=100, image_height=50, coordinate_mode="center")
+
+    np.testing.assert_allclose(grid_xy[0], [12.0, 12.0])
+    np.testing.assert_allclose(grid_xy[-1], [87.0, 37.0])
+    assert np.all(grid_xy[:, 0] > 0.0)
+    assert np.all(grid_xy[:, 0] < 99.0)
+    assert np.all(grid_xy[:, 1] > 0.0)
+    assert np.all(grid_xy[:, 1] < 49.0)
+
+
+def test_token_grid_xy_defaults_to_legacy_edge_coordinates() -> None:
+    grid_xy = token_grid_xy(token_width=4, token_height=2, image_width=100, image_height=50)
+
+    np.testing.assert_allclose(grid_xy[0], [0.0, 0.0])
+    np.testing.assert_allclose(grid_xy[-1], [99.0, 49.0])
+
+
+def test_deduplicate_pnp_matches_keeps_first_track_occurrence() -> None:
+    matches = [
+        QueryTo3DMatch(
+            token_index=0,
+            xy=np.asarray([10.0, 10.0], dtype=np.float64),
+            track_id=1,
+            xyz=np.asarray([0.0, 0.0, 5.0], dtype=np.float64),
+            similarity=0.9,
+            ratio=0.0,
+            landmark_variance=0.0,
+        ),
+        QueryTo3DMatch(
+            token_index=1,
+            xy=np.asarray([20.0, 10.0], dtype=np.float64),
+            track_id=2,
+            xyz=np.asarray([1.0, 0.0, 5.0], dtype=np.float64),
+            similarity=0.8,
+            ratio=0.0,
+            landmark_variance=0.0,
+        ),
+        QueryTo3DMatch(
+            token_index=2,
+            xy=np.asarray([90.0, 90.0], dtype=np.float64),
+            track_id=1,
+            xyz=np.asarray([0.0, 0.0, 5.0], dtype=np.float64),
+            similarity=0.1,
+            ratio=0.0,
+            landmark_variance=0.0,
+        ),
+    ]
+
+    unique_matches, original_indices = deduplicate_pnp_matches(matches)
+
+    assert [match.track_id for match in unique_matches] == [1, 2]
+    assert original_indices.tolist() == [0, 1]
 
 
 def test_query_tokens_match_landmarks_and_support_pnp() -> None:
@@ -88,6 +155,65 @@ def test_query_tokens_match_landmarks_and_support_pnp() -> None:
     assert not strict_result.success
     assert strict_result.pose_w2c is None
     assert strict_result.inlier_count == 0
+
+    refined_result = estimate_pose_pnp_ransac(
+        matches,
+        _camera(),
+        reprojection_error_px=2.0,
+        iterations=200,
+        pnp_method="EPNP",
+        refine_method="LM",
+    )
+    assert refined_result.success
+    refined_error = pnp_pose_error(refined_result.pose_w2c, np.eye(4, dtype=np.float64))
+    assert refined_error.translation_m < 1e-4
+
+    fixed_result = estimate_pose_pnp_fixed(matches, _camera(), pnp_method="EPNP", refine_method="LM")
+    assert fixed_result.success
+    assert fixed_result.inlier_count == len(matches)
+    assert fixed_result.inlier_mask.tolist() == [True] * len(matches)
+    fixed_error = pnp_pose_error(fixed_result.pose_w2c, np.eye(4, dtype=np.float64))
+    assert fixed_error.translation_m < 1e-4
+    assert fixed_error.rotation_deg < 1e-3
+
+    with pytest.raises(ValueError, match="unsupported PnP method"):
+        estimate_pose_pnp_ransac(matches, _camera(), pnp_method="BAD")
+
+
+def test_soft_order_pnp_matches_keeps_matches_but_prioritizes_confident_inputs() -> None:
+    base = QueryTo3DMatch(
+        token_index=0,
+        xy=np.array([0.0, 0.0], dtype=np.float64),
+        track_id=1,
+        xyz=np.array([0.0, 0.0, 3.0], dtype=np.float64),
+        similarity=0.9,
+        ratio=0.5,
+        landmark_variance=0.1,
+        similarity_margin=0.01,
+        map_reliability=0.2,
+    )
+    reliable = QueryTo3DMatch(
+        token_index=1,
+        xy=np.array([1.0, 0.0], dtype=np.float64),
+        track_id=2,
+        xyz=np.array([1.0, 0.0, 3.0], dtype=np.float64),
+        similarity=0.8,
+        ratio=0.5,
+        landmark_variance=0.1,
+        similarity_margin=0.2,
+        map_reliability=0.9,
+    )
+
+    ordered = soft_order_pnp_matches([base, reliable], mode="composite")
+    assert [match.track_id for match in ordered] == [2, 1]
+    assert ordered[0].pnp_soft_score is not None
+    assert ordered[0].pnp_soft_score > ordered[1].pnp_soft_score
+
+    top1 = soft_order_pnp_matches([base, reliable], mode="composite", max_matches=1)
+    assert [match.track_id for match in top1] == [2]
+
+    with pytest.raises(ValueError, match="unsupported soft PnP ordering mode"):
+        soft_order_pnp_matches([base], mode="bad")
 
 
 def test_matching_filters_by_ratio_mutual_and_landmark_variance() -> None:
@@ -382,6 +508,192 @@ def test_select_pnp_matches_by_map_reliability_keeps_descriptor_order() -> None:
     selected = select_pnp_matches_by_map_reliability(matches, keep_fraction=0.5)
 
     assert [match.track_id for match in selected] == [2, 3]
+
+
+def test_ambiguity_pruning_drops_duplicate_landmarks_before_matching() -> None:
+    index = LandmarkMapIndex(
+        track_ids=np.asarray([1, 2, 3, 4], dtype=np.int64),
+        xyz=np.zeros((4, 3), dtype=np.float64),
+        features=np.asarray(
+            [
+                [1.0, 0.0, 0.0],
+                [0.999, 0.01, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float32,
+        ),
+        mean_variances=np.zeros((4,), dtype=np.float32),
+        observation_counts=np.ones((4,), dtype=np.int64) * 3,
+        observation_image_ids=(("a",), ("a",), ("a",), ("a",)),
+    )
+
+    scores = landmark_submap_ambiguity_scores(index, close_similarity_threshold=0.95, block_size=2)
+    pruned = prune_ambiguous_landmarks(
+        index,
+        LandmarkAmbiguityPruningConfig(enabled=True, drop_fraction=0.5, close_similarity_threshold=0.95),
+    )
+
+    assert scores[0] > scores[2]
+    assert scores[1] > scores[3]
+    assert pruned.track_ids.tolist() == [3, 4]
+
+
+def test_spatial_diversity_pnp_selection_limits_matches_per_image_cell() -> None:
+    matches = [
+        QueryTo3DMatch(
+            token_index=idx,
+            xy=np.asarray(xy, dtype=np.float64),
+            track_id=idx,
+            xyz=np.asarray([float(idx), 0.0, 5.0], dtype=np.float64),
+            similarity=similarity,
+            ratio=0.0,
+            landmark_variance=0.0,
+            similarity_margin=margin,
+        )
+        for idx, xy, similarity, margin in [
+            (1, [10.0, 10.0], 0.9, 0.05),
+            (2, [20.0, 20.0], 0.8, 0.20),
+            (3, [80.0, 10.0], 0.7, 0.10),
+            (4, [90.0, 20.0], 0.6, 0.30),
+        ]
+    ]
+
+    selected = select_pnp_matches_by_spatial_diversity(
+        matches,
+        image_width=100,
+        image_height=100,
+        config=SpatialDiversityPnPConfig(enabled=True, grid_rows=1, grid_cols=2, max_per_cell=1, score_mode="margin"),
+    )
+
+    assert [match.track_id for match in selected] == [2, 4]
+
+
+def test_spatial_diversity_pnp_selection_can_fill_for_depth_diversity() -> None:
+    matches = [
+        QueryTo3DMatch(
+            token_index=idx,
+            xy=np.asarray([10.0 + float(idx), 10.0], dtype=np.float64),
+            track_id=idx,
+            xyz=np.asarray([float(idx), 0.0, depth], dtype=np.float64),
+            similarity=0.9 - 0.01 * idx,
+            ratio=0.0,
+            landmark_variance=0.0,
+            similarity_margin=0.5 - 0.01 * idx,
+        )
+        for idx, depth in [(1, 5.0), (2, 5.1), (3, 9.5)]
+    ]
+
+    selected = select_pnp_matches_by_spatial_diversity(
+        matches,
+        image_width=100,
+        image_height=100,
+        config=SpatialDiversityPnPConfig(
+            enabled=True,
+            grid_rows=1,
+            grid_cols=1,
+            max_per_cell=1,
+            score_mode="margin",
+            min_depth_range_m=3.0,
+            max_matches=3,
+        ),
+    )
+
+    assert [match.track_id for match in selected] == [1, 3]
+
+
+def test_spatial_diversity_pnp_selection_can_fill_for_3d_covariance() -> None:
+    matches = [
+        QueryTo3DMatch(
+            token_index=idx,
+            xy=np.asarray([10.0 + float(idx), 10.0 + float(idx)], dtype=np.float64),
+            track_id=idx,
+            xyz=np.asarray(xyz, dtype=np.float64),
+            similarity=0.9 - 0.01 * idx,
+            ratio=0.0,
+            landmark_variance=0.0,
+            similarity_margin=0.5 - 0.01 * idx,
+        )
+        for idx, xyz in [
+            (1, [0.0, 0.0, 5.0]),
+            (2, [1.0, 0.0, 5.0]),
+            (3, [0.0, 1.0, 5.0]),
+            (4, [0.0, 0.0, 7.0]),
+        ]
+    ]
+
+    selected = select_pnp_matches_by_spatial_diversity(
+        matches,
+        image_width=100,
+        image_height=100,
+        config=SpatialDiversityPnPConfig(
+            enabled=True,
+            grid_rows=1,
+            grid_cols=1,
+            max_per_cell=3,
+            score_mode="margin",
+            min_planarity_ratio=0.01,
+            max_matches=4,
+        ),
+    )
+
+    assert [match.track_id for match in selected] == [1, 2, 3, 4]
+
+
+def test_selective_localization_summary_reports_low_risk_coverage_metrics() -> None:
+    rows = [
+        {
+            "pose_risk": 0.1,
+            "success_25cm_10deg": True,
+            "translation_error_m": 0.10,
+            "rotation_error_deg": 1.0,
+        },
+        {
+            "pose_risk": 0.2,
+            "success_25cm_10deg": True,
+            "translation_error_m": 0.20,
+            "rotation_error_deg": 2.0,
+        },
+        {
+            "pose_risk": 0.9,
+            "success_25cm_10deg": False,
+            "translation_error_m": 2.00,
+            "rotation_error_deg": 20.0,
+        },
+    ]
+
+    summary = selective_localization_summary(rows, coverages=(2.0 / 3.0, 1.0), success_key="success_25cm_10deg")
+
+    assert summary["coverage_0.667"]["success_rate"] == 1.0
+    assert np.isclose(summary["coverage_0.667"]["median_translation_error_m"], 0.15)
+    assert summary["coverage_1.000"]["success_rate"] == 2.0 / 3.0
+
+
+def test_pose_risk_score_increases_for_low_inlier_and_poor_spatial_coverage() -> None:
+    good = pose_risk_score(
+        {
+            "pnp_inlier_count": 80,
+            "pnp_inlier_ratio": 0.6,
+            "patch_geometry": {"pnp_inlier_patch_at_1": 0.8},
+            "pnp_reprojection": {"pnp_reproj_inlier_median_px": 2.0},
+            "pnp_inlier_spatial": {"grid_4x4_occupancy_frac": 0.5, "depth_range_m": 4.0, "xyz_planarity_ratio": 0.1},
+            "map_reliability": {"pnp_inliers": {"mean": 0.8}},
+        },
+        PoseRiskConfig(),
+    )
+    bad = pose_risk_score(
+        {
+            "pnp_inlier_count": 5,
+            "pnp_inlier_ratio": 0.05,
+            "patch_geometry": {"pnp_inlier_patch_at_1": 0.1},
+            "pnp_reprojection": {"pnp_reproj_inlier_median_px": 40.0},
+            "pnp_inlier_spatial": {"grid_4x4_occupancy_frac": 0.05, "depth_range_m": 0.1, "xyz_planarity_ratio": 0.0},
+            "map_reliability": {"pnp_inliers": {"mean": 0.2}},
+        },
+        PoseRiskConfig(),
+    )
+
+    assert 0.0 <= good < bad <= 1.0
 
 
 def test_local_geometric_consistency_filters_isolated_3d_outlier_without_reranking() -> None:

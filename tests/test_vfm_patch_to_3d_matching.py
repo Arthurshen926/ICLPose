@@ -9,8 +9,10 @@ from feature_extract.vfm.patch_to_3d_matching import (
     PatchTo3DMatchingConfig,
     build_patch_positive_sets,
     evaluate_patch_matches,
+    filter_patch_correct_matches,
     filter_landmarks_by_projected_visibility,
     match_query_patches_to_landmarks,
+    oracle_patch_positive_matches,
     patch_positive_set_stats,
     token_patch_boxes,
 )
@@ -155,6 +157,61 @@ def test_patch_evaluator_reports_pnp_inlier_patch_at_k() -> None:
 
     assert stats["pnp_inlier_patch_at_1"] == 1.0
     assert stats["pnp_inlier_patch_at_5"] == 1.0
+
+
+def test_oracle_patch_positive_matches_use_gt_positive_landmarks() -> None:
+    xy = token_grid_xy(3, 3, image_width=100, image_height=100)
+    index = LandmarkMapIndex(
+        track_ids=np.asarray([10, 20], dtype=np.int64),
+        xyz=_xyz_from_xy(np.stack([xy[4], xy[8]], axis=0), np.asarray([5.0, 6.0], dtype=np.float64)),
+        features=np.eye(2, dtype=np.float32),
+        mean_variances=np.asarray([0.1, 0.2], dtype=np.float32),
+        observation_counts=np.asarray([3, 4], dtype=np.int64),
+        observation_image_ids=(("a",), ("b",)),
+        reprojection_errors=np.asarray([0.5, 0.6], dtype=np.float32),
+    )
+    positives = build_patch_positive_sets(index, np.eye(4, dtype=np.float64), _camera(), 3, 3)
+
+    matches = oracle_patch_positive_matches(index, positives, max_per_token=1)
+
+    assert {match.track_id for match in matches} == {10, 20}
+    assert {match.source for match in matches} == {"oracle_patch_positive"}
+    assert all(match.similarity == 1.0 for match in matches)
+    center_by_token = {box.token_index: box.center for box in token_patch_boxes(3, 3, 100, 100)}
+    for match in matches:
+        np.testing.assert_allclose(match.xy, center_by_token[match.token_index])
+
+
+def test_filter_patch_correct_matches_keeps_only_gt_correct_current_matches() -> None:
+    xy = token_grid_xy(2, 1, image_width=100, image_height=100)
+    index = LandmarkMapIndex(
+        track_ids=np.asarray([10, 20], dtype=np.int64),
+        xyz=_xyz_from_xy(xy, np.asarray([5.0, 5.0], dtype=np.float64)),
+        features=np.eye(2, dtype=np.float32),
+        mean_variances=np.zeros((2,), dtype=np.float32),
+        observation_counts=np.ones((2,), dtype=np.int64),
+        observation_image_ids=(("a",), ("b",)),
+    )
+    positives = build_patch_positive_sets(index, np.eye(4, dtype=np.float64), _camera(), 2, 1)
+    matches = [
+        *oracle_patch_positive_matches(index, positives, max_per_token=1),
+        # Same query patch as track 10 but wrong 3D point.
+        oracle_patch_positive_matches(index, positives, max_per_token=1)[0].__class__(
+            token_index=0,
+            xy=xy[0],
+            track_id=20,
+            xyz=index.xyz[1],
+            similarity=0.99,
+            ratio=0.0,
+            landmark_variance=0.0,
+            source="test_wrong",
+        ),
+    ]
+
+    filtered = filter_patch_correct_matches(matches, positives)
+
+    assert [match.track_id for match in filtered] == [10, 20]
+    assert {match.source for match in filtered} == {"oracle_patch_positive"}
 
 
 def test_soft_mutual_topk_keeps_patch_level_many_to_one_candidates() -> None:
@@ -471,6 +528,16 @@ def test_token_patch_boxes_cover_stride_sized_regions() -> None:
 
     center = boxes[4]
     assert center.center.tolist() == [49.5, 49.5]
+    assert center.x0 < 49.5 < center.x1
+    assert center.y0 < 49.5 < center.y1
+
+
+def test_token_patch_boxes_support_center_coordinate_mode() -> None:
+    boxes = token_patch_boxes(token_width=3, token_height=3, image_width=100, image_height=100, coordinate_mode="center")
+
+    center = boxes[4]
+    assert center.center.tolist() == [49.5, 49.5]
+    np.testing.assert_allclose([center.x0, center.y0, center.x1, center.y1], [32.8333333333, 32.8333333333, 66.1666666667, 66.1666666667])
     assert center.x0 < 49.5 < center.x1
     assert center.y0 < 49.5 < center.y1
 

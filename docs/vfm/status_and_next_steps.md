@@ -2977,3 +2977,491 @@ is local geometry-aware rendered-map verification and causal controls, not more
 global mean-pooled descriptor tuning.
 
 Expected promotion metrics are tracked in `docs/vfm/expected_metrics.md`.
+
+## Stage C2.6 OldHospital Robust Local Matching
+
+Artifacts:
+
+- `output/vfm/stage_c26_oldhospital_robust_matching/c26_summary.json`
+- OldHospital run directory:
+  `output/vfm/stage_c26_oldhospital_robust_matching/oldhospital/`
+- ShopFacade sanity:
+  `output/vfm/stage_c26_oldhospital_robust_matching/shopfacade_c25_margin01_refinelm_summary.json`
+
+Protocol:
+
+- reference-pose top10 submap
+- sparse landmark MNN top1
+- COLMAP intrinsics from `sparse/0`
+- C2.5 descriptor unless explicitly marked as semi-hard C2.6
+- fixed PnP-RANSAC handoff, with solver-free descriptor matching reported
+  separately from the final pose solver behavior
+
+OldHospital full182 results:
+
+| method | S@25cm/10deg | S@50cm/10deg | median t | inlier P@1 | inliers |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| C2.5, 0.75 stride PnP | 0.390 | 0.687 | 0.308m | 0.676 | 449.9 |
+| C2.5 + PnP LM refine | 0.412 | 0.720 | 0.296m | 0.676 | 449.9 |
+| PnP 0.5 stride | 0.352 | 0.621 | 0.378m | 0.800 | 297.7 |
+| PnP 1.0 stride | 0.324 | 0.681 | 0.371m | 0.593 | 540.1 |
+| PnP 1.25 stride | 0.357 | 0.659 | 0.337m | 0.546 | 597.4 |
+| 2D grid max4 | 0.242 | 0.549 | 0.454m | 0.664 | 34.2 |
+| 2D grid max8 + depth/cov | 0.203 | 0.571 | 0.443m | 0.665 | 63.9 |
+| semi-hard curriculum + LM | 0.176 | 0.538 | 0.444m | 0.601 | 272.7 |
+
+ShopFacade sanity:
+
+| method | S@25cm/10deg | S@50cm/10deg | median t | inlier P@1 |
+| --- | ---: | ---: | ---: | ---: |
+| C2.5 baseline | 0.864 | 0.922 | 0.136m | 0.428 |
+| C2.5 + PnP LM refine | 0.864 | 0.922 | 0.096m | 0.604 |
+
+Conclusions:
+
+- Promote `C2.5 descriptor + MNN top1 + 0.75 stride PnP-RANSAC +
+  solvePnPRefineLM` as the current fixed geometric handoff default.
+- Do not promote semi-hard curriculum yet. It broke many C2.5 successes on
+  OldHospital, so the current patch-positive labels are still too brittle for
+  this training signal.
+- Do not promote pre-PnP 2D grid spatial filtering. It improves neither final
+  pose nor rescue/break, because it removes too many useful correspondences.
+- Ambiguity pruning drop5 was negative on the first 20 OldHospital queries
+  against the same-query baseline, so full ambiguity pruning is not expanded.
+- Risk scoring is now logged, but the current hand-built score does not yet
+  improve selective localization at 80/90 percent coverage. It remains a
+  diagnostic, not a claim.
+
+## Stage C2.7 Canonical Local Pipeline and Bottleneck Analysis
+
+Artifacts:
+
+- protocol:
+  `feature_extract/configs/vfm/protocol/canonical_local_pipeline.yaml`
+- report:
+  `output/vfm/stage_c27_canonical_local_pipeline/canonical_summary.md`
+- machine-readable summary:
+  `output/vfm/stage_c27_canonical_local_pipeline/canonical_summary.json`
+- report tool:
+  `feature_extract/tools/vfm/report_canonical_local_pipeline.py`
+
+Fixed canonical protocol:
+
+- descriptor: scene-specific C2.5 best checkpoint
+- submap: reference-pose top10 landmark pool
+- matching: patch-level MNN top1
+- PnP: EPNP RANSAC at `0.75 * token_stride`
+- refinement: `solvePnPRefineLM` on RANSAC inliers
+- sparse map filters: current sparse landmark quality defaults
+
+Canonical results:
+
+| scene | method | S@10cm/5deg | S@25cm/10deg | S@50cm/10deg | median t | inlier P@1 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| OldHospital | C1 learned128 | - | 0.290 | 0.652 | 0.367m | 0.511 |
+| OldHospital | C2-S | - | 0.357 | 0.689 | 0.344m | 0.527 |
+| OldHospital | C2.5 | - | 0.390 | 0.687 | 0.308m | 0.676 |
+| OldHospital | C2.5 + LM | 0.088 | 0.412 | 0.720 | 0.295m | 0.676 |
+| ShopFacade | C1 learned128 | - | 0.806 | 0.932 | 0.147m | 0.451 |
+| ShopFacade | C2-S | - | 0.825 | 0.922 | 0.141m | 0.455 |
+| ShopFacade | C2.5 | - | 0.854 | 0.913 | 0.116m | 0.601 |
+| ShopFacade | C2.5 + LM | 0.524 | 0.864 | 0.922 | 0.096m | 0.604 |
+
+OldHospital upper-bound diagnostics:
+
+| diagnostic | S@10cm/5deg | S@25cm/10deg | S@50cm/10deg | median t | interpretation |
+| --- | ---: | ---: | ---: | ---: | --- |
+| GT patch-positive correspondences in top10 | 0.819 | 0.995 | 1.000 | 0.041m | landmark geometry and patch uncertainty are not the main limit |
+| current matches filtered to GT-correct | 0.462 | 0.846 | 0.973 | 0.114m | current matches contain enough correct correspondences, but confidence is weak |
+| GT-visible capped20k diagnostic | 0.027 | 0.297 | 0.615 | 0.395m | not a true oracle; the 20k cap changes the candidate pool |
+
+Solver backend sweep:
+
+| backend | S@25cm/10deg | S@50cm/10deg | median t | conclusion |
+| --- | ---: | ---: | ---: | --- |
+| EPNP + LM | 0.412 | 0.720 | 0.295m | canonical default |
+| AP3P + LM | 0.297 | 0.615 | 0.392m | worse |
+| SQPNP + LM | 0.412 | 0.720 | 0.295m | tied with default |
+| EPNP + VVS | 0.412 | 0.720 | 0.295m | tied with default |
+
+Soft PnP ordering diagnostic:
+
+| setting | S@10cm/5deg | S@25cm/10deg | S@50cm/10deg | median t | inlier P@1 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| canonical EPNP + LM, 1000 matches | 0.088 | 0.412 | 0.720 | 0.295m | 0.676 |
+| composite soft order, top800 | 0.104 | 0.385 | 0.659 | 0.330m | 0.681 |
+| composite soft order, top600 | 0.044 | 0.368 | 0.621 | 0.364m | 0.686 |
+
+Failure buckets on OldHospital C2.5 + LM at S@25:
+
+- failed queries: 107 / 182
+- high inlier count but wrong pose: 104
+- spatially degenerate inliers: 90
+- low reference top10 visible-landmark recall: 107
+- repeated-structure confusion: 51
+- LM worsens relative to no-LM on successful baseline queries: 10
+
+Conclusion:
+
+- Freeze C2.5 + LM as the local baseline for the next paper table.
+- Do not spend more effort on PnP backend tuning now; AP3P is negative and
+  SQPNP/VVS do not improve the metric.
+- Do not promote soft top-N PnP preselection. It slightly raises inlier
+  Patch@1 but reduces inlier count and broad localization success, which means
+  the removed correspondences still carry useful geometric coverage.
+- The real gap is false match confidence and correspondence selection. The
+  current top10 pool contains enough geometry for strong localization, and
+  current C2.5 matches contain many correct correspondences, but RANSAC still
+  accepts spatially coherent wrong matches in OldHospital repeated structures.
+- The next local improvement should be soft correspondence weighting or
+  calibrated match confidence, not hard grid deletion and not more descriptor
+  capacity by default.
+
+## Stage C2.8 Calibrated Correspondence Selection
+
+Artifacts:
+
+- match tables:
+  `output/vfm/stage_c28_correspondence_confidence/*/canonical_matches.jsonl`
+- confidence models:
+  `output/vfm/stage_c28_correspondence_confidence/*/confidence_models/`
+- summary:
+  `output/vfm/stage_c28_correspondence_confidence/c28_summary.md`
+- tools:
+  `feature_extract/tools/vfm/train_stage_c28_correspondence_confidence.py`
+  `feature_extract/tools/vfm/eval_stage_c28_confidence_model.py`
+  `feature_extract/tools/vfm/eval_stage_c28_confidence_selection.py`
+
+Question answered:
+
+Can the current descriptor's wrong correspondences be separated using
+observable match evidence?
+
+Answer:
+
+- Yes, partially, from descriptor and map statistics alone.
+- Yes, strongly, if baseline PnP inlier/residual features are included.
+- But current confidence use is not yet stable enough to replace the canonical
+  C2.5+LM baseline.
+
+Confidence quality on held-out query split:
+
+| scene | model | AUROC | AUPRC | ECE | P@10% |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| OldHospital | descriptor | 0.715 | 0.792 | 0.107 | 0.867 |
+| OldHospital | descriptor + map | 0.732 | 0.804 | 0.102 | 0.879 |
+| OldHospital | full observable | 0.936 | 0.969 | 0.044 | 1.000 |
+| ShopFacade | descriptor | 0.716 | 0.790 | 0.100 | 0.857 |
+| ShopFacade | descriptor + map | 0.750 | 0.822 | 0.093 | 0.907 |
+| ShopFacade | full observable | 0.971 | 0.984 | 0.054 | 0.999 |
+
+Cross-scene descriptor+map confidence:
+
+| transfer | AUROC | AUPRC | ECE | P@10% |
+| --- | ---: | ---: | ---: | ---: |
+| OldHospital -> ShopFacade | 0.713 | 0.768 | 0.194 | 0.839 |
+| ShopFacade -> OldHospital | 0.757 | 0.831 | 0.101 | 0.908 |
+
+Pose impact with descriptor+map confidence:
+
+| scene | method | S@25cm/10deg | S@50cm/10deg | median t | rescue/break |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| OldHospital | canonical | 0.412 | 0.720 | 0.295m | - |
+| OldHospital | confidence global top800 | 0.357 | 0.654 | 0.388m | - |
+| OldHospital | confidence grid top800 | 0.385 | 0.709 | 0.325m | - |
+| OldHospital | confidence hypothesis rescoring | 0.445 | 0.714 | 0.312m | 20/14 = 1.43 |
+| ShopFacade | canonical | 0.864 | 0.922 | 0.096m | - |
+| ShopFacade | confidence hypothesis rescoring | 0.874 | 0.932 | 0.099m | 2/1 = 2.00 |
+
+Conclusions:
+
+- Descriptor+map confidence passes the minimum separability gate
+  (`AUROC > 0.70`) on both scenes and transfers across scenes.
+- Map stats alone are weak, so the useful signal is mostly descriptor evidence
+  plus a small map-quality correction.
+- Full observable confidence is very strong, but it uses baseline PnP
+  residual/inlier features, so it should be treated as a hypothesis-rescoring
+  diagnostic, not as a descriptor-only correspondence claim.
+- Direct confidence preselection is negative. It raises match correctness
+  slightly but removes useful geometric coverage.
+- Multi-hypothesis rescoring is promising but not promoted yet: it improves
+  OldHospital S@25 from 0.412 to 0.445, but misses the conservative target
+  (`>=0.45` and median `<=0.27m`) and rescue/break is 1.43, below 1.5.
+
+Next local step:
+
+- Keep C2.5+LM as the frozen default.
+- Keep C2.8 as a positive diagnostic branch.
+- Improve confidence rescoring by calibrating the hypothesis score, adding
+  broader candidate hypotheses without hard deletion, and validating on
+  hard-failure subsets before promotion.
+
+## Stage C2.9 Confidence-Supervised Descriptor Refinement
+
+Artifacts:
+
+- topK correspondence training tables:
+  `output/vfm/stage_c29_confidence_descriptor_refinement/*/topk_candidate_matches.jsonl`
+- identity-start residual descriptor checkpoints:
+  `output/vfm/stage_c29_confidence_descriptor_refinement/*/*refiner.pt`
+- exported refined descriptor banks:
+  `output/vfm/stage_c29_confidence_descriptor_refinement/*/*query_manifest.json`
+  `output/vfm/stage_c29_confidence_descriptor_refinement/*/*landmark_bank.npz`
+- summary:
+  `output/vfm/stage_c29_confidence_descriptor_refinement/c29_summary.md`
+- tool:
+  `feature_extract/tools/vfm/train_stage_c29_confidence_descriptor_refinement.py`
+
+Question answered:
+
+Can C2.8 correspondence correctness/confidence be pushed back into descriptor
+training so GT-correct matches become easier to separate before RANSAC?
+
+Answer:
+
+- Candidate-level ranking improves on both scenes.
+- Final pose improves on ShopFacade with conservative identity-start training.
+- OldHospital remains below the frozen C2.5+LM baseline on S@25 and median
+  translation, so C2.9 is not promoted to the main local descriptor.
+
+The first C2.9 implementation exposed an important engineering issue: a
+LayerNorm before the identity projection made the refiner non-identity at
+initialization and severely damaged final pose. The refiner is now an
+identity-start residual mapper for square input/output dimensions, with an
+explicit test that verifies exact identity behavior before training.
+
+Results:
+
+| scene | method | train top1 eval | S@10cm/5deg | S@25cm/10deg | S@50cm/10deg | median t | inlier P@1 | rescue/break |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| OldHospital | C2.5+LM baseline | - | 0.066 | 0.390 | 0.687 | 0.308m | 0.676 | - |
+| OldHospital | C2.9 non-identity full | 0.761 -> 0.842 | 0.016 | 0.291 | 0.549 | 0.442m | 0.603 | 17/35 |
+| OldHospital | C2.9 identity conservative | 0.761 -> 0.870 | 0.027 | 0.352 | 0.665 | 0.337m | 0.634 | 27/34 |
+| OldHospital | C2.9 identity micro | 0.761 -> 0.856 | 0.055 | 0.379 | 0.692 | 0.347m | 0.658 | 23/25 |
+| ShopFacade | C2.5+LM baseline | - | 0.369 | 0.806 | 0.913 | 0.115m | 0.604 | - |
+| ShopFacade | C2.9 non-identity full | 0.752 -> 0.782 | 0.098 | 0.441 | 0.676 | 0.279m | 0.449 | 4/42 |
+| ShopFacade | C2.9 identity conservative | 0.752 -> 0.835 | 0.456 | 0.854 | 0.942 | 0.108m | 0.577 | 11/6 |
+
+Conclusions:
+
+- C2.8 confidence/correctness is a real descriptor-training signal: topK
+  candidate top1 improves by about 3-11 points depending on scene and training
+  strength.
+- The signal is not automatically aligned with the canonical MNN+PnP objective.
+  Aggressive refinement improves the training ranking but destroys final pose.
+- Conservative identity-start refinement is useful for ShopFacade and improves
+  OldHospital broad success/inlier count, but it still loses OldHospital S@25
+  and median translation.
+- Keep C2.5+LM as the frozen default. Keep C2.9 as a diagnostic branch and a
+  possible ShopFacade ablation, not as the main method.
+
+Next local step:
+
+- For OldHospital, do not keep increasing descriptor capacity. The failure is
+  likely outdoor landmark-scale ambiguity, repeated facade/path geometry, and
+  weaker reference-pool coverage: topK candidate ranking can improve while
+  MNN+PnP still chooses spatially coherent wrong correspondences.
+- If revisiting C2.9, train on pose-hypothesis-level rescue/break labels or use
+  confidence for multi-hypothesis rescoring rather than single-match MNN
+  descriptor replacement.
+
+## Cambridge Scene Audit After C2.9
+
+Audit artifact:
+
+- `output/vfm/audit_cambridge_scene/audit_summary.md`
+- visualizations:
+  `output/vfm/audit_cambridge_scene/edge_dedup_visualizations/`
+
+Conclusions:
+
+- OldHospital and ShopFacade are Cambridge outdoor landmark scenes. The previous
+  "indoor repeated structure" phrase was a wording error, not a data-path
+  finding.
+- No reviewed artifact shows OldHospital/ShopFacade crossing into an indoor or
+  wrong-scene data source.
+- A real comparison issue was found: older ShopFacade C2.5 baseline summaries
+  used `model_train_tracks_min2_head100k_v1.jsonl`, while later C2.9 evaluation
+  used the full ShopFacade track file. Full-track C2.5 is the fair baseline.
+- Token coordinate mode was audited. A center-coordinate diagnostic worsened
+  final pose substantially, so the default remains the legacy edge-aligned
+  coordinate convention. The code now exposes `coordinate_mode` explicitly
+  rather than hiding this assumption.
+- PnP now deduplicates repeated 3D track IDs before solving.
+- `reference_visibility` now fails fast when candidate references are missing
+  instead of silently using an empty submap.
+
+Fair edge-aligned + PnP-dedup audit:
+
+| scene | method | S@10cm/5deg | S@25cm/10deg | S@50cm/10deg | median t | inlier P@1 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| OldHospital | C2.5 | 0.088 | 0.412 | 0.720 | 0.295m | 0.676 |
+| OldHospital | C2.9 micro | 0.055 | 0.379 | 0.692 | 0.347m | 0.658 |
+| ShopFacade | C2.5 full-track | 0.524 | 0.864 | 0.922 | 0.096m | 0.604 |
+| ShopFacade | C2.9 conservative | 0.456 | 0.854 | 0.942 | 0.108m | 0.577 |
+
+Updated conclusion:
+
+- Freeze C2.5 as the local descriptor baseline.
+- C2.9 should be treated as diagnostic only until retrained/evaluated under a
+  fully fixed and documented coordinate/provenance protocol.
+
+## Stage C2.10 MNN-Consistent Descriptor Selection
+
+Artifacts:
+
+- implementation:
+  `feature_extract/vfm/mnn_consistent_descriptor_selection.py`
+- CLI:
+  `feature_extract/tools/vfm/train_stage_c210_mnn_consistent_descriptor_selection.py`
+- tests:
+  `tests/test_vfm_mnn_consistent_descriptor_selection.py`
+- report:
+  `output/vfm/stage_c210_mnn_consistent_descriptor_selection/c210_summary.md`
+
+Question:
+
+Can the C2.8/C2.9 correspondence correctness signal be pushed back into the
+descriptor by aligning training with MNN inference?
+
+Implemented objective:
+
+- dual-softmax query-token by landmark loss, matching MNN-style bidirectional
+  retrieval;
+- soft reprojection labels for VFM patch-level ambiguity;
+- wrong-pose consensus negative margin for GT-false RANSAC inliers;
+- full-observable confidence teacher distillation;
+- C2.5 anchor loss and identity-start residual selector.
+
+Training diagnostics are positive but not sufficient:
+
+| scene | config | groups | loss | train dual top1 | eval dual top1 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| OldHospital | conservative full | 182 | 1.579 -> 1.526 | 0.929 -> 0.944 | 0.943 |
+| ShopFacade | conservative full | 103 | 1.277 -> 1.168 | 0.824 -> 0.855 | 0.820 |
+
+Full localization under the same reference-top10 MNN+PnP protocol is negative:
+
+| scene | method | S@25 | S@50 | median t | inlier Patch@1 | mean inliers |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| OldHospital | C2.5 canonical | 0.412 | 0.720 | 0.295m | 0.676 | 449.9 |
+| OldHospital | C2.10 conservative | 0.282 | 0.586 | 0.408m | 0.621 | 343.2 |
+| ShopFacade | C2.5 canonical | 0.864 | 0.922 | 0.096m | 0.604 | 288.7 |
+| ShopFacade | C2.10 conservative | 0.553 | 0.806 | 0.223m | 0.502 | 115.5 |
+
+Conclusion:
+
+- C2.10 is implemented and verified, but it is not promoted to the mainline.
+- The correspondence teacher signal can improve table-level dual ranking, but
+  direct descriptor distillation harms the geometric coverage that C2.5 relies
+  on.
+- Keep C2.5 canonical as the local descriptor baseline. Keep C2.10 as an
+  ablation showing that match-table ranking gains are not enough; future work
+  should prefer hypothesis-level rescoring or a separate confidence head over
+  mutating the descriptor geometry directly.
+
+## Patch-To-Pixel Offset Refinement
+
+Artifacts:
+
+- implementation:
+  `feature_extract/vfm/patch_offset_refiner.py`
+- training CLI:
+  `feature_extract/tools/vfm/train_patch_offset_refiner.py`
+- evaluator integration:
+  `feature_extract/tools/vfm/eval_patch_to_3d_vfm_matching.py`
+- report:
+  `output/vfm/patch_offset_refiner/patch_offset_refiner_summary.md`
+
+Question:
+
+Can a scene-specific offset head refine C2.5 patch-center 2D measurements into
+more precise 2D points without replacing the patch-level matching backbone?
+
+Implemented modes:
+
+- `oracle_two_pass_inliers`: run patch-center PnP, replace first-pass inlier
+  2D points by their GT projections, then rerun PnP.
+- `learned_two_pass_inliers`: run patch-center PnP, apply learned offset only
+  to first-pass inliers passing confidence gate, then rerun PnP.
+
+Training diagnostics:
+
+| scene | samples | positive offset MAE |
+| --- | ---: | ---: |
+| OldHospital | 120,000 | 8.26px -> 7.06px |
+| ShopFacade | 62,120 | 8.96px -> 7.77px |
+
+Full localization:
+
+| scene | method | S@10 | S@25 | S@50 | median t | inlier Patch@1 | mean inliers |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| OldHospital | C2.5 patch center | 0.088 | 0.412 | 0.720 | 0.295m | 0.676 | 449.9 |
+| OldHospital | oracle two-pass offset | 0.335 | 0.802 | 0.912 | 0.137m | 0.642 | 508.2 |
+| OldHospital | learned two-pass, gate 0.5 | 0.038 | 0.385 | 0.665 | 0.317m | 0.663 | 462.3 |
+| OldHospital | learned two-pass, gate 0.9 | 0.044 | 0.330 | 0.643 | 0.382m | 0.674 | 449.2 |
+| ShopFacade | C2.5 patch center | 0.524 | 0.864 | 0.922 | 0.096m | 0.604 | 288.7 |
+| ShopFacade | oracle two-pass offset | 0.757 | 0.893 | 0.932 | 0.046m | 0.568 | 332.7 |
+| ShopFacade | learned two-pass, gate 0.5 | 0.437 | 0.835 | 0.903 | 0.113m | 0.596 | 294.1 |
+| ShopFacade | learned two-pass, gate 0.9 | 0.330 | 0.825 | 0.903 | 0.118m | 0.604 | 287.3 |
+
+Conclusion:
+
+- Oracle offset proves patch-center 2D noise is a major remaining bottleneck.
+- The first learned local-correlation offset head is not promoted: it improves
+  positive offset MAE on the training table but hurts final pose.
+- Gate 0.9 mostly preserves the original inlier structure, but still does not
+  improve pose.
+- Keep this branch as an upper-bound diagnostic and engineering interface.
+  The next learned version needs validation-calibrated confidence and richer
+  local/view context before it can be considered for the mainline.
+
+## Strict Patch Offset Feasibility
+
+Artifacts:
+
+- strict diagnostics:
+  `output/vfm/patch_offset_feasibility/*/strict_offset_feasibility_summary.json`
+- report:
+  `output/vfm/patch_offset_feasibility/strict_offset_feasibility_summary.md`
+- analysis CLI:
+  `feature_extract/tools/vfm/analyze_patch_offset_feasibility.py`
+
+Question:
+
+Was the strong oracle offset mostly a free correspondence rewrite, or is there
+a bounded, patch-local offset signal that can improve pose without damaging the
+existing patch-level PnP inliers?
+
+Answer:
+
+- Free oracle is too optimistic: fixed same-inlier free oracle reaches
+  near-perfect pose on both scenes.
+- Bounded same-inlier oracle is still positive. At 0.5 stride, OldHospital
+  improves S@25 from 0.412 to 0.500 and ShopFacade from 0.864 to 0.874. At
+  1.0 stride, the upper bound becomes very large.
+- The current learned offset head becomes useful only if RANSAC is not allowed
+  to reselect inliers. The new optional `learned_same_inlier_fixed` evaluator
+  mode runs C2.5 PnP first, refines only first-pass inliers, then solves fixed
+  PnP/LM from that same inlier set.
+
+Full evaluator result:
+
+| scene | method | S@10 | S@25 | S@50 | median t | inlier P@1 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| OldHospital | C2.5 patch center | 0.088 | 0.412 | 0.720 | 0.295m | 0.676 |
+| OldHospital | learned offset, second RANSAC | 0.038 | 0.385 | 0.665 | 0.317m | 0.663 |
+| OldHospital | learned offset, same-inlier fixed | 0.099 | 0.434 | 0.747 | 0.283m | 0.676 |
+| ShopFacade | C2.5 patch center | 0.524 | 0.864 | 0.922 | 0.096m | 0.604 |
+| ShopFacade | learned offset, second RANSAC | 0.437 | 0.835 | 0.903 | 0.113m | 0.596 |
+| ShopFacade | learned offset, same-inlier fixed | 0.544 | 0.864 | 0.932 | 0.094m | 0.604 |
+
+Conclusion:
+
+- Keep C2.5 patch-center matching as the mainline.
+- Do not promote offset-before-RANSAC or offset-with-second-RANSAC.
+- Keep `learned_same_inlier_fixed` as a positive optional refinement branch:
+  it is small but safe, because it preserves PnP-inlier Patch@1 and inlier
+  count by construction.
+- The next offset training target should be first-pass-inlier fixed-PnP/LM
+  improvement and offset confidence calibration, not all-match dx/dy regression.

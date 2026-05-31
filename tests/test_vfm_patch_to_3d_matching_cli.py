@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from feature_extract.tools.vfm.eval_patch_to_3d_vfm_matching import main
 from feature_extract.vfm.map_lifting import SelectedTrackFeatureBank, TrackFeature, save_selected_track_bank_npz
@@ -101,6 +102,7 @@ def test_eval_patch_to_3d_cli_reports_patch_metrics(tmp_path: Path) -> None:
         + "\n"
     )
     rows_path = tmp_path / "rows.jsonl"
+    matches_path = tmp_path / "matches.jsonl"
     summary_path = tmp_path / "summary.json"
 
     main(
@@ -138,12 +140,15 @@ def test_eval_patch_to_3d_cli_reports_patch_metrics(tmp_path: Path) -> None:
             "1.5",
             "--output_jsonl",
             str(rows_path),
+            "--output_matches_jsonl",
+            str(matches_path),
             "--summary_json",
             str(summary_path),
         ]
     )
 
     rows = [json.loads(line) for line in rows_path.read_text().splitlines()]
+    matches = [json.loads(line) for line in matches_path.read_text().splitlines()]
     summary = json.loads(summary_path.read_text())
     assert rows[0]["patch_geometry"]["patch_at_1"] == 1.0
     assert rows[0]["patch_geometry"]["gt_precision_5px"] == 0.0
@@ -172,6 +177,64 @@ def test_eval_patch_to_3d_cli_reports_patch_metrics(tmp_path: Path) -> None:
     assert summary["reference_prior"]["top1"]["median_translation_error_m"] == 2.0
     assert summary["reference_prior"]["oracle"]["median_translation_error_m"] == 0.2
     assert summary["reference_prior"]["oracle"]["success_25cm_10deg"] == 1.0
+    assert matches[0]["gt_reproj_error_px"] == 12.0
+    assert matches[0]["gt_reproj_error_stride"] < 1.0
+    assert matches[0]["strong_positive_label"] is True
+    assert matches[0]["stride_positive_label"] is True
+    assert matches[0]["hard_negative_label"] is False
+    assert matches[0]["baseline_reproj_residual_px"] is None
+    assert matches[0]["xyz"] == xyz.tolist()
+
+
+def test_eval_patch_to_3d_cli_requires_candidate_bank_for_reference_visibility(tmp_path: Path) -> None:
+    dim = 2
+    token_path = tmp_path / "q.npz"
+    np.savez_compressed(token_path, radio_final=np.zeros((dim, 1, 1), dtype=np.float32))
+    manifest = TokenBankManifest(
+        records=(
+            TokenBankRecord(
+                image_id="q.png",
+                token_path=token_path,
+                layers=(TokenLayerSpec("radio_final", "synthetic", "final", dim, 16),),
+                split="test",
+                scene="Synthetic",
+            ),
+        )
+    )
+    manifest_path = tmp_path / "manifest.json"
+    manifest.to_json(manifest_path)
+    bank_path = tmp_path / "bank.npz"
+    save_selected_track_bank_npz(SelectedTrackFeatureBank(tracks={}, feature_dim=dim), bank_path)
+    tracks_path = tmp_path / "tracks.jsonl"
+    tracks_path.write_text("")
+    pose_path = tmp_path / "poses.txt"
+    pose_path.write_text(
+        "Visual Landmark Dataset V1\n"
+        "ImageFile, Camera Position [X Y Z W P Q R]\n\n"
+        "q.png 0 0 0 1 0 0 0\n"
+    )
+
+    with pytest.raises(ValueError, match="candidate_bank is required"):
+        main(
+            [
+                "--query_manifest",
+                str(manifest_path),
+                "--landmark_bank",
+                str(bank_path),
+                "--track_observations",
+                str(tracks_path),
+                "--query_pose_file",
+                str(pose_path),
+                "--submap_mode",
+                "reference_visibility",
+                "--default_camera",
+                "1,100,100,80,80,50,50",
+                "--output_jsonl",
+                str(tmp_path / "rows.jsonl"),
+                "--summary_json",
+                str(tmp_path / "summary.json"),
+            ]
+        )
 
 
 def test_eval_patch_to_3d_cli_supports_gt_visible_submap(tmp_path: Path) -> None:

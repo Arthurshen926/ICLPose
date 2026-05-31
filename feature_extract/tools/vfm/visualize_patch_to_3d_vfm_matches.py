@@ -31,6 +31,7 @@ from feature_extract.vfm.patch_to_3d_matching import (
     patch_uncertainty_pnp_threshold,
 )
 from feature_extract.vfm.query_to_3d_matching import (
+    LandmarkAmbiguityPruningConfig,
     LandmarkQualityConfig,
     LandmarkMapIndex,
     LocalGeometricConsistencyConfig,
@@ -53,6 +54,9 @@ def _matching_config_dict(config: PatchTo3DMatchingConfig) -> dict[str, object]:
     local = values.get("local_geometric_consistency")
     if isinstance(local, LocalGeometricConsistencyConfig):
         values["local_geometric_consistency"] = dict(local.__dict__)
+    ambiguity = values.get("landmark_ambiguity_pruning")
+    if isinstance(ambiguity, LandmarkAmbiguityPruningConfig):
+        values["landmark_ambiguity_pruning"] = dict(ambiguity.__dict__)
     return values
 
 

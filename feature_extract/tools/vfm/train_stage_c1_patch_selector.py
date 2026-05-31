@@ -90,6 +90,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     parser.add_argument("--max_positives_per_token", type=int, default=4)
     parser.add_argument("--hard_negatives_per_token", type=int, default=32)
     parser.add_argument("--hard_negative_pool", type=int, default=256)
+    parser.add_argument("--negative_curriculum", default="hard", choices=("hard", "medium", "semi_hard", "mixed"))
+    parser.add_argument("--medium_min_stride", type=float, default=4.0)
+    parser.add_argument("--semi_hard_min_stride", type=float, default=2.0)
+    parser.add_argument("--semi_hard_max_stride", type=float, default=4.0)
+    parser.add_argument("--mixed_hard_fraction", type=float, default=0.1)
     parser.add_argument("--min_positive_count", type=int, default=1)
     parser.add_argument("--max_train_samples", type=int, default=20000)
     parser.add_argument("--max_queries", type=int, default=0)
@@ -213,6 +218,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 query_token_step=int(args.query_token_step),
                 min_positive_count=int(args.min_positive_count),
                 seed=_stable_query_seed(args.seed, record_idx, record.image_id),
+                negative_curriculum=str(args.negative_curriculum),
+                medium_min_stride=float(args.medium_min_stride),
+                semi_hard_min_stride=float(args.semi_hard_min_stride),
+                semi_hard_max_stride=float(args.semi_hard_max_stride),
+                mixed_hard_fraction=float(args.mixed_hard_fraction),
             )
             samples = build_patch_selector_samples_for_query(
                 query_feature,
@@ -272,6 +282,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 "max_positives_per_token": int(args.max_positives_per_token),
                 "hard_negatives_per_token": int(args.hard_negatives_per_token),
                 "hard_negative_pool": int(args.hard_negative_pool),
+                "negative_curriculum": str(args.negative_curriculum),
+                "medium_min_stride": float(args.medium_min_stride),
+                "semi_hard_min_stride": float(args.semi_hard_min_stride),
+                "semi_hard_max_stride": float(args.semi_hard_max_stride),
+                "mixed_hard_fraction": float(args.mixed_hard_fraction),
                 "min_positive_count": int(args.min_positive_count),
                 "max_train_samples": int(args.max_train_samples),
             },
@@ -330,6 +345,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             "submap_mode": str(args.submap_mode),
             "submap_top_n": int(args.submap_top_n),
             "seed": int(args.seed),
+            "negative_curriculum": str(args.negative_curriculum),
         },
     )
 
@@ -395,6 +411,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             "max_positives_per_token": int(args.max_positives_per_token),
             "hard_negatives_per_token": int(args.hard_negatives_per_token),
             "hard_negative_pool": int(args.hard_negative_pool),
+            "negative_curriculum": str(args.negative_curriculum),
+            "medium_min_stride": float(args.medium_min_stride),
+            "semi_hard_min_stride": float(args.semi_hard_min_stride),
+            "semi_hard_max_stride": float(args.semi_hard_max_stride),
+            "mixed_hard_fraction": float(args.mixed_hard_fraction),
             "min_positive_count": int(args.min_positive_count),
             "max_train_samples": int(args.max_train_samples),
         },

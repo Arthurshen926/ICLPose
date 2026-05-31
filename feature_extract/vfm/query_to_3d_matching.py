@@ -168,6 +168,28 @@ class LandmarkQualityConfig:
 
 
 @dataclass(frozen=True)
+class LandmarkAmbiguityPruningConfig:
+    enabled: bool = False
+    drop_fraction: float | None = None
+    max_score: float | None = None
+    close_similarity_threshold: float = 0.9
+    reference_size: int = 4096
+    block_size: int = 512
+
+    def __post_init__(self) -> None:
+        if self.drop_fraction is not None and not 0.0 < float(self.drop_fraction) < 1.0:
+            raise ValueError("drop_fraction must be in (0, 1)")
+        if self.max_score is not None and not 0.0 <= float(self.max_score) <= 1.0:
+            raise ValueError("max_score must be in [0, 1]")
+        if not -1.0 <= float(self.close_similarity_threshold) <= 1.0:
+            raise ValueError("close_similarity_threshold must be in [-1, 1]")
+        if int(self.reference_size) <= 1:
+            raise ValueError("reference_size must be greater than 1")
+        if int(self.block_size) <= 0:
+            raise ValueError("block_size must be positive")
+
+
+@dataclass(frozen=True)
 class MapReliabilityConfig:
     enabled: bool = False
     track_weight: float = 1.0
@@ -231,6 +253,44 @@ class LocalGeometricConsistencyConfig:
             raise ValueError("keep_fraction must be in (0, 1]")
         if self.max_input_matches is not None and int(self.max_input_matches) <= 0:
             raise ValueError("max_input_matches must be positive")
+
+
+@dataclass(frozen=True)
+class SpatialDiversityPnPConfig:
+    enabled: bool = False
+    grid_rows: int = 4
+    grid_cols: int = 4
+    max_per_cell: int = 2
+    max_matches: int | None = None
+    score_mode: str = "margin"
+    min_depth_range_m: float | None = None
+    min_planarity_ratio: float | None = None
+
+    def __post_init__(self) -> None:
+        if int(self.grid_rows) <= 0 or int(self.grid_cols) <= 0:
+            raise ValueError("grid rows/cols must be positive")
+        if int(self.max_per_cell) <= 0:
+            raise ValueError("max_per_cell must be positive")
+        if self.max_matches is not None and int(self.max_matches) <= 0:
+            raise ValueError("max_matches must be positive")
+        if self.score_mode not in {"margin", "pairwise", "reliability", "similarity"}:
+            raise ValueError("score_mode must be one of: margin, pairwise, reliability, similarity")
+        if self.min_depth_range_m is not None and float(self.min_depth_range_m) < 0.0:
+            raise ValueError("min_depth_range_m must be non-negative")
+        if self.min_planarity_ratio is not None and float(self.min_planarity_ratio) < 0.0:
+            raise ValueError("min_planarity_ratio must be non-negative")
+
+
+@dataclass(frozen=True)
+class PoseRiskConfig:
+    min_inlier_count: float = 64.0
+    min_inlier_ratio: float = 0.25
+    min_inlier_patch_at_1: float = 0.5
+    max_reprojection_median_px: float = 16.0
+    min_grid_coverage: float = 0.25
+    min_depth_range_m: float = 1.0
+    min_planarity_ratio: float = 0.02
+    min_map_reliability: float = 0.5
 
 
 @dataclass(frozen=True)
@@ -306,6 +366,7 @@ class QueryTo3DMatch:
     pnp_uncertainty_scale: float | None = None
     local_consistency_support: int | None = None
     local_consistency_score: float | None = None
+    pnp_soft_score: float | None = None
 
 
 @dataclass(frozen=True)
@@ -343,6 +404,7 @@ def token_grid_xy(
     image_width: int,
     image_height: int,
     step: int = 1,
+    coordinate_mode: str = "edge",
 ) -> np.ndarray:
     if token_width <= 0 or token_height <= 0:
         raise ValueError("token grid dimensions must be positive")
@@ -350,13 +412,42 @@ def token_grid_xy(
         raise ValueError("image dimensions must be positive")
     if step <= 0:
         raise ValueError("step must be positive")
-    xs = np.linspace(0.0, float(image_width - 1), token_width, dtype=np.float64)
-    ys = np.linspace(0.0, float(image_height - 1), token_height, dtype=np.float64)
+    if coordinate_mode == "edge":
+        xs = np.linspace(0.0, float(image_width - 1), token_width, dtype=np.float64)
+        ys = np.linspace(0.0, float(image_height - 1), token_height, dtype=np.float64)
+    elif coordinate_mode == "center":
+        stride_x = float(image_width) / float(token_width)
+        stride_y = float(image_height) / float(token_height)
+        xs = (np.arange(token_width, dtype=np.float64) + 0.5) * stride_x - 0.5
+        ys = (np.arange(token_height, dtype=np.float64) + 0.5) * stride_y - 0.5
+    else:
+        raise ValueError("coordinate_mode must be one of: edge, center")
     coords = []
     for y_idx in range(0, token_height, step):
         for x_idx in range(0, token_width, step):
             coords.append((xs[x_idx], ys[y_idx]))
     return np.asarray(coords, dtype=np.float64)
+
+
+def deduplicate_pnp_matches(matches: Sequence[QueryTo3DMatch]) -> tuple[list[QueryTo3DMatch], np.ndarray]:
+    """Keep one 2D observation per 3D track before PnP.
+
+    Matches are already sorted by descriptor/quality confidence before PnP, so
+    keeping the first occurrence preserves the current scoring policy while
+    avoiding repeated 3D points with conflicting 2D observations.
+    """
+
+    unique: list[QueryTo3DMatch] = []
+    original_indices: list[int] = []
+    seen_tracks: set[int] = set()
+    for idx, match in enumerate(matches):
+        track_id = int(match.track_id)
+        if track_id in seen_tracks:
+            continue
+        seen_tracks.add(track_id)
+        unique.append(match)
+        original_indices.append(int(idx))
+    return unique, np.asarray(original_indices, dtype=np.int64)
 
 
 def _flatten_query_features(
@@ -439,6 +530,81 @@ def _landmark_nearest_neighbor_ambiguity(
                 scores[local_row, ref_pos] = -np.inf
         ambiguity[start:end] = np.max(scores, axis=1).astype(np.float32)
     return np.clip((ambiguity + 1.0) * 0.5, 0.0, 1.0).astype(np.float32, copy=False)
+
+
+def landmark_submap_ambiguity_scores(
+    index: LandmarkMapIndex,
+    close_similarity_threshold: float = 0.9,
+    reference_size: int = 4096,
+    block_size: int = 512,
+) -> np.ndarray:
+    """Score descriptor ambiguity inside the current landmark pool."""
+
+    count = len(index)
+    if count == 0:
+        return np.zeros((0,), dtype=np.float32)
+    features, valid = normalize_rows(index.features)
+    if count <= 1:
+        return np.zeros((count,), dtype=np.float32)
+    if count > int(reference_size):
+        reference_indices = np.linspace(0, count - 1, int(reference_size), dtype=np.int64)
+    else:
+        reference_indices = np.arange(count, dtype=np.int64)
+    reference = features[reference_indices]
+    reference_position_by_index = {int(index_value): pos for pos, index_value in enumerate(reference_indices.tolist())}
+    top1 = np.zeros((count,), dtype=np.float32)
+    top2 = np.zeros((count,), dtype=np.float32)
+    close_counts = np.zeros((count,), dtype=np.float32)
+    threshold = float(close_similarity_threshold)
+    for start in range(0, count, int(block_size)):
+        end = min(start + int(block_size), count)
+        scores = features[start:end] @ reference.T
+        for local_row, global_row in enumerate(range(start, end)):
+            if not bool(valid[global_row]):
+                scores[local_row, :] = -np.inf
+                continue
+            ref_pos = reference_position_by_index.get(int(global_row))
+            if ref_pos is not None:
+                scores[local_row, ref_pos] = -np.inf
+        finite_scores = np.where(np.isfinite(scores), scores, -1.0)
+        close_counts[start:end] = np.sum(finite_scores >= threshold, axis=1).astype(np.float32)
+        if finite_scores.shape[1] == 1:
+            top1[start:end] = finite_scores[:, 0]
+            top2[start:end] = -1.0
+        else:
+            part = np.partition(finite_scores, kth=max(finite_scores.shape[1] - 2, 0), axis=1)
+            top2[start:end] = part[:, -2]
+            top1[start:end] = part[:, -1]
+    top1_norm = np.clip((top1 + 1.0) * 0.5, 0.0, 1.0)
+    margin = np.clip(top1 - top2, 0.0, 2.0)
+    margin_ambiguity = 1.0 - np.clip(margin / 2.0, 0.0, 1.0)
+    close_norm = close_counts / max(float(np.max(close_counts)), 1.0)
+    ambiguity = 0.6 * top1_norm + 0.25 * margin_ambiguity + 0.15 * close_norm
+    ambiguity[~valid] = 1.0
+    return np.clip(ambiguity, 0.0, 1.0).astype(np.float32, copy=False)
+
+
+def prune_ambiguous_landmarks(
+    index: LandmarkMapIndex,
+    config: LandmarkAmbiguityPruningConfig,
+) -> LandmarkMapIndex:
+    if not config.enabled or len(index) == 0:
+        return index
+    scores = landmark_submap_ambiguity_scores(
+        index,
+        close_similarity_threshold=float(config.close_similarity_threshold),
+        reference_size=int(config.reference_size),
+        block_size=int(config.block_size),
+    )
+    keep = np.ones((len(index),), dtype=bool)
+    if config.max_score is not None:
+        keep &= scores <= float(config.max_score)
+    if config.drop_fraction is not None:
+        drop_count = int(np.floor(len(index) * float(config.drop_fraction)))
+        if drop_count > 0:
+            order = np.argsort(-scores, kind="mergesort")
+            keep[order[:drop_count]] = False
+    return index.subset(keep)
 
 
 def landmark_quality_scores(
@@ -568,6 +734,66 @@ def select_pnp_matches_by_map_reliability(
     return selected
 
 
+def _sigmoid(value: float) -> float:
+    if value >= 0.0:
+        z = np.exp(-float(value))
+        return float(1.0 / (1.0 + z))
+    z = np.exp(float(value))
+    return float(z / (1.0 + z))
+
+
+def _soft_pnp_score(match: QueryTo3DMatch, mode: str) -> float:
+    similarity = float(np.clip((float(match.similarity) + 1.0) * 0.5, 0.0, 1.0))
+    margin = 0.0 if match.similarity_margin is None else float(np.clip(match.similarity_margin, 0.0, 1.0))
+    reliability = 1.0 if match.map_reliability is None else float(np.clip(match.map_reliability, 0.0, 1.0))
+    quality = 1.0 if match.landmark_quality is None else float(np.clip(match.landmark_quality, 0.0, 1.0))
+    local = 1.0 if match.local_consistency_score is None else float(np.clip(match.local_consistency_score, 0.0, 1.0))
+    if match.pairwise_inlier_logit is not None:
+        confidence = _sigmoid(float(match.pairwise_inlier_logit))
+    elif match.pairwise_inlier_logprob is not None:
+        confidence = float(np.clip(np.exp(float(match.pairwise_inlier_logprob)), 0.0, 1.0))
+    else:
+        confidence = 1.0
+
+    if mode == "similarity":
+        return similarity
+    if mode == "margin":
+        return 0.75 * margin + 0.25 * similarity
+    if mode == "reliability":
+        return 0.5 * reliability + 0.25 * margin + 0.25 * similarity
+    if mode == "confidence":
+        return 0.5 * confidence + 0.25 * margin + 0.25 * similarity
+    if mode == "composite":
+        return float(similarity * (0.5 + 0.5 * reliability) * (0.5 + 0.5 * quality) * (0.5 + 0.5 * confidence) * (0.5 + 0.5 * local) * (1.0 + margin))
+    raise ValueError(f"unsupported soft PnP ordering mode: {mode}")
+
+
+def soft_order_pnp_matches(
+    matches: Sequence[QueryTo3DMatch],
+    mode: str = "none",
+    max_matches: int | None = None,
+) -> list[QueryTo3DMatch]:
+    """Order PnP inputs by a soft confidence score without grid-style deletion."""
+
+    values = list(matches)
+    if mode == "none" or not values:
+        return values if max_matches is None else values[: int(max_matches)]
+    if max_matches is not None and int(max_matches) <= 0:
+        raise ValueError("max_matches must be positive when provided")
+    annotated = [replace(match, pnp_soft_score=_soft_pnp_score(match, mode)) for match in values]
+    ordered = sorted(
+        annotated,
+        key=lambda match: (
+            float(match.pnp_soft_score) if match.pnp_soft_score is not None else float("-inf"),
+            float(match.similarity),
+        ),
+        reverse=True,
+    )
+    if max_matches is not None:
+        ordered = ordered[: int(max_matches)]
+    return ordered
+
+
 def local_geometric_consistency_scores(
     matches: Sequence[QueryTo3DMatch],
     config: LocalGeometricConsistencyConfig,
@@ -628,6 +854,193 @@ def filter_matches_by_local_geometric_consistency(
         top_keep[order[:keep_count]] = True
         keep &= top_keep
     return [match for idx, match in enumerate(annotated) if bool(keep[idx])]
+
+
+def _spatial_diversity_match_score(match: QueryTo3DMatch, mode: str) -> float:
+    if mode == "margin":
+        if match.similarity_margin is not None:
+            return float(match.similarity_margin)
+        return float(match.similarity)
+    if mode == "pairwise":
+        if match.pairwise_inlier_logit is not None:
+            return float(match.pairwise_inlier_logit)
+        return float(match.similarity)
+    if mode == "reliability":
+        if match.map_reliability is not None:
+            return float(match.map_reliability)
+        return float(match.similarity)
+    return float(match.similarity)
+
+
+def _selected_depth_range_m(matches: Sequence[QueryTo3DMatch]) -> float:
+    if not matches:
+        return 0.0
+    depths = np.asarray([float(match.xyz[2]) for match in matches], dtype=np.float64)
+    return float(np.max(depths) - np.min(depths)) if depths.size else 0.0
+
+
+def _selected_planarity_ratio(matches: Sequence[QueryTo3DMatch]) -> float:
+    if len(matches) < 3:
+        return 0.0
+    xyz = np.stack([match.xyz for match in matches], axis=0).astype(np.float64)
+    cov = np.cov((xyz - np.mean(xyz, axis=0)).T)
+    eigvals = np.sort(np.maximum(np.linalg.eigvalsh(cov), 0.0))
+    return float(eigvals[0] / max(float(np.sum(eigvals)), 1e-12))
+
+
+def _spatial_diversity_targets_met(
+    matches: Sequence[QueryTo3DMatch],
+    config: SpatialDiversityPnPConfig,
+) -> bool:
+    if config.min_depth_range_m is not None and _selected_depth_range_m(matches) < float(config.min_depth_range_m):
+        return False
+    if config.min_planarity_ratio is not None and _selected_planarity_ratio(matches) < float(config.min_planarity_ratio):
+        return False
+    return True
+
+
+def _spatial_diversity_target_progress(
+    matches: Sequence[QueryTo3DMatch],
+    config: SpatialDiversityPnPConfig,
+) -> float:
+    progress = 0.0
+    if config.min_depth_range_m is not None:
+        progress += float(np.clip(_selected_depth_range_m(matches) / max(float(config.min_depth_range_m), 1e-12), 0.0, 1.0))
+    if config.min_planarity_ratio is not None:
+        progress += float(np.clip(_selected_planarity_ratio(matches) / max(float(config.min_planarity_ratio), 1e-12), 0.0, 1.0))
+    return progress
+
+
+def select_pnp_matches_by_spatial_diversity(
+    matches: Sequence[QueryTo3DMatch],
+    image_width: int,
+    image_height: int,
+    config: SpatialDiversityPnPConfig,
+) -> list[QueryTo3DMatch]:
+    values = list(matches)
+    if not config.enabled or not values:
+        return values
+    width = max(float(image_width), 1.0)
+    height = max(float(image_height), 1.0)
+    cells: dict[tuple[int, int], list[QueryTo3DMatch]] = {}
+    for match in values:
+        x_cell = int(np.clip(np.floor(float(match.xy[0]) / width * int(config.grid_cols)), 0, int(config.grid_cols) - 1))
+        y_cell = int(np.clip(np.floor(float(match.xy[1]) / height * int(config.grid_rows)), 0, int(config.grid_rows) - 1))
+        cells.setdefault((y_cell, x_cell), []).append(match)
+    keep_ids: set[int] = set()
+    for cell_matches in cells.values():
+        ordered = sorted(
+            cell_matches,
+            key=lambda item: _spatial_diversity_match_score(item, config.score_mode),
+            reverse=True,
+        )
+        keep_ids.update(id(match) for match in ordered[: int(config.max_per_cell)])
+    selected = [match for match in values if id(match) in keep_ids]
+    if config.max_matches is not None and len(selected) > int(config.max_matches):
+        ordered_ids = {
+            id(match)
+            for match in sorted(
+                selected,
+                key=lambda item: _spatial_diversity_match_score(item, config.score_mode),
+                reverse=True,
+            )[: int(config.max_matches)]
+        }
+        selected = [match for match in selected if id(match) in ordered_ids]
+    if (config.min_depth_range_m is not None or config.min_planarity_ratio is not None) and not _spatial_diversity_targets_met(
+        selected,
+        config,
+    ):
+        selected_ids = {id(match) for match in selected}
+        remaining = [match for match in values if id(match) not in selected_ids]
+        max_count = int(config.max_matches) if config.max_matches is not None else len(values)
+        while remaining:
+            if len(selected) >= max_count:
+                break
+            current_progress = _spatial_diversity_target_progress(selected, config)
+            best_index = max(
+                range(len(remaining)),
+                key=lambda idx: (
+                    _spatial_diversity_target_progress([*selected, remaining[idx]], config) - current_progress,
+                    _spatial_diversity_match_score(remaining[idx], config.score_mode),
+                ),
+            )
+            match = remaining.pop(int(best_index))
+            selected.append(match)
+            selected_ids.add(id(match))
+            if _spatial_diversity_targets_met(selected, config):
+                break
+    return selected
+
+
+def _risk_component_low(value: float | None, target: float) -> float:
+    if value is None or not np.isfinite(float(value)):
+        return 1.0
+    return float(np.clip(1.0 - float(value) / max(float(target), 1e-6), 0.0, 1.0))
+
+
+def _risk_component_high(value: float | None, target: float) -> float:
+    if value is None or not np.isfinite(float(value)):
+        return 1.0
+    return float(np.clip(float(value) / max(float(target), 1e-6), 0.0, 1.0))
+
+
+def pose_risk_score(row: Mapping[str, object], config: PoseRiskConfig) -> float:
+    patch = dict(row.get("patch_geometry") or {})
+    reproj = dict(row.get("pnp_reprojection") or {})
+    spatial = dict(row.get("pnp_inlier_spatial") or {})
+    reliability = dict(dict(row.get("map_reliability") or {}).get("pnp_inliers") or {})
+    components = [
+        _risk_component_low(row.get("pnp_inlier_count"), config.min_inlier_count),
+        _risk_component_low(row.get("pnp_inlier_ratio"), config.min_inlier_ratio),
+        _risk_component_low(patch.get("pnp_inlier_patch_at_1"), config.min_inlier_patch_at_1),
+        _risk_component_high(reproj.get("pnp_reproj_inlier_median_px"), config.max_reprojection_median_px),
+        _risk_component_low(spatial.get("grid_4x4_occupancy_frac"), config.min_grid_coverage),
+        _risk_component_low(spatial.get("depth_range_m"), config.min_depth_range_m),
+        _risk_component_low(spatial.get("xyz_planarity_ratio"), config.min_planarity_ratio),
+        _risk_component_low(reliability.get("mean"), config.min_map_reliability),
+    ]
+    return float(np.clip(np.mean(components), 0.0, 1.0))
+
+
+def selective_localization_summary(
+    rows: Sequence[Mapping[str, object]],
+    coverages: Sequence[float] = (0.8, 0.9, 1.0),
+    success_key: str = "success_25cm_10deg",
+) -> dict[str, dict[str, float | int | None]]:
+    usable = [dict(row) for row in rows if row.get("pose_risk") is not None]
+    usable.sort(key=lambda row: float(row["pose_risk"]))
+    output: dict[str, dict[str, float | int | None]] = {}
+    if not usable:
+        for coverage in coverages:
+            output[f"coverage_{float(coverage):.3f}"] = {
+                "query_count": 0,
+                "success_rate": None,
+                "median_translation_error_m": None,
+                "median_rotation_error_deg": None,
+                "risk_threshold": None,
+            }
+        return output
+    for coverage in coverages:
+        count = max(1, int(np.ceil(len(usable) * float(coverage))))
+        selected = usable[: min(count, len(usable))]
+        translations = [
+            float(row["translation_error_m"])
+            for row in selected
+            if row.get("translation_error_m") is not None and np.isfinite(float(row["translation_error_m"]))
+        ]
+        rotations = [
+            float(row["rotation_error_deg"])
+            for row in selected
+            if row.get("rotation_error_deg") is not None and np.isfinite(float(row["rotation_error_deg"]))
+        ]
+        output[f"coverage_{float(coverage):.3f}"] = {
+            "query_count": int(len(selected)),
+            "success_rate": float(np.mean([1.0 if row.get(success_key) else 0.0 for row in selected])),
+            "median_translation_error_m": None if not translations else float(np.median(translations)),
+            "median_rotation_error_deg": None if not rotations else float(np.median(rotations)),
+            "risk_threshold": float(selected[-1]["pose_risk"]),
+        }
+    return output
 
 
 def with_landmark_ambiguity_scores(
@@ -872,6 +1285,9 @@ def estimate_pose_pnp_ransac(
     confidence: float = 0.999,
     iterations: int = 1000,
     min_inliers: int = 0,
+    refine_lm: bool = False,
+    pnp_method: str = "EPNP",
+    refine_method: str = "none",
 ) -> PnPResult:
     if len(matches) < 4:
         return PnPResult(
@@ -886,8 +1302,33 @@ def estimate_pose_pnp_ransac(
     except Exception as exc:  # pragma: no cover - exercised only when OpenCV is absent.
         raise RuntimeError("OpenCV is required for PnP-RANSAC") from exc
 
-    object_points = np.stack([match.xyz for match in matches], axis=0).astype(np.float64)
-    image_points = np.stack([match.xy for match in matches], axis=0).astype(np.float64)
+    method_name = str(pnp_method).upper()
+    method_attr = {
+        "AP3P": "SOLVEPNP_AP3P",
+        "EPNP": "SOLVEPNP_EPNP",
+        "ITERATIVE": "SOLVEPNP_ITERATIVE",
+        "P3P": "SOLVEPNP_P3P",
+        "SQPNP": "SOLVEPNP_SQPNP",
+    }.get(method_name)
+    if method_attr is None or not hasattr(cv2, method_attr):
+        raise ValueError(f"unsupported PnP method: {pnp_method}")
+    refine_name = str(refine_method).upper()
+    if bool(refine_lm) and refine_name == "NONE":
+        refine_name = "LM"
+    if refine_name not in {"NONE", "LM", "VVS"}:
+        raise ValueError(f"unsupported PnP refine method: {refine_method}")
+
+    unique_matches, original_indices = deduplicate_pnp_matches(matches)
+    if len(unique_matches) < 4:
+        return PnPResult(
+            success=False,
+            pose_w2c=None,
+            inlier_mask=np.zeros((len(matches),), dtype=bool),
+            match_count=len(matches),
+            inlier_count=0,
+        )
+    object_points = np.stack([match.xyz for match in unique_matches], axis=0).astype(np.float64)
+    image_points = np.stack([match.xy for match in unique_matches], axis=0).astype(np.float64)
     camera_matrix, distortion = camera_matrix_and_distortion(camera)
     success, rvec, tvec, inliers = cv2.solvePnPRansac(
         object_points,
@@ -897,7 +1338,7 @@ def estimate_pose_pnp_ransac(
         iterationsCount=int(iterations),
         reprojectionError=float(reprojection_error_px),
         confidence=float(confidence),
-        flags=cv2.SOLVEPNP_EPNP,
+        flags=getattr(cv2, method_attr),
     )
     if not success or rvec is None or tvec is None or inliers is None:
         return PnPResult(
@@ -908,11 +1349,42 @@ def estimate_pose_pnp_ransac(
             inlier_count=0,
         )
     rotation, _jacobian = cv2.Rodrigues(rvec)
+    if refine_name == "LM" and hasattr(cv2, "solvePnPRefineLM"):
+        try:
+            inlier_indices = np.asarray(inliers, dtype=np.int64).reshape(-1)
+            if inlier_indices.size >= 4:
+                rvec, tvec = cv2.solvePnPRefineLM(
+                    object_points[inlier_indices],
+                    image_points[inlier_indices],
+                    camera_matrix,
+                    distortion,
+                    rvec,
+                    tvec,
+                )
+                rotation, _jacobian = cv2.Rodrigues(rvec)
+        except Exception:
+            rotation, _jacobian = cv2.Rodrigues(rvec)
+    elif refine_name == "VVS" and hasattr(cv2, "solvePnPRefineVVS"):
+        try:
+            inlier_indices = np.asarray(inliers, dtype=np.int64).reshape(-1)
+            if inlier_indices.size >= 4:
+                rvec, tvec = cv2.solvePnPRefineVVS(
+                    object_points[inlier_indices],
+                    image_points[inlier_indices],
+                    camera_matrix,
+                    distortion,
+                    rvec,
+                    tvec,
+                )
+                rotation, _jacobian = cv2.Rodrigues(rvec)
+        except Exception:
+            rotation, _jacobian = cv2.Rodrigues(rvec)
     pose = np.eye(4, dtype=np.float64)
     pose[:3, :3] = rotation.astype(np.float64)
     pose[:3, 3] = tvec.reshape(3).astype(np.float64)
     mask = np.zeros((len(matches),), dtype=bool)
-    mask[np.asarray(inliers, dtype=np.int64).reshape(-1)] = True
+    unique_inlier_indices = np.asarray(inliers, dtype=np.int64).reshape(-1)
+    mask[original_indices[unique_inlier_indices]] = True
     if int(min_inliers) > 0 and int(mask.sum()) < int(min_inliers):
         return PnPResult(
             success=False,
@@ -921,6 +1393,94 @@ def estimate_pose_pnp_ransac(
             match_count=len(matches),
             inlier_count=0,
         )
+    return PnPResult(
+        success=True,
+        pose_w2c=pose,
+        inlier_mask=mask,
+        match_count=len(matches),
+        inlier_count=int(mask.sum()),
+    )
+
+
+def estimate_pose_pnp_fixed(
+    matches: Sequence[QueryTo3DMatch],
+    camera: ColmapCamera,
+    min_inliers: int = 4,
+    pnp_method: str = "EPNP",
+    refine_method: str = "none",
+) -> PnPResult:
+    """Estimate pose from a fixed correspondence set without RANSAC reselection."""
+
+    if len(matches) < 4 or len(matches) < int(min_inliers):
+        return PnPResult(
+            success=False,
+            pose_w2c=None,
+            inlier_mask=np.zeros((len(matches),), dtype=bool),
+            match_count=len(matches),
+            inlier_count=0,
+        )
+    try:
+        import cv2
+    except Exception as exc:  # pragma: no cover - exercised only when OpenCV is absent.
+        raise RuntimeError("OpenCV is required for fixed PnP") from exc
+
+    method_name = str(pnp_method).upper()
+    method_attr = {
+        "AP3P": "SOLVEPNP_AP3P",
+        "EPNP": "SOLVEPNP_EPNP",
+        "ITERATIVE": "SOLVEPNP_ITERATIVE",
+        "P3P": "SOLVEPNP_P3P",
+        "SQPNP": "SOLVEPNP_SQPNP",
+    }.get(method_name)
+    if method_attr is None or not hasattr(cv2, method_attr):
+        raise ValueError(f"unsupported PnP method: {pnp_method}")
+    refine_name = str(refine_method).upper()
+    if refine_name not in {"NONE", "LM", "VVS"}:
+        raise ValueError(f"unsupported PnP refine method: {refine_method}")
+
+    unique_matches, original_indices = deduplicate_pnp_matches(matches)
+    if len(unique_matches) < 4 or len(unique_matches) < int(min_inliers):
+        return PnPResult(
+            success=False,
+            pose_w2c=None,
+            inlier_mask=np.zeros((len(matches),), dtype=bool),
+            match_count=len(matches),
+            inlier_count=0,
+        )
+    object_points = np.stack([match.xyz for match in unique_matches], axis=0).astype(np.float64)
+    image_points = np.stack([match.xy for match in unique_matches], axis=0).astype(np.float64)
+    camera_matrix, distortion = camera_matrix_and_distortion(camera)
+    success, rvec, tvec = cv2.solvePnP(
+        object_points,
+        image_points,
+        camera_matrix,
+        distortion,
+        flags=getattr(cv2, method_attr),
+    )
+    if not success or rvec is None or tvec is None:
+        return PnPResult(
+            success=False,
+            pose_w2c=None,
+            inlier_mask=np.zeros((len(matches),), dtype=bool),
+            match_count=len(matches),
+            inlier_count=0,
+        )
+    if refine_name == "LM" and hasattr(cv2, "solvePnPRefineLM"):
+        try:
+            rvec, tvec = cv2.solvePnPRefineLM(object_points, image_points, camera_matrix, distortion, rvec, tvec)
+        except Exception:
+            pass
+    elif refine_name == "VVS" and hasattr(cv2, "solvePnPRefineVVS"):
+        try:
+            rvec, tvec = cv2.solvePnPRefineVVS(object_points, image_points, camera_matrix, distortion, rvec, tvec)
+        except Exception:
+            pass
+    rotation, _jacobian = cv2.Rodrigues(rvec)
+    pose = np.eye(4, dtype=np.float64)
+    pose[:3, :3] = rotation.astype(np.float64)
+    pose[:3, 3] = np.asarray(tvec, dtype=np.float64).reshape(3)
+    mask = np.zeros((len(matches),), dtype=bool)
+    mask[original_indices] = True
     return PnPResult(
         success=True,
         pose_w2c=pose,
