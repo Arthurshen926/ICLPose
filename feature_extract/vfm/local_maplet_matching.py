@@ -80,6 +80,12 @@ class ContextualLandmarkMatchingConfig:
     max_matches: int | None = 1000
     block_size: int = 512
     similarity_device: str = "cpu"
+    top_m_anchor: int = 0
+    gate_mode: str = "none"
+    anchor_margin_tau: float = 0.08
+    anchor_margin_slope: float = 20.0
+    context_margin_tau: float = 0.05
+    context_margin_slope: float = 20.0
 
     def __post_init__(self) -> None:
         if int(self.top_k) <= 0:
@@ -94,12 +100,18 @@ class ContextualLandmarkMatchingConfig:
             raise ValueError("context_pool must be one of: mean, quality_mean, topk")
         if self.score_mode not in {"anchor_only", "context_only", "anchor_context", "anchor_context_quality"}:
             raise ValueError("score_mode must be one of: anchor_only, context_only, anchor_context, anchor_context_quality")
+        if self.gate_mode not in {"none", "anchor_margin", "maplet", "anchor_maplet", "anchor_context_maplet", "full"}:
+            raise ValueError(
+                "gate_mode must be one of: none, anchor_margin, maplet, anchor_maplet, anchor_context_maplet, full"
+            )
         if int(self.query_token_step) <= 0:
             raise ValueError("query_token_step must be positive")
         if self.max_matches is not None and int(self.max_matches) <= 0:
             raise ValueError("max_matches must be positive")
         if int(self.block_size) <= 0:
             raise ValueError("block_size must be positive")
+        if int(self.top_m_anchor) < 0:
+            raise ValueError("top_m_anchor must be non-negative")
 
 
 def _normalize_vector(vector: np.ndarray) -> np.ndarray:
@@ -159,6 +171,37 @@ def _landmark_quality_weights(index: LandmarkMapIndex) -> np.ndarray:
     reproj_score = 1.0 / (1.0 + np.maximum(reproj, 0.0) / reproj_scale)
     quality = np.clip(counts * variance_score * reproj_score, 0.0, 1.0)
     return quality.astype(np.float32, copy=False)
+
+
+def _sigmoid(values: np.ndarray | float) -> np.ndarray:
+    array = np.asarray(values, dtype=np.float32)
+    return (1.0 / (1.0 + np.exp(-np.clip(array, -60.0, 60.0)))).astype(np.float32, copy=False)
+
+
+def maplet_reliability_scores(bank: LocalMapletBank) -> np.ndarray:
+    """Compute an interpretable [0, 1] reliability prior for each local maplet."""
+
+    count = len(bank)
+    if count == 0:
+        return np.zeros((0,), dtype=np.float32)
+    neighbor_ratio = np.clip(
+        np.asarray(bank.neighbor_counts, dtype=np.float32) / max(float(bank.maplet_k), 1.0),
+        0.0,
+        1.0,
+    )
+    variance = np.maximum(np.asarray(bank.context_feature_variance, dtype=np.float32), 0.0)
+    finite = variance[np.isfinite(variance)]
+    scale = float(np.percentile(finite, 75.0)) if finite.size else 1.0
+    if scale <= 1e-8:
+        scale = 1.0
+    variance_score = 1.0 / (1.0 + variance / scale)
+    covisibility = np.asarray(bank.covisibility_strength, dtype=np.float32)
+    if np.max(covisibility) > 0.0:
+        covisibility_score = np.clip(covisibility / max(float(np.percentile(covisibility, 90.0)), 1e-6), 0.0, 1.0)
+    else:
+        covisibility_score = np.ones((count,), dtype=np.float32)
+    reliability = np.clip(neighbor_ratio * variance_score * covisibility_score, 0.0, 1.0)
+    return reliability.astype(np.float32, copy=False)
 
 
 def compute_query_context_descriptors(feature_map: np.ndarray, context: str = "3x3") -> np.ndarray:
@@ -430,6 +473,7 @@ def build_ref_neighborhood_maplets(
 
 def local_maplet_bank_stats(bank: LocalMapletBank) -> dict[str, float | int | str]:
     counts = np.asarray(bank.neighbor_counts, dtype=np.float32)
+    reliability = maplet_reliability_scores(bank)
     if counts.size == 0:
         return {
             "maplet_type": bank.maplet_type,
@@ -441,6 +485,7 @@ def local_maplet_bank_stats(bank: LocalMapletBank) -> dict[str, float | int | st
             "mean_context_radius": 0.0,
             "mean_context_feature_variance": 0.0,
             "mean_covisibility_strength": 0.0,
+            "mean_maplet_reliability": 0.0,
         }
     return {
         "maplet_type": bank.maplet_type,
@@ -452,6 +497,7 @@ def local_maplet_bank_stats(bank: LocalMapletBank) -> dict[str, float | int | st
         "mean_context_radius": float(np.mean(bank.context_radius)),
         "mean_context_feature_variance": float(np.mean(bank.context_feature_variance)),
         "mean_covisibility_strength": float(np.mean(bank.covisibility_strength)),
+        "mean_maplet_reliability": float(np.mean(reliability)) if reliability.size else 0.0,
     }
 
 
@@ -531,6 +577,95 @@ def _combined_topk(
     return top_indices, top_scores
 
 
+def _gated_context_lambdas(
+    anchor_margin: np.ndarray,
+    context_margin: np.ndarray,
+    maplet_reliability: np.ndarray,
+    config: ContextualLandmarkMatchingConfig,
+) -> np.ndarray:
+    mode = str(config.gate_mode)
+    base = np.full_like(context_margin, float(config.context_weight), dtype=np.float32)
+    if mode == "none":
+        return base
+    anchor_factor = _sigmoid(float(config.anchor_margin_slope) * (float(config.anchor_margin_tau) - anchor_margin))
+    context_factor = _sigmoid(float(config.context_margin_slope) * (context_margin - float(config.context_margin_tau)))
+    maplet_factor = np.asarray(maplet_reliability, dtype=np.float32)
+    if mode == "anchor_margin":
+        return (base * anchor_factor[:, None]).astype(np.float32, copy=False)
+    if mode == "maplet":
+        return (base * maplet_factor).astype(np.float32, copy=False)
+    if mode == "anchor_maplet":
+        return (base * anchor_factor[:, None] * maplet_factor).astype(np.float32, copy=False)
+    return (base * anchor_factor[:, None] * context_factor * maplet_factor).astype(np.float32, copy=False)
+
+
+def _gated_anchor_topm_rerank(
+    query_anchor: np.ndarray,
+    query_context: np.ndarray,
+    landmark_anchor: np.ndarray,
+    landmark_context: np.ndarray,
+    quality_bias: np.ndarray | None,
+    maplet_reliability: np.ndarray,
+    config: ContextualLandmarkMatchingConfig,
+) -> tuple[np.ndarray, np.ndarray]:
+    top_m = max(int(config.top_m_anchor), int(config.top_k), 2)
+    anchor_indices, anchor_scores = _combined_topk(
+        query_anchor,
+        query_context,
+        landmark_anchor,
+        landmark_context,
+        anchor_weight=1.0,
+        context_weight=0.0,
+        quality_bias=None,
+        top_k=top_m,
+        block_size=int(config.block_size),
+        device=config.similarity_device,
+    )
+    if anchor_indices.size == 0:
+        return anchor_indices, anchor_scores
+    candidate_context_scores = np.full_like(anchor_scores, -np.inf, dtype=np.float32)
+    for row in range(anchor_indices.shape[0]):
+        valid = anchor_indices[row] >= 0
+        if not np.any(valid):
+            continue
+        candidates = anchor_indices[row, valid]
+        candidate_context_scores[row, valid] = query_context[row] @ landmark_context[candidates].T
+    if anchor_scores.shape[1] > 1:
+        anchor_margin = anchor_scores[:, 0] - anchor_scores[:, 1]
+    else:
+        anchor_margin = np.zeros((anchor_scores.shape[0],), dtype=np.float32)
+    context_margin = np.zeros_like(candidate_context_scores, dtype=np.float32)
+    for row in range(candidate_context_scores.shape[0]):
+        for col in range(candidate_context_scores.shape[1]):
+            if anchor_indices[row, col] < 0:
+                continue
+            others = np.delete(candidate_context_scores[row], col)
+            others = others[np.isfinite(others)]
+            best_other = float(np.max(others)) if others.size else 0.0
+            context_margin[row, col] = float(candidate_context_scores[row, col] - best_other)
+    candidate_reliability = np.zeros_like(candidate_context_scores, dtype=np.float32)
+    for row in range(anchor_indices.shape[0]):
+        valid = anchor_indices[row] >= 0
+        if np.any(valid):
+            candidate_reliability[row, valid] = maplet_reliability[anchor_indices[row, valid]]
+    lambdas = _gated_context_lambdas(anchor_margin, context_margin, candidate_reliability, config)
+    final_scores = float(config.anchor_weight) * anchor_scores + lambdas * candidate_context_scores
+    if quality_bias is not None:
+        for row in range(anchor_indices.shape[0]):
+            valid = anchor_indices[row] >= 0
+            if np.any(valid):
+                final_scores[row, valid] += quality_bias[anchor_indices[row, valid]]
+    final_scores[anchor_indices < 0] = -np.inf
+    keep_k = min(int(config.top_k), final_scores.shape[1])
+    final_indices = np.full((anchor_indices.shape[0], keep_k), -1, dtype=np.int64)
+    sorted_scores = np.full((anchor_indices.shape[0], keep_k), -np.inf, dtype=np.float32)
+    for row in range(anchor_indices.shape[0]):
+        order = np.argsort(-final_scores[row])[:keep_k]
+        final_indices[row, : order.size] = anchor_indices[row, order]
+        sorted_scores[row, : order.size] = final_scores[row, order]
+    return final_indices, sorted_scores
+
+
 def match_query_patches_to_contextual_landmarks(
     query_feature_map: np.ndarray,
     landmark_index: LandmarkMapIndex,
@@ -564,6 +699,7 @@ def match_query_patches_to_contextual_landmarks(
     landmark_anchor, valid_landmarks = normalize_rows(landmark_index.features)
     landmark_context, valid_context_landmarks = normalize_rows(maplet_bank.context_features)
     valid_map = valid_landmarks & valid_context_landmarks
+    all_maplet_reliability = maplet_reliability_scores(maplet_bank)
     if not np.any(valid_map):
         return []
     if not np.all(valid_map):
@@ -571,39 +707,67 @@ def match_query_patches_to_contextual_landmarks(
         landmark_anchor = landmark_anchor[valid_map]
         landmark_context = landmark_context[valid_map]
         maplet_neighbor_counts = maplet_bank.neighbor_counts[valid_map]
+        maplet_reliability = all_maplet_reliability[valid_map]
     else:
         index = landmark_index
         maplet_neighbor_counts = maplet_bank.neighbor_counts
+        maplet_reliability = all_maplet_reliability
     quality = _landmark_quality_weights(index)
     anchor_weight, context_weight, quality_weight = _score_weights(config)
     quality_bias = None
     if quality_weight != 0.0:
         quality_bias = float(quality_weight) * quality
-    query_top_indices, query_top_scores = _combined_topk(
-        query_anchor,
-        query_context,
-        landmark_anchor,
-        landmark_context,
-        anchor_weight,
-        context_weight,
-        quality_bias,
-        top_k=int(config.top_k),
-        block_size=int(config.block_size),
-        device=config.similarity_device,
-    )
-    if config.match_mode in {"mnn", "soft_mutual"}:
-        landmark_top_indices, _landmark_top_scores = _combined_topk(
-            landmark_anchor,
-            landmark_context,
+    use_gated_topm = int(config.top_m_anchor) > 0
+    if use_gated_topm:
+        query_top_indices, query_top_scores = _gated_anchor_topm_rerank(
             query_anchor,
             query_context,
+            landmark_anchor,
+            landmark_context,
+            quality_bias,
+            maplet_reliability,
+            config,
+        )
+    else:
+        query_top_indices, query_top_scores = _combined_topk(
+            query_anchor,
+            query_context,
+            landmark_anchor,
+            landmark_context,
             anchor_weight,
             context_weight,
-            None,
-            top_k=int(config.mutual_top_k),
+            quality_bias,
+            top_k=int(config.top_k),
             block_size=int(config.block_size),
             device=config.similarity_device,
         )
+    if config.match_mode in {"mnn", "soft_mutual"}:
+        if use_gated_topm:
+            landmark_top_indices, _landmark_top_scores = _combined_topk(
+                landmark_anchor,
+                landmark_context,
+                query_anchor,
+                query_context,
+                anchor_weight=1.0,
+                context_weight=0.0,
+                quality_bias=None,
+                top_k=int(config.mutual_top_k),
+                block_size=int(config.block_size),
+                device=config.similarity_device,
+            )
+        else:
+            landmark_top_indices, _landmark_top_scores = _combined_topk(
+                landmark_anchor,
+                landmark_context,
+                query_anchor,
+                query_context,
+                anchor_weight,
+                context_weight,
+                None,
+                top_k=int(config.mutual_top_k),
+                block_size=int(config.block_size),
+                device=config.similarity_device,
+            )
         reciprocal = [set(row.tolist()) for row in landmark_top_indices]
     else:
         reciprocal = []
@@ -649,7 +813,10 @@ def match_query_patches_to_contextual_landmarks(
                     similarity=score,
                     ratio=0.0,
                     landmark_variance=float(index.mean_variances[landmark_idx]),
-                    source=f"contextual_landmark_{maplet_bank.maplet_type}_k{int(maplet_bank.maplet_k)}",
+                    source=(
+                        f"contextual_landmark_{maplet_bank.maplet_type}_k{int(maplet_bank.maplet_k)}"
+                        + ("_gated" if use_gated_topm and config.gate_mode != "none" else "")
+                    ),
                     observation_count=int(index.observation_counts[landmark_idx]),
                     visibility_count=len(index.observation_image_ids[landmark_idx]),
                     landmark_reprojection_error=float(index.reprojection_errors[landmark_idx]),

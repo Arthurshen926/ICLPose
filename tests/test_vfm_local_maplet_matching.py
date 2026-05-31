@@ -2,6 +2,7 @@ import numpy as np
 
 from feature_extract.vfm.local_maplet_matching import (
     ContextualLandmarkMatchingConfig,
+    LocalMapletBank,
     build_covisibility_maplets,
     build_knn_maplets,
     compute_query_context_descriptors,
@@ -103,3 +104,109 @@ def test_contextual_matching_keeps_single_anchor_but_scores_with_local_context()
     assert len(center_matches) == 1
     assert center_matches[0].track_id == 10
     assert center_matches[0].source == "contextual_landmark_knn_k1"
+
+
+def _manual_context_bank(context_features: np.ndarray) -> LocalMapletBank:
+    count = int(context_features.shape[0])
+    return LocalMapletBank(
+        neighbor_indices=np.full((count, 1), -1, dtype=np.int64),
+        context_features=np.asarray(context_features, dtype=np.float32),
+        neighbor_counts=np.ones((count,), dtype=np.int64),
+        context_radius=np.ones((count,), dtype=np.float32),
+        context_feature_variance=np.zeros((count,), dtype=np.float32),
+        covisibility_strength=np.ones((count,), dtype=np.float32),
+        xyz_cov_eigvals=np.ones((count, 3), dtype=np.float32),
+        neighbor_idf_mean=np.zeros((count,), dtype=np.float32),
+        maplet_type="manual",
+        maplet_k=1,
+    )
+
+
+def test_reliability_gate_suppresses_context_when_anchor_margin_is_high() -> None:
+    index = LandmarkMapIndex(
+        track_ids=np.asarray([1, 2], dtype=np.int64),
+        xyz=np.asarray([[0.0, 0.0, 4.0], [1.0, 0.0, 4.0]], dtype=np.float64),
+        features=np.asarray([[1.0, 0.0, 0.0], [0.4, 0.9165, 0.0]], dtype=np.float32),
+        mean_variances=np.asarray([0.01, 0.01], dtype=np.float32),
+        observation_counts=np.asarray([5, 5], dtype=np.int64),
+        observation_image_ids=(("ref.png",), ("ref.png",)),
+        reprojection_errors=np.asarray([0.1, 0.1], dtype=np.float32),
+    )
+    bank = _manual_context_bank(np.asarray([[0.0, 1.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float32))
+    query = np.asarray([[[1.0]], [[0.0]], [[0.0]]], dtype=np.float32)
+
+    fixed = match_query_patches_to_contextual_landmarks(
+        query,
+        index,
+        bank,
+        ContextualLandmarkMatchingConfig(
+            query_context="1x1",
+            context_weight=1.0,
+            top_m_anchor=2,
+            gate_mode="none",
+            match_mode="nn",
+            min_similarity=-1.0,
+            max_matches=None,
+        ),
+        image_width=30,
+        image_height=30,
+    )
+    gated = match_query_patches_to_contextual_landmarks(
+        query,
+        index,
+        bank,
+        ContextualLandmarkMatchingConfig(
+            query_context="1x1",
+            context_weight=1.0,
+            top_m_anchor=2,
+            gate_mode="anchor_margin",
+            anchor_margin_tau=0.1,
+            anchor_margin_slope=20.0,
+            match_mode="nn",
+            min_similarity=-1.0,
+            max_matches=None,
+        ),
+        image_width=30,
+        image_height=30,
+    )
+
+    assert fixed[0].track_id == 2
+    assert gated[0].track_id == 1
+
+
+def test_reliability_gate_uses_context_for_ambiguous_anchor_topm_candidates() -> None:
+    index = LandmarkMapIndex(
+        track_ids=np.asarray([1, 2], dtype=np.int64),
+        xyz=np.asarray([[0.0, 0.0, 4.0], [1.0, 0.0, 4.0]], dtype=np.float64),
+        features=np.asarray([[1.0, 0.0, 0.0], [0.99, 0.0, 0.14]], dtype=np.float32),
+        mean_variances=np.asarray([0.01, 0.01], dtype=np.float32),
+        observation_counts=np.asarray([5, 5], dtype=np.int64),
+        observation_image_ids=(("ref.png",), ("ref.png",)),
+        reprojection_errors=np.asarray([0.1, 0.1], dtype=np.float32),
+    )
+    bank = _manual_context_bank(np.asarray([[0.0, 1.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float32))
+    query = np.asarray([[[1.0]], [[0.0]], [[0.0]]], dtype=np.float32)
+
+    matches = match_query_patches_to_contextual_landmarks(
+        query,
+        index,
+        bank,
+        ContextualLandmarkMatchingConfig(
+            query_context="1x1",
+            context_weight=1.0,
+            top_m_anchor=2,
+            gate_mode="anchor_context_maplet",
+            anchor_margin_tau=0.1,
+            anchor_margin_slope=20.0,
+            context_margin_tau=0.1,
+            context_margin_slope=20.0,
+            match_mode="nn",
+            min_similarity=-1.0,
+            max_matches=None,
+        ),
+        image_width=30,
+        image_height=30,
+    )
+
+    assert matches[0].track_id == 2
+    assert matches[0].source == "contextual_landmark_manual_k1_gated"

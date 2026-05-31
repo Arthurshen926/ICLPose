@@ -130,10 +130,12 @@ def _write_markdown_summary(
     c25_summary: dict[str, object] | None = None,
     c3_summary: dict[str, object] | None = None,
 ) -> None:
+    descriptor = summary.get("matching_config", {})
+    stage_name = "Stage C3.2 Reliability-Gated Contextual Landmark Matching" if int(descriptor.get("top_m_anchor", 0) or 0) > 0 else "Stage C3.1 Contextual Landmark Matching"
     lines = [
-        "# Stage C3.1 Contextual Landmark Matching",
+        f"# {stage_name}",
         "",
-        "C3.1 keeps the final PnP correspondence as a single query patch to a single 3D landmark, while using local maplet context only for match scoring.",
+        "The final PnP correspondence remains a single query patch to a single 3D landmark. Local maplet context is used only for match scoring.",
         "",
         "## Main Table",
         "",
@@ -144,11 +146,11 @@ def _write_markdown_summary(
         lines.append(_summary_metric_row("C2.5 baseline", c25_summary))
     if c3_summary is not None:
         lines.append(_summary_metric_row("C3-new reference footprint", c3_summary))
-    descriptor = summary.get("matching_config", {})
     label = (
-        f"C3.1 {descriptor.get('score_mode', 'contextual')} "
+        f"{'C3.2' if int(descriptor.get('top_m_anchor', 0) or 0) > 0 else 'C3.1'} {descriptor.get('score_mode', 'contextual')} "
         f"{summary.get('maplet_type', 'maplet')} k{summary.get('maplet_k', '')} "
-        f"q{descriptor.get('query_context', '')} w{descriptor.get('context_weight', '')}"
+        f"q{descriptor.get('query_context', '')} w{descriptor.get('context_weight', '')} "
+        f"gate={descriptor.get('gate_mode', 'none')} topM={descriptor.get('top_m_anchor', 0)}"
     )
     lines.append(_summary_metric_row(label, summary))
     lines.extend(
@@ -159,6 +161,7 @@ def _write_markdown_summary(
             f"- mean neighbors: {float(summary.get('mean_maplet_neighbors', 0.0)):.3f}",
             f"- zero-neighbor ratio: {float(summary.get('mean_zero_neighbor_ratio', 0.0)):.3f}",
             f"- mean context radius: {float(summary.get('mean_context_radius', 0.0)):.3f}",
+            f"- mean maplet reliability: {float(summary.get('mean_maplet_reliability', 0.0)):.3f}",
             f"- mean visible landmark recall: {float(summary.get('mean_visible_landmark_recall', 0.0)):.3f}",
             "",
             "## Inputs",
@@ -203,6 +206,16 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     parser.add_argument("--match_mode", default="mnn", choices=("nn", "mnn", "soft_mutual"))
     parser.add_argument("--top_k", type=int, default=1)
     parser.add_argument("--mutual_top_k", type=int, default=1)
+    parser.add_argument("--top_m_anchor", type=int, default=0)
+    parser.add_argument(
+        "--gate_mode",
+        default="none",
+        choices=("none", "anchor_margin", "maplet", "anchor_maplet", "anchor_context_maplet", "full"),
+    )
+    parser.add_argument("--anchor_margin_tau", type=float, default=0.08)
+    parser.add_argument("--anchor_margin_slope", type=float, default=20.0)
+    parser.add_argument("--context_margin_tau", type=float, default=0.05)
+    parser.add_argument("--context_margin_slope", type=float, default=20.0)
     parser.add_argument("--min_similarity", type=float, default=0.2)
     parser.add_argument("--query_token_step", type=int, default=1)
     parser.add_argument("--min_observation_count", type=int, default=2)
@@ -271,6 +284,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         max_matches=None if int(args.max_matches) <= 0 else int(args.max_matches),
         block_size=int(args.match_block_size),
         similarity_device=args.similarity_device,
+        top_m_anchor=int(args.top_m_anchor),
+        gate_mode=args.gate_mode,
+        anchor_margin_tau=float(args.anchor_margin_tau),
+        anchor_margin_slope=float(args.anchor_margin_slope),
+        context_margin_tau=float(args.context_margin_tau),
+        context_margin_slope=float(args.context_margin_slope),
     )
 
     rows = []
@@ -492,7 +511,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         if flag is not None
     ]
     summary = {
-        "stage": "stage_c31_contextual_landmark_matching",
+        "stage": "stage_c32_reliability_gated_contextual_landmark_matching"
+        if int(args.top_m_anchor) > 0
+        else "stage_c31_contextual_landmark_matching",
         "elapsed_sec": float(time.perf_counter() - started),
         "query_count": len(rows),
         "labeled_query_count": len(labeled_rows),
@@ -542,6 +563,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         "mean_covisibility_strength": _mean(
             [float(row["maplet_bank"]["mean_covisibility_strength"]) for row in rows]
         ),
+        "mean_maplet_reliability": _mean([float(row["maplet_bank"]["mean_maplet_reliability"]) for row in rows]),
         "mean_match_count": _mean([float(row["match_count"]) for row in rows]),
         "mean_pnp_match_count": _mean([float(row["pnp_match_count"]) for row in rows]),
         "mean_patch_at_1": _mean([float(row["patch_geometry"]["patch_at_1"]) for row in rows]),

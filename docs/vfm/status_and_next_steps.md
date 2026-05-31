@@ -3465,3 +3465,182 @@ Conclusion:
   count by construction.
 - The next offset training target should be first-pass-inlier fixed-PnP/LM
   improvement and offset confidence calibration, not all-match dx/dy regression.
+
+## Stage C2.7 Conservative Offset Measurement Refinement
+
+Artifacts:
+
+- report:
+  `output/vfm/stage_c27_conservative_offset/c27_conservative_offset_summary.md`
+- first-pass-inlier checkpoints:
+  `output/vfm/stage_c27_conservative_offset/*/reg_inlier.pt`
+  `output/vfm/stage_c27_conservative_offset/*/heatmap8_inlier.pt`
+
+Goal:
+
+Improve the safe offset branch without changing the C2.5 first-pass inlier set.
+Offset is only a 2D measurement refinement before fixed PnP/LM; it does not
+control RANSAC.
+
+Implemented:
+
+- first-pass-inlier-only training data;
+- patch-or-bounded positive labels and no-refine labels for bad inliers;
+- heatmap/bin offset head plus residual regression;
+- sigma-gated offset application;
+- confidence threshold sweep at gate 0.5 and 0.7.
+
+Training diagnostics:
+
+| scene | model | samples | positives | positive offset MAE |
+| --- | --- | ---: | ---: | ---: |
+| OldHospital | regression inlier-only | 81,875 | 57,081 | 5.655px -> 4.918px |
+| OldHospital | heatmap8 inlier-only | 81,875 | 57,081 | 5.385px -> 4.893px |
+| ShopFacade | regression inlier-only | 29,739 | 18,021 | 5.831px -> 5.107px |
+| ShopFacade | heatmap8 inlier-only | 29,739 | 18,021 | 5.550px -> 5.093px |
+
+Full localization:
+
+| scene | method | S@10 | S@25 | S@50 | median t | inlier P@1 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| OldHospital | C2.5 patch center | 0.088 | 0.412 | 0.720 | 0.295m | 0.676 |
+| OldHospital | previous offset head, gate0.5 | 0.099 | 0.434 | 0.747 | 0.283m | 0.676 |
+| OldHospital | previous offset head, gate0.7 | 0.099 | 0.429 | 0.736 | 0.288m | 0.676 |
+| OldHospital | inlier-only regression | 0.088 | 0.429 | 0.731 | 0.280m | 0.676 |
+| OldHospital | inlier-only heatmap8 | 0.093 | 0.434 | 0.731 | 0.281m | 0.676 |
+| ShopFacade | C2.5 patch center | 0.524 | 0.864 | 0.922 | 0.096m | 0.604 |
+| ShopFacade | previous offset head, gate0.5 | 0.544 | 0.864 | 0.932 | 0.094m | 0.604 |
+| ShopFacade | previous offset head, gate0.7 | 0.534 | 0.864 | 0.913 | 0.096m | 0.604 |
+| ShopFacade | inlier-only regression | 0.534 | 0.864 | 0.922 | 0.097m | 0.604 |
+| ShopFacade | inlier-only heatmap8 | 0.534 | 0.864 | 0.922 | 0.097m | 0.604 |
+
+Conclusion:
+
+- C2.7 is safe but does not meet the target gate. OldHospital reaches S@25
+  0.434 but not 0.45; ShopFacade reaches S@10 0.544 but not 0.56.
+- The previous broader offset head remains the best learned offset variant.
+- Inlier-only and heatmap training reduce offset MAE, but the improvement does
+  not translate into better pose.
+- Keep `learned_same_inlier_fixed` as optional refinement only. Do not make it
+  part of the main method.
+- Further offset progress probably needs lower-level localization evidence
+  beyond the current VFM token window.
+
+## Stage C2.7 Low-Level Offset Sidecar
+
+Artifacts:
+
+- report:
+  `output/vfm/stage_c27_lowlevel_offset/lowlevel_offset_sidecar_summary.md`
+- implementation:
+  `feature_extract/vfm/lowlevel_offset_sidecar.py`
+- evaluator mode:
+  `--patch_offset_mode lowlevel_same_inlier_fixed`
+
+Goal:
+
+Introduce low-level localization information only as a measurement refinement
+sidecar. The low-level branch does not participate in descriptor learning,
+query-to-3D matching, RANSAC inlier selection, or submap retrieval. It only
+adjusts 2D measurements for fixed first-pass PnP inliers, then runs fixed-inlier
+PnP/LM.
+
+Implemented:
+
+- support observation bank from COLMAP track observations;
+- support view selection by closest viewing direction under the first-pass pose;
+- grayscale NCC and Sobel NCC local correlation;
+- bounded offsets and low-confidence fallback to patch center;
+- summary fields for offset usage rate, offset magnitude, score, confidence,
+  missing support/image counts, and fixed same-inlier count.
+
+Full localization:
+
+| scene | method | S@10 | S@25 | S@50 | median t | inlier P@1 | refined | applied ratio |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| OldHospital | C2.5 patch center | 0.088 | 0.412 | 0.720 | 0.295m | 0.676 | - | - |
+| OldHospital | learned offset, same-inlier fixed | 0.099 | 0.434 | 0.747 | 0.283m | 0.676 | 395.6 | 0.879 |
+| OldHospital | gray NCC, 0.5 stride | 0.077 | 0.401 | 0.731 | 0.316m | 0.676 | 171.1 | 0.380 |
+| OldHospital | gray NCC, conservative 0.25 stride | 0.099 | 0.418 | 0.720 | 0.295m | 0.676 | 17.1 | 0.038 |
+| ShopFacade | C2.5 patch center | 0.524 | 0.864 | 0.922 | 0.096m | 0.604 | - | - |
+| ShopFacade | learned offset, same-inlier fixed | 0.544 | 0.864 | 0.932 | 0.094m | 0.604 | 246.3 | 0.853 |
+| ShopFacade | gray NCC, 0.5 stride | 0.515 | 0.864 | 0.913 | 0.097m | 0.604 | 110.1 | 0.381 |
+| ShopFacade | Sobel NCC, 0.5 stride | 0.485 | 0.854 | 0.922 | 0.103m | 0.604 | 136.1 | 0.482 |
+| ShopFacade | gray NCC, conservative 0.25 stride | 0.524 | 0.864 | 0.922 | 0.097m | 0.604 | 10.0 | 0.035 |
+
+Conclusion:
+
+- The low-level sidecar is safe by construction: no second RANSAC and no inlier
+  re-selection.
+- Plain grayscale/Sobel correlation is not strong enough to become the offset
+  method. Aggressive NCC often chooses near-boundary offsets and hurts pose.
+- Conservative NCC gives a small OldHospital S@10/S@25 improvement over C2.5,
+  but does not beat the learned same-inlier offset head and gives no ShopFacade
+  improvement.
+- Keep low-level NCC/Sobel as a diagnostic optional baseline, not a mainline
+  module. A future low-level branch should use a stronger localization signal
+  such as SuperPoint snapping or a learned low-level heatmap, and must beat the
+  current learned same-inlier fixed offset without reducing PnP-inlier Patch@1.
+
+Visual diagnostics:
+
+- `output/vfm/stage_c27_lowlevel_offset/visualizations/lowlevel_offset_pose_metrics.png`
+- `output/vfm/stage_c27_lowlevel_offset/visualizations/lowlevel_offset_usage_histograms.png`
+
+## Stage C2.7 SuperPoint Keypoint Snapping Sidecar
+
+Artifacts:
+
+- report:
+  `output/vfm/stage_c27_superpoint_offset/superpoint_snap_summary.md`
+- implementation:
+  `feature_extract/vfm/lowlevel_offset_sidecar.py`
+- evaluator mode:
+  `--patch_offset_mode superpoint_snap_same_inlier_fixed`
+
+Goal:
+
+Use SuperPoint only as a low-level keypoint localization sidecar. VFM still
+decides the query-to-3D match identity. SuperPoint descriptors are not used, the
+candidate match set is unchanged, and the first-pass PnP inlier set remains
+fixed.
+
+Implemented:
+
+- HLoc SuperPoint detector wrapper using local weights;
+- query-side keypoint snapping for fixed first-pass PnP inliers;
+- `highest_score` and `nearest` snapping strategies;
+- conservative radius/score sweep;
+- applied ratio, keypoint count, snap offset, and keypoint score reporting.
+
+Full localization:
+
+| scene | method | S@10 | S@25 | S@50 | median t | inlier P@1 | refined | applied ratio |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| OldHospital | C2.5 patch center | 0.088 | 0.412 | 0.720 | 0.295m | 0.676 | - | - |
+| OldHospital | learned offset, same-inlier fixed | 0.099 | 0.434 | 0.747 | 0.283m | 0.676 | 395.6 | 0.879 |
+| OldHospital | SP highest r0.5 s0.005 | 0.088 | 0.412 | 0.709 | 0.308m | 0.676 | 240.6 | 0.543 |
+| OldHospital | SP highest r0.25 s0.02 | 0.088 | 0.407 | 0.720 | 0.297m | 0.676 | 57.5 | 0.130 |
+| OldHospital | SP nearest r0.5 s0.005 | 0.077 | 0.401 | 0.703 | 0.302m | 0.676 | 240.6 | 0.543 |
+| ShopFacade | C2.5 patch center | 0.524 | 0.864 | 0.922 | 0.096m | 0.604 | - | - |
+| ShopFacade | learned offset, same-inlier fixed | 0.544 | 0.864 | 0.932 | 0.094m | 0.604 | 246.3 | 0.853 |
+| ShopFacade | SP highest r0.5 s0.005 | 0.495 | 0.854 | 0.913 | 0.101m | 0.604 | 177.3 | 0.621 |
+| ShopFacade | SP highest r0.25 s0.02 | 0.524 | 0.864 | 0.913 | 0.096m | 0.604 | 45.9 | 0.163 |
+| ShopFacade | SP nearest r0.5 s0.005 | 0.515 | 0.854 | 0.922 | 0.099m | 0.604 | 177.3 | 0.621 |
+| ShopFacade | SP nearest r0.25 s0.02 | 0.524 | 0.864 | 0.913 | 0.096m | 0.604 | 45.9 | 0.163 |
+
+Conclusion:
+
+- SuperPoint snapping is safe but not positive. It preserves the fixed inlier
+  structure and PnP-inlier Patch@1, but does not improve pose metrics.
+- Aggressive snapping is harmful; conservative snapping mainly returns to C2.5
+  and still underperforms the learned same-inlier fixed offset branch.
+- Do not promote keypoint snapping alone into the main method. Keep it as a
+  diagnostic sidecar baseline. A future low-level offset adapter should include
+  support-view validation or a learned heatmap, because a nearby SuperPoint
+  keypoint is not necessarily the projection of the matched 3D landmark.
+
+Visual diagnostics:
+
+- `output/vfm/stage_c27_superpoint_offset/visualizations/superpoint_snap_pose_metrics.png`
+- `output/vfm/stage_c27_superpoint_offset/visualizations/superpoint_snap_usage_histograms.png`
