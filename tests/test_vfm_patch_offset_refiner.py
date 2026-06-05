@@ -327,3 +327,55 @@ def test_apply_predicted_patch_offsets_can_keep_high_sigma_matches_at_patch_cent
     np.testing.assert_allclose(refined[1].xy, [63.0, 0.0], atol=1e-6)
     assert summary["refined_count"] == 1
     assert summary["rejected_by_sigma_count"] == 1
+
+
+def test_apply_predicted_patch_offsets_can_reject_offsets_that_worsen_initial_pose_residual() -> None:
+    matches = [
+        QueryTo3DMatch(0, np.asarray([10.0, 10.0]), 1, _xyz_for_xy(12.0, 10.0), 0.9, 0.0, 0.0),
+        QueryTo3DMatch(1, np.asarray([20.0, 10.0]), 2, _xyz_for_xy(22.0, 10.0), 0.8, 0.0, 0.0),
+    ]
+
+    refined, summary = apply_predicted_patch_offsets(
+        matches,
+        offsets=np.asarray([[0.125, 0.0], [0.5, 0.0]], dtype=np.float32),
+        confidences=np.asarray([0.9, 0.9], dtype=np.float32),
+        stride_px=16.0,
+        confidence_threshold=0.5,
+        consistency_pose_w2c=_pose(),
+        consistency_camera=_camera(),
+        max_consistency_residual_increase_px=0.25,
+    )
+
+    np.testing.assert_allclose(refined[0].xy, [12.0, 10.0], atol=1e-6)
+    np.testing.assert_allclose(refined[1].xy, [20.0, 10.0], atol=1e-6)
+    assert refined[0].patch_offset_applied is True
+    assert refined[1].patch_offset_applied is False
+    assert summary["refined_count"] == 1
+    assert summary["rejected_by_consistency_count"] == 1
+
+
+def test_apply_predicted_patch_offsets_records_confidence_metadata() -> None:
+    matches = [
+        QueryTo3DMatch(0, np.asarray([0.0, 0.0]), 1, _xyz_for_xy(6.0, 8.0), 0.9, 0.0, 0.0),
+        QueryTo3DMatch(1, np.asarray([63.0, 0.0]), 2, _xyz_for_xy(56.0, 9.0), 0.8, 0.0, 0.0),
+    ]
+
+    refined, summary = apply_predicted_patch_offsets(
+        matches,
+        offsets=np.asarray([[0.25, 0.0], [0.25, 0.0]], dtype=np.float32),
+        confidences=np.asarray([0.9, 0.2], dtype=np.float32),
+        stride_px=16.0,
+        sigmas=np.asarray([0.3, 1.8], dtype=np.float32),
+        confidence_threshold=0.5,
+    )
+
+    assert refined[0].patch_offset_applied is True
+    assert refined[1].patch_offset_applied is False
+    assert refined[0].patch_offset_confidence == 0.9
+    assert refined[1].patch_offset_confidence == 0.2
+    assert refined[0].patch_offset_sigma == 0.3
+    assert refined[1].patch_offset_sigma == 1.8
+    assert refined[0].patch_offset_norm_px == 4.0
+    assert refined[1].patch_offset_norm_px == 0.0
+    assert summary["mean_applied_confidence"] == 0.9
+    assert summary["offset_applied_ratio"] == 0.5

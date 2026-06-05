@@ -10,12 +10,12 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping
+from typing import Mapping, Sequence
 
 import numpy as np
 from scipy.spatial import cKDTree
 
-from feature_extract.vfm.gaussian_vfm_field import GaussianVFMSource
+from feature_extract.vfm.gaussian_vfm_field import GaussianVFMField, GaussianVFMSource
 from feature_extract.vfm.query_to_3d_matching import LandmarkMapIndex, normalize_rows
 
 
@@ -62,6 +62,65 @@ class SemiDenseAnchorConfig:
             "include_sparse": bool(self.include_sparse),
             "l2_normalize_features": bool(self.l2_normalize_features),
             "gaussian_track_id_offset": int(self.gaussian_track_id_offset),
+        }
+
+
+@dataclass(frozen=True)
+class GaussianConsensusAnchorConfig:
+    """ULF-Loc-style reliable Gaussian landmark sampling from a fused VFM field."""
+
+    max_anchors: int = 20000
+    min_support: int = 2
+    min_opacity: float = 0.02
+    max_gaussian_scale: float | None = None
+    max_mean_distance: float | None = None
+    nms_voxel_size: float = 0.03
+    support_weight: float = 1.0
+    opacity_weight: float = 1.0
+    distance_weight: float = 0.5
+    scale_weight: float = 0.5
+    min_keypoint_votes: int = 0
+    keypoint_vote_weight: float = 0.0
+    l2_normalize_features: bool = True
+
+    def __post_init__(self) -> None:
+        if int(self.max_anchors) <= 0:
+            raise ValueError("max_anchors must be positive")
+        if int(self.min_support) <= 0:
+            raise ValueError("min_support must be positive")
+        if float(self.min_opacity) < 0.0:
+            raise ValueError("min_opacity must be non-negative")
+        if self.max_gaussian_scale is not None and float(self.max_gaussian_scale) <= 0.0:
+            raise ValueError("max_gaussian_scale must be positive")
+        if self.max_mean_distance is not None and float(self.max_mean_distance) <= 0.0:
+            raise ValueError("max_mean_distance must be positive")
+        if float(self.nms_voxel_size) < 0.0:
+            raise ValueError("nms_voxel_size must be non-negative")
+        for name in ("support_weight", "opacity_weight", "distance_weight", "scale_weight"):
+            if float(getattr(self, name)) < 0.0:
+                raise ValueError(f"{name} must be non-negative")
+        if int(self.min_keypoint_votes) < 0:
+            raise ValueError("min_keypoint_votes must be non-negative")
+        if float(self.keypoint_vote_weight) < 0.0:
+            raise ValueError("keypoint_vote_weight must be non-negative")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "max_anchors": int(self.max_anchors),
+            "min_support": int(self.min_support),
+            "min_opacity": float(self.min_opacity),
+            "max_gaussian_scale": None
+            if self.max_gaussian_scale is None
+            else float(self.max_gaussian_scale),
+            "max_mean_distance": None if self.max_mean_distance is None else float(self.max_mean_distance),
+            "nms_voxel_size": float(self.nms_voxel_size),
+            "support_weight": float(self.support_weight),
+            "opacity_weight": float(self.opacity_weight),
+            "distance_weight": float(self.distance_weight),
+            "scale_weight": float(self.scale_weight),
+            "min_keypoint_votes": int(self.min_keypoint_votes),
+            "keypoint_vote_weight": float(self.keypoint_vote_weight),
+            "l2_normalize_features": bool(self.l2_normalize_features),
         }
 
 
@@ -132,11 +191,38 @@ class SemiDenseAnchorMap:
     def __len__(self) -> int:
         return int(self.anchor_ids.shape[0])
 
+    def subset(self, indices: np.ndarray | list[int] | list[bool]) -> "SemiDenseAnchorMap":
+        idx = np.asarray(indices)
+        if idx.dtype == bool:
+            idx = np.flatnonzero(idx)
+        idx = idx.astype(np.int64).reshape(-1)
+        return SemiDenseAnchorMap(
+            anchor_ids=self.anchor_ids[idx],
+            xyz=self.xyz[idx],
+            features=self.features[idx],
+            source_types=self.source_types[idx],
+            source_track_ids=self.source_track_ids[idx],
+            source_gaussian_indices=self.source_gaussian_indices[idx],
+            support_counts=self.support_counts[idx],
+            mean_distances=self.mean_distances[idx],
+            feature_variances=self.feature_variances[idx],
+            observation_counts=self.observation_counts[idx],
+            visibility_counts=self.visibility_counts[idx],
+            quality_scores=self.quality_scores[idx],
+            opacity=self.opacity[idx],
+            scale=self.scale[idx],
+            observation_image_ids=tuple(self.observation_image_ids[int(i)] for i in idx),
+            metadata=self.metadata,
+        )
+
     def to_landmark_index(self) -> LandmarkMapIndex:
         track_ids = np.asarray(self.source_track_ids, dtype=np.int64).copy()
         gaussian_rows = np.flatnonzero(np.asarray(self.source_types) != "sfm")
         if gaussian_rows.size:
-            track_ids[gaussian_rows] = -100_000_000 - np.arange(gaussian_rows.size, dtype=np.int64)
+            needs_synthetic = track_ids[gaussian_rows] >= -1
+            if np.any(needs_synthetic):
+                rows = gaussian_rows[needs_synthetic]
+                track_ids[rows] = -100_000_000 - self.anchor_ids[rows].astype(np.int64, copy=False)
         return LandmarkMapIndex(
             track_ids=track_ids,
             xyz=self.xyz,
@@ -381,6 +467,211 @@ def _rows_to_anchor_map(rows: list[dict[str, object]], feature_dim: int, config:
     )
 
 
+def _safe_unit_interval(values: np.ndarray, high: float | None = None, invert: bool = False) -> np.ndarray:
+    array = np.asarray(values, dtype=np.float32).reshape(-1)
+    if array.size == 0:
+        return array
+    if high is None:
+        high = float(np.percentile(array, 95.0))
+    if not np.isfinite(high) or high <= 1e-8:
+        high = float(np.max(array)) if array.size else 1.0
+    if not np.isfinite(high) or high <= 1e-8:
+        high = 1.0
+    score = np.clip(array / float(high), 0.0, 1.0)
+    return (1.0 - score if invert else score).astype(np.float32)
+
+
+def _gaussian_consensus_quality(
+    field: GaussianVFMField,
+    config: GaussianConsensusAnchorConfig,
+    keypoint_vote_counts: np.ndarray | None = None,
+) -> np.ndarray:
+    support_score = _safe_unit_interval(field.support_counts.astype(np.float32))
+    opacity_score = np.clip(np.asarray(field.opacity, dtype=np.float32), 0.0, 1.0)
+    distance_score = _safe_unit_interval(
+        field.mean_distances,
+        high=config.max_mean_distance,
+        invert=True,
+    )
+    scale_score = _safe_unit_interval(
+        field.scale,
+        high=config.max_gaussian_scale,
+        invert=True,
+    )
+    components_list = [support_score, opacity_score, distance_score, scale_score]
+    weights_list = [
+        float(config.support_weight),
+        float(config.opacity_weight),
+        float(config.distance_weight),
+        float(config.scale_weight),
+    ]
+    if keypoint_vote_counts is not None:
+        vote_score = _safe_unit_interval(np.asarray(keypoint_vote_counts, dtype=np.float32))
+        components_list.append(vote_score)
+        weights_list.append(float(config.keypoint_vote_weight))
+    components = np.stack(components_list, axis=1)
+    weights = np.asarray(weights_list, dtype=np.float32)
+    active = weights > 0.0
+    if not np.any(active):
+        return np.ones((len(field),), dtype=np.float32)
+    weighted_log = np.sum(np.log(np.clip(components[:, active], 1e-6, 1.0)) * weights[active][None, :], axis=1)
+    quality = np.exp(weighted_log / float(np.sum(weights[active])))
+    return np.clip(quality, 0.0, 1.0).astype(np.float32)
+
+
+def _voxel_diverse_top_indices(
+    xyz: np.ndarray,
+    quality: np.ndarray,
+    max_count: int,
+    voxel_size: float,
+) -> np.ndarray:
+    order = np.argsort(-np.asarray(quality, dtype=np.float32), kind="mergesort")
+    if float(voxel_size) <= 0.0:
+        return order[: int(max_count)].astype(np.int64, copy=False)
+    selected: list[int] = []
+    occupied: set[tuple[int, int, int]] = set()
+    inv_size = 1.0 / float(voxel_size)
+    for row in order.tolist():
+        key = tuple(np.floor(np.asarray(xyz[row], dtype=np.float64) * inv_size).astype(np.int64).tolist())
+        if key in occupied:
+            continue
+        occupied.add(key)
+        selected.append(int(row))
+        if len(selected) >= int(max_count):
+            break
+    return np.asarray(selected, dtype=np.int64)
+
+
+def _consensus_vote_stats(vote_counts: np.ndarray | None) -> dict[str, int | float | None]:
+    if vote_counts is None:
+        return {"mean": None, "median": None, "max": None, "nonzero_fraction": None}
+    votes = np.asarray(vote_counts, dtype=np.int64).reshape(-1)
+    if votes.size == 0:
+        return {"mean": None, "median": None, "max": None, "nonzero_fraction": None}
+    return {
+        "mean": float(np.mean(votes)),
+        "median": float(np.median(votes)),
+        "max": int(np.max(votes)),
+        "nonzero_fraction": float(np.mean(votes > 0)),
+    }
+
+
+def build_gaussian_consensus_anchor_map(
+    field: GaussianVFMField,
+    config: GaussianConsensusAnchorConfig | None = None,
+    nearest_track_observation_image_ids: Mapping[int, Sequence[str]] | None = None,
+    keypoint_vote_counts: np.ndarray | None = None,
+) -> SemiDenseAnchorMap:
+    """Sample reliable feature-bearing Gaussian landmarks from a fused VFM field.
+
+    This is a lightweight analogue of ULF-Loc's keypoint-consensus landmark
+    sampling: it keeps only Gaussians with stable multi-view feature support and
+    performs spatial diversity pruning before exposing them as sparse 3D anchors.
+    """
+
+    cfg = config or GaussianConsensusAnchorConfig()
+    visibility_by_track = {
+        int(track_id): tuple(str(image_id) for image_id in image_ids)
+        for track_id, image_ids in dict(nearest_track_observation_image_ids or {}).items()
+    }
+    vote_counts = None
+    if keypoint_vote_counts is not None:
+        vote_counts = np.asarray(keypoint_vote_counts, dtype=np.int64).reshape(-1)
+        if vote_counts.shape != (len(field),):
+            raise ValueError("keypoint_vote_counts must have shape (N,)")
+    feature_dim = int(field.feature_dim)
+    if len(field) == 0:
+        return SemiDenseAnchorMap(
+            anchor_ids=np.zeros((0,), dtype=np.int64),
+            xyz=np.zeros((0, 3), dtype=np.float64),
+            features=np.zeros((0, feature_dim), dtype=np.float32),
+            source_types=np.zeros((0,), dtype=str),
+            source_track_ids=np.zeros((0,), dtype=np.int64),
+            source_gaussian_indices=np.zeros((0,), dtype=np.int64),
+            support_counts=np.zeros((0,), dtype=np.int64),
+            mean_distances=np.zeros((0,), dtype=np.float32),
+            feature_variances=np.zeros((0,), dtype=np.float32),
+            observation_counts=np.zeros((0,), dtype=np.int64),
+            visibility_counts=np.zeros((0,), dtype=np.int64),
+            quality_scores=np.zeros((0,), dtype=np.float32),
+            opacity=np.zeros((0,), dtype=np.float32),
+            scale=np.zeros((0,), dtype=np.float32),
+            observation_image_ids=(),
+            metadata={"stage": "stage_h_gaussian_consensus", "config": cfg.to_dict(), "field_metadata": dict(field.metadata or {})},
+        )
+
+    mask = np.asarray(field.support_counts >= int(cfg.min_support), dtype=bool)
+    mask &= np.asarray(field.opacity >= float(cfg.min_opacity), dtype=bool)
+    if cfg.max_gaussian_scale is not None:
+        mask &= np.asarray(field.scale <= float(cfg.max_gaussian_scale), dtype=bool)
+    if cfg.max_mean_distance is not None:
+        mask &= np.asarray(field.mean_distances <= float(cfg.max_mean_distance), dtype=bool)
+    if vote_counts is not None and int(cfg.min_keypoint_votes) > 0:
+        mask &= np.asarray(vote_counts >= int(cfg.min_keypoint_votes), dtype=bool)
+    candidate_indices = np.flatnonzero(mask)
+    if candidate_indices.size == 0:
+        return build_gaussian_consensus_anchor_map(
+            GaussianVFMField(
+                xyz=np.zeros((0, 3), dtype=np.float64),
+                features=np.zeros((0, feature_dim), dtype=np.float32),
+                opacity=np.zeros((0,), dtype=np.float32),
+                scale=np.zeros((0,), dtype=np.float32),
+                gaussian_indices=np.zeros((0,), dtype=np.int64),
+                nearest_track_ids=np.zeros((0,), dtype=np.int64),
+                support_counts=np.zeros((0,), dtype=np.int64),
+                mean_distances=np.zeros((0,), dtype=np.float32),
+                metadata=field.metadata,
+            ),
+            cfg,
+        )
+
+    quality = _gaussian_consensus_quality(field, cfg, keypoint_vote_counts=vote_counts)
+    local_keep = _voxel_diverse_top_indices(
+        field.xyz[candidate_indices],
+        quality[candidate_indices],
+        max_count=min(int(cfg.max_anchors), int(candidate_indices.size)),
+        voxel_size=float(cfg.nms_voxel_size),
+    )
+    keep = candidate_indices[local_keep]
+    features = field.features[keep].astype(np.float32, copy=True)
+    if bool(cfg.l2_normalize_features):
+        features, _valid = normalize_rows(features)
+    support = field.support_counts[keep].astype(np.int64, copy=False)
+    nearest_track_ids = field.nearest_track_ids[keep].astype(np.int64, copy=False)
+    source_track_ids = np.full((int(keep.size),), -1, dtype=np.int64)
+    observation_image_ids: list[tuple[str, ...]] = []
+    for row, track_id in enumerate(nearest_track_ids.tolist()):
+        image_ids = visibility_by_track.get(int(track_id), ())
+        if image_ids:
+            source_track_ids[row] = int(track_id)
+        observation_image_ids.append(tuple(image_ids))
+    return SemiDenseAnchorMap(
+        anchor_ids=np.arange(int(keep.size), dtype=np.int64),
+        xyz=field.xyz[keep].astype(np.float64, copy=False),
+        features=features.astype(np.float32, copy=False),
+        source_types=np.asarray(["gaussian_consensus"] * int(keep.size), dtype=str),
+        source_track_ids=source_track_ids,
+        source_gaussian_indices=field.gaussian_indices[keep].astype(np.int64, copy=False),
+        support_counts=support,
+        mean_distances=field.mean_distances[keep].astype(np.float32, copy=False),
+        feature_variances=np.zeros((int(keep.size),), dtype=np.float32),
+        observation_counts=support,
+        visibility_counts=support,
+        quality_scores=quality[keep].astype(np.float32, copy=False),
+        opacity=field.opacity[keep].astype(np.float32, copy=False),
+        scale=field.scale[keep].astype(np.float32, copy=False),
+        observation_image_ids=tuple(observation_image_ids),
+        metadata={
+            "stage": "stage_h_gaussian_consensus",
+            "config": cfg.to_dict(),
+            "field_metadata": dict(field.metadata or {}),
+            "source_gaussian_count": int(len(field)),
+            "candidate_gaussian_count": int(candidate_indices.size),
+            "keypoint_vote_count_stats": _consensus_vote_stats(vote_counts[keep] if vote_counts is not None else None),
+        },
+    )
+
+
 def semidense_anchor_map_stats(
     anchor_map: SemiDenseAnchorMap,
     sparse_landmark_count: int,
@@ -411,22 +702,28 @@ def filter_semidense_by_source_visibility(
     visibility_index,
     reference_images,
 ) -> tuple[LandmarkMapIndex, dict[str, float | int]]:
-    """Filter semi-dense anchors by visibility of their supporting SfM tracks."""
+    """Filter semi-dense anchors by SfM-track or source-observation visibility."""
 
     full_visible = visibility_index.visible_tracks(reference_images)
-    if not full_visible:
-        return anchor_map.to_landmark_index().subset([]), {
-            "full_visible_tracks": 0,
-            "bank_visible_tracks": 0,
-            "bank_visibility_coverage": 0.0,
-        }
+    reference_set = {str(item) for item in reference_images}
     source_track_ids = np.asarray(anchor_map.source_track_ids, dtype=np.int64)
-    mask = np.asarray([int(track_id) in full_visible for track_id in source_track_ids], dtype=bool)
+    track_mask = np.asarray([int(track_id) in full_visible for track_id in source_track_ids], dtype=bool)
+    observation_mask = np.asarray(
+        [
+            bool(reference_set.intersection(str(image_id) for image_id in image_ids))
+            for image_ids in anchor_map.observation_image_ids
+        ],
+        dtype=bool,
+    )
+    synthetic_mask = source_track_ids < 0
+    mask = track_mask | (synthetic_mask & observation_mask)
     subset = anchor_map.to_landmark_index().subset(mask)
     return subset, {
         "full_visible_tracks": int(len(full_visible)),
         "bank_visible_tracks": int(len(subset)),
         "bank_visibility_coverage": float(len(subset) / max(len(full_visible), 1)),
+        "track_visible_anchors": int(np.sum(track_mask)),
+        "observation_image_visible_anchors": int(np.sum(synthetic_mask & observation_mask)),
     }
 
 

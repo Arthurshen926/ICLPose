@@ -21,15 +21,26 @@ from feature_extract.tools.vfm.eval_query_to_3d_vfm_matching import (
     _parse_default_camera,
 )
 from feature_extract.vfm.cambridge_pose_lattice import camera_center_from_pose_w2c, parse_cambridge_pose_file
+from feature_extract.vfm.correspondence_confidence import (
+    CalibratedMatchCandidateScorer,
+    CalibratedLogisticConfidence,
+    annotate_matches_with_calibrated_confidence,
+)
 from feature_extract.vfm.landmark_visibility import LandmarkVisibilityIndex, count_projected_landmarks, filter_landmarks_by_visibility
 from feature_extract.vfm.lowlevel_offset_sidecar import (
     HLocSuperPointKeypointDetector,
+    LandmarkConditionedKeypointSelectorConfig,
     LowLevelOffsetSidecarConfig,
     LowLevelSupportBank,
     SuperPointSnapConfig,
+    apply_landmark_conditioned_superpoint_snaps_to_matches,
+    build_landmark_conditioned_superpoint_candidate_rows,
+    apply_superpoint_gt_oracle_snaps_to_matches,
     apply_superpoint_snaps_to_matches,
     apply_lowlevel_offsets_to_matches,
     select_support_observation,
+    select_support_superpoint_keypoint,
+    superpoint_availability_summary,
 )
 from feature_extract.vfm.map_lifting import load_selected_track_bank_npz
 from feature_extract.vfm.patch_selector_training import SafePairwiseInlierScorer
@@ -50,6 +61,7 @@ from feature_extract.vfm.patch_offset_refiner import (
     predict_patch_offsets_for_matches,
     refine_matches_with_oracle_offsets,
 )
+from feature_extract.vfm.rendered_map_verifier import project_xyz_to_image
 from feature_extract.vfm.query_to_3d_matching import (
     LandmarkAmbiguityPruningConfig,
     LandmarkQualityConfig,
@@ -60,6 +72,7 @@ from feature_extract.vfm.query_to_3d_matching import (
     SpatialDiversityPnPConfig,
     estimate_pose_pnp_ransac,
     estimate_pose_pnp_fixed,
+    estimate_pose_pnp_fixed_robust,
     filter_landmarks_by_reference_images,
     match_reprojection_errors,
     match_spatial_distribution_stats,
@@ -125,6 +138,65 @@ def _safe_float(value) -> float | None:
     except (TypeError, ValueError):
         return None
     return result if np.isfinite(result) else None
+
+
+def _fixed_pose_refinement_weights(matches: Sequence[object], mode: str) -> np.ndarray | None:
+    mode_value = str(mode)
+    if mode_value == "uniform":
+        return np.ones((len(matches),), dtype=np.float64)
+    weights = []
+    for match in matches:
+        weight = 1.0
+        if mode_value in {"reliability", "composite", "offset_composite", "offset_consistency_composite"}:
+            reliability = _safe_float(getattr(match, "map_reliability", None))
+            if reliability is not None:
+                weight *= max(reliability, 0.05)
+            quality = _safe_float(getattr(match, "landmark_quality", None))
+            if quality is not None:
+                weight *= max(quality, 0.05)
+            scale = _safe_float(getattr(match, "pnp_uncertainty_scale", None))
+            if scale is not None:
+                weight /= max(scale * scale, 1e-3)
+        if mode_value in {"match", "composite", "offset_composite", "offset_consistency_composite"}:
+            similarity = _safe_float(getattr(match, "similarity", None))
+            if similarity is not None:
+                weight *= max(similarity, 0.05)
+            margin = _safe_float(getattr(match, "similarity_margin", None))
+            if margin is not None:
+                weight *= 1.0 + min(max(margin, 0.0) * 5.0, 2.0)
+            variance = _safe_float(getattr(match, "landmark_variance", None))
+            if variance is not None:
+                weight /= 1.0 + max(variance, 0.0)
+            reproj = _safe_float(getattr(match, "landmark_reprojection_error", None))
+            if reproj is not None:
+                weight /= 1.0 + max(reproj, 0.0) / 4.0
+            ambiguity = _safe_float(getattr(match, "landmark_ambiguity", None))
+            if ambiguity is not None:
+                weight *= max(1.0 - 0.75 * min(max(ambiguity, 0.0), 1.0), 0.05)
+            obs = _safe_float(getattr(match, "observation_count", None))
+            if obs is not None:
+                weight *= max(np.log1p(max(obs, 0.0)), 1.0)
+        if mode_value in {"offset_confidence", "offset_composite", "offset_consistency_composite"}:
+            confidence = _safe_float(getattr(match, "patch_offset_confidence", None))
+            if confidence is not None:
+                confidence = min(max(confidence, 0.0), 1.0)
+                weight *= 0.25 + 1.5 * confidence
+            sigma = _safe_float(getattr(match, "patch_offset_sigma", None))
+            if sigma is not None:
+                weight /= max(float(sigma) * float(sigma), 0.25)
+            applied = getattr(match, "patch_offset_applied", None)
+            if applied is False and confidence is not None and confidence < 0.5:
+                weight *= 0.75
+        if mode_value == "offset_consistency_composite":
+            before = _safe_float(getattr(match, "patch_offset_consistency_before_px", None))
+            after = _safe_float(getattr(match, "patch_offset_consistency_after_px", None))
+            if before is not None and after is not None:
+                increase = max(after - before, 0.0)
+                weight /= 1.0 + increase / 2.0
+                if after > before:
+                    weight *= max(before / max(after, 1e-6), 0.25)
+        weights.append(float(np.clip(weight, 0.05, 10.0)))
+    return np.asarray(weights, dtype=np.float64)
 
 
 def _success(row: dict[str, object], translation_m: float, rotation_deg: float) -> bool:
@@ -426,6 +498,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     )
     parser.add_argument("--pnp_soft_order_top_n", type=int, default=0)
     parser.add_argument("--max_matches", type=int, default=1000)
+    parser.add_argument("--return_all_topk_candidates", action="store_true")
+    parser.add_argument(
+        "--deduplicate_track_matches",
+        action="store_true",
+        help="Keep only the highest-scoring match for each query token and 3D track id.",
+    )
     parser.add_argument("--match_block_size", type=int, default=256)
     parser.add_argument("--similarity_device", default="cpu")
     parser.add_argument(
@@ -434,6 +512,18 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         choices=("similarity", "landmark_quality", "similarity_quality", "similarity_pairwise"),
     )
     parser.add_argument("--safe_pairwise_checkpoint", default="")
+    parser.add_argument("--calibrated_candidate_checkpoint", default="")
+    parser.add_argument(
+        "--calibrated_candidate_feature_set",
+        default="descriptor_map",
+        choices=("descriptor", "map_stats", "descriptor_map", "full"),
+    )
+    parser.add_argument("--calibrated_confidence_checkpoint", default="")
+    parser.add_argument(
+        "--calibrated_confidence_feature_set",
+        default="descriptor_map",
+        choices=("descriptor", "map_stats", "descriptor_map", "full"),
+    )
     parser.add_argument("--pairwise_inlier_weight", type=float, default=0.0)
     parser.add_argument("--pairwise_filter_keep_fraction", type=float, default=None)
     parser.add_argument("--pairwise_filter_min_logit", type=float, default=None)
@@ -449,11 +539,29 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     parser.add_argument("--pnp_method", default="EPNP", choices=("AP3P", "EPNP", "ITERATIVE", "P3P", "SQPNP"))
     parser.add_argument("--pnp_refine_method", default="none", choices=("none", "LM", "VVS"))
     parser.add_argument("--pnp_refine_lm", action="store_true")
+    parser.add_argument("--fixed_pose_refine_method", default="auto", choices=("auto", "none", "LM", "VVS", "robust_lm"))
+    parser.add_argument("--robust_fixed_pose_loss", default="huber", choices=("linear", "soft_l1", "huber", "cauchy", "arctan"))
+    parser.add_argument("--robust_fixed_pose_f_scale_px", type=float, default=4.0)
+    parser.add_argument("--robust_fixed_pose_max_nfev", type=int, default=50)
+    parser.add_argument(
+        "--robust_fixed_pose_weight_mode",
+        default="uniform",
+        choices=(
+            "uniform",
+            "match",
+            "reliability",
+            "composite",
+            "offset_confidence",
+            "offset_composite",
+            "offset_consistency_composite",
+        ),
+    )
     parser.add_argument(
         "--patch_offset_mode",
         default="none",
         choices=(
             "none",
+            "fixed_same_inlier",
             "oracle_all",
             "oracle_patch_positive",
             "oracle_two_pass_inliers",
@@ -465,6 +573,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             "learned_same_inlier_fixed",
             "lowlevel_same_inlier_fixed",
             "superpoint_snap_same_inlier_fixed",
+            "superpoint_gt_oracle_same_inlier_fixed",
+            "superpoint_gt_oracle_patch_positive_same_inlier_fixed",
+            "landmark_conditioned_superpoint_same_inlier_fixed",
         ),
     )
     parser.add_argument("--patch_offset_checkpoint", default="")
@@ -473,6 +584,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     parser.add_argument("--patch_offset_confidence_threshold", type=float, default=0.5)
     parser.add_argument("--patch_offset_max_stride", type=float, default=0.5)
     parser.add_argument("--patch_offset_max_sigma", type=float, default=None)
+    parser.add_argument("--patch_offset_max_consistency_residual_increase_px", type=float, default=None)
+    parser.add_argument("--patch_offset_max_consistency_residual_px", type=float, default=None)
     parser.add_argument("--patch_offset_free_oracle", action="store_true")
     parser.add_argument("--patch_offset_bound_metric", default="l2", choices=("l2", "linf"))
     parser.add_argument("--patch_offset_oracle_noise_px", type=float, default=0.0)
@@ -492,6 +605,18 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     parser.add_argument("--superpoint_snap_radius_stride", type=float, default=0.5)
     parser.add_argument("--superpoint_min_score", type=float, default=0.005)
     parser.add_argument("--superpoint_snap_strategy", default="highest_score", choices=("highest_score", "nearest"))
+    parser.add_argument("--superpoint_availability_radii_px", default="2,4,8,12,16")
+    parser.add_argument("--superpoint_oracle_max_distance_px", type=float, default=16.0)
+    parser.add_argument("--lcks_candidate_radius_stride", type=float, default=0.5)
+    parser.add_argument("--lcks_support_radius_px", type=float, default=16.0)
+    parser.add_argument("--lcks_min_query_score", type=float, default=0.005)
+    parser.add_argument("--lcks_min_support_score", type=float, default=0.005)
+    parser.add_argument("--lcks_descriptor_weight", type=float, default=1.0)
+    parser.add_argument("--lcks_query_score_weight", type=float, default=0.25)
+    parser.add_argument("--lcks_center_penalty_weight", type=float, default=0.15)
+    parser.add_argument("--lcks_support_distance_penalty_weight", type=float, default=0.10)
+    parser.add_argument("--lcks_score_threshold", type=float, default=0.2)
+    parser.add_argument("--lcks_support_selection_strategy", default="nearest", choices=("nearest", "highest_score"))
     parser.add_argument("--risk_coverages", default="0.8,0.9,1.0")
     parser.add_argument(
         "--oracle_match_mode",
@@ -502,12 +627,19 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     parser.add_argument("--max_queries", type=int, default=0)
     parser.add_argument("--output_jsonl", required=True)
     parser.add_argument("--output_matches_jsonl", default="")
+    parser.add_argument("--output_superpoint_candidate_jsonl", default="")
     parser.add_argument("--summary_json", required=True)
     args = parser.parse_args(argv)
 
     if args.submap_mode == "reference_visibility" and not args.candidate_bank:
         raise ValueError("candidate_bank is required when submap_mode=reference_visibility")
-    if args.patch_offset_mode in {"lowlevel_same_inlier_fixed", "superpoint_snap_same_inlier_fixed"} and not args.image_root:
+    if args.patch_offset_mode in {
+        "lowlevel_same_inlier_fixed",
+        "superpoint_snap_same_inlier_fixed",
+        "superpoint_gt_oracle_same_inlier_fixed",
+        "superpoint_gt_oracle_patch_positive_same_inlier_fixed",
+        "landmark_conditioned_superpoint_same_inlier_fixed",
+    } and not args.image_root:
         raise ValueError(f"image_root is required for {args.patch_offset_mode}")
 
     if not args.landmark_bank and not args.semidense_anchor_npz:
@@ -567,6 +699,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         block_size=args.match_block_size,
         similarity_device=args.similarity_device,
         match_score_mode=args.match_score_mode,
+        return_all_topk_candidates=bool(args.return_all_topk_candidates),
+        deduplicate_track_matches=bool(args.deduplicate_track_matches),
         pairwise_filter_keep_fraction=args.pairwise_filter_keep_fraction,
         pairwise_filter_min_logit=args.pairwise_filter_min_logit,
         pairwise_filter_min_logprob=args.pairwise_filter_min_logprob,
@@ -621,6 +755,17 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             device=args.pairwise_device or args.similarity_device,
             batch_size=int(args.pairwise_batch_size),
         )
+    calibrated_confidence_model = None
+    if args.calibrated_confidence_checkpoint:
+        calibrated_confidence_model = CalibratedLogisticConfidence.load_json(
+            Path(args.calibrated_confidence_checkpoint),
+        )
+    calibrated_candidate_scorer = None
+    if args.calibrated_candidate_checkpoint:
+        calibrated_candidate_scorer = CalibratedMatchCandidateScorer(
+            model=CalibratedLogisticConfidence.load_json(Path(args.calibrated_candidate_checkpoint)),
+            feature_set=args.calibrated_candidate_feature_set,
+        )
     offset_run = None
     if args.patch_offset_mode.startswith("learned"):
         if not args.patch_offset_checkpoint:
@@ -632,10 +777,15 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     lowlevel_support_bank = None
     image_cache: dict[str, np.ndarray] = {}
     image_root = Path(args.image_root) if args.image_root else None
-    if args.patch_offset_mode == "lowlevel_same_inlier_fixed":
+    if args.patch_offset_mode in {"lowlevel_same_inlier_fixed", "landmark_conditioned_superpoint_same_inlier_fixed"}:
         lowlevel_support_bank = LowLevelSupportBank.from_jsonl(Path(args.track_observations))
     superpoint_detector = None
-    if args.patch_offset_mode == "superpoint_snap_same_inlier_fixed":
+    if args.patch_offset_mode in {
+        "superpoint_snap_same_inlier_fixed",
+        "superpoint_gt_oracle_same_inlier_fixed",
+        "superpoint_gt_oracle_patch_positive_same_inlier_fixed",
+        "landmark_conditioned_superpoint_same_inlier_fixed",
+    }:
         superpoint_detector = HLocSuperPointKeypointDetector(
             device=args.superpoint_device or args.patch_offset_device or args.similarity_device,
             nms_radius=int(args.superpoint_nms_radius),
@@ -643,6 +793,21 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             max_keypoints=int(args.superpoint_max_keypoints),
             remove_borders=int(args.superpoint_remove_borders),
         )
+    superpoint_cache = {}
+
+    def get_superpoint_keypoints(image_id: str):
+        if superpoint_detector is None:
+            raise ValueError("SuperPoint detector is not initialized")
+        key = str(image_id)
+        if key not in superpoint_cache:
+            superpoint_cache[key] = superpoint_detector.detect(get_image(key))
+        return superpoint_cache[key]
+
+    superpoint_availability_radii = tuple(
+        float(item.strip())
+        for item in str(args.superpoint_availability_radii_px).split(",")
+        if item.strip()
+    )
 
     def get_image(image_id: str) -> np.ndarray:
         if image_root is None:
@@ -654,6 +819,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     rows = []
     match_rows = []
+    superpoint_candidate_rows = []
     records = list(manifest.records)
     if args.max_queries > 0:
         records = records[: args.max_queries]
@@ -734,9 +900,16 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 int(camera.height),
                 pairwise_inlier_scorer=pairwise_scorer,
                 pairwise_inlier_weight=float(args.pairwise_inlier_weight),
+                candidate_match_scorer=calibrated_candidate_scorer,
             )
             if args.oracle_match_mode == "filter_gt_correct":
                 matches = filter_patch_correct_matches(matches, positives)
+        if calibrated_confidence_model is not None:
+            matches = annotate_matches_with_calibrated_confidence(
+                matches,
+                calibrated_confidence_model,
+                feature_set=args.calibrated_confidence_feature_set,
+            )
         if args.pnp_soft_order_mode != "none":
             matches = soft_order_pnp_matches(matches, mode=args.pnp_soft_order_mode)
         pnp_matches = select_pnp_matches_by_map_reliability(
@@ -823,6 +996,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             pnp_matches = [matches[idx] for idx in selected_indices]
             pnp = run_pnp(pnp_matches)
         elif args.patch_offset_mode in {
+            "fixed_same_inlier",
             "oracle_two_pass_inliers",
             "oracle_two_pass_inliers_patch_positive",
             "oracle_same_inlier_fixed",
@@ -831,6 +1005,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             "learned_same_inlier_fixed",
             "lowlevel_same_inlier_fixed",
             "superpoint_snap_same_inlier_fixed",
+            "superpoint_gt_oracle_same_inlier_fixed",
+            "superpoint_gt_oracle_patch_positive_same_inlier_fixed",
+            "landmark_conditioned_superpoint_same_inlier_fixed",
         }:
             initial_pnp = run_pnp(pnp_matches)
             initial_full_inlier_mask = _full_inlier_mask(matches, pnp_matches, initial_pnp.inlier_mask)
@@ -874,6 +1051,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     max_offset_stride=float(args.patch_offset_max_stride),
                     sigmas=sigmas,
                     max_sigma=args.patch_offset_max_sigma,
+                    consistency_pose_w2c=initial_pnp.pose_w2c,
+                    consistency_camera=camera if initial_pnp.pose_w2c is not None else None,
+                    max_consistency_residual_increase_px=args.patch_offset_max_consistency_residual_increase_px,
+                    max_consistency_residual_px=args.patch_offset_max_consistency_residual_px,
                 )
             elif args.patch_offset_mode == "lowlevel_same_inlier_fixed":
                 if lowlevel_support_bank is None:
@@ -922,6 +1103,16 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 if superpoint_detector is None:
                     raise ValueError("SuperPoint detector is not initialized")
                 query_keypoints = superpoint_detector.detect(get_image(query_id))
+                gt_xy_by_match = []
+                for match in matches:
+                    projected = project_xyz_to_image(np.asarray(match.xyz, dtype=np.float64), gt_pose.pose_w2c, camera)
+                    gt_xy_by_match.append(None if projected is None else np.asarray(projected, dtype=np.float64))
+                availability = superpoint_availability_summary(
+                    gt_xy_by_match,
+                    query_keypoints,
+                    initial_full_inlier_mask,
+                    radii_px=superpoint_availability_radii,
+                )
                 matches, offset_summary = apply_superpoint_snaps_to_matches(
                     matches,
                     query_keypoints,
@@ -932,24 +1123,187 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                         selection_strategy=args.superpoint_snap_strategy,
                     ),
                 )
+                offset_summary = {**offset_summary, **availability}
+            elif args.patch_offset_mode in {
+                "superpoint_gt_oracle_same_inlier_fixed",
+                "superpoint_gt_oracle_patch_positive_same_inlier_fixed",
+            }:
+                if superpoint_detector is None:
+                    raise ValueError("SuperPoint detector is not initialized")
+                query_keypoints = superpoint_detector.detect(get_image(query_id))
+                gt_xy_by_match = []
+                for match in matches:
+                    projected = project_xyz_to_image(np.asarray(match.xyz, dtype=np.float64), gt_pose.pose_w2c, camera)
+                    gt_xy_by_match.append(None if projected is None else np.asarray(projected, dtype=np.float64))
+                availability = superpoint_availability_summary(
+                    gt_xy_by_match,
+                    query_keypoints,
+                    initial_full_inlier_mask,
+                    radii_px=superpoint_availability_radii,
+                )
+                matches, offset_summary = apply_superpoint_gt_oracle_snaps_to_matches(
+                    matches,
+                    query_keypoints,
+                    inlier_mask=initial_full_inlier_mask,
+                    gt_xy_by_match=gt_xy_by_match,
+                    max_distance_px=float(args.superpoint_oracle_max_distance_px),
+                    patch_positive_by_token=patch_positive_by_token,
+                    require_patch_positive=args.patch_offset_mode
+                    == "superpoint_gt_oracle_patch_positive_same_inlier_fixed",
+                )
+                offset_summary = {**offset_summary, **availability}
+            elif args.patch_offset_mode == "landmark_conditioned_superpoint_same_inlier_fixed":
+                if lowlevel_support_bank is None:
+                    raise ValueError("low-level support bank is not initialized")
+                query_keypoints = get_superpoint_keypoints(query_id)
+                gt_xy_by_match = []
+                for match in matches:
+                    projected = project_xyz_to_image(np.asarray(match.xyz, dtype=np.float64), gt_pose.pose_w2c, camera)
+                    gt_xy_by_match.append(None if projected is None else np.asarray(projected, dtype=np.float64))
+                availability = superpoint_availability_summary(
+                    gt_xy_by_match,
+                    query_keypoints,
+                    initial_full_inlier_mask,
+                    radii_px=superpoint_availability_radii,
+                )
+                query_viewing_ray_by_track = {}
+                if initial_pnp.pose_w2c is not None:
+                    camera_center = camera_center_from_pose_w2c(initial_pnp.pose_w2c)
+                    for idx, match in enumerate(matches):
+                        if not bool(initial_full_inlier_mask[idx]):
+                            continue
+                        ray = np.asarray(match.xyz, dtype=np.float64).reshape(3) - camera_center
+                        norm = max(float(np.linalg.norm(ray)), 1e-12)
+                        query_viewing_ray_by_track[int(match.track_id)] = ray / norm
+                support_by_track = {}
+                missing_support_observation = 0
+                missing_support_keypoint = 0
+                for idx, match in enumerate(matches):
+                    if not bool(initial_full_inlier_mask[idx]):
+                        continue
+                    support_obs = select_support_observation(
+                        lowlevel_support_bank,
+                        int(match.track_id),
+                        query_viewing_ray=query_viewing_ray_by_track.get(int(match.track_id)),
+                    )
+                    if support_obs is None:
+                        missing_support_observation += 1
+                        continue
+                    support_keypoints = get_superpoint_keypoints(str(support_obs.image_id))
+                    support = select_support_superpoint_keypoint(
+                        track_id=int(match.track_id),
+                        support_image_id=str(support_obs.image_id),
+                        observation_xy=np.asarray(support_obs.xy, dtype=np.float64),
+                        keypoints=support_keypoints,
+                        max_distance_px=float(args.lcks_support_radius_px),
+                        min_score=float(args.lcks_min_support_score),
+                        strategy=args.lcks_support_selection_strategy,
+                    )
+                    if support is None:
+                        missing_support_keypoint += 1
+                        continue
+                    support_by_track[int(match.track_id)] = support
+                lcks_config = LandmarkConditionedKeypointSelectorConfig(
+                    candidate_radius_px=float(args.lcks_candidate_radius_stride) * float(stride),
+                    support_radius_px=float(args.lcks_support_radius_px),
+                    min_query_score=float(args.lcks_min_query_score),
+                    min_support_score=float(args.lcks_min_support_score),
+                    descriptor_weight=float(args.lcks_descriptor_weight),
+                    query_score_weight=float(args.lcks_query_score_weight),
+                    center_penalty_weight=float(args.lcks_center_penalty_weight),
+                    support_distance_penalty_weight=float(args.lcks_support_distance_penalty_weight),
+                    score_threshold=float(args.lcks_score_threshold),
+                    support_selection_strategy=args.lcks_support_selection_strategy,
+                )
+                if args.output_superpoint_candidate_jsonl:
+                    initial_reproj_errors = (
+                        [None for _match in matches]
+                        if initial_pnp.pose_w2c is None
+                        else [
+                            None if not np.isfinite(value) else float(value)
+                            for value in match_reprojection_errors(matches, initial_pnp.pose_w2c, camera)
+                        ]
+                    )
+                    superpoint_candidate_rows.extend(
+                        build_landmark_conditioned_superpoint_candidate_rows(
+                            matches,
+                            query_keypoints,
+                            support_by_track,
+                            inlier_mask=initial_full_inlier_mask,
+                            config=lcks_config,
+                            gt_xy_by_match=gt_xy_by_match,
+                            query_id=query_id,
+                            stride_px=stride,
+                            baseline_reproj_residual_by_match=initial_reproj_errors,
+                        )
+                    )
+                matches, offset_summary = apply_landmark_conditioned_superpoint_snaps_to_matches(
+                    matches,
+                    query_keypoints,
+                    support_by_track,
+                    inlier_mask=initial_full_inlier_mask,
+                    config=lcks_config,
+                    gt_xy_by_match=gt_xy_by_match,
+                )
+                support_availability = float(len(support_by_track) / max(int(initial_pnp.inlier_count), 1))
+                offset_summary = {
+                    **offset_summary,
+                    **availability,
+                    "support_observation_missing_count": int(missing_support_observation),
+                    "support_keypoint_missing_count": int(missing_support_keypoint),
+                    "support_availability_ratio": support_availability,
+                }
             offset_summary = {**offset_summary, "initial_inlier_count": int(initial_pnp.inlier_count)}
             if args.patch_offset_mode in {
+                "fixed_same_inlier",
                 "oracle_same_inlier_fixed",
                 "oracle_same_inlier_fixed_patch_positive",
                 "learned_same_inlier_fixed",
                 "lowlevel_same_inlier_fixed",
                 "superpoint_snap_same_inlier_fixed",
+                "superpoint_gt_oracle_same_inlier_fixed",
+                "superpoint_gt_oracle_patch_positive_same_inlier_fixed",
+                "landmark_conditioned_superpoint_same_inlier_fixed",
             }:
                 fixed_indices = np.flatnonzero(initial_full_inlier_mask).astype(np.int64).tolist()
                 pnp_matches = [matches[int(idx)] for idx in fixed_indices]
-                pnp = estimate_pose_pnp_fixed(
-                    pnp_matches,
-                    camera,
-                    min_inliers=max(4, int(args.pnp_min_inliers)),
-                    pnp_method=args.pnp_method,
-                    refine_method=args.pnp_refine_method if args.pnp_refine_method != "none" else "LM",
+                fixed_refine_method = (
+                    args.pnp_refine_method if args.pnp_refine_method != "none" else "LM"
                 )
-                offset_summary = {**offset_summary, "fixed_same_inlier_count": int(len(fixed_indices))}
+                if args.fixed_pose_refine_method != "auto":
+                    fixed_refine_method = args.fixed_pose_refine_method
+                if fixed_refine_method == "robust_lm":
+                    fixed_weights = _fixed_pose_refinement_weights(
+                        pnp_matches,
+                        args.robust_fixed_pose_weight_mode,
+                    )
+                    pnp = estimate_pose_pnp_fixed_robust(
+                        pnp_matches,
+                        camera,
+                        weights=fixed_weights,
+                        min_inliers=max(4, int(args.pnp_min_inliers)),
+                        initial_pose_w2c=initial_pnp.pose_w2c,
+                        pnp_method=args.pnp_method,
+                        loss=args.robust_fixed_pose_loss,
+                        f_scale_px=float(args.robust_fixed_pose_f_scale_px),
+                        max_nfev=int(args.robust_fixed_pose_max_nfev),
+                    )
+                else:
+                    pnp = estimate_pose_pnp_fixed(
+                        pnp_matches,
+                        camera,
+                        min_inliers=max(4, int(args.pnp_min_inliers)),
+                        pnp_method=args.pnp_method,
+                        refine_method=fixed_refine_method,
+                    )
+                offset_summary = {
+                    **offset_summary,
+                    "fixed_same_inlier_count": int(len(fixed_indices)),
+                    "fixed_pose_refine_method": fixed_refine_method,
+                    "robust_fixed_pose_loss": args.robust_fixed_pose_loss,
+                    "robust_fixed_pose_f_scale_px": float(args.robust_fixed_pose_f_scale_px),
+                    "robust_fixed_pose_weight_mode": args.robust_fixed_pose_weight_mode,
+                }
             else:
                 pnp_matches = [matches[idx] for idx in selected_indices]
                 pnp = run_pnp(pnp_matches)
@@ -1038,6 +1392,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                         "local_consistency_support": match.local_consistency_support,
                         "local_consistency_score": match.local_consistency_score,
                         "pnp_soft_score": match.pnp_soft_score,
+                        "patch_offset_confidence": match.patch_offset_confidence,
+                        "patch_offset_sigma": match.patch_offset_sigma,
+                        "patch_offset_applied": match.patch_offset_applied,
+                        "patch_offset_norm_px": match.patch_offset_norm_px,
+                        "patch_offset_consistency_before_px": match.patch_offset_consistency_before_px,
+                        "patch_offset_consistency_after_px": match.patch_offset_consistency_after_px,
                         "distance_to_boundary_px": match.distance_to_boundary_px,
                         "gt_reproj_error_px": gt_error_px,
                         "gt_reproj_error_stride": gt_error_stride,
@@ -1130,6 +1490,13 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         matches_path = Path(args.output_matches_jsonl)
         matches_path.parent.mkdir(parents=True, exist_ok=True)
         matches_path.write_text("\n".join(json.dumps(row, sort_keys=True) for row in match_rows) + ("\n" if match_rows else ""))
+    if args.output_superpoint_candidate_jsonl:
+        candidates_path = Path(args.output_superpoint_candidate_jsonl)
+        candidates_path.parent.mkdir(parents=True, exist_ok=True)
+        candidates_path.write_text(
+            "\n".join(json.dumps(row, sort_keys=True) for row in superpoint_candidate_rows)
+            + ("\n" if superpoint_candidate_rows else "")
+        )
 
     labeled_rows = [row for row in rows if row["translation_error_m"] is not None]
     visible_recall_values = [row["visible_landmark_recall"] for row in rows if row["visible_landmark_recall"] is not None]
@@ -1179,6 +1546,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             "patch_scale": float(args.patch_scale),
             "patch_at_k": int(args.patch_at_k),
             "safe_pairwise_checkpoint": args.safe_pairwise_checkpoint,
+            "calibrated_candidate_checkpoint": args.calibrated_candidate_checkpoint,
+            "calibrated_candidate_feature_set": args.calibrated_candidate_feature_set,
+            "calibrated_confidence_checkpoint": args.calibrated_confidence_checkpoint,
+            "calibrated_confidence_feature_set": args.calibrated_confidence_feature_set,
             "pairwise_inlier_weight": float(args.pairwise_inlier_weight),
             "pairwise_filter_keep_fraction": args.pairwise_filter_keep_fraction,
             "pairwise_filter_min_logit": args.pairwise_filter_min_logit,
@@ -1200,9 +1571,19 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 "confidence_threshold": float(args.patch_offset_confidence_threshold),
                 "max_stride": float(args.patch_offset_max_stride),
                 "max_sigma": args.patch_offset_max_sigma,
+                "max_consistency_residual_increase_px": args.patch_offset_max_consistency_residual_increase_px,
+                "max_consistency_residual_px": args.patch_offset_max_consistency_residual_px,
                 "free_oracle": bool(args.patch_offset_free_oracle),
                 "bound_metric": args.patch_offset_bound_metric,
                 "oracle_noise_px": float(args.patch_offset_oracle_noise_px),
+                "fixed_pose_refine": {
+                    "method": args.fixed_pose_refine_method,
+                    "robust_loss": args.robust_fixed_pose_loss,
+                    "robust_f_scale_px": float(args.robust_fixed_pose_f_scale_px),
+                    "robust_max_nfev": int(args.robust_fixed_pose_max_nfev),
+                    "weight_mode": args.robust_fixed_pose_weight_mode,
+                    "mean_fixed_refine_count": _offset_summary_mean(rows, "fixed_same_inlier_count"),
+                },
                 "lowlevel": {
                     "feature_mode": args.lowlevel_feature_mode,
                     "template_radius_px": int(args.lowlevel_template_radius_px),
@@ -1220,6 +1601,20 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     "snap_radius_stride": float(args.superpoint_snap_radius_stride),
                     "min_score": float(args.superpoint_min_score),
                     "snap_strategy": args.superpoint_snap_strategy,
+                    "availability_radii_px": [float(value) for value in superpoint_availability_radii],
+                    "oracle_max_distance_px": float(args.superpoint_oracle_max_distance_px),
+                },
+                "landmark_conditioned_keypoint_selector": {
+                    "candidate_radius_stride": float(args.lcks_candidate_radius_stride),
+                    "support_radius_px": float(args.lcks_support_radius_px),
+                    "min_query_score": float(args.lcks_min_query_score),
+                    "min_support_score": float(args.lcks_min_support_score),
+                    "descriptor_weight": float(args.lcks_descriptor_weight),
+                    "query_score_weight": float(args.lcks_query_score_weight),
+                    "center_penalty_weight": float(args.lcks_center_penalty_weight),
+                    "support_distance_penalty_weight": float(args.lcks_support_distance_penalty_weight),
+                    "score_threshold": float(args.lcks_score_threshold),
+                    "support_selection_strategy": args.lcks_support_selection_strategy,
                 },
                 "device": args.patch_offset_device or args.similarity_device,
                 "batch_size": int(args.patch_offset_batch_size),
@@ -1239,7 +1634,35 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 "mean_lowlevel_offset_px": _offset_summary_mean(rows, "mean_offset_px"),
                 "mean_lowlevel_score": _offset_summary_mean(rows, "mean_score"),
                 "mean_lowlevel_confidence": _offset_summary_mean(rows, "mean_confidence"),
+                "mean_learned_offset_px": _offset_summary_mean(rows, "mean_offset_px"),
+                "mean_learned_offset_confidence": _offset_summary_mean(rows, "mean_confidence"),
+                "mean_learned_offset_applied_confidence": _offset_summary_mean(rows, "mean_applied_confidence"),
+                "mean_rejected_by_consistency_count": _offset_summary_mean(rows, "rejected_by_consistency_count"),
+                "mean_offset_consistency_evaluated_count": _offset_summary_mean(rows, "consistency_evaluated_count"),
+                "mean_offset_consistency_before_px": _offset_summary_mean(rows, "mean_consistency_before_px"),
+                "mean_offset_consistency_after_px": _offset_summary_mean(rows, "mean_consistency_after_px"),
+                "mean_offset_consistency_increase_px": _offset_summary_mean(rows, "mean_consistency_increase_px"),
                 "mean_superpoint_keypoint_count": _offset_summary_mean(rows, "keypoint_count"),
+                "mean_superpoint_availability": {
+                    f"at_{int(radius) if float(radius).is_integer() else radius:g}px": _offset_summary_mean(
+                        rows,
+                        f"sp_availability_at_{int(radius) if float(radius).is_integer() else radius:g}px",
+                    )
+                    for radius in superpoint_availability_radii
+                },
+                "mean_nearest_sp_distance_px": _offset_summary_mean(rows, "nearest_sp_distance_px_mean"),
+                "median_nearest_sp_distance_px": _offset_summary_mean(rows, "nearest_sp_distance_px_median"),
+                "mean_gt_to_sp_distance_px": _offset_summary_mean(rows, "mean_gt_to_sp_distance_px"),
+                "mean_skipped_by_patch_positive_count": _offset_summary_mean(rows, "skipped_by_patch_positive_count"),
+                "mean_too_far_count": _offset_summary_mean(rows, "too_far_count"),
+                "mean_snap_error_to_gt_px": _offset_summary_mean(rows, "mean_snap_error_to_gt_px"),
+                "mean_snap_selection_accuracy_at_4px": _offset_summary_mean(rows, "snap_selection_accuracy_at_4px"),
+                "mean_snap_selection_accuracy_at_8px": _offset_summary_mean(rows, "snap_selection_accuracy_at_8px"),
+                "mean_sp_descriptor_top1_accuracy": _offset_summary_mean(rows, "sp_descriptor_top1_accuracy"),
+                "mean_sp_descriptor_top5_accuracy": _offset_summary_mean(rows, "sp_descriptor_top5_accuracy"),
+                "mean_support_availability_ratio": _offset_summary_mean(rows, "support_availability_ratio"),
+                "mean_support_observation_missing_count": _offset_summary_mean(rows, "support_observation_missing_count"),
+                "mean_support_keypoint_missing_count": _offset_summary_mean(rows, "support_keypoint_missing_count"),
             },
             "oracle_match_mode": args.oracle_match_mode,
             "oracle_max_positives_per_token": int(args.oracle_max_positives_per_token),
@@ -1481,6 +1904,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             ),
         },
         "pnp_success_rate": _mean([1.0 if row["pnp_success"] else 0.0 for row in rows]),
+        "success_10cm_5deg_all_queries": _mean([1.0 if row["success_10cm_5deg"] else 0.0 for row in rows]),
+        "success_25cm_10deg_all_queries": _mean([1.0 if row["success_25cm_10deg"] else 0.0 for row in rows]),
+        "success_50cm_10deg_all_queries": _mean([1.0 if row["success_50cm_10deg"] else 0.0 for row in rows]),
+        "success_1m_10deg_all_queries": _mean([1.0 if row["success_1m_10deg"] else 0.0 for row in rows]),
         "success_10cm_5deg": _mean([1.0 if row["success_10cm_5deg"] else 0.0 for row in labeled_rows]),
         "success_25cm_10deg": _mean([1.0 if row["success_25cm_10deg"] else 0.0 for row in labeled_rows]),
         "success_50cm_10deg": _mean([1.0 if row["success_50cm_10deg"] else 0.0 for row in labeled_rows]),
@@ -1500,7 +1927,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             "query_pose_file": args.query_pose_file,
             "candidate_bank": args.candidate_bank,
         },
-        "outputs": {"rows": str(output_jsonl), "matches": args.output_matches_jsonl},
+        "outputs": {
+            "rows": str(output_jsonl),
+            "matches": args.output_matches_jsonl,
+            "superpoint_candidates": args.output_superpoint_candidate_jsonl,
+        },
     }
     summary_json = Path(args.summary_json)
     summary_json.parent.mkdir(parents=True, exist_ok=True)

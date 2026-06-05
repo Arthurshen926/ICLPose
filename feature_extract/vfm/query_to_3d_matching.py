@@ -367,6 +367,14 @@ class QueryTo3DMatch:
     local_consistency_support: int | None = None
     local_consistency_score: float | None = None
     pnp_soft_score: float | None = None
+    patch_offset_confidence: float | None = None
+    patch_offset_sigma: float | None = None
+    patch_offset_applied: bool | None = None
+    patch_offset_norm_px: float | None = None
+    patch_offset_consistency_before_px: float | None = None
+    patch_offset_consistency_after_px: float | None = None
+    token_match_rank: int | None = None
+    measurement_sigma_px: float | None = None
 
 
 @dataclass(frozen=True)
@@ -1479,6 +1487,130 @@ def estimate_pose_pnp_fixed(
     pose = np.eye(4, dtype=np.float64)
     pose[:3, :3] = rotation.astype(np.float64)
     pose[:3, 3] = np.asarray(tvec, dtype=np.float64).reshape(3)
+    mask = np.zeros((len(matches),), dtype=bool)
+    mask[original_indices] = True
+    return PnPResult(
+        success=True,
+        pose_w2c=pose,
+        inlier_mask=mask,
+        match_count=len(matches),
+        inlier_count=int(mask.sum()),
+    )
+
+
+def estimate_pose_pnp_fixed_robust(
+    matches: Sequence[QueryTo3DMatch],
+    camera: ColmapCamera,
+    weights: np.ndarray | Sequence[float] | None = None,
+    min_inliers: int = 4,
+    initial_pose_w2c: np.ndarray | None = None,
+    pnp_method: str = "EPNP",
+    loss: str = "huber",
+    f_scale_px: float = 4.0,
+    max_nfev: int = 50,
+) -> PnPResult:
+    """Refine a fixed correspondence set with robust weighted reprojection LM.
+
+    The correspondence set is fixed: all unique tracks are kept in the returned
+    inlier mask. Weights only scale residuals inside the optimizer and never
+    remove matches.
+    """
+
+    if len(matches) < 4 or len(matches) < int(min_inliers):
+        return PnPResult(
+            success=False,
+            pose_w2c=None,
+            inlier_mask=np.zeros((len(matches),), dtype=bool),
+            match_count=len(matches),
+            inlier_count=0,
+        )
+    try:
+        import cv2
+        from scipy.optimize import least_squares
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError("OpenCV and SciPy are required for robust fixed PnP refinement") from exc
+
+    robust_loss = str(loss).lower()
+    if robust_loss not in {"linear", "soft_l1", "huber", "cauchy", "arctan"}:
+        raise ValueError(f"unsupported robust PnP loss: {loss}")
+    unique_matches, original_indices = deduplicate_pnp_matches(matches)
+    if len(unique_matches) < 4 or len(unique_matches) < int(min_inliers):
+        return PnPResult(
+            success=False,
+            pose_w2c=None,
+            inlier_mask=np.zeros((len(matches),), dtype=bool),
+            match_count=len(matches),
+            inlier_count=0,
+        )
+    object_points = np.stack([match.xyz for match in unique_matches], axis=0).astype(np.float64)
+    image_points = np.stack([match.xy for match in unique_matches], axis=0).astype(np.float64)
+    camera_matrix, distortion = camera_matrix_and_distortion(camera)
+    if initial_pose_w2c is None:
+        initial = estimate_pose_pnp_fixed(
+            matches,
+            camera,
+            min_inliers=min_inliers,
+            pnp_method=pnp_method,
+            refine_method="none",
+        )
+        if not initial.success or initial.pose_w2c is None:
+            return initial
+        pose0 = np.asarray(initial.pose_w2c, dtype=np.float64).reshape(4, 4)
+    else:
+        pose0 = np.asarray(initial_pose_w2c, dtype=np.float64).reshape(4, 4)
+    rvec0, _jacobian = cv2.Rodrigues(pose0[:3, :3])
+    tvec0 = pose0[:3, 3].reshape(3, 1)
+    params0 = np.concatenate([rvec0.reshape(3), tvec0.reshape(3)]).astype(np.float64)
+    if weights is None:
+        weight_values = np.ones((len(unique_matches),), dtype=np.float64)
+    else:
+        all_weights = np.asarray(weights, dtype=np.float64).reshape(-1)
+        if all_weights.shape[0] != len(matches):
+            raise ValueError("weights must have one value per input match")
+        weight_values = all_weights[np.asarray(original_indices, dtype=np.int64)]
+        weight_values = np.where(np.isfinite(weight_values), weight_values, 0.0)
+        weight_values = np.clip(weight_values, 0.0, None)
+        if float(np.sum(weight_values)) <= 1e-12:
+            weight_values = np.ones((len(unique_matches),), dtype=np.float64)
+    weight_values = weight_values / max(float(np.mean(weight_values)), 1e-12)
+    sqrt_weights = np.sqrt(weight_values).astype(np.float64)
+
+    def residuals(params: np.ndarray) -> np.ndarray:
+        rvec = np.asarray(params[:3], dtype=np.float64).reshape(3, 1)
+        tvec = np.asarray(params[3:6], dtype=np.float64).reshape(3, 1)
+        projected, _jacobian = cv2.projectPoints(object_points, rvec, tvec, camera_matrix, distortion)
+        errors = projected.reshape(-1, 2) - image_points
+        return (errors * sqrt_weights[:, None]).reshape(-1)
+
+    try:
+        result = least_squares(
+            residuals,
+            params0,
+            loss=robust_loss,
+            f_scale=max(float(f_scale_px), 1e-6),
+            max_nfev=int(max_nfev),
+            method="trf",
+        )
+    except Exception:
+        return PnPResult(
+            success=False,
+            pose_w2c=None,
+            inlier_mask=np.zeros((len(matches),), dtype=bool),
+            match_count=len(matches),
+            inlier_count=0,
+        )
+    if not bool(result.success) or not np.all(np.isfinite(result.x)):
+        return PnPResult(
+            success=False,
+            pose_w2c=None,
+            inlier_mask=np.zeros((len(matches),), dtype=bool),
+            match_count=len(matches),
+            inlier_count=0,
+        )
+    rotation, _jacobian = cv2.Rodrigues(np.asarray(result.x[:3], dtype=np.float64).reshape(3, 1))
+    pose = np.eye(4, dtype=np.float64)
+    pose[:3, :3] = rotation.astype(np.float64)
+    pose[:3, 3] = np.asarray(result.x[3:6], dtype=np.float64).reshape(3)
     mask = np.zeros((len(matches),), dtype=bool)
     mask[original_indices] = True
     return PnPResult(

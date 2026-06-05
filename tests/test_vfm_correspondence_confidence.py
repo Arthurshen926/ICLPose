@@ -2,11 +2,15 @@ import numpy as np
 
 from feature_extract.vfm.correspondence_confidence import (
     CalibratedLogisticConfidence,
+    CalibratedMatchCandidateScorer,
+    annotate_matches_with_calibrated_confidence,
     confidence_metrics,
     label_match_row,
     select_confident_matches_coverage_preserving,
+    vectorize_match_row_features,
     vectorize_match_rows,
 )
+from feature_extract.vfm.query_to_3d_matching import QueryTo3DMatch
 
 
 def test_label_match_row_separates_positive_negative_and_ambiguous_zone() -> None:
@@ -61,6 +65,131 @@ def test_vectorize_and_train_logistic_confidence_on_observable_features() -> Non
     assert "similarity" in names
     assert scores[0] > scores[2]
     assert scores[1] > scores[3]
+
+
+def test_vectorize_feature_rows_without_labels_for_inference() -> None:
+    rows = [
+        {"similarity": 0.9, "similarity_margin": 0.1, "match_rank": 0},
+        {"similarity": 0.4, "similarity_margin": 0.0, "match_rank": 4},
+    ]
+
+    matrix, names = vectorize_match_row_features(rows, feature_set="descriptor")
+
+    assert matrix.shape == (2, 4)
+    assert names == ["similarity", "similarity_margin", "rank_score", "mnn_flag"]
+    assert matrix[0, 0] > matrix[1, 0]
+
+
+def test_annotate_matches_with_calibrated_confidence_returns_new_matches() -> None:
+    model = CalibratedLogisticConfidence()
+    model.mean_ = np.zeros((4,), dtype=np.float64)
+    model.scale_ = np.ones((4,), dtype=np.float64)
+    model.weights_ = np.asarray([8.0, 0.0, 0.0, 0.0], dtype=np.float64)
+    model.bias_ = -4.0
+    matches = [
+        QueryTo3DMatch(
+            token_index=0,
+            xy=np.asarray([10.0, 10.0], dtype=np.float64),
+            track_id=1,
+            xyz=np.asarray([0.0, 0.0, 5.0], dtype=np.float64),
+            similarity=0.9,
+            ratio=0.0,
+            landmark_variance=0.1,
+            source="sparse_patch",
+        ),
+        QueryTo3DMatch(
+            token_index=1,
+            xy=np.asarray([20.0, 10.0], dtype=np.float64),
+            track_id=2,
+            xyz=np.asarray([1.0, 0.0, 5.0], dtype=np.float64),
+            similarity=0.2,
+            ratio=0.0,
+            landmark_variance=0.1,
+            source="sparse_patch",
+        ),
+    ]
+
+    annotated = annotate_matches_with_calibrated_confidence(matches, model, feature_set="descriptor")
+
+    assert matches[0].pairwise_inlier_logit is None
+    assert annotated[0].track_id == 1
+    assert annotated[0].pairwise_inlier_logit is not None
+    assert annotated[1].pairwise_inlier_logit is not None
+    assert annotated[0].pairwise_inlier_logit > annotated[1].pairwise_inlier_logit
+    assert annotated[0].pairwise_inlier_logprob > annotated[1].pairwise_inlier_logprob
+
+
+def test_calibrated_match_candidate_scorer_is_callable_for_matcher_topk() -> None:
+    model = CalibratedLogisticConfidence()
+    model.mean_ = np.zeros((4,), dtype=np.float64)
+    model.scale_ = np.ones((4,), dtype=np.float64)
+    model.weights_ = np.asarray([8.0, 0.0, 0.0, 0.0], dtype=np.float64)
+    model.bias_ = -4.0
+    matches = [
+        QueryTo3DMatch(
+            token_index=0,
+            xy=np.asarray([10.0, 10.0], dtype=np.float64),
+            track_id=1,
+            xyz=np.asarray([0.0, 0.0, 5.0], dtype=np.float64),
+            similarity=0.9,
+            ratio=0.0,
+            landmark_variance=0.1,
+            source="sparse_patch",
+        ),
+        QueryTo3DMatch(
+            token_index=0,
+            xy=np.asarray([10.0, 10.0], dtype=np.float64),
+            track_id=2,
+            xyz=np.asarray([1.0, 0.0, 5.0], dtype=np.float64),
+            similarity=0.2,
+            ratio=0.0,
+            landmark_variance=0.1,
+            source="sparse_patch",
+        ),
+    ]
+
+    scorer = CalibratedMatchCandidateScorer(model=model, feature_set="descriptor")
+    rescored = scorer(matches)
+
+    assert len(rescored) == 2
+    assert rescored[0].pairwise_inlier_logit is not None
+    assert rescored[0].pairwise_inlier_logit > rescored[1].pairwise_inlier_logit
+
+
+def test_calibrated_match_candidate_scorer_uses_token_match_rank() -> None:
+    model = CalibratedLogisticConfidence()
+    model.mean_ = np.zeros((4,), dtype=np.float64)
+    model.scale_ = np.ones((4,), dtype=np.float64)
+    model.weights_ = np.asarray([0.0, 0.0, 4.0, 0.0], dtype=np.float64)
+    model.bias_ = 0.0
+    matches = [
+        QueryTo3DMatch(
+            token_index=0,
+            xy=np.asarray([10.0, 10.0], dtype=np.float64),
+            track_id=1,
+            xyz=np.asarray([0.0, 0.0, 5.0], dtype=np.float64),
+            similarity=0.8,
+            ratio=0.0,
+            landmark_variance=0.1,
+            source="sparse_patch",
+            token_match_rank=0,
+        ),
+        QueryTo3DMatch(
+            token_index=0,
+            xy=np.asarray([10.0, 10.0], dtype=np.float64),
+            track_id=2,
+            xyz=np.asarray([1.0, 0.0, 5.0], dtype=np.float64),
+            similarity=0.8,
+            ratio=0.0,
+            landmark_variance=0.1,
+            source="sparse_patch",
+            token_match_rank=4,
+        ),
+    ]
+
+    rescored = CalibratedMatchCandidateScorer(model=model, feature_set="descriptor")(matches)
+
+    assert rescored[0].pairwise_inlier_logit > rescored[1].pairwise_inlier_logit
 
 
 def test_coverage_preserving_selection_keeps_high_confidence_per_grid_cell() -> None:

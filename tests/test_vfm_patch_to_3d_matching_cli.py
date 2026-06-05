@@ -4,9 +4,10 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from feature_extract.tools.vfm.eval_patch_to_3d_vfm_matching import _fixed_pose_refinement_weights
 from feature_extract.tools.vfm.eval_patch_to_3d_vfm_matching import main
 from feature_extract.vfm.map_lifting import SelectedTrackFeatureBank, TrackFeature, save_selected_track_bank_npz
-from feature_extract.vfm.query_to_3d_matching import token_grid_xy
+from feature_extract.vfm.query_to_3d_matching import QueryTo3DMatch, token_grid_xy
 from feature_extract.vfm.tokens import TokenBankManifest, TokenBankRecord, TokenLayerSpec
 
 
@@ -138,6 +139,12 @@ def test_eval_patch_to_3d_cli_reports_patch_metrics(tmp_path: Path) -> None:
             "0.0",
             "--pnp_threshold_stride_multiplier",
             "1.5",
+            "--patch_offset_mode",
+            "fixed_same_inlier",
+            "--fixed_pose_refine_method",
+            "robust_lm",
+            "--robust_fixed_pose_weight_mode",
+            "uniform",
             "--output_jsonl",
             str(rows_path),
             "--output_matches_jsonl",
@@ -159,6 +166,9 @@ def test_eval_patch_to_3d_cli_reports_patch_metrics(tmp_path: Path) -> None:
     assert summary["pnp_solve_rate"] == 0.0
     assert summary["matching_config"]["landmark_quality"]["enabled"] is True
     assert summary["matching_config"]["landmark_quality"]["track_weight"] == 1.0
+    assert summary["matching_config"]["patch_offset_refinement"]["mode"] == "fixed_same_inlier"
+    assert summary["matching_config"]["patch_offset_refinement"]["fixed_pose_refine"]["method"] == "robust_lm"
+    assert summary["matching_config"]["patch_offset_refinement"]["fixed_pose_refine"]["weight_mode"] == "uniform"
     assert summary["mean_pnp_inlier_count"] == 0.0
     assert summary["mean_pnp_inlier_ratio"] == 0.0
     assert summary["elapsed_sec"] >= 0.0
@@ -184,6 +194,76 @@ def test_eval_patch_to_3d_cli_reports_patch_metrics(tmp_path: Path) -> None:
     assert matches[0]["hard_negative_label"] is False
     assert matches[0]["baseline_reproj_residual_px"] is None
     assert matches[0]["xyz"] == xyz.tolist()
+
+
+def test_offset_confidence_fixed_pose_weights_downweight_uncertain_offsets() -> None:
+    confident = QueryTo3DMatch(
+        token_index=0,
+        xy=np.asarray([10.0, 10.0], dtype=np.float64),
+        track_id=1,
+        xyz=np.asarray([0.0, 0.0, 4.0], dtype=np.float64),
+        similarity=0.9,
+        ratio=0.0,
+        landmark_variance=0.0,
+        patch_offset_confidence=0.95,
+        patch_offset_sigma=0.25,
+        patch_offset_applied=True,
+    )
+    uncertain = QueryTo3DMatch(
+        token_index=1,
+        xy=np.asarray([20.0, 20.0], dtype=np.float64),
+        track_id=2,
+        xyz=np.asarray([0.2, 0.2, 5.0], dtype=np.float64),
+        similarity=0.9,
+        ratio=0.0,
+        landmark_variance=0.0,
+        patch_offset_confidence=0.15,
+        patch_offset_sigma=2.0,
+        patch_offset_applied=False,
+    )
+
+    weights = _fixed_pose_refinement_weights([confident, uncertain], "offset_confidence")
+
+    assert weights is not None
+    assert weights[0] > weights[1]
+    assert weights[1] >= 0.05
+
+
+def test_offset_consistency_fixed_pose_weights_downweight_regressed_offsets() -> None:
+    improved = QueryTo3DMatch(
+        token_index=0,
+        xy=np.asarray([10.0, 10.0], dtype=np.float64),
+        track_id=1,
+        xyz=np.asarray([0.0, 0.0, 4.0], dtype=np.float64),
+        similarity=0.9,
+        ratio=0.0,
+        landmark_variance=0.0,
+        patch_offset_confidence=0.8,
+        patch_offset_sigma=0.5,
+        patch_offset_applied=True,
+        patch_offset_consistency_before_px=4.0,
+        patch_offset_consistency_after_px=1.0,
+    )
+    regressed = QueryTo3DMatch(
+        token_index=1,
+        xy=np.asarray([20.0, 20.0], dtype=np.float64),
+        track_id=2,
+        xyz=np.asarray([0.2, 0.2, 5.0], dtype=np.float64),
+        similarity=0.9,
+        ratio=0.0,
+        landmark_variance=0.0,
+        patch_offset_confidence=0.8,
+        patch_offset_sigma=0.5,
+        patch_offset_applied=True,
+        patch_offset_consistency_before_px=1.0,
+        patch_offset_consistency_after_px=5.0,
+    )
+
+    weights = _fixed_pose_refinement_weights([improved, regressed], "offset_consistency_composite")
+
+    assert weights is not None
+    assert weights[0] > weights[1]
+    assert weights[1] >= 0.05
 
 
 def test_eval_patch_to_3d_cli_requires_candidate_bank_for_reference_visibility(tmp_path: Path) -> None:

@@ -10,12 +10,17 @@ import numpy as np
 
 from feature_extract.vfm.cambridge_pose_lattice import parse_cambridge_pose_file
 from feature_extract.vfm.colmap_tracks import ColmapCamera, read_colmap_cameras_binary, read_colmap_images_binary
+from feature_extract.vfm.dense_gaussian_field_diagnostics import (
+    encode_feature_map_with_selector,
+    gaussian_field_coverage_stats,
+)
 from feature_extract.vfm.gaussian_vfm_field import (
     GaussianVFMFeatureView,
     GaussianVFMRayContributionConfig,
     aggregate_ray_contributed_gaussian_vfm_features,
     load_gaussian_vfm_source_from_ply,
 )
+from feature_extract.vfm.patch_selector_training import load_safe_patch_selector_checkpoint
 from feature_extract.vfm.tokens import TokenBankManifest
 
 
@@ -59,6 +64,9 @@ def main() -> None:
     parser.add_argument("--reference_pose_file", required=True)
     parser.add_argument("--camera_model_dir", default="")
     parser.add_argument("--layer_name", default="radio_final")
+    parser.add_argument("--selector_checkpoint", default="")
+    parser.add_argument("--selector_device", default="cpu")
+    parser.add_argument("--selector_batch_size", type=int, default=65536)
     parser.add_argument("--max_views", type=int, default=16)
     parser.add_argument("--view_selection", default="prefix", choices=("prefix", "uniform"))
     parser.add_argument("--max_gaussians", type=int, default=0)
@@ -78,6 +86,9 @@ def main() -> None:
     pose_by_image = {record.image_id: record for record in parse_cambridge_pose_file(Path(args.reference_pose_file))}
     camera_by_image = _load_camera_by_image(args.camera_model_dir)
     fallback_camera = _parse_default_camera(args.default_camera)
+    selector = None
+    if args.selector_checkpoint:
+        selector = load_safe_patch_selector_checkpoint(Path(args.selector_checkpoint), device=args.selector_device)
     views: list[GaussianVFMFeatureView] = []
     records = list(manifest.records)
     if args.max_views > 0 and args.view_selection == "uniform" and len(records) > args.max_views:
@@ -88,10 +99,18 @@ def main() -> None:
             break
         if record.image_id not in pose_by_image:
             continue
+        feature_map = _load_feature(record.token_path, args.layer_name)
+        if selector is not None:
+            feature_map = encode_feature_map_with_selector(
+                feature_map,
+                selector,
+                device=args.selector_device,
+                batch_size=int(args.selector_batch_size),
+            )
         views.append(
             GaussianVFMFeatureView(
                 image_id=record.image_id,
-                feature_map=_load_feature(record.token_path, args.layer_name),
+                feature_map=feature_map,
                 pose_w2c=pose_by_image[record.image_id].pose_w2c,
                 camera=camera_by_image.get(record.image_id, fallback_camera),
             )
@@ -111,13 +130,9 @@ def main() -> None:
     field.save_npz(Path(args.output))
     summary = {
         "stage": "ray_contributed_gaussian_vfm_field",
-        "source_gaussian_count": int(source.xyz.shape[0]),
-        "feature_bearing_gaussian_count": int(len(field)),
+        **gaussian_field_coverage_stats(source, field),
         "coverage_fraction": 0.0 if source.xyz.shape[0] == 0 else float(len(field) / source.xyz.shape[0]),
-        "feature_dim": int(field.feature_dim),
         "view_count": int(len(views)),
-        "mean_samples": 0.0 if len(field) == 0 else float(np.mean(field.support_counts)),
-        "mean_pixel_distance": 0.0 if len(field) == 0 else float(np.mean(field.mean_distances)),
         "config": config.to_dict(),
         "inputs": {
             "gaussian_ply": args.gaussian_ply,
@@ -125,6 +140,7 @@ def main() -> None:
             "reference_pose_file": args.reference_pose_file,
             "camera_model_dir": args.camera_model_dir,
             "layer_name": args.layer_name,
+            "selector_checkpoint": args.selector_checkpoint,
             "view_selection": args.view_selection,
         },
         "outputs": {"field": str(args.output)},

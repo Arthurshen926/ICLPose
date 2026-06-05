@@ -13,6 +13,7 @@ from feature_extract.vfm.gaussian_vfm_field import (
     aggregate_ray_contributed_gaussian_vfm_features,
     associate_landmarks_to_gaussians,
     export_gaussian_vfm_field_to_ply,
+    load_gaussian_vfm_source_from_ply,
     load_gaussian_rgb_source_from_ply,
     merge_gaussian_vfm_fields,
     render_gaussian_rgb_image_soft,
@@ -152,6 +153,71 @@ def _write_minimal_gaussian_ply(path):
     rows["scale_0"] = rows["scale_1"] = rows["scale_2"] = -2.0
     rows["rot_0"] = 1.0
     PlyData([PlyElement.describe(rows, "vertex")]).write(path)
+
+
+def test_load_gaussian_vfm_source_preserves_anisotropic_geometry(tmp_path):
+    source_ply = tmp_path / "anisotropic_gaussians.ply"
+    dtype = [
+        ("x", "f4"),
+        ("y", "f4"),
+        ("z", "f4"),
+        ("opacity", "f4"),
+        ("scale_0", "f4"),
+        ("scale_1", "f4"),
+        ("scale_2", "f4"),
+        ("rot_0", "f4"),
+        ("rot_1", "f4"),
+        ("rot_2", "f4"),
+        ("rot_3", "f4"),
+    ]
+    rows = np.zeros((1,), dtype=dtype)
+    rows["z"] = [1.0]
+    rows["opacity"] = [0.0]
+    rows["scale_0"] = [np.log(0.05)]
+    rows["scale_1"] = [np.log(0.20)]
+    rows["scale_2"] = [np.log(0.40)]
+    rows["rot_0"] = [1.0]
+    PlyData([PlyElement.describe(rows, "vertex")]).write(source_ply)
+
+    source = load_gaussian_vfm_source_from_ply(source_ply)
+
+    assert source.scale_xyz.shape == (1, 3)
+    np.testing.assert_allclose(source.scale_xyz[0], np.asarray([0.05, 0.20, 0.40], dtype=np.float32), rtol=1e-6)
+    assert source.rotation is not None
+    assert source.rotation.shape == (1, 4)
+    np.testing.assert_allclose(source.rotation[0], np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float32))
+    assert source.normal is not None
+    assert source.normal.shape == (1, 3)
+    np.testing.assert_allclose(np.abs(source.normal[0]), np.asarray([1.0, 0.0, 0.0], dtype=np.float32), atol=1e-6)
+
+
+def test_load_gaussian_vfm_source_handles_2dgs_two_scale_geometry(tmp_path):
+    source_ply = tmp_path / "twodgs_gaussians.ply"
+    dtype = [
+        ("x", "f4"),
+        ("y", "f4"),
+        ("z", "f4"),
+        ("opacity", "f4"),
+        ("scale_0", "f4"),
+        ("scale_1", "f4"),
+        ("rot_0", "f4"),
+        ("rot_1", "f4"),
+        ("rot_2", "f4"),
+        ("rot_3", "f4"),
+    ]
+    rows = np.zeros((1,), dtype=dtype)
+    rows["z"] = [1.0]
+    rows["scale_0"] = [np.log(0.05)]
+    rows["scale_1"] = [np.log(0.20)]
+    rows["rot_0"] = [1.0]
+    PlyData([PlyElement.describe(rows, "vertex")]).write(source_ply)
+
+    source = load_gaussian_vfm_source_from_ply(source_ply)
+
+    assert source.scale_xyz.shape == (1, 3)
+    np.testing.assert_allclose(source.scale_xyz[0], np.asarray([0.05, 0.20, 0.05], dtype=np.float32), rtol=1e-6)
+    assert source.normal is not None
+    np.testing.assert_allclose(np.abs(source.normal[0]), np.asarray([0.0, 0.0, 1.0], dtype=np.float32), atol=1e-6)
 
 
 def test_export_gaussian_vfm_field_to_ply_preserves_gaussian_rows_and_writes_loc_features(tmp_path):

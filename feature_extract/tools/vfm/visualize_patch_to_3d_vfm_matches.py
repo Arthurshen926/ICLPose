@@ -41,6 +41,7 @@ from feature_extract.vfm.query_to_3d_matching import (
     pnp_pose_error,
     with_landmark_ambiguity_scores,
 )
+from feature_extract.vfm.semidense_anchor_map import SemiDenseAnchorMap
 
 
 def _matching_config_dict(config: PatchTo3DMatchingConfig) -> dict[str, object]:
@@ -109,8 +110,9 @@ def _quality_enabled(args: argparse.Namespace) -> bool:
 def main(argv: Optional[Sequence[str]] = None) -> None:
     parser = argparse.ArgumentParser(description="Visualize patch-level query VFM token to sparse 3D landmark matches")
     parser.add_argument("--query_manifest", required=True)
-    parser.add_argument("--landmark_bank", required=True)
-    parser.add_argument("--track_observations", required=True)
+    parser.add_argument("--landmark_bank", default="")
+    parser.add_argument("--semidense_anchor_npz", default="")
+    parser.add_argument("--track_observations", default="")
     parser.add_argument("--visibility_index", default="")
     parser.add_argument("--query_pose_file", required=True)
     parser.add_argument("--candidate_bank", default="")
@@ -146,6 +148,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     parser.add_argument("--quality_ambiguity_weight", type=float, default=0.5)
     parser.add_argument("--quality_ambiguity_reference_size", type=int, default=4096)
     parser.add_argument("--max_matches", type=int, default=1000)
+    parser.add_argument("--deduplicate_track_matches", action="store_true")
     parser.add_argument("--match_block_size", type=int, default=256)
     parser.add_argument("--patch_scale", type=float, default=1.0)
     parser.add_argument("--patch_at_k", type=int, default=5)
@@ -163,9 +166,19 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     if missing_queries:
         raise ValueError(f"query_id not found in manifest: {missing_queries}")
     gt_by_query = {record.image_id: record for record in parse_cambridge_pose_file(Path(args.query_pose_file))}
-    bank = load_selected_track_bank_npz(Path(args.landmark_bank))
-    xyz_by_track, reprojection_error_by_track = _load_track_stats(Path(args.track_observations))
-    landmark_index = LandmarkMapIndex.from_track_bank(bank, xyz_by_track, reprojection_error_by_track)
+    if not args.landmark_bank and not args.semidense_anchor_npz:
+        raise ValueError("either --landmark_bank or --semidense_anchor_npz is required")
+    if args.semidense_anchor_npz:
+        semidense_map = SemiDenseAnchorMap.load_npz(Path(args.semidense_anchor_npz))
+        landmark_index = semidense_map.to_landmark_index()
+        map_source = "semidense_anchor_npz"
+    else:
+        if not args.track_observations:
+            raise ValueError("--track_observations is required when loading --landmark_bank")
+        bank = load_selected_track_bank_npz(Path(args.landmark_bank))
+        xyz_by_track, reprojection_error_by_track = _load_track_stats(Path(args.track_observations))
+        landmark_index = LandmarkMapIndex.from_track_bank(bank, xyz_by_track, reprojection_error_by_track)
+        map_source = "landmark_bank"
     if _quality_enabled(args):
         landmark_index = with_landmark_ambiguity_scores(
             landmark_index,
@@ -194,6 +207,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         query_token_step=args.query_token_step,
         max_matches=args.max_matches,
         block_size=args.match_block_size,
+        deduplicate_track_matches=bool(args.deduplicate_track_matches),
         landmark_quality=LandmarkQualityConfig(
             enabled=bool(args.enable_landmark_quality),
             track_weight=args.quality_track_weight,
@@ -308,6 +322,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         _write_image_rgb(projection_feature_path, projection_feature)
         item = {
             "query_id": query_id,
+            "map_source": map_source,
             "overlay_png": str(overlay_path),
             "projection_rgb_png": str(projection_rgb_path),
             "projection_feature_png": str(projection_feature_path),
@@ -334,6 +349,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         json.dumps(
             {
                 "stage": "patch_to_3d_vfm_match_visualization",
+                "map_source": map_source,
                 "query_count": len(summaries),
                 "queries": summaries,
                 "matching_config": {

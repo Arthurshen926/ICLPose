@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from dataclasses import replace
 from collections.abc import Mapping, Sequence
 import json
 import math
@@ -10,6 +11,8 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+from feature_extract.vfm.query_to_3d_matching import QueryTo3DMatch
 
 
 @dataclass(frozen=True)
@@ -119,18 +122,29 @@ def vectorize_match_rows(
     stride_positive: float = 1.0,
     weak_positive_stride: float = 2.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str]]:
-    specs = _feature_specs(feature_set)
-    matrix = np.zeros((len(rows), len(specs)), dtype=np.float32)
+    matrix, names = vectorize_match_row_features(rows, feature_set=feature_set)
     labels = np.zeros((len(rows),), dtype=np.int64)
     keep = np.zeros((len(rows),), dtype=bool)
     for row_idx, row in enumerate(rows):
-        for col_idx, (_name, getter) in enumerate(specs):
-            matrix[row_idx, col_idx] = float(getter(row))
         label = label_match_row(row, stride_positive=stride_positive, weak_positive_stride=weak_positive_stride)
         labels[row_idx] = int(label.target)
         keep[row_idx] = not bool(label.ignore)
-    names = [name for name, _getter in specs]
     return matrix, labels, keep, names
+
+
+def vectorize_match_row_features(
+    rows: Sequence[Mapping[str, Any]],
+    feature_set: str = "full",
+) -> tuple[np.ndarray, list[str]]:
+    """Vectorize observable match fields for inference without GT labels."""
+
+    specs = _feature_specs(feature_set)
+    matrix = np.zeros((len(rows), len(specs)), dtype=np.float32)
+    for row_idx, row in enumerate(rows):
+        for col_idx, (_name, getter) in enumerate(specs):
+            matrix[row_idx, col_idx] = float(getter(row))
+    names = [name for name, _getter in specs]
+    return matrix, names
 
 
 def _sigmoid(values: np.ndarray) -> np.ndarray:
@@ -212,6 +226,67 @@ class CalibratedLogisticConfidence:
     @classmethod
     def load_json(cls, path: str | Path) -> "CalibratedLogisticConfidence":
         return cls.from_json_dict(json.loads(Path(path).read_text()))
+
+
+def _match_to_confidence_row(match: QueryTo3DMatch) -> dict[str, Any]:
+    return {
+        "similarity": float(match.similarity),
+        "similarity_margin": match.similarity_margin,
+        "token_match_rank": match.token_match_rank,
+        "source": match.source,
+        "observation_count": match.observation_count,
+        "visibility_count": match.visibility_count,
+        "landmark_variance": match.landmark_variance,
+        "landmark_reprojection_error": match.landmark_reprojection_error,
+        "landmark_ambiguity": match.landmark_ambiguity,
+        "landmark_quality": match.landmark_quality,
+        "map_reliability": match.map_reliability,
+        "xy": match.xy,
+        "distance_to_boundary_px": match.distance_to_boundary_px,
+        "local_consistency_support": match.local_consistency_support,
+        "local_consistency_score": match.local_consistency_score,
+    }
+
+
+def _probability_to_logit(probabilities: np.ndarray) -> np.ndarray:
+    values = np.clip(np.asarray(probabilities, dtype=np.float64), 1e-6, 1.0 - 1e-6)
+    return np.log(values / (1.0 - values))
+
+
+def annotate_matches_with_calibrated_confidence(
+    matches: Sequence[QueryTo3DMatch],
+    model: CalibratedLogisticConfidence,
+    feature_set: str = "descriptor_map",
+) -> list[QueryTo3DMatch]:
+    """Attach calibrated correspondence confidence without mutating the input matches."""
+
+    values = list(matches)
+    if not values:
+        return []
+    rows = [_match_to_confidence_row(match) for match in values]
+    features, _names = vectorize_match_row_features(rows, feature_set=feature_set)
+    probabilities = model.predict_proba(features)
+    logits = _probability_to_logit(probabilities)
+    logprobs = np.log(np.clip(probabilities, 1e-12, 1.0))
+    return [
+        replace(
+            match,
+            pairwise_inlier_logit=float(logit),
+            pairwise_inlier_logprob=float(logprob),
+        )
+        for match, logit, logprob in zip(values, logits, logprobs)
+    ]
+
+
+@dataclass(frozen=True)
+class CalibratedMatchCandidateScorer:
+    """Callable adapter used by patch matching to score candidates before top-k selection."""
+
+    model: CalibratedLogisticConfidence
+    feature_set: str = "descriptor_map"
+
+    def __call__(self, matches: Sequence[QueryTo3DMatch]) -> list[QueryTo3DMatch]:
+        return annotate_matches_with_calibrated_confidence(matches, self.model, feature_set=self.feature_set)
 
 
 def _binary_auroc(labels: np.ndarray, scores: np.ndarray) -> float | None:

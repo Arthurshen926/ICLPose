@@ -3644,3 +3644,689 @@ Visual diagnostics:
 
 - `output/vfm/stage_c27_superpoint_offset/visualizations/superpoint_snap_pose_metrics.png`
 - `output/vfm/stage_c27_superpoint_offset/visualizations/superpoint_snap_usage_histograms.png`
+
+## Stage C2.7 SuperPoint Oracle Diagnostics
+
+Artifacts:
+
+- report:
+  `output/vfm/stage_c27_superpoint_oracle/superpoint_oracle_diagnostics_summary.md`
+- evaluator modes:
+  - `--patch_offset_mode superpoint_gt_oracle_same_inlier_fixed`
+  - `--patch_offset_mode superpoint_gt_oracle_patch_positive_same_inlier_fixed`
+
+Goal:
+
+Before tuning SuperPoint snapping further, check the actual upper bounds:
+whether SuperPoint keypoints exist near the true projection, whether perfect
+keypoint choice can improve pose, and whether restricting to patch-positive
+matches is enough.
+
+Availability around GT projection for first-pass PnP inliers:
+
+| scene | SP@2px | SP@4px | SP@8px | SP@12px | SP@16px | mean nearest SP dist |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| OldHospital | 0.048 | 0.185 | 0.567 | 0.829 | 0.935 | 8.12px |
+| ShopFacade | 0.051 | 0.208 | 0.629 | 0.854 | 0.936 | 7.69px |
+
+Fixed-inlier oracle localization:
+
+| scene | method | S@10 | S@25 | S@50 | median t | median r |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| OldHospital | C2.5 patch center | 0.088 | 0.412 | 0.720 | 0.295m | 0.559deg |
+| OldHospital | SP nearest-to-GT oracle | 0.582 | 0.896 | 0.989 | 0.086m | 0.144deg |
+| OldHospital | SP patch-positive oracle | 0.154 | 0.478 | 0.753 | 0.269m | 0.460deg |
+| ShopFacade | C2.5 patch center | 0.524 | 0.864 | 0.922 | 0.096m | 0.409deg |
+| ShopFacade | SP nearest-to-GT oracle | 0.903 | 0.981 | 1.000 | 0.027m | 0.110deg |
+| ShopFacade | SP patch-positive oracle | 0.612 | 0.864 | 0.932 | 0.084m | 0.357deg |
+
+Conclusion:
+
+- SuperPoint keypoints are rarely within 2-4 px but usually available within
+  12-16 px; they are patch-level useful, not pixel-perfect by default.
+- The all-inlier nearest-to-GT oracle is very strong, so SuperPoint keypoints
+  themselves are not the bottleneck.
+- The patch-positive-only oracle gives realistic positive signal, especially
+  OldHospital S@25 0.412 -> 0.478 and ShopFacade S@10 0.524 -> 0.612.
+- Therefore the missing piece is keypoint selection / match reliability
+  conditioning, not more unconditioned SuperPoint parameter tuning.
+
+Visual diagnostics:
+
+- `output/vfm/stage_c27_superpoint_oracle/visualizations/superpoint_availability_curve.png`
+- `output/vfm/stage_c27_superpoint_oracle/visualizations/oldhospital_superpoint_oracle_pose_metrics.png`
+- `output/vfm/stage_c27_superpoint_oracle/visualizations/shopfacade_superpoint_oracle_pose_metrics.png`
+
+## Stage C2.7 Landmark-Conditioned SuperPoint Keypoint Selection
+
+Artifacts:
+
+- report:
+  `output/vfm/stage_c27_lcks/lcks_summary.md`
+- implementation:
+  `feature_extract/vfm/lowlevel_offset_sidecar.py`
+- evaluator mode:
+  `--patch_offset_mode landmark_conditioned_superpoint_same_inlier_fixed`
+
+Goal:
+
+Move from unconditional query-side SuperPoint snapping to landmark-conditioned
+keypoint selection. The first-pass VFM patch-to-3D match identity and RANSAC
+inlier set remain fixed; SuperPoint is used only to choose a more precise 2D
+measurement for those fixed inliers.
+
+Implemented:
+
+- HLoc SuperPoint descriptors are now exposed by the local detector wrapper.
+- Each 3D landmark first selects a support observation, then binds that support
+  observation to a nearby support-view SuperPoint keypoint.
+- Query SuperPoint candidates inside the patch radius are ranked by support
+  descriptor cosine, query keypoint score, patch-center distance, and support
+  binding distance.
+- The evaluator reports support availability, applied ratio, snapped-keypoint
+  GT error, snap@4/8px, and support/query SuperPoint descriptor top-k accuracy.
+
+Full localization:
+
+| scene | method | S@10 | S@25 | S@50 | median t | median r | inlier P@1 | refined | applied |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| OldHospital | C2.5 patch center | 0.088 | 0.412 | 0.720 | 0.295m | 0.559deg | 0.676 | - | - |
+| OldHospital | learned offset fixed | 0.099 | 0.434 | 0.747 | 0.283m | - | 0.676 | 395.6 | 0.879 |
+| OldHospital | LCKS r0.5 thr0.2 | 0.082 | 0.412 | 0.720 | 0.296m | 0.556deg | 0.676 | 12.8 | 0.029 |
+| OldHospital | LCKS r0.5 thr0.0 | 0.082 | 0.418 | 0.714 | 0.301m | 0.566deg | 0.676 | 59.4 | 0.137 |
+| OldHospital | SP patch-positive oracle | 0.154 | 0.478 | 0.753 | 0.269m | 0.460deg | - | - | - |
+| OldHospital | SP nearest-GT oracle | 0.582 | 0.896 | 0.989 | 0.086m | 0.144deg | - | - | - |
+| ShopFacade | C2.5 patch center | 0.524 | 0.864 | 0.922 | 0.096m | 0.409deg | 0.604 | - | - |
+| ShopFacade | learned offset fixed | 0.544 | 0.864 | 0.932 | 0.094m | - | 0.604 | 246.3 | 0.853 |
+| ShopFacade | LCKS r0.5 thr0.2 | 0.524 | 0.854 | 0.922 | 0.097m | 0.405deg | 0.604 | 8.6 | 0.033 |
+| ShopFacade | LCKS r0.5 thr0.0 | 0.515 | 0.864 | 0.922 | 0.098m | 0.400deg | 0.604 | 43.9 | 0.155 |
+| ShopFacade | SP patch-positive oracle | 0.612 | 0.864 | 0.932 | 0.084m | 0.357deg | - | - | - |
+| ShopFacade | SP nearest-GT oracle | 0.903 | 0.981 | 1.000 | 0.027m | 0.110deg | - | - | - |
+
+Selection diagnostics:
+
+| scene | method | support avail | snap@4 | snap@8 | snap err | SP desc top1 | SP desc top5 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| OldHospital | LCKS r0.5 thr0.2 | 0.813 | 0.169 | 0.514 | 8.76px | 0.849 | 1.000 |
+| OldHospital | LCKS r0.5 thr0.0 | 0.813 | 0.171 | 0.508 | 8.60px | 0.849 | 1.000 |
+| ShopFacade | LCKS r0.5 thr0.2 | 0.743 | 0.153 | 0.484 | 8.97px | 0.808 | 1.000 |
+| ShopFacade | LCKS r0.5 thr0.0 | 0.743 | 0.159 | 0.464 | 8.98px | 0.808 | 1.000 |
+
+Conclusion:
+
+- Landmark-conditioned SuperPoint has a useful diagnostic signal: support/query
+  SuperPoint descriptor top1 is about 0.81-0.85 and top5 is 1.0 on supported
+  fixed-inlier matches.
+- The current heuristic selector is still not accurate enough. Actual snapped
+  query keypoints are only about 46-51% correct at 8 px and remain about
+  8.6-9.0 px from the GT projection on average.
+- Pose metrics do not beat the current learned same-inlier offset branch and do
+  not consistently improve over the C2.5 patch-center baseline.
+- Keep LCKS as a sidecar diagnostic. The next useful version should learn a
+  landmark-conditioned keypoint confidence/no-snap model from this candidate
+  table, and support-view SuperPoint memories should be precomputed for larger
+  sweeps.
+
+Visual diagnostics:
+
+- `output/vfm/stage_c27_lcks/visualizations/lcks_pose_metrics.png`
+- `output/vfm/stage_c27_lcks/visualizations/lcks_selection_diagnostics.png`
+
+## Stage C2.7 SuperPoint Experiments ABCD
+
+Artifacts:
+
+- overview:
+  `output/vfm/stage_c27_superpoint_abcd/abcd_overview.md`
+- candidate tables:
+  - `output/vfm/stage_c27_superpoint_abcd/oldhospital/lcks_candidates.jsonl`
+  - `output/vfm/stage_c27_superpoint_abcd/shopfacade/lcks_candidates.jsonl`
+- runner:
+  `feature_extract/tools/vfm/run_superpoint_keypoint_abcd.py`
+- implementation:
+  `feature_extract/vfm/superpoint_keypoint_abcd.py`
+
+Goal:
+
+Check whether SuperPoint keypoints are useful after moving from unconditional
+snapping to a more task-aligned setup:
+
+- Experiment A: snap-improvement gate;
+- Experiment B: no-snap softmax selector;
+- Experiment C: support/learned residual from a selected keypoint anchor;
+- Experiment D: confidence-risk curve over selective snapping.
+
+Protocol:
+
+Candidate tables are generated from fixed first-pass C2.5/LCKS inliers. Each
+first-pass inlier has an explicit `no_snap` action plus all query SuperPoint
+candidate actions inside the patch radius. Each scene uses a deterministic
+50/50 query split; train is used only for the gate/softmax/residual models,
+and pose metrics below are on held-out queries.
+
+Held-out pose metrics:
+
+| scene | method | S@10 | S@25 | S@50 | median t | applied | meas err |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| OldHospital | C2.5 no-snap | 0.055 | 0.407 | 0.747 | 0.320m | 0.000 | 7.26px |
+| OldHospital | heuristic LCKS | 0.066 | 0.418 | 0.747 | 0.319m | 0.436 | 7.82px |
+| OldHospital | A gate | 0.055 | 0.407 | 0.747 | 0.320m | 0.000 | 7.26px |
+| OldHospital | B no-snap softmax | 0.055 | 0.407 | 0.747 | 0.320m | 0.000 | 7.26px |
+| OldHospital | C support residual | 0.044 | 0.418 | 0.725 | 0.316m | 0.436 | 9.23px |
+| OldHospital | C learned residual | 0.066 | 0.418 | 0.736 | 0.317m | 0.436 | 7.80px |
+| ShopFacade | C2.5 no-snap | 0.549 | 0.863 | 0.922 | 0.091m | 0.000 | 8.37px |
+| ShopFacade | heuristic LCKS | 0.549 | 0.843 | 0.941 | 0.091m | 0.455 | 8.92px |
+| ShopFacade | A gate | 0.549 | 0.863 | 0.922 | 0.091m | 0.000 | 8.37px |
+| ShopFacade | B no-snap softmax | 0.549 | 0.863 | 0.922 | 0.091m | 0.000 | 8.37px |
+| ShopFacade | C support residual | 0.569 | 0.843 | 0.922 | 0.091m | 0.455 | 10.22px |
+| ShopFacade | C learned residual | 0.549 | 0.863 | 0.922 | 0.092m | 0.455 | 8.88px |
+
+Key diagnostics:
+
+| scene | useful prior | gate AUC | precision@20% | heuristic improve | heuristic worsen | any cand @8 | top5 @8 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| OldHospital | 0.161 | 0.600 | 0.232 | 0.359 | 0.641 | 0.565 | 0.565 |
+| ShopFacade | 0.145 | 0.553 | 0.150 | 0.369 | 0.631 | 0.497 | 0.497 |
+
+Conclusion:
+
+- SuperPoint keypoints have an oracle upper bound and a weak selective signal,
+  especially on OldHospital, but current observable candidate features cannot
+  reliably decide when to snap.
+- The snap-improvement gate is weak: held-out AUC is about 0.60 on OldHospital
+  and 0.55 on ShopFacade. Threshold selection falls back to no-snap.
+- The no-snap softmax selector also falls back to no-snap, which is the safer
+  action under the current labels/features.
+- Support residual does not fix keypoint-anchor bias; it raises measurement
+  error and can hurt broad recall. Learned residual is mostly neutral.
+- Current answer: SuperPoint keypoints are useful for oracle diagnostics, but
+  not yet useful enough as an automatic measurement-refinement module. Keep
+  the learned continuous offset head as the stronger optional sidecar.
+
+Visual diagnostics:
+
+- `output/vfm/stage_c27_superpoint_abcd/visualizations/abcd_pose_metrics.png`
+- `output/vfm/stage_c27_superpoint_abcd/visualizations/abcd_risk_curve.png`
+
+## Stage C2.11 Robust Fixed-Inlier Pose Refinement
+
+Artifacts:
+
+- report:
+  `output/vfm/stage_c28_robust_fixed_lm/robust_fixed_lm_summary.md`
+- implementation:
+  - `feature_extract/vfm/query_to_3d_matching.py`
+  - `feature_extract/tools/vfm/eval_patch_to_3d_vfm_matching.py`
+- visualization:
+  `output/vfm/stage_c28_robust_fixed_lm/visualizations/robust_fixed_lm_pose_metrics.png`
+
+Goal:
+
+Improve final local pose without changing matches or re-running RANSAC. The
+method keeps the first-pass inlier set fixed and replaces plain fixed-inlier LM
+with robust weighted reprojection optimization. The tested robust setting uses
+Cauchy loss with `f_scale=4px`; the composite weight uses match similarity,
+similarity margin, landmark statistics, map reliability, and PnP uncertainty
+when available.
+
+Metrics:
+
+| scene | method | S@10 | S@25 | S@50 | median t | median r |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| OldHospital | C2.5 fixed LM | 0.088 | 0.412 | 0.720 | 0.296m | 0.559deg |
+| OldHospital | C2.5 robust LM uniform | 0.126 | 0.473 | 0.747 | 0.273m | 0.498deg |
+| OldHospital | C2.5 robust LM composite | 0.126 | 0.473 | 0.747 | 0.262m | 0.503deg |
+| OldHospital | learned offset fixed LM | 0.099 | 0.434 | 0.747 | 0.283m | 0.534deg |
+| OldHospital | learned offset + robust LM | 0.121 | 0.467 | 0.775 | 0.259m | 0.487deg |
+| ShopFacade | C2.5 fixed LM | 0.524 | 0.864 | 0.922 | 0.096m | 0.409deg |
+| ShopFacade | C2.5 robust LM uniform | 0.553 | 0.864 | 0.903 | 0.093m | 0.368deg |
+| ShopFacade | C2.5 robust LM composite | 0.553 | 0.864 | 0.903 | 0.096m | 0.365deg |
+| ShopFacade | learned offset fixed LM | 0.544 | 0.864 | 0.932 | 0.094m | 0.377deg |
+| ShopFacade | learned offset + robust LM | 0.592 | 0.864 | 0.932 | 0.088m | 0.333deg |
+
+S@25 rescue/break versus C2.5 fixed LM:
+
+| scene | comparison | rescued | broken | rescue/break |
+| --- | --- | ---: | ---: | ---: |
+| OldHospital | C2.5 robust composite | 14 | 3 | 4.67 |
+| OldHospital | learned offset + robust | 15 | 5 | 3.00 |
+| ShopFacade | C2.5 robust composite | 0 | 0 | inf |
+| ShopFacade | learned offset + robust | 0 | 0 | inf |
+
+Conclusion:
+
+- Robust fixed-inlier LM is a stronger next step than continuing SuperPoint
+  snapping.
+- OldHospital improves substantially from C2.5 fixed LM `S@25 0.412 /
+  median 0.296m` to robust composite `0.473 / 0.262m`.
+- Learned offset remains useful only when paired with robust LM: it gives the
+  best OldHospital median/S@50 and the best ShopFacade fine precision
+  (`S@10 0.592`, median `0.088m`).
+- The recommended local pose head is now:
+  `C2.5 patch-to-3D matches -> fixed first-pass inliers -> optional learned
+  offset -> robust fixed-inlier LM`.
+- Do not continue hand-tuning SuperPoint snapping. Future precision work should
+  focus on robust pose weighting and offset confidence, not keypoint snapping.
+
+## Stage C2.12 Calibrated Pose-Head Selection
+
+Artifacts:
+
+- report:
+  `output/vfm/stage_c212_pose_head_selection/pose_head_selection_summary.md`
+- implementation:
+  - `feature_extract/vfm/pose_head_selection.py`
+  - `feature_extract/tools/vfm/run_pose_head_selection.py`
+- visualization:
+  `output/vfm/stage_c212_pose_head_selection/visualizations/pose_head_selection_eval.png`
+
+Goal:
+
+Test whether an offline calibrated selector can choose among already-fixed pose
+heads per query. The selector uses only no-GT inference diagnostics such as
+pose risk, PnP inlier count/ratio, reprojection residual, spatial coverage,
+visible landmark recall, patch inlier diagnostics, and pose-head prior.
+
+Held-out eval metrics:
+
+| scene | method | S@10 | S@25 | S@50 | median t | median r |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| OldHospital | fixed LM | 0.055 | 0.407 | 0.747 | 0.320m | 0.601deg |
+| OldHospital | learned offset + robust LM | 0.132 | 0.462 | 0.780 | 0.265m | 0.533deg |
+| OldHospital | calibrated selected head | 0.088 | 0.429 | 0.780 | 0.296m | 0.578deg |
+| OldHospital | oracle head per query | 0.154 | 0.527 | 0.802 | 0.237m | 0.508deg |
+| ShopFacade | fixed LM | 0.549 | 0.863 | 0.922 | 0.091m | 0.396deg |
+| ShopFacade | learned offset + robust LM | 0.627 | 0.863 | 0.941 | 0.084m | 0.289deg |
+| ShopFacade | calibrated selected head | 0.588 | 0.863 | 0.941 | 0.084m | 0.287deg |
+| ShopFacade | oracle head per query | 0.647 | 0.863 | 0.961 | 0.077m | 0.287deg |
+
+Conclusion:
+
+- C2.12 is useful as a diagnostic but not yet as a main-method improvement.
+- Row-level calibration is strong on the train split, but per-query selection
+  does not beat the fixed `learned_offset_robust` head on held-out
+  OldHospital.
+- The main local pose head remains `learned offset + robust fixed-inlier LM`.
+- The remaining oracle gap says head selection still has signal, but it needs
+  better confidence features before it should replace the fixed head.
+
+## Stage C2.13 Offset-Confidence Robust Weighting
+
+Artifacts:
+
+- report:
+  `output/vfm/stage_c213_offset_confidence_weighting/offset_confidence_weighting_summary.md`
+- implementation:
+  - `feature_extract/vfm/query_to_3d_matching.py`
+  - `feature_extract/vfm/patch_offset_refiner.py`
+  - `feature_extract/tools/vfm/eval_patch_to_3d_vfm_matching.py`
+- visualization:
+  `output/vfm/stage_c213_offset_confidence_weighting/visualizations/offset_confidence_weighting_metrics.png`
+
+Goal:
+
+Use learned offset confidence and uncertainty only as soft robust-LM weights.
+The first-pass inlier set, match identities, offset gate, and RANSAC output are
+unchanged.
+
+Metrics:
+
+| scene | method | S@10 | S@25 | S@50 | median t | median r |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| OldHospital | fixed LM | 0.088 | 0.412 | 0.720 | 0.296m | 0.559deg |
+| OldHospital | learned offset + robust composite | 0.121 | 0.467 | 0.775 | 0.259m | 0.487deg |
+| OldHospital | offset-confidence weight | 0.126 | 0.473 | 0.780 | 0.278m | 0.491deg |
+| OldHospital | offset-composite weight | 0.121 | 0.456 | 0.775 | 0.272m | 0.491deg |
+| ShopFacade | fixed LM | 0.524 | 0.864 | 0.922 | 0.096m | 0.409deg |
+| ShopFacade | learned offset + robust composite | 0.592 | 0.864 | 0.932 | 0.088m | 0.333deg |
+| ShopFacade | offset-confidence weight | 0.583 | 0.864 | 0.932 | 0.089m | 0.336deg |
+| ShopFacade | offset-composite weight | 0.592 | 0.864 | 0.922 | 0.086m | 0.324deg |
+
+Conclusion:
+
+- Offset-confidence weighting is measurable but not clean enough to become the
+  new canonical head.
+- OldHospital gains threshold recall with `offset_confidence`, but median
+  translation gets worse.
+- ShopFacade gains median translation/rotation with `offset_composite`, but
+  broad recall drops.
+- Keep the current canonical head as `learned offset + robust composite`.
+Future work should calibrate offset confidence against actual fixed-inlier
+  pose improvement before using it as the default pose weight.
+
+## Stage F VFM-Aware Sparse Landmark Discovery
+
+Artifacts:
+
+- implementation:
+  - `feature_extract/vfm/vfm_aware_landmarks.py`
+  - `feature_extract/tools/vfm/build_stage_f_vfm_patch_tracks.py`
+  - `feature_extract/tools/vfm/build_stage_f_vfm_multiview_landmark_bank.py`
+  - `feature_extract/tools/vfm/project_stage_f_landmark_bank.py`
+  - `feature_extract/tools/vfm/combine_stage_f_landmark_banks.py`
+  - `feature_extract/tools/vfm/combine_stage_f_track_observations.py`
+  - `feature_extract/tools/vfm/visualize_stage_f_vfm_anchors_camera.py`
+- candidate-aware outputs:
+  - `output/vfm/stage_f_vfm_aware_landmarks/oldhospital/f4_vfm_multiview_candidate_all_relaxed_summary.json`
+  - `output/vfm/stage_f_vfm_aware_landmarks/shopfacade/f4_vfm_multiview_candidate_all_relaxed_summary.json`
+  - `output/vfm/stage_f_vfm_aware_landmarks/oldhospital/camera_visualizations_candidate96/`
+  - `output/vfm/stage_f_vfm_aware_landmarks/shopfacade/camera_visualizations_candidate64/`
+
+Goal:
+
+Test whether VFM-distinctive patches can discover additional sparse 3D
+landmarks beyond SfM keypoint tracks without changing the canonical
+patch-to-3D localization pipeline.
+
+Implementation update:
+
+- F1 now supports candidate-pool-aware reference selection via
+  `--candidate_bank`, `--candidate_top_n`, `--candidate_max_queries`, and
+  `--max_candidate_images`.
+- Candidate-aware F1 selects reference images from the same reference-pose
+  top-K pool used by localization, instead of taking the first N train images.
+- F4 links pairwise VFM patch tracks into multi-view landmarks, triangulates
+  them with Cambridge/COLMAP camera intrinsics, projects raw RADIO features
+  through the C2.5 selector, then evaluates either VFM-only or SfM+VFM
+  augmented maps.
+
+F4 candidate-aware reconstruction:
+
+| scene | reference pool | pair matches | accepted VFM landmarks | median reproj | median angle |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| OldHospital | top10 unique, first 96 | 5,208 | 233 | 4.31px | 2.46deg |
+| OldHospital | top10 unique, all 335 | 17,674 | 829 | 4.28px | 2.19deg |
+| ShopFacade | top10 unique, first 64 | 5,313 | 231 | 4.48px | 5.83deg |
+| ShopFacade | top10 unique, all 134 | 11,014 | 542 | 4.41px | 5.68deg |
+
+q24 diagnostic:
+
+| scene | method | VFM landmarks | S@10 | S@25 | S@50 | median t | median r |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| OldHospital | SfM-only | 0 | 0.125 | 0.875 | 1.000 | 0.164m | 0.337deg |
+| OldHospital | VFM-only all-candidate | 829 | 0.000 | 0.250 | 0.417 | 0.603m | 1.520deg |
+| OldHospital | SfM+VFM all-candidate | 829 | 0.208 | 0.833 | 1.000 | 0.145m | 0.350deg |
+| ShopFacade | SfM-only | 0 | 0.667 | 1.000 | 1.000 | 0.084m | 0.323deg |
+| ShopFacade | VFM-only all-candidate | 542 | 0.217 | 0.652 | 0.826 | 0.232m | 0.694deg |
+| ShopFacade | SfM+VFM all-candidate | 542 | 0.500 | 1.000 | 1.000 | 0.101m | 0.363deg |
+
+Strict all-candidate F4 (`max reproj 4px`, `min angle 0.5deg`) keeps fewer
+anchors but does not fix the break pattern:
+
+| scene | method | VFM landmarks | S@10 | S@25 | S@50 | median t | median r |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| OldHospital | SfM+VFM strict all-candidate | 342 | 0.083 | 0.833 | 1.000 | 0.150m | 0.409deg |
+| ShopFacade | SfM+VFM strict all-candidate | 214 | 0.542 | 1.000 | 1.000 | 0.099m | 0.327deg |
+
+Full-set diagnostic:
+
+| scene | method | S@10 | S@25 | S@50 | median t | median r |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| OldHospital | SfM-only | 0.049 | 0.341 | 0.643 | 0.341m | 0.665deg |
+| OldHospital | SfM+VFM ref48 | 0.049 | 0.341 | 0.621 | 0.347m | 0.702deg |
+| OldHospital | SfM+VFM all-candidate | 0.049 | 0.324 | 0.626 | 0.375m | 0.734deg |
+| ShopFacade | SfM-only | 0.524 | 0.864 | 0.922 | 0.096m | 0.409deg |
+| ShopFacade | SfM+VFM ref12 relaxed | 0.515 | 0.883 | 0.913 | 0.098m | 0.424deg |
+| ShopFacade | SfM+VFM all-candidate | 0.466 | 0.893 | 0.922 | 0.103m | 0.413deg |
+
+Conclusion:
+
+- Candidate-pool-aware F1 fixes the previous reference selection bias and
+  increases VFM-native landmarks substantially.
+- The discovered VFM-native landmarks are still too sparse and too noisy to
+  replace SfM tracks. VFM-only localization remains weak on both scenes.
+- SfM+VFM augmentation has a small fine-precision signal on OldHospital q24
+  and improves ShopFacade full S@25, but it hurts OldHospital full and
+  degrades ShopFacade S@10/median.
+- A stricter triangulation-quality gate reduces anchor count but does not
+  remove the break cases, so the bottleneck is not only bad reprojection-error
+  outliers.
+- Stage F should stay as a diagnostic side path. It should not replace the
+  canonical C2.5/C2.13 patch-to-3D pipeline until VFM-aware landmarks can
+  improve full-set recall without increasing break cases.
+
+## Stage F6 Source-Aware VFM Anchor Reliability Gate
+
+Artifacts:
+
+- implementation:
+  - `feature_extract/tools/vfm/filter_stage_f_vfm_landmark_bank.py`
+  - `feature_extract/vfm/vfm_aware_landmarks.py`
+- outputs:
+  - `output/vfm/stage_f_vfm_aware_landmarks/oldhospital/f6_vfm_candidate_all_oracle_mid_summary.json`
+  - `output/vfm/stage_f_vfm_aware_landmarks/oldhospital/f6_vfm_candidate_all_proxy_geo_sim_summary.json`
+  - `output/vfm/stage_f_vfm_aware_landmarks/shopfacade/f6_vfm_candidate_all_oracle_mid_summary.json`
+  - `output/vfm/stage_f_vfm_aware_landmarks/shopfacade/f6_vfm_candidate_all_proxy_geo_sim_summary.json`
+
+Goal:
+
+Test the diagnosis that VFM-native anchors are not hopeless, but cannot be
+mixed with SfM anchors at equal trust. F6 filters only the VFM-native bank,
+then merges the surviving VFM anchors back into the SfM map.
+
+Filters:
+
+- `oracle_mid`: match-table GT diagnostic, requiring at least 2 matches,
+  stride precision >= 0.8, PnP-inlier rate >= 0.25, and median GT reprojection
+  error <= 16 px.
+- `proxy_geo_sim`: no-GT observable proxy, requiring at least 2 matches,
+  mean similarity >= 0.68, landmark reprojection <= 3.2 px, ambiguity <= 0.85,
+  and observation count >= 3.
+
+Selected VFM anchors:
+
+| scene | filter | selected anchors | mean Patch@1 | mean stride precision | mean inlier rate |
+| --- | --- | ---: | ---: | ---: | ---: |
+| OldHospital | oracle_mid | 26 | 0.603 | 0.943 | 0.786 |
+| OldHospital | proxy_geo_sim | 45 | 0.233 | 0.415 | 0.321 |
+| ShopFacade | oracle_mid | 45 | 0.593 | 0.938 | 0.776 |
+| ShopFacade | proxy_geo_sim | 43 | 0.385 | 0.663 | 0.565 |
+
+q24:
+
+| scene | method | S@10 | S@25 | S@50 | median t | median r |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| OldHospital | SfM-only | 0.125 | 0.875 | 1.000 | 0.164m | 0.337deg |
+| OldHospital | unfiltered SfM+VFM | 0.208 | 0.833 | 1.000 | 0.145m | 0.350deg |
+| OldHospital | oracle_mid SfM+VFM | 0.167 | 0.917 | 1.000 | 0.130m | 0.333deg |
+| OldHospital | proxy_geo_sim SfM+VFM | 0.292 | 0.875 | 1.000 | 0.168m | 0.403deg |
+| ShopFacade | SfM-only | 0.667 | 1.000 | 1.000 | 0.084m | 0.323deg |
+| ShopFacade | unfiltered SfM+VFM | 0.500 | 1.000 | 1.000 | 0.101m | 0.363deg |
+| ShopFacade | oracle_mid SfM+VFM | 0.417 | 1.000 | 1.000 | 0.103m | 0.306deg |
+| ShopFacade | proxy_geo_sim SfM+VFM | 0.583 | 1.000 | 1.000 | 0.087m | 0.327deg |
+
+Full set:
+
+| scene | method | S@10 | S@25 | S@50 | median t | median r | rescue/break |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| OldHospital | SfM-only | 0.049 | 0.341 | 0.643 | 0.341m | 0.665deg | - |
+| OldHospital | unfiltered SfM+VFM | 0.049 | 0.324 | 0.626 | 0.375m | 0.734deg | 21/24 |
+| OldHospital | oracle_mid SfM+VFM | 0.055 | 0.335 | 0.643 | 0.351m | 0.666deg | 3/4 |
+| OldHospital | proxy_geo_sim SfM+VFM | 0.066 | 0.368 | 0.632 | 0.351m | 0.667deg | 13/8 |
+| ShopFacade | SfM-only | 0.524 | 0.864 | 0.922 | 0.096m | 0.409deg | - |
+| ShopFacade | unfiltered SfM+VFM | 0.466 | 0.893 | 0.922 | 0.103m | 0.413deg | 4/1 |
+| ShopFacade | oracle_mid SfM+VFM | 0.466 | 0.874 | 0.913 | 0.101m | 0.451deg | 4/3 |
+| ShopFacade | proxy_geo_sim SfM+VFM | 0.495 | 0.874 | 0.913 | 0.101m | 0.400deg | 3/2 |
+
+Conclusion:
+
+- The source-aware diagnosis is confirmed: filtered VFM anchors can rescue
+  cases, while unfiltered anchors inject too many break cases.
+- OldHospital `proxy_geo_sim` is the first non-oracle F-stage result with
+  full-set S@25 improvement over SfM-only (`0.341 -> 0.368`) and
+  rescue/break > 1 (`13/8`).
+- However, median translation and S@50 still do not beat SfM-only, and
+  ShopFacade filtered VFM remains worse than SfM-only on S@10/median.
+- Therefore F6 is a useful reliability-gating diagnostic, not a replacement for
+  the canonical map. The next viable F-stage direction is a learned
+  source-aware confidence model trained on held-out validation matches, not
+  more hand thresholds.
+
+## Stage G Reference Patch Maplets
+
+Artifacts:
+
+- implementation:
+  - `feature_extract/vfm/reference_patch_maplets.py`
+  - `feature_extract/tools/vfm/eval_stage_g_reference_patch_maplet_matching.py`
+- tests:
+  - `tests/test_vfm_reference_patch_maplets.py`
+- outputs:
+  - `output/vfm/stage_g_reference_patch_maplets/oldhospital/`
+  - `output/vfm/stage_g_reference_patch_maplets/shopfacade/`
+
+Definition:
+
+Stage G stops treating a VFM token match as a new triangulated 3D point.
+Instead, each reference VFM token becomes a patch maplet:
+
+```text
+reference token descriptor
++ existing SfM landmark set whose 2D observations fall inside that token
+```
+
+This is the concrete version of a "3D support region" without surface
+reconstruction.  The support region is not a mesh patch.  It is a footprint of
+existing metric SfM landmarks attached to a reference VFM patch.  Matching is
+therefore:
+
+```text
+query VFM patch descriptor -> reference VFM patch descriptor
+                                  -> attached SfM landmark set
+```
+
+The primary metric is set overlap with the GT-positive query patch landmark
+set, not point reprojection.
+
+q24 raw RADIO patch-to-reference-patch:
+
+| scene | oracle coverage | positive maplets/token | Maplet@1 | Maplet@5 | recall@1 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| OldHospital | 1.000 | 1.876 | 0.075 | 0.148 | 0.060 |
+| ShopFacade | 1.000 | 3.669 | 0.079 | 0.140 | 0.054 |
+
+q24 C2.5-selected patch-to-reference-patch:
+
+| scene | oracle coverage | positive maplets/token | Maplet@1 | Maplet@5 | Maplet@20 | recall@1 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| OldHospital | 1.000 | 1.876 | 0.100 | 0.170 | 0.208 | 0.082 |
+| ShopFacade | 1.000 | 3.669 | 0.088 | 0.148 | 0.190 | 0.060 |
+
+q24 C2.5-selected patch-to-reference-patch with local token context:
+
+| scene | context | Maplet@1 | Maplet@5 | recall@1 |
+| --- | ---: | ---: | ---: | ---: |
+| OldHospital | 1x1 | 0.100 | 0.170 | 0.082 |
+| OldHospital | 3x3 | 0.104 | 0.193 | 0.087 |
+| OldHospital | 5x5 | 0.083 | 0.171 | 0.068 |
+| ShopFacade | 1x1 | 0.088 | 0.148 | 0.060 |
+| ShopFacade | 3x3 | 0.089 | 0.162 | 0.062 |
+| ShopFacade | 5x5 | 0.075 | 0.146 | 0.052 |
+
+q24 pose handoff from 3x3 patch maplets:
+
+| scene | support/maplet | S@10 | S@25 | S@50 | median t | median r | inliers | inlier ratio |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| OldHospital | 1 | 0.042 | 0.333 | 0.917 | 0.292m | 0.460deg | 281.0 | 0.141 |
+| OldHospital | 3 | 0.042 | 0.333 | 0.917 | 0.306m | 0.535deg | 417.0 | 0.083 |
+| ShopFacade | 1 | 0.375 | 0.958 | 1.000 | 0.126m | 0.369deg | 372.0 | 0.186 |
+| ShopFacade | 3 | 0.250 | 1.000 | 1.000 | 0.124m | 0.440deg | 673.2 | 0.135 |
+
+q24 Stage G4 support-set measurement recovery:
+
+| scene | recovery | S@10 | S@25 | S@50 | median t | median r | inliers | inlier ratio | sigma |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| OldHospital | quality point | 0.042 | 0.333 | 0.917 | 0.292m | 0.460deg | 281.0 | 0.141 | - |
+| OldHospital | feature-consistent point | 0.042 | 0.167 | 0.875 | 0.337m | 0.493deg | 280.2 | 0.140 | 4.66px |
+| OldHospital | soft XYZ | 0.083 | 0.167 | 0.875 | 0.350m | 0.572deg | 403.0 | 0.202 | 4.66px |
+| ShopFacade | quality point | 0.375 | 0.958 | 1.000 | 0.126m | 0.369deg | 372.0 | 0.186 | - |
+| ShopFacade | feature-consistent point | 0.458 | 0.917 | 1.000 | 0.101m | 0.444deg | 381.8 | 0.191 | 4.66px |
+| ShopFacade | soft XYZ | 0.250 | 0.875 | 1.000 | 0.136m | 0.349deg | 572.6 | 0.286 | 4.67px |
+
+q24 Stage G5 learned support selector smoke:
+
+Protocol: first 12 query images train a tiny logistic support selector; next
+12 query images are held out for evaluation.  Inputs are observable support
+features only: maplet similarity, support feature similarity, support quality,
+rank score, and support count score.
+
+| scene | recovery | S@10 | S@25 | S@50 | median t | median r | inliers | inlier ratio |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| OldHospital | quality point eval12 | 0.000 | 0.417 | 1.000 | 0.284m | 0.373deg | 325.0 | 0.163 |
+| OldHospital | learned unbalanced | 0.083 | 0.250 | 0.917 | 0.315m | 0.589deg | 331.6 | 0.166 |
+| OldHospital | learned balanced | 0.000 | 0.250 | 1.000 | 0.320m | 0.510deg | 325.0 | 0.163 |
+| ShopFacade | quality point eval12 | 0.500 | 1.000 | 1.000 | 0.110m | 0.437deg | 339.5 | 0.170 |
+| ShopFacade | learned unbalanced | 0.500 | 1.000 | 1.000 | 0.101m | 0.346deg | 348.8 | 0.174 |
+| ShopFacade | learned balanced | 0.500 | 1.000 | 1.000 | 0.098m | 0.480deg | 338.3 | 0.169 |
+
+q24 Stage G6 calibrated reference-patch verifier smoke:
+
+Protocol: first 12 query images train a tiny logistic maplet verifier; next
+12 query images are held out.  Inputs are observable maplet-level attributes:
+maplet similarity, rank score, support count score, mean observation score, and
+mean reprojection score.  The verifier label is whether the reference maplet
+support set overlaps the GT-positive query patch landmark set.
+
+| scene | recovery | Maplet@1 | Maplet@5 | S@10 | S@25 | S@50 | median t | median r | AUROC | AUPRC |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| OldHospital | quality point eval12 | 0.108 | 0.199 | 0.000 | 0.417 | 1.000 | 0.284m | 0.373deg | - | - |
+| OldHospital | verifier rerank | 0.108 | 0.199 | 0.167 | 0.333 | 1.000 | 0.305m | 0.585deg | 0.726 | 0.110 |
+| OldHospital | verifier rerank+filter50 | 0.108 | 0.173 | 0.083 | 0.333 | 1.000 | 0.334m | 0.576deg | 0.726 | 0.110 |
+| ShopFacade | quality point eval12 | 0.078 | 0.155 | 0.500 | 1.000 | 1.000 | 0.110m | 0.437deg | - | - |
+| ShopFacade | verifier rerank | 0.078 | 0.155 | 0.500 | 1.000 | 1.000 | 0.112m | 0.511deg | 0.685 | 0.138 |
+| ShopFacade | verifier rerank+filter50 | 0.078 | 0.132 | 0.500 | 1.000 | 1.000 | 0.092m | 0.548deg | 0.685 | 0.138 |
+
+Conclusion:
+
+- The reference patch maplet "landing point" is feasible.  Oracle coverage is
+  1.0 on q24 for both scenes, so the top10 reference pool contains patch
+  maplets overlapping every GT-positive query patch.
+- The failure is descriptor ranking, not maplet existence.  Raw RADIO
+  patch-to-patch top5 is only about 14-15%; C2.5 selected descriptors improve
+  top1/top5 modestly but top20 is still only about 19-21%.
+- A small 3x3 context is positive, especially for Maplet@5, but 5x5
+  over-smooths and hurts both scenes.  VFM patch-patch matching needs local
+  context, not large-window descriptor averaging.
+- Pose handoff proves the direction is not dead: ShopFacade q24 gets strong
+  localization from patch maplets, and OldHospital reaches high S@50 with a
+  median near 0.29m.  However, OldHospital S@25 remains below the canonical
+  sparse selected-landmark pipeline, so direct patch-maplet-to-PnP is not yet
+  a replacement.
+- Expanding more support landmarks per maplet increases inlier count but lowers
+  inlier ratio and does not improve OldHospital.  The support region should be
+  treated as a set requiring selection/weighting, not blindly expanded into
+  PnP.
+- The first explicit set-to-point recovery baselines are negative.  Selecting
+  the support point whose landmark descriptor is most consistent with the
+  reference patch hurts OldHospital and slightly hurts ShopFacade S@25, even
+  when ShopFacade median translation improves.  Soft feature-weighted 3D
+  averaging increases inlier count/inlier ratio but makes median pose worse,
+  which is consistent with pseudo-points drifting off the true surface.
+- Measurement uncertainty is now explicit in Stage G rows for new recovery
+  modes (`measurement_sigma_px`, initialized at stride/sqrt(12)), but OpenCV
+  PnP still consumes a global stride-aware RANSAC threshold.  Per-match
+  covariance-weighted PnP remains future work.
+- A tiny learned support selector does not yet solve support recovery.
+  Class balancing makes the learned weights more interpretable, but OldHospital
+  still drops from S@25 0.417 to 0.250 on the held-out 12-query smoke.  On
+  ShopFacade, learned support selection improves median translation slightly
+  without changing success rates.  This indicates that observable support
+  features are not sufficient by themselves for robust cross-scene support
+  selection, especially in OldHospital.
+- A calibrated reference-patch verifier has diagnostic signal: held-out AUROC
+  is 0.726 on OldHospital and 0.685 on ShopFacade, and AUPRC is above the
+  positive priors.  This means maplet-level geometry/feature attributes can
+  partially distinguish true patch-maplet evidence from repeated-structure
+  false evidence.
+- However, direct verifier filtering/reranking is not yet a safe localization
+  improvement.  Filtering hurts Maplet@5 and does not improve OldHospital
+  S@25; reranking preserves Maplet@5 but still lowers OldHospital S@25.  The
+  verifier should therefore be used first for risk scoring or multi-hypothesis
+  pose rescoring, not as a hard match deletion rule.
+- Therefore true patch-patch matching is currently reasonable as a
+  candidate/support-region formulation and as a source of local context.  The
+  next viable Stage G direction is a learned reference-patch verifier/reranker
+  or set-level support selector using patch descriptor, support-set reliability,
+  candidate rank, local context, and geometry priors.  Simple feature-only
+  support selection and soft XYZ averaging should not be used as the main
+  handoff rule.

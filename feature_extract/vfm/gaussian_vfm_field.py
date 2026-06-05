@@ -124,12 +124,18 @@ class GaussianVFMSource:
     opacity: np.ndarray
     scale: np.ndarray
     gaussian_indices: np.ndarray
+    scale_xyz: np.ndarray | None = None
+    rotation: np.ndarray | None = None
+    normal: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         xyz = np.asarray(self.xyz, dtype=np.float64)
         opacity = np.asarray(self.opacity, dtype=np.float32).reshape(-1)
         scale = np.asarray(self.scale, dtype=np.float32).reshape(-1)
         gaussian_indices = np.asarray(self.gaussian_indices, dtype=np.int64).reshape(-1)
+        scale_xyz = None if self.scale_xyz is None else np.asarray(self.scale_xyz, dtype=np.float32)
+        rotation = None if self.rotation is None else np.asarray(self.rotation, dtype=np.float32)
+        normal = None if self.normal is None else np.asarray(self.normal, dtype=np.float32)
         if xyz.ndim != 2 or xyz.shape[1] != 3:
             raise ValueError("xyz must have shape (N, 3)")
         if opacity.shape != (xyz.shape[0],):
@@ -138,10 +144,25 @@ class GaussianVFMSource:
             raise ValueError("scale must have shape (N,)")
         if gaussian_indices.shape != (xyz.shape[0],):
             raise ValueError("gaussian_indices must have shape (N,)")
+        if scale_xyz is None:
+            scale_xyz = np.repeat(scale[:, None], 3, axis=1)
+        if scale_xyz.shape != (xyz.shape[0], 3):
+            raise ValueError("scale_xyz must have shape (N, 3)")
+        if rotation is not None:
+            if rotation.shape != (xyz.shape[0], 4):
+                raise ValueError("rotation must have shape (N, 4)")
+            rotation = _normalize_quaternions(rotation)
+        if normal is not None:
+            if normal.shape != (xyz.shape[0], 3):
+                raise ValueError("normal must have shape (N, 3)")
+            normal = _normalize_vectors(normal)
         object.__setattr__(self, "xyz", xyz)
         object.__setattr__(self, "opacity", opacity)
         object.__setattr__(self, "scale", scale)
         object.__setattr__(self, "gaussian_indices", gaussian_indices)
+        object.__setattr__(self, "scale_xyz", scale_xyz)
+        object.__setattr__(self, "rotation", rotation)
+        object.__setattr__(self, "normal", normal)
 
 
 @dataclass(frozen=True)
@@ -289,6 +310,63 @@ def _sigmoid(values: np.ndarray) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(-clipped))
 
 
+def _normalize_vectors(values: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    vectors = np.asarray(values, dtype=np.float32)
+    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+    return vectors / np.maximum(norms, float(eps))
+
+
+def _normalize_quaternions(values: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    quaternions = np.asarray(values, dtype=np.float32)
+    norms = np.linalg.norm(quaternions, axis=1, keepdims=True)
+    normalized = quaternions / np.maximum(norms, float(eps))
+    zero_rows = np.squeeze(norms <= float(eps), axis=1)
+    if np.any(zero_rows):
+        normalized[zero_rows] = np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    return normalized.astype(np.float32, copy=False)
+
+
+def _quaternion_rotation_matrices(quaternions: np.ndarray) -> np.ndarray:
+    q = _normalize_quaternions(quaternions)
+    w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+    matrices = np.empty((q.shape[0], 3, 3), dtype=np.float32)
+    matrices[:, 0, 0] = 1.0 - 2.0 * (y * y + z * z)
+    matrices[:, 0, 1] = 2.0 * (x * y - z * w)
+    matrices[:, 0, 2] = 2.0 * (x * z + y * w)
+    matrices[:, 1, 0] = 2.0 * (x * y + z * w)
+    matrices[:, 1, 1] = 1.0 - 2.0 * (x * x + z * z)
+    matrices[:, 1, 2] = 2.0 * (y * z - x * w)
+    matrices[:, 2, 0] = 2.0 * (x * z - y * w)
+    matrices[:, 2, 1] = 2.0 * (y * z + x * w)
+    matrices[:, 2, 2] = 1.0 - 2.0 * (x * x + y * y)
+    return matrices
+
+
+def _smallest_axis_normals(scale_xyz: np.ndarray, rotation: np.ndarray) -> np.ndarray:
+    axis_indices = np.argmin(np.asarray(scale_xyz, dtype=np.float32), axis=1)
+    matrices = _quaternion_rotation_matrices(rotation)
+    rows = np.arange(matrices.shape[0], dtype=np.int64)
+    normals = matrices[rows, :, axis_indices]
+    return _normalize_vectors(normals.astype(np.float32, copy=False))
+
+
+def _normal_from_ply_fields(vertex, limit: int) -> np.ndarray | None:
+    names = vertex.data.dtype.names or ()
+    if not {"nx", "ny", "nz"}.issubset(set(names)):
+        return None
+    normal = np.stack(
+        [
+            np.asarray(vertex["nx"], dtype=np.float32)[:limit],
+            np.asarray(vertex["ny"], dtype=np.float32)[:limit],
+            np.asarray(vertex["nz"], dtype=np.float32)[:limit],
+        ],
+        axis=1,
+    )
+    if not np.any(np.linalg.norm(normal, axis=1) > 1e-8):
+        return None
+    return _normalize_vectors(normal)
+
+
 def load_gaussian_vfm_source_from_ply(path: Path, max_gaussians: int = 0) -> GaussianVFMSource:
     """Load Gaussian centers and render weights from a 3DGS/2DGS PLY file."""
 
@@ -312,12 +390,42 @@ def load_gaussian_vfm_source_from_ply(path: Path, max_gaussians: int = 0) -> Gau
         [name for name in vertex.data.dtype.names if name.startswith("scale_")],
         key=lambda name: int(name.split("_")[-1]),
     )
+    scale_xyz = None
     if scale_names:
         scales = np.stack([np.asarray(vertex[name], dtype=np.float32)[:limit] for name in scale_names], axis=1)
-        scale = np.mean(np.exp(scales), axis=1)
+        exp_scales = np.exp(scales).astype(np.float32, copy=False)
+        scale = np.mean(exp_scales, axis=1)
+        if exp_scales.shape[1] == 3:
+            scale_xyz = exp_scales
+        elif exp_scales.shape[1] == 2:
+            scale_xyz = np.concatenate(
+                [exp_scales, np.min(exp_scales, axis=1, keepdims=True)],
+                axis=1,
+            ).astype(np.float32, copy=False)
     else:
         scale = np.ones((limit,), dtype=np.float32)
-    return GaussianVFMSource(xyz=xyz, opacity=opacity, scale=scale, gaussian_indices=indices)
+    rotation_names = sorted(
+        [name for name in vertex.data.dtype.names if name.startswith("rot_")],
+        key=lambda name: int(name.split("_")[-1]),
+    )
+    rotation = None
+    normal = _normal_from_ply_fields(vertex, limit)
+    if len(rotation_names) == 4:
+        rotation = np.stack([np.asarray(vertex[name], dtype=np.float32)[:limit] for name in rotation_names], axis=1)
+        rotation = _normalize_quaternions(rotation)
+        if scale_xyz is not None and len(scale_names) == 3:
+            normal = _smallest_axis_normals(scale_xyz, rotation)
+        elif scale_xyz is not None and len(scale_names) == 2:
+            normal = _normalize_vectors(_quaternion_rotation_matrices(rotation)[:, :, 2])
+    return GaussianVFMSource(
+        xyz=xyz,
+        opacity=opacity,
+        scale=scale,
+        gaussian_indices=indices,
+        scale_xyz=scale_xyz,
+        rotation=rotation,
+        normal=normal,
+    )
 
 
 def _dc_sh_to_rgb(dc: np.ndarray) -> np.ndarray:

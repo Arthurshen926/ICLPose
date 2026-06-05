@@ -124,7 +124,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--teacher_feature_set", default="full")
     parser.add_argument("--max_candidates_per_token", type=int, default=16)
     parser.add_argument("--max_samples", type=int, default=20000)
+    parser.add_argument("--min_negative_candidates", type=int, default=0)
+    parser.add_argument("--negative_sampling_mode", default="default", choices=("default", "semi_hard"))
     parser.add_argument("--weak_positive_weight", type=float, default=0.35)
+    parser.add_argument("--positive_reprojection_weight", type=float, default=0.0)
+    parser.add_argument("--positive_reprojection_scale_stride", type=float, default=1.0)
     parser.add_argument("--output_dim", type=int, default=128)
     parser.add_argument("--hidden_dim", type=int, default=256)
     parser.add_argument("--steps", type=int, default=800)
@@ -135,6 +139,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--margin", type=float, default=0.2)
     parser.add_argument("--distill_loss_weight", type=float, default=0.2)
     parser.add_argument("--anchor_loss_weight", type=float, default=0.05)
+    parser.add_argument("--score_anchor_loss_weight", type=float, default=0.0)
     parser.add_argument("--eval_split_fraction", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cpu")
@@ -157,7 +162,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         layer_name=str(args.layer_name),
         max_candidates_per_token=int(args.max_candidates_per_token),
         max_samples=int(args.max_samples),
+        min_negative_candidates=int(args.min_negative_candidates),
+        negative_sampling_mode=str(args.negative_sampling_mode),
         weak_positive_weight=float(args.weak_positive_weight),
+        positive_reprojection_weight=float(args.positive_reprojection_weight),
+        positive_reprojection_scale_stride=float(args.positive_reprojection_scale_stride),
         teacher_model=teacher,
         teacher_feature_set=str(args.teacher_feature_set),
         seed=int(args.seed),
@@ -175,6 +184,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             margin=float(args.margin),
             distill_loss_weight=float(args.distill_loss_weight),
             anchor_loss_weight=float(args.anchor_loss_weight),
+            score_anchor_loss_weight=float(args.score_anchor_loss_weight),
             eval_split_fraction=float(args.eval_split_fraction),
             seed=int(args.seed),
             device=str(args.device),

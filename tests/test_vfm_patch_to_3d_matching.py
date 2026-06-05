@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -238,6 +239,37 @@ def test_soft_mutual_topk_keeps_patch_level_many_to_one_candidates() -> None:
     assert [(match.token_index, match.track_id) for match in matches] == [(0, 1), (1, 1)]
 
 
+def test_patch_matching_can_deduplicate_same_token_track_candidates() -> None:
+    query_map = np.zeros((2, 1, 1), dtype=np.float32)
+    query_map[:, 0, 0] = np.asarray([1.0, 0.0], dtype=np.float32)
+    index = LandmarkMapIndex(
+        track_ids=np.asarray([10, 10, 20], dtype=np.int64),
+        xyz=np.asarray([[0.0, 0.0, 5.0], [0.0, 0.0, 5.0], [1.0, 0.0, 5.0]], dtype=np.float64),
+        features=np.asarray([[0.98, 0.02], [1.0, 0.0], [0.9, 0.1]], dtype=np.float32),
+        mean_variances=np.zeros((3,), dtype=np.float32),
+        observation_counts=np.ones((3,), dtype=np.int64),
+        observation_image_ids=(("a",), ("a",), ("a",)),
+    )
+
+    matches = match_query_patches_to_landmarks(
+        query_map,
+        index,
+        PatchTo3DMatchingConfig(
+            top_k=3,
+            mutual_top_k=1,
+            min_similarity=0.0,
+            ratio_threshold=None,
+            match_mode="soft_mutual",
+            deduplicate_track_matches=True,
+        ),
+        image_width=100,
+        image_height=100,
+    )
+
+    assert [(match.token_index, match.track_id) for match in matches] == [(0, 10), (0, 20)]
+    assert np.isclose(matches[0].similarity, 1.0)
+
+
 def test_patch_matching_can_rank_by_landmark_quality_weighted_similarity() -> None:
     query_map = np.zeros((2, 1, 1), dtype=np.float32)
     query_map[:, 0, 0] = np.asarray([1.0, 0.0], dtype=np.float32)
@@ -389,6 +421,79 @@ def test_patch_matching_pairwise_head_can_filter_without_reranking() -> None:
 
     assert [match.track_id for match in matches] == [2]
     assert matches[0].pairwise_inlier_logit == 4.0
+
+
+def test_patch_matching_candidate_confidence_can_rerank_topk_before_selection() -> None:
+    def candidate_scorer(candidates):
+        output = []
+        for match in candidates:
+            if match.observation_count is not None and int(match.observation_count) >= 10:
+                output.append(replace(match, pairwise_inlier_logit=4.0, pairwise_inlier_logprob=-0.02))
+            else:
+                output.append(replace(match, pairwise_inlier_logit=-4.0, pairwise_inlier_logprob=-3.0))
+        return output
+
+    query_map = np.zeros((2, 1, 1), dtype=np.float32)
+    query_map[:, 0, 0] = np.asarray([1.0, 0.0], dtype=np.float32)
+    index = LandmarkMapIndex(
+        track_ids=np.asarray([1, 2], dtype=np.int64),
+        xyz=np.asarray([[0.0, 0.0, 5.0], [0.0, 0.0, 6.0]], dtype=np.float64),
+        features=np.asarray([[1.0, 0.0], [0.97, 0.24]], dtype=np.float32),
+        mean_variances=np.zeros((2,), dtype=np.float32),
+        observation_counts=np.asarray([1, 12], dtype=np.int64),
+        observation_image_ids=(("a",), tuple(f"ref_{idx}" for idx in range(12))),
+    )
+
+    matches = match_query_patches_to_landmarks(
+        query_map,
+        index,
+        PatchTo3DMatchingConfig(
+            top_k=2,
+            match_mode="nn",
+            min_similarity=0.0,
+            ratio_threshold=None,
+            match_score_mode="similarity_pairwise",
+        ),
+        image_width=100,
+        image_height=100,
+        pairwise_inlier_weight=0.2,
+        candidate_match_scorer=candidate_scorer,
+    )
+
+    assert len(matches) == 1
+    assert matches[0].track_id == 2
+    assert matches[0].pairwise_inlier_logit == 4.0
+    assert matches[0].pairwise_weighted_similarity is not None
+
+
+def test_patch_matching_can_return_all_topk_candidates_for_training_tables() -> None:
+    query_map = np.zeros((2, 1, 1), dtype=np.float32)
+    query_map[:, 0, 0] = np.asarray([1.0, 0.0], dtype=np.float32)
+    index = LandmarkMapIndex(
+        track_ids=np.asarray([1, 2, 3], dtype=np.int64),
+        xyz=np.asarray([[0.0, 0.0, 5.0], [0.0, 0.0, 6.0], [0.0, 0.0, 7.0]], dtype=np.float64),
+        features=np.asarray([[1.0, 0.0], [0.95, 0.31], [0.0, 1.0]], dtype=np.float32),
+        mean_variances=np.zeros((3,), dtype=np.float32),
+        observation_counts=np.ones((3,), dtype=np.int64) * 3,
+        observation_image_ids=(("a",), ("b",), ("c",)),
+    )
+
+    matches = match_query_patches_to_landmarks(
+        query_map,
+        index,
+        PatchTo3DMatchingConfig(
+            top_k=2,
+            match_mode="nn",
+            min_similarity=0.0,
+            ratio_threshold=None,
+            return_all_topk_candidates=True,
+        ),
+        image_width=100,
+        image_height=100,
+    )
+
+    assert [match.track_id for match in matches] == [1, 2]
+    assert [match.token_match_rank for match in matches] == [0, 1]
 
 
 def test_patch_matching_map_reliability_filter_does_not_rerank_descriptor_matches() -> None:

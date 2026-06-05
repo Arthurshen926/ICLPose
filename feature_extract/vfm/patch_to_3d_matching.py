@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Mapping, Protocol, Sequence
+from dataclasses import replace
+from typing import Callable, Mapping, Protocol, Sequence
 
 import numpy as np
 
@@ -34,6 +35,9 @@ from feature_extract.vfm.query_to_3d_matching import (
 class PairwiseInlierScorer(Protocol):
     def score_pairs(self, query_descriptors: np.ndarray, landmark_descriptors: np.ndarray) -> np.ndarray:
         ...
+
+
+CandidateMatchScorer = Callable[[Sequence[QueryTo3DMatch]], Sequence[QueryTo3DMatch]]
 
 
 @dataclass(frozen=True)
@@ -96,6 +100,8 @@ class PatchTo3DMatchingConfig:
     map_reliability: MapReliabilityConfig = MapReliabilityConfig()
     local_geometric_consistency: LocalGeometricConsistencyConfig = LocalGeometricConsistencyConfig()
     landmark_ambiguity_pruning: LandmarkAmbiguityPruningConfig = LandmarkAmbiguityPruningConfig()
+    return_all_topk_candidates: bool = False
+    deduplicate_track_matches: bool = False
 
     def __post_init__(self) -> None:
         if self.top_k <= 0:
@@ -506,6 +512,26 @@ def _filter_matches_by_pairwise_score(
     return output
 
 
+def _with_pairwise_weighted_similarity(
+    matches: Sequence[QueryTo3DMatch],
+    pairwise_inlier_weight: float,
+) -> list[QueryTo3DMatch]:
+    output: list[QueryTo3DMatch] = []
+    for match in matches:
+        if match.pairwise_inlier_logprob is None:
+            output.append(match)
+            continue
+        output.append(
+            replace(
+                match,
+                pairwise_weighted_similarity=float(
+                    match.similarity + float(pairwise_inlier_weight) * float(match.pairwise_inlier_logprob)
+                ),
+            )
+        )
+    return output
+
+
 def _filter_matches_by_map_reliability(
     matches: list[QueryTo3DMatch],
     config: MapReliabilityConfig,
@@ -519,6 +545,21 @@ def _filter_matches_by_map_reliability(
     )
 
 
+def _deduplicate_token_track_matches(
+    matches: Sequence[QueryTo3DMatch],
+    score_mode: str,
+) -> list[QueryTo3DMatch]:
+    best_by_key: dict[tuple[int, int], QueryTo3DMatch] = {}
+    for match in matches:
+        key = (int(match.token_index), int(match.track_id))
+        current = best_by_key.get(key)
+        if current is None or _match_score(match, score_mode) > _match_score(current, score_mode):
+            best_by_key[key] = match
+    output = list(best_by_key.values())
+    output.sort(key=lambda item: _match_score(item, score_mode), reverse=True)
+    return output
+
+
 def match_query_patches_to_landmarks(
     query_feature_map: np.ndarray,
     landmark_index: LandmarkMapIndex,
@@ -527,6 +568,7 @@ def match_query_patches_to_landmarks(
     image_height: int = 576,
     pairwise_inlier_scorer: PairwiseInlierScorer | None = None,
     pairwise_inlier_weight: float = 0.0,
+    candidate_match_scorer: CandidateMatchScorer | None = None,
 ) -> list[QueryTo3DMatch]:
     config = config or PatchTo3DMatchingConfig()
     index = _valid_subset(landmark_index, config)
@@ -603,15 +645,15 @@ def match_query_patches_to_landmarks(
     else:
         reciprocal = []
 
-    matches: list[QueryTo3DMatch] = []
+    candidate_groups: list[tuple[list[QueryTo3DMatch], bool]] = []
     for query_row in range(query_features.shape[0]):
         candidate_matches: list[QueryTo3DMatch] = []
+        allow_multi_candidate_nn = config.landmark_quality.enabled or config.match_score_mode in {"similarity_pairwise"}
         for rank in range(query_top_indices.shape[1]):
             landmark_idx = int(query_top_indices[query_row, rank])
             if landmark_idx < 0:
                 continue
-            allow_multi_candidate_nn = config.landmark_quality.enabled or config.match_score_mode in {"similarity_pairwise"}
-            if config.match_mode == "nn" and rank > 0 and not allow_multi_candidate_nn:
+            if config.match_mode == "nn" and rank > 0 and not (allow_multi_candidate_nn or config.return_all_topk_candidates):
                 continue
             if config.match_mode == "mnn" and (rank > 0 or query_row not in reciprocal[landmark_idx]):
                 continue
@@ -677,9 +719,29 @@ def match_query_patches_to_landmarks(
                     distance_to_boundary_px=float(boundary),
                     map_reliability=map_reliability,
                     pnp_uncertainty_scale=pnp_uncertainty_scale,
+                    token_match_rank=int(rank),
                 )
             )
-        if config.match_mode == "nn" and allow_multi_candidate_nn and candidate_matches:
+        candidate_groups.append((candidate_matches, allow_multi_candidate_nn))
+    if candidate_match_scorer is not None and candidate_groups:
+        flat_candidates = [match for group, _allow in candidate_groups for match in group]
+        rescored_flat = list(candidate_match_scorer(flat_candidates))
+        if len(rescored_flat) != len(flat_candidates):
+            raise ValueError("candidate_match_scorer must return one match per input candidate")
+        rescored_flat = _with_pairwise_weighted_similarity(rescored_flat, pairwise_inlier_weight)
+        cursor = 0
+        rescored_groups: list[tuple[list[QueryTo3DMatch], bool]] = []
+        for group, allow_multi_candidate_nn in candidate_groups:
+            next_cursor = cursor + len(group)
+            rescored_groups.append((rescored_flat[cursor:next_cursor], allow_multi_candidate_nn))
+            cursor = next_cursor
+        candidate_groups = rescored_groups
+
+    matches: list[QueryTo3DMatch] = []
+    for candidate_matches, allow_multi_candidate_nn in candidate_groups:
+        if config.return_all_topk_candidates:
+            matches.extend(candidate_matches)
+        elif config.match_mode == "nn" and allow_multi_candidate_nn and candidate_matches:
             matches.append(max(candidate_matches, key=lambda item: _match_score(item, config.match_score_mode)))
         else:
             matches.extend(candidate_matches)
@@ -692,6 +754,8 @@ def match_query_patches_to_landmarks(
     )
     matches = _filter_matches_by_map_reliability(matches, config.map_reliability)
     matches = filter_matches_by_local_geometric_consistency(matches, config.local_geometric_consistency)
+    if bool(config.deduplicate_track_matches):
+        matches = _deduplicate_token_track_matches(matches, config.match_score_mode)
     if config.max_matches is not None:
         matches = matches[: int(config.max_matches)]
     return matches

@@ -836,6 +836,10 @@ def apply_predicted_patch_offsets(
     max_offset_stride: float = 0.5,
     sigmas: np.ndarray | None = None,
     max_sigma: float | None = None,
+    consistency_pose_w2c: np.ndarray | None = None,
+    consistency_camera: ColmapCamera | None = None,
+    max_consistency_residual_increase_px: float | None = None,
+    max_consistency_residual_px: float | None = None,
 ) -> tuple[list[QueryTo3DMatch], dict[str, object]]:
     refined = list(matches)
     offsets = np.asarray(offsets, dtype=np.float32)
@@ -855,21 +859,110 @@ def apply_predicted_patch_offsets(
         gate &= sigma_gate
     refined_count = 0
     offset_norms = []
+    applied_confidences = []
+    sigma_values = None if sigmas is None else np.asarray(sigmas, dtype=np.float32).reshape(-1)
+    if sigma_values is not None and sigma_values.shape[0] != len(matches):
+        raise ValueError("sigmas must have one value per match")
+    compute_consistency = consistency_pose_w2c is not None and consistency_camera is not None
+    use_consistency_gate = bool(compute_consistency)
+    if compute_consistency:
+        if max_consistency_residual_increase_px is None and max_consistency_residual_px is None:
+            use_consistency_gate = False
+        if max_consistency_residual_increase_px is not None and float(max_consistency_residual_increase_px) < 0.0:
+            raise ValueError("max_consistency_residual_increase_px must be non-negative")
+        if max_consistency_residual_px is not None and float(max_consistency_residual_px) < 0.0:
+            raise ValueError("max_consistency_residual_px must be non-negative")
+    rejected_by_consistency = 0
+    consistency_before_values = []
+    consistency_after_values = []
+    consistency_increase_values = []
     for idx, match in enumerate(matches):
+        confidence_value = round(float(confidences[idx]), 6)
+        sigma_value = None if sigma_values is None else round(float(sigma_values[idx]), 6)
         if not bool(gate[idx]):
+            refined[idx] = replace(
+                match,
+                patch_offset_confidence=confidence_value,
+                patch_offset_sigma=sigma_value,
+                patch_offset_applied=False,
+                patch_offset_norm_px=0.0,
+            )
             continue
         delta = np.clip(offsets[idx], -float(max_offset_stride), float(max_offset_stride)) * float(stride_px)
-        refined[idx] = replace(match, xy=np.asarray(match.xy, dtype=np.float64).reshape(2) + delta.astype(np.float64))
+        offset_norm = float(np.linalg.norm(delta))
+        refined_xy = np.asarray(match.xy, dtype=np.float64).reshape(2) + delta.astype(np.float64)
+        consistency_before = None
+        consistency_after = None
+        reject_offset = False
+        if compute_consistency:
+            projected = project_xyz_to_image(
+                np.asarray(match.xyz, dtype=np.float64).reshape(3),
+                np.asarray(consistency_pose_w2c, dtype=np.float64).reshape(4, 4),
+                consistency_camera,
+            )
+            if projected is None:
+                reject_offset = bool(use_consistency_gate)
+            else:
+                projected_xy = np.asarray(projected, dtype=np.float64).reshape(2)
+                consistency_before = float(np.linalg.norm(np.asarray(match.xy, dtype=np.float64).reshape(2) - projected_xy))
+                consistency_after = float(np.linalg.norm(refined_xy - projected_xy))
+                consistency_before_values.append(consistency_before)
+                consistency_after_values.append(consistency_after)
+                consistency_increase_values.append(consistency_after - consistency_before)
+                if use_consistency_gate:
+                    if max_consistency_residual_px is not None and consistency_after > float(max_consistency_residual_px):
+                        reject_offset = True
+                    if (
+                        max_consistency_residual_increase_px is not None
+                        and consistency_after > consistency_before + float(max_consistency_residual_increase_px)
+                    ):
+                        reject_offset = True
+        if reject_offset:
+            rejected_by_consistency += 1
+            refined[idx] = replace(
+                match,
+                patch_offset_confidence=confidence_value,
+                patch_offset_sigma=sigma_value,
+                patch_offset_applied=False,
+                patch_offset_norm_px=0.0,
+                patch_offset_consistency_before_px=None if consistency_before is None else round(consistency_before, 6),
+                patch_offset_consistency_after_px=None if consistency_after is None else round(consistency_after, 6),
+            )
+            continue
+        refined[idx] = replace(
+            match,
+            xy=refined_xy,
+            patch_offset_confidence=confidence_value,
+            patch_offset_sigma=sigma_value,
+            patch_offset_applied=True,
+            patch_offset_norm_px=offset_norm,
+            patch_offset_consistency_before_px=None if consistency_before is None else round(consistency_before, 6),
+            patch_offset_consistency_after_px=None if consistency_after is None else round(consistency_after, 6),
+        )
         refined_count += 1
-        offset_norms.append(float(np.linalg.norm(delta)))
+        offset_norms.append(offset_norm)
+        applied_confidences.append(confidence_value)
     return refined, {
         "mode": "learned",
         "refined_count": int(refined_count),
         "mean_offset_px": None if not offset_norms else float(np.mean(offset_norms)),
         "mean_confidence": float(np.mean(confidences)) if confidences.size else 0.0,
+        "mean_applied_confidence": None if not applied_confidences else float(np.mean(applied_confidences)),
+        "offset_applied_ratio": float(refined_count / max(len(matches), 1)),
         "confidence_threshold": float(confidence_threshold),
         "max_sigma": None if max_sigma is None else float(max_sigma),
         "rejected_by_sigma_count": int(rejected_by_sigma),
+        "rejected_by_consistency_count": int(rejected_by_consistency),
+        "max_consistency_residual_increase_px": None
+        if max_consistency_residual_increase_px is None
+        else float(max_consistency_residual_increase_px),
+        "max_consistency_residual_px": None
+        if max_consistency_residual_px is None
+        else float(max_consistency_residual_px),
+        "consistency_evaluated_count": int(len(consistency_before_values)),
+        "mean_consistency_before_px": None if not consistency_before_values else float(np.mean(consistency_before_values)),
+        "mean_consistency_after_px": None if not consistency_after_values else float(np.mean(consistency_after_values)),
+        "mean_consistency_increase_px": None if not consistency_increase_values else float(np.mean(consistency_increase_values)),
     }
 
 

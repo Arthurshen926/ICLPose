@@ -42,6 +42,7 @@ from feature_extract.vfm.patch_selector_training import (
 )
 from feature_extract.vfm.patch_to_3d_matching import build_patch_positive_sets, filter_landmarks_by_projected_visibility
 from feature_extract.vfm.query_to_3d_matching import LandmarkMapIndex, filter_landmarks_by_reference_images
+from feature_extract.vfm.semidense_anchor_map import SemiDenseAnchorMap
 from feature_extract.vfm.tokens import TokenBankManifest
 
 
@@ -65,15 +66,18 @@ def _summary_stats(values: list[float]) -> dict[str, float]:
 
 
 def _path_sha_or_empty(path: str) -> str:
+    if not str(path):
+        return ""
     value = Path(path)
-    return file_sha256_short(value) if value.exists() else ""
+    return file_sha256_short(value) if value.exists() and value.is_file() else ""
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
     parser = argparse.ArgumentParser(description="Train Stage C1 supervised linear patch selector")
     parser.add_argument("--query_manifest", required=True)
-    parser.add_argument("--landmark_bank", required=True)
-    parser.add_argument("--track_observations", required=True)
+    parser.add_argument("--landmark_bank", default="")
+    parser.add_argument("--semidense_anchor_npz", default="")
+    parser.add_argument("--track_observations", default="")
     parser.add_argument("--query_pose_file", required=True)
     parser.add_argument("--candidate_bank", default="")
     parser.add_argument("--visibility_index", default="")
@@ -147,9 +151,14 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     else:
         manifest = TokenBankManifest.from_json(Path(args.query_manifest))
         manifest.validate(verify_checksums=False)
-        bank = load_selected_track_bank_npz(Path(args.landmark_bank))
-        xyz_by_track, reprojection_error_by_track = _load_track_stats(Path(args.track_observations))
-        landmark_index = LandmarkMapIndex.from_track_bank(bank, xyz_by_track, reprojection_error_by_track)
+        if args.semidense_anchor_npz:
+            landmark_index = SemiDenseAnchorMap.load_npz(Path(args.semidense_anchor_npz)).to_landmark_index()
+        else:
+            if not args.landmark_bank or not args.track_observations:
+                raise ValueError("provide --landmark_bank and --track_observations, or --semidense_anchor_npz")
+            bank = load_selected_track_bank_npz(Path(args.landmark_bank))
+            xyz_by_track, reprojection_error_by_track = _load_track_stats(Path(args.track_observations))
+            landmark_index = LandmarkMapIndex.from_track_bank(bank, xyz_by_track, reprojection_error_by_track)
         visibility_index = LandmarkVisibilityIndex.load_npz(Path(args.visibility_index)) if args.visibility_index else None
         reference_submaps = _load_reference_submaps(args.candidate_bank, args.submap_top_n)
         gt_by_query = {record.image_id: record for record in parse_cambridge_pose_file(Path(args.query_pose_file))}
@@ -306,6 +315,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                     "path": str(args.landmark_bank),
                     "sha256": _path_sha_or_empty(args.landmark_bank),
                 },
+                "semidense_anchor_npz": {
+                    "path": str(args.semidense_anchor_npz),
+                    "sha256": _path_sha_or_empty(args.semidense_anchor_npz),
+                },
                 "track_observations": str(args.track_observations),
                 "query_pose_file": str(args.query_pose_file),
                 "candidate_bank": str(args.candidate_bank),
@@ -339,6 +352,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         metadata={
             "stage": "stage_c1_supervised_linear_patch_selector",
             "source_landmark_bank": str(args.landmark_bank),
+            "source_semidense_anchor_npz": str(args.semidense_anchor_npz),
             "source_query_manifest": str(args.query_manifest),
             "query_pose_file": str(args.query_pose_file),
             "candidate_bank": str(args.candidate_bank),
@@ -354,6 +368,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     if any(export_args):
         if not all(export_args):
             raise ValueError("--output_query_dir, --output_query_manifest and --output_landmark_bank must be provided together")
+        if args.semidense_anchor_npz:
+            raise ValueError("export from --semidense_anchor_npz is not supported by this script; use project_stage_h2_gaussian_anchor_map.py")
         if manifest is None:
             manifest = TokenBankManifest.from_json(Path(args.query_manifest))
             manifest.validate(verify_checksums=False)

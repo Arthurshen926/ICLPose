@@ -15,6 +15,7 @@ from feature_extract.vfm.query_to_3d_matching import (
     SpatialDiversityPnPConfig,
     deduplicate_pnp_matches,
     estimate_pose_pnp_fixed,
+    estimate_pose_pnp_fixed_robust,
     estimate_pose_pnp_ransac,
     filter_matches_by_local_geometric_consistency,
     filter_landmarks_by_reference_images,
@@ -178,6 +179,70 @@ def test_query_tokens_match_landmarks_and_support_pnp() -> None:
 
     with pytest.raises(ValueError, match="unsupported PnP method"):
         estimate_pose_pnp_ransac(matches, _camera(), pnp_method="BAD")
+
+
+def test_robust_fixed_pnp_refinement_downweights_bad_measurements() -> None:
+    rng = np.random.default_rng(7)
+    clean_xy = np.asarray(
+        [
+            [20.0, 20.0],
+            [80.0, 22.0],
+            [25.0, 75.0],
+            [75.0, 78.0],
+            [50.0, 18.0],
+            [18.0, 50.0],
+            [82.0, 50.0],
+            [50.0, 82.0],
+            [35.0, 35.0],
+            [65.0, 65.0],
+        ],
+        dtype=np.float64,
+    )
+    z = np.linspace(4.0, 8.0, clean_xy.shape[0], dtype=np.float64)
+    xyz = _xyz_from_xy(clean_xy, z)
+    measured = clean_xy + rng.normal(0.0, 0.25, size=clean_xy.shape)
+    measured[-2:] += np.asarray([[25.0, -20.0], [-28.0, 18.0]], dtype=np.float64)
+    matches = [
+        QueryTo3DMatch(
+            token_index=idx,
+            xy=measured[idx],
+            track_id=idx + 1,
+            xyz=xyz[idx],
+            similarity=0.9,
+            ratio=0.0,
+            landmark_variance=0.0,
+        )
+        for idx in range(clean_xy.shape[0])
+    ]
+    initial = np.eye(4, dtype=np.float64)
+    initial[:3, 3] = np.asarray([0.08, -0.06, 0.04], dtype=np.float64)
+    weights = np.ones((len(matches),), dtype=np.float64)
+    weights[-2:] = 0.02
+
+    unweighted = estimate_pose_pnp_fixed_robust(
+        matches,
+        _camera(),
+        initial_pose_w2c=initial,
+        weights=np.ones_like(weights),
+        loss="linear",
+        max_nfev=80,
+    )
+    weighted = estimate_pose_pnp_fixed_robust(
+        matches,
+        _camera(),
+        initial_pose_w2c=initial,
+        weights=weights,
+        loss="huber",
+        f_scale_px=2.0,
+        max_nfev=80,
+    )
+
+    assert weighted.success
+    assert weighted.inlier_count == len(matches)
+    unweighted_error = pnp_pose_error(unweighted.pose_w2c, np.eye(4, dtype=np.float64))
+    weighted_error = pnp_pose_error(weighted.pose_w2c, np.eye(4, dtype=np.float64))
+    assert weighted_error.translation_m < unweighted_error.translation_m
+    assert weighted_error.translation_m < 0.05
 
 
 def test_soft_order_pnp_matches_keeps_matches_but_prioritizes_confident_inputs() -> None:
