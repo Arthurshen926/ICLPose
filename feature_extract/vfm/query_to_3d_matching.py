@@ -762,6 +762,12 @@ def _soft_pnp_score(match: QueryTo3DMatch, mode: str) -> float:
         confidence = float(np.clip(np.exp(float(match.pairwise_inlier_logprob)), 0.0, 1.0))
     else:
         confidence = 1.0
+    sigma = 1.0
+    if match.measurement_sigma_px is not None and np.isfinite(float(match.measurement_sigma_px)):
+        sigma = max(float(match.measurement_sigma_px), 1.0)
+    if match.pnp_uncertainty_scale is not None and np.isfinite(float(match.pnp_uncertainty_scale)):
+        sigma *= max(float(match.pnp_uncertainty_scale), 1e-6)
+    uncertainty = float(1.0 / (1.0 + max(0.0, sigma - 1.0) / 8.0))
 
     if mode == "similarity":
         return similarity
@@ -771,8 +777,18 @@ def _soft_pnp_score(match: QueryTo3DMatch, mode: str) -> float:
         return 0.5 * reliability + 0.25 * margin + 0.25 * similarity
     if mode == "confidence":
         return 0.5 * confidence + 0.25 * margin + 0.25 * similarity
+    if mode == "uncertainty":
+        return float((0.60 * similarity + 0.25 * margin + 0.15 * confidence) * uncertainty)
     if mode == "composite":
-        return float(similarity * (0.5 + 0.5 * reliability) * (0.5 + 0.5 * quality) * (0.5 + 0.5 * confidence) * (0.5 + 0.5 * local) * (1.0 + margin))
+        return float(
+            similarity
+            * (0.5 + 0.5 * reliability)
+            * (0.5 + 0.5 * quality)
+            * (0.5 + 0.5 * confidence)
+            * (0.5 + 0.5 * local)
+            * (0.5 + 0.5 * uncertainty)
+            * (1.0 + margin)
+        )
     raise ValueError(f"unsupported soft PnP ordering mode: {mode}")
 
 

@@ -231,6 +231,18 @@ from feature_extract.vfm.vfm_depth_head import (
     scale_invariant_log_loss,
     splat_surface_token_depth,
 )
+from feature_extract.vfm.vfm_2dgs_geometry_labels import (
+    TwoDgsGeometryLabel,
+    TwoDgsGeometryRenderConfig,
+    render_2dgs_geometry_label,
+)
+from feature_extract.vfm.vfm_highres_geometry_head import (
+    GeometryHeadOutput,
+    RadioHighResGeometryHead,
+    masked_geometry_loss,
+    masked_log_depth_l1 as masked_highres_log_depth_l1,
+    masked_normal_cosine_loss,
+)
 from feature_extract.vfm.patch_footprint_matching import (
     FootprintBank,
     FootprintMatch,
@@ -372,6 +384,7 @@ __all__ = [
     "GaussianVFMRenderResult",
     "GaussianVFMRayContributionConfig",
     "GaussianVFMSource",
+    "GeometryHeadOutput",
     "HardCaseCandidate",
     "HardCaseSplits",
     "HeatmapPatchOffsetRefiner",
@@ -413,6 +426,7 @@ __all__ = [
     "QueryTo3DMatchingConfig",
     "QueryToRenderMatchingConfig",
     "RADIO_TOKEN_DEPTH_INVALID",
+    "RadioHighResGeometryHead",
     "RadioTokenDepthHead",
     "RenderedSelectedMapFeature",
     "RenderedMapEvidenceScore",
@@ -438,6 +452,8 @@ __all__ = [
     "TokenPatchBox",
     "TokenDepthRasterConfig",
     "TokenDepthLabel",
+    "TwoDgsGeometryLabel",
+    "TwoDgsGeometryRenderConfig",
     "TrackFeature",
     "TrackObservation",
     "VFMExperimentManifest",
@@ -518,6 +534,9 @@ __all__ = [
     "map_reliability_uncertainty_scale",
     "mask_channels_by_utility",
     "masked_log_depth_l1",
+    "masked_geometry_loss",
+    "masked_highres_log_depth_l1",
+    "masked_normal_cosine_loss",
     "mapability_summary",
     "metadata_only_scores",
     "mcnemar_exact_pvalue",
@@ -560,6 +579,7 @@ __all__ = [
     "render_gaussian_vfm_feature_map",
     "render_gaussian_vfm_feature_map_gsplat",
     "render_surface_token_depth_label",
+    "render_2dgs_geometry_label",
     "render_selected_track_bank",
     "rendered_selected_map_token_grid",
     "refine_matches_with_oracle_offsets",

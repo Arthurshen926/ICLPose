@@ -1,0 +1,2532 @@
+"""MATCHA-first joint training loop for RADIO render/query matching.
+
+This module intentionally keeps the old coarse-fine adapter usable, but trains
+the MATCHA-inspired heads in one optimizer step:
+
+* descriptor selector with dual-softmax correspondence loss,
+* 8x8 offset and pair-fine heads,
+* pair confidence head,
+* dense heatmap/reliability head on selected feature maps,
+* RGB-local 65-bin keypoint detector trained by ALIKE-style labels.
+"""
+
+from __future__ import annotations
+
+import json
+import random
+from collections import OrderedDict
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+import torch
+from torch import nn
+from torch.nn import functional as F
+
+from feature_extract.vfm.matcha_coarse_fine_adapter import (
+    MatchaCoarseFineAdapter,
+    MatchaCoarseFineTrainingRun,
+    MatchaCoarseFineTrainingSet,
+    _OriginalMatchaFineMatcher,
+    _dual_softmax_descriptor_loss_and_confidence,
+    _fine_coordinate_loss_and_metrics,
+)
+from feature_extract.vfm.matcha_rgb_keypoint_detector import (
+    BasicConvLayer,
+    MatchaRgbKeypointDetector,
+    matcha_alike_distillation_loss,
+    matcha_keypoint_position_loss,
+)
+
+
+_JOINT_FORMAT = "vfm_matcha_joint_training_set_v1"
+_JOINT_INDEX_FORMAT = "vfm_matcha_joint_index_training_set_v2"
+_JOINT_MODEL_FORMAT = "vfm_matcha_joint_model_v1"
+_JOINT_MANIFEST_FORMAT = "vfm_matcha_joint_training_manifest_v1"
+
+
+class _IndexedFeatureRows:
+    def __init__(self, feature_maps: np.ndarray, cell_indices: np.ndarray, pair_indices: np.ndarray | None = None) -> None:
+        maps = np.asarray(feature_maps, dtype=np.float32)
+        if maps.ndim != 4:
+            raise ValueError("feature_maps must have shape (B, C, H, W)")
+        indices = np.asarray(cell_indices, dtype=np.int64).reshape(-1)
+        pairs = np.zeros((indices.shape[0],), dtype=np.int64) if pair_indices is None else np.asarray(pair_indices, dtype=np.int64).reshape(-1)
+        if pairs.shape[0] != indices.shape[0]:
+            raise ValueError("pair_indices must contain one value per cell index")
+        if np.any(pairs < 0) or np.any(pairs >= maps.shape[0]):
+            raise ValueError("pair_indices contains an out-of-range pair")
+        if np.any(indices < 0) or np.any(indices >= int(maps.shape[2] * maps.shape[3])):
+            raise ValueError("cell_indices contains an out-of-range cell")
+        self.feature_maps = maps
+        self.cell_indices = indices
+        self.pair_indices = pairs
+        self.shape = (int(indices.shape[0]), int(maps.shape[1]))
+
+    def __len__(self) -> int:
+        return int(self.shape[0])
+
+    def __getitem__(self, item) -> np.ndarray:
+        rows = np.asarray(np.arange(len(self))[item], dtype=np.int64).reshape(-1)
+        maps = self.feature_maps
+        height, width = int(maps.shape[2]), int(maps.shape[3])
+        pairs = self.pair_indices[rows]
+        cells = self.cell_indices[rows]
+        y = cells // width
+        x = cells % width
+        return maps[pairs, :, y, x].astype(np.float32, copy=False)
+
+
+class _IndexedNegativeFeatureRows:
+    def __init__(self, render_feature_maps: np.ndarray, negative_render_indices: np.ndarray, pair_indices: np.ndarray | None = None) -> None:
+        maps = np.asarray(render_feature_maps, dtype=np.float32)
+        if maps.ndim != 4:
+            raise ValueError("render_feature_maps must have shape (B, C, H, W)")
+        negative = np.asarray(negative_render_indices, dtype=np.int64)
+        if negative.ndim != 2:
+            raise ValueError("negative_render_indices must have shape (N, K)")
+        pairs = np.zeros((negative.shape[0],), dtype=np.int64) if pair_indices is None else np.asarray(pair_indices, dtype=np.int64).reshape(-1)
+        if pairs.shape[0] != negative.shape[0]:
+            raise ValueError("pair_indices must contain one value per negative row")
+        if np.any(pairs < 0) or np.any(pairs >= maps.shape[0]):
+            raise ValueError("pair_indices contains an out-of-range pair")
+        if np.any(negative < 0) or np.any(negative >= int(maps.shape[2] * maps.shape[3])):
+            raise ValueError("negative_render_indices contains an out-of-range cell")
+        self.render_feature_maps = maps
+        self.negative_render_indices = negative
+        self.pair_indices = pairs
+        self.shape = (int(negative.shape[0]), int(negative.shape[1]), int(maps.shape[1]))
+
+    def __len__(self) -> int:
+        return int(self.shape[0])
+
+    def __getitem__(self, item) -> np.ndarray:
+        rows = np.asarray(np.arange(len(self))[item], dtype=np.int64).reshape(-1)
+        maps = self.render_feature_maps
+        _batch, _channels, _height, width = maps.shape
+        pairs = self.pair_indices[rows]
+        cells = self.negative_render_indices[rows]
+        y = cells // int(width)
+        x = cells % int(width)
+        gathered = maps[pairs[:, None], :, y, x]
+        return gathered.astype(np.float32, copy=False)
+
+
+class IndexOnlyCoarseFineRows:
+    """Coarse/fine rows backed by full feature maps and integer cell indices."""
+
+    def __init__(
+        self,
+        *,
+        query_feature_maps: np.ndarray,
+        render_feature_maps: np.ndarray,
+        query_cell_indices: np.ndarray,
+        render_cell_indices: np.ndarray,
+        negative_render_indices: np.ndarray,
+        query_offset_labels: np.ndarray,
+        render_offset_labels: np.ndarray,
+        roundtrip_errors_px: np.ndarray,
+        query_offset_soft_labels: np.ndarray | None = None,
+        render_offset_soft_labels: np.ndarray | None = None,
+        sample_confidence_targets: np.ndarray | None = None,
+        sample_uncertainty_px: np.ndarray | None = None,
+        sample_pair_indices: np.ndarray | None = None,
+        metadata: dict[str, object] | None = None,
+    ) -> None:
+        self.query_features = _IndexedFeatureRows(query_feature_maps, query_cell_indices, sample_pair_indices)
+        self.render_features = _IndexedFeatureRows(render_feature_maps, render_cell_indices, sample_pair_indices)
+        self.negative_render_features = _IndexedNegativeFeatureRows(render_feature_maps, negative_render_indices, sample_pair_indices)
+        self.query_offset_labels = np.asarray(query_offset_labels, dtype=np.int64).reshape(-1)
+        self.render_offset_labels = np.asarray(render_offset_labels, dtype=np.int64).reshape(-1)
+        self.roundtrip_errors_px = np.asarray(roundtrip_errors_px, dtype=np.float32).reshape(-1)
+        self.query_offset_soft_labels = None if query_offset_soft_labels is None else np.asarray(query_offset_soft_labels, dtype=np.float32)
+        self.render_offset_soft_labels = None if render_offset_soft_labels is None else np.asarray(render_offset_soft_labels, dtype=np.float32)
+        self.sample_confidence_targets = None if sample_confidence_targets is None else np.asarray(sample_confidence_targets, dtype=np.float32).reshape(-1)
+        self.sample_uncertainty_px = None if sample_uncertainty_px is None else np.asarray(sample_uncertainty_px, dtype=np.float32).reshape(-1)
+        self.negative_render_indices = np.asarray(negative_render_indices, dtype=np.int64)
+        self.metadata = dict(metadata or {})
+        sample_count = int(self.query_features.shape[0])
+        if self.render_features.shape[0] != sample_count or self.negative_render_features.shape[0] != sample_count:
+            raise ValueError("index-only row views must have the same sample count")
+        for name, value in (
+            ("query_offset_labels", self.query_offset_labels),
+            ("render_offset_labels", self.render_offset_labels),
+            ("roundtrip_errors_px", self.roundtrip_errors_px),
+        ):
+            if value.shape[0] != sample_count:
+                raise ValueError(f"{name} must contain one value per sample")
+        for name, value in (("query_offset_soft_labels", self.query_offset_soft_labels), ("render_offset_soft_labels", self.render_offset_soft_labels)):
+            if value is not None and value.shape != (sample_count, 65):
+                raise ValueError(f"{name} must have shape (N, 65)")
+        for name, value in (("sample_confidence_targets", self.sample_confidence_targets), ("sample_uncertainty_px", self.sample_uncertainty_px)):
+            if value is not None and value.shape[0] != sample_count:
+                raise ValueError(f"{name} must contain one value per sample")
+
+    @property
+    def sample_count(self) -> int:
+        return int(self.query_features.shape[0])
+
+    @property
+    def input_dim(self) -> int:
+        return int(self.query_features.shape[1])
+
+
+@dataclass(frozen=True)
+class MatchaJointTrainingSet:
+    coarse_fine_samples: MatchaCoarseFineTrainingSet
+    query_feature_maps: np.ndarray | None = None
+    render_feature_maps: np.ndarray | None = None
+    query_heatmap_targets: np.ndarray | None = None
+    render_heatmap_targets: np.ndarray | None = None
+    sample_pair_indices: np.ndarray | None = None
+    query_cell_indices: np.ndarray | None = None
+    render_cell_indices: np.ndarray | None = None
+    query_rgb_images: np.ndarray | None = None
+    render_rgb_images: np.ndarray | None = None
+    query_rgb_keypoint_labels: np.ndarray | None = None
+    render_rgb_keypoint_labels: np.ndarray | None = None
+    pair_type_ids: np.ndarray | None = None
+    pair_type_names: np.ndarray | None = None
+    pair_query_ids: np.ndarray | None = None
+    pair_split_names: np.ndarray | None = None
+    pair_candidate_ids: np.ndarray | None = None
+    pair_translation_errors_m: np.ndarray | None = None
+    pair_rotation_errors_deg: np.ndarray | None = None
+    sample_no_match_labels: np.ndarray | None = None
+    sample_ignore_mask: np.ndarray | None = None
+    sample_confidence_ignore_mask: np.ndarray | None = None
+    query_repeatability_targets: np.ndarray | None = None
+    render_repeatability_targets: np.ndarray | None = None
+
+    def __post_init__(self) -> None:
+        if self.coarse_fine_samples.sample_count <= 0:
+            raise ValueError("coarse_fine_samples must contain at least one sample")
+
+        def check_maps(name: str, maps: np.ndarray | None, targets: np.ndarray | None) -> None:
+            if maps is None and targets is None:
+                return
+            if maps is None or targets is None:
+                raise ValueError(f"{name} feature maps and heatmap targets must be provided together")
+            arr = np.asarray(maps, dtype=np.float32)
+            tgt = np.asarray(targets, dtype=np.float32)
+            if arr.ndim != 4:
+                raise ValueError(f"{name} feature maps must have shape (B, C, H, W)")
+            if tgt.shape != (arr.shape[0], arr.shape[2], arr.shape[3]):
+                raise ValueError(f"{name} heatmap targets must have shape (B, H, W)")
+            if int(arr.shape[1]) != int(self.coarse_fine_samples.input_dim):
+                raise ValueError(f"{name} feature-map channels must match sample input_dim")
+
+        def check_rgb(name: str, images: np.ndarray | None, labels: np.ndarray | None) -> None:
+            if images is None and labels is None:
+                return
+            if images is None or labels is None:
+                raise ValueError(f"{name} RGB images and keypoint labels must be provided together")
+            img = np.asarray(images, dtype=np.float32)
+            lab = np.asarray(labels, dtype=np.int64)
+            if img.ndim != 4 or int(img.shape[1]) != 3:
+                raise ValueError(f"{name} RGB images must have shape (B, 3, H, W)")
+            if int(img.shape[2]) % 8 != 0 or int(img.shape[3]) % 8 != 0:
+                raise ValueError(f"{name} RGB image height and width must be divisible by 8")
+            if lab.shape != (img.shape[0], img.shape[2] // 8, img.shape[3] // 8):
+                raise ValueError(f"{name} labels must have shape (B, H/8, W/8)")
+            if lab.size and (np.any(lab < 0) or np.any(lab > 64)):
+                raise ValueError(f"{name} labels must be in [0, 64]")
+
+        check_maps("query", self.query_feature_maps, self.query_heatmap_targets)
+        check_maps("render", self.render_feature_maps, self.render_heatmap_targets)
+        check_rgb("query", self.query_rgb_images, self.query_rgb_keypoint_labels)
+        check_rgb("render", self.render_rgb_images, self.render_rgb_keypoint_labels)
+        for name, targets, maps in (
+            ("query_repeatability_targets", self.query_repeatability_targets, self.query_feature_maps),
+            ("render_repeatability_targets", self.render_repeatability_targets, self.render_feature_maps),
+        ):
+            if targets is None:
+                continue
+            if maps is None:
+                raise ValueError(f"{name} requires corresponding feature maps")
+            tgt = np.asarray(targets, dtype=np.float32)
+            arr = np.asarray(maps, dtype=np.float32)
+            if tgt.shape != (arr.shape[0], arr.shape[2], arr.shape[3]):
+                raise ValueError(f"{name} must have shape (B, H, W)")
+            object.__setattr__(self, name, tgt)
+        sample_count = int(self.coarse_fine_samples.sample_count)
+        for name, value, dtype in (
+            ("sample_no_match_labels", self.sample_no_match_labels, np.int64),
+            ("sample_ignore_mask", self.sample_ignore_mask, bool),
+            ("sample_confidence_ignore_mask", self.sample_confidence_ignore_mask, bool),
+        ):
+            if value is None:
+                continue
+            arr = np.asarray(value, dtype=dtype).reshape(-1)
+            if arr.shape[0] != sample_count:
+                raise ValueError(f"{name} must contain one value per coarse-fine sample")
+            object.__setattr__(self, name, arr)
+        if (self.query_cell_indices is None) != (self.render_cell_indices is None):
+            raise ValueError("query_cell_indices and render_cell_indices must be provided together")
+        if self.query_cell_indices is not None and self.render_cell_indices is not None:
+            qidx = np.asarray(self.query_cell_indices, dtype=np.int64).reshape(-1)
+            ridx = np.asarray(self.render_cell_indices, dtype=np.int64).reshape(-1)
+            if qidx.shape[0] != self.coarse_fine_samples.sample_count or ridx.shape[0] != self.coarse_fine_samples.sample_count:
+                raise ValueError("cell indices must contain one value per coarse-fine sample")
+            object.__setattr__(self, "query_cell_indices", qidx)
+            object.__setattr__(self, "render_cell_indices", ridx)
+            if self.sample_pair_indices is None:
+                pair_indices = np.zeros((self.coarse_fine_samples.sample_count,), dtype=np.int64)
+            else:
+                pair_indices = np.asarray(self.sample_pair_indices, dtype=np.int64).reshape(-1)
+                if pair_indices.shape[0] != self.coarse_fine_samples.sample_count:
+                    raise ValueError("sample_pair_indices must contain one value per coarse-fine sample")
+            if np.any(pair_indices < 0):
+                raise ValueError("sample_pair_indices must be non-negative")
+            object.__setattr__(self, "sample_pair_indices", pair_indices)
+        pair_count = int(self.query_feature_maps.shape[0]) if self.query_feature_maps is not None else 0
+        for name, value, dtype in (
+            ("pair_type_ids", self.pair_type_ids, np.int64),
+            ("pair_translation_errors_m", self.pair_translation_errors_m, np.float32),
+            ("pair_rotation_errors_deg", self.pair_rotation_errors_deg, np.float32),
+        ):
+            if value is None:
+                continue
+            arr = np.asarray(value, dtype=dtype).reshape(-1)
+            if pair_count and arr.shape[0] != pair_count:
+                raise ValueError(f"{name} must contain one value per query/render pair")
+            object.__setattr__(self, name, arr)
+        if self.pair_type_names is not None:
+            names = np.asarray(self.pair_type_names, dtype=object).reshape(-1)
+            if pair_count and names.shape[0] != pair_count:
+                raise ValueError("pair_type_names must contain one value per query/render pair")
+            object.__setattr__(self, "pair_type_names", names)
+        for name in ("pair_query_ids", "pair_split_names", "pair_candidate_ids"):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            arr = np.asarray(value, dtype=object).reshape(-1)
+            if pair_count and arr.shape[0] != pair_count:
+                raise ValueError(f"{name} must contain one value per query/render pair")
+            object.__setattr__(self, name, arr)
+
+
+@dataclass(frozen=True)
+class MatchaJointTrainingConfig:
+    model_type: str = "residual_adapter"
+    output_dim: int = 128
+    residual_hidden_dim: int = 256
+    fine_input_dim: int = 0
+    coarse_input_dim: int = 0
+    attention_hidden_dim: int = 256
+    attention_depth: int = 2
+    attention_heads: int = 4
+    attention_patch_size: int = 2
+    attention_upsample_mode: str = "bilinear"
+    attention_fusion_mode: str = "legacy"
+    steps: int = 300
+    batch_size: int = 512
+    lr: float = 5e-5
+    temperature: float = 0.07
+    dual_softmax_weight: float = 1.0
+    offset_loss_weight: float = 0.25
+    pair_fine_loss_weight: float = 0.25
+    query_pair_fine_loss_weight: float = 0.0
+    pair_confidence_loss_weight: float = 0.1
+    dense_heatmap_loss_weight: float = 0.25
+    rgb_keypoint_loss_weight: float = 0.25
+    rgb_keypoint_position_loss_weight: float = 0.0
+    repeatability_loss_weight: float = 0.0
+    local_fine_transformer_loss_weight: float = 0.0
+    patch_correlation_loss_weight: float = 0.0
+    patch_correlation_window_size: int = 3
+    hard_negative_weight: float = 0.2
+    hard_negative_margin: float = 0.2
+    hard_false_match_weight: float = 0.0
+    hard_false_match_margin: float = 0.2
+    group_size: int = 64
+    input_norm_mode: str = "identity"
+    gate_mode: str = "residual"
+    residual_gate_scale: float = 0.1
+    rgb_non_keypoint_divisor: int = 32
+    map_pair_batch_size: int = 8
+    device: str = "cpu"
+    seed: int = 0
+
+    def __post_init__(self) -> None:
+        if str(self.model_type) not in {"residual_adapter", "radio_dual_attention"}:
+            raise ValueError("model_type must be 'residual_adapter' or 'radio_dual_attention'")
+        if int(self.output_dim) <= 0:
+            raise ValueError("output_dim must be positive")
+        if int(self.residual_hidden_dim) <= 0:
+            raise ValueError("residual_hidden_dim must be positive")
+        if str(self.model_type) == "radio_dual_attention":
+            if int(self.fine_input_dim) <= 0 or int(self.coarse_input_dim) <= 0:
+                raise ValueError("fine_input_dim and coarse_input_dim must be positive for radio_dual_attention")
+            if int(self.attention_hidden_dim) <= 0:
+                raise ValueError("attention_hidden_dim must be positive")
+            if int(self.attention_depth) <= 0:
+                raise ValueError("attention_depth must be positive")
+            if int(self.attention_heads) <= 0:
+                raise ValueError("attention_heads must be positive")
+            if int(self.attention_patch_size) <= 0:
+                raise ValueError("attention_patch_size must be positive")
+            if str(self.attention_upsample_mode) not in {"bilinear", "pixel_shuffle"}:
+                raise ValueError("attention_upsample_mode must be 'bilinear' or 'pixel_shuffle'")
+            if str(self.attention_fusion_mode) not in {"legacy", "matcha_original"}:
+                raise ValueError("attention_fusion_mode must be 'legacy' or 'matcha_original'")
+            if str(self.attention_upsample_mode) == "pixel_shuffle" and int(self.attention_hidden_dim) % (int(self.attention_patch_size) ** 2) != 0:
+                raise ValueError("attention_hidden_dim must be divisible by attention_patch_size^2 for pixel_shuffle")
+        if int(self.steps) <= 0:
+            raise ValueError("steps must be positive")
+        if int(self.batch_size) <= 1:
+            raise ValueError("batch_size must be greater than one")
+        if int(self.map_pair_batch_size) <= 0:
+            raise ValueError("map_pair_batch_size must be positive")
+        if float(self.lr) <= 0.0:
+            raise ValueError("lr must be positive")
+        if float(self.temperature) <= 0.0:
+            raise ValueError("temperature must be positive")
+        for name in (
+            "dual_softmax_weight",
+            "offset_loss_weight",
+            "pair_fine_loss_weight",
+            "query_pair_fine_loss_weight",
+            "pair_confidence_loss_weight",
+            "dense_heatmap_loss_weight",
+            "rgb_keypoint_loss_weight",
+            "rgb_keypoint_position_loss_weight",
+            "repeatability_loss_weight",
+            "local_fine_transformer_loss_weight",
+            "patch_correlation_loss_weight",
+            "hard_negative_weight",
+            "hard_false_match_weight",
+        ):
+            if float(getattr(self, name)) < 0.0:
+                raise ValueError(f"{name} must be non-negative")
+        if int(self.patch_correlation_window_size) <= 0 or int(self.patch_correlation_window_size) % 2 == 0:
+            raise ValueError("patch_correlation_window_size must be a positive odd integer")
+        if int(self.rgb_non_keypoint_divisor) <= 0:
+            raise ValueError("rgb_non_keypoint_divisor must be positive")
+
+
+@dataclass
+class MatchaJointTrainingRun:
+    model: "MatchaStyleJointModel"
+    summary: dict[str, object]
+
+
+class MatchaStyleJointModel(nn.Module):
+    """MATCHA-first wrapper around the existing RADIO selector adapter."""
+
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int = 128,
+        residual_hidden_dim: int = 256,
+        group_size: int = 64,
+        input_norm_mode: str = "identity",
+        gate_mode: str = "residual",
+        residual_gate_scale: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.adapter = MatchaCoarseFineAdapter(
+            input_dim=int(input_dim),
+            output_dim=int(output_dim),
+            residual_hidden_dim=int(residual_hidden_dim),
+            group_size=int(group_size),
+            input_norm_mode=str(input_norm_mode),
+            gate_mode=str(gate_mode),
+            residual_gate_scale=float(residual_gate_scale),
+        )
+        self.rgb_keypoint_detector = MatchaRgbKeypointDetector()
+        self.feature_fusion = nn.Sequential(
+            BasicConvLayer(int(input_dim), int(input_dim), 1, padding=0),
+            nn.Conv2d(int(input_dim), int(input_dim), 1),
+        )
+        self.heatmap_head = nn.Sequential(
+            BasicConvLayer(int(output_dim), int(residual_hidden_dim), 3, padding=1),
+            BasicConvLayer(int(residual_hidden_dim), int(residual_hidden_dim), 1, padding=0),
+            nn.Conv2d(int(residual_hidden_dim), 1, 1),
+        )
+        heads = 4
+        while int(output_dim) % heads != 0 and heads > 1:
+            heads -= 1
+        self.local_fine_attention = nn.MultiheadAttention(int(output_dim), num_heads=heads, batch_first=True)
+        self.local_fine_norm = nn.LayerNorm(int(output_dim))
+        self.local_fine_head = nn.Sequential(
+            nn.Linear(int(output_dim), int(residual_hidden_dim)),
+            nn.GELU(),
+            nn.Linear(int(residual_hidden_dim), 64),
+        )
+        self.query_pair_fine_head = _OriginalMatchaFineMatcher(
+            descriptor_dim=int(output_dim),
+            hidden_dim=int(residual_hidden_dim),
+            output_bins=64,
+        )
+
+    @property
+    def input_dim(self) -> int:
+        return int(self.adapter.input_dim)
+
+    @property
+    def output_dim(self) -> int:
+        return int(self.adapter.output_dim)
+
+    def encode(self, features: torch.Tensor) -> torch.Tensor:
+        return self.adapter.encode(features)
+
+    def forward_rows(self, features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.adapter(features)
+
+    def pair_confidence_logits(self, query_descriptors: torch.Tensor, render_descriptors: torch.Tensor) -> torch.Tensor:
+        return self.adapter.pair_confidence_logits(query_descriptors, render_descriptors)
+
+    def pair_fine_logits(self, query_descriptors: torch.Tensor, render_descriptors: torch.Tensor) -> torch.Tensor:
+        return self.adapter.pair_fine_logits(query_descriptors, render_descriptors)
+
+    def query_pair_fine_logits(self, query_descriptors: torch.Tensor, render_descriptors: torch.Tensor) -> torch.Tensor:
+        return self.query_pair_fine_head(query_descriptors, render_descriptors)
+
+    def fuse_feature_map(self, feature_maps: torch.Tensor) -> torch.Tensor:
+        fused = self.feature_fusion(feature_maps)
+        return feature_maps + 0.1 * fused
+
+    def forward_feature_map(self, feature_maps: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if feature_maps.ndim != 4 or int(feature_maps.shape[1]) != self.input_dim:
+            raise ValueError("feature_maps must have shape (B, input_dim, H, W)")
+        feature_maps = self.fuse_feature_map(feature_maps)
+        batch, _channels, height, width = feature_maps.shape
+        rows = feature_maps.permute(0, 2, 3, 1).reshape(-1, self.input_dim)
+        descriptors, offset_logits = self.adapter(rows)
+        descriptor_map = descriptors.reshape(batch, height, width, self.output_dim).permute(0, 3, 1, 2).contiguous()
+        offset_map = offset_logits.reshape(batch, height, width, 65).permute(0, 3, 1, 2).contiguous()
+        heatmap_logits = self.heatmap_head(descriptor_map)
+        return descriptor_map, heatmap_logits, offset_map
+
+    def forward_rgb_keypoints(self, images: torch.Tensor) -> torch.Tensor:
+        return self.rgb_keypoint_detector(images)
+
+    def local_fine_logits_from_maps(
+        self,
+        query_feature_maps: torch.Tensor,
+        render_feature_maps: torch.Tensor,
+        pair_indices: torch.Tensor,
+        query_indices: torch.Tensor,
+        render_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        query_desc, _query_heat, _query_offset = self.forward_feature_map(query_feature_maps)
+        render_desc, _render_heat, _render_offset = self.forward_feature_map(render_feature_maps)
+        batch, channels, qh, qw = query_desc.shape
+        if int(render_desc.shape[0]) != int(batch):
+            raise ValueError("query/render feature maps must have the same batch size")
+        query_rows = query_desc.permute(0, 2, 3, 1).reshape(batch, qh * qw, channels)
+        _rb, _rc, rh, rw = render_desc.shape
+        render_rows = render_desc.permute(0, 2, 3, 1).reshape(batch, rh * rw, channels)
+        pairs = pair_indices.long().reshape(-1).clamp(0, batch - 1)
+        qidx = query_indices.long().reshape(-1).clamp(0, qh * qw - 1)
+        ridx = render_indices.long().reshape(-1).clamp(0, rh * rw - 1)
+        qtoken = query_rows[pairs, qidx]
+        rtoken = render_rows[pairs, ridx]
+        sequence = torch.stack([qtoken, rtoken], dim=1)
+        attended, _weights = self.local_fine_attention(sequence, sequence, sequence, need_weights=False)
+        attended = self.local_fine_norm(attended[:, 0] + qtoken)
+        return self.local_fine_head(attended)
+
+
+class _RadioDualAttentionBlock(nn.Module):
+    """Small bidirectional decoder block inspired by MATCHA's joint decoder."""
+
+    def __init__(self, hidden_dim: int, num_heads: int) -> None:
+        super().__init__()
+        hidden = int(hidden_dim)
+        heads = max(1, int(num_heads))
+        while hidden % heads != 0 and heads > 1:
+            heads -= 1
+        self.fine_self_norm = nn.LayerNorm(hidden)
+        self.coarse_self_norm = nn.LayerNorm(hidden)
+        self.fine_norm_q = nn.LayerNorm(hidden)
+        self.fine_norm_kv = nn.LayerNorm(hidden)
+        self.coarse_norm_q = nn.LayerNorm(hidden)
+        self.coarse_norm_kv = nn.LayerNorm(hidden)
+        self.fine_self = nn.MultiheadAttention(hidden, heads, batch_first=True)
+        self.coarse_self = nn.MultiheadAttention(hidden, heads, batch_first=True)
+        self.fine_cross = nn.MultiheadAttention(hidden, heads, batch_first=True)
+        self.coarse_cross = nn.MultiheadAttention(hidden, heads, batch_first=True)
+        self.fine_mlp = nn.Sequential(nn.LayerNorm(hidden), nn.Linear(hidden, hidden * 4), nn.GELU(), nn.Linear(hidden * 4, hidden))
+        self.coarse_mlp = nn.Sequential(nn.LayerNorm(hidden), nn.Linear(hidden, hidden * 4), nn.GELU(), nn.Linear(hidden * 4, hidden))
+
+    def forward(self, fine_tokens: torch.Tensor, coarse_tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        fine_update, _ = self.fine_self(
+            self.fine_self_norm(fine_tokens),
+            self.fine_self_norm(fine_tokens),
+            self.fine_self_norm(fine_tokens),
+            need_weights=False,
+        )
+        coarse_update, _ = self.coarse_self(
+            self.coarse_self_norm(coarse_tokens),
+            self.coarse_self_norm(coarse_tokens),
+            self.coarse_self_norm(coarse_tokens),
+            need_weights=False,
+        )
+        fine_tokens = fine_tokens + fine_update
+        coarse_tokens = coarse_tokens + coarse_update
+        fine_update, _ = self.fine_cross(
+            self.fine_norm_q(fine_tokens),
+            self.fine_norm_kv(coarse_tokens),
+            self.fine_norm_kv(coarse_tokens),
+            need_weights=False,
+        )
+        coarse_update, _ = self.coarse_cross(
+            self.coarse_norm_q(coarse_tokens),
+            self.coarse_norm_kv(fine_tokens),
+            self.coarse_norm_kv(fine_tokens),
+            need_weights=False,
+        )
+        fine_tokens = fine_tokens + fine_update
+        coarse_tokens = coarse_tokens + coarse_update
+        fine_tokens = fine_tokens + self.fine_mlp(fine_tokens)
+        coarse_tokens = coarse_tokens + self.coarse_mlp(coarse_tokens)
+        return fine_tokens, coarse_tokens
+
+
+class RadioDualAttentionFusionJointModel(nn.Module):
+    """RADIO-dual MATCHA-style joint model.
+
+    Input maps are channel-concatenated as `[fine_geo, coarse_sem]`. The row
+    path remains compatible with the existing sampled dual-softmax losses, while
+    the full-map path uses a MATCHA-style bidirectional attention fusion before
+    predicting descriptors, heatmaps and offsets.
+    """
+
+    def __init__(
+        self,
+        fine_input_dim: int,
+        coarse_input_dim: int,
+        output_dim: int = 128,
+        residual_hidden_dim: int = 256,
+        attention_hidden_dim: int = 256,
+        attention_depth: int = 2,
+        attention_heads: int = 4,
+        attention_patch_size: int = 2,
+        attention_upsample_mode: str = "bilinear",
+        attention_fusion_mode: str = "legacy",
+        group_size: int = 64,
+        input_norm_mode: str = "identity",
+        gate_mode: str = "residual",
+        residual_gate_scale: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.fine_input_dim = int(fine_input_dim)
+        self.coarse_input_dim = int(coarse_input_dim)
+        self.output_dim_value = int(output_dim)
+        self.residual_hidden_dim = int(residual_hidden_dim)
+        self.attention_hidden_dim = int(attention_hidden_dim)
+        self.attention_depth = int(attention_depth)
+        self.attention_heads = int(attention_heads)
+        self.attention_patch_size = int(attention_patch_size)
+        self.attention_upsample_mode = str(attention_upsample_mode)
+        self.attention_fusion_mode = str(attention_fusion_mode)
+        hidden = int(attention_hidden_dim)
+        if self.attention_upsample_mode not in {"bilinear", "pixel_shuffle"}:
+            raise ValueError("attention_upsample_mode must be 'bilinear' or 'pixel_shuffle'")
+        if self.attention_fusion_mode not in {"legacy", "matcha_original"}:
+            raise ValueError("attention_fusion_mode must be 'legacy' or 'matcha_original'")
+        context_channels = hidden if self.attention_upsample_mode == "bilinear" else hidden // (self.attention_patch_size**2)
+        if self.attention_upsample_mode == "pixel_shuffle" and hidden % (self.attention_patch_size**2) != 0:
+            raise ValueError("attention_hidden_dim must be divisible by attention_patch_size^2 for pixel_shuffle")
+        self.adapter = MatchaCoarseFineAdapter(
+            input_dim=self.input_dim,
+            output_dim=int(output_dim),
+            residual_hidden_dim=int(residual_hidden_dim),
+            group_size=int(group_size),
+            input_norm_mode=str(input_norm_mode),
+            gate_mode=str(gate_mode),
+            residual_gate_scale=float(residual_gate_scale),
+        )
+        self.fine_proj = nn.Conv2d(self.fine_input_dim, hidden, 1)
+        self.coarse_proj = nn.Conv2d(self.coarse_input_dim, hidden, 1)
+        self.attention_blocks = nn.ModuleList(
+            [_RadioDualAttentionBlock(hidden, int(attention_heads)) for _ in range(int(attention_depth))]
+        )
+        self.dec_norm_f = nn.LayerNorm(hidden)
+        self.dec_norm_c = nn.LayerNorm(hidden)
+        self.fusion = nn.Sequential(
+            BasicConvLayer(self.fine_input_dim + self.coarse_input_dim + int(context_channels) * 2, int(residual_hidden_dim), 1, padding=0),
+            BasicConvLayer(int(residual_hidden_dim), int(residual_hidden_dim), 3, padding=1),
+            nn.Conv2d(int(residual_hidden_dim), int(output_dim), 1),
+        )
+        self.fusion_c = nn.Sequential(
+            BasicConvLayer(self.coarse_input_dim + int(context_channels), int(residual_hidden_dim), 3, padding=1),
+            BasicConvLayer(int(residual_hidden_dim), int(residual_hidden_dim), 3, padding=1),
+            nn.Conv2d(int(residual_hidden_dim), int(output_dim), 1),
+        )
+        self.fusion_f = nn.Sequential(
+            BasicConvLayer(self.fine_input_dim + int(context_channels), int(residual_hidden_dim), 3, padding=1),
+            BasicConvLayer(int(residual_hidden_dim), int(residual_hidden_dim), 3, padding=1),
+            nn.Conv2d(int(residual_hidden_dim), int(output_dim), 1),
+        )
+        self.offset_head_map = nn.Sequential(
+            BasicConvLayer(int(output_dim), int(residual_hidden_dim), 1, padding=0),
+            nn.Conv2d(int(residual_hidden_dim), 65, 1),
+        )
+        self.heatmap_head = nn.Sequential(
+            BasicConvLayer(int(output_dim), int(residual_hidden_dim), 3, padding=1),
+            BasicConvLayer(int(residual_hidden_dim), int(residual_hidden_dim), 1, padding=0),
+            nn.Conv2d(int(residual_hidden_dim), 1, 1),
+        )
+        self.rgb_keypoint_detector = MatchaRgbKeypointDetector()
+        self.original_fine_matcher = _OriginalMatchaFineMatcher(
+            descriptor_dim=int(output_dim),
+            hidden_dim=int(residual_hidden_dim),
+            output_bins=64,
+        )
+        self.query_original_fine_matcher = _OriginalMatchaFineMatcher(
+            descriptor_dim=int(output_dim),
+            hidden_dim=int(residual_hidden_dim),
+            output_bins=64,
+        )
+
+    @property
+    def input_dim(self) -> int:
+        return int(self.fine_input_dim + self.coarse_input_dim)
+
+    @property
+    def output_dim(self) -> int:
+        return int(self.output_dim_value)
+
+    def _split_map(self, feature_maps: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if feature_maps.ndim != 4 or int(feature_maps.shape[1]) != self.input_dim:
+            raise ValueError("feature_maps must have shape (B, fine_input_dim + coarse_input_dim, H, W)")
+        fine = feature_maps[:, : self.fine_input_dim]
+        coarse = feature_maps[:, self.fine_input_dim :]
+        return fine, coarse
+
+    def encode(self, features: torch.Tensor) -> torch.Tensor:
+        return self.adapter.encode(features)
+
+    def forward_rows(self, features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.adapter(features)
+
+    def _attention_contexts(self, feature_maps: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        fine, coarse = self._split_map(feature_maps)
+        batch, _channels, height, width = fine.shape
+        patch = max(1, int(self.attention_patch_size))
+        if patch > 1:
+            fine_attention_input = F.avg_pool2d(fine, kernel_size=patch, stride=patch, ceil_mode=True)
+            coarse_attention_input = F.avg_pool2d(coarse, kernel_size=patch, stride=patch, ceil_mode=True)
+        else:
+            fine_attention_input = fine
+            coarse_attention_input = coarse
+        _batch, _channels, attention_height, attention_width = fine_attention_input.shape
+        fine_tokens = self.fine_proj(fine_attention_input).flatten(2).transpose(1, 2)
+        coarse_tokens = self.coarse_proj(coarse_attention_input).flatten(2).transpose(1, 2)
+        for block in self.attention_blocks:
+            fine_tokens, coarse_tokens = block(fine_tokens, coarse_tokens)
+        hidden = int(self.attention_hidden_dim)
+        fine_att = self.dec_norm_f(fine_tokens).transpose(1, 2).reshape(batch, hidden, attention_height, attention_width)
+        coarse_att = self.dec_norm_c(coarse_tokens).transpose(1, 2).reshape(batch, hidden, attention_height, attention_width)
+
+        def restore(attention_map: torch.Tensor) -> torch.Tensor:
+            if self.attention_upsample_mode == "pixel_shuffle" and patch > 1:
+                restored = F.pixel_shuffle(attention_map, patch)
+                if int(restored.shape[2]) >= height and int(restored.shape[3]) >= width:
+                    return restored[:, :, :height, :width]
+                return F.interpolate(restored, size=(height, width), mode="bilinear", align_corners=False)
+            if tuple(attention_map.shape[-2:]) != (height, width):
+                return F.interpolate(attention_map, size=(height, width), mode="bilinear", align_corners=False)
+            return attention_map
+
+        fine_att = restore(fine_att)
+        coarse_att = restore(coarse_att)
+        return fine, coarse, fine_att, coarse_att
+
+    def forward_fuse_feature(self, feature_maps: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        fine, coarse, fine_att, coarse_att = self._attention_contexts(feature_maps)
+        if self.attention_fusion_mode == "matcha_original":
+            coarse_descriptors = F.normalize(self.fusion_c(torch.cat([coarse, coarse_att], dim=1)), dim=1)
+            fine_descriptors = F.normalize(self.fusion_f(torch.cat([fine, fine_att], dim=1)), dim=1)
+            heatmap_logits = self.heatmap_head(fine_descriptors)
+            return coarse_descriptors, fine_descriptors, heatmap_logits
+        descriptor_map = F.normalize(self.fusion(torch.cat([fine, coarse, fine_att, coarse_att], dim=1)), dim=1)
+        heatmap_logits = self.heatmap_head(descriptor_map)
+        return descriptor_map, descriptor_map, heatmap_logits
+
+    def forward_feature_map(self, feature_maps: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        coarse_descriptors, fine_descriptors, heatmap_logits = self.forward_fuse_feature(feature_maps)
+        descriptor_map = fine_descriptors
+        if self.attention_fusion_mode != "matcha_original":
+            descriptor_map = coarse_descriptors
+        offset_logits = self.offset_head_map(descriptor_map)
+        return descriptor_map, heatmap_logits, offset_logits
+
+    def forward_rgb_keypoints(self, images: torch.Tensor) -> torch.Tensor:
+        return self.rgb_keypoint_detector(images)
+
+    def pair_confidence_logits(self, query_descriptors: torch.Tensor, render_descriptors: torch.Tensor) -> torch.Tensor:
+        return self.adapter.pair_confidence_logits(query_descriptors, render_descriptors)
+
+    def pair_fine_logits(self, query_descriptors: torch.Tensor, render_descriptors: torch.Tensor) -> torch.Tensor:
+        return self.original_fine_matcher(query_descriptors, render_descriptors)
+
+    def query_pair_fine_logits(self, query_descriptors: torch.Tensor, render_descriptors: torch.Tensor) -> torch.Tensor:
+        return self.query_original_fine_matcher(query_descriptors, render_descriptors)
+
+    def local_fine_logits_from_maps(
+        self,
+        query_feature_maps: torch.Tensor,
+        render_feature_maps: torch.Tensor,
+        pair_indices: torch.Tensor,
+        query_indices: torch.Tensor,
+        render_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        query_desc, _query_heat, _query_offset = self.forward_feature_map(query_feature_maps)
+        render_desc, _render_heat, _render_offset = self.forward_feature_map(render_feature_maps)
+        batch, channels, qh, qw = query_desc.shape
+        _rb, _rc, rh, rw = render_desc.shape
+        query_rows = query_desc.permute(0, 2, 3, 1).reshape(batch, qh * qw, channels)
+        render_rows = render_desc.permute(0, 2, 3, 1).reshape(batch, rh * rw, channels)
+        pairs = pair_indices.long().reshape(-1).clamp(0, batch - 1)
+        qidx = query_indices.long().reshape(-1).clamp(0, qh * qw - 1)
+        ridx = render_indices.long().reshape(-1).clamp(0, rh * rw - 1)
+        return self.pair_fine_logits(query_rows[pairs, qidx], render_rows[pairs, ridx])
+
+
+def _tensor(array: np.ndarray, *, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    return torch.as_tensor(np.asarray(array), dtype=dtype, device=device)
+
+
+def _sample_indices(rng: np.random.Generator, count: int, batch_size: int) -> np.ndarray:
+    take = min(int(batch_size), int(count))
+    return rng.choice(int(count), size=take, replace=False)
+
+
+def _sample_map_pair_subset(
+    samples: MatchaJointTrainingSet,
+    indices: np.ndarray,
+    max_pairs: int,
+    seed: int,
+) -> np.ndarray | None:
+    if samples.sample_pair_indices is None:
+        if samples.query_feature_maps is None:
+            return None
+        count = int(samples.query_feature_maps.shape[0])
+        pairs = np.arange(count, dtype=np.int64)
+    else:
+        pairs = np.unique(np.asarray(samples.sample_pair_indices, dtype=np.int64)[indices])
+    if pairs.size <= int(max_pairs):
+        return np.sort(pairs.astype(np.int64))
+    rng = np.random.default_rng(int(seed))
+    return np.sort(rng.choice(pairs, size=int(max_pairs), replace=False).astype(np.int64))
+
+
+def _filter_indices_to_pair_subset(
+    samples: MatchaJointTrainingSet,
+    indices: np.ndarray,
+    pair_subset: np.ndarray | None,
+) -> np.ndarray:
+    if pair_subset is None or samples.sample_pair_indices is None:
+        return indices
+    pair_values = np.asarray(samples.sample_pair_indices, dtype=np.int64)[indices]
+    keep = np.isin(pair_values, np.asarray(pair_subset, dtype=np.int64))
+    return indices[keep]
+
+
+def _filter_indices_to_positive_matches(samples: MatchaJointTrainingSet, indices: np.ndarray) -> np.ndarray:
+    values = np.asarray(indices, dtype=np.int64).reshape(-1)
+    if values.size == 0:
+        return values
+    keep = np.ones((values.shape[0],), dtype=bool)
+    if samples.sample_ignore_mask is not None:
+        keep &= ~np.asarray(samples.sample_ignore_mask, dtype=bool)[values]
+    if samples.sample_no_match_labels is not None:
+        keep &= np.asarray(samples.sample_no_match_labels, dtype=np.int64)[values] == 0
+    return values[keep]
+
+
+def _filter_indices_to_no_matches(samples: MatchaJointTrainingSet, indices: np.ndarray) -> np.ndarray:
+    values = np.asarray(indices, dtype=np.int64).reshape(-1)
+    if values.size == 0 or samples.sample_no_match_labels is None:
+        return values[:0]
+    keep = np.asarray(samples.sample_no_match_labels, dtype=np.int64)[values] != 0
+    if samples.sample_ignore_mask is not None:
+        keep &= ~np.asarray(samples.sample_ignore_mask, dtype=bool)[values]
+    return values[keep]
+
+
+def _remap_pair_indices(global_pairs: np.ndarray, pair_subset: np.ndarray | None) -> np.ndarray:
+    pairs = np.asarray(global_pairs, dtype=np.int64).reshape(-1)
+    if pair_subset is None:
+        return pairs
+    lookup = {int(pair): int(local) for local, pair in enumerate(np.asarray(pair_subset, dtype=np.int64).reshape(-1))}
+    return np.asarray([lookup[int(pair)] for pair in pairs], dtype=np.int64)
+
+
+def _offset_distribution_loss(logits: torch.Tensor, labels: torch.Tensor, soft_targets: torch.Tensor | None) -> torch.Tensor:
+    labels = labels.long().reshape(-1)
+    if soft_targets is None:
+        return F.cross_entropy(logits, labels)
+    if soft_targets.shape != (int(logits.shape[0]), int(logits.shape[1])):
+        raise ValueError("offset soft_targets must match logits shape")
+    target = soft_targets.float()
+    target_sum = torch.sum(target, dim=1, keepdim=True).clamp_min(1e-8)
+    target = target / target_sum
+    return -torch.sum(target * F.log_softmax(logits, dim=1), dim=1).mean()
+
+
+def _coarse_fine_loss(
+    model: MatchaStyleJointModel,
+    samples: MatchaCoarseFineTrainingSet,
+    indices: np.ndarray,
+    config: MatchaJointTrainingConfig,
+    device: torch.device,
+    confidence_ignore_mask: np.ndarray | None = None,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    query = _tensor(samples.query_features[indices], dtype=torch.float32, device=device)
+    render = _tensor(samples.render_features[indices], dtype=torch.float32, device=device)
+    qlabels = _tensor(samples.query_offset_labels[indices], dtype=torch.long, device=device)
+    rlabels = _tensor(samples.render_offset_labels[indices], dtype=torch.long, device=device)
+    qsoft = (
+        None
+        if getattr(samples, "query_offset_soft_labels", None) is None
+        else _tensor(samples.query_offset_soft_labels[indices], dtype=torch.float32, device=device)
+    )
+    rsoft = (
+        None
+        if getattr(samples, "render_offset_soft_labels", None) is None
+        else _tensor(samples.render_offset_soft_labels[indices], dtype=torch.float32, device=device)
+    )
+    confidence_targets = (
+        None
+        if getattr(samples, "sample_confidence_targets", None) is None
+        else _tensor(samples.sample_confidence_targets[indices], dtype=torch.float32, device=device)
+    )
+    confidence_keep = None
+    if confidence_ignore_mask is not None:
+        ignore = _tensor(np.asarray(confidence_ignore_mask, dtype=bool).reshape(-1), dtype=torch.bool, device=device)
+        if int(ignore.shape[0]) != int(len(indices)):
+            raise ValueError("confidence_ignore_mask must contain one value per selected sample")
+        confidence_keep = ~ignore
+    negatives = _tensor(samples.negative_render_features[indices], dtype=torch.float32, device=device)
+
+    query_z, query_offsets = model.forward_rows(query)
+    render_z, render_offsets = model.forward_rows(render)
+    loss = query.new_tensor(0.0)
+    descriptor_loss, match_confidence = _dual_softmax_descriptor_loss_and_confidence(
+        query_z,
+        render_z,
+        float(config.temperature),
+    )
+    if float(config.dual_softmax_weight) > 0.0:
+        loss = loss + float(config.dual_softmax_weight) * descriptor_loss
+    if float(config.offset_loss_weight) > 0.0:
+        offset_loss = 0.5 * (
+            _offset_distribution_loss(query_offsets, qlabels, qsoft)
+            + _offset_distribution_loss(render_offsets, rlabels, rsoft)
+        )
+        loss = loss + float(config.offset_loss_weight) * offset_loss
+    fine_metrics: dict[str, float] = {}
+    if float(config.pair_fine_loss_weight) > 0.0:
+        pair_fine = model.pair_fine_logits(query_z, render_z)
+        pair_fine_loss, item_metrics = _fine_coordinate_loss_and_metrics(
+            pair_fine,
+            rlabels,
+            soft_targets=rsoft,
+            confidence=match_confidence,
+        )
+        fine_metrics.update({f"render_pair_fine_{key}": value for key, value in item_metrics.items()})
+        if pair_fine_loss is not None:
+            loss = loss + float(config.pair_fine_loss_weight) * pair_fine_loss
+    if float(config.query_pair_fine_loss_weight) > 0.0:
+        query_pair_fine = model.query_pair_fine_logits(query_z, render_z)
+        query_pair_fine_loss, item_metrics = _fine_coordinate_loss_and_metrics(
+            query_pair_fine,
+            qlabels,
+            soft_targets=qsoft,
+            confidence=match_confidence,
+        )
+        fine_metrics.update({f"query_pair_fine_{key}": value for key, value in item_metrics.items()})
+        if query_pair_fine_loss is not None:
+            loss = loss + float(config.query_pair_fine_loss_weight) * query_pair_fine_loss
+    if float(config.pair_confidence_loss_weight) > 0.0 and negatives.numel() > 0:
+        negative_z = model.encode(negatives.reshape(-1, negatives.shape[-1])).reshape(negatives.shape[0], negatives.shape[1], -1)
+        pos_logits = model.pair_confidence_logits(query_z, render_z)
+        neg_logits = model.pair_confidence_logits(
+            query_z[:, None, :].expand_as(negative_z).reshape(-1, query_z.shape[-1]),
+            negative_z.reshape(-1, query_z.shape[-1]),
+        )
+        pos_targets = torch.ones_like(pos_logits) if confidence_targets is None else torch.clamp(confidence_targets, 0.0, 1.0)
+        if confidence_keep is not None:
+            if torch.any(confidence_keep):
+                confidence_loss = F.binary_cross_entropy_with_logits(pos_logits[confidence_keep], pos_targets[confidence_keep])
+            else:
+                confidence_loss = pos_logits.new_tensor(0.0)
+        else:
+            confidence_loss = F.binary_cross_entropy_with_logits(pos_logits, pos_targets)
+        confidence_loss = confidence_loss + F.binary_cross_entropy_with_logits(neg_logits, torch.zeros_like(neg_logits))
+        loss = loss + float(config.pair_confidence_loss_weight) * confidence_loss
+    elif negatives.numel() > 0:
+        negative_z = model.encode(negatives.reshape(-1, negatives.shape[-1])).reshape(negatives.shape[0], negatives.shape[1], -1)
+    else:
+        negative_z = None
+    if float(config.hard_negative_weight) > 0.0 and negative_z is not None:
+        pos_scores = torch.sum(query_z * render_z, dim=1, keepdim=True)
+        neg_scores = torch.einsum("bd,bkd->bk", query_z, negative_z)
+        hard_loss = torch.relu(neg_scores - pos_scores + float(config.hard_negative_margin)).mean()
+        loss = loss + float(config.hard_negative_weight) * hard_loss
+    state = {
+        "query_z": query_z.detach(),
+        "render_z": render_z.detach(),
+        "query_offsets": query_offsets.detach(),
+        "render_offsets": render_offsets.detach(),
+        "query_labels": qlabels.detach(),
+        "render_labels": rlabels.detach(),
+        "match_confidence": match_confidence.detach(),
+    }
+    state.update({key: query_z.new_tensor(float(value)) for key, value in fine_metrics.items()})
+    return loss, state
+
+
+def _heatmap_loss(
+    model: MatchaStyleJointModel,
+    feature_maps: np.ndarray | None,
+    targets: np.ndarray | None,
+    *,
+    device: torch.device,
+    pair_subset: np.ndarray | None = None,
+) -> torch.Tensor | None:
+    if feature_maps is None or targets is None:
+        return None
+    if pair_subset is not None:
+        feature_maps = np.asarray(feature_maps)[pair_subset]
+        targets = np.asarray(targets)[pair_subset]
+    maps = _tensor(feature_maps, dtype=torch.float32, device=device)
+    target = _tensor(targets, dtype=torch.float32, device=device)
+    _desc, logits, _offsets = model.forward_feature_map(maps)
+    return F.l1_loss(torch.sigmoid(logits[:, 0]), target)
+
+
+def _no_match_confidence_loss(
+    model: MatchaStyleJointModel,
+    samples: MatchaJointTrainingSet,
+    indices: np.ndarray,
+    *,
+    device: torch.device,
+) -> torch.Tensor | None:
+    no_match_indices = _filter_indices_to_no_matches(samples, indices)
+    if no_match_indices.size and samples.sample_confidence_ignore_mask is not None:
+        confidence_ignore = np.asarray(samples.sample_confidence_ignore_mask, dtype=bool)[no_match_indices]
+        no_match_indices = no_match_indices[~confidence_ignore]
+    if no_match_indices.size == 0:
+        return None
+    base = samples.coarse_fine_samples
+    query = _tensor(base.query_features[no_match_indices], dtype=torch.float32, device=device)
+    render = _tensor(base.render_features[no_match_indices], dtype=torch.float32, device=device)
+    query_z = model.encode(query)
+    render_z = model.encode(render)
+    logits = model.pair_confidence_logits(query_z, render_z)
+    targets = torch.zeros_like(logits)
+    if getattr(base, "sample_confidence_targets", None) is not None:
+        targets = _tensor(
+            np.asarray(base.sample_confidence_targets, dtype=np.float32)[no_match_indices],
+            dtype=torch.float32,
+            device=device,
+        )
+        targets = torch.clamp(targets, 0.0, 1.0)
+    return F.binary_cross_entropy_with_logits(logits, targets)
+
+
+def _repeatability_loss(
+    model: MatchaStyleJointModel,
+    images: np.ndarray | None,
+    targets: np.ndarray | None,
+    *,
+    device: torch.device,
+    pair_subset: np.ndarray | None = None,
+) -> torch.Tensor | None:
+    if images is None or targets is None:
+        return None
+    if pair_subset is not None:
+        images = np.asarray(images)[pair_subset]
+        targets = np.asarray(targets)[pair_subset]
+    image_tensor = _tensor(images, dtype=torch.float32, device=device)
+    target = _tensor(targets, dtype=torch.float32, device=device)
+    logits = model.forward_rgb_keypoints(image_tensor)
+    keypoint_prob = 1.0 - torch.softmax(logits, dim=1)[:, 64]
+    return F.binary_cross_entropy(torch.clamp(keypoint_prob, 1e-6, 1.0 - 1e-6), torch.clamp(target, 0.0, 1.0))
+
+
+def _select_map_rows(
+    descriptor_map: torch.Tensor,
+    offset_map: torch.Tensor,
+    pair_indices: torch.Tensor,
+    cell_indices: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    batch, channels, height, width = descriptor_map.shape
+    pairs = pair_indices.long().reshape(-1).clamp(0, batch - 1)
+    idx = cell_indices.long().reshape(-1).clamp(0, height * width - 1)
+    desc_rows = descriptor_map.permute(0, 2, 3, 1).reshape(batch, height * width, channels)
+    offset_rows = offset_map.permute(0, 2, 3, 1).reshape(batch, height * width, 65)
+    return desc_rows[pairs, idx], offset_rows[pairs, idx]
+
+
+def _local_patch_correlation_loss(
+    *,
+    source_descriptors: torch.Tensor,
+    target_descriptor_map: torch.Tensor,
+    pair_indices: torch.Tensor,
+    target_cell_indices: torch.Tensor,
+    window_size: int,
+) -> tuple[torch.Tensor | None, float]:
+    if source_descriptors.ndim != 2:
+        raise ValueError("source_descriptors must have shape (N, C)")
+    if target_descriptor_map.ndim != 4:
+        raise ValueError("target_descriptor_map must have shape (B, C, H, W)")
+    window = int(window_size)
+    if window <= 0 or window % 2 == 0:
+        raise ValueError("window_size must be a positive odd integer")
+    batch, channels, height, width = target_descriptor_map.shape
+    if int(source_descriptors.shape[1]) != int(channels):
+        raise ValueError("source_descriptors channels must match target_descriptor_map")
+    pairs = pair_indices.long().reshape(-1).clamp(0, batch - 1)
+    indices = target_cell_indices.long().reshape(-1)
+    if pairs.numel() != source_descriptors.shape[0] or indices.numel() != source_descriptors.shape[0]:
+        raise ValueError("pair_indices and target_cell_indices must contain one value per source descriptor")
+    rows = indices // int(width)
+    cols = indices % int(width)
+    radius = window // 2
+    keep = (indices >= 0) & (indices < height * width) & (rows >= radius) & (rows < height - radius) & (cols >= radius) & (cols < width - radius)
+    if not torch.any(keep):
+        return None, 0.0
+    source = F.normalize(source_descriptors[keep], dim=1)
+    pairs = pairs[keep]
+    rows = rows[keep]
+    cols = cols[keep]
+    target_hwc = target_descriptor_map.permute(0, 2, 3, 1).contiguous()
+    candidates = []
+    for dy in range(-radius, radius + 1):
+        for dx in range(-radius, radius + 1):
+            candidates.append(target_hwc[pairs, rows + int(dy), cols + int(dx)])
+    candidate_tensor = F.normalize(torch.stack(candidates, dim=1), dim=2)
+    logits = torch.einsum("nc,nkc->nk", source, candidate_tensor)
+    labels = torch.full((int(logits.shape[0]),), radius * window + radius, dtype=torch.long, device=logits.device)
+    loss = F.cross_entropy(logits, labels)
+    with torch.no_grad():
+        acc = float(torch.mean((torch.argmax(logits, dim=1) == labels).float()).detach().cpu().item())
+    return loss, acc
+
+
+def _full_map_correspondence_loss(
+    model: MatchaStyleJointModel,
+    samples: MatchaJointTrainingSet,
+    indices: np.ndarray,
+    config: MatchaJointTrainingConfig,
+    device: torch.device,
+    pair_subset: np.ndarray | None = None,
+) -> tuple[torch.Tensor | None, dict[str, float]]:
+    if (
+        samples.query_feature_maps is None
+        or samples.render_feature_maps is None
+        or samples.sample_pair_indices is None
+        or samples.query_cell_indices is None
+        or samples.render_cell_indices is None
+    ):
+        return None, {}
+    base = samples.coarse_fine_samples
+    indices = _filter_indices_to_pair_subset(samples, indices, pair_subset)
+    if indices.size == 0:
+        return None, {}
+    if pair_subset is None:
+        query_feature_maps = samples.query_feature_maps
+        render_feature_maps = samples.render_feature_maps
+    else:
+        query_feature_maps = np.asarray(samples.query_feature_maps)[pair_subset]
+        render_feature_maps = np.asarray(samples.render_feature_maps)[pair_subset]
+    query_maps = _tensor(query_feature_maps, dtype=torch.float32, device=device)
+    render_maps = _tensor(render_feature_maps, dtype=torch.float32, device=device)
+    pairs_global = np.asarray(samples.sample_pair_indices, dtype=np.int64)[indices]
+    pairs = _tensor(_remap_pair_indices(pairs_global, pair_subset), dtype=torch.long, device=device)
+    qidx = _tensor(np.asarray(samples.query_cell_indices)[indices], dtype=torch.long, device=device)
+    ridx = _tensor(np.asarray(samples.render_cell_indices)[indices], dtype=torch.long, device=device)
+    qlabels = _tensor(base.query_offset_labels[indices], dtype=torch.long, device=device)
+    rlabels = _tensor(base.render_offset_labels[indices], dtype=torch.long, device=device)
+    qsoft = (
+        None
+        if getattr(base, "query_offset_soft_labels", None) is None
+        else _tensor(base.query_offset_soft_labels[indices], dtype=torch.float32, device=device)
+    )
+    rsoft = (
+        None
+        if getattr(base, "render_offset_soft_labels", None) is None
+        else _tensor(base.render_offset_soft_labels[indices], dtype=torch.float32, device=device)
+    )
+
+    query_desc_map, _query_heat, query_offset_map = model.forward_feature_map(query_maps)
+    render_desc_map, _render_heat, render_offset_map = model.forward_feature_map(render_maps)
+    query_z, query_offsets = _select_map_rows(query_desc_map, query_offset_map, pairs, qidx)
+    render_z, render_offsets = _select_map_rows(render_desc_map, render_offset_map, pairs, ridx)
+
+    loss = query_z.new_tensor(0.0)
+    descriptor_losses = []
+    top1_values = []
+    match_confidence = torch.ones((int(query_z.shape[0]),), dtype=query_z.dtype, device=query_z.device)
+    for pair in torch.unique(pairs).tolist():
+        mask = pairs == int(pair)
+        if torch.count_nonzero(mask).item() <= 1:
+            continue
+        pair_q = query_z[mask]
+        pair_r = render_z[mask]
+        descriptor_loss, confidence = _dual_softmax_descriptor_loss_and_confidence(
+            pair_q,
+            pair_r,
+            float(config.temperature),
+        )
+        descriptor_losses.append(descriptor_loss)
+        match_confidence[mask] = confidence.detach()
+        with torch.no_grad():
+            scores = pair_q @ pair_r.T
+            labels = torch.arange(scores.shape[0], device=device)
+            top1_values.append(torch.mean((torch.argmax(scores, dim=1) == labels).float()))
+    if descriptor_losses:
+        descriptor_loss = torch.stack(descriptor_losses).mean()
+    else:
+        descriptor_loss, match_confidence = _dual_softmax_descriptor_loss_and_confidence(
+            query_z,
+            render_z,
+            float(config.temperature),
+        )
+    if float(config.dual_softmax_weight) > 0.0:
+        loss = loss + float(config.dual_softmax_weight) * descriptor_loss
+    if float(config.offset_loss_weight) > 0.0:
+        offset_loss = 0.5 * (
+            _offset_distribution_loss(query_offsets, qlabels, qsoft)
+            + _offset_distribution_loss(render_offsets, rlabels, rsoft)
+        )
+        loss = loss + float(config.offset_loss_weight) * offset_loss
+    fine_metrics: dict[str, float] = {}
+    if float(config.pair_fine_loss_weight) > 0.0:
+        pair_fine = model.pair_fine_logits(query_z, render_z)
+        pair_fine_loss, item_metrics = _fine_coordinate_loss_and_metrics(
+            pair_fine,
+            rlabels,
+            soft_targets=rsoft,
+            confidence=match_confidence,
+        )
+        fine_metrics.update({f"map_render_pair_fine_{key}": value for key, value in item_metrics.items()})
+        if pair_fine_loss is not None:
+            loss = loss + float(config.pair_fine_loss_weight) * pair_fine_loss
+    if float(config.query_pair_fine_loss_weight) > 0.0:
+        query_pair_fine = model.query_pair_fine_logits(query_z, render_z)
+        query_pair_fine_loss, item_metrics = _fine_coordinate_loss_and_metrics(
+            query_pair_fine,
+            qlabels,
+            soft_targets=qsoft,
+            confidence=match_confidence,
+        )
+        fine_metrics.update({f"map_query_pair_fine_{key}": value for key, value in item_metrics.items()})
+        if query_pair_fine_loss is not None:
+            loss = loss + float(config.query_pair_fine_loss_weight) * query_pair_fine_loss
+    hard_false_losses = []
+    hard_false_count = 0
+    if float(config.hard_false_match_weight) > 0.0:
+        for pair in torch.unique(pairs).tolist():
+            mask = pairs == int(pair)
+            count = int(torch.count_nonzero(mask).item())
+            if count <= 1:
+                continue
+            scores = query_z[mask] @ render_z[mask].T
+            positive_scores = torch.diagonal(scores)
+            false_scores = scores.masked_fill(torch.eye(count, dtype=torch.bool, device=scores.device), -1e9)
+            hardest_false = torch.max(false_scores, dim=1).values
+            hard_false_losses.append(torch.relu(hardest_false - positive_scores + float(config.hard_false_match_margin)).mean())
+            hard_false_count += count
+        if hard_false_losses:
+            hard_false_loss = torch.stack(hard_false_losses).mean()
+            loss = loss + float(config.hard_false_match_weight) * hard_false_loss
+    patch_acc_values = []
+    if float(config.patch_correlation_loss_weight) > 0.0:
+        query_to_render, query_to_render_acc = _local_patch_correlation_loss(
+            source_descriptors=query_z,
+            target_descriptor_map=render_desc_map,
+            pair_indices=pairs,
+            target_cell_indices=ridx,
+            window_size=int(config.patch_correlation_window_size),
+        )
+        render_to_query, render_to_query_acc = _local_patch_correlation_loss(
+            source_descriptors=render_z,
+            target_descriptor_map=query_desc_map,
+            pair_indices=pairs,
+            target_cell_indices=qidx,
+            window_size=int(config.patch_correlation_window_size),
+        )
+        patch_losses = [item for item in (query_to_render, render_to_query) if item is not None]
+        if patch_losses:
+            patch_loss = torch.stack(patch_losses).mean()
+            loss = loss + float(config.patch_correlation_loss_weight) * patch_loss
+        patch_acc_values = [float(item) for item in (query_to_render_acc, render_to_query_acc)]
+    with torch.no_grad():
+        if top1_values:
+            map_top1 = float(torch.mean(torch.stack(top1_values)).item())
+        else:
+            scores = query_z @ render_z.T
+            labels = torch.arange(scores.shape[0], device=device)
+            map_top1 = float(torch.mean((torch.argmax(scores, dim=1) == labels).float()).item())
+        metrics = {
+            "map_descriptor_top1_acc": map_top1,
+            "map_query_offset_acc": float(torch.mean((torch.argmax(query_offsets, dim=1) == qlabels).float()).item()),
+            "map_render_offset_acc": float(torch.mean((torch.argmax(render_offsets, dim=1) == rlabels).float()).item()),
+        }
+        metrics.update(fine_metrics)
+        if patch_acc_values:
+            metrics["patch_correlation_acc"] = float(np.mean(patch_acc_values))
+        if hard_false_losses:
+            metrics["hard_false_match_loss"] = float(torch.stack(hard_false_losses).mean().detach().cpu().item())
+            metrics["hard_false_match_count"] = float(hard_false_count)
+    return loss, metrics
+
+
+def _rgb_keypoint_loss(
+    model: MatchaStyleJointModel,
+    images: np.ndarray | None,
+    labels: np.ndarray | None,
+    *,
+    config: MatchaJointTrainingConfig,
+    device: torch.device,
+    seed: int,
+    pair_subset: np.ndarray | None = None,
+) -> tuple[torch.Tensor | None, dict[str, float | int]]:
+    if images is None or labels is None:
+        return None, {}
+    if pair_subset is not None:
+        images = np.asarray(images)[pair_subset]
+        labels = np.asarray(labels)[pair_subset]
+    image_tensor = _tensor(images, dtype=torch.float32, device=device)
+    labels_tensor = _tensor(labels, dtype=torch.long, device=device)
+    logits = model.forward_rgb_keypoints(image_tensor)
+    return matcha_alike_distillation_loss(
+        logits,
+        labels_tensor,
+        non_keypoint_divisor=int(config.rgb_non_keypoint_divisor),
+        seed=int(seed),
+    )
+
+
+def _local_fine_transformer_loss(
+    model: MatchaStyleJointModel,
+    samples: MatchaJointTrainingSet,
+    indices: np.ndarray,
+    *,
+    device: torch.device,
+    pair_subset: np.ndarray | None = None,
+) -> tuple[torch.Tensor | None, dict[str, float]]:
+    if samples.query_feature_maps is None or samples.render_feature_maps is None:
+        return None, {}
+    if samples.query_cell_indices is None or samples.render_cell_indices is None:
+        return None, {}
+    if samples.sample_pair_indices is None:
+        return None, {}
+    base = samples.coarse_fine_samples
+    indices = _filter_indices_to_pair_subset(samples, indices, pair_subset)
+    if indices.size == 0:
+        return None, {}
+    if pair_subset is None:
+        query_feature_maps = samples.query_feature_maps
+        render_feature_maps = samples.render_feature_maps
+    else:
+        query_feature_maps = np.asarray(samples.query_feature_maps)[pair_subset]
+        render_feature_maps = np.asarray(samples.render_feature_maps)[pair_subset]
+    query_maps = _tensor(query_feature_maps, dtype=torch.float32, device=device)
+    render_maps = _tensor(render_feature_maps, dtype=torch.float32, device=device)
+    pairs_global = np.asarray(samples.sample_pair_indices, dtype=np.int64)[indices]
+    pairs = _tensor(_remap_pair_indices(pairs_global, pair_subset), dtype=torch.long, device=device)
+    qidx = _tensor(np.asarray(samples.query_cell_indices)[indices], dtype=torch.long, device=device)
+    ridx = _tensor(np.asarray(samples.render_cell_indices)[indices], dtype=torch.long, device=device)
+    labels = _tensor(base.render_offset_labels[indices], dtype=torch.long, device=device)
+    logits = model.local_fine_logits_from_maps(query_maps, render_maps, pairs, qidx, ridx)
+    loss, metrics = _fine_coordinate_loss_and_metrics(logits, labels)
+    return loss, metrics
+
+
+def _rgb_keypoint_position_loss(
+    model: MatchaStyleJointModel,
+    source_images: np.ndarray | None,
+    target_images: np.ndarray | None,
+    pair_indices: np.ndarray | None,
+    source_cell_indices: np.ndarray | None,
+    target_cell_indices: np.ndarray | None,
+    source_labels: np.ndarray,
+    target_labels: np.ndarray,
+    *,
+    device: torch.device,
+) -> tuple[torch.Tensor | None, float]:
+    if source_images is None or target_images is None or source_cell_indices is None or target_cell_indices is None:
+        return None, 0.0
+    source_tensor = _tensor(source_images, dtype=torch.float32, device=device)
+    target_tensor = _tensor(target_images, dtype=torch.float32, device=device)
+    source_logits = model.forward_rgb_keypoints(source_tensor)
+    target_logits = model.forward_rgb_keypoints(target_tensor)
+    batch = int(source_logits.shape[0])
+    height, width = int(source_logits.shape[2]), int(source_logits.shape[3])
+    src_idx = np.asarray(source_cell_indices, dtype=np.int64).reshape(-1)
+    tgt_idx = np.asarray(target_cell_indices, dtype=np.int64).reshape(-1)
+    src_labels = np.asarray(source_labels, dtype=np.int64).reshape(-1)
+    tgt_labels = np.asarray(target_labels, dtype=np.int64).reshape(-1)
+    if not (src_idx.shape[0] == tgt_idx.shape[0] == src_labels.shape[0] == tgt_labels.shape[0]):
+        raise ValueError("cell indices and labels must contain one value per correspondence")
+    pairs = (
+        np.zeros((src_idx.shape[0],), dtype=np.int64)
+        if pair_indices is None
+        else np.asarray(pair_indices, dtype=np.int64).reshape(-1)
+    )
+    if pairs.shape[0] != src_idx.shape[0]:
+        raise ValueError("pair_indices must contain one value per correspondence")
+    keep = (
+        (pairs >= 0)
+        & (pairs < batch)
+        & (src_idx >= 0)
+        & (src_idx < height * width)
+        & (tgt_idx >= 0)
+        & (tgt_idx < height * width)
+        & (src_labels >= 0)
+        & (src_labels < 64)
+        & (tgt_labels >= 0)
+        & (tgt_labels < 64)
+    )
+    if not np.any(keep):
+        return None, 0.0
+    pairs = pairs[keep]
+    src_idx = src_idx[keep]
+    tgt_idx = tgt_idx[keep]
+    src_labels = src_labels[keep]
+    tgt_labels = tgt_labels[keep]
+
+    def points_from_cells(indices: np.ndarray, labels: np.ndarray) -> np.ndarray:
+        rows = indices // int(width)
+        cols = indices % int(width)
+        x = cols * 8 + (labels % 8)
+        y = rows * 8 + (labels // 8)
+        return np.stack([x, y], axis=1).astype(np.float32, copy=False)
+
+    source_points = _tensor(points_from_cells(src_idx, src_labels), dtype=torch.float32, device=device)
+    target_points = _tensor(points_from_cells(tgt_idx, tgt_labels), dtype=torch.float32, device=device)
+    batch_indices = _tensor(pairs, dtype=torch.long, device=device)
+    loss, acc, _metrics = matcha_keypoint_position_loss(
+        source_logits,
+        target_logits,
+        source_points,
+        target_points,
+        point_batch_indices=batch_indices,
+    )
+    return loss, acc
+
+
+def _total_loss(
+    model: MatchaStyleJointModel,
+    samples: MatchaJointTrainingSet,
+    indices: np.ndarray,
+    config: MatchaJointTrainingConfig,
+    device: torch.device,
+    *,
+    seed: int,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    positive_indices = _filter_indices_to_positive_matches(samples, indices)
+    loss = torch.zeros((), dtype=torch.float32, device=device)
+    metrics: dict[str, float] = {}
+    if positive_indices.size >= 2:
+        confidence_ignore = (
+            None
+            if samples.sample_confidence_ignore_mask is None
+            else np.asarray(samples.sample_confidence_ignore_mask, dtype=bool)[positive_indices]
+        )
+        coarse_loss, state = _coarse_fine_loss(
+            model,
+            samples.coarse_fine_samples,
+            positive_indices,
+            config,
+            device,
+            confidence_ignore_mask=confidence_ignore,
+        )
+        loss = loss + coarse_loss
+        for key, value in state.items():
+            if key.endswith(("_valid_count", "_acc")):
+                metrics[key] = float(value.detach().cpu().item())
+    metrics["positive_match_count"] = float(positive_indices.size)
+    no_match_loss = _no_match_confidence_loss(model, samples, indices, device=device)
+    if no_match_loss is not None:
+        loss = loss + float(config.pair_confidence_loss_weight) * no_match_loss
+        metrics["no_match_confidence_loss"] = float(no_match_loss.detach().cpu().item())
+    pair_subset = _sample_map_pair_subset(samples, positive_indices if positive_indices.size else indices, int(config.map_pair_batch_size), int(seed))
+    map_loss, map_metrics = _full_map_correspondence_loss(model, samples, positive_indices, config, device, pair_subset=pair_subset)
+    if map_loss is not None:
+        loss = loss + map_loss
+        metrics["map_correspondence_loss"] = float(map_loss.detach().cpu().item())
+        metrics.update(map_metrics)
+    for prefix, maps, targets in (
+        ("query", samples.query_feature_maps, samples.query_heatmap_targets),
+        ("render", samples.render_feature_maps, samples.render_heatmap_targets),
+    ):
+        value = _heatmap_loss(model, maps, targets, device=device, pair_subset=pair_subset)
+        if value is not None:
+            loss = loss + float(config.dense_heatmap_loss_weight) * value
+            metrics[f"{prefix}_heatmap_loss"] = float(value.detach().cpu().item())
+    for prefix, images, labels in (
+        ("query", samples.query_rgb_images, samples.query_rgb_keypoint_labels),
+        ("render", samples.render_rgb_images, samples.render_rgb_keypoint_labels),
+    ):
+        value, keypoint_metrics = _rgb_keypoint_loss(
+            model,
+            images,
+            labels,
+            config=config,
+            device=device,
+            seed=int(seed),
+            pair_subset=pair_subset,
+        )
+        if value is not None:
+            loss = loss + float(config.rgb_keypoint_loss_weight) * value
+            metrics[f"{prefix}_rgb_keypoint_loss"] = float(value.detach().cpu().item())
+            for key, item in keypoint_metrics.items():
+                if isinstance(item, (int, float)):
+                    metrics[f"{prefix}_rgb_{key}"] = float(item)
+    if float(config.repeatability_loss_weight) > 0.0:
+        for prefix, images, targets in (
+            ("query", samples.query_rgb_images, samples.query_repeatability_targets),
+            ("render", samples.render_rgb_images, samples.render_repeatability_targets),
+        ):
+            value = _repeatability_loss(model, images, targets, device=device, pair_subset=pair_subset)
+            if value is not None:
+                loss = loss + float(config.repeatability_loss_weight) * value
+                metrics[f"{prefix}_repeatability_loss"] = float(value.detach().cpu().item())
+    if float(config.local_fine_transformer_loss_weight) > 0.0:
+        value, local_metrics = _local_fine_transformer_loss(model, samples, positive_indices, device=device, pair_subset=pair_subset)
+        if value is not None:
+            loss = loss + float(config.local_fine_transformer_loss_weight) * value
+            metrics["local_fine_transformer_loss"] = float(value.detach().cpu().item())
+            metrics["local_fine_transformer_acc"] = float(local_metrics["acc"])
+            metrics["local_fine_transformer_valid_count"] = float(local_metrics["valid_count"])
+    if float(config.rgb_keypoint_position_loss_weight) > 0.0:
+        base = samples.coarse_fine_samples
+        for prefix, source_images, target_images, source_cells, target_cells, source_labels, target_labels in (
+            (
+                "query",
+                samples.query_rgb_images,
+                samples.render_rgb_images,
+                samples.query_cell_indices,
+                samples.render_cell_indices,
+                base.query_offset_labels,
+                base.render_offset_labels,
+            ),
+            (
+                "render",
+                samples.render_rgb_images,
+                samples.query_rgb_images,
+                samples.render_cell_indices,
+                samples.query_cell_indices,
+                base.render_offset_labels,
+                base.query_offset_labels,
+            ),
+        ):
+            selected_source_cells = None if source_cells is None else np.asarray(source_cells)[positive_indices]
+            selected_target_cells = None if target_cells is None else np.asarray(target_cells)[positive_indices]
+            selected_pairs = None if samples.sample_pair_indices is None else np.asarray(samples.sample_pair_indices)[positive_indices]
+            value, acc = _rgb_keypoint_position_loss(
+                model,
+                source_images,
+                target_images,
+                selected_pairs,
+                selected_source_cells,
+                selected_target_cells,
+                np.asarray(source_labels)[positive_indices],
+                np.asarray(target_labels)[positive_indices],
+                device=device,
+            )
+            if value is not None:
+                loss = loss + float(config.rgb_keypoint_position_loss_weight) * value
+                metrics[f"{prefix}_rgb_position_loss"] = float(value.detach().cpu().item())
+                metrics[f"{prefix}_rgb_position_acc"] = float(acc)
+    return loss, metrics
+
+
+def _sample_eval_indices(sample_count: int, max_count: int, seed: int) -> np.ndarray:
+    """Deterministic bounded subset for diagnostic losses on large joint caches."""
+
+    count = int(sample_count)
+    limit = max(2, int(max_count))
+    if count <= limit:
+        return np.arange(count, dtype=np.int64)
+    rng = np.random.default_rng(int(seed))
+    return np.sort(rng.choice(count, size=limit, replace=False).astype(np.int64))
+
+
+def _build_matcha_joint_model_for_samples(
+    samples: MatchaJointTrainingSet,
+    config: MatchaJointTrainingConfig,
+    device: torch.device,
+) -> MatchaStyleJointModel:
+    if int(config.output_dim) > samples.coarse_fine_samples.input_dim:
+        raise ValueError("output_dim must be <= sample input_dim")
+    if (
+        str(config.model_type) == "radio_dual_attention"
+        and int(config.fine_input_dim) + int(config.coarse_input_dim) != samples.coarse_fine_samples.input_dim
+    ):
+        raise ValueError("fine_input_dim + coarse_input_dim must match sample input_dim")
+    if str(config.model_type) == "radio_dual_attention":
+        return RadioDualAttentionFusionJointModel(
+            fine_input_dim=int(config.fine_input_dim),
+            coarse_input_dim=int(config.coarse_input_dim),
+            output_dim=int(config.output_dim),
+            residual_hidden_dim=int(config.residual_hidden_dim),
+            attention_hidden_dim=int(config.attention_hidden_dim),
+            attention_depth=int(config.attention_depth),
+            attention_heads=int(config.attention_heads),
+            attention_patch_size=int(config.attention_patch_size),
+            attention_upsample_mode=str(config.attention_upsample_mode),
+            attention_fusion_mode=str(config.attention_fusion_mode),
+            group_size=int(config.group_size),
+            input_norm_mode=str(config.input_norm_mode),
+            gate_mode=str(config.gate_mode),
+            residual_gate_scale=float(config.residual_gate_scale),
+        ).to(device)
+    return MatchaStyleJointModel(
+        input_dim=samples.coarse_fine_samples.input_dim,
+        output_dim=int(config.output_dim),
+        residual_hidden_dim=int(config.residual_hidden_dim),
+        group_size=int(config.group_size),
+        input_norm_mode=str(config.input_norm_mode),
+        gate_mode=str(config.gate_mode),
+        residual_gate_scale=float(config.residual_gate_scale),
+    ).to(device)
+
+
+def _model_state_snapshot(model: nn.Module) -> dict[str, torch.Tensor]:
+    return {str(key): value.detach().cpu().clone() for key, value in model.state_dict().items()}
+
+
+def _loss_value_for_samples(
+    model: MatchaStyleJointModel,
+    samples: MatchaJointTrainingSet,
+    config: MatchaJointTrainingConfig,
+    device: torch.device,
+    *,
+    seed: int,
+) -> float:
+    model.eval()
+    with torch.no_grad():
+        idx = _sample_eval_indices(samples.coarse_fine_samples.sample_count, int(config.batch_size), int(seed))
+        value, _metrics = _total_loss(model, samples, idx, config, device, seed=int(seed))
+    model.train()
+    return float(value.detach().cpu().item())
+
+
+def _evaluate(model: MatchaStyleJointModel, samples: MatchaJointTrainingSet, config: MatchaJointTrainingConfig, device: torch.device) -> dict[str, float]:
+    model.eval()
+    base = samples.coarse_fine_samples
+    eval_indices = _sample_eval_indices(base.sample_count, int(config.batch_size), int(config.seed) + 991)
+    positive_eval_indices = _filter_indices_to_positive_matches(samples, eval_indices)
+    pair_subset = _sample_map_pair_subset(samples, positive_eval_indices if positive_eval_indices.size else eval_indices, int(config.map_pair_batch_size), int(config.seed) + 992)
+    with torch.no_grad():
+        active_indices = positive_eval_indices if positive_eval_indices.size >= 2 else eval_indices
+        query = _tensor(base.query_features[active_indices], dtype=torch.float32, device=device)
+        render = _tensor(base.render_features[active_indices], dtype=torch.float32, device=device)
+        query_z, query_offsets = model.forward_rows(query)
+        render_z, render_offsets = model.forward_rows(render)
+        scores = query_z @ render_z.T
+        labels = torch.arange(scores.shape[0], device=device)
+        qlabels = _tensor(base.query_offset_labels[active_indices], dtype=torch.long, device=device)
+        rlabels = _tensor(base.render_offset_labels[active_indices], dtype=torch.long, device=device)
+        metrics = {
+            "eval_sample_count": int(eval_indices.shape[0]),
+            "positive_match_count": int(positive_eval_indices.shape[0]),
+            "train_top1_acc": float(torch.mean((torch.argmax(scores, dim=1) == labels).float()).item()),
+            "query_offset_acc": float(torch.mean((torch.argmax(query_offsets, dim=1) == qlabels).float()).item()),
+            "render_offset_acc": float(torch.mean((torch.argmax(render_offsets, dim=1) == rlabels).float()).item()),
+        }
+        _query_pair_loss, query_pair_metrics = _fine_coordinate_loss_and_metrics(model.query_pair_fine_logits(query_z, render_z), qlabels)
+        _render_pair_loss, render_pair_metrics = _fine_coordinate_loss_and_metrics(model.pair_fine_logits(query_z, render_z), rlabels)
+        metrics["query_pair_fine_acc"] = float(query_pair_metrics["acc"])
+        metrics["query_pair_fine_valid_count"] = float(query_pair_metrics["valid_count"])
+        metrics["render_pair_fine_acc"] = float(render_pair_metrics["acc"])
+        metrics["render_pair_fine_valid_count"] = float(render_pair_metrics["valid_count"])
+        no_match_loss = _no_match_confidence_loss(model, samples, eval_indices, device=device)
+        if no_match_loss is not None:
+            metrics["no_match_confidence_loss"] = float(no_match_loss.detach().cpu().item())
+        for prefix, maps, targets in (
+            ("query", samples.query_feature_maps, samples.query_heatmap_targets),
+            ("render", samples.render_feature_maps, samples.render_heatmap_targets),
+    ):
+            value = _heatmap_loss(model, maps, targets, device=device, pair_subset=pair_subset)
+            if value is not None:
+                metrics[f"{prefix}_heatmap_mae"] = float(value.detach().cpu().item())
+        for prefix, images, keypoint_labels in (
+            ("query", samples.query_rgb_images, samples.query_rgb_keypoint_labels),
+            ("render", samples.render_rgb_images, samples.render_rgb_keypoint_labels),
+        ):
+            _loss_value, keypoint_metrics = _rgb_keypoint_loss(
+                model,
+                images,
+                keypoint_labels,
+                config=config,
+                device=device,
+                seed=int(config.seed) + 10000,
+                pair_subset=pair_subset,
+            )
+            for key, value in keypoint_metrics.items():
+                if isinstance(value, (int, float)):
+                    metrics[f"{prefix}_rgb_keypoint_{key if key != 'loss' else 'ce'}"] = float(value)
+        for prefix, images, targets in (
+            ("query", samples.query_rgb_images, samples.query_repeatability_targets),
+            ("render", samples.render_rgb_images, samples.render_repeatability_targets),
+        ):
+            value = _repeatability_loss(model, images, targets, device=device, pair_subset=pair_subset)
+            if value is not None:
+                metrics[f"{prefix}_repeatability_loss"] = float(value.detach().cpu().item())
+        if samples.query_cell_indices is not None and samples.render_cell_indices is not None:
+            indices = positive_eval_indices
+            _map_loss, map_metrics = _full_map_correspondence_loss(model, samples, indices, config, device, pair_subset=pair_subset)
+            metrics.update(map_metrics)
+            local_loss, local_metrics = _local_fine_transformer_loss(model, samples, indices, device=device, pair_subset=pair_subset)
+            if local_loss is not None:
+                metrics["local_fine_transformer_acc"] = float(local_metrics["acc"])
+                metrics["local_fine_transformer_valid_count"] = float(local_metrics["valid_count"])
+                metrics["local_fine_transformer_loss"] = float(local_loss.detach().cpu().item())
+            if float(config.rgb_keypoint_position_loss_weight) > 0.0:
+                for prefix, source_images, target_images, source_cells, target_cells, source_labels, target_labels in (
+                    (
+                        "query",
+                        samples.query_rgb_images,
+                        samples.render_rgb_images,
+                        samples.query_cell_indices,
+                        samples.render_cell_indices,
+                        base.query_offset_labels,
+                        base.render_offset_labels,
+                    ),
+                    (
+                        "render",
+                        samples.render_rgb_images,
+                        samples.query_rgb_images,
+                        samples.render_cell_indices,
+                        samples.query_cell_indices,
+                        base.render_offset_labels,
+                        base.query_offset_labels,
+                    ),
+                ):
+                    value, acc = _rgb_keypoint_position_loss(
+                        model,
+                        source_images,
+                        target_images,
+                        samples.sample_pair_indices,
+                        source_cells,
+                        target_cells,
+                        source_labels,
+                        target_labels,
+                        device=device,
+                    )
+                    if value is not None:
+                        metrics[f"{prefix}_rgb_position_acc"] = float(acc)
+                        metrics[f"{prefix}_rgb_position_loss"] = float(value.detach().cpu().item())
+    model.train()
+    return metrics
+
+
+def train_matcha_joint_model(
+    samples: MatchaJointTrainingSet,
+    config: MatchaJointTrainingConfig | None = None,
+    *,
+    validation_samples: MatchaJointTrainingSet | None = None,
+    validation_interval: int = 0,
+    warm_start_model: MatchaStyleJointModel | None = None,
+) -> MatchaJointTrainingRun:
+    cfg = config or MatchaJointTrainingConfig()
+    torch.manual_seed(int(cfg.seed))
+    random.seed(int(cfg.seed))
+    np.random.seed(int(cfg.seed))
+    device = torch.device(cfg.device if torch.cuda.is_available() or not str(cfg.device).startswith("cuda") else "cpu")
+    model = _build_matcha_joint_model_for_samples(samples, cfg, device)
+    warm_start_report: dict[str, object] = {}
+    if warm_start_model is not None:
+        result = model.load_state_dict(warm_start_model.state_dict(), strict=False)
+        warm_start_report = {
+            "warm_start_loaded": True,
+            "warm_start_missing_keys": list(result.missing_keys),
+            "warm_start_unexpected_keys": list(result.unexpected_keys),
+        }
+    optimizer = torch.optim.AdamW(model.parameters(), lr=float(cfg.lr), weight_decay=1e-4)
+    rng = np.random.default_rng(int(cfg.seed))
+
+    def loss_value(step_seed: int) -> float:
+        return _loss_value_for_samples(model, samples, cfg, device, seed=int(step_seed))
+
+    initial_loss = loss_value(int(cfg.seed))
+    validation_history: list[dict[str, float | int]] = []
+    best_validation_loss = float("inf")
+    best_validation_step = -1
+    best_state: dict[str, torch.Tensor] | None = None
+
+    def maybe_validate(step: int) -> None:
+        nonlocal best_validation_loss, best_validation_step, best_state
+        if validation_samples is None:
+            return
+        value = _loss_value_for_samples(model, validation_samples, cfg, device, seed=int(cfg.seed) + 50000 + int(step))
+        validation_history.append({"step": int(step), "loss": float(value)})
+        if value < best_validation_loss:
+            best_validation_loss = float(value)
+            best_validation_step = int(step)
+            best_state = _model_state_snapshot(model)
+
+    maybe_validate(0)
+    model.train()
+    for step in range(int(cfg.steps)):
+        idx = _sample_indices(rng, samples.coarse_fine_samples.sample_count, int(cfg.batch_size))
+        loss, _metrics = _total_loss(model, samples, idx, cfg, device, seed=int(cfg.seed) + int(step))
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+        if validation_samples is not None and int(validation_interval) > 0 and ((int(step) + 1) % int(validation_interval) == 0):
+            maybe_validate(int(step) + 1)
+    if validation_samples is not None and (not validation_history or int(validation_history[-1]["step"]) != int(cfg.steps)):
+        maybe_validate(int(cfg.steps))
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    final_loss = loss_value(int(cfg.seed) + int(cfg.steps) + 1)
+    summary = {
+        "stage": "matcha_style_joint_training",
+        "model_type": str(cfg.model_type),
+        "initial_loss": float(initial_loss),
+        "final_loss": float(final_loss),
+        "sample_count": int(samples.coarse_fine_samples.sample_count),
+        "input_dim": int(samples.coarse_fine_samples.input_dim),
+        "output_dim": int(cfg.output_dim),
+        "steps": int(cfg.steps),
+        "batch_size": int(cfg.batch_size),
+    }
+    summary.update(warm_start_report)
+    if validation_samples is not None:
+        summary.update(
+            {
+                "best_validation_loss": float(best_validation_loss),
+                "best_validation_step": int(best_validation_step),
+                "validation_eval_count": int(len(validation_history)),
+                "validation_history": validation_history,
+            }
+        )
+    summary.update(_evaluate(model, samples, cfg, device))
+    return MatchaJointTrainingRun(model=model.cpu().eval(), summary=summary)
+
+
+def _load_joint_manifest_metadata(path: Path) -> tuple[Path, dict[str, object], list[dict[str, object]]]:
+    manifest_path = Path(path)
+    metadata = json.loads(manifest_path.read_text())
+    if str(metadata.get("format", "")) != _JOINT_MANIFEST_FORMAT:
+        raise ValueError(f"unsupported MATCHA joint training manifest format in {path}")
+    shards = list(metadata.get("shards", []))
+    if not shards:
+        raise ValueError("MATCHA joint training manifest contains no shards")
+    return manifest_path, metadata, [dict(item) for item in shards]
+
+
+class _LazyJointShardCache:
+    def __init__(self, manifest_path: Path, shards: list[dict[str, object]], *, max_size: int = 1) -> None:
+        self.manifest_path = Path(manifest_path)
+        self.shards = shards
+        self.max_size = max(1, int(max_size))
+        self.cache: OrderedDict[int, MatchaJointTrainingSet] = OrderedDict()
+
+    def _path_for_index(self, index: int) -> Path:
+        shard_path = Path(str(self.shards[int(index)]["path"]))
+        if not shard_path.is_absolute():
+            shard_path = self.manifest_path.parent / shard_path
+        return shard_path
+
+    def get(self, index: int) -> MatchaJointTrainingSet:
+        key = int(index)
+        if key in self.cache:
+            value = self.cache.pop(key)
+            self.cache[key] = value
+            return value
+        sample, _metadata = load_matcha_joint_training_set_npz(self._path_for_index(key))
+        self.cache[key] = sample
+        while len(self.cache) > self.max_size:
+            self.cache.popitem(last=False)
+        return sample
+
+
+def train_matcha_joint_model_from_manifest(
+    manifest_path: Path,
+    config: MatchaJointTrainingConfig | None = None,
+    *,
+    validation_samples: MatchaJointTrainingSet | None = None,
+    validation_manifest_path: Path | None = None,
+    validation_interval: int = 0,
+    shard_cache_size: int = 1,
+    steps_per_shard: int = 1,
+    warm_start_model: MatchaStyleJointModel | None = None,
+) -> MatchaJointTrainingRun:
+    cfg = config or MatchaJointTrainingConfig()
+    manifest, metadata, shards = _load_joint_manifest_metadata(Path(manifest_path))
+    cache = _LazyJointShardCache(manifest, shards, max_size=int(shard_cache_size))
+    validation_cache = None
+    validation_shards: list[dict[str, object]] = []
+    validation_metadata: dict[str, object] = {}
+    if validation_manifest_path is not None:
+        validation_manifest, validation_metadata, validation_shards = _load_joint_manifest_metadata(Path(validation_manifest_path))
+        validation_cache = _LazyJointShardCache(validation_manifest, validation_shards, max_size=max(1, min(int(shard_cache_size), 2)))
+    first_samples = cache.get(0)
+    torch.manual_seed(int(cfg.seed))
+    random.seed(int(cfg.seed))
+    np.random.seed(int(cfg.seed))
+    device = torch.device(cfg.device if torch.cuda.is_available() or not str(cfg.device).startswith("cuda") else "cpu")
+    model = _build_matcha_joint_model_for_samples(first_samples, cfg, device)
+    warm_start_report: dict[str, object] = {}
+    if warm_start_model is not None:
+        result = model.load_state_dict(warm_start_model.state_dict(), strict=False)
+        warm_start_report = {
+            "warm_start_loaded": True,
+            "warm_start_missing_keys": list(result.missing_keys),
+            "warm_start_unexpected_keys": list(result.unexpected_keys),
+        }
+    optimizer = torch.optim.AdamW(model.parameters(), lr=float(cfg.lr), weight_decay=1e-4)
+    rng = np.random.default_rng(int(cfg.seed))
+    shard_count = int(len(shards))
+    total_sample_count = int(sum(int(item.get("sample_count", 0)) for item in shards))
+
+    def shard_for_step(step: int) -> int:
+        epoch = int(step) // max(1, int(steps_per_shard) * shard_count)
+        position = (int(step) // max(1, int(steps_per_shard))) % shard_count
+        order_rng = np.random.default_rng(int(cfg.seed) + 1009 + int(epoch))
+        return int(order_rng.permutation(shard_count)[position])
+
+    initial_loss = _loss_value_for_samples(model, first_samples, cfg, device, seed=int(cfg.seed))
+    validation_history: list[dict[str, float | int]] = []
+    best_validation_loss = float("inf")
+    best_validation_step = -1
+    best_state: dict[str, torch.Tensor] | None = None
+
+    def maybe_validate(step: int) -> None:
+        nonlocal best_validation_loss, best_validation_step, best_state
+        if validation_samples is None and validation_cache is None:
+            return
+        if validation_cache is not None:
+            values = []
+            for shard_idx in range(len(validation_shards)):
+                shard_samples = validation_cache.get(shard_idx)
+                values.append(
+                    _loss_value_for_samples(
+                        model,
+                        shard_samples,
+                        cfg,
+                        device,
+                        seed=int(cfg.seed) + 50000 + int(step) + int(shard_idx),
+                    )
+                )
+            value = float(np.mean(values)) if values else float("inf")
+        else:
+            assert validation_samples is not None
+            value = _loss_value_for_samples(model, validation_samples, cfg, device, seed=int(cfg.seed) + 50000 + int(step))
+        validation_history.append({"step": int(step), "loss": float(value)})
+        if value < best_validation_loss:
+            best_validation_loss = float(value)
+            best_validation_step = int(step)
+            best_state = _model_state_snapshot(model)
+
+    maybe_validate(0)
+    model.train()
+    last_samples = first_samples
+    for step in range(int(cfg.steps)):
+        samples = cache.get(shard_for_step(step))
+        last_samples = samples
+        idx = _sample_indices(rng, samples.coarse_fine_samples.sample_count, int(cfg.batch_size))
+        loss, _metrics = _total_loss(model, samples, idx, cfg, device, seed=int(cfg.seed) + int(step))
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+        if (validation_samples is not None or validation_cache is not None) and int(validation_interval) > 0 and ((int(step) + 1) % int(validation_interval) == 0):
+            maybe_validate(int(step) + 1)
+    if (validation_samples is not None or validation_cache is not None) and (not validation_history or int(validation_history[-1]["step"]) != int(cfg.steps)):
+        maybe_validate(int(cfg.steps))
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    final_loss = _loss_value_for_samples(model, last_samples, cfg, device, seed=int(cfg.seed) + int(cfg.steps) + 1)
+    eval_samples = validation_samples if validation_samples is not None else (validation_cache.get(0) if validation_cache is not None else last_samples)
+    summary = {
+        "stage": "matcha_style_joint_training",
+        "model_type": str(cfg.model_type),
+        "initial_loss": float(initial_loss),
+        "final_loss": float(final_loss),
+        "sample_count": int(total_sample_count),
+        "input_dim": int(first_samples.coarse_fine_samples.input_dim),
+        "output_dim": int(cfg.output_dim),
+        "steps": int(cfg.steps),
+        "batch_size": int(cfg.batch_size),
+        "manifest_shard_count": int(shard_count),
+        "manifest_sample_count": int(total_sample_count),
+        "manifest_lazy_training": True,
+        "manifest_shard_cache_size": int(shard_cache_size),
+        "manifest_steps_per_shard": int(steps_per_shard),
+    }
+    summary.update(warm_start_report)
+    if validation_samples is not None or validation_cache is not None:
+        summary.update(
+            {
+                "best_validation_loss": float(best_validation_loss),
+                "best_validation_step": int(best_validation_step),
+                "validation_eval_count": int(len(validation_history)),
+                "validation_history": validation_history,
+            }
+        )
+    if validation_cache is not None:
+        summary.update(
+            {
+                "validation_manifest_lazy": True,
+                "validation_manifest_shard_count": int(len(validation_shards)),
+                "validation_manifest_sample_count": int(validation_metadata.get("sample_count", 0)),
+            }
+        )
+    summary.update(_evaluate(model, eval_samples, cfg, device))
+    return MatchaJointTrainingRun(model=model.cpu().eval(), summary=summary)
+
+
+def joint_run_as_coarse_fine_adapter_run(run: MatchaJointTrainingRun) -> MatchaCoarseFineTrainingRun:
+    """Expose the trained adapter for existing render/matching evaluators."""
+
+    return MatchaCoarseFineTrainingRun(model=run.model.adapter.cpu().eval(), summary=dict(run.summary))
+
+
+def save_matcha_joint_model(run: MatchaJointTrainingRun, path: Path) -> None:
+    """Save the full MATCHA-style joint model, not only its adapter submodule."""
+
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    model = run.model.cpu().eval()
+    torch.save(
+        {
+            "format": _JOINT_MODEL_FORMAT,
+            "model_config": {
+                "model_type": "radio_dual_attention" if isinstance(model, RadioDualAttentionFusionJointModel) else "residual_adapter",
+                "input_dim": int(model.input_dim),
+                "output_dim": int(model.output_dim),
+                "residual_hidden_dim": int(model.adapter.residual_hidden_dim),
+                "group_size": int(model.adapter.group_size),
+                "input_norm_mode": str(model.adapter.input_norm_mode),
+                "gate_mode": str(model.adapter.gate_mode),
+                "residual_gate_scale": float(model.adapter.residual_gate_scale),
+                "fine_input_dim": int(getattr(model, "fine_input_dim", 0)),
+                "coarse_input_dim": int(getattr(model, "coarse_input_dim", 0)),
+                "attention_hidden_dim": int(getattr(model, "attention_hidden_dim", 0)),
+                "attention_depth": int(getattr(model, "attention_depth", 0)),
+                "attention_heads": int(getattr(model, "attention_heads", 0)),
+                "attention_patch_size": int(getattr(model, "attention_patch_size", 1)),
+                "attention_upsample_mode": str(getattr(model, "attention_upsample_mode", "bilinear")),
+                "attention_fusion_mode": str(getattr(model, "attention_fusion_mode", "legacy")),
+            },
+            "state_dict": model.state_dict(),
+            "summary": dict(run.summary),
+        },
+        output,
+    )
+
+
+def load_matcha_joint_model(path: Path, device: str = "cpu") -> MatchaJointTrainingRun:
+    payload = torch.load(Path(path), map_location=device)
+    if payload.get("format") != _JOINT_MODEL_FORMAT:
+        raise ValueError(f"unsupported MATCHA joint checkpoint format in {path}")
+    cfg = dict(payload["model_config"])
+    if str(cfg.get("model_type", "residual_adapter")) == "radio_dual_attention":
+        model = RadioDualAttentionFusionJointModel(
+            fine_input_dim=int(cfg["fine_input_dim"]),
+            coarse_input_dim=int(cfg["coarse_input_dim"]),
+            output_dim=int(cfg["output_dim"]),
+            residual_hidden_dim=int(cfg["residual_hidden_dim"]),
+            attention_hidden_dim=int(cfg.get("attention_hidden_dim", cfg["residual_hidden_dim"])),
+            attention_depth=int(cfg.get("attention_depth", 2)),
+            attention_heads=int(cfg.get("attention_heads", 4)),
+            attention_patch_size=int(cfg.get("attention_patch_size", 1)),
+            attention_upsample_mode=str(cfg.get("attention_upsample_mode", "bilinear")),
+            attention_fusion_mode=str(cfg.get("attention_fusion_mode", "legacy")),
+            group_size=int(cfg["group_size"]),
+            input_norm_mode=str(cfg.get("input_norm_mode", "identity")),
+            gate_mode=str(cfg.get("gate_mode", "residual")),
+            residual_gate_scale=float(cfg.get("residual_gate_scale", 0.1)),
+        )
+    else:
+        model = MatchaStyleJointModel(
+            input_dim=int(cfg["input_dim"]),
+            output_dim=int(cfg["output_dim"]),
+            residual_hidden_dim=int(cfg["residual_hidden_dim"]),
+            group_size=int(cfg["group_size"]),
+            input_norm_mode=str(cfg.get("input_norm_mode", "identity")),
+            gate_mode=str(cfg.get("gate_mode", "residual")),
+            residual_gate_scale=float(cfg.get("residual_gate_scale", 0.1)),
+        )
+    incompatible = model.load_state_dict(payload["state_dict"], strict=False)
+    summary = dict(payload.get("summary", {}))
+    missing = [str(item) for item in getattr(incompatible, "missing_keys", [])]
+    unexpected = [str(item) for item in getattr(incompatible, "unexpected_keys", [])]
+    if missing:
+        summary["missing_state_keys"] = missing
+    if unexpected:
+        summary["unexpected_state_keys"] = unexpected
+    return MatchaJointTrainingRun(model=model.to(torch.device(device)).eval(), summary=summary)
+
+
+def project_feature_map_with_matcha_joint_model(
+    model: MatchaStyleJointModel,
+    feature_map: np.ndarray,
+    *,
+    device: str = "cpu",
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Project one raw feature map through learned fusion, selector, offsets and heatmap."""
+
+    fmap = np.asarray(feature_map, dtype=np.float32)
+    if fmap.ndim != 3:
+        raise ValueError("feature_map must have shape (C, H, W)")
+    torch_device = torch.device(device if torch.cuda.is_available() or not str(device).startswith("cuda") else "cpu")
+    was_training = model.training
+    model = model.to(torch_device).eval()
+    tensor = torch.as_tensor(fmap[None], dtype=torch.float32, device=torch_device)
+    with torch.no_grad():
+        desc, heatmap_logits, offset_logits = model.forward_feature_map(tensor)
+    if was_training:
+        model.train()
+    selected = desc[0].detach().cpu().numpy().astype(np.float32, copy=False)
+    offsets = offset_logits[0].detach().cpu().numpy().astype(np.float32, copy=False)
+    heatmap = torch.sigmoid(heatmap_logits[0, 0]).detach().cpu().numpy().astype(np.float32, copy=False)
+    return selected, offsets, heatmap
+
+
+def _descriptor_rows_from_feature_map(feature_map: np.ndarray) -> np.ndarray:
+    fmap = np.asarray(feature_map, dtype=np.float32)
+    if fmap.ndim != 3:
+        raise ValueError("feature_map must have shape (C, H, W)")
+    return fmap.reshape(fmap.shape[0], -1).T.astype(np.float32, copy=False)
+
+
+def predict_matcha_joint_pair_heads_for_matches(
+    model: MatchaStyleJointModel | RadioDualAttentionFusionJointModel,
+    query_feature_map: np.ndarray,
+    render_feature_map: np.ndarray,
+    matches,
+    *,
+    device: str = "cpu",
+    batch_size: int = 65536,
+    fine_target_side: str = "render",
+) -> tuple[np.ndarray, np.ndarray]:
+    """Predict confidence and MATCHA fine-offset logits using a joint model."""
+
+    values = list(matches)
+    if not values:
+        return np.zeros((0,), dtype=np.float32), np.zeros((0, 64), dtype=np.float32)
+    side = str(fine_target_side)
+    if side not in {"render", "query"}:
+        raise ValueError("fine_target_side must be 'render' or 'query'")
+    query_rows = _descriptor_rows_from_feature_map(query_feature_map)
+    render_rows = _descriptor_rows_from_feature_map(render_feature_map)
+    query_indices = np.asarray([int(match.query_index) for match in values], dtype=np.int64)
+    render_indices = np.asarray([int(match.render_index) for match in values], dtype=np.int64)
+    if np.any(query_indices < 0) or np.any(query_indices >= query_rows.shape[0]):
+        raise ValueError("match query_index exceeds query feature map size")
+    if np.any(render_indices < 0) or np.any(render_indices >= render_rows.shape[0]):
+        raise ValueError("match render_index exceeds render feature map size")
+    torch_device = torch.device(device if torch.cuda.is_available() or not str(device).startswith("cuda") else "cpu")
+    was_training = model.training
+    model = model.to(torch_device).eval()
+    confidences = []
+    fine_logits = []
+    with torch.no_grad():
+        for start in range(0, len(values), int(batch_size)):
+            end = min(start + int(batch_size), len(values))
+            query = torch.as_tensor(query_rows[query_indices[start:end]], dtype=torch.float32, device=torch_device)
+            render = torch.as_tensor(render_rows[render_indices[start:end]], dtype=torch.float32, device=torch_device)
+            if int(query.shape[1]) == int(model.output_dim) and int(render.shape[1]) == int(model.output_dim):
+                query_z = F.normalize(query, dim=1)
+                render_z = F.normalize(render, dim=1)
+            elif int(query.shape[1]) == int(model.input_dim) and int(render.shape[1]) == int(model.input_dim):
+                query_z = model.encode(query)
+                render_z = model.encode(render)
+            else:
+                raise ValueError("feature maps must contain either raw joint input descriptors or projected descriptors")
+            logits = model.pair_confidence_logits(query_z, render_z)
+            fine = model.query_pair_fine_logits(query_z, render_z) if side == "query" else model.pair_fine_logits(query_z, render_z)
+            confidences.append(torch.sigmoid(logits).detach().cpu().numpy().astype(np.float32, copy=False))
+            fine_logits.append(fine.detach().cpu().numpy().astype(np.float32, copy=False))
+    if was_training:
+        model.train()
+    return np.concatenate(confidences, axis=0), np.concatenate(fine_logits, axis=0)
+
+
+def _optional_npz_value(value: np.ndarray | None) -> np.ndarray:
+    if value is None:
+        return np.asarray([], dtype=np.float32)
+    return np.asarray(value)
+
+
+def _optional_loaded(data, key: str) -> np.ndarray | None:
+    if key not in data:
+        return None
+    value = np.asarray(data[key])
+    return None if value.size == 0 else value
+
+
+def save_matcha_joint_training_set_npz(samples: MatchaJointTrainingSet, path: Path) -> None:
+    """Save full MATCHA joint training tensors for reproducible training."""
+
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    base = samples.coarse_fine_samples
+    if isinstance(base, IndexOnlyCoarseFineRows):
+        np.savez_compressed(
+            output,
+            format=np.asarray([_JOINT_INDEX_FORMAT], dtype=object),
+            input_dim=np.asarray([int(base.input_dim)], dtype=np.int64),
+            sample_count=np.asarray([int(base.sample_count)], dtype=np.int64),
+            query_offset_labels=base.query_offset_labels,
+            render_offset_labels=base.render_offset_labels,
+            query_offset_soft_labels=_optional_npz_value(base.query_offset_soft_labels),
+            render_offset_soft_labels=_optional_npz_value(base.render_offset_soft_labels),
+            sample_confidence_targets=_optional_npz_value(base.sample_confidence_targets),
+            sample_uncertainty_px=_optional_npz_value(base.sample_uncertainty_px),
+            negative_render_indices=base.negative_render_indices,
+            roundtrip_errors_px=base.roundtrip_errors_px,
+            coarse_metadata=np.asarray([dict(base.metadata or {})], dtype=object),
+            query_feature_maps=_optional_npz_value(samples.query_feature_maps),
+            render_feature_maps=_optional_npz_value(samples.render_feature_maps),
+            query_heatmap_targets=_optional_npz_value(samples.query_heatmap_targets),
+            render_heatmap_targets=_optional_npz_value(samples.render_heatmap_targets),
+            sample_pair_indices=_optional_npz_value(samples.sample_pair_indices),
+            query_cell_indices=_optional_npz_value(samples.query_cell_indices),
+            render_cell_indices=_optional_npz_value(samples.render_cell_indices),
+            query_rgb_images=_optional_npz_value(samples.query_rgb_images),
+            render_rgb_images=_optional_npz_value(samples.render_rgb_images),
+            query_rgb_keypoint_labels=_optional_npz_value(samples.query_rgb_keypoint_labels),
+            render_rgb_keypoint_labels=_optional_npz_value(samples.render_rgb_keypoint_labels),
+            pair_type_ids=_optional_npz_value(samples.pair_type_ids),
+            pair_type_names=_optional_npz_value(samples.pair_type_names),
+            pair_query_ids=_optional_npz_value(samples.pair_query_ids),
+            pair_split_names=_optional_npz_value(samples.pair_split_names),
+            pair_candidate_ids=_optional_npz_value(samples.pair_candidate_ids),
+            pair_translation_errors_m=_optional_npz_value(samples.pair_translation_errors_m),
+            pair_rotation_errors_deg=_optional_npz_value(samples.pair_rotation_errors_deg),
+            sample_no_match_labels=_optional_npz_value(samples.sample_no_match_labels),
+            sample_ignore_mask=_optional_npz_value(samples.sample_ignore_mask),
+            sample_confidence_ignore_mask=_optional_npz_value(samples.sample_confidence_ignore_mask),
+            query_repeatability_targets=_optional_npz_value(samples.query_repeatability_targets),
+            render_repeatability_targets=_optional_npz_value(samples.render_repeatability_targets),
+        )
+        return
+    np.savez_compressed(
+        output,
+        format=np.asarray([_JOINT_FORMAT], dtype=object),
+        query_features=base.query_features,
+        render_features=base.render_features,
+        query_offset_labels=base.query_offset_labels,
+        render_offset_labels=base.render_offset_labels,
+        query_offset_soft_labels=_optional_npz_value(base.query_offset_soft_labels),
+        render_offset_soft_labels=_optional_npz_value(base.render_offset_soft_labels),
+        sample_confidence_targets=_optional_npz_value(base.sample_confidence_targets),
+        sample_uncertainty_px=_optional_npz_value(base.sample_uncertainty_px),
+        negative_render_features=base.negative_render_features,
+        roundtrip_errors_px=base.roundtrip_errors_px,
+        coarse_metadata=np.asarray([dict(base.metadata or {})], dtype=object),
+        query_feature_maps=_optional_npz_value(samples.query_feature_maps),
+        render_feature_maps=_optional_npz_value(samples.render_feature_maps),
+        query_heatmap_targets=_optional_npz_value(samples.query_heatmap_targets),
+        render_heatmap_targets=_optional_npz_value(samples.render_heatmap_targets),
+        sample_pair_indices=_optional_npz_value(samples.sample_pair_indices),
+        query_cell_indices=_optional_npz_value(samples.query_cell_indices),
+        render_cell_indices=_optional_npz_value(samples.render_cell_indices),
+        query_rgb_images=_optional_npz_value(samples.query_rgb_images),
+        render_rgb_images=_optional_npz_value(samples.render_rgb_images),
+        query_rgb_keypoint_labels=_optional_npz_value(samples.query_rgb_keypoint_labels),
+        render_rgb_keypoint_labels=_optional_npz_value(samples.render_rgb_keypoint_labels),
+        pair_type_ids=_optional_npz_value(samples.pair_type_ids),
+        pair_type_names=_optional_npz_value(samples.pair_type_names),
+        pair_query_ids=_optional_npz_value(samples.pair_query_ids),
+        pair_split_names=_optional_npz_value(samples.pair_split_names),
+        pair_candidate_ids=_optional_npz_value(samples.pair_candidate_ids),
+        pair_translation_errors_m=_optional_npz_value(samples.pair_translation_errors_m),
+        pair_rotation_errors_deg=_optional_npz_value(samples.pair_rotation_errors_deg),
+        sample_no_match_labels=_optional_npz_value(samples.sample_no_match_labels),
+        sample_ignore_mask=_optional_npz_value(samples.sample_ignore_mask),
+        sample_confidence_ignore_mask=_optional_npz_value(samples.sample_confidence_ignore_mask),
+        query_repeatability_targets=_optional_npz_value(samples.query_repeatability_targets),
+        render_repeatability_targets=_optional_npz_value(samples.render_repeatability_targets),
+    )
+
+
+def load_matcha_joint_training_set_npz(path: Path) -> tuple[MatchaJointTrainingSet, dict[str, object]]:
+    """Load a full MATCHA joint training cache."""
+
+    with np.load(Path(path), allow_pickle=True) as data:
+        fmt = str(data["format"][0]) if "format" in data else ""
+        if fmt == _JOINT_INDEX_FORMAT:
+            coarse_metadata = dict(data["coarse_metadata"][0]) if "coarse_metadata" in data else {}
+            query_feature_maps = _optional_loaded(data, "query_feature_maps")
+            render_feature_maps = _optional_loaded(data, "render_feature_maps")
+            query_cell_indices = _optional_loaded(data, "query_cell_indices")
+            render_cell_indices = _optional_loaded(data, "render_cell_indices")
+            sample_pair_indices = _optional_loaded(data, "sample_pair_indices")
+            if query_feature_maps is None or render_feature_maps is None:
+                raise ValueError("index-only joint cache requires query/render feature maps")
+            if query_cell_indices is None or render_cell_indices is None:
+                raise ValueError("index-only joint cache requires query/render cell indices")
+            base = IndexOnlyCoarseFineRows(
+                query_feature_maps=query_feature_maps,
+                render_feature_maps=render_feature_maps,
+                query_cell_indices=query_cell_indices,
+                render_cell_indices=render_cell_indices,
+                negative_render_indices=np.asarray(data["negative_render_indices"], dtype=np.int64),
+                query_offset_labels=np.asarray(data["query_offset_labels"], dtype=np.int64),
+                render_offset_labels=np.asarray(data["render_offset_labels"], dtype=np.int64),
+                roundtrip_errors_px=np.asarray(data["roundtrip_errors_px"], dtype=np.float32),
+                query_offset_soft_labels=_optional_loaded(data, "query_offset_soft_labels"),
+                render_offset_soft_labels=_optional_loaded(data, "render_offset_soft_labels"),
+                sample_confidence_targets=_optional_loaded(data, "sample_confidence_targets"),
+                sample_uncertainty_px=_optional_loaded(data, "sample_uncertainty_px"),
+                sample_pair_indices=sample_pair_indices,
+                metadata=coarse_metadata,
+            )
+            samples = MatchaJointTrainingSet(
+                coarse_fine_samples=base,
+                query_feature_maps=query_feature_maps,
+                render_feature_maps=render_feature_maps,
+                query_heatmap_targets=_optional_loaded(data, "query_heatmap_targets"),
+                render_heatmap_targets=_optional_loaded(data, "render_heatmap_targets"),
+                sample_pair_indices=sample_pair_indices,
+                query_cell_indices=query_cell_indices,
+                render_cell_indices=render_cell_indices,
+                query_rgb_images=_optional_loaded(data, "query_rgb_images"),
+                render_rgb_images=_optional_loaded(data, "render_rgb_images"),
+                query_rgb_keypoint_labels=_optional_loaded(data, "query_rgb_keypoint_labels"),
+                render_rgb_keypoint_labels=_optional_loaded(data, "render_rgb_keypoint_labels"),
+                pair_type_ids=_optional_loaded(data, "pair_type_ids"),
+                pair_type_names=_optional_loaded(data, "pair_type_names"),
+                pair_query_ids=_optional_loaded(data, "pair_query_ids"),
+                pair_split_names=_optional_loaded(data, "pair_split_names"),
+                pair_candidate_ids=_optional_loaded(data, "pair_candidate_ids"),
+                pair_translation_errors_m=_optional_loaded(data, "pair_translation_errors_m"),
+                pair_rotation_errors_deg=_optional_loaded(data, "pair_rotation_errors_deg"),
+                sample_no_match_labels=_optional_loaded(data, "sample_no_match_labels"),
+                sample_ignore_mask=_optional_loaded(data, "sample_ignore_mask"),
+                sample_confidence_ignore_mask=_optional_loaded(data, "sample_confidence_ignore_mask"),
+                query_repeatability_targets=_optional_loaded(data, "query_repeatability_targets"),
+                render_repeatability_targets=_optional_loaded(data, "render_repeatability_targets"),
+            )
+            return samples, {"format": _JOINT_INDEX_FORMAT, "coarse_metadata": coarse_metadata}
+        if fmt != _JOINT_FORMAT:
+            raise ValueError(f"unsupported MATCHA joint training-set format in {path}")
+        coarse_metadata = dict(data["coarse_metadata"][0]) if "coarse_metadata" in data else {}
+        base = MatchaCoarseFineTrainingSet(
+            query_features=np.asarray(data["query_features"], dtype=np.float32),
+            render_features=np.asarray(data["render_features"], dtype=np.float32),
+            query_offset_labels=np.asarray(data["query_offset_labels"], dtype=np.int64),
+            render_offset_labels=np.asarray(data["render_offset_labels"], dtype=np.int64),
+            negative_render_features=np.asarray(data["negative_render_features"], dtype=np.float32),
+            roundtrip_errors_px=np.asarray(data["roundtrip_errors_px"], dtype=np.float32),
+            query_offset_soft_labels=_optional_loaded(data, "query_offset_soft_labels"),
+            render_offset_soft_labels=_optional_loaded(data, "render_offset_soft_labels"),
+            sample_confidence_targets=_optional_loaded(data, "sample_confidence_targets"),
+            sample_uncertainty_px=_optional_loaded(data, "sample_uncertainty_px"),
+            metadata=coarse_metadata,
+        )
+        samples = MatchaJointTrainingSet(
+            coarse_fine_samples=base,
+            query_feature_maps=_optional_loaded(data, "query_feature_maps"),
+            render_feature_maps=_optional_loaded(data, "render_feature_maps"),
+            query_heatmap_targets=_optional_loaded(data, "query_heatmap_targets"),
+            render_heatmap_targets=_optional_loaded(data, "render_heatmap_targets"),
+            sample_pair_indices=_optional_loaded(data, "sample_pair_indices"),
+            query_cell_indices=_optional_loaded(data, "query_cell_indices"),
+            render_cell_indices=_optional_loaded(data, "render_cell_indices"),
+            query_rgb_images=_optional_loaded(data, "query_rgb_images"),
+            render_rgb_images=_optional_loaded(data, "render_rgb_images"),
+            query_rgb_keypoint_labels=_optional_loaded(data, "query_rgb_keypoint_labels"),
+            render_rgb_keypoint_labels=_optional_loaded(data, "render_rgb_keypoint_labels"),
+            pair_type_ids=_optional_loaded(data, "pair_type_ids"),
+            pair_type_names=_optional_loaded(data, "pair_type_names"),
+            pair_query_ids=_optional_loaded(data, "pair_query_ids"),
+            pair_split_names=_optional_loaded(data, "pair_split_names"),
+            pair_candidate_ids=_optional_loaded(data, "pair_candidate_ids"),
+            pair_translation_errors_m=_optional_loaded(data, "pair_translation_errors_m"),
+            pair_rotation_errors_deg=_optional_loaded(data, "pair_rotation_errors_deg"),
+            sample_no_match_labels=_optional_loaded(data, "sample_no_match_labels"),
+            sample_ignore_mask=_optional_loaded(data, "sample_ignore_mask"),
+            sample_confidence_ignore_mask=_optional_loaded(data, "sample_confidence_ignore_mask"),
+            query_repeatability_targets=_optional_loaded(data, "query_repeatability_targets"),
+            render_repeatability_targets=_optional_loaded(data, "render_repeatability_targets"),
+        )
+    return samples, {"format": _JOINT_FORMAT, "coarse_metadata": coarse_metadata}
+
+
+def save_matcha_joint_training_set_manifest(
+    items: list[MatchaJointTrainingSet] | tuple[MatchaJointTrainingSet, ...],
+    manifest_path: Path,
+    *,
+    shard_dir: Path | None = None,
+) -> dict[str, object]:
+    """Save joint training sets as multiple shards plus a lightweight manifest."""
+
+    values = list(items)
+    if not values:
+        raise ValueError("at least one joint training set is required")
+    manifest = Path(manifest_path)
+    root = manifest.parent
+    output_dir = Path(shard_dir) if shard_dir is not None else root / "shards"
+    if not output_dir.is_absolute():
+        output_dir = root / output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+    shards = []
+    split_counts: dict[str, int] = {}
+    pair_type_counts: dict[str, int] = {}
+
+    def first_string(value: np.ndarray | None, default: str = "") -> str:
+        if value is None:
+            return default
+        arr = np.asarray(value, dtype=object).reshape(-1)
+        if arr.shape[0] == 0:
+            return default
+        return str(arr[0])
+
+    for index, item in enumerate(values):
+        shard_path = output_dir / f"shard_{int(index):05d}.npz"
+        save_matcha_joint_training_set_npz(item, shard_path)
+        try:
+            relative_path = shard_path.relative_to(root)
+        except ValueError:
+            relative_path = shard_path
+        pair_count = int(item.query_feature_maps.shape[0]) if item.query_feature_maps is not None else 0
+        split_name = first_string(item.pair_split_names)
+        pair_type = first_string(item.pair_type_names)
+        if split_name:
+            split_counts[split_name] = int(split_counts.get(split_name, 0) + max(pair_count, 1))
+        if pair_type:
+            pair_type_counts[pair_type] = int(pair_type_counts.get(pair_type, 0) + max(pair_count, 1))
+        shards.append(
+            {
+                "path": str(relative_path),
+                "sample_count": int(item.coarse_fine_samples.sample_count),
+                "pair_count": pair_count,
+                "query_id": first_string(item.pair_query_ids),
+                "split": split_name,
+                "pair_type": pair_type,
+                "candidate_id": first_string(item.pair_candidate_ids),
+            }
+        )
+    metadata = {
+        "format": _JOINT_MANIFEST_FORMAT,
+        "shard_count": int(len(shards)),
+        "sample_count": int(sum(int(item["sample_count"]) for item in shards)),
+        "split_counts": split_counts,
+        "pair_type_counts": pair_type_counts,
+        "shards": shards,
+    }
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    manifest.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
+    return metadata
+
+
+def load_matcha_joint_training_set_manifest(path: Path) -> tuple[MatchaJointTrainingSet, dict[str, object]]:
+    """Load and merge a sharded MATCHA joint training cache manifest."""
+
+    manifest_path = Path(path)
+    metadata = json.loads(manifest_path.read_text())
+    if str(metadata.get("format", "")) != _JOINT_MANIFEST_FORMAT:
+        raise ValueError(f"unsupported MATCHA joint training manifest format in {path}")
+    shards = list(metadata.get("shards", []))
+    if not shards:
+        raise ValueError("MATCHA joint training manifest contains no shards")
+    loaded = []
+    for shard in shards:
+        shard_path = Path(str(shard["path"]))
+        if not shard_path.is_absolute():
+            shard_path = manifest_path.parent / shard_path
+        sample, _sample_metadata = load_matcha_joint_training_set_npz(shard_path)
+        loaded.append(sample)
+    merged = merge_matcha_joint_training_sets(loaded)
+    output_metadata = dict(metadata)
+    output_metadata["format"] = _JOINT_MANIFEST_FORMAT
+    output_metadata["shard_count"] = int(len(shards))
+    output_metadata["sample_count"] = int(merged.coarse_fine_samples.sample_count)
+    return merged, output_metadata
+
+
+def merge_matcha_joint_training_sets(
+    items: list[MatchaJointTrainingSet] | tuple[MatchaJointTrainingSet, ...],
+) -> MatchaJointTrainingSet:
+    """Merge one-pair joint caches into a multi-pair cache."""
+
+    values = list(items)
+    if not values:
+        raise ValueError("at least one joint training set is required")
+    if any(isinstance(item.coarse_fine_samples, IndexOnlyCoarseFineRows) for item in values):
+        raise ValueError("index-only joint caches must be trained with lazy manifest loading")
+    input_dim = values[0].coarse_fine_samples.input_dim
+    negative_count = int(values[0].coarse_fine_samples.negative_render_features.shape[1])
+    for item in values:
+        base = item.coarse_fine_samples
+        if int(base.input_dim) != int(input_dim):
+            raise ValueError("cannot merge joint sets with different input dimensions")
+        if int(base.negative_render_features.shape[1]) != int(negative_count):
+            raise ValueError("cannot merge joint sets with different negative counts")
+
+    def stack_base_optional(name: str) -> np.ndarray | None:
+        arrays = [getattr(item.coarse_fine_samples, name) for item in values]
+        if all(array is None for array in arrays):
+            return None
+        if any(array is None for array in arrays):
+            raise ValueError(f"cannot merge partially missing coarse_fine_samples.{name}")
+        return np.concatenate([np.asarray(array) for array in arrays], axis=0)
+
+    base = MatchaCoarseFineTrainingSet(
+        query_features=np.concatenate([item.coarse_fine_samples.query_features for item in values], axis=0),
+        render_features=np.concatenate([item.coarse_fine_samples.render_features for item in values], axis=0),
+        query_offset_labels=np.concatenate([item.coarse_fine_samples.query_offset_labels for item in values], axis=0),
+        render_offset_labels=np.concatenate([item.coarse_fine_samples.render_offset_labels for item in values], axis=0),
+        negative_render_features=np.concatenate([item.coarse_fine_samples.negative_render_features for item in values], axis=0),
+        roundtrip_errors_px=np.concatenate([item.coarse_fine_samples.roundtrip_errors_px for item in values], axis=0),
+        query_offset_soft_labels=stack_base_optional("query_offset_soft_labels"),
+        render_offset_soft_labels=stack_base_optional("render_offset_soft_labels"),
+        sample_confidence_targets=stack_base_optional("sample_confidence_targets"),
+        sample_uncertainty_px=stack_base_optional("sample_uncertainty_px"),
+        metadata={"merged": True, "source_count": int(len(values))},
+    )
+
+    def stack_optional(name: str) -> np.ndarray | None:
+        arrays = [getattr(item, name) for item in values]
+        if all(array is None for array in arrays):
+            return None
+        if any(array is None for array in arrays):
+            raise ValueError(f"cannot merge partially missing {name}")
+        return np.concatenate([np.asarray(array) for array in arrays], axis=0)
+
+    pair_indices = []
+    query_indices = []
+    render_indices = []
+    for pair_idx, item in enumerate(values):
+        count = int(item.coarse_fine_samples.sample_count)
+        pair_indices.append(np.full((count,), int(pair_idx), dtype=np.int64))
+        if item.query_cell_indices is not None and item.render_cell_indices is not None:
+            query_indices.append(np.asarray(item.query_cell_indices, dtype=np.int64))
+            render_indices.append(np.asarray(item.render_cell_indices, dtype=np.int64))
+    if query_indices and len(query_indices) != len(values):
+        raise ValueError("cannot merge partially missing cell indices")
+
+    return MatchaJointTrainingSet(
+        coarse_fine_samples=base,
+        query_feature_maps=stack_optional("query_feature_maps"),
+        render_feature_maps=stack_optional("render_feature_maps"),
+        query_heatmap_targets=stack_optional("query_heatmap_targets"),
+        render_heatmap_targets=stack_optional("render_heatmap_targets"),
+        sample_pair_indices=np.concatenate(pair_indices, axis=0),
+        query_cell_indices=np.concatenate(query_indices, axis=0) if query_indices else None,
+        render_cell_indices=np.concatenate(render_indices, axis=0) if render_indices else None,
+        query_rgb_images=stack_optional("query_rgb_images"),
+        render_rgb_images=stack_optional("render_rgb_images"),
+        query_rgb_keypoint_labels=stack_optional("query_rgb_keypoint_labels"),
+        render_rgb_keypoint_labels=stack_optional("render_rgb_keypoint_labels"),
+        pair_type_ids=stack_optional("pair_type_ids"),
+        pair_type_names=stack_optional("pair_type_names"),
+        pair_query_ids=stack_optional("pair_query_ids"),
+        pair_split_names=stack_optional("pair_split_names"),
+        pair_candidate_ids=stack_optional("pair_candidate_ids"),
+        pair_translation_errors_m=stack_optional("pair_translation_errors_m"),
+        pair_rotation_errors_deg=stack_optional("pair_rotation_errors_deg"),
+        sample_no_match_labels=stack_optional("sample_no_match_labels"),
+        sample_ignore_mask=stack_optional("sample_ignore_mask"),
+        sample_confidence_ignore_mask=stack_optional("sample_confidence_ignore_mask"),
+        query_repeatability_targets=stack_optional("query_repeatability_targets"),
+        render_repeatability_targets=stack_optional("render_repeatability_targets"),
+    )

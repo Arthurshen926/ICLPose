@@ -281,6 +281,39 @@ def test_soft_order_pnp_matches_keeps_matches_but_prioritizes_confident_inputs()
         soft_order_pnp_matches([base], mode="bad")
 
 
+def test_soft_order_pnp_matches_uncertainty_penalizes_noisy_measurements() -> None:
+    noisy = QueryTo3DMatch(
+        token_index=0,
+        xy=np.array([0.0, 0.0], dtype=np.float64),
+        track_id=1,
+        xyz=np.array([0.0, 0.0, 3.0], dtype=np.float64),
+        similarity=0.9,
+        ratio=0.5,
+        landmark_variance=0.1,
+        similarity_margin=0.2,
+        measurement_sigma_px=16.0,
+        pnp_uncertainty_scale=2.0,
+    )
+    crisp = QueryTo3DMatch(
+        token_index=1,
+        xy=np.array([1.0, 0.0], dtype=np.float64),
+        track_id=2,
+        xyz=np.array([1.0, 0.0, 3.0], dtype=np.float64),
+        similarity=0.86,
+        ratio=0.5,
+        landmark_variance=0.1,
+        similarity_margin=0.2,
+        measurement_sigma_px=2.0,
+        pnp_uncertainty_scale=1.0,
+    )
+
+    ordered = soft_order_pnp_matches([noisy, crisp], mode="uncertainty")
+
+    assert [match.track_id for match in ordered] == [2, 1]
+    assert ordered[0].pnp_soft_score is not None
+    assert ordered[0].pnp_soft_score > ordered[1].pnp_soft_score
+
+
 def test_matching_filters_by_ratio_mutual_and_landmark_variance() -> None:
     query_map = np.zeros((4, 1, 3), dtype=np.float32)
     query_map[:, 0, 0] = np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
