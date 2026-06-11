@@ -22,6 +22,7 @@ from feature_extract.vfm.cambridge_pose_lattice import parse_cambridge_pose_file
 from feature_extract.vfm.gaussian_vfm_field import GaussianVFMRenderConfig
 from feature_extract.vfm.official_2dgs_renderer import load_official_2dgs_source_from_ply
 from feature_extract.vfm.query_to_3d_matching import camera_matrix_and_distortion
+from feature_extract.vfm.render_perturbation_flow import flow_capture_stats
 from feature_extract.vfm.render_pose_protocol import translate_pose_world
 
 
@@ -100,7 +101,16 @@ def _write_rgb(path: Path, rgb: np.ndarray) -> None:
         raise ValueError(f"failed to write image: {path}")
 
 
-def _project_flow_stats(depth: np.ndarray, camera, gt_pose_w2c: np.ndarray, render_pose_w2c: np.ndarray, *, step: int = 8) -> dict[str, float | None]:
+def _project_flow_stats(
+    depth: np.ndarray,
+    camera,
+    gt_pose_w2c: np.ndarray,
+    render_pose_w2c: np.ndarray,
+    *,
+    step: int = 8,
+    feature_grid_width: int | None = None,
+    feature_grid_height: int | None = None,
+) -> dict[str, float | int | None]:
     """Project GT-render depth points into a perturbed camera and summarize pixel displacement."""
 
     try:
@@ -111,7 +121,7 @@ def _project_flow_stats(depth: np.ndarray, camera, gt_pose_w2c: np.ndarray, rend
     valid = np.isfinite(depth_values) & (depth_values > 0.0)
     ys, xs = np.nonzero(valid[:: int(step), :: int(step)])
     if xs.size == 0:
-        return {"flow_median_px": None, "flow_p90_px": None, "flow_p95_px": None, "flow_visible_fraction": 0.0}
+        return {"flow_count": 0, "flow_valid_count": 0, "flow_median_px": None, "flow_p90_px": None, "flow_p95_px": None, "flow_visible_fraction": 0.0}
     xs = xs.astype(np.float64) * float(step)
     ys = ys.astype(np.float64) * float(step)
     z = depth_values[ys.astype(np.int64), xs.astype(np.int64)]
@@ -132,7 +142,7 @@ def _project_flow_stats(depth: np.ndarray, camera, gt_pose_w2c: np.ndarray, rend
     points_render = (perturb[:3, :3] @ points_world.T).T + perturb[:3, 3]
     in_front = points_render[:, 2] > 1e-6
     if not np.any(in_front):
-        return {"flow_median_px": None, "flow_p90_px": None, "flow_p95_px": None, "flow_visible_fraction": 0.0}
+        return {"flow_count": int(xs.size), "flow_valid_count": 0, "flow_median_px": None, "flow_p90_px": None, "flow_p95_px": None, "flow_visible_fraction": 0.0}
     projected, _jac = cv2.projectPoints(
         points_world[in_front],
         cv2.Rodrigues(perturb[:3, :3])[0],
@@ -149,14 +159,17 @@ def _project_flow_stats(depth: np.ndarray, camera, gt_pose_w2c: np.ndarray, rend
         & (projected[:, 1] <= float(camera.height - 1))
     )
     if not np.any(inside):
-        return {"flow_median_px": None, "flow_p90_px": None, "flow_p95_px": None, "flow_visible_fraction": 0.0}
-    flow = np.linalg.norm(projected[inside] - source[inside], axis=1)
-    return {
-        "flow_median_px": float(np.median(flow)),
-        "flow_p90_px": float(np.percentile(flow, 90.0)),
-        "flow_p95_px": float(np.percentile(flow, 95.0)),
-        "flow_visible_fraction": float(np.mean(inside)),
-    }
+        return {"flow_count": int(source.shape[0]), "flow_valid_count": 0, "flow_median_px": None, "flow_p90_px": None, "flow_p95_px": None, "flow_visible_fraction": 0.0}
+    grid_w = int(feature_grid_width) if feature_grid_width is not None and int(feature_grid_width) > 0 else max(1, int(round(float(camera.width) / 16.0)))
+    grid_h = int(feature_grid_height) if feature_grid_height is not None and int(feature_grid_height) > 0 else max(1, int(round(float(camera.height) / 16.0)))
+    return flow_capture_stats(
+        source,
+        projected,
+        image_width=int(camera.width),
+        image_height=int(camera.height),
+        grid_width=grid_w,
+        grid_height=grid_h,
+    )
 
 
 def _render_stats(rgb: np.ndarray, depth: np.ndarray, alpha: np.ndarray) -> dict[str, float]:
@@ -183,6 +196,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--default_camera", default="2,1024,576,883.0,512.0,288.0,0.0")
     parser.add_argument("--render_width", type=int, default=1280)
     parser.add_argument("--render_height", type=int, default=720)
+    parser.add_argument("--feature_grid_width", type=int, default=80)
+    parser.add_argument("--feature_grid_height", type=int, default=45)
+    parser.add_argument("--flow_step", type=int, default=8)
     parser.add_argument("--offsets", default="0,0,0;0.05,0,0;0.10,0,0;0.25,0,0")
     parser.add_argument("--max_queries", type=int, default=4)
     parser.add_argument("--device", default="cuda:0")
@@ -236,9 +252,28 @@ def main(argv: Sequence[str] | None = None) -> None:
             panel_labels.append(label)
             stats = _render_stats(rgb, depth, alpha)
             flow = (
-                {"flow_median_px": 0.0, "flow_p90_px": 0.0, "flow_p95_px": 0.0, "flow_visible_fraction": 1.0}
+                {
+                    "flow_count": 0,
+                    "flow_valid_count": 0,
+                    "flow_median_px": 0.0,
+                    "flow_p90_px": 0.0,
+                    "flow_p95_px": 0.0,
+                    "flow_visible_fraction": 1.0,
+                    "flow_within_8px": 1.0,
+                    "flow_within_16px": 1.0,
+                    "flow_within_32px": 1.0,
+                    "flow_within_same_cell": 1.0,
+                }
                 if np.allclose(offset, 0.0)
-                else _project_flow_stats(gt_depth if gt_depth is not None else depth, render_camera, gt_pose, pose)
+                else _project_flow_stats(
+                    gt_depth if gt_depth is not None else depth,
+                    render_camera,
+                    gt_pose,
+                    pose,
+                    step=max(1, int(args.flow_step)),
+                    feature_grid_width=int(args.feature_grid_width),
+                    feature_grid_height=int(args.feature_grid_height),
+                )
             )
             row = {
                 "query_id": image_id,

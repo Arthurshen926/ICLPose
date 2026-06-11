@@ -31,6 +31,8 @@ from feature_extract.vfm.query_to_3d_matching import (
     pnp_pose_error,
     pnp_reprojection_residual_stats,
     reprojection_error_stats,
+    refit_pose_with_unique_query_inliers,
+    select_unique_query_inlier_mask,
     match_spatial_distribution_stats,
     token_grid_xy,
     with_landmark_ambiguity_scores,
@@ -106,6 +108,85 @@ def test_deduplicate_pnp_matches_keeps_first_track_occurrence() -> None:
 
     assert [match.track_id for match in unique_matches] == [1, 2]
     assert original_indices.tolist() == [0, 1]
+
+
+def test_select_unique_query_inlier_mask_keeps_lowest_residual_candidate() -> None:
+    matches = [
+        QueryTo3DMatch(
+            token_index=0,
+            xy=np.asarray([50.0, 50.0], dtype=np.float64),
+            track_id=1,
+            xyz=np.asarray([0.0, 0.0, 5.0], dtype=np.float64),
+            similarity=0.7,
+            ratio=0.0,
+            landmark_variance=0.0,
+        ),
+        QueryTo3DMatch(
+            token_index=0,
+            xy=np.asarray([50.0, 50.0], dtype=np.float64),
+            track_id=2,
+            xyz=np.asarray([1.0, 0.0, 5.0], dtype=np.float64),
+            similarity=0.99,
+            ratio=0.0,
+            landmark_variance=0.0,
+        ),
+        QueryTo3DMatch(
+            token_index=1,
+            xy=np.asarray([66.0, 50.0], dtype=np.float64),
+            track_id=3,
+            xyz=np.asarray([1.0, 0.0, 5.0], dtype=np.float64),
+            similarity=0.8,
+            ratio=0.0,
+            landmark_variance=0.0,
+        ),
+    ]
+
+    mask = select_unique_query_inlier_mask(matches, np.eye(4, dtype=np.float64), _camera(), np.ones((3,), dtype=bool))
+
+    assert mask.tolist() == [True, False, True]
+
+
+def test_refit_pose_with_unique_query_inliers_remaps_mask() -> None:
+    xy = np.asarray(
+        [
+            [20.0, 20.0],
+            [80.0, 20.0],
+            [20.0, 80.0],
+            [80.0, 80.0],
+            [50.0, 35.0],
+        ],
+        dtype=np.float64,
+    )
+    xyz = _xyz_from_xy(xy, np.full((xy.shape[0],), 5.0, dtype=np.float64))
+    matches = [
+        QueryTo3DMatch(idx, xy[idx], idx + 10, xyz[idx], 0.9, 0.0, 0.0)
+        for idx in range(xy.shape[0])
+    ]
+    bad_duplicate = QueryTo3DMatch(
+        token_index=0,
+        xy=xy[0],
+        track_id=99,
+        xyz=np.asarray([1.0, 0.0, 5.0], dtype=np.float64),
+        similarity=0.99,
+        ratio=0.0,
+        landmark_variance=0.0,
+    )
+    matches.insert(1, bad_duplicate)
+    initial = estimate_pose_pnp_fixed([matches[0], *matches[2:]], _camera(), refine_method="LM")
+    initial_mask = np.ones((len(matches),), dtype=bool)
+
+    refit = refit_pose_with_unique_query_inliers(
+        matches,
+        _camera(),
+        initial.pose_w2c,
+        initial_mask,
+        min_inliers=4,
+    )
+
+    assert refit.success
+    assert refit.inlier_mask.tolist() == [True, False, True, True, True, True]
+    error = pnp_pose_error(refit.pose_w2c, np.eye(4, dtype=np.float64))
+    assert error.translation_m < 1e-4
 
 
 def test_query_tokens_match_landmarks_and_support_pnp() -> None:

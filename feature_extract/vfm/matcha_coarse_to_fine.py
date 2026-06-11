@@ -476,6 +476,41 @@ def rescore_keypoint_matches_by_feature_similarity(
     return rescored
 
 
+def retain_topk_matches_per_query(
+    matches: Sequence[KeypointFeatureMatch],
+    *,
+    max_per_query: int,
+) -> list[KeypointFeatureMatch]:
+    """Keep at most K highest-scoring render candidates for each query token."""
+
+    limit = int(max_per_query)
+    values = list(matches)
+    if limit <= 0 or not values:
+        return values
+    buckets: dict[int, list[KeypointFeatureMatch]] = {}
+    for match in values:
+        buckets.setdefault(int(match.query_index), []).append(match)
+    kept: list[KeypointFeatureMatch] = []
+    for query_index in sorted(buckets):
+        candidates = sorted(
+            buckets[query_index],
+            key=lambda item: (
+                float(item.dual_softmax_confidence or 0.0),
+                float(item.similarity),
+            ),
+            reverse=True,
+        )
+        kept.extend(candidates[:limit])
+    kept.sort(
+        key=lambda item: (
+            float(item.dual_softmax_confidence or 0.0),
+            float(item.similarity),
+        ),
+        reverse=True,
+    )
+    return kept
+
+
 def matcha_coarse_dual_softmax_matches(
     query_feature_map: np.ndarray,
     render_feature_map: np.ndarray,

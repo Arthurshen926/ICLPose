@@ -59,7 +59,9 @@ def test_match_table_rows_store_gt_error_confidence_and_inlier_label() -> None:
         query_id="seq/frame.png",
         matches=matches,
         gt_errors=np.asarray([12.0], dtype=np.float64),
+        gt_stride_px=16.0,
         inlier_mask=np.asarray([True]),
+        baseline_reproj_errors=np.asarray([4.25], dtype=np.float64),
         render_xy_by_match={3: np.asarray([30.0, 40.0], dtype=np.float64)},
     )
 
@@ -73,19 +75,62 @@ def test_match_table_rows_store_gt_error_confidence_and_inlier_label() -> None:
             "query_y": 20.0,
             "render_x": 30.0,
             "render_y": 40.0,
+            "xy": [10.0, 20.0],
             "world_x": 1.0,
             "world_y": 2.0,
             "world_z": 3.0,
             "similarity": 0.75,
             "similarity_margin": None,
+            "match_rank": 0,
+            "token_match_rank": None,
             "confidence": 0.9,
             "gt_reproj_error_px": 12.0,
+            "gt_reproj_error_stride": 0.75,
             "gt_correct_8px": False,
             "gt_correct_16px": True,
             "gt_correct_24px": True,
+            "patch_correct": True,
+            "patch_positive_label": True,
+            "strong_positive_label": True,
+            "weak_positive_label": False,
+            "hard_negative_label": False,
+            "ignore_label": False,
+            "pose_usable_label": True,
             "pnp_inlier": True,
+            "baseline_reproj_residual_px": 4.25,
             "patch_offset_norm_px": 1.5,
             "render_depth": None,
             "render_alpha": None,
         }
     ]
+
+
+def test_match_table_rows_mark_self_consistent_wrong_match_as_hard_negative() -> None:
+    matches = [
+        QueryTo3DMatch(
+            token_index=9,
+            xy=np.asarray([32.0, 48.0], dtype=np.float64),
+            track_id=4,
+            xyz=np.asarray([2.0, 3.0, 4.0], dtype=np.float64),
+            similarity=0.85,
+            ratio=0.1,
+            landmark_variance=0.0,
+        )
+    ]
+
+    rows = _match_table_rows_for_query(
+        query_id="seq/frame.png",
+        matches=matches,
+        gt_errors=np.asarray([40.0], dtype=np.float64),
+        gt_stride_px=16.0,
+        inlier_mask=np.asarray([True]),
+        baseline_reproj_errors=np.asarray([2.0], dtype=np.float64),
+        render_xy_by_match={4: np.asarray([64.0, 80.0], dtype=np.float64)},
+    )
+
+    assert rows[0]["gt_reproj_error_stride"] == 2.5
+    assert rows[0]["patch_positive_label"] is False
+    assert rows[0]["ignore_label"] is False
+    assert rows[0]["pnp_inlier"] is True
+    assert rows[0]["baseline_reproj_residual_px"] == 2.0
+    assert rows[0]["hard_negative_label"] is True

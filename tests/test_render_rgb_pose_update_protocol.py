@@ -35,6 +35,52 @@ def test_confidence_coverage_filter_is_default_for_render_rgb_eval() -> None:
     assert args.coverage_filter_max_total == 512
 
 
+def test_anti_lock_render_search_preset_enables_render_side_measurement_relocation() -> None:
+    args = parse_args(_base_args() + ["--matcha_eval_preset", "anti_lock_render_search"])
+
+    assert args.matcha_pair_fine_side == "query"
+    assert args.fine_render_search_radius_px == 24.0
+    assert args.fine_render_search_step_px == 2.0
+    assert args.matcha_fine_mode == "fine_attention_argmax"
+    assert args.pnp_soft_order_mode == "confidence"
+    assert args.pnp_soft_order_top_n == 800
+    assert args.measurement_sigma_px == 16.0
+    assert args.coverage_filter_min_confidence == 0.05
+
+
+def test_post_pair_render_refine_controls_are_exposed() -> None:
+    args = parse_args(
+        _base_args()
+        + [
+            "--post_pair_render_refine_radius_px",
+            "20",
+            "--post_pair_render_refine_step_px",
+            "2",
+            "--post_pair_render_refine_mode",
+            "softargmax",
+            "--post_pair_render_refine_query_sigma_px",
+            "6",
+        ]
+    )
+
+    assert args.post_pair_render_refine_radius_px == 20.0
+    assert args.post_pair_render_refine_step_px == 2.0
+    assert args.post_pair_render_refine_mode == "softargmax"
+    assert args.post_pair_render_refine_query_sigma_px == 6.0
+
+
+def test_anti_lock_post_pair_preset_refines_render_after_query_pair_fine() -> None:
+    args = parse_args(_base_args() + ["--matcha_eval_preset", "anti_lock_post_pair_render_search"])
+
+    assert args.matcha_pair_fine_side == "query"
+    assert args.fine_render_search_radius_px == 0.0
+    assert args.post_pair_render_refine_radius_px == 24.0
+    assert args.post_pair_render_refine_step_px == 2.0
+    assert args.post_pair_render_refine_mode == "argmax"
+    assert args.pnp_soft_order_mode == "confidence"
+    assert args.coverage_filter_min_confidence == 0.05
+
+
 def test_pose_update_iterations_is_explicitly_configurable() -> None:
     default_args = parse_args(_base_args())
     updated_args = parse_args(

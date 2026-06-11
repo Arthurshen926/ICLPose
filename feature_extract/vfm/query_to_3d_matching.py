@@ -1692,6 +1692,136 @@ def match_reprojection_errors(
     return np.linalg.norm(projected.reshape(-1, 2) - xy, axis=1).astype(np.float64)
 
 
+def _pnp_match_confidence(match: QueryTo3DMatch) -> float:
+    for value in (
+        match.pnp_soft_score,
+        match.pairwise_weighted_similarity,
+        match.quality_weighted_similarity,
+        match.pairwise_inlier_logprob,
+        match.similarity,
+        match.landmark_quality,
+    ):
+        if value is None:
+            continue
+        try:
+            score = float(value)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(score):
+            return score
+    return 0.0
+
+
+def select_unique_query_inlier_mask(
+    matches: Sequence[QueryTo3DMatch],
+    pose_w2c: np.ndarray | None,
+    camera: ColmapCamera,
+    inlier_mask: np.ndarray | Sequence[bool] | None,
+    *,
+    residual_tie_px: float = 1e-3,
+) -> np.ndarray:
+    """Keep at most one inlier candidate per query token under a pose.
+
+    Render-side local expansion can create multiple possible 3D anchors for one
+    query measurement. A valid PnP inlier set should not accept several of them
+    at once, because they share the same 2D observation but represent different
+    render-depth backprojections.
+    """
+
+    values = list(matches)
+    if not values:
+        return np.zeros((0,), dtype=bool)
+    if pose_w2c is None:
+        return np.zeros((len(values),), dtype=bool)
+    if inlier_mask is None:
+        base_mask = np.ones((len(values),), dtype=bool)
+    else:
+        base_mask = np.asarray(inlier_mask, dtype=bool).reshape(-1)
+        if base_mask.shape[0] != len(values):
+            raise ValueError("inlier_mask must contain one value per match")
+    errors = match_reprojection_errors(values, np.asarray(pose_w2c, dtype=np.float64).reshape(4, 4), camera)
+    selected = np.zeros((len(values),), dtype=bool)
+    best_by_query: dict[int, tuple[int, float, float]] = {}
+    tie = max(float(residual_tie_px), 0.0)
+    for idx, (match, is_inlier) in enumerate(zip(values, base_mask)):
+        if not bool(is_inlier) or not np.isfinite(errors[idx]):
+            continue
+        query_id = int(match.token_index)
+        residual = float(errors[idx])
+        confidence = _pnp_match_confidence(match)
+        previous = best_by_query.get(query_id)
+        if previous is None:
+            best_by_query[query_id] = (idx, residual, confidence)
+            continue
+        _prev_idx, prev_residual, prev_confidence = previous
+        if residual < prev_residual - tie or (abs(residual - prev_residual) <= tie and confidence > prev_confidence):
+            best_by_query[query_id] = (idx, residual, confidence)
+    for idx, _residual, _confidence in best_by_query.values():
+        selected[int(idx)] = True
+    return selected
+
+
+def refit_pose_with_unique_query_inliers(
+    matches: Sequence[QueryTo3DMatch],
+    camera: ColmapCamera,
+    initial_pose_w2c: np.ndarray | None,
+    initial_inlier_mask: np.ndarray | Sequence[bool] | None,
+    *,
+    min_inliers: int = 4,
+    pnp_method: str = "EPNP",
+    refine_method: str = "LM",
+) -> PnPResult:
+    """Refit PnP after enforcing at most one accepted 3D candidate per query token."""
+
+    values = list(matches)
+    if len(values) < 4 or initial_pose_w2c is None:
+        return PnPResult(
+            success=False,
+            pose_w2c=None,
+            inlier_mask=np.zeros((len(values),), dtype=bool),
+            match_count=len(values),
+            inlier_count=0,
+        )
+    unique_mask = select_unique_query_inlier_mask(values, initial_pose_w2c, camera, initial_inlier_mask)
+    selected_indices = np.flatnonzero(unique_mask)
+    if selected_indices.shape[0] < 4 or selected_indices.shape[0] < int(min_inliers):
+        return PnPResult(
+            success=False,
+            pose_w2c=None,
+            inlier_mask=np.zeros((len(values),), dtype=bool),
+            match_count=len(values),
+            inlier_count=0,
+        )
+    selected_matches = [values[int(idx)] for idx in selected_indices]
+    refit = estimate_pose_pnp_fixed(
+        selected_matches,
+        camera,
+        min_inliers=int(min_inliers),
+        pnp_method=pnp_method,
+        refine_method=refine_method,
+    )
+    if not refit.success or refit.pose_w2c is None:
+        return PnPResult(
+            success=False,
+            pose_w2c=None,
+            inlier_mask=np.zeros((len(values),), dtype=bool),
+            match_count=len(values),
+            inlier_count=0,
+        )
+    mask = np.zeros((len(values),), dtype=bool)
+    refit_mask = np.asarray(refit.inlier_mask, dtype=bool).reshape(-1)
+    if refit_mask.shape[0] != selected_indices.shape[0]:
+        refit_mask = np.ones((selected_indices.shape[0],), dtype=bool)
+    mask[selected_indices[refit_mask]] = True
+    return PnPResult(
+        success=True,
+        pose_w2c=np.asarray(refit.pose_w2c, dtype=np.float64).reshape(4, 4),
+        inlier_mask=mask,
+        match_count=len(values),
+        inlier_count=int(mask.sum()),
+    )
+
+
 def reprojection_error_stats(
     matches: Sequence[QueryTo3DMatch],
     pose_w2c: np.ndarray,

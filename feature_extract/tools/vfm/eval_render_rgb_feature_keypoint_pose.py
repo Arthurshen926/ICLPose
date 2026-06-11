@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import time
 from pathlib import Path
@@ -39,6 +40,10 @@ from feature_extract.tools.vfm.eval_rendered_feature_keypoint_pose import (
     _summary,
 )
 from feature_extract.vfm.cambridge_pose_lattice import parse_cambridge_pose_file
+from feature_extract.vfm.correspondence_confidence import (
+    CalibratedLogisticConfidence,
+    annotate_matches_with_calibrated_confidence,
+)
 from feature_extract.vfm.gaussian_vfm_field import GaussianVFMRenderConfig, load_gaussian_rgb_source_from_ply
 from feature_extract.vfm.matcha_coarse_to_fine import (
     apply_cell_reliability_prior_to_matches,
@@ -47,7 +52,9 @@ from feature_extract.vfm.matcha_coarse_to_fine import (
     expand_matches_with_render_local_offsets,
     feature_map_to_coarse_grid,
     matcha_coarse_to_fine_keypoint_matches,
+    refine_render_matches_by_local_attention,
     rescore_keypoint_matches_by_feature_similarity,
+    retain_topk_matches_per_query,
 )
 from feature_extract.vfm.matcha_coarse_fine_adapter import (
     load_matcha_coarse_fine_adapter,
@@ -73,6 +80,7 @@ from feature_extract.vfm.official_2dgs_renderer import load_official_2dgs_source
 from feature_extract.vfm.query_to_3d_matching import (
     camera_matrix_and_distortion,
     match_reprojection_errors,
+    refit_pose_with_unique_query_inliers,
     reprojection_error_stats,
     soft_order_pnp_matches,
 )
@@ -108,6 +116,29 @@ def _write_csv(path: Path, rows: Sequence[dict[str, object]]) -> None:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
+
+
+def _cache_file_sha1(path: Path | None, *, chunk_size: int = 1024 * 1024) -> str | None:
+    if path is None or not Path(path).exists():
+        return None
+    digest = hashlib.sha1()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(int(chunk_size)), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _cache_numpy_sha1(array: np.ndarray) -> str:
+    value = np.asarray(array)
+    digest = hashlib.sha1()
+    digest.update(str(value.dtype).encode("utf8"))
+    digest.update(np.asarray(value.shape, dtype=np.int64).tobytes())
+    digest.update(np.ascontiguousarray(value).tobytes())
+    return digest.hexdigest()
+
+
+def _cache_pose_hash(pose_w2c: np.ndarray) -> str:
+    return _cache_numpy_sha1(np.asarray(pose_w2c, dtype=np.float64).reshape(4, 4))
 
 
 def _render_canvas_camera_from_base(base_camera, *, canvas_width: int, canvas_height: int):
@@ -154,19 +185,35 @@ def _match_table_rows_for_query(
     query_id: str,
     matches,
     gt_errors: np.ndarray,
+    gt_stride_px: float,
     inlier_mask: np.ndarray | None,
+    baseline_reproj_errors: np.ndarray | None,
     render_xy_by_match: dict[int, np.ndarray],
 ) -> list[dict[str, object]]:
     """Export match-level diagnostics for candidate-mined training."""
 
     errors = np.asarray(gt_errors, dtype=np.float64).reshape(-1)
     inliers = None if inlier_mask is None else np.asarray(inlier_mask, dtype=bool).reshape(-1)
+    baseline_errors = (
+        None if baseline_reproj_errors is None else np.asarray(baseline_reproj_errors, dtype=np.float64).reshape(-1)
+    )
+    stride = float(gt_stride_px) if np.isfinite(gt_stride_px) and float(gt_stride_px) > 0.0 else 16.0
     rows: list[dict[str, object]] = []
     for idx, match in enumerate(matches):
         qxy = np.asarray(match.xy, dtype=np.float64).reshape(2)
         xyz = np.asarray(match.xyz, dtype=np.float64).reshape(3)
         render_xy = np.asarray(render_xy_by_match.get(int(match.track_id), np.full((2,), np.nan)), dtype=np.float64).reshape(2)
         error = float(errors[idx]) if idx < errors.shape[0] and np.isfinite(errors[idx]) else None
+        error_stride = None if error is None else float(error / stride)
+        baseline_error = (
+            None
+            if baseline_errors is None or idx >= baseline_errors.shape[0] or not np.isfinite(baseline_errors[idx])
+            else float(baseline_errors[idx])
+        )
+        patch_correct = False if error is None else bool(error <= stride)
+        weak_positive = False if error is None else bool(stride < error <= (2.0 * stride))
+        pnp_inlier = False if inliers is None or idx >= inliers.shape[0] else bool(inliers[idx])
+        hard_negative = False if error is None else bool(error > (2.0 * stride) and pnp_inlier)
         rows.append(
             {
                 "query_id": str(query_id),
@@ -177,17 +224,29 @@ def _match_table_rows_for_query(
                 "query_y": float(qxy[1]),
                 "render_x": _optional_float(render_xy[0]),
                 "render_y": _optional_float(render_xy[1]),
+                "xy": [float(qxy[0]), float(qxy[1])],
                 "world_x": float(xyz[0]),
                 "world_y": float(xyz[1]),
                 "world_z": float(xyz[2]),
                 "similarity": float(match.similarity),
                 "similarity_margin": _optional_float(match.similarity_margin),
+                "match_rank": int(idx),
+                "token_match_rank": None if match.token_match_rank is None else int(match.token_match_rank),
                 "confidence": _optional_float(match.pnp_soft_score),
                 "gt_reproj_error_px": error,
+                "gt_reproj_error_stride": error_stride,
                 "gt_correct_8px": False if error is None else bool(error <= 8.0),
                 "gt_correct_16px": False if error is None else bool(error <= 16.0),
                 "gt_correct_24px": False if error is None else bool(error <= 24.0),
-                "pnp_inlier": False if inliers is None or idx >= inliers.shape[0] else bool(inliers[idx]),
+                "patch_correct": patch_correct,
+                "patch_positive_label": patch_correct,
+                "strong_positive_label": patch_correct,
+                "weak_positive_label": weak_positive,
+                "hard_negative_label": hard_negative,
+                "ignore_label": weak_positive,
+                "pose_usable_label": patch_correct,
+                "pnp_inlier": pnp_inlier,
+                "baseline_reproj_residual_px": baseline_error,
                 "patch_offset_norm_px": _optional_float(match.patch_offset_norm_px),
                 "render_depth": _optional_float(match.render_depth),
                 "render_alpha": _optional_float(match.render_alpha),
@@ -966,7 +1025,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--matcha_adapter_checkpoint", default="")
     parser.add_argument("--matcha_joint_checkpoint", default="")
     parser.add_argument("--matcha_qkv_attention_checkpoint", default="")
-    parser.add_argument("--matcha_eval_preset", default="none", choices=("none", "conservative_confidence"))
+    parser.add_argument(
+        "--matcha_eval_preset",
+        default="none",
+        choices=(
+            "none",
+            "conservative_confidence",
+            "anti_lock_render_search",
+            "anti_lock_post_pair_render_search",
+        ),
+    )
     parser.add_argument("--matcha_confidence_mode", default="dual_softmax", choices=("dual_softmax", "learned", "blend"))
     parser.add_argument("--matcha_confidence_blend", type=float, default=0.5)
     parser.add_argument("--matcha_min_detector_confidence", type=float, default=0.0)
@@ -975,8 +1043,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--matcha_use_pair_fine_head", action="store_true")
     parser.add_argument("--matcha_pair_fine_side", default="query", choices=("render", "query"))
     parser.add_argument("--matcha_use_local_fine_attention", action="store_true")
+    parser.add_argument("--post_pair_render_refine_radius_px", type=float, default=0.0)
+    parser.add_argument("--post_pair_render_refine_step_px", type=float, default=2.0)
+    parser.add_argument("--post_pair_render_refine_mode", default="argmax", choices=("argmax", "softargmax"))
+    parser.add_argument("--post_pair_render_refine_query_sigma_px", type=float, default=4.0)
     parser.add_argument("--render_side_local_offset_radius_cells", type=int, default=0)
     parser.add_argument("--render_side_local_offset_max_candidates", type=int, default=9)
+    parser.add_argument("--render_side_local_offset_top_k_per_query", type=int, default=0)
     parser.add_argument(
         "--matcha_keypoint_proposal_source",
         default="none",
@@ -1058,6 +1131,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--measurement_sigma_px", type=float, default=0.0)
     parser.add_argument("--pnp_soft_order_mode", default="none", choices=("none", "similarity", "margin", "reliability", "confidence", "uncertainty", "composite"))
     parser.add_argument("--pnp_soft_order_top_n", type=int, default=0)
+    parser.add_argument("--calibrated_correspondence_confidence_model", default="")
+    parser.add_argument("--calibrated_correspondence_feature_set", default="descriptor")
+    parser.add_argument("--pnp_unique_query_refit", action="store_true")
     parser.add_argument("--render_offset_min_alpha", type=float, default=0.0)
     parser.add_argument("--render_offset_max_depth_delta_m", type=float, default=-1.0)
     parser.add_argument("--render_offset_fallback_to_cell_center", action="store_true")
@@ -1086,6 +1162,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--save_match_table", action="store_true")
     parser.add_argument("--match_table_path", default="")
+    parser.add_argument("--match_table_stage", choices=("pose", "candidate"), default="pose")
     parser.add_argument("--max_queries", type=int, default=20)
     parser.add_argument("--view_selection", default="prefix", choices=("prefix", "uniform"))
     parser.add_argument("--visualize_limit", type=int, default=5)
@@ -1095,6 +1172,29 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     if str(args.matcha_eval_preset) == "conservative_confidence":
         args.matcha_confidence_mode = "learned"
         args.matcha_confidence_blend = 1.0
+        args.pnp_soft_order_mode = "confidence"
+        args.pnp_soft_order_top_n = 800
+        args.coverage_filter_min_confidence = 0.05
+        args.measurement_sigma_px = 16.0
+    if str(args.matcha_eval_preset) == "anti_lock_render_search":
+        args.matcha_confidence_mode = "learned"
+        args.matcha_confidence_blend = 1.0
+        args.matcha_pair_fine_side = "query"
+        args.fine_render_search_radius_px = 24.0
+        args.fine_render_search_step_px = 2.0
+        args.matcha_fine_mode = "fine_attention_argmax"
+        args.pnp_soft_order_mode = "confidence"
+        args.pnp_soft_order_top_n = 800
+        args.coverage_filter_min_confidence = 0.05
+        args.measurement_sigma_px = 16.0
+    if str(args.matcha_eval_preset) == "anti_lock_post_pair_render_search":
+        args.matcha_confidence_mode = "learned"
+        args.matcha_confidence_blend = 1.0
+        args.matcha_pair_fine_side = "query"
+        args.fine_render_search_radius_px = 0.0
+        args.post_pair_render_refine_radius_px = 24.0
+        args.post_pair_render_refine_step_px = 2.0
+        args.post_pair_render_refine_mode = "argmax"
         args.pnp_soft_order_mode = "confidence"
         args.pnp_soft_order_top_n = 800
         args.coverage_filter_min_confidence = 0.05
@@ -1177,6 +1277,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     qkv_attention = None
     if str(args.matcha_qkv_attention_checkpoint):
         qkv_attention, _qkv_summary = load_qkv_attention_checkpoint(Path(args.matcha_qkv_attention_checkpoint), device=args.device)
+    calibrated_confidence_model = (
+        CalibratedLogisticConfidence.load_json(Path(args.calibrated_correspondence_confidence_model))
+        if str(args.calibrated_correspondence_confidence_model)
+        else None
+    )
     rgb_keypoint_detector = None
     if str(args.matcha_keypoint_proposal_source) == "rgb_detector":
         if str(args.matcha_rgb_keypoint_detector_checkpoint):
@@ -1215,6 +1320,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     output_dir = Path(args.output_dir)
     rows = []
     match_table_rows = []
+    render_cache_rows = []
     records = _select_records(manifest.records, int(args.max_queries), str(args.view_selection))
     for vis_idx, record in enumerate(records):
         gt = gt_by_query.get(record.image_id)
@@ -1289,6 +1395,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                     render_rgb_depth_cache_dir
                     / f"{_safe_image_stem(record.image_id)}_{_safe_image_stem(current_render_pose.label)}_{render_width}x{render_height}.npz"
                 )
+            rgb_depth_cache_hit = bool(
+                rgb_depth_cache_path is not None
+                and bool(args.skip_existing_render_rgb_depth)
+                and Path(rgb_depth_cache_path).exists()
+            )
             render_rgb, render_depth, render_alpha = _load_or_render_rgb_depth_cache(
                 cache_path=rgb_depth_cache_path,
                 render_fn=lambda pose=current_render_pose.pose_w2c: _render_rgb_and_depth(
@@ -1310,6 +1421,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                     render_width,
                     render_height,
                 )
+            render_feature_cache_hit = bool(
+                cache_path is not None and bool(args.skip_existing_render_tokens) and Path(cache_path).exists()
+            )
             render_feature = _load_or_extract_matcha_joint_feature(
                 cache_path=cache_path,
                 rgb=render_rgb,
@@ -1320,6 +1434,50 @@ def main(argv: Sequence[str] | None = None) -> None:
                 coarse_source=str(args.radio_coarse_source),
                 coarse_intermediate_index=int(args.radio_coarse_intermediate_index),
                 skip_existing=bool(args.skip_existing_render_tokens) and cacheable_iteration,
+            )
+            render_cache_rows.append(
+                {
+                    "query_id": record.image_id,
+                    "iteration_index": int(iteration_index),
+                    "render_pose_label": current_render_pose.label,
+                    "render_pose_mode": str(args.render_pose_mode),
+                    "render_pose_hash": _cache_pose_hash(current_render_pose.pose_w2c),
+                    "render_camera_hash": _cache_numpy_sha1(
+                        np.asarray(
+                            [
+                                float(camera.width),
+                                float(camera.height),
+                                float(camera.model_id),
+                                *[float(value) for value in camera.params],
+                            ],
+                            dtype=np.float64,
+                        )
+                    ),
+                    "render_width": int(render_width),
+                    "render_height": int(render_height),
+                    "rgb_depth_cache_path": "" if rgb_depth_cache_path is None else str(rgb_depth_cache_path),
+                    "render_token_cache_path": "" if cache_path is None else str(cache_path),
+                    "rgb_depth_cache_hit": bool(rgb_depth_cache_hit),
+                    "render_feature_cache_hit": bool(render_feature_cache_hit),
+                    "rgb_depth_cache_file_sha1": _cache_file_sha1(rgb_depth_cache_path),
+                    "render_token_cache_file_sha1": _cache_file_sha1(cache_path),
+                    "rgb_sha1": _cache_numpy_sha1(render_rgb),
+                    "depth_sha1": _cache_numpy_sha1(render_depth),
+                    "alpha_sha1": _cache_numpy_sha1(render_alpha),
+                    "feature_sha1": _cache_numpy_sha1(render_feature),
+                    "matcha_joint_checkpoint_sha1": _cache_file_sha1(Path(args.matcha_joint_checkpoint))
+                    if str(args.matcha_joint_checkpoint)
+                    else None,
+                    "matcha_adapter_checkpoint_sha1": _cache_file_sha1(Path(args.matcha_adapter_checkpoint))
+                    if str(args.matcha_adapter_checkpoint)
+                    else None,
+                    "gaussian_rgb_ply_size": Path(args.gaussian_rgb_ply).stat().st_size
+                    if Path(args.gaussian_rgb_ply).exists()
+                    else None,
+                    "gaussian_rgb_ply_mtime": Path(args.gaussian_rgb_ply).stat().st_mtime
+                    if Path(args.gaussian_rgb_ply).exists()
+                    else None,
+                }
             )
             query_feature = maybe_fuse_feature_map(
                 query_feature_raw,
@@ -1687,6 +1845,28 @@ def main(argv: Sequence[str] | None = None) -> None:
                         render_grid_width=int(render_feature.shape[2]),
                         render_grid_height=int(render_feature.shape[1]),
                     )
+            post_pair_render_refine_count = 0
+            if (
+                args.match_mode == "matcha_c2f"
+                and float(args.post_pair_render_refine_radius_px) > 0.0
+                and kp_matches
+            ):
+                before_count = int(len(kp_matches))
+                kp_matches = refine_render_matches_by_local_attention(
+                    kp_matches,
+                    query_feature,
+                    render_feature,
+                    query_image_width=int(camera.width),
+                    query_image_height=int(camera.height),
+                    render_image_width=int(render_config.width),
+                    render_image_height=int(render_config.height),
+                    search_radius_px=float(args.post_pair_render_refine_radius_px),
+                    step_px=float(args.post_pair_render_refine_step_px),
+                    mode=str(args.post_pair_render_refine_mode),
+                    temperature=float(args.matcha_fine_softmax_temperature),
+                    query_spatial_sigma_px=float(args.post_pair_render_refine_query_sigma_px),
+                )
+                post_pair_render_refine_count = int(min(before_count, len(kp_matches)))
             if (
                 args.match_mode == "matcha_c2f"
                 and str(args.matcha_keypoint_proposal_source) != "none"
@@ -1737,6 +1917,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                     render_image_width=int(render_config.width),
                     render_image_height=int(render_config.height),
                 )
+                if int(args.render_side_local_offset_top_k_per_query) > 0:
+                    kp_matches = retain_topk_matches_per_query(
+                        kp_matches,
+                        max_per_query=int(args.render_side_local_offset_top_k_per_query),
+                    )
                 render_side_local_offset_expanded_match_count = int(len(kp_matches))
             if float(args.fine_render_search_radius_px) > 0.0 and args.match_mode != "matcha_c2f":
                 kp_matches = refine_render_keypoint_matches_by_local_correlation(
@@ -1766,6 +1951,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 ),
                 fallback_to_cell_center=bool(args.render_offset_fallback_to_cell_center),
             )
+            candidate_pnp_matches_for_table = list(pnp_matches)
             if float(args.measurement_sigma_px) > 0.0:
                 pnp_matches = annotate_measurement_uncertainty(
                     pnp_matches,
@@ -1773,6 +1959,13 @@ def main(argv: Sequence[str] | None = None) -> None:
                     fine_refined=float(args.fine_render_search_radius_px) > 0.0,
                 )
             unfiltered_pnp_match_count = int(len(pnp_matches))
+            if calibrated_confidence_model is not None and pnp_matches:
+                pnp_matches = annotate_matches_with_calibrated_confidence(
+                    pnp_matches,
+                    calibrated_confidence_model,
+                    feature_set=str(args.calibrated_correspondence_feature_set),
+                )
+                candidate_pnp_matches_for_table = list(pnp_matches)
             if str(args.pnp_soft_order_mode) != "none":
                 pnp_matches = soft_order_pnp_matches(
                     pnp_matches,
@@ -1812,6 +2005,23 @@ def main(argv: Sequence[str] | None = None) -> None:
                 max_matches=int(args.max_matches),
                 rescore_margin=float(args.pose_rescore_margin),
             )
+            unique_query_refit_applied = False
+            unique_query_refit_inlier_count = None
+            unique_query_refit_input_inlier_count = None
+            if bool(args.pnp_unique_query_refit) and pnp.success and pnp.pose_w2c is not None:
+                unique_query_refit_input_inlier_count = int(pnp.inlier_count)
+                refit_pnp = refit_pose_with_unique_query_inliers(
+                    pose_pnp_matches,
+                    camera,
+                    pnp.pose_w2c,
+                    pnp.inlier_mask,
+                    min_inliers=int(args.pnp_min_inliers),
+                    refine_method="LM",
+                )
+                if refit_pnp.success:
+                    pnp = refit_pnp
+                    unique_query_refit_applied = True
+                    unique_query_refit_inlier_count = int(refit_pnp.inlier_count)
             iteration_pose_score = score_pose_hypothesis(
                 pose_pnp_matches,
                 pnp.pose_w2c if pnp.success else None,
@@ -1834,11 +2044,16 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "rdesc": rdesc,
                 "kp_matches": kp_matches,
                 "render_side_local_offset_expanded_match_count": int(render_side_local_offset_expanded_match_count),
+                "post_pair_render_refine_count": int(post_pair_render_refine_count),
                 "unfiltered_pnp_match_count": unfiltered_pnp_match_count,
                 "coverage_filter_applied": bool(apply_coverage_filter),
+                "candidate_pnp_matches_for_table": candidate_pnp_matches_for_table,
                 "pnp_matches": pnp_matches,
                 "render_xy_by_match": render_xy_by_match,
                 "pnp": pnp,
+                "unique_query_refit_applied": bool(unique_query_refit_applied),
+                "unique_query_refit_input_inlier_count": unique_query_refit_input_inlier_count,
+                "unique_query_refit_inlier_count": unique_query_refit_inlier_count,
                 "pose_candidate_label": pose_candidate_label,
                 "pose_candidate_score": pose_candidate_score,
                 "iteration_pose_score": iteration_pose_score,
@@ -1927,9 +2142,13 @@ def main(argv: Sequence[str] | None = None) -> None:
         kp_matches = final["kp_matches"]
         render_side_local_offset_expanded_match_count = int(final.get("render_side_local_offset_expanded_match_count", 0))
         unfiltered_pnp_match_count = int(final["unfiltered_pnp_match_count"])
+        candidate_pnp_matches_for_table = list(final.get("candidate_pnp_matches_for_table", []))
         pnp_matches = final["pnp_matches"]
         render_xy_by_match = final["render_xy_by_match"]
         pnp = final["pnp"]
+        unique_query_refit_applied = bool(final.get("unique_query_refit_applied", False))
+        unique_query_refit_input_inlier_count = final.get("unique_query_refit_input_inlier_count")
+        unique_query_refit_inlier_count = final.get("unique_query_refit_inlier_count")
         pose_candidate_label = final["pose_candidate_label"]
         pose_candidate_score = final["pose_candidate_score"]
         pose_pnp_matches = final["pose_pnp_matches"]
@@ -1990,6 +2209,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             if pose_pnp_matches
             else np.zeros((0,), dtype=np.float64)
         )
+        pnp_pose_errors = (
+            match_reprojection_errors(pose_pnp_matches, pnp.pose_w2c, camera)
+            if pose_pnp_matches and pnp.success and pnp.pose_w2c is not None
+            else None
+        )
         pnp_match_diagnostics = _pnp_match_diagnostics(pose_pnp_matches, pnp.inlier_mask)
         fine_offset_diagnostics = _fine_offset_diagnostics(
             pose_pnp_matches,
@@ -2012,12 +2236,40 @@ def main(argv: Sequence[str] | None = None) -> None:
             else {}
         )
         if bool(args.save_match_table):
+            if str(args.match_table_stage) == "candidate":
+                table_matches = list(candidate_pnp_matches_for_table)
+                table_gt_errors = (
+                    match_reprojection_errors(table_matches, gt.pose_w2c, camera)
+                    if table_matches
+                    else np.zeros((0,), dtype=np.float64)
+                )
+                table_baseline_errors = (
+                    match_reprojection_errors(table_matches, pnp.pose_w2c, camera)
+                    if table_matches and pnp.success and pnp.pose_w2c is not None
+                    else None
+                )
+                table_inlier_mask = (
+                    table_baseline_errors <= float(args.pnp_reprojection_error_px)
+                    if table_baseline_errors is not None
+                    else None
+                )
+            else:
+                table_matches = pose_pnp_matches
+                table_gt_errors = gt_errors
+                table_baseline_errors = pnp_pose_errors
+                table_inlier_mask = pnp.inlier_mask
             match_table_rows.extend(
                 _match_table_rows_for_query(
                     query_id=record.image_id,
-                    matches=pose_pnp_matches,
-                    gt_errors=gt_errors,
-                    inlier_mask=pnp.inlier_mask,
+                    matches=table_matches,
+                    gt_errors=table_gt_errors,
+                    gt_stride_px=0.5
+                    * (
+                        float(camera.width) / max(float(query_feature.shape[2]), 1.0)
+                        + float(camera.height) / max(float(query_feature.shape[1]), 1.0)
+                    ),
+                    inlier_mask=table_inlier_mask,
+                    baseline_reproj_errors=table_baseline_errors,
                     render_xy_by_match=render_xy_by_match,
                 )
             )
@@ -2065,12 +2317,16 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "render_depth_valid_fraction": float(np.mean(np.isfinite(render_depth) & (render_depth > 0.0))),
                 "match_count": int(len(kp_matches)),
                 "render_side_local_offset_expanded_match_count": int(render_side_local_offset_expanded_match_count),
+                "post_pair_render_refine_count": int(final.get("post_pair_render_refine_count", 0)),
                 "unfiltered_depth_valid_match_count": int(unfiltered_pnp_match_count),
                 "depth_valid_match_count": int(len(pnp_matches)),
                 "pose_candidate_match_count": int(len(pose_pnp_matches)),
                 "pnp_success": bool(pnp.success),
                 "pnp_inlier_count": int(pnp.inlier_count),
                 "pnp_inlier_ratio": float(pnp.inlier_ratio),
+                "unique_query_refit_applied": bool(unique_query_refit_applied),
+                "unique_query_refit_input_inlier_count": unique_query_refit_input_inlier_count,
+                "unique_query_refit_inlier_count": unique_query_refit_inlier_count,
                 "pose_candidate_label": pose_candidate_label,
                 "pose_candidate_score": None if pose_candidate_score is None else float(pose_candidate_score.score),
                 "translation_error_m": translation_error,
@@ -2092,7 +2348,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     rows_path = output_dir / "rows.csv"
     summary_path = output_dir / "summary.json"
+    render_cache_manifest_path = output_dir / "render_cache_manifest.csv"
     _write_csv(rows_path, rows)
+    _write_csv(render_cache_manifest_path, render_cache_rows)
     match_table_path = None
     if bool(args.save_match_table):
         match_table_path = Path(args.match_table_path) if str(args.match_table_path) else output_dir / "match_table.csv"
@@ -2145,8 +2403,13 @@ def main(argv: Sequence[str] | None = None) -> None:
             "matcha_use_pair_fine_head": bool(args.matcha_use_pair_fine_head),
             "matcha_pair_fine_side": str(args.matcha_pair_fine_side),
             "matcha_use_local_fine_attention": bool(args.matcha_use_local_fine_attention),
+            "post_pair_render_refine_radius_px": float(args.post_pair_render_refine_radius_px),
+            "post_pair_render_refine_step_px": float(args.post_pair_render_refine_step_px),
+            "post_pair_render_refine_mode": str(args.post_pair_render_refine_mode),
+            "post_pair_render_refine_query_sigma_px": float(args.post_pair_render_refine_query_sigma_px),
             "render_side_local_offset_radius_cells": int(args.render_side_local_offset_radius_cells),
             "render_side_local_offset_max_candidates": int(args.render_side_local_offset_max_candidates),
+            "render_side_local_offset_top_k_per_query": int(args.render_side_local_offset_top_k_per_query),
             "matcha_keypoint_proposal_source": str(args.matcha_keypoint_proposal_source),
             "matcha_keypoint_proposal_mode": str(args.matcha_keypoint_proposal_mode),
             "matcha_keypoint_proposal_threshold": float(args.matcha_keypoint_proposal_threshold),
@@ -2169,6 +2432,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             "measurement_sigma_px": float(args.measurement_sigma_px),
             "pnp_soft_order_mode": str(args.pnp_soft_order_mode),
             "pnp_soft_order_top_n": int(args.pnp_soft_order_top_n),
+            "calibrated_correspondence_confidence_model": str(args.calibrated_correspondence_confidence_model),
+            "calibrated_correspondence_feature_set": str(args.calibrated_correspondence_feature_set),
+            "pnp_unique_query_refit": bool(args.pnp_unique_query_refit),
             "render_offset_min_alpha": float(args.render_offset_min_alpha),
             "render_offset_max_depth_delta_m": float(args.render_offset_max_depth_delta_m),
             "render_offset_fallback_to_cell_center": bool(args.render_offset_fallback_to_cell_center),
@@ -2190,12 +2456,19 @@ def main(argv: Sequence[str] | None = None) -> None:
             "render_pose_world_offset": str(args.render_pose_world_offset),
             "render_canvas_scale": float(args.render_canvas_scale),
             "save_match_table": bool(args.save_match_table),
+            "match_table_stage": str(args.match_table_stage),
             "view_selection": str(args.view_selection),
             "radio_version": args.radio_version,
         },
         "metrics": _summary(rows),
-        "outputs": {"rows": str(rows_path), "summary": str(summary_path), "visualizations": str(output_dir / "visualizations")},
+        "outputs": {
+            "rows": str(rows_path),
+            "summary": str(summary_path),
+            "visualizations": str(output_dir / "visualizations"),
+            "render_cache_manifest": str(render_cache_manifest_path),
+        },
     }
+    summary["metrics"]["render_cache_manifest_row_count"] = int(len(render_cache_rows))
     if match_table_path is not None:
         summary["outputs"]["match_table"] = str(match_table_path)
         summary["metrics"]["match_table_row_count"] = int(len(match_table_rows))

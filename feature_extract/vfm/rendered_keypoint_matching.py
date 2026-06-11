@@ -425,6 +425,8 @@ def keypoint_feature_matches_to_pnp_matches(
     center_alpha = None
     center_valid = None
     has_grid = render_grid_width is not None and render_grid_height is not None
+    if max_render_depth_delta_m is not None and float(max_render_depth_delta_m) >= 0.0 and not has_grid:
+        raise ValueError("max_render_depth_delta_m requires render_grid_width and render_grid_height")
     if has_grid:
         center_xy = _coarse_cell_centers_from_indices(
             np.asarray([match.render_index for match in matches], dtype=np.int64),

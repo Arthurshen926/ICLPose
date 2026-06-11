@@ -206,6 +206,30 @@ def test_keypoint_feature_matches_to_pnp_matches_can_guard_render_offset_with_al
     assert pnp_matches[0].render_alpha == 1.0
 
 
+def test_keypoint_feature_matches_requires_grid_for_depth_delta_guard() -> None:
+    camera = ColmapCamera(camera_id=1, model_id=1, width=20, height=20, params=(10.0, 10.0, 10.0, 10.0))
+    matches = [
+        KeypointFeatureMatch(
+            query_index=0,
+            render_index=0,
+            query_xy=np.asarray([10.0, 10.0], dtype=np.float64),
+            render_xy=np.asarray([10.0, 10.0], dtype=np.float64),
+            similarity=0.9,
+            ratio=0.1,
+        )
+    ]
+    depth = np.full((20, 20), 4.0, dtype=np.float32)
+
+    with np.testing.assert_raises(ValueError):
+        keypoint_feature_matches_to_pnp_matches(
+            matches,
+            depth,
+            camera,
+            np.eye(4, dtype=np.float64),
+            max_render_depth_delta_m=0.1,
+        )
+
+
 def test_geometry_row_fields_uses_reprojection_stats_key_names() -> None:
     fields = _geometry_row_fields(
         {

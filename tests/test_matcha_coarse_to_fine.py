@@ -15,6 +15,7 @@ from feature_extract.vfm.matcha_coarse_to_fine import (
     matcha_coarse_to_fine_keypoint_matches,
     refine_render_matches_by_local_attention,
     refine_matches_by_bilateral_local_correlation,
+    retain_topk_matches_per_query,
     rescore_keypoint_matches_by_feature_similarity,
 )
 from feature_extract.vfm.rendered_keypoint_matching import KeypointFeatureMatch
@@ -316,6 +317,51 @@ def test_rescore_keypoint_matches_by_feature_similarity_ranks_moved_render_candi
     assert [item.render_index for item in rescored] == [6, 5]
     assert rescored[0].similarity > 0.99
     assert rescored[0].dual_softmax_confidence > rescored[1].dual_softmax_confidence
+
+
+def test_retain_topk_matches_per_query_limits_expanded_candidates() -> None:
+    matches = [
+        KeypointFeatureMatch(
+            query_index=0,
+            render_index=0,
+            query_xy=np.asarray([0.0, 0.0]),
+            render_xy=np.asarray([0.0, 0.0]),
+            similarity=0.1,
+            ratio=1.0,
+            dual_softmax_confidence=0.1,
+        ),
+        KeypointFeatureMatch(
+            query_index=0,
+            render_index=1,
+            query_xy=np.asarray([0.0, 0.0]),
+            render_xy=np.asarray([1.0, 0.0]),
+            similarity=0.9,
+            ratio=1.0,
+            dual_softmax_confidence=0.8,
+        ),
+        KeypointFeatureMatch(
+            query_index=0,
+            render_index=2,
+            query_xy=np.asarray([0.0, 0.0]),
+            render_xy=np.asarray([2.0, 0.0]),
+            similarity=0.8,
+            ratio=1.0,
+            dual_softmax_confidence=0.7,
+        ),
+        KeypointFeatureMatch(
+            query_index=1,
+            render_index=3,
+            query_xy=np.asarray([1.0, 0.0]),
+            render_xy=np.asarray([3.0, 0.0]),
+            similarity=0.5,
+            ratio=1.0,
+            dual_softmax_confidence=0.6,
+        ),
+    ]
+
+    kept = retain_topk_matches_per_query(matches, max_per_query=2)
+
+    assert [(match.query_index, match.render_index) for match in kept] == [(0, 1), (0, 2), (1, 3)]
 
 
 def test_deduplicate_repeated_correspondences_keeps_best_per_cell_pair() -> None:
