@@ -64,6 +64,42 @@ def label_match_row(
     )
 
 
+def label_match_validity_row(
+    row: Mapping[str, Any],
+    *,
+    threshold_px: float = 5.0,
+) -> MatchConfidenceLabel:
+    """Label a match by an absolute GT reprojection residual threshold."""
+
+    value = row.get("gt_reproj_error_px")
+    try:
+        error_px = float(value)
+    except (TypeError, ValueError):
+        return MatchConfidenceLabel(
+            target=0,
+            ignore=True,
+            strong_positive=False,
+            weak_positive=False,
+            hard_negative=False,
+        )
+    if not math.isfinite(error_px):
+        return MatchConfidenceLabel(
+            target=0,
+            ignore=True,
+            strong_positive=False,
+            weak_positive=False,
+            hard_negative=False,
+        )
+    positive = bool(error_px <= float(threshold_px))
+    return MatchConfidenceLabel(
+        target=1 if positive else 0,
+        ignore=False,
+        strong_positive=positive,
+        weak_positive=False,
+        hard_negative=bool((not positive) and _bool_value(row, "pnp_inlier")),
+    )
+
+
 def _rank_score(row: Mapping[str, Any]) -> float:
     rank = row.get("token_match_rank", row.get("match_rank", row.get("match_index", 0)))
     try:
@@ -127,6 +163,23 @@ def vectorize_match_rows(
     keep = np.zeros((len(rows),), dtype=bool)
     for row_idx, row in enumerate(rows):
         label = label_match_row(row, stride_positive=stride_positive, weak_positive_stride=weak_positive_stride)
+        labels[row_idx] = int(label.target)
+        keep[row_idx] = not bool(label.ignore)
+    return matrix, labels, keep, names
+
+
+def vectorize_match_validity_rows(
+    rows: Sequence[Mapping[str, Any]],
+    feature_set: str = "full",
+    threshold_px: float = 5.0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str]]:
+    """Vectorize observable match fields and label by absolute residual validity."""
+
+    matrix, names = vectorize_match_row_features(rows, feature_set=feature_set)
+    labels = np.zeros((len(rows),), dtype=np.int64)
+    keep = np.zeros((len(rows),), dtype=bool)
+    for row_idx, row in enumerate(rows):
+        label = label_match_validity_row(row, threshold_px=float(threshold_px))
         labels[row_idx] = int(label.target)
         keep[row_idx] = not bool(label.ignore)
     return matrix, labels, keep, names
@@ -273,8 +326,9 @@ def annotate_matches_with_calibrated_confidence(
             match,
             pairwise_inlier_logit=float(logit),
             pairwise_inlier_logprob=float(logprob),
+            pnp_soft_score=float(probability),
         )
-        for match, logit, logprob in zip(values, logits, logprobs)
+        for match, logit, logprob, probability in zip(values, logits, logprobs, probabilities)
     ]
 
 

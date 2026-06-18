@@ -18,6 +18,8 @@ from feature_extract.tools.vfm.eval_render_rgb_feature_keypoint_pose import (
 )
 from feature_extract.vfm.render_pose_protocol import RenderPoseSelection
 from feature_extract.vfm.rendered_pose_scoring import PoseHypothesisScore
+from feature_extract.vfm.colmap_tracks import ColmapCamera
+from feature_extract.vfm.query_to_3d_matching import QueryTo3DMatch
 from feature_extract.tools.vfm.report_perturbation_adapter_eval import main as report_perturbation_adapter_eval
 
 
@@ -277,6 +279,23 @@ def test_render_rgb_eval_pose_candidate_table_controls_are_exposed() -> None:
     assert args.pose_candidate_table_path == "candidate_rows.csv"
 
 
+def test_render_rgb_eval_oracle_pnp_ablation_controls_are_exposed() -> None:
+    args = parse_args(
+        _base_args()
+        + [
+            "--enable_oracle_pnp_ablation",
+            "--oracle_pnp_thresholds_px",
+            "5,10",
+            "--oracle_pnp_solvers",
+            "plain,weighted",
+        ]
+    )
+
+    assert args.enable_oracle_pnp_ablation is True
+    assert args.oracle_pnp_thresholds_px == "5,10"
+    assert args.oracle_pnp_solvers == "plain,weighted"
+
+
 def test_pose_candidate_table_rows_are_candidate_level_scorer_examples() -> None:
     gt_pose = np.eye(4, dtype=np.float64)
     pnp = SimpleNamespace(success=True, pose_w2c=np.eye(4, dtype=np.float64), inlier_count=32, inlier_ratio=0.5)
@@ -317,6 +336,68 @@ def test_pose_candidate_table_rows_are_candidate_level_scorer_examples() -> None
     assert row["rotation_error_deg"] == pytest.approx(0.0)
     assert row["pose_update_selected_score"] == pytest.approx(0.7)
     assert row["pose_score_weighted_residual"] == pytest.approx(2.0)
+
+
+def test_pose_candidate_table_rows_report_match_validity_labels_when_camera_is_available() -> None:
+    gt_pose = np.eye(4, dtype=np.float64)
+    camera = ColmapCamera(camera_id=1, model_id=1, width=64, height=64, params=(100.0, 100.0, 0.0, 0.0))
+    matches = [
+        QueryTo3DMatch(
+            token_index=0,
+            xy=np.asarray([3.0, 0.0], dtype=np.float64),
+            track_id=1,
+            xyz=np.asarray([0.0, 0.0, 1.0], dtype=np.float64),
+            similarity=0.8,
+            ratio=0.0,
+            landmark_variance=0.0,
+            pnp_soft_score=0.9,
+        ),
+        QueryTo3DMatch(
+            token_index=1,
+            xy=np.asarray([20.0, 0.0], dtype=np.float64),
+            track_id=2,
+            xyz=np.asarray([0.0, 0.0, 1.0], dtype=np.float64),
+            similarity=0.1,
+            ratio=0.0,
+            landmark_variance=0.0,
+            pnp_soft_score=0.1,
+        ),
+    ]
+    pnp = SimpleNamespace(
+        success=True,
+        pose_w2c=np.eye(4, dtype=np.float64),
+        inlier_count=1,
+        inlier_ratio=0.5,
+        inlier_mask=np.asarray([True, False]),
+    )
+    candidate = {
+        "pnp": pnp,
+        "pose_pnp_matches": matches,
+        "unfiltered_pnp_match_count": 2,
+        "iteration_pose_score": PoseHypothesisScore(0.7, 1, 2.0, 0.5, 0.4, 0.1),
+        "render_pose": RenderPoseSelection(
+            pose_w2c=np.eye(4, dtype=np.float64),
+            label="gt",
+            candidate_id="gt",
+            reference_image="",
+            render_translation_error_m=0.0,
+            render_rotation_error_deg=0.0,
+        ),
+    }
+
+    rows = _pose_candidate_table_rows_for_query(
+        query_id="q0",
+        render_pose_mode="gt",
+        candidates=[candidate],
+        gt_pose_w2c=gt_pose,
+        camera=camera,
+    )
+
+    row = rows[0]
+    assert row["match_validity_rate_5px"] == pytest.approx(0.5)
+    assert row["match_validity_rate_10px"] == pytest.approx(0.5)
+    assert row["match_validity_probability_mean"] == pytest.approx(0.5)
+    assert row["match_validity_brier_5px"] == pytest.approx(0.01)
 
 
 def test_streaming_csv_writer_can_append_and_existing_query_ids_are_typed(tmp_path) -> None:

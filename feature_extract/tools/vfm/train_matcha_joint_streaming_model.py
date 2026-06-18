@@ -1560,6 +1560,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--repeatability_loss_weight", type=float, default=0.0)
     parser.add_argument("--local_fine_transformer_loss_weight", type=float, default=0.0)
     parser.add_argument("--local_window_fine_loss_weight", type=float, default=0.5)
+    parser.add_argument("--local_window_fine_mode", choices=("mlp", "correlation"), default="correlation")
     parser.add_argument("--patch_corr_fine_loss_weight", type=float, default=0.0)
     parser.add_argument("--patch_corr_fine_epe_weight", type=float, default=0.1)
     parser.add_argument("--patch_corr_fine_batch_size", type=int, default=256)
@@ -1604,11 +1605,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         args.fine_supervision_source = "render_subcell_stratified"
         args.multiview_supervision_support_views = 0
         args.multiview_supervision_min_support_views = 0
+        args.collect_visibility_no_match = True
         args.offset_loss_weight = 0.25
         args.pair_confidence_loss_weight = 0.1
         args.dense_heatmap_loss_weight = 0.25
         args.rgb_keypoint_loss_weight = 0.25
         args.local_window_fine_loss_weight = 1.0
+        args.local_window_fine_mode = "correlation"
         args.patch_correlation_loss_weight = 0.0
         args.patch_corr_fine_loss_weight = 0.0
     if args.render_pair_fine_loss_weight is not None:
@@ -1652,6 +1655,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         repeatability_loss_weight=float(args.repeatability_loss_weight),
         local_fine_transformer_loss_weight=float(args.local_fine_transformer_loss_weight),
         local_window_fine_loss_weight=float(args.local_window_fine_loss_weight),
+        local_window_fine_mode=str(args.local_window_fine_mode),
         patch_corr_fine_loss_weight=float(args.patch_corr_fine_loss_weight),
         patch_corr_fine_epe_weight=float(args.patch_corr_fine_epe_weight),
         patch_corr_fine_batch_size=int(args.patch_corr_fine_batch_size),

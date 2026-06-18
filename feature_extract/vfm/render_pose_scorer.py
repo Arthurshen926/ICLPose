@@ -38,6 +38,88 @@ def _bool_value(row: Mapping[str, Any], key: str) -> bool:
     return bool(value)
 
 
+def _match_validity_probability(match: Any) -> float:
+    score = getattr(match, "pnp_soft_score", None)
+    if score is not None:
+        try:
+            value = float(score)
+        except (TypeError, ValueError):
+            value = float("nan")
+        if math.isfinite(value):
+            return float(np.clip(value, 0.0, 1.0))
+    logit = getattr(match, "pairwise_inlier_logit", None)
+    if logit is not None:
+        try:
+            value = float(logit)
+        except (TypeError, ValueError):
+            value = float("nan")
+        if math.isfinite(value):
+            return float(_sigmoid(np.asarray([value], dtype=np.float64))[0])
+    logprob = getattr(match, "pairwise_inlier_logprob", None)
+    if logprob is not None:
+        try:
+            value = float(logprob)
+        except (TypeError, ValueError):
+            value = float("nan")
+        if math.isfinite(value):
+            return float(np.clip(math.exp(value), 0.0, 1.0))
+    similarity = getattr(match, "similarity", 0.0)
+    try:
+        sim = float(similarity)
+    except (TypeError, ValueError):
+        sim = 0.0
+    return float(np.clip((sim + 1.0) * 0.5, 0.0, 1.0))
+
+
+def match_validity_probability_stats(
+    matches: Sequence[Any],
+    *,
+    inlier_mask: Sequence[bool] | np.ndarray | None = None,
+) -> dict[str, object]:
+    """Aggregate observable match-validity probabilities for pose candidate scoring."""
+
+    values = list(matches)
+    if not values:
+        return {
+            "match_validity_probability_mean": None,
+            "match_validity_probability_median": None,
+            "match_validity_probability_min": None,
+            "match_validity_probability_top20_mean": None,
+            "match_validity_expected_good_count": 0.0,
+            "match_validity_inlier_probability_mean": None,
+            "match_validity_outlier_probability_mean": None,
+            "match_validity_inlier_outlier_gap": None,
+        }
+    probabilities = np.asarray([_match_validity_probability(match) for match in values], dtype=np.float64)
+    top_count = max(1, int(math.ceil(0.20 * float(probabilities.shape[0]))))
+    sorted_probabilities = np.sort(probabilities)[::-1]
+    stats: dict[str, object] = {
+        "match_validity_probability_mean": float(np.mean(probabilities)),
+        "match_validity_probability_median": float(np.median(probabilities)),
+        "match_validity_probability_min": float(np.min(probabilities)),
+        "match_validity_probability_top20_mean": float(np.mean(sorted_probabilities[:top_count])),
+        "match_validity_expected_good_count": float(np.sum(probabilities)),
+        "match_validity_inlier_probability_mean": None,
+        "match_validity_outlier_probability_mean": None,
+        "match_validity_inlier_outlier_gap": None,
+    }
+    if inlier_mask is None:
+        return stats
+    inliers = np.asarray(inlier_mask, dtype=bool).reshape(-1)
+    if inliers.shape[0] != probabilities.shape[0]:
+        return stats
+    if np.any(inliers):
+        stats["match_validity_inlier_probability_mean"] = float(np.mean(probabilities[inliers]))
+    if np.any(~inliers):
+        stats["match_validity_outlier_probability_mean"] = float(np.mean(probabilities[~inliers]))
+    if stats["match_validity_inlier_probability_mean"] is not None and stats["match_validity_outlier_probability_mean"] is not None:
+        stats["match_validity_inlier_outlier_gap"] = float(
+            float(stats["match_validity_inlier_probability_mean"])
+            - float(stats["match_validity_outlier_probability_mean"])
+        )
+    return stats
+
+
 def label_pose_row(
     row: Mapping[str, Any],
     *,
@@ -66,6 +148,11 @@ def _pose_feature_specs() -> list[tuple[str, Any]]:
         ("pnp_inlier_confidence_mean", lambda row: _float_value(row, "pnp_inlier_confidence_mean")),
         ("pnp_outlier_confidence_mean", lambda row: _float_value(row, "pnp_outlier_confidence_mean")),
         ("pnp_confidence_gap", lambda row: _float_value(row, "pnp_inlier_confidence_mean") - _float_value(row, "pnp_outlier_confidence_mean")),
+        ("match_validity_probability_mean", lambda row: _float_value(row, "match_validity_probability_mean")),
+        ("match_validity_probability_median", lambda row: _float_value(row, "match_validity_probability_median")),
+        ("match_validity_probability_top20_mean", lambda row: _float_value(row, "match_validity_probability_top20_mean")),
+        ("match_validity_expected_good_count", lambda row: math.log1p(max(_float_value(row, "match_validity_expected_good_count"), 0.0))),
+        ("match_validity_inlier_outlier_gap", lambda row: _float_value(row, "match_validity_inlier_outlier_gap")),
         ("candidate_rank_score", lambda row: 1.0 / (1.0 + max(_float_value(row, "initial_render_index"), 0.0))),
     ]
 
@@ -393,15 +480,18 @@ def pose_candidate_selection_report(
 def pose_candidate_row_from_eval_candidate(candidate: Mapping[str, Any]) -> dict[str, object]:
     pnp = candidate.get("pnp")
     score = candidate.get("iteration_pose_score")
+    pose_matches = list(candidate.get("pose_pnp_matches", []) or [])
+    inlier_mask = getattr(pnp, "inlier_mask", None)
     row: dict[str, object] = {
         "pnp_success": bool(getattr(pnp, "success", False)),
         "pnp_inlier_count": int(getattr(pnp, "inlier_count", 0)),
         "pnp_inlier_ratio": float(getattr(pnp, "inlier_ratio", 0.0)),
-        "pose_candidate_match_count": int(len(candidate.get("pose_pnp_matches", []) or [])),
+        "pose_candidate_match_count": int(len(pose_matches)),
         "unfiltered_depth_valid_match_count": int(candidate.get("unfiltered_pnp_match_count", 0) or 0),
         "alignment_score": float(candidate.get("iteration_alignment_score", 0.0) or 0.0),
         "initial_render_index": int(candidate.get("initial_render_index", 0) or 0),
     }
+    row.update(match_validity_probability_stats(pose_matches, inlier_mask=inlier_mask))
     if isinstance(score, PoseHypothesisScore):
         row.update(
             {

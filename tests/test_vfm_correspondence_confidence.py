@@ -5,9 +5,11 @@ from feature_extract.vfm.correspondence_confidence import (
     CalibratedMatchCandidateScorer,
     annotate_matches_with_calibrated_confidence,
     confidence_metrics,
+    label_match_validity_row,
     label_match_row,
     select_confident_matches_coverage_preserving,
     vectorize_match_row_features,
+    vectorize_match_validity_rows,
     vectorize_match_rows,
 )
 from feature_extract.vfm.query_to_3d_matching import QueryTo3DMatch
@@ -30,6 +32,18 @@ def test_label_match_row_separates_positive_negative_and_ambiguous_zone() -> Non
     assert hard_negative.target == 0
     assert hard_negative.ignore is False
     assert hard_negative.hard_negative is True
+
+
+def test_label_match_validity_row_uses_absolute_pixel_residual() -> None:
+    positive = label_match_validity_row({"gt_reproj_error_px": 4.9}, threshold_px=5.0)
+    negative = label_match_validity_row({"gt_reproj_error_px": 5.1}, threshold_px=5.0)
+    missing = label_match_validity_row({}, threshold_px=5.0)
+
+    assert positive.target == 1
+    assert positive.ignore is False
+    assert negative.target == 0
+    assert negative.ignore is False
+    assert missing.ignore is True
 
 
 def test_confidence_metrics_report_ranking_calibration_and_top_fraction() -> None:
@@ -65,6 +79,22 @@ def test_vectorize_and_train_logistic_confidence_on_observable_features() -> Non
     assert "similarity" in names
     assert scores[0] > scores[2]
     assert scores[1] > scores[3]
+
+
+def test_vectorize_match_validity_rows_trains_5px_pixel_classifier() -> None:
+    rows = [
+        {"similarity": 0.95, "similarity_margin": 0.30, "match_rank": 0, "gt_reproj_error_px": 2.0},
+        {"similarity": 0.90, "similarity_margin": 0.25, "match_rank": 1, "gt_reproj_error_px": 4.0},
+        {"similarity": 0.45, "similarity_margin": 0.02, "match_rank": 2, "gt_reproj_error_px": 12.0},
+        {"similarity": 0.40, "similarity_margin": 0.01, "match_rank": 3, "gt_reproj_error_px": 24.0},
+        {"similarity": 0.50, "similarity_margin": 0.01, "match_rank": 4, "gt_reproj_error_px": None},
+    ]
+    matrix, labels, keep, names = vectorize_match_validity_rows(rows, feature_set="descriptor", threshold_px=5.0)
+
+    assert matrix.shape == (5, 4)
+    assert names == ["similarity", "similarity_margin", "rank_score", "mnn_flag"]
+    assert labels.tolist() == [1, 1, 0, 0, 0]
+    assert keep.tolist() == [True, True, True, True, False]
 
 
 def test_vectorize_feature_rows_without_labels_for_inference() -> None:
@@ -114,9 +144,11 @@ def test_annotate_matches_with_calibrated_confidence_returns_new_matches() -> No
     assert matches[0].pairwise_inlier_logit is None
     assert annotated[0].track_id == 1
     assert annotated[0].pairwise_inlier_logit is not None
+    assert annotated[0].pnp_soft_score is not None
     assert annotated[1].pairwise_inlier_logit is not None
     assert annotated[0].pairwise_inlier_logit > annotated[1].pairwise_inlier_logit
     assert annotated[0].pairwise_inlier_logprob > annotated[1].pairwise_inlier_logprob
+    assert annotated[0].pnp_soft_score > annotated[1].pnp_soft_score
 
 
 def test_calibrated_match_candidate_scorer_is_callable_for_matcher_topk() -> None:

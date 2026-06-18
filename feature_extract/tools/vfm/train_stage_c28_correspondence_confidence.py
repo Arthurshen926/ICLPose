@@ -15,6 +15,7 @@ import numpy as np
 from feature_extract.vfm.correspondence_confidence import (
     CalibratedLogisticConfidence,
     confidence_metrics,
+    vectorize_match_validity_rows,
     vectorize_match_rows,
 )
 
@@ -69,8 +70,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--feature_sets", default="descriptor,map_stats,descriptor_map,full")
     parser.add_argument("--eval_fraction", type=float, default=0.30)
     parser.add_argument("--eval_on_train", action="store_true")
+    parser.add_argument("--label_mode", default="stride", choices=("stride", "pixel"))
     parser.add_argument("--stride_positive", type=float, default=1.0)
     parser.add_argument("--weak_positive_stride", type=float, default=2.0)
+    parser.add_argument("--positive_px", type=float, default=5.0)
     parser.add_argument("--learning_rate", type=float, default=0.05)
     parser.add_argument("--max_iter", type=int, default=800)
     parser.add_argument("--l2", type=float, default=1e-3)
@@ -93,18 +96,30 @@ def main(argv: Sequence[str] | None = None) -> None:
     feature_sets = [item.strip() for item in str(args.feature_sets).split(",") if item.strip()]
     models: dict[str, object] = {}
     for feature_set in feature_sets:
-        train_x, train_y, train_keep, feature_names = vectorize_match_rows(
-            train_rows,
-            feature_set=feature_set,
-            stride_positive=float(args.stride_positive),
-            weak_positive_stride=float(args.weak_positive_stride),
-        )
-        eval_x, eval_y, eval_keep, _eval_names = vectorize_match_rows(
-            eval_rows,
-            feature_set=feature_set,
-            stride_positive=float(args.stride_positive),
-            weak_positive_stride=float(args.weak_positive_stride),
-        )
+        if str(args.label_mode) == "pixel":
+            train_x, train_y, train_keep, feature_names = vectorize_match_validity_rows(
+                train_rows,
+                feature_set=feature_set,
+                threshold_px=float(args.positive_px),
+            )
+            eval_x, eval_y, eval_keep, _eval_names = vectorize_match_validity_rows(
+                eval_rows,
+                feature_set=feature_set,
+                threshold_px=float(args.positive_px),
+            )
+        else:
+            train_x, train_y, train_keep, feature_names = vectorize_match_rows(
+                train_rows,
+                feature_set=feature_set,
+                stride_positive=float(args.stride_positive),
+                weak_positive_stride=float(args.weak_positive_stride),
+            )
+            eval_x, eval_y, eval_keep, _eval_names = vectorize_match_rows(
+                eval_rows,
+                feature_set=feature_set,
+                stride_positive=float(args.stride_positive),
+                weak_positive_stride=float(args.weak_positive_stride),
+            )
         model_info: dict[str, object] = {
             "feature_set": feature_set,
             "feature_names": feature_names,
@@ -142,9 +157,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         "eval_row_count": int(len(eval_rows)),
         "eval_on_train": bool(args.eval_on_train),
         "label_policy": {
+            "mode": str(args.label_mode),
             "stride_positive": float(args.stride_positive),
             "weak_positive_stride": float(args.weak_positive_stride),
             "ambiguous_band": [float(args.stride_positive), float(args.weak_positive_stride)],
+            "positive_px": float(args.positive_px),
         },
         "models": models,
     }

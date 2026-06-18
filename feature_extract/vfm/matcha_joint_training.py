@@ -426,6 +426,7 @@ class MatchaJointTrainingConfig:
     repeatability_loss_weight: float = 0.0
     local_fine_transformer_loss_weight: float = 0.0
     local_window_fine_loss_weight: float = 0.0
+    local_window_fine_mode: str = "mlp"
     patch_corr_fine_loss_weight: float = 0.0
     patch_corr_fine_epe_weight: float = 0.1
     patch_corr_fine_batch_size: int = 256
@@ -511,6 +512,8 @@ class MatchaJointTrainingConfig:
                 raise ValueError(f"{name} must be non-negative")
         if int(self.patch_correlation_window_size) <= 0 or int(self.patch_correlation_window_size) % 2 == 0:
             raise ValueError("patch_correlation_window_size must be a positive odd integer")
+        if str(self.local_window_fine_mode) not in {"mlp", "correlation"}:
+            raise ValueError("local_window_fine_mode must be 'mlp' or 'correlation'")
         if int(self.rgb_non_keypoint_divisor) <= 0:
             raise ValueError("rgb_non_keypoint_divisor must be positive")
 
@@ -533,8 +536,10 @@ class MatchaStyleJointModel(nn.Module):
         input_norm_mode: str = "identity",
         gate_mode: str = "residual",
         residual_gate_scale: float = 0.1,
+        local_window_fine_mode: str = "mlp",
     ) -> None:
         super().__init__()
+        self.local_window_fine_mode = str(local_window_fine_mode)
         self.adapter = MatchaCoarseFineAdapter(
             input_dim=int(input_dim),
             output_dim=int(output_dim),
@@ -581,6 +586,7 @@ class MatchaStyleJointModel(nn.Module):
             nn.GELU(),
             nn.Linear(int(residual_hidden_dim), 1),
         )
+        self.local_window_logit_scale = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
         self.patch_corr_fine_head = PatchCorrelationFineHead(
             context_dim=int(output_dim),
             hidden_dim=int(residual_hidden_dim),
@@ -674,6 +680,16 @@ class MatchaStyleJointModel(nn.Module):
         render_desc, _render_heat, _render_offset = self.forward_feature_map(render_feature_maps)
         query_tokens = _select_descriptor_rows_from_map(query_desc, pair_indices, query_indices)
         render_candidates = _sample_local_window_descriptors(render_desc, pair_indices, render_indices)
+        if str(self.local_window_fine_mode) == "correlation":
+            logits, _sigma = _score_local_window_correlation_candidates_with_uncertainty(
+                query_tokens,
+                render_candidates,
+                self.local_window_query_proj,
+                self.local_window_render_proj,
+                self.local_window_uncertainty_head,
+                logit_scale=torch.exp(torch.clamp(self.local_window_logit_scale, min=-4.0, max=4.0)),
+            )
+            return logits
         return _score_local_window_candidates(
             query_tokens,
             render_candidates,
@@ -694,6 +710,15 @@ class MatchaStyleJointModel(nn.Module):
         render_desc, _render_heat, _render_offset = self.forward_feature_map(render_feature_maps)
         query_tokens = _select_descriptor_rows_from_map(query_desc, pair_indices, query_indices)
         render_candidates = _sample_local_window_descriptors(render_desc, pair_indices, render_indices)
+        if str(self.local_window_fine_mode) == "correlation":
+            return _score_local_window_correlation_candidates_with_uncertainty(
+                query_tokens,
+                render_candidates,
+                self.local_window_query_proj,
+                self.local_window_render_proj,
+                self.local_window_uncertainty_head,
+                logit_scale=torch.exp(torch.clamp(self.local_window_logit_scale, min=-4.0, max=4.0)),
+            )
         return _score_local_window_candidates_with_uncertainty(
             query_tokens,
             render_candidates,
@@ -701,6 +726,27 @@ class MatchaStyleJointModel(nn.Module):
             self.local_window_render_proj,
             self.local_window_score_head,
             self.local_window_uncertainty_head,
+        )
+
+    def local_window_correlation_logits_uncertainty_from_maps(
+        self,
+        query_feature_maps: torch.Tensor,
+        render_feature_maps: torch.Tensor,
+        pair_indices: torch.Tensor,
+        query_indices: torch.Tensor,
+        render_indices: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        query_desc, _query_heat, _query_offset = self.forward_feature_map(query_feature_maps)
+        render_desc, _render_heat, _render_offset = self.forward_feature_map(render_feature_maps)
+        query_tokens = _select_descriptor_rows_from_map(query_desc, pair_indices, query_indices)
+        render_candidates = _sample_local_window_descriptors(render_desc, pair_indices, render_indices)
+        return _score_local_window_correlation_candidates_with_uncertainty(
+            query_tokens,
+            render_candidates,
+            self.local_window_query_proj,
+            self.local_window_render_proj,
+            self.local_window_uncertainty_head,
+            logit_scale=torch.exp(torch.clamp(self.local_window_logit_scale, min=-4.0, max=4.0)),
         )
 
     def patch_corr_fine_logits_from_maps_and_rgb(
@@ -812,8 +858,10 @@ class RadioDualAttentionFusionJointModel(nn.Module):
         input_norm_mode: str = "identity",
         gate_mode: str = "residual",
         residual_gate_scale: float = 0.1,
+        local_window_fine_mode: str = "mlp",
     ) -> None:
         super().__init__()
+        self.local_window_fine_mode = str(local_window_fine_mode)
         self.fine_input_dim = int(fine_input_dim)
         self.coarse_input_dim = int(coarse_input_dim)
         self.output_dim_value = int(output_dim)
@@ -895,6 +943,7 @@ class RadioDualAttentionFusionJointModel(nn.Module):
             nn.GELU(),
             nn.Linear(int(residual_hidden_dim), 1),
         )
+        self.local_window_logit_scale = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
         self.patch_corr_fine_head = PatchCorrelationFineHead(
             context_dim=int(output_dim),
             hidden_dim=int(residual_hidden_dim),
@@ -1024,6 +1073,16 @@ class RadioDualAttentionFusionJointModel(nn.Module):
         render_desc, _render_heat, _render_offset = self.forward_feature_map(render_feature_maps)
         query_tokens = _select_descriptor_rows_from_map(query_desc, pair_indices, query_indices)
         render_candidates = _sample_local_window_descriptors(render_desc, pair_indices, render_indices)
+        if str(self.local_window_fine_mode) == "correlation":
+            logits, _sigma = _score_local_window_correlation_candidates_with_uncertainty(
+                query_tokens,
+                render_candidates,
+                self.local_window_query_proj,
+                self.local_window_render_proj,
+                self.local_window_uncertainty_head,
+                logit_scale=torch.exp(torch.clamp(self.local_window_logit_scale, min=-4.0, max=4.0)),
+            )
+            return logits
         return _score_local_window_candidates(
             query_tokens,
             render_candidates,
@@ -1044,6 +1103,15 @@ class RadioDualAttentionFusionJointModel(nn.Module):
         render_desc, _render_heat, _render_offset = self.forward_feature_map(render_feature_maps)
         query_tokens = _select_descriptor_rows_from_map(query_desc, pair_indices, query_indices)
         render_candidates = _sample_local_window_descriptors(render_desc, pair_indices, render_indices)
+        if str(self.local_window_fine_mode) == "correlation":
+            return _score_local_window_correlation_candidates_with_uncertainty(
+                query_tokens,
+                render_candidates,
+                self.local_window_query_proj,
+                self.local_window_render_proj,
+                self.local_window_uncertainty_head,
+                logit_scale=torch.exp(torch.clamp(self.local_window_logit_scale, min=-4.0, max=4.0)),
+            )
         return _score_local_window_candidates_with_uncertainty(
             query_tokens,
             render_candidates,
@@ -1051,6 +1119,27 @@ class RadioDualAttentionFusionJointModel(nn.Module):
             self.local_window_render_proj,
             self.local_window_score_head,
             self.local_window_uncertainty_head,
+        )
+
+    def local_window_correlation_logits_uncertainty_from_maps(
+        self,
+        query_feature_maps: torch.Tensor,
+        render_feature_maps: torch.Tensor,
+        pair_indices: torch.Tensor,
+        query_indices: torch.Tensor,
+        render_indices: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        query_desc, _query_heat, _query_offset = self.forward_feature_map(query_feature_maps)
+        render_desc, _render_heat, _render_offset = self.forward_feature_map(render_feature_maps)
+        query_tokens = _select_descriptor_rows_from_map(query_desc, pair_indices, query_indices)
+        render_candidates = _sample_local_window_descriptors(render_desc, pair_indices, render_indices)
+        return _score_local_window_correlation_candidates_with_uncertainty(
+            query_tokens,
+            render_candidates,
+            self.local_window_query_proj,
+            self.local_window_render_proj,
+            self.local_window_uncertainty_head,
+            logit_scale=torch.exp(torch.clamp(self.local_window_logit_scale, min=-4.0, max=4.0)),
         )
 
     def patch_corr_fine_logits_from_maps_and_rgb(
@@ -1517,6 +1606,37 @@ def _score_local_window_candidates_with_uncertainty(
     return logits, log_sigma
 
 
+def _score_local_window_correlation_candidates_with_uncertainty(
+    query_descriptors: torch.Tensor,
+    render_candidates: torch.Tensor,
+    query_proj: nn.Module,
+    render_proj: nn.Module,
+    uncertainty_head: nn.Module,
+    *,
+    logit_scale: float | torch.Tensor = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Score a local 8x8 window as an explicit query-render correlation volume."""
+
+    if query_descriptors.ndim != 2:
+        raise ValueError("query_descriptors must have shape (N, C)")
+    if render_candidates.ndim != 3:
+        raise ValueError("render_candidates must have shape (N, K, C)")
+    if int(render_candidates.shape[0]) != int(query_descriptors.shape[0]):
+        raise ValueError("query_descriptors and render_candidates must have the same batch size")
+    query_hidden = query_proj(F.normalize(query_descriptors, dim=1))
+    render_hidden = render_proj(F.normalize(render_candidates, dim=2))
+    query_hidden = F.normalize(query_hidden, dim=1)
+    render_hidden = F.normalize(render_hidden, dim=2)
+    logits = torch.sum(query_hidden[:, None, :] * render_hidden, dim=2)
+    scale = torch.as_tensor(logit_scale, dtype=logits.dtype, device=logits.device)
+    logits = logits * torch.clamp(scale, min=1e-3, max=100.0)
+    probs = F.softmax(logits, dim=1).detach()
+    pooled_render = torch.sum(render_hidden * probs[:, :, None], dim=1)
+    pooled = torch.tanh(query_hidden + pooled_render)
+    log_sigma = uncertainty_head(pooled).squeeze(-1)
+    return logits, log_sigma
+
+
 def _local_window_logits_from_descriptor_maps(
     model: MatchaStyleJointModel,
     source_descriptor_map: torch.Tensor,
@@ -1543,9 +1663,22 @@ def _local_window_logits_uncertainty_from_descriptor_maps(
     pair_indices: torch.Tensor,
     source_indices: torch.Tensor,
     target_indices: torch.Tensor,
+    *,
+    mode: str = "mlp",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     source_tokens = _select_descriptor_rows_from_map(source_descriptor_map, pair_indices, source_indices)
     target_candidates = _sample_local_window_descriptors(target_descriptor_map, pair_indices, target_indices)
+    if str(mode) == "correlation":
+        return _score_local_window_correlation_candidates_with_uncertainty(
+            source_tokens,
+            target_candidates,
+            model.local_window_query_proj,
+            model.local_window_render_proj,
+            model.local_window_uncertainty_head,
+            logit_scale=torch.exp(torch.clamp(model.local_window_logit_scale, min=-4.0, max=4.0)),
+        )
+    if str(mode) != "mlp":
+        raise ValueError("local window fine mode must be 'mlp' or 'correlation'")
     return _score_local_window_candidates_with_uncertainty(
         source_tokens,
         target_candidates,
@@ -1862,10 +1995,11 @@ def _local_window_fine_loss(
     samples: MatchaJointTrainingSet,
     indices: np.ndarray,
     *,
-    config: MatchaJointTrainingConfig,
+    config: MatchaJointTrainingConfig | None = None,
     device: torch.device,
     pair_subset: np.ndarray | None = None,
 ) -> tuple[torch.Tensor | None, dict[str, float]]:
+    config = config or MatchaJointTrainingConfig()
     if samples.query_feature_maps is None or samples.render_feature_maps is None:
         return None, {}
     use_dense_fine = samples.fine_sample_pair_indices is not None
@@ -1944,6 +2078,7 @@ def _local_window_fine_loss(
         pairs,
         qidx,
         ridx,
+        mode=str(config.local_window_fine_mode),
     )
     render_loss, render_metrics = _fine_coordinate_loss_and_metrics(
         render_logits,
@@ -1963,6 +2098,7 @@ def _local_window_fine_loss(
         pairs,
         ridx,
         qidx,
+        mode=str(config.local_window_fine_mode),
     )
     query_loss, query_metrics = _fine_coordinate_loss_and_metrics(
         query_logits,
@@ -2038,6 +2174,7 @@ def _local_window_fine_loss(
             )
             / total_valid
         ),
+        "mode_correlation": 1.0 if str(config.local_window_fine_mode) == "correlation" else 0.0,
     }
 
 
@@ -2603,6 +2740,7 @@ def _build_matcha_joint_model_for_samples(
             input_norm_mode=str(config.input_norm_mode),
             gate_mode=str(config.gate_mode),
             residual_gate_scale=float(config.residual_gate_scale),
+            local_window_fine_mode=str(config.local_window_fine_mode),
         ).to(device)
     return MatchaStyleJointModel(
         input_dim=samples.coarse_fine_samples.input_dim,
@@ -2612,6 +2750,7 @@ def _build_matcha_joint_model_for_samples(
         input_norm_mode=str(config.input_norm_mode),
         gate_mode=str(config.gate_mode),
         residual_gate_scale=float(config.residual_gate_scale),
+        local_window_fine_mode=str(config.local_window_fine_mode),
     ).to(device)
 
 
@@ -3093,6 +3232,7 @@ def save_matcha_joint_model(run: MatchaJointTrainingRun, path: Path) -> None:
                 "attention_patch_size": int(getattr(model, "attention_patch_size", 1)),
                 "attention_upsample_mode": str(getattr(model, "attention_upsample_mode", "bilinear")),
                 "attention_fusion_mode": str(getattr(model, "attention_fusion_mode", "legacy")),
+                "local_window_fine_mode": str(getattr(model, "local_window_fine_mode", "mlp")),
             },
             "state_dict": model.state_dict(),
             "summary": dict(run.summary),
@@ -3122,6 +3262,7 @@ def load_matcha_joint_model(path: Path, device: str = "cpu") -> MatchaJointTrain
             input_norm_mode=str(cfg.get("input_norm_mode", "identity")),
             gate_mode=str(cfg.get("gate_mode", "residual")),
             residual_gate_scale=float(cfg.get("residual_gate_scale", 0.1)),
+            local_window_fine_mode=str(cfg.get("local_window_fine_mode", "mlp")),
         )
     else:
         model = MatchaStyleJointModel(
@@ -3132,6 +3273,7 @@ def load_matcha_joint_model(path: Path, device: str = "cpu") -> MatchaJointTrain
             input_norm_mode=str(cfg.get("input_norm_mode", "identity")),
             gate_mode=str(cfg.get("gate_mode", "residual")),
             residual_gate_scale=float(cfg.get("residual_gate_scale", 0.1)),
+            local_window_fine_mode=str(cfg.get("local_window_fine_mode", "mlp")),
         )
     incompatible = model.load_state_dict(payload["state_dict"], strict=False)
     summary = dict(payload.get("summary", {}))

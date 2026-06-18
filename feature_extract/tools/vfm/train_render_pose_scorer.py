@@ -60,27 +60,73 @@ def _query_hash_fraction(query_id: str) -> float:
     return float(int(digest[:12], 16)) / float(16**12 - 1)
 
 
+def _query_count(rows: Sequence[dict[str, object]]) -> int:
+    return len({str(row.get("query_id", "")) for row in rows})
+
+
 def _split_rows(
     rows: Sequence[dict[str, object]],
     *,
     eval_fraction: float,
     eval_on_train: bool,
-) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    split_mode: str = "hash_fraction",
+    fold_count: int = 5,
+    fold_index: int = 0,
+    min_train_queries: int = 0,
+    min_eval_queries: int = 0,
+) -> tuple[list[dict[str, object]], list[dict[str, object]], dict[str, object]]:
     values = list(rows)
     if bool(eval_on_train):
-        return values, values
+        split = {
+            "mode": "eval_on_train",
+            "eval_fraction": float(eval_fraction),
+            "fold_count": int(fold_count),
+            "fold_index": int(fold_index),
+        }
+        return values, values, split
     train: list[dict[str, object]] = []
     eval_rows: list[dict[str, object]] = []
-    for row in values:
-        if _query_hash_fraction(str(row.get("query_id", ""))) < float(eval_fraction):
-            eval_rows.append(row)
-        else:
-            train.append(row)
+    if str(split_mode) == "kfold":
+        if int(fold_count) < 2:
+            raise ValueError("--fold_count must be at least 2 for kfold split")
+        if int(fold_index) < 0 or int(fold_index) >= int(fold_count):
+            raise ValueError("--fold_index must be in [0, fold_count)")
+        query_ids = sorted({str(row.get("query_id", "")) for row in values})
+        eval_queries = {
+            query_id
+            for idx, query_id in enumerate(query_ids)
+            if int(idx) % int(fold_count) == int(fold_index)
+        }
+        for row in values:
+            if str(row.get("query_id", "")) in eval_queries:
+                eval_rows.append(row)
+            else:
+                train.append(row)
+    else:
+        for row in values:
+            if _query_hash_fraction(str(row.get("query_id", ""))) < float(eval_fraction):
+                eval_rows.append(row)
+            else:
+                train.append(row)
     if not train or not eval_rows:
         midpoint = max(1, len(values) // 2)
         train = values[:midpoint]
         eval_rows = values[midpoint:] or values[:midpoint]
-    return train, eval_rows
+    train_query_count = _query_count(train)
+    eval_query_count = _query_count(eval_rows)
+    if int(min_train_queries) > 0 and train_query_count < int(min_train_queries):
+        raise ValueError(f"train split has {train_query_count} queries, below --min_train_queries={int(min_train_queries)}")
+    if int(min_eval_queries) > 0 and eval_query_count < int(min_eval_queries):
+        raise ValueError(f"eval split has {eval_query_count} queries, below --min_eval_queries={int(min_eval_queries)}")
+    split = {
+        "mode": str(split_mode),
+        "eval_fraction": float(eval_fraction),
+        "fold_count": int(fold_count),
+        "fold_index": int(fold_index),
+        "min_train_queries": int(min_train_queries),
+        "min_eval_queries": int(min_eval_queries),
+    }
+    return train, eval_rows, split
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -91,6 +137,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--rotation_threshold_deg", type=float, default=5.0)
     parser.add_argument("--eval_fraction", type=float, default=0.30)
     parser.add_argument("--eval_on_train", action="store_true")
+    parser.add_argument("--split_mode", default="hash_fraction", choices=("hash_fraction", "kfold"))
+    parser.add_argument("--fold_count", type=int, default=5)
+    parser.add_argument("--fold_index", type=int, default=0)
+    parser.add_argument("--min_train_queries", type=int, default=0)
+    parser.add_argument("--min_eval_queries", type=int, default=0)
     parser.add_argument("--learning_rate", type=float, default=0.05)
     parser.add_argument("--max_iter", type=int, default=800)
     parser.add_argument("--l2", type=float, default=1e-3)
@@ -102,10 +153,15 @@ def main(argv: Sequence[str] | None = None) -> None:
     rows = _load_csv_rows([str(path) for path in args.rows_csv])
     if not rows:
         raise ValueError("no pose rows loaded")
-    train_rows, eval_rows = _split_rows(
+    train_rows, eval_rows, split_summary = _split_rows(
         rows,
         eval_fraction=float(args.eval_fraction),
         eval_on_train=bool(args.eval_on_train),
+        split_mode=str(args.split_mode),
+        fold_count=int(args.fold_count),
+        fold_index=int(args.fold_index),
+        min_train_queries=int(args.min_train_queries),
+        min_eval_queries=int(args.min_eval_queries),
     )
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -156,6 +212,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         "objective": str(args.objective),
         "train_row_count": int(len(train_rows)),
         "eval_row_count": int(len(eval_rows)),
+        "train_query_count": int(_query_count(train_rows)),
+        "eval_query_count": int(_query_count(eval_rows)),
+        "split": split_summary,
         "thresholds": {
             "translation_m": float(args.translation_threshold_m),
             "rotation_deg": float(args.rotation_threshold_deg),

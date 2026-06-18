@@ -81,6 +81,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--rgb_keypoint_position_loss_weight", type=float, default=0.0)
     parser.add_argument("--repeatability_loss_weight", type=float, default=0.0)
     parser.add_argument("--local_fine_transformer_loss_weight", type=float, default=0.0)
+    parser.add_argument("--local_window_fine_loss_weight", type=float, default=0.0)
+    parser.add_argument("--local_window_fine_mode", choices=("mlp", "correlation"), default="mlp")
     parser.add_argument("--patch_correlation_loss_weight", type=float, default=0.0)
     parser.add_argument("--patch_correlation_window_size", type=int, default=3)
     parser.add_argument("--hard_negative_weight", type=float, default=0.2)
@@ -159,6 +161,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         rgb_keypoint_position_loss_weight=float(args.rgb_keypoint_position_loss_weight),
         repeatability_loss_weight=float(args.repeatability_loss_weight),
         local_fine_transformer_loss_weight=float(args.local_fine_transformer_loss_weight),
+        local_window_fine_loss_weight=float(args.local_window_fine_loss_weight),
+        local_window_fine_mode=str(args.local_window_fine_mode),
         patch_correlation_loss_weight=float(args.patch_correlation_loss_weight),
         patch_correlation_window_size=int(args.patch_correlation_window_size),
         hard_negative_weight=float(args.hard_negative_weight),

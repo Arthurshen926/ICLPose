@@ -659,6 +659,7 @@ def test_streaming_training_cli_defaults_to_matcha_original_attention() -> None:
     assert args.pair_fine_loss_weight == 0.0
     assert args.query_pair_fine_loss_weight == 0.0
     assert args.local_window_fine_loss_weight > 0.0
+    assert args.local_window_fine_mode == "correlation"
     assert args.patch_correlation_loss_weight == 0.0
     assert not args.merge_fine_labels_into_coarse
 
@@ -775,6 +776,8 @@ def test_streaming_training_radio_matcha_2dgs_synthetic_preset_uses_local_window
     assert args.pair_confidence_loss_weight == 0.1
     assert args.dense_heatmap_loss_weight == 0.25
     assert args.local_window_fine_loss_weight == 1.0
+    assert args.local_window_fine_mode == "correlation"
+    assert args.collect_visibility_no_match is True
     assert args.patch_corr_fine_loss_weight == 0.0
     assert args.multiview_supervision_support_views == 0
 
@@ -1212,6 +1215,9 @@ def test_fine_confidence_diagnostics_from_rows_reports_ece_and_offset_stats() ->
             "pnp_match_measurement_sigma_mean": 12.0,
             "pnp_match_patch_offset_applied_ratio": 1.0,
             "pnp_match_patch_offset_norm_mean_px": 2.0,
+            "match_validity_probability_mean": 0.8,
+            "match_validity_rate_5px": 1.0,
+            "match_validity_brier_5px": 0.04,
         },
         {
             "match_count": 10,
@@ -1226,6 +1232,9 @@ def test_fine_confidence_diagnostics_from_rows_reports_ece_and_offset_stats() ->
             "pnp_match_measurement_sigma_mean": 24.0,
             "pnp_match_patch_offset_applied_ratio": 0.0,
             "pnp_match_patch_offset_norm_mean_px": 0.0,
+            "match_validity_probability_mean": 0.2,
+            "match_validity_rate_5px": 0.0,
+            "match_validity_brier_5px": 0.04,
         },
     ]
 
@@ -1235,6 +1244,9 @@ def test_fine_confidence_diagnostics_from_rows_reports_ece_and_offset_stats() ->
     assert diagnostics["mean_pnp_confidence_inlier_gap"] == 0.25
     assert diagnostics["confidence_ece_16px"] >= 0.0
     assert diagnostics["mean_pnp_measurement_sigma_px"] == 18.0
+    assert diagnostics["mean_match_validity_rate_5px"] == 0.5
+    assert diagnostics["mean_match_validity_brier_5px"] == pytest.approx(0.04)
+    assert diagnostics["match_validity_ece_5px"] >= 0.0
 
 
 def test_fine_offset_diagnostics_measure_refined_query_measurement_accuracy() -> None:

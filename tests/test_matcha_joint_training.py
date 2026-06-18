@@ -5,6 +5,7 @@ import zipfile
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 import feature_extract.vfm.matcha_joint_training as joint_training
@@ -280,6 +281,45 @@ def test_radio_dual_attention_local_window_head_outputs_uncertainty() -> None:
 
     assert logits.shape == (2, 64)
     assert log_sigma.shape == (2,)
+
+
+def test_local_window_correlation_head_scores_exact_descriptor_candidate_highest() -> None:
+    class ZeroUncertainty(torch.nn.Module):
+        def forward(self, values):
+            return values.new_zeros((values.shape[0], 1))
+
+    query = torch.asarray([[1.0, 0.0, 0.0]], dtype=torch.float32)
+    candidates = torch.asarray(
+        [
+            [
+                [0.0, 1.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [-1.0, 0.0, 0.0],
+            ]
+        ],
+        dtype=torch.float32,
+    )
+
+    logits, log_sigma = joint_training._score_local_window_correlation_candidates_with_uncertainty(
+        query,
+        candidates,
+        torch.nn.Identity(),
+        torch.nn.Identity(),
+        ZeroUncertainty(),
+        logit_scale=5.0,
+    )
+
+    assert logits.shape == (1, 3)
+    assert int(torch.argmax(logits, dim=1).item()) == 1
+    assert log_sigma.shape == (1,)
+
+
+def test_matcha_joint_config_accepts_correlation_local_window_mode() -> None:
+    cfg = MatchaJointTrainingConfig(local_window_fine_mode="correlation")
+
+    assert cfg.local_window_fine_mode == "correlation"
+    with pytest.raises(ValueError, match="local_window_fine_mode"):
+        MatchaJointTrainingConfig(local_window_fine_mode="unsupported")
 
 
 def test_build_matcha_joint_cache_radio_dual_defaults_to_radio_dual_layer() -> None:

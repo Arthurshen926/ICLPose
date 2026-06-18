@@ -92,6 +92,7 @@ from feature_extract.vfm.query_to_3d_matching import (
     reprojection_error_stats,
     soft_order_pnp_matches,
 )
+from feature_extract.vfm.render_pose_diagnostics import run_oracle_correspondence_pnp_diagnostics
 from feature_extract.vfm.hypothesis_io import CandidateHypothesisBank
 from feature_extract.vfm.rendered_keypoint_matching import (
     backproject_depth_to_world,
@@ -108,6 +109,7 @@ from feature_extract.vfm.rendered_pose_scoring import (
 )
 from feature_extract.vfm.render_pose_scorer import (
     load_pose_scorer_model,
+    match_validity_probability_stats,
     pose_candidate_row_from_eval_candidate,
     score_pose_candidates_with_model,
 )
@@ -202,6 +204,9 @@ def _write_rebuilt_summary_from_rows(output_dir: Path, args: argparse.Namespace,
             "render_pose_rotation_offset_deg": str(args.render_pose_rotation_offset_deg),
             "render_pose_rotation_search_offsets_deg": str(args.render_pose_rotation_search_offsets_deg),
             "render_pose_rotation_search_axis": str(args.render_pose_rotation_search_axis),
+            "enable_oracle_pnp_ablation": bool(getattr(args, "enable_oracle_pnp_ablation", False)),
+            "oracle_pnp_thresholds_px": str(getattr(args, "oracle_pnp_thresholds_px", "")),
+            "oracle_pnp_solvers": str(getattr(args, "oracle_pnp_solvers", "")),
             "stream_rows": bool(args.stream_rows),
             "resume_existing_rows": bool(args.resume_existing_rows),
         },
@@ -216,6 +221,7 @@ def _write_rebuilt_summary_from_rows(output_dir: Path, args: argparse.Namespace,
     summary["metrics"].update(_render_lock_diagnostics_from_rows(rows))
     summary["metrics"].update(_fine_confidence_diagnostics_from_rows(rows))
     summary["metrics"].update(_residual_solver_diagnostics_from_rows(rows))
+    summary["metrics"].update(_oracle_pnp_diagnostics_from_rows(rows))
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
     return summary
@@ -417,6 +423,8 @@ def _match_table_rows_for_query(
                 "confidence": _optional_float(match.pnp_soft_score),
                 "gt_reproj_error_px": error,
                 "gt_reproj_error_stride": error_stride,
+                "gt_correct_5px": False if error is None else bool(error <= 5.0),
+                "gt_correct_10px": False if error is None else bool(error <= 10.0),
                 "gt_correct_8px": False if error is None else bool(error <= 8.0),
                 "gt_correct_16px": False if error is None else bool(error <= 16.0),
                 "gt_correct_24px": False if error is None else bool(error <= 24.0),
@@ -566,6 +574,7 @@ def _pose_candidate_table_rows_for_query(
     render_pose_mode: str,
     candidates: Sequence[dict[str, object]],
     gt_pose_w2c: np.ndarray,
+    camera=None,
 ) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     for candidate_rank, candidate in enumerate(candidates):
@@ -624,6 +633,14 @@ def _pose_candidate_table_rows_for_query(
             else float(getattr(pose_score, "degeneracy_penalty", 0.0)),
         }
         row.update(feature_row)
+        if camera is not None:
+            row.update(
+                _match_validity_label_fields(
+                    list(candidate.get("pose_pnp_matches", []) or []),
+                    gt_pose_w2c,
+                    camera,
+                )
+            )
         rows.append(row)
     return rows
 
@@ -968,6 +985,80 @@ def _pnp_match_diagnostics(pnp_matches, inlier_mask: np.ndarray | None) -> dict[
     }
 
 
+def _match_probability_values(pnp_matches) -> np.ndarray:
+    probabilities = []
+    for match in list(pnp_matches):
+        score = getattr(match, "pnp_soft_score", None)
+        if score is not None:
+            try:
+                value = float(score)
+            except (TypeError, ValueError):
+                value = float("nan")
+            if np.isfinite(value):
+                probabilities.append(float(np.clip(value, 0.0, 1.0)))
+                continue
+        logit = getattr(match, "pairwise_inlier_logit", None)
+        if logit is not None:
+            try:
+                value = float(logit)
+            except (TypeError, ValueError):
+                value = float("nan")
+            if np.isfinite(value):
+                probabilities.append(float(1.0 / (1.0 + np.exp(-value))))
+                continue
+        logprob = getattr(match, "pairwise_inlier_logprob", None)
+        if logprob is not None:
+            try:
+                value = float(logprob)
+            except (TypeError, ValueError):
+                value = float("nan")
+            if np.isfinite(value):
+                probabilities.append(float(np.clip(np.exp(value), 0.0, 1.0)))
+                continue
+        try:
+            similarity = float(getattr(match, "similarity", 0.0))
+        except (TypeError, ValueError):
+            similarity = 0.0
+        probabilities.append(float(np.clip((similarity + 1.0) * 0.5, 0.0, 1.0)))
+    return np.asarray(probabilities, dtype=np.float64)
+
+
+def _match_validity_label_fields(
+    pnp_matches,
+    gt_pose_w2c: np.ndarray,
+    camera,
+    *,
+    thresholds_px: Sequence[float] = (5.0, 10.0),
+) -> dict[str, object]:
+    values = list(pnp_matches)
+    fields: dict[str, object] = {
+        "match_validity_eval_count": 0,
+        "match_validity_median_gt_reproj_error_px": None,
+    }
+    for threshold in thresholds_px:
+        tag = str(int(threshold)) if float(threshold).is_integer() else str(threshold).replace(".", "p")
+        fields[f"match_validity_rate_{tag}px"] = None
+        fields[f"match_validity_brier_{tag}px"] = None
+        fields[f"match_validity_ece_{tag}px"] = None
+    if not values:
+        return fields
+    errors = match_reprojection_errors(values, gt_pose_w2c, camera)
+    valid = np.isfinite(errors)
+    if not np.any(valid):
+        return fields
+    probabilities = _match_probability_values(values)
+    fields["match_validity_eval_count"] = int(np.sum(valid))
+    fields["match_validity_median_gt_reproj_error_px"] = float(np.median(errors[valid]))
+    for threshold in thresholds_px:
+        tag = str(int(threshold)) if float(threshold).is_integer() else str(threshold).replace(".", "p")
+        labels = (errors[valid] <= float(threshold)).astype(np.float64)
+        probs = probabilities[valid]
+        fields[f"match_validity_rate_{tag}px"] = float(np.mean(labels))
+        fields[f"match_validity_brier_{tag}px"] = float(np.mean((probs - labels) ** 2))
+        fields[f"match_validity_ece_{tag}px"] = _ece_binary(probs, labels)
+    return fields
+
+
 def _coarse_cell_center_xy(
     token_index: int,
     *,
@@ -1246,6 +1337,17 @@ def _fine_confidence_diagnostics_from_rows(rows: Sequence[dict[str, object]]) ->
     if match_counts and fine_counts and len(match_counts) == len(fine_counts):
         denom = np.maximum(np.asarray(match_counts, dtype=np.float64), 1.0)
         fine_ratio = float(np.mean(np.asarray(fine_counts, dtype=np.float64) / denom))
+    match_validity_probability = vals("match_validity_probability_mean")
+
+    def match_validity_ece_for(tag: str) -> float | None:
+        rates = vals(f"match_validity_rate_{tag}px")
+        if len(match_validity_probability) != len(rates) or not rates:
+            return None
+        return _ece_binary(
+            np.asarray(match_validity_probability, dtype=np.float64),
+            np.asarray(rates, dtype=np.float64),
+        )
+
     return {
         "mean_fine_pair_applied_ratio": fine_ratio,
         "mean_fine_pair_confidence": mean_or_none("fine_pair_mean_confidence"),
@@ -1269,6 +1371,13 @@ def _fine_confidence_diagnostics_from_rows(rows: Sequence[dict[str, object]]) ->
         "mean_pnp_patch_offset_applied_ratio": mean_or_none("pnp_match_patch_offset_applied_ratio"),
         "mean_pnp_patch_offset_norm_px": mean_or_none("pnp_match_patch_offset_norm_mean_px"),
         "confidence_ece_16px": ece,
+        "mean_match_validity_probability": mean_or_none("match_validity_probability_mean"),
+        "mean_match_validity_rate_5px": mean_or_none("match_validity_rate_5px"),
+        "mean_match_validity_rate_10px": mean_or_none("match_validity_rate_10px"),
+        "mean_match_validity_brier_5px": mean_or_none("match_validity_brier_5px"),
+        "mean_match_validity_brier_10px": mean_or_none("match_validity_brier_10px"),
+        "match_validity_ece_5px": match_validity_ece_for("5"),
+        "match_validity_ece_10px": match_validity_ece_for("10"),
     }
 
 
@@ -1388,6 +1497,42 @@ def _residual_solver_diagnostics_from_rows(rows: Sequence[dict[str, object]]) ->
     return output
 
 
+def _oracle_pnp_diagnostics_from_rows(rows: Sequence[dict[str, object]]) -> dict[str, object]:
+    def vals(key: str) -> list[float]:
+        out = []
+        for row in rows:
+            value = row.get(key)
+            if value is None:
+                continue
+            try:
+                item = float(value)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(item):
+                out.append(item)
+        return out
+
+    def median_or_none(key: str) -> float | None:
+        values = vals(key)
+        return None if not values else float(np.median(values))
+
+    output: dict[str, object] = {}
+    prefixes: set[str] = set()
+    for row in rows:
+        for key in row.keys():
+            text = str(key)
+            if text.startswith("oracle_pnp_") and text.endswith("_match_count"):
+                prefixes.add(text[: -len("_match_count")])
+    for prefix in sorted(prefixes):
+        counts = vals(f"{prefix}_match_count")
+        output[f"{prefix}_mean_match_count"] = None if not counts else float(np.mean(counts))
+        output[f"{prefix}_median_translation_error_m"] = median_or_none(f"{prefix}_translation_error_m")
+        output[f"{prefix}_median_rotation_error_deg"] = median_or_none(f"{prefix}_rotation_error_deg")
+        successes = vals(f"{prefix}_success")
+        output[f"{prefix}_solve_rate"] = None if not successes else float(np.mean(successes))
+    return output
+
+
 def _run_render_pose_residual_diagnostic(
     *,
     matches,
@@ -1473,6 +1618,46 @@ def _run_render_pose_residual_diagnostic(
                 output[f"residual_solver_oracle16_{suffix}"] = output[source]
     elif "residual_solver_oracle16_match_count" not in output:
         output["residual_solver_oracle16_match_count"] = 0
+    return output
+
+
+def _run_oracle_pnp_diagnostic(
+    *,
+    matches,
+    gt_pose_w2c: np.ndarray,
+    camera,
+    thresholds_px: Sequence[float],
+    solvers: Sequence[str],
+    reprojection_error_px: float,
+    iterations: int,
+) -> dict[str, object]:
+    rows = run_oracle_correspondence_pnp_diagnostics(
+        matches,
+        camera,
+        gt_pose_w2c=gt_pose_w2c,
+        thresholds_px=thresholds_px,
+        solvers=solvers,
+        reprojection_error_px=float(reprojection_error_px),
+        iterations=int(iterations),
+    )
+    output: dict[str, object] = {}
+    for key, row in rows.items():
+        prefix = f"oracle_pnp_{key}"
+        for metric in (
+            "success",
+            "match_count",
+            "inlier_count",
+            "inlier_ratio",
+            "translation_error_m",
+            "rotation_error_deg",
+            "residual_median_px",
+            "residual_p95_px",
+        ):
+            value = row.get(metric)
+            if isinstance(value, bool):
+                output[f"{prefix}_{metric}"] = 1.0 if value else 0.0
+            else:
+                output[f"{prefix}_{metric}"] = value
     return output
 
 
@@ -1663,6 +1848,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--residual_solver_oracle_threshold_px", type=float, default=16.0)
     parser.add_argument("--residual_solver_oracle_thresholds_px", default="5,10,16")
     parser.add_argument("--residual_solver_iterations", type=int, default=10)
+    parser.add_argument("--enable_oracle_pnp_ablation", action="store_true")
+    parser.add_argument("--oracle_pnp_thresholds_px", default="5,10,16")
+    parser.add_argument("--oracle_pnp_solvers", default="ransac,weighted,oracle_uncertainty")
     parser.add_argument("--pose_update_iterations", type=int, default=1)
     parser.add_argument(
         "--pose_update_selection",
@@ -2944,6 +3132,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 render_pose_mode=str(args.render_pose_mode),
                 candidates=candidate_finals,
                 gt_pose_w2c=gt.pose_w2c,
+                camera=camera,
             )
         topk_selection_mode = (
             "best_score"
@@ -3083,6 +3272,37 @@ def main(argv: Sequence[str] | None = None) -> None:
             )
             if bool(args.enable_render_pose_residual_solver)
             else {}
+        )
+        oracle_pnp_diagnostics = (
+            _run_oracle_pnp_diagnostic(
+                matches=pose_pnp_matches,
+                gt_pose_w2c=gt.pose_w2c,
+                camera=camera,
+                thresholds_px=[
+                    float(item)
+                    for item in str(args.oracle_pnp_thresholds_px).split(",")
+                    if str(item).strip()
+                ],
+                solvers=[
+                    str(item).strip()
+                    for item in str(args.oracle_pnp_solvers).split(",")
+                    if str(item).strip()
+                ],
+                reprojection_error_px=float(args.pnp_reprojection_error_px),
+                iterations=int(args.pnp_iterations),
+            )
+            if bool(args.enable_oracle_pnp_ablation)
+            else {}
+        )
+        match_validity_diagnostics = dict(
+            match_validity_probability_stats(pose_pnp_matches, inlier_mask=pnp.inlier_mask)
+        )
+        match_validity_diagnostics.update(
+            _match_validity_label_fields(
+                pose_pnp_matches,
+                gt.pose_w2c,
+                camera,
+            )
         )
         if bool(args.save_coarse_oracle_table) or bool(args.save_coarse_oracle_candidate_table):
             query_depth_config = GaussianVFMRenderConfig(
@@ -3279,6 +3499,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             **pnp_match_diagnostics,
             **fine_offset_diagnostics,
             **residual_solver_diagnostics,
+            **oracle_pnp_diagnostics,
+            **match_validity_diagnostics,
             **_geometry_row_fields(geometry),
         }
         rows.append(row)
@@ -3422,6 +3644,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             "residual_solver_oracle_threshold_px": float(args.residual_solver_oracle_threshold_px),
             "residual_solver_oracle_thresholds_px": str(args.residual_solver_oracle_thresholds_px),
             "residual_solver_iterations": int(args.residual_solver_iterations),
+            "enable_oracle_pnp_ablation": bool(args.enable_oracle_pnp_ablation),
+            "oracle_pnp_thresholds_px": str(args.oracle_pnp_thresholds_px),
+            "oracle_pnp_solvers": str(args.oracle_pnp_solvers),
             "pose_update_iterations": int(args.pose_update_iterations),
             "pose_update_selection": str(args.pose_update_selection),
             "pose_update_score_margin": float(args.pose_update_score_margin),
@@ -3476,6 +3701,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     summary["metrics"].update(_render_lock_diagnostics_from_rows(rows))
     summary["metrics"].update(_fine_confidence_diagnostics_from_rows(rows))
     summary["metrics"].update(_residual_solver_diagnostics_from_rows(rows))
+    summary["metrics"].update(_oracle_pnp_diagnostics_from_rows(rows))
     summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
     print(json.dumps(summary, indent=2, sort_keys=True))
 

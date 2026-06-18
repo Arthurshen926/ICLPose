@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import numpy as np
@@ -10,11 +11,13 @@ from feature_extract.vfm.render_pose_scorer import (
     PairwisePoseRanker,
     fit_pairwise_pose_ranker,
     label_pose_row,
+    pose_candidate_row_from_eval_candidate,
     pose_candidate_selection_report,
     score_pose_candidates_with_model,
     vectorize_pose_candidate_rows,
     vectorize_pose_rows,
 )
+from feature_extract.vfm.query_to_3d_matching import QueryTo3DMatch
 from feature_extract.vfm.rendered_pose_scoring import PoseHypothesisScore
 from feature_extract.tools.vfm.train_render_pose_scorer import main as train_pose_scorer_main
 
@@ -60,6 +63,47 @@ def test_pose_scorer_vectorizes_rows_without_gt_pose_error_features() -> None:
     assert "translation_error_m" not in names
     assert "rotation_error_deg" not in names
     assert "pnp_inlier_count" in names
+
+
+def test_pose_scorer_uses_match_validity_aggregates_without_gt_validity_labels() -> None:
+    matches = [
+        QueryTo3DMatch(
+            token_index=0,
+            xy=np.asarray([10.0, 10.0], dtype=np.float64),
+            track_id=1,
+            xyz=np.asarray([0.0, 0.0, 4.0], dtype=np.float64),
+            similarity=0.9,
+            ratio=0.0,
+            landmark_variance=0.1,
+            pnp_soft_score=0.9,
+        ),
+        QueryTo3DMatch(
+            token_index=1,
+            xy=np.asarray([20.0, 10.0], dtype=np.float64),
+            track_id=2,
+            xyz=np.asarray([1.0, 0.0, 4.0], dtype=np.float64),
+            similarity=0.2,
+            ratio=0.0,
+            landmark_variance=0.1,
+            pnp_soft_score=0.1,
+        ),
+    ]
+    candidate = {
+        "pnp": SimpleNamespace(success=True, inlier_count=1, inlier_ratio=0.5, inlier_mask=np.asarray([True, False])),
+        "pose_pnp_matches": matches,
+        "unfiltered_pnp_match_count": 2,
+        "iteration_pose_score": PoseHypothesisScore(0.8, 1, 2.0, 0.5, 0.5, 0.0),
+    }
+
+    row = pose_candidate_row_from_eval_candidate(candidate)
+    features, names = vectorize_pose_candidate_rows([row])
+
+    assert row["match_validity_probability_mean"] == pytest.approx(0.5)
+    assert row["match_validity_inlier_outlier_gap"] == pytest.approx(0.8)
+    assert "match_validity_probability_mean" in names
+    assert "match_validity_inlier_outlier_gap" in names
+    assert "match_validity_rate_5px" not in names
+    assert features.shape[1] == len(names)
 
 
 def test_pose_scorer_scores_eval_candidate_dicts_with_trained_model() -> None:
@@ -188,3 +232,51 @@ def test_train_render_pose_scorer_cli_supports_pairwise_ranking_objective(tmp_pa
     assert '"model_type": "pairwise_pose_ranker"' in model_json
     assert '"objective": "pairwise_rank"' in summary
     assert '"pair_count"' in summary
+
+
+def test_train_render_pose_scorer_cli_supports_query_kfold_validation_split(tmp_path) -> None:
+    rows_csv = tmp_path / "rows.csv"
+    rows_csv.write_text(
+        "\n".join(
+            [
+                "query_id,candidate_rank,pnp_success,pnp_inlier_count,pnp_inlier_ratio,pose_candidate_match_count,pose_update_selected_score,translation_error_m,rotation_error_deg,match_validity_probability_mean",
+                "q0,0,True,50,0.9,90,0.8,0.03,1.0,0.9",
+                "q0,1,False,2,0.1,20,0.1,0.8,12.0,0.1",
+                "q1,0,True,45,0.8,80,0.7,0.04,1.0,0.8",
+                "q1,1,False,2,0.1,20,0.1,0.9,15.0,0.2",
+                "q2,0,True,40,0.8,70,0.6,0.05,2.0,0.8",
+                "q2,1,False,1,0.0,10,0.1,1.0,20.0,0.1",
+                "q3,0,True,42,0.8,72,0.6,0.06,2.0,0.8",
+                "q3,1,False,1,0.0,10,0.1,1.1,20.0,0.1",
+            ]
+        )
+        + "\n"
+    )
+    output_dir = tmp_path / "pose_ranker_kfold"
+
+    train_pose_scorer_main(
+        [
+            "--rows_csv",
+            str(rows_csv),
+            "--output_dir",
+            str(output_dir),
+            "--objective",
+            "pairwise_rank",
+            "--split_mode",
+            "kfold",
+            "--fold_count",
+            "2",
+            "--fold_index",
+            "0",
+            "--min_train_queries",
+            "1",
+            "--min_eval_queries",
+            "1",
+        ]
+    )
+
+    summary = json.loads((output_dir / "pose_scorer_summary.json").read_text())
+    assert summary["split"]["mode"] == "kfold"
+    assert summary["split"]["fold_count"] == 2
+    assert summary["train_query_count"] >= 1
+    assert summary["eval_query_count"] >= 1

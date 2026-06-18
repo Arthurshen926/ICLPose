@@ -95,6 +95,8 @@ def test_match_table_rows_store_gt_error_confidence_and_inlier_label() -> None:
             "confidence": 0.9,
             "gt_reproj_error_px": 12.0,
             "gt_reproj_error_stride": 0.75,
+            "gt_correct_5px": False,
+            "gt_correct_10px": False,
             "gt_correct_8px": False,
             "gt_correct_16px": True,
             "gt_correct_24px": True,
