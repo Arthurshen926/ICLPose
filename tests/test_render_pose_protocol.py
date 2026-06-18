@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from feature_extract.vfm.hypotheses import CandidateHypothesis, PoseCost
 from feature_extract.vfm.render_pose_protocol import (
     RenderPoseSelection,
+    expand_render_pose_rotation_candidates,
     group_topk_reference_poses,
     group_top_reference_poses,
+    parse_rotation_search_offsets_deg,
     sample_se3_perturbation,
     parse_world_offset,
     select_render_pose,
@@ -122,3 +125,45 @@ def test_select_render_pose_supports_gt_offset_and_reference() -> None:
     assert np.allclose(offset.pose_w2c[:3, 3], [-1.0, 0.0, 0.0])
     assert ref.label == "reference_top1"
     assert np.allclose(ref.pose_w2c, reference_pose)
+
+
+def test_select_render_pose_supports_gt_rotation_offset() -> None:
+    gt_pose = np.eye(4, dtype=np.float64)
+
+    selected = select_render_pose(
+        "q.png",
+        gt_pose,
+        mode="gt_rotation_offset",
+        rotation_offset_deg=np.asarray([0.0, 3.0, 0.0], dtype=np.float64),
+    )
+
+    assert selected.label == "gt_rotation_offset:0.000,3.000,0.000"
+    assert selected.render_translation_error_m == pytest.approx(0.0)
+    assert selected.render_rotation_error_deg == pytest.approx(3.0)
+
+
+def test_parse_rotation_search_offsets_deg_keeps_order_and_allows_empty() -> None:
+    assert parse_rotation_search_offsets_deg("") == ()
+    assert parse_rotation_search_offsets_deg("-3,0,3") == (-3.0, 0.0, 3.0)
+
+
+def test_expand_render_pose_rotation_candidates_tracks_errors_and_labels() -> None:
+    gt_pose = np.eye(4, dtype=np.float64)
+    base = RenderPoseSelection(pose_w2c=gt_pose, label="base", candidate_id="c0", reference_image="ref.png")
+
+    expanded = expand_render_pose_rotation_candidates(
+        [base],
+        rotation_offsets_deg=(-1.0, 0.0, 1.0),
+        axis="y",
+        gt_pose_w2c=gt_pose,
+    )
+
+    assert [item.label for item in expanded] == [
+        "base:rot_y_m1p000deg",
+        "base:rot_y_0p000deg",
+        "base:rot_y_p1p000deg",
+    ]
+    assert [item.candidate_id for item in expanded] == ["c0", "c0", "c0"]
+    assert expanded[0].render_rotation_error_deg == pytest.approx(1.0)
+    assert expanded[1].render_rotation_error_deg == pytest.approx(0.0)
+    assert expanded[2].render_rotation_error_deg == pytest.approx(1.0)

@@ -73,6 +73,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--offset_loss_weight", type=float, default=0.25)
     parser.add_argument("--pair_fine_loss_weight", type=float, default=0.25)
     parser.add_argument("--query_pair_fine_loss_weight", type=float, default=0.0)
+    parser.add_argument("--fine_continuous_loss_weight", type=float, default=0.25)
+    parser.add_argument("--fine_uncertainty_loss_weight", type=float, default=0.05)
     parser.add_argument("--pair_confidence_loss_weight", type=float, default=0.1)
     parser.add_argument("--dense_heatmap_loss_weight", type=float, default=0.0)
     parser.add_argument("--rgb_keypoint_loss_weight", type=float, default=0.0)
@@ -149,6 +151,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         offset_loss_weight=float(args.offset_loss_weight),
         pair_fine_loss_weight=float(args.pair_fine_loss_weight),
         query_pair_fine_loss_weight=float(args.query_pair_fine_loss_weight),
+        fine_continuous_loss_weight=float(args.fine_continuous_loss_weight),
+        fine_uncertainty_loss_weight=float(args.fine_uncertainty_loss_weight),
         pair_confidence_loss_weight=float(args.pair_confidence_loss_weight),
         dense_heatmap_loss_weight=float(args.dense_heatmap_loss_weight),
         rgb_keypoint_loss_weight=float(args.rgb_keypoint_loss_weight),

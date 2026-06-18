@@ -1,0 +1,88 @@
+protocol_name: oldhospital_matcha_clean_fullmap_v1
+protocol_kind: render_rgb_feature_keypoint_pose
+description: >
+  Locked OldHospital MATCHA-style render-RGB localization protocol used as the
+  clean baseline before coarse-candidate retraining. This protocol intentionally
+  fixes the full 30k RGB/depth map, the fully trained clean checkpoint, the
+  full test split, and the legacy coarse matcher. Debug checkpoints, 5k maps,
+  q32/q4 subsets, and top-k candidate inference are non-comparable to this
+  protocol unless explicitly listed as ablations.
+
+scene:
+  name: OldHospital
+  image_root: /hy-tmp/Cambridge_stdloc/OldHospital
+  train_pose_file: /hy-tmp/Cambridge_stdloc/OldHospital/dataset_train.txt
+  test_pose_file: /hy-tmp/Cambridge_stdloc/OldHospital/dataset_test.txt
+  train_manifest: output/vfm_tokens_radio/OldHospital/train_manifest.json
+  test_manifest: output/vfm/stage_r_matcha_joint/oldhospital/clean_protocol_v1/split_manifests/test_full182_manifest.json
+  expected_train_queries: 895
+  expected_test_queries: 182
+
+map:
+  renderer: official_2dgs
+  gaussian_rgb_ply: /root/ICLPose/result/result/feature_gaussian/joint_rgb_geometry_cambridge_oldhospital_processed_rebuild_v4_4gpu_1280_safe_rgbft_30k/point_cloud/best/point_cloud.ply
+  render_width: 1280
+  render_height: 720
+
+model:
+  matcha_joint_checkpoint: output/vfm/stage_r_matcha_joint/oldhospital/clean_protocol_v1/train_clean_abcd_best_recipe/best_joint.pt
+  training_summary: output/vfm/stage_r_matcha_joint/oldhospital/clean_protocol_v1/train_clean_abcd_best_recipe/summary.json
+  status: fully_trained_clean_baseline
+
+candidate_bank:
+  reference_top10: output/vfm/candidate_banks/oldhospital_reference_pose_top10_fixed.jsonl
+
+matcher:
+  match_mode: matcha_c2f
+  matcha_coarse_top_k_per_query: 1
+  matcha_coarse_mutual_mode: legacy
+  matcha_use_pair_fine_head: true
+  matcha_pair_fine_side: query
+  matcha_confidence_mode: blend
+  matcha_confidence_blend: 0.5
+  matcha_keypoint_proposal_source: rgb_detector
+  matcha_keypoint_proposal_mode: soft
+  matcha_keypoint_proposal_top_k: 1000
+  matcha_keypoint_prior_boost: 0.25
+  matcha_reliability_prior_boost: 0.25
+  max_keypoints: 1000
+  max_matches: 1000
+  pnp_reprojection_error_px: 12
+  coverage_filter_grid: 8
+  coverage_filter_max_per_cell: 8
+  coverage_filter_max_total: 512
+
+baseline_eval_modes:
+  - name: gt
+    render_pose_mode: gt
+    render_pose_world_offset: 0,0,0
+  - name: gt_offset025
+    render_pose_mode: gt_offset
+    render_pose_world_offset: 0.25,0,0
+  - name: reference_top1
+    render_pose_mode: reference_top1
+    reference_top_k: 5
+  - name: reference_top5
+    render_pose_mode: reference_top5
+    reference_top_k: 5
+
+required_report_metrics:
+  - query_count
+  - median_translation_error_m
+  - median_rotation_error_deg
+  - success_10cm_5deg
+  - success_25cm_10deg
+  - pnp_solve_rate
+  - mean_gt_precision_16px
+  - mean_gt_precision_32px
+  - mean_pnp_inlier_gt_precision_16px
+  - mean_pnp_inlier_count
+
+non_comparable_by_default:
+  - map: safe_rgbft_5k
+  - checkpoints:
+      - rank_loss_warmstart_40
+      - q4_or_q32_debug_runs
+  - matchers:
+      - coarse_top_k_without_full_retraining
+      - render_side_local_offset_as_default_inference

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import numpy as np
 
+from feature_extract.vfm.colmap_tracks import ColmapCamera
 from feature_extract.vfm.matcha_coarse_to_fine import (
     apply_cell_reliability_prior_to_matches,
+    apply_fine_logit_confidence_to_matches,
     apply_keypoint_cell_prior_to_matches,
     apply_pair_fine_logits_to_matches,
     cross_attention_enhance_feature_maps,
@@ -12,13 +14,14 @@ from feature_extract.vfm.matcha_coarse_to_fine import (
     deduplicate_repeated_correspondences,
     feature_map_to_coarse_grid,
     matcha_coarse_dual_softmax_matches,
+    matcha_coarse_topk_matches,
     matcha_coarse_to_fine_keypoint_matches,
     refine_render_matches_by_local_attention,
     refine_matches_by_bilateral_local_correlation,
     retain_topk_matches_per_query,
     rescore_keypoint_matches_by_feature_similarity,
 )
-from feature_extract.vfm.rendered_keypoint_matching import KeypointFeatureMatch
+from feature_extract.vfm.rendered_keypoint_matching import KeypointFeatureMatch, keypoint_feature_matches_to_pnp_matches
 
 
 def test_feature_map_to_coarse_grid_uses_patch_centers() -> None:
@@ -81,6 +84,64 @@ def test_matcha_coarse_dual_softmax_respects_candidate_cell_indices() -> None:
     assert [(match.query_index, match.render_index) for match in matches] == [(1, 1)]
 
 
+def test_matcha_coarse_topk_matches_keeps_non_mutual_candidates_with_rank_metadata() -> None:
+    query = np.zeros((2, 1, 1), dtype=np.float32)
+    render = np.zeros((2, 1, 3), dtype=np.float32)
+    query[:, 0, 0] = [1.0, 0.0]
+    render[:, 0, 0] = [0.8, 0.2]
+    render[:, 0, 1] = [1.0, 0.0]
+    render[:, 0, 2] = [0.7, 0.3]
+
+    matches = matcha_coarse_topk_matches(
+        query,
+        render,
+        query_image_width=10,
+        query_image_height=10,
+        render_image_width=30,
+        render_image_height=10,
+        k_per_query=2,
+        mutual_mode="annotate",
+        logit_scale=10.0,
+    )
+
+    assert len(matches) == 2
+    assert [match.coarse_rank for match in matches] == [0, 1]
+    assert matches[0].render_index == 1
+    assert matches[0].base_render_index == 1
+    assert matches[0].candidate_render_index == 1
+    assert matches[0].candidate_id == 0
+    assert matches[0].coarse_score > matches[1].coarse_score
+    assert matches[0].coarse_score_gap == 0.0
+    assert matches[1].coarse_score_gap > 0.0
+
+
+def test_matcha_coarse_to_fine_can_use_topk_coarse_candidates_without_mutual_filter() -> None:
+    query = np.zeros((2, 1, 1), dtype=np.float32)
+    render = np.zeros((2, 1, 3), dtype=np.float32)
+    query[:, 0, 0] = [1.0, 0.0]
+    render[:, 0, 0] = [0.8, 0.2]
+    render[:, 0, 1] = [1.0, 0.0]
+    render[:, 0, 2] = [0.7, 0.3]
+
+    matches = matcha_coarse_to_fine_keypoint_matches(
+        query,
+        render,
+        query_image_width=10,
+        query_image_height=10,
+        render_image_width=30,
+        render_image_height=10,
+        logit_scale=10.0,
+        fine_search_radius_px=0.0,
+        coarse_top_k_per_query=2,
+        coarse_mutual_mode="annotate",
+    )
+
+    assert len(matches) == 2
+    assert [match.coarse_rank for match in matches] == [0, 1]
+    assert [match.render_index for match in matches] == [1, 0]
+    assert all(match.mutual_rank is not None for match in matches)
+
+
 def test_matcha_coarse_to_fine_moves_render_measurement_to_local_peak() -> None:
     query = np.zeros((2, 1, 1), dtype=np.float32)
     query[:, 0, 0] = [0.0, 1.0]
@@ -133,6 +194,44 @@ def test_matcha_coarse_to_fine_softargmax_outputs_continuous_peak() -> None:
 
     assert len(matches) == 1
     assert np.allclose(matches[0].render_xy, [7.0, 5.0], atol=1e-3)
+
+
+def test_pair_fine_render_offset_updates_depth_sample_used_for_pnp_3d() -> None:
+    match = KeypointFeatureMatch(
+        query_index=0,
+        render_index=0,
+        query_xy=np.asarray([10.0, 10.0], dtype=np.float64),
+        render_xy=np.asarray([4.0, 4.0], dtype=np.float64),
+        similarity=0.9,
+        ratio=1.0,
+    )
+    logits = np.full((1, 64), -20.0, dtype=np.float32)
+    logits[0, 63] = 20.0
+    refined = apply_pair_fine_logits_to_matches(
+        [match],
+        logits,
+        render_image_width=16,
+        render_image_height=16,
+        render_grid_width=2,
+        render_grid_height=2,
+    )
+    depth = np.tile(np.arange(16, dtype=np.float32)[None, :], (16, 1))
+    camera = ColmapCamera(camera_id=1, model_id=1, width=16, height=16, params=(10.0, 10.0, 8.0, 8.0))
+
+    pnp_matches = keypoint_feature_matches_to_pnp_matches(
+        refined,
+        depth,
+        camera,
+        np.eye(4, dtype=np.float64),
+        image_width=16,
+        image_height=16,
+        render_grid_width=2,
+        render_grid_height=2,
+    )
+
+    assert np.allclose(refined[0].render_xy, [7.5, 7.5])
+    assert len(pnp_matches) == 1
+    assert np.isclose(pnp_matches[0].xyz[2], 7.5)
 
 
 def test_bilateral_local_correlation_moves_query_and_render_measurements() -> None:
@@ -277,6 +376,15 @@ def test_expand_matches_with_render_local_offsets_keeps_query_fixed_and_moves_re
     assert all(np.allclose(item.query_xy, match.query_xy) for item in expanded)
     assert any(not np.allclose(item.render_xy, match.render_xy) for item in expanded)
     assert {item.render_index for item in expanded} == {0, 1, 2, 4, 5, 6, 8, 9, 10}
+    assert all(item.base_render_index == 5 for item in expanded)
+    assert all(item.candidate_render_index == item.render_index for item in expanded)
+    center = [item for item in expanded if item.render_index == 5][0]
+    right = [item for item in expanded if item.render_index == 6][0]
+    assert center.cell_delta_x == 0
+    assert center.cell_delta_y == 0
+    assert right.cell_delta_x == 1
+    assert right.cell_delta_y == 0
+    assert len({item.candidate_id for item in expanded}) == len(expanded)
 
 
 def test_rescore_keypoint_matches_by_feature_similarity_ranks_moved_render_candidate() -> None:
@@ -528,6 +636,33 @@ def test_apply_pair_fine_logits_to_matches_accepts_original_matcha_64_bins() -> 
     assert np.allclose(refined[0].render_xy, [10.5, 2.5])
 
 
+def test_apply_pair_fine_logits_to_matches_can_softargmax_offset_bins() -> None:
+    match = KeypointFeatureMatch(
+        query_index=0,
+        render_index=1,
+        query_xy=np.asarray([4.0, 4.0]),
+        render_xy=np.asarray([12.0, 4.0]),
+        similarity=0.9,
+        ratio=0.1,
+    )
+    logits = np.full((1, 64), -30.0, dtype=np.float32)
+    logits[0, 18] = 5.0
+    logits[0, 19] = 5.0
+
+    refined = apply_pair_fine_logits_to_matches(
+        [match],
+        logits,
+        render_image_width=16,
+        render_image_height=8,
+        render_grid_width=2,
+        render_grid_height=1,
+        coordinate_mode="softargmax",
+    )
+
+    assert len(refined) == 1
+    assert np.allclose(refined[0].render_xy, [11.0, 2.5])
+
+
 def test_apply_pair_fine_logits_to_matches_can_refine_query_side_only() -> None:
     match = KeypointFeatureMatch(
         query_index=0,
@@ -621,4 +756,33 @@ def test_apply_cell_reliability_prior_uses_continuous_scores_without_dropping() 
 
     assert len(updated) == 2
     assert updated[0].query_index == 0
+    assert updated[0].dual_softmax_confidence > updated[1].dual_softmax_confidence
+
+
+def test_apply_fine_logit_confidence_to_matches_uses_local_window_peak() -> None:
+    ambiguous = KeypointFeatureMatch(
+        query_index=0,
+        render_index=0,
+        query_xy=np.asarray([4.0, 4.0]),
+        render_xy=np.asarray([4.0, 4.0]),
+        similarity=0.9,
+        ratio=0.1,
+        dual_softmax_confidence=0.4,
+    )
+    sharp = KeypointFeatureMatch(
+        query_index=1,
+        render_index=1,
+        query_xy=np.asarray([12.0, 4.0]),
+        render_xy=np.asarray([12.0, 4.0]),
+        similarity=0.1,
+        ratio=0.1,
+        dual_softmax_confidence=0.4,
+    )
+    logits = np.zeros((2, 64), dtype=np.float32)
+    logits[1, 9] = 10.0
+
+    updated = apply_fine_logit_confidence_to_matches([ambiguous, sharp], logits, blend=0.5)
+
+    assert len(updated) == 2
+    assert updated[0].query_index == 1
     assert updated[0].dual_softmax_confidence > updated[1].dual_softmax_confidence

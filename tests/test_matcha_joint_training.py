@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import zipfile
 from types import SimpleNamespace
 
 import numpy as np
@@ -15,7 +16,10 @@ from feature_extract.tools.vfm.build_matcha_joint_cache import (
     parse_args as parse_build_matcha_joint_cache_args,
 )
 from feature_extract.tools.vfm.train_matcha_joint_model import main as train_matcha_joint_model_cli
-from feature_extract.tools.vfm.train_matcha_joint_streaming_model import parse_args as parse_streaming_train_args
+from feature_extract.tools.vfm.train_matcha_joint_streaming_model import (
+    _set_frozen_descriptor_batchnorm_eval,
+    parse_args as parse_streaming_train_args,
+)
 from feature_extract.vfm.matcha_coarse_fine_adapter import MatchaCoarseFineTrainingSet
 from feature_extract.vfm.matcha_coarse_supervision import MatchaCoarseSupervision
 from feature_extract.vfm.matcha_joint_cache import (
@@ -23,6 +27,7 @@ from feature_extract.vfm.matcha_joint_cache import (
     build_matcha_joint_index_training_set_from_maps,
     build_matcha_joint_training_set_from_maps,
     heatmap_targets_from_coarse_supervision,
+    pose_confidence_targets_from_reprojection_errors,
 )
 from feature_extract.vfm.matcha_joint_training import (
     MatchaJointTrainingConfig,
@@ -250,6 +255,33 @@ def test_radio_extract_dual_uses_single_forward_for_two_intermediate_layers() ->
     assert model.final_calls == 0
 
 
+def test_radio_dual_attention_local_window_head_outputs_uncertainty() -> None:
+    model = RadioDualAttentionFusionJointModel(
+        fine_input_dim=4,
+        coarse_input_dim=4,
+        output_dim=4,
+        residual_hidden_dim=8,
+        attention_hidden_dim=8,
+        attention_depth=1,
+        attention_heads=2,
+        attention_patch_size=1,
+        group_size=2,
+    )
+    query_maps = torch.rand(1, 8, 2, 2)
+    render_maps = torch.rand(1, 8, 2, 2)
+
+    logits, log_sigma = model.local_window_fine_logits_uncertainty_from_maps(
+        query_maps,
+        render_maps,
+        torch.asarray([0, 0], dtype=torch.long),
+        torch.asarray([0, 3], dtype=torch.long),
+        torch.asarray([0, 3], dtype=torch.long),
+    )
+
+    assert logits.shape == (2, 64)
+    assert log_sigma.shape == (2,)
+
+
 def test_build_matcha_joint_cache_radio_dual_defaults_to_radio_dual_layer() -> None:
     args = parse_build_matcha_joint_cache_args(
         [
@@ -396,7 +428,161 @@ def test_build_matcha_joint_index_training_set_preserves_robust_targets() -> Non
     assert samples.sample_confidence_ignore_mask.tolist() == [False, True, True, False, False]
 
 
-def test_build_matcha_joint_index_training_set_omits_rgb_when_keypoint_labels_absent() -> None:
+def test_build_matcha_joint_index_training_set_keeps_dense_fine_supervision_separate() -> None:
+    feature = np.arange(4 * 2 * 2, dtype=np.float32).reshape(4, 2, 2)
+    coarse = _toy_supervision()
+    dense_fine = MatchaCoarseSupervision(
+        query_indices=np.asarray([0, 0, 1], dtype=np.int64),
+        render_indices=np.asarray([0, 0, 1], dtype=np.int64),
+        query_xy=np.zeros((3, 2), dtype=np.float64),
+        render_xy=np.zeros((3, 2), dtype=np.float64),
+        query_offset_labels=np.asarray([3, 4, 5], dtype=np.int64),
+        render_offset_labels=np.asarray([6, 7, 8], dtype=np.int64),
+        roundtrip_errors_px=np.asarray([0.0, 0.2, 0.3], dtype=np.float32),
+    )
+
+    baseline = build_matcha_joint_index_training_set_from_maps(
+        feature,
+        feature,
+        coarse,
+        hard_negatives_per_match=1,
+    )
+    samples = build_matcha_joint_index_training_set_from_maps(
+        feature,
+        feature,
+        coarse,
+        fine_supervision=dense_fine,
+        hard_negatives_per_match=1,
+    )
+
+    assert samples.coarse_fine_samples.sample_count == baseline.coarse_fine_samples.sample_count
+    assert samples.fine_sample_pair_indices is not None
+    assert samples.fine_sample_pair_indices.tolist() == [0, 0, 0]
+    assert samples.fine_query_cell_indices is not None
+    assert samples.fine_query_cell_indices.tolist() == [0, 0, 1]
+    assert samples.fine_render_offset_labels is not None
+    assert samples.fine_render_offset_labels.tolist() == [6, 7, 8]
+
+
+def test_matcha_joint_index_npz_round_trip_preserves_dense_fine_supervision(tmp_path) -> None:
+    feature = np.arange(4 * 2 * 2, dtype=np.float32).reshape(4, 2, 2)
+    dense_fine = MatchaCoarseSupervision(
+        query_indices=np.asarray([0, 0, 1], dtype=np.int64),
+        render_indices=np.asarray([0, 0, 1], dtype=np.int64),
+        query_xy=np.zeros((3, 2), dtype=np.float64),
+        render_xy=np.zeros((3, 2), dtype=np.float64),
+        query_offset_labels=np.asarray([3, 4, 5], dtype=np.int64),
+        render_offset_labels=np.asarray([6, 7, 8], dtype=np.int64),
+        roundtrip_errors_px=np.asarray([0.0, 0.2, 0.3], dtype=np.float32),
+    )
+    samples = build_matcha_joint_index_training_set_from_maps(
+        feature,
+        feature,
+        _toy_supervision(),
+        fine_supervision=dense_fine,
+        hard_negatives_per_match=1,
+    )
+    path = tmp_path / "joint.npz"
+
+    save_matcha_joint_training_set_npz(samples, path)
+    loaded, _metadata = load_matcha_joint_training_set_npz(path)
+
+    assert loaded.fine_sample_pair_indices is not None
+    assert loaded.fine_sample_pair_indices.tolist() == [0, 0, 0]
+    assert loaded.fine_render_offset_labels is not None
+    assert loaded.fine_render_offset_labels.tolist() == [6, 7, 8]
+
+
+def test_matcha_joint_index_npz_round_trip_preserves_dense_fine_v2_fields(tmp_path) -> None:
+    feature = np.arange(4 * 2 * 2, dtype=np.float32).reshape(4, 2, 2)
+    rgb = np.zeros((16, 16, 3), dtype=np.uint8)
+    rgb[3, 3] = [255, 0, 0]
+    dense_fine = MatchaCoarseSupervision(
+        query_indices=np.asarray([0, 1, 2], dtype=np.int64),
+        render_indices=np.asarray([0, 1, 2], dtype=np.int64),
+        query_xy=np.asarray([[3.0, 3.0], [11.0, 3.0], [3.0, 11.0]], dtype=np.float64),
+        render_xy=np.asarray([[2.0, 5.0], [9.0, 6.0], [6.0, 14.0]], dtype=np.float64),
+        query_offset_labels=np.asarray([27, 27, 27], dtype=np.int64),
+        render_offset_labels=np.asarray([42, 49, 54], dtype=np.int64),
+        roundtrip_errors_px=np.asarray([0.0, 0.2, 0.3], dtype=np.float32),
+        support_view_counts=np.asarray([1, 2, 3], dtype=np.int64),
+    )
+    samples = build_matcha_joint_index_training_set_from_maps(
+        feature,
+        feature,
+        _toy_supervision(),
+        fine_supervision=dense_fine,
+        query_rgb=rgb,
+        render_rgb=rgb,
+        query_keypoint_label_map=None,
+        render_keypoint_label_map=None,
+        hard_negatives_per_match=1,
+    )
+    path = tmp_path / "joint_v2.npz"
+
+    save_matcha_joint_training_set_npz(samples, path)
+    loaded, _metadata = load_matcha_joint_training_set_npz(path)
+
+    assert loaded.query_rgb_images is not None
+    assert loaded.query_rgb_images.shape == (1, 3, 16, 16)
+    assert loaded.query_rgb_keypoint_labels is None
+    assert loaded.fine_query_xy is not None
+    np.testing.assert_allclose(loaded.fine_query_xy, dense_fine.query_xy)
+    assert loaded.fine_render_xy is not None
+    np.testing.assert_allclose(loaded.fine_render_xy, dense_fine.render_xy)
+    assert loaded.fine_render_depth is not None
+    assert loaded.fine_render_depth.shape == (3,)
+    assert np.all(np.isnan(loaded.fine_render_depth))
+    assert loaded.fine_support_view_count is not None
+    assert loaded.fine_support_view_count.tolist() == [1, 2, 3]
+    assert loaded.fine_validity_weight is not None
+    np.testing.assert_allclose(loaded.fine_validity_weight, np.ones((3,), dtype=np.float32))
+
+
+def test_merge_matcha_joint_training_sets_preserves_dense_fine_v2_fields() -> None:
+    dense_query_xy = np.asarray([[3.0, 3.0], [11.0, 3.0]], dtype=np.float64)
+    samples = MatchaJointTrainingSet(
+        coarse_fine_samples=MatchaCoarseFineTrainingSet(
+            query_features=np.zeros((2, 4), dtype=np.float32),
+            render_features=np.zeros((2, 4), dtype=np.float32),
+            query_offset_labels=np.asarray([1, 2], dtype=np.int64),
+            render_offset_labels=np.asarray([3, 4], dtype=np.int64),
+            negative_render_features=np.zeros((2, 0, 4), dtype=np.float32),
+            roundtrip_errors_px=np.zeros((2,), dtype=np.float32),
+        ),
+        query_feature_maps=np.zeros((1, 4, 2, 2), dtype=np.float32),
+        render_feature_maps=np.zeros((1, 4, 2, 2), dtype=np.float32),
+        query_heatmap_targets=np.zeros((1, 2, 2), dtype=np.float32),
+        render_heatmap_targets=np.zeros((1, 2, 2), dtype=np.float32),
+        sample_pair_indices=np.zeros((2,), dtype=np.int64),
+        query_cell_indices=np.asarray([0, 1], dtype=np.int64),
+        render_cell_indices=np.asarray([0, 1], dtype=np.int64),
+        fine_sample_pair_indices=np.zeros((2,), dtype=np.int64),
+        fine_query_cell_indices=np.asarray([0, 1], dtype=np.int64),
+        fine_render_cell_indices=np.asarray([0, 1], dtype=np.int64),
+        fine_query_offset_labels=np.asarray([27, 28], dtype=np.int64),
+        fine_render_offset_labels=np.asarray([42, 49], dtype=np.int64),
+        fine_query_xy=dense_query_xy,
+        fine_render_xy=np.asarray([[2.0, 5.0], [9.0, 6.0]], dtype=np.float64),
+        fine_render_depth=np.asarray([4.0, 5.0], dtype=np.float32),
+        fine_support_view_count=np.asarray([1, 3], dtype=np.int64),
+        fine_validity_weight=np.asarray([0.5, 1.0], dtype=np.float32),
+    )
+
+    merged = merge_matcha_joint_training_sets([samples, samples])
+
+    assert merged.fine_query_xy is not None
+    assert merged.fine_query_xy.shape == (4, 2)
+    np.testing.assert_allclose(merged.fine_query_xy[:2], dense_query_xy)
+    assert merged.fine_render_depth is not None
+    np.testing.assert_allclose(merged.fine_render_depth, np.asarray([4.0, 5.0, 4.0, 5.0], dtype=np.float32))
+    assert merged.fine_support_view_count is not None
+    assert merged.fine_support_view_count.tolist() == [1, 3, 1, 3]
+    assert merged.fine_validity_weight is not None
+    np.testing.assert_allclose(merged.fine_validity_weight, np.asarray([0.5, 1.0, 0.5, 1.0], dtype=np.float32))
+
+
+def test_build_matcha_joint_index_training_set_keeps_rgb_when_keypoint_labels_absent() -> None:
     feature = np.arange(4 * 2 * 2, dtype=np.float32).reshape(4, 2, 2)
     rgb = np.zeros((16, 16, 3), dtype=np.uint8)
 
@@ -411,8 +597,11 @@ def test_build_matcha_joint_index_training_set_omits_rgb_when_keypoint_labels_ab
         hard_negatives_per_match=2,
     )
 
-    assert samples.query_rgb_images is None
-    assert samples.render_rgb_images is None
+    assert samples.query_rgb_images is not None
+    assert samples.query_rgb_images.shape == (1, 3, 16, 16)
+    assert samples.query_rgb_keypoint_labels is None
+    assert samples.render_rgb_images is not None
+    assert samples.render_rgb_keypoint_labels is None
 
 
 def test_matcha_joint_cache_extractor_can_build_radio_dual_feature_map() -> None:
@@ -430,6 +619,329 @@ def test_matcha_joint_cache_extractor_can_build_radio_dual_feature_map() -> None
     assert feature.shape == (8, 2, 2)
     assert np.allclose(feature[:4], 1.0)
     assert np.allclose(feature[4:], 2.0)
+
+
+def test_render_subcell_stratified_seed_covers_all_offset_bins() -> None:
+    from feature_extract.tools.vfm.train_matcha_joint_streaming_model import _render_subcell_stratified_seed_xy
+    from feature_extract.vfm.matcha_coarse_supervision import cell_offset_labels
+
+    xy = _render_subcell_stratified_seed_xy(
+        image_width=640,
+        image_height=640,
+        grid_width=80,
+        grid_height=80,
+        seed=123,
+        offset_bins=8,
+        jitter=False,
+    )
+    labels, valid = cell_offset_labels(
+        xy,
+        image_width=640,
+        image_height=640,
+        grid_width=80,
+        grid_height=80,
+        offset_bins=8,
+    )
+
+    assert xy.shape == (6400, 2)
+    assert np.all(valid)
+    assert set(labels.tolist()) == set(range(64))
+    counts = np.bincount(labels, minlength=64)
+    assert int(counts.min()) >= 90
+    assert int(counts.max()) <= 110
+
+
+def test_patch_fine_patch_extractors_preserve_render_cell_bin_coordinates() -> None:
+    from feature_extract.vfm.matcha_patch_fine import _select_pair_images, extract_query_source_patch, extract_render_cell_patch
+
+    query_rgb = torch.zeros((1, 3, 64, 64), dtype=torch.float32)
+    render_rgb = torch.zeros((1, 3, 64, 64), dtype=torch.float32)
+    query_rgb[0, 0, 22, 10] = 1.0
+    render_rgb[0, 0, 22, 10] = 1.0
+
+    query_patch = extract_query_source_patch(
+        query_rgb,
+        torch.asarray([0], dtype=torch.long),
+        torch.asarray([[10.0, 22.0]], dtype=torch.float32),
+        patch_size=32,
+    )
+    render_patch = extract_render_cell_patch(
+        render_rgb,
+        torch.asarray([0], dtype=torch.long),
+        torch.asarray([0], dtype=torch.long),
+        render_grid_hw=(2, 2),
+        patch_size=32,
+    )
+
+    assert query_patch.shape == (1, 3, 32, 32)
+    assert render_patch.shape == (1, 3, 32, 32)
+    assert float(query_patch[0, 0, 16, 16]) > 0.95
+    assert float(render_patch[0, 0, 22, 10]) > 0.95
+    selected = _select_pair_images(query_rgb, torch.asarray([0, 0, 0], dtype=torch.long))
+    assert selected.shape == (3, 3, 64, 64)
+    assert selected.storage().data_ptr() == query_rgb.storage().data_ptr()
+
+
+def test_patch_correlation_fine_head_and_model_method_output_render_offset_logits() -> None:
+    from feature_extract.vfm.matcha_patch_fine import PatchCorrelationFineHead, explicit_patch_cost_volume_logits
+
+    query_features = torch.zeros((1, 2, 8, 8), dtype=torch.float32)
+    target_features = torch.zeros((1, 2, 8, 8), dtype=torch.float32)
+    query_features[:, 0, 4, 4] = 1.0
+    target_features[:, 1, :, :] = 1.0
+    target_features[:, 1, 2, 3] = 0.0
+    target_features[:, 0, 2, 3] = 1.0
+
+    cost_logits = explicit_patch_cost_volume_logits(query_features, target_features, offset_bins=8)
+    assert cost_logits.shape == (1, 64)
+    assert int(torch.argmax(cost_logits, dim=1).item()) == 19
+
+    head = PatchCorrelationFineHead(context_dim=4, hidden_dim=16, patch_size=32, offset_bins=8)
+    query_rgb = torch.rand((2, 3, 64, 64), dtype=torch.float32)
+    render_rgb = torch.rand((2, 3, 64, 64), dtype=torch.float32)
+    pair_indices = torch.asarray([0, 1], dtype=torch.long)
+    query_xy = torch.asarray([[10.0, 22.0], [48.0, 38.0]], dtype=torch.float32)
+    render_indices = torch.asarray([0, 3], dtype=torch.long)
+    query_context = torch.rand((2, 4), dtype=torch.float32, requires_grad=True)
+    render_context = torch.rand((2, 4), dtype=torch.float32, requires_grad=True)
+
+    logits = head(
+        query_rgb,
+        render_rgb,
+        pair_indices,
+        query_xy,
+        render_indices,
+        render_grid_hw=(2, 2),
+        query_context=query_context,
+        render_context=render_context,
+    )
+    assert logits.shape == (2, 64)
+    loss = torch.nn.functional.cross_entropy(logits, torch.asarray([42, 7], dtype=torch.long))
+    loss.backward()
+    assert query_context.grad is not None
+    assert render_context.grad is not None
+
+    model = MatchaStyleJointModel(input_dim=4, output_dim=4, residual_hidden_dim=16, group_size=2)
+    feature_maps = torch.rand((2, 4, 2, 2), dtype=torch.float32)
+    model_logits = model.patch_corr_fine_logits_from_maps_and_rgb(
+        feature_maps,
+        feature_maps.clone(),
+        query_rgb,
+        render_rgb,
+        pair_indices,
+        torch.asarray([0, 3], dtype=torch.long),
+        render_indices,
+        query_xy=query_xy,
+    )
+    assert model_logits.shape == (2, 64)
+
+
+def test_patch_corr_fine_loss_reconstructs_query_patch_xy_in_resized_rgb_space() -> None:
+    class CapturePatchCorrModel:
+        def __init__(self) -> None:
+            self.query_xy_calls: list[torch.Tensor] = []
+
+        def patch_corr_fine_logits_from_maps_and_rgb(
+            self,
+            _query_feature_maps,
+            _render_feature_maps,
+            _query_rgb_images,
+            _render_rgb_images,
+            _pair_indices,
+            _query_cell_indices,
+            _render_cell_indices,
+            *,
+            query_xy,
+        ):
+            self.query_xy_calls.append(query_xy.detach().cpu())
+            return torch.zeros((query_xy.shape[0], 64), dtype=torch.float32, device=query_xy.device)
+
+    samples = MatchaJointTrainingSet(
+        coarse_fine_samples=MatchaCoarseFineTrainingSet(
+            query_features=np.zeros((1, 4), dtype=np.float32),
+            render_features=np.zeros((1, 4), dtype=np.float32),
+            query_offset_labels=np.zeros((1,), dtype=np.int64),
+            render_offset_labels=np.zeros((1,), dtype=np.int64),
+            negative_render_features=np.zeros((1, 0, 4), dtype=np.float32),
+            roundtrip_errors_px=np.zeros((1,), dtype=np.float32),
+        ),
+        query_feature_maps=np.zeros((1, 4, 2, 2), dtype=np.float32),
+        render_feature_maps=np.zeros((1, 4, 2, 2), dtype=np.float32),
+        query_heatmap_targets=np.zeros((1, 2, 2), dtype=np.float32),
+        render_heatmap_targets=np.zeros((1, 2, 2), dtype=np.float32),
+        query_rgb_images=np.zeros((1, 3, 16, 16), dtype=np.float32),
+        render_rgb_images=np.zeros((1, 3, 16, 16), dtype=np.float32),
+        sample_pair_indices=np.zeros((1,), dtype=np.int64),
+        query_cell_indices=np.asarray([1], dtype=np.int64),
+        render_cell_indices=np.asarray([2], dtype=np.int64),
+        fine_sample_pair_indices=np.zeros((1,), dtype=np.int64),
+        fine_query_cell_indices=np.asarray([1], dtype=np.int64),
+        fine_render_cell_indices=np.asarray([2], dtype=np.int64),
+        fine_query_offset_labels=np.asarray([9], dtype=np.int64),
+        fine_render_offset_labels=np.asarray([10], dtype=np.int64),
+        fine_query_xy=np.asarray([[100.0, 100.0]], dtype=np.float64),
+        fine_render_xy=np.asarray([[100.0, 100.0]], dtype=np.float64),
+    )
+    model = CapturePatchCorrModel()
+
+    loss, metrics = joint_training._patch_corr_fine_loss(
+        model,
+        samples,
+        config=MatchaJointTrainingConfig(
+            output_dim=4,
+            residual_hidden_dim=8,
+            patch_corr_fine_epe_weight=0.0,
+            patch_corr_fine_detach_context=False,
+            device="cpu",
+        ),
+        device=torch.device("cpu"),
+    )
+
+    assert loss is not None
+    assert metrics["valid_count"] == 2.0
+    assert metrics["render_valid_count"] == 1.0
+    assert metrics["query_valid_count"] == 1.0
+    assert len(model.query_xy_calls) == 2
+    np.testing.assert_allclose(model.query_xy_calls[0].numpy(), np.asarray([[9.5, 1.5]], dtype=np.float32))
+    np.testing.assert_allclose(model.query_xy_calls[1].numpy(), np.asarray([[2.5, 9.5]], dtype=np.float32))
+
+
+def test_patch_corr_fine_loss_chunks_dense_fine_samples() -> None:
+    class CapturePatchCorrModel:
+        def __init__(self) -> None:
+            self.batch_sizes: list[int] = []
+
+        def patch_corr_fine_logits_from_maps_and_rgb(
+            self,
+            _query_feature_maps,
+            _render_feature_maps,
+            _query_rgb_images,
+            _render_rgb_images,
+            _pair_indices,
+            _query_cell_indices,
+            _render_cell_indices,
+            *,
+            query_xy,
+        ):
+            self.batch_sizes.append(int(query_xy.shape[0]))
+            return torch.zeros((query_xy.shape[0], 64), dtype=torch.float32, device=query_xy.device)
+
+    count = 5
+    samples = MatchaJointTrainingSet(
+        coarse_fine_samples=MatchaCoarseFineTrainingSet(
+            query_features=np.zeros((count, 4), dtype=np.float32),
+            render_features=np.zeros((count, 4), dtype=np.float32),
+            query_offset_labels=np.zeros((count,), dtype=np.int64),
+            render_offset_labels=np.zeros((count,), dtype=np.int64),
+            negative_render_features=np.zeros((count, 0, 4), dtype=np.float32),
+            roundtrip_errors_px=np.zeros((count,), dtype=np.float32),
+        ),
+        query_feature_maps=np.zeros((1, 4, 2, 4), dtype=np.float32),
+        render_feature_maps=np.zeros((1, 4, 2, 4), dtype=np.float32),
+        query_heatmap_targets=np.zeros((1, 2, 4), dtype=np.float32),
+        render_heatmap_targets=np.zeros((1, 2, 4), dtype=np.float32),
+        query_rgb_images=np.zeros((1, 3, 16, 32), dtype=np.float32),
+        render_rgb_images=np.zeros((1, 3, 16, 32), dtype=np.float32),
+        sample_pair_indices=np.zeros((count,), dtype=np.int64),
+        query_cell_indices=np.arange(count, dtype=np.int64),
+        render_cell_indices=np.arange(count, dtype=np.int64),
+        fine_sample_pair_indices=np.zeros((count,), dtype=np.int64),
+        fine_query_cell_indices=np.arange(count, dtype=np.int64),
+        fine_render_cell_indices=np.arange(count, dtype=np.int64),
+        fine_query_offset_labels=np.arange(count, dtype=np.int64),
+        fine_render_offset_labels=np.arange(count, dtype=np.int64),
+    )
+    model = CapturePatchCorrModel()
+
+    loss, metrics = joint_training._patch_corr_fine_loss(
+        model,
+        samples,
+        config=MatchaJointTrainingConfig(
+            output_dim=4,
+            residual_hidden_dim=8,
+            patch_corr_fine_epe_weight=0.0,
+            patch_corr_fine_batch_size=2,
+            patch_corr_fine_detach_context=False,
+            device="cpu",
+        ),
+        device=torch.device("cpu"),
+    )
+
+    assert loss is not None
+    assert torch.isfinite(loss)
+    assert metrics["valid_count"] == 10.0
+    assert metrics["render_valid_count"] == 5.0
+    assert metrics["query_valid_count"] == 5.0
+    assert model.batch_sizes == [2, 2, 1, 2, 2, 1]
+
+
+def test_patch_corr_fine_loss_subsamples_dense_fine_samples_per_pair() -> None:
+    class CapturePatchCorrModel:
+        def __init__(self) -> None:
+            self.batch_sizes: list[int] = []
+
+        def patch_corr_fine_logits_from_maps_and_rgb(
+            self,
+            _query_feature_maps,
+            _render_feature_maps,
+            _query_rgb_images,
+            _render_rgb_images,
+            _pair_indices,
+            _query_cell_indices,
+            _render_cell_indices,
+            *,
+            query_xy,
+        ):
+            self.batch_sizes.append(int(query_xy.shape[0]))
+            return torch.zeros((query_xy.shape[0], 64), dtype=torch.float32, device=query_xy.device)
+
+    count = 5
+    samples = MatchaJointTrainingSet(
+        coarse_fine_samples=MatchaCoarseFineTrainingSet(
+            query_features=np.zeros((count, 4), dtype=np.float32),
+            render_features=np.zeros((count, 4), dtype=np.float32),
+            query_offset_labels=np.zeros((count,), dtype=np.int64),
+            render_offset_labels=np.zeros((count,), dtype=np.int64),
+            negative_render_features=np.zeros((count, 0, 4), dtype=np.float32),
+            roundtrip_errors_px=np.zeros((count,), dtype=np.float32),
+        ),
+        query_feature_maps=np.zeros((1, 4, 2, 4), dtype=np.float32),
+        render_feature_maps=np.zeros((1, 4, 2, 4), dtype=np.float32),
+        query_heatmap_targets=np.zeros((1, 2, 4), dtype=np.float32),
+        render_heatmap_targets=np.zeros((1, 2, 4), dtype=np.float32),
+        query_rgb_images=np.zeros((1, 3, 16, 32), dtype=np.float32),
+        render_rgb_images=np.zeros((1, 3, 16, 32), dtype=np.float32),
+        sample_pair_indices=np.zeros((count,), dtype=np.int64),
+        query_cell_indices=np.arange(count, dtype=np.int64),
+        render_cell_indices=np.arange(count, dtype=np.int64),
+        fine_sample_pair_indices=np.zeros((count,), dtype=np.int64),
+        fine_query_cell_indices=np.arange(count, dtype=np.int64),
+        fine_render_cell_indices=np.arange(count, dtype=np.int64),
+        fine_query_offset_labels=np.arange(count, dtype=np.int64),
+        fine_render_offset_labels=np.arange(count, dtype=np.int64),
+    )
+    model = CapturePatchCorrModel()
+
+    _loss, metrics = joint_training._patch_corr_fine_loss(
+        model,
+        samples,
+        config=MatchaJointTrainingConfig(
+            output_dim=4,
+            residual_hidden_dim=8,
+            patch_corr_fine_epe_weight=0.0,
+            patch_corr_fine_batch_size=2,
+            patch_corr_fine_max_samples_per_pair=3,
+            patch_corr_fine_detach_context=False,
+            device="cpu",
+        ),
+        device=torch.device("cpu"),
+        sample_seed=123,
+    )
+
+    assert metrics["valid_count"] == 6.0
+    assert metrics["render_valid_count"] == 3.0
+    assert metrics["query_valid_count"] == 3.0
+    assert model.batch_sizes == [2, 1, 2, 1]
 
 
 def test_build_matcha_joint_training_set_adds_repeatability_and_match_masks() -> None:
@@ -455,6 +967,39 @@ def test_build_matcha_joint_training_set_adds_repeatability_and_match_masks() ->
     assert samples.render_repeatability_targets is not None
     assert np.max(samples.query_repeatability_targets) <= 1.0
     assert np.max(samples.render_repeatability_targets) <= 1.0
+
+
+def test_pose_confidence_targets_from_reprojection_errors_are_soft_inlier_labels() -> None:
+    targets = pose_confidence_targets_from_reprojection_errors(
+        np.asarray([0.0, 4.0, 8.0, 12.0, 16.0, np.inf], dtype=np.float32),
+        positive_threshold_px=4.0,
+        negative_threshold_px=12.0,
+    )
+
+    np.testing.assert_allclose(
+        targets,
+        np.asarray([1.0, 1.0, 0.5, 0.0, 0.0, 0.0], dtype=np.float32),
+        atol=1e-6,
+    )
+
+
+def test_freeze_descriptor_keeps_non_head_batchnorm_eval_but_heads_train() -> None:
+    class Toy(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.descriptor_bn = torch.nn.BatchNorm1d(2)
+            self.pair_confidence_head = torch.nn.Sequential(torch.nn.BatchNorm1d(2))
+
+    model = Toy().train()
+
+    _set_frozen_descriptor_batchnorm_eval(model, freeze=True)
+
+    assert model.descriptor_bn.training is False
+    assert model.pair_confidence_head[0].training is True
+
+    _set_frozen_descriptor_batchnorm_eval(model, freeze=False)
+
+    assert model.descriptor_bn.training is True
 
 
 def test_coarse_fine_confidence_bce_skips_confidence_ignored_rows() -> None:
@@ -498,6 +1043,90 @@ def test_coarse_fine_confidence_bce_skips_confidence_ignored_rows() -> None:
         torch.zeros(3),
     )
     assert torch.allclose(loss, expected_pos + expected_neg)
+
+
+def test_coarse_candidate_rank_loss_penalizes_hard_negative_cells() -> None:
+    samples = MatchaCoarseFineTrainingSet(
+        query_features=np.asarray([[1.0, 0.0], [1.0, 0.0]], dtype=np.float32),
+        render_features=np.asarray([[0.0, 1.0], [0.0, 1.0]], dtype=np.float32),
+        query_offset_labels=np.zeros((2,), dtype=np.int64),
+        render_offset_labels=np.zeros((2,), dtype=np.int64),
+        negative_render_features=np.asarray(
+            [
+                [[1.0, 0.0]],
+                [[1.0, 0.0]],
+            ],
+            dtype=np.float32,
+        ),
+        roundtrip_errors_px=np.zeros((2,), dtype=np.float32),
+    )
+    config = MatchaJointTrainingConfig(
+        output_dim=2,
+        residual_hidden_dim=4,
+        batch_size=2,
+        dual_softmax_weight=0.0,
+        offset_loss_weight=0.0,
+        pair_fine_loss_weight=0.0,
+        query_pair_fine_loss_weight=0.0,
+        pair_confidence_loss_weight=0.0,
+        hard_negative_weight=0.0,
+        coarse_candidate_rank_loss_weight=1.0,
+        coarse_candidate_rank_margin=0.25,
+        group_size=1,
+    )
+
+    loss, state = joint_training._coarse_fine_loss(
+        _ConfidenceOnlyModel(),
+        samples,
+        np.arange(2, dtype=np.int64),
+        config,
+        torch.device("cpu"),
+    )
+
+    assert torch.allclose(loss, torch.tensor(1.25))
+    assert torch.allclose(state["coarse_candidate_rank_loss"], torch.tensor(1.25))
+    assert torch.allclose(state["coarse_candidate_rank_top1_acc"], torch.tensor(0.0))
+    assert torch.allclose(state["coarse_candidate_rank_positive_score_mean"], torch.tensor(0.0))
+    assert torch.allclose(state["coarse_candidate_rank_hard_negative_score_mean"], torch.tensor(1.0))
+
+
+def test_train_matcha_joint_model_reports_coarse_candidate_rank_metrics() -> None:
+    samples = MatchaJointTrainingSet(
+        coarse_fine_samples=MatchaCoarseFineTrainingSet(
+            query_features=np.eye(4, dtype=np.float32),
+            render_features=np.eye(4, dtype=np.float32),
+            query_offset_labels=np.zeros((4,), dtype=np.int64),
+            render_offset_labels=np.zeros((4,), dtype=np.int64),
+            negative_render_features=np.roll(np.eye(4, dtype=np.float32), shift=1, axis=0)[:, None, :],
+            roundtrip_errors_px=np.zeros((4,), dtype=np.float32),
+        )
+    )
+
+    run = train_matcha_joint_model(
+        samples,
+        MatchaJointTrainingConfig(
+            output_dim=4,
+            residual_hidden_dim=8,
+            steps=1,
+            batch_size=4,
+            lr=1e-3,
+            dual_softmax_weight=0.0,
+            offset_loss_weight=0.0,
+            pair_fine_loss_weight=0.0,
+            query_pair_fine_loss_weight=0.0,
+            pair_confidence_loss_weight=0.0,
+            hard_negative_weight=0.0,
+            coarse_candidate_rank_loss_weight=0.5,
+            dense_heatmap_loss_weight=0.0,
+            rgb_keypoint_loss_weight=0.0,
+            group_size=2,
+            device="cpu",
+            seed=5,
+        ),
+    )
+
+    assert "coarse_candidate_rank_top1_acc" in run.summary
+    assert "coarse_candidate_rank_loss" in run.summary
 
 
 def test_no_match_confidence_loss_uses_sample_targets_for_pose_usable_rows() -> None:
@@ -552,8 +1181,10 @@ def test_index_only_joint_cache_round_trip_omits_row_descriptor_tensors(tmp_path
 
     loaded, metadata = load_matcha_joint_training_set_npz(cache_path)
     assert metadata["format"] == "vfm_matcha_joint_index_training_set_v2"
+    assert samples.coarse_fine_samples.metadata["supervision_source"] == "geometry_depth_pose"
     assert loaded.coarse_fine_samples.sample_count == 8
     assert loaded.coarse_fine_samples.input_dim == 8
+    assert loaded.coarse_fine_samples.metadata["supervision_source"] == "geometry_depth_pose"
     assert loaded.sample_no_match_labels is not None
     assert loaded.sample_no_match_labels.tolist() == [0, 0, 0, 0, 1, 1, 1, 1]
     assert loaded.coarse_fine_samples.query_features[[0, 4]].shape == (2, 8)
@@ -596,11 +1227,19 @@ def test_matcha_style_joint_model_forwards_all_matcha_heads() -> None:
     images = torch.rand(1, 3, 16, 32)
 
     descriptors, heatmap_logits, offset_logits = model.forward_feature_map(feature_maps)
+    local_window_logits = model.local_window_fine_logits_from_maps(
+        feature_maps,
+        feature_maps,
+        torch.asarray([0, 0], dtype=torch.long),
+        torch.asarray([0, 5], dtype=torch.long),
+        torch.asarray([0, 5], dtype=torch.long),
+    )
     keypoint_logits = model.forward_rgb_keypoints(images)
 
     assert descriptors.shape == (1, 8, 2, 4)
     assert heatmap_logits.shape == (1, 1, 2, 4)
     assert offset_logits.shape == (1, 65, 2, 4)
+    assert local_window_logits.shape == (2, 64)
     assert keypoint_logits.shape == (1, 65, 2, 4)
 
 
@@ -625,6 +1264,13 @@ def test_radio_dual_attention_fusion_model_splits_fine_and_coarse_maps() -> None
     keypoint_logits = model.forward_rgb_keypoints(images)
     query_z = descriptors.permute(0, 2, 3, 1).reshape(-1, 4)
     pair_logits = model.pair_fine_logits(query_z, query_z)
+    local_window_logits = model.local_window_fine_logits_from_maps(
+        feature_maps,
+        feature_maps,
+        torch.asarray([0, 0], dtype=torch.long),
+        torch.asarray([0, 3], dtype=torch.long),
+        torch.asarray([0, 3], dtype=torch.long),
+    )
     confidence_logits = model.pair_confidence_logits(query_z, query_z)
 
     assert descriptors.shape == (1, 4, 2, 2)
@@ -632,6 +1278,7 @@ def test_radio_dual_attention_fusion_model_splits_fine_and_coarse_maps() -> None
     assert offset_logits.shape == (1, 65, 2, 2)
     assert keypoint_logits.shape == (1, 65, 2, 2)
     assert pair_logits.shape == (4, 64)
+    assert local_window_logits.shape == (2, 64)
     assert confidence_logits.shape == (4,)
     norms = torch.linalg.norm(descriptors.reshape(4, -1), dim=0)
     assert torch.allclose(norms, torch.ones_like(norms), atol=1e-5)
@@ -720,6 +1367,70 @@ def test_radio_dual_attention_fusion_model_exposes_matcha_original_fine_and_coar
     assert confidence_logits.shape == (24,)
     assert torch.allclose(torch.linalg.norm(coarse_descriptors, dim=1), torch.ones(1, 4, 6), atol=1e-5)
     assert torch.allclose(torch.linalg.norm(fine_descriptors, dim=1), torch.ones(1, 4, 6), atol=1e-5)
+
+
+def test_radio_dual_attention_total_loss_uses_full_map_geometry_path(monkeypatch) -> None:
+    base_features = np.eye(4, dtype=np.float32)
+    fine_map = base_features.T.reshape(1, 4, 2, 2)
+    coarse_map = np.flip(fine_map, axis=1).copy()
+    feature_map = np.concatenate([fine_map, coarse_map], axis=1)
+    samples = MatchaJointTrainingSet(
+        coarse_fine_samples=MatchaCoarseFineTrainingSet(
+            query_features=np.concatenate([base_features, np.flip(base_features, axis=1).copy()], axis=1),
+            render_features=np.concatenate([base_features, np.flip(base_features, axis=1).copy()], axis=1),
+            query_offset_labels=np.asarray([0, 1, 2, 3], dtype=np.int64),
+            render_offset_labels=np.asarray([0, 1, 2, 3], dtype=np.int64),
+            negative_render_features=np.zeros((4, 0, 8), dtype=np.float32),
+            roundtrip_errors_px=np.zeros((4,), dtype=np.float32),
+        ),
+        query_feature_maps=feature_map,
+        render_feature_maps=feature_map.copy(),
+        query_heatmap_targets=np.ones((1, 2, 2), dtype=np.float32),
+        render_heatmap_targets=np.ones((1, 2, 2), dtype=np.float32),
+        sample_pair_indices=np.zeros((4,), dtype=np.int64),
+        query_cell_indices=np.asarray([0, 1, 2, 3], dtype=np.int64),
+        render_cell_indices=np.asarray([0, 1, 2, 3], dtype=np.int64),
+    )
+    config = MatchaJointTrainingConfig(
+        model_type="radio_dual_attention",
+        fine_input_dim=4,
+        coarse_input_dim=4,
+        output_dim=4,
+        residual_hidden_dim=8,
+        attention_hidden_dim=8,
+        attention_depth=1,
+        attention_heads=1,
+        attention_patch_size=1,
+        batch_size=4,
+        dual_softmax_weight=1.0,
+        offset_loss_weight=0.0,
+        pair_fine_loss_weight=0.0,
+        query_pair_fine_loss_weight=0.0,
+        pair_confidence_loss_weight=0.0,
+        dense_heatmap_loss_weight=0.0,
+        rgb_keypoint_loss_weight=0.0,
+        hard_negative_weight=0.0,
+        patch_correlation_loss_weight=0.0,
+        device="cpu",
+        seed=19,
+    )
+    model = joint_training._build_matcha_joint_model_for_samples(samples, config, torch.device("cpu"))
+
+    def forbidden_row_path(*_args, **_kwargs):
+        raise AssertionError("radio_dual_attention geometry loss must use full-map descriptors")
+
+    monkeypatch.setattr(model, "forward_rows", forbidden_row_path)
+    loss, metrics = joint_training._total_loss(
+        model,
+        samples,
+        np.arange(4, dtype=np.int64),
+        config,
+        torch.device("cpu"),
+        seed=19,
+    )
+
+    assert torch.isfinite(loss)
+    assert "map_correspondence_loss" in metrics
 
 
 def test_train_matcha_joint_model_optimizes_descriptor_heatmap_and_rgb_detector() -> None:
@@ -1050,6 +1761,290 @@ def test_local_patch_correlation_loss_ignores_boundary_windows() -> None:
     assert acc == 0.0
 
 
+def test_sample_local_window_descriptors_groups_repeated_pair_indices(monkeypatch) -> None:
+    descriptor_map = torch.arange(2 * 3 * 4 * 4, dtype=torch.float32).reshape(2, 3, 4, 4)
+    pair_indices = torch.asarray([0, 0, 0, 1, 1], dtype=torch.long)
+    cell_indices = torch.asarray([0, 5, 10, 3, 12], dtype=torch.long)
+    original_grid_sample = joint_training.F.grid_sample
+    input_batch_sizes: list[int] = []
+
+    def recording_grid_sample(input_tensor, grid, *args, **kwargs):
+        input_batch_sizes.append(int(input_tensor.shape[0]))
+        return original_grid_sample(input_tensor, grid, *args, **kwargs)
+
+    monkeypatch.setattr(joint_training.F, "grid_sample", recording_grid_sample)
+
+    reference = original_grid_sample(
+        descriptor_map[pair_indices],
+        torch.stack(
+            [
+                2.0
+                * (
+                    (cell_indices % 4).to(dtype=torch.float32)[:, None]
+                    + (
+                        (torch.arange(64, dtype=torch.float32) % 8)[None, :] + 0.5
+                    )
+                    / 8.0
+                    - 0.5
+                )
+                / 3.0
+                - 1.0,
+                2.0
+                * (
+                    torch.div(cell_indices, 4, rounding_mode="floor").to(dtype=torch.float32)[:, None]
+                    + (
+                        torch.div(torch.arange(64, dtype=torch.float32), 8, rounding_mode="floor")[None, :]
+                        + 0.5
+                    )
+                    / 8.0
+                    - 0.5
+                )
+                / 3.0
+                - 1.0,
+            ],
+            dim=-1,
+        ).reshape(5, 64, 1, 2),
+        mode="bilinear",
+        padding_mode="border",
+        align_corners=True,
+    ).squeeze(-1).transpose(1, 2).contiguous().reshape(5, 64, 3)
+    sampled = joint_training._sample_local_window_descriptors(
+        descriptor_map,
+        pair_indices,
+        cell_indices,
+    )
+
+    assert sampled.shape == (5, 64, 3)
+    assert torch.allclose(sampled, reference)
+    assert not input_batch_sizes or max(input_batch_sizes) == 1
+
+
+def test_local_window_fine_loss_uses_query_and_render_subcell_labels_and_ignores_dustbin() -> None:
+    feature_map = np.eye(8, dtype=np.float32).T.reshape(1, 8, 2, 4)
+    row_features = np.eye(8, dtype=np.float32)[:3]
+    samples = MatchaJointTrainingSet(
+        coarse_fine_samples=MatchaCoarseFineTrainingSet(
+            query_features=row_features,
+            render_features=row_features.copy(),
+            query_offset_labels=np.asarray([4, 5, 6], dtype=np.int64),
+            render_offset_labels=np.asarray([7, 64, 9], dtype=np.int64),
+            negative_render_features=np.zeros((3, 0, 8), dtype=np.float32),
+            roundtrip_errors_px=np.zeros((3,), dtype=np.float32),
+        ),
+        query_feature_maps=feature_map,
+        render_feature_maps=feature_map.copy(),
+        query_heatmap_targets=np.zeros((1, 2, 4), dtype=np.float32),
+        render_heatmap_targets=np.zeros((1, 2, 4), dtype=np.float32),
+        sample_pair_indices=np.zeros((3,), dtype=np.int64),
+        query_cell_indices=np.asarray([0, 1, 2], dtype=np.int64),
+        render_cell_indices=np.asarray([0, 1, 2], dtype=np.int64),
+    )
+    model = MatchaStyleJointModel(input_dim=8, output_dim=8, residual_hidden_dim=16, group_size=4)
+
+    loss, metrics = joint_training._local_window_fine_loss(
+        model,
+        samples,
+        np.arange(3, dtype=np.int64),
+        device=torch.device("cpu"),
+    )
+
+    assert loss is not None
+    assert torch.isfinite(loss)
+    assert metrics["valid_count"] == 5.0
+    assert 0.0 <= metrics["acc"] <= 1.0
+
+
+def test_local_window_fine_loss_prefers_dense_fine_supervision_labels() -> None:
+    feature_map = np.eye(8, dtype=np.float32).T.reshape(1, 8, 2, 4)
+    row_features = np.eye(8, dtype=np.float32)[:3]
+    samples = MatchaJointTrainingSet(
+        coarse_fine_samples=MatchaCoarseFineTrainingSet(
+            query_features=row_features,
+            render_features=row_features.copy(),
+            query_offset_labels=np.full((3,), 64, dtype=np.int64),
+            render_offset_labels=np.full((3,), 64, dtype=np.int64),
+            negative_render_features=np.zeros((3, 0, 8), dtype=np.float32),
+            roundtrip_errors_px=np.zeros((3,), dtype=np.float32),
+        ),
+        query_feature_maps=feature_map,
+        render_feature_maps=feature_map.copy(),
+        query_heatmap_targets=np.zeros((1, 2, 4), dtype=np.float32),
+        render_heatmap_targets=np.zeros((1, 2, 4), dtype=np.float32),
+        sample_pair_indices=np.zeros((3,), dtype=np.int64),
+        query_cell_indices=np.asarray([0, 1, 2], dtype=np.int64),
+        render_cell_indices=np.asarray([0, 1, 2], dtype=np.int64),
+        fine_sample_pair_indices=np.zeros((4,), dtype=np.int64),
+        fine_query_cell_indices=np.asarray([0, 0, 1, 2], dtype=np.int64),
+        fine_render_cell_indices=np.asarray([0, 0, 1, 2], dtype=np.int64),
+        fine_query_offset_labels=np.asarray([4, 5, 6, 7], dtype=np.int64),
+        fine_render_offset_labels=np.asarray([7, 64, 9, 10], dtype=np.int64),
+    )
+    model = MatchaStyleJointModel(input_dim=8, output_dim=8, residual_hidden_dim=16, group_size=4)
+
+    loss, metrics = joint_training._local_window_fine_loss(
+        model,
+        samples,
+        np.arange(3, dtype=np.int64),
+        device=torch.device("cpu"),
+    )
+
+    assert loss is not None
+    assert torch.isfinite(loss)
+    assert metrics["valid_count"] == 7.0
+
+
+def test_local_window_fine_loss_uses_dense_fine_validity_weights(monkeypatch) -> None:
+    feature_map = np.eye(8, dtype=np.float32).T.reshape(1, 8, 2, 4)
+    row_features = np.eye(8, dtype=np.float32)[:3]
+    weights = np.asarray([0.25, 1.0, 0.5], dtype=np.float32)
+    samples = MatchaJointTrainingSet(
+        coarse_fine_samples=MatchaCoarseFineTrainingSet(
+            query_features=row_features,
+            render_features=row_features.copy(),
+            query_offset_labels=np.full((3,), 64, dtype=np.int64),
+            render_offset_labels=np.full((3,), 64, dtype=np.int64),
+            negative_render_features=np.zeros((3, 0, 8), dtype=np.float32),
+            roundtrip_errors_px=np.zeros((3,), dtype=np.float32),
+        ),
+        query_feature_maps=feature_map,
+        render_feature_maps=feature_map.copy(),
+        query_heatmap_targets=np.zeros((1, 2, 4), dtype=np.float32),
+        render_heatmap_targets=np.zeros((1, 2, 4), dtype=np.float32),
+        sample_pair_indices=np.zeros((3,), dtype=np.int64),
+        query_cell_indices=np.asarray([0, 1, 2], dtype=np.int64),
+        render_cell_indices=np.asarray([0, 1, 2], dtype=np.int64),
+        fine_sample_pair_indices=np.zeros((3,), dtype=np.int64),
+        fine_query_cell_indices=np.asarray([0, 1, 2], dtype=np.int64),
+        fine_render_cell_indices=np.asarray([0, 1, 2], dtype=np.int64),
+        fine_query_offset_labels=np.asarray([4, 5, 6], dtype=np.int64),
+        fine_render_offset_labels=np.asarray([7, 8, 9], dtype=np.int64),
+        fine_validity_weight=weights,
+    )
+    captured: list[np.ndarray | None] = []
+
+    def fake_fine_loss(logits, labels, *, soft_targets=None, confidence=None, **_kwargs):
+        captured.append(None if confidence is None else confidence.detach().cpu().numpy())
+        return logits.sum() * 0.0 + 1.0, {"valid_count": float(labels.numel()), "acc": 1.0}
+
+    monkeypatch.setattr(joint_training, "_fine_coordinate_loss_and_metrics", fake_fine_loss)
+    model = MatchaStyleJointModel(input_dim=8, output_dim=8, residual_hidden_dim=16, group_size=4)
+
+    loss, metrics = joint_training._local_window_fine_loss(
+        model,
+        samples,
+        np.arange(3, dtype=np.int64),
+        device=torch.device("cpu"),
+    )
+
+    assert loss is not None
+    assert metrics["valid_count"] == 6.0
+    assert len(captured) == 2
+    assert captured[0] is not None
+    assert captured[1] is not None
+    np.testing.assert_allclose(captured[0], weights)
+    np.testing.assert_allclose(captured[1], weights)
+
+
+def test_local_window_fine_loss_reuses_feature_maps_for_bidirectional_supervision() -> None:
+    class CountingModel(MatchaStyleJointModel):
+        def __init__(self) -> None:
+            super().__init__(input_dim=8, output_dim=8, residual_hidden_dim=16, group_size=4)
+            self.forward_feature_map_calls = 0
+
+        def forward_feature_map(self, feature_maps: torch.Tensor):
+            self.forward_feature_map_calls += 1
+            return super().forward_feature_map(feature_maps)
+
+    feature_map = np.eye(8, dtype=np.float32).T.reshape(1, 8, 2, 4)
+    row_features = np.eye(8, dtype=np.float32)[:2]
+    samples = MatchaJointTrainingSet(
+        coarse_fine_samples=MatchaCoarseFineTrainingSet(
+            query_features=row_features,
+            render_features=row_features.copy(),
+            query_offset_labels=np.asarray([4, 5], dtype=np.int64),
+            render_offset_labels=np.asarray([7, 8], dtype=np.int64),
+            negative_render_features=np.zeros((2, 0, 8), dtype=np.float32),
+            roundtrip_errors_px=np.zeros((2,), dtype=np.float32),
+        ),
+        query_feature_maps=feature_map,
+        render_feature_maps=feature_map.copy(),
+        query_heatmap_targets=np.zeros((1, 2, 4), dtype=np.float32),
+        render_heatmap_targets=np.zeros((1, 2, 4), dtype=np.float32),
+        sample_pair_indices=np.zeros((2,), dtype=np.int64),
+        query_cell_indices=np.asarray([0, 1], dtype=np.int64),
+        render_cell_indices=np.asarray([0, 1], dtype=np.int64),
+    )
+    model = CountingModel()
+
+    loss, metrics = joint_training._local_window_fine_loss(
+        model,
+        samples,
+        np.arange(2, dtype=np.int64),
+        device=torch.device("cpu"),
+    )
+
+    assert loss is not None
+    assert metrics["valid_count"] == 4.0
+    assert model.forward_feature_map_calls == 2
+
+
+def test_total_loss_reports_local_window_fine_metrics_when_enabled() -> None:
+    feature_map = np.eye(8, dtype=np.float32).T.reshape(1, 8, 2, 4)
+    row_features = np.eye(8, dtype=np.float32)[:4]
+    samples = MatchaJointTrainingSet(
+        coarse_fine_samples=MatchaCoarseFineTrainingSet(
+            query_features=row_features,
+            render_features=row_features.copy(),
+            query_offset_labels=np.asarray([0, 1, 2, 3], dtype=np.int64),
+            render_offset_labels=np.asarray([7, 8, 9, 10], dtype=np.int64),
+            negative_render_features=np.zeros((4, 0, 8), dtype=np.float32),
+            roundtrip_errors_px=np.zeros((4,), dtype=np.float32),
+        ),
+        query_feature_maps=feature_map,
+        render_feature_maps=feature_map.copy(),
+        query_heatmap_targets=np.zeros((1, 2, 4), dtype=np.float32),
+        render_heatmap_targets=np.zeros((1, 2, 4), dtype=np.float32),
+        sample_pair_indices=np.zeros((4,), dtype=np.int64),
+        query_cell_indices=np.asarray([0, 1, 2, 3], dtype=np.int64),
+        render_cell_indices=np.asarray([0, 1, 2, 3], dtype=np.int64),
+    )
+    config = MatchaJointTrainingConfig(
+        output_dim=8,
+        residual_hidden_dim=16,
+        steps=1,
+        batch_size=4,
+        dual_softmax_weight=0.0,
+        offset_loss_weight=0.0,
+        pair_fine_loss_weight=0.0,
+        query_pair_fine_loss_weight=0.0,
+        pair_confidence_loss_weight=0.0,
+        dense_heatmap_loss_weight=0.0,
+        rgb_keypoint_loss_weight=0.0,
+        local_window_fine_loss_weight=1.0,
+        hard_negative_weight=0.0,
+        group_size=4,
+        device="cpu",
+    )
+    model = MatchaStyleJointModel(input_dim=8, output_dim=8, residual_hidden_dim=16, group_size=4)
+
+    loss, metrics = joint_training._total_loss(
+        model,
+        samples,
+        np.arange(4, dtype=np.int64),
+        config,
+        torch.device("cpu"),
+        seed=4,
+    )
+
+    assert torch.isfinite(loss)
+    assert "local_window_fine_loss" in metrics
+    assert metrics["local_window_fine_valid_count"] == 8.0
+    assert metrics["local_window_fine_query_valid_count"] == 4.0
+    assert metrics["local_window_fine_render_valid_count"] == 4.0
+    assert "local_window_fine_epe_bins" in metrics
+    assert "local_window_fine_uncertainty_bins" in metrics
+
+
 def test_matcha_rgb_keypoint_position_loss_uses_valid_correspondence_mask() -> None:
     query_logits = torch.full((1, 65, 1, 2), -10.0)
     render_logits = torch.full((1, 65, 1, 2), -10.0)
@@ -1211,6 +2206,31 @@ def test_matcha_joint_training_set_npz_round_trip(tmp_path) -> None:
     assert loaded.query_feature_maps.shape == (1, 8, 2, 4)
     assert loaded.query_rgb_keypoint_labels is not None
     assert loaded.query_rgb_keypoint_labels[0, 0, 0] == 36
+
+
+def test_matcha_joint_training_set_npz_can_save_uncompressed(tmp_path) -> None:
+    feature_map = np.eye(8, dtype=np.float32).T.reshape(1, 8, 2, 4)
+    heatmap_target = np.zeros((1, 2, 4), dtype=np.float32)
+    original = MatchaJointTrainingSet(
+        coarse_fine_samples=_toy_samples(),
+        query_feature_maps=feature_map,
+        render_feature_maps=feature_map.copy(),
+        query_heatmap_targets=heatmap_target,
+        render_heatmap_targets=heatmap_target.copy(),
+    )
+
+    path = tmp_path / "joint_cache_uncompressed.npz"
+    save_matcha_joint_training_set_npz(original, path, compressed=False)
+    loaded, metadata = load_matcha_joint_training_set_npz(path)
+
+    with zipfile.ZipFile(path) as archive:
+        compression_types = {info.compress_type for info in archive.infolist()}
+
+    assert compression_types == {zipfile.ZIP_STORED}
+    assert metadata["format"] == "vfm_matcha_joint_training_set_v1"
+    assert loaded.coarse_fine_samples.sample_count == original.coarse_fine_samples.sample_count
+    assert loaded.query_feature_maps is not None
+    assert loaded.query_feature_maps.shape == (1, 8, 2, 4)
 
 
 def test_matcha_joint_training_set_npz_round_trip_perturbation_fields(tmp_path) -> None:
@@ -1760,6 +2780,7 @@ def test_full_joint_cache_builder_creates_heatmaps_indices_and_rgb_labels() -> N
 
     assert samples.coarse_fine_samples.sample_count == 8
     assert samples.coarse_fine_samples.metadata["positive_match_count"] == 4
+    assert samples.coarse_fine_samples.metadata["supervision_source"] == "geometry_depth_pose"
     assert samples.coarse_fine_samples.metadata["no_match_count"] == 4
     assert samples.sample_no_match_labels is not None
     assert samples.sample_no_match_labels.tolist() == [0, 0, 0, 0, 1, 1, 1, 1]

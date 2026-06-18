@@ -375,6 +375,16 @@ class QueryTo3DMatch:
     patch_offset_consistency_after_px: float | None = None
     token_match_rank: int | None = None
     measurement_sigma_px: float | None = None
+    render_xy: np.ndarray | None = None
+    base_render_index: int | None = None
+    candidate_render_index: int | None = None
+    candidate_id: int | None = None
+    coarse_rank: int | None = None
+    coarse_score: float | None = None
+    coarse_score_gap: float | None = None
+    mutual_rank: int | None = None
+    cell_delta_x: int | None = None
+    cell_delta_y: int | None = None
 
 
 @dataclass(frozen=True)
@@ -760,6 +770,8 @@ def _soft_pnp_score(match: QueryTo3DMatch, mode: str) -> float:
         confidence = _sigmoid(float(match.pairwise_inlier_logit))
     elif match.pairwise_inlier_logprob is not None:
         confidence = float(np.clip(np.exp(float(match.pairwise_inlier_logprob)), 0.0, 1.0))
+    elif match.pnp_soft_score is not None:
+        confidence = float(np.clip(float(match.pnp_soft_score), 0.0, 1.0))
     else:
         confidence = 1.0
     sigma = 1.0

@@ -63,6 +63,37 @@ def test_descriptor_retrieval_bank_uses_descriptor_order_and_pose_labels(tmp_pat
     assert bank.candidates[0].metadata["pose_label_uses_gt"] is True
 
 
+def test_descriptor_retrieval_bank_supports_chunked_topk_scoring(tmp_path):
+    pose_file = tmp_path / "poses.txt"
+    _write_poses(pose_file)
+    query_descriptors = TokenDescriptorBank(
+        image_ids=("q0.png",),
+        descriptors=np.asarray([[1.0, 0.0]], dtype=np.float32),
+        layer_name="radio_final",
+        pooling="vlad",
+    )
+    map_descriptors = TokenDescriptorBank(
+        image_ids=("r0.png", "r1.png"),
+        descriptors=np.asarray([[0.2, 0.8], [0.9, 0.1]], dtype=np.float32),
+        layer_name="radio_final",
+        pooling="vlad",
+    )
+
+    bank = build_descriptor_retrieval_reference_pose_bank(
+        query_descriptors=query_descriptors,
+        map_descriptors=map_descriptors,
+        query_pose_file=pose_file,
+        reference_pose_file=pose_file,
+        protocol_name="descriptor_retrieval_train",
+        top_k=2,
+        score_block_size=1,
+    )
+
+    assert [candidate.reference_image for candidate in bank.candidates] == ["r1.png", "r0.png"]
+    assert bank.candidates[0].metadata["descriptor_pooling"] == "vlad"
+    assert bank.candidates[0].metadata["score_block_size"] == 1
+
+
 def test_descriptor_retrieval_bank_cli_writes_jsonl(tmp_path):
     pose_file = tmp_path / "poses.txt"
     query_npz = tmp_path / "query.npz"
@@ -98,6 +129,8 @@ def test_descriptor_retrieval_bank_cli_writes_jsonl(tmp_path):
             "--protocol_name",
             "descriptor_retrieval_train",
             "--top_k",
+            "1",
+            "--score_block_size",
             "1",
             "--output",
             str(output),

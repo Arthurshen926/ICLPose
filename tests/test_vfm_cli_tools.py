@@ -1,6 +1,7 @@
 import json
 import subprocess
 import sys
+from pathlib import Path
 
 import numpy as np
 
@@ -181,6 +182,170 @@ def test_build_token_descriptor_bank_cli(tmp_path):
     with np.load(output, allow_pickle=True) as data:
         assert data["image_ids"].tolist() == ["q0"]
         np.testing.assert_allclose(data["descriptors"], np.asarray([[1.0, 0.0]], dtype=np.float32))
+
+
+def test_build_token_descriptor_bank_cli_supports_vlad_pooling(tmp_path):
+    token_dir = tmp_path / "tokens"
+    token_dir.mkdir()
+    np.savez_compressed(
+        token_dir / "q0.npz",
+        radio_final=np.asarray([[[1.0, 0.4]], [[0.0, 0.6]]], dtype=np.float32),
+    )
+    np.savez_compressed(
+        token_dir / "q1.npz",
+        radio_final=np.asarray([[[0.0, 0.6]], [[1.0, 0.4]]], dtype=np.float32),
+    )
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "records": [
+                    {
+                        "image_id": "q0",
+                        "token_path": str(token_dir / "q0.npz"),
+                        "layers": [{"name": "radio_final", "model": "c-radio_v4-h", "layer": "final", "channels": 2, "stride": 16}],
+                        "split": "test",
+                        "scene": "Synthetic",
+                        "checksum": "",
+                        "metadata": {},
+                    },
+                    {
+                        "image_id": "q1",
+                        "token_path": str(token_dir / "q1.npz"),
+                        "layers": [{"name": "radio_final", "model": "c-radio_v4-h", "layer": "final", "channels": 2, "stride": 16}],
+                        "split": "test",
+                        "scene": "Synthetic",
+                        "checksum": "",
+                        "metadata": {},
+                    },
+                ]
+            }
+        )
+    )
+    output = tmp_path / "vlad_descriptors.npz"
+
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "feature_extract.tools.vfm.build_token_descriptor_bank",
+            "--manifest",
+            str(manifest),
+            "--layer_name",
+            "radio_final",
+            "--pooling",
+            "vlad",
+            "--vlad_clusters",
+            "2",
+            "--vlad_iterations",
+            "4",
+            "--output",
+            str(output),
+        ],
+        check=True,
+    )
+
+    with np.load(output, allow_pickle=True) as data:
+        descriptors = np.asarray(data["descriptors"], dtype=np.float32)
+        metadata = json.loads(str(data["metadata_json"].tolist()))
+    assert descriptors.shape == (2, 4)
+    np.testing.assert_allclose(np.linalg.norm(descriptors, axis=1), np.ones(2), atol=1e-5)
+    assert float(descriptors[0] @ descriptors[1]) < 0.5
+    assert metadata["pooling"] == "vlad"
+    assert metadata["metadata"]["vlad_clusters"] == 2
+
+
+def test_build_token_descriptor_bank_cli_reuses_vlad_codebook(tmp_path):
+    token_dir = tmp_path / "tokens"
+    token_dir.mkdir()
+    for image_id, values in {
+        "db0": np.asarray([[[1.0, 0.4]], [[0.0, 0.6]]], dtype=np.float32),
+        "db1": np.asarray([[[0.0, 0.6]], [[1.0, 0.4]]], dtype=np.float32),
+        "q0": np.asarray([[[0.9, 0.5]], [[0.1, 0.5]]], dtype=np.float32),
+    }.items():
+        np.savez_compressed(token_dir / f"{image_id}.npz", radio_final=values)
+
+    def write_manifest(path: Path, image_ids) -> None:
+        path.write_text(
+            json.dumps(
+                {
+                    "records": [
+                        {
+                            "image_id": image_id,
+                            "token_path": str(token_dir / f"{image_id}.npz"),
+                            "layers": [{"name": "radio_final", "model": "c-radio_v4-h", "layer": "final", "channels": 2, "stride": 16}],
+                            "split": "test",
+                            "scene": "Synthetic",
+                            "checksum": "",
+                            "metadata": {},
+                        }
+                        for image_id in image_ids
+                    ]
+                }
+            )
+        )
+
+    db_manifest = tmp_path / "db_manifest.json"
+    query_manifest = tmp_path / "query_manifest.json"
+    write_manifest(db_manifest, ["db0", "db1"])
+    write_manifest(query_manifest, ["q0"])
+    codebook = tmp_path / "vlad_codebook.npz"
+    db_output = tmp_path / "db_vlad.npz"
+    query_output = tmp_path / "query_vlad.npz"
+
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "feature_extract.tools.vfm.build_token_descriptor_bank",
+            "--manifest",
+            str(db_manifest),
+            "--layer_name",
+            "radio_final",
+            "--pooling",
+            "vlad",
+            "--vlad_clusters",
+            "2",
+            "--vlad_codebook_output",
+            str(codebook),
+            "--vlad_tokens_per_image",
+            "1",
+            "--output",
+            str(db_output),
+        ],
+        check=True,
+    )
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "feature_extract.tools.vfm.build_token_descriptor_bank",
+            "--manifest",
+            str(query_manifest),
+            "--layer_name",
+            "radio_final",
+            "--pooling",
+            "vlad",
+            "--vlad_codebook_input",
+            str(codebook),
+            "--vlad_tokens_per_image",
+            "1",
+            "--output",
+            str(query_output),
+        ],
+        check=True,
+    )
+
+    with np.load(codebook) as data:
+        assert data["centroids"].shape == (2, 2)
+    with np.load(db_output, allow_pickle=True) as data:
+        db_meta = json.loads(str(data["metadata_json"].tolist()))
+    with np.load(query_output, allow_pickle=True) as data:
+        query_meta = json.loads(str(data["metadata_json"].tolist()))
+    assert db_meta["metadata"]["vlad_codebook_output"] == str(codebook)
+    assert db_meta["metadata"]["vlad_tokens_per_image"] == 1
+    assert query_meta["metadata"]["vlad_codebook_input"] == str(codebook)
+    assert query_meta["metadata"]["vlad_tokens_per_image"] == 1
 
 
 def test_score_candidate_bank_descriptors_cli(tmp_path):

@@ -56,11 +56,82 @@ def parse_world_offset(text: str) -> np.ndarray:
     return np.asarray(parts, dtype=np.float64)
 
 
+def parse_rotation_offset_deg(text: str) -> np.ndarray:
+    parts = [float(item.strip()) for item in str(text).split(",") if item.strip()]
+    if len(parts) != 3:
+        raise ValueError("rotation offset must be formatted as rx,ry,rz degrees")
+    return np.asarray(parts, dtype=np.float64)
+
+
+def parse_rotation_search_offsets_deg(text: str) -> tuple[float, ...]:
+    raw = str(text).strip()
+    if not raw:
+        return ()
+    offsets = tuple(float(item.strip()) for item in raw.split(",") if item.strip())
+    if not offsets:
+        return ()
+    if not all(np.isfinite(offset) for offset in offsets):
+        raise ValueError("rotation search offsets must be finite degrees")
+    return offsets
+
+
 def translate_pose_world(pose_w2c: np.ndarray, offset_world: Sequence[float]) -> np.ndarray:
     pose = np.asarray(pose_w2c, dtype=np.float64).reshape(4, 4)
     offset = np.asarray(offset_world, dtype=np.float64).reshape(3)
     center = camera_center_from_pose_w2c(pose) + offset
     return pose_w2c_from_center_rotation(center, pose[:3, :3])
+
+
+def rotate_pose_camera_frame(pose_w2c: np.ndarray, rotation_deg_xyz: Sequence[float]) -> np.ndarray:
+    pose = np.asarray(pose_w2c, dtype=np.float64).reshape(4, 4)
+    rotation = np.asarray(rotation_deg_xyz, dtype=np.float64).reshape(3)
+    center = camera_center_from_pose_w2c(pose)
+    delta_rotation = _euler_xyz_to_rotation(rotation)
+    return pose_w2c_from_center_rotation(center, delta_rotation @ pose[:3, :3])
+
+
+def _format_rotation_candidate_offset_deg(value: float) -> str:
+    amount = float(value)
+    prefix = "m" if amount < 0.0 else "p" if amount > 0.0 else ""
+    return f"{prefix}{abs(amount):.3f}".replace(".", "p") + "deg"
+
+
+def expand_render_pose_rotation_candidates(
+    render_poses: Sequence[RenderPoseSelection],
+    *,
+    rotation_offsets_deg: Sequence[float],
+    axis: str,
+    gt_pose_w2c: np.ndarray,
+) -> list[RenderPoseSelection]:
+    """Expand each render pose into deterministic camera-frame rotation hypotheses."""
+
+    offsets = tuple(float(value) for value in rotation_offsets_deg)
+    if not offsets:
+        return list(render_poses)
+    axis_key = str(axis).lower()
+    axis_to_index = {"x": 0, "y": 1, "z": 2}
+    if axis_key not in axis_to_index:
+        raise ValueError("rotation search axis must be one of: x, y, z")
+    gt = np.asarray(gt_pose_w2c, dtype=np.float64).reshape(4, 4)
+    axis_index = axis_to_index[axis_key]
+    expanded: list[RenderPoseSelection] = []
+    for render_pose in render_poses:
+        for offset in offsets:
+            rotation = np.zeros((3,), dtype=np.float64)
+            rotation[axis_index] = float(offset)
+            pose = rotate_pose_camera_frame(render_pose.pose_w2c, rotation)
+            t_error, r_error = render_pose_error_fields(pose, gt)
+            expanded.append(
+                RenderPoseSelection(
+                    pose_w2c=pose,
+                    label=f"{render_pose.label}:rot_{axis_key}_{_format_rotation_candidate_offset_deg(offset)}",
+                    candidate_id=render_pose.candidate_id,
+                    reference_image=render_pose.reference_image,
+                    render_translation_error_m=t_error,
+                    render_rotation_error_deg=r_error,
+                )
+            )
+    return expanded
 
 
 def _stable_seed(seed: int, key: str) -> int:
@@ -173,6 +244,7 @@ def select_render_pose(
     *,
     mode: str,
     world_offset: np.ndarray | None = None,
+    rotation_offset_deg: np.ndarray | None = None,
     reference_top1: Mapping[str, CandidateHypothesis] | None = None,
 ) -> RenderPoseSelection:
     gt = np.asarray(gt_pose_w2c, dtype=np.float64).reshape(4, 4)
@@ -197,6 +269,19 @@ def select_render_pose(
             render_translation_error_m=t_error,
             render_rotation_error_deg=r_error,
         )
+    if mode == "gt_rotation_offset":
+        if rotation_offset_deg is None:
+            raise ValueError("mode=gt_rotation_offset requires rotation_offset_deg")
+        rotation = np.asarray(rotation_offset_deg, dtype=np.float64).reshape(3)
+        pose = rotate_pose_camera_frame(gt, rotation)
+        t_error, r_error = render_pose_error_fields(pose, gt)
+        label = f"gt_rotation_offset:{rotation[0]:.3f},{rotation[1]:.3f},{rotation[2]:.3f}"
+        return RenderPoseSelection(
+            pose_w2c=pose,
+            label=label,
+            render_translation_error_m=t_error,
+            render_rotation_error_deg=r_error,
+        )
     if mode == "reference_top1":
         reference_top1 = reference_top1 or {}
         candidate = reference_top1.get(str(query_id))
@@ -212,4 +297,4 @@ def select_render_pose(
             render_translation_error_m=t_error,
             render_rotation_error_deg=r_error,
         )
-    raise ValueError("render pose mode must be one of: gt, gt_offset, reference_top1")
+    raise ValueError("render pose mode must be one of: gt, gt_offset, gt_rotation_offset, reference_top1")

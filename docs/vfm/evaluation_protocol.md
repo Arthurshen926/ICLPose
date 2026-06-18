@@ -1,5 +1,11 @@
 # VFM-MapLoc Evaluation Protocol
 
+> **Historical reference.** This protocol belongs to the earlier VFM-MapLoc
+> selector/verifier line. It must not be used as the phase-1 gate for the active
+> 2DGS Synthetic RADIO-MATCHA mainline. Use
+> `docs/vfm/2dgs_synthetic_radio_matcha_status.md` for the current synthetic
+> MATCHA gates.
+
 ## Protocol Kinds
 
 Every artifact must declare exactly one protocol kind:

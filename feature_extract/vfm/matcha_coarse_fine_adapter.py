@@ -278,6 +278,12 @@ class MatchaCoarseFineAdapter(nn.Module):
             nn.GELU(),
             nn.Linear(int(residual_hidden_dim), 1),
         )
+        self.pair_fine_uncertainty_head = nn.Sequential(
+            nn.LayerNorm(pair_dim),
+            nn.Linear(pair_dim, int(residual_hidden_dim)),
+            nn.GELU(),
+            nn.Linear(int(residual_hidden_dim), 1),
+        )
         self.pair_fine_head = _OriginalMatchaFineMatcher(
             descriptor_dim=int(output_dim),
             hidden_dim=int(residual_hidden_dim),
@@ -319,6 +325,13 @@ class MatchaCoarseFineAdapter(nn.Module):
 
     def pair_confidence_logits(self, query_descriptors: torch.Tensor, render_descriptors: torch.Tensor) -> torch.Tensor:
         return self.pair_confidence_head(self.pair_features(query_descriptors, render_descriptors)).squeeze(-1)
+
+    def pair_fine_uncertainty_log_sigma(
+        self,
+        query_descriptors: torch.Tensor,
+        render_descriptors: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.pair_fine_uncertainty_head(self.pair_features(query_descriptors, render_descriptors)).squeeze(-1)
 
     def pair_fine_logits(self, query_descriptors: torch.Tensor, render_descriptors: torch.Tensor) -> torch.Tensor:
         return self.pair_fine_head(query_descriptors, render_descriptors)
@@ -477,7 +490,7 @@ def build_matcha_coarse_fine_training_set(
             query_keypoint_labels=qkp_labels,
             render_keypoint_features=rkp_features,
             render_keypoint_labels=rkp_labels,
-            metadata={"sample_count": 0},
+            metadata={"sample_count": 0, "supervision_source": str(getattr(supervision, "source", "geometry_depth_pose"))},
         )
     if np.max(supervision.query_indices, initial=-1) >= query_rows.shape[0]:
         raise ValueError("supervision query index exceeds query feature map size")
@@ -522,6 +535,7 @@ def build_matcha_coarse_fine_training_set(
         render_keypoint_labels=rkp_labels,
         metadata={
             "source": "matcha_coarse_supervision",
+            "supervision_source": str(getattr(supervision, "source", "geometry_depth_pose")),
             "sample_count": int(supervision.count),
             "hard_negatives_per_match": int(hard_negatives_per_match),
             "query_keypoint_sample_count": int(qkp_labels.shape[0]),
@@ -621,6 +635,9 @@ def _fine_coordinate_loss_and_metrics(
     soft_targets: torch.Tensor | None = None,
     confidence: torch.Tensor | None = None,
     confidence_acc_threshold: float = 0.1,
+    continuous_loss_weight: float = 0.0,
+    uncertainty_log_sigma: torch.Tensor | None = None,
+    uncertainty_loss_weight: float = 0.0,
 ) -> tuple[torch.Tensor | None, dict[str, float]]:
     """64-bin coordinate classification loss for matched feature pairs.
 
@@ -645,6 +662,10 @@ def _fine_coordinate_loss_and_metrics(
         confidence = confidence.detach().float().reshape(-1)
         if int(confidence.shape[0]) != int(logits.shape[0]):
             raise ValueError("fine matcher confidence must contain one value per logit row")
+    if uncertainty_log_sigma is not None:
+        uncertainty_log_sigma = uncertainty_log_sigma.float().reshape(-1)
+        if int(uncertainty_log_sigma.shape[0]) != int(logits.shape[0]):
+            raise ValueError("fine matcher uncertainty_log_sigma must contain one value per logit row")
     valid = (target >= 0) & (target < 64)
     valid_count = int(torch.count_nonzero(valid).detach().cpu().item())
     if valid_count == 0:
@@ -670,10 +691,83 @@ def _fine_coordinate_loss_and_metrics(
         acc_mask = valid & (confidence > float(confidence_acc_threshold))
         if not torch.any(acc_mask):
             acc_mask = valid
+    probs_for_loss = F.softmax(spatial_logits[valid], dim=1)
+    bins = 8
+    coords_for_loss = torch.arange(64, dtype=probs_for_loss.dtype, device=probs_for_loss.device)
+    bin_x_for_loss = torch.remainder(coords_for_loss, bins) + 0.5
+    bin_y_for_loss = torch.floor(coords_for_loss / bins) + 0.5
+    expected_x_for_loss = torch.sum(probs_for_loss * bin_x_for_loss[None], dim=1)
+    expected_y_for_loss = torch.sum(probs_for_loss * bin_y_for_loss[None], dim=1)
+    target_valid_for_loss = target[valid].to(probs_for_loss.device)
+    target_x_for_loss = torch.remainder(target_valid_for_loss, bins).to(probs_for_loss.dtype) + 0.5
+    target_y_for_loss = torch.floor(target_valid_for_loss.to(probs_for_loss.dtype) / float(bins)) + 0.5
+    continuous_epe = torch.sqrt(
+        torch.clamp(
+            (expected_x_for_loss - target_x_for_loss) ** 2 + (expected_y_for_loss - target_y_for_loss) ** 2,
+            min=1e-12,
+        )
+    )
+
+    def weighted_mean(values: torch.Tensor) -> torch.Tensor:
+        if confidence is None:
+            return torch.mean(values)
+        valid_weights = torch.clamp(confidence[valid].to(values.device), min=0.0)
+        weight_sum = torch.sum(valid_weights)
+        if float(weight_sum.detach().cpu().item()) <= 0.0:
+            return torch.mean(values)
+        return torch.sum(values * (valid_weights / weight_sum))
+
+    continuous_loss = weighted_mean(continuous_epe)
+    if float(continuous_loss_weight) > 0.0:
+        loss = loss + float(continuous_loss_weight) * continuous_loss
+    uncertainty_nll = None
+    learned_uncertainty = None
+    if uncertainty_log_sigma is not None and float(uncertainty_loss_weight) > 0.0:
+        log_sigma = torch.clamp(uncertainty_log_sigma[valid].to(continuous_epe.device), min=-5.0, max=5.0)
+        sigma = torch.exp(log_sigma).clamp_min(1e-6)
+        uncertainty_nll = weighted_mean(continuous_epe / sigma + log_sigma)
+        learned_uncertainty = weighted_mean(sigma)
+        loss = loss + float(uncertainty_loss_weight) * uncertainty_nll
     with torch.no_grad():
         predictions = torch.argmax(spatial_logits[acc_mask], dim=1)
         acc = float(torch.mean((predictions == target[acc_mask]).float()).detach().cpu().item())
-    return loss, {"valid_count": float(valid_count), "acc": acc}
+        probs = F.softmax(spatial_logits[valid], dim=1)
+        bins = 8
+        coords = torch.arange(64, dtype=probs.dtype, device=probs.device)
+        bin_x = torch.remainder(coords, bins) + 0.5
+        bin_y = torch.floor(coords / bins) + 0.5
+        expected_x = torch.sum(probs * bin_x[None], dim=1)
+        expected_y = torch.sum(probs * bin_y[None], dim=1)
+        target_valid = target[valid].to(probs.device)
+        target_x = torch.remainder(target_valid, bins).to(probs.dtype) + 0.5
+        target_y = torch.floor(target_valid.to(probs.dtype) / float(bins)) + 0.5
+        epe = torch.sqrt((expected_x - target_x) ** 2 + (expected_y - target_y) ** 2)
+        variance = torch.sum(probs * ((bin_x[None] - expected_x[:, None]) ** 2 + (bin_y[None] - expected_y[:, None]) ** 2), dim=1)
+        uncertainty = torch.sqrt(torch.clamp(variance, min=0.0))
+        if confidence is not None:
+            valid_weights = torch.clamp(confidence[valid].to(probs.device), min=0.0)
+            weight_sum = torch.sum(valid_weights)
+            if float(weight_sum.detach().cpu().item()) > 0.0:
+                epe_value = float(torch.sum(epe * (valid_weights / weight_sum)).detach().cpu().item())
+                uncertainty_value = float(torch.sum(uncertainty * (valid_weights / weight_sum)).detach().cpu().item())
+            else:
+                epe_value = float(torch.mean(epe).detach().cpu().item())
+                uncertainty_value = float(torch.mean(uncertainty).detach().cpu().item())
+        else:
+            epe_value = float(torch.mean(epe).detach().cpu().item())
+            uncertainty_value = float(torch.mean(uncertainty).detach().cpu().item())
+    metrics = {
+        "valid_count": float(valid_count),
+        "acc": acc,
+        "epe_bins": epe_value,
+        "uncertainty_bins": uncertainty_value,
+        "continuous_epe_bins": float(continuous_loss.detach().cpu().item()),
+    }
+    if uncertainty_nll is not None:
+        metrics["uncertainty_nll"] = float(uncertainty_nll.detach().cpu().item())
+    if learned_uncertainty is not None:
+        metrics["learned_uncertainty_bins"] = float(learned_uncertainty.detach().cpu().item())
+    return loss, metrics
 
 
 def _loss(

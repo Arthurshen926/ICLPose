@@ -7,6 +7,7 @@ import json
 import time
 from pathlib import Path
 from typing import Sequence
+import zipfile
 
 import numpy as np
 
@@ -83,19 +84,22 @@ def _load_or_render_rgb_depth_cache(
     """Load cached rendered RGB/depth/alpha or render and cache them."""
 
     if cache_path is not None and bool(skip_existing) and cache_path.exists():
-        with np.load(cache_path) as data:
-            return (
-                np.asarray(data["rgb"], dtype=np.uint8),
-                np.asarray(data["depth"], dtype=np.float32),
-                np.asarray(data["alpha"], dtype=np.float32),
-            )
+        try:
+            with np.load(cache_path) as data:
+                return (
+                    np.asarray(data["rgb"], dtype=np.uint8),
+                    np.asarray(data["depth"], dtype=np.float32),
+                    np.asarray(data["alpha"], dtype=np.float32),
+                )
+        except (OSError, ValueError, KeyError, zipfile.BadZipFile):
+            Path(cache_path).unlink(missing_ok=True)
     rgb, depth, alpha = render_fn()
     rgb = np.asarray(rgb, dtype=np.uint8)
     depth = np.asarray(depth, dtype=np.float32)
     alpha = np.asarray(alpha, dtype=np.float32)
     if cache_path is not None:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(cache_path, rgb=rgb, depth=depth, alpha=alpha)
+        _save_npz_compressed_atomic(cache_path, rgb=rgb, depth=depth, alpha=alpha)
     return rgb, depth, alpha
 
 
@@ -114,6 +118,15 @@ def _extract_radio_feature_from_rgb(rgb: np.ndarray, extractor) -> np.ndarray:
     tensor = torch.from_numpy(image).permute(2, 0, 1).unsqueeze(0)
     output = extractor.extract(tensor)
     return output["local"].detach().cpu().numpy().astype(np.float32, copy=False)
+
+
+def _save_npz_compressed_atomic(path: Path, **arrays: object) -> None:
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = output.with_name(f".{output.name}.tmp")
+    np.savez_compressed(tmp_path, **arrays)
+    generated = tmp_path if tmp_path.exists() else tmp_path.with_suffix(tmp_path.suffix + ".npz")
+    generated.replace(output)
 
 
 def _depth_field_from_rgb_source(source: GaussianRGBSource) -> GaussianVFMField:
@@ -174,12 +187,15 @@ def _load_or_extract_render_feature(
     skip_existing: bool,
 ) -> np.ndarray:
     if cache_path is not None and skip_existing and cache_path.exists():
-        with np.load(cache_path) as data:
-            return np.asarray(data[layer_name], dtype=np.float32)
+        try:
+            with np.load(cache_path) as data:
+                return np.asarray(data[layer_name], dtype=np.float32)
+        except (OSError, ValueError, KeyError, zipfile.BadZipFile):
+            Path(cache_path).unlink(missing_ok=True)
     feature = _extract_radio_feature_from_rgb(render_rgb, extractor)
     if cache_path is not None:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(cache_path, **{layer_name: feature})
+        _save_npz_compressed_atomic(cache_path, **{layer_name: feature})
     return feature
 
 

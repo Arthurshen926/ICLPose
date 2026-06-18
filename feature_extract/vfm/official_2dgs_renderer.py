@@ -185,37 +185,38 @@ def render_official_2dgs_rgb_depth(
     torch_device = torch.device(device)
     if torch_device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("official 2DGS rendering requested CUDA, but CUDA is unavailable")
-    means = torch.as_tensor(source.xyz, dtype=torch.float32, device=torch_device)
-    quats = torch.as_tensor(source.rotations, dtype=torch.float32, device=torch_device)
-    quats = torch.nn.functional.normalize(quats, dim=1)
-    scales2d = torch.as_tensor(source.log_scales_2d, dtype=torch.float32, device=torch_device).exp()
-    scales = torch.cat([scales2d, torch.ones((scales2d.shape[0], 1), dtype=scales2d.dtype, device=torch_device)], dim=1)
-    opacities = torch.sigmoid(torch.as_tensor(source.opacity_logits, dtype=torch.float32, device=torch_device).reshape(-1))
-    colors = torch.as_tensor(source.sh_features, dtype=torch.float32, device=torch_device)
-    viewmat = torch.as_tensor(np.asarray(pose_w2c, dtype=np.float32).reshape(4, 4), dtype=torch.float32, device=torch_device)
-    k_matrix = torch.as_tensor(scaled_camera_matrix(camera, int(width), int(height)), dtype=torch.float32, device=torch_device)
-    bg = torch.as_tensor(background, dtype=torch.float32, device=torch_device).reshape(4)
-    rendered, alphas, _normals, _surf_normals, _distort, _median_depth, _info = rasterization_2dgs(
-        means=means,
-        quats=quats,
-        scales=scales,
-        opacities=opacities,
-        colors=colors,
-        viewmats=viewmat[None],
-        Ks=k_matrix[None],
-        width=int(width),
-        height=int(height),
-        packed=False,
-        sh_degree=int(source.sh_degree),
-        backgrounds=bg[None],
-        near_plane=float(near_plane),
-        far_plane=float(far_plane),
-        render_mode="RGB+ED",
-    )
-    image = rendered[0].detach().cpu().numpy().astype(np.float32, copy=False)
+    with torch.inference_mode():
+        means = torch.as_tensor(source.xyz, dtype=torch.float32, device=torch_device)
+        quats = torch.as_tensor(source.rotations, dtype=torch.float32, device=torch_device)
+        quats = torch.nn.functional.normalize(quats, dim=1)
+        scales2d = torch.as_tensor(source.log_scales_2d, dtype=torch.float32, device=torch_device).exp()
+        scales = torch.cat([scales2d, torch.ones((scales2d.shape[0], 1), dtype=scales2d.dtype, device=torch_device)], dim=1)
+        opacities = torch.sigmoid(torch.as_tensor(source.opacity_logits, dtype=torch.float32, device=torch_device).reshape(-1))
+        colors = torch.as_tensor(source.sh_features, dtype=torch.float32, device=torch_device)
+        viewmat = torch.as_tensor(np.asarray(pose_w2c, dtype=np.float32).reshape(4, 4), dtype=torch.float32, device=torch_device)
+        k_matrix = torch.as_tensor(scaled_camera_matrix(camera, int(width), int(height)), dtype=torch.float32, device=torch_device)
+        bg = torch.as_tensor(background, dtype=torch.float32, device=torch_device).reshape(4)
+        rendered, alphas, _normals, _surf_normals, _distort, _median_depth, _info = rasterization_2dgs(
+            means=means,
+            quats=quats,
+            scales=scales,
+            opacities=opacities,
+            colors=colors,
+            viewmats=viewmat[None],
+            Ks=k_matrix[None],
+            width=int(width),
+            height=int(height),
+            packed=False,
+            sh_degree=int(source.sh_degree),
+            backgrounds=bg[None],
+            near_plane=float(near_plane),
+            far_plane=float(far_plane),
+            render_mode="RGB+ED",
+        )
+        image = rendered[0].detach().cpu().numpy().astype(np.float32, copy=False)
+        alpha = alphas[0].detach().cpu().numpy().astype(np.float32, copy=False)
     rgb = np.clip(image[..., :3], 0.0, 1.0)
     depth = image[..., 3].astype(np.float32, copy=False) if image.shape[-1] > 3 else np.zeros((int(height), int(width)), dtype=np.float32)
-    alpha = alphas[0].detach().cpu().numpy().astype(np.float32, copy=False)
     if alpha.ndim == 3:
         alpha = alpha[..., 0]
     return rgb, depth, alpha

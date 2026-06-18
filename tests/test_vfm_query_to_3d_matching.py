@@ -362,6 +362,35 @@ def test_soft_order_pnp_matches_keeps_matches_but_prioritizes_confident_inputs()
         soft_order_pnp_matches([base], mode="bad")
 
 
+def test_soft_order_pnp_matches_confidence_uses_render_match_confidence() -> None:
+    low = QueryTo3DMatch(
+        token_index=0,
+        xy=np.array([0.0, 0.0], dtype=np.float64),
+        track_id=1,
+        xyz=np.array([0.0, 0.0, 3.0], dtype=np.float64),
+        similarity=0.8,
+        ratio=0.5,
+        landmark_variance=0.1,
+        similarity_margin=0.1,
+        pnp_soft_score=0.1,
+    )
+    high = QueryTo3DMatch(
+        token_index=1,
+        xy=np.array([1.0, 0.0], dtype=np.float64),
+        track_id=2,
+        xyz=np.array([1.0, 0.0, 3.0], dtype=np.float64),
+        similarity=0.8,
+        ratio=0.5,
+        landmark_variance=0.1,
+        similarity_margin=0.1,
+        pnp_soft_score=0.9,
+    )
+
+    ordered = soft_order_pnp_matches([low, high], mode="confidence")
+
+    assert [match.track_id for match in ordered] == [2, 1]
+
+
 def test_soft_order_pnp_matches_uncertainty_penalizes_noisy_measurements() -> None:
     noisy = QueryTo3DMatch(
         token_index=0,

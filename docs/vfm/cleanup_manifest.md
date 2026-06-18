@@ -1,5 +1,11 @@
 # VFM Branch Cleanup Manifest
 
+> **Superseded mainline note.** This cleanup manifest documents the earlier
+> reset from RADIO/POFD/CPR exploration into VFM-MapLoc. The current branch has
+> been re-scoped again: 2DGS Synthetic RADIO-MATCHA is now the active phase-1
+> mainline. The retained VFM-MapLoc selector/verifier and 3D aggregation files
+> are historical references unless a newer document explicitly promotes them.
+
 The `vfm` branch removes the previous RADIO/POFD/CPR active mainline instead of
 archiving it in this branch.
 

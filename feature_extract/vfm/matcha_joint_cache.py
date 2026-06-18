@@ -9,9 +9,48 @@ from feature_extract.vfm.matcha_coarse_fine_adapter import (
     MatchaCoarseFineTrainingSet,
     build_matcha_coarse_fine_training_set,
 )
+from feature_extract.vfm.colmap_tracks import ColmapCamera
 from feature_extract.vfm.matcha_coarse_supervision import MatchaCoarseSupervision
+from feature_extract.vfm.matcha_coarse_supervision import _project_world_to_image
 from feature_extract.vfm.matcha_joint_training import IndexOnlyCoarseFineRows, MatchaJointTrainingSet
 from feature_extract.vfm.query_to_3d_matching import normalize_rows
+from feature_extract.vfm.rendered_keypoint_matching import (
+    _coarse_cell_centers_from_indices,
+    _sample_scalar_map,
+    backproject_depth_to_world,
+)
+
+
+def pose_confidence_targets_from_reprojection_errors(
+    reprojection_errors_px: np.ndarray,
+    *,
+    positive_threshold_px: float,
+    negative_threshold_px: float,
+) -> np.ndarray:
+    """Map GT-pose reprojection residuals to soft PnP inlier quality labels."""
+
+    positive = float(positive_threshold_px)
+    negative = float(negative_threshold_px)
+    if positive < 0.0:
+        raise ValueError("positive_threshold_px must be non-negative")
+    if negative < positive:
+        raise ValueError("negative_threshold_px must be >= positive_threshold_px")
+    residual = np.asarray(reprojection_errors_px, dtype=np.float32).reshape(-1)
+    target = np.zeros_like(residual, dtype=np.float32)
+    finite = np.isfinite(residual)
+    if not np.any(finite):
+        return target
+    if negative <= positive:
+        target[finite & (residual <= positive)] = 1.0
+        return target
+    target[finite] = np.clip((negative - residual[finite]) / (negative - positive), 0.0, 1.0)
+    target[finite & (residual <= positive)] = 1.0
+    target[finite & (residual >= negative)] = 0.0
+    return target.astype(np.float32, copy=False)
+
+
+def _supervision_source(supervision: MatchaCoarseSupervision) -> str:
+    return str(getattr(supervision, "source", "geometry_depth_pose"))
 
 
 def heatmap_targets_from_coarse_supervision(
@@ -86,7 +125,7 @@ def _label_bhw(label_map: np.ndarray | None) -> np.ndarray | None:
 
 
 def _rgb_to_bchw_float_if_labeled(rgb: np.ndarray | None, label_map: np.ndarray | None, *, grid_hw: tuple[int, int]) -> np.ndarray | None:
-    if rgb is None or label_map is None:
+    if rgb is None:
         return None
     return _rgb_to_bchw_float(rgb, grid_hw=grid_hw)
 
@@ -125,6 +164,60 @@ def _mine_negative_render_indices(
             order = np.resize(order, int(count))
         output[row] = order[: int(count)]
     return output
+
+
+def _pose_reprojection_errors_for_rows(
+    *,
+    query_xy: np.ndarray,
+    render_xy: np.ndarray,
+    render_depth: np.ndarray,
+    query_camera: ColmapCamera,
+    render_camera: ColmapCamera,
+    query_pose_w2c: np.ndarray,
+    render_pose_w2c: np.ndarray,
+) -> np.ndarray:
+    query_points = np.asarray(query_xy, dtype=np.float64).reshape(-1, 2)
+    render_points = np.asarray(render_xy, dtype=np.float64).reshape(-1, 2)
+    if query_points.shape != render_points.shape:
+        raise ValueError("query_xy and render_xy must have matching shape")
+    if query_points.shape[0] == 0:
+        return np.zeros((0,), dtype=np.float32)
+    depth_values, depth_valid = _sample_scalar_map(
+        np.asarray(render_depth, dtype=np.float32),
+        render_points,
+        int(render_camera.width),
+        int(render_camera.height),
+    )
+    world, world_valid = backproject_depth_to_world(
+        render_points,
+        depth_values,
+        render_camera,
+        np.asarray(render_pose_w2c, dtype=np.float64).reshape(4, 4),
+    )
+    projected, projected_valid = _project_world_to_image(
+        world,
+        query_camera,
+        np.asarray(query_pose_w2c, dtype=np.float64).reshape(4, 4),
+    )
+    valid = depth_valid & world_valid & projected_valid & np.isfinite(projected).all(axis=1)
+    residual = np.full((query_points.shape[0],), np.inf, dtype=np.float32)
+    residual[valid] = np.linalg.norm(projected[valid] - query_points[valid], axis=1).astype(np.float32, copy=False)
+    return residual
+
+
+def _cell_center_xy(
+    indices: np.ndarray,
+    *,
+    camera: ColmapCamera,
+    grid_hw: tuple[int, int],
+) -> np.ndarray:
+    return _coarse_cell_centers_from_indices(
+        np.asarray(indices, dtype=np.int64),
+        image_width=int(camera.width),
+        image_height=int(camera.height),
+        grid_width=int(grid_hw[1]),
+        grid_height=int(grid_hw[0]),
+    )
 
 
 def _same_query_render_exclusion_sets(query_indices: np.ndarray, render_indices: np.ndarray) -> tuple[np.ndarray, ...]:
@@ -199,6 +292,7 @@ def build_matcha_joint_training_set_from_maps(
         hard_negatives_per_match=int(hard_negatives_per_match),
         seed=int(seed),
     )
+    supervision_source = _supervision_source(supervision)
     positive_count = int(samples.sample_count)
     supervision_no_match_count = int(getattr(supervision, "no_match_count", 0))
     no_match_count = 0
@@ -269,6 +363,7 @@ def build_matcha_joint_training_set_from_maps(
             ),
             metadata={
                 **dict(samples.metadata or {}),
+                "supervision_source": supervision_source,
                 "positive_match_count": positive_count,
                 "supervision_no_match_count": supervision_no_match_count,
             },
@@ -341,6 +436,7 @@ def build_matcha_joint_training_set_from_maps(
             render_keypoint_labels=samples.render_keypoint_labels,
             metadata={
                 **dict(samples.metadata or {}),
+                "supervision_source": supervision_source,
                 "positive_match_count": positive_count,
                 "supervision_no_match_count": supervision_no_match_count,
                 "mined_no_match_count": positive_count,
@@ -411,12 +507,23 @@ def build_matcha_joint_index_training_set_from_maps(
     render_feature_map: np.ndarray,
     supervision: MatchaCoarseSupervision,
     *,
+    fine_supervision: MatchaCoarseSupervision | None = None,
+    fine_render_depth: np.ndarray | None = None,
+    fine_support_view_count: np.ndarray | None = None,
+    fine_validity_weight: np.ndarray | None = None,
     query_rgb: np.ndarray | None = None,
     render_rgb: np.ndarray | None = None,
     query_keypoint_label_map: np.ndarray | None = None,
     render_keypoint_label_map: np.ndarray | None = None,
     hard_negatives_per_match: int = 16,
     roundtrip_heatmap_threshold_px: float = 2.0,
+    pose_confidence_render_depth: np.ndarray | None = None,
+    pose_confidence_query_camera: ColmapCamera | None = None,
+    pose_confidence_render_camera: ColmapCamera | None = None,
+    pose_confidence_query_pose_w2c: np.ndarray | None = None,
+    pose_confidence_render_pose_w2c: np.ndarray | None = None,
+    pose_confidence_positive_threshold_px: float = 8.0,
+    pose_confidence_negative_threshold_px: float = 24.0,
 ) -> MatchaJointTrainingSet:
     """Build one index-only full-map joint training sample.
 
@@ -438,7 +545,25 @@ def build_matcha_joint_index_training_set_from_maps(
         raise ValueError("supervision query index exceeds query feature map size")
     if np.max(supervision.render_indices, initial=-1) >= render_rows.shape[0]:
         raise ValueError("supervision render index exceeds render feature map size")
+    if fine_supervision is not None:
+        if np.max(fine_supervision.query_indices, initial=-1) >= query_rows.shape[0]:
+            raise ValueError("fine_supervision query index exceeds query feature map size")
+        if np.max(fine_supervision.render_indices, initial=-1) >= render_rows.shape[0]:
+            raise ValueError("fine_supervision render index exceeds render feature map size")
+    fine_count = int(0 if fine_supervision is None else fine_supervision.count)
+
+    def fine_optional_1d(value: np.ndarray | None, *, dtype, default: float | int) -> np.ndarray | None:
+        if fine_supervision is None:
+            return None
+        if value is None:
+            return np.full((fine_count,), default, dtype=dtype)
+        arr = np.asarray(value, dtype=dtype).reshape(-1)
+        if arr.shape[0] != fine_count:
+            raise ValueError("fine v2 auxiliary arrays must contain one value per fine sample")
+        return arr
+
     positive_count = int(supervision.count)
+    supervision_source = _supervision_source(supervision)
     supervision_no_match_count = int(getattr(supervision, "no_match_count", 0))
     positive_query_indices = np.asarray(supervision.query_indices, dtype=np.int64)
     positive_render_indices = np.asarray(supervision.render_indices, dtype=np.int64)
@@ -516,6 +641,65 @@ def build_matcha_joint_index_training_set_from_maps(
         ],
         axis=0,
     )
+    confidence_label_source = "supervision"
+    if pose_confidence_render_depth is not None:
+        if (
+            pose_confidence_query_camera is None
+            or pose_confidence_render_camera is None
+            or pose_confidence_query_pose_w2c is None
+            or pose_confidence_render_pose_w2c is None
+        ):
+            raise ValueError("GT reprojection confidence labels require render depth, cameras, and query/render poses")
+        query_grid_hw = (int(query.shape[1]), int(query.shape[2]))
+        render_grid_hw = (int(render.shape[1]), int(render.shape[2]))
+        supervision_no_query_xy = _cell_center_xy(
+            supervision_no_query_indices,
+            camera=pose_confidence_query_camera,
+            grid_hw=query_grid_hw,
+        )
+        supervision_no_render_xy = _cell_center_xy(
+            supervision_no_render_indices,
+            camera=pose_confidence_render_camera,
+            grid_hw=render_grid_hw,
+        )
+        mined_query_xy = np.asarray(supervision.query_xy, dtype=np.float64)[:no_match_count]
+        mined_render_xy = _cell_center_xy(
+            negative_indices[:no_match_count, 0] if no_match_count else np.zeros((0,), dtype=np.int64),
+            camera=pose_confidence_render_camera,
+            grid_hw=render_grid_hw,
+        )
+        pose_query_xy = np.concatenate(
+            [
+                np.asarray(supervision.query_xy, dtype=np.float64),
+                supervision_no_query_xy,
+                mined_query_xy,
+            ],
+            axis=0,
+        )
+        pose_render_xy = np.concatenate(
+            [
+                np.asarray(supervision.render_xy, dtype=np.float64),
+                supervision_no_render_xy,
+                mined_render_xy,
+            ],
+            axis=0,
+        )
+        residuals = _pose_reprojection_errors_for_rows(
+            query_xy=pose_query_xy,
+            render_xy=pose_render_xy,
+            render_depth=np.asarray(pose_confidence_render_depth, dtype=np.float32),
+            query_camera=pose_confidence_query_camera,
+            render_camera=pose_confidence_render_camera,
+            query_pose_w2c=np.asarray(pose_confidence_query_pose_w2c, dtype=np.float64).reshape(4, 4),
+            render_pose_w2c=np.asarray(pose_confidence_render_pose_w2c, dtype=np.float64).reshape(4, 4),
+        )
+        confidence_targets = pose_confidence_targets_from_reprojection_errors(
+            residuals,
+            positive_threshold_px=float(pose_confidence_positive_threshold_px),
+            negative_threshold_px=float(pose_confidence_negative_threshold_px),
+        )
+        uncertainty_px = residuals.astype(np.float32, copy=False)
+        confidence_label_source = "gt_reprojection_residual"
     sample_pair_indices = np.zeros((positive_count + supervision_no_match_count + no_match_count,), dtype=np.int64)
     qheat, rheat = heatmap_targets_from_coarse_supervision(
         supervision,
@@ -539,12 +723,15 @@ def build_matcha_joint_index_training_set_from_maps(
         sample_pair_indices=sample_pair_indices,
         metadata={
             "source": "matcha_coarse_supervision_index_only",
+            "supervision_source": supervision_source,
             "sample_count": int(positive_count + supervision_no_match_count + no_match_count),
             "positive_match_count": int(positive_count),
             "supervision_no_match_count": int(supervision_no_match_count),
             "mined_no_match_count": int(no_match_count),
             "no_match_count": int(supervision_no_match_count + no_match_count),
+            "fine_supervision_count": int(0 if fine_supervision is None else fine_supervision.count),
             "hard_negatives_per_match": int(hard_negatives_per_match),
+            "confidence_label_source": str(confidence_label_source),
         },
     )
     return MatchaJointTrainingSet(
@@ -556,6 +743,48 @@ def build_matcha_joint_index_training_set_from_maps(
         sample_pair_indices=sample_pair_indices,
         query_cell_indices=query_cell_indices,
         render_cell_indices=render_cell_indices,
+        fine_sample_pair_indices=(
+            None if fine_supervision is None else np.zeros((int(fine_supervision.count),), dtype=np.int64)
+        ),
+        fine_query_cell_indices=(
+            None if fine_supervision is None else np.asarray(fine_supervision.query_indices, dtype=np.int64)
+        ),
+        fine_render_cell_indices=(
+            None if fine_supervision is None else np.asarray(fine_supervision.render_indices, dtype=np.int64)
+        ),
+        fine_query_offset_labels=(
+            None if fine_supervision is None else np.asarray(fine_supervision.query_offset_labels, dtype=np.int64)
+        ),
+        fine_render_offset_labels=(
+            None if fine_supervision is None else np.asarray(fine_supervision.render_offset_labels, dtype=np.int64)
+        ),
+        fine_query_offset_soft_labels=(
+            None if fine_supervision is None else np.asarray(fine_supervision.query_offset_soft_labels, dtype=np.float32)
+        ),
+        fine_render_offset_soft_labels=(
+            None if fine_supervision is None else np.asarray(fine_supervision.render_offset_soft_labels, dtype=np.float32)
+        ),
+        fine_query_xy=(
+            None if fine_supervision is None else np.asarray(fine_supervision.query_xy, dtype=np.float64)
+        ),
+        fine_render_xy=(
+            None if fine_supervision is None else np.asarray(fine_supervision.render_xy, dtype=np.float64)
+        ),
+        fine_render_depth=fine_optional_1d(fine_render_depth, dtype=np.float32, default=np.nan),
+        fine_support_view_count=fine_optional_1d(
+            fine_support_view_count
+            if fine_support_view_count is not None
+            else getattr(fine_supervision, "support_view_counts", None),
+            dtype=np.int64,
+            default=0,
+        ),
+        fine_validity_weight=fine_optional_1d(
+            fine_validity_weight
+            if fine_validity_weight is not None
+            else (None if fine_supervision is None else np.asarray(fine_supervision.confidence_targets, dtype=np.float32)),
+            dtype=np.float32,
+            default=1.0,
+        ),
         query_rgb_images=_rgb_to_bchw_float_if_labeled(
             query_rgb,
             query_keypoint_label_map,

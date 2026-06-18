@@ -12,6 +12,9 @@ from feature_extract.vfm.rendered_keypoint_matching import bilinear_sample_featu
 from feature_extract.vfm.rendered_keypoint_selector_samples import render_keypoints_to_world
 
 
+_GEOMETRY_SUPERVISION_SOURCES = frozenset({"geometry_depth_pose", "geometry_3dgs_multiview"})
+
+
 @dataclass(frozen=True)
 class MatchaCoarseSupervisionConfig:
     offset_bins: int = 8
@@ -69,8 +72,18 @@ class MatchaCoarseSupervision:
     no_match_reason_ids: np.ndarray | None = None
     no_match_confidence_targets: np.ndarray | None = None
     no_match_confidence_ignore_mask: np.ndarray | None = None
+    source: str = "geometry_depth_pose"
+    support_view_counts: np.ndarray | None = None
 
     def __post_init__(self) -> None:
+        source = str(self.source)
+        if "matcher" in source.lower():
+            raise ValueError("MATCHA coarse supervision source must be geometry-derived, not matcher-derived")
+        if source not in _GEOMETRY_SUPERVISION_SOURCES:
+            allowed = ", ".join(sorted(_GEOMETRY_SUPERVISION_SOURCES))
+            raise ValueError(f"MATCHA coarse supervision source must be one of: {allowed}")
+        object.__setattr__(self, "source", source)
+
         query_indices = np.asarray(self.query_indices, dtype=np.int64).reshape(-1)
         render_indices = np.asarray(self.render_indices, dtype=np.int64).reshape(-1)
         query_xy = np.asarray(self.query_xy, dtype=np.float64).reshape(-1, 2)
@@ -156,6 +169,14 @@ class MatchaCoarseSupervision:
         object.__setattr__(self, "no_match_reason_ids", no_reason)
         object.__setattr__(self, "no_match_confidence_targets", np.clip(no_confidence, 0.0, 1.0))
         object.__setattr__(self, "no_match_confidence_ignore_mask", no_confidence_ignore)
+        if self.support_view_counts is None:
+            support_counts = np.zeros((count,), dtype=np.int64)
+        else:
+            support_counts = np.asarray(self.support_view_counts, dtype=np.int64).reshape(-1)
+            if support_counts.shape[0] != count:
+                raise ValueError("support_view_counts must contain one value per match")
+            support_counts = np.maximum(support_counts, 0)
+        object.__setattr__(self, "support_view_counts", support_counts)
 
     @property
     def count(self) -> int:
@@ -175,6 +196,82 @@ def _empty_supervision() -> MatchaCoarseSupervision:
         query_offset_labels=np.zeros((0,), dtype=np.int64),
         render_offset_labels=np.zeros((0,), dtype=np.int64),
         roundtrip_errors_px=np.zeros((0,), dtype=np.float32),
+    )
+
+
+def merge_fine_labels_by_cell_pair(
+    coarse: MatchaCoarseSupervision,
+    fine: MatchaCoarseSupervision,
+) -> tuple[MatchaCoarseSupervision, int]:
+    """Copy geometry-validated fine labels without changing coarse pairs.
+
+    Sub-cell or detector seeds are useful fine supervision, but using them as
+    the coarse correspondence seed changes descriptor positives and can make
+    the coarse matcher chase seed jitter.  This helper keeps the stable coarse
+    query/render cell pairs.  Query-side labels are copied only when the same
+    query/render cell pair survived the fine-seed geometry pass; render-side
+    labels are copied by render cell because render refinement drives the 3D
+    sample used by PnP and does not require the sub-cell projection to remain
+    inside the center-derived query cell.
+    """
+
+    coarse_count = int(coarse.count)
+    fine_count = int(fine.count)
+    if coarse_count == 0 or fine_count == 0:
+        return coarse, 0
+    fine_by_pair: dict[tuple[int, int], int] = {}
+    fine_by_render: dict[int, int] = {}
+    for idx, (query_idx, render_idx) in enumerate(zip(fine.query_indices.tolist(), fine.render_indices.tolist())):
+        fine_by_pair.setdefault((int(query_idx), int(render_idx)), int(idx))
+        fine_by_render.setdefault(int(render_idx), int(idx))
+
+    query_labels = np.asarray(coarse.query_offset_labels, dtype=np.int64).copy()
+    render_labels = np.asarray(coarse.render_offset_labels, dtype=np.int64).copy()
+    query_soft = np.asarray(coarse.query_offset_soft_labels, dtype=np.float32).copy()
+    render_soft = np.asarray(coarse.render_offset_soft_labels, dtype=np.float32).copy()
+    transferred = 0
+    for idx, (query_idx, render_idx) in enumerate(zip(coarse.query_indices.tolist(), coarse.render_indices.tolist())):
+        copied = False
+        pair_fine_idx = fine_by_pair.get((int(query_idx), int(render_idx)))
+        if pair_fine_idx is not None:
+            query_labels[int(idx)] = int(fine.query_offset_labels[pair_fine_idx])
+            query_soft[int(idx)] = np.asarray(fine.query_offset_soft_labels[pair_fine_idx], dtype=np.float32)
+            copied = True
+        render_fine_idx = fine_by_render.get(int(render_idx))
+        if render_fine_idx is not None:
+            render_labels[int(idx)] = int(fine.render_offset_labels[render_fine_idx])
+            render_soft[int(idx)] = np.asarray(fine.render_offset_soft_labels[render_fine_idx], dtype=np.float32)
+            copied = True
+        if copied:
+            transferred += 1
+
+    if transferred == 0:
+        return coarse, 0
+    return (
+        MatchaCoarseSupervision(
+            query_indices=coarse.query_indices,
+            render_indices=coarse.render_indices,
+            query_xy=coarse.query_xy,
+            render_xy=coarse.render_xy,
+            query_offset_labels=query_labels,
+            render_offset_labels=render_labels,
+            roundtrip_errors_px=coarse.roundtrip_errors_px,
+            query_offset_soft_labels=query_soft,
+            render_offset_soft_labels=render_soft,
+            confidence_targets=coarse.confidence_targets,
+            confidence_ignore_mask=coarse.confidence_ignore_mask,
+            uncertainty_px=coarse.uncertainty_px,
+            no_match_query_indices=coarse.no_match_query_indices,
+            no_match_render_indices=coarse.no_match_render_indices,
+            no_match_query_offset_labels=coarse.no_match_query_offset_labels,
+            no_match_render_offset_labels=coarse.no_match_render_offset_labels,
+            no_match_roundtrip_errors_px=coarse.no_match_roundtrip_errors_px,
+            no_match_reason_ids=coarse.no_match_reason_ids,
+            no_match_confidence_targets=coarse.no_match_confidence_targets,
+            no_match_confidence_ignore_mask=coarse.no_match_confidence_ignore_mask,
+            source=coarse.source,
+        ),
+        int(transferred),
     )
 
 

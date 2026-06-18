@@ -23,6 +23,7 @@ class PoseHypothesisScore:
     confidence_mean: float
     coverage: float
     degeneracy_penalty: float
+    learned_probability: float | None = None
 
 
 def annotate_measurement_uncertainty(
@@ -43,6 +44,8 @@ def annotate_measurement_uncertainty(
     for match in matches:
         conf = 0.0 if match.pnp_soft_score is None else float(np.clip(match.pnp_soft_score, 0.0, 1.0))
         sigma = sigma0 * (1.0 + float(confidence_scale) * (1.0 - conf))
+        if match.patch_offset_sigma is not None and np.isfinite(float(match.patch_offset_sigma)):
+            sigma = min(float(sigma), max(float(match.patch_offset_sigma), float(min_sigma_px)))
         annotated.append(replace(match, measurement_sigma_px=max(float(sigma), float(min_sigma_px))))
     return annotated
 

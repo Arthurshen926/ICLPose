@@ -7,6 +7,7 @@ import json
 import time
 from pathlib import Path
 from typing import Sequence
+import zipfile
 
 import numpy as np
 
@@ -16,6 +17,7 @@ from feature_extract.tools.vfm.build_render_rgb_keypoint_adapter_samples import 
     _render_rgb_and_depth,
     _render_token_cache_path,
     _resolve_render_size,
+    _save_npz_compressed_atomic,
     _safe_image_stem,
     _select_records,
 )
@@ -255,8 +257,11 @@ def _load_or_extract_matcha_joint_feature(
     skip_existing: bool,
 ) -> np.ndarray:
     if cache_path is not None and bool(skip_existing) and cache_path.exists():
-        with np.load(cache_path) as data:
-            return np.asarray(data[layer_name], dtype=np.float32)
+        try:
+            with np.load(cache_path) as data:
+                return np.asarray(data[layer_name], dtype=np.float32)
+        except (OSError, ValueError, KeyError, zipfile.BadZipFile):
+            Path(cache_path).unlink(missing_ok=True)
     feature = _extract_matcha_joint_feature_from_rgb(
         rgb,
         extractor,
@@ -267,7 +272,7 @@ def _load_or_extract_matcha_joint_feature(
     )
     if cache_path is not None:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(cache_path, **{layer_name: feature})
+        _save_npz_compressed_atomic(cache_path, **{layer_name: feature})
     return feature
 
 

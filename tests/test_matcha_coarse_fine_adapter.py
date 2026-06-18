@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 import torch
 
 from feature_extract.vfm.matcha_coarse_fine_adapter import (
@@ -253,6 +254,31 @@ def test_fine_coordinate_loss_ignores_dustbin_and_uses_confidence_weights() -> N
     assert not torch.allclose(loss, torch.mean(per_row))
     assert metrics["valid_count"] == 2.0
     assert metrics["acc"] == 1.0
+    assert "epe_bins" in metrics
+    assert "uncertainty_bins" in metrics
+    assert metrics["epe_bins"] >= 0.0
+    assert metrics["uncertainty_bins"] >= 0.0
+
+
+def test_fine_coordinate_loss_trains_continuous_offset_and_learned_uncertainty() -> None:
+    logits = torch.full((2, 64), -6.0)
+    logits[0, 9] = 6.0
+    logits[1, 18] = 6.0
+    labels = torch.asarray([9, 18], dtype=torch.long)
+    learned_log_sigma = torch.zeros((2,), dtype=torch.float32)
+
+    loss, metrics = _fine_coordinate_loss_and_metrics(
+        logits,
+        labels,
+        continuous_loss_weight=0.25,
+        uncertainty_log_sigma=learned_log_sigma,
+        uncertainty_loss_weight=0.1,
+    )
+
+    assert loss is not None
+    assert metrics["continuous_epe_bins"] < 0.05
+    assert metrics["learned_uncertainty_bins"] == pytest.approx(1.0)
+    assert metrics["uncertainty_nll"] < 0.1
 
 
 def test_adapter_pair_fine_loss_ignores_dustbin_labels() -> None:

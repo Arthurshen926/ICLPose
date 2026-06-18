@@ -1,84 +1,113 @@
-# VFM-MapLoc
+# ICLPose
 
-Localizable foundation feature selection for prior-map visual localization.
+2DGS Synthetic RADIO-MATCHA for learning geometry-aware VFM feature mappings.
 
-This branch is a clean reset of the previous RADIO/POFD/CPR exploration. The
-active project studies a narrower and more defensible question:
+## Active Mainline
 
-> Can we learn a compact, interpretable, and mapable subspace from frozen vision
-> foundation model dense tokens that provides reliable map-conditioned evidence
-> for localization hypothesis verification?
+The current mainline is **2DGS Synthetic RADIO-MATCHA**. The phase-1 question is
+narrow and deliberately staged:
 
-The project does not claim to be a new camera pose refinement solver. Fixed
-retrieval, matching, PnP, photometric, or 3DGS-style solvers may be used as
-candidate generators or downstream handoff modules, but the contribution is the
-selected feature evidence used to verify and reject hypotheses.
+> Can RADIO/VFM dense tokens be trained, in a controlled 2DGS simulator, into a
+> geometry-matchable feature mapping that supports accurate source-to-target
+> correspondence and PnP before we attempt real-image domain transfer or compact
+> 3D feature aggregation?
 
-## Mainline
+This phase does **not** claim full real-image localization, SOTA pose refinement,
+or a deployable map-conditioned verifier. It first isolates feature learning:
+both source and target images are rendered from the same 2DGS scene so the system
+can be tested without the real-image-to-render domain gap.
 
 The active pipeline is:
 
 ```text
-raw VFM token bank
-  -> localizable feature selector
-  -> selected feature lifting into an explicit 3D map
-  -> map-conditioned hypothesis verification
-  -> risk-aware handoff to fixed downstream solvers
+2DGS scene and calibrated poses
+  -> deterministic synthetic source/target pose sampling
+  -> 2DGS RGB/depth/alpha rendering for both views
+  -> frozen RADIO/VFM dense token extraction
+  -> MATCHA-style geometry matching and fine correspondence learning
+  -> pair-level correspondence evaluation
+  -> PnP from predicted correspondences and rendered depth
+  -> later real-image transfer and compact 3D aggregation
 ```
 
-Core terms used in this branch:
+## Current Status
 
-- raw VFM token bank
-- localizable feature subspace
-- candidate hypothesis
-- map-conditioned hypothesis verification
-- selected feature map
-- hard negative rejection
-- risk calibration
-- fixed solver handoff
+See `docs/vfm/2dgs_synthetic_radio_matcha_status.md` for the current
+implementation status, metrics, acceptance gates, and next experiments.
 
-Terms from the old branch, such as POFD, CPR, coarse/fine feature stages, and
-GT-centered q50 lattice results, are not part of the active method narrative.
+As of the latest local audit:
+
+- Gate 1 single-pair synthetic overfit is passed on OldHospital micro pairs.
+- Gate 2 is not yet passed because held-out validation currently uses 16 pairs,
+  below the required 32, and small-pose precision is still slightly under the
+  threshold in the best documented run.
+- Gate 3 is not yet passed because medium-pose validation currently uses 16
+  pairs, below the required 128.
+- No real-image localization claim is active.
 
 ## Active Code
 
-- `feature_extract/vfm/`: protocol records, hypothesis schema, selector, metrics,
-  selected-track aggregation, verifier interfaces, and reporting helpers.
-- `feature_extract/tools/vfm/`: small command-line entrypoints for the new
-  experiment surface.
-- `feature_extract/configs/vfm/`: clean data and protocol configs.
-- `docs/vfm/`: method definition, evaluation protocol, experiment plan, and
-  cleanup manifest.
+- `feature_extract/vfm/matcha_synthetic_pairs.py`: deterministic synthetic
+  source/target pose sampling and pose-bin metadata.
+- `feature_extract/tools/vfm/build_matcha_2dgs_synthetic_manifest.py`: tensor-free
+  synthetic manifest generation.
+- `feature_extract/tools/vfm/train_matcha_joint_streaming_model.py`: streaming
+  MATCHA training entrypoint, including `pair_source=2dgs_synthetic` routing.
+- `feature_extract/tools/vfm/eval_matcha_2dgs_synthetic_pairs.py`: synthetic
+  pair-level correspondence and PnP evaluation.
+- `feature_extract/vfm/matcha_*`: MATCHA model, supervision, cache, and fine
+  matching components.
+- `feature_extract/vfm/official_2dgs_renderer.py`: official 2DGS rendering
+  adapter used for synthetic RGB/depth generation.
 
-Reusable infrastructure remains available in:
+## Historical And Reference Lines
 
-- `feature_extract/extractors/`: frozen VFM extractors.
-- `feature_extract/utils/`: model loading utilities.
-- `feature_retrieval/`: candidate generation infrastructure.
-- `feature_gaussian/`: fixed 3D Gaussian map/rendering infrastructure.
-- `data/`: dataset loaders.
+Previous VFM-MapLoc selector, selected-track aggregation, SfM/Gaussian anchor
+mapping, rendered-map verifier, candidate-bank reranking, and hard-case utility
+experiments are retained as reference infrastructure. They are not the active
+paper narrative for this branch.
 
-## Evaluation Gates
+Those experiments may still be useful later for compact 3D feature aggregation,
+for example aggregating learned features onto SfM points or Gaussian anchors and
+then doing patch-level matching plus PnP. They must not be mixed into the phase-1
+2DGS Synthetic RADIO-MATCHA claim table unless a document explicitly states the
+bridge experiment and evaluation protocol.
 
-Every result must be tagged with one protocol kind:
+## Evaluation Discipline
 
-- `controlled_lattice`: GT-centered diagnostic only.
-- `reference_pose`: reference-image or reference-pose ranking.
-- `real_retrieval`: deployment-like retrieval candidates without GT candidate
-  generation.
-- `rendered_pose`: explicit rendered pose candidates around a declared init.
+Every result must state which stage it belongs to:
 
-The main gates are:
+- `synthetic_overfit`: one deterministic pair, diagnostic only.
+- `synthetic_heldout_micro_small`: held-out micro/small synthetic pairs.
+- `synthetic_heldout_medium`: held-out micro/small/medium synthetic pairs.
+- `real_gt_render_diagnostic`: real query image to GT-pose 2DGS render,
+  allowed only after synthetic gates pass.
+- `real_candidate_localization`: reference/retrieval/init candidate localization,
+  not active until the real GT-render diagnostic is credible.
 
-1. Feature Utility: selected features beat raw VFM, PCA, random projection, and
-   metadata-only baselines on hypothesis ranking.
-2. Causal Selection: high-utility removal hurts, low-utility removal does not,
-   and feature shuffle/wrong-scene controls collapse toward baseline.
-3. Mapability: selected features aggregate into stable explicit 3D tracks and
-   retain ranking signal after rendering/projection from the map.
-4. Hard-Case Utility: hard false accepts are reduced on retrieval false
-   positives, repeated structures, weak texture, and solver traps.
-5. Final Localization: fixed downstream solver handoff is reported separately
-   from solver-free hypothesis verification.
+Synthetic render-to-render pose error is a simulator-domain diagnostic. It must
+not be reported as real localization accuracy.
 
-See `docs/vfm/evaluation_protocol.md` for metrics and promotion gates.
+## Verification
+
+The current repository expects the project root on `PYTHONPATH` when running the
+focused tests from this checkout:
+
+```bash
+PYTHONPATH=. pytest tests/test_matcha_synthetic_pairs.py \
+  tests/test_matcha_streaming_manifest.py \
+  tests/test_matcha_joint_training.py \
+  tests/test_matcha_coarse_supervision.py \
+  tests/test_matcha_multiview_supervision.py -q
+
+PYTHONPATH=. pytest tests/test_vfm_*.py -q
+
+python -m compileall -q feature_extract/vfm feature_extract/tools/vfm feature_extract/extractors
+```
+
+## Strict Audit
+
+See `docs/vfm/2dgs_synthetic_radio_matcha_audit.md` for the current technical
+and methodological audit. The audit is intentionally conservative: results are
+promoted only when the relevant gate passes with the required sample count and
+protocol separation.

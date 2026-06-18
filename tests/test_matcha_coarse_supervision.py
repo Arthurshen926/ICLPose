@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from feature_extract.vfm.colmap_tracks import ColmapCamera
 from feature_extract.vfm.matcha_coarse_supervision import (
+    MatchaCoarseSupervision,
     MatchaCoarseSupervisionConfig,
     build_matcha_coarse_supervision,
     cell_offset_labels,
@@ -76,6 +78,24 @@ def test_matcha_coarse_supervision_identity_pose_roundtrip_and_dedup() -> None:
     assert supervision.query_offset_soft_labels.shape == (4, 65)
     assert np.allclose(supervision.query_offset_soft_labels.sum(axis=1), 1.0)
     assert np.all(supervision.confidence_targets > 0.0)
+    assert supervision.source == "geometry_depth_pose"
+
+
+def test_matcha_coarse_supervision_rejects_matcher_derived_source() -> None:
+    kwargs = dict(
+        query_indices=np.zeros((0,), dtype=np.int64),
+        render_indices=np.zeros((0,), dtype=np.int64),
+        query_xy=np.zeros((0, 2), dtype=np.float64),
+        render_xy=np.zeros((0, 2), dtype=np.float64),
+        query_offset_labels=np.zeros((0,), dtype=np.int64),
+        render_offset_labels=np.zeros((0,), dtype=np.int64),
+        roundtrip_errors_px=np.zeros((0,), dtype=np.float32),
+    )
+
+    supervision = MatchaCoarseSupervision(**kwargs)
+    assert supervision.source == "geometry_depth_pose"
+    with pytest.raises(ValueError, match="matcher"):
+        MatchaCoarseSupervision(**kwargs, source="current_matcher_matches")
 
 
 def test_matcha_coarse_supervision_uses_render_seed_xy_for_non_center_offsets() -> None:

@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Sequence
 
+from feature_extract.vfm.matcha_render_query_protocol import validate_render_query_metadata
+
 
 STREAMING_PAIR_MANIFEST_FORMAT = "vfm_matcha_streaming_pair_manifest_v1"
 
@@ -60,6 +62,8 @@ class MatchaStreamingPairManifest:
     def validate(self) -> None:
         if not self.records:
             raise ValueError("streaming pair manifest contains no records")
+        if "pair_source" in self.metadata:
+            validate_render_query_metadata(self.metadata)
         for record in self.records:
             if not record.query_id:
                 raise ValueError("streaming pair record has empty query_id")

@@ -21,6 +21,17 @@ class KeypointFeatureMatch:
     ratio: float
     similarity_margin: float | None = None
     dual_softmax_confidence: float | None = None
+    base_render_index: int | None = None
+    candidate_render_index: int | None = None
+    candidate_id: int | None = None
+    coarse_rank: int | None = None
+    coarse_score: float | None = None
+    coarse_score_gap: float | None = None
+    mutual_rank: int | None = None
+    cell_delta_x: int | None = None
+    cell_delta_y: int | None = None
+    fine_offset_confidence: float | None = None
+    fine_offset_sigma_px: float | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "query_xy", np.asarray(self.query_xy, dtype=np.float64).reshape(2))
@@ -166,6 +177,15 @@ def dual_softmax_keypoint_matches(
                 ratio=ratio,
                 similarity_margin=margin,
                 dual_softmax_confidence=conf,
+                base_render_index=int(rrows[local_r]),
+                candidate_render_index=int(rrows[local_r]),
+                candidate_id=len(matches),
+                coarse_rank=0,
+                coarse_score=similarity,
+                coarse_score_gap=margin,
+                mutual_rank=int(render_best_query[local_r]),
+                cell_delta_x=0,
+                cell_delta_y=0,
             )
         )
     matches.sort(
@@ -320,6 +340,15 @@ def mutual_nn_keypoint_matches(
                 ratio=ratio,
                 similarity_margin=margin,
                 dual_softmax_confidence=conf,
+                base_render_index=int(rrows[local_r]),
+                candidate_render_index=int(rrows[local_r]),
+                candidate_id=len(matches),
+                coarse_rank=0,
+                coarse_score=similarity,
+                coarse_score_gap=margin,
+                mutual_rank=int(render_best_query[local_r]),
+                cell_delta_x=0,
+                cell_delta_y=0,
             )
         )
     matches.sort(
@@ -483,6 +512,18 @@ def keypoint_feature_matches_to_pnp_matches(
                 pnp_soft_score=match.dual_softmax_confidence,
                 patch_offset_applied=None if offset_applied[idx] is None else bool(offset_applied[idx]),
                 patch_offset_norm_px=None if not np.isfinite(offset_norm[idx]) else float(offset_norm[idx]),
+                render_xy=used_xy[idx].astype(np.float64, copy=True),
+                base_render_index=match.base_render_index,
+                candidate_render_index=match.candidate_render_index,
+                candidate_id=match.candidate_id,
+                coarse_rank=match.coarse_rank,
+                coarse_score=match.coarse_score,
+                coarse_score_gap=match.coarse_score_gap,
+                mutual_rank=match.mutual_rank,
+                cell_delta_x=match.cell_delta_x,
+                cell_delta_y=match.cell_delta_y,
+                patch_offset_confidence=match.fine_offset_confidence,
+                patch_offset_sigma=match.fine_offset_sigma_px,
             )
         )
     return pnp_matches

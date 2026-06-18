@@ -199,6 +199,83 @@ def _offset_label_to_xy(
     return np.asarray([x, y], dtype=np.float64)
 
 
+def _offset_logits_to_xy(
+    row_logits: np.ndarray,
+    cell_index: int,
+    *,
+    image_width: int,
+    image_height: int,
+    grid_width: int,
+    grid_height: int,
+    offset_bins: int = 8,
+    coordinate_mode: str = "argmax",
+) -> np.ndarray | None:
+    logits = np.asarray(row_logits, dtype=np.float32).reshape(-1)
+    bins = int(offset_bins)
+    mode = str(coordinate_mode)
+    if mode not in {"argmax", "softargmax"}:
+        raise ValueError("coordinate_mode must be 'argmax' or 'softargmax'")
+    label_count = 65 if int(logits.shape[0]) >= bins * bins + 1 else bins * bins
+    label = int(np.argmax(logits[:label_count]))
+    if mode == "argmax":
+        return _offset_label_to_xy(
+            label,
+            int(cell_index),
+            image_width=int(image_width),
+            image_height=int(image_height),
+            grid_width=int(grid_width),
+            grid_height=int(grid_height),
+            offset_bins=bins,
+        )
+    if label == bins * bins:
+        return None
+    cell = int(cell_index)
+    if cell < 0 or cell >= int(grid_width) * int(grid_height):
+        return None
+    scores = logits[: bins * bins].astype(np.float64)
+    scores = scores - float(np.max(scores))
+    probs = np.exp(scores)
+    probs = probs / max(float(np.sum(probs)), 1e-12)
+    labels = np.arange(bins * bins, dtype=np.float64)
+    bin_x = np.remainder(labels, float(bins)) + 0.5
+    bin_y = np.floor(labels / float(bins)) + 0.5
+    col = cell % int(grid_width)
+    row = cell // int(grid_width)
+    cell_w = float(image_width) / float(grid_width)
+    cell_h = float(image_height) / float(grid_height)
+    x = (float(col) + float(np.sum(probs * bin_x)) / float(bins)) * cell_w
+    y = (float(row) + float(np.sum(probs * bin_y)) / float(bins)) * cell_h
+    return np.asarray([x, y], dtype=np.float64)
+
+
+def _offset_logits_confidence_sigma(
+    row_logits: np.ndarray,
+    *,
+    image_width: int,
+    image_height: int,
+    grid_width: int,
+    grid_height: int,
+    offset_bins: int = 8,
+) -> tuple[float, float]:
+    logits = np.asarray(row_logits, dtype=np.float32).reshape(-1)
+    bins = int(offset_bins)
+    scores = logits[: bins * bins].astype(np.float64)
+    scores = scores - float(np.max(scores))
+    probs = np.exp(scores)
+    probs = probs / max(float(np.sum(probs)), 1e-12)
+    labels = np.arange(bins * bins, dtype=np.float64)
+    bin_x = np.remainder(labels, float(bins)) + 0.5
+    bin_y = np.floor(labels / float(bins)) + 0.5
+    expected_x = float(np.sum(probs * bin_x))
+    expected_y = float(np.sum(probs * bin_y))
+    variance = float(np.sum(probs * ((bin_x - expected_x) ** 2 + (bin_y - expected_y) ** 2)))
+    sigma_bins = float(np.sqrt(max(variance, 0.0)))
+    cell_w = float(image_width) / float(grid_width)
+    cell_h = float(image_height) / float(grid_height)
+    bin_px = 0.5 * (cell_w + cell_h) / float(bins)
+    return float(np.max(probs)), float(max(sigma_bins * bin_px, 1e-6))
+
+
 def apply_offset_logits_to_matches(
     matches: Sequence[KeypointFeatureMatch],
     query_offset_logits: np.ndarray | None,
@@ -287,6 +364,7 @@ def apply_pair_fine_logits_to_matches(
     query_grid_height: int | None = None,
     target_side: str = "render",
     offset_bins: int = 8,
+    coordinate_mode: str = "argmax",
 ) -> list[KeypointFeatureMatch]:
     """Move one side of a match using pair-conditioned 8x8 offset logits.
 
@@ -307,6 +385,9 @@ def apply_pair_fine_logits_to_matches(
     side = str(target_side)
     if side not in {"render", "query"}:
         raise ValueError("target_side must be 'render' or 'query'")
+    mode = str(coordinate_mode)
+    if mode not in {"argmax", "softargmax"}:
+        raise ValueError("coordinate_mode must be 'argmax' or 'softargmax'")
     if side == "render":
         if render_image_width is None or render_image_height is None or render_grid_width is None or render_grid_height is None:
             raise ValueError("render image and grid dimensions are required for render-side refinement")
@@ -323,24 +404,80 @@ def apply_pair_fine_logits_to_matches(
         grid_height = int(query_grid_height)
     refined: list[KeypointFeatureMatch] = []
     for match, row_logits in zip(values, logits):
-        label_count = 65 if int(row_logits.shape[0]) >= 65 else 64
-        label = int(np.argmax(row_logits[:label_count]))
-        xy = _offset_label_to_xy(
-            label,
+        xy = _offset_logits_to_xy(
+            row_logits,
             int(match.render_index if side == "render" else match.query_index),
             image_width=image_width,
             image_height=image_height,
             grid_width=grid_width,
             grid_height=grid_height,
             offset_bins=int(offset_bins),
+            coordinate_mode=mode,
         )
         if xy is None:
             continue
+        fine_confidence, fine_sigma = _offset_logits_confidence_sigma(
+            row_logits,
+            image_width=image_width,
+            image_height=image_height,
+            grid_width=grid_width,
+            grid_height=grid_height,
+            offset_bins=int(offset_bins),
+        )
         if side == "render":
-            refined.append(replace(match, render_xy=xy.astype(np.float64, copy=False)))
+            refined.append(
+                replace(
+                    match,
+                    render_xy=xy.astype(np.float64, copy=False),
+                    fine_offset_confidence=fine_confidence,
+                    fine_offset_sigma_px=fine_sigma,
+                )
+            )
         else:
-            refined.append(replace(match, query_xy=xy.astype(np.float64, copy=False)))
+            refined.append(
+                replace(
+                    match,
+                    query_xy=xy.astype(np.float64, copy=False),
+                    fine_offset_confidence=fine_confidence,
+                    fine_offset_sigma_px=fine_sigma,
+                )
+            )
     return refined
+
+
+def apply_fine_logit_confidence_to_matches(
+    matches: Sequence[KeypointFeatureMatch],
+    fine_logits: np.ndarray,
+    *,
+    blend: float = 0.5,
+) -> list[KeypointFeatureMatch]:
+    """Blend local fine-head peak probability into match confidence."""
+
+    values = list(matches)
+    logits = np.asarray(fine_logits, dtype=np.float32)
+    if logits.ndim != 2 or logits.shape[0] != len(values) or logits.shape[1] < 64:
+        raise ValueError("fine_logits must have shape (len(matches), 64) or larger")
+    amount = float(np.clip(float(blend), 0.0, 1.0))
+    if not values or amount <= 0.0:
+        return values
+    spatial_logits = logits[:, :64]
+    shifted = spatial_logits - np.max(spatial_logits, axis=1, keepdims=True)
+    probs = np.exp(shifted)
+    probs /= np.maximum(np.sum(probs, axis=1, keepdims=True), 1e-12)
+    peak = np.max(probs, axis=1)
+    uniform = 1.0 / 64.0
+    fine_confidences = np.clip((peak - uniform) / (1.0 - uniform), 0.0, 1.0)
+    updated: list[KeypointFeatureMatch] = []
+    for match, fine_confidence in zip(values, fine_confidences):
+        base = (
+            float(match.dual_softmax_confidence)
+            if match.dual_softmax_confidence is not None
+            else float(np.clip((float(match.similarity) + 1.0) * 0.5, 0.0, 1.0))
+        )
+        confidence = (1.0 - amount) * base + amount * float(fine_confidence)
+        updated.append(replace(match, dual_softmax_confidence=float(np.clip(confidence, 0.0, 1.0))))
+    updated.sort(key=lambda item: (float(item.dual_softmax_confidence or 0.0), float(item.similarity)), reverse=True)
+    return updated
 
 
 def expand_matches_with_render_local_offsets(
@@ -382,6 +519,7 @@ def expand_matches_with_render_local_offsets(
             expanded.append(match)
             continue
         row, col = divmod(ridx, grid_w)
+        base_render_index = int(match.base_render_index) if match.base_render_index is not None else int(ridx)
         render_xy = np.asarray(match.render_xy, dtype=np.float64).reshape(2)
         local_x = render_xy[0] / max(cell_w, 1e-12) - float(col)
         local_y = render_xy[1] / max(cell_h, 1e-12) - float(row)
@@ -402,7 +540,18 @@ def expand_matches_with_render_local_offsets(
         for nrow, ncol, _flat_delta, _distance2 in candidates[:limit]:
             candidate_idx = int(nrow * grid_w + ncol)
             xy = np.asarray([(float(ncol) + local_x) * cell_w, (float(nrow) + local_y) * cell_h], dtype=np.float64)
-            expanded.append(replace(match, render_index=candidate_idx, render_xy=xy))
+            expanded.append(
+                replace(
+                    match,
+                    render_index=candidate_idx,
+                    render_xy=xy,
+                    base_render_index=base_render_index,
+                    candidate_render_index=candidate_idx,
+                    candidate_id=len(expanded),
+                    cell_delta_x=int(ncol - col),
+                    cell_delta_y=int(nrow - row),
+                )
+            )
     expanded.sort(
         key=lambda item: (
             float(item.dual_softmax_confidence or 0.0),
@@ -511,6 +660,163 @@ def retain_topk_matches_per_query(
     return kept
 
 
+def _coarse_reciprocal_rank(confidence: np.ndarray, local_q: int, local_r: int) -> int:
+    value = float(confidence[int(local_q), int(local_r)])
+    column = np.asarray(confidence[:, int(local_r)], dtype=np.float32)
+    return int(np.count_nonzero(column > value))
+
+
+def _local_window_mask_for_query(
+    local_q_index: int,
+    qrows: np.ndarray,
+    rrows: np.ndarray,
+    *,
+    query_grid_width: int,
+    query_grid_height: int,
+    render_grid_width: int,
+    render_grid_height: int,
+    radius: int | None,
+) -> np.ndarray:
+    if radius is None:
+        return np.ones((rrows.shape[0],), dtype=bool)
+    r = int(radius)
+    if r < 0:
+        return np.ones((rrows.shape[0],), dtype=bool)
+    qidx = int(qrows[int(local_q_index)])
+    qrow, qcol = divmod(qidx, int(query_grid_width))
+    center_col = (float(qcol) + 0.5) / float(query_grid_width) * float(render_grid_width) - 0.5
+    center_row = (float(qrow) + 0.5) / float(query_grid_height) * float(render_grid_height) - 0.5
+    rcols = (rrows % int(render_grid_width)).astype(np.float64)
+    rrows_grid = (rrows // int(render_grid_width)).astype(np.float64)
+    return (np.abs(rcols - center_col) <= float(r) + 1e-9) & (np.abs(rrows_grid - center_row) <= float(r) + 1e-9)
+
+
+def matcha_coarse_topk_matches(
+    query_feature_map: np.ndarray,
+    render_feature_map: np.ndarray,
+    *,
+    query_image_width: int,
+    query_image_height: int,
+    render_image_width: int,
+    render_image_height: int,
+    k_per_query: int = 5,
+    logit_scale: float = 10.0,
+    min_confidence: float = 0.0,
+    min_similarity: float = -1.0,
+    max_matches: int | None = None,
+    mutual_mode: str = "annotate",
+    local_window_radius_cells: int | None = None,
+    query_candidate_indices: np.ndarray | None = None,
+    render_candidate_indices: np.ndarray | None = None,
+) -> list[KeypointFeatureMatch]:
+    """Return multiple coarse render-cell candidates for each query cell.
+
+    This is a candidate-recall path for pose refinement. Mutual nearest-neighbor
+    is not a hard requirement by default; reciprocal rank is recorded as a
+    feature so downstream ranking/PnP can decide how to use it.
+    """
+
+    k = int(k_per_query)
+    if k <= 0:
+        raise ValueError("k_per_query must be positive")
+    mode = str(mutual_mode)
+    if mode not in {"none", "annotate", "filter"}:
+        raise ValueError("mutual_mode must be one of: none, annotate, filter")
+    query_grid = feature_map_to_coarse_grid(
+        query_feature_map,
+        image_width=int(query_image_width),
+        image_height=int(query_image_height),
+    )
+    render_grid = feature_map_to_coarse_grid(
+        render_feature_map,
+        image_width=int(render_image_width),
+        image_height=int(render_image_height),
+    )
+    qdesc, qvalid = normalize_rows(query_grid.descriptors)
+    rdesc, rvalid = normalize_rows(render_grid.descriptors)
+    qrows = np.flatnonzero(qvalid)
+    rrows = np.flatnonzero(rvalid)
+    if query_candidate_indices is not None:
+        qmask = np.zeros((query_grid.xy.shape[0],), dtype=bool)
+        qidx = np.asarray(query_candidate_indices, dtype=np.int64).reshape(-1)
+        qidx = qidx[(qidx >= 0) & (qidx < qmask.shape[0])]
+        qmask[qidx] = True
+        qrows = qrows[qmask[qrows]]
+    if render_candidate_indices is not None:
+        rmask = np.zeros((render_grid.xy.shape[0],), dtype=bool)
+        ridx = np.asarray(render_candidate_indices, dtype=np.int64).reshape(-1)
+        ridx = ridx[(ridx >= 0) & (ridx < rmask.shape[0])]
+        rmask[ridx] = True
+        rrows = rrows[rmask[rrows]]
+    if qrows.size == 0 or rrows.size == 0:
+        return []
+    qdesc_local = qdesc[qrows]
+    rdesc_local = rdesc[rrows]
+    scores = qdesc_local @ rdesc_local.T
+    confidence = _dual_softmax_confidence(scores, float(logit_scale))
+    matches: list[KeypointFeatureMatch] = []
+    for local_q in range(qdesc_local.shape[0]):
+        keep_mask = _local_window_mask_for_query(
+            local_q,
+            qrows,
+            rrows,
+            query_grid_width=int(query_grid.width),
+            query_grid_height=int(query_grid.height),
+            render_grid_width=int(render_grid.width),
+            render_grid_height=int(render_grid.height),
+            radius=local_window_radius_cells,
+        )
+        candidate_locals = np.flatnonzero(keep_mask)
+        if candidate_locals.size == 0:
+            continue
+        row_conf = confidence[local_q, candidate_locals]
+        order = np.lexsort((-scores[local_q, candidate_locals], -row_conf))
+        ordered_locals = candidate_locals[order]
+        top1_score = float(scores[local_q, ordered_locals[0]])
+        for rank, local_r in enumerate(ordered_locals[:k]):
+            conf = float(confidence[local_q, int(local_r)])
+            sim = float(scores[local_q, int(local_r)])
+            if conf < float(min_confidence) or sim < float(min_similarity):
+                continue
+            reciprocal_rank = _coarse_reciprocal_rank(confidence, local_q, int(local_r))
+            if mode == "filter" and reciprocal_rank != 0:
+                continue
+            margin, ratio = _top2_margin(scores, local_q, int(local_r))
+            render_index = int(rrows[int(local_r)])
+            matches.append(
+                KeypointFeatureMatch(
+                    query_index=int(qrows[local_q]),
+                    render_index=render_index,
+                    query_xy=query_grid.xy[int(qrows[local_q])],
+                    render_xy=render_grid.xy[render_index],
+                    similarity=sim,
+                    ratio=ratio,
+                    similarity_margin=margin,
+                    dual_softmax_confidence=conf,
+                    base_render_index=render_index,
+                    candidate_render_index=render_index,
+                    candidate_id=len(matches),
+                    coarse_rank=int(rank),
+                    coarse_score=sim,
+                    coarse_score_gap=float(top1_score - sim),
+                    mutual_rank=int(reciprocal_rank),
+                    cell_delta_x=0,
+                    cell_delta_y=0,
+                )
+            )
+    matches.sort(
+        key=lambda item: (
+            float(item.dual_softmax_confidence or 0.0),
+            -float(item.coarse_rank or 0),
+            float(item.similarity),
+        ),
+        reverse=True,
+    )
+    if max_matches is not None:
+        matches = matches[: int(max_matches)]
+    return matches
+
+
 def matcha_coarse_dual_softmax_matches(
     query_feature_map: np.ndarray,
     render_feature_map: np.ndarray,
@@ -574,6 +880,7 @@ def matcha_coarse_dual_softmax_matches(
         if conf < float(min_confidence) or sim < float(min_similarity):
             continue
         margin, ratio = _top2_margin(scores, local_q, local_r)
+        reciprocal_rank = _coarse_reciprocal_rank(confidence, local_q, local_r)
         candidates.append(
             KeypointFeatureMatch(
                 query_index=int(qrows[local_q]),
@@ -584,6 +891,15 @@ def matcha_coarse_dual_softmax_matches(
                 ratio=ratio,
                 similarity_margin=margin,
                 dual_softmax_confidence=conf,
+                base_render_index=int(rrows[local_r]),
+                candidate_render_index=int(rrows[local_r]),
+                candidate_id=len(candidates),
+                coarse_rank=0,
+                coarse_score=sim,
+                coarse_score_gap=0.0,
+                mutual_rank=int(reciprocal_rank),
+                cell_delta_x=0,
+                cell_delta_y=0,
             )
         )
     candidates.sort(key=lambda item: (float(item.dual_softmax_confidence or 0.0), float(item.similarity)), reverse=True)
@@ -942,6 +1258,9 @@ def matcha_coarse_to_fine_keypoint_matches(
     fine_mode: str = "argmax",
     fine_softmax_temperature: float = 20.0,
     mutual: bool = True,
+    coarse_top_k_per_query: int = 1,
+    coarse_mutual_mode: str | None = None,
+    coarse_local_window_radius_cells: int | None = None,
     query_offset_logits: np.ndarray | None = None,
     render_offset_logits: np.ndarray | None = None,
     query_candidate_indices: np.ndarray | None = None,
@@ -959,22 +1278,45 @@ def matcha_coarse_to_fine_keypoint_matches(
             alpha=0.25,
             logit_scale=float(logit_scale),
         )
-    matches = matcha_coarse_dual_softmax_matches(
-        coarse_query_feature_map,
-        coarse_render_feature_map,
-        query_image_width=int(query_image_width),
-        query_image_height=int(query_image_height),
-        render_image_width=int(render_image_width),
-        render_image_height=int(render_image_height),
-        logit_scale=float(logit_scale),
-        min_confidence=float(min_confidence),
-        min_similarity=float(min_similarity),
-        max_matches=max_matches,
-        mutual=bool(mutual),
-        deduplicate=True,
-        query_candidate_indices=query_candidate_indices,
-        render_candidate_indices=render_candidate_indices,
-    )
+    top_k = max(int(coarse_top_k_per_query), 1)
+    mutual_mode = None if coarse_mutual_mode is None else str(coarse_mutual_mode)
+    if top_k > 1 or mutual_mode is not None:
+        if mutual_mode is None:
+            mutual_mode = "filter" if bool(mutual) else "none"
+        matches = matcha_coarse_topk_matches(
+            coarse_query_feature_map,
+            coarse_render_feature_map,
+            query_image_width=int(query_image_width),
+            query_image_height=int(query_image_height),
+            render_image_width=int(render_image_width),
+            render_image_height=int(render_image_height),
+            k_per_query=top_k,
+            logit_scale=float(logit_scale),
+            min_confidence=float(min_confidence),
+            min_similarity=float(min_similarity),
+            max_matches=max_matches,
+            mutual_mode=mutual_mode,
+            local_window_radius_cells=coarse_local_window_radius_cells,
+            query_candidate_indices=query_candidate_indices,
+            render_candidate_indices=render_candidate_indices,
+        )
+    else:
+        matches = matcha_coarse_dual_softmax_matches(
+            coarse_query_feature_map,
+            coarse_render_feature_map,
+            query_image_width=int(query_image_width),
+            query_image_height=int(query_image_height),
+            render_image_width=int(render_image_width),
+            render_image_height=int(render_image_height),
+            logit_scale=float(logit_scale),
+            min_confidence=float(min_confidence),
+            min_similarity=float(min_similarity),
+            max_matches=max_matches,
+            mutual=bool(mutual),
+            deduplicate=True,
+            query_candidate_indices=query_candidate_indices,
+            render_candidate_indices=render_candidate_indices,
+        )
     if not matches or float(fine_search_radius_px) <= 0.0:
         if query_offset_logits is not None or render_offset_logits is not None:
             return apply_offset_logits_to_matches(

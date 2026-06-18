@@ -83,6 +83,15 @@ def test_match_table_rows_store_gt_error_confidence_and_inlier_label() -> None:
             "similarity_margin": None,
             "match_rank": 0,
             "token_match_rank": None,
+            "base_render_index": None,
+            "candidate_render_index": None,
+            "candidate_id": None,
+            "coarse_rank": None,
+            "coarse_score": None,
+            "coarse_score_gap": None,
+            "mutual_rank": None,
+            "cell_delta_x": None,
+            "cell_delta_y": None,
             "confidence": 0.9,
             "gt_reproj_error_px": 12.0,
             "gt_reproj_error_stride": 0.75,
@@ -134,3 +143,39 @@ def test_match_table_rows_mark_self_consistent_wrong_match_as_hard_negative() ->
     assert rows[0]["pnp_inlier"] is True
     assert rows[0]["baseline_reproj_residual_px"] == 2.0
     assert rows[0]["hard_negative_label"] is True
+
+
+def test_match_table_rows_prefer_per_match_render_xy_over_render_index_lookup() -> None:
+    match = QueryTo3DMatch(
+        token_index=1,
+        xy=np.asarray([10.0, 12.0], dtype=np.float64),
+        track_id=5,
+        xyz=np.asarray([0.0, 0.0, 3.0], dtype=np.float64),
+        similarity=0.5,
+        ratio=0.0,
+        landmark_variance=0.0,
+        render_xy=np.asarray([40.0, 44.0], dtype=np.float64),
+        base_render_index=4,
+        candidate_render_index=5,
+        candidate_id=12,
+        cell_delta_x=1,
+        cell_delta_y=0,
+    )
+
+    rows = _match_table_rows_for_query(
+        query_id="seq/frame.png",
+        matches=[match],
+        gt_errors=np.asarray([4.0], dtype=np.float64),
+        gt_stride_px=16.0,
+        inlier_mask=None,
+        baseline_reproj_errors=None,
+        render_xy_by_match={5: np.asarray([999.0, 999.0], dtype=np.float64)},
+    )
+
+    assert rows[0]["render_x"] == 40.0
+    assert rows[0]["render_y"] == 44.0
+    assert rows[0]["base_render_index"] == 4
+    assert rows[0]["candidate_render_index"] == 5
+    assert rows[0]["candidate_id"] == 12
+    assert rows[0]["cell_delta_x"] == 1
+    assert rows[0]["cell_delta_y"] == 0

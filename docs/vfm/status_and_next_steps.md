@@ -1,5 +1,12 @@
 # VFM-MapLoc Status And Next Steps
 
+> **Historical reference.** This document describes the previous VFM-MapLoc
+> selector / selected-map / verifier line. It is retained because some
+> aggregation, candidate-bank, and verifier infrastructure may be useful later.
+> It is not the active mainline for the current branch. The active mainline is
+> 2DGS Synthetic RADIO-MATCHA; see
+> `docs/vfm/2dgs_synthetic_radio_matcha_status.md`.
+
 ## Current Status
 
 The branch now has a clean VFM-MapLoc mainline:
