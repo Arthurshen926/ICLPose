@@ -9,14 +9,17 @@ import feature_extract.tools.vfm.eval_render_rgb_feature_keypoint_pose as render
 from feature_extract.tools.vfm.eval_render_rgb_feature_keypoint_pose import (
     _StreamingCsvWriter,
     _existing_query_ids_from_rows,
+    _gt_query_pixels_for_matches,
+    _match_table_rows_for_query,
     _pose_candidate_table_rows_for_query,
+    _pose_protocol_audit_fields,
     _read_csv_rows,
     _render_lock_diagnostics_from_rows,
     _run_render_pose_residual_diagnostic,
     _select_pose_update_iteration,
     parse_args,
 )
-from feature_extract.vfm.render_pose_protocol import RenderPoseSelection
+from feature_extract.vfm.render_pose_protocol import RenderPoseSelection, rotate_pose_camera_frame
 from feature_extract.vfm.rendered_pose_scoring import PoseHypothesisScore
 from feature_extract.vfm.colmap_tracks import ColmapCamera
 from feature_extract.vfm.query_to_3d_matching import QueryTo3DMatch
@@ -44,6 +47,29 @@ def test_confidence_coverage_filter_is_default_for_render_rgb_eval() -> None:
     assert args.coverage_filter_grid == 8
     assert args.coverage_filter_max_per_cell == 8
     assert args.coverage_filter_max_total == 512
+
+
+def test_pose_protocol_audit_fields_preserve_pure_rotation_camera_center() -> None:
+    gt_pose = np.eye(4, dtype=np.float64)
+    render_pose = RenderPoseSelection(
+        pose_w2c=rotate_pose_camera_frame(gt_pose, [0.0, 1.0, 0.0]),
+        label="gt_rotation_offset",
+        render_translation_error_m=0.0,
+        render_rotation_error_deg=1.0,
+    )
+
+    fields = _pose_protocol_audit_fields(
+        render_pose_mode="gt_rotation_offset",
+        render_pose_world_offset=np.asarray([0.0, 0.0, 0.0], dtype=np.float64),
+        render_pose_rotation_offset_deg=np.asarray([0.0, 1.0, 0.0], dtype=np.float64),
+        gt_pose_w2c=gt_pose,
+        render_pose=render_pose,
+    )
+
+    assert fields["requested_translation_m"] == 0.0
+    assert fields["requested_rotation_deg"] == pytest.approx(1.0)
+    assert fields["realized_initial_translation_error_m"] == 0.0
+    assert fields["camera_center_delta_m"] == pytest.approx(0.0, abs=1e-12)
 
 
 def test_anti_lock_render_search_preset_enables_render_side_measurement_relocation() -> None:
@@ -197,6 +223,40 @@ def test_reference_top5_render_pose_mode_is_exposed() -> None:
     assert args.reference_top_k == 5
 
 
+def test_match_table_rows_include_gt_query_projection_for_measurement_fusion() -> None:
+    camera = ColmapCamera(camera_id=1, model_id=1, width=640, height=480, params=(500.0, 500.0, 320.0, 240.0))
+    pose = np.eye(4, dtype=np.float64)
+    match = QueryTo3DMatch(
+        token_index=0,
+        xy=np.asarray([321.0, 240.0], dtype=np.float64),
+        track_id=7,
+        xyz=np.asarray([0.0, 0.0, 5.0], dtype=np.float64),
+        similarity=0.8,
+        ratio=1.0,
+        landmark_variance=0.0,
+        source="test",
+        render_depth=5.0,
+        render_xy=np.asarray([320.0, 240.0], dtype=np.float64),
+    )
+    gt_query_xy = _gt_query_pixels_for_matches([match], pose, camera)
+
+    rows = _match_table_rows_for_query(
+        query_id="q0.png",
+        matches=[match],
+        gt_errors=np.asarray([1.0], dtype=np.float64),
+        gt_stride_px=16.0,
+        inlier_mask=np.asarray([True]),
+        baseline_reproj_errors=np.asarray([0.5], dtype=np.float64),
+        render_xy_by_match={7: np.asarray([320.0, 240.0], dtype=np.float64)},
+        gt_query_xy=gt_query_xy,
+    )
+
+    assert rows[0]["query_gt_x"] == pytest.approx(320.0)
+    assert rows[0]["query_gt_y"] == pytest.approx(240.0)
+    assert rows[0]["world_x"] == pytest.approx(0.0)
+    assert rows[0]["render_depth"] == pytest.approx(5.0)
+
+
 def test_reference_top10_render_pose_mode_sets_top_k() -> None:
     args = parse_args(_base_args() + ["--render_pose_mode", "reference_top10", "--candidate_bank", "bank.jsonl"])
 
@@ -251,6 +311,44 @@ def test_radio_local_window_preset_uses_continuous_fine_coordinates() -> None:
     assert args.matcha_pair_fine_coordinate_mode == "softargmax"
 
 
+def test_fixed_anchor_coarse_only_preset_freezes_mainline_baseline() -> None:
+    args = parse_args(
+        _base_args()
+        + [
+            "--matcha_eval_preset",
+            "fixed_anchor_coarse_only_v1",
+            "--pose_scorer_model",
+            "legacy_scorer.json",
+            "--calibrated_correspondence_confidence_model",
+            "legacy_conf.json",
+            "--matcha_use_pair_fine_head",
+            "--matcha_use_local_window_fine_head",
+            "--matcha_use_patch_corr_fine_head",
+            "--pnp_soft_order_mode",
+            "confidence",
+        ]
+    )
+
+    assert args.fixed_render_anchor is True
+    assert args.matcha_confidence_mode == "dual_softmax"
+    assert args.matcha_cell_offset_side == "none"
+    assert args.matcha_use_pair_fine_head is False
+    assert args.matcha_use_local_fine_attention is False
+    assert args.matcha_use_local_window_fine_head is False
+    assert args.matcha_use_patch_corr_fine_head is False
+    assert args.fine_render_search_radius_px == 0.0
+    assert args.post_pair_render_refine_radius_px == 0.0
+    assert args.render_side_local_offset_radius_cells == 0
+    assert args.matcha_keypoint_proposal_source == "none"
+    assert args.matcha_reliability_prior_source == "none"
+    assert args.pnp_soft_order_mode == "none"
+    assert args.pnp_soft_order_top_n == 0
+    assert args.calibrated_correspondence_confidence_model == ""
+    assert args.pose_scorer_model == ""
+    assert args.measurement_sigma_px == 0.0
+    assert args.coverage_filter_min_confidence == -1.0
+
+
 def test_render_rgb_eval_resume_controls_are_exposed() -> None:
     args = parse_args(_base_args() + ["--stream_rows", "--resume_existing_rows", "--rebuild_summary_from_rows"])
 
@@ -277,6 +375,13 @@ def test_render_rgb_eval_pose_candidate_table_controls_are_exposed() -> None:
 
     assert args.save_pose_candidate_table is True
     assert args.pose_candidate_table_path == "candidate_rows.csv"
+
+
+def test_render_rgb_eval_all_candidate_match_table_control_is_exposed() -> None:
+    args = parse_args(_base_args() + ["--save_match_table", "--save_all_candidate_match_table"])
+
+    assert args.save_match_table is True
+    assert args.save_all_candidate_match_table is True
 
 
 def test_render_rgb_eval_oracle_pnp_ablation_controls_are_exposed() -> None:

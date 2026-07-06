@@ -1,0 +1,585 @@
+from __future__ import annotations
+
+import csv
+import json
+import math
+from pathlib import Path
+from typing import Any, Mapping, Sequence
+
+import numpy as np
+import torch
+from torch import nn
+from torch.nn import functional as F
+
+from feature_extract.vfm.dense_depth_measurement_fusion import (
+    DENSE_DEPTH_FUSION_FIELDNAMES,
+    dense_depth_measurement_summary,
+)
+from feature_extract.vfm.measurement_v1.measurement_branch import Conv3FeatureProjection, SharedFeatureProjection
+from feature_extract.vfm.measurement_v1.rgb_patch_measurement_branch import (
+    RGBPatchMeasurementPrediction,
+    RGBPatchMeasurementBranch,
+    TexturePatchEncoder,
+    crop_rgb_window,
+    template_search_cost_volume_logits,
+)
+from feature_extract.vfm.measurement_v1.rgb_patch_training import (
+    _load_query_rgb,
+    _load_render_rgb,
+    _load_tensor_cached,
+    _prior_scale_batch,
+    _read_csv,
+    _render_cache_by_query,
+)
+
+
+RGB_PATCH_FUSION_FIELDNAMES = [
+    *DENSE_DEPTH_FUSION_FIELDNAMES,
+    "measurement_peak_dx",
+    "measurement_peak_dy",
+    "local_cost_peak_prob",
+    "local_cost_top2_gap",
+    "rgb_patch_prediction_head",
+    "measurement_search_radius_px",
+    "measurement_context_radius_px",
+    "measurement_step_px",
+]
+
+
+def _optional_float(row: Mapping[str, object], *names: str) -> float | None:
+    for name in names:
+        value = row.get(name)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if not text:
+            continue
+        try:
+            number = float(text)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(number):
+            return float(number)
+    return None
+
+
+def _query_center(row: Mapping[str, object]) -> tuple[float, float]:
+    x = _optional_float(row, "query_center_x", "center_x", "query_x")
+    y = _optional_float(row, "query_center_y", "center_y", "query_y")
+    if x is None or y is None:
+        raise ValueError("match row missing query center: expected query_center_x/y, center_x/y, or query_x/y")
+    return float(x), float(y)
+
+
+def _render_anchor(row: Mapping[str, object]) -> tuple[float, float]:
+    x = _optional_float(row, "render_x")
+    y = _optional_float(row, "render_y")
+    if x is None or y is None:
+        raise ValueError("match row missing render_x/render_y")
+    return float(x), float(y)
+
+
+def _has_explicit_value(row: Mapping[str, object], name: str) -> bool:
+    value = row.get(name)
+    return value is not None and str(value).strip() != ""
+
+
+def _valid_render_depth(row: Mapping[str, object]) -> bool:
+    depth = _optional_float(row, "render_depth", "depth")
+    return bool(depth is not None and np.isfinite(float(depth)) and float(depth) > 1e-6)
+
+
+def _read_csv_rows(path: Path, max_rows: int | None = None) -> list[dict[str, str]]:
+    with Path(path).open(newline="") as handle:
+        rows: list[dict[str, str]] = []
+        for row in csv.DictReader(handle):
+            rows.append(dict(row))
+            if max_rows is not None and len(rows) >= int(max_rows):
+                break
+        return rows
+
+
+def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]], fieldnames: Sequence[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(fieldnames), extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({name: row.get(name, "") for name in fieldnames})
+
+
+def _write_jsonl(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w") as handle:
+        for row in rows:
+            handle.write(json.dumps(dict(row), sort_keys=True) + "\n")
+
+
+def _fieldnames_for_rows(rows: Sequence[Mapping[str, Any]]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for name in RGB_PATCH_FUSION_FIELDNAMES:
+        if name not in seen:
+            seen.add(name)
+            out.append(name)
+    for row in rows:
+        for name in row.keys():
+            if name not in seen:
+                seen.add(name)
+                out.append(str(name))
+    return out
+
+
+class CachedProjectionMeasurementAdapter(nn.Module):
+    """Compatibility wrapper for cache-trained template correlation projections."""
+
+    measurement_model_type = "cached_projection"
+
+    def __init__(
+        self,
+        *,
+        projection: nn.Module,
+        search_radius_px: float,
+        context_radius_px: float,
+        step_px: float,
+        temperature: float,
+    ) -> None:
+        super().__init__()
+        self.projection = projection
+        self.search_radius_px = float(search_radius_px)
+        self.context_radius_px = float(context_radius_px)
+        self.step_px = float(step_px)
+        self.temperature = float(temperature)
+        if self.search_radius_px < 0.0 or self.context_radius_px < 0.0 or self.step_px <= 0.0:
+            raise ValueError("search/context radii and step are invalid")
+        if self.temperature <= 0.0:
+            raise ValueError("temperature must be positive")
+
+    @property
+    def crop_radius_px(self) -> float:
+        return float(self.search_radius_px + self.context_radius_px)
+
+    def forward_from_patches(
+        self,
+        query_patch: torch.Tensor,
+        render_patch: torch.Tensor,
+        prior_scale_px: torch.Tensor | None = None,
+    ) -> RGBPatchMeasurementPrediction:
+        del prior_scale_px
+        if query_patch.ndim != 4 or render_patch.ndim != 4:
+            raise ValueError("query_patch and render_patch must have shape (B,C,H,W)")
+        if int(query_patch.shape[0]) != int(render_patch.shape[0]):
+            raise ValueError("query_patch and render_patch must share batch size")
+        query_features = self.projection(query_patch)
+        render_features = self.projection(render_patch)
+        logits, offsets = template_search_cost_volume_logits(
+            query_features,
+            render_features,
+            search_radius_px=float(self.search_radius_px),
+            context_radius_px=float(self.context_radius_px),
+            step_px=float(self.step_px),
+            temperature=1.0,
+        )
+        logits = logits / max(float(self.temperature), 1e-8)
+        return RGBPatchMeasurementPrediction(
+            logits=logits,
+            offsets_xy=offsets,
+            dustbin_logit=torch.zeros((int(query_patch.shape[0]),), device=logits.device, dtype=logits.dtype),
+        )
+
+
+def _load_cached_projection_measurement_adapter(
+    payload: Mapping[str, Any],
+    *,
+    device: torch.device,
+) -> CachedProjectionMeasurementAdapter:
+    config = dict(payload.get("config", {}))
+    projection_type = str(config.get("projection_type", ""))
+    input_dim = int(config.get("input_dim", 0))
+    hidden_dim = int(config.get("hidden_dim", 128))
+    output_dim = int(config.get("output_dim", config.get("feature_dim", 64)))
+    if projection_type == "linear1x1":
+        projection: nn.Module = SharedFeatureProjection(input_dim=input_dim, hidden_dim=hidden_dim, output_dim=output_dim)
+    elif projection_type == "conv3":
+        projection = Conv3FeatureProjection(input_dim=input_dim, hidden_dim=hidden_dim, output_dim=output_dim)
+    elif projection_type in {"texture_rgb", "texture_rgb_graygrad", "texture_norm_graygrad"}:
+        if input_dim != 3:
+            raise ValueError(f"{projection_type} requires 3-channel RGB-like input, got {input_dim} channels")
+        projection = TexturePatchEncoder(
+            feature_dim=output_dim,
+            hidden_dim=hidden_dim,
+            input_mode=projection_type[len("texture_") :],
+        )
+    else:
+        raise ValueError(f"unsupported cached projection_type: {projection_type}")
+    state = payload["model"]
+    projection.load_state_dict(state, strict=True)
+    return CachedProjectionMeasurementAdapter(
+        projection=projection.to(device),
+        search_radius_px=float(config["search_radius_px"]),
+        context_radius_px=float(config.get("context_radius_px", 0.0)),
+        step_px=float(config["step_px"]),
+        temperature=float(config.get("temperature", 1.0)),
+    ).to(device)
+
+
+def load_rgb_patch_measurement_branch(checkpoint: Path, *, device: torch.device) -> nn.Module:
+    payload = torch.load(Path(checkpoint), map_location=device)
+    config = dict(payload.get("config", {}) if isinstance(payload, dict) else {})
+    projection_type = str(config.get("projection_type", ""))
+    if isinstance(payload, dict) and "model" in payload and projection_type in {
+        "linear1x1",
+        "conv3",
+        "texture_rgb",
+        "texture_rgb_graygrad",
+        "texture_norm_graygrad",
+    }:
+        return _load_cached_projection_measurement_adapter(payload, device=device)
+    model = RGBPatchMeasurementBranch(
+        search_radius_px=float(config.get("search_radius_px", 2.0)),
+        context_radius_px=float(config.get("context_radius_px", 8.0)),
+        step_px=float(config.get("step_px", 0.5)),
+        feature_dim=int(config.get("feature_dim", 32)),
+        hidden_dim=None if config.get("hidden_dim") is None else int(config.get("hidden_dim")),
+        input_mode=str(config.get("input_mode", "rgb")),
+        template_scale_factors=tuple(float(value) for value in config.get("template_scale_factors", [1.0])),
+        condition_on_prior_scale=bool(config.get("condition_on_prior_scale", False)),
+        prior_scale_expert_centers_px=tuple(float(value) for value in config.get("prior_scale_expert_centers_px", [])),
+        prior_scale_expert_projection=bool(config.get("prior_scale_expert_projection", False)),
+        prior_scale_expert_gate=str(config.get("prior_scale_expert_gate", "soft")),
+    ).to(device)
+    state = payload["model"] if isinstance(payload, dict) and "model" in payload else payload
+    incompatible = model.load_state_dict(state, strict=False)
+    allowed_missing = set()
+    if int(model.prior_scale_expert_centers.numel()) == 0:
+        allowed_missing.add("prior_scale_expert_centers")
+    missing = [key for key in incompatible.missing_keys if key not in allowed_missing]
+    if missing or incompatible.unexpected_keys:
+        raise RuntimeError(
+            "checkpoint is incompatible with RGBPatchMeasurementBranch: "
+            f"missing={missing}, unexpected={list(incompatible.unexpected_keys)}"
+        )
+    model.eval()
+    return model
+
+
+def _load_query_image(
+    *,
+    row: Mapping[str, object],
+    image_root: Path,
+    query_cache: dict[str, torch.Tensor],
+) -> torch.Tensor:
+    query_id = str(row.get("query_id", "")).strip()
+    if not query_id:
+        raise ValueError("match row missing query_id")
+    query_path = Path(image_root) / query_id
+    return _load_tensor_cached(query_cache, str(query_path), lambda p=query_path: _load_query_rgb(p))
+
+
+def _load_render_image(
+    *,
+    row: Mapping[str, object],
+    render_cache_by_query: Mapping[str, Path],
+    render_cache: dict[str, torch.Tensor],
+) -> torch.Tensor:
+    query_id = str(row.get("query_id", "")).strip()
+    if not query_id:
+        raise ValueError("match row missing query_id")
+    render_path = render_cache_by_query.get(query_id)
+    if render_path is None:
+        raise ValueError(f"missing render cache for query_id={query_id}")
+    return _load_tensor_cached(render_cache, str(render_path), lambda p=render_path: _load_render_rgb(p))
+
+
+def _crop_windows_for_rows(
+    rows: Sequence[Mapping[str, object]],
+    *,
+    image_root: Path,
+    render_cache_by_query: Mapping[str, Path],
+    query_image_width: int,
+    query_image_height: int,
+    render_image_width: int,
+    render_image_height: int,
+    crop_radius_px: float,
+    step_px: float,
+    query_cache: dict[str, torch.Tensor],
+    render_cache: dict[str, torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    query_patches: list[torch.Tensor] = []
+    render_patches: list[torch.Tensor] = []
+    for row in rows:
+        query_image = _load_query_image(row=row, image_root=image_root, query_cache=query_cache).unsqueeze(0)
+        render_image = _load_render_image(row=row, render_cache_by_query=render_cache_by_query, render_cache=render_cache).unsqueeze(0)
+        center = torch.tensor([_query_center(row)], dtype=torch.float32)
+        anchor = torch.tensor([_render_anchor(row)], dtype=torch.float32)
+        query_patch, _ = crop_rgb_window(
+            query_image,
+            center,
+            radius_px=float(crop_radius_px),
+            step_px=float(step_px),
+            image_width=int(query_image_width),
+            image_height=int(query_image_height),
+        )
+        render_patch, _ = crop_rgb_window(
+            render_image,
+            anchor,
+            radius_px=float(crop_radius_px),
+            step_px=float(step_px),
+            image_width=int(render_image_width),
+            image_height=int(render_image_height),
+        )
+        query_patches.append(query_patch[0])
+        render_patches.append(render_patch[0])
+    return torch.stack(query_patches, dim=0), torch.stack(render_patches, dim=0)
+
+
+def _likelihood_stats(
+    logits: torch.Tensor,
+    offsets_xy: torch.Tensor,
+    *,
+    covariance_floor_px2: float,
+) -> dict[str, torch.Tensor]:
+    probs = F.softmax(logits, dim=1)
+    offsets = offsets_xy.to(device=logits.device, dtype=logits.dtype)
+    mean = torch.sum(probs[..., None] * offsets.reshape(1, -1, 2), dim=1)
+    centered = offsets.reshape(1, -1, 2) - mean[:, None, :]
+    cov = torch.einsum("bk,bki,bkj->bij", probs, centered, centered)
+    cov = cov + torch.eye(2, device=logits.device, dtype=logits.dtype).unsqueeze(0) * float(covariance_floor_px2)
+    entropy = -torch.sum(probs * torch.log(probs.clamp_min(1e-12)), dim=1)
+    entropy_norm = entropy / max(math.log(float(int(probs.shape[1]))), 1e-12)
+    top2 = torch.topk(probs, k=2, dim=1).values
+    peak_idx = torch.argmax(probs, dim=1)
+    peak = offsets[peak_idx]
+    return {
+        "mean": mean,
+        "cov": cov,
+        "entropy_norm": entropy_norm,
+        "peak": peak,
+        "peak_prob": top2[:, 0],
+        "top2_gap": top2[:, 0] - top2[:, 1],
+    }
+
+
+def _direct_stats(
+    mean_offset_xy: torch.Tensor,
+    log_sigma_xy: torch.Tensor,
+    logits: torch.Tensor,
+    offsets_xy: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    log_sigma = log_sigma_xy.reshape(int(mean_offset_xy.shape[0]), 2).clamp(-5.0, 3.0)
+    sigma = torch.exp(log_sigma).clamp_min(1e-4)
+    likelihood = _likelihood_stats(logits, offsets_xy, covariance_floor_px2=1e-4)
+    return {
+        "mean": mean_offset_xy.reshape(int(mean_offset_xy.shape[0]), 2),
+        "cov": torch.diag_embed(sigma * sigma),
+        "entropy_norm": likelihood["entropy_norm"],
+        "peak": likelihood["peak"],
+        "peak_prob": likelihood["peak_prob"],
+        "top2_gap": likelihood["top2_gap"],
+    }
+
+
+def _mode_stats(
+    logits: torch.Tensor,
+    offsets_xy: torch.Tensor,
+    *,
+    covariance_floor_px2: float,
+) -> dict[str, torch.Tensor]:
+    likelihood = _likelihood_stats(logits, offsets_xy, covariance_floor_px2=float(covariance_floor_px2))
+    return {
+        "mean": likelihood["peak"],
+        "cov": likelihood["cov"],
+        "entropy_norm": likelihood["entropy_norm"],
+        "peak": likelihood["peak"],
+        "peak_prob": likelihood["peak_prob"],
+        "top2_gap": likelihood["top2_gap"],
+    }
+
+
+def apply_rgb_patch_measurements_to_rows(
+    rows: Sequence[Mapping[str, object]],
+    *,
+    image_root: Path,
+    render_cache_by_query: Mapping[str, Path],
+    model: nn.Module,
+    image_width: int | None = None,
+    image_height: int | None = None,
+    query_image_width: int | None = None,
+    query_image_height: int | None = None,
+    render_image_width: int | None = None,
+    render_image_height: int | None = None,
+    batch_size: int = 16,
+    device: torch.device | str = "cuda",
+    prediction_head: str = "likelihood",
+    prior_scale_key: str = "",
+    covariance_floor_px2: float = 1e-4,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Attach RGB template-to-search local measurements to match-table rows.
+
+    The function deliberately treats render-side geometry as immutable. It only
+    writes query_refined_x/query_refined_y and measurement diagnostics. Existing
+    render_x/render_y/render_depth/world_x/world_y/world_z values are preserved.
+    """
+
+    head = str(prediction_head)
+    if head not in {"likelihood", "mode", "direct"}:
+        raise ValueError("prediction_head must be 'likelihood', 'mode', or 'direct'")
+    torch_device = torch.device(device if torch.cuda.is_available() or not str(device).startswith("cuda") else "cpu")
+    q_width = int(query_image_width if query_image_width is not None else image_width if image_width is not None else 0)
+    q_height = int(query_image_height if query_image_height is not None else image_height if image_height is not None else 0)
+    r_width = int(render_image_width if render_image_width is not None else image_width if image_width is not None else q_width)
+    r_height = int(render_image_height if render_image_height is not None else image_height if image_height is not None else q_height)
+    if q_width <= 0 or q_height <= 0 or r_width <= 0 or r_height <= 0:
+        raise ValueError("query/render image dimensions must be positive")
+    model = model.to(torch_device)
+    model.eval()
+    output = [dict(row) for row in rows]
+    query_cache: dict[str, torch.Tensor] = {}
+    render_cache: dict[str, torch.Tensor] = {}
+    batch = max(1, int(batch_size))
+    with torch.no_grad():
+        for start in range(0, len(output), batch):
+            batch_rows = output[start : start + batch]
+            query_patch, render_patch = _crop_windows_for_rows(
+                batch_rows,
+                image_root=Path(image_root),
+                render_cache_by_query=render_cache_by_query,
+                query_image_width=q_width,
+                query_image_height=q_height,
+                render_image_width=r_width,
+                render_image_height=r_height,
+                crop_radius_px=model.crop_radius_px,
+                step_px=model.step_px,
+                query_cache=query_cache,
+                render_cache=render_cache,
+            )
+            prior_scale = _prior_scale_batch(batch_rows, prior_scale_key=str(prior_scale_key))
+            pred = model.forward_from_patches(
+                query_patch.to(torch_device),
+                render_patch.to(torch_device),
+                prior_scale_px=None if prior_scale is None else prior_scale.to(torch_device),
+            )
+            if head == "likelihood":
+                stats = _likelihood_stats(pred.logits, pred.offsets_xy, covariance_floor_px2=float(covariance_floor_px2))
+            elif head == "mode":
+                stats = _mode_stats(pred.logits, pred.offsets_xy, covariance_floor_px2=float(covariance_floor_px2))
+            else:
+                if pred.direct_mean_offset_xy is None or pred.direct_log_sigma_xy is None:
+                    raise ValueError("checkpoint does not expose direct offset head outputs")
+                stats = _direct_stats(pred.direct_mean_offset_xy, pred.direct_log_sigma_xy, pred.logits, pred.offsets_xy)
+            mean = stats["mean"].detach().cpu()
+            cov = stats["cov"].detach().cpu()
+            entropy = stats["entropy_norm"].detach().cpu()
+            peak = stats["peak"].detach().cpu()
+            peak_prob = stats["peak_prob"].detach().cpu()
+            top2_gap = stats["top2_gap"].detach().cpu()
+            valid_prob = (1.0 - torch.sigmoid(pred.dustbin_logit.detach())).cpu()
+            for local_index, row in enumerate(batch_rows):
+                cx, cy = _query_center(row)
+                dx = float(mean[local_index, 0].item())
+                dy = float(mean[local_index, 1].item())
+                cov_row = cov[local_index]
+                cov_xx = float(cov_row[0, 0].item())
+                cov_xy = float(cov_row[0, 1].item())
+                cov_yy = float(cov_row[1, 1].item())
+                sigma = float(math.sqrt(max(0.5 * (cov_xx + cov_yy), 1e-12)))
+                row["query_center_x"] = row.get("query_center_x", row.get("center_x", row.get("query_x", cx)))
+                row["query_center_y"] = row.get("query_center_y", row.get("center_y", row.get("query_y", cy)))
+                row["query_refined_x"] = float(cx + dx)
+                row["query_refined_y"] = float(cy + dy)
+                row["measurement_dx"] = dx
+                row["measurement_dy"] = dy
+                row["measurement_cov_xx"] = cov_xx
+                row["measurement_cov_xy"] = cov_xy
+                row["measurement_cov_yy"] = cov_yy
+                row["measurement_sigma_px"] = sigma
+                row["measurement_valid_prob"] = float(valid_prob[local_index].item())
+                row["local_cost_entropy"] = float(entropy[local_index].item())
+                row["measurement_peak_dx"] = float(peak[local_index, 0].item())
+                row["measurement_peak_dy"] = float(peak[local_index, 1].item())
+                row["local_cost_peak_prob"] = float(peak_prob[local_index].item())
+                row["local_cost_top2_gap"] = float(top2_gap[local_index].item())
+                row["rgb_patch_prediction_head"] = head
+                row["measurement_search_radius_px"] = float(model.search_radius_px)
+                row["measurement_context_radius_px"] = float(model.context_radius_px)
+                row["measurement_step_px"] = float(model.step_px)
+                if not _has_explicit_value(row, "depth_valid"):
+                    row["depth_valid"] = _valid_render_depth(row)
+    summary = dense_depth_measurement_summary(output)
+    summary.update(
+        {
+            "stage": "measurement_v1_rgb_patch_match_table_fusion",
+            "prediction_head": head,
+            "measurement_model_type": str(getattr(model, "measurement_model_type", model.__class__.__name__)),
+            "batch_size": int(batch),
+            "query_image_width": int(q_width),
+            "query_image_height": int(q_height),
+            "render_image_width": int(r_width),
+            "render_image_height": int(r_height),
+            "prior_scale_key": str(prior_scale_key),
+        }
+    )
+    return output, summary
+
+
+def apply_rgb_patch_measurements_to_match_table(
+    *,
+    match_table_csv: Path,
+    render_cache_manifest_csv: Path,
+    image_root: Path,
+    checkpoint: Path,
+    output_dir: Path,
+    image_width: int | None = None,
+    image_height: int | None = None,
+    query_image_width: int | None = None,
+    query_image_height: int | None = None,
+    render_image_width: int | None = None,
+    render_image_height: int | None = None,
+    batch_size: int = 16,
+    device: str = "cuda",
+    base_dir: Path | None = None,
+    max_rows: int | None = None,
+    prediction_head: str = "likelihood",
+    prior_scale_key: str = "",
+) -> dict[str, Any]:
+    base = Path.cwd() if base_dir is None else Path(base_dir)
+    rows = _read_csv_rows(Path(match_table_csv), max_rows=max_rows)
+    render_map = _render_cache_by_query(Path(render_cache_manifest_csv), base_dir=base)
+    torch_device = torch.device(device if torch.cuda.is_available() or not str(device).startswith("cuda") else "cpu")
+    model = load_rgb_patch_measurement_branch(Path(checkpoint), device=torch_device)
+    fused_rows, summary = apply_rgb_patch_measurements_to_rows(
+        rows,
+        image_root=Path(image_root),
+        render_cache_by_query=render_map,
+        model=model,
+        image_width=image_width,
+        image_height=image_height,
+        query_image_width=query_image_width,
+        query_image_height=query_image_height,
+        render_image_width=render_image_width,
+        render_image_height=render_image_height,
+        batch_size=int(batch_size),
+        device=torch_device,
+        prediction_head=str(prediction_head),
+        prior_scale_key=str(prior_scale_key),
+    )
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    fieldnames = _fieldnames_for_rows(fused_rows)
+    _write_csv(output / "match_table.csv", fused_rows, fieldnames)
+    _write_jsonl(output / "match_table.jsonl", fused_rows)
+    summary = {
+        **summary,
+        "match_table_csv": str(match_table_csv),
+        "render_cache_manifest_csv": str(render_cache_manifest_csv),
+        "image_root": str(image_root),
+        "checkpoint": str(checkpoint),
+        "row_count": int(len(fused_rows)),
+        "outputs": {
+            "match_table_csv": str(output / "match_table.csv"),
+            "match_table_jsonl": str(output / "match_table.jsonl"),
+            "summary": str(output / "summary.json"),
+        },
+    }
+    (output / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+    return summary

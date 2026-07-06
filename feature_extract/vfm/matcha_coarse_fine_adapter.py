@@ -12,6 +12,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from feature_extract.vfm.measurement_v1.continuous_fine import continuous_fine_nll, local_map_refined_xy
+
 from feature_extract.vfm.matcha_coarse_supervision import MatchaCoarseSupervision
 from feature_extract.vfm.patch_selector_training import ResidualGatedPatchSelector
 from feature_extract.vfm.query_to_3d_matching import normalize_rows
@@ -638,6 +640,7 @@ def _fine_coordinate_loss_and_metrics(
     continuous_loss_weight: float = 0.0,
     uncertainty_log_sigma: torch.Tensor | None = None,
     uncertainty_loss_weight: float = 0.0,
+    loss_mode: str = "ce_plus_continuous",
 ) -> tuple[torch.Tensor | None, dict[str, float]]:
     """64-bin coordinate classification loss for matched feature pairs.
 
@@ -647,6 +650,8 @@ def _fine_coordinate_loss_and_metrics(
     detached dual-softmax match confidence.
     """
 
+    if str(loss_mode) not in {"ce", "ce_plus_continuous", "continuous"}:
+        raise ValueError("loss_mode must be 'ce', 'ce_plus_continuous', or 'continuous'")
     if logits.ndim != 2:
         raise ValueError("fine matcher logits must have shape (N, C)")
     if int(logits.shape[1]) < 64:
@@ -679,15 +684,15 @@ def _fine_coordinate_loss_and_metrics(
         spatial_target = spatial_target / spatial_target_sum
         per_row = -torch.sum(spatial_target * F.log_softmax(spatial_logits[valid], dim=1), dim=1)
     if confidence is None:
-        loss = per_row.mean()
+        ce_loss = per_row.mean()
         acc_mask = valid
     else:
         valid_confidence = torch.clamp(confidence[valid], min=0.0)
         confidence_sum = torch.sum(valid_confidence)
         if float(confidence_sum.detach().cpu().item()) > 0.0:
-            loss = torch.sum(per_row * (valid_confidence / confidence_sum))
+            ce_loss = torch.sum(per_row * (valid_confidence / confidence_sum))
         else:
-            loss = per_row.mean()
+            ce_loss = per_row.mean()
         acc_mask = valid & (confidence > float(confidence_acc_threshold))
         if not torch.any(acc_mask):
             acc_mask = valid
@@ -696,14 +701,19 @@ def _fine_coordinate_loss_and_metrics(
     coords_for_loss = torch.arange(64, dtype=probs_for_loss.dtype, device=probs_for_loss.device)
     bin_x_for_loss = torch.remainder(coords_for_loss, bins) + 0.5
     bin_y_for_loss = torch.floor(coords_for_loss / bins) + 0.5
-    expected_x_for_loss = torch.sum(probs_for_loss * bin_x_for_loss[None], dim=1)
-    expected_y_for_loss = torch.sum(probs_for_loss * bin_y_for_loss[None], dim=1)
     target_valid_for_loss = target[valid].to(probs_for_loss.device)
-    target_x_for_loss = torch.remainder(target_valid_for_loss, bins).to(probs_for_loss.dtype) + 0.5
-    target_y_for_loss = torch.floor(target_valid_for_loss.to(probs_for_loss.dtype) / float(bins)) + 0.5
+    if soft_targets is None:
+        target_x_for_loss = torch.remainder(target_valid_for_loss, bins).to(probs_for_loss.dtype) + 0.5
+        target_y_for_loss = torch.floor(target_valid_for_loss.to(probs_for_loss.dtype) / float(bins)) + 0.5
+    else:
+        spatial_target_for_xy = soft_targets[valid, :64].to(probs_for_loss.device, dtype=probs_for_loss.dtype)
+        spatial_target_for_xy = spatial_target_for_xy / torch.sum(spatial_target_for_xy, dim=1, keepdim=True).clamp_min(1e-8)
+        target_x_for_loss = torch.sum(spatial_target_for_xy * bin_x_for_loss[None], dim=1)
+        target_y_for_loss = torch.sum(spatial_target_for_xy * bin_y_for_loss[None], dim=1)
+    refined_xy_for_loss = local_map_refined_xy(spatial_logits[valid], radius=1)
     continuous_epe = torch.sqrt(
         torch.clamp(
-            (expected_x_for_loss - target_x_for_loss) ** 2 + (expected_y_for_loss - target_y_for_loss) ** 2,
+            (refined_xy_for_loss[:, 0] - target_x_for_loss) ** 2 + (refined_xy_for_loss[:, 1] - target_y_for_loss) ** 2,
             min=1e-12,
         )
     )
@@ -717,8 +727,18 @@ def _fine_coordinate_loss_and_metrics(
             return torch.mean(values)
         return torch.sum(values * (valid_weights / weight_sum))
 
-    continuous_loss = weighted_mean(continuous_epe)
-    if float(continuous_loss_weight) > 0.0:
+    target_xy_for_loss = torch.stack([target_x_for_loss, target_y_for_loss], dim=1)
+    continuous_nll, continuous_nll_metrics = continuous_fine_nll(
+        spatial_logits[valid],
+        target_xy_for_loss,
+        confidence=None if confidence is None else confidence[valid],
+    )
+    continuous_loss = continuous_nll
+    if str(loss_mode) == "continuous":
+        loss = continuous_loss
+    else:
+        loss = ce_loss
+    if str(loss_mode) == "ce_plus_continuous" and float(continuous_loss_weight) > 0.0:
         loss = loss + float(continuous_loss_weight) * continuous_loss
     uncertainty_nll = None
     learned_uncertainty = None
@@ -736,11 +756,18 @@ def _fine_coordinate_loss_and_metrics(
         coords = torch.arange(64, dtype=probs.dtype, device=probs.device)
         bin_x = torch.remainder(coords, bins) + 0.5
         bin_y = torch.floor(coords / bins) + 0.5
-        expected_x = torch.sum(probs * bin_x[None], dim=1)
-        expected_y = torch.sum(probs * bin_y[None], dim=1)
         target_valid = target[valid].to(probs.device)
-        target_x = torch.remainder(target_valid, bins).to(probs.dtype) + 0.5
-        target_y = torch.floor(target_valid.to(probs.dtype) / float(bins)) + 0.5
+        if soft_targets is None:
+            target_x = torch.remainder(target_valid, bins).to(probs.dtype) + 0.5
+            target_y = torch.floor(target_valid.to(probs.dtype) / float(bins)) + 0.5
+        else:
+            spatial_target_for_metrics = soft_targets[valid, :64].to(probs.device, dtype=probs.dtype)
+            spatial_target_for_metrics = spatial_target_for_metrics / torch.sum(spatial_target_for_metrics, dim=1, keepdim=True).clamp_min(1e-8)
+            target_x = torch.sum(spatial_target_for_metrics * bin_x[None], dim=1)
+            target_y = torch.sum(spatial_target_for_metrics * bin_y[None], dim=1)
+        refined_xy = local_map_refined_xy(spatial_logits[valid], radius=1)
+        expected_x = refined_xy[:, 0]
+        expected_y = refined_xy[:, 1]
         epe = torch.sqrt((expected_x - target_x) ** 2 + (expected_y - target_y) ** 2)
         variance = torch.sum(probs * ((bin_x[None] - expected_x[:, None]) ** 2 + (bin_y[None] - expected_y[:, None]) ** 2), dim=1)
         uncertainty = torch.sqrt(torch.clamp(variance, min=0.0))
@@ -761,7 +788,10 @@ def _fine_coordinate_loss_and_metrics(
         "acc": acc,
         "epe_bins": epe_value,
         "uncertainty_bins": uncertainty_value,
-        "continuous_epe_bins": float(continuous_loss.detach().cpu().item()),
+        "continuous_epe_bins": float(weighted_mean(continuous_epe).detach().cpu().item()),
+        "continuous_nll": float(continuous_nll_metrics["nll"]),
+        "loss_mode_continuous": 1.0 if str(loss_mode) == "continuous" else 0.0,
+        "loss_mode_ce": 1.0 if str(loss_mode) == "ce" else 0.0,
     }
     if uncertainty_nll is not None:
         metrics["uncertainty_nll"] = float(uncertainty_nll.detach().cpu().item())

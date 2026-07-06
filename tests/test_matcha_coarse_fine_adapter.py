@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 import torch
 
+from feature_extract.vfm.measurement_v1.continuous_fine import continuous_fine_nll
 from feature_extract.vfm.matcha_coarse_fine_adapter import (
     MatchaCoarseFineAdapter,
     MatchaCoarseFineTrainingConfig,
@@ -279,6 +280,59 @@ def test_fine_coordinate_loss_trains_continuous_offset_and_learned_uncertainty()
     assert metrics["continuous_epe_bins"] < 0.05
     assert metrics["learned_uncertainty_bins"] == pytest.approx(1.0)
     assert metrics["uncertainty_nll"] < 0.1
+
+
+def test_fine_coordinate_loss_can_use_continuous_only_or_ce_only_modes() -> None:
+    logits = torch.full((2, 64), -3.0)
+    logits[0, 9] = 4.0
+    logits[1, 18] = 2.0
+    labels = torch.asarray([9, 18], dtype=torch.long)
+    target_xy = torch.asarray([[1.5, 1.5], [2.5, 2.5]], dtype=torch.float32)
+
+    continuous_loss, continuous_metrics = _fine_coordinate_loss_and_metrics(
+        logits,
+        labels,
+        continuous_loss_weight=999.0,
+        loss_mode="continuous",
+    )
+    expected_nll, _expected_metrics = continuous_fine_nll(logits, target_xy)
+    ce_loss, ce_metrics = _fine_coordinate_loss_and_metrics(
+        logits,
+        labels,
+        continuous_loss_weight=999.0,
+        loss_mode="ce",
+    )
+    expected_ce = torch.nn.functional.cross_entropy(logits, labels)
+
+    assert continuous_loss is not None
+    assert ce_loss is not None
+    assert torch.allclose(continuous_loss, expected_nll)
+    assert torch.allclose(ce_loss, expected_ce)
+    assert continuous_metrics["loss_mode_continuous"] == 1.0
+    assert ce_metrics["loss_mode_ce"] == 1.0
+
+
+def test_fine_coordinate_continuous_target_uses_soft_label_subcell_mean() -> None:
+    logits = torch.full((1, 64), -4.0)
+    logits[0, 9] = 2.0
+    logits[0, 10] = 1.0
+    labels = torch.asarray([9], dtype=torch.long)
+    soft_targets = torch.zeros((1, 65), dtype=torch.float32)
+    soft_targets[0, 9] = 0.25
+    soft_targets[0, 10] = 0.75
+
+    loss, metrics = _fine_coordinate_loss_and_metrics(
+        logits,
+        labels,
+        soft_targets=soft_targets,
+        loss_mode="continuous",
+    )
+    expected_target_xy = torch.asarray([[2.25, 1.5]], dtype=torch.float32)
+    expected_nll, _expected_metrics = continuous_fine_nll(logits, expected_target_xy)
+
+    assert loss is not None
+    assert torch.allclose(loss, expected_nll)
+    assert metrics["loss_mode_continuous"] == 1.0
 
 
 def test_adapter_pair_fine_loss_ignores_dustbin_labels() -> None:

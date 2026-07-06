@@ -371,6 +371,10 @@ class QueryTo3DMatch:
     patch_offset_sigma: float | None = None
     patch_offset_applied: bool | None = None
     patch_offset_norm_px: float | None = None
+    anchor_xyz_change_m: float | None = None
+    render_depth_change_m: float | None = None
+    surface_switch_flag: bool | None = None
+    render_depth_gradient: float | None = None
     patch_offset_consistency_before_px: float | None = None
     patch_offset_consistency_after_px: float | None = None
     token_match_rank: int | None = None

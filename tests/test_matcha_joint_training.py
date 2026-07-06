@@ -315,11 +315,14 @@ def test_local_window_correlation_head_scores_exact_descriptor_candidate_highest
 
 
 def test_matcha_joint_config_accepts_correlation_local_window_mode() -> None:
-    cfg = MatchaJointTrainingConfig(local_window_fine_mode="correlation")
+    cfg = MatchaJointTrainingConfig(local_window_fine_mode="correlation", fine_loss_mode="continuous")
 
     assert cfg.local_window_fine_mode == "correlation"
+    assert cfg.fine_loss_mode == "continuous"
     with pytest.raises(ValueError, match="local_window_fine_mode"):
         MatchaJointTrainingConfig(local_window_fine_mode="unsupported")
+    with pytest.raises(ValueError, match="fine_loss_mode"):
+        MatchaJointTrainingConfig(fine_loss_mode="unsupported")
 
 
 def test_build_matcha_joint_cache_radio_dual_defaults_to_radio_dual_layer() -> None:
@@ -2496,6 +2499,8 @@ def test_train_matcha_joint_model_cli_accepts_joint_cache_manifest(tmp_path) -> 
             "8",
             "--group_size",
             "4",
+            "--fine_loss_mode",
+            "continuous",
             "--device",
             "cpu",
         ]
@@ -2504,6 +2509,9 @@ def test_train_matcha_joint_model_cli_accepts_joint_cache_manifest(tmp_path) -> 
     assert adapter_model.exists()
     assert joint_model.exists()
     assert summary.exists()
+    payload = json.loads(summary.read_text())
+    assert payload["config"]["fine_loss_mode"] == "continuous"
+    assert payload["training"]["fine_loss_mode"] == "continuous"
 
 
 def test_train_matcha_joint_model_cli_supports_lazy_manifest_validation_and_best_checkpoint(tmp_path) -> None:

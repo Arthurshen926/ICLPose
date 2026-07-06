@@ -508,6 +508,8 @@ def rotation_angle_deg(rotation_a_w2c: np.ndarray, rotation_b_w2c: np.ndarray) -
     relative = np.asarray(rotation_a_w2c, dtype=np.float64) @ np.asarray(rotation_b_w2c, dtype=np.float64).T
     cos_angle = float((np.trace(relative) - 1.0) * 0.5)
     cos_angle = min(1.0, max(-1.0, cos_angle))
+    if abs(1.0 - cos_angle) <= 1e-12:
+        return 0.0
     return float(np.degrees(np.arccos(cos_angle)))
 
 

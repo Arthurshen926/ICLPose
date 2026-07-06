@@ -1552,6 +1552,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--render_pair_fine_loss_weight", type=float, default=None)
     parser.add_argument("--query_pair_fine_loss_weight", type=float, default=0.0)
     parser.add_argument("--fine_continuous_loss_weight", type=float, default=0.25)
+    parser.add_argument("--fine_loss_mode", choices=("ce", "ce_plus_continuous", "continuous"), default="ce_plus_continuous")
     parser.add_argument("--fine_uncertainty_loss_weight", type=float, default=0.05)
     parser.add_argument("--pair_confidence_loss_weight", type=float, default=0.1)
     parser.add_argument("--dense_heatmap_loss_weight", type=float, default=0.25)
@@ -1649,6 +1650,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         fine_continuous_loss_weight=float(args.fine_continuous_loss_weight),
         fine_uncertainty_loss_weight=float(args.fine_uncertainty_loss_weight),
         pair_confidence_loss_weight=float(args.pair_confidence_loss_weight),
+        fine_loss_mode=str(args.fine_loss_mode),
         dense_heatmap_loss_weight=float(args.dense_heatmap_loss_weight),
         rgb_keypoint_loss_weight=float(args.rgb_keypoint_loss_weight),
         rgb_keypoint_position_loss_weight=float(args.rgb_keypoint_position_loss_weight),

@@ -432,6 +432,7 @@ def keypoint_feature_matches_to_pnp_matches(
     min_render_alpha: float = 0.0,
     max_render_depth_delta_m: float | None = None,
     fallback_to_cell_center: bool = False,
+    fixed_render_anchor: bool = False,
 ) -> list[QueryTo3DMatch]:
     """Convert render-keypoint matches into query 2D to world 3D PnP matches."""
 
@@ -475,12 +476,19 @@ def keypoint_feature_matches_to_pnp_matches(
     used_xy = render_xy.copy()
     used_depth = depth_values.copy()
     used_alpha = alpha_values.copy()
+    fixed_anchor = bool(fixed_render_anchor) and has_grid and center_xy is not None and center_depth is not None and center_valid is not None
     offset_applied = np.full((render_xy.shape[0],), None, dtype=object)
     offset_norm = np.full((render_xy.shape[0],), np.nan, dtype=np.float64)
     if has_grid and center_xy is not None:
         offset_norm = np.linalg.norm(render_xy - center_xy, axis=1).astype(np.float64)
         offset_applied[:] = True
     valid = guard_valid.copy()
+    if fixed_anchor:
+        used_xy = center_xy.copy()
+        used_depth = center_depth.copy()
+        used_alpha = center_alpha.copy() if center_alpha is not None else np.ones_like(center_depth)
+        valid = center_valid.copy()
+        offset_applied[:] = False
     if bool(fallback_to_cell_center) and has_grid and center_xy is not None and center_valid is not None:
         fallback = ~valid & center_valid
         used_xy[fallback] = center_xy[fallback]
@@ -490,7 +498,19 @@ def keypoint_feature_matches_to_pnp_matches(
         offset_applied[fallback] = False
         offset_norm[fallback] = 0.0
     xyz, xyz_valid = backproject_depth_to_world(used_xy, used_depth, camera, render_pose_w2c)
+    dynamic_xyz = None
+    dynamic_xyz_valid = None
+    anchor_xyz_change = np.full((render_xy.shape[0],), np.nan, dtype=np.float64)
+    render_depth_change = np.full((render_xy.shape[0],), np.nan, dtype=np.float64)
+    surface_switch = np.full((render_xy.shape[0],), False, dtype=bool)
+    if fixed_anchor:
+        dynamic_xyz, dynamic_xyz_valid = backproject_depth_to_world(render_xy, depth_values, camera, render_pose_w2c)
+        both_valid = dynamic_xyz_valid & xyz_valid & np.isfinite(depth_values) & np.isfinite(used_depth)
+        anchor_xyz_change[both_valid] = np.linalg.norm(dynamic_xyz[both_valid] - xyz[both_valid], axis=1)
+        render_depth_change[both_valid] = np.abs(depth_values[both_valid] - used_depth[both_valid])
+        surface_switch[both_valid] = False
     valid = valid & xyz_valid
+    gradients = _depth_gradient_at_xy(depth_map, used_xy, width, height)
     pnp_matches: list[QueryTo3DMatch] = []
     for idx, (match, is_valid) in enumerate(zip(matches, valid)):
         if not bool(is_valid):
@@ -524,6 +544,21 @@ def keypoint_feature_matches_to_pnp_matches(
                 cell_delta_y=match.cell_delta_y,
                 patch_offset_confidence=match.fine_offset_confidence,
                 patch_offset_sigma=match.fine_offset_sigma_px,
+                anchor_xyz_change_m=0.0 if fixed_anchor else (None if not np.isfinite(anchor_xyz_change[idx]) else float(anchor_xyz_change[idx])),
+                render_depth_change_m=None if not np.isfinite(render_depth_change[idx]) else float(render_depth_change[idx]),
+                surface_switch_flag=bool(surface_switch[idx]) if fixed_anchor else None,
+                render_depth_gradient=None if not np.isfinite(gradients[idx]) else float(gradients[idx]),
             )
         )
     return pnp_matches
+
+
+def _depth_gradient_at_xy(depth_map: np.ndarray, xy: np.ndarray, image_width: int, image_height: int) -> np.ndarray:
+    depth = np.asarray(depth_map, dtype=np.float64)
+    if depth.ndim != 2:
+        return np.full((np.asarray(xy).reshape(-1, 2).shape[0],), np.nan, dtype=np.float64)
+    gy, gx = np.gradient(depth)
+    grad = np.sqrt(gx * gx + gy * gy).astype(np.float32)
+    values, valid = _sample_scalar_map(grad, np.asarray(xy, dtype=np.float64).reshape(-1, 2), int(image_width), int(image_height))
+    values[~valid] = np.nan
+    return values.astype(np.float64, copy=False)

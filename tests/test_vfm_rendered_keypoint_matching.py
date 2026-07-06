@@ -206,6 +206,47 @@ def test_keypoint_feature_matches_to_pnp_matches_can_guard_render_offset_with_al
     assert pnp_matches[0].render_alpha == 1.0
 
 
+def test_keypoint_feature_matches_to_pnp_matches_can_freeze_render_anchor_xyz() -> None:
+    camera = ColmapCamera(camera_id=1, model_id=1, width=20, height=20, params=(10.0, 10.0, 10.0, 10.0))
+    matches = [
+        KeypointFeatureMatch(
+            query_index=0,
+            render_index=0,
+            query_xy=np.asarray([10.0, 10.0], dtype=np.float64),
+            render_xy=np.asarray([15.0, 15.0], dtype=np.float64),
+            similarity=0.9,
+            ratio=0.1,
+        )
+    ]
+    depth = np.full((20, 20), 4.0, dtype=np.float32)
+    depth[15, 15] = 8.0
+
+    dynamic = keypoint_feature_matches_to_pnp_matches(
+        matches,
+        depth,
+        camera,
+        np.eye(4, dtype=np.float64),
+        render_grid_width=2,
+        render_grid_height=2,
+    )
+    fixed = keypoint_feature_matches_to_pnp_matches(
+        matches,
+        depth,
+        camera,
+        np.eye(4, dtype=np.float64),
+        render_grid_width=2,
+        render_grid_height=2,
+        fixed_render_anchor=True,
+    )
+
+    assert len(dynamic) == len(fixed) == 1
+    assert np.allclose(dynamic[0].xyz, [4.0, 4.0, 8.0], atol=1e-6)
+    assert np.allclose(fixed[0].xyz, [-2.0, -2.0, 4.0], atol=1e-6)
+    assert fixed[0].anchor_xyz_change_m == 0.0
+    assert fixed[0].surface_switch_flag is False
+    assert fixed[0].render_depth_change_m == 4.0
+
+
 def test_keypoint_feature_matches_requires_grid_for_depth_delta_guard() -> None:
     camera = ColmapCamera(camera_id=1, model_id=1, width=20, height=20, params=(10.0, 10.0, 10.0, 10.0))
     matches = [

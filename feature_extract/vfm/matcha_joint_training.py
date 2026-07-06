@@ -418,6 +418,7 @@ class MatchaJointTrainingConfig:
     pair_fine_loss_weight: float = 0.25
     query_pair_fine_loss_weight: float = 0.0
     fine_continuous_loss_weight: float = 0.25
+    fine_loss_mode: str = "ce_plus_continuous"
     fine_uncertainty_loss_weight: float = 0.05
     pair_confidence_loss_weight: float = 0.1
     dense_heatmap_loss_weight: float = 0.25
@@ -514,6 +515,8 @@ class MatchaJointTrainingConfig:
             raise ValueError("patch_correlation_window_size must be a positive odd integer")
         if str(self.local_window_fine_mode) not in {"mlp", "correlation"}:
             raise ValueError("local_window_fine_mode must be 'mlp' or 'correlation'")
+        if str(self.fine_loss_mode) not in {"ce", "ce_plus_continuous", "continuous"}:
+            raise ValueError("fine_loss_mode must be 'ce', 'ce_plus_continuous', or 'continuous'")
         if int(self.rgb_non_keypoint_divisor) <= 0:
             raise ValueError("rgb_non_keypoint_divisor must be positive")
 
@@ -1317,7 +1320,12 @@ def _coarse_fine_loss(
     fine_metrics: dict[str, float] = {}
     if float(config.pair_fine_loss_weight) > 0.0:
         pair_fine = model.pair_fine_logits(query_z, render_z)
-        pair_sigma = model.pair_fine_uncertainty_log_sigma(query_z, render_z)
+        pair_sigma = (
+            model.pair_fine_uncertainty_log_sigma(query_z, render_z)
+            if float(config.fine_uncertainty_loss_weight) > 0.0
+            and hasattr(model, "pair_fine_uncertainty_log_sigma")
+            else None
+        )
         pair_fine_loss, item_metrics = _fine_coordinate_loss_and_metrics(
             pair_fine,
             rlabels,
@@ -1326,13 +1334,19 @@ def _coarse_fine_loss(
             continuous_loss_weight=float(config.fine_continuous_loss_weight),
             uncertainty_log_sigma=pair_sigma,
             uncertainty_loss_weight=float(config.fine_uncertainty_loss_weight),
+            loss_mode=str(config.fine_loss_mode),
         )
         fine_metrics.update({f"render_pair_fine_{key}": value for key, value in item_metrics.items()})
         if pair_fine_loss is not None:
             loss = loss + float(config.pair_fine_loss_weight) * pair_fine_loss
     if float(config.query_pair_fine_loss_weight) > 0.0:
         query_pair_fine = model.query_pair_fine_logits(query_z, render_z)
-        query_pair_sigma = model.query_pair_fine_uncertainty_log_sigma(query_z, render_z)
+        query_pair_sigma = (
+            model.query_pair_fine_uncertainty_log_sigma(query_z, render_z)
+            if float(config.fine_uncertainty_loss_weight) > 0.0
+            and hasattr(model, "query_pair_fine_uncertainty_log_sigma")
+            else None
+        )
         query_pair_fine_loss, item_metrics = _fine_coordinate_loss_and_metrics(
             query_pair_fine,
             qlabels,
@@ -1341,6 +1355,7 @@ def _coarse_fine_loss(
             continuous_loss_weight=float(config.fine_continuous_loss_weight),
             uncertainty_log_sigma=query_pair_sigma,
             uncertainty_loss_weight=float(config.fine_uncertainty_loss_weight),
+            loss_mode=str(config.fine_loss_mode),
         )
         fine_metrics.update({f"query_pair_fine_{key}": value for key, value in item_metrics.items()})
         if query_pair_fine_loss is not None:
@@ -1819,7 +1834,12 @@ def _full_map_correspondence_loss(
     fine_metrics: dict[str, float] = {}
     if float(config.pair_fine_loss_weight) > 0.0:
         pair_fine = model.pair_fine_logits(query_z, render_z)
-        pair_sigma = model.pair_fine_uncertainty_log_sigma(query_z, render_z)
+        pair_sigma = (
+            model.pair_fine_uncertainty_log_sigma(query_z, render_z)
+            if float(config.fine_uncertainty_loss_weight) > 0.0
+            and hasattr(model, "pair_fine_uncertainty_log_sigma")
+            else None
+        )
         pair_fine_loss, item_metrics = _fine_coordinate_loss_and_metrics(
             pair_fine,
             rlabels,
@@ -1828,13 +1848,19 @@ def _full_map_correspondence_loss(
             continuous_loss_weight=float(config.fine_continuous_loss_weight),
             uncertainty_log_sigma=pair_sigma,
             uncertainty_loss_weight=float(config.fine_uncertainty_loss_weight),
+            loss_mode=str(config.fine_loss_mode),
         )
         fine_metrics.update({f"map_render_pair_fine_{key}": value for key, value in item_metrics.items()})
         if pair_fine_loss is not None:
             loss = loss + float(config.pair_fine_loss_weight) * pair_fine_loss
     if float(config.query_pair_fine_loss_weight) > 0.0:
         query_pair_fine = model.query_pair_fine_logits(query_z, render_z)
-        query_pair_sigma = model.query_pair_fine_uncertainty_log_sigma(query_z, render_z)
+        query_pair_sigma = (
+            model.query_pair_fine_uncertainty_log_sigma(query_z, render_z)
+            if float(config.fine_uncertainty_loss_weight) > 0.0
+            and hasattr(model, "query_pair_fine_uncertainty_log_sigma")
+            else None
+        )
         query_pair_fine_loss, item_metrics = _fine_coordinate_loss_and_metrics(
             query_pair_fine,
             qlabels,
@@ -1843,6 +1869,7 @@ def _full_map_correspondence_loss(
             continuous_loss_weight=float(config.fine_continuous_loss_weight),
             uncertainty_log_sigma=query_pair_sigma,
             uncertainty_loss_weight=float(config.fine_uncertainty_loss_weight),
+            loss_mode=str(config.fine_loss_mode),
         )
         fine_metrics.update({f"map_query_pair_fine_{key}": value for key, value in item_metrics.items()})
         if query_pair_fine_loss is not None:
@@ -2088,6 +2115,7 @@ def _local_window_fine_loss(
         continuous_loss_weight=float(config.fine_continuous_loss_weight),
         uncertainty_log_sigma=render_sigma,
         uncertainty_loss_weight=float(config.fine_uncertainty_loss_weight),
+        loss_mode=str(config.fine_loss_mode),
     )
     query_labels = _tensor(query_labels_np, dtype=torch.long, device=device)
     query_soft_targets = None if query_soft_np is None else _tensor(query_soft_np, dtype=torch.float32, device=device)
@@ -2108,6 +2136,7 @@ def _local_window_fine_loss(
         continuous_loss_weight=float(config.fine_continuous_loss_weight),
         uncertainty_log_sigma=query_sigma,
         uncertainty_loss_weight=float(config.fine_uncertainty_loss_weight),
+        loss_mode=str(config.fine_loss_mode),
     )
     parts: list[tuple[torch.Tensor, float, float]] = []
     for item_loss, item_metrics in ((render_loss, render_metrics), (query_loss, query_metrics)):
@@ -3013,6 +3042,7 @@ def train_matcha_joint_model(
         "output_dim": int(cfg.output_dim),
         "steps": int(cfg.steps),
         "batch_size": int(cfg.batch_size),
+        "fine_loss_mode": str(cfg.fine_loss_mode),
     }
     summary.update(warm_start_report)
     if validation_samples is not None:

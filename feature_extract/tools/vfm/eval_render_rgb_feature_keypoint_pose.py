@@ -39,7 +39,7 @@ from feature_extract.tools.vfm.eval_rendered_feature_keypoint_pose import (
     _scale_camera,
     _summary,
 )
-from feature_extract.vfm.cambridge_pose_lattice import parse_cambridge_pose_file
+from feature_extract.vfm.cambridge_pose_lattice import camera_center_from_pose_w2c, parse_cambridge_pose_file
 from feature_extract.vfm.correspondence_confidence import (
     CalibratedLogisticConfidence,
     annotate_matches_with_calibrated_confidence,
@@ -84,6 +84,13 @@ from feature_extract.vfm.matcha_rgb_keypoint_detector import (
     decode_keypoints_from_logits,
     keypoint_xy_to_feature_cell_indices,
 )
+from feature_extract.vfm.measurement_v1.coarse_only_audit import (
+    COARSE_CONTROL_MODES,
+    apply_coarse_feature_control,
+    coarse_match_index_summary,
+    parse_cell_shift,
+    same_cell_identity_keypoint_matches,
+)
 from feature_extract.vfm.official_2dgs_renderer import load_official_2dgs_source_from_ply
 from feature_extract.vfm.query_to_3d_matching import (
     camera_matrix_and_distortion,
@@ -92,7 +99,7 @@ from feature_extract.vfm.query_to_3d_matching import (
     reprojection_error_stats,
     soft_order_pnp_matches,
 )
-from feature_extract.vfm.render_pose_diagnostics import run_oracle_correspondence_pnp_diagnostics
+from feature_extract.vfm.render_pose_diagnostics import project_world_to_image, run_oracle_correspondence_pnp_diagnostics
 from feature_extract.vfm.hypothesis_io import CandidateHypothesisBank
 from feature_extract.vfm.rendered_keypoint_matching import (
     backproject_depth_to_world,
@@ -175,6 +182,14 @@ def _read_csv_rows(path: Path) -> list[dict[str, object]]:
 
 def _existing_query_ids_from_rows(path: Path) -> set[str]:
     return {str(row["query_id"]) for row in _read_csv_rows(Path(path)) if row.get("query_id") is not None}
+
+
+def _gt_query_pixels_for_matches(matches, gt_pose_w2c: np.ndarray, camera) -> np.ndarray | None:
+    values = list(matches)
+    if not values:
+        return None
+    xyz = np.stack([np.asarray(match.xyz, dtype=np.float64).reshape(3) for match in values], axis=0)
+    return project_world_to_image(xyz, gt_pose_w2c, camera)
 
 
 def _write_rebuilt_summary_from_rows(output_dir: Path, args: argparse.Namespace, *, elapsed_sec: float = 0.0) -> dict[str, object]:
@@ -361,6 +376,7 @@ def _match_table_rows_for_query(
     inlier_mask: np.ndarray | None,
     baseline_reproj_errors: np.ndarray | None,
     render_xy_by_match: dict[int, np.ndarray],
+    gt_query_xy: np.ndarray | None = None,
 ) -> list[dict[str, object]]:
     """Export match-level diagnostics for candidate-mined training."""
 
@@ -369,6 +385,7 @@ def _match_table_rows_for_query(
     baseline_errors = (
         None if baseline_reproj_errors is None else np.asarray(baseline_reproj_errors, dtype=np.float64).reshape(-1)
     )
+    gt_xy_values = None if gt_query_xy is None else np.asarray(gt_query_xy, dtype=np.float64).reshape(-1, 2)
     stride = float(gt_stride_px) if np.isfinite(gt_stride_px) and float(gt_stride_px) > 0.0 else 16.0
     rows: list[dict[str, object]] = []
     for idx, match in enumerate(matches):
@@ -387,6 +404,7 @@ def _match_table_rows_for_query(
             if baseline_errors is None or idx >= baseline_errors.shape[0] or not np.isfinite(baseline_errors[idx])
             else float(baseline_errors[idx])
         )
+        gt_xy = None if gt_xy_values is None or idx >= gt_xy_values.shape[0] else gt_xy_values[idx]
         patch_correct = False if error is None else bool(error <= stride)
         weak_positive = False if error is None else bool(stride < error <= (2.0 * stride))
         pnp_inlier = False if inliers is None or idx >= inliers.shape[0] else bool(inliers[idx])
@@ -399,6 +417,8 @@ def _match_table_rows_for_query(
                 "render_index": int(match.track_id),
                 "query_x": float(qxy[0]),
                 "query_y": float(qxy[1]),
+                "query_gt_x": None if gt_xy is None or not np.isfinite(gt_xy[0]) else float(gt_xy[0]),
+                "query_gt_y": None if gt_xy is None or not np.isfinite(gt_xy[1]) else float(gt_xy[1]),
                 "render_x": _optional_float(render_xy[0]),
                 "render_y": _optional_float(render_xy[1]),
                 "xy": [float(qxy[0]), float(qxy[1])],
@@ -438,6 +458,10 @@ def _match_table_rows_for_query(
                 "pnp_inlier": pnp_inlier,
                 "baseline_reproj_residual_px": baseline_error,
                 "patch_offset_norm_px": _optional_float(match.patch_offset_norm_px),
+                "anchor_xyz_change_m": _optional_float(match.anchor_xyz_change_m),
+                "render_depth_change_m": _optional_float(match.render_depth_change_m),
+                "surface_switch_flag": None if match.surface_switch_flag is None else bool(match.surface_switch_flag),
+                "render_depth_gradient": _optional_float(match.render_depth_gradient),
                 "render_depth": _optional_float(match.render_depth),
                 "render_alpha": _optional_float(match.render_alpha),
             }
@@ -643,6 +667,40 @@ def _pose_candidate_table_rows_for_query(
             )
         rows.append(row)
     return rows
+
+
+def _pose_protocol_audit_fields(
+    *,
+    render_pose_mode: str,
+    render_pose_world_offset: np.ndarray,
+    render_pose_rotation_offset_deg: np.ndarray,
+    gt_pose_w2c: np.ndarray,
+    render_pose: RenderPoseSelection,
+) -> dict[str, object]:
+    """Expose requested and realized render-pose perturbation at row level."""
+
+    world_offset = np.asarray(render_pose_world_offset, dtype=np.float64).reshape(3)
+    rotation_offset = np.asarray(render_pose_rotation_offset_deg, dtype=np.float64).reshape(3)
+    gt_center = camera_center_from_pose_w2c(np.asarray(gt_pose_w2c, dtype=np.float64).reshape(4, 4))
+    render_center = camera_center_from_pose_w2c(np.asarray(render_pose.pose_w2c, dtype=np.float64).reshape(4, 4))
+    mode = str(render_pose_mode)
+    requested_translation_m = float(np.linalg.norm(world_offset)) if mode in {"gt_offset", "gt"} else 0.0
+    requested_rotation_deg = float(np.linalg.norm(rotation_offset)) if mode in {"gt_rotation_offset", "gt"} else 0.0
+    realized_translation = render_pose.render_translation_error_m
+    realized_rotation = render_pose.render_rotation_error_deg
+    return {
+        "requested_translation_m": requested_translation_m,
+        "requested_rotation_deg": requested_rotation_deg,
+        "realized_initial_translation_error_m": None if realized_translation is None else float(realized_translation),
+        "realized_initial_rotation_error_deg": None if realized_rotation is None else float(realized_rotation),
+        "gt_camera_center_x": float(gt_center[0]),
+        "gt_camera_center_y": float(gt_center[1]),
+        "gt_camera_center_z": float(gt_center[2]),
+        "render_camera_center_x": float(render_center[0]),
+        "render_camera_center_y": float(render_center[1]),
+        "render_camera_center_z": float(render_center[2]),
+        "camera_center_delta_m": float(np.linalg.norm(render_center - gt_center)),
+    }
 
 
 def _resize_hw(image: np.ndarray, *, height: int, width: int, interpolation: int) -> np.ndarray:
@@ -948,6 +1006,10 @@ def _pnp_match_diagnostics(pnp_matches, inlier_mask: np.ndarray | None) -> dict[
             "pnp_match_measurement_sigma_mean": None,
             "pnp_match_patch_offset_applied_ratio": None,
             "pnp_match_patch_offset_norm_mean_px": None,
+            "anchor_xyz_change_max_m": None,
+            "surface_switch_rate": None,
+            "render_depth_change_mean_m": None,
+            "render_depth_gradient_mean": None,
         }
     confidences = np.asarray(
         [
@@ -975,6 +1037,22 @@ def _pnp_match_diagnostics(pnp_matches, inlier_mask: np.ndarray | None) -> dict[
         for match in values
         if match.patch_offset_norm_px is not None and np.isfinite(float(match.patch_offset_norm_px))
     ]
+    xyz_changes = [
+        float(match.anchor_xyz_change_m)
+        for match in values
+        if match.anchor_xyz_change_m is not None and np.isfinite(float(match.anchor_xyz_change_m))
+    ]
+    depth_changes = [
+        float(match.render_depth_change_m)
+        for match in values
+        if match.render_depth_change_m is not None and np.isfinite(float(match.render_depth_change_m))
+    ]
+    surface_switches = [match.surface_switch_flag for match in values if match.surface_switch_flag is not None]
+    depth_gradients = [
+        float(match.render_depth_gradient)
+        for match in values
+        if match.render_depth_gradient is not None and np.isfinite(float(match.render_depth_gradient))
+    ]
     return {
         "pnp_match_confidence_mean": float(np.mean(confidences)),
         "pnp_inlier_confidence_mean": None if not np.any(inliers) else float(np.mean(confidences[inliers])),
@@ -982,6 +1060,10 @@ def _pnp_match_diagnostics(pnp_matches, inlier_mask: np.ndarray | None) -> dict[
         "pnp_match_measurement_sigma_mean": None if not sigmas else float(np.mean(sigmas)),
         "pnp_match_patch_offset_applied_ratio": None if not applied else float(np.mean([1.0 if item else 0.0 for item in applied])),
         "pnp_match_patch_offset_norm_mean_px": None if not offset_norms else float(np.mean(offset_norms)),
+        "anchor_xyz_change_max_m": None if not xyz_changes else float(np.max(xyz_changes)),
+        "surface_switch_rate": None if not surface_switches else float(np.mean([1.0 if item else 0.0 for item in surface_switches])),
+        "render_depth_change_mean_m": None if not depth_changes else float(np.mean(depth_changes)),
+        "render_depth_gradient_mean": None if not depth_gradients else float(np.mean(depth_gradients)),
     }
 
 
@@ -1713,6 +1795,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "radio_matcha_patch_corr",
             "anti_lock_render_search",
             "anti_lock_post_pair_render_search",
+            "fixed_anchor_coarse_only_v1",
         ),
     )
     parser.add_argument("--matcha_confidence_mode", default="dual_softmax", choices=("dual_softmax", "learned", "blend"))
@@ -1808,6 +1891,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--coarse_candidate_ranker_model", default="")
     parser.add_argument("--coarse_candidate_ranker_feature_set", default="coarse", choices=("descriptor", "coarse", "coarse_local"))
     parser.add_argument("--coarse_candidate_ranker_blend", type=float, default=1.0)
+    parser.add_argument("--coarse_control_mode", default="learned", choices=COARSE_CONTROL_MODES)
+    parser.add_argument("--coarse_control_seed", type=int, default=0)
+    parser.add_argument("--coarse_control_shift_cells", default="0,0")
     parser.add_argument("--fine_render_search_radius_px", type=float, default=0.0)
     parser.add_argument("--fine_render_search_step_px", type=float, default=1.0)
     parser.add_argument(
@@ -1838,6 +1924,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--render_offset_min_alpha", type=float, default=0.0)
     parser.add_argument("--render_offset_max_depth_delta_m", type=float, default=-1.0)
     parser.add_argument("--render_offset_fallback_to_cell_center", action="store_true")
+    parser.add_argument(
+        "--fixed_render_anchor",
+        action="store_true",
+        help="Freeze 3D anchor at the coarse render cell center; fine may only update query-side xy.",
+    )
     parser.add_argument("--coverage_filter_grid", type=int, default=8)
     parser.add_argument("--coverage_filter_max_per_cell", type=int, default=8)
     parser.add_argument("--coverage_filter_min_confidence", type=float, default=-1.0)
@@ -1868,6 +1959,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--save_match_table", action="store_true")
     parser.add_argument("--match_table_path", default="")
     parser.add_argument("--match_table_stage", choices=("pose", "candidate"), default="pose")
+    parser.add_argument(
+        "--save_all_candidate_match_table",
+        action="store_true",
+        help="Export match rows for every render-pose candidate, not only the selected final candidate.",
+    )
     parser.add_argument("--save_pose_candidate_table", action="store_true")
     parser.add_argument("--pose_candidate_table_path", default="")
     parser.add_argument("--save_coarse_oracle_table", action="store_true")
@@ -1890,6 +1986,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                 "--render_pose_world_offset",
                 "--render_pose_rotation_offset_deg",
                 "--render_pose_rotation_search_offsets_deg",
+                "--coarse_control_shift_cells",
             },
         )
     )
@@ -1974,6 +2071,31 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         args.pnp_soft_order_top_n = 800
         args.coverage_filter_min_confidence = 0.05
         args.measurement_sigma_px = 16.0
+    if str(args.matcha_eval_preset) == "fixed_anchor_coarse_only_v1":
+        args.fixed_render_anchor = True
+        args.matcha_confidence_mode = "dual_softmax"
+        args.matcha_confidence_blend = 0.0
+        args.matcha_cell_offset_side = "none"
+        args.matcha_use_pair_fine_head = False
+        args.matcha_use_local_fine_attention = False
+        args.matcha_use_local_window_fine_head = False
+        args.matcha_use_patch_corr_fine_head = False
+        args.matcha_local_window_confidence_blend = 0.0
+        args.matcha_patch_corr_confidence_blend = 0.0
+        args.fine_render_search_radius_px = 0.0
+        args.post_pair_render_refine_radius_px = 0.0
+        args.render_side_local_offset_radius_cells = 0
+        args.render_side_local_offset_top_k_per_query = 0
+        args.matcha_keypoint_proposal_source = "none"
+        args.matcha_reliability_prior_source = "none"
+        args.matcha_post_confidence_top_k_per_query = 0
+        args.coarse_candidate_ranker_model = ""
+        args.pnp_soft_order_mode = "none"
+        args.pnp_soft_order_top_n = 0
+        args.calibrated_correspondence_confidence_model = ""
+        args.pose_scorer_model = ""
+        args.measurement_sigma_px = 0.0
+        args.coverage_filter_min_confidence = -1.0
     return args
 
 
@@ -2447,6 +2569,14 @@ def main(argv: Sequence[str] | None = None) -> None:
                     render_feature,
                     device=str(args.device),
                 )
+            coarse_control_shift = parse_cell_shift(str(args.coarse_control_shift_cells))
+            query_feature, render_feature = apply_coarse_feature_control(
+                query_feature,
+                render_feature,
+                mode=str(args.coarse_control_mode),
+                seed=int(args.coarse_control_seed),
+                shift_cells=coarse_control_shift,
+            )
             iteration_alignment_score = _render_query_feature_alignment_score(
                 query_feature,
                 render_feature,
@@ -2563,44 +2693,55 @@ def main(argv: Sequence[str] | None = None) -> None:
                 cell_offset_side = str(args.matcha_cell_offset_side)
                 query_offset_for_matching = query_offset_logits if cell_offset_side in {"both", "query"} else None
                 render_offset_for_matching = render_offset_logits if cell_offset_side in {"both", "render"} else None
-                kp_matches = matcha_coarse_to_fine_keypoint_matches(
-                    query_feature,
-                    render_feature,
-                    query_image_width=int(camera.width),
-                    query_image_height=int(camera.height),
-                    render_image_width=int(render_config.width),
-                    render_image_height=int(render_config.height),
-                    logit_scale=float(args.dual_softmax_logit_scale),
-                    min_confidence=float(args.min_dual_softmax_confidence),
-                    min_similarity=float(args.min_similarity),
-                    max_matches=args.max_matches,
-                    fine_search_radius_px=float(args.fine_render_search_radius_px),
-                    fine_search_step_px=float(args.fine_render_search_step_px),
-                    fine_mode=str(args.matcha_fine_mode),
-                    fine_softmax_temperature=float(args.matcha_fine_softmax_temperature),
-                    mutual=True,
-                    coarse_top_k_per_query=int(args.matcha_coarse_top_k_per_query),
-                    coarse_mutual_mode=(
-                        None if str(args.matcha_coarse_mutual_mode) == "legacy" else str(args.matcha_coarse_mutual_mode)
-                    ),
-                    coarse_local_window_radius_cells=(
-                        None
-                        if int(args.matcha_coarse_local_window_radius_cells) < 0
-                        else int(args.matcha_coarse_local_window_radius_cells)
-                    ),
-                    query_offset_logits=query_offset_for_matching,
-                    render_offset_logits=render_offset_for_matching,
-                    query_candidate_indices=(
-                        query_candidate_indices
-                        if str(args.matcha_keypoint_proposal_mode) == "hard"
-                        else None
-                    ),
-                    render_candidate_indices=(
-                        render_candidate_indices
-                        if str(args.matcha_keypoint_proposal_mode) == "hard"
-                        else None
-                    ),
-                )
+                if str(args.coarse_control_mode) == "same_cell_identity":
+                    kp_matches = same_cell_identity_keypoint_matches(
+                        query_feature,
+                        render_feature,
+                        query_image_width=int(camera.width),
+                        query_image_height=int(camera.height),
+                        render_image_width=int(render_config.width),
+                        render_image_height=int(render_config.height),
+                        max_matches=args.max_matches,
+                    )
+                else:
+                    kp_matches = matcha_coarse_to_fine_keypoint_matches(
+                        query_feature,
+                        render_feature,
+                        query_image_width=int(camera.width),
+                        query_image_height=int(camera.height),
+                        render_image_width=int(render_config.width),
+                        render_image_height=int(render_config.height),
+                        logit_scale=float(args.dual_softmax_logit_scale),
+                        min_confidence=float(args.min_dual_softmax_confidence),
+                        min_similarity=float(args.min_similarity),
+                        max_matches=args.max_matches,
+                        fine_search_radius_px=float(args.fine_render_search_radius_px),
+                        fine_search_step_px=float(args.fine_render_search_step_px),
+                        fine_mode=str(args.matcha_fine_mode),
+                        fine_softmax_temperature=float(args.matcha_fine_softmax_temperature),
+                        mutual=True,
+                        coarse_top_k_per_query=int(args.matcha_coarse_top_k_per_query),
+                        coarse_mutual_mode=(
+                            None if str(args.matcha_coarse_mutual_mode) == "legacy" else str(args.matcha_coarse_mutual_mode)
+                        ),
+                        coarse_local_window_radius_cells=(
+                            None
+                            if int(args.matcha_coarse_local_window_radius_cells) < 0
+                            else int(args.matcha_coarse_local_window_radius_cells)
+                        ),
+                        query_offset_logits=query_offset_for_matching,
+                        render_offset_logits=render_offset_for_matching,
+                        query_candidate_indices=(
+                            query_candidate_indices
+                            if str(args.matcha_keypoint_proposal_mode) == "hard"
+                            else None
+                        ),
+                        render_candidate_indices=(
+                            render_candidate_indices
+                            if str(args.matcha_keypoint_proposal_mode) == "hard"
+                            else None
+                        ),
+                    )
             else:
                 query_xy, _query_scores = detector_fn(query_image)
                 render_xy, _render_scores = detector_fn(render_rgb)
@@ -2964,6 +3105,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                     else float(args.render_offset_max_depth_delta_m)
                 ),
                 fallback_to_cell_center=bool(args.render_offset_fallback_to_cell_center),
+                fixed_render_anchor=bool(args.fixed_render_anchor),
             )
             candidate_pnp_matches_for_table = list(pnp_matches)
             if float(args.measurement_sigma_px) > 0.0:
@@ -3074,6 +3216,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "iteration_alignment_score": float(iteration_alignment_score),
                 "pose_pnp_matches": pose_pnp_matches,
                 "fine_pair_stats": _pair_fine_logit_stats(pair_fine_logits),
+                "coarse_control_summary": coarse_match_index_summary(
+                    kp_matches,
+                    query_grid_width=int(query_feature.shape[2]),
+                    render_grid_width=int(render_feature.shape[2]),
+                ),
                 "query_candidate_cell_count": (
                     int(query_candidate_indices.shape[0]) if query_candidate_indices is not None else int(query_feature.shape[1] * query_feature.shape[2])
                 ),
@@ -3186,6 +3333,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         pose_candidate_score = final["pose_candidate_score"]
         pose_pnp_matches = final["pose_pnp_matches"]
         fine_pair_stats = dict(final.get("fine_pair_stats", {}))
+        coarse_control_summary = dict(final.get("coarse_control_summary", {}))
         translation_error, rotation_error = _pose_metrics(pnp.pose_w2c if pnp.success else None, gt.pose_w2c)
         pnp_render_translation_delta, pnp_render_rotation_delta = _pose_metrics(
             pnp.pose_w2c if pnp.success else None,
@@ -3389,7 +3537,81 @@ def main(argv: Sequence[str] | None = None) -> None:
                 if coarse_oracle_candidate_writer is not None:
                     coarse_oracle_candidate_writer.writerows(query_candidate_rows)
         if bool(args.save_match_table):
-            if str(args.match_table_stage) == "candidate":
+            if bool(args.save_all_candidate_match_table):
+                for candidate_rank, candidate in enumerate(candidate_finals):
+                    if str(candidate.get("status", "")) != "ok":
+                        continue
+                    candidate_matches = (
+                        list(candidate.get("candidate_pnp_matches_for_table", []) or [])
+                        if str(args.match_table_stage) == "candidate"
+                        else list(candidate.get("pose_pnp_matches", []) or [])
+                    )
+                    candidate_pnp = candidate.get("pnp")
+                    candidate_gt_errors = (
+                        match_reprojection_errors(candidate_matches, gt.pose_w2c, camera)
+                        if candidate_matches
+                        else np.zeros((0,), dtype=np.float64)
+                    )
+                    candidate_baseline_errors = (
+                        match_reprojection_errors(candidate_matches, candidate_pnp.pose_w2c, camera)
+                        if candidate_matches
+                        and candidate_pnp is not None
+                        and candidate_pnp.success
+                        and candidate_pnp.pose_w2c is not None
+                        else None
+                    )
+                    candidate_inlier_mask = (
+                        candidate_baseline_errors <= float(args.pnp_reprojection_error_px)
+                        if str(args.match_table_stage) == "candidate" and candidate_baseline_errors is not None
+                        else getattr(candidate_pnp, "inlier_mask", None)
+                    )
+                    candidate_render_xy_by_match = dict(candidate.get("render_xy_by_match", {}) or {})
+                    candidate_rows = _match_table_rows_for_query(
+                        query_id=record.image_id,
+                        matches=candidate_matches,
+                        gt_errors=candidate_gt_errors,
+                        gt_stride_px=0.5
+                        * (
+                            float(camera.width) / max(float(query_feature.shape[2]), 1.0)
+                            + float(camera.height) / max(float(query_feature.shape[1]), 1.0)
+                        ),
+                        inlier_mask=candidate_inlier_mask,
+                        baseline_reproj_errors=candidate_baseline_errors,
+                        render_xy_by_match=candidate_render_xy_by_match,
+                        gt_query_xy=_gt_query_pixels_for_matches(candidate_matches, gt.pose_w2c, camera),
+                    )
+                    candidate_render_pose = candidate.get("render_pose")
+                    for candidate_row in candidate_rows:
+                        candidate_row.update(
+                            {
+                                "candidate_rank": int(candidate_rank),
+                                "initial_render_index": int(candidate.get("initial_render_index", candidate_rank) or 0),
+                                "initial_render_pose_label": str(candidate.get("initial_render_pose_label", "")),
+                                "initial_render_candidate_id": str(candidate.get("initial_render_candidate_id", "")),
+                                "initial_render_reference_image": str(candidate.get("initial_render_reference_image", "")),
+                                "render_pose_label": ""
+                                if candidate_render_pose is None
+                                else str(getattr(candidate_render_pose, "label", "")),
+                                "render_candidate_id": ""
+                                if candidate_render_pose is None
+                                else str(getattr(candidate_render_pose, "candidate_id", "")),
+                                "render_reference_image": ""
+                                if candidate_render_pose is None
+                                else str(getattr(candidate_render_pose, "reference_image", "")),
+                                "render_translation_error_m": None
+                                if candidate_render_pose is None
+                                else getattr(candidate_render_pose, "render_translation_error_m", None),
+                                "render_rotation_error_deg": None
+                                if candidate_render_pose is None
+                                else getattr(candidate_render_pose, "render_rotation_error_deg", None),
+                                "query_grid_width": int(query_feature.shape[2]),
+                                "query_grid_height": int(query_feature.shape[1]),
+                                "render_grid_width": int(render_feature.shape[2]),
+                                "render_grid_height": int(render_feature.shape[1]),
+                            }
+                        )
+                    match_table_rows.extend(candidate_rows)
+            elif str(args.match_table_stage) == "candidate":
                 table_matches = list(candidate_pnp_matches_for_table)
                 table_gt_errors = (
                     match_reprojection_errors(table_matches, gt.pose_w2c, camera)
@@ -3411,21 +3633,23 @@ def main(argv: Sequence[str] | None = None) -> None:
                 table_gt_errors = gt_errors
                 table_baseline_errors = pnp_pose_errors
                 table_inlier_mask = pnp.inlier_mask
-            match_table_rows.extend(
-                _match_table_rows_for_query(
-                    query_id=record.image_id,
-                    matches=table_matches,
-                    gt_errors=table_gt_errors,
-                    gt_stride_px=0.5
-                    * (
-                        float(camera.width) / max(float(query_feature.shape[2]), 1.0)
-                        + float(camera.height) / max(float(query_feature.shape[1]), 1.0)
-                    ),
-                    inlier_mask=table_inlier_mask,
-                    baseline_reproj_errors=table_baseline_errors,
-                    render_xy_by_match=render_xy_by_match,
+            if not bool(args.save_all_candidate_match_table):
+                match_table_rows.extend(
+                    _match_table_rows_for_query(
+                        query_id=record.image_id,
+                        matches=table_matches,
+                        gt_errors=table_gt_errors,
+                        gt_stride_px=0.5
+                        * (
+                            float(camera.width) / max(float(query_feature.shape[2]), 1.0)
+                            + float(camera.height) / max(float(query_feature.shape[1]), 1.0)
+                        ),
+                        inlier_mask=table_inlier_mask,
+                        baseline_reproj_errors=table_baseline_errors,
+                        render_xy_by_match=render_xy_by_match,
+                        gt_query_xy=_gt_query_pixels_for_matches(table_matches, gt.pose_w2c, camera),
+                    )
                 )
-            )
         if vis_idx < int(args.visualize_limit):
             _draw_matches(
                 query_image,
@@ -3465,6 +3689,10 @@ def main(argv: Sequence[str] | None = None) -> None:
             "render_height": int(render_height),
             "query_feature_shape": json.dumps(list(query_feature.shape)),
             "render_feature_shape": json.dumps(list(render_feature.shape)),
+            "coarse_control_mode": str(args.coarse_control_mode),
+            "coarse_control_seed": int(args.coarse_control_seed),
+            "coarse_control_shift_dx_cells": int(parse_cell_shift(str(args.coarse_control_shift_cells))[0]),
+            "coarse_control_shift_dy_cells": int(parse_cell_shift(str(args.coarse_control_shift_cells))[1]),
             "render_alpha_mean": float(np.mean(render_alpha)),
             "render_depth_valid_fraction": float(np.mean(np.isfinite(render_depth) & (render_depth > 0.0))),
             "match_count": int(len(kp_matches)),
@@ -3495,12 +3723,20 @@ def main(argv: Sequence[str] | None = None) -> None:
                 if not kp_matches or kp_matches[0].dual_softmax_confidence is None
                 else float(np.mean([float(match.dual_softmax_confidence or 0.0) for match in kp_matches]))
             ),
+            **{f"coarse_{key}": value for key, value in coarse_control_summary.items()},
             **fine_pair_stats,
             **pnp_match_diagnostics,
             **fine_offset_diagnostics,
             **residual_solver_diagnostics,
             **oracle_pnp_diagnostics,
             **match_validity_diagnostics,
+            **_pose_protocol_audit_fields(
+                render_pose_mode=str(args.render_pose_mode),
+                render_pose_world_offset=render_world_offset,
+                render_pose_rotation_offset_deg=render_rotation_offset,
+                gt_pose_w2c=gt.pose_w2c,
+                render_pose=render_pose,
+            ),
             **_geometry_row_fields(geometry),
         }
         rows.append(row)
@@ -3579,6 +3815,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             "coarse_candidate_ranker_model": str(args.coarse_candidate_ranker_model),
             "coarse_candidate_ranker_feature_set": str(args.coarse_candidate_ranker_feature_set),
             "coarse_candidate_ranker_blend": float(args.coarse_candidate_ranker_blend),
+            "coarse_control_mode": str(args.coarse_control_mode),
+            "coarse_control_seed": int(args.coarse_control_seed),
+            "coarse_control_shift_cells": str(args.coarse_control_shift_cells),
             "fine_render_search_radius_px": float(args.fine_render_search_radius_px),
             "fine_render_search_step_px": float(args.fine_render_search_step_px),
             "matcha_fine_mode": str(args.matcha_fine_mode),
@@ -3634,6 +3873,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             "render_offset_min_alpha": float(args.render_offset_min_alpha),
             "render_offset_max_depth_delta_m": float(args.render_offset_max_depth_delta_m),
             "render_offset_fallback_to_cell_center": bool(args.render_offset_fallback_to_cell_center),
+            "fixed_render_anchor": bool(args.fixed_render_anchor),
             "coverage_filter_grid": int(args.coverage_filter_grid),
             "coverage_filter_max_per_cell": int(args.coverage_filter_max_per_cell),
             "coverage_filter_min_confidence": float(args.coverage_filter_min_confidence),
@@ -3660,6 +3900,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             "render_canvas_scale": float(args.render_canvas_scale),
             "save_match_table": bool(args.save_match_table),
             "match_table_stage": str(args.match_table_stage),
+            "save_all_candidate_match_table": bool(args.save_all_candidate_match_table),
             "save_pose_candidate_table": bool(args.save_pose_candidate_table),
             "save_coarse_oracle_table": bool(args.save_coarse_oracle_table),
             "save_coarse_oracle_candidate_table": bool(args.save_coarse_oracle_candidate_table),
