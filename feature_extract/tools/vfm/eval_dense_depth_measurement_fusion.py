@@ -13,6 +13,7 @@ from feature_extract.vfm.colmap_tracks import read_colmap_cameras_binary
 from feature_extract.vfm.colmap_tracks import ColmapCamera
 from feature_extract.vfm.dense_depth_measurement_fusion import (
     DENSE_DEPTH_FUSION_FIELDNAMES,
+    GEOMETRY_SOURCE_CHOICES,
     augment_rows_with_query_gt_projection,
     dense_depth_measurement_summary,
     dense_depth_pose_ablation_from_rows,
@@ -21,7 +22,9 @@ from feature_extract.vfm.dense_depth_measurement_fusion import (
 
 
 ABLATION_FIELDNAMES = [
+    "group_id",
     "query_id",
+    "candidate_id",
     "variant",
     "solver",
     "success",
@@ -109,11 +112,20 @@ def _query_pose_lookup(path: Path) -> dict[str, np.ndarray]:
     return {str(record.image_id): np.asarray(record.pose_w2c, dtype=np.float64).reshape(4, 4) for record in parse_cambridge_pose_file(Path(path))}
 
 
-def _ablation_rows(report: Mapping[str, Any], *, query_id: str = "") -> list[dict[str, Any]]:
+def _ablation_rows(report: Mapping[str, Any], *, query_id: str = "", candidate_id: str = "", group_id: str = "") -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for variant, solvers in dict(report.get("variants", {})).items():
         for solver, values in dict(solvers).items():
-            rows.append({"query_id": str(query_id), "variant": str(variant), "solver": str(solver), **dict(values)})
+            rows.append(
+                {
+                    "group_id": str(group_id),
+                    "query_id": str(query_id),
+                    "candidate_id": str(candidate_id),
+                    "variant": str(variant),
+                    "solver": str(solver),
+                    **dict(values),
+                }
+            )
     return rows
 
 
@@ -184,11 +196,39 @@ def _aggregate_pose_rows(rows: Sequence[Mapping[str, Any]], measurement_summary:
     return summary_rows
 
 
-def _rows_by_query(rows: Sequence[Mapping[str, Any]]) -> dict[str, list[Mapping[str, Any]]]:
-    grouped: dict[str, list[Mapping[str, Any]]] = {}
+def _candidate_id(row: Mapping[str, Any]) -> str:
+    for name in ("candidate_id", "render_pose_id", "render_pose_label", "initial_render_pose_label"):
+        value = row.get(name)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return ""
+
+
+def _group_id(query_id: str, candidate_id: str) -> str:
+    return str(query_id) if not str(candidate_id).strip() else f"{query_id}::{candidate_id}"
+
+
+def _rows_by_pose_group(rows: Sequence[Mapping[str, Any]]) -> dict[tuple[str, str], list[Mapping[str, Any]]]:
+    grouped: dict[tuple[str, str], list[Mapping[str, Any]]] = {}
     for row in rows:
-        grouped.setdefault(str(row.get("query_id", "")), []).append(row)
+        query_id = str(row.get("query_id", ""))
+        candidate_id = _candidate_id(row)
+        grouped.setdefault((query_id, candidate_id), []).append(row)
     return grouped
+
+
+def _candidate_group_summary(groups: Mapping[tuple[str, str], Sequence[Mapping[str, Any]]]) -> dict[str, Any]:
+    per_query: dict[str, set[str]] = {}
+    for query_id, candidate_id in groups.keys():
+        per_query.setdefault(str(query_id), set()).add(str(candidate_id))
+    counts = [len(values) for values in per_query.values()]
+    return {
+        "query_count": int(len(per_query)),
+        "pose_group_count": int(len(groups)),
+        "max_candidates_per_query": int(max(counts)) if counts else 0,
+        "min_candidates_per_query": int(min(counts)) if counts else 0,
+        "candidate_count_by_query": {query_id: int(len(values)) for query_id, values in sorted(per_query.items())},
+    }
 
 
 def evaluate_dense_depth_measurement_fusion(
@@ -202,6 +242,9 @@ def evaluate_dense_depth_measurement_fusion(
     variants: Sequence[str] = ("center", "measurement", "oracle"),
     solvers: Sequence[str] = ("ransac", "weighted", "covariance", "oracle_uncertainty"),
     reprojection_error_px: float = 8.0,
+    geometry_source: str = "force_backproject",
+    world_xyz_consistency_threshold_m: float = 1e-4,
+    strict_measurement_schema: bool = True,
 ) -> dict[str, Any]:
     rows = _read_csv(Path(match_table_csv))
     query_gt_projection_summary: dict[str, Any] | None = None
@@ -212,11 +255,20 @@ def evaluate_dense_depth_measurement_fusion(
             camera=camera,
         )
     output = Path(output_dir)
-    dense_rows = dense_depth_rows_from_rows(rows, camera=camera, render_pose_w2c=render_pose_w2c)
+    groups = _rows_by_pose_group(rows)
+    if render_pose_w2c is not None and len(groups) != 1:
+        raise ValueError("--render_pose_w2c_json is only valid for a single query/candidate group")
+    dense_rows = dense_depth_rows_from_rows(
+        rows,
+        camera=camera,
+        render_pose_w2c=render_pose_w2c,
+        geometry_source=str(geometry_source),
+        world_xyz_consistency_threshold_m=float(world_xyz_consistency_threshold_m),
+    )
     measurement_summary = dense_depth_measurement_summary(dense_rows)
     query_reports: dict[str, Any] = {}
     ablation_rows: list[dict[str, Any]] = []
-    for query_id, query_rows in sorted(_rows_by_query(rows).items()):
+    for (query_id, candidate_id), query_rows in sorted(groups.items()):
         query_gt_pose = (
             None
             if query_pose_w2c_by_id is None
@@ -232,9 +284,13 @@ def evaluate_dense_depth_measurement_fusion(
             variants=tuple(str(value) for value in variants),
             solvers=tuple(str(value) for value in solvers),
             reprojection_error_px=float(reprojection_error_px),
+            geometry_source=str(geometry_source),
+            world_xyz_consistency_threshold_m=float(world_xyz_consistency_threshold_m),
+            strict_measurement_schema=bool(strict_measurement_schema),
         )
-        query_reports[str(query_id)] = report
-        ablation_rows.extend(_ablation_rows(report, query_id=str(query_id)))
+        gid = _group_id(str(query_id), str(candidate_id))
+        query_reports[gid] = report
+        ablation_rows.extend(_ablation_rows(report, query_id=str(query_id), candidate_id=str(candidate_id), group_id=gid))
     aggregate_rows = _aggregate_pose_rows(ablation_rows, measurement_summary)
     _write_csv(output / "match_table.csv", dense_rows, DENSE_DEPTH_FUSION_FIELDNAMES)
     _write_jsonl(output / "match_table.jsonl", dense_rows)
@@ -243,7 +299,9 @@ def evaluate_dense_depth_measurement_fusion(
     summary = {
         "stage": "radio_matcha_dense_depth_measurement_fusion_cli",
         "input_count": int(len(rows)),
-        "query_count": int(len(_rows_by_query(rows))),
+        "query_count": int(len({str(row.get("query_id", "")) for row in rows})),
+        "pose_group_count": int(len(groups)),
+        "candidate_group_summary": _candidate_group_summary(groups),
         "camera": {
             "camera_id": int(camera.camera_id),
             "model_id": int(camera.model_id),
@@ -252,6 +310,9 @@ def evaluate_dense_depth_measurement_fusion(
             "params": [float(value) for value in camera.params],
         },
         "query_gt_projection_summary": query_gt_projection_summary,
+        "geometry_source": str(geometry_source),
+        "world_xyz_consistency_threshold_m": float(world_xyz_consistency_threshold_m),
+        "strict_measurement_schema": bool(strict_measurement_schema),
         "dense_depth_summary": measurement_summary,
         "pose_summary": aggregate_rows,
         "pose_ablation_by_query": query_reports,
@@ -290,6 +351,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--variants", nargs="+", default=["center", "measurement", "oracle"])
     parser.add_argument("--solvers", nargs="+", default=["ransac", "weighted", "covariance", "oracle_uncertainty"])
     parser.add_argument("--reprojection_error_px", type=float, default=8.0)
+    parser.add_argument("--geometry_source", default="force_backproject", choices=list(GEOMETRY_SOURCE_CHOICES))
+    parser.add_argument("--world_xyz_consistency_threshold_m", type=float, default=1e-4)
+    parser.add_argument("--no_strict_measurement_schema", action="store_true")
     return parser.parse_args(argv)
 
 
@@ -307,6 +371,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         variants=[str(value) for value in args.variants],
         solvers=[str(value) for value in args.solvers],
         reprojection_error_px=float(args.reprojection_error_px),
+        geometry_source=str(args.geometry_source),
+        world_xyz_consistency_threshold_m=float(args.world_xyz_consistency_threshold_m),
+        strict_measurement_schema=not bool(args.no_strict_measurement_schema),
     )
     print(json.dumps(summary, indent=2, sort_keys=True))
 

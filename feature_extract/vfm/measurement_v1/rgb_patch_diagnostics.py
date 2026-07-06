@@ -17,6 +17,7 @@ from feature_extract.vfm.measurement_v1.rgb_patch_training import (
     _prior_scale_batch,
     _read_csv,
     _render_cache_by_query,
+    _support_patch_source_audit,
     _stack_patch_batch,
 )
 
@@ -30,11 +31,19 @@ DIAGNOSTIC_FIELDNAMES = [
     "target_is_dustbin",
     "baseline_epe_px",
     "likelihood_epe_px",
+    "mode_epe_px",
+    "direct_epe_px",
     "improved",
+    "mode_improved",
+    "direct_improved",
     "center_x",
     "center_y",
     "query_pred_x",
     "query_pred_y",
+    "query_mode_x",
+    "query_mode_y",
+    "query_direct_x",
+    "query_direct_y",
     "query_gt_x",
     "query_gt_y",
     "target_dx",
@@ -43,6 +52,8 @@ DIAGNOSTIC_FIELDNAMES = [
     "pred_dy",
     "peak_dx",
     "peak_dy",
+    "direct_dx",
+    "direct_dy",
     "dustbin_probability",
     "visualization",
 ]
@@ -107,7 +118,16 @@ def _load_model(checkpoint: Path, *, device: torch.device) -> RGBPatchMeasuremen
         prior_scale_expert_gate=str(config.get("prior_scale_expert_gate", "soft")),
     ).to(device)
     state = payload["model"] if isinstance(payload, dict) and "model" in payload else payload
-    model.load_state_dict(state)
+    incompatible = model.load_state_dict(state, strict=False)
+    allowed_missing = set()
+    if int(model.prior_scale_expert_centers.numel()) == 0:
+        allowed_missing.add("prior_scale_expert_centers")
+    missing = [key for key in incompatible.missing_keys if key not in allowed_missing]
+    if missing or incompatible.unexpected_keys:
+        raise RuntimeError(
+            "checkpoint is incompatible with RGBPatchMeasurementBranch: "
+            f"missing={missing}, unexpected={list(incompatible.unexpected_keys)}"
+        )
     model.eval()
     return model
 
@@ -177,6 +197,7 @@ def export_rgb_patch_diagnostics(
             epe_batch = likelihood.epe_px.detach().cpu()
             dustbin_batch = likelihood.dustbin_probability.detach().cpu()
             target_cpu = target.detach().cpu()
+            direct_mean_batch = None if pred0.direct_mean_offset_xy is None else pred0.direct_mean_offset_xy.detach().cpu()
             for local_index, row in enumerate(batch_rows):
                 row_index = int(batch_start + local_index)
                 spatial_probs = spatial_probs_batch[local_index]
@@ -184,6 +205,9 @@ def export_rgb_patch_diagnostics(
                 peak_xy = likelihood.offsets_xy[peak_idx].detach().cpu()
                 mean_xy = mean_xy_batch[local_index]
                 epe = float(epe_batch[local_index].item())
+                mode_epe = float(torch.linalg.norm(peak_xy - target_cpu[local_index]).item())
+                direct_xy = None if direct_mean_batch is None else direct_mean_batch[local_index]
+                direct_epe = None if direct_xy is None else float(torch.linalg.norm(direct_xy - target_cpu[local_index]).item())
                 baseline_value = float(baseline[local_index].item())
                 center_x = float(str(row.get("center_x", "0")).strip())
                 center_y = float(str(row.get("center_y", "0")).strip())
@@ -201,11 +225,19 @@ def export_rgb_patch_diagnostics(
                         "target_is_dustbin": str(row.get("target_is_dustbin", "")),
                         "baseline_epe_px": baseline_value,
                         "likelihood_epe_px": epe,
+                        "mode_epe_px": mode_epe,
+                        "direct_epe_px": "" if direct_epe is None else direct_epe,
                         "improved": bool(epe < baseline_value),
+                        "mode_improved": bool(mode_epe < baseline_value),
+                        "direct_improved": "" if direct_epe is None else bool(direct_epe < baseline_value),
                         "center_x": center_x,
                         "center_y": center_y,
                         "query_pred_x": center_x + float(mean_xy[0].item()),
                         "query_pred_y": center_y + float(mean_xy[1].item()),
+                        "query_mode_x": center_x + float(peak_xy[0].item()),
+                        "query_mode_y": center_y + float(peak_xy[1].item()),
+                        "query_direct_x": "" if direct_xy is None else center_x + float(direct_xy[0].item()),
+                        "query_direct_y": "" if direct_xy is None else center_y + float(direct_xy[1].item()),
                         "query_gt_x": str(row.get("query_gt_x", "")),
                         "query_gt_y": str(row.get("query_gt_y", "")),
                         "target_dx": float(target_cpu[local_index, 0].item()),
@@ -214,6 +246,8 @@ def export_rgb_patch_diagnostics(
                         "pred_dy": float(mean_xy[1].item()),
                         "peak_dx": float(peak_xy[0].item()),
                         "peak_dy": float(peak_xy[1].item()),
+                        "direct_dx": "" if direct_xy is None else float(direct_xy[0].item()),
+                        "direct_dy": "" if direct_xy is None else float(direct_xy[1].item()),
                         "dustbin_probability": float(dustbin_batch[local_index].item()),
                         "visualization": vis_path,
                     }
@@ -228,6 +262,14 @@ def export_rgb_patch_diagnostics(
         row["visualization"] = row_to_vis.get(int(row["row_index"]), "")
     _write_csv(output / "diagnostic_rows.csv", diagnostic_rows)
     epe_values = np.asarray([float(row["likelihood_epe_px"]) for row in diagnostic_rows], dtype=np.float64)
+    mode_epe_values = np.asarray([float(row["mode_epe_px"]) for row in diagnostic_rows], dtype=np.float64)
+    direct_pairs = [
+        (float(row["direct_epe_px"]), float(row["baseline_epe_px"]))
+        for row in diagnostic_rows
+        if str(row["direct_epe_px"]).strip()
+    ]
+    direct_epe_values = np.asarray([item[0] for item in direct_pairs], dtype=np.float64)
+    direct_baseline_values = np.asarray([item[1] for item in direct_pairs], dtype=np.float64)
     baseline_values = np.asarray([float(row["baseline_epe_px"]) for row in diagnostic_rows], dtype=np.float64)
     summary = {
         "stage": "measurement_v1_rgb_patch_diagnostics",
@@ -236,15 +278,24 @@ def export_rgb_patch_diagnostics(
         "rows_csv": str(rows_csv),
         "query_source": str(query_source),
         "support_patch_warp": str(support_patch_warp),
+        "support_patch_source_audit": _support_patch_source_audit(rows, query_source=str(query_source)),
         "batch_size": int(batch),
         "prior_scale_key": str(prior_scale_key),
         "metrics": {
             "baseline_median_px": float(np.median(baseline_values)) if baseline_values.size else None,
             "likelihood_median_px": float(np.median(epe_values)) if epe_values.size else None,
             "likelihood_p90_px": float(np.percentile(epe_values, 90.0)) if epe_values.size else None,
+            "mode_median_px": float(np.median(mode_epe_values)) if mode_epe_values.size else None,
+            "mode_p90_px": float(np.percentile(mode_epe_values, 90.0)) if mode_epe_values.size else None,
+            "direct_median_px": float(np.median(direct_epe_values)) if direct_epe_values.size else None,
+            "direct_p90_px": float(np.percentile(direct_epe_values, 90.0)) if direct_epe_values.size else None,
             "improve_ratio": float(np.mean(epe_values < baseline_values)) if epe_values.size else None,
+            "mode_improve_ratio": float(np.mean(mode_epe_values < baseline_values)) if mode_epe_values.size else None,
+            "direct_improve_ratio": float(np.mean(direct_epe_values < direct_baseline_values)) if direct_epe_values.size else None,
             "recall_0p5px": float(np.mean(epe_values <= 0.5)) if epe_values.size else None,
             "recall_1px": float(np.mean(epe_values <= 1.0)) if epe_values.size else None,
+            "mode_recall_0p5px": float(np.mean(mode_epe_values <= 0.5)) if mode_epe_values.size else None,
+            "mode_recall_1px": float(np.mean(mode_epe_values <= 1.0)) if mode_epe_values.size else None,
         },
         "outputs": {
             "diagnostic_rows": str(output / "diagnostic_rows.csv"),

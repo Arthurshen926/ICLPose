@@ -290,6 +290,56 @@ def _center_baseline_metrics(rows: Sequence[Mapping[str, object]]) -> dict[str, 
     }
 
 
+def _support_patch_source_audit(rows: Sequence[Mapping[str, object]], *, query_source: str) -> dict[str, object]:
+    source = str(query_source)
+    count = int(len(rows))
+    if source == "real_pair":
+        missing_support = 0
+        same_image = 0
+        cross_image = 0
+        missing_support_xy = 0
+        for row in rows:
+            query_id = str(row.get("query_id", "")).strip()
+            support_id = str(row.get("support_image_id", "")).strip()
+            if not support_id:
+                missing_support += 1
+                continue
+            if support_id == query_id:
+                same_image += 1
+            else:
+                cross_image += 1
+            if not str(row.get("support_x", "")).strip() or not str(row.get("support_y", "")).strip():
+                missing_support_xy += 1
+        return {
+            "query_source": source,
+            "support_patch_source": "support_image_id",
+            "row_count": count,
+            "missing_support_image_id_count": int(missing_support),
+            "same_image_pair_count": int(same_image),
+            "cross_image_pair_count": int(cross_image),
+            "missing_support_xy_count": int(missing_support_xy),
+        }
+    if source in {"render", "render_augmented"}:
+        return {
+            "query_source": source,
+            "support_patch_source": "render_cache_by_query",
+            "row_count": count,
+            "missing_support_image_id_count": 0,
+            "same_image_pair_count": 0,
+            "cross_image_pair_count": 0,
+            "missing_support_xy_count": 0,
+        }
+    return {
+        "query_source": source,
+        "support_patch_source": "render_cache_by_query",
+        "row_count": count,
+        "missing_support_image_id_count": 0,
+        "same_image_pair_count": 0,
+        "cross_image_pair_count": 0,
+        "missing_support_xy_count": 0,
+    }
+
+
 def _residual_bin_metrics(
     rows: Sequence[Mapping[str, object]],
     epe: torch.Tensor,
@@ -330,9 +380,13 @@ def _residual_bin_metrics(
         out[f"{key}_count"] = int(bin_epe.numel())
         out[f"{key}_epe_px"] = float(torch.mean(bin_epe).item()) if bin_epe.numel() else None
         out[f"{key}_epe_median_px"] = float(torch.median(bin_epe).item()) if bin_epe.numel() else None
+        out[f"{key}_baseline_epe_px"] = float(torch.mean(bin_baseline).item()) if bin_baseline.numel() else None
+        out[f"{key}_baseline_epe_median_px"] = float(torch.median(bin_baseline).item()) if bin_baseline.numel() else None
+        out[f"{key}_median_improvement_px"] = float(torch.median(bin_baseline - bin_epe).item()) if bin_epe.numel() else None
         out[f"{key}_recall_0p5px"] = float(torch.mean((bin_epe <= 0.5).float()).item()) if bin_epe.numel() else None
         out[f"{key}_recall_1px"] = float(torch.mean((bin_epe <= 1.0).float()).item()) if bin_epe.numel() else None
         out[f"{key}_improve_ratio"] = float(torch.mean((bin_epe < bin_baseline).float()).item()) if bin_epe.numel() else None
+        out[f"{key}_worsen_ratio"] = float(torch.mean((bin_epe > bin_baseline).float()).item()) if bin_epe.numel() else None
     return out
 
 
@@ -423,6 +477,44 @@ def _passes_measurement_gate(
         "improve_ratio_passes": bool(improve_passes),
         "passes": bool(epe_passes and improve_passes),
     }
+
+
+def _residual_bin_gate_summary(
+    metrics: Mapping[str, object],
+    *,
+    prefix: str,
+    median_epe_threshold_px: float,
+    improve_ratio_threshold: float,
+) -> dict[str, dict[str, float | bool | int | None]]:
+    out: dict[str, dict[str, float | bool | int | None]] = {}
+    marker = f"{prefix}_bin_"
+    for key, value in sorted(metrics.items()):
+        if not key.startswith(marker) or not key.endswith("_count") or "overflow" in key:
+            continue
+        base = key[: -len("_count")]
+        count = int(value) if value is not None else 0
+        median_value = metrics.get(f"{base}_epe_median_px")
+        baseline_value = metrics.get(f"{base}_baseline_epe_median_px")
+        improve_value = metrics.get(f"{base}_improve_ratio")
+        worsen_value = metrics.get(f"{base}_worsen_ratio")
+        median_epe = None if median_value is None else float(median_value)
+        baseline_epe = None if baseline_value is None else float(baseline_value)
+        improve_ratio = None if improve_value is None else float(improve_value)
+        worsen_ratio = None if worsen_value is None else float(worsen_value)
+        epe_passes = median_epe is not None and median_epe <= float(median_epe_threshold_px)
+        improve_passes = improve_ratio is not None and improve_ratio >= float(improve_ratio_threshold)
+        bin_name = base[len(marker) :].replace("p", ".")
+        out[bin_name] = {
+            "count": count,
+            "baseline_epe_median_px": baseline_epe,
+            "median_epe_px": median_epe,
+            "improve_ratio": improve_ratio,
+            "worsen_ratio": worsen_ratio,
+            "median_epe_passes": bool(epe_passes),
+            "improve_ratio_passes": bool(improve_passes),
+            "passes": bool(epe_passes and improve_passes),
+        }
+    return out
 
 
 def _binary_auroc(scores: torch.Tensor, labels: torch.Tensor) -> float | None:
@@ -1379,6 +1471,7 @@ def train_rgb_patch_measurement_branch(
         "val_metrics": val_metrics,
         "train_center_baseline": _center_baseline_metrics(train_eval_rows),
         "val_center_baseline": _center_baseline_metrics(val_eval_rows),
+        "support_patch_source_audit": _support_patch_source_audit(rows, query_source=str(query_source)),
         "acceptance_gate": {
             "split": "val",
             "evaluated_row_count": int(len(val_eval_rows)),
@@ -1407,6 +1500,26 @@ def train_rgb_patch_measurement_branch(
                 median_epe_threshold_px=float(gate_median_epe_px),
                 improve_ratio_threshold=float(gate_improve_ratio),
             ),
+            "residual_bin_gates": {
+                "direct_head": _residual_bin_gate_summary(
+                    val_metrics,
+                    prefix="direct",
+                    median_epe_threshold_px=float(gate_median_epe_px),
+                    improve_ratio_threshold=float(gate_improve_ratio),
+                ),
+                "likelihood_head": _residual_bin_gate_summary(
+                    val_metrics,
+                    prefix="likelihood",
+                    median_epe_threshold_px=float(gate_median_epe_px),
+                    improve_ratio_threshold=float(gate_improve_ratio),
+                ),
+                "mode_head": _residual_bin_gate_summary(
+                    val_metrics,
+                    prefix="mode",
+                    median_epe_threshold_px=float(gate_median_epe_px),
+                    improve_ratio_threshold=float(gate_improve_ratio),
+                ),
+            },
         },
         "outputs": {"checkpoint": str(checkpoint), "summary": str(output / "summary.json")},
     }

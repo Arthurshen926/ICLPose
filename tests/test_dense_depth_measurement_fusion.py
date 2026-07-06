@@ -110,6 +110,146 @@ def test_dense_depth_fusion_can_use_existing_dense_depth_world_xyz_without_rende
     assert dense_rows[0]["world_x"] == 0.1
 
 
+def test_dense_depth_fusion_can_force_backproject_and_ignore_stale_world_xyz() -> None:
+    camera = _camera()
+    render_pose = np.eye(4, dtype=np.float64)
+    row = {
+        "query_id": "q0.png",
+        "match_index": "3",
+        "query_center_x": "320.0",
+        "query_center_y": "240.0",
+        "query_refined_x": "320.0",
+        "query_refined_y": "240.0",
+        "render_x": "320.0",
+        "render_y": "240.0",
+        "render_depth": "4.0",
+        "world_x": "100.0",
+        "world_y": "100.0",
+        "world_z": "100.0",
+    }
+
+    matches, summary = dense_depth_matches_from_rows(
+        [row],
+        camera=camera,
+        render_pose_w2c=render_pose,
+        geometry_source="force_backproject",
+    )
+    dense_rows = dense_depth_rows_from_rows(
+        [row],
+        camera=camera,
+        render_pose_w2c=render_pose,
+        geometry_source="force_backproject",
+    )
+
+    assert summary["world_xyz_source_counts"] == {"backproject": 1}
+    assert summary["world_xyz_mismatch_count"] == 1
+    assert summary["world_xyz_backproject_delta_m_median"] > 100.0
+    assert np.allclose(matches[0].xyz, np.asarray([0.0, 0.0, 4.0]))
+    assert dense_rows[0]["world_xyz_source"] == "backproject"
+    assert dense_rows[0]["world_xyz_consistency_ok"] is False
+
+
+def test_dense_depth_fusion_assert_consistent_rejects_stale_world_xyz() -> None:
+    camera = _camera()
+    render_pose = np.eye(4, dtype=np.float64)
+    row = {
+        "query_id": "q0.png",
+        "match_index": "3",
+        "query_center_x": "320.0",
+        "query_center_y": "240.0",
+        "query_refined_x": "320.0",
+        "query_refined_y": "240.0",
+        "render_x": "320.0",
+        "render_y": "240.0",
+        "render_depth": "4.0",
+        "world_x": "1.0",
+        "world_y": "0.0",
+        "world_z": "4.0",
+    }
+
+    with np.testing.assert_raises(ValueError):
+        dense_depth_matches_from_rows(
+            [row],
+            camera=camera,
+            render_pose_w2c=render_pose,
+            geometry_source="assert_consistent",
+            world_xyz_consistency_threshold_m=1e-4,
+        )
+
+
+def test_dense_depth_pose_ablation_strict_measurement_schema_rejects_query_xy_fallback() -> None:
+    camera = _camera()
+    row = {
+        "query_id": "q0.png",
+        "match_index": "3",
+        "query_center_x": "320.0",
+        "query_center_y": "240.0",
+        "query_x": "321.0",
+        "query_y": "240.0",
+        "world_x": "0.0",
+        "world_y": "0.0",
+        "world_z": "4.0",
+    }
+
+    with np.testing.assert_raises(ValueError):
+        dense_depth_pose_ablation_from_rows(
+            [row],
+            camera=camera,
+            variants=("measurement",),
+            solvers=("plain",),
+            strict_measurement_schema=True,
+        )
+
+
+def test_dense_depth_pose_ablation_oracle_in_window_only_replaces_inside_rows() -> None:
+    camera = _camera()
+    rows = [
+        {
+            "query_id": "q0.png",
+            "match_index": "0",
+            "query_center_x": "10.0",
+            "query_center_y": "10.0",
+            "query_refined_x": "10.0",
+            "query_refined_y": "10.0",
+            "query_gt_x": "11.0",
+            "query_gt_y": "10.0",
+            "measurement_search_radius_px": "2.0",
+            "world_x": "0.0",
+            "world_y": "0.0",
+            "world_z": "4.0",
+        },
+        {
+            "query_id": "q0.png",
+            "match_index": "1",
+            "query_center_x": "20.0",
+            "query_center_y": "20.0",
+            "query_refined_x": "20.0",
+            "query_refined_y": "20.0",
+            "query_gt_x": "30.0",
+            "query_gt_y": "20.0",
+            "measurement_search_radius_px": "2.0",
+            "world_x": "1.0",
+            "world_y": "0.0",
+            "world_z": "4.0",
+        },
+    ]
+
+    prepared = dense_depth_rows_from_rows(
+        rows,
+        camera=camera,
+    )
+    report = dense_depth_pose_ablation_from_rows(
+        prepared,
+        camera=camera,
+        variants=("oracle_if_gt_in_window",),
+        solvers=("plain",),
+    )
+
+    summary = report["variant_preparation"]["oracle_if_gt_in_window"]
+    assert summary["oracle_replaced_count"] == 1
+    assert summary["oracle_out_of_window_count"] == 1
+
+
 def test_augment_rows_with_query_gt_projection_projects_existing_world_xyz() -> None:
     camera = _camera()
     pose = np.eye(4, dtype=np.float64)

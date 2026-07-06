@@ -115,6 +115,14 @@ def test_rgb_patch_match_table_fusion_only_refines_query_side(tmp_path: Path) ->
     assert float(row["measurement_search_radius_px"]) == 1.0
     assert float(row["measurement_context_radius_px"]) == 1.0
     assert float(row["measurement_step_px"]) == 1.0
+    assert row["rgb_patch_prediction_head"] == "center"
+    assert summary["prediction_head"] == "center"
+    assert float(row["measurement_dx"]) == 0.0
+    assert float(row["measurement_dy"]) == 0.0
+    assert float(row["query_refined_x"]) == float(row["query_center_x"])
+    assert float(row["query_refined_y"]) == float(row["query_center_y"])
+    assert row["measurement_mean_dx"] != ""
+    assert row["measurement_mean_dy"] != ""
     assert summary["measurement_improve_pair_count"] == 1
     assert summary["center_within_measurement_window_pair_count"] == 1
     assert summary["center_within_measurement_window_rate"] == 1.0
@@ -154,10 +162,55 @@ def test_rgb_patch_match_table_fusion_mode_head_uses_cost_volume_peak(tmp_path: 
     )
 
     row = fused_rows[0]
-    assert summary["prediction_head"] == "mode"
-    assert row["rgb_patch_prediction_head"] == "mode"
+    assert summary["prediction_head"] == "likelihood_mode"
+    assert row["rgb_patch_prediction_head"] == "likelihood_mode"
     assert float(row["measurement_dx"]) == float(row["measurement_peak_dx"])
     assert float(row["measurement_dy"]) == float(row["measurement_peak_dy"])
+    assert float(row["measurement_dx"]) == float(row["measurement_mode_dx"])
+    assert float(row["measurement_dy"]) == float(row["measurement_mode_dy"])
+    assert row["measurement_mean_dx"] != ""
+    assert row["measurement_mean_dy"] != ""
+
+
+def test_rgb_patch_match_table_fusion_likelihood_mean_head_is_explicit(tmp_path: Path) -> None:
+    image_root = tmp_path / "images"
+    image_root.mkdir()
+    _write_query_image(image_root / "q0.png")
+    render_cache = tmp_path / "render_q0.npz"
+    _write_render_cache(render_cache)
+
+    fused_rows, summary = apply_rgb_patch_measurements_to_rows(
+        [
+            {
+                "query_id": "q0.png",
+                "match_index": "5",
+                "query_center_x": "8.0",
+                "query_center_y": "8.0",
+                "render_x": "7.0",
+                "render_y": "6.0",
+                "render_depth": "4.5",
+                "world_x": "1.0",
+                "world_y": "2.0",
+                "world_z": "3.0",
+            }
+        ],
+        image_root=image_root,
+        render_cache_by_query={"q0.png": render_cache},
+        model=_model(),
+        image_width=16,
+        image_height=16,
+        batch_size=1,
+        device=torch.device("cpu"),
+        prediction_head="likelihood_mean",
+    )
+
+    row = fused_rows[0]
+    assert summary["prediction_head"] == "likelihood_mean"
+    assert row["rgb_patch_prediction_head"] == "likelihood_mean"
+    assert float(row["measurement_dx"]) == float(row["measurement_mean_dx"])
+    assert float(row["measurement_dy"]) == float(row["measurement_mean_dy"])
+    assert row["measurement_mode_dx"] != ""
+    assert row["measurement_mode_dy"] != ""
 
 
 def test_rgb_patch_match_table_fusion_cli_writes_dense_depth_schema(tmp_path: Path) -> None:
@@ -427,4 +480,4 @@ def test_rgb_patch_match_table_fusion_can_apply_cached_texture_projection_checkp
     assert summary["measurement_model_type"] == "cached_projection"
     assert rows[0]["query_refined_x"] != ""
     assert rows[0]["measurement_valid_prob"] == "0.5"
-    assert rows[0]["rgb_patch_prediction_head"] == "likelihood"
+    assert rows[0]["rgb_patch_prediction_head"] == "center"

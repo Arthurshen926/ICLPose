@@ -21,6 +21,7 @@ def decodability_metrics(result: LocalLikelihoodResult, *, gt_xy_px: np.ndarray)
     probabilities = probabilities / max(float(np.sum(probabilities)), 1e-12)
     entropy = -float(np.sum(probabilities * np.log(np.clip(probabilities, 1e-12, None))))
     epe = float(np.linalg.norm(np.asarray(result.mean_xy_px, dtype=np.float64).reshape(2) - gt))
+    mode_error = float(np.linalg.norm(np.asarray(result.mode_xy_px, dtype=np.float64).reshape(2) - gt))
     top_count = min(5, order.shape[0])
     top5_distances = distances[order[:top_count]] if top_count else np.asarray([], dtype=np.float64)
     sorted_probs = np.sort(probabilities)[::-1]
@@ -34,7 +35,11 @@ def decodability_metrics(result: LocalLikelihoodResult, *, gt_xy_px: np.ndarray)
         "recall_1px": float(epe <= 1.0),
         "recall_2px": float(epe <= 2.0),
         "recall_5px": float(epe <= 5.0),
-        "mode_error_px": float(np.linalg.norm(np.asarray(result.mode_xy_px, dtype=np.float64).reshape(2) - gt)),
+        "mode_error_px": mode_error,
+        "mode_recall_0p5px": float(mode_error <= 0.5),
+        "mode_recall_1px": float(mode_error <= 1.0),
+        "mode_recall_2px": float(mode_error <= 2.0),
+        "mode_recall_5px": float(mode_error <= 5.0),
         "top5_mode_recall_0p5px": float(bool(top5_distances.size) and np.min(top5_distances) <= 0.5),
         "top5_mode_recall_1px": float(bool(top5_distances.size) and np.min(top5_distances) <= 1.0),
         "top5_mode_recall_2px": float(bool(top5_distances.size) and np.min(top5_distances) <= 2.0),

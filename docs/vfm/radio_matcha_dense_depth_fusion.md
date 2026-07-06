@@ -50,7 +50,11 @@ It consumes a RADIO/MATCHA `match_table.csv` and writes:
 The normalized match table keeps these fields:
 
 - `render_x/render_y/render_depth`
-- `world_x/world_y/world_z` when already materialized by the upstream dense-depth path
+- `candidate_id/render_pose_id` when present
+- `world_x/world_y/world_z`
+- `world_xyz_source`
+- `world_xyz_backproject_delta_m`
+- `world_xyz_consistency_ok`
 - `query_center_x/query_center_y`
 - `query_refined_x/query_refined_y`
 - `measurement_dx/measurement_dy`
@@ -58,14 +62,32 @@ The normalized match table keeps these fields:
 - `measurement_valid_prob`
 - `radio_match_score`
 - `local_cost_entropy`
+- `measurement_search_radius_px`
 - `query_gt_x/query_gt_y` when available for diagnostics
 - `depth_valid`
 - `pnp_inlier`
 
-For full-query evaluation, the preferred input is the upstream RADIO/MATCHA
-match table with `world_x/world_y/world_z`. A single `render_pose_w2c` is only
-valid for toy or single-render cases because full-182 rows can come from
-different query-specific or candidate-specific render poses.
+The geometry source is now explicit:
+
+- `--geometry_source force_backproject`: recompute 3D from `render_x/render_y/render_depth` and the supplied render pose. This is the default CLI mode and is safest for dense-depth protocol checks.
+- `--geometry_source prefer_world_xyz`: use materialized `world_x/world_y/world_z` when present. This is useful for legacy tables or full-query tables that already carry per-row 3D.
+- `--geometry_source assert_consistent`: require both materialized world coordinates and render-depth backprojection to agree within `--world_xyz_consistency_threshold_m`.
+
+Full-query or topK evaluation groups rows by `(query_id, candidate_id/render_pose_id)`
+when candidate fields exist. A single `--render_pose_w2c_json` is allowed only for
+one query/candidate group; otherwise the CLI fails loudly rather than applying one
+render pose to unrelated rows.
+
+Pose variants now support:
+
+- `center`: use `query_center_x/query_center_y`
+- `measurement` or `measurement_mean`: use explicit `query_refined_x/query_refined_y` or `measurement_dx/measurement_dy`
+- `measurement_mode`: use `measurement_mode_dx/measurement_mode_dy` or `measurement_peak_dx/measurement_peak_dy`
+- `oracle_if_gt_in_window`: use GT query pixel only when it is inside the local search window
+- `oracle` or `oracle_all`: use all available `query_gt_x/query_gt_y`
+
+The default evaluation is strict: `measurement` no longer falls back to `query_x/y`.
+Use `--no_strict_measurement_schema` only for legacy debugging.
 
 ## Current Acceptance Gates
 
@@ -107,11 +129,35 @@ python -m feature_extract.tools.vfm.eval_dense_depth_measurement_fusion \
   --camera_width 640 \
   --camera_height 480 \
   --camera_model_id 1 \
-  --camera_params fx fy cx cy
+  --camera_params fx fy cx cy \
+  --geometry_source prefer_world_xyz \
+  --variants center measurement measurement_mode oracle_if_gt_in_window oracle_all
 ```
 
 If `world_x/world_y/world_z` are absent and all rows share one render pose, pass
-`--render_pose_w2c_json`.
+`--render_pose_w2c_json` and keep the default `--geometry_source force_backproject`.
+For multi-query or topK tables, provide per-row world coordinates or a future
+per-candidate render-pose manifest; do not use one global render pose.
+
+RGB patch measurement application now defaults to `center` / no-op. The branch
+still runs and writes diagnostics, but it does not move the query pixel unless an
+explicit ablation chooses a learned head. A mean or mode decoder must be promoted
+to the PnP input only after controlled diagnostics show that it does not damage
+good center measurements and improves the relevant residual bins. It still
+writes mean/mode/direct diagnostics:
+
+- `measurement_mean_dx/measurement_mean_dy`
+- `measurement_mode_dx/measurement_mode_dy`
+- `measurement_direct_dx/measurement_direct_dy`
+- `measurement_peak_dx/measurement_peak_dy`
+
+Use `--prediction_head likelihood_mean`, `--prediction_head likelihood_mode`, or
+`--prediction_head direct` only for explicit decoder ablations or after the
+conservative no-op / validity gates show that an update is safe.
+
+Training and diagnostics now report residual-bin metrics, baseline EPE per bin,
+worsen ratio, and `support_patch_source_audit`. These are protocol guards, not
+accuracy claims.
 
 ## Full-182 Postprocess Snapshot
 

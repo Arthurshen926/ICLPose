@@ -35,6 +35,12 @@ from feature_extract.vfm.measurement_v1.rgb_patch_training import (
 
 RGB_PATCH_FUSION_FIELDNAMES = [
     *DENSE_DEPTH_FUSION_FIELDNAMES,
+    "measurement_mean_dx",
+    "measurement_mean_dy",
+    "measurement_mode_dx",
+    "measurement_mode_dy",
+    "measurement_direct_dx",
+    "measurement_direct_dy",
     "measurement_peak_dx",
     "measurement_peak_dy",
     "local_cost_peak_prob",
@@ -128,6 +134,19 @@ def _fieldnames_for_rows(rows: Sequence[Mapping[str, Any]]) -> list[str]:
                 seen.add(name)
                 out.append(str(name))
     return out
+
+
+def _canonical_prediction_head(prediction_head: str) -> str:
+    head = str(prediction_head).strip().lower()
+    if head in {"likelihood", "likelihood_mean", "mean"}:
+        return "likelihood_mean"
+    if head in {"mode", "likelihood_mode"}:
+        return "likelihood_mode"
+    if head in {"center", "noop", "no_op"}:
+        return "center"
+    if head == "direct":
+        return "direct"
+    raise ValueError("prediction_head must be one of center, likelihood_mean, likelihood_mode, mode, likelihood, or direct")
 
 
 class CachedProjectionMeasurementAdapter(nn.Module):
@@ -410,7 +429,7 @@ def apply_rgb_patch_measurements_to_rows(
     render_image_height: int | None = None,
     batch_size: int = 16,
     device: torch.device | str = "cuda",
-    prediction_head: str = "likelihood",
+    prediction_head: str = "center",
     prior_scale_key: str = "",
     covariance_floor_px2: float = 1e-4,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -421,9 +440,7 @@ def apply_rgb_patch_measurements_to_rows(
     render_x/render_y/render_depth/world_x/world_y/world_z values are preserved.
     """
 
-    head = str(prediction_head)
-    if head not in {"likelihood", "mode", "direct"}:
-        raise ValueError("prediction_head must be 'likelihood', 'mode', or 'direct'")
+    head = _canonical_prediction_head(str(prediction_head))
     torch_device = torch.device(device if torch.cuda.is_available() or not str(device).startswith("cuda") else "cpu")
     q_width = int(query_image_width if query_image_width is not None else image_width if image_width is not None else 0)
     q_height = int(query_image_height if query_image_height is not None else image_height if image_height is not None else 0)
@@ -459,20 +476,30 @@ def apply_rgb_patch_measurements_to_rows(
                 render_patch.to(torch_device),
                 prior_scale_px=None if prior_scale is None else prior_scale.to(torch_device),
             )
-            if head == "likelihood":
-                stats = _likelihood_stats(pred.logits, pred.offsets_xy, covariance_floor_px2=float(covariance_floor_px2))
-            elif head == "mode":
-                stats = _mode_stats(pred.logits, pred.offsets_xy, covariance_floor_px2=float(covariance_floor_px2))
-            else:
+            likelihood_stats = _likelihood_stats(pred.logits, pred.offsets_xy, covariance_floor_px2=float(covariance_floor_px2))
+            mode_stats = _mode_stats(pred.logits, pred.offsets_xy, covariance_floor_px2=float(covariance_floor_px2))
+            direct_stats = None
+            if head == "direct":
                 if pred.direct_mean_offset_xy is None or pred.direct_log_sigma_xy is None:
                     raise ValueError("checkpoint does not expose direct offset head outputs")
-                stats = _direct_stats(pred.direct_mean_offset_xy, pred.direct_log_sigma_xy, pred.logits, pred.offsets_xy)
+                direct_stats = _direct_stats(pred.direct_mean_offset_xy, pred.direct_log_sigma_xy, pred.logits, pred.offsets_xy)
+                stats = direct_stats
+            elif head == "center":
+                stats = dict(likelihood_stats)
+                stats["mean"] = torch.zeros_like(likelihood_stats["mean"])
+            elif head == "likelihood_mean":
+                stats = likelihood_stats
+            else:
+                stats = mode_stats
             mean = stats["mean"].detach().cpu()
             cov = stats["cov"].detach().cpu()
             entropy = stats["entropy_norm"].detach().cpu()
             peak = stats["peak"].detach().cpu()
             peak_prob = stats["peak_prob"].detach().cpu()
             top2_gap = stats["top2_gap"].detach().cpu()
+            likelihood_mean = likelihood_stats["mean"].detach().cpu()
+            mode_mean = mode_stats["mean"].detach().cpu()
+            direct_mean = None if direct_stats is None else direct_stats["mean"].detach().cpu()
             valid_prob = (1.0 - torch.sigmoid(pred.dustbin_logit.detach())).cpu()
             for local_index, row in enumerate(batch_rows):
                 cx, cy = _query_center(row)
@@ -489,6 +516,12 @@ def apply_rgb_patch_measurements_to_rows(
                 row["query_refined_y"] = float(cy + dy)
                 row["measurement_dx"] = dx
                 row["measurement_dy"] = dy
+                row["measurement_mean_dx"] = float(likelihood_mean[local_index, 0].item())
+                row["measurement_mean_dy"] = float(likelihood_mean[local_index, 1].item())
+                row["measurement_mode_dx"] = float(mode_mean[local_index, 0].item())
+                row["measurement_mode_dy"] = float(mode_mean[local_index, 1].item())
+                row["measurement_direct_dx"] = "" if direct_mean is None else float(direct_mean[local_index, 0].item())
+                row["measurement_direct_dy"] = "" if direct_mean is None else float(direct_mean[local_index, 1].item())
                 row["measurement_cov_xx"] = cov_xx
                 row["measurement_cov_xy"] = cov_xy
                 row["measurement_cov_yy"] = cov_yy
@@ -539,7 +572,7 @@ def apply_rgb_patch_measurements_to_match_table(
     device: str = "cuda",
     base_dir: Path | None = None,
     max_rows: int | None = None,
-    prediction_head: str = "likelihood",
+    prediction_head: str = "center",
     prior_scale_key: str = "",
 ) -> dict[str, Any]:
     base = Path.cwd() if base_dir is None else Path(base_dir)

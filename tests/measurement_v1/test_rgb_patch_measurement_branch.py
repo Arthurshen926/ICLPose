@@ -63,8 +63,10 @@ def test_residual_bin_metrics_report_per_requested_residual_performance() -> Non
     metrics = rgb_patch_training._residual_bin_metrics(rows, epe, baseline, prefix="likelihood")
 
     assert metrics["likelihood_bin_1p000_count"] == 2
+    assert metrics["likelihood_bin_1p000_baseline_epe_median_px"] == 1.0
     assert metrics["likelihood_bin_1p000_epe_median_px"] == 0.25
     assert metrics["likelihood_bin_1p000_recall_0p5px"] == 0.5
+    assert metrics["likelihood_bin_1p000_worsen_ratio"] == 0.0
     assert metrics["likelihood_bin_2p000_count"] == 1
     assert metrics["likelihood_bin_2p000_improve_ratio"] == 1.0
 
@@ -847,6 +849,7 @@ def test_train_rgb_patch_measurement_branch_reports_center_baseline_and_improve_
     assert summary["train_center_baseline"]["epe_px"] == 0.5
     assert summary["query_source"] == "render"
     assert summary["support_patch_warp"] == "none"
+    assert summary["support_patch_source_audit"]["support_patch_source"] == "render_cache_by_query"
     assert summary["template_scale_factors"] == [0.75, 1.0, 1.25]
     assert summary["delta_loss_weight"] == 1.0
     assert "improve_ratio" in summary["val_metrics"]
@@ -869,6 +872,8 @@ def test_train_rgb_patch_measurement_branch_reports_center_baseline_and_improve_
     assert summary["acceptance_gate"]["improve_ratio_threshold"] == 0.8
     assert "direct_head" in summary["acceptance_gate"]
     assert "likelihood_head" in summary["acceptance_gate"]
+    assert "residual_bin_gates" in summary["acceptance_gate"]
+    assert "likelihood_head" in summary["acceptance_gate"]["residual_bin_gates"]
     assert "passes" in summary["acceptance_gate"]["direct_head"]
     assert "passes" in summary["acceptance_gate"]["likelihood_head"]
     assert (tmp_path / "train" / "rgb_patch_measurement_branch.pt").exists()

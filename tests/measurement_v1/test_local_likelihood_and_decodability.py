@@ -65,5 +65,8 @@ def test_decodability_metrics_report_rank_recall_nll_and_entropy() -> None:
     assert metrics["gt_rank"] == 1
     assert metrics["recall_1px"] == 1.0
     assert metrics["epe_px"] < 0.1
+    assert metrics["mode_recall_0p5px"] == 1.0
+    assert metrics["mode_recall_1px"] == 1.0
+    assert metrics["mode_error_px"] == 0.0
     assert metrics["nll"] < 0.01
     assert metrics["entropy"] >= 0.0

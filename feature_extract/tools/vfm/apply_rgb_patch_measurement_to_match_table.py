@@ -29,7 +29,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--base_dir", default=".")
     parser.add_argument("--max_rows", type=int, default=0)
-    parser.add_argument("--prediction_head", default="likelihood", choices=("likelihood", "mode", "direct"))
+    parser.add_argument(
+        "--prediction_head",
+        default="center",
+        choices=("center", "noop", "likelihood_mode", "likelihood_mean", "likelihood", "mode", "direct"),
+    )
     parser.add_argument("--prior_scale_key", default="")
     return parser.parse_args(argv)
 

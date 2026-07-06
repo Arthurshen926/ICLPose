@@ -82,16 +82,22 @@ def test_export_rgb_patch_diagnostics_writes_rows_and_visualizations(tmp_path: P
 
     assert summary["row_count"] == 1
     assert summary["support_patch_warp"] == "none"
+    assert summary["support_patch_source_audit"]["support_patch_source"] == "render_cache_by_query"
+    assert "mode_median_px" in summary["metrics"]
     assert (output_dir / "diagnostic_rows.csv").exists()
     assert list((output_dir / "visualizations").glob("*.png"))
     row = next(csv.DictReader((output_dir / "diagnostic_rows.csv").open()))
     assert {
         "baseline_epe_px",
         "likelihood_epe_px",
+        "mode_epe_px",
+        "direct_epe_px",
         "pred_dx",
         "pred_dy",
         "peak_dx",
         "peak_dy",
+        "query_mode_x",
+        "query_mode_y",
         "query_pred_x",
         "query_pred_y",
         "track_id",
@@ -206,3 +212,63 @@ def test_export_rgb_patch_diagnostics_batching_matches_single_row_mode(tmp_path:
         assert single["track_id"] == batched["track_id"]
         for key in ("query_pred_x", "query_pred_y", "pred_dx", "pred_dy", "dustbin_probability"):
             assert np.isclose(float(single[key]), float(batched[key]), atol=1e-6)
+
+
+def test_export_rgb_patch_diagnostics_loads_legacy_checkpoint_without_empty_prior_buffer(tmp_path: Path) -> None:
+    image_root = tmp_path / "images"
+    (image_root / "seq0").mkdir(parents=True)
+    rgb = np.zeros((16, 16, 3), dtype=np.uint8)
+    rgb[8, 8] = [255, 255, 255]
+    Image.fromarray(rgb).save(image_root / "seq0" / "frame00000.png")
+    rows_csv = tmp_path / "rows.csv"
+    _write_csv(
+        rows_csv,
+        [
+            {
+                "query_id": "seq0/frame00000.png",
+                "support_image_id": "seq0/frame00000.png",
+                "support_x": 8.0,
+                "support_y": 8.0,
+                "render_x": 8.0,
+                "render_y": 8.0,
+                "center_x": 7.5,
+                "center_y": 8.0,
+                "query_gt_x": 8.0,
+                "query_gt_y": 8.0,
+                "target_is_dustbin": "False",
+            }
+        ],
+    )
+    model = RGBPatchMeasurementBranch(search_radius_px=1.0, context_radius_px=2.0, step_px=0.5, feature_dim=4)
+    state = dict(model.state_dict())
+    state.pop("prior_scale_expert_centers")
+    checkpoint = tmp_path / "legacy_model.pt"
+    torch.save(
+        {
+            "model": state,
+            "config": {
+                "search_radius_px": 1.0,
+                "context_radius_px": 2.0,
+                "step_px": 0.5,
+                "feature_dim": 4,
+                "template_scale_factors": [1.0],
+            },
+        },
+        checkpoint,
+    )
+
+    summary = export_rgb_patch_diagnostics(
+        rows_csv=rows_csv,
+        render_cache_manifest_csv=None,
+        image_root=image_root,
+        checkpoint=checkpoint,
+        output_dir=tmp_path / "diagnostics",
+        image_width=16,
+        image_height=16,
+        query_source="real_pair",
+        max_rows=1,
+        visualize_limit=0,
+        device="cpu",
+    )
+
+    assert summary["row_count"] == 1
