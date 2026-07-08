@@ -9,10 +9,19 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import numpy as np
+from PIL import Image
 
 from feature_extract.vfm.cambridge_pose_lattice import CambridgePoseRecord
-from feature_extract.vfm.colmap_tracks import ColmapCamera, ColmapTrackObservation
+from feature_extract.vfm.colmap_tracks import ColmapCamera, ColmapImageObservation, ColmapTrackObservation
+from feature_extract.vfm.localization.model import SelectorCoarseMeasurementModel
+from feature_extract.vfm.localization.pipeline import (
+    RealRadioLocalizationPair,
+    _load_feature_map,
+    _load_rgb_chw,
+    _resolve_path,
+)
 from feature_extract.vfm.localization.schemas import CoarseProposal, MeasurementResult
+from feature_extract.vfm.measurement_v1.rgb_patch_pose_proxy import scaled_colmap_camera
 from feature_extract.vfm.query_to_3d_matching import (
     QueryTo3DMatch,
     SpatialDiversityPnPConfig,
@@ -344,3 +353,168 @@ def write_mapping_rows_jsonl(path: Path, rows: Sequence[Mapping[str, Any]]) -> N
     with output.open("w") as handle:
         for row in rows:
             handle.write(json.dumps(dict(row), sort_keys=True) + "\n")
+
+
+def _image_size(path: Path) -> tuple[int, int]:
+    with Image.open(path) as image:
+        return int(image.width), int(image.height)
+
+
+def _cameras_by_query_from_colmap(
+    *,
+    cameras: Mapping[int, ColmapCamera],
+    colmap_images: Mapping[int, ColmapImageObservation],
+    image_root: Path,
+) -> dict[str, ColmapCamera]:
+    out: dict[str, ColmapCamera] = {}
+    for image in colmap_images.values():
+        camera = cameras.get(int(image.camera_id))
+        if camera is None:
+            continue
+        image_path = Path(image_root) / image.image_name
+        if image_path.exists():
+            width, height = _image_size(image_path)
+            out[str(image.image_name)] = scaled_colmap_camera(camera, image_width=width, image_height=height)
+        else:
+            out[str(image.image_name)] = camera
+    return out
+
+
+def _bridge_summary(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    total = len(rows)
+    matched = [row for row in rows if row.get("association_status") == "matched"]
+    distances = _finite_values(matched, "support_observation_distance_px")
+    return {
+        "proposal_count": int(total),
+        "associated_match_count": int(len(matched)),
+        "association_rate": float(len(matched) / total) if total else 0.0,
+        "support_observation_distance_median_px": float(np.median(distances)) if distances.size else None,
+        "support_observation_distance_p90_px": float(np.percentile(distances, 90.0)) if distances.size else None,
+    }
+
+
+def run_real_radio_pose_localization_eval(
+    pairs: Sequence[RealRadioLocalizationPair],
+    *,
+    image_root: Path,
+    feature_root: Path,
+    output_dir: Path,
+    feature_mapper,
+    coarse_matcher,
+    measurement_branch,
+    cameras: Mapping[int, ColmapCamera],
+    colmap_images: Mapping[int, ColmapImageObservation],
+    colmap_observations: Sequence[ColmapTrackObservation],
+    gt_poses_by_query: Mapping[str, CambridgePoseRecord],
+    feature_key: str = "",
+    max_pairs: int | None = None,
+    max_support_distance_px: float = 6.0,
+    pnp_reprojection_error_px: float = 8.0,
+    pnp_iterations: int = 1000,
+    pnp_confidence: float = 0.999,
+    pnp_min_inliers: int = 4,
+) -> dict[str, Any]:
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    selected_pairs = list(pairs)
+    if max_pairs is not None:
+        selected_pairs = selected_pairs[: int(max_pairs)]
+
+    model = SelectorCoarseMeasurementModel(feature_mapper, coarse_matcher, measurement_branch)
+    records: list[ClosedLoopProposalRecord] = []
+    proposal_rows: list[dict[str, Any]] = []
+    for pair in selected_pairs:
+        query_rgb = _load_rgb_chw(Path(image_root) / pair.query_id)
+        reference_rgb = _load_rgb_chw(Path(image_root) / pair.reference_image_id)
+        query_feature = _load_feature_map(
+            _resolve_path(pair.query_feature_path, base_dir=Path(feature_root)),
+            key=str(feature_key),
+        )
+        reference_feature = _load_feature_map(
+            _resolve_path(pair.reference_feature_path, base_dir=Path(feature_root)),
+            key=str(feature_key),
+        )
+        result = model.match_pair(
+            query_feature,
+            reference_feature,
+            query_image_size=(int(query_rgb.shape[2]), int(query_rgb.shape[1])),
+            reference_image_size=(int(reference_rgb.shape[2]), int(reference_rgb.shape[1])),
+            query_rgb=query_rgb,
+            reference_rgb=reference_rgb,
+        )
+        measurements = {
+            (id(item.proposal), int(item.proposal.query_index), int(item.proposal.reference_index)): item
+            for item in result.measurements
+        }
+        for proposal_index, proposal in enumerate(result.coarse_proposals):
+            measurement = measurements.get((id(proposal), int(proposal.query_index), int(proposal.reference_index)))
+            records.append(
+                ClosedLoopProposalRecord(
+                    query_id=pair.query_id,
+                    reference_image_id=pair.reference_image_id,
+                    proposal=proposal,
+                    measurement=measurement,
+                    proposal_index=proposal_index,
+                )
+            )
+            proposal_rows.append(
+                {
+                    "query_id": pair.query_id,
+                    "reference_image_id": pair.reference_image_id,
+                    "proposal_index": int(proposal_index),
+                    "query_x": float(proposal.query_xy[0]),
+                    "query_y": float(proposal.query_xy[1]),
+                    "reference_x": float(proposal.reference_xy[0]),
+                    "reference_y": float(proposal.reference_xy[1]),
+                    "coarse_score": float(proposal.score),
+                    "measurement_confidence": (
+                        "" if measurement is None or measurement.confidence is None else float(measurement.confidence)
+                    ),
+                }
+            )
+
+    observation_index = build_support_observation_index(colmap_observations)
+    match_rows, matches_by_query = convert_proposals_to_query_3d_matches(
+        records,
+        observation_index=observation_index,
+        max_support_distance_px=float(max_support_distance_px),
+    )
+    cameras_by_query = _cameras_by_query_from_colmap(cameras=cameras, colmap_images=colmap_images, image_root=Path(image_root))
+    pose_rows = evaluate_query_poses(
+        matches_by_query,
+        cameras_by_query=cameras_by_query,
+        gt_poses_by_query=gt_poses_by_query,
+        pnp_reprojection_error_px=float(pnp_reprojection_error_px),
+        pnp_iterations=int(pnp_iterations),
+        pnp_confidence=float(pnp_confidence),
+        pnp_min_inliers=int(pnp_min_inliers),
+    )
+
+    write_mapping_rows_csv(output / "proposals.csv", proposal_rows)
+    write_mapping_rows_jsonl(output / "proposals.jsonl", proposal_rows)
+    write_mapping_rows_csv(output / "matches_2d3d.csv", match_rows)
+    write_mapping_rows_jsonl(output / "matches_2d3d.jsonl", match_rows)
+    write_mapping_rows_csv(output / "pose_rows.csv", pose_rows)
+    write_mapping_rows_jsonl(output / "pose_rows.jsonl", pose_rows)
+    summary = {
+        "stage": "real_radio_pose_localization",
+        "pair_count": int(len(selected_pairs)),
+        "bridge": _bridge_summary(match_rows),
+        "pose": summarize_pose_rows(pose_rows),
+        "max_support_distance_px": float(max_support_distance_px),
+        "pnp_reprojection_error_px": float(pnp_reprojection_error_px),
+        "pnp_iterations": int(pnp_iterations),
+        "pnp_confidence": float(pnp_confidence),
+        "pnp_min_inliers": int(pnp_min_inliers),
+        "outputs": {
+            "proposals_csv": str(output / "proposals.csv"),
+            "proposals_jsonl": str(output / "proposals.jsonl"),
+            "matches_2d3d_csv": str(output / "matches_2d3d.csv"),
+            "matches_2d3d_jsonl": str(output / "matches_2d3d.jsonl"),
+            "pose_rows_csv": str(output / "pose_rows.csv"),
+            "pose_rows_jsonl": str(output / "pose_rows.jsonl"),
+            "summary": str(output / "summary.json"),
+        },
+    }
+    (output / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+    return summary

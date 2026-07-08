@@ -1,17 +1,23 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
+from PIL import Image
 
 from feature_extract.vfm.cambridge_pose_lattice import CambridgePoseRecord
 from feature_extract.vfm.colmap_tracks import ColmapCamera
+from feature_extract.vfm.colmap_tracks import ColmapImageObservation
 from feature_extract.vfm.colmap_tracks import ColmapTrackObservation
-from feature_extract.vfm.localization import CoarseProposal, MeasurementResult
+from feature_extract.vfm.localization import CoarseProposal, MappedFeatureMap, MeasurementResult
+from feature_extract.vfm.localization.pipeline import RealRadioLocalizationPair
 from feature_extract.vfm.localization.pose_eval import build_support_observation_index
 from feature_extract.vfm.localization.pose_eval import (
     ClosedLoopProposalRecord,
     convert_proposals_to_query_3d_matches,
     deduplicate_query_3d_matches,
     evaluate_query_poses,
+    run_real_radio_pose_localization_eval,
     summarize_pose_rows,
 )
 from feature_extract.vfm.query_to_3d_matching import QueryTo3DMatch
@@ -226,3 +232,63 @@ def test_evaluate_query_poses_solves_simple_pnp() -> None:
     assert rows[0]["translation_error_m"] < 1e-4
     assert rows[0]["rotation_error_deg"] < 1e-4
     assert rows[0]["inlier_count"] >= 4
+
+
+def _write_rgb(path: Path, size=(100, 100)) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(np.zeros((size[1], size[0], 3), dtype=np.uint8), mode="RGB").save(path)
+
+
+def test_run_real_radio_pose_localization_eval_writes_artifacts(tmp_path: Path) -> None:
+    image_root = tmp_path / "images"
+    feature_root = tmp_path / "features"
+    _write_rgb(image_root / "q.png")
+    _write_rgb(image_root / "r.png")
+    feature_root.mkdir()
+    np.save(feature_root / "q.npy", np.zeros((2, 1, 1), dtype=np.float32))
+    np.save(feature_root / "r.npy", np.zeros((2, 1, 1), dtype=np.float32))
+
+    class FakeFeatureMapper:
+        def project(self, feature_map):
+            return MappedFeatureMap(np.asarray(feature_map, dtype=np.float32), np.asarray(feature_map, dtype=np.float32))
+
+    class FakeCoarseMatcher:
+        def match(self, query_descriptors, reference_descriptors, *, query_image_size, reference_image_size):
+            del query_descriptors, reference_descriptors, query_image_size, reference_image_size
+            return [_proposal(query_xy=(50.0, 50.0), reference_xy=(50.0, 50.0), score=1.0)]
+
+    class FakeMeasurement:
+        def measure(self, query_rgb, reference_rgb, proposals, *, mapped_query=None, mapped_reference=None):
+            del query_rgb, reference_rgb, proposals, mapped_query, mapped_reference
+            return []
+
+    camera = ColmapCamera(camera_id=1, model_id=1, width=100, height=100, params=(80.0, 80.0, 50.0, 50.0))
+    colmap_image = ColmapImageObservation(
+        image_id=1,
+        image_name="q.png",
+        camera_id=1,
+        qvec=np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float64),
+        tvec=np.zeros(3, dtype=np.float64),
+        xys=np.zeros((0, 2), dtype=np.float64),
+        point3d_ids=np.zeros((0,), dtype=np.int64),
+    )
+    gt = CambridgePoseRecord("q.png", np.zeros(3, dtype=np.float64), np.eye(3), np.eye(4))
+    summary = run_real_radio_pose_localization_eval(
+        [RealRadioLocalizationPair("q.png", "r.png", Path("q.npy"), Path("r.npy"))],
+        image_root=image_root,
+        feature_root=feature_root,
+        output_dir=tmp_path / "out",
+        feature_mapper=FakeFeatureMapper(),
+        coarse_matcher=FakeCoarseMatcher(),
+        measurement_branch=FakeMeasurement(),
+        cameras={1: camera},
+        colmap_images={1: colmap_image},
+        colmap_observations=[_obs("r.png", 1, (50.0, 50.0))],
+        gt_poses_by_query={"q.png": gt},
+        max_support_distance_px=2.0,
+    )
+
+    assert summary["pose"]["query_count"] == 1
+    assert summary["bridge"]["associated_match_count"] == 1
+    assert Path(summary["outputs"]["matches_2d3d_csv"]).exists()
+    assert Path(summary["outputs"]["pose_rows_csv"]).exists()
