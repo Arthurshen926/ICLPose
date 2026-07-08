@@ -3,7 +3,13 @@ from __future__ import annotations
 import numpy as np
 
 from feature_extract.vfm.colmap_tracks import ColmapTrackObservation
+from feature_extract.vfm.localization import CoarseProposal, MeasurementResult
 from feature_extract.vfm.localization.pose_eval import build_support_observation_index
+from feature_extract.vfm.localization.pose_eval import (
+    ClosedLoopProposalRecord,
+    convert_proposals_to_query_3d_matches,
+    deduplicate_query_3d_matches,
+)
 
 
 def _obs(image_id: str, track_id: int, xy: tuple[float, float]) -> ColmapTrackObservation:
@@ -42,3 +48,93 @@ def test_support_observation_index_respects_radius_and_image_id() -> None:
 
     assert index.nearest("seq/r.png", np.asarray([30.0, 30.0], dtype=np.float32), max_distance_px=4.0) is None
     assert index.nearest("seq/missing.png", np.asarray([10.0, 10.0], dtype=np.float32), max_distance_px=4.0) is None
+
+
+def _proposal(query_xy=(3.0, 4.0), reference_xy=(10.0, 10.0), score=0.7) -> CoarseProposal:
+    return CoarseProposal(
+        query_index=0,
+        reference_index=0,
+        query_xy=np.asarray(query_xy, dtype=np.float32),
+        reference_xy=np.asarray(reference_xy, dtype=np.float32),
+        score=score,
+        confidence=score,
+        rank=0,
+    )
+
+
+def test_convert_proposals_uses_measurement_coordinates_and_support_xyz() -> None:
+    index = build_support_observation_index([_obs("seq/r.png", 42, (20.0, 21.0))])
+    proposal = _proposal(reference_xy=(10.0, 10.0))
+    measurement = MeasurementResult(
+        proposal=proposal,
+        measured_query_xy=np.asarray([7.0, 8.0], dtype=np.float32),
+        measured_reference_xy=np.asarray([20.0, 21.0], dtype=np.float32),
+        confidence=0.9,
+        uncertainty_px=0.5,
+    )
+
+    rows, matches = convert_proposals_to_query_3d_matches(
+        [
+            ClosedLoopProposalRecord(
+                query_id="seq/q.png",
+                reference_image_id="seq/r.png",
+                proposal=proposal,
+                measurement=measurement,
+                proposal_index=0,
+            )
+        ],
+        observation_index=index,
+        max_support_distance_px=2.0,
+    )
+
+    assert len(rows) == 1
+    assert len(matches["seq/q.png"]) == 1
+    match = matches["seq/q.png"][0]
+    assert match.track_id == 42
+    np.testing.assert_allclose(match.xy, [7.0, 8.0])
+    np.testing.assert_allclose(match.xyz, [42.0, 0.0, 4.0])
+    assert match.pnp_soft_score == 0.9
+    assert rows[0]["association_status"] == "matched"
+
+
+def test_convert_proposals_falls_back_to_coarse_coordinates() -> None:
+    index = build_support_observation_index([_obs("seq/r.png", 43, (10.0, 10.0))])
+    proposal = _proposal(query_xy=(3.0, 4.0), reference_xy=(10.0, 10.0), score=0.6)
+
+    rows, matches = convert_proposals_to_query_3d_matches(
+        [
+            ClosedLoopProposalRecord(
+                query_id="seq/q.png",
+                reference_image_id="seq/r.png",
+                proposal=proposal,
+                measurement=None,
+                proposal_index=0,
+            )
+        ],
+        observation_index=index,
+        max_support_distance_px=1.0,
+    )
+
+    assert rows[0]["association_status"] == "matched"
+    np.testing.assert_allclose(matches["seq/q.png"][0].xy, [3.0, 4.0])
+    assert matches["seq/q.png"][0].pnp_soft_score == 0.6
+
+
+def test_deduplicate_query_3d_matches_keeps_best_confidence() -> None:
+    index = build_support_observation_index([_obs("seq/r.png", 42, (10.0, 10.0))])
+    low = _proposal(query_xy=(1.0, 1.0), reference_xy=(10.0, 10.0), score=0.1)
+    high = _proposal(query_xy=(2.0, 2.0), reference_xy=(10.0, 10.0), score=0.9)
+    _, matches = convert_proposals_to_query_3d_matches(
+        [
+            ClosedLoopProposalRecord("seq/q.png", "seq/r.png", low, None, 0),
+            ClosedLoopProposalRecord("seq/q.png", "seq/r.png", high, None, 1),
+        ],
+        observation_index=index,
+        max_support_distance_px=1.0,
+    )
+
+    deduped = deduplicate_query_3d_matches(matches["seq/q.png"])
+
+    assert len(deduped) == 1
+    np.testing.assert_allclose(deduped[0].xy, [2.0, 2.0])
+    assert deduped[0].pnp_soft_score == 0.9
