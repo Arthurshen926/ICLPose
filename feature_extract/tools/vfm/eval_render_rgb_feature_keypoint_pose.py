@@ -108,6 +108,7 @@ from feature_extract.vfm.rendered_keypoint_matching import (
     keypoint_feature_matches_to_pnp_matches,
     mutual_nn_keypoint_matches,
     refine_render_keypoint_matches_by_local_correlation,
+    render_anchor_topk_keypoint_matches,
 )
 from feature_extract.vfm.rendered_pose_scoring import (
     annotate_measurement_uncertainty,
@@ -235,6 +236,7 @@ def _write_rebuilt_summary_from_rows(output_dir: Path, args: argparse.Namespace,
     summary["metrics"]["render_cache_manifest_row_count"] = int(len(render_cache_rows))
     summary["metrics"].update(_render_lock_diagnostics_from_rows(rows))
     summary["metrics"].update(_fine_confidence_diagnostics_from_rows(rows))
+    summary["metrics"].update(_proposal_pool_diagnostics_from_rows(rows))
     summary["metrics"].update(_residual_solver_diagnostics_from_rows(rows))
     summary["metrics"].update(_oracle_pnp_diagnostics_from_rows(rows))
     summary_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1463,6 +1465,42 @@ def _fine_confidence_diagnostics_from_rows(rows: Sequence[dict[str, object]]) ->
     }
 
 
+def _proposal_pool_diagnostics_from_rows(rows: Sequence[dict[str, object]]) -> dict[str, object]:
+    def vals(key: str) -> list[float]:
+        out = []
+        for row in rows:
+            value = row.get(key)
+            if value is None:
+                continue
+            try:
+                item = float(value)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(item):
+                out.append(item)
+        return out
+
+    output: dict[str, object] = {}
+    match_counts = vals("candidate_pool_match_count")
+    total_matches = int(np.sum(match_counts)) if match_counts else 0
+    output["candidate_pool_match_count"] = total_matches
+    output["candidate_pool_match_count_per_query_median"] = None if not match_counts else float(np.median(match_counts))
+    for tag in ("2", "5", "10", "16"):
+        key = f"candidate_pool_valid_{tag}px_count"
+        counts = vals(key)
+        total = int(np.sum(counts)) if counts else 0
+        output[key] = total
+        output[f"candidate_pool_valid_{tag}px_rate"] = (
+            None if total_matches <= 0 else float(total / float(total_matches))
+        )
+        output[f"candidate_pool_valid_{tag}px_queries_with_valid_count"] = int(
+            sum(1 for count in counts if float(count) > 0.0)
+        )
+        output[f"candidate_pool_valid_{tag}px_per_query_median"] = None if not counts else float(np.median(counts))
+        output[f"candidate_pool_valid_{tag}px_per_query_p90"] = None if not counts else float(np.percentile(counts, 90.0))
+    return output
+
+
 def _render_lock_diagnostics_from_rows(rows: Sequence[dict[str, object]]) -> dict[str, object]:
     def vals(key: str) -> list[float]:
         out = []
@@ -1878,14 +1916,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--skip_existing_render_rgb_depth", action="store_true")
     parser.add_argument("--detector", default="superpoint", choices=("orb", "superpoint", "disk"))
     parser.add_argument("--max_keypoints", type=int, default=1000)
-    parser.add_argument("--match_mode", default="mnn", choices=("mnn", "mnn_dual_filter", "dual_softmax", "matcha_c2f"))
+    parser.add_argument("--match_mode", default="mnn", choices=("mnn", "mnn_dual_filter", "dual_softmax", "render_anchor_topk", "matcha_c2f"))
     parser.add_argument("--ratio_threshold", type=float, default=0.9)
+    parser.add_argument("--render_anchor_top_l", type=int, default=5)
     parser.add_argument("--dual_softmax_logit_scale", type=float, default=10.0)
     parser.add_argument("--min_dual_softmax_confidence", type=float, default=0.0)
     parser.add_argument("--min_similarity", type=float, default=0.0)
     parser.add_argument("--max_matches", type=int, default=1000)
     parser.add_argument("--matcha_coarse_top_k_per_query", type=int, default=1)
     parser.add_argument("--matcha_coarse_mutual_mode", default="legacy", choices=("legacy", "none", "annotate", "filter"))
+    parser.add_argument("--matcha_coarse_anchor_side", default="query", choices=("query", "render"))
     parser.add_argument("--matcha_coarse_local_window_radius_cells", type=int, default=-1)
     parser.add_argument("--matcha_post_confidence_top_k_per_query", type=int, default=0)
     parser.add_argument("--coarse_candidate_ranker_model", default="")
@@ -2724,6 +2764,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                         coarse_mutual_mode=(
                             None if str(args.matcha_coarse_mutual_mode) == "legacy" else str(args.matcha_coarse_mutual_mode)
                         ),
+                        coarse_anchor_side=str(args.matcha_coarse_anchor_side),
                         coarse_local_window_radius_cells=(
                             None
                             if int(args.matcha_coarse_local_window_radius_cells) < 0
@@ -2770,6 +2811,18 @@ def main(argv: Sequence[str] | None = None) -> None:
                     logit_scale=float(args.dual_softmax_logit_scale),
                     min_confidence=float(args.min_dual_softmax_confidence),
                     min_similarity=float(args.min_similarity),
+                    max_matches=args.max_matches,
+                )
+            elif args.match_mode == "render_anchor_topk":
+                kp_matches = render_anchor_topk_keypoint_matches(
+                    query_xy_valid,
+                    qdesc,
+                    render_xy_valid,
+                    rdesc,
+                    top_l=int(args.render_anchor_top_l),
+                    min_similarity=float(args.min_similarity),
+                    dual_softmax_logit_scale=float(args.dual_softmax_logit_scale),
+                    min_dual_softmax_confidence=float(args.min_dual_softmax_confidence),
                     max_matches=args.max_matches,
                 )
             elif args.match_mode != "matcha_c2f":
@@ -3323,6 +3376,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         render_side_local_offset_expanded_match_count = int(final.get("render_side_local_offset_expanded_match_count", 0))
         unfiltered_pnp_match_count = int(final["unfiltered_pnp_match_count"])
         candidate_pnp_matches_for_table = list(final.get("candidate_pnp_matches_for_table", []))
+        candidate_pool_gt_errors = (
+            match_reprojection_errors(candidate_pnp_matches_for_table, gt.pose_w2c, camera)
+            if candidate_pnp_matches_for_table
+            else np.zeros((0,), dtype=np.float64)
+        )
+        candidate_pool_finite_errors = candidate_pool_gt_errors[np.isfinite(candidate_pool_gt_errors)]
         pnp_matches = final["pnp_matches"]
         render_xy_by_match = final["render_xy_by_match"]
         pnp = final["pnp"]
@@ -3696,6 +3755,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             "render_alpha_mean": float(np.mean(render_alpha)),
             "render_depth_valid_fraction": float(np.mean(np.isfinite(render_depth) & (render_depth > 0.0))),
             "match_count": int(len(kp_matches)),
+            "candidate_pool_match_count": int(len(candidate_pnp_matches_for_table)),
+            "candidate_pool_valid_2px_count": int(np.sum(candidate_pool_finite_errors <= 2.0)),
+            "candidate_pool_valid_5px_count": int(np.sum(candidate_pool_finite_errors <= 5.0)),
+            "candidate_pool_valid_10px_count": int(np.sum(candidate_pool_finite_errors <= 10.0)),
+            "candidate_pool_valid_16px_count": int(np.sum(candidate_pool_finite_errors <= 16.0)),
             "render_side_local_offset_expanded_match_count": int(render_side_local_offset_expanded_match_count),
             "post_pair_render_refine_count": int(final.get("post_pair_render_refine_count", 0)),
             "unfiltered_depth_valid_match_count": int(unfiltered_pnp_match_count),
@@ -3805,11 +3869,13 @@ def main(argv: Sequence[str] | None = None) -> None:
             "match_mode": args.match_mode,
             "max_keypoints": int(args.max_keypoints),
             "ratio_threshold": float(args.ratio_threshold),
+            "render_anchor_top_l": int(args.render_anchor_top_l),
             "dual_softmax_logit_scale": float(args.dual_softmax_logit_scale),
             "min_dual_softmax_confidence": float(args.min_dual_softmax_confidence),
             "min_similarity": float(args.min_similarity),
             "matcha_coarse_top_k_per_query": int(args.matcha_coarse_top_k_per_query),
             "matcha_coarse_mutual_mode": str(args.matcha_coarse_mutual_mode),
+            "matcha_coarse_anchor_side": str(args.matcha_coarse_anchor_side),
             "matcha_coarse_local_window_radius_cells": int(args.matcha_coarse_local_window_radius_cells),
             "matcha_post_confidence_top_k_per_query": int(args.matcha_post_confidence_top_k_per_query),
             "coarse_candidate_ranker_model": str(args.coarse_candidate_ranker_model),
@@ -3941,6 +4007,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             )
     summary["metrics"].update(_render_lock_diagnostics_from_rows(rows))
     summary["metrics"].update(_fine_confidence_diagnostics_from_rows(rows))
+    summary["metrics"].update(_proposal_pool_diagnostics_from_rows(rows))
     summary["metrics"].update(_residual_solver_diagnostics_from_rows(rows))
     summary["metrics"].update(_oracle_pnp_diagnostics_from_rows(rows))
     summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")

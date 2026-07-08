@@ -11,6 +11,7 @@ from feature_extract.vfm.rendered_keypoint_matching import (
     keypoint_feature_matches_to_pnp_matches,
     mutual_nn_keypoint_matches,
     refine_render_keypoint_matches_by_local_correlation,
+    render_anchor_topk_keypoint_matches,
 )
 from feature_extract.tools.vfm.eval_rendered_feature_keypoint_pose import _geometry_row_fields
 from feature_extract.tools.vfm.eval_rendered_feature_keypoint_pose import _render_keypoint_detector_image
@@ -93,6 +94,30 @@ def test_dual_softmax_keypoint_matches_uses_symmetric_confidence() -> None:
     assert [(m.query_index, m.render_index) for m in matches] == [(1, 1), (0, 0)]
     assert all(m.dual_softmax_confidence is not None for m in matches)
     assert matches[0].dual_softmax_confidence >= matches[1].dual_softmax_confidence
+
+
+def test_render_anchor_topk_keypoint_matches_keeps_multiple_query_candidates_per_render_anchor() -> None:
+    query_xy = np.asarray([[0.0, 0.0], [10.0, 0.0], [20.0, 0.0]], dtype=np.float64)
+    render_xy = np.asarray([[1.0, 0.0], [21.0, 0.0]], dtype=np.float64)
+    query_desc = np.asarray([[1.0, 0.0], [0.8, 0.2], [0.0, 1.0]], dtype=np.float32)
+    render_desc = np.asarray([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32)
+
+    matches = render_anchor_topk_keypoint_matches(
+        query_xy,
+        query_desc,
+        render_xy,
+        render_desc,
+        top_l=2,
+        min_similarity=-1.0,
+    )
+
+    by_render = {}
+    for match in matches:
+        by_render.setdefault(match.render_index, []).append(match)
+    assert [match.query_index for match in by_render[0]] == [0, 1]
+    assert [match.coarse_rank for match in by_render[0]] == [0, 1]
+    assert [match.query_index for match in by_render[1]][0] == 2
+    assert all(match.base_render_index == match.render_index for match in matches)
 
 
 def test_refine_render_keypoint_matches_by_local_correlation_moves_render_point() -> None:

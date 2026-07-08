@@ -115,6 +115,36 @@ def test_matcha_coarse_topk_matches_keeps_non_mutual_candidates_with_rank_metada
     assert matches[1].coarse_score_gap > 0.0
 
 
+def test_matcha_coarse_topk_matches_can_anchor_on_render_cells() -> None:
+    query = np.zeros((2, 1, 3), dtype=np.float32)
+    render = np.zeros((2, 1, 1), dtype=np.float32)
+    query[:, 0, 0] = [0.8, 0.2]
+    query[:, 0, 1] = [1.0, 0.0]
+    query[:, 0, 2] = [0.7, 0.3]
+    render[:, 0, 0] = [1.0, 0.0]
+
+    matches = matcha_coarse_topk_matches(
+        query,
+        render,
+        query_image_width=30,
+        query_image_height=10,
+        render_image_width=10,
+        render_image_height=10,
+        k_per_query=2,
+        mutual_mode="annotate",
+        logit_scale=10.0,
+        anchor_side="render",
+    )
+
+    assert len(matches) == 2
+    assert [match.query_index for match in matches] == [1, 0]
+    assert [match.render_index for match in matches] == [0, 0]
+    assert [match.coarse_rank for match in matches] == [0, 1]
+    assert matches[0].base_render_index == 0
+    assert matches[1].candidate_render_index == 0
+    assert matches[1].coarse_score_gap > 0.0
+
+
 def test_matcha_coarse_to_fine_can_use_topk_coarse_candidates_without_mutual_filter() -> None:
     query = np.zeros((2, 1, 1), dtype=np.float32)
     render = np.zeros((2, 1, 3), dtype=np.float32)

@@ -691,6 +691,31 @@ def _local_window_mask_for_query(
     return (np.abs(rcols - center_col) <= float(r) + 1e-9) & (np.abs(rrows_grid - center_row) <= float(r) + 1e-9)
 
 
+def _local_window_mask_for_render(
+    local_r_index: int,
+    qrows: np.ndarray,
+    rrows: np.ndarray,
+    *,
+    query_grid_width: int,
+    query_grid_height: int,
+    render_grid_width: int,
+    render_grid_height: int,
+    radius: int | None,
+) -> np.ndarray:
+    if radius is None:
+        return np.ones((qrows.shape[0],), dtype=bool)
+    r = int(radius)
+    if r < 0:
+        return np.ones((qrows.shape[0],), dtype=bool)
+    ridx = int(rrows[int(local_r_index)])
+    rrow, rcol = divmod(ridx, int(render_grid_width))
+    center_col = (float(rcol) + 0.5) / float(render_grid_width) * float(query_grid_width) - 0.5
+    center_row = (float(rrow) + 0.5) / float(render_grid_height) * float(query_grid_height) - 0.5
+    qcols = (qrows % int(query_grid_width)).astype(np.float64)
+    qrows_grid = (qrows // int(query_grid_width)).astype(np.float64)
+    return (np.abs(qcols - center_col) <= float(r) + 1e-9) & (np.abs(qrows_grid - center_row) <= float(r) + 1e-9)
+
+
 def matcha_coarse_topk_matches(
     query_feature_map: np.ndarray,
     render_feature_map: np.ndarray,
@@ -708,8 +733,9 @@ def matcha_coarse_topk_matches(
     local_window_radius_cells: int | None = None,
     query_candidate_indices: np.ndarray | None = None,
     render_candidate_indices: np.ndarray | None = None,
+    anchor_side: str = "query",
 ) -> list[KeypointFeatureMatch]:
-    """Return multiple coarse render-cell candidates for each query cell.
+    """Return multiple coarse candidates for each query or render cell.
 
     This is a candidate-recall path for pose refinement. Mutual nearest-neighbor
     is not a hard requirement by default; reciprocal rank is recorded as a
@@ -722,6 +748,9 @@ def matcha_coarse_topk_matches(
     mode = str(mutual_mode)
     if mode not in {"none", "annotate", "filter"}:
         raise ValueError("mutual_mode must be one of: none, annotate, filter")
+    anchor = str(anchor_side)
+    if anchor not in {"query", "render"}:
+        raise ValueError("anchor_side must be one of: query, render")
     query_grid = feature_map_to_coarse_grid(
         query_feature_map,
         image_width=int(query_image_width),
@@ -755,55 +784,106 @@ def matcha_coarse_topk_matches(
     scores = qdesc_local @ rdesc_local.T
     confidence = _dual_softmax_confidence(scores, float(logit_scale))
     matches: list[KeypointFeatureMatch] = []
-    for local_q in range(qdesc_local.shape[0]):
-        keep_mask = _local_window_mask_for_query(
-            local_q,
-            qrows,
-            rrows,
-            query_grid_width=int(query_grid.width),
-            query_grid_height=int(query_grid.height),
-            render_grid_width=int(render_grid.width),
-            render_grid_height=int(render_grid.height),
-            radius=local_window_radius_cells,
-        )
-        candidate_locals = np.flatnonzero(keep_mask)
-        if candidate_locals.size == 0:
-            continue
-        row_conf = confidence[local_q, candidate_locals]
-        order = np.lexsort((-scores[local_q, candidate_locals], -row_conf))
-        ordered_locals = candidate_locals[order]
-        top1_score = float(scores[local_q, ordered_locals[0]])
-        for rank, local_r in enumerate(ordered_locals[:k]):
-            conf = float(confidence[local_q, int(local_r)])
-            sim = float(scores[local_q, int(local_r)])
-            if conf < float(min_confidence) or sim < float(min_similarity):
-                continue
-            reciprocal_rank = _coarse_reciprocal_rank(confidence, local_q, int(local_r))
-            if mode == "filter" and reciprocal_rank != 0:
-                continue
-            margin, ratio = _top2_margin(scores, local_q, int(local_r))
-            render_index = int(rrows[int(local_r)])
-            matches.append(
-                KeypointFeatureMatch(
-                    query_index=int(qrows[local_q]),
-                    render_index=render_index,
-                    query_xy=query_grid.xy[int(qrows[local_q])],
-                    render_xy=render_grid.xy[render_index],
-                    similarity=sim,
-                    ratio=ratio,
-                    similarity_margin=margin,
-                    dual_softmax_confidence=conf,
-                    base_render_index=render_index,
-                    candidate_render_index=render_index,
-                    candidate_id=len(matches),
-                    coarse_rank=int(rank),
-                    coarse_score=sim,
-                    coarse_score_gap=float(top1_score - sim),
-                    mutual_rank=int(reciprocal_rank),
-                    cell_delta_x=0,
-                    cell_delta_y=0,
-                )
+    if anchor == "query":
+        for local_q in range(qdesc_local.shape[0]):
+            keep_mask = _local_window_mask_for_query(
+                local_q,
+                qrows,
+                rrows,
+                query_grid_width=int(query_grid.width),
+                query_grid_height=int(query_grid.height),
+                render_grid_width=int(render_grid.width),
+                render_grid_height=int(render_grid.height),
+                radius=local_window_radius_cells,
             )
+            candidate_locals = np.flatnonzero(keep_mask)
+            if candidate_locals.size == 0:
+                continue
+            row_conf = confidence[local_q, candidate_locals]
+            order = np.lexsort((-scores[local_q, candidate_locals], -row_conf))
+            ordered_locals = candidate_locals[order]
+            top1_score = float(scores[local_q, ordered_locals[0]])
+            for rank, local_r in enumerate(ordered_locals[:k]):
+                conf = float(confidence[local_q, int(local_r)])
+                sim = float(scores[local_q, int(local_r)])
+                if conf < float(min_confidence) or sim < float(min_similarity):
+                    continue
+                reciprocal_rank = _coarse_reciprocal_rank(confidence, local_q, int(local_r))
+                if mode == "filter" and reciprocal_rank != 0:
+                    continue
+                margin, ratio = _top2_margin(scores, local_q, int(local_r))
+                render_index = int(rrows[int(local_r)])
+                matches.append(
+                    KeypointFeatureMatch(
+                        query_index=int(qrows[local_q]),
+                        render_index=render_index,
+                        query_xy=query_grid.xy[int(qrows[local_q])],
+                        render_xy=render_grid.xy[render_index],
+                        similarity=sim,
+                        ratio=ratio,
+                        similarity_margin=margin,
+                        dual_softmax_confidence=conf,
+                        base_render_index=render_index,
+                        candidate_render_index=render_index,
+                        candidate_id=len(matches),
+                        coarse_rank=int(rank),
+                        coarse_score=sim,
+                        coarse_score_gap=float(top1_score - sim),
+                        mutual_rank=int(reciprocal_rank),
+                        cell_delta_x=0,
+                        cell_delta_y=0,
+                    )
+                )
+    else:
+        for local_r in range(rdesc_local.shape[0]):
+            keep_mask = _local_window_mask_for_render(
+                local_r,
+                qrows,
+                rrows,
+                query_grid_width=int(query_grid.width),
+                query_grid_height=int(query_grid.height),
+                render_grid_width=int(render_grid.width),
+                render_grid_height=int(render_grid.height),
+                radius=local_window_radius_cells,
+            )
+            candidate_locals = np.flatnonzero(keep_mask)
+            if candidate_locals.size == 0:
+                continue
+            col_conf = confidence[candidate_locals, local_r]
+            order = np.lexsort((-scores[candidate_locals, local_r], -col_conf))
+            ordered_locals = candidate_locals[order]
+            top1_score = float(scores[ordered_locals[0], local_r])
+            render_index = int(rrows[int(local_r)])
+            for rank, local_q in enumerate(ordered_locals[:k]):
+                conf = float(confidence[int(local_q), local_r])
+                sim = float(scores[int(local_q), local_r])
+                if conf < float(min_confidence) or sim < float(min_similarity):
+                    continue
+                reciprocal_rank = _coarse_reciprocal_rank(confidence, int(local_q), local_r)
+                if mode == "filter" and reciprocal_rank != 0:
+                    continue
+                margin, ratio = _top2_margin(scores, int(local_q), local_r)
+                matches.append(
+                    KeypointFeatureMatch(
+                        query_index=int(qrows[int(local_q)]),
+                        render_index=render_index,
+                        query_xy=query_grid.xy[int(qrows[int(local_q)])],
+                        render_xy=render_grid.xy[render_index],
+                        similarity=sim,
+                        ratio=ratio,
+                        similarity_margin=margin,
+                        dual_softmax_confidence=conf,
+                        base_render_index=render_index,
+                        candidate_render_index=render_index,
+                        candidate_id=len(matches),
+                        coarse_rank=int(rank),
+                        coarse_score=sim,
+                        coarse_score_gap=float(top1_score - sim),
+                        mutual_rank=int(reciprocal_rank),
+                        cell_delta_x=0,
+                        cell_delta_y=0,
+                    )
+                )
     matches.sort(
         key=lambda item: (
             float(item.dual_softmax_confidence or 0.0),
@@ -1260,6 +1340,7 @@ def matcha_coarse_to_fine_keypoint_matches(
     mutual: bool = True,
     coarse_top_k_per_query: int = 1,
     coarse_mutual_mode: str | None = None,
+    coarse_anchor_side: str = "query",
     coarse_local_window_radius_cells: int | None = None,
     query_offset_logits: np.ndarray | None = None,
     render_offset_logits: np.ndarray | None = None,
@@ -1296,6 +1377,7 @@ def matcha_coarse_to_fine_keypoint_matches(
             min_similarity=float(min_similarity),
             max_matches=max_matches,
             mutual_mode=mutual_mode,
+            anchor_side=str(coarse_anchor_side),
             local_window_radius_cells=coarse_local_window_radius_cells,
             query_candidate_indices=query_candidate_indices,
             render_candidate_indices=render_candidate_indices,

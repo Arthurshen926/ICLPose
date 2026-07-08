@@ -32,9 +32,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--prediction_head",
         default="center",
-        choices=("center", "noop", "likelihood_mode", "likelihood_mean", "likelihood", "mode", "direct"),
+        choices=("center", "noop", "likelihood_mode", "likelihood_mean", "likelihood", "mode", "direct", "gated"),
     )
     parser.add_argument("--prior_scale_key", default="")
+    parser.add_argument("--data_parallel_device_ids", nargs="*", type=int, default=[])
     return parser.parse_args(argv)
 
 
@@ -58,6 +59,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         max_rows=int(args.max_rows) if int(args.max_rows) > 0 else None,
         prediction_head=str(args.prediction_head),
         prior_scale_key=str(args.prior_scale_key),
+        data_parallel_device_ids=[int(value) for value in args.data_parallel_device_ids],
     )
     print(json.dumps(summary, indent=2, sort_keys=True))
 

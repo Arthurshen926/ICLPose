@@ -24,6 +24,8 @@ from feature_extract.vfm.measurement_v1.rgb_patch_measurement_branch import (
     template_search_cost_volume_logits,
 )
 from feature_extract.vfm.measurement_v1.rgb_patch_training import (
+    _PatchForwardOnly,
+    _forward_patch_prediction,
     _load_query_rgb,
     _load_render_rgb,
     _load_tensor_cached,
@@ -41,12 +43,18 @@ RGB_PATCH_FUSION_FIELDNAMES = [
     "measurement_mode_dy",
     "measurement_direct_dx",
     "measurement_direct_dy",
+    "measurement_gated_dx",
+    "measurement_gated_dy",
+    "measurement_gate_prob",
     "measurement_peak_dx",
     "measurement_peak_dy",
     "local_cost_peak_prob",
     "local_cost_top2_gap",
     "rgb_patch_prediction_head",
     "measurement_search_radius_px",
+    "measurement_fine_search_radius_px",
+    "measurement_coarse_search_radius_px",
+    "measurement_coarse_step_px",
     "measurement_context_radius_px",
     "measurement_step_px",
 ]
@@ -146,7 +154,9 @@ def _canonical_prediction_head(prediction_head: str) -> str:
         return "center"
     if head == "direct":
         return "direct"
-    raise ValueError("prediction_head must be one of center, likelihood_mean, likelihood_mode, mode, likelihood, or direct")
+    if head in {"gated", "center_gated", "gated_likelihood"}:
+        return "gated"
+    raise ValueError("prediction_head must be one of center, likelihood_mean, likelihood_mode, mode, likelihood, direct, or gated")
 
 
 class CachedProjectionMeasurementAdapter(nn.Module):
@@ -242,10 +252,60 @@ def _load_cached_projection_measurement_adapter(
     ).to(device)
 
 
+def _load_joint_measurement_patch_branch(payload: Mapping[str, Any], *, device: torch.device) -> RGBPatchMeasurementBranch:
+    model_config = dict(payload.get("model_config", {}))
+    branch_config = dict(model_config.get("measurement_patch_config", {}))
+    if not branch_config:
+        raise ValueError("joint checkpoint does not contain model_config.measurement_patch_config")
+    model = RGBPatchMeasurementBranch(
+        search_radius_px=float(branch_config.get("search_radius_px", 2.0)),
+        context_radius_px=float(branch_config.get("context_radius_px", 8.0)),
+        step_px=float(branch_config.get("step_px", 0.5)),
+        coarse_search_radius_px=(
+            None
+            if float(branch_config.get("coarse_search_radius_px", 0.0)) <= 0.0
+            else float(branch_config.get("coarse_search_radius_px"))
+        ),
+        coarse_step_px=(
+            None
+            if float(branch_config.get("coarse_step_px", 0.0)) <= 0.0
+            else float(branch_config.get("coarse_step_px"))
+        ),
+        feature_dim=int(branch_config.get("feature_dim", 32)),
+        hidden_dim=None if branch_config.get("hidden_dim") is None else int(branch_config.get("hidden_dim")),
+        input_mode=str(branch_config.get("input_mode", "rgb")),
+        encoder_arch=str(branch_config.get("encoder_arch", "simple")),
+    ).to(device)
+    state_dict = dict(payload.get("state_dict", {}))
+    prefix = "measurement_patch_branch."
+    branch_state = {
+        str(key)[len(prefix) :]: value
+        for key, value in state_dict.items()
+        if str(key).startswith(prefix)
+    }
+    if not branch_state:
+        raise ValueError("joint checkpoint state_dict does not contain measurement_patch_branch weights")
+    incompatible = model.load_state_dict(branch_state, strict=False)
+    allowed_missing = set()
+    if int(model.prior_scale_expert_centers.numel()) == 0:
+        allowed_missing.add("prior_scale_expert_centers")
+    missing = [key for key in incompatible.missing_keys if key not in allowed_missing]
+    if missing or incompatible.unexpected_keys:
+        raise RuntimeError(
+            "joint checkpoint is incompatible with RGBPatchMeasurementBranch: "
+            f"missing={missing}, unexpected={list(incompatible.unexpected_keys)}"
+        )
+    model.measurement_model_type = "joint_measurement_patch_branch"
+    model.eval()
+    return model
+
+
 def load_rgb_patch_measurement_branch(checkpoint: Path, *, device: torch.device) -> nn.Module:
     payload = torch.load(Path(checkpoint), map_location=device)
     config = dict(payload.get("config", {}) if isinstance(payload, dict) else {})
     projection_type = str(config.get("projection_type", ""))
+    if isinstance(payload, dict) and "state_dict" in payload and "model_config" in payload:
+        return _load_joint_measurement_patch_branch(payload, device=device)
     if isinstance(payload, dict) and "model" in payload and projection_type in {
         "linear1x1",
         "conv3",
@@ -258,9 +318,14 @@ def load_rgb_patch_measurement_branch(checkpoint: Path, *, device: torch.device)
         search_radius_px=float(config.get("search_radius_px", 2.0)),
         context_radius_px=float(config.get("context_radius_px", 8.0)),
         step_px=float(config.get("step_px", 0.5)),
+        coarse_search_radius_px=(
+            None if config.get("coarse_search_radius_px") is None else float(config.get("coarse_search_radius_px"))
+        ),
+        coarse_step_px=None if config.get("coarse_step_px") is None else float(config.get("coarse_step_px")),
         feature_dim=int(config.get("feature_dim", 32)),
         hidden_dim=None if config.get("hidden_dim") is None else int(config.get("hidden_dim")),
         input_mode=str(config.get("input_mode", "rgb")),
+        encoder_arch=str(config.get("encoder_arch", "simple")),
         template_scale_factors=tuple(float(value) for value in config.get("template_scale_factors", [1.0])),
         condition_on_prior_scale=bool(config.get("condition_on_prior_scale", False)),
         prior_scale_expert_centers_px=tuple(float(value) for value in config.get("prior_scale_expert_centers_px", [])),
@@ -272,6 +337,7 @@ def load_rgb_patch_measurement_branch(checkpoint: Path, *, device: torch.device)
     allowed_missing = set()
     if int(model.prior_scale_expert_centers.numel()) == 0:
         allowed_missing.add("prior_scale_expert_centers")
+    allowed_missing.update(key for key in incompatible.missing_keys if str(key).startswith("measurement_gate_head."))
     missing = [key for key in incompatible.missing_keys if key not in allowed_missing]
     if missing or incompatible.unexpected_keys:
         raise RuntimeError(
@@ -360,15 +426,25 @@ def _likelihood_stats(
 ) -> dict[str, torch.Tensor]:
     probs = F.softmax(logits, dim=1)
     offsets = offsets_xy.to(device=logits.device, dtype=logits.dtype)
-    mean = torch.sum(probs[..., None] * offsets.reshape(1, -1, 2), dim=1)
-    centered = offsets.reshape(1, -1, 2) - mean[:, None, :]
+    if offsets.ndim == 2:
+        offsets = offsets.reshape(1, -1, 2).expand(int(logits.shape[0]), -1, -1)
+    elif offsets.ndim == 3:
+        if int(offsets.shape[0]) != int(logits.shape[0]):
+            raise ValueError("batched offsets must have the same batch size as logits")
+    else:
+        raise ValueError("offsets_xy must have shape (K,2) or (B,K,2)")
+    if int(offsets.shape[1]) != int(logits.shape[1]) or int(offsets.shape[2]) != 2:
+        raise ValueError("offsets_xy must align with logits and contain xy pairs")
+    mean = torch.sum(probs[..., None] * offsets, dim=1)
+    centered = offsets - mean[:, None, :]
     cov = torch.einsum("bk,bki,bkj->bij", probs, centered, centered)
     cov = cov + torch.eye(2, device=logits.device, dtype=logits.dtype).unsqueeze(0) * float(covariance_floor_px2)
     entropy = -torch.sum(probs * torch.log(probs.clamp_min(1e-12)), dim=1)
     entropy_norm = entropy / max(math.log(float(int(probs.shape[1]))), 1e-12)
     top2 = torch.topk(probs, k=2, dim=1).values
     peak_idx = torch.argmax(probs, dim=1)
-    peak = offsets[peak_idx]
+    batch_idx = torch.arange(int(logits.shape[0]), device=logits.device)
+    peak = offsets[batch_idx, peak_idx]
     return {
         "mean": mean,
         "cov": cov,
@@ -432,6 +508,7 @@ def apply_rgb_patch_measurements_to_rows(
     prediction_head: str = "center",
     prior_scale_key: str = "",
     covariance_floor_px2: float = 1e-4,
+    data_parallel_device_ids: Sequence[int] = (),
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Attach RGB template-to-search local measurements to match-table rows.
 
@@ -450,6 +527,19 @@ def apply_rgb_patch_measurements_to_rows(
         raise ValueError("query/render image dimensions must be positive")
     model = model.to(torch_device)
     model.eval()
+    requested_data_parallel_ids = [int(value) for value in data_parallel_device_ids]
+    active_data_parallel_ids: list[int] = []
+    parallel_forward: nn.DataParallel | None = None
+    if torch_device.type == "cuda" and isinstance(model, RGBPatchMeasurementBranch) and len(requested_data_parallel_ids) > 1:
+        visible_count = int(torch.cuda.device_count())
+        usable_ids = [idx for idx in requested_data_parallel_ids if 0 <= int(idx) < visible_count]
+        if len(usable_ids) > 1:
+            active_data_parallel_ids = usable_ids
+            parallel_forward = nn.DataParallel(
+                _PatchForwardOnly(model),
+                device_ids=active_data_parallel_ids,
+                output_device=active_data_parallel_ids[0],
+            )
     output = [dict(row) for row in rows]
     query_cache: dict[str, torch.Tensor] = {}
     render_cache: dict[str, torch.Tensor] = {}
@@ -471,19 +561,28 @@ def apply_rgb_patch_measurements_to_rows(
                 render_cache=render_cache,
             )
             prior_scale = _prior_scale_batch(batch_rows, prior_scale_key=str(prior_scale_key))
-            pred = model.forward_from_patches(
-                query_patch.to(torch_device),
-                render_patch.to(torch_device),
-                prior_scale_px=None if prior_scale is None else prior_scale.to(torch_device),
+            pred = _forward_patch_prediction(
+                model=model,
+                parallel_forward=parallel_forward,
+                query_patch=query_patch,
+                render_patch=render_patch,
+                prior_scale=prior_scale,
+                device=torch_device,
             )
             likelihood_stats = _likelihood_stats(pred.logits, pred.offsets_xy, covariance_floor_px2=float(covariance_floor_px2))
             mode_stats = _mode_stats(pred.logits, pred.offsets_xy, covariance_floor_px2=float(covariance_floor_px2))
             direct_stats = None
+            gated_stats = None
             if head == "direct":
                 if pred.direct_mean_offset_xy is None or pred.direct_log_sigma_xy is None:
                     raise ValueError("checkpoint does not expose direct offset head outputs")
                 direct_stats = _direct_stats(pred.direct_mean_offset_xy, pred.direct_log_sigma_xy, pred.logits, pred.offsets_xy)
                 stats = direct_stats
+            elif head == "gated":
+                if pred.gated_mean_offset_xy is None or pred.direct_log_sigma_xy is None:
+                    raise ValueError("checkpoint does not expose gated offset head outputs")
+                gated_stats = _direct_stats(pred.gated_mean_offset_xy, pred.direct_log_sigma_xy, pred.logits, pred.offsets_xy)
+                stats = gated_stats
             elif head == "center":
                 stats = dict(likelihood_stats)
                 stats["mean"] = torch.zeros_like(likelihood_stats["mean"])
@@ -500,6 +599,8 @@ def apply_rgb_patch_measurements_to_rows(
             likelihood_mean = likelihood_stats["mean"].detach().cpu()
             mode_mean = mode_stats["mean"].detach().cpu()
             direct_mean = None if direct_stats is None else direct_stats["mean"].detach().cpu()
+            gated_mean = None if pred.gated_mean_offset_xy is None else pred.gated_mean_offset_xy.detach().cpu()
+            gate_prob = None if pred.gate_probability is None else pred.gate_probability.detach().cpu()
             valid_prob = (1.0 - torch.sigmoid(pred.dustbin_logit.detach())).cpu()
             for local_index, row in enumerate(batch_rows):
                 cx, cy = _query_center(row)
@@ -522,6 +623,9 @@ def apply_rgb_patch_measurements_to_rows(
                 row["measurement_mode_dy"] = float(mode_mean[local_index, 1].item())
                 row["measurement_direct_dx"] = "" if direct_mean is None else float(direct_mean[local_index, 0].item())
                 row["measurement_direct_dy"] = "" if direct_mean is None else float(direct_mean[local_index, 1].item())
+                row["measurement_gated_dx"] = "" if gated_mean is None else float(gated_mean[local_index, 0].item())
+                row["measurement_gated_dy"] = "" if gated_mean is None else float(gated_mean[local_index, 1].item())
+                row["measurement_gate_prob"] = "" if gate_prob is None else float(gate_prob[local_index].item())
                 row["measurement_cov_xx"] = cov_xx
                 row["measurement_cov_xy"] = cov_xy
                 row["measurement_cov_yy"] = cov_yy
@@ -533,7 +637,16 @@ def apply_rgb_patch_measurements_to_rows(
                 row["local_cost_peak_prob"] = float(peak_prob[local_index].item())
                 row["local_cost_top2_gap"] = float(top2_gap[local_index].item())
                 row["rgb_patch_prediction_head"] = head
-                row["measurement_search_radius_px"] = float(model.search_radius_px)
+                coarse_radius = getattr(model, "coarse_search_radius_px", None)
+                coarse_step = getattr(model, "coarse_step_px", None)
+                fine_radius = float(getattr(model, "search_radius_px"))
+                total_radius = float(getattr(model, "measurement_search_radius_px", fine_radius))
+                row["measurement_search_radius_px"] = total_radius
+                row["measurement_fine_search_radius_px"] = fine_radius
+                row["measurement_coarse_search_radius_px"] = (
+                    "" if coarse_radius is None else float(coarse_radius)
+                )
+                row["measurement_coarse_step_px"] = "" if coarse_step is None else float(coarse_step)
                 row["measurement_context_radius_px"] = float(model.context_radius_px)
                 row["measurement_step_px"] = float(model.step_px)
                 if not _has_explicit_value(row, "depth_valid"):
@@ -550,6 +663,8 @@ def apply_rgb_patch_measurements_to_rows(
             "render_image_width": int(r_width),
             "render_image_height": int(r_height),
             "prior_scale_key": str(prior_scale_key),
+            "requested_data_parallel_device_ids": requested_data_parallel_ids,
+            "active_data_parallel_device_ids": active_data_parallel_ids,
         }
     )
     return output, summary
@@ -574,6 +689,7 @@ def apply_rgb_patch_measurements_to_match_table(
     max_rows: int | None = None,
     prediction_head: str = "center",
     prior_scale_key: str = "",
+    data_parallel_device_ids: Sequence[int] = (),
 ) -> dict[str, Any]:
     base = Path.cwd() if base_dir is None else Path(base_dir)
     rows = _read_csv_rows(Path(match_table_csv), max_rows=max_rows)
@@ -595,6 +711,7 @@ def apply_rgb_patch_measurements_to_match_table(
         device=torch_device,
         prediction_head=str(prediction_head),
         prior_scale_key=str(prior_scale_key),
+        data_parallel_device_ids=[int(value) for value in data_parallel_device_ids],
     )
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)

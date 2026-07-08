@@ -38,6 +38,12 @@ from feature_extract.vfm.matcha_rgb_keypoint_detector import (
     matcha_alike_distillation_loss,
     matcha_keypoint_position_loss,
 )
+from feature_extract.vfm.measurement_v1.rgb_patch_measurement_branch import (
+    RGBPatchMeasurementBranch,
+    continuous_offset_nll_with_dustbin,
+    crop_rgb_window,
+    residual_delta_gaussian_nll,
+)
 
 
 _JOINT_FORMAT = "vfm_matcha_joint_training_set_v1"
@@ -433,6 +439,23 @@ class MatchaJointTrainingConfig:
     patch_corr_fine_batch_size: int = 256
     patch_corr_fine_max_samples_per_pair: int = 512
     patch_corr_fine_detach_context: bool = True
+    measurement_patch_loss_weight: float = 0.0
+    measurement_patch_direct_loss_weight: float = 0.25
+    measurement_patch_epe_weight: float = 0.05
+    measurement_patch_dustbin_bce_weight: float = 0.25
+    measurement_patch_batch_size: int = 128
+    measurement_patch_max_samples_per_pair: int = 512
+    measurement_patch_search_radius_px: float = 8.0
+    measurement_patch_context_radius_px: float = 8.0
+    measurement_patch_step_px: float = 1.0
+    measurement_patch_coarse_search_radius_px: float = 0.0
+    measurement_patch_coarse_step_px: float = 0.0
+    measurement_patch_feature_dim: int = 32
+    measurement_patch_hidden_dim: int = 64
+    measurement_patch_target_heatmap_sigma_px: float = 0.5
+    measurement_patch_dustbin_positive_weight: float = 1.0
+    measurement_patch_encoder_arch: str = "simple"
+    measurement_patch_input_mode: str = "rgb"
     patch_correlation_loss_weight: float = 0.0
     patch_correlation_window_size: int = 3
     hard_negative_weight: float = 0.2
@@ -484,6 +507,30 @@ class MatchaJointTrainingConfig:
             raise ValueError("patch_corr_fine_batch_size must be positive")
         if int(self.patch_corr_fine_max_samples_per_pair) < 0:
             raise ValueError("patch_corr_fine_max_samples_per_pair must be non-negative")
+        if int(self.measurement_patch_batch_size) <= 0:
+            raise ValueError("measurement_patch_batch_size must be positive")
+        if int(self.measurement_patch_max_samples_per_pair) < 0:
+            raise ValueError("measurement_patch_max_samples_per_pair must be non-negative")
+        if float(self.measurement_patch_search_radius_px) <= 0.0:
+            raise ValueError("measurement_patch_search_radius_px must be positive")
+        if float(self.measurement_patch_context_radius_px) < 0.0:
+            raise ValueError("measurement_patch_context_radius_px must be non-negative")
+        if float(self.measurement_patch_step_px) <= 0.0:
+            raise ValueError("measurement_patch_step_px must be positive")
+        if float(self.measurement_patch_coarse_search_radius_px) < 0.0:
+            raise ValueError("measurement_patch_coarse_search_radius_px must be non-negative")
+        if float(self.measurement_patch_coarse_step_px) < 0.0:
+            raise ValueError("measurement_patch_coarse_step_px must be non-negative")
+        if (float(self.measurement_patch_coarse_search_radius_px) > 0.0) != (float(self.measurement_patch_coarse_step_px) > 0.0):
+            raise ValueError("measurement coarse search radius and step must be enabled together")
+        if int(self.measurement_patch_feature_dim) <= 0:
+            raise ValueError("measurement_patch_feature_dim must be positive")
+        if int(self.measurement_patch_hidden_dim) <= 0:
+            raise ValueError("measurement_patch_hidden_dim must be positive")
+        if float(self.measurement_patch_target_heatmap_sigma_px) < 0.0:
+            raise ValueError("measurement_patch_target_heatmap_sigma_px must be non-negative")
+        if float(self.measurement_patch_dustbin_positive_weight) <= 0.0:
+            raise ValueError("measurement_patch_dustbin_positive_weight must be positive")
         if float(self.lr) <= 0.0:
             raise ValueError("lr must be positive")
         if float(self.temperature) <= 0.0:
@@ -504,6 +551,10 @@ class MatchaJointTrainingConfig:
             "local_window_fine_loss_weight",
             "patch_corr_fine_loss_weight",
             "patch_corr_fine_epe_weight",
+            "measurement_patch_loss_weight",
+            "measurement_patch_direct_loss_weight",
+            "measurement_patch_epe_weight",
+            "measurement_patch_dustbin_bce_weight",
             "patch_correlation_loss_weight",
             "hard_negative_weight",
             "coarse_candidate_rank_loss_weight",
@@ -540,9 +591,29 @@ class MatchaStyleJointModel(nn.Module):
         gate_mode: str = "residual",
         residual_gate_scale: float = 0.1,
         local_window_fine_mode: str = "mlp",
+        measurement_patch_search_radius_px: float = 8.0,
+        measurement_patch_context_radius_px: float = 8.0,
+        measurement_patch_step_px: float = 1.0,
+        measurement_patch_coarse_search_radius_px: float = 0.0,
+        measurement_patch_coarse_step_px: float = 0.0,
+        measurement_patch_feature_dim: int = 32,
+        measurement_patch_hidden_dim: int = 64,
+        measurement_patch_encoder_arch: str = "simple",
+        measurement_patch_input_mode: str = "rgb",
     ) -> None:
         super().__init__()
         self.local_window_fine_mode = str(local_window_fine_mode)
+        self.measurement_patch_config = {
+            "search_radius_px": float(measurement_patch_search_radius_px),
+            "context_radius_px": float(measurement_patch_context_radius_px),
+            "step_px": float(measurement_patch_step_px),
+            "coarse_search_radius_px": float(measurement_patch_coarse_search_radius_px),
+            "coarse_step_px": float(measurement_patch_coarse_step_px),
+            "feature_dim": int(measurement_patch_feature_dim),
+            "hidden_dim": int(measurement_patch_hidden_dim),
+            "encoder_arch": str(measurement_patch_encoder_arch),
+            "input_mode": str(measurement_patch_input_mode),
+        }
         self.adapter = MatchaCoarseFineAdapter(
             input_dim=int(input_dim),
             output_dim=int(output_dim),
@@ -595,6 +666,19 @@ class MatchaStyleJointModel(nn.Module):
             hidden_dim=int(residual_hidden_dim),
             patch_size=32,
             offset_bins=8,
+        )
+        coarse_radius = float(measurement_patch_coarse_search_radius_px)
+        coarse_step = float(measurement_patch_coarse_step_px)
+        self.measurement_patch_branch = RGBPatchMeasurementBranch(
+            search_radius_px=float(measurement_patch_search_radius_px),
+            context_radius_px=float(measurement_patch_context_radius_px),
+            step_px=float(measurement_patch_step_px),
+            coarse_search_radius_px=None if coarse_radius <= 0.0 else coarse_radius,
+            coarse_step_px=None if coarse_step <= 0.0 else coarse_step,
+            feature_dim=int(measurement_patch_feature_dim),
+            hidden_dim=int(measurement_patch_hidden_dim),
+            encoder_arch=str(measurement_patch_encoder_arch),
+            input_mode=str(measurement_patch_input_mode),
         )
 
     @property
@@ -862,9 +946,29 @@ class RadioDualAttentionFusionJointModel(nn.Module):
         gate_mode: str = "residual",
         residual_gate_scale: float = 0.1,
         local_window_fine_mode: str = "mlp",
+        measurement_patch_search_radius_px: float = 8.0,
+        measurement_patch_context_radius_px: float = 8.0,
+        measurement_patch_step_px: float = 1.0,
+        measurement_patch_coarse_search_radius_px: float = 0.0,
+        measurement_patch_coarse_step_px: float = 0.0,
+        measurement_patch_feature_dim: int = 32,
+        measurement_patch_hidden_dim: int = 64,
+        measurement_patch_encoder_arch: str = "simple",
+        measurement_patch_input_mode: str = "rgb",
     ) -> None:
         super().__init__()
         self.local_window_fine_mode = str(local_window_fine_mode)
+        self.measurement_patch_config = {
+            "search_radius_px": float(measurement_patch_search_radius_px),
+            "context_radius_px": float(measurement_patch_context_radius_px),
+            "step_px": float(measurement_patch_step_px),
+            "coarse_search_radius_px": float(measurement_patch_coarse_search_radius_px),
+            "coarse_step_px": float(measurement_patch_coarse_step_px),
+            "feature_dim": int(measurement_patch_feature_dim),
+            "hidden_dim": int(measurement_patch_hidden_dim),
+            "encoder_arch": str(measurement_patch_encoder_arch),
+            "input_mode": str(measurement_patch_input_mode),
+        }
         self.fine_input_dim = int(fine_input_dim)
         self.coarse_input_dim = int(coarse_input_dim)
         self.output_dim_value = int(output_dim)
@@ -952,6 +1056,19 @@ class RadioDualAttentionFusionJointModel(nn.Module):
             hidden_dim=int(residual_hidden_dim),
             patch_size=32,
             offset_bins=8,
+        )
+        coarse_radius = float(measurement_patch_coarse_search_radius_px)
+        coarse_step = float(measurement_patch_coarse_step_px)
+        self.measurement_patch_branch = RGBPatchMeasurementBranch(
+            search_radius_px=float(measurement_patch_search_radius_px),
+            context_radius_px=float(measurement_patch_context_radius_px),
+            step_px=float(measurement_patch_step_px),
+            coarse_search_radius_px=None if coarse_radius <= 0.0 else coarse_radius,
+            coarse_step_px=None if coarse_step <= 0.0 else coarse_step,
+            feature_dim=int(measurement_patch_feature_dim),
+            hidden_dim=int(measurement_patch_hidden_dim),
+            encoder_arch=str(measurement_patch_encoder_arch),
+            input_mode=str(measurement_patch_input_mode),
         )
 
     @property
@@ -1531,6 +1648,40 @@ def _select_descriptor_rows_from_map(
     return rows[pairs, idx]
 
 
+def _select_negative_descriptor_rows_from_map(
+    descriptor_map: torch.Tensor,
+    pair_indices: torch.Tensor,
+    cell_indices: torch.Tensor,
+) -> torch.Tensor:
+    if descriptor_map.ndim != 4:
+        raise ValueError("descriptor_map must have shape (B, C, H, W)")
+    cells = cell_indices.long()
+    if cells.ndim != 2:
+        raise ValueError("cell_indices must have shape (N, K)")
+    batch, channels, height, width = descriptor_map.shape
+    pairs = pair_indices.long().reshape(-1).clamp(0, batch - 1)
+    if pairs.numel() != cells.shape[0]:
+        raise ValueError("pair_indices must contain one value per cell-index row")
+    idx = cells.clamp(0, height * width - 1)
+    rows = descriptor_map.permute(0, 2, 3, 1).reshape(batch, height * width, channels)
+    return rows[pairs[:, None], idx]
+
+
+def _forward_coarse_and_fine_feature_maps(
+    model: MatchaStyleJointModel,
+    feature_maps: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if (
+        isinstance(model, RadioDualAttentionFusionJointModel)
+        and str(model.attention_fusion_mode) == "matcha_original"
+    ):
+        coarse_desc, fine_desc, heatmap_logits = model.forward_fuse_feature(feature_maps)
+        offset_logits = model.offset_head_map(fine_desc)
+        return coarse_desc, fine_desc, heatmap_logits, offset_logits
+    desc, heatmap_logits, offset_logits = model.forward_feature_map(feature_maps)
+    return desc, desc, heatmap_logits, offset_logits
+
+
 def _sample_local_window_descriptors(
     descriptor_map: torch.Tensor,
     pair_indices: torch.Tensor,
@@ -1789,10 +1940,18 @@ def _full_map_correspondence_loss(
         else _tensor(base.render_offset_soft_labels[indices], dtype=torch.float32, device=device)
     )
 
-    query_desc_map, _query_heat, query_offset_map = model.forward_feature_map(query_maps)
-    render_desc_map, _render_heat, render_offset_map = model.forward_feature_map(render_maps)
+    query_desc_map, query_fine_desc_map, _query_heat, query_offset_map = _forward_coarse_and_fine_feature_maps(
+        model,
+        query_maps,
+    )
+    render_desc_map, render_fine_desc_map, _render_heat, render_offset_map = _forward_coarse_and_fine_feature_maps(
+        model,
+        render_maps,
+    )
     query_z, query_offsets = _select_map_rows(query_desc_map, query_offset_map, pairs, qidx)
     render_z, render_offsets = _select_map_rows(render_desc_map, render_offset_map, pairs, ridx)
+    query_fine_z = _select_descriptor_rows_from_map(query_fine_desc_map, pairs, qidx)
+    render_fine_z = _select_descriptor_rows_from_map(render_fine_desc_map, pairs, ridx)
 
     loss = query_z.new_tensor(0.0)
     descriptor_losses = []
@@ -1833,9 +1992,9 @@ def _full_map_correspondence_loss(
         loss = loss + float(config.offset_loss_weight) * offset_loss
     fine_metrics: dict[str, float] = {}
     if float(config.pair_fine_loss_weight) > 0.0:
-        pair_fine = model.pair_fine_logits(query_z, render_z)
+        pair_fine = model.pair_fine_logits(query_fine_z, render_fine_z)
         pair_sigma = (
-            model.pair_fine_uncertainty_log_sigma(query_z, render_z)
+            model.pair_fine_uncertainty_log_sigma(query_fine_z, render_fine_z)
             if float(config.fine_uncertainty_loss_weight) > 0.0
             and hasattr(model, "pair_fine_uncertainty_log_sigma")
             else None
@@ -1854,9 +2013,9 @@ def _full_map_correspondence_loss(
         if pair_fine_loss is not None:
             loss = loss + float(config.pair_fine_loss_weight) * pair_fine_loss
     if float(config.query_pair_fine_loss_weight) > 0.0:
-        query_pair_fine = model.query_pair_fine_logits(query_z, render_z)
+        query_pair_fine = model.query_pair_fine_logits(query_fine_z, render_fine_z)
         query_pair_sigma = (
-            model.query_pair_fine_uncertainty_log_sigma(query_z, render_z)
+            model.query_pair_fine_uncertainty_log_sigma(query_fine_z, render_fine_z)
             if float(config.fine_uncertainty_loss_weight) > 0.0
             and hasattr(model, "query_pair_fine_uncertainty_log_sigma")
             else None
@@ -1911,6 +2070,19 @@ def _full_map_correspondence_loss(
         if hard_false_losses:
             hard_false_loss = torch.stack(hard_false_losses).mean()
             loss = loss + float(config.hard_false_match_weight) * hard_false_loss
+    rank_metrics: dict[str, torch.Tensor] = {}
+    if float(config.coarse_candidate_rank_loss_weight) > 0.0 and hasattr(base, "negative_render_indices"):
+        negative_indices_np = np.asarray(base.negative_render_indices, dtype=np.int64)[indices]
+        if negative_indices_np.size > 0 and int(negative_indices_np.shape[1]) > 0:
+            negative_indices = _tensor(negative_indices_np, dtype=torch.long, device=device)
+            negative_z = _select_negative_descriptor_rows_from_map(render_desc_map, pairs, negative_indices)
+            rank_loss, rank_metrics = _coarse_candidate_rank_loss_and_metrics(
+                query_z,
+                render_z,
+                negative_z,
+                margin=float(config.coarse_candidate_rank_margin),
+            )
+            loss = loss + float(config.coarse_candidate_rank_loss_weight) * rank_loss
     patch_acc_values = []
     if float(config.patch_correlation_loss_weight) > 0.0:
         query_to_render, query_to_render_acc = _local_patch_correlation_loss(
@@ -1952,6 +2124,7 @@ def _full_map_correspondence_loss(
         if hard_false_losses:
             metrics["hard_false_match_loss"] = float(torch.stack(hard_false_losses).mean().detach().cpu().item())
             metrics["hard_false_match_count"] = float(hard_false_count)
+        metrics.update({key: float(value.detach().cpu().item()) for key, value in rank_metrics.items()})
     return loss, metrics
 
 
@@ -2465,6 +2638,334 @@ def _patch_corr_fine_loss(
     }
 
 
+def _cell_center_xy(
+    cell_indices: np.ndarray,
+    *,
+    grid_h: int,
+    grid_w: int,
+    rgb_h: int,
+    rgb_w: int,
+) -> np.ndarray:
+    cells = np.asarray(cell_indices, dtype=np.int64).reshape(-1)
+    cols = cells % max(int(grid_w), 1)
+    rows = cells // max(int(grid_w), 1)
+    return np.stack(
+        [
+            (cols.astype(np.float64) + 0.5) * (float(rgb_w) / max(float(grid_w), 1.0)),
+            (rows.astype(np.float64) + 0.5) * (float(rgb_h) / max(float(grid_h), 1.0)),
+        ],
+        axis=1,
+    ).astype(np.float32, copy=False)
+
+
+def _subcell_label_xy(
+    cell_indices: np.ndarray,
+    offset_labels: np.ndarray,
+    *,
+    grid_h: int,
+    grid_w: int,
+    rgb_h: int,
+    rgb_w: int,
+) -> np.ndarray:
+    cells = np.asarray(cell_indices, dtype=np.int64).reshape(-1)
+    labels = np.asarray(offset_labels, dtype=np.int64).reshape(-1)
+    cols = cells % max(int(grid_w), 1)
+    rows = cells // max(int(grid_w), 1)
+    bin_x = labels % 8
+    bin_y = labels // 8
+    return np.stack(
+        [
+            (cols.astype(np.float64) + (bin_x.astype(np.float64) + 0.5) / 8.0)
+            * (float(rgb_w) / max(float(grid_w), 1.0)),
+            (rows.astype(np.float64) + (bin_y.astype(np.float64) + 0.5) / 8.0)
+            * (float(rgb_h) / max(float(grid_h), 1.0)),
+        ],
+        axis=1,
+    ).astype(np.float32, copy=False)
+
+
+def _scale_supervision_xy_to_rgb_grid(
+    xy: np.ndarray,
+    cell_indices: np.ndarray,
+    offset_labels: np.ndarray,
+    *,
+    grid_h: int,
+    grid_w: int,
+    rgb_h: int,
+    rgb_w: int,
+    offset_bins: int = 8,
+) -> tuple[np.ndarray, tuple[float, float]]:
+    coords = np.asarray(xy, dtype=np.float64).reshape(-1, 2)
+    cells = np.asarray(cell_indices, dtype=np.int64).reshape(-1)
+    labels = np.asarray(offset_labels, dtype=np.int64).reshape(-1)
+    if coords.shape[0] != cells.shape[0] or coords.shape[0] != labels.shape[0]:
+        raise ValueError("xy, cell_indices and offset_labels must contain the same number of rows")
+    if coords.shape[0] == 0:
+        return coords.astype(np.float32, copy=False), (1.0, 1.0)
+    bins = max(int(offset_bins), 1)
+    cols = cells % max(int(grid_w), 1)
+    rows = cells // max(int(grid_w), 1)
+    bin_x = labels % bins
+    bin_y = labels // bins
+    denom_x = cols.astype(np.float64) + (bin_x.astype(np.float64) + 0.5) / float(bins)
+    denom_y = rows.astype(np.float64) + (bin_y.astype(np.float64) + 0.5) / float(bins)
+
+    def estimate_axis_scale(values: np.ndarray, denom: np.ndarray, *, rgb_size: int, grid_size: int) -> float:
+        stored_cell = float(rgb_size) / max(float(grid_size), 1.0)
+        valid = np.isfinite(values) & np.isfinite(denom) & (denom > 0.25) & (values > 0.0)
+        if not np.any(valid):
+            return 1.0
+        estimated_cell = values[valid] / denom[valid]
+        estimated_cell = estimated_cell[np.isfinite(estimated_cell) & (estimated_cell > 1e-6)]
+        if estimated_cell.size == 0:
+            return 1.0
+        original_cell = float(np.median(estimated_cell))
+        if original_cell <= 0.0 or not np.isfinite(original_cell):
+            return 1.0
+        return float(stored_cell / original_cell)
+
+    scale_x = estimate_axis_scale(coords[:, 0], denom_x, rgb_size=int(rgb_w), grid_size=int(grid_w))
+    scale_y = estimate_axis_scale(coords[:, 1], denom_y, rgb_size=int(rgb_h), grid_size=int(grid_h))
+    scaled = coords.copy()
+    scaled[:, 0] *= scale_x
+    scaled[:, 1] *= scale_y
+    return scaled.astype(np.float32, copy=False), (float(scale_x), float(scale_y))
+
+
+def _joint_measurement_patch_loss(
+    model: MatchaStyleJointModel,
+    samples: MatchaJointTrainingSet,
+    *,
+    config: MatchaJointTrainingConfig,
+    device: torch.device,
+    pair_subset: np.ndarray | None = None,
+    sample_seed: int = 0,
+) -> tuple[torch.Tensor | None, dict[str, float]]:
+    if samples.query_feature_maps is None or samples.render_feature_maps is None:
+        return None, {}
+    if samples.query_rgb_images is None or samples.render_rgb_images is None:
+        return None, {}
+    required = (
+        samples.fine_sample_pair_indices,
+        samples.fine_query_cell_indices,
+        samples.fine_render_cell_indices,
+        samples.fine_query_offset_labels,
+        samples.fine_render_offset_labels,
+    )
+    if any(value is None for value in required):
+        return None, {}
+    branch = getattr(model, "measurement_patch_branch", None)
+    if branch is None:
+        return None, {}
+    pairs_global_np = np.asarray(samples.fine_sample_pair_indices, dtype=np.int64).reshape(-1)
+    keep = np.ones((pairs_global_np.shape[0],), dtype=bool)
+    if pair_subset is not None:
+        keep &= np.isin(pairs_global_np, np.asarray(pair_subset, dtype=np.int64))
+    qlabels_np_all = np.asarray(samples.fine_query_offset_labels, dtype=np.int64).reshape(-1)
+    rlabels_np_all = np.asarray(samples.fine_render_offset_labels, dtype=np.int64).reshape(-1)
+    keep &= (qlabels_np_all >= 0) & (qlabels_np_all < 64) & (rlabels_np_all >= 0) & (rlabels_np_all < 64)
+    if samples.fine_validity_weight is None:
+        weights_np_all = np.ones((pairs_global_np.shape[0],), dtype=np.float32)
+    else:
+        weights_np_all = np.asarray(samples.fine_validity_weight, dtype=np.float32).reshape(-1)
+        keep &= np.isfinite(weights_np_all) & (weights_np_all > 0.0)
+    if not np.any(keep):
+        return None, {}
+
+    pairs_global = pairs_global_np[keep]
+    qidx_np = np.asarray(samples.fine_query_cell_indices, dtype=np.int64).reshape(-1)[keep]
+    ridx_np = np.asarray(samples.fine_render_cell_indices, dtype=np.int64).reshape(-1)[keep]
+    qlabels_np = qlabels_np_all[keep]
+    rlabels_np = rlabels_np_all[keep]
+    weights_np = weights_np_all[keep]
+    max_samples = int(config.measurement_patch_max_samples_per_pair)
+    if max_samples > 0 and int(pairs_global.shape[0]) > max_samples:
+        rng = np.random.default_rng(int(sample_seed))
+        selected = np.sort(rng.choice(int(pairs_global.shape[0]), size=max_samples, replace=False))
+        pairs_global = pairs_global[selected]
+        qidx_np = qidx_np[selected]
+        ridx_np = ridx_np[selected]
+        qlabels_np = qlabels_np[selected]
+        rlabels_np = rlabels_np[selected]
+        weights_np = weights_np[selected]
+
+    if pair_subset is None:
+        query_feature_maps = samples.query_feature_maps
+        render_feature_maps = samples.render_feature_maps
+        query_rgb_images = samples.query_rgb_images
+        render_rgb_images = samples.render_rgb_images
+    else:
+        subset = np.asarray(pair_subset, dtype=np.int64)
+        query_feature_maps = np.asarray(samples.query_feature_maps)[subset]
+        render_feature_maps = np.asarray(samples.render_feature_maps)[subset]
+        query_rgb_images = np.asarray(samples.query_rgb_images)[subset]
+        render_rgb_images = np.asarray(samples.render_rgb_images)[subset]
+
+    query_rgb_arr = np.asarray(query_rgb_images, dtype=np.float32)
+    render_rgb_arr = np.asarray(render_rgb_images, dtype=np.float32)
+    if query_rgb_arr.ndim != 4 or render_rgb_arr.ndim != 4:
+        raise ValueError("query/render RGB images must have shape (B, C, H, W)")
+    q_grid_h, q_grid_w = int(np.asarray(query_feature_maps).shape[2]), int(np.asarray(query_feature_maps).shape[3])
+    r_grid_h, r_grid_w = int(np.asarray(render_feature_maps).shape[2]), int(np.asarray(render_feature_maps).shape[3])
+    q_rgb_h, q_rgb_w = int(query_rgb_arr.shape[2]), int(query_rgb_arr.shape[3])
+    r_rgb_h, r_rgb_w = int(render_rgb_arr.shape[2]), int(render_rgb_arr.shape[3])
+
+    query_center_xy_np = _cell_center_xy(qidx_np, grid_h=q_grid_h, grid_w=q_grid_w, rgb_h=q_rgb_h, rgb_w=q_rgb_w)
+    query_xy_scale = (1.0, 1.0)
+    render_xy_scale = (1.0, 1.0)
+    if samples.fine_query_xy is not None:
+        query_target_xy_np = np.asarray(samples.fine_query_xy, dtype=np.float32).reshape(-1, 2)[keep]
+        if max_samples > 0 and int(pairs_global_np[keep].shape[0]) > max_samples:
+            query_target_xy_np = query_target_xy_np[selected]
+        query_target_xy_np, query_xy_scale = _scale_supervision_xy_to_rgb_grid(
+            query_target_xy_np,
+            qidx_np,
+            qlabels_np,
+            grid_h=q_grid_h,
+            grid_w=q_grid_w,
+            rgb_h=q_rgb_h,
+            rgb_w=q_rgb_w,
+        )
+    else:
+        query_target_xy_np = _subcell_label_xy(qidx_np, qlabels_np, grid_h=q_grid_h, grid_w=q_grid_w, rgb_h=q_rgb_h, rgb_w=q_rgb_w)
+    if samples.fine_render_xy is not None:
+        render_anchor_xy_np = np.asarray(samples.fine_render_xy, dtype=np.float32).reshape(-1, 2)[keep]
+        if max_samples > 0 and int(pairs_global_np[keep].shape[0]) > max_samples:
+            render_anchor_xy_np = render_anchor_xy_np[selected]
+        render_anchor_xy_np, render_xy_scale = _scale_supervision_xy_to_rgb_grid(
+            render_anchor_xy_np,
+            ridx_np,
+            rlabels_np,
+            grid_h=r_grid_h,
+            grid_w=r_grid_w,
+            rgb_h=r_rgb_h,
+            rgb_w=r_rgb_w,
+        )
+    else:
+        render_anchor_xy_np = _subcell_label_xy(ridx_np, rlabels_np, grid_h=r_grid_h, grid_w=r_grid_w, rgb_h=r_rgb_h, rgb_w=r_rgb_w)
+    target_delta_np = (query_target_xy_np - query_center_xy_np).astype(np.float32, copy=False)
+
+    pairs = _tensor(_remap_pair_indices(pairs_global, pair_subset), dtype=torch.long, device=device)
+    query_center_xy = _tensor(query_center_xy_np, dtype=torch.float32, device=device)
+    render_anchor_xy = _tensor(render_anchor_xy_np, dtype=torch.float32, device=device)
+    target_delta = _tensor(target_delta_np, dtype=torch.float32, device=device)
+    weights = _tensor(weights_np, dtype=torch.float32, device=device).clamp_min(0.0)
+    query_rgb_t = _tensor(query_rgb_arr, dtype=torch.float32, device=device)
+    render_rgb_t = _tensor(render_rgb_arr, dtype=torch.float32, device=device)
+
+    chunk_size = max(int(config.measurement_patch_batch_size), 1)
+    total_loss = torch.zeros((), dtype=torch.float32, device=device)
+    total_weight = torch.zeros((), dtype=torch.float32, device=device)
+    metric_sums = {
+        "center_epe_px": 0.0,
+        "mean_epe_px": 0.0,
+        "mode_epe_px": 0.0,
+        "direct_epe_px": 0.0,
+        "gated_epe_px": 0.0,
+        "mean_improve_ratio": 0.0,
+        "mode_improve_ratio": 0.0,
+        "direct_improve_ratio": 0.0,
+        "target_in_window_ratio": 0.0,
+        "dustbin_probability": 0.0,
+        "entropy": 0.0,
+    }
+    metric_weight = 0.0
+    radius = float(branch.measurement_search_radius_px)
+    for start in range(0, int(target_delta.shape[0]), chunk_size):
+        end = min(start + chunk_size, int(target_delta.shape[0]))
+        chunk = slice(start, end)
+        pair_chunk = pairs[chunk]
+        chunk_weights = weights[chunk]
+        query_patch, _ = crop_rgb_window(
+            query_rgb_t[pair_chunk],
+            query_center_xy[chunk],
+            radius_px=float(branch.crop_radius_px),
+            step_px=float(branch.step_px),
+            image_width=q_rgb_w,
+            image_height=q_rgb_h,
+        )
+        render_patch, _ = crop_rgb_window(
+            render_rgb_t[pair_chunk],
+            render_anchor_xy[chunk],
+            radius_px=float(branch.crop_radius_px),
+            step_px=float(branch.step_px),
+            image_width=r_rgb_w,
+            image_height=r_rgb_h,
+        )
+        delta = target_delta[chunk]
+        prior_scale = torch.linalg.norm(delta.detach(), dim=1)
+        pred = branch.forward_from_patches(query_patch, render_patch, prior_scale_px=prior_scale)
+        spatial_loss, spatial_pred = continuous_offset_nll_with_dustbin(
+            pred.logits,
+            pred.offsets_xy,
+            delta,
+            dustbin_logit=pred.dustbin_logit,
+            search_radius_px=radius,
+            epe_weight=float(config.measurement_patch_epe_weight),
+            dustbin_bce_weight=float(config.measurement_patch_dustbin_bce_weight),
+            dustbin_positive_weight=float(config.measurement_patch_dustbin_positive_weight),
+            target_heatmap_sigma_px=float(config.measurement_patch_target_heatmap_sigma_px),
+            sample_weight=chunk_weights,
+        )
+        direct_loss, _direct_pred = residual_delta_gaussian_nll(
+            pred.direct_mean_offset_xy,
+            pred.direct_log_sigma_xy,
+            delta,
+            search_radius_px=radius,
+            dustbin_logit=pred.dustbin_logit,
+            sample_weight=chunk_weights,
+            dustbin_positive_weight=float(config.measurement_patch_dustbin_positive_weight),
+        )
+        row_weight = torch.sum(chunk_weights).clamp_min(1e-6)
+        total_loss = total_loss + (spatial_loss + float(config.measurement_patch_direct_loss_weight) * direct_loss) * row_weight
+        total_weight = total_weight + row_weight
+        with torch.no_grad():
+            center_epe = torch.linalg.norm(delta, dim=1)
+            mean_epe = torch.linalg.norm(spatial_pred.mean_offset_xy - delta, dim=1)
+            mode_xy = spatial_pred.mode_offset_xy if spatial_pred.mode_offset_xy is not None else spatial_pred.mean_offset_xy
+            mode_epe = torch.linalg.norm(mode_xy - delta, dim=1)
+            direct_epe = torch.linalg.norm(pred.direct_mean_offset_xy - delta, dim=1)
+            gated_xy = pred.gated_mean_offset_xy if pred.gated_mean_offset_xy is not None else spatial_pred.mean_offset_xy
+            gated_epe = torch.linalg.norm(gated_xy - delta, dim=1)
+            in_window = ((torch.abs(delta[:, 0]) <= radius) & (torch.abs(delta[:, 1]) <= radius)).to(dtype=torch.float32)
+            dustbin_prob = (
+                torch.sigmoid(pred.dustbin_logit.reshape(-1))
+                if pred.dustbin_logit is not None
+                else torch.zeros_like(center_epe)
+            )
+            log_probs = spatial_pred.local_log_probs if spatial_pred.local_log_probs is not None else F.log_softmax(pred.logits, dim=1)
+            probs = torch.exp(log_probs)
+            entropy = -torch.sum(probs * torch.log(torch.clamp(probs, min=1e-8)), dim=1)
+            denom = torch.sum(chunk_weights).clamp_min(1e-6)
+
+            def accumulate(name: str, values: torch.Tensor) -> None:
+                metric_sums[name] += float(torch.sum(values.detach() * chunk_weights).cpu().item())
+
+            accumulate("center_epe_px", center_epe)
+            accumulate("mean_epe_px", mean_epe)
+            accumulate("mode_epe_px", mode_epe)
+            accumulate("direct_epe_px", direct_epe)
+            accumulate("gated_epe_px", gated_epe)
+            accumulate("mean_improve_ratio", (mean_epe < center_epe).to(dtype=torch.float32))
+            accumulate("mode_improve_ratio", (mode_epe < center_epe).to(dtype=torch.float32))
+            accumulate("direct_improve_ratio", (direct_epe < center_epe).to(dtype=torch.float32))
+            accumulate("target_in_window_ratio", in_window)
+            accumulate("dustbin_probability", dustbin_prob)
+            accumulate("entropy", entropy)
+            metric_weight += float(denom.detach().cpu().item())
+    if float(total_weight.detach().cpu().item()) <= 0.0:
+        return None, {}
+    loss = total_loss / total_weight.clamp_min(1e-6)
+    normalizer = max(float(metric_weight), 1e-6)
+    metrics = {key: float(value / normalizer) for key, value in metric_sums.items()}
+    metrics["valid_count"] = float(target_delta.shape[0])
+    metrics["query_xy_scale_x"] = float(query_xy_scale[0])
+    metrics["query_xy_scale_y"] = float(query_xy_scale[1])
+    metrics["render_xy_scale_x"] = float(render_xy_scale[0])
+    metrics["render_xy_scale_y"] = float(render_xy_scale[1])
+    return loss, metrics
+
+
 def _rgb_keypoint_position_loss(
     model: MatchaStyleJointModel,
     source_images: np.ndarray | None,
@@ -2687,6 +3188,20 @@ def _total_loss(
             ):
                 if key in patch_metrics:
                     metrics[f"patch_corr_fine_{key}"] = float(patch_metrics[key])
+    if float(config.measurement_patch_loss_weight) > 0.0:
+        value, measurement_metrics = _joint_measurement_patch_loss(
+            model,
+            samples,
+            config=config,
+            device=device,
+            pair_subset=pair_subset,
+            sample_seed=int(seed) + 31000,
+        )
+        if value is not None:
+            loss = loss + float(config.measurement_patch_loss_weight) * value
+            metrics["measurement_patch_loss"] = float(value.detach().cpu().item())
+            for key, item in measurement_metrics.items():
+                metrics[f"measurement_patch_{key}"] = float(item)
     if float(config.rgb_keypoint_position_loss_weight) > 0.0:
         base = samples.coarse_fine_samples
         for prefix, source_images, target_images, source_cells, target_cells, source_labels, target_labels in (
@@ -2770,6 +3285,15 @@ def _build_matcha_joint_model_for_samples(
             gate_mode=str(config.gate_mode),
             residual_gate_scale=float(config.residual_gate_scale),
             local_window_fine_mode=str(config.local_window_fine_mode),
+            measurement_patch_search_radius_px=float(config.measurement_patch_search_radius_px),
+            measurement_patch_context_radius_px=float(config.measurement_patch_context_radius_px),
+            measurement_patch_step_px=float(config.measurement_patch_step_px),
+            measurement_patch_coarse_search_radius_px=float(config.measurement_patch_coarse_search_radius_px),
+            measurement_patch_coarse_step_px=float(config.measurement_patch_coarse_step_px),
+            measurement_patch_feature_dim=int(config.measurement_patch_feature_dim),
+            measurement_patch_hidden_dim=int(config.measurement_patch_hidden_dim),
+            measurement_patch_encoder_arch=str(config.measurement_patch_encoder_arch),
+            measurement_patch_input_mode=str(config.measurement_patch_input_mode),
         ).to(device)
     return MatchaStyleJointModel(
         input_dim=samples.coarse_fine_samples.input_dim,
@@ -2780,6 +3304,15 @@ def _build_matcha_joint_model_for_samples(
         gate_mode=str(config.gate_mode),
         residual_gate_scale=float(config.residual_gate_scale),
         local_window_fine_mode=str(config.local_window_fine_mode),
+        measurement_patch_search_radius_px=float(config.measurement_patch_search_radius_px),
+        measurement_patch_context_radius_px=float(config.measurement_patch_context_radius_px),
+        measurement_patch_step_px=float(config.measurement_patch_step_px),
+        measurement_patch_coarse_search_radius_px=float(config.measurement_patch_coarse_search_radius_px),
+        measurement_patch_coarse_step_px=float(config.measurement_patch_coarse_step_px),
+        measurement_patch_feature_dim=int(config.measurement_patch_feature_dim),
+        measurement_patch_hidden_dim=int(config.measurement_patch_hidden_dim),
+        measurement_patch_encoder_arch=str(config.measurement_patch_encoder_arch),
+        measurement_patch_input_mode=str(config.measurement_patch_input_mode),
     ).to(device)
 
 
@@ -2933,6 +3466,19 @@ def _evaluate(model: MatchaStyleJointModel, samples: MatchaJointTrainingSet, con
                     metrics["patch_corr_fine_epe_bins"] = float(patch_corr_metrics["epe_bins"])
                     metrics["patch_corr_fine_confidence"] = float(patch_corr_metrics["confidence"])
                     metrics["patch_corr_fine_entropy"] = float(patch_corr_metrics["entropy"])
+            if float(config.measurement_patch_loss_weight) > 0.0:
+                measurement_loss, measurement_metrics = _joint_measurement_patch_loss(
+                    model,
+                    samples,
+                    config=config,
+                    device=device,
+                    pair_subset=pair_subset,
+                    sample_seed=int(config.seed) + 41000,
+                )
+                if measurement_loss is not None:
+                    metrics["measurement_patch_loss"] = float(measurement_loss.detach().cpu().item())
+                    for key, value in measurement_metrics.items():
+                        metrics[f"measurement_patch_{key}"] = float(value)
             if float(config.rgb_keypoint_position_loss_weight) > 0.0:
                 for prefix, source_images, target_images, source_cells, target_cells, source_labels, target_labels in (
                     (
@@ -3263,6 +3809,7 @@ def save_matcha_joint_model(run: MatchaJointTrainingRun, path: Path) -> None:
                 "attention_upsample_mode": str(getattr(model, "attention_upsample_mode", "bilinear")),
                 "attention_fusion_mode": str(getattr(model, "attention_fusion_mode", "legacy")),
                 "local_window_fine_mode": str(getattr(model, "local_window_fine_mode", "mlp")),
+                "measurement_patch_config": dict(getattr(model, "measurement_patch_config", {})),
             },
             "state_dict": model.state_dict(),
             "summary": dict(run.summary),
@@ -3293,6 +3840,15 @@ def load_matcha_joint_model(path: Path, device: str = "cpu") -> MatchaJointTrain
             gate_mode=str(cfg.get("gate_mode", "residual")),
             residual_gate_scale=float(cfg.get("residual_gate_scale", 0.1)),
             local_window_fine_mode=str(cfg.get("local_window_fine_mode", "mlp")),
+            measurement_patch_search_radius_px=float(dict(cfg.get("measurement_patch_config", {})).get("search_radius_px", 8.0)),
+            measurement_patch_context_radius_px=float(dict(cfg.get("measurement_patch_config", {})).get("context_radius_px", 8.0)),
+            measurement_patch_step_px=float(dict(cfg.get("measurement_patch_config", {})).get("step_px", 1.0)),
+            measurement_patch_coarse_search_radius_px=float(dict(cfg.get("measurement_patch_config", {})).get("coarse_search_radius_px", 0.0)),
+            measurement_patch_coarse_step_px=float(dict(cfg.get("measurement_patch_config", {})).get("coarse_step_px", 0.0)),
+            measurement_patch_feature_dim=int(dict(cfg.get("measurement_patch_config", {})).get("feature_dim", 32)),
+            measurement_patch_hidden_dim=int(dict(cfg.get("measurement_patch_config", {})).get("hidden_dim", 64)),
+            measurement_patch_encoder_arch=str(dict(cfg.get("measurement_patch_config", {})).get("encoder_arch", "simple")),
+            measurement_patch_input_mode=str(dict(cfg.get("measurement_patch_config", {})).get("input_mode", "rgb")),
         )
     else:
         model = MatchaStyleJointModel(
@@ -3304,6 +3860,15 @@ def load_matcha_joint_model(path: Path, device: str = "cpu") -> MatchaJointTrain
             gate_mode=str(cfg.get("gate_mode", "residual")),
             residual_gate_scale=float(cfg.get("residual_gate_scale", 0.1)),
             local_window_fine_mode=str(cfg.get("local_window_fine_mode", "mlp")),
+            measurement_patch_search_radius_px=float(dict(cfg.get("measurement_patch_config", {})).get("search_radius_px", 8.0)),
+            measurement_patch_context_radius_px=float(dict(cfg.get("measurement_patch_config", {})).get("context_radius_px", 8.0)),
+            measurement_patch_step_px=float(dict(cfg.get("measurement_patch_config", {})).get("step_px", 1.0)),
+            measurement_patch_coarse_search_radius_px=float(dict(cfg.get("measurement_patch_config", {})).get("coarse_search_radius_px", 0.0)),
+            measurement_patch_coarse_step_px=float(dict(cfg.get("measurement_patch_config", {})).get("coarse_step_px", 0.0)),
+            measurement_patch_feature_dim=int(dict(cfg.get("measurement_patch_config", {})).get("feature_dim", 32)),
+            measurement_patch_hidden_dim=int(dict(cfg.get("measurement_patch_config", {})).get("hidden_dim", 64)),
+            measurement_patch_encoder_arch=str(dict(cfg.get("measurement_patch_config", {})).get("encoder_arch", "simple")),
+            measurement_patch_input_mode=str(dict(cfg.get("measurement_patch_config", {})).get("input_mode", "rgb")),
         )
     incompatible = model.load_state_dict(payload["state_dict"], strict=False)
     summary = dict(payload.get("summary", {}))

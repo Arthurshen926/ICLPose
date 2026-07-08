@@ -108,9 +108,14 @@ def _load_model(checkpoint: Path, *, device: torch.device) -> RGBPatchMeasuremen
         search_radius_px=float(config.get("search_radius_px", 2.0)),
         context_radius_px=float(config.get("context_radius_px", 8.0)),
         step_px=float(config.get("step_px", 0.5)),
+        coarse_search_radius_px=(
+            None if config.get("coarse_search_radius_px") is None else float(config.get("coarse_search_radius_px"))
+        ),
+        coarse_step_px=None if config.get("coarse_step_px") is None else float(config.get("coarse_step_px")),
         feature_dim=int(config.get("feature_dim", 32)),
         hidden_dim=None if config.get("hidden_dim") is None else int(config.get("hidden_dim")),
         input_mode=str(config.get("input_mode", "rgb")),
+        encoder_arch=str(config.get("encoder_arch", "simple")),
         template_scale_factors=tuple(float(value) for value in config.get("template_scale_factors", [1.0])),
         condition_on_prior_scale=bool(config.get("condition_on_prior_scale", False)),
         prior_scale_expert_centers_px=tuple(float(value) for value in config.get("prior_scale_expert_centers_px", [])),
@@ -122,6 +127,7 @@ def _load_model(checkpoint: Path, *, device: torch.device) -> RGBPatchMeasuremen
     allowed_missing = set()
     if int(model.prior_scale_expert_centers.numel()) == 0:
         allowed_missing.add("prior_scale_expert_centers")
+    allowed_missing.update(key for key in incompatible.missing_keys if str(key).startswith("measurement_gate_head."))
     missing = [key for key in incompatible.missing_keys if key not in allowed_missing]
     if missing or incompatible.unexpected_keys:
         raise RuntimeError(

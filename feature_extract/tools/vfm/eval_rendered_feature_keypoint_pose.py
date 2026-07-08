@@ -46,6 +46,7 @@ from feature_extract.vfm.rendered_keypoint_matching import (
     keypoint_feature_matches_to_pnp_matches,
     mutual_nn_keypoint_matches,
     refine_render_keypoint_matches_by_local_correlation,
+    render_anchor_topk_keypoint_matches,
 )
 from feature_extract.vfm.selector_descriptor_scoring import load_selector_from_checkpoint
 from feature_extract.vfm.tokens import TokenBankManifest
@@ -482,8 +483,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--channel_chunk", type=int, default=32)
     parser.add_argument("--detector", default="orb", choices=("orb", "superpoint", "disk"))
     parser.add_argument("--max_keypoints", type=int, default=1000)
-    parser.add_argument("--match_mode", default="mnn", choices=("mnn", "mnn_dual_filter", "dual_softmax"))
+    parser.add_argument("--match_mode", default="mnn", choices=("mnn", "mnn_dual_filter", "dual_softmax", "render_anchor_topk"))
     parser.add_argument("--ratio_threshold", type=float, default=0.9)
+    parser.add_argument("--render_anchor_top_l", type=int, default=5)
     parser.add_argument("--dual_softmax_logit_scale", type=float, default=10.0)
     parser.add_argument("--min_dual_softmax_confidence", type=float, default=0.0)
     parser.add_argument("--min_similarity", type=float, default=0.0)
@@ -596,6 +598,18 @@ def main() -> None:
                 logit_scale=float(args.dual_softmax_logit_scale),
                 min_confidence=float(args.min_dual_softmax_confidence),
                 min_similarity=float(args.min_similarity),
+                max_matches=args.max_matches,
+            )
+        elif args.match_mode == "render_anchor_topk":
+            kp_matches = render_anchor_topk_keypoint_matches(
+                query_xy_valid,
+                qdesc,
+                render_xy_valid,
+                rdesc,
+                top_l=int(args.render_anchor_top_l),
+                min_similarity=float(args.min_similarity),
+                dual_softmax_logit_scale=float(args.dual_softmax_logit_scale),
+                min_dual_softmax_confidence=float(args.min_dual_softmax_confidence),
                 max_matches=args.max_matches,
             )
         else:
@@ -734,6 +748,7 @@ def main() -> None:
             "match_mode": args.match_mode,
             "max_keypoints": int(args.max_keypoints),
             "ratio_threshold": float(args.ratio_threshold),
+            "render_anchor_top_l": int(args.render_anchor_top_l),
             "dual_softmax_logit_scale": float(args.dual_softmax_logit_scale),
             "min_dual_softmax_confidence": float(args.min_dual_softmax_confidence),
             "min_similarity": float(args.min_similarity),

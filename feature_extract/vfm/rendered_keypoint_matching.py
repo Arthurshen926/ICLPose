@@ -200,6 +200,98 @@ def dual_softmax_keypoint_matches(
     return matches
 
 
+def render_anchor_topk_keypoint_matches(
+    query_xy: np.ndarray,
+    query_descriptors: np.ndarray,
+    render_xy: np.ndarray,
+    render_descriptors: np.ndarray,
+    *,
+    top_l: int = 5,
+    min_similarity: float = -1.0,
+    dual_softmax_logit_scale: float | None = None,
+    min_dual_softmax_confidence: float = 0.0,
+    max_matches: int | None = None,
+) -> list[KeypointFeatureMatch]:
+    """Keep top-L query candidates for every render anchor.
+
+    This is intentionally render-anchored: each render point keeps multiple
+    query-side hypotheses instead of applying mutual/top-1 pruning before
+    validity selection or RANSAC.
+    """
+
+    qxy = np.asarray(query_xy, dtype=np.float64).reshape(-1, 2)
+    rxy = np.asarray(render_xy, dtype=np.float64).reshape(-1, 2)
+    qdesc = np.asarray(query_descriptors, dtype=np.float32)
+    rdesc = np.asarray(render_descriptors, dtype=np.float32)
+    if qdesc.ndim != 2 or rdesc.ndim != 2:
+        raise ValueError("descriptors must have shape (N, C)")
+    if qdesc.shape[0] != qxy.shape[0] or rdesc.shape[0] != rxy.shape[0]:
+        raise ValueError("descriptor and keypoint counts must match")
+    if qdesc.shape[1] != rdesc.shape[1]:
+        raise ValueError("query and render descriptor dimensions must match")
+    if int(top_l) <= 0:
+        raise ValueError("top_l must be positive")
+    if qdesc.shape[0] == 0 or rdesc.shape[0] == 0:
+        return []
+    qdesc, qvalid = normalize_rows(qdesc)
+    rdesc, rvalid = normalize_rows(rdesc)
+    qrows = np.flatnonzero(qvalid)
+    rrows = np.flatnonzero(rvalid)
+    if qrows.size == 0 or rrows.size == 0:
+        return []
+    qdesc = qdesc[qrows]
+    rdesc = rdesc[rrows]
+    scores = qdesc @ rdesc.T
+    confidence = (
+        _dual_softmax_confidence(scores, float(dual_softmax_logit_scale))
+        if dual_softmax_logit_scale is not None
+        else None
+    )
+    query_render_order = np.argsort(-scores, axis=1)
+    render_best_gap = np.zeros((scores.shape[1],), dtype=np.float32)
+    if scores.shape[0] > 1:
+        render_top2 = np.sort(scores, axis=0)[-2:, :]
+        render_best_gap = (render_top2[-1, :] - render_top2[-2, :]).astype(np.float32)
+    candidate_id = 0
+    matches: list[KeypointFeatureMatch] = []
+    for local_r in range(scores.shape[1]):
+        query_order = np.argsort(-scores[:, local_r], kind="mergesort")
+        for rank, local_q in enumerate(query_order[: int(top_l)]):
+            similarity = float(scores[local_q, local_r])
+            if similarity < float(min_similarity):
+                continue
+            conf = None if confidence is None else float(confidence[local_q, local_r])
+            if conf is not None and conf < float(min_dual_softmax_confidence):
+                continue
+            render_rank_for_query = int(np.where(query_render_order[local_q] == local_r)[0][0])
+            matches.append(
+                KeypointFeatureMatch(
+                    query_index=int(qrows[local_q]),
+                    render_index=int(rrows[local_r]),
+                    query_xy=qxy[int(qrows[local_q])],
+                    render_xy=rxy[int(rrows[local_r])],
+                    similarity=similarity,
+                    ratio=0.0,
+                    similarity_margin=float(render_best_gap[local_r]),
+                    dual_softmax_confidence=conf,
+                    base_render_index=int(rrows[local_r]),
+                    candidate_render_index=int(rrows[local_r]),
+                    candidate_id=int(candidate_id),
+                    coarse_rank=int(rank),
+                    coarse_score=similarity,
+                    coarse_score_gap=float(render_best_gap[local_r]),
+                    mutual_rank=render_rank_for_query,
+                    cell_delta_x=0,
+                    cell_delta_y=0,
+                )
+            )
+            candidate_id += 1
+    matches.sort(key=lambda item: (int(item.render_index), int(item.coarse_rank or 0), -float(item.similarity)))
+    if max_matches is not None:
+        matches = matches[: int(max_matches)]
+    return matches
+
+
 def refine_render_keypoint_matches_by_local_correlation(
     matches: Sequence[KeypointFeatureMatch],
     query_descriptors: np.ndarray,

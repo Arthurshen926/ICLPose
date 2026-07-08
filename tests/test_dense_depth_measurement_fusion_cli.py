@@ -187,7 +187,7 @@ def test_eval_dense_depth_measurement_fusion_cli_can_project_query_gt_from_pose_
     assert dense_rows[0]["query_gt_x"] != ""
 
 
-def test_eval_dense_depth_measurement_fusion_cli_groups_by_candidate_id(tmp_path: Path) -> None:
+def test_eval_dense_depth_measurement_fusion_cli_groups_by_render_pose_id(tmp_path: Path) -> None:
     camera = ColmapCamera(camera_id=1, model_id=1, width=640, height=480, params=(500.0, 500.0, 320.0, 240.0))
     points = np.asarray(
         [
@@ -202,13 +202,14 @@ def test_eval_dense_depth_measurement_fusion_cli_groups_by_candidate_id(tmp_path
     )
     xy = project_world_to_image(points, np.eye(4, dtype=np.float64), camera)
     rows = []
-    for candidate_id, shift in [("c0", 0.0), ("c1", 3.0)]:
+    for render_pose_id, shift in [("pose0", 0.0), ("pose1", 3.0)]:
         for index, (point, (x, y)) in enumerate(zip(points, xy)):
             rows.append(
                 {
                     "query_id": "q0.png",
-                    "candidate_id": candidate_id,
-                    "match_index": f"{candidate_id}_{index}",
+                    "candidate_id": f"match_{render_pose_id}_{index}",
+                    "render_pose_id": render_pose_id,
+                    "match_index": f"{render_pose_id}_{index}",
                     "world_x": point[0],
                     "world_y": point[1],
                     "world_z": point[2],
@@ -253,7 +254,7 @@ def test_eval_dense_depth_measurement_fusion_cli_groups_by_candidate_id(tmp_path
     assert summary["query_count"] == 1
     assert summary["pose_group_count"] == 2
     assert summary["candidate_group_summary"]["max_candidates_per_query"] == 2
-    assert {row["candidate_id"] for row in pose_rows} == {"c0", "c1"}
+    assert {row["candidate_id"] for row in pose_rows} == {"pose0", "pose1"}
 
 
 def test_eval_dense_depth_measurement_fusion_cli_rejects_single_render_pose_for_multiple_groups(tmp_path: Path) -> None:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import random
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -268,6 +269,103 @@ def _filter_rows_for_training(
         "baseline_epe_min_px": min_epe,
         "baseline_epe_max_px": max_epe,
     }
+
+
+def _normalised_residual_bin_edges(edges: Sequence[float]) -> tuple[float, ...]:
+    values = tuple(float(value) for value in edges)
+    if not values:
+        return (0.0, 2.0, 5.0, 10.0, 20.0)
+    if any(value < 0.0 for value in values):
+        raise ValueError("residual sampling bin edges must be non-negative")
+    sorted_values = tuple(sorted(set(values)))
+    if len(sorted_values) != len(values):
+        raise ValueError("residual sampling bin edges must be unique")
+    if sorted_values[0] > 0.0:
+        sorted_values = (0.0,) + sorted_values
+    return sorted_values
+
+
+def _residual_bin_label(index: int, edges: Sequence[float]) -> str:
+    values = tuple(float(value) for value in edges)
+    lower = values[int(index)]
+    if int(index) + 1 < len(values):
+        upper = values[int(index) + 1]
+        return f"[{lower:g},{upper:g})"
+    return f"[{lower:g},inf)"
+
+
+def _residual_bin_index(residual_px: float, edges: Sequence[float]) -> int:
+    values = tuple(float(value) for value in edges)
+    residual = max(0.0, float(residual_px))
+    for index in range(len(values) - 1):
+        if values[index] <= residual < values[index + 1]:
+            return int(index)
+    return max(0, len(values) - 1)
+
+
+@dataclass
+class _ResidualBalancedBatchSampler:
+    rows: Sequence[dict[str, str]]
+    residual_bin_edges_px: Sequence[float]
+    target_x_key: str
+    target_y_key: str
+    search_radius_px: float
+
+    def __post_init__(self) -> None:
+        edges = _normalised_residual_bin_edges(self.residual_bin_edges_px)
+        object.__setattr__(self, "edges", edges)
+        groups: dict[int, list[dict[str, str]]] = {index: [] for index in range(len(edges))}
+        dustbin_count = 0
+        valid_count = 0
+        for row in self.rows:
+            residual = _baseline_epe_px(row, target_x_key=str(self.target_x_key), target_y_key=str(self.target_y_key))
+            bin_index = _residual_bin_index(residual, edges)
+            groups.setdefault(bin_index, []).append(dict(row))
+            if _target_is_dustbin_for_filter(
+                row,
+                search_radius_px=float(self.search_radius_px),
+                target_x_key=str(self.target_x_key),
+                target_y_key=str(self.target_y_key),
+            ):
+                dustbin_count += 1
+            else:
+                valid_count += 1
+        non_empty = {index: values for index, values in groups.items() if values}
+        object.__setattr__(self, "groups", non_empty)
+        object.__setattr__(
+            self,
+            "summary",
+            {
+                "enabled": True,
+                "row_count": int(len(self.rows)),
+                "residual_bin_edges_px": [float(value) for value in edges],
+                "bin_count": int(len(edges)),
+                "non_empty_bin_count": int(len(non_empty)),
+                "valid_count": int(valid_count),
+                "dustbin_count": int(dustbin_count),
+                "bins": {
+                    _residual_bin_label(index, edges): int(len(values))
+                    for index, values in sorted(groups.items())
+                    if values
+                },
+            },
+        )
+        if not non_empty:
+            raise ValueError("residual balanced sampler received no non-empty bins")
+
+    def sample_batch(self, *, batch_size: int, rng: random.Random) -> list[dict[str, str]]:
+        size = int(batch_size)
+        if size <= 0:
+            raise ValueError("batch_size must be positive")
+        bin_ids = sorted(self.groups)
+        out: list[dict[str, str]] = []
+        start = int(rng.randrange(len(bin_ids)))
+        for index in range(size):
+            bin_id = bin_ids[(start + index) % len(bin_ids)]
+            bucket = self.groups[bin_id]
+            out.append(dict(bucket[rng.randrange(len(bucket))]))
+        rng.shuffle(out)
+        return out
 
 
 def _center_baseline_metrics(rows: Sequence[Mapping[str, object]]) -> dict[str, float | int | None]:
@@ -574,10 +672,42 @@ class _PatchForwardOnly(nn.Module):
         query_patch: torch.Tensor,
         render_patch: torch.Tensor,
         prior_scale_px: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         prior = None if int(prior_scale_px.numel()) == 0 else prior_scale_px
         pred = self.model.forward_from_patches(query_patch, render_patch, prior_scale_px=prior)
-        return pred.logits, pred.dustbin_logit, pred.direct_mean_offset_xy, pred.direct_log_sigma_xy
+        empty_coarse_logits = torch.empty((int(query_patch.shape[0]), 0), device=query_patch.device, dtype=query_patch.dtype)
+        empty_coarse_offsets = torch.empty((int(query_patch.shape[0]), 0, 2), device=query_patch.device, dtype=query_patch.dtype)
+        offsets = pred.offsets_xy
+        if offsets.ndim == 2:
+            offsets = offsets.to(device=query_patch.device, dtype=query_patch.dtype).unsqueeze(0).expand(int(query_patch.shape[0]), -1, -1)
+        coarse_offsets = pred.coarse_offsets_xy
+        if coarse_offsets is not None and coarse_offsets.ndim == 2:
+            coarse_offsets = coarse_offsets.to(device=query_patch.device, dtype=query_patch.dtype).unsqueeze(0).expand(
+                int(query_patch.shape[0]), -1, -1
+            )
+        return (
+            pred.logits,
+            offsets,
+            pred.dustbin_logit,
+            pred.mean_offset_xy,
+            pred.direct_mean_offset_xy,
+            pred.direct_log_sigma_xy,
+            pred.gated_mean_offset_xy,
+            pred.gate_logit,
+            empty_coarse_logits if pred.coarse_logits is None else pred.coarse_logits,
+            empty_coarse_offsets if coarse_offsets is None else coarse_offsets,
+        )
 
 
 def _forward_patch_prediction(
@@ -596,23 +726,119 @@ def _forward_patch_prediction(
             prior_scale_px=None if prior_scale is None else prior_scale.to(device),
         )
     empty_prior = torch.empty((0,), device=device, dtype=query_patch.dtype)
-    logits, dustbin_logit, direct_mean, direct_log_sigma = parallel_forward(
+    (
+        logits,
+        offsets_xy,
+        dustbin_logit,
+        likelihood_mean,
+        direct_mean,
+        direct_log_sigma,
+        gated_mean,
+        gate_logit,
+        coarse_logits,
+        coarse_offsets,
+    ) = parallel_forward(
         query_patch.to(device),
         render_patch.to(device),
         empty_prior if prior_scale is None else prior_scale.to(device),
     )
+    coarse_logits_value = None if int(coarse_logits.shape[1]) == 0 else coarse_logits
+    coarse_offsets_value = None if int(coarse_offsets.numel()) == 0 else coarse_offsets
     return RGBPatchMeasurementPrediction(
         logits=logits,
-        offsets_xy=local_offset_grid(
-            search_radius_px=model.search_radius_px,
-            step_px=model.step_px,
-            device=logits.device,
-            dtype=logits.dtype,
-        ),
+        offsets_xy=offsets_xy,
         dustbin_logit=dustbin_logit,
+        coarse_logits=coarse_logits_value,
+        coarse_offsets_xy=coarse_offsets_value,
+        mean_offset_xy=likelihood_mean,
         direct_mean_offset_xy=direct_mean,
         direct_log_sigma_xy=direct_log_sigma,
+        gated_mean_offset_xy=gated_mean,
+        gate_logit=gate_logit,
+        gate_probability=torch.sigmoid(gate_logit),
     )
+
+
+def _coarse_stage_likelihood_loss(
+    pred: RGBPatchMeasurementPrediction,
+    target: torch.Tensor,
+    *,
+    search_radius_px: float,
+    target_is_dustbin: torch.Tensor | None,
+    sample_weight: torch.Tensor | None,
+    dustbin_positive_weight: float,
+    target_heatmap_sigma_px: float,
+) -> tuple[torch.Tensor | None, RGBPatchMeasurementPrediction | None]:
+    if pred.coarse_logits is None or pred.coarse_offsets_xy is None:
+        return None, None
+    return continuous_offset_nll_with_dustbin(
+        pred.coarse_logits,
+        pred.coarse_offsets_xy,
+        target,
+        dustbin_logit=pred.dustbin_logit,
+        search_radius_px=float(search_radius_px),
+        epe_weight=0.0,
+        dustbin_bce_weight=0.0,
+        dustbin_positive_weight=float(dustbin_positive_weight),
+        target_is_dustbin=target_is_dustbin,
+        target_heatmap_sigma_px=float(target_heatmap_sigma_px),
+        sample_weight=sample_weight,
+    )
+
+
+def _gate_supervision_loss(
+    pred: RGBPatchMeasurementPrediction,
+    target: torch.Tensor,
+    *,
+    target_is_dustbin: torch.Tensor | None,
+    sample_weight: torch.Tensor | None,
+    center_radius_px: float,
+    full_radius_px: float,
+    target_mode: str = "residual",
+    utility_temperature_px: float = 0.25,
+) -> torch.Tensor | None:
+    if pred.gate_logit is None:
+        return None
+    logits = pred.gate_logit.reshape(int(target.shape[0]))
+    target_xy = target.to(device=logits.device, dtype=logits.dtype).reshape(int(logits.shape[0]), 2)
+    mode = str(target_mode).strip().lower()
+    if mode == "residual":
+        residual = torch.linalg.norm(target_xy, dim=1)
+        center = float(center_radius_px)
+        full = float(full_radius_px)
+        if full <= center:
+            raise ValueError("gate_full_radius_px must be greater than gate_center_radius_px")
+        target_gate = ((residual - center) / (full - center)).clamp(0.0, 1.0)
+    elif mode == "utility":
+        if pred.mean_offset_xy is None:
+            raise ValueError("utility gate supervision requires pred.mean_offset_xy")
+        temperature = float(utility_temperature_px)
+        if temperature <= 0.0:
+            raise ValueError("gate_utility_temperature_px must be positive")
+        center_epe = torch.linalg.norm(target_xy, dim=1)
+        likelihood_mean = pred.mean_offset_xy.to(device=logits.device, dtype=logits.dtype).reshape(int(logits.shape[0]), 2)
+        likelihood_epe = torch.linalg.norm(likelihood_mean.detach() - target_xy, dim=1)
+        target_gate = torch.sigmoid((center_epe - likelihood_epe) / temperature)
+    else:
+        raise ValueError("gate_target_mode must be residual or utility")
+    if target_is_dustbin is None:
+        valid_mask = torch.ones_like(target_gate, dtype=torch.bool)
+    else:
+        valid_mask = ~target_is_dustbin.to(device=logits.device).reshape(int(logits.shape[0])).bool()
+    if not torch.any(valid_mask):
+        return torch.zeros((), device=logits.device, dtype=logits.dtype)
+    loss_rows = F.binary_cross_entropy_with_logits(logits, target_gate, reduction="none")
+    weights = None
+    if sample_weight is not None:
+        weights = sample_weight.to(device=logits.device, dtype=logits.dtype).reshape(int(logits.shape[0])).clamp_min(0.0)
+    selected_loss = loss_rows[valid_mask]
+    if weights is None:
+        return torch.mean(selected_loss)
+    selected_weight = weights[valid_mask]
+    denom = torch.sum(selected_weight)
+    if float(denom.detach().cpu().item()) <= 0.0:
+        return torch.zeros((), device=logits.device, dtype=logits.dtype)
+    return torch.sum(selected_loss * selected_weight) / denom.clamp_min(1e-12)
 
 
 def _load_tensor_cached(
@@ -836,6 +1062,39 @@ def _stack_patch_batch(
     return torch.stack(query_patches, dim=0), torch.stack(render_patches, dim=0), target_tensor, torch.linalg.norm(target_tensor, dim=1), target_is_dustbin
 
 
+def _append_roll_hard_negatives(
+    query_patch: torch.Tensor,
+    render_patch: torch.Tensor,
+    target: torch.Tensor,
+    target_is_dustbin: torch.Tensor | None,
+    *,
+    fraction: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    frac = float(fraction)
+    if frac <= 0.0:
+        return query_patch, render_patch, target, target_is_dustbin
+    batch = int(query_patch.shape[0])
+    if batch < 2:
+        return query_patch, render_patch, target, target_is_dustbin
+    negative_count = max(1, min(batch, int(round(batch * frac))))
+    base_dustbin = (
+        torch.zeros((batch,), dtype=torch.bool, device=query_patch.device)
+        if target_is_dustbin is None
+        else target_is_dustbin.to(device=query_patch.device).reshape(batch).bool()
+    )
+    selected = torch.arange(negative_count, device=query_patch.device)
+    rolled_render = torch.roll(render_patch, shifts=1, dims=0)[selected]
+    query_negative = query_patch[selected]
+    target_negative = torch.zeros((negative_count, 2), dtype=target.dtype, device=target.device)
+    negative_dustbin = torch.ones((negative_count,), dtype=torch.bool, device=query_patch.device)
+    return (
+        torch.cat([query_patch, query_negative], dim=0),
+        torch.cat([render_patch, rolled_render], dim=0),
+        torch.cat([target, target_negative.to(device=target.device)], dim=0),
+        torch.cat([base_dustbin, negative_dustbin], dim=0),
+    )
+
+
 @torch.no_grad()
 def _evaluate(
     *,
@@ -856,7 +1115,14 @@ def _evaluate(
     max_eval_rows: int | None,
     epe_weight: float,
     delta_loss_weight: float,
+    gated_delta_loss_weight: float,
+    gate_supervision_loss_weight: float,
+    gate_center_radius_px: float,
+    gate_full_radius_px: float,
+    gate_target_mode: str,
+    gate_utility_temperature_px: float,
     likelihood_loss_weight: float,
+    coarse_likelihood_loss_weight: float,
     dustbin_bce_weight: float,
     dustbin_positive_weight: float,
     target_heatmap_sigma_px: float,
@@ -876,6 +1142,9 @@ def _evaluate(
     epes: list[torch.Tensor] = []
     likelihood_epes: list[torch.Tensor] = []
     mode_epes: list[torch.Tensor] = []
+    coarse_epes: list[torch.Tensor] = []
+    gated_epes: list[torch.Tensor] = []
+    gate_probs: list[torch.Tensor] = []
     baselines: list[torch.Tensor] = []
     valid_masks: list[torch.Tensor] = []
     dustbin_probs: list[torch.Tensor] = []
@@ -914,7 +1183,7 @@ def _evaluate(
             pred0.direct_log_sigma_xy,
             target.to(device),
             dustbin_logit=pred0.dustbin_logit,
-            search_radius_px=model.search_radius_px,
+            search_radius_px=model.measurement_search_radius_px,
             target_is_dustbin=None if target_is_dustbin is None else target_is_dustbin.to(device),
             sample_weight=None if sample_weight is None else sample_weight.to(device),
             dustbin_positive_weight=float(dustbin_positive_weight),
@@ -924,7 +1193,7 @@ def _evaluate(
             pred0.offsets_xy,
             target.to(device),
             dustbin_logit=pred0.dustbin_logit,
-            search_radius_px=model.search_radius_px,
+            search_radius_px=model.measurement_search_radius_px,
             epe_weight=float(epe_weight),
             dustbin_bce_weight=float(dustbin_bce_weight),
             dustbin_positive_weight=float(dustbin_positive_weight),
@@ -932,11 +1201,53 @@ def _evaluate(
             target_heatmap_sigma_px=float(target_heatmap_sigma_px),
             sample_weight=None if sample_weight is None else sample_weight.to(device),
         )
+        coarse_loss, coarse_pred = _coarse_stage_likelihood_loss(
+            pred0,
+            target.to(device),
+            search_radius_px=model.measurement_search_radius_px,
+            target_is_dustbin=None if target_is_dustbin is None else target_is_dustbin.to(device),
+            sample_weight=None if sample_weight is None else sample_weight.to(device),
+            dustbin_positive_weight=float(dustbin_positive_weight),
+            target_heatmap_sigma_px=float(target_heatmap_sigma_px),
+        )
+        gated_delta_loss = None
+        if pred0.gated_mean_offset_xy is not None:
+            gated_delta_loss, _gated_pred = residual_delta_gaussian_nll(
+                pred0.gated_mean_offset_xy,
+                pred0.direct_log_sigma_xy,
+                target.to(device),
+                dustbin_logit=pred0.dustbin_logit,
+                search_radius_px=model.measurement_search_radius_px,
+                target_is_dustbin=None if target_is_dustbin is None else target_is_dustbin.to(device),
+                sample_weight=None if sample_weight is None else sample_weight.to(device),
+                dustbin_positive_weight=float(dustbin_positive_weight),
+            )
+        gate_supervision_loss = _gate_supervision_loss(
+            pred0,
+            target.to(device),
+            target_is_dustbin=None if target_is_dustbin is None else target_is_dustbin.to(device),
+            sample_weight=None if sample_weight is None else sample_weight.to(device),
+            center_radius_px=float(gate_center_radius_px),
+            full_radius_px=float(gate_full_radius_px),
+            target_mode=str(gate_target_mode),
+            utility_temperature_px=float(gate_utility_temperature_px),
+        )
+        if pred0.gated_mean_offset_xy is not None and pred0.gate_probability is not None:
+            gated_epes.append(torch.linalg.norm(pred0.gated_mean_offset_xy.detach().cpu() - target.detach().cpu(), dim=1))
+            gate_probs.append(pred0.gate_probability.detach().cpu())
         loss = float(delta_loss_weight) * delta_loss + float(likelihood_loss_weight) * likelihood_loss
+        if gated_delta_loss is not None:
+            loss = loss + float(gated_delta_loss_weight) * gated_delta_loss
+        if gate_supervision_loss is not None:
+            loss = loss + float(gate_supervision_loss_weight) * gate_supervision_loss
+        if coarse_loss is not None:
+            loss = loss + float(coarse_likelihood_loss_weight) * coarse_loss
         epe = pred.epe_px.detach().cpu()
         losses.append(float(loss.detach().cpu().item()) * len(batch_rows))
         epes.append(epe)
         likelihood_epes.append(likelihood_pred.epe_px.detach().cpu())
+        if coarse_pred is not None:
+            coarse_epes.append(coarse_pred.epe_px.detach().cpu())
         if likelihood_pred.mode_offset_xy is None:
             mode_epes.append(likelihood_pred.epe_px.detach().cpu())
         else:
@@ -947,6 +1258,9 @@ def _evaluate(
     epe_all = torch.cat(epes, dim=0)
     likelihood_epe_all = torch.cat(likelihood_epes, dim=0)
     mode_epe_all = torch.cat(mode_epes, dim=0)
+    coarse_epe_all = torch.cat(coarse_epes, dim=0) if coarse_epes else None
+    gated_epe_all = torch.cat(gated_epes, dim=0) if gated_epes else None
+    gate_prob_all = torch.cat(gate_probs, dim=0) if gate_probs else None
     baseline_all = torch.cat(baselines, dim=0)
     valid_mask_all = torch.cat(valid_masks, dim=0).bool()
     dustbin_mask_all = ~valid_mask_all
@@ -957,6 +1271,8 @@ def _evaluate(
     valid_epe = epe_all[valid_mask_all]
     valid_likelihood_epe = likelihood_epe_all[valid_mask_all]
     valid_mode_epe = mode_epe_all[valid_mask_all]
+    valid_coarse_epe = coarse_epe_all[valid_mask_all] if coarse_epe_all is not None else None
+    valid_gated_epe = gated_epe_all[valid_mask_all] if gated_epe_all is not None else None
     valid_baseline = baseline_all[valid_mask_all]
     dustbin_prob = dustbin_prob_all[dustbin_mask_all]
     valid_dustbin_prob = dustbin_prob_all[valid_mask_all]
@@ -1055,6 +1371,44 @@ def _evaluate(
             float(torch.mean((~accepted_mask_0p5[dustbin_mask_all]).float()).item()) if dustbin_count else None
         ),
     }
+    if coarse_epe_all is not None:
+        metrics.update(
+            {
+                "coarse_epe_px": float(torch.mean(coarse_epe_all).item()),
+                "coarse_epe_median_px": float(torch.median(coarse_epe_all).item()),
+                "coarse_recall_0p5px": float(torch.mean((coarse_epe_all <= 0.5).float()).item()),
+                "coarse_recall_1px": float(torch.mean((coarse_epe_all <= 1.0).float()).item()),
+                "coarse_improve_ratio": float(torch.mean((coarse_epe_all < baseline_all).float()).item()),
+                "coarse_valid_epe_median_px": float(torch.median(valid_coarse_epe).item()) if valid_count else None,
+                "coarse_valid_improve_ratio": (
+                    float(torch.mean((valid_coarse_epe < valid_baseline).float()).item()) if valid_count else None
+                ),
+            }
+        )
+        metrics.update(_residual_bin_metrics(values, coarse_epe_all, baseline_all, prefix="coarse"))
+    if gated_epe_all is not None and valid_gated_epe is not None:
+        metrics.update(
+            {
+                "gated_epe_px": float(torch.mean(gated_epe_all).item()),
+                "gated_epe_median_px": float(torch.median(gated_epe_all).item()),
+                "gated_recall_0p5px": float(torch.mean((gated_epe_all <= 0.5).float()).item()),
+                "gated_recall_1px": float(torch.mean((gated_epe_all <= 1.0).float()).item()),
+                "gated_improve_ratio": float(torch.mean((gated_epe_all < baseline_all).float()).item()),
+                "gated_median_improvement_px": float(torch.median(baseline_all - gated_epe_all).item()),
+                "gated_valid_epe_px": float(torch.mean(valid_gated_epe).item()) if valid_count else None,
+                "gated_valid_epe_median_px": float(torch.median(valid_gated_epe).item()) if valid_count else None,
+                "gated_valid_recall_0p5px": float(torch.mean((valid_gated_epe <= 0.5).float()).item()) if valid_count else None,
+                "gated_valid_recall_1px": float(torch.mean((valid_gated_epe <= 1.0).float()).item()) if valid_count else None,
+                "gated_valid_improve_ratio": (
+                    float(torch.mean((valid_gated_epe < valid_baseline).float()).item()) if valid_count else None
+                ),
+                "gate_probability_mean": None if gate_prob_all is None else float(torch.mean(gate_prob_all).item()),
+                "gate_probability_valid_mean": (
+                    None if gate_prob_all is None or not valid_count else float(torch.mean(gate_prob_all[valid_mask_all]).item())
+                ),
+            }
+        )
+        metrics.update(_residual_bin_metrics(values, gated_epe_all, baseline_all, prefix="gated"))
     metrics.update(_residual_bin_metrics(values, likelihood_epe_all, baseline_all, prefix="likelihood"))
     metrics.update(_residual_bin_metrics(values, mode_epe_all, baseline_all, prefix="mode"))
     metrics.update(_residual_bin_metrics(values, epe_all, baseline_all, prefix="direct"))
@@ -1092,6 +1446,8 @@ def train_rgb_patch_measurement_branch(
     search_radius_px: float,
     context_radius_px: float,
     step_px: float,
+    coarse_search_radius_px: float | None = None,
+    coarse_step_px: float | None = None,
     query_image_width: int | None = None,
     query_image_height: int | None = None,
     render_image_width: int | None = None,
@@ -1101,11 +1457,19 @@ def train_rgb_patch_measurement_branch(
     feature_dim: int = 32,
     hidden_dim: int | None = None,
     input_mode: str = "rgb",
+    encoder_arch: str = "simple",
     template_scale_factors: Sequence[float] = (1.0,),
     lr: float = 1e-3,
     epe_weight: float = 0.25,
     delta_loss_weight: float = 1.0,
+    gated_delta_loss_weight: float = 0.0,
+    gate_supervision_loss_weight: float = 0.0,
+    gate_center_radius_px: float = 0.5,
+    gate_full_radius_px: float = 2.0,
+    gate_target_mode: str = "residual",
+    gate_utility_temperature_px: float = 0.25,
     likelihood_loss_weight: float = 0.1,
+    coarse_likelihood_loss_weight: float = 0.0,
     dustbin_bce_weight: float = 0.0,
     dustbin_positive_weight: float = 1.0,
     target_heatmap_sigma_px: float = 0.0,
@@ -1124,6 +1488,7 @@ def train_rgb_patch_measurement_branch(
     gate_median_epe_px: float = 0.5,
     gate_improve_ratio: float = 0.8,
     render_patch_augmentation: str = "none",
+    hard_negative_fraction: float = 0.0,
     train_dustbin_head_only: bool = False,
     condition_on_prior_scale: bool = False,
     prior_scale_key: str = "",
@@ -1137,9 +1502,14 @@ def train_rgb_patch_measurement_branch(
     target_dustbin_filter: str = "all",
     baseline_epe_min_px: float | None = None,
     baseline_epe_max_px: float | None = None,
+    residual_balanced_sampling: bool = False,
+    residual_sampling_bins_px: Sequence[float] = (),
     data_parallel_device_ids: Sequence[int] = (),
 ) -> dict[str, Any]:
     base = Path.cwd() if base_dir is None else Path(base_dir)
+    if (coarse_search_radius_px is None) != (coarse_step_px is None):
+        raise ValueError("coarse_search_radius_px and coarse_step_px must be provided together")
+    effective_search_radius_px = float(search_radius_px) + (0.0 if coarse_search_radius_px is None else float(coarse_search_radius_px))
     if max_eval_rows is not None and int(max_eval_rows) <= 0:
         max_eval_rows = None
     if eval_batch_size is not None and int(eval_batch_size) <= 0:
@@ -1149,7 +1519,7 @@ def train_rgb_patch_measurement_branch(
         raise ValueError("rows_csv contains no rows")
     rows, row_filter_summary = _filter_rows_for_training(
         raw_rows,
-        search_radius_px=float(search_radius_px),
+        search_radius_px=float(effective_search_radius_px),
         target_x_key=str(target_x_key),
         target_y_key=str(target_y_key),
         target_dustbin_filter=str(target_dustbin_filter),
@@ -1164,7 +1534,7 @@ def train_rgb_patch_measurement_branch(
         raw_val_rows = _read_csv(Path(val_rows_csv), max_rows=max_rows)
         val_rows, val_row_filter_summary = _filter_rows_for_training(
             raw_val_rows,
-            search_radius_px=float(search_radius_px),
+            search_radius_px=float(effective_search_radius_px),
             target_x_key=str(target_x_key),
             target_y_key=str(target_y_key),
             target_dustbin_filter=str(target_dustbin_filter),
@@ -1193,9 +1563,12 @@ def train_rgb_patch_measurement_branch(
         search_radius_px=float(search_radius_px),
         context_radius_px=float(context_radius_px),
         step_px=float(step_px),
+        coarse_search_radius_px=None if coarse_search_radius_px is None else float(coarse_search_radius_px),
+        coarse_step_px=None if coarse_step_px is None else float(coarse_step_px),
         feature_dim=int(feature_dim),
         hidden_dim=hidden_dim,
         input_mode=str(input_mode),
+        encoder_arch=str(encoder_arch),
         template_scale_factors=tuple(float(value) for value in template_scale_factors),
         condition_on_prior_scale=bool(condition_on_prior_scale),
         prior_scale_expert_centers_px=tuple(float(value) for value in prior_scale_expert_centers_px),
@@ -1204,10 +1577,12 @@ def train_rgb_patch_measurement_branch(
     ).to(torch_device)
     if init_checkpoint is not None and str(init_checkpoint):
         state = torch.load(Path(init_checkpoint), map_location=torch_device)
+        state_dict = state["model"] if isinstance(state, dict) and "model" in state else state
         allow_missing_prior_parameters = bool(condition_on_prior_scale) or bool(tuple(float(value) for value in prior_scale_expert_centers_px))
+        allow_missing_gate_parameters = not any(str(key).startswith("measurement_gate_head.") for key in state_dict.keys())
         model.load_state_dict(
-            state["model"] if isinstance(state, dict) and "model" in state else state,
-            strict=not allow_missing_prior_parameters,
+            state_dict,
+            strict=not (allow_missing_prior_parameters or allow_missing_gate_parameters),
         )
     if bool(train_dustbin_head_only):
         for parameter in model.parameters():
@@ -1235,10 +1610,31 @@ def train_rgb_patch_measurement_branch(
     trainable_parameter_count = int(sum(parameter.numel() for parameter in trainable_parameters))
     query_cache: dict[str, torch.Tensor] = {}
     render_cache: dict[str, torch.Tensor] = {}
+    residual_sampler: _ResidualBalancedBatchSampler | None = None
+    if bool(residual_balanced_sampling):
+        residual_sampler = _ResidualBalancedBatchSampler(
+            train_rows,
+            residual_bin_edges_px=tuple(float(value) for value in residual_sampling_bins_px),
+            target_x_key=str(target_x_key),
+            target_y_key=str(target_y_key),
+            search_radius_px=float(effective_search_radius_px),
+        )
+    residual_sampling_summary: dict[str, Any] = (
+        {
+            "enabled": False,
+            "residual_bin_edges_px": [float(value) for value in residual_sampling_bins_px],
+            "row_count": int(len(train_rows)),
+        }
+        if residual_sampler is None
+        else dict(residual_sampler.summary)
+    )
     final_metrics: dict[str, float] = {}
     for _step in range(int(steps)):
         model.train()
-        batch_rows = [train_rows[rng.randrange(len(train_rows))] for _ in range(int(batch_size))]
+        if residual_sampler is None:
+            batch_rows = [train_rows[rng.randrange(len(train_rows))] for _ in range(int(batch_size))]
+        else:
+            batch_rows = residual_sampler.sample_batch(batch_size=int(batch_size), rng=rng)
         query_patch, render_patch, target, _baseline, target_is_dustbin = _stack_patch_batch(
             batch_rows,
             image_root=Path(image_root),
@@ -1260,8 +1656,23 @@ def train_rgb_patch_measurement_branch(
             target_y_key=str(target_y_key),
             image_cache_device=image_cache_device,
         )
+        query_patch, render_patch, target, target_is_dustbin = _append_roll_hard_negatives(
+            query_patch,
+            render_patch,
+            target,
+            target_is_dustbin,
+            fraction=float(hard_negative_fraction),
+        )
         prior_scale = _prior_scale_batch(batch_rows, prior_scale_key=str(prior_scale_key))
+        if prior_scale is not None and int(query_patch.shape[0]) != int(prior_scale.shape[0]):
+            extra = int(query_patch.shape[0]) - int(prior_scale.shape[0])
+            if extra > 0:
+                prior_scale = torch.cat([prior_scale, prior_scale[:extra]], dim=0)
         sample_weight = _sample_weight_batch(batch_rows, loss_weight_key=str(loss_weight_key))
+        if sample_weight is not None and int(query_patch.shape[0]) != int(sample_weight.shape[0]):
+            extra = int(query_patch.shape[0]) - int(sample_weight.shape[0])
+            if extra > 0:
+                sample_weight = torch.cat([sample_weight, sample_weight[:extra]], dim=0)
         pred0 = _forward_patch_prediction(
             model=model,
             parallel_forward=parallel_forward,
@@ -1275,7 +1686,7 @@ def train_rgb_patch_measurement_branch(
             pred0.direct_log_sigma_xy,
             target.to(torch_device),
             dustbin_logit=pred0.dustbin_logit,
-            search_radius_px=float(search_radius_px),
+            search_radius_px=model.measurement_search_radius_px,
             target_is_dustbin=None if target_is_dustbin is None else target_is_dustbin.to(torch_device),
             sample_weight=None if sample_weight is None else sample_weight.to(torch_device),
             dustbin_positive_weight=float(dustbin_positive_weight),
@@ -1285,7 +1696,7 @@ def train_rgb_patch_measurement_branch(
             pred0.offsets_xy,
             target.to(torch_device),
             dustbin_logit=pred0.dustbin_logit,
-            search_radius_px=float(search_radius_px),
+            search_radius_px=model.measurement_search_radius_px,
             epe_weight=float(epe_weight),
             dustbin_bce_weight=float(dustbin_bce_weight),
             dustbin_positive_weight=float(dustbin_positive_weight),
@@ -1293,7 +1704,44 @@ def train_rgb_patch_measurement_branch(
             target_heatmap_sigma_px=float(target_heatmap_sigma_px),
             sample_weight=None if sample_weight is None else sample_weight.to(torch_device),
         )
+        coarse_loss, coarse_pred = _coarse_stage_likelihood_loss(
+            pred0,
+            target.to(torch_device),
+            search_radius_px=model.measurement_search_radius_px,
+            target_is_dustbin=None if target_is_dustbin is None else target_is_dustbin.to(torch_device),
+            sample_weight=None if sample_weight is None else sample_weight.to(torch_device),
+            dustbin_positive_weight=float(dustbin_positive_weight),
+            target_heatmap_sigma_px=float(target_heatmap_sigma_px),
+        )
+        gated_delta_loss = None
+        if pred0.gated_mean_offset_xy is not None:
+            gated_delta_loss, _gated_pred = residual_delta_gaussian_nll(
+                pred0.gated_mean_offset_xy,
+                pred0.direct_log_sigma_xy,
+                target.to(torch_device),
+                dustbin_logit=pred0.dustbin_logit,
+                search_radius_px=model.measurement_search_radius_px,
+                target_is_dustbin=None if target_is_dustbin is None else target_is_dustbin.to(torch_device),
+                sample_weight=None if sample_weight is None else sample_weight.to(torch_device),
+                dustbin_positive_weight=float(dustbin_positive_weight),
+            )
+        gate_supervision_loss = _gate_supervision_loss(
+            pred0,
+            target.to(torch_device),
+            target_is_dustbin=None if target_is_dustbin is None else target_is_dustbin.to(torch_device),
+            sample_weight=None if sample_weight is None else sample_weight.to(torch_device),
+            center_radius_px=float(gate_center_radius_px),
+            full_radius_px=float(gate_full_radius_px),
+            target_mode=str(gate_target_mode),
+            utility_temperature_px=float(gate_utility_temperature_px),
+        )
         loss = float(delta_loss_weight) * delta_loss + float(likelihood_loss_weight) * likelihood_loss
+        if gated_delta_loss is not None:
+            loss = loss + float(gated_delta_loss_weight) * gated_delta_loss
+        if gate_supervision_loss is not None:
+            loss = loss + float(gate_supervision_loss_weight) * gate_supervision_loss
+        if coarse_loss is not None:
+            loss = loss + float(coarse_likelihood_loss_weight) * coarse_loss
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
@@ -1302,13 +1750,30 @@ def train_rgb_patch_measurement_branch(
             final_metrics = {
                 "loss": float(loss.detach().cpu().item()),
                 "delta_loss": float(delta_loss.detach().cpu().item()),
+                "gated_delta_loss": None if gated_delta_loss is None else float(gated_delta_loss.detach().cpu().item()),
+                "gate_supervision_loss": (
+                    None if gate_supervision_loss is None else float(gate_supervision_loss.detach().cpu().item())
+                ),
                 "likelihood_loss": float(likelihood_loss.detach().cpu().item()),
+                "coarse_likelihood_loss": None if coarse_loss is None else float(coarse_loss.detach().cpu().item()),
                 "epe_px": float(torch.mean(epe).item()),
                 "recall_0p5px": float(torch.mean((epe <= 0.5).float()).item()),
                 "recall_1px": float(torch.mean((epe <= 1.0).float()).item()),
                 "likelihood_epe_px": float(torch.mean(likelihood_pred.epe_px.detach().cpu()).item()),
                 "likelihood_recall_0p5px": float(torch.mean((likelihood_pred.epe_px.detach().cpu() <= 0.5).float()).item()),
             }
+            if pred0.gated_mean_offset_xy is not None:
+                gated_epe = torch.linalg.norm(pred0.gated_mean_offset_xy.detach().cpu() - target.detach().cpu(), dim=1)
+                final_metrics.update(
+                    {
+                        "gated_epe_px": float(torch.mean(gated_epe).item()),
+                        "gated_recall_0p5px": float(torch.mean((gated_epe <= 0.5).float()).item()),
+                        "gated_recall_1px": float(torch.mean((gated_epe <= 1.0).float()).item()),
+                        "gate_probability_mean": (
+                            None if pred0.gate_probability is None else float(torch.mean(pred0.gate_probability.detach().cpu()).item())
+                        ),
+                    }
+                )
             if likelihood_pred.mode_offset_xy is not None:
                 mode_epe = torch.linalg.norm(likelihood_pred.mode_offset_xy.detach().cpu() - target.detach().cpu(), dim=1)
                 final_metrics.update(
@@ -1316,6 +1781,15 @@ def train_rgb_patch_measurement_branch(
                         "mode_epe_px": float(torch.mean(mode_epe).item()),
                         "mode_recall_0p5px": float(torch.mean((mode_epe <= 0.5).float()).item()),
                         "mode_recall_1px": float(torch.mean((mode_epe <= 1.0).float()).item()),
+                    }
+                )
+            if coarse_pred is not None:
+                coarse_epe = coarse_pred.epe_px.detach().cpu()
+                final_metrics.update(
+                    {
+                        "coarse_epe_px": float(torch.mean(coarse_epe).item()),
+                        "coarse_recall_0p5px": float(torch.mean((coarse_epe <= 0.5).float()).item()),
+                        "coarse_recall_1px": float(torch.mean((coarse_epe <= 1.0).float()).item()),
                     }
                 )
     eval_batch = max(1, int(eval_batch_size)) if eval_batch_size is not None else max(1, min(int(batch_size), 16))
@@ -1341,7 +1815,14 @@ def train_rgb_patch_measurement_branch(
         max_eval_rows=None,
         epe_weight=float(epe_weight),
         likelihood_loss_weight=float(likelihood_loss_weight),
+        coarse_likelihood_loss_weight=float(coarse_likelihood_loss_weight),
         delta_loss_weight=float(delta_loss_weight),
+        gated_delta_loss_weight=float(gated_delta_loss_weight),
+        gate_supervision_loss_weight=float(gate_supervision_loss_weight),
+        gate_center_radius_px=float(gate_center_radius_px),
+        gate_full_radius_px=float(gate_full_radius_px),
+        gate_target_mode=str(gate_target_mode),
+        gate_utility_temperature_px=float(gate_utility_temperature_px),
         dustbin_bce_weight=float(dustbin_bce_weight),
         dustbin_positive_weight=float(dustbin_positive_weight),
         target_heatmap_sigma_px=float(target_heatmap_sigma_px),
@@ -1371,7 +1852,14 @@ def train_rgb_patch_measurement_branch(
         max_eval_rows=None,
         epe_weight=float(epe_weight),
         likelihood_loss_weight=float(likelihood_loss_weight),
+        coarse_likelihood_loss_weight=float(coarse_likelihood_loss_weight),
         delta_loss_weight=float(delta_loss_weight),
+        gated_delta_loss_weight=float(gated_delta_loss_weight),
+        gate_supervision_loss_weight=float(gate_supervision_loss_weight),
+        gate_center_radius_px=float(gate_center_radius_px),
+        gate_full_radius_px=float(gate_full_radius_px),
+        gate_target_mode=str(gate_target_mode),
+        gate_utility_temperature_px=float(gate_utility_temperature_px),
         dustbin_bce_weight=float(dustbin_bce_weight),
         dustbin_positive_weight=float(dustbin_positive_weight),
         target_heatmap_sigma_px=float(target_heatmap_sigma_px),
@@ -1393,9 +1881,12 @@ def train_rgb_patch_measurement_branch(
                 "search_radius_px": float(search_radius_px),
                 "context_radius_px": float(context_radius_px),
                 "step_px": float(step_px),
+                "coarse_search_radius_px": None if coarse_search_radius_px is None else float(coarse_search_radius_px),
+                "coarse_step_px": None if coarse_step_px is None else float(coarse_step_px),
                 "feature_dim": int(feature_dim),
                 "hidden_dim": None if hidden_dim is None else int(hidden_dim),
                 "input_mode": str(input_mode),
+                "encoder_arch": str(encoder_arch),
                 "template_scale_factors": [float(value) for value in template_scale_factors],
                 "condition_on_prior_scale": bool(condition_on_prior_scale),
                 "prior_scale_expert_centers_px": [float(value) for value in prior_scale_expert_centers_px],
@@ -1442,11 +1933,16 @@ def train_rgb_patch_measurement_branch(
         "requested_data_parallel_device_ids": requested_data_parallel_ids,
         "active_data_parallel_device_ids": active_data_parallel_ids,
         "search_radius_px": float(search_radius_px),
+        "coarse_search_radius_px": None if coarse_search_radius_px is None else float(coarse_search_radius_px),
+        "coarse_step_px": None if coarse_step_px is None else float(coarse_step_px),
+        "measurement_search_radius_px": float(model.measurement_search_radius_px),
         "context_radius_px": float(context_radius_px),
         "step_px": float(step_px),
         "input_mode": str(input_mode),
+        "encoder_arch": str(encoder_arch),
         "template_scale_factors": [float(value) for value in template_scale_factors],
         "render_patch_augmentation": str(render_patch_augmentation),
+        "hard_negative_fraction": float(hard_negative_fraction),
         "train_dustbin_head_only": bool(train_dustbin_head_only),
         "condition_on_prior_scale": bool(condition_on_prior_scale),
         "prior_scale_key": str(prior_scale_key),
@@ -1459,10 +1955,19 @@ def train_rgb_patch_measurement_branch(
         "target_dustbin_filter": str(target_dustbin_filter),
         "baseline_epe_min_px": None if baseline_epe_min_px is None else float(baseline_epe_min_px),
         "baseline_epe_max_px": None if baseline_epe_max_px is None else float(baseline_epe_max_px),
+        "residual_balanced_sampling": bool(residual_balanced_sampling),
+        "residual_sampling": residual_sampling_summary,
         "parameter_count": int(parameter_count),
         "trainable_parameter_count": int(trainable_parameter_count),
         "delta_loss_weight": float(delta_loss_weight),
+        "gated_delta_loss_weight": float(gated_delta_loss_weight),
+        "gate_supervision_loss_weight": float(gate_supervision_loss_weight),
+        "gate_center_radius_px": float(gate_center_radius_px),
+        "gate_full_radius_px": float(gate_full_radius_px),
+        "gate_target_mode": str(gate_target_mode),
+        "gate_utility_temperature_px": float(gate_utility_temperature_px),
         "likelihood_loss_weight": float(likelihood_loss_weight),
+        "coarse_likelihood_loss_weight": float(coarse_likelihood_loss_weight),
         "dustbin_bce_weight": float(dustbin_bce_weight),
         "dustbin_positive_weight": float(dustbin_positive_weight),
         "target_heatmap_sigma_px": float(target_heatmap_sigma_px),
@@ -1500,6 +2005,13 @@ def train_rgb_patch_measurement_branch(
                 median_epe_threshold_px=float(gate_median_epe_px),
                 improve_ratio_threshold=float(gate_improve_ratio),
             ),
+            "gated_head": _passes_measurement_gate(
+                val_metrics,
+                median_epe_key="gated_valid_epe_median_px",
+                improve_ratio_key="gated_valid_improve_ratio",
+                median_epe_threshold_px=float(gate_median_epe_px),
+                improve_ratio_threshold=float(gate_improve_ratio),
+            ),
             "residual_bin_gates": {
                 "direct_head": _residual_bin_gate_summary(
                     val_metrics,
@@ -1516,6 +2028,12 @@ def train_rgb_patch_measurement_branch(
                 "mode_head": _residual_bin_gate_summary(
                     val_metrics,
                     prefix="mode",
+                    median_epe_threshold_px=float(gate_median_epe_px),
+                    improve_ratio_threshold=float(gate_improve_ratio),
+                ),
+                "gated_head": _residual_bin_gate_summary(
+                    val_metrics,
+                    prefix="gated",
                     median_epe_threshold_px=float(gate_median_epe_px),
                     improve_ratio_threshold=float(gate_improve_ratio),
                 ),

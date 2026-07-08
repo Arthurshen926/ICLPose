@@ -1480,7 +1480,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--matcha_train_preset",
         default="none",
-        choices=("none", "radio_matcha_patch_corr", "radio_matcha_2dgs_synthetic"),
+        choices=("none", "radio_matcha_patch_corr", "radio_matcha_2dgs_synthetic", "radio_matcha_joint_measurement"),
     )
     parser.add_argument("--layer_name", default="radio_dual")
     parser.add_argument("--feature_mode", default="radio_dual", choices=("radio_final", "radio_dual"))
@@ -1567,6 +1567,23 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--patch_corr_fine_batch_size", type=int, default=256)
     parser.add_argument("--patch_corr_fine_max_samples_per_pair", type=int, default=512)
     parser.add_argument("--patch_corr_fine_backprop_context", action="store_true")
+    parser.add_argument("--measurement_patch_loss_weight", type=float, default=0.0)
+    parser.add_argument("--measurement_patch_direct_loss_weight", type=float, default=0.25)
+    parser.add_argument("--measurement_patch_epe_weight", type=float, default=0.05)
+    parser.add_argument("--measurement_patch_dustbin_bce_weight", type=float, default=0.25)
+    parser.add_argument("--measurement_patch_batch_size", type=int, default=128)
+    parser.add_argument("--measurement_patch_max_samples_per_pair", type=int, default=512)
+    parser.add_argument("--measurement_patch_search_radius_px", type=float, default=8.0)
+    parser.add_argument("--measurement_patch_context_radius_px", type=float, default=8.0)
+    parser.add_argument("--measurement_patch_step_px", type=float, default=1.0)
+    parser.add_argument("--measurement_patch_coarse_search_radius_px", type=float, default=0.0)
+    parser.add_argument("--measurement_patch_coarse_step_px", type=float, default=0.0)
+    parser.add_argument("--measurement_patch_feature_dim", type=int, default=32)
+    parser.add_argument("--measurement_patch_hidden_dim", type=int, default=64)
+    parser.add_argument("--measurement_patch_target_heatmap_sigma_px", type=float, default=0.5)
+    parser.add_argument("--measurement_patch_dustbin_positive_weight", type=float, default=1.0)
+    parser.add_argument("--measurement_patch_encoder_arch", default="simple")
+    parser.add_argument("--measurement_patch_input_mode", default="rgb")
     parser.add_argument("--patch_correlation_loss_weight", type=float, default=0.0)
     parser.add_argument("--patch_correlation_window_size", type=int, default=3)
     parser.add_argument("--hard_negative_weight", type=float, default=0.1)
@@ -1586,6 +1603,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--head_lr_scale", type=float, default=1.0)
     parser.add_argument("--validation_interval", type=int, default=0)
     parser.add_argument("--validation_pair_count", type=int, default=8)
+    parser.add_argument("--final_validation_pair_count", type=int, default=-1)
+    parser.add_argument("--log_interval", type=int, default=0)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--builder_device", default="")
     parser.add_argument("--radio_version", default="c-radio_v4-h")
@@ -1615,6 +1634,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         args.local_window_fine_mode = "correlation"
         args.patch_correlation_loss_weight = 0.0
         args.patch_corr_fine_loss_weight = 0.0
+    if str(args.matcha_train_preset) == "radio_matcha_joint_measurement":
+        args.fine_supervision_source = "render_subcell_stratified"
+        args.local_window_fine_loss_weight = 0.0
+        args.patch_corr_fine_loss_weight = 0.0
+        args.patch_correlation_loss_weight = 0.0
+        args.measurement_patch_loss_weight = 1.0
+        args.measurement_patch_direct_loss_weight = 0.25
+        args.measurement_patch_epe_weight = 0.05
+        args.measurement_patch_dustbin_bce_weight = 0.25
     if args.render_pair_fine_loss_weight is not None:
         args.pair_fine_loss_weight = float(args.render_pair_fine_loss_weight)
     return args
@@ -1663,6 +1691,23 @@ def main(argv: Sequence[str] | None = None) -> None:
         patch_corr_fine_batch_size=int(args.patch_corr_fine_batch_size),
         patch_corr_fine_max_samples_per_pair=int(args.patch_corr_fine_max_samples_per_pair),
         patch_corr_fine_detach_context=not bool(args.patch_corr_fine_backprop_context),
+        measurement_patch_loss_weight=float(args.measurement_patch_loss_weight),
+        measurement_patch_direct_loss_weight=float(args.measurement_patch_direct_loss_weight),
+        measurement_patch_epe_weight=float(args.measurement_patch_epe_weight),
+        measurement_patch_dustbin_bce_weight=float(args.measurement_patch_dustbin_bce_weight),
+        measurement_patch_batch_size=int(args.measurement_patch_batch_size),
+        measurement_patch_max_samples_per_pair=int(args.measurement_patch_max_samples_per_pair),
+        measurement_patch_search_radius_px=float(args.measurement_patch_search_radius_px),
+        measurement_patch_context_radius_px=float(args.measurement_patch_context_radius_px),
+        measurement_patch_step_px=float(args.measurement_patch_step_px),
+        measurement_patch_coarse_search_radius_px=float(args.measurement_patch_coarse_search_radius_px),
+        measurement_patch_coarse_step_px=float(args.measurement_patch_coarse_step_px),
+        measurement_patch_feature_dim=int(args.measurement_patch_feature_dim),
+        measurement_patch_hidden_dim=int(args.measurement_patch_hidden_dim),
+        measurement_patch_target_heatmap_sigma_px=float(args.measurement_patch_target_heatmap_sigma_px),
+        measurement_patch_dustbin_positive_weight=float(args.measurement_patch_dustbin_positive_weight),
+        measurement_patch_encoder_arch=str(args.measurement_patch_encoder_arch),
+        measurement_patch_input_mode=str(args.measurement_patch_input_mode),
         patch_correlation_loss_weight=float(args.patch_correlation_loss_weight),
         patch_correlation_window_size=int(args.patch_correlation_window_size),
         hard_negative_weight=float(args.hard_negative_weight),
@@ -1831,6 +1876,25 @@ def main(argv: Sequence[str] | None = None) -> None:
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
+        if int(args.log_interval) > 0 and ((int(step) + 1) % int(args.log_interval) == 0):
+            log_row = {
+                "step": int(step) + 1,
+                "loss": float(loss.detach().cpu().item()),
+                "pair_type": str(row.get("pair_type", "")),
+                "query_id": str(row.get("query_id", "")),
+            }
+            for key in (
+                "measurement_patch_center_epe_px",
+                "measurement_patch_mean_epe_px",
+                "measurement_patch_mode_epe_px",
+                "measurement_patch_mean_improve_ratio",
+                "measurement_patch_mode_improve_ratio",
+                "measurement_patch_target_in_window_ratio",
+                "map_descriptor_top1_acc",
+            ):
+                if key in last_metrics:
+                    log_row[key] = float(last_metrics[key])
+            print(json.dumps(log_row, sort_keys=True), flush=True)
         if int(args.validation_interval) > 0 and ((int(step) + 1) % int(args.validation_interval) == 0):
             maybe_validate(int(step) + 1)
     if val_manifest is not None and (not validation_history or int(validation_history[-1]["step"]) != int(cfg.steps)):
@@ -1838,6 +1902,54 @@ def main(argv: Sequence[str] | None = None) -> None:
     if best_state is not None:
         model.load_state_dict(best_state)
     final_loss = _loss_value_for_samples(model, last_samples, cfg, device, seed=int(cfg.seed) + int(cfg.steps) + 1)
+
+    def final_validation_metrics() -> dict[str, object]:
+        final_count_arg = int(args.final_validation_pair_count)
+        requested_count = int(args.validation_pair_count) if final_count_arg < 0 else final_count_arg
+        if val_manifest is None or val_builder is None or requested_count <= 0:
+            return {}
+        rows: list[dict[str, float]] = []
+        pair_rows: list[dict[str, object]] = []
+        failures: list[dict[str, object]] = []
+        count = min(int(requested_count), int(len(val_manifest.records)))
+        for item, record in enumerate(val_manifest.records[:count]):
+            try:
+                samples, row = val_builder.build(record)
+            except Exception as exc:
+                failures.append(
+                    {
+                        "index": int(item),
+                        "query_id": str(record.query_id),
+                        "pair_type": str(record.pair_type),
+                        "error": str(exc),
+                    }
+                )
+                continue
+            row = dict(row)
+            row["training_source"] = "validation_final"
+            metrics = _evaluate(model, samples, cfg, device)
+            rows.append({str(key): float(value) for key, value in metrics.items() if isinstance(value, (int, float))})
+            pair_rows.append(dict(row))
+        if not rows:
+            return {
+                "validation_final_eval_count": 0,
+                "validation_final_failed_count": int(len(failures)),
+                "validation_final_failures": failures,
+            }
+        keys = sorted({key for row in rows for key in row})
+        mean_metrics = {
+            key: float(np.mean([row[key] for row in rows if key in row]))
+            for key in keys
+            if any(key in row for row in rows)
+        }
+        return {
+            "validation_final_eval_count": int(len(rows)),
+            "validation_final_failed_count": int(len(failures)),
+            "validation_final_metrics": mean_metrics,
+            "validation_final_pairs": pair_rows,
+            "validation_final_failures": failures,
+        }
+
     all_train_records = [record for source in training_sources for record in source.manifest.records]
     manifest_pair_type_counts: dict[str, int] = {}
     for record in all_train_records:
@@ -1894,6 +2006,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             }
         )
     summary.update(_evaluate(model, last_samples, cfg, device))
+    summary.update(final_validation_metrics())
     run = MatchaJointTrainingRun(model=model.cpu().eval(), summary=summary)
     adapter_run = joint_run_as_coarse_fine_adapter_run(run)
     save_matcha_coarse_fine_adapter(adapter_run, Path(args.output_model))

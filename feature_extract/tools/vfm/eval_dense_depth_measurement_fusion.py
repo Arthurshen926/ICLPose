@@ -197,7 +197,10 @@ def _aggregate_pose_rows(rows: Sequence[Mapping[str, Any]], measurement_summary:
 
 
 def _candidate_id(row: Mapping[str, Any]) -> str:
-    for name in ("candidate_id", "render_pose_id", "render_pose_label", "initial_render_pose_label"):
+    # Many match tables use candidate_id for match-level/top-L cell candidates,
+    # not for pose hypotheses. Treat only explicit pose-level fields as a pose
+    # group key; otherwise the correct grouping is query-level.
+    for name in ("render_pose_id", "pose_candidate_label", "initial_render_pose_label", "render_pose_label"):
         value = row.get(name)
         if value is not None and str(value).strip():
             return str(value).strip()

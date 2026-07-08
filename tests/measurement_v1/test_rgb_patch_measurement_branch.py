@@ -9,6 +9,9 @@ from PIL import Image
 
 from feature_extract.vfm.measurement_v1.rgb_patch_measurement_branch import (
     RGBPatchMeasurementBranch,
+    RGBPatchMeasurementPrediction,
+    TexturePatchEncoder,
+    coarse_to_fine_template_search_cost_volume_logits,
     continuous_offset_nll_with_dustbin,
     cost_volume_quality_features,
     crop_rgb_window,
@@ -386,6 +389,123 @@ def test_continuous_offset_nll_honors_per_row_sample_weight() -> None:
     assert weighted_loss.item() < unweighted_loss.item() * 0.1
 
 
+def test_coarse_stage_likelihood_loss_supervises_two_stage_coarse_logits() -> None:
+    coarse_offsets = local_offset_grid(search_radius_px=1.0, step_px=1.0)
+    target = torch.tensor([[1.0, 0.0]], dtype=torch.float32)
+    dustbin = torch.tensor([-10.0], dtype=torch.float32)
+    correct = RGBPatchMeasurementPrediction(
+        logits=torch.empty((1, 0), dtype=torch.float32),
+        offsets_xy=torch.empty((0, 2), dtype=torch.float32),
+        dustbin_logit=dustbin,
+        coarse_logits=-torch.sum((coarse_offsets[None] - target[:, None]) ** 2, dim=2) * 10.0,
+        coarse_offsets_xy=coarse_offsets,
+    )
+    wrong = RGBPatchMeasurementPrediction(
+        logits=torch.empty((1, 0), dtype=torch.float32),
+        offsets_xy=torch.empty((0, 2), dtype=torch.float32),
+        dustbin_logit=dustbin,
+        coarse_logits=-torch.sum((coarse_offsets[None] - torch.tensor([[[-1.0, 0.0]]])) ** 2, dim=2) * 10.0,
+        coarse_offsets_xy=coarse_offsets,
+    )
+
+    correct_loss, _ = rgb_patch_training._coarse_stage_likelihood_loss(
+        correct,
+        target,
+        search_radius_px=1.0,
+        target_is_dustbin=None,
+        sample_weight=None,
+        dustbin_positive_weight=1.0,
+        target_heatmap_sigma_px=0.0,
+    )
+    wrong_loss, _ = rgb_patch_training._coarse_stage_likelihood_loss(
+        wrong,
+        target,
+        search_radius_px=1.0,
+        target_is_dustbin=None,
+        sample_weight=None,
+        dustbin_positive_weight=1.0,
+        target_heatmap_sigma_px=0.0,
+    )
+
+    assert correct_loss.item() < wrong_loss.item()
+
+
+def test_gate_supervision_loss_teaches_center_preserve_and_large_residual_correction() -> None:
+    pred = RGBPatchMeasurementPrediction(
+        logits=torch.empty((2, 0), dtype=torch.float32),
+        offsets_xy=torch.empty((0, 2), dtype=torch.float32),
+        dustbin_logit=torch.zeros((2,), dtype=torch.float32),
+        gate_logit=torch.tensor([-4.0, 4.0], dtype=torch.float32),
+    )
+    target = torch.tensor([[0.25, 0.0], [2.0, 0.0]], dtype=torch.float32)
+
+    good = rgb_patch_training._gate_supervision_loss(
+        pred,
+        target,
+        target_is_dustbin=None,
+        sample_weight=None,
+        center_radius_px=0.5,
+        full_radius_px=2.0,
+    )
+    bad = rgb_patch_training._gate_supervision_loss(
+        RGBPatchMeasurementPrediction(
+            logits=torch.empty((2, 0), dtype=torch.float32),
+            offsets_xy=torch.empty((0, 2), dtype=torch.float32),
+            dustbin_logit=torch.zeros((2,), dtype=torch.float32),
+            gate_logit=torch.tensor([4.0, -4.0], dtype=torch.float32),
+        ),
+        target,
+        target_is_dustbin=None,
+        sample_weight=None,
+        center_radius_px=0.5,
+        full_radius_px=2.0,
+    )
+
+    assert good is not None
+    assert bad is not None
+    assert good.item() < bad.item()
+
+
+def test_gate_supervision_loss_can_target_likelihood_utility() -> None:
+    target = torch.tensor([[1.0, 0.0], [1.0, 0.0]], dtype=torch.float32)
+    good = rgb_patch_training._gate_supervision_loss(
+        RGBPatchMeasurementPrediction(
+            logits=torch.empty((2, 0), dtype=torch.float32),
+            offsets_xy=torch.empty((0, 2), dtype=torch.float32),
+            dustbin_logit=torch.zeros((2,), dtype=torch.float32),
+            mean_offset_xy=torch.tensor([[1.0, 0.0], [3.0, 0.0]], dtype=torch.float32),
+            gate_logit=torch.tensor([4.0, -4.0], dtype=torch.float32),
+        ),
+        target,
+        target_is_dustbin=None,
+        sample_weight=None,
+        center_radius_px=0.5,
+        full_radius_px=2.0,
+        target_mode="utility",
+        utility_temperature_px=0.1,
+    )
+    bad = rgb_patch_training._gate_supervision_loss(
+        RGBPatchMeasurementPrediction(
+            logits=torch.empty((2, 0), dtype=torch.float32),
+            offsets_xy=torch.empty((0, 2), dtype=torch.float32),
+            dustbin_logit=torch.zeros((2,), dtype=torch.float32),
+            mean_offset_xy=torch.tensor([[1.0, 0.0], [3.0, 0.0]], dtype=torch.float32),
+            gate_logit=torch.tensor([-4.0, 4.0], dtype=torch.float32),
+        ),
+        target,
+        target_is_dustbin=None,
+        sample_weight=None,
+        center_radius_px=0.5,
+        full_radius_px=2.0,
+        target_mode="utility",
+        utility_temperature_px=0.1,
+    )
+
+    assert good is not None
+    assert bad is not None
+    assert good.item() < bad.item()
+
+
 def test_dustbin_probability_is_independent_of_spatial_softmax_scale() -> None:
     offsets = local_offset_grid(search_radius_px=1.0, step_px=0.5)
     target = torch.tensor([[0.0, 0.0]], dtype=torch.float32)
@@ -416,6 +536,44 @@ def test_rgb_patch_measurement_branch_outputs_dense_offset_likelihood() -> None:
     assert pred.direct_mean_offset_xy is not None
     assert pred.direct_log_sigma_xy is not None
     assert pred.direct_mean_offset_xy.shape == (2, 2)
+    assert pred.gated_mean_offset_xy is not None
+    assert pred.gate_probability is not None
+    assert pred.gated_mean_offset_xy.shape == (2, 2)
+    assert pred.gate_probability.shape == (2,)
+    assert torch.all(pred.gate_probability >= 0.0)
+    assert torch.all(pred.gate_probability <= 1.0)
+
+
+def test_texture_patch_encoder_fpn_arch_outputs_dense_normalized_features() -> None:
+    encoder = TexturePatchEncoder(feature_dim=12, hidden_dim=16, input_mode="norm_graygrad", encoder_arch="fpn")
+    patch = torch.rand((2, 3, 17, 17), dtype=torch.float32)
+
+    feat = encoder(patch)
+
+    assert feat.shape == (2, 12, 17, 17)
+    assert torch.all(torch.isfinite(feat))
+    norms = torch.linalg.norm(feat, dim=1)
+    assert torch.allclose(norms, torch.ones_like(norms), atol=1e-4)
+
+
+def test_rgb_patch_measurement_branch_accepts_fpn_encoder_arch() -> None:
+    branch = RGBPatchMeasurementBranch(
+        search_radius_px=1.0,
+        context_radius_px=1.0,
+        step_px=0.5,
+        feature_dim=12,
+        hidden_dim=16,
+        input_mode="norm_graygrad",
+        encoder_arch="fpn",
+    )
+    query_patch = torch.rand((2, 3, 9, 9), dtype=torch.float32)
+    render_patch = torch.rand((2, 3, 9, 9), dtype=torch.float32)
+
+    pred = branch.forward_from_patches(query_patch, render_patch)
+
+    assert pred.logits.shape == (2, 25)
+    assert pred.mean_offset_xy is not None
+    assert pred.gated_mean_offset_xy is not None
 
 
 def test_rgb_patch_measurement_branch_accepts_template_scale_factors() -> None:
@@ -434,6 +592,109 @@ def test_rgb_patch_measurement_branch_accepts_template_scale_factors() -> None:
     assert pred.logits.shape == (2, 9)
     assert pred.offsets_xy.shape == (9, 2)
     assert branch.template_scale_factors == (0.75, 1.0, 1.25)
+
+
+def test_rgb_patch_measurement_branch_can_use_two_stage_coarse_to_fine_search() -> None:
+    branch = RGBPatchMeasurementBranch(
+        coarse_search_radius_px=2.0,
+        coarse_step_px=1.0,
+        search_radius_px=0.5,
+        context_radius_px=1.0,
+        step_px=0.5,
+        feature_dim=8,
+    )
+    query_patch = torch.rand((2, 3, 15, 15), dtype=torch.float32)
+    render_patch = torch.rand((2, 3, 15, 15), dtype=torch.float32)
+
+    pred = branch.forward_from_patches(query_patch, render_patch)
+
+    assert branch.crop_radius_px == 3.5
+    assert branch.measurement_search_radius_px == 2.5
+    assert pred.logits.shape == (2, 9)
+    assert pred.offsets_xy.shape == (2, 9, 2)
+    assert pred.coarse_logits is not None
+    assert pred.coarse_offsets_xy is not None
+    assert pred.coarse_mode_offset_xy is not None
+    assert pred.coarse_logits.shape == (2, 25)
+    assert pred.coarse_offsets_xy.shape == (25, 2)
+    assert pred.coarse_mode_offset_xy.shape == (2, 2)
+
+
+def test_patch_forward_only_preserves_two_stage_coarse_logits_for_training() -> None:
+    branch = RGBPatchMeasurementBranch(
+        coarse_search_radius_px=2.0,
+        coarse_step_px=1.0,
+        search_radius_px=0.5,
+        context_radius_px=1.0,
+        step_px=0.5,
+        feature_dim=8,
+    )
+    wrapper = rgb_patch_training._PatchForwardOnly(branch)
+    query_patch = torch.rand((2, 3, 15, 15), dtype=torch.float32)
+    render_patch = torch.rand((2, 3, 15, 15), dtype=torch.float32)
+
+    (
+        logits,
+        offsets,
+        dustbin,
+        likelihood_mean,
+        direct_mean,
+        direct_log_sigma,
+        gated_mean,
+        gate_logit,
+        coarse_logits,
+        coarse_offsets,
+    ) = wrapper(
+        query_patch,
+        render_patch,
+        torch.empty((0,), dtype=torch.float32),
+    )
+
+    assert logits.shape == (2, 9)
+    assert offsets.shape == (2, 9, 2)
+    assert dustbin.shape == (2,)
+    assert likelihood_mean.shape == (2, 2)
+    assert direct_mean.shape == (2, 2)
+    assert direct_log_sigma.shape == (2, 2)
+    assert gated_mean.shape == (2, 2)
+    assert gate_logit.shape == (2,)
+    assert coarse_logits is not None
+    assert coarse_offsets is not None
+    assert coarse_logits.shape == (2, 25)
+    assert coarse_offsets.shape == (2, 25, 2)
+
+
+def test_patch_forward_only_expands_single_stage_offsets_for_data_parallel_gather() -> None:
+    branch = RGBPatchMeasurementBranch(
+        search_radius_px=1.0,
+        context_radius_px=1.0,
+        step_px=0.5,
+        feature_dim=8,
+    )
+    wrapper = rgb_patch_training._PatchForwardOnly(branch)
+    query_patch = torch.rand((2, 3, 9, 9), dtype=torch.float32)
+    render_patch = torch.rand((2, 3, 9, 9), dtype=torch.float32)
+
+    (
+        logits,
+        offsets,
+        _dustbin,
+        likelihood_mean,
+        _direct_mean,
+        _direct_log_sigma,
+        _gated_mean,
+        _gate_logit,
+        _coarse_logits,
+        _coarse_offsets,
+    ) = wrapper(
+        query_patch,
+        render_patch,
+        torch.empty((0,), dtype=torch.float32),
+    )
+
+    assert logits.shape == (2, 25)
+    assert offsets.shape == (2, 25, 2)
+    assert likelihood_mean.shape == (2, 2)
 
 
 def test_rgb_patch_measurement_branch_can_condition_logits_on_prior_scale() -> None:
@@ -699,6 +960,69 @@ def test_template_search_cost_volume_supports_multiple_template_scales() -> None
     assert offsets.shape == (9, 2)
     assert query_features.grad is not None
     assert render_features.grad is not None
+
+
+def test_template_search_cost_volume_can_decouple_feature_and_output_steps() -> None:
+    query_features = torch.zeros((1, 1, 7, 7), dtype=torch.float32)
+    render_features = torch.zeros((1, 1, 7, 7), dtype=torch.float32)
+    template = torch.tensor(
+        [
+            [0.0, 1.0, 0.0],
+            [1.0, 2.0, 1.0],
+            [0.0, 1.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    render_features[0, 0, 2:5, 2:5] = template
+    query_features[0, 0, 2:5, 4:7] = template
+
+    logits, offsets = template_search_cost_volume_logits(
+        query_features,
+        render_features,
+        search_radius_px=2.0,
+        context_radius_px=1.0,
+        step_px=1.0,
+        output_step_px=2.0,
+        temperature=10.0,
+    )
+
+    assert logits.shape == (1, 9)
+    assert offsets.shape == (9, 2)
+    assert torch.allclose(offsets[torch.argmax(logits, dim=1).item()], torch.tensor([2.0, 0.0]))
+
+
+def test_coarse_to_fine_template_search_volume_centers_fine_grid_on_coarse_mode() -> None:
+    query_features = torch.zeros((1, 1, 11, 11), dtype=torch.float32)
+    render_features = torch.zeros((1, 1, 11, 11), dtype=torch.float32)
+    template = torch.tensor(
+        [
+            [0.0, 1.0, 0.0],
+            [1.0, 2.0, 1.0],
+            [0.0, 1.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    render_features[0, 0, 4:7, 4:7] = template
+    query_features[0, 0, 5:8, 6:9] = template
+
+    fine_logits, fine_offsets, coarse_logits, coarse_offsets = coarse_to_fine_template_search_cost_volume_logits(
+        query_features,
+        render_features,
+        coarse_search_radius_px=3.0,
+        coarse_step_px=1.0,
+        fine_search_radius_px=1.0,
+        fine_step_px=1.0,
+        context_radius_px=1.0,
+        feature_step_px=1.0,
+        temperature=10.0,
+    )
+
+    assert coarse_logits.shape == (1, 49)
+    assert coarse_offsets.shape == (49, 2)
+    assert torch.allclose(coarse_offsets[torch.argmax(coarse_logits, dim=1).item()], torch.tensor([2.0, 1.0]))
+    assert fine_logits.shape == (1, 9)
+    assert fine_offsets.shape == (1, 9, 2)
+    assert torch.allclose(fine_offsets[0, torch.argmax(fine_logits, dim=1).item()], torch.tensor([2.0, 1.0]))
 
 
 def test_cost_volume_quality_features_capture_peakiness_without_absolute_logit_scale() -> None:

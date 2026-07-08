@@ -11,6 +11,7 @@ from PIL import Image
 from feature_extract.vfm.measurement_v1.rgb_patch_measurement_branch import TexturePatchEncoder
 from feature_extract.vfm.measurement_v1.rgb_patch_measurement_branch import RGBPatchMeasurementBranch
 from feature_extract.vfm.measurement_v1.rgb_patch_match_table_fusion import (
+    _likelihood_stats,
     apply_rgb_patch_measurements_to_match_table,
     apply_rgb_patch_measurements_to_rows,
     load_rgb_patch_measurement_branch,
@@ -59,6 +60,44 @@ def _model() -> RGBPatchMeasurementBranch:
     )
     model.eval()
     return model
+
+
+def test_load_rgb_patch_measurement_branch_preserves_two_stage_config(tmp_path: Path) -> None:
+    model = RGBPatchMeasurementBranch(
+        coarse_search_radius_px=2.0,
+        coarse_step_px=1.0,
+        search_radius_px=0.5,
+        context_radius_px=1.0,
+        step_px=0.5,
+        feature_dim=4,
+        hidden_dim=8,
+        input_mode="rgb",
+    )
+    checkpoint = tmp_path / "two_stage.pt"
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "config": {
+                "coarse_search_radius_px": 2.0,
+                "coarse_step_px": 1.0,
+                "search_radius_px": 0.5,
+                "context_radius_px": 1.0,
+                "step_px": 0.5,
+                "feature_dim": 4,
+                "hidden_dim": 8,
+                "input_mode": "rgb",
+            },
+        },
+        checkpoint,
+    )
+
+    loaded = load_rgb_patch_measurement_branch(checkpoint, device=torch.device("cpu"))
+
+    assert isinstance(loaded, RGBPatchMeasurementBranch)
+    assert loaded.coarse_search_radius_px == 2.0
+    assert loaded.coarse_step_px == 1.0
+    assert loaded.measurement_search_radius_px == 2.5
+    assert loaded.crop_radius_px == 3.5
 
 
 def test_rgb_patch_match_table_fusion_only_refines_query_side(tmp_path: Path) -> None:
@@ -172,6 +211,50 @@ def test_rgb_patch_match_table_fusion_mode_head_uses_cost_volume_peak(tmp_path: 
     assert row["measurement_mean_dy"] != ""
 
 
+def test_rgb_patch_match_table_fusion_records_total_search_radius_for_coarse_to_fine(tmp_path: Path) -> None:
+    image_root = tmp_path / "images"
+    image_root.mkdir()
+    _write_query_image(image_root / "q0.png")
+    render_cache = tmp_path / "render_q0.npz"
+    _write_render_cache(render_cache)
+    model = RGBPatchMeasurementBranch(
+        search_radius_px=0.5,
+        context_radius_px=1.0,
+        step_px=0.5,
+        coarse_search_radius_px=2.0,
+        coarse_step_px=1.0,
+        feature_dim=4,
+        hidden_dim=8,
+        input_mode="rgb",
+    )
+
+    fused_rows, summary = apply_rgb_patch_measurements_to_rows(
+        [
+            {
+                "query_id": "q0.png",
+                "query_center_x": "8.0",
+                "query_center_y": "8.0",
+                "query_gt_x": "9.0",
+                "query_gt_y": "8.0",
+                "render_x": "7.0",
+                "render_y": "6.0",
+            }
+        ],
+        image_root=image_root,
+        render_cache_by_query={"q0.png": render_cache},
+        model=model,
+        image_width=16,
+        image_height=16,
+        batch_size=1,
+        device=torch.device("cpu"),
+    )
+
+    assert float(fused_rows[0]["measurement_search_radius_px"]) == 2.5
+    assert float(fused_rows[0]["measurement_fine_search_radius_px"]) == 0.5
+    assert float(fused_rows[0]["measurement_coarse_search_radius_px"]) == 2.0
+    assert summary["center_within_measurement_window_rate"] == 1.0
+
+
 def test_rgb_patch_match_table_fusion_likelihood_mean_head_is_explicit(tmp_path: Path) -> None:
     image_root = tmp_path / "images"
     image_root.mkdir()
@@ -211,6 +294,90 @@ def test_rgb_patch_match_table_fusion_likelihood_mean_head_is_explicit(tmp_path:
     assert float(row["measurement_dy"]) == float(row["measurement_mean_dy"])
     assert row["measurement_mode_dx"] != ""
     assert row["measurement_mode_dy"] != ""
+
+
+def test_rgb_patch_match_table_fusion_can_use_gated_head(tmp_path: Path) -> None:
+    image_root = tmp_path / "images"
+    image_root.mkdir()
+    _write_query_image(image_root / "q0.png")
+    render_cache = tmp_path / "render_q0.npz"
+    _write_render_cache(render_cache)
+
+    fused_rows, summary = apply_rgb_patch_measurements_to_rows(
+        [
+            {
+                "query_id": "q0.png",
+                "match_index": "5",
+                "query_center_x": "8.0",
+                "query_center_y": "8.0",
+                "render_x": "7.0",
+                "render_y": "6.0",
+                "render_depth": "4.5",
+                "world_x": "1.0",
+                "world_y": "2.0",
+                "world_z": "3.0",
+            }
+        ],
+        image_root=image_root,
+        render_cache_by_query={"q0.png": render_cache},
+        model=_model(),
+        image_width=16,
+        image_height=16,
+        batch_size=1,
+        device=torch.device("cpu"),
+        prediction_head="gated",
+    )
+
+    row = fused_rows[0]
+    assert summary["prediction_head"] == "gated"
+    assert row["rgb_patch_prediction_head"] == "gated"
+    assert float(row["measurement_dx"]) == float(row["measurement_gated_dx"])
+    assert float(row["measurement_dy"]) == float(row["measurement_gated_dy"])
+    assert row["measurement_gate_prob"] != ""
+
+
+def test_likelihood_stats_accepts_batched_offsets_from_data_parallel() -> None:
+    logits = torch.tensor([[0.0, 2.0], [3.0, 0.0]], dtype=torch.float32)
+    offsets = torch.tensor(
+        [
+            [[0.0, 0.0], [1.0, 0.0]],
+            [[0.0, 0.0], [0.0, 2.0]],
+        ],
+        dtype=torch.float32,
+    )
+
+    stats = _likelihood_stats(logits, offsets, covariance_floor_px2=1e-4)
+
+    assert stats["mean"].shape == (2, 2)
+    assert stats["cov"].shape == (2, 2, 2)
+    assert torch.allclose(stats["peak"], torch.tensor([[1.0, 0.0], [0.0, 0.0]]))
+
+
+def test_rgb_patch_match_table_fusion_cli_accepts_gated_prediction_head() -> None:
+    from feature_extract.tools.vfm.apply_rgb_patch_measurement_to_match_table import parse_args
+
+    args = parse_args(
+        [
+            "--match_table_csv",
+            "matches.csv",
+            "--render_cache_manifest_csv",
+            "render_cache.csv",
+            "--image_root",
+            "images",
+            "--checkpoint",
+            "model.pt",
+            "--output_dir",
+            "out",
+            "--prediction_head",
+            "gated",
+            "--data_parallel_device_ids",
+            "0",
+            "1",
+        ]
+    )
+
+    assert args.prediction_head == "gated"
+    assert args.data_parallel_device_ids == [0, 1]
 
 
 def test_rgb_patch_match_table_fusion_cli_writes_dense_depth_schema(tmp_path: Path) -> None:
@@ -284,9 +451,12 @@ def test_rgb_patch_match_table_fusion_cli_writes_dense_depth_schema(tmp_path: Pa
         batch_size=1,
         device="cpu",
         base_dir=tmp_path,
+        data_parallel_device_ids=[0, 1],
     )
 
     assert summary["row_count"] == 1
+    assert summary["requested_data_parallel_device_ids"] == [0, 1]
+    assert summary["active_data_parallel_device_ids"] == []
     assert Path(summary["outputs"]["match_table_csv"]).exists()
     assert Path(summary["outputs"]["match_table_jsonl"]).exists()
     assert json.loads(Path(summary["outputs"]["summary"]).read_text())["row_count"] == 1
@@ -399,6 +569,52 @@ def test_rgb_patch_checkpoint_loader_accepts_cached_texture_projection_checkpoin
     assert pred.logits.shape == (2, 9)
     assert pred.offsets_xy.shape == (9, 2)
     assert pred.dustbin_logit.shape == (2,)
+
+
+def test_rgb_patch_checkpoint_loader_accepts_joint_measurement_branch_checkpoint(tmp_path: Path) -> None:
+    torch.manual_seed(0)
+    model = RGBPatchMeasurementBranch(
+        search_radius_px=1.0,
+        context_radius_px=1.0,
+        step_px=1.0,
+        feature_dim=4,
+        hidden_dim=8,
+        input_mode="rgb",
+    )
+    checkpoint = tmp_path / "joint.pt"
+    torch.save(
+        {
+            "format": "matcha_joint_model_v1",
+            "model_config": {
+                "measurement_patch_config": {
+                    "search_radius_px": 1.0,
+                    "context_radius_px": 1.0,
+                    "step_px": 1.0,
+                    "coarse_search_radius_px": 0.0,
+                    "coarse_step_px": 0.0,
+                    "feature_dim": 4,
+                    "hidden_dim": 8,
+                    "input_mode": "rgb",
+                    "encoder_arch": "simple",
+                }
+            },
+            "state_dict": {
+                f"measurement_patch_branch.{key}": value
+                for key, value in model.state_dict().items()
+            },
+        },
+        checkpoint,
+    )
+
+    loaded = load_rgb_patch_measurement_branch(checkpoint, device=torch.device("cpu"))
+    query_patch = torch.rand((2, 3, 5, 5), dtype=torch.float32)
+    render_patch = torch.rand((2, 3, 5, 5), dtype=torch.float32)
+    pred = loaded.forward_from_patches(query_patch, render_patch)
+
+    assert isinstance(loaded, RGBPatchMeasurementBranch)
+    assert loaded.measurement_model_type == "joint_measurement_patch_branch"
+    assert loaded.search_radius_px == 1.0
+    assert pred.logits.shape == (2, 9)
 
 
 def test_rgb_patch_match_table_fusion_can_apply_cached_texture_projection_checkpoint(tmp_path: Path) -> None:
