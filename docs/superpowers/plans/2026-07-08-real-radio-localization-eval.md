@@ -1244,7 +1244,8 @@ python feature_extract/tools/vfm/eval_real_radio_pose_localization.py \
   --image_root /hy-tmp/Cambridge_stdloc/OldHospital/processed \
   --feature_root output/vfm_tokens_radio/OldHospital/train \
   --colmap_model_dir /hy-tmp/Cambridge_stdloc/OldHospital/sparse/0 \
-  --query_pose_file /hy-tmp/Cambridge_stdloc/OldHospital/dataset_test.txt \
+  --track_observations_jsonl output/vfm/colmap_tracks/OldHospital/model_train_tracks_min2_balanced300k_v2.jsonl \
+  --query_pose_file /hy-tmp/Cambridge_stdloc/OldHospital/dataset_train.txt \
   --matcha_joint_checkpoint output/vfm/stage_r_matcha_joint/oldhospital/real_radio_joint_referenced_v1/full_epoch_14144_prefetch_accum4_joint.pt \
   --measurement_checkpoint output/vfm/stage_r_matcha_joint/oldhospital/real_radio_joint_referenced_v1/full_epoch_14144_prefetch_accum4_adapter.pt \
   --output_dir output/vfm/stage_r_matcha_joint/oldhospital/real_radio_joint_referenced_v1/eval_pose_val_smoke \
@@ -1269,7 +1270,8 @@ python feature_extract/tools/vfm/eval_real_radio_pose_localization.py \
   --image_root /hy-tmp/Cambridge_stdloc/OldHospital/processed \
   --feature_root output/vfm_tokens_radio/OldHospital/train \
   --colmap_model_dir /hy-tmp/Cambridge_stdloc/OldHospital/sparse/0 \
-  --query_pose_file /hy-tmp/Cambridge_stdloc/OldHospital/dataset_test.txt \
+  --track_observations_jsonl output/vfm/colmap_tracks/OldHospital/model_train_tracks_min2_balanced300k_v2.jsonl \
+  --query_pose_file /hy-tmp/Cambridge_stdloc/OldHospital/dataset_train.txt \
   --matcha_joint_checkpoint output/vfm/stage_r_matcha_joint/oldhospital/real_radio_joint_referenced_v1/full_epoch_14144_prefetch_accum4_joint.pt \
   --measurement_checkpoint output/vfm/stage_r_matcha_joint/oldhospital/real_radio_joint_referenced_v1/full_epoch_14144_prefetch_accum4_adapter.pt \
   --output_dir output/vfm/stage_r_matcha_joint/oldhospital/real_radio_joint_referenced_v1/eval_pose_val_200pairs \
