@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import numpy as np
 
+from feature_extract.vfm.cambridge_pose_lattice import CambridgePoseRecord
+from feature_extract.vfm.colmap_tracks import ColmapCamera
 from feature_extract.vfm.colmap_tracks import ColmapTrackObservation
 from feature_extract.vfm.localization import CoarseProposal, MeasurementResult
 from feature_extract.vfm.localization.pose_eval import build_support_observation_index
@@ -9,7 +11,10 @@ from feature_extract.vfm.localization.pose_eval import (
     ClosedLoopProposalRecord,
     convert_proposals_to_query_3d_matches,
     deduplicate_query_3d_matches,
+    evaluate_query_poses,
+    summarize_pose_rows,
 )
+from feature_extract.vfm.query_to_3d_matching import QueryTo3DMatch
 
 
 def _obs(image_id: str, track_id: int, xy: tuple[float, float]) -> ColmapTrackObservation:
@@ -138,3 +143,86 @@ def test_deduplicate_query_3d_matches_keeps_best_confidence() -> None:
     assert len(deduped) == 1
     np.testing.assert_allclose(deduped[0].xy, [2.0, 2.0])
     assert deduped[0].pnp_soft_score == 0.9
+
+
+def test_summarize_pose_rows_counts_failures_in_recall_denominator() -> None:
+    summary = summarize_pose_rows(
+        [
+            {
+                "query_id": "ok.png",
+                "success": True,
+                "translation_error_m": 0.2,
+                "rotation_error_deg": 1.0,
+                "match_count": 10,
+                "inlier_count": 7,
+                "failure_reason": "",
+            },
+            {
+                "query_id": "fail.png",
+                "success": False,
+                "translation_error_m": float("inf"),
+                "rotation_error_deg": float("inf"),
+                "match_count": 3,
+                "inlier_count": 0,
+                "failure_reason": "insufficient_matches",
+            },
+        ]
+    )
+
+    assert summary["query_count"] == 2
+    assert summary["success_count"] == 1
+    assert summary["success_rate"] == 0.5
+    assert summary["recall_0_25m_2deg"] == 0.5
+    assert summary["recall_0_5m_5deg"] == 0.5
+    assert summary["failure_counts"]["insufficient_matches"] == 1
+    assert summary["median_translation_error_m"] == 0.2
+    assert summary["median_rotation_error_deg"] == 1.0
+
+
+def test_evaluate_query_poses_solves_simple_pnp() -> None:
+    camera = ColmapCamera(camera_id=1, model_id=1, width=100, height=100, params=(80.0, 80.0, 50.0, 50.0))
+    pose = np.eye(4, dtype=np.float64)
+    gt = CambridgePoseRecord(
+        image_id="q.png",
+        camera_center=np.zeros(3, dtype=np.float64),
+        rotation_w2c=np.eye(3, dtype=np.float64),
+        pose_w2c=pose,
+    )
+    xyz_values = [
+        np.asarray([-1.0, -1.0, 4.0], dtype=np.float64),
+        np.asarray([1.0, -1.0, 4.0], dtype=np.float64),
+        np.asarray([1.0, 1.0, 4.0], dtype=np.float64),
+        np.asarray([-1.0, 1.0, 4.0], dtype=np.float64),
+        np.asarray([0.0, 0.0, 6.0], dtype=np.float64),
+        np.asarray([0.5, -0.25, 5.0], dtype=np.float64),
+    ]
+    matches = []
+    for idx, xyz in enumerate(xyz_values):
+        xy = np.asarray([80.0 * xyz[0] / xyz[2] + 50.0, 80.0 * xyz[1] / xyz[2] + 50.0], dtype=np.float64)
+        matches.append(
+            QueryTo3DMatch(
+                token_index=idx,
+                xy=xy,
+                track_id=idx,
+                xyz=xyz,
+                similarity=1.0,
+                ratio=1.0,
+                landmark_variance=0.0,
+                pnp_soft_score=1.0,
+            )
+        )
+
+    rows = evaluate_query_poses(
+        {"q.png": matches},
+        cameras_by_query={"q.png": camera},
+        gt_poses_by_query={"q.png": gt},
+        pnp_reprojection_error_px=2.0,
+        pnp_iterations=200,
+        pnp_min_inliers=4,
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["success"] is True
+    assert rows[0]["translation_error_m"] < 1e-4
+    assert rows[0]["rotation_error_deg"] < 1e-4
+    assert rows[0]["inlier_count"] >= 4

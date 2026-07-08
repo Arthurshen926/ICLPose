@@ -10,9 +10,18 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
-from feature_extract.vfm.colmap_tracks import ColmapTrackObservation
+from feature_extract.vfm.cambridge_pose_lattice import CambridgePoseRecord
+from feature_extract.vfm.colmap_tracks import ColmapCamera, ColmapTrackObservation
 from feature_extract.vfm.localization.schemas import CoarseProposal, MeasurementResult
-from feature_extract.vfm.query_to_3d_matching import QueryTo3DMatch
+from feature_extract.vfm.query_to_3d_matching import (
+    QueryTo3DMatch,
+    SpatialDiversityPnPConfig,
+    estimate_pose_pnp_ransac,
+    match_spatial_distribution_stats,
+    pnp_pose_error,
+    pnp_reprojection_residual_stats,
+    select_pnp_matches_by_spatial_diversity,
+)
 
 
 @dataclass(frozen=True)
@@ -160,3 +169,152 @@ def deduplicate_query_3d_matches(matches: Sequence[QueryTo3DMatch]) -> list[Quer
         if existing is None or current_score > existing_score:
             best[key] = match
     return [best[key] for key in sorted(best)]
+
+
+def _finite_values(rows: Sequence[Mapping[str, Any]], key: str) -> np.ndarray:
+    values = [float(row[key]) for row in rows if np.isfinite(float(row.get(key, float("inf"))))]
+    return np.asarray(values, dtype=np.float64)
+
+
+def summarize_pose_rows(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    values = [dict(row) for row in rows]
+    success_rows = [row for row in values if bool(row.get("success", False))]
+    translations = _finite_values(success_rows, "translation_error_m")
+    rotations = _finite_values(success_rows, "rotation_error_deg")
+    failure_counts: dict[str, int] = {}
+    for row in values:
+        if bool(row.get("success", False)):
+            continue
+        reason = str(row.get("failure_reason", "") or "unknown")
+        failure_counts[reason] = failure_counts.get(reason, 0) + 1
+
+    def percentile(arr: np.ndarray, q: float) -> float:
+        return float(np.percentile(arr, q)) if arr.size else float("inf")
+
+    def recall(max_t: float, max_r: float) -> float:
+        if not values:
+            return 0.0
+        passed = sum(
+            1
+            for row in success_rows
+            if float(row.get("translation_error_m", float("inf"))) <= max_t
+            and float(row.get("rotation_error_deg", float("inf"))) <= max_r
+        )
+        return float(passed / len(values))
+
+    match_counts = np.asarray([float(row.get("match_count", 0)) for row in values], dtype=np.float64)
+    inlier_counts = np.asarray([float(row.get("inlier_count", 0)) for row in values], dtype=np.float64)
+    return {
+        "query_count": int(len(values)),
+        "success_count": int(len(success_rows)),
+        "success_rate": float(len(success_rows) / len(values)) if values else 0.0,
+        "median_translation_error_m": percentile(translations, 50.0),
+        "translation_error_p90_m": percentile(translations, 90.0),
+        "median_rotation_error_deg": percentile(rotations, 50.0),
+        "rotation_error_p90_deg": percentile(rotations, 90.0),
+        "recall_0_25m_2deg": recall(0.25, 2.0),
+        "recall_0_5m_5deg": recall(0.5, 5.0),
+        "recall_5m_10deg": recall(5.0, 10.0),
+        "median_match_count": float(np.median(match_counts)) if match_counts.size else 0.0,
+        "median_inlier_count": float(np.median(inlier_counts)) if inlier_counts.size else 0.0,
+        "failure_counts": failure_counts,
+    }
+
+
+def evaluate_query_poses(
+    matches_by_query: Mapping[str, Sequence[QueryTo3DMatch]],
+    *,
+    cameras_by_query: Mapping[str, ColmapCamera],
+    gt_poses_by_query: Mapping[str, CambridgePoseRecord],
+    pnp_reprojection_error_px: float = 8.0,
+    pnp_iterations: int = 1000,
+    pnp_confidence: float = 0.999,
+    pnp_min_inliers: int = 4,
+    spatial_diversity: SpatialDiversityPnPConfig | None = None,
+) -> list[dict[str, Any]]:
+    pose_rows: list[dict[str, Any]] = []
+    for query_id in sorted(matches_by_query):
+        raw_matches = deduplicate_query_3d_matches(matches_by_query[query_id])
+        camera = cameras_by_query.get(query_id)
+        gt = gt_poses_by_query.get(query_id)
+        if camera is None:
+            pose_rows.append(
+                {
+                    "query_id": query_id,
+                    "success": False,
+                    "match_count": 0,
+                    "inlier_count": 0,
+                    "translation_error_m": float("inf"),
+                    "rotation_error_deg": float("inf"),
+                    "failure_reason": "missing_camera",
+                }
+            )
+            continue
+        if gt is None:
+            pose_rows.append(
+                {
+                    "query_id": query_id,
+                    "success": False,
+                    "match_count": 0,
+                    "inlier_count": 0,
+                    "translation_error_m": float("inf"),
+                    "rotation_error_deg": float("inf"),
+                    "failure_reason": "missing_gt_pose",
+                }
+            )
+            continue
+        matches = raw_matches
+        if spatial_diversity is not None:
+            matches = select_pnp_matches_by_spatial_diversity(
+                matches,
+                int(camera.width),
+                int(camera.height),
+                spatial_diversity,
+            )
+        if len(matches) < int(pnp_min_inliers):
+            pose_rows.append(
+                {
+                    "query_id": query_id,
+                    "success": False,
+                    "match_count": int(len(matches)),
+                    "inlier_count": 0,
+                    "translation_error_m": float("inf"),
+                    "rotation_error_deg": float("inf"),
+                    "failure_reason": "insufficient_matches",
+                }
+            )
+            continue
+        pnp = estimate_pose_pnp_ransac(
+            matches,
+            camera,
+            reprojection_error_px=float(pnp_reprojection_error_px),
+            confidence=float(pnp_confidence),
+            iterations=int(pnp_iterations),
+            min_inliers=int(pnp_min_inliers),
+            refine_method="LM",
+        )
+        error = pnp_pose_error(pnp.pose_w2c if pnp.success else None, gt.pose_w2c)
+        spatial_all = match_spatial_distribution_stats(matches, int(camera.width), int(camera.height))
+        spatial_inliers = match_spatial_distribution_stats(
+            matches,
+            int(camera.width),
+            int(camera.height),
+            pnp.inlier_mask,
+        )
+        residuals = pnp_reprojection_residual_stats(matches, pnp.pose_w2c, camera, inlier_mask=pnp.inlier_mask)
+        pose_rows.append(
+            {
+                "query_id": query_id,
+                "success": bool(pnp.success),
+                "match_count": int(len(matches)),
+                "inlier_count": int(pnp.inlier_count),
+                "inlier_ratio": float(pnp.inlier_ratio),
+                "translation_error_m": float(error.translation_m),
+                "rotation_error_deg": float(error.rotation_deg),
+                "failure_reason": "" if pnp.success else "pnp_failed",
+                "all_grid_4x4_occupancy_frac": spatial_all.get("grid_4x4_occupancy_frac"),
+                "inlier_grid_4x4_occupancy_frac": spatial_inliers.get("grid_4x4_occupancy_frac"),
+                **residuals,
+            }
+        )
+    return pose_rows
