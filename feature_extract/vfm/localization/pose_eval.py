@@ -318,3 +318,29 @@ def evaluate_query_poses(
             }
         )
     return pose_rows
+
+
+def write_mapping_rows_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        for key in row:
+            name = str(key)
+            if name not in seen:
+                seen.add(name)
+                fieldnames.append(name)
+    with output.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({name: row.get(name, "") for name in fieldnames})
+
+
+def write_mapping_rows_jsonl(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open("w") as handle:
+        for row in rows:
+            handle.write(json.dumps(dict(row), sort_keys=True) + "\n")
