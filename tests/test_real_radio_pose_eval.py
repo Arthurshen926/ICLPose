@@ -61,6 +61,18 @@ def test_support_observation_index_respects_radius_and_image_id() -> None:
     assert index.nearest("seq/missing.png", np.asarray([10.0, 10.0], dtype=np.float32), max_distance_px=4.0) is None
 
 
+def test_support_observation_index_scales_observations_to_target_image_size() -> None:
+    index = build_support_observation_index(
+        [_obs("seq/r.png", 11, (10.0, 5.0))],
+        target_image_sizes={"seq/r.png": (200, 160)},
+    )
+
+    match = index.nearest("seq/r.png", np.asarray([20.0, 10.0], dtype=np.float32), max_distance_px=0.01)
+
+    assert match is not None
+    assert match.observation.track_id == 11
+
+
 def _proposal(query_xy=(3.0, 4.0), reference_xy=(10.0, 10.0), score=0.7) -> CoarseProposal:
     return CoarseProposal(
         query_index=0,
@@ -283,7 +295,7 @@ def test_run_real_radio_pose_localization_eval_writes_artifacts(tmp_path: Path) 
         measurement_branch=FakeMeasurement(),
         cameras={1: camera},
         colmap_images={1: colmap_image},
-        colmap_observations=[_obs("r.png", 1, (50.0, 50.0))],
+        colmap_observations=[_obs("r.png", 1, (50.0, 40.0))],
         gt_poses_by_query={"q.png": gt},
         max_support_distance_px=2.0,
     )

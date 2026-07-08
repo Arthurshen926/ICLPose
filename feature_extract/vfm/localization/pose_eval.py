@@ -42,13 +42,19 @@ class NearestSupportObservation:
 class SupportObservationIndex:
     """Nearest-neighbor lookup over COLMAP observations grouped by image id."""
 
-    def __init__(self, observations: Sequence[ColmapTrackObservation]) -> None:
+    def __init__(
+        self,
+        observations: Sequence[ColmapTrackObservation],
+        *,
+        target_image_sizes: Mapping[str, tuple[int, int]] | None = None,
+    ) -> None:
+        target_sizes = {str(key): (int(value[0]), int(value[1])) for key, value in (target_image_sizes or {}).items()}
         by_image: dict[str, list[ColmapTrackObservation]] = {}
         for observation in observations:
             by_image.setdefault(str(observation.image_id), []).append(observation)
         self._by_image = {image_id: tuple(items) for image_id, items in by_image.items()}
         self._xy_by_image = {
-            image_id: np.asarray([item.xy for item in items], dtype=np.float64)
+            image_id: np.asarray([_observation_xy_for_target_size(item, target_sizes) for item in items], dtype=np.float64)
             for image_id, items in self._by_image.items()
         }
 
@@ -73,8 +79,29 @@ class SupportObservationIndex:
         return NearestSupportObservation(observation=items[best], distance_px=distance)
 
 
-def build_support_observation_index(observations: Sequence[ColmapTrackObservation]) -> SupportObservationIndex:
-    return SupportObservationIndex(observations)
+def _observation_xy_for_target_size(
+    observation: ColmapTrackObservation,
+    target_image_sizes: Mapping[str, tuple[int, int]],
+) -> tuple[float, float]:
+    xy = np.asarray(observation.xy, dtype=np.float64).reshape(2)
+    target = target_image_sizes.get(str(observation.image_id))
+    if target is None:
+        return float(xy[0]), float(xy[1])
+    source_w = int(observation.image_width or target[0])
+    source_h = int(observation.image_height or target[1])
+    if source_w <= 0 or source_h <= 0:
+        return float(xy[0]), float(xy[1])
+    scale_x = float(target[0]) / float(source_w)
+    scale_y = float(target[1]) / float(source_h)
+    return float(xy[0] * scale_x), float(xy[1] * scale_y)
+
+
+def build_support_observation_index(
+    observations: Sequence[ColmapTrackObservation],
+    *,
+    target_image_sizes: Mapping[str, tuple[int, int]] | None = None,
+) -> SupportObservationIndex:
+    return SupportObservationIndex(observations, target_image_sizes=target_image_sizes)
 
 
 @dataclass(frozen=True)
@@ -423,9 +450,11 @@ def run_real_radio_pose_localization_eval(
     model = SelectorCoarseMeasurementModel(feature_mapper, coarse_matcher, measurement_branch)
     records: list[ClosedLoopProposalRecord] = []
     proposal_rows: list[dict[str, Any]] = []
+    reference_image_sizes: dict[str, tuple[int, int]] = {}
     for pair in selected_pairs:
         query_rgb = _load_rgb_chw(Path(image_root) / pair.query_id)
         reference_rgb = _load_rgb_chw(Path(image_root) / pair.reference_image_id)
+        reference_image_sizes[str(pair.reference_image_id)] = (int(reference_rgb.shape[2]), int(reference_rgb.shape[1]))
         query_feature = _load_feature_map(
             _resolve_path(pair.query_feature_path, base_dir=Path(feature_root)),
             key=str(feature_key),
@@ -473,7 +502,10 @@ def run_real_radio_pose_localization_eval(
                 }
             )
 
-    observation_index = build_support_observation_index(colmap_observations)
+    observation_index = build_support_observation_index(
+        colmap_observations,
+        target_image_sizes=reference_image_sizes,
+    )
     match_rows, matches_by_query = convert_proposals_to_query_3d_matches(
         records,
         observation_index=observation_index,

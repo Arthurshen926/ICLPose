@@ -14,6 +14,8 @@ def test_eval_real_radio_pose_localization_cli_args() -> None:
             "features",
             "--colmap_model_dir",
             "sparse/0",
+            "--track_observations_jsonl",
+            "tracks.jsonl",
             "--query_pose_file",
             "dataset_test.txt",
             "--matcha_joint_checkpoint",
@@ -36,6 +38,7 @@ def test_eval_real_radio_pose_localization_cli_args() -> None:
     )
 
     assert args.colmap_model_dir == "sparse/0"
+    assert args.track_observations_jsonl == "tracks.jsonl"
     assert args.query_pose_file == "dataset_test.txt"
     assert args.feature_key == "radio_final"
     assert args.k_per_query == 2

@@ -16,6 +16,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--image_root", required=True)
     parser.add_argument("--feature_root", required=True)
     parser.add_argument("--colmap_model_dir", required=True)
+    parser.add_argument("--track_observations_jsonl", default="")
     parser.add_argument("--query_pose_file", required=True)
     parser.add_argument("--matcha_joint_checkpoint", required=True)
     parser.add_argument("--measurement_checkpoint", default="")
@@ -55,6 +56,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         read_colmap_cameras_binary,
         read_colmap_images_binary,
     )
+    from feature_extract.vfm.track_feature_sampling import load_colmap_track_observations_jsonl
     from feature_extract.vfm.localization.coarse_matcher import MatchaTopKCoarseMatcher
     from feature_extract.vfm.localization.feature_mapper import JointFeatureMapper
     from feature_extract.vfm.localization.measurement import RGBPatchMeasurementAdapter
@@ -68,7 +70,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     model_dir = Path(args.colmap_model_dir)
     cameras = read_colmap_cameras_binary(model_dir / "cameras.bin")
     images = read_colmap_images_binary(model_dir / "images.bin")
-    observations = load_colmap_track_observations(model_dir)
+    observations = (
+        load_colmap_track_observations_jsonl(Path(args.track_observations_jsonl))
+        if str(args.track_observations_jsonl)
+        else load_colmap_track_observations(model_dir)
+    )
     gt_poses = {record.image_id: record for record in parse_cambridge_pose_file(Path(args.query_pose_file))}
     pairs = load_real_radio_localization_pairs_csv(
         Path(args.pairs_csv),
@@ -115,6 +121,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             "image_root": str(args.image_root),
             "feature_root": str(args.feature_root),
             "colmap_model_dir": str(args.colmap_model_dir),
+            "track_observations_jsonl": str(args.track_observations_jsonl),
             "query_pose_file": str(args.query_pose_file),
             "matcha_joint_checkpoint": str(args.matcha_joint_checkpoint),
             "measurement_checkpoint": str(measurement_checkpoint),
