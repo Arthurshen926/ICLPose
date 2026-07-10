@@ -21,6 +21,7 @@ AGGREGATION_METHODS = {
     "geometry_weighted",
     "robust_trimmed_mean",
     "view_consistent",
+    "ulf_geometry_weighted",
     "geometric_median",
     "medoid",
 }
@@ -232,6 +233,23 @@ def _aggregate_one_track(
         selected_features = features[keep_indices]
         selected_utilities = utilities[keep_indices]
         mean, variance = _weighted_mean_and_variance(selected_features, np.maximum(selected_utilities, config.weight_floor))
+    elif config.method == "ulf_geometry_weighted":
+        normalized = _normalize_rows(features)
+        similarity = normalized @ normalized.T
+        off_diagonal = similarity.copy()
+        np.fill_diagonal(off_diagonal, -np.inf)
+        neighbor_count = max(1, min(features.shape[0] - 1, int(config.min_observations) - 1))
+        nearest = np.sort(off_diagonal, axis=1)[:, -neighbor_count:]
+        consensus = np.maximum(nearest, 0.0).mean(axis=1)
+        positive_indices = np.flatnonzero(consensus > float(config.weight_floor))
+        candidate_indices = positive_indices if positive_indices.size >= int(config.min_observations) else np.arange(features.shape[0])
+        keep_count = min(candidate_indices.size, max(config.min_observations, int(config.view_consistent_keep)))
+        candidate_scores = consensus[candidate_indices] * np.maximum(utilities[candidate_indices], config.weight_floor)
+        keep_indices = np.sort(candidate_indices[np.argsort(-candidate_scores, kind="mergesort")[:keep_count]])
+        selected_features = normalized[keep_indices]
+        selected_utilities = utilities[keep_indices] * np.maximum(consensus[keep_indices], config.weight_floor)
+        mean, variance = _weighted_mean_and_variance(selected_features, np.maximum(selected_utilities, config.weight_floor))
+        mean = (mean / max(float(np.linalg.norm(mean)), 1e-6)).astype(np.float32)
     elif config.method == "geometric_median":
         mean = _weighted_geometric_median(
             features,

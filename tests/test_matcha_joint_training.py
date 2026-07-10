@@ -45,6 +45,7 @@ from feature_extract.vfm.matcha_joint_training import (
     save_matcha_joint_training_set_npz,
     train_matcha_joint_model,
     train_matcha_joint_model_from_manifest,
+    train_matcha_joint_model_from_sample_provider,
 )
 
 
@@ -1976,6 +1977,87 @@ def test_train_matcha_joint_model_from_manifest_loads_shards_lazily(tmp_path, mo
 
     assert run.summary["manifest_shard_count"] == 3
     assert len(set(loaded_paths)) < 3
+
+
+def test_train_matcha_joint_model_from_sample_provider_loads_pairs_lazily() -> None:
+    samples = [MatchaJointTrainingSet(coarse_fine_samples=_toy_samples()) for _ in range(5)]
+    loaded_indices: list[int] = []
+
+    def get_sample(index: int) -> MatchaJointTrainingSet:
+        loaded_indices.append(int(index))
+        return samples[int(index)]
+
+    run = train_matcha_joint_model_from_sample_provider(
+        len(samples),
+        get_sample,
+        MatchaJointTrainingConfig(
+            output_dim=8,
+            residual_hidden_dim=16,
+            steps=2,
+            batch_size=8,
+            lr=5e-3,
+            dual_softmax_weight=1.0,
+            offset_loss_weight=0.0,
+            pair_fine_loss_weight=0.0,
+            pair_confidence_loss_weight=0.0,
+            dense_heatmap_loss_weight=0.0,
+            rgb_keypoint_loss_weight=0.0,
+            hard_negative_weight=0.0,
+            group_size=4,
+            device="cpu",
+            seed=53,
+        ),
+        steps_per_sample=1,
+        provider_name="unit_provider",
+    )
+
+    assert run.summary["provider_lazy_training"] is True
+    assert run.summary["provider_name"] == "unit_provider"
+    assert run.summary["provider_sample_count"] == 5
+    assert loaded_indices[0] == 0
+    assert len(set(loaded_indices)) < len(samples)
+
+
+def test_train_matcha_joint_model_from_sample_provider_accumulates_prefetched_pairs() -> None:
+    samples = [MatchaJointTrainingSet(coarse_fine_samples=_toy_samples()) for _ in range(8)]
+    loaded_indices: list[int] = []
+
+    def get_sample(index: int) -> MatchaJointTrainingSet:
+        loaded_indices.append(int(index))
+        return samples[int(index)]
+
+    run = train_matcha_joint_model_from_sample_provider(
+        len(samples),
+        get_sample,
+        MatchaJointTrainingConfig(
+            output_dim=8,
+            residual_hidden_dim=16,
+            steps=2,
+            batch_size=8,
+            lr=5e-3,
+            dual_softmax_weight=1.0,
+            offset_loss_weight=0.0,
+            pair_fine_loss_weight=0.0,
+            pair_confidence_loss_weight=0.0,
+            dense_heatmap_loss_weight=0.0,
+            rgb_keypoint_loss_weight=0.0,
+            hard_negative_weight=0.0,
+            group_size=4,
+            device="cpu",
+            seed=54,
+        ),
+        provider_gradient_accumulation_pairs=3,
+        provider_prefetch_workers=1,
+        provider_prefetch_depth=2,
+        provider_name="prefetch_provider",
+    )
+
+    assert run.summary["provider_gradient_accumulation_pairs"] == 3
+    assert run.summary["provider_training_pair_count"] == 6
+    assert run.summary["provider_prefetch_workers"] == 1
+    assert run.summary["provider_prefetch_depth"] == 2
+    assert loaded_indices[0] == 0
+    assert len(loaded_indices) >= 7
 
 
 def test_train_matcha_joint_model_uses_no_match_ignore_and_repeatability_targets() -> None:

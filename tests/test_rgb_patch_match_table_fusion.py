@@ -12,6 +12,7 @@ from feature_extract.vfm.measurement_v1.rgb_patch_measurement_branch import Text
 from feature_extract.vfm.measurement_v1.rgb_patch_measurement_branch import RGBPatchMeasurementBranch
 from feature_extract.vfm.measurement_v1.rgb_patch_match_table_fusion import (
     _likelihood_stats,
+    apply_rgb_patch_measurements_to_real_pair_rows,
     apply_rgb_patch_measurements_to_match_table,
     apply_rgb_patch_measurements_to_rows,
     load_rgb_patch_measurement_branch,
@@ -506,6 +507,109 @@ def test_rgb_patch_match_table_fusion_supports_different_query_and_render_sizes(
 
     assert fused_rows[0]["render_x"] == "4.0"
     assert fused_rows[0]["query_refined_x"] != ""
+
+
+def test_rgb_patch_match_table_fusion_supports_real_pair_reference_images(tmp_path: Path) -> None:
+    image_root = tmp_path / "images"
+    (image_root / "seq0").mkdir(parents=True)
+    _write_query_image(image_root / "seq0" / "query.png", size=(16, 16))
+    _write_query_image(image_root / "seq0" / "support.png", size=(16, 16))
+    rows = [
+        {
+            "query_id": "seq0/query.png",
+            "reference_image_id": "seq0/support.png",
+            "reference_x": "7.0",
+            "reference_y": "6.0",
+            "query_center_x": "8.0",
+            "query_center_y": "8.0",
+            "query_gt_x": "8.0",
+            "query_gt_y": "8.0",
+        }
+    ]
+
+    fused_rows, summary = apply_rgb_patch_measurements_to_rows(
+        rows,
+        image_root=image_root,
+        render_cache_by_query={},
+        model=_model(),
+        image_width=16,
+        image_height=16,
+        batch_size=1,
+        device=torch.device("cpu"),
+        reference_source="real_pair",
+    )
+
+    assert summary["reference_source"] == "real_pair"
+    assert fused_rows[0]["query_refined_x"] != ""
+    assert fused_rows[0]["measurement_valid_prob"] != ""
+
+
+def test_apply_real_pair_measurements_writes_outputs_without_render_manifest(tmp_path: Path) -> None:
+    image_root = tmp_path / "images"
+    (image_root / "seq0").mkdir(parents=True)
+    _write_query_image(image_root / "seq0" / "query.png", size=(16, 16))
+    _write_query_image(image_root / "seq0" / "support.png", size=(16, 16))
+    rows_csv = tmp_path / "rows.csv"
+    with rows_csv.open("w", newline="") as handle:
+        fieldnames = [
+            "query_id",
+            "support_image_id",
+            "support_x",
+            "support_y",
+            "query_center_x",
+            "query_center_y",
+            "query_gt_x",
+            "query_gt_y",
+        ]
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerow(
+            {
+                "query_id": "seq0/query.png",
+                "support_image_id": "seq0/support.png",
+                "support_x": "7.0",
+                "support_y": "6.0",
+                "query_center_x": "8.0",
+                "query_center_y": "8.0",
+                "query_gt_x": "8.0",
+                "query_gt_y": "8.0",
+            }
+        )
+    checkpoint = tmp_path / "rgb_patch_measurement_branch.pt"
+    model = _model()
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "config": {
+                "search_radius_px": 1.0,
+                "context_radius_px": 1.0,
+                "step_px": 1.0,
+                "feature_dim": 4,
+                "hidden_dim": 8,
+                "input_mode": "rgb",
+                "template_scale_factors": [1.0],
+            },
+        },
+        checkpoint,
+    )
+
+    summary = apply_rgb_patch_measurements_to_real_pair_rows(
+        rows_csv=rows_csv,
+        image_root=image_root,
+        checkpoint=checkpoint,
+        output_dir=tmp_path / "out_real_pair",
+        image_width=16,
+        image_height=16,
+        batch_size=1,
+        device="cpu",
+    )
+
+    assert summary["reference_source"] == "real_pair"
+    assert summary["render_cache_manifest_csv"] == ""
+    assert Path(summary["outputs"]["match_table_csv"]).exists()
+    with Path(summary["outputs"]["match_table_csv"]).open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert rows[0]["query_refined_x"] != ""
 
 
 def test_rgb_patch_checkpoint_loader_accepts_legacy_missing_empty_prior_scale_buffer(tmp_path: Path) -> None:

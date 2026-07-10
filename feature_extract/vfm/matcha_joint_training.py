@@ -14,9 +14,11 @@ from __future__ import annotations
 
 import json
 import random
-from collections import OrderedDict
+from collections import OrderedDict, deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable, Sequence
 
 import numpy as np
 import torch
@@ -3770,6 +3772,196 @@ def train_matcha_joint_model_from_manifest(
                 "validation_manifest_lazy": True,
                 "validation_manifest_shard_count": int(len(validation_shards)),
                 "validation_manifest_sample_count": int(validation_metadata.get("sample_count", 0)),
+            }
+        )
+    summary.update(_evaluate(model, eval_samples, cfg, device))
+    return MatchaJointTrainingRun(model=model.cpu().eval(), summary=summary)
+
+
+def _iter_prefetched_provider_samples(
+    get_sample: Callable[[int], MatchaJointTrainingSet],
+    indices: Sequence[int],
+    *,
+    workers: int,
+    depth: int,
+):
+    if int(workers) <= 0 or int(depth) <= 0:
+        for index in indices:
+            yield get_sample(int(index))
+        return
+    pending = deque()
+    source = iter(int(index) for index in indices)
+    max_pending = max(int(depth), int(workers))
+    with ThreadPoolExecutor(max_workers=int(workers)) as executor:
+        exhausted = False
+
+        def fill() -> None:
+            nonlocal exhausted
+            while not exhausted and len(pending) < max_pending:
+                try:
+                    index = next(source)
+                except StopIteration:
+                    exhausted = True
+                    return
+                pending.append(executor.submit(get_sample, int(index)))
+
+        fill()
+        while pending:
+            future = pending.popleft()
+            fill()
+            yield future.result()
+
+
+def train_matcha_joint_model_from_sample_provider(
+    sample_count: int,
+    get_sample: Callable[[int], MatchaJointTrainingSet],
+    config: MatchaJointTrainingConfig | None = None,
+    *,
+    validation_sample_count: int = 0,
+    get_validation_sample: Callable[[int], MatchaJointTrainingSet] | None = None,
+    validation_interval: int = 0,
+    steps_per_sample: int = 1,
+    provider_gradient_accumulation_pairs: int = 1,
+    provider_prefetch_workers: int = 0,
+    provider_prefetch_depth: int = 0,
+    warm_start_model: MatchaStyleJointModel | None = None,
+    provider_name: str = "sample_provider",
+) -> MatchaJointTrainingRun:
+    """Train from a lazy per-sample provider without materializing all pairs."""
+
+    cfg = config or MatchaJointTrainingConfig()
+    provider_sample_count = int(sample_count)
+    if provider_sample_count <= 0:
+        raise ValueError("sample provider must contain at least one sample")
+    validation_provider_count = int(validation_sample_count) if get_validation_sample is not None else 0
+    if validation_provider_count < 0:
+        raise ValueError("validation_sample_count must be non-negative")
+    gradient_accumulation_pairs = max(1, int(provider_gradient_accumulation_pairs))
+    prefetch_workers = max(0, int(provider_prefetch_workers))
+    prefetch_depth = max(0, int(provider_prefetch_depth))
+    first_samples = get_sample(0)
+    torch.manual_seed(int(cfg.seed))
+    random.seed(int(cfg.seed))
+    np.random.seed(int(cfg.seed))
+    device = torch.device(cfg.device if torch.cuda.is_available() or not str(cfg.device).startswith("cuda") else "cpu")
+    model = _build_matcha_joint_model_for_samples(first_samples, cfg, device)
+    warm_start_report: dict[str, object] = {}
+    if warm_start_model is not None:
+        result = model.load_state_dict(warm_start_model.state_dict(), strict=False)
+        warm_start_report = {
+            "warm_start_loaded": True,
+            "warm_start_missing_keys": list(result.missing_keys),
+            "warm_start_unexpected_keys": list(result.unexpected_keys),
+        }
+    optimizer = torch.optim.AdamW(model.parameters(), lr=float(cfg.lr), weight_decay=1e-4)
+    rng = np.random.default_rng(int(cfg.seed))
+
+    def provider_index_for_training_pair(pair_index: int, count: int, *, salt: int) -> int:
+        epoch = int(pair_index) // max(1, int(steps_per_sample) * int(count))
+        position = (int(pair_index) // max(1, int(steps_per_sample))) % int(count)
+        order_rng = np.random.default_rng(int(cfg.seed) + int(salt) + int(epoch))
+        return int(order_rng.permutation(int(count))[position])
+
+    initial_loss = _loss_value_for_samples(model, first_samples, cfg, device, seed=int(cfg.seed))
+    validation_history: list[dict[str, float | int]] = []
+    best_validation_loss = float("inf")
+    best_validation_step = -1
+    best_state: dict[str, torch.Tensor] | None = None
+
+    def maybe_validate(step: int) -> None:
+        nonlocal best_validation_loss, best_validation_step, best_state
+        if get_validation_sample is None or validation_provider_count <= 0:
+            return
+        values = []
+        for validation_index in range(validation_provider_count):
+            samples = get_validation_sample(int(validation_index))
+            values.append(
+                _loss_value_for_samples(
+                    model,
+                    samples,
+                    cfg,
+                    device,
+                    seed=int(cfg.seed) + 50000 + int(step) + int(validation_index),
+                )
+            )
+        value = float(np.mean(values)) if values else float("inf")
+        validation_history.append({"step": int(step), "loss": float(value)})
+        if value < best_validation_loss:
+            best_validation_loss = float(value)
+            best_validation_step = int(step)
+            best_state = _model_state_snapshot(model)
+
+    maybe_validate(0)
+    model.train()
+    last_samples = first_samples
+    training_pair_count = int(cfg.steps) * int(gradient_accumulation_pairs)
+    training_indices = [
+        provider_index_for_training_pair(pair_index, provider_sample_count, salt=1009)
+        for pair_index in range(training_pair_count)
+    ]
+    training_samples = _iter_prefetched_provider_samples(
+        get_sample,
+        training_indices,
+        workers=int(prefetch_workers),
+        depth=int(prefetch_depth),
+    )
+    consumed_training_pairs = 0
+    for step in range(int(cfg.steps)):
+        optimizer.zero_grad(set_to_none=True)
+        for accumulation_index in range(int(gradient_accumulation_pairs)):
+            samples = next(training_samples)
+            last_samples = samples
+            idx = _sample_indices(rng, samples.coarse_fine_samples.sample_count, int(cfg.batch_size))
+            loss, _metrics = _total_loss(
+                model,
+                samples,
+                idx,
+                cfg,
+                device,
+                seed=int(cfg.seed) + int(consumed_training_pairs),
+            )
+            (loss / float(gradient_accumulation_pairs)).backward()
+            consumed_training_pairs += 1
+        optimizer.step()
+        if get_validation_sample is not None and validation_provider_count > 0 and int(validation_interval) > 0 and ((int(step) + 1) % int(validation_interval) == 0):
+            maybe_validate(int(step) + 1)
+    if get_validation_sample is not None and validation_provider_count > 0 and (not validation_history or int(validation_history[-1]["step"]) != int(cfg.steps)):
+        maybe_validate(int(cfg.steps))
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    final_loss = _loss_value_for_samples(model, last_samples, cfg, device, seed=int(cfg.seed) + int(cfg.steps) + 1)
+    eval_samples = get_validation_sample(0) if get_validation_sample is not None and validation_provider_count > 0 else last_samples
+    summary = {
+        "stage": "matcha_style_joint_training",
+        "model_type": str(cfg.model_type),
+        "initial_loss": float(initial_loss),
+        "final_loss": float(final_loss),
+        "sample_count": int(provider_sample_count),
+        "input_dim": int(first_samples.coarse_fine_samples.input_dim),
+        "output_dim": int(cfg.output_dim),
+        "steps": int(cfg.steps),
+        "batch_size": int(cfg.batch_size),
+        "provider_lazy_training": True,
+        "provider_name": str(provider_name),
+        "provider_sample_count": int(provider_sample_count),
+        "provider_steps_per_sample": int(steps_per_sample),
+        "provider_gradient_accumulation_pairs": int(gradient_accumulation_pairs),
+        "provider_training_pair_count": int(consumed_training_pairs),
+        "provider_prefetch_workers": int(prefetch_workers),
+        "provider_prefetch_depth": int(prefetch_depth),
+        "provider_first_pair_sample_count": int(first_samples.coarse_fine_samples.sample_count),
+        "provider_last_pair_sample_count": int(last_samples.coarse_fine_samples.sample_count),
+    }
+    summary.update(warm_start_report)
+    if get_validation_sample is not None and validation_provider_count > 0:
+        summary.update(
+            {
+                "best_validation_loss": float(best_validation_loss),
+                "best_validation_step": int(best_validation_step),
+                "validation_eval_count": int(len(validation_history)),
+                "validation_history": validation_history,
+                "validation_provider_lazy": True,
+                "validation_provider_sample_count": int(validation_provider_count),
             }
         )
     summary.update(_evaluate(model, eval_samples, cfg, device))

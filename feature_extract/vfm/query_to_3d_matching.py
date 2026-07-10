@@ -379,6 +379,7 @@ class QueryTo3DMatch:
     patch_offset_consistency_after_px: float | None = None
     token_match_rank: int | None = None
     measurement_sigma_px: float | None = None
+    query_heatmap_score: float | None = None
     render_xy: np.ndarray | None = None
     base_render_index: int | None = None
     candidate_render_index: int | None = None

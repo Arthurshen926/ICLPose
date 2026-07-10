@@ -25,6 +25,7 @@ from feature_extract.vfm.measurement_v1.rgb_patch_pose_proxy import scaled_colma
 from feature_extract.vfm.query_to_3d_matching import (
     QueryTo3DMatch,
     SpatialDiversityPnPConfig,
+    estimate_pose_pnp_fixed_robust,
     estimate_pose_pnp_ransac,
     match_spatial_distribution_stats,
     pnp_pose_error,
@@ -257,6 +258,27 @@ def summarize_pose_rows(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _pose_refine_weight(match: QueryTo3DMatch) -> float:
+    score = match.pnp_soft_score
+    if score is None:
+        score = match.quality_weighted_similarity
+    if score is None:
+        score = match.similarity
+    try:
+        value = float(score)
+    except (TypeError, ValueError):
+        value = 0.0
+    if not np.isfinite(value):
+        value = 0.0
+    value = float(np.clip(value, 0.0, 1.0))
+    if match.patch_offset_confidence is not None:
+        value *= float(np.clip(float(match.patch_offset_confidence), 0.0, 1.0))
+    if match.measurement_sigma_px is not None and np.isfinite(float(match.measurement_sigma_px)):
+        sigma = max(float(match.measurement_sigma_px), 0.0)
+        value *= float(1.0 / (1.0 + sigma / 4.0))
+    return float(max(value, 1e-3))
+
+
 def evaluate_query_poses(
     matches_by_query: Mapping[str, Sequence[QueryTo3DMatch]],
     *,
@@ -267,6 +289,10 @@ def evaluate_query_poses(
     pnp_confidence: float = 0.999,
     pnp_min_inliers: int = 4,
     spatial_diversity: SpatialDiversityPnPConfig | None = None,
+    pnp_weighted_refine: bool = False,
+    pnp_weighted_loss: str = "huber",
+    pnp_weighted_f_scale_px: float = 4.0,
+    pnp_weighted_max_nfev: int = 50,
 ) -> list[dict[str, Any]]:
     pose_rows: list[dict[str, Any]] = []
     for query_id in sorted(matches_by_query):
@@ -329,7 +355,27 @@ def evaluate_query_poses(
             min_inliers=int(pnp_min_inliers),
             refine_method="LM",
         )
-        error = pnp_pose_error(pnp.pose_w2c if pnp.success else None, gt.pose_w2c)
+        weighted_refine_applied = False
+        pose_for_metrics = pnp.pose_w2c if pnp.success else None
+        if bool(pnp_weighted_refine) and pnp.success and pnp.pose_w2c is not None:
+            inlier_indices = np.flatnonzero(np.asarray(pnp.inlier_mask, dtype=bool))
+            if inlier_indices.size >= max(4, int(pnp_min_inliers)):
+                inlier_matches = [matches[int(index)] for index in inlier_indices]
+                weights = np.asarray([_pose_refine_weight(match) for match in inlier_matches], dtype=np.float64)
+                refined = estimate_pose_pnp_fixed_robust(
+                    inlier_matches,
+                    camera,
+                    weights=weights,
+                    min_inliers=int(pnp_min_inliers),
+                    initial_pose_w2c=np.asarray(pnp.pose_w2c, dtype=np.float64).reshape(4, 4),
+                    loss=str(pnp_weighted_loss),
+                    f_scale_px=float(pnp_weighted_f_scale_px),
+                    max_nfev=int(pnp_weighted_max_nfev),
+                )
+                if refined.success and refined.pose_w2c is not None:
+                    pose_for_metrics = refined.pose_w2c
+                    weighted_refine_applied = True
+        error = pnp_pose_error(pose_for_metrics if pnp.success else None, gt.pose_w2c)
         spatial_all = match_spatial_distribution_stats(matches, int(camera.width), int(camera.height))
         spatial_inliers = match_spatial_distribution_stats(
             matches,
@@ -337,7 +383,7 @@ def evaluate_query_poses(
             int(camera.height),
             pnp.inlier_mask,
         )
-        residuals = pnp_reprojection_residual_stats(matches, pnp.pose_w2c, camera, inlier_mask=pnp.inlier_mask)
+        residuals = pnp_reprojection_residual_stats(matches, pose_for_metrics, camera, inlier_mask=pnp.inlier_mask)
         pose_rows.append(
             {
                 "query_id": query_id,
@@ -348,6 +394,7 @@ def evaluate_query_poses(
                 "translation_error_m": float(error.translation_m),
                 "rotation_error_deg": float(error.rotation_deg),
                 "failure_reason": "" if pnp.success else "pnp_failed",
+                "pnp_weighted_refine_applied": bool(weighted_refine_applied),
                 "all_grid_4x4_occupancy_frac": spatial_all.get("grid_4x4_occupancy_frac"),
                 "inlier_grid_4x4_occupancy_frac": spatial_inliers.get("grid_4x4_occupancy_frac"),
                 **residuals,

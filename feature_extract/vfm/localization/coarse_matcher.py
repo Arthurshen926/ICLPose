@@ -8,7 +8,7 @@ from typing import Protocol
 import numpy as np
 
 from feature_extract.vfm.localization.schemas import CoarseProposal
-from feature_extract.vfm.matcha_coarse_to_fine import matcha_coarse_dual_softmax_matches
+from feature_extract.vfm.matcha_coarse_to_fine import matcha_coarse_dual_softmax_matches, matcha_coarse_topk_matches
 
 
 class CoarseMatcher(Protocol):
@@ -73,5 +73,41 @@ class MatchaCoarseMatcher:
             min_similarity=float(self.min_similarity),
             max_matches=self.max_matches,
             mutual=bool(self.mutual),
+        )
+        return [_proposal_from_match(match) for match in matches]
+
+
+@dataclass(frozen=True)
+class MatchaTopKCoarseMatcher:
+    """MATCHA-style top-k coarse proposal pool matcher."""
+
+    k_per_query: int = 1
+    mutual_mode: str | None = "annotate"
+    logit_scale: float = 10.0
+    min_similarity: float = -1.0
+    max_matches: int | None = None
+    anchor_side: str = "query"
+
+    def match(
+        self,
+        query_descriptors: np.ndarray,
+        reference_descriptors: np.ndarray,
+        *,
+        query_image_size: tuple[int, int],
+        reference_image_size: tuple[int, int],
+    ) -> list[CoarseProposal]:
+        matches = matcha_coarse_topk_matches(
+            query_descriptors,
+            reference_descriptors,
+            query_image_width=int(query_image_size[0]),
+            query_image_height=int(query_image_size[1]),
+            render_image_width=int(reference_image_size[0]),
+            render_image_height=int(reference_image_size[1]),
+            k_per_query=int(self.k_per_query),
+            mutual_mode="none" if self.mutual_mode is None else str(self.mutual_mode),
+            logit_scale=float(self.logit_scale),
+            min_similarity=float(self.min_similarity),
+            max_matches=self.max_matches,
+            anchor_side=str(self.anchor_side),
         )
         return [_proposal_from_match(match) for match in matches]

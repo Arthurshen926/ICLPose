@@ -93,6 +93,31 @@ def _render_anchor(row: Mapping[str, object]) -> tuple[float, float]:
     return float(x), float(y)
 
 
+def _canonical_reference_source(reference_source: str) -> str:
+    source = str(reference_source).strip().lower()
+    if source in {"", "render", "render_cache"}:
+        return "render_cache"
+    if source in {"real_pair", "support_image", "reference_image"}:
+        return "real_pair"
+    raise ValueError("reference_source must be one of: render_cache, real_pair")
+
+
+def _real_pair_reference_image_id(row: Mapping[str, object]) -> str:
+    for name in ("reference_image_id", "support_image_id"):
+        value = str(row.get(name, "")).strip()
+        if value:
+            return value
+    raise ValueError("real-pair row missing reference_image_id/support_image_id")
+
+
+def _real_pair_reference_anchor(row: Mapping[str, object]) -> tuple[float, float]:
+    x = _optional_float(row, "reference_x", "support_x", "render_x")
+    y = _optional_float(row, "reference_y", "support_y", "render_y")
+    if x is None or y is None:
+        raise ValueError("real-pair row missing reference/support anchor coordinates")
+    return float(x), float(y)
+
+
 def _has_explicit_value(row: Mapping[str, object], name: str) -> bool:
     value = row.get(name)
     return value is not None and str(value).strip() != ""
@@ -376,6 +401,17 @@ def _load_render_image(
     return _load_tensor_cached(render_cache, str(render_path), lambda p=render_path: _load_render_rgb(p))
 
 
+def _load_real_pair_reference_image(
+    *,
+    row: Mapping[str, object],
+    image_root: Path,
+    reference_cache: dict[str, torch.Tensor],
+) -> torch.Tensor:
+    reference_id = _real_pair_reference_image_id(row)
+    reference_path = Path(image_root) / reference_id
+    return _load_tensor_cached(reference_cache, str(reference_path), lambda p=reference_path: _load_query_rgb(p))
+
+
 def _crop_windows_for_rows(
     rows: Sequence[Mapping[str, object]],
     *,
@@ -389,14 +425,29 @@ def _crop_windows_for_rows(
     step_px: float,
     query_cache: dict[str, torch.Tensor],
     render_cache: dict[str, torch.Tensor],
+    reference_source: str = "render_cache",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     query_patches: list[torch.Tensor] = []
     render_patches: list[torch.Tensor] = []
+    source = _canonical_reference_source(str(reference_source))
     for row in rows:
         query_image = _load_query_image(row=row, image_root=image_root, query_cache=query_cache).unsqueeze(0)
-        render_image = _load_render_image(row=row, render_cache_by_query=render_cache_by_query, render_cache=render_cache).unsqueeze(0)
+        if source == "real_pair":
+            render_image = _load_real_pair_reference_image(
+                row=row,
+                image_root=image_root,
+                reference_cache=render_cache,
+            ).unsqueeze(0)
+            anchor_xy = _real_pair_reference_anchor(row)
+        else:
+            render_image = _load_render_image(
+                row=row,
+                render_cache_by_query=render_cache_by_query,
+                render_cache=render_cache,
+            ).unsqueeze(0)
+            anchor_xy = _render_anchor(row)
         center = torch.tensor([_query_center(row)], dtype=torch.float32)
-        anchor = torch.tensor([_render_anchor(row)], dtype=torch.float32)
+        anchor = torch.tensor([anchor_xy], dtype=torch.float32)
         query_patch, _ = crop_rgb_window(
             query_image,
             center,
@@ -509,6 +560,7 @@ def apply_rgb_patch_measurements_to_rows(
     prior_scale_key: str = "",
     covariance_floor_px2: float = 1e-4,
     data_parallel_device_ids: Sequence[int] = (),
+    reference_source: str = "render_cache",
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Attach RGB template-to-search local measurements to match-table rows.
 
@@ -518,6 +570,7 @@ def apply_rgb_patch_measurements_to_rows(
     """
 
     head = _canonical_prediction_head(str(prediction_head))
+    source = _canonical_reference_source(str(reference_source))
     torch_device = torch.device(device if torch.cuda.is_available() or not str(device).startswith("cuda") else "cpu")
     q_width = int(query_image_width if query_image_width is not None else image_width if image_width is not None else 0)
     q_height = int(query_image_height if query_image_height is not None else image_height if image_height is not None else 0)
@@ -559,6 +612,7 @@ def apply_rgb_patch_measurements_to_rows(
                 step_px=model.step_px,
                 query_cache=query_cache,
                 render_cache=render_cache,
+                reference_source=source,
             )
             prior_scale = _prior_scale_batch(batch_rows, prior_scale_key=str(prior_scale_key))
             pred = _forward_patch_prediction(
@@ -657,6 +711,7 @@ def apply_rgb_patch_measurements_to_rows(
             "stage": "measurement_v1_rgb_patch_match_table_fusion",
             "prediction_head": head,
             "measurement_model_type": str(getattr(model, "measurement_model_type", model.__class__.__name__)),
+            "reference_source": source,
             "batch_size": int(batch),
             "query_image_width": int(q_width),
             "query_image_height": int(q_height),
@@ -668,6 +723,68 @@ def apply_rgb_patch_measurements_to_rows(
         }
     )
     return output, summary
+
+
+def apply_rgb_patch_measurements_to_real_pair_rows(
+    *,
+    rows_csv: Path,
+    image_root: Path,
+    checkpoint: Path,
+    output_dir: Path,
+    image_width: int | None = None,
+    image_height: int | None = None,
+    query_image_width: int | None = None,
+    query_image_height: int | None = None,
+    reference_image_width: int | None = None,
+    reference_image_height: int | None = None,
+    batch_size: int = 16,
+    device: str = "cuda",
+    max_rows: int | None = None,
+    prediction_head: str = "center",
+    prior_scale_key: str = "",
+    data_parallel_device_ids: Sequence[int] = (),
+) -> dict[str, Any]:
+    rows = _read_csv_rows(Path(rows_csv), max_rows=max_rows)
+    torch_device = torch.device(device if torch.cuda.is_available() or not str(device).startswith("cuda") else "cpu")
+    model = load_rgb_patch_measurement_branch(Path(checkpoint), device=torch_device)
+    fused_rows, summary = apply_rgb_patch_measurements_to_rows(
+        rows,
+        image_root=Path(image_root),
+        render_cache_by_query={},
+        model=model,
+        image_width=image_width,
+        image_height=image_height,
+        query_image_width=query_image_width,
+        query_image_height=query_image_height,
+        render_image_width=reference_image_width,
+        render_image_height=reference_image_height,
+        batch_size=int(batch_size),
+        device=torch_device,
+        prediction_head=str(prediction_head),
+        prior_scale_key=str(prior_scale_key),
+        data_parallel_device_ids=[int(value) for value in data_parallel_device_ids],
+        reference_source="real_pair",
+    )
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    fieldnames = _fieldnames_for_rows(fused_rows)
+    _write_csv(output / "match_table.csv", fused_rows, fieldnames)
+    _write_jsonl(output / "match_table.jsonl", fused_rows)
+    summary = {
+        **summary,
+        "rows_csv": str(rows_csv),
+        "render_cache_manifest_csv": "",
+        "image_root": str(image_root),
+        "checkpoint": str(checkpoint),
+        "row_count": int(len(fused_rows)),
+        "outputs": {
+            "match_table_csv": str(output / "match_table.csv"),
+            "match_table_jsonl": str(output / "match_table.jsonl"),
+            "summary": str(output / "summary.json"),
+        },
+    }
+    (output / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+    return summary
 
 
 def apply_rgb_patch_measurements_to_match_table(

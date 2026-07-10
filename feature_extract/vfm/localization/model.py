@@ -9,7 +9,7 @@ import numpy as np
 
 from feature_extract.vfm.localization.coarse_matcher import CoarseMatcher
 from feature_extract.vfm.localization.feature_mapper import FeatureMapper
-from feature_extract.vfm.localization.schemas import LocalizationMatchResult, MeasurementResult
+from feature_extract.vfm.localization.schemas import LocalizationMatchResult, MappedFeatureMap, MeasurementResult
 
 
 class MeasurementBranch(Protocol):
@@ -20,6 +20,9 @@ class MeasurementBranch(Protocol):
         query_rgb: np.ndarray,
         reference_rgb: np.ndarray,
         proposals,
+        *,
+        mapped_query: MappedFeatureMap | None = None,
+        mapped_reference: MappedFeatureMap | None = None,
     ) -> list[MeasurementResult]:
         """Return patch measurements for coarse proposals."""
 
@@ -54,7 +57,13 @@ class SelectorCoarseMeasurementModel:
         if self.measurement_branch is not None:
             if query_rgb is None or reference_rgb is None:
                 raise ValueError("query_rgb and reference_rgb are required when measurement_branch is set")
-            measurements = self.measurement_branch.measure(query_rgb, reference_rgb, proposals)
+            measurements = self.measurement_branch.measure(
+                query_rgb,
+                reference_rgb,
+                proposals,
+                mapped_query=mapped_query,
+                mapped_reference=mapped_reference,
+            )
         return LocalizationMatchResult(
             mapped_query=mapped_query,
             mapped_reference=mapped_reference,

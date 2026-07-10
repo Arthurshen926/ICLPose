@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from feature_extract.tools.vfm.build_raw_vfm_landmark_bank import main as build_raw_landmark_bank_cli_main
+from feature_extract.tools.vfm.build_projected_observation_landmark_bank import parse_args as parse_projected_bank_args
 from feature_extract.tools.vfm.visualize_raw_vfm_landmark_bank import main as visualize_raw_landmark_bank_cli_main
 from feature_extract.vfm.colmap_tracks import ColmapTrackObservation
 from feature_extract.vfm.landmark_feature_aggregation import (
@@ -110,6 +111,49 @@ def test_view_consistent_aggregation_keeps_mutually_consistent_observations():
     assert feature[0] > 0.8
     assert abs(float(feature[1])) < 0.1
     assert bank.tracks[7].observation_count == 2
+
+
+def test_ulf_geometry_weighted_aggregation_combines_geometry_and_consensus():
+    observations = [
+        _obs(11, [1.0, 0.0], utility=1.0, image_id="a"),
+        _obs(11, [0.95, 0.05], utility=1.0, image_id="b"),
+        _obs(11, [-1.0, 0.0], utility=8.0, image_id="bad_geometry_outlier"),
+    ]
+
+    geometry_bank = aggregate_landmark_features(
+        observations,
+        LandmarkAggregationConfig(method="geometry_weighted", min_observations=2, l2_normalize_observations=True),
+    )
+    ulf_bank = aggregate_landmark_features(
+        observations,
+        LandmarkAggregationConfig(method="ulf_geometry_weighted", min_observations=2),
+    )
+
+    assert geometry_bank.tracks[11].mean_feature[0] < 0.0
+    assert ulf_bank.tracks[11].mean_feature[0] > 0.8
+    assert abs(float(ulf_bank.tracks[11].mean_feature[1])) < 0.1
+    assert ulf_bank.tracks[11].observation_count == 2
+
+
+def test_projected_observation_bank_cli_accepts_ulf_geometry_weighted_method(tmp_path):
+    args = parse_projected_bank_args(
+        [
+            "--track_observations",
+            "tracks.jsonl",
+            "--token_manifest",
+            "manifest.json",
+            "--matcha_joint_checkpoint",
+            "joint.pt",
+            "--method",
+            "ulf_geometry_weighted",
+            "--output_index",
+            str(tmp_path / "bank.npz"),
+            "--summary_json",
+            str(tmp_path / "summary.json"),
+        ]
+    )
+
+    assert args.method == "ulf_geometry_weighted"
 
 
 def test_geometric_median_and_medoid_are_robust_to_outlier():
