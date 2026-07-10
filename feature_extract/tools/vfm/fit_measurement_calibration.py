@@ -15,6 +15,7 @@ from feature_extract.vfm.localization.landmark_hybrid import cameras_by_image_na
 from feature_extract.vfm.localization.measurement_calibration import (
     calibration_rows_from_matches,
     fit_confidence_temperature_bias,
+    fit_geometry_probability_model,
     fit_uncertainty_scale_floor,
 )
 
@@ -29,6 +30,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output_samples_csv", default="")
     parser.add_argument("--inlier_threshold_px", type=float, default=2.0)
     parser.add_argument("--uncertainty_max_residual_px", type=float, default=None)
+    parser.add_argument("--geometry_inlier_threshold_px", type=float, default=None)
+    parser.add_argument("--source_measurement_confidence_temperature", type=float, default=None)
+    parser.add_argument("--source_measurement_confidence_bias", type=float, default=None)
+    parser.add_argument("--source_measurement_uncertainty_scale", type=float, default=None)
+    parser.add_argument("--source_measurement_uncertainty_floor_px", type=float, default=None)
     return parser.parse_args(argv)
 
 
@@ -70,6 +76,33 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     confidence = fit_confidence_temperature_bias(samples, inlier_threshold_px=float(args.inlier_threshold_px))
     uncertainty = fit_uncertainty_scale_floor(samples, max_residual_px=args.uncertainty_max_residual_px)
+    geometry_threshold = (
+        float(args.geometry_inlier_threshold_px)
+        if args.geometry_inlier_threshold_px is not None
+        else float(args.inlier_threshold_px)
+    )
+    geometry = fit_geometry_probability_model(samples, inlier_threshold_px=geometry_threshold)
+    geometry_output = dict(geometry)
+    geometry_output["model"] = geometry["model"].to_dict()
+    source_measurement_config = {
+        "measurement_confidence_temperature": args.source_measurement_confidence_temperature,
+        "measurement_confidence_bias": args.source_measurement_confidence_bias,
+        "measurement_uncertainty_scale": args.source_measurement_uncertainty_scale,
+        "measurement_uncertainty_floor_px": args.source_measurement_uncertainty_floor_px,
+    }
+    geometry_eval_args = {
+        "measurement_geometry_probability_model": str(args.output_json),
+        "min_measurement_geometry_probability": geometry["best_f1_threshold"],
+    }
+    for key, value in source_measurement_config.items():
+        if value is not None:
+            geometry_eval_args[key] = float(value)
+    confidence_uncertainty_eval_args = {
+        "measurement_confidence_temperature": confidence["confidence_temperature"],
+        "measurement_confidence_bias": confidence["confidence_bias"],
+        "measurement_uncertainty_scale": uncertainty["uncertainty_scale"],
+        "measurement_uncertainty_floor_px": uncertainty["uncertainty_floor_px"],
+    }
     output = {
         "stage": "measurement_confidence_uncertainty_calibration",
         "matches_csv": str(args.matches_csv),
@@ -79,12 +112,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         "sample_count": int(len(samples)),
         "confidence": confidence,
         "uncertainty": uncertainty,
-        "recommended_eval_args": {
-            "measurement_confidence_temperature": confidence["confidence_temperature"],
-            "measurement_confidence_bias": confidence["confidence_bias"],
-            "measurement_uncertainty_scale": uncertainty["uncertainty_scale"],
-            "measurement_uncertainty_floor_px": uncertainty["uncertainty_floor_px"],
-        },
+        "geometry_probability": geometry_output,
+        "source_measurement_adapter_config": source_measurement_config,
+        "recommended_eval_args": geometry_eval_args,
+        "recommended_geometry_probability_eval_args": geometry_eval_args,
+        "recommended_confidence_uncertainty_eval_args": confidence_uncertainty_eval_args,
     }
     output_path = Path(args.output_json)
     output_path.parent.mkdir(parents=True, exist_ok=True)

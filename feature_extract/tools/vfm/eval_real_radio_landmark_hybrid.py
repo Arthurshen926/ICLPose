@@ -4,11 +4,149 @@ from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
 import numpy as np
 import torch
+
+from feature_extract.vfm.artifacts import file_sha256_short
+from feature_extract.vfm.localization.descriptor_space import (
+    canonical_descriptor_space_id,
+    descriptor_space_manifest,
+    post_aggregate_1x1_descriptor_space_manifest,
+    raw_descriptor_space_manifest,
+)
+
+
+@dataclass(frozen=True)
+class ProjectionPreset:
+    name: str
+    query_projection: str
+    landmark_projection: str
+    expected_projection_mode: str
+    requires_projected_cache: bool = False
+    diagnostic_only: bool = False
+
+
+PROJECTION_PRESETS: dict[str, ProjectionPreset] = {
+    "raw_query_to_raw_landmark": ProjectionPreset(
+        name="raw_query_to_raw_landmark",
+        query_projection="raw",
+        landmark_projection="raw",
+        expected_projection_mode="raw_landmark_bank",
+    ),
+    "joint_query_to_projected_observation_landmark": ProjectionPreset(
+        name="joint_query_to_projected_observation_landmark",
+        query_projection="joint",
+        landmark_projection="joint",
+        expected_projection_mode="full_map_projected_observations",
+        requires_projected_cache=True,
+    ),
+    "post_aggregate_1x1_projection_baseline": ProjectionPreset(
+        name="post_aggregate_1x1_projection_baseline",
+        query_projection="joint",
+        landmark_projection="joint",
+        expected_projection_mode="post_aggregate_1x1_projection_baseline",
+        diagnostic_only=True,
+    ),
+}
+
+
+def resolve_projection_preset(args: argparse.Namespace) -> ProjectionPreset:
+    preset_name = str(getattr(args, "projection_preset", "joint_query_to_projected_observation_landmark"))
+    try:
+        return PROJECTION_PRESETS[preset_name]
+    except KeyError as exc:
+        raise ValueError(f"unsupported projection_preset: {preset_name}") from exc
+
+
+def projected_cache_expected_metadata(
+    *,
+    projection_mode: str,
+    feature_key: str,
+    matcha_joint_checkpoint: Path,
+    track_observations: Path,
+    feature_dim: int,
+) -> dict[str, object]:
+    expected = {
+        "projection_mode": str(projection_mode),
+        "feature_key": str(feature_key),
+        "track_observations_sha256": file_sha256_short(Path(track_observations)),
+        "feature_dim": int(feature_dim),
+    }
+    if str(projection_mode) != "raw_landmark_bank":
+        expected["matcha_joint_checkpoint_sha256"] = file_sha256_short(Path(matcha_joint_checkpoint))
+    return expected
+
+
+def validate_projected_cache_metadata(metadata: dict[str, object], expected: dict[str, object]) -> None:
+    mismatches: list[str] = []
+    required_keys: tuple[str, ...] = (
+        "projection_mode",
+        "feature_key",
+        "track_observations_sha256",
+        "feature_dim",
+        "descriptor_dimension",
+        "normalization_mode",
+        "descriptor_space_manifest",
+        "descriptor_space_id",
+    )
+    if expected.get("projection_mode") == "full_map_projected_observations":
+        required_keys = required_keys + (
+            "matcha_joint_checkpoint_sha256",
+            "mapper_class",
+            "mapper_config_hash",
+            "aggregation",
+            "source_image_list_hash",
+        )
+    for key in required_keys:
+        if key not in metadata or metadata.get(key) in ("", None):
+            mismatches.append(f"{key}: missing")
+    for key, expected_value in expected.items():
+        actual = metadata.get(key)
+        if actual != expected_value:
+            mismatches.append(f"{key}: expected {expected_value!r}, got {actual!r}")
+    actual_manifest = metadata.get("descriptor_space_manifest")
+    if not isinstance(actual_manifest, dict):
+        mismatches.append("descriptor_space_manifest: expected object")
+        actual_manifest = {}
+    else:
+        actual_id = str(actual_manifest.get("descriptor_space_id", ""))
+        recomputed_id = canonical_descriptor_space_id(actual_manifest)
+        if actual_id != recomputed_id:
+            mismatches.append(
+                f"descriptor_space_manifest.descriptor_space_id: expected recomputed {recomputed_id!r}, got {actual_id!r}"
+            )
+        if metadata.get("descriptor_space_id") != actual_id:
+            mismatches.append(
+                "descriptor_space_id: expected to match descriptor_space_manifest.descriptor_space_id, "
+                f"got {metadata.get('descriptor_space_id')!r} vs {actual_id!r}"
+            )
+    if expected.get("projection_mode") == "full_map_projected_observations":
+        aggregation = metadata.get("aggregation")
+        if not isinstance(aggregation, dict):
+            mismatches.append("aggregation: expected object")
+            aggregation = {}
+        expected_manifest = descriptor_space_manifest(
+            checkpoint_sha256=str(expected.get("matcha_joint_checkpoint_sha256", "")),
+            mapper_mode="joint_full_map",
+            feature_key=str(expected.get("feature_key", "")),
+            projection_source="projected_observation_full_map",
+            aggregation_method=str(aggregation.get("method", "")),
+            l2_normalize_observations=bool(aggregation.get("l2_normalize_observations", False)),
+            image_manifest_hash=str(metadata.get("source_image_list_hash", "")),
+            sfm_track_hash=str(expected.get("track_observations_sha256", "")),
+            descriptor_dimension=int(expected.get("feature_dim", 0)),
+            normalization_mode=str(metadata.get("normalization_mode", "")),
+        )
+        for key, expected_value in expected_manifest.items():
+            actual_value = actual_manifest.get(key) if isinstance(actual_manifest, dict) else None
+            if actual_value != expected_value:
+                mismatches.append(f"descriptor_space_manifest.{key}: expected {expected_value!r}, got {actual_value!r}")
+    if mismatches:
+        raise ValueError("projected landmark cache metadata mismatch: " + "; ".join(mismatches))
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -23,6 +161,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--measurement_checkpoint", default="")
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--feature_key", default="radio_final")
+    parser.add_argument(
+        "--projection_preset",
+        default="joint_query_to_projected_observation_landmark",
+        choices=tuple(PROJECTION_PRESETS),
+    )
+    parser.add_argument(
+        "--allow_diagnostic_projection",
+        action="store_true",
+        help="Allow diagnostic-only descriptor paths such as post-aggregate 1x1 projection baselines.",
+    )
     parser.add_argument("--query_projection", default="joint", choices=("joint", "raw"))
     parser.add_argument("--landmark_projection", default="joint", choices=("joint", "raw"))
     parser.add_argument("--projection_batch_size", type=int, default=8192)
@@ -60,6 +208,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--measurement_tensor_cache_size", type=int, default=64)
     parser.add_argument("--reference_rgb_cache_size", type=int, default=32)
     parser.add_argument("--top_k", type=int, default=2)
+    parser.add_argument("--nn_search_k_for_ratio", type=int, default=0)
+    parser.add_argument("--proposal_top_l", type=int, default=1)
     parser.add_argument("--ratio_threshold", type=float, default=0.95)
     parser.add_argument("--disable_ratio_test", action="store_true")
     parser.add_argument("--min_similarity", type=float, default=0.2)
@@ -82,8 +232,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--pnp_min_inliers", type=int, default=4)
     parser.add_argument("--enable_quality_rescore", action="store_true")
     parser.add_argument("--measurement_score_mode", default="match", choices=("match", "measurement_quality"))
+    parser.add_argument("--measurement_final_match_policy", default="keep_all", choices=("keep_all", "measured_only"))
     parser.add_argument("--min_measurement_confidence", type=float, default=None)
     parser.add_argument("--max_measurement_uncertainty_px", type=float, default=None)
+    parser.add_argument("--measurement_geometry_probability_model", default="")
+    parser.add_argument("--min_measurement_geometry_probability", type=float, default=None)
+    parser.add_argument("--drop_rejected_measurements", action="store_true")
     parser.add_argument("--pnp_min_soft_score", type=float, default=None)
     parser.add_argument("--pnp_weighted_refine", action="store_true")
     parser.add_argument("--pnp_weighted_loss", default="huber")
@@ -178,6 +332,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         save_landmark_index_npz,
         target_image_sizes_from_observations,
     )
+    from feature_extract.vfm.localization.measurement_calibration import load_geometry_probability_model
     from feature_extract.vfm.localization.measurement import RGBPatchMeasurementAdapter
     from feature_extract.vfm.map_lifting import load_selected_track_bank_npz
     from feature_extract.vfm.matcha_joint_training import load_matcha_joint_model
@@ -188,6 +343,12 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     runtime_device = resolve_runtime_device(str(args.device))
     device_text = str(runtime_device)
+    projection_preset = resolve_projection_preset(args)
+    if projection_preset.diagnostic_only and not bool(args.allow_diagnostic_projection):
+        raise ValueError(
+            f"projection_preset={projection_preset.name} is diagnostic-only; "
+            "rerun with --allow_diagnostic_projection only for ablation/debugging"
+        )
     query_manifest = TokenBankManifest.from_json(Path(args.query_manifest))
     query_manifest.validate(verify_checksums=False)
     observations = load_colmap_track_observations_jsonl(Path(args.track_observations_jsonl))
@@ -197,18 +358,38 @@ def main(argv: Sequence[str] | None = None) -> None:
     landmark_index = _limit_landmarks(landmark_index, int(args.max_landmarks))
 
     joint_run = load_matcha_joint_model(Path(args.matcha_joint_checkpoint), device=device_text)
-    if str(args.query_projection) == "joint":
+    query_projection = projection_preset.query_projection
+    landmark_projection = projection_preset.landmark_projection
+    if str(query_projection) == "joint":
         feature_mapper = JointFeatureMapper(joint_run.model, device=device_text)
     else:
         feature_mapper = _RawFeatureMapper()
 
     projected_cache_hit = False
     projected_cache_metadata: dict[str, object] = {}
+    query_descriptor_space_manifest: dict[str, object] = {}
+    landmark_descriptor_space_manifest: dict[str, object] = {}
     projected_cache_path = Path(args.projected_landmark_cache) if str(args.projected_landmark_cache) else None
+    if projection_preset.requires_projected_cache and projected_cache_path is None:
+        raise ValueError(f"--projected_landmark_cache is required for projection_preset={projection_preset.name}")
     if projected_cache_path is not None and projected_cache_path.exists():
         landmark_index, projected_cache_metadata = load_landmark_index_npz(projected_cache_path)
+        expected_cache_metadata = projected_cache_expected_metadata(
+            projection_mode=projection_preset.expected_projection_mode,
+            feature_key=str(args.feature_key),
+            matcha_joint_checkpoint=Path(args.matcha_joint_checkpoint),
+            track_observations=Path(args.track_observations_jsonl),
+            feature_dim=int(landmark_index.feature_dim),
+        )
+        validate_projected_cache_metadata(projected_cache_metadata, expected_cache_metadata)
+        landmark_descriptor_space_manifest = dict(projected_cache_metadata["descriptor_space_manifest"])
+        query_descriptor_space_manifest = dict(landmark_descriptor_space_manifest)
         projected_cache_hit = True
-    elif str(args.landmark_projection) == "joint":
+    elif str(landmark_projection) == "joint":
+        if projection_preset.expected_projection_mode == "full_map_projected_observations":
+            raise ValueError(
+                "full-map projected-observation landmark preset requires an existing projected_landmark_cache"
+            )
         landmark_index = project_landmark_index_features(
             landmark_index,
             lambda values: project_landmark_features_with_joint_model(
@@ -218,26 +399,81 @@ def main(argv: Sequence[str] | None = None) -> None:
                 batch_size=int(args.projection_batch_size),
             ),
         )
+        space_manifest = post_aggregate_1x1_descriptor_space_manifest(
+            checkpoint_sha256=file_sha256_short(Path(args.matcha_joint_checkpoint)),
+            feature_key=str(args.feature_key),
+            raw_landmark_bank_sha256=file_sha256_short(Path(args.landmark_bank)),
+            sfm_track_hash=file_sha256_short(Path(args.track_observations_jsonl)),
+            descriptor_dimension=int(landmark_index.feature_dim),
+            normalization_mode="row_l2_normalized_search",
+        )
+        landmark_descriptor_space_manifest = dict(space_manifest)
+        query_descriptor_space_manifest = dict(space_manifest)
         if projected_cache_path is not None:
             projected_cache_metadata = {
                 "landmark_bank": str(args.landmark_bank),
+                "landmark_bank_sha256": file_sha256_short(Path(args.landmark_bank)),
                 "matcha_joint_checkpoint": str(args.matcha_joint_checkpoint),
-                "landmark_projection": str(args.landmark_projection),
+                "matcha_joint_checkpoint_sha256": file_sha256_short(Path(args.matcha_joint_checkpoint)),
+                "track_observations": str(args.track_observations_jsonl),
+                "track_observations_sha256": file_sha256_short(Path(args.track_observations_jsonl)),
+                "feature_key": str(args.feature_key),
+                "projection_preset": str(projection_preset.name),
+                "projection_mode": str(projection_preset.expected_projection_mode),
+                "mapper_class": "JointFeatureMapper",
+                "normalization_mode": "row_l2_normalized_search",
+                "landmark_projection": str(landmark_projection),
+                "diagnostic_only": True,
                 "projection_batch_size": int(args.projection_batch_size),
+                "descriptor_space_manifest": space_manifest,
+                "descriptor_space_id": str(space_manifest["descriptor_space_id"]),
                 "feature_dim": int(landmark_index.feature_dim),
+                "descriptor_dimension": int(landmark_index.feature_dim),
             }
             save_landmark_index_npz(landmark_index, projected_cache_path, metadata=projected_cache_metadata)
     elif projected_cache_path is not None:
+        space_manifest = raw_descriptor_space_manifest(
+            feature_key=str(args.feature_key),
+            descriptor_dimension=int(landmark_index.feature_dim),
+            normalization_mode="row_l2_normalized_search",
+        )
+        landmark_descriptor_space_manifest = dict(space_manifest)
+        query_descriptor_space_manifest = dict(space_manifest)
         projected_cache_metadata = {
             "landmark_bank": str(args.landmark_bank),
-            "landmark_projection": str(args.landmark_projection),
+            "landmark_bank_sha256": file_sha256_short(Path(args.landmark_bank)),
+            "track_observations": str(args.track_observations_jsonl),
+            "track_observations_sha256": file_sha256_short(Path(args.track_observations_jsonl)),
+            "feature_key": str(args.feature_key),
+            "projection_preset": str(projection_preset.name),
+            "projection_mode": str(projection_preset.expected_projection_mode),
+            "normalization_mode": "row_l2_normalized_search",
+            "landmark_projection": str(landmark_projection),
+            "descriptor_space_manifest": space_manifest,
+            "descriptor_space_id": str(space_manifest["descriptor_space_id"]),
             "feature_dim": int(landmark_index.feature_dim),
+            "descriptor_dimension": int(landmark_index.feature_dim),
         }
         save_landmark_index_npz(landmark_index, projected_cache_path, metadata=projected_cache_metadata)
-    landmark_index = _limit_landmarks(landmark_index, int(args.max_landmarks))
-    if int(landmark_index.feature_dim) != int(joint_run.model.output_dim if str(args.query_projection) == "joint" else landmark_bank.feature_dim):
+    else:
+        space_manifest = raw_descriptor_space_manifest(
+            feature_key=str(args.feature_key),
+            descriptor_dimension=int(landmark_index.feature_dim),
+            normalization_mode="row_l2_normalized_search",
+        )
+        landmark_descriptor_space_manifest = dict(space_manifest)
+        query_descriptor_space_manifest = dict(space_manifest)
+    if query_descriptor_space_manifest.get("descriptor_space_id") != landmark_descriptor_space_manifest.get("descriptor_space_id"):
         raise ValueError(
-            "query and landmark descriptor dimensions do not match; use joint/joint or raw/raw projection modes"
+            "query and landmark descriptor space mismatch: "
+            f"query={query_descriptor_space_manifest.get('descriptor_space_id')!r}, "
+            f"landmark={landmark_descriptor_space_manifest.get('descriptor_space_id')!r}"
+        )
+    landmark_index = _limit_landmarks(landmark_index, int(args.max_landmarks))
+    if int(landmark_index.feature_dim) != int(joint_run.model.output_dim if str(query_projection) == "joint" else landmark_bank.feature_dim):
+        raise ValueError(
+            "query and landmark descriptor dimensions do not match for projection_preset="
+            f"{projection_preset.name}"
         )
 
     measurement_adapter = None
@@ -260,6 +496,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
         target_sizes = target_image_sizes_from_observations(observations, image_root=Path(args.image_root))
         owner_index = LandmarkOwnerObservationIndex(observations, target_image_sizes=target_sizes)
+    measurement_geometry_model = None
+    if str(args.measurement_geometry_probability_model):
+        measurement_geometry_model = load_geometry_probability_model(Path(args.measurement_geometry_probability_model))
 
     model_dir = Path(args.colmap_model_dir)
     cameras = read_colmap_cameras_binary(model_dir / "cameras.bin")
@@ -280,6 +519,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     retrieval_config = LandmarkRetrievalConfig(
         backend=str(args.landmark_search_backend),
         top_k=int(args.top_k),
+        nn_search_k_for_ratio=int(args.nn_search_k_for_ratio) if int(args.nn_search_k_for_ratio) > 0 else None,
+        proposal_top_l=int(args.proposal_top_l),
         ratio_threshold=None if bool(args.disable_ratio_test) else float(args.ratio_threshold),
         min_similarity=float(args.min_similarity),
         min_similarity_margin=args.min_similarity_margin,
@@ -329,8 +570,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         measurement_grid_rows=int(args.measurement_grid_rows),
         measurement_grid_cols=int(args.measurement_grid_cols),
         measurement_score_mode=str(args.measurement_score_mode),
+        measurement_final_match_policy=str(args.measurement_final_match_policy),
         min_measurement_confidence=args.min_measurement_confidence,
         max_measurement_uncertainty_px=args.max_measurement_uncertainty_px,
+        measurement_geometry_model=measurement_geometry_model,
+        min_measurement_geometry_probability=args.min_measurement_geometry_probability,
+        drop_rejected_measurements=bool(args.drop_rejected_measurements),
         enable_quality_rescore=bool(args.enable_quality_rescore),
         pnp_min_soft_score=args.pnp_min_soft_score,
         reference_rgb_cache_size=int(args.reference_rgb_cache_size),
@@ -357,6 +602,15 @@ def main(argv: Sequence[str] | None = None) -> None:
             "measurement_checkpoint": str(measurement_checkpoint),
             "query_projection": str(args.query_projection),
             "landmark_projection": str(args.landmark_projection),
+            "resolved_query_projection": str(query_projection),
+            "resolved_landmark_projection": str(landmark_projection),
+            "projection_preset": str(projection_preset.name),
+            "projection_preset_diagnostic_only": bool(projection_preset.diagnostic_only),
+            "allow_diagnostic_projection": bool(args.allow_diagnostic_projection),
+            "query_descriptor_space_id": query_descriptor_space_manifest.get("descriptor_space_id"),
+            "landmark_descriptor_space_id": landmark_descriptor_space_manifest.get("descriptor_space_id"),
+            "query_descriptor_space_manifest": query_descriptor_space_manifest,
+            "landmark_descriptor_space_manifest": landmark_descriptor_space_manifest,
             "projected_landmark_cache": "" if projected_cache_path is None else str(projected_cache_path),
             "projected_landmark_cache_hit": bool(projected_cache_hit),
             "projected_landmark_cache_metadata": projected_cache_metadata,
@@ -372,10 +626,14 @@ def main(argv: Sequence[str] | None = None) -> None:
             "submap_fallback_fraction": float(args.submap_fallback_fraction),
             "measurement_query_batch_size": int(args.measurement_query_batch_size),
             "measurement_selection_strategy": str(args.measurement_selection_strategy),
+            "measurement_final_match_policy": str(args.measurement_final_match_policy),
             "measurement_confidence_temperature": float(args.measurement_confidence_temperature),
             "measurement_confidence_bias": float(args.measurement_confidence_bias),
             "measurement_uncertainty_scale": float(args.measurement_uncertainty_scale),
             "measurement_uncertainty_floor_px": float(args.measurement_uncertainty_floor_px),
+            "measurement_geometry_probability_model": str(args.measurement_geometry_probability_model),
+            "min_measurement_geometry_probability": args.min_measurement_geometry_probability,
+            "drop_rejected_measurements": bool(args.drop_rejected_measurements),
             "measurement_amp": bool(args.measurement_amp),
             "measurement_amp_dtype": str(args.measurement_amp_dtype),
             "measurement_tensor_cache_size": int(args.measurement_tensor_cache_size),

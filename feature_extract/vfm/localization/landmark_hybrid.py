@@ -17,6 +17,7 @@ from feature_extract.vfm.colmap_tracks import ColmapCamera, ColmapImageObservati
 from feature_extract.vfm.landmark_feature_aggregation import LandmarkAggregationConfig, aggregate_landmark_features
 from feature_extract.vfm.localization.pipeline import _load_feature_map, _load_rgb_chw
 from feature_extract.vfm.localization.schemas import CoarseProposal, MeasurementResult
+from feature_extract.vfm.localization.measurement_calibration import GeometryProbabilityModel
 from feature_extract.vfm.map_lifting import TrackObservation
 from feature_extract.vfm.measurement_v1.rgb_patch_pose_proxy import scaled_colmap_camera
 from feature_extract.vfm.query_to_3d_matching import (
@@ -26,6 +27,7 @@ from feature_extract.vfm.query_to_3d_matching import (
     estimate_pose_pnp_ransac,
     filter_landmarks_by_reference_images,
     match_query_tokens_to_landmarks,
+    match_reprojection_errors,
     normalize_rows,
     token_grid_xy,
     )
@@ -49,6 +51,8 @@ class LandmarkRetrievalConfig:
 
     backend: str = "auto"
     top_k: int = 2
+    nn_search_k_for_ratio: int | None = None
+    proposal_top_l: int = 1
     ratio_threshold: float | None = 0.95
     min_similarity: float = 0.2
     min_similarity_margin: float | None = None
@@ -69,6 +73,10 @@ class LandmarkRetrievalConfig:
             raise ValueError("backend must be one of: auto, exact, faiss")
         if int(self.top_k) <= 0:
             raise ValueError("top_k must be positive")
+        if self.nn_search_k_for_ratio is not None and int(self.nn_search_k_for_ratio) <= 0:
+            raise ValueError("nn_search_k_for_ratio must be positive")
+        if int(self.proposal_top_l) <= 0:
+            raise ValueError("proposal_top_l must be positive")
         if self.ratio_threshold is not None and not 0.0 < float(self.ratio_threshold) <= 1.0:
             raise ValueError("ratio_threshold must be in (0, 1]")
         if self.min_similarity_margin is not None and float(self.min_similarity_margin) < 0.0:
@@ -853,7 +861,15 @@ def match_query_tokens_to_landmarks_ann(
     if query_heatmap is not None:
         heatmap_flat = np.asarray(query_heatmap, dtype=np.float32).reshape(-1)
         heatmap_values = heatmap_flat[token_indices]
-    search_top_k = min(max(int(config.top_k), 2 if config.ratio_threshold is not None else 1), len(index))
+    ratio_k = int(config.nn_search_k_for_ratio or config.top_k)
+    search_top_k = min(
+        max(
+            int(ratio_k),
+            int(config.proposal_top_l),
+            2 if config.ratio_threshold is not None else 1,
+        ),
+        len(index),
+    )
     top_indices, top_scores = _prepared_topk(
         prepared,
         query_features,
@@ -871,24 +887,24 @@ def match_query_tokens_to_landmarks_ann(
             continue
         candidate_indices = candidate_indices[valid_candidates]
         candidate_scores = candidate_scores[valid_candidates]
-        best_pos = int(np.argmax(candidate_scores))
-        landmark_idx = int(candidate_indices[best_pos])
-        similarity = float(candidate_scores[best_pos])
-        if similarity < float(config.min_similarity):
+        order = np.argsort(-candidate_scores, kind="mergesort")
+        best_pos = int(order[0])
+        best_similarity = float(candidate_scores[best_pos])
+        if best_similarity < float(config.min_similarity):
             continue
         other_scores = np.delete(candidate_scores, best_pos)
         ratio = 0.0
         second_similarity = None
         if other_scores.size >= 1:
             second_similarity = float(np.max(other_scores))
-            best_distance = max(0.0, 1.0 - similarity)
+            best_distance = max(0.0, 1.0 - best_similarity)
             second_distance = max(1e-6, 1.0 - second_similarity)
             ratio = float(best_distance / second_distance)
             if config.ratio_threshold is not None and ratio > float(config.ratio_threshold):
                 continue
-        similarity_margin = None if second_similarity is None else float(similarity - second_similarity)
+        best_similarity_margin = None if second_similarity is None else float(best_similarity - second_similarity)
         if config.min_similarity_margin is not None:
-            if similarity_margin is None or similarity_margin < float(config.min_similarity_margin):
+            if best_similarity_margin is None or best_similarity_margin < float(config.min_similarity_margin):
                 continue
         xy = query_xy[query_idx].astype(np.float64, copy=True)
         boundary = min(
@@ -897,26 +913,42 @@ def match_query_tokens_to_landmarks_ann(
             float(image_width - 1) - float(xy[0]),
             float(image_height - 1) - float(xy[1]),
         )
-        matches.append(
-            QueryTo3DMatch(
-                token_index=int(token_indices[query_idx]),
-                xy=xy,
-                track_id=int(index.track_ids[landmark_idx]),
-                xyz=index.xyz[landmark_idx].astype(np.float64, copy=True),
-                similarity=similarity,
-                ratio=ratio,
-                landmark_variance=float(index.mean_variances[landmark_idx]),
-                source=source,
-                observation_count=int(index.observation_counts[landmark_idx]),
-                visibility_count=len(index.observation_image_ids[landmark_idx]),
-                landmark_reprojection_error=float(index.reprojection_errors[landmark_idx]),
-                landmark_ambiguity=float(index.feature_ambiguities[landmark_idx]),
-                quality_weighted_similarity=similarity,
-                query_heatmap_score=None if heatmap_values is None else float(heatmap_values[query_idx]),
-                similarity_margin=similarity_margin,
-                distance_to_boundary_px=float(boundary),
+        for proposal_rank, rank_pos in enumerate(order[: int(config.proposal_top_l)], start=1):
+            landmark_idx = int(candidate_indices[int(rank_pos)])
+            similarity = float(candidate_scores[int(rank_pos)])
+            if similarity < float(config.min_similarity):
+                continue
+            next_similarity = None
+            if proposal_rank < len(order):
+                next_similarity = float(candidate_scores[int(order[proposal_rank])])
+            similarity_margin = (
+                best_similarity_margin
+                if proposal_rank == 1
+                else None if next_similarity is None else float(similarity - next_similarity)
             )
-        )
+            matches.append(
+                QueryTo3DMatch(
+                    token_index=int(token_indices[query_idx]),
+                    xy=xy.copy(),
+                    track_id=int(index.track_ids[landmark_idx]),
+                    xyz=index.xyz[landmark_idx].astype(np.float64, copy=True),
+                    similarity=similarity,
+                    ratio=ratio if proposal_rank == 1 else 0.0,
+                    landmark_variance=float(index.mean_variances[landmark_idx]),
+                    source=source,
+                    observation_count=int(index.observation_counts[landmark_idx]),
+                    visibility_count=len(index.observation_image_ids[landmark_idx]),
+                    landmark_reprojection_error=float(index.reprojection_errors[landmark_idx]),
+                    landmark_ambiguity=float(index.feature_ambiguities[landmark_idx]),
+                    quality_weighted_similarity=similarity,
+                    query_heatmap_score=None if heatmap_values is None else float(heatmap_values[query_idx]),
+                    similarity_margin=similarity_margin,
+                    distance_to_boundary_px=float(boundary),
+                    coarse_rank=int(proposal_rank),
+                    coarse_score=similarity,
+                    coarse_score_gap=similarity_margin,
+                )
+            )
     matches.sort(key=lambda item: item.similarity, reverse=True)
     if bool(config.deduplicate_tracks):
         deduped: list[QueryTo3DMatch] = []
@@ -936,6 +968,8 @@ def match_query_tokens_to_landmarks_ann(
             **selection_metadata,
             "valid_query_token_count": int(query_features.shape[0]),
             "search_top_k": int(search_top_k),
+            "nn_search_k_for_ratio": int(ratio_k),
+            "proposal_top_l": int(config.proposal_top_l),
             "deduplicate_tracks": bool(config.deduplicate_tracks),
             "output_match_count": int(len(matches)),
         }
@@ -1312,6 +1346,8 @@ def _track_quality_for_match(match: QueryTo3DMatch) -> float:
 def landmark_match_measurement_quality(match: QueryTo3DMatch) -> float:
     """Score a match for measurement/PnP using retrieval, selector, landmark and measurement cues."""
 
+    if match.geometry_probability is not None:
+        return _bounded_score(match.geometry_probability, default=0.0)
     components: list[tuple[float, float]] = [
         (0.45, _bounded_score(match.similarity, default=0.0)),
         (0.25, _bounded_score(match.query_heatmap_score, default=0.5)),
@@ -1531,8 +1567,20 @@ def select_measurement_candidates_after_coarse_pnp(
             "coarse_pnp_inlier_count": int(pnp.inlier_count),
             "measurement_filled_from_non_inliers": 0,
         }
+    values_for_selection = values
+    if pnp.pose_w2c is not None:
+        residuals = match_reprojection_errors(values, pnp.pose_w2c, camera)
+        threshold = max(float(pnp_reprojection_error_px), 1e-6)
+        values_for_selection = [
+            replace(
+                match,
+                local_consistency_score=float(1.0 / (1.0 + max(float(residual), 0.0) / threshold)),
+                patch_offset_consistency_before_px=float(residual),
+            )
+            for match, residual in zip(values, residuals)
+        ]
     selected, skipped, metadata = select_measurement_candidates_from_inlier_mask(
-        values,
+        values_for_selection,
         inlier_mask=pnp.inlier_mask,
         image_width=int(image_width),
         image_height=int(image_height),
@@ -1558,6 +1606,64 @@ def _proposal_from_landmark_match(match: QueryTo3DMatch, owner: LandmarkOwnerObs
     )
 
 
+def _match_with_measurement_verification(
+    base_match: QueryTo3DMatch,
+    measurement: MeasurementResult,
+    *,
+    min_measurement_confidence: float | None = None,
+    max_measurement_uncertainty_px: float | None = None,
+    measurement_geometry_model: GeometryProbabilityModel | None = None,
+    min_measurement_geometry_probability: float | None = None,
+    drop_rejected_measurements: bool = False,
+) -> tuple[QueryTo3DMatch | None, str, bool, bool, float | None]:
+    confidence = measurement.confidence if measurement.confidence is not None else _score_for_match(base_match)
+    candidate = replace(
+        base_match,
+        patch_offset_confidence=measurement.confidence,
+        measurement_sigma_px=measurement.uncertainty_px,
+    )
+    geometry_probability = None
+    if measurement_geometry_model is not None:
+        geometry_probability = float(measurement_geometry_model.predict_match(candidate))
+        candidate = replace(
+            candidate,
+            geometry_probability=geometry_probability,
+            pnp_soft_score=geometry_probability,
+            quality_weighted_similarity=geometry_probability,
+        )
+
+    reject_reason = ""
+    if min_measurement_confidence is not None and float(confidence) < float(min_measurement_confidence):
+        reject_reason = "rejected_low_confidence"
+    if (
+        not reject_reason
+        and max_measurement_uncertainty_px is not None
+        and measurement.uncertainty_px is not None
+        and float(measurement.uncertainty_px) > float(max_measurement_uncertainty_px)
+    ):
+        reject_reason = "rejected_high_uncertainty"
+    if (
+        not reject_reason
+        and min_measurement_geometry_probability is not None
+        and geometry_probability is not None
+        and float(geometry_probability) < float(min_measurement_geometry_probability)
+    ):
+        reject_reason = "rejected_low_geometry_probability"
+
+    if reject_reason:
+        updated = candidate
+        measurement_applied = False
+    else:
+        updated = replace(candidate, xy=np.asarray(measurement.measured_query_xy, dtype=np.float64).reshape(2))
+        measurement_applied = True
+
+    if measurement_geometry_model is None:
+        updated = _with_measurement_quality_score(updated)
+
+    measurement_kept = not (bool(reject_reason) and bool(drop_rejected_measurements))
+    return (updated if measurement_kept else None), reject_reason, measurement_applied, measurement_kept, geometry_probability
+
+
 def refine_landmark_matches_with_measurement(
     *,
     query_id: str,
@@ -1568,6 +1674,9 @@ def refine_landmark_matches_with_measurement(
     reference_image_loader: Callable[[str], np.ndarray],
     min_measurement_confidence: float | None = None,
     max_measurement_uncertainty_px: float | None = None,
+    measurement_geometry_model: GeometryProbabilityModel | None = None,
+    min_measurement_geometry_probability: float | None = None,
+    drop_rejected_measurements: bool = False,
 ) -> tuple[list[QueryTo3DMatch], list[dict[str, Any]]]:
     """Refine query coordinates for landmark matches using real owner-view RGB patches."""
 
@@ -1624,34 +1733,19 @@ def refine_landmark_matches_with_measurement(
                 refined.append(match)
             continue
         base_match, owner, measurement = measured
-        confidence = measurement.confidence if measurement.confidence is not None else _score_for_match(base_match)
-        reject_reason = ""
-        if min_measurement_confidence is not None and float(confidence) < float(min_measurement_confidence):
-            reject_reason = "rejected_low_confidence"
-        if (
-            not reject_reason
-            and max_measurement_uncertainty_px is not None
-            and measurement.uncertainty_px is not None
-            and float(measurement.uncertainty_px) > float(max_measurement_uncertainty_px)
-        ):
-            reject_reason = "rejected_high_uncertainty"
-        if reject_reason:
-            updated = replace(
-                base_match,
-                patch_offset_confidence=measurement.confidence,
-                measurement_sigma_px=measurement.uncertainty_px,
-            )
-        else:
-            updated = replace(
-                base_match,
-                xy=np.asarray(measurement.measured_query_xy, dtype=np.float64).reshape(2),
-                patch_offset_confidence=measurement.confidence,
-                measurement_sigma_px=measurement.uncertainty_px,
-            )
-        updated = _with_measurement_quality_score(updated)
-        refined.append(updated)
+        updated, reject_reason, measurement_applied, measurement_kept, geometry_probability = _match_with_measurement_verification(
+            base_match,
+            measurement,
+            min_measurement_confidence=min_measurement_confidence,
+            max_measurement_uncertainty_px=max_measurement_uncertainty_px,
+            measurement_geometry_model=measurement_geometry_model,
+            min_measurement_geometry_probability=min_measurement_geometry_probability,
+            drop_rejected_measurements=drop_rejected_measurements,
+        )
+        if updated is not None:
+            refined.append(updated)
         before = np.asarray(base_match.xy, dtype=np.float64).reshape(2)
-        after = np.asarray(updated.xy, dtype=np.float64).reshape(2)
+        after = before if updated is None else np.asarray(updated.xy, dtype=np.float64).reshape(2)
         rows.append(
             {
                 "query_id": str(query_id),
@@ -1666,7 +1760,9 @@ def refine_landmark_matches_with_measurement(
                 "owner_y": float(owner.xy[1]),
                 "confidence": None if measurement.confidence is None else float(measurement.confidence),
                 "uncertainty_px": None if measurement.uncertainty_px is None else float(measurement.uncertainty_px),
-                "measurement_applied": not bool(reject_reason),
+                "geometry_probability": None if geometry_probability is None else float(geometry_probability),
+                "measurement_applied": bool(measurement_applied),
+                "measurement_kept": bool(measurement_kept),
             }
         )
     return refined, rows
@@ -1680,6 +1776,9 @@ def refine_landmark_match_batches_with_measurement(
     reference_image_loader: Callable[[str], np.ndarray],
     min_measurement_confidence: float | None = None,
     max_measurement_uncertainty_px: float | None = None,
+    measurement_geometry_model: GeometryProbabilityModel | None = None,
+    min_measurement_geometry_probability: float | None = None,
+    drop_rejected_measurements: bool = False,
 ) -> dict[str, tuple[list[QueryTo3DMatch], list[dict[str, Any]]]]:
     """Refine multiple queries together when the adapter supports cross-query measurement batching."""
 
@@ -1695,6 +1794,9 @@ def refine_landmark_match_batches_with_measurement(
                 reference_image_loader=reference_image_loader,
                 min_measurement_confidence=min_measurement_confidence,
                 max_measurement_uncertainty_px=max_measurement_uncertainty_px,
+                measurement_geometry_model=measurement_geometry_model,
+                min_measurement_geometry_probability=min_measurement_geometry_probability,
+                drop_rejected_measurements=drop_rejected_measurements,
             )
             for query_id, query_rgb, matches in query_batches
         }
@@ -1747,34 +1849,19 @@ def refine_landmark_match_batches_with_measurement(
                 refined.append(match)
                 continue
             base_match, owner, measurement = measured
-            confidence = measurement.confidence if measurement.confidence is not None else _score_for_match(base_match)
-            reject_reason = ""
-            if min_measurement_confidence is not None and float(confidence) < float(min_measurement_confidence):
-                reject_reason = "rejected_low_confidence"
-            if (
-                not reject_reason
-                and max_measurement_uncertainty_px is not None
-                and measurement.uncertainty_px is not None
-                and float(measurement.uncertainty_px) > float(max_measurement_uncertainty_px)
-            ):
-                reject_reason = "rejected_high_uncertainty"
-            if reject_reason:
-                updated = replace(
-                    base_match,
-                    patch_offset_confidence=measurement.confidence,
-                    measurement_sigma_px=measurement.uncertainty_px,
-                )
-            else:
-                updated = replace(
-                    base_match,
-                    xy=np.asarray(measurement.measured_query_xy, dtype=np.float64).reshape(2),
-                    patch_offset_confidence=measurement.confidence,
-                    measurement_sigma_px=measurement.uncertainty_px,
-                )
-            updated = _with_measurement_quality_score(updated)
-            refined.append(updated)
+            updated, reject_reason, measurement_applied, measurement_kept, geometry_probability = _match_with_measurement_verification(
+                base_match,
+                measurement,
+                min_measurement_confidence=min_measurement_confidence,
+                max_measurement_uncertainty_px=max_measurement_uncertainty_px,
+                measurement_geometry_model=measurement_geometry_model,
+                min_measurement_geometry_probability=min_measurement_geometry_probability,
+                drop_rejected_measurements=drop_rejected_measurements,
+            )
+            if updated is not None:
+                refined.append(updated)
             before = np.asarray(base_match.xy, dtype=np.float64).reshape(2)
-            after = np.asarray(updated.xy, dtype=np.float64).reshape(2)
+            after = before if updated is None else np.asarray(updated.xy, dtype=np.float64).reshape(2)
             rows.append(
                 {
                     "query_id": qid,
@@ -1789,7 +1876,9 @@ def refine_landmark_match_batches_with_measurement(
                     "owner_y": float(owner.xy[1]),
                     "confidence": None if measurement.confidence is None else float(measurement.confidence),
                     "uncertainty_px": None if measurement.uncertainty_px is None else float(measurement.uncertainty_px),
-                    "measurement_applied": not bool(reject_reason),
+                    "geometry_probability": None if geometry_probability is None else float(geometry_probability),
+                    "measurement_applied": bool(measurement_applied),
+                    "measurement_kept": bool(measurement_kept),
                 }
             )
         output[qid] = (refined, rows)
@@ -1825,6 +1914,15 @@ def _query_match_rows(query_id: str, matches: Sequence[QueryTo3DMatch]) -> list[
                 if match.patch_offset_confidence is None
                 else float(match.patch_offset_confidence),
                 "measurement_sigma_px": None if match.measurement_sigma_px is None else float(match.measurement_sigma_px),
+                "geometry_probability": None
+                if match.geometry_probability is None
+                else float(match.geometry_probability),
+                "local_consistency_score": None
+                if match.local_consistency_score is None
+                else float(match.local_consistency_score),
+                "patch_offset_consistency_before_px": None
+                if match.patch_offset_consistency_before_px is None
+                else float(match.patch_offset_consistency_before_px),
             }
         )
     return rows
@@ -1941,8 +2039,12 @@ def run_real_radio_landmark_hybrid_eval(
     measurement_grid_rows: int = 4,
     measurement_grid_cols: int = 4,
     measurement_score_mode: str = "match",
+    measurement_final_match_policy: str = "keep_all",
     min_measurement_confidence: float | None = None,
     max_measurement_uncertainty_px: float | None = None,
+    measurement_geometry_model: GeometryProbabilityModel | None = None,
+    min_measurement_geometry_probability: float | None = None,
+    drop_rejected_measurements: bool = False,
     enable_quality_rescore: bool = False,
     pnp_min_soft_score: float | None = None,
     reference_rgb_cache_size: int = 32,
@@ -1980,6 +2082,9 @@ def run_real_radio_landmark_hybrid_eval(
         else None
     )
     pending_measurement: list[dict[str, Any]] = []
+    final_policy = str(measurement_final_match_policy)
+    if final_policy not in {"keep_all", "measured_only"}:
+        raise ValueError("measurement_final_match_policy must be 'keep_all' or 'measured_only'")
 
     def load_reference_rgb_cached(image_id: str) -> np.ndarray:
         key = str(image_id)
@@ -2021,6 +2126,9 @@ def run_real_radio_landmark_hybrid_eval(
             reference_image_loader=load_reference_rgb_cached,
             min_measurement_confidence=min_measurement_confidence,
             max_measurement_uncertainty_px=max_measurement_uncertainty_px,
+            measurement_geometry_model=measurement_geometry_model,
+            min_measurement_geometry_probability=min_measurement_geometry_probability,
+            drop_rejected_measurements=drop_rejected_measurements,
         )
         for item in pending_measurement:
             query_id = str(item["query_id"])
@@ -2028,7 +2136,9 @@ def run_real_radio_landmark_hybrid_eval(
             if bool(enable_quality_rescore):
                 refined_measurement_matches = rescore_landmark_matches_for_measurement(refined_measurement_matches)
             measurement_skipped = list(item["measurement_skipped"])
-            if measurement_skipped:
+            if final_policy == "measured_only":
+                matches = list(refined_measurement_matches)
+            elif measurement_skipped:
                 matches = sorted(
                     list(refined_measurement_matches) + measurement_skipped,
                     key=_score_for_match,
@@ -2257,6 +2367,7 @@ def run_real_radio_landmark_hybrid_eval(
         "measurement_grid_rows": int(measurement_grid_rows),
         "measurement_grid_cols": int(measurement_grid_cols),
         "measurement_score_mode": str(measurement_score_mode),
+        "measurement_final_match_policy": final_policy,
         "measurement_adapter_config": {}
         if measurement_adapter is None
         else {
@@ -2274,6 +2385,11 @@ def run_real_radio_landmark_hybrid_eval(
         "max_measurement_uncertainty_px": None
         if max_measurement_uncertainty_px is None
         else float(max_measurement_uncertainty_px),
+        "measurement_geometry_probability_model_enabled": bool(measurement_geometry_model is not None),
+        "min_measurement_geometry_probability": None
+        if min_measurement_geometry_probability is None
+        else float(min_measurement_geometry_probability),
+        "drop_rejected_measurements": bool(drop_rejected_measurements),
         "enable_quality_rescore": bool(enable_quality_rescore),
         "pnp_min_soft_score": None if pnp_min_soft_score is None else float(pnp_min_soft_score),
         "pnp_weighted_refine": bool(pnp_weighted_refine),
@@ -2312,6 +2428,9 @@ def run_real_radio_landmark_hybrid_eval(
         else {
             "backend": str(retrieval_config.backend),
             "top_k": int(retrieval_config.top_k),
+            "top_k_legacy_alias_for_nn_search": int(retrieval_config.top_k),
+            "nn_search_k_for_ratio": int(retrieval_config.nn_search_k_for_ratio or retrieval_config.top_k),
+            "proposal_top_l": int(retrieval_config.proposal_top_l),
             "ratio_threshold": retrieval_config.ratio_threshold,
             "min_similarity": float(retrieval_config.min_similarity),
             "min_similarity_margin": retrieval_config.min_similarity_margin,

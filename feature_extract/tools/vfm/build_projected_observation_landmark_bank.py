@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 from typing import Sequence
@@ -10,6 +11,7 @@ from typing import Sequence
 import torch
 
 from feature_extract.vfm.artifacts import file_sha256_short
+from feature_extract.vfm.localization.descriptor_space import descriptor_space_manifest
 from feature_extract.vfm.localization.feature_mapper import JointFeatureMapper
 from feature_extract.vfm.localization.landmark_hybrid import (
     build_projected_observation_landmark_index,
@@ -65,6 +67,18 @@ def _resolve_device(device: str) -> str:
     return str(requested)
 
 
+def source_image_list_hash(manifest: TokenBankManifest) -> str:
+    payload = [
+        {
+            "image_id": str(record.image_id),
+            "token_path": str(record.token_path),
+            "layers": [str(layer.name) for layer in record.layers],
+        }
+        for record in manifest.records
+    ]
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     args = parse_args(argv)
     device = _resolve_device(str(args.device))
@@ -90,11 +104,40 @@ def main(argv: Sequence[str] | None = None) -> None:
         l2_normalize_observations=bool(args.l2_normalize_observations),
     )
     output_index = Path(args.output_index)
+    checkpoint_sha256 = file_sha256_short(Path(args.matcha_joint_checkpoint))
+    track_sha256 = file_sha256_short(Path(args.track_observations))
+    token_manifest_sha256 = file_sha256_short(Path(args.token_manifest))
+    image_manifest_hash = source_image_list_hash(manifest)
+    aggregation = dict(metadata.get("aggregation", {}))
+    space_manifest = descriptor_space_manifest(
+        checkpoint_sha256=checkpoint_sha256,
+        mapper_mode="joint_full_map",
+        feature_key=str(args.feature_key),
+        projection_source="projected_observation_full_map",
+        aggregation_method=str(aggregation.get("method", args.method)),
+        l2_normalize_observations=bool(aggregation.get("l2_normalize_observations", bool(args.l2_normalize_observations))),
+        image_manifest_hash=image_manifest_hash,
+        sfm_track_hash=track_sha256,
+        descriptor_dimension=int(index.feature_dim),
+        normalization_mode="row_l2_normalized_search",
+    )
     output_metadata = {
         **metadata,
+        "projection_mode": "full_map_projected_observations",
+        "feature_key": str(args.feature_key),
+        "mapper_class": "JointFeatureMapper",
+        "mapper_config_hash": checkpoint_sha256,
+        "normalization_mode": "row_l2_normalized_search",
         "track_observations": str(args.track_observations),
+        "track_observations_sha256": track_sha256,
         "token_manifest": str(args.token_manifest),
+        "token_manifest_sha256": token_manifest_sha256,
+        "source_image_list_hash": image_manifest_hash,
         "matcha_joint_checkpoint": str(args.matcha_joint_checkpoint),
+        "matcha_joint_checkpoint_sha256": checkpoint_sha256,
+        "descriptor_space_manifest": space_manifest,
+        "descriptor_space_id": str(space_manifest["descriptor_space_id"]),
+        "descriptor_dimension": int(index.feature_dim),
         "device": device,
     }
     save_landmark_index_npz(index, output_index, metadata=output_metadata)
@@ -104,15 +147,15 @@ def main(argv: Sequence[str] | None = None) -> None:
         "input_files": {
             "track_observations": {
                 "path": str(args.track_observations),
-                "sha256": file_sha256_short(Path(args.track_observations)),
+                "sha256": track_sha256,
             },
             "token_manifest": {
                 "path": str(args.token_manifest),
-                "sha256": file_sha256_short(Path(args.token_manifest)),
+                "sha256": token_manifest_sha256,
             },
             "matcha_joint_checkpoint": {
                 "path": str(args.matcha_joint_checkpoint),
-                "sha256": file_sha256_short(Path(args.matcha_joint_checkpoint)),
+                "sha256": checkpoint_sha256,
             },
         },
         "output_files": {

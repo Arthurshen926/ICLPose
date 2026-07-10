@@ -42,6 +42,9 @@ def test_build_eval_command_uses_fullbank_no_submap_and_optional_measurement(tmp
         "device": "cuda",
         "max_queries": 0,
         "measurement_selection_strategy": "coarse_pnp_inliers",
+        "proposal_top_l": 10,
+        "nn_search_k_for_ratio": 20,
+        "disable_ratio_test": True,
     }
 
     no_measurement = build_eval_command(common, measurement_k=0)
@@ -51,6 +54,9 @@ def test_build_eval_command_uses_fullbank_no_submap_and_optional_measurement(tmp
     assert no_measurement[no_measurement.index("--submap_mode") + 1] == "none"
     assert no_measurement[no_measurement.index("--landmark_search_backend") + 1] == "faiss"
     assert no_measurement[no_measurement.index("--query_token_selection") + 1] == "heatmap"
+    assert no_measurement[no_measurement.index("--proposal_top_l") + 1] == "10"
+    assert no_measurement[no_measurement.index("--nn_search_k_for_ratio") + 1] == "20"
+    assert "--disable_ratio_test" in no_measurement
     assert "--measurement_mode" not in no_measurement
     assert "--measurement_max_matches" not in no_measurement
 

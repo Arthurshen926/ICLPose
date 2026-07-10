@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import zipfile
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -35,6 +36,7 @@ from feature_extract.vfm.matcha_joint_training import (
     MatchaJointTrainingSet,
     RadioDualAttentionFusionJointModel,
     MatchaStyleJointModel,
+    _provider_training_pair_ordinals,
     load_matcha_joint_model,
     load_matcha_joint_training_set_manifest,
     load_matcha_joint_training_set_npz,
@@ -47,6 +49,45 @@ from feature_extract.vfm.matcha_joint_training import (
     train_matcha_joint_model_from_manifest,
     train_matcha_joint_model_from_sample_provider,
 )
+from feature_extract.vfm.measurement_v1.rgb_patch_measurement_branch import crop_rgb_window
+
+
+def test_provider_training_pair_ordinals_partition_global_pair_stream() -> None:
+    rank_zero = _provider_training_pair_ordinals(
+        steps=3,
+        gradient_accumulation_pairs=2,
+        pair_batch_size=1,
+        rank=0,
+        world_size=2,
+    )
+    rank_one = _provider_training_pair_ordinals(
+        steps=3,
+        gradient_accumulation_pairs=2,
+        pair_batch_size=1,
+        rank=1,
+        world_size=2,
+    )
+
+    assert rank_zero == [0, 1, 4, 5, 8, 9]
+    assert rank_one == [2, 3, 6, 7, 10, 11]
+    assert sorted(rank_zero + rank_one) == list(range(12))
+
+    batched_rank_zero = _provider_training_pair_ordinals(
+        steps=2,
+        gradient_accumulation_pairs=1,
+        pair_batch_size=2,
+        rank=0,
+        world_size=2,
+    )
+    batched_rank_one = _provider_training_pair_ordinals(
+        steps=2,
+        gradient_accumulation_pairs=1,
+        pair_batch_size=2,
+        rank=1,
+        world_size=2,
+    )
+    assert batched_rank_zero == [0, 1, 4, 5]
+    assert batched_rank_one == [2, 3, 6, 7]
 
 
 def test_render_pair_cache_key_includes_actual_perturbation_metadata() -> None:
@@ -1412,6 +1453,42 @@ def test_joint_measurement_patch_loss_is_part_of_total_loss_and_updates_branch()
 
     after = model.measurement_patch_branch.logit_scale.detach()
     assert float(torch.abs(before - after).item()) > 0.0
+
+    merged = joint_training.merge_matcha_joint_training_sets([samples, samples])
+    _batched_loss, batched_metrics = joint_training._joint_measurement_patch_loss(
+        model,
+        merged,
+        config=replace(config, measurement_patch_max_samples_per_pair=2),
+        device=torch.device("cpu"),
+        sample_seed=17,
+    )
+    assert batched_metrics["valid_count"] == 4.0
+
+
+def test_measurement_pair_grouped_crop_matches_repeated_rgb_indexing() -> None:
+    images = torch.arange(2 * 3 * 16 * 16, dtype=torch.float32).reshape(2, 3, 16, 16) / 1000.0
+    pairs = torch.asarray([1, 0, 1, 0], dtype=torch.long)
+    centers = torch.asarray([[5.0, 6.0], [4.0, 4.0], [10.0, 9.0], [12.0, 11.0]], dtype=torch.float32)
+
+    expected, _ = crop_rgb_window(
+        images[pairs],
+        centers,
+        radius_px=2.0,
+        step_px=1.0,
+        image_width=16,
+        image_height=16,
+    )
+    actual = joint_training._crop_rgb_windows_for_pairs(
+        images,
+        pairs,
+        centers,
+        radius_px=2.0,
+        step_px=1.0,
+        image_width=16,
+        image_height=16,
+    )
+
+    assert torch.allclose(actual, expected)
 
 
 def test_joint_measurement_patch_scales_original_supervision_xy_to_cached_rgb_grid() -> None:

@@ -6,7 +6,8 @@ import argparse
 import csv
 import json
 import time
-from collections import OrderedDict
+from collections import Counter, OrderedDict
+from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import RLock
 from typing import Any, Mapping, Sequence
@@ -50,6 +51,140 @@ def _optional_float(row: Mapping[str, object], *names: str, default: float = np.
         return float(text)
     except ValueError:
         return float(default)
+
+
+def _optional_int(row: Mapping[str, object], *names: str, default: int = -1) -> int:
+    text = _first_text(row, *names)
+    if not text:
+        return int(default)
+    try:
+        return int(text)
+    except ValueError:
+        return int(default)
+
+
+@dataclass(frozen=True)
+class SfMImageTrackObservations:
+    track_ids: np.ndarray
+    xy: np.ndarray
+    image_sizes: np.ndarray
+    xyz: np.ndarray
+    track_lengths: np.ndarray
+
+
+@dataclass(frozen=True)
+class SfMTrackObservationIndex:
+    by_image: dict[str, SfMImageTrackObservations]
+    track_xyz_by_id: dict[int, np.ndarray]
+
+    def common_tracks(
+        self,
+        query_image_id: str,
+        reference_image_id: str,
+        *,
+        query_source_size: tuple[int, int],
+        reference_source_size: tuple[int, int],
+    ) -> dict[str, np.ndarray]:
+        query = self.by_image.get(str(query_image_id))
+        reference = self.by_image.get(str(reference_image_id))
+        if query is None or reference is None:
+            return _empty_landmark_retrieval_supervision()
+        track_ids, query_indices, reference_indices = np.intersect1d(
+            query.track_ids,
+            reference.track_ids,
+            assume_unique=True,
+            return_indices=True,
+        )
+        if track_ids.size == 0:
+            return _empty_landmark_retrieval_supervision()
+
+        def scale_xy(
+            xy: np.ndarray,
+            source_sizes: np.ndarray,
+            target_size: tuple[int, int],
+        ) -> np.ndarray:
+            target_width, target_height = map(int, target_size)
+            widths = source_sizes[:, 0].astype(np.float64)
+            heights = source_sizes[:, 1].astype(np.float64)
+            source_aspect = widths / np.maximum(heights, 1.0)
+            target_aspect = float(target_width) / max(float(target_height), 1.0)
+            if np.any(np.abs(source_aspect - target_aspect) > 1e-3):
+                raise ValueError("SfM and source RGB aspect ratios differ; an explicit crop transform is required")
+            output = np.asarray(xy, dtype=np.float64).copy()
+            output[:, 0] *= max(float(target_width - 1), 1.0) / np.maximum(widths - 1.0, 1.0)
+            output[:, 1] *= max(float(target_height - 1), 1.0) / np.maximum(heights - 1.0, 1.0)
+            return output
+
+        query_xy = scale_xy(query.xy[query_indices], query.image_sizes[query_indices], query_source_size)
+        reference_xy = scale_xy(
+            reference.xy[reference_indices],
+            reference.image_sizes[reference_indices],
+            reference_source_size,
+        )
+        return {
+            "query_xy": query_xy,
+            "reference_xy": reference_xy,
+            "track_ids": track_ids.astype(np.int64, copy=False),
+            "track_xyz": query.xyz[query_indices].astype(np.float64, copy=False),
+            "support_view_counts": reference.track_lengths[reference_indices].astype(np.int64, copy=False),
+        }
+
+
+def _empty_landmark_retrieval_supervision() -> dict[str, np.ndarray]:
+    return {
+        "query_xy": np.zeros((0, 2), dtype=np.float64),
+        "reference_xy": np.zeros((0, 2), dtype=np.float64),
+        "track_ids": np.zeros((0,), dtype=np.int64),
+        "track_xyz": np.zeros((0, 3), dtype=np.float64),
+        "support_view_counts": np.zeros((0,), dtype=np.int64),
+    }
+
+
+def load_track_observation_index(path: Path) -> SfMTrackObservationIndex:
+    grouped: dict[str, dict[int, tuple[int, np.ndarray, np.ndarray, np.ndarray, int, float]]] = {}
+    xyz_lookup: dict[int, np.ndarray] = {}
+    with Path(path).open() as handle:
+        for line_number, line in enumerate(handle, start=1):
+            text = line.strip()
+            if not text:
+                continue
+            row = json.loads(text)
+            track_id = int(row["track_id"])
+            xyz = np.asarray(row["xyz"], dtype=np.float64).reshape(3)
+            xy = np.asarray(row["xy"], dtype=np.float64).reshape(2)
+            image_size = np.asarray([int(row["image_width"]), int(row["image_height"])], dtype=np.int64)
+            if not np.isfinite(xyz).all() or not np.isfinite(xy).all() or np.any(image_size <= 0):
+                continue
+            previous = xyz_lookup.get(track_id)
+            if previous is not None and not np.allclose(previous, xyz, rtol=0.0, atol=1e-6):
+                raise ValueError(f"inconsistent xyz for track {track_id} at {path}:{line_number}")
+            xyz_lookup.setdefault(track_id, xyz)
+            image_id = str(row["image_id"])
+            reprojection_error = float(row.get("reprojection_error", np.inf))
+            value = (track_id, xy, image_size, xyz, int(row.get("track_length", 0)), reprojection_error)
+            existing = grouped.setdefault(image_id, {}).get(track_id)
+            if existing is None or float(value[5]) < float(existing[5]):
+                grouped[image_id][track_id] = value
+    by_image: dict[str, SfMImageTrackObservations] = {}
+    for image_id, by_track in grouped.items():
+        values = list(by_track.values())
+        values.sort(key=lambda item: int(item[0]))
+        track_ids = np.asarray([item[0] for item in values], dtype=np.int64)
+        by_image[image_id] = SfMImageTrackObservations(
+            track_ids=track_ids,
+            xy=np.stack([item[1] for item in values], axis=0),
+            image_sizes=np.stack([item[2] for item in values], axis=0),
+            xyz=np.stack([item[3] for item in values], axis=0),
+            track_lengths=np.asarray([item[4] for item in values], dtype=np.int64),
+        )
+    if not by_image or not xyz_lookup:
+        raise ValueError(f"track observation file contains no finite observations: {path}")
+    return SfMTrackObservationIndex(by_image=by_image, track_xyz_by_id=xyz_lookup)
+
+
+def load_track_xyz_lookup(path: Path) -> dict[int, np.ndarray]:
+    """Load one canonical XYZ per SfM track from observation JSONL."""
+    return load_track_observation_index(Path(path)).track_xyz_by_id
 
 
 def _parse_bool(value: object) -> bool:
@@ -162,6 +297,18 @@ def _dedupe_matches(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(by_pair.values(), key=lambda value: (int(value["query_index"]), int(value["reference_index"])))
 
 
+def _dedupe_track_observations(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_track: dict[int, dict[str, Any]] = {}
+    for item in items:
+        track_id = int(item["track_id"])
+        if track_id < 0 or not bool(item.get("same_track", False)):
+            continue
+        existing = by_track.get(track_id)
+        if existing is None or float(item["uncertainty_px"]) < float(existing["uncertainty_px"]):
+            by_track[track_id] = item
+    return [by_track[track_id] for track_id in sorted(by_track)]
+
+
 def _confidence_from_error(error_px: float, *, positive_error_px: float) -> float:
     if not np.isfinite(float(error_px)):
         return 1.0
@@ -180,7 +327,8 @@ def _build_supervision_for_pair(
     positive_reprojection_error_px: float,
     require_same_track: bool,
     include_dustbin_rows: bool,
-) -> tuple[MatchaCoarseSupervision | None, dict[str, int]]:
+    track_xyz_by_id: Mapping[int, np.ndarray] | None = None,
+) -> tuple[MatchaCoarseSupervision | None, dict[str, int], dict[str, np.ndarray]]:
     q_width, q_height = int(query_image_size[0]), int(query_image_size[1])
     r_width, r_height = int(reference_image_size[0]), int(reference_image_size[1])
     q_grid_h, q_grid_w = int(query_grid_hw[0]), int(query_grid_hw[1])
@@ -257,8 +405,10 @@ def _build_supervision_for_pair(
             "reference_soft": rsoft[0].astype(np.float32, copy=False),
             "uncertainty_px": float(residual),
         }
+        track_id = _optional_int(row, "track_id")
+        support_track_id = _optional_int(row, "support_track_id", "reference_track_id")
         is_dustbin = _parse_bool(row.get("target_is_dustbin", ""))
-        same_track = _first_text(row, "track_id") == _first_text(row, "support_track_id", "reference_track_id")
+        same_track = track_id >= 0 and track_id == support_track_id
         if is_dustbin:
             skipped["dustbin_rows"] += 1
             if include_dustbin_rows:
@@ -267,12 +417,41 @@ def _build_supervision_for_pair(
         if require_same_track and not same_track:
             skipped["track_mismatch"] += 1
             continue
+        item["track_id"] = int(track_id)
+        item["same_track"] = bool(same_track)
+        item["support_view_count"] = max(0, _optional_int(row, "track_length", default=0))
+        item["landmark_xyz"] = np.asarray(
+            np.full((3,), np.nan, dtype=np.float64)
+            if track_xyz_by_id is None or int(track_id) not in track_xyz_by_id
+            else track_xyz_by_id[int(track_id)],
+            dtype=np.float64,
+        ).reshape(3)
         item["confidence"] = _confidence_from_error(residual, positive_error_px=float(positive_reprojection_error_px))
         positive.append(item)
-    positive = _dedupe_matches(positive)
+    retrieval_positive = _dedupe_track_observations(positive)
+    positive = _dedupe_matches(retrieval_positive)
+    empty_retrieval = {
+        "query_xy": np.zeros((0, 2), dtype=np.float64),
+        "reference_xy": np.zeros((0, 2), dtype=np.float64),
+        "track_ids": np.zeros((0,), dtype=np.int64),
+        "track_xyz": np.zeros((0, 3), dtype=np.float64),
+        "support_view_counts": np.zeros((0,), dtype=np.int64),
+    }
     if not positive:
-        return None, skipped
+        return None, skipped, empty_retrieval
     no_match = _dedupe_matches(no_match)
+    retrieval = empty_retrieval
+    if retrieval_positive:
+        retrieval = {
+            "query_xy": np.stack([item["query_xy"] for item in retrieval_positive], axis=0),
+            "reference_xy": np.stack([item["reference_xy"] for item in retrieval_positive], axis=0),
+            "track_ids": np.asarray([item["track_id"] for item in retrieval_positive], dtype=np.int64),
+            "track_xyz": np.stack([item["landmark_xyz"] for item in retrieval_positive], axis=0),
+            "support_view_counts": np.asarray(
+                [item["support_view_count"] for item in retrieval_positive],
+                dtype=np.int64,
+            ),
+        }
     return (
         MatchaCoarseSupervision(
             query_indices=np.asarray([item["query_index"] for item in positive], dtype=np.int64),
@@ -293,8 +472,12 @@ def _build_supervision_for_pair(
             no_match_roundtrip_errors_px=np.asarray([item["uncertainty_px"] for item in no_match], dtype=np.float32),
             no_match_confidence_targets=np.zeros((len(no_match),), dtype=np.float32),
             source="geometry_3dgs_multiview",
+            support_view_counts=np.asarray([item["support_view_count"] for item in positive], dtype=np.int64),
+            track_ids=np.asarray([item["track_id"] for item in positive], dtype=np.int64),
+            landmark_xyz=np.stack([item["landmark_xyz"] for item in positive], axis=0),
         ),
         skipped,
+        retrieval,
     )
 
 
@@ -335,7 +518,9 @@ def _has_positive_candidate_rows(
             continue
         if _parse_bool(row.get("target_is_dustbin", "")):
             continue
-        same_track = _first_text(row, "track_id") == _first_text(row, "support_track_id", "reference_track_id")
+        track_id = _optional_int(row, "track_id")
+        support_track_id = _optional_int(row, "support_track_id", "reference_track_id")
+        same_track = track_id >= 0 and track_id == support_track_id
         if bool(require_same_track) and not same_track:
             continue
         return True
@@ -379,10 +564,12 @@ def _build_joint_set_for_real_pair(
     positive_reprojection_error_px: float,
     require_same_track: bool,
     include_dustbin_rows: bool,
+    track_xyz_by_id: Mapping[int, np.ndarray] | None = None,
+    track_observation_index: SfMTrackObservationIndex | None = None,
 ) -> tuple[MatchaJointTrainingSet, dict[str, int]]:
     if int(query_feature.shape[0]) != int(reference_feature.shape[0]):
         raise ValueError("query/reference feature-map channels must match")
-    supervision, skip_counts = _build_supervision_for_pair(
+    supervision, skip_counts, retrieval = _build_supervision_for_pair(
         rows,
         query_image_size=(int(query_rgb.shape[1]), int(query_rgb.shape[0])),
         reference_image_size=(int(reference_rgb.shape[1]), int(reference_rgb.shape[0])),
@@ -391,9 +578,19 @@ def _build_joint_set_for_real_pair(
         positive_reprojection_error_px=float(positive_reprojection_error_px),
         require_same_track=bool(require_same_track),
         include_dustbin_rows=bool(include_dustbin_rows),
+        track_xyz_by_id=track_xyz_by_id,
     )
     if supervision is None or int(supervision.count) == 0:
         raise ValueError("real pair has no valid positive supervision")
+    if track_observation_index is not None:
+        retrieval = track_observation_index.common_tracks(
+            query_id,
+            reference_id,
+            query_source_size=(int(query_rgb.shape[1]), int(query_rgb.shape[0])),
+            reference_source_size=(int(reference_rgb.shape[1]), int(reference_rgb.shape[0])),
+        )
+        if int(np.asarray(retrieval["track_ids"]).shape[0]) == 0:
+            raise ValueError("real pair has no common SfM tracks for landmark retrieval")
     joint = build_matcha_joint_index_training_set_from_maps(
         query_feature,
         reference_feature,
@@ -403,6 +600,16 @@ def _build_joint_set_for_real_pair(
         render_rgb=reference_rgb,
         hard_negatives_per_match=int(hard_negatives_per_match),
         roundtrip_heatmap_threshold_px=float(roundtrip_heatmap_threshold_px),
+    )
+    retrieval_count = int(np.asarray(retrieval["track_ids"]).shape[0])
+    joint = replace(
+        joint,
+        landmark_sample_pair_indices=np.zeros((retrieval_count,), dtype=np.int64),
+        landmark_query_xy=np.asarray(retrieval["query_xy"], dtype=np.float64),
+        landmark_reference_xy=np.asarray(retrieval["reference_xy"], dtype=np.float64),
+        landmark_track_ids=np.asarray(retrieval["track_ids"], dtype=np.int64),
+        landmark_track_xyz=np.asarray(retrieval["track_xyz"], dtype=np.float64),
+        landmark_support_view_counts=np.asarray(retrieval["support_view_counts"], dtype=np.int64),
     )
     return _set_pair_metadata(joint, query_id=query_id, reference_id=reference_id, split_name=split_name), skip_counts
 
@@ -416,6 +623,8 @@ class RealRadioReferencedJointSampleProvider:
         *,
         feature_cache_size: int = 4,
         rgb_cache_size: int = 8,
+        track_xyz_by_id: Mapping[int, np.ndarray] | None = None,
+        track_observation_index: SfMTrackObservationIndex | None = None,
     ) -> None:
         self.manifest_path = Path(manifest_path)
         self.metadata = json.loads(self.manifest_path.read_text())
@@ -433,6 +642,15 @@ class RealRadioReferencedJointSampleProvider:
         self.positive_reprojection_error_px = float(self.metadata.get("positive_reprojection_error_px", 2.0))
         self.require_same_track = bool(self.metadata.get("require_same_track", True))
         self.include_dustbin_rows = bool(self.metadata.get("include_dustbin_rows", True))
+        track_observations_text = str(self.metadata.get("track_observations", "")).strip()
+        if track_observation_index is None and track_observations_text:
+            track_observation_index = load_track_observation_index(
+                _resolve_path(track_observations_text, base_dir=base_dir)
+            )
+        if track_xyz_by_id is None and track_observation_index is not None:
+            track_xyz_by_id = track_observation_index.track_xyz_by_id
+        self.track_xyz_by_id = track_xyz_by_id
+        self.track_observation_index = track_observation_index
         self.records = [dict(item) for item in self.metadata.get("records", [])]
         if not self.records:
             raise ValueError(f"{manifest_path} contains no referenced pair records")
@@ -442,9 +660,58 @@ class RealRadioReferencedJointSampleProvider:
         self._feature_cache: OrderedDict[str, np.ndarray] = OrderedDict()
         self._rgb_cache: OrderedDict[str, np.ndarray] = OrderedDict()
         self._cache_lock = RLock()
+        self._landmark_retrieval_audit: dict[str, object] | None = None
 
     def __len__(self) -> int:
         return int(len(self.records))
+
+    def landmark_retrieval_audit(self) -> dict[str, object]:
+        if self._landmark_retrieval_audit is not None:
+            return dict(self._landmark_retrieval_audit)
+        pair_counts: Counter[int] = Counter()
+        positive_row_count = 0
+        for record in self.records:
+            pair_track_ids: set[int] = set()
+            if self.track_observation_index is not None:
+                query = self.track_observation_index.by_image.get(str(record.get("query_id", "")))
+                reference = self.track_observation_index.by_image.get(str(record.get("reference_image_id", "")))
+                if query is not None and reference is not None:
+                    pair_track_ids.update(
+                        np.intersect1d(query.track_ids, reference.track_ids, assume_unique=True).tolist()
+                    )
+                    positive_row_count += int(len(pair_track_ids))
+            else:
+                for row in self._record_rows(record):
+                    if _parse_bool(row.get("target_is_dustbin", "")):
+                        continue
+                    track_id = _optional_int(row, "track_id")
+                    support_track_id = _optional_int(row, "support_track_id", "reference_track_id")
+                    if track_id < 0 or track_id != support_track_id:
+                        continue
+                    pair_track_ids.add(int(track_id))
+                    positive_row_count += 1
+            pair_counts.update(pair_track_ids)
+        pair_track_link_count = int(sum(pair_counts.values()))
+        unique_track_count = int(len(pair_counts))
+        repeated_link_count = max(0, pair_track_link_count - unique_track_count)
+        audit = {
+            "pair_count": int(len(self.records)),
+            "positive_row_count": int(positive_row_count),
+            "pair_track_link_count": pair_track_link_count,
+            "unique_track_count": unique_track_count,
+            "tracks_seen_at_least_twice": int(sum(count >= 2 for count in pair_counts.values())),
+            "max_pairs_per_track": int(max(pair_counts.values(), default=0)),
+            "expected_first_epoch_history_hit_fraction_without_eviction": float(
+                repeated_link_count / max(1, pair_track_link_count)
+            ),
+            "supervision_source": (
+                "sfm_common_track_observations"
+                if self.track_observation_index is not None
+                else "measurement_csv_track_rows_fallback"
+            ),
+        }
+        self._landmark_retrieval_audit = dict(audit)
+        return audit
 
     def _remember(self, cache: OrderedDict[str, np.ndarray], key: str, value: np.ndarray, *, max_size: int) -> np.ndarray:
         if max_size <= 0:
@@ -530,6 +797,8 @@ class RealRadioReferencedJointSampleProvider:
             positive_reprojection_error_px=self.positive_reprojection_error_px,
             require_same_track=self.require_same_track,
             include_dustbin_rows=self.include_dustbin_rows,
+            track_xyz_by_id=self.track_xyz_by_id,
+            track_observation_index=self.track_observation_index,
         )
         return joint
 
@@ -549,6 +818,7 @@ def build_real_radio_referenced_joint_manifest(
     positive_reprojection_error_px: float = 2.0,
     require_same_track: bool = True,
     include_dustbin_rows: bool = True,
+    track_observations: Path | None = None,
 ) -> dict[str, Any]:
     started = time.perf_counter()
     rows = _read_csv(Path(rows_csv))
@@ -599,6 +869,7 @@ def build_real_radio_referenced_joint_manifest(
         "cache_format": "referenced",
         "reference_source": "real_image",
         "measurement_supervision": "fine_supervision_from_sfm_tracks",
+        "track_observations": "" if track_observations is None else str(Path(track_observations).resolve()),
         "records": records,
     }
     output_manifest_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
@@ -618,6 +889,7 @@ def build_real_radio_referenced_joint_manifest(
         "cache_format": "referenced",
         "reference_source": "real_image",
         "measurement_supervision": "fine_supervision_from_sfm_tracks",
+        "track_observations": "" if track_observations is None else str(Path(track_observations).resolve()),
         "skipped": skipped,
         "row_skips": {},
         "outputs": {"joint_cache_manifest": str(output_manifest_path)},
@@ -640,6 +912,7 @@ def build_real_radio_joint_cache(
     positive_reprojection_error_px: float = 2.0,
     require_same_track: bool = True,
     include_dustbin_rows: bool = True,
+    track_observations: Path | None = None,
 ) -> dict[str, Any]:
     if str(manifest_mode) == "referenced":
         return build_real_radio_referenced_joint_manifest(
@@ -656,10 +929,15 @@ def build_real_radio_joint_cache(
             positive_reprojection_error_px=float(positive_reprojection_error_px),
             require_same_track=bool(require_same_track),
             include_dustbin_rows=bool(include_dustbin_rows),
+            track_observations=track_observations,
         )
     if str(manifest_mode) != "sharded_cache":
         raise ValueError("manifest_mode must be 'sharded_cache' or 'referenced'")
     started = time.perf_counter()
+    track_observation_index = (
+        None if track_observations is None else load_track_observation_index(Path(track_observations))
+    )
+    track_xyz_by_id = None if track_observation_index is None else track_observation_index.track_xyz_by_id
     grouped = _group_rows(_read_csv(Path(rows_csv)))
     joint_sets: list[MatchaJointTrainingSet] = []
     skipped: dict[str, int] = {
@@ -711,6 +989,8 @@ def build_real_radio_joint_cache(
                 positive_reprojection_error_px=float(positive_reprojection_error_px),
                 require_same_track=bool(require_same_track),
                 include_dustbin_rows=bool(include_dustbin_rows),
+                track_xyz_by_id=track_xyz_by_id,
+                track_observation_index=track_observation_index,
             )
         except ValueError as exc:
             if "channels must match" in str(exc):
@@ -741,6 +1021,7 @@ def build_real_radio_joint_cache(
         "cache_format": "index_v2",
         "reference_source": "real_image",
         "measurement_supervision": "fine_supervision_from_sfm_tracks",
+        "track_observations": "" if track_observations is None else str(Path(track_observations).resolve()),
         "skipped": skipped,
         "row_skips": row_skips,
         "outputs": {"joint_cache_manifest": str(output_manifest_path)},
@@ -764,6 +1045,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--positive_reprojection_error_px", type=float, default=2.0)
     parser.add_argument("--allow_track_mismatch", action="store_true")
     parser.add_argument("--exclude_dustbin_rows", action="store_true")
+    parser.add_argument("--track_observations", default="")
     return parser.parse_args(argv)
 
 
@@ -784,6 +1066,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         positive_reprojection_error_px=float(args.positive_reprojection_error_px),
         require_same_track=not bool(args.allow_track_mismatch),
         include_dustbin_rows=not bool(args.exclude_dustbin_rows),
+        track_observations=Path(args.track_observations) if str(args.track_observations) else None,
     )
     output = Path(args.summary_json)
     output.parent.mkdir(parents=True, exist_ok=True)

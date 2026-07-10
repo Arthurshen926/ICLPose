@@ -130,6 +130,15 @@ def _rgb_to_bchw_float_if_labeled(rgb: np.ndarray | None, label_map: np.ndarray 
     return _rgb_to_bchw_float(rgb, grid_hw=grid_hw)
 
 
+def _source_rgb_image_size(rgb: np.ndarray | None) -> np.ndarray | None:
+    if rgb is None:
+        return None
+    image = np.asarray(rgb)
+    if image.ndim != 3 or int(image.shape[2]) != 3:
+        raise ValueError("rgb must have shape (H, W, 3)")
+    return np.asarray([[int(image.shape[1]), int(image.shape[0])]], dtype=np.int64)
+
+
 def _mine_negative_render_indices(
     query_features: np.ndarray,
     render_features: np.ndarray,
@@ -262,6 +271,31 @@ def _confidence_ignore_mask_from_supervision(
         ],
         axis=0,
     )
+
+
+def _sample_track_supervision(
+    supervision: MatchaCoarseSupervision,
+    *,
+    mined_no_match_count: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Align SfM track identity with positive/no-match joint rows."""
+
+    explicit_no_match_count = int(getattr(supervision, "no_match_count", 0))
+    track_ids = np.concatenate(
+        [
+            np.asarray(supervision.track_ids, dtype=np.int64),
+            np.full((explicit_no_match_count + int(mined_no_match_count),), -1, dtype=np.int64),
+        ],
+        axis=0,
+    )
+    track_xyz = np.concatenate(
+        [
+            np.asarray(supervision.landmark_xyz, dtype=np.float64).reshape(-1, 3),
+            np.full((explicit_no_match_count + int(mined_no_match_count), 3), np.nan, dtype=np.float64),
+        ],
+        axis=0,
+    )
+    return track_ids, track_xyz
 
 
 def build_matcha_joint_training_set_from_maps(
@@ -451,6 +485,10 @@ def build_matcha_joint_training_set_from_maps(
         render_grid_hw=(int(render.shape[1]), int(render.shape[2])),
         roundtrip_threshold_px=float(roundtrip_heatmap_threshold_px),
     )
+    sample_track_ids, sample_track_xyz = _sample_track_supervision(
+        supervision,
+        mined_no_match_count=int(mined_no_match_count),
+    )
     return MatchaJointTrainingSet(
         coarse_fine_samples=samples,
         query_feature_maps=query[None],
@@ -497,6 +535,16 @@ def build_matcha_joint_training_set_from_maps(
             supervision,
             mined_no_match_count=int(mined_no_match_count),
         ),
+        sample_track_ids=sample_track_ids,
+        sample_track_xyz=sample_track_xyz,
+        landmark_sample_pair_indices=np.zeros((int(supervision.count),), dtype=np.int64),
+        landmark_query_xy=np.asarray(supervision.query_xy, dtype=np.float64),
+        landmark_reference_xy=np.asarray(supervision.render_xy, dtype=np.float64),
+        landmark_track_ids=np.asarray(supervision.track_ids, dtype=np.int64),
+        landmark_track_xyz=np.asarray(supervision.landmark_xyz, dtype=np.float64),
+        landmark_support_view_counts=np.asarray(supervision.support_view_counts, dtype=np.int64),
+        pair_query_image_sizes=_source_rgb_image_size(query_rgb),
+        pair_reference_image_sizes=_source_rgb_image_size(render_rgb),
         query_repeatability_targets=qheat[None],
         render_repeatability_targets=rheat[None],
     )
@@ -734,6 +782,10 @@ def build_matcha_joint_index_training_set_from_maps(
             "confidence_label_source": str(confidence_label_source),
         },
     )
+    sample_track_ids, sample_track_xyz = _sample_track_supervision(
+        supervision,
+        mined_no_match_count=int(no_match_count),
+    )
     return MatchaJointTrainingSet(
         coarse_fine_samples=base,
         query_feature_maps=query[None],
@@ -810,6 +862,16 @@ def build_matcha_joint_index_training_set_from_maps(
             supervision,
             mined_no_match_count=int(no_match_count),
         ),
+        sample_track_ids=sample_track_ids,
+        sample_track_xyz=sample_track_xyz,
+        landmark_sample_pair_indices=np.zeros((int(supervision.count),), dtype=np.int64),
+        landmark_query_xy=np.asarray(supervision.query_xy, dtype=np.float64),
+        landmark_reference_xy=np.asarray(supervision.render_xy, dtype=np.float64),
+        landmark_track_ids=np.asarray(supervision.track_ids, dtype=np.int64),
+        landmark_track_xyz=np.asarray(supervision.landmark_xyz, dtype=np.float64),
+        landmark_support_view_counts=np.asarray(supervision.support_view_counts, dtype=np.int64),
+        pair_query_image_sizes=_source_rgb_image_size(query_rgb),
+        pair_reference_image_sizes=_source_rgb_image_size(render_rgb),
         query_repeatability_targets=qheat[None],
         render_repeatability_targets=rheat[None],
     )

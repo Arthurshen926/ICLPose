@@ -262,6 +262,44 @@ def test_ann_landmark_matcher_returns_nearest_tracks() -> None:
     assert [match.source for match in matches] == ["landmark_exact", "landmark_exact"]
 
 
+def test_ann_landmark_matcher_proposal_top_l_keeps_multiple_landmarks_per_query_token() -> None:
+    index = LandmarkMapIndex(
+        track_ids=np.asarray([11, 22, 33], dtype=np.int64),
+        xyz=np.asarray([[0.0, 0.0, 5.0], [1.0, 0.0, 5.0], [2.0, 0.0, 5.0]], dtype=np.float64),
+        features=np.asarray([[1.0, 0.0], [0.9, 0.1], [0.0, 1.0]], dtype=np.float32),
+        mean_variances=np.asarray([0.1, 0.1, 0.1], dtype=np.float32),
+        observation_counts=np.asarray([3, 3, 3], dtype=np.int64),
+        observation_image_ids=(("r0.png",), ("r1.png",), ("r2.png",)),
+        reprojection_errors=np.asarray([0.2, 0.2, 0.2], dtype=np.float32),
+        feature_ambiguities=np.asarray([0.0, 0.0, 0.0], dtype=np.float32),
+    )
+    query = np.asarray([[[1.0]], [[0.0]]], dtype=np.float32)
+    config = LandmarkRetrievalConfig(
+        backend="exact",
+        top_k=2,
+        nn_search_k_for_ratio=3,
+        proposal_top_l=2,
+        ratio_threshold=None,
+        min_similarity=0.1,
+        query_token_step=1,
+        max_matches=4,
+        deduplicate_tracks=False,
+    )
+
+    matches, metadata = match_query_tokens_to_landmarks_ann(
+        query,
+        index,
+        config,
+        image_width=20,
+        image_height=10,
+    )
+
+    assert [match.track_id for match in matches[:2]] == [11, 22]
+    assert [match.coarse_rank for match in matches[:2]] == [1, 2]
+    assert metadata["nn_search_k_for_ratio"] == 3
+    assert metadata["proposal_top_l"] == 2
+
+
 def test_heatmap_query_token_selector_uses_nms_and_spatial_quota() -> None:
     feature_map = np.arange(16, dtype=np.float32).reshape(1, 4, 4)
     heatmap = np.zeros((4, 4), dtype=np.float32)
@@ -571,6 +609,11 @@ class _FakeManyMeasurementAdapter:
         }
 
 
+class _LowGeometryProbabilityModel:
+    def predict_match(self, match) -> float:
+        return 0.1 if int(match.track_id) == 9 else 0.9
+
+
 def test_refine_matches_with_measurement_updates_query_xy_and_preserves_xyz() -> None:
     xyz = np.asarray([3.0, 4.0, 5.0], dtype=np.float64)
     match = QueryTo3DMatch(
@@ -608,6 +651,40 @@ def test_refine_matches_with_measurement_updates_query_xy_and_preserves_xyz() ->
     assert refined[0].pnp_soft_score != pytest.approx(refined[0].patch_offset_confidence)
     assert refined[0].patch_offset_confidence == 0.8
     assert refined[0].measurement_sigma_px == 0.25
+
+
+def test_refine_matches_with_measurement_can_drop_low_geometry_probability() -> None:
+    match = QueryTo3DMatch(
+        token_index=4,
+        xy=np.asarray([10.0, 20.0], dtype=np.float64),
+        track_id=9,
+        xyz=np.asarray([3.0, 4.0, 5.0], dtype=np.float64),
+        similarity=0.7,
+        ratio=1.0,
+        landmark_variance=0.1,
+        pnp_soft_score=0.7,
+    )
+    owner_index = LandmarkOwnerObservationIndex(
+        [_track_observation(9, "seq/r.png", (5.0, 6.0))],
+        target_image_sizes={"seq/r.png": (100, 50)},
+    )
+
+    refined, rows = refine_landmark_matches_with_measurement(
+        query_id="seq/q.png",
+        query_rgb=np.zeros((3, 50, 100), dtype=np.float32),
+        matches=[match],
+        owner_index=owner_index,
+        measurement_adapter=_FakeMeasurementAdapter(),
+        reference_image_loader=lambda _image_id: np.zeros((3, 50, 100), dtype=np.float32),
+        measurement_geometry_model=_LowGeometryProbabilityModel(),
+        min_measurement_geometry_probability=0.5,
+        drop_rejected_measurements=True,
+    )
+
+    assert refined == []
+    assert rows[0]["measurement_status"] == "rejected_low_geometry_probability"
+    assert rows[0]["geometry_probability"] == pytest.approx(0.1)
+    assert rows[0]["measurement_kept"] is False
 
 
 def test_refine_matches_with_measurement_uses_grouped_reference_measurement() -> None:

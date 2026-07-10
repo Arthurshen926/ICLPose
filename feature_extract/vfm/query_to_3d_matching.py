@@ -380,6 +380,7 @@ class QueryTo3DMatch:
     token_match_rank: int | None = None
     measurement_sigma_px: float | None = None
     query_heatmap_score: float | None = None
+    geometry_probability: float | None = None
     render_xy: np.ndarray | None = None
     base_render_index: int | None = None
     candidate_render_index: int | None = None

@@ -75,6 +75,64 @@ def crop_rgb_window(
     return patch, offsets.detach().cpu()
 
 
+def crop_rgb_windows_by_owner(
+    images: torch.Tensor,
+    owner_indices: torch.Tensor,
+    centers_xy: torch.Tensor,
+    *,
+    radius_px: float,
+    step_px: float,
+    image_width: int,
+    image_height: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Crop many windows while keeping one full RGB tensor per unique owner."""
+
+    if images.ndim != 4 or int(images.shape[1]) != 3:
+        raise ValueError("images must have shape (B,3,H,W)")
+    owners = owner_indices.to(device=images.device, dtype=torch.long).reshape(-1)
+    centers = centers_xy.to(device=images.device, dtype=images.dtype).reshape(-1, 2)
+    if int(owners.numel()) != int(centers.shape[0]):
+        raise ValueError("owner_indices and centers_xy must contain the same number of rows")
+    if bool(torch.any(owners < 0)) or bool(torch.any(owners >= int(images.shape[0]))):
+        raise ValueError("owner_indices contains an out-of-range image owner")
+    offsets = local_offset_grid(
+        search_radius_px=float(radius_px),
+        step_px=float(step_px),
+        device=images.device,
+        dtype=images.dtype,
+    )
+    side = int(round((2.0 * float(radius_px)) / float(step_px))) + 1
+    if int(owners.numel()) == 0:
+        return (
+            torch.zeros((0, int(images.shape[1]), side, side), dtype=torch.float32, device=images.device),
+            offsets.detach().cpu(),
+        )
+    grouped_patches = []
+    grouped_rows = []
+    for owner_id in torch.unique(owners, sorted=True).tolist():
+        rows = torch.nonzero(owners == int(owner_id), as_tuple=False).reshape(-1)
+        owner_centers = centers[rows]
+        xy = owner_centers[:, None, :] + offsets[None, :, :]
+        packed_grid = _normalise_xy(
+            xy.reshape(1, int(rows.numel()) * side, side, 2),
+            image_width=int(image_width),
+            image_height=int(image_height),
+        )
+        packed = F.grid_sample(
+            images[int(owner_id) : int(owner_id) + 1].float(),
+            packed_grid,
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=True,
+        )
+        patches = packed[0].reshape(int(images.shape[1]), int(rows.numel()), side, side).permute(1, 0, 2, 3)
+        grouped_patches.append(patches)
+        grouped_rows.append(rows)
+    row_order = torch.cat(grouped_rows, dim=0)
+    patches_by_group = torch.cat(grouped_patches, dim=0)
+    return patches_by_group[torch.argsort(row_order)].contiguous(), offsets.detach().cpu()
+
+
 def crop_rgb_window_with_source_from_output_affine(
     images: torch.Tensor,
     centers_xy: torch.Tensor,

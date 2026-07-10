@@ -103,6 +103,8 @@ def build_eval_command(common: Mapping[str, object], *, measurement_k: int) -> l
             str(int(common.get("query_heatmap_grid_cols", 8))),
             "--top_k",
             str(int(common.get("top_k", 2))),
+            "--proposal_top_l",
+            str(int(common.get("proposal_top_l", 1))),
             "--max_matches",
             str(int(common.get("max_matches", 300))),
             "--enable_quality_rescore",
@@ -114,6 +116,11 @@ def build_eval_command(common: Mapping[str, object], *, measurement_k: int) -> l
             str(common.get("device", "cuda")),
         ]
     )
+    nn_search_k = int(common.get("nn_search_k_for_ratio", 0))
+    if nn_search_k > 0:
+        cmd.extend(["--nn_search_k_for_ratio", str(nn_search_k)])
+    if bool(common.get("disable_ratio_test", False)):
+        cmd.append("--disable_ratio_test")
     max_queries = int(common.get("max_queries", 0))
     if max_queries > 0:
         cmd.extend(["--max_queries", str(max_queries)])
@@ -184,6 +191,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--methods", default=",".join(DEFAULT_AGGREGATION_METHODS))
     parser.add_argument("--measurement_ks", default="0")
     parser.add_argument("--measurement_selection_strategy", default="score_spatial", choices=("score_spatial", "coarse_pnp_inliers"))
+    parser.add_argument("--proposal_top_l", type=int, default=1)
+    parser.add_argument("--nn_search_k_for_ratio", type=int, default=0)
+    parser.add_argument("--disable_ratio_test", action="store_true")
     parser.add_argument("--select_top_n", type=int, default=0)
     parser.add_argument("--selection_metric", default="recall_0_5m_5deg", choices=("recall_0_5m_5deg", "median_translation_error_m"))
     parser.add_argument("--skip_build", action="store_true")

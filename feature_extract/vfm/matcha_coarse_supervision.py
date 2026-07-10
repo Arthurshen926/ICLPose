@@ -74,6 +74,8 @@ class MatchaCoarseSupervision:
     no_match_confidence_ignore_mask: np.ndarray | None = None
     source: str = "geometry_depth_pose"
     support_view_counts: np.ndarray | None = None
+    track_ids: np.ndarray | None = None
+    landmark_xyz: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         source = str(self.source)
@@ -177,6 +179,20 @@ class MatchaCoarseSupervision:
                 raise ValueError("support_view_counts must contain one value per match")
             support_counts = np.maximum(support_counts, 0)
         object.__setattr__(self, "support_view_counts", support_counts)
+        if self.track_ids is None:
+            track_ids = np.full((count,), -1, dtype=np.int64)
+        else:
+            track_ids = np.asarray(self.track_ids, dtype=np.int64).reshape(-1)
+            if track_ids.shape[0] != count:
+                raise ValueError("track_ids must contain one value per match")
+        object.__setattr__(self, "track_ids", track_ids)
+        if self.landmark_xyz is None:
+            landmark_xyz = np.full((count, 3), np.nan, dtype=np.float64)
+        else:
+            landmark_xyz = np.asarray(self.landmark_xyz, dtype=np.float64).reshape(-1, 3)
+            if landmark_xyz.shape[0] != count:
+                raise ValueError("landmark_xyz must contain one 3D point per match")
+        object.__setattr__(self, "landmark_xyz", landmark_xyz)
 
     @property
     def count(self) -> int:
@@ -270,6 +286,9 @@ def merge_fine_labels_by_cell_pair(
             no_match_confidence_targets=coarse.no_match_confidence_targets,
             no_match_confidence_ignore_mask=coarse.no_match_confidence_ignore_mask,
             source=coarse.source,
+            support_view_counts=coarse.support_view_counts,
+            track_ids=coarse.track_ids,
+            landmark_xyz=coarse.landmark_xyz,
         ),
         int(transferred),
     )

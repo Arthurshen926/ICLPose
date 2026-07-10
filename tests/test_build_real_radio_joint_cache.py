@@ -126,6 +126,9 @@ def test_build_real_radio_joint_cache_materializes_fine_supervised_real_pairs(tm
     assert samples.fine_render_xy is not None
     assert samples.sample_no_match_labels is not None
     assert int(np.sum(samples.sample_no_match_labels)) >= 1
+    assert samples.sample_track_ids is not None
+    assert samples.sample_track_ids.tolist() == [1, -1, -1]
+    assert samples.landmark_track_ids.tolist() == [1]
 
 
 def test_build_real_radio_joint_cache_supports_radio_token_feature_template(tmp_path: Path) -> None:
@@ -189,6 +192,7 @@ def test_build_real_radio_joint_cache_writes_referenced_manifest_without_shards(
     summary = json.loads(summary_json.read_text())
     provider = build_real_radio_joint_cache.RealRadioReferencedJointSampleProvider(manifest)
     samples = provider.get(0)
+    landmark_audit = provider.landmark_retrieval_audit()
 
     assert metadata["format"] == "vfm_real_radio_joint_referenced_manifest_v1"
     assert "shards" not in metadata
@@ -201,3 +205,122 @@ def test_build_real_radio_joint_cache_writes_referenced_manifest_without_shards(
     assert len(provider) == 1
     assert samples.query_feature_maps.shape == (1, 4, 2, 2)
     assert samples.fine_sample_pair_indices is not None
+    assert samples.sample_track_ids is not None
+    assert samples.sample_track_ids.tolist() == [1, -1]
+    assert samples.landmark_track_ids.tolist() == [1]
+    assert landmark_audit["unique_track_count"] == 1
+    assert landmark_audit["expected_first_epoch_history_hit_fraction_without_eviction"] == 0.0
+
+
+def test_referenced_cache_preserves_cell_colliding_tracks_for_landmark_retrieval(tmp_path: Path) -> None:
+    image_root = tmp_path / "images"
+    feature_root = tmp_path / "features"
+    _write_rgb(image_root / "seq/q.png", value=16)
+    _write_rgb(image_root / "seq/r.png", value=48)
+    _write_feature(feature_root / "seq_q.npz", offset=1.0)
+    _write_feature(feature_root / "seq_r.npz", offset=2.0)
+    rows_csv = tmp_path / "rows.csv"
+    with rows_csv.open("w", newline="") as handle:
+        fieldnames = [
+            "query_id",
+            "support_image_id",
+            "track_id",
+            "support_track_id",
+            "query_gt_x",
+            "query_gt_y",
+            "support_x",
+            "support_y",
+        ]
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for track_id, delta in ((1, 0.0), (2, 0.25)):
+            writer.writerow(
+                {
+                    "query_id": "seq/q.png",
+                    "support_image_id": "seq/r.png",
+                    "track_id": str(track_id),
+                    "support_track_id": str(track_id),
+                    "query_gt_x": str(3.0 + delta),
+                    "query_gt_y": str(4.0 + delta),
+                    "support_x": str(11.0 + delta),
+                    "support_y": str(12.0 + delta),
+                }
+            )
+    manifest = tmp_path / "referenced_manifest.json"
+    build_real_radio_joint_cache.build_real_radio_joint_cache(
+        rows_csv=rows_csv,
+        image_root=image_root,
+        feature_root=feature_root,
+        feature_path_template="{image_stem}.npz",
+        feature_key="radio_final",
+        output_manifest=manifest,
+        split_name="train",
+        manifest_mode="referenced",
+        hard_negatives_per_match=1,
+    )
+
+    samples = build_real_radio_joint_cache.RealRadioReferencedJointSampleProvider(manifest).get(0)
+
+    assert int(np.count_nonzero(samples.sample_no_match_labels == 0)) == 1
+    assert samples.landmark_track_ids.tolist() == [1, 2]
+    assert samples.landmark_query_xy.shape == (2, 2)
+
+
+def test_sfm_observation_index_builds_scaled_common_track_supervision(tmp_path: Path) -> None:
+    observations = tmp_path / "tracks.jsonl"
+    rows = [
+        {
+            "image_id": "q.png",
+            "track_id": 7,
+            "xy": [511.5, 287.5],
+            "image_width": 1024,
+            "image_height": 576,
+            "xyz": [1.0, 2.0, 3.0],
+            "track_length": 4,
+            "reprojection_error": 0.1,
+        },
+        {
+            "image_id": "q.png",
+            "track_id": 7,
+            "xy": [400.0, 200.0],
+            "image_width": 1024,
+            "image_height": 576,
+            "xyz": [1.0, 2.0, 3.0],
+            "track_length": 4,
+            "reprojection_error": 1.0,
+        },
+        {
+            "image_id": "r.png",
+            "track_id": 7,
+            "xy": [255.75, 143.75],
+            "image_width": 1024,
+            "image_height": 576,
+            "xyz": [1.0, 2.0, 3.0],
+            "track_length": 4,
+            "reprojection_error": 0.2,
+        },
+        {
+            "image_id": "q.png",
+            "track_id": 8,
+            "xy": [100.0, 100.0],
+            "image_width": 1024,
+            "image_height": 576,
+            "xyz": [4.0, 5.0, 6.0],
+            "track_length": 2,
+            "reprojection_error": 0.3,
+        },
+    ]
+    observations.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+
+    index = build_real_radio_joint_cache.load_track_observation_index(observations)
+    common = index.common_tracks(
+        "q.png",
+        "r.png",
+        query_source_size=(1920, 1080),
+        reference_source_size=(1920, 1080),
+    )
+
+    assert common["track_ids"].tolist() == [7]
+    np.testing.assert_allclose(common["query_xy"], [[959.5, 539.5]], atol=1e-6)
+    np.testing.assert_allclose(common["reference_xy"], [[479.75, 269.75]], atol=1e-6)
+    np.testing.assert_allclose(common["track_xyz"], [[1.0, 2.0, 3.0]])

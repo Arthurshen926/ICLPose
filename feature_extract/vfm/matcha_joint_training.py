@@ -14,9 +14,10 @@ from __future__ import annotations
 
 import json
 import random
+import time
 from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Sequence
 
@@ -25,6 +26,11 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from feature_extract.vfm.landmark_retrieval_training import (
+    LandmarkPrototypeMemoryBank,
+    LandmarkRetrievalLossConfig,
+    landmark_retrieval_loss,
+)
 from feature_extract.vfm.matcha_coarse_fine_adapter import (
     MatchaCoarseFineAdapter,
     MatchaCoarseFineTrainingRun,
@@ -43,7 +49,7 @@ from feature_extract.vfm.matcha_rgb_keypoint_detector import (
 from feature_extract.vfm.measurement_v1.rgb_patch_measurement_branch import (
     RGBPatchMeasurementBranch,
     continuous_offset_nll_with_dustbin,
-    crop_rgb_window,
+    crop_rgb_windows_by_owner,
     residual_delta_gaussian_nll,
 )
 
@@ -213,9 +219,19 @@ class MatchaJointTrainingSet:
     pair_candidate_ids: np.ndarray | None = None
     pair_translation_errors_m: np.ndarray | None = None
     pair_rotation_errors_deg: np.ndarray | None = None
+    pair_query_image_sizes: np.ndarray | None = None
+    pair_reference_image_sizes: np.ndarray | None = None
     sample_no_match_labels: np.ndarray | None = None
     sample_ignore_mask: np.ndarray | None = None
     sample_confidence_ignore_mask: np.ndarray | None = None
+    sample_track_ids: np.ndarray | None = None
+    sample_track_xyz: np.ndarray | None = None
+    landmark_sample_pair_indices: np.ndarray | None = None
+    landmark_query_xy: np.ndarray | None = None
+    landmark_reference_xy: np.ndarray | None = None
+    landmark_track_ids: np.ndarray | None = None
+    landmark_track_xyz: np.ndarray | None = None
+    landmark_support_view_counts: np.ndarray | None = None
     query_repeatability_targets: np.ndarray | None = None
     render_repeatability_targets: np.ndarray | None = None
 
@@ -279,6 +295,7 @@ class MatchaJointTrainingSet:
             ("sample_no_match_labels", self.sample_no_match_labels, np.int64),
             ("sample_ignore_mask", self.sample_ignore_mask, bool),
             ("sample_confidence_ignore_mask", self.sample_confidence_ignore_mask, bool),
+            ("sample_track_ids", self.sample_track_ids, np.int64),
         ):
             if value is None:
                 continue
@@ -286,6 +303,11 @@ class MatchaJointTrainingSet:
             if arr.shape[0] != sample_count:
                 raise ValueError(f"{name} must contain one value per coarse-fine sample")
             object.__setattr__(self, name, arr)
+        if self.sample_track_xyz is not None:
+            track_xyz = np.asarray(self.sample_track_xyz, dtype=np.float64).reshape(-1, 3)
+            if track_xyz.shape[0] != sample_count:
+                raise ValueError("sample_track_xyz must contain one 3D point per coarse-fine sample")
+            object.__setattr__(self, "sample_track_xyz", track_xyz)
         if (self.query_cell_indices is None) != (self.render_cell_indices is None):
             raise ValueError("query_cell_indices and render_cell_indices must be provided together")
         if self.query_cell_indices is not None and self.render_cell_indices is not None:
@@ -305,6 +327,54 @@ class MatchaJointTrainingSet:
                 raise ValueError("sample_pair_indices must be non-negative")
             object.__setattr__(self, "sample_pair_indices", pair_indices)
         pair_count = int(self.query_feature_maps.shape[0]) if self.query_feature_maps is not None else 0
+        for name in ("pair_query_image_sizes", "pair_reference_image_sizes"):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            sizes = np.asarray(value, dtype=np.int64).reshape(-1, 2)
+            if pair_count and sizes.shape[0] != pair_count:
+                raise ValueError(f"{name} must contain one (width, height) pair per image pair")
+            if sizes.size and np.any(sizes <= 0):
+                raise ValueError(f"{name} must contain positive image dimensions")
+            object.__setattr__(self, name, sizes)
+        landmark_required = (
+            "landmark_sample_pair_indices",
+            "landmark_query_xy",
+            "landmark_reference_xy",
+            "landmark_track_ids",
+        )
+        landmark_present = [getattr(self, name) is not None for name in landmark_required]
+        if any(landmark_present):
+            if not all(landmark_present):
+                missing = ", ".join(name for name in landmark_required if getattr(self, name) is None)
+                raise ValueError(f"landmark retrieval supervision requires: {missing}")
+            if self.query_feature_maps is None or self.render_feature_maps is None:
+                raise ValueError("landmark retrieval supervision requires query/reference feature maps")
+            landmark_pairs = np.asarray(self.landmark_sample_pair_indices, dtype=np.int64).reshape(-1)
+            landmark_query_xy = np.asarray(self.landmark_query_xy, dtype=np.float64).reshape(-1, 2)
+            landmark_reference_xy = np.asarray(self.landmark_reference_xy, dtype=np.float64).reshape(-1, 2)
+            landmark_track_ids = np.asarray(self.landmark_track_ids, dtype=np.int64).reshape(-1)
+            landmark_count = int(landmark_pairs.shape[0])
+            if landmark_query_xy.shape[0] != landmark_count or landmark_reference_xy.shape[0] != landmark_count:
+                raise ValueError("landmark query/reference xy must contain one coordinate per retrieval sample")
+            if landmark_track_ids.shape[0] != landmark_count:
+                raise ValueError("landmark_track_ids must contain one value per retrieval sample")
+            if landmark_count and (np.any(landmark_pairs < 0) or np.any(landmark_pairs >= pair_count)):
+                raise ValueError("landmark_sample_pair_indices contains an out-of-range pair")
+            object.__setattr__(self, "landmark_sample_pair_indices", landmark_pairs)
+            object.__setattr__(self, "landmark_query_xy", landmark_query_xy)
+            object.__setattr__(self, "landmark_reference_xy", landmark_reference_xy)
+            object.__setattr__(self, "landmark_track_ids", landmark_track_ids)
+            if self.landmark_track_xyz is not None:
+                landmark_xyz = np.asarray(self.landmark_track_xyz, dtype=np.float64).reshape(-1, 3)
+                if landmark_xyz.shape[0] != landmark_count:
+                    raise ValueError("landmark_track_xyz must contain one 3D point per retrieval sample")
+                object.__setattr__(self, "landmark_track_xyz", landmark_xyz)
+            if self.landmark_support_view_counts is not None:
+                view_counts = np.asarray(self.landmark_support_view_counts, dtype=np.int64).reshape(-1)
+                if view_counts.shape[0] != landmark_count:
+                    raise ValueError("landmark_support_view_counts must contain one value per retrieval sample")
+                object.__setattr__(self, "landmark_support_view_counts", np.maximum(view_counts, 0))
         fine_required = (
             "fine_sample_pair_indices",
             "fine_query_cell_indices",
@@ -466,6 +536,17 @@ class MatchaJointTrainingConfig:
     coarse_candidate_rank_margin: float = 0.2
     hard_false_match_weight: float = 0.0
     hard_false_match_margin: float = 0.2
+    landmark_retrieval_loss_weight: float = 0.0
+    landmark_retrieval_temperature: float = 0.07
+    landmark_prototype_history_mix: float = 0.5
+    landmark_memory_capacity: int = 65536
+    landmark_memory_momentum: float = 0.9
+    landmark_memory_candidate_pool_size: int = 4096
+    landmark_semantic_hard_negatives_per_query: int = 16
+    landmark_geometry_hard_negatives_per_track: int = 8
+    landmark_random_negatives: int = 128
+    landmark_max_memory_negatives: int = 2048
+    landmark_dustbin_logit: float = 0.0
     group_size: int = 64
     input_norm_mode: str = "identity"
     gate_mode: str = "residual"
@@ -537,6 +618,25 @@ class MatchaJointTrainingConfig:
             raise ValueError("lr must be positive")
         if float(self.temperature) <= 0.0:
             raise ValueError("temperature must be positive")
+        if float(self.landmark_retrieval_temperature) <= 0.0:
+            raise ValueError("landmark_retrieval_temperature must be positive")
+        if not 0.0 <= float(self.landmark_prototype_history_mix) <= 1.0:
+            raise ValueError("landmark_prototype_history_mix must be in [0, 1]")
+        if not 0.0 <= float(self.landmark_memory_momentum) < 1.0:
+            raise ValueError("landmark_memory_momentum must be in [0, 1)")
+        if int(self.landmark_memory_capacity) <= 0:
+            raise ValueError("landmark_memory_capacity must be positive")
+        for name in (
+            "landmark_memory_candidate_pool_size",
+            "landmark_semantic_hard_negatives_per_query",
+            "landmark_geometry_hard_negatives_per_track",
+            "landmark_random_negatives",
+            "landmark_max_memory_negatives",
+        ):
+            if int(getattr(self, name)) < 0:
+                raise ValueError(f"{name} must be non-negative")
+        if np.isnan(float(self.landmark_dustbin_logit)):
+            raise ValueError("landmark_dustbin_logit must not be NaN")
         for name in (
             "dual_softmax_weight",
             "offset_loss_weight",
@@ -561,6 +661,7 @@ class MatchaJointTrainingConfig:
             "hard_negative_weight",
             "coarse_candidate_rank_loss_weight",
             "hard_false_match_weight",
+            "landmark_retrieval_loss_weight",
         ):
             if float(getattr(self, name)) < 0.0:
                 raise ValueError(f"{name} must be non-negative")
@@ -1669,6 +1770,74 @@ def _select_negative_descriptor_rows_from_map(
     return rows[pairs[:, None], idx]
 
 
+def _sample_descriptor_rows_at_image_xy(
+    descriptor_map: torch.Tensor,
+    pair_indices: torch.Tensor,
+    xy: torch.Tensor,
+    *,
+    image_width: int | torch.Tensor,
+    image_height: int | torch.Tensor,
+) -> torch.Tensor:
+    """Match projected-observation bank sampling with differentiable bilinear sampling."""
+
+    if descriptor_map.ndim != 4:
+        raise ValueError("descriptor_map must have shape (B, C, H, W)")
+    pairs = pair_indices.long().reshape(-1)
+    coordinates = xy.to(device=descriptor_map.device, dtype=descriptor_map.dtype).reshape(-1, 2)
+    if pairs.shape[0] != coordinates.shape[0]:
+        raise ValueError("pair_indices and xy must contain the same number of observations")
+    if pairs.numel() == 0:
+        return descriptor_map.new_zeros((0, int(descriptor_map.shape[1])))
+    if torch.any(pairs < 0) or torch.any(pairs >= int(descriptor_map.shape[0])):
+        raise ValueError("pair_indices contains an out-of-range map index")
+    widths = torch.as_tensor(image_width, dtype=descriptor_map.dtype, device=descriptor_map.device).reshape(-1)
+    heights = torch.as_tensor(image_height, dtype=descriptor_map.dtype, device=descriptor_map.device).reshape(-1)
+    if widths.numel() == 1:
+        widths = widths.expand(coordinates.shape[0])
+    if heights.numel() == 1:
+        heights = heights.expand(coordinates.shape[0])
+    if widths.shape[0] != coordinates.shape[0] or heights.shape[0] != coordinates.shape[0]:
+        raise ValueError("image dimensions must be scalar or contain one value per observation")
+    if torch.any(widths <= 0) or torch.any(heights <= 0):
+        raise ValueError("image dimensions must be positive")
+    x = 2.0 * coordinates[:, 0] / (widths - 1.0).clamp_min(1.0) - 1.0
+    y = 2.0 * coordinates[:, 1] / (heights - 1.0).clamp_min(1.0) - 1.0
+    grid = torch.stack([x, y], dim=1).reshape(-1, 1, 1, 2)
+    sampled = F.grid_sample(
+        descriptor_map[pairs],
+        grid,
+        mode="bilinear",
+        padding_mode="zeros",
+        align_corners=True,
+    )
+    return sampled[:, :, 0, 0]
+
+
+def _observation_query_group_ids(
+    pair_indices: torch.Tensor,
+    xy: torch.Tensor,
+    *,
+    image_width: int | torch.Tensor,
+    image_height: int | torch.Tensor,
+    grid_width: int,
+    grid_height: int,
+) -> torch.Tensor:
+    coordinates = xy.to(device=pair_indices.device, dtype=torch.float32).reshape(-1, 2)
+    widths = torch.as_tensor(image_width, dtype=torch.float32, device=pair_indices.device).reshape(-1)
+    heights = torch.as_tensor(image_height, dtype=torch.float32, device=pair_indices.device).reshape(-1)
+    if widths.numel() == 1:
+        widths = widths.expand(coordinates.shape[0])
+    if heights.numel() == 1:
+        heights = heights.expand(coordinates.shape[0])
+    if widths.shape[0] != coordinates.shape[0] or heights.shape[0] != coordinates.shape[0]:
+        raise ValueError("image dimensions must be scalar or contain one value per observation")
+    col = torch.floor(coordinates[:, 0] / widths.clamp_min(1.0) * float(grid_width)).long()
+    row = torch.floor(coordinates[:, 1] / heights.clamp_min(1.0) * float(grid_height)).long()
+    col = col.clamp(0, max(int(grid_width) - 1, 0))
+    row = row.clamp(0, max(int(grid_height) - 1, 0))
+    return pair_indices.long().reshape(-1) * int(grid_width * grid_height) + row * int(grid_width) + col
+
+
 def _forward_coarse_and_fine_feature_maps(
     model: MatchaStyleJointModel,
     feature_maps: torch.Tensor,
@@ -1910,6 +2079,9 @@ def _full_map_correspondence_loss(
     config: MatchaJointTrainingConfig,
     device: torch.device,
     pair_subset: np.ndarray | None = None,
+    landmark_memory_bank: LandmarkPrototypeMemoryBank | None = None,
+    update_landmark_memory: bool = False,
+    seed: int = 0,
 ) -> tuple[torch.Tensor | None, dict[str, float]]:
     if not _has_full_map_correspondence_supervision(samples):
         return None, {}
@@ -2085,6 +2257,106 @@ def _full_map_correspondence_loss(
                 margin=float(config.coarse_candidate_rank_margin),
             )
             loss = loss + float(config.coarse_candidate_rank_loss_weight) * rank_loss
+    landmark_metrics: dict[str, float] = {}
+    if float(config.landmark_retrieval_loss_weight) > 0.0:
+        required = (
+            samples.landmark_sample_pair_indices,
+            samples.landmark_query_xy,
+            samples.landmark_reference_xy,
+            samples.landmark_track_ids,
+        )
+        if any(value is None for value in required):
+            raise ValueError("landmark retrieval loss requires continuous SfM observation supervision")
+        landmark_pairs_global = np.asarray(samples.landmark_sample_pair_indices, dtype=np.int64)
+        landmark_keep = np.ones((landmark_pairs_global.shape[0],), dtype=bool)
+        if pair_subset is not None:
+            landmark_keep &= np.isin(landmark_pairs_global, np.asarray(pair_subset, dtype=np.int64))
+        if not np.any(landmark_keep):
+            raise ValueError("selected full-map pairs contain no landmark retrieval observations")
+        landmark_pairs_global = landmark_pairs_global[landmark_keep]
+        landmark_pairs = _tensor(
+            _remap_pair_indices(landmark_pairs_global, pair_subset),
+            dtype=torch.long,
+            device=device,
+        )
+        landmark_query_xy = _tensor(
+            np.asarray(samples.landmark_query_xy, dtype=np.float32)[landmark_keep],
+            dtype=torch.float32,
+            device=device,
+        )
+        landmark_reference_xy = _tensor(
+            np.asarray(samples.landmark_reference_xy, dtype=np.float32)[landmark_keep],
+            dtype=torch.float32,
+            device=device,
+        )
+        if samples.pair_query_image_sizes is None or samples.pair_reference_image_sizes is None:
+            raise ValueError("continuous landmark retrieval sampling requires original query/reference image sizes")
+        query_image_sizes_np = np.asarray(samples.pair_query_image_sizes, dtype=np.int64)
+        reference_image_sizes_np = np.asarray(samples.pair_reference_image_sizes, dtype=np.int64)
+        if pair_subset is not None:
+            query_image_sizes_np = query_image_sizes_np[pair_subset]
+            reference_image_sizes_np = reference_image_sizes_np[pair_subset]
+        query_image_sizes = _tensor(query_image_sizes_np, dtype=torch.float32, device=device)[landmark_pairs]
+        reference_image_sizes = _tensor(reference_image_sizes_np, dtype=torch.float32, device=device)[landmark_pairs]
+        landmark_query_descriptors = _sample_descriptor_rows_at_image_xy(
+            query_desc_map,
+            landmark_pairs,
+            landmark_query_xy,
+            image_width=query_image_sizes[:, 0],
+            image_height=query_image_sizes[:, 1],
+        )
+        landmark_reference_descriptors = _sample_descriptor_rows_at_image_xy(
+            render_desc_map,
+            landmark_pairs,
+            landmark_reference_xy,
+            image_width=reference_image_sizes[:, 0],
+            image_height=reference_image_sizes[:, 1],
+        )
+        selected_track_ids = _tensor(
+            np.asarray(samples.landmark_track_ids, dtype=np.int64)[landmark_keep],
+            dtype=torch.long,
+            device=device,
+        )
+        if torch.any(selected_track_ids < 0):
+            raise ValueError("every landmark retrieval observation must have a valid SfM track id")
+        selected_track_xyz = None
+        if samples.landmark_track_xyz is not None:
+            selected_track_xyz = _tensor(
+                np.asarray(samples.landmark_track_xyz, dtype=np.float32)[landmark_keep],
+                dtype=torch.float32,
+                device=device,
+            )
+        query_group_ids = _observation_query_group_ids(
+            landmark_pairs,
+            landmark_query_xy,
+            image_width=query_image_sizes[:, 0],
+            image_height=query_image_sizes[:, 1],
+            grid_width=int(query_desc_map.shape[3]),
+            grid_height=int(query_desc_map.shape[2]),
+        )
+        landmark_loss, landmark_metrics = landmark_retrieval_loss(
+            landmark_query_descriptors,
+            landmark_reference_descriptors,
+            selected_track_ids,
+            track_xyz=selected_track_xyz,
+            query_group_ids=query_group_ids,
+            memory_bank=landmark_memory_bank,
+            config=LandmarkRetrievalLossConfig(
+                temperature=float(config.landmark_retrieval_temperature),
+                prototype_history_mix=float(config.landmark_prototype_history_mix),
+                memory_candidate_pool_size=int(config.landmark_memory_candidate_pool_size),
+                semantic_hard_negatives_per_query=int(config.landmark_semantic_hard_negatives_per_query),
+                geometry_hard_negatives_per_track=int(config.landmark_geometry_hard_negatives_per_track),
+                random_negatives=int(config.landmark_random_negatives),
+                max_memory_negatives=int(config.landmark_max_memory_negatives),
+                dustbin_logit=float(config.landmark_dustbin_logit),
+            ),
+            update_memory=bool(update_landmark_memory),
+            seed=int(seed),
+        )
+        if landmark_loss is None:
+            raise ValueError("landmark retrieval loss found no valid non-negative SfM track ids")
+        loss = loss + float(config.landmark_retrieval_loss_weight) * landmark_loss
     patch_acc_values = []
     if float(config.patch_correlation_loss_weight) > 0.0:
         query_to_render, query_to_render_acc = _local_patch_correlation_loss(
@@ -2127,6 +2399,7 @@ def _full_map_correspondence_loss(
             metrics["hard_false_match_loss"] = float(torch.stack(hard_false_losses).mean().detach().cpu().item())
             metrics["hard_false_match_count"] = float(hard_false_count)
         metrics.update({key: float(value.detach().cpu().item()) for key, value in rank_metrics.items()})
+        metrics.update(landmark_metrics)
     return loss, metrics
 
 
@@ -2734,6 +3007,31 @@ def _scale_supervision_xy_to_rgb_grid(
     return scaled.astype(np.float32, copy=False), (float(scale_x), float(scale_y))
 
 
+@torch.no_grad()
+def _crop_rgb_windows_for_pairs(
+    images: torch.Tensor,
+    pair_indices: torch.Tensor,
+    centers_xy: torch.Tensor,
+    *,
+    radius_px: float,
+    step_px: float,
+    image_width: int,
+    image_height: int,
+) -> torch.Tensor:
+    """Crop repeated owners without materializing one full RGB image per measurement row."""
+
+    patches, _ = crop_rgb_windows_by_owner(
+        images,
+        pair_indices,
+        centers_xy,
+        radius_px=float(radius_px),
+        step_px=float(step_px),
+        image_width=int(image_width),
+        image_height=int(image_height),
+    )
+    return patches
+
+
 def _joint_measurement_patch_loss(
     model: MatchaStyleJointModel,
     samples: MatchaJointTrainingSet,
@@ -2781,9 +3079,20 @@ def _joint_measurement_patch_loss(
     rlabels_np = rlabels_np_all[keep]
     weights_np = weights_np_all[keep]
     max_samples = int(config.measurement_patch_max_samples_per_pair)
-    if max_samples > 0 and int(pairs_global.shape[0]) > max_samples:
+    selected: np.ndarray | None = None
+    if max_samples > 0:
         rng = np.random.default_rng(int(sample_seed))
-        selected = np.sort(rng.choice(int(pairs_global.shape[0]), size=max_samples, replace=False))
+        selected_parts = []
+        for pair_id in np.unique(pairs_global).tolist():
+            pair_indices = np.flatnonzero(pairs_global == int(pair_id))
+            if int(pair_indices.size) > max_samples:
+                pair_indices = np.sort(rng.choice(pair_indices, size=max_samples, replace=False))
+            selected_parts.append(pair_indices)
+        selected = (
+            np.sort(np.concatenate(selected_parts, axis=0)).astype(np.int64, copy=False)
+            if selected_parts
+            else np.zeros((0,), dtype=np.int64)
+        )
         pairs_global = pairs_global[selected]
         qidx_np = qidx_np[selected]
         ridx_np = ridx_np[selected]
@@ -2817,7 +3126,7 @@ def _joint_measurement_patch_loss(
     render_xy_scale = (1.0, 1.0)
     if samples.fine_query_xy is not None:
         query_target_xy_np = np.asarray(samples.fine_query_xy, dtype=np.float32).reshape(-1, 2)[keep]
-        if max_samples > 0 and int(pairs_global_np[keep].shape[0]) > max_samples:
+        if selected is not None:
             query_target_xy_np = query_target_xy_np[selected]
         query_target_xy_np, query_xy_scale = _scale_supervision_xy_to_rgb_grid(
             query_target_xy_np,
@@ -2832,7 +3141,7 @@ def _joint_measurement_patch_loss(
         query_target_xy_np = _subcell_label_xy(qidx_np, qlabels_np, grid_h=q_grid_h, grid_w=q_grid_w, rgb_h=q_rgb_h, rgb_w=q_rgb_w)
     if samples.fine_render_xy is not None:
         render_anchor_xy_np = np.asarray(samples.fine_render_xy, dtype=np.float32).reshape(-1, 2)[keep]
-        if max_samples > 0 and int(pairs_global_np[keep].shape[0]) > max_samples:
+        if selected is not None:
             render_anchor_xy_np = render_anchor_xy_np[selected]
         render_anchor_xy_np, render_xy_scale = _scale_supervision_xy_to_rgb_grid(
             render_anchor_xy_np,
@@ -2878,16 +3187,18 @@ def _joint_measurement_patch_loss(
         chunk = slice(start, end)
         pair_chunk = pairs[chunk]
         chunk_weights = weights[chunk]
-        query_patch, _ = crop_rgb_window(
-            query_rgb_t[pair_chunk],
+        query_patch = _crop_rgb_windows_for_pairs(
+            query_rgb_t,
+            pair_chunk,
             query_center_xy[chunk],
             radius_px=float(branch.crop_radius_px),
             step_px=float(branch.step_px),
             image_width=q_rgb_w,
             image_height=q_rgb_h,
         )
-        render_patch, _ = crop_rgb_window(
-            render_rgb_t[pair_chunk],
+        render_patch = _crop_rgb_windows_for_pairs(
+            render_rgb_t,
+            pair_chunk,
             render_anchor_xy[chunk],
             radius_px=float(branch.crop_radius_px),
             step_px=float(branch.step_px),
@@ -3049,6 +3360,8 @@ def _total_loss(
     device: torch.device,
     *,
     seed: int,
+    landmark_memory_bank: LandmarkPrototypeMemoryBank | None = None,
+    update_landmark_memory: bool = False,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     positive_indices = _filter_indices_to_positive_matches(samples, indices)
     loss = torch.zeros((), dtype=torch.float32, device=device)
@@ -3078,7 +3391,17 @@ def _total_loss(
         loss = loss + float(config.pair_confidence_loss_weight) * no_match_loss
         metrics["no_match_confidence_loss"] = float(no_match_loss.detach().cpu().item())
     pair_subset = _sample_map_pair_subset(samples, positive_indices if positive_indices.size else indices, int(config.map_pair_batch_size), int(seed))
-    map_loss, map_metrics = _full_map_correspondence_loss(model, samples, positive_indices, config, device, pair_subset=pair_subset)
+    map_loss, map_metrics = _full_map_correspondence_loss(
+        model,
+        samples,
+        positive_indices,
+        config,
+        device,
+        pair_subset=pair_subset,
+        landmark_memory_bank=landmark_memory_bank,
+        update_landmark_memory=bool(update_landmark_memory),
+        seed=int(seed) + 17011,
+    )
     if map_loss is not None:
         loss = loss + map_loss
         metrics["map_correspondence_loss"] = float(map_loss.detach().cpu().item())
@@ -3322,6 +3645,56 @@ def _model_state_snapshot(model: nn.Module) -> dict[str, torch.Tensor]:
     return {str(key): value.detach().cpu().clone() for key, value in model.state_dict().items()}
 
 
+def _build_landmark_memory_bank(
+    samples: MatchaJointTrainingSet,
+    config: MatchaJointTrainingConfig,
+    device: torch.device,
+) -> LandmarkPrototypeMemoryBank | None:
+    if float(config.landmark_retrieval_loss_weight) <= 0.0:
+        return None
+    if samples.landmark_track_ids is None:
+        raise ValueError("landmark retrieval training requires continuous SfM observation supervision; rebuild the cache")
+    track_ids = np.asarray(samples.landmark_track_ids, dtype=np.int64).reshape(-1)
+    if track_ids.size == 0 or np.any(track_ids < 0):
+        raise ValueError("landmark retrieval training requires valid non-negative SfM track ids for every observation")
+    return LandmarkPrototypeMemoryBank(
+        capacity=int(config.landmark_memory_capacity),
+        descriptor_dim=int(config.output_dim),
+        device=device,
+        momentum=float(config.landmark_memory_momentum),
+    )
+
+
+def _accumulate_landmark_training_metrics(
+    sums: dict[str, float],
+    counts: dict[str, int],
+    metrics: dict[str, float],
+) -> None:
+    for key, value in metrics.items():
+        if not str(key).startswith("landmark_retrieval_") or not np.isfinite(float(value)):
+            continue
+        sums[str(key)] = float(sums.get(str(key), 0.0) + float(value))
+        counts[str(key)] = int(counts.get(str(key), 0) + 1)
+
+
+def _landmark_training_summary(
+    memory_bank: LandmarkPrototypeMemoryBank | None,
+    sums: dict[str, float],
+    counts: dict[str, int],
+) -> dict[str, float | int | bool | str]:
+    if memory_bank is None:
+        return {"landmark_retrieval_enabled": False}
+    output: dict[str, float | int | bool | str] = {
+        "landmark_retrieval_enabled": True,
+        "landmark_retrieval_memory_final_size": int(len(memory_bank)),
+        "landmark_retrieval_training_metric_reduction": "mean_over_training_pairs",
+    }
+    for key, value in sums.items():
+        count = max(1, int(counts.get(key, 0)))
+        output[f"train_{key}"] = float(value) / float(count)
+    return output
+
+
 def _loss_value_for_samples(
     model: MatchaStyleJointModel,
     samples: MatchaJointTrainingSet,
@@ -3544,6 +3917,9 @@ def train_matcha_joint_model(
         }
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(cfg.lr), weight_decay=1e-4)
     rng = np.random.default_rng(int(cfg.seed))
+    landmark_memory_bank = _build_landmark_memory_bank(samples, cfg, device)
+    landmark_metric_sums: dict[str, float] = {}
+    landmark_metric_counts: dict[str, int] = {}
 
     def loss_value(step_seed: int) -> float:
         return _loss_value_for_samples(model, samples, cfg, device, seed=int(step_seed))
@@ -3558,7 +3934,7 @@ def train_matcha_joint_model(
         nonlocal best_validation_loss, best_validation_step, best_state
         if validation_samples is None:
             return
-        value = _loss_value_for_samples(model, validation_samples, cfg, device, seed=int(cfg.seed) + 50000 + int(step))
+        value = _loss_value_for_samples(model, validation_samples, cfg, device, seed=int(cfg.seed) + 50000)
         validation_history.append({"step": int(step), "loss": float(value)})
         if value < best_validation_loss:
             best_validation_loss = float(value)
@@ -3569,7 +3945,17 @@ def train_matcha_joint_model(
     model.train()
     for step in range(int(cfg.steps)):
         idx = _sample_indices(rng, samples.coarse_fine_samples.sample_count, int(cfg.batch_size))
-        loss, _metrics = _total_loss(model, samples, idx, cfg, device, seed=int(cfg.seed) + int(step))
+        loss, step_metrics = _total_loss(
+            model,
+            samples,
+            idx,
+            cfg,
+            device,
+            seed=int(cfg.seed) + int(step),
+            landmark_memory_bank=landmark_memory_bank,
+            update_landmark_memory=True,
+        )
+        _accumulate_landmark_training_metrics(landmark_metric_sums, landmark_metric_counts, step_metrics)
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
@@ -3579,7 +3965,7 @@ def train_matcha_joint_model(
         maybe_validate(int(cfg.steps))
     if best_state is not None:
         model.load_state_dict(best_state)
-    final_loss = loss_value(int(cfg.seed) + int(cfg.steps) + 1)
+    final_loss = loss_value(int(cfg.seed))
     summary = {
         "stage": "matcha_style_joint_training",
         "model_type": str(cfg.model_type),
@@ -3591,8 +3977,10 @@ def train_matcha_joint_model(
         "steps": int(cfg.steps),
         "batch_size": int(cfg.batch_size),
         "fine_loss_mode": str(cfg.fine_loss_mode),
+        "loss_audit_source": "fixed_training_subset",
     }
     summary.update(warm_start_report)
+    summary.update(_landmark_training_summary(landmark_memory_bank, landmark_metric_sums, landmark_metric_counts))
     if validation_samples is not None:
         summary.update(
             {
@@ -3679,6 +4067,9 @@ def train_matcha_joint_model_from_manifest(
         }
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(cfg.lr), weight_decay=1e-4)
     rng = np.random.default_rng(int(cfg.seed))
+    landmark_memory_bank = _build_landmark_memory_bank(first_samples, cfg, device)
+    landmark_metric_sums: dict[str, float] = {}
+    landmark_metric_counts: dict[str, int] = {}
     shard_count = int(len(shards))
     total_sample_count = int(sum(int(item.get("sample_count", 0)) for item in shards))
 
@@ -3708,13 +4099,13 @@ def train_matcha_joint_model_from_manifest(
                         shard_samples,
                         cfg,
                         device,
-                        seed=int(cfg.seed) + 50000 + int(step) + int(shard_idx),
+                        seed=int(cfg.seed) + 50000 + int(shard_idx),
                     )
                 )
             value = float(np.mean(values)) if values else float("inf")
         else:
             assert validation_samples is not None
-            value = _loss_value_for_samples(model, validation_samples, cfg, device, seed=int(cfg.seed) + 50000 + int(step))
+            value = _loss_value_for_samples(model, validation_samples, cfg, device, seed=int(cfg.seed) + 50000)
         validation_history.append({"step": int(step), "loss": float(value)})
         if value < best_validation_loss:
             best_validation_loss = float(value)
@@ -3728,7 +4119,17 @@ def train_matcha_joint_model_from_manifest(
         samples = cache.get(shard_for_step(step))
         last_samples = samples
         idx = _sample_indices(rng, samples.coarse_fine_samples.sample_count, int(cfg.batch_size))
-        loss, _metrics = _total_loss(model, samples, idx, cfg, device, seed=int(cfg.seed) + int(step))
+        loss, step_metrics = _total_loss(
+            model,
+            samples,
+            idx,
+            cfg,
+            device,
+            seed=int(cfg.seed) + int(step),
+            landmark_memory_bank=landmark_memory_bank,
+            update_landmark_memory=True,
+        )
+        _accumulate_landmark_training_metrics(landmark_metric_sums, landmark_metric_counts, step_metrics)
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
@@ -3738,8 +4139,8 @@ def train_matcha_joint_model_from_manifest(
         maybe_validate(int(cfg.steps))
     if best_state is not None:
         model.load_state_dict(best_state)
-    final_loss = _loss_value_for_samples(model, last_samples, cfg, device, seed=int(cfg.seed) + int(cfg.steps) + 1)
-    eval_samples = validation_samples if validation_samples is not None else (validation_cache.get(0) if validation_cache is not None else last_samples)
+    final_loss = _loss_value_for_samples(model, first_samples, cfg, device, seed=int(cfg.seed))
+    eval_samples = validation_samples if validation_samples is not None else (validation_cache.get(0) if validation_cache is not None else first_samples)
     summary = {
         "stage": "matcha_style_joint_training",
         "model_type": str(cfg.model_type),
@@ -3755,8 +4156,10 @@ def train_matcha_joint_model_from_manifest(
         "manifest_lazy_training": True,
         "manifest_shard_cache_size": int(shard_cache_size),
         "manifest_steps_per_shard": int(steps_per_shard),
+        "loss_audit_source": "manifest_shard_0_fixed_subset",
     }
     summary.update(warm_start_report)
+    summary.update(_landmark_training_summary(landmark_memory_bank, landmark_metric_sums, landmark_metric_counts))
     if validation_samples is not None or validation_cache is not None:
         summary.update(
             {
@@ -3812,6 +4215,213 @@ def _iter_prefetched_provider_samples(
             yield future.result()
 
 
+def _distributed_training_context() -> tuple[int, int]:
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return 0, 1
+    return int(torch.distributed.get_rank()), int(torch.distributed.get_world_size())
+
+
+def _provider_training_pair_ordinals(
+    *,
+    steps: int,
+    gradient_accumulation_pairs: int,
+    pair_batch_size: int = 1,
+    rank: int,
+    world_size: int,
+) -> list[int]:
+    """Return this rank's disjoint slice of the global provider pair stream."""
+
+    if int(steps) < 0:
+        raise ValueError("steps must be non-negative")
+    if int(gradient_accumulation_pairs) <= 0:
+        raise ValueError("gradient_accumulation_pairs must be positive")
+    if int(pair_batch_size) <= 0:
+        raise ValueError("pair_batch_size must be positive")
+    if int(world_size) <= 0 or not 0 <= int(rank) < int(world_size):
+        raise ValueError("rank must be in [0, world_size)")
+    local_pairs_per_step = int(gradient_accumulation_pairs) * int(pair_batch_size)
+    local_count = int(steps) * local_pairs_per_step
+    global_pairs_per_step = local_pairs_per_step * int(world_size)
+    return [
+        (local_index // local_pairs_per_step) * global_pairs_per_step
+        + int(rank) * local_pairs_per_step
+        + local_index % local_pairs_per_step
+        for local_index in range(local_count)
+    ]
+
+
+@torch.no_grad()
+def _average_distributed_model_gradients(model: nn.Module, world_size: int) -> None:
+    """Average gradients in one dense collective while preserving globally-unused params."""
+
+    if int(world_size) <= 1:
+        return
+    parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    if not parameters:
+        return
+    devices = {parameter.device for parameter in parameters}
+    dtypes = {parameter.dtype for parameter in parameters}
+    if len(devices) != 1 or len(dtypes) != 1:
+        raise ValueError("distributed joint training requires model parameters on one device and dtype")
+    active = torch.as_tensor(
+        [parameter.grad is not None for parameter in parameters],
+        dtype=torch.uint8,
+        device=parameters[0].device,
+    )
+    flattened = torch.cat(
+        [
+            parameter.grad.detach().reshape(-1)
+            if parameter.grad is not None
+            else torch.zeros_like(parameter).reshape(-1)
+            for parameter in parameters
+        ]
+    )
+    torch.distributed.all_reduce(flattened, op=torch.distributed.ReduceOp.SUM)
+    flattened.div_(float(world_size))
+    torch.distributed.all_reduce(active, op=torch.distributed.ReduceOp.MAX)
+    offset = 0
+    for parameter, is_active in zip(parameters, active.tolist()):
+        count = int(parameter.numel())
+        if bool(is_active):
+            if parameter.grad is None:
+                parameter.grad = torch.empty_like(parameter)
+            parameter.grad.copy_(flattened[offset : offset + count].view_as(parameter))
+        else:
+            parameter.grad = None
+        offset += count
+
+
+@torch.no_grad()
+def _synchronize_distributed_model_buffers(model: nn.Module, world_size: int) -> None:
+    """Average floating running state and broadcast integral counters from rank zero."""
+
+    if int(world_size) <= 1:
+        return
+    for buffer in model.buffers():
+        if buffer.is_floating_point():
+            torch.distributed.all_reduce(buffer, op=torch.distributed.ReduceOp.SUM)
+            buffer.div_(float(world_size))
+        else:
+            torch.distributed.broadcast(buffer, src=0)
+
+
+def _reduce_distributed_training_statistics(
+    *,
+    landmark_metric_sums: dict[str, float],
+    landmark_metric_counts: dict[str, int],
+    total_loss_sum: float,
+    total_loss_count: int,
+    memory_size: int,
+) -> tuple[dict[str, float], dict[str, int], float, int, list[int]]:
+    rank, world_size = _distributed_training_context()
+    if int(world_size) <= 1:
+        return (
+            dict(landmark_metric_sums),
+            dict(landmark_metric_counts),
+            float(total_loss_sum),
+            int(total_loss_count),
+            [int(memory_size)],
+        )
+    gathered: list[object] = [None for _ in range(int(world_size))]
+    torch.distributed.all_gather_object(
+        gathered,
+        (
+            dict(landmark_metric_sums),
+            dict(landmark_metric_counts),
+            float(total_loss_sum),
+            int(total_loss_count),
+            int(memory_size),
+        ),
+    )
+    reduced_sums: dict[str, float] = {}
+    reduced_counts: dict[str, int] = {}
+    reduced_loss_sum = 0.0
+    reduced_loss_count = 0
+    memory_sizes: list[int] = []
+    for item in gathered:
+        if item is None:
+            raise RuntimeError(f"rank {rank} received an empty distributed statistic payload")
+        item_sums, item_counts, item_loss_sum, item_loss_count, item_memory_size = item
+        for key, value in item_sums.items():
+            reduced_sums[str(key)] = float(reduced_sums.get(str(key), 0.0) + float(value))
+        for key, value in item_counts.items():
+            reduced_counts[str(key)] = int(reduced_counts.get(str(key), 0) + int(value))
+        reduced_loss_sum += float(item_loss_sum)
+        reduced_loss_count += int(item_loss_count)
+        memory_sizes.append(int(item_memory_size))
+    return reduced_sums, reduced_counts, reduced_loss_sum, reduced_loss_count, memory_sizes
+
+
+def _report_distributed_provider_progress(
+    *,
+    step: int,
+    steps: int,
+    rank: int,
+    world_size: int,
+    elapsed_seconds: float,
+    global_pair_count: int,
+    metric_sums: dict[str, float],
+    metric_counts: dict[str, int],
+) -> None:
+    keys = (
+        "total_loss",
+        "map_correspondence_loss",
+        "landmark_retrieval_loss",
+        "query_heatmap_loss",
+        "render_heatmap_loss",
+        "local_window_fine_loss",
+        "measurement_patch_loss",
+    )
+    values = []
+    for key in keys:
+        values.extend((float(metric_sums.get(key, 0.0)), float(metric_counts.get(key, 0))))
+    reduced = torch.as_tensor(values, dtype=torch.float64, device=torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
+    if int(world_size) > 1:
+        torch.distributed.all_reduce(reduced, op=torch.distributed.ReduceOp.SUM)
+    memory_values = None
+    if torch.cuda.is_available():
+        memory_values = torch.as_tensor(
+            [
+                float(torch.cuda.memory_allocated()),
+                float(torch.cuda.memory_reserved()),
+                float(torch.cuda.max_memory_allocated()),
+                float(torch.cuda.max_memory_reserved()),
+            ],
+            dtype=torch.float64,
+            device=torch.device("cuda"),
+        )
+        if int(world_size) > 1:
+            torch.distributed.all_reduce(memory_values, op=torch.distributed.ReduceOp.MAX)
+    if int(rank) != 0:
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+        return
+    payload: dict[str, float | int | str] = {
+        "stage": "provider_training_progress",
+        "step": int(step),
+        "steps": int(steps),
+        "world_size": int(world_size),
+        "elapsed_seconds": float(elapsed_seconds),
+        "global_pair_count": int(global_pair_count),
+        "global_pairs_per_second": float(global_pair_count) / max(float(elapsed_seconds), 1e-9),
+    }
+    reduced_values = reduced.detach().cpu().tolist()
+    for index, key in enumerate(keys):
+        value_sum = float(reduced_values[2 * index])
+        value_count = int(round(float(reduced_values[2 * index + 1])))
+        if value_count > 0:
+            payload[f"mean_{key}"] = value_sum / float(value_count)
+    if memory_values is not None:
+        allocated, reserved, peak_allocated, peak_reserved = memory_values.detach().cpu().tolist()
+        payload["cuda_memory_allocated_gib"] = float(allocated / (1024**3))
+        payload["cuda_memory_reserved_gib"] = float(reserved / (1024**3))
+        payload["cuda_peak_memory_allocated_gib"] = float(peak_allocated / (1024**3))
+        payload["cuda_peak_memory_reserved_gib"] = float(peak_reserved / (1024**3))
+    print(json.dumps(payload, sort_keys=True), flush=True)
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
+
 def train_matcha_joint_model_from_sample_provider(
     sample_count: int,
     get_sample: Callable[[int], MatchaJointTrainingSet],
@@ -3822,8 +4432,11 @@ def train_matcha_joint_model_from_sample_provider(
     validation_interval: int = 0,
     steps_per_sample: int = 1,
     provider_gradient_accumulation_pairs: int = 1,
+    provider_pair_batch_size: int = 1,
     provider_prefetch_workers: int = 0,
     provider_prefetch_depth: int = 0,
+    provider_progress_interval_steps: int = 0,
+    provider_empty_cuda_cache_interval_steps: int = 0,
     warm_start_model: MatchaStyleJointModel | None = None,
     provider_name: str = "sample_provider",
 ) -> MatchaJointTrainingRun:
@@ -3837,8 +4450,12 @@ def train_matcha_joint_model_from_sample_provider(
     if validation_provider_count < 0:
         raise ValueError("validation_sample_count must be non-negative")
     gradient_accumulation_pairs = max(1, int(provider_gradient_accumulation_pairs))
+    pair_batch_size = max(1, int(provider_pair_batch_size))
     prefetch_workers = max(0, int(provider_prefetch_workers))
     prefetch_depth = max(0, int(provider_prefetch_depth))
+    progress_interval_steps = max(0, int(provider_progress_interval_steps))
+    empty_cuda_cache_interval_steps = max(0, int(provider_empty_cuda_cache_interval_steps))
+    rank, world_size = _distributed_training_context()
     first_samples = get_sample(0)
     torch.manual_seed(int(cfg.seed))
     random.seed(int(cfg.seed))
@@ -3854,7 +4471,14 @@ def train_matcha_joint_model_from_sample_provider(
             "warm_start_unexpected_keys": list(result.unexpected_keys),
         }
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(cfg.lr), weight_decay=1e-4)
-    rng = np.random.default_rng(int(cfg.seed))
+    rng = np.random.default_rng(int(cfg.seed) + int(rank) * 104729)
+    landmark_memory_bank = _build_landmark_memory_bank(first_samples, cfg, device)
+    landmark_metric_sums: dict[str, float] = {}
+    landmark_metric_counts: dict[str, int] = {}
+    total_loss_sum = 0.0
+    total_loss_count = 0
+    progress_metric_sums: dict[str, float] = {}
+    progress_metric_counts: dict[str, int] = {}
 
     def provider_index_for_training_pair(pair_index: int, count: int, *, salt: int) -> int:
         epoch = int(pair_index) // max(1, int(steps_per_sample) * int(count))
@@ -3881,7 +4505,7 @@ def train_matcha_joint_model_from_sample_provider(
                     samples,
                     cfg,
                     device,
-                    seed=int(cfg.seed) + 50000 + int(step) + int(validation_index),
+                    seed=int(cfg.seed) + 50000 + int(validation_index),
                 )
             )
         value = float(np.mean(values)) if values else float("inf")
@@ -3894,10 +4518,16 @@ def train_matcha_joint_model_from_sample_provider(
     maybe_validate(0)
     model.train()
     last_samples = first_samples
-    training_pair_count = int(cfg.steps) * int(gradient_accumulation_pairs)
+    training_pair_ordinals = _provider_training_pair_ordinals(
+        steps=int(cfg.steps),
+        gradient_accumulation_pairs=int(gradient_accumulation_pairs),
+        pair_batch_size=int(pair_batch_size),
+        rank=int(rank),
+        world_size=int(world_size),
+    )
     training_indices = [
-        provider_index_for_training_pair(pair_index, provider_sample_count, salt=1009)
-        for pair_index in range(training_pair_count)
+        provider_index_for_training_pair(pair_ordinal, provider_sample_count, salt=1009)
+        for pair_ordinal in training_pair_ordinals
     ]
     training_samples = _iter_prefetched_provider_samples(
         get_sample,
@@ -3906,31 +4536,101 @@ def train_matcha_joint_model_from_sample_provider(
         depth=int(prefetch_depth),
     )
     consumed_training_pairs = 0
+    pair_ordinal_iterator = iter(training_pair_ordinals)
+    training_loop_started = time.perf_counter()
+    if torch.cuda.is_available() and device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
     for step in range(int(cfg.steps)):
         optimizer.zero_grad(set_to_none=True)
         for accumulation_index in range(int(gradient_accumulation_pairs)):
-            samples = next(training_samples)
+            pair_ordinals = [int(next(pair_ordinal_iterator)) for _ in range(int(pair_batch_size))]
+            pair_samples = [next(training_samples) for _ in range(int(pair_batch_size))]
+            samples = (
+                pair_samples[0]
+                if len(pair_samples) == 1
+                else merge_matcha_joint_training_sets(
+                    [_materialize_index_only_joint_training_set(item) for item in pair_samples]
+                )
+            )
             last_samples = samples
             idx = _sample_indices(rng, samples.coarse_fine_samples.sample_count, int(cfg.batch_size))
-            loss, _metrics = _total_loss(
+            loss, step_metrics = _total_loss(
                 model,
                 samples,
                 idx,
                 cfg,
                 device,
-                seed=int(cfg.seed) + int(consumed_training_pairs),
+                seed=int(cfg.seed) + int(pair_ordinals[0]),
+                landmark_memory_bank=landmark_memory_bank,
+                update_landmark_memory=True,
             )
+            _accumulate_landmark_training_metrics(landmark_metric_sums, landmark_metric_counts, step_metrics)
+            loss_value = float(loss.detach().cpu().item())
+            total_loss_sum += loss_value
+            total_loss_count += 1
+            progress_metric_sums["total_loss"] = float(progress_metric_sums.get("total_loss", 0.0) + loss_value)
+            progress_metric_counts["total_loss"] = int(progress_metric_counts.get("total_loss", 0) + 1)
+            for key in (
+                "map_correspondence_loss",
+                "landmark_retrieval_loss",
+                "query_heatmap_loss",
+                "render_heatmap_loss",
+                "local_window_fine_loss",
+                "measurement_patch_loss",
+            ):
+                value = step_metrics.get(key)
+                if value is None or not np.isfinite(float(value)):
+                    continue
+                progress_metric_sums[key] = float(progress_metric_sums.get(key, 0.0) + float(value))
+                progress_metric_counts[key] = int(progress_metric_counts.get(key, 0) + 1)
             (loss / float(gradient_accumulation_pairs)).backward()
-            consumed_training_pairs += 1
+            consumed_training_pairs += int(pair_batch_size)
+        _average_distributed_model_gradients(model, int(world_size))
         optimizer.step()
+        should_report = int(progress_interval_steps) > 0 and (
+            (int(step) + 1) % int(progress_interval_steps) == 0 or int(step) + 1 == int(cfg.steps)
+        )
+        if should_report:
+            _report_distributed_provider_progress(
+                step=int(step) + 1,
+                steps=int(cfg.steps),
+                rank=int(rank),
+                world_size=int(world_size),
+                elapsed_seconds=float(time.perf_counter() - training_loop_started),
+                global_pair_count=int(consumed_training_pairs) * int(world_size),
+                metric_sums=progress_metric_sums,
+                metric_counts=progress_metric_counts,
+            )
+            progress_metric_sums.clear()
+            progress_metric_counts.clear()
+        if (
+            int(empty_cuda_cache_interval_steps) > 0
+            and device.type == "cuda"
+            and (int(step) + 1) % int(empty_cuda_cache_interval_steps) == 0
+        ):
+            torch.cuda.empty_cache()
         if get_validation_sample is not None and validation_provider_count > 0 and int(validation_interval) > 0 and ((int(step) + 1) % int(validation_interval) == 0):
             maybe_validate(int(step) + 1)
     if get_validation_sample is not None and validation_provider_count > 0 and (not validation_history or int(validation_history[-1]["step"]) != int(cfg.steps)):
         maybe_validate(int(cfg.steps))
     if best_state is not None:
         model.load_state_dict(best_state)
-    final_loss = _loss_value_for_samples(model, last_samples, cfg, device, seed=int(cfg.seed) + int(cfg.steps) + 1)
-    eval_samples = get_validation_sample(0) if get_validation_sample is not None and validation_provider_count > 0 else last_samples
+    _synchronize_distributed_model_buffers(model, int(world_size))
+    (
+        landmark_metric_sums,
+        landmark_metric_counts,
+        total_loss_sum,
+        total_loss_count,
+        landmark_memory_sizes,
+    ) = _reduce_distributed_training_statistics(
+        landmark_metric_sums=landmark_metric_sums,
+        landmark_metric_counts=landmark_metric_counts,
+        total_loss_sum=float(total_loss_sum),
+        total_loss_count=int(total_loss_count),
+        memory_size=0 if landmark_memory_bank is None else int(len(landmark_memory_bank)),
+    )
+    final_loss = _loss_value_for_samples(model, first_samples, cfg, device, seed=int(cfg.seed))
+    eval_samples = get_validation_sample(0) if get_validation_sample is not None and validation_provider_count > 0 else first_samples
     summary = {
         "stage": "matcha_style_joint_training",
         "model_type": str(cfg.model_type),
@@ -3946,13 +4646,36 @@ def train_matcha_joint_model_from_sample_provider(
         "provider_sample_count": int(provider_sample_count),
         "provider_steps_per_sample": int(steps_per_sample),
         "provider_gradient_accumulation_pairs": int(gradient_accumulation_pairs),
+        "provider_pair_batch_size": int(pair_batch_size),
         "provider_training_pair_count": int(consumed_training_pairs),
+        "provider_global_training_pair_count": int(consumed_training_pairs) * int(world_size),
+        "provider_effective_global_gradient_accumulation_pairs": int(gradient_accumulation_pairs) * int(pair_batch_size) * int(world_size),
         "provider_prefetch_workers": int(prefetch_workers),
         "provider_prefetch_depth": int(prefetch_depth),
+        "provider_progress_interval_steps": int(progress_interval_steps),
+        "provider_empty_cuda_cache_interval_steps": int(empty_cuda_cache_interval_steps),
         "provider_first_pair_sample_count": int(first_samples.coarse_fine_samples.sample_count),
         "provider_last_pair_sample_count": int(last_samples.coarse_fine_samples.sample_count),
+        "distributed_training": bool(int(world_size) > 1),
+        "distributed_rank": int(rank),
+        "distributed_world_size": int(world_size),
+        "train_total_loss_mean": float(total_loss_sum) / float(max(1, int(total_loss_count))),
+        "training_loop_elapsed_sec": float(time.perf_counter() - training_loop_started),
+        "training_global_pairs_per_second": (
+            float(consumed_training_pairs) * float(world_size)
+            / max(float(time.perf_counter() - training_loop_started), 1e-9)
+        ),
+        "loss_audit_source": "provider_index_0_fixed_subset",
     }
     summary.update(warm_start_report)
+    summary.update(_landmark_training_summary(landmark_memory_bank, landmark_metric_sums, landmark_metric_counts))
+    if landmark_memory_bank is not None:
+        summary.update(
+            {
+                "landmark_retrieval_memory_scope": "rank_local",
+                "landmark_retrieval_memory_final_size_by_rank": [int(value) for value in landmark_memory_sizes],
+            }
+        )
     if get_validation_sample is not None and validation_provider_count > 0:
         summary.update(
             {
@@ -4233,9 +4956,19 @@ def save_matcha_joint_training_set_npz(
             pair_candidate_ids=_optional_npz_value(samples.pair_candidate_ids),
             pair_translation_errors_m=_optional_npz_value(samples.pair_translation_errors_m),
             pair_rotation_errors_deg=_optional_npz_value(samples.pair_rotation_errors_deg),
+            pair_query_image_sizes=_optional_npz_value(samples.pair_query_image_sizes),
+            pair_reference_image_sizes=_optional_npz_value(samples.pair_reference_image_sizes),
             sample_no_match_labels=_optional_npz_value(samples.sample_no_match_labels),
             sample_ignore_mask=_optional_npz_value(samples.sample_ignore_mask),
             sample_confidence_ignore_mask=_optional_npz_value(samples.sample_confidence_ignore_mask),
+            sample_track_ids=_optional_npz_value(samples.sample_track_ids),
+            sample_track_xyz=_optional_npz_value(samples.sample_track_xyz),
+            landmark_sample_pair_indices=_optional_npz_value(samples.landmark_sample_pair_indices),
+            landmark_query_xy=_optional_npz_value(samples.landmark_query_xy),
+            landmark_reference_xy=_optional_npz_value(samples.landmark_reference_xy),
+            landmark_track_ids=_optional_npz_value(samples.landmark_track_ids),
+            landmark_track_xyz=_optional_npz_value(samples.landmark_track_xyz),
+            landmark_support_view_counts=_optional_npz_value(samples.landmark_support_view_counts),
             query_repeatability_targets=_optional_npz_value(samples.query_repeatability_targets),
             render_repeatability_targets=_optional_npz_value(samples.render_repeatability_targets),
         )
@@ -4285,9 +5018,19 @@ def save_matcha_joint_training_set_npz(
         pair_candidate_ids=_optional_npz_value(samples.pair_candidate_ids),
         pair_translation_errors_m=_optional_npz_value(samples.pair_translation_errors_m),
         pair_rotation_errors_deg=_optional_npz_value(samples.pair_rotation_errors_deg),
+        pair_query_image_sizes=_optional_npz_value(samples.pair_query_image_sizes),
+        pair_reference_image_sizes=_optional_npz_value(samples.pair_reference_image_sizes),
         sample_no_match_labels=_optional_npz_value(samples.sample_no_match_labels),
         sample_ignore_mask=_optional_npz_value(samples.sample_ignore_mask),
         sample_confidence_ignore_mask=_optional_npz_value(samples.sample_confidence_ignore_mask),
+        sample_track_ids=_optional_npz_value(samples.sample_track_ids),
+        sample_track_xyz=_optional_npz_value(samples.sample_track_xyz),
+        landmark_sample_pair_indices=_optional_npz_value(samples.landmark_sample_pair_indices),
+        landmark_query_xy=_optional_npz_value(samples.landmark_query_xy),
+        landmark_reference_xy=_optional_npz_value(samples.landmark_reference_xy),
+        landmark_track_ids=_optional_npz_value(samples.landmark_track_ids),
+        landmark_track_xyz=_optional_npz_value(samples.landmark_track_xyz),
+        landmark_support_view_counts=_optional_npz_value(samples.landmark_support_view_counts),
         query_repeatability_targets=_optional_npz_value(samples.query_repeatability_targets),
         render_repeatability_targets=_optional_npz_value(samples.render_repeatability_targets),
     )
@@ -4357,9 +5100,19 @@ def load_matcha_joint_training_set_npz(path: Path) -> tuple[MatchaJointTrainingS
                 pair_candidate_ids=_optional_loaded(data, "pair_candidate_ids"),
                 pair_translation_errors_m=_optional_loaded(data, "pair_translation_errors_m"),
                 pair_rotation_errors_deg=_optional_loaded(data, "pair_rotation_errors_deg"),
+                pair_query_image_sizes=_optional_loaded(data, "pair_query_image_sizes"),
+                pair_reference_image_sizes=_optional_loaded(data, "pair_reference_image_sizes"),
                 sample_no_match_labels=_optional_loaded(data, "sample_no_match_labels"),
                 sample_ignore_mask=_optional_loaded(data, "sample_ignore_mask"),
                 sample_confidence_ignore_mask=_optional_loaded(data, "sample_confidence_ignore_mask"),
+                sample_track_ids=_optional_loaded(data, "sample_track_ids"),
+                sample_track_xyz=_optional_loaded(data, "sample_track_xyz"),
+                landmark_sample_pair_indices=_optional_loaded(data, "landmark_sample_pair_indices"),
+                landmark_query_xy=_optional_loaded(data, "landmark_query_xy"),
+                landmark_reference_xy=_optional_loaded(data, "landmark_reference_xy"),
+                landmark_track_ids=_optional_loaded(data, "landmark_track_ids"),
+                landmark_track_xyz=_optional_loaded(data, "landmark_track_xyz"),
+                landmark_support_view_counts=_optional_loaded(data, "landmark_support_view_counts"),
                 query_repeatability_targets=_optional_loaded(data, "query_repeatability_targets"),
                 render_repeatability_targets=_optional_loaded(data, "render_repeatability_targets"),
             )
@@ -4412,9 +5165,19 @@ def load_matcha_joint_training_set_npz(path: Path) -> tuple[MatchaJointTrainingS
             pair_candidate_ids=_optional_loaded(data, "pair_candidate_ids"),
             pair_translation_errors_m=_optional_loaded(data, "pair_translation_errors_m"),
             pair_rotation_errors_deg=_optional_loaded(data, "pair_rotation_errors_deg"),
+            pair_query_image_sizes=_optional_loaded(data, "pair_query_image_sizes"),
+            pair_reference_image_sizes=_optional_loaded(data, "pair_reference_image_sizes"),
             sample_no_match_labels=_optional_loaded(data, "sample_no_match_labels"),
             sample_ignore_mask=_optional_loaded(data, "sample_ignore_mask"),
             sample_confidence_ignore_mask=_optional_loaded(data, "sample_confidence_ignore_mask"),
+            sample_track_ids=_optional_loaded(data, "sample_track_ids"),
+            sample_track_xyz=_optional_loaded(data, "sample_track_xyz"),
+            landmark_sample_pair_indices=_optional_loaded(data, "landmark_sample_pair_indices"),
+            landmark_query_xy=_optional_loaded(data, "landmark_query_xy"),
+            landmark_reference_xy=_optional_loaded(data, "landmark_reference_xy"),
+            landmark_track_ids=_optional_loaded(data, "landmark_track_ids"),
+            landmark_track_xyz=_optional_loaded(data, "landmark_track_xyz"),
+            landmark_support_view_counts=_optional_loaded(data, "landmark_support_view_counts"),
             query_repeatability_targets=_optional_loaded(data, "query_repeatability_targets"),
             render_repeatability_targets=_optional_loaded(data, "render_repeatability_targets"),
         )
@@ -4513,6 +5276,44 @@ def load_matcha_joint_training_set_manifest(path: Path) -> tuple[MatchaJointTrai
     return merged, output_metadata
 
 
+def _materialize_index_only_joint_training_set(samples: MatchaJointTrainingSet) -> MatchaJointTrainingSet:
+    """Materialize only bounded coarse rows so a few lazy image pairs can form one GPU batch."""
+
+    rows = samples.coarse_fine_samples
+    if not isinstance(rows, IndexOnlyCoarseFineRows):
+        return samples
+    base = MatchaCoarseFineTrainingSet(
+        query_features=np.asarray(rows.query_features[:], dtype=np.float32),
+        render_features=np.asarray(rows.render_features[:], dtype=np.float32),
+        query_offset_labels=np.asarray(rows.query_offset_labels, dtype=np.int64),
+        render_offset_labels=np.asarray(rows.render_offset_labels, dtype=np.int64),
+        negative_render_features=np.asarray(rows.negative_render_features[:], dtype=np.float32),
+        roundtrip_errors_px=np.asarray(rows.roundtrip_errors_px, dtype=np.float32),
+        query_offset_soft_labels=(
+            None
+            if rows.query_offset_soft_labels is None
+            else np.asarray(rows.query_offset_soft_labels, dtype=np.float32)
+        ),
+        render_offset_soft_labels=(
+            None
+            if rows.render_offset_soft_labels is None
+            else np.asarray(rows.render_offset_soft_labels, dtype=np.float32)
+        ),
+        sample_confidence_targets=(
+            None
+            if rows.sample_confidence_targets is None
+            else np.asarray(rows.sample_confidence_targets, dtype=np.float32)
+        ),
+        sample_uncertainty_px=(
+            None
+            if rows.sample_uncertainty_px is None
+            else np.asarray(rows.sample_uncertainty_px, dtype=np.float32)
+        ),
+        metadata={**dict(rows.metadata), "bounded_lazy_materialization": True},
+    )
+    return replace(samples, coarse_fine_samples=base)
+
+
 def merge_matcha_joint_training_sets(
     items: list[MatchaJointTrainingSet] | tuple[MatchaJointTrainingSet, ...],
 ) -> MatchaJointTrainingSet:
@@ -4566,6 +5367,29 @@ def merge_matcha_joint_training_sets(
     query_indices = []
     render_indices = []
     fine_arrays = [item.fine_sample_pair_indices for item in values]
+    landmark_arrays = [item.landmark_sample_pair_indices for item in values]
+    if all(array is None for array in landmark_arrays):
+        landmark_pair_indices = None
+        landmark_query_xy = None
+        landmark_reference_xy = None
+        landmark_track_ids = None
+        landmark_track_xyz = None
+        landmark_support_view_counts = None
+    elif any(array is None for array in landmark_arrays):
+        raise ValueError("cannot merge partially missing landmark retrieval supervision")
+    else:
+        landmark_pair_indices = np.concatenate(
+            [
+                np.asarray(item.landmark_sample_pair_indices, dtype=np.int64) + int(pair_idx)
+                for pair_idx, item in enumerate(values)
+            ],
+            axis=0,
+        )
+        landmark_query_xy = stack_optional("landmark_query_xy")
+        landmark_reference_xy = stack_optional("landmark_reference_xy")
+        landmark_track_ids = stack_optional("landmark_track_ids")
+        landmark_track_xyz = stack_optional("landmark_track_xyz")
+        landmark_support_view_counts = stack_optional("landmark_support_view_counts")
     if all(array is None for array in fine_arrays):
         fine_pair_indices = None
         fine_query_indices = None
@@ -4641,9 +5465,19 @@ def merge_matcha_joint_training_sets(
         pair_candidate_ids=stack_optional("pair_candidate_ids"),
         pair_translation_errors_m=stack_optional("pair_translation_errors_m"),
         pair_rotation_errors_deg=stack_optional("pair_rotation_errors_deg"),
+        pair_query_image_sizes=stack_optional("pair_query_image_sizes"),
+        pair_reference_image_sizes=stack_optional("pair_reference_image_sizes"),
         sample_no_match_labels=stack_optional("sample_no_match_labels"),
         sample_ignore_mask=stack_optional("sample_ignore_mask"),
         sample_confidence_ignore_mask=stack_optional("sample_confidence_ignore_mask"),
+        sample_track_ids=stack_optional("sample_track_ids"),
+        sample_track_xyz=stack_optional("sample_track_xyz"),
+        landmark_sample_pair_indices=landmark_pair_indices,
+        landmark_query_xy=landmark_query_xy,
+        landmark_reference_xy=landmark_reference_xy,
+        landmark_track_ids=landmark_track_ids,
+        landmark_track_xyz=landmark_track_xyz,
+        landmark_support_view_counts=landmark_support_view_counts,
         query_repeatability_targets=stack_optional("query_repeatability_targets"),
         render_repeatability_targets=stack_optional("render_repeatability_targets"),
     )

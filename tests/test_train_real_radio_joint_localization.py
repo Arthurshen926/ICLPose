@@ -33,6 +33,16 @@ def _full_joint_set() -> MatchaJointTrainingSet:
         sample_pair_indices=np.asarray([0], dtype=np.int64),
         query_cell_indices=np.asarray([0], dtype=np.int64),
         render_cell_indices=np.asarray([0], dtype=np.int64),
+        sample_track_ids=np.asarray([7], dtype=np.int64),
+        sample_track_xyz=np.asarray([[1.0, 2.0, 3.0]], dtype=np.float64),
+        landmark_sample_pair_indices=np.asarray([0], dtype=np.int64),
+        landmark_query_xy=np.asarray([[4.0, 4.0]], dtype=np.float64),
+        landmark_reference_xy=np.asarray([[4.0, 4.0]], dtype=np.float64),
+        landmark_track_ids=np.asarray([7], dtype=np.int64),
+        landmark_track_xyz=np.asarray([[1.0, 2.0, 3.0]], dtype=np.float64),
+        landmark_support_view_counts=np.asarray([2], dtype=np.int64),
+        pair_query_image_sizes=np.asarray([[16, 16]], dtype=np.int64),
+        pair_reference_image_sizes=np.asarray([[16, 16]], dtype=np.int64),
         fine_sample_pair_indices=np.asarray([0], dtype=np.int64),
         fine_query_cell_indices=np.asarray([0], dtype=np.int64),
         fine_render_cell_indices=np.asarray([0], dtype=np.int64),
@@ -66,6 +76,7 @@ def test_train_real_radio_joint_localization_cli_defaults_to_full_joint_training
     assert args.joint_cache == "train.npz"
     assert args.model_type == "residual_adapter"
     assert args.measurement_patch_loss_weight == pytest.approx(1.0)
+    assert args.landmark_retrieval_loss_weight == pytest.approx(0.25)
     assert args.local_window_fine_loss_weight > 0.0
     assert not hasattr(args, "sample_cache")
     assert not hasattr(args, "render_cache_manifest_csv")
@@ -173,6 +184,7 @@ def test_train_real_radio_joint_localization_main_uses_joint_backend(monkeypatch
     assert captured["samples"] is full_set
     assert captured["config"].model_type == "residual_adapter"
     assert captured["config"].measurement_patch_loss_weight == pytest.approx(1.0)
+    assert captured["config"].landmark_retrieval_loss_weight == pytest.approx(0.25)
     assert captured["config"].steps == 3
     assert captured["adapter_path"] == tmp_path / "adapter.pt"
     assert captured["joint_path"] == tmp_path / "joint.pt"
@@ -199,6 +211,9 @@ def test_train_real_radio_joint_localization_main_uses_referenced_lazy_provider(
         def get(self, index):
             captured.setdefault("provider_get_indices", []).append(int(index))
             return full_set
+
+        def landmark_retrieval_audit(self):
+            return {"unique_track_count": 1, "supervision_source": "sfm_common_track_observations"}
 
     def fake_train_from_provider(sample_count, get_sample, config, **kwargs):
         captured["provider_sample_count"] = int(sample_count)
@@ -237,6 +252,10 @@ def test_train_real_radio_joint_localization_main_uses_referenced_lazy_provider(
             "8",
             "--provider_gradient_accumulation_pairs",
             "4",
+            "--provider_pair_batch_size",
+            "2",
+            "--provider_progress_interval_steps",
+            "25",
             "--device",
             "cpu",
         ]
@@ -251,6 +270,8 @@ def test_train_real_radio_joint_localization_main_uses_referenced_lazy_provider(
     assert captured["train_kwargs"]["provider_prefetch_workers"] == 2
     assert captured["train_kwargs"]["provider_prefetch_depth"] == 8
     assert captured["train_kwargs"]["provider_gradient_accumulation_pairs"] == 4
+    assert captured["train_kwargs"]["provider_pair_batch_size"] == 2
+    assert captured["train_kwargs"]["provider_progress_interval_steps"] == 25
     assert captured["adapter_path"] == tmp_path / "adapter.pt"
     assert captured["joint_path"] == tmp_path / "joint.pt"
     summary = json.loads(summary_json.read_text())
