@@ -87,6 +87,74 @@ def test_train_real_radio_joint_localization_cli_defaults_to_full_joint_training
     assert args.landmark_normalize_final_prototypes is True
     assert args.landmark_frozen_negative_bank == ""
     assert args.landmark_frozen_bank_support_observations == ""
+    assert train_real_radio_joint_localization._requires_rgb_training(args) is True
+
+
+def test_retrieval_only_training_does_not_require_rgb() -> None:
+    args = train_real_radio_joint_localization.parse_args(
+        [
+            "--joint_cache",
+            "train.npz",
+            "--output_model",
+            "adapter.pt",
+            "--output_joint_model",
+            "joint.pt",
+            "--summary_json",
+            "summary.json",
+            "--measurement_patch_loss_weight",
+            "0",
+            "--rgb_keypoint_loss_weight",
+            "0",
+            "--rgb_keypoint_position_loss_weight",
+            "0",
+        ]
+    )
+
+    assert train_real_radio_joint_localization._requires_rgb_training(args) is False
+
+    audit = train_real_radio_joint_localization._validate_joint_localization_training_set(
+        replace(_full_joint_set(), query_rgb_images=None, render_rgb_images=None),
+        source="train",
+        require_landmark_retrieval_supervision=True,
+    )
+    assert audit["query_rgb_shape"] is None
+    assert audit["reference_rgb_shape"] is None
+
+
+@pytest.mark.parametrize(
+    ("rank", "expected_events"),
+    ((0, ["load", "barrier"]), (1, ["barrier", "load"])),
+)
+def test_distributed_track_index_cache_is_built_by_rank_zero(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    rank: int,
+    expected_events: list[str],
+) -> None:
+    events: list[str] = []
+    sentinel = object()
+    args = SimpleNamespace(
+        landmark_track_observations=str(tmp_path / "tracks.jsonl"),
+        landmark_track_observation_index_cache=str(tmp_path / "tracks.index.npz"),
+    )
+    monkeypatch.setattr(
+        train_real_radio_joint_localization,
+        "load_track_observation_index",
+        lambda *_args, **_kwargs: events.append("load") or sentinel,
+    )
+    monkeypatch.setattr(
+        train_real_radio_joint_localization.torch.distributed,
+        "barrier",
+        lambda: events.append("barrier"),
+    )
+
+    result = train_real_radio_joint_localization._load_training_track_observation_index(
+        args,
+        {"enabled": True, "rank": rank},
+    )
+
+    assert result is sentinel
+    assert events == expected_events
 
 
 def test_multiview_episode_provider_groups_distinct_support_images() -> None:
@@ -220,6 +288,79 @@ def test_frozen_landmark_bank_contract_rejects_stale_support_split(tmp_path: Pat
             warm_start_checkpoint=checkpoint,
             support_observations=stale_support,
             expected_source_image_count=3,
+        )
+
+
+def test_upstream_disjoint_manifest_contract_rejects_either_pair_side(tmp_path: Path) -> None:
+    from feature_extract.vfm.artifacts import file_sha256_short
+
+    query_split = tmp_path / "query_split.json"
+    query_split.write_text(json.dumps({"train": ["q.png"], "validation": [], "test": []}))
+    manifest = tmp_path / "manifest.json"
+    base = {
+        "heldout_image_filter": {
+            "query_split_sha256": file_sha256_short(query_split),
+            "heldout_image_count": 1,
+        }
+    }
+    manifest.write_text(json.dumps({**base, "records": [{"query_id": "a.png", "reference_image_id": "b.png"}]}))
+
+    audit = train_real_radio_joint_localization.validate_upstream_disjoint_manifest_contract(
+        manifest,
+        query_split_path=query_split,
+    )
+
+    assert audit["validated"] is True
+    assert audit["leaked_pair_count"] == 0
+    for record in (
+        {"query_id": "q.png", "reference_image_id": "b.png"},
+        {"query_id": "a.png", "reference_image_id": "q.png"},
+    ):
+        manifest.write_text(json.dumps({**base, "records": [record]}))
+        with pytest.raises(ValueError, match="held-out query images"):
+            train_real_radio_joint_localization.validate_upstream_disjoint_manifest_contract(
+                manifest,
+                query_split_path=query_split,
+            )
+
+
+def test_episode_support_manifest_uses_full_disjoint_scope(tmp_path: Path) -> None:
+    token_path = tmp_path / "token.npz"
+    np.savez(token_path, radio_final=np.ones((4, 2, 2), dtype=np.float32))
+    query_split = tmp_path / "query_split.json"
+    query_split.write_text(json.dumps({"train": ["q.png"], "validation": [], "test": []}))
+
+    def record(image_id: str) -> dict[str, object]:
+        return {
+            "image_id": image_id,
+            "token_path": str(token_path),
+            "layers": [
+                {
+                    "name": "radio_final",
+                    "model": "C-RADIO",
+                    "layer": "final",
+                    "channels": 4,
+                    "stride": 16,
+                }
+            ],
+            "split": "train",
+            "scene": "scene",
+        }
+
+    support_manifest = tmp_path / "support.json"
+    support_manifest.write_text(json.dumps({"records": [record("a.png"), record("b.png")]}))
+    image_ids, audit = train_real_radio_joint_localization.load_episode_support_image_ids(
+        support_manifest,
+        upstream_disjoint_query_split=query_split,
+    )
+
+    assert image_ids == {"a.png", "b.png"}
+    assert audit["image_count"] == 2
+    support_manifest.write_text(json.dumps({"records": [record("a.png"), record("q.png")]}))
+    with pytest.raises(ValueError, match="held-out query images"):
+        train_real_radio_joint_localization.load_episode_support_image_ids(
+            support_manifest,
+            upstream_disjoint_query_split=query_split,
         )
 
 
@@ -403,7 +544,9 @@ def test_train_real_radio_joint_localization_main_uses_referenced_lazy_provider(
     )
 
     assert captured["provider_paths"] == [manifest]
-    assert captured["provider_kwargs"] == [{"feature_cache_size": 256, "rgb_cache_size": 128}]
+    assert captured["provider_kwargs"] == [
+        {"feature_cache_size": 256, "rgb_cache_size": 128, "load_rgb": True}
+    ]
     assert captured["provider_get_indices"] == [0, 1]
     assert captured["provider_sample_count"] == 3
     assert captured["config"].model_type == "residual_adapter"

@@ -212,6 +212,38 @@ def test_build_real_radio_joint_cache_writes_referenced_manifest_without_shards(
     assert landmark_audit["unique_track_count"] == 1
     assert landmark_audit["expected_first_epoch_history_hit_fraction_without_eviction"] == 0.0
 
+    observations = tmp_path / "tracks.jsonl"
+    observations.write_text(
+        "\n".join(
+            json.dumps(
+                {
+                    "image_id": image_id,
+                    "track_id": 1,
+                    "xy": xy,
+                    "image_width": 16,
+                    "image_height": 16,
+                    "xyz": [1.0, 2.0, 3.0],
+                    "track_length": 2,
+                    "reprojection_error": 0.1,
+                }
+            )
+            for image_id, xy in (("seq/q.png", [3.0, 4.0]), ("seq/r.png", [12.0, 12.0]))
+        )
+        + "\n"
+    )
+    feature_only_provider = build_real_radio_joint_cache.RealRadioReferencedJointSampleProvider(
+        manifest,
+        load_rgb=False,
+        track_observation_index=build_real_radio_joint_cache.load_track_observation_index(observations),
+    )
+    feature_only = feature_only_provider.get(0)
+
+    assert feature_only.query_rgb_images is None
+    assert feature_only.render_rgb_images is None
+    assert feature_only.pair_query_image_sizes.tolist() == [[16, 16]]
+    assert feature_only.pair_reference_image_sizes.tolist() == [[16, 16]]
+    assert not feature_only_provider._rgb_cache
+
 
 def test_referenced_cache_preserves_cell_colliding_tracks_for_landmark_retrieval(tmp_path: Path) -> None:
     image_root = tmp_path / "images"
@@ -349,6 +381,7 @@ def test_sfm_track_observation_index_cache_roundtrip_and_stale_rejection(tmp_pat
     second = build_real_radio_joint_cache.load_track_observation_index(observations, cache_path=cache)
 
     assert cache.exists()
+    assert not list(tmp_path.glob(".*.tmp.npz"))
     np.testing.assert_array_equal(first.by_image["q.png"].track_ids, second.by_image["q.png"].track_ids)
     observations.write_text(observations.read_text() + json.dumps({**rows[0], "track_id": 8}) + "\n")
     with pytest.raises(ValueError, match="stale track observation index cache"):

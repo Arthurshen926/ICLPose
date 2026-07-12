@@ -112,14 +112,14 @@ image overlap with the historical `seq4`/`seq8` full182 query set. The split
 manifest is a hashed model input; count-based implicit slicing is not accepted
 for this experiment.
 
-This is leakage-free for S4 prototype support and local-matcher supervision, not
-an end-to-end untouched global-mapper test. The frozen R1 mapper predates this
-split and its image-pair training saw 57/63 train, 19/21 validation, and 18/21
-late images. Therefore the current 105-query run isolates whether broader S4
-episodes improve local assignment; it cannot promote the complete localization
-system. A later end-to-end run must rebuild the R1 pair data, frozen negative
-snapshot, projected bank, and S4 artifacts after excluding all validation/test
-images upstream.
+The historical L97/P13 branch is leakage-free for S4 prototype support and
+local-matcher supervision, but its frozen R1 mapper predates this split and saw
+many current query images during pair training. P18 now provides a separate
+upstream-disjoint mapper/bank branch: all 105 query images are excluded from
+both sides of mapper pair training and from the 790-image prototype support
+scope. This makes the P18/P19 branch valid for end-to-end development auditing,
+but it does not retroactively make L97 upstream-disjoint or create a new
+untouched test after full182 has been inspected.
 
 The image-referenced lazy episode store loads feature/RGB data per candidate
 group and keeps bounded caches. Full feature/RGB duplication is not required.
@@ -200,8 +200,9 @@ Candidate-maplet checkpoints are selected independently:
   Recall@1/@20 of `77.98%/98.99%`, yet full182 no-measurement pose is only
   `43.4 cm` median, `124.7 cm` P90, and `0.797 deg`. This is worse than the R1
   development path and demonstrates that train-observation recall is not an
-  external-query checkpoint metric. A fully upstream-disjoint validation set is
-  still required.
+  external-query checkpoint metric. P18 subsequently supplies the required
+  upstream-disjoint branch and confirms that checkpoint selection must use
+  held-out full-bank pose as well as Recall@K.
 - S2 no-ratio global top-L proposal/oracle audits: implemented and passed for
   entering local assignment development.
 - S3 projected-observation bank, aggregation audits, maplets, and support views:
@@ -256,11 +257,71 @@ Candidate-maplet checkpoints are selected independently:
   validation hypothesis oracle from `9.61 cm` to `8.87 cm`, but neither a
   retrained global ranker nor a frozen hierarchical margin gate generalizes
   across the reused late block. L97 remains the mainline policy.
-- The next S6 step is candidate-specific selective RGB verification: measure a
-  small pose-conditioned set of top-L alternatives rather than only the frozen
-  hard-selected track. Any added candidate pool must preserve the original P13
-  ranking as an invariant fallback; optional candidates may not silently change
-  the baseline's cross-hypothesis features or score.
+- P14 candidate-specific RGB verification is implemented with an unambiguous
+  `(query, source row, track, prototype, support-view set, crop version,
+  checkpoint)` key. At top-5, the fixed candidate pool contains a correct 2 px
+  alternative for about `60.6%/63.6%` of validation/late rows. The old RGB
+  branch has useful row evidence (validation 5 px AUROC `0.740`), but naive
+  candidate argmax loses more correct identities than it rescues. A separate
+  pose-free candidate geometry calibrator reaches validation/late 5 px AUROC
+  `0.865/0.865`; its frozen high-precision abstention gate makes no net
+  replacement on validation. The learned neural replacement head is not
+  promoted because it underperforms the calibrated evidence model.
+- P15 optional candidate hypotheses prove that generation still has useful
+  headroom. On validation, the immutable L97 replay remains
+  `18.93/56.89 cm, 0.414 deg`; unconditional calibrated-candidate selection is
+  not safe, while the optional-hypothesis oracle reaches `13.68/37.38 cm,
+  0.327 deg`. This is an oracle diagnostic, not an inference result.
+- P16 replaces pool-relative global ranking with an immutable baseline artifact
+  and an abstaining optional-vs-baseline pairwise gate. Property tests require
+  arbitrary garbage optional hypotheses to leave baseline bytes and fallback
+  pose unchanged. The first cross-block pairwise model abstains on all
+  validation queries; it is safe but ineffective and is not promoted.
+- P17 fixes held-out candidate identity by a pose-independent calibrated
+  posterior and scores poses by marginalizing that fixed top-L distribution.
+  A train-frozen 80% promotion margin improves validation median translation
+  from `26.93` to `19.74 cm`, but worsens P90 from `55.04` to `79.81 cm`.
+  A 90% target abstains everywhere and exactly replays baseline. This confirms
+  that row-level 80% precision is insufficient for tail-safe pose promotion.
+- P18 upstream-disjoint rebuild is required before any production claim. The
+  historical pair filter removed only 174 records and still exposed current
+  validation images to the mapper. The strict all-105 filter removes 2,691
+  records and retains 11,453 real-image pairs; neither side may be any S4
+  train/validation/late query. Training now validates the query-split hash at
+  startup, builds SfM observation caches rank-safely, and can omit RGB decoding
+  when every RGB loss is disabled. The completed 300-step feature-only DDP run
+  uses 790 explicit support images and produces a 184,714-track
+  projected-observation bank. Against the historical mapper, all105 full-bank
+  Recall@1 improves from `25.67%` to `26.43%` and direct global-PnP pose improves
+  from `39.83/123.20 cm, 0.827 deg` to `31.71/113.85 cm, 0.809 deg`. A subsequent
+  100-step frozen-bank fine-tune raises Recall@1 slightly to `26.86%` but degrades
+  pose to `38.80/118.07 cm, 0.863 deg`; it is rejected. This confirms that
+  retrieval Recall alone is not a checkpoint promotion metric.
+- P19 external full182 replay confirms that the upstream improvement is not
+  confined to S4: direct pose improves from `55.19/171.38 cm, 0.975 deg` to
+  `48.91/132.31 cm, 0.898 deg`, with 110/72 paired translation wins/losses and
+  fewer old catastrophes. The rebuilt detector top-L proposal oracle remains
+  strong at `3.04/8.23 cm, 0.064 deg` for 2 px matches, but actual coarse pose is
+  `24.29/84.49 cm, 0.508 deg`. Thus the remaining gap is predominantly identity
+  selection and pose-tail safety, not map geometry or absence of correct top-L
+  candidates.
+- P19 local assignment retraining does not pass the strict gate. Two seeds and
+  their arithmetic ensemble fail to improve identity and all pose risks
+  together. An evaluator bug was found and fixed: the ensemble tool previously
+  accepted a frozen global-baseline manifest but compared against ordinary
+  row-argmax PnP. It now replays the hashed whole-image unique-track baseline,
+  exact K/selection mode, and evaluates identity before conflict resolution.
+- Precision-head auditing shows that the old `p_geometry(<=5 px)` promotion
+  score was misaligned with centimeter accuracy. The center-precision head
+  improves validation median/rotation from `19.41 cm/0.386 deg` to
+  `14.97 cm/0.325 deg`, but worsens P90 from `102.20` to `113.32 cm` and fails
+  identity. Relative to immutable L97, its constrained optional-pose oracle is
+  `13.68/56.89 cm, 0.318 deg` on validation and `12.66/68.35 cm, 0.284 deg` on
+  reused late queries. A V2 pairwise gate using only absolute PnP count,
+  coverage, residual, and confidence evidence has validation/test AUROC
+  `0.531/0.394`; validation supports zero safe promotions, so the strict policy
+  freezes a `>1` no-promotion threshold and replays L97 bit-for-bit. This
+  optional branch is promising generation evidence, not a promoted selector.
 
 ## Forbidden Production Combinations
 
@@ -294,5 +355,7 @@ PYTHONPATH=. pytest -q \
   tests/test_measurement_pose_evidence.py \
   tests/test_pose_hypothesis_verifier.py \
   tests/test_pose_hypothesis_ranking.py \
-  tests/test_pose_backend_selection.py
+  tests/test_pose_backend_selection.py \
+  tests/test_eval_candidate_maplet_ensemble.py \
+  tests/test_pairwise_pose_promotion_v2.py
 ```

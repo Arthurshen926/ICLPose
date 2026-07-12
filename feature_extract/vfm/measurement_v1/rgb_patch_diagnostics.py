@@ -15,6 +15,10 @@ from feature_extract.vfm.measurement_v1.rgb_patch_measurement_branch import (
     RGBPatchMeasurementBranch,
     continuous_offset_nll_with_dustbin,
 )
+from feature_extract.vfm.measurement_v1.candidate_measurement_schema import (
+    CandidateIdentityKey,
+    CandidateMeasurementCacheKey,
+)
 from feature_extract.vfm.measurement_v1.rgb_patch_training import (
     TensorImageLRUCache,
     _prior_scale_batch,
@@ -32,6 +36,21 @@ DIAGNOSTIC_FIELDNAMES = [
     "track_id",
     "support_track_id",
     "policy_row_index",
+    "candidate_identity_key",
+    "candidate_measurement_cache_key",
+    "measurement_checkpoint_sha256",
+    "support_view_set_id",
+    "source_query_row",
+    "candidate_measurement_rank",
+    "candidate_score_rank",
+    "candidate_role",
+    "candidate_prototype_id",
+    "candidate_bank_row",
+    "candidate_assignment_probability",
+    "candidate_retrieval_similarity",
+    "candidate_geometry_p01",
+    "candidate_geometry_p02",
+    "candidate_geometry_p05",
     "split",
     "support_view_rank",
     "support_view_probability",
@@ -88,6 +107,7 @@ DIAGNOSTIC_FIELDNAMES = [
     "gated_dx",
     "gated_dy",
     "measurement_gate_probability",
+    "measurement_geometry_probability",
     "dustbin_probability",
     "likelihood_entropy",
     "likelihood_normalized_entropy",
@@ -195,8 +215,13 @@ def _group_measurement_metrics(
             continue
         if not str(row.get(baseline_key, "")).strip():
             continue
+        candidate_identity = str(row.get("candidate_identity_key", "")).strip()
         policy_row = str(row.get("policy_row_index", "")).strip()
-        key = policy_row if policy_row else f"row:{row.get('row_index', '')}"
+        key = (
+            candidate_identity
+            if candidate_identity
+            else policy_row if policy_row else f"row:{row.get('row_index', '')}"
+        )
         groups.setdefault(key, []).append(row)
 
     target_xy: list[list[float]] = []
@@ -252,6 +277,179 @@ def _group_measurement_metrics(
             oracle_best_xy, target_xy, baseline
         ),
     }
+
+
+def _candidate_geometry_evidence_metrics(
+    rows: Sequence[Mapping[str, object]],
+) -> dict[str, object] | None:
+    """Audit whether RGB validity can rescue a non-rank1 candidate.
+
+    This is target-only evaluation. Candidate and support-view selection remain
+    frozen and pose-free; the GT geometry flags are never read by the scorer.
+    """
+
+    candidate_groups: dict[str, list[Mapping[str, object]]] = {}
+    for row in rows:
+        identity = str(row.get("candidate_identity_key", "")).strip()
+        if identity:
+            candidate_groups.setdefault(identity, []).append(row)
+    if not candidate_groups:
+        return None
+
+    candidates: list[dict[str, object]] = []
+    for identity, group_rows in candidate_groups.items():
+        first = group_rows[0]
+        probabilities = np.asarray(
+            [1.0 - float(row["dustbin_probability"]) for row in group_rows],
+            dtype=np.float64,
+        )
+        weights = np.asarray(
+            [
+                float(str(row.get("support_view_probability", "")).strip() or 1.0)
+                for row in group_rows
+            ],
+            dtype=np.float64,
+        )
+        weights = np.clip(weights, 0.0, None)
+        if float(np.sum(weights)) <= 0.0:
+            weights = np.ones_like(weights)
+        weights /= float(np.sum(weights))
+        geometry_values = [
+            str(row.get("measurement_geometry_probability", "")).strip()
+            for row in group_rows
+        ]
+        geometry_probabilities = (
+            None
+            if not geometry_values or any(not value for value in geometry_values)
+            else np.asarray([float(value) for value in geometry_values], dtype=np.float64)
+        )
+        candidate = {
+            "identity": identity,
+            "token": str(first.get("source_query_row", "")).strip(),
+            "measurement_rank": int(first.get("candidate_measurement_rank", 0)),
+            "correct_2px": _bool_text(first.get("target_geometry_correct_2px", "")),
+            "correct_5px": _bool_text(first.get("target_geometry_correct_5px", "")),
+            "validity_max": float(np.max(probabilities)),
+            "validity_mean": float(np.mean(probabilities)),
+            "validity_posterior": float(np.sum(probabilities * weights)),
+            "support_view_count": int(len(group_rows)),
+        }
+        if geometry_probabilities is not None:
+            candidate.update(
+                {
+                    "geometry_head_max": float(np.max(geometry_probabilities)),
+                    "geometry_head_mean": float(np.mean(geometry_probabilities)),
+                    "geometry_head_posterior": float(
+                        np.sum(geometry_probabilities * weights)
+                    ),
+                }
+            )
+        candidates.append(
+            candidate
+        )
+    if any(not str(candidate["token"]) for candidate in candidates):
+        raise ValueError("candidate diagnostic row is missing source_query_row")
+    token_groups: dict[str, list[dict[str, object]]] = {}
+    for candidate in candidates:
+        token_groups.setdefault(str(candidate["token"]), []).append(candidate)
+    comparable_token_groups: dict[str, list[dict[str, object]]] = {}
+    missing_frozen_candidate_count = 0
+    duplicate_frozen_candidate_count = 0
+    for token, group in token_groups.items():
+        frozen_count = sum(
+            int(candidate["measurement_rank"]) == 1 for candidate in group
+        )
+        if frozen_count == 1:
+            comparable_token_groups[token] = group
+        elif frozen_count == 0:
+            missing_frozen_candidate_count += 1
+        else:
+            duplicate_frozen_candidate_count += 1
+
+    report: dict[str, object] = {
+        "candidate_count": int(len(candidates)),
+        "token_count": int(len(token_groups)),
+        "comparable_token_count": int(len(comparable_token_groups)),
+        "missing_frozen_candidate_token_count": int(missing_frozen_candidate_count),
+        "duplicate_frozen_candidate_token_count": int(
+            duplicate_frozen_candidate_count
+        ),
+        "mean_support_views": float(
+            np.mean([int(candidate["support_view_count"]) for candidate in candidates])
+        ),
+    }
+    for threshold in (2, 5):
+        label_key = f"correct_{threshold}px"
+        labels = np.asarray([bool(candidate[label_key]) for candidate in candidates])
+        threshold_report: dict[str, object] = {}
+        aggregations = ["validity_max", "validity_mean", "validity_posterior"]
+        if all("geometry_head_max" in candidate for candidate in candidates):
+            aggregations.extend(
+                ["geometry_head_max", "geometry_head_mean", "geometry_head_posterior"]
+            )
+        for aggregation in aggregations:
+            probabilities = np.asarray(
+                [float(candidate[aggregation]) for candidate in candidates],
+                dtype=np.float64,
+            )
+            row_metrics = confidence_metrics(labels, probabilities)
+            selected_correct: list[bool] = []
+            chosen_correct: list[bool] = []
+            oracle_correct: list[bool] = []
+            changed: list[bool] = []
+            for group in comparable_token_groups.values():
+                baseline_candidates = [
+                    candidate
+                    for candidate in group
+                    if int(candidate["measurement_rank"]) == 1
+                ]
+                baseline = baseline_candidates[0]
+                chosen = max(
+                    group,
+                    key=lambda candidate: (
+                        float(candidate[aggregation]),
+                        -int(candidate["measurement_rank"]),
+                    ),
+                )
+                selected_correct.append(bool(baseline[label_key]))
+                chosen_correct.append(bool(chosen[label_key]))
+                oracle_correct.append(any(bool(candidate[label_key]) for candidate in group))
+                changed.append(str(chosen["identity"]) != str(baseline["identity"]))
+            selected_array = np.asarray(selected_correct, dtype=bool)
+            chosen_array = np.asarray(chosen_correct, dtype=bool)
+            oracle_array = np.asarray(oracle_correct, dtype=bool)
+            changed_array = np.asarray(changed, dtype=bool)
+            rescue_eligible = (~selected_array) & oracle_array
+            rescued = (~selected_array) & chosen_array
+            harmed = selected_array & (~chosen_array)
+            row_metrics.update(
+                {
+                    "frozen_selected_correct_rate": (
+                        None if not len(selected_array) else float(np.mean(selected_array))
+                    ),
+                    "rgb_selected_correct_rate": (
+                        None if not len(chosen_array) else float(np.mean(chosen_array))
+                    ),
+                    "oracle_top_m_correct_rate": (
+                        None if not len(oracle_array) else float(np.mean(oracle_array))
+                    ),
+                    "candidate_change_rate": (
+                        None if not len(changed_array) else float(np.mean(changed_array))
+                    ),
+                    "rescue_eligible_count": int(np.sum(rescue_eligible)),
+                    "rescued_count": int(np.sum(rescued)),
+                    "rescue_recall": (
+                        None
+                        if not np.any(rescue_eligible)
+                        else float(np.sum(rescued) / np.sum(rescue_eligible))
+                    ),
+                    "harmed_count": int(np.sum(harmed)),
+                    "net_correct_change": int(np.sum(chosen_array) - np.sum(selected_array)),
+                }
+            )
+            threshold_report[aggregation] = row_metrics
+        report[f"geometry_correct_{threshold}px"] = threshold_report
+    return report
 
 
 def _residual_update_metrics(
@@ -366,6 +564,7 @@ def _load_model(checkpoint: Path, *, device: torch.device) -> RGBPatchMeasuremen
     if int(model.prior_scale_expert_centers.numel()) == 0:
         allowed_missing.add("prior_scale_expert_centers")
     allowed_missing.update(key for key in incompatible.missing_keys if str(key).startswith("measurement_gate_head."))
+    allowed_missing.update(key for key in incompatible.missing_keys if str(key).startswith("geometry_head."))
     missing = [key for key in incompatible.missing_keys if key not in allowed_missing]
     if missing or incompatible.unexpected_keys:
         raise RuntimeError(
@@ -416,6 +615,7 @@ def export_rgb_patch_diagnostics(
     torch_device = torch.device(device if torch.cuda.is_available() or not str(device).startswith("cuda") else "cpu")
     image_cache_device = torch_device if bool(cache_images_on_device) else None
     model = _load_model(Path(checkpoint), device=torch_device)
+    checkpoint_sha256 = file_sha256_short(Path(checkpoint))
     cache_max_bytes = (
         None
         if image_cache_max_gb is None or float(image_cache_max_gb) <= 0.0
@@ -495,6 +695,11 @@ def export_rgb_patch_diagnostics(
             direct_mean_batch = None if pred0.direct_mean_offset_xy is None else pred0.direct_mean_offset_xy.detach().cpu()
             gated_mean_batch = None if pred0.gated_mean_offset_xy is None else pred0.gated_mean_offset_xy.detach().cpu()
             gate_probability_batch = None if pred0.gate_probability is None else pred0.gate_probability.detach().cpu()
+            geometry_probability_batch = (
+                None
+                if pred0.geometry_probability is None
+                else pred0.geometry_probability.detach().cpu()
+            )
             for local_index, row in enumerate(batch_rows):
                 row_index = int(batch_source_indices[local_index])
                 spatial_probs = spatial_probs_batch[local_index]
@@ -514,6 +719,25 @@ def export_rgb_patch_diagnostics(
                 if int(visualize_limit) > 0:
                     candidate_path = output / "visualizations" / f"rank_pending_row{row_index:06d}.png"
                     visual_candidates.append((epe, row_index, candidate_path, query_patch[local_index], render_patch[local_index], spatial_probs))
+                candidate_identity_key = str(
+                    row.get("candidate_identity_key", "")
+                ).strip()
+                candidate_cache_key = ""
+                if candidate_identity_key:
+                    identity = CandidateIdentityKey(
+                        query_id=str(row.get("query_id", "")),
+                        source_query_row=int(row["source_query_row"]),
+                        track_id=int(row["track_id"]),
+                        prototype_id=int(row["candidate_prototype_id"]),
+                        support_view_set_id=str(row["support_view_set_id"]),
+                    )
+                    if identity.digest != candidate_identity_key:
+                        raise ValueError("candidate identity digest changed before RGB inference")
+                    candidate_cache_key = CandidateMeasurementCacheKey(
+                        identity=identity,
+                        support_image_id=str(row.get("support_image_id", "")),
+                        measurement_checkpoint_sha256=checkpoint_sha256,
+                    ).digest
                 diagnostic_rows.append(
                     {
                         "row_index": int(row_index),
@@ -522,6 +746,35 @@ def export_rgb_patch_diagnostics(
                         "track_id": str(row.get("track_id", "")),
                         "support_track_id": str(row.get("support_track_id", "")),
                         "policy_row_index": str(row.get("policy_row_index", "")),
+                        "candidate_identity_key": candidate_identity_key,
+                        "candidate_measurement_cache_key": candidate_cache_key,
+                        "measurement_checkpoint_sha256": checkpoint_sha256,
+                        "support_view_set_id": str(row.get("support_view_set_id", "")),
+                        "source_query_row": str(row.get("source_query_row", "")),
+                        "candidate_measurement_rank": str(
+                            row.get("candidate_measurement_rank", "")
+                        ),
+                        "candidate_score_rank": str(row.get("candidate_score_rank", "")),
+                        "candidate_role": str(row.get("candidate_role", "")),
+                        "candidate_prototype_id": str(
+                            row.get("candidate_prototype_id", "")
+                        ),
+                        "candidate_bank_row": str(row.get("candidate_bank_row", "")),
+                        "candidate_assignment_probability": str(
+                            row.get("candidate_assignment_probability", "")
+                        ),
+                        "candidate_retrieval_similarity": str(
+                            row.get("candidate_retrieval_similarity", "")
+                        ),
+                        "candidate_geometry_p01": str(
+                            row.get("candidate_geometry_p01", "")
+                        ),
+                        "candidate_geometry_p02": str(
+                            row.get("candidate_geometry_p02", "")
+                        ),
+                        "candidate_geometry_p05": str(
+                            row.get("candidate_geometry_p05", "")
+                        ),
                         "split": str(row.get("split", "")),
                         "support_view_rank": str(row.get("support_view_rank", "")),
                         "support_view_probability": str(row.get("support_view_probability", "")),
@@ -607,6 +860,11 @@ def export_rgb_patch_diagnostics(
                         "gated_dy": "" if gated_xy is None else float(gated_xy[1].item()),
                         "measurement_gate_probability": (
                             "" if gate_probability_batch is None else float(gate_probability_batch[local_index].item())
+                        ),
+                        "measurement_geometry_probability": (
+                            ""
+                            if geometry_probability_batch is None
+                            else float(geometry_probability_batch[local_index].item())
                         ),
                         "dustbin_probability": float(dustbin_batch[local_index].item()),
                         "likelihood_entropy": float(entropy_batch[local_index].item()),
@@ -753,11 +1011,14 @@ def export_rgb_patch_diagnostics(
         "raw_row_count": int(len(raw_rows)),
         "target_dustbin_filter": dustbin_filter,
         "checkpoint": str(checkpoint),
-        "checkpoint_sha256": file_sha256_short(Path(checkpoint)),
+        "checkpoint_sha256": checkpoint_sha256,
         "rows_csv": str(rows_csv),
         "rows_csv_sha256": file_sha256_short(Path(rows_csv)),
         "query_source": str(query_source),
         "support_patch_warp": str(support_patch_warp),
+        "candidate_geometry_evidence": _candidate_geometry_evidence_metrics(
+            diagnostic_rows
+        ),
         "support_patch_source_audit": _support_patch_source_audit(rows, query_source=str(query_source)),
         "batch_size": int(batch),
         "cache_images_on_device": bool(cache_images_on_device),

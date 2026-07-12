@@ -28,11 +28,17 @@ from feature_extract.vfm.localization.local_assignment_probe import (
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--policy_artifact", required=True)
-    parser.add_argument("--action_predictions_csv", required=True)
+    parser.add_argument(
+        "--action_predictions_csv",
+        default="",
+        help="optional action CSV; omit to replay the immutable selected policy",
+    )
     parser.add_argument("--projected_landmark_bank", required=True)
     parser.add_argument("--colmap_model_dir", required=True)
     parser.add_argument("--split_json", required=True)
-    parser.add_argument("--split_name", choices=("validation", "test"), required=True)
+    parser.add_argument(
+        "--split_name", choices=("train", "validation", "test"), required=True
+    )
     parser.add_argument("--output_dir", required=True)
     parser.add_argument(
         "--evaluation_role",
@@ -162,7 +168,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     }
     if mismatches:
         raise ValueError(f"stale selected-policy pose inputs: {mismatches}")
-    actions = _load_actions(Path(args.action_predictions_csv))
+    actions = (
+        {}
+        if not str(args.action_predictions_csv)
+        else _load_actions(Path(args.action_predictions_csv))
+    )
     split = json.loads(split_path.read_text())
     split_query_ids = {str(value) for value in split[str(args.split_name)]}
     query_ids_all = np.asarray(arrays["query_ids"]).astype(str)
@@ -285,6 +295,15 @@ def main(argv: Sequence[str] | None = None) -> None:
     output.mkdir(parents=True, exist_ok=True)
     pose_rows_path = output / "pose_rows.csv"
     _write_pose_rows(pose_rows_path, baseline_rows, action_rows)
+    pose_rows_json_path = output / "pose_rows.json"
+    pose_rows_json_path.write_text(
+        json.dumps(
+            {"baseline": baseline_rows, "action": action_rows},
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
     gate = _pose_gate(action_summary, baseline_summary)
     summary = {
         "stage": "selected_measurement_action_pose_evaluation",
@@ -327,9 +346,15 @@ def main(argv: Sequence[str] | None = None) -> None:
         "inputs": {
             "policy_artifact": str(policy_path),
             "policy_artifact_sha256": file_sha256_short(policy_path),
-            "action_predictions_csv": str(args.action_predictions_csv),
-            "action_predictions_sha256": file_sha256_short(
-                Path(args.action_predictions_csv)
+            "action_predictions_csv": (
+                None
+                if not str(args.action_predictions_csv)
+                else str(args.action_predictions_csv)
+            ),
+            "action_predictions_sha256": (
+                None
+                if not str(args.action_predictions_csv)
+                else file_sha256_short(Path(args.action_predictions_csv))
             ),
             "projected_landmark_bank": str(bank_path),
             "projected_landmark_bank_sha256": expected_hashes[
@@ -341,6 +366,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         "outputs": {
             "pose_rows": str(pose_rows_path),
             "pose_rows_sha256": file_sha256_short(pose_rows_path),
+            "pose_rows_json": str(pose_rows_json_path),
+            "pose_rows_json_sha256": file_sha256_short(pose_rows_json_path),
             "summary": str(output / "summary.json"),
         },
     }

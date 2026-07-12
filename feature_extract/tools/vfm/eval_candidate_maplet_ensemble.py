@@ -17,8 +17,10 @@ from feature_extract.tools.vfm.train_candidate_maplet_matcher import (
     _assignment_identity_gate,
     _candidate_data_manifest,
     _compact_values,
+    _load_frozen_global_baseline_policy,
     _predict_edges,
     _rescue_policy_report,
+    _validate_frozen_baseline_pose,
 )
 from feature_extract.vfm.artifacts import file_sha256_short
 from feature_extract.vfm.colmap_tracks import (
@@ -36,6 +38,9 @@ from feature_extract.vfm.localization.local_assignment_linear import (
     selective_switch_scores,
 )
 from feature_extract.vfm.localization.local_assignment_probe import UniqueTrackCandidateSet
+from feature_extract.vfm.localization.pose_safe_selection import (
+    global_assignment_score_matrix,
+)
 
 
 def _float_list(value: str) -> tuple[float, ...]:
@@ -43,6 +48,45 @@ def _float_list(value: str) -> tuple[float, ...]:
     if not parsed:
         raise argparse.ArgumentTypeError("expected a comma-separated float list")
     return parsed
+
+
+def _global_assignment_scores(
+    *,
+    candidates: UniqueTrackCandidateSet,
+    scores: np.ndarray,
+    query_ids: np.ndarray,
+    valid_edges: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Resolve one candidate per token and one token per physical track."""
+
+    return global_assignment_score_matrix(
+        candidates.track_ids,
+        scores,
+        query_ids,
+        valid_mask=valid_edges & np.isfinite(scores),
+        dustbin_score=None,
+    )
+
+
+def _baseline_assignment_scores(
+    *,
+    candidates: UniqueTrackCandidateSet,
+    scores: np.ndarray,
+    query_ids: np.ndarray,
+    valid_edges: np.ndarray,
+    formal_global_assignment: bool,
+) -> tuple[np.ndarray, np.ndarray]:
+    if formal_global_assignment:
+        return _global_assignment_scores(
+            candidates=candidates,
+            scores=scores,
+            query_ids=query_ids,
+            valid_edges=valid_edges,
+        )
+    selected = np.argmax(np.where(valid_edges, scores, -np.inf), axis=1).astype(
+        np.int64
+    )
+    return scores, selected
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -183,6 +227,15 @@ def main(argv: Sequence[str] | None = None) -> None:
         static_feature_count=int(args.static_feature_count),
     )
     data_manifest = _candidate_data_manifest(args, store)
+    frozen_global_baseline_source = (
+        None
+        if not str(args.global_assignment_baseline_summary)
+        else _load_frozen_global_baseline_policy(
+            Path(args.global_assignment_baseline_summary),
+            args=args,
+            data_manifest=data_manifest,
+        )
+    )
     selected_query_ids = store.query_ids[store.selected_rows]
     split_row_masks = {
         name: np.isin(selected_query_ids, np.asarray(split[name], dtype=np.str_))
@@ -236,7 +289,14 @@ def main(argv: Sequence[str] | None = None) -> None:
             valid_edges=store.valid_edges[mask],
         )
 
-    def pose(scores: np.ndarray, split_name: str, strategy: str):
+    def pose(
+        scores: np.ndarray,
+        split_name: str,
+        strategy: str,
+        *,
+        max_matches: int | None = None,
+        selection_mode: str = "score_topk",
+    ):
         rows = np.flatnonzero(split_row_masks[split_name])
         subset = UniqueTrackCandidateSet(
             candidates.bank_row_indices[rows],
@@ -255,6 +315,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             images_by_name=images_by_name,
             reprojection_error_px=float(args.pnp_reprojection_error_px),
             iterations=int(args.pnp_iterations),
+            max_matches=max_matches,
+            pose_selection_mode=str(selection_mode),
         )
 
     checkpoint_predictions = []
@@ -393,9 +455,31 @@ def main(argv: Sequence[str] | None = None) -> None:
         ensemble_predictions["rescue_action_probability"] = rescue_action_scores
 
     baseline_validation_identity = identity(baseline_scores, "validation")
-    baseline_validation_pose, _baseline_validation_rows = pose(
+    row_baseline_validation_pose, _row_baseline_validation_rows = pose(
         baseline_scores, "validation", "baseline_validation"
     )
+    formal_global_assignment = frozen_global_baseline_source is not None
+    baseline_pose_scores, baseline_selected_columns = _baseline_assignment_scores(
+        candidates=candidates,
+        scores=baseline_scores,
+        query_ids=selected_query_ids,
+        valid_edges=store.valid_edges,
+        formal_global_assignment=formal_global_assignment,
+    )
+    baseline_validation_pose = row_baseline_validation_pose
+    baseline_validation_rows = _row_baseline_validation_rows
+    if formal_global_assignment:
+        baseline_validation_pose, baseline_validation_rows = pose(
+            baseline_pose_scores,
+            "validation",
+            "frozen_global_baseline_validation",
+            max_matches=int(args.global_assignment_match_count),
+            selection_mode=str(args.global_assignment_selection_mode),
+        )
+        _validate_frozen_baseline_pose(
+            baseline_validation_pose,
+            frozen_global_baseline_source,
+        )
     validation_strategy_names = tuple(
         value.strip()
         for value in str(args.validation_strategies).split(",")
@@ -407,8 +491,63 @@ def main(argv: Sequence[str] | None = None) -> None:
             f"invalid validation strategies; missing={sorted(missing_strategies)}"
         )
     validation_trials = []
+    validation_trial_pose_rows: list[dict[str, object]] = []
+    formal_resolved_scores: dict[str, np.ndarray] = {}
+    formal_selected_columns: dict[str, np.ndarray] = {}
+    formal_pose_rows: dict[str, dict[str, list[dict[str, object]]]] = {}
+    if formal_global_assignment:
+        formal_pose_rows["validation"] = {
+            "frozen_baseline": baseline_validation_rows,
+        }
     for strategy_name in validation_strategy_names:
         scores = ensemble_predictions[strategy_name]
+        if formal_global_assignment:
+            resolved, selected_columns = _global_assignment_scores(
+                candidates=candidates,
+                scores=scores,
+                query_ids=selected_query_ids,
+                valid_edges=store.valid_edges,
+            )
+            selected_identity = identity(scores, "validation")
+            formal_resolved_scores[str(strategy_name)] = resolved
+            formal_selected_columns[str(strategy_name)] = selected_columns
+            selected_pose, selected_rows = pose(
+                resolved,
+                "validation",
+                f"ensemble_{strategy_name}_global_partial_assignment_validation",
+                max_matches=int(args.global_assignment_match_count),
+                selection_mode=str(args.global_assignment_selection_mode),
+            )
+            validation_mask = split_row_masks["validation"]
+            trial = {
+                "strategy": strategy_name,
+                "mode": "global_partial_assignment",
+                "margin_threshold": None,
+                "action_margin_threshold": None,
+                "switch_count": int(
+                    np.sum(
+                        selected_columns[validation_mask]
+                        != baseline_selected_columns[validation_mask]
+                    )
+                ),
+                "accepted_query_count": int(
+                    np.sum(selected_columns[validation_mask] >= 0)
+                ),
+                "identity": selected_identity,
+                "pose": selected_pose,
+                "passes_pose_gate": _pose_gate(
+                    selected_pose, baseline_validation_pose
+                ),
+                "passes_identity_gate": _assignment_identity_gate(
+                    selected_identity, baseline_validation_identity
+                ),
+            }
+            validation_trials.append(trial)
+            validation_trial_pose_rows.append(
+                {"trial": trial, "pose_rows": selected_rows}
+            )
+            formal_pose_rows["validation"][str(strategy_name)] = selected_rows
+            continue
         if str(strategy_name) == "rescue_policy_resolved":
             for action_threshold in tuple(args.rescue_action_margin_thresholds):
                 (
@@ -427,37 +566,39 @@ def main(argv: Sequence[str] | None = None) -> None:
                         f"action_margin{float(action_threshold):g}_validation"
                     ),
                 )
-                validation_trials.append(
-                    {
-                        "strategy": strategy_name,
-                        "mode": "rescue_action_margin",
-                        "margin_threshold": None,
-                        "action_margin_threshold": float(action_threshold),
-                        "switch_count": int(
-                            np.sum(switched[split_row_masks["validation"]])
+                trial = {
+                    "strategy": strategy_name,
+                    "mode": "rescue_action_margin",
+                    "margin_threshold": None,
+                    "action_margin_threshold": float(action_threshold),
+                    "switch_count": int(
+                        np.sum(switched[split_row_masks["validation"]])
+                    ),
+                    "identity": selected_identity,
+                    "pose": selected_pose,
+                    "rescue_policy": _rescue_policy_report(
+                        ensemble_predictions,
+                        store,
+                        baseline_scores,
+                        row_mask=split_row_masks["validation"],
+                        candidate_threshold_px=float(
+                            config.rescue_candidate_threshold_px
                         ),
-                        "identity": selected_identity,
-                        "pose": selected_pose,
-                        "rescue_policy": _rescue_policy_report(
-                            ensemble_predictions,
-                            store,
-                            baseline_scores,
-                            row_mask=split_row_masks["validation"],
-                            candidate_threshold_px=float(
-                                config.rescue_candidate_threshold_px
-                            ),
-                            baseline_invalid_threshold_px=float(
-                                config.rescue_baseline_invalid_threshold_px
-                            ),
-                            action_margin_threshold=float(action_threshold),
+                        baseline_invalid_threshold_px=float(
+                            config.rescue_baseline_invalid_threshold_px
                         ),
-                        "passes_pose_gate": _pose_gate(
-                            selected_pose, baseline_validation_pose
-                        ),
-                        "passes_identity_gate": _assignment_identity_gate(
-                            selected_identity, baseline_validation_identity
-                        ),
-                    }
+                        action_margin_threshold=float(action_threshold),
+                    ),
+                    "passes_pose_gate": _pose_gate(
+                        selected_pose, baseline_validation_pose
+                    ),
+                    "passes_identity_gate": _assignment_identity_gate(
+                        selected_identity, baseline_validation_identity
+                    ),
+                }
+                validation_trials.append(trial)
+                validation_trial_pose_rows.append(
+                    {"trial": trial, "pose_rows": _selected_rows}
                 )
             continue
         unconditional_identity = identity(scores, "validation")
@@ -466,29 +607,29 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
         unconditional_choices = np.argmax(scores, axis=1)
         baseline_choices = np.argmax(baseline_scores, axis=1)
-        validation_trials.append(
-            {
-                "strategy": strategy_name,
-                "mode": "unconditional",
-                "margin_threshold": None,
-                "action_margin_threshold": None,
-                "switch_count": int(
-                    np.sum(
-                        (unconditional_choices != baseline_choices)
-                        & split_row_masks["validation"]
-                    )
-                ),
-                "identity": unconditional_identity,
-                "pose": unconditional_pose,
-                "passes_pose_gate": _pose_gate(unconditional_pose, baseline_validation_pose),
-                "passes_identity_gate": _assignment_identity_gate(
-                    unconditional_identity, baseline_validation_identity
-                ),
-            }
-        )
-        strategy_switch_thresholds = (
-            tuple(args.switch_margin_thresholds)
-        )
+        trial = {
+            "strategy": strategy_name,
+            "mode": "unconditional",
+            "margin_threshold": None,
+            "action_margin_threshold": None,
+            "switch_count": int(
+                np.sum(
+                    (unconditional_choices != baseline_choices)
+                    & split_row_masks["validation"]
+                )
+            ),
+            "identity": unconditional_identity,
+            "pose": unconditional_pose,
+            "passes_pose_gate": _pose_gate(
+                unconditional_pose, baseline_validation_pose
+            ),
+            "passes_identity_gate": _assignment_identity_gate(
+                unconditional_identity, baseline_validation_identity
+            ),
+        }
+        validation_trials.append(trial)
+        validation_trial_pose_rows.append({"trial": trial, "pose_rows": _rows})
+        strategy_switch_thresholds = tuple(args.switch_margin_thresholds)
         for threshold in strategy_switch_thresholds:
             _selected, resolved, switched, _margins = selective_switch_scores(
                 scores,
@@ -505,20 +646,26 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "validation",
                 f"ensemble_{strategy_name}_margin{float(threshold):g}_validation",
             )
-            validation_trials.append(
-                {
-                    "strategy": strategy_name,
-                    "mode": "selective",
-                    "margin_threshold": float(threshold),
-                    "action_margin_threshold": None,
-                    "switch_count": int(np.sum(switched[split_row_masks["validation"]])),
-                    "identity": selected_identity,
-                    "pose": selected_pose,
-                    "passes_pose_gate": _pose_gate(selected_pose, baseline_validation_pose),
-                    "passes_identity_gate": _assignment_identity_gate(
-                        selected_identity, baseline_validation_identity
-                    ),
-                }
+            trial = {
+                "strategy": strategy_name,
+                "mode": "selective",
+                "margin_threshold": float(threshold),
+                "action_margin_threshold": None,
+                "switch_count": int(
+                    np.sum(switched[split_row_masks["validation"]])
+                ),
+                "identity": selected_identity,
+                "pose": selected_pose,
+                "passes_pose_gate": _pose_gate(
+                    selected_pose, baseline_validation_pose
+                ),
+                "passes_identity_gate": _assignment_identity_gate(
+                    selected_identity, baseline_validation_identity
+                ),
+            }
+            validation_trials.append(trial)
+            validation_trial_pose_rows.append(
+                {"trial": trial, "pose_rows": _selected_rows}
             )
     for trial in validation_trials:
         trial["passes_stage_gate"] = bool(
@@ -545,7 +692,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     else:
         chosen = {
             "strategy": "baseline",
-            "mode": "fallback",
+            "mode": (
+                "global_baseline_fallback"
+                if formal_global_assignment
+                else "fallback"
+            ),
             "margin_threshold": None,
             "action_margin_threshold": None,
             "switch_count": 0,
@@ -559,17 +710,34 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     def resolve_trial_scores(
         trial: dict[str, object],
-    ) -> tuple[np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return pose scores, pre-conflict identity scores, and changed rows."""
+
         mode = str(trial["mode"])
+        if mode == "global_baseline_fallback":
+            return (
+                baseline_pose_scores,
+                baseline_scores,
+                np.zeros((len(baseline_scores),), dtype=bool),
+            )
         if mode == "fallback":
-            return baseline_scores, np.zeros((len(baseline_scores),), dtype=bool)
+            return (
+                baseline_scores,
+                baseline_scores,
+                np.zeros((len(baseline_scores),), dtype=bool),
+            )
         strategy = str(trial["strategy"])
         model_scores = ensemble_predictions[strategy]
+        if mode == "global_partial_assignment":
+            resolved = formal_resolved_scores[strategy]
+            selected_columns = formal_selected_columns[strategy]
+            switched = selected_columns != baseline_selected_columns
+            return resolved, model_scores, switched
         if mode == "rescue_action_margin":
             _selected, resolved, switched, _margins, _action_scores = (
                 resolve_ensemble_rescue(float(trial["action_margin_threshold"]))
             )
-            return resolved, switched
+            return resolved, resolved, switched
         if mode == "selective":
             _selected, resolved, switched, _margins = selective_switch_scores(
                 model_scores,
@@ -580,25 +748,54 @@ def main(argv: Sequence[str] | None = None) -> None:
                     "_prior_row_confidence"
                 ),
             )
-            return resolved, switched
+            return resolved, resolved, switched
         if mode == "unconditional":
             switched = np.argmax(model_scores, axis=1) != np.argmax(
                 baseline_scores, axis=1
             )
-            return model_scores, switched
+            return model_scores, model_scores, switched
         raise ValueError(f"unsupported validation trial mode: {mode}")
 
     baseline_test_identity = identity(baseline_scores, "test")
-    baseline_test_pose, baseline_test_rows = pose(baseline_scores, "test", "baseline_test")
+    baseline_test_pose, baseline_test_rows = pose(
+        baseline_pose_scores,
+        "test",
+        "baseline_test",
+        max_matches=(
+            int(args.global_assignment_match_count)
+            if formal_global_assignment
+            else None
+        ),
+        selection_mode=(
+            str(args.global_assignment_selection_mode)
+            if formal_global_assignment
+            else "score_topk"
+        ),
+    )
+    if formal_global_assignment:
+        formal_pose_rows["test"] = {"frozen_baseline": baseline_test_rows}
     cross_block_trials = []
+    cross_block_trial_pose_rows: list[dict[str, object]] = []
     if bool(args.development_cross_block_audit):
         for trial_index, trial in enumerate(validation_trials):
-            trial_scores, trial_switched = resolve_trial_scores(trial)
-            trial_test_identity = identity(trial_scores, "test")
+            trial_scores, trial_identity_scores, trial_switched = resolve_trial_scores(
+                trial
+            )
+            trial_test_identity = identity(trial_identity_scores, "test")
             trial_test_pose, _trial_test_rows = pose(
                 trial_scores,
                 "test",
                 f"development_cross_block_trial_{trial_index}",
+                max_matches=(
+                    int(args.global_assignment_match_count)
+                    if formal_global_assignment
+                    else None
+                ),
+                selection_mode=(
+                    str(args.global_assignment_selection_mode)
+                    if formal_global_assignment
+                    else "score_topk"
+                ),
             )
             trial_test_pose_gate = _pose_gate(trial_test_pose, baseline_test_pose)
             trial_test_identity_gate = _assignment_identity_gate(
@@ -642,10 +839,36 @@ def main(argv: Sequence[str] | None = None) -> None:
                     ),
                 }
             )
+            cross_block_trial_pose_rows.append(
+                {"trial": dict(cross_block_trials[-1]), "pose_rows": _trial_test_rows}
+            )
+            if formal_global_assignment:
+                formal_pose_rows["test"][str(trial["strategy"])] = _trial_test_rows
+
+    if formal_global_assignment and "train" in prediction_split_names:
+        _baseline_train_pose, baseline_train_rows = pose(
+            baseline_pose_scores,
+            "train",
+            "frozen_global_baseline_train_diagnostic",
+            max_matches=int(args.global_assignment_match_count),
+            selection_mode=str(args.global_assignment_selection_mode),
+        )
+        formal_pose_rows["train"] = {"frozen_baseline": baseline_train_rows}
+        for strategy_name in validation_strategy_names:
+            _strategy_train_pose, strategy_train_rows = pose(
+                formal_resolved_scores[str(strategy_name)],
+                "train",
+                f"ensemble_{strategy_name}_global_partial_assignment_train_diagnostic",
+                max_matches=int(args.global_assignment_match_count),
+                selection_mode=str(args.global_assignment_selection_mode),
+            )
+            formal_pose_rows["train"][str(strategy_name)] = strategy_train_rows
 
     selected_test_rescue_policy = None
     if validation_gate_passed:
-        selected_scores, switched = resolve_trial_scores(chosen)
+        selected_scores, selected_identity_scores, switched = resolve_trial_scores(
+            chosen
+        )
         test_switch_count = int(np.sum(switched[split_row_masks["test"]]))
         if str(chosen["mode"]) == "rescue_action_margin":
             selected_test_rescue_policy = _rescue_policy_report(
@@ -659,12 +882,25 @@ def main(argv: Sequence[str] | None = None) -> None:
                 ),
                 action_margin_threshold=float(chosen["action_margin_threshold"]),
             )
-        selected_test_identity = identity(selected_scores, "test")
+        selected_test_identity = identity(selected_identity_scores, "test")
         selected_test_pose, selected_test_rows = pose(
-            selected_scores, "test", "ensemble_selected_test"
+            selected_scores,
+            "test",
+            "ensemble_selected_test",
+            max_matches=(
+                int(args.global_assignment_match_count)
+                if formal_global_assignment
+                else None
+            ),
+            selection_mode=(
+                str(args.global_assignment_selection_mode)
+                if formal_global_assignment
+                else "score_topk"
+            ),
         )
     else:
-        selected_scores = baseline_scores
+        selected_scores = baseline_pose_scores
+        selected_identity_scores = baseline_scores
         selected_test_identity = baseline_test_identity
         selected_test_pose = baseline_test_pose
         selected_test_rows = baseline_test_rows
@@ -687,6 +923,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         },
         baseline_scores=baseline_scores,
         selected_scores=selected_scores,
+        selected_identity_scores=selected_identity_scores,
     )
     (output_dir / "pose_rows_test.json").write_text(
         json.dumps(
@@ -696,6 +933,16 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
         + "\n"
     )
+    (output_dir / "validation_trial_pose_rows.json").write_text(
+        json.dumps(validation_trial_pose_rows, indent=2, sort_keys=True) + "\n"
+    )
+    (output_dir / "cross_block_trial_pose_rows.json").write_text(
+        json.dumps(cross_block_trial_pose_rows, indent=2, sort_keys=True) + "\n"
+    )
+    if formal_global_assignment:
+        (output_dir / "formal_global_pose_rows.json").write_text(
+            json.dumps(formal_pose_rows, indent=2, sort_keys=True) + "\n"
+        )
     summary = {
         "stage": "candidate_maplet_checkpoint_ensemble",
         "protocol": {
@@ -717,6 +964,18 @@ def main(argv: Sequence[str] | None = None) -> None:
                 args.development_cross_block_audit
             ),
             "cross_block_audit_used_for_selection": False,
+            "formal_global_assignment": (
+                None
+                if not formal_global_assignment
+                else {
+                    "assignment": "whole_image_sparse_bipartite_with_per_query_dustbin",
+                    "dustbin_score": None,
+                    "max_matches": int(args.global_assignment_match_count),
+                    "selection_mode": str(args.global_assignment_selection_mode),
+                    "frozen_baseline_source": frozen_global_baseline_source,
+                    "identity_evaluated_before_conflict_resolution": True,
+                }
+            ),
             "rescue_probability_fusion": (
                 "average_candidate_and_keep_probabilities_then_resolve_once"
             ),
@@ -728,6 +987,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             "baseline": {
                 "identity": baseline_validation_identity,
                 "pose": baseline_validation_pose,
+                "row_argmax_pose_diagnostic": row_baseline_validation_pose,
             },
             "trials": validation_trials,
             "chosen": chosen,
@@ -776,6 +1036,28 @@ def main(argv: Sequence[str] | None = None) -> None:
             "scores": str(output_dir / "ensemble_scores.npz"),
             "scores_sha256": file_sha256_short(output_dir / "ensemble_scores.npz"),
             "pose_rows_test": str(output_dir / "pose_rows_test.json"),
+            "validation_trial_pose_rows": str(
+                output_dir / "validation_trial_pose_rows.json"
+            ),
+            "validation_trial_pose_rows_sha256": file_sha256_short(
+                output_dir / "validation_trial_pose_rows.json"
+            ),
+            "cross_block_trial_pose_rows": str(
+                output_dir / "cross_block_trial_pose_rows.json"
+            ),
+            "cross_block_trial_pose_rows_sha256": file_sha256_short(
+                output_dir / "cross_block_trial_pose_rows.json"
+            ),
+            "formal_global_pose_rows": (
+                None
+                if not formal_global_assignment
+                else str(output_dir / "formal_global_pose_rows.json")
+            ),
+            "formal_global_pose_rows_sha256": (
+                None
+                if not formal_global_assignment
+                else file_sha256_short(output_dir / "formal_global_pose_rows.json")
+            ),
         },
     }
     (output_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")

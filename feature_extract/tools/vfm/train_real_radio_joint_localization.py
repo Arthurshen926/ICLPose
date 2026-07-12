@@ -89,6 +89,83 @@ def validate_frozen_landmark_bank_contract(
     }
 
 
+def validate_upstream_disjoint_manifest_contract(
+    manifest_path: Path,
+    *,
+    query_split_path: Path,
+) -> dict[str, object]:
+    manifest = json.loads(Path(manifest_path).read_text())
+    query_split = json.loads(Path(query_split_path).read_text())
+    excluded = {
+        str(image_id)
+        for split_name in ("train", "validation", "test")
+        for image_id in query_split.get(split_name, [])
+    }
+    if not excluded:
+        raise ValueError("upstream-disjoint query split contains no train/validation/test images")
+    records = list(manifest.get("records", []))
+    leaked = [
+        (str(record.get("query_id", "")), str(record.get("reference_image_id", "")))
+        for record in records
+        if str(record.get("query_id", "")) in excluded
+        or str(record.get("reference_image_id", "")) in excluded
+    ]
+    if leaked:
+        raise ValueError(
+            "upstream-disjoint training manifest contains held-out query images: "
+            f"count={len(leaked)}, preview={leaked[:3]!r}"
+        )
+    filter_metadata = manifest.get("heldout_image_filter")
+    if not isinstance(filter_metadata, dict):
+        raise ValueError("upstream-disjoint training manifest has no heldout_image_filter contract")
+    expected_split_hash = file_sha256_short(Path(query_split_path))
+    if str(filter_metadata.get("query_split_sha256", "")) != expected_split_hash:
+        raise ValueError("upstream-disjoint training manifest query-split hash is stale")
+    if int(filter_metadata.get("heldout_image_count", -1)) != int(len(excluded)):
+        raise ValueError("upstream-disjoint training manifest held-out image count is stale")
+    return {
+        "validated": True,
+        "manifest": str(manifest_path),
+        "manifest_sha256": file_sha256_short(Path(manifest_path)),
+        "query_split": str(query_split_path),
+        "query_split_sha256": expected_split_hash,
+        "heldout_image_count": int(len(excluded)),
+        "training_pair_count": int(len(records)),
+        "leaked_pair_count": 0,
+    }
+
+
+def load_episode_support_image_ids(
+    support_manifest_path: Path,
+    *,
+    upstream_disjoint_query_split: Path | None = None,
+) -> tuple[set[str], dict[str, object]]:
+    manifest = TokenBankManifest.from_json(Path(support_manifest_path))
+    manifest.validate(verify_checksums=False)
+    image_ids = {str(record.image_id) for record in manifest.records}
+    if len(image_ids) != len(manifest.records) or not image_ids:
+        raise ValueError("landmark episode support manifest must contain unique non-empty image ids")
+    if upstream_disjoint_query_split is not None:
+        query_split = json.loads(Path(upstream_disjoint_query_split).read_text())
+        excluded = {
+            str(image_id)
+            for split_name in ("train", "validation", "test")
+            for image_id in query_split.get(split_name, [])
+        }
+        overlap = sorted(image_ids.intersection(excluded))
+        if overlap:
+            raise ValueError(
+                "landmark episode support manifest contains held-out query images: "
+                f"count={len(overlap)}, preview={overlap[:3]!r}"
+            )
+    return image_ids, {
+        "path": str(support_manifest_path),
+        "sha256": file_sha256_short(Path(support_manifest_path)),
+        "image_count": int(len(image_ids)),
+        "upstream_disjoint": upstream_disjoint_query_split is not None,
+    }
+
+
 class RealRadioMultiViewEpisodeProvider:
     """Group one query with distinct real-image support views on demand."""
 
@@ -479,6 +556,40 @@ def _finish_distributed_runtime(runtime: dict[str, int | bool | str]) -> None:
     torch.distributed.destroy_process_group()
 
 
+def _requires_rgb_training(args: argparse.Namespace) -> bool:
+    return bool(
+        float(args.measurement_patch_loss_weight) > 0.0
+        or float(args.rgb_keypoint_loss_weight) > 0.0
+        or float(args.rgb_keypoint_position_loss_weight) > 0.0
+    )
+
+
+def _load_training_track_observation_index(
+    args: argparse.Namespace,
+    distributed_runtime: dict[str, int | bool | str],
+) -> SfMTrackObservationIndex | None:
+    if not str(args.landmark_track_observations):
+        return None
+    source_path = Path(args.landmark_track_observations)
+    cache_path = (
+        Path(args.landmark_track_observation_index_cache)
+        if str(args.landmark_track_observation_index_cache)
+        else None
+    )
+    distributed = bool(distributed_runtime.get("enabled", False))
+    rank = int(distributed_runtime.get("rank", 0))
+    if distributed and cache_path is not None:
+        rank_zero_index = (
+            load_track_observation_index(source_path, cache_path=cache_path)
+            if rank == 0
+            else None
+        )
+        torch.distributed.barrier()
+        if rank == 0:
+            return rank_zero_index
+    return load_track_observation_index(source_path, cache_path=cache_path)
+
+
 def _validate_joint_localization_training_set(
     samples: MatchaJointTrainingSet,
     *,
@@ -491,7 +602,9 @@ def _validate_joint_localization_training_set(
         missing.append("full-map query/reference feature maps")
     if samples.sample_pair_indices is None or samples.query_cell_indices is None or samples.render_cell_indices is None:
         missing.append("full-map correspondence pair/cell indices")
-    if samples.query_rgb_images is None or samples.render_rgb_images is None:
+    if bool(require_measurement_supervision) and (
+        samples.query_rgb_images is None or samples.render_rgb_images is None
+    ):
         missing.append("RGB measurement images")
     if bool(require_measurement_supervision):
         fine_required = (
@@ -534,15 +647,21 @@ def _validate_joint_localization_training_set(
         raise ValueError(f"{source} joint cache is not a full-map real localization cache; missing {', '.join(missing)}")
     query_maps = np.asarray(samples.query_feature_maps, dtype=np.float32)
     reference_maps = np.asarray(samples.render_feature_maps, dtype=np.float32)
-    query_rgb = np.asarray(samples.query_rgb_images, dtype=np.float32)
-    reference_rgb = np.asarray(samples.render_rgb_images, dtype=np.float32)
+    query_rgb = (
+        None if samples.query_rgb_images is None else np.asarray(samples.query_rgb_images, dtype=np.float32)
+    )
+    reference_rgb = (
+        None if samples.render_rgb_images is None else np.asarray(samples.render_rgb_images, dtype=np.float32)
+    )
     if int(query_maps.shape[0]) != int(reference_maps.shape[0]):
         raise ValueError(f"{source} query/reference feature maps must contain the same pair count")
     if int(query_maps.shape[1]) != int(reference_maps.shape[1]):
         raise ValueError(f"{source} query/reference feature-map channels must match")
     if int(query_maps.shape[1]) != int(samples.coarse_fine_samples.input_dim):
         raise ValueError(f"{source} feature-map channels must match coarse_fine_samples input_dim")
-    if int(query_rgb.shape[0]) != int(query_maps.shape[0]) or int(reference_rgb.shape[0]) != int(reference_maps.shape[0]):
+    if query_rgb is not None and int(query_rgb.shape[0]) != int(query_maps.shape[0]):
+        raise ValueError(f"{source} RGB image count must match feature-map pair count")
+    if reference_rgb is not None and int(reference_rgb.shape[0]) != int(reference_maps.shape[0]):
         raise ValueError(f"{source} RGB image count must match feature-map pair count")
     return {
         "source": str(source),
@@ -551,8 +670,8 @@ def _validate_joint_localization_training_set(
         "input_dim": int(samples.coarse_fine_samples.input_dim),
         "query_feature_map_shape": [int(value) for value in query_maps.shape],
         "reference_feature_map_shape": [int(value) for value in reference_maps.shape],
-        "query_rgb_shape": [int(value) for value in query_rgb.shape],
-        "reference_rgb_shape": [int(value) for value in reference_rgb.shape],
+        "query_rgb_shape": None if query_rgb is None else [int(value) for value in query_rgb.shape],
+        "reference_rgb_shape": None if reference_rgb is None else [int(value) for value in reference_rgb.shape],
         "has_measurement_fine_supervision": bool(samples.fine_sample_pair_indices is not None),
         "has_landmark_track_supervision": bool(valid_positive_track_ids),
         "landmark_track_supervision_count": int(0 if landmark_track_ids is None else landmark_track_ids.size),
@@ -612,12 +731,14 @@ def _load_referenced_joint_provider(
     require_landmark_retrieval_supervision: bool = False,
     feature_cache_size: int = 4,
     rgb_cache_size: int = 8,
+    load_rgb: bool = True,
     track_xyz_by_id: dict[int, np.ndarray] | None = None,
     track_observation_index: SfMTrackObservationIndex | None = None,
 ) -> tuple[RealRadioReferencedJointSampleProvider, MatchaJointTrainingSet, dict[str, object], dict[str, object]]:
     provider_kwargs: dict[str, object] = {
         "feature_cache_size": int(feature_cache_size),
         "rgb_cache_size": int(rgb_cache_size),
+        "load_rgb": bool(load_rgb),
     }
     if track_xyz_by_id is not None:
         provider_kwargs["track_xyz_by_id"] = track_xyz_by_id
@@ -787,6 +908,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     source.add_argument("--joint_cache_manifest", default="")
     parser.add_argument("--validation_joint_cache", default="")
     parser.add_argument("--validation_joint_cache_manifest", default="")
+    parser.add_argument(
+        "--upstream_disjoint_query_split",
+        default="",
+        help="Require that neither side of any referenced training pair occurs in this query split.",
+    )
     parser.add_argument("--warm_start_joint_checkpoint", default="")
     parser.add_argument("--output_model", required=True)
     parser.add_argument("--output_joint_model", required=True)
@@ -818,6 +944,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Group each held-out query with 2-8 distinct reference observations; 0 keeps pair-wise loading.",
     )
     parser.add_argument("--landmark_episode_min_support_pairs", type=int, default=2)
+    parser.add_argument(
+        "--landmark_episode_support_manifest",
+        default="",
+        help="Explicit token manifest defining the complete allowed support-image scope for SfM episodes.",
+    )
     parser.add_argument("--landmark_episode_seed", type=int, default=0)
     parser.add_argument(
         "--landmark_episode_support_selection",
@@ -952,19 +1083,31 @@ def main(argv: Sequence[str] | None = None) -> None:
     distributed_runtime = _initialize_distributed_runtime(args)
     started = time.perf_counter()
     train_path = Path(args.joint_cache_manifest or args.joint_cache)
+    upstream_disjoint_contract = (
+        validate_upstream_disjoint_manifest_contract(
+            train_path,
+            query_split_path=Path(args.upstream_disjoint_query_split),
+        )
+        if str(args.upstream_disjoint_query_split)
+        else {}
+    )
     require_measurement = float(args.measurement_patch_loss_weight) > 0.0
+    require_rgb = _requires_rgb_training(args)
     require_landmark_retrieval = float(args.landmark_retrieval_loss_weight) > 0.0
-    track_observation_index = (
-        load_track_observation_index(
-            Path(args.landmark_track_observations),
-            cache_path=(
-                Path(args.landmark_track_observation_index_cache)
-                if str(args.landmark_track_observation_index_cache)
+    episode_support_image_ids: set[str] | None = None
+    episode_support_manifest_audit: dict[str, object] = {}
+    if str(args.landmark_episode_support_manifest):
+        episode_support_image_ids, episode_support_manifest_audit = load_episode_support_image_ids(
+            Path(args.landmark_episode_support_manifest),
+            upstream_disjoint_query_split=(
+                Path(args.upstream_disjoint_query_split)
+                if str(args.upstream_disjoint_query_split)
                 else None
             ),
         )
-        if str(args.landmark_track_observations)
-        else None
+    track_observation_index = _load_training_track_observation_index(
+        args,
+        distributed_runtime,
     )
     track_xyz_by_id = (
         None if track_observation_index is None else track_observation_index.track_xyz_by_id
@@ -979,6 +1122,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             require_landmark_retrieval_supervision=bool(require_landmark_retrieval),
             feature_cache_size=int(args.referenced_feature_cache_size),
             rgb_cache_size=int(args.referenced_rgb_cache_size),
+            load_rgb=bool(require_rgb),
             track_xyz_by_id=track_xyz_by_id,
             track_observation_index=track_observation_index,
         )
@@ -1000,6 +1144,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             episodes_per_query=int(args.landmark_episodes_per_query),
             sfm_candidate_pool_size=int(args.landmark_episode_sfm_candidate_pool_size),
             retrieval_tracks_per_episode=int(args.landmark_retrieval_tracks_per_episode),
+            allowed_support_image_ids=episode_support_image_ids,
         )
         train_samples = train_provider.get(0)
         train_metadata.update(
@@ -1009,6 +1154,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "episode_support_pairs": int(args.landmark_episode_support_pairs),
                 "episode_min_support_pairs": int(args.landmark_episode_min_support_pairs),
                 "episode_support_selection": str(args.landmark_episode_support_selection),
+                "episode_support_manifest": episode_support_manifest_audit,
             }
         )
         train_audit = _validate_joint_localization_training_set(
@@ -1216,7 +1362,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             "landmark_retrieval_target": "query_full_map_to_multi_observation_track_prototype",
             "landmark_hard_negative_sources": ["same_pair_covisible", "global_semantic_memory", "nearby_3d_memory"],
             "landmark_track_observations": str(args.landmark_track_observations),
-            "requires_rgb_measurement_images": True,
+            "requires_rgb_measurement_images": bool(require_rgb),
             "rejects_row_only_sample_cache": True,
             "reference_source": "real_image",
             "default_feature_source": "radio_final",
@@ -1224,6 +1370,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             "track_prototype_builder": prototype_builder.to_dict(),
         },
         "distributed_runtime": dict(distributed_runtime),
+        "upstream_disjoint_contract": upstream_disjoint_contract,
         "frozen_landmark_bank_contract": frozen_bank_contract,
         "config": asdict(cfg),
         "training": dict(run.summary),

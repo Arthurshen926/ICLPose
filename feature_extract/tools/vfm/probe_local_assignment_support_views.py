@@ -49,7 +49,9 @@ from feature_extract.vfm.matcha_joint_training import load_matcha_joint_model
 from feature_extract.vfm.query_to_3d_matching import (
     QueryTo3DMatch,
     estimate_pose_pnp_ransac,
+    match_spatial_distribution_stats,
     pnp_pose_error,
+    pnp_reprojection_residual_stats,
 )
 from feature_extract.vfm.tokens import TokenBankManifest
 from feature_extract.vfm.track_feature_sampling import (
@@ -459,6 +461,25 @@ def _evaluate_pose_strategy(
             and np.isfinite(error.translation_m)
             and np.isfinite(error.rotation_deg)
         )
+        spatial_all = match_spatial_distribution_stats(
+            matches,
+            int(camera.width),
+            int(camera.height),
+            pose_w2c=result.pose_w2c,
+        )
+        spatial_inliers = match_spatial_distribution_stats(
+            matches,
+            int(camera.width),
+            int(camera.height),
+            result.inlier_mask,
+            pose_w2c=result.pose_w2c,
+        )
+        residuals = pnp_reprojection_residual_stats(
+            matches,
+            result.pose_w2c,
+            camera,
+            inlier_mask=result.inlier_mask,
+        )
         output_rows.append(
             {
                 "query_id": query_id,
@@ -475,6 +496,14 @@ def _evaluate_pose_strategy(
                 ),
                 "match_count": int(result.match_count),
                 "inlier_count": int(result.inlier_count),
+                "inlier_ratio": float(result.inlier_ratio),
+                "all_grid_4x4_occupancy_frac": spatial_all.get(
+                    "grid_4x4_occupancy_frac"
+                ),
+                "inlier_grid_4x4_occupancy_frac": spatial_inliers.get(
+                    "grid_4x4_occupancy_frac"
+                ),
+                **residuals,
                 "selection_confidence_min": (
                     None if finite_confidences.size == 0 else float(np.min(finite_confidences))
                 ),
@@ -486,6 +515,11 @@ def _evaluate_pose_strategy(
                 ),
                 "translation_m": None if not np.isfinite(error.translation_m) else float(error.translation_m),
                 "rotation_deg": None if not np.isfinite(error.rotation_deg) else float(error.rotation_deg),
+                "pose_w2c": (
+                    None
+                    if result.pose_w2c is None
+                    else np.asarray(result.pose_w2c, dtype=np.float64).reshape(4, 4).tolist()
+                ),
             }
         )
     success = [row for row in output_rows if bool(row.get("success"))]

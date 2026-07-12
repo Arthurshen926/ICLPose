@@ -29,6 +29,8 @@ class RGBPatchMeasurementPrediction:
     gated_mean_offset_xy: torch.Tensor | None = None
     gate_logit: torch.Tensor | None = None
     gate_probability: torch.Tensor | None = None
+    geometry_logit: torch.Tensor | None = None
+    geometry_probability: torch.Tensor | None = None
 
 
 def local_offset_grid(*, search_radius_px: float, step_px: float, device: torch.device | None = None, dtype: torch.dtype = torch.float32) -> torch.Tensor:
@@ -911,6 +913,12 @@ class RGBPatchMeasurementBranch(nn.Module):
             nn.Linear(hidden, 1),
         )
         nn.init.constant_(self.dustbin_head[-1].bias, -4.0)
+        self.geometry_head = nn.Sequential(
+            nn.Linear(pair_dim + 6, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, 1),
+        )
+        nn.init.constant_(self.geometry_head[-1].bias, -0.7)
         self.measurement_gate_head = nn.Sequential(
             nn.Linear(pair_dim + 12, hidden),
             nn.GELU(),
@@ -1084,6 +1092,9 @@ class RGBPatchMeasurementBranch(nn.Module):
         gate_probability = torch.sigmoid(gate_logit)
         gated_mean = gate_probability[:, None] * likelihood_mean.to(device=pair.device, dtype=pair.dtype)
         dustbin = self.dustbin_head(torch.cat([pair, quality.to(device=pair.device, dtype=pair.dtype)], dim=1)).reshape(int(query_patch.shape[0]))
+        geometry_logit = self.geometry_head(
+            torch.cat([pair, quality.to(device=pair.device, dtype=pair.dtype)], dim=1)
+        ).reshape(int(query_patch.shape[0]))
         return RGBPatchMeasurementPrediction(
             logits=logits,
             offsets_xy=offsets,
@@ -1100,6 +1111,8 @@ class RGBPatchMeasurementBranch(nn.Module):
             gated_mean_offset_xy=gated_mean,
             gate_logit=gate_logit,
             gate_probability=gate_probability,
+            geometry_logit=geometry_logit,
+            geometry_probability=torch.sigmoid(geometry_logit),
         )
 
     def forward(

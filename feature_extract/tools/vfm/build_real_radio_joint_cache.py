@@ -6,6 +6,7 @@ import argparse
 import csv
 import hashlib
 import json
+import os
 import time
 from collections import Counter, OrderedDict
 from dataclasses import dataclass, replace
@@ -179,21 +180,24 @@ def _save_track_observation_index_npz(
     }
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)
-    temporary = output.with_suffix(output.suffix + ".tmp.npz")
-    np.savez(
-        temporary,
-        metadata_json=np.asarray(json.dumps(metadata, sort_keys=True)),
-        image_ids=np.asarray(image_ids, dtype=np.str_),
-        offsets=offsets,
-        track_ids=track_ids,
-        xy=xy,
-        image_sizes=image_sizes,
-        xyz=xyz,
-        track_lengths=track_lengths,
-        unique_track_ids=unique_track_ids,
-        unique_track_xyz=unique_track_xyz,
-    )
-    temporary.replace(output)
+    temporary = output.with_name(f".{output.name}.{os.getpid()}.{time.time_ns()}.tmp.npz")
+    try:
+        np.savez(
+            temporary,
+            metadata_json=np.asarray(json.dumps(metadata, sort_keys=True)),
+            image_ids=np.asarray(image_ids, dtype=np.str_),
+            offsets=offsets,
+            track_ids=track_ids,
+            xy=xy,
+            image_sizes=image_sizes,
+            xyz=xyz,
+            track_lengths=track_lengths,
+            unique_track_ids=unique_track_ids,
+            unique_track_xyz=unique_track_xyz,
+        )
+        temporary.replace(output)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _load_track_observation_index_npz(path: Path, *, source_jsonl: Path) -> SfMTrackObservationIndex:
@@ -657,8 +661,10 @@ def _build_joint_set_for_real_pair(
     reference_id: str,
     query_feature: np.ndarray,
     reference_feature: np.ndarray,
-    query_rgb: np.ndarray,
-    reference_rgb: np.ndarray,
+    query_rgb: np.ndarray | None,
+    reference_rgb: np.ndarray | None,
+    query_image_size: tuple[int, int] | None = None,
+    reference_image_size: tuple[int, int] | None = None,
     split_name: str,
     hard_negatives_per_match: int,
     roundtrip_heatmap_threshold_px: float,
@@ -670,10 +676,22 @@ def _build_joint_set_for_real_pair(
 ) -> tuple[MatchaJointTrainingSet, dict[str, int]]:
     if int(query_feature.shape[0]) != int(reference_feature.shape[0]):
         raise ValueError("query/reference feature-map channels must match")
+    resolved_query_size = (
+        (int(query_rgb.shape[1]), int(query_rgb.shape[0]))
+        if query_rgb is not None
+        else query_image_size
+    )
+    resolved_reference_size = (
+        (int(reference_rgb.shape[1]), int(reference_rgb.shape[0]))
+        if reference_rgb is not None
+        else reference_image_size
+    )
+    if resolved_query_size is None or resolved_reference_size is None:
+        raise ValueError("query/reference image sizes are required when RGB loading is disabled")
     supervision, skip_counts, retrieval = _build_supervision_for_pair(
         rows,
-        query_image_size=(int(query_rgb.shape[1]), int(query_rgb.shape[0])),
-        reference_image_size=(int(reference_rgb.shape[1]), int(reference_rgb.shape[0])),
+        query_image_size=resolved_query_size,
+        reference_image_size=resolved_reference_size,
         query_grid_hw=(int(query_feature.shape[1]), int(query_feature.shape[2])),
         reference_grid_hw=(int(reference_feature.shape[1]), int(reference_feature.shape[2])),
         positive_reprojection_error_px=float(positive_reprojection_error_px),
@@ -687,8 +705,8 @@ def _build_joint_set_for_real_pair(
         retrieval = track_observation_index.common_tracks(
             query_id,
             reference_id,
-            query_source_size=(int(query_rgb.shape[1]), int(query_rgb.shape[0])),
-            reference_source_size=(int(reference_rgb.shape[1]), int(reference_rgb.shape[0])),
+            query_source_size=resolved_query_size,
+            reference_source_size=resolved_reference_size,
         )
         if int(np.asarray(retrieval["track_ids"]).shape[0]) == 0:
             raise ValueError("real pair has no common SfM tracks for landmark retrieval")
@@ -705,6 +723,8 @@ def _build_joint_set_for_real_pair(
     retrieval_count = int(np.asarray(retrieval["track_ids"]).shape[0])
     joint = replace(
         joint,
+        pair_query_image_sizes=np.asarray([resolved_query_size], dtype=np.int64),
+        pair_reference_image_sizes=np.asarray([resolved_reference_size], dtype=np.int64),
         landmark_sample_pair_indices=np.zeros((retrieval_count,), dtype=np.int64),
         landmark_query_xy=np.asarray(retrieval["query_xy"], dtype=np.float64),
         landmark_reference_xy=np.asarray(retrieval["reference_xy"], dtype=np.float64),
@@ -724,6 +744,7 @@ class RealRadioReferencedJointSampleProvider:
         *,
         feature_cache_size: int = 4,
         rgb_cache_size: int = 8,
+        load_rgb: bool = True,
         track_xyz_by_id: Mapping[int, np.ndarray] | None = None,
         track_observation_index: SfMTrackObservationIndex | None = None,
     ) -> None:
@@ -758,6 +779,7 @@ class RealRadioReferencedJointSampleProvider:
         self.rows = _read_csv(self.rows_csv)
         self.feature_cache_size = max(0, int(feature_cache_size))
         self.rgb_cache_size = max(0, int(rgb_cache_size))
+        self.load_rgb = bool(load_rgb)
         self._feature_cache: OrderedDict[str, np.ndarray] = OrderedDict()
         self._rgb_cache: OrderedDict[str, np.ndarray] = OrderedDict()
         self._cache_lock = RLock()
@@ -851,6 +873,17 @@ class RealRadioReferencedJointSampleProvider:
             max_size=self.rgb_cache_size,
         )
 
+    def _image_size(self, image_id: str) -> tuple[int, int]:
+        if self.track_observation_index is None:
+            raise ValueError("feature-only referenced loading requires a full SfM observation index")
+        observations = self.track_observation_index.by_image.get(str(image_id))
+        if observations is None or int(observations.image_sizes.shape[0]) == 0:
+            raise ValueError(f"SfM observation index has no image size for {image_id!r}")
+        sizes = np.asarray(observations.image_sizes, dtype=np.int64).reshape(-1, 2)
+        if not bool(np.all(sizes == sizes[0])):
+            raise ValueError(f"SfM observation index has inconsistent image sizes for {image_id!r}")
+        return int(sizes[0, 0]), int(sizes[0, 1])
+
     def _record_rows(self, record: Mapping[str, object]) -> list[dict[str, str]]:
         row_indices = [int(value) for value in record.get("row_indices", [])]
         rows: list[dict[str, str]] = []
@@ -884,14 +917,18 @@ class RealRadioReferencedJointSampleProvider:
                 feature_path_template=self.feature_path_template,
             )
         )
+        query_rgb = self._rgb(query_id) if self.load_rgb else None
+        reference_rgb = self._rgb(reference_id) if self.load_rgb else None
         joint, _skip_counts = _build_joint_set_for_real_pair(
             rows=self._record_rows(record),
             query_id=query_id,
             reference_id=reference_id,
             query_feature=query_feature,
             reference_feature=reference_feature,
-            query_rgb=self._rgb(query_id),
-            reference_rgb=self._rgb(reference_id),
+            query_rgb=query_rgb,
+            reference_rgb=reference_rgb,
+            query_image_size=None if query_rgb is not None else self._image_size(query_id),
+            reference_image_size=None if reference_rgb is not None else self._image_size(reference_id),
             split_name=str(record.get("split", self.split_name)),
             hard_negatives_per_match=self.hard_negatives_per_match,
             roundtrip_heatmap_threshold_px=self.roundtrip_heatmap_threshold_px,
@@ -908,13 +945,23 @@ class RealRadioReferencedJointSampleProvider:
 
         if self.track_observation_index is None:
             raise ValueError("get_sfm_pair requires a full SfM track observation index")
-        query_rgb = self._rgb(str(query_id))
-        reference_rgb = self._rgb(str(reference_id))
+        query_rgb = self._rgb(str(query_id)) if self.load_rgb else None
+        reference_rgb = self._rgb(str(reference_id)) if self.load_rgb else None
+        query_image_size = (
+            (int(query_rgb.shape[1]), int(query_rgb.shape[0]))
+            if query_rgb is not None
+            else self._image_size(str(query_id))
+        )
+        reference_image_size = (
+            (int(reference_rgb.shape[1]), int(reference_rgb.shape[0]))
+            if reference_rgb is not None
+            else self._image_size(str(reference_id))
+        )
         retrieval = self.track_observation_index.common_tracks(
             str(query_id),
             str(reference_id),
-            query_source_size=(int(query_rgb.shape[1]), int(query_rgb.shape[0])),
-            reference_source_size=(int(reference_rgb.shape[1]), int(reference_rgb.shape[0])),
+            query_source_size=query_image_size,
+            reference_source_size=reference_image_size,
         )
         track_ids = np.asarray(retrieval["track_ids"], dtype=np.int64).reshape(-1)
         if track_ids.size == 0:
@@ -961,6 +1008,8 @@ class RealRadioReferencedJointSampleProvider:
             reference_feature=reference_feature,
             query_rgb=query_rgb,
             reference_rgb=reference_rgb,
+            query_image_size=query_image_size,
+            reference_image_size=reference_image_size,
             split_name=str(self.split_name),
             hard_negatives_per_match=int(self.hard_negatives_per_match),
             roundtrip_heatmap_threshold_px=float(self.roundtrip_heatmap_threshold_px),
