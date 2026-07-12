@@ -1,0 +1,88 @@
+protocol_name: oldhospital_landmark_retrieval_dev_v1
+protocol_kind: real_image_global_landmark_retrieval_pose_dev
+status: locked_dev_only
+description: >
+  Fixed development protocol for projected-observation landmark localization.
+  The 182-query Cambridge OldHospital test split has been used repeatedly while
+  developing this pipeline and is therefore a dev set, not an untouched test
+  set. Results under this protocol must not be reported as final test results.
+
+scene:
+  name: OldHospital
+  image_root: /hy-tmp/Cambridge_stdloc/OldHospital/processed
+  colmap_model_dir: /hy-tmp/Cambridge_stdloc/OldHospital/sparse/0
+  source_token_manifest: output/vfm_tokens_radio/OldHospital/train_manifest.json
+  source_token_manifest_sha256: b0df0572c10617ef81cf6197d291b18007534a6d0a4cdeebee7b08aea6ce04ad
+  track_observations: output/vfm/colmap_tracks/OldHospital/model_train_tracks_min2_balanced300k_v2.jsonl
+  track_observations_sha256: 44951d4dd4b5c41a2956234c50ba1f5532e6ccc868002fbf01eb42a01348fef7
+  query_manifest: output/vfm_tokens_radio/OldHospital/test_manifest.json
+  query_manifest_sha256: 47de68debbf0e089a52c00b813e1b636f9ad27d1b1dff16192d6bde42d00bce3
+  query_pose_file: /hy-tmp/Cambridge_stdloc/OldHospital/dataset_test.txt
+  query_pose_file_sha256: e3f24fb231a3bbf8d33031197796d9b4dd83cd6d788d0c14460920bf1c83462a
+  expected_query_count: 182
+  split_role: development
+
+descriptor_contract:
+  descriptor_space_version: 2
+  projection_preset: joint_query_to_projected_observation_landmark
+  projection_source: projected_observation_full_map
+  feature_key: radio_final
+  radio_model_version: c-radio_v4-h
+  output_branch: coarse_descriptors
+  sample_mode: bilinear
+  sampling_convention: pixel_endpoint_to_token_endpoint_v1
+  production_1x1_projection_allowed: false
+  min_path_parity_cosine: 0.99999
+
+bank:
+  aggregation_method: mean
+  min_observations: 2
+  l2_normalize_observations: false
+  view_clustering: none
+  maplet_bank_version: none
+  search_scope: full_bank
+  submap_mode: none
+  image_retrieval: false
+
+baseline_matrix:
+  - name: l1_ratio_on
+    proposal_top_l: 1
+    nn_search_k_for_ratio: 2
+    ratio_threshold: 0.95
+    measurement_mode: none
+  - name: l1_ratio_off
+    proposal_top_l: 1
+    nn_search_k_for_ratio: 2
+    ratio_threshold: null
+    measurement_mode: none
+
+fixed_inference:
+  query_token_selection: heatmap
+  query_heatmap_top_k: 1000
+  query_heatmap_nms_radius: 1
+  query_heatmap_grid_rows: 4
+  query_heatmap_grid_cols: 8
+  min_similarity: 0.2
+  max_matches: 300
+  pnp_reprojection_error_px: 8.0
+  measurement_mode: none
+
+required_report_metrics:
+  - full_bank_recall_at_1
+  - full_bank_recall_at_5
+  - full_bank_recall_at_20
+  - full_bank_recall_at_50
+  - median_correct_rank
+  - mean_reciprocal_rank
+  - median_translation_error_m
+  - median_rotation_error_deg
+  - recall_0_25m_2deg
+  - recall_0_5m_5deg
+  - translation_error_p90_m
+  - rotation_error_p90_deg
+
+promotion_rules:
+  checkpoint_selection_metric: heldout_full_bank_recall_at_20
+  scalar_joint_training_loss_selection_allowed: false
+  final_test_claim_allowed: false
+  required_next_test: untouched_cross_scene_or_new_query_holdout

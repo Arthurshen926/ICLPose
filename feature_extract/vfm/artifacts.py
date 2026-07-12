@@ -3,10 +3,29 @@
 from __future__ import annotations
 
 import hashlib
+from functools import lru_cache
 from pathlib import Path
 from typing import Mapping
 
 from feature_extract.vfm.hypothesis_io import CandidateHypothesisBank
+
+
+@lru_cache(maxsize=512)
+def _file_sha256_short_cached(
+    resolved_path: str,
+    file_size: int,
+    modified_time_ns: int,
+    changed_time_ns: int,
+    length: int,
+) -> str:
+    # File metadata is part of the cache key: an artifact rewrite forces a
+    # fresh digest while repeated manifest checks avoid rereading large NPZs.
+    del file_size, modified_time_ns, changed_time_ns
+    digest = hashlib.sha256()
+    with Path(resolved_path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()[:length]
 
 
 def file_sha256_short(path: Path, length: int = 16) -> str:
@@ -14,11 +33,15 @@ def file_sha256_short(path: Path, length: int = 16) -> str:
 
     if length <= 0:
         raise ValueError("digest length must be positive")
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()[:length]
+    resolved = Path(path).resolve(strict=True)
+    stat = resolved.stat()
+    return _file_sha256_short_cached(
+        str(resolved),
+        int(stat.st_size),
+        int(stat.st_mtime_ns),
+        int(stat.st_ctime_ns),
+        int(length),
+    )
 
 
 def candidate_bank_artifact_metadata(

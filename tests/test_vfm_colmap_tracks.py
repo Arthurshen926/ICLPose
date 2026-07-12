@@ -5,7 +5,16 @@ import json
 
 import numpy as np
 
-from feature_extract.vfm.colmap_tracks import load_colmap_track_observations
+from feature_extract.vfm.colmap_tracks import (
+    ColmapCamera,
+    ColmapImageObservation,
+    load_colmap_track_observations,
+    read_colmap_cameras_binary,
+    read_colmap_images_binary,
+    scale_colmap_camera,
+    write_colmap_cameras_binary,
+    write_colmap_images_binary,
+)
 
 
 def _write_cameras_bin(path):
@@ -109,3 +118,43 @@ def test_export_colmap_track_observations_cli_writes_jsonl_and_summary(tmp_path)
     assert summary["observation_count"] == 2
     assert summary["available_observation_count"] == 2
     assert summary["track_count"] == 1
+
+
+def test_scaled_colmap_binary_roundtrip_preserves_pose_and_scales_pixels(tmp_path):
+    camera = ColmapCamera(
+        camera_id=4,
+        model_id=2,
+        width=1920,
+        height=1080,
+        params=(1669.05, 960.0, 540.0, 0.03),
+    )
+    scaled = scale_colmap_camera(camera, width=1024, height=576)
+    image = ColmapImageObservation(
+        image_id=7,
+        image_name="query.png",
+        camera_id=4,
+        qvec=np.asarray([1.0, 0.0, 0.0, 0.0]),
+        tvec=np.asarray([1.0, 2.0, 3.0]),
+        xys=np.asarray([[960.0, 540.0], [480.0, 270.0]]),
+        point3d_ids=np.asarray([11, -1], dtype=np.int64),
+    )
+    camera_path = tmp_path / "cameras.bin"
+    image_path = tmp_path / "images.bin"
+    write_colmap_cameras_binary({4: scaled}, camera_path)
+    write_colmap_images_binary(
+        {7: image},
+        image_path,
+        xy_scale_by_camera_id={4: (1024.0 / 1920.0, 576.0 / 1080.0)},
+    )
+
+    loaded_camera = read_colmap_cameras_binary(camera_path)[4]
+    loaded_image = read_colmap_images_binary(image_path)[7]
+    assert (loaded_camera.width, loaded_camera.height) == (1024, 576)
+    np.testing.assert_allclose(
+        loaded_camera.params,
+        [890.16, 512.0, 288.0, 0.03],
+    )
+    np.testing.assert_allclose(loaded_image.xys, [[512.0, 288.0], [256.0, 144.0]])
+    np.testing.assert_allclose(loaded_image.qvec, image.qvec)
+    np.testing.assert_allclose(loaded_image.tvec, image.tvec)
+    assert loaded_image.point3d_ids.tolist() == [11, -1]

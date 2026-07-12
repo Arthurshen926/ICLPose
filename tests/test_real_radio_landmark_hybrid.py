@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+import torch
 
 from feature_extract.vfm.colmap_tracks import ColmapTrackObservation
 from feature_extract.vfm.localization.landmark_hybrid import (
@@ -16,6 +17,7 @@ from feature_extract.vfm.localization.landmark_hybrid import (
     project_landmark_index_features,
     refine_landmark_match_batches_with_measurement,
     refine_landmark_matches_with_measurement,
+    run_real_radio_landmark_hybrid_eval,
     rescore_landmark_matches_for_measurement,
     save_landmark_index_npz,
     select_measurement_candidates_from_inlier_mask,
@@ -196,7 +198,9 @@ def test_projected_observation_landmark_index_samples_full_map_mapper_outputs(tm
     assert metadata["projection_mode"] == "full_map_projected_observations"
     assert list(index.track_ids) == [3]
     np.testing.assert_allclose(index.xyz, [[3.0, 1.0, 4.0]])
-    np.testing.assert_allclose(index.features, [[12.0, 120.0]])
+    expected = np.asarray([[12.0, 120.0]], dtype=np.float32)
+    expected /= np.linalg.norm(expected, axis=1, keepdims=True)
+    np.testing.assert_allclose(index.features, expected)
     np.testing.assert_array_equal(index.observation_counts, [2])
     assert index.observation_image_ids == (("a.png", "b.png"),)
 
@@ -211,6 +215,7 @@ def test_landmark_index_npz_roundtrip_preserves_metadata(tmp_path) -> None:
         observation_image_ids=(("a.png", "b.png"), ("c.png",)),
         reprojection_errors=np.asarray([0.25, 0.5], dtype=np.float32),
         feature_ambiguities=np.asarray([0.05, 0.1], dtype=np.float32),
+        prototype_ids=np.asarray([0, 1], dtype=np.int64),
     )
     path = tmp_path / "projected_landmarks.npz"
 
@@ -225,6 +230,7 @@ def test_landmark_index_npz_roundtrip_preserves_metadata(tmp_path) -> None:
     assert loaded.observation_image_ids == index.observation_image_ids
     np.testing.assert_allclose(loaded.reprojection_errors, index.reprojection_errors)
     np.testing.assert_allclose(loaded.feature_ambiguities, index.feature_ambiguities)
+    np.testing.assert_array_equal(loaded.prototype_ids, index.prototype_ids)
     assert metadata["projection"] == "joint"
 
 
@@ -300,6 +306,67 @@ def test_ann_landmark_matcher_proposal_top_l_keeps_multiple_landmarks_per_query_
     assert metadata["proposal_top_l"] == 2
 
 
+def test_ann_landmark_matcher_collapses_prototypes_before_track_top_l() -> None:
+    index = LandmarkMapIndex(
+        track_ids=np.asarray([11, 11, 22], dtype=np.int64),
+        prototype_ids=np.asarray([0, 1, 0], dtype=np.int64),
+        xyz=np.asarray([[0.0, 0.0, 5.0], [0.0, 0.0, 5.0], [1.0, 0.0, 5.0]], dtype=np.float64),
+        features=np.asarray([[1.0, 0.0], [0.99, 0.01], [0.9, 0.1]], dtype=np.float32),
+        mean_variances=np.asarray([0.1, 0.1, 0.1], dtype=np.float32),
+        observation_counts=np.asarray([3, 2, 4], dtype=np.int64),
+        observation_image_ids=(("r0.png",), ("r1.png",), ("r2.png",)),
+        reprojection_errors=np.asarray([0.2, 0.2, 0.2], dtype=np.float32),
+        feature_ambiguities=np.asarray([0.0, 0.0, 0.0], dtype=np.float32),
+    )
+    query = np.asarray([[[1.0]], [[0.0]]], dtype=np.float32)
+
+    matches, metadata = match_query_tokens_to_landmarks_ann(
+        query,
+        index,
+        LandmarkRetrievalConfig(
+            backend="exact",
+            top_k=2,
+            proposal_top_l=2,
+            ratio_threshold=None,
+            min_similarity=0.1,
+            query_token_step=1,
+            max_matches=2,
+            deduplicate_tracks=False,
+        ),
+        image_width=20,
+        image_height=10,
+    )
+
+    assert [match.track_id for match in matches] == [11, 22]
+    assert [match.prototype_id for match in matches] == [0, 0]
+    assert metadata["max_prototypes_per_track"] == 2
+    assert metadata["search_top_k"] == 3
+
+
+def test_pose_eval_rejects_unresolved_top_l_proposals(tmp_path) -> None:
+    empty_index = LandmarkMapIndex(
+        track_ids=np.zeros((0,), dtype=np.int64),
+        xyz=np.zeros((0, 3), dtype=np.float64),
+        features=np.zeros((0, 2), dtype=np.float32),
+        mean_variances=np.zeros((0,), dtype=np.float32),
+        observation_counts=np.zeros((0,), dtype=np.int64),
+        observation_image_ids=(),
+    )
+
+    with pytest.raises(ValueError, match="unresolved top-L proposals"):
+        run_real_radio_landmark_hybrid_eval(
+            [],
+            landmark_index=empty_index,
+            output_dir=tmp_path,
+            feature_mapper=None,
+            cameras_by_query={},
+            gt_poses_by_query={},
+            image_root=tmp_path,
+            retrieval_config=LandmarkRetrievalConfig(proposal_top_l=2, ratio_threshold=None),
+            evaluate_pose=True,
+        )
+
+
 def test_heatmap_query_token_selector_uses_nms_and_spatial_quota() -> None:
     feature_map = np.arange(16, dtype=np.float32).reshape(1, 4, 4)
     heatmap = np.zeros((4, 4), dtype=np.float32)
@@ -326,6 +393,39 @@ def test_heatmap_query_token_selector_uses_nms_and_spatial_quota() -> None:
     assert token_indices.tolist() == [0, 15]
     assert metadata["query_token_selection"] == "heatmap"
     assert metadata["selected_query_token_count"] == 2
+
+
+def test_query_token_selector_exposes_legacy_edge_and_cell_center_coordinates() -> None:
+    feature_map = np.ones((2, 2, 2), dtype=np.float32)
+    heatmap = np.asarray([[1.0, 0.1], [0.2, 0.9]], dtype=np.float32)
+    common = dict(
+        backend="exact",
+        query_token_selection="heatmap",
+        query_heatmap_top_k=2,
+        query_heatmap_nms_radius=0,
+        query_heatmap_grid_rows=1,
+        query_heatmap_grid_cols=1,
+    )
+
+    _features, edge_xy, edge_tokens, _metadata = select_query_tokens_for_landmark_retrieval(
+        feature_map,
+        image_width=40,
+        image_height=20,
+        config=LandmarkRetrievalConfig(query_xy_coordinate_mode="edge_legacy", **common),
+        query_heatmap=heatmap,
+    )
+    _features, center_xy, center_tokens, metadata = select_query_tokens_for_landmark_retrieval(
+        feature_map,
+        image_width=40,
+        image_height=20,
+        config=LandmarkRetrievalConfig(query_xy_coordinate_mode="cell_center", **common),
+        query_heatmap=heatmap,
+    )
+
+    np.testing.assert_array_equal(edge_tokens, center_tokens)
+    np.testing.assert_allclose(edge_xy, [[0.0, 0.0], [39.0, 19.0]])
+    np.testing.assert_allclose(center_xy, [[9.5, 4.5], [29.5, 14.5]])
+    assert metadata["query_xy_coordinate_mode"] == "cell_center"
 
 
 def test_faiss_landmark_matcher_matches_exact_backend_when_available() -> None:
@@ -360,6 +460,46 @@ def test_faiss_landmark_matcher_matches_exact_backend_when_available() -> None:
 
     assert metadata["backend"] == "faiss_flat_ip"
     assert [match.track_id for match in faiss_matches] == [match.track_id for match in exact]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_torch_cuda_landmark_matcher_matches_exact_backend() -> None:
+    index = LandmarkMapIndex(
+        track_ids=np.asarray([1, 2, 3], dtype=np.int64),
+        xyz=np.asarray([[0.0, 0.0, 5.0], [1.0, 0.0, 5.0], [2.0, 0.0, 5.0]], dtype=np.float64),
+        features=np.asarray([[1.0, 0.0], [0.0, 1.0], [0.7, 0.7]], dtype=np.float32),
+        mean_variances=np.asarray([0.1, 0.1, 0.1], dtype=np.float32),
+        observation_counts=np.asarray([3, 3, 3], dtype=np.int64),
+        observation_image_ids=(("r0.png",), ("r1.png",), ("r2.png",)),
+        reprojection_errors=np.asarray([0.2, 0.2, 0.2], dtype=np.float32),
+        feature_ambiguities=np.asarray([0.0, 0.0, 0.0], dtype=np.float32),
+    )
+    query = np.asarray([[[1.0]], [[0.0]]], dtype=np.float32)
+    common = dict(top_k=2, ratio_threshold=None, min_similarity=0.1, query_token_step=1, max_matches=2)
+
+    exact, _ = match_query_tokens_to_landmarks_ann(
+        query,
+        index,
+        LandmarkRetrievalConfig(backend="exact", **common),
+        image_width=20,
+        image_height=10,
+    )
+    cuda_matches, metadata = match_query_tokens_to_landmarks_ann(
+        query,
+        index,
+        LandmarkRetrievalConfig(backend="torch_cuda", **common),
+        image_width=20,
+        image_height=10,
+    )
+
+    assert metadata["backend"] == "torch_cuda_exact_ip"
+    assert [match.track_id for match in cuda_matches] == [match.track_id for match in exact]
+    np.testing.assert_allclose(
+        [match.similarity for match in cuda_matches],
+        [match.similarity for match in exact],
+        rtol=1e-6,
+        atol=1e-6,
+    )
 
 
 def test_landmark_search_index_cache_reuses_same_submap_key() -> None:

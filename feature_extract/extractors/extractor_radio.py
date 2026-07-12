@@ -127,6 +127,51 @@ class RADIOFeatureExtractor:
         }
 
     @torch.no_grad()
+    def extract_intermediate_batch(
+        self,
+        image_tensors,
+        *,
+        intermediate_index: int = -6,
+        norm_intermediates: bool = True,
+        aggregation: str = "sparse",
+    ):
+        """Extract one intermediate map and stop before unneeded later blocks."""
+
+        _, _, height, width = image_tensors.shape
+        nearest = self.model.get_nearest_supported_resolution(height, width)
+        target_height, target_width = nearest.height, nearest.width
+        if target_height != height or target_width != width:
+            image_tensors = F.interpolate(
+                image_tensors,
+                (target_height, target_width),
+                mode="bilinear",
+                align_corners=False,
+            )
+        image_tensors = image_tensors.to(self.device)
+        autocast_context = (
+            torch.autocast("cuda", dtype=torch.bfloat16)
+            if self.device.type == "cuda"
+            else nullcontext()
+        )
+        with autocast_context:
+            outputs = self.model.forward_intermediates(
+                image_tensors,
+                indices=[int(intermediate_index)],
+                norm=bool(norm_intermediates),
+                stop_early=True,
+                output_fmt="NCHW",
+                intermediates_only=True,
+                aggregation=str(aggregation),
+            )
+        values = list(outputs) if isinstance(outputs, (list, tuple)) else [outputs]
+        if len(values) != 1:
+            raise ValueError("RADIO returned the wrong number of intermediate feature maps")
+        features = _radio_output_features(values[0])
+        if features.ndim != 4 or int(features.shape[0]) != int(image_tensors.shape[0]):
+            raise ValueError("RADIO intermediate output must have shape (B, C, H, W)")
+        return features.float()
+
+    @torch.no_grad()
     def extract_dual(
         self,
         image_tensor,

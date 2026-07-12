@@ -484,7 +484,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     parser.add_argument("--spatial_diversity_grid_cols", type=int, default=4)
     parser.add_argument("--spatial_diversity_max_per_cell", type=int, default=2)
     parser.add_argument("--spatial_diversity_max_matches", type=int, default=None)
-    parser.add_argument("--spatial_diversity_min_depth_range_m", type=float, default=None)
+    parser.add_argument("--spatial_diversity_min_world_z_range_m", type=float, default=None)
     parser.add_argument("--spatial_diversity_min_planarity_ratio", type=float, default=None)
     parser.add_argument(
         "--spatial_diversity_score_mode",
@@ -930,7 +930,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 max_per_cell=int(args.spatial_diversity_max_per_cell),
                 max_matches=args.spatial_diversity_max_matches,
                 score_mode=args.spatial_diversity_score_mode,
-                min_depth_range_m=args.spatial_diversity_min_depth_range_m,
+                min_world_z_range_m=args.spatial_diversity_min_world_z_range_m,
                 min_planarity_ratio=args.spatial_diversity_min_planarity_ratio,
             ),
         )
@@ -1323,12 +1323,15 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         )
         positive_stats = patch_positive_set_stats(positives)
         pose_error = pnp_pose_error(pnp.pose_w2c, gt_pose.pose_w2c)
-        all_spatial_stats = match_spatial_distribution_stats(matches, int(camera.width), int(camera.height))
+        all_spatial_stats = match_spatial_distribution_stats(
+            matches, int(camera.width), int(camera.height), pose_w2c=pnp.pose_w2c
+        )
         inlier_spatial_stats = match_spatial_distribution_stats(
             matches,
             int(camera.width),
             int(camera.height),
             full_pnp_inlier_mask,
+            pose_w2c=pnp.pose_w2c,
         )
         pnp_residual_stats = pnp_reprojection_residual_stats(
             matches,
@@ -1673,7 +1676,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 "max_per_cell": int(args.spatial_diversity_max_per_cell),
                 "max_matches": args.spatial_diversity_max_matches,
                 "score_mode": args.spatial_diversity_score_mode,
-                "min_depth_range_m": args.spatial_diversity_min_depth_range_m,
+                "min_world_z_range_m": args.spatial_diversity_min_world_z_range_m,
                 "min_planarity_ratio": args.spatial_diversity_min_planarity_ratio,
             },
         },

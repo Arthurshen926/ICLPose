@@ -326,12 +326,18 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             strong_overlap_ratio=float(args.strong_positive_ratio),
         )
         pose_error = pnp_pose_error(pnp.pose_w2c, gt_pose.pose_w2c)
-        all_spatial_stats = match_spatial_distribution_stats(pnp_matches, int(camera.width), int(camera.height))
+        all_spatial_stats = match_spatial_distribution_stats(
+            pnp_matches,
+            int(camera.width),
+            int(camera.height),
+            pose_w2c=pnp.pose_w2c,
+        )
         inlier_spatial_stats = match_spatial_distribution_stats(
             pnp_matches,
             int(camera.width),
             int(camera.height),
             pnp.inlier_mask,
+            pose_w2c=pnp.pose_w2c,
         )
         pnp_residual_stats = pnp_reprojection_residual_stats(
             pnp_matches,

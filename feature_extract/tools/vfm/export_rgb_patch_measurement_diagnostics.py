@@ -24,7 +24,19 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max_rows", type=int, default=0)
     parser.add_argument("--visualize_limit", type=int, default=16)
     parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--cache_images_on_device", action="store_true")
+    parser.add_argument(
+        "--image_cache_max_gb",
+        type=float,
+        default=0.0,
+        help="Optional shared query/support image-cache byte budget in GiB.",
+    )
     parser.add_argument("--prior_scale_key", default="")
+    parser.add_argument(
+        "--target_dustbin_filter",
+        default="all",
+        choices=("all", "valid", "dustbin"),
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--base_dir", default=".")
     return parser.parse_args(argv)
@@ -45,7 +57,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         max_rows=int(args.max_rows) if int(args.max_rows) > 0 else None,
         visualize_limit=int(args.visualize_limit),
         batch_size=max(1, int(args.batch_size)),
+        cache_images_on_device=bool(args.cache_images_on_device),
+        image_cache_max_gb=float(args.image_cache_max_gb) if float(args.image_cache_max_gb) > 0.0 else None,
         prior_scale_key=str(args.prior_scale_key),
+        target_dustbin_filter=str(args.target_dustbin_filter),
         device=str(args.device),
         base_dir=Path(args.base_dir),
     )

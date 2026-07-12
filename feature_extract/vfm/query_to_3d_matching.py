@@ -9,6 +9,7 @@ import numpy as np
 
 from feature_extract.vfm.cambridge_pose_lattice import camera_center_from_pose_w2c, rotation_angle_deg
 from feature_extract.vfm.colmap_tracks import ColmapCamera
+from feature_extract.vfm.landmark_feature_aggregation import MultiPrototypeTrackBank
 from feature_extract.vfm.map_lifting import SelectedTrackFeatureBank
 
 
@@ -22,6 +23,7 @@ class LandmarkMapIndex:
     observation_image_ids: tuple[tuple[str, ...], ...]
     reprojection_errors: np.ndarray | None = None
     feature_ambiguities: np.ndarray | None = None
+    prototype_ids: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         track_ids = np.asarray(self.track_ids, dtype=np.int64).reshape(-1)
@@ -37,6 +39,10 @@ class LandmarkMapIndex:
             feature_ambiguities = np.zeros((track_ids.size,), dtype=np.float32)
         else:
             feature_ambiguities = np.asarray(self.feature_ambiguities, dtype=np.float32).reshape(-1)
+        if self.prototype_ids is None:
+            prototype_ids = np.zeros((track_ids.size,), dtype=np.int64)
+        else:
+            prototype_ids = np.asarray(self.prototype_ids, dtype=np.int64).reshape(-1)
         if xyz.shape != (track_ids.size, 3):
             raise ValueError("xyz must have shape (N, 3)")
         if features.ndim != 2 or features.shape[0] != track_ids.size:
@@ -49,6 +55,10 @@ class LandmarkMapIndex:
             raise ValueError("reprojection_errors must have shape (N,)")
         if feature_ambiguities.shape[0] != track_ids.size:
             raise ValueError("feature_ambiguities must have shape (N,)")
+        if prototype_ids.shape[0] != track_ids.size:
+            raise ValueError("prototype_ids must have shape (N,)")
+        if np.any(prototype_ids < 0):
+            raise ValueError("prototype_ids must be non-negative")
         if len(self.observation_image_ids) != track_ids.size:
             raise ValueError("observation_image_ids must have length N")
         object.__setattr__(self, "track_ids", track_ids)
@@ -58,6 +68,7 @@ class LandmarkMapIndex:
         object.__setattr__(self, "observation_counts", observation_counts)
         object.__setattr__(self, "reprojection_errors", reprojection_errors)
         object.__setattr__(self, "feature_ambiguities", np.clip(feature_ambiguities, 0.0, 1.0))
+        object.__setattr__(self, "prototype_ids", prototype_ids)
         object.__setattr__(
             self,
             "observation_image_ids",
@@ -108,6 +119,7 @@ class LandmarkMapIndex:
                 observation_image_ids=(),
                 reprojection_errors=np.zeros((0,), dtype=np.float32),
                 feature_ambiguities=np.zeros((0,), dtype=np.float32),
+                prototype_ids=np.zeros((0,), dtype=np.int64),
             )
         return cls(
             track_ids=np.asarray(track_ids, dtype=np.int64),
@@ -118,6 +130,49 @@ class LandmarkMapIndex:
             observation_image_ids=tuple(image_ids),
             reprojection_errors=np.asarray(reprojection_errors, dtype=np.float32),
             feature_ambiguities=np.zeros((len(track_ids),), dtype=np.float32),
+            prototype_ids=np.zeros((len(track_ids),), dtype=np.int64),
+        )
+
+    @classmethod
+    def from_multi_prototype_bank(
+        cls,
+        bank: MultiPrototypeTrackBank,
+        xyz_by_track: Mapping[int, np.ndarray],
+        reprojection_error_by_track: Mapping[int, float] | None = None,
+    ) -> "LandmarkMapIndex":
+        reprojection_error_by_track = reprojection_error_by_track or {}
+        prototypes = [item for item in bank.prototypes if int(item.track_id) in xyz_by_track]
+        if not prototypes:
+            return cls(
+                track_ids=np.zeros((0,), dtype=np.int64),
+                xyz=np.zeros((0, 3), dtype=np.float64),
+                features=np.zeros((0, int(bank.feature_dim)), dtype=np.float32),
+                mean_variances=np.zeros((0,), dtype=np.float32),
+                observation_counts=np.zeros((0,), dtype=np.int64),
+                observation_image_ids=(),
+                reprojection_errors=np.zeros((0,), dtype=np.float32),
+                feature_ambiguities=np.zeros((0,), dtype=np.float32),
+                prototype_ids=np.zeros((0,), dtype=np.int64),
+            )
+        return cls(
+            track_ids=np.asarray([int(item.track_id) for item in prototypes], dtype=np.int64),
+            xyz=np.stack(
+                [np.asarray(xyz_by_track[int(item.track_id)], dtype=np.float64).reshape(3) for item in prototypes],
+                axis=0,
+            ),
+            features=np.stack([np.asarray(item.feature, dtype=np.float32) for item in prototypes], axis=0),
+            mean_variances=np.asarray(
+                [float(np.mean(np.asarray(item.variance, dtype=np.float32))) for item in prototypes],
+                dtype=np.float32,
+            ),
+            observation_counts=np.asarray([int(item.observation_count) for item in prototypes], dtype=np.int64),
+            observation_image_ids=tuple(tuple(item.observation_image_ids) for item in prototypes),
+            reprojection_errors=np.asarray(
+                [float(reprojection_error_by_track.get(int(item.track_id), 0.0)) for item in prototypes],
+                dtype=np.float32,
+            ),
+            feature_ambiguities=np.zeros((len(prototypes),), dtype=np.float32),
+            prototype_ids=np.asarray([int(item.prototype_id) for item in prototypes], dtype=np.int64),
         )
 
     def subset(self, indices: Sequence[int] | np.ndarray) -> "LandmarkMapIndex":
@@ -134,6 +189,7 @@ class LandmarkMapIndex:
             observation_image_ids=tuple(self.observation_image_ids[int(i)] for i in idx),
             reprojection_errors=self.reprojection_errors[idx],
             feature_ambiguities=self.feature_ambiguities[idx],
+            prototype_ids=self.prototype_ids[idx],
         )
 
 
@@ -263,7 +319,7 @@ class SpatialDiversityPnPConfig:
     max_per_cell: int = 2
     max_matches: int | None = None
     score_mode: str = "margin"
-    min_depth_range_m: float | None = None
+    min_world_z_range_m: float | None = None
     min_planarity_ratio: float | None = None
 
     def __post_init__(self) -> None:
@@ -275,8 +331,8 @@ class SpatialDiversityPnPConfig:
             raise ValueError("max_matches must be positive")
         if self.score_mode not in {"margin", "pairwise", "reliability", "similarity"}:
             raise ValueError("score_mode must be one of: margin, pairwise, reliability, similarity")
-        if self.min_depth_range_m is not None and float(self.min_depth_range_m) < 0.0:
-            raise ValueError("min_depth_range_m must be non-negative")
+        if self.min_world_z_range_m is not None and float(self.min_world_z_range_m) < 0.0:
+            raise ValueError("min_world_z_range_m must be non-negative")
         if self.min_planarity_ratio is not None and float(self.min_planarity_ratio) < 0.0:
             raise ValueError("min_planarity_ratio must be non-negative")
 
@@ -381,6 +437,7 @@ class QueryTo3DMatch:
     measurement_sigma_px: float | None = None
     query_heatmap_score: float | None = None
     geometry_probability: float | None = None
+    measurement_refined_xy: np.ndarray | None = None
     render_xy: np.ndarray | None = None
     base_render_index: int | None = None
     candidate_render_index: int | None = None
@@ -388,6 +445,7 @@ class QueryTo3DMatch:
     coarse_rank: int | None = None
     coarse_score: float | None = None
     coarse_score_gap: float | None = None
+    prototype_id: int | None = None
     mutual_rank: int | None = None
     cell_delta_x: int | None = None
     cell_delta_y: int | None = None
@@ -456,9 +514,8 @@ def token_grid_xy(
 def deduplicate_pnp_matches(matches: Sequence[QueryTo3DMatch]) -> tuple[list[QueryTo3DMatch], np.ndarray]:
     """Keep one 2D observation per 3D track before PnP.
 
-    Matches are already sorted by descriptor/quality confidence before PnP, so
-    keeping the first occurrence preserves the current scoring policy while
-    avoiding repeated 3D points with conflicting 2D observations.
+    Callers choose the conflict policy through input order. Keeping the first
+    occurrence avoids repeated 3D points with conflicting 2D observations.
     """
 
     unique: list[QueryTo3DMatch] = []
@@ -472,6 +529,27 @@ def deduplicate_pnp_matches(matches: Sequence[QueryTo3DMatch]) -> tuple[list[Que
         unique.append(match)
         original_indices.append(int(idx))
     return unique, np.asarray(original_indices, dtype=np.int64)
+
+
+def canonicalize_pnp_solver_order(
+    matches: Sequence[QueryTo3DMatch], original_indices: np.ndarray
+) -> tuple[list[QueryTo3DMatch], np.ndarray]:
+    """Canonicalize solver input after confidence-based conflict resolution."""
+
+    indices = np.asarray(original_indices, dtype=np.int64).reshape(-1)
+    if len(matches) != len(indices):
+        raise ValueError("PnP matches and original indices must have equal length")
+    order = sorted(
+        range(len(matches)),
+        key=lambda index: (
+            int(matches[index].token_index),
+            int(matches[index].track_id),
+            -1
+            if matches[index].prototype_id is None
+            else int(matches[index].prototype_id),
+        ),
+    )
+    return [matches[index] for index in order], indices[np.asarray(order, dtype=np.int64)]
 
 
 def _flatten_query_features(
@@ -914,11 +992,11 @@ def _spatial_diversity_match_score(match: QueryTo3DMatch, mode: str) -> float:
     return float(match.similarity)
 
 
-def _selected_depth_range_m(matches: Sequence[QueryTo3DMatch]) -> float:
+def _selected_world_z_range_m(matches: Sequence[QueryTo3DMatch]) -> float:
     if not matches:
         return 0.0
-    depths = np.asarray([float(match.xyz[2]) for match in matches], dtype=np.float64)
-    return float(np.max(depths) - np.min(depths)) if depths.size else 0.0
+    world_z = np.asarray([float(match.xyz[2]) for match in matches], dtype=np.float64)
+    return float(np.max(world_z) - np.min(world_z)) if world_z.size else 0.0
 
 
 def _selected_planarity_ratio(matches: Sequence[QueryTo3DMatch]) -> float:
@@ -934,7 +1012,7 @@ def _spatial_diversity_targets_met(
     matches: Sequence[QueryTo3DMatch],
     config: SpatialDiversityPnPConfig,
 ) -> bool:
-    if config.min_depth_range_m is not None and _selected_depth_range_m(matches) < float(config.min_depth_range_m):
+    if config.min_world_z_range_m is not None and _selected_world_z_range_m(matches) < float(config.min_world_z_range_m):
         return False
     if config.min_planarity_ratio is not None and _selected_planarity_ratio(matches) < float(config.min_planarity_ratio):
         return False
@@ -946,8 +1024,8 @@ def _spatial_diversity_target_progress(
     config: SpatialDiversityPnPConfig,
 ) -> float:
     progress = 0.0
-    if config.min_depth_range_m is not None:
-        progress += float(np.clip(_selected_depth_range_m(matches) / max(float(config.min_depth_range_m), 1e-12), 0.0, 1.0))
+    if config.min_world_z_range_m is not None:
+        progress += float(np.clip(_selected_world_z_range_m(matches) / max(float(config.min_world_z_range_m), 1e-12), 0.0, 1.0))
     if config.min_planarity_ratio is not None:
         progress += float(np.clip(_selected_planarity_ratio(matches) / max(float(config.min_planarity_ratio), 1e-12), 0.0, 1.0))
     return progress
@@ -988,7 +1066,7 @@ def select_pnp_matches_by_spatial_diversity(
             )[: int(config.max_matches)]
         }
         selected = [match for match in selected if id(match) in ordered_ids]
-    if (config.min_depth_range_m is not None or config.min_planarity_ratio is not None) and not _spatial_diversity_targets_met(
+    if (config.min_world_z_range_m is not None or config.min_planarity_ratio is not None) and not _spatial_diversity_targets_met(
         selected,
         config,
     ):
@@ -1361,6 +1439,9 @@ def estimate_pose_pnp_ransac(
         raise ValueError(f"unsupported PnP refine method: {refine_method}")
 
     unique_matches, original_indices = deduplicate_pnp_matches(matches)
+    unique_matches, original_indices = canonicalize_pnp_solver_order(
+        unique_matches, original_indices
+    )
     if len(unique_matches) < 4:
         return PnPResult(
             success=False,
@@ -1481,6 +1562,9 @@ def estimate_pose_pnp_fixed(
         raise ValueError(f"unsupported PnP refine method: {refine_method}")
 
     unique_matches, original_indices = deduplicate_pnp_matches(matches)
+    unique_matches, original_indices = canonicalize_pnp_solver_order(
+        unique_matches, original_indices
+    )
     if len(unique_matches) < 4 or len(unique_matches) < int(min_inliers):
         return PnPResult(
             success=False,
@@ -1928,6 +2012,8 @@ def match_spatial_distribution_stats(
     image_width: int,
     image_height: int,
     mask: np.ndarray | None = None,
+    *,
+    pose_w2c: np.ndarray | None = None,
 ) -> dict[str, float | int | None]:
     if mask is None:
         selected = np.ones((len(matches),), dtype=bool)
@@ -1945,7 +2031,9 @@ def match_spatial_distribution_stats(
         "boundary_median_px": None,
         "xyz_planarity_ratio": None,
         "xyz_linearity_ratio": None,
+        "world_z_range_m": None,
         "depth_range_m": None,
+        "positive_depth_fraction": None,
     }
     if not matches or not np.any(selected):
         return stats
@@ -1985,5 +2073,15 @@ def match_spatial_distribution_stats(
     else:
         stats["xyz_planarity_ratio"] = 0.0
         stats["xyz_linearity_ratio"] = 0.0
-    stats["depth_range_m"] = float(np.max(xyz[:, 2]) - np.min(xyz[:, 2])) if xyz.shape[0] else None
+    stats["world_z_range_m"] = float(np.max(xyz[:, 2]) - np.min(xyz[:, 2])) if xyz.shape[0] else None
+    if pose_w2c is not None and xyz.shape[0]:
+        pose = np.asarray(pose_w2c, dtype=np.float64).reshape(4, 4)
+        camera_depths = (xyz @ pose[:3, :3].T + pose[:3, 3])[:, 2]
+        finite = np.isfinite(camera_depths)
+        positive = finite & (camera_depths > 1e-6)
+        stats["positive_depth_fraction"] = float(np.sum(positive) / max(len(camera_depths), 1))
+        if np.any(positive):
+            stats["depth_range_m"] = float(
+                np.max(camera_depths[positive]) - np.min(camera_depths[positive])
+            )
     return stats

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -80,6 +81,146 @@ def test_train_real_radio_joint_localization_cli_defaults_to_full_joint_training
     assert args.local_window_fine_loss_weight > 0.0
     assert not hasattr(args, "sample_cache")
     assert not hasattr(args, "render_cache_manifest_csv")
+    assert args.landmark_episode_support_pairs == 0
+    assert args.landmark_prototype_aggregation_method == "mean"
+    assert args.landmark_l2_normalize_observations is False
+    assert args.landmark_normalize_final_prototypes is True
+    assert args.landmark_frozen_negative_bank == ""
+    assert args.landmark_frozen_bank_support_observations == ""
+
+
+def test_multiview_episode_provider_groups_distinct_support_images() -> None:
+    records = [
+        {"query_id": "q0", "reference_image_id": "r0"},
+        {"query_id": "q0", "reference_image_id": "r1"},
+        {"query_id": "q0", "reference_image_id": "r2"},
+        {"query_id": "q1", "reference_image_id": "r3"},
+        {"query_id": "q1", "reference_image_id": "r4"},
+    ]
+
+    class BaseProvider:
+        metadata = {"records": records}
+
+        def get(self, index):
+            record = records[int(index)]
+            return replace(
+                _full_joint_set(),
+                pair_query_ids=np.asarray([record["query_id"]], dtype=object),
+                pair_candidate_ids=np.asarray([record["reference_image_id"]], dtype=object),
+            )
+
+        def landmark_retrieval_audit(self):
+            return {"supervision_source": "sfm_common_track_observations", "unique_track_count": 1}
+
+    provider = train_real_radio_joint_localization.RealRadioMultiViewEpisodeProvider(
+        BaseProvider(),
+        support_pairs=2,
+        min_support_pairs=2,
+        seed=3,
+    )
+    episode = provider.get(0)
+
+    assert len(provider) == 3
+    assert episode.query_feature_maps.shape[0] == 2
+    assert len(set(episode.pair_candidate_ids.tolist())) == 2
+    assert len(set(episode.pair_query_ids.tolist())) == 1
+    assert provider.landmark_retrieval_audit()["query_excluded_from_support"] is True
+
+
+def test_track_centric_episode_keeps_target_in_every_support_view() -> None:
+    records = [{"query_id": "q0", "reference_image_id": "r0"}]
+    tracks_by_image = {
+        "q0": [7, 8],
+        "r0": [7],
+        "r1": [7, 8],
+        "r2": [7],
+    }
+
+    class BaseProvider:
+        metadata = {"records": records}
+        track_observation_index = SimpleNamespace(
+            by_image={
+                image_id: SimpleNamespace(track_ids=np.asarray(track_ids, dtype=np.int64))
+                for image_id, track_ids in tracks_by_image.items()
+            }
+        )
+
+        def get_sfm_pair(self, query_id, reference_id):
+            common = sorted(set(tracks_by_image[query_id]).intersection(tracks_by_image[reference_id]))
+            count = len(common)
+            return replace(
+                _full_joint_set(),
+                pair_query_ids=np.asarray([query_id], dtype=object),
+                pair_candidate_ids=np.asarray([reference_id], dtype=object),
+                landmark_sample_pair_indices=np.zeros((count,), dtype=np.int64),
+                landmark_query_xy=np.tile(np.asarray([[4.0, 4.0]]), (count, 1)),
+                landmark_reference_xy=np.tile(np.asarray([[4.0, 4.0]]), (count, 1)),
+                landmark_track_ids=np.asarray(common, dtype=np.int64),
+                landmark_track_xyz=np.zeros((count, 3), dtype=np.float64),
+                landmark_support_view_counts=np.full((count,), 3, dtype=np.int64),
+            )
+
+        def landmark_retrieval_audit(self):
+            return {"supervision_source": "sfm_common_track_observations", "unique_track_count": 2}
+
+    provider = train_real_radio_joint_localization.RealRadioMultiViewEpisodeProvider(
+        BaseProvider(),
+        support_pairs=3,
+        min_support_pairs=2,
+        seed=5,
+        support_selection="sfm_track_episode",
+        episodes_per_query=1,
+        allowed_support_image_ids={"r0", "r1", "r2"},
+    )
+    episode = provider.get(0)
+    audit = provider.landmark_retrieval_audit()
+
+    support_count = int(episode.query_feature_maps.shape[0])
+    assert 2 <= support_count <= 3
+    assert np.count_nonzero(episode.landmark_track_ids == 7) == support_count
+    assert audit["episode_target_track_count"] == 1
+    assert audit["episode_target_track_support_count_mean"] == pytest.approx(float(support_count))
+
+
+def test_frozen_landmark_bank_contract_rejects_stale_support_split(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "joint.pt"
+    checkpoint.write_text("checkpoint")
+    support = tmp_path / "support.jsonl"
+    support.write_text("support\n")
+    from feature_extract.vfm.artifacts import file_sha256_short
+
+    bank = tmp_path / "bank.npz"
+    metadata = {
+        "descriptor_space_id": "space",
+        "descriptor_space_manifest": {"version": 2, "projection_source": "projected_observation_full_map"},
+        "track_observations_sha256": file_sha256_short(support),
+        "matcha_joint_checkpoint_sha256": file_sha256_short(checkpoint),
+        "source_image_count": 3,
+    }
+    np.savez(
+        bank,
+        track_ids=np.asarray([1], dtype=np.int64),
+        features=np.ones((1, 4), dtype=np.float32),
+        metadata_json=np.asarray(json.dumps(metadata)),
+    )
+
+    audit = train_real_radio_joint_localization.validate_frozen_landmark_bank_contract(
+        bank,
+        warm_start_checkpoint=checkpoint,
+        support_observations=support,
+        expected_source_image_count=3,
+    )
+    stale_support = tmp_path / "stale.jsonl"
+    stale_support.write_text("different\n")
+
+    assert audit["validated"] is True
+    with pytest.raises(ValueError, match="support-observation mismatch"):
+        train_real_radio_joint_localization.validate_frozen_landmark_bank_contract(
+            bank,
+            warm_start_checkpoint=checkpoint,
+            support_observations=stale_support,
+            expected_source_image_count=3,
+        )
 
 
 def test_validate_joint_localization_training_set_rejects_row_only_samples() -> None:

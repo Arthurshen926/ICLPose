@@ -86,6 +86,7 @@ def test_joint_feature_mapper_exposes_coarse_and_measurement_context_separately(
     raw = np.concatenate([fine, coarse], axis=1)[0]
 
     output = mapper.project(raw)
+    batch_output = mapper.project_batch(np.stack([raw, raw], axis=0))
     with torch.no_grad():
         coarse_desc, fine_desc, _heat = model.forward_fuse_feature(torch.as_tensor(raw[None], dtype=torch.float32))
 
@@ -95,6 +96,9 @@ def test_joint_feature_mapper_exposes_coarse_and_measurement_context_separately(
     assert output.offset_logits.shape == (65, 2, 2)
     assert output.heatmap is not None
     assert output.heatmap.shape == (2, 2)
+    assert len(batch_output) == 2
+    np.testing.assert_allclose(batch_output[0].coarse_descriptors, output.coarse_descriptors, atol=1e-6)
+    np.testing.assert_allclose(batch_output[1].measurement_context, output.measurement_context, atol=1e-6)
 
 
 def test_matcha_coarse_matcher_returns_reference_proposals_without_fine_measurement() -> None:

@@ -170,11 +170,13 @@ def source_breakdown_stats(
                 [match for match, keep in zip(matches, mask) if bool(keep)],
                 int(camera.width),
                 int(camera.height),
+                pose_w2c=pose_w2c,
             ),
             "pnp_inlier_spatial": match_spatial_distribution_stats(
                 [match for match, keep in zip(matches, inliers) if bool(keep)],
                 int(camera.width),
                 int(camera.height),
+                pose_w2c=pose_w2c,
             ),
         }
     duplicate_sources = [int(match.track_id) for match in matches if int(match.track_id) < 0]

@@ -149,7 +149,13 @@ def score_pose_hypothesis(
     normalized_residual = residuals[inliers] / np.maximum(sigmas[inliers], 1e-6)
     weighted_residual = float(np.mean(normalized_residual))
     confidence_mean = float(np.mean(confidences[inliers]))
-    spatial = match_spatial_distribution_stats(values, int(camera.width), int(camera.height), inliers)
+    spatial = match_spatial_distribution_stats(
+        values,
+        int(camera.width),
+        int(camera.height),
+        inliers,
+        pose_w2c=pose_w2c,
+    )
     coverage = float(spatial.get("grid_4x4_occupancy_frac") or 0.0)
     line_ratio = float(spatial.get("xyz_linearity_ratio") or 0.0)
     xy_ratio = float(spatial.get("xy_pca_minor_major_ratio") or 0.0)

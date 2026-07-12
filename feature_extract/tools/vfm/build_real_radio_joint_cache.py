@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import time
 from collections import Counter, OrderedDict
@@ -28,6 +29,15 @@ from feature_extract.vfm.matcha_joint_training import (
 
 
 REFERENCED_MANIFEST_FORMAT = "vfm_real_radio_joint_referenced_manifest_v1"
+TRACK_OBSERVATION_INDEX_FORMAT = "sfm_track_observation_index_v1"
+
+
+def _file_sha256_short(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(4 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()[:16]
 
 
 def _read_csv(path: Path) -> list[dict[str, str]]:
@@ -140,7 +150,95 @@ def _empty_landmark_retrieval_supervision() -> dict[str, np.ndarray]:
     }
 
 
-def load_track_observation_index(path: Path) -> SfMTrackObservationIndex:
+def _save_track_observation_index_npz(
+    index: SfMTrackObservationIndex,
+    path: Path,
+    *,
+    source_jsonl: Path,
+) -> None:
+    image_ids = sorted(index.by_image)
+    offsets = np.zeros((len(image_ids) + 1,), dtype=np.int64)
+    for image_index, image_id in enumerate(image_ids):
+        offsets[image_index + 1] = offsets[image_index] + int(index.by_image[image_id].track_ids.size)
+    track_ids = np.concatenate([index.by_image[image_id].track_ids for image_id in image_ids], axis=0)
+    xy = np.concatenate([index.by_image[image_id].xy for image_id in image_ids], axis=0)
+    image_sizes = np.concatenate([index.by_image[image_id].image_sizes for image_id in image_ids], axis=0)
+    xyz = np.concatenate([index.by_image[image_id].xyz for image_id in image_ids], axis=0)
+    track_lengths = np.concatenate([index.by_image[image_id].track_lengths for image_id in image_ids], axis=0)
+    unique_track_ids = np.asarray(sorted(index.track_xyz_by_id), dtype=np.int64)
+    unique_track_xyz = np.stack([index.track_xyz_by_id[int(track_id)] for track_id in unique_track_ids], axis=0)
+    source = Path(source_jsonl)
+    metadata = {
+        "format": TRACK_OBSERVATION_INDEX_FORMAT,
+        "source_path": str(source),
+        "source_size": int(source.stat().st_size),
+        "source_sha256": _file_sha256_short(source),
+        "image_count": int(len(image_ids)),
+        "observation_count": int(track_ids.size),
+        "track_count": int(unique_track_ids.size),
+    }
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_suffix(output.suffix + ".tmp.npz")
+    np.savez(
+        temporary,
+        metadata_json=np.asarray(json.dumps(metadata, sort_keys=True)),
+        image_ids=np.asarray(image_ids, dtype=np.str_),
+        offsets=offsets,
+        track_ids=track_ids,
+        xy=xy,
+        image_sizes=image_sizes,
+        xyz=xyz,
+        track_lengths=track_lengths,
+        unique_track_ids=unique_track_ids,
+        unique_track_xyz=unique_track_xyz,
+    )
+    temporary.replace(output)
+
+
+def _load_track_observation_index_npz(path: Path, *, source_jsonl: Path) -> SfMTrackObservationIndex:
+    with np.load(Path(path), allow_pickle=False) as data:
+        metadata = json.loads(str(data["metadata_json"].item()))
+        if str(metadata.get("format", "")) != TRACK_OBSERVATION_INDEX_FORMAT:
+            raise ValueError(f"unsupported track observation index cache: {path}")
+        source = Path(source_jsonl)
+        expected_size = int(source.stat().st_size)
+        expected_sha = _file_sha256_short(source)
+        if int(metadata.get("source_size", -1)) != expected_size or str(metadata.get("source_sha256", "")) != expected_sha:
+            raise ValueError(f"stale track observation index cache for {source}: {path}")
+        image_ids = np.asarray(data["image_ids"], dtype=str)
+        offsets = np.asarray(data["offsets"], dtype=np.int64)
+        track_ids = np.asarray(data["track_ids"], dtype=np.int64)
+        xy = np.asarray(data["xy"], dtype=np.float64)
+        image_sizes = np.asarray(data["image_sizes"], dtype=np.int64)
+        xyz = np.asarray(data["xyz"], dtype=np.float64)
+        track_lengths = np.asarray(data["track_lengths"], dtype=np.int64)
+        unique_track_ids = np.asarray(data["unique_track_ids"], dtype=np.int64)
+        unique_track_xyz = np.asarray(data["unique_track_xyz"], dtype=np.float64)
+    by_image = {
+        str(image_id): SfMImageTrackObservations(
+            track_ids=track_ids[int(offsets[index]) : int(offsets[index + 1])],
+            xy=xy[int(offsets[index]) : int(offsets[index + 1])],
+            image_sizes=image_sizes[int(offsets[index]) : int(offsets[index + 1])],
+            xyz=xyz[int(offsets[index]) : int(offsets[index + 1])],
+            track_lengths=track_lengths[int(offsets[index]) : int(offsets[index + 1])],
+        )
+        for index, image_id in enumerate(image_ids.tolist())
+    }
+    track_xyz_by_id = {
+        int(track_id): unique_track_xyz[index]
+        for index, track_id in enumerate(unique_track_ids.tolist())
+    }
+    return SfMTrackObservationIndex(by_image=by_image, track_xyz_by_id=track_xyz_by_id)
+
+
+def load_track_observation_index(
+    path: Path,
+    *,
+    cache_path: Path | None = None,
+) -> SfMTrackObservationIndex:
+    if cache_path is not None and Path(cache_path).exists():
+        return _load_track_observation_index_npz(Path(cache_path), source_jsonl=Path(path))
     grouped: dict[str, dict[int, tuple[int, np.ndarray, np.ndarray, np.ndarray, int, float]]] = {}
     xyz_lookup: dict[int, np.ndarray] = {}
     with Path(path).open() as handle:
@@ -179,7 +277,10 @@ def load_track_observation_index(path: Path) -> SfMTrackObservationIndex:
         )
     if not by_image or not xyz_lookup:
         raise ValueError(f"track observation file contains no finite observations: {path}")
-    return SfMTrackObservationIndex(by_image=by_image, track_xyz_by_id=xyz_lookup)
+    index = SfMTrackObservationIndex(by_image=by_image, track_xyz_by_id=xyz_lookup)
+    if cache_path is not None:
+        _save_track_observation_index_npz(index, Path(cache_path), source_jsonl=Path(path))
+    return index
 
 
 def load_track_xyz_lookup(path: Path) -> dict[int, np.ndarray]:
@@ -797,6 +898,75 @@ class RealRadioReferencedJointSampleProvider:
             positive_reprojection_error_px=self.positive_reprojection_error_px,
             require_same_track=self.require_same_track,
             include_dustbin_rows=self.include_dustbin_rows,
+            track_xyz_by_id=self.track_xyz_by_id,
+            track_observation_index=self.track_observation_index,
+        )
+        return joint
+
+    def get_sfm_pair(self, query_id: str, reference_id: str) -> MatchaJointTrainingSet:
+        """Materialize an arbitrary real pair directly from SfM common tracks."""
+
+        if self.track_observation_index is None:
+            raise ValueError("get_sfm_pair requires a full SfM track observation index")
+        query_rgb = self._rgb(str(query_id))
+        reference_rgb = self._rgb(str(reference_id))
+        retrieval = self.track_observation_index.common_tracks(
+            str(query_id),
+            str(reference_id),
+            query_source_size=(int(query_rgb.shape[1]), int(query_rgb.shape[0])),
+            reference_source_size=(int(reference_rgb.shape[1]), int(reference_rgb.shape[0])),
+        )
+        track_ids = np.asarray(retrieval["track_ids"], dtype=np.int64).reshape(-1)
+        if track_ids.size == 0:
+            raise ValueError(f"SfM pair {query_id!r}/{reference_id!r} has no common tracks")
+        query_xy = np.asarray(retrieval["query_xy"], dtype=np.float64).reshape(-1, 2)
+        reference_xy = np.asarray(retrieval["reference_xy"], dtype=np.float64).reshape(-1, 2)
+        support_counts = np.asarray(retrieval["support_view_counts"], dtype=np.int64).reshape(-1)
+        rows = [
+            {
+                "query_gt_x": float(query_xy[row, 0]),
+                "query_gt_y": float(query_xy[row, 1]),
+                "reference_gt_x": float(reference_xy[row, 0]),
+                "reference_gt_y": float(reference_xy[row, 1]),
+                "track_id": int(track_ids[row]),
+                "support_track_id": int(track_ids[row]),
+                "track_length": int(support_counts[row]),
+                "query_reprojection_error": 0.0,
+                "support_reprojection_error": 0.0,
+                "target_is_dustbin": False,
+            }
+            for row in range(int(track_ids.size))
+        ]
+        query_feature = self._feature(
+            _path_for_feature(
+                "",
+                image_id=str(query_id),
+                feature_root=self.feature_root,
+                feature_path_template=self.feature_path_template,
+            )
+        )
+        reference_feature = self._feature(
+            _path_for_feature(
+                "",
+                image_id=str(reference_id),
+                feature_root=self.feature_root,
+                feature_path_template=self.feature_path_template,
+            )
+        )
+        joint, _skip_counts = _build_joint_set_for_real_pair(
+            rows=rows,
+            query_id=str(query_id),
+            reference_id=str(reference_id),
+            query_feature=query_feature,
+            reference_feature=reference_feature,
+            query_rgb=query_rgb,
+            reference_rgb=reference_rgb,
+            split_name=str(self.split_name),
+            hard_negatives_per_match=int(self.hard_negatives_per_match),
+            roundtrip_heatmap_threshold_px=float(self.roundtrip_heatmap_threshold_px),
+            positive_reprojection_error_px=float(self.positive_reprojection_error_px),
+            require_same_track=True,
+            include_dustbin_rows=False,
             track_xyz_by_id=self.track_xyz_by_id,
             track_observation_index=self.track_observation_index,
         )

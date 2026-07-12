@@ -14,7 +14,10 @@ from feature_extract.tools.vfm.eval_real_radio_landmark_hybrid import (
     resolve_runtime_device,
     validate_projected_cache_metadata,
 )
-from feature_extract.vfm.localization.descriptor_space import descriptor_space_manifest
+from feature_extract.vfm.localization.descriptor_space import (
+    TRACK_IMAGE_OBSERVATION_SELECTION_V1,
+    descriptor_space_manifest,
+)
 
 
 def _full_map_descriptor_space_metadata(
@@ -26,6 +29,27 @@ def _full_map_descriptor_space_metadata(
     source_image_hash: str = "images123",
 ) -> dict[str, object]:
     aggregation = {"method": aggregation_method, "l2_normalize_observations": False}
+    prototype_builder = {
+        "version": "track_prototype_builder_v2",
+        "aggregation": aggregation,
+        "normalize_final_prototypes": True,
+    }
+    source_config = {
+        "radio_model": "C-RADIO",
+        "radio_model_version": "c-radio_v4-h",
+        "radio_intermediate_layer_index": None,
+        "preprocessing": {
+            "implementation": "feature_extract.tools.vfm.extract_tokens.RadioTokenExtractor.v1",
+            "color_space": "RGB",
+            "input_dtype": "float32",
+            "input_range": "0_1",
+            "resize_policy": "radio_nearest_supported_resolution",
+            "resize_mode": "bilinear",
+            "resize_align_corners": False,
+        },
+        "feature_grid_stride": 16,
+        "input_channels": 1280,
+    }
     space = descriptor_space_manifest(
         checkpoint_sha256=checkpoint,
         mapper_mode="joint_full_map",
@@ -37,6 +61,14 @@ def _full_map_descriptor_space_metadata(
         sfm_track_hash=tracks,
         descriptor_dimension=feature_dim,
         normalization_mode="row_l2_normalized_search",
+        radio_model=str(source_config["radio_model"]),
+        radio_model_version=str(source_config["radio_model_version"]),
+        radio_intermediate_layer_index=source_config["radio_intermediate_layer_index"],
+        preprocessing=dict(source_config["preprocessing"]),
+        feature_grid_stride=int(source_config["feature_grid_stride"]),
+        input_channels=int(source_config["input_channels"]),
+        prototype_builder_config=prototype_builder,
+        observation_selection=TRACK_IMAGE_OBSERVATION_SELECTION_V1,
     )
     return {
         "projection_mode": "full_map_projected_observations",
@@ -47,7 +79,12 @@ def _full_map_descriptor_space_metadata(
         "mapper_class": "JointFeatureMapper",
         "mapper_config_hash": checkpoint,
         "aggregation": aggregation,
+        "prototype_builder": prototype_builder,
+        "observation_selection": dict(TRACK_IMAGE_OBSERVATION_SELECTION_V1),
         "source_image_list_hash": source_image_hash,
+        "descriptor_source_config": source_config,
+        "descriptor_source_config_audit": {"resolution": "test"},
+        "sample_mode": "bilinear",
         "descriptor_dimension": feature_dim,
         "normalization_mode": "row_l2_normalized_search",
         "descriptor_space_manifest": space,
@@ -222,6 +259,21 @@ def test_projected_cache_metadata_validation_requires_source_image_hash() -> Non
         validate_projected_cache_metadata(metadata, expected)
 
 
+def test_projected_cache_metadata_validation_requires_observation_selection() -> None:
+    expected = {
+        "projection_mode": "full_map_projected_observations",
+        "feature_key": "radio_final",
+        "matcha_joint_checkpoint_sha256": "abc123",
+        "track_observations_sha256": "tracks123",
+        "feature_dim": 128,
+    }
+    metadata = _full_map_descriptor_space_metadata()
+    metadata.pop("observation_selection")
+
+    with pytest.raises(ValueError, match="observation_selection"):
+        validate_projected_cache_metadata(metadata, expected)
+
+
 def test_projected_cache_metadata_validation_requires_descriptor_space_manifest() -> None:
     expected = {
         "projection_mode": "full_map_projected_observations",
@@ -249,6 +301,41 @@ def test_projected_cache_metadata_validation_rejects_descriptor_space_mismatch()
     metadata["descriptor_space_id"] = "stale"
 
     with pytest.raises(ValueError, match="descriptor_space_id"):
+        validate_projected_cache_metadata(metadata, expected)
+
+
+def test_projected_cache_metadata_validation_rejects_v1_manifest() -> None:
+    expected = {
+        "projection_mode": "full_map_projected_observations",
+        "feature_key": "radio_final",
+        "matcha_joint_checkpoint_sha256": "abc123",
+        "track_observations_sha256": "tracks123",
+        "feature_dim": 128,
+    }
+    metadata = _full_map_descriptor_space_metadata()
+    manifest = dict(metadata["descriptor_space_manifest"])
+    manifest["version"] = 1
+    metadata["descriptor_space_manifest"] = manifest
+
+    with pytest.raises(ValueError, match="version"):
+        validate_projected_cache_metadata(metadata, expected)
+
+
+def test_projected_cache_metadata_validation_rejects_query_source_mismatch() -> None:
+    metadata = _full_map_descriptor_space_metadata()
+    expected = {
+        "projection_mode": "full_map_projected_observations",
+        "feature_key": "radio_final",
+        "matcha_joint_checkpoint_sha256": "abc123",
+        "track_observations_sha256": "tracks123",
+        "feature_dim": 128,
+        "descriptor_source_config": {
+            **dict(metadata["descriptor_source_config"]),
+            "radio_model_version": "different-radio",
+        },
+    }
+
+    with pytest.raises(ValueError, match="descriptor_source_config"):
         validate_projected_cache_metadata(metadata, expected)
 
 

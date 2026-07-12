@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+from dataclasses import fields, replace
 from pathlib import Path
 from typing import Sequence
 
@@ -15,6 +16,7 @@ from feature_extract.tools.vfm.eval_real_radio_landmark_hybrid import (
     projected_cache_expected_metadata,
     validate_projected_cache_metadata,
 )
+from feature_extract.vfm.localization.descriptor_space import token_feature_source_config
 from feature_extract.vfm.localization.feature_mapper import JointFeatureMapper
 from feature_extract.vfm.localization.landmark_hybrid import (
     load_landmark_index_npz,
@@ -23,7 +25,7 @@ from feature_extract.vfm.localization.landmark_hybrid import (
 )
 from feature_extract.vfm.localization.landmark_recall_oracle import (
     LandmarkRecallRecord,
-    rank_correct_landmark,
+    rank_correct_landmarks_batch,
     summarize_landmark_recall_records,
 )
 from feature_extract.vfm.localization.pipeline import _load_feature_map
@@ -38,6 +40,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--query_manifest", required=True)
     parser.add_argument("--track_observations_jsonl", required=True)
+    parser.add_argument(
+        "--bank_track_observations_jsonl",
+        default="",
+        help="Support observations used to build the bank; defaults to track_observations_jsonl.",
+    )
     parser.add_argument("--projected_landmark_cache", default="")
     parser.add_argument("--landmark_bank", default="")
     parser.add_argument("--matcha_joint_checkpoint", required=True)
@@ -59,6 +66,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--top_ks", default="1,5,10,20,50,100")
     parser.add_argument("--max_queries", type=int, default=0)
     parser.add_argument("--max_observations_per_query", type=int, default=0)
+    parser.add_argument("--observation_sampling", default="uniform", choices=("uniform", "first"))
+    parser.add_argument("--rank_batch_size", type=int, default=64)
     parser.add_argument("--device", default="cuda")
     return parser.parse_args(argv)
 
@@ -91,15 +100,7 @@ def _track_stats(observations) -> tuple[dict[int, np.ndarray], dict[int, float]]
 
 def _write_csv(path: Path, records: Sequence[LandmarkRecallRecord]) -> None:
     rows = [record.to_dict() for record in records]
-    fieldnames = [
-        "query_id",
-        "correct_track_id",
-        "correct_rank",
-        "correct_score",
-        "rank1_track_id",
-        "rank1_score",
-        "score_gap_to_rank1",
-    ]
+    fieldnames = [field.name for field in fields(LandmarkRecallRecord)]
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -140,10 +141,16 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     manifest = TokenBankManifest.from_json(Path(args.query_manifest))
     manifest.validate(verify_checksums=False)
+    descriptor_source_config = token_feature_source_config(manifest, str(args.feature_key))
     records = list(manifest.records)
     if int(args.max_queries) > 0:
         records = records[: int(args.max_queries)]
-    observations = load_colmap_track_observations_jsonl(Path(args.track_observations_jsonl))
+    query_ids = {str(record.image_id) for record in records}
+    observations = load_colmap_track_observations_jsonl(
+        Path(args.track_observations_jsonl),
+        image_ids=query_ids,
+    )
+    bank_track_observations = Path(args.bank_track_observations_jsonl or args.track_observations_jsonl)
     observations_by_query: dict[str, list[object]] = {}
     for observation in observations:
         observations_by_query.setdefault(str(observation.image_id), []).append(observation)
@@ -164,8 +171,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                 projection_mode=expected_modes[str(args.projection_preset)],
                 feature_key=str(args.feature_key),
                 matcha_joint_checkpoint=Path(args.matcha_joint_checkpoint),
-                track_observations=Path(args.track_observations_jsonl),
+                track_observations=bank_track_observations,
                 feature_dim=int(landmark_index.feature_dim),
+                descriptor_source_config=descriptor_source_config,
             ),
         )
     else:
@@ -186,7 +194,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             )
     normalized_landmark_features, valid_landmark_mask = normalize_rows(landmark_index.features)
 
-    recall_records: list[LandmarkRecallRecord] = []
+    query_descriptors: list[np.ndarray] = []
+    ranked_observations: list[object] = []
+    ranked_query_ids: list[str] = []
     query_count_with_observations = 0
     for record in records:
         query_id = str(record.image_id)
@@ -195,22 +205,46 @@ def main(argv: Sequence[str] | None = None) -> None:
             continue
         query_count_with_observations += 1
         if int(args.max_observations_per_query) > 0:
-            query_observations = query_observations[: int(args.max_observations_per_query)]
+            limit = int(args.max_observations_per_query)
+            if len(query_observations) > limit and str(args.observation_sampling) == "uniform":
+                selected_indices = np.linspace(0, len(query_observations) - 1, num=limit, dtype=np.int64)
+                query_observations = [query_observations[int(index)] for index in selected_indices.tolist()]
+            else:
+                query_observations = query_observations[:limit]
         feature_map = _load_feature_map(Path(record.token_path), key=str(args.feature_key))
         mapped = np.asarray(feature_map, dtype=np.float32) if mapper is None else mapper.project(feature_map).coarse_descriptors
         for observation in query_observations:
             descriptor = _sample_observation_descriptor(mapped, observation, sample_mode=str(args.sample_mode))
-            recall_records.append(
-                rank_correct_landmark(
-                    query_descriptor=descriptor,
-                    landmark_features=normalized_landmark_features,
-                    landmark_track_ids=landmark_index.track_ids,
-                    correct_track_id=int(observation.track_id),
-                    query_id=query_id,
-                    landmark_features_are_normalized=True,
-                    valid_landmark_mask=valid_landmark_mask,
-                )
-            )
+            query_descriptors.append(np.asarray(descriptor, dtype=np.float32))
+            ranked_observations.append(observation)
+            ranked_query_ids.append(query_id)
+
+    ranked_records = rank_correct_landmarks_batch(
+        query_descriptors=(
+            np.stack(query_descriptors, axis=0)
+            if query_descriptors
+            else np.zeros((0, int(landmark_index.feature_dim)), dtype=np.float32)
+        ),
+        landmark_features=normalized_landmark_features,
+        landmark_track_ids=landmark_index.track_ids,
+        correct_track_ids=[int(observation.track_id) for observation in ranked_observations],
+        query_ids=ranked_query_ids,
+        landmark_features_are_normalized=True,
+        valid_landmark_mask=valid_landmark_mask,
+        device=device,
+        batch_size=int(args.rank_batch_size),
+    )
+    recall_records = [
+        replace(
+            record,
+            query_x=float(observation.xy[0]),
+            query_y=float(observation.xy[1]),
+            landmark_x=float(observation.xyz[0]),
+            landmark_y=float(observation.xyz[1]),
+            landmark_z=float(observation.xyz[2]),
+        )
+        for record, observation in zip(ranked_records, ranked_observations)
+    ]
 
     rows_csv = output_dir / "landmark_recall_oracle_rows.csv"
     rows_jsonl = output_dir / "landmark_recall_oracle_rows.jsonl"
@@ -220,12 +254,16 @@ def main(argv: Sequence[str] | None = None) -> None:
         "stage": "landmark_recall_oracle",
         "query_manifest": str(args.query_manifest),
         "track_observations_jsonl": str(args.track_observations_jsonl),
+        "bank_track_observations_jsonl": str(bank_track_observations),
         "projected_landmark_cache": str(args.projected_landmark_cache),
         "landmark_bank": str(args.landmark_bank),
         "matcha_joint_checkpoint": str(args.matcha_joint_checkpoint),
         "projection_preset": str(args.projection_preset),
         "feature_key": str(args.feature_key),
         "sample_mode": str(args.sample_mode),
+        "observation_sampling": str(args.observation_sampling),
+        "rank_batch_size": int(args.rank_batch_size),
+        "rank_device": str(device),
         "query_count": int(len(records)),
         "query_count_with_observations": int(query_count_with_observations),
         "landmark_count": int(len(landmark_index)),

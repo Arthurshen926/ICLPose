@@ -7,8 +7,30 @@ import numpy as np
 import torch
 from PIL import Image
 
-from feature_extract.vfm.measurement_v1.rgb_patch_diagnostics import export_rgb_patch_diagnostics
+from feature_extract.vfm.measurement_v1.rgb_patch_diagnostics import (
+    _group_measurement_metrics,
+    export_rgb_patch_diagnostics,
+)
 from feature_extract.vfm.measurement_v1.rgb_patch_measurement_branch import RGBPatchMeasurementBranch
+
+
+def test_group_metrics_skip_rows_with_missing_target_baseline() -> None:
+    metrics = _group_measurement_metrics(
+        [
+            {
+                "row_index": 0,
+                "target_gt_projected_x": "12.0",
+                "target_gt_projected_y": "8.0",
+                "target_gt_projected_residual_px": "",
+            }
+        ],
+        target_x_key="target_gt_projected_x",
+        target_y_key="target_gt_projected_y",
+        baseline_key="target_gt_projected_residual_px",
+        require_non_dustbin=False,
+    )
+
+    assert metrics["policy_group_count"] == 0
 
 
 def _write_csv(path: Path, rows: list[dict[str, object]]) -> None:
@@ -82,6 +104,9 @@ def test_export_rgb_patch_diagnostics_writes_rows_and_visualizations(tmp_path: P
 
     assert summary["row_count"] == 1
     assert summary["support_patch_warp"] == "none"
+    assert summary["metrics_scope"] == "valid_non_dustbin_rows_only"
+    assert summary["metrics"]["count"] == 1
+    assert summary["dustbin_metrics"]["dustbin_count"] == 0
     assert summary["support_patch_source_audit"]["support_patch_source"] == "render_cache_by_query"
     assert "mode_median_px" in summary["metrics"]
     assert (output_dir / "diagnostic_rows.csv").exists()
@@ -92,6 +117,7 @@ def test_export_rgb_patch_diagnostics_writes_rows_and_visualizations(tmp_path: P
         "likelihood_epe_px",
         "mode_epe_px",
         "direct_epe_px",
+        "gated_epe_px",
         "pred_dx",
         "pred_dy",
         "peak_dx",
@@ -100,6 +126,9 @@ def test_export_rgb_patch_diagnostics_writes_rows_and_visualizations(tmp_path: P
         "query_mode_y",
         "query_pred_x",
         "query_pred_y",
+        "query_gated_x",
+        "query_gated_y",
+        "measurement_gate_probability",
         "track_id",
         "support_track_id",
         "target_is_dustbin",
@@ -210,8 +239,44 @@ def test_export_rgb_patch_diagnostics_batching_matches_single_row_mode(tmp_path:
     assert len(single_rows) == len(batched_rows) == 2
     for single, batched in zip(single_rows, batched_rows):
         assert single["track_id"] == batched["track_id"]
-        for key in ("query_pred_x", "query_pred_y", "pred_dx", "pred_dy", "dustbin_probability"):
-            assert np.isclose(float(single[key]), float(batched[key]), atol=1e-6)
+        for key in (
+            "query_pred_x",
+            "query_pred_y",
+            "pred_dx",
+            "pred_dy",
+            "dustbin_probability",
+            "measurement_gate_probability",
+        ):
+            # Grouped convolutions may accumulate channels in a different order
+            # for batch one versus batch many.
+            assert np.isclose(float(single[key]), float(batched[key]), atol=1e-5)
+
+    filtered_source = list(csv.DictReader(rows_csv.open()))
+    filtered_source[0]["target_is_dustbin"] = "True"
+    filtered_rows_csv = tmp_path / "filtered_rows.csv"
+    _write_csv(filtered_rows_csv, filtered_source)
+    export_rgb_patch_diagnostics(
+        rows_csv=filtered_rows_csv,
+        render_cache_manifest_csv=None,
+        image_root=image_root,
+        checkpoint=checkpoint,
+        output_dir=tmp_path / "filtered",
+        image_width=20,
+        image_height=20,
+        query_source="real_pair",
+        visualize_limit=0,
+        batch_size=2,
+        prior_scale_key="requested_residual_px",
+        target_dustbin_filter="valid",
+        device="cpu",
+    )
+    filtered = list(
+        csv.DictReader(
+            (tmp_path / "filtered" / "diagnostic_rows.csv").open()
+        )
+    )
+    assert len(filtered) == 1
+    assert filtered[0]["row_index"] == "1"
 
 
 def test_export_rgb_patch_diagnostics_loads_legacy_checkpoint_without_empty_prior_buffer(tmp_path: Path) -> None:

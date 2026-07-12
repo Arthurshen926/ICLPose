@@ -500,6 +500,32 @@ def _template_search_cost_volume_logits_for_offsets(
     )
     width = int(query_features.shape[3])
     height = int(query_features.shape[2])
+    offset_steps = offsets / feature_step
+    rounded_offset_steps = torch.round(offset_steps)
+    use_grouped_correlation = bool(
+        int(expected_side - template_side + 1) == 2 * search_steps + 1
+        and torch.all(torch.abs(offset_steps - rounded_offset_steps) <= 1e-4).item()
+    )
+    grouped_query = None
+    grouped_query_norm = None
+    gather_x = None
+    gather_y = None
+    gather_batch = None
+    if use_grouped_correlation:
+        channels = int(query_features.shape[1])
+        grouped_query = query_features.float().reshape(1, batch * channels, height, width)
+        norm_kernel = torch.ones(
+            (batch, channels, template_side, template_side),
+            device=query_features.device,
+            dtype=grouped_query.dtype,
+        )
+        grouped_query_norm = torch.sqrt(
+            F.conv2d(grouped_query.square(), norm_kernel, groups=batch).clamp_min(1e-12)
+        ).reshape(batch, 2 * search_steps + 1, 2 * search_steps + 1)
+        integer_steps = rounded_offset_steps.to(dtype=torch.long)
+        gather_x = integer_steps[..., 0] + search_steps
+        gather_y = integer_steps[..., 1] + search_steps
+        gather_batch = torch.arange(batch, device=query_features.device)[:, None].expand_as(gather_x)
     logits_by_scale = []
     for template_scale in scale_values:
         source_side = int(round(float(template_side) * float(template_scale)))
@@ -510,6 +536,23 @@ def _template_search_cost_volume_logits_for_offsets(
         render_template = render_features[:, :, center - half : center + half + 1, center - half : center + half + 1]
         if int(render_template.shape[2]) != template_side or int(render_template.shape[3]) != template_side:
             render_template = F.interpolate(render_template, size=(template_side, template_side), mode="bilinear", align_corners=True)
+        if use_grouped_correlation:
+            if grouped_query is None or grouped_query_norm is None:
+                raise RuntimeError("grouped correlation buffers were not initialized")
+            render_kernel = render_template.float()
+            numerator = F.conv2d(grouped_query, render_kernel, groups=batch).reshape(
+                batch, 2 * search_steps + 1, 2 * search_steps + 1
+            )
+            render_norm = torch.linalg.vector_norm(
+                render_kernel.reshape(batch, -1), dim=1
+            ).clamp_min(1e-12)
+            correlation = numerator / (
+                grouped_query_norm * render_norm[:, None, None]
+            ).clamp_min(1e-12)
+            if gather_batch is None or gather_x is None or gather_y is None:
+                raise RuntimeError("grouped correlation gather indices were not initialized")
+            logits_by_scale.append(correlation[gather_batch, gather_y, gather_x])
+            continue
         render_flat = F.normalize(render_template.reshape(batch, -1), dim=1)
         candidate_logits = []
         for candidate_index in range(int(offsets.shape[1])):

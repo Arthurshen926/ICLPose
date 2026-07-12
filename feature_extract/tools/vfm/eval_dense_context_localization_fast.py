@@ -279,7 +279,13 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             translation = None if pose_error is None or not np.isfinite(pose_error.translation_m) else float(pose_error.translation_m)
             rotation = None if pose_error is None or not np.isfinite(pose_error.rotation_deg) else float(pose_error.rotation_deg)
             patch_stats = evaluate_patch_matches(matches, positives, pose.pose_w2c, camera, stride_px=stride, pnp_inlier_mask=pnp.inlier_mask)
-            spatial = match_spatial_distribution_stats(matches, int(camera.width), int(camera.height), mask=pnp.inlier_mask)
+            spatial = match_spatial_distribution_stats(
+                matches,
+                int(camera.width),
+                int(camera.height),
+                mask=pnp.inlier_mask,
+                pose_w2c=pnp.pose_w2c,
+            )
             residual = pnp_reprojection_residual_stats(matches, pnp.pose_w2c, camera, inlier_mask=pnp.inlier_mask)
             score_row = {
                 "query_id": record.image_id,

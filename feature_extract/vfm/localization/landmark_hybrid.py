@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import time
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Hashable, Mapping, Sequence
@@ -14,7 +15,7 @@ import torch
 
 from feature_extract.vfm.cambridge_pose_lattice import CambridgePoseRecord
 from feature_extract.vfm.colmap_tracks import ColmapCamera, ColmapImageObservation, ColmapTrackObservation
-from feature_extract.vfm.landmark_feature_aggregation import LandmarkAggregationConfig, aggregate_landmark_features
+from feature_extract.vfm.landmark_feature_aggregation import LandmarkAggregationConfig, TrackPrototypeBuilder
 from feature_extract.vfm.localization.pipeline import _load_feature_map, _load_rgb_chw
 from feature_extract.vfm.localization.schemas import CoarseProposal, MeasurementResult
 from feature_extract.vfm.localization.measurement_calibration import GeometryProbabilityModel
@@ -40,8 +41,9 @@ from feature_extract.vfm.localization.pose_eval import (
 from feature_extract.vfm.tokens import TokenBankManifest, TokenBankRecord
 from feature_extract.vfm.track_feature_sampling import (
     _observation_utility,
-    _sample_feature_vector,
+    _sample_feature_vectors,
     _track_view_consistency_weights,
+    deduplicate_track_image_observations,
 )
 
 
@@ -67,10 +69,11 @@ class LandmarkRetrievalConfig:
     query_heatmap_grid_rows: int = 4
     query_heatmap_grid_cols: int = 4
     query_heatmap_min_score: float | None = None
+    query_xy_coordinate_mode: str = "edge_legacy"
 
     def __post_init__(self) -> None:
-        if self.backend not in {"auto", "exact", "faiss"}:
-            raise ValueError("backend must be one of: auto, exact, faiss")
+        if self.backend not in {"auto", "exact", "faiss", "torch_cuda"}:
+            raise ValueError("backend must be one of: auto, exact, faiss, torch_cuda")
         if int(self.top_k) <= 0:
             raise ValueError("top_k must be positive")
         if self.nn_search_k_for_ratio is not None and int(self.nn_search_k_for_ratio) <= 0:
@@ -99,6 +102,8 @@ class LandmarkRetrievalConfig:
             raise ValueError("query_heatmap grid dimensions must be positive")
         if self.query_heatmap_min_score is not None and not 0.0 <= float(self.query_heatmap_min_score) <= 1.0:
             raise ValueError("query_heatmap_min_score must be in [0, 1]")
+        if str(self.query_xy_coordinate_mode) not in {"edge_legacy", "cell_center"}:
+            raise ValueError("query_xy_coordinate_mode must be 'edge_legacy' or 'cell_center'")
 
 
 @dataclass(frozen=True)
@@ -107,6 +112,8 @@ class _PreparedLandmarkSearchIndex:
     landmark_features: np.ndarray
     backend_name: str
     faiss_index: Any | None = None
+    torch_features: torch.Tensor | None = None
+    max_prototypes_per_track: int = 1
 
 
 class LandmarkSearchIndexCache:
@@ -283,6 +290,7 @@ def project_landmark_index_features(
         observation_image_ids=index.observation_image_ids,
         reprojection_errors=index.reprojection_errors,
         feature_ambiguities=index.feature_ambiguities,
+        prototype_ids=index.prototype_ids,
     )
 
 
@@ -316,6 +324,8 @@ def sample_projected_track_observations(
     utility_mode: str = "inverse_reprojection",
     weight_floor: float = 1e-6,
     sample_mode: str = "bilinear",
+    projection_image_batch_size: int = 8,
+    projection_load_workers: int = 4,
 ) -> tuple[list[TrackObservation], dict[str, Any]]:
     """Project each source image as a full map, then sample mapped descriptors at SfM observations."""
 
@@ -325,10 +335,19 @@ def sample_projected_track_observations(
         raise ValueError("sample_mode must be 'nearest' or 'bilinear'")
     if float(weight_floor) <= 0.0:
         raise ValueError("weight_floor must be positive")
+    if int(projection_image_batch_size) <= 0:
+        raise ValueError("projection_image_batch_size must be positive")
+    if int(projection_load_workers) < 0:
+        raise ValueError("projection_load_workers must be non-negative")
 
-    values = list(observations)
+    raw_values = list(observations)
+    values = deduplicate_track_image_observations(raw_values)
     records = _records_by_image_id(token_manifest)
-    view_weights = _track_view_consistency_weights(values, weight_floor=float(weight_floor))
+    view_weights = (
+        _track_view_consistency_weights(values, weight_floor=float(weight_floor))
+        if str(utility_mode) in {"view_consistency", "inverse_reprojection_center_view"}
+        else {}
+    )
     by_image: dict[str, list[ColmapTrackObservation]] = {}
     for observation in values:
         by_image.setdefault(str(observation.image_id), []).append(observation)
@@ -336,51 +355,98 @@ def sample_projected_track_observations(
     sampled: list[TrackObservation] = []
     missing_images: list[str] = []
     projected_image_count = 0
-    for image_id, image_observations in sorted(by_image.items()):
-        record = records.get(str(image_id))
-        if record is None:
-            if str(missing) == "error":
-                raise ValueError(f"token record not found for image {image_id}")
-            missing_images.append(str(image_id))
-            continue
-        raw_map = _load_feature_map(Path(record.token_path), key=str(feature_key))
-        mapped = feature_mapper.project(raw_map).coarse_descriptors
-        projected_map = np.asarray(mapped, dtype=np.float32)
-        if projected_map.ndim != 3:
-            raise ValueError("mapped feature map must have shape (C, H, W)")
-        projected_image_count += 1
-        for observation in image_observations:
-            if observation.image_width is None or observation.image_height is None:
-                if str(missing) == "error":
-                    raise ValueError(f"image dimensions missing for {observation.image_id}")
+    image_items = sorted(by_image.items())
+    loader = ThreadPoolExecutor(max_workers=int(projection_load_workers)) if int(projection_load_workers) > 1 else None
+    try:
+        for batch_start in range(0, len(image_items), int(projection_image_batch_size)):
+            load_specs: list[tuple[str, list[ColmapTrackObservation], Path]] = []
+            for image_id, image_observations in image_items[
+                batch_start : batch_start + int(projection_image_batch_size)
+            ]:
+                record = records.get(str(image_id))
+                if record is None:
+                    if str(missing) == "error":
+                        raise ValueError(f"token record not found for image {image_id}")
+                    missing_images.append(str(image_id))
+                    continue
+                load_specs.append((str(image_id), image_observations, Path(record.token_path)))
+            if not load_specs:
                 continue
-            feature = _sample_feature_vector(
-                projected_map,
-                observation.xy,
-                int(observation.image_width),
-                int(observation.image_height),
-                str(sample_mode),
-            )
-            view_weight = view_weights.get((int(observation.track_id), str(observation.image_id), int(observation.point2d_idx)))
-            sampled.append(
-                TrackObservation(
-                    track_id=int(observation.track_id),
-                    image_id=str(observation.image_id),
-                    feature=feature,
-                    visible=True,
-                    geometry_valid=True,
-                    utility=_observation_utility(
-                        observation,
-                        str(utility_mode),
-                        float(weight_floor),
-                        view_consistency_weight=view_weight,
-                    ),
+            if loader is None:
+                raw_maps = [_load_feature_map(path, key=str(feature_key)) for _image, _obs, path in load_specs]
+            else:
+                raw_maps = list(
+                    loader.map(
+                        lambda path: _load_feature_map(path, key=str(feature_key)),
+                        [path for _image, _obs, path in load_specs],
+                    )
                 )
-            )
+            available = [
+                (image_id, image_observations, raw_map)
+                for (image_id, image_observations, _path), raw_map in zip(load_specs, raw_maps)
+            ]
+            project_batch = getattr(feature_mapper, "project_batch", None)
+            if callable(project_batch) and len({tuple(raw_map.shape) for raw_map in raw_maps}) == 1:
+                mapped_batch = project_batch(np.stack(raw_maps, axis=0))
+                projected_maps = [np.asarray(item.coarse_descriptors, dtype=np.float32) for item in mapped_batch]
+            else:
+                projected_maps = [
+                    np.asarray(feature_mapper.project(raw_map).coarse_descriptors, dtype=np.float32)
+                    for raw_map in raw_maps
+                ]
+            if len(projected_maps) != len(available):
+                raise ValueError("feature mapper returned the wrong number of projected maps")
+            projected_image_count += int(len(projected_maps))
+            for (_image_id, image_observations, _raw_map), projected_map in zip(available, projected_maps):
+                if projected_map.ndim != 3:
+                    raise ValueError("mapped feature map must have shape (C, H, W)")
+                valid_observations = [
+                    observation
+                    for observation in image_observations
+                    if observation.image_width is not None and observation.image_height is not None
+                ]
+                if len(valid_observations) != len(image_observations) and str(missing) == "error":
+                    missing_observation = next(
+                        observation
+                        for observation in image_observations
+                        if observation.image_width is None or observation.image_height is None
+                    )
+                    raise ValueError(f"image dimensions missing for {missing_observation.image_id}")
+                features = _sample_feature_vectors(
+                    projected_map,
+                    np.asarray([observation.xy for observation in valid_observations], dtype=np.float64),
+                    np.asarray([observation.image_width for observation in valid_observations], dtype=np.int64),
+                    np.asarray([observation.image_height for observation in valid_observations], dtype=np.int64),
+                    str(sample_mode),
+                )
+                for observation, feature in zip(valid_observations, features):
+                    view_weight = view_weights.get(
+                        (int(observation.track_id), str(observation.image_id), int(observation.point2d_idx))
+                    )
+                    sampled.append(
+                        TrackObservation(
+                            track_id=int(observation.track_id),
+                            image_id=str(observation.image_id),
+                            feature=feature,
+                            visible=True,
+                            geometry_valid=True,
+                            utility=_observation_utility(
+                                observation,
+                                str(utility_mode),
+                                float(weight_floor),
+                                view_consistency_weight=view_weight,
+                            ),
+                        )
+                    )
+    finally:
+        if loader is not None:
+            loader.shutdown(wait=True)
 
     metadata = {
         "projection_mode": "full_map_projected_observations",
-        "input_observation_count": int(len(values)),
+        "input_observation_count": int(len(raw_values)),
+        "effective_observation_count": int(len(values)),
+        "duplicate_track_image_observation_count": int(len(raw_values) - len(values)),
         "sampled_observation_count": int(len(sampled)),
         "projected_image_count": int(projected_image_count),
         "missing_image_count": int(len(missing_images)),
@@ -388,6 +454,8 @@ def sample_projected_track_observations(
         "feature_key": str(feature_key),
         "sample_mode": str(sample_mode),
         "utility_mode": str(utility_mode),
+        "projection_image_batch_size": int(projection_image_batch_size),
+        "projection_load_workers": int(projection_load_workers),
     }
     return sampled, metadata
 
@@ -409,6 +477,8 @@ def build_projected_observation_landmark_index(
     view_consistent_keep: int = 4,
     geometric_median_iterations: int = 32,
     l2_normalize_observations: bool = False,
+    projection_image_batch_size: int = 8,
+    projection_load_workers: int = 4,
 ) -> tuple[LandmarkMapIndex, dict[str, Any]]:
     """Build a 3D landmark index by aggregating per-observation full-map projected descriptors."""
 
@@ -421,6 +491,8 @@ def build_projected_observation_landmark_index(
         utility_mode=str(utility_mode),
         weight_floor=float(weight_floor),
         sample_mode=str(sample_mode),
+        projection_image_batch_size=int(projection_image_batch_size),
+        projection_load_workers=int(projection_load_workers),
     )
     aggregation = LandmarkAggregationConfig(
         method=str(aggregation_method),
@@ -432,12 +504,19 @@ def build_projected_observation_landmark_index(
         l2_normalize_observations=bool(l2_normalize_observations),
         weight_floor=float(weight_floor),
     )
-    bank = aggregate_landmark_features(sampled, aggregation)
+    prototype_builder = TrackPrototypeBuilder(
+        aggregation=aggregation,
+        normalize_final_prototypes=True,
+    )
+    aggregation_device = str(getattr(feature_mapper, "device", "cpu"))
+    bank = prototype_builder.build_bank_torch(sampled, device=aggregation_device)
     xyz_by_track, reprojection_error_by_track = _track_xyz_and_reprojection_stats(list(observations))
     index = LandmarkMapIndex.from_track_bank(bank, xyz_by_track, reprojection_error_by_track)
     metadata = {
         **sampling_metadata,
         "aggregation": aggregation.to_dict(),
+        "prototype_builder": prototype_builder.to_dict(),
+        "aggregation_device": aggregation_device,
         "landmark_count": int(len(index)),
         "feature_dim": int(index.feature_dim),
     }
@@ -456,7 +535,7 @@ def save_landmark_index_npz(
     output.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "format": "landmark_map_index_npz",
-        "format_version": 1,
+        "format_version": 2,
         **dict(metadata or {}),
     }
     np.savez(
@@ -468,6 +547,7 @@ def save_landmark_index_npz(
         observation_counts=np.asarray(index.observation_counts, dtype=np.int64),
         reprojection_errors=np.asarray(index.reprojection_errors, dtype=np.float32),
         feature_ambiguities=np.asarray(index.feature_ambiguities, dtype=np.float32),
+        prototype_ids=np.asarray(index.prototype_ids, dtype=np.int64),
         observation_image_ids_json=np.asarray(json.dumps(index.observation_image_ids), dtype=np.str_),
         metadata_json=np.asarray(json.dumps(payload, sort_keys=True), dtype=np.str_),
     )
@@ -488,6 +568,11 @@ def load_landmark_index_npz(path: Path) -> tuple[LandmarkMapIndex, dict[str, Any
             observation_image_ids=observation_image_ids,
             reprojection_errors=np.asarray(data["reprojection_errors"], dtype=np.float32),
             feature_ambiguities=np.asarray(data["feature_ambiguities"], dtype=np.float32),
+            prototype_ids=(
+                np.asarray(data["prototype_ids"], dtype=np.int64)
+                if "prototype_ids" in data
+                else np.zeros_like(np.asarray(data["track_ids"], dtype=np.int64))
+            ),
         )
     return index, dict(metadata)
 
@@ -528,6 +613,7 @@ def _flatten_query_feature_map(
     image_width: int,
     image_height: int,
     step: int,
+    coordinate_mode: str,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     values = np.asarray(feature_map, dtype=np.float32)
     if values.ndim != 3:
@@ -545,7 +631,14 @@ def _flatten_query_feature_map(
             np.zeros((0, 2), dtype=np.float64),
             np.zeros((0,), dtype=np.int64),
         )
-    xy = token_grid_xy(token_width, token_height, image_width, image_height, step=int(step))
+    xy = token_grid_xy(
+        token_width,
+        token_height,
+        image_width,
+        image_height,
+        step=int(step),
+        coordinate_mode="edge" if str(coordinate_mode) == "edge_legacy" else "center",
+    )
     return np.stack(rows, axis=0).astype(np.float32, copy=False), xy, np.asarray(token_indices, dtype=np.int64)
 
 
@@ -659,11 +752,13 @@ def select_query_tokens_for_landmark_retrieval(
             image_width=int(image_width),
             image_height=int(image_height),
             step=int(config.query_token_step),
+            coordinate_mode=str(config.query_xy_coordinate_mode),
         )
         return features, xy, token_indices, {
             "query_token_selection": "uniform",
             "query_token_step": int(config.query_token_step),
             "selected_query_token_count": int(token_indices.size),
+            "query_xy_coordinate_mode": str(config.query_xy_coordinate_mode),
         }
     if query_heatmap is None:
         raise ValueError("query_heatmap is required when query_token_selection='heatmap'")
@@ -680,8 +775,16 @@ def select_query_tokens_for_landmark_retrieval(
     )
     flat = values.reshape(channels, token_height * token_width).T
     features = flat[selected].astype(np.float32, copy=False) if selected.size else np.zeros((0, channels), dtype=np.float32)
-    all_xy = token_grid_xy(token_width, token_height, int(image_width), int(image_height), step=1)
+    all_xy = token_grid_xy(
+        token_width,
+        token_height,
+        int(image_width),
+        int(image_height),
+        step=1,
+        coordinate_mode="edge" if str(config.query_xy_coordinate_mode) == "edge_legacy" else "center",
+    )
     xy = all_xy[selected].astype(np.float64, copy=False) if selected.size else np.zeros((0, 2), dtype=np.float64)
+    metadata["query_xy_coordinate_mode"] = str(config.query_xy_coordinate_mode)
     return features, xy, selected, metadata
 
 
@@ -738,6 +841,8 @@ def _faiss_topk(
 def _retrieval_backend_available(backend: str) -> bool:
     if backend == "exact":
         return True
+    if backend == "torch_cuda":
+        return bool(torch.cuda.is_available())
     if backend != "faiss":
         return False
     try:
@@ -764,6 +869,11 @@ def _prepare_landmark_search_index(
         index = index.subset(valid_landmarks)
         landmark_features = landmark_features[valid_landmarks]
     backend = _resolved_retrieval_backend(config)
+    if len(index) > 0:
+        _track_ids, prototype_counts = np.unique(index.track_ids, return_counts=True)
+        max_prototypes_per_track = int(np.max(prototype_counts))
+    else:
+        max_prototypes_per_track = 1
     if backend == "faiss":
         try:
             import faiss  # type: ignore
@@ -777,12 +887,27 @@ def _prepare_landmark_search_index(
             landmark_features=landmark_features,
             backend_name="faiss_flat_ip",
             faiss_index=faiss_index,
+            torch_features=None,
+            max_prototypes_per_track=max_prototypes_per_track,
+        )
+    if backend == "torch_cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("torch_cuda landmark search requires CUDA")
+        return _PreparedLandmarkSearchIndex(
+            index=index,
+            landmark_features=landmark_features,
+            backend_name="torch_cuda_exact_ip",
+            faiss_index=None,
+            torch_features=torch.as_tensor(landmark_features, dtype=torch.float32, device="cuda"),
+            max_prototypes_per_track=max_prototypes_per_track,
         )
     return _PreparedLandmarkSearchIndex(
         index=index,
         landmark_features=landmark_features,
         backend_name="exact",
         faiss_index=None,
+        torch_features=None,
+        max_prototypes_per_track=max_prototypes_per_track,
     )
 
 
@@ -799,6 +924,17 @@ def _prepared_topk(
             int(top_k),
         )
         return indices.astype(np.int64, copy=False), scores.astype(np.float32, copy=False)
+    if prepared.torch_features is not None:
+        query = torch.as_tensor(query_features, dtype=torch.float32, device=prepared.torch_features.device)
+        output_indices: list[np.ndarray] = []
+        output_scores: list[np.ndarray] = []
+        with torch.no_grad():
+            for start in range(0, int(query.shape[0]), max(1, int(block_size))):
+                scores = query[start : start + int(block_size)] @ prepared.torch_features.T
+                top_scores, top_indices = torch.topk(scores, k=int(top_k), dim=1, largest=True, sorted=True)
+                output_indices.append(top_indices.cpu().numpy().astype(np.int64, copy=False))
+                output_scores.append(top_scores.cpu().numpy().astype(np.float32, copy=False))
+        return np.concatenate(output_indices, axis=0), np.concatenate(output_scores, axis=0)
     return _exact_topk(
         query_features,
         prepared.landmark_features,
@@ -862,12 +998,13 @@ def match_query_tokens_to_landmarks_ann(
         heatmap_flat = np.asarray(query_heatmap, dtype=np.float32).reshape(-1)
         heatmap_values = heatmap_flat[token_indices]
     ratio_k = int(config.nn_search_k_for_ratio or config.top_k)
+    unique_search_top_k = max(
+        int(ratio_k),
+        int(config.proposal_top_l),
+        2 if config.ratio_threshold is not None else 1,
+    )
     search_top_k = min(
-        max(
-            int(ratio_k),
-            int(config.proposal_top_l),
-            2 if config.ratio_threshold is not None else 1,
-        ),
+        int(unique_search_top_k) * int(prepared.max_prototypes_per_track),
         len(index),
     )
     top_indices, top_scores = _prepared_topk(
@@ -878,7 +1015,13 @@ def match_query_tokens_to_landmarks_ann(
     )
 
     matches: list[QueryTo3DMatch] = []
-    source = "landmark_faiss" if str(prepared.backend_name).startswith("faiss") else "landmark_exact"
+    source = (
+        "landmark_faiss"
+        if str(prepared.backend_name).startswith("faiss")
+        else "landmark_torch_cuda"
+        if str(prepared.backend_name).startswith("torch_cuda")
+        else "landmark_exact"
+    )
     for query_idx in range(query_features.shape[0]):
         candidate_indices = np.asarray(top_indices[query_idx], dtype=np.int64)
         candidate_scores = np.asarray(top_scores[query_idx], dtype=np.float32)
@@ -887,12 +1030,26 @@ def match_query_tokens_to_landmarks_ann(
             continue
         candidate_indices = candidate_indices[valid_candidates]
         candidate_scores = candidate_scores[valid_candidates]
-        order = np.argsort(-candidate_scores, kind="mergesort")
+        raw_order = np.argsort(-candidate_scores, kind="mergesort")
+        order_values: list[int] = []
+        seen_candidate_tracks: set[int] = set()
+        for rank_pos in raw_order.tolist():
+            landmark_idx = int(candidate_indices[int(rank_pos)])
+            track_id = int(index.track_ids[landmark_idx])
+            if track_id in seen_candidate_tracks:
+                continue
+            seen_candidate_tracks.add(track_id)
+            order_values.append(int(rank_pos))
+            if len(order_values) >= int(unique_search_top_k):
+                break
+        order = np.asarray(order_values, dtype=np.int64)
+        if order.size == 0:
+            continue
         best_pos = int(order[0])
         best_similarity = float(candidate_scores[best_pos])
         if best_similarity < float(config.min_similarity):
             continue
-        other_scores = np.delete(candidate_scores, best_pos)
+        other_scores = candidate_scores[order[1:]]
         ratio = 0.0
         second_similarity = None
         if other_scores.size >= 1:
@@ -947,6 +1104,7 @@ def match_query_tokens_to_landmarks_ann(
                     coarse_rank=int(proposal_rank),
                     coarse_score=similarity,
                     coarse_score_gap=similarity_margin,
+                    prototype_id=int(index.prototype_ids[landmark_idx]),
                 )
             )
     matches.sort(key=lambda item: item.similarity, reverse=True)
@@ -968,6 +1126,8 @@ def match_query_tokens_to_landmarks_ann(
             **selection_metadata,
             "valid_query_token_count": int(query_features.shape[0]),
             "search_top_k": int(search_top_k),
+            "unique_track_search_top_k": int(unique_search_top_k),
+            "max_prototypes_per_track": int(prepared.max_prototypes_per_track),
             "nn_search_k_for_ratio": int(ratio_k),
             "proposal_top_l": int(config.proposal_top_l),
             "deduplicate_tracks": bool(config.deduplicate_tracks),
@@ -1151,6 +1311,7 @@ def _concat_landmark_indices(first: LandmarkMapIndex, second: LandmarkMapIndex) 
         observation_image_ids=tuple(first.observation_image_ids) + tuple(second.observation_image_ids),
         reprojection_errors=np.concatenate([first.reprojection_errors, second.reprojection_errors], axis=0),
         feature_ambiguities=np.concatenate([first.feature_ambiguities, second.feature_ambiguities], axis=0),
+        prototype_ids=np.concatenate([first.prototype_ids, second.prototype_ids], axis=0),
     )
 
 
@@ -1895,6 +2056,7 @@ def _query_match_rows(query_id: str, matches: Sequence[QueryTo3DMatch]) -> list[
                 "source": str(match.source),
                 "token_index": int(match.token_index),
                 "track_id": int(match.track_id),
+                "prototype_id": None if match.prototype_id is None else int(match.prototype_id),
                 "x": float(np.asarray(match.xy).reshape(2)[0]),
                 "y": float(np.asarray(match.xy).reshape(2)[1]),
                 "xyz": [float(value) for value in np.asarray(match.xyz).reshape(3).tolist()],
@@ -2058,12 +2220,18 @@ def run_real_radio_landmark_hybrid_eval(
     pnp_weighted_f_scale_px: float = 4.0,
     pnp_weighted_max_nfev: int = 50,
     progress_interval_queries: int = 0,
+    evaluate_pose: bool = True,
 ) -> dict[str, Any]:
     records = list(query_records)
     if max_queries is not None:
         records = records[: int(max_queries)]
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
+    if bool(evaluate_pose) and retrieval_config is not None and int(retrieval_config.proposal_top_l) > 1:
+        raise ValueError(
+            "unresolved top-L proposals cannot be passed to ordinary PnP; "
+            "run proposal-only or resolve each query-token group first"
+        )
 
     matches_by_query: dict[str, list[QueryTo3DMatch]] = {}
     match_rows: list[dict[str, Any]] = []
@@ -2330,18 +2498,22 @@ def run_real_radio_landmark_hybrid_eval(
             )
     flush_pending_measurement()
 
-    pose_rows = evaluate_query_poses(
-        matches_by_query,
-        cameras_by_query=cameras_by_query,
-        gt_poses_by_query=gt_poses_by_query,
-        pnp_reprojection_error_px=float(pnp_reprojection_error_px),
-        pnp_iterations=int(pnp_iterations),
-        pnp_confidence=float(pnp_confidence),
-        pnp_min_inliers=int(pnp_min_inliers),
-        pnp_weighted_refine=bool(pnp_weighted_refine),
-        pnp_weighted_loss=str(pnp_weighted_loss),
-        pnp_weighted_f_scale_px=float(pnp_weighted_f_scale_px),
-        pnp_weighted_max_nfev=int(pnp_weighted_max_nfev),
+    pose_rows = (
+        evaluate_query_poses(
+            matches_by_query,
+            cameras_by_query=cameras_by_query,
+            gt_poses_by_query=gt_poses_by_query,
+            pnp_reprojection_error_px=float(pnp_reprojection_error_px),
+            pnp_iterations=int(pnp_iterations),
+            pnp_confidence=float(pnp_confidence),
+            pnp_min_inliers=int(pnp_min_inliers),
+            pnp_weighted_refine=bool(pnp_weighted_refine),
+            pnp_weighted_loss=str(pnp_weighted_loss),
+            pnp_weighted_f_scale_px=float(pnp_weighted_f_scale_px),
+            pnp_weighted_max_nfev=int(pnp_weighted_max_nfev),
+        )
+        if bool(evaluate_pose)
+        else []
     )
 
     write_mapping_rows_jsonl(output / "matches_2d3d.jsonl", match_rows)
@@ -2356,7 +2528,12 @@ def run_real_radio_landmark_hybrid_eval(
     write_mapping_rows_csv(output / "pose_rows.csv", pose_rows)
     match_counts = [len(values) for values in matches_by_query.values()]
     summary = {
-        "stage": "real_radio_landmark_hybrid_pose_localization",
+        "stage": (
+            "real_radio_landmark_hybrid_pose_localization"
+            if bool(evaluate_pose)
+            else "real_radio_landmark_proposal_generation"
+        ),
+        "proposal_only": not bool(evaluate_pose),
         "query_count": int(len(records)),
         "evaluated_query_count": int(len(matches_by_query)),
         "landmark_count": int(len(landmark_index)),
@@ -2445,6 +2622,7 @@ def run_real_radio_landmark_hybrid_eval(
             "query_heatmap_grid_rows": int(retrieval_config.query_heatmap_grid_rows),
             "query_heatmap_grid_cols": int(retrieval_config.query_heatmap_grid_cols),
             "query_heatmap_min_score": retrieval_config.query_heatmap_min_score,
+            "query_xy_coordinate_mode": str(retrieval_config.query_xy_coordinate_mode),
         },
         "outputs": {
             "matches_2d3d_jsonl": str(output / "matches_2d3d.jsonl"),

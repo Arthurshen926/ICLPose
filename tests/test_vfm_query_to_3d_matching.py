@@ -13,6 +13,7 @@ from feature_extract.vfm.query_to_3d_matching import (
     QueryTo3DMatch,
     QueryTo3DMatchingConfig,
     SpatialDiversityPnPConfig,
+    canonicalize_pnp_solver_order,
     deduplicate_pnp_matches,
     estimate_pose_pnp_fixed,
     estimate_pose_pnp_fixed_robust,
@@ -108,6 +109,35 @@ def test_deduplicate_pnp_matches_keeps_first_track_occurrence() -> None:
 
     assert [match.track_id for match in unique_matches] == [1, 2]
     assert original_indices.tolist() == [0, 1]
+
+
+def test_canonical_pnp_order_is_independent_of_confidence_order() -> None:
+    matches = [
+        QueryTo3DMatch(
+            token_index=2,
+            xy=np.asarray([20.0, 20.0]),
+            track_id=30,
+            xyz=np.asarray([0.0, 0.0, 5.0]),
+            similarity=0.9,
+            ratio=0.0,
+            landmark_variance=0.0,
+        ),
+        QueryTo3DMatch(
+            token_index=0,
+            xy=np.asarray([10.0, 10.0]),
+            track_id=10,
+            xyz=np.asarray([1.0, 0.0, 5.0]),
+            similarity=0.1,
+            ratio=0.0,
+            landmark_variance=0.0,
+        ),
+    ]
+    ordered, indices = canonicalize_pnp_solver_order(
+        matches, np.asarray([4, 7], dtype=np.int64)
+    )
+
+    assert [match.token_index for match in ordered] == [0, 2]
+    assert indices.tolist() == [7, 4]
 
 
 def test_select_unique_query_inlier_mask_keeps_lowest_residual_candidate() -> None:
@@ -658,6 +688,13 @@ def test_pnp_residual_and_spatial_distribution_stats_expose_degeneracy() -> None
 
     residual = pnp_reprojection_residual_stats(matches, np.eye(4, dtype=np.float64), _camera(), inlier_mask)
     spatial = match_spatial_distribution_stats(matches, 100, 100, inlier_mask)
+    spatial_with_pose = match_spatial_distribution_stats(
+        matches,
+        100,
+        100,
+        inlier_mask,
+        pose_w2c=np.eye(4, dtype=np.float64),
+    )
 
     assert residual["pnp_reproj_inlier_count"] == 4
     assert residual["pnp_reproj_inlier_median_px"] < 1e-6
@@ -665,6 +702,10 @@ def test_pnp_residual_and_spatial_distribution_stats_expose_degeneracy() -> None
     assert spatial["bbox_area_frac"] < 0.01
     assert spatial["grid_4x4_occupancy_frac"] == 1.0 / 16.0
     assert spatial["xy_pca_minor_major_ratio"] < 1e-6
+    assert spatial["depth_range_m"] is None
+    assert spatial["world_z_range_m"] == 0.0
+    assert spatial_with_pose["depth_range_m"] == 0.0
+    assert spatial_with_pose["positive_depth_fraction"] == 1.0
 
 
 def test_map_reliability_scores_rank_stable_distinctive_tracks() -> None:
@@ -777,7 +818,7 @@ def test_spatial_diversity_pnp_selection_limits_matches_per_image_cell() -> None
     assert [match.track_id for match in selected] == [2, 4]
 
 
-def test_spatial_diversity_pnp_selection_can_fill_for_depth_diversity() -> None:
+def test_spatial_diversity_pnp_selection_can_fill_for_explicit_world_z_diversity() -> None:
     matches = [
         QueryTo3DMatch(
             token_index=idx,
@@ -802,7 +843,7 @@ def test_spatial_diversity_pnp_selection_can_fill_for_depth_diversity() -> None:
             grid_cols=1,
             max_per_cell=1,
             score_mode="margin",
-            min_depth_range_m=3.0,
+            min_world_z_range_m=3.0,
             max_matches=3,
         ),
     )

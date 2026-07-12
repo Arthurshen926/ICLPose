@@ -35,6 +35,30 @@ def test_landmark_retrieval_aggregates_same_track_support_rows() -> None:
     assert metrics["landmark_retrieval_mean_prototype_observation_count"] == pytest.approx(1.5)
 
 
+def test_landmark_retrieval_deduplicates_heldout_query_but_keeps_all_support_views() -> None:
+    query = torch.tensor(
+        [[1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 1.0, 0.0]]
+    )
+    support = torch.tensor(
+        [[1.0, 0.1, 0.0], [0.9, 0.0, 0.0], [0.1, 1.0, 0.0], [0.0, 0.9, 0.0]]
+    )
+
+    loss, metrics = landmark_retrieval_loss(
+        query,
+        support,
+        torch.tensor([10, 10, 20, 20]),
+        query_group_ids=torch.tensor([100, 100, 101, 101]),
+        query_image_group_ids=torch.tensor([7, 7, 7, 7]),
+        config=LandmarkRetrievalLossConfig(dustbin_logit=None),
+    )
+
+    assert loss is not None
+    assert metrics["landmark_retrieval_valid_count"] == 2
+    assert metrics["landmark_retrieval_support_observation_count"] == 4
+    assert metrics["landmark_retrieval_deduplicated_query_count"] == 2
+    assert metrics["landmark_retrieval_mean_prototype_observation_count"] == pytest.approx(2.0)
+
+
 def test_landmark_retrieval_excludes_current_track_history_from_negatives() -> None:
     bank = _bank()
     bank.update(
@@ -137,6 +161,36 @@ def test_landmark_memory_ema_accumulates_observation_count() -> None:
     np.testing.assert_allclose(descriptor.numpy(), [[2**-0.5, 2**-0.5, 0.0]], atol=1e-6)
 
 
+def test_frozen_landmark_snapshot_is_immutable_and_global(tmp_path) -> None:
+    path = tmp_path / "projected.npz"
+    np.savez(
+        path,
+        track_ids=np.asarray([10, 20], dtype=np.int64),
+        features=np.asarray([[2.0, 0.0, 0.0], [0.0, 3.0, 0.0]], dtype=np.float32),
+        xyz=np.asarray([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float32),
+        observation_counts=np.asarray([2, 3], dtype=np.int64),
+        metadata_json=np.asarray('{"descriptor_space_id":"space"}'),
+    )
+    bank = LandmarkPrototypeMemoryBank.from_projected_landmark_npz(
+        path,
+        device="cpu",
+        expected_descriptor_dim=3,
+    )
+    before, _found, before_counts, _xyz = bank.lookup([10])
+    bank.update(
+        track_ids=[10],
+        descriptors=torch.tensor([[0.0, 1.0, 0.0]]),
+        observation_counts=[100],
+    )
+    after, _found, after_counts, _xyz = bank.lookup([10])
+
+    assert bank.frozen is True
+    assert bank.source_path == str(path)
+    np.testing.assert_allclose(before.numpy(), after.numpy())
+    np.testing.assert_array_equal(before_counts, after_counts)
+    assert len(bank) == 2
+
+
 def test_landmark_retrieval_returns_no_loss_without_valid_track_ids() -> None:
     loss, metrics = landmark_retrieval_loss(
         torch.tensor([[1.0, 0.0, 0.0]]),
@@ -146,6 +200,60 @@ def test_landmark_retrieval_returns_no_loss_without_valid_track_ids() -> None:
 
     assert loss is None
     assert metrics["landmark_retrieval_valid_count"] == 0
+
+
+def test_landmark_retrieval_learns_query_dependent_dustbin_from_unmatched_rows() -> None:
+    valid_dustbin = torch.tensor([-2.0], requires_grad=True)
+    unmatched_dustbin = torch.tensor([8.0], requires_grad=True)
+    query = torch.tensor([[1.0, 0.0, 0.0]], requires_grad=True)
+    support = torch.tensor([[1.0, 0.0, 0.0]], requires_grad=True)
+    unmatched = torch.tensor([[0.0, 1.0, 0.0]], requires_grad=True)
+
+    loss, metrics = landmark_retrieval_loss(
+        query,
+        support,
+        torch.tensor([10]),
+        dustbin_logits=valid_dustbin,
+        unmatched_query_descriptors=unmatched,
+        unmatched_dustbin_logits=unmatched_dustbin,
+        config=LandmarkRetrievalLossConfig(dustbin_logit=None, dustbin_loss_weight=1.0),
+    )
+    assert loss is not None
+    loss.backward()
+
+    assert metrics["landmark_retrieval_dustbin_positive_count"] == 1
+    assert metrics["landmark_retrieval_dustbin_recall_0p5"] == pytest.approx(1.0)
+    assert metrics["landmark_retrieval_valid_accept_rate_0p5"] == pytest.approx(1.0)
+    assert valid_dustbin.grad is not None and torch.isfinite(valid_dustbin.grad).all()
+    assert unmatched_dustbin.grad is not None and torch.isfinite(unmatched_dustbin.grad).all()
+    assert unmatched.grad is not None and torch.isfinite(unmatched.grad).all()
+
+
+def test_landmark_dustbin_can_train_without_moving_descriptor_space() -> None:
+    query = torch.tensor([[1.0, 0.0, 0.0]], requires_grad=True)
+    support = torch.tensor([[1.0, 0.0, 0.0]], requires_grad=True)
+    unmatched = torch.tensor([[0.0, 1.0, 0.0]], requires_grad=True)
+    valid_dustbin = torch.tensor([-2.0], requires_grad=True)
+    unmatched_dustbin = torch.tensor([2.0], requires_grad=True)
+
+    loss, _metrics = landmark_retrieval_loss(
+        query,
+        support,
+        torch.tensor([10]),
+        dustbin_logits=valid_dustbin,
+        unmatched_query_descriptors=unmatched,
+        unmatched_dustbin_logits=unmatched_dustbin,
+        config=LandmarkRetrievalLossConfig(
+            dustbin_logit=None,
+            dustbin_loss_weight=1.0,
+            dustbin_detach_descriptors=True,
+        ),
+    )
+    assert loss is not None
+    loss.backward()
+
+    assert unmatched.grad is None
+    assert unmatched_dustbin.grad is not None
 
 
 def test_landmark_retrieval_masks_same_query_cell_tracks_as_false_negatives() -> None:
@@ -189,3 +297,26 @@ def test_torch_observation_sampling_matches_projected_bank_bilinear_sampling() -
 
     assert valid.tolist() == [True, True, True]
     np.testing.assert_allclose(actual.detach().numpy(), expected, rtol=1e-6, atol=1e-6)
+
+
+def test_torch_observation_sampling_groups_rows_without_breaking_gradients() -> None:
+    feature_maps = torch.arange(2 * 3 * 4 * 5, dtype=torch.float32).reshape(2, 3, 4, 5)
+    feature_maps.requires_grad_(True)
+    pair_indices = torch.tensor([0, 0, 0, 1, 1, 1], dtype=torch.long)
+    xy = torch.tensor(
+        [[0.0, 0.0], [4.0, 3.0], [7.0, 5.0], [1.0, 1.0], [5.0, 4.0], [7.0, 5.0]],
+        dtype=torch.float32,
+    )
+
+    sampled = _sample_descriptor_rows_at_image_xy(
+        feature_maps,
+        pair_indices,
+        xy,
+        image_width=torch.full((6,), 8.0),
+        image_height=torch.full((6,), 6.0),
+    )
+    sampled.sum().backward()
+
+    assert sampled.shape == (6, 3)
+    assert feature_maps.grad is not None
+    assert torch.isfinite(feature_maps.grad).all()

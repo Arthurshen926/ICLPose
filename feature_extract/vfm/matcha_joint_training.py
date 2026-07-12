@@ -539,7 +539,13 @@ class MatchaJointTrainingConfig:
     landmark_retrieval_loss_weight: float = 0.0
     landmark_retrieval_temperature: float = 0.07
     landmark_prototype_history_mix: float = 0.5
+    landmark_prototype_aggregation_method: str = "mean"
+    landmark_l2_normalize_observations: bool = False
+    landmark_normalize_final_prototypes: bool = True
+    landmark_min_support_observations: int = 1
+    landmark_set_valued_cell_positives: bool = True
     landmark_memory_capacity: int = 65536
+    landmark_frozen_negative_bank: str = ""
     landmark_memory_momentum: float = 0.9
     landmark_memory_candidate_pool_size: int = 4096
     landmark_semantic_hard_negatives_per_query: int = 16
@@ -547,6 +553,11 @@ class MatchaJointTrainingConfig:
     landmark_random_negatives: int = 128
     landmark_max_memory_negatives: int = 2048
     landmark_dustbin_logit: float = 0.0
+    landmark_dustbin_samples_per_image: int = 0
+    landmark_dustbin_exclusion_radius_cells: int = 1
+    landmark_dustbin_max_heatmap_target: float = 0.01
+    landmark_dustbin_loss_weight: float = 0.25
+    landmark_dustbin_detach_descriptors: bool = True
     group_size: int = 64
     input_norm_mode: str = "identity"
     gate_mode: str = "residual"
@@ -622,6 +633,14 @@ class MatchaJointTrainingConfig:
             raise ValueError("landmark_retrieval_temperature must be positive")
         if not 0.0 <= float(self.landmark_prototype_history_mix) <= 1.0:
             raise ValueError("landmark_prototype_history_mix must be in [0, 1]")
+        if str(self.landmark_prototype_aggregation_method) not in {
+            "mean",
+            "cosine_weighted_mean",
+            "geometry_weighted",
+        }:
+            raise ValueError("unsupported landmark_prototype_aggregation_method")
+        if int(self.landmark_min_support_observations) <= 0:
+            raise ValueError("landmark_min_support_observations must be positive")
         if not 0.0 <= float(self.landmark_memory_momentum) < 1.0:
             raise ValueError("landmark_memory_momentum must be in [0, 1)")
         if int(self.landmark_memory_capacity) <= 0:
@@ -637,6 +656,14 @@ class MatchaJointTrainingConfig:
                 raise ValueError(f"{name} must be non-negative")
         if np.isnan(float(self.landmark_dustbin_logit)):
             raise ValueError("landmark_dustbin_logit must not be NaN")
+        if int(self.landmark_dustbin_samples_per_image) < 0:
+            raise ValueError("landmark_dustbin_samples_per_image must be non-negative")
+        if int(self.landmark_dustbin_exclusion_radius_cells) < 0:
+            raise ValueError("landmark_dustbin_exclusion_radius_cells must be non-negative")
+        if not 0.0 <= float(self.landmark_dustbin_max_heatmap_target) <= 1.0:
+            raise ValueError("landmark_dustbin_max_heatmap_target must be in [0, 1]")
+        if float(self.landmark_dustbin_loss_weight) < 0.0:
+            raise ValueError("landmark_dustbin_loss_weight must be non-negative")
         for name in (
             "dual_softmax_weight",
             "offset_loss_weight",
@@ -736,6 +763,12 @@ class MatchaStyleJointModel(nn.Module):
             BasicConvLayer(int(residual_hidden_dim), int(residual_hidden_dim), 1, padding=0),
             nn.Conv2d(int(residual_hidden_dim), 1, 1),
         )
+        self.landmark_dustbin_head = nn.Sequential(
+            nn.LayerNorm(int(output_dim)),
+            nn.Linear(int(output_dim), 1),
+        )
+        nn.init.zeros_(self.landmark_dustbin_head[-1].weight)
+        nn.init.constant_(self.landmark_dustbin_head[-1].bias, 0.7)
         heads = 4
         while int(output_dim) % heads != 0 and heads > 1:
             heads -= 1
@@ -794,6 +827,9 @@ class MatchaStyleJointModel(nn.Module):
 
     def encode(self, features: torch.Tensor) -> torch.Tensor:
         return self.adapter.encode(features)
+
+    def landmark_dustbin_logits(self, query_descriptors: torch.Tensor) -> torch.Tensor:
+        return self.landmark_dustbin_head(query_descriptors).reshape(-1)
 
     def forward_rows(self, features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return self.adapter(features)
@@ -1130,6 +1166,12 @@ class RadioDualAttentionFusionJointModel(nn.Module):
             BasicConvLayer(int(residual_hidden_dim), int(residual_hidden_dim), 1, padding=0),
             nn.Conv2d(int(residual_hidden_dim), 1, 1),
         )
+        self.landmark_dustbin_head = nn.Sequential(
+            nn.LayerNorm(int(output_dim)),
+            nn.Linear(int(output_dim), 1),
+        )
+        nn.init.zeros_(self.landmark_dustbin_head[-1].weight)
+        nn.init.constant_(self.landmark_dustbin_head[-1].bias, 0.7)
         self.rgb_keypoint_detector = MatchaRgbKeypointDetector()
         self.original_fine_matcher = _OriginalMatchaFineMatcher(
             descriptor_dim=int(output_dim),
@@ -1191,6 +1233,9 @@ class RadioDualAttentionFusionJointModel(nn.Module):
 
     def encode(self, features: torch.Tensor) -> torch.Tensor:
         return self.adapter.encode(features)
+
+    def landmark_dustbin_logits(self, query_descriptors: torch.Tensor) -> torch.Tensor:
+        return self.landmark_dustbin_head(query_descriptors).reshape(-1)
 
     def forward_rows(self, features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return self.adapter(features)
@@ -1802,15 +1847,20 @@ def _sample_descriptor_rows_at_image_xy(
         raise ValueError("image dimensions must be positive")
     x = 2.0 * coordinates[:, 0] / (widths - 1.0).clamp_min(1.0) - 1.0
     y = 2.0 * coordinates[:, 1] / (heights - 1.0).clamp_min(1.0) - 1.0
-    grid = torch.stack([x, y], dim=1).reshape(-1, 1, 1, 2)
-    sampled = F.grid_sample(
-        descriptor_map[pairs],
-        grid,
-        mode="bilinear",
-        padding_mode="zeros",
-        align_corners=True,
-    )
-    return sampled[:, :, 0, 0]
+    normalized_xy = torch.stack([x, y], dim=1)
+    sampled_rows = descriptor_map.new_empty((int(pairs.shape[0]), int(descriptor_map.shape[1])))
+    for pair in torch.unique(pairs, sorted=True):
+        row_indices = torch.nonzero(pairs == pair, as_tuple=False).reshape(-1)
+        grid = normalized_xy[row_indices].reshape(1, -1, 1, 2)
+        sampled = F.grid_sample(
+            descriptor_map[int(pair.item()) : int(pair.item()) + 1],
+            grid,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=True,
+        )
+        sampled_rows[row_indices] = sampled[0, :, :, 0].T
+    return sampled_rows
 
 
 def _observation_query_group_ids(
@@ -1821,6 +1871,7 @@ def _observation_query_group_ids(
     image_height: int | torch.Tensor,
     grid_width: int,
     grid_height: int,
+    image_group_ids: torch.Tensor | None = None,
 ) -> torch.Tensor:
     coordinates = xy.to(device=pair_indices.device, dtype=torch.float32).reshape(-1, 2)
     widths = torch.as_tensor(image_width, dtype=torch.float32, device=pair_indices.device).reshape(-1)
@@ -1835,7 +1886,101 @@ def _observation_query_group_ids(
     row = torch.floor(coordinates[:, 1] / heights.clamp_min(1.0) * float(grid_height)).long()
     col = col.clamp(0, max(int(grid_width) - 1, 0))
     row = row.clamp(0, max(int(grid_height) - 1, 0))
-    return pair_indices.long().reshape(-1) * int(grid_width * grid_height) + row * int(grid_width) + col
+    image_groups = pair_indices.long().reshape(-1) if image_group_ids is None else image_group_ids.long().reshape(-1)
+    if image_groups.shape[0] != coordinates.shape[0]:
+        raise ValueError("image_group_ids must contain one value per observation")
+    return image_groups * int(grid_width * grid_height) + row * int(grid_width) + col
+
+
+def _sample_landmark_dustbin_descriptors(
+    descriptor_map: torch.Tensor,
+    *,
+    query_heatmap_targets: np.ndarray | None,
+    pair_query_group_ids: torch.Tensor,
+    positive_pair_indices: torch.Tensor,
+    positive_xy: torch.Tensor,
+    positive_image_width: torch.Tensor,
+    positive_image_height: torch.Tensor,
+    samples_per_image: int,
+    exclusion_radius_cells: int,
+    max_heatmap_target: float,
+    seed: int,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Sample no-reliable-track cells once per unique query image."""
+
+    if descriptor_map.ndim != 4:
+        raise ValueError("descriptor_map must have shape (B, C, H, W)")
+    batch, channels, height, width = descriptor_map.shape
+    pair_groups = pair_query_group_ids.to(device=descriptor_map.device, dtype=torch.long).reshape(-1)
+    if pair_groups.shape[0] != int(batch):
+        raise ValueError("pair_query_group_ids must contain one value per descriptor map")
+    if int(samples_per_image) <= 0:
+        return descriptor_map.new_zeros((0, int(channels))), {
+            "landmark_retrieval_dustbin_candidate_count": 0.0,
+            "landmark_retrieval_dustbin_sampled_image_count": 0.0,
+        }
+    positive_pairs = positive_pair_indices.to(device=descriptor_map.device, dtype=torch.long).reshape(-1)
+    coordinates = positive_xy.to(device=descriptor_map.device, dtype=torch.float32).reshape(-1, 2)
+    widths = positive_image_width.to(device=descriptor_map.device, dtype=torch.float32).reshape(-1)
+    heights = positive_image_height.to(device=descriptor_map.device, dtype=torch.float32).reshape(-1)
+    if not (
+        positive_pairs.shape[0]
+        == coordinates.shape[0]
+        == widths.shape[0]
+        == heights.shape[0]
+    ):
+        raise ValueError("positive observation arrays must have the same length")
+    positive_cols = torch.floor(coordinates[:, 0] / widths.clamp_min(1.0) * float(width)).long()
+    positive_rows = torch.floor(coordinates[:, 1] / heights.clamp_min(1.0) * float(height)).long()
+    positive_cols = positive_cols.clamp(0, max(int(width) - 1, 0))
+    positive_rows = positive_rows.clamp(0, max(int(height) - 1, 0))
+    positive_groups = pair_groups[positive_pairs]
+    heatmap = None
+    if query_heatmap_targets is not None:
+        heatmap = torch.as_tensor(
+            np.asarray(query_heatmap_targets, dtype=np.float32),
+            dtype=torch.float32,
+            device=descriptor_map.device,
+        )
+        if heatmap.shape != (int(batch), int(height), int(width)):
+            raise ValueError("query heatmap targets must match descriptor map shape")
+
+    rows = descriptor_map.permute(0, 2, 3, 1).reshape(int(batch), int(height * width), int(channels))
+    selected: list[torch.Tensor] = []
+    candidate_count = 0
+    sampled_image_count = 0
+    radius = int(exclusion_radius_cells)
+    for group in torch.unique(pair_groups, sorted=True).detach().cpu().tolist():
+        pair_indices = torch.nonzero(pair_groups == int(group), as_tuple=False).reshape(-1)
+        if pair_indices.numel() == 0:
+            continue
+        available = torch.ones((int(height), int(width)), dtype=torch.bool, device=descriptor_map.device)
+        if heatmap is not None:
+            group_heatmap = torch.amax(heatmap[pair_indices], dim=0)
+            available &= group_heatmap <= float(max_heatmap_target)
+        group_positive = torch.nonzero(positive_groups == int(group), as_tuple=False).reshape(-1)
+        for positive_index in group_positive.detach().cpu().tolist():
+            row = int(positive_rows[int(positive_index)].item())
+            col = int(positive_cols[int(positive_index)].item())
+            available[
+                max(0, row - radius) : min(int(height), row + radius + 1),
+                max(0, col - radius) : min(int(width), col + radius + 1),
+            ] = False
+        candidates = torch.nonzero(available.reshape(-1), as_tuple=False).reshape(-1)
+        candidate_count += int(candidates.numel())
+        if candidates.numel() == 0:
+            continue
+        take = min(int(samples_per_image), int(candidates.numel()))
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(int(seed) + 104729 * (int(group) + 1))
+        order = torch.randperm(int(candidates.numel()), generator=generator)[:take].to(candidates.device)
+        selected.append(rows[int(pair_indices[0].item()), candidates[order]])
+        sampled_image_count += 1
+    output = descriptor_map.new_zeros((0, int(channels))) if not selected else torch.cat(selected, dim=0)
+    return output, {
+        "landmark_retrieval_dustbin_candidate_count": float(candidate_count),
+        "landmark_retrieval_dustbin_sampled_image_count": float(sampled_image_count),
+    }
 
 
 def _forward_coarse_and_fine_feature_maps(
@@ -2095,6 +2240,26 @@ def _full_map_correspondence_loss(
     else:
         query_feature_maps = np.asarray(samples.query_feature_maps)[pair_subset]
         render_feature_maps = np.asarray(samples.render_feature_maps)[pair_subset]
+    query_map_inverse = np.arange(int(np.asarray(query_feature_maps).shape[0]), dtype=np.int64)
+    unique_query_map_count = int(query_map_inverse.size)
+    if samples.pair_query_ids is not None:
+        query_names = np.asarray(samples.pair_query_ids, dtype=object).reshape(-1)
+        if pair_subset is not None:
+            query_names = query_names[pair_subset]
+        unique_indices: list[int] = []
+        name_to_index: dict[str, int] = {}
+        inverse: list[int] = []
+        for pair_index, name in enumerate(query_names.tolist()):
+            key = str(name)
+            unique_index = name_to_index.get(key)
+            if unique_index is None:
+                unique_index = len(unique_indices)
+                name_to_index[key] = int(unique_index)
+                unique_indices.append(int(pair_index))
+            inverse.append(int(unique_index))
+        query_feature_maps = np.asarray(query_feature_maps)[np.asarray(unique_indices, dtype=np.int64)]
+        query_map_inverse = np.asarray(inverse, dtype=np.int64)
+        unique_query_map_count = int(len(unique_indices))
     query_maps = _tensor(query_feature_maps, dtype=torch.float32, device=device)
     render_maps = _tensor(render_feature_maps, dtype=torch.float32, device=device)
     pairs_global = np.asarray(samples.sample_pair_indices, dtype=np.int64)[indices]
@@ -2118,6 +2283,12 @@ def _full_map_correspondence_loss(
         model,
         query_maps,
     )
+    if unique_query_map_count != int(query_map_inverse.size):
+        inverse = _tensor(query_map_inverse, dtype=torch.long, device=device)
+        query_desc_map = query_desc_map[inverse]
+        query_fine_desc_map = query_fine_desc_map[inverse]
+        _query_heat = _query_heat[inverse]
+        query_offset_map = query_offset_map[inverse]
     render_desc_map, render_fine_desc_map, _render_heat, render_offset_map = _forward_coarse_and_fine_feature_maps(
         model,
         render_maps,
@@ -2298,6 +2469,25 @@ def _full_map_correspondence_loss(
             reference_image_sizes_np = reference_image_sizes_np[pair_subset]
         query_image_sizes = _tensor(query_image_sizes_np, dtype=torch.float32, device=device)[landmark_pairs]
         reference_image_sizes = _tensor(reference_image_sizes_np, dtype=torch.float32, device=device)[landmark_pairs]
+        pair_query_groups = torch.arange(
+            int(query_desc_map.shape[0]),
+            dtype=torch.long,
+            device=device,
+        )
+        if samples.pair_query_ids is not None:
+            query_names = np.asarray(samples.pair_query_ids, dtype=object).reshape(-1)
+            if pair_subset is not None:
+                query_names = query_names[pair_subset]
+            query_name_to_group = {
+                str(name): int(group)
+                for group, name in enumerate(sorted({str(value) for value in query_names.tolist()}))
+            }
+            pair_query_groups = _tensor(
+                np.asarray([query_name_to_group[str(value)] for value in query_names.tolist()], dtype=np.int64),
+                dtype=torch.long,
+                device=device,
+            )
+        landmark_query_image_groups = pair_query_groups[landmark_pairs]
         landmark_query_descriptors = _sample_descriptor_rows_at_image_xy(
             query_desc_map,
             landmark_pairs,
@@ -2333,13 +2523,60 @@ def _full_map_correspondence_loss(
             image_height=query_image_sizes[:, 1],
             grid_width=int(query_desc_map.shape[3]),
             grid_height=int(query_desc_map.shape[2]),
+            image_group_ids=landmark_query_image_groups,
         )
+        learned_landmark_dustbin = int(config.landmark_dustbin_samples_per_image) > 0
+        unmatched_query_descriptors = None
+        unmatched_dustbin_logits = None
+        landmark_dustbin_logits = None
+        dustbin_sampling_metrics: dict[str, float] = {}
+        if learned_landmark_dustbin:
+            query_heatmap_targets = samples.query_heatmap_targets
+            if query_heatmap_targets is not None and pair_subset is not None:
+                query_heatmap_targets = np.asarray(query_heatmap_targets)[pair_subset]
+            unmatched_query_descriptors, dustbin_sampling_metrics = _sample_landmark_dustbin_descriptors(
+                query_desc_map,
+                query_heatmap_targets=query_heatmap_targets,
+                pair_query_group_ids=pair_query_groups,
+                positive_pair_indices=landmark_pairs,
+                positive_xy=landmark_query_xy,
+                positive_image_width=query_image_sizes[:, 0],
+                positive_image_height=query_image_sizes[:, 1],
+                samples_per_image=int(config.landmark_dustbin_samples_per_image),
+                exclusion_radius_cells=int(config.landmark_dustbin_exclusion_radius_cells),
+                max_heatmap_target=float(config.landmark_dustbin_max_heatmap_target),
+                seed=int(seed),
+            )
+            dustbin_valid_input = (
+                landmark_query_descriptors.detach()
+                if bool(config.landmark_dustbin_detach_descriptors)
+                else landmark_query_descriptors
+            )
+            dustbin_unmatched_input = (
+                unmatched_query_descriptors.detach()
+                if bool(config.landmark_dustbin_detach_descriptors)
+                else unmatched_query_descriptors
+            )
+            landmark_dustbin_logits = (
+                model.landmark_dustbin_logits(dustbin_valid_input)
+                / float(config.landmark_retrieval_temperature)
+                + float(config.landmark_dustbin_logit)
+            )
+            unmatched_dustbin_logits = (
+                model.landmark_dustbin_logits(dustbin_unmatched_input)
+                / float(config.landmark_retrieval_temperature)
+                + float(config.landmark_dustbin_logit)
+            )
         landmark_loss, landmark_metrics = landmark_retrieval_loss(
             landmark_query_descriptors,
             landmark_reference_descriptors,
             selected_track_ids,
             track_xyz=selected_track_xyz,
             query_group_ids=query_group_ids,
+            query_image_group_ids=landmark_query_image_groups,
+            dustbin_logits=landmark_dustbin_logits,
+            unmatched_query_descriptors=unmatched_query_descriptors,
+            unmatched_dustbin_logits=unmatched_dustbin_logits,
             memory_bank=landmark_memory_bank,
             config=LandmarkRetrievalLossConfig(
                 temperature=float(config.landmark_retrieval_temperature),
@@ -2349,13 +2586,21 @@ def _full_map_correspondence_loss(
                 geometry_hard_negatives_per_track=int(config.landmark_geometry_hard_negatives_per_track),
                 random_negatives=int(config.landmark_random_negatives),
                 max_memory_negatives=int(config.landmark_max_memory_negatives),
-                dustbin_logit=float(config.landmark_dustbin_logit),
+                dustbin_logit=None if learned_landmark_dustbin else float(config.landmark_dustbin_logit),
+                dustbin_loss_weight=float(config.landmark_dustbin_loss_weight),
+                dustbin_detach_descriptors=bool(config.landmark_dustbin_detach_descriptors),
+                prototype_aggregation_method=str(config.landmark_prototype_aggregation_method),
+                prototype_l2_normalize_observations=bool(config.landmark_l2_normalize_observations),
+                normalize_final_prototypes=bool(config.landmark_normalize_final_prototypes),
+                prototype_min_support_observations=int(config.landmark_min_support_observations),
+                set_valued_cell_positives=bool(config.landmark_set_valued_cell_positives),
             ),
             update_memory=bool(update_landmark_memory),
             seed=int(seed),
         )
         if landmark_loss is None:
             raise ValueError("landmark retrieval loss found no valid non-negative SfM track ids")
+        landmark_metrics.update(dustbin_sampling_metrics)
         loss = loss + float(config.landmark_retrieval_loss_weight) * landmark_loss
     patch_acc_values = []
     if float(config.patch_correlation_loss_weight) > 0.0:
@@ -2387,6 +2632,8 @@ def _full_map_correspondence_loss(
             map_top1 = float(torch.mean((torch.argmax(scores, dim=1) == labels).float()).item())
         metrics = {
             "map_descriptor_top1_acc": map_top1,
+            "map_query_pair_count": float(query_map_inverse.size),
+            "map_unique_query_forward_count": float(unique_query_map_count),
             "map_query_offset_acc": float(torch.mean((torch.argmax(query_offsets, dim=1) == qlabels).float()).item()),
             "map_render_offset_acc": float(torch.mean((torch.argmax(render_offsets, dim=1) == rlabels).float()).item()),
         }
@@ -3657,6 +3904,12 @@ def _build_landmark_memory_bank(
     track_ids = np.asarray(samples.landmark_track_ids, dtype=np.int64).reshape(-1)
     if track_ids.size == 0 or np.any(track_ids < 0):
         raise ValueError("landmark retrieval training requires valid non-negative SfM track ids for every observation")
+    if str(config.landmark_frozen_negative_bank):
+        return LandmarkPrototypeMemoryBank.from_projected_landmark_npz(
+            Path(config.landmark_frozen_negative_bank),
+            device=device,
+            expected_descriptor_dim=int(config.output_dim),
+        )
     return LandmarkPrototypeMemoryBank(
         capacity=int(config.landmark_memory_capacity),
         descriptor_dim=int(config.output_dim),
@@ -3688,6 +3941,10 @@ def _landmark_training_summary(
         "landmark_retrieval_enabled": True,
         "landmark_retrieval_memory_final_size": int(len(memory_bank)),
         "landmark_retrieval_training_metric_reduction": "mean_over_training_pairs",
+        "landmark_retrieval_memory_scope": (
+            "global_frozen_snapshot" if bool(memory_bank.frozen) else "rank_local_ema"
+        ),
+        "landmark_retrieval_memory_source": str(memory_bank.source_path),
     }
     for key, value in sums.items():
         count = max(1, int(counts.get(key, 0)))
@@ -4672,7 +4929,9 @@ def train_matcha_joint_model_from_sample_provider(
     if landmark_memory_bank is not None:
         summary.update(
             {
-                "landmark_retrieval_memory_scope": "rank_local",
+                "landmark_retrieval_memory_scope": (
+                    "global_frozen_snapshot" if bool(landmark_memory_bank.frozen) else "rank_local_ema"
+                ),
                 "landmark_retrieval_memory_final_size_by_rank": [int(value) for value in landmark_memory_sizes],
             }
         )

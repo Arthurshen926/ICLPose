@@ -416,12 +416,15 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         )
         positive_stats = patch_positive_set_stats(positives)
         pose_error = pnp_pose_error(pnp.pose_w2c, gt_pose.pose_w2c)
-        all_spatial_stats = match_spatial_distribution_stats(matches, int(camera.width), int(camera.height))
+        all_spatial_stats = match_spatial_distribution_stats(
+            matches, int(camera.width), int(camera.height), pose_w2c=pnp.pose_w2c
+        )
         inlier_spatial_stats = match_spatial_distribution_stats(
             matches,
             int(camera.width),
             int(camera.height),
             pnp.inlier_mask,
+            pose_w2c=pnp.pose_w2c,
         )
         pnp_residual_stats = pnp_reprojection_residual_stats(
             matches,

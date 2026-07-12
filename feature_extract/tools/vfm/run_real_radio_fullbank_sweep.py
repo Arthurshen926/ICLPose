@@ -121,6 +121,8 @@ def build_eval_command(common: Mapping[str, object], *, measurement_k: int) -> l
         cmd.extend(["--nn_search_k_for_ratio", str(nn_search_k)])
     if bool(common.get("disable_ratio_test", False)):
         cmd.append("--disable_ratio_test")
+    if int(common.get("proposal_top_l", 1)) > 1:
+        cmd.append("--proposal_only")
     max_queries = int(common.get("max_queries", 0))
     if max_queries > 0:
         cmd.extend(["--max_queries", str(max_queries)])

@@ -43,8 +43,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--gate_supervision_loss_weight", type=float, default=0.0)
     parser.add_argument("--gate_center_radius_px", type=float, default=0.5)
     parser.add_argument("--gate_full_radius_px", type=float, default=2.0)
-    parser.add_argument("--gate_target_mode", default="residual", choices=("residual", "utility"))
+    parser.add_argument(
+        "--gate_target_mode",
+        default="residual",
+        choices=("residual", "utility", "binary_utility"),
+    )
     parser.add_argument("--gate_utility_temperature_px", type=float, default=0.25)
+    parser.add_argument("--gate_minimum_update_gain_px", type=float, default=0.1)
+    parser.add_argument("--gate_positive_weight", type=float, default=1.0)
+    parser.add_argument("--gate_low_residual_threshold_px", type=float, default=1.0)
+    parser.add_argument("--gate_low_residual_negative_weight", type=float, default=1.0)
     parser.add_argument("--likelihood_loss_weight", type=float, default=0.1)
     parser.add_argument("--coarse_likelihood_loss_weight", type=float, default=0.0)
     parser.add_argument("--dustbin_bce_weight", type=float, default=0.0)
@@ -58,12 +66,19 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--cache_images_on_device", action="store_true")
+    parser.add_argument(
+        "--image_cache_max_gb",
+        type=float,
+        default=0.0,
+        help="Optional shared query/support image-cache byte budget in GiB.",
+    )
     parser.add_argument("--base_dir", default=".")
     parser.add_argument("--query_source", default="real", choices=("real", "render", "render_augmented", "real_pair"))
     parser.add_argument("--support_patch_warp", default="none", choices=("none", "local_affine", "local_homography"))
     parser.add_argument("--render_patch_augmentation", default="none", choices=("none", "realistic"))
     parser.add_argument("--hard_negative_fraction", type=float, default=0.0)
     parser.add_argument("--train_dustbin_head_only", action="store_true")
+    parser.add_argument("--train_measurement_gate_head_only", action="store_true")
     parser.add_argument("--condition_on_prior_scale", action="store_true")
     parser.add_argument("--prior_scale_key", default="")
     parser.add_argument("--prior_scale_expert_centers_px", nargs="*", type=float, default=[])
@@ -72,9 +87,23 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--target_x_key", default="query_gt_x")
     parser.add_argument("--target_y_key", default="query_gt_y")
     parser.add_argument("--loss_weight_key", default="")
+    parser.add_argument(
+        "--min_loss_weight",
+        type=float,
+        default=-1.0,
+        help="Optionally discard rows below this loss weight before sampling and image loading.",
+    )
     parser.add_argument("--target_dustbin_filter", default="all", choices=("all", "valid", "dustbin"))
     parser.add_argument("--baseline_epe_min_px", type=float, default=-1.0)
     parser.add_argument("--baseline_epe_max_px", type=float, default=-1.0)
+    parser.add_argument("--residual_balanced_sampling", action="store_true")
+    parser.add_argument(
+        "--residual_sampling_bins_px",
+        nargs="*",
+        type=float,
+        default=[],
+        help="Residual-bin lower edges used by balanced batch sampling.",
+    )
     parser.add_argument("--data_parallel_device_ids", nargs="*", type=int, default=[])
     parser.add_argument("--init_checkpoint", default="")
     parser.add_argument("--train_stage", default="")
@@ -119,6 +148,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         gate_full_radius_px=float(args.gate_full_radius_px),
         gate_target_mode=str(args.gate_target_mode),
         gate_utility_temperature_px=float(args.gate_utility_temperature_px),
+        gate_minimum_update_gain_px=float(args.gate_minimum_update_gain_px),
+        gate_positive_weight=float(args.gate_positive_weight),
+        gate_low_residual_threshold_px=float(args.gate_low_residual_threshold_px),
+        gate_low_residual_negative_weight=float(args.gate_low_residual_negative_weight),
         likelihood_loss_weight=float(args.likelihood_loss_weight),
         coarse_likelihood_loss_weight=float(args.coarse_likelihood_loss_weight),
         dustbin_bce_weight=float(args.dustbin_bce_weight),
@@ -138,6 +171,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         render_patch_augmentation=str(args.render_patch_augmentation),
         hard_negative_fraction=float(args.hard_negative_fraction),
         train_dustbin_head_only=bool(args.train_dustbin_head_only),
+        train_measurement_gate_head_only=bool(args.train_measurement_gate_head_only),
         condition_on_prior_scale=bool(args.condition_on_prior_scale),
         prior_scale_key=str(args.prior_scale_key),
         prior_scale_expert_centers_px=[float(value) for value in args.prior_scale_expert_centers_px],
@@ -146,10 +180,14 @@ def main(argv: Sequence[str] | None = None) -> None:
         target_x_key=str(args.target_x_key),
         target_y_key=str(args.target_y_key),
         loss_weight_key=str(args.loss_weight_key),
+        min_loss_weight=float(args.min_loss_weight) if float(args.min_loss_weight) >= 0.0 else None,
         target_dustbin_filter=str(args.target_dustbin_filter),
         baseline_epe_min_px=float(args.baseline_epe_min_px) if float(args.baseline_epe_min_px) >= 0.0 else None,
         baseline_epe_max_px=float(args.baseline_epe_max_px) if float(args.baseline_epe_max_px) >= 0.0 else None,
+        residual_balanced_sampling=bool(args.residual_balanced_sampling),
+        residual_sampling_bins_px=[float(value) for value in args.residual_sampling_bins_px],
         data_parallel_device_ids=[int(value) for value in args.data_parallel_device_ids],
+        image_cache_max_gb=float(args.image_cache_max_gb) if float(args.image_cache_max_gb) > 0.0 else None,
         init_checkpoint=Path(args.init_checkpoint) if str(args.init_checkpoint) else None,
         train_stage=str(args.train_stage),
         gate_median_epe_px=float(args.gate_median_epe_px),

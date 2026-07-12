@@ -37,6 +37,7 @@ from feature_extract.vfm.matcha_joint_training import (
     RadioDualAttentionFusionJointModel,
     MatchaStyleJointModel,
     _provider_training_pair_ordinals,
+    _sample_landmark_dustbin_descriptors,
     load_matcha_joint_model,
     load_matcha_joint_training_set_manifest,
     load_matcha_joint_training_set_npz,
@@ -50,6 +51,35 @@ from feature_extract.vfm.matcha_joint_training import (
     train_matcha_joint_model_from_sample_provider,
 )
 from feature_extract.vfm.measurement_v1.rgb_patch_measurement_branch import crop_rgb_window
+
+
+def test_landmark_dustbin_sampler_excludes_positive_and_heatmap_cells() -> None:
+    descriptor_map = torch.tensor(
+        [
+            [[[0.0, 1.0], [2.0, 3.0]]],
+            [[[0.0, 1.0], [2.0, 3.0]]],
+        ]
+    )
+    heatmap = np.zeros((2, 2, 2), dtype=np.float32)
+    heatmap[1, 1, 1] = 1.0
+
+    sampled, metrics = _sample_landmark_dustbin_descriptors(
+        descriptor_map,
+        query_heatmap_targets=heatmap,
+        pair_query_group_ids=torch.tensor([0, 0]),
+        positive_pair_indices=torch.tensor([0]),
+        positive_xy=torch.tensor([[0.0, 0.0]]),
+        positive_image_width=torch.tensor([2.0]),
+        positive_image_height=torch.tensor([2.0]),
+        samples_per_image=4,
+        exclusion_radius_cells=0,
+        max_heatmap_target=0.01,
+        seed=3,
+    )
+
+    assert sorted(sampled[:, 0].tolist()) == [1.0, 2.0]
+    assert metrics["landmark_retrieval_dustbin_candidate_count"] == 2
+    assert metrics["landmark_retrieval_dustbin_sampled_image_count"] == 1
 
 
 def test_provider_training_pair_ordinals_partition_global_pair_stream() -> None:
@@ -3280,6 +3310,49 @@ def test_full_map_auxiliary_losses_use_pair_batches(monkeypatch) -> None:
     )
 
     assert observed_map_batches
+
+
+def test_full_map_correspondence_forwards_repeated_query_image_once() -> None:
+    feature_map = np.eye(8, dtype=np.float32).T.reshape(8, 2, 4)
+    samples = []
+    for index in range(4):
+        samples.append(
+            MatchaJointTrainingSet(
+                coarse_fine_samples=_toy_samples(),
+                query_feature_maps=feature_map[None],
+                render_feature_maps=feature_map[None],
+                query_heatmap_targets=np.zeros((1, 2, 4), dtype=np.float32),
+                render_heatmap_targets=np.zeros((1, 2, 4), dtype=np.float32),
+                sample_pair_indices=np.zeros((8,), dtype=np.int64),
+                query_cell_indices=np.arange(8, dtype=np.int64),
+                render_cell_indices=np.arange(8, dtype=np.int64),
+                pair_query_ids=np.asarray(["same-query.png"], dtype=object),
+                pair_candidate_ids=np.asarray([f"support-{index}.png"], dtype=object),
+            )
+        )
+    merged = merge_matcha_joint_training_sets(samples)
+    model = MatchaStyleJointModel(input_dim=8, output_dim=8, residual_hidden_dim=16, group_size=4)
+
+    loss, metrics = joint_training._full_map_correspondence_loss(
+        model,
+        merged,
+        np.arange(merged.coarse_fine_samples.sample_count, dtype=np.int64),
+        MatchaJointTrainingConfig(
+            output_dim=8,
+            residual_hidden_dim=16,
+            steps=1,
+            batch_size=32,
+            dual_softmax_weight=1.0,
+            offset_loss_weight=0.0,
+            group_size=4,
+            device="cpu",
+        ),
+        torch.device("cpu"),
+    )
+
+    assert loss is not None
+    assert metrics["map_query_pair_count"] == 4
+    assert metrics["map_unique_query_forward_count"] == 1
 
 
 def test_full_joint_cache_builder_creates_heatmaps_indices_and_rgb_labels() -> None:

@@ -22,7 +22,6 @@ from feature_extract.vfm.track_feature_sampling import sample_token_track_observ
 
 
 def _token_manifest(tmp_path):
-    token_path = tmp_path / "seq1__frame0001.npz"
     feature = np.asarray(
         [
             [[1.0, 2.0], [3.0, 4.0]],
@@ -30,18 +29,22 @@ def _token_manifest(tmp_path):
         ],
         dtype=np.float32,
     )
-    write_npz_token_record(token_path, {"radio_final": feature})
-    return TokenBankManifest(
-        records=(
+    records = []
+    for frame in ("frame0001", "frame0002"):
+        token_path = tmp_path / f"seq1__{frame}.npz"
+        write_npz_token_record(token_path, {"radio_final": feature})
+        records.append(
             TokenBankRecord(
-                image_id="seq1/frame0001.png",
+                image_id=f"seq1/{frame}.png",
                 token_path=token_path,
                 layers=(TokenLayerSpec("radio_final", "c-radio_v4-h", "final", 2, 16),),
                 split="train",
                 scene="Synthetic",
                 checksum=compute_file_sha256(token_path),
-            ),
+            )
         )
+    return TokenBankManifest(
+        records=tuple(records)
     )
 
 
@@ -70,6 +73,99 @@ def test_sample_token_track_observations_uses_relative_colmap_coordinates(tmp_pa
     assert sampled[0].feature.base is None
 
 
+@pytest.mark.parametrize("sample_mode", ["nearest", "bilinear"])
+def test_vectorized_feature_sampling_matches_scalar_path(sample_mode):
+    rng = np.random.default_rng(7)
+    feature_map = rng.normal(size=(5, 7, 11)).astype(np.float32)
+    xy = np.asarray([[0.0, 0.0], [31.25, 19.75], [63.0, 47.0]], dtype=np.float64)
+    widths = np.asarray([64, 64, 64], dtype=np.int64)
+    heights = np.asarray([48, 48, 48], dtype=np.int64)
+    expected = np.stack(
+        [
+            track_feature_sampling._sample_feature_vector(
+                feature_map,
+                tuple(coordinate),
+                int(width),
+                int(height),
+                sample_mode,
+            )
+            for coordinate, width, height in zip(xy, widths, heights)
+        ],
+        axis=0,
+    )
+
+    actual = track_feature_sampling._sample_feature_vectors(
+        feature_map,
+        xy,
+        widths,
+        heights,
+        sample_mode,
+    )
+
+    np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
+
+
+def test_jsonl_loader_deduplicates_track_image_observations_deterministically(tmp_path):
+    path = tmp_path / "duplicates.jsonl"
+    common = {
+        "track_id": 7,
+        "image_id": "seq1/frame0001.png",
+        "xyz": [0.0, 0.0, 1.0],
+        "track_length": 2,
+        "camera_id": 1,
+        "image_width": 100,
+        "image_height": 80,
+    }
+    path.write_text(
+        "\n".join(
+            [
+                json.dumps({**common, "point2d_idx": 5, "xy": [9.0, 9.0], "reprojection_error": 0.2}),
+                json.dumps({**common, "point2d_idx": 8, "xy": [8.0, 8.0], "reprojection_error": 0.1}),
+                json.dumps({**common, "point2d_idx": 3, "xy": [3.0, 3.0], "reprojection_error": 0.1}),
+            ]
+        )
+        + "\n"
+    )
+
+    deduplicated = track_feature_sampling.load_colmap_track_observations_jsonl(path)
+    raw = track_feature_sampling.load_colmap_track_observations_jsonl(
+        path,
+        deduplicate_track_images=False,
+    )
+
+    assert len(deduplicated) == 1
+    assert deduplicated[0].point2d_idx == 3
+    assert len(raw) == 3
+
+
+def test_jsonl_loader_filters_tracks_before_deduplication(tmp_path):
+    path = tmp_path / "tracks.jsonl"
+    rows = []
+    for track_id in (7, 8):
+        for point2d_idx, error in ((2, 0.2), (1, 0.1)):
+            rows.append(
+                {
+                    "track_id": track_id,
+                    "image_id": "seq1/frame0001.png",
+                    "point2d_idx": point2d_idx,
+                    "xy": [float(point2d_idx), float(point2d_idx)],
+                    "xyz": [0.0, 0.0, 1.0],
+                    "track_length": 2,
+                    "reprojection_error": error,
+                    "camera_id": 1,
+                    "image_width": 100,
+                    "image_height": 80,
+                }
+            )
+    path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+
+    selected = track_feature_sampling.load_colmap_track_observations_jsonl(path, track_ids={8})
+
+    assert len(selected) == 1
+    assert selected[0].track_id == 8
+    assert selected[0].point2d_idx == 1
+
+
 def test_build_track_feature_bank_from_colmap_tokens_cli(tmp_path):
     manifest = _token_manifest(tmp_path)
     manifest_path = tmp_path / "manifest.json"
@@ -95,7 +191,7 @@ def test_build_track_feature_bank_from_colmap_tokens_cli(tmp_path):
                 json.dumps(
                     {
                         "track_id": 7,
-                        "image_id": "seq1/frame0001.png",
+                        "image_id": "seq1/frame0002.png",
                         "point2d_idx": 1,
                         "xy": [99.0, 79.0],
                         "xyz": [0.0, 0.0, 1.0],
@@ -165,7 +261,7 @@ def test_build_track_feature_bank_cli_supports_first_channel_transform(tmp_path)
                 json.dumps(
                     {
                         "track_id": 7,
-                        "image_id": "seq1/frame0001.png",
+                        "image_id": "seq1/frame0002.png",
                         "point2d_idx": 1,
                         "xy": [99.0, 79.0],
                         "xyz": [0.0, 0.0, 1.0],
@@ -240,7 +336,7 @@ def test_build_track_feature_bank_cli_supports_selector_checkpoint(tmp_path):
                 json.dumps(
                     {
                         "track_id": 7,
-                        "image_id": "seq1/frame0001.png",
+                        "image_id": "seq1/frame0002.png",
                         "point2d_idx": 1,
                         "xy": [99.0, 79.0],
                         "xyz": [0.0, 0.0, 1.0],

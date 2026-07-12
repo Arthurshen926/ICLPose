@@ -8,7 +8,9 @@ ambiguity into the solver.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Mapping, Sequence
 
 import numpy as np
@@ -62,6 +64,49 @@ class LocalMapletBank:
 
     def __len__(self) -> int:
         return int(self.context_features.shape[0])
+
+
+@dataclass(frozen=True)
+class LocalMapletSupportIndex:
+    maplets: LocalMapletBank
+    anchor_track_ids: np.ndarray
+    neighbor_track_ids: np.ndarray
+    support_image_ids: tuple[str, ...]
+    support_image_indices: np.ndarray
+    support_coverage_counts: np.ndarray
+    candidate_k: int
+    version: str = "local_maplet_support_v1"
+
+    def __post_init__(self) -> None:
+        anchor_track_ids = np.asarray(self.anchor_track_ids, dtype=np.int64).reshape(-1)
+        neighbor_track_ids = np.asarray(self.neighbor_track_ids, dtype=np.int64)
+        support_image_indices = np.asarray(self.support_image_indices, dtype=np.int64)
+        support_coverage_counts = np.asarray(self.support_coverage_counts, dtype=np.int64)
+        count = int(anchor_track_ids.size)
+        if len(self.maplets) != count:
+            raise ValueError("maplet count must match anchor_track_ids")
+        if neighbor_track_ids.shape != self.maplets.neighbor_indices.shape:
+            raise ValueError("neighbor_track_ids must match maplet neighbor shape")
+        if support_image_indices.ndim != 2 or support_image_indices.shape[0] != count:
+            raise ValueError("support_image_indices must have shape (N, V)")
+        if support_coverage_counts.shape != support_image_indices.shape:
+            raise ValueError("support_coverage_counts must match support_image_indices")
+        if np.any((support_image_indices < -1) | (support_image_indices >= len(self.support_image_ids))):
+            raise ValueError("support_image_indices contains an out-of-range image index")
+        if int(self.candidate_k) < int(self.maplets.maplet_k):
+            raise ValueError("candidate_k must be at least maplet_k")
+        object.__setattr__(self, "anchor_track_ids", anchor_track_ids)
+        object.__setattr__(self, "neighbor_track_ids", neighbor_track_ids)
+        object.__setattr__(self, "support_image_ids", tuple(str(item) for item in self.support_image_ids))
+        object.__setattr__(self, "support_image_indices", support_image_indices)
+        object.__setattr__(self, "support_coverage_counts", support_coverage_counts)
+
+    def __len__(self) -> int:
+        return int(self.anchor_track_ids.size)
+
+    def support_views(self, row: int) -> tuple[str, ...]:
+        indices = self.support_image_indices[int(row)]
+        return tuple(self.support_image_ids[int(index)] for index in indices if int(index) >= 0)
 
 
 @dataclass(frozen=True)
@@ -417,6 +462,182 @@ def build_covisibility_maplets(
     return _replace_bank_type(_maplet_context_features(index, neighbor_indices, context_pool, covis_counts), "covis")
 
 
+def build_hybrid_maplet_support_index(
+    index: LandmarkMapIndex,
+    *,
+    maplet_k: int = 32,
+    candidate_k: int = 128,
+    max_support_views: int = 8,
+    radius: float | None = None,
+    context_pool: str = "quality_mean",
+) -> LocalMapletSupportIndex:
+    """Build bounded 3D-neighbor maplets reranked by true SfM covisibility."""
+
+    if len(np.unique(index.track_ids)) != len(index):
+        raise ValueError("maplet construction requires one row per unique track")
+    if int(maplet_k) <= 0:
+        raise ValueError("maplet_k must be positive")
+    if int(candidate_k) < int(maplet_k):
+        raise ValueError("candidate_k must be at least maplet_k")
+    if int(max_support_views) <= 0:
+        raise ValueError("max_support_views must be positive")
+    if radius is not None and float(radius) <= 0.0:
+        raise ValueError("radius must be positive when provided")
+    count = len(index)
+    maplet_size = int(maplet_k)
+    candidate_count = int(candidate_k)
+    image_vocab = tuple(sorted({str(image_id) for values in index.observation_image_ids for image_id in values}))
+    image_to_index = {image_id: row for row, image_id in enumerate(image_vocab)}
+    neighbor_indices = np.full((count, maplet_size), -1, dtype=np.int64)
+    neighbor_track_ids = np.full((count, maplet_size), -1, dtype=np.int64)
+    covisibility_counts = np.zeros((count, maplet_size), dtype=np.float32)
+    support_image_indices = np.full((count, int(max_support_views)), -1, dtype=np.int64)
+    support_coverage_counts = np.zeros((count, int(max_support_views)), dtype=np.int64)
+    if count == 0:
+        empty_maplets = _replace_bank_type(
+            _maplet_context_features(index, neighbor_indices, context_pool, covisibility_counts),
+            "knn_covisibility_hybrid",
+        )
+        return LocalMapletSupportIndex(
+            maplets=empty_maplets,
+            anchor_track_ids=index.track_ids,
+            neighbor_track_ids=neighbor_track_ids,
+            support_image_ids=image_vocab,
+            support_image_indices=support_image_indices,
+            support_coverage_counts=support_coverage_counts,
+            candidate_k=candidate_count,
+        )
+
+    try:
+        from scipy.spatial import cKDTree
+    except Exception as exc:  # pragma: no cover - scipy is a project dependency
+        raise RuntimeError("scipy is required for full-bank hybrid maplet construction") from exc
+    tree = cKDTree(np.asarray(index.xyz, dtype=np.float64))
+    effective = min(count, candidate_count + 1)
+    try:
+        distances, candidates = tree.query(index.xyz, k=effective, workers=-1)
+    except TypeError:  # pragma: no cover - old scipy compatibility
+        distances, candidates = tree.query(index.xyz, k=effective)
+    if effective == 1:
+        distances = distances[:, None]
+        candidates = candidates[:, None]
+    image_sets = tuple(frozenset(str(item) for item in values) for values in index.observation_image_ids)
+    observation_counts = np.asarray(index.observation_counts, dtype=np.int64)
+
+    for row in range(count):
+        anchor_images = image_sets[row]
+        scored: list[tuple[int, float, int, int]] = []
+        for distance, candidate in zip(distances[row].tolist(), candidates[row].tolist()):
+            candidate_row = int(candidate)
+            if candidate_row == row or not np.isfinite(float(distance)):
+                continue
+            if radius is not None and float(distance) > float(radius):
+                continue
+            shared = len(anchor_images.intersection(image_sets[candidate_row]))
+            scored.append((candidate_row, float(distance), int(shared), int(observation_counts[candidate_row])))
+        scored.sort(key=lambda item: (-item[2], item[1], -item[3], int(index.track_ids[item[0]])))
+        selected = scored[:maplet_size]
+        if selected:
+            selected_rows = np.asarray([item[0] for item in selected], dtype=np.int64)
+            neighbor_indices[row, : len(selected)] = selected_rows
+            neighbor_track_ids[row, : len(selected)] = index.track_ids[selected_rows]
+            covisibility_counts[row, : len(selected)] = np.asarray([item[2] for item in selected], dtype=np.float32)
+
+        maplet_rows = [row] + [item[0] for item in selected]
+        support_scores = [
+            (
+                str(image_id),
+                sum(1 for maplet_row in maplet_rows if str(image_id) in image_sets[int(maplet_row)]),
+            )
+            for image_id in anchor_images
+        ]
+        support_scores.sort(key=lambda item: (-item[1], item[0]))
+        for support_rank, (image_id, coverage) in enumerate(support_scores[: int(max_support_views)]):
+            support_image_indices[row, support_rank] = int(image_to_index[image_id])
+            support_coverage_counts[row, support_rank] = int(coverage)
+
+    maplet_bank = _replace_bank_type(
+        _maplet_context_features(index, neighbor_indices, context_pool, covisibility_counts),
+        "knn_covisibility_hybrid",
+    )
+    return LocalMapletSupportIndex(
+        maplets=maplet_bank,
+        anchor_track_ids=index.track_ids,
+        neighbor_track_ids=neighbor_track_ids,
+        support_image_ids=image_vocab,
+        support_image_indices=support_image_indices,
+        support_coverage_counts=support_coverage_counts,
+        candidate_k=candidate_count,
+    )
+
+
+def save_local_maplet_support_index_npz(
+    index: LocalMapletSupportIndex,
+    path: Path,
+    *,
+    metadata: Mapping[str, object] | None = None,
+) -> None:
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    bank = index.maplets
+    payload = {
+        "format": "local_maplet_support_index_npz",
+        "format_version": 1,
+        "version": str(index.version),
+        **dict(metadata or {}),
+    }
+    np.savez(
+        output,
+        anchor_track_ids=index.anchor_track_ids,
+        neighbor_indices=bank.neighbor_indices,
+        neighbor_track_ids=index.neighbor_track_ids,
+        context_features=bank.context_features,
+        neighbor_counts=bank.neighbor_counts,
+        context_radius=bank.context_radius,
+        context_feature_variance=bank.context_feature_variance,
+        covisibility_strength=bank.covisibility_strength,
+        xyz_cov_eigvals=bank.xyz_cov_eigvals,
+        neighbor_idf_mean=bank.neighbor_idf_mean,
+        support_image_ids=np.asarray(index.support_image_ids, dtype=np.str_),
+        support_image_indices=index.support_image_indices,
+        support_coverage_counts=index.support_coverage_counts,
+        maplet_type=np.asarray(bank.maplet_type, dtype=np.str_),
+        maplet_k=np.asarray(bank.maplet_k, dtype=np.int64),
+        context_pool=np.asarray(bank.context_pool, dtype=np.str_),
+        candidate_k=np.asarray(index.candidate_k, dtype=np.int64),
+        metadata_json=np.asarray(json.dumps(payload, sort_keys=True), dtype=np.str_),
+    )
+
+
+def load_local_maplet_support_index_npz(path: Path) -> tuple[LocalMapletSupportIndex, dict[str, object]]:
+    with np.load(Path(path), allow_pickle=False) as data:
+        maplets = LocalMapletBank(
+            neighbor_indices=np.asarray(data["neighbor_indices"], dtype=np.int64),
+            context_features=np.asarray(data["context_features"], dtype=np.float32),
+            neighbor_counts=np.asarray(data["neighbor_counts"], dtype=np.int64),
+            context_radius=np.asarray(data["context_radius"], dtype=np.float32),
+            context_feature_variance=np.asarray(data["context_feature_variance"], dtype=np.float32),
+            covisibility_strength=np.asarray(data["covisibility_strength"], dtype=np.float32),
+            xyz_cov_eigvals=np.asarray(data["xyz_cov_eigvals"], dtype=np.float32),
+            neighbor_idf_mean=np.asarray(data["neighbor_idf_mean"], dtype=np.float32),
+            maplet_type=str(data["maplet_type"].item()),
+            maplet_k=int(data["maplet_k"].item()),
+            context_pool=str(data["context_pool"].item()),
+        )
+        metadata = json.loads(str(data["metadata_json"].item()))
+        output = LocalMapletSupportIndex(
+            maplets=maplets,
+            anchor_track_ids=np.asarray(data["anchor_track_ids"], dtype=np.int64),
+            neighbor_track_ids=np.asarray(data["neighbor_track_ids"], dtype=np.int64),
+            support_image_ids=tuple(str(item) for item in data["support_image_ids"].tolist()),
+            support_image_indices=np.asarray(data["support_image_indices"], dtype=np.int64),
+            support_coverage_counts=np.asarray(data["support_coverage_counts"], dtype=np.int64),
+            candidate_k=int(data["candidate_k"].item()),
+            version=str(metadata.get("version", "local_maplet_support_v1")),
+        )
+    return output, dict(metadata)
+
+
 def build_ref_neighborhood_maplets(
     index: LandmarkMapIndex,
     observations_by_image: Mapping[str, Sequence[FootprintObservation]],
@@ -498,6 +719,22 @@ def local_maplet_bank_stats(bank: LocalMapletBank) -> dict[str, float | int | st
         "mean_context_feature_variance": float(np.mean(bank.context_feature_variance)),
         "mean_covisibility_strength": float(np.mean(bank.covisibility_strength)),
         "mean_maplet_reliability": float(np.mean(reliability)) if reliability.size else 0.0,
+    }
+
+
+def local_maplet_support_index_stats(index: LocalMapletSupportIndex) -> dict[str, float | int | str]:
+    base = local_maplet_bank_stats(index.maplets)
+    valid_supports = index.support_image_indices >= 0
+    support_counts = np.sum(valid_supports, axis=1) if len(index) else np.zeros((0,), dtype=np.int64)
+    valid_coverages = index.support_coverage_counts[valid_supports]
+    return {
+        **base,
+        "version": str(index.version),
+        "candidate_k": int(index.candidate_k),
+        "support_image_count": int(len(index.support_image_ids)),
+        "mean_support_view_count": float(np.mean(support_counts)) if support_counts.size else 0.0,
+        "min_support_view_count": int(np.min(support_counts)) if support_counts.size else 0,
+        "mean_support_coverage_count": float(np.mean(valid_coverages)) if valid_coverages.size else 0.0,
     }
 
 

@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
+from pathlib import Path
 from typing import Sequence
 
 import numpy as np
 import torch
 from torch.nn import functional as F
+
+from feature_extract.vfm.landmark_feature_aggregation import LandmarkAggregationConfig, TrackPrototypeBuilder
 
 
 @dataclass(frozen=True)
@@ -20,6 +24,13 @@ class LandmarkRetrievalLossConfig:
     random_negatives: int = 128
     max_memory_negatives: int = 2048
     dustbin_logit: float | None = 0.0
+    dustbin_loss_weight: float = 0.25
+    dustbin_detach_descriptors: bool = False
+    prototype_aggregation_method: str = "mean"
+    prototype_l2_normalize_observations: bool = False
+    normalize_final_prototypes: bool = True
+    prototype_min_support_observations: int = 1
+    set_valued_cell_positives: bool = True
 
     def __post_init__(self) -> None:
         if float(self.temperature) <= 0.0:
@@ -35,6 +46,18 @@ class LandmarkRetrievalLossConfig:
         ):
             if int(getattr(self, name)) < 0:
                 raise ValueError(f"{name} must be non-negative")
+        if str(self.prototype_aggregation_method) not in {
+            "mean",
+            "cosine_weighted_mean",
+            "geometry_weighted",
+        }:
+            raise ValueError("unsupported training-time prototype aggregation method")
+        if int(self.prototype_min_support_observations) <= 0:
+            raise ValueError("prototype_min_support_observations must be positive")
+        if self.dustbin_logit is not None and not np.isfinite(float(self.dustbin_logit)):
+            raise ValueError("dustbin_logit must be finite or None")
+        if float(self.dustbin_loss_weight) < 0.0:
+            raise ValueError("dustbin_loss_weight must be non-negative")
 
 
 class LandmarkPrototypeMemoryBank:
@@ -47,6 +70,8 @@ class LandmarkPrototypeMemoryBank:
         descriptor_dim: int,
         device: torch.device | str,
         momentum: float = 0.9,
+        frozen: bool = False,
+        source_path: str = "",
     ) -> None:
         if int(capacity) <= 0:
             raise ValueError("landmark memory capacity must be positive")
@@ -58,6 +83,9 @@ class LandmarkPrototypeMemoryBank:
         self.descriptor_dim = int(descriptor_dim)
         self.device = torch.device(device)
         self.momentum = float(momentum)
+        self.frozen = bool(frozen)
+        self.source_path = str(source_path)
+        self.snapshot_metadata: dict[str, object] = {}
         self.descriptors = torch.zeros(
             (self.capacity, self.descriptor_dim),
             dtype=torch.float32,
@@ -69,6 +97,52 @@ class LandmarkPrototypeMemoryBank:
         self._slot_by_track: dict[int, int] = {}
         self._size = 0
         self._next_evict = 0
+
+    @classmethod
+    def from_projected_landmark_npz(
+        cls,
+        path: Path,
+        *,
+        device: torch.device | str,
+        expected_descriptor_dim: int,
+    ) -> "LandmarkPrototypeMemoryBank":
+        source = Path(path)
+        with np.load(source, allow_pickle=False) as data:
+            track_ids = np.asarray(data["track_ids"], dtype=np.int64).reshape(-1)
+            descriptors = np.asarray(data["features"], dtype=np.float32)
+            xyz = np.asarray(data["xyz"], dtype=np.float32).reshape(-1, 3)
+            counts = np.asarray(data["observation_counts"], dtype=np.int64).reshape(-1)
+            metadata = json.loads(str(data["metadata_json"].item())) if "metadata_json" in data else {}
+        if descriptors.ndim != 2 or descriptors.shape[0] != track_ids.shape[0]:
+            raise ValueError("frozen landmark snapshot has inconsistent track_ids/features")
+        if int(descriptors.shape[1]) != int(expected_descriptor_dim):
+            raise ValueError(
+                "frozen landmark snapshot descriptor dimension mismatch: "
+                f"snapshot={descriptors.shape[1]}, model={int(expected_descriptor_dim)}"
+            )
+        if len(set(track_ids.tolist())) != int(track_ids.size):
+            raise ValueError("frozen landmark snapshot contains duplicate track ids")
+        if xyz.shape[0] != track_ids.shape[0] or counts.shape[0] != track_ids.shape[0]:
+            raise ValueError("frozen landmark snapshot xyz/count arrays do not match track ids")
+        bank = cls(
+            capacity=max(1, int(track_ids.size)),
+            descriptor_dim=int(expected_descriptor_dim),
+            device=device,
+            momentum=0.0,
+            frozen=True,
+            source_path=str(source),
+        )
+        bank._size = int(track_ids.size)
+        bank.track_ids[: bank._size] = track_ids
+        bank.observation_counts[: bank._size] = counts
+        bank.descriptors[: bank._size] = F.normalize(
+            torch.as_tensor(descriptors, dtype=torch.float32, device=bank.device),
+            dim=1,
+        )
+        bank.xyz[: bank._size] = torch.as_tensor(xyz, dtype=torch.float32, device=bank.device)
+        bank._slot_by_track = {int(track_id): int(slot) for slot, track_id in enumerate(track_ids.tolist())}
+        bank.snapshot_metadata = dict(metadata)
+        return bank
 
     def __len__(self) -> int:
         return int(self._size)
@@ -141,6 +215,8 @@ class LandmarkPrototypeMemoryBank:
         observation_counts: Sequence[int] | np.ndarray,
         xyz: torch.Tensor | None = None,
     ) -> None:
+        if bool(self.frozen):
+            return
         ids = np.asarray(track_ids, dtype=np.int64).reshape(-1)
         counts = np.asarray(observation_counts, dtype=np.int64).reshape(-1)
         values = F.normalize(descriptors.detach().to(device=self.device, dtype=torch.float32), dim=1)
@@ -173,13 +249,17 @@ def _aggregate_track_rows(
     descriptors: torch.Tensor,
     inverse: torch.Tensor,
     track_count: int,
+    config: LandmarkRetrievalLossConfig,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    normalized = F.normalize(descriptors, dim=1)
-    sums = torch.zeros((int(track_count), int(normalized.shape[1])), dtype=normalized.dtype, device=normalized.device)
-    sums.index_add_(0, inverse, normalized)
-    counts = torch.bincount(inverse, minlength=int(track_count)).to(dtype=normalized.dtype)
-    prototypes = F.normalize(sums / counts.clamp_min(1.0)[:, None], dim=1)
-    return prototypes, counts
+    builder = TrackPrototypeBuilder(
+        aggregation=LandmarkAggregationConfig(
+            method=str(config.prototype_aggregation_method),
+            min_observations=1,
+            l2_normalize_observations=bool(config.prototype_l2_normalize_observations),
+        ),
+        normalize_final_prototypes=bool(config.normalize_final_prototypes),
+    )
+    return builder.aggregate_torch(descriptors, inverse, int(track_count))
 
 
 def _aggregate_track_xyz(xyz: torch.Tensor | None, inverse: torch.Tensor, track_count: int) -> torch.Tensor:
@@ -218,6 +298,10 @@ def landmark_retrieval_loss(
     *,
     track_xyz: torch.Tensor | None = None,
     query_group_ids: torch.Tensor | None = None,
+    query_image_group_ids: torch.Tensor | None = None,
+    dustbin_logits: torch.Tensor | None = None,
+    unmatched_query_descriptors: torch.Tensor | None = None,
+    unmatched_dustbin_logits: torch.Tensor | None = None,
     memory_bank: LandmarkPrototypeMemoryBank | None = None,
     config: LandmarkRetrievalLossConfig | None = None,
     update_memory: bool = False,
@@ -236,23 +320,87 @@ def landmark_retrieval_loss(
         groups = query_group_ids.to(device=query_descriptors.device, dtype=torch.long).reshape(-1)
         if groups.shape[0] != ids.shape[0]:
             raise ValueError("query_group_ids must contain one value per descriptor pair")
+    image_groups = None
+    if query_image_group_ids is not None:
+        image_groups = query_image_group_ids.to(device=query_descriptors.device, dtype=torch.long).reshape(-1)
+        if image_groups.shape[0] != ids.shape[0]:
+            raise ValueError("query_image_group_ids must contain one value per descriptor pair")
     valid = (ids >= 0) & torch.isfinite(query_descriptors).all(dim=1) & torch.isfinite(support_descriptors).all(dim=1)
     if not torch.any(valid):
         return None, {"landmark_retrieval_valid_count": 0.0}
     query = F.normalize(query_descriptors[valid], dim=1)
+    valid_dustbin_logits = None
+    if dustbin_logits is not None:
+        all_dustbin_logits = dustbin_logits.to(device=query.device, dtype=query.dtype).reshape(-1)
+        if all_dustbin_logits.shape[0] != valid.shape[0]:
+            raise ValueError("dustbin_logits must contain one value per query descriptor")
+        valid_dustbin_logits = all_dustbin_logits[valid]
     support = support_descriptors[valid]
     ids = ids[valid]
     if groups is not None:
         groups = groups[valid]
+    if image_groups is not None:
+        image_groups = image_groups[valid]
     xyz_rows = None if track_xyz is None else track_xyz.to(device=query.device, dtype=torch.float32).reshape(-1, 3)[valid]
-    unique_ids, inverse = torch.unique(ids, sorted=True, return_inverse=True)
-    current_prototypes, current_counts = _aggregate_track_rows(support, inverse, int(unique_ids.numel()))
-    current_xyz = _aggregate_track_xyz(xyz_rows, inverse, int(unique_ids.numel()))
+    all_unique_ids, all_inverse = torch.unique(ids, sorted=True, return_inverse=True)
+    all_prototypes, all_counts = _aggregate_track_rows(
+        support,
+        all_inverse,
+        int(all_unique_ids.numel()),
+        cfg,
+    )
+    all_xyz = _aggregate_track_xyz(xyz_rows, all_inverse, int(all_unique_ids.numel()))
+    eligible_tracks = all_counts >= float(cfg.prototype_min_support_observations)
+    if not torch.any(eligible_tracks):
+        return None, {
+            "landmark_retrieval_valid_count": 0.0,
+            "landmark_retrieval_support_observation_count": float(query.shape[0]),
+            "landmark_retrieval_eligible_track_count": 0.0,
+            "landmark_retrieval_dropped_singleton_track_count": float(all_unique_ids.numel()),
+        }
+    old_to_new = torch.full((all_unique_ids.numel(),), -1, dtype=torch.long, device=query.device)
+    old_to_new[eligible_tracks] = torch.arange(int(torch.count_nonzero(eligible_tracks)), device=query.device)
+    eligible_rows = eligible_tracks[all_inverse]
+    query = query[eligible_rows]
+    if valid_dustbin_logits is not None:
+        valid_dustbin_logits = valid_dustbin_logits[eligible_rows]
+    ids = ids[eligible_rows]
+    labels = old_to_new[all_inverse[eligible_rows]]
+    if groups is not None:
+        groups = groups[eligible_rows]
+    if image_groups is not None:
+        image_groups = image_groups[eligible_rows]
+    unique_ids = all_unique_ids[eligible_tracks]
+    current_prototypes = all_prototypes[eligible_tracks]
+    current_counts = all_counts[eligible_tracks]
+    current_xyz = all_xyz[eligible_tracks]
+    total_valid_support_count = int(support.shape[0])
+    eligible_support_count = int(torch.count_nonzero(eligible_rows).item())
+    input_query_count = int(query.shape[0])
+    if image_groups is not None:
+        keep_rows: list[int] = []
+        seen_query_tracks: set[tuple[int, int]] = set()
+        for row, (image_group, track_id) in enumerate(
+            zip(image_groups.detach().cpu().tolist(), ids.detach().cpu().tolist())
+        ):
+            key = (int(image_group), int(track_id))
+            if key in seen_query_tracks:
+                continue
+            seen_query_tracks.add(key)
+            keep_rows.append(int(row))
+        keep = torch.as_tensor(keep_rows, dtype=torch.long, device=query.device)
+        query = query[keep]
+        if valid_dustbin_logits is not None:
+            valid_dustbin_logits = valid_dustbin_logits[keep]
+        labels = labels[keep]
+        image_groups = image_groups[keep]
+        if groups is not None:
+            groups = groups[keep]
 
     history_found = torch.zeros((unique_ids.numel(),), dtype=torch.bool, device=query.device)
     history_counts = np.zeros((unique_ids.numel(),), dtype=np.int64)
     positive_prototypes = current_prototypes
-    if memory_bank is not None and len(memory_bank) > 0:
+    if memory_bank is not None and len(memory_bank) > 0 and not bool(memory_bank.frozen):
         history, history_found, history_counts, _history_xyz = memory_bank.lookup(unique_ids.detach().cpu().numpy())
         mix = float(cfg.prototype_history_mix)
         weights = history_found.to(dtype=current_prototypes.dtype)[:, None] * mix
@@ -270,8 +418,29 @@ def landmark_retrieval_loss(
             max_count=int(cfg.memory_candidate_pool_size),
             seed=int(seed),
         )
+    unmatched_query = query.new_zeros((0, query.shape[1]))
+    valid_unmatched_dustbin_logits = None
+    if unmatched_query_descriptors is not None:
+        unmatched_values = unmatched_query_descriptors.to(device=query.device, dtype=query.dtype).reshape(
+            -1, query.shape[1]
+        )
+        unmatched_valid = torch.isfinite(unmatched_values).all(dim=1)
+        unmatched_query = F.normalize(unmatched_values[unmatched_valid], dim=1)
+        if unmatched_dustbin_logits is not None:
+            all_unmatched_dustbin_logits = unmatched_dustbin_logits.to(
+                device=query.device,
+                dtype=query.dtype,
+            ).reshape(-1)
+            if all_unmatched_dustbin_logits.shape[0] != unmatched_values.shape[0]:
+                raise ValueError("unmatched_dustbin_logits must contain one value per unmatched descriptor")
+            valid_unmatched_dustbin_logits = all_unmatched_dustbin_logits[unmatched_valid]
+    elif unmatched_dustbin_logits is not None:
+        raise ValueError("unmatched_dustbin_logits requires unmatched_query_descriptors")
     if memory_descriptors.shape[0] > 0:
-        detached_scores = query.detach() @ memory_descriptors.T
+        semantic_queries = query.detach()
+        if unmatched_query.shape[0] > 0:
+            semantic_queries = torch.cat([semantic_queries, unmatched_query.detach()], dim=0)
+        detached_scores = semantic_queries @ memory_descriptors.T
         semantic_k = min(int(cfg.semantic_hard_negatives_per_query), int(memory_descriptors.shape[0]))
         if semantic_k > 0:
             semantic_selected = torch.topk(detached_scores, k=semantic_k, dim=1).indices.reshape(-1).detach().cpu().tolist()
@@ -299,10 +468,11 @@ def landmark_retrieval_loss(
         candidate_descriptors = torch.cat([candidate_descriptors, memory_descriptors[selected]], dim=0)
     cosine_scores = query @ candidate_descriptors.T
     logits = cosine_scores / float(cfg.temperature)
-    if cfg.dustbin_logit is not None and np.isfinite(float(cfg.dustbin_logit)):
+    if valid_dustbin_logits is not None:
+        logits = torch.cat([logits, valid_dustbin_logits[:, None]], dim=1)
+    elif cfg.dustbin_logit is not None and np.isfinite(float(cfg.dustbin_logit)):
         dustbin = torch.full((logits.shape[0], 1), float(cfg.dustbin_logit), dtype=logits.dtype, device=logits.device)
         logits = torch.cat([logits, dustbin], dim=1)
-    labels = inverse
     same_group_track_mask = torch.zeros(
         (int(query.shape[0]), int(unique_ids.numel())),
         dtype=torch.bool,
@@ -311,18 +481,56 @@ def landmark_retrieval_loss(
     same_group_track_mask[torch.arange(query.shape[0], device=query.device), labels] = True
     if groups is not None:
         same_group_rows = groups[:, None] == groups[None, :]
-        row_track_membership = F.one_hot(inverse, num_classes=int(unique_ids.numel())).to(dtype=torch.float32)
+        row_track_membership = F.one_hot(labels, num_classes=int(unique_ids.numel())).to(dtype=torch.float32)
         same_group_track_mask = (same_group_rows.to(dtype=torch.float32) @ row_track_membership) > 0
-    denominator_keep = torch.ones_like(logits, dtype=torch.bool)
-    denominator_keep[:, : int(unique_ids.numel())] = ~same_group_track_mask
-    denominator_keep[torch.arange(logits.shape[0], device=logits.device), labels] = True
-    masked_logits = logits.masked_fill(~denominator_keep, float("-inf"))
-    loss = F.cross_entropy(masked_logits, labels)
+    if bool(cfg.set_valued_cell_positives):
+        positive_mask = torch.zeros_like(logits, dtype=torch.bool)
+        positive_mask[:, : int(unique_ids.numel())] = same_group_track_mask
+        positive_logsumexp = torch.logsumexp(logits.masked_fill(~positive_mask, float("-inf")), dim=1)
+        retrieval_loss = (torch.logsumexp(logits, dim=1) - positive_logsumexp).mean()
+    else:
+        denominator_keep = torch.ones_like(logits, dtype=torch.bool)
+        denominator_keep[:, : int(unique_ids.numel())] = ~same_group_track_mask
+        denominator_keep[torch.arange(logits.shape[0], device=logits.device), labels] = True
+        masked_logits = logits.masked_fill(~denominator_keep, float("-inf"))
+        retrieval_loss = F.cross_entropy(masked_logits, labels)
+
+    unmatched_logits = logits.new_zeros((0, int(candidate_descriptors.shape[0]) + 1))
+    dustbin_loss = logits.new_tensor(0.0)
+    if unmatched_query.shape[0] > 0:
+        unmatched_for_scores = unmatched_query.detach() if bool(cfg.dustbin_detach_descriptors) else unmatched_query
+        candidates_for_scores = (
+            candidate_descriptors.detach() if bool(cfg.dustbin_detach_descriptors) else candidate_descriptors
+        )
+        unmatched_logits = (unmatched_for_scores @ candidates_for_scores.T) / float(cfg.temperature)
+        if valid_unmatched_dustbin_logits is not None:
+            unmatched_logits = torch.cat([unmatched_logits, valid_unmatched_dustbin_logits[:, None]], dim=1)
+        elif cfg.dustbin_logit is not None and np.isfinite(float(cfg.dustbin_logit)):
+            dustbin = torch.full(
+                (unmatched_logits.shape[0], 1),
+                float(cfg.dustbin_logit),
+                dtype=unmatched_logits.dtype,
+                device=unmatched_logits.device,
+            )
+            unmatched_logits = torch.cat([unmatched_logits, dustbin], dim=1)
+        else:
+            raise ValueError("unmatched landmark queries require a learned or fixed dustbin logit")
+        dustbin_targets = torch.full(
+            (unmatched_logits.shape[0],),
+            int(unmatched_logits.shape[1] - 1),
+            dtype=torch.long,
+            device=unmatched_logits.device,
+        )
+        dustbin_loss = F.cross_entropy(unmatched_logits, dustbin_targets)
+    loss = retrieval_loss + float(cfg.dustbin_loss_weight) * dustbin_loss
 
     with torch.no_grad():
         positive_scores = cosine_scores[torch.arange(cosine_scores.shape[0], device=query.device), labels]
         negative_mask = torch.ones_like(cosine_scores, dtype=torch.bool)
-        negative_mask[torch.arange(cosine_scores.shape[0], device=query.device), labels] = False
+        if bool(cfg.set_valued_cell_positives):
+            negative_mask[:, : int(unique_ids.numel())] &= ~same_group_track_mask
+        else:
+            negative_mask[torch.arange(cosine_scores.shape[0], device=query.device), labels] = False
         if torch.any(negative_mask):
             hardest_negative = cosine_scores.masked_fill(~negative_mask, -1.0).max(dim=1).values
             score_gap = positive_scores - hardest_negative
@@ -333,7 +541,18 @@ def landmark_retrieval_loss(
             score_gap_mean = float("nan")
         metrics: dict[str, float] = {
             "landmark_retrieval_loss": float(loss.detach().cpu().item()),
+            "landmark_retrieval_positive_loss": float(retrieval_loss.detach().cpu().item()),
+            "landmark_retrieval_dustbin_loss": float(dustbin_loss.detach().cpu().item()),
+            "landmark_retrieval_dustbin_positive_count": float(unmatched_query.shape[0]),
             "landmark_retrieval_valid_count": float(query.shape[0]),
+            "landmark_retrieval_support_observation_count": float(input_query_count),
+            "landmark_retrieval_deduplicated_query_count": float(input_query_count - int(query.shape[0])),
+            "landmark_retrieval_total_valid_support_observation_count": float(total_valid_support_count),
+            "landmark_retrieval_eligible_support_observation_count": float(eligible_support_count),
+            "landmark_retrieval_eligible_track_count": float(unique_ids.numel()),
+            "landmark_retrieval_dropped_singleton_track_count": float(
+                all_unique_ids.numel() - unique_ids.numel()
+            ),
             "landmark_retrieval_track_count": float(unique_ids.numel()),
             "landmark_retrieval_candidate_count": float(logits.shape[1]),
             "landmark_retrieval_memory_negative_count": float(len(selected_memory_indices)),
@@ -352,7 +571,22 @@ def landmark_retrieval_loss(
                 (same_group_track_mask.sum(dim=1) - 1).clamp_min(0).float().mean().item()
             ),
             "landmark_retrieval_memory_size_before": float(0 if memory_bank is None else len(memory_bank)),
+            "landmark_retrieval_set_valued_cell_positives": float(bool(cfg.set_valued_cell_positives)),
         }
+        if valid_dustbin_logits is not None:
+            valid_dustbin_prob = torch.softmax(logits, dim=1)[:, -1]
+            metrics["landmark_retrieval_valid_dustbin_probability_mean"] = float(valid_dustbin_prob.mean().item())
+            metrics["landmark_retrieval_valid_accept_rate_0p5"] = float(
+                (valid_dustbin_prob < 0.5).float().mean().item()
+            )
+        if unmatched_query.shape[0] > 0:
+            unmatched_dustbin_prob = torch.softmax(unmatched_logits, dim=1)[:, -1]
+            metrics["landmark_retrieval_unmatched_dustbin_probability_mean"] = float(
+                unmatched_dustbin_prob.mean().item()
+            )
+            metrics["landmark_retrieval_dustbin_recall_0p5"] = float(
+                (unmatched_dustbin_prob >= 0.5).float().mean().item()
+            )
         ranking = torch.argsort(logits, dim=1, descending=True)
         valid_group_candidates = torch.zeros_like(logits, dtype=torch.bool)
         valid_group_candidates[:, : int(unique_ids.numel())] = same_group_track_mask

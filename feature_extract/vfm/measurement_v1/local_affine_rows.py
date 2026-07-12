@@ -9,7 +9,11 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
-from feature_extract.vfm.colmap_tracks import ColmapTrackObservation
+from feature_extract.vfm.colmap_tracks import (
+    ColmapTrackObservation,
+    read_colmap_cameras_binary,
+    read_colmap_images_binary,
+)
 from feature_extract.vfm.track_feature_sampling import load_colmap_track_observations_jsonl
 
 
@@ -117,6 +121,49 @@ def _pair_points_for_rows(
                     continue
                 qx, qy = _scaled_xy(query, image_width=image_width, image_height=image_height)
                 pair_points[(support_id, query_id)].append((sx, sy, qx, qy))
+    return pair_points
+
+
+def _pair_points_from_colmap_model(
+    model_dir: Path,
+    pair_keys: set[tuple[str, str]],
+    *,
+    image_width: int | None = None,
+    image_height: int | None = None,
+) -> dict[tuple[str, str], list[tuple[float, float, float, float]]]:
+    """Load only image-level intersections needed by a diagnostic pair set."""
+
+    images = read_colmap_images_binary(Path(model_dir) / "images.bin")
+    cameras = read_colmap_cameras_binary(Path(model_dir) / "cameras.bin")
+    required_images = {image_id for pair in pair_keys for image_id in pair}
+    by_name = {str(image.image_name): image for image in images.values()}
+    track_xy_by_image: dict[str, dict[int, tuple[float, float]]] = {}
+    for image_id in required_images:
+        image = by_name.get(str(image_id))
+        if image is None:
+            continue
+        camera = cameras.get(int(image.camera_id))
+        source_width = int(camera.width) if camera is not None else int(image_width or 0)
+        source_height = int(camera.height) if camera is not None else int(image_height or 0)
+        target_width = int(image_width or source_width)
+        target_height = int(image_height or source_height)
+        if min(source_width, source_height, target_width, target_height) <= 0:
+            raise ValueError("COLMAP affine oracle requires valid image dimensions")
+        scale_x = float(target_width) / float(source_width)
+        scale_y = float(target_height) / float(source_height)
+        track_xy_by_image[str(image_id)] = {
+            int(track_id): (float(xy[0]) * scale_x, float(xy[1]) * scale_y)
+            for track_id, xy in zip(image.point3d_ids.tolist(), image.xys.tolist())
+            if int(track_id) >= 0
+        }
+    pair_points: dict[tuple[str, str], list[tuple[float, float, float, float]]] = {}
+    for support_id, query_id in pair_keys:
+        support = track_xy_by_image.get(str(support_id), {})
+        query = track_xy_by_image.get(str(query_id), {})
+        common = sorted(set(support) & set(query))
+        pair_points[(str(support_id), str(query_id))] = [
+            (*support[track_id], *query[track_id]) for track_id in common
+        ]
     return pair_points
 
 
@@ -333,24 +380,17 @@ def _fit_local_support_to_query_homography(
     }
 
 
-def augment_measurement_rows_with_local_affine_from_observations(
+def _augment_affine_rows(
     *,
-    rows_csv: Path,
-    observations: Sequence[ColmapTrackObservation],
+    rows: Sequence[Mapping[str, Any]],
+    fieldnames: Sequence[str],
+    pair_points: Mapping[tuple[str, str], Sequence[tuple[float, float, float, float]]],
     output_rows_csv: Path,
-    image_width: int | None = None,
-    image_height: int | None = None,
-    local_radius_px: float = 32.0,
-    min_points: int = 6,
-    max_points: int = 64,
-    max_rmse_px: float | None = None,
-    max_rows: int | None = None,
+    local_radius_px: float,
+    min_points: int,
+    max_points: int,
+    max_rmse_px: float | None,
 ) -> dict[str, Any]:
-    rows, fieldnames = _read_csv(Path(rows_csv))
-    if max_rows is not None:
-        rows = rows[: int(max_rows)]
-    pair_keys = {_target_pair(row) for row in rows}
-    pair_points = _pair_points_for_rows(observations, pair_keys, image_width=image_width, image_height=image_height)
     out_rows: list[dict[str, Any]] = []
     skipped: dict[str, int] = {}
     for row in rows:
@@ -377,6 +417,7 @@ def augment_measurement_rows_with_local_affine_from_observations(
         if name not in output_fields:
             output_fields.append(name)
     _write_csv(Path(output_rows_csv), out_rows, output_fields)
+    pair_keys = {_target_pair(row) for row in rows}
     return {
         "input_rows": int(len(rows)),
         "output_rows": int(len(out_rows)),
@@ -389,6 +430,87 @@ def augment_measurement_rows_with_local_affine_from_observations(
         "max_rmse_px": None if max_rmse_px is None else float(max_rmse_px),
         "skipped": dict(sorted(skipped.items())),
     }
+
+
+def augment_measurement_rows_with_local_affine_from_observations(
+    *,
+    rows_csv: Path,
+    observations: Sequence[ColmapTrackObservation],
+    output_rows_csv: Path,
+    image_width: int | None = None,
+    image_height: int | None = None,
+    local_radius_px: float = 32.0,
+    min_points: int = 6,
+    max_points: int = 64,
+    max_rmse_px: float | None = None,
+    max_rows: int | None = None,
+) -> dict[str, Any]:
+    rows, fieldnames = _read_csv(Path(rows_csv))
+    if max_rows is not None:
+        rows = rows[: int(max_rows)]
+    pair_keys = {_target_pair(row) for row in rows}
+    pair_points = _pair_points_for_rows(
+        observations,
+        pair_keys,
+        image_width=image_width,
+        image_height=image_height,
+    )
+    return _augment_affine_rows(
+        rows=rows,
+        fieldnames=fieldnames,
+        pair_points=pair_points,
+        output_rows_csv=Path(output_rows_csv),
+        local_radius_px=float(local_radius_px),
+        min_points=int(min_points),
+        max_points=int(max_points),
+        max_rmse_px=max_rmse_px,
+    )
+
+
+def augment_measurement_rows_with_local_affine_from_colmap_model(
+    *,
+    rows_csv: Path,
+    model_dir: Path,
+    output_rows_csv: Path,
+    image_width: int | None = None,
+    image_height: int | None = None,
+    local_radius_px: float = 32.0,
+    min_points: int = 6,
+    max_points: int = 64,
+    max_rmse_px: float | None = None,
+    max_rows: int | None = None,
+) -> dict[str, Any]:
+    """Fit a GT-observation affine upper bound; never use this in online inference."""
+
+    rows, fieldnames = _read_csv(Path(rows_csv))
+    if max_rows is not None:
+        rows = rows[: int(max_rows)]
+    pair_keys = {_target_pair(row) for row in rows}
+    pair_points = _pair_points_from_colmap_model(
+        Path(model_dir),
+        pair_keys,
+        image_width=image_width,
+        image_height=image_height,
+    )
+    summary = _augment_affine_rows(
+        rows=rows,
+        fieldnames=fieldnames,
+        pair_points=pair_points,
+        output_rows_csv=Path(output_rows_csv),
+        local_radius_px=float(local_radius_px),
+        min_points=int(min_points),
+        max_points=int(max_points),
+        max_rmse_px=max_rmse_px,
+    )
+    summary.update(
+        {
+            "diagnostic_only": True,
+            "online_available": False,
+            "geometry_source": "gt_colmap_query_observation_intersections",
+            "model_dir": str(model_dir),
+        }
+    )
+    return summary
 
 
 def augment_measurement_rows_with_local_homography_from_observations(

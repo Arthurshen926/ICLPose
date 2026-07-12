@@ -11,10 +11,32 @@ import torch
 
 from feature_extract.vfm.measurement_v1 import rgb_patch_training
 from feature_extract.vfm.measurement_v1.rgb_patch_training import (
+    _configure_head_only_training,
     _residual_bin_metrics,
     _ResidualBalancedBatchSampler,
     train_rgb_patch_measurement_branch,
 )
+
+
+def test_measurement_gate_head_only_training_freezes_every_other_parameter() -> None:
+    model = rgb_patch_training.RGBPatchMeasurementBranch(
+        search_radius_px=1.0,
+        context_radius_px=1.0,
+        step_px=1.0,
+        feature_dim=4,
+        hidden_dim=8,
+    )
+
+    scope = _configure_head_only_training(
+        model,
+        train_dustbin_head_only=False,
+        train_measurement_gate_head_only=True,
+    )
+    trainable = {name for name, parameter in model.named_parameters() if parameter.requires_grad}
+
+    assert scope == "measurement_gate_head"
+    assert trainable
+    assert all(name.startswith("measurement_gate_head.") for name in trainable)
 
 
 def test_append_roll_hard_negatives_marks_rolled_support_patches_as_dustbin() -> None:
@@ -363,6 +385,39 @@ def test_two_stage_rgb_patch_training_uses_full_coarse_fine_radius_for_valid_fil
     assert summary["row_filter"]["kept_count"] == 1
 
 
+def test_rgb_patch_training_filters_zero_weight_rows_before_sampling(tmp_path: Path) -> None:
+    rows = [
+        {
+            "center_x": "8.0",
+            "center_y": "8.0",
+            "query_gt_x": "8.0",
+            "query_gt_y": "8.0",
+            "dustbin_supervision_weight": "0.0",
+        },
+        {
+            "center_x": "8.0",
+            "center_y": "8.0",
+            "query_gt_x": "8.0",
+            "query_gt_y": "8.0",
+            "dustbin_supervision_weight": "1.0",
+        },
+    ]
+
+    kept, summary = rgb_patch_training._filter_rows_for_training(
+        rows,
+        search_radius_px=2.0,
+        target_x_key="query_gt_x",
+        target_y_key="query_gt_y",
+        loss_weight_key="dustbin_supervision_weight",
+        min_loss_weight=0.5,
+    )
+
+    assert len(kept) == 1
+    assert kept[0]["dustbin_supervision_weight"] == "1.0"
+    assert summary["dropped_by_loss_weight_count"] == 1
+    assert summary["min_loss_weight"] == 0.5
+
+
 def test_rgb_patch_training_records_data_parallel_device_ids_on_cpu(tmp_path: Path) -> None:
     image_root = tmp_path / "images"
     image_root.mkdir()
@@ -460,3 +515,27 @@ def test_residual_balanced_sampler_draws_from_each_non_empty_residual_bin() -> N
     assert any(5.0 <= value < 20.0 for value in residuals)
     assert any(20.0 <= value < 28.0 for value in residuals)
     assert any(value >= 28.0 for value in residuals)
+
+
+def test_tensor_image_lru_cache_enforces_shared_byte_budget() -> None:
+    cache = rgb_patch_training.TensorImageLRUCache(max_bytes=32)
+    cache.record_miss()
+    cache["first"] = torch.zeros((4,), dtype=torch.float32)
+    cache.record_miss()
+    cache["second"] = torch.ones((4,), dtype=torch.float32)
+    assert list(cache) == ["first", "second"]
+
+    assert torch.equal(cache["first"], torch.zeros((4,)))
+    cache.record_miss()
+    cache["third"] = torch.full((4,), 2.0)
+
+    assert list(cache) == ["first", "third"]
+    assert cache.summary() == {
+        "entry_count": 2,
+        "max_bytes": 32,
+        "current_bytes": 32,
+        "peak_bytes": 32,
+        "hits": 1,
+        "misses": 3,
+        "evictions": 1,
+    }

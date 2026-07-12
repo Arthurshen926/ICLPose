@@ -87,6 +87,53 @@ def _sample_feature_vector(
     return np.asarray((1.0 - wy) * top + wy * bottom, dtype=np.float32)
 
 
+def _sample_feature_vectors(
+    feature_map: np.ndarray,
+    xy: np.ndarray,
+    image_widths: np.ndarray,
+    image_heights: np.ndarray,
+    sample_mode: str,
+) -> np.ndarray:
+    """Vectorized counterpart of :func:`_sample_feature_vector`."""
+
+    values = np.asarray(feature_map, dtype=np.float32)
+    coordinates = np.asarray(xy, dtype=np.float64).reshape(-1, 2)
+    widths = np.asarray(image_widths, dtype=np.float64).reshape(-1)
+    heights = np.asarray(image_heights, dtype=np.float64).reshape(-1)
+    if values.ndim != 3:
+        raise ValueError("feature_map must have shape (C, H, W)")
+    if widths.shape[0] != coordinates.shape[0] or heights.shape[0] != coordinates.shape[0]:
+        raise ValueError("image dimensions must contain one value per coordinate")
+    if np.any(widths <= 0.0) or np.any(heights <= 0.0):
+        raise ValueError("image dimensions must be positive")
+    channels, token_height, token_width = values.shape
+    if coordinates.shape[0] == 0:
+        return np.zeros((0, int(channels)), dtype=np.float32)
+    x_pos = np.clip(coordinates[:, 0] / np.maximum(widths - 1.0, 1.0), 0.0, 1.0) * max(
+        int(token_width) - 1,
+        0,
+    )
+    y_pos = np.clip(coordinates[:, 1] / np.maximum(heights - 1.0, 1.0), 0.0, 1.0) * max(
+        int(token_height) - 1,
+        0,
+    )
+    if str(sample_mode) == "nearest":
+        x_idx = np.rint(x_pos).astype(np.int64)
+        y_idx = np.rint(y_pos).astype(np.int64)
+        return values[:, y_idx, x_idx].T.astype(np.float32, copy=True)
+    if str(sample_mode) != "bilinear":
+        raise ValueError("sample_mode must be 'nearest' or 'bilinear'")
+    x0 = np.floor(x_pos).astype(np.int64)
+    y0 = np.floor(y_pos).astype(np.int64)
+    x1 = np.minimum(x0 + 1, int(token_width) - 1)
+    y1 = np.minimum(y0 + 1, int(token_height) - 1)
+    wx = (x_pos - x0).astype(np.float32)[:, None]
+    wy = (y_pos - y0).astype(np.float32)[:, None]
+    top = (1.0 - wx) * values[:, y0, x0].T + wx * values[:, y0, x1].T
+    bottom = (1.0 - wx) * values[:, y1, x0].T + wx * values[:, y1, x1].T
+    return ((1.0 - wy) * top + wy * bottom).astype(np.float32, copy=False)
+
+
 def _track_view_consistency_weights(
     track_observations: Iterable[ColmapTrackObservation],
     weight_floor: float,
@@ -232,33 +279,82 @@ def sample_token_track_observations(
     return sampled
 
 
-def load_colmap_track_observations_jsonl(path: Path) -> list[ColmapTrackObservation]:
-    observations: list[ColmapTrackObservation] = []
-    for line in Path(path).read_text().splitlines():
-        if not line.strip():
+def deduplicate_track_image_observations(
+    observations: Iterable[ColmapTrackObservation],
+) -> list[ColmapTrackObservation]:
+    """Keep one deterministic SfM observation for each physical track/image pair."""
+
+    selected: list[ColmapTrackObservation] = []
+    position_by_key: dict[tuple[int, str], int] = {}
+    for observation in observations:
+        key = (int(observation.track_id), str(observation.image_id))
+        position = position_by_key.get(key)
+        if position is None:
+            position_by_key[key] = len(selected)
+            selected.append(observation)
             continue
-        item = json.loads(line)
-        observations.append(
-            ColmapTrackObservation(
-                track_id=int(item["track_id"]),
-                image_id=str(item["image_id"]),
-                point2d_idx=int(item["point2d_idx"]),
-                xy=(float(item["xy"][0]), float(item["xy"][1])),
-                xyz=np.asarray(item["xyz"], dtype=np.float64),
-                track_length=int(item["track_length"]),
-                reprojection_error=float(item["reprojection_error"]),
-                camera_id=None if item.get("camera_id") is None else int(item["camera_id"]),
-                image_width=None if item.get("image_width") is None else int(item["image_width"]),
-                image_height=None if item.get("image_height") is None else int(item["image_height"]),
-                camera_center=None
-                if item.get("camera_center") is None
-                else np.asarray(item["camera_center"], dtype=np.float64),
-                viewing_ray=None
-                if item.get("viewing_ray") is None
-                else np.asarray(item["viewing_ray"], dtype=np.float64),
-            )
+        current = selected[position]
+        current_key = (
+            float(current.reprojection_error),
+            int(current.point2d_idx),
+            float(current.xy[0]),
+            float(current.xy[1]),
         )
-    return observations
+        candidate_key = (
+            float(observation.reprojection_error),
+            int(observation.point2d_idx),
+            float(observation.xy[0]),
+            float(observation.xy[1]),
+        )
+        if candidate_key < current_key:
+            selected[position] = observation
+    return selected
+
+
+def load_colmap_track_observations_jsonl(
+    path: Path,
+    *,
+    image_ids: set[str] | None = None,
+    track_ids: set[int] | None = None,
+    deduplicate_track_images: bool = True,
+) -> list[ColmapTrackObservation]:
+    observations: list[ColmapTrackObservation] = []
+    selected_images = None if image_ids is None else {str(image_id) for image_id in image_ids}
+    selected_tracks = None if track_ids is None else {int(track_id) for track_id in track_ids}
+    with Path(path).open() as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            item = json.loads(line)
+            image_id = str(item["image_id"])
+            if selected_images is not None and image_id not in selected_images:
+                continue
+            track_id = int(item["track_id"])
+            if selected_tracks is not None and track_id not in selected_tracks:
+                continue
+            observations.append(
+                ColmapTrackObservation(
+                    track_id=track_id,
+                    image_id=image_id,
+                    point2d_idx=int(item["point2d_idx"]),
+                    xy=(float(item["xy"][0]), float(item["xy"][1])),
+                    xyz=np.asarray(item["xyz"], dtype=np.float64),
+                    track_length=int(item["track_length"]),
+                    reprojection_error=float(item["reprojection_error"]),
+                    camera_id=None if item.get("camera_id") is None else int(item["camera_id"]),
+                    image_width=None if item.get("image_width") is None else int(item["image_width"]),
+                    image_height=None if item.get("image_height") is None else int(item["image_height"]),
+                    camera_center=None
+                    if item.get("camera_center") is None
+                    else np.asarray(item["camera_center"], dtype=np.float64),
+                    viewing_ray=None
+                    if item.get("viewing_ray") is None
+                    else np.asarray(item["viewing_ray"], dtype=np.float64),
+                )
+            )
+    if not bool(deduplicate_track_images):
+        return observations
+    return deduplicate_track_image_observations(observations)
 
 
 def save_sampled_track_observations_npz(

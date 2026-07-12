@@ -14,9 +14,12 @@ import torch
 from feature_extract.vfm.artifacts import file_sha256_short
 from feature_extract.vfm.localization.descriptor_space import (
     canonical_descriptor_space_id,
+    canonical_projection_space_id,
     descriptor_space_manifest,
     post_aggregate_1x1_descriptor_space_manifest,
     raw_descriptor_space_manifest,
+    token_feature_source_config,
+    validate_projected_observation_descriptor_manifest,
 )
 
 
@@ -69,6 +72,7 @@ def projected_cache_expected_metadata(
     matcha_joint_checkpoint: Path,
     track_observations: Path,
     feature_dim: int,
+    descriptor_source_config: dict[str, object] | None = None,
 ) -> dict[str, object]:
     expected = {
         "projection_mode": str(projection_mode),
@@ -78,6 +82,8 @@ def projected_cache_expected_metadata(
     }
     if str(projection_mode) != "raw_landmark_bank":
         expected["matcha_joint_checkpoint_sha256"] = file_sha256_short(Path(matcha_joint_checkpoint))
+    if descriptor_source_config is not None:
+        expected["descriptor_source_config"] = dict(descriptor_source_config)
     return expected
 
 
@@ -99,7 +105,12 @@ def validate_projected_cache_metadata(metadata: dict[str, object], expected: dic
             "mapper_class",
             "mapper_config_hash",
             "aggregation",
+            "prototype_builder",
             "source_image_list_hash",
+            "descriptor_source_config",
+            "descriptor_source_config_audit",
+            "sample_mode",
+            "observation_selection",
         )
     for key in required_keys:
         if key not in metadata or metadata.get(key) in ("", None):
@@ -125,10 +136,23 @@ def validate_projected_cache_metadata(metadata: dict[str, object], expected: dic
                 f"got {metadata.get('descriptor_space_id')!r} vs {actual_id!r}"
             )
     if expected.get("projection_mode") == "full_map_projected_observations":
+        if isinstance(actual_manifest, dict):
+            try:
+                validate_projected_observation_descriptor_manifest(actual_manifest)
+            except ValueError as exc:
+                mismatches.append(str(exc))
         aggregation = metadata.get("aggregation")
         if not isinstance(aggregation, dict):
             mismatches.append("aggregation: expected object")
             aggregation = {}
+        prototype_builder = metadata.get("prototype_builder")
+        if not isinstance(prototype_builder, dict):
+            mismatches.append("prototype_builder: expected object")
+            prototype_builder = {}
+        source_config = expected.get("descriptor_source_config", metadata.get("descriptor_source_config"))
+        if not isinstance(source_config, dict):
+            mismatches.append("descriptor_source_config: expected object")
+            source_config = {}
         expected_manifest = descriptor_space_manifest(
             checkpoint_sha256=str(expected.get("matcha_joint_checkpoint_sha256", "")),
             mapper_mode="joint_full_map",
@@ -140,6 +164,21 @@ def validate_projected_cache_metadata(metadata: dict[str, object], expected: dic
             sfm_track_hash=str(expected.get("track_observations_sha256", "")),
             descriptor_dimension=int(expected.get("feature_dim", 0)),
             normalization_mode=str(metadata.get("normalization_mode", "")),
+            output_branch="coarse_descriptors",
+            radio_model=str(source_config.get("radio_model", "")),
+            radio_model_version=str(source_config.get("radio_model_version", "")),
+            radio_intermediate_layer_index=source_config.get("radio_intermediate_layer_index"),
+            preprocessing=dict(source_config.get("preprocessing", {})),
+            feature_grid_stride=int(source_config.get("feature_grid_stride", 0)),
+            input_channels=int(source_config.get("input_channels", 0)),
+            sampling_mode=str(metadata.get("sample_mode", "")),
+            sampling_convention="pixel_endpoint_to_token_endpoint_v1",
+            sampling_align_corners=True,
+            prototype_builder_version=str(actual_manifest.get("prototype_builder_version", "")),
+            prototype_builder_config=prototype_builder,
+            view_clustering=dict(actual_manifest.get("view_clustering", {})),
+            maplet_bank_version=str(actual_manifest.get("maplet_bank_version", "")),
+            observation_selection=dict(metadata.get("observation_selection", {})),
         )
         for key, expected_value in expected_manifest.items():
             actual_value = actual_manifest.get(key) if isinstance(actual_manifest, dict) else None
@@ -175,7 +214,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--landmark_projection", default="joint", choices=("joint", "raw"))
     parser.add_argument("--projection_batch_size", type=int, default=8192)
     parser.add_argument("--projected_landmark_cache", default="")
-    parser.add_argument("--landmark_search_backend", default="auto", choices=("auto", "exact", "faiss"))
+    parser.add_argument(
+        "--landmark_search_backend",
+        default="auto",
+        choices=("auto", "exact", "faiss", "torch_cuda"),
+    )
     parser.add_argument("--landmark_index_cache_size", type=int, default=64)
     parser.add_argument("--match_block_size", type=int, default=512)
     parser.add_argument("--candidate_bank", default="")
@@ -210,6 +253,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--top_k", type=int, default=2)
     parser.add_argument("--nn_search_k_for_ratio", type=int, default=0)
     parser.add_argument("--proposal_top_l", type=int, default=1)
+    parser.add_argument(
+        "--proposal_track_deduplication",
+        default="auto",
+        choices=("auto", "across_tokens", "none"),
+    )
+    parser.add_argument(
+        "--proposal_only",
+        action="store_true",
+        help="Export grouped proposals without running PnP; required for unresolved top-L candidates.",
+    )
     parser.add_argument("--ratio_threshold", type=float, default=0.95)
     parser.add_argument("--disable_ratio_test", action="store_true")
     parser.add_argument("--min_similarity", type=float, default=0.2)
@@ -221,6 +274,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--query_heatmap_grid_rows", type=int, default=4)
     parser.add_argument("--query_heatmap_grid_cols", type=int, default=4)
     parser.add_argument("--query_heatmap_min_score", type=float, default=None)
+    parser.add_argument(
+        "--query_xy_coordinate_mode",
+        default="edge_legacy",
+        choices=("edge_legacy", "cell_center"),
+    )
     parser.add_argument("--max_matches", type=int, default=1000)
     parser.add_argument("--max_landmarks", type=int, default=0)
     parser.add_argument("--min_observation_count", type=int, default=2)
@@ -317,6 +375,11 @@ def _load_reference_submaps(candidate_bank: str, submap_top_n: int) -> dict[str,
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = parse_args(argv)
+    if int(args.proposal_top_l) > 1 and not bool(args.proposal_only):
+        raise ValueError(
+            "proposal_top_l > 1 contains mutually exclusive tracks per query token; "
+            "use --proposal_only until a local assignment/conflict resolver has selected at most one track per token"
+        )
 
     from feature_extract.vfm.cambridge_pose_lattice import parse_cambridge_pose_file
     from feature_extract.vfm.colmap_tracks import read_colmap_cameras_binary, read_colmap_images_binary
@@ -351,13 +414,28 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
     query_manifest = TokenBankManifest.from_json(Path(args.query_manifest))
     query_manifest.validate(verify_checksums=False)
-    observations = load_colmap_track_observations_jsonl(Path(args.track_observations_jsonl))
-    xyz_by_track, reprojection_error_by_track = _track_stats(observations)
-    landmark_bank = load_selected_track_bank_npz(Path(args.landmark_bank))
-    landmark_index = LandmarkMapIndex.from_track_bank(landmark_bank, xyz_by_track, reprojection_error_by_track)
-    landmark_index = _limit_landmarks(landmark_index, int(args.max_landmarks))
+    query_descriptor_source_config = token_feature_source_config(query_manifest, str(args.feature_key))
+    projected_cache_path = Path(args.projected_landmark_cache) if str(args.projected_landmark_cache) else None
+    projected_cache_exists = bool(projected_cache_path is not None and projected_cache_path.exists())
+    observations = (
+        load_colmap_track_observations_jsonl(Path(args.track_observations_jsonl))
+        if not projected_cache_exists or str(args.measurement_mode) == "owner_rgb"
+        else []
+    )
+    landmark_bank = None
+    landmark_index = None
+    if not projected_cache_exists:
+        xyz_by_track, reprojection_error_by_track = _track_stats(observations)
+        landmark_bank = load_selected_track_bank_npz(Path(args.landmark_bank))
+        landmark_index = LandmarkMapIndex.from_track_bank(landmark_bank, xyz_by_track, reprojection_error_by_track)
+        landmark_index = _limit_landmarks(landmark_index, int(args.max_landmarks))
 
     joint_run = load_matcha_joint_model(Path(args.matcha_joint_checkpoint), device=device_text)
+    if int(query_descriptor_source_config["input_channels"]) != int(joint_run.model.input_dim):
+        raise ValueError(
+            "query token feature source does not match mapper input dimension: "
+            f"tokens={query_descriptor_source_config['input_channels']!r}, model={joint_run.model.input_dim!r}"
+        )
     query_projection = projection_preset.query_projection
     landmark_projection = projection_preset.landmark_projection
     if str(query_projection) == "joint":
@@ -369,7 +447,6 @@ def main(argv: Sequence[str] | None = None) -> None:
     projected_cache_metadata: dict[str, object] = {}
     query_descriptor_space_manifest: dict[str, object] = {}
     landmark_descriptor_space_manifest: dict[str, object] = {}
-    projected_cache_path = Path(args.projected_landmark_cache) if str(args.projected_landmark_cache) else None
     if projection_preset.requires_projected_cache and projected_cache_path is None:
         raise ValueError(f"--projected_landmark_cache is required for projection_preset={projection_preset.name}")
     if projected_cache_path is not None and projected_cache_path.exists():
@@ -380,12 +457,19 @@ def main(argv: Sequence[str] | None = None) -> None:
             matcha_joint_checkpoint=Path(args.matcha_joint_checkpoint),
             track_observations=Path(args.track_observations_jsonl),
             feature_dim=int(landmark_index.feature_dim),
+            descriptor_source_config=query_descriptor_source_config,
         )
         validate_projected_cache_metadata(projected_cache_metadata, expected_cache_metadata)
         landmark_descriptor_space_manifest = dict(projected_cache_metadata["descriptor_space_manifest"])
         query_descriptor_space_manifest = dict(landmark_descriptor_space_manifest)
+        if query_descriptor_space_manifest.get("projection_space_id") != canonical_projection_space_id(
+            query_descriptor_space_manifest
+        ):
+            raise ValueError("query descriptor projection-space id is internally inconsistent")
         projected_cache_hit = True
     elif str(landmark_projection) == "joint":
+        if landmark_index is None:
+            raise RuntimeError("raw landmark index was not initialized for on-demand projection")
         if projection_preset.expected_projection_mode == "full_map_projected_observations":
             raise ValueError(
                 "full-map projected-observation landmark preset requires an existing projected_landmark_cache"
@@ -432,6 +516,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             }
             save_landmark_index_npz(landmark_index, projected_cache_path, metadata=projected_cache_metadata)
     elif projected_cache_path is not None:
+        if landmark_index is None:
+            raise RuntimeError("raw landmark index was not initialized for cache creation")
         space_manifest = raw_descriptor_space_manifest(
             feature_key=str(args.feature_key),
             descriptor_dimension=int(landmark_index.feature_dim),
@@ -456,6 +542,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         }
         save_landmark_index_npz(landmark_index, projected_cache_path, metadata=projected_cache_metadata)
     else:
+        if landmark_index is None:
+            raise RuntimeError("raw landmark index was not initialized")
         space_manifest = raw_descriptor_space_manifest(
             feature_key=str(args.feature_key),
             descriptor_dimension=int(landmark_index.feature_dim),
@@ -470,7 +558,12 @@ def main(argv: Sequence[str] | None = None) -> None:
             f"landmark={landmark_descriptor_space_manifest.get('descriptor_space_id')!r}"
         )
     landmark_index = _limit_landmarks(landmark_index, int(args.max_landmarks))
-    if int(landmark_index.feature_dim) != int(joint_run.model.output_dim if str(query_projection) == "joint" else landmark_bank.feature_dim):
+    query_descriptor_dimension = (
+        int(joint_run.model.output_dim)
+        if str(query_projection) == "joint"
+        else int(query_descriptor_source_config["input_channels"])
+    )
+    if int(landmark_index.feature_dim) != query_descriptor_dimension:
         raise ValueError(
             "query and landmark descriptor dimensions do not match for projection_preset="
             f"{projection_preset.name}"
@@ -516,6 +609,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         max_matches=int(args.max_matches) if int(args.max_matches) > 0 else None,
         block_size=int(args.match_block_size),
     )
+    proposal_track_deduplication = str(args.proposal_track_deduplication)
+    deduplicate_proposal_tracks = (
+        int(args.proposal_top_l) == 1
+        if proposal_track_deduplication == "auto"
+        else proposal_track_deduplication == "across_tokens"
+    )
     retrieval_config = LandmarkRetrievalConfig(
         backend=str(args.landmark_search_backend),
         top_k=int(args.top_k),
@@ -528,13 +627,14 @@ def main(argv: Sequence[str] | None = None) -> None:
         query_token_step=int(args.query_token_step),
         max_matches=int(args.max_matches) if int(args.max_matches) > 0 else None,
         block_size=int(args.match_block_size),
-        deduplicate_tracks=True,
+        deduplicate_tracks=bool(deduplicate_proposal_tracks),
         query_token_selection=str(args.query_token_selection),
         query_heatmap_top_k=int(args.query_heatmap_top_k),
         query_heatmap_nms_radius=int(args.query_heatmap_nms_radius),
         query_heatmap_grid_rows=int(args.query_heatmap_grid_rows),
         query_heatmap_grid_cols=int(args.query_heatmap_grid_cols),
         query_heatmap_min_score=args.query_heatmap_min_score,
+        query_xy_coordinate_mode=str(args.query_xy_coordinate_mode),
     )
     reference_submaps = None
     if str(args.submap_mode) in {"reference_visibility", "hybrid"}:
@@ -589,6 +689,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         pnp_weighted_f_scale_px=float(args.pnp_weighted_f_scale_px),
         pnp_weighted_max_nfev=int(args.pnp_weighted_max_nfev),
         progress_interval_queries=int(args.progress_interval_queries),
+        evaluate_pose=not bool(args.proposal_only),
     )
     summary.update(
         {
@@ -611,6 +712,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             "landmark_descriptor_space_id": landmark_descriptor_space_manifest.get("descriptor_space_id"),
             "query_descriptor_space_manifest": query_descriptor_space_manifest,
             "landmark_descriptor_space_manifest": landmark_descriptor_space_manifest,
+            "query_descriptor_source_config": query_descriptor_source_config,
             "projected_landmark_cache": "" if projected_cache_path is None else str(projected_cache_path),
             "projected_landmark_cache_hit": bool(projected_cache_hit),
             "projected_landmark_cache_metadata": projected_cache_metadata,
@@ -639,6 +741,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             "measurement_tensor_cache_size": int(args.measurement_tensor_cache_size),
             "landmark_index_cache_size": int(args.landmark_index_cache_size),
             "device": device_text,
+            "proposal_only": bool(args.proposal_only),
+            "proposal_track_deduplication": proposal_track_deduplication,
         }
     )
     Path(summary["outputs"]["summary"]).write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")

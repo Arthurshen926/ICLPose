@@ -376,12 +376,15 @@ def evaluate_query_poses(
                     pose_for_metrics = refined.pose_w2c
                     weighted_refine_applied = True
         error = pnp_pose_error(pose_for_metrics if pnp.success else None, gt.pose_w2c)
-        spatial_all = match_spatial_distribution_stats(matches, int(camera.width), int(camera.height))
+        spatial_all = match_spatial_distribution_stats(
+            matches, int(camera.width), int(camera.height), pose_w2c=pose_for_metrics
+        )
         spatial_inliers = match_spatial_distribution_stats(
             matches,
             int(camera.width),
             int(camera.height),
             pnp.inlier_mask,
+            pose_w2c=pose_for_metrics,
         )
         residuals = pnp_reprojection_residual_stats(matches, pose_for_metrics, camera, inlier_mask=pnp.inlier_mask)
         pose_rows.append(

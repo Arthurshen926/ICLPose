@@ -4,9 +4,12 @@ from feature_extract.vfm.local_maplet_matching import (
     ContextualLandmarkMatchingConfig,
     LocalMapletBank,
     build_covisibility_maplets,
+    build_hybrid_maplet_support_index,
     build_knn_maplets,
     compute_query_context_descriptors,
     match_query_patches_to_contextual_landmarks,
+    load_local_maplet_support_index_npz,
+    save_local_maplet_support_index_npz,
 )
 from feature_extract.vfm.query_to_3d_matching import LandmarkMapIndex
 
@@ -62,6 +65,32 @@ def test_covisibility_maplets_use_shared_reference_views() -> None:
     assert int(bank.neighbor_indices[2, 0]) == 3
     assert int(bank.neighbor_indices[3, 0]) == 2
     assert bank.covisibility_strength[2] > 0.0
+
+
+def test_hybrid_maplets_select_covisible_neighbors_and_covering_support_views(tmp_path) -> None:
+    index = _toy_index()
+
+    support = build_hybrid_maplet_support_index(
+        index,
+        maplet_k=2,
+        candidate_k=3,
+        max_support_views=2,
+        context_pool="mean",
+    )
+
+    track10_row = int(np.flatnonzero(support.anchor_track_ids == 10)[0])
+    assert support.maplets.maplet_type == "knn_covisibility_hybrid"
+    assert support.neighbor_track_ids[track10_row, 0] == 11
+    assert support.support_views(track10_row) == ("ref_correct_a.png", "ref_shared.png")
+    assert support.support_coverage_counts[track10_row].tolist() == [2, 2]
+
+    path = tmp_path / "maplets.npz"
+    save_local_maplet_support_index_npz(support, path, metadata={"source": "toy"})
+    loaded, metadata = load_local_maplet_support_index_npz(path)
+    np.testing.assert_array_equal(loaded.neighbor_track_ids, support.neighbor_track_ids)
+    np.testing.assert_array_equal(loaded.support_image_indices, support.support_image_indices)
+    assert loaded.support_views(track10_row) == support.support_views(track10_row)
+    assert metadata["source"] == "toy"
 
 
 def test_query_context_descriptors_average_neighboring_tokens() -> None:

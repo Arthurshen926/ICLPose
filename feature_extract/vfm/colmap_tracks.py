@@ -5,7 +5,7 @@ from __future__ import annotations
 import struct
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO, Dict, Tuple
+from typing import BinaryIO, Dict, Mapping, Tuple
 
 import numpy as np
 
@@ -166,6 +166,119 @@ def read_colmap_images_binary(path: Path) -> Dict[int, ColmapImageObservation]:
                 point3d_ids=point3d_ids,
             )
     return images
+
+
+def scale_colmap_camera(
+    camera: ColmapCamera,
+    *,
+    width: int,
+    height: int,
+) -> ColmapCamera:
+    """Scale a COLMAP camera while preserving its normalized ray geometry."""
+
+    target_width = int(width)
+    target_height = int(height)
+    if target_width <= 0 or target_height <= 0:
+        raise ValueError("scaled camera dimensions must be positive")
+    scale_x = float(target_width) / float(camera.width)
+    scale_y = float(target_height) / float(camera.height)
+    params = list(float(value) for value in camera.params)
+    if int(camera.model_id) in {0, 2, 3, 8, 9}:
+        if not np.isclose(scale_x, scale_y, rtol=1e-7, atol=1e-9):
+            raise ValueError(
+                "single-focal COLMAP cameras require aspect-preserving scaling"
+            )
+        params[0] *= scale_x
+        params[1] *= scale_x
+        params[2] *= scale_y
+    elif int(camera.model_id) in {1, 4, 5, 6, 7, 10}:
+        params[0] *= scale_x
+        params[1] *= scale_y
+        params[2] *= scale_x
+        params[3] *= scale_y
+    else:
+        raise ValueError(f"unsupported COLMAP camera model id: {camera.model_id}")
+    return ColmapCamera(
+        camera_id=int(camera.camera_id),
+        model_id=int(camera.model_id),
+        width=target_width,
+        height=target_height,
+        params=tuple(params),
+    )
+
+
+def write_colmap_cameras_binary(
+    cameras: Mapping[int, ColmapCamera], path: Path
+) -> None:
+    """Write the camera subset of a COLMAP binary model."""
+
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open("wb") as handle:
+        handle.write(struct.pack("<Q", len(cameras)))
+        for camera_id in sorted(cameras):
+            camera = cameras[int(camera_id)]
+            expected = _CAMERA_MODEL_PARAM_COUNTS.get(int(camera.model_id))
+            if expected is None or len(camera.params) != int(expected):
+                raise ValueError("camera parameters do not match its COLMAP model")
+            handle.write(
+                struct.pack(
+                    "<iiQQ",
+                    int(camera.camera_id),
+                    int(camera.model_id),
+                    int(camera.width),
+                    int(camera.height),
+                )
+            )
+            handle.write(
+                struct.pack(
+                    "<" + "d" * len(camera.params),
+                    *(float(value) for value in camera.params),
+                )
+            )
+
+
+def write_colmap_images_binary(
+    images: Mapping[int, ColmapImageObservation],
+    path: Path,
+    *,
+    xy_scale_by_camera_id: Mapping[int, tuple[float, float]] | None = None,
+) -> None:
+    """Write COLMAP images, optionally scaling every stored 2D observation."""
+
+    scales = {} if xy_scale_by_camera_id is None else xy_scale_by_camera_id
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open("wb") as handle:
+        handle.write(struct.pack("<Q", len(images)))
+        for image_id in sorted(images):
+            image = images[int(image_id)]
+            scale_x, scale_y = scales.get(int(image.camera_id), (1.0, 1.0))
+            xys = np.asarray(image.xys, dtype=np.float64).reshape(-1, 2).copy()
+            point3d_ids = np.asarray(image.point3d_ids, dtype=np.int64).reshape(-1)
+            if len(xys) != len(point3d_ids):
+                raise ValueError("COLMAP image xy and point3D arrays differ")
+            xys[:, 0] *= float(scale_x)
+            xys[:, 1] *= float(scale_y)
+            handle.write(struct.pack("<i", int(image.image_id)))
+            handle.write(
+                struct.pack("<dddd", *(float(value) for value in image.qvec))
+            )
+            handle.write(
+                struct.pack("<ddd", *(float(value) for value in image.tvec))
+            )
+            handle.write(struct.pack("<i", int(image.camera_id)))
+            handle.write(str(image.image_name).encode("utf8") + b"\x00")
+            handle.write(struct.pack("<Q", len(xys)))
+            for xy, point3d_id in zip(xys, point3d_ids):
+                handle.write(
+                    struct.pack(
+                        "<ddq",
+                        float(xy[0]),
+                        float(xy[1]),
+                        int(point3d_id),
+                    )
+                )
 
 
 def read_colmap_points3d_binary(path: Path) -> Dict[int, ColmapPoint3D]:

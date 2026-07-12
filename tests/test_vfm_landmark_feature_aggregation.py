@@ -9,8 +9,11 @@ from feature_extract.tools.vfm.visualize_raw_vfm_landmark_bank import main as vi
 from feature_extract.vfm.colmap_tracks import ColmapTrackObservation
 from feature_extract.vfm.landmark_feature_aggregation import (
     LandmarkAggregationConfig,
+    LandmarkViewClusteringConfig,
+    TrackPrototypeBuilder,
     aggregate_landmark_features,
     aggregate_landmark_features_torch,
+    build_multi_prototype_track_bank,
     evaluate_landmark_observation_retrieval,
     evaluate_landmark_split_stability,
 )
@@ -73,6 +76,39 @@ def test_torch_aggregate_matches_numpy_mean_when_available():
     for track_id in sorted(numpy_bank.tracks):
         np.testing.assert_allclose(torch_bank.tracks[track_id].mean_feature, numpy_bank.tracks[track_id].mean_feature)
         np.testing.assert_allclose(torch_bank.tracks[track_id].variance, numpy_bank.tracks[track_id].variance)
+
+
+def test_shared_track_prototype_builder_matches_numpy_and_differentiable_paths():
+    torch = pytest.importorskip("torch")
+    observations = [
+        _obs(1, [2.0, 0.0], image_id="a"),
+        _obs(1, [0.0, 1.0], image_id="b"),
+        _obs(2, [0.0, 3.0], image_id="a"),
+        _obs(2, [1.0, 1.0], image_id="b"),
+    ]
+    builder = TrackPrototypeBuilder(
+        LandmarkAggregationConfig(method="mean", min_observations=2, l2_normalize_observations=False),
+        normalize_final_prototypes=True,
+    )
+
+    bank = builder.build_bank(observations)
+    fast_bank = builder.build_bank_torch(observations, device="cpu")
+    rows = torch.tensor(np.stack([obs.feature for obs in observations]), dtype=torch.float32, requires_grad=True)
+    prototypes, counts = builder.aggregate_torch(rows, torch.tensor([0, 0, 1, 1]), 2)
+
+    np.testing.assert_allclose(
+        prototypes.detach().numpy(),
+        np.stack([bank.tracks[1].mean_feature, bank.tracks[2].mean_feature]),
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        np.stack([fast_bank.tracks[1].mean_feature, fast_bank.tracks[2].mean_feature]),
+        np.stack([bank.tracks[1].mean_feature, bank.tracks[2].mean_feature]),
+        atol=1e-6,
+    )
+    np.testing.assert_array_equal(counts.detach().numpy(), np.asarray([2.0, 2.0]))
+    prototypes.sum().backward()
+    assert rows.grad is not None
 
 
 def test_robust_trimmed_mean_rejects_feature_outlier():
@@ -175,6 +211,41 @@ def test_geometric_median_and_medoid_are_robust_to_outlier():
     assert median_bank.tracks[8].mean_feature[0] == pytest.approx(1.2, abs=0.25)
     assert min(abs(float(medoid_bank.tracks[8].mean_feature[0]) - 1.0), abs(float(medoid_bank.tracks[8].mean_feature[0]) - 1.2)) < 1e-6
     assert medoid_bank.tracks[8].observation_count == 3
+
+
+def test_multi_prototype_builder_separates_descriptor_modes_deterministically():
+    observations = [
+        _obs(8, [1.0, 0.0], image_id="a"),
+        _obs(8, [0.98, 0.02], image_id="b"),
+        _obs(8, [0.0, 1.0], image_id="c"),
+        _obs(8, [0.02, 0.98], image_id="d"),
+        _obs(9, [1.0, 0.0], image_id="e"),
+        _obs(9, [0.9, 0.1], image_id="f"),
+        _obs(9, [0.8, 0.2], image_id="g"),
+    ]
+    config = LandmarkViewClusteringConfig(
+        max_prototypes_per_track=2,
+        min_observations_per_prototype=2,
+        iterations=8,
+    )
+
+    bank_a = build_multi_prototype_track_bank(
+        observations,
+        aggregation=LandmarkAggregationConfig(method="mean", min_observations=2, l2_normalize_observations=True),
+        clustering=config,
+    )
+    bank_b = build_multi_prototype_track_bank(
+        observations,
+        aggregation=LandmarkAggregationConfig(method="mean", min_observations=2, l2_normalize_observations=True),
+        clustering=config,
+    )
+
+    assert [(item.track_id, item.prototype_id) for item in bank_a.prototypes] == [(8, 0), (8, 1), (9, 0)]
+    assert [item.observation_count for item in bank_a.prototypes] == [2, 2, 3]
+    for left, right in zip(bank_a.prototypes, bank_b.prototypes):
+        np.testing.assert_allclose(left.feature, right.feature)
+    track8 = [item.feature for item in bank_a.prototypes if item.track_id == 8]
+    assert abs(float(np.dot(track8[0], track8[1]))) < 0.1
 
 
 def test_random_observation_aggregation_is_seeded_and_deterministic():

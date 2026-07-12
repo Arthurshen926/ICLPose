@@ -359,12 +359,15 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 camera,
                 inlier_mask=pnp.inlier_mask,
             )
-            all_spatial_stats = match_spatial_distribution_stats(matches, int(camera.width), int(camera.height))
+            all_spatial_stats = match_spatial_distribution_stats(
+                matches, int(camera.width), int(camera.height), pose_w2c=pnp.pose_w2c
+            )
             inlier_spatial_stats = match_spatial_distribution_stats(
                 matches,
                 int(camera.width),
                 int(camera.height),
                 mask=pnp.inlier_mask,
+                pose_w2c=pnp.pose_w2c,
             )
             for match_idx, match in enumerate(matches):
                 render_diag = contributor_stats.get(int(match.track_id), {})

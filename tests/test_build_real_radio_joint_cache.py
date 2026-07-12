@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 from PIL import Image
 
 from feature_extract.tools.vfm import build_real_radio_joint_cache
@@ -324,3 +325,31 @@ def test_sfm_observation_index_builds_scaled_common_track_supervision(tmp_path: 
     np.testing.assert_allclose(common["query_xy"], [[959.5, 539.5]], atol=1e-6)
     np.testing.assert_allclose(common["reference_xy"], [[479.75, 269.75]], atol=1e-6)
     np.testing.assert_allclose(common["track_xyz"], [[1.0, 2.0, 3.0]])
+
+
+def test_sfm_track_observation_index_cache_roundtrip_and_stale_rejection(tmp_path: Path) -> None:
+    observations = tmp_path / "tracks.jsonl"
+    rows = [
+        {
+            "image_id": image_id,
+            "track_id": 7,
+            "xy": [10.0, 20.0],
+            "image_width": 100,
+            "image_height": 80,
+            "xyz": [1.0, 2.0, 3.0],
+            "track_length": 2,
+            "reprojection_error": 0.1,
+        }
+        for image_id in ("q.png", "r.png")
+    ]
+    observations.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+    cache = tmp_path / "tracks.index.npz"
+
+    first = build_real_radio_joint_cache.load_track_observation_index(observations, cache_path=cache)
+    second = build_real_radio_joint_cache.load_track_observation_index(observations, cache_path=cache)
+
+    assert cache.exists()
+    np.testing.assert_array_equal(first.by_image["q.png"].track_ids, second.by_image["q.png"].track_ids)
+    observations.write_text(observations.read_text() + json.dumps({**rows[0], "track_id": 8}) + "\n")
+    with pytest.raises(ValueError, match="stale track observation index cache"):
+        build_real_radio_joint_cache.load_track_observation_index(observations, cache_path=cache)

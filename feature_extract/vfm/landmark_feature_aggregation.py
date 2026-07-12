@@ -26,6 +26,81 @@ AGGREGATION_METHODS = {
     "medoid",
 }
 
+TRACK_PROTOTYPE_BUILDER_VERSION = "track_prototype_builder_v2"
+
+
+@dataclass(frozen=True)
+class LandmarkViewClusteringConfig:
+    method: str = "descriptor_spherical_kmeans"
+    max_prototypes_per_track: int = 2
+    min_observations_per_prototype: int = 2
+    iterations: int = 16
+
+    def __post_init__(self) -> None:
+        if str(self.method) != "descriptor_spherical_kmeans":
+            raise ValueError("view clustering method must be 'descriptor_spherical_kmeans'")
+        if int(self.max_prototypes_per_track) <= 0:
+            raise ValueError("max_prototypes_per_track must be positive")
+        if int(self.min_observations_per_prototype) <= 0:
+            raise ValueError("min_observations_per_prototype must be positive")
+        if int(self.iterations) <= 0:
+            raise ValueError("view clustering iterations must be positive")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "enabled": bool(int(self.max_prototypes_per_track) > 1),
+            "method": str(self.method),
+            "max_prototypes_per_track": int(self.max_prototypes_per_track),
+            "min_observations_per_prototype": int(self.min_observations_per_prototype),
+            "iterations": int(self.iterations),
+        }
+
+
+@dataclass(frozen=True)
+class TrackPrototype:
+    track_id: int
+    prototype_id: int
+    feature: np.ndarray
+    variance: np.ndarray
+    observation_count: int
+    mean_utility: float
+    observation_image_ids: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        feature = np.asarray(self.feature, dtype=np.float32).reshape(-1)
+        variance = np.asarray(self.variance, dtype=np.float32).reshape(-1)
+        if feature.shape != variance.shape:
+            raise ValueError("prototype feature and variance must have the same shape")
+        if int(self.prototype_id) < 0:
+            raise ValueError("prototype_id must be non-negative")
+        if int(self.observation_count) <= 0:
+            raise ValueError("prototype observation_count must be positive")
+        object.__setattr__(self, "feature", feature)
+        object.__setattr__(self, "variance", variance)
+        object.__setattr__(self, "observation_image_ids", tuple(str(item) for item in self.observation_image_ids))
+
+
+@dataclass(frozen=True)
+class MultiPrototypeTrackBank:
+    prototypes: tuple[TrackPrototype, ...]
+    feature_dim: int
+    clustering: LandmarkViewClusteringConfig
+
+    def __post_init__(self) -> None:
+        for prototype in self.prototypes:
+            if int(prototype.feature.size) != int(self.feature_dim):
+                raise ValueError("all prototypes must match feature_dim")
+        keys = [(int(item.track_id), int(item.prototype_id)) for item in self.prototypes]
+        if len(keys) != len(set(keys)):
+            raise ValueError("prototype (track_id, prototype_id) keys must be unique")
+
+    def __len__(self) -> int:
+        return len(self.prototypes)
+
+    @property
+    def track_count(self) -> int:
+        return len({int(item.track_id) for item in self.prototypes})
+
 
 @dataclass(frozen=True)
 class LandmarkAggregationConfig:
@@ -178,7 +253,9 @@ def _weighted_geometric_median(
 def _weighted_medoid(features: np.ndarray, weights: np.ndarray) -> tuple[np.ndarray, int]:
     feature64 = features.astype(np.float64)
     clean_weights = np.maximum(np.asarray(weights, dtype=np.float64).reshape(-1), 1e-12)
-    distances = np.linalg.norm(feature64[:, None, :] - feature64[None, :, :], axis=-1)
+    squared_norms = np.sum(feature64 * feature64, axis=1)
+    squared_distances = squared_norms[:, None] + squared_norms[None, :] - 2.0 * (feature64 @ feature64.T)
+    distances = np.sqrt(np.maximum(squared_distances, 0.0))
     weighted_distances = distances @ clean_weights
     idx = int(np.argmin(weighted_distances))
     return features[idx].astype(np.float32), idx
@@ -293,6 +370,199 @@ def aggregate_landmark_features(
             continue
         tracks[track_id] = _aggregate_one_track(track_id, group, cfg)
     return SelectedTrackFeatureBank(tracks=tracks, feature_dim=feature_dim)
+
+
+def _deterministic_spherical_kmeans_labels(
+    features: np.ndarray,
+    *,
+    cluster_count: int,
+    iterations: int,
+) -> np.ndarray:
+    values = _normalize_rows(np.asarray(features, dtype=np.float32))
+    count = int(values.shape[0])
+    clusters = min(max(1, int(cluster_count)), count)
+    if clusters == 1:
+        return np.zeros((count,), dtype=np.int64)
+
+    mean_direction = values.mean(axis=0)
+    mean_direction /= max(float(np.linalg.norm(mean_direction)), 1e-6)
+    center_indices = [int(np.argmax(values @ mean_direction))]
+    while len(center_indices) < clusters:
+        similarity = values @ values[np.asarray(center_indices, dtype=np.int64)].T
+        nearest_similarity = np.max(similarity, axis=1)
+        nearest_similarity[np.asarray(center_indices, dtype=np.int64)] = np.inf
+        center_indices.append(int(np.argmin(nearest_similarity)))
+    centers = values[np.asarray(center_indices, dtype=np.int64)].copy()
+    labels = np.full((count,), -1, dtype=np.int64)
+    for _ in range(int(iterations)):
+        similarities = values @ centers.T
+        next_labels = np.argmax(similarities, axis=1).astype(np.int64)
+        for cluster_id in range(clusters):
+            if np.any(next_labels == cluster_id):
+                continue
+            assigned_similarity = similarities[np.arange(count), next_labels]
+            move_index = int(np.argmin(assigned_similarity))
+            next_labels[move_index] = int(cluster_id)
+        if np.array_equal(next_labels, labels):
+            break
+        labels = next_labels
+        for cluster_id in range(clusters):
+            members = values[labels == cluster_id]
+            center = members.mean(axis=0)
+            centers[cluster_id] = center / max(float(np.linalg.norm(center)), 1e-6)
+    return labels
+
+
+def build_multi_prototype_track_bank(
+    observations: Iterable[TrackObservation],
+    *,
+    aggregation: LandmarkAggregationConfig | None = None,
+    clustering: LandmarkViewClusteringConfig | None = None,
+    normalize_final_prototypes: bool = True,
+) -> MultiPrototypeTrackBank:
+    """Build deterministic descriptor-clustered prototypes without changing track identity."""
+
+    aggregation_config = aggregation or LandmarkAggregationConfig(
+        method="mean",
+        l2_normalize_observations=True,
+    )
+    clustering_config = clustering or LandmarkViewClusteringConfig()
+    valid = _valid_observations(observations)
+    feature_dim = int(valid[0].feature.size) if valid else 0
+    output: list[TrackPrototype] = []
+    for track_id, group in sorted(_group_by_track(valid).items()):
+        if len(group) < int(aggregation_config.min_observations):
+            continue
+        max_by_support = max(1, len(group) // int(clustering_config.min_observations_per_prototype))
+        cluster_count = min(int(clustering_config.max_prototypes_per_track), max_by_support)
+        features = _features_for_track(group, aggregation_config)
+        labels = _deterministic_spherical_kmeans_labels(
+            features,
+            cluster_count=int(cluster_count),
+            iterations=int(clustering_config.iterations),
+        )
+        groups = [np.flatnonzero(labels == cluster_id) for cluster_id in range(int(cluster_count))]
+        if any(indices.size < int(clustering_config.min_observations_per_prototype) for indices in groups):
+            groups = [np.arange(len(group), dtype=np.int64)]
+        groups.sort(key=lambda indices: int(np.min(indices)))
+        for prototype_id, indices in enumerate(groups):
+            selected = [group[int(index)] for index in indices.tolist()]
+            aggregated = _aggregate_one_track(int(track_id), selected, aggregation_config)
+            feature = np.asarray(aggregated.mean_feature, dtype=np.float32)
+            if bool(normalize_final_prototypes):
+                feature = feature / max(float(np.linalg.norm(feature)), 1e-6)
+            output.append(
+                TrackPrototype(
+                    track_id=int(track_id),
+                    prototype_id=int(prototype_id),
+                    feature=feature.astype(np.float32, copy=False),
+                    variance=np.asarray(aggregated.variance, dtype=np.float32),
+                    observation_count=int(aggregated.observation_count),
+                    mean_utility=float(aggregated.mean_utility),
+                    observation_image_ids=tuple(aggregated.observation_image_ids),
+                )
+            )
+    return MultiPrototypeTrackBank(
+        prototypes=tuple(output),
+        feature_dim=int(feature_dim),
+        clustering=clustering_config,
+    )
+
+
+@dataclass(frozen=True)
+class TrackPrototypeBuilder:
+    """One prototype contract shared by offline bank building and training."""
+
+    aggregation: LandmarkAggregationConfig = LandmarkAggregationConfig()
+    normalize_final_prototypes: bool = True
+    version: str = TRACK_PROTOTYPE_BUILDER_VERSION
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "version": str(self.version),
+            "aggregation": self.aggregation.to_dict(),
+            "normalize_final_prototypes": bool(self.normalize_final_prototypes),
+        }
+
+    def _normalize_bank(self, bank: SelectedTrackFeatureBank) -> SelectedTrackFeatureBank:
+        if not bool(self.normalize_final_prototypes):
+            return bank
+        tracks: dict[int, TrackFeature] = {}
+        for track_id, track in bank.tracks.items():
+            feature = np.asarray(track.mean_feature, dtype=np.float32)
+            feature = feature / max(float(np.linalg.norm(feature)), 1e-6)
+            tracks[int(track_id)] = TrackFeature(
+                track_id=int(track.track_id),
+                mean_feature=feature.astype(np.float32, copy=False),
+                variance=np.asarray(track.variance, dtype=np.float32),
+                observation_count=int(track.observation_count),
+                mean_utility=float(track.mean_utility),
+                observation_image_ids=tuple(track.observation_image_ids),
+            )
+        return SelectedTrackFeatureBank(tracks=tracks, feature_dim=int(bank.feature_dim))
+
+    def build_bank(self, observations: Iterable[TrackObservation]) -> SelectedTrackFeatureBank:
+        return self._normalize_bank(aggregate_landmark_features(observations, self.aggregation))
+
+    def build_bank_torch(
+        self,
+        observations: Iterable[TrackObservation],
+        *,
+        device: str = "cuda",
+    ) -> SelectedTrackFeatureBank:
+        """Use the scatter fast path where it is exactly supported."""
+
+        bank = aggregate_landmark_features_torch(observations, self.aggregation, device=str(device))
+        return self._normalize_bank(bank)
+
+    def aggregate_torch(
+        self,
+        descriptors,
+        inverse,
+        track_count: int,
+        *,
+        utilities=None,
+    ):
+        """Differentiably aggregate rows with the same semantics as ``build_bank``."""
+
+        import torch
+        from torch.nn import functional as torch_functional
+
+        if descriptors.ndim != 2:
+            raise ValueError("descriptors must have shape (N, C)")
+        groups = inverse.to(device=descriptors.device, dtype=torch.long).reshape(-1)
+        if groups.shape[0] != descriptors.shape[0]:
+            raise ValueError("inverse must contain one group index per descriptor")
+        if int(track_count) <= 0:
+            raise ValueError("track_count must be positive")
+        if groups.numel() and (torch.any(groups < 0) or torch.any(groups >= int(track_count))):
+            raise ValueError("inverse contains an out-of-range track index")
+        method = str(self.aggregation.method)
+        if method not in {"mean", "cosine_weighted_mean", "geometry_weighted"}:
+            raise ValueError(f"training-time prototype aggregation does not support method={method!r}")
+        values = descriptors
+        if bool(self.aggregation.l2_normalize_observations) or method == "cosine_weighted_mean":
+            values = torch_functional.normalize(values, dim=1, eps=1e-6)
+        if utilities is None or method == "mean":
+            weights = torch.ones((values.shape[0],), dtype=values.dtype, device=values.device)
+        else:
+            weights = torch.as_tensor(utilities, dtype=values.dtype, device=values.device).reshape(-1)
+            if weights.shape[0] != values.shape[0]:
+                raise ValueError("utilities must contain one value per descriptor")
+            weights = torch.clamp(weights, min=float(self.aggregation.weight_floor))
+        sums = torch.zeros(
+            (int(track_count), int(values.shape[1])),
+            dtype=values.dtype,
+            device=values.device,
+        )
+        weight_sums = torch.zeros((int(track_count),), dtype=values.dtype, device=values.device)
+        sums.index_add_(0, groups, values * weights[:, None])
+        weight_sums.index_add_(0, groups, weights)
+        prototypes = sums / weight_sums.clamp_min(1e-12)[:, None]
+        if bool(self.normalize_final_prototypes) or method == "cosine_weighted_mean":
+            prototypes = torch_functional.normalize(prototypes, dim=1, eps=1e-6)
+        counts = torch.bincount(groups, minlength=int(track_count)).to(dtype=values.dtype)
+        return prototypes, counts
 
 
 def aggregate_landmark_features_torch(

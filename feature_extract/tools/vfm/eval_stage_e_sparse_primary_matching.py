@@ -283,9 +283,18 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 "match_count": int(len(matches)),
                 "source_breakdown": source_breakdown,
                 "patch_geometry": patch_geometry,
-                "all_match_spatial": match_spatial_distribution_stats(matches, int(camera.width), int(camera.height)),
+                "all_match_spatial": match_spatial_distribution_stats(
+                    matches,
+                    int(camera.width),
+                    int(camera.height),
+                    pose_w2c=pnp.pose_w2c,
+                ),
                 "pnp_inlier_spatial": match_spatial_distribution_stats(
-                    matches, int(camera.width), int(camera.height), mask=pnp.inlier_mask
+                    matches,
+                    int(camera.width),
+                    int(camera.height),
+                    mask=pnp.inlier_mask,
+                    pose_w2c=pnp.pose_w2c,
                 ),
                 "pnp_reprojection": pnp_reprojection_residual_stats(matches, pnp.pose_w2c, camera, pnp.inlier_mask),
                 "pnp_solve": bool(pnp.success),

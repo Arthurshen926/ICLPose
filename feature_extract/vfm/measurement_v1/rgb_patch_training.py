@@ -3,9 +3,10 @@ from __future__ import annotations
 import csv
 import json
 import random
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, MutableMapping, Sequence
 
 import numpy as np
 import torch
@@ -223,6 +224,8 @@ def _filter_rows_for_training(
     target_dustbin_filter: str = "all",
     baseline_epe_min_px: float | None = None,
     baseline_epe_max_px: float | None = None,
+    loss_weight_key: str = "",
+    min_loss_weight: float | None = None,
 ) -> tuple[list[dict[str, str]], dict[str, Any]]:
     dustbin_filter = str(target_dustbin_filter).strip().lower() or "all"
     if dustbin_filter not in {"all", "valid", "dustbin"}:
@@ -235,9 +238,16 @@ def _filter_rows_for_training(
         raise ValueError("baseline_epe_max_px must be non-negative")
     if min_epe is not None and max_epe is not None and min_epe > max_epe:
         raise ValueError("baseline_epe_min_px must be <= baseline_epe_max_px")
+    weight_key = str(loss_weight_key).strip()
+    minimum_weight = None if min_loss_weight is None else float(min_loss_weight)
+    if minimum_weight is not None and minimum_weight < 0.0:
+        raise ValueError("min_loss_weight must be non-negative")
+    if minimum_weight is not None and not weight_key:
+        raise ValueError("min_loss_weight requires loss_weight_key")
     kept: list[dict[str, str]] = []
     dropped_dustbin = 0
     dropped_residual = 0
+    dropped_loss_weight = 0
     for row in rows:
         is_dustbin = _target_is_dustbin_for_filter(
             row,
@@ -258,6 +268,13 @@ def _filter_rows_for_training(
         if max_epe is not None and residual > max_epe:
             dropped_residual += 1
             continue
+        if minimum_weight is not None:
+            weight_text = str(row.get(weight_key, "")).strip()
+            if not weight_text:
+                raise ValueError(f"row missing {weight_key!r}")
+            if float(weight_text) < minimum_weight:
+                dropped_loss_weight += 1
+                continue
         kept.append(dict(row))
     return kept, {
         "raw_count": int(len(rows)),
@@ -265,9 +282,12 @@ def _filter_rows_for_training(
         "dropped_count": int(len(rows) - len(kept)),
         "dropped_by_dustbin_count": int(dropped_dustbin),
         "dropped_by_residual_count": int(dropped_residual),
+        "dropped_by_loss_weight_count": int(dropped_loss_weight),
         "target_dustbin_filter": dustbin_filter,
         "baseline_epe_min_px": min_epe,
         "baseline_epe_max_px": max_epe,
+        "loss_weight_key": weight_key,
+        "min_loss_weight": minimum_weight,
     }
 
 
@@ -554,6 +574,24 @@ def _sample_weight_batch(rows: Sequence[Mapping[str, object]], *, loss_weight_ke
     return torch.tensor(values, dtype=torch.float32)
 
 
+def _configure_head_only_training(
+    model: RGBPatchMeasurementBranch,
+    *,
+    train_dustbin_head_only: bool,
+    train_measurement_gate_head_only: bool,
+) -> str:
+    if bool(train_dustbin_head_only) and bool(train_measurement_gate_head_only):
+        raise ValueError("dustbin-head-only and measurement-gate-head-only training are mutually exclusive")
+    if not bool(train_dustbin_head_only) and not bool(train_measurement_gate_head_only):
+        return "all"
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    selected = model.dustbin_head if bool(train_dustbin_head_only) else model.measurement_gate_head
+    for parameter in selected.parameters():
+        parameter.requires_grad_(True)
+    return "dustbin_head" if bool(train_dustbin_head_only) else "measurement_gate_head"
+
+
 def _passes_measurement_gate(
     metrics: Mapping[str, object],
     *,
@@ -796,6 +834,10 @@ def _gate_supervision_loss(
     full_radius_px: float,
     target_mode: str = "residual",
     utility_temperature_px: float = 0.25,
+    minimum_update_gain_px: float = 0.1,
+    positive_weight: float = 1.0,
+    low_residual_threshold_px: float = 1.0,
+    low_residual_negative_weight: float = 1.0,
 ) -> torch.Tensor | None:
     if pred.gate_logit is None:
         return None
@@ -809,7 +851,7 @@ def _gate_supervision_loss(
         if full <= center:
             raise ValueError("gate_full_radius_px must be greater than gate_center_radius_px")
         target_gate = ((residual - center) / (full - center)).clamp(0.0, 1.0)
-    elif mode == "utility":
+    elif mode in {"utility", "binary_utility"}:
         if pred.mean_offset_xy is None:
             raise ValueError("utility gate supervision requires pred.mean_offset_xy")
         temperature = float(utility_temperature_px)
@@ -818,9 +860,12 @@ def _gate_supervision_loss(
         center_epe = torch.linalg.norm(target_xy, dim=1)
         likelihood_mean = pred.mean_offset_xy.to(device=logits.device, dtype=logits.dtype).reshape(int(logits.shape[0]), 2)
         likelihood_epe = torch.linalg.norm(likelihood_mean.detach() - target_xy, dim=1)
-        target_gate = torch.sigmoid((center_epe - likelihood_epe) / temperature)
+        if mode == "utility":
+            target_gate = torch.sigmoid((center_epe - likelihood_epe) / temperature)
+        else:
+            target_gate = (likelihood_epe + float(minimum_update_gain_px) <= center_epe).to(dtype=logits.dtype)
     else:
-        raise ValueError("gate_target_mode must be residual or utility")
+        raise ValueError("gate_target_mode must be residual, utility, or binary_utility")
     if target_is_dustbin is None:
         valid_mask = torch.ones_like(target_gate, dtype=torch.bool)
     else:
@@ -828,6 +873,19 @@ def _gate_supervision_loss(
     if not torch.any(valid_mask):
         return torch.zeros((), device=logits.device, dtype=logits.dtype)
     loss_rows = F.binary_cross_entropy_with_logits(logits, target_gate, reduction="none")
+    loss_rows = loss_rows * torch.where(
+        target_gate > 0.5,
+        torch.full_like(loss_rows, float(positive_weight)),
+        torch.ones_like(loss_rows),
+    )
+    if float(low_residual_negative_weight) != 1.0:
+        center_epe = torch.linalg.norm(target_xy, dim=1)
+        low_negative = (center_epe <= float(low_residual_threshold_px)) & (target_gate <= 0.5)
+        loss_rows = loss_rows * torch.where(
+            low_negative,
+            torch.full_like(loss_rows, float(low_residual_negative_weight)),
+            torch.ones_like(loss_rows),
+        )
     weights = None
     if sample_weight is not None:
         weights = sample_weight.to(device=logits.device, dtype=logits.dtype).reshape(int(logits.shape[0])).clamp_min(0.0)
@@ -841,14 +899,81 @@ def _gate_supervision_loss(
     return torch.sum(selected_loss * selected_weight) / denom.clamp_min(1e-12)
 
 
+class TensorImageLRUCache(MutableMapping[str, torch.Tensor]):
+    """Byte-bounded tensor cache shared by query and support image owners."""
+
+    def __init__(self, *, max_bytes: int | None = None) -> None:
+        if max_bytes is not None and int(max_bytes) <= 0:
+            raise ValueError("max_bytes must be positive when provided")
+        self.max_bytes = None if max_bytes is None else int(max_bytes)
+        self._values: OrderedDict[str, torch.Tensor] = OrderedDict()
+        self.current_bytes = 0
+        self.peak_bytes = 0
+        self.hits = 0
+        self.misses = 0
+        self.evictions = 0
+
+    @staticmethod
+    def _tensor_bytes(value: torch.Tensor) -> int:
+        return int(value.numel() * value.element_size())
+
+    def __getitem__(self, key: str) -> torch.Tensor:
+        value = self._values.pop(key)
+        self._values[key] = value
+        self.hits += 1
+        return value
+
+    def __setitem__(self, key: str, value: torch.Tensor) -> None:
+        if key in self._values:
+            previous = self._values.pop(key)
+            self.current_bytes -= self._tensor_bytes(previous)
+        self._values[key] = value
+        self.current_bytes += self._tensor_bytes(value)
+        while (
+            self.max_bytes is not None
+            and self.current_bytes > self.max_bytes
+            and len(self._values) > 1
+        ):
+            _old_key, old_value = self._values.popitem(last=False)
+            self.current_bytes -= self._tensor_bytes(old_value)
+            self.evictions += 1
+        self.peak_bytes = max(self.peak_bytes, self.current_bytes)
+
+    def __delitem__(self, key: str) -> None:
+        value = self._values.pop(key)
+        self.current_bytes -= self._tensor_bytes(value)
+
+    def __iter__(self):
+        return iter(self._values)
+
+    def __len__(self) -> int:
+        return len(self._values)
+
+    def record_miss(self) -> None:
+        self.misses += 1
+
+    def summary(self) -> dict[str, int | None]:
+        return {
+            "entry_count": int(len(self)),
+            "max_bytes": self.max_bytes,
+            "current_bytes": int(self.current_bytes),
+            "peak_bytes": int(self.peak_bytes),
+            "hits": int(self.hits),
+            "misses": int(self.misses),
+            "evictions": int(self.evictions),
+        }
+
+
 def _load_tensor_cached(
-    cache: dict[str, torch.Tensor],
+    cache: MutableMapping[str, torch.Tensor],
     key: str,
     loader,
     *,
     cache_device: torch.device | None = None,
 ) -> torch.Tensor:
     if key not in cache:
+        if isinstance(cache, TensorImageLRUCache):
+            cache.record_miss()
         value = loader()
         if cache_device is not None:
             value = value.to(cache_device)
@@ -909,8 +1034,8 @@ def _stack_patch_batch(
     render_image_height: int | None = None,
     crop_radius_px: float,
     step_px: float,
-    query_cache: dict[str, torch.Tensor],
-    render_cache: dict[str, torch.Tensor],
+    query_cache: MutableMapping[str, torch.Tensor],
+    render_cache: MutableMapping[str, torch.Tensor],
     query_source: str,
     render_patch_augmentation: str = "none",
     support_patch_warp: str = "none",
@@ -1110,8 +1235,8 @@ def _evaluate(
     render_image_height: int | None,
     batch_size: int,
     device: torch.device,
-    query_cache: dict[str, torch.Tensor],
-    render_cache: dict[str, torch.Tensor],
+    query_cache: MutableMapping[str, torch.Tensor],
+    render_cache: MutableMapping[str, torch.Tensor],
     max_eval_rows: int | None,
     epe_weight: float,
     delta_loss_weight: float,
@@ -1121,6 +1246,10 @@ def _evaluate(
     gate_full_radius_px: float,
     gate_target_mode: str,
     gate_utility_temperature_px: float,
+    gate_minimum_update_gain_px: float,
+    gate_positive_weight: float,
+    gate_low_residual_threshold_px: float,
+    gate_low_residual_negative_weight: float,
     likelihood_loss_weight: float,
     coarse_likelihood_loss_weight: float,
     dustbin_bce_weight: float,
@@ -1231,6 +1360,10 @@ def _evaluate(
             full_radius_px=float(gate_full_radius_px),
             target_mode=str(gate_target_mode),
             utility_temperature_px=float(gate_utility_temperature_px),
+            minimum_update_gain_px=float(gate_minimum_update_gain_px),
+            positive_weight=float(gate_positive_weight),
+            low_residual_threshold_px=float(gate_low_residual_threshold_px),
+            low_residual_negative_weight=float(gate_low_residual_negative_weight),
         )
         if pred0.gated_mean_offset_xy is not None and pred0.gate_probability is not None:
             gated_epes.append(torch.linalg.norm(pred0.gated_mean_offset_xy.detach().cpu() - target.detach().cpu(), dim=1))
@@ -1468,6 +1601,10 @@ def train_rgb_patch_measurement_branch(
     gate_full_radius_px: float = 2.0,
     gate_target_mode: str = "residual",
     gate_utility_temperature_px: float = 0.25,
+    gate_minimum_update_gain_px: float = 0.1,
+    gate_positive_weight: float = 1.0,
+    gate_low_residual_threshold_px: float = 1.0,
+    gate_low_residual_negative_weight: float = 1.0,
     likelihood_loss_weight: float = 0.1,
     coarse_likelihood_loss_weight: float = 0.0,
     dustbin_bce_weight: float = 0.0,
@@ -1490,6 +1627,7 @@ def train_rgb_patch_measurement_branch(
     render_patch_augmentation: str = "none",
     hard_negative_fraction: float = 0.0,
     train_dustbin_head_only: bool = False,
+    train_measurement_gate_head_only: bool = False,
     condition_on_prior_scale: bool = False,
     prior_scale_key: str = "",
     prior_scale_expert_centers_px: Sequence[float] = (),
@@ -1498,6 +1636,7 @@ def train_rgb_patch_measurement_branch(
     target_x_key: str = "query_gt_x",
     target_y_key: str = "query_gt_y",
     loss_weight_key: str = "",
+    min_loss_weight: float | None = None,
     cache_images_on_device: bool = False,
     target_dustbin_filter: str = "all",
     baseline_epe_min_px: float | None = None,
@@ -1505,6 +1644,7 @@ def train_rgb_patch_measurement_branch(
     residual_balanced_sampling: bool = False,
     residual_sampling_bins_px: Sequence[float] = (),
     data_parallel_device_ids: Sequence[int] = (),
+    image_cache_max_gb: float | None = None,
 ) -> dict[str, Any]:
     base = Path.cwd() if base_dir is None else Path(base_dir)
     if (coarse_search_radius_px is None) != (coarse_step_px is None):
@@ -1525,6 +1665,8 @@ def train_rgb_patch_measurement_branch(
         target_dustbin_filter=str(target_dustbin_filter),
         baseline_epe_min_px=baseline_epe_min_px,
         baseline_epe_max_px=baseline_epe_max_px,
+        loss_weight_key=str(loss_weight_key),
+        min_loss_weight=min_loss_weight,
     )
     if not rows:
         raise ValueError("row filters removed all rows")
@@ -1540,6 +1682,8 @@ def train_rgb_patch_measurement_branch(
             target_dustbin_filter=str(target_dustbin_filter),
             baseline_epe_min_px=baseline_epe_min_px,
             baseline_epe_max_px=baseline_epe_max_px,
+            loss_weight_key=str(loss_weight_key),
+            min_loss_weight=min_loss_weight,
         )
         if not val_rows:
             raise ValueError("val_rows_csv contains no rows")
@@ -1584,11 +1728,11 @@ def train_rgb_patch_measurement_branch(
             state_dict,
             strict=not (allow_missing_prior_parameters or allow_missing_gate_parameters),
         )
-    if bool(train_dustbin_head_only):
-        for parameter in model.parameters():
-            parameter.requires_grad_(False)
-        for parameter in model.dustbin_head.parameters():
-            parameter.requires_grad_(True)
+    trainable_scope = _configure_head_only_training(
+        model,
+        train_dustbin_head_only=bool(train_dustbin_head_only),
+        train_measurement_gate_head_only=bool(train_measurement_gate_head_only),
+    )
     requested_data_parallel_ids = [int(value) for value in data_parallel_device_ids]
     active_data_parallel_ids: list[int] = []
     parallel_forward: nn.DataParallel | None = None
@@ -1608,8 +1752,14 @@ def train_rgb_patch_measurement_branch(
     optimizer = torch.optim.AdamW(trainable_parameters, lr=float(lr))
     parameter_count = int(sum(parameter.numel() for parameter in model.parameters()))
     trainable_parameter_count = int(sum(parameter.numel() for parameter in trainable_parameters))
-    query_cache: dict[str, torch.Tensor] = {}
-    render_cache: dict[str, torch.Tensor] = {}
+    cache_max_bytes = (
+        None
+        if image_cache_max_gb is None or float(image_cache_max_gb) <= 0.0
+        else int(float(image_cache_max_gb) * (1024**3))
+    )
+    image_cache = TensorImageLRUCache(max_bytes=cache_max_bytes)
+    query_cache: MutableMapping[str, torch.Tensor] = image_cache
+    render_cache: MutableMapping[str, torch.Tensor] = image_cache
     residual_sampler: _ResidualBalancedBatchSampler | None = None
     if bool(residual_balanced_sampling):
         residual_sampler = _ResidualBalancedBatchSampler(
@@ -1734,6 +1884,10 @@ def train_rgb_patch_measurement_branch(
             full_radius_px=float(gate_full_radius_px),
             target_mode=str(gate_target_mode),
             utility_temperature_px=float(gate_utility_temperature_px),
+            minimum_update_gain_px=float(gate_minimum_update_gain_px),
+            positive_weight=float(gate_positive_weight),
+            low_residual_threshold_px=float(gate_low_residual_threshold_px),
+            low_residual_negative_weight=float(gate_low_residual_negative_weight),
         )
         loss = float(delta_loss_weight) * delta_loss + float(likelihood_loss_weight) * likelihood_loss
         if gated_delta_loss is not None:
@@ -1823,6 +1977,10 @@ def train_rgb_patch_measurement_branch(
         gate_full_radius_px=float(gate_full_radius_px),
         gate_target_mode=str(gate_target_mode),
         gate_utility_temperature_px=float(gate_utility_temperature_px),
+        gate_minimum_update_gain_px=float(gate_minimum_update_gain_px),
+        gate_positive_weight=float(gate_positive_weight),
+        gate_low_residual_threshold_px=float(gate_low_residual_threshold_px),
+        gate_low_residual_negative_weight=float(gate_low_residual_negative_weight),
         dustbin_bce_weight=float(dustbin_bce_weight),
         dustbin_positive_weight=float(dustbin_positive_weight),
         target_heatmap_sigma_px=float(target_heatmap_sigma_px),
@@ -1860,6 +2018,10 @@ def train_rgb_patch_measurement_branch(
         gate_full_radius_px=float(gate_full_radius_px),
         gate_target_mode=str(gate_target_mode),
         gate_utility_temperature_px=float(gate_utility_temperature_px),
+        gate_minimum_update_gain_px=float(gate_minimum_update_gain_px),
+        gate_positive_weight=float(gate_positive_weight),
+        gate_low_residual_threshold_px=float(gate_low_residual_threshold_px),
+        gate_low_residual_negative_weight=float(gate_low_residual_negative_weight),
         dustbin_bce_weight=float(dustbin_bce_weight),
         dustbin_positive_weight=float(dustbin_positive_weight),
         target_heatmap_sigma_px=float(target_heatmap_sigma_px),
@@ -1927,9 +2089,15 @@ def train_rgb_patch_measurement_branch(
         "val_group_key": str(val_group_key),
         "steps": int(steps),
         "batch_size": int(batch_size),
+        "feature_dim": int(feature_dim),
+        "hidden_dim": None if hidden_dim is None else int(hidden_dim),
+        "learning_rate": float(lr),
+        "seed": int(seed),
         "eval_batch_size": int(eval_batch),
         "cache_images_on_device": bool(cache_images_on_device),
         "image_cache_device": "" if image_cache_device is None else str(image_cache_device),
+        "image_cache_max_gb": None if cache_max_bytes is None else float(cache_max_bytes / (1024**3)),
+        "image_cache": image_cache.summary(),
         "requested_data_parallel_device_ids": requested_data_parallel_ids,
         "active_data_parallel_device_ids": active_data_parallel_ids,
         "search_radius_px": float(search_radius_px),
@@ -1944,6 +2112,8 @@ def train_rgb_patch_measurement_branch(
         "render_patch_augmentation": str(render_patch_augmentation),
         "hard_negative_fraction": float(hard_negative_fraction),
         "train_dustbin_head_only": bool(train_dustbin_head_only),
+        "train_measurement_gate_head_only": bool(train_measurement_gate_head_only),
+        "trainable_scope": str(trainable_scope),
         "condition_on_prior_scale": bool(condition_on_prior_scale),
         "prior_scale_key": str(prior_scale_key),
         "prior_scale_expert_centers_px": [float(value) for value in prior_scale_expert_centers_px],
@@ -1952,6 +2122,7 @@ def train_rgb_patch_measurement_branch(
         "target_x_key": str(target_x_key),
         "target_y_key": str(target_y_key),
         "loss_weight_key": str(loss_weight_key),
+        "min_loss_weight": None if min_loss_weight is None else float(min_loss_weight),
         "target_dustbin_filter": str(target_dustbin_filter),
         "baseline_epe_min_px": None if baseline_epe_min_px is None else float(baseline_epe_min_px),
         "baseline_epe_max_px": None if baseline_epe_max_px is None else float(baseline_epe_max_px),
@@ -1966,6 +2137,10 @@ def train_rgb_patch_measurement_branch(
         "gate_full_radius_px": float(gate_full_radius_px),
         "gate_target_mode": str(gate_target_mode),
         "gate_utility_temperature_px": float(gate_utility_temperature_px),
+        "gate_minimum_update_gain_px": float(gate_minimum_update_gain_px),
+        "gate_positive_weight": float(gate_positive_weight),
+        "gate_low_residual_threshold_px": float(gate_low_residual_threshold_px),
+        "gate_low_residual_negative_weight": float(gate_low_residual_negative_weight),
         "likelihood_loss_weight": float(likelihood_loss_weight),
         "coarse_likelihood_loss_weight": float(coarse_likelihood_loss_weight),
         "dustbin_bce_weight": float(dustbin_bce_weight),

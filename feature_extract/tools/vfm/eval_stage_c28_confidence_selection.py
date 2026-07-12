@@ -135,7 +135,13 @@ def _hypothesis_score(matches: list[QueryTo3DMatch], confidences: np.ndarray, po
     if not np.any(inliers):
         return float("-inf")
     probs = np.clip(confidences[inliers], 1e-4, 1.0 - 1e-4)
-    spatial = match_spatial_distribution_stats(matches, int(camera.width), int(camera.height), inliers)
+    spatial = match_spatial_distribution_stats(
+        matches,
+        int(camera.width),
+        int(camera.height),
+        inliers,
+        pose_w2c=pose_w2c,
+    )
     coverage = float(spatial.get("grid_4x4_occupancy_frac") or 0.0)
     planarity = float(spatial.get("xyz_planarity_ratio") or 0.0)
     depth_range = float(spatial.get("depth_range_m") or 0.0)

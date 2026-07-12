@@ -19,6 +19,11 @@ class LandmarkRecallRecord:
     rank1_track_id: int | None
     rank1_score: float | None
     score_gap_to_rank1: float | None
+    query_x: float | None = None
+    query_y: float | None = None
+    landmark_x: float | None = None
+    landmark_y: float | None = None
+    landmark_z: float | None = None
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -60,6 +65,17 @@ def rank_correct_landmark(
         return LandmarkRecallRecord(str(query_id), int(correct_track_id), None, None, None, None, None)
     scores = (norm_features @ norm_query[0].astype(np.float32)).astype(np.float64)
     scores[~valid_features] = -np.inf
+    if np.unique(track_ids).size != track_ids.size:
+        # Multi-prototype banks are evaluated in track space. A track receives
+        # the score of its best prototype and therefore occupies one rank.
+        if np.any(track_ids[1:] < track_ids[:-1]):
+            order = np.argsort(track_ids, kind="stable")
+            track_ids = track_ids[order]
+            scores = scores[order]
+        starts = np.flatnonzero(np.r_[True, track_ids[1:] != track_ids[:-1]])
+        scores = np.maximum.reduceat(scores, starts)
+        track_ids = track_ids[starts]
+        valid_features = np.isfinite(scores)
     rank1_index = int(np.argmax(scores)) if scores.size else None
     if rank1_index is not None and not np.isfinite(scores[rank1_index]):
         rank1_index = None
@@ -104,6 +120,139 @@ def rank_correct_landmark(
     )
 
 
+def rank_correct_landmarks_batch(
+    *,
+    query_descriptors: np.ndarray,
+    landmark_features: np.ndarray,
+    landmark_track_ids: np.ndarray,
+    correct_track_ids: Sequence[int],
+    query_ids: Sequence[str] | None = None,
+    landmark_features_are_normalized: bool = False,
+    valid_landmark_mask: np.ndarray | None = None,
+    device: str = "cpu",
+    batch_size: int = 64,
+) -> list[LandmarkRecallRecord]:
+    """Compute exact track-level ranks in batches, including multi-prototype banks."""
+
+    import torch
+
+    queries = np.asarray(query_descriptors, dtype=np.float32)
+    features = np.asarray(landmark_features, dtype=np.float32)
+    track_ids = np.asarray(landmark_track_ids, dtype=np.int64).reshape(-1)
+    correct_ids = np.asarray(correct_track_ids, dtype=np.int64).reshape(-1)
+    if queries.ndim != 2 or features.ndim != 2:
+        raise ValueError("query_descriptors and landmark_features must have shape (N, C)")
+    if queries.shape[1] != features.shape[1]:
+        raise ValueError("query and landmark descriptor dimensions must match")
+    if track_ids.shape[0] != features.shape[0]:
+        raise ValueError("landmark_track_ids must contain one id per landmark feature")
+    if correct_ids.shape[0] != queries.shape[0]:
+        raise ValueError("correct_track_ids must contain one id per query descriptor")
+    if query_ids is None:
+        ids = tuple("" for _ in range(queries.shape[0]))
+    else:
+        ids = tuple(str(item) for item in query_ids)
+        if len(ids) != queries.shape[0]:
+            raise ValueError("query_ids must contain one id per query descriptor")
+    if int(batch_size) <= 0:
+        raise ValueError("batch_size must be positive")
+
+    normalized_queries, valid_queries = normalize_rows(queries)
+    if landmark_features_are_normalized:
+        normalized_features = features
+        if valid_landmark_mask is None:
+            _normalized, valid_features = normalize_rows(features)
+        else:
+            valid_features = np.asarray(valid_landmark_mask, dtype=bool).reshape(-1)
+            if valid_features.shape[0] != features.shape[0]:
+                raise ValueError("valid_landmark_mask must contain one value per landmark feature")
+    else:
+        normalized_features, valid_features = normalize_rows(features)
+
+    requested = torch.device(str(device))
+    if requested.type == "cuda" and not torch.cuda.is_available():
+        requested = torch.device("cpu")
+    feature_tensor = torch.as_tensor(normalized_features, dtype=torch.float32, device=requested)
+    valid_feature_tensor = torch.as_tensor(valid_features, dtype=torch.bool, device=requested)
+    unique_track_ids, track_inverse = np.unique(track_ids, return_inverse=True)
+    has_multiple_prototypes = bool(unique_track_ids.size != track_ids.size)
+    score_track_ids = unique_track_ids if has_multiple_prototypes else track_ids
+    track_position = {int(track_id): int(index) for index, track_id in enumerate(score_track_ids.tolist())}
+    track_inverse_tensor = (
+        torch.as_tensor(track_inverse, dtype=torch.long, device=requested) if has_multiple_prototypes else None
+    )
+    score_positions = torch.arange(int(score_track_ids.size), dtype=torch.long, device=requested)
+
+    output: list[LandmarkRecallRecord] = []
+    with torch.no_grad():
+        for start in range(0, int(queries.shape[0]), int(batch_size)):
+            end = min(start + int(batch_size), int(queries.shape[0]))
+            query_tensor = torch.as_tensor(normalized_queries[start:end], dtype=torch.float32, device=requested)
+            scores = query_tensor @ feature_tensor.T
+            scores[:, ~valid_feature_tensor] = -torch.inf
+            if track_inverse_tensor is not None:
+                track_scores = torch.full(
+                    (end - start, int(unique_track_ids.size)),
+                    -torch.inf,
+                    dtype=torch.float32,
+                    device=requested,
+                )
+                track_scores.scatter_reduce_(
+                    1,
+                    track_inverse_tensor[None, :].expand(end - start, -1),
+                    scores,
+                    reduce="amax",
+                    include_self=True,
+                )
+            else:
+                track_scores = scores
+            for local_index, global_index in enumerate(range(start, end)):
+                query_id = ids[global_index]
+                correct_track_id = int(correct_ids[global_index])
+                row = track_scores[local_index]
+                finite = torch.isfinite(row)
+                if not bool(valid_queries[global_index]) or not bool(torch.any(finite)):
+                    output.append(
+                        LandmarkRecallRecord(query_id, correct_track_id, None, None, None, None, None)
+                    )
+                    continue
+                rank1_position = int(torch.argmax(row).item())
+                rank1_track_id = int(score_track_ids[rank1_position])
+                rank1_score = float(row[rank1_position].item())
+                correct_position = track_position.get(correct_track_id)
+                if correct_position is None or not bool(finite[correct_position]):
+                    output.append(
+                        LandmarkRecallRecord(
+                            query_id,
+                            correct_track_id,
+                            None,
+                            None,
+                            rank1_track_id,
+                            rank1_score,
+                            None,
+                        )
+                    )
+                    continue
+                correct_score_tensor = row[correct_position]
+                correct_score = float(correct_score_tensor.item())
+                higher = int(torch.sum(row > correct_score_tensor).item())
+                tied_before = int(
+                    torch.sum((row == correct_score_tensor) & (score_positions < int(correct_position))).item()
+                )
+                output.append(
+                    LandmarkRecallRecord(
+                        query_id,
+                        correct_track_id,
+                        int(higher + tied_before + 1),
+                        correct_score,
+                        rank1_track_id,
+                        rank1_score,
+                        float(rank1_score - correct_score),
+                    )
+                )
+    return output
+
+
 def summarize_landmark_recall_records(
     records: Sequence[LandmarkRecallRecord],
     *,
@@ -116,7 +265,14 @@ def summarize_landmark_recall_records(
         "found_count": int(len(ranks)),
         "missing_count": int(len(values) - len(ranks)),
         "median_correct_rank": None if not ranks else float(np.median(np.asarray(ranks, dtype=np.float64))),
+        "mean_correct_rank_found": None if not ranks else float(np.mean(np.asarray(ranks, dtype=np.float64))),
+        "mean_reciprocal_rank": (
+            0.0
+            if not values
+            else float(np.mean([0.0 if record.correct_rank is None else 1.0 / float(record.correct_rank) for record in values]))
+        ),
     }
+    query_ids = sorted({str(record.query_id) for record in values})
     for k in top_ks:
         kk = int(k)
         if kk <= 0:
@@ -124,6 +280,13 @@ def summarize_landmark_recall_records(
         summary[f"recall_at_{kk}"] = (
             0.0 if not values else float(np.mean([(rank is not None and rank <= kk) for rank in (r.correct_rank for r in values)]))
         )
+        per_query = []
+        for query_id in query_ids:
+            query_records = [record for record in values if str(record.query_id) == query_id]
+            per_query.append(
+                float(np.mean([record.correct_rank is not None and record.correct_rank <= kk for record in query_records]))
+            )
+        summary[f"macro_query_recall_at_{kk}"] = 0.0 if not per_query else float(np.mean(per_query))
     gaps = [record.score_gap_to_rank1 for record in values if record.score_gap_to_rank1 is not None]
     summary["median_score_gap_to_rank1"] = None if not gaps else float(np.median(np.asarray(gaps, dtype=np.float64)))
     return summary
