@@ -32,6 +32,7 @@ from feature_extract.vfm.measurement_v1.rgb_patch_training import (
 DIAGNOSTIC_FIELDNAMES = [
     "row_index",
     "query_id",
+    "support_image_id",
     "anchor_id",
     "track_id",
     "support_track_id",
@@ -593,6 +594,7 @@ def export_rgb_patch_diagnostics(
     image_cache_max_gb: float | None = None,
     prior_scale_key: str = "",
     target_dustbin_filter: str = "all",
+    export_full_likelihood: bool = False,
     device: str = "cuda",
     base_dir: Path | None = None,
 ) -> dict[str, Any]:
@@ -626,6 +628,9 @@ def export_rgb_patch_diagnostics(
     render_cache = image_cache
     output = Path(output_dir)
     diagnostic_rows: list[dict[str, object]] = []
+    likelihood_log_prob_batches: list[np.ndarray] = []
+    likelihood_target_batches: list[np.ndarray] = []
+    likelihood_offsets_xy: np.ndarray | None = None
     visual_candidates: list[tuple[float, int, Path, torch.Tensor, torch.Tensor, torch.Tensor]] = []
     batch = max(1, int(batch_size))
     with torch.no_grad():
@@ -667,6 +672,23 @@ def export_rgb_patch_diagnostics(
                 target_is_dustbin=None if _target_is_dustbin is None else _target_is_dustbin.to(torch_device),
             )
             spatial_probs_batch = torch.exp(likelihood.local_log_probs).detach().cpu()
+            if bool(export_full_likelihood):
+                batch_offsets = likelihood.offsets_xy.detach().cpu().numpy().astype(
+                    np.float32, copy=False
+                )
+                if likelihood_offsets_xy is None:
+                    likelihood_offsets_xy = np.array(batch_offsets, copy=True)
+                elif not np.array_equal(likelihood_offsets_xy, batch_offsets):
+                    raise RuntimeError("measurement offset support changed between batches")
+                likelihood_log_prob_batches.append(
+                    likelihood.local_log_probs.detach()
+                    .cpu()
+                    .numpy()
+                    .astype(np.float16)
+                )
+                likelihood_target_batches.append(
+                    target.detach().cpu().numpy().astype(np.float32)
+                )
             mean_xy_batch = likelihood.mean_offset_xy.detach().cpu()
             epe_batch = likelihood.epe_px.detach().cpu()
             dustbin_batch = likelihood.dustbin_probability.detach().cpu()
@@ -742,6 +764,7 @@ def export_rgb_patch_diagnostics(
                     {
                         "row_index": int(row_index),
                         "query_id": str(row.get("query_id", "")),
+                        "support_image_id": str(row.get("support_image_id", "")),
                         "anchor_id": str(row.get("anchor_id", "")),
                         "track_id": str(row.get("track_id", "")),
                         "support_track_id": str(row.get("support_track_id", "")),
@@ -954,6 +977,127 @@ def export_rgb_patch_diagnostics(
         row["visualization"] = row_to_vis.get(int(row["row_index"]), "")
     diagnostic_rows_path = output / "diagnostic_rows.csv"
     _write_csv(diagnostic_rows_path, diagnostic_rows)
+    likelihood_path: Path | None = None
+    if bool(export_full_likelihood):
+        if likelihood_offsets_xy is None or not likelihood_log_prob_batches:
+            raise RuntimeError("full likelihood export produced no spatial likelihoods")
+        likelihood_path = output / "candidate_spatial_likelihood_v3.npz"
+        full_log_probabilities = np.concatenate(likelihood_log_prob_batches, axis=0)
+        target_offsets = np.concatenate(likelihood_target_batches, axis=0)
+        if len(full_log_probabilities) != len(diagnostic_rows):
+            raise RuntimeError("likelihood rows and diagnostic rows are not aligned")
+
+        def text_array(key: str) -> np.ndarray:
+            return np.asarray(
+                [str(row.get(key, "")) for row in diagnostic_rows], dtype=np.str_
+            )
+
+        def int_array(key: str, *, default: int = -1) -> np.ndarray:
+            return np.asarray(
+                [int(str(row.get(key, default) or default)) for row in diagnostic_rows],
+                dtype=np.int64,
+            )
+
+        def float_array(key: str, *, default: float = np.nan) -> np.ndarray:
+            values = []
+            for row in diagnostic_rows:
+                text = str(row.get(key, "")).strip()
+                values.append(float(text) if text else float(default))
+            return np.asarray(values, dtype=np.float32)
+
+        likelihood_metadata = {
+            "format": "candidate_spatial_likelihood_v3",
+            "format_version": 3,
+            "rows_csv": str(rows_csv),
+            "rows_csv_sha256": file_sha256_short(Path(rows_csv)),
+            "measurement_checkpoint": str(checkpoint),
+            "measurement_checkpoint_sha256": checkpoint_sha256,
+            "query_source": str(query_source),
+            "support_patch_warp": str(support_patch_warp),
+            "image_width": int(image_width),
+            "image_height": int(image_height),
+            "search_radius_px": float(model.search_radius_px),
+            "context_radius_px": float(model.context_radius_px),
+            "step_px": float(model.step_px),
+            "spatial_probability_semantics": "conditional_on_non_dustbin",
+            "dustbin_probability_semantics": "independent_binary_head",
+            "support_views_unmarginalized": True,
+            "ground_truth_arrays_target_only": [
+                "target_offset_xy",
+                "target_is_dustbin",
+                "target_gt_projected_xy",
+                "target_gt_projected_residual_px",
+                "target_geometry_correct_1px",
+                "target_geometry_correct_2px",
+                "target_geometry_correct_5px",
+            ],
+            "pose_or_ground_truth_used_for_inference": False,
+            "render": False,
+        }
+        np.savez_compressed(
+            likelihood_path,
+            source_row_indices=np.asarray(
+                [int(row["row_index"]) for row in diagnostic_rows], dtype=np.int64
+            ),
+            query_ids=text_array("query_id"),
+            source_query_rows=int_array("source_query_row"),
+            candidate_identity_keys=text_array("candidate_identity_key"),
+            candidate_measurement_cache_keys=text_array(
+                "candidate_measurement_cache_key"
+            ),
+            candidate_measurement_ranks=int_array("candidate_measurement_rank"),
+            candidate_track_ids=int_array("track_id"),
+            candidate_prototype_ids=int_array("candidate_prototype_id"),
+            support_image_ids=text_array("support_image_id"),
+            support_view_ranks=int_array("support_view_rank"),
+            support_view_probabilities=float_array("support_view_probability"),
+            candidate_prior_probabilities=float_array(
+                "candidate_assignment_probability"
+            ),
+            center_xy=np.stack(
+                [float_array("center_x"), float_array("center_y")], axis=1
+            ),
+            offsets_xy=likelihood_offsets_xy,
+            local_log_probabilities=full_log_probabilities,
+            dustbin_probabilities=float_array("dustbin_probability"),
+            likelihood_entropy=float_array("likelihood_entropy"),
+            likelihood_covariance_trace_px2=float_array(
+                "likelihood_covariance_trace_px2"
+            ),
+            measurement_geometry_probabilities=float_array(
+                "measurement_geometry_probability"
+            ),
+            target_offset_xy=target_offsets,
+            target_is_dustbin=np.asarray(
+                [_bool_text(row["target_is_dustbin"]) for row in diagnostic_rows],
+                dtype=bool,
+            ),
+            target_gt_projected_xy=np.stack(
+                [
+                    float_array("target_gt_projected_x"),
+                    float_array("target_gt_projected_y"),
+                ],
+                axis=1,
+            ),
+            target_gt_projected_residual_px=float_array(
+                "target_gt_projected_residual_px"
+            ),
+            target_geometry_correct_1px=np.asarray(
+                [_bool_text(row["target_geometry_correct_1px"]) for row in diagnostic_rows],
+                dtype=bool,
+            ),
+            target_geometry_correct_2px=np.asarray(
+                [_bool_text(row["target_geometry_correct_2px"]) for row in diagnostic_rows],
+                dtype=bool,
+            ),
+            target_geometry_correct_5px=np.asarray(
+                [_bool_text(row["target_geometry_correct_5px"]) for row in diagnostic_rows],
+                dtype=bool,
+            ),
+            metadata_json=np.asarray(
+                json.dumps(likelihood_metadata, sort_keys=True), dtype=np.str_
+            ),
+        )
     valid_rows = [
         row for row in diagnostic_rows if not _bool_text(row["target_is_dustbin"])
     ]
@@ -1048,6 +1192,14 @@ def export_rgb_patch_diagnostics(
                 diagnostic_rows_path
             ),
             "visualizations": str(output / "visualizations"),
+            "candidate_spatial_likelihood": (
+                None if likelihood_path is None else str(likelihood_path)
+            ),
+            "candidate_spatial_likelihood_sha256": (
+                None
+                if likelihood_path is None
+                else file_sha256_short(likelihood_path)
+            ),
             "summary": str(output / "summary.json"),
         },
     }

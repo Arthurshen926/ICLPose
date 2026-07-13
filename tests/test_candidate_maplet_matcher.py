@@ -104,6 +104,124 @@ def test_candidate_maplet_matcher_inference_does_not_require_supervision() -> No
     assert len(output["query_log_probabilities"]) == 2
 
 
+def test_non_anchor_node_permutation_preserves_candidate_output() -> None:
+    torch.manual_seed(41)
+    supervised = _batch()
+    original = CandidateMapletBatch(
+        query_features=supervised.query_features[:1],
+        query_mask=supervised.query_mask[:1],
+        support_features=supervised.support_features[:1],
+        support_mask=supervised.support_mask[:1],
+        static_features=supervised.static_features[:1],
+        target_track_indices=None,
+        candidate_labels=None,
+        edge_indices=supervised.edge_indices[:1],
+    )
+    query_order = torch.tensor([0, 2, 1])
+    support_order = torch.tensor([0, 2, 1])
+    permuted = CandidateMapletBatch(
+        query_features=original.query_features[:, query_order],
+        query_mask=original.query_mask[:, query_order],
+        support_features=original.support_features[:, support_order],
+        support_mask=original.support_mask[:, support_order],
+        static_features=original.static_features,
+        target_track_indices=None,
+        candidate_labels=None,
+        edge_indices=original.edge_indices,
+    )
+    model = CandidateMapletMatcher(
+        CandidateMapletMatcherConfig(
+            query_input_dim=8,
+            support_input_dim=9,
+            static_input_dim=4,
+            descriptor_dim=4,
+            model_dim=16,
+            num_heads=4,
+            layers=1,
+            dropout=0.0,
+            sinkhorn_iterations=5,
+        )
+    ).eval()
+
+    with torch.no_grad():
+        expected = model(original)
+        actual = model(permuted)
+
+    torch.testing.assert_close(actual["candidate_logits"], expected["candidate_logits"])
+    torch.testing.assert_close(
+        actual["candidate_embeddings"], expected["candidate_embeddings"], atol=1e-6, rtol=1e-6
+    )
+    torch.testing.assert_close(
+        actual["pair_logits"][:, 0, 0], expected["pair_logits"][:, 0, 0]
+    )
+
+
+def test_support_view_permutation_preserves_marginal_embedding() -> None:
+    torch.manual_seed(43)
+    model = CandidateMapletMatcher(
+        CandidateMapletMatcherConfig(
+            query_input_dim=8,
+            support_input_dim=9,
+            static_input_dim=4,
+            descriptor_dim=4,
+            model_dim=16,
+            num_heads=4,
+            layers=1,
+            dropout=0.0,
+            sinkhorn_iterations=5,
+        )
+    ).eval()
+    values = torch.randn(3, 4, 16)
+    order = torch.tensor([2, 0, 3, 1])
+
+    with torch.no_grad():
+        expected_embedding, expected_weights = model.aggregate_candidate_views(values)
+        actual_embedding, actual_weights = model.aggregate_candidate_views(values[:, order])
+
+    torch.testing.assert_close(actual_embedding, expected_embedding, atol=1e-6, rtol=1e-6)
+    inverse = torch.argsort(order)
+    torch.testing.assert_close(
+        actual_weights[:, inverse], expected_weights, atol=1e-6, rtol=1e-6
+    )
+
+
+def test_candidate_rank_permutation_is_equivariant_and_preserves_dustbin() -> None:
+    torch.manual_seed(47)
+    model = CandidateMapletMatcher(
+        CandidateMapletMatcherConfig(
+            query_input_dim=8,
+            support_input_dim=9,
+            static_input_dim=4,
+            descriptor_dim=4,
+            model_dim=16,
+            num_heads=4,
+            layers=1,
+            dropout=0.0,
+            sinkhorn_iterations=5,
+        )
+    ).eval()
+    values = torch.randn(2, 5, 16)
+    prior = torch.rand(2, 5)
+    order = torch.tensor([3, 1, 4, 0, 2])
+
+    with torch.no_grad():
+        expected = model.resolve_candidate_sets(values, candidate_prior_scores=prior)
+        actual = model.resolve_candidate_sets(
+            values[:, order], candidate_prior_scores=prior[:, order]
+        )
+
+    inverse = torch.argsort(order)
+    torch.testing.assert_close(
+        actual["candidate_logits"][:, inverse],
+        expected["candidate_logits"],
+        atol=1e-6,
+        rtol=1e-6,
+    )
+    torch.testing.assert_close(
+        actual["dustbin_logits"], expected["dustbin_logits"], atol=1e-6, rtol=1e-6
+    )
+
+
 def test_candidate_maplet_batch_requires_anchor_nodes() -> None:
     batch = _batch()
     invalid = CandidateMapletBatch(
@@ -293,6 +411,96 @@ def test_geometry_validity_heads_are_monotonic_and_train_on_real_residuals() -> 
     assert model.geometry_logit_gap_head.weight.grad is not None
     assert model.candidate_visibility_head is not None
     assert model.candidate_visibility_head.weight.grad is not None
+
+
+def test_decoupled_candidate_heads_do_not_reuse_identity_logits() -> None:
+    torch.manual_seed(23)
+    model = CandidateMapletMatcher(
+        CandidateMapletMatcherConfig(
+            query_input_dim=8,
+            support_input_dim=9,
+            static_input_dim=4,
+            descriptor_dim=4,
+            model_dim=16,
+            num_heads=4,
+            layers=1,
+            dropout=0.0,
+            sinkhorn_iterations=5,
+            geometry_validity_enabled=True,
+            decoupled_candidate_heads=True,
+        )
+    )
+    embeddings = torch.randn(2, 4, 16)
+    prior = torch.rand(2, 4)
+    before = model.resolve_candidate_sets(
+        embeddings, candidate_prior_scores=prior
+    )
+    assert model.geometry_base_head is not None
+    with torch.no_grad():
+        model.geometry_base_head.weight.fill_(3.0)
+        model.geometry_base_head.bias.fill_(-2.0)
+    after = model.resolve_candidate_sets(
+        embeddings, candidate_prior_scores=prior
+    )
+    torch.testing.assert_close(after["candidate_logits"], before["candidate_logits"])
+    probabilities = torch.sigmoid(after["geometry_validity_logits"])
+    assert torch.all(probabilities[:, :, 0] <= probabilities[:, :, 1])
+    assert torch.all(probabilities[:, :, 1] <= probabilities[:, :, 2])
+
+    geometry_loss = after["geometry_validity_logits"].sum()
+    geometry_loss.backward()
+    assert model.geometry_base_head.weight.grad is not None
+    assert model.set_candidate_head.weight.grad is None
+
+
+def test_candidate_view_marginalization_preserves_prior_and_view_order() -> None:
+    torch.manual_seed(29)
+    model = CandidateMapletMatcher(
+        CandidateMapletMatcherConfig(
+            query_input_dim=8,
+            support_input_dim=9,
+            static_input_dim=4,
+            descriptor_dim=4,
+            model_dim=16,
+            num_heads=4,
+            layers=1,
+            dropout=0.0,
+            sinkhorn_iterations=5,
+            geometry_validity_enabled=True,
+            decoupled_candidate_heads=True,
+            candidate_view_marginalization_enabled=True,
+        )
+    ).eval()
+    views = torch.randn(2, 5, 3, 16)
+    view_probability = torch.softmax(torch.randn(2, 5, 3), dim=2)
+    prior = torch.rand(2, 5)
+    original = model.resolve_candidate_view_sets(
+        views, view_probability, candidate_prior_scores=prior
+    )
+    expected = model.resolve_candidate_sets(
+        torch.sum(views * view_probability.unsqueeze(3), dim=2),
+        candidate_prior_scores=prior,
+    )
+    torch.testing.assert_close(original["candidate_logits"], expected["candidate_logits"])
+
+    assert model.candidate_view_head is not None
+    with torch.no_grad():
+        torch.nn.init.normal_(model.candidate_view_head.weight)
+    permutation = torch.tensor([2, 0, 1])
+    expected_permuted = model.resolve_candidate_view_sets(
+        views, view_probability, candidate_prior_scores=prior
+    )
+    actual_permuted = model.resolve_candidate_view_sets(
+        views[:, :, permutation],
+        view_probability[:, :, permutation],
+        candidate_prior_scores=prior,
+    )
+    torch.testing.assert_close(
+        actual_permuted["candidate_logits"],
+        expected_permuted["candidate_logits"],
+        atol=1e-6,
+        rtol=1e-6,
+    )
 
 
 def test_rescue_targets_only_replace_an_invalid_baseline_with_a_valid_candidate() -> None:

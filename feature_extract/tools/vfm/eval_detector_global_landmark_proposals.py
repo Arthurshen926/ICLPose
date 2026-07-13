@@ -628,6 +628,22 @@ def main(argv: Sequence[str] | None = None) -> None:
             "candidate_gt_residuals_px": candidate_residuals,
         }
 
+    model_manifest = {
+        "colmap_model_dir": str(model_dir),
+        "colmap_images_sha256": file_sha256_short(model_dir / "images.bin"),
+        "colmap_cameras_sha256": file_sha256_short(model_dir / "cameras.bin"),
+        "colmap_points3d_sha256": file_sha256_short(model_dir / "points3D.bin"),
+    }
+    proposal_metadata = {
+        "format": "detector_global_landmark_proposals_v2",
+        "descriptor_space_id": descriptor_space_id,
+        "projected_landmark_bank_sha256": file_sha256_short(
+            Path(args.projected_landmark_bank)
+        ),
+        "query_manifest_sha256": file_sha256_short(Path(args.query_manifest)),
+        "ground_truth_geometry_present": not bool(args.inference_only),
+        **model_manifest,
+    }
     proposal_path = output_dir / "detector_global_proposals.npz"
     np.savez(
         proposal_path,
@@ -641,6 +657,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         coarse_scores=candidates.coarse_scores,
         pose_keep_mask=pose_keep,
         **supervision_payload,
+        metadata_json=np.asarray(
+            json.dumps(proposal_metadata, sort_keys=True), dtype=np.str_
+        ),
     )
     pose_rows_path = output_dir / "pose_rows.json"
     pose_rows_path.write_text(json.dumps(pose_rows, indent=2, sort_keys=True) + "\n")
@@ -659,6 +678,15 @@ def main(argv: Sequence[str] | None = None) -> None:
             "ground_truth_pose_used": not bool(args.inference_only),
         },
         "descriptor_space_id": descriptor_space_id,
+        "inputs": {
+            "query_manifest": str(args.query_manifest),
+            "query_manifest_sha256": file_sha256_short(Path(args.query_manifest)),
+            "projected_landmark_bank": str(args.projected_landmark_bank),
+            "projected_landmark_bank_sha256": file_sha256_short(
+                Path(args.projected_landmark_bank)
+            ),
+            **model_manifest,
+        },
         "detector_cache": {
             "cache_hit": bool(detector_cache_hit),
             "path": str(detector_cache_path),

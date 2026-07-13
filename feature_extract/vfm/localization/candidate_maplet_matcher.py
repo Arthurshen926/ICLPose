@@ -32,6 +32,8 @@ class CandidateMapletMatcherConfig:
     static_feature_mean: tuple[float, ...] | None = None
     static_feature_scale: tuple[float, ...] | None = None
     geometry_validity_enabled: bool = False
+    decoupled_candidate_heads: bool = False
+    candidate_view_marginalization_enabled: bool = False
     geometry_validity_thresholds_px: tuple[float, ...] = (1.0, 2.0, 5.0)
     rescue_policy_enabled: bool = False
     rescue_candidate_threshold_px: float = 5.0
@@ -98,6 +100,18 @@ class CandidateMapletMatcherConfig:
         ):
             raise ValueError(
                 "rescue thresholds must be positive and candidate <= baseline-invalid"
+            )
+        if bool(self.decoupled_candidate_heads) and not bool(
+            self.geometry_validity_enabled
+        ):
+            raise ValueError(
+                "decoupled_candidate_heads requires geometry validity supervision"
+            )
+        if bool(self.candidate_view_marginalization_enabled) and not bool(
+            self.decoupled_candidate_heads
+        ):
+            raise ValueError(
+                "candidate view marginalization requires decoupled candidate heads"
             )
 
     def to_dict(self) -> dict[str, object]:
@@ -419,6 +433,16 @@ class CandidateMapletMatcher(nn.Module):
             ]
         )
         self.set_candidate_head = nn.Linear(dim, 1)
+        if bool(config.candidate_view_marginalization_enabled):
+            self.candidate_view_context: nn.Linear | None = nn.Linear(dim, dim)
+            self.candidate_view_norm: nn.LayerNorm | None = nn.LayerNorm(dim)
+            self.candidate_view_head: nn.Linear | None = nn.Linear(dim, 1)
+            nn.init.zeros_(self.candidate_view_head.weight)
+            nn.init.zeros_(self.candidate_view_head.bias)
+        else:
+            self.candidate_view_context = None
+            self.candidate_view_norm = None
+            self.candidate_view_head = None
         self.candidate_prior_log_scale = nn.Parameter(
             torch.tensor(float(math.log(config.candidate_prior_scale)), dtype=torch.float32)
         )
@@ -430,14 +454,39 @@ class CandidateMapletMatcher(nn.Module):
         )
         if bool(config.geometry_validity_enabled):
             self.geometry_logit_gap_head: nn.Linear | None = nn.Linear(dim, 2)
+            self.geometry_base_head: nn.Linear | None = (
+                nn.Linear(dim, 1) if bool(config.decoupled_candidate_heads) else None
+            )
             self.candidate_visibility_head: nn.Linear | None = nn.Linear(dim, 1)
+            self.geometry_candidate_set_blocks = nn.ModuleList(
+                [
+                    _CandidateSetBlock(dim, int(config.num_heads), float(config.dropout))
+                    for _ in range(int(config.candidate_set_layers))
+                ]
+                if bool(config.decoupled_candidate_heads)
+                else []
+            )
+            self.visibility_candidate_set_blocks = nn.ModuleList(
+                [
+                    _CandidateSetBlock(dim, int(config.num_heads), float(config.dropout))
+                    for _ in range(int(config.candidate_set_layers))
+                ]
+                if bool(config.decoupled_candidate_heads)
+                else []
+            )
             nn.init.zeros_(self.geometry_logit_gap_head.weight)
             nn.init.zeros_(self.geometry_logit_gap_head.bias)
+            if self.geometry_base_head is not None:
+                nn.init.zeros_(self.geometry_base_head.weight)
+                nn.init.zeros_(self.geometry_base_head.bias)
             nn.init.zeros_(self.candidate_visibility_head.weight)
             nn.init.zeros_(self.candidate_visibility_head.bias)
         else:
             self.geometry_logit_gap_head = None
+            self.geometry_base_head = None
             self.candidate_visibility_head = None
+            self.geometry_candidate_set_blocks = nn.ModuleList()
+            self.visibility_candidate_set_blocks = nn.ModuleList()
         if bool(config.rescue_policy_enabled):
             self.rescue_candidate_head: nn.Sequential | None = nn.Sequential(
                 nn.Linear(dim * 4, dim * 2),
@@ -571,14 +620,117 @@ class CandidateMapletMatcher(nn.Module):
         if self.geometry_logit_gap_head is not None:
             if self.candidate_visibility_head is None:
                 raise RuntimeError("geometry validity heads are only partially configured")
-            gaps = F.softplus(self.geometry_logit_gap_head(contextual))
-            geometry_logits = torch.stack(
-                [logits - gaps[:, :, 0], logits, logits + gaps[:, :, 1]], dim=2
+            geometry_contextual = candidate_embeddings
+            visibility_contextual = candidate_embeddings
+            for block in self.geometry_candidate_set_blocks:
+                geometry_contextual = block(geometry_contextual, valid)
+            for block in self.visibility_candidate_set_blocks:
+                visibility_contextual = block(visibility_contextual, valid)
+            gaps = F.softplus(self.geometry_logit_gap_head(geometry_contextual))
+            geometry_middle = (
+                logits
+                if self.geometry_base_head is None
+                else self.geometry_base_head(geometry_contextual)[:, :, 0].masked_fill(
+                    ~valid, -1e4
+                )
             )
-            visibility_logits = self.candidate_visibility_head(contextual)[:, :, 0]
+            geometry_logits = torch.stack(
+                [
+                    geometry_middle - gaps[:, :, 0],
+                    geometry_middle,
+                    geometry_middle + gaps[:, :, 1],
+                ],
+                dim=2,
+            )
+            visibility_logits = self.candidate_visibility_head(visibility_contextual)[:, :, 0]
             visibility_logits = visibility_logits.masked_fill(~valid, -1e4)
             output["geometry_validity_logits"] = geometry_logits
             output["candidate_visibility_logits"] = visibility_logits
+        return output
+
+    def resolve_candidate_view_sets(
+        self,
+        candidate_view_embeddings: torch.Tensor,
+        support_view_probabilities: torch.Tensor,
+        *,
+        support_view_mask: torch.Tensor | None = None,
+        candidate_mask: torch.Tensor | None = None,
+        candidate_prior_scores: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Resolve top-L identity while marginalizing rather than averaging views."""
+
+        if self.candidate_view_head is None:
+            raise RuntimeError("candidate view marginalization is not enabled")
+        if self.candidate_view_context is None or self.candidate_view_norm is None:
+            raise RuntimeError("candidate view marginalization modules are incomplete")
+        if candidate_view_embeddings.ndim != 4:
+            raise ValueError(
+                "candidate_view_embeddings must have shape (G, L, V, C)"
+            )
+        group_count, candidate_count, view_count, _ = candidate_view_embeddings.shape
+        if support_view_probabilities.shape != (group_count, candidate_count, view_count):
+            raise ValueError("support-view probabilities are not aligned")
+        view_valid = (
+            torch.ones_like(support_view_probabilities, dtype=torch.bool)
+            if support_view_mask is None
+            else support_view_mask.bool()
+        )
+        if view_valid.shape != support_view_probabilities.shape:
+            raise ValueError("support-view mask is not aligned")
+        if torch.any(torch.sum(view_valid, dim=2) <= 0):
+            raise ValueError("every candidate requires at least one support view")
+        view_weights = torch.where(
+            view_valid,
+            support_view_probabilities.clamp_min(0.0),
+            torch.zeros_like(support_view_probabilities),
+        )
+        view_weights = view_weights / view_weights.sum(dim=2, keepdim=True).clamp_min(
+            1e-8
+        )
+        marginal = torch.sum(
+            candidate_view_embeddings * view_weights.unsqueeze(3), dim=2
+        )
+        output = self.resolve_candidate_sets(
+            marginal,
+            candidate_mask=candidate_mask,
+            candidate_prior_scores=candidate_prior_scores,
+        )
+        contextual = output["candidate_embeddings"]
+        view_contextual = self.candidate_view_norm(
+            candidate_view_embeddings
+            + self.candidate_view_context(contextual).unsqueeze(2)
+        )
+        view_residual = self.candidate_view_head(view_contextual)[:, :, :, 0]
+        view_residual = view_residual.masked_fill(~view_valid, -1e4)
+        candidate_residual = self.set_candidate_head(contextual)[:, :, 0] + torch.logsumexp(
+            torch.log(view_weights.clamp_min(1e-8)) + view_residual, dim=2
+        )
+        valid = (
+            torch.ones(
+                (group_count, candidate_count),
+                dtype=torch.bool,
+                device=candidate_view_embeddings.device,
+            )
+            if candidate_mask is None
+            else candidate_mask.bool()
+        )
+        if candidate_prior_scores is not None:
+            prior = candidate_prior_scores.to(dtype=candidate_residual.dtype)
+            if prior.shape != candidate_residual.shape:
+                raise ValueError("candidate prior scores are not aligned")
+            prior_weights = valid.to(dtype=prior.dtype)
+            prior_center = torch.sum(
+                prior * prior_weights, dim=1, keepdim=True
+            ) / torch.clamp(torch.sum(prior_weights, dim=1, keepdim=True), min=1.0)
+            prior_scale = torch.clamp(
+                torch.exp(self.candidate_prior_log_scale), min=0.1, max=100.0
+            )
+            candidate_residual = candidate_residual + prior_scale * (
+                prior - prior_center
+            )
+        output["candidate_logits"] = candidate_residual.masked_fill(~valid, -1e4)
+        output["candidate_view_logits"] = view_residual
+        output["support_view_probabilities"] = view_weights
         return output
 
     def forward(self, batch: CandidateMapletBatch) -> dict[str, object]:
@@ -1044,6 +1196,7 @@ def candidate_maplet_group_loss(
     geometry_validity_weight: float = 0.0,
     candidate_visibility_weight: float = 0.0,
     rescue_policy_weight: float = 0.0,
+    support_view_dropout: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Train all support views and resolve each complete mutually exclusive top-L set."""
 
@@ -1087,14 +1240,49 @@ def candidate_maplet_group_loss(
         embeddings.append(candidate_embeddings)
     episode_loss = torch.mean(torch.stack(episode_losses))
     view_embeddings = torch.stack(embeddings, dim=1)
-    aggregated, view_weights = model.aggregate_candidate_views(view_embeddings)
+    dropout = float(support_view_dropout)
+    if not 0.0 <= dropout < 1.0:
+        raise ValueError("support_view_dropout must be in [0, 1)")
+    view_mask = torch.ones(
+        view_embeddings.shape[:2], dtype=torch.bool, device=view_embeddings.device
+    )
+    if model.training and dropout > 0.0 and view_embeddings.shape[1] > 1:
+        view_mask = torch.rand(
+            view_embeddings.shape[:2], device=view_embeddings.device
+        ) >= dropout
+        empty = ~torch.any(view_mask, dim=1)
+        if torch.any(empty):
+            replacement = torch.randint(
+                int(view_embeddings.shape[1]),
+                (int(torch.sum(empty).item()),),
+                device=view_embeddings.device,
+            )
+            view_mask[torch.nonzero(empty, as_tuple=False)[:, 0], replacement] = True
+    aggregated, view_weights = model.aggregate_candidate_views(
+        view_embeddings, view_mask=view_mask
+    )
     prior_scores = batches_by_view[0].static_features[
         :, int(model.config.candidate_prior_index)
     ].reshape(-1, group_size)
-    resolved = model.resolve_candidate_sets(
-        aggregated.reshape(-1, group_size, int(aggregated.shape[1])),
-        candidate_prior_scores=prior_scores,
-    )
+    if bool(model.config.candidate_view_marginalization_enabled):
+        resolved = model.resolve_candidate_view_sets(
+            view_embeddings.reshape(
+                -1,
+                group_size,
+                int(view_embeddings.shape[1]),
+                int(view_embeddings.shape[2]),
+            ),
+            view_weights.reshape(-1, group_size, int(view_weights.shape[1])),
+            support_view_mask=view_mask.reshape(
+                -1, group_size, int(view_mask.shape[1])
+            ),
+            candidate_prior_scores=prior_scores,
+        )
+    else:
+        resolved = model.resolve_candidate_sets(
+            aggregated.reshape(-1, group_size, int(aggregated.shape[1])),
+            candidate_prior_scores=prior_scores,
+        )
     positive_mask = batches_by_view[0].candidate_labels.bool().reshape(-1, group_size)
     set_loss, set_metrics = set_valued_candidate_loss(
         resolved["candidate_logits"], resolved["dustbin_logits"], positive_mask

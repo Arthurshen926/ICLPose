@@ -78,7 +78,11 @@ def _load_selection(path: Path) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
             if key != "metadata_json"
         }
         metadata = json.loads(str(payload["metadata_json"].item()))
-    if metadata.get("format") != "candidate_measurement_selection_v1":
+    artifact_format = metadata.get("format")
+    if artifact_format not in {
+        "candidate_measurement_selection_v1",
+        "candidate_evidence_v3",
+    }:
         raise ValueError("unsupported candidate measurement selection artifact")
     required = {
         "selected_rows",
@@ -91,15 +95,26 @@ def _load_selection(path: Path) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
         "candidate_track_ids",
         "candidate_prototype_ids",
         "candidate_bank_rows",
-        "candidate_scores",
         "candidate_coarse_similarities",
-        "candidate_gt_residuals_px",
         "candidate_geometry_probabilities",
         "candidate_support_view_probabilities",
     }
     missing = required - set(arrays)
     if missing:
         raise ValueError(f"candidate measurement selection lacks arrays: {sorted(missing)}")
+    if artifact_format == "candidate_evidence_v3":
+        if "candidate_prior_probabilities" not in arrays:
+            raise ValueError("candidate evidence V3 lacks candidate prior probabilities")
+        if "candidate_target_gt_residuals_px" not in arrays:
+            raise ValueError("candidate evidence V3 lacks target-only GT residuals")
+        arrays["candidate_scores"] = arrays["candidate_prior_probabilities"]
+        arrays["candidate_gt_residuals_px"] = arrays[
+            "candidate_target_gt_residuals_px"
+        ]
+    else:
+        for key in ("candidate_scores", "candidate_gt_residuals_px"):
+            if key not in arrays:
+                raise ValueError(f"candidate measurement selection lacks array: {key}")
     return arrays, metadata
 
 
@@ -136,12 +151,27 @@ def _validate_input_hashes(
     support_geometry_index: Path,
     maplet_support_index: Path,
     projected_landmark_bank: Path,
+    colmap_model_dir: Path,
 ) -> dict[str, str]:
-    actual = {
+    actual: dict[str, str] = {
         "support_geometry_index_sha256": file_sha256_short(Path(support_geometry_index)),
         "maplet_support_index_sha256": file_sha256_short(Path(maplet_support_index)),
         "projected_landmark_bank_sha256": file_sha256_short(Path(projected_landmark_bank)),
     }
+    if metadata.get("format") == "candidate_evidence_v3":
+        actual.update(
+            {
+                "colmap_images_sha256": file_sha256_short(
+                    Path(colmap_model_dir) / "images.bin"
+                ),
+                "colmap_cameras_sha256": file_sha256_short(
+                    Path(colmap_model_dir) / "cameras.bin"
+                ),
+                "colmap_points3d_sha256": file_sha256_short(
+                    Path(colmap_model_dir) / "points3D.bin"
+                ),
+            }
+        )
     mismatches = {
         key: {"selection": metadata.get(key), "input": value}
         for key, value in actual.items()
@@ -182,6 +212,7 @@ def build_candidate_measurement_rows(
         support_geometry_index=Path(support_geometry_index),
         maplet_support_index=Path(maplet_support_index),
         projected_landmark_bank=Path(projected_landmark_bank),
+        colmap_model_dir=Path(colmap_model_dir),
     )
     geometry_index, geometry_metadata = load_support_observation_geometry_index_npz(
         Path(support_geometry_index)

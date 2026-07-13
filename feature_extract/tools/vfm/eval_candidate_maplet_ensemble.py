@@ -170,6 +170,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--pnp_reprojection_error_px", type=float, default=8.0)
     parser.add_argument("--pnp_iterations", type=int, default=5000)
     parser.add_argument("--no_amp", action="store_true")
+    parser.add_argument(
+        "--export_checkpoint_latents",
+        action="store_true",
+        help="export per-support-view candidate embeddings without averaging checkpoint spaces",
+    )
     return parser.parse_args(argv)
 
 
@@ -321,6 +326,7 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     checkpoint_predictions = []
     checkpoint_metadata = []
+    checkpoint_latent_artifacts = []
     checkpoint_formats = set()
     for checkpoint_index, checkpoint_path in enumerate(checkpoint_paths):
         device = torch.device(devices[checkpoint_index % len(devices)])
@@ -367,7 +373,39 @@ def main(argv: Sequence[str] | None = None) -> None:
             device=device,
             batch_size=int(args.eval_batch_size),
             use_amp=bool(device.type == "cuda" and not args.no_amp),
+            export_candidate_view_embeddings=bool(args.export_checkpoint_latents),
         )
+        if bool(args.export_checkpoint_latents):
+            latent_keys = tuple(
+                f"candidate_view_embedding_{view_rank}"
+                for view_rank in range(store.support_view_count)
+            )
+            if not all(key in predictions for key in latent_keys):
+                raise RuntimeError("candidate latent export is incomplete")
+            latent_path = output_dir / f"checkpoint_{checkpoint_index}_candidate_latents.npz"
+            latent_metadata = {
+                "format": "candidate_maplet_view_latents_v1",
+                "data_manifest": data_manifest,
+                "checkpoint_sha256": file_sha256_short(checkpoint_path),
+                "checkpoint_format": checkpoint_format,
+                "prediction_splits": list(prediction_split_names),
+                "model_dim": int(config.model_dim),
+                "support_view_count": int(store.support_view_count),
+            }
+            np.savez(
+                latent_path,
+                **{key: predictions.pop(key) for key in latent_keys},
+                metadata_json=np.asarray(
+                    json.dumps(latent_metadata, sort_keys=True), dtype=np.str_
+                ),
+            )
+            checkpoint_latent_artifacts.append(
+                {
+                    "path": str(latent_path),
+                    "sha256": file_sha256_short(latent_path),
+                    "checkpoint_sha256": latent_metadata["checkpoint_sha256"],
+                }
+            )
         checkpoint_predictions.append(predictions)
         checkpoint_metadata.append(
             {
@@ -915,6 +953,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         and test_gate_passed
         and args.evaluation_role == "untouched_test"
     )
+    score_metadata = {
+        "format": "candidate_maplet_ensemble_scores_v2",
+        "data_manifest": data_manifest,
+        "checkpoint_sha256": [item["sha256"] for item in checkpoint_metadata],
+        "prediction_splits": list(prediction_split_names),
+    }
     np.savez(
         output_dir / "ensemble_scores.npz",
         **{
@@ -924,6 +968,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         baseline_scores=baseline_scores,
         selected_scores=selected_scores,
         selected_identity_scores=selected_identity_scores,
+        metadata_json=np.asarray(json.dumps(score_metadata, sort_keys=True), dtype=np.str_),
     )
     (output_dir / "pose_rows_test.json").write_text(
         json.dumps(
@@ -1035,6 +1080,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             "summary": str(output_dir / "summary.json"),
             "scores": str(output_dir / "ensemble_scores.npz"),
             "scores_sha256": file_sha256_short(output_dir / "ensemble_scores.npz"),
+            "checkpoint_latents": checkpoint_latent_artifacts,
             "pose_rows_test": str(output_dir / "pose_rows_test.json"),
             "validation_trial_pose_rows": str(
                 output_dir / "validation_trial_pose_rows.json"

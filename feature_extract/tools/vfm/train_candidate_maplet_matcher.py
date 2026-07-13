@@ -107,6 +107,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--candidate_pos_weight", type=float, default=3.0)
     parser.add_argument("--geometry_validity_loss_weight", type=float, default=0.0)
     parser.add_argument("--candidate_visibility_loss_weight", type=float, default=0.0)
+    parser.add_argument(
+        "--decoupled_candidate_heads",
+        action="store_true",
+        help="use independent candidate-set branches for identity, geometry, and visibility",
+    )
+    parser.add_argument(
+        "--candidate_view_marginalization",
+        action="store_true",
+        help="retain per-support-view identity residuals until candidate-logit marginalization",
+    )
+    parser.add_argument("--support_view_dropout", type=float, default=0.0)
     parser.add_argument("--rescue_policy_loss_weight", type=float, default=0.0)
     parser.add_argument("--rescue_candidate_threshold_px", type=float, default=5.0)
     parser.add_argument(
@@ -198,6 +209,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default="score_topk",
     )
     parser.add_argument("--no_amp", action="store_true")
+    parser.add_argument("--profile_training_timing", action="store_true")
     return parser.parse_args(argv)
 
 
@@ -649,6 +661,7 @@ def _predict_edges(
         0.40,
         0.50,
     ),
+    export_candidate_view_embeddings: bool = False,
 ) -> dict[str, np.ndarray]:
     model.eval()
     thresholds = tuple(float(value) for value in dustbin_thresholds)
@@ -785,6 +798,10 @@ def _predict_edges(
                 outputs[name][edges] = np.maximum(outputs[name][edges], values)
         view_embeddings.append(embeddings)
 
+    if bool(export_candidate_view_embeddings):
+        for view_rank, embeddings in enumerate(view_embeddings):
+            outputs[f"candidate_view_embedding_{view_rank}"] = embeddings
+
     top_l = store.candidate_top_k
     requested = np.zeros((store.edge_count,), dtype=bool)
     requested[np.asarray(edge_indices, dtype=np.int64)] = True
@@ -813,10 +830,24 @@ def _predict_edges(
         ).to(device)
         with torch.cuda.amp.autocast(enabled=bool(use_amp)):
             aggregated, view_weights_t = model.aggregate_candidate_views(candidate_views)
-            resolved = model.resolve_candidate_sets(
-                aggregated.reshape(len(groups), top_l, int(aggregated.shape[1])),
-                candidate_prior_scores=prior_scores,
-            )
+            if bool(model.config.candidate_view_marginalization_enabled):
+                resolved = model.resolve_candidate_view_sets(
+                    candidate_views.reshape(
+                        len(groups),
+                        top_l,
+                        store.support_view_count,
+                        int(candidate_views.shape[2]),
+                    ),
+                    view_weights_t.reshape(
+                        len(groups), top_l, store.support_view_count
+                    ),
+                    candidate_prior_scores=prior_scores,
+                )
+            else:
+                resolved = model.resolve_candidate_sets(
+                    aggregated.reshape(len(groups), top_l, int(aggregated.shape[1])),
+                    candidate_prior_scores=prior_scores,
+                )
             joint_logits = torch.cat(
                 [resolved["candidate_logits"], resolved["dustbin_logits"][:, None]], dim=1
             )
@@ -1231,6 +1262,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         or float(args.rescue_policy_loss_weight) < 0.0
     ):
         raise ValueError("geometry-aware loss weights must be non-negative")
+    if not 0.0 <= float(args.support_view_dropout) < 1.0:
+        raise ValueError("support_view_dropout must be in [0, 1)")
     geometry_thresholds = tuple(
         float(value) for value in args.geometry_validity_thresholds_px
     )
@@ -1244,6 +1277,16 @@ def main(argv: Sequence[str] | None = None) -> None:
         float(args.geometry_validity_loss_weight) > 0.0
         or float(args.candidate_visibility_loss_weight) > 0.0
     )
+    if bool(args.decoupled_candidate_heads) and not geometry_validity_enabled:
+        raise ValueError(
+            "--decoupled_candidate_heads requires geometry or visibility supervision"
+        )
+    if bool(args.candidate_view_marginalization) and not bool(
+        args.decoupled_candidate_heads
+    ):
+        raise ValueError(
+            "--candidate_view_marginalization requires --decoupled_candidate_heads"
+        )
     rescue_policy_enabled = bool(float(args.rescue_policy_loss_weight) > 0.0)
     if (
         not np.isfinite(float(args.rescue_candidate_threshold_px))
@@ -1439,6 +1482,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         static_feature_mean=static_feature_mean,
         static_feature_scale=static_feature_scale,
         geometry_validity_enabled=geometry_validity_enabled,
+        decoupled_candidate_heads=bool(args.decoupled_candidate_heads),
+        candidate_view_marginalization_enabled=bool(
+            args.candidate_view_marginalization
+        ),
         geometry_validity_thresholds_px=geometry_thresholds,
         rescue_policy_enabled=rescue_policy_enabled,
         rescue_candidate_threshold_px=float(args.rescue_candidate_threshold_px),
@@ -1558,6 +1605,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
         metric_sums: dict[str, float] = {}
         batch_count = 0
+        data_build_seconds = 0.0
+        gpu_compute_seconds = 0.0
         groups_per_batch = max(1, int(args.batch_size) // store.candidate_top_k)
         for batch_start in range(0, len(train_groups), groups_per_batch):
             groups = train_groups[batch_start : batch_start + groups_per_batch]
@@ -1566,14 +1615,17 @@ def main(argv: Sequence[str] | None = None) -> None:
                 + np.arange(store.candidate_top_k, dtype=np.int64)[None]
             ).reshape(-1)
             optimizer.zero_grad(set_to_none=True)
+            data_start = time.perf_counter()
+            batches = []
+            for view_rank in range(store.support_view_count):
+                ranks = np.full(edges.shape, view_rank, dtype=np.int64)
+                batches.append(store.batch(edges, view_ranks=ranks).to(device))
+            data_build_seconds += time.perf_counter() - data_start
+            if bool(args.profile_training_timing) and device.type == "cuda":
+                torch.cuda.synchronize(device)
+            compute_start = time.perf_counter()
             with torch.cuda.amp.autocast(enabled=use_amp):
-                batches = []
-                outputs = []
-                for view_rank in range(store.support_view_count):
-                    ranks = np.full(edges.shape, view_rank, dtype=np.int64)
-                    batch = store.batch(edges, view_ranks=ranks).to(device)
-                    batches.append(batch)
-                    outputs.append(model(batch))
+                outputs = [model(batch) for batch in batches]
                 loss, metrics = candidate_maplet_group_loss(
                     model,
                     outputs,
@@ -1590,18 +1642,24 @@ def main(argv: Sequence[str] | None = None) -> None:
                         args.candidate_visibility_loss_weight
                     ),
                     rescue_policy_weight=float(args.rescue_policy_loss_weight),
+                    support_view_dropout=float(args.support_view_dropout),
                 )
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), float(args.gradient_clip_norm))
             scaler.step(optimizer)
             scaler.update()
+            if bool(args.profile_training_timing) and device.type == "cuda":
+                torch.cuda.synchronize(device)
+            gpu_compute_seconds += time.perf_counter() - compute_start
             for name, value in metrics.items():
                 metric_sums[name] = metric_sums.get(name, 0.0) + float(value)
             batch_count += 1
         train_metrics = {
             name: value / max(batch_count, 1) for name, value in metric_sums.items()
         }
+        train_metrics["data_build_seconds"] = float(data_build_seconds)
+        train_metrics["gpu_compute_seconds"] = float(gpu_compute_seconds)
 
         if refit_metadata is not None:
             epoch_summary = {
@@ -1929,6 +1987,12 @@ def main(argv: Sequence[str] | None = None) -> None:
                     "epoch": int(epoch),
                     "epoch_seconds": float(epoch_summary["epoch_seconds"]),
                     "train_group_count": int(len(train_groups)),
+                    "train_data_build_seconds": float(
+                        train_metrics["data_build_seconds"]
+                    ),
+                    "train_gpu_compute_seconds": float(
+                        train_metrics["gpu_compute_seconds"]
+                    ),
                     "train_loss": float(train_metrics["loss"]),
                     "train_assignment_loss": float(train_metrics["assignment_loss"]),
                     "train_candidate_set_loss": float(train_metrics["candidate_set_loss"]),
@@ -2266,7 +2330,12 @@ def main(argv: Sequence[str] | None = None) -> None:
             "anchor_positive_threshold_px": float(args.positive_threshold_px),
             "context_assignment_threshold_px": float(args.assignment_threshold_px),
             "support_view_count": int(args.support_view_count),
-            "support_view_aggregation": "learned_posterior",
+            "support_view_aggregation": (
+                "learned_posterior_logsumexp_identity_marginal"
+                if bool(args.candidate_view_marginalization)
+                else "learned_posterior_embedding_mean"
+            ),
+            "support_view_dropout": float(args.support_view_dropout),
             "candidate_resolution": "top_l_set_attention_multi_positive_with_dustbin",
             "global_assignment_validation": (
                 None

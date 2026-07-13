@@ -58,6 +58,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "training cache; only new query images are sampled"
         ),
     )
+    parser.add_argument(
+        "--projection_source_support_feature_cache",
+        default=None,
+        help="source ALIKE support cache used to validate/reindex reused RADIO rows",
+    )
+    parser.add_argument(
+        "--projection_source_support_geometry_index",
+        default=None,
+        help="source support geometry used to reindex reused RADIO rows by observation identity",
+    )
     parser.add_argument("--devices", default="cuda:0,cuda:1")
     parser.add_argument("--radio_repo", default="feature_extract/checkpoints/RADIO")
     parser.add_argument("--radio_version", default="c-radio_v4-h")
@@ -233,6 +243,99 @@ def _stat_manifest_hash(paths: Sequence[Path]) -> str:
     return hashlib.sha256("\n".join(rows).encode("utf8")).hexdigest()[:16]
 
 
+def _reindex_support_descriptors(
+    *,
+    source_descriptors: np.ndarray,
+    source_feature_track_ids: np.ndarray,
+    source_geometry,
+    target_feature_track_ids: np.ndarray,
+    target_geometry,
+    allow_missing: bool = False,
+) -> tuple[np.ndarray, dict[str, object]]:
+    """Reuse descriptors only for identical image/track/xy observations."""
+
+    source_values = np.asarray(source_descriptors, dtype=np.float32)
+    source_tracks = np.asarray(source_feature_track_ids, dtype=np.int64)
+    target_tracks = np.asarray(target_feature_track_ids, dtype=np.int64)
+    if len(source_values) != len(source_tracks):
+        raise ValueError("source RADIO and source feature rows differ")
+    if not np.array_equal(
+        source_tracks[source_geometry.source_row_indices], source_geometry.track_ids
+    ):
+        raise ValueError("source support geometry and feature rows differ")
+    if not np.array_equal(
+        target_tracks[target_geometry.source_row_indices], target_geometry.track_ids
+    ):
+        raise ValueError("target support geometry and feature rows differ")
+    source_image_positions = {
+        str(image_id): int(index)
+        for index, image_id in enumerate(
+            np.asarray(source_geometry.image_ids).astype(str).tolist()
+        )
+    }
+    output = np.full(
+        (len(target_tracks), int(source_values.shape[1])), np.nan, dtype=np.float32
+    )
+    matched_observations = 0
+    missing_observations = 0
+    missing_images: list[str] = []
+    for target_image_index, image_id in enumerate(
+        np.asarray(target_geometry.image_ids).astype(str).tolist()
+    ):
+        target_start = int(target_geometry.image_offsets[target_image_index])
+        target_end = int(target_geometry.image_offsets[target_image_index + 1])
+        source_image_index = source_image_positions.get(str(image_id))
+        if source_image_index is None:
+            missing_images.append(str(image_id))
+            missing_observations += int(target_end - target_start)
+            continue
+        source_start = int(source_geometry.image_offsets[source_image_index])
+        source_end = int(source_geometry.image_offsets[source_image_index + 1])
+        source_by_track: dict[int, int] = {}
+        for source_row in range(source_start, source_end):
+            track_id = int(source_geometry.track_ids[source_row])
+            if track_id in source_by_track:
+                raise ValueError(
+                    f"projection source has duplicate image/track observation: {image_id}/{track_id}"
+                )
+            source_by_track[track_id] = source_row
+        for target_row in range(target_start, target_end):
+            track_id = int(target_geometry.track_ids[target_row])
+            source_row = source_by_track.get(track_id)
+            if source_row is None:
+                missing_observations += 1
+                continue
+            if not np.allclose(
+                source_geometry.xy[source_row],
+                target_geometry.xy[target_row],
+                rtol=0.0,
+                atol=1e-5,
+            ):
+                raise ValueError(
+                    f"projection source observation coordinates changed: {image_id}/{track_id}"
+                )
+            source_feature_row = int(source_geometry.source_row_indices[source_row])
+            target_feature_row = int(target_geometry.source_row_indices[target_row])
+            output[target_feature_row] = source_values[source_feature_row]
+            matched_observations += 1
+    missing = int(np.sum(~np.isfinite(output).all(axis=1)))
+    if missing != int(missing_observations):
+        raise RuntimeError("support reindex missing-row accounting changed")
+    if missing and not bool(allow_missing):
+        raise ValueError(f"support reindex left {missing} target feature rows missing")
+    return output, {
+        "method": "exact_image_track_xy_reindex_v1",
+        "matched_observation_count": int(matched_observations),
+        "missing_observation_count": int(missing),
+        "missing_image_count": int(len(missing_images)),
+        "missing_images": missing_images,
+        "source_feature_row_count": int(len(source_tracks)),
+        "target_feature_row_count": int(len(target_tracks)),
+        "source_image_count": int(len(source_geometry.image_ids)),
+        "target_image_count": int(len(target_geometry.image_ids)),
+    }
+
+
 def _coordinate_space(
     model_dir: Path | None,
     image_ids: Sequence[str],
@@ -315,6 +418,22 @@ def main(argv: Sequence[str] | None = None) -> None:
         if args.projection_source_cache is None
         else Path(args.projection_source_cache)
     )
+    source_support_feature_path = (
+        None
+        if args.projection_source_support_feature_cache is None
+        else Path(args.projection_source_support_feature_cache)
+    )
+    source_support_geometry_path = (
+        None
+        if args.projection_source_support_geometry_index is None
+        else Path(args.projection_source_support_geometry_index)
+    )
+    if (source_support_feature_path is None) != (source_support_geometry_path is None):
+        raise ValueError(
+            "projection source support feature and geometry paths must be provided together"
+        )
+    if source_cache_path is None and source_support_feature_path is not None:
+        raise ValueError("support reindex requires projection_source_cache")
     if source_cache_path is None:
         if str(args.pca_source) == "fresh_rgb":
             pca_mean, pca_components, pca_metadata = _fit_pca_from_rgb(
@@ -341,11 +460,21 @@ def main(argv: Sequence[str] | None = None) -> None:
             (len(support_tracks), int(args.projection_dim)), np.nan, dtype=np.float32
         )
     else:
+        expected_source_support_feature_hash = file_sha256_short(
+            support_path
+            if source_support_feature_path is None
+            else source_support_feature_path
+        )
+        expected_source_support_geometry_hash = file_sha256_short(
+            geometry_path
+            if source_support_geometry_path is None
+            else source_support_geometry_path
+        )
         source_cache = load_radio_intermediate_context_cache(
             source_cache_path,
             expected_metadata={
-                "support_feature_cache_sha256": file_sha256_short(support_path),
-                "support_geometry_index_sha256": file_sha256_short(geometry_path),
+                "support_feature_cache_sha256": expected_source_support_feature_hash,
+                "support_geometry_index_sha256": expected_source_support_geometry_hash,
                 "radio_version": str(args.radio_version),
                 "radio_checkpoint_sha256": file_sha256_short(checkpoint_path),
                 "radio_model_load_spec": "explicit_checkpoint_path_v1",
@@ -357,12 +486,31 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "descriptor_dim": int(args.projection_dim),
             },
         )
-        if len(source_cache.support_descriptors) != len(support_tracks):
-            raise ValueError("projection source support descriptors do not align")
         pca_mean = source_cache.pca_mean.copy()
         pca_components = source_cache.pca_components.copy()
         pca_metadata = dict(source_cache.metadata.get("pca") or {})
-        support_output = source_cache.support_descriptors.copy()
+        if source_support_feature_path is None:
+            if len(source_cache.support_descriptors) != len(support_tracks):
+                raise ValueError("projection source support descriptors do not align")
+            support_output = source_cache.support_descriptors.copy()
+            support_reindex_metadata = None
+        else:
+            assert source_support_geometry_path is not None
+            with np.load(source_support_feature_path, allow_pickle=False) as data:
+                source_support_tracks = np.asarray(data["track_ids"], dtype=np.int64)
+            source_geometry, _source_geometry_metadata = (
+                load_support_observation_geometry_index_npz(
+                    source_support_geometry_path
+                )
+            )
+            support_output, support_reindex_metadata = _reindex_support_descriptors(
+                source_descriptors=source_cache.support_descriptors,
+                source_feature_track_ids=source_support_tracks,
+                source_geometry=source_geometry,
+                target_feature_track_ids=support_tracks,
+                target_geometry=geometry,
+                allow_missing=True,
+            )
     anchor_output = np.full(
         (len(anchor["xy"]), int(args.projection_dim)), np.nan, dtype=np.float32
     )
@@ -371,7 +519,18 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     anchor_entries = _image_entries(anchor["image_ids"], anchor["offsets"])
     context_entries = _image_entries(context["image_ids"], context["offsets"])
-    support_image_ids = set() if source_cache is not None else set(geometry.image_ids)
+    if source_cache is None:
+        support_image_ids = set(geometry.image_ids)
+    elif source_support_feature_path is None:
+        support_image_ids = set()
+    else:
+        support_image_ids = set()
+        for image_index, image_id in enumerate(geometry.image_ids):
+            begin = int(geometry.image_offsets[image_index])
+            end = int(geometry.image_offsets[image_index + 1])
+            feature_rows = geometry.source_row_indices[begin:end]
+            if np.any(~np.isfinite(support_output[feature_rows]).all(axis=1)):
+                support_image_ids.add(str(image_id))
     image_ids = tuple(sorted(support_image_ids | set(anchor_entries) | set(context_entries)))
     source_image_stat_manifest_sha256 = _stat_manifest_hash(
         [image_root / image_id for image_id in image_ids]
@@ -442,15 +601,23 @@ def main(argv: Sequence[str] | None = None) -> None:
                 extracted += 1
             blocks: list[tuple[str, np.ndarray, np.ndarray]] = []
             geometry_slice = geometry.image_slice(str(image_id))
-            if source_cache is None and int(geometry_slice.stop) > int(geometry_slice.start):
+            if int(geometry_slice.stop) > int(geometry_slice.start) and (
+                source_cache is None or source_support_feature_path is not None
+            ):
                 rows = np.arange(int(geometry_slice.start), int(geometry_slice.stop), dtype=np.int64)
-                blocks.append(
-                    (
-                        "support",
-                        geometry.source_row_indices[rows],
-                        geometry.xy[rows],
+                if source_cache is not None:
+                    missing = ~np.isfinite(
+                        support_output[geometry.source_row_indices[rows]]
+                    ).all(axis=1)
+                    rows = rows[missing]
+                if len(rows):
+                    blocks.append(
+                        (
+                            "support",
+                            geometry.source_row_indices[rows],
+                            geometry.xy[rows],
+                        )
                     )
-                )
             if str(image_id) in anchor_entries:
                 begin, end = anchor_entries[str(image_id)]
                 rows = np.arange(begin, end, dtype=np.int64)
@@ -533,7 +700,26 @@ def main(argv: Sequence[str] | None = None) -> None:
             else file_sha256_short(source_cache_path)
         ),
         "support_descriptor_source": (
-            "extracted" if source_cache is None else "reused_projection_source_cache"
+            "extracted"
+            if source_cache is None
+            else (
+                "reindexed_projection_source_cache"
+                if source_support_feature_path is not None
+                else "reused_projection_source_cache"
+            )
+        ),
+        "support_reindex": (
+            None if source_cache is None else support_reindex_metadata
+        ),
+        "projection_source_support_feature_cache_sha256": (
+            None
+            if source_support_feature_path is None
+            else file_sha256_short(source_support_feature_path)
+        ),
+        "projection_source_support_geometry_index_sha256": (
+            None
+            if source_support_geometry_path is None
+            else file_sha256_short(source_support_geometry_path)
         ),
         "workers": worker_metadata,
     }

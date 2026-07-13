@@ -37,6 +37,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default="all",
         choices=("all", "valid", "dustbin"),
     )
+    parser.add_argument("--export_full_likelihood", action="store_true")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--base_dir", default=".")
     return parser.parse_args(argv)
@@ -61,6 +62,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         image_cache_max_gb=float(args.image_cache_max_gb) if float(args.image_cache_max_gb) > 0.0 else None,
         prior_scale_key=str(args.prior_scale_key),
         target_dustbin_filter=str(args.target_dustbin_filter),
+        export_full_likelihood=bool(args.export_full_likelihood),
         device=str(args.device),
         base_dir=Path(args.base_dir),
     )

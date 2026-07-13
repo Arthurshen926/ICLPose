@@ -99,6 +99,7 @@ def test_export_rgb_patch_diagnostics_writes_rows_and_visualizations(tmp_path: P
         support_patch_warp="none",
         max_rows=1,
         visualize_limit=1,
+        export_full_likelihood=True,
         device="cpu",
     )
 
@@ -111,6 +112,12 @@ def test_export_rgb_patch_diagnostics_writes_rows_and_visualizations(tmp_path: P
     assert "mode_median_px" in summary["metrics"]
     assert (output_dir / "diagnostic_rows.csv").exists()
     assert list((output_dir / "visualizations").glob("*.png"))
+    likelihood_path = output_dir / "candidate_spatial_likelihood_v3.npz"
+    assert likelihood_path.exists()
+    with np.load(likelihood_path, allow_pickle=False) as likelihood:
+        assert likelihood["local_log_probabilities"].shape[0] == 1
+        assert likelihood["offsets_xy"].shape[1] == 2
+        assert likelihood["target_offset_xy"].shape == (1, 2)
     row = next(csv.DictReader((output_dir / "diagnostic_rows.csv").open()))
     assert {
         "baseline_epe_px",
