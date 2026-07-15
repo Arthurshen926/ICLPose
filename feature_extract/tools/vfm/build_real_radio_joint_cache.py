@@ -140,6 +140,121 @@ class SfMTrackObservationIndex:
             "support_view_counts": reference.track_lengths[reference_indices].astype(np.int64, copy=False),
         }
 
+    def query_cell_positive_csr(
+        self,
+        image_id: str,
+        query_xy: np.ndarray,
+        *,
+        target_size: tuple[int, int],
+        grid_hw: tuple[int, int],
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return all SfM tracks visible in each queried coarse feature cell."""
+
+        coordinates = np.asarray(query_xy, dtype=np.float64).reshape(-1, 2)
+        observations = self.by_image.get(str(image_id))
+        if observations is None:
+            return np.zeros((coordinates.shape[0] + 1,), dtype=np.int64), np.zeros((0,), dtype=np.int64)
+        target_width, target_height = map(int, target_size)
+        grid_height, grid_width = map(int, grid_hw)
+        if min(target_width, target_height, grid_width, grid_height) <= 0:
+            raise ValueError("target image and feature-grid dimensions must be positive")
+        source_sizes = np.asarray(observations.image_sizes, dtype=np.int64).reshape(-1, 2)
+        source_aspect = source_sizes[:, 0].astype(np.float64) / np.maximum(
+            source_sizes[:, 1].astype(np.float64), 1.0
+        )
+        target_aspect = float(target_width) / float(target_height)
+        if np.any(np.abs(source_aspect - target_aspect) > 1e-3):
+            raise ValueError("SfM and source RGB aspect ratios differ; an explicit crop transform is required")
+        scaled_xy = np.asarray(observations.xy, dtype=np.float64).copy()
+        scaled_xy[:, 0] *= max(float(target_width - 1), 1.0) / np.maximum(
+            source_sizes[:, 0].astype(np.float64) - 1.0, 1.0
+        )
+        scaled_xy[:, 1] *= max(float(target_height - 1), 1.0) / np.maximum(
+            source_sizes[:, 1].astype(np.float64) - 1.0, 1.0
+        )
+
+        def cell_indices(xy: np.ndarray) -> np.ndarray:
+            cols = np.floor(xy[:, 0] / float(target_width) * float(grid_width)).astype(np.int64)
+            rows = np.floor(xy[:, 1] / float(target_height) * float(grid_height)).astype(np.int64)
+            cols = np.clip(cols, 0, grid_width - 1)
+            rows = np.clip(rows, 0, grid_height - 1)
+            return rows * grid_width + cols
+
+        tracks_by_cell: dict[int, list[int]] = {}
+        for cell, track_id in zip(
+            cell_indices(scaled_xy).tolist(),
+            np.asarray(observations.track_ids, dtype=np.int64).tolist(),
+        ):
+            tracks_by_cell.setdefault(int(cell), []).append(int(track_id))
+        values: list[int] = []
+        offsets = np.zeros((coordinates.shape[0] + 1,), dtype=np.int64)
+        for row, cell in enumerate(cell_indices(coordinates).tolist()):
+            values.extend(sorted(set(tracks_by_cell.get(int(cell), []))))
+            offsets[row + 1] = int(len(values))
+        return offsets, np.asarray(values, dtype=np.int64)
+
+    def query_radius_positive_csr(
+        self,
+        image_id: str,
+        query_xy: np.ndarray,
+        *,
+        target_size: tuple[int, int],
+        radius_px: float,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return visible SfM tracks within a strict pixel radius of each query."""
+
+        coordinates = np.asarray(query_xy, dtype=np.float64).reshape(-1, 2)
+        observations = self.by_image.get(str(image_id))
+        if observations is None:
+            return np.zeros((coordinates.shape[0] + 1,), dtype=np.int64), np.zeros((0,), dtype=np.int64)
+        radius = float(radius_px)
+        if not np.isfinite(radius) or radius <= 0.0:
+            raise ValueError("radius_px must be finite and positive")
+        target_width, target_height = map(int, target_size)
+        if min(target_width, target_height) <= 0:
+            raise ValueError("target image dimensions must be positive")
+        source_sizes = np.asarray(observations.image_sizes, dtype=np.int64).reshape(-1, 2)
+        source_aspect = source_sizes[:, 0].astype(np.float64) / np.maximum(
+            source_sizes[:, 1].astype(np.float64), 1.0
+        )
+        target_aspect = float(target_width) / float(target_height)
+        if np.any(np.abs(source_aspect - target_aspect) > 1e-3):
+            raise ValueError("SfM and source RGB aspect ratios differ; an explicit crop transform is required")
+        scaled_xy = np.asarray(observations.xy, dtype=np.float64).copy()
+        scaled_xy[:, 0] *= max(float(target_width - 1), 1.0) / np.maximum(
+            source_sizes[:, 0].astype(np.float64) - 1.0, 1.0
+        )
+        scaled_xy[:, 1] *= max(float(target_height - 1), 1.0) / np.maximum(
+            source_sizes[:, 1].astype(np.float64) - 1.0, 1.0
+        )
+
+        # A radius-sized spatial hash keeps this exact search linear in the
+        # number of observations instead of materializing an N x M distance matrix.
+        buckets: dict[tuple[int, int], list[int]] = {}
+        bucket_xy = np.floor(scaled_xy / radius).astype(np.int64)
+        for index, key in enumerate(bucket_xy.tolist()):
+            buckets.setdefault((int(key[0]), int(key[1])), []).append(int(index))
+        track_ids = np.asarray(observations.track_ids, dtype=np.int64)
+        radius_squared = radius * radius
+        values: list[int] = []
+        offsets = np.zeros((coordinates.shape[0] + 1,), dtype=np.int64)
+        for row, coordinate in enumerate(coordinates):
+            center = np.floor(coordinate / radius).astype(np.int64)
+            candidates: list[int] = []
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    candidates.extend(
+                        buckets.get((int(center[0] + dx), int(center[1] + dy)), ())
+                    )
+            if candidates:
+                candidate_indices = np.asarray(sorted(set(candidates)), dtype=np.int64)
+                residuals = scaled_xy[candidate_indices] - coordinate[None, :]
+                keep = np.einsum("nd,nd->n", residuals, residuals) <= radius_squared + 1e-9
+                strict_tracks = sorted(set(track_ids[candidate_indices[keep]].tolist()))
+                values.extend(int(track_id) for track_id in strict_tracks)
+            offsets[row + 1] = int(len(values))
+        return offsets, np.asarray(values, dtype=np.int64)
+
 
 def _empty_landmark_retrieval_supervision() -> dict[str, np.ndarray]:
     return {
@@ -710,6 +825,23 @@ def _build_joint_set_for_real_pair(
         )
         if int(np.asarray(retrieval["track_ids"]).shape[0]) == 0:
             raise ValueError("real pair has no common SfM tracks for landmark retrieval")
+        known_positive_offsets, known_positive_track_ids = track_observation_index.query_cell_positive_csr(
+            query_id,
+            np.asarray(retrieval["query_xy"], dtype=np.float64),
+            target_size=resolved_query_size,
+            grid_hw=(int(query_feature.shape[1]), int(query_feature.shape[2])),
+        )
+        strict_positive_offsets, strict_positive_track_ids = track_observation_index.query_radius_positive_csr(
+            query_id,
+            np.asarray(retrieval["query_xy"], dtype=np.float64),
+            target_size=resolved_query_size,
+            radius_px=float(positive_reprojection_error_px),
+        )
+    else:
+        known_positive_offsets = None
+        known_positive_track_ids = None
+        strict_positive_offsets = None
+        strict_positive_track_ids = None
     joint = build_matcha_joint_index_training_set_from_maps(
         query_feature,
         reference_feature,
@@ -731,6 +863,10 @@ def _build_joint_set_for_real_pair(
         landmark_track_ids=np.asarray(retrieval["track_ids"], dtype=np.int64),
         landmark_track_xyz=np.asarray(retrieval["track_xyz"], dtype=np.float64),
         landmark_support_view_counts=np.asarray(retrieval["support_view_counts"], dtype=np.int64),
+        landmark_known_positive_offsets=known_positive_offsets,
+        landmark_known_positive_track_ids=known_positive_track_ids,
+        landmark_strict_positive_offsets=strict_positive_offsets,
+        landmark_strict_positive_track_ids=strict_positive_track_ids,
     )
     return _set_pair_metadata(joint, query_id=query_id, reference_id=reference_id, split_name=split_name), skip_counts
 

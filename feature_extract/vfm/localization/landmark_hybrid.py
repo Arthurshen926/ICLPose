@@ -436,6 +436,20 @@ def sample_projected_track_observations(
                                 float(weight_floor),
                                 view_consistency_weight=view_weight,
                             ),
+                            camera_center=(
+                                None
+                                if observation.camera_center is None
+                                else np.asarray(
+                                    observation.camera_center, dtype=np.float64
+                                ).reshape(3)
+                            ),
+                            viewing_ray=(
+                                None
+                                if observation.viewing_ray is None
+                                else np.asarray(
+                                    observation.viewing_ray, dtype=np.float64
+                                ).reshape(3)
+                            ),
                         )
                     )
     finally:

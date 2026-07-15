@@ -1,6 +1,9 @@
+import pytest
 import torch
 
 from feature_extract.tools.vfm.train_candidate_maplet_matcher import (
+    _relative_pose_risk,
+    _relative_pose_risk_rank_key,
     _validation_strategy_names,
 )
 from feature_extract.vfm.localization.candidate_maplet_matcher import (
@@ -9,6 +12,9 @@ from feature_extract.vfm.localization.candidate_maplet_matcher import (
     CandidateMapletMatcherConfig,
     candidate_maplet_assignment_loss,
     candidate_maplet_group_loss,
+    conditional_set_identity_loss,
+    factorized_candidate_posterior,
+    factorized_top_l_availability_loss,
     log_optimal_transport_batched,
     rescue_policy_targets,
     set_valued_candidate_loss,
@@ -25,6 +31,69 @@ def test_rescue_validation_strategy_is_added_before_training() -> None:
         "rescue_policy_resolved,rescue_policy_resolved",
         rescue_policy_enabled=True,
     ) == ("rescue_policy_resolved",)
+
+
+def test_training_pose_risk_ranks_failed_pnp_below_finite_trials() -> None:
+    baseline = {
+        "median_translation_m_success": 0.3,
+        "p90_translation_m_success": 0.7,
+        "median_rotation_deg_success": 0.4,
+    }
+    failed = _relative_pose_risk(
+        {
+            "median_translation_m_success": None,
+            "p90_translation_m_success": None,
+            "median_rotation_deg_success": None,
+        },
+        baseline,
+    )
+    finite = _relative_pose_risk(
+        {
+            "median_translation_m_success": 0.4,
+            "p90_translation_m_success": 0.8,
+            "median_rotation_deg_success": 0.5,
+        },
+        baseline,
+    )
+
+    assert failed["valid"] is False
+    assert failed["failure_reason"] == "missing_pose_error_metric"
+    assert _relative_pose_risk_rank_key(failed) < _relative_pose_risk_rank_key(
+        finite
+    )
+
+
+def test_full_view_identity_mixture_does_not_require_geometry_heads() -> None:
+    config = CandidateMapletMatcherConfig(
+        query_input_dim=8,
+        support_input_dim=9,
+        static_input_dim=4,
+        descriptor_dim=4,
+        model_dim=16,
+        num_heads=4,
+        decoupled_candidate_heads=True,
+        candidate_view_marginalization_enabled=True,
+        identity_conditioned_view_posterior_enabled=True,
+        full_candidate_view_mixture_enabled=True,
+        geometry_validity_enabled=False,
+    )
+    model = CandidateMapletMatcher(config)
+
+    assert model.geometry_logit_gap_head is None
+    assert model.candidate_view_head is not None
+    assert len(model.candidate_view_set_blocks) == config.candidate_set_layers
+
+    batch = _batch()
+    outputs = [model(batch), model(batch)]
+    loss, metrics = candidate_maplet_group_loss(
+        model,
+        outputs,
+        [batch, batch],
+        candidate_group_size=2,
+    )
+    assert torch.isfinite(loss)
+    assert "geometry_validity_loss" not in metrics
+    assert "rescue_policy_loss" not in metrics
 
 
 def _batch() -> CandidateMapletBatch:
@@ -70,6 +139,391 @@ def test_candidate_maplet_matcher_outputs_partial_assignment_and_dustbin() -> No
     assert torch.isfinite(loss)
     assert metrics["matched_query_rate"] == 0.6
     assert model.prior_log_scale.grad is not None
+
+
+def test_batched_assignment_probabilities_match_ragged_contract() -> None:
+    torch.manual_seed(40)
+    batch = _batch()
+    model = CandidateMapletMatcher(
+        CandidateMapletMatcherConfig(
+            query_input_dim=8,
+            support_input_dim=9,
+            static_input_dim=4,
+            descriptor_dim=4,
+            model_dim=16,
+            num_heads=4,
+            layers=1,
+            dropout=0.0,
+            sinkhorn_iterations=5,
+        )
+    )
+    ragged = model(batch)
+    batched = model(batch, return_ragged_query_probabilities=False)
+
+    assert batched["query_log_probabilities"] is None
+    assert torch.allclose(
+        ragged["query_log_probabilities_batched"],
+        batched["query_log_probabilities_batched"],
+        atol=1e-7,
+        rtol=1e-7,
+    )
+    for row, values in enumerate(ragged["query_log_probabilities"]):
+        query_count = int(batch.query_mask[row].sum().item())
+        support_count = int(batch.support_mask[row].sum().item())
+        expected = torch.cat(
+            [
+                batched["query_log_probabilities_batched"][
+                    row, :query_count, :support_count
+                ],
+                batched["query_log_probabilities_batched"][row, :query_count, -1:],
+            ],
+            dim=1,
+        )
+        assert torch.allclose(values, expected, atol=1e-7, rtol=1e-7)
+
+    ragged_loss, ragged_metrics = candidate_maplet_assignment_loss(ragged, batch)
+    batched_loss, batched_metrics = candidate_maplet_assignment_loss(batched, batch)
+    assert torch.allclose(ragged_loss, batched_loss, atol=1e-7, rtol=1e-7)
+    assert ragged_metrics == batched_metrics
+
+
+def test_prior_free_set_identity_does_not_receive_static_features() -> None:
+    torch.manual_seed(41)
+    original = _batch()
+    changed_static = CandidateMapletBatch(
+        query_features=original.query_features,
+        query_mask=original.query_mask,
+        support_features=original.support_features,
+        support_mask=original.support_mask,
+        static_features=original.static_features + 10.0,
+        target_track_indices=original.target_track_indices,
+        candidate_labels=original.candidate_labels,
+        edge_indices=original.edge_indices,
+        anchor_residuals_px=original.anchor_residuals_px,
+        candidate_visible=original.candidate_visible,
+    )
+    model = CandidateMapletMatcher(
+        CandidateMapletMatcherConfig(
+            query_input_dim=8,
+            support_input_dim=9,
+            static_input_dim=4,
+            descriptor_dim=4,
+            model_dim=16,
+            num_heads=4,
+            layers=1,
+            dropout=0.0,
+            sinkhorn_iterations=5,
+            prior_free_set_identity_enabled=True,
+        )
+    ).eval()
+
+    with torch.no_grad():
+        original_output = model(original)
+        changed_output = model(changed_static)
+
+    assert not torch.allclose(
+        original_output["candidate_embeddings"],
+        changed_output["candidate_embeddings"],
+    )
+    torch.testing.assert_close(
+        original_output["set_identity_candidate_embeddings"],
+        changed_output["set_identity_candidate_embeddings"],
+        atol=0.0,
+        rtol=0.0,
+    )
+
+
+def test_deployable_identity_context_excludes_prior_fields_but_uses_context() -> None:
+    torch.manual_seed(42)
+    original = _batch()
+
+    def with_static(static_features: torch.Tensor) -> CandidateMapletBatch:
+        return CandidateMapletBatch(
+            query_features=original.query_features,
+            query_mask=original.query_mask,
+            support_features=original.support_features,
+            support_mask=original.support_mask,
+            static_features=static_features,
+            target_track_indices=original.target_track_indices,
+            candidate_labels=original.candidate_labels,
+            edge_indices=original.edge_indices,
+            anchor_residuals_px=original.anchor_residuals_px,
+            candidate_visible=original.candidate_visible,
+        )
+
+    changed_prior = original.static_features.clone()
+    changed_prior[:, :2] += 10.0
+    changed_context = original.static_features.clone()
+    changed_context[:, 2:] += 10.0
+    model = CandidateMapletMatcher(
+        CandidateMapletMatcherConfig(
+            query_input_dim=8,
+            support_input_dim=9,
+            static_input_dim=4,
+            descriptor_dim=4,
+            model_dim=16,
+            num_heads=4,
+            layers=1,
+            dropout=0.0,
+            sinkhorn_iterations=5,
+            prior_free_set_identity_enabled=True,
+            deployable_identity_context_enabled=True,
+            deployable_identity_static_start_index=2,
+        )
+    ).eval()
+
+    with torch.no_grad():
+        expected = model(original)["set_identity_candidate_embeddings"]
+        prior_changed = model(with_static(changed_prior))[
+            "set_identity_candidate_embeddings"
+        ]
+        context_changed = model(with_static(changed_context))[
+            "set_identity_candidate_embeddings"
+        ]
+
+    torch.testing.assert_close(prior_changed, expected, atol=0.0, rtol=0.0)
+    assert not torch.allclose(context_changed, expected)
+    assert model.prior_free_set_identity_encoder is not None
+    first_layer = model.prior_free_set_identity_encoder[0]
+    assert isinstance(first_layer, torch.nn.Linear)
+    assert first_layer.in_features == 16 * 4 + 2 + 4
+
+
+def test_deployable_identity_context_requires_prior_free_identity() -> None:
+    with pytest.raises(ValueError, match="requires prior-free set identity"):
+        CandidateMapletMatcherConfig(
+            query_input_dim=8,
+            support_input_dim=9,
+            static_input_dim=4,
+            descriptor_dim=4,
+            model_dim=16,
+            num_heads=4,
+            deployable_identity_context_enabled=True,
+            deployable_identity_static_start_index=2,
+        )
+
+    with pytest.raises(ValueError, match="outside static input"):
+        CandidateMapletMatcherConfig(
+            query_input_dim=8,
+            support_input_dim=9,
+            static_input_dim=4,
+            descriptor_dim=4,
+            model_dim=16,
+            num_heads=4,
+            prior_free_set_identity_enabled=True,
+            deployable_identity_context_enabled=True,
+            deployable_identity_static_start_index=5,
+        )
+
+
+def test_prior_free_set_identity_receives_set_loss_gradients() -> None:
+    torch.manual_seed(43)
+    batch = _batch()
+    model = CandidateMapletMatcher(
+        CandidateMapletMatcherConfig(
+            query_input_dim=8,
+            support_input_dim=9,
+            static_input_dim=4,
+            descriptor_dim=4,
+            model_dim=16,
+            num_heads=4,
+            layers=1,
+            dropout=0.0,
+            sinkhorn_iterations=5,
+            prior_free_set_identity_enabled=True,
+        )
+    )
+    outputs = [model(batch), model(batch)]
+    loss, metrics = candidate_maplet_group_loss(
+        model,
+        outputs,
+        [batch, batch],
+        candidate_group_size=2,
+        assignment_weight=0.0,
+        pair_weight=0.0,
+        candidate_aux_weight=0.0,
+        candidate_set_weight=1.0,
+        prior_free_identity_weight=1.0,
+    )
+    loss.backward()
+
+    assert model.prior_free_set_identity_encoder is not None
+    first_layer = model.prior_free_set_identity_encoder[0]
+    assert isinstance(first_layer, torch.nn.Linear)
+    assert first_layer.weight.grad is not None
+    assert torch.any(first_layer.weight.grad != 0)
+    assert "prior_free_identity_loss" in metrics
+
+
+def test_candidate_evidence_logits_exclude_explicit_coarse_prior() -> None:
+    torch.manual_seed(47)
+    model = CandidateMapletMatcher(
+        CandidateMapletMatcherConfig(
+            query_input_dim=8,
+            support_input_dim=9,
+            static_input_dim=4,
+            descriptor_dim=4,
+            model_dim=16,
+            num_heads=4,
+            layers=1,
+            dropout=0.0,
+            sinkhorn_iterations=5,
+        )
+    ).eval()
+    embeddings = torch.randn(2, 3, 16)
+    first = model.resolve_candidate_sets(
+        embeddings, candidate_prior_scores=torch.tensor([[0.8, 0.1, 0.0]] * 2)
+    )
+    second = model.resolve_candidate_sets(
+        embeddings, candidate_prior_scores=torch.tensor([[0.0, 0.1, 0.8]] * 2)
+    )
+
+    torch.testing.assert_close(
+        first["candidate_evidence_logits"],
+        second["candidate_evidence_logits"],
+        atol=0.0,
+        rtol=0.0,
+    )
+    assert not torch.allclose(first["candidate_logits"], second["candidate_logits"])
+
+
+def test_conditional_identity_loss_ignores_null_and_no_match_groups() -> None:
+    logits = torch.tensor(
+        [[0.0, 2.0, -1.0], [20.0, -20.0, -20.0]], requires_grad=True
+    )
+    positives = torch.tensor(
+        [[False, True, False], [False, False, False]], dtype=torch.bool
+    )
+    loss, metrics = conditional_set_identity_loss(logits, positives)
+    loss.backward()
+
+    expected = torch.logsumexp(torch.tensor([0.0, 2.0, -1.0]), dim=0) - 2.0
+    torch.testing.assert_close(loss.detach(), expected)
+    assert metrics["conditional_identity_top1_accuracy"] == 1.0
+    assert metrics["conditional_identity_group_count"] == 1.0
+    torch.testing.assert_close(logits.grad[1], torch.zeros(3))
+
+    no_match_logits = torch.randn(2, 3, requires_grad=True)
+    no_match_loss, no_match_metrics = conditional_set_identity_loss(
+        no_match_logits, torch.zeros(2, 3, dtype=torch.bool)
+    )
+    no_match_loss.backward()
+    assert no_match_loss.item() == 0.0
+    assert no_match_metrics["conditional_identity_group_count"] == 0.0
+    torch.testing.assert_close(no_match_logits.grad, torch.zeros_like(no_match_logits))
+
+
+def test_conditional_identity_weights_do_not_reweight_no_match_groups() -> None:
+    logits = torch.tensor(
+        [[2.0, 0.0], [0.0, 2.0], [20.0, -20.0]], requires_grad=True
+    )
+    positives = torch.tensor(
+        [[True, False], [True, False], [False, False]], dtype=torch.bool
+    )
+    weights = torch.tensor([3.0, 1.0, 1000.0])
+
+    loss, metrics = conditional_set_identity_loss(
+        logits, positives, group_weights=weights
+    )
+    per_group = torch.stack(
+        [
+            torch.logsumexp(logits.detach()[0], dim=0) - logits.detach()[0, 0],
+            torch.logsumexp(logits.detach()[1], dim=0) - logits.detach()[1, 0],
+        ]
+    )
+    expected = (3.0 * per_group[0] + per_group[1]) / 4.0
+    torch.testing.assert_close(loss.detach(), expected)
+    assert metrics["conditional_identity_group_weight_sum"] == 4.0
+    torch.testing.assert_close(
+        torch.tensor(metrics["conditional_identity_unweighted_loss"]),
+        torch.mean(per_group),
+    )
+    loss.backward()
+    torch.testing.assert_close(logits.grad[2], torch.zeros(2))
+
+
+def test_conditional_identity_weights_reject_invalid_values() -> None:
+    logits = torch.zeros((2, 2))
+    positives = torch.tensor([[True, False], [False, True]])
+    with pytest.raises(ValueError, match="one value per candidate group"):
+        conditional_set_identity_loss(
+            logits, positives, group_weights=torch.ones(3)
+        )
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        conditional_set_identity_loss(
+            logits, positives, group_weights=torch.tensor([1.0, -1.0])
+        )
+
+
+def test_factorized_top_l_availability_is_independent_of_candidate_softmax() -> None:
+    logits = torch.tensor([2.0, -2.0], requires_grad=True)
+    positives = torch.tensor(
+        [[False, True, False], [False, False, False]], dtype=torch.bool
+    )
+
+    loss, metrics = factorized_top_l_availability_loss(logits, positives)
+    loss.backward()
+
+    expected = torch.nn.functional.binary_cross_entropy_with_logits(
+        logits.detach(), torch.tensor([1.0, 0.0])
+    )
+    torch.testing.assert_close(loss.detach(), expected)
+    assert logits.grad is not None
+    assert metrics["factorized_top_l_availability_accuracy"] == 1.0
+    assert metrics["factorized_top_l_availability_positive_rate"] == 0.5
+
+    short_candidates, short_null, _ = factorized_candidate_posterior(
+        torch.tensor([[0.0, 1.0]]), torch.tensor([0.4])
+    )
+    long_candidates, long_null, _ = factorized_candidate_posterior(
+        torch.tensor([[0.0, 1.0, -1.0, 2.0]]), torch.tensor([0.4])
+    )
+    torch.testing.assert_close(short_null, long_null)
+    torch.testing.assert_close(short_candidates.sum(dim=1), long_candidates.sum(dim=1))
+    torch.testing.assert_close(
+        short_candidates.sum(dim=1) + short_null, torch.ones_like(short_null)
+    )
+
+
+def test_factorized_set_head_trains_separately_from_conditional_identity() -> None:
+    torch.manual_seed(53)
+    batch = _batch()
+    model = CandidateMapletMatcher(
+        CandidateMapletMatcherConfig(
+            query_input_dim=8,
+            support_input_dim=9,
+            static_input_dim=4,
+            descriptor_dim=4,
+            model_dim=16,
+            num_heads=4,
+            layers=1,
+            dropout=0.0,
+            sinkhorn_iterations=5,
+            prior_free_set_identity_enabled=True,
+            factorized_set_posterior_enabled=True,
+        )
+    )
+    outputs = [model(batch), model(batch)]
+    loss, metrics = candidate_maplet_group_loss(
+        model,
+        outputs,
+        [batch, batch],
+        candidate_group_size=2,
+        assignment_weight=0.0,
+        pair_weight=0.0,
+        candidate_aux_weight=0.0,
+        candidate_set_weight=0.0,
+        prior_free_conditional_identity_weight=1.0,
+        factorized_top_l_availability_weight=1.0,
+    )
+    loss.backward()
+
+    assert model.set_top_l_availability_head is not None
+    first_layer = model.set_top_l_availability_head[0]
+    assert isinstance(first_layer, torch.nn.Linear)
+    assert first_layer.weight.grad is not None
+    assert torch.any(first_layer.weight.grad != 0)
+    assert "factorized_top_l_availability_loss" in metrics
 
 
 def test_candidate_maplet_matcher_inference_does_not_require_supervision() -> None:
@@ -500,6 +954,122 @@ def test_candidate_view_marginalization_preserves_prior_and_view_order() -> None
         expected_permuted["candidate_logits"],
         atol=1e-6,
         rtol=1e-6,
+    )
+
+
+def test_full_candidate_view_mixture_is_candidate_and_view_equivariant() -> None:
+    torch.manual_seed(83)
+    model = CandidateMapletMatcher(
+        CandidateMapletMatcherConfig(
+            query_input_dim=8,
+            support_input_dim=9,
+            static_input_dim=4,
+            descriptor_dim=4,
+            model_dim=16,
+            num_heads=4,
+            layers=1,
+            dropout=0.0,
+            sinkhorn_iterations=5,
+            geometry_validity_enabled=True,
+            decoupled_candidate_heads=True,
+            candidate_view_marginalization_enabled=True,
+            full_candidate_view_mixture_enabled=True,
+            identity_conditioned_view_posterior_enabled=True,
+        )
+    ).eval()
+    views = torch.randn(2, 5, 3, 16)
+    view_probability = torch.softmax(torch.randn(2, 5, 3), dim=2)
+    prior = torch.rand(2, 5)
+    candidate_order = torch.tensor([3, 1, 4, 0, 2])
+    view_order = torch.tensor([2, 0, 1])
+    assert model.candidate_view_head is not None
+    with torch.no_grad():
+        torch.nn.init.normal_(model.candidate_view_head.weight)
+
+    with torch.no_grad():
+        original = model.resolve_candidate_view_sets(
+            views, view_probability, candidate_prior_scores=prior
+        )
+        permuted = model.resolve_candidate_view_sets(
+            views[:, candidate_order][:, :, view_order],
+            view_probability[:, candidate_order][:, :, view_order],
+            candidate_prior_scores=prior[:, candidate_order],
+        )
+
+    candidate_inverse = torch.argsort(candidate_order)
+    torch.testing.assert_close(
+        permuted["candidate_logits"][:, candidate_inverse],
+        original["candidate_logits"],
+        atol=1e-5,
+        rtol=1e-5,
+    )
+    torch.testing.assert_close(
+        permuted["dustbin_logits"],
+        original["dustbin_logits"],
+        atol=1e-5,
+        rtol=1e-5,
+    )
+    torch.testing.assert_close(
+        permuted["support_view_probabilities"][:, candidate_inverse][:, :, view_order.argsort()],
+        original["support_view_probabilities"],
+        atol=1e-5,
+        rtol=1e-5,
+    )
+    torch.testing.assert_close(
+        original["support_view_probabilities"].sum(dim=2),
+        torch.ones_like(original["support_view_probabilities"][:, :, 0]),
+    )
+    assert not torch.allclose(
+        original["support_view_probabilities"], view_probability
+    )
+
+
+def test_explicit_anchor_role_keeps_nonanchor_permutation_invariant() -> None:
+    torch.manual_seed(89)
+    supervised = _batch()
+    original = CandidateMapletBatch(
+        query_features=supervised.query_features[:1],
+        query_mask=supervised.query_mask[:1],
+        support_features=supervised.support_features[:1],
+        support_mask=supervised.support_mask[:1],
+        static_features=supervised.static_features[:1],
+        target_track_indices=None,
+        candidate_labels=None,
+        edge_indices=supervised.edge_indices[:1],
+    )
+    query_order = torch.tensor([0, 2, 1])
+    support_order = torch.tensor([0, 2, 1])
+    permuted = CandidateMapletBatch(
+        query_features=original.query_features[:, query_order],
+        query_mask=original.query_mask[:, query_order],
+        support_features=original.support_features[:, support_order],
+        support_mask=original.support_mask[:, support_order],
+        static_features=original.static_features,
+        target_track_indices=None,
+        candidate_labels=None,
+        edge_indices=original.edge_indices,
+    )
+    model = CandidateMapletMatcher(
+        CandidateMapletMatcherConfig(
+            query_input_dim=8,
+            support_input_dim=9,
+            static_input_dim=4,
+            descriptor_dim=4,
+            model_dim=16,
+            num_heads=4,
+            layers=1,
+            dropout=0.0,
+            sinkhorn_iterations=5,
+            explicit_anchor_role_embedding=True,
+        )
+    ).eval()
+
+    with torch.no_grad():
+        expected = model(original)
+        actual = model(permuted)
+
+    torch.testing.assert_close(
+        actual["candidate_logits"], expected["candidate_logits"], atol=1e-6, rtol=1e-6
     )
 
 

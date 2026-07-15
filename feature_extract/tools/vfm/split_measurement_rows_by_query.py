@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -46,6 +47,9 @@ def split_measurement_rows_by_query(
     val_query_count: int = 0,
     val_query_id_file: Path | None = None,
     render_cache_manifest_csv: Path | None = None,
+    hash_folds: int = 0,
+    hash_val_fold: int = 0,
+    hash_salt: str = "measurement_query_split_v1",
 ) -> dict[str, Any]:
     row_fields, rows = _read_csv(Path(rows_csv))
     if "query_id" not in row_fields:
@@ -53,7 +57,29 @@ def split_measurement_rows_by_query(
     all_query_ids = _query_ids(rows)
     explicit_val = _parse_query_id_file(val_query_id_file)
     if explicit_val:
+        if int(hash_folds) > 0:
+            raise ValueError("explicit and hash query splits are mutually exclusive")
         val_query_ids = [query_id for query_id in explicit_val if query_id in set(all_query_ids)]
+        split_strategy = "explicit_query_id_file"
+    elif int(hash_folds) > 0:
+        fold_count = int(hash_folds)
+        validation_fold = int(hash_val_fold)
+        if fold_count < 2 or not 0 <= validation_fold < fold_count:
+            raise ValueError("hash query split fold configuration is invalid")
+
+        def fold(query_id: str) -> int:
+            payload = f"{str(hash_salt)}\0{query_id}".encode("utf-8")
+            return (
+                int.from_bytes(hashlib.sha256(payload).digest()[:8], "little")
+                % fold_count
+            )
+
+        val_query_ids = [
+            query_id for query_id in all_query_ids if fold(query_id) == validation_fold
+        ]
+        if not val_query_ids or len(val_query_ids) == len(all_query_ids):
+            raise ValueError("hash query split produced an empty partition")
+        split_strategy = "stable_sha256_query_fold"
     else:
         count = int(val_query_count)
         if count <= 0:
@@ -61,6 +87,7 @@ def split_measurement_rows_by_query(
         if count >= len(all_query_ids):
             raise ValueError("val_query_count must be smaller than the number of unique queries")
         val_query_ids = all_query_ids[-count:]
+        split_strategy = "lexicographic_tail_count"
     val_set = set(val_query_ids)
     train_set = set(all_query_ids) - val_set
     train_rows = [row for row in rows if str(row.get("query_id", "")).strip() in train_set]
@@ -106,6 +133,10 @@ def split_measurement_rows_by_query(
         "train_row_count": len(train_rows),
         "val_row_count": len(val_rows),
         "query_overlap_count": len(train_set & val_set),
+        "split_strategy": split_strategy,
+        "hash_folds": int(hash_folds),
+        "hash_val_fold": int(hash_val_fold),
+        "hash_salt": str(hash_salt),
         "train_query_ids": sorted(train_set),
         "val_query_ids": sorted(val_set),
         "manifest_train_count": manifest_train_count,
@@ -123,6 +154,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--val_query_count", type=int, default=0)
     parser.add_argument("--val_query_id_file", default="")
     parser.add_argument("--render_cache_manifest_csv", default="")
+    parser.add_argument("--hash_folds", type=int, default=0)
+    parser.add_argument("--hash_val_fold", type=int, default=0)
+    parser.add_argument("--hash_salt", default="measurement_query_split_v1")
     return parser.parse_args(argv)
 
 
@@ -134,6 +168,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         val_query_count=int(args.val_query_count),
         val_query_id_file=Path(args.val_query_id_file) if str(args.val_query_id_file) else None,
         render_cache_manifest_csv=Path(args.render_cache_manifest_csv) if str(args.render_cache_manifest_csv) else None,
+        hash_folds=int(args.hash_folds),
+        hash_val_fold=int(args.hash_val_fold),
+        hash_salt=str(args.hash_salt),
     )
     print(json.dumps(summary, indent=2, sort_keys=True))
 

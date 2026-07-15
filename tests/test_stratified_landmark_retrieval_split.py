@@ -119,3 +119,85 @@ def test_stratified_split_rejects_sequence_with_too_few_eligible_images(tmp_path
             test_per_sequence=1,
             min_query_observations=2,
         )
+
+
+def test_stratified_split_restricts_queries_without_shrinking_support_scope(
+    tmp_path: Path,
+) -> None:
+    token_manifest = _token_manifest(tmp_path)
+    eligible = {
+        f"{sequence}/frame{frame:05d}.png"
+        for sequence in ("seq1", "seq2")
+        for frame in range(1, 7)
+    }
+    query_tokens = tmp_path / "query.json"
+    support_tokens = tmp_path / "support.json"
+    split_path = tmp_path / "split.json"
+
+    summary = build_stratified_landmark_retrieval_split(
+        track_observations_jsonl=_track_observations(tmp_path),
+        token_manifest=token_manifest,
+        output_support_observations_jsonl=tmp_path / "support.jsonl",
+        output_query_token_manifest=query_tokens,
+        output_support_token_manifest=support_tokens,
+        output_query_split_json=split_path,
+        train_per_sequence=1,
+        validation_per_sequence=1,
+        test_per_sequence=1,
+        min_query_observations=2,
+        eligible_query_ids=eligible,
+    )
+
+    selected = {
+        record.image_id for record in TokenBankManifest.from_json(query_tokens).records
+    }
+    support = {
+        record.image_id for record in TokenBankManifest.from_json(support_tokens).records
+    }
+    assert selected <= eligible
+    assert len(support) == 20 - len(selected)
+    assert summary["split_counts"] == {"train": 2, "validation": 2, "test": 2}
+
+
+def test_stratified_split_extends_train_while_preserving_fixed_holdouts(
+    tmp_path: Path,
+) -> None:
+    token_manifest = _token_manifest(tmp_path)
+    fixed = tmp_path / "fixed.json"
+    fixed.write_text(
+        json.dumps(
+            {
+                "train": ["seq1/frame00001.png", "seq2/frame00001.png"],
+                "validation": ["seq1/frame00004.png", "seq2/frame00004.png"],
+                "test": ["seq1/frame00008.png", "seq2/frame00008.png"],
+            }
+        )
+    )
+    split_path = tmp_path / "extended.json"
+
+    summary = build_stratified_landmark_retrieval_split(
+        track_observations_jsonl=_track_observations(tmp_path),
+        token_manifest=token_manifest,
+        output_support_observations_jsonl=tmp_path / "support.jsonl",
+        output_query_token_manifest=tmp_path / "query.json",
+        output_support_token_manifest=tmp_path / "support.json",
+        output_query_split_json=split_path,
+        train_per_sequence=3,
+        validation_per_sequence=1,
+        test_per_sequence=1,
+        min_query_observations=2,
+        fixed_query_split=fixed,
+    )
+
+    split = json.loads(split_path.read_text())
+    assert set(split["validation"]) == {
+        "seq1/frame00004.png",
+        "seq2/frame00004.png",
+    }
+    assert set(split["test"]) == {
+        "seq1/frame00008.png",
+        "seq2/frame00008.png",
+    }
+    assert {"seq1/frame00001.png", "seq2/frame00001.png"} <= set(split["train"])
+    assert summary["split_counts"] == {"train": 6, "validation": 2, "test": 2}
+    assert split["contract"]["fixed_validation_test_preserved"] is True

@@ -1,0 +1,10 @@
+[
+  {
+    "name": "ap3p_raw_beta1_h8",
+    "hypotheses_per_limit": 8,
+    "minimal_set_sizes": [4],
+    "candidate_probability_power": 1.0,
+    "local_optimization": false,
+    "use_spatial_modes": false
+  }
+]

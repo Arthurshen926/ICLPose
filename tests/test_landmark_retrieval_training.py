@@ -7,6 +7,7 @@ import torch
 from feature_extract.vfm.landmark_retrieval_training import (
     LandmarkPrototypeMemoryBank,
     LandmarkRetrievalLossConfig,
+    _merge_memory_negative_sources,
     landmark_retrieval_loss,
 )
 from feature_extract.vfm.matcha_joint_training import _sample_descriptor_rows_at_image_xy
@@ -112,6 +113,298 @@ def test_landmark_retrieval_geometry_hard_negative_uses_track_xyz() -> None:
 
     assert metrics["landmark_retrieval_geometry_hard_negative_count"] == 1
     assert metrics["landmark_retrieval_memory_negative_count"] == 1
+
+
+def test_memory_negative_merge_balances_sources_under_shared_limit() -> None:
+    selected, counts = _merge_memory_negative_sources(
+        semantic=list(range(10)),
+        geometry=list(range(100, 110)),
+        random=list(range(200, 210)),
+        limit=8,
+        policy="source_balanced_round_robin",
+    )
+    legacy, legacy_counts = _merge_memory_negative_sources(
+        semantic=list(range(10)),
+        geometry=list(range(100, 110)),
+        random=list(range(200, 210)),
+        limit=8,
+        policy="legacy_source_concat",
+    )
+
+    assert selected == [0, 1, 100, 200, 2, 3, 101, 201]
+    assert counts == {"semantic": 4, "geometry": 2, "random": 2}
+    assert legacy == list(range(8))
+    assert legacy_counts == {"semantic": 8, "geometry": 0, "random": 0}
+
+
+def test_rank_major_semantic_mining_admits_each_query_top_confuser() -> None:
+    bank = LandmarkPrototypeMemoryBank(
+        capacity=8,
+        descriptor_dim=4,
+        device="cpu",
+        momentum=0.0,
+    )
+    bank.update(
+        track_ids=np.arange(100, 108, dtype=np.int64),
+        descriptors=torch.cat([torch.eye(4), 0.9 * torch.eye(4)], dim=0),
+        observation_counts=np.ones((8,), dtype=np.int64),
+        xyz=torch.arange(24, dtype=torch.float32).reshape(8, 3),
+    )
+    query = torch.eye(4)
+    support = torch.eye(4)
+    loss, metrics = landmark_retrieval_loss(
+        query,
+        support,
+        torch.arange(4),
+        memory_bank=bank,
+        config=LandmarkRetrievalLossConfig(
+            memory_candidate_pool_size=0,
+            semantic_hard_negatives_per_query=2,
+            geometry_hard_negatives_per_track=0,
+            random_negatives=0,
+            max_memory_negatives=4,
+            memory_negative_merge_policy="source_balanced_round_robin",
+            dustbin_logit=None,
+        ),
+    )
+
+    assert loss is not None
+    assert metrics["landmark_retrieval_global_exact_semantic_mining"] == 1
+    assert metrics["landmark_retrieval_memory_candidate_pool_count"] == 8
+    assert metrics["landmark_retrieval_semantic_top1_admitted_fraction"] == pytest.approx(1.0)
+    assert metrics["landmark_retrieval_semantic_topk_admitted_per_query_mean"] == pytest.approx(1.0)
+
+
+def test_balanced_merge_does_not_let_semantic_negatives_starve_geometry() -> None:
+    bank = _bank()
+    bank.update(
+        track_ids=np.asarray([30, 40, 50, 60]),
+        descriptors=torch.tensor(
+            [
+                [0.0, 0.0, 1.0],
+                [0.9, 0.1, 0.0],
+                [0.8, 0.2, 0.0],
+                [0.7, 0.3, 0.0],
+            ]
+        ),
+        observation_counts=np.ones((4,), dtype=np.int64),
+        xyz=torch.tensor(
+            [[0.1, 0.0, 0.0], [2.0, 0.0, 0.0], [3.0, 0.0, 0.0], [4.0, 0.0, 0.0]]
+        ),
+    )
+    _loss, metrics = landmark_retrieval_loss(
+        torch.tensor([[1.0, 0.0, 0.0], [0.9, 0.1, 0.0]]),
+        torch.tensor([[1.0, 0.0, 0.0], [0.9, 0.1, 0.0]]),
+        torch.tensor([10, 20]),
+        track_xyz=torch.tensor([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]),
+        memory_bank=bank,
+        config=LandmarkRetrievalLossConfig(
+            semantic_hard_negatives_per_query=4,
+            geometry_hard_negatives_per_track=1,
+            random_negatives=0,
+            max_memory_negatives=3,
+            memory_negative_merge_policy="source_balanced_round_robin",
+        ),
+    )
+
+    assert metrics["landmark_retrieval_semantic_hard_negative_count"] == 2
+    assert metrics["landmark_retrieval_geometry_hard_negative_count"] == 1
+    assert metrics["landmark_retrieval_geometry_hard_negative_raw_unique_count"] >= 1
+
+
+def test_system_confuser_margin_contributes_finite_gradients() -> None:
+    bank = _bank()
+    bank.update(
+        track_ids=np.asarray([30]),
+        descriptors=torch.tensor([[1.0, 0.0, 0.0]]),
+        observation_counts=np.asarray([2]),
+    )
+    query = torch.tensor([[1.0, 0.0, 0.0]], requires_grad=True)
+    support = torch.tensor([[0.8, 0.6, 0.0]], requires_grad=True)
+    loss, metrics = landmark_retrieval_loss(
+        query,
+        support,
+        torch.tensor([10]),
+        memory_bank=bank,
+        config=LandmarkRetrievalLossConfig(
+            semantic_hard_negatives_per_query=1,
+            geometry_hard_negatives_per_track=0,
+            random_negatives=0,
+            system_hard_negative_margin=0.1,
+            system_hard_negative_margin_weight=1.0,
+            dustbin_logit=None,
+        ),
+    )
+    assert loss is not None
+    loss.backward()
+
+    assert metrics["landmark_retrieval_system_hard_negative_margin_count"] == 1
+    assert metrics["landmark_retrieval_system_hard_negative_margin_loss"] > 0.0
+    assert query.grad is not None and torch.isfinite(query.grad).all()
+    assert support.grad is not None and torch.isfinite(support.grad).all()
+
+
+def test_global_mining_excludes_full_sfm_same_cell_tracks_from_negatives() -> None:
+    bank = _bank()
+    bank.update(
+        track_ids=np.asarray([30, 40]),
+        descriptors=torch.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]),
+        observation_counts=np.asarray([2, 2]),
+    )
+    query = torch.tensor([[1.0, 0.0, 0.0]], requires_grad=True)
+    support = torch.tensor([[0.8, 0.6, 0.0]], requires_grad=True)
+    loss, metrics = landmark_retrieval_loss(
+        query,
+        support,
+        torch.tensor([10]),
+        known_positive_track_ids=torch.tensor([[10, 30, -1]]),
+        memory_bank=bank,
+        config=LandmarkRetrievalLossConfig(
+            semantic_hard_negatives_per_query=1,
+            geometry_hard_negatives_per_track=0,
+            random_negatives=2,
+            max_memory_negatives=2,
+            system_hard_negative_margin=0.1,
+            system_hard_negative_margin_weight=1.0,
+            dustbin_logit=None,
+        ),
+    )
+    assert loss is not None
+    loss.backward()
+
+    assert metrics["landmark_retrieval_known_positive_raw_top1_fraction"] == pytest.approx(1.0)
+    assert metrics["landmark_retrieval_known_positive_memory_candidate_count"] == 1
+    assert metrics["landmark_retrieval_known_positive_selected_negative_count"] == 1
+    assert metrics["landmark_retrieval_system_hard_negative_margin_loss"] == pytest.approx(0.0)
+    assert metrics["landmark_retrieval_hardest_negative_score_mean"] == pytest.approx(0.0)
+    assert query.grad is not None and torch.isfinite(query.grad).all()
+
+
+def test_strict_spatial_bank_track_is_excluded_not_used_as_positive() -> None:
+    bank = _bank()
+    bank.update(
+        track_ids=np.asarray([30, 40]),
+        descriptors=torch.tensor([[1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]),
+        observation_counts=np.asarray([2, 2]),
+    )
+    query = torch.tensor([[1.0, 0.0, 0.0]], requires_grad=True)
+    support = torch.tensor([[0.0, 1.0, 0.0]], requires_grad=True)
+
+    loss, metrics = landmark_retrieval_loss(
+        query,
+        support,
+        torch.tensor([10]),
+        known_positive_track_ids=torch.tensor([[10, 30, -1]]),
+        strict_positive_track_ids=torch.tensor([[10, 30, -1]]),
+        memory_bank=bank,
+        config=LandmarkRetrievalLossConfig(
+            semantic_hard_negatives_per_query=1,
+            geometry_hard_negatives_per_track=0,
+            random_negatives=0,
+            max_memory_negatives=1,
+            dustbin_logit=None,
+        ),
+    )
+    assert loss is not None
+    loss.backward()
+
+    assert metrics["landmark_retrieval_memory_negative_count"] == 1
+    assert metrics["landmark_retrieval_strict_ambiguity_memory_pair_count"] == 1
+    assert metrics["landmark_retrieval_memory_strict_ambiguity_candidate_count"] == 0
+    assert metrics["landmark_retrieval_strict_ambiguity_selected_pair_count"] == 0
+    assert metrics["landmark_retrieval_candidate_count"] == 2
+    assert float(loss.detach()) == pytest.approx(np.log(2.0))
+    assert query.grad is not None and torch.isfinite(query.grad).all()
+
+
+def test_strict_spatial_support_prototype_enters_set_valued_numerator() -> None:
+    query = torch.tensor(
+        [[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]], requires_grad=True
+    )
+    support = torch.tensor(
+        [[0.0, 1.0, 0.0], [1.0, 0.0, 0.0]], requires_grad=True
+    )
+    track_ids = torch.tensor([10, 20])
+    strict = torch.tensor([[10, 20], [20, -1]])
+
+    exact_loss, _ = landmark_retrieval_loss(
+        query,
+        support,
+        track_ids,
+        config=LandmarkRetrievalLossConfig(
+            set_valued_cell_positives=False,
+            dustbin_logit=None,
+        ),
+    )
+    strict_loss, metrics = landmark_retrieval_loss(
+        query,
+        support,
+        track_ids,
+        strict_positive_track_ids=strict,
+        config=LandmarkRetrievalLossConfig(dustbin_logit=None),
+    )
+
+    assert exact_loss is not None and strict_loss is not None
+    assert strict_loss < exact_loss
+    assert metrics["landmark_retrieval_strict_valid_recall_at_1"] == pytest.approx(1.0)
+
+
+def test_query_disjoint_frozen_bank_supplies_positive_prototype() -> None:
+    bank = _bank()
+    bank.update(
+        track_ids=np.asarray([10, 30]),
+        descriptors=torch.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]),
+        observation_counts=np.asarray([7, 5]),
+    )
+    bank.frozen = True
+    query = torch.tensor([[1.0, 0.0, 0.0]], requires_grad=True)
+    deliberately_wrong_episode_support = torch.tensor(
+        [[0.0, 1.0, 0.0]], requires_grad=True
+    )
+
+    loss, metrics = landmark_retrieval_loss(
+        query,
+        deliberately_wrong_episode_support,
+        torch.tensor([10]),
+        memory_bank=bank,
+        config=LandmarkRetrievalLossConfig(
+            positive_prototype_source="query_disjoint_frozen_bank",
+            semantic_hard_negatives_per_query=1,
+            geometry_hard_negatives_per_track=0,
+            random_negatives=0,
+            dustbin_logit=None,
+        ),
+    )
+    assert loss is not None
+    loss.backward()
+
+    assert float(loss.detach()) < 1e-4
+    assert metrics["landmark_retrieval_positive_source_query_disjoint_frozen_bank"] == 1.0
+    assert metrics["landmark_retrieval_mean_prototype_observation_count"] == pytest.approx(7.0)
+    assert query.grad is not None and torch.isfinite(query.grad).all()
+    assert deliberately_wrong_episode_support.grad is None
+
+
+def test_query_disjoint_frozen_bank_rejects_missing_positive_track() -> None:
+    bank = _bank()
+    bank.update(
+        track_ids=np.asarray([30]),
+        descriptors=torch.tensor([[0.0, 1.0, 0.0]]),
+        observation_counts=np.asarray([5]),
+    )
+    bank.frozen = True
+
+    with pytest.raises(ValueError, match="missing episode-positive tracks"):
+        landmark_retrieval_loss(
+            torch.tensor([[1.0, 0.0, 0.0]]),
+            torch.tensor([[1.0, 0.0, 0.0]]),
+            torch.tensor([10]),
+            memory_bank=bank,
+            config=LandmarkRetrievalLossConfig(
+                positive_prototype_source="query_disjoint_frozen_bank",
+                dustbin_logit=None,
+            ),
+        )
 
 
 def test_landmark_memory_update_during_loss_does_not_break_backward() -> None:

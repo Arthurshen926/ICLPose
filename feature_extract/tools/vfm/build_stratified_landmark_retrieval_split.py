@@ -18,6 +18,7 @@ from feature_extract.vfm.tokens import TokenBankManifest
 
 SPLIT_FORMAT = "stratified_landmark_query_split_v1"
 SPLIT_STRATEGY = "sequence_balanced_temporal_coverage_v1"
+FIXED_HOLDOUT_SPLIT_STRATEGY = "sequence_balanced_temporal_coverage_fixed_holdout_v1"
 
 
 def _sha256(path: Path) -> str:
@@ -150,6 +151,8 @@ def build_stratified_landmark_retrieval_split(
     test_per_sequence: int = 3,
     min_query_observations: int = 32,
     track_observation_index: Path | None = None,
+    eligible_query_ids: set[str] | None = None,
+    fixed_query_split: Path | None = None,
 ) -> dict[str, object]:
     source_tracks = Path(track_observations_jsonl)
     source_tokens = Path(token_manifest)
@@ -169,6 +172,8 @@ def build_stratified_landmark_retrieval_split(
 
     records_by_sequence: dict[str, list[tuple[int, object]]] = defaultdict(list)
     for record in manifest.records:
+        if eligible_query_ids is not None and str(record.image_id) not in eligible_query_ids:
+            continue
         sequence, frame = _sequence_and_frame(str(record.image_id))
         if int(observation_counts.get(str(record.image_id), 0)) >= int(min_query_observations):
             records_by_sequence[sequence].append((frame, record))
@@ -187,6 +192,24 @@ def build_stratified_landmark_retrieval_split(
         validation_count=int(validation_per_sequence),
         test_count=int(test_per_sequence),
     )
+    fixed_split_ids: dict[str, set[str]] | None = None
+    fixed_split_sha256 = ""
+    if fixed_query_split is not None:
+        fixed_path = Path(fixed_query_split)
+        fixed_payload = json.loads(fixed_path.read_text())
+        fixed_split_ids = {
+            role: {str(value) for value in fixed_payload.get(role, [])}
+            for role in ("train", "validation", "test")
+        }
+        if any(not values for values in fixed_split_ids.values()):
+            raise ValueError("fixed query split requires non-empty train/validation/test sets")
+        if (
+            fixed_split_ids["train"] & fixed_split_ids["validation"]
+            or fixed_split_ids["train"] & fixed_split_ids["test"]
+            or fixed_split_ids["validation"] & fixed_split_ids["test"]
+        ):
+            raise ValueError("fixed query split sets overlap")
+        fixed_split_sha256 = _sha256(fixed_path)
     split_ids: dict[str, list[str]] = {"train": [], "validation": [], "test": []}
     sequence_summary: dict[str, object] = {}
     selected_record_by_id: dict[str, object] = {}
@@ -197,14 +220,80 @@ def build_stratified_landmark_retrieval_split(
                 f"sequence {sequence!r} has {len(eligible)} eligible images, "
                 f"but {total_per_sequence} are required"
             )
-        selected_positions = _quantile_positions(len(eligible), total_per_sequence, phase=0.5)
-        selected = [eligible[position] for position in selected_positions]
         per_split: dict[str, list[str]] = {"train": [], "validation": [], "test": []}
-        for label, (_, record) in zip(labels, selected):
-            image_id = str(record.image_id)
-            split_ids[label].append(image_id)
-            per_split[label].append(image_id)
-            selected_record_by_id[image_id] = record
+        if fixed_split_ids is None:
+            selected_positions = _quantile_positions(len(eligible), total_per_sequence, phase=0.5)
+            selected = [eligible[position] for position in selected_positions]
+            for label, (_, record) in zip(labels, selected):
+                image_id = str(record.image_id)
+                split_ids[label].append(image_id)
+                per_split[label].append(image_id)
+                selected_record_by_id[image_id] = record
+        else:
+            eligible_by_id = {str(record.image_id): (int(frame), record) for frame, record in eligible}
+            fixed_for_sequence = {
+                role: {
+                    image_id
+                    for image_id in fixed_split_ids[role]
+                    if _sequence_and_frame(image_id)[0] == sequence
+                }
+                for role in ("train", "validation", "test")
+            }
+            if len(fixed_for_sequence["validation"]) != int(validation_per_sequence):
+                raise ValueError(
+                    f"fixed split sequence {sequence!r} has "
+                    f"{len(fixed_for_sequence['validation'])} validation images, "
+                    f"expected {int(validation_per_sequence)}"
+                )
+            if len(fixed_for_sequence["test"]) != int(test_per_sequence):
+                raise ValueError(
+                    f"fixed split sequence {sequence!r} has {len(fixed_for_sequence['test'])} "
+                    f"test images, expected {int(test_per_sequence)}"
+                )
+            if len(fixed_for_sequence["train"]) > int(train_per_sequence):
+                raise ValueError(
+                    f"fixed split sequence {sequence!r} already has more train images than requested"
+                )
+            fixed_for_sequence_all = set().union(*fixed_for_sequence.values())
+            missing_fixed = sorted(fixed_for_sequence_all - set(eligible_by_id))
+            if missing_fixed:
+                raise ValueError(
+                    f"fixed split images are not eligible in sequence {sequence!r}: {missing_fixed[:10]!r}"
+                )
+            selected_train = set(fixed_for_sequence["train"])
+            candidates = [
+                (frame, record)
+                for frame, record in eligible
+                if str(record.image_id) not in fixed_for_sequence_all
+            ]
+            while len(selected_train) < int(train_per_sequence):
+                if not candidates:
+                    raise ValueError(f"sequence {sequence!r} has too few candidates to extend train split")
+                selected_frames = [eligible_by_id[image_id][0] for image_id in selected_train]
+                if selected_frames:
+                    chosen_index = max(
+                        range(len(candidates)),
+                        key=lambda index: (
+                            min(abs(int(candidates[index][0]) - frame) for frame in selected_frames),
+                            -int(candidates[index][0]),
+                            str(candidates[index][1].image_id),
+                        ),
+                    )
+                else:
+                    chosen_index = int(len(candidates) // 2)
+                _frame, chosen_record = candidates.pop(int(chosen_index))
+                selected_train.add(str(chosen_record.image_id))
+            for role, values in (
+                ("train", selected_train),
+                ("validation", fixed_for_sequence["validation"]),
+                ("test", fixed_for_sequence["test"]),
+            ):
+                ordered = sorted(values, key=lambda image_id: _sequence_and_frame(image_id)[1])
+                per_split[role].extend(ordered)
+                split_ids[role].extend(ordered)
+                for image_id in ordered:
+                    selected_record_by_id[image_id] = eligible_by_id[image_id][1]
+            selected = [eligible_by_id[image_id] for role in ("train", "validation", "test") for image_id in per_split[role]]
         sequence_summary[sequence] = {
             "eligible_image_count": int(len(eligible)),
             "selected_image_count": int(len(selected)),
@@ -219,6 +308,14 @@ def build_stratified_landmark_retrieval_split(
     heldout_set = set(heldout_ids)
     if len(heldout_set) != len(heldout_ids):
         raise RuntimeError("query split contains duplicate image ids")
+    if fixed_split_ids is not None:
+        fixed_all = set().union(*fixed_split_ids.values())
+        missing_fixed = sorted(fixed_all - heldout_set)
+        if missing_fixed:
+            raise ValueError(
+                "fixed split contains images outside the selected sequences or eligible scope: "
+                f"{missing_fixed[:10]!r}"
+            )
     query_manifest = TokenBankManifest(records=tuple(selected_record_by_id[value] for value in heldout_ids))
     support_manifest = TokenBankManifest(
         records=tuple(record for record in manifest.records if str(record.image_id) not in heldout_set)
@@ -230,7 +327,11 @@ def build_stratified_landmark_retrieval_split(
 
     split_payload: dict[str, object] = {
         "format": SPLIT_FORMAT,
-        "strategy": SPLIT_STRATEGY,
+        "strategy": (
+            SPLIT_STRATEGY
+            if fixed_split_ids is None
+            else FIXED_HOLDOUT_SPLIT_STRATEGY
+        ),
         "train": split_ids["train"],
         "validation": split_ids["validation"],
         "test": split_ids["test"],
@@ -240,6 +341,7 @@ def build_stratified_landmark_retrieval_split(
             "query_images_excluded_from_support_observations": True,
             "split_sets_are_disjoint": True,
             "temporal_coverage_per_sequence": True,
+            "fixed_validation_test_preserved": bool(fixed_split_ids is not None),
         },
         "inputs": {
             "token_manifest": str(source_tokens),
@@ -247,6 +349,8 @@ def build_stratified_landmark_retrieval_split(
             "track_observations_jsonl": str(source_tracks),
             "track_observations_sha256": source_track_sha256,
             "track_observation_index": "" if track_observation_index is None else str(track_observation_index),
+            "fixed_query_split": "" if fixed_query_split is None else str(fixed_query_split),
+            "fixed_query_split_sha256": str(fixed_split_sha256),
         },
         "selection": {
             "sequences": list(selected_sequences),
@@ -255,8 +359,23 @@ def build_stratified_landmark_retrieval_split(
             "test_per_sequence": int(test_per_sequence),
             "min_query_observations": int(min_query_observations),
             "image_sampling": "temporal_quantile_centers",
+            "eligible_query_scope": (
+                "all_token_manifest_images"
+                if eligible_query_ids is None
+                else "explicit_referenced_query_images"
+            ),
+            "eligible_query_count": (
+                int(len(manifest.records))
+                if eligible_query_ids is None
+                else int(len(eligible_query_ids))
+            ),
             "validation_positions": "temporal_bin_centers",
             "test_positions": "staggered_temporal_quantiles_phase_1p0",
+            "fixed_holdout_policy": (
+                "none"
+                if fixed_split_ids is None
+                else "preserve_validation_test_and_extend_train_by_temporal_farthest_point"
+            ),
         },
     }
     _write_json(Path(output_query_split_json), split_payload)
@@ -290,7 +409,11 @@ def build_stratified_landmark_retrieval_split(
     return {
         "stage": "stratified_landmark_retrieval_split",
         "format": SPLIT_FORMAT,
-        "split_strategy": SPLIT_STRATEGY,
+        "split_strategy": (
+            SPLIT_STRATEGY
+            if fixed_split_ids is None
+            else FIXED_HOLDOUT_SPLIT_STRATEGY
+        ),
         "query_count": int(len(heldout_ids)),
         "support_image_count": int(len(support_manifest.records)),
         "input_observation_count": int(input_count),
@@ -322,6 +445,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--track_observations_jsonl", required=True)
     parser.add_argument("--track_observation_index", default="")
     parser.add_argument("--token_manifest", required=True)
+    parser.add_argument(
+        "--query_referenced_manifest",
+        default="",
+        help="Optional referenced manifest restricting which mapping images may be selected as held-out queries.",
+    )
+    parser.add_argument(
+        "--fixed_query_split",
+        default="",
+        help="Optional prior split whose validation/test sets and existing train queries are preserved.",
+    )
     parser.add_argument("--output_support_observations_jsonl", required=True)
     parser.add_argument("--output_query_token_manifest", required=True)
     parser.add_argument("--output_support_token_manifest", required=True)
@@ -337,6 +470,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = parse_args(argv)
+    eligible_query_ids = None
+    if str(args.query_referenced_manifest):
+        referenced = json.loads(Path(args.query_referenced_manifest).read_text())
+        eligible_query_ids = {
+            str(record.get("query_id", ""))
+            for record in referenced.get("records", [])
+            if str(record.get("query_id", ""))
+        }
+        if not eligible_query_ids:
+            raise ValueError("query referenced manifest contains no query ids")
     summary = build_stratified_landmark_retrieval_split(
         track_observations_jsonl=Path(args.track_observations_jsonl),
         track_observation_index=(Path(args.track_observation_index) if args.track_observation_index else None),
@@ -350,6 +493,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         validation_per_sequence=int(args.validation_per_sequence),
         test_per_sequence=int(args.test_per_sequence),
         min_query_observations=int(args.min_query_observations),
+        eligible_query_ids=eligible_query_ids,
+        fixed_query_split=(Path(args.fixed_query_split) if str(args.fixed_query_split) else None),
     )
     _write_json(Path(args.summary_json), summary)
     print(json.dumps(summary, indent=2, sort_keys=True))

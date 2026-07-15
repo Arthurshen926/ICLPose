@@ -82,12 +82,131 @@ def test_train_real_radio_joint_localization_cli_defaults_to_full_joint_training
     assert not hasattr(args, "sample_cache")
     assert not hasattr(args, "render_cache_manifest_csv")
     assert args.landmark_episode_support_pairs == 0
+    assert args.validation_landmark_episodes_per_query == 0
+    assert args.validation_selection_metric == "total_loss"
+    assert args.internal_query_disjoint_split == ""
     assert args.landmark_prototype_aggregation_method == "mean"
     assert args.landmark_l2_normalize_observations is False
     assert args.landmark_normalize_final_prototypes is True
+    assert args.landmark_positive_prototype_source == "episode_support_observations"
     assert args.landmark_frozen_negative_bank == ""
     assert args.landmark_frozen_bank_support_observations == ""
+    assert args.landmark_memory_candidate_pool_size == 0
+    assert args.landmark_memory_negative_merge_policy == "source_balanced_round_robin"
+    assert args.landmark_exclude_known_cell_positives_from_memory is True
+    assert args.landmark_system_hard_negative_margin == pytest.approx(0.05)
+    assert args.landmark_system_hard_negative_margin_weight == pytest.approx(0.0)
     assert train_real_radio_joint_localization._requires_rgb_training(args) is True
+
+
+def test_train_real_radio_joint_localization_accepts_retrieval_validation_selection() -> None:
+    args = train_real_radio_joint_localization.parse_args(
+        [
+            "--joint_cache",
+            "train.npz",
+            "--output_model",
+            "adapter.pt",
+            "--output_joint_model",
+            "joint.pt",
+            "--summary_json",
+            "summary.json",
+            "--validation_selection_metric",
+            "landmark_retrieval_loss",
+        ]
+    )
+
+    config = train_real_radio_joint_localization._build_config(args, _full_joint_set())
+    assert config.validation_selection_metric == "landmark_retrieval_loss"
+
+
+def test_internal_query_disjoint_contract_checks_train_validation_and_support(
+    tmp_path: Path,
+) -> None:
+    split = tmp_path / "split.json"
+    split.write_text(
+        json.dumps({"train": ["d"], "validation": ["v"], "test": ["t"]})
+    )
+    split_hash = train_real_radio_joint_localization.file_sha256_short(split)
+    common = {
+        "internal_query_disjoint_filter": {"query_split_sha256": split_hash}
+    }
+    train = tmp_path / "train.json"
+    train.write_text(
+        json.dumps(
+            {
+                **common,
+                "records": [{"query_id": "q", "reference_image_id": "s"}],
+            }
+        )
+    )
+    validation = tmp_path / "validation.json"
+    validation.write_text(
+        json.dumps(
+            {
+                **common,
+                "records": [{"query_id": "v", "reference_image_id": "s"}],
+            }
+        )
+    )
+
+    audit = train_real_radio_joint_localization.validate_internal_query_disjoint_contract(
+        train_manifest_path=train,
+        validation_manifest_path=validation,
+        query_split_path=split,
+        allowed_support_image_ids={"q", "s"},
+    )
+    assert audit["validated"] is True
+    assert audit["query_support_disjoint"] is True
+
+    with pytest.raises(ValueError, match="episode support"):
+        train_real_radio_joint_localization.validate_internal_query_disjoint_contract(
+            train_manifest_path=train,
+            validation_manifest_path=validation,
+            query_split_path=split,
+            allowed_support_image_ids={"q", "s", "t"},
+        )
+
+
+def test_internal_query_disjoint_contract_allows_explicit_train_split_queries(
+    tmp_path: Path,
+) -> None:
+    split = tmp_path / "split.json"
+    split.write_text(
+        json.dumps({"train": ["d"], "validation": ["v"], "test": ["t"]})
+    )
+    split_hash = train_real_radio_joint_localization.file_sha256_short(split)
+    common = {
+        "internal_query_disjoint_filter": {"query_split_sha256": split_hash}
+    }
+    train = tmp_path / "train.json"
+    train.write_text(
+        json.dumps(
+            {
+                **common,
+                "records": [{"query_id": "d", "reference_image_id": "s"}],
+            }
+        )
+    )
+    validation = tmp_path / "validation.json"
+    validation.write_text(
+        json.dumps(
+            {
+                **common,
+                "records": [{"query_id": "v", "reference_image_id": "s"}],
+            }
+        )
+    )
+
+    audit = train_real_radio_joint_localization.validate_internal_query_disjoint_contract(
+        train_manifest_path=train,
+        validation_manifest_path=validation,
+        query_split_path=split,
+        allowed_support_image_ids={"s"},
+        train_queries_are_heldout=True,
+    )
+
+    assert audit["training_query_mode"] == "query_disjoint_train_split"
+    assert audit["training_query_count"] == 1
 
 
 def test_retrieval_only_training_does_not_require_rgb() -> None:
@@ -288,6 +407,95 @@ def test_frozen_landmark_bank_contract_rejects_stale_support_split(tmp_path: Pat
             warm_start_checkpoint=checkpoint,
             support_observations=stale_support,
             expected_source_image_count=3,
+        )
+
+
+def test_frozen_landmark_bank_contract_validates_source_image_sets(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "joint.pt"
+    checkpoint.write_text("checkpoint")
+    observations = tmp_path / "support.jsonl"
+    observations.write_text("support\n")
+    token_path = tmp_path / "token.npz"
+    np.savez(token_path, radio_final=np.ones((4, 2, 2), dtype=np.float32))
+
+    def record(image_id: str) -> dict[str, object]:
+        return {
+            "image_id": image_id,
+            "token_path": str(token_path),
+            "layers": [
+                {
+                    "name": "radio_final",
+                    "model": "C-RADIO",
+                    "layer": "final",
+                    "channels": 4,
+                    "stride": 16,
+                }
+            ],
+            "split": "train",
+            "scene": "scene",
+        }
+
+    source_manifest = tmp_path / "source_manifest.json"
+    source_manifest.write_text(
+        json.dumps(
+            {
+                "records": [
+                    record("map-a.png"),
+                    record("map-b.png"),
+                    record("extra-negative.png"),
+                ]
+            }
+        )
+    )
+    from feature_extract.vfm.artifacts import file_sha256_short
+
+    metadata = {
+        "descriptor_space_id": "space",
+        "descriptor_space_manifest": {
+            "version": 2,
+            "projection_source": "projected_observation_full_map",
+        },
+        "track_observations_sha256": file_sha256_short(observations),
+        "matcha_joint_checkpoint_sha256": file_sha256_short(checkpoint),
+        "source_image_count": 3,
+        "token_manifest": str(source_manifest),
+        "token_manifest_sha256": file_sha256_short(source_manifest),
+    }
+    bank = tmp_path / "bank.npz"
+    np.savez(
+        bank,
+        track_ids=np.asarray([1], dtype=np.int64),
+        features=np.ones((1, 4), dtype=np.float32),
+        metadata_json=np.asarray(json.dumps(metadata)),
+    )
+
+    audit = train_real_radio_joint_localization.validate_frozen_landmark_bank_contract(
+        bank,
+        warm_start_checkpoint=checkpoint,
+        support_observations=observations,
+        required_source_image_ids={"map-a.png", "map-b.png"},
+        forbidden_source_image_ids={"query.png"},
+    )
+
+    assert audit["source_image_set_validated"] is True
+    assert audit["required_source_image_count"] == 2
+    with pytest.raises(ValueError, match="held-out query images"):
+        train_real_radio_joint_localization.validate_frozen_landmark_bank_contract(
+            bank,
+            warm_start_checkpoint=checkpoint,
+            support_observations=observations,
+            required_source_image_ids={"map-a.png"},
+            forbidden_source_image_ids={"extra-negative.png"},
+        )
+    with pytest.raises(ValueError, match="missing required mapping support images"):
+        train_real_radio_joint_localization.validate_frozen_landmark_bank_contract(
+            bank,
+            warm_start_checkpoint=checkpoint,
+            support_observations=observations,
+            required_source_image_ids={"missing.png"},
+            forbidden_source_image_ids=set(),
         )
 
 
@@ -538,6 +746,8 @@ def test_train_real_radio_joint_localization_main_uses_referenced_lazy_provider(
             "2",
             "--provider_progress_interval_steps",
             "25",
+            "--provider_fixed_audit_interval_steps",
+            "10",
             "--device",
             "cpu",
         ]
@@ -556,6 +766,7 @@ def test_train_real_radio_joint_localization_main_uses_referenced_lazy_provider(
     assert captured["train_kwargs"]["provider_gradient_accumulation_pairs"] == 4
     assert captured["train_kwargs"]["provider_pair_batch_size"] == 2
     assert captured["train_kwargs"]["provider_progress_interval_steps"] == 25
+    assert captured["train_kwargs"]["provider_fixed_audit_interval_steps"] == 10
     assert captured["adapter_path"] == tmp_path / "adapter.pt"
     assert captured["joint_path"] == tmp_path / "joint.pt"
     summary = json.loads(summary_json.read_text())

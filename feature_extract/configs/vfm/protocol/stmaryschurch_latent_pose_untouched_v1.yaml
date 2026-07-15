@@ -1,0 +1,39 @@
+protocol_id: stmaryschurch_latent_pose_untouched_v1
+dataset_family: CambridgeLandmarks
+scene: StMarysChurch
+role: untouched_test
+query_count: 530
+
+policy:
+  development_scenes: [OldHospital]
+  method_selection_allowed: false
+  threshold_selection_allowed: false
+  checkpoint_selection_allowed: false
+  aggregation_selection_allowed: false
+  inspect_pose_metrics_before_freeze: false
+  evaluate_once_after_development_freeze: true
+  rerun_only_for_bit_exact_reproduction_or_declared_bugfix: true
+
+inputs:
+  image_root: /hy-tmp/Cambridge_stdloc/StMarysChurch
+  query_list:
+    path: /hy-tmp/Cambridge_stdloc/CambridgeLandmarks_Colmap_Retriangulated_1024px/StMarysChurch/list_query.txt
+    sha256: 4ca05f24e988f835f2208f455431725ff077dd9c76e879b1168a9b089d5cad82
+  ground_truth_poses_DO_NOT_READ_DURING_DEVELOPMENT:
+    path: /hy-tmp/Cambridge_stdloc/StMarysChurch/dataset_test.txt
+    sha256: 5dc0b9aa1aadeb9bccbd4f789a040cc20a32bcf743895f5943b0a7269475d3c4
+  colmap_model:
+    root: /hy-tmp/Cambridge_stdloc/CambridgeLandmarks_Colmap_Retriangulated_1024px/StMarysChurch/model_train
+    cameras_bin_sha256: 398cac4fcdde00f844510dbb5cc9d7afaafcc12d9fcb3a7bbbe1d6b94680f7fe
+    images_bin_sha256: 52df371eb3eaf5c39000b6a42f977ff7163a6c52f4d3dc3fa09ea2c966c142f3
+    points3D_bin_sha256: fbe8598d803faa5cbabf223f72730045436570756b65c9b2a0ad38c8b9263b60
+
+required_frozen_development_artifacts:
+  - mapper_checkpoint_sha256
+  - descriptor_space_id
+  - projected_observation_bank_builder_config
+  - aggregation_method
+  - proposal_builder_config
+  - candidate_model_checkpoint_sha256
+  - pose_solver_config
+  - promotion_thresholds

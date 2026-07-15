@@ -92,6 +92,96 @@ def _write_render_cache(path: Path, *, size: tuple[int, int]) -> None:
     np.savez(path, rgb=rgb.astype(np.float32), depth=np.ones((height, width), dtype=np.float32))
 
 
+def test_unwarped_real_pair_crops_once_per_unique_image_owner(
+    tmp_path: Path, monkeypatch
+) -> None:
+    image_root = tmp_path / "images"
+    image_root.mkdir()
+    for image_id in ("q0.png", "q1.png", "support.png"):
+        _write_query_image(image_root / image_id, size=(16, 16))
+    rows = [
+        {
+            "query_id": query_id,
+            "support_image_id": "support.png",
+            "center_x": center_x,
+            "center_y": "8.0",
+            "query_gt_x": str(float(center_x) + 0.5),
+            "query_gt_y": "8.0",
+            "support_x": "8.0",
+            "support_y": "8.0",
+        }
+        for query_id, center_x in (("q0.png", "7.0"), ("q0.png", "8.0"), ("q1.png", "9.0"))
+    ]
+    real_crop = rgb_patch_training.crop_rgb_windows_by_owner
+    call_count = 0
+
+    def counted_crop(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return real_crop(*args, **kwargs)
+
+    monkeypatch.setattr(
+        rgb_patch_training, "crop_rgb_windows_by_owner", counted_crop
+    )
+    query_patch, support_patch, target, baseline, dustbin = (
+        rgb_patch_training._stack_patch_batch(
+            rows,
+            image_root=image_root,
+            render_cache_by_query={},
+            image_width=16,
+            image_height=16,
+            crop_radius_px=2.0,
+            step_px=1.0,
+            query_cache={},
+            render_cache={},
+            query_source="real_pair",
+            support_patch_warp="none",
+        )
+    )
+
+    # Query owners share one batched crop call; support owners use a second call.
+    assert call_count == 2
+    assert query_patch.shape == support_patch.shape == (3, 3, 5, 5)
+    expected_query = []
+    expected_support = []
+    for row in rows:
+        query_image = rgb_patch_training._load_query_rgb(
+            image_root / str(row["query_id"])
+        ).unsqueeze(0)
+        support_image = rgb_patch_training._load_query_rgb(
+            image_root / str(row["support_image_id"])
+        ).unsqueeze(0)
+        query_crop, _ = rgb_patch_training.crop_rgb_window(
+            query_image,
+            torch.tensor(
+                [[float(row["center_x"]), float(row["center_y"])]],
+                dtype=torch.float32,
+            ),
+            radius_px=2.0,
+            step_px=1.0,
+            image_width=16,
+            image_height=16,
+        )
+        support_crop, _ = rgb_patch_training.crop_rgb_window(
+            support_image,
+            torch.tensor(
+                [[float(row["support_x"]), float(row["support_y"])]],
+                dtype=torch.float32,
+            ),
+            radius_px=2.0,
+            step_px=1.0,
+            image_width=16,
+            image_height=16,
+        )
+        expected_query.append(query_crop[0])
+        expected_support.append(support_crop[0])
+    torch.testing.assert_close(query_patch, torch.stack(expected_query))
+    torch.testing.assert_close(support_patch, torch.stack(expected_support))
+    np.testing.assert_allclose(target.numpy(), np.asarray([[0.5, 0.0]] * 3))
+    np.testing.assert_allclose(baseline.numpy(), np.asarray([0.5] * 3))
+    assert dustbin is None
+
+
 def test_rgb_patch_training_supports_different_query_and_render_sizes(tmp_path: Path) -> None:
     image_root = tmp_path / "images"
     image_root.mkdir()
@@ -146,6 +236,8 @@ def test_rgb_patch_training_supports_different_query_and_render_sizes(tmp_path: 
         step_px=1.0,
         steps=1,
         batch_size=1,
+        gradient_accumulation_steps=2,
+        use_amp=True,
         feature_dim=4,
         hidden_dim=8,
         input_mode="rgb",
@@ -159,6 +251,9 @@ def test_rgb_patch_training_supports_different_query_and_render_sizes(tmp_path: 
     assert summary["query_image_width"] == 16
     assert summary["query_image_height"] == 16
     assert summary["render_image_width"] == 8
+    assert summary["gradient_accumulation_steps"] == 2
+    assert summary["effective_batch_size"] == 2
+    assert summary["use_amp"] is False
     assert summary["gate_target_mode"] == "utility"
     assert summary["gate_utility_temperature_px"] == 0.5
     assert summary["render_image_height"] == 8

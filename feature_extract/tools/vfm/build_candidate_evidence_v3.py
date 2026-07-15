@@ -25,6 +25,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--support_geometry_index", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--score_prefix", default="ensemble")
+    parser.add_argument("--candidate_score_key", default="")
+    parser.add_argument("--dustbin_score_key", default="")
     parser.add_argument("--candidates_per_token", type=int, default=5)
     return parser.parse_args(argv)
 
@@ -43,6 +45,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         support_geometry_index_path=Path(args.support_geometry_index),
         output_path=Path(args.output),
         score_prefix=str(args.score_prefix),
+        candidate_score_key=(
+            None if not str(args.candidate_score_key) else str(args.candidate_score_key)
+        ),
+        dustbin_score_key=(
+            None if not str(args.dustbin_score_key) else str(args.dustbin_score_key)
+        ),
         candidates_per_token=int(args.candidates_per_token),
     )
     print(json.dumps(summary, indent=2, sort_keys=True))

@@ -99,6 +99,16 @@ def _build_track_supervision_groups(
                 visible=True,
                 geometry_valid=True,
                 utility=float(obs.utility),
+                camera_center=(
+                    None
+                    if obs.camera_center is None
+                    else np.asarray(obs.camera_center, dtype=np.float64).reshape(3)
+                ),
+                viewing_ray=(
+                    None
+                    if obs.viewing_ray is None
+                    else np.asarray(obs.viewing_ray, dtype=np.float64).reshape(3)
+                ),
             )
         )
 

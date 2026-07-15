@@ -1,0 +1,47 @@
+[
+  {
+    "name": "ap3p_raw_beta1_h64",
+    "hypotheses_per_limit": 64,
+    "minimal_set_sizes": [4],
+    "candidate_probability_power": 1.0,
+    "candidate_uniform_mix": 0.0,
+    "local_optimization": false,
+    "use_spatial_modes": false
+  },
+  {
+    "name": "ap3p_explore_u25_h64",
+    "hypotheses_per_limit": 64,
+    "minimal_set_sizes": [4],
+    "candidate_probability_power": 1.0,
+    "candidate_uniform_mix": 0.25,
+    "local_optimization": false,
+    "use_spatial_modes": false
+  },
+  {
+    "name": "ap3p_explore_u50_h64",
+    "hypotheses_per_limit": 64,
+    "minimal_set_sizes": [4],
+    "candidate_probability_power": 1.0,
+    "candidate_uniform_mix": 0.5,
+    "local_optimization": false,
+    "use_spatial_modes": false
+  },
+  {
+    "name": "ap3p_local_beta1_h16",
+    "hypotheses_per_limit": 16,
+    "minimal_set_sizes": [4],
+    "candidate_probability_power": 1.0,
+    "candidate_uniform_mix": 0.0,
+    "local_optimization": true,
+    "use_spatial_modes": false
+  },
+  {
+    "name": "m456_rgb_beta1_h48",
+    "hypotheses_per_limit": 48,
+    "minimal_set_sizes": [4, 5, 6],
+    "candidate_probability_power": 1.0,
+    "candidate_uniform_mix": 0.0,
+    "local_optimization": false,
+    "use_spatial_modes": true
+  }
+]

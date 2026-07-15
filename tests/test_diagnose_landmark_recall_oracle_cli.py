@@ -5,7 +5,13 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from feature_extract.tools.vfm.diagnose_landmark_recall_oracle import _sample_observation_descriptor, main, parse_args
+from feature_extract.tools.vfm.diagnose_landmark_recall_oracle import (
+    _sample_observation_descriptor,
+    _select_query_records,
+    main,
+    parse_args,
+)
+from feature_extract.vfm.tokens import TokenBankManifest, TokenBankRecord
 
 
 def test_diagnose_landmark_recall_oracle_cli_parse_args() -> None:
@@ -36,6 +42,43 @@ def test_diagnose_landmark_recall_oracle_cli_parse_args() -> None:
     assert args.projection_preset == "joint_query_to_projected_observation_landmark"
     assert args.top_ks == "1,5,10,50"
     assert args.max_queries == 20
+
+
+def test_select_query_records_uses_explicit_split_order(tmp_path) -> None:
+    manifest = TokenBankManifest(
+        records=(
+            TokenBankRecord(image_id="q0", token_path="q0.npz", layers=(), split="train", scene="s"),
+            TokenBankRecord(image_id="q1", token_path="q1.npz", layers=(), split="train", scene="s"),
+            TokenBankRecord(image_id="q2", token_path="q2.npz", layers=(), split="train", scene="s"),
+        )
+    )
+    split_path = tmp_path / "split.json"
+    split_path.write_text('{"train": ["q2", "q0"], "validation": [], "test": []}')
+
+    records, contract = _select_query_records(
+        manifest,
+        query_split_json=split_path,
+        query_split_name="train",
+    )
+
+    assert [record.image_id for record in records] == ["q2", "q0"]
+    assert contract["mode"] == "explicit_query_split"
+    assert contract["query_count"] == 2
+
+
+def test_select_query_records_rejects_missing_split_id(tmp_path) -> None:
+    manifest = TokenBankManifest(
+        records=(TokenBankRecord(image_id="q0", token_path="q0.npz", layers=(), split="train", scene="s"),)
+    )
+    split_path = tmp_path / "split.json"
+    split_path.write_text('{"train": ["missing"], "validation": [], "test": []}')
+
+    with pytest.raises(ValueError, match="missing from query manifest"):
+        _select_query_records(
+            manifest,
+            query_split_json=split_path,
+            query_split_name="train",
+        )
 
 
 def test_diagnose_landmark_recall_oracle_cli_accepts_raw_projection_preset() -> None:

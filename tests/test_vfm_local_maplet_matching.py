@@ -3,6 +3,8 @@ import numpy as np
 from feature_extract.vfm.local_maplet_matching import (
     ContextualLandmarkMatchingConfig,
     LocalMapletBank,
+    LocalMapletSupportIndex,
+    build_disjoint_maplet_cluster_ids,
     build_covisibility_maplets,
     build_hybrid_maplet_support_index,
     build_knn_maplets,
@@ -45,6 +47,43 @@ def _toy_index() -> LandmarkMapIndex:
         ),
         reprojection_errors=np.asarray([0.2, 0.3, 0.2, 0.3], dtype=np.float32),
     )
+
+
+def test_disjoint_maplet_clusters_are_deterministic_and_nonoverlapping() -> None:
+    bank = LocalMapletBank(
+        neighbor_indices=np.asarray(
+            [[1, -1], [0, -1], [3, -1], [2, -1]], dtype=np.int64
+        ),
+        context_features=np.eye(4, dtype=np.float32),
+        neighbor_counts=np.asarray([1, 1, 1, 1]),
+        context_radius=np.ones((4,), dtype=np.float32),
+        context_feature_variance=np.ones((4,), dtype=np.float32),
+        covisibility_strength=np.asarray([1.0, 3.0, 2.0, 1.0], dtype=np.float32),
+        xyz_cov_eigvals=np.ones((4, 3), dtype=np.float32),
+        neighbor_idf_mean=np.ones((4,), dtype=np.float32),
+        maplet_type="toy",
+        maplet_k=2,
+    )
+    support = LocalMapletSupportIndex(
+        maplets=bank,
+        anchor_track_ids=np.asarray([10, 11, 12, 13], dtype=np.int64),
+        neighbor_track_ids=np.asarray(
+            [[11, -1], [10, -1], [13, -1], [12, -1]], dtype=np.int64
+        ),
+        support_image_ids=(),
+        support_image_indices=np.full((4, 1), -1, dtype=np.int64),
+        support_coverage_counts=np.zeros((4, 1), dtype=np.int64),
+        candidate_k=2,
+    )
+
+    first = build_disjoint_maplet_cluster_ids(support)
+    second = build_disjoint_maplet_cluster_ids(support)
+
+    np.testing.assert_array_equal(first, second)
+    assert np.all(first >= 0)
+    assert first[0] == first[1]
+    assert first[2] == first[3]
+    assert first[1] != first[2]
 
 
 def test_knn_maplets_use_nearby_3d_landmarks_as_context() -> None:

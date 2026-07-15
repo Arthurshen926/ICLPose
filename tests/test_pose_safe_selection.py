@@ -3,7 +3,9 @@ from __future__ import annotations
 import numpy as np
 
 from feature_extract.vfm.localization.pose_safe_selection import (
+    candidate_admission_utility_scores,
     global_assignment_score_matrix,
+    paired_pose_safety_report,
     resolve_global_query_track_assignment,
     select_pose_safe_matches,
     stable_uniform_ransac_order,
@@ -147,6 +149,42 @@ def test_global_assignment_uses_an_independent_dustbin_per_query() -> None:
     assert selected.tolist() == [0, -1, -1]
 
 
+def test_candidate_admission_bonus_changes_utility_not_posterior() -> None:
+    posterior_log_odds = np.asarray(
+        [[-1.0, -np.inf], [0.25, -0.5]], dtype=np.float32
+    )
+    frozen = posterior_log_odds.copy()
+
+    utility = candidate_admission_utility_scores(
+        posterior_log_odds, admission_log_bonus=2.0
+    )
+
+    np.testing.assert_array_equal(posterior_log_odds, frozen)
+    np.testing.assert_allclose(utility[np.isfinite(utility)], [1.0, 2.25, 1.5])
+    assert np.isneginf(utility[0, 1])
+
+
+def test_paired_pose_safety_rejects_hidden_catastrophic_tail() -> None:
+    baseline = [
+        {"query_id": "a", "success": True, "translation_m": 0.40},
+        {"query_id": "b", "success": True, "translation_m": 0.20},
+        {"query_id": "c", "success": True, "translation_m": 0.10},
+    ]
+    candidate = [
+        {"query_id": "a", "success": True, "translation_m": 1.20},
+        {"query_id": "b", "success": True, "translation_m": 0.05},
+        {"query_id": "c", "success": True, "translation_m": 0.04},
+    ]
+
+    report = paired_pose_safety_report(candidate, baseline)
+
+    assert report["passes"] is False
+    assert report["win_count"] == 2
+    assert report["loss_count"] == 1
+    assert report["new_catastrophic_count"] == 1
+    assert np.isclose(report["max_translation_regression_m"], 0.8)
+
+
 def test_global_assignment_score_matrix_resolves_each_image_separately() -> None:
     tracks = np.asarray([[10], [10], [10], [10]], dtype=np.int64)
     scores = np.asarray([[0.9], [0.8], [0.7], [0.6]], dtype=np.float32)
@@ -158,3 +196,17 @@ def test_global_assignment_score_matrix_resolves_each_image_separately() -> None
 
     assert selected.tolist() == [0, -1, 0, -1]
     assert np.isfinite(resolved[:, 0]).tolist() == [True, False, True, False]
+
+
+def test_global_assignment_score_matrix_uses_row_specific_learned_dustbins() -> None:
+    tracks = np.asarray([[10], [20], [30], [40]], dtype=np.int64)
+    scores = np.full((4, 1), 0.8, dtype=np.float32)
+    resolved, selected = global_assignment_score_matrix(
+        tracks,
+        scores,
+        ["a", "a", "b", "b"],
+        dustbin_score=np.asarray([0.9, 0.1, 0.9, 0.1], dtype=np.float32),
+    )
+
+    assert selected.tolist() == [-1, 0, -1, 0]
+    assert np.isfinite(resolved[:, 0]).tolist() == [False, True, False, True]

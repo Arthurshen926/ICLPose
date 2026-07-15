@@ -358,6 +358,56 @@ def test_sfm_observation_index_builds_scaled_common_track_supervision(tmp_path: 
     np.testing.assert_allclose(common["reference_xy"], [[479.75, 269.75]], atol=1e-6)
     np.testing.assert_allclose(common["track_xyz"], [[1.0, 2.0, 3.0]])
 
+    offsets, track_ids = index.query_cell_positive_csr(
+        "q.png",
+        np.asarray([[959.5, 539.5], [187.6, 187.7]], dtype=np.float64),
+        target_size=(1920, 1080),
+        grid_hw=(68, 120),
+    )
+    assert offsets.tolist() == [0, 1, 2]
+    assert track_ids.tolist() == [7, 8]
+
+
+def test_sfm_observation_index_strict_radius_crosses_coarse_cell_boundary(tmp_path: Path) -> None:
+    observations = tmp_path / "tracks.jsonl"
+    rows = [
+        {
+            "image_id": "q.png",
+            "track_id": track_id,
+            "xy": xy,
+            "image_width": 100,
+            "image_height": 100,
+            "xyz": [float(track_id), 0.0, 1.0],
+            "track_length": 2,
+            "reprojection_error": 0.1,
+        }
+        for track_id, xy in (
+            (1, [14.2, 20.0]),
+            (2, [14.4, 20.0]),
+            (3, [16.4, 20.0]),
+        )
+    ]
+    observations.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+    index = build_real_radio_joint_cache.load_track_observation_index(observations)
+
+    cell_offsets, cell_tracks = index.query_cell_positive_csr(
+        "q.png",
+        np.asarray([[14.2, 20.0]], dtype=np.float64),
+        target_size=(100, 100),
+        grid_hw=(7, 7),
+    )
+    strict_offsets, strict_tracks = index.query_radius_positive_csr(
+        "q.png",
+        np.asarray([[14.2, 20.0]], dtype=np.float64),
+        target_size=(100, 100),
+        radius_px=2.0,
+    )
+
+    assert cell_offsets.tolist() == [0, 1]
+    assert cell_tracks.tolist() == [1]
+    assert strict_offsets.tolist() == [0, 2]
+    assert strict_tracks.tolist() == [1, 2]
+
 
 def test_sfm_track_observation_index_cache_roundtrip_and_stale_rejection(tmp_path: Path) -> None:
     observations = tmp_path / "tracks.jsonl"

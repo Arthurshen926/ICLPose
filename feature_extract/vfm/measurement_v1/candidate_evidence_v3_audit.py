@@ -208,7 +208,11 @@ def build_and_audit_candidate_evidence_v3(
     likelihood, likelihood_metadata = _load_npz(Path(spatial_likelihood_path))
     if evidence_metadata.get("format") != "candidate_evidence_v3":
         raise ValueError("unsupported candidate evidence artifact")
-    if likelihood_metadata.get("format") != "candidate_spatial_likelihood_v3":
+    if likelihood_metadata.get("format") not in {
+        "candidate_spatial_likelihood_v3",
+        "candidate_spatial_likelihood_v4",
+        "candidate_spatial_likelihood_v5",
+    }:
         raise ValueError("unsupported candidate spatial likelihood artifact")
     if str(split_name) not in {"train", "validation", "test"}:
         raise ValueError("split_name must be train, validation, or test")

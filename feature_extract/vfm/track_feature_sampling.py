@@ -274,6 +274,16 @@ def sample_token_track_observations(
                         weight_floor=weight_floor,
                         view_consistency_weight=view_weight,
                     ),
+                    camera_center=(
+                        None
+                        if obs.camera_center is None
+                        else np.asarray(obs.camera_center, dtype=np.float64).reshape(3)
+                    ),
+                    viewing_ray=(
+                        None
+                        if obs.viewing_ray is None
+                        else np.asarray(obs.viewing_ray, dtype=np.float64).reshape(3)
+                    ),
                 )
             )
     return sampled
@@ -374,6 +384,24 @@ def save_sampled_track_observations_npz(
         utilities = np.asarray([float(obs.utility) for obs in obs_list], dtype=np.float32)
         visible = np.asarray([bool(obs.visible) for obs in obs_list], dtype=bool)
         geometry_valid = np.asarray([bool(obs.geometry_valid) for obs in obs_list], dtype=bool)
+        camera_centers = np.stack(
+            [
+                np.full((3,), np.nan, dtype=np.float64)
+                if obs.camera_center is None
+                else np.asarray(obs.camera_center, dtype=np.float64).reshape(3)
+                for obs in obs_list
+            ],
+            axis=0,
+        )
+        viewing_rays = np.stack(
+            [
+                np.full((3,), np.nan, dtype=np.float64)
+                if obs.viewing_ray is None
+                else np.asarray(obs.viewing_ray, dtype=np.float64).reshape(3)
+                for obs in obs_list
+            ],
+            axis=0,
+        )
         feature_dim = int(features.shape[1])
     else:
         features = np.zeros((0, 0), dtype=np.float32)
@@ -382,6 +410,8 @@ def save_sampled_track_observations_npz(
         utilities = np.zeros((0,), dtype=np.float32)
         visible = np.zeros((0,), dtype=bool)
         geometry_valid = np.zeros((0,), dtype=bool)
+        camera_centers = np.zeros((0, 3), dtype=np.float64)
+        viewing_rays = np.zeros((0, 3), dtype=np.float64)
         feature_dim = 0
     payload = {
         "format": _SAMPLED_TRACK_OBSERVATION_CACHE_FORMAT,
@@ -398,6 +428,8 @@ def save_sampled_track_observations_npz(
         utilities=utilities,
         visible=visible,
         geometry_valid=geometry_valid,
+        camera_centers=camera_centers,
+        viewing_rays=viewing_rays,
     )
 
 
@@ -417,6 +449,16 @@ def load_sampled_track_observations_npz(path: Path) -> tuple[list[TrackObservati
         utilities = data["utilities"].astype(np.float32)
         visible = data["visible"].astype(bool)
         geometry_valid = data["geometry_valid"].astype(bool)
+        camera_centers = (
+            data["camera_centers"].astype(np.float64)
+            if "camera_centers" in data
+            else np.full((len(track_ids), 3), np.nan, dtype=np.float64)
+        )
+        viewing_rays = (
+            data["viewing_rays"].astype(np.float64)
+            if "viewing_rays" in data
+            else np.full((len(track_ids), 3), np.nan, dtype=np.float64)
+        )
     if features.shape[0] != track_ids.shape[0]:
         raise ValueError("sampled observation cache has inconsistent feature and track counts")
     observations = [
@@ -427,6 +469,16 @@ def load_sampled_track_observations_npz(path: Path) -> tuple[list[TrackObservati
             visible=bool(visible[idx]),
             geometry_valid=bool(geometry_valid[idx]),
             utility=float(utilities[idx]),
+            camera_center=(
+                camera_centers[idx].copy()
+                if np.all(np.isfinite(camera_centers[idx]))
+                else None
+            ),
+            viewing_ray=(
+                viewing_rays[idx].copy()
+                if np.all(np.isfinite(viewing_rays[idx]))
+                else None
+            ),
         )
         for idx in range(track_ids.shape[0])
     ]

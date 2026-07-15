@@ -6,6 +6,65 @@ import torch
 from torch import nn
 
 
+class ExplicitCandidateRelationBlock(nn.Module):
+    """Aggregate sparse candidate-pair messages with explicit geometry factors."""
+
+    def __init__(self, model_dim: int, relation_dim: int) -> None:
+        super().__init__()
+        if min(int(model_dim), int(relation_dim)) <= 0:
+            raise ValueError("relation block dimensions must be positive")
+        self.relation_dim = int(relation_dim)
+        self.relation_encoder = nn.Sequential(
+            nn.Linear(int(relation_dim), int(model_dim)),
+            nn.GELU(),
+            nn.Linear(int(model_dim), int(model_dim)),
+        )
+        self.neighbor_value = nn.Linear(int(model_dim), int(model_dim))
+        self.edge_gate = nn.Sequential(
+            nn.Linear(2 * int(model_dim) + int(relation_dim), int(model_dim)),
+            nn.GELU(),
+            nn.Linear(int(model_dim), 1),
+        )
+        self.output = nn.Linear(int(model_dim), int(model_dim))
+        self.norm = nn.LayerNorm(int(model_dim))
+
+    def forward(
+        self,
+        candidate_nodes: torch.Tensor,
+        neighbor_indices: torch.Tensor,
+        relation_features: torch.Tensor,
+    ) -> torch.Tensor:
+        if candidate_nodes.ndim != 4:
+            raise ValueError("candidate nodes must have shape (B, Q, L, D)")
+        batch, query_count, candidate_count, feature_dim = candidate_nodes.shape
+        if neighbor_indices.shape[:3] != (batch, query_count, candidate_count):
+            raise ValueError("relation neighbor indices are not aligned")
+        if relation_features.shape != (
+            *neighbor_indices.shape,
+            self.relation_dim,
+        ):
+            raise ValueError("explicit relation features are not aligned")
+        flat = candidate_nodes.reshape(batch, query_count * candidate_count, feature_dim)
+        gather = neighbor_indices.reshape(batch, -1, 1).expand(-1, -1, feature_dim)
+        neighbors = torch.gather(flat, 1, gather).reshape(
+            batch,
+            query_count,
+            candidate_count,
+            neighbor_indices.shape[3],
+            feature_dim,
+        )
+        source = candidate_nodes.unsqueeze(3).expand_as(neighbors)
+        gate = self.edge_gate(
+            torch.cat([source, neighbors, relation_features], dim=4)
+        )[:, :, :, :, 0]
+        weights = torch.softmax(gate.float(), dim=3).to(dtype=gate.dtype)
+        messages = self.neighbor_value(neighbors) + self.relation_encoder(
+            relation_features
+        )
+        aggregate = torch.sum(messages * weights.unsqueeze(4), dim=3)
+        return self.norm(candidate_nodes + self.output(aggregate))
+
+
 class WholeImageCandidateGraph(nn.Module):
     """Refine candidate/null logits using query and 3D-neighborhood context."""
 
@@ -17,6 +76,7 @@ class WholeImageCandidateGraph(nn.Module):
         heads: int = 4,
         layers: int = 2,
         dropout: float = 0.1,
+        relation_dim: int = 0,
     ) -> None:
         super().__init__()
         if int(input_dim) <= 0 or int(model_dim) % int(heads) != 0:
@@ -30,6 +90,11 @@ class WholeImageCandidateGraph(nn.Module):
             int(model_dim), int(heads), dropout=float(dropout), batch_first=True
         )
         self.candidate_norm = nn.LayerNorm(int(model_dim))
+        self.relation_block = (
+            ExplicitCandidateRelationBlock(int(model_dim), int(relation_dim))
+            if int(relation_dim) > 0
+            else None
+        )
         self.query_position = nn.Sequential(
             nn.Linear(2, int(model_dim)), nn.GELU(), nn.Linear(int(model_dim), int(model_dim))
         )
@@ -63,6 +128,7 @@ class WholeImageCandidateGraph(nn.Module):
         neighbor_indices: torch.Tensor,
         candidate_prior_probability: torch.Tensor,
         null_prior_probability: torch.Tensor,
+        relation_features: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if candidate_features.ndim != 4:
             raise ValueError("candidate_features must have shape (B, Q, L, F)")
@@ -82,6 +148,12 @@ class WholeImageCandidateGraph(nn.Module):
         within = self.candidate_norm(within + attended).reshape(
             batch, query_count, candidate_count, -1
         )
+        if self.relation_block is not None:
+            if relation_features is None:
+                raise ValueError("explicit relation graph requires relation features")
+            within = self.relation_block(within, neighbor_indices, relation_features)
+        elif relation_features is not None:
+            raise ValueError("relation features were provided to a relation-free graph")
         weights = candidate_prior_probability / candidate_prior_probability.sum(
             dim=2, keepdim=True
         ).clamp_min(1e-8)
@@ -131,6 +203,7 @@ class WholeImageLatentCandidateGraph(nn.Module):
         heads: int = 4,
         layers: int = 2,
         dropout: float = 0.1,
+        relation_dim: int = 0,
     ) -> None:
         super().__init__()
         if min(int(latent_dim), int(scalar_dim)) <= 0:
@@ -150,6 +223,11 @@ class WholeImageLatentCandidateGraph(nn.Module):
             int(model_dim), int(heads), dropout=float(dropout), batch_first=True
         )
         self.candidate_norm = nn.LayerNorm(int(model_dim))
+        self.relation_block = (
+            ExplicitCandidateRelationBlock(int(model_dim), int(relation_dim))
+            if int(relation_dim) > 0
+            else None
+        )
         self.query_position = nn.Sequential(
             nn.Linear(2, int(model_dim)),
             nn.GELU(),
@@ -189,6 +267,7 @@ class WholeImageLatentCandidateGraph(nn.Module):
         neighbor_indices: torch.Tensor,
         candidate_prior_probability: torch.Tensor,
         null_prior_probability: torch.Tensor,
+        relation_features: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if candidate_view_latents.ndim != 5:
             raise ValueError("candidate_view_latents must have shape (B, Q, L, V, D)")
@@ -241,6 +320,14 @@ class WholeImageLatentCandidateGraph(nn.Module):
         candidate_context = self.candidate_norm(within + attended_candidates).reshape_as(
             candidate_nodes
         )
+        if self.relation_block is not None:
+            if relation_features is None:
+                raise ValueError("explicit relation graph requires relation features")
+            candidate_context = self.relation_block(
+                candidate_context, neighbor_indices, relation_features
+            )
+        elif relation_features is not None:
+            raise ValueError("relation features were provided to a relation-free graph")
         candidate_weights = candidate_prior_probability / candidate_prior_probability.sum(
             dim=2, keepdim=True
         ).clamp_min(1e-8)
@@ -304,3 +391,58 @@ def set_identity_nll(
         torch.any(positive_mask.bool(), dim=2), positive_numerator, null_logits
     )
     return torch.mean(denominator - numerator)
+
+
+def system_hard_negative_margin_loss(
+    candidate_logits: torch.Tensor,
+    positive_mask: torch.Tensor,
+    candidate_prior_probability: torch.Tensor,
+    *,
+    margin: float = 0.2,
+    hard_negative_k: int = 3,
+    preserve_weight: float = 1.0,
+) -> torch.Tensor:
+    """Rescue prior errors without freely breaking already-correct identities."""
+
+    if (
+        candidate_logits.shape != positive_mask.shape
+        or candidate_logits.shape != candidate_prior_probability.shape
+    ):
+        raise ValueError("hard-negative tensors must be aligned")
+    if int(hard_negative_k) <= 0:
+        raise ValueError("hard_negative_k must be positive")
+    if float(preserve_weight) < 0.0:
+        raise ValueError("hard-negative preserve weight must be non-negative")
+    candidate_count = int(candidate_logits.shape[2])
+    if candidate_count < 2:
+        return candidate_logits.sum() * 0.0
+    positives = positive_mask.bool()
+    available = torch.any(positives, dim=2)
+    prior_top1 = torch.argmax(candidate_prior_probability, dim=2, keepdim=True)
+    prior_top1_correct = torch.gather(positives, 2, prior_top1)[:, :, 0]
+    rescue = available & ~prior_top1_correct
+    preserve = available & prior_top1_correct
+    if not bool(torch.any(rescue | preserve)):
+        return candidate_logits.sum() * 0.0
+
+    negative_prior = candidate_prior_probability.masked_fill(positives, -1.0)
+    k = min(int(hard_negative_k), candidate_count - 1)
+    hard_indices = torch.topk(negative_prior, k=k, dim=2).indices
+    hard_logits = torch.gather(candidate_logits, 2, hard_indices)
+    negative_score = torch.amax(hard_logits, dim=2)
+    positive_score = torch.logsumexp(
+        candidate_logits.masked_fill(~positives, -1e4), dim=2
+    )
+    losses = torch.nn.functional.softplus(
+        negative_score + float(margin) - positive_score
+    )
+    rescue_sum = torch.sum(losses[rescue])
+    preserve_sum = torch.sum(losses[preserve])
+    denominator = (
+        torch.count_nonzero(rescue).to(dtype=losses.dtype)
+        + float(preserve_weight)
+        * torch.count_nonzero(preserve).to(dtype=losses.dtype)
+    )
+    return (
+        rescue_sum + float(preserve_weight) * preserve_sum
+    ) / denominator.clamp_min(1.0)

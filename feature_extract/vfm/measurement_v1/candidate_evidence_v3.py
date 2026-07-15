@@ -188,6 +188,8 @@ def build_candidate_evidence_v3(
     support_geometry_index_path: Path,
     output_path: Path,
     score_prefix: str = "ensemble",
+    candidate_score_key: str | None = None,
+    dustbin_score_key: str | None = None,
     candidates_per_token: int = 5,
 ) -> dict[str, object]:
     """Create a top-M identity posterior with an explicit unknown state."""
@@ -222,8 +224,16 @@ def build_candidate_evidence_v3(
     _require_arrays(landmark_arrays, ("track_ids", "features"), artifact="landmark bank")
 
     prefix = str(score_prefix)
-    candidate_key = f"{prefix}__set_candidate_probability"
-    dustbin_key = f"{prefix}__set_dustbin_probability_DIAGNOSTIC_ONLY"
+    candidate_key = (
+        f"{prefix}__set_candidate_probability"
+        if candidate_score_key is None
+        else str(candidate_score_key)
+    )
+    dustbin_key = (
+        f"{prefix}__set_dustbin_probability_DIAGNOSTIC_ONLY"
+        if dustbin_score_key is None
+        else str(dustbin_score_key)
+    )
     geometry_keys = tuple(
         f"{prefix}__geometry_p{threshold:02d}px" for threshold in (1, 2, 5)
     )
@@ -239,11 +249,16 @@ def build_candidate_evidence_v3(
     )
     _require_arrays(
         scores,
-        (candidate_key, dustbin_key, *geometry_keys, *support_keys),
+        (candidate_key, dustbin_key, *support_keys),
         artifact="score artifact",
     )
     if not support_keys:
         raise ValueError("score artifact has no support-view probabilities")
+    available_geometry_keys = tuple(key for key in geometry_keys if key in scores)
+    if available_geometry_keys and available_geometry_keys != geometry_keys:
+        raise ValueError(
+            "score artifact must provide every geometry threshold or none of them"
+        )
 
     actual_hashes = {
         "proposals_sha256": file_sha256_short(Path(proposals_path)),
@@ -362,13 +377,17 @@ def build_candidate_evidence_v3(
         output[~selected_valid] = fill
         return output
 
-    geometry = np.stack(
-        [
-            _take(np.asarray(scores[key]), selected_columns, fill=np.nan)
-            for key in geometry_keys
-        ],
-        axis=2,
-    ).astype(np.float32)
+    geometry = (
+        np.stack(
+            [
+                _take(np.asarray(scores[key]), selected_columns, fill=np.nan)
+                for key in available_geometry_keys
+            ],
+            axis=2,
+        ).astype(np.float32)
+        if available_geometry_keys
+        else np.full((*selected_columns.shape, 3), np.nan, dtype=np.float32)
+    )
     support = np.stack(
         [
             _take(np.asarray(scores[key]), selected_columns, fill=np.nan)
@@ -423,15 +442,25 @@ def build_candidate_evidence_v3(
         }
         for item in score_summary.get("checkpoints", [])
     ]
+    candidate_probability_semantics = (
+        "factorized_top_l_availability_times_conditional_identity"
+        if "factorized" in candidate_key
+        else "joint_softmax_with_set_dustbin"
+    )
     metadata = {
         "format": CANDIDATE_EVIDENCE_V3_FORMAT,
         "format_version": 3,
         "selection_strategy": "pose_free_set_identity_probability_descending",
-        "candidate_probability_semantics": "joint_softmax_with_set_dustbin",
+        "candidate_probability_semantics": candidate_probability_semantics,
         "unknown_probability_semantics": "set_dustbin_plus_omitted_top_l_mass",
         "candidate_score_key": candidate_key,
         "dustbin_score_key": dustbin_key,
-        "geometry_probability_keys": list(geometry_keys),
+        "geometry_probability_keys": list(available_geometry_keys),
+        "geometry_probability_semantics": (
+            "nested_true_residual_event_probabilities"
+            if available_geometry_keys
+            else "unavailable_unknown_nan"
+        ),
         "support_view_probability_keys": list(support_keys),
         "candidates_per_token": int(candidates_per_token),
         "source_candidate_top_l": int(candidate_probabilities.shape[1]),

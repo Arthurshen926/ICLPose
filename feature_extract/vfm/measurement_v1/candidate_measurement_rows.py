@@ -33,6 +33,9 @@ from feature_extract.vfm.measurement_v1.candidate_measurement_selection import (
 from feature_extract.vfm.measurement_v1.real_real_tracks import (
     REAL_REAL_MEASUREMENT_FIELDNAMES,
 )
+from feature_extract.vfm.measurement_v1.rgb_data_contract import (
+    coordinate_space_contract,
+)
 from feature_extract.vfm.render_pose_diagnostics import project_world_to_image
 
 
@@ -231,6 +234,11 @@ def build_candidate_measurement_rows(
     }
     images = read_colmap_images_binary(Path(colmap_model_dir) / "images.bin")
     cameras = read_colmap_cameras_binary(Path(colmap_model_dir) / "cameras.bin")
+    coordinate_space = coordinate_space_contract(
+        cameras,
+        colmap_model_dir=Path(colmap_model_dir),
+        cameras_sha256=expected_hashes["colmap_cameras_sha256"],
+    )
     images_by_name = {str(image.image_name): image for image in images.values()}
 
     query_ids = np.asarray(arrays["query_ids"]).astype(str)
@@ -579,9 +587,11 @@ def build_candidate_measurement_rows(
         "search_radius_px": float(search_radius_px),
         "context_radius_px": float(context_radius_px),
         "support_views_per_candidate": int(support_views_per_candidate),
+        "coordinate_space": coordinate_space,
         "inputs": {
             "selection_artifact": str(selection_artifact),
             "selection_artifact_sha256": file_sha256_short(Path(selection_artifact)),
+            "colmap_model_dir": str(Path(colmap_model_dir).resolve()),
             **expected_hashes,
             "colmap_images_sha256": file_sha256_short(
                 Path(colmap_model_dir) / "images.bin"

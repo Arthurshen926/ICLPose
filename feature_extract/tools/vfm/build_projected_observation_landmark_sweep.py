@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 from typing import Sequence
 
+import numpy as np
 import torch
 
 from feature_extract.tools.vfm.build_projected_observation_landmark_bank import (
@@ -45,6 +46,7 @@ REPRESENTATIONS = (
     "medoid",
     "descriptor_kmeans_2",
 )
+PROTOTYPE_VIEW_GEOMETRY_FORMAT = "landmark_prototype_view_geometry_v1"
 
 
 def parse_csv(value: str) -> tuple[str, ...]:
@@ -145,7 +147,16 @@ def main(argv: Sequence[str] | None = None) -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     output_paths = {name: output_dir / f"projected_observations_{name}.npz" for name in representations}
-    existing = [str(path) for path in output_paths.values() if path.exists()]
+    sidecar_paths = {
+        name: output_dir / f"projected_observations_{name}.view_geometry.npz"
+        for name in representations
+        if name.startswith("descriptor_kmeans_")
+    }
+    existing = [
+        str(path)
+        for path in (*output_paths.values(), *sidecar_paths.values())
+        if path.exists()
+    ]
     if existing and not bool(args.force):
         raise FileExistsError(f"refusing to overwrite existing landmark banks: {existing!r}")
 
@@ -243,6 +254,44 @@ def main(argv: Sequence[str] | None = None) -> None:
             maplet_bank_version="none",
             observation_selection=TRACK_IMAGE_OBSERVATION_SELECTION_V1,
         )
+        view_geometry_path = sidecar_paths.get(name)
+        view_geometry_sha256 = None
+        view_geometry_valid_fraction = None
+        if clustering is not None:
+            if view_geometry_path is None:
+                raise RuntimeError("multi-prototype representation has no view sidecar path")
+            view_arrays = bank.view_geometry_arrays()
+            if not np.array_equal(view_arrays["track_ids"], index.track_ids):
+                raise RuntimeError("prototype view sidecar track rows differ from index")
+            if not np.array_equal(
+                view_arrays["prototype_ids"], index.prototype_ids
+            ):
+                raise RuntimeError("prototype view sidecar IDs differ from index")
+            view_metadata = {
+                "format": PROTOTYPE_VIEW_GEOMETRY_FORMAT,
+                "row_count": int(len(index)),
+                "descriptor_space_id": str(space_manifest["descriptor_space_id"]),
+                "ray_convention": "camera_to_landmark_world",
+                "cluster_assignment": str(clustering.method),
+                "view_geometry_semantics": (
+                    "mean observation ray and p90 angular radius inside each "
+                    "descriptor prototype cluster"
+                ),
+                "projected_landmark_bank": str(output_paths[name]),
+                "matcha_joint_checkpoint_sha256": checkpoint_sha256,
+                "track_observations_sha256": track_sha256,
+            }
+            np.savez_compressed(
+                view_geometry_path,
+                **view_arrays,
+                metadata_json=np.asarray(
+                    json.dumps(view_metadata, sort_keys=True), dtype=np.str_
+                ),
+            )
+            view_geometry_sha256 = file_sha256_short(view_geometry_path)
+            view_geometry_valid_fraction = float(
+                np.mean(view_arrays["view_geometry_valid"])
+            ) if len(index) else 0.0
         metadata = {
             **sampling_metadata,
             "aggregation": aggregation.to_dict(),
@@ -278,6 +327,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             "projection_seconds_shared": projection_seconds,
             "representation_build_seconds": build_seconds,
             "device": device,
+            "prototype_view_geometry": (
+                None if view_geometry_path is None else str(view_geometry_path)
+            ),
+            "prototype_view_geometry_sha256": view_geometry_sha256,
+            "prototype_view_geometry_valid_fraction": view_geometry_valid_fraction,
         }
         output_path = output_paths[name]
         save_landmark_index_npz(index, output_path, metadata=metadata)
@@ -286,6 +340,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             "representation": str(name),
             "output_index": str(output_path),
             "metadata": metadata,
+            "prototype_view_geometry": (
+                None if view_geometry_path is None else str(view_geometry_path)
+            ),
         }
         summary_path = output_dir / f"projected_observations_{name}.summary.json"
         summary_path.write_text(json.dumps(representation_summary, indent=2, sort_keys=True) + "\n")

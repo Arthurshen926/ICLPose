@@ -34,6 +34,13 @@ class CandidateMapletMatcherConfig:
     geometry_validity_enabled: bool = False
     decoupled_candidate_heads: bool = False
     candidate_view_marginalization_enabled: bool = False
+    identity_conditioned_view_posterior_enabled: bool = False
+    full_candidate_view_mixture_enabled: bool = False
+    explicit_anchor_role_embedding: bool = False
+    prior_free_set_identity_enabled: bool = False
+    deployable_identity_context_enabled: bool = False
+    deployable_identity_static_start_index: int = 0
+    factorized_set_posterior_enabled: bool = False
     geometry_validity_thresholds_px: tuple[float, ...] = (1.0, 2.0, 5.0)
     rescue_policy_enabled: bool = False
     rescue_candidate_threshold_px: float = 5.0
@@ -101,17 +108,40 @@ class CandidateMapletMatcherConfig:
             raise ValueError(
                 "rescue thresholds must be positive and candidate <= baseline-invalid"
             )
-        if bool(self.decoupled_candidate_heads) and not bool(
-            self.geometry_validity_enabled
-        ):
-            raise ValueError(
-                "decoupled_candidate_heads requires geometry validity supervision"
-            )
         if bool(self.candidate_view_marginalization_enabled) and not bool(
             self.decoupled_candidate_heads
         ):
             raise ValueError(
                 "candidate view marginalization requires decoupled candidate heads"
+            )
+        if bool(self.full_candidate_view_mixture_enabled) and not bool(
+            self.candidate_view_marginalization_enabled
+        ):
+            raise ValueError(
+                "full candidate view mixture requires view marginalization"
+            )
+        if bool(self.identity_conditioned_view_posterior_enabled) and not bool(
+            self.candidate_view_marginalization_enabled
+        ):
+            raise ValueError(
+                "identity-conditioned view posterior requires view marginalization"
+            )
+        if bool(self.full_candidate_view_mixture_enabled) and not bool(
+            self.identity_conditioned_view_posterior_enabled
+        ):
+            raise ValueError(
+                "full candidate view mixture requires an identity-conditioned view posterior"
+            )
+        if bool(self.deployable_identity_context_enabled) and not bool(
+            self.prior_free_set_identity_enabled
+        ):
+            raise ValueError(
+                "deployable identity context requires prior-free set identity"
+            )
+        context_start = int(self.deployable_identity_static_start_index)
+        if context_start < 0 or context_start > int(self.static_input_dim):
+            raise ValueError(
+                "deployable identity static start is outside static input features"
             )
 
     def to_dict(self) -> dict[str, object]:
@@ -400,6 +430,18 @@ class CandidateMapletMatcher(nn.Module):
 
         self.query_encoder = encoder(int(config.query_input_dim))
         self.support_encoder = encoder(int(config.support_input_dim))
+        if bool(config.explicit_anchor_role_embedding):
+            self.query_anchor_role: nn.Parameter | None = nn.Parameter(
+                torch.empty((dim,), dtype=torch.float32)
+            )
+            self.support_anchor_role: nn.Parameter | None = nn.Parameter(
+                torch.empty((dim,), dtype=torch.float32)
+            )
+            nn.init.normal_(self.query_anchor_role, mean=0.0, std=0.02)
+            nn.init.normal_(self.support_anchor_role, mean=0.0, std=0.02)
+        else:
+            self.query_anchor_role = None
+            self.support_anchor_role = None
         self.context_blocks = nn.ModuleList(
             [
                 _CrossContextBlock(dim, int(config.num_heads), float(config.dropout))
@@ -424,6 +466,25 @@ class CandidateMapletMatcher(nn.Module):
             nn.Linear(dim * 2, dim),
             nn.GELU(),
         )
+        deployable_identity_context_dim = (
+            int(config.static_input_dim)
+            - int(config.deployable_identity_static_start_index)
+            + 4
+            if bool(config.deployable_identity_context_enabled)
+            else 0
+        )
+        self.prior_free_set_identity_encoder: nn.Sequential | None = (
+            nn.Sequential(
+                nn.Linear(dim * 4 + deployable_identity_context_dim, dim * 2),
+                nn.LayerNorm(dim * 2),
+                nn.GELU(),
+                nn.Dropout(float(config.dropout)),
+                nn.Linear(dim * 2, dim),
+                nn.GELU(),
+            )
+            if bool(config.prior_free_set_identity_enabled)
+            else None
+        )
         self.raw_candidate_head = nn.Linear(dim, 1)
         self.support_view_head = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, 1))
         self.candidate_set_blocks = nn.ModuleList(
@@ -431,6 +492,14 @@ class CandidateMapletMatcher(nn.Module):
                 _CandidateSetBlock(dim, int(config.num_heads), float(config.dropout))
                 for _ in range(int(config.candidate_set_layers))
             ]
+        )
+        self.candidate_view_set_blocks = nn.ModuleList(
+            [
+                _CandidateSetBlock(dim, int(config.num_heads), float(config.dropout))
+                for _ in range(int(config.candidate_set_layers))
+            ]
+            if bool(config.full_candidate_view_mixture_enabled)
+            else []
         )
         self.set_candidate_head = nn.Linear(dim, 1)
         if bool(config.candidate_view_marginalization_enabled):
@@ -451,6 +520,16 @@ class CandidateMapletMatcher(nn.Module):
             nn.LayerNorm(dim),
             nn.GELU(),
             nn.Linear(dim, 1),
+        )
+        self.set_top_l_availability_head: nn.Sequential | None = (
+            nn.Sequential(
+                nn.Linear(dim * 2 + 8, dim),
+                nn.LayerNorm(dim),
+                nn.GELU(),
+                nn.Linear(dim, 1),
+            )
+            if bool(config.factorized_set_posterior_enabled)
+            else None
         )
         if bool(config.geometry_validity_enabled):
             self.geometry_logit_gap_head: nn.Linear | None = nn.Linear(dim, 2)
@@ -561,6 +640,7 @@ class CandidateMapletMatcher(nn.Module):
         for block in self.candidate_set_blocks:
             contextual = block(contextual, valid)
         logits = self.set_candidate_head(contextual)[:, :, 0]
+        candidate_evidence_logits = logits.masked_fill(~valid, -1e4)
         if candidate_prior_scores is not None:
             prior = candidate_prior_scores.to(dtype=logits.dtype)
             if prior.shape != logits.shape:
@@ -585,8 +665,16 @@ class CandidateMapletMatcher(nn.Module):
         output = {
             "candidate_logits": logits,
             "dustbin_logits": dustbin_logits,
+            "candidate_evidence_logits": candidate_evidence_logits,
             "candidate_embeddings": contextual,
         }
+        if self.set_top_l_availability_head is not None:
+            output["top_l_availability_logits"] = self._set_top_l_availability_logits(
+                contextual,
+                valid,
+                candidate_evidence_logits,
+                candidate_prior_scores,
+            )
         if self.rescue_candidate_head is not None:
             if self.rescue_keep_head is None or candidate_prior_scores is None:
                 raise RuntimeError(
@@ -648,6 +736,73 @@ class CandidateMapletMatcher(nn.Module):
             output["candidate_visibility_logits"] = visibility_logits
         return output
 
+    @staticmethod
+    def _masked_set_statistics(
+        values: torch.Tensor, valid: torch.Tensor
+    ) -> torch.Tensor:
+        if values.ndim != 2 or valid.shape != values.shape:
+            raise ValueError("set statistics require aligned (G, L) tensors")
+        if torch.any(torch.sum(valid, dim=1) <= 0):
+            raise ValueError("set statistics require at least one valid candidate")
+        weights = valid.to(dtype=values.dtype)
+        count = torch.sum(weights, dim=1).clamp_min(1.0)
+        safe = torch.where(valid, values, torch.zeros_like(values))
+        mean = torch.sum(safe, dim=1) / count
+        variance = torch.sum(
+            torch.square(safe - mean[:, None]) * weights, dim=1
+        ) / count
+        maximum = values.masked_fill(~valid, -1e4).amax(dim=1)
+        top2 = torch.topk(
+            values.masked_fill(~valid, -1e4),
+            k=min(2, int(values.shape[1])),
+            dim=1,
+        ).values
+        gap = (
+            top2[:, 0] - top2[:, 1]
+            if int(top2.shape[1]) == 2
+            else torch.zeros_like(top2[:, 0])
+        )
+        gap = torch.where(torch.sum(valid, dim=1) >= 2, gap, torch.zeros_like(gap))
+        return torch.stack([mean, torch.sqrt(variance.clamp_min(0.0)), maximum, gap], dim=1)
+
+    def _set_top_l_availability_logits(
+        self,
+        contextual: torch.Tensor,
+        valid: torch.Tensor,
+        evidence_logits: torch.Tensor,
+        candidate_prior_scores: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if self.set_top_l_availability_head is None:
+            raise RuntimeError("factorized set posterior is not enabled")
+        if candidate_prior_scores is None:
+            raise ValueError(
+                "factorized top-L availability requires absolute candidate prior scores"
+            )
+        prior = candidate_prior_scores.to(dtype=contextual.dtype)
+        if prior.shape != valid.shape or evidence_logits.shape != valid.shape:
+            raise ValueError("top-L availability inputs are not aligned with the candidate set")
+        if not torch.all(torch.isfinite(prior[valid])) or not torch.all(
+            torch.isfinite(evidence_logits[valid])
+        ):
+            raise ValueError("valid top-L availability inputs must be finite")
+        weights = valid.to(dtype=contextual.dtype)
+        mean_pool = torch.sum(contextual * weights.unsqueeze(2), dim=1) / torch.sum(
+            weights, dim=1, keepdim=True
+        ).clamp_min(1.0)
+        max_pool = contextual.masked_fill(~valid.unsqueeze(2), -1e4).amax(dim=1)
+        statistics = torch.cat(
+            [
+                self._masked_set_statistics(prior, valid),
+                self._masked_set_statistics(
+                    evidence_logits.to(dtype=contextual.dtype), valid
+                ),
+            ],
+            dim=1,
+        )
+        return self.set_top_l_availability_head(
+            torch.cat([mean_pool, max_pool, statistics], dim=1)
+        )[:, 0]
+
     def resolve_candidate_view_sets(
         self,
         candidate_view_embeddings: torch.Tensor,
@@ -687,24 +842,6 @@ class CandidateMapletMatcher(nn.Module):
         view_weights = view_weights / view_weights.sum(dim=2, keepdim=True).clamp_min(
             1e-8
         )
-        marginal = torch.sum(
-            candidate_view_embeddings * view_weights.unsqueeze(3), dim=2
-        )
-        output = self.resolve_candidate_sets(
-            marginal,
-            candidate_mask=candidate_mask,
-            candidate_prior_scores=candidate_prior_scores,
-        )
-        contextual = output["candidate_embeddings"]
-        view_contextual = self.candidate_view_norm(
-            candidate_view_embeddings
-            + self.candidate_view_context(contextual).unsqueeze(2)
-        )
-        view_residual = self.candidate_view_head(view_contextual)[:, :, :, 0]
-        view_residual = view_residual.masked_fill(~view_valid, -1e4)
-        candidate_residual = self.set_candidate_head(contextual)[:, :, 0] + torch.logsumexp(
-            torch.log(view_weights.clamp_min(1e-8)) + view_residual, dim=2
-        )
         valid = (
             torch.ones(
                 (group_count, candidate_count),
@@ -714,6 +851,72 @@ class CandidateMapletMatcher(nn.Module):
             if candidate_mask is None
             else candidate_mask.bool()
         )
+        if valid.shape != (group_count, candidate_count):
+            raise ValueError("candidate mask is not aligned")
+        joint_view_valid = view_valid & valid.unsqueeze(2)
+        if bool(self.config.full_candidate_view_mixture_enabled):
+            flat_views = candidate_view_embeddings.reshape(
+                group_count, candidate_count * view_count, -1
+            )
+            flat_valid = joint_view_valid.reshape(
+                group_count, candidate_count * view_count
+            )
+            contextual_views = flat_views
+            for block in self.candidate_view_set_blocks:
+                contextual_views = block(contextual_views, flat_valid)
+            contextual_views = contextual_views.reshape_as(
+                candidate_view_embeddings
+            )
+            view_contextual = self.candidate_view_norm(
+                contextual_views + self.candidate_view_context(contextual_views)
+            )
+            marginal = torch.sum(
+                view_contextual * view_weights.unsqueeze(3), dim=2
+            )
+            output = self.resolve_candidate_sets(
+                marginal,
+                candidate_mask=valid,
+                candidate_prior_scores=candidate_prior_scores,
+            )
+            view_base = self.set_candidate_head(view_contextual)[:, :, :, 0]
+        else:
+            marginal = torch.sum(
+                candidate_view_embeddings * view_weights.unsqueeze(3), dim=2
+            )
+            output = self.resolve_candidate_sets(
+                marginal,
+                candidate_mask=valid,
+                candidate_prior_scores=candidate_prior_scores,
+            )
+            contextual = output["candidate_embeddings"]
+            view_contextual = self.candidate_view_norm(
+                candidate_view_embeddings
+                + self.candidate_view_context(contextual).unsqueeze(2)
+            )
+            view_base = self.set_candidate_head(contextual)[:, :, 0].unsqueeze(2)
+        view_residual = self.candidate_view_head(view_contextual)[:, :, :, 0]
+        view_log_likelihood = (view_base + view_residual).masked_fill(
+            ~joint_view_valid, -1e4
+        )
+        view_joint_logits = (
+            torch.log(view_weights.clamp_min(1e-8)) + view_log_likelihood
+        ).masked_fill(~joint_view_valid, -1e4)
+        candidate_residual = torch.logsumexp(view_joint_logits, dim=2)
+        identity_conditioned_view_probabilities = torch.softmax(
+            view_joint_logits.float(), dim=2
+        ).to(dtype=view_joint_logits.dtype)
+        identity_conditioned_view_probabilities = torch.where(
+            joint_view_valid,
+            identity_conditioned_view_probabilities,
+            torch.zeros_like(identity_conditioned_view_probabilities),
+        )
+        identity_conditioned_view_probabilities = (
+            identity_conditioned_view_probabilities
+            / identity_conditioned_view_probabilities.sum(dim=2, keepdim=True).clamp_min(
+                1e-8
+            )
+        )
+        candidate_evidence_logits = candidate_residual.masked_fill(~valid, -1e4)
         if candidate_prior_scores is not None:
             prior = candidate_prior_scores.to(dtype=candidate_residual.dtype)
             if prior.shape != candidate_residual.shape:
@@ -729,16 +932,47 @@ class CandidateMapletMatcher(nn.Module):
                 prior - prior_center
             )
         output["candidate_logits"] = candidate_residual.masked_fill(~valid, -1e4)
-        output["candidate_view_logits"] = view_residual
-        output["support_view_probabilities"] = view_weights
+        output["candidate_evidence_logits"] = candidate_evidence_logits
+        if self.set_top_l_availability_head is not None:
+            contextual = output.get("candidate_embeddings")
+            if not isinstance(contextual, torch.Tensor):
+                raise TypeError("candidate-set output is missing contextual embeddings")
+            output["top_l_availability_logits"] = self._set_top_l_availability_logits(
+                contextual,
+                valid,
+                candidate_evidence_logits,
+                candidate_prior_scores,
+            )
+        output["candidate_view_logits"] = view_log_likelihood
+        output["support_view_prior_probabilities"] = view_weights
+        output["identity_conditioned_support_view_probabilities"] = (
+            identity_conditioned_view_probabilities
+        )
+        output["support_view_probabilities"] = (
+            identity_conditioned_view_probabilities
+            if bool(self.config.identity_conditioned_view_posterior_enabled)
+            else view_weights
+        )
         return output
 
-    def forward(self, batch: CandidateMapletBatch) -> dict[str, object]:
+    def forward(
+        self,
+        batch: CandidateMapletBatch,
+        *,
+        return_ragged_query_probabilities: bool = True,
+    ) -> dict[str, object]:
         batch.validate()
         query_mask = batch.query_mask.bool()
         support_mask = batch.support_mask.bool()
         query = self.query_encoder(batch.query_features)
         support = self.support_encoder(batch.support_features)
+        if self.query_anchor_role is not None:
+            if self.support_anchor_role is None:
+                raise RuntimeError("anchor role embeddings are partially configured")
+            query = query.clone()
+            support = support.clone()
+            query[:, 0] = query[:, 0] + self.query_anchor_role
+            support[:, 0] = support[:, 0] + self.support_anchor_role
         query = query * query_mask.unsqueeze(2).to(dtype=query.dtype)
         support = support * support_mask.unsqueeze(2).to(dtype=support.dtype)
         for block in self.context_blocks:
@@ -767,22 +1001,47 @@ class CandidateMapletMatcher(nn.Module):
             support_mask,
             iterations=int(self.config.sinkhorn_iterations),
         )
-        query_log_probabilities = []
-        for batch_index in range(int(query.shape[0])):
-            query_count = int(torch.sum(query_mask[batch_index]).item())
-            support_count = int(torch.sum(support_mask[batch_index]).item())
-            transport = torch.cat(
-                [
-                    transport_batch[batch_index, :query_count, :support_count],
-                    transport_batch[
-                        batch_index,
-                        :query_count,
-                        int(transport_batch.shape[2]) - 1 : int(transport_batch.shape[2]),
-                    ],
-                ],
-                dim=1,
-            )
-            query_log_probabilities.append(F.log_softmax(transport, dim=1))
+        support_slots = int(support.shape[1])
+        query_transport = torch.cat(
+            [
+                transport_batch[:, : int(query.shape[1]), :support_slots],
+                transport_batch[:, : int(query.shape[1]), -1:],
+            ],
+            dim=2,
+        )
+        support_or_dustbin_mask = torch.cat(
+            [
+                support_mask[:, None, :].expand(-1, int(query.shape[1]), -1),
+                torch.ones(
+                    (int(query.shape[0]), int(query.shape[1]), 1),
+                    dtype=torch.bool,
+                    device=query.device,
+                ),
+            ],
+            dim=2,
+        )
+        query_log_probabilities_batched = F.log_softmax(
+            query_transport.masked_fill(~support_or_dustbin_mask, -1e4), dim=2
+        )
+        query_log_probabilities = None
+        if bool(return_ragged_query_probabilities):
+            query_log_probabilities = []
+            for batch_index in range(int(query.shape[0])):
+                query_count = int(torch.sum(query_mask[batch_index]).item())
+                support_count = int(torch.sum(support_mask[batch_index]).item())
+                query_log_probabilities.append(
+                    torch.cat(
+                        [
+                            query_log_probabilities_batched[
+                                batch_index, :query_count, :support_count
+                            ],
+                            query_log_probabilities_batched[
+                                batch_index, :query_count, -1:
+                            ],
+                        ],
+                        dim=1,
+                    )
+                )
 
         query_weights = query_mask.to(dtype=query.dtype)
         support_weights = support_mask.to(dtype=support.dtype)
@@ -799,6 +1058,41 @@ class CandidateMapletMatcher(nn.Module):
             [query[:, 0], support[:, 0], query_pool, support_pool, normalized_static], dim=1
         )
         candidate_embeddings = self.candidate_encoder(candidate_input)
+        direct_identity_input = torch.cat(
+            [query[:, 0], support[:, 0], query_pool, support_pool], dim=1
+        )
+        if bool(self.config.deployable_identity_context_enabled):
+            context_start = int(
+                self.config.deployable_identity_static_start_index
+            )
+            anchor_assignment_probability = torch.exp(
+                query_log_probabilities_batched[:, 0, 0].float()
+            ).to(dtype=query.dtype)
+            anchor_dustbin_probability = torch.exp(
+                query_log_probabilities_batched[:, 0, -1].float()
+            ).to(dtype=query.dtype)
+            anchor_evidence = torch.stack(
+                [
+                    descriptor_scores[:, 0, 0],
+                    contextual_scores[:, 0, 0],
+                    anchor_assignment_probability,
+                    anchor_dustbin_probability,
+                ],
+                dim=1,
+            )
+            direct_identity_input = torch.cat(
+                [
+                    direct_identity_input,
+                    normalized_static[:, context_start:],
+                    anchor_evidence,
+                ],
+                dim=1,
+            )
+        set_identity_candidate_embeddings = (
+            candidate_embeddings
+            if self.prior_free_set_identity_encoder is None
+            else self.prior_free_set_identity_encoder(direct_identity_input)
+        )
         candidate_logits = (
             self.raw_candidate_head(candidate_embeddings)[:, 0] + pair_logits[:, 0, 0]
         )
@@ -806,9 +1100,11 @@ class CandidateMapletMatcher(nn.Module):
             "pair_logits": pair_logits,
             "pair_mask": pair_mask,
             "query_log_probabilities": query_log_probabilities,
+            "query_log_probabilities_batched": query_log_probabilities_batched,
             "log_transport": transport_batch,
             "candidate_logits": candidate_logits,
             "candidate_embeddings": candidate_embeddings,
+            "set_identity_candidate_embeddings": set_identity_candidate_embeddings,
             "descriptor_scores": descriptor_scores,
         }
 
@@ -824,35 +1120,46 @@ def candidate_maplet_assignment_loss(
     candidate_pos_weight: float = 5.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     batch.validate()
-    log_probabilities = output["query_log_probabilities"]
-    if not isinstance(log_probabilities, list):
-        raise TypeError("query_log_probabilities must be a list")
+    log_probabilities_batched = output.get("query_log_probabilities_batched")
+    if not isinstance(log_probabilities_batched, torch.Tensor):
+        raise TypeError("query_log_probabilities_batched must be a tensor")
     pair_logits = output["pair_logits"]
     candidate_logits = output["candidate_logits"]
     if not isinstance(pair_logits, torch.Tensor) or not isinstance(candidate_logits, torch.Tensor):
         raise TypeError("matcher outputs contain invalid tensors")
-    assignment_losses = []
     pair_targets = torch.zeros_like(pair_logits)
-    matched_count = 0
-    valid_query_count = 0
-    for batch_index, query_log_probability in enumerate(log_probabilities):
-        query_count = int(query_log_probability.shape[0])
-        support_count = int(query_log_probability.shape[1] - 1)
-        targets = batch.target_track_indices[batch_index, :query_count].long()
-        nll = -query_log_probability[torch.arange(query_count, device=targets.device), targets]
-        matched = targets < support_count
-        weights = torch.where(
-            matched,
-            torch.full_like(nll, float(matched_query_weight)),
-            torch.ones_like(nll),
-        )
-        assignment_losses.append(torch.sum(nll * weights) / torch.clamp(torch.sum(weights), min=1.0))
-        matched_rows = torch.nonzero(matched, as_tuple=False).reshape(-1)
-        if matched_rows.numel():
-            pair_targets[batch_index, matched_rows, targets[matched_rows]] = 1.0
-        matched_count += int(torch.sum(matched).item())
-        valid_query_count += query_count
-    assignment_loss = torch.mean(torch.stack(assignment_losses))
+    query_valid = batch.query_mask.bool()
+    support_counts = torch.sum(batch.support_mask.bool(), dim=1).long()
+    targets = batch.target_track_indices.long()
+    support_slots = int(pair_logits.shape[2])
+    matched = (
+        query_valid
+        & (targets >= 0)
+        & (targets < support_counts[:, None])
+    )
+    mapped_targets = torch.where(
+        matched,
+        targets,
+        torch.full_like(targets, support_slots),
+    )
+    nll = -torch.gather(
+        log_probabilities_batched,
+        dim=2,
+        index=mapped_targets.unsqueeze(2),
+    )[:, :, 0]
+    weights = torch.where(
+        matched,
+        torch.full_like(nll, float(matched_query_weight)),
+        torch.ones_like(nll),
+    ) * query_valid.to(dtype=nll.dtype)
+    assignment_loss = torch.mean(
+        torch.sum(nll * weights, dim=1)
+        / torch.sum(weights, dim=1).clamp_min(1.0)
+    )
+    safe_targets = targets.clamp(min=0, max=max(support_slots - 1, 0))
+    pair_targets.scatter_(2, safe_targets.unsqueeze(2), matched.unsqueeze(2).to(pair_targets.dtype))
+    matched_count = int(torch.sum(matched).item())
+    valid_query_count = int(torch.sum(query_valid).item())
     pair_mask = output["pair_mask"]
     if not isinstance(pair_mask, torch.Tensor):
         raise TypeError("pair_mask must be a tensor")
@@ -981,6 +1288,405 @@ def set_valued_candidate_loss(
             ),
         }
     return loss, metrics
+
+
+def conditional_set_identity_loss(
+    candidate_logits: torch.Tensor,
+    positive_mask: torch.Tensor,
+    candidate_mask: torch.Tensor | None = None,
+    group_weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Rank the positive track set after conditioning on a non-null group."""
+
+    if candidate_logits.ndim != 2:
+        raise ValueError("candidate_logits must have shape (G, L)")
+    positives = positive_mask.bool()
+    if positives.shape != candidate_logits.shape:
+        raise ValueError("positive_mask must match candidate_logits")
+    valid = (
+        torch.ones_like(positives)
+        if candidate_mask is None
+        else candidate_mask.bool()
+    )
+    if valid.shape != candidate_logits.shape:
+        raise ValueError("candidate_mask must match candidate_logits")
+    if torch.any(positives & ~valid):
+        raise ValueError("positive candidates must also be valid")
+    weights = (
+        torch.ones(
+            (int(candidate_logits.shape[0]),),
+            dtype=candidate_logits.dtype,
+            device=candidate_logits.device,
+        )
+        if group_weights is None
+        else group_weights.to(
+            dtype=candidate_logits.dtype, device=candidate_logits.device
+        ).reshape(-1)
+    )
+    if int(weights.numel()) != int(candidate_logits.shape[0]):
+        raise ValueError("group_weights must contain one value per candidate group")
+    if torch.any(~torch.isfinite(weights)) or torch.any(weights < 0.0):
+        raise ValueError("group_weights must be finite and non-negative")
+    mappable = torch.any(positives, dim=1)
+    if not torch.any(mappable):
+        zero = torch.sum(candidate_logits) * 0.0
+        return zero, {
+            "conditional_identity_loss": 0.0,
+            "conditional_identity_top1_accuracy": 0.0,
+            "conditional_identity_group_count": 0.0,
+        }
+    negative = torch.tensor(
+        -1e4, dtype=candidate_logits.dtype, device=candidate_logits.device
+    )
+    logits = candidate_logits[mappable].masked_fill(~valid[mappable], negative)
+    positive_logits = logits.masked_fill(~positives[mappable], negative)
+    per_group_loss = (
+        torch.logsumexp(logits, dim=1)
+        - torch.logsumexp(positive_logits, dim=1)
+    )
+    mappable_weights = weights[mappable]
+    weight_sum = torch.sum(mappable_weights)
+    if float(weight_sum.detach().cpu().item()) <= 0.0:
+        raise ValueError("mappable conditional identity groups have zero total weight")
+    loss = torch.sum(mappable_weights * per_group_loss) / weight_sum
+    with torch.no_grad():
+        selected = torch.argmax(logits, dim=1)
+        correct = positives[mappable][
+            torch.arange(len(selected), device=selected.device), selected
+        ]
+        metrics = {
+            "conditional_identity_loss": float(loss.detach().cpu().item()),
+            "conditional_identity_top1_accuracy": float(
+                torch.mean(correct.float()).cpu().item()
+            ),
+            "conditional_identity_group_count": float(torch.sum(mappable).item()),
+            "conditional_identity_group_weight_sum": float(
+                weight_sum.detach().cpu().item()
+            ),
+            "conditional_identity_unweighted_loss": float(
+                torch.mean(per_group_loss).detach().cpu().item()
+            ),
+        }
+    return loss, metrics
+
+
+def pose_conditioned_hard_negative_margin_loss(
+    candidate_logits: torch.Tensor,
+    positive_mask: torch.Tensor,
+    hard_negative_mask: torch.Tensor,
+    *,
+    candidate_mask: torch.Tensor | None = None,
+    hard_negative_mode_counts: torch.Tensor | None = None,
+    margin: float = 0.2,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Suppress wrong identities that coherently support a bad pose mode.
+
+    Each hard group contributes equally. Within a group, candidates supported by
+    multiple independently generated bad pose modes receive sqrt-count weight.
+    The loss is deliberately conditional on a real positive identity and never
+    changes the group's availability/null target.
+    """
+
+    if candidate_logits.ndim != 2:
+        raise ValueError("candidate_logits must have shape (G, L)")
+    positives = positive_mask.bool()
+    hard = hard_negative_mask.bool()
+    if positives.shape != candidate_logits.shape or hard.shape != candidate_logits.shape:
+        raise ValueError("positive and hard-negative masks must match candidate_logits")
+    valid = (
+        torch.ones_like(positives)
+        if candidate_mask is None
+        else candidate_mask.bool()
+    )
+    if valid.shape != candidate_logits.shape:
+        raise ValueError("candidate_mask must match candidate_logits")
+    if torch.any(positives & ~valid) or torch.any(hard & ~valid):
+        raise ValueError("positive and hard-negative candidates must be valid")
+    if torch.any(positives & hard):
+        raise ValueError("a candidate cannot be both positive and a hard negative")
+    hard_groups = torch.any(hard, dim=1)
+    if torch.any(hard_groups & ~torch.any(positives, dim=1)):
+        raise ValueError("every pose-conditioned hard group requires a positive candidate")
+    margin_value = float(margin)
+    if not math.isfinite(margin_value) or margin_value < 0.0:
+        raise ValueError("pose-conditioned hard-negative margin must be non-negative")
+    if hard_negative_mode_counts is None:
+        mode_counts = torch.ones_like(candidate_logits)
+    else:
+        mode_counts = hard_negative_mode_counts.to(
+            dtype=candidate_logits.dtype, device=candidate_logits.device
+        )
+        if mode_counts.shape != candidate_logits.shape:
+            raise ValueError("hard_negative_mode_counts must match candidate_logits")
+        if torch.any(~torch.isfinite(mode_counts)) or torch.any(mode_counts < 0.0):
+            raise ValueError("hard-negative mode counts must be finite and non-negative")
+        if torch.any(hard & (mode_counts <= 0.0)):
+            raise ValueError("every hard negative requires a positive mode count")
+    if not torch.any(hard_groups):
+        zero = torch.sum(candidate_logits) * 0.0
+        return zero, {
+            "pose_hard_negative_margin_loss": 0.0,
+            "pose_hard_negative_group_count": 0.0,
+            "pose_hard_negative_candidate_count": 0.0,
+            "pose_hard_negative_active_fraction": 0.0,
+            "pose_hard_negative_margin_satisfied_fraction": 0.0,
+            "pose_hard_negative_mean_positive_gap": 0.0,
+            "pose_hard_group_top1_accuracy": 0.0,
+        }
+
+    negative = torch.tensor(
+        -1e4, dtype=candidate_logits.dtype, device=candidate_logits.device
+    )
+    positive_reference = candidate_logits.masked_fill(~positives, negative).amax(dim=1)
+    violations = F.relu(
+        candidate_logits - positive_reference[:, None] + margin_value
+    )
+    hard_weights = torch.sqrt(torch.clamp(mode_counts, min=1.0)) * hard.to(
+        dtype=candidate_logits.dtype
+    )
+    per_group = torch.sum(violations * hard_weights, dim=1) / torch.sum(
+        hard_weights, dim=1
+    ).clamp_min(1.0)
+    loss = torch.mean(per_group[hard_groups])
+
+    with torch.no_grad():
+        hard_violations = violations[hard]
+        hard_gaps = (
+            positive_reference[:, None] - candidate_logits
+        )[hard]
+        selected = torch.argmax(candidate_logits.masked_fill(~valid, negative), dim=1)
+        selected_positive = positives[
+            torch.arange(len(selected), device=selected.device), selected
+        ]
+        metrics = {
+            "pose_hard_negative_margin_loss": float(loss.detach().cpu().item()),
+            "pose_hard_negative_group_count": float(torch.sum(hard_groups).item()),
+            "pose_hard_negative_candidate_count": float(torch.sum(hard).item()),
+            "pose_hard_negative_active_fraction": float(
+                torch.mean((hard_violations > 0.0).float()).cpu().item()
+            ),
+            "pose_hard_negative_margin_satisfied_fraction": float(
+                torch.mean((hard_gaps >= margin_value).float()).cpu().item()
+            ),
+            "pose_hard_negative_mean_positive_gap": float(
+                torch.mean(hard_gaps).cpu().item()
+            ),
+            "pose_hard_group_top1_accuracy": float(
+                torch.mean(selected_positive[hard_groups].float()).cpu().item()
+            ),
+        }
+    return loss, metrics
+
+
+def pose_conditioned_hard_mode_margin_loss(
+    candidate_logits: torch.Tensor,
+    positive_mask: torch.Tensor,
+    hard_mode_ids: torch.Tensor,
+    hard_mode_candidate_mask: torch.Tensor,
+    *,
+    candidate_mask: torch.Tensor | None = None,
+    margin: float = 0.2,
+    top_group_fraction: float = 0.5,
+    minimum_mode_groups: int = 6,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Suppress a coherent wrong-pose identity mode as one structured negative.
+
+    A mode spans multiple query groups. Its score is the mean wrong-over-positive
+    advantage among the strongest supporting groups, so easy groups cannot hide
+    a repeated-structure mode that already has enough support to fit a pose.
+    """
+
+    if candidate_logits.ndim != 2:
+        raise ValueError("candidate_logits must have shape (G, L)")
+    positives = positive_mask.bool()
+    valid = (
+        torch.ones_like(positives)
+        if candidate_mask is None
+        else candidate_mask.bool()
+    )
+    mode_ids = hard_mode_ids.long()
+    mode_candidates = hard_mode_candidate_mask.bool()
+    group_count, candidate_count = candidate_logits.shape
+    if positives.shape != (group_count, candidate_count):
+        raise ValueError("positive_mask must match candidate_logits")
+    if valid.shape != positives.shape:
+        raise ValueError("candidate_mask must match candidate_logits")
+    if mode_ids.ndim != 2 or mode_ids.shape[0] != group_count:
+        raise ValueError("hard_mode_ids must have shape (G, M)")
+    if mode_candidates.shape != (
+        group_count,
+        mode_ids.shape[1],
+        candidate_count,
+    ):
+        raise ValueError(
+            "hard_mode_candidate_mask must have shape (G, M, L)"
+        )
+    if torch.any(mode_ids < -1):
+        raise ValueError("hard mode IDs must be -1 or non-negative")
+    mode_present = mode_ids >= 0
+    candidate_present = torch.any(mode_candidates, dim=2)
+    if not torch.equal(mode_present, candidate_present):
+        raise ValueError("hard mode IDs and candidate membership differ")
+    if torch.any(mode_candidates & ~valid[:, None, :]):
+        raise ValueError("hard-mode candidates must be valid")
+    if torch.any(mode_candidates & positives[:, None, :]):
+        raise ValueError("hard-mode candidates cannot be positive")
+    participating_groups = torch.any(mode_present, dim=1)
+    if torch.any(participating_groups & ~torch.any(positives, dim=1)):
+        raise ValueError("every hard-mode group requires a positive candidate")
+    margin_value = float(margin)
+    fraction = float(top_group_fraction)
+    minimum_groups = int(minimum_mode_groups)
+    if not math.isfinite(margin_value) or margin_value < 0.0:
+        raise ValueError("pose-conditioned hard-mode margin must be non-negative")
+    if not math.isfinite(fraction) or not 0.0 < fraction <= 1.0:
+        raise ValueError("top_group_fraction must be in (0, 1]")
+    if minimum_groups <= 0:
+        raise ValueError("minimum_mode_groups must be positive")
+    unique_mode_ids = torch.unique(mode_ids[mode_present], sorted=True)
+    if unique_mode_ids.numel() == 0:
+        zero = torch.sum(candidate_logits) * 0.0
+        return zero, {
+            "pose_hard_mode_margin_loss": 0.0,
+            "pose_hard_mode_count": 0.0,
+            "pose_hard_mode_group_incidence_count": 0.0,
+            "pose_hard_mode_active_fraction": 0.0,
+            "pose_hard_mode_margin_satisfied_fraction": 0.0,
+            "pose_hard_mode_mean_positive_gap": 0.0,
+            "pose_hard_mode_group_top1_accuracy": 0.0,
+        }
+
+    negative = torch.tensor(
+        -1e4, dtype=candidate_logits.dtype, device=candidate_logits.device
+    )
+    positive_reference = candidate_logits.masked_fill(~positives, negative).amax(
+        dim=1
+    )
+    mode_gaps: list[torch.Tensor] = []
+    mode_group_counts: list[int] = []
+    for mode_id in unique_mode_ids:
+        locations = torch.nonzero(mode_ids == mode_id, as_tuple=False)
+        rows = locations[:, 0]
+        slots = locations[:, 1]
+        if int(torch.unique(rows).numel()) != int(rows.numel()):
+            raise ValueError("a hard mode repeats a query group")
+        support_count = int(rows.numel())
+        if support_count < minimum_groups:
+            raise ValueError(
+                "every structured hard mode requires minimum_mode_groups"
+            )
+        memberships = mode_candidates[rows, slots]
+        hard_reference = candidate_logits[rows].masked_fill(
+            ~memberships, negative
+        ).amax(dim=1)
+        wrong_advantage = hard_reference - positive_reference[rows]
+        top_count = min(
+            support_count,
+            max(minimum_groups, int(math.ceil(fraction * support_count))),
+        )
+        strongest = torch.topk(
+            wrong_advantage, k=top_count, largest=True, sorted=False
+        ).values
+        mode_gaps.append(-torch.mean(strongest))
+        mode_group_counts.append(support_count)
+    stacked_gaps = torch.stack(mode_gaps)
+    violations = F.relu(margin_value - stacked_gaps)
+    loss = torch.mean(violations)
+
+    with torch.no_grad():
+        selected = torch.argmax(candidate_logits.masked_fill(~valid, negative), dim=1)
+        selected_positive = positives[
+            torch.arange(group_count, device=selected.device), selected
+        ]
+        metrics = {
+            "pose_hard_mode_margin_loss": float(loss.detach().cpu().item()),
+            "pose_hard_mode_count": float(len(mode_group_counts)),
+            "pose_hard_mode_group_incidence_count": float(sum(mode_group_counts)),
+            "pose_hard_mode_active_fraction": float(
+                torch.mean((violations > 0.0).float()).cpu().item()
+            ),
+            "pose_hard_mode_margin_satisfied_fraction": float(
+                torch.mean((stacked_gaps >= margin_value).float()).cpu().item()
+            ),
+            "pose_hard_mode_mean_positive_gap": float(
+                torch.mean(stacked_gaps).cpu().item()
+            ),
+            "pose_hard_mode_group_top1_accuracy": float(
+                torch.mean(selected_positive[participating_groups].float())
+                .cpu()
+                .item()
+            ),
+        }
+    return loss, metrics
+
+
+def factorized_top_l_availability_loss(
+    top_l_availability_logits: torch.Tensor,
+    positive_mask: torch.Tensor,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Learn P(group has a usable top-L identity) independently of candidate count."""
+
+    logits = top_l_availability_logits.reshape(-1)
+    positives = positive_mask.bool()
+    if positives.ndim != 2 or int(positives.shape[0]) != int(logits.numel()):
+        raise ValueError("positive_mask must contain one candidate set per logit")
+    target = torch.any(positives, dim=1).to(dtype=logits.dtype)
+    loss = F.binary_cross_entropy_with_logits(logits, target)
+    with torch.no_grad():
+        probability = torch.sigmoid(logits)
+        prediction = probability >= 0.5
+        target_bool = target.bool()
+        metrics = {
+            "factorized_top_l_availability_loss": float(loss.detach().cpu().item()),
+            "factorized_top_l_availability_accuracy": float(
+                torch.mean((prediction == target_bool).float()).cpu().item()
+            ),
+            "factorized_top_l_availability_positive_rate": float(
+                torch.mean(target).cpu().item()
+            ),
+            "factorized_top_l_availability_predicted_positive_rate": float(
+                torch.mean(prediction.float()).cpu().item()
+            ),
+        }
+    return loss, metrics
+
+
+def factorized_candidate_posterior(
+    candidate_logits: torch.Tensor,
+    top_l_availability_logits: torch.Tensor,
+    candidate_mask: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return q*r, 1-q, and r without an L-dependent null softmax."""
+
+    if candidate_logits.ndim != 2:
+        raise ValueError("candidate_logits must have shape (G, L)")
+    group_count = int(candidate_logits.shape[0])
+    availability = top_l_availability_logits.reshape(-1)
+    if int(availability.numel()) != group_count:
+        raise ValueError("top_l_availability_logits must contain one value per group")
+    valid = (
+        torch.ones_like(candidate_logits, dtype=torch.bool)
+        if candidate_mask is None
+        else candidate_mask.bool()
+    )
+    if valid.shape != candidate_logits.shape or torch.any(
+        torch.sum(valid, dim=1) <= 0
+    ):
+        raise ValueError("candidate_mask must align and keep one candidate per group")
+    conditional = torch.softmax(
+        candidate_logits.float().masked_fill(~valid, -1e4), dim=1
+    )
+    conditional = torch.where(valid, conditional, torch.zeros_like(conditional))
+    conditional = conditional / conditional.sum(dim=1, keepdim=True).clamp_min(1e-8)
+    nonnull = torch.sigmoid(availability.float())
+    candidates = nonnull[:, None] * conditional
+    null = 1.0 - nonnull
+    mass = candidates.sum(dim=1) + null
+    if not torch.allclose(
+        mass, torch.ones_like(mass), atol=1e-6, rtol=1e-6
+    ):
+        raise RuntimeError("factorized candidate posterior lost probability mass")
+    return candidates, null, conditional
 
 
 def geometry_validity_loss(
@@ -1196,7 +1902,22 @@ def candidate_maplet_group_loss(
     geometry_validity_weight: float = 0.0,
     candidate_visibility_weight: float = 0.0,
     rescue_policy_weight: float = 0.0,
+    prior_free_identity_weight: float = 0.0,
+    prior_free_conditional_identity_weight: float = 0.0,
+    factorized_top_l_availability_weight: float = 0.0,
+    pose_conditioned_hard_negative_weight: float = 0.0,
+    pose_conditioned_hard_negative_margin: float = 0.2,
+    pose_conditioned_hard_negative_mask: torch.Tensor | None = None,
+    pose_conditioned_hard_negative_mode_counts: torch.Tensor | None = None,
+    pose_conditioned_hard_mode_weight: float = 0.0,
+    pose_conditioned_hard_mode_margin: float = 0.2,
+    pose_conditioned_hard_mode_top_group_fraction: float = 0.5,
+    pose_conditioned_hard_mode_minimum_groups: int = 6,
+    pose_conditioned_hard_mode_ids: torch.Tensor | None = None,
+    pose_conditioned_hard_mode_candidate_mask: torch.Tensor | None = None,
+    pose_conditioned_candidate_mask: torch.Tensor | None = None,
     support_view_dropout: float = 0.0,
+    conditional_identity_group_weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Train all support views and resolve each complete mutually exclusive top-L set."""
 
@@ -1232,9 +1953,11 @@ def candidate_maplet_group_loss(
             matched_query_weight=float(matched_query_weight),
             candidate_pos_weight=float(candidate_pos_weight),
         )
-        candidate_embeddings = output.get("candidate_embeddings")
+        candidate_embeddings = output.get("set_identity_candidate_embeddings")
         if not isinstance(candidate_embeddings, torch.Tensor):
-            raise TypeError("matcher output is missing candidate_embeddings")
+            raise TypeError(
+                "matcher output is missing set_identity_candidate_embeddings"
+            )
         episode_losses.append(loss)
         episode_metrics.append(metrics)
         embeddings.append(candidate_embeddings)
@@ -1288,6 +2011,117 @@ def candidate_maplet_group_loss(
         resolved["candidate_logits"], resolved["dustbin_logits"], positive_mask
     )
     total = episode_loss + float(candidate_set_weight) * set_loss
+    prior_free_metrics: dict[str, float] = {}
+    if float(prior_free_identity_weight) > 0.0:
+        if not bool(model.config.prior_free_set_identity_enabled):
+            raise ValueError(
+                "prior-free identity loss requires prior-free set identity embeddings"
+            )
+        evidence_logits = resolved.get("candidate_evidence_logits")
+        if not isinstance(evidence_logits, torch.Tensor):
+            raise TypeError("candidate-set output is missing prior-free evidence logits")
+        prior_free_loss, raw_prior_free_metrics = set_valued_candidate_loss(
+            evidence_logits, resolved["dustbin_logits"], positive_mask
+        )
+        total = total + float(prior_free_identity_weight) * prior_free_loss
+        prior_free_metrics = {
+            f"prior_free_identity_{name}": value
+            for name, value in raw_prior_free_metrics.items()
+        }
+        prior_free_metrics["prior_free_identity_loss"] = float(
+            prior_free_loss.detach().cpu().item()
+        )
+    if float(prior_free_conditional_identity_weight) > 0.0:
+        if not bool(model.config.prior_free_set_identity_enabled):
+            raise ValueError(
+                "prior-free conditional identity loss requires prior-free embeddings"
+            )
+        evidence_logits = resolved.get("candidate_evidence_logits")
+        if not isinstance(evidence_logits, torch.Tensor):
+            raise TypeError("candidate-set output is missing prior-free evidence logits")
+        conditional_loss, conditional_metrics = conditional_set_identity_loss(
+            evidence_logits,
+            positive_mask,
+            group_weights=conditional_identity_group_weights,
+        )
+        total = total + float(
+            prior_free_conditional_identity_weight
+        ) * conditional_loss
+        prior_free_metrics.update(
+            {
+                f"prior_free_{name}": value
+                for name, value in conditional_metrics.items()
+            }
+        )
+    if float(factorized_top_l_availability_weight) > 0.0:
+        if not bool(model.config.factorized_set_posterior_enabled):
+            raise ValueError(
+                "factorized top-L availability loss requires factorized set posterior"
+            )
+        availability_logits = resolved.get("top_l_availability_logits")
+        if not isinstance(availability_logits, torch.Tensor):
+            raise TypeError("candidate-set output is missing top-L availability logits")
+        availability_loss, availability_metrics = factorized_top_l_availability_loss(
+            availability_logits, positive_mask
+        )
+        total = (
+            total
+            + float(factorized_top_l_availability_weight) * availability_loss
+        )
+        prior_free_metrics.update(availability_metrics)
+    if float(pose_conditioned_hard_negative_weight) > 0.0:
+        if not bool(model.config.prior_free_set_identity_enabled):
+            raise ValueError(
+                "pose-conditioned hard negatives require prior-free identity embeddings"
+            )
+        if pose_conditioned_hard_negative_mask is None:
+            raise ValueError("pose-conditioned hard-negative mask is required")
+        evidence_logits = resolved.get("candidate_evidence_logits")
+        if not isinstance(evidence_logits, torch.Tensor):
+            raise TypeError("candidate-set output is missing prior-free evidence logits")
+        pose_hard_loss, pose_hard_metrics = (
+            pose_conditioned_hard_negative_margin_loss(
+                evidence_logits,
+                positive_mask,
+                pose_conditioned_hard_negative_mask,
+                candidate_mask=pose_conditioned_candidate_mask,
+                hard_negative_mode_counts=(
+                    pose_conditioned_hard_negative_mode_counts
+                ),
+                margin=float(pose_conditioned_hard_negative_margin),
+            )
+        )
+        total = total + float(pose_conditioned_hard_negative_weight) * pose_hard_loss
+        prior_free_metrics.update(pose_hard_metrics)
+    if float(pose_conditioned_hard_mode_weight) > 0.0:
+        if not bool(model.config.prior_free_set_identity_enabled):
+            raise ValueError(
+                "pose-conditioned hard modes require prior-free identity embeddings"
+            )
+        if (
+            pose_conditioned_hard_mode_ids is None
+            or pose_conditioned_hard_mode_candidate_mask is None
+        ):
+            raise ValueError("pose-conditioned hard-mode membership is required")
+        evidence_logits = resolved.get("candidate_evidence_logits")
+        if not isinstance(evidence_logits, torch.Tensor):
+            raise TypeError("candidate-set output is missing prior-free evidence logits")
+        pose_mode_loss, pose_mode_metrics = pose_conditioned_hard_mode_margin_loss(
+            evidence_logits,
+            positive_mask,
+            pose_conditioned_hard_mode_ids,
+            pose_conditioned_hard_mode_candidate_mask,
+            candidate_mask=pose_conditioned_candidate_mask,
+            margin=float(pose_conditioned_hard_mode_margin),
+            top_group_fraction=float(
+                pose_conditioned_hard_mode_top_group_fraction
+            ),
+            minimum_mode_groups=int(
+                pose_conditioned_hard_mode_minimum_groups
+            ),
+        )
+        total = total + float(pose_conditioned_hard_mode_weight) * pose_mode_loss
+        prior_free_metrics.update(pose_mode_metrics)
     geometry_metrics: dict[str, float] = {}
     rescue_metrics: dict[str, float] = {}
     residual_supervision_required = bool(
@@ -1368,17 +2202,51 @@ def candidate_maplet_group_loss(
         for name in episode_metrics[0]
     }
     metrics.update(set_metrics)
+    metrics.update(prior_free_metrics)
     metrics.update(geometry_metrics)
     metrics.update(rescue_metrics)
     metrics["episode_loss"] = float(episode_loss.detach().cpu().item())
     metrics["loss"] = float(total.detach().cpu().item())
     with torch.no_grad():
-        entropy = -torch.sum(
+        resolved_view_weights = resolved.get("support_view_probabilities")
+        metric_view_weights = (
+            resolved_view_weights.reshape(-1, int(view_weights.shape[1]))
+            if isinstance(resolved_view_weights, torch.Tensor)
+            else view_weights
+        )
+        prior_entropy = -torch.sum(
             view_weights * torch.log(torch.clamp(view_weights, min=1e-8)), dim=1
         )
+        entropy = -torch.sum(
+            metric_view_weights
+            * torch.log(torch.clamp(metric_view_weights, min=1e-8)),
+            dim=1,
+        )
         metrics["support_view_entropy"] = float(torch.mean(entropy).cpu().item())
+        metrics["support_view_prior_entropy"] = float(
+            torch.mean(prior_entropy).cpu().item()
+        )
         metrics["support_view_max_probability"] = float(
-            torch.mean(torch.max(view_weights, dim=1).values).cpu().item()
+            torch.mean(torch.max(metric_view_weights, dim=1).values).cpu().item()
+        )
+        metrics["support_view_posterior_kl_from_prior"] = float(
+            torch.mean(
+                torch.sum(
+                    metric_view_weights
+                    * (
+                        torch.log(torch.clamp(metric_view_weights, min=1e-8))
+                        - torch.log(torch.clamp(view_weights, min=1e-8))
+                    ),
+                    dim=1,
+                )
+            )
+            .cpu()
+            .item()
+        )
+        metrics["support_view_max_probability_shift"] = float(
+            torch.mean(torch.amax(torch.abs(metric_view_weights - view_weights), dim=1))
+            .cpu()
+            .item()
         )
     return total, metrics
 

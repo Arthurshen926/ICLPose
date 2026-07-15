@@ -232,6 +232,14 @@ class MatchaJointTrainingSet:
     landmark_track_ids: np.ndarray | None = None
     landmark_track_xyz: np.ndarray | None = None
     landmark_support_view_counts: np.ndarray | None = None
+    # Coarse-cell tracks are ambiguity exclusions: they must not become
+    # negatives, but are too far apart to be interchangeable pose positives.
+    landmark_known_positive_offsets: np.ndarray | None = None
+    landmark_known_positive_track_ids: np.ndarray | None = None
+    # Strict spatial positives use the cache's pixel reprojection threshold
+    # and are valid set-valued retrieval targets.
+    landmark_strict_positive_offsets: np.ndarray | None = None
+    landmark_strict_positive_track_ids: np.ndarray | None = None
     query_repeatability_targets: np.ndarray | None = None
     render_repeatability_targets: np.ndarray | None = None
 
@@ -375,6 +383,53 @@ class MatchaJointTrainingSet:
                 if view_counts.shape[0] != landmark_count:
                     raise ValueError("landmark_support_view_counts must contain one value per retrieval sample")
                 object.__setattr__(self, "landmark_support_view_counts", np.maximum(view_counts, 0))
+            def validate_track_csr(
+                *,
+                label: str,
+                offsets_value: np.ndarray | None,
+                track_ids_value: np.ndarray | None,
+            ) -> tuple[np.ndarray | None, np.ndarray | None]:
+                present = (offsets_value is not None, track_ids_value is not None)
+                if not any(present):
+                    return None, None
+                if not all(present):
+                    raise ValueError(f"{label} requires both offsets and track ids")
+                offsets = np.asarray(offsets_value, dtype=np.int64).reshape(-1)
+                track_ids = np.asarray(track_ids_value, dtype=np.int64).reshape(-1)
+                if offsets.shape[0] != landmark_count + 1:
+                    raise ValueError(
+                        f"{label} offsets must contain one offset per row plus a sentinel"
+                    )
+                if (
+                    int(offsets[0]) != 0
+                    or np.any(np.diff(offsets) < 0)
+                    or int(offsets[-1]) != int(track_ids.size)
+                ):
+                    raise ValueError(f"{label} CSR offsets are invalid")
+                if track_ids.size and np.any(track_ids < 0):
+                    raise ValueError(f"{label} track ids must be non-negative")
+                for row, target_track_id in enumerate(landmark_track_ids.tolist()):
+                    values = track_ids[int(offsets[row]) : int(offsets[row + 1])]
+                    if values.size and int(target_track_id) not in set(values.tolist()):
+                        raise ValueError(
+                            f"each non-empty {label} row must include its supervised track"
+                        )
+                return offsets, track_ids
+
+            known_offsets, known_track_ids = validate_track_csr(
+                label="landmark coarse-cell ambiguity",
+                offsets_value=self.landmark_known_positive_offsets,
+                track_ids_value=self.landmark_known_positive_track_ids,
+            )
+            strict_offsets, strict_track_ids = validate_track_csr(
+                label="landmark strict positive",
+                offsets_value=self.landmark_strict_positive_offsets,
+                track_ids_value=self.landmark_strict_positive_track_ids,
+            )
+            object.__setattr__(self, "landmark_known_positive_offsets", known_offsets)
+            object.__setattr__(self, "landmark_known_positive_track_ids", known_track_ids)
+            object.__setattr__(self, "landmark_strict_positive_offsets", strict_offsets)
+            object.__setattr__(self, "landmark_strict_positive_track_ids", strict_track_ids)
         fine_required = (
             "fine_sample_pair_indices",
             "fine_query_cell_indices",
@@ -474,6 +529,59 @@ class MatchaJointTrainingSet:
             object.__setattr__(self, name, arr)
 
 
+def subset_landmark_known_positive_csr(
+    offsets: np.ndarray,
+    track_ids: np.ndarray,
+    keep: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Select ragged known-positive rows while preserving CSR invariants."""
+
+    source_offsets = np.asarray(offsets, dtype=np.int64).reshape(-1)
+    source_track_ids = np.asarray(track_ids, dtype=np.int64).reshape(-1)
+    selection = np.asarray(keep)
+    if selection.dtype == bool:
+        if selection.shape != (source_offsets.size - 1,):
+            raise ValueError("known-positive CSR boolean selector has the wrong length")
+        row_indices = np.flatnonzero(selection)
+    else:
+        row_indices = selection.astype(np.int64, copy=False).reshape(-1)
+    if row_indices.size and (
+        np.any(row_indices < 0) or np.any(row_indices >= source_offsets.size - 1)
+    ):
+        raise ValueError("known-positive CSR row selector is out of range")
+    pieces = [
+        source_track_ids[int(source_offsets[row]) : int(source_offsets[row + 1])]
+        for row in row_indices.tolist()
+    ]
+    counts = np.asarray([piece.size for piece in pieces], dtype=np.int64)
+    output_offsets = np.zeros((row_indices.size + 1,), dtype=np.int64)
+    if counts.size:
+        output_offsets[1:] = np.cumsum(counts)
+    output_track_ids = (
+        np.zeros((0,), dtype=np.int64)
+        if not pieces or int(output_offsets[-1]) == 0
+        else np.concatenate(pieces, axis=0).astype(np.int64, copy=False)
+    )
+    return output_offsets, output_track_ids
+
+
+def _landmark_known_positive_csr_to_padded(
+    offsets: np.ndarray,
+    track_ids: np.ndarray,
+) -> np.ndarray:
+    source_offsets = np.asarray(offsets, dtype=np.int64).reshape(-1)
+    source_track_ids = np.asarray(track_ids, dtype=np.int64).reshape(-1)
+    counts = np.diff(source_offsets)
+    width = int(counts.max()) if counts.size else 0
+    output = np.full((counts.size, width), -1, dtype=np.int64)
+    for row, count in enumerate(counts.tolist()):
+        if int(count) > 0:
+            output[row, : int(count)] = source_track_ids[
+                int(source_offsets[row]) : int(source_offsets[row + 1])
+            ]
+    return output
+
+
 @dataclass(frozen=True)
 class MatchaJointTrainingConfig:
     model_type: str = "residual_adapter"
@@ -543,15 +651,20 @@ class MatchaJointTrainingConfig:
     landmark_l2_normalize_observations: bool = False
     landmark_normalize_final_prototypes: bool = True
     landmark_min_support_observations: int = 1
+    landmark_positive_prototype_source: str = "episode_support_observations"
     landmark_set_valued_cell_positives: bool = True
+    landmark_exclude_known_cell_positives_from_memory: bool = True
     landmark_memory_capacity: int = 65536
     landmark_frozen_negative_bank: str = ""
     landmark_memory_momentum: float = 0.9
-    landmark_memory_candidate_pool_size: int = 4096
+    landmark_memory_candidate_pool_size: int = 0
     landmark_semantic_hard_negatives_per_query: int = 16
     landmark_geometry_hard_negatives_per_track: int = 8
     landmark_random_negatives: int = 128
     landmark_max_memory_negatives: int = 2048
+    landmark_memory_negative_merge_policy: str = "source_balanced_round_robin"
+    landmark_system_hard_negative_margin: float = 0.05
+    landmark_system_hard_negative_margin_weight: float = 0.0
     landmark_dustbin_logit: float = 0.0
     landmark_dustbin_samples_per_image: int = 0
     landmark_dustbin_exclusion_radius_cells: int = 1
@@ -564,6 +677,7 @@ class MatchaJointTrainingConfig:
     residual_gate_scale: float = 0.1
     rgb_non_keypoint_divisor: int = 32
     map_pair_batch_size: int = 8
+    validation_selection_metric: str = "total_loss"
     device: str = "cpu"
     seed: int = 0
 
@@ -597,6 +711,14 @@ class MatchaJointTrainingConfig:
             raise ValueError("batch_size must be greater than one")
         if int(self.map_pair_batch_size) <= 0:
             raise ValueError("map_pair_batch_size must be positive")
+        if str(self.validation_selection_metric) not in {
+            "total_loss",
+            "landmark_retrieval_loss",
+        }:
+            raise ValueError(
+                "validation_selection_metric must be 'total_loss' or "
+                "'landmark_retrieval_loss'"
+            )
         if int(self.patch_corr_fine_batch_size) <= 0:
             raise ValueError("patch_corr_fine_batch_size must be positive")
         if int(self.patch_corr_fine_max_samples_per_pair) < 0:
@@ -641,6 +763,11 @@ class MatchaJointTrainingConfig:
             raise ValueError("unsupported landmark_prototype_aggregation_method")
         if int(self.landmark_min_support_observations) <= 0:
             raise ValueError("landmark_min_support_observations must be positive")
+        if str(self.landmark_positive_prototype_source) not in {
+            "episode_support_observations",
+            "query_disjoint_frozen_bank",
+        }:
+            raise ValueError("unsupported landmark_positive_prototype_source")
         if not 0.0 <= float(self.landmark_memory_momentum) < 1.0:
             raise ValueError("landmark_memory_momentum must be in [0, 1)")
         if int(self.landmark_memory_capacity) <= 0:
@@ -654,6 +781,15 @@ class MatchaJointTrainingConfig:
         ):
             if int(getattr(self, name)) < 0:
                 raise ValueError(f"{name} must be non-negative")
+        if str(self.landmark_memory_negative_merge_policy) not in {
+            "legacy_source_concat",
+            "source_balanced_round_robin",
+        }:
+            raise ValueError("unsupported landmark memory negative merge policy")
+        if float(self.landmark_system_hard_negative_margin) < 0.0:
+            raise ValueError("landmark_system_hard_negative_margin must be non-negative")
+        if float(self.landmark_system_hard_negative_margin_weight) < 0.0:
+            raise ValueError("landmark_system_hard_negative_margin_weight must be non-negative")
         if np.isnan(float(self.landmark_dustbin_logit)):
             raise ValueError("landmark_dustbin_logit must not be NaN")
         if int(self.landmark_dustbin_samples_per_image) < 0:
@@ -2509,6 +2645,46 @@ def _full_map_correspondence_loss(
         )
         if torch.any(selected_track_ids < 0):
             raise ValueError("every landmark retrieval observation must have a valid SfM track id")
+        known_positive_track_ids = None
+        if (
+            samples.landmark_known_positive_offsets is not None
+            or samples.landmark_known_positive_track_ids is not None
+        ):
+            if (
+                samples.landmark_known_positive_offsets is None
+                or samples.landmark_known_positive_track_ids is None
+            ):
+                raise ValueError("landmark known-positive CSR is partially missing")
+            known_offsets, known_tracks = subset_landmark_known_positive_csr(
+                samples.landmark_known_positive_offsets,
+                samples.landmark_known_positive_track_ids,
+                landmark_keep,
+            )
+            known_positive_track_ids = _tensor(
+                _landmark_known_positive_csr_to_padded(known_offsets, known_tracks),
+                dtype=torch.long,
+                device=device,
+            )
+        strict_positive_track_ids = None
+        if (
+            samples.landmark_strict_positive_offsets is not None
+            or samples.landmark_strict_positive_track_ids is not None
+        ):
+            if (
+                samples.landmark_strict_positive_offsets is None
+                or samples.landmark_strict_positive_track_ids is None
+            ):
+                raise ValueError("landmark strict-positive CSR is partially missing")
+            strict_offsets, strict_tracks = subset_landmark_known_positive_csr(
+                samples.landmark_strict_positive_offsets,
+                samples.landmark_strict_positive_track_ids,
+                landmark_keep,
+            )
+            strict_positive_track_ids = _tensor(
+                _landmark_known_positive_csr_to_padded(strict_offsets, strict_tracks),
+                dtype=torch.long,
+                device=device,
+            )
         selected_track_xyz = None
         if samples.landmark_track_xyz is not None:
             selected_track_xyz = _tensor(
@@ -2574,6 +2750,8 @@ def _full_map_correspondence_loss(
             track_xyz=selected_track_xyz,
             query_group_ids=query_group_ids,
             query_image_group_ids=landmark_query_image_groups,
+            known_positive_track_ids=known_positive_track_ids,
+            strict_positive_track_ids=strict_positive_track_ids,
             dustbin_logits=landmark_dustbin_logits,
             unmatched_query_descriptors=unmatched_query_descriptors,
             unmatched_dustbin_logits=unmatched_dustbin_logits,
@@ -2586,6 +2764,15 @@ def _full_map_correspondence_loss(
                 geometry_hard_negatives_per_track=int(config.landmark_geometry_hard_negatives_per_track),
                 random_negatives=int(config.landmark_random_negatives),
                 max_memory_negatives=int(config.landmark_max_memory_negatives),
+                memory_negative_merge_policy=str(
+                    config.landmark_memory_negative_merge_policy
+                ),
+                system_hard_negative_margin=float(
+                    config.landmark_system_hard_negative_margin
+                ),
+                system_hard_negative_margin_weight=float(
+                    config.landmark_system_hard_negative_margin_weight
+                ),
                 dustbin_logit=None if learned_landmark_dustbin else float(config.landmark_dustbin_logit),
                 dustbin_loss_weight=float(config.landmark_dustbin_loss_weight),
                 dustbin_detach_descriptors=bool(config.landmark_dustbin_detach_descriptors),
@@ -2593,7 +2780,11 @@ def _full_map_correspondence_loss(
                 prototype_l2_normalize_observations=bool(config.landmark_l2_normalize_observations),
                 normalize_final_prototypes=bool(config.landmark_normalize_final_prototypes),
                 prototype_min_support_observations=int(config.landmark_min_support_observations),
+                positive_prototype_source=str(config.landmark_positive_prototype_source),
                 set_valued_cell_positives=bool(config.landmark_set_valued_cell_positives),
+                exclude_known_cell_positives_from_memory=bool(
+                    config.landmark_exclude_known_cell_positives_from_memory
+                ),
             ),
             update_memory=bool(update_landmark_memory),
             seed=int(seed),
@@ -3952,6 +4143,53 @@ def _landmark_training_summary(
     return output
 
 
+_VALIDATION_RETRIEVAL_METRICS = (
+    "landmark_retrieval_loss",
+    "landmark_retrieval_positive_loss",
+    "landmark_retrieval_system_hard_negative_margin_loss",
+    "landmark_retrieval_recall_at_1",
+    "landmark_retrieval_recall_at_5",
+    "landmark_retrieval_recall_at_20",
+    "landmark_retrieval_strict_valid_recall_at_1",
+    "landmark_retrieval_strict_valid_recall_at_5",
+    "landmark_retrieval_strict_valid_recall_at_20",
+    "landmark_retrieval_positive_score_mean",
+    "landmark_retrieval_hardest_negative_score_mean",
+    "landmark_retrieval_score_gap_mean",
+)
+
+
+def _loss_and_metrics_for_samples(
+    model: MatchaStyleJointModel,
+    samples: MatchaJointTrainingSet,
+    config: MatchaJointTrainingConfig,
+    device: torch.device,
+    *,
+    seed: int,
+    landmark_memory_bank: LandmarkPrototypeMemoryBank | None = None,
+) -> tuple[float, dict[str, float]]:
+    model.eval()
+    with torch.no_grad():
+        idx = _sample_eval_indices(samples.coarse_fine_samples.sample_count, int(config.batch_size), int(seed))
+        value, metrics = _total_loss(
+            model,
+            samples,
+            idx,
+            config,
+            device,
+            seed=int(seed),
+            landmark_memory_bank=landmark_memory_bank,
+            update_landmark_memory=False,
+        )
+    model.train()
+    numeric_metrics = {
+        str(key): float(metric)
+        for key, metric in metrics.items()
+        if isinstance(metric, (int, float)) and np.isfinite(float(metric))
+    }
+    return float(value.detach().cpu().item()), numeric_metrics
+
+
 def _loss_value_for_samples(
     model: MatchaStyleJointModel,
     samples: MatchaJointTrainingSet,
@@ -3959,16 +4197,87 @@ def _loss_value_for_samples(
     device: torch.device,
     *,
     seed: int,
+    landmark_memory_bank: LandmarkPrototypeMemoryBank | None = None,
 ) -> float:
-    model.eval()
-    with torch.no_grad():
-        idx = _sample_eval_indices(samples.coarse_fine_samples.sample_count, int(config.batch_size), int(seed))
-        value, _metrics = _total_loss(model, samples, idx, config, device, seed=int(seed))
-    model.train()
-    return float(value.detach().cpu().item())
+    value, _metrics = _loss_and_metrics_for_samples(
+        model,
+        samples,
+        config,
+        device,
+        seed=int(seed),
+        landmark_memory_bank=landmark_memory_bank,
+    )
+    return float(value)
 
 
-def _evaluate(model: MatchaStyleJointModel, samples: MatchaJointTrainingSet, config: MatchaJointTrainingConfig, device: torch.device) -> dict[str, float]:
+def _aggregate_validation_evaluations(
+    evaluations: Sequence[tuple[float, dict[str, float]]],
+    *,
+    selection_metric: str,
+) -> dict[str, float | str]:
+    if not evaluations:
+        raise ValueError("validation requires at least one evaluation")
+    losses = np.asarray([float(loss) for loss, _metrics in evaluations], dtype=np.float64)
+    if not np.all(np.isfinite(losses)):
+        raise ValueError("validation total loss contains non-finite values")
+    row: dict[str, float | str] = {
+        "loss": float(np.mean(losses)),
+        "validation_episode_count": float(len(evaluations)),
+    }
+
+    map_losses = [
+        float(metrics["map_correspondence_loss"])
+        for _loss, metrics in evaluations
+        if "map_correspondence_loss" in metrics
+        and np.isfinite(float(metrics["map_correspondence_loss"]))
+    ]
+    if map_losses:
+        row["map_correspondence_loss"] = float(np.mean(map_losses))
+
+    valid_counts = np.asarray(
+        [
+            max(0.0, float(metrics.get("landmark_retrieval_valid_count", 0.0)))
+            for _loss, metrics in evaluations
+        ],
+        dtype=np.float64,
+    )
+    if np.any(valid_counts > 0.0):
+        row["landmark_retrieval_valid_count"] = float(np.sum(valid_counts))
+        row["landmark_retrieval_valid_count_mean"] = float(np.mean(valid_counts))
+    for key in _VALIDATION_RETRIEVAL_METRICS:
+        weighted_sum = 0.0
+        weight_sum = 0.0
+        for (_loss, metrics), weight in zip(evaluations, valid_counts.tolist()):
+            if weight <= 0.0 or key not in metrics:
+                continue
+            value = float(metrics[key])
+            if not np.isfinite(value):
+                continue
+            weighted_sum += float(weight) * value
+            weight_sum += float(weight)
+        if weight_sum > 0.0:
+            row[key] = float(weighted_sum / weight_sum)
+
+    metric_name = str(selection_metric)
+    metric_key = "loss" if metric_name == "total_loss" else metric_name
+    if metric_key not in row or not np.isfinite(float(row[metric_key])):
+        raise ValueError(
+            f"validation selection metric {metric_name!r} is unavailable; "
+            "enable landmark retrieval supervision with valid query observations"
+        )
+    row["selection_metric"] = metric_name
+    row["selection_value"] = float(row[metric_key])
+    return row
+
+
+def _evaluate(
+    model: MatchaStyleJointModel,
+    samples: MatchaJointTrainingSet,
+    config: MatchaJointTrainingConfig,
+    device: torch.device,
+    *,
+    landmark_memory_bank: LandmarkPrototypeMemoryBank | None = None,
+) -> dict[str, float]:
     model.eval()
     base = samples.coarse_fine_samples
     eval_indices = _sample_eval_indices(base.sample_count, int(config.batch_size), int(config.seed) + 991)
@@ -4043,7 +4352,17 @@ def _evaluate(model: MatchaStyleJointModel, samples: MatchaJointTrainingSet, con
                 metrics[f"{prefix}_repeatability_loss"] = float(value.detach().cpu().item())
         if samples.query_cell_indices is not None and samples.render_cell_indices is not None:
             indices = positive_eval_indices
-            _map_loss, map_metrics = _full_map_correspondence_loss(model, samples, indices, config, device, pair_subset=pair_subset)
+            _map_loss, map_metrics = _full_map_correspondence_loss(
+                model,
+                samples,
+                indices,
+                config,
+                device,
+                pair_subset=pair_subset,
+                landmark_memory_bank=landmark_memory_bank,
+                update_landmark_memory=False,
+                seed=int(config.seed) + 17011,
+            )
             metrics.update(map_metrics)
             local_loss, local_metrics = _local_fine_transformer_loss(model, samples, indices, device=device, pair_subset=pair_subset)
             if local_loss is not None:
@@ -4179,22 +4498,45 @@ def train_matcha_joint_model(
     landmark_metric_counts: dict[str, int] = {}
 
     def loss_value(step_seed: int) -> float:
-        return _loss_value_for_samples(model, samples, cfg, device, seed=int(step_seed))
+        return _loss_value_for_samples(
+            model,
+            samples,
+            cfg,
+            device,
+            seed=int(step_seed),
+            landmark_memory_bank=landmark_memory_bank,
+        )
 
     initial_loss = loss_value(int(cfg.seed))
-    validation_history: list[dict[str, float | int]] = []
-    best_validation_loss = float("inf")
+    validation_history: list[dict[str, float | int | str]] = []
+    best_validation_value = float("inf")
+    best_validation_total_loss = float("inf")
     best_validation_step = -1
     best_state: dict[str, torch.Tensor] | None = None
 
     def maybe_validate(step: int) -> None:
-        nonlocal best_validation_loss, best_validation_step, best_state
+        nonlocal best_validation_value, best_validation_total_loss, best_validation_step, best_state
         if validation_samples is None:
             return
-        value = _loss_value_for_samples(model, validation_samples, cfg, device, seed=int(cfg.seed) + 50000)
-        validation_history.append({"step": int(step), "loss": float(value)})
-        if value < best_validation_loss:
-            best_validation_loss = float(value)
+        row = _aggregate_validation_evaluations(
+            [
+                _loss_and_metrics_for_samples(
+                    model,
+                    validation_samples,
+                    cfg,
+                    device,
+                    seed=int(cfg.seed) + 50000,
+                    landmark_memory_bank=landmark_memory_bank,
+                )
+            ],
+            selection_metric=str(cfg.validation_selection_metric),
+        )
+        row["step"] = int(step)
+        validation_history.append(row)
+        selection_value = float(row["selection_value"])
+        if selection_value < best_validation_value:
+            best_validation_value = selection_value
+            best_validation_total_loss = float(row["loss"])
             best_validation_step = int(step)
             best_state = _model_state_snapshot(model)
 
@@ -4241,13 +4583,26 @@ def train_matcha_joint_model(
     if validation_samples is not None:
         summary.update(
             {
-                "best_validation_loss": float(best_validation_loss),
+                "best_validation_loss": float(best_validation_value),
+                "best_validation_metric": str(cfg.validation_selection_metric),
+                "best_validation_value": float(best_validation_value),
+                "best_validation_total_loss": float(best_validation_total_loss),
+                "best_validation_loss_compatibility_semantics": "selection_value",
                 "best_validation_step": int(best_validation_step),
                 "validation_eval_count": int(len(validation_history)),
                 "validation_history": validation_history,
+                "validation_retrieval_metric_reduction": "weighted_by_landmark_retrieval_valid_count",
             }
         )
-    summary.update(_evaluate(model, samples, cfg, device))
+    summary.update(
+        _evaluate(
+            model,
+            samples,
+            cfg,
+            device,
+            landmark_memory_bank=landmark_memory_bank,
+        )
+    )
     return MatchaJointTrainingRun(model=model.cpu().eval(), summary=summary)
 
 
@@ -4336,36 +4691,60 @@ def train_matcha_joint_model_from_manifest(
         order_rng = np.random.default_rng(int(cfg.seed) + 1009 + int(epoch))
         return int(order_rng.permutation(shard_count)[position])
 
-    initial_loss = _loss_value_for_samples(model, first_samples, cfg, device, seed=int(cfg.seed))
-    validation_history: list[dict[str, float | int]] = []
-    best_validation_loss = float("inf")
+    initial_loss = _loss_value_for_samples(
+        model,
+        first_samples,
+        cfg,
+        device,
+        seed=int(cfg.seed),
+        landmark_memory_bank=landmark_memory_bank,
+    )
+    validation_history: list[dict[str, float | int | str]] = []
+    best_validation_value = float("inf")
+    best_validation_total_loss = float("inf")
     best_validation_step = -1
     best_state: dict[str, torch.Tensor] | None = None
 
     def maybe_validate(step: int) -> None:
-        nonlocal best_validation_loss, best_validation_step, best_state
+        nonlocal best_validation_value, best_validation_total_loss, best_validation_step, best_state
         if validation_samples is None and validation_cache is None:
             return
         if validation_cache is not None:
-            values = []
+            evaluations = []
             for shard_idx in range(len(validation_shards)):
                 shard_samples = validation_cache.get(shard_idx)
-                values.append(
-                    _loss_value_for_samples(
+                evaluations.append(
+                    _loss_and_metrics_for_samples(
                         model,
                         shard_samples,
                         cfg,
                         device,
                         seed=int(cfg.seed) + 50000 + int(shard_idx),
+                        landmark_memory_bank=landmark_memory_bank,
                     )
                 )
-            value = float(np.mean(values)) if values else float("inf")
         else:
             assert validation_samples is not None
-            value = _loss_value_for_samples(model, validation_samples, cfg, device, seed=int(cfg.seed) + 50000)
-        validation_history.append({"step": int(step), "loss": float(value)})
-        if value < best_validation_loss:
-            best_validation_loss = float(value)
+            evaluations = [
+                _loss_and_metrics_for_samples(
+                    model,
+                    validation_samples,
+                    cfg,
+                    device,
+                    seed=int(cfg.seed) + 50000,
+                    landmark_memory_bank=landmark_memory_bank,
+                )
+            ]
+        row = _aggregate_validation_evaluations(
+            evaluations,
+            selection_metric=str(cfg.validation_selection_metric),
+        )
+        row["step"] = int(step)
+        validation_history.append(row)
+        selection_value = float(row["selection_value"])
+        if selection_value < best_validation_value:
+            best_validation_value = selection_value
+            best_validation_total_loss = float(row["loss"])
             best_validation_step = int(step)
             best_state = _model_state_snapshot(model)
 
@@ -4396,7 +4775,14 @@ def train_matcha_joint_model_from_manifest(
         maybe_validate(int(cfg.steps))
     if best_state is not None:
         model.load_state_dict(best_state)
-    final_loss = _loss_value_for_samples(model, first_samples, cfg, device, seed=int(cfg.seed))
+    final_loss = _loss_value_for_samples(
+        model,
+        first_samples,
+        cfg,
+        device,
+        seed=int(cfg.seed),
+        landmark_memory_bank=landmark_memory_bank,
+    )
     eval_samples = validation_samples if validation_samples is not None else (validation_cache.get(0) if validation_cache is not None else first_samples)
     summary = {
         "stage": "matcha_style_joint_training",
@@ -4420,10 +4806,15 @@ def train_matcha_joint_model_from_manifest(
     if validation_samples is not None or validation_cache is not None:
         summary.update(
             {
-                "best_validation_loss": float(best_validation_loss),
+                "best_validation_loss": float(best_validation_value),
+                "best_validation_metric": str(cfg.validation_selection_metric),
+                "best_validation_value": float(best_validation_value),
+                "best_validation_total_loss": float(best_validation_total_loss),
+                "best_validation_loss_compatibility_semantics": "selection_value",
                 "best_validation_step": int(best_validation_step),
                 "validation_eval_count": int(len(validation_history)),
                 "validation_history": validation_history,
+                "validation_retrieval_metric_reduction": "weighted_by_landmark_retrieval_valid_count",
             }
         )
     if validation_cache is not None:
@@ -4434,7 +4825,15 @@ def train_matcha_joint_model_from_manifest(
                 "validation_manifest_sample_count": int(validation_metadata.get("sample_count", 0)),
             }
         )
-    summary.update(_evaluate(model, eval_samples, cfg, device))
+    summary.update(
+        _evaluate(
+            model,
+            eval_samples,
+            cfg,
+            device,
+            landmark_memory_bank=landmark_memory_bank,
+        )
+    )
     return MatchaJointTrainingRun(model=model.cpu().eval(), summary=summary)
 
 
@@ -4619,6 +5018,7 @@ def _report_distributed_provider_progress(
     global_pair_count: int,
     metric_sums: dict[str, float],
     metric_counts: dict[str, int],
+    device: torch.device,
 ) -> None:
     keys = (
         "total_loss",
@@ -4636,22 +5036,22 @@ def _report_distributed_provider_progress(
     if int(world_size) > 1:
         torch.distributed.all_reduce(reduced, op=torch.distributed.ReduceOp.SUM)
     memory_values = None
-    if torch.cuda.is_available():
+    if device.type == "cuda":
         memory_values = torch.as_tensor(
             [
-                float(torch.cuda.memory_allocated()),
-                float(torch.cuda.memory_reserved()),
-                float(torch.cuda.max_memory_allocated()),
-                float(torch.cuda.max_memory_reserved()),
+                float(torch.cuda.memory_allocated(device)),
+                float(torch.cuda.memory_reserved(device)),
+                float(torch.cuda.max_memory_allocated(device)),
+                float(torch.cuda.max_memory_reserved(device)),
             ],
             dtype=torch.float64,
-            device=torch.device("cuda"),
+            device=device,
         )
         if int(world_size) > 1:
             torch.distributed.all_reduce(memory_values, op=torch.distributed.ReduceOp.MAX)
     if int(rank) != 0:
-        if torch.cuda.is_available():
-            torch.cuda.reset_peak_memory_stats()
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
         return
     payload: dict[str, float | int | str] = {
         "stage": "provider_training_progress",
@@ -4675,8 +5075,8 @@ def _report_distributed_provider_progress(
         payload["cuda_peak_memory_allocated_gib"] = float(peak_allocated / (1024**3))
         payload["cuda_peak_memory_reserved_gib"] = float(peak_reserved / (1024**3))
     print(json.dumps(payload, sort_keys=True), flush=True)
-    if torch.cuda.is_available():
-        torch.cuda.reset_peak_memory_stats()
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
 
 
 def train_matcha_joint_model_from_sample_provider(
@@ -4693,6 +5093,7 @@ def train_matcha_joint_model_from_sample_provider(
     provider_prefetch_workers: int = 0,
     provider_prefetch_depth: int = 0,
     provider_progress_interval_steps: int = 0,
+    provider_fixed_audit_interval_steps: int = 0,
     provider_empty_cuda_cache_interval_steps: int = 0,
     warm_start_model: MatchaStyleJointModel | None = None,
     provider_name: str = "sample_provider",
@@ -4711,6 +5112,7 @@ def train_matcha_joint_model_from_sample_provider(
     prefetch_workers = max(0, int(provider_prefetch_workers))
     prefetch_depth = max(0, int(provider_prefetch_depth))
     progress_interval_steps = max(0, int(provider_progress_interval_steps))
+    fixed_audit_interval_steps = max(0, int(provider_fixed_audit_interval_steps))
     empty_cuda_cache_interval_steps = max(0, int(provider_empty_cuda_cache_interval_steps))
     rank, world_size = _distributed_training_context()
     first_samples = get_sample(0)
@@ -4743,34 +5145,77 @@ def train_matcha_joint_model_from_sample_provider(
         order_rng = np.random.default_rng(int(cfg.seed) + int(salt) + int(epoch))
         return int(order_rng.permutation(int(count))[position])
 
-    initial_loss = _loss_value_for_samples(model, first_samples, cfg, device, seed=int(cfg.seed))
-    validation_history: list[dict[str, float | int]] = []
-    best_validation_loss = float("inf")
+    initial_loss = _loss_value_for_samples(
+        model,
+        first_samples,
+        cfg,
+        device,
+        seed=int(cfg.seed),
+        landmark_memory_bank=landmark_memory_bank,
+    )
+    fixed_audit_history: list[dict[str, float | int]] = []
+    if int(fixed_audit_interval_steps) > 0:
+        fixed_audit_history.append({"step": 0, "loss": float(initial_loss)})
+    validation_history: list[dict[str, float | int | str]] = []
+    best_validation_value = float("inf")
+    best_validation_total_loss = float("inf")
     best_validation_step = -1
     best_state: dict[str, torch.Tensor] | None = None
+    validation_elapsed_seconds = 0.0
+    fixed_audit_elapsed_seconds = 0.0
+    training_loop_started: float | None = None
 
     def maybe_validate(step: int) -> None:
-        nonlocal best_validation_loss, best_validation_step, best_state
+        nonlocal best_validation_value, best_validation_total_loss, best_validation_step, best_state, validation_elapsed_seconds
         if get_validation_sample is None or validation_provider_count <= 0:
             return
-        values = []
+        validation_started = time.perf_counter()
+        evaluations = []
         for validation_index in range(validation_provider_count):
             samples = get_validation_sample(int(validation_index))
-            values.append(
-                _loss_value_for_samples(
+            evaluations.append(
+                _loss_and_metrics_for_samples(
                     model,
                     samples,
                     cfg,
                     device,
                     seed=int(cfg.seed) + 50000 + int(validation_index),
+                    landmark_memory_bank=landmark_memory_bank,
                 )
             )
-        value = float(np.mean(values)) if values else float("inf")
-        validation_history.append({"step": int(step), "loss": float(value)})
-        if value < best_validation_loss:
-            best_validation_loss = float(value)
+        row = _aggregate_validation_evaluations(
+            evaluations,
+            selection_metric=str(cfg.validation_selection_metric),
+        )
+        row["step"] = int(step)
+        validation_history.append(row)
+        selection_value = float(row["selection_value"])
+        if selection_value < best_validation_value:
+            best_validation_value = selection_value
+            best_validation_total_loss = float(row["loss"])
             best_validation_step = int(step)
             best_state = _model_state_snapshot(model)
+        validation_seconds = float(time.perf_counter() - validation_started)
+        if int(rank) == 0:
+            print(
+                json.dumps(
+                    {
+                        "stage": "provider_validation",
+                        "step": int(step),
+                        "steps": int(cfg.steps),
+                        **row,
+                        "best_validation_metric": str(cfg.validation_selection_metric),
+                        "best_validation_value": float(best_validation_value),
+                        "best_validation_total_loss": float(best_validation_total_loss),
+                        "best_step": int(best_validation_step),
+                        "elapsed_seconds": float(validation_seconds),
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+        if training_loop_started is not None:
+            validation_elapsed_seconds += validation_seconds
 
     maybe_validate(0)
     model.train()
@@ -4844,19 +5289,59 @@ def train_matcha_joint_model_from_sample_provider(
             consumed_training_pairs += int(pair_batch_size)
         _average_distributed_model_gradients(model, int(world_size))
         optimizer.step()
+        should_fixed_audit = int(fixed_audit_interval_steps) > 0 and (
+            (int(step) + 1) % int(fixed_audit_interval_steps) == 0
+            or int(step) + 1 == int(cfg.steps)
+        )
+        if should_fixed_audit:
+            fixed_audit_started = time.perf_counter()
+            fixed_audit_loss = _loss_value_for_samples(
+                model,
+                first_samples,
+                cfg,
+                device,
+                seed=int(cfg.seed),
+                landmark_memory_bank=landmark_memory_bank,
+            )
+            fixed_audit_history.append(
+                {"step": int(step) + 1, "loss": float(fixed_audit_loss)}
+            )
+            fixed_audit_elapsed_seconds += float(
+                time.perf_counter() - fixed_audit_started
+            )
+            if int(rank) == 0:
+                print(
+                    json.dumps(
+                        {
+                            "stage": "provider_fixed_audit",
+                            "step": int(step) + 1,
+                            "steps": int(cfg.steps),
+                            "loss": float(fixed_audit_loss),
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
         should_report = int(progress_interval_steps) > 0 and (
             (int(step) + 1) % int(progress_interval_steps) == 0 or int(step) + 1 == int(cfg.steps)
         )
         if should_report:
+            active_training_seconds = max(
+                float(time.perf_counter() - training_loop_started)
+                - float(validation_elapsed_seconds)
+                - float(fixed_audit_elapsed_seconds),
+                1e-9,
+            )
             _report_distributed_provider_progress(
                 step=int(step) + 1,
                 steps=int(cfg.steps),
                 rank=int(rank),
                 world_size=int(world_size),
-                elapsed_seconds=float(time.perf_counter() - training_loop_started),
+                elapsed_seconds=active_training_seconds,
                 global_pair_count=int(consumed_training_pairs) * int(world_size),
                 metric_sums=progress_metric_sums,
                 metric_counts=progress_metric_counts,
+                device=device,
             )
             progress_metric_sums.clear()
             progress_metric_counts.clear()
@@ -4868,6 +5353,7 @@ def train_matcha_joint_model_from_sample_provider(
             torch.cuda.empty_cache()
         if get_validation_sample is not None and validation_provider_count > 0 and int(validation_interval) > 0 and ((int(step) + 1) % int(validation_interval) == 0):
             maybe_validate(int(step) + 1)
+    training_loop_finished = time.perf_counter()
     if get_validation_sample is not None and validation_provider_count > 0 and (not validation_history or int(validation_history[-1]["step"]) != int(cfg.steps)):
         maybe_validate(int(cfg.steps))
     if best_state is not None:
@@ -4886,7 +5372,21 @@ def train_matcha_joint_model_from_sample_provider(
         total_loss_count=int(total_loss_count),
         memory_size=0 if landmark_memory_bank is None else int(len(landmark_memory_bank)),
     )
-    final_loss = _loss_value_for_samples(model, first_samples, cfg, device, seed=int(cfg.seed))
+    final_loss = _loss_value_for_samples(
+        model,
+        first_samples,
+        cfg,
+        device,
+        seed=int(cfg.seed),
+        landmark_memory_bank=landmark_memory_bank,
+    )
+    training_wall_seconds = float(training_loop_finished - training_loop_started)
+    active_training_seconds = max(
+        training_wall_seconds
+        - float(validation_elapsed_seconds)
+        - float(fixed_audit_elapsed_seconds),
+        1e-9,
+    )
     eval_samples = get_validation_sample(0) if get_validation_sample is not None and validation_provider_count > 0 else first_samples
     summary = {
         "stage": "matcha_style_joint_training",
@@ -4910,6 +5410,9 @@ def train_matcha_joint_model_from_sample_provider(
         "provider_prefetch_workers": int(prefetch_workers),
         "provider_prefetch_depth": int(prefetch_depth),
         "provider_progress_interval_steps": int(progress_interval_steps),
+        "provider_fixed_audit_interval_steps": int(fixed_audit_interval_steps),
+        "provider_fixed_audit_count": int(len(fixed_audit_history)),
+        "provider_fixed_audit_history": fixed_audit_history,
         "provider_empty_cuda_cache_interval_steps": int(empty_cuda_cache_interval_steps),
         "provider_first_pair_sample_count": int(first_samples.coarse_fine_samples.sample_count),
         "provider_last_pair_sample_count": int(last_samples.coarse_fine_samples.sample_count),
@@ -4917,10 +5420,13 @@ def train_matcha_joint_model_from_sample_provider(
         "distributed_rank": int(rank),
         "distributed_world_size": int(world_size),
         "train_total_loss_mean": float(total_loss_sum) / float(max(1, int(total_loss_count))),
-        "training_loop_elapsed_sec": float(time.perf_counter() - training_loop_started),
+        "training_loop_elapsed_sec": float(active_training_seconds),
+        "training_loop_wall_elapsed_sec": float(training_wall_seconds),
+        "provider_validation_elapsed_sec": float(validation_elapsed_seconds),
+        "provider_fixed_audit_elapsed_sec": float(fixed_audit_elapsed_seconds),
         "training_global_pairs_per_second": (
             float(consumed_training_pairs) * float(world_size)
-            / max(float(time.perf_counter() - training_loop_started), 1e-9)
+            / float(active_training_seconds)
         ),
         "loss_audit_source": "provider_index_0_fixed_subset",
     }
@@ -4938,15 +5444,28 @@ def train_matcha_joint_model_from_sample_provider(
     if get_validation_sample is not None and validation_provider_count > 0:
         summary.update(
             {
-                "best_validation_loss": float(best_validation_loss),
+                "best_validation_loss": float(best_validation_value),
+                "best_validation_metric": str(cfg.validation_selection_metric),
+                "best_validation_value": float(best_validation_value),
+                "best_validation_total_loss": float(best_validation_total_loss),
+                "best_validation_loss_compatibility_semantics": "selection_value",
                 "best_validation_step": int(best_validation_step),
                 "validation_eval_count": int(len(validation_history)),
                 "validation_history": validation_history,
                 "validation_provider_lazy": True,
                 "validation_provider_sample_count": int(validation_provider_count),
+                "validation_retrieval_metric_reduction": "weighted_by_landmark_retrieval_valid_count",
             }
         )
-    summary.update(_evaluate(model, eval_samples, cfg, device))
+    summary.update(
+        _evaluate(
+            model,
+            eval_samples,
+            cfg,
+            device,
+            landmark_memory_bank=landmark_memory_bank,
+        )
+    )
     return MatchaJointTrainingRun(model=model.cpu().eval(), summary=summary)
 
 
@@ -5228,6 +5747,10 @@ def save_matcha_joint_training_set_npz(
             landmark_track_ids=_optional_npz_value(samples.landmark_track_ids),
             landmark_track_xyz=_optional_npz_value(samples.landmark_track_xyz),
             landmark_support_view_counts=_optional_npz_value(samples.landmark_support_view_counts),
+            landmark_known_positive_offsets=_optional_npz_value(samples.landmark_known_positive_offsets),
+            landmark_known_positive_track_ids=_optional_npz_value(samples.landmark_known_positive_track_ids),
+            landmark_strict_positive_offsets=_optional_npz_value(samples.landmark_strict_positive_offsets),
+            landmark_strict_positive_track_ids=_optional_npz_value(samples.landmark_strict_positive_track_ids),
             query_repeatability_targets=_optional_npz_value(samples.query_repeatability_targets),
             render_repeatability_targets=_optional_npz_value(samples.render_repeatability_targets),
         )
@@ -5290,6 +5813,10 @@ def save_matcha_joint_training_set_npz(
         landmark_track_ids=_optional_npz_value(samples.landmark_track_ids),
         landmark_track_xyz=_optional_npz_value(samples.landmark_track_xyz),
         landmark_support_view_counts=_optional_npz_value(samples.landmark_support_view_counts),
+        landmark_known_positive_offsets=_optional_npz_value(samples.landmark_known_positive_offsets),
+        landmark_known_positive_track_ids=_optional_npz_value(samples.landmark_known_positive_track_ids),
+        landmark_strict_positive_offsets=_optional_npz_value(samples.landmark_strict_positive_offsets),
+        landmark_strict_positive_track_ids=_optional_npz_value(samples.landmark_strict_positive_track_ids),
         query_repeatability_targets=_optional_npz_value(samples.query_repeatability_targets),
         render_repeatability_targets=_optional_npz_value(samples.render_repeatability_targets),
     )
@@ -5372,6 +5899,10 @@ def load_matcha_joint_training_set_npz(path: Path) -> tuple[MatchaJointTrainingS
                 landmark_track_ids=_optional_loaded(data, "landmark_track_ids"),
                 landmark_track_xyz=_optional_loaded(data, "landmark_track_xyz"),
                 landmark_support_view_counts=_optional_loaded(data, "landmark_support_view_counts"),
+                landmark_known_positive_offsets=_optional_loaded(data, "landmark_known_positive_offsets"),
+                landmark_known_positive_track_ids=_optional_loaded(data, "landmark_known_positive_track_ids"),
+                landmark_strict_positive_offsets=_optional_loaded(data, "landmark_strict_positive_offsets"),
+                landmark_strict_positive_track_ids=_optional_loaded(data, "landmark_strict_positive_track_ids"),
                 query_repeatability_targets=_optional_loaded(data, "query_repeatability_targets"),
                 render_repeatability_targets=_optional_loaded(data, "render_repeatability_targets"),
             )
@@ -5437,6 +5968,10 @@ def load_matcha_joint_training_set_npz(path: Path) -> tuple[MatchaJointTrainingS
             landmark_track_ids=_optional_loaded(data, "landmark_track_ids"),
             landmark_track_xyz=_optional_loaded(data, "landmark_track_xyz"),
             landmark_support_view_counts=_optional_loaded(data, "landmark_support_view_counts"),
+            landmark_known_positive_offsets=_optional_loaded(data, "landmark_known_positive_offsets"),
+            landmark_known_positive_track_ids=_optional_loaded(data, "landmark_known_positive_track_ids"),
+            landmark_strict_positive_offsets=_optional_loaded(data, "landmark_strict_positive_offsets"),
+            landmark_strict_positive_track_ids=_optional_loaded(data, "landmark_strict_positive_track_ids"),
             query_repeatability_targets=_optional_loaded(data, "query_repeatability_targets"),
             render_repeatability_targets=_optional_loaded(data, "render_repeatability_targets"),
         )
@@ -5634,6 +6169,10 @@ def merge_matcha_joint_training_sets(
         landmark_track_ids = None
         landmark_track_xyz = None
         landmark_support_view_counts = None
+        landmark_known_positive_offsets = None
+        landmark_known_positive_track_ids = None
+        landmark_strict_positive_offsets = None
+        landmark_strict_positive_track_ids = None
     elif any(array is None for array in landmark_arrays):
         raise ValueError("cannot merge partially missing landmark retrieval supervision")
     else:
@@ -5649,6 +6188,46 @@ def merge_matcha_joint_training_sets(
         landmark_track_ids = stack_optional("landmark_track_ids")
         landmark_track_xyz = stack_optional("landmark_track_xyz")
         landmark_support_view_counts = stack_optional("landmark_support_view_counts")
+        known_offsets = [item.landmark_known_positive_offsets for item in values]
+        known_track_ids = [item.landmark_known_positive_track_ids for item in values]
+        if all(item is None for item in [*known_offsets, *known_track_ids]):
+            landmark_known_positive_offsets = None
+            landmark_known_positive_track_ids = None
+        elif any(item is None for item in [*known_offsets, *known_track_ids]):
+            raise ValueError("cannot merge partially missing landmark known-positive CSR")
+        else:
+            known_counts = np.concatenate(
+                [np.diff(np.asarray(item, dtype=np.int64).reshape(-1)) for item in known_offsets],
+                axis=0,
+            )
+            landmark_known_positive_offsets = np.zeros(
+                (known_counts.size + 1,), dtype=np.int64
+            )
+            landmark_known_positive_offsets[1:] = np.cumsum(known_counts)
+            landmark_known_positive_track_ids = np.concatenate(
+                [np.asarray(item, dtype=np.int64).reshape(-1) for item in known_track_ids],
+                axis=0,
+            )
+        strict_offsets = [item.landmark_strict_positive_offsets for item in values]
+        strict_track_ids = [item.landmark_strict_positive_track_ids for item in values]
+        if all(item is None for item in [*strict_offsets, *strict_track_ids]):
+            landmark_strict_positive_offsets = None
+            landmark_strict_positive_track_ids = None
+        elif any(item is None for item in [*strict_offsets, *strict_track_ids]):
+            raise ValueError("cannot merge partially missing landmark strict-positive CSR")
+        else:
+            strict_counts = np.concatenate(
+                [np.diff(np.asarray(item, dtype=np.int64).reshape(-1)) for item in strict_offsets],
+                axis=0,
+            )
+            landmark_strict_positive_offsets = np.zeros(
+                (strict_counts.size + 1,), dtype=np.int64
+            )
+            landmark_strict_positive_offsets[1:] = np.cumsum(strict_counts)
+            landmark_strict_positive_track_ids = np.concatenate(
+                [np.asarray(item, dtype=np.int64).reshape(-1) for item in strict_track_ids],
+                axis=0,
+            )
     if all(array is None for array in fine_arrays):
         fine_pair_indices = None
         fine_query_indices = None
@@ -5737,6 +6316,10 @@ def merge_matcha_joint_training_sets(
         landmark_track_ids=landmark_track_ids,
         landmark_track_xyz=landmark_track_xyz,
         landmark_support_view_counts=landmark_support_view_counts,
+        landmark_known_positive_offsets=landmark_known_positive_offsets,
+        landmark_known_positive_track_ids=landmark_known_positive_track_ids,
+        landmark_strict_positive_offsets=landmark_strict_positive_offsets,
+        landmark_strict_positive_track_ids=landmark_strict_positive_track_ids,
         query_repeatability_targets=stack_optional("query_repeatability_targets"),
         render_repeatability_targets=stack_optional("render_repeatability_targets"),
     )

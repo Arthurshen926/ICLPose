@@ -33,6 +33,7 @@ from feature_extract.vfm.matcha_joint_training import (
     load_matcha_joint_training_set_npz,
     merge_matcha_joint_training_sets,
     save_matcha_joint_model,
+    subset_landmark_known_positive_csr,
     train_matcha_joint_model,
     train_matcha_joint_model_from_manifest,
     train_matcha_joint_model_from_sample_provider,
@@ -46,6 +47,8 @@ def validate_frozen_landmark_bank_contract(
     warm_start_checkpoint: Path | None,
     support_observations: Path,
     expected_source_image_count: int | None = None,
+    required_source_image_ids: set[str] | None = None,
+    forbidden_source_image_ids: set[str] | None = None,
 ) -> dict[str, object]:
     with np.load(Path(bank_path), allow_pickle=False) as data:
         metadata = json.loads(str(data["metadata_json"].item())) if "metadata_json" in data else {}
@@ -76,6 +79,44 @@ def validate_frozen_landmark_bank_contract(
             "frozen landmark bank source-image count does not match the allowed training support split: "
             f"expected={int(expected_source_image_count)}, got={metadata.get('source_image_count')!r}"
         )
+    source_image_ids: set[str] | None = None
+    source_manifest_path = str(metadata.get("token_manifest", ""))
+    if required_source_image_ids is not None or forbidden_source_image_ids is not None:
+        if not source_manifest_path:
+            raise ValueError(
+                "frozen landmark bank requires its source token manifest for image-set validation"
+            )
+        source_manifest = TokenBankManifest.from_json(Path(source_manifest_path))
+        source_manifest.validate(verify_checksums=False)
+        source_image_ids = {str(record.image_id) for record in source_manifest.records}
+        if len(source_image_ids) != len(source_manifest.records):
+            raise ValueError("frozen landmark bank source manifest has duplicate image ids")
+        recorded_manifest_hash = str(metadata.get("token_manifest_sha256", ""))
+        actual_manifest_hash = file_sha256_short(Path(source_manifest_path))
+        if recorded_manifest_hash and recorded_manifest_hash != actual_manifest_hash:
+            raise ValueError("frozen landmark bank source token manifest hash is stale")
+        if int(metadata.get("source_image_count", -1)) != len(source_image_ids):
+            raise ValueError(
+                "frozen landmark bank source-image count disagrees with its token manifest"
+            )
+        required = set() if required_source_image_ids is None else {
+            str(value) for value in required_source_image_ids
+        }
+        missing = sorted(required - source_image_ids)
+        if missing:
+            raise ValueError(
+                "frozen landmark bank is missing required mapping support images: "
+                f"count={len(missing)}, preview={missing[:3]!r}"
+            )
+        forbidden = set() if forbidden_source_image_ids is None else {
+            str(value) for value in forbidden_source_image_ids
+        }
+        overlap = sorted(source_image_ids.intersection(forbidden))
+        if overlap:
+            raise ValueError(
+                "frozen landmark bank contains held-out query images: "
+                f"count={len(overlap)}, preview={overlap[:3]!r}"
+            )
     return {
         "path": str(bank_path),
         "descriptor_space_id": str(metadata.get("descriptor_space_id", "")),
@@ -84,6 +125,18 @@ def validate_frozen_landmark_bank_contract(
         "support_observations": str(support_observations),
         "support_observations_sha256": expected_track_hash,
         "source_image_count": int(metadata.get("source_image_count", 0)),
+        "source_token_manifest": source_manifest_path,
+        "source_image_set_validated": bool(source_image_ids is not None),
+        "required_source_image_count": (
+            None
+            if required_source_image_ids is None
+            else int(len(required_source_image_ids))
+        ),
+        "forbidden_source_image_count": (
+            None
+            if forbidden_source_image_ids is None
+            else int(len(forbidden_source_image_ids))
+        ),
         "warm_start_checkpoint_sha256": str(metadata.get("matcha_joint_checkpoint_sha256", "")),
         "validated": True,
     }
@@ -132,6 +185,108 @@ def validate_upstream_disjoint_manifest_contract(
         "heldout_image_count": int(len(excluded)),
         "training_pair_count": int(len(records)),
         "leaked_pair_count": 0,
+    }
+
+
+def validate_internal_query_disjoint_contract(
+    *,
+    train_manifest_path: Path,
+    validation_manifest_path: Path,
+    query_split_path: Path,
+    allowed_support_image_ids: set[str],
+    train_queries_are_heldout: bool = False,
+) -> dict[str, object]:
+    split_path = Path(query_split_path)
+    split = json.loads(split_path.read_text())
+    split_ids = {
+        name: {str(value) for value in split.get(name, [])}
+        for name in ("train", "validation", "test")
+    }
+    if any(not values for values in split_ids.values()):
+        raise ValueError("internal query-disjoint split requires non-empty train/validation/test sets")
+    if (
+        split_ids["train"] & split_ids["validation"]
+        or split_ids["train"] & split_ids["test"]
+        or split_ids["validation"] & split_ids["test"]
+    ):
+        raise ValueError("internal query-disjoint split sets overlap")
+    heldout = set().union(*split_ids.values())
+    train_manifest = json.loads(Path(train_manifest_path).read_text())
+    validation_manifest = json.loads(Path(validation_manifest_path).read_text())
+    expected_hash = file_sha256_short(split_path)
+    for role, manifest in (("train", train_manifest), ("validation", validation_manifest)):
+        contract = manifest.get("internal_query_disjoint_filter")
+        if not isinstance(contract, dict):
+            raise ValueError(f"{role} manifest has no internal query-disjoint contract")
+        recorded_hash = str(contract.get("query_split_sha256", ""))
+        if not recorded_hash.startswith(expected_hash):
+            raise ValueError(f"{role} manifest internal query split hash is stale")
+    train_records = list(train_manifest.get("records", []))
+    train_query_ids = {str(record.get("query_id", "")) for record in train_records}
+    if bool(train_queries_are_heldout):
+        if train_query_ids != split_ids["train"]:
+            raise ValueError(
+                "query-disjoint bank-positive training manifest query ids do not exactly "
+                "match the internal train split"
+            )
+        train_reference_leaks = sorted(
+            {
+                str(record.get("reference_image_id", ""))
+                for record in train_records
+                if str(record.get("reference_image_id", "")) in heldout
+            }
+        )
+        if train_reference_leaks:
+            raise ValueError("internal held-out images leaked into training support records")
+    else:
+        train_leaks = [
+            (str(record.get("query_id", "")), str(record.get("reference_image_id", "")))
+            for record in train_records
+            if str(record.get("query_id", "")) in heldout
+            or str(record.get("reference_image_id", "")) in heldout
+        ]
+        if train_leaks:
+            raise ValueError(
+                "internal held-out image leaked into training manifest: "
+                f"count={len(train_leaks)}, preview={train_leaks[:3]!r}"
+            )
+    validation_records = list(validation_manifest.get("records", []))
+    validation_query_ids = {
+        str(record.get("query_id", "")) for record in validation_records
+    }
+    if validation_query_ids != split_ids["validation"]:
+        raise ValueError("validation manifest query ids do not exactly match the internal validation split")
+    validation_reference_leaks = sorted(
+        {
+            str(record.get("reference_image_id", ""))
+            for record in validation_records
+            if str(record.get("reference_image_id", "")) in heldout
+        }
+    )
+    if validation_reference_leaks:
+        raise ValueError("internal held-out images leaked into validation support records")
+    support_overlap = sorted(set(allowed_support_image_ids).intersection(heldout))
+    if support_overlap:
+        raise ValueError(
+            "internal held-out query images leaked into the episode support manifest: "
+            f"count={len(support_overlap)}, preview={support_overlap[:3]!r}"
+        )
+    return {
+        "validated": True,
+        "query_split": str(split_path),
+        "query_split_sha256": expected_hash,
+        "heldout_query_count": int(len(heldout)),
+        "development_query_count": int(len(split_ids["train"])),
+        "validation_query_count": int(len(split_ids["validation"])),
+        "untouched_internal_test_query_count": int(len(split_ids["test"])),
+        "training_record_count": int(len(train_records)),
+        "training_query_count": int(len(train_query_ids)),
+        "training_query_mode": (
+            "query_disjoint_train_split" if bool(train_queries_are_heldout) else "support_image_queries"
+        ),
+        "validation_record_count": int(len(validation_records)),
+        "allowed_support_image_count": int(len(allowed_support_image_ids)),
+        "query_support_disjoint": True,
     }
 
 
@@ -455,6 +610,26 @@ class RealRadioMultiViewEpisodeProvider:
                     f"track-centric episode target {target_track_id} has {support_count} support rows; "
                     f"expected {len(support_items)}"
                 )
+            known_positive_offsets = merged.landmark_known_positive_offsets
+            known_positive_track_ids = merged.landmark_known_positive_track_ids
+            if known_positive_offsets is not None and known_positive_track_ids is not None:
+                known_positive_offsets, known_positive_track_ids = (
+                    subset_landmark_known_positive_csr(
+                        known_positive_offsets,
+                        known_positive_track_ids,
+                        target_keep,
+                    )
+                )
+            strict_positive_offsets = merged.landmark_strict_positive_offsets
+            strict_positive_track_ids = merged.landmark_strict_positive_track_ids
+            if strict_positive_offsets is not None and strict_positive_track_ids is not None:
+                strict_positive_offsets, strict_positive_track_ids = (
+                    subset_landmark_known_positive_csr(
+                        strict_positive_offsets,
+                        strict_positive_track_ids,
+                        target_keep,
+                    )
+                )
             merged = replace(
                 merged,
                 landmark_sample_pair_indices=np.asarray(merged.landmark_sample_pair_indices)[target_keep],
@@ -463,6 +638,10 @@ class RealRadioMultiViewEpisodeProvider:
                 landmark_track_ids=selected_tracks[target_keep],
                 landmark_track_xyz=np.asarray(merged.landmark_track_xyz)[target_keep],
                 landmark_support_view_counts=np.asarray(merged.landmark_support_view_counts)[target_keep],
+                landmark_known_positive_offsets=known_positive_offsets,
+                landmark_known_positive_track_ids=known_positive_track_ids,
+                landmark_strict_positive_offsets=strict_positive_offsets,
+                landmark_strict_positive_track_ids=strict_positive_track_ids,
             )
         return merged
 
@@ -859,7 +1038,11 @@ def _build_config(args: argparse.Namespace, samples: MatchaJointTrainingSet) -> 
         landmark_l2_normalize_observations=bool(args.landmark_l2_normalize_observations),
         landmark_normalize_final_prototypes=bool(args.landmark_normalize_final_prototypes),
         landmark_min_support_observations=int(args.landmark_min_support_observations),
+        landmark_positive_prototype_source=str(args.landmark_positive_prototype_source),
         landmark_set_valued_cell_positives=bool(args.landmark_set_valued_cell_positives),
+        landmark_exclude_known_cell_positives_from_memory=bool(
+            args.landmark_exclude_known_cell_positives_from_memory
+        ),
         landmark_memory_capacity=int(args.landmark_memory_capacity),
         landmark_frozen_negative_bank=str(args.landmark_frozen_negative_bank),
         landmark_memory_momentum=float(args.landmark_memory_momentum),
@@ -868,6 +1051,15 @@ def _build_config(args: argparse.Namespace, samples: MatchaJointTrainingSet) -> 
         landmark_geometry_hard_negatives_per_track=int(args.landmark_geometry_hard_negatives_per_track),
         landmark_random_negatives=int(args.landmark_random_negatives),
         landmark_max_memory_negatives=int(args.landmark_max_memory_negatives),
+        landmark_memory_negative_merge_policy=str(
+            args.landmark_memory_negative_merge_policy
+        ),
+        landmark_system_hard_negative_margin=float(
+            args.landmark_system_hard_negative_margin
+        ),
+        landmark_system_hard_negative_margin_weight=float(
+            args.landmark_system_hard_negative_margin_weight
+        ),
         landmark_dustbin_logit=float(args.landmark_dustbin_logit),
         landmark_dustbin_samples_per_image=int(args.landmark_dustbin_samples_per_image),
         landmark_dustbin_exclusion_radius_cells=int(args.landmark_dustbin_exclusion_radius_cells),
@@ -879,6 +1071,7 @@ def _build_config(args: argparse.Namespace, samples: MatchaJointTrainingSet) -> 
         gate_mode=str(args.gate_mode),
         residual_gate_scale=float(args.residual_gate_scale),
         map_pair_batch_size=int(args.map_pair_batch_size),
+        validation_selection_metric=str(args.validation_selection_metric),
         measurement_patch_loss_weight=float(args.measurement_patch_loss_weight),
         measurement_patch_direct_loss_weight=float(args.measurement_patch_direct_loss_weight),
         measurement_patch_epe_weight=float(args.measurement_patch_epe_weight),
@@ -912,6 +1105,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--upstream_disjoint_query_split",
         default="",
         help="Require that neither side of any referenced training pair occurs in this query split.",
+    )
+    parser.add_argument(
+        "--internal_query_disjoint_split",
+        default="",
+        help="Optional mapping-image development/validation/test split enforced across train, support, and bank scopes.",
     )
     parser.add_argument("--warm_start_joint_checkpoint", default="")
     parser.add_argument("--output_model", required=True)
@@ -956,9 +1154,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default="manifest",
     )
     parser.add_argument("--landmark_episodes_per_query", type=int, default=4)
+    parser.add_argument(
+        "--validation_landmark_episodes_per_query",
+        type=int,
+        default=0,
+        help="Validation episodes per query; 0 reuses --landmark_episodes_per_query.",
+    )
     parser.add_argument("--landmark_episode_sfm_candidate_pool_size", type=int, default=32)
     parser.add_argument("--landmark_retrieval_tracks_per_episode", type=int, default=16)
     parser.add_argument("--provider_progress_interval_steps", type=int, default=0)
+    parser.add_argument("--provider_fixed_audit_interval_steps", type=int, default=0)
     parser.add_argument("--provider_empty_cuda_cache_interval_steps", type=int, default=0)
     parser.add_argument("--model_type", choices=("radio_dual_attention", "residual_adapter"), default="residual_adapter")
     parser.add_argument("--output_dim", type=int, default=128)
@@ -1015,11 +1220,27 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.set_defaults(landmark_normalize_final_prototypes=True)
     parser.add_argument("--landmark_min_support_observations", type=int, default=1)
     parser.add_argument(
+        "--landmark_positive_prototype_source",
+        choices=("episode_support_observations", "query_disjoint_frozen_bank"),
+        default="episode_support_observations",
+        help=(
+            "Positive prototype contract. Frozen-bank positives are only permitted when "
+            "the internal split proves that every training query is absent from the bank."
+        ),
+    )
+    parser.add_argument(
         "--no_landmark_set_valued_cell_positives",
         dest="landmark_set_valued_cell_positives",
         action="store_false",
     )
     parser.set_defaults(landmark_set_valued_cell_positives=True)
+    parser.add_argument(
+        "--allow_landmark_known_cell_false_negatives",
+        dest="landmark_exclude_known_cell_positives_from_memory",
+        action="store_false",
+        help="Diagnostic ablation: allow globally mined tracks visible in the same query cell to act as negatives.",
+    )
+    parser.set_defaults(landmark_exclude_known_cell_positives_from_memory=True)
     parser.add_argument("--landmark_memory_capacity", type=int, default=65536)
     parser.add_argument(
         "--landmark_frozen_negative_bank",
@@ -1032,11 +1253,23 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Exact support-observation JSONL used to build the frozen bank; validated by hash.",
     )
     parser.add_argument("--landmark_memory_momentum", type=float, default=0.9)
-    parser.add_argument("--landmark_memory_candidate_pool_size", type=int, default=4096)
+    parser.add_argument(
+        "--landmark_memory_candidate_pool_size",
+        type=int,
+        default=0,
+        help="Frozen-bank candidates searched per step; 0 searches the complete global bank.",
+    )
     parser.add_argument("--landmark_semantic_hard_negatives_per_query", type=int, default=16)
     parser.add_argument("--landmark_geometry_hard_negatives_per_track", type=int, default=8)
     parser.add_argument("--landmark_random_negatives", type=int, default=128)
     parser.add_argument("--landmark_max_memory_negatives", type=int, default=2048)
+    parser.add_argument(
+        "--landmark_memory_negative_merge_policy",
+        choices=("legacy_source_concat", "source_balanced_round_robin"),
+        default="source_balanced_round_robin",
+    )
+    parser.add_argument("--landmark_system_hard_negative_margin", type=float, default=0.05)
+    parser.add_argument("--landmark_system_hard_negative_margin_weight", type=float, default=0.0)
     parser.add_argument("--landmark_dustbin_logit", type=float, default=0.0)
     parser.add_argument("--landmark_dustbin_samples_per_image", type=int, default=0)
     parser.add_argument("--landmark_dustbin_exclusion_radius_cells", type=int, default=1)
@@ -1072,6 +1305,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--measurement_patch_encoder_arch", default="simple")
     parser.add_argument("--measurement_patch_input_mode", default="rgb")
     parser.add_argument("--validation_interval", type=int, default=0)
+    parser.add_argument(
+        "--validation_selection_metric",
+        choices=("total_loss", "landmark_retrieval_loss"),
+        default="total_loss",
+        help=(
+            "Metric used to restore the best validation checkpoint. Retrieval-only "
+            "experiments should select landmark_retrieval_loss instead of mixed total loss."
+        ),
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--local_rank", "--local-rank", type=int, default=-1, help=argparse.SUPPRESS)
@@ -1083,6 +1325,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     distributed_runtime = _initialize_distributed_runtime(args)
     started = time.perf_counter()
     train_path = Path(args.joint_cache_manifest or args.joint_cache)
+    validation_path = (
+        Path(args.validation_joint_cache_manifest or args.validation_joint_cache)
+        if (args.validation_joint_cache_manifest or args.validation_joint_cache)
+        else None
+    )
     upstream_disjoint_contract = (
         validate_upstream_disjoint_manifest_contract(
             train_path,
@@ -1105,6 +1352,33 @@ def main(argv: Sequence[str] | None = None) -> None:
                 else None
             ),
         )
+    internal_query_disjoint_contract: dict[str, object] = {}
+    if str(args.internal_query_disjoint_split):
+        if validation_path is None or not bool(args.validation_joint_cache_manifest):
+            raise ValueError(
+                "internal query-disjoint training requires a referenced validation manifest"
+            )
+        if episode_support_image_ids is None:
+            raise ValueError(
+                "internal query-disjoint training requires an explicit episode support manifest"
+            )
+        internal_query_disjoint_contract = validate_internal_query_disjoint_contract(
+            train_manifest_path=train_path,
+            validation_manifest_path=validation_path,
+            query_split_path=Path(args.internal_query_disjoint_split),
+            allowed_support_image_ids=episode_support_image_ids,
+            train_queries_are_heldout=(
+                str(args.landmark_positive_prototype_source)
+                == "query_disjoint_frozen_bank"
+            ),
+        )
+    if str(args.landmark_positive_prototype_source) == "query_disjoint_frozen_bank":
+        if not str(args.landmark_frozen_negative_bank):
+            raise ValueError("query-disjoint frozen-bank positives require --landmark_frozen_negative_bank")
+        if not str(args.internal_query_disjoint_split):
+            raise ValueError(
+                "query-disjoint frozen-bank positives require --internal_query_disjoint_split"
+            )
     track_observation_index = _load_training_track_observation_index(
         args,
         distributed_runtime,
@@ -1183,7 +1457,6 @@ def main(argv: Sequence[str] | None = None) -> None:
     validation_manifest_path = None
     validation_metadata: dict[str, object] = {}
     validation_audit: dict[str, object] = {}
-    validation_path = Path(args.validation_joint_cache_manifest or args.validation_joint_cache) if (args.validation_joint_cache_manifest or args.validation_joint_cache) else None
     if validation_path is not None:
         validation_is_referenced = bool(args.validation_joint_cache_manifest) and _is_referenced_manifest(validation_path)
         if validation_is_referenced:
@@ -1194,6 +1467,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 require_landmark_retrieval_supervision=bool(require_landmark_retrieval),
                 feature_cache_size=int(args.referenced_feature_cache_size),
                 rgb_cache_size=int(args.referenced_rgb_cache_size),
+                load_rgb=bool(require_rgb),
                 track_xyz_by_id=track_xyz_by_id,
                 track_observation_index=track_observation_index,
             )
@@ -1204,7 +1478,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                     min_support_pairs=int(args.landmark_episode_min_support_pairs),
                     seed=int(args.landmark_episode_seed) + 1,
                     support_selection=str(args.landmark_episode_support_selection),
-                    episodes_per_query=int(args.landmark_episodes_per_query),
+                    episodes_per_query=(
+                        int(args.landmark_episodes_per_query)
+                        if int(args.validation_landmark_episodes_per_query) <= 0
+                        else int(args.validation_landmark_episodes_per_query)
+                    ),
                     sfm_candidate_pool_size=int(args.landmark_episode_sfm_candidate_pool_size),
                     retrieval_tracks_per_episode=int(args.landmark_retrieval_tracks_per_episode),
                     allowed_support_image_ids=getattr(train_provider, "allowed_support_image_ids", None),
@@ -1241,17 +1519,40 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
         if not str(support_observations):
             raise ValueError("frozen landmark bank validation requires support observations")
+        forbidden_source_image_ids: set[str] = set()
+        if str(args.upstream_disjoint_query_split):
+            query_split = json.loads(
+                Path(args.upstream_disjoint_query_split).read_text()
+            )
+            forbidden_source_image_ids = {
+                str(image_id)
+                for split_name in ("train", "validation", "test")
+                for image_id in query_split.get(split_name, [])
+            }
+        if str(args.internal_query_disjoint_split):
+            internal_split = json.loads(Path(args.internal_query_disjoint_split).read_text())
+            forbidden_source_image_ids.update(
+                str(image_id)
+                for split_name in ("train", "validation", "test")
+                for image_id in internal_split.get(split_name, [])
+            )
+        required_source_image_ids = (
+            set(train_provider.allowed_support_image_ids)
+            if isinstance(train_provider, RealRadioMultiViewEpisodeProvider)
+            else None
+        )
         frozen_bank_contract = validate_frozen_landmark_bank_contract(
             Path(args.landmark_frozen_negative_bank),
             warm_start_checkpoint=(
                 Path(args.warm_start_joint_checkpoint) if str(args.warm_start_joint_checkpoint) else None
             ),
             support_observations=support_observations,
+            required_source_image_ids=required_source_image_ids,
+            forbidden_source_image_ids=forbidden_source_image_ids,
             expected_source_image_count=(
-                len(train_provider.allowed_support_image_ids)
-                if isinstance(train_provider, RealRadioMultiViewEpisodeProvider)
-                and str(train_provider.support_selection) in {"sfm_track_overlap", "sfm_track_episode"}
-                else None
+                None
+                if required_source_image_ids is None
+                else int(len(required_source_image_ids))
             ),
         )
     cfg = _build_config(args, train_samples)
@@ -1284,6 +1585,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             provider_prefetch_workers=int(args.provider_prefetch_workers),
             provider_prefetch_depth=int(args.provider_prefetch_depth),
             provider_progress_interval_steps=int(args.provider_progress_interval_steps),
+            provider_fixed_audit_interval_steps=int(
+                args.provider_fixed_audit_interval_steps
+            ),
             provider_empty_cuda_cache_interval_steps=int(args.provider_empty_cuda_cache_interval_steps),
             warm_start_model=warm_start_model,
             provider_name=(
@@ -1359,8 +1663,35 @@ def main(argv: Sequence[str] | None = None) -> None:
             "requires_full_map_correspondence_indices": True,
             "requires_fine_measurement_supervision": bool(require_measurement),
             "requires_sfm_track_identity": bool(require_landmark_retrieval),
+            "validation_selection_metric": str(cfg.validation_selection_metric),
             "landmark_retrieval_target": "query_full_map_to_multi_observation_track_prototype",
-            "landmark_hard_negative_sources": ["same_pair_covisible", "global_semantic_memory", "nearby_3d_memory"],
+            "landmark_positive_prototype_source": str(cfg.landmark_positive_prototype_source),
+            "frozen_bank_query_visible_track_policy": (
+                "query_images_proven_absent_bank_tracks_may_be_positive"
+                if str(cfg.landmark_positive_prototype_source)
+                == "query_disjoint_frozen_bank"
+                else "exclude_from_negative_denominator_never_use_as_positive"
+            ),
+            "landmark_hard_negative_sources": [
+                "same_pair_covisible",
+                "global_semantic_memory",
+                "nearby_3d_memory",
+                "global_random_memory",
+            ],
+            "landmark_memory_search_scope": (
+                "full_global_exact"
+                if int(cfg.landmark_memory_candidate_pool_size) == 0
+                else "deterministic_random_presample"
+            ),
+            "landmark_memory_negative_merge_policy": str(
+                cfg.landmark_memory_negative_merge_policy
+            ),
+            "landmark_system_hard_negative_margin_weight": float(
+                cfg.landmark_system_hard_negative_margin_weight
+            ),
+            "landmark_exclude_known_cell_positives_from_memory": bool(
+                cfg.landmark_exclude_known_cell_positives_from_memory
+            ),
             "landmark_track_observations": str(args.landmark_track_observations),
             "requires_rgb_measurement_images": bool(require_rgb),
             "rejects_row_only_sample_cache": True,
@@ -1371,6 +1702,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         },
         "distributed_runtime": dict(distributed_runtime),
         "upstream_disjoint_contract": upstream_disjoint_contract,
+        "internal_query_disjoint_contract": internal_query_disjoint_contract,
         "frozen_landmark_bank_contract": frozen_bank_contract,
         "config": asdict(cfg),
         "training": dict(run.summary),

@@ -12,6 +12,7 @@ from typing import Sequence
 import numpy as np
 import torch
 
+from feature_extract.vfm.artifacts import file_sha256_short
 from feature_extract.tools.vfm.eval_real_radio_landmark_hybrid import (
     projected_cache_expected_metadata,
     validate_projected_cache_metadata,
@@ -39,6 +40,17 @@ from feature_extract.vfm.track_feature_sampling import _sample_feature_vector, l
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--query_manifest", required=True)
+    parser.add_argument(
+        "--query_split_json",
+        default="",
+        help="Optional explicit query split used to select unique records from query_manifest.",
+    )
+    parser.add_argument(
+        "--query_split_name",
+        default="",
+        choices=("", "train", "validation", "test"),
+        help="Split key in query_split_json. Both split arguments must be supplied together.",
+    )
     parser.add_argument("--track_observations_jsonl", required=True)
     parser.add_argument(
         "--bank_track_observations_jsonl",
@@ -84,6 +96,50 @@ def _resolve_device(device: str) -> str:
     if requested.type == "cuda" and not torch.cuda.is_available():
         return "cpu"
     return str(requested)
+
+
+def _select_query_records(
+    manifest: TokenBankManifest,
+    *,
+    query_split_json: Path | None,
+    query_split_name: str,
+) -> tuple[list[object], dict[str, object]]:
+    if (query_split_json is None) != (not str(query_split_name)):
+        raise ValueError("--query_split_json and --query_split_name must be provided together")
+    records = list(manifest.records)
+    if query_split_json is None:
+        return records, {"mode": "all_manifest_records", "query_count": int(len(records))}
+
+    split_path = Path(query_split_json)
+    split = json.loads(split_path.read_text())
+    query_ids = [str(value) for value in split.get(str(query_split_name), [])]
+    if not query_ids:
+        raise ValueError(f"query split {query_split_name!r} contains no query ids")
+    if len(set(query_ids)) != len(query_ids):
+        raise ValueError(f"query split {query_split_name!r} contains duplicate query ids")
+    records_by_id: dict[str, object] = {}
+    duplicate_manifest_ids: set[str] = set()
+    for record in records:
+        image_id = str(record.image_id)
+        if image_id in records_by_id:
+            duplicate_manifest_ids.add(image_id)
+        records_by_id[image_id] = record
+    if duplicate_manifest_ids:
+        raise ValueError(
+            "query manifest must contain unique image ids when an explicit split is used; "
+            f"duplicates={sorted(duplicate_manifest_ids)[:10]!r}"
+        )
+    missing = sorted(set(query_ids) - set(records_by_id))
+    if missing:
+        raise ValueError(f"query split ids missing from query manifest: {missing[:10]!r}")
+    selected = [records_by_id[query_id] for query_id in query_ids]
+    return selected, {
+        "mode": "explicit_query_split",
+        "query_split_json": str(split_path),
+        "query_split_sha256": file_sha256_short(split_path),
+        "query_split_name": str(query_split_name),
+        "query_count": int(len(selected)),
+    }
 
 
 def _track_stats(observations) -> tuple[dict[int, np.ndarray], dict[int, float]]:
@@ -142,7 +198,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     manifest = TokenBankManifest.from_json(Path(args.query_manifest))
     manifest.validate(verify_checksums=False)
     descriptor_source_config = token_feature_source_config(manifest, str(args.feature_key))
-    records = list(manifest.records)
+    records, query_selection = _select_query_records(
+        manifest,
+        query_split_json=(Path(args.query_split_json) if str(args.query_split_json) else None),
+        query_split_name=str(args.query_split_name),
+    )
     if int(args.max_queries) > 0:
         records = records[: int(args.max_queries)]
     query_ids = {str(record.image_id) for record in records}
@@ -266,6 +326,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         "rank_device": str(device),
         "query_count": int(len(records)),
         "query_count_with_observations": int(query_count_with_observations),
+        "query_selection": query_selection,
         "landmark_count": int(len(landmark_index)),
         "projected_landmark_cache_metadata": cache_metadata,
         "metrics": summarize_landmark_recall_records(recall_records, top_ks=top_ks),

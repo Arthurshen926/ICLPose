@@ -46,6 +46,42 @@ BASE_QUERY_INPUT_DIM = 70
 BASE_SUPPORT_INPUT_DIM = 71
 
 
+def _load_candidate_proposal_arrays(
+    path: Path, *, load_supervision: bool
+) -> dict[str, np.ndarray]:
+    """Load only arrays required by the requested execution role.
+
+    Inference is deliberately allow-listed.  A deny-list would silently start
+    loading future pose/GT audit arrays added to the proposal artifact.
+    """
+
+    required = {
+        "query_ids",
+        "xy",
+        "candidate_track_ids",
+        "candidate_prototype_ids",
+        "coarse_scores",
+    }
+    if bool(load_supervision):
+        required.update(
+            {
+                "candidate_gt_residuals_px",
+                "nearest_visible_residuals_px",
+                "nearest_visible_track_ids",
+            }
+        )
+    with np.load(Path(path), allow_pickle=False) as data:
+        missing = required - set(data.files)
+        if missing:
+            raise ValueError(
+                f"candidate proposals are missing arrays: {sorted(missing)}"
+            )
+        allowed = required | {
+            key for key in data.files if str(key).startswith("strategy__")
+        }
+        return {key: np.asarray(data[key]) for key in sorted(allowed)}
+
+
 @dataclass(frozen=True)
 class CandidateMapletEpisodeArrays:
     query_features: np.ndarray
@@ -214,18 +250,9 @@ class CandidateMapletEpisodeStore:
         self.episode_cache_size = int(episode_cache_size)
         self.load_supervision = bool(load_supervision)
 
-        with np.load(Path(proposals), allow_pickle=False) as data:
-            supervision_keys = {
-                "nearest_visible_bank_rows",
-                "nearest_visible_track_ids",
-                "nearest_visible_residuals_px",
-                "candidate_gt_residuals_px",
-            }
-            self.proposals = {
-                key: np.asarray(data[key])
-                for key in data.files
-                if self.load_supervision or key not in supervision_keys
-            }
+        self.proposals = _load_candidate_proposal_arrays(
+            Path(proposals), load_supervision=self.load_supervision
+        )
         with np.load(Path(detector_query_cache), allow_pickle=False) as data:
             self.query_cache = {key: np.asarray(data[key]) for key in data.files if key != "metadata_json"}
             self.query_metadata = json.loads(str(data["metadata_json"].item()))

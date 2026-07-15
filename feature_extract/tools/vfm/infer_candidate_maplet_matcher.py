@@ -164,6 +164,10 @@ def main(argv: Sequence[str] | None = None) -> None:
             "candidate_maplet_matcher_checkpoint_v5",
             "candidate_maplet_matcher_checkpoint_v6",
             "candidate_maplet_matcher_checkpoint_v7",
+            "candidate_maplet_matcher_checkpoint_v8",
+            "candidate_maplet_matcher_checkpoint_v9",
+            "candidate_maplet_matcher_checkpoint_v10",
+            "candidate_maplet_matcher_checkpoint_v11",
         }:
             raise ValueError(f"unsupported checkpoint: {checkpoint_path}")
         checkpoint_manifest = dict(checkpoint.get("data_manifest") or {})

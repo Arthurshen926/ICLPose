@@ -1616,6 +1616,154 @@ def estimate_pose_pnp_fixed(
     )
 
 
+def estimate_pose_pnp_fixed_hypotheses(
+    matches: Sequence[QueryTo3DMatch],
+    camera: ColmapCamera,
+    min_inliers: int = 4,
+    pnp_method: str = "AP3P",
+) -> tuple[PnPResult, ...]:
+    """Enumerate all visible P3P/AP3P solutions for one fixed minimal set."""
+
+    method_name = str(pnp_method).upper()
+    if method_name not in {"P3P", "AP3P"}:
+        return (
+            estimate_pose_pnp_fixed(
+                matches,
+                camera,
+                min_inliers=min_inliers,
+                pnp_method=method_name,
+                refine_method="none",
+            ),
+        )
+    if len(matches) < 4 or len(matches) < int(min_inliers):
+        return (
+            PnPResult(
+                success=False,
+                pose_w2c=None,
+                inlier_mask=np.zeros((len(matches),), dtype=bool),
+                match_count=len(matches),
+                inlier_count=0,
+            ),
+        )
+    try:
+        import cv2
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError("OpenCV is required for fixed PnP") from exc
+    method_attr = f"SOLVEPNP_{method_name}"
+    if not hasattr(cv2, method_attr) or not hasattr(cv2, "solvePnPGeneric"):
+        return (
+            estimate_pose_pnp_fixed(
+                matches,
+                camera,
+                min_inliers=min_inliers,
+                pnp_method=method_name,
+                refine_method="none",
+            ),
+        )
+
+    unique_matches, original_indices = deduplicate_pnp_matches(matches)
+    unique_matches, original_indices = canonicalize_pnp_solver_order(
+        unique_matches, original_indices
+    )
+    if len(unique_matches) != 4 or len(unique_matches) < int(min_inliers):
+        return (
+            estimate_pose_pnp_fixed(
+                matches,
+                camera,
+                min_inliers=min_inliers,
+                pnp_method=method_name,
+                refine_method="none",
+            ),
+        )
+    object_points = np.stack(
+        [match.xyz for match in unique_matches], axis=0
+    ).astype(np.float64)
+    image_points = np.stack(
+        [match.xy for match in unique_matches], axis=0
+    ).astype(np.float64)
+    camera_matrix, distortion = camera_matrix_and_distortion(camera)
+    try:
+        output = cv2.solvePnPGeneric(
+            object_points,
+            image_points,
+            camera_matrix,
+            distortion,
+            flags=getattr(cv2, method_attr),
+        )
+    except Exception:
+        output = ()
+    if len(output) < 3 or not bool(output[0]):
+        return (
+            estimate_pose_pnp_fixed(
+                matches,
+                camera,
+                min_inliers=min_inliers,
+                pnp_method=method_name,
+                refine_method="none",
+            ),
+        )
+
+    mask = np.zeros((len(matches),), dtype=bool)
+    mask[np.asarray(original_indices, dtype=np.int64)] = True
+    candidates: list[tuple[float, np.ndarray]] = []
+    for rvec, tvec in zip(output[1], output[2]):
+        rotation, _jacobian = cv2.Rodrigues(
+            np.asarray(rvec, dtype=np.float64).reshape(3, 1)
+        )
+        translation = np.asarray(tvec, dtype=np.float64).reshape(3)
+        if not np.all(np.isfinite(rotation)) or not np.all(np.isfinite(translation)):
+            continue
+        camera_points = object_points @ rotation.T + translation
+        if np.any(camera_points[:, 2] <= 1e-8):
+            continue
+        projected, _jacobian = cv2.projectPoints(
+            object_points,
+            np.asarray(rvec, dtype=np.float64).reshape(3, 1),
+            translation,
+            camera_matrix,
+            distortion,
+        )
+        reprojection = float(
+            np.mean(
+                np.linalg.norm(
+                    projected.reshape(-1, 2) - image_points,
+                    axis=1,
+                )
+            )
+        )
+        pose = np.eye(4, dtype=np.float64)
+        pose[:3, :3] = rotation
+        pose[:3, 3] = translation
+        if any(
+            np.linalg.norm(pose[:3, 3] - existing[:3, 3]) <= 1e-9
+            and np.linalg.norm(pose[:3, :3] - existing[:3, :3]) <= 1e-9
+            for _error, existing in candidates
+        ):
+            continue
+        candidates.append((reprojection, pose))
+    candidates.sort(key=lambda item: (float(item[0]), tuple(item[1].reshape(-1))))
+    if not candidates:
+        return (
+            estimate_pose_pnp_fixed(
+                matches,
+                camera,
+                min_inliers=min_inliers,
+                pnp_method=method_name,
+                refine_method="none",
+            ),
+        )
+    return tuple(
+        PnPResult(
+            success=True,
+            pose_w2c=pose,
+            inlier_mask=mask.copy(),
+            match_count=len(matches),
+            inlier_count=int(mask.sum()),
+        )
+        for _error, pose in candidates
+    )
+
+
 def estimate_pose_pnp_fixed_robust(
     matches: Sequence[QueryTo3DMatch],
     camera: ColmapCamera,

@@ -10,6 +10,7 @@ from feature_extract.vfm.colmap_tracks import (
     ColmapImageObservation,
     load_colmap_track_observations,
     read_colmap_cameras_binary,
+    read_colmap_image_camera_ids_binary,
     read_colmap_images_binary,
     scale_colmap_camera,
     write_colmap_cameras_binary,
@@ -79,6 +80,18 @@ def test_load_colmap_track_observations_filters_short_tracks(tmp_path):
     _write_points3d_bin(model_dir / "points3D.bin")
 
     assert load_colmap_track_observations(model_dir, min_track_length=3) == []
+
+
+def test_read_colmap_image_camera_ids_discards_pose_payload(tmp_path):
+    image_path = tmp_path / "images.bin"
+    _write_images_bin(image_path)
+
+    image_camera_ids = read_colmap_image_camera_ids_binary(image_path)
+
+    assert image_camera_ids == {
+        "seq1/frame0001.png": 1,
+        "seq1/frame0002.png": 1,
+    }
 
 
 def test_export_colmap_track_observations_cli_writes_jsonl_and_summary(tmp_path):

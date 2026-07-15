@@ -1,0 +1,62 @@
+protocol_id: oldhospital_latent_pose_dev_v1
+status: frozen_development_baseline
+development_only: true
+production_promoted: false
+untouched_test_available: false
+
+code:
+  baseline_commit: 4a70322343a286c44a10d2a41c4525bd5ebd9960
+
+artifacts:
+  mapper_checkpoint:
+    path: output/vfm/stage_r_matcha_joint/oldhospital/real_radio_joint_referenced_v1/s8_p18_upstream_disjoint_mapper_s300_featureonly_v7/joint.pt
+    sha256: 981626a4ffb96042e23018a20ba7fed36c375e14a35253cf74b039ac1578bf54
+  projected_observation_bank:
+    path: output/vfm/stage_r_matcha_joint/oldhospital/real_radio_joint_referenced_v1/s8_p18_upstream_disjoint_mapper_s300_featureonly_v7/bank_mean/projected_observations_mean.npz
+    sha256: 53aa8994189c55d17f571a33f78eb78c069643e4a54105ada844658e551ff5f9
+  proposals:
+    path: output/vfm/stage_r_matcha_joint/oldhospital/real_radio_joint_referenced_v1/s8_p19_disjoint_support_probe_v1/detector_support_reranked_proposals.npz
+    sha256: 677dea1b482d0b1de942f1ff41e669397eb09600427e59ebc3a4e15c75c24a28
+  candidate_features:
+    path: output/vfm/stage_r_matcha_joint/oldhospital/real_radio_joint_referenced_v1/s8_p19_disjoint_maplet_features_q128_k20_v1/features.npz
+    sha256: aa138208e4712d426ac47bab9276603a7f224d5d140c67837e02fd930e59c641
+  candidate_evidence:
+    path: output/vfm/stage_r_matcha_joint/oldhospital/real_radio_joint_referenced_v1/s12_p20_candidate_evidence_v3_top5_ensemble_v1/candidate_evidence_v3.npz
+    sha256: cd257eacb2387847cfb151e88f2018501159b2dce4de08087e4fbca7bd5b321f
+  candidate_scores:
+    path: output/vfm/stage_r_matcha_joint/oldhospital/real_radio_joint_referenced_v1/s12_p23_radiointermediate_viewmarginal_ensemble_fullscores_v1/ensemble_scores.npz
+    sha256: a7c0e38d1f97c861c17a8d4b22ee5c251172be3d81a60a973b63c4b7bf0bf33a
+  query_split:
+    path: output/vfm/stage_r_matcha_joint/oldhospital/real_radio_joint_referenced_v1/s4_l64_multisequence_split_v1/query_split.json
+    sha256: b8ef43cccee9f19f935a03ab93596eaa4500883266564d6620e85d5d80986cc3
+  candidate_geometry_verifier:
+    path: output/vfm/stage_r_matcha_joint/oldhospital/real_radio_joint_referenced_v1/s23_p20_candidate_geometry_verifier_2px_p18_v1/candidate_geometry_verifier.json
+    sha256: ea9e98a0055c8eab3d1d180a74f37c16a3c20c390cb3436068ebddba6ccbc523
+  coordinate_update_verifier:
+    path: output/vfm/stage_r_matcha_joint/oldhospital/real_radio_joint_referenced_v1/s45_p22_candidate_coordinate_update_verifier_v1/candidate_update_verifier.json
+    sha256: 8e5bdc8a5b072eb19b5ee986ec61f27730fe29255f708ef63dd6ef75bfbed572
+
+frozen_results:
+  s43:
+    path: output/vfm/stage_r_matcha_joint/oldhospital/real_radio_joint_referenced_v1/s43_p22_geometry_map_gridfallback_strict_optional_refine_v1/summary.json
+    sha256: 36f73652fa6d82356b55b874724d87ef8ace454b84453cbc49afddb0c2c4ef58
+    validation_translation_median_m: 0.18224320721113263
+    validation_translation_p90_m: 0.9695120425807856
+    validation_rotation_median_deg: 0.40918660108797766
+    validation_hypothesis_oracle_median_m: 0.07610546717862322
+    late_translation_median_m: 0.1558126246641078
+    late_translation_p90_m: 0.7499911318222199
+    late_rotation_median_deg: 0.3813125678843481
+    late_hypothesis_oracle_median_m: 0.07144098991881404
+  s47:
+    path: output/vfm/stage_r_matcha_joint/oldhospital/real_radio_joint_referenced_v1/s47_p22_selected_candidate_coordinate_refine_min4_grid2_v1/summary.json
+    sha256: 491044bc185f901e84340a972bfb4c68877e20f830b47456a0cad5acbb6a18ae
+    aggregate_pose_matches_s43: true
+
+promotion_gates:
+  proposal_oracle_median_m: 0.0319
+  p21a_target_hypothesis_oracle_median_m: 0.05
+  require_hypothesis_oracle_p90_nondegradation: true
+  require_cross_block_replay: true
+  reject_if_selected_p90_regresses: true
+

@@ -50,3 +50,38 @@ def test_split_measurement_rows_by_query_writes_disjoint_rows_and_manifests(tmp_
     val_manifest = _read_csv(Path(summary["outputs"]["val_render_cache_manifest_csv"]))
     assert {row["query_id"] for row in train_manifest} == {"q0.png", "q1.png", "q2.png"}
     assert {row["query_id"] for row in val_manifest} == {"q3.png"}
+
+
+def test_hash_query_split_is_stable_and_query_disjoint(tmp_path: Path) -> None:
+    rows_csv = tmp_path / "measurement_rows.csv"
+    with rows_csv.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["query_id", "match_index"])
+        writer.writeheader()
+        for query_index in range(30):
+            for match_index in range(2):
+                writer.writerow(
+                    {
+                        "query_id": f"q{query_index:02d}.png",
+                        "match_index": str(match_index),
+                    }
+                )
+
+    first = split_measurement_rows_by_query(
+        rows_csv=rows_csv,
+        output_dir=tmp_path / "first",
+        hash_folds=3,
+        hash_val_fold=2,
+        hash_salt="production-calibration",
+    )
+    second = split_measurement_rows_by_query(
+        rows_csv=rows_csv,
+        output_dir=tmp_path / "second",
+        hash_folds=3,
+        hash_val_fold=2,
+        hash_salt="production-calibration",
+    )
+
+    assert first["split_strategy"] == "stable_sha256_query_fold"
+    assert first["val_query_ids"] == second["val_query_ids"]
+    assert set(first["train_query_ids"]).isdisjoint(first["val_query_ids"])
+    assert first["train_row_count"] + first["val_row_count"] == 60

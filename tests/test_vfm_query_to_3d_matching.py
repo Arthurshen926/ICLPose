@@ -16,6 +16,7 @@ from feature_extract.vfm.query_to_3d_matching import (
     canonicalize_pnp_solver_order,
     deduplicate_pnp_matches,
     estimate_pose_pnp_fixed,
+    estimate_pose_pnp_fixed_hypotheses,
     estimate_pose_pnp_fixed_robust,
     estimate_pose_pnp_ransac,
     filter_matches_by_local_geometric_consistency,
@@ -290,6 +291,43 @@ def test_query_tokens_match_landmarks_and_support_pnp() -> None:
 
     with pytest.raises(ValueError, match="unsupported PnP method"):
         estimate_pose_pnp_ransac(matches, _camera(), pnp_method="BAD")
+
+
+def test_fixed_ap3p_enumerates_deterministic_visible_hypotheses() -> None:
+    xy = np.asarray(
+        [[18.0, 22.0], [82.0, 25.0], [28.0, 79.0], [76.0, 73.0]],
+        dtype=np.float64,
+    )
+    xyz = _xyz_from_xy(xy, np.asarray([4.0, 5.5, 7.0, 9.0]))
+    matches = [
+        QueryTo3DMatch(
+            token_index=index,
+            xy=xy[index],
+            track_id=100 + index,
+            xyz=xyz[index],
+            similarity=1.0,
+            ratio=0.0,
+            landmark_variance=0.0,
+        )
+        for index in range(4)
+    ]
+
+    first = estimate_pose_pnp_fixed_hypotheses(matches, _camera())
+    second = estimate_pose_pnp_fixed_hypotheses(matches, _camera())
+
+    assert first
+    assert all(item.success and item.pose_w2c is not None for item in first)
+    assert len(first) == len(second)
+    for left, right in zip(first, second):
+        np.testing.assert_allclose(left.pose_w2c, right.pose_w2c, atol=1e-10)
+        camera_xyz = xyz @ left.pose_w2c[:3, :3].T + left.pose_w2c[:3, 3]
+        assert np.all(camera_xyz[:, 2] > 0.0)
+    errors = [
+        pnp_pose_error(item.pose_w2c, np.eye(4, dtype=np.float64))
+        for item in first
+    ]
+    assert min(item.translation_m for item in errors) < 1e-3
+    assert min(item.rotation_deg for item in errors) < 1e-2
 
 
 def test_robust_fixed_pnp_refinement_downweights_bad_measurements() -> None:

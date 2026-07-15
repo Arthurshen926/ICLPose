@@ -109,6 +109,64 @@ class LocalMapletSupportIndex:
         return tuple(self.support_image_ids[int(index)] for index in indices if int(index) >= 0)
 
 
+def build_disjoint_maplet_cluster_ids(
+    index: LocalMapletSupportIndex,
+) -> np.ndarray:
+    """Pack overlapping local maplets into deterministic, disjoint clusters.
+
+    The raw KNN maplets overlap and their transitive closure commonly spans an
+    entire facade.  Cross-fit needs an equivalence relation instead, so mutual
+    local-maplet neighbors are greedily packed around stable high-degree seeds.
+    Every landmark belongs to exactly one cluster, identified by its seed track.
+    """
+
+    count = len(index)
+    neighbors = np.asarray(index.maplets.neighbor_indices, dtype=np.int64)
+    if neighbors.shape[0] != count:
+        raise ValueError("maplet neighbors and support index are not aligned")
+    neighbor_sets = tuple(
+        frozenset(int(value) for value in row if 0 <= int(value) < count)
+        for row in neighbors
+    )
+    mutual_degree = np.fromiter(
+        (
+            sum(1 for other in values if row in neighbor_sets[other])
+            for row, values in enumerate(neighbor_sets)
+        ),
+        dtype=np.int64,
+        count=count,
+    )
+    covisibility = np.asarray(
+        index.maplets.covisibility_strength, dtype=np.float64
+    ).reshape(-1)
+    if covisibility.shape != (count,):
+        raise ValueError("maplet covisibility and support index are not aligned")
+    tracks = np.asarray(index.anchor_track_ids, dtype=np.int64)
+    order = sorted(
+        range(count),
+        key=lambda row: (
+            -int(mutual_degree[row]),
+            -float(covisibility[row]) if np.isfinite(covisibility[row]) else 0.0,
+            int(tracks[row]),
+        ),
+    )
+    cluster_ids = np.full((count,), -1, dtype=np.int64)
+    for seed in order:
+        if cluster_ids[seed] >= 0:
+            continue
+        members = [seed]
+        members.extend(
+            other
+            for other in neighbor_sets[seed]
+            if cluster_ids[other] < 0 and seed in neighbor_sets[other]
+        )
+        members = sorted(set(members), key=lambda row: int(tracks[row]))
+        cluster_ids[np.asarray(members, dtype=np.int64)] = int(tracks[seed])
+    if np.any(cluster_ids < 0):
+        raise RuntimeError("disjoint maplet packing left landmarks unassigned")
+    return cluster_ids
+
+
 @dataclass(frozen=True)
 class ContextualLandmarkMatchingConfig:
     top_k: int = 1

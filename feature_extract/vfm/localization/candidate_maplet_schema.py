@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from feature_extract.vfm.localization.local_maplet_geometry_probe import (
+    VIEW_EVIDENCE_NAMES,
+)
+
 
 CANDIDATE_MAPLET_STATIC_SCHEMA_VERSION = 1
 
@@ -23,6 +27,15 @@ CANDIDATE_MAPLET_STATIC_FEATURE_NAMES = (
     "maplet_context_radius_log1p",
     "maplet_covisibility_log1p",
     "maplet_feature_variance_log1p",
+)
+
+CANDIDATE_MAPLET_DEPLOYABLE_FEATURE_NAMES = (
+    *CANDIDATE_MAPLET_STATIC_FEATURE_NAMES,
+    *(
+        f"{reduction}__{name}"
+        for reduction in ("max", "mean", "min")
+        for name in VIEW_EVIDENCE_NAMES
+    ),
 )
 
 
@@ -70,10 +83,13 @@ def validate_candidate_maplet_static_feature_names(
     count: int,
 ) -> tuple[str, ...]:
     requested = int(count)
-    if requested <= 0 or requested > len(feature_names):
+    if (
+        requested <= 0
+        or requested > len(feature_names)
+        or requested > len(CANDIDATE_MAPLET_DEPLOYABLE_FEATURE_NAMES)
+    ):
         raise ValueError("requested static feature count exceeds the artifact schema")
-    shared_count = min(requested, len(CANDIDATE_MAPLET_STATIC_FEATURE_NAMES))
-    expected = CANDIDATE_MAPLET_STATIC_FEATURE_NAMES[:shared_count]
-    if tuple(feature_names[:shared_count]) != expected:
+    expected = CANDIDATE_MAPLET_DEPLOYABLE_FEATURE_NAMES[:requested]
+    if tuple(feature_names[:requested]) != expected:
         raise ValueError("candidate static feature schema or field order differs")
     return tuple(feature_names[:requested])

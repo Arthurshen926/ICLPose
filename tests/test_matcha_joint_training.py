@@ -46,11 +46,96 @@ from feature_extract.vfm.matcha_joint_training import (
     save_matcha_joint_model,
     save_matcha_joint_training_set_manifest,
     save_matcha_joint_training_set_npz,
+    subset_landmark_known_positive_csr,
     train_matcha_joint_model,
     train_matcha_joint_model_from_manifest,
     train_matcha_joint_model_from_sample_provider,
 )
 from feature_extract.vfm.measurement_v1.rgb_patch_measurement_branch import crop_rgb_window
+
+
+def test_loss_audit_forwards_frozen_landmark_bank_without_updating(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_total_loss(
+        model,
+        samples,
+        indices,
+        config,
+        device,
+        *,
+        seed,
+        landmark_memory_bank=None,
+        update_landmark_memory=False,
+    ):
+        captured["memory"] = landmark_memory_bank
+        captured["update"] = update_landmark_memory
+        return torch.tensor(2.5), {}
+
+    monkeypatch.setattr(joint_training, "_total_loss", fake_total_loss)
+    model = torch.nn.Linear(1, 1)
+    samples = SimpleNamespace(
+        coarse_fine_samples=SimpleNamespace(sample_count=4)
+    )
+    config = SimpleNamespace(batch_size=2)
+    frozen_memory = object()
+
+    value = joint_training._loss_value_for_samples(
+        model,
+        samples,
+        config,
+        torch.device("cpu"),
+        seed=3,
+        landmark_memory_bank=frozen_memory,
+    )
+
+    assert value == pytest.approx(2.5)
+    assert captured == {"memory": frozen_memory, "update": False}
+
+
+def test_validation_metrics_use_valid_observation_weighting() -> None:
+    row = joint_training._aggregate_validation_evaluations(
+        [
+            (
+                1.0,
+                {
+                    "map_correspondence_loss": 4.0,
+                    "landmark_retrieval_valid_count": 2.0,
+                    "landmark_retrieval_loss": 0.8,
+                    "landmark_retrieval_recall_at_1": 0.0,
+                    "landmark_retrieval_score_gap_mean": -0.2,
+                },
+            ),
+            (
+                3.0,
+                {
+                    "map_correspondence_loss": 2.0,
+                    "landmark_retrieval_valid_count": 6.0,
+                    "landmark_retrieval_loss": 0.4,
+                    "landmark_retrieval_recall_at_1": 1.0,
+                    "landmark_retrieval_score_gap_mean": 0.2,
+                },
+            ),
+        ],
+        selection_metric="landmark_retrieval_loss",
+    )
+
+    assert row["loss"] == pytest.approx(2.0)
+    assert row["map_correspondence_loss"] == pytest.approx(3.0)
+    assert row["landmark_retrieval_valid_count"] == pytest.approx(8.0)
+    assert row["landmark_retrieval_loss"] == pytest.approx(0.5)
+    assert row["landmark_retrieval_recall_at_1"] == pytest.approx(0.75)
+    assert row["landmark_retrieval_score_gap_mean"] == pytest.approx(0.1)
+    assert row["selection_metric"] == "landmark_retrieval_loss"
+    assert row["selection_value"] == pytest.approx(0.5)
+
+
+def test_validation_retrieval_selection_rejects_missing_metric() -> None:
+    with pytest.raises(ValueError, match="selection metric"):
+        joint_training._aggregate_validation_evaluations(
+            [(1.0, {"map_correspondence_loss": 1.0})],
+            selection_metric="landmark_retrieval_loss",
+        )
 
 
 def test_landmark_dustbin_sampler_excludes_positive_and_heatmap_cells() -> None:
@@ -80,6 +165,17 @@ def test_landmark_dustbin_sampler_excludes_positive_and_heatmap_cells() -> None:
     assert sorted(sampled[:, 0].tolist()) == [1.0, 2.0]
     assert metrics["landmark_retrieval_dustbin_candidate_count"] == 2
     assert metrics["landmark_retrieval_dustbin_sampled_image_count"] == 1
+
+
+def test_landmark_known_positive_csr_subset_preserves_ragged_rows() -> None:
+    offsets, track_ids = subset_landmark_known_positive_csr(
+        np.asarray([0, 2, 3, 6], dtype=np.int64),
+        np.asarray([10, 11, 20, 30, 31, 32], dtype=np.int64),
+        np.asarray([True, False, True]),
+    )
+
+    assert offsets.tolist() == [0, 2, 5]
+    assert track_ids.tolist() == [10, 11, 30, 31, 32]
 
 
 def test_provider_training_pair_ordinals_partition_global_pair_stream() -> None:
@@ -2041,9 +2137,19 @@ def test_train_matcha_joint_model_records_best_validation_checkpoint() -> None:
     )
 
     assert "best_validation_loss" in run.summary
+    assert run.summary["best_validation_metric"] == "total_loss"
+    assert run.summary["best_validation_value"] == pytest.approx(
+        run.summary["best_validation_loss"]
+    )
+    assert np.isfinite(run.summary["best_validation_total_loss"])
     assert "best_validation_step" in run.summary
     assert run.summary["validation_eval_count"] >= 2
     assert run.summary["best_validation_step"] in {0, 1, 2}
+    assert all(
+        row["selection_metric"] == "total_loss"
+        and row["selection_value"] == pytest.approx(row["loss"])
+        for row in run.summary["validation_history"]
+    )
 
 
 def test_train_matcha_joint_model_from_manifest_loads_shards_lazily(tmp_path, monkeypatch) -> None:
@@ -2115,12 +2221,18 @@ def test_train_matcha_joint_model_from_sample_provider_loads_pairs_lazily() -> N
             seed=53,
         ),
         steps_per_sample=1,
+        provider_fixed_audit_interval_steps=1,
         provider_name="unit_provider",
     )
 
     assert run.summary["provider_lazy_training"] is True
     assert run.summary["provider_name"] == "unit_provider"
     assert run.summary["provider_sample_count"] == 5
+    assert run.summary["provider_fixed_audit_interval_steps"] == 1
+    assert run.summary["provider_fixed_audit_count"] == 3
+    assert [row["step"] for row in run.summary["provider_fixed_audit_history"]] == [0, 1, 2]
+    assert run.summary["training_loop_wall_elapsed_sec"] >= run.summary["training_loop_elapsed_sec"]
+    assert run.summary["provider_fixed_audit_elapsed_sec"] >= 0.0
     assert loaded_indices[0] == 0
     assert len(set(loaded_indices)) < len(samples)
 

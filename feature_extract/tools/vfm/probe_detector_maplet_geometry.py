@@ -50,9 +50,10 @@ from feature_extract.vfm.localization.real_image_observation_features import (
 
 
 STATIC_FEATURE_NAMES = CANDIDATE_MAPLET_STATIC_FEATURE_NAMES
-QUERY_POINT_SELECTION_POLICY = (
+SUPERVISED_QUERY_POINT_SELECTION_POLICY = (
     "pose_keep_priority_then_full_detector_spatial_fallback_v2"
 )
+INFERENCE_QUERY_POINT_SELECTION_POLICY = "detector_spatial_only_inference_v1"
 
 
 def _float_list(value: str) -> tuple[float, ...]:
@@ -124,6 +125,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--pnp_reprojection_error_px", type=float, default=8.0)
     parser.add_argument("--pnp_iterations", type=int, default=5000)
     parser.add_argument("--maplet_view_cache_size", type=int, default=4096)
+    parser.add_argument("--query_shard_count", type=int, default=1)
+    parser.add_argument("--query_shard_index", type=int, default=0)
     return parser.parse_args(argv)
 
 
@@ -370,7 +373,11 @@ def _expected_feature_metadata(args: argparse.Namespace) -> dict[str, object]:
         "max_tentative_matches": int(args.max_tentative_matches),
         "geometry_threshold_px": float(args.geometry_threshold_px),
         "positive_threshold_px": float(args.positive_threshold_px),
-        "query_point_selection": QUERY_POINT_SELECTION_POLICY,
+        "query_point_selection": (
+            INFERENCE_QUERY_POINT_SELECTION_POLICY
+            if bool(args.inference_only)
+            else SUPERVISED_QUERY_POINT_SELECTION_POLICY
+        ),
         "query_image_dimensions": "colmap_per_image",
         "query_context_source": (
             "dense_alike_detector_cache" if args.query_context_detector_cache else "global_anchor_detector_cache"
@@ -383,6 +390,9 @@ def _expected_feature_metadata(args: argparse.Namespace) -> dict[str, object]:
         )
     if bool(args.inference_only):
         metadata["supervision_mode"] = "none_inference_only"
+    if int(args.query_shard_count) > 1:
+        metadata["query_shard_count"] = int(args.query_shard_count)
+        metadata["query_shard_index"] = int(args.query_shard_index)
     return metadata
 
 
@@ -441,17 +451,38 @@ def _extract_or_load_features(
         context_descriptors /= np.maximum(
             np.linalg.norm(context_descriptors, axis=1, keepdims=True), 1e-8
         )
+    # Inference artifacts must not even read a pose-derived keep mask.  An all-
+    # false preference mask makes the existing selector use only detector score
+    # and spatial coverage while preserving the same deterministic code path.
+    pose_keep_mask = (
+        np.zeros(len(query_ids), dtype=bool)
+        if bool(args.inference_only)
+        else np.asarray(proposals["pose_keep_mask"], dtype=bool)
+    )
     selected_rows = _select_query_rows(
         query_ids=query_ids,
         xy=query_xy,
         detector_scores=detector_scores,
-        pose_keep_mask=np.asarray(proposals["pose_keep_mask"], dtype=bool),
+        pose_keep_mask=pose_keep_mask,
         image_sizes_by_id=inputs["query_image_sizes"],
         top_k=int(args.query_points_per_image),
     )
-    selected_from_pose_keep = np.asarray(
-        proposals["pose_keep_mask"], dtype=bool
-    )[selected_rows]
+    if int(args.query_shard_count) > 1:
+        ordered_query_ids = tuple(dict.fromkeys(query_ids.tolist()))
+        shard_query_ids = {
+            str(query_id)
+            for index, query_id in enumerate(ordered_query_ids)
+            if index % int(args.query_shard_count) == int(args.query_shard_index)
+        }
+        selected_rows = selected_rows[
+            np.asarray(
+                [str(query_ids[row]) in shard_query_ids for row in selected_rows],
+                dtype=bool,
+            )
+        ]
+    selected_from_pose_keep = (
+        None if bool(args.inference_only) else pose_keep_mask[selected_rows]
+    )
     selected_columns = np.full((len(selected_rows), int(args.candidate_top_k)), -1, dtype=np.int64)
     for local_row, global_row in enumerate(selected_rows.tolist()):
         valid = np.flatnonzero((candidate_rows[global_row] >= 0) & np.isfinite(baseline[global_row]))
@@ -479,7 +510,7 @@ def _extract_or_load_features(
     view_cache: OrderedDict[int, tuple[tuple[str, object], ...]] = OrderedDict()
 
     rows_by_image: dict[str, np.ndarray] = {}
-    for query_id in dict.fromkeys(query_ids.tolist()):
+    for query_id in dict.fromkeys(query_ids[selected_rows].tolist()):
         rows_by_image[str(query_id)] = np.flatnonzero(query_ids == str(query_id))
     previous_query = None
     completed_images = 0
@@ -630,8 +661,9 @@ def _extract_or_load_features(
         "selected_columns": selected_columns,
         "features": features,
         "valid_edges": valid_edges,
-        "selected_from_pose_keep": selected_from_pose_keep,
     }
+    if selected_from_pose_keep is not None:
+        payload["selected_from_pose_keep"] = selected_from_pose_keep
     if labels is not None:
         payload["labels"] = labels
     artifact.parent.mkdir(parents=True, exist_ok=True)
@@ -798,6 +830,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         raise ValueError("probe counts must be positive")
     if int(args.support_view_candidate_count) < int(args.support_view_count):
         raise ValueError("support_view_candidate_count must be at least support_view_count")
+    if int(args.query_shard_count) <= 0 or not (
+        0 <= int(args.query_shard_index) < int(args.query_shard_count)
+    ):
+        raise ValueError("invalid query shard")
     np.random.seed(int(args.seed))
     start = time.time()
     output_dir = Path(args.output_dir)
@@ -823,11 +859,19 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "cache_hit": bool(cache_hit),
                 "build_seconds": float(feature_seconds),
                 "selected_query_point_count": int(len(feature_payload["selected_rows"])),
-                "pose_keep_priority_point_count": int(
-                    np.sum(feature_payload["selected_from_pose_keep"])
+                "pose_keep_priority_point_count": (
+                    None
+                    if bool(args.inference_only)
+                    else int(np.sum(feature_payload["selected_from_pose_keep"]))
                 ),
                 "full_detector_fallback_point_count": int(
-                    np.sum(~np.asarray(feature_payload["selected_from_pose_keep"], dtype=bool))
+                    len(feature_payload["selected_rows"])
+                    if bool(args.inference_only)
+                    else np.sum(
+                        ~np.asarray(
+                            feature_payload["selected_from_pose_keep"], dtype=bool
+                        )
+                    )
                 ),
                 "candidate_edge_count": int(np.sum(feature_payload["valid_edges"])),
                 "feature_count": int(len(feature_names)),

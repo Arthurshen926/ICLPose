@@ -31,6 +31,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--coarse_step_px", type=float, default=-1.0)
     parser.add_argument("--steps", type=int, default=1000)
     parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument(
+        "--gradient_accumulation_steps",
+        type=int,
+        default=1,
+        help="Number of micro-batches accumulated per optimizer update; --steps still counts optimizer updates.",
+    )
+    parser.add_argument("--use_amp", action="store_true")
     parser.add_argument("--feature_dim", type=int, default=32)
     parser.add_argument("--hidden_dim", type=int, default=0)
     parser.add_argument("--input_mode", default="rgb", choices=("rgb", "rgb_graygrad", "norm_graygrad"))
@@ -134,6 +141,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         coarse_step_px=float(args.coarse_step_px) if float(args.coarse_step_px) > 0.0 else None,
         steps=int(args.steps),
         batch_size=int(args.batch_size),
+        gradient_accumulation_steps=int(args.gradient_accumulation_steps),
+        use_amp=bool(args.use_amp),
         feature_dim=int(args.feature_dim),
         hidden_dim=int(args.hidden_dim) if int(args.hidden_dim) > 0 else None,
         input_mode=str(args.input_mode),

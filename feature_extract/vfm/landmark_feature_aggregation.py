@@ -65,6 +65,9 @@ class TrackPrototype:
     observation_count: int
     mean_utility: float
     observation_image_ids: tuple[str, ...]
+    mean_viewing_ray: np.ndarray | None = None
+    viewing_ray_concentration: float = 0.0
+    viewing_angle_p90_deg: float = 180.0
 
     def __post_init__(self) -> None:
         feature = np.asarray(self.feature, dtype=np.float32).reshape(-1)
@@ -75,9 +78,24 @@ class TrackPrototype:
             raise ValueError("prototype_id must be non-negative")
         if int(self.observation_count) <= 0:
             raise ValueError("prototype observation_count must be positive")
+        mean_viewing_ray = (
+            None
+            if self.mean_viewing_ray is None
+            else np.asarray(self.mean_viewing_ray, dtype=np.float32).reshape(3)
+        )
+        if mean_viewing_ray is not None:
+            norm = float(np.linalg.norm(mean_viewing_ray))
+            if not np.isfinite(norm) or norm <= 1e-8:
+                raise ValueError("prototype mean_viewing_ray must be finite and non-zero")
+            mean_viewing_ray = mean_viewing_ray / norm
+        if not 0.0 <= float(self.viewing_ray_concentration) <= 1.0:
+            raise ValueError("viewing_ray_concentration must be in [0, 1]")
+        if not 0.0 <= float(self.viewing_angle_p90_deg) <= 180.0:
+            raise ValueError("viewing_angle_p90_deg must be in [0, 180]")
         object.__setattr__(self, "feature", feature)
         object.__setattr__(self, "variance", variance)
         object.__setattr__(self, "observation_image_ids", tuple(str(item) for item in self.observation_image_ids))
+        object.__setattr__(self, "mean_viewing_ray", mean_viewing_ray)
 
 
 @dataclass(frozen=True)
@@ -100,6 +118,42 @@ class MultiPrototypeTrackBank:
     @property
     def track_count(self) -> int:
         return len({int(item.track_id) for item in self.prototypes})
+
+    def view_geometry_arrays(self) -> dict[str, np.ndarray]:
+        """Return row-aligned prototype view geometry for a sidecar artifact."""
+
+        count = len(self.prototypes)
+        mean_rays = np.full((count, 3), np.nan, dtype=np.float32)
+        valid = np.zeros((count,), dtype=bool)
+        for row, prototype in enumerate(self.prototypes):
+            if prototype.mean_viewing_ray is None:
+                continue
+            mean_rays[row] = np.asarray(
+                prototype.mean_viewing_ray, dtype=np.float32
+            ).reshape(3)
+            valid[row] = True
+        return {
+            "track_ids": np.asarray(
+                [int(item.track_id) for item in self.prototypes], dtype=np.int64
+            ),
+            "prototype_ids": np.asarray(
+                [int(item.prototype_id) for item in self.prototypes], dtype=np.int64
+            ),
+            "mean_viewing_rays": mean_rays,
+            "viewing_ray_concentrations": np.asarray(
+                [float(item.viewing_ray_concentration) for item in self.prototypes],
+                dtype=np.float32,
+            ),
+            "viewing_angle_p90_deg": np.asarray(
+                [float(item.viewing_angle_p90_deg) for item in self.prototypes],
+                dtype=np.float32,
+            ),
+            "view_geometry_valid": valid,
+            "observation_counts": np.asarray(
+                [int(item.observation_count) for item in self.prototypes],
+                dtype=np.int64,
+            ),
+        }
 
 
 @dataclass(frozen=True)
@@ -185,6 +239,16 @@ def _valid_observations(observations: Iterable[TrackObservation]) -> list[TrackO
                 visible=True,
                 geometry_valid=True,
                 utility=float(obs.utility),
+                camera_center=(
+                    None
+                    if obs.camera_center is None
+                    else np.asarray(obs.camera_center, dtype=np.float64).reshape(3)
+                ),
+                viewing_ray=(
+                    None
+                    if obs.viewing_ray is None
+                    else np.asarray(obs.viewing_ray, dtype=np.float64).reshape(3)
+                ),
             )
         )
     return valid
@@ -451,6 +515,31 @@ def build_multi_prototype_track_bank(
             feature = np.asarray(aggregated.mean_feature, dtype=np.float32)
             if bool(normalize_final_prototypes):
                 feature = feature / max(float(np.linalg.norm(feature)), 1e-6)
+            selected_rays = [
+                np.asarray(observation.viewing_ray, dtype=np.float64).reshape(3)
+                for observation in selected
+                if observation.viewing_ray is not None
+            ]
+            mean_viewing_ray = None
+            viewing_ray_concentration = 0.0
+            viewing_angle_p90_deg = 180.0
+            if len(selected_rays) == len(selected) and selected_rays:
+                rays = np.stack(selected_rays, axis=0)
+                rays = rays / np.maximum(
+                    np.linalg.norm(rays, axis=1, keepdims=True), 1e-12
+                )
+                mean_ray = np.mean(rays, axis=0)
+                viewing_ray_concentration = float(np.linalg.norm(mean_ray))
+                if viewing_ray_concentration > 1e-8:
+                    mean_viewing_ray = (
+                        mean_ray / viewing_ray_concentration
+                    ).astype(np.float32)
+                    angles = np.degrees(
+                        np.arccos(
+                            np.clip(rays @ mean_viewing_ray, -1.0, 1.0)
+                        )
+                    )
+                    viewing_angle_p90_deg = float(np.percentile(angles, 90.0))
             output.append(
                 TrackPrototype(
                     track_id=int(track_id),
@@ -460,6 +549,9 @@ def build_multi_prototype_track_bank(
                     observation_count=int(aggregated.observation_count),
                     mean_utility=float(aggregated.mean_utility),
                     observation_image_ids=tuple(aggregated.observation_image_ids),
+                    mean_viewing_ray=mean_viewing_ray,
+                    viewing_ray_concentration=viewing_ray_concentration,
+                    viewing_angle_p90_deg=viewing_angle_p90_deg,
                 )
             )
     return MultiPrototypeTrackBank(

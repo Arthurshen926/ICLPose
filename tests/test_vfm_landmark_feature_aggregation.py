@@ -32,7 +32,16 @@ from feature_extract.vfm.tokens import (
 )
 
 
-def _obs(track_id, feature, utility=1.0, image_id=None, visible=True, geometry_valid=True):
+def _obs(
+    track_id,
+    feature,
+    utility=1.0,
+    image_id=None,
+    visible=True,
+    geometry_valid=True,
+    viewing_ray=None,
+    camera_center=None,
+):
     return TrackObservation(
         track_id=track_id,
         image_id=image_id or f"img_{track_id}",
@@ -40,6 +49,12 @@ def _obs(track_id, feature, utility=1.0, image_id=None, visible=True, geometry_v
         visible=visible,
         geometry_valid=geometry_valid,
         utility=float(utility),
+        viewing_ray=(
+            None if viewing_ray is None else np.asarray(viewing_ray, dtype=np.float64)
+        ),
+        camera_center=(
+            None if camera_center is None else np.asarray(camera_center, dtype=np.float64)
+        ),
     )
 
 
@@ -215,13 +230,13 @@ def test_geometric_median_and_medoid_are_robust_to_outlier():
 
 def test_multi_prototype_builder_separates_descriptor_modes_deterministically():
     observations = [
-        _obs(8, [1.0, 0.0], image_id="a"),
-        _obs(8, [0.98, 0.02], image_id="b"),
-        _obs(8, [0.0, 1.0], image_id="c"),
-        _obs(8, [0.02, 0.98], image_id="d"),
-        _obs(9, [1.0, 0.0], image_id="e"),
-        _obs(9, [0.9, 0.1], image_id="f"),
-        _obs(9, [0.8, 0.2], image_id="g"),
+        _obs(8, [1.0, 0.0], image_id="a", viewing_ray=[0.0, 0.0, 1.0]),
+        _obs(8, [0.98, 0.02], image_id="b", viewing_ray=[0.0, 0.1, 0.995]),
+        _obs(8, [0.0, 1.0], image_id="c", viewing_ray=[1.0, 0.0, 0.0]),
+        _obs(8, [0.02, 0.98], image_id="d", viewing_ray=[0.995, 0.1, 0.0]),
+        _obs(9, [1.0, 0.0], image_id="e", viewing_ray=[0.0, 0.0, 1.0]),
+        _obs(9, [0.9, 0.1], image_id="f", viewing_ray=[0.0, 0.0, 1.0]),
+        _obs(9, [0.8, 0.2], image_id="g", viewing_ray=[0.0, 0.0, 1.0]),
     ]
     config = LandmarkViewClusteringConfig(
         max_prototypes_per_track=2,
@@ -246,6 +261,14 @@ def test_multi_prototype_builder_separates_descriptor_modes_deterministically():
         np.testing.assert_allclose(left.feature, right.feature)
     track8 = [item.feature for item in bank_a.prototypes if item.track_id == 8]
     assert abs(float(np.dot(track8[0], track8[1]))) < 0.1
+    track8_rays = [item.mean_viewing_ray for item in bank_a.prototypes if item.track_id == 8]
+    assert all(ray is not None for ray in track8_rays)
+    assert abs(float(np.dot(track8_rays[0], track8_rays[1]))) < 0.1
+    view_arrays = bank_a.view_geometry_arrays()
+    assert view_arrays["view_geometry_valid"].all()
+    np.testing.assert_array_equal(
+        view_arrays["prototype_ids"], np.asarray([0, 1, 0], dtype=np.int64)
+    )
 
 
 def test_random_observation_aggregation_is_seeded_and_deterministic():
@@ -505,7 +528,14 @@ def test_build_raw_vfm_landmark_bank_cli_writes_bank_and_summary(tmp_path):
 
 def test_sampled_track_observation_cache_round_trips_features_and_metadata(tmp_path):
     observations = [
-        _obs(1, [1.0, 2.0], utility=0.5, image_id="img_a"),
+        _obs(
+            1,
+            [1.0, 2.0],
+            utility=0.5,
+            image_id="img_a",
+            camera_center=[1.0, 2.0, 3.0],
+            viewing_ray=[0.0, 0.0, 1.0],
+        ),
         _obs(2, [3.0, 4.0], utility=2.0, image_id="img_b", geometry_valid=False),
     ]
     cache_path = tmp_path / "sampled_observations.npz"
@@ -523,6 +553,9 @@ def test_sampled_track_observation_cache_round_trips_features_and_metadata(tmp_p
     assert [obs.image_id for obs in loaded] == ["img_a", "img_b"]
     assert [obs.geometry_valid for obs in loaded] == [True, False]
     np.testing.assert_allclose(loaded[0].feature, np.asarray([1.0, 2.0], dtype=np.float32))
+    np.testing.assert_allclose(loaded[0].camera_center, np.asarray([1.0, 2.0, 3.0]))
+    np.testing.assert_allclose(loaded[0].viewing_ray, np.asarray([0.0, 0.0, 1.0]))
+    assert loaded[1].viewing_ray is None
     assert loaded[1].utility == pytest.approx(2.0)
 
 

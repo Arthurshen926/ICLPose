@@ -595,6 +595,7 @@ def export_rgb_patch_diagnostics(
     prior_scale_key: str = "",
     target_dustbin_filter: str = "all",
     export_full_likelihood: bool = False,
+    use_amp: bool = False,
     device: str = "cuda",
     base_dir: Path | None = None,
 ) -> dict[str, Any]:
@@ -633,6 +634,7 @@ def export_rgb_patch_diagnostics(
     likelihood_offsets_xy: np.ndarray | None = None
     visual_candidates: list[tuple[float, int, Path, torch.Tensor, torch.Tensor, torch.Tensor]] = []
     batch = max(1, int(batch_size))
+    amp_enabled = bool(use_amp) and torch_device.type == "cuda"
     with torch.no_grad():
         for batch_start in range(0, len(rows), batch):
             batch_rows = rows[batch_start : batch_start + batch]
@@ -658,16 +660,23 @@ def export_rgb_patch_diagnostics(
                 image_cache_device=image_cache_device,
             )
             prior_scale = _prior_scale_batch(batch_rows, prior_scale_key=str(prior_scale_key))
-            pred0 = model.forward_from_patches(
-                query_patch.to(torch_device),
-                render_patch.to(torch_device),
-                prior_scale_px=None if prior_scale is None else prior_scale.to(torch_device),
-            )
+            with torch.cuda.amp.autocast(enabled=amp_enabled):
+                pred0 = model.forward_from_patches(
+                    query_patch.to(torch_device),
+                    render_patch.to(torch_device),
+                    prior_scale_px=(
+                        None
+                        if prior_scale is None
+                        else prior_scale.to(torch_device)
+                    ),
+                )
+            # Keep probability normalization and calibration diagnostics in
+            # FP32 even when the convolutional branch runs under autocast.
             _loss, likelihood = continuous_offset_nll_with_dustbin(
-                pred0.logits,
-                pred0.offsets_xy,
+                pred0.logits.float(),
+                pred0.offsets_xy.float(),
                 target.to(torch_device),
-                dustbin_logit=pred0.dustbin_logit,
+                dustbin_logit=pred0.dustbin_logit.float(),
                 search_radius_px=model.search_radius_px,
                 target_is_dustbin=None if _target_is_dustbin is None else _target_is_dustbin.to(torch_device),
             )
@@ -1165,6 +1174,7 @@ def export_rgb_patch_diagnostics(
         ),
         "support_patch_source_audit": _support_patch_source_audit(rows, query_source=str(query_source)),
         "batch_size": int(batch),
+        "use_amp": bool(amp_enabled),
         "cache_images_on_device": bool(cache_images_on_device),
         "image_cache_device": "" if image_cache_device is None else str(image_cache_device),
         "image_cache_max_gb": None if cache_max_bytes is None else float(cache_max_bytes / (1024**3)),

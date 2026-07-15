@@ -85,6 +85,11 @@ online query
   input is canonicalized afterward.
 - The next backend gate is coverage-safe multi-hypothesis PnP with held-out
   verification. Uncalibrated network scores are not treated as covariance.
+- P21A adds group-aware posterior-guided minimal-set sampling. A sample contains
+  one candidate from each query group and never repeats a physical track.
+- P21B latent EM is experimental: identity, support view, spatial mode, and null
+  remain latent during bounded weighted-PnP refinement. Initial hypotheses are
+  immutable fallbacks and are never overwritten by local refinement.
 
 ## Data
 
@@ -123,6 +128,13 @@ untouched test after full182 has been inspected.
 
 The image-referenced lazy episode store loads feature/RGB data per candidate
 group and keeps bounded caches. Full feature/RGB duplication is not required.
+
+StMarysChurch is now locked as the first genuinely untouched scene. Its 530
+query IDs, GT-pose file, and COLMAP model hashes are frozen in
+`feature_extract/configs/vfm/protocol/stmaryschurch_latent_pose_untouched_v1.yaml`.
+No method, checkpoint, threshold, aggregation, or pose policy may be selected
+from that scene, and its pose metrics may be read only once after development
+is frozen.
 
 ### Coordinate and inference protocol
 
@@ -322,6 +334,28 @@ Candidate-maplet checkpoints are selected independently:
   `0.531/0.394`; validation supports zero safe promotions, so the strict policy
   freezes a `>1` no-promotion threshold and replays L97 bit-for-bit. This
   optional branch is promising generation evidence, not a promoted selector.
+- P20 candidate spatial likelihood is retained as a candidate/view-specific
+  multimodal RGB likelihood, not multiplied into the identity posterior as if
+  it were an independent classifier. The selected-coordinate update verifier
+  has cross-block evidence, but S47 does not improve the aggregate S43 pose and
+  therefore remains optional.
+- P22/S43 is the current frozen OldHospital development pose reference. On the
+  21-query validation block it reaches `18.22 cm` median, `96.95 cm` P90, and
+  `0.409 deg`; reused-late replay reaches `15.58 cm`, `75.00 cm`, and
+  `0.381 deg`. Its hypothesis oracle is `7.61 cm` median and `47.34 cm` P90 on
+  validation, so its selected median is not the available-candidate limit.
+- P23 RADIO-intermediate/view-marginal identity evidence improves candidate
+  identity AP to about `0.399`, but remains unsafe for hard argmax in repeated
+  structures. Geometry/update classifier posteriors keep their own semantics
+  and are not multiplied into this identity mass.
+- P21A now has a true group-aware PROSAC/AP3P path with explicit null, unique
+  query groups/tracks, 4/5/6-point schedules, center/RGB spatial-mode variants,
+  and target-only minimal-set audits. The fixed four-generator union closes the
+  proposal-to-hypothesis gap: validation hypothesis oracle reaches `4.17 cm`
+  median and `23.91 cm` P90, with R3/R5/R10/R25 of
+  `28.6%/52.4%/71.4%/90.5%`. This passes the generation gate but is not a final
+  inference result; the current selector still cannot reliably identify the
+  best pose among the generated modes.
 
 ## Forbidden Production Combinations
 
@@ -350,6 +384,7 @@ Candidate-maplet checkpoints are selected independently:
 
 ```bash
 PYTHONPATH=. pytest -q \
+  tests/test_latent_correspondence_pnp.py \
   tests/measurement_v1/test_action_calibration.py \
   tests/measurement_v1/test_pose_free_geometry_verifier.py \
   tests/test_measurement_pose_evidence.py \

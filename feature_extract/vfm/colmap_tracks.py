@@ -168,6 +168,30 @@ def read_colmap_images_binary(path: Path) -> Dict[int, ColmapImageObservation]:
     return images
 
 
+def read_colmap_image_camera_ids_binary(path: Path) -> Dict[str, int]:
+    """Read only image-name to camera-ID ownership, discarding all pose targets.
+
+    Inference-only evaluators need the camera intrinsics associated with a
+    query image but must not retain its COLMAP qvec/tvec.  Keeping this parser
+    separate makes that boundary explicit and auditable.
+    """
+
+    image_camera_ids: Dict[str, int] = {}
+    with Path(path).open("rb") as handle:
+        (image_count,) = struct.unpack("<Q", _read_exact(handle, 8))
+        for _ in range(image_count):
+            _image_id = struct.unpack("<i", _read_exact(handle, 4))[0]
+            _read_exact(handle, 8 * 7)  # qvec and tvec are intentionally discarded.
+            (camera_id,) = struct.unpack("<i", _read_exact(handle, 4))
+            image_name = _read_c_string(handle)
+            (point2d_count,) = struct.unpack("<Q", _read_exact(handle, 8))
+            handle.seek(int(point2d_count) * 24, 1)
+            if image_name in image_camera_ids:
+                raise ValueError(f"duplicate COLMAP image name: {image_name}")
+            image_camera_ids[str(image_name)] = int(camera_id)
+    return image_camera_ids
+
+
 def scale_colmap_camera(
     camera: ColmapCamera,
     *,

@@ -3,12 +3,144 @@
 from __future__ import annotations
 
 from collections import defaultdict, deque
-from typing import Sequence
+from typing import Mapping, Sequence
 
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
 from feature_extract.vfm.query_to_3d_matching import QueryTo3DMatch
+
+
+def candidate_admission_utility_scores(
+    candidate_vs_null_log_odds: np.ndarray,
+    *,
+    admission_log_bonus: float,
+) -> np.ndarray:
+    """Add a task utility for admitting a group without rewriting its posterior."""
+
+    scores = np.asarray(candidate_vs_null_log_odds)
+    bonus = float(admission_log_bonus)
+    if scores.ndim != 2:
+        raise ValueError("candidate-vs-null log odds must have shape (Nq, L)")
+    if not np.isfinite(bonus):
+        raise ValueError("candidate admission log bonus must be finite")
+    utility = scores.astype(np.float32, copy=True)
+    finite = np.isfinite(utility)
+    utility[finite] += bonus
+    return utility
+
+
+def paired_pose_safety_report(
+    candidate_rows: Sequence[Mapping[str, object]],
+    baseline_rows: Sequence[Mapping[str, object]],
+    *,
+    catastrophic_translation_m: float = 1.0,
+    max_translation_regression_m: float = 0.25,
+) -> dict[str, object]:
+    """Reject aggregate improvements that hide a severe paired pose regression."""
+
+    catastrophic = float(catastrophic_translation_m)
+    max_regression = float(max_translation_regression_m)
+    if not np.isfinite(catastrophic) or catastrophic <= 0.0:
+        raise ValueError("catastrophic translation threshold must be positive and finite")
+    if not np.isfinite(max_regression) or max_regression < 0.0:
+        raise ValueError("maximum translation regression must be finite and non-negative")
+
+    def index_rows(rows: Sequence[Mapping[str, object]]) -> dict[str, Mapping[str, object]]:
+        indexed: dict[str, Mapping[str, object]] = {}
+        for row in rows:
+            query_id = str(row.get("query_id", ""))
+            if not query_id or query_id in indexed:
+                raise ValueError("pose rows require unique non-empty query ids")
+            indexed[query_id] = row
+        return indexed
+
+    candidate = index_rows(candidate_rows)
+    baseline = index_rows(baseline_rows)
+    if set(candidate) != set(baseline):
+        raise ValueError("candidate and baseline pose rows must cover identical queries")
+    query_ids = sorted(candidate)
+    candidate_success = np.asarray(
+        [bool(candidate[query_id].get("success", False)) for query_id in query_ids],
+        dtype=bool,
+    )
+    baseline_success = np.asarray(
+        [bool(baseline[query_id].get("success", False)) for query_id in query_ids],
+        dtype=bool,
+    )
+
+    def translation(row: Mapping[str, object], success: bool) -> float:
+        if not success:
+            return np.inf
+        try:
+            value = float(row["translation_m"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError("successful pose row has no translation error") from error
+        if not np.isfinite(value) or value < 0.0:
+            raise ValueError("successful pose translation error must be finite and non-negative")
+        return value
+
+    candidate_translation = np.asarray(
+        [
+            translation(candidate[query_id], bool(candidate_success[index]))
+            for index, query_id in enumerate(query_ids)
+        ],
+        dtype=np.float64,
+    )
+    baseline_translation = np.asarray(
+        [
+            translation(baseline[query_id], bool(baseline_success[index]))
+            for index, query_id in enumerate(query_ids)
+        ],
+        dtype=np.float64,
+    )
+    paired_success = candidate_success & baseline_success
+    regressions = candidate_translation - baseline_translation
+    finite_regressions = regressions[paired_success]
+    candidate_catastrophic = (~candidate_success) | (
+        candidate_translation >= catastrophic
+    )
+    baseline_catastrophic = (~baseline_success) | (
+        baseline_translation >= catastrophic
+    )
+    new_catastrophic = candidate_catastrophic & ~baseline_catastrophic
+    lost_success = baseline_success & ~candidate_success
+    maximum_regression = (
+        np.inf
+        if np.any(lost_success)
+        else (
+            0.0
+            if finite_regressions.size == 0
+            else float(np.max(finite_regressions))
+        )
+    )
+    passes = bool(
+        not np.any(lost_success)
+        and not np.any(new_catastrophic)
+        and maximum_regression <= max_regression + 1e-12
+    )
+    return {
+        "passes": passes,
+        "query_count": int(len(query_ids)),
+        "paired_success_count": int(np.sum(paired_success)),
+        "win_count": int(np.sum(paired_success & (regressions < 0.0))),
+        "loss_count": int(np.sum(paired_success & (regressions > 0.0))),
+        "tie_count": int(np.sum(paired_success & (regressions == 0.0))),
+        "lost_success_count": int(np.sum(lost_success)),
+        "candidate_catastrophic_count": int(np.sum(candidate_catastrophic)),
+        "baseline_catastrophic_count": int(np.sum(baseline_catastrophic)),
+        "new_catastrophic_count": int(np.sum(new_catastrophic)),
+        "max_translation_regression_m": (
+            None if not np.isfinite(maximum_regression) else maximum_regression
+        ),
+        "median_translation_delta_m": (
+            None
+            if finite_regressions.size == 0
+            else float(np.median(finite_regressions))
+        ),
+        "catastrophic_translation_threshold_m": catastrophic,
+        "allowed_max_translation_regression_m": max_regression,
+    }
 
 
 def resolve_global_query_track_assignment(
@@ -122,7 +254,7 @@ def global_assignment_score_matrix(
     query_ids: Sequence[str],
     *,
     valid_mask: np.ndarray | None = None,
-    dustbin_score: float | None = None,
+    dustbin_score: float | np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Resolve independent whole-image assignments and retain chosen scores."""
 
@@ -134,6 +266,20 @@ def global_assignment_score_matrix(
     valid = None if valid_mask is None else np.asarray(valid_mask, dtype=bool)
     if valid is not None and valid.shape != tracks.shape:
         raise ValueError("valid_mask must match candidate arrays")
+    if dustbin_score is None:
+        dustbins: float | np.ndarray | None = None
+    else:
+        dustbins = np.asarray(dustbin_score, dtype=np.float64)
+        if dustbins.ndim == 0:
+            dustbins = float(dustbins)
+        else:
+            dustbins = dustbins.reshape(-1)
+            if dustbins.shape != (len(tracks),):
+                raise ValueError(
+                    "dustbin_score must be scalar or contain one value per query row"
+                )
+            if not np.all(np.isfinite(dustbins)):
+                raise ValueError("explicit dustbin scores must be finite")
     resolved = np.full(scores.shape, -np.inf, dtype=np.float32)
     selected = np.full((len(tracks),), -1, dtype=np.int64)
     for query_id in dict.fromkeys(ids.tolist()):
@@ -142,7 +288,9 @@ def global_assignment_score_matrix(
             tracks[rows],
             scores[rows],
             valid_mask=None if valid is None else valid[rows],
-            dustbin_score=dustbin_score,
+            dustbin_score=(
+                dustbins[rows] if isinstance(dustbins, np.ndarray) else dustbins
+            ),
         )
         selected[rows] = local
         accepted = local >= 0

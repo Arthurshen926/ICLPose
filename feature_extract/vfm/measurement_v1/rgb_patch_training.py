@@ -10,15 +10,16 @@ from typing import Any, Mapping, MutableMapping, Sequence
 
 import numpy as np
 import torch
-from PIL import Image
 from torch import nn
 from torch.nn import functional as F
+from torchvision.io import ImageReadMode, read_image
 
 from feature_extract.vfm.measurement_v1.rgb_patch_measurement_branch import (
     RGBPatchMeasurementBranch,
     RGBPatchMeasurementPrediction,
     continuous_offset_nll_with_dustbin,
     crop_rgb_window,
+    crop_rgb_windows_by_owner,
     crop_rgb_window_with_source_from_output_affine,
     crop_rgb_window_with_source_from_output_homography,
     local_offset_grid,
@@ -146,8 +147,8 @@ def _has_local_homography(row: Mapping[str, object]) -> bool:
 
 
 def _load_query_rgb(path: Path) -> torch.Tensor:
-    arr = np.asarray(Image.open(Path(path)).convert("RGB"), dtype=np.float32) / 255.0
-    return torch.from_numpy(np.moveaxis(arr, -1, 0).astype(np.float32, copy=False))
+    image = read_image(str(Path(path)), mode=ImageReadMode.RGB)
+    return image.to(dtype=torch.float32).div_(255.0)
 
 
 def _load_render_rgb(path: Path) -> torch.Tensor:
@@ -902,10 +903,18 @@ def _gate_supervision_loss(
 class TensorImageLRUCache(MutableMapping[str, torch.Tensor]):
     """Byte-bounded tensor cache shared by query and support image owners."""
 
-    def __init__(self, *, max_bytes: int | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        max_bytes: int | None = None,
+        storage_dtype: torch.dtype | None = None,
+    ) -> None:
         if max_bytes is not None and int(max_bytes) <= 0:
             raise ValueError("max_bytes must be positive when provided")
+        if storage_dtype not in {None, torch.float16, torch.float32, torch.bfloat16}:
+            raise ValueError("storage_dtype must be a floating-point torch dtype")
         self.max_bytes = None if max_bytes is None else int(max_bytes)
+        self.storage_dtype = storage_dtype
         self._values: OrderedDict[str, torch.Tensor] = OrderedDict()
         self.current_bytes = 0
         self.peak_bytes = 0
@@ -924,11 +933,12 @@ class TensorImageLRUCache(MutableMapping[str, torch.Tensor]):
         return value
 
     def __setitem__(self, key: str, value: torch.Tensor) -> None:
+        stored = value if self.storage_dtype is None else value.to(dtype=self.storage_dtype)
         if key in self._values:
             previous = self._values.pop(key)
             self.current_bytes -= self._tensor_bytes(previous)
-        self._values[key] = value
-        self.current_bytes += self._tensor_bytes(value)
+        self._values[key] = stored
+        self.current_bytes += self._tensor_bytes(stored)
         while (
             self.max_bytes is not None
             and self.current_bytes > self.max_bytes
@@ -952,8 +962,8 @@ class TensorImageLRUCache(MutableMapping[str, torch.Tensor]):
     def record_miss(self) -> None:
         self.misses += 1
 
-    def summary(self) -> dict[str, int | None]:
-        return {
+    def summary(self) -> dict[str, int | str | None]:
+        summary: dict[str, int | str | None] = {
             "entry_count": int(len(self)),
             "max_bytes": self.max_bytes,
             "current_bytes": int(self.current_bytes),
@@ -962,6 +972,9 @@ class TensorImageLRUCache(MutableMapping[str, torch.Tensor]):
             "misses": int(self.misses),
             "evictions": int(self.evictions),
         }
+        if self.storage_dtype is not None:
+            summary["storage_dtype"] = str(self.storage_dtype)
+        return summary
 
 
 def _load_tensor_cached(
@@ -1021,6 +1034,190 @@ def augment_render_template_patch(patch: torch.Tensor, *, mode: str = "none") ->
     return torch.clamp(out + noise, 0.0, 1.0)
 
 
+def _crop_cached_rgb_windows_grouped(
+    specs: Sequence[tuple[str, Any]],
+    centers_xy: Sequence[Sequence[float]],
+    *,
+    cache: MutableMapping[str, torch.Tensor],
+    cache_device: torch.device | None,
+    radius_px: float,
+    step_px: float,
+    image_width: int,
+    image_height: int,
+    augment_query_image: bool = False,
+) -> torch.Tensor:
+    """Crop packed grids from small batches of unique owner images."""
+
+    if len(specs) != len(centers_xy):
+        raise ValueError("crop specs and centers must contain the same number of rows")
+    if not specs:
+        raise ValueError("grouped RGB crop requires at least one row")
+    rows_by_key: OrderedDict[str, list[int]] = OrderedDict()
+    for row, (key, _loader) in enumerate(specs):
+        rows_by_key.setdefault(str(key), []).append(int(row))
+
+    grouped_patches: list[torch.Tensor] = []
+    grouped_rows: list[torch.Tensor] = []
+    owner_items = list(rows_by_key.items())
+    owner_batch_size = 16
+    for start in range(0, len(owner_items), owner_batch_size):
+        chunk = owner_items[start : start + owner_batch_size]
+        images: list[torch.Tensor] = []
+        chunk_centers: list[list[float]] = []
+        chunk_owners: list[int] = []
+        chunk_rows: list[int] = []
+        for owner, (key, rows) in enumerate(chunk):
+            loader = specs[rows[0]][1]
+            images.append(
+                _load_tensor_cached(
+                    cache,
+                    str(key),
+                    loader,
+                    cache_device=cache_device,
+                )
+            )
+            chunk_rows.extend(rows)
+            chunk_owners.extend([int(owner)] * len(rows))
+            chunk_centers.extend([centers_xy[row] for row in rows])
+        image = torch.stack(images, dim=0)
+        if bool(augment_query_image):
+            image = _augment_render_query_image(image)
+        centers = torch.tensor(
+            chunk_centers,
+            dtype=torch.float32,
+            device=image.device,
+        )
+        patches, _offsets = crop_rgb_windows_by_owner(
+            image,
+            torch.tensor(chunk_owners, dtype=torch.long, device=image.device),
+            centers,
+            radius_px=float(radius_px),
+            step_px=float(step_px),
+            image_width=int(image_width),
+            image_height=int(image_height),
+        )
+        grouped_patches.append(patches)
+        grouped_rows.append(
+            torch.tensor(chunk_rows, dtype=torch.long, device=patches.device)
+        )
+    row_order = torch.cat(grouped_rows, dim=0)
+    patches_by_group = torch.cat(grouped_patches, dim=0)
+    return patches_by_group[torch.argsort(row_order)].contiguous()
+
+
+def _stack_unwarped_patch_batch(
+    rows: Sequence[Mapping[str, object]],
+    *,
+    image_root: Path,
+    render_cache_by_query: Mapping[str, Path],
+    query_crop_width: int,
+    query_crop_height: int,
+    render_width: int,
+    render_height: int,
+    crop_radius_px: float,
+    step_px: float,
+    query_cache: MutableMapping[str, torch.Tensor],
+    render_cache: MutableMapping[str, torch.Tensor],
+    query_source: str,
+    render_patch_augmentation: str,
+    target_x_key: str,
+    target_y_key: str,
+    image_cache_device: torch.device | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    source = str(query_source)
+    query_specs: list[tuple[str, Any]] = []
+    render_specs: list[tuple[str, Any]] = []
+    centers: list[list[float]] = []
+    anchors: list[list[float]] = []
+    targets: list[list[float]] = []
+    explicit_dustbin_targets: list[bool | None] = []
+    for row in rows:
+        query_id = str(row.get("query_id", "")).strip()
+        if not query_id:
+            raise ValueError("row missing query_id")
+        query_path = Path(image_root) / query_id
+        if source == "real_pair":
+            support_id = str(row.get("support_image_id", "")).strip()
+            if not support_id:
+                raise ValueError("real_pair row missing support_image_id")
+            support_path = Path(image_root) / support_id
+            query_specs.append(
+                (str(query_path), lambda path=query_path: _load_query_rgb(path))
+            )
+            render_specs.append(
+                (str(support_path), lambda path=support_path: _load_query_rgb(path))
+            )
+            anchor = [
+                _float(row, "support_x")
+                if str(row.get("support_x", "")).strip()
+                else _float(row, "render_x"),
+                _float(row, "support_y")
+                if str(row.get("support_y", "")).strip()
+                else _float(row, "render_y"),
+            ]
+        else:
+            render_path = render_cache_by_query.get(query_id)
+            if render_path is None:
+                raise ValueError(f"missing render cache for query_id={query_id}")
+            render_specs.append(
+                (str(render_path), lambda path=render_path: _load_render_rgb(path))
+            )
+            if source in {"render", "render_augmented"}:
+                query_specs.append(
+                    (str(render_path), lambda path=render_path: _load_render_rgb(path))
+                )
+            else:
+                query_specs.append(
+                    (str(query_path), lambda path=query_path: _load_query_rgb(path))
+                )
+            anchor = [_float(row, "render_x"), _float(row, "render_y")]
+        center_x, center_y = _center_xy(row)
+        target_x = _float(row, str(target_x_key))
+        target_y = _float(row, str(target_y_key))
+        centers.append([center_x, center_y])
+        anchors.append(anchor)
+        targets.append([target_x - center_x, target_y - center_y])
+        explicit_dustbin_targets.append(_optional_bool(row, "target_is_dustbin"))
+
+    query_patch = _crop_cached_rgb_windows_grouped(
+        query_specs,
+        centers,
+        cache=(render_cache if source in {"render", "render_augmented"} else query_cache),
+        cache_device=image_cache_device,
+        radius_px=float(crop_radius_px),
+        step_px=float(step_px),
+        image_width=int(query_crop_width),
+        image_height=int(query_crop_height),
+        augment_query_image=source == "render_augmented",
+    )
+    render_patch = _crop_cached_rgb_windows_grouped(
+        render_specs,
+        anchors,
+        cache=render_cache,
+        cache_device=image_cache_device,
+        radius_px=float(crop_radius_px),
+        step_px=float(step_px),
+        image_width=int(render_width),
+        image_height=int(render_height),
+    )
+    render_patch = augment_render_template_patch(
+        render_patch, mode=str(render_patch_augmentation)
+    )
+    target_tensor = torch.tensor(targets, dtype=torch.float32)
+    target_is_dustbin = None
+    if any(value is not None for value in explicit_dustbin_targets):
+        target_is_dustbin = torch.tensor(
+            [bool(value) for value in explicit_dustbin_targets], dtype=torch.bool
+        )
+    return (
+        query_patch,
+        render_patch,
+        target_tensor,
+        torch.linalg.norm(target_tensor, dim=1),
+        target_is_dustbin,
+    )
+
+
 def _stack_patch_batch(
     rows: Sequence[Mapping[str, object]],
     *,
@@ -1059,6 +1256,25 @@ def _stack_patch_batch(
     r_height = int(render_image_height if render_image_height is not None else image_height)
     query_crop_width = r_width if source in {"render", "render_augmented"} else q_width
     query_crop_height = r_height if source in {"render", "render_augmented"} else q_height
+    if warp_mode == "none":
+        return _stack_unwarped_patch_batch(
+            rows,
+            image_root=Path(image_root),
+            render_cache_by_query=render_cache_by_query,
+            query_crop_width=int(query_crop_width),
+            query_crop_height=int(query_crop_height),
+            render_width=int(r_width),
+            render_height=int(r_height),
+            crop_radius_px=float(crop_radius_px),
+            step_px=float(step_px),
+            query_cache=query_cache,
+            render_cache=render_cache,
+            query_source=source,
+            render_patch_augmentation=str(render_patch_augmentation),
+            target_x_key=str(target_x_key),
+            target_y_key=str(target_y_key),
+            image_cache_device=image_cache_device,
+        )
     for row in rows:
         query_id = str(row.get("query_id", "")).strip()
         if not query_id:
@@ -1587,6 +1803,8 @@ def train_rgb_patch_measurement_branch(
     render_image_height: int | None = None,
     steps: int = 1000,
     batch_size: int = 32,
+    gradient_accumulation_steps: int = 1,
+    use_amp: bool = False,
     feature_dim: int = 32,
     hidden_dim: int | None = None,
     input_mode: str = "rgb",
@@ -1647,6 +1865,12 @@ def train_rgb_patch_measurement_branch(
     image_cache_max_gb: float | None = None,
 ) -> dict[str, Any]:
     base = Path.cwd() if base_dir is None else Path(base_dir)
+    if int(steps) <= 0:
+        raise ValueError("steps must be positive")
+    if int(batch_size) <= 0:
+        raise ValueError("batch_size must be positive")
+    if int(gradient_accumulation_steps) <= 0:
+        raise ValueError("gradient_accumulation_steps must be positive")
     if (coarse_search_radius_px is None) != (coarse_step_px is None):
         raise ValueError("coarse_search_radius_px and coarse_step_px must be provided together")
     effective_search_radius_px = float(search_radius_px) + (0.0 if coarse_search_radius_px is None else float(coarse_search_radius_px))
@@ -1750,6 +1974,8 @@ def train_rgb_patch_measurement_branch(
     if not trainable_parameters:
         raise ValueError("no trainable parameters selected")
     optimizer = torch.optim.AdamW(trainable_parameters, lr=float(lr))
+    amp_enabled = bool(use_amp) and torch_device.type == "cuda"
+    gradient_scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
     parameter_count = int(sum(parameter.numel() for parameter in model.parameters()))
     trainable_parameter_count = int(sum(parameter.numel() for parameter in trainable_parameters))
     cache_max_bytes = (
@@ -1778,8 +2004,10 @@ def train_rgb_patch_measurement_branch(
         if residual_sampler is None
         else dict(residual_sampler.summary)
     )
+    accumulation_steps = int(gradient_accumulation_steps)
     final_metrics: dict[str, float] = {}
-    for _step in range(int(steps)):
+    optimizer.zero_grad(set_to_none=True)
+    for _micro_step in range(int(steps) * accumulation_steps):
         model.train()
         if residual_sampler is None:
             batch_rows = [train_rows[rng.randrange(len(train_rows))] for _ in range(int(batch_size))]
@@ -1823,14 +2051,15 @@ def train_rgb_patch_measurement_branch(
             extra = int(query_patch.shape[0]) - int(sample_weight.shape[0])
             if extra > 0:
                 sample_weight = torch.cat([sample_weight, sample_weight[:extra]], dim=0)
-        pred0 = _forward_patch_prediction(
-            model=model,
-            parallel_forward=parallel_forward,
-            query_patch=query_patch,
-            render_patch=render_patch,
-            prior_scale=prior_scale,
-            device=torch_device,
-        )
+        with torch.cuda.amp.autocast(enabled=amp_enabled):
+            pred0 = _forward_patch_prediction(
+                model=model,
+                parallel_forward=parallel_forward,
+                query_patch=query_patch,
+                render_patch=render_patch,
+                prior_scale=prior_scale,
+                device=torch_device,
+            )
         delta_loss, pred = residual_delta_gaussian_nll(
             pred0.direct_mean_offset_xy,
             pred0.direct_log_sigma_xy,
@@ -1896,9 +2125,11 @@ def train_rgb_patch_measurement_branch(
             loss = loss + float(gate_supervision_loss_weight) * gate_supervision_loss
         if coarse_loss is not None:
             loss = loss + float(coarse_likelihood_loss_weight) * coarse_loss
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        optimizer.step()
+        gradient_scaler.scale(loss / float(accumulation_steps)).backward()
+        if (_micro_step + 1) % accumulation_steps == 0:
+            gradient_scaler.step(optimizer)
+            gradient_scaler.update()
+            optimizer.zero_grad(set_to_none=True)
         with torch.no_grad():
             epe = pred.epe_px.detach().cpu()
             final_metrics = {
@@ -2089,6 +2320,9 @@ def train_rgb_patch_measurement_branch(
         "val_group_key": str(val_group_key),
         "steps": int(steps),
         "batch_size": int(batch_size),
+        "gradient_accumulation_steps": int(accumulation_steps),
+        "effective_batch_size": int(batch_size) * int(accumulation_steps),
+        "use_amp": bool(amp_enabled),
         "feature_dim": int(feature_dim),
         "hidden_dim": None if hidden_dim is None else int(hidden_dim),
         "learning_rate": float(lr),
