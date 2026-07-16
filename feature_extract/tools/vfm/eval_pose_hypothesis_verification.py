@@ -34,6 +34,9 @@ from feature_extract.vfm.localization.landmark_hybrid import load_landmark_index
 from feature_extract.vfm.localization.candidate_pose_evidence import (
     CANDIDATE_POSE_EVIDENCE_VERSION,
 )
+from feature_extract.vfm.localization.candidate_relation_features import (
+    RELATION_CHANNELS,
+)
 from feature_extract.vfm.local_maplet_matching import (
     build_disjoint_maplet_cluster_ids,
     load_local_maplet_support_index_npz,
@@ -81,6 +84,31 @@ from feature_extract.vfm.query_to_3d_matching import (
     pnp_pose_error,
 )
 from feature_extract.vfm.statistics import paired_bootstrap_delta_ci
+
+
+def _pad_relation_edge_rows(
+    rows: list[dict[str, object]],
+    key: str,
+    *,
+    trailing_size: int | None = None,
+) -> np.ndarray:
+    """Pad variable edge features without inventing evidence for absent edges."""
+    values = [np.asarray(row[key], dtype=np.float64) for row in rows]
+    max_edges = max((len(value) for value in values), default=0)
+    shape = (len(values), max_edges)
+    if trailing_size is not None:
+        shape += (int(trailing_size),)
+    output = np.full(shape, np.nan, dtype=np.float64)
+    for row_index, value in enumerate(values):
+        if not len(value):
+            continue
+        expected_shape = (
+            (len(value),)
+            if trailing_size is None
+            else (len(value), trailing_size)
+        )
+        output[row_index, : len(value)] = value.reshape(expected_shape)
+    return output
 
 
 def _positive_int_list(value: str) -> tuple[int, ...]:
@@ -235,12 +263,29 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--candidate_pose_relation_outlier_likelihood", type=float, default=1e-3
     )
+    parser.add_argument(
+        "--candidate_relation_feature_neighbor_k",
+        type=int,
+        default=0,
+        help=(
+            "Export calibrated-relation input features over this query KNN; "
+            "zero keeps the feature path disabled and cannot change pose ranking."
+        ),
+    )
+    parser.add_argument(
+        "--candidate_relation_feature_max_modes", type=int, default=1
+    )
     parser.add_argument("--candidate_pool_hard_threshold_px", type=float, default=8.0)
     parser.add_argument(
         "--candidate_pool_descriptor_rank_weight", type=float, default=0.02
     )
     parser.add_argument("--candidate_pool_refine_iterations", type=int, default=2)
     parser.add_argument("--candidate_evidence", default="")
+    parser.add_argument(
+        "--candidate_spatial_likelihood_train",
+        default="",
+        help="comma-separated target-free train spatial likelihood shards",
+    )
     parser.add_argument("--candidate_spatial_likelihood_validation", default="")
     parser.add_argument("--candidate_spatial_likelihood_test", default="")
     parser.add_argument(
@@ -762,6 +807,23 @@ def _train_grouped_export_requires_geometry(args: argparse.Namespace) -> bool:
         float(args.candidate_geometry_prior_mix_weight) > 0.0
         or float(args.candidate_geometry_generation_mix_weight) > 0.0
         or float(args.candidate_spatial_geometry_calibration_weight) > 0.0
+    )
+
+
+def _immutable_baseline_required_splits(
+    args: argparse.Namespace,
+) -> tuple[str, ...]:
+    """Return inference splits that can actually invoke baseline promotion.
+
+    Train hypotheses are exported only as target-free calibration episodes;
+    they never enter immutable-baseline selection and therefore must not make
+    a validation/test-only baseline artifact fail its coverage contract.
+    """
+
+    return (
+        ("validation", "test")
+        if bool(args.development_cross_block_audit)
+        else ("validation",)
     )
 
 
@@ -1491,6 +1553,67 @@ def _validate_spatial_likelihood_artifact(
             f"{json.dumps(mismatches, sort_keys=True)}"
         )
     return payload
+
+
+def _validate_spatial_likelihood_artifact_set(
+    paths: Sequence[Path],
+    **kwargs: object,
+) -> dict[str, np.ndarray]:
+    if not paths:
+        raise ValueError("candidate spatial likelihood shard set is empty")
+    payloads = [
+        _validate_spatial_likelihood_artifact(path, **kwargs) for path in paths
+    ]
+    if len(payloads) == 1:
+        return payloads[0]
+    keys = set(payloads[0])
+    if any(set(payload) != keys for payload in payloads[1:]):
+        raise ValueError("candidate spatial likelihood shards expose different schemas")
+    metadata = [json.loads(str(payload["metadata_json"].item())) for payload in payloads]
+    shard_counts = {int(item.get("query_shard_count", -1)) for item in metadata}
+    shard_indices = [int(item.get("query_shard_index", -1)) for item in metadata]
+    if len(shard_counts) != 1 or shard_counts != {len(paths)} or sorted(
+        shard_indices
+    ) != list(range(len(paths))):
+        raise ValueError("candidate spatial likelihood shard set is incomplete")
+    ignored = {"query_shard_count", "query_shard_index"}
+    canonical = [
+        {key: value for key, value in item.items() if key not in ignored}
+        for item in metadata
+    ]
+    if any(item != canonical[0] for item in canonical[1:]):
+        raise ValueError("candidate spatial likelihood shard manifests differ")
+    merged: dict[str, np.ndarray] = {}
+    row_counts = [len(np.asarray(payload["query_ids"])) for payload in payloads]
+    for key in sorted(keys - {"metadata_json"}):
+        arrays = [np.asarray(payload[key]) for payload in payloads]
+        row_aligned = all(
+            array.ndim > 0 and int(array.shape[0]) == row_count
+            for array, row_count in zip(arrays, row_counts)
+        )
+        if not row_aligned:
+            if not all(np.array_equal(arrays[0], array) for array in arrays[1:]):
+                raise ValueError(f"spatial shard shared array {key!r} differs")
+            merged[key] = arrays[0].copy()
+        else:
+            merged[key] = np.concatenate(arrays, axis=0)
+    query_ids = np.asarray(merged["query_ids"]).astype(str)
+    source_rows = np.asarray(merged["source_query_rows"], dtype=np.int64)
+    identity = np.asarray(merged["candidate_identity_keys"]).astype(str)
+    support = np.asarray(merged["support_image_ids"]).astype(str)
+    row_keys = list(zip(query_ids.tolist(), source_rows.tolist(), identity.tolist(), support.tolist()))
+    if len(row_keys) != len(set(row_keys)):
+        raise ValueError("candidate spatial likelihood shards contain duplicate rows")
+    merged_metadata = dict(canonical[0])
+    merged_metadata["merged_query_shard_count"] = len(paths)
+    merged_metadata["merged_query_shard_indices"] = sorted(shard_indices)
+    merged_metadata["source_shard_sha256"] = [
+        file_sha256_short(path) for path in paths
+    ]
+    merged["metadata_json"] = np.asarray(
+        json.dumps(merged_metadata, sort_keys=True)
+    )
+    return merged
 
 
 def _resolve_spatial_view_mixture_probabilities(
@@ -2948,15 +3071,20 @@ def main(argv: Sequence[str] | None = None) -> None:
     candidate = _load_npz(candidate_path)
     score_payload = _load_npz(score_path)
     spatial_paths = {
+        "train": tuple(
+            Path(value)
+            for value in str(args.candidate_spatial_likelihood_train).split(",")
+            if value
+        ),
         "validation": (
-            None
+            ()
             if not str(args.candidate_spatial_likelihood_validation)
-            else Path(args.candidate_spatial_likelihood_validation)
+            else (Path(args.candidate_spatial_likelihood_validation),)
         ),
         "test": (
-            None
+            ()
             if not str(args.candidate_spatial_likelihood_test)
-            else Path(args.candidate_spatial_likelihood_test)
+            else (Path(args.candidate_spatial_likelihood_test),)
         ),
     }
     generation_spatial_paths = {
@@ -2971,7 +3099,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             else Path(args.candidate_generation_spatial_likelihood_test)
         ),
     }
-    spatial_requested = any(path is not None for path in spatial_paths.values())
+    spatial_requested = any(paths for paths in spatial_paths.values())
     generation_spatial_requested = any(
         path is not None for path in generation_spatial_paths.values()
     )
@@ -3125,8 +3253,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         {}
         if candidate_evidence_path is None
         else {
-            split_name: _validate_spatial_likelihood_artifact(
-                path,
+            split_name: _validate_spatial_likelihood_artifact_set(
+                paths,
                 split_name=split_name,
                 candidate_evidence_path=candidate_evidence_path,
                 candidate_evidence_metadata=candidate_evidence_metadata,
@@ -3138,8 +3266,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                     args.allow_legacy_candidate_spatial_dustbin
                 ),
             )
-            for split_name, path in spatial_paths.items()
-            if path is not None
+            for split_name, paths in spatial_paths.items()
+            if paths
         }
     )
     generation_spatial_payloads = (
@@ -3496,6 +3624,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         else Path(args.maplet_support_index)
     )
     maplet_metadata = None
+    maplet_index = None
     maplet_cluster_ids_by_bank_row = None
     if maplet_path is not None:
         maplet_index, maplet_metadata = load_local_maplet_support_index_npz(
@@ -3762,11 +3891,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     if immutable_baseline_pose_source is not None:
         baseline_records = immutable_baseline_pose_source["records"]
-        required_splits = ["validation"]
-        if bool(args.development_cross_block_audit):
-            required_splits.append("test")
-        if bool(args.export_train_grouped_hypotheses):
-            required_splits.append("train")
+        required_splits = _immutable_baseline_required_splits(args)
         missing = [
             (split_name, str(query_id))
             for split_name in required_splits
@@ -3979,6 +4104,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         ),
         candidate_pose_relation_outlier_likelihood=float(
             args.candidate_pose_relation_outlier_likelihood
+        ),
+        candidate_relation_feature_neighbor_k=int(
+            args.candidate_relation_feature_neighbor_k
+        ),
+        candidate_relation_feature_max_modes=int(
+            args.candidate_relation_feature_max_modes
         ),
         candidate_pool_hard_threshold_px=float(
             args.candidate_pool_hard_threshold_px
@@ -4398,6 +4529,39 @@ def main(argv: Sequence[str] | None = None) -> None:
                         -1,
                     )
                 ),
+                topology_neighbor_track_ids=(
+                    None
+                    if maplet_index is None
+                    else np.where(
+                        local_valid[:, :, None],
+                        maplet_index.neighbor_track_ids[
+                            np.maximum(canonical_rows[rows], 0)
+                        ],
+                        -1,
+                    )
+                ),
+                topology_support_image_indices=(
+                    None
+                    if maplet_index is None
+                    else np.where(
+                        local_valid[:, :, None],
+                        maplet_index.support_image_indices[
+                            np.maximum(canonical_rows[rows], 0)
+                        ],
+                        -1,
+                    )
+                ),
+                topology_support_coverage_counts=(
+                    None
+                    if maplet_index is None
+                    else np.where(
+                        local_valid[:, :, None],
+                        maplet_index.support_coverage_counts[
+                            np.maximum(canonical_rows[rows], 0)
+                        ],
+                        0,
+                    )
+                ),
                 candidate_update_threshold=float(update_threshold),
                 spatial_utility_gate_weight=float(spatial_utility_gate_weight),
             )
@@ -4652,6 +4816,72 @@ def main(argv: Sequence[str] | None = None) -> None:
                             verification.fixed_posterior_relation_log_likelihood_ratio_sum
                         )
                     ),
+                    "verification_relation_feature_edge_count": (
+                        0
+                        if verification is None
+                        else int(
+                            verification.fixed_posterior_relation_feature_edge_count
+                        )
+                    ),
+                    "verification_relation_feature_candidate_pair_mass_mean": (
+                        np.nan
+                        if verification is None
+                        or verification.fixed_posterior_relation_feature_candidate_pair_mass_mean
+                        is None
+                        else float(
+                            verification.fixed_posterior_relation_feature_candidate_pair_mass_mean
+                        )
+                    ),
+                    "verification_relation_feature_null_touching_mass_mean": (
+                        np.nan
+                        if verification is None
+                        or verification.fixed_posterior_relation_feature_null_touching_mass_mean
+                        is None
+                        else float(
+                            verification.fixed_posterior_relation_feature_null_touching_mass_mean
+                        )
+                    ),
+                    "verification_relation_feature_histogram": (
+                        (np.nan,)
+                        * (
+                            len(RELATION_CHANNELS)
+                            * (
+                                (
+                                    len((0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 1e6))
+                                    - 1
+                                )
+                                if optional_grouped_config is None
+                                else (
+                                    len(optional_grouped_config.candidate_relation_feature_bin_edges_px)
+                                    - 1
+                                )
+                            )
+                        )
+                        if verification is None
+                        or not verification.fixed_posterior_relation_feature_histogram
+                        else tuple(
+                            verification.fixed_posterior_relation_feature_histogram
+                        )
+                    ),
+                    "verification_relation_feature_edge_histograms": (
+                        ()
+                        if verification is None
+                        else verification.fixed_posterior_relation_feature_edge_histograms
+                    ),
+                    "verification_relation_feature_edge_null_touching_masses": (
+                        ()
+                        if verification is None
+                        else verification.fixed_posterior_relation_feature_edge_null_touching_masses
+                    ),
+                    "verification_relation_feature_edge_graph_sha256": (
+                        ""
+                        if verification is None
+                        or verification.fixed_posterior_relation_feature_edge_graph_sha256
+                        is None
+                        else str(
+                            verification.fixed_posterior_relation_feature_edge_graph_sha256
+                        )
+                    ),
                     "verification_positive_depth_ratio": (
                         np.nan
                         if verification is None
@@ -4854,7 +5084,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                     evaluation_label=evaluation_label,
                 )
                 generation_promotion_audit = None
-                if bool(args.enable_grouped_crossfit_likelihood_fallback):
+                if bool(args.enable_grouped_crossfit_likelihood_fallback) and (
+                    split_name != "train"
+                ):
                     if immutable_grouped_config is None:
                         raise RuntimeError("immutable grouped baseline is missing")
                     frozen_baseline_result = (
@@ -6315,6 +6547,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 candidate_pool_scores=scores,
                 candidate_pool_null_scores=grouped_null_scores,
                 candidate_pool_geometry_probabilities=train_geometry,
+                candidate_pool_spatial_payload=spatial_payloads.get("train"),
                 evaluation_label=(
                     f"grouped_candidate_pool__{str(score_key)}"
                 ),
@@ -6405,21 +6638,23 @@ def main(argv: Sequence[str] | None = None) -> None:
             if candidate_evidence_path is None
             else file_sha256_short(candidate_evidence_path)
         ),
+        "candidate_spatial_likelihood_train": [
+            str(path) for path in spatial_paths["train"]
+        ],
+        "candidate_spatial_likelihood_train_sha256": [
+            file_sha256_short(path) for path in spatial_paths["train"]
+        ],
         "candidate_spatial_likelihood_validation": (
-            None if spatial_paths["validation"] is None else str(spatial_paths["validation"])
+            None if not spatial_paths["validation"] else str(spatial_paths["validation"][0])
         ),
         "candidate_spatial_likelihood_validation_sha256": (
-            None
-            if spatial_paths["validation"] is None
-            else file_sha256_short(spatial_paths["validation"])
+            None if not spatial_paths["validation"] else file_sha256_short(spatial_paths["validation"][0])
         ),
         "candidate_spatial_likelihood_test": (
-            None if spatial_paths["test"] is None else str(spatial_paths["test"])
+            None if not spatial_paths["test"] else str(spatial_paths["test"][0])
         ),
         "candidate_spatial_likelihood_test_sha256": (
-            None
-            if spatial_paths["test"] is None
-            else file_sha256_short(spatial_paths["test"])
+            None if not spatial_paths["test"] else file_sha256_short(spatial_paths["test"][0])
         ),
         "candidate_generation_spatial_likelihood_validation": (
             None
@@ -6541,6 +6776,22 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "verification_relation_log_likelihood_ratio_sum",
                 np.float64,
             ),
+            "verification_relation_feature_edge_counts": (
+                "verification_relation_feature_edge_count",
+                np.int64,
+            ),
+            "verification_relation_feature_candidate_pair_mass_means": (
+                "verification_relation_feature_candidate_pair_mass_mean",
+                np.float64,
+            ),
+            "verification_relation_feature_null_touching_mass_means": (
+                "verification_relation_feature_null_touching_mass_mean",
+                np.float64,
+            ),
+            "verification_relation_feature_edge_graph_sha256": (
+                "verification_relation_feature_edge_graph_sha256",
+                str,
+            ),
             "verification_positive_depth_ratios": (
                 "verification_positive_depth_ratio",
                 np.float64,
@@ -6629,6 +6880,32 @@ def main(argv: Sequence[str] | None = None) -> None:
                         for row in grouped_hypothesis_export_rows
                     ],
                     axis=0,
+                ),
+                "verification_relation_feature_histograms": np.asarray(
+                    [
+                        row["verification_relation_feature_histogram"]
+                        for row in grouped_hypothesis_export_rows
+                    ],
+                    dtype=np.float64,
+                ),
+                "verification_relation_feature_edge_histograms": _pad_relation_edge_rows(
+                    grouped_hypothesis_export_rows,
+                    "verification_relation_feature_edge_histograms",
+                    trailing_size=(
+                        len(RELATION_CHANNELS)
+                        * (
+                            len(
+                                optional_grouped_config.candidate_relation_feature_bin_edges_px
+                            )
+                            - 1
+                        )
+                    ),
+                ),
+                "verification_relation_feature_edge_null_touching_masses": (
+                    _pad_relation_edge_rows(
+                        grouped_hypothesis_export_rows,
+                        "verification_relation_feature_edge_null_touching_masses",
+                    )
                 ),
                 "metadata_json": np.asarray(
                     json.dumps(

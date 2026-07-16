@@ -28,6 +28,14 @@ from feature_extract.vfm.localization.candidate_pose_evidence import (
     measurement_reliability,
     project_candidate_xyz,
 )
+from feature_extract.vfm.localization.candidate_relation_features import (
+    RELATION_FEATURE_VERSION,
+    CandidateModeMixture,
+    RelationEdgeGraph,
+    build_query_knn_relation_graph,
+    pose_independent_candidate_modes,
+    relation_residual_histograms,
+)
 from feature_extract.vfm.localization.latent_correspondence_pnp import (
     LatentEMConfig,
     refine_pose_latent_em,
@@ -217,12 +225,27 @@ class GroupedCandidatePnPConfig:
     candidate_pose_relation_neighbor_k: int = 0
     candidate_pose_relation_sigma_px: float = 4.0
     candidate_pose_relation_outlier_likelihood: float = 1e-3
+    candidate_relation_feature_neighbor_k: int = 0
+    candidate_relation_feature_max_modes: int = 1
+    candidate_relation_feature_bin_edges_px: tuple[float, ...] = (
+        0.0,
+        1.0,
+        2.0,
+        4.0,
+        8.0,
+        16.0,
+        32.0,
+        64.0,
+        1e6,
+    )
     candidate_pool_hard_threshold_px: float = 8.0
     candidate_pool_descriptor_rank_weight: float = 0.02
     final_consensus_px: float = 4.0
     final_refine_f_scale_px: float = 2.0
     min_final_inliers: int = 6
-    enable_final_refine: bool = True
+    # Refinement is an optional experiment.  Keeping it disabled here makes a
+    # plain GroupedCandidatePnPConfig replay the immutable hypothesis result.
+    enable_final_refine: bool = False
     final_refine_mode: str = "auto"
     final_refine_acceptance_policy: str = "fixed_posterior_likelihood_gain"
     hypothesis_selection_policy: str = "fixed_posterior_likelihood_only"
@@ -365,6 +388,20 @@ class GroupedCandidatePnPConfig:
             raise ValueError(
                 "candidate pose relation outlier likelihood must be in (0, 1]"
             )
+        if int(self.candidate_relation_feature_neighbor_k) < 0:
+            raise ValueError("candidate relation feature neighbor count must be non-negative")
+        if int(self.candidate_relation_feature_max_modes) < 1:
+            raise ValueError("candidate relation feature mode count must be positive")
+        relation_bins = np.asarray(
+            self.candidate_relation_feature_bin_edges_px, dtype=np.float64
+        )
+        if (
+            len(relation_bins) < 2
+            or relation_bins[0] != 0.0
+            or np.any(~np.isfinite(relation_bins))
+            or np.any(np.diff(relation_bins) <= 0.0)
+        ):
+            raise ValueError("candidate relation feature bins are invalid")
         if float(self.candidate_pool_hard_threshold_px) <= 0.0:
             raise ValueError("candidate-pool hard threshold must be positive")
         if float(self.candidate_pool_descriptor_rank_weight) < 0.0:
@@ -772,6 +809,9 @@ class PoseVerificationCandidatePool:
     candidate_update_threshold: float = 0.5
     spatial_utility_gate_weight: float = 0.0
     maplet_cluster_ids: np.ndarray | None = None
+    topology_neighbor_track_ids: np.ndarray | None = None
+    topology_support_image_indices: np.ndarray | None = None
+    topology_support_coverage_counts: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         explicit_null = self.null_scores is not None
@@ -927,6 +967,44 @@ class PoseVerificationCandidatePool:
         if explicit_maplet_clusters and np.any(maplet_clusters[valid] < 0):
             raise ValueError("valid candidates require explicit maplet cluster ids")
         maplet_clusters[~valid] = -1
+        explicit_topology = (
+            self.topology_neighbor_track_ids is not None
+            and self.topology_support_image_indices is not None
+            and self.topology_support_coverage_counts is not None
+        )
+        topology_presence = (
+            self.topology_neighbor_track_ids is not None,
+            self.topology_support_image_indices is not None,
+            self.topology_support_coverage_counts is not None,
+        )
+        if any(topology_presence) and not all(topology_presence):
+            raise ValueError("topology neighbor, support, and coverage arrays must be paired")
+        topology_neighbors = (
+            np.full((*tracks.shape, 0), -1, dtype=np.int64)
+            if not explicit_topology
+            else np.asarray(self.topology_neighbor_track_ids, dtype=np.int64).copy()
+        )
+        topology_supports = (
+            np.full((*tracks.shape, 0), -1, dtype=np.int64)
+            if not explicit_topology
+            else np.asarray(self.topology_support_image_indices, dtype=np.int64).copy()
+        )
+        topology_coverage = (
+            np.zeros((*tracks.shape, 0), dtype=np.int64)
+            if not explicit_topology
+            else np.asarray(self.topology_support_coverage_counts, dtype=np.int64).copy()
+        )
+        if topology_neighbors.ndim != 3 or topology_neighbors.shape[:2] != tracks.shape:
+            raise ValueError("topology neighbors must have shape (N, L, K)")
+        if topology_supports.ndim != 3 or topology_supports.shape[:2] != tracks.shape:
+            raise ValueError("topology supports must have shape (N, L, V)")
+        if topology_coverage.shape != topology_supports.shape:
+            raise ValueError("topology support coverage must match support indices")
+        if np.any(topology_coverage < 0):
+            raise ValueError("topology support coverage must be non-negative")
+        topology_neighbors[~valid] = -1
+        topology_supports[~valid] = -1
+        topology_coverage[~valid] = 0
         for array in (
             tokens,
             xy,
@@ -940,6 +1018,9 @@ class PoseVerificationCandidatePool:
             update_probability,
             refined_xy,
             maplet_clusters,
+            topology_neighbors,
+            topology_supports,
+            topology_coverage,
         ):
             array.setflags(write=False)
         object.__setattr__(self, "token_indices", tokens)
@@ -977,9 +1058,13 @@ class PoseVerificationCandidatePool:
             self, "spatial_utility_gate_weight", spatial_utility_gate_weight
         )
         object.__setattr__(self, "maplet_cluster_ids", maplet_clusters)
+        object.__setattr__(self, "topology_neighbor_track_ids", topology_neighbors)
+        object.__setattr__(self, "topology_support_image_indices", topology_supports)
+        object.__setattr__(self, "topology_support_coverage_counts", topology_coverage)
         object.__setattr__(
             self, "_has_explicit_maplet_clusters", bool(explicit_maplet_clusters)
         )
+        object.__setattr__(self, "_has_explicit_topology", bool(explicit_topology))
 
     @property
     def query_count(self) -> int:
@@ -992,6 +1077,10 @@ class PoseVerificationCandidatePool:
     @property
     def has_explicit_maplet_clusters(self) -> bool:
         return bool(self._has_explicit_maplet_clusters)
+
+    @property
+    def has_explicit_topology(self) -> bool:
+        return bool(self._has_explicit_topology)
 
     def subset_by_token_indices(
         self, token_indices: Sequence[int]
@@ -1035,6 +1124,21 @@ class PoseVerificationCandidatePool:
             maplet_cluster_ids=(
                 self.maplet_cluster_ids[rows]
                 if self.has_explicit_maplet_clusters
+                else None
+            ),
+            topology_neighbor_track_ids=(
+                self.topology_neighbor_track_ids[rows]
+                if self.has_explicit_topology
+                else None
+            ),
+            topology_support_image_indices=(
+                self.topology_support_image_indices[rows]
+                if self.has_explicit_topology
+                else None
+            ),
+            topology_support_coverage_counts=(
+                self.topology_support_coverage_counts[rows]
+                if self.has_explicit_topology
                 else None
             ),
         )
@@ -1133,6 +1237,17 @@ class PoseVerificationCandidatePool:
                 if self.has_explicit_maplet_clusters
                 else None
             ),
+            topology_neighbor_track_ids=(
+                self.topology_neighbor_track_ids if self.has_explicit_topology else None
+            ),
+            topology_support_image_indices=(
+                self.topology_support_image_indices if self.has_explicit_topology else None
+            ),
+            topology_support_coverage_counts=(
+                self.topology_support_coverage_counts
+                if self.has_explicit_topology
+                else None
+            ),
         )
 
 
@@ -1143,6 +1258,7 @@ def candidate_pool_likelihood_manifest_sha256(
     residual_sigma_px: float,
     candidate_outlier_likelihood: float = 1e-4,
     null_likelihood: float = 1.0,
+    relation_feature_manifest: tuple[object, ...] | None = None,
 ) -> str:
     """Hash every pose-independent input to the held-out likelihood."""
 
@@ -1170,6 +1286,20 @@ def candidate_pool_likelihood_manifest_sha256(
     )
     if pool.has_explicit_maplet_clusters:
         update_array("maplet_cluster_ids", pool.maplet_cluster_ids)
+    digest.update(
+        b"candidate_topology:present"
+        if pool.has_explicit_topology
+        else b"candidate_topology:none"
+    )
+    if pool.has_explicit_topology:
+        update_array("topology_neighbor_track_ids", pool.topology_neighbor_track_ids)
+        update_array(
+            "topology_support_image_indices", pool.topology_support_image_indices
+        )
+        update_array(
+            "topology_support_coverage_counts",
+            pool.topology_support_coverage_counts,
+        )
     update_array(
         "measurement_geometry_probabilities",
         pool.measurement_geometry_probabilities,
@@ -1226,6 +1356,9 @@ def candidate_pool_likelihood_manifest_sha256(
                     "spatial_support_camera_centers",
                     spatial.support_camera_centers,
                 )
+    if relation_feature_manifest is not None:
+        digest.update(b"relation_feature:present")
+        digest.update(repr(tuple(relation_feature_manifest)).encode("ascii"))
     return digest.hexdigest()
 
 
@@ -1289,6 +1422,13 @@ class HypothesisVerification:
     fixed_posterior_relation_effective_pair_count: int = 0
     fixed_posterior_relation_log_likelihood_ratio_sum: float | None = None
     fixed_posterior_relation_log_likelihood_ratio_mean: float | None = None
+    fixed_posterior_relation_feature_edge_count: int = 0
+    fixed_posterior_relation_feature_candidate_pair_mass_mean: float | None = None
+    fixed_posterior_relation_feature_null_touching_mass_mean: float | None = None
+    fixed_posterior_relation_feature_histogram: tuple[float, ...] = ()
+    fixed_posterior_relation_feature_edge_histograms: tuple[tuple[float, ...], ...] = ()
+    fixed_posterior_relation_feature_edge_null_touching_masses: tuple[float, ...] = ()
+    fixed_posterior_relation_feature_edge_graph_sha256: str | None = None
     information_match_count: int = 0
     translation_information_min_eigenvalue: float | None = None
     translation_information_condition: float | None = None
@@ -3703,6 +3843,9 @@ def verify_pose_candidate_pool(
     relation_sigma_px: float = 4.0,
     relation_outlier_likelihood: float = 1e-3,
     relation_neighbor_edges: np.ndarray | None = None,
+    relation_feature_graph: RelationEdgeGraph | None = None,
+    relation_feature_modes: CandidateModeMixture | None = None,
+    relation_feature_bin_edges_px: np.ndarray | None = None,
     hard_threshold_px: float = 8.0,
     descriptor_rank_weight: float = 0.02,
     strict_threshold_px: float = 2.0,
@@ -3860,6 +4003,54 @@ def verify_pose_candidate_pool(
                     ),
                     "fixed_posterior_relation_log_likelihood_ratio_mean": float(
                         relation["log_likelihood_ratio_mean"]
+                    ),
+                }
+            )
+        if relation_feature_graph is not None:
+            if relation_feature_modes is None or relation_feature_bin_edges_px is None:
+                raise ValueError("relation feature graph requires modes and bins")
+            relation_features = relation_residual_histograms(
+                pool,
+                np.asarray(pose_w2c, dtype=np.float64).reshape(4, 4),
+                camera,
+                relation_feature_graph,
+                relation_feature_modes,
+                bin_edges_px=np.asarray(
+                    relation_feature_bin_edges_px, dtype=np.float64
+                ),
+                residual_sigma_px=float(residual_sigma_px),
+                candidate_outlier_likelihood=float(candidate_outlier_likelihood),
+                null_likelihood=float(null_likelihood),
+            )
+            edge_count = int(len(relation_features.candidate_pair_mass))
+            fixed_posterior_statistics.update(
+                {
+                    "fixed_posterior_relation_feature_edge_count": edge_count,
+                    "fixed_posterior_relation_feature_candidate_pair_mass_mean": (
+                        None
+                        if edge_count == 0
+                        else float(np.mean(relation_features.candidate_pair_mass))
+                    ),
+                    "fixed_posterior_relation_feature_null_touching_mass_mean": (
+                        None
+                        if edge_count == 0
+                        else float(np.mean(relation_features.null_touching_mass))
+                    ),
+                    "fixed_posterior_relation_feature_histogram": tuple(
+                        float(value)
+                        for value in np.sum(
+                            relation_features.histograms, axis=0
+                        ).reshape(-1)
+                    ),
+                    "fixed_posterior_relation_feature_edge_histograms": tuple(
+                        tuple(float(value) for value in edge_histogram.reshape(-1))
+                        for edge_histogram in relation_features.histograms
+                    ),
+                    "fixed_posterior_relation_feature_edge_null_touching_masses": tuple(
+                        float(value) for value in relation_features.null_touching_mass
+                    ),
+                    "fixed_posterior_relation_feature_edge_graph_sha256": str(
+                        relation_features.edge_graph_sha256
                     ),
                 }
             )
@@ -6100,19 +6291,59 @@ def _grouped_relation_verification_kwargs(
     config: GroupedCandidatePnPConfig,
     pool: PoseVerificationCandidatePool,
 ) -> dict[str, object]:
+    output: dict[str, object] = {}
     neighbor_k = int(config.candidate_pose_relation_neighbor_k)
-    if neighbor_k <= 0:
-        return {}
-    return {
-        "relation_neighbor_k": neighbor_k,
-        "relation_sigma_px": float(config.candidate_pose_relation_sigma_px),
-        "relation_outlier_likelihood": float(
-            config.candidate_pose_relation_outlier_likelihood
-        ),
-        "relation_neighbor_edges": candidate_relation_neighbor_edges(
-            pool, neighbor_k=neighbor_k
-        ),
-    }
+    if neighbor_k > 0:
+        output.update(
+            {
+                "relation_neighbor_k": neighbor_k,
+                "relation_sigma_px": float(config.candidate_pose_relation_sigma_px),
+                "relation_outlier_likelihood": float(
+                    config.candidate_pose_relation_outlier_likelihood
+                ),
+                "relation_neighbor_edges": candidate_relation_neighbor_edges(
+                    pool, neighbor_k=neighbor_k
+                ),
+            }
+        )
+    feature_neighbor_k = int(config.candidate_relation_feature_neighbor_k)
+    if feature_neighbor_k > 0:
+        output.update(
+            {
+                "relation_feature_graph": build_query_knn_relation_graph(
+                    pool.xy, neighbor_k=feature_neighbor_k
+                ),
+                "relation_feature_modes": pose_independent_candidate_modes(
+                    pool,
+                    max_modes=int(config.candidate_relation_feature_max_modes),
+                ),
+                "relation_feature_bin_edges_px": np.asarray(
+                    config.candidate_relation_feature_bin_edges_px,
+                    dtype=np.float64,
+                ),
+            }
+        )
+    return output
+
+
+def _relation_feature_manifest(
+    kwargs: dict[str, object],
+) -> tuple[object, ...] | None:
+    graph = kwargs.get("relation_feature_graph")
+    modes = kwargs.get("relation_feature_modes")
+    bins = kwargs.get("relation_feature_bin_edges_px")
+    if graph is None:
+        return None
+    if not isinstance(graph, RelationEdgeGraph) or not isinstance(
+        modes, CandidateModeMixture
+    ):
+        raise TypeError("relation feature graph and modes must be typed")
+    return (
+        str(RELATION_FEATURE_VERSION),
+        str(graph.sha256),
+        int(modes.xy.shape[2]),
+        tuple(float(value) for value in np.asarray(bins).tolist()),
+    )
 
 
 def _validate_generation_candidate_pool_compatibility(
@@ -6259,6 +6490,9 @@ def estimate_pose_from_grouped_candidate_pool(
             config.candidate_pose_outlier_likelihood
         ),
         null_likelihood=float(config.candidate_pose_null_likelihood),
+        relation_feature_manifest=_relation_feature_manifest(
+            verification_relation_kwargs
+        ),
     )
     final_audit_denominator_sha256 = candidate_pool_likelihood_manifest_sha256(
         audit_pool,
@@ -6268,6 +6502,9 @@ def estimate_pose_from_grouped_candidate_pool(
             config.candidate_pose_outlier_likelihood
         ),
         null_likelihood=float(config.candidate_pose_null_likelihood),
+        relation_feature_manifest=_relation_feature_manifest(
+            audit_relation_kwargs
+        ),
     )
 
     hypotheses: list[PoseHypothesisRecord] = []
@@ -7130,6 +7367,11 @@ def reverify_grouped_result_on_shared_denominator(
             config.candidate_pose_outlier_likelihood
         ),
         null_likelihood=float(config.candidate_pose_null_likelihood),
+        relation_feature_manifest=_relation_feature_manifest(
+            _grouped_relation_verification_kwargs(
+                config, partitions.verification
+            )
+        ),
     )
     final_audit_denominator_sha256 = candidate_pool_likelihood_manifest_sha256(
         partitions.audit,
@@ -7139,6 +7381,9 @@ def reverify_grouped_result_on_shared_denominator(
             config.candidate_pose_outlier_likelihood
         ),
         null_likelihood=float(config.candidate_pose_null_likelihood),
+        relation_feature_manifest=_relation_feature_manifest(
+            _grouped_relation_verification_kwargs(config, partitions.audit)
+        ),
     )
     return replace(
         result,
@@ -7183,6 +7428,12 @@ def wrap_immutable_pose_on_grouped_denominator(
         config=config,
         query_seed=int(query_seed),
     )
+    verification_relation_kwargs = _grouped_relation_verification_kwargs(
+        config, partitions.verification
+    )
+    audit_relation_kwargs = _grouped_relation_verification_kwargs(
+        config, partitions.audit
+    )
     verification = verify_pose_candidate_pool(
         pose,
         partitions.verification,
@@ -7198,9 +7449,7 @@ def wrap_immutable_pose_on_grouped_denominator(
         loose_threshold_px=float(config.verification_loose_px),
         grid_rows=int(config.grid_rows),
         grid_cols=int(config.grid_cols),
-        **_grouped_relation_verification_kwargs(
-            config, partitions.verification
-        ),
+        **verification_relation_kwargs,
     )
     audit = verify_pose_candidate_pool(
         pose,
@@ -7217,7 +7466,7 @@ def wrap_immutable_pose_on_grouped_denominator(
         loose_threshold_px=float(config.verification_loose_px),
         grid_rows=int(config.grid_rows),
         grid_cols=int(config.grid_cols),
-        **_grouped_relation_verification_kwargs(config, partitions.audit),
+        **audit_relation_kwargs,
     )
     verification_hash = candidate_pool_likelihood_manifest_sha256(
         partitions.verification,
@@ -7227,6 +7476,9 @@ def wrap_immutable_pose_on_grouped_denominator(
             config.candidate_pose_outlier_likelihood
         ),
         null_likelihood=float(config.candidate_pose_null_likelihood),
+        relation_feature_manifest=_relation_feature_manifest(
+            verification_relation_kwargs
+        ),
     )
     audit_hash = candidate_pool_likelihood_manifest_sha256(
         partitions.audit,
@@ -7236,6 +7488,9 @@ def wrap_immutable_pose_on_grouped_denominator(
             config.candidate_pose_outlier_likelihood
         ),
         null_likelihood=float(config.candidate_pose_null_likelihood),
+        relation_feature_manifest=_relation_feature_manifest(
+            audit_relation_kwargs
+        ),
     )
     return VerifiedPnPResult(
         success=True,

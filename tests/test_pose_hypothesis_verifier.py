@@ -10,6 +10,11 @@ from feature_extract.vfm.colmap_tracks import ColmapCamera
 from feature_extract.vfm.localization.candidate_pose_evidence import (
     pose_conditioned_view_probabilities,
 )
+from feature_extract.vfm.localization.candidate_relation_features import (
+    CandidateModeMixture,
+    build_query_knn_relation_graph,
+    relation_residual_histograms,
+)
 from feature_extract.vfm.localization.pose_hypothesis_verifier import (
     CandidateSpatialLikelihood,
     GroupedCandidatePnPConfig,
@@ -393,6 +398,69 @@ def test_candidate_masking_transfers_removed_identity_mass_to_null() -> None:
         1.0,
     )
     assert np.array_equal(masked.maplet_cluster_ids, [[7, -1], [-1, 10]])
+
+
+def test_candidate_topology_is_masked_and_preserved_with_identity_pool() -> None:
+    pool = PoseVerificationCandidatePool(
+        token_indices=np.asarray([10, 20]),
+        xy=np.asarray([[100.0, 100.0], [200.0, 200.0]]),
+        track_ids=np.asarray([[1, 2], [3, 4]]),
+        prototype_ids=np.zeros((2, 2), dtype=np.int64),
+        xyz=np.ones((2, 2, 3), dtype=np.float64),
+        descriptor_scores=np.asarray([[0.4, 0.3], [0.2, 0.5]]),
+        valid_mask=np.ones((2, 2), dtype=bool),
+        null_scores=np.asarray([0.3, 0.3]),
+        topology_neighbor_track_ids=np.asarray(
+            [[[3, -1], [4, -1]], [[1, -1], [2, -1]]]
+        ),
+        topology_support_image_indices=np.asarray(
+            [[[7, -1], [8, -1]], [[7, -1], [9, -1]]]
+        ),
+        topology_support_coverage_counts=np.asarray(
+            [[[8, 0], [6, 0]], [[7, 0], [5, 0]]]
+        ),
+    )
+    masked = pool.mask_candidates_to_null(
+        np.asarray([[True, False], [True, False]])
+    )
+    assert masked.has_explicit_topology
+    assert np.array_equal(masked.topology_neighbor_track_ids[0, 0], [3, -1])
+    assert np.all(masked.topology_neighbor_track_ids[0, 1] == -1)
+    assert np.array_equal(masked.topology_support_image_indices[1, 0], [7, -1])
+
+
+def test_relation_feature_prioritizes_explicit_sfm_neighbor_topology() -> None:
+    pool = PoseVerificationCandidatePool(
+        token_indices=np.asarray([10, 20]),
+        xy=np.asarray([[320.0, 240.0], [420.0, 240.0]]),
+        track_ids=np.asarray([[1], [3]]),
+        prototype_ids=np.zeros((2, 1), dtype=np.int64),
+        xyz=np.asarray([[[0.0, 0.0, 5.0]], [[1.0, 0.0, 5.0]]]),
+        descriptor_scores=np.ones((2, 1), dtype=np.float64),
+        valid_mask=np.ones((2, 1), dtype=bool),
+        null_scores=np.zeros((2,), dtype=np.float64),
+        maplet_cluster_ids=np.asarray([[7], [7]]),
+        topology_neighbor_track_ids=np.asarray([[[3, -1]], [[1, -1]]]),
+        topology_support_image_indices=np.asarray([[[5, -1]], [[5, -1]]]),
+        topology_support_coverage_counts=np.asarray([[[8, 0]], [[8, 0]]]),
+    )
+    modes = CandidateModeMixture(
+        pool.xy[:, None, None, :],
+        np.ones((2, 1, 1), dtype=np.float64),
+        np.ones((2, 1, 1), dtype=bool),
+    )
+    features = relation_residual_histograms(
+        pool,
+        np.eye(4),
+        _camera(),
+        build_query_knn_relation_graph(pool.xy, neighbor_k=1),
+        modes,
+        bin_edges_px=np.asarray([0.0, 1.0, 8.0]),
+        candidate_outlier_likelihood=1e-3,
+        null_likelihood=1e-3,
+    )
+    assert np.isclose(features.histograms[0, 24, 0], 1.0)
+    assert np.isclose(np.sum(features.histograms[0, :24]), 0.0)
 
 
 def test_candidate_masking_canonicalizes_float32_simplex_drift() -> None:
@@ -930,6 +998,40 @@ def test_likelihood_scale_changes_immutable_denominator_hash() -> None:
     )
 
     assert len({baseline, changed_outlier, changed_null}) == 3
+
+
+def test_relation_graph_changes_immutable_denominator_hash() -> None:
+    pool = PoseVerificationCandidatePool(
+        token_indices=np.asarray([0], dtype=np.int64),
+        xy=np.asarray([[320.0, 240.0]], dtype=np.float64),
+        track_ids=np.asarray([[1]], dtype=np.int64),
+        prototype_ids=np.asarray([[0]], dtype=np.int64),
+        xyz=np.asarray([[[0.0, 0.0, 8.0]]], dtype=np.float64),
+        descriptor_scores=np.asarray([[0.9]], dtype=np.float64),
+        valid_mask=np.ones((1, 1), dtype=bool),
+        null_scores=np.asarray([0.1], dtype=np.float64),
+    )
+    common = dict(
+        residual_sigma_px=2.0,
+        candidate_outlier_likelihood=1e-3,
+        null_likelihood=1e-3,
+    )
+    baseline = candidate_pool_likelihood_manifest_sha256(
+        pool, _camera(), **common
+    )
+    first = candidate_pool_likelihood_manifest_sha256(
+        pool,
+        _camera(),
+        relation_feature_manifest=("v1", "graph-a", 1, (0.0, 1.0)),
+        **common,
+    )
+    second = candidate_pool_likelihood_manifest_sha256(
+        pool,
+        _camera(),
+        relation_feature_manifest=("v1", "graph-b", 1, (0.0, 1.0)),
+        **common,
+    )
+    assert len({baseline, first, second}) == 3
 
 
 def _match(
@@ -1758,6 +1860,7 @@ def test_grouped_candidate_pnp_recovers_when_top1_identity_is_wrong() -> None:
             min_fit_matches=12,
             min_fit_grid_cells=4,
             min_final_inliers=8,
+            enable_final_refine=True,
         ),
         query_seed=23,
     )

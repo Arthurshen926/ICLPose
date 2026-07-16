@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from feature_extract.tools.vfm.eval_pose_hypothesis_verification import (
+    _immutable_baseline_required_splits,
     _hypothesis_is_chosen_for_audit,
     _load_immutable_baseline_pose_artifact,
     _pose_summary,
@@ -95,6 +96,23 @@ def test_train_grouped_export_only_requires_geometry_when_consumed() -> None:
     disabled["export_train_grouped_hypotheses"] = False
     disabled["candidate_geometry_generation_mix_weight"] = 1.0
     assert not _train_grouped_export_requires_geometry(SimpleNamespace(**disabled))
+
+
+def test_train_export_does_not_expand_immutable_baseline_coverage() -> None:
+    validation_only = SimpleNamespace(
+        development_cross_block_audit=False,
+        export_train_grouped_hypotheses=True,
+    )
+    cross_block = SimpleNamespace(
+        development_cross_block_audit=True,
+        export_train_grouped_hypotheses=True,
+    )
+
+    assert _immutable_baseline_required_splits(validation_only) == ("validation",)
+    assert _immutable_baseline_required_splits(cross_block) == (
+        "validation",
+        "test",
+    )
 
 
 @pytest.mark.parametrize(

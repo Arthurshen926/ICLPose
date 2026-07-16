@@ -133,6 +133,29 @@ def load_inference_artifact(path: Path) -> tuple[dict[str, np.ndarray], dict[str
     return arrays, metadata
 
 
+def load_inference_artifact_fields(
+    path: Path, fields: Sequence[str]
+) -> tuple[dict[str, np.ndarray], dict[str, object]]:
+    """Load a validated row subset without inflating unrelated dense features."""
+    requested = set(fields) | REQUIRED_FIELDS
+    with np.load(Path(path), allow_pickle=False) as payload:
+        names = set(payload.files)
+        missing = sorted(requested.difference(names))
+        if missing:
+            raise ValueError(f"{path}: missing requested fields: {missing}")
+        forbidden = sorted(
+            key
+            for key in names
+            if key != "metadata_json"
+            and any(marker in key.lower() for marker in TARGET_FIELD_MARKERS)
+        )
+        if forbidden:
+            raise ValueError(f"{path}: inference artifact contains target fields: {forbidden}")
+        arrays = {key: np.asarray(payload[key]).copy() for key in requested}
+    metadata = validate_inference_artifact(arrays, source=str(path))
+    return arrays, metadata
+
+
 def _compatibility_payload(metadata: Mapping[str, object]) -> dict[str, object]:
     return {
         "inputs": metadata.get("inputs"),
@@ -394,12 +417,45 @@ def _write_query_csv(path: Path, rows: Sequence[Mapping[str, object]]) -> None:
         writer.writerows(rows)
 
 
+_VARIABLE_EDGE_FIELDS = {
+    "verification_relation_feature_edge_histograms",
+    "verification_relation_feature_edge_null_touching_masses",
+}
+
+
+def concatenate_hypothesis_shard_field(
+    key: str, values: Sequence[np.ndarray]
+) -> np.ndarray:
+    """Merge row shards while preserving NaN padding for variable edge axes."""
+    arrays = [np.asarray(value) for value in values]
+    if key not in _VARIABLE_EDGE_FIELDS:
+        return np.concatenate(arrays, axis=0)
+    if any(array.ndim < 2 for array in arrays):
+        raise ValueError(f"variable-edge field {key} must have at least two axes")
+    trailing = arrays[0].shape[2:]
+    if any(array.shape[2:] != trailing for array in arrays):
+        raise ValueError(f"variable-edge field {key} has incompatible trailing shape")
+    max_edges = max(array.shape[1] for array in arrays)
+    padded = []
+    for array in arrays:
+        if array.shape[1] == max_edges:
+            padded.append(array)
+            continue
+        output = np.full(
+            (array.shape[0], max_edges, *trailing), np.nan, dtype=array.dtype
+        )
+        output[:, : array.shape[1]] = array
+        padded.append(output)
+    return np.concatenate(padded, axis=0)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     paths = [Path(value.strip()) for value in args.hypothesis_artifacts.split(",") if value.strip()]
     if not paths:
         raise ValueError("at least one hypothesis artifact is required")
-    loaded = [load_inference_artifact(path) for path in paths]
+    gt_join_fields = tuple(REQUIRED_FIELDS) + (RELATION_SCORE_FIELD,)
+    loaded = [load_inference_artifact_fields(path, gt_join_fields) for path in paths]
     compatibility = [_compatibility_payload(metadata) for _arrays, metadata in loaded]
     fingerprints = [_canonical_sha256(item) for item in compatibility]
     if len(set(fingerprints)) != 1:
@@ -409,7 +465,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if any((set(arrays) - {"metadata_json"}) != array_keys for arrays, _metadata in loaded):
         raise ValueError("hypothesis shards have different schemas")
     merged = {
-        key: np.concatenate([arrays[key] for arrays, _metadata in loaded], axis=0)
+        key: concatenate_hypothesis_shard_field(
+            key, [arrays[key] for arrays, _metadata in loaded]
+        )
         for key in sorted(array_keys)
     }
     source_artifact_indices = np.concatenate(
