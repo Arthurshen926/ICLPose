@@ -28,6 +28,9 @@ class LandmarkRetrievalLossConfig:
     memory_negative_merge_policy: str = "source_balanced_round_robin"
     system_hard_negative_margin: float = 0.05
     system_hard_negative_margin_weight: float = 0.0
+    coherent_hard_negative_margin: float = 0.05
+    coherent_hard_negative_margin_weight: float = 0.0
+    coherent_hard_negative_min_mode_rows: int = 4
     dustbin_logit: float | None = 0.0
     dustbin_loss_weight: float = 0.25
     dustbin_detach_descriptors: bool = False
@@ -62,6 +65,12 @@ class LandmarkRetrievalLossConfig:
             raise ValueError("system_hard_negative_margin must be non-negative")
         if float(self.system_hard_negative_margin_weight) < 0.0:
             raise ValueError("system_hard_negative_margin_weight must be non-negative")
+        if float(self.coherent_hard_negative_margin) < 0.0:
+            raise ValueError("coherent_hard_negative_margin must be non-negative")
+        if float(self.coherent_hard_negative_margin_weight) < 0.0:
+            raise ValueError("coherent_hard_negative_margin_weight must be non-negative")
+        if int(self.coherent_hard_negative_min_mode_rows) < 2:
+            raise ValueError("coherent_hard_negative_min_mode_rows must be at least 2")
         if str(self.prototype_aggregation_method) not in {
             "mean",
             "cosine_weighted_mean",
@@ -435,6 +444,10 @@ def landmark_retrieval_loss(
     # observations. A frozen full-map bank may contain the query observation
     # itself, so matching bank tracks are ambiguity exclusions, never positives.
     strict_positive_track_ids: torch.Tensor | None = None,
+    # Explicit train-only tracks mined from coherent wrong-pose hypotheses.
+    # These are candidate identities, not generic nearest descriptors.
+    coherent_hard_negative_track_ids: torch.Tensor | None = None,
+    coherent_hard_negative_mode_ids: torch.Tensor | None = None,
     dustbin_logits: torch.Tensor | None = None,
     unmatched_query_descriptors: torch.Tensor | None = None,
     unmatched_dustbin_logits: torch.Tensor | None = None,
@@ -479,6 +492,30 @@ def landmark_retrieval_loss(
             raise ValueError(
                 "strict_positive_track_ids must have shape (descriptor pair count, padded track count)"
             )
+    coherent_hard_negatives = None
+    coherent_hard_modes = None
+    if coherent_hard_negative_track_ids is not None:
+        coherent_hard_negatives = coherent_hard_negative_track_ids.to(
+            device=query_descriptors.device, dtype=torch.long
+        )
+        if (
+            coherent_hard_negatives.ndim != 2
+            or coherent_hard_negatives.shape[0] != ids.shape[0]
+        ):
+            raise ValueError(
+                "coherent_hard_negative_track_ids must have shape "
+                "(descriptor pair count, padded track count)"
+            )
+    if coherent_hard_negative_mode_ids is not None:
+        if coherent_hard_negatives is None:
+            raise ValueError("coherent hard-mode ids require coherent track ids")
+        coherent_hard_modes = coherent_hard_negative_mode_ids.to(
+            device=query_descriptors.device, dtype=torch.long
+        )
+        if coherent_hard_modes.shape != coherent_hard_negatives.shape:
+            raise ValueError("coherent hard-mode ids must align with coherent track ids")
+        if torch.any((coherent_hard_negatives >= 0) & (coherent_hard_modes < 0)):
+            raise ValueError("valid coherent tracks require non-negative mode ids")
     valid = (ids >= 0) & torch.isfinite(query_descriptors).all(dim=1) & torch.isfinite(support_descriptors).all(dim=1)
     if not torch.any(valid):
         return None, {"landmark_retrieval_valid_count": 0.0}
@@ -499,6 +536,10 @@ def landmark_retrieval_loss(
         known_positives = known_positives[valid]
     if strict_positives is not None:
         strict_positives = strict_positives[valid]
+    if coherent_hard_negatives is not None:
+        coherent_hard_negatives = coherent_hard_negatives[valid]
+    if coherent_hard_modes is not None:
+        coherent_hard_modes = coherent_hard_modes[valid]
     xyz_rows = None if track_xyz is None else track_xyz.to(device=query.device, dtype=torch.float32).reshape(-1, 3)[valid]
     all_unique_ids, all_inverse = torch.unique(ids, sorted=True, return_inverse=True)
     all_prototypes, all_counts = _aggregate_track_rows(
@@ -532,6 +573,10 @@ def landmark_retrieval_loss(
         known_positives = known_positives[eligible_rows]
     if strict_positives is not None:
         strict_positives = strict_positives[eligible_rows]
+    if coherent_hard_negatives is not None:
+        coherent_hard_negatives = coherent_hard_negatives[eligible_rows]
+    if coherent_hard_modes is not None:
+        coherent_hard_modes = coherent_hard_modes[eligible_rows]
     unique_ids = all_unique_ids[eligible_tracks]
     current_prototypes = all_prototypes[eligible_tracks]
     current_counts = all_counts[eligible_tracks]
@@ -552,6 +597,7 @@ def landmark_retrieval_loss(
             keep_rows.append(int(row))
         keep = torch.as_tensor(keep_rows, dtype=torch.long, device=query.device)
         query = query[keep]
+        ids = ids[keep]
         if valid_dustbin_logits is not None:
             valid_dustbin_logits = valid_dustbin_logits[keep]
         labels = labels[keep]
@@ -562,11 +608,17 @@ def landmark_retrieval_loss(
             known_positives = known_positives[keep]
         if strict_positives is not None:
             strict_positives = strict_positives[keep]
+        if coherent_hard_negatives is not None:
+            coherent_hard_negatives = coherent_hard_negatives[keep]
+        if coherent_hard_modes is not None:
+            coherent_hard_modes = coherent_hard_modes[keep]
 
     history_found = torch.zeros((unique_ids.numel(),), dtype=torch.bool, device=query.device)
     history_counts = np.zeros((unique_ids.numel(),), dtype=np.int64)
     positive_observation_counts = current_counts.detach().cpu().numpy().astype(np.int64)
     positive_prototypes = current_prototypes
+    frozen_bank_missing_positive_track_count = 0
+    frozen_bank_dropped_query_count = 0
     if str(cfg.positive_prototype_source) == "query_disjoint_frozen_bank":
         if memory_bank is None or not bool(memory_bank.frozen):
             raise ValueError(
@@ -576,11 +628,56 @@ def landmark_retrieval_loss(
             unique_ids.detach().cpu().numpy()
         )
         if not bool(torch.all(bank_found)):
-            missing = unique_ids[~bank_found].detach().cpu().tolist()
-            raise ValueError(
-                "query-disjoint frozen bank is missing episode-positive tracks: "
-                f"count={len(missing)}, preview={missing[:10]!r}"
+            # Tracks absent from the query-disjoint map (for example, tracks
+            # left with fewer than min_observations after removing query
+            # images) are not deployable positive classes.  Exclude their
+            # query rows instead of leaking query observations into the map or
+            # treating an unavailable identity as a negative.
+            frozen_bank_missing_positive_track_count = int(
+                torch.count_nonzero(~bank_found).item()
             )
+            bank_row_keep = bank_found[labels]
+            frozen_bank_dropped_query_count = int(
+                torch.count_nonzero(~bank_row_keep).item()
+            )
+            if not bool(torch.any(bank_row_keep)):
+                return None, {
+                    "landmark_retrieval_valid_count": 0.0,
+                    "landmark_retrieval_frozen_bank_missing_positive_track_count": float(
+                        frozen_bank_missing_positive_track_count
+                    ),
+                    "landmark_retrieval_frozen_bank_dropped_query_count": float(
+                        frozen_bank_dropped_query_count
+                    ),
+                }
+            query = query[bank_row_keep]
+            ids = ids[bank_row_keep]
+            if valid_dustbin_logits is not None:
+                valid_dustbin_logits = valid_dustbin_logits[bank_row_keep]
+            if groups is not None:
+                groups = groups[bank_row_keep]
+            if image_groups is not None:
+                image_groups = image_groups[bank_row_keep]
+            if known_positives is not None:
+                known_positives = known_positives[bank_row_keep]
+            if strict_positives is not None:
+                strict_positives = strict_positives[bank_row_keep]
+            if coherent_hard_negatives is not None:
+                coherent_hard_negatives = coherent_hard_negatives[bank_row_keep]
+            if coherent_hard_modes is not None:
+                coherent_hard_modes = coherent_hard_modes[bank_row_keep]
+
+            bank_old_to_new = torch.full_like(bank_found, -1, dtype=torch.long)
+            bank_old_to_new[bank_found] = torch.arange(
+                int(torch.count_nonzero(bank_found).item()), device=query.device
+            )
+            labels = bank_old_to_new[labels[bank_row_keep]]
+            unique_ids = unique_ids[bank_found]
+            current_prototypes = current_prototypes[bank_found]
+            current_counts = current_counts[bank_found]
+            current_xyz = current_xyz[bank_found]
+            bank_prototypes = bank_prototypes[bank_found]
+            bank_counts = bank_counts[bank_found.detach().cpu().numpy()]
         positive_prototypes = bank_prototypes
         positive_observation_counts = bank_counts
     elif memory_bank is not None and len(memory_bank) > 0 and not bool(memory_bank.frozen):
@@ -863,11 +960,132 @@ def landmark_retrieval_loss(
             system_hard_negative_margin_count = int(
                 torch.count_nonzero(margin_rows).item()
             )
+    coherent_hard_negative_margin_loss = logits.new_tensor(0.0)
+    coherent_hard_negative_margin_count = 0
+    coherent_configuration_mode_count = 0
+    coherent_configuration_row_count = 0
+    coherent_configuration_margin_loss = logits.new_tensor(0.0)
+    coherent_configuration_row_margin_loss = logits.new_tensor(0.0)
+    coherent_configuration_row_violation_fraction = 0.0
+    coherent_hard_negative_missing_count = 0
+    coherent_hard_negative_excluded_positive_count = 0
+    if (
+        float(cfg.coherent_hard_negative_margin_weight) > 0.0
+        and coherent_hard_negatives is not None
+        and coherent_hard_negatives.shape[1] > 0
+    ):
+        if memory_bank is None or not bool(memory_bank.frozen):
+            raise ValueError(
+                "coherent hard negatives require a frozen projected landmark bank"
+            )
+        hard_ids = coherent_hard_negatives.detach().cpu().numpy().astype(
+            np.int64, copy=False
+        )
+        ids_np = ids.detach().cpu().numpy().astype(np.int64, copy=False)
+        if hard_ids.shape[0] != ids_np.shape[0]:
+            raise ValueError(
+                "coherent hard-negative rows must remain aligned with filtered query rows"
+            )
+        hard_descriptors_flat, hard_found_flat, _counts, _xyz = memory_bank.lookup(
+            hard_ids.reshape(-1)
+        )
+        hard_descriptors = hard_descriptors_flat.reshape(
+            hard_ids.shape[0], hard_ids.shape[1], -1
+        ).to(device=query.device, dtype=query.dtype)
+        hard_found = hard_found_flat.reshape(hard_ids.shape).to(device=query.device)
+        hard_valid = torch.as_tensor(hard_ids >= 0, dtype=torch.bool, device=query.device)
+        hard_valid &= hard_found
+        forbidden = hard_ids[:, :, None] == ids_np[:, None, None]
+        forbidden = np.any(forbidden, axis=2)
+        for positive_rows in (known_positives, strict_positives):
+            if positive_rows is None or positive_rows.numel() == 0:
+                continue
+            positive_np = positive_rows.detach().cpu().numpy().astype(np.int64, copy=False)
+            forbidden |= np.any(
+                hard_ids[:, :, None] == positive_np[:, None, :], axis=2
+            )
+        forbidden_t = torch.as_tensor(forbidden, dtype=torch.bool, device=query.device)
+        coherent_hard_negative_excluded_positive_count = int(
+            torch.count_nonzero(hard_valid & forbidden_t).item()
+        )
+        hard_valid &= ~forbidden_t
+        coherent_hard_negative_missing_count = int(
+            np.count_nonzero(hard_ids >= 0) - torch.count_nonzero(hard_found).item()
+        )
+        hard_scores = torch.einsum(
+            "qc,qkc->qk", query, F.normalize(hard_descriptors.detach(), dim=2)
+        ).masked_fill(~hard_valid, float("-inf"))
+        current_positive_scores = query @ positive_prototypes.T
+        best_positive_score = current_positive_scores.masked_fill(
+            ~strict_track_mask, float("-inf")
+        ).max(dim=1).values
+        if coherent_hard_modes is None:
+            hardest_coherent = hard_scores.max(dim=1).values
+            margin_rows = torch.isfinite(best_positive_score) & torch.isfinite(
+                hardest_coherent
+            )
+            if torch.any(margin_rows):
+                coherent_hard_negative_margin_loss = F.relu(
+                    hardest_coherent[margin_rows]
+                    - best_positive_score[margin_rows]
+                    + float(cfg.coherent_hard_negative_margin)
+                ).mean()
+                coherent_hard_negative_margin_count = int(
+                    torch.count_nonzero(margin_rows).item()
+                )
+        else:
+            mode_losses: list[torch.Tensor] = []
+            configuration_losses: list[torch.Tensor] = []
+            row_margin_losses: list[torch.Tensor] = []
+            violating_row_count = 0
+            valid_mode_ids = coherent_hard_modes[hard_valid]
+            for mode_id in torch.unique(valid_mode_ids[valid_mode_ids >= 0]).tolist():
+                mode_candidates = hard_valid & (coherent_hard_modes == int(mode_id))
+                mode_wrong_scores = hard_scores.masked_fill(
+                    ~mode_candidates, float("-inf")
+                ).max(dim=1).values
+                mode_rows = torch.isfinite(best_positive_score) & torch.isfinite(
+                    mode_wrong_scores
+                )
+                row_count = int(torch.count_nonzero(mode_rows).item())
+                if row_count < int(cfg.coherent_hard_negative_min_mode_rows):
+                    continue
+                row_margins = (
+                    mode_wrong_scores[mode_rows]
+                    - best_positive_score[mode_rows]
+                    + float(cfg.coherent_hard_negative_margin)
+                )
+                configuration_loss = F.relu(row_margins.mean())
+                row_margin_loss = F.relu(row_margins).mean()
+                # The configuration term enforces the whole-mode ordering.  Its
+                # row-wise upper bound prevents many easy correspondences from
+                # cancelling the few high-score wrong identities that actually
+                # make the coherent pose hypothesis viable.
+                configuration_losses.append(configuration_loss)
+                row_margin_losses.append(row_margin_loss)
+                mode_losses.append(configuration_loss + row_margin_loss)
+                violating_row_count += int(torch.count_nonzero(row_margins > 0).item())
+                coherent_configuration_mode_count += 1
+                coherent_configuration_row_count += row_count
+            if mode_losses:
+                coherent_hard_negative_margin_loss = torch.stack(mode_losses).mean()
+                coherent_configuration_margin_loss = torch.stack(
+                    configuration_losses
+                ).mean()
+                coherent_configuration_row_margin_loss = torch.stack(
+                    row_margin_losses
+                ).mean()
+                coherent_configuration_row_violation_fraction = float(
+                    violating_row_count / max(1, coherent_configuration_row_count)
+                )
+                coherent_hard_negative_margin_count = coherent_configuration_row_count
     loss = (
         retrieval_loss
         + float(cfg.dustbin_loss_weight) * dustbin_loss
         + float(cfg.system_hard_negative_margin_weight)
         * system_hard_negative_margin_loss
+        + float(cfg.coherent_hard_negative_margin_weight)
+        * coherent_hard_negative_margin_loss
     )
 
     with torch.no_grad():
@@ -911,6 +1129,12 @@ def landmark_retrieval_loss(
                 all_unique_ids.numel() - unique_ids.numel()
             ),
             "landmark_retrieval_track_count": float(unique_ids.numel()),
+            "landmark_retrieval_frozen_bank_missing_positive_track_count": float(
+                frozen_bank_missing_positive_track_count
+            ),
+            "landmark_retrieval_frozen_bank_dropped_query_count": float(
+                frozen_bank_dropped_query_count
+            ),
             "landmark_retrieval_candidate_count": float(logits.shape[1]),
             "landmark_retrieval_memory_negative_count": float(selected_memory_negative_count),
             "landmark_retrieval_memory_strict_ambiguity_candidate_count": float(
@@ -946,6 +1170,33 @@ def landmark_retrieval_loss(
             ),
             "landmark_retrieval_system_hard_negative_margin_count": float(
                 system_hard_negative_margin_count
+            ),
+            "landmark_retrieval_coherent_hard_negative_margin_loss": float(
+                coherent_hard_negative_margin_loss.detach().cpu().item()
+            ),
+            "landmark_retrieval_coherent_hard_negative_margin_count": float(
+                coherent_hard_negative_margin_count
+            ),
+            "landmark_retrieval_coherent_configuration_mode_count": float(
+                coherent_configuration_mode_count
+            ),
+            "landmark_retrieval_coherent_configuration_row_count": float(
+                coherent_configuration_row_count
+            ),
+            "landmark_retrieval_coherent_configuration_margin_loss": float(
+                coherent_configuration_margin_loss.detach().cpu()
+            ),
+            "landmark_retrieval_coherent_configuration_row_margin_loss": float(
+                coherent_configuration_row_margin_loss.detach().cpu()
+            ),
+            "landmark_retrieval_coherent_configuration_row_violation_fraction": float(
+                coherent_configuration_row_violation_fraction
+            ),
+            "landmark_retrieval_coherent_hard_negative_missing_count": float(
+                coherent_hard_negative_missing_count
+            ),
+            "landmark_retrieval_coherent_hard_negative_excluded_positive_count": float(
+                coherent_hard_negative_excluded_positive_count
             ),
             "landmark_retrieval_positive_score_mean": float(positive_scores.mean().item()),
             "landmark_retrieval_hardest_negative_score_mean": hardest_negative_mean,

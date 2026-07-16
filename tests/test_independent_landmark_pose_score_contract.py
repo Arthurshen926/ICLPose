@@ -4,8 +4,12 @@ from feature_extract.tools.vfm.eval_independent_landmark_pose_scores import (
     _best_correct_rank,
 )
 from feature_extract.tools.vfm.score_independent_landmark_pose_hypotheses import (
+    _load_candidate_prior_overlay,
+    _load_npz_fields,
     _maplet_purged_tracks,
+    _strict_absolute_likelihood_config,
     _verification_points_for_query,
+    parse_args,
 )
 
 
@@ -106,3 +110,107 @@ def test_best_correct_rank_uses_frozen_score_order() -> None:
     )
 
     assert rank == 3
+
+
+def test_absolute_score_cli_enforces_fixed_topl_with_explicit_null() -> None:
+    args = parse_args(
+        [
+            "--hypothesis_artifacts",
+            "hypotheses.npz",
+            "--detector_query_cache",
+            "detector.npz",
+            "--proposals",
+            "proposals.npz",
+            "--candidate_artifact",
+            "candidate.npz",
+            "--fixed_candidate_prior_overlay",
+            "prior.npz",
+            "--projected_landmark_bank",
+            "bank.npz",
+            "--support_geometry_index",
+            "views.npz",
+            "--colmap_model_dir",
+            "model",
+            "--output_dir",
+            "output",
+        ]
+    )
+
+    config = _strict_absolute_likelihood_config(args)
+
+    assert config.candidate_mode == "fixed_global_topl"
+    assert config.fixed_candidate_prior_source == "learned_probability"
+    assert config.maximum_view_angle_deg == 90.0
+
+
+def test_absolute_score_cli_refuses_missing_explicit_null_overlay() -> None:
+    with np.testing.assert_raises(SystemExit):
+        parse_args(
+            [
+                "--hypothesis_artifacts",
+                "hypotheses.npz",
+                "--detector_query_cache",
+                "detector.npz",
+                "--proposals",
+                "proposals.npz",
+                "--candidate_artifact",
+                "candidate.npz",
+                "--projected_landmark_bank",
+                "bank.npz",
+                "--support_geometry_index",
+                "views.npz",
+                "--colmap_model_dir",
+                "model",
+                "--output_dir",
+                "output",
+            ]
+        )
+
+
+def test_inference_field_loader_does_not_materialize_supervision(tmp_path) -> None:
+    path = tmp_path / "artifact.npz"
+    np.savez(
+        path,
+        query_ids=np.asarray(["q"]),
+        candidate_gt_residuals_px=np.asarray([[1.0]], dtype=np.float32),
+        metadata_json=np.asarray('{"format":"test"}'),
+    )
+
+    arrays, metadata = _load_npz_fields(path, ("query_ids",))
+
+    assert set(arrays) == {"query_ids"}
+    assert metadata == {"format": "test"}
+
+
+def test_strict_scorer_accepts_target_free_image_context_overlay(tmp_path) -> None:
+    proposals_path = tmp_path / "proposals.npz"
+    tracks = np.asarray([[10, 11]], dtype=np.int64)
+    np.savez(proposals_path, candidate_track_ids=tracks)
+    from feature_extract.vfm.artifacts import file_sha256_short
+
+    overlay_path = tmp_path / "overlay.npz"
+    metadata = {
+        "format": "candidate_image_context_prior_overlay_v1",
+        "contains_ground_truth": False,
+        "contains_target_errors": False,
+        "probability_semantics": (
+            "candidate_identity_probability_plus_explicit_null_equals_one"
+        ),
+        "proposals_sha256": file_sha256_short(proposals_path),
+    }
+    np.savez(
+        overlay_path,
+        candidate_track_ids=tracks,
+        candidate_probabilities=np.asarray([[0.2, 0.3]], dtype=np.float32),
+        null_probabilities=np.asarray([0.5], dtype=np.float32),
+        metadata_json=np.asarray(__import__("json").dumps(metadata)),
+    )
+
+    arrays, loaded_metadata = _load_candidate_prior_overlay(
+        overlay_path,
+        proposals_path=proposals_path,
+        proposals={"candidate_track_ids": tracks},
+    )
+
+    np.testing.assert_allclose(arrays["null_probabilities"], [0.5])
+    assert loaded_metadata["format"] == "candidate_image_context_prior_overlay_v1"

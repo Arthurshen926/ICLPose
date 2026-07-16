@@ -833,6 +833,8 @@ class IndependentLandmarkPoseVerifier:
             landmark_index.track_ids, dtype=np.int64
         )[track_order]
         self._fixed_candidate_cache: dict[tuple[int, int], object] = {}
+        self._fixed_candidate_vector_cache: dict[tuple[int, int], object] = {}
+        self._fixed_candidate_row_cache: dict[tuple[int, int], object] = {}
 
     def _static_eligible_mask(
         self, eligible_landmark_mask: np.ndarray | None
@@ -996,40 +998,131 @@ class IndependentLandmarkPoseVerifier:
         pose_eligible: np.ndarray,
         points: IndependentVerificationPoints,
         eligible_landmark_mask: np.ndarray | None,
+        *,
+        projected_row_indices: np.ndarray | None = None,
     ) -> np.ndarray:
-        prepared = self._prepare_fixed_candidates(points, eligible_landmark_mask)
+        (
+            row_indices,
+            point_indices,
+            candidate_indices,
+            priors,
+            view_evidence,
+            candidate_count,
+        ) = self._fixed_candidate_vectors(points, eligible_landmark_mask)
         evidence = np.zeros((len(points),), dtype=np.float64)
-        radius = float(self.config.maximum_reprojection_distance_px)
-        sigma = float(self.config.spatial_sigma_px)
+        if row_indices.size == 0:
+            return evidence
+        if projected_row_indices is None:
+            local_rows = row_indices
+        else:
+            projected_rows = np.asarray(
+                projected_row_indices, dtype=np.int64
+            ).reshape(-1)
+            local_rows = np.searchsorted(projected_rows, row_indices)
+            if np.any(local_rows >= len(projected_rows)) or not np.array_equal(
+                projected_rows[local_rows], row_indices
+            ):
+                raise ValueError("fixed candidate projection rows are incomplete")
+        visible = pose_eligible[local_rows]
+        if not np.any(visible):
+            return evidence
+        rows = local_rows[visible]
+        point_rows = point_indices[visible]
+        candidate_rows = candidate_indices[visible]
+        distances = np.linalg.norm(
+            projected[rows] - points.xy[point_rows], axis=1
+        )
+        within = distances <= float(self.config.maximum_reprojection_distance_px)
+        if not np.any(within):
+            return evidence
+        candidate_rows = candidate_rows[within]
+        values = (
+            priors[visible][within]
+            * view_evidence[visible][within]
+            * np.exp(
+                -0.5
+                * np.square(
+                    distances[within] / float(self.config.spatial_sigma_px)
+                )
+            )
+        )
+        candidate_evidence = np.zeros((candidate_count,), dtype=np.float64)
+        np.maximum.at(candidate_evidence, candidate_rows, values)
+        candidate_points = np.empty((candidate_count,), dtype=np.int64)
+        candidate_points[candidate_indices] = point_indices
+        np.add.at(evidence, candidate_points, candidate_evidence)
+        return np.clip(evidence, 0.0, 1.0)
+
+    def _fixed_candidate_vectors(
+        self,
+        points: IndependentVerificationPoints,
+        eligible_landmark_mask: np.ndarray | None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]:
+        """Flatten fixed candidates once for vectorized per-pose scoring."""
+
+        mask_key = 0 if eligible_landmark_mask is None else id(eligible_landmark_mask)
+        cache_key = (id(points), mask_key)
+        cached = self._fixed_candidate_vector_cache.get(cache_key)
+        if cached is not None:
+            cached_points, cached_mask, vectors = cached  # type: ignore[misc]
+            if cached_points is points and cached_mask is eligible_landmark_mask:
+                return vectors  # type: ignore[return-value]
+        prepared = self._prepare_fixed_candidates(points, eligible_landmark_mask)
+        rows: list[np.ndarray] = []
+        point_rows: list[np.ndarray] = []
+        candidate_rows: list[np.ndarray] = []
+        priors: list[np.ndarray] = []
+        view_values: list[np.ndarray] = []
+        candidate_index = 0
         for point_index, candidates in enumerate(prepared):
-            point_evidence = 0.0
-            for _track_id, rows, view_evidence, _relative_prior, prior in candidates:
-                rows_array = np.asarray(rows, dtype=np.int64)
-                visible = pose_eligible[rows_array]
-                if not np.any(visible):
-                    continue
-                visible_rows = rows_array[visible]
-                distances = np.linalg.norm(
-                    projected[visible_rows] - points.xy[point_index], axis=1
-                )
-                within = distances <= radius
-                if not np.any(within):
-                    continue
-                spatial = np.exp(-0.5 * np.square(distances[within] / sigma))
-                view_values = np.asarray(view_evidence, dtype=np.float64)[visible][
-                    within
-                ]
-                point_evidence += float(prior) * float(
-                    np.max(view_values * spatial)
-                )
-            evidence[point_index] = min(max(point_evidence, 0.0), 1.0)
-        return evidence
+            for _track_id, candidate, views, _relative_prior, prior in candidates:
+                candidate_array = np.asarray(candidate, dtype=np.int64).reshape(-1)
+                view_array = np.asarray(views, dtype=np.float64).reshape(-1)
+                if candidate_array.shape != view_array.shape:
+                    raise ValueError("fixed candidate rows and view evidence differ")
+                count = len(candidate_array)
+                if count:
+                    rows.append(candidate_array)
+                    point_rows.append(np.full(count, point_index, dtype=np.int64))
+                    candidate_rows.append(
+                        np.full(count, candidate_index, dtype=np.int64)
+                    )
+                    priors.append(np.full(count, float(prior), dtype=np.float64))
+                    view_values.append(view_array)
+                    candidate_index += 1
+        vectors = (
+            np.concatenate(rows) if rows else np.zeros((0,), dtype=np.int64),
+            np.concatenate(point_rows)
+            if point_rows
+            else np.zeros((0,), dtype=np.int64),
+            np.concatenate(candidate_rows)
+            if candidate_rows
+            else np.zeros((0,), dtype=np.int64),
+            np.concatenate(priors) if priors else np.zeros((0,), dtype=np.float64),
+            np.concatenate(view_values)
+            if view_values
+            else np.zeros((0,), dtype=np.float64),
+            int(candidate_index),
+        )
+        self._fixed_candidate_vector_cache[cache_key] = (
+            points,
+            eligible_landmark_mask,
+            vectors,
+        )
+        return vectors
 
     def _fixed_candidate_landmark_rows(
         self,
         points: IndependentVerificationPoints,
         eligible_landmark_mask: np.ndarray | None,
     ) -> np.ndarray:
+        mask_key = 0 if eligible_landmark_mask is None else id(eligible_landmark_mask)
+        cache_key = (id(points), mask_key)
+        cached = self._fixed_candidate_row_cache.get(cache_key)
+        if cached is not None:
+            cached_points, cached_mask, cached_rows = cached  # type: ignore[misc]
+            if cached_points is points and cached_mask is eligible_landmark_mask:
+                return cached_rows  # type: ignore[return-value]
         prepared = self._prepare_fixed_candidates(points, eligible_landmark_mask)
         row_blocks = [
             np.asarray(candidate[1], dtype=np.int64)
@@ -1037,9 +1130,17 @@ class IndependentLandmarkPoseVerifier:
             for candidate in candidates
             if len(np.asarray(candidate[1]).reshape(-1))
         ]
-        if not row_blocks:
-            return np.zeros((0,), dtype=np.int64)
-        return np.unique(np.concatenate(row_blocks))
+        rows = (
+            np.unique(np.concatenate(row_blocks))
+            if row_blocks
+            else np.zeros((0,), dtype=np.int64)
+        )
+        self._fixed_candidate_row_cache[cache_key] = (
+            points,
+            eligible_landmark_mask,
+            rows,
+        )
+        return rows
 
     def eligible_mask_excluding_tracks(
         self, excluded_track_ids: np.ndarray | None
@@ -1102,10 +1203,12 @@ class IndependentLandmarkPoseVerifier:
         rows = self._fixed_candidate_landmark_rows(
             points, eligible_landmark_mask
         )
-        projected = np.full((len(self.landmark_index), 2), np.nan, dtype=np.float64)
-        eligible = np.zeros((len(self.landmark_index),), dtype=bool)
         if rows.size == 0:
-            return projected, eligible, rows
+            return (
+                np.zeros((0, 2), dtype=np.float64),
+                np.zeros((0,), dtype=bool),
+                rows,
+            )
 
         xyz = np.asarray(self.landmark_index.xyz[rows], dtype=np.float64)
         selected_projected = project_world_to_image(xyz, pose, camera)
@@ -1128,9 +1231,7 @@ class IndependentLandmarkPoseVerifier:
             )
         else:
             selected_eligible &= np.isfinite(minimum_view_angles)
-        projected[rows] = selected_projected
-        eligible[rows] = selected_eligible
-        return projected, eligible, rows
+        return selected_projected, selected_eligible, rows
 
     def pose_conditioned_correspondences(
         self,
@@ -1411,7 +1512,7 @@ class IndependentLandmarkPoseVerifier:
         if points.descriptors.shape[1] != self._features.shape[1]:
             raise ValueError("query and landmark descriptor dimensions differ")
         if str(self.config.candidate_mode) == "fixed_global_topl":
-            projected, eligible, _candidate_rows = (
+            projected, eligible, candidate_rows = (
                 self._projected_fixed_candidate_landmarks(
                     pose_w2c,
                     camera,
@@ -1424,6 +1525,7 @@ class IndependentLandmarkPoseVerifier:
                 eligible,
                 points,
                 eligible_landmark_mask,
+                projected_row_indices=candidate_rows,
             )
         else:
             projected, eligible = self._projected_eligible_landmarks(
@@ -1431,7 +1533,11 @@ class IndependentLandmarkPoseVerifier:
             )
             evidence = np.zeros((len(points),), dtype=np.float64)
         view_eligible_count = int(np.count_nonzero(eligible))
-        landmark_rows = np.flatnonzero(eligible)
+        landmark_rows = (
+            candidate_rows[np.asarray(eligible, dtype=bool)]
+            if str(self.config.candidate_mode) == "fixed_global_topl"
+            else np.flatnonzero(eligible)
+        )
         if (
             str(self.config.candidate_mode) == "pose_local_knn"
             and len(points)

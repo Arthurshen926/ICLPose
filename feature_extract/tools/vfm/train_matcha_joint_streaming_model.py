@@ -1531,12 +1531,19 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--alike_top_k", type=int, default=4096)
     parser.add_argument("--alike_scores_th", type=float, default=0.1)
     parser.add_argument("--alike_n_limit", type=int, default=8000)
-    parser.add_argument("--model_type", choices=("residual_adapter", "radio_dual_attention"), default="radio_dual_attention")
+    parser.add_argument(
+        "--model_type",
+        choices=("residual_adapter", "radio_spatial_context", "radio_dual_attention"),
+        default="radio_dual_attention",
+    )
     parser.add_argument("--output_dim", type=int, default=128)
     parser.add_argument("--residual_hidden_dim", type=int, default=256)
     parser.add_argument("--fine_input_dim", type=int, default=1280)
     parser.add_argument("--coarse_input_dim", type=int, default=1280)
     parser.add_argument("--attention_hidden_dim", type=int, default=128)
+    parser.add_argument("--context_hidden_dim", type=int, default=256)
+    parser.add_argument("--context_broad_kernel_size", type=int, default=7)
+    parser.add_argument("--context_freeze_base_steps", type=int, default=0)
     parser.add_argument("--attention_depth", type=int, default=1)
     parser.add_argument("--attention_heads", type=int, default=4)
     parser.add_argument("--attention_patch_size", type=int, default=4)
@@ -1667,6 +1674,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         attention_patch_size=int(args.attention_patch_size),
         attention_upsample_mode=str(args.attention_upsample_mode),
         attention_fusion_mode=str(args.attention_fusion_mode),
+        context_hidden_dim=int(args.context_hidden_dim),
+        context_broad_kernel_size=int(args.context_broad_kernel_size),
+        context_freeze_base_steps=int(args.context_freeze_base_steps),
         steps=int(args.steps),
         batch_size=int(args.batch_size),
         lr=float(args.lr),

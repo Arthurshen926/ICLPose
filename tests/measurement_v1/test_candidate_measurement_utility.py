@@ -78,6 +78,31 @@ def test_measurement_utility_aggregates_multiview_distribution_without_identity(
     )
 
 
+def test_measurement_utility_can_propose_discrete_mixture_map() -> None:
+    offsets = np.asarray([[0.0, 0.0], [2.0, 0.0]], dtype=np.float64)
+    features, proposed_offset = aggregate_candidate_measurement_views(
+        offsets_xy=offsets,
+        local_log_probabilities=np.log(
+            np.asarray([[0.4, 0.6]], dtype=np.float64)
+        ),
+        dustbin_probabilities=np.asarray([0.0]),
+        support_view_probabilities=np.asarray([1.0]),
+        likelihood_entropy=np.asarray([0.5]),
+        likelihood_covariance_trace_px2=np.asarray([1.0]),
+        observable_rows=[
+            {
+                "track_length": "4",
+                "support_reprojection_error": "0.5",
+                "support_frame_gap": "1",
+            }
+        ],
+        coordinate_proposal_policy="mixture_map",
+    )
+
+    assert np.all(np.isfinite(features))
+    np.testing.assert_allclose(proposed_offset, [2.0, 0.0])
+
+
 def test_measurement_utility_rejects_invalid_support_mass() -> None:
     with np.testing.assert_raises(ValueError):
         aggregate_candidate_measurement_views(

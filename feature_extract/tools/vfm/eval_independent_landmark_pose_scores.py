@@ -75,6 +75,23 @@ def _load_score_artifact(
         raise ValueError(f"{path}: score artifact is not target-free")
     if metadata.get("pose_or_ground_truth_used_for_scoring") is not False:
         raise ValueError(f"{path}: score generation accessed pose targets")
+    if metadata.get("supervision_arrays_loaded") is not False:
+        raise ValueError(f"{path}: score generation loaded supervision arrays")
+    strict_contract = metadata.get("strict_absolute_evidence_contract")
+    required_contract = {
+        "heldout_query_rows": True,
+        "fixed_global_topl": True,
+        "explicit_null_mass": True,
+        "identity_prior_fixed_across_hypotheses": True,
+        "support_appearance_posterior_pose_independent": True,
+        "pose_local_candidate_reselection": False,
+        "pose_conditioned_refinement": False,
+    }
+    if not isinstance(strict_contract, Mapping) or any(
+        strict_contract.get(key) is not expected
+        for key, expected in required_contract.items()
+    ):
+        raise ValueError(f"{path}: score artifact is not strict absolute evidence")
     row_count = int(metadata.get("row_count", -1))
     for key, value in arrays.items():
         if value.ndim == 0 or value.shape[0] != row_count:
@@ -104,12 +121,22 @@ def _score_compatibility(metadata: Mapping[str, object]) -> dict[str, object]:
         "query_point_selection": metadata.get("query_point_selection"),
         "hypothesis_scope": metadata.get("hypothesis_scope"),
         "crossfit": metadata.get("crossfit"),
+        "strict_absolute_evidence_contract": metadata.get(
+            "strict_absolute_evidence_contract"
+        ),
+        "supervision_arrays_loaded": metadata.get("supervision_arrays_loaded"),
         "view_geometry_mode": metadata.get("view_geometry_mode"),
         "detector_query_cache_sha256": inputs.get(
             "detector_query_cache_sha256"
         ),
         "proposals_sha256": inputs.get("proposals_sha256"),
         "candidate_artifact_sha256": inputs.get("candidate_artifact_sha256"),
+        "fixed_candidate_prior_overlay_sha256": inputs.get(
+            "fixed_candidate_prior_overlay_sha256"
+        ),
+        "fixed_candidate_prior_overlay_metadata_sha256": inputs.get(
+            "fixed_candidate_prior_overlay_metadata_sha256"
+        ),
         "projected_landmark_bank_sha256": inputs.get(
             "projected_landmark_bank_sha256"
         ),

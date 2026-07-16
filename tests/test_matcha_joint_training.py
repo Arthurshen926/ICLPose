@@ -35,6 +35,7 @@ from feature_extract.vfm.matcha_joint_training import (
     MatchaJointTrainingConfig,
     MatchaJointTrainingSet,
     RadioDualAttentionFusionJointModel,
+    RadioSpatialContextJointModel,
     MatchaStyleJointModel,
     _provider_training_pair_ordinals,
     _sample_landmark_dustbin_descriptors,
@@ -46,12 +47,123 @@ from feature_extract.vfm.matcha_joint_training import (
     save_matcha_joint_model,
     save_matcha_joint_training_set_manifest,
     save_matcha_joint_training_set_npz,
+    set_radio_spatial_context_base_trainable,
     subset_landmark_known_positive_csr,
     train_matcha_joint_model,
     train_matcha_joint_model_from_manifest,
     train_matcha_joint_model_from_sample_provider,
 )
 from feature_extract.vfm.measurement_v1.rgb_patch_measurement_branch import crop_rgb_window
+
+
+def test_radio_spatial_context_descriptor_depends_on_neighboring_tokens() -> None:
+    torch.manual_seed(3)
+    model = RadioSpatialContextJointModel(
+        input_dim=4,
+        output_dim=2,
+        residual_hidden_dim=8,
+        group_size=1,
+        context_hidden_dim=2,
+        context_broad_kernel_size=3,
+    ).eval()
+    with torch.no_grad():
+        model.context_local.weight.zero_()
+        model.context_mid.weight.zero_()
+        model.context_mix[0].weight.zero_()
+        model.context_mix[0].bias.zero_()
+        model.context_mix[0].weight[0, 8, 0, 0] = 1.0
+        model.context_mix[2].weight.zero_()
+        model.context_mix[2].bias.zero_()
+        model.context_mix[2].weight[0, 0, 0, 0] = 1.0
+
+    first = torch.zeros((1, 4, 5, 5), dtype=torch.float32)
+    second = first.clone()
+    second[0, 0, 2, 3] = 4.0
+    first_descriptor = model.forward_feature_map(first)[0][0, :, 2, 2]
+    second_descriptor = model.forward_feature_map(second)[0][0, :, 2, 2]
+
+    assert not torch.allclose(first_descriptor, second_descriptor)
+    with pytest.raises(RuntimeError, match="row-by-row"):
+        model.forward_rows(torch.zeros((1, 4)))
+
+
+def test_radio_spatial_context_evaluate_skips_row_only_candidate_rank_metric() -> None:
+    model = RadioSpatialContextJointModel(
+        input_dim=8,
+        output_dim=4,
+        residual_hidden_dim=8,
+        group_size=1,
+        context_hidden_dim=4,
+        context_broad_kernel_size=3,
+    )
+    metrics = joint_training._evaluate(
+        model,
+        MatchaJointTrainingSet(coarse_fine_samples=_toy_samples()),
+        MatchaJointTrainingConfig(
+            model_type="radio_spatial_context",
+            output_dim=4,
+            residual_hidden_dim=8,
+            group_size=1,
+            context_hidden_dim=4,
+            context_broad_kernel_size=3,
+            coarse_candidate_rank_loss_weight=1.0,
+            batch_size=8,
+            steps=1,
+        ),
+        torch.device("cpu"),
+    )
+
+    assert metrics["eval_sample_count"] == 8
+    assert "coarse_candidate_rank_loss" not in metrics
+
+
+def test_radio_spatial_context_checkpoint_preserves_descriptor_space(tmp_path) -> None:
+    model = RadioSpatialContextJointModel(
+        input_dim=4,
+        output_dim=2,
+        residual_hidden_dim=8,
+        group_size=1,
+        context_hidden_dim=3,
+        context_broad_kernel_size=5,
+    )
+    path = tmp_path / "spatial_context.pt"
+    save_matcha_joint_model(
+        joint_training.MatchaJointTrainingRun(model=model, summary={}), path
+    )
+
+    loaded = load_matcha_joint_model(path)
+
+    assert isinstance(loaded.model, RadioSpatialContextJointModel)
+    assert loaded.model.context_hidden_dim == 3
+    assert loaded.model.context_broad_kernel_size == 5
+    assert "missing_state_keys" not in loaded.summary
+    assert "unexpected_state_keys" not in loaded.summary
+
+
+def test_radio_spatial_context_warmup_freezes_only_base_parameters() -> None:
+    model = RadioSpatialContextJointModel(
+        input_dim=4,
+        output_dim=2,
+        residual_hidden_dim=8,
+        group_size=1,
+        context_hidden_dim=2,
+        context_broad_kernel_size=3,
+    )
+
+    set_radio_spatial_context_base_trainable(model, trainable=False)
+
+    assert all(
+        parameter.requires_grad
+        for name, parameter in model.named_parameters()
+        if name.startswith("context_")
+    )
+    assert all(
+        not parameter.requires_grad
+        for name, parameter in model.named_parameters()
+        if not name.startswith("context_")
+    )
+    set_radio_spatial_context_base_trainable(model, trainable=True)
+    assert all(parameter.requires_grad for parameter in model.parameters())
 
 
 def test_loss_audit_forwards_frozen_landmark_bank_without_updating(monkeypatch) -> None:

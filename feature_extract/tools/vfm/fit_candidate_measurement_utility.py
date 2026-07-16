@@ -29,6 +29,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--minimum_selected_fraction", type=float, default=0.01)
     parser.add_argument("--minimum_baseline_residual_px", type=float, default=1.0)
     parser.add_argument("--minimum_improvement_px", type=float, default=0.1)
+    parser.add_argument(
+        "--coordinate_proposal_policy",
+        choices=("posterior_mean", "mixture_map"),
+        default="posterior_mean",
+    )
     return parser.parse_args(argv)
 
 
@@ -44,6 +49,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         minimum_selected_fraction=float(args.minimum_selected_fraction),
         minimum_baseline_residual_px=float(args.minimum_baseline_residual_px),
         minimum_improvement_px=float(args.minimum_improvement_px),
+        coordinate_proposal_policy=str(args.coordinate_proposal_policy),
     )
     print(json.dumps(summary, indent=2, sort_keys=True))
 

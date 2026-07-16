@@ -11,7 +11,9 @@ from feature_extract.vfm.colmap_tracks import ColmapCamera
 from feature_extract.vfm.query_to_3d_matching import camera_matrix_and_distortion
 
 
-CANDIDATE_POSE_EVIDENCE_VERSION = "spatial_kernel_mixture_v8_action_separated"
+CANDIDATE_POSE_EVIDENCE_VERSION = (
+    "spatial_kernel_mixture_v10_calibrated_pose_independent_coordinate_mode"
+)
 POSE_CONDITIONED_VIEW_GEOMETRY_VERSION = (
     "track_to_camera_direction_gaussian_v1"
 )
@@ -27,6 +29,8 @@ class CandidatePoseEvidence:
     candidate_inlier_probabilities: np.ndarray
     spatial_candidate_mask: np.ndarray
     spatial_calibrated_mask: np.ndarray
+    candidate_coordinate_mode_probabilities: np.ndarray | None = None
+    candidate_coordinate_updated_mask: np.ndarray | None = None
 
 
 def project_candidate_xyz(
@@ -190,6 +194,8 @@ def candidate_pose_evidence(
     residual_sigma_px: float,
     outlier_likelihood: float,
     spatial_evidence_weight: float | None = None,
+    coordinate_update_policy: str = "posterior_mean",
+    minimum_coordinate_mode_probability: float = 0.0,
 ) -> CandidatePoseEvidence:
     """Evaluate mutually exclusive candidate evidence under a pose.
 
@@ -206,6 +212,16 @@ def candidate_pose_evidence(
         raise ValueError("residual_sigma_px must be positive")
     if not 0.0 < outlier <= 1.0:
         raise ValueError("outlier_likelihood must be in (0, 1]")
+    update_policy = str(coordinate_update_policy)
+    if update_policy not in {
+        "posterior_mean",
+        "concentrated_map",
+        "calibrated_mixture_map",
+    }:
+        raise ValueError("unsupported coordinate update policy")
+    minimum_mode_probability = float(minimum_coordinate_mode_probability)
+    if not 0.0 <= minimum_mode_probability <= 1.0:
+        raise ValueError("minimum coordinate mode probability must be in [0, 1]")
 
     valid = np.asarray(pool.valid_mask, dtype=bool)
     base_xy = np.asarray(pool.xy, dtype=np.float64).reshape(-1, 2)
@@ -235,6 +251,32 @@ def candidate_pose_evidence(
     spatial = getattr(pool, "spatial_likelihood", None)
     spatial_candidate_mask = np.zeros(valid.shape, dtype=bool)
     spatial_calibrated_mask = np.zeros(valid.shape, dtype=bool)
+    coordinate_mode_probabilities = np.ones(valid.shape, dtype=np.float64)
+    coordinate_updated_mask = np.zeros(valid.shape, dtype=bool)
+    if update_policy == "calibrated_mixture_map":
+        update_probability = np.asarray(
+            pool.candidate_update_probabilities, dtype=np.float64
+        )
+        refined_xy = np.asarray(pool.candidate_refined_xy, dtype=np.float64)
+        update_threshold = float(pool.candidate_update_threshold)
+        if update_probability.shape != valid.shape or refined_xy.shape != (
+            *valid.shape,
+            2,
+        ):
+            raise ValueError(
+                "calibrated mixture-map coordinate arrays do not match the pool"
+            )
+        finite = (
+            valid
+            & np.isfinite(update_probability)
+            & np.all(np.isfinite(refined_xy), axis=2)
+        )
+        approved = finite & (update_probability >= update_threshold)
+        candidate_xy[approved] = refined_xy[approved]
+        coordinate_mode_probabilities = np.where(
+            finite, update_probability, 0.0
+        )
+        coordinate_updated_mask = approved.copy()
     if spatial is None:
         return CandidatePoseEvidence(
             projected,
@@ -245,6 +287,8 @@ def candidate_pose_evidence(
             base_inlier,
             spatial_candidate_mask,
             spatial_calibrated_mask,
+            coordinate_mode_probabilities,
+            coordinate_updated_mask,
         )
     weight = (
         float(spatial.log_evidence_weight)
@@ -266,6 +310,8 @@ def candidate_pose_evidence(
             base_inlier,
             spatial_candidate_mask,
             spatial_calibrated_mask,
+            coordinate_mode_probabilities,
+            coordinate_updated_mask,
         )
 
     offsets_xy = np.asarray(spatial.offsets_xy, dtype=np.float64)
@@ -364,6 +410,11 @@ def candidate_pose_evidence(
         spatial_coordinate_numerator = (
             missing_view_mass * base_inlier_numerator * base_xy[row]
         )
+        combined_base_coordinate_mass = (
+            (1.0 - weight) + weight * missing_view_mass
+        ) * base_inlier_numerator
+        best_mode_coordinate_mass = 0.0
+        best_mode_xy = base_xy[row]
         for local_view, view in enumerate(view_indices.tolist()):
             log_probability = np.array(
                 spatial.local_log_probabilities[row, column, view],
@@ -395,6 +446,9 @@ def candidate_pose_evidence(
             spatial_coordinate_numerator += (
                 local_view_prior * local_base_inlier_mass * base_xy[row]
             )
+            combined_base_coordinate_mass += (
+                weight * local_view_prior * local_base_inlier_mass
+            )
             if mode_evidence > 1e-12 and local_mode_inlier_mass > 0.0:
                 mode_mean_xy = np.sum(
                     (mode_probability * geometric)[:, None] * mode_xy, axis=0
@@ -402,6 +456,18 @@ def candidate_pose_evidence(
                 spatial_coordinate_numerator += (
                     local_view_prior * local_mode_inlier_mass * mode_mean_xy
                 )
+                component_masses = (
+                    weight
+                    * local_view_prior
+                    * local_reliability
+                    * (1.0 - outlier)
+                    * mode_probability
+                    * geometric
+                )
+                best_mode = int(np.argmax(component_masses))
+                if float(component_masses[best_mode]) > best_mode_coordinate_mass:
+                    best_mode_coordinate_mass = float(component_masses[best_mode])
+                    best_mode_xy = mode_xy[best_mode]
 
         combined_likelihood = (
             (1.0 - weight) * base_value + weight * spatial_likelihood
@@ -416,9 +482,30 @@ def candidate_pose_evidence(
         )
         likelihoods[row, column] = combined_likelihood
         if combined_inlier_numerator > 1e-12:
-            candidate_xy[row, column] = (
-                combined_coordinate_numerator / combined_inlier_numerator
+            top_coordinate_mass = max(
+                combined_base_coordinate_mass, best_mode_coordinate_mass
             )
+            if update_policy != "calibrated_mixture_map":
+                coordinate_mode_probabilities[row, column] = (
+                    top_coordinate_mass / combined_inlier_numerator
+                )
+            if update_policy == "posterior_mean":
+                candidate_xy[row, column] = (
+                    combined_coordinate_numerator / combined_inlier_numerator
+                )
+                coordinate_updated_mask[row, column] = True
+            elif update_policy == "concentrated_map" and (
+                coordinate_mode_probabilities[row, column]
+                >= minimum_mode_probability
+            ):
+                candidate_xy[row, column] = (
+                    base_xy[row]
+                    if combined_base_coordinate_mass >= best_mode_coordinate_mass
+                    else best_mode_xy
+                )
+                coordinate_updated_mask[row, column] = bool(
+                    best_mode_coordinate_mass > combined_base_coordinate_mass
+                )
         inlier_probabilities[row, column] = (
             combined_inlier_numerator / max(combined_likelihood, 1e-12)
         )
@@ -435,4 +522,6 @@ def candidate_pose_evidence(
         inlier_probabilities,
         spatial_candidate_mask,
         spatial_calibrated_mask,
+        coordinate_mode_probabilities,
+        coordinate_updated_mask,
     )

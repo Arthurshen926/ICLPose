@@ -424,6 +424,107 @@ def test_missing_view_mass_keeps_candidate_coordinate_near_base() -> None:
     assert 0.0 < shift < 0.1
 
 
+def test_concentrated_map_does_not_average_ambiguous_spatial_modes() -> None:
+    offsets = np.stack(
+        np.meshgrid(
+            np.asarray([0.0, 2.0, 4.0]),
+            np.asarray([-2.0, 0.0, 2.0]),
+            indexing="xy",
+        ),
+        axis=-1,
+    ).reshape(-1, 2)
+    probabilities = np.full((len(offsets),), 1e-8, dtype=np.float64)
+    probabilities[np.all(offsets == np.asarray([0.0, 0.0]), axis=1)] = 0.5
+    probabilities[np.all(offsets == np.asarray([4.0, 0.0]), axis=1)] = 0.5
+    spatial = CandidateSpatialLikelihood(
+        offsets_xy=offsets,
+        local_log_probabilities=np.log(probabilities).reshape(1, 1, 1, -1),
+        view_probabilities=np.ones((1, 1, 1), dtype=np.float64),
+        dustbin_probabilities=np.zeros((1, 1, 1), dtype=np.float64),
+        valid_mask=np.ones((1, 1, 1), dtype=bool),
+    )
+    pool = PoseVerificationCandidatePool(
+        token_indices=np.asarray([0]),
+        xy=np.asarray([[318.0, 240.0]]),
+        track_ids=np.asarray([[1]]),
+        prototype_ids=np.asarray([[0]]),
+        xyz=np.asarray([[[0.0, 0.0, 8.0]]]),
+        descriptor_scores=np.asarray([[0.9]]),
+        valid_mask=np.ones((1, 1), dtype=bool),
+        null_scores=np.asarray([0.1]),
+        spatial_likelihood=spatial,
+    )
+
+    evidence = candidate_pose_evidence(
+        pool,
+        np.eye(4, dtype=np.float64),
+        _camera(),
+        residual_sigma_px=3.0,
+        outlier_likelihood=1e-4,
+        coordinate_update_policy="concentrated_map",
+        minimum_coordinate_mode_probability=0.6,
+    )
+
+    np.testing.assert_allclose(evidence.candidate_xy[0, 0], pool.xy[0])
+    assert evidence.candidate_coordinate_mode_probabilities[0, 0] < 0.6
+    assert not evidence.candidate_coordinate_updated_mask[0, 0]
+
+
+def test_calibrated_mixture_map_uses_frozen_target_free_action_gate() -> None:
+    offsets = np.asarray(
+        [[0.0, 0.0], [4.0, 0.0], [0.0, 4.0], [4.0, 4.0]],
+        dtype=np.float64,
+    )
+    spatial = CandidateSpatialLikelihood(
+        offsets_xy=offsets,
+        local_log_probabilities=np.log(
+            np.asarray(
+                [[[[0.05, 0.85, 0.05, 0.05]], [[0.05, 0.85, 0.05, 0.05]]]],
+                dtype=np.float64,
+            )
+        ),
+        view_probabilities=np.ones((1, 2, 1), dtype=np.float64),
+        dustbin_probabilities=np.zeros((1, 2, 1), dtype=np.float64),
+        valid_mask=np.ones((1, 2, 1), dtype=bool),
+    )
+    base_xy = np.asarray([[318.0, 240.0]], dtype=np.float64)
+    refined_xy = np.asarray([[[322.0, 240.0], [314.0, 240.0]]])
+    pool = PoseVerificationCandidatePool(
+        token_indices=np.asarray([0]),
+        xy=base_xy,
+        track_ids=np.asarray([[1, 2]]),
+        prototype_ids=np.asarray([[0, 0]]),
+        xyz=np.asarray([[[0.0, 0.0, 8.0], [0.1, 0.0, 8.0]]]),
+        descriptor_scores=np.asarray([[0.45, 0.45]]),
+        valid_mask=np.ones((1, 2), dtype=bool),
+        null_scores=np.asarray([0.1]),
+        spatial_likelihood=spatial,
+        candidate_update_probabilities=np.asarray([[0.81, 0.79]]),
+        candidate_refined_xy=refined_xy,
+        candidate_update_threshold=0.8,
+    )
+
+    evidence = candidate_pose_evidence(
+        pool,
+        np.eye(4, dtype=np.float64),
+        _camera(),
+        residual_sigma_px=2.0,
+        outlier_likelihood=1e-4,
+        coordinate_update_policy="calibrated_mixture_map",
+    )
+
+    np.testing.assert_allclose(evidence.candidate_xy[0, 0], refined_xy[0, 0])
+    np.testing.assert_allclose(evidence.candidate_xy[0, 1], base_xy[0])
+    np.testing.assert_array_equal(
+        evidence.candidate_coordinate_updated_mask,
+        np.asarray([[True, False]]),
+    )
+    np.testing.assert_allclose(
+        evidence.candidate_coordinate_mode_probabilities,
+        np.asarray([[0.81, 0.79]]),
+    )
+
+
 def test_spatial_mixture_uses_one_normalizer_for_likelihood_inlier_and_xy() -> None:
     offsets = np.stack(
         np.meshgrid(

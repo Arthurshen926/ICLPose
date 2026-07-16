@@ -42,7 +42,12 @@ from feature_extract.vfm.localization.landmark_hybrid import (
 
 
 SCORE_ARTIFACT_FORMAT = "independent_landmark_hypothesis_scores_v1"
-CANDIDATE_PRIOR_OVERLAY_FORMAT = "candidate_maplet_prior_overlay_v1"
+CANDIDATE_PRIOR_OVERLAY_FORMATS = frozenset(
+    {
+        "candidate_maplet_prior_overlay_v1",
+        "candidate_image_context_prior_overlay_v1",
+    }
+)
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -55,6 +60,26 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--detector_query_cache", required=True)
     parser.add_argument("--proposals", required=True)
     parser.add_argument("--candidate_artifact", required=True)
+    parser.add_argument(
+        "--fixed_candidate_prior_overlay",
+        required=True,
+        help=(
+            "Target-free, proposal-aligned candidate probabilities plus explicit "
+            "null mass. Strict absolute scoring refuses an implicit denominator."
+        ),
+    )
+    parser.add_argument(
+        "--fixed_candidate_prior_source",
+        choices=(
+            "learned_probability",
+            "prototype_similarity_with_learned_null",
+        ),
+        default="learned_probability",
+        help=(
+            "Pose-independent identity prior frozen before any hypothesis is "
+            "scored. Both supported modes preserve the overlay null mass."
+        ),
+    )
     parser.add_argument("--projected_landmark_bank", required=True)
     parser.add_argument(
         "--independent_verification_landmark_bank",
@@ -77,7 +102,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--descriptor_temperature", type=float, default=0.04)
     parser.add_argument("--outlier_likelihood", type=float, default=0.01)
     parser.add_argument("--minimum_observation_count", type=int, default=2)
-    parser.add_argument("--maximum_view_angle_deg", type=float, default=15.0)
+    parser.add_argument("--maximum_view_angle_deg", type=float, default=90.0)
     parser.add_argument("--disable_view_gate", action="store_true")
     parser.add_argument("--purge_maplet_clusters", action="store_true")
     parser.add_argument("--kdtree_workers", type=int, default=1)
@@ -98,6 +123,31 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _strict_absolute_likelihood_config(
+    args: argparse.Namespace,
+) -> IndependentLandmarkPoseLikelihoodConfig:
+    """Build the non-self-selecting production absolute-evidence protocol."""
+
+    return IndependentLandmarkPoseLikelihoodConfig(
+        nearest_landmarks=int(args.nearest_landmarks),
+        maximum_reprojection_distance_px=float(
+            args.maximum_reprojection_distance_px
+        ),
+        spatial_sigma_px=float(args.spatial_sigma_px),
+        descriptor_temperature=float(args.descriptor_temperature),
+        outlier_likelihood=float(args.outlier_likelihood),
+        minimum_observation_count=int(args.minimum_observation_count),
+        maximum_view_angle_deg=(
+            None
+            if bool(args.disable_view_gate)
+            else float(args.maximum_view_angle_deg)
+        ),
+        kdtree_workers=int(args.kdtree_workers),
+        candidate_mode="fixed_global_topl",
+        fixed_candidate_prior_source=str(args.fixed_candidate_prior_source),
+    )
+
+
 def _canonical_hash(payload: object) -> str:
     value = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(value).hexdigest()[:16]
@@ -110,6 +160,28 @@ def _load_npz(path: Path) -> tuple[dict[str, np.ndarray], dict[str, object]]:
             for key in payload.files
             if key != "metadata_json"
         }
+        metadata = (
+            {}
+            if "metadata_json" not in payload.files
+            else json.loads(str(payload["metadata_json"].item()))
+        )
+    if not isinstance(metadata, dict):
+        raise ValueError(f"{path}: metadata_json must decode to an object")
+    return arrays, metadata
+
+
+def _load_npz_fields(
+    path: Path,
+    fields: Sequence[str],
+) -> tuple[dict[str, np.ndarray], dict[str, object]]:
+    """Load an explicit inference-only field allowlist from an NPZ artifact."""
+
+    requested = tuple(str(field) for field in fields)
+    with np.load(Path(path), allow_pickle=False) as payload:
+        missing = sorted(set(requested).difference(payload.files))
+        if missing:
+            raise ValueError(f"{path}: missing required fields: {missing}")
+        arrays = {field: np.asarray(payload[field]).copy() for field in requested}
         metadata = (
             {}
             if "metadata_json" not in payload.files
@@ -144,7 +216,7 @@ def _load_candidate_prior_overlay(
     }
     if set(arrays) != required:
         raise ValueError("candidate prior overlay fields differ from contract")
-    if metadata.get("format") != CANDIDATE_PRIOR_OVERLAY_FORMAT:
+    if metadata.get("format") not in CANDIDATE_PRIOR_OVERLAY_FORMATS:
         raise ValueError("unsupported candidate prior overlay format")
     if metadata.get("contains_ground_truth") is not False or metadata.get(
         "contains_target_errors"
@@ -444,9 +516,29 @@ def main(argv: Sequence[str] | None = None) -> int:
         path=source_bank_path,
     )
 
-    detector, detector_metadata = _load_npz(Path(args.detector_query_cache))
-    proposals, proposal_metadata = _load_npz(proposal_path)
-    candidate, candidate_metadata = _load_npz(candidate_path)
+    detector, detector_metadata = _load_npz_fields(
+        Path(args.detector_query_cache),
+        (
+            "image_ids",
+            "offsets",
+            "xy",
+            "global_descriptors",
+            "detector_scores",
+        ),
+    )
+    proposals, proposal_metadata = _load_npz_fields(
+        proposal_path,
+        ("query_ids", "coarse_scores", "candidate_track_ids"),
+    )
+    candidate, candidate_metadata = _load_npz_fields(
+        candidate_path, ("selected_rows",)
+    )
+    prior_overlay_path = Path(args.fixed_candidate_prior_overlay)
+    prior_overlay, prior_overlay_metadata = _load_candidate_prior_overlay(
+        prior_overlay_path,
+        proposals_path=proposal_path,
+        proposals=proposals,
+    )
     support_geometry = None
     support_geometry_metadata: dict[str, object] = {}
     if args.support_geometry_index is not None:
@@ -513,22 +605,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         )
         view_geometry_mode = "descriptor_prototype_aligned_view_distribution"
-    config = IndependentLandmarkPoseLikelihoodConfig(
-        nearest_landmarks=int(args.nearest_landmarks),
-        maximum_reprojection_distance_px=float(
-            args.maximum_reprojection_distance_px
-        ),
-        spatial_sigma_px=float(args.spatial_sigma_px),
-        descriptor_temperature=float(args.descriptor_temperature),
-        outlier_likelihood=float(args.outlier_likelihood),
-        minimum_observation_count=int(args.minimum_observation_count),
-        maximum_view_angle_deg=(
-            None
-            if bool(args.disable_view_gate)
-            else float(args.maximum_view_angle_deg)
-        ),
-        kdtree_workers=int(args.kdtree_workers),
-    )
+    config = _strict_absolute_likelihood_config(args)
     verifier = IndependentLandmarkPoseVerifier(
         landmark_index, view_index, config
     )
@@ -603,6 +680,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             selected_rows=selected_rows,
             point_count=int(args.verification_point_count),
             detector_log_merit_weight=float(args.detector_log_merit_weight),
+            candidate_prior_overlay=prior_overlay,
         )
         direct_excluded_count = int(len(excluded_tracks))
         if bool(args.purge_maplet_clusters):
@@ -733,6 +811,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         "format": SCORE_ARTIFACT_FORMAT,
         "contains_target_fields": False,
         "pose_or_ground_truth_used_for_scoring": False,
+        "supervision_arrays_loaded": False,
+        "strict_absolute_evidence_contract": {
+            "heldout_query_rows": True,
+            "fixed_global_topl": True,
+            "explicit_null_mass": True,
+            "identity_prior_fixed_across_hypotheses": True,
+            "support_appearance_posterior_pose_independent": True,
+            "pose_local_candidate_reselection": False,
+            "pose_conditioned_refinement": False,
+            "pose_effects": (
+                "positive_depth_image_bounds_and_optional_loose_view_gate_only"
+            ),
+        },
         "camera_ownership_parser": "image_name_to_camera_id_pose_discarded_v1",
         "version": INDEPENDENT_LANDMARK_POSE_LIKELIHOOD_VERSION,
         "row_count": int(len(output_rows)),
@@ -780,6 +871,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             "proposals_sha256": file_sha256_short(proposal_path),
             "candidate_artifact": str(candidate_path),
             "candidate_artifact_sha256": file_sha256_short(candidate_path),
+            "fixed_candidate_prior_overlay": str(prior_overlay_path),
+            "fixed_candidate_prior_overlay_sha256": file_sha256_short(
+                prior_overlay_path
+            ),
+            "fixed_candidate_prior_overlay_metadata_sha256": _canonical_hash(
+                prior_overlay_metadata
+            ),
             "projected_landmark_bank": str(source_bank_path),
             "projected_landmark_bank_sha256": file_sha256_short(
                 source_bank_path

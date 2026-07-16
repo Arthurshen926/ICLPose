@@ -27,7 +27,8 @@ from feature_extract.vfm.measurement_v1.candidate_rgb_spatial_inference import (
 )
 
 
-UTILITY_MODEL_FORMAT = "candidate_measurement_utility_gate_v1"
+UTILITY_MODEL_FORMAT = "candidate_measurement_utility_gate_v2"
+LEGACY_UTILITY_MODEL_FORMAT = "candidate_measurement_utility_gate_v1"
 UTILITY_APPLY_STAGE = "candidate_measurement_utility_apply"
 UTILITY_FEATURE_SET = "independent_rgb_geometry_v1"
 UTILITY_FEATURE_NAMES = (
@@ -123,6 +124,7 @@ class CandidateMeasurementUtilityGate:
     candidate_inference_evidence_sha256: str
     coordinate_space_id: str
     offsets_sha256: str
+    coordinate_proposal_policy: str = "posterior_mean"
 
     def __post_init__(self) -> None:
         count = len(self.feature_names)
@@ -137,6 +139,11 @@ class CandidateMeasurementUtilityGate:
             raise ValueError("candidate measurement utility scales must be positive")
         if not 0.0 <= float(self.update_threshold) <= 1.0:
             raise ValueError("candidate measurement utility threshold is invalid")
+        if str(self.coordinate_proposal_policy) not in {
+            "posterior_mean",
+            "mixture_map",
+        }:
+            raise ValueError("unsupported measurement coordinate proposal policy")
         if float(self.minimum_baseline_residual_px) < 0.0:
             raise ValueError("minimum baseline residual must be non-negative")
         if float(self.minimum_improvement_px) < 0.0:
@@ -191,13 +198,17 @@ class CandidateMeasurementUtilityGate:
             ),
             "coordinate_space_id": self.coordinate_space_id,
             "offsets_sha256": self.offsets_sha256,
+            "coordinate_proposal_policy": self.coordinate_proposal_policy,
         }
 
     @classmethod
     def from_dict(
         cls, payload: Mapping[str, object]
     ) -> "CandidateMeasurementUtilityGate":
-        if payload.get("format") != UTILITY_MODEL_FORMAT:
+        if payload.get("format") not in {
+            UTILITY_MODEL_FORMAT,
+            LEGACY_UTILITY_MODEL_FORMAT,
+        }:
             raise ValueError("unsupported candidate measurement utility model")
         if payload.get("feature_set") != UTILITY_FEATURE_SET:
             raise ValueError("unsupported candidate measurement utility feature set")
@@ -223,6 +234,9 @@ class CandidateMeasurementUtilityGate:
             ),
             coordinate_space_id=str(payload["coordinate_space_id"]),
             offsets_sha256=str(payload["offsets_sha256"]),
+            coordinate_proposal_policy=str(
+                payload.get("coordinate_proposal_policy", "posterior_mean")
+            ),
         )
 
 
@@ -403,6 +417,7 @@ def aggregate_candidate_measurement_views(
     likelihood_entropy: np.ndarray,
     likelihood_covariance_trace_px2: np.ndarray,
     observable_rows: Sequence[Mapping[str, object]],
+    coordinate_proposal_policy: str = "posterior_mean",
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return target-free utility features and one multi-view coordinate offset."""
 
@@ -453,7 +468,13 @@ def aggregate_candidate_measurement_views(
     else:
         mixture = np.sum(view_prior[:, None] * local_probability, axis=0)
     mixture /= max(float(np.sum(mixture)), 1e-12)
-    proposed_offset = mixture @ offsets
+    proposal_policy = str(coordinate_proposal_policy)
+    if proposal_policy == "posterior_mean":
+        proposed_offset = mixture @ offsets
+    elif proposal_policy == "mixture_map":
+        proposed_offset = offsets[int(np.argmax(mixture))]
+    else:
+        raise ValueError("unsupported measurement coordinate proposal policy")
 
     local_means = local_probability @ offsets
     local_modes = offsets[np.argmax(local_probability, axis=1)]
@@ -530,6 +551,8 @@ def aggregate_candidate_measurement_views(
 
 def build_candidate_measurement_utility_examples(
     spatial_paths: Sequence[Path],
+    *,
+    coordinate_proposal_policy: str = "posterior_mean",
 ) -> tuple[list[dict[str, object]], dict[str, object]]:
     spatial = _load_target_free_spatial(spatial_paths)
     arrays = spatial.arrays
@@ -576,6 +599,7 @@ def build_candidate_measurement_utility_examples(
                 "likelihood_covariance_trace_px2"
             ][indices],
             observable_rows=observable,
+            coordinate_proposal_policy=str(coordinate_proposal_policy),
         )
         center_xy = center[0]
         examples.append(
@@ -616,6 +640,7 @@ def build_candidate_measurement_utility_examples(
         ),
         "coordinate_space_id": str(spatial.metadata["coordinate_space_id"]),
         "offsets_sha256": _array_sha256_short(spatial.offsets_xy),
+        "coordinate_proposal_policy": str(coordinate_proposal_policy),
         "offset_min_xy": np.min(spatial.offsets_xy, axis=0).tolist(),
         "offset_max_xy": np.max(spatial.offsets_xy, axis=0).tolist(),
         "spatial_paths": [str(path) for path in spatial.paths],
@@ -876,6 +901,7 @@ def _validate_model_contract(
         ),
         "coordinate_space_id": model.coordinate_space_id,
         "offsets_sha256": model.offsets_sha256,
+        "coordinate_proposal_policy": model.coordinate_proposal_policy,
     }
     mismatches = {
         key: {"expected": value, "actual": contract.get(key)}
@@ -900,9 +926,11 @@ def fit_candidate_measurement_utility(
     minimum_selected_fraction: float = 0.01,
     minimum_baseline_residual_px: float = 1.0,
     minimum_improvement_px: float = 0.1,
+    coordinate_proposal_policy: str = "posterior_mean",
 ) -> dict[str, object]:
     examples, contract = build_candidate_measurement_utility_examples(
-        train_spatial_paths
+        train_spatial_paths,
+        coordinate_proposal_policy=str(coordinate_proposal_policy),
     )
     if contract["split"] != "train":
         raise ValueError("candidate measurement utility fit requires train artifacts")
@@ -964,6 +992,7 @@ def fit_candidate_measurement_utility(
         ),
         coordinate_space_id=str(contract["coordinate_space_id"]),
         offsets_sha256=str(contract["offsets_sha256"]),
+        coordinate_proposal_policy=str(coordinate_proposal_policy),
     )
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
@@ -986,7 +1015,7 @@ def fit_candidate_measurement_utility(
         "stage": "candidate_measurement_utility_fit",
         "protocol": {
             "probability_semantics": (
-                "P(posterior_mean_RGB_coordinate_improves_GT_pose_projection_"
+                f"P({coordinate_proposal_policy}_RGB_coordinate_improves_GT_pose_projection_"
                 "within_local_support)"
             ),
             "identity_likelihood": False,
@@ -1008,6 +1037,7 @@ def fit_candidate_measurement_utility(
             "minimum_selected_fraction": float(minimum_selected_fraction),
             "minimum_baseline_residual_px": float(minimum_baseline_residual_px),
             "minimum_improvement_px": float(minimum_improvement_px),
+            "coordinate_proposal_policy": str(coordinate_proposal_policy),
         },
         "threshold_audit": threshold_audit,
         "train_oof_TARGET_ONLY": train_metrics,
@@ -1042,7 +1072,10 @@ def apply_candidate_measurement_utility(
     gate = CandidateMeasurementUtilityGate.from_dict(
         json.loads(model_file.read_text())
     )
-    examples, contract = build_candidate_measurement_utility_examples(spatial_paths)
+    examples, contract = build_candidate_measurement_utility_examples(
+        spatial_paths,
+        coordinate_proposal_policy=str(gate.coordinate_proposal_policy),
+    )
     _validate_model_contract(gate, contract)
     probabilities = gate.predict(_feature_matrix(examples))
     output = Path(output_path)
@@ -1122,7 +1155,10 @@ def audit_candidate_measurement_utility(
     if summary.get("inputs", {}).get("model_sha256") != file_sha256_short(model_path):
         raise ValueError("measurement utility model is stale")
     gate = CandidateMeasurementUtilityGate.from_dict(json.loads(model_path.read_text()))
-    examples, contract = build_candidate_measurement_utility_examples(spatial_paths)
+    examples, contract = build_candidate_measurement_utility_examples(
+        spatial_paths,
+        coordinate_proposal_policy=str(gate.coordinate_proposal_policy),
+    )
     _validate_model_contract(gate, contract)
     labels, evaluable, baseline, refined = _load_targets(
         examples=examples,

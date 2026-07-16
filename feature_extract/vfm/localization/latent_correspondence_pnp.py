@@ -25,6 +25,8 @@ class LatentEMConfig:
     outlier_likelihood: float = 1e-3
     residual_sigma_px: float = 3.0
     spatial_evidence_weight: float | None = None
+    coordinate_update_policy: str = "posterior_mean"
+    minimum_coordinate_mode_probability: float = 0.0
     max_responsibility_change: float = 0.25
     min_candidate_weight: float = 2e-3
     min_effective_group_mass: float = 0.05
@@ -58,6 +60,16 @@ class LatentEMConfig:
             self.spatial_evidence_weight
         ) <= 1.0:
             raise ValueError("spatial evidence weight must be in [0, 1]")
+        if str(self.coordinate_update_policy) not in {
+            "posterior_mean",
+            "concentrated_map",
+            "calibrated_mixture_map",
+        }:
+            raise ValueError("unsupported latent coordinate update policy")
+        if not 0.0 <= float(self.minimum_coordinate_mode_probability) <= 1.0:
+            raise ValueError(
+                "minimum latent coordinate mode probability must be in [0, 1]"
+            )
         if not 0.0 < float(self.max_responsibility_change) <= 1.0:
             raise ValueError("maximum responsibility change must be in (0, 1]")
         if float(self.min_candidate_weight) < 0.0:
@@ -167,6 +179,10 @@ def _candidate_likelihoods_and_xy(
         residual_sigma_px=float(config.residual_sigma_px),
         outlier_likelihood=float(config.outlier_likelihood),
         spatial_evidence_weight=config.spatial_evidence_weight,
+        coordinate_update_policy=str(config.coordinate_update_policy),
+        minimum_coordinate_mode_probability=float(
+            config.minimum_coordinate_mode_probability
+        ),
     )
     return (
         evidence.candidate_likelihoods,

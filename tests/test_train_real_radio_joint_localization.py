@@ -99,6 +99,53 @@ def test_train_real_radio_joint_localization_cli_defaults_to_full_joint_training
     assert train_real_radio_joint_localization._requires_rgb_training(args) is True
 
 
+def test_coherent_query_coverage_requires_exact_artifact_subset() -> None:
+    provider = SimpleNamespace(
+        metadata={
+            "records": [
+                {"query_id": "seq1/a.png"},
+                {"query_id": "seq1/b.png"},
+            ]
+        }
+    )
+    index = SimpleNamespace(
+        query_xy_by_id={
+            "seq1/a.png": np.zeros((1, 2), dtype=np.float32),
+            "seq1/b.png": np.zeros((1, 2), dtype=np.float32),
+        }
+    )
+    audit = (
+        train_real_radio_joint_localization.validate_coherent_hard_negative_query_coverage(
+            provider, index
+        )
+    )
+    assert audit["coherent_query_coverage"] == pytest.approx(1.0)
+    assert audit["overlap_query_count"] == 2
+
+
+def test_coherent_query_coverage_rejects_zero_or_partial_overlap() -> None:
+    provider = SimpleNamespace(
+        metadata={"records": [{"query_id": "seq1/a.png"}]}
+    )
+    with pytest.raises(ValueError, match="zero query overlap"):
+        train_real_radio_joint_localization.validate_coherent_hard_negative_query_coverage(
+            provider,
+            SimpleNamespace(
+                query_xy_by_id={"seq9/z.png": np.zeros((1, 2), dtype=np.float32)}
+            ),
+        )
+    with pytest.raises(ValueError, match="absent from the training provider"):
+        train_real_radio_joint_localization.validate_coherent_hard_negative_query_coverage(
+            provider,
+            SimpleNamespace(
+                query_xy_by_id={
+                    "seq1/a.png": np.zeros((1, 2), dtype=np.float32),
+                    "seq1/b.png": np.zeros((1, 2), dtype=np.float32),
+                }
+            ),
+        )
+
+
 def test_train_real_radio_joint_localization_accepts_retrieval_validation_selection() -> None:
     args = train_real_radio_joint_localization.parse_args(
         [
@@ -167,7 +214,7 @@ def test_internal_query_disjoint_contract_checks_train_validation_and_support(
         )
 
 
-def test_internal_query_disjoint_contract_allows_explicit_train_split_queries(
+def test_internal_query_disjoint_contract_infers_explicit_train_split_queries(
     tmp_path: Path,
 ) -> None:
     split = tmp_path / "split.json"
@@ -202,7 +249,6 @@ def test_internal_query_disjoint_contract_allows_explicit_train_split_queries(
         validation_manifest_path=validation,
         query_split_path=split,
         allowed_support_image_ids={"s"},
-        train_queries_are_heldout=True,
     )
 
     assert audit["training_query_mode"] == "query_disjoint_train_split"

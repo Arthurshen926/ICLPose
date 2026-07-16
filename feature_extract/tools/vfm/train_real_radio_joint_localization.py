@@ -39,6 +39,10 @@ from feature_extract.vfm.matcha_joint_training import (
     train_matcha_joint_model_from_sample_provider,
 )
 from feature_extract.vfm.tokens import TokenBankManifest
+from feature_extract.vfm.coherent_landmark_hard_negatives import (
+    CoherentLandmarkHardNegativeIndex,
+    attach_coherent_landmark_hard_negatives,
+)
 
 
 def validate_frozen_landmark_bank_contract(
@@ -194,7 +198,7 @@ def validate_internal_query_disjoint_contract(
     validation_manifest_path: Path,
     query_split_path: Path,
     allowed_support_image_ids: set[str],
-    train_queries_are_heldout: bool = False,
+    train_queries_are_heldout: bool | None = None,
 ) -> dict[str, object]:
     split_path = Path(query_split_path)
     split = json.loads(split_path.read_text())
@@ -223,7 +227,12 @@ def validate_internal_query_disjoint_contract(
             raise ValueError(f"{role} manifest internal query split hash is stale")
     train_records = list(train_manifest.get("records", []))
     train_query_ids = {str(record.get("query_id", "")) for record in train_records}
-    if bool(train_queries_are_heldout):
+    explicit_train_query_mode = (
+        train_query_ids == split_ids["train"]
+        if train_queries_are_heldout is None
+        else bool(train_queries_are_heldout)
+    )
+    if explicit_train_query_mode:
         if train_query_ids != split_ids["train"]:
             raise ValueError(
                 "query-disjoint bank-positive training manifest query ids do not exactly "
@@ -282,7 +291,7 @@ def validate_internal_query_disjoint_contract(
         "training_record_count": int(len(train_records)),
         "training_query_count": int(len(train_query_ids)),
         "training_query_mode": (
-            "query_disjoint_train_split" if bool(train_queries_are_heldout) else "support_image_queries"
+            "query_disjoint_train_split" if explicit_train_query_mode else "support_image_queries"
         ),
         "validation_record_count": int(len(validation_records)),
         "allowed_support_image_count": int(len(allowed_support_image_ids)),
@@ -700,6 +709,46 @@ class RealRadioMultiViewEpisodeProvider:
         return output
 
 
+def validate_coherent_hard_negative_query_coverage(
+    provider: object,
+    index: CoherentLandmarkHardNegativeIndex,
+) -> dict[str, object]:
+    """Reject coherent supervision that cannot attach to this provider."""
+
+    records = list(dict(getattr(provider, "metadata", {})).get("records", []))
+    provider_query_ids = {
+        str(record.get("query_id", "")).replace("\\", "/").lstrip("./")
+        for record in records
+        if isinstance(record, dict) and str(record.get("query_id", "")).strip()
+    }
+    coherent_query_ids = {
+        str(value).replace("\\", "/").lstrip("./")
+        for value in index.query_xy_by_id
+    }
+    if not provider_query_ids:
+        raise ValueError("coherent hard negatives require provider query metadata")
+    if not coherent_query_ids:
+        raise ValueError("coherent hard-negative artifact contains no attachable query groups")
+    overlap = provider_query_ids.intersection(coherent_query_ids)
+    if not overlap:
+        raise ValueError(
+            "coherent hard-negative artifact has zero query overlap with the "
+            "training provider"
+        )
+    missing = sorted(coherent_query_ids.difference(provider_query_ids))
+    if missing:
+        raise ValueError(
+            "coherent hard-negative queries are absent from the training provider: "
+            f"count={len(missing)}, preview={missing[:3]!r}"
+        )
+    return {
+        "provider_query_count": int(len(provider_query_ids)),
+        "coherent_query_count": int(len(coherent_query_ids)),
+        "overlap_query_count": int(len(overlap)),
+        "coherent_query_coverage": float(len(overlap) / len(coherent_query_ids)),
+    }
+
+
 def _initialize_distributed_runtime(args: argparse.Namespace) -> dict[str, int | bool | str]:
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     if int(world_size) <= 1:
@@ -1004,6 +1053,9 @@ def _build_config(args: argparse.Namespace, samples: MatchaJointTrainingSet) -> 
         attention_patch_size=int(args.attention_patch_size),
         attention_upsample_mode=str(args.attention_upsample_mode),
         attention_fusion_mode=str(args.attention_fusion_mode),
+        context_hidden_dim=int(args.context_hidden_dim),
+        context_broad_kernel_size=int(args.context_broad_kernel_size),
+        context_freeze_base_steps=int(args.context_freeze_base_steps),
         steps=int(args.steps),
         batch_size=int(args.batch_size),
         lr=float(args.lr),
@@ -1059,6 +1111,15 @@ def _build_config(args: argparse.Namespace, samples: MatchaJointTrainingSet) -> 
         ),
         landmark_system_hard_negative_margin_weight=float(
             args.landmark_system_hard_negative_margin_weight
+        ),
+        landmark_coherent_hard_negative_margin=float(
+            args.landmark_coherent_hard_negative_margin
+        ),
+        landmark_coherent_hard_negative_margin_weight=float(
+            args.landmark_coherent_hard_negative_margin_weight
+        ),
+        landmark_coherent_hard_negative_min_mode_rows=int(
+            args.landmark_coherent_hard_negative_min_mode_rows
         ),
         landmark_dustbin_logit=float(args.landmark_dustbin_logit),
         landmark_dustbin_samples_per_image=int(args.landmark_dustbin_samples_per_image),
@@ -1165,12 +1226,19 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--provider_progress_interval_steps", type=int, default=0)
     parser.add_argument("--provider_fixed_audit_interval_steps", type=int, default=0)
     parser.add_argument("--provider_empty_cuda_cache_interval_steps", type=int, default=0)
-    parser.add_argument("--model_type", choices=("radio_dual_attention", "residual_adapter"), default="residual_adapter")
+    parser.add_argument(
+        "--model_type",
+        choices=("radio_dual_attention", "radio_spatial_context", "residual_adapter"),
+        default="residual_adapter",
+    )
     parser.add_argument("--output_dim", type=int, default=128)
     parser.add_argument("--residual_hidden_dim", type=int, default=256)
     parser.add_argument("--fine_input_dim", type=int, default=0)
     parser.add_argument("--coarse_input_dim", type=int, default=0)
     parser.add_argument("--attention_hidden_dim", type=int, default=128)
+    parser.add_argument("--context_hidden_dim", type=int, default=256)
+    parser.add_argument("--context_broad_kernel_size", type=int, default=7)
+    parser.add_argument("--context_freeze_base_steps", type=int, default=0)
     parser.add_argument("--attention_depth", type=int, default=1)
     parser.add_argument("--attention_heads", type=int, default=4)
     parser.add_argument("--attention_patch_size", type=int, default=4)
@@ -1270,6 +1338,26 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--landmark_system_hard_negative_margin", type=float, default=0.05)
     parser.add_argument("--landmark_system_hard_negative_margin_weight", type=float, default=0.0)
+    parser.add_argument("--landmark_coherent_hard_negative_margin", type=float, default=0.05)
+    parser.add_argument("--landmark_coherent_hard_negative_margin_weight", type=float, default=0.0)
+    parser.add_argument(
+        "--landmark_coherent_hard_negative_min_mode_rows", type=int, default=4
+    )
+    parser.add_argument(
+        "--landmark_coherent_hard_negative_artifact",
+        default="",
+        help="Train-only pose-conditioned coherent wrong-mode artifact.",
+    )
+    parser.add_argument(
+        "--landmark_coherent_hard_negative_proposals",
+        default="",
+        help="Proposal artifact whose exact hash is recorded by the coherent artifact.",
+    )
+    parser.add_argument(
+        "--landmark_coherent_hard_negative_max_distance_px",
+        type=float,
+        default=8.0,
+    )
     parser.add_argument("--landmark_dustbin_logit", type=float, default=0.0)
     parser.add_argument("--landmark_dustbin_samples_per_image", type=int, default=0)
     parser.add_argument("--landmark_dustbin_exclusion_radius_cells", type=int, default=1)
@@ -1367,10 +1455,10 @@ def main(argv: Sequence[str] | None = None) -> None:
             validation_manifest_path=validation_path,
             query_split_path=Path(args.internal_query_disjoint_split),
             allowed_support_image_ids=episode_support_image_ids,
-            train_queries_are_heldout=(
-                str(args.landmark_positive_prototype_source)
-                == "query_disjoint_frozen_bank"
-            ),
+            # The manifest/split defines whether internal train queries are the
+            # supervised query set.  Prototype source is an orthogonal model
+            # choice and must not alter the leakage contract.
+            train_queries_are_heldout=None,
         )
     if str(args.landmark_positive_prototype_source) == "query_disjoint_frozen_bank":
         if not str(args.landmark_frozen_negative_bank):
@@ -1555,6 +1643,62 @@ def main(argv: Sequence[str] | None = None) -> None:
                 else int(len(required_source_image_ids))
             ),
         )
+    train_sample_get = None if train_provider is None else train_provider.get
+    coherent_hard_negative_audit: dict[str, object] = {}
+    coherent_enabled = float(args.landmark_coherent_hard_negative_margin_weight) > 0.0
+    coherent_paths_present = bool(
+        str(args.landmark_coherent_hard_negative_artifact)
+        or str(args.landmark_coherent_hard_negative_proposals)
+    )
+    if coherent_enabled != bool(
+        str(args.landmark_coherent_hard_negative_artifact)
+        and str(args.landmark_coherent_hard_negative_proposals)
+    ):
+        raise ValueError(
+            "coherent hard-negative weight, artifact, and proposals must be enabled together"
+        )
+    if coherent_paths_present and not coherent_enabled:
+        raise ValueError(
+            "coherent hard-negative artifacts require a positive margin weight"
+        )
+    if coherent_enabled:
+        if train_provider is None:
+            raise ValueError(
+                "external coherent hard-negative artifacts currently require the "
+                "image-referenced provider"
+            )
+        if float(args.landmark_coherent_hard_negative_max_distance_px) <= 0.0:
+            raise ValueError("coherent hard-negative max distance must be positive")
+        coherent_index = CoherentLandmarkHardNegativeIndex.from_pose_mode_artifact(
+            Path(args.landmark_coherent_hard_negative_artifact),
+            Path(args.landmark_coherent_hard_negative_proposals),
+        )
+        coherent_hard_negative_audit.update(
+            validate_coherent_hard_negative_query_coverage(
+                train_provider,
+                coherent_index,
+            )
+        )
+        base_train_get = train_provider.get
+
+        def train_sample_get(index: int):
+            attached, _audit = attach_coherent_landmark_hard_negatives(
+                base_train_get(int(index)),
+                coherent_index,
+                max_distance_px=float(
+                    args.landmark_coherent_hard_negative_max_distance_px
+                ),
+            )
+            return attached
+
+        train_samples, attachment_audit = attach_coherent_landmark_hard_negatives(
+            train_samples,
+            coherent_index,
+            max_distance_px=float(
+                args.landmark_coherent_hard_negative_max_distance_px
+            ),
+        )
+        coherent_hard_negative_audit.update(attachment_audit)
     cfg = _build_config(args, train_samples)
     descriptor_source_config: dict[str, object] = {}
     if str(args.descriptor_token_manifest):
@@ -1574,7 +1718,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     if train_provider is not None:
         run = train_matcha_joint_model_from_sample_provider(
             int(len(train_provider)),
-            train_provider.get,
+            train_sample_get,
             cfg,
             validation_sample_count=0 if validation_provider is None else int(len(validation_provider)),
             get_validation_sample=None if validation_provider is None else validation_provider.get,
@@ -1636,6 +1780,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             "descriptor_token_manifest": str(args.descriptor_token_manifest),
             "track_prototype_builder": prototype_builder.to_dict(),
             "frozen_landmark_bank_contract": frozen_bank_contract,
+            "coherent_hard_negative_audit": coherent_hard_negative_audit,
             "landmark_episode_support_pairs": int(args.landmark_episode_support_pairs),
             "landmark_episode_min_support_pairs": int(args.landmark_episode_min_support_pairs),
         }
@@ -1667,7 +1812,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             "landmark_retrieval_target": "query_full_map_to_multi_observation_track_prototype",
             "landmark_positive_prototype_source": str(cfg.landmark_positive_prototype_source),
             "frozen_bank_query_visible_track_policy": (
-                "query_images_proven_absent_bank_tracks_may_be_positive"
+                "positive_tracks_require_query_disjoint_bank_membership_missing_rows_filtered"
                 if str(cfg.landmark_positive_prototype_source)
                 == "query_disjoint_frozen_bank"
                 else "exclude_from_negative_denominator_never_use_as_positive"
@@ -1677,6 +1822,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "global_semantic_memory",
                 "nearby_3d_memory",
                 "global_random_memory",
+                *(
+                    ["train_only_coherent_wrong_pose_tracks"]
+                    if float(cfg.landmark_coherent_hard_negative_margin_weight) > 0.0
+                    else []
+                ),
             ],
             "landmark_memory_search_scope": (
                 "full_global_exact"
@@ -1688,6 +1838,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             ),
             "landmark_system_hard_negative_margin_weight": float(
                 cfg.landmark_system_hard_negative_margin_weight
+            ),
+            "landmark_coherent_hard_negative_margin_weight": float(
+                cfg.landmark_coherent_hard_negative_margin_weight
             ),
             "landmark_exclude_known_cell_positives_from_memory": bool(
                 cfg.landmark_exclude_known_cell_positives_from_memory
@@ -1704,6 +1857,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         "upstream_disjoint_contract": upstream_disjoint_contract,
         "internal_query_disjoint_contract": internal_query_disjoint_contract,
         "frozen_landmark_bank_contract": frozen_bank_contract,
+        "coherent_hard_negative_audit": coherent_hard_negative_audit,
         "config": asdict(cfg),
         "training": dict(run.summary),
         "outputs": {

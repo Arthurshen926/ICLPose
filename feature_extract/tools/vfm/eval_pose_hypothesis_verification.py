@@ -755,6 +755,20 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--grouped_latent_em_spatial_evidence_weight", type=float, default=-1.0
     )
     parser.add_argument(
+        "--grouped_latent_em_coordinate_update_policy",
+        choices=(
+            "posterior_mean",
+            "concentrated_map",
+            "calibrated_mixture_map",
+        ),
+        default="posterior_mean",
+    )
+    parser.add_argument(
+        "--grouped_latent_em_minimum_coordinate_mode_probability",
+        type=float,
+        default=0.0,
+    )
+    parser.add_argument(
         "--grouped_latent_em_max_responsibility_change", type=float, default=0.25
     )
     parser.add_argument(
@@ -1803,6 +1817,9 @@ def _load_candidate_update_rows(
             ),
             "coordinate_space_id": spatial_metadata.get("coordinate_space_id"),
             "offsets_sha256": offset_hash,
+            "coordinate_proposal_policy": inputs.get(
+                "coordinate_proposal_policy"
+            ),
         }
         mismatches = {
             key: {"expected": value, "actual": model.get(key)}
@@ -1817,6 +1834,12 @@ def _load_candidate_update_rows(
         if inputs.get("spatial_sha256") != [file_sha256_short(spatial_path)]:
             raise ValueError(
                 "candidate measurement utility was applied to different spatial RGB"
+            )
+        if str(model.get("coordinate_proposal_policy", "")) != str(
+            inputs.get("coordinate_proposal_policy", "")
+        ):
+            raise ValueError(
+                "candidate measurement utility coordinate policy is inconsistent"
             )
         protocol = summary.get("protocol", {})
         if (
@@ -1876,6 +1899,9 @@ def _load_candidate_update_rows(
             "measurement_utility_action_gate"
             if is_utility
             else "legacy_coordinate_update_verifier"
+        ),
+        "coordinate_proposal_policy": str(
+            model.get("coordinate_proposal_policy", "")
         ),
     }
 
@@ -3474,11 +3500,12 @@ def main(argv: Sequence[str] | None = None) -> None:
                     _load_train_oof_candidate_geometry_probability_rows(path)
                 )
             else:
-                spatial_path = spatial_paths[split_name]
-                if spatial_path is None:
+                split_spatial_paths = spatial_paths[split_name]
+                if len(split_spatial_paths) != 1:
                     raise RuntimeError(
                         "candidate geometry artifact configuration is incomplete"
                     )
+                spatial_path = split_spatial_paths[0]
                 rows, metadata = _load_candidate_geometry_probability_rows(
                     path,
                     spatial_path=spatial_path,
@@ -3490,9 +3517,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     update_prediction_metadata: dict[str, dict[str, object]] = {}
     if update_predictions_requested:
         for split_name, path in update_prediction_paths.items():
-            spatial_path = spatial_paths[split_name]
-            if path is None or spatial_path is None:
+            split_spatial_paths = spatial_paths[split_name]
+            if path is None or len(split_spatial_paths) != 1:
                 raise RuntimeError("candidate update artifact configuration is incomplete")
+            spatial_path = split_spatial_paths[0]
             rows, metadata = _load_candidate_update_rows(
                 path,
                 spatial_path=spatial_path,
@@ -4058,6 +4086,12 @@ def main(argv: Sequence[str] | None = None) -> None:
                 None
                 if float(args.grouped_latent_em_spatial_evidence_weight) < 0.0
                 else float(args.grouped_latent_em_spatial_evidence_weight)
+            ),
+            coordinate_update_policy=str(
+                args.grouped_latent_em_coordinate_update_policy
+            ),
+            minimum_coordinate_mode_probability=float(
+                args.grouped_latent_em_minimum_coordinate_mode_probability
             ),
             max_responsibility_change=float(
                 args.grouped_latent_em_max_responsibility_change

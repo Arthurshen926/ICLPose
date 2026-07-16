@@ -240,6 +240,10 @@ class MatchaJointTrainingSet:
     # and are valid set-valued retrieval targets.
     landmark_strict_positive_offsets: np.ndarray | None = None
     landmark_strict_positive_track_ids: np.ndarray | None = None
+    # Train-only wrong track identities jointly supporting coherent bad poses.
+    landmark_coherent_hard_negative_offsets: np.ndarray | None = None
+    landmark_coherent_hard_negative_track_ids: np.ndarray | None = None
+    landmark_coherent_hard_negative_mode_ids: np.ndarray | None = None
     query_repeatability_targets: np.ndarray | None = None
     render_repeatability_targets: np.ndarray | None = None
 
@@ -430,6 +434,81 @@ class MatchaJointTrainingSet:
             object.__setattr__(self, "landmark_known_positive_track_ids", known_track_ids)
             object.__setattr__(self, "landmark_strict_positive_offsets", strict_offsets)
             object.__setattr__(self, "landmark_strict_positive_track_ids", strict_track_ids)
+            coherent_present = (
+                self.landmark_coherent_hard_negative_offsets is not None,
+                self.landmark_coherent_hard_negative_track_ids is not None,
+            )
+            if any(coherent_present):
+                if not all(coherent_present):
+                    raise ValueError(
+                        "landmark coherent hard negatives require offsets and track ids"
+                    )
+                coherent_offsets = np.asarray(
+                    self.landmark_coherent_hard_negative_offsets, dtype=np.int64
+                ).reshape(-1)
+                coherent_tracks = np.asarray(
+                    self.landmark_coherent_hard_negative_track_ids, dtype=np.int64
+                ).reshape(-1)
+                coherent_modes = (
+                    None
+                    if self.landmark_coherent_hard_negative_mode_ids is None
+                    else np.asarray(
+                        self.landmark_coherent_hard_negative_mode_ids,
+                        dtype=np.int64,
+                    ).reshape(-1)
+                )
+                if coherent_offsets.shape[0] != landmark_count + 1:
+                    raise ValueError(
+                        "landmark coherent hard-negative offsets must contain one "
+                        "offset per row plus a sentinel"
+                    )
+                if (
+                    int(coherent_offsets[0]) != 0
+                    or np.any(np.diff(coherent_offsets) < 0)
+                    or int(coherent_offsets[-1]) != int(coherent_tracks.size)
+                ):
+                    raise ValueError("landmark coherent hard-negative CSR is invalid")
+                if coherent_tracks.size and np.any(coherent_tracks < 0):
+                    raise ValueError(
+                        "landmark coherent hard-negative track ids must be non-negative"
+                    )
+                if coherent_modes is not None:
+                    if coherent_modes.shape != coherent_tracks.shape:
+                        raise ValueError(
+                            "landmark coherent hard-negative mode ids must align "
+                            "with track ids"
+                        )
+                    if coherent_modes.size and np.any(coherent_modes < 0):
+                        raise ValueError(
+                            "landmark coherent hard-negative mode ids must be non-negative"
+                        )
+                for row, target_track_id in enumerate(landmark_track_ids.tolist()):
+                    values = coherent_tracks[
+                        int(coherent_offsets[row]) : int(coherent_offsets[row + 1])
+                    ]
+                    if int(target_track_id) in set(values.tolist()):
+                        raise ValueError(
+                            "a supervised landmark track cannot be a coherent hard negative"
+                        )
+                object.__setattr__(
+                    self,
+                    "landmark_coherent_hard_negative_offsets",
+                    coherent_offsets,
+                )
+                object.__setattr__(
+                    self,
+                    "landmark_coherent_hard_negative_track_ids",
+                    coherent_tracks,
+                )
+                object.__setattr__(
+                    self,
+                    "landmark_coherent_hard_negative_mode_ids",
+                    coherent_modes,
+                )
+            elif self.landmark_coherent_hard_negative_mode_ids is not None:
+                raise ValueError(
+                    "landmark coherent hard-negative mode ids require the track CSR"
+                )
         fine_required = (
             "fine_sample_pair_indices",
             "fine_query_cell_indices",
@@ -595,6 +674,9 @@ class MatchaJointTrainingConfig:
     attention_patch_size: int = 2
     attention_upsample_mode: str = "bilinear"
     attention_fusion_mode: str = "matcha_original"
+    context_hidden_dim: int = 256
+    context_broad_kernel_size: int = 7
+    context_freeze_base_steps: int = 0
     steps: int = 300
     batch_size: int = 512
     lr: float = 5e-5
@@ -665,6 +747,9 @@ class MatchaJointTrainingConfig:
     landmark_memory_negative_merge_policy: str = "source_balanced_round_robin"
     landmark_system_hard_negative_margin: float = 0.05
     landmark_system_hard_negative_margin_weight: float = 0.0
+    landmark_coherent_hard_negative_margin: float = 0.05
+    landmark_coherent_hard_negative_margin_weight: float = 0.0
+    landmark_coherent_hard_negative_min_mode_rows: int = 4
     landmark_dustbin_logit: float = 0.0
     landmark_dustbin_samples_per_image: int = 0
     landmark_dustbin_exclusion_radius_cells: int = 1
@@ -682,12 +767,34 @@ class MatchaJointTrainingConfig:
     seed: int = 0
 
     def __post_init__(self) -> None:
-        if str(self.model_type) not in {"residual_adapter", "radio_dual_attention"}:
-            raise ValueError("model_type must be 'residual_adapter' or 'radio_dual_attention'")
+        if str(self.model_type) not in {
+            "residual_adapter",
+            "radio_spatial_context",
+            "radio_dual_attention",
+        }:
+            raise ValueError(
+                "model_type must be 'residual_adapter', "
+                "'radio_spatial_context', or 'radio_dual_attention'"
+            )
         if int(self.output_dim) <= 0:
             raise ValueError("output_dim must be positive")
         if int(self.residual_hidden_dim) <= 0:
             raise ValueError("residual_hidden_dim must be positive")
+        if int(self.context_hidden_dim) <= 0:
+            raise ValueError("context_hidden_dim must be positive")
+        if (
+            int(self.context_broad_kernel_size) <= 0
+            or int(self.context_broad_kernel_size) % 2 == 0
+        ):
+            raise ValueError("context_broad_kernel_size must be a positive odd integer")
+        if int(self.context_freeze_base_steps) < 0:
+            raise ValueError("context_freeze_base_steps must be non-negative")
+        if int(self.context_freeze_base_steps) > 0 and str(self.model_type) != "radio_spatial_context":
+            raise ValueError(
+                "context_freeze_base_steps is only valid for radio_spatial_context"
+            )
+        if int(self.context_freeze_base_steps) > int(self.steps):
+            raise ValueError("context_freeze_base_steps cannot exceed training steps")
         if str(self.model_type) == "radio_dual_attention":
             if int(self.fine_input_dim) <= 0 or int(self.coarse_input_dim) <= 0:
                 raise ValueError("fine_input_dim and coarse_input_dim must be positive for radio_dual_attention")
@@ -790,6 +897,16 @@ class MatchaJointTrainingConfig:
             raise ValueError("landmark_system_hard_negative_margin must be non-negative")
         if float(self.landmark_system_hard_negative_margin_weight) < 0.0:
             raise ValueError("landmark_system_hard_negative_margin_weight must be non-negative")
+        if float(self.landmark_coherent_hard_negative_margin) < 0.0:
+            raise ValueError("landmark_coherent_hard_negative_margin must be non-negative")
+        if float(self.landmark_coherent_hard_negative_margin_weight) < 0.0:
+            raise ValueError(
+                "landmark_coherent_hard_negative_margin_weight must be non-negative"
+            )
+        if int(self.landmark_coherent_hard_negative_min_mode_rows) < 2:
+            raise ValueError(
+                "landmark_coherent_hard_negative_min_mode_rows must be at least 2"
+            )
         if np.isnan(float(self.landmark_dustbin_logit)):
             raise ValueError("landmark_dustbin_logit must not be NaN")
         if int(self.landmark_dustbin_samples_per_image) < 0:
@@ -1001,6 +1118,7 @@ class MatchaStyleJointModel(nn.Module):
         heatmap_logits = self.heatmap_head(descriptor_map)
         return descriptor_map, heatmap_logits, offset_map
 
+
     def forward_rgb_keypoints(self, images: torch.Tensor) -> torch.Tensor:
         return self.rgb_keypoint_detector(images)
 
@@ -1138,6 +1256,95 @@ class MatchaStyleJointModel(nn.Module):
             query_context=query_context,
             render_context=render_context,
         )
+
+class RadioSpatialContextJointModel(MatchaStyleJointModel):
+    """Single-RADIO mapper with explicit local-to-broad spatial context.
+
+    This descriptor space is defined only for full feature maps. In
+    particular, a landmark vector must never be reshaped to 1x1 and projected
+    through this model; projected-observation banks must sample descriptors
+    after this complete map forward.
+    """
+
+    def __init__(
+        self,
+        *args,
+        context_hidden_dim: int = 256,
+        context_broad_kernel_size: int = 7,
+        **kwargs,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        channels = int(self.input_dim)
+        hidden = int(context_hidden_dim)
+        broad_kernel = int(context_broad_kernel_size)
+        if hidden <= 0:
+            raise ValueError("context_hidden_dim must be positive")
+        if broad_kernel <= 0 or broad_kernel % 2 == 0:
+            raise ValueError("context_broad_kernel_size must be a positive odd integer")
+        self.context_hidden_dim = hidden
+        self.context_broad_kernel_size = broad_kernel
+        self.context_local = nn.Conv2d(
+            channels, channels, 3, padding=1, groups=channels, bias=False
+        )
+        self.context_mid = nn.Conv2d(
+            channels,
+            channels,
+            3,
+            padding=2,
+            dilation=2,
+            groups=channels,
+            bias=False,
+        )
+        self.context_mix = nn.Sequential(
+            nn.Conv2d(3 * channels, hidden, 1),
+            nn.GELU(),
+            nn.Conv2d(hidden, channels, 1),
+        )
+        # Start as the established residual mapper. Context is admitted only
+        # when the retrieval objective provides a gradient for it.
+        nn.init.zeros_(self.context_mix[-1].weight)
+        nn.init.zeros_(self.context_mix[-1].bias)
+
+    def encode(self, features: torch.Tensor) -> torch.Tensor:
+        raise RuntimeError(
+            "radio_spatial_context descriptors require a complete feature map; "
+            "use forward_feature_map"
+        )
+
+    def forward_rows(self, features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        raise RuntimeError(
+            "radio_spatial_context descriptors cannot be projected row-by-row; "
+            "use forward_feature_map"
+        )
+
+    def fuse_feature_map(self, feature_maps: torch.Tensor) -> torch.Tensor:
+        local = self.context_local(feature_maps)
+        mid = self.context_mid(feature_maps)
+        radius = self.context_broad_kernel_size // 2
+        broad = F.avg_pool2d(
+            feature_maps,
+            kernel_size=self.context_broad_kernel_size,
+            stride=1,
+            padding=radius,
+            count_include_pad=False,
+        )
+        context = self.context_mix(torch.cat([local, mid, broad], dim=1))
+        pointwise = self.feature_fusion(feature_maps)
+        return feature_maps + 0.1 * pointwise + 0.1 * context
+
+
+def set_radio_spatial_context_base_trainable(
+    model: nn.Module,
+    *,
+    trainable: bool,
+) -> None:
+    """Freeze/unfreeze all parameters except the spatial context branch."""
+
+    if not isinstance(model, RadioSpatialContextJointModel):
+        raise TypeError("context base freezing requires RadioSpatialContextJointModel")
+    for name, parameter in model.named_parameters():
+        parameter.requires_grad_(bool(trainable) or str(name).startswith("context_"))
+
 
 class _RadioDualAttentionBlock(nn.Module):
     """Small bidirectional decoder block inspired by MATCHA's joint decoder."""
@@ -2685,6 +2892,44 @@ def _full_map_correspondence_loss(
                 dtype=torch.long,
                 device=device,
             )
+        coherent_hard_negative_track_ids = None
+        coherent_hard_negative_mode_ids = None
+        if (
+            samples.landmark_coherent_hard_negative_offsets is not None
+            or samples.landmark_coherent_hard_negative_track_ids is not None
+        ):
+            if (
+                samples.landmark_coherent_hard_negative_offsets is None
+                or samples.landmark_coherent_hard_negative_track_ids is None
+            ):
+                raise ValueError("landmark coherent hard-negative CSR is partially missing")
+            coherent_offsets, coherent_tracks = subset_landmark_known_positive_csr(
+                samples.landmark_coherent_hard_negative_offsets,
+                samples.landmark_coherent_hard_negative_track_ids,
+                landmark_keep,
+            )
+            coherent_hard_negative_track_ids = _tensor(
+                _landmark_known_positive_csr_to_padded(
+                    coherent_offsets, coherent_tracks
+                ),
+                dtype=torch.long,
+                device=device,
+            )
+            if samples.landmark_coherent_hard_negative_mode_ids is not None:
+                _mode_offsets, coherent_modes = subset_landmark_known_positive_csr(
+                    samples.landmark_coherent_hard_negative_offsets,
+                    samples.landmark_coherent_hard_negative_mode_ids,
+                    landmark_keep,
+                )
+                if not np.array_equal(_mode_offsets, coherent_offsets):
+                    raise RuntimeError("coherent track/mode CSR offsets diverged")
+                coherent_hard_negative_mode_ids = _tensor(
+                    _landmark_known_positive_csr_to_padded(
+                        coherent_offsets, coherent_modes
+                    ),
+                    dtype=torch.long,
+                    device=device,
+                )
         selected_track_xyz = None
         if samples.landmark_track_xyz is not None:
             selected_track_xyz = _tensor(
@@ -2752,6 +2997,8 @@ def _full_map_correspondence_loss(
             query_image_group_ids=landmark_query_image_groups,
             known_positive_track_ids=known_positive_track_ids,
             strict_positive_track_ids=strict_positive_track_ids,
+            coherent_hard_negative_track_ids=coherent_hard_negative_track_ids,
+            coherent_hard_negative_mode_ids=coherent_hard_negative_mode_ids,
             dustbin_logits=landmark_dustbin_logits,
             unmatched_query_descriptors=unmatched_query_descriptors,
             unmatched_dustbin_logits=unmatched_dustbin_logits,
@@ -2772,6 +3019,15 @@ def _full_map_correspondence_loss(
                 ),
                 system_hard_negative_margin_weight=float(
                     config.landmark_system_hard_negative_margin_weight
+                ),
+                coherent_hard_negative_margin=float(
+                    config.landmark_coherent_hard_negative_margin
+                ),
+                coherent_hard_negative_margin_weight=float(
+                    config.landmark_coherent_hard_negative_margin_weight
+                ),
+                coherent_hard_negative_min_mode_rows=int(
+                    config.landmark_coherent_hard_negative_min_mode_rows
                 ),
                 dustbin_logit=None if learned_landmark_dustbin else float(config.landmark_dustbin_logit),
                 dustbin_loss_weight=float(config.landmark_dustbin_loss_weight),
@@ -3804,7 +4060,10 @@ def _total_loss(
     positive_indices = _filter_indices_to_positive_matches(samples, indices)
     loss = torch.zeros((), dtype=torch.float32, device=device)
     metrics: dict[str, float] = {}
-    use_full_map_geometry_loss = str(config.model_type) == "radio_dual_attention" and _has_full_map_correspondence_supervision(samples)
+    use_full_map_geometry_loss = str(config.model_type) in {
+        "radio_dual_attention",
+        "radio_spatial_context",
+    } and _has_full_map_correspondence_supervision(samples)
     if positive_indices.size >= 2 and not use_full_map_geometry_loss:
         confidence_ignore = (
             None
@@ -3824,7 +4083,16 @@ def _total_loss(
             if key.endswith(("_valid_count", "_acc")) or key.startswith("coarse_candidate_rank_"):
                 metrics[key] = float(value.detach().cpu().item())
     metrics["positive_match_count"] = float(positive_indices.size)
-    no_match_loss = _no_match_confidence_loss(model, samples, indices, device=device)
+    no_match_loss = None
+    if float(config.pair_confidence_loss_weight) > 0.0:
+        if str(config.model_type) == "radio_spatial_context":
+            raise ValueError(
+                "radio_spatial_context no-match confidence requires a future "
+                "full-map implementation; row projection is forbidden"
+            )
+        no_match_loss = _no_match_confidence_loss(
+            model, samples, indices, device=device
+        )
     if no_match_loss is not None:
         loss = loss + float(config.pair_confidence_loss_weight) * no_match_loss
         metrics["no_match_confidence_loss"] = float(no_match_loss.detach().cpu().item())
@@ -4058,7 +4326,12 @@ def _build_matcha_joint_model_for_samples(
             measurement_patch_encoder_arch=str(config.measurement_patch_encoder_arch),
             measurement_patch_input_mode=str(config.measurement_patch_input_mode),
         ).to(device)
-    return MatchaStyleJointModel(
+    model_class = (
+        RadioSpatialContextJointModel
+        if str(config.model_type) == "radio_spatial_context"
+        else MatchaStyleJointModel
+    )
+    model_kwargs = dict(
         input_dim=samples.coarse_fine_samples.input_dim,
         output_dim=int(config.output_dim),
         residual_hidden_dim=int(config.residual_hidden_dim),
@@ -4076,7 +4349,13 @@ def _build_matcha_joint_model_for_samples(
         measurement_patch_hidden_dim=int(config.measurement_patch_hidden_dim),
         measurement_patch_encoder_arch=str(config.measurement_patch_encoder_arch),
         measurement_patch_input_mode=str(config.measurement_patch_input_mode),
-    ).to(device)
+    )
+    if model_class is RadioSpatialContextJointModel:
+        model_kwargs.update(
+            context_hidden_dim=int(config.context_hidden_dim),
+            context_broad_kernel_size=int(config.context_broad_kernel_size),
+        )
+    return model_class(**model_kwargs).to(device)
 
 
 def _model_state_snapshot(model: nn.Module) -> dict[str, torch.Tensor]:
@@ -4092,6 +4371,19 @@ def _build_landmark_memory_bank(
         return None
     if samples.landmark_track_ids is None:
         raise ValueError("landmark retrieval training requires continuous SfM observation supervision; rebuild the cache")
+    if float(config.landmark_coherent_hard_negative_margin_weight) > 0.0:
+        if (
+            samples.landmark_coherent_hard_negative_offsets is None
+            or samples.landmark_coherent_hard_negative_track_ids is None
+        ):
+            raise ValueError(
+                "coherent hard-negative training requires train-only coherent "
+                "track CSR supervision"
+            )
+        if not str(config.landmark_frozen_negative_bank):
+            raise ValueError(
+                "coherent hard-negative training requires --landmark_frozen_negative_bank"
+            )
     track_ids = np.asarray(samples.landmark_track_ids, dtype=np.int64).reshape(-1)
     if track_ids.size == 0 or np.any(track_ids < 0):
         raise ValueError("landmark retrieval training requires valid non-negative SfM track ids for every observation")
@@ -4147,6 +4439,7 @@ _VALIDATION_RETRIEVAL_METRICS = (
     "landmark_retrieval_loss",
     "landmark_retrieval_positive_loss",
     "landmark_retrieval_system_hard_negative_margin_loss",
+    "landmark_retrieval_coherent_hard_negative_margin_loss",
     "landmark_retrieval_recall_at_1",
     "landmark_retrieval_recall_at_5",
     "landmark_retrieval_recall_at_20",
@@ -4285,28 +4578,36 @@ def _evaluate(
     pair_subset = _sample_map_pair_subset(samples, positive_eval_indices if positive_eval_indices.size else eval_indices, int(config.map_pair_batch_size), int(config.seed) + 992)
     with torch.no_grad():
         active_indices = positive_eval_indices if positive_eval_indices.size >= 2 else eval_indices
-        query = _tensor(base.query_features[active_indices], dtype=torch.float32, device=device)
-        render = _tensor(base.render_features[active_indices], dtype=torch.float32, device=device)
-        query_z, query_offsets = model.forward_rows(query)
-        render_z, render_offsets = model.forward_rows(render)
-        scores = query_z @ render_z.T
-        labels = torch.arange(scores.shape[0], device=device)
-        qlabels = _tensor(base.query_offset_labels[active_indices], dtype=torch.long, device=device)
-        rlabels = _tensor(base.render_offset_labels[active_indices], dtype=torch.long, device=device)
         metrics = {
             "eval_sample_count": int(eval_indices.shape[0]),
             "positive_match_count": int(positive_eval_indices.shape[0]),
-            "train_top1_acc": float(torch.mean((torch.argmax(scores, dim=1) == labels).float()).item()),
-            "query_offset_acc": float(torch.mean((torch.argmax(query_offsets, dim=1) == qlabels).float()).item()),
-            "render_offset_acc": float(torch.mean((torch.argmax(render_offsets, dim=1) == rlabels).float()).item()),
         }
-        _query_pair_loss, query_pair_metrics = _fine_coordinate_loss_and_metrics(model.query_pair_fine_logits(query_z, render_z), qlabels)
-        _render_pair_loss, render_pair_metrics = _fine_coordinate_loss_and_metrics(model.pair_fine_logits(query_z, render_z), rlabels)
-        metrics["query_pair_fine_acc"] = float(query_pair_metrics["acc"])
-        metrics["query_pair_fine_valid_count"] = float(query_pair_metrics["valid_count"])
-        metrics["render_pair_fine_acc"] = float(render_pair_metrics["acc"])
-        metrics["render_pair_fine_valid_count"] = float(render_pair_metrics["valid_count"])
-        if float(config.coarse_candidate_rank_loss_weight) > 0.0:
+        if str(config.model_type) != "radio_spatial_context":
+            query = _tensor(base.query_features[active_indices], dtype=torch.float32, device=device)
+            render = _tensor(base.render_features[active_indices], dtype=torch.float32, device=device)
+            query_z, query_offsets = model.forward_rows(query)
+            render_z, render_offsets = model.forward_rows(render)
+            scores = query_z @ render_z.T
+            labels = torch.arange(scores.shape[0], device=device)
+            qlabels = _tensor(base.query_offset_labels[active_indices], dtype=torch.long, device=device)
+            rlabels = _tensor(base.render_offset_labels[active_indices], dtype=torch.long, device=device)
+            metrics.update(
+                {
+                    "train_top1_acc": float(torch.mean((torch.argmax(scores, dim=1) == labels).float()).item()),
+                    "query_offset_acc": float(torch.mean((torch.argmax(query_offsets, dim=1) == qlabels).float()).item()),
+                    "render_offset_acc": float(torch.mean((torch.argmax(render_offsets, dim=1) == rlabels).float()).item()),
+                }
+            )
+            _query_pair_loss, query_pair_metrics = _fine_coordinate_loss_and_metrics(model.query_pair_fine_logits(query_z, render_z), qlabels)
+            _render_pair_loss, render_pair_metrics = _fine_coordinate_loss_and_metrics(model.pair_fine_logits(query_z, render_z), rlabels)
+            metrics["query_pair_fine_acc"] = float(query_pair_metrics["acc"])
+            metrics["query_pair_fine_valid_count"] = float(query_pair_metrics["valid_count"])
+            metrics["render_pair_fine_acc"] = float(render_pair_metrics["acc"])
+            metrics["render_pair_fine_valid_count"] = float(render_pair_metrics["valid_count"])
+        if (
+            float(config.coarse_candidate_rank_loss_weight) > 0.0
+            and str(config.model_type) != "radio_spatial_context"
+        ):
             negatives = _tensor(base.negative_render_features[active_indices], dtype=torch.float32, device=device)
             if negatives.numel() > 0:
                 negative_z = model.encode(negatives.reshape(-1, negatives.shape[-1])).reshape(negatives.shape[0], negatives.shape[1], -1)
@@ -4317,7 +4618,14 @@ def _evaluate(
                     margin=float(config.coarse_candidate_rank_margin),
                 )
                 metrics.update({key: float(value.detach().cpu().item()) for key, value in rank_metrics.items()})
-        no_match_loss = _no_match_confidence_loss(model, samples, eval_indices, device=device)
+        no_match_loss = None
+        if (
+            float(config.pair_confidence_loss_weight) > 0.0
+            and str(config.model_type) != "radio_spatial_context"
+        ):
+            no_match_loss = _no_match_confidence_loss(
+                model, samples, eval_indices, device=device
+            )
         if no_match_loss is not None:
             metrics["no_match_confidence_loss"] = float(no_match_loss.detach().cpu().item())
         for prefix, maps, targets in (
@@ -4491,6 +4799,8 @@ def train_matcha_joint_model(
             "warm_start_missing_keys": list(result.missing_keys),
             "warm_start_unexpected_keys": list(result.unexpected_keys),
         }
+    if int(cfg.context_freeze_base_steps) > 0:
+        set_radio_spatial_context_base_trainable(model, trainable=False)
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(cfg.lr), weight_decay=1e-4)
     rng = np.random.default_rng(int(cfg.seed))
     landmark_memory_bank = _build_landmark_memory_bank(samples, cfg, device)
@@ -4543,6 +4853,11 @@ def train_matcha_joint_model(
     maybe_validate(0)
     model.train()
     for step in range(int(cfg.steps)):
+        if (
+            int(cfg.context_freeze_base_steps) > 0
+            and int(step) == int(cfg.context_freeze_base_steps)
+        ):
+            set_radio_spatial_context_base_trainable(model, trainable=True)
         idx = _sample_indices(rng, samples.coarse_fine_samples.sample_count, int(cfg.batch_size))
         loss, step_metrics = _total_loss(
             model,
@@ -4677,6 +4992,8 @@ def train_matcha_joint_model_from_manifest(
             "warm_start_missing_keys": list(result.missing_keys),
             "warm_start_unexpected_keys": list(result.unexpected_keys),
         }
+    if int(cfg.context_freeze_base_steps) > 0:
+        set_radio_spatial_context_base_trainable(model, trainable=False)
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(cfg.lr), weight_decay=1e-4)
     rng = np.random.default_rng(int(cfg.seed))
     landmark_memory_bank = _build_landmark_memory_bank(first_samples, cfg, device)
@@ -4752,6 +5069,11 @@ def train_matcha_joint_model_from_manifest(
     model.train()
     last_samples = first_samples
     for step in range(int(cfg.steps)):
+        if (
+            int(cfg.context_freeze_base_steps) > 0
+            and int(step) == int(cfg.context_freeze_base_steps)
+        ):
+            set_radio_spatial_context_base_trainable(model, trainable=True)
         samples = cache.get(shard_for_step(step))
         last_samples = samples
         idx = _sample_indices(rng, samples.coarse_fine_samples.sample_count, int(cfg.batch_size))
@@ -5129,6 +5451,8 @@ def train_matcha_joint_model_from_sample_provider(
             "warm_start_missing_keys": list(result.missing_keys),
             "warm_start_unexpected_keys": list(result.unexpected_keys),
         }
+    if int(cfg.context_freeze_base_steps) > 0:
+        set_radio_spatial_context_base_trainable(model, trainable=False)
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(cfg.lr), weight_decay=1e-4)
     rng = np.random.default_rng(int(cfg.seed) + int(rank) * 104729)
     landmark_memory_bank = _build_landmark_memory_bank(first_samples, cfg, device)
@@ -5243,6 +5567,11 @@ def train_matcha_joint_model_from_sample_provider(
     if torch.cuda.is_available() and device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
     for step in range(int(cfg.steps)):
+        if (
+            int(cfg.context_freeze_base_steps) > 0
+            and int(step) == int(cfg.context_freeze_base_steps)
+        ):
+            set_radio_spatial_context_base_trainable(model, trainable=True)
         optimizer.zero_grad(set_to_none=True)
         for accumulation_index in range(int(gradient_accumulation_pairs)):
             pair_ordinals = [int(next(pair_ordinal_iterator)) for _ in range(int(pair_batch_size))]
@@ -5485,7 +5814,13 @@ def save_matcha_joint_model(run: MatchaJointTrainingRun, path: Path) -> None:
         {
             "format": _JOINT_MODEL_FORMAT,
             "model_config": {
-                "model_type": "radio_dual_attention" if isinstance(model, RadioDualAttentionFusionJointModel) else "residual_adapter",
+                "model_type": (
+                    "radio_dual_attention"
+                    if isinstance(model, RadioDualAttentionFusionJointModel)
+                    else "radio_spatial_context"
+                    if isinstance(model, RadioSpatialContextJointModel)
+                    else "residual_adapter"
+                ),
                 "input_dim": int(model.input_dim),
                 "output_dim": int(model.output_dim),
                 "residual_hidden_dim": int(model.adapter.residual_hidden_dim),
@@ -5501,6 +5836,10 @@ def save_matcha_joint_model(run: MatchaJointTrainingRun, path: Path) -> None:
                 "attention_patch_size": int(getattr(model, "attention_patch_size", 1)),
                 "attention_upsample_mode": str(getattr(model, "attention_upsample_mode", "bilinear")),
                 "attention_fusion_mode": str(getattr(model, "attention_fusion_mode", "legacy")),
+                "context_hidden_dim": int(getattr(model, "context_hidden_dim", 0)),
+                "context_broad_kernel_size": int(
+                    getattr(model, "context_broad_kernel_size", 0)
+                ),
                 "local_window_fine_mode": str(getattr(model, "local_window_fine_mode", "mlp")),
                 "measurement_patch_config": dict(getattr(model, "measurement_patch_config", {})),
             },
@@ -5544,7 +5883,13 @@ def load_matcha_joint_model(path: Path, device: str = "cpu") -> MatchaJointTrain
             measurement_patch_input_mode=str(dict(cfg.get("measurement_patch_config", {})).get("input_mode", "rgb")),
         )
     else:
-        model = MatchaStyleJointModel(
+        model_type = str(cfg.get("model_type", "residual_adapter"))
+        model_class = (
+            RadioSpatialContextJointModel
+            if model_type == "radio_spatial_context"
+            else MatchaStyleJointModel
+        )
+        model_kwargs = dict(
             input_dim=int(cfg["input_dim"]),
             output_dim=int(cfg["output_dim"]),
             residual_hidden_dim=int(cfg["residual_hidden_dim"]),
@@ -5563,6 +5908,12 @@ def load_matcha_joint_model(path: Path, device: str = "cpu") -> MatchaJointTrain
             measurement_patch_encoder_arch=str(dict(cfg.get("measurement_patch_config", {})).get("encoder_arch", "simple")),
             measurement_patch_input_mode=str(dict(cfg.get("measurement_patch_config", {})).get("input_mode", "rgb")),
         )
+        if model_class is RadioSpatialContextJointModel:
+            model_kwargs.update(
+                context_hidden_dim=int(cfg["context_hidden_dim"]),
+                context_broad_kernel_size=int(cfg["context_broad_kernel_size"]),
+            )
+        model = model_class(**model_kwargs)
     incompatible = model.load_state_dict(payload["state_dict"], strict=False)
     summary = dict(payload.get("summary", {}))
     missing = [str(item) for item in getattr(incompatible, "missing_keys", [])]
@@ -5751,6 +6102,9 @@ def save_matcha_joint_training_set_npz(
             landmark_known_positive_track_ids=_optional_npz_value(samples.landmark_known_positive_track_ids),
             landmark_strict_positive_offsets=_optional_npz_value(samples.landmark_strict_positive_offsets),
             landmark_strict_positive_track_ids=_optional_npz_value(samples.landmark_strict_positive_track_ids),
+            landmark_coherent_hard_negative_offsets=_optional_npz_value(samples.landmark_coherent_hard_negative_offsets),
+            landmark_coherent_hard_negative_track_ids=_optional_npz_value(samples.landmark_coherent_hard_negative_track_ids),
+            landmark_coherent_hard_negative_mode_ids=_optional_npz_value(samples.landmark_coherent_hard_negative_mode_ids),
             query_repeatability_targets=_optional_npz_value(samples.query_repeatability_targets),
             render_repeatability_targets=_optional_npz_value(samples.render_repeatability_targets),
         )
@@ -5817,6 +6171,9 @@ def save_matcha_joint_training_set_npz(
         landmark_known_positive_track_ids=_optional_npz_value(samples.landmark_known_positive_track_ids),
         landmark_strict_positive_offsets=_optional_npz_value(samples.landmark_strict_positive_offsets),
         landmark_strict_positive_track_ids=_optional_npz_value(samples.landmark_strict_positive_track_ids),
+        landmark_coherent_hard_negative_offsets=_optional_npz_value(samples.landmark_coherent_hard_negative_offsets),
+        landmark_coherent_hard_negative_track_ids=_optional_npz_value(samples.landmark_coherent_hard_negative_track_ids),
+        landmark_coherent_hard_negative_mode_ids=_optional_npz_value(samples.landmark_coherent_hard_negative_mode_ids),
         query_repeatability_targets=_optional_npz_value(samples.query_repeatability_targets),
         render_repeatability_targets=_optional_npz_value(samples.render_repeatability_targets),
     )
@@ -5903,6 +6260,9 @@ def load_matcha_joint_training_set_npz(path: Path) -> tuple[MatchaJointTrainingS
                 landmark_known_positive_track_ids=_optional_loaded(data, "landmark_known_positive_track_ids"),
                 landmark_strict_positive_offsets=_optional_loaded(data, "landmark_strict_positive_offsets"),
                 landmark_strict_positive_track_ids=_optional_loaded(data, "landmark_strict_positive_track_ids"),
+                landmark_coherent_hard_negative_offsets=_optional_loaded(data, "landmark_coherent_hard_negative_offsets"),
+                landmark_coherent_hard_negative_track_ids=_optional_loaded(data, "landmark_coherent_hard_negative_track_ids"),
+                landmark_coherent_hard_negative_mode_ids=_optional_loaded(data, "landmark_coherent_hard_negative_mode_ids"),
                 query_repeatability_targets=_optional_loaded(data, "query_repeatability_targets"),
                 render_repeatability_targets=_optional_loaded(data, "render_repeatability_targets"),
             )
@@ -5972,6 +6332,9 @@ def load_matcha_joint_training_set_npz(path: Path) -> tuple[MatchaJointTrainingS
             landmark_known_positive_track_ids=_optional_loaded(data, "landmark_known_positive_track_ids"),
             landmark_strict_positive_offsets=_optional_loaded(data, "landmark_strict_positive_offsets"),
             landmark_strict_positive_track_ids=_optional_loaded(data, "landmark_strict_positive_track_ids"),
+            landmark_coherent_hard_negative_offsets=_optional_loaded(data, "landmark_coherent_hard_negative_offsets"),
+            landmark_coherent_hard_negative_track_ids=_optional_loaded(data, "landmark_coherent_hard_negative_track_ids"),
+            landmark_coherent_hard_negative_mode_ids=_optional_loaded(data, "landmark_coherent_hard_negative_mode_ids"),
             query_repeatability_targets=_optional_loaded(data, "query_repeatability_targets"),
             render_repeatability_targets=_optional_loaded(data, "render_repeatability_targets"),
         )
@@ -6173,6 +6536,9 @@ def merge_matcha_joint_training_sets(
         landmark_known_positive_track_ids = None
         landmark_strict_positive_offsets = None
         landmark_strict_positive_track_ids = None
+        landmark_coherent_hard_negative_offsets = None
+        landmark_coherent_hard_negative_track_ids = None
+        landmark_coherent_hard_negative_mode_ids = None
     elif any(array is None for array in landmark_arrays):
         raise ValueError("cannot merge partially missing landmark retrieval supervision")
     else:
@@ -6227,6 +6593,61 @@ def merge_matcha_joint_training_sets(
             landmark_strict_positive_track_ids = np.concatenate(
                 [np.asarray(item, dtype=np.int64).reshape(-1) for item in strict_track_ids],
                 axis=0,
+            )
+        coherent_offsets = [
+            item.landmark_coherent_hard_negative_offsets for item in values
+        ]
+        coherent_track_ids = [
+            item.landmark_coherent_hard_negative_track_ids for item in values
+        ]
+        coherent_mode_ids = [
+            item.landmark_coherent_hard_negative_mode_ids for item in values
+        ]
+        if all(item is None for item in [*coherent_offsets, *coherent_track_ids]):
+            landmark_coherent_hard_negative_offsets = None
+            landmark_coherent_hard_negative_track_ids = None
+            landmark_coherent_hard_negative_mode_ids = None
+        elif any(item is None for item in [*coherent_offsets, *coherent_track_ids]):
+            raise ValueError(
+                "cannot merge partially missing landmark coherent hard-negative CSR"
+            )
+        else:
+            if any(item is None for item in coherent_mode_ids) and not all(
+                item is None for item in coherent_mode_ids
+            ):
+                raise ValueError(
+                    "cannot merge partially missing coherent hard-mode ids"
+                )
+            coherent_counts = np.concatenate(
+                [
+                    np.diff(np.asarray(item, dtype=np.int64).reshape(-1))
+                    for item in coherent_offsets
+                ],
+                axis=0,
+            )
+            landmark_coherent_hard_negative_offsets = np.zeros(
+                (coherent_counts.size + 1,), dtype=np.int64
+            )
+            landmark_coherent_hard_negative_offsets[1:] = np.cumsum(
+                coherent_counts
+            )
+            landmark_coherent_hard_negative_track_ids = np.concatenate(
+                [
+                    np.asarray(item, dtype=np.int64).reshape(-1)
+                    for item in coherent_track_ids
+                ],
+                axis=0,
+            )
+            landmark_coherent_hard_negative_mode_ids = (
+                None
+                if all(item is None for item in coherent_mode_ids)
+                else np.concatenate(
+                    [
+                        np.asarray(item, dtype=np.int64).reshape(-1)
+                        for item in coherent_mode_ids
+                    ],
+                    axis=0,
+                )
             )
     if all(array is None for array in fine_arrays):
         fine_pair_indices = None
@@ -6320,6 +6741,9 @@ def merge_matcha_joint_training_sets(
         landmark_known_positive_track_ids=landmark_known_positive_track_ids,
         landmark_strict_positive_offsets=landmark_strict_positive_offsets,
         landmark_strict_positive_track_ids=landmark_strict_positive_track_ids,
+        landmark_coherent_hard_negative_offsets=landmark_coherent_hard_negative_offsets,
+        landmark_coherent_hard_negative_track_ids=landmark_coherent_hard_negative_track_ids,
+        landmark_coherent_hard_negative_mode_ids=landmark_coherent_hard_negative_mode_ids,
         query_repeatability_targets=stack_optional("query_repeatability_targets"),
         render_repeatability_targets=stack_optional("render_repeatability_targets"),
     )
