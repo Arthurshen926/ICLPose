@@ -44,6 +44,11 @@ class IndependentVerificationPoints:
     candidate_track_ids: np.ndarray | None = None
     candidate_descriptor_scores: np.ndarray | None = None
     candidate_null_probabilities: np.ndarray | None = None
+    candidate_spatial_offsets_xy: np.ndarray | None = None
+    candidate_spatial_log_probabilities: np.ndarray | None = None
+    candidate_spatial_dustbin_probabilities: np.ndarray | None = None
+    candidate_support_view_probabilities: np.ndarray | None = None
+    candidate_spatial_valid_mask: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         xy = np.asarray(self.xy, dtype=np.float64).reshape(-1, 2)
@@ -121,6 +126,73 @@ class IndependentVerificationPoints:
                     )
         elif candidate_null is not None:
             raise ValueError("candidate null probabilities require fixed candidates")
+        spatial_values = (
+            self.candidate_spatial_offsets_xy,
+            self.candidate_spatial_log_probabilities,
+            self.candidate_spatial_dustbin_probabilities,
+            self.candidate_support_view_probabilities,
+            self.candidate_spatial_valid_mask,
+        )
+        if any(value is not None for value in spatial_values):
+            if candidate_tracks is None or not all(
+                value is not None for value in spatial_values
+            ):
+                raise ValueError(
+                    "candidate spatial modes require fixed candidates and all arrays"
+                )
+            offsets = np.asarray(
+                self.candidate_spatial_offsets_xy, dtype=np.float32
+            ).reshape(-1, 2)
+            log_probability = np.asarray(
+                self.candidate_spatial_log_probabilities, dtype=np.float32
+            )
+            dustbin = np.asarray(
+                self.candidate_spatial_dustbin_probabilities, dtype=np.float32
+            )
+            view_probability = np.asarray(
+                self.candidate_support_view_probabilities, dtype=np.float32
+            )
+            spatial_valid = np.asarray(
+                self.candidate_spatial_valid_mask, dtype=bool
+            )
+            expected_prefix = (*candidate_tracks.shape,)
+            if (
+                log_probability.ndim != 4
+                or log_probability.shape[:2] != expected_prefix
+                or log_probability.shape[3] != len(offsets)
+                or dustbin.shape != log_probability.shape[:3]
+                or view_probability.shape != dustbin.shape
+                or spatial_valid.shape != dustbin.shape
+            ):
+                raise ValueError("candidate spatial mode arrays are not aligned")
+            if np.any(~np.isfinite(offsets)) or np.any(
+                ~np.isfinite(log_probability[spatial_valid])
+            ):
+                raise ValueError("valid candidate spatial modes must be finite")
+            if np.any(~np.isfinite(dustbin)) or np.any(~np.isfinite(view_probability)):
+                raise ValueError("candidate spatial probabilities must be finite")
+            if np.any((dustbin < 0.0) | (dustbin > 1.0)) or np.any(
+                (view_probability < 0.0) | (view_probability > 1.0)
+            ):
+                raise ValueError("candidate spatial probabilities must be in [0, 1]")
+            if np.any(spatial_valid & ~valid_candidates[:, :, None]):
+                raise ValueError("invalid candidates cannot carry spatial modes")
+            view_mass = np.sum(
+                np.where(spatial_valid, view_probability, 0.0), axis=2
+            )
+            if np.any(view_mass > 1.0 + 2e-5):
+                raise ValueError("candidate support-view mass exceeds one")
+            object.__setattr__(self, "candidate_spatial_offsets_xy", offsets)
+            object.__setattr__(
+                self, "candidate_spatial_log_probabilities", log_probability
+            )
+            object.__setattr__(
+                self, "candidate_spatial_dustbin_probabilities", dustbin
+            )
+            object.__setattr__(
+                self, "candidate_support_view_probabilities", view_probability
+            )
+            object.__setattr__(self, "candidate_spatial_valid_mask", spatial_valid)
         object.__setattr__(self, "xy", xy)
         object.__setattr__(self, "descriptors", _normalize_rows(descriptors))
         object.__setattr__(self, "descriptor_reference_scores", reference)
@@ -153,6 +225,27 @@ class IndependentVerificationPoints:
                 None
                 if self.candidate_null_probabilities is None
                 else self.candidate_null_probabilities[indices]
+            ),
+            candidate_spatial_offsets_xy=self.candidate_spatial_offsets_xy,
+            candidate_spatial_log_probabilities=(
+                None
+                if self.candidate_spatial_log_probabilities is None
+                else self.candidate_spatial_log_probabilities[indices]
+            ),
+            candidate_spatial_dustbin_probabilities=(
+                None
+                if self.candidate_spatial_dustbin_probabilities is None
+                else self.candidate_spatial_dustbin_probabilities[indices]
+            ),
+            candidate_support_view_probabilities=(
+                None
+                if self.candidate_support_view_probabilities is None
+                else self.candidate_support_view_probabilities[indices]
+            ),
+            candidate_spatial_valid_mask=(
+                None
+                if self.candidate_spatial_valid_mask is None
+                else self.candidate_spatial_valid_mask[indices]
             ),
         )
 
@@ -835,6 +928,7 @@ class IndependentLandmarkPoseVerifier:
         self._fixed_candidate_cache: dict[tuple[int, int], object] = {}
         self._fixed_candidate_vector_cache: dict[tuple[int, int], object] = {}
         self._fixed_candidate_row_cache: dict[tuple[int, int], object] = {}
+        self._fixed_candidate_spatial_cache: dict[tuple[int, int], object] = {}
 
     def _static_eligible_mask(
         self, eligible_landmark_mask: np.ndarray | None
@@ -1052,6 +1146,143 @@ class IndependentLandmarkPoseVerifier:
         candidate_points[candidate_indices] = point_indices
         np.add.at(evidence, candidate_points, candidate_evidence)
         return np.clip(evidence, 0.0, 1.0)
+
+    def _fixed_candidate_spatial_point_evidence(
+        self,
+        projected: np.ndarray,
+        pose_eligible: np.ndarray,
+        projected_row_indices: np.ndarray,
+        points: IndependentVerificationPoints,
+        eligible_landmark_mask: np.ndarray | None,
+    ) -> np.ndarray:
+        """Evaluate immutable per-view RGB modes at candidate projections."""
+
+        if points.candidate_spatial_log_probabilities is None:
+            raise ValueError("candidate spatial modes are unavailable")
+        mask_key = 0 if eligible_landmark_mask is None else id(eligible_landmark_mask)
+        cache_key = (id(points), mask_key)
+        cached = self._fixed_candidate_spatial_cache.get(cache_key)
+        if cached is None or cached[0] is not points or cached[1] is not eligible_landmark_mask:
+            from scipy.ndimage import gaussian_filter
+
+            prepared = self._prepare_fixed_candidates(points, eligible_landmark_mask)
+            candidate_shape = np.asarray(points.candidate_track_ids).shape
+            bank_rows = np.full(candidate_shape, -1, dtype=np.int64)
+            priors = np.zeros(candidate_shape, dtype=np.float64)
+            for point_index, candidates in enumerate(prepared):
+                for candidate_column, candidate in enumerate(candidates):
+                    rows = np.asarray(candidate[1], dtype=np.int64).reshape(-1)
+                    if rows.size:
+                        bank_rows[point_index, candidate_column] = int(rows[0])
+                        priors[point_index, candidate_column] = float(candidate[4])
+
+            offsets = np.asarray(points.candidate_spatial_offsets_xy, dtype=np.float64)
+            x_values = np.unique(offsets[:, 0])
+            y_values = np.unique(offsets[:, 1])
+            if len(x_values) * len(y_values) != len(offsets):
+                raise ValueError("candidate spatial offsets are not a complete grid")
+            expected = np.stack(np.meshgrid(x_values, y_values), axis=-1).reshape(-1, 2)
+            if not np.allclose(offsets, expected, rtol=0.0, atol=1e-6):
+                raise ValueError("candidate spatial offsets use unexpected ordering")
+            step_x = float(np.diff(x_values)[0]) if len(x_values) > 1 else 1.0
+            step_y = float(np.diff(y_values)[0]) if len(y_values) > 1 else 1.0
+            log_maps = np.asarray(
+                points.candidate_spatial_log_probabilities, dtype=np.float32
+            )
+            valid_views = np.asarray(points.candidate_spatial_valid_mask, dtype=bool)
+            surfaces = np.zeros(log_maps.shape[:3] + (len(y_values), len(x_values)), dtype=np.float32)
+            gaussian_sigma = (
+                float(self.config.spatial_sigma_px) / step_y,
+                float(self.config.spatial_sigma_px) / step_x,
+            )
+            kernel_mass = float(2.0 * np.pi * gaussian_sigma[0] * gaussian_sigma[1])
+            for point_index, candidate_column, view in np.argwhere(valid_views).tolist():
+                logits = log_maps[point_index, candidate_column, view].astype(np.float64)
+                logits -= float(np.max(logits))
+                probability = np.exp(logits)
+                probability /= max(float(np.sum(probability)), 1e-12)
+                filtered = gaussian_filter(
+                    probability.reshape(len(y_values), len(x_values)),
+                    sigma=gaussian_sigma,
+                    mode="constant",
+                    cval=0.0,
+                )
+                surfaces[point_index, candidate_column, view] = np.clip(
+                    filtered * kernel_mass, 0.0, 1.0
+                )
+            vectors = (
+                bank_rows,
+                priors,
+                surfaces,
+                x_values,
+                y_values,
+                step_x,
+                step_y,
+            )
+            cached = (points, eligible_landmark_mask, vectors)
+            self._fixed_candidate_spatial_cache[cache_key] = cached
+        bank_rows, priors, surfaces, x_values, y_values, step_x, step_y = cached[2]
+
+        projected_rows = np.asarray(projected_row_indices, dtype=np.int64).reshape(-1)
+        safe_rows = np.maximum(bank_rows, 0)
+        local = np.searchsorted(projected_rows, safe_rows)
+        complete = (bank_rows >= 0) & (local < len(projected_rows))
+        valid_local = np.flatnonzero(complete.reshape(-1))
+        if valid_local.size:
+            complete.reshape(-1)[valid_local] &= (
+                projected_rows[local.reshape(-1)[valid_local]]
+                == safe_rows.reshape(-1)[valid_local]
+            )
+        safe_local = np.minimum(local, max(len(projected_rows) - 1, 0))
+        visible = complete & pose_eligible[safe_local]
+        projected_xy = projected[safe_local]
+        delta = projected_xy - points.xy[:, None, :]
+        sigma = float(self.config.spatial_sigma_px)
+        base = np.exp(-0.5 * np.sum(np.square(delta / sigma), axis=2))
+        base = np.where(visible, base, 0.0)
+
+        x = (delta[:, :, 0] - float(x_values[0])) / float(step_x)
+        y = (delta[:, :, 1] - float(y_values[0])) / float(step_y)
+        inside = visible & (x >= 0.0) & (x <= len(x_values) - 1) & (y >= 0.0) & (y <= len(y_values) - 1)
+        x0 = np.clip(np.floor(x).astype(np.int64), 0, len(x_values) - 1)
+        y0 = np.clip(np.floor(y).astype(np.int64), 0, len(y_values) - 1)
+        x1 = np.minimum(x0 + 1, len(x_values) - 1)
+        y1 = np.minimum(y0 + 1, len(y_values) - 1)
+        wx = x - x0
+        wy = y - y0
+        view_count = surfaces.shape[2]
+        point_grid = np.arange(len(points), dtype=np.int64)[:, None, None]
+        candidate_grid = np.arange(bank_rows.shape[1], dtype=np.int64)[None, :, None]
+        view_grid = np.arange(view_count, dtype=np.int64)[None, None, :]
+        mode = (
+            surfaces[point_grid, candidate_grid, view_grid, y0[:, :, None], x0[:, :, None]]
+            * (1.0 - wx[:, :, None]) * (1.0 - wy[:, :, None])
+            + surfaces[point_grid, candidate_grid, view_grid, y0[:, :, None], x1[:, :, None]]
+            * wx[:, :, None] * (1.0 - wy[:, :, None])
+            + surfaces[point_grid, candidate_grid, view_grid, y1[:, :, None], x0[:, :, None]]
+            * (1.0 - wx[:, :, None]) * wy[:, :, None]
+            + surfaces[point_grid, candidate_grid, view_grid, y1[:, :, None], x1[:, :, None]]
+            * wx[:, :, None] * wy[:, :, None]
+        )
+        mode *= inside[:, :, None]
+        valid_views = np.asarray(points.candidate_spatial_valid_mask, dtype=bool)
+        view_weight = np.where(
+            valid_views,
+            np.asarray(points.candidate_support_view_probabilities, dtype=np.float64),
+            0.0,
+        )
+        reliability = 1.0 - np.asarray(
+            points.candidate_spatial_dustbin_probabilities, dtype=np.float64
+        )
+        local_evidence = (
+            (1.0 - reliability) * base[:, :, None] + reliability * mode
+        )
+        available_mass = np.clip(np.sum(view_weight, axis=2), 0.0, 1.0)
+        candidate_evidence = (
+            (1.0 - available_mass) * base
+            + np.sum(view_weight * local_evidence, axis=2)
+        )
+        return np.clip(np.sum(priors * candidate_evidence, axis=1), 0.0, 1.0)
 
     def _fixed_candidate_vectors(
         self,
@@ -1520,13 +1751,27 @@ class IndependentLandmarkPoseVerifier:
                     eligible_landmark_mask,
                 )
             )
-            evidence = self._fixed_candidate_point_evidence(
-                projected,
-                eligible,
-                points,
-                eligible_landmark_mask,
-                projected_row_indices=candidate_rows,
+            has_candidate_spatial_evidence = (
+                points.candidate_spatial_log_probabilities is not None
+                and points.candidate_spatial_valid_mask is not None
+                and bool(np.any(points.candidate_spatial_valid_mask))
             )
+            if not has_candidate_spatial_evidence:
+                evidence = self._fixed_candidate_point_evidence(
+                    projected,
+                    eligible,
+                    points,
+                    eligible_landmark_mask,
+                    projected_row_indices=candidate_rows,
+                )
+            else:
+                evidence = self._fixed_candidate_spatial_point_evidence(
+                    projected,
+                    eligible,
+                    candidate_rows,
+                    points,
+                    eligible_landmark_mask,
+                )
         else:
             projected, eligible = self._projected_eligible_landmarks(
                 pose_w2c, camera, eligible_landmark_mask

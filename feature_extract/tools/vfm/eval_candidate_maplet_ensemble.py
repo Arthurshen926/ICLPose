@@ -124,6 +124,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--maplet_support_index", required=True)
     parser.add_argument("--feature_artifact", required=True)
     parser.add_argument("--radio_intermediate_cache", default=None)
+    parser.add_argument("--radio_final_context_cache", default=None)
     parser.add_argument("--colmap_model_dir", required=True)
     parser.add_argument("--split_json", required=True)
     parser.add_argument(
@@ -307,6 +308,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             None
             if args.radio_intermediate_cache is None
             else Path(args.radio_intermediate_cache)
+        ),
+        radio_final_context_cache=(
+            None
+            if args.radio_final_context_cache is None
+            else Path(args.radio_final_context_cache)
         ),
         query_radius_px=float(args.query_radius_px),
         max_query_nodes=int(args.max_query_nodes),

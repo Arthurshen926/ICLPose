@@ -37,6 +37,10 @@ from feature_extract.vfm.localization.local_maplet_geometry_probe import (
 from feature_extract.vfm.localization.radio_intermediate_context import (
     load_radio_intermediate_context_cache,
 )
+from feature_extract.vfm.localization.radio_final_context import (
+    RadioFinalContextPcaCache,
+    load_radio_final_context_pca_cache,
+)
 from feature_extract.vfm.query_to_3d_matching import normalize_rows
 from feature_extract.vfm.render_pose_diagnostics import project_world_to_image
 
@@ -210,6 +214,7 @@ class CandidateMapletEpisodeStore:
         feature_artifact: Path,
         colmap_model_dir: Path,
         radio_intermediate_cache: Path | None = None,
+        radio_final_context_cache: Path | None = None,
         query_radius_px: float = 96.0,
         max_query_nodes: int = 48,
         max_support_tracks: int = 33,
@@ -440,6 +445,35 @@ class CandidateMapletEpisodeStore:
                 source_descriptors=radio_cache.support_descriptors,
                 source_detector_scores=support_scores,
             )
+        self.radio_final_context_cache_path = (
+            None
+            if radio_final_context_cache is None
+            else Path(radio_final_context_cache)
+        )
+        self.radio_final_context: RadioFinalContextPcaCache | None = None
+        self.radio_final_context_dim = 0
+        if self.radio_final_context_cache_path is not None:
+            self.radio_final_context = load_radio_final_context_pca_cache(
+                self.radio_final_context_cache_path
+            )
+            self.radio_final_context_dim = int(
+                self.radio_final_context.node_feature_dim
+            )
+            if self.radio_intermediate_cache_path is not None:
+                intermediate_checkpoint = str(
+                    radio_cache.metadata.get("radio_checkpoint_sha256", "")
+                )
+                final_checkpoint = str(
+                    self.radio_final_context.metadata.get(
+                        "radio_checkpoint_sha256", ""
+                    )
+                )
+                if not intermediate_checkpoint or (
+                    intermediate_checkpoint != final_checkpoint
+                ):
+                    raise ValueError(
+                        "RADIO intermediate and final context checkpoints differ"
+                    )
         self.context_image_position = {
             str(image_id): int(index)
             for index, image_id in enumerate(self.context_cache["image_ids"].astype(str).tolist())
@@ -472,11 +506,19 @@ class CandidateMapletEpisodeStore:
 
     @property
     def query_input_dim(self) -> int:
-        return int(BASE_QUERY_INPUT_DIM + self.radio_descriptor_dim)
+        return int(
+            BASE_QUERY_INPUT_DIM
+            + self.radio_descriptor_dim
+            + self.radio_final_context_dim
+        )
 
     @property
     def support_input_dim(self) -> int:
-        return int(BASE_SUPPORT_INPUT_DIM + self.radio_descriptor_dim)
+        return int(
+            BASE_SUPPORT_INPUT_DIM
+            + self.radio_descriptor_dim
+            + self.radio_final_context_dim
+        )
 
     @property
     def static_input_dim(self) -> int:
@@ -533,6 +575,11 @@ class CandidateMapletEpisodeStore:
             )
         else:
             radio_descriptors = np.zeros((len(descriptors), 0), dtype=np.float32)
+        final_context = (
+            np.zeros((len(descriptors), 0), dtype=np.float32)
+            if self.radio_final_context is None
+            else self.radio_final_context.node_descriptors(query_id, xy)
+        )
         scores = np.concatenate(
             [
                 np.asarray([self.query_cache["detector_scores"][global_row]], dtype=np.float32),
@@ -547,6 +594,7 @@ class CandidateMapletEpisodeStore:
             [
                 descriptors,
                 radio_descriptors,
+                final_context,
                 relative,
                 radius[:, None],
                 np.clip(scores, 0.0, 1.0)[:, None],
@@ -623,6 +671,11 @@ class CandidateMapletEpisodeStore:
             )
             detector_scores = view.detector_scores
             reprojection_errors = view.reprojection_errors
+        final_context = (
+            np.zeros((len(tracks), 0), dtype=np.float32)
+            if self.radio_final_context is None
+            else self.radio_final_context.node_descriptors(image_id, xy)
+        )
         rows = np.asarray([self.landmark_track_rows[int(track)] for track in tracks], dtype=np.int64)
         xyz = np.asarray(self.landmark_index.xyz[rows], dtype=np.float32)
         relative = np.clip((xy - xy[0:1]) / self.query_radius_px, -4.0, 4.0)
@@ -633,6 +686,7 @@ class CandidateMapletEpisodeStore:
             [
                 descriptors,
                 radio_descriptors,
+                final_context,
                 relative,
                 radius[:, None],
                 np.clip(detector_scores, 0.0, 1.0)[:, None],

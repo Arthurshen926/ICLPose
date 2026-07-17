@@ -48,6 +48,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--maplet_support_index", required=True)
     parser.add_argument("--feature_artifact", required=True)
     parser.add_argument("--radio_intermediate_cache", default=None)
+    parser.add_argument("--radio_final_context_cache", default=None)
     parser.add_argument("--colmap_model_dir", required=True)
     parser.add_argument("--checkpoints", required=True)
     parser.add_argument("--devices", default="cuda:0,cuda:1")
@@ -111,6 +112,48 @@ def _validate_radio_projection_lineage(
     }
 
 
+def _validate_radio_final_context_lineage(
+    checkpoint_manifest: dict[str, object],
+    inference_cache: Path | None,
+) -> dict[str, object]:
+    checkpoint_hash = checkpoint_manifest.get("radio_final_context_cache_sha256")
+    if checkpoint_hash is None:
+        if inference_cache is not None:
+            raise ValueError("checkpoint did not use RADIO final context")
+        return {"mode": "not_used", "checkpoint_cache_sha256": None}
+    if inference_cache is None:
+        raise ValueError("checkpoint requires a RADIO final context cache")
+    inference_hash = file_sha256_short(inference_cache)
+    if str(inference_hash) == str(checkpoint_hash):
+        return {
+            "mode": "same_cache",
+            "checkpoint_cache_sha256": str(checkpoint_hash),
+            "inference_cache_sha256": str(inference_hash),
+        }
+    metadata = _radio_metadata(inference_cache)
+    if str(metadata.get("projection_source_cache_sha256", "")) != str(
+        checkpoint_hash
+    ):
+        raise ValueError(
+            "external RADIO final context cache must reuse the checkpoint "
+            "training cache as projection_source_cache"
+        )
+    if str(metadata.get("pca_fit_scope", "")) != "mapping_train_images_only":
+        raise ValueError("external RADIO final context cache has invalid PCA fit scope")
+    return {
+        "mode": "external_images_with_training_pca_lineage",
+        "checkpoint_cache_sha256": str(checkpoint_hash),
+        "inference_cache_sha256": str(inference_hash),
+        "projection_source_cache_sha256": str(
+            metadata.get("projection_source_cache_sha256")
+        ),
+        "radio_checkpoint_sha256": metadata.get("radio_checkpoint_sha256"),
+        "projection_dim": metadata.get("projection_dim"),
+        "normalization": metadata.get("normalization"),
+        "grid": metadata.get("grid"),
+    }
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     args = parse_args(argv)
     checkpoint_paths = tuple(
@@ -140,6 +183,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             if args.radio_intermediate_cache is None
             else Path(args.radio_intermediate_cache)
         ),
+        radio_final_context_cache=(
+            None
+            if args.radio_final_context_cache is None
+            else Path(args.radio_final_context_cache)
+        ),
         query_radius_px=float(args.query_radius_px),
         max_query_nodes=int(args.max_query_nodes),
         max_support_tracks=int(args.max_support_tracks),
@@ -156,6 +204,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     checkpoint_formats: set[str] = set()
     model_configs: list[dict[str, object]] = []
     radio_lineages: list[dict[str, object]] = []
+    radio_final_lineages: list[dict[str, object]] = []
     for index, checkpoint_path in enumerate(checkpoint_paths):
         device = torch.device(devices[index % len(devices)])
         checkpoint = torch.load(checkpoint_path, map_location=device)
@@ -185,6 +234,12 @@ def main(argv: Sequence[str] | None = None) -> None:
             if args.radio_intermediate_cache is None
             else Path(args.radio_intermediate_cache),
         )
+        radio_final_lineage = _validate_radio_final_context_lineage(
+            checkpoint_manifest,
+            None
+            if args.radio_final_context_cache is None
+            else Path(args.radio_final_context_cache),
+        )
         config_payload = dict(checkpoint["model_config"])
         config = CandidateMapletMatcherConfig(**config_payload)
         if (
@@ -208,6 +263,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         checkpoint_formats.add(checkpoint_format)
         model_configs.append(config_payload)
         radio_lineages.append(radio_lineage)
+        radio_final_lineages.append(radio_final_lineage)
         checkpoint_rows.append(
             {
                 "path": str(checkpoint_path),
@@ -219,6 +275,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "training_selection": checkpoint.get("selection"),
                 "training_data_manifest": checkpoint_manifest,
                 "radio_projection_lineage": radio_lineage,
+                "radio_final_context_lineage": radio_final_lineage,
             }
         )
         del model
@@ -314,6 +371,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         ],
         "model_config": model_configs[0],
         "radio_projection_lineages": radio_lineages,
+        "radio_final_context_lineages": radio_final_lineages,
         "outputs": {
             "scores": str(scores_path),
             "scores_sha256": file_sha256_short(scores_path),

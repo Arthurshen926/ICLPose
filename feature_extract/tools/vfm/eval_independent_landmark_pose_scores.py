@@ -137,6 +137,12 @@ def _score_compatibility(metadata: Mapping[str, object]) -> dict[str, object]:
         "fixed_candidate_prior_overlay_metadata_sha256": inputs.get(
             "fixed_candidate_prior_overlay_metadata_sha256"
         ),
+        "candidate_spatial_likelihood_sha256": inputs.get(
+            "candidate_spatial_likelihood_sha256"
+        ),
+        "candidate_spatial_likelihood_metadata_sha256": inputs.get(
+            "candidate_spatial_likelihood_metadata_sha256"
+        ),
         "projected_landmark_bank_sha256": inputs.get(
             "projected_landmark_bank_sha256"
         ),

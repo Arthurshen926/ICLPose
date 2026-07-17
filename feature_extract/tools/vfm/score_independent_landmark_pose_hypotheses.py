@@ -91,6 +91,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--support_geometry_index", default=None)
     parser.add_argument("--prototype_view_geometry", default=None)
+    parser.add_argument(
+        "--candidate_spatial_likelihood",
+        default=None,
+        help=(
+            "optional comma-separated target-free candidate_spatial_likelihood_v7 "
+            "artifacts aligned by source query row and physical track"
+        ),
+    )
     parser.add_argument("--maplet_support_index", default=None)
     parser.add_argument("--colmap_model_dir", required=True)
     parser.add_argument("--output_dir", required=True)
@@ -259,6 +267,163 @@ def _load_candidate_prior_overlay(
     }, metadata
 
 
+def _load_candidate_spatial_mode_index(
+    paths: Sequence[Path],
+) -> tuple[
+    dict[tuple[int, int], list[tuple[int, float, float, float, float, float, int, int]]],
+    np.ndarray,
+    list[np.ndarray],
+    list[dict[str, object]],
+]:
+    index: dict[
+        tuple[int, int],
+        list[tuple[int, float, float, float, float, float, int, int]],
+    ] = {}
+    offsets: np.ndarray | None = None
+    log_probability_arrays: list[np.ndarray] = []
+    metadata_rows: list[dict[str, object]] = []
+    required = {
+        "source_query_rows",
+        "candidate_track_ids",
+        "support_view_ranks",
+        "support_view_probabilities",
+        "candidate_prior_probabilities",
+        "center_xy",
+        "offsets_xy",
+        "local_log_probabilities",
+        "dustbin_probabilities",
+        "metadata_json",
+    }
+    for path in paths:
+        with np.load(path, allow_pickle=False) as payload:
+            missing = sorted(required.difference(payload.files))
+            if missing:
+                raise ValueError(f"{path}: candidate spatial artifact lacks {missing}")
+            metadata = json.loads(str(payload["metadata_json"].item()))
+            if metadata.get("format") != "candidate_spatial_likelihood_v7":
+                raise ValueError(f"{path}: unsupported candidate spatial format")
+            if metadata.get("ground_truth_loaded_by_inference_process") is not False:
+                raise ValueError(f"{path}: candidate spatial inference loaded targets")
+            if metadata.get("pose_or_ground_truth_used_for_inference") is not False:
+                raise ValueError(f"{path}: candidate spatial modes are not target-free")
+            local_offsets = np.asarray(payload["offsets_xy"], dtype=np.float32)
+            if offsets is None:
+                offsets = local_offsets.copy()
+            elif not np.array_equal(offsets, local_offsets):
+                raise ValueError("candidate spatial shards use different offset grids")
+            rows = np.asarray(payload["source_query_rows"], dtype=np.int64)
+            tracks = np.asarray(payload["candidate_track_ids"], dtype=np.int64)
+            ranks = np.asarray(payload["support_view_ranks"], dtype=np.int64)
+            view_probability = np.asarray(
+                payload["support_view_probabilities"], dtype=np.float32
+            )
+            candidate_prior = np.asarray(
+                payload["candidate_prior_probabilities"], dtype=np.float32
+            )
+            centers = np.asarray(payload["center_xy"], dtype=np.float32)
+            local_log = np.asarray(payload["local_log_probabilities"], dtype=np.float16)
+            dustbin = np.asarray(payload["dustbin_probabilities"], dtype=np.float32)
+            count = len(rows)
+            if not (
+                tracks.shape == ranks.shape == view_probability.shape
+                == candidate_prior.shape == dustbin.shape == (count,)
+                and centers.shape == (count, 2)
+                and local_log.shape == (count, len(local_offsets))
+            ):
+                raise ValueError(f"{path}: candidate spatial rows are not aligned")
+            artifact_index = len(log_probability_arrays)
+            log_probability_arrays.append(local_log)
+            for row_index in range(count):
+                key = (int(rows[row_index]), int(tracks[row_index]))
+                index.setdefault(key, []).append(
+                    (
+                        int(ranks[row_index]),
+                        float(view_probability[row_index]),
+                        float(candidate_prior[row_index]),
+                        float(centers[row_index, 0]),
+                        float(centers[row_index, 1]),
+                        float(dustbin[row_index]),
+                        artifact_index,
+                        row_index,
+                    )
+                )
+            metadata_rows.append(metadata)
+    if offsets is None:
+        raise ValueError("at least one candidate spatial artifact is required")
+    for key, views in index.items():
+        ranks = [int(view[0]) for view in views]
+        if len(ranks) != len(set(ranks)):
+            raise ValueError(f"candidate spatial views repeat for {key}")
+        views.sort(key=lambda view: int(view[0]))
+    return index, offsets, log_probability_arrays, metadata_rows
+
+
+def _candidate_spatial_modes_for_points(
+    *,
+    source_rows: np.ndarray,
+    xy: np.ndarray,
+    candidate_track_ids: np.ndarray,
+    candidate_probabilities: np.ndarray,
+    mode_index: Mapping[
+        tuple[int, int],
+        Sequence[tuple[int, float, float, float, float, float, int, int]],
+    ],
+    offsets_xy: np.ndarray,
+    log_probability_arrays: Sequence[np.ndarray],
+) -> dict[str, np.ndarray]:
+    rows = np.asarray(source_rows, dtype=np.int64).reshape(-1)
+    tracks = np.asarray(candidate_track_ids, dtype=np.int64)
+    priors = np.asarray(candidate_probabilities, dtype=np.float32)
+    centers = np.asarray(xy, dtype=np.float32)
+    maximum_views = max(
+        (int(view[0]) + 1 for views in mode_index.values() for view in views),
+        default=0,
+    )
+    if maximum_views <= 0:
+        raise ValueError("candidate spatial artifact contains no support views")
+    shape = (*tracks.shape, maximum_views)
+    local_log = np.zeros((*shape, len(offsets_xy)), dtype=np.float16)
+    dustbin = np.ones(shape, dtype=np.float32)
+    view_probability = np.zeros(shape, dtype=np.float32)
+    valid = np.zeros(shape, dtype=bool)
+    for point_index, source_row in enumerate(rows.tolist()):
+        for candidate_column, track_id in enumerate(tracks[point_index].tolist()):
+            if int(track_id) < 0:
+                continue
+            views = mode_index.get((int(source_row), int(track_id)), ())
+            for view in views:
+                rank, view_prob, candidate_prior, center_x, center_y, dust, artifact, row = view
+                if not np.allclose(
+                    np.asarray([center_x, center_y], dtype=np.float32),
+                    centers[point_index],
+                    rtol=0.0,
+                    atol=1e-4,
+                ):
+                    raise ValueError("candidate spatial center differs from query point")
+                if not np.isclose(
+                    float(candidate_prior),
+                    float(priors[point_index, candidate_column]),
+                    rtol=0.0,
+                    atol=2e-5,
+                ):
+                    raise ValueError(
+                        "candidate spatial identity prior differs from fixed overlay"
+                    )
+                local_log[point_index, candidate_column, rank] = np.asarray(
+                    log_probability_arrays[int(artifact)][int(row)], dtype=np.float16
+                )
+                dustbin[point_index, candidate_column, rank] = float(dust)
+                view_probability[point_index, candidate_column, rank] = float(view_prob)
+                valid[point_index, candidate_column, rank] = True
+    return {
+        "candidate_spatial_offsets_xy": np.asarray(offsets_xy, dtype=np.float32),
+        "candidate_spatial_log_probabilities": local_log,
+        "candidate_spatial_dustbin_probabilities": dustbin,
+        "candidate_support_view_probabilities": view_probability,
+        "candidate_spatial_valid_mask": valid,
+    }
+
+
 def _validate_alternate_verification_bank(
     source_metadata: Mapping[str, object],
     verification_metadata: Mapping[str, object],
@@ -399,6 +564,12 @@ def _verification_points_for_query(
     detector_log_merit_weight: float,
     descriptor_key: str = "global_descriptors",
     candidate_prior_overlay: Mapping[str, np.ndarray] | None = None,
+    candidate_spatial_mode_index: Mapping[
+        tuple[int, int],
+        Sequence[tuple[int, float, float, float, float, float, int, int]],
+    ] | None = None,
+    candidate_spatial_offsets_xy: np.ndarray | None = None,
+    candidate_spatial_log_probability_arrays: Sequence[np.ndarray] | None = None,
 ) -> tuple[IndependentVerificationPoints, np.ndarray, dict[str, int]]:
     all_rows = _query_detector_rows(query_id, detector=detector)
     proposal_query_ids = proposals["query_ids"].astype(str)
@@ -444,6 +615,23 @@ def _verification_points_for_query(
             raise ValueError("candidate prior overlay rows differ from proposals")
         candidate_scores = candidate_prior_overlay["candidate_probabilities"][kept]
         candidate_null = candidate_prior_overlay["null_probabilities"][kept]
+    spatial_kwargs: dict[str, np.ndarray] = {}
+    if candidate_spatial_mode_index is not None:
+        if (
+            candidate_prior_overlay is None
+            or candidate_spatial_offsets_xy is None
+            or candidate_spatial_log_probability_arrays is None
+        ):
+            raise ValueError("candidate spatial modes require the fixed prior overlay")
+        spatial_kwargs = _candidate_spatial_modes_for_points(
+            source_rows=kept,
+            xy=detector["xy"][kept],
+            candidate_track_ids=proposals["candidate_track_ids"][kept],
+            candidate_probabilities=candidate_scores,
+            mode_index=candidate_spatial_mode_index,
+            offsets_xy=candidate_spatial_offsets_xy,
+            log_probability_arrays=candidate_spatial_log_probability_arrays,
+        )
     points = IndependentVerificationPoints(
         xy=detector["xy"][kept],
         descriptors=detector[str(descriptor_key)][kept],
@@ -454,6 +642,7 @@ def _verification_points_for_query(
         candidate_track_ids=proposals["candidate_track_ids"][kept],
         candidate_descriptor_scores=candidate_scores,
         candidate_null_probabilities=candidate_null,
+        **spatial_kwargs,
     )
     candidate_tracks = np.asarray(
         proposals["candidate_track_ids"][fit_rows], dtype=np.int64
@@ -539,6 +728,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         proposals_path=proposal_path,
         proposals=proposals,
     )
+    spatial_mode_index = None
+    spatial_offsets_xy = None
+    spatial_log_probability_arrays: list[np.ndarray] = []
+    spatial_mode_metadata: list[dict[str, object]] = []
+    spatial_mode_paths: tuple[Path, ...] = tuple()
+    if args.candidate_spatial_likelihood is not None:
+        spatial_mode_paths = tuple(
+            Path(value.strip())
+            for value in str(args.candidate_spatial_likelihood).split(",")
+            if value.strip()
+        )
+        if not spatial_mode_paths:
+            raise ValueError("candidate spatial likelihood path list is empty")
+        (
+            spatial_mode_index,
+            spatial_offsets_xy,
+            spatial_log_probability_arrays,
+            spatial_mode_metadata,
+        ) = _load_candidate_spatial_mode_index(spatial_mode_paths)
     support_geometry = None
     support_geometry_metadata: dict[str, object] = {}
     if args.support_geometry_index is not None:
@@ -681,6 +889,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             point_count=int(args.verification_point_count),
             detector_log_merit_weight=float(args.detector_log_merit_weight),
             candidate_prior_overlay=prior_overlay,
+            candidate_spatial_mode_index=spatial_mode_index,
+            candidate_spatial_offsets_xy=spatial_offsets_xy,
+            candidate_spatial_log_probability_arrays=spatial_log_probability_arrays,
         )
         direct_excluded_count = int(len(excluded_tracks))
         if bool(args.purge_maplet_clusters):
@@ -820,6 +1031,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             "support_appearance_posterior_pose_independent": True,
             "pose_local_candidate_reselection": False,
             "pose_conditioned_refinement": False,
+            "candidate_specific_rgb_spatial_modes": bool(
+                spatial_mode_index is not None
+            ),
             "pose_effects": (
                 "positive_depth_image_bounds_and_optional_loose_view_gate_only"
             ),
@@ -878,6 +1092,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             "fixed_candidate_prior_overlay_metadata_sha256": _canonical_hash(
                 prior_overlay_metadata
             ),
+            "candidate_spatial_likelihood": [
+                str(path) for path in spatial_mode_paths
+            ],
+            "candidate_spatial_likelihood_sha256": [
+                file_sha256_short(path) for path in spatial_mode_paths
+            ],
+            "candidate_spatial_likelihood_metadata_sha256": [
+                _canonical_hash(row) for row in spatial_mode_metadata
+            ],
             "projected_landmark_bank": str(source_bank_path),
             "projected_landmark_bank_sha256": file_sha256_short(
                 source_bank_path

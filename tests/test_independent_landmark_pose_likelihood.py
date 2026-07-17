@@ -207,6 +207,101 @@ def test_learned_candidate_posterior_preserves_null_probability_mass() -> None:
     )
 
 
+def test_candidate_specific_spatial_mode_scores_its_offset_not_query_center() -> None:
+    bank = _bank()
+    views = LandmarkObservationViewIndex.from_track_observations(
+        bank.track_ids,
+        np.asarray([7], dtype=np.int64),
+        np.asarray([[0.0, 0.0, 1.0]], dtype=np.float32),
+    )
+    points = IndependentVerificationPoints(
+        xy=np.asarray([[50.0, 50.0]], dtype=np.float64),
+        descriptors=np.asarray([[1.0, 0.0]], dtype=np.float32),
+        descriptor_reference_scores=np.asarray([1.0], dtype=np.float32),
+        source_row_indices=np.asarray([11], dtype=np.int64),
+        candidate_track_ids=np.asarray([[7]], dtype=np.int64),
+        candidate_descriptor_scores=np.asarray([[1.0]], dtype=np.float32),
+        candidate_null_probabilities=np.asarray([0.0], dtype=np.float32),
+        candidate_spatial_offsets_xy=np.asarray(
+            [[0.0, 0.0], [4.0, 0.0]], dtype=np.float32
+        ),
+        candidate_spatial_log_probabilities=np.log(
+            np.asarray([[[[0.01, 0.99]]]], dtype=np.float32)
+        ),
+        candidate_spatial_dustbin_probabilities=np.zeros(
+            (1, 1, 1), dtype=np.float32
+        ),
+        candidate_support_view_probabilities=np.ones(
+            (1, 1, 1), dtype=np.float32
+        ),
+        candidate_spatial_valid_mask=np.ones((1, 1, 1), dtype=bool),
+    )
+    verifier = IndependentLandmarkPoseVerifier(
+        bank,
+        views,
+        IndependentLandmarkPoseLikelihoodConfig(
+            candidate_mode="fixed_global_topl",
+            fixed_candidate_prior_source="learned_probability",
+            spatial_sigma_px=0.75,
+        ),
+    )
+    center = verifier.score_pose(np.eye(4), _camera(), points)
+    shifted_pose = np.eye(4)
+    shifted_pose[0, 3] = 0.25
+    shifted = verifier.score_pose(shifted_pose, _camera(), points)
+
+    assert shifted.point_evidence[0] > 0.4
+    assert center.point_evidence[0] < 0.05
+    assert shifted.log_likelihood_mean > center.log_likelihood_mean
+
+
+def test_candidate_spatial_tensor_without_valid_modes_uses_exact_baseline() -> None:
+    bank = _bank()
+    views = LandmarkObservationViewIndex.from_track_observations(
+        bank.track_ids,
+        np.asarray([7], dtype=np.int64),
+        np.asarray([[0.0, 0.0, 1.0]], dtype=np.float32),
+    )
+    common = {
+        "xy": np.asarray([[50.0, 50.0]], dtype=np.float64),
+        "descriptors": np.asarray([[1.0, 0.0]], dtype=np.float32),
+        "descriptor_reference_scores": np.asarray([1.0], dtype=np.float32),
+        "source_row_indices": np.asarray([11], dtype=np.int64),
+        "candidate_track_ids": np.asarray([[7]], dtype=np.int64),
+        "candidate_descriptor_scores": np.asarray([[1.0]], dtype=np.float32),
+        "candidate_null_probabilities": np.asarray([0.0], dtype=np.float32),
+    }
+    baseline = IndependentVerificationPoints(**common)
+    no_modes = IndependentVerificationPoints(
+        **common,
+        candidate_spatial_offsets_xy=np.asarray([[0.0, 0.0]], dtype=np.float32),
+        candidate_spatial_log_probabilities=np.zeros(
+            (1, 1, 1, 1), dtype=np.float32
+        ),
+        candidate_spatial_dustbin_probabilities=np.ones(
+            (1, 1, 1), dtype=np.float32
+        ),
+        candidate_support_view_probabilities=np.zeros(
+            (1, 1, 1), dtype=np.float32
+        ),
+        candidate_spatial_valid_mask=np.zeros((1, 1, 1), dtype=bool),
+    )
+    verifier = IndependentLandmarkPoseVerifier(
+        bank,
+        views,
+        IndependentLandmarkPoseLikelihoodConfig(
+            candidate_mode="fixed_global_topl",
+            fixed_candidate_prior_source="learned_probability",
+        ),
+    )
+
+    baseline_score = verifier.score_pose(np.eye(4), _camera(), baseline)
+    no_modes_score = verifier.score_pose(np.eye(4), _camera(), no_modes)
+
+    assert np.array_equal(no_modes_score.point_evidence, baseline_score.point_evidence)
+    assert no_modes_score.log_likelihood_mean == baseline_score.log_likelihood_mean
+
+
 def test_fixed_candidate_fold_does_not_renormalize_removed_identity_mass() -> None:
     bank = LandmarkMapIndex(
         track_ids=np.asarray([7, 8], dtype=np.int64),

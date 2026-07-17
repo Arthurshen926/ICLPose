@@ -106,6 +106,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--maplet_support_index", required=True)
     parser.add_argument("--feature_artifact", required=True)
     parser.add_argument("--radio_intermediate_cache", default=None)
+    parser.add_argument("--radio_final_context_cache", default=None)
     parser.add_argument("--colmap_model_dir", required=True)
     parser.add_argument("--output_dir", required=True)
     parser.add_argument(
@@ -608,6 +609,11 @@ def _candidate_data_manifest(
                 if args.radio_intermediate_cache is None
                 else file_sha256_short(Path(args.radio_intermediate_cache))
             ),
+            "radio_final_context_cache_sha256": (
+                None
+                if args.radio_final_context_cache is None
+                else file_sha256_short(Path(args.radio_final_context_cache))
+            ),
             "query_input_dim": int(store.query_input_dim),
             "support_input_dim": int(store.support_input_dim),
             "static_input_dim": int(store.static_input_dim),
@@ -636,6 +642,7 @@ _SYSTEM_HARD_SCORE_MANIFEST_KEYS = (
     "query_split_manifest_sha256",
     "global_assignment_baseline_summary_sha256",
     "radio_intermediate_cache_sha256",
+    "radio_final_context_cache_sha256",
     "query_input_dim",
     "support_input_dim",
     "static_input_dim",
@@ -2908,6 +2915,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             if args.radio_intermediate_cache is None
             else Path(args.radio_intermediate_cache)
         ),
+        radio_final_context_cache=(
+            None
+            if args.radio_final_context_cache is None
+            else Path(args.radio_final_context_cache)
+        ),
         query_radius_px=float(args.query_radius_px),
         max_query_nodes=int(args.max_query_nodes),
         max_support_tracks=int(args.max_support_tracks),
@@ -4368,6 +4380,19 @@ def main(argv: Sequence[str] | None = None) -> None:
             "anchor_positive_threshold_px": float(args.positive_threshold_px),
             "context_assignment_threshold_px": float(args.assignment_threshold_px),
             "support_view_count": int(args.support_view_count),
+            "multiscale_absolute_evidence": {
+                "alike_fpn_local": True,
+                "radio_intermediate_local": bool(
+                    args.radio_intermediate_cache is not None
+                ),
+                "radio_final_summary_global_grid4": bool(
+                    args.radio_final_context_cache is not None
+                ),
+                "candidate_specific": True,
+                "support_views_preserved": bool(
+                    args.candidate_view_marginalization
+                ),
+            },
             "support_view_aggregation": (
                 "identity_conditioned_posterior_logsumexp_full_view_mixture"
                 if bool(args.identity_conditioned_view_posterior)
