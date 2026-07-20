@@ -24,7 +24,7 @@ from feature_extract.vfm.render_pose_diagnostics import project_world_to_image
 
 
 INDEPENDENT_LANDMARK_POSE_LIKELIHOOD_VERSION = (
-    "independent_landmark_pose_likelihood_v2"
+    "independent_landmark_pose_likelihood_v5"
 )
 
 
@@ -33,6 +33,168 @@ def _normalize_rows(values: np.ndarray) -> np.ndarray:
     if matrix.ndim != 2:
         raise ValueError("descriptor arrays must have shape (N, C)")
     return matrix / np.maximum(np.linalg.norm(matrix, axis=1, keepdims=True), 1e-6)
+
+
+def _logsumexp_last_axis(values: np.ndarray) -> np.ndarray:
+    """Numerically stable log-sum-exp that also handles all--inf rows."""
+
+    array = np.asarray(values, dtype=np.float64)
+    maximum = np.max(array, axis=-1, keepdims=True)
+    finite = np.isfinite(maximum)
+    with np.errstate(invalid="ignore", over="ignore", under="ignore"):
+        shifted = np.where(finite, array - maximum, -np.inf)
+        total = np.sum(np.exp(shifted), axis=-1)
+    return np.where(
+        finite[..., 0],
+        maximum[..., 0] + np.log(np.maximum(total, 1e-300)),
+        -np.inf,
+    )
+
+
+def _regular_offset_grid_axes(offsets_xy: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Validate the canonical offset-grid ordering and return its axes."""
+
+    offsets = np.asarray(offsets_xy, dtype=np.float64).reshape(-1, 2)
+    if len(offsets) == 0 or np.any(~np.isfinite(offsets)):
+        raise ValueError("spatial offsets must be a non-empty finite (K, 2) array")
+    x_values = np.unique(offsets[:, 0])
+    y_values = np.unique(offsets[:, 1])
+    if len(x_values) * len(y_values) != len(offsets):
+        raise ValueError("candidate spatial offsets must form a complete grid")
+    for values in (x_values, y_values):
+        if len(values) <= 1:
+            continue
+        differences = np.diff(values)
+        step = float(np.median(differences))
+        if (
+            not np.isfinite(step)
+            or step <= 0.0
+            or not np.allclose(differences, step, rtol=0.0, atol=1e-6)
+        ):
+            raise ValueError("candidate spatial offsets must use a regular grid")
+    expected = np.stack(np.meshgrid(x_values, y_values), axis=-1).reshape(-1, 2)
+    if not np.allclose(offsets, expected, rtol=0.0, atol=1e-6):
+        raise ValueError("candidate spatial offsets use unexpected ordering")
+    return x_values, y_values
+
+
+def _regular_offset_grid_background_density(offsets_xy: np.ndarray) -> float:
+    """Return the uniform density over the categorical offset-grid support.
+
+    The RGB head predicts a categorical distribution on grid-cell centres.  Its
+    dustbin represents the complementary unknown event, so its neutral density
+    must not vary with the pose.  Extending each regular grid by half a cell on
+    both sides makes that density invariant to the grid resolution.
+    """
+
+    axes = _regular_offset_grid_axes(offsets_xy)
+    widths: list[float] = []
+    for values in axes:
+        if len(values) == 1:
+            widths.append(1.0)
+            continue
+        differences = np.diff(values)
+        step = float(np.median(differences))
+        if (
+            not np.isfinite(step)
+            or step <= 0.0
+            or not np.allclose(differences, step, rtol=0.0, atol=1e-6)
+        ):
+            raise ValueError("candidate spatial offsets must use a regular grid")
+        widths.append(float(values[-1] - values[0] + step))
+    area = float(widths[0] * widths[1])
+    if not np.isfinite(area) or area <= 0.0:
+        raise ValueError("candidate spatial offset support must have positive area")
+    return 1.0 / area
+
+
+def _normalized_spatial_mixture_density_from_regular_grid(
+    *,
+    delta_xy: np.ndarray,
+    probability_grids: np.ndarray,
+    x_values: np.ndarray,
+    y_values: np.ndarray,
+    sigma_px: float,
+) -> np.ndarray:
+    """Exactly evaluate normalized Gaussian mixtures using their separability.
+
+    This is algebraically identical to exponentiating the log-sum-exp mixture,
+    but evaluates only active candidate/view pairs and avoids constructing an
+    ``(N, L, V, K)`` temporary for every pose.  The posterior itself is still
+    normalized in log space before this contraction.
+    """
+
+    delta = np.asarray(delta_xy, dtype=np.float32).reshape(-1, 2)
+    grids = np.asarray(probability_grids, dtype=np.float32)
+    x_axis = np.asarray(x_values, dtype=np.float32).reshape(-1)
+    y_axis = np.asarray(y_values, dtype=np.float32).reshape(-1)
+    if grids.shape != (len(delta), len(y_axis), len(x_axis)):
+        raise ValueError("spatial probability grids and deltas are not aligned")
+    if np.any(~np.isfinite(grids)) or np.any(grids < 0.0):
+        raise ValueError("spatial probability grids must be finite and non-negative")
+    sigma = float(sigma_px)
+    if not np.isfinite(sigma) or sigma <= 0.0:
+        raise ValueError("spatial mixture sigma must be positive")
+    sigma32 = np.float32(sigma)
+    kernel_x = np.exp(
+        -0.5 * np.square((delta[:, :1] - x_axis[None, :]) / sigma32)
+    )
+    kernel_y = np.exp(
+        -0.5 * np.square((delta[:, 1:] - y_axis[None, :]) / sigma32)
+    )
+    density = np.einsum(
+        "qy,qyx,qx->q", kernel_y, grids, kernel_x, optimize=True
+    )
+    return np.asarray(density, dtype=np.float64) / (2.0 * np.pi * sigma * sigma)
+
+
+def _normalized_spatial_mixture_log_density(
+    *,
+    delta_xy: np.ndarray,
+    offsets_xy: np.ndarray,
+    log_probabilities: np.ndarray,
+    sigma_px: float,
+) -> np.ndarray:
+    """Evaluate a categorical offset posterior as a continuous Gaussian mixture.
+
+    ``log_probabilities`` has shape ``(N, L, V, K)`` and the returned density
+    has shape ``(N, L, V)``.  Every mode is a unit-integral 2D Gaussian.  This
+    deliberately avoids the former Gaussian-filter/interpolation/clip path:
+    it evaluates the normalized mixture itself using log-sum-exp.
+    """
+
+    delta = np.asarray(delta_xy, dtype=np.float64)
+    offsets = np.asarray(offsets_xy, dtype=np.float64).reshape(-1, 2)
+    log_map = np.asarray(log_probabilities, dtype=np.float64)
+    if delta.ndim != 3 or delta.shape[2] != 2:
+        raise ValueError("spatial deltas must have shape (N, L, 2)")
+    if (
+        log_map.ndim != 4
+        or log_map.shape[:2] != delta.shape[:2]
+        or log_map.shape[3] != len(offsets)
+    ):
+        raise ValueError("spatial mode probabilities and deltas are not aligned")
+    sigma = float(sigma_px)
+    if not np.isfinite(sigma) or sigma <= 0.0:
+        raise ValueError("spatial mixture sigma must be positive")
+
+    # Invalid mode rows are represented by all -inf and remain -inf here.
+    mode_log_normalizer = _logsumexp_last_axis(log_map)
+    valid_mode_rows = np.isfinite(mode_log_normalizer)
+    with np.errstate(invalid="ignore"):
+        normalized_log_map = np.where(
+            valid_mode_rows[..., None],
+            log_map - mode_log_normalizer[..., None],
+            -np.inf,
+        )
+    displacement = delta[:, :, None, :] - offsets[None, None, :, :]
+    log_gaussian = (
+        -np.log(2.0 * np.pi * sigma * sigma)
+        - 0.5 * np.sum(np.square(displacement / sigma), axis=-1)
+    )
+    return _logsumexp_last_axis(
+        normalized_log_map + log_gaussian[:, :, None, :]
+    )
 
 
 @dataclass(frozen=True)
@@ -629,6 +791,11 @@ class IndependentLandmarkPoseLikelihoodConfig:
     kdtree_workers: int = 1
     candidate_mode: str = "pose_local_knn"
     fixed_candidate_prior_source: str = "prototype_similarity"
+    candidate_spatial_semantics: str = (
+        "normalized_gaussian_mixture_relative_to_uniform_grid_null_v1"
+    )
+    candidate_spatial_null_density: float | None = None
+    candidate_spatial_ineligible_likelihood_ratio: float = 0.0
 
     def __post_init__(self) -> None:
         if int(self.nearest_landmarks) <= 0:
@@ -658,6 +825,24 @@ class IndependentLandmarkPoseLikelihoodConfig:
             "learned_probability",
         }:
             raise ValueError("unsupported fixed candidate prior source")
+        if str(self.candidate_spatial_semantics) != (
+            "normalized_gaussian_mixture_relative_to_uniform_grid_null_v1"
+        ):
+            raise ValueError("unsupported candidate spatial likelihood semantics")
+        if self.candidate_spatial_null_density is not None and (
+            not np.isfinite(float(self.candidate_spatial_null_density))
+            or float(self.candidate_spatial_null_density) <= 0.0
+        ):
+            raise ValueError("candidate spatial null density must be positive")
+        if (
+            not np.isfinite(
+                float(self.candidate_spatial_ineligible_likelihood_ratio)
+            )
+            or float(self.candidate_spatial_ineligible_likelihood_ratio) < 0.0
+        ):
+            raise ValueError(
+                "candidate spatial ineligible likelihood ratio must be non-negative"
+            )
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -679,7 +864,56 @@ class IndependentLandmarkPoseLikelihoodConfig:
             "fixed_candidate_prior_source": str(
                 self.fixed_candidate_prior_source
             ),
+            "candidate_spatial_semantics": str(
+                self.candidate_spatial_semantics
+            ),
+            "candidate_spatial_null_density": (
+                None
+                if self.candidate_spatial_null_density is None
+                else float(self.candidate_spatial_null_density)
+            ),
+            "candidate_spatial_ineligible_likelihood_ratio": float(
+                self.candidate_spatial_ineligible_likelihood_ratio
+            ),
         }
+
+
+@dataclass(frozen=True)
+class FixedCandidateUniqueTrackAssignmentDiagnostic:
+    """Pose-conditioned, one-to-one diagnostic over frozen RGB candidates.
+
+    This is intentionally not part of the default independent likelihood.  It
+    asks whether the candidate-specific RGB evidence supports a globally
+    consistent explanation in which one physical SfM track is used by at most
+    one held-out query point.  Null remains available independently for every
+    point, so absent, dustbin, and cross-fit-removed evidence cannot be
+    converted into a forced correspondence.
+    """
+
+    log_joint: float
+    log_gain_over_null: float
+    independent_log_joint: float
+    independent_log_gain_over_null: float
+    collision_penalty: float
+    verification_point_count: int
+    active_point_count: int
+    eligible_edge_count: int
+    selected_candidate_count: int
+    selected_unique_track_count: int
+    selected_candidate_columns: np.ndarray
+
+
+@dataclass(frozen=True)
+class _FixedCandidateSpatialEvidence:
+    """Per-candidate terms shared by mixture and assignment diagnostics."""
+
+    point_ratio: np.ndarray
+    candidate_ratio: np.ndarray
+    candidate_priors: np.ndarray
+    null_probabilities: np.ndarray
+    bank_rows: np.ndarray
+    pose_visible: np.ndarray
+    active_visual_mass: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -697,6 +931,7 @@ class IndependentLandmarkPoseLikelihoodScore:
     projected_landmark_count: int
     view_eligible_landmark_count: int
     point_evidence: np.ndarray
+    unique_track_assignment: FixedCandidateUniqueTrackAssignmentDiagnostic | None = None
 
     def statistic(self, name: str) -> float:
         fields = {
@@ -1147,6 +1382,221 @@ class IndependentLandmarkPoseVerifier:
         np.add.at(evidence, candidate_points, candidate_evidence)
         return np.clip(evidence, 0.0, 1.0)
 
+    def _fixed_candidate_spatial_evidence_components(
+        self,
+        projected: np.ndarray,
+        pose_eligible: np.ndarray,
+        projected_row_indices: np.ndarray,
+        points: IndependentVerificationPoints,
+        eligible_landmark_mask: np.ndarray | None,
+    ) -> _FixedCandidateSpatialEvidence:
+        """Evaluate immutable per-candidate RGB terms at projections.
+
+        The local RGB head is a categorical distribution over offsets plus a
+        dustbin.  A dustbin or an unmaterialized support view means *unknown*,
+        not a centre-aligned geometric match: both contribute the fixed uniform
+        null density.  Only a non-dustbin RGB mode is allowed to depend on the
+        candidate projection.
+        """
+
+        if (
+            points.candidate_spatial_log_probabilities is None
+            or points.candidate_spatial_offsets_xy is None
+            or points.candidate_spatial_valid_mask is None
+            or points.candidate_support_view_probabilities is None
+            or points.candidate_spatial_dustbin_probabilities is None
+            or points.candidate_null_probabilities is None
+        ):
+            raise ValueError(
+                "candidate spatial scoring requires modes and explicit null mass"
+            )
+        mask_key = 0 if eligible_landmark_mask is None else id(eligible_landmark_mask)
+        cache_key = (id(points), mask_key)
+        cached = self._fixed_candidate_spatial_cache.get(cache_key)
+        if (
+            cached is None
+            or cached[0] is not points
+            or cached[1] is not eligible_landmark_mask
+        ):
+            prepared = self._prepare_fixed_candidates(points, eligible_landmark_mask)
+            candidate_shape = np.asarray(points.candidate_track_ids).shape
+            bank_rows = np.full(candidate_shape, -1, dtype=np.int64)
+            priors = np.zeros(candidate_shape, dtype=np.float64)
+            for point_index, candidates in enumerate(prepared):
+                for candidate_column, candidate in enumerate(candidates):
+                    rows = np.asarray(candidate[1], dtype=np.int64).reshape(-1)
+                    # Keep the frozen posterior even if cross-fitting removes
+                    # this track from the bank; its mass is then neutral rather
+                    # than silently renormalized onto remaining candidates.
+                    priors[point_index, candidate_column] = float(candidate[4])
+                    if rows.size:
+                        bank_rows[point_index, candidate_column] = int(rows[0])
+
+            offsets = np.asarray(points.candidate_spatial_offsets_xy, dtype=np.float64)
+            x_values, y_values = _regular_offset_grid_axes(offsets)
+            grid_null_density = _regular_offset_grid_background_density(offsets)
+            null_density = (
+                grid_null_density
+                if self.config.candidate_spatial_null_density is None
+                else float(self.config.candidate_spatial_null_density)
+            )
+            valid_views = np.asarray(points.candidate_spatial_valid_mask, dtype=bool)
+            raw_log_maps = np.asarray(
+                points.candidate_spatial_log_probabilities, dtype=np.float64
+            )
+            # Invalid cells in artifacts are allowed to contain placeholders.
+            # Normalize only valid rows, then mark invalid rows as -inf so the
+            # mixture cannot accidentally use them.
+            safe_log_maps = np.where(valid_views[..., None], raw_log_maps, 0.0)
+            normalized_log_maps = (
+                safe_log_maps
+                - _logsumexp_last_axis(safe_log_maps)[..., None]
+            )
+            normalized_log_maps = np.where(
+                valid_views[..., None], normalized_log_maps, -np.inf
+            )
+            probability_grids = np.exp(normalized_log_maps).astype(
+                np.float32, copy=False
+            ).reshape(
+                *normalized_log_maps.shape[:3], len(y_values), len(x_values)
+            )
+            vectors = (
+                bank_rows,
+                priors,
+                x_values.astype(np.float32, copy=False),
+                y_values.astype(np.float32, copy=False),
+                probability_grids,
+                float(null_density),
+            )
+            cached = (points, eligible_landmark_mask, vectors)
+            self._fixed_candidate_spatial_cache[cache_key] = cached
+        (
+            bank_rows,
+            priors,
+            x_values,
+            y_values,
+            probability_grids,
+            null_density,
+        ) = cached[2]
+
+        null_mass = np.asarray(
+            points.candidate_null_probabilities, dtype=np.float64
+        ).reshape(-1)
+        if null_mass.shape != (len(points),):
+            raise ValueError("candidate spatial null mass is not point-aligned")
+        if np.any(np.abs(np.sum(priors, axis=1) + null_mass - 1.0) > 2e-4):
+            raise ValueError("candidate spatial posterior mass is not conserved")
+        if len(projected_row_indices) == 0:
+            # All frozen candidate mass is unavailable after the fit-track
+            # exclusion.  It is unknown evidence, hence an exact neutral ratio.
+            return _FixedCandidateSpatialEvidence(
+                point_ratio=np.ones((len(points),), dtype=np.float64),
+                candidate_ratio=np.ones_like(priors, dtype=np.float64),
+                candidate_priors=np.asarray(priors, dtype=np.float64),
+                null_probabilities=np.asarray(null_mass, dtype=np.float64),
+                bank_rows=np.asarray(bank_rows, dtype=np.int64),
+                pose_visible=np.zeros_like(bank_rows, dtype=bool),
+                active_visual_mass=np.zeros_like(priors, dtype=np.float64),
+            )
+
+        projected_rows = np.asarray(projected_row_indices, dtype=np.int64).reshape(-1)
+        safe_rows = np.maximum(bank_rows, 0)
+        local = np.searchsorted(projected_rows, safe_rows)
+        complete = (bank_rows >= 0) & (local < len(projected_rows))
+        complete_flat = complete.reshape(-1)
+        local_flat = local.reshape(-1)
+        safe_rows_flat = safe_rows.reshape(-1)
+        valid_local = np.flatnonzero(complete_flat)
+        if valid_local.size:
+            complete_flat[valid_local] &= (
+                projected_rows[local_flat[valid_local]]
+                == safe_rows_flat[valid_local]
+            )
+        safe_local = np.minimum(local, len(projected_rows) - 1)
+        visible = complete & pose_eligible[safe_local]
+        projected_xy = projected[safe_local]
+        delta = projected_xy - points.xy[:, None, :]
+
+        valid_views = np.asarray(points.candidate_spatial_valid_mask, dtype=bool)
+        # A view can only contribute pose-dependent negative evidence through
+        # its non-dustbin spatial mode.  Missing views, dropped cross-fit
+        # tracks, and dustbin mass are all explicit unknown/null terms, so
+        # they must stay at ratio one even when this pose cannot project the
+        # corresponding 3D landmark.  Initialising only materialized modes to
+        # the geometric ineligible ratio enforces that separation.
+        mode_ratio = np.ones(valid_views.shape, dtype=np.float64)
+        materialized_bank_views = valid_views & (bank_rows >= 0)[..., None]
+        mode_ratio[materialized_bank_views] = float(
+            self.config.candidate_spatial_ineligible_likelihood_ratio
+        )
+        active_point, active_candidate, active_view = np.nonzero(
+            visible[:, :, None] & valid_views
+        )
+        if len(active_point):
+            density = _normalized_spatial_mixture_density_from_regular_grid(
+                delta_xy=delta[active_point, active_candidate],
+                probability_grids=probability_grids[
+                    active_point, active_candidate, active_view
+                ],
+                x_values=x_values,
+                y_values=y_values,
+                sigma_px=float(self.config.spatial_sigma_px),
+            )
+            mode_ratio[active_point, active_candidate, active_view] = (
+                density / float(null_density)
+            )
+        view_weight = np.where(
+            valid_views,
+            np.asarray(
+                points.candidate_support_view_probabilities, dtype=np.float64
+            ),
+            0.0,
+        )
+        available_mass = np.sum(view_weight, axis=2)
+        if np.any(available_mass > 1.0 + 2e-5):
+            raise ValueError("candidate spatial support-view mass exceeds one")
+        dustbin = np.asarray(
+            points.candidate_spatial_dustbin_probabilities, dtype=np.float64
+        )
+        local_ratio = dustbin + (1.0 - dustbin) * mode_ratio
+        candidate_ratio = (1.0 - available_mass) + np.sum(
+            view_weight * local_ratio, axis=2
+        )
+        # Tracks removed by cross-fitting have no bank row and must not become
+        # negative evidence.  They retain their frozen mass as a null term.
+        # For in-bank tracks, a non-visible *mode* has already received the
+        # configured ineligible ratio above; its dustbin and missing-view mass
+        # remain neutral in ``candidate_ratio``.
+        candidate_ratio = np.where(
+            bank_rows >= 0,
+            candidate_ratio,
+            1.0,
+        )
+        point_ratio = null_mass + np.sum(priors * candidate_ratio, axis=1)
+        if np.any(~np.isfinite(point_ratio)) or np.any(point_ratio < 0.0):
+            raise RuntimeError("candidate spatial likelihood ratio is invalid")
+        # This mass is intentionally independent of the pose.  It identifies
+        # whether an RGB mode can ever provide geometric evidence; dustbin and
+        # missing view mass remain unknown/null and must never become an edge
+        # in the unique-track assignment diagnostic.
+        active_visual_mass = np.sum(view_weight * (1.0 - dustbin), axis=2)
+        if (
+            np.any(~np.isfinite(candidate_ratio))
+            or np.any(candidate_ratio < 0.0)
+            or np.any(~np.isfinite(active_visual_mass))
+            or np.any(active_visual_mass < 0.0)
+        ):
+            raise RuntimeError("candidate spatial likelihood components are invalid")
+        return _FixedCandidateSpatialEvidence(
+            point_ratio=np.asarray(point_ratio, dtype=np.float64),
+            candidate_ratio=np.asarray(candidate_ratio, dtype=np.float64),
+            candidate_priors=np.asarray(priors, dtype=np.float64),
+            null_probabilities=np.asarray(null_mass, dtype=np.float64),
+            bank_rows=np.asarray(bank_rows, dtype=np.int64),
+            pose_visible=np.asarray(visible, dtype=bool),
+            active_visual_mass=np.asarray(active_visual_mass, dtype=np.float64),
+        )
+
     def _fixed_candidate_spatial_point_evidence(
         self,
         projected: np.ndarray,
@@ -1155,134 +1605,121 @@ class IndependentLandmarkPoseVerifier:
         points: IndependentVerificationPoints,
         eligible_landmark_mask: np.ndarray | None,
     ) -> np.ndarray:
-        """Evaluate immutable per-view RGB modes at candidate projections."""
+        """Return the original fixed-candidate RGB mixture likelihood ratio."""
 
-        if points.candidate_spatial_log_probabilities is None:
-            raise ValueError("candidate spatial modes are unavailable")
-        mask_key = 0 if eligible_landmark_mask is None else id(eligible_landmark_mask)
-        cache_key = (id(points), mask_key)
-        cached = self._fixed_candidate_spatial_cache.get(cache_key)
-        if cached is None or cached[0] is not points or cached[1] is not eligible_landmark_mask:
-            from scipy.ndimage import gaussian_filter
+        return self._fixed_candidate_spatial_evidence_components(
+            projected,
+            pose_eligible,
+            projected_row_indices,
+            points,
+            eligible_landmark_mask,
+        ).point_ratio
 
-            prepared = self._prepare_fixed_candidates(points, eligible_landmark_mask)
-            candidate_shape = np.asarray(points.candidate_track_ids).shape
-            bank_rows = np.full(candidate_shape, -1, dtype=np.int64)
-            priors = np.zeros(candidate_shape, dtype=np.float64)
-            for point_index, candidates in enumerate(prepared):
-                for candidate_column, candidate in enumerate(candidates):
-                    rows = np.asarray(candidate[1], dtype=np.int64).reshape(-1)
-                    if rows.size:
-                        bank_rows[point_index, candidate_column] = int(rows[0])
-                        priors[point_index, candidate_column] = float(candidate[4])
+    def _fixed_candidate_unique_track_assignment_diagnostic(
+        self,
+        components: _FixedCandidateSpatialEvidence,
+        points: IndependentVerificationPoints,
+        *,
+        null_probability_floor: float,
+        minimum_active_visual_mass: float,
+    ) -> FixedCandidateUniqueTrackAssignmentDiagnostic:
+        """Maximise a fixed-candidate null-or-unique-track RGB explanation.
 
-            offsets = np.asarray(points.candidate_spatial_offsets_xy, dtype=np.float64)
-            x_values = np.unique(offsets[:, 0])
-            y_values = np.unique(offsets[:, 1])
-            if len(x_values) * len(y_values) != len(offsets):
-                raise ValueError("candidate spatial offsets are not a complete grid")
-            expected = np.stack(np.meshgrid(x_values, y_values), axis=-1).reshape(-1, 2)
-            if not np.allclose(offsets, expected, rtol=0.0, atol=1e-6):
-                raise ValueError("candidate spatial offsets use unexpected ordering")
-            step_x = float(np.diff(x_values)[0]) if len(x_values) > 1 else 1.0
-            step_y = float(np.diff(y_values)[0]) if len(y_values) > 1 else 1.0
-            log_maps = np.asarray(
-                points.candidate_spatial_log_probabilities, dtype=np.float32
+        The assignment is a diagnostic only: it consumes exactly the frozen
+        candidate posterior and per-view RGB likelihood that the mixture path
+        already used.  A candidate becomes eligible only when it is projected
+        by the tested pose and has non-dustbin materialized RGB mass.  This
+        prevents a static identity prior, a missing support view, or a dustbin
+        from manufacturing a pose-dependent correspondence.
+        """
+
+        if points.candidate_track_ids is None:
+            raise ValueError("unique-track diagnostic requires fixed candidates")
+        null_floor = float(null_probability_floor)
+        active_floor = float(minimum_active_visual_mass)
+        if not np.isfinite(null_floor) or not 0.0 < null_floor <= 1.0:
+            raise ValueError("unique-track null probability floor must be in (0, 1]")
+        if not np.isfinite(active_floor) or active_floor < 0.0:
+            raise ValueError("unique-track active visual mass floor must be non-negative")
+
+        from feature_extract.vfm.localization.pose_safe_selection import (
+            resolve_global_query_track_assignment,
+        )
+
+        tracks = np.asarray(points.candidate_track_ids, dtype=np.int64)
+        priors = np.asarray(components.candidate_priors, dtype=np.float64)
+        ratios = np.asarray(components.candidate_ratio, dtype=np.float64)
+        null_probabilities = np.asarray(
+            components.null_probabilities, dtype=np.float64
+        ).reshape(-1)
+        if (
+            tracks.shape != priors.shape
+            or tracks.shape != ratios.shape
+            or components.pose_visible.shape != tracks.shape
+            or components.active_visual_mass.shape != tracks.shape
+            or null_probabilities.shape != (len(points),)
+        ):
+            raise ValueError("unique-track diagnostic components are not aligned")
+
+        with np.errstate(divide="ignore", invalid="ignore"):
+            candidate_log_weights = np.log(priors) + np.log(ratios)
+        null_log_weights = np.log(np.maximum(null_probabilities, null_floor))
+        eligible = (
+            (tracks >= 0)
+            & (np.asarray(components.bank_rows, dtype=np.int64) >= 0)
+            & np.asarray(components.pose_visible, dtype=bool)
+            & (
+                np.asarray(components.active_visual_mass, dtype=np.float64)
+                > active_floor
             )
-            valid_views = np.asarray(points.candidate_spatial_valid_mask, dtype=bool)
-            surfaces = np.zeros(log_maps.shape[:3] + (len(y_values), len(x_values)), dtype=np.float32)
-            gaussian_sigma = (
-                float(self.config.spatial_sigma_px) / step_y,
-                float(self.config.spatial_sigma_px) / step_x,
-            )
-            kernel_mass = float(2.0 * np.pi * gaussian_sigma[0] * gaussian_sigma[1])
-            for point_index, candidate_column, view in np.argwhere(valid_views).tolist():
-                logits = log_maps[point_index, candidate_column, view].astype(np.float64)
-                logits -= float(np.max(logits))
-                probability = np.exp(logits)
-                probability /= max(float(np.sum(probability)), 1e-12)
-                filtered = gaussian_filter(
-                    probability.reshape(len(y_values), len(x_values)),
-                    sigma=gaussian_sigma,
-                    mode="constant",
-                    cval=0.0,
-                )
-                surfaces[point_index, candidate_column, view] = np.clip(
-                    filtered * kernel_mass, 0.0, 1.0
-                )
-            vectors = (
-                bank_rows,
-                priors,
-                surfaces,
-                x_values,
-                y_values,
-                step_x,
-                step_y,
-            )
-            cached = (points, eligible_landmark_mask, vectors)
-            self._fixed_candidate_spatial_cache[cache_key] = cached
-        bank_rows, priors, surfaces, x_values, y_values, step_x, step_y = cached[2]
+            & np.isfinite(candidate_log_weights)
+        )
+        candidate_log_weights = np.where(
+            eligible, candidate_log_weights, -np.inf
+        )
+        selected_columns = resolve_global_query_track_assignment(
+            tracks,
+            candidate_log_weights,
+            valid_mask=eligible,
+            dustbin_score=null_log_weights,
+        )
+        selected_log_weights = null_log_weights.copy()
+        selected_mask = selected_columns >= 0
+        if np.any(selected_mask):
+            selected_rows = np.flatnonzero(selected_mask)
+            selected_log_weights[selected_rows] = candidate_log_weights[
+                selected_rows, selected_columns[selected_rows]
+            ]
 
-        projected_rows = np.asarray(projected_row_indices, dtype=np.int64).reshape(-1)
-        safe_rows = np.maximum(bank_rows, 0)
-        local = np.searchsorted(projected_rows, safe_rows)
-        complete = (bank_rows >= 0) & (local < len(projected_rows))
-        valid_local = np.flatnonzero(complete.reshape(-1))
-        if valid_local.size:
-            complete.reshape(-1)[valid_local] &= (
-                projected_rows[local.reshape(-1)[valid_local]]
-                == safe_rows.reshape(-1)[valid_local]
-            )
-        safe_local = np.minimum(local, max(len(projected_rows) - 1, 0))
-        visible = complete & pose_eligible[safe_local]
-        projected_xy = projected[safe_local]
-        delta = projected_xy - points.xy[:, None, :]
-        sigma = float(self.config.spatial_sigma_px)
-        base = np.exp(-0.5 * np.sum(np.square(delta / sigma), axis=2))
-        base = np.where(visible, base, 0.0)
-
-        x = (delta[:, :, 0] - float(x_values[0])) / float(step_x)
-        y = (delta[:, :, 1] - float(y_values[0])) / float(step_y)
-        inside = visible & (x >= 0.0) & (x <= len(x_values) - 1) & (y >= 0.0) & (y <= len(y_values) - 1)
-        x0 = np.clip(np.floor(x).astype(np.int64), 0, len(x_values) - 1)
-        y0 = np.clip(np.floor(y).astype(np.int64), 0, len(y_values) - 1)
-        x1 = np.minimum(x0 + 1, len(x_values) - 1)
-        y1 = np.minimum(y0 + 1, len(y_values) - 1)
-        wx = x - x0
-        wy = y - y0
-        view_count = surfaces.shape[2]
-        point_grid = np.arange(len(points), dtype=np.int64)[:, None, None]
-        candidate_grid = np.arange(bank_rows.shape[1], dtype=np.int64)[None, :, None]
-        view_grid = np.arange(view_count, dtype=np.int64)[None, None, :]
-        mode = (
-            surfaces[point_grid, candidate_grid, view_grid, y0[:, :, None], x0[:, :, None]]
-            * (1.0 - wx[:, :, None]) * (1.0 - wy[:, :, None])
-            + surfaces[point_grid, candidate_grid, view_grid, y0[:, :, None], x1[:, :, None]]
-            * wx[:, :, None] * (1.0 - wy[:, :, None])
-            + surfaces[point_grid, candidate_grid, view_grid, y1[:, :, None], x0[:, :, None]]
-            * (1.0 - wx[:, :, None]) * wy[:, :, None]
-            + surfaces[point_grid, candidate_grid, view_grid, y1[:, :, None], x1[:, :, None]]
-            * wx[:, :, None] * wy[:, :, None]
+        independent_log_weights = np.maximum(
+            null_log_weights,
+            np.max(candidate_log_weights, axis=1),
         )
-        mode *= inside[:, :, None]
-        valid_views = np.asarray(points.candidate_spatial_valid_mask, dtype=bool)
-        view_weight = np.where(
-            valid_views,
-            np.asarray(points.candidate_support_view_probabilities, dtype=np.float64),
-            0.0,
+        null_log_joint = float(np.sum(null_log_weights))
+        log_joint = float(np.sum(selected_log_weights))
+        independent_log_joint = float(np.sum(independent_log_weights))
+        collision_penalty = float(independent_log_joint - log_joint)
+        if collision_penalty < -1e-8:
+            raise RuntimeError("unique-track assignment is worse than its independent optimum")
+        collision_penalty = max(collision_penalty, 0.0)
+        selected_tracks = tracks[np.flatnonzero(selected_mask), selected_columns[selected_mask]]
+        if len(selected_tracks) != len(np.unique(selected_tracks)):
+            raise RuntimeError("unique-track assignment selected duplicate physical tracks")
+        return FixedCandidateUniqueTrackAssignmentDiagnostic(
+            log_joint=log_joint,
+            log_gain_over_null=float(log_joint - null_log_joint),
+            independent_log_joint=independent_log_joint,
+            independent_log_gain_over_null=float(
+                independent_log_joint - null_log_joint
+            ),
+            collision_penalty=collision_penalty,
+            verification_point_count=int(len(points)),
+            active_point_count=int(np.count_nonzero(np.any(eligible, axis=1))),
+            eligible_edge_count=int(np.count_nonzero(eligible)),
+            selected_candidate_count=int(np.count_nonzero(selected_mask)),
+            selected_unique_track_count=int(len(np.unique(selected_tracks))),
+            selected_candidate_columns=np.asarray(selected_columns, dtype=np.int64),
         )
-        reliability = 1.0 - np.asarray(
-            points.candidate_spatial_dustbin_probabilities, dtype=np.float64
-        )
-        local_evidence = (
-            (1.0 - reliability) * base[:, :, None] + reliability * mode
-        )
-        available_mass = np.clip(np.sum(view_weight, axis=2), 0.0, 1.0)
-        candidate_evidence = (
-            (1.0 - available_mass) * base
-            + np.sum(view_weight * local_evidence, axis=2)
-        )
-        return np.clip(np.sum(priors * candidate_evidence, axis=1), 0.0, 1.0)
 
     def _fixed_candidate_vectors(
         self,
@@ -1739,9 +2176,14 @@ class IndependentLandmarkPoseVerifier:
         points: IndependentVerificationPoints,
         *,
         eligible_landmark_mask: np.ndarray | None = None,
+        emit_unique_track_assignment_diagnostic: bool = False,
+        unique_track_assignment_null_probability_floor: float = 1e-12,
+        unique_track_assignment_minimum_active_visual_mass: float = 1e-6,
     ) -> IndependentLandmarkPoseLikelihoodScore:
         if points.descriptors.shape[1] != self._features.shape[1]:
             raise ValueError("query and landmark descriptor dimensions differ")
+        spatial_likelihood_ratio = False
+        unique_track_assignment: FixedCandidateUniqueTrackAssignmentDiagnostic | None = None
         if str(self.config.candidate_mode) == "fixed_global_topl":
             projected, eligible, candidate_rows = (
                 self._projected_fixed_candidate_landmarks(
@@ -1751,12 +2193,36 @@ class IndependentLandmarkPoseVerifier:
                     eligible_landmark_mask,
                 )
             )
-            has_candidate_spatial_evidence = (
-                points.candidate_spatial_log_probabilities is not None
-                and points.candidate_spatial_valid_mask is not None
-                and bool(np.any(points.candidate_spatial_valid_mask))
+            # The presence of a spatial artifact changes the likelihood
+            # contract even when this particular query has no materialized
+            # RGB modes.  In that case the spatial scorer returns a neutral
+            # unknown likelihood; falling back to the legacy centre Gaussian
+            # would make missing RGB evidence pose-dependent again.
+            spatial_map_fields = (
+                points.candidate_spatial_log_probabilities,
+                points.candidate_spatial_offsets_xy,
+                points.candidate_spatial_valid_mask,
+                points.candidate_support_view_probabilities,
+                points.candidate_spatial_dustbin_probabilities,
             )
-            if not has_candidate_spatial_evidence:
+            has_candidate_spatial_maps = all(
+                field is not None for field in spatial_map_fields
+            )
+            has_candidate_spatial_artifact = (
+                has_candidate_spatial_maps
+                and points.candidate_null_probabilities is not None
+            )
+            if any(field is not None for field in spatial_map_fields) and not (
+                has_candidate_spatial_artifact
+            ):
+                raise ValueError(
+                    "candidate spatial artifact is incomplete; refusing legacy fallback"
+                )
+            if not has_candidate_spatial_artifact:
+                if emit_unique_track_assignment_diagnostic:
+                    raise ValueError(
+                        "unique-track diagnostic requires candidate-specific RGB modes"
+                    )
                 evidence = self._fixed_candidate_point_evidence(
                     projected,
                     eligible,
@@ -1765,13 +2231,32 @@ class IndependentLandmarkPoseVerifier:
                     projected_row_indices=candidate_rows,
                 )
             else:
-                evidence = self._fixed_candidate_spatial_point_evidence(
+                spatial_components = self._fixed_candidate_spatial_evidence_components(
                     projected,
                     eligible,
                     candidate_rows,
                     points,
                     eligible_landmark_mask,
                 )
+                evidence = spatial_components.point_ratio
+                if emit_unique_track_assignment_diagnostic:
+                    unique_track_assignment = (
+                        self._fixed_candidate_unique_track_assignment_diagnostic(
+                            spatial_components,
+                            points,
+                            null_probability_floor=(
+                                unique_track_assignment_null_probability_floor
+                            ),
+                            minimum_active_visual_mass=(
+                                unique_track_assignment_minimum_active_visual_mass
+                            ),
+                        )
+                    )
+                spatial_likelihood_ratio = True
+        elif emit_unique_track_assignment_diagnostic:
+            raise ValueError(
+                "unique-track diagnostic requires fixed_global_topl candidate mode"
+            )
         else:
             projected, eligible = self._projected_eligible_landmarks(
                 pose_w2c, camera, eligible_landmark_mask
@@ -1835,9 +2320,17 @@ class IndependentLandmarkPoseVerifier:
                     evidence[valid], descriptor_evidence * spatial_evidence
                 )
 
-        likelihood = float(self.config.outlier_likelihood) + (
-            1.0 - float(self.config.outlier_likelihood)
-        ) * evidence
+        if spatial_likelihood_ratio:
+            # The spatial path returns a dimensionless likelihood ratio against
+            # a fixed grid-uniform null density.  Applying the legacy [0, 1]
+            # outlier blend would destroy its normalized mixture semantics.
+            likelihood = evidence
+            coverage_threshold = 1.0
+        else:
+            likelihood = float(self.config.outlier_likelihood) + (
+                1.0 - float(self.config.outlier_likelihood)
+            ) * evidence
+            coverage_threshold = 0.05
         log_likelihood = np.log(np.maximum(likelihood, 1e-12))
         statistics = _fixed_group_log_likelihood_statistics(
             log_likelihood, points.xy
@@ -1851,9 +2344,10 @@ class IndependentLandmarkPoseVerifier:
             verification_point_count=int(len(points)),
             effective_point_count=int(np.count_nonzero(evidence > 0.0)),
             evidence_coverage=(
-                float(np.mean(evidence > 0.05)) if len(points) else 0.0
+                float(np.mean(evidence > coverage_threshold)) if len(points) else 0.0
             ),
             projected_landmark_count=int(landmark_rows.size),
             view_eligible_landmark_count=view_eligible_count,
             point_evidence=evidence,
+            unique_track_assignment=unique_track_assignment,
         )

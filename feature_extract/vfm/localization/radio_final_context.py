@@ -26,6 +26,8 @@ class RadioFinalContextPcaCache:
     global_descriptors: np.ndarray
     grid4_descriptors: np.ndarray
     metadata: dict[str, object]
+    grid8_descriptors: np.ndarray | None = None
+    grid16_descriptors: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         image_ids = np.asarray(self.image_ids).astype(str).reshape(-1)
@@ -33,6 +35,16 @@ class RadioFinalContextPcaCache:
         summary = np.asarray(self.summary_descriptors, dtype=np.float32)
         global_descriptors = np.asarray(self.global_descriptors, dtype=np.float32)
         grid4 = np.asarray(self.grid4_descriptors, dtype=np.float32)
+        grid8 = (
+            None
+            if self.grid8_descriptors is None
+            else np.asarray(self.grid8_descriptors, dtype=np.float32)
+        )
+        grid16 = (
+            None
+            if self.grid16_descriptors is None
+            else np.asarray(self.grid16_descriptors, dtype=np.float32)
+        )
         count = len(image_ids)
         if len(set(image_ids.tolist())) != count:
             raise ValueError("RADIO final context cache contains duplicate image IDs")
@@ -42,10 +54,16 @@ class RadioFinalContextPcaCache:
             raise ValueError("RADIO final summary/global descriptors are not aligned")
         if grid4.shape != (count, 16, int(summary.shape[1])):
             raise ValueError("RADIO final grid4 descriptors are not aligned")
+        if grid8 is not None and grid8.shape != (count, 64, int(summary.shape[1])):
+            raise ValueError("RADIO final grid8 descriptors are not aligned")
+        if grid16 is not None and grid16.shape != (count, 256, int(summary.shape[1])):
+            raise ValueError("RADIO final grid16 descriptors are not aligned")
         for name, values in (
             ("summary", summary),
             ("global", global_descriptors),
             ("grid4", grid4),
+            *(() if grid8 is None else (("grid8", grid8),)),
+            *(() if grid16 is None else (("grid16", grid16),)),
         ):
             if np.any(~np.isfinite(values)):
                 raise ValueError(f"RADIO final {name} descriptors are not finite")
@@ -62,6 +80,8 @@ class RadioFinalContextPcaCache:
         object.__setattr__(self, "summary_descriptors", summary)
         object.__setattr__(self, "global_descriptors", global_descriptors)
         object.__setattr__(self, "grid4_descriptors", grid4)
+        object.__setattr__(self, "grid8_descriptors", grid8)
+        object.__setattr__(self, "grid16_descriptors", grid16)
         object.__setattr__(self, "metadata", metadata)
 
     @property
@@ -72,7 +92,9 @@ class RadioFinalContextPcaCache:
     def node_feature_dim(self) -> int:
         return 3 * self.descriptor_dim
 
-    def node_descriptors(self, image_id: str, xy: np.ndarray) -> np.ndarray:
+    def _image_row_and_cells(
+        self, image_id: str, xy: np.ndarray
+    ) -> tuple[int, np.ndarray]:
         positions = getattr(self, "_position_by_image", None)
         if positions is None:
             positions = {value: row for row, value in enumerate(self.image_ids.tolist())}
@@ -92,8 +114,47 @@ class RadioFinalContextPcaCache:
             0,
             3,
         )
-        cells = rows * 4 + columns
-        count = len(coordinates)
+        return int(row), rows * 4 + columns
+
+    def node_grid4_descriptors(self, image_id: str, xy: np.ndarray) -> np.ndarray:
+        """Return only candidate-local grid4 descriptors.
+
+        This is the production S1 accessor.  It intentionally cannot expose
+        whole-image summary/global terms to a local candidate probe.
+        """
+
+        row, cells = self._image_row_and_cells(image_id, xy)
+        return self.grid4_descriptors[int(row), cells].astype(np.float32)
+
+    def image_grid_descriptors(self, image_id: str, *, grid_size: int) -> tuple[np.ndarray, np.ndarray]:
+        """Return one image's pose-free spatial grid and its pixel dimensions.
+
+        Callers must crop this grid around a query/support anchor.  Returning
+        the grid rather than the legacy summary/global terms makes accidental
+        whole-image retrieval use impossible in the structured-context path.
+        """
+
+        row, _ = self._image_row_and_cells(str(image_id), np.zeros((1, 2), dtype=np.float32))
+        grids = {
+            4: self.grid4_descriptors,
+            8: self.grid8_descriptors,
+            16: self.grid16_descriptors,
+        }
+        values = grids.get(int(grid_size))
+        if values is None:
+            raise ValueError(f"RADIO final context cache has no grid{int(grid_size)} descriptors")
+        return (
+            values[int(row)]
+            .reshape(int(grid_size), int(grid_size), self.descriptor_dim)
+            .astype(np.float32),
+            self.image_sizes[int(row)].astype(np.int64),
+        )
+
+    def node_descriptors(self, image_id: str, xy: np.ndarray) -> np.ndarray:
+        """Return the legacy concatenated context representation."""
+
+        row, cells = self._image_row_and_cells(image_id, xy)
+        count = len(cells)
         return np.concatenate(
             [
                 np.repeat(self.summary_descriptors[int(row)][None], count, axis=0),
@@ -128,5 +189,14 @@ def load_radio_final_context_pca_cache(
             global_descriptors=np.asarray(data["global_descriptors"]),
             grid4_descriptors=np.asarray(data["grid4_descriptors"]),
             metadata=metadata,
+            grid8_descriptors=(
+                None
+                if "grid8_descriptors" not in data.files
+                else np.asarray(data["grid8_descriptors"])
+            ),
+            grid16_descriptors=(
+                None
+                if "grid16_descriptors" not in data.files
+                else np.asarray(data["grid16_descriptors"])
+            ),
         )
-

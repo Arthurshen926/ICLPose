@@ -117,6 +117,28 @@ def test_radio_spatial_context_evaluate_skips_row_only_candidate_rank_metric() -
     assert "coarse_candidate_rank_loss" not in metrics
 
 
+def test_global_warm_start_memory_config_requires_unambiguous_contract() -> None:
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        MatchaJointTrainingConfig(
+            landmark_frozen_negative_bank="frozen.npz",
+            landmark_memory_warm_start_bank="warm.npz",
+        )
+    with pytest.raises(ValueError, match="requires landmark_memory_warm_start_bank"):
+        MatchaJointTrainingConfig(landmark_memory_sync_ddp=True)
+    with pytest.raises(ValueError, match="query_disjoint_frozen_bank positives"):
+        MatchaJointTrainingConfig(
+            landmark_memory_warm_start_bank="warm.npz",
+            landmark_positive_prototype_source="query_disjoint_frozen_bank",
+        )
+    config = MatchaJointTrainingConfig(
+        landmark_memory_warm_start_bank="warm.npz",
+        landmark_memory_sync_ddp=True,
+    )
+
+    assert config.landmark_memory_warm_start_bank == "warm.npz"
+    assert config.landmark_memory_sync_ddp is True
+
+
 def test_radio_spatial_context_checkpoint_preserves_descriptor_space(tmp_path) -> None:
     model = RadioSpatialContextJointModel(
         input_dim=4,

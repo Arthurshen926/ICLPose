@@ -4,6 +4,7 @@ import pytest
 from feature_extract.vfm.colmap_tracks import ColmapImageObservation
 from feature_extract.vfm.localization.query_observation_identity import (
     registered_candidate_identity_labels,
+    registered_candidate_identity_target_membership,
     registered_query_observation_targets,
     summarize_registered_candidate_identity,
 )
@@ -52,6 +53,26 @@ def test_registered_candidate_identity_distinguishes_unsupervised_from_no_match(
     assert summary["candidate_recall_given_supervised"] == 0.5
     assert summary["rank1_recall_given_supervised"] == 0.0
     assert summary["median_positive_rank_when_retrieved"] == 2.0
+
+
+def test_registered_identity_target_membership_keeps_unknown_anchors_unlabeled() -> None:
+    targets = registered_query_observation_targets(
+        query_ids=["q.png", "q.png", "q.png"],
+        query_xy=np.asarray([[10.0, 10.0], [20.0, 20.0], [40.0, 40.0]]),
+        images_by_name={"q.png": _image("q.png")},
+        max_distance_px=0.25,
+    )
+    membership = registered_candidate_identity_target_membership(
+        np.asarray([[101, 9], [8, 7], [202, 101]], dtype=np.int64), targets
+    )
+
+    # The first anchor has its exact candidate, the second is registered but
+    # absent from top-L, and the third has no registered target at all.
+    assert membership.tolist() == [
+        [True, False, False],
+        [False, False, True],
+        [False, False, False],
+    ]
 
 
 def test_registered_query_targets_reject_missing_colmap_image() -> None:

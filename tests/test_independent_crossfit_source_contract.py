@@ -10,8 +10,13 @@ from feature_extract.tools.vfm.run_independent_crossfit_pose_alignment import (
     _canonical_hash,
     _crossfit_rank_shortlist,
     _crossfit_role_partitions,
+    _disabled_refinement_result,
+    _exactly_one_artifact_chosen_entry,
     _filtered_sharded_group_keys,
     _hypothesis_group,
+    _missing_immutable_source_is_allowed,
+    _optional_pose_differs_from_source,
+    _require_spatial_materialization_for_active_roles,
     _resolve_immutable_source_pose_artifact,
     _validate_local_descriptor_verification_bank,
 )
@@ -21,12 +26,18 @@ from feature_extract.vfm.localization.independent_landmark_pose_likelihood impor
 )
 
 
-def _write_selected_pose_artifact(path: Path) -> None:
+def _write_selected_pose_artifact(path: Path, *, marker: str = "") -> None:
     source_manifest = {
         "inputs": {
             "colmap_cameras_bin_sha256": "camera-hash",
             "colmap_images_bin_sha256": "image-hash",
-        }
+            "proposals_sha256": "proposals-hash",
+            "candidate_artifact_sha256": "candidate-hash",
+            "score_artifact_sha256": "score-hash",
+            "candidate_evidence_sha256": "evidence-hash",
+            "projected_landmark_bank_sha256": "bank-hash",
+        },
+        "marker": str(marker),
     }
     metadata = {
         "format": SELECTED_POSE_ARTIFACT_FORMAT,
@@ -103,6 +114,45 @@ def test_immutable_source_rejects_manifest_hash_mismatch(tmp_path: Path) -> None
         )
 
 
+def test_explicit_immutable_source_override_requires_matching_lineage(
+    tmp_path: Path,
+) -> None:
+    declared = tmp_path / "declared.npz"
+    override = tmp_path / "override.npz"
+    _write_selected_pose_artifact(declared)
+    _write_selected_pose_artifact(override, marker="override")
+    metadata = {
+        "inputs": {
+            "immutable_baseline_pose_artifact": str(declared),
+            "immutable_baseline_pose_artifact_sha256": file_sha256_short(declared),
+            "immutable_baseline_pose_evaluation_label": "frozen-policy",
+            "proposals_sha256": "proposals-hash",
+            "candidate_artifact_sha256": "candidate-hash",
+            "score_artifact_sha256": "score-hash",
+            "candidate_evidence_sha256": "evidence-hash",
+            "projected_landmark_bank_sha256": "bank-hash",
+        }
+    }
+    source = _resolve_immutable_source_pose_artifact(
+        metadata,
+        requested_path=str(override),
+        requested_evaluation_label="frozen-policy",
+        expected_colmap_cameras_sha256="camera-hash",
+        expected_colmap_images_sha256="image-hash",
+        allow_override=True,
+    )
+    assert source["override"] is True
+    with pytest.raises(ValueError, match="hash differs"):
+        _resolve_immutable_source_pose_artifact(
+            metadata,
+            requested_path=str(override),
+            requested_evaluation_label="frozen-policy",
+            expected_colmap_cameras_sha256="camera-hash",
+            expected_colmap_images_sha256="image-hash",
+            allow_override=False,
+        )
+
+
 def test_local_descriptor_bank_requires_exact_map_and_alike_contract(
     tmp_path: Path,
 ) -> None:
@@ -172,6 +222,38 @@ def test_split_filter_is_applied_before_query_sharding() -> None:
     assert selected == [("validation", "policy", "val-1")]
 
 
+def test_missing_immutable_source_escape_hatch_is_train_only() -> None:
+    assert _missing_immutable_source_is_allowed(
+        "train", train_calibration_escape_hatch=True
+    )
+    assert not _missing_immutable_source_is_allowed(
+        "validation", train_calibration_escape_hatch=True
+    )
+    assert not _missing_immutable_source_is_allowed(
+        "test", train_calibration_escape_hatch=True
+    )
+    assert not _missing_immutable_source_is_allowed(
+        "train", train_calibration_escape_hatch=False
+    )
+
+
+def test_grouped_artifact_source_requires_one_frozen_entry() -> None:
+    entries = [
+        {"artifact_chosen": False},
+        {"artifact_chosen": True},
+        {"artifact_chosen": False},
+    ]
+
+    assert _exactly_one_artifact_chosen_entry(
+        entries, query_id="query.png"
+    ) == 1
+
+    with pytest.raises(RuntimeError, match="not unique"):
+        _exactly_one_artifact_chosen_entry(
+            [{"artifact_chosen": False}], query_id="query.png"
+        )
+
+
 def test_crossfit_rank_shortlist_forces_source_and_is_deterministic() -> None:
     selected = _crossfit_rank_shortlist(
         np.asarray([0.5, 0.9, 0.8, 0.8]),
@@ -218,3 +300,90 @@ def test_two_role_crossfit_uses_all_points_without_rank_audit_overlap() -> None:
         role_points[1].source_row_indices, role_points[2].source_row_indices
     ).size
     assert not np.any(role_landmarks[1] & role_landmarks[2])
+
+
+def test_three_fold_rank_complement_keeps_audit_independent() -> None:
+    points = IndependentVerificationPoints(
+        xy=np.arange(18, dtype=np.float64).reshape(9, 2),
+        descriptors=np.tile(np.asarray([[1.0, 0.0]], dtype=np.float32), (9, 1)),
+        descriptor_reference_scores=np.zeros((9,), dtype=np.float32),
+        source_row_indices=np.arange(100, 109, dtype=np.int64),
+    )
+    point_folds = np.asarray([0, 1, 2, 0, 1, 2, 0, 1, 2], dtype=np.int64)
+    base = np.ones((6,), dtype=bool)
+    landmark_folds = np.asarray([0, 1, 2, 0, 1, 2], dtype=np.int64)
+
+    role_points, role_landmarks, active = _crossfit_role_partitions(
+        points,
+        point_folds,
+        base,
+        landmark_folds,
+        role_count=3,
+        rank_uses_complement_of_audit_fold=True,
+    )
+
+    assert active == (1, 2)
+    assert len(role_points[1]) == 6
+    assert len(role_points[2]) == 3
+    assert not np.intersect1d(
+        role_points[1].source_row_indices, role_points[2].source_row_indices
+    ).size
+    assert not np.any(role_landmarks[1] & role_landmarks[2])
+
+
+def test_crossfit_noop_optional_pose_is_not_a_promotion() -> None:
+    pose = np.eye(4, dtype=np.float64)
+
+    assert _optional_pose_differs_from_source(pose, pose) is False
+    changed = pose.copy()
+    changed[0, 3] = 0.01
+    assert _optional_pose_differs_from_source(changed, pose) is True
+
+
+def test_disabled_refinement_is_a_bit_exact_noop() -> None:
+    pose = np.eye(4, dtype=np.float64)
+    pose[0, 3] = 0.125
+
+    result = _disabled_refinement_result(pose)
+
+    assert result.success is False
+    assert result.accepted_iterations == 0
+    assert result.failure_reason == "disabled_by_config"
+    np.testing.assert_array_equal(result.pose_w2c, pose)
+    assert result.translation_step_m == 0.0
+    assert result.rotation_step_deg == 0.0
+
+
+def test_crossfit_rejects_unmaterialized_rgb_audit_role() -> None:
+    points = IndependentVerificationPoints(
+        xy=np.asarray([[0.0, 0.0], [1.0, 1.0]], dtype=np.float64),
+        descriptors=np.asarray([[1.0, 0.0], [1.0, 0.0]], dtype=np.float32),
+        descriptor_reference_scores=np.zeros((2,), dtype=np.float32),
+        source_row_indices=np.asarray([100, 101], dtype=np.int64),
+        candidate_track_ids=np.asarray([[7], [8]], dtype=np.int64),
+        candidate_descriptor_scores=np.ones((2, 1), dtype=np.float32),
+        candidate_null_probabilities=np.zeros((2,), dtype=np.float32),
+        candidate_spatial_offsets_xy=np.asarray([[0.0, 0.0]], dtype=np.float32),
+        candidate_spatial_log_probabilities=np.zeros((2, 1, 1, 1), dtype=np.float32),
+        candidate_spatial_dustbin_probabilities=np.zeros((2, 1, 1), dtype=np.float32),
+        candidate_support_view_probabilities=np.ones((2, 1, 1), dtype=np.float32),
+        candidate_spatial_valid_mask=np.asarray(
+            [[[True]], [[False]]], dtype=bool
+        ),
+    )
+    roles = (points.subset([0]), points.subset([0]), points.subset([1]))
+
+    with pytest.raises(ValueError, match="unmaterialized"):
+        _require_spatial_materialization_for_active_roles(
+            roles,
+            (1, 2),
+            allow_unmaterialized=False,
+        )
+
+    audits = _require_spatial_materialization_for_active_roles(
+        roles,
+        (1, 2),
+        allow_unmaterialized=True,
+    )
+    assert audits[0]["materialized_verification_point_count"] == 1
+    assert audits[1]["materialized_verification_point_count"] == 0

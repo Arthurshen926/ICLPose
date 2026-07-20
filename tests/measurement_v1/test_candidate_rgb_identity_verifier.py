@@ -17,6 +17,12 @@ from feature_extract.vfm.measurement_v1.candidate_rgb_identity_verifier import (
     normalized_spatial_log_probabilities_with_dustbin,
 )
 from feature_extract.vfm.measurement_v1.candidate_rgb_identity_training import (
+    coarse_prior_hard_negative_ranking_loss,
+    _resolve_identity_context_config,
+    _resolve_identity_context_layout_config,
+    _resolve_spatial_support_config,
+    _set_identity_context_residual_training_mode,
+    _set_identity_context_layout_residual_training_mode,
     gt_pose_candidate_view_mixture_nll,
     gt_pose_spatial_density_nll,
 )
@@ -31,6 +37,495 @@ from feature_extract.vfm.measurement_v1.rgb_patch_measurement_branch import (
     crop_rgb_windows_by_owner,
 )
 from feature_extract.vfm.measurement_v1.rgb_patch_training import TensorImageLRUCache
+from feature_extract.tools.vfm.train_independent_rgb_candidate_verifier import (
+    _parse_prediction_splits,
+)
+
+
+def test_spatial_support_override_is_explicit_and_validated() -> None:
+    initial = {
+        "search_radius_px": 6.0,
+        "context_radius_px": 12.0,
+        "step_px": 0.5,
+    }
+    resolved, overrides = _resolve_spatial_support_config(
+        initial,
+        context_radius_px_override=48.0,
+    )
+    assert resolved == {
+        "search_radius_px": 6.0,
+        "context_radius_px": 48.0,
+        "step_px": 0.5,
+    }
+    assert overrides == {
+        "context_radius_px": {
+            "checkpoint_value": 12.0,
+            "resolved_value": 48.0,
+        }
+    }
+
+    unchanged, no_overrides = _resolve_spatial_support_config(initial)
+    assert unchanged == initial
+    assert no_overrides == {}
+    with pytest.raises(ValueError, match="context_radius_px_override must be non-negative"):
+        _resolve_spatial_support_config(initial, context_radius_px_override=-1.0)
+
+
+def test_identity_context_config_is_explicit_and_separate_from_spatial_support() -> None:
+    initial = {
+        "search_radius_px": 6.0,
+        "context_radius_px": 12.0,
+        "step_px": 0.5,
+    }
+    resolved, overrides = _resolve_identity_context_config(
+        initial,
+        identity_context_radius_px=54.0,
+        identity_context_step_px=1.5,
+    )
+    assert resolved == {"enabled": True, "radius_px": 54.0, "step_px": 1.5}
+    assert overrides == {
+        "radius_px": {"checkpoint_value": None, "resolved_value": 54.0},
+        "step_px": {"checkpoint_value": None, "resolved_value": 1.5},
+    }
+    with pytest.raises(ValueError, match="must be provided together"):
+        _resolve_identity_context_config(
+            initial,
+            identity_context_radius_px=54.0,
+        )
+
+
+def test_identity_context_layout_config_is_opt_in_and_v6_compatible() -> None:
+    v6_config = {
+        "identity_context_enabled": True,
+        "identity_context_radius_px": 54.0,
+        "identity_context_step_px": 1.5,
+        "identity_context_layout_enabled": False,
+        "identity_context_layout_grid_size": None,
+    }
+    resolved, overrides = _resolve_identity_context_layout_config(
+        v6_config,
+        identity_context_layout_grid_size=3,
+    )
+    assert resolved == {"enabled": True, "grid_size": 3}
+    assert overrides == {
+        "grid_size": {"checkpoint_value": None, "resolved_value": 3}
+    }
+    unchanged, no_overrides = _resolve_identity_context_layout_config(v6_config)
+    assert unchanged == {"enabled": False, "grid_size": None}
+    assert no_overrides == {}
+    with pytest.raises(ValueError, match=r"must be in \[2, 8\]"):
+        _resolve_identity_context_layout_config(
+            v6_config,
+            identity_context_layout_grid_size=1,
+        )
+
+
+def test_coarse_prior_hard_negative_ranking_targets_confusable_candidates() -> None:
+    logits = torch.zeros((1, 3), requires_grad=True)
+    loss, active = coarse_prior_hard_negative_ranking_loss(
+        logits,
+        labels=torch.tensor([[True, False, False]]),
+        supervision_valid=torch.tensor([[True, True, True]]),
+        candidate_prior=torch.tensor([[0.1, 0.8, 0.1]]),
+        margin=0.0,
+        prior_power=1.0,
+        evidence_weight=1.0,
+    )
+    assert torch.equal(active, torch.tensor([True]))
+    assert torch.allclose(loss, torch.tensor(math.log(10.0)), atol=1e-6)
+    loss.backward()
+    assert logits.grad is not None
+    assert logits.grad[0, 1] > logits.grad[0, 2]
+
+
+def test_coarse_prior_hard_negative_ranking_ignores_ambiguous_candidates() -> None:
+    logits = torch.zeros((1, 3))
+    loss, active = coarse_prior_hard_negative_ranking_loss(
+        logits,
+        labels=torch.tensor([[True, False, False]]),
+        supervision_valid=torch.tensor([[True, True, False]]),
+        candidate_prior=torch.tensor([[0.1, 0.1, 0.8]]),
+        margin=0.0,
+        prior_power=1.0,
+        evidence_weight=1.0,
+    )
+    assert torch.equal(active, torch.tensor([True]))
+    assert torch.allclose(loss, torch.tensor(math.log(2.0)), atol=1e-6)
+
+
+def test_coarse_prior_hard_negative_ranking_skips_groups_without_hard_pairs() -> None:
+    loss, active = coarse_prior_hard_negative_ranking_loss(
+        torch.zeros((2, 2)),
+        labels=torch.tensor([[True, False], [False, False]]),
+        supervision_valid=torch.tensor([[True, False], [True, True]]),
+        candidate_prior=torch.tensor([[0.5, 0.5], [0.5, 0.5]]),
+        margin=0.0,
+        prior_power=1.0,
+        evidence_weight=1.0,
+    )
+    assert torch.equal(active, torch.tensor([False, False]))
+    assert loss.item() == 0.0
+
+
+def test_dual_scale_identity_context_starts_as_exact_local_fallback() -> None:
+    torch.manual_seed(71)
+    local = IndependentRGBCandidateVerifier(
+        search_radius_px=1.0,
+        context_radius_px=1.0,
+        step_px=1.0,
+        feature_dim=8,
+        hidden_dim=16,
+        input_mode="rgb",
+        encoder_arch="simple",
+        template_scale_factors=(1.0,),
+        max_views=2,
+    ).eval()
+    dual = IndependentRGBCandidateVerifier(
+        search_radius_px=1.0,
+        context_radius_px=1.0,
+        step_px=1.0,
+        feature_dim=8,
+        hidden_dim=16,
+        input_mode="rgb",
+        encoder_arch="simple",
+        template_scale_factors=(1.0,),
+        max_views=2,
+        identity_context_radius_px=3.0,
+        identity_context_step_px=1.0,
+    ).eval()
+    incompatible = dual.load_state_dict(local.state_dict(), strict=False)
+    assert not incompatible.unexpected_keys
+    assert all(key.startswith("identity_context_") for key in incompatible.missing_keys)
+    dual.initialize_identity_context_from_local_encoder()
+
+    local_inputs = {
+        "query_patches_by_group": torch.rand((2, 3, 5, 5)),
+        "support_patches": torch.rand((4, 3, 5, 5)),
+        "pair_group_indices": torch.tensor([0, 0, 1, 1]),
+        "pair_candidate_indices": torch.tensor([0, 1, 0, 1]),
+        "pair_view_slots": torch.tensor([0, 0, 0, 0]),
+        "pair_view_probabilities": torch.ones((4,)),
+        "candidate_valid": torch.ones((2, 2), dtype=torch.bool),
+    }
+    context_inputs = {
+        "identity_context_query_patches_by_group": torch.rand((2, 3, 7, 7)),
+        "identity_context_support_patches": torch.rand((4, 3, 7, 7)),
+    }
+    with torch.no_grad():
+        expected = local(**local_inputs)
+        actual = dual(**local_inputs, **context_inputs)
+    assert torch.equal(expected.view_identity_logits, actual.view_identity_logits)
+    assert torch.equal(
+        expected.candidate_log_likelihood_ratios,
+        actual.candidate_log_likelihood_ratios,
+    )
+    assert torch.equal(expected.view_spatial_logits, actual.view_spatial_logits)
+    assert torch.equal(
+        expected.view_measurement_validity_logits,
+        actual.view_measurement_validity_logits,
+    )
+
+
+def test_identity_context_can_change_identity_without_changing_local_measurement() -> None:
+    torch.manual_seed(72)
+    model = IndependentRGBCandidateVerifier(
+        search_radius_px=1.0,
+        context_radius_px=1.0,
+        step_px=1.0,
+        feature_dim=8,
+        hidden_dim=16,
+        input_mode="rgb",
+        encoder_arch="simple",
+        template_scale_factors=(1.0,),
+        max_views=2,
+        identity_context_radius_px=3.0,
+        identity_context_step_px=1.0,
+    ).eval()
+    inputs = {
+        "query_patches_by_group": torch.rand((1, 3, 5, 5)),
+        "support_patches": torch.rand((2, 3, 5, 5)),
+        "identity_context_query_patches_by_group": torch.rand((1, 3, 7, 7)),
+        "identity_context_support_patches": torch.rand((2, 3, 7, 7)),
+        "pair_group_indices": torch.tensor([0, 0]),
+        "pair_candidate_indices": torch.tensor([0, 1]),
+        "pair_view_slots": torch.tensor([0, 0]),
+        "pair_view_probabilities": torch.ones((2,)),
+        "candidate_valid": torch.ones((1, 2), dtype=torch.bool),
+    }
+    with torch.no_grad():
+        before = model(**inputs)
+        assert model.identity_context_residual is not None
+        model.identity_context_residual[-1].bias.fill_(1.0)
+        after = model(**inputs)
+    assert not torch.allclose(before.view_identity_logits, after.view_identity_logits)
+    assert torch.equal(before.view_spatial_logits, after.view_spatial_logits)
+    assert torch.equal(
+        before.view_measurement_validity_logits,
+        after.view_measurement_validity_logits,
+    )
+    assert torch.equal(
+        before.measured_set_availability_logit,
+        after.measured_set_availability_logit,
+    )
+    assert torch.equal(
+        before.measured_set_availability_probability,
+        after.measured_set_availability_probability,
+    )
+
+
+def test_identity_context_zero_scale_is_exact_local_counterfactual() -> None:
+    torch.manual_seed(73)
+    local = IndependentRGBCandidateVerifier(
+        search_radius_px=1.0,
+        context_radius_px=1.0,
+        step_px=1.0,
+        feature_dim=8,
+        hidden_dim=16,
+        input_mode="rgb",
+        encoder_arch="simple",
+        template_scale_factors=(1.0,),
+        max_views=2,
+    ).eval()
+    dual = IndependentRGBCandidateVerifier(
+        search_radius_px=1.0,
+        context_radius_px=1.0,
+        step_px=1.0,
+        feature_dim=8,
+        hidden_dim=16,
+        input_mode="rgb",
+        encoder_arch="simple",
+        template_scale_factors=(1.0,),
+        max_views=2,
+        identity_context_radius_px=3.0,
+        identity_context_step_px=1.0,
+    ).eval()
+    dual.load_state_dict(local.state_dict(), strict=False)
+    dual.initialize_identity_context_from_local_encoder()
+    assert dual.identity_context_residual is not None
+    with torch.no_grad():
+        dual.identity_context_residual[-1].bias.fill_(1.0)
+    inputs = {
+        "query_patches_by_group": torch.rand((1, 3, 5, 5)),
+        "support_patches": torch.rand((2, 3, 5, 5)),
+        "pair_group_indices": torch.tensor([0, 0]),
+        "pair_candidate_indices": torch.tensor([0, 1]),
+        "pair_view_slots": torch.tensor([0, 0]),
+        "pair_view_probabilities": torch.ones((2,)),
+        "candidate_valid": torch.ones((1, 2), dtype=torch.bool),
+    }
+    with torch.no_grad():
+        expected = local(**inputs)
+        actual = dual(**inputs, identity_context_residual_scale=0.0)
+    assert torch.equal(expected.view_identity_logits, actual.view_identity_logits)
+    assert torch.equal(
+        expected.candidate_log_likelihood_ratios,
+        actual.candidate_log_likelihood_ratios,
+    )
+    assert torch.equal(expected.view_spatial_logits, actual.view_spatial_logits)
+    with pytest.raises(ValueError, match=r"in \[0, 1\]"):
+        dual(**inputs, identity_context_residual_scale=1.1)
+
+
+def test_layout_context_starts_as_exact_v6_fallback_and_is_identity_only() -> None:
+    torch.manual_seed(74)
+    v6 = IndependentRGBCandidateVerifier(
+        search_radius_px=1.0,
+        context_radius_px=1.0,
+        step_px=1.0,
+        feature_dim=8,
+        hidden_dim=16,
+        input_mode="rgb",
+        encoder_arch="simple",
+        template_scale_factors=(1.0,),
+        max_views=2,
+        identity_context_radius_px=3.0,
+        identity_context_step_px=1.0,
+    ).eval()
+    layout = IndependentRGBCandidateVerifier(
+        search_radius_px=1.0,
+        context_radius_px=1.0,
+        step_px=1.0,
+        feature_dim=8,
+        hidden_dim=16,
+        input_mode="rgb",
+        encoder_arch="simple",
+        template_scale_factors=(1.0,),
+        max_views=2,
+        identity_context_radius_px=3.0,
+        identity_context_step_px=1.0,
+        identity_context_layout_grid_size=3,
+    ).eval()
+    incompatible = layout.load_state_dict(v6.state_dict(), strict=False)
+    assert not incompatible.unexpected_keys
+    assert incompatible.missing_keys
+    assert all(key.startswith("identity_context_layout_") for key in incompatible.missing_keys)
+    inputs = {
+        "query_patches_by_group": torch.rand((2, 3, 5, 5)),
+        "support_patches": torch.rand((4, 3, 5, 5)),
+        "identity_context_query_patches_by_group": torch.rand((2, 3, 7, 7)),
+        "identity_context_support_patches": torch.rand((4, 3, 7, 7)),
+        "pair_group_indices": torch.tensor([0, 0, 1, 1]),
+        "pair_candidate_indices": torch.tensor([0, 1, 0, 1]),
+        "pair_view_slots": torch.tensor([0, 0, 0, 0]),
+        "pair_view_probabilities": torch.ones((4,)),
+        "candidate_valid": torch.ones((2, 2), dtype=torch.bool),
+    }
+    with torch.no_grad():
+        expected = v6(**inputs)
+        before = layout(**inputs, identity_context_layout_residual_scale=1.0)
+    assert torch.equal(expected.view_identity_logits, before.view_identity_logits)
+    assert torch.equal(
+        expected.candidate_log_likelihood_ratios,
+        before.candidate_log_likelihood_ratios,
+    )
+
+    assert layout.identity_context_layout_residual is not None
+    with torch.no_grad():
+        layout.view_identity_head.weight.fill_(1.0)
+        layout.view_identity_head.bias.zero_()
+        layout.identity_context_layout_residual[-1].bias.fill_(1.0)
+        baseline = layout(
+            **inputs,
+            identity_context_residual_scale=0.0,
+            identity_context_layout_residual_scale=0.0,
+        )
+        after = layout(
+            **inputs,
+            identity_context_residual_scale=0.0,
+            identity_context_layout_residual_scale=1.0,
+        )
+    assert not torch.allclose(baseline.view_identity_logits, after.view_identity_logits)
+    assert not torch.allclose(
+        baseline.candidate_log_likelihood_ratios,
+        after.candidate_log_likelihood_ratios,
+    )
+    assert torch.equal(baseline.view_spatial_logits, after.view_spatial_logits)
+    assert torch.equal(
+        baseline.view_measurement_validity_logits,
+        after.view_measurement_validity_logits,
+    )
+    assert torch.equal(
+        baseline.view_pose_mixture_logits,
+        after.view_pose_mixture_logits,
+    )
+    assert torch.equal(
+        baseline.measured_set_availability_logit,
+        after.measured_set_availability_logit,
+    )
+    assert torch.equal(
+        baseline.measured_set_availability_probability,
+        after.measured_set_availability_probability,
+    )
+
+
+def test_layout_encoder_is_initialized_from_frozen_v6_context_encoder() -> None:
+    torch.manual_seed(75)
+    v6 = IndependentRGBCandidateVerifier(
+        search_radius_px=1.0,
+        context_radius_px=1.0,
+        step_px=1.0,
+        feature_dim=8,
+        hidden_dim=16,
+        input_mode="rgb",
+        encoder_arch="simple",
+        template_scale_factors=(1.0,),
+        max_views=2,
+        identity_context_radius_px=3.0,
+        identity_context_step_px=1.0,
+    )
+    layout = IndependentRGBCandidateVerifier(
+        search_radius_px=1.0,
+        context_radius_px=1.0,
+        step_px=1.0,
+        feature_dim=8,
+        hidden_dim=16,
+        input_mode="rgb",
+        encoder_arch="simple",
+        template_scale_factors=(1.0,),
+        max_views=2,
+        identity_context_radius_px=3.0,
+        identity_context_step_px=1.0,
+        identity_context_layout_grid_size=3,
+    )
+    layout.load_state_dict(v6.state_dict(), strict=False)
+    layout.initialize_identity_context_layout_from_pooled_encoder()
+    assert layout.identity_context_encoder is not None
+    assert layout.identity_context_layout_encoder is not None
+    pooled_state = layout.identity_context_encoder.state_dict()
+    layout_state = layout.identity_context_layout_encoder.state_dict()
+    assert pooled_state.keys() == layout_state.keys()
+    assert all(torch.equal(pooled_state[key], layout_state[key]) for key in pooled_state)
+
+
+def test_layout_context_training_keeps_local_and_pooled_paths_in_eval_mode() -> None:
+    model = IndependentRGBCandidateVerifier(
+        search_radius_px=1.0,
+        context_radius_px=1.0,
+        step_px=1.0,
+        feature_dim=8,
+        hidden_dim=16,
+        input_mode="rgb",
+        encoder_arch="simple",
+        template_scale_factors=(1.0,),
+        max_views=2,
+        identity_context_radius_px=3.0,
+        identity_context_step_px=1.0,
+        identity_context_layout_grid_size=3,
+    )
+    _set_identity_context_layout_residual_training_mode(model)
+    assert not model.encoder.training
+    assert not model.view_evidence.training
+    assert not model.identity_context_evidence.training
+    assert not model.identity_context_residual.training
+    assert model.identity_context_encoder is not None
+    assert not model.identity_context_encoder.training
+    assert model.identity_context_layout_encoder is not None
+    assert model.identity_context_layout_fusion is not None
+    assert model.identity_context_layout_evidence is not None
+    assert model.identity_context_layout_residual is not None
+    assert model.identity_context_layout_encoder.training
+    assert model.identity_context_layout_fusion.training
+    assert model.identity_context_layout_evidence.training
+    assert model.identity_context_layout_residual.training
+
+
+def test_context_only_training_keeps_local_modules_in_eval_mode() -> None:
+    model = IndependentRGBCandidateVerifier(
+        search_radius_px=1.0,
+        context_radius_px=1.0,
+        step_px=1.0,
+        feature_dim=8,
+        hidden_dim=16,
+        input_mode="rgb",
+        encoder_arch="simple",
+        template_scale_factors=(1.0,),
+        max_views=2,
+        identity_context_radius_px=3.0,
+        identity_context_step_px=1.0,
+    )
+    _set_identity_context_residual_training_mode(model)
+
+    assert not model.encoder.training
+    assert not model.view_evidence.training
+    assert not model.view_identity_head.training
+    assert not model.view_measurement_validity_head.training
+    assert not model.view_pose_mixture_head.training
+    assert not model.set_candidate_encoder.training
+    assert not model.measured_set_availability_head.training
+    assert model.identity_context_encoder is not None
+    assert model.identity_context_evidence is not None
+    assert model.identity_context_residual is not None
+    assert model.identity_context_encoder.training
+    assert model.identity_context_evidence.training
+    assert model.identity_context_residual.training
+
+
+def test_training_prediction_split_none_is_explicitly_supported() -> None:
+    assert _parse_prediction_splits("none") == ()
+    assert _parse_prediction_splits("") == ()
+    assert _parse_prediction_splits("train, validation") == ("train", "validation")
+    with pytest.raises(ValueError, match="may contain"):
+        _parse_prediction_splits("validation,late")
 
 
 def test_view_mixture_is_permutation_invariant_and_missing_views_are_neutral() -> None:
@@ -160,6 +655,167 @@ def test_candidate_and_view_order_are_explicit_not_array_shortcuts() -> None:
         permuted.measured_set_availability_logit,
         atol=1e-6,
     )
+
+
+def test_pair_forward_microbatch_preserves_values_and_backpropagates() -> None:
+    torch.manual_seed(23)
+    base = IndependentRGBCandidateVerifier(
+        search_radius_px=1.0,
+        context_radius_px=1.0,
+        step_px=1.0,
+        feature_dim=8,
+        hidden_dim=16,
+        input_mode="rgb",
+        encoder_arch="simple",
+        template_scale_factors=(1.0,),
+        max_views=2,
+    ).eval()
+    chunked = IndependentRGBCandidateVerifier(
+        search_radius_px=1.0,
+        context_radius_px=1.0,
+        step_px=1.0,
+        feature_dim=8,
+        hidden_dim=16,
+        input_mode="rgb",
+        encoder_arch="simple",
+        template_scale_factors=(1.0,),
+        max_views=2,
+        pair_forward_batch_size=2,
+        pair_forward_gradient_checkpointing=True,
+    ).eval()
+    chunked.load_state_dict(base.state_dict())
+    query = torch.rand((2, 3, 5, 5))
+    support = torch.rand((6, 3, 5, 5))
+    groups = torch.tensor([0, 0, 0, 1, 1, 1])
+    candidates = torch.tensor([0, 0, 2, 0, 1, 2])
+    slots = torch.tensor([0, 1, 0, 0, 0, 0])
+    view_probability = torch.tensor([0.6, 0.4, 0.8, 0.5, 0.5, 1.0])
+    valid = torch.ones((2, 3), dtype=torch.bool)
+    kwargs = {
+        "query_patches_by_group": query,
+        "support_patches": support,
+        "pair_group_indices": groups,
+        "pair_candidate_indices": candidates,
+        "pair_view_slots": slots,
+        "pair_view_probabilities": view_probability,
+        "candidate_valid": valid,
+    }
+    with torch.no_grad():
+        expected = base(**kwargs)
+        actual = chunked(**kwargs)
+    assert torch.allclose(
+        expected.candidate_log_likelihood_ratios,
+        actual.candidate_log_likelihood_ratios,
+        atol=1e-6,
+    )
+    assert torch.allclose(
+        expected.view_spatial_logits,
+        actual.view_spatial_logits,
+        atol=1e-6,
+    )
+    assert torch.allclose(
+        expected.view_spatial_offsets_xy,
+        actual.view_spatial_offsets_xy,
+        atol=1e-6,
+    )
+    assert torch.allclose(
+        expected.measured_set_availability_logit,
+        actual.measured_set_availability_logit,
+        atol=1e-6,
+    )
+
+    chunked.train()
+    train_prediction = chunked(**kwargs)
+    loss = (
+        train_prediction.view_identity_logits.square().mean()
+        + train_prediction.view_spatial_logits.square().mean()
+        + train_prediction.measured_set_availability_logit.square().mean()
+    )
+    loss.backward()
+    encoder_gradients = [
+        parameter.grad
+        for parameter in chunked.encoder.parameters()
+        if parameter.grad is not None
+    ]
+    assert encoder_gradients
+    assert all(torch.all(torch.isfinite(gradient)) for gradient in encoder_gradients)
+
+
+def test_layout_context_support_encoder_streams_with_pair_microbatches() -> None:
+    torch.manual_seed(24)
+    base = IndependentRGBCandidateVerifier(
+        search_radius_px=1.0,
+        context_radius_px=1.0,
+        step_px=1.0,
+        feature_dim=8,
+        hidden_dim=16,
+        input_mode="rgb",
+        encoder_arch="simple",
+        template_scale_factors=(1.0,),
+        max_views=2,
+        identity_context_radius_px=3.0,
+        identity_context_step_px=1.0,
+        identity_context_layout_grid_size=3,
+    ).eval()
+    chunked = IndependentRGBCandidateVerifier(
+        search_radius_px=1.0,
+        context_radius_px=1.0,
+        step_px=1.0,
+        feature_dim=8,
+        hidden_dim=16,
+        input_mode="rgb",
+        encoder_arch="simple",
+        template_scale_factors=(1.0,),
+        max_views=2,
+        identity_context_radius_px=3.0,
+        identity_context_step_px=1.0,
+        identity_context_layout_grid_size=3,
+        pair_forward_batch_size=2,
+        pair_forward_gradient_checkpointing=True,
+    ).eval()
+    chunked.load_state_dict(base.state_dict())
+    kwargs = {
+        "query_patches_by_group": torch.rand((2, 3, 5, 5)),
+        "support_patches": torch.rand((6, 3, 5, 5)),
+        "identity_context_query_patches_by_group": torch.rand((2, 3, 7, 7)),
+        "identity_context_support_patches": torch.rand((6, 3, 7, 7)),
+        "pair_group_indices": torch.tensor([0, 0, 0, 1, 1, 1]),
+        "pair_candidate_indices": torch.tensor([0, 0, 2, 0, 1, 2]),
+        "pair_view_slots": torch.tensor([0, 1, 0, 0, 0, 0]),
+        "pair_view_probabilities": torch.tensor([0.6, 0.4, 0.8, 0.5, 0.5, 1.0]),
+        "candidate_valid": torch.ones((2, 3), dtype=torch.bool),
+        "identity_context_residual_scale": 0.0,
+        "identity_context_layout_residual_scale": 1.0,
+    }
+    with torch.no_grad():
+        expected = base(**kwargs)
+        actual = chunked(**kwargs)
+    assert torch.allclose(
+        expected.view_identity_logits, actual.view_identity_logits, atol=1e-6
+    )
+    assert torch.allclose(
+        expected.candidate_log_likelihood_ratios,
+        actual.candidate_log_likelihood_ratios,
+        atol=1e-6,
+    )
+    assert torch.equal(expected.view_spatial_logits, actual.view_spatial_logits)
+    assert torch.equal(
+        expected.view_measurement_validity_logits,
+        actual.view_measurement_validity_logits,
+    )
+
+    chunked.train()
+    prediction = chunked(**kwargs)
+    loss = prediction.candidate_log_likelihood_ratios.square().mean()
+    loss.backward()
+    assert chunked.identity_context_layout_encoder is not None
+    gradients = [
+        parameter.grad
+        for parameter in chunked.identity_context_layout_encoder.parameters()
+        if parameter.grad is not None
+    ]
+    assert gradients
+    assert all(torch.all(torch.isfinite(gradient)) for gradient in gradients)
 
 
 def test_pose_view_mixture_is_permutation_equivariant_and_normalized() -> None:
@@ -693,3 +1349,69 @@ def test_spatial_export_loads_learned_pose_view_v5_checkpoint(tmp_path) -> None:
     assert loaded.config()["pose_view_mixture_semantics"] == (
         POSE_VIEW_MIXTURE_SEMANTICS
     )
+
+
+def test_spatial_export_loads_dual_scale_v6_checkpoint(tmp_path) -> None:
+    model = IndependentRGBCandidateVerifier(
+        search_radius_px=1.0,
+        context_radius_px=1.0,
+        step_px=1.0,
+        feature_dim=8,
+        hidden_dim=16,
+        input_mode="rgb",
+        encoder_arch="simple",
+        template_scale_factors=(1.0,),
+        max_views=2,
+        identity_context_radius_px=3.0,
+        identity_context_step_px=1.0,
+    )
+    checkpoint = tmp_path / "dual_scale.pt"
+    torch.save(
+        {
+            "format": "independent_rgb_candidate_verifier_v6",
+            "config": model.config(),
+            "training": {"measurement_success_threshold_px": 2.0},
+            "data_contract": {"version": 1},
+            "model": model.state_dict(),
+        },
+        checkpoint,
+    )
+
+    loaded = _load_model(checkpoint, torch.device("cpu"))
+
+    assert loaded.identity_context_enabled
+    assert loaded.config()["identity_context_radius_px"] == 3.0
+
+
+def test_spatial_export_loads_isolated_layout_v8_checkpoint(tmp_path) -> None:
+    model = IndependentRGBCandidateVerifier(
+        search_radius_px=1.0,
+        context_radius_px=1.0,
+        step_px=1.0,
+        feature_dim=8,
+        hidden_dim=16,
+        input_mode="rgb",
+        encoder_arch="simple",
+        template_scale_factors=(1.0,),
+        max_views=2,
+        identity_context_radius_px=3.0,
+        identity_context_step_px=1.0,
+        identity_context_layout_grid_size=3,
+    )
+    checkpoint = tmp_path / "layout_v8.pt"
+    torch.save(
+        {
+            "format": "independent_rgb_candidate_verifier_v8",
+            "config": model.config(),
+            "training": {"measurement_success_threshold_px": 2.0},
+            "data_contract": {"version": 1},
+            "model": model.state_dict(),
+        },
+        checkpoint,
+    )
+
+    loaded = _load_model(checkpoint, torch.device("cpu"))
+
+    assert loaded.identity_context_enabled
+    assert loaded.identity_context_layout_enabled
+    assert loaded.config()["identity_context_layout_grid_size"] == 3

@@ -90,6 +90,8 @@ def test_train_real_radio_joint_localization_cli_defaults_to_full_joint_training
     assert args.landmark_normalize_final_prototypes is True
     assert args.landmark_positive_prototype_source == "episode_support_observations"
     assert args.landmark_frozen_negative_bank == ""
+    assert args.landmark_memory_warm_start_bank == ""
+    assert args.landmark_memory_sync_ddp is False
     assert args.landmark_frozen_bank_support_observations == ""
     assert args.landmark_memory_candidate_pool_size == 0
     assert args.landmark_memory_negative_merge_policy == "source_balanced_round_robin"
@@ -454,6 +456,42 @@ def test_frozen_landmark_bank_contract_rejects_stale_support_split(tmp_path: Pat
             support_observations=stale_support,
             expected_source_image_count=3,
         )
+
+
+def test_landmark_memory_warm_start_contract_uses_projected_bank_schema(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "joint.pt"
+    checkpoint.write_text("checkpoint")
+    support = tmp_path / "support.jsonl"
+    support.write_text("support\n")
+    from feature_extract.vfm.artifacts import file_sha256_short
+
+    bank = tmp_path / "bank.npz"
+    metadata = {
+        "descriptor_space_id": "space",
+        "descriptor_space_manifest": {
+            "version": 2,
+            "projection_source": "projected_observation_full_map",
+        },
+        "track_observations_sha256": file_sha256_short(support),
+        "matcha_joint_checkpoint_sha256": file_sha256_short(checkpoint),
+        "source_image_count": 2,
+    }
+    np.savez(
+        bank,
+        track_ids=np.asarray([1, 2], dtype=np.int64),
+        features=np.ones((2, 4), dtype=np.float32),
+        metadata_json=np.asarray(json.dumps(metadata)),
+    )
+
+    audit = train_real_radio_joint_localization.validate_landmark_memory_warm_start_contract(
+        bank,
+        warm_start_checkpoint=checkpoint,
+        support_observations=support,
+        expected_source_image_count=2,
+    )
+
+    assert audit["validated"] is True
+    assert audit["memory_initialization_mode"] == "projected_landmark_mutable_warm_start"
 
 
 def test_frozen_landmark_bank_contract_validates_source_image_sets(

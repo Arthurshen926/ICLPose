@@ -106,6 +106,39 @@ def registered_candidate_identity_labels(
     )
 
 
+def registered_candidate_identity_target_membership(
+    candidate_track_ids: np.ndarray,
+    targets: RegisteredQueryObservationTargets,
+) -> np.ndarray:
+    """Build exact-track-or-null targets without inventing labels for unknown anchors.
+
+    Rows with a nearby registered SfM observation receive exactly one target:
+    the matching top-L track when it is present, otherwise the explicit null
+    class.  Detector anchors with no nearby registered observation intentionally
+    remain targetless so callers can exclude them from supervised fitting rather
+    than treating absence of annotation as an outlier label.
+    """
+
+    candidates = np.asarray(candidate_track_ids, dtype=np.int64)
+    if candidates.ndim != 2 or candidates.shape[0] != len(targets.track_ids):
+        raise ValueError("candidate tracks must have shape (N, L) aligned with targets")
+    labels = registered_candidate_identity_labels(candidates, targets)
+    positive_count = np.sum(labels, axis=1)
+    if np.any(positive_count > 1):
+        raise ValueError(
+            "exact registered-track supervision requires unique candidate tracks per row"
+        )
+    membership = np.zeros((len(candidates), candidates.shape[1] + 1), dtype=bool)
+    membership[:, :-1] = labels
+    membership[targets.supervised & (positive_count == 0), -1] = True
+    supervised_count = np.sum(membership[targets.supervised], axis=1)
+    if np.any(supervised_count != 1):
+        raise RuntimeError("registered identity rows must select one candidate or explicit null")
+    if np.any(membership[~targets.supervised]):
+        raise RuntimeError("unsupervised anchors must not receive an identity target")
+    return membership
+
+
 def summarize_registered_candidate_identity(
     labels: np.ndarray,
     targets: RegisteredQueryObservationTargets,

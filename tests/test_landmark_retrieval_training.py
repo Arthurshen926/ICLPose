@@ -719,6 +719,68 @@ def test_frozen_landmark_snapshot_is_immutable_and_global(tmp_path) -> None:
     assert len(bank) == 2
 
 
+def test_mutable_warm_start_preserves_global_track_universe(tmp_path) -> None:
+    path = tmp_path / "projected.npz"
+    np.savez(
+        path,
+        track_ids=np.asarray([10, 20], dtype=np.int64),
+        features=np.asarray([[2.0, 0.0, 0.0], [0.0, 3.0, 0.0]], dtype=np.float32),
+        xyz=np.asarray([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float32),
+        observation_counts=np.asarray([2, 3], dtype=np.int64),
+        metadata_json=np.asarray('{"descriptor_space_id":"space"}'),
+    )
+    bank = LandmarkPrototypeMemoryBank.mutable_from_projected_landmark_npz(
+        path,
+        device="cpu",
+        expected_descriptor_dim=3,
+        momentum=0.5,
+    )
+    initial_digest = bank.state_sha256()
+    before, found, before_counts, _xyz = bank.lookup([10, 20])
+    applied = bank.update(
+        track_ids=[10, 30],
+        descriptors=torch.tensor([[0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]),
+        observation_counts=[4, 9],
+    )
+    after, found_after, after_counts, _xyz = bank.lookup([10, 20, 30])
+
+    assert bank.frozen is False
+    assert bank.allow_new_tracks is False
+    assert bank.initialization_mode == "projected_landmark_mutable_warm_start"
+    assert found.tolist() == [True, True]
+    assert applied == 1
+    assert len(bank) == 2
+    assert found_after.tolist() == [True, True, False]
+    assert after_counts.tolist() == [6, 3, 0]
+    assert not torch.allclose(before[0], after[0])
+    assert bank.state_sha256() != initial_digest
+
+
+def test_landmark_retrieval_memory_sync_flag_preserves_single_rank_update() -> None:
+    bank = _bank()
+    query = torch.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], requires_grad=True)
+    support = torch.tensor([[1.0, 0.1, 0.0], [0.1, 1.0, 0.0]], requires_grad=True)
+
+    loss, metrics = landmark_retrieval_loss(
+        query,
+        support,
+        torch.tensor([10, 20]),
+        memory_bank=bank,
+        update_memory=True,
+        config=LandmarkRetrievalLossConfig(
+            geometry_hard_negatives_per_track=0,
+            synchronize_memory_updates_across_ranks=True,
+        ),
+    )
+
+    assert loss is not None
+    assert len(bank) == 2
+    assert metrics["landmark_retrieval_memory_update_rows_local"] == 2
+    assert metrics["landmark_retrieval_memory_update_rows_global"] == 2
+    assert metrics["landmark_retrieval_memory_update_applied_tracks"] == 2
+    assert metrics["landmark_retrieval_memory_update_ddp_synchronized"] == 0
+
+
 def test_landmark_retrieval_returns_no_loss_without_valid_track_ids() -> None:
     loss, metrics = landmark_retrieval_loss(
         torch.tensor([[1.0, 0.0, 0.0]]),

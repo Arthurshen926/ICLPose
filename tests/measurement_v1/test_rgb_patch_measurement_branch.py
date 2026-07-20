@@ -170,6 +170,25 @@ def test_rgb_patch_stack_batch_can_cache_images_on_requested_device(tmp_path: Pa
     assert torch.allclose(cached_target.cpu(), cpu_target)
     assert torch.allclose(cached_baseline.cpu(), cpu_baseline)
 
+    cpu_cache = rgb_patch_training.TensorImageLRUCache(
+        max_bytes=1024 * 1024,
+        storage_dtype=torch.float16,
+    )
+    streamed_query, streamed_render, streamed_target, streamed_baseline, _ = (
+        rgb_patch_training._stack_patch_batch(
+            **kwargs,
+            query_cache=cpu_cache,
+            render_cache=cpu_cache,
+            image_cache_device=None,
+            crop_device=torch.device("cpu"),
+        )
+    )
+    assert all(cpu_cache[key].device.type == "cpu" for key in list(cpu_cache))
+    assert torch.allclose(streamed_query, cpu_query, atol=1e-3)
+    assert torch.allclose(streamed_render, cpu_render, atol=1e-3)
+    assert torch.allclose(streamed_target, cpu_target)
+    assert torch.allclose(streamed_baseline, cpu_baseline)
+
 
 def test_continuous_offset_nll_can_upweight_dustbin_positive_targets() -> None:
     offsets = local_offset_grid(search_radius_px=1.0, step_px=1.0)

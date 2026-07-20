@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
 from pathlib import Path
 from typing import Sequence
@@ -41,6 +42,10 @@ class LandmarkRetrievalLossConfig:
     positive_prototype_source: str = "episode_support_observations"
     set_valued_cell_positives: bool = True
     exclude_known_cell_positives_from_memory: bool = True
+    # A mutable full-map warm-start bank is shared across ranks only when this
+    # flag is enabled. It is deliberately opt-in: ordinary bounded EMA banks
+    # retain their historical rank-local behavior.
+    synchronize_memory_updates_across_ranks: bool = False
 
     def __post_init__(self) -> None:
         if float(self.temperature) <= 0.0:
@@ -91,7 +96,7 @@ class LandmarkRetrievalLossConfig:
 
 
 class LandmarkPrototypeMemoryBank:
-    """Bounded EMA bank of detached, multi-observation track prototypes."""
+    """Detached, multi-observation track prototypes with optional EMA updates."""
 
     def __init__(
         self,
@@ -102,6 +107,7 @@ class LandmarkPrototypeMemoryBank:
         momentum: float = 0.9,
         frozen: bool = False,
         source_path: str = "",
+        allow_new_tracks: bool = True,
     ) -> None:
         if int(capacity) <= 0:
             raise ValueError("landmark memory capacity must be positive")
@@ -115,6 +121,8 @@ class LandmarkPrototypeMemoryBank:
         self.momentum = float(momentum)
         self.frozen = bool(frozen)
         self.source_path = str(source_path)
+        self.allow_new_tracks = bool(allow_new_tracks)
+        self.initialization_mode = "empty"
         self.snapshot_metadata: dict[str, object] = {}
         self.descriptors = torch.zeros(
             (self.capacity, self.descriptor_dim),
@@ -135,6 +143,54 @@ class LandmarkPrototypeMemoryBank:
         *,
         device: torch.device | str,
         expected_descriptor_dim: int,
+    ) -> "LandmarkPrototypeMemoryBank":
+        return cls._from_projected_landmark_npz(
+            path,
+            device=device,
+            expected_descriptor_dim=expected_descriptor_dim,
+            momentum=0.0,
+            frozen=True,
+            allow_new_tracks=False,
+            initialization_mode="projected_landmark_frozen_snapshot",
+        )
+
+    @classmethod
+    def mutable_from_projected_landmark_npz(
+        cls,
+        path: Path,
+        *,
+        device: torch.device | str,
+        expected_descriptor_dim: int,
+        momentum: float,
+    ) -> "LandmarkPrototypeMemoryBank":
+        """Load a full projected bank as a fixed-universe mutable EMA memory.
+
+        The track universe must remain stable during fine-tuning.  Allowing a
+        sparse episode to evict an unrelated deployment track would recreate
+        the rank-local/truncated-bank mismatch this mode is intended to avoid.
+        """
+
+        return cls._from_projected_landmark_npz(
+            path,
+            device=device,
+            expected_descriptor_dim=expected_descriptor_dim,
+            momentum=float(momentum),
+            frozen=False,
+            allow_new_tracks=False,
+            initialization_mode="projected_landmark_mutable_warm_start",
+        )
+
+    @classmethod
+    def _from_projected_landmark_npz(
+        cls,
+        path: Path,
+        *,
+        device: torch.device | str,
+        expected_descriptor_dim: int,
+        momentum: float,
+        frozen: bool,
+        allow_new_tracks: bool,
+        initialization_mode: str,
     ) -> "LandmarkPrototypeMemoryBank":
         source = Path(path)
         with np.load(source, allow_pickle=False) as data:
@@ -158,9 +214,10 @@ class LandmarkPrototypeMemoryBank:
             capacity=max(1, int(track_ids.size)),
             descriptor_dim=int(expected_descriptor_dim),
             device=device,
-            momentum=0.0,
-            frozen=True,
+            momentum=float(momentum),
+            frozen=bool(frozen),
             source_path=str(source),
+            allow_new_tracks=bool(allow_new_tracks),
         )
         bank._size = int(track_ids.size)
         bank.track_ids[: bank._size] = track_ids
@@ -172,10 +229,30 @@ class LandmarkPrototypeMemoryBank:
         bank.xyz[: bank._size] = torch.as_tensor(xyz, dtype=torch.float32, device=bank.device)
         bank._slot_by_track = {int(track_id): int(slot) for slot, track_id in enumerate(track_ids.tolist())}
         bank.snapshot_metadata = dict(metadata)
+        bank.initialization_mode = str(initialization_mode)
         return bank
 
     def __len__(self) -> int:
         return int(self._size)
+
+    @torch.no_grad()
+    def state_sha256(self) -> str:
+        """Return a deterministic digest of the deployable memory state."""
+
+        size = int(self._size)
+        digest = hashlib.sha256()
+        digest.update(np.asarray([size, self.descriptor_dim], dtype=np.int64).tobytes())
+        digest.update(np.ascontiguousarray(self.track_ids[:size]).tobytes())
+        digest.update(np.ascontiguousarray(self.observation_counts[:size]).tobytes())
+        digest.update(
+            np.ascontiguousarray(
+                self.descriptors[:size].detach().cpu().numpy()
+            ).tobytes()
+        )
+        digest.update(
+            np.ascontiguousarray(self.xyz[:size].detach().cpu().numpy()).tobytes()
+        )
+        return digest.hexdigest()
 
     def _allocate_slot(self, track_id: int) -> int:
         if self._size < self.capacity:
@@ -246,9 +323,9 @@ class LandmarkPrototypeMemoryBank:
         descriptors: torch.Tensor,
         observation_counts: Sequence[int] | np.ndarray,
         xyz: torch.Tensor | None = None,
-    ) -> None:
+    ) -> int:
         if bool(self.frozen):
-            return
+            return 0
         ids = np.asarray(track_ids, dtype=np.int64).reshape(-1)
         counts = np.asarray(observation_counts, dtype=np.int64).reshape(-1)
         values = F.normalize(descriptors.detach().to(device=self.device, dtype=torch.float32), dim=1)
@@ -261,11 +338,14 @@ class LandmarkPrototypeMemoryBank:
             xyz_values = xyz.detach().to(device=self.device, dtype=torch.float32).reshape(-1, 3)
             if xyz_values.shape[0] != ids.shape[0]:
                 raise ValueError("xyz must contain one 3D point per track")
+        applied = 0
         for row, track_id in enumerate(ids.tolist()):
             if int(track_id) < 0:
                 continue
             slot = self._slot_by_track.get(int(track_id))
             if slot is None:
+                if not bool(self.allow_new_tracks):
+                    continue
                 slot = self._allocate_slot(int(track_id))
                 self.descriptors[slot] = values[row]
                 self.observation_counts[slot] = max(1, int(counts[row]))
@@ -275,6 +355,180 @@ class LandmarkPrototypeMemoryBank:
                 self.observation_counts[slot] += max(1, int(counts[row]))
             if xyz_values is not None and bool(torch.isfinite(xyz_values[row]).all()):
                 self.xyz[slot] = xyz_values[row]
+            applied += 1
+        return int(applied)
+
+
+def _empty_memory_update_metrics() -> dict[str, float]:
+    return {
+        "landmark_retrieval_memory_update_rows_local": 0.0,
+        "landmark_retrieval_memory_update_rows_global": 0.0,
+        "landmark_retrieval_memory_update_unique_tracks_global": 0.0,
+        "landmark_retrieval_memory_update_applied_tracks": 0.0,
+        "landmark_retrieval_memory_update_ddp_synchronized": 0.0,
+    }
+
+
+def _coalesce_memory_updates(
+    track_ids: torch.Tensor,
+    descriptors: torch.Tensor,
+    observation_counts: torch.Tensor,
+    xyz: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Merge rank-local track updates into one observation-count-weighted update."""
+
+    ids = track_ids.to(device=descriptors.device, dtype=torch.long).reshape(-1)
+    values = descriptors.detach().to(device=descriptors.device, dtype=torch.float32).reshape(
+        -1, descriptors.shape[-1]
+    )
+    counts = observation_counts.to(device=descriptors.device, dtype=torch.float32).reshape(-1)
+    xyz_values = xyz.detach().to(device=descriptors.device, dtype=torch.float32).reshape(-1, 3)
+    if values.shape[0] != ids.shape[0] or counts.shape[0] != ids.shape[0] or xyz_values.shape[0] != ids.shape[0]:
+        raise ValueError("distributed landmark memory update tensors must share a row count")
+    valid = ids >= 0
+    if not bool(torch.any(valid)):
+        return (
+            torch.zeros((0,), dtype=torch.long, device=descriptors.device),
+            torch.zeros((0, values.shape[1]), dtype=torch.float32, device=descriptors.device),
+            torch.zeros((0,), dtype=torch.long, device=descriptors.device),
+            torch.zeros((0, 3), dtype=torch.float32, device=descriptors.device),
+        )
+    ids = ids[valid]
+    values = F.normalize(values[valid], dim=1)
+    counts = counts[valid].clamp_min(1.0)
+    xyz_values = xyz_values[valid]
+    unique_ids, inverse = torch.unique(ids, sorted=True, return_inverse=True)
+    weights = counts[:, None]
+    descriptor_sums = torch.zeros(
+        (int(unique_ids.numel()), values.shape[1]), dtype=torch.float32, device=values.device
+    )
+    descriptor_sums.index_add_(0, inverse, values * weights)
+    count_sums = torch.zeros((int(unique_ids.numel()),), dtype=torch.float32, device=values.device)
+    count_sums.index_add_(0, inverse, counts)
+    prototypes = F.normalize(descriptor_sums / count_sums.clamp_min(1.0)[:, None], dim=1)
+    finite_xyz = torch.isfinite(xyz_values).all(dim=1)
+    xyz_sums = torch.zeros((int(unique_ids.numel()), 3), dtype=torch.float32, device=values.device)
+    xyz_weights = torch.zeros((int(unique_ids.numel()),), dtype=torch.float32, device=values.device)
+    if bool(torch.any(finite_xyz)):
+        finite_inverse = inverse[finite_xyz]
+        finite_weights = counts[finite_xyz]
+        xyz_sums.index_add_(0, finite_inverse, xyz_values[finite_xyz] * finite_weights[:, None])
+        xyz_weights.index_add_(0, finite_inverse, finite_weights)
+    merged_xyz = xyz_sums / xyz_weights.clamp_min(1.0)[:, None]
+    merged_xyz[xyz_weights == 0] = float("nan")
+    return unique_ids, prototypes, count_sums.round().to(dtype=torch.long), merged_xyz
+
+
+@torch.no_grad()
+def _update_memory_bank(
+    memory_bank: LandmarkPrototypeMemoryBank | None,
+    *,
+    track_ids: torch.Tensor,
+    descriptors: torch.Tensor,
+    observation_counts: torch.Tensor,
+    xyz: torch.Tensor,
+    synchronize_across_ranks: bool,
+    update_memory: bool,
+) -> dict[str, float]:
+    """Update a bank locally or with a deterministic global DDP aggregate."""
+
+    if memory_bank is None or not bool(update_memory):
+        return {}
+    metrics = _empty_memory_update_metrics()
+    if bool(memory_bank.frozen):
+        return metrics
+    ids = track_ids.detach().to(device=descriptors.device, dtype=torch.long).reshape(-1)
+    values = descriptors.detach().to(device=descriptors.device, dtype=torch.float32).reshape(
+        -1, descriptors.shape[-1]
+    )
+    counts = observation_counts.detach().to(device=descriptors.device, dtype=torch.long).reshape(-1)
+    xyz_values = xyz.detach().to(device=descriptors.device, dtype=torch.float32).reshape(-1, 3)
+    if values.shape[0] != ids.shape[0] or counts.shape[0] != ids.shape[0] or xyz_values.shape[0] != ids.shape[0]:
+        raise ValueError("landmark memory update tensors must share a row count")
+    local_rows = int(torch.count_nonzero(ids >= 0).item())
+    metrics["landmark_retrieval_memory_update_rows_local"] = float(local_rows)
+    distributed = (
+        bool(synchronize_across_ranks)
+        and torch.distributed.is_available()
+        and torch.distributed.is_initialized()
+        and int(torch.distributed.get_world_size()) > 1
+    )
+    if not distributed:
+        applied = memory_bank.update(
+            track_ids=ids.detach().cpu().numpy(),
+            descriptors=values,
+            observation_counts=counts.detach().cpu().numpy(),
+            xyz=xyz_values,
+        )
+        metrics["landmark_retrieval_memory_update_rows_global"] = float(local_rows)
+        metrics["landmark_retrieval_memory_update_unique_tracks_global"] = float(local_rows)
+        metrics["landmark_retrieval_memory_update_applied_tracks"] = float(applied)
+        return metrics
+
+    world_size = int(torch.distributed.get_world_size())
+    local_count = torch.as_tensor([int(ids.shape[0])], dtype=torch.long, device=values.device)
+    gathered_counts = [torch.zeros_like(local_count) for _ in range(world_size)]
+    torch.distributed.all_gather(gathered_counts, local_count)
+    row_counts = [int(item.item()) for item in gathered_counts]
+    max_rows = max(row_counts, default=0)
+    global_rows = int(sum(row_counts))
+    metrics["landmark_retrieval_memory_update_rows_global"] = float(global_rows)
+    metrics["landmark_retrieval_memory_update_ddp_synchronized"] = 1.0
+    if max_rows <= 0:
+        return metrics
+
+    def pad_rows(values_to_pad: torch.Tensor, fill_value: float | int) -> torch.Tensor:
+        output = torch.full(
+            (max_rows, *values_to_pad.shape[1:]),
+            fill_value,
+            dtype=values_to_pad.dtype,
+            device=values_to_pad.device,
+        )
+        if values_to_pad.shape[0] > 0:
+            output[: values_to_pad.shape[0]] = values_to_pad
+        return output
+
+    padded_ids = pad_rows(ids, -1)
+    padded_values = pad_rows(values, 0.0)
+    padded_counts = pad_rows(counts, 0)
+    padded_xyz = pad_rows(xyz_values, float("nan"))
+    gathered_ids = [torch.empty_like(padded_ids) for _ in range(world_size)]
+    gathered_values = [torch.empty_like(padded_values) for _ in range(world_size)]
+    gathered_observation_counts = [torch.empty_like(padded_counts) for _ in range(world_size)]
+    gathered_xyz = [torch.empty_like(padded_xyz) for _ in range(world_size)]
+    torch.distributed.all_gather(gathered_ids, padded_ids)
+    torch.distributed.all_gather(gathered_values, padded_values)
+    torch.distributed.all_gather(gathered_observation_counts, padded_counts)
+    torch.distributed.all_gather(gathered_xyz, padded_xyz)
+    merged_ids = torch.cat(
+        [item[:count] for item, count in zip(gathered_ids, row_counts) if count > 0], dim=0
+    )
+    merged_values = torch.cat(
+        [item[:count] for item, count in zip(gathered_values, row_counts) if count > 0], dim=0
+    )
+    merged_counts = torch.cat(
+        [item[:count] for item, count in zip(gathered_observation_counts, row_counts) if count > 0], dim=0
+    )
+    merged_xyz = torch.cat(
+        [item[:count] for item, count in zip(gathered_xyz, row_counts) if count > 0], dim=0
+    )
+    update_ids, update_values, update_counts, update_xyz = _coalesce_memory_updates(
+        merged_ids,
+        merged_values,
+        merged_counts,
+        merged_xyz,
+    )
+    applied = memory_bank.update(
+        track_ids=update_ids.detach().cpu().numpy(),
+        descriptors=update_values,
+        observation_counts=update_counts.detach().cpu().numpy(),
+        xyz=update_xyz,
+    )
+    metrics["landmark_retrieval_memory_update_unique_tracks_global"] = float(
+        update_ids.numel()
+    )
+    metrics["landmark_retrieval_memory_update_applied_tracks"] = float(applied)
+    return metrics
 
 
 def _aggregate_track_rows(
@@ -518,7 +772,16 @@ def landmark_retrieval_loss(
             raise ValueError("valid coherent tracks require non-negative mode ids")
     valid = (ids >= 0) & torch.isfinite(query_descriptors).all(dim=1) & torch.isfinite(support_descriptors).all(dim=1)
     if not torch.any(valid):
-        return None, {"landmark_retrieval_valid_count": 0.0}
+        update_metrics = _update_memory_bank(
+            memory_bank,
+            track_ids=torch.zeros((0,), dtype=torch.long, device=query_descriptors.device),
+            descriptors=query_descriptors.new_zeros((0, query_descriptors.shape[1])),
+            observation_counts=torch.zeros((0,), dtype=torch.long, device=query_descriptors.device),
+            xyz=torch.zeros((0, 3), dtype=torch.float32, device=query_descriptors.device),
+            synchronize_across_ranks=bool(cfg.synchronize_memory_updates_across_ranks),
+            update_memory=bool(update_memory),
+        )
+        return None, {"landmark_retrieval_valid_count": 0.0, **update_metrics}
     query = F.normalize(query_descriptors[valid], dim=1)
     valid_dustbin_logits = None
     if dustbin_logits is not None:
@@ -551,11 +814,21 @@ def landmark_retrieval_loss(
     all_xyz = _aggregate_track_xyz(xyz_rows, all_inverse, int(all_unique_ids.numel()))
     eligible_tracks = all_counts >= float(cfg.prototype_min_support_observations)
     if not torch.any(eligible_tracks):
+        update_metrics = _update_memory_bank(
+            memory_bank,
+            track_ids=torch.zeros((0,), dtype=torch.long, device=query.device),
+            descriptors=query.new_zeros((0, query.shape[1])),
+            observation_counts=torch.zeros((0,), dtype=torch.long, device=query.device),
+            xyz=torch.zeros((0, 3), dtype=torch.float32, device=query.device),
+            synchronize_across_ranks=bool(cfg.synchronize_memory_updates_across_ranks),
+            update_memory=bool(update_memory),
+        )
         return None, {
             "landmark_retrieval_valid_count": 0.0,
             "landmark_retrieval_support_observation_count": float(query.shape[0]),
             "landmark_retrieval_eligible_track_count": 0.0,
             "landmark_retrieval_dropped_singleton_track_count": float(all_unique_ids.numel()),
+            **update_metrics,
         }
     old_to_new = torch.full((all_unique_ids.numel(),), -1, dtype=torch.long, device=query.device)
     old_to_new[eligible_tracks] = torch.arange(int(torch.count_nonzero(eligible_tracks)), device=query.device)
@@ -641,6 +914,15 @@ def landmark_retrieval_loss(
                 torch.count_nonzero(~bank_row_keep).item()
             )
             if not bool(torch.any(bank_row_keep)):
+                update_metrics = _update_memory_bank(
+                    memory_bank,
+                    track_ids=torch.zeros((0,), dtype=torch.long, device=query.device),
+                    descriptors=query.new_zeros((0, query.shape[1])),
+                    observation_counts=torch.zeros((0,), dtype=torch.long, device=query.device),
+                    xyz=torch.zeros((0, 3), dtype=torch.float32, device=query.device),
+                    synchronize_across_ranks=bool(cfg.synchronize_memory_updates_across_ranks),
+                    update_memory=bool(update_memory),
+                )
                 return None, {
                     "landmark_retrieval_valid_count": 0.0,
                     "landmark_retrieval_frozen_bank_missing_positive_track_count": float(
@@ -649,6 +931,7 @@ def landmark_retrieval_loss(
                     "landmark_retrieval_frozen_bank_dropped_query_count": float(
                         frozen_bank_dropped_query_count
                     ),
+                    **update_metrics,
                 }
             query = query[bank_row_keep]
             ids = ids[bank_row_keep]
@@ -1306,12 +1589,16 @@ def landmark_retrieval_loss(
                 strict_hit.float().mean().item()
             )
 
-    if memory_bank is not None and bool(update_memory):
-        memory_bank.update(
-            track_ids=unique_ids.detach().cpu().numpy(),
+    metrics.update(
+        _update_memory_bank(
+            memory_bank,
+            track_ids=unique_ids,
             descriptors=current_prototypes,
-            observation_counts=current_counts.detach().cpu().numpy().astype(np.int64),
+            observation_counts=current_counts.to(dtype=torch.long),
             xyz=current_xyz,
+            synchronize_across_ranks=bool(cfg.synchronize_memory_updates_across_ranks),
+            update_memory=bool(update_memory),
         )
+    )
     metrics["landmark_retrieval_memory_size_after"] = float(0 if memory_bank is None else len(memory_bank))
     return loss, metrics

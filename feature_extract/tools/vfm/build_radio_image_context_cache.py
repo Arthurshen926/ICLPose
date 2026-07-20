@@ -18,6 +18,7 @@ from PIL import Image
 from feature_extract.extractors.extractor_radio import RADIOFeatureExtractor
 from feature_extract.vfm.artifacts import file_sha256_short
 from feature_extract.vfm.colmap_tracks import read_colmap_images_binary
+from feature_extract.vfm.measurement_v1.rgb_data_contract import image_root_manifest
 
 
 ARTIFACT_FORMAT = "radio_image_multiscale_context_v1"
@@ -30,6 +31,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output", required=True)
     parser.add_argument("--devices", default="cuda:0,cuda:1")
     parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument(
+        "--spatial_grid_sizes",
+        default="2,4",
+        help="comma-separated adaptive spatial grid sizes, for example 4,8",
+    )
     parser.add_argument("--radio_repo", default="feature_extract/checkpoints/RADIO")
     parser.add_argument("--radio_version", default="c-radio_v4-h")
     parser.add_argument(
@@ -63,6 +69,27 @@ def multiscale_context_descriptors(
     )
 
 
+def spatial_grid_descriptors(local: torch.Tensor, *, grid_size: int) -> torch.Tensor:
+    """Return an L2-normalized adaptive RADIO-final spatial grid."""
+
+    if local.ndim != 4 or int(grid_size) <= 0:
+        raise ValueError("RADIO local feature map or spatial grid size is invalid")
+    grid = F.adaptive_avg_pool2d(local.float(), (int(grid_size), int(grid_size)))
+    return _normalize_last(grid.permute(0, 2, 3, 1)).reshape(
+        len(local), int(grid_size) ** 2, local.shape[1]
+    )
+
+
+def _parse_spatial_grid_sizes(value: str) -> tuple[int, ...]:
+    try:
+        sizes = tuple(int(item.strip()) for item in str(value).split(",") if item.strip())
+    except ValueError as error:
+        raise ValueError("spatial_grid_sizes must be comma-separated integers") from error
+    if not sizes or len(set(sizes)) != len(sizes) or any(size <= 0 for size in sizes):
+        raise ValueError("spatial_grid_sizes must contain unique positive integers")
+    return sizes
+
+
 def _load_rgb_batch(image_root: Path, image_ids: Sequence[str]) -> torch.Tensor:
     tensors = []
     shape = None
@@ -83,6 +110,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     if int(args.batch_size) <= 0:
         raise ValueError("batch_size must be positive")
+    grid_sizes = _parse_spatial_grid_sizes(args.spatial_grid_sizes)
     output_path = Path(args.output)
     if output_path.exists() and not bool(args.force):
         raise FileExistsError(f"refusing to overwrite {output_path}")
@@ -106,8 +134,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     count = len(image_ids)
     summaries = np.empty((count, 2560), dtype=np.float16)
     global_local = np.empty((count, 1280), dtype=np.float16)
-    grid2 = np.empty((count, 4, 1280), dtype=np.float16)
-    grid4 = np.empty((count, 16, 1280), dtype=np.float16)
+    grids = {
+        int(size): np.empty((count, int(size) ** 2, 1280), dtype=np.float16)
+        for size in grid_sizes
+    }
     started = time.time()
 
     def worker(worker_index: int) -> dict[str, object]:
@@ -124,12 +154,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             batch_ids = image_ids[batch_rows].tolist()
             batch = _load_rgb_batch(image_root, batch_ids)
             output = extractor.extract_batch(batch)
-            values = multiscale_context_descriptors(
+            summary, global_descriptor, _, _ = multiscale_context_descriptors(
                 output["summary"], output["local"]
             )
-            for target, value in zip(
-                (summaries, global_local, grid2, grid4), values
-            ):
+            for target, value in ((summaries, summary), (global_local, global_descriptor)):
+                target[batch_rows] = value.cpu().numpy().astype(np.float16)
+            for grid_size, target in grids.items():
+                value = spatial_grid_descriptors(output["local"], grid_size=int(grid_size))
                 target[batch_rows] = value.cpu().numpy().astype(np.float16)
             completed += len(batch_rows)
             if completed % 32 == 0 or completed == len(rows):
@@ -155,15 +186,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     for name, values in (
         ("summary", summaries),
         ("global_local", global_local),
-        ("grid2", grid2),
-        ("grid4", grid4),
+        *((f"grid{size}", values) for size, values in grids.items()),
     ):
         if np.any(~np.isfinite(values)):
             raise RuntimeError(f"RADIO context extraction left invalid {name}")
-    manifest = "\n".join(
+    # Retain the legacy digest only for backwards diagnostics. New consumers must
+    # use image_source_contract, which binds IDs, dimensions, and sampled pixels.
+    legacy_manifest = "\n".join(
         f"{value}:{file_sha256_short(image_root / value)}"
         for value in image_ids.tolist()
     )
+    image_source_contract = image_root_manifest(image_root, image_ids.tolist())
     metadata = {
         "format": ARTIFACT_FORMAT,
         "pose_or_ground_truth_used": False,
@@ -173,13 +206,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         "radio_checkpoint_sha256": file_sha256_short(checkpoint_path),
         "radio_model_load_spec": "explicit_checkpoint_path_v1",
         "colmap_images_sha256": file_sha256_short(images_path),
-        "image_manifest_sha256": hashlib.sha256(manifest.encode()).hexdigest()[:16],
+        "image_manifest_sha256": hashlib.sha256(legacy_manifest.encode()).hexdigest()[:16],
+        "legacy_image_manifest_sha256": hashlib.sha256(
+            legacy_manifest.encode()
+        ).hexdigest()[:16],
+        "image_source_contract": image_source_contract,
+        "source_image_manifest_sha256": image_source_contract[
+            "sampled_content_manifest_sha256"
+        ],
         "descriptor_semantics": {
             "summary": "l2_normalized_radio_final_summary",
             "global_local": "l2_normalized_mean_radio_final_patch_tokens",
-            "grid2": "per_cell_l2_normalized_radio_final_2x2_pool",
-            "grid4": "per_cell_l2_normalized_radio_final_4x4_pool",
+            **{
+                f"grid{size}": (
+                    "per_cell_l2_normalized_radio_final_"
+                    f"{size}x{size}_pool"
+                )
+                for size in grid_sizes
+            },
         },
+        "spatial_grid_sizes": list(grid_sizes),
         "devices": list(devices),
         "batch_size_per_device": int(args.batch_size),
         "workers": workers,
@@ -191,8 +237,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         image_ids=image_ids,
         summary_descriptors=summaries,
         global_local_descriptors=global_local,
-        grid2_descriptors=grid2,
-        grid4_descriptors=grid4,
+        **{f"grid{size}_descriptors": values for size, values in grids.items()},
         metadata_json=np.asarray(json.dumps(metadata, sort_keys=True)),
     )
     print(json.dumps({"output": str(output_path), "metadata": metadata}, indent=2))

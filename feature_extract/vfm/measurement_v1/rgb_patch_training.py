@@ -1040,6 +1040,7 @@ def _crop_cached_rgb_windows_grouped(
     *,
     cache: MutableMapping[str, torch.Tensor],
     cache_device: torch.device | None,
+    crop_device: torch.device | None = None,
     radius_px: float,
     step_px: float,
     image_width: int,
@@ -1080,6 +1081,8 @@ def _crop_cached_rgb_windows_grouped(
             chunk_owners.extend([int(owner)] * len(rows))
             chunk_centers.extend([centers_xy[row] for row in rows])
         image = torch.stack(images, dim=0)
+        if crop_device is not None and image.device != crop_device:
+            image = image.to(crop_device)
         if bool(augment_query_image):
             image = _augment_render_query_image(image)
         centers = torch.tensor(
@@ -1123,6 +1126,7 @@ def _stack_unwarped_patch_batch(
     target_x_key: str,
     target_y_key: str,
     image_cache_device: torch.device | None,
+    crop_device: torch.device | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
     source = str(query_source)
     query_specs: list[tuple[str, Any]] = []
@@ -1184,6 +1188,7 @@ def _stack_unwarped_patch_batch(
         centers,
         cache=(render_cache if source in {"render", "render_augmented"} else query_cache),
         cache_device=image_cache_device,
+        crop_device=crop_device,
         radius_px=float(crop_radius_px),
         step_px=float(step_px),
         image_width=int(query_crop_width),
@@ -1195,6 +1200,7 @@ def _stack_unwarped_patch_batch(
         anchors,
         cache=render_cache,
         cache_device=image_cache_device,
+        crop_device=crop_device,
         radius_px=float(crop_radius_px),
         step_px=float(step_px),
         image_width=int(render_width),
@@ -1239,6 +1245,7 @@ def _stack_patch_batch(
     target_x_key: str = "query_gt_x",
     target_y_key: str = "query_gt_y",
     image_cache_device: torch.device | None = None,
+    crop_device: torch.device | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
     query_patches = []
     render_patches = []
@@ -1274,6 +1281,7 @@ def _stack_patch_batch(
             target_x_key=str(target_x_key),
             target_y_key=str(target_y_key),
             image_cache_device=image_cache_device,
+            crop_device=crop_device,
         )
     for row in rows:
         query_id = str(row.get("query_id", "")).strip()
@@ -1318,6 +1326,11 @@ def _stack_patch_batch(
                 lambda p=query_path: _load_query_rgb(p),
                 cache_device=image_cache_device,
             ).unsqueeze(0)
+        if crop_device is not None:
+            if query_image.device != crop_device:
+                query_image = query_image.to(crop_device)
+            if render_image.device != crop_device:
+                render_image = render_image.to(crop_device)
         center = list(_center_xy(row))
         if source == "real_pair":
             anchor = [

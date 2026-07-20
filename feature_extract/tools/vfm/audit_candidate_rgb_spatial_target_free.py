@@ -35,6 +35,12 @@ def _logsumexp(values: np.ndarray) -> float:
     return float(maximum + np.log(np.sum(np.exp(array - maximum))))
 
 
+def _same_path(left: Path | str, right: Path | str) -> bool:
+    """Compare artifact paths without making relative/absolute spelling semantic."""
+
+    return Path(left).resolve(strict=False) == Path(right).resolve(strict=False)
+
+
 def _distribution(values: np.ndarray) -> dict[str, float | int | None]:
     array = np.asarray(values, dtype=np.float64)
     array = array[np.isfinite(array)]
@@ -46,6 +52,130 @@ def _distribution(values: np.ndarray) -> dict[str, float | int | None]:
         "median": float(np.median(array)),
         "p90": float(np.quantile(array, 0.9)),
     }
+
+
+def _support_view_oracle_gap(
+    *,
+    candidate_records: Mapping[tuple[str, int, int], Sequence[int]],
+    target_log_likelihood: np.ndarray,
+    support_view_probabilities: np.ndarray,
+    support_view_ranks: np.ndarray,
+    correct_labels_by_threshold: Mapping[str, np.ndarray],
+) -> dict[str, object]:
+    """Measure the target-only gap between frozen view weights and a best view.
+
+    This is intentionally an oracle diagnostic, not an inference score.  It
+    holds a geometrically correct candidate track fixed, conditions on its
+    materialized support views, and asks whether the frozen appearance mixture
+    picked the support view whose already-frozen RGB likelihood best explains
+    the true projection.  Missing support mass is reported but never turned
+    into target-dependent evidence.
+    """
+
+    log_likelihood = np.asarray(target_log_likelihood, dtype=np.float64).reshape(-1)
+    probabilities = np.asarray(
+        support_view_probabilities, dtype=np.float64
+    ).reshape(-1)
+    ranks = np.asarray(support_view_ranks, dtype=np.int64).reshape(-1)
+    count = len(log_likelihood)
+    if probabilities.shape != ranks.shape or probabilities.shape != (count,):
+        raise ValueError("support-view oracle arrays are not aligned")
+    if np.any(~np.isfinite(probabilities)) or np.any(probabilities < 0.0):
+        raise ValueError("support-view oracle probabilities are invalid")
+
+    result: dict[str, object] = {}
+    for threshold, labels_value in correct_labels_by_threshold.items():
+        labels = np.asarray(labels_value, dtype=bool).reshape(-1)
+        if labels.shape != (count,):
+            raise ValueError("support-view oracle labels are not row-aligned")
+        mixture_nll: list[float] = []
+        top1_nll: list[float] = []
+        top2_nll: list[float] = []
+        oracle_nll: list[float] = []
+        oracle_over_mixture_gain: list[float] = []
+        oracle_over_top1_gain: list[float] = []
+        view_counts: list[float] = []
+        available_masses: list[float] = []
+        top1_oracle_hits: list[float] = []
+        top2_oracle_hits: list[float] = []
+        correct_candidate_count = 0
+        skipped_no_evaluable_view_count = 0
+        for key in sorted(candidate_records):
+            indices = np.asarray(candidate_records[key], dtype=np.int64)
+            if np.any((indices < 0) | (indices >= count)):
+                raise ValueError("support-view oracle candidate index is invalid")
+            if not np.all(labels[indices] == labels[indices[0]]):
+                raise ValueError("candidate support views disagree on target label")
+            if not bool(labels[indices[0]]):
+                continue
+            correct_candidate_count += 1
+            # The support-view rank is part of the frozen artifact identity;
+            # sorting prevents input shard order from changing tie behaviour.
+            indices = indices[np.argsort(ranks[indices], kind="stable")]
+            indices = indices[np.isfinite(log_likelihood[indices])]
+            if len(indices) == 0:
+                skipped_no_evaluable_view_count += 1
+                continue
+            weights = probabilities[indices]
+            available_mass = float(np.sum(weights))
+            if available_mass > 1.0 + 2e-5:
+                raise ValueError("candidate support-view probability mass exceeds one")
+            if available_mass <= 1e-12:
+                skipped_no_evaluable_view_count += 1
+                continue
+            normalized = weights / available_mass
+            local_log = log_likelihood[indices]
+            mixture_log = _logsumexp(np.log(np.maximum(normalized, 1e-30)) + local_log)
+            frozen_order = np.argsort(-normalized, kind="stable")
+            top1_local = int(frozen_order[0])
+            top2_local = frozen_order[: min(2, len(frozen_order))]
+            top2_weight = normalized[top2_local]
+            top2_weight /= max(float(np.sum(top2_weight)), 1e-30)
+            top2_log = _logsumexp(
+                np.log(np.maximum(top2_weight, 1e-30)) + local_log[top2_local]
+            )
+            oracle_local = int(np.argmax(local_log))
+            oracle_log = float(local_log[oracle_local])
+            mixture_nll.append(-mixture_log)
+            top1_nll.append(-float(local_log[top1_local]))
+            top2_nll.append(-top2_log)
+            oracle_nll.append(-oracle_log)
+            oracle_over_mixture_gain.append(oracle_log - mixture_log)
+            oracle_over_top1_gain.append(oracle_log - float(local_log[top1_local]))
+            view_counts.append(float(len(indices)))
+            available_masses.append(available_mass)
+            top1_oracle_hits.append(float(top1_local == oracle_local))
+            top2_oracle_hits.append(float(oracle_local in set(top2_local.tolist())))
+        result[str(threshold)] = {
+            "correct_candidate_count": int(correct_candidate_count),
+            "evaluable_correct_candidate_count": int(len(mixture_nll)),
+            "skipped_no_evaluable_view_count": int(skipped_no_evaluable_view_count),
+            "materialized_support_view_count": _distribution(np.asarray(view_counts)),
+            "materialized_support_probability_mass": _distribution(
+                np.asarray(available_masses)
+            ),
+            "frozen_all_view_mixture_nll": _distribution(np.asarray(mixture_nll)),
+            "frozen_top1_view_nll": _distribution(np.asarray(top1_nll)),
+            "frozen_top2_view_marginal_nll": _distribution(np.asarray(top2_nll)),
+            "oracle_best_view_nll_TARGET_ONLY": _distribution(np.asarray(oracle_nll)),
+            "oracle_over_all_view_log_likelihood_gain_TARGET_ONLY": _distribution(
+                np.asarray(oracle_over_mixture_gain)
+            ),
+            "oracle_over_top1_log_likelihood_gain_TARGET_ONLY": _distribution(
+                np.asarray(oracle_over_top1_gain)
+            ),
+            "frozen_top1_matches_oracle_best_rate_TARGET_ONLY": (
+                None
+                if not top1_oracle_hits
+                else float(np.mean(top1_oracle_hits))
+            ),
+            "frozen_top2_contains_oracle_best_rate_TARGET_ONLY": (
+                None
+                if not top2_oracle_hits
+                else float(np.mean(top2_oracle_hits))
+            ),
+        }
+    return result
 
 
 def _candidate_metrics(
@@ -146,7 +276,7 @@ def audit_candidate_rgb_spatial_target_free(
     target_path = Path(supervision_rows_csv)
     if (
         inputs.get("supervision_rows_sha256") != file_sha256_short(target_path)
-        or str(Path(str(inputs.get("supervision_rows", "")))) != str(target_path)
+        or not _same_path(inputs.get("supervision_rows", ""), target_path)
     ):
         raise ValueError("external audit targets differ from the sanitized-row manifest")
     with target_path.open(newline="") as handle:
@@ -165,6 +295,7 @@ def audit_candidate_rgb_spatial_target_free(
     candidate_ranks = np.asarray(
         arrays["candidate_measurement_ranks"], dtype=np.int64
     )
+    support_view_ranks = np.asarray(arrays["support_view_ranks"], dtype=np.int64)
     track_ids = np.asarray(arrays["candidate_track_ids"], dtype=np.int64)
     support_ids = np.asarray(arrays["support_image_ids"]).astype(str)
     for index, row in enumerate(rows):
@@ -190,6 +321,7 @@ def audit_candidate_rgb_spatial_target_free(
         or dustbin.shape != (len(local_log),)
         or center_xy.shape != (len(local_log), 2)
         or view_probability.shape != (len(local_log),)
+        or support_view_ranks.shape != (len(local_log),)
         or len(rows) != len(local_log)
     ):
         raise ValueError("RGB prediction arrays have incompatible shapes")
@@ -370,6 +502,23 @@ def audit_candidate_rgb_spatial_target_free(
         "2px": np.asarray(label_2px, dtype=bool),
         "5px": np.asarray(label_5px, dtype=bool),
     }
+    # Keep the original per-view target labels so the oracle helper can assert
+    # that every view of one candidate agrees on its geometric identity.  The
+    # diagnostic never changes the frozen RGB prediction artifact.
+    labels_by_threshold_by_view = {
+        threshold: np.asarray(
+            [_bool(row.get(f"target_geometry_correct_{threshold}")) for row in rows],
+            dtype=bool,
+        )
+        for threshold in labels_by_threshold
+    }
+    support_view_oracle = _support_view_oracle_gap(
+        candidate_records=candidate_records,
+        target_log_likelihood=target_log_likelihood,
+        support_view_probabilities=view_probability,
+        support_view_ranks=support_view_ranks,
+        correct_labels_by_threshold=labels_by_threshold_by_view,
+    )
     candidate_identity: dict[str, object] = {}
     for label_name, labels in labels_by_threshold.items():
         result: dict[str, object] = {
@@ -422,6 +571,19 @@ def audit_candidate_rgb_spatial_target_free(
             "supervision_rows_csv_sha256": file_sha256_short(target_path),
         },
         "spatial_density": spatial_metrics,
+        "support_view_oracle_gap_TARGET_ONLY": {
+            "scope": (
+                "fixed geometrically-correct candidate tracks; materialized support "
+                "views only; target-side diagnostic"
+            ),
+            "frozen_prediction_context_radius_px": metadata.get("context_radius_px"),
+            "frozen_prediction_search_radius_px": metadata.get("search_radius_px"),
+            "comparison": (
+                "frozen all-view mixture vs frozen top-1 view vs frozen top-2 "
+                "marginal vs GT oracle best support view"
+            ),
+            "thresholds": support_view_oracle,
+        },
         "candidate_identity_at_true_pose_TARGET_ONLY": candidate_identity,
     }
     output_path = Path(output)

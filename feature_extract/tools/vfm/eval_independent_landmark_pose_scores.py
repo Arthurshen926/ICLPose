@@ -57,6 +57,62 @@ def _paths(value: str) -> tuple[Path, ...]:
     return paths
 
 
+def _validate_candidate_spatial_materialization_contract(
+    path: Path,
+    arrays: Mapping[str, np.ndarray],
+    strict_contract: Mapping[str, object],
+    *,
+    row_count: int,
+) -> None:
+    """Reject RGB score artifacts whose claimed absolute evidence was absent.
+
+    A neutral all-missing spatial tensor is mathematically pose-independent, but
+    it is not a usable independent RGB verifier.  Requiring the scorer's
+    per-query materialization audit here prevents a legacy artifact from being
+    ranked as though it carried RGB evidence on a split for which no modes were
+    exported.
+    """
+
+    if strict_contract.get("candidate_specific_rgb_spatial_modes") is not True:
+        return
+    required_contract = {
+        "candidate_spatial_dustbin_and_missing_pose_independent": True,
+        "candidate_spatial_omitted_topk_mass_is_null": True,
+        "candidate_spatial_query_materialization": (
+            "required_at_least_one_heldout_verification_point"
+        ),
+    }
+    if any(
+        strict_contract.get(key) != expected
+        for key, expected in required_contract.items()
+    ):
+        raise ValueError(
+            f"{path}: candidate RGB spatial evidence lacks the strict "
+            "materialization contract"
+        )
+    required_arrays = (
+        "candidate_spatial_materialized_verification_point_counts",
+        "candidate_spatial_materialized_candidate_view_counts",
+    )
+    missing = [key for key in required_arrays if key not in arrays]
+    if missing:
+        raise ValueError(
+            f"{path}: candidate RGB spatial evidence lacks materialization "
+            f"audit arrays: {missing}"
+        )
+    for key in required_arrays:
+        values = np.asarray(arrays[key])
+        if values.ndim != 1 or len(values) != int(row_count):
+            raise ValueError(
+                f"{path}: {key} must be a row-aligned one-dimensional audit"
+            )
+        if np.any(~np.isfinite(values)) or np.any(values <= 0):
+            raise ValueError(
+                f"{path}: candidate RGB spatial evidence is unmaterialized "
+                f"for at least one scored row ({key})"
+            )
+
+
 def _load_score_artifact(
     path: Path,
 ) -> tuple[dict[str, np.ndarray], dict[str, object]]:
@@ -96,6 +152,12 @@ def _load_score_artifact(
     for key, value in arrays.items():
         if value.ndim == 0 or value.shape[0] != row_count:
             raise ValueError(f"{path}: {key} is not row-aligned")
+    _validate_candidate_spatial_materialization_contract(
+        path,
+        arrays,
+        strict_contract,
+        row_count=row_count,
+    )
     keys = list(
         zip(
             arrays["query_ids"].astype(str).tolist(),
@@ -118,6 +180,8 @@ def _score_compatibility(metadata: Mapping[str, object]) -> dict[str, object]:
             "hypothesis_compatibility_sha256"
         ),
         "config": metadata.get("config"),
+        "selection": metadata.get("selection"),
+        "implementation": metadata.get("implementation"),
         "query_point_selection": metadata.get("query_point_selection"),
         "hypothesis_scope": metadata.get("hypothesis_scope"),
         "crossfit": metadata.get("crossfit"),
@@ -165,6 +229,31 @@ def _score_compatibility(metadata: Mapping[str, object]) -> dict[str, object]:
         "projection_space_id": inputs.get("projection_space_id"),
         "projection_compatibility": inputs.get("projection_compatibility"),
     }
+
+
+def _selection_score_contract(
+    metadata: Mapping[str, object], score_fields: set[str]
+) -> tuple[str, str]:
+    """Resolve the target-free score array used for frozen pose ranking."""
+
+    selection_metadata = metadata.get("selection")
+    if selection_metadata is None:
+        selection_score_field = "independent_log_likelihood_means"
+        selection_statistic = "mean"
+    elif isinstance(selection_metadata, Mapping):
+        selection_score_field = str(
+            selection_metadata.get(
+                "score_field", "independent_log_likelihood_means"
+            )
+        )
+        selection_statistic = str(selection_metadata.get("statistic", "mean"))
+    else:
+        raise ValueError("score metadata selection contract must be an object")
+    if selection_score_field not in score_fields:
+        raise ValueError(
+            f"score artifact lacks configured selection field: {selection_score_field}"
+        )
+    return selection_score_field, selection_statistic
 
 
 def _merge_score_artifacts(
@@ -303,7 +392,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     split_names = scores["split_names"].astype(str)
     labels = scores["evaluation_labels"].astype(str)
     hypothesis_indices = scores["hypothesis_indices"].astype(np.int64)
-    likelihood = np.asarray(
+    selection_score_field, selection_statistic = _selection_score_contract(
+        score_metadata[0], set(scores)
+    )
+    likelihood = np.asarray(scores[selection_score_field], dtype=np.float64)
+    likelihood_mean = np.asarray(
         scores["independent_log_likelihood_means"], dtype=np.float64
     )
     score_top1 = np.asarray(scores["independent_score_top1"], dtype=bool)
@@ -364,7 +457,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             "hypothesis_count": int(len(group)),
             "selected_translation_error_m": float(translation[selected_row]),
             "selected_rotation_error_deg": float(rotation[selected_row]),
-            "selected_log_likelihood_mean": float(likelihood[selected_row]),
+            "selected_log_likelihood_mean": float(likelihood_mean[selected_row]),
+            "selected_selection_score": float(likelihood[selected_row]),
             "chosen_translation_error_m": (
                 None if chosen_row is None else float(translation[chosen_row])
             ),
@@ -372,6 +466,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 None if chosen_row is None else float(rotation[chosen_row])
             ),
             "chosen_log_likelihood_mean": (
+                None if chosen_row is None else float(likelihood_mean[chosen_row])
+            ),
+            "chosen_selection_score": (
                 None if chosen_row is None else float(likelihood[chosen_row])
             ),
             "oracle_translation_error_m": float(translation[oracle_row]),
@@ -543,6 +640,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             "score_selection_frozen_before_gt_join": True,
             "target_free_score_artifact_validated": True,
             "same_hypothesis_denominator_for_source_and_independent_selection": True,
+        },
+        "selection": {
+            "statistic": selection_statistic,
+            "score_field": selection_score_field,
         },
         "metrics": metrics,
         "inputs": target_metadata,

@@ -20,9 +20,11 @@ from feature_extract.tools.vfm.score_independent_landmark_pose_hypotheses import
     _canonical_hash,
     _landmark_bank_metadata,
     _load_candidate_prior_overlay,
+    _load_candidate_spatial_mode_index,
     _load_npz,
     _maplet_purged_tracks,
     _merge_hypothesis_artifacts,
+    _spatial_materialization_audit,
     _validate_alternate_verification_bank,
     _validate_declared_input,
     _verification_points_for_query,
@@ -42,6 +44,7 @@ from feature_extract.vfm.localization.independent_landmark_pose_likelihood impor
     IndependentLandmarkPoseVerifier,
     IndependentPoseCorrespondences,
     IndependentPoseRefinementConfig,
+    IndependentPoseRefinementResult,
     LandmarkObservationViewIndex,
     deterministic_identity_folds,
     load_landmark_prototype_view_index_npz,
@@ -65,7 +68,7 @@ SCORE_STATISTICS = (
     "lcb95",
     "spatial_median_of_means_2x2",
 )
-SPLIT_FILTERS = ("all", "validation", "test")
+SPLIT_FILTERS = ("all", "train", "validation", "test")
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -80,6 +83,23 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help=(
             "Target-free learned candidate/null posterior aligned to every "
             "proposal row; required by learned_probability prior mode."
+        ),
+    )
+    parser.add_argument(
+        "--candidate_spatial_likelihood",
+        default="",
+        help=(
+            "Optional comma-separated target-free candidate_spatial_likelihood_v7 "
+            "artifacts. When supplied, both rank and audit folds must contain "
+            "materialized RGB spatial evidence."
+        ),
+    )
+    parser.add_argument(
+        "--allow_unmaterialized_spatial_roles",
+        action="store_true",
+        help=(
+            "Diagnostic-only escape hatch. Production cross-fit refuses a rank "
+            "or audit fold without materialized candidate RGB spatial modes."
         ),
     )
     parser.add_argument("--projected_landmark_bank", required=True)
@@ -110,6 +130,35 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "is resolved from the grouped-hypothesis input manifest."
         ),
     )
+    parser.add_argument(
+        "--allow_immutable_source_override",
+        action="store_true",
+        help=(
+            "Allow an explicitly supplied external source pose artifact in place "
+            "of the hypothesis-declared one. The artifact must retain the same "
+            "candidate/map/scene lineage and the override is recorded in outputs."
+        ),
+    )
+    parser.add_argument(
+        "--source_pose_policy",
+        choices=("immutable_artifact", "grouped_artifact_chosen"),
+        default="immutable_artifact",
+        help=(
+            "Use the historical external immutable pose or the already-frozen "
+            "chosen grouped pose as the source baseline. The latter is useful "
+            "only when every calibration and held-out split uses it."
+        ),
+    )
+    parser.add_argument(
+        "--allow_missing_immutable_source_for_train_calibration",
+        action="store_true",
+        help=(
+            "Train-only calibration escape hatch. When the declared immutable "
+            "source artifact omits a train query, use the grouped artifact's "
+            "already-frozen chosen pose as the baseline. Validation/test and "
+            "production-style runs always reject missing immutable sources."
+        ),
+    )
     parser.add_argument("--verification_point_count", type=int, default=288)
     parser.add_argument("--detector_log_merit_weight", type=float, default=0.01)
     parser.add_argument("--point_fold_seed", type=int, default=173)
@@ -122,6 +171,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help=(
             "Use two active rank/audit roles when refinement and staged "
             "shortlisting are disabled, otherwise use refine/rank/audit."
+        ),
+    )
+    parser.add_argument(
+        "--rank_uses_complement_of_audit_fold",
+        action="store_true",
+        help=(
+            "With three spatial/map folds and no refinement, rank hypotheses "
+            "on two folds while reserving the remaining fold for the independent "
+            "audit. This keeps rank/audit disjoint but gives rank two-thirds of "
+            "the frozen RGB evidence."
         ),
     )
     parser.add_argument("--nearest_landmarks", type=int, default=4)
@@ -322,6 +381,7 @@ def _resolve_immutable_source_pose_artifact(
     requested_evaluation_label: str,
     expected_colmap_cameras_sha256: str,
     expected_colmap_images_sha256: str,
+    allow_override: bool = False,
 ) -> dict[str, object]:
     """Resolve the source from the hypothesis manifest and enforce its hash."""
 
@@ -339,9 +399,15 @@ def _resolve_immutable_source_pose_artifact(
         raise ValueError(
             "grouped hypothesis artifact does not declare an immutable pose source"
         )
-    path = Path(str(requested_path) or declared_path)
+    requested = str(requested_path)
+    if bool(allow_override) and not requested:
+        raise ValueError(
+            "immutable source override requires --immutable_source_pose_artifact"
+        )
+    path = Path(requested or declared_path)
     actual_sha256 = file_sha256_short(path)
-    if actual_sha256 != declared_sha256:
+    overridden = bool(allow_override) and path != Path(declared_path)
+    if actual_sha256 != declared_sha256 and not overridden:
         raise ValueError(
             "immutable source pose hash differs from grouped hypothesis manifest: "
             f"expected={declared_sha256}, actual={actual_sha256}"
@@ -353,9 +419,43 @@ def _resolve_immutable_source_pose_artifact(
         expected_colmap_images_sha256=expected_colmap_images_sha256,
         evaluation_label=selected_label,
     )
+    if overridden:
+        source_manifest = source["metadata"].get("source_manifest")
+        source_inputs = (
+            None
+            if not isinstance(source_manifest, Mapping)
+            else source_manifest.get("inputs")
+        )
+        hypothesis_inputs = inputs
+        if not isinstance(source_inputs, Mapping):
+            raise ValueError("immutable source override has no lineage inputs")
+        lineage_keys = (
+            "proposals_sha256",
+            "candidate_artifact_sha256",
+            "score_artifact_sha256",
+            "candidate_evidence_sha256",
+            "projected_landmark_bank_sha256",
+            "colmap_cameras_bin_sha256",
+            "colmap_images_bin_sha256",
+        )
+        mismatches = {
+            key: {
+                "hypothesis": hypothesis_inputs.get(key),
+                "source": source_inputs.get(key),
+            }
+            for key in lineage_keys
+            if hypothesis_inputs.get(key) is not None
+            and source_inputs.get(key) != hypothesis_inputs.get(key)
+        }
+        if mismatches:
+            raise ValueError(
+                "immutable source override lineage differs from grouped hypotheses: "
+                + json.dumps(mismatches, sort_keys=True)
+            )
     source["declared_path"] = declared_path
     source["declared_sha256"] = declared_sha256
     source["declared_evaluation_label"] = declared_label
+    source["override"] = overridden
     return source
 
 
@@ -566,6 +666,31 @@ def _filtered_sharded_group_keys(
     ]
 
 
+def _missing_immutable_source_is_allowed(
+    split_name: str,
+    *,
+    train_calibration_escape_hatch: bool,
+) -> bool:
+    """Keep the artifact-chosen fallback strictly out of held-out inference."""
+
+    return bool(train_calibration_escape_hatch) and str(split_name) == "train"
+
+
+def _exactly_one_artifact_chosen_entry(
+    entries: Sequence[Mapping[str, object]], *, query_id: str
+) -> int:
+    """Return the frozen grouped source entry or reject an ambiguous baseline."""
+
+    selected = [
+        index
+        for index, entry in enumerate(entries)
+        if bool(entry["artifact_chosen"])
+    ]
+    if len(selected) != 1:
+        raise RuntimeError(f"{query_id}: artifact-chosen source pose is not unique")
+    return int(selected[0])
+
+
 def _crossfit_rank_shortlist(
     scores: np.ndarray,
     effective_points: np.ndarray,
@@ -621,6 +746,7 @@ def _crossfit_role_partitions(
     landmark_folds: np.ndarray,
     *,
     role_count: int,
+    rank_uses_complement_of_audit_fold: bool = False,
 ):
     """Return legacy three slots while keeping only active roles independent."""
 
@@ -635,12 +761,87 @@ def _crossfit_role_partitions(
             (1, 2),
         )
     if int(role_count) == 3:
+        if bool(rank_uses_complement_of_audit_fold):
+            # Refinement is disabled for this mode.  Reusing the rank partition
+            # in the legacy refine slot keeps the surrounding artifact schema
+            # stable while rank and audit remain strictly disjoint.
+            rank_points = points.subset(point_folds != 2)
+            audit_points = points.subset(point_folds == 2)
+            rank_landmarks = base_eligible & (landmark_folds != 2)
+            audit_landmarks = base_eligible & (landmark_folds == 2)
+            return (
+                [rank_points, rank_points, audit_points],
+                [rank_landmarks, rank_landmarks, audit_landmarks],
+                (1, 2),
+            )
         return (
             [points.subset(point_folds == fold) for fold in range(3)],
             [base_eligible & (landmark_folds == fold) for fold in range(3)],
             (0, 1, 2),
         )
     raise ValueError("cross-fit role count must be two or three")
+
+
+def _optional_pose_differs_from_source(
+    optional_pose: np.ndarray,
+    source_pose: np.ndarray,
+) -> bool:
+    """Prevent a no-op source selection from being counted as a promotion."""
+
+    return not np.array_equal(
+        np.asarray(optional_pose, dtype=np.float64),
+        np.asarray(source_pose, dtype=np.float64),
+    )
+
+
+def _disabled_refinement_result(initial_pose: np.ndarray) -> IndependentPoseRefinementResult:
+    """Avoid scoring a refinement fold when refinement is explicitly disabled."""
+
+    pose = np.asarray(initial_pose, dtype=np.float64).reshape(4, 4).copy()
+    return IndependentPoseRefinementResult(
+        success=False,
+        pose_w2c=pose,
+        accepted_iterations=0,
+        final_correspondence_count=0,
+        fit_log_likelihood_before=float("nan"),
+        fit_log_likelihood_after=float("nan"),
+        translation_step_m=0.0,
+        rotation_step_deg=0.0,
+        used_track_ids=np.zeros((0,), dtype=np.int64),
+        failure_reason="disabled_by_config",
+    )
+
+
+def _require_spatial_materialization_for_active_roles(
+    role_points: Sequence[object],
+    active_role_indices: Sequence[int],
+    *,
+    allow_unmaterialized: bool,
+) -> tuple[dict[str, int], ...]:
+    """Audit RGB-mode coverage separately for rank/audit point partitions.
+
+    A full-query materialization check is insufficient here: a spatially
+    balanced fold may otherwise contain no RGB mode at all, which turns its
+    likelihood into a neutral unknown and lets it pass an audit by tie break.
+    This check happens before any hypothesis score is evaluated.
+    """
+
+    audits = tuple(
+        _spatial_materialization_audit(role_points[index])
+        for index in active_role_indices
+    )
+    if not bool(allow_unmaterialized):
+        missing = [
+            str(index)
+            for index, audit in zip(active_role_indices, audits)
+            if int(audit["materialized_verification_point_count"]) <= 0
+        ]
+        if missing:
+            raise ValueError(
+                "candidate RGB spatial modes are unmaterialized for active "
+                f"cross-fit roles: {', '.join(missing)}"
+            )
+    return audits
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -661,6 +862,37 @@ def main(argv: Sequence[str] | None = None) -> int:
     ):
         raise ValueError(
             "two-role cross-fit requires disabled refinement and staged shortlist"
+        )
+    if bool(args.rank_uses_complement_of_audit_fold) and (
+        int(args.crossfit_role_count) != 3
+        or int(args.refine_iterations) != 0
+        or int(args.crossfit_rank_shortlist_size) != 0
+    ):
+        raise ValueError(
+            "rank_uses_complement_of_audit_fold requires three folds with "
+            "disabled refinement and staged shortlist"
+        )
+    if bool(args.allow_missing_immutable_source_for_train_calibration) and (
+        str(args.split_filter) != "train"
+    ):
+        raise ValueError(
+            "allow_missing_immutable_source_for_train_calibration requires "
+            "--split_filter train"
+        )
+    if (
+        str(args.source_pose_policy) != "immutable_artifact"
+        and bool(args.allow_missing_immutable_source_for_train_calibration)
+    ):
+        raise ValueError(
+            "allow_missing_immutable_source_for_train_calibration only applies "
+            "to --source_pose_policy immutable_artifact"
+        )
+    if bool(args.allow_immutable_source_override) and (
+        str(args.source_pose_policy) != "immutable_artifact"
+    ):
+        raise ValueError(
+            "allow_immutable_source_override requires --source_pose_policy "
+            "immutable_artifact"
         )
     if int(args.query_shard_count) <= 0 or not (
         0 <= int(args.query_shard_index) < int(args.query_shard_count)
@@ -731,6 +963,32 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         prior_overlay = None
         prior_overlay_metadata = {}
+    spatial_mode_paths = tuple(
+        Path(value.strip())
+        for value in str(args.candidate_spatial_likelihood).split(",")
+        if value.strip()
+    )
+    spatial_mode_index = None
+    spatial_mode_offsets = None
+    spatial_mode_log_probabilities = None
+    spatial_mode_metadata: list[dict[str, object]] = []
+    if spatial_mode_paths:
+        if str(args.score_candidate_mode) != "fixed_global_topl":
+            raise ValueError(
+                "candidate RGB spatial modes require --score_candidate_mode "
+                "fixed_global_topl"
+            )
+        if prior_overlay is None:
+            raise ValueError(
+                "candidate RGB spatial modes require a fixed learned candidate "
+                "prior overlay"
+            )
+        (
+            spatial_mode_index,
+            spatial_mode_offsets,
+            spatial_mode_log_probabilities,
+            spatial_mode_metadata,
+        ) = _load_candidate_spatial_mode_index(spatial_mode_paths)
     selected_rows = np.asarray(candidate["selected_rows"], dtype=np.int64)
     if np.any((selected_rows < 0) | (selected_rows >= len(proposals["query_ids"]))):
         raise ValueError("candidate artifact contains invalid selected rows")
@@ -859,32 +1117,48 @@ def main(argv: Sequence[str] | None = None) -> int:
         shard_index=int(args.query_shard_index),
     )
 
-    immutable_source = _resolve_immutable_source_pose_artifact(
-        hypothesis_metadata,
-        requested_path=str(args.immutable_source_pose_artifact),
-        requested_evaluation_label=str(
-            args.immutable_source_pose_evaluation_label
-        ),
-        expected_colmap_cameras_sha256=file_sha256_short(
-            model_dir / "cameras.bin"
-        ),
-        expected_colmap_images_sha256=file_sha256_short(model_dir / "images.bin"),
-    )
-    immutable_records = immutable_source["records"]
-    missing_source_queries = [
-        (split_name, query_id)
-        for split_name, _label, query_id in group_keys
-        if (split_name, query_id) not in immutable_records
-    ]
-    if missing_source_queries:
-        raise ValueError(
-            "immutable source pose artifact does not cover this execution: "
-            f"{missing_source_queries[:5]}"
+    immutable_source: Mapping[str, object] | None = None
+    immutable_records: Mapping[tuple[str, str], Mapping[str, object]] = {}
+    if str(args.source_pose_policy) == "immutable_artifact":
+        immutable_source = _resolve_immutable_source_pose_artifact(
+            hypothesis_metadata,
+            requested_path=str(args.immutable_source_pose_artifact),
+            requested_evaluation_label=str(
+                args.immutable_source_pose_evaluation_label
+            ),
+            expected_colmap_cameras_sha256=file_sha256_short(
+                model_dir / "cameras.bin"
+            ),
+            expected_colmap_images_sha256=file_sha256_short(
+                model_dir / "images.bin"
+            ),
+            allow_override=bool(args.allow_immutable_source_override),
         )
+        immutable_records = immutable_source["records"]
+        missing_source_queries = [
+            (split_name, query_id)
+            for split_name, _label, query_id in group_keys
+            if (split_name, query_id) not in immutable_records
+        ]
+        if missing_source_queries and not all(
+            _missing_immutable_source_is_allowed(
+                split_name,
+                train_calibration_escape_hatch=bool(
+                    args.allow_missing_immutable_source_for_train_calibration
+                ),
+            )
+            for split_name, _query_id in missing_source_queries
+        ):
+            raise ValueError(
+                "immutable source pose artifact does not cover this execution: "
+                f"{missing_source_queries[:5]}"
+            )
 
     rows: list[dict[str, object]] = []
     immutable_source_success_count = 0
     immutable_source_failure_fallback_count = 0
+    missing_immutable_source_train_calibration_count = 0
+    grouped_artifact_source_count = 0
     start = time.time()
     diagnostic_keys = (
         "information_match_count",
@@ -929,6 +1203,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 else "global_descriptors"
             ),
             candidate_prior_overlay=prior_overlay,
+            candidate_spatial_mode_index=spatial_mode_index,
+            candidate_spatial_offsets_xy=spatial_mode_offsets,
+            candidate_spatial_log_probability_arrays=spatial_mode_log_probabilities,
         )
         excluded_tracks = _maplet_purged_tracks(
             excluded_tracks,
@@ -949,15 +1226,29 @@ def main(argv: Sequence[str] | None = None) -> int:
             base_eligible,
             landmark_folds,
             role_count=role_count,
+            rank_uses_complement_of_audit_fold=bool(
+                args.rank_uses_complement_of_audit_fold
+            ),
         )
+        role_spatial_audits = tuple(
+            _spatial_materialization_audit(role_points[index])
+            for index in range(len(role_points))
+        )
+        if spatial_mode_index is not None:
+            _require_spatial_materialization_for_active_roles(
+                role_points,
+                active_role_indices,
+                allow_unmaterialized=bool(args.allow_unmaterialized_spatial_roles),
+            )
         if any(
             len(role_points[index]) < int(args.refine_minimum_correspondences)
             for index in active_role_indices
         ):
             raise ValueError(f"{query_id}: a query cross-fit role is too small")
 
-        source_record = immutable_records[(split_name, query_id)]
-        immutable_success = bool(source_record["success"])
+        source_record = immutable_records.get((split_name, query_id))
+        immutable_source_missing = source_record is None
+        immutable_success = bool(source_record["success"]) if source_record else False
         candidate_entries = [
             {
                 "source_row": int(source_row),
@@ -969,7 +1260,33 @@ def main(argv: Sequence[str] | None = None) -> int:
             }
             for source_row in group.tolist()
         ]
-        if immutable_success:
+        if str(args.source_pose_policy) == "grouped_artifact_chosen":
+            source_entry = _exactly_one_artifact_chosen_entry(
+                candidate_entries, query_id=query_id
+            )
+            candidate_entries[source_entry]["source_chosen"] = True
+            candidate_entries[source_entry]["hypothesis_origin"] = (
+                "grouped_artifact_chosen_source"
+            )
+            grouped_artifact_source_count += 1
+            source_origin = "grouped_artifact_chosen"
+        elif immutable_source_missing:
+            if not _missing_immutable_source_is_allowed(
+                split_name,
+                train_calibration_escape_hatch=bool(
+                    args.allow_missing_immutable_source_for_train_calibration
+                ),
+            ):
+                raise RuntimeError(
+                    f"{query_id}: missing immutable source escaped validation"
+                )
+            missing_immutable_source_train_calibration_count += 1
+            source_entry = _exactly_one_artifact_chosen_entry(
+                candidate_entries, query_id=query_id
+            )
+            candidate_entries[source_entry]["source_chosen"] = True
+            source_origin = "artifact_chosen_missing_immutable_train_calibration"
+        elif immutable_success:
             immutable_source_success_count += 1
             immutable_pose = np.asarray(
                 source_record["pose_w2c"], dtype=np.float64
@@ -1002,28 +1319,26 @@ def main(argv: Sequence[str] | None = None) -> int:
             source_origin = "immutable_pose_artifact"
         else:
             immutable_source_failure_fallback_count += 1
-            artifact_source_entries = [
-                index
-                for index, entry in enumerate(candidate_entries)
-                if bool(entry["artifact_chosen"])
-            ]
-            if len(artifact_source_entries) != 1:
-                raise RuntimeError(
-                    f"{query_id}: artifact-chosen fallback pose is not unique"
-                )
-            candidate_entries[artifact_source_entries[0]]["source_chosen"] = True
+            source_entry = _exactly_one_artifact_chosen_entry(
+                candidate_entries, query_id=query_id
+            )
+            candidate_entries[source_entry]["source_chosen"] = True
             source_origin = "artifact_chosen_after_immutable_failure"
 
         staged_rank_size = int(args.crossfit_rank_shortlist_size)
         group_rows: list[dict[str, object]] = []
         for entry in candidate_entries:
             initial_pose = np.asarray(entry["initial_pose"], dtype=np.float64)
-            refinement = verifier.refine_pose(
-                initial_pose,
-                camera,
-                role_points[0],
-                refine_config,
-                eligible_landmark_mask=role_landmarks[0],
+            refinement = (
+                _disabled_refinement_result(initial_pose)
+                if int(args.refine_iterations) == 0
+                else verifier.refine_pose(
+                    initial_pose,
+                    camera,
+                    role_points[0],
+                    refine_config,
+                    eligible_landmark_mask=role_landmarks[0],
+                )
             )
             if staged_rank_size > 0:
                 exploration = verifier.score_pose(
@@ -1236,6 +1551,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         audit_delta = float(optional_audit_value - source_audit_value)
         promotion_failures: list[str] = list(observability_failures)
+        optional_differs_from_source = _optional_pose_differs_from_source(
+            optional_pose, source_pose
+        )
+        if not optional_differs_from_source:
+            promotion_failures.append("optional_matches_immutable_source")
         if int(group_rows[optional_local]["candidate_rank_effective_points"]) < int(
             args.minimum_rank_effective_points
         ):
@@ -1259,6 +1579,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "immutable_source_artifact_success": immutable_success,
                     **value,
                     "optional_rank_top1": bool(local_index == optional_local),
+                    "optional_differs_from_source": optional_differs_from_source,
                     "promoted": bool(promoted),
                     "promotion_failures": ",".join(promotion_failures),
                     "optional_pose": optional_pose,
@@ -1277,14 +1598,46 @@ def main(argv: Sequence[str] | None = None) -> int:
                         optional_audit.effective_point_count
                     ),
                     "refine_point_count": (
-                        int(len(role_points[0])) if role_count == 3 else 0
+                        int(len(role_points[0]))
+                        if role_count == 3
+                        and not bool(args.rank_uses_complement_of_audit_fold)
+                        else 0
                     ),
                     "rank_point_count": int(len(role_points[1])),
                     "audit_point_count": int(len(role_points[2])),
-                    "refine_landmark_count": int(np.count_nonzero(role_landmarks[0])),
+                    "refine_landmark_count": (
+                        int(np.count_nonzero(role_landmarks[0]))
+                        if role_count == 3
+                        and not bool(args.rank_uses_complement_of_audit_fold)
+                        else 0
+                    ),
                     "rank_landmark_count": int(np.count_nonzero(role_landmarks[1])),
                     "audit_landmark_count": int(np.count_nonzero(role_landmarks[2])),
                     "excluded_track_count": int(len(excluded_tracks)),
+                    "candidate_spatial_refine_materialized_point_count": int(
+                        role_spatial_audits[0]["materialized_verification_point_count"]
+                        if role_count == 3
+                        and not bool(args.rank_uses_complement_of_audit_fold)
+                        else 0
+                    ),
+                    "candidate_spatial_refine_materialized_view_count": int(
+                        role_spatial_audits[0]["materialized_candidate_view_count"]
+                        if role_count == 3
+                        and not bool(args.rank_uses_complement_of_audit_fold)
+                        else 0
+                    ),
+                    "candidate_spatial_rank_materialized_point_count": int(
+                        role_spatial_audits[1]["materialized_verification_point_count"]
+                    ),
+                    "candidate_spatial_rank_materialized_view_count": int(
+                        role_spatial_audits[1]["materialized_candidate_view_count"]
+                    ),
+                    "candidate_spatial_audit_materialized_point_count": int(
+                        role_spatial_audits[2]["materialized_verification_point_count"]
+                    ),
+                    "candidate_spatial_audit_materialized_view_count": int(
+                        role_spatial_audits[2]["materialized_candidate_view_count"]
+                    ),
                     **{
                         key: information.get(key)
                         for key in diagnostic_keys
@@ -1342,6 +1695,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         "fit_query_point_counts": "fit_query_point_count",
         "available_unused_query_point_counts": "available_unused_query_point_count",
         "selected_verification_point_counts": "selected_verification_point_count",
+        "candidate_spatial_refine_materialized_point_counts": (
+            "candidate_spatial_refine_materialized_point_count"
+        ),
+        "candidate_spatial_refine_materialized_view_counts": (
+            "candidate_spatial_refine_materialized_view_count"
+        ),
+        "candidate_spatial_rank_materialized_point_counts": (
+            "candidate_spatial_rank_materialized_point_count"
+        ),
+        "candidate_spatial_rank_materialized_view_counts": (
+            "candidate_spatial_rank_materialized_view_count"
+        ),
+        "candidate_spatial_audit_materialized_point_counts": (
+            "candidate_spatial_audit_materialized_point_count"
+        ),
+        "candidate_spatial_audit_materialized_view_counts": (
+            "candidate_spatial_audit_materialized_view_count"
+        ),
     }
     bool_fields = {
         "artifact_chosen_for_optional_pose": "artifact_chosen",
@@ -1351,6 +1722,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "refinement_used": "refinement_used",
         "rank_shortlisted": "rank_shortlisted",
         "optional_rank_top1": "optional_rank_top1",
+        "optional_differs_from_source": "optional_differs_from_source",
         "promoted": "promoted",
     }
     float_fields = {
@@ -1453,6 +1825,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             "explicit_candidate_null_probability": bool(
                 prior_overlay is not None
             ),
+            "candidate_specific_rgb_spatial_modes": bool(spatial_mode_paths),
+            "candidate_spatial_semantics": (
+                "normalized_gaussian_mixture_relative_to_uniform_grid_null_v1"
+                if spatial_mode_paths
+                else None
+            ),
         },
         "refinement_config": refine_config.to_dict(),
         "score_thresholds": score_thresholds,
@@ -1460,15 +1838,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         "hypothesis_scope": {
             "mode": str(args.hypothesis_scope),
             "limit": int(args.hypothesis_limit),
-            "immutable_source_forced_into_scope": True,
+            "immutable_source_forced_into_scope": bool(
+                str(args.source_pose_policy) == "immutable_artifact"
+            ),
             "artifact_chosen_pose_forced_into_scope": True,
         },
         "crossfit": {
             "roles": (
-                ROLE_NAMES if role_count == 3 else ("rank", "audit")
+                ROLE_NAMES
+                if role_count == 3
+                and not bool(args.rank_uses_complement_of_audit_fold)
+                else ("rank", "audit")
             ),
-            "active_role_count": role_count,
-            "refinement_role_inactive": bool(role_count == 2),
+            "active_role_count": (
+                2 if role_count == 2 or bool(args.rank_uses_complement_of_audit_fold)
+                else 3
+            ),
+            "refinement_role_inactive": bool(
+                role_count == 2 or bool(args.rank_uses_complement_of_audit_fold)
+            ),
             "query_token_disjoint": True,
             "physical_track_disjoint": True,
             "maplet_cluster_disjoint": True,
@@ -1481,20 +1869,48 @@ def main(argv: Sequence[str] | None = None) -> int:
             "rank_selects_from_explore_shortlist_only": bool(
                 int(args.crossfit_rank_shortlist_size) > 0
             ),
+            "rank_uses_complement_of_audit_fold": bool(
+                args.rank_uses_complement_of_audit_fold
+            ),
             "role_semantics": (
                 ["explore", "rank", "audit"]
                 if int(args.crossfit_rank_shortlist_size) > 0
                 else (
-                    ["refine", "rank", "audit"]
-                    if role_count == 3
-                    else ["rank", "audit"]
+                    ["rank_union_two_spatial_track_folds", "audit_remaining_fold"]
+                    if bool(args.rank_uses_complement_of_audit_fold)
+                    else (
+                        ["refine", "rank", "audit"]
+                        if role_count == 3
+                        else ["rank", "audit"]
+                    )
                 )
             ),
             "audit_compares_frozen_optional_to_immutable_source_only": True,
             "denominator_fixed_across_hypotheses_within_each_role": True,
+            "candidate_spatial_role_materialization_required": bool(
+                spatial_mode_paths
+                and not bool(args.allow_unmaterialized_spatial_roles)
+            ),
+            "candidate_spatial_missing_is_neutral_unknown": bool(
+                spatial_mode_paths
+            ),
             "fallback_pose_bit_exact": True,
+            "promotion_requires_distinct_optional_pose": True,
+            "source_pose_policy": str(args.source_pose_policy),
+            "immutable_source_override": bool(
+                immutable_source is not None and immutable_source.get("override")
+            ),
+            "audit_compares_frozen_optional_to_fixed_source_only": True,
+            "audit_compares_frozen_optional_to_immutable_source_only": bool(
+                str(args.source_pose_policy) == "immutable_artifact"
+            ),
             "immutable_source_failure_policy": (
                 "artifact_chosen_pose_only_when_immutable_source_failed"
+                if str(args.source_pose_policy) == "immutable_artifact"
+                else "not_applicable_grouped_artifact_chosen_source"
+            ),
+            "missing_immutable_source_train_calibration_only": bool(
+                args.allow_missing_immutable_source_for_train_calibration
             ),
         },
         "immutable_source_coverage": {
@@ -1502,24 +1918,44 @@ def main(argv: Sequence[str] | None = None) -> int:
             "failure_fallback_query_count": int(
                 immutable_source_failure_fallback_count
             ),
+            "missing_train_calibration_fallback_query_count": int(
+                missing_immutable_source_train_calibration_count
+            ),
+            "grouped_artifact_source_query_count": int(
+                grouped_artifact_source_count
+            ),
         },
         "inputs": {
             "hypothesis_artifacts": [str(path) for path in hypothesis_paths],
             "hypothesis_artifact_sha256": [
                 file_sha256_short(path) for path in hypothesis_paths
             ],
-            "immutable_source_pose_artifact": str(immutable_source["path"]),
-            "immutable_source_pose_artifact_sha256": str(
-                immutable_source["sha256"]
+            "source_pose_policy": str(args.source_pose_policy),
+            "immutable_source_pose_artifact": (
+                None if immutable_source is None else str(immutable_source["path"])
             ),
-            "immutable_source_pose_evaluation_label": str(
-                immutable_source["evaluation_label"]
+            "immutable_source_pose_artifact_sha256": (
+                None if immutable_source is None else str(immutable_source["sha256"])
             ),
-            "immutable_source_declared_path": str(
-                immutable_source["declared_path"]
+            "immutable_source_pose_evaluation_label": (
+                None
+                if immutable_source is None
+                else str(immutable_source["evaluation_label"])
             ),
-            "immutable_source_declared_sha256": str(
-                immutable_source["declared_sha256"]
+            "immutable_source_declared_path": (
+                None
+                if immutable_source is None
+                else str(immutable_source["declared_path"])
+            ),
+            "immutable_source_declared_sha256": (
+                None
+                if immutable_source is None
+                else str(immutable_source["declared_sha256"])
+            ),
+            "immutable_source_override": (
+                None
+                if immutable_source is None
+                else bool(immutable_source.get("override"))
             ),
             "detector_query_cache": str(args.detector_query_cache),
             "detector_query_cache_sha256": file_sha256_short(
@@ -1543,6 +1979,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if prior_overlay_path is None
                 else _canonical_hash(prior_overlay_metadata)
             ),
+            "candidate_spatial_likelihood": [
+                str(path) for path in spatial_mode_paths
+            ],
+            "candidate_spatial_likelihood_sha256": [
+                file_sha256_short(path) for path in spatial_mode_paths
+            ],
+            "candidate_spatial_likelihood_metadata_sha256": [
+                _canonical_hash(value) for value in spatial_mode_metadata
+            ],
             "projected_landmark_bank": str(source_bank_path),
             "projected_landmark_bank_sha256": file_sha256_short(source_bank_path),
             "independent_verification_landmark_bank": str(verification_bank_path),

@@ -738,6 +738,11 @@ class MatchaJointTrainingConfig:
     landmark_exclude_known_cell_positives_from_memory: bool = True
     landmark_memory_capacity: int = 65536
     landmark_frozen_negative_bank: str = ""
+    # Mutable full-map initialization for retrieval training. Unlike the
+    # read-only negative bank, this preserves the deployment track universe
+    # while allowing EMA descriptor refreshes during training.
+    landmark_memory_warm_start_bank: str = ""
+    landmark_memory_sync_ddp: bool = False
     landmark_memory_momentum: float = 0.9
     landmark_memory_candidate_pool_size: int = 0
     landmark_semantic_hard_negatives_per_query: int = 16
@@ -879,6 +884,23 @@ class MatchaJointTrainingConfig:
             raise ValueError("landmark_memory_momentum must be in [0, 1)")
         if int(self.landmark_memory_capacity) <= 0:
             raise ValueError("landmark_memory_capacity must be positive")
+        if str(self.landmark_frozen_negative_bank) and str(self.landmark_memory_warm_start_bank):
+            raise ValueError(
+                "landmark_frozen_negative_bank and landmark_memory_warm_start_bank are mutually exclusive"
+            )
+        if bool(self.landmark_memory_sync_ddp) and not str(self.landmark_memory_warm_start_bank):
+            raise ValueError(
+                "landmark_memory_sync_ddp requires landmark_memory_warm_start_bank "
+                "so every rank starts from the same full track universe"
+            )
+        if (
+            str(self.landmark_memory_warm_start_bank)
+            and str(self.landmark_positive_prototype_source) == "query_disjoint_frozen_bank"
+        ):
+            raise ValueError(
+                "query_disjoint_frozen_bank positives require landmark_frozen_negative_bank, "
+                "not a mutable warm-start bank"
+            )
         for name in (
             "landmark_memory_candidate_pool_size",
             "landmark_semantic_hard_negatives_per_query",
@@ -3041,6 +3063,9 @@ def _full_map_correspondence_loss(
                 exclude_known_cell_positives_from_memory=bool(
                     config.landmark_exclude_known_cell_positives_from_memory
                 ),
+                synchronize_memory_updates_across_ranks=bool(
+                    config.landmark_memory_sync_ddp
+                ),
             ),
             update_memory=bool(update_landmark_memory),
             seed=int(seed),
@@ -4393,6 +4418,13 @@ def _build_landmark_memory_bank(
             device=device,
             expected_descriptor_dim=int(config.output_dim),
         )
+    if str(config.landmark_memory_warm_start_bank):
+        return LandmarkPrototypeMemoryBank.mutable_from_projected_landmark_npz(
+            Path(config.landmark_memory_warm_start_bank),
+            device=device,
+            expected_descriptor_dim=int(config.output_dim),
+            momentum=float(config.landmark_memory_momentum),
+        )
     return LandmarkPrototypeMemoryBank(
         capacity=int(config.landmark_memory_capacity),
         descriptor_dim=int(config.output_dim),
@@ -4425,9 +4457,18 @@ def _landmark_training_summary(
         "landmark_retrieval_memory_final_size": int(len(memory_bank)),
         "landmark_retrieval_training_metric_reduction": "mean_over_training_pairs",
         "landmark_retrieval_memory_scope": (
-            "global_frozen_snapshot" if bool(memory_bank.frozen) else "rank_local_ema"
+            "global_frozen_snapshot"
+            if bool(memory_bank.frozen)
+            else (
+                "global_warm_start_ema"
+                if str(memory_bank.initialization_mode)
+                == "projected_landmark_mutable_warm_start"
+                else "rank_local_ema"
+            )
         ),
         "landmark_retrieval_memory_source": str(memory_bank.source_path),
+        "landmark_retrieval_memory_initialization_mode": str(memory_bank.initialization_mode),
+        "landmark_retrieval_memory_allow_new_tracks": bool(memory_bank.allow_new_tracks),
     }
     for key, value in sums.items():
         count = max(1, int(counts.get(key, 0)))
@@ -5330,6 +5371,26 @@ def _reduce_distributed_training_statistics(
     return reduced_sums, reduced_counts, reduced_loss_sum, reduced_loss_count, memory_sizes
 
 
+def _gather_distributed_memory_state_hashes(
+    memory_bank: LandmarkPrototypeMemoryBank | None,
+) -> list[str]:
+    """Collect full memory-state digests and reject a silent DDP divergence."""
+
+    digest = "" if memory_bank is None else str(memory_bank.state_sha256())
+    _rank, world_size = _distributed_training_context()
+    if int(world_size) <= 1:
+        return [digest]
+    gathered: list[object] = [None for _ in range(int(world_size))]
+    torch.distributed.all_gather_object(gathered, digest)
+    values = [str(value) for value in gathered]
+    if memory_bank is not None and len(set(values)) != 1:
+        raise RuntimeError(
+            "landmark memory banks diverged across DDP ranks; refusing to save an "
+            "ambiguous global retrieval checkpoint"
+        )
+    return values
+
+
 def _report_distributed_provider_progress(
     *,
     step: int,
@@ -5709,6 +5770,9 @@ def train_matcha_joint_model_from_sample_provider(
         seed=int(cfg.seed),
         landmark_memory_bank=landmark_memory_bank,
     )
+    landmark_memory_state_hashes = _gather_distributed_memory_state_hashes(
+        landmark_memory_bank
+    )
     training_wall_seconds = float(training_loop_finished - training_loop_started)
     active_training_seconds = max(
         training_wall_seconds
@@ -5765,9 +5829,31 @@ def train_matcha_joint_model_from_sample_provider(
         summary.update(
             {
                 "landmark_retrieval_memory_scope": (
-                    "global_frozen_snapshot" if bool(landmark_memory_bank.frozen) else "rank_local_ema"
+                    "global_frozen_snapshot"
+                    if bool(landmark_memory_bank.frozen)
+                    else (
+                        "ddp_synchronized_global_warm_start_ema"
+                        if (
+                            str(landmark_memory_bank.initialization_mode)
+                            == "projected_landmark_mutable_warm_start"
+                            and bool(cfg.landmark_memory_sync_ddp)
+                            and int(world_size) > 1
+                        )
+                        else (
+                            "global_warm_start_ema"
+                            if str(landmark_memory_bank.initialization_mode)
+                            == "projected_landmark_mutable_warm_start"
+                            else "rank_local_ema"
+                        )
+                    )
                 ),
                 "landmark_retrieval_memory_final_size_by_rank": [int(value) for value in landmark_memory_sizes],
+                "landmark_retrieval_memory_state_sha256_by_rank": list(
+                    landmark_memory_state_hashes
+                ),
+                "landmark_retrieval_memory_state_synchronized": bool(
+                    len(set(landmark_memory_state_hashes)) <= 1
+                ),
             }
         )
     if get_validation_sample is not None and validation_provider_count > 0:

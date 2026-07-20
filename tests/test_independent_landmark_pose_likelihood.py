@@ -9,6 +9,9 @@ from feature_extract.vfm.localization.independent_landmark_pose_likelihood impor
     IndependentVerificationPoints,
     LandmarkObservationViewIndex,
     LandmarkPrototypeViewIndex,
+    _normalized_spatial_mixture_density_from_regular_grid,
+    _normalized_spatial_mixture_log_density,
+    _regular_offset_grid_background_density,
     deterministic_identity_folds,
     spatially_balanced_point_folds,
 )
@@ -255,7 +258,7 @@ def test_candidate_specific_spatial_mode_scores_its_offset_not_query_center() ->
     assert shifted.log_likelihood_mean > center.log_likelihood_mean
 
 
-def test_candidate_spatial_tensor_without_valid_modes_uses_exact_baseline() -> None:
+def test_candidate_spatial_tensor_without_valid_modes_is_pose_independent_unknown() -> None:
     bank = _bank()
     views = LandmarkObservationViewIndex.from_track_observations(
         bank.track_ids,
@@ -271,7 +274,6 @@ def test_candidate_spatial_tensor_without_valid_modes_uses_exact_baseline() -> N
         "candidate_descriptor_scores": np.asarray([[1.0]], dtype=np.float32),
         "candidate_null_probabilities": np.asarray([0.0], dtype=np.float32),
     }
-    baseline = IndependentVerificationPoints(**common)
     no_modes = IndependentVerificationPoints(
         **common,
         candidate_spatial_offsets_xy=np.asarray([[0.0, 0.0]], dtype=np.float32),
@@ -295,11 +297,378 @@ def test_candidate_spatial_tensor_without_valid_modes_uses_exact_baseline() -> N
         ),
     )
 
-    baseline_score = verifier.score_pose(np.eye(4), _camera(), baseline)
-    no_modes_score = verifier.score_pose(np.eye(4), _camera(), no_modes)
+    shifted_pose = np.eye(4)
+    shifted_pose[0, 3] = 0.25
+    center_score = verifier.score_pose(np.eye(4), _camera(), no_modes)
+    shifted_score = verifier.score_pose(shifted_pose, _camera(), no_modes)
 
-    assert np.array_equal(no_modes_score.point_evidence, baseline_score.point_evidence)
-    assert no_modes_score.log_likelihood_mean == baseline_score.log_likelihood_mean
+    behind_camera = np.eye(4)
+    behind_camera[2, 3] = -10.0
+    behind_score = verifier.score_pose(behind_camera, _camera(), no_modes)
+
+    assert center_score.point_evidence[0] == pytest.approx(1.0, abs=1e-6)
+    assert shifted_score.point_evidence[0] == pytest.approx(1.0, abs=1e-6)
+    assert behind_score.point_evidence[0] == pytest.approx(1.0, abs=1e-6)
+    assert shifted_score.log_likelihood_mean == pytest.approx(
+        center_score.log_likelihood_mean
+    )
+    assert behind_score.log_likelihood_mean == pytest.approx(
+        center_score.log_likelihood_mean
+    )
+
+
+def test_incomplete_candidate_spatial_artifact_is_rejected() -> None:
+    with pytest.raises(ValueError, match="candidate spatial modes require"):
+        IndependentVerificationPoints(
+            xy=np.asarray([[50.0, 50.0]], dtype=np.float64),
+            descriptors=np.asarray([[1.0, 0.0]], dtype=np.float32),
+            descriptor_reference_scores=np.asarray([1.0], dtype=np.float32),
+            candidate_track_ids=np.asarray([[7]], dtype=np.int64),
+            candidate_descriptor_scores=np.asarray([[1.0]], dtype=np.float32),
+            candidate_null_probabilities=np.asarray([0.0], dtype=np.float32),
+            candidate_spatial_offsets_xy=np.asarray([[0.0, 0.0]], dtype=np.float32),
+        )
+
+
+def _offset_grid(values: tuple) -> np.ndarray:
+    return np.stack(np.meshgrid(values, values), axis=-1).reshape(-1, 2).astype(
+        np.float32
+    )
+
+
+def _spatial_verifier(bank: LandmarkMapIndex) -> IndependentLandmarkPoseVerifier:
+    rays = bank.xyz / np.linalg.norm(bank.xyz, axis=1, keepdims=True)
+    views = LandmarkObservationViewIndex.from_track_observations(
+        bank.track_ids, bank.track_ids, rays.astype(np.float32)
+    )
+    return IndependentLandmarkPoseVerifier(
+        bank,
+        views,
+        IndependentLandmarkPoseLikelihoodConfig(
+            candidate_mode="fixed_global_topl",
+            fixed_candidate_prior_source="learned_probability",
+            maximum_view_angle_deg=90.0,
+            spatial_sigma_px=0.75,
+        ),
+    )
+
+
+def test_normalized_spatial_mixture_density_integrates_to_one() -> None:
+    axis = np.linspace(-6.0, 6.0, 241, dtype=np.float64)
+    xx, yy = np.meshgrid(axis, axis)
+    deltas = np.stack([xx.reshape(-1), yy.reshape(-1)], axis=1)[:, None, :]
+    log_density = _normalized_spatial_mixture_log_density(
+        delta_xy=deltas,
+        offsets_xy=np.asarray([[0.0, 0.0]], dtype=np.float64),
+        log_probabilities=np.zeros((len(deltas), 1, 1, 1), dtype=np.float64),
+        sigma_px=0.75,
+    )[:, 0, 0]
+    step = float(axis[1] - axis[0])
+    assert np.sum(np.exp(log_density)) * step * step == pytest.approx(
+        1.0, abs=2e-4
+    )
+
+
+def test_spatial_mode_density_does_not_depend_on_offset_grid_resolution() -> None:
+    coarse = _offset_grid((-2.0, 0.0, 2.0))
+    fine = _offset_grid((-2.0, -1.0, 0.0, 1.0, 2.0))
+
+    def density(offsets: np.ndarray) -> float:
+        logits = np.full((1, 1, 1, len(offsets)), -30.0, dtype=np.float64)
+        center = int(np.flatnonzero(np.all(offsets == 0.0, axis=1))[0])
+        logits[..., center] = 0.0
+        return float(
+            np.exp(
+                _normalized_spatial_mixture_log_density(
+                    delta_xy=np.asarray([[[0.7, -0.4]]], dtype=np.float64),
+                    offsets_xy=offsets,
+                    log_probabilities=logits,
+                    sigma_px=0.75,
+                )[0, 0, 0]
+            )
+        )
+
+    assert density(coarse) == pytest.approx(density(fine), rel=1e-8)
+    assert _regular_offset_grid_background_density(_offset_grid((-2.0, 0.0, 2.0))) > 0
+
+
+def test_separable_spatial_mixture_matches_logsumexp_density() -> None:
+    offsets = _offset_grid((-2.0, 0.0, 2.0)).astype(np.float64)
+    logits = np.linspace(-2.0, 1.0, len(offsets), dtype=np.float64)[None, None, None]
+    delta = np.asarray([[[0.6, -0.4]]], dtype=np.float64)
+    log_density = _normalized_spatial_mixture_log_density(
+        delta_xy=delta,
+        offsets_xy=offsets,
+        log_probabilities=logits,
+        sigma_px=0.75,
+    )[0, 0, 0]
+    probability_grid = np.exp(logits - np.logaddexp.reduce(logits, axis=-1)[..., None])
+    density = _normalized_spatial_mixture_density_from_regular_grid(
+        delta_xy=delta.reshape(-1, 2),
+        probability_grids=probability_grid.reshape(1, 3, 3),
+        x_values=np.asarray([-2.0, 0.0, 2.0], dtype=np.float64),
+        y_values=np.asarray([-2.0, 0.0, 2.0], dtype=np.float64),
+        sigma_px=0.75,
+    )[0]
+
+    assert np.log(density) == pytest.approx(log_density, abs=2e-6)
+
+
+def test_spatial_dustbin_is_pose_independent() -> None:
+    offsets = _offset_grid((-2.0, 0.0, 2.0))
+    points = IndependentVerificationPoints(
+        xy=np.asarray([[50.0, 50.0]], dtype=np.float64),
+        descriptors=np.asarray([[1.0, 0.0]], dtype=np.float32),
+        descriptor_reference_scores=np.asarray([1.0], dtype=np.float32),
+        candidate_track_ids=np.asarray([[7]], dtype=np.int64),
+        candidate_descriptor_scores=np.asarray([[1.0]], dtype=np.float32),
+        candidate_null_probabilities=np.asarray([0.0], dtype=np.float32),
+        candidate_spatial_offsets_xy=offsets,
+        candidate_spatial_log_probabilities=np.zeros(
+            (1, 1, 1, len(offsets)), dtype=np.float32
+        ),
+        candidate_spatial_dustbin_probabilities=np.ones(
+            (1, 1, 1), dtype=np.float32
+        ),
+        candidate_support_view_probabilities=np.ones(
+            (1, 1, 1), dtype=np.float32
+        ),
+        candidate_spatial_valid_mask=np.ones((1, 1, 1), dtype=bool),
+    )
+    verifier = _spatial_verifier(_bank())
+    shifted_pose = np.eye(4)
+    shifted_pose[0, 3] = 0.25
+    behind_camera = np.eye(4)
+    behind_camera[2, 3] = -10.0
+
+    center = verifier.score_pose(np.eye(4), _camera(), points)
+    shifted = verifier.score_pose(shifted_pose, _camera(), points)
+    behind = verifier.score_pose(behind_camera, _camera(), points)
+
+    assert center.point_evidence[0] == pytest.approx(1.0, abs=1e-6)
+    assert shifted.point_evidence[0] == pytest.approx(1.0, abs=1e-6)
+    assert behind.point_evidence[0] == pytest.approx(1.0, abs=1e-6)
+    assert shifted.log_likelihood_mean == pytest.approx(center.log_likelihood_mean)
+    assert behind.log_likelihood_mean == pytest.approx(center.log_likelihood_mean)
+
+
+def test_unique_track_assignment_rejects_repeated_track_explanations() -> None:
+    bank = LandmarkMapIndex(
+        track_ids=np.asarray([7, 8], dtype=np.int64),
+        xyz=np.asarray([[0.0, 0.0, 5.0], [0.05, 0.0, 5.0]], dtype=np.float64),
+        features=np.asarray([[1.0, 0.0], [1.0, 0.0]], dtype=np.float32),
+        mean_variances=np.zeros((2,), dtype=np.float32),
+        observation_counts=np.asarray([3, 3], dtype=np.int64),
+        observation_image_ids=(('support_7.png',), ('support_8.png',)),
+    )
+    offsets = _offset_grid((-2.0, 0.0, 2.0))
+    center = int(np.flatnonzero(np.all(offsets == 0.0, axis=1))[0])
+    log_maps = np.full((2, 2, 1, len(offsets)), -20.0, dtype=np.float32)
+    log_maps[..., center] = 0.0
+    points = IndependentVerificationPoints(
+        xy=np.asarray([[50.0, 50.0], [50.0, 50.0]], dtype=np.float64),
+        descriptors=np.asarray([[1.0, 0.0], [1.0, 0.0]], dtype=np.float32),
+        descriptor_reference_scores=np.asarray([1.0, 1.0], dtype=np.float32),
+        source_row_indices=np.asarray([11, 12], dtype=np.int64),
+        candidate_track_ids=np.asarray([[7, 8], [7, 8]], dtype=np.int64),
+        candidate_descriptor_scores=np.asarray(
+            [[0.7, 0.3], [0.7, 0.3]], dtype=np.float32
+        ),
+        candidate_null_probabilities=np.zeros((2,), dtype=np.float32),
+        candidate_spatial_offsets_xy=offsets,
+        candidate_spatial_log_probabilities=log_maps,
+        candidate_spatial_dustbin_probabilities=np.zeros((2, 2, 1), dtype=np.float32),
+        candidate_support_view_probabilities=np.ones((2, 2, 1), dtype=np.float32),
+        candidate_spatial_valid_mask=np.ones((2, 2, 1), dtype=bool),
+    )
+    verifier = _spatial_verifier(bank)
+
+    baseline = verifier.score_pose(np.eye(4), _camera(), points)
+    diagnostic_score = verifier.score_pose(
+        np.eye(4),
+        _camera(),
+        points,
+        emit_unique_track_assignment_diagnostic=True,
+    )
+    diagnostic = diagnostic_score.unique_track_assignment
+
+    assert diagnostic is not None
+    np.testing.assert_allclose(
+        diagnostic_score.point_evidence, baseline.point_evidence, rtol=0.0, atol=0.0
+    )
+    assert diagnostic.eligible_edge_count == 4
+    assert diagnostic.selected_candidate_count == 2
+    assert diagnostic.selected_unique_track_count == 2
+    assert diagnostic.collision_penalty > 0.0
+    selected = diagnostic.selected_candidate_columns
+    assert sorted(points.candidate_track_ids[np.arange(2), selected].tolist()) == [7, 8]
+
+
+def test_unique_track_assignment_keeps_dustbin_and_missing_modes_neutral() -> None:
+    offsets = _offset_grid((-2.0, 0.0, 2.0))
+    points = IndependentVerificationPoints(
+        xy=np.asarray([[50.0, 50.0]], dtype=np.float64),
+        descriptors=np.asarray([[1.0, 0.0]], dtype=np.float32),
+        descriptor_reference_scores=np.asarray([1.0], dtype=np.float32),
+        candidate_track_ids=np.asarray([[7]], dtype=np.int64),
+        candidate_descriptor_scores=np.asarray([[1.0]], dtype=np.float32),
+        candidate_null_probabilities=np.asarray([0.0], dtype=np.float32),
+        candidate_spatial_offsets_xy=offsets,
+        candidate_spatial_log_probabilities=np.zeros(
+            (1, 1, 1, len(offsets)), dtype=np.float32
+        ),
+        candidate_spatial_dustbin_probabilities=np.ones((1, 1, 1), dtype=np.float32),
+        candidate_support_view_probabilities=np.ones((1, 1, 1), dtype=np.float32),
+        candidate_spatial_valid_mask=np.ones((1, 1, 1), dtype=bool),
+    )
+    verifier = _spatial_verifier(_bank())
+    shifted_pose = np.eye(4)
+    shifted_pose[0, 3] = 0.25
+    behind_camera = np.eye(4)
+    behind_camera[2, 3] = -10.0
+
+    diagnostics = [
+        verifier.score_pose(
+            pose,
+            _camera(),
+            points,
+            emit_unique_track_assignment_diagnostic=True,
+        ).unique_track_assignment
+        for pose in (np.eye(4), shifted_pose, behind_camera)
+    ]
+
+    assert all(value is not None for value in diagnostics)
+    for diagnostic in diagnostics:
+        assert diagnostic is not None
+        assert diagnostic.active_point_count == 0
+        assert diagnostic.eligible_edge_count == 0
+        assert diagnostic.selected_candidate_count == 0
+        assert diagnostic.log_gain_over_null == pytest.approx(0.0, abs=1e-12)
+        assert diagnostic.independent_log_gain_over_null == pytest.approx(
+            0.0, abs=1e-12
+        )
+    assert diagnostics[0].log_joint == pytest.approx(diagnostics[1].log_joint)
+    assert diagnostics[0].log_joint == pytest.approx(diagnostics[2].log_joint)
+
+
+def test_unique_track_assignment_requires_candidate_specific_rgb_modes() -> None:
+    bank = _bank()
+    views = LandmarkObservationViewIndex.from_track_observations(
+        bank.track_ids,
+        np.asarray([7], dtype=np.int64),
+        np.asarray([[0.0, 0.0, 1.0]], dtype=np.float32),
+    )
+    verifier = IndependentLandmarkPoseVerifier(
+        bank,
+        views,
+        IndependentLandmarkPoseLikelihoodConfig(candidate_mode="fixed_global_topl"),
+    )
+    points = IndependentVerificationPoints(
+        xy=np.asarray([[50.0, 50.0]], dtype=np.float64),
+        descriptors=np.asarray([[1.0, 0.0]], dtype=np.float32),
+        descriptor_reference_scores=np.asarray([1.0], dtype=np.float32),
+        candidate_track_ids=np.asarray([[7]], dtype=np.int64),
+        candidate_descriptor_scores=np.asarray([[1.0]], dtype=np.float32),
+    )
+
+    with pytest.raises(ValueError, match="candidate-specific RGB modes"):
+        verifier.score_pose(
+            np.eye(4),
+            _camera(),
+            points,
+            emit_unique_track_assignment_diagnostic=True,
+        )
+
+
+def test_spatial_missing_view_and_omitted_candidate_mass_are_neutral() -> None:
+    bank = LandmarkMapIndex(
+        track_ids=np.asarray([7, 8], dtype=np.int64),
+        xyz=np.asarray([[0.0, 0.0, 5.0], [0.5, 0.0, 5.0]], dtype=np.float64),
+        features=np.asarray([[1.0, 0.0], [1.0, 0.0]], dtype=np.float32),
+        mean_variances=np.zeros((2,), dtype=np.float32),
+        observation_counts=np.asarray([3, 3], dtype=np.int64),
+        observation_image_ids=(("support_7.png",), ("support_8.png",)),
+    )
+    offsets = _offset_grid((-2.0, 0.0, 2.0))
+    points = IndependentVerificationPoints(
+        xy=np.asarray([[50.0, 50.0]], dtype=np.float64),
+        descriptors=np.asarray([[1.0, 0.0]], dtype=np.float32),
+        descriptor_reference_scores=np.asarray([1.0], dtype=np.float32),
+        candidate_track_ids=np.asarray([[7, 8]], dtype=np.int64),
+        candidate_descriptor_scores=np.asarray([[0.2, 0.3]], dtype=np.float32),
+        candidate_null_probabilities=np.asarray([0.5], dtype=np.float32),
+        candidate_spatial_offsets_xy=offsets,
+        candidate_spatial_log_probabilities=np.zeros(
+            (1, 2, 1, len(offsets)), dtype=np.float32
+        ),
+        candidate_spatial_dustbin_probabilities=np.ones(
+            (1, 2, 1), dtype=np.float32
+        ),
+        candidate_support_view_probabilities=np.asarray(
+            [[[1.0], [0.0]]], dtype=np.float32
+        ),
+        candidate_spatial_valid_mask=np.asarray(
+            [[[True], [False]]], dtype=bool
+        ),
+    )
+    verifier = _spatial_verifier(bank)
+    shifted_pose = np.eye(4)
+    shifted_pose[0, 3] = 0.2
+
+    center = verifier.score_pose(np.eye(4), _camera(), points)
+    shifted = verifier.score_pose(shifted_pose, _camera(), points)
+
+    # 0.5 explicit null + 0.2 dustbin + 0.3 missing candidate = one.
+    assert center.point_evidence[0] == pytest.approx(1.0, abs=1e-6)
+    assert shifted.point_evidence[0] == pytest.approx(1.0, abs=1e-6)
+
+
+def test_spatial_support_view_permutation_preserves_mixture_likelihood() -> None:
+    offsets = _offset_grid((-4.0, 0.0, 4.0))
+    center = int(np.flatnonzero(np.all(offsets == 0.0, axis=1))[0])
+    right = int(
+        np.flatnonzero(np.all(offsets == np.asarray([4.0, 0.0]), axis=1))[0]
+    )
+    log_maps = np.full((1, 1, 2, len(offsets)), -20.0, dtype=np.float32)
+    log_maps[0, 0, 0, center] = 0.0
+    log_maps[0, 0, 1, right] = 0.0
+    common = {
+        "xy": np.asarray([[50.0, 50.0]], dtype=np.float64),
+        "descriptors": np.asarray([[1.0, 0.0]], dtype=np.float32),
+        "descriptor_reference_scores": np.asarray([1.0], dtype=np.float32),
+        "candidate_track_ids": np.asarray([[7]], dtype=np.int64),
+        "candidate_descriptor_scores": np.asarray([[1.0]], dtype=np.float32),
+        "candidate_null_probabilities": np.asarray([0.0], dtype=np.float32),
+        "candidate_spatial_offsets_xy": offsets,
+        "candidate_spatial_dustbin_probabilities": np.zeros(
+            (1, 1, 2), dtype=np.float32
+        ),
+        "candidate_spatial_valid_mask": np.ones((1, 1, 2), dtype=bool),
+    }
+    original = IndependentVerificationPoints(
+        **common,
+        candidate_spatial_log_probabilities=log_maps,
+        candidate_support_view_probabilities=np.asarray(
+            [[[0.25, 0.75]]], dtype=np.float32
+        ),
+    )
+    swapped = IndependentVerificationPoints(
+        **common,
+        candidate_spatial_log_probabilities=log_maps[:, :, ::-1],
+        candidate_support_view_probabilities=np.asarray(
+            [[[0.75, 0.25]]], dtype=np.float32
+        ),
+    )
+    pose = np.eye(4)
+    pose[0, 3] = 0.25
+    verifier = _spatial_verifier(_bank())
+
+    first = verifier.score_pose(pose, _camera(), original)
+    second = verifier.score_pose(pose, _camera(), swapped)
+
+    assert first.point_evidence[0] == pytest.approx(
+        second.point_evidence[0], abs=1e-12
+    )
 
 
 def test_fixed_candidate_fold_does_not_renormalize_removed_identity_mass() -> None:

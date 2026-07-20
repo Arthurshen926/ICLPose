@@ -146,6 +146,38 @@ def validate_frozen_landmark_bank_contract(
     }
 
 
+def validate_landmark_memory_warm_start_contract(
+    bank_path: Path,
+    *,
+    warm_start_checkpoint: Path | None,
+    support_observations: Path,
+    expected_source_image_count: int | None = None,
+    required_source_image_ids: set[str] | None = None,
+    forbidden_source_image_ids: set[str] | None = None,
+) -> dict[str, object]:
+    """Validate a mutable full-bank initialization with the frozen-bank schema.
+
+    The artifact becomes mutable during training, but its descriptor space and
+    fixed track universe must be just as compatible with the warm-start model.
+    A global deployment bank may contain additional mapping images beyond the
+    episode support subset, so callers intentionally do not require an exact
+    source-image count match.
+    """
+
+    audit = validate_frozen_landmark_bank_contract(
+        bank_path,
+        warm_start_checkpoint=warm_start_checkpoint,
+        support_observations=support_observations,
+        expected_source_image_count=expected_source_image_count,
+        required_source_image_ids=required_source_image_ids,
+        forbidden_source_image_ids=forbidden_source_image_ids,
+    )
+    return {
+        **audit,
+        "memory_initialization_mode": "projected_landmark_mutable_warm_start",
+    }
+
+
 def validate_upstream_disjoint_manifest_contract(
     manifest_path: Path,
     *,
@@ -1097,6 +1129,8 @@ def _build_config(args: argparse.Namespace, samples: MatchaJointTrainingSet) -> 
         ),
         landmark_memory_capacity=int(args.landmark_memory_capacity),
         landmark_frozen_negative_bank=str(args.landmark_frozen_negative_bank),
+        landmark_memory_warm_start_bank=str(args.landmark_memory_warm_start_bank),
+        landmark_memory_sync_ddp=bool(args.landmark_memory_sync_ddp),
         landmark_memory_momentum=float(args.landmark_memory_momentum),
         landmark_memory_candidate_pool_size=int(args.landmark_memory_candidate_pool_size),
         landmark_semantic_hard_negatives_per_query=int(args.landmark_semantic_hard_negatives_per_query),
@@ -1314,6 +1348,23 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--landmark_frozen_negative_bank",
         default="",
         help="Read-only projected landmark snapshot shared by every DDP rank for global hard negatives.",
+    )
+    parser.add_argument(
+        "--landmark_memory_warm_start_bank",
+        default="",
+        help=(
+            "Projected-observation bank used as a mutable fixed-universe EMA warm start. "
+            "It must match --warm_start_joint_checkpoint and is mutually exclusive with "
+            "--landmark_frozen_negative_bank."
+        ),
+    )
+    parser.add_argument(
+        "--landmark_memory_sync_ddp",
+        action="store_true",
+        help=(
+            "Synchronize each mutable warm-start memory update across DDP ranks. "
+            "Requires --landmark_memory_warm_start_bank."
+        ),
     )
     parser.add_argument(
         "--landmark_frozen_bank_support_observations",
@@ -1601,12 +1652,20 @@ def main(argv: Sequence[str] | None = None) -> None:
             validation_manifest_path = validation_path
             validation_samples = None
     frozen_bank_contract: dict[str, object] = {}
-    if str(args.landmark_frozen_negative_bank):
+    warm_start_bank_contract: dict[str, object] = {}
+    if (
+        str(args.landmark_frozen_negative_bank)
+        and str(args.landmark_memory_warm_start_bank)
+    ):
+        raise ValueError(
+            "landmark_frozen_negative_bank and landmark_memory_warm_start_bank are mutually exclusive"
+        )
+    if str(args.landmark_frozen_negative_bank) or str(args.landmark_memory_warm_start_bank):
         support_observations = Path(
             args.landmark_frozen_bank_support_observations or args.landmark_track_observations
         )
         if not str(support_observations):
-            raise ValueError("frozen landmark bank validation requires support observations")
+            raise ValueError("landmark memory bank validation requires support observations")
         forbidden_source_image_ids: set[str] = set()
         if str(args.upstream_disjoint_query_split):
             query_split = json.loads(
@@ -1629,20 +1688,37 @@ def main(argv: Sequence[str] | None = None) -> None:
             if isinstance(train_provider, RealRadioMultiViewEpisodeProvider)
             else None
         )
-        frozen_bank_contract = validate_frozen_landmark_bank_contract(
-            Path(args.landmark_frozen_negative_bank),
-            warm_start_checkpoint=(
-                Path(args.warm_start_joint_checkpoint) if str(args.warm_start_joint_checkpoint) else None
+        validation_kwargs = {
+            "warm_start_checkpoint": (
+                Path(args.warm_start_joint_checkpoint)
+                if str(args.warm_start_joint_checkpoint)
+                else None
             ),
-            support_observations=support_observations,
-            required_source_image_ids=required_source_image_ids,
-            forbidden_source_image_ids=forbidden_source_image_ids,
-            expected_source_image_count=(
+            "support_observations": support_observations,
+            "required_source_image_ids": required_source_image_ids,
+            "forbidden_source_image_ids": forbidden_source_image_ids,
+            "expected_source_image_count": (
                 None
                 if required_source_image_ids is None
                 else int(len(required_source_image_ids))
             ),
-        )
+        }
+        if str(args.landmark_frozen_negative_bank):
+            frozen_bank_contract = validate_frozen_landmark_bank_contract(
+                Path(args.landmark_frozen_negative_bank),
+                **validation_kwargs,
+            )
+        if str(args.landmark_memory_warm_start_bank):
+            warm_start_validation_kwargs = {
+                **validation_kwargs,
+                # The global inference bank can legitimately contain mapping
+                # images that the episode sampler does not use as support.
+                "expected_source_image_count": None,
+            }
+            warm_start_bank_contract = validate_landmark_memory_warm_start_contract(
+                Path(args.landmark_memory_warm_start_bank),
+                **warm_start_validation_kwargs,
+            )
     train_sample_get = None if train_provider is None else train_provider.get
     coherent_hard_negative_audit: dict[str, object] = {}
     coherent_enabled = float(args.landmark_coherent_hard_negative_margin_weight) > 0.0
@@ -1780,6 +1856,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             "descriptor_token_manifest": str(args.descriptor_token_manifest),
             "track_prototype_builder": prototype_builder.to_dict(),
             "frozen_landmark_bank_contract": frozen_bank_contract,
+            "landmark_memory_warm_start_contract": warm_start_bank_contract,
             "coherent_hard_negative_audit": coherent_hard_negative_audit,
             "landmark_episode_support_pairs": int(args.landmark_episode_support_pairs),
             "landmark_episode_min_support_pairs": int(args.landmark_episode_min_support_pairs),
@@ -1836,6 +1913,27 @@ def main(argv: Sequence[str] | None = None) -> None:
             "landmark_memory_negative_merge_policy": str(
                 cfg.landmark_memory_negative_merge_policy
             ),
+            "landmark_memory_mode": (
+                "global_frozen_snapshot"
+                if str(cfg.landmark_frozen_negative_bank)
+                else (
+                    "ddp_synchronized_global_warm_start_ema"
+                    if (
+                        str(cfg.landmark_memory_warm_start_bank)
+                        and bool(cfg.landmark_memory_sync_ddp)
+                        and bool(distributed_runtime["enabled"])
+                    )
+                    else (
+                        "global_warm_start_ema"
+                        if str(cfg.landmark_memory_warm_start_bank)
+                        else "rank_local_ema"
+                    )
+                )
+            ),
+            "landmark_memory_warm_start_bank": str(
+                cfg.landmark_memory_warm_start_bank
+            ),
+            "landmark_memory_sync_ddp": bool(cfg.landmark_memory_sync_ddp),
             "landmark_system_hard_negative_margin_weight": float(
                 cfg.landmark_system_hard_negative_margin_weight
             ),
@@ -1857,6 +1955,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         "upstream_disjoint_contract": upstream_disjoint_contract,
         "internal_query_disjoint_contract": internal_query_disjoint_contract,
         "frozen_landmark_bank_contract": frozen_bank_contract,
+        "landmark_memory_warm_start_contract": warm_start_bank_contract,
         "coherent_hard_negative_audit": coherent_hard_negative_audit,
         "config": asdict(cfg),
         "training": dict(run.summary),

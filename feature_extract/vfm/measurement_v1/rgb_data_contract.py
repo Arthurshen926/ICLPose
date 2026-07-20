@@ -133,6 +133,74 @@ def image_root_manifest(
     }
 
 
+def image_source_contract_signature(contract: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the immutable real-image identity for a spatial feature cache.
+
+    This is intentionally separate from a candidate/measurement data contract:
+    image-context caches are shared by multiple target-free probes, but their
+    descriptors cease to be meaningful as soon as either image IDs or source
+    pixels change.
+    """
+
+    value = dict(contract)
+    required = {
+        "version",
+        "resolved_image_root",
+        "image_count",
+        "image_ids_sha256",
+        "sampled_content_manifest_sha256",
+        "source_image_dimensions",
+        "sampled_bytes_per_file_end",
+    }
+    missing = sorted(required - set(value))
+    if missing:
+        raise ValueError(f"image source contract lacks fields: {missing}")
+    signature = {
+        "version": int(value["version"]),
+        "resolved_image_root": str(value["resolved_image_root"]),
+        "image_count": int(value["image_count"]),
+        "image_ids_sha256": str(value["image_ids_sha256"]),
+        "sampled_content_manifest_sha256": str(
+            value["sampled_content_manifest_sha256"]
+        ),
+        "source_image_dimensions": dict(value["source_image_dimensions"]),
+        "sampled_bytes_per_file_end": int(value["sampled_bytes_per_file_end"]),
+    }
+    if (
+        signature["version"] != 1
+        or signature["image_count"] <= 0
+        or not signature["resolved_image_root"]
+        or not signature["image_ids_sha256"]
+        or not signature["sampled_content_manifest_sha256"]
+        or not signature["source_image_dimensions"]
+        or signature["sampled_bytes_per_file_end"] <= 0
+    ):
+        raise ValueError("image source contract is invalid")
+    return signature
+
+
+def require_compatible_image_source_contracts(
+    expected: Mapping[str, Any], actual: Mapping[str, Any], *, context: str
+) -> None:
+    """Fail closed when two cached image descriptor sources differ."""
+
+    expected_signature = image_source_contract_signature(expected)
+    actual_signature = image_source_contract_signature(actual)
+    if expected_signature != actual_signature:
+        differences = {
+            key: {
+                "expected": expected_signature.get(key),
+                "actual": actual_signature.get(key),
+            }
+            for key in sorted(set(expected_signature) | set(actual_signature))
+            if expected_signature.get(key) != actual_signature.get(key)
+        }
+        raise ValueError(
+            f"{context} image source contract mismatch: "
+            f"{json.dumps(differences, sort_keys=True)}"
+        )
+
+
 def contract_compatibility_signature(contract: Mapping[str, Any]) -> dict[str, Any]:
     coordinate = dict(contract.get("coordinate_space", {}))
     images = dict(contract.get("image_source", {}))

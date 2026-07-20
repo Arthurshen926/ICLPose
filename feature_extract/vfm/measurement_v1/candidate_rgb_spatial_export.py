@@ -22,6 +22,8 @@ from feature_extract.vfm.measurement_v1.candidate_rgb_identity_training import (
 )
 from feature_extract.vfm.measurement_v1.candidate_rgb_identity_verifier import (
     GT_POSE_SPATIAL_DENSITY_SEMANTICS,
+    IDENTITY_CONTEXT_LAYOUT_SEMANTICS,
+    IDENTITY_CONTEXT_SEMANTICS,
     IndependentRGBCandidateVerifier,
     MEASUREMENT_MODE_SUCCESS_SEMANTICS,
     POSE_VIEW_MIXTURE_SEMANTICS,
@@ -96,9 +98,11 @@ def _load_model(
         "independent_rgb_candidate_verifier_v3",
         "independent_rgb_candidate_verifier_v4",
         "independent_rgb_candidate_verifier_v5",
+        "independent_rgb_candidate_verifier_v6",
+        "independent_rgb_candidate_verifier_v8",
     }:
         raise ValueError(
-            "production RGB spatial export requires verifier v3, v4, or v5 with "
+            "production RGB spatial export requires verifier v3 through v6 or v8 with "
             "target-only GT-pose supervision"
         )
     if (
@@ -136,8 +140,66 @@ def _load_model(
         pose_view_mixture_enabled=bool(
             config.get("pose_view_mixture_enabled", False)
         ),
+        identity_context_radius_px=(
+            float(config["identity_context_radius_px"])
+            if bool(config.get("identity_context_enabled", False))
+            else None
+        ),
+        identity_context_step_px=(
+            float(config["identity_context_step_px"])
+            if bool(config.get("identity_context_enabled", False))
+            else None
+        ),
+        identity_context_layout_grid_size=(
+            int(config["identity_context_layout_grid_size"])
+            if bool(config.get("identity_context_layout_enabled", False))
+            else None
+        ),
     )
     if checkpoint_format in {
+        "independent_rgb_candidate_verifier_v6",
+        "independent_rgb_candidate_verifier_v8",
+    }:
+        if not model.identity_context_enabled or config.get(
+            "identity_context_semantics"
+        ) != IDENTITY_CONTEXT_SEMANTICS:
+            raise ValueError("RGB verifier identity-context contract is incompatible")
+        if checkpoint_format == "independent_rgb_candidate_verifier_v8" and (
+            not model.identity_context_layout_enabled
+            or config.get("identity_context_layout_semantics")
+            != IDENTITY_CONTEXT_LAYOUT_SEMANTICS
+        ):
+            raise ValueError("RGB verifier v8 layout-context contract is incompatible")
+        model.load_state_dict(payload["model"], strict=True)
+        data_contract = dict(payload.get("data_contract", {}))
+        if not data_contract:
+            raise ValueError("production RGB verifier lacks its RGB data contract")
+        if config.get("measurement_validity_semantics") == (
+            GT_POSE_SPATIAL_DENSITY_SEMANTICS
+        ):
+            dustbin_semantics = NORMALIZED_SPATIAL_DUSTBIN_SEMANTICS
+            success_threshold_px = float("nan")
+            if (
+                not math.isfinite(spatial_target_sigma_px)
+                or spatial_target_sigma_px <= 0.0
+            ):
+                raise ValueError(
+                    "RGB verifier lacks its positive spatial target sigma contract"
+                )
+        elif config.get("measurement_validity_semantics") == (
+            MEASUREMENT_VALIDITY_SEMANTICS
+        ):
+            dustbin_semantics = MEASUREMENT_DUSTBIN_SEMANTICS
+            success_threshold_px = float(
+                training.get("measurement_success_threshold_px", 2.0)
+            )
+            if not math.isclose(
+                success_threshold_px, 2.0, rel_tol=0.0, abs_tol=1e-8
+            ):
+                raise ValueError("production RGB verifier must use the 2px validity contract")
+        else:
+            raise ValueError("RGB verifier measurement-validity contract is incompatible")
+    elif checkpoint_format in {
         "independent_rgb_candidate_verifier_v4",
         "independent_rgb_candidate_verifier_v5",
     }:
@@ -242,6 +304,13 @@ def _architecture_signature(model: IndependentRGBCandidateVerifier) -> dict[str,
             "max_views",
             "pose_view_mixture_enabled",
             "pose_view_mixture_semantics",
+            "identity_context_enabled",
+            "identity_context_radius_px",
+            "identity_context_step_px",
+            "identity_context_semantics",
+            "identity_context_layout_enabled",
+            "identity_context_layout_grid_size",
+            "identity_context_layout_semantics",
         )
     }
     signature.update({
@@ -344,6 +413,8 @@ def export_candidate_rgb_spatial_likelihood(
             "independent_rgb_candidate_verifier_v3",
             "independent_rgb_candidate_verifier_v4",
             "independent_rgb_candidate_verifier_v5",
+            "independent_rgb_candidate_verifier_v6",
+            "independent_rgb_candidate_verifier_v8",
         }:
             require_inference_compatible_contracts(
                 model._data_contract,
@@ -400,12 +471,24 @@ def export_candidate_rgb_spatial_likelihood(
                 image_cache_device=torch_device,
                 crop_radius_px=models[0].crop_radius_px,
                 step_px=models[0].step_px,
+                # This artifact exports only the local K+1 measurement density.
+                # Identity context is intentionally disabled here: broad RGB is
+                # not allowed to alter offsets, dustbin, or pose-view weights.
+                identity_context_crop_radius_px=None,
+                identity_context_step_px=None,
                 identity_threshold_px=2.0,
                 identity_negative_threshold_px=5.0,
                 spatial_radius_px=models[0].search_radius_px,
             )
             predictions = [
-                _forward_batch(model, batch, device=torch_device, use_amp=amp_enabled)
+                _forward_batch(
+                    model,
+                    batch,
+                    device=torch_device,
+                    use_amp=amp_enabled,
+                    identity_context_residual_scale=0.0,
+                    identity_context_layout_residual_scale=0.0,
+                )
                 for model in models
             ]
             normalized_density = (

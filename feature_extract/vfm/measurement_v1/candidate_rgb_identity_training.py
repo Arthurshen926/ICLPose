@@ -62,6 +62,351 @@ def _average_precision(labels: np.ndarray, scores: np.ndarray) -> float:
     return float(np.sum(precision[ranked]) / positives)
 
 
+IDENTITY_TARGET_APPEARANCE = "appearance_observation"
+IDENTITY_TARGET_GEOMETRIC = "geometric_projection"
+IDENTITY_TARGET_MODES = (
+    IDENTITY_TARGET_APPEARANCE,
+    IDENTITY_TARGET_GEOMETRIC,
+)
+
+
+def _identity_training_masks(
+    *,
+    valid: np.ndarray,
+    actual_query_observation: np.ndarray,
+    actual_center_residuals: np.ndarray,
+    target_projection_residuals: np.ndarray,
+    identity_target: str,
+    positive_threshold_px: float,
+    negative_threshold_px: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build the groupwise target and hard-negative mask for RGB evidence.
+
+    ``appearance_observation`` is the original exact-SfM-observation objective.
+    ``geometric_projection`` is deliberately separate: it learns whether a
+    frozen candidate can serve the downstream PnP geometry at the GT pose,
+    including near-correct tracks that were not the exact observed SfM track.
+    """
+
+    target_mode = str(identity_target)
+    if target_mode not in IDENTITY_TARGET_MODES:
+        raise ValueError(
+            "identity_target must be one of " f"{list(IDENTITY_TARGET_MODES)}"
+        )
+    candidate_valid = np.asarray(valid, dtype=bool)
+    observed = np.asarray(actual_query_observation, dtype=bool)
+    center_residual = np.asarray(actual_center_residuals, dtype=np.float32)
+    projection_residual = np.asarray(target_projection_residuals, dtype=np.float32)
+    if not (
+        candidate_valid.shape == observed.shape
+        == center_residual.shape
+        == projection_residual.shape
+    ):
+        raise ValueError("identity training target arrays are incompatible")
+    if float(positive_threshold_px) <= 0.0 or float(negative_threshold_px) <= float(
+        positive_threshold_px
+    ):
+        raise ValueError("identity target thresholds are invalid")
+    if target_mode == IDENTITY_TARGET_APPEARANCE:
+        labels = (
+            candidate_valid
+            & observed
+            & np.isfinite(center_residual)
+            & (center_residual <= float(positive_threshold_px))
+        )
+    else:
+        labels = (
+            candidate_valid
+            & np.isfinite(projection_residual)
+            & (projection_residual <= float(positive_threshold_px))
+        )
+    supervision_valid = candidate_valid & (
+        labels
+        | (
+            np.isfinite(projection_residual)
+            & (projection_residual >= float(negative_threshold_px))
+        )
+    )
+    return labels, supervision_valid
+
+
+def _identity_target_semantics(identity_target: str) -> str:
+    if str(identity_target) == IDENTITY_TARGET_APPEARANCE:
+        return "actual_query_sfm_observation_center_residual_le_threshold"
+    if str(identity_target) == IDENTITY_TARGET_GEOMETRIC:
+        return "candidate_target_gt_projection_residual_le_threshold"
+    raise ValueError(f"unsupported identity target: {identity_target}")
+
+
+def _resolve_identity_target(
+    requested: str | None, *, initialization_training: Mapping[str, Any]
+) -> str:
+    """Use checkpoint lineage for evaluation unless the caller overrides it."""
+
+    target = (
+        initialization_training.get("identity_target", IDENTITY_TARGET_APPEARANCE)
+        if requested is None
+        else requested
+    )
+    resolved = str(target)
+    if resolved not in IDENTITY_TARGET_MODES:
+        raise ValueError(
+            "identity_target must be one of " f"{list(IDENTITY_TARGET_MODES)}"
+        )
+    return resolved
+
+
+def _initialization_provenance(
+    path: Path, payload: Mapping[str, Any]
+) -> dict[str, object]:
+    """Preserve the source model's actual training lineage in eval-only runs."""
+
+    training = dict(payload.get("training", {}))
+    return {
+        "initialization_checkpoint": str(Path(path)),
+        "initialization_checkpoint_sha256": file_sha256_short(Path(path)),
+        "initialization_checkpoint_format": str(payload.get("format", "")),
+        "initialization_training": training,
+    }
+
+
+def _resolve_spatial_support_config(
+    initial_config: Mapping[str, Any],
+    *,
+    search_radius_px_override: float | None = None,
+    context_radius_px_override: float | None = None,
+    step_px_override: float | None = None,
+) -> tuple[dict[str, float], dict[str, dict[str, float]]]:
+    """Resolve an explicit spatial-support ablation without changing defaults.
+
+    A different crop/template support changes the meaning of a learned spatial
+    density.  Callers therefore receive both the resolved values and a compact
+    manifest of every override, rather than silently inheriting a checkpoint's
+    calibrated support.
+    """
+
+    required = {"search_radius_px", "context_radius_px", "step_px"}
+    missing = required.difference(initial_config)
+    if missing:
+        raise ValueError(
+            "measurement checkpoint lacks spatial support config: "
+            f"{sorted(missing)}"
+        )
+    resolved = {
+        name: float(initial_config[name])
+        for name in ("search_radius_px", "context_radius_px", "step_px")
+    }
+    overrides: dict[str, dict[str, float]] = {}
+    requested = {
+        "search_radius_px": search_radius_px_override,
+        "context_radius_px": context_radius_px_override,
+        "step_px": step_px_override,
+    }
+    for name, value in requested.items():
+        if value is None:
+            continue
+        resolved_value = float(value)
+        if not math.isfinite(resolved_value):
+            raise ValueError(f"{name}_override must be finite")
+        if name == "context_radius_px":
+            valid = resolved_value >= 0.0
+        else:
+            valid = resolved_value > 0.0
+        if not valid:
+            comparison = "non-negative" if name == "context_radius_px" else "positive"
+            raise ValueError(f"{name}_override must be {comparison}")
+        if not math.isclose(
+            resolved_value,
+            resolved[name],
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ):
+            overrides[name] = {
+                "checkpoint_value": float(resolved[name]),
+                "resolved_value": resolved_value,
+            }
+            resolved[name] = resolved_value
+    return resolved, overrides
+
+
+def _resolve_identity_context_config(
+    initial_config: Mapping[str, Any],
+    *,
+    identity_context_radius_px: float | None = None,
+    identity_context_step_px: float | None = None,
+) -> tuple[dict[str, float | bool | None], dict[str, dict[str, float | None]]]:
+    """Resolve a separately declared broad identity-context branch.
+
+    Unlike the local spatial support, this branch provides no offset or
+    dustbin density. It contributes only per-view candidate identity evidence.
+    """
+
+    checkpoint_enabled = bool(initial_config.get("identity_context_enabled", False))
+    checkpoint_radius = initial_config.get("identity_context_radius_px")
+    checkpoint_step = initial_config.get("identity_context_step_px")
+    if checkpoint_enabled:
+        if checkpoint_radius is None or checkpoint_step is None:
+            raise ValueError("identity-context checkpoint lacks radius or step")
+        checkpoint_radius = float(checkpoint_radius)
+        checkpoint_step = float(checkpoint_step)
+    else:
+        checkpoint_radius = None
+        checkpoint_step = None
+
+    if (identity_context_radius_px is None) != (identity_context_step_px is None):
+        raise ValueError(
+            "identity_context_radius_px and identity_context_step_px must be provided together"
+        )
+    if identity_context_radius_px is None:
+        return {
+            "enabled": checkpoint_enabled,
+            "radius_px": checkpoint_radius,
+            "step_px": checkpoint_step,
+        }, {}
+
+    resolved_radius = float(identity_context_radius_px)
+    resolved_step = float(identity_context_step_px)
+    if (
+        not math.isfinite(resolved_radius)
+        or not math.isfinite(resolved_step)
+        or resolved_radius <= 0.0
+        or resolved_step <= 0.0
+    ):
+        raise ValueError("identity context radius and step must be finite and positive")
+    overrides: dict[str, dict[str, float | None]] = {}
+    if checkpoint_radius is None or not math.isclose(
+        resolved_radius, checkpoint_radius, rel_tol=0.0, abs_tol=1e-12
+    ):
+        overrides["radius_px"] = {
+            "checkpoint_value": checkpoint_radius,
+            "resolved_value": resolved_radius,
+        }
+    if checkpoint_step is None or not math.isclose(
+        resolved_step, checkpoint_step, rel_tol=0.0, abs_tol=1e-12
+    ):
+        overrides["step_px"] = {
+            "checkpoint_value": checkpoint_step,
+            "resolved_value": resolved_step,
+        }
+    return {
+        "enabled": True,
+        "radius_px": resolved_radius,
+        "step_px": resolved_step,
+    }, overrides
+
+
+def _resolve_identity_context_layout_config(
+    initial_config: Mapping[str, Any],
+    *,
+    identity_context_layout_grid_size: int | None = None,
+) -> tuple[dict[str, int | bool | None], dict[str, dict[str, int | None]]]:
+    """Resolve an opt-in broad-context layout residual without changing v6.
+
+    The pooled broad context introduced in v6 and the layout-preserving branch
+    are separate evidence paths.  A checkpoint that already declares a layout
+    grid must retain it; enabling a grid on a v6 checkpoint explicitly creates
+    a new v8 branch whose missing parameters are initialized from scratch.
+    """
+
+    checkpoint_enabled = bool(
+        initial_config.get("identity_context_layout_enabled", False)
+    )
+    checkpoint_grid = initial_config.get("identity_context_layout_grid_size")
+    if checkpoint_enabled:
+        if checkpoint_grid is None:
+            raise ValueError("identity-context layout checkpoint lacks grid size")
+        checkpoint_grid = int(checkpoint_grid)
+    else:
+        checkpoint_grid = None
+    if identity_context_layout_grid_size is None:
+        return {"enabled": checkpoint_enabled, "grid_size": checkpoint_grid}, {}
+    resolved_grid = int(identity_context_layout_grid_size)
+    if resolved_grid < 2 or resolved_grid > 8:
+        raise ValueError("identity_context_layout_grid_size must be in [2, 8]")
+    overrides: dict[str, dict[str, int | None]] = {}
+    if checkpoint_grid is None or resolved_grid != checkpoint_grid:
+        overrides["grid_size"] = {
+            "checkpoint_value": checkpoint_grid,
+            "resolved_value": resolved_grid,
+        }
+    return {"enabled": True, "grid_size": resolved_grid}, overrides
+
+
+def _set_identity_context_residual_training_mode(
+    model: IndependentRGBCandidateVerifier,
+) -> None:
+    """Train broad identity context without updating local evidence buffers.
+
+    ``requires_grad_(False)`` does not stop BatchNorm-style buffers or dropout
+    behavior from changing when the parent model is switched to train mode.
+    Context-only calibration must therefore keep every local evidence module in
+    eval mode while the explicitly trainable broad-context modules remain in
+    train mode.
+    """
+
+    if (
+        model.identity_context_encoder is None
+        or model.identity_context_evidence is None
+        or model.identity_context_residual is None
+    ):
+        raise ValueError("identity-context residual training requires context modules")
+    model.train()
+    for module in (
+        model.encoder,
+        model.view_evidence,
+        model.view_identity_head,
+        model.view_measurement_validity_head,
+        model.view_pose_mixture_head,
+        model.set_candidate_encoder,
+        model.measured_set_availability_head,
+    ):
+        module.eval()
+    for module in (
+        model.identity_context_encoder,
+        model.identity_context_evidence,
+        model.identity_context_residual,
+    ):
+        module.train()
+
+
+def _set_identity_context_layout_residual_training_mode(
+    model: IndependentRGBCandidateVerifier,
+) -> None:
+    """Train only the isolated layout path while preserving local/v6 paths."""
+
+    if (
+        model.identity_context_encoder is None
+        or model.identity_context_evidence is None
+        or model.identity_context_residual is None
+        or model.identity_context_layout_encoder is None
+        or model.identity_context_layout_fusion is None
+        or model.identity_context_layout_evidence is None
+        or model.identity_context_layout_residual is None
+    ):
+        raise ValueError("identity-context layout training requires v8 context modules")
+    model.train()
+    for module in (
+        model.encoder,
+        model.view_evidence,
+        model.view_identity_head,
+        model.view_measurement_validity_head,
+        model.view_pose_mixture_head,
+        model.set_candidate_encoder,
+        model.measured_set_availability_head,
+        model.identity_context_encoder,
+        model.identity_context_evidence,
+        model.identity_context_residual,
+    ):
+        module.eval()
+    for module in (
+        model.identity_context_layout_encoder,
+        model.identity_context_layout_fusion,
+        model.identity_context_layout_evidence,
+        model.identity_context_layout_residual,
+    ):
+        module.train()
+
+
 def _load_evidence(path: Path) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
     with np.load(Path(path), allow_pickle=False) as payload:
         arrays = {
@@ -370,6 +715,7 @@ class CandidateRGBTrainingData:
         split_name: str,
         positive_threshold_px: float,
         negative_threshold_px: float,
+        identity_target: str = IDENTITY_TARGET_APPEARANCE,
     ) -> float:
         positive_views = 0
         total_views = 0
@@ -378,22 +724,24 @@ class CandidateRGBTrainingData:
                 if not bool(self.candidate_valid[int(index), candidate]):
                     continue
                 count = len(rows)
-                appearance_positive = bool(
-                    self.actual_query_observation[int(index), candidate]
-                    and np.isfinite(
-                        self.actual_center_residuals[int(index), candidate]
-                    )
-                    and float(self.actual_center_residuals[int(index), candidate])
-                    <= float(positive_threshold_px)
+                labels, supervised = _identity_training_masks(
+                    valid=self.candidate_valid[int(index), candidate : candidate + 1],
+                    actual_query_observation=self.actual_query_observation[
+                        int(index), candidate : candidate + 1
+                    ],
+                    actual_center_residuals=self.actual_center_residuals[
+                        int(index), candidate : candidate + 1
+                    ],
+                    target_projection_residuals=self.residuals[
+                        int(index), candidate : candidate + 1
+                    ],
+                    identity_target=str(identity_target),
+                    positive_threshold_px=float(positive_threshold_px),
+                    negative_threshold_px=float(negative_threshold_px),
                 )
-                hard_negative = bool(
-                    np.isfinite(self.residuals[int(index), candidate])
-                    and float(self.residuals[int(index), candidate])
-                    >= float(negative_threshold_px)
-                )
-                if appearance_positive or hard_negative:
+                if bool(supervised[0]):
                     total_views += count
-                if appearance_positive:
+                if bool(labels[0]):
                     positive_views += count
         if positive_views <= 0 or positive_views >= total_views:
             raise ValueError("view identity prior requires both natural target classes")
@@ -428,10 +776,14 @@ def _prepare_batch(
     image_height: int,
     image_cache: TensorImageLRUCache,
     image_cache_device: torch.device | None,
+    image_crop_device: torch.device | None = None,
     crop_radius_px: float,
     step_px: float,
+    identity_context_crop_radius_px: float | None = None,
+    identity_context_step_px: float | None = None,
     identity_threshold_px: float,
     identity_negative_threshold_px: float,
+    identity_target: str = IDENTITY_TARGET_APPEARANCE,
     spatial_radius_px: float,
     natural_supervision_mask: Sequence[bool] | None = None,
 ) -> dict[str, object]:
@@ -466,6 +818,7 @@ def _prepare_batch(
         render_patch_augmentation="none",
         support_patch_warp="none",
         image_cache_device=image_cache_device,
+        crop_device=image_crop_device,
     )
     first_pair_by_group = [-1] * len(evidence_indices)
     for pair_row, group in enumerate(pair_groups):
@@ -473,6 +826,49 @@ def _prepare_batch(
             first_pair_by_group[group] = int(pair_row)
     if any(value < 0 for value in first_pair_by_group):
         raise ValueError("candidate RGB batch contains a group without a query patch")
+    if (identity_context_crop_radius_px is None) != (
+        identity_context_step_px is None
+    ):
+        raise ValueError(
+            "identity context crop radius and step must be provided together"
+        )
+    identity_context_query_patch: torch.Tensor | None = None
+    identity_context_support_patch: torch.Tensor | None = None
+    if identity_context_crop_radius_px is not None:
+        (
+            context_query_patch,
+            context_support_patch,
+            _context_target,
+            _context_baseline,
+            _context_dustbin,
+        ) = _stack_patch_batch(
+            flat_rows,
+            image_root=Path(image_root),
+            render_cache_by_query={},
+            image_width=int(image_width),
+            image_height=int(image_height),
+            crop_radius_px=float(identity_context_crop_radius_px),
+            step_px=float(identity_context_step_px),
+            query_cache=image_cache,
+            render_cache=image_cache,
+            query_source="real_pair",
+            render_patch_augmentation="none",
+            support_patch_warp="none",
+            image_cache_device=image_cache_device,
+            crop_device=image_crop_device,
+        )
+        if int(context_query_patch.shape[0]) != len(flat_rows) or int(
+            context_support_patch.shape[0]
+        ) != len(flat_rows):
+            raise ValueError("identity context crops are misaligned with RGB pairs")
+        identity_context_query_patch = context_query_patch[
+            torch.tensor(
+                first_pair_by_group,
+                dtype=torch.long,
+                device=context_query_patch.device,
+            )
+        ]
+        identity_context_support_patch = context_support_patch
     indices = np.asarray(evidence_indices, dtype=np.int64)
     natural_mask = np.ones((len(indices),), dtype=bool)
     if natural_supervision_mask is not None:
@@ -481,18 +877,14 @@ def _prepare_batch(
             raise ValueError("natural supervision mask must select at least one batch group")
     valid = data.candidate_valid[indices]
     residuals = data.residuals[indices]
-    labels = (
-        valid
-        & data.actual_query_observation[indices]
-        & np.isfinite(data.actual_center_residuals[indices])
-        & (data.actual_center_residuals[indices] <= float(identity_threshold_px))
-    )
-    identity_supervision_valid = valid & (
-        labels
-        | (
-            np.isfinite(residuals)
-            & (residuals >= float(identity_negative_threshold_px))
-        )
+    labels, identity_supervision_valid = _identity_training_masks(
+        valid=valid,
+        actual_query_observation=data.actual_query_observation[indices],
+        actual_center_residuals=data.actual_center_residuals[indices],
+        target_projection_residuals=residuals,
+        identity_target=str(identity_target),
+        positive_threshold_px=float(identity_threshold_px),
+        negative_threshold_px=float(identity_negative_threshold_px),
     )
     availability_labels = data.availability_valid[indices] & np.isfinite(
         data.availability_residuals[indices]
@@ -644,6 +1036,8 @@ def _prepare_batch(
             torch.tensor(first_pair_by_group, dtype=torch.long, device=query_patch.device)
         ],
         "support_patches": support_patch,
+        "identity_context_query_patches_by_group": identity_context_query_patch,
+        "identity_context_support_patches": identity_context_support_patch,
         "pair_group_indices": torch.tensor(pair_groups, dtype=torch.long),
         "pair_candidate_indices": torch.tensor(pair_candidates, dtype=torch.long),
         "pair_view_slots": torch.tensor(pair_slots, dtype=torch.long),
@@ -693,21 +1087,41 @@ def _forward_batch(
     *,
     device: torch.device,
     use_amp: bool,
+    identity_context_residual_scale: float = 1.0,
+    identity_context_layout_residual_scale: float = 0.0,
 ) -> RGBCandidateIdentityPrediction:
     with torch.autocast(
         device_type=device.type,
         dtype=(torch.float16 if device.type == "cuda" else torch.bfloat16),
         enabled=bool(use_amp and device.type == "cuda"),
     ):
-        return model(
-            query_patches_by_group=batch["query_patches_by_group"].to(device),
-            support_patches=batch["support_patches"].to(device),
-            pair_group_indices=batch["pair_group_indices"].to(device),
-            pair_candidate_indices=batch["pair_candidate_indices"].to(device),
-            pair_view_slots=batch["pair_view_slots"].to(device),
-            pair_view_probabilities=batch["pair_view_probabilities"].to(device),
-            candidate_valid=batch["candidate_valid"].to(device),
+        kwargs: dict[str, torch.Tensor] = {
+            "query_patches_by_group": batch["query_patches_by_group"].to(device),
+            "support_patches": batch["support_patches"].to(device),
+            "pair_group_indices": batch["pair_group_indices"].to(device),
+            "pair_candidate_indices": batch["pair_candidate_indices"].to(device),
+            "pair_view_slots": batch["pair_view_slots"].to(device),
+            "pair_view_probabilities": batch["pair_view_probabilities"].to(device),
+            "candidate_valid": batch["candidate_valid"].to(device),
+            "identity_context_residual_scale": float(
+                identity_context_residual_scale
+            ),
+            "identity_context_layout_residual_scale": float(
+                identity_context_layout_residual_scale
+            ),
+        }
+        context_requested = (
+            float(identity_context_residual_scale) > 0.0
+            or float(identity_context_layout_residual_scale) > 0.0
         )
+        if model.identity_context_enabled and context_requested:
+            context_query = batch["identity_context_query_patches_by_group"]
+            context_support = batch["identity_context_support_patches"]
+            if context_query is None or context_support is None:
+                raise ValueError("dual-scale verifier batch lacks identity context crops")
+            kwargs["identity_context_query_patches_by_group"] = context_query.to(device)
+            kwargs["identity_context_support_patches"] = context_support.to(device)
+        return model(**kwargs)
 
 
 def gt_pose_spatial_density_nll(
@@ -875,6 +1289,86 @@ def _weighted_selected_mean(
     )
 
 
+def coarse_prior_hard_negative_ranking_loss(
+    candidate_log_likelihood_ratios: torch.Tensor,
+    *,
+    labels: torch.Tensor,
+    supervision_valid: torch.Tensor,
+    candidate_prior: torch.Tensor,
+    margin: float,
+    prior_power: float,
+    evidence_weight: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Rank geometric positives above frozen high-prior hard negatives.
+
+    The frozen coarse probabilities are used only to weight the training
+    comparison.  They are not an RGB-model input: at inference the verifier
+    still emits a target-free candidate log-likelihood ratio.  This loss
+    mirrors the declared conditional candidate fusion used downstream, so a
+    visual residual must overcome a confusable candidate's coarse prior rather
+    than merely win an unweighted listwise comparison.
+    """
+
+    logits = candidate_log_likelihood_ratios.float()
+    positive = labels.to(device=logits.device, dtype=torch.bool)
+    supervised = supervision_valid.to(device=logits.device, dtype=torch.bool)
+    prior = candidate_prior.to(device=logits.device, dtype=torch.float32)
+    if logits.ndim != 2:
+        raise ValueError("candidate log-likelihood ratios must be [groups,candidates]")
+    if positive.shape != logits.shape or supervised.shape != logits.shape:
+        raise ValueError("hard-negative labels do not match candidate logits")
+    if prior.shape != logits.shape:
+        raise ValueError("hard-negative candidate priors do not match candidate logits")
+    if not bool(torch.all(torch.isfinite(prior))) or bool(torch.any(prior < 0.0)):
+        raise ValueError("hard-negative candidate priors must be finite and non-negative")
+    if not math.isfinite(float(margin)) or float(margin) < 0.0:
+        raise ValueError("coarse hard-negative margin must be finite and non-negative")
+    if not math.isfinite(float(prior_power)) or float(prior_power) <= 0.0:
+        raise ValueError("coarse hard-negative prior power must be finite and positive")
+    if not math.isfinite(float(evidence_weight)) or float(evidence_weight) <= 0.0:
+        raise ValueError("coarse hard-negative evidence weight must be finite and positive")
+
+    positive = positive & supervised
+    negative = ~positive & supervised
+    active = torch.any(positive, dim=1) & torch.any(negative, dim=1)
+    if not bool(torch.any(active)):
+        return torch.zeros((), device=logits.device), active
+
+    # Candidate priors normally have positive retained mass.  The uniform
+    # fallback makes malformed all-zero supervised rows neutral rather than
+    # silently producing an infinite target preference.
+    supervised_prior_mass = torch.sum(
+        torch.where(supervised, prior, torch.zeros_like(prior)), dim=1
+    )
+    log_prior = float(prior_power) * torch.log(
+        prior.clamp_min(torch.finfo(torch.float32).tiny)
+    )
+    uniform_log_prior = torch.zeros_like(log_prior)
+    log_prior = torch.where(
+        (supervised_prior_mass <= 0.0)[:, None], uniform_log_prior, log_prior
+    )
+    positive_log_mass = torch.logsumexp(
+        torch.where(
+            positive,
+            log_prior + float(evidence_weight) * logits,
+            torch.full_like(logits, -torch.inf),
+        ),
+        dim=1,
+    )
+    negative_log_mass = torch.logsumexp(
+        torch.where(
+            negative,
+            log_prior + float(evidence_weight) * logits,
+            torch.full_like(logits, -torch.inf),
+        ),
+        dim=1,
+    )
+    per_group = F.softplus(
+        float(margin) + negative_log_mass - positive_log_mass
+    )
+    return torch.mean(per_group[active]), active
+
+
 def _training_loss(
     prediction: RGBCandidateIdentityPrediction,
     batch: Mapping[str, object],
@@ -882,6 +1376,10 @@ def _training_loss(
     identity_loss_weight: float,
     availability_loss_weight: float,
     pair_loss_weight: float,
+    coarse_hard_negative_loss_weight: float,
+    coarse_hard_negative_margin: float,
+    coarse_hard_negative_prior_power: float,
+    coarse_hard_negative_evidence_weight: float,
     spatial_loss_weight: float,
     spatial_target_sigma_px: float,
     measurement_validity_loss_weight: float,
@@ -932,6 +1430,17 @@ def _training_loss(
         )
         if bool(torch.any(pair_supervised))
         else torch.zeros((), device=device)
+    )
+    coarse_hard_negative_loss, coarse_hard_negative_groups = (
+        coarse_prior_hard_negative_ranking_loss(
+            prediction.candidate_log_likelihood_ratios,
+            labels=labels,
+            supervision_valid=supervision_valid,
+            candidate_prior=batch["candidate_prior"],
+            margin=float(coarse_hard_negative_margin),
+            prior_power=float(coarse_hard_negative_prior_power),
+            evidence_weight=float(coarse_hard_negative_evidence_weight),
+        )
     )
 
     spatial_valid = batch["spatial_valid"].to(device=device, dtype=torch.bool)
@@ -1040,6 +1549,7 @@ def _training_loss(
         float(identity_loss_weight) * identity_loss
         + float(availability_loss_weight) * availability_loss
         + float(pair_loss_weight) * pair_loss
+        + float(coarse_hard_negative_loss_weight) * coarse_hard_negative_loss
         + float(spatial_loss_weight) * spatial_loss
         + float(measurement_validity_loss_weight) * measurement_validity_loss
         + float(spatial_density_loss_weight) * spatial_density_loss
@@ -1050,6 +1560,10 @@ def _training_loss(
         "identity": float(identity_loss.detach().cpu()),
         "availability": float(availability_loss.detach().cpu()),
         "pair": float(pair_loss.detach().cpu()),
+        "coarse_hard_negative": float(coarse_hard_negative_loss.detach().cpu()),
+        "coarse_hard_negative_group_rate": float(
+            torch.mean(coarse_hard_negative_groups.float()).detach().cpu()
+        ),
         "spatial": float(spatial_loss.detach().cpu()),
         "measurement_validity": float(
             measurement_validity_loss.detach().cpu()
@@ -1157,6 +1671,8 @@ def _evaluate(
     image_width: int,
     image_height: int,
     image_cache: TensorImageLRUCache,
+    image_cache_device: torch.device | None,
+    image_crop_device: torch.device | None,
     device: torch.device,
     batch_size: int,
     identity_threshold_px: float,
@@ -1164,6 +1680,9 @@ def _evaluate(
     measurement_success_threshold_px: float,
     spatial_density_target_sigma_px: float,
     use_amp: bool,
+    collect_spatial_diagnostics: bool,
+    identity_context_residual_scale: float = 1.0,
+    identity_context_layout_residual_scale: float = 0.0,
 ) -> tuple[dict[str, object], dict[str, np.ndarray]]:
     indices = data.indices_by_split[str(split_name)]
     candidate_count = int(data.candidate_valid.shape[1])
@@ -1197,20 +1716,50 @@ def _evaluate(
                 image_width=int(image_width),
                 image_height=int(image_height),
                 image_cache=image_cache,
-                image_cache_device=device,
+                image_cache_device=image_cache_device,
+                image_crop_device=image_crop_device,
                 crop_radius_px=model.crop_radius_px,
                 step_px=model.step_px,
+                identity_context_crop_radius_px=(
+                    model.identity_context_crop_radius_px
+                    if (
+                        float(identity_context_residual_scale) > 0.0
+                        or float(identity_context_layout_residual_scale) > 0.0
+                    )
+                    else None
+                ),
+                identity_context_step_px=(
+                    model.identity_context_step_px
+                    if (
+                        float(identity_context_residual_scale) > 0.0
+                        or float(identity_context_layout_residual_scale) > 0.0
+                    )
+                    else None
+                ),
                 identity_threshold_px=float(identity_threshold_px),
                 identity_negative_threshold_px=float(
                     identity_negative_threshold_px
                 ),
                 spatial_radius_px=model.search_radius_px,
             )
-            prediction = _forward_batch(model, batch, device=device, use_amp=bool(use_amp))
+            prediction = _forward_batch(
+                model,
+                batch,
+                device=device,
+                use_amp=bool(use_amp),
+                identity_context_residual_scale=float(
+                    identity_context_residual_scale
+                ),
+                identity_context_layout_residual_scale=float(
+                    identity_context_layout_residual_scale
+                ),
+            )
             llr[positions] = prediction.candidate_log_likelihood_ratios.cpu().numpy()
             measured[positions] = prediction.candidate_measured.cpu().numpy()
             coverage[positions] = prediction.candidate_view_coverage.cpu().numpy()
             q_logit[positions] = prediction.measured_set_availability_logit.cpu().numpy()
+            if not collect_spatial_diagnostics:
+                continue
             spatial_valid = batch["spatial_valid"].to(device=device, dtype=torch.bool)
             if bool(torch.any(spatial_valid)):
                 logits = prediction.view_spatial_logits[spatial_valid]
@@ -1457,6 +2006,7 @@ def _evaluate(
         else "legacy_mode_success_correlation_DIAGNOSTIC_ONLY"
     )
     metrics: dict[str, object] = {
+        "spatial_diagnostics_collected": bool(collect_spatial_diagnostics),
         "rgb_only": _identity_metrics(
             llr, labels=geometric_labels, valid=valid, prior=prior
         ),
@@ -1651,9 +2201,21 @@ def train_independent_rgb_candidate_verifier(
     image_root: Path,
     init_measurement_checkpoint: Path,
     init_independent_checkpoint: Path | None = None,
+    search_radius_px_override: float | None = None,
+    context_radius_px_override: float | None = None,
+    step_px_override: float | None = None,
+    identity_context_radius_px: float | None = None,
+    identity_context_step_px: float | None = None,
+    identity_context_layout_grid_size: int | None = None,
+    prediction_identity_context_residual_scale: float = 1.0,
+    prediction_identity_context_layout_residual_scale: float | None = None,
+    pair_forward_batch_size: int = 0,
+    pair_forward_gradient_checkpointing: bool = False,
     freeze_for_measurement_validity: bool = False,
     freeze_for_spatial_density: bool = False,
     freeze_for_pose_view_mixture: bool = False,
+    freeze_for_identity_context_residual: bool = False,
+    freeze_for_identity_context_layout_residual: bool = False,
     output_dir: Path,
     image_width: int,
     image_height: int,
@@ -1667,9 +2229,14 @@ def train_independent_rgb_candidate_verifier(
     weight_decay: float = 1e-4,
     identity_threshold_px: float = 2.0,
     identity_negative_threshold_px: float = 5.0,
+    identity_target: str | None = None,
     identity_loss_weight: float = 1.0,
     availability_loss_weight: float = 0.5,
     pair_loss_weight: float = 0.25,
+    coarse_hard_negative_loss_weight: float = 0.0,
+    coarse_hard_negative_margin: float = 0.0,
+    coarse_hard_negative_prior_power: float = 1.0,
+    coarse_hard_negative_evidence_weight: float = 1.0,
     spatial_loss_weight: float = 0.25,
     spatial_target_sigma_px: float = 0.75,
     measurement_validity_loss_weight: float = 0.5,
@@ -1682,30 +2249,117 @@ def train_independent_rgb_candidate_verifier(
     image_cache_max_gb: float = 12.0,
     gpu_non_cache_reserve_gb: float = 14.0,
     image_cache_dtype: str = "float16",
+    image_cache_location: str = "gpu",
     use_amp: bool = True,
     log_every: int = 25,
     prediction_splits: Sequence[str] = ("validation", "test"),
+    collect_spatial_diagnostics: bool | None = None,
 ) -> dict[str, Any]:
+    prediction_context_scale = float(prediction_identity_context_residual_scale)
+    if not math.isfinite(prediction_context_scale) or not (
+        0.0 <= prediction_context_scale <= 1.0
+    ):
+        raise ValueError(
+            "prediction_identity_context_residual_scale must be finite and in [0, 1]"
+        )
+    if prediction_context_scale != 1.0 and int(steps) != 0:
+        raise ValueError(
+            "prediction_identity_context_residual_scale is evaluation-only and requires steps=0"
+        )
+    requested_layout_prediction_scale = (
+        None
+        if prediction_identity_context_layout_residual_scale is None
+        else float(prediction_identity_context_layout_residual_scale)
+    )
+    if requested_layout_prediction_scale is not None and (
+        not math.isfinite(requested_layout_prediction_scale)
+        or not 0.0 <= requested_layout_prediction_scale <= 1.0
+    ):
+        raise ValueError(
+            "prediction_identity_context_layout_residual_scale must be finite and in [0, 1]"
+        )
     if float(measurement_validity_loss_weight) < 0.0:
         raise ValueError("measurement_validity_loss_weight must be non-negative")
+    if not math.isfinite(float(coarse_hard_negative_loss_weight)) or float(
+        coarse_hard_negative_loss_weight
+    ) < 0.0:
+        raise ValueError("coarse_hard_negative_loss_weight must be finite and non-negative")
+    if not math.isfinite(float(coarse_hard_negative_margin)) or float(
+        coarse_hard_negative_margin
+    ) < 0.0:
+        raise ValueError("coarse_hard_negative_margin must be finite and non-negative")
+    if not math.isfinite(float(coarse_hard_negative_prior_power)) or float(
+        coarse_hard_negative_prior_power
+    ) <= 0.0:
+        raise ValueError("coarse_hard_negative_prior_power must be finite and positive")
+    if not math.isfinite(float(coarse_hard_negative_evidence_weight)) or float(
+        coarse_hard_negative_evidence_weight
+    ) <= 0.0:
+        raise ValueError(
+            "coarse_hard_negative_evidence_weight must be finite and positive"
+        )
     if float(spatial_density_loss_weight) < 0.0:
         raise ValueError("spatial_density_loss_weight must be non-negative")
     if float(pose_view_mixture_loss_weight) < 0.0:
         raise ValueError("pose_view_mixture_loss_weight must be non-negative")
     if float(measurement_success_threshold_px) <= 0.0:
         raise ValueError("measurement_success_threshold_px must be positive")
+    spatial_diagnostics_enabled = (
+        bool(collect_spatial_diagnostics)
+        if collect_spatial_diagnostics is not None
+        else any(
+            float(weight) > 0.0
+            for weight in (
+                spatial_loss_weight,
+                measurement_validity_loss_weight,
+                spatial_density_loss_weight,
+                pose_view_mixture_loss_weight,
+            )
+        )
+    )
     if sum(
         bool(value)
         for value in (
             freeze_for_measurement_validity,
             freeze_for_spatial_density,
             freeze_for_pose_view_mixture,
+            freeze_for_identity_context_residual,
+            freeze_for_identity_context_layout_residual,
         )
     ) > 1:
         raise ValueError(
-            "measurement-validity, spatial-density, and pose-view freeze modes "
-            "are exclusive"
+            "measurement-validity, spatial-density, pose-view, pooled-context, and layout-context "
+            "freeze modes are exclusive"
         )
+    if bool(freeze_for_identity_context_residual) or bool(
+        freeze_for_identity_context_layout_residual
+    ):
+        non_identity_weights = {
+            "availability_loss_weight": availability_loss_weight,
+            "spatial_loss_weight": spatial_loss_weight,
+            "measurement_validity_loss_weight": measurement_validity_loss_weight,
+            "spatial_density_loss_weight": spatial_density_loss_weight,
+            "pose_view_mixture_loss_weight": pose_view_mixture_loss_weight,
+        }
+        enabled_non_identity = [
+            name for name, weight in non_identity_weights.items() if float(weight) != 0.0
+        ]
+        if enabled_non_identity:
+            raise ValueError(
+                "frozen identity-context residual training permits only identity and "
+                "pair losses; set these weights to zero: "
+                f"{enabled_non_identity}"
+            )
+        if (
+            float(identity_loss_weight) <= 0.0
+            and float(pair_loss_weight) <= 0.0
+            and float(coarse_hard_negative_loss_weight) <= 0.0
+        ):
+            raise ValueError(
+                "frozen identity-context residual training requires a positive "
+                "identity_loss_weight, pair_loss_weight, or "
+                "coarse_hard_negative_loss_weight"
+            )
     torch_device = torch.device(
         device if torch.cuda.is_available() or not str(device).startswith("cuda") else "cpu"
     )
@@ -1735,6 +2389,73 @@ def train_independent_rgb_candidate_verifier(
     )
     initial_payload = torch.load(initialization_path, map_location="cpu")
     initial_config = dict(initial_payload.get("config", {}))
+    initialization_provenance = _initialization_provenance(
+        initialization_path, initial_payload
+    )
+    resolved_identity_target = _resolve_identity_target(
+        identity_target,
+        initialization_training=dict(
+            initialization_provenance["initialization_training"]
+        ),
+    )
+    if (
+        float(coarse_hard_negative_loss_weight) > 0.0
+        and resolved_identity_target != IDENTITY_TARGET_GEOMETRIC
+    ):
+        raise ValueError(
+            "coarse hard-negative ranking requires identity_target=geometric_projection"
+        )
+    spatial_support, spatial_support_overrides = _resolve_spatial_support_config(
+        initial_config,
+        search_radius_px_override=search_radius_px_override,
+        context_radius_px_override=context_radius_px_override,
+        step_px_override=step_px_override,
+    )
+    identity_context, identity_context_overrides = _resolve_identity_context_config(
+        initial_config,
+        identity_context_radius_px=identity_context_radius_px,
+        identity_context_step_px=identity_context_step_px,
+    )
+    identity_context_layout, identity_context_layout_overrides = (
+        _resolve_identity_context_layout_config(
+            initial_config,
+            identity_context_layout_grid_size=identity_context_layout_grid_size,
+        )
+    )
+    if bool(identity_context_layout["enabled"]) and not bool(
+        identity_context["enabled"]
+    ):
+        raise ValueError("identity-context layout requires an enabled broad context branch")
+    default_layout_prediction_scale = (
+        1.0 if bool(identity_context_layout["enabled"]) else 0.0
+    )
+    prediction_layout_scale = (
+        default_layout_prediction_scale
+        if requested_layout_prediction_scale is None
+        else requested_layout_prediction_scale
+    )
+    if prediction_layout_scale != default_layout_prediction_scale and int(steps) != 0:
+        raise ValueError(
+            "prediction_identity_context_layout_residual_scale is evaluation-only and requires steps=0"
+        )
+    if spatial_support_overrides and init_independent_checkpoint is not None:
+        raise ValueError(
+            "a spatial-support override must initialize from the measurement "
+            "encoder, not a fully calibrated independent RGB checkpoint"
+        )
+    if spatial_support_overrides and any(
+        (
+            freeze_for_measurement_validity,
+            freeze_for_spatial_density,
+            freeze_for_pose_view_mixture,
+            freeze_for_identity_context_residual,
+            freeze_for_identity_context_layout_residual,
+        )
+    ):
+        raise ValueError(
+            "a spatial-support override requires joint retraining; frozen-head "
+            "modes would reuse a likelihood calibrated for a different support"
+        )
     pose_view_mixture_enabled = bool(
         initial_config.get("pose_view_mixture_enabled", False)
         or freeze_for_pose_view_mixture
@@ -1756,9 +2477,9 @@ def train_independent_rgb_candidate_verifier(
             f"measurement checkpoint lacks RGB encoder config: {sorted(missing_config)}"
         )
     model = IndependentRGBCandidateVerifier(
-        search_radius_px=float(initial_config["search_radius_px"]),
-        context_radius_px=float(initial_config["context_radius_px"]),
-        step_px=float(initial_config["step_px"]),
+        search_radius_px=float(spatial_support["search_radius_px"]),
+        context_radius_px=float(spatial_support["context_radius_px"]),
+        step_px=float(spatial_support["step_px"]),
         feature_dim=int(initial_config["feature_dim"]),
         hidden_dim=int(initial_config["hidden_dim"]),
         input_mode=str(initial_config["input_mode"]),
@@ -1776,6 +2497,25 @@ def train_independent_rgb_candidate_verifier(
             )
         ),
         pose_view_mixture_enabled=pose_view_mixture_enabled,
+        pair_forward_batch_size=int(pair_forward_batch_size),
+        pair_forward_gradient_checkpointing=bool(
+            pair_forward_gradient_checkpointing
+        ),
+        identity_context_radius_px=(
+            None
+            if not bool(identity_context["enabled"])
+            else float(identity_context["radius_px"])
+        ),
+        identity_context_step_px=(
+            None
+            if not bool(identity_context["enabled"])
+            else float(identity_context["step_px"])
+        ),
+        identity_context_layout_grid_size=(
+            None
+            if not bool(identity_context_layout["enabled"])
+            else int(identity_context_layout["grid_size"])
+        ),
     )
     initialized_from_independent = init_independent_checkpoint is not None
     if initialized_from_independent:
@@ -1785,14 +2525,18 @@ def train_independent_rgb_candidate_verifier(
             "independent_rgb_candidate_verifier_v3",
             "independent_rgb_candidate_verifier_v4",
             "independent_rgb_candidate_verifier_v5",
+            "independent_rgb_candidate_verifier_v6",
+            "independent_rgb_candidate_verifier_v8",
         }:
             raise ValueError(
-                "independent initialization requires verifier v2, v3, v4, or v5"
+                "independent initialization requires verifier v2 through v6 or v8"
             )
         if checkpoint_format in {
             "independent_rgb_candidate_verifier_v3",
             "independent_rgb_candidate_verifier_v4",
             "independent_rgb_candidate_verifier_v5",
+            "independent_rgb_candidate_verifier_v6",
+            "independent_rgb_candidate_verifier_v8",
         }:
             initial_data_contract = dict(initial_payload.get("data_contract", {}))
             if not initial_data_contract:
@@ -1809,10 +2553,68 @@ def train_independent_rgb_candidate_verifier(
             "view_pose_mixture_head.weight",
             "view_pose_mixture_head.bias",
         }
+        if model.identity_context_enabled and checkpoint_format not in {
+            "independent_rgb_candidate_verifier_v6",
+            "independent_rgb_candidate_verifier_v8",
+        }:
+            allowed_missing.update(
+                {
+                    key
+                    for key in model.state_dict()
+                    if key.startswith("identity_context_")
+                }
+            )
+        if model.identity_context_layout_enabled and checkpoint_format != (
+            "independent_rgb_candidate_verifier_v8"
+        ):
+            allowed_missing.update(
+                {
+                    key
+                    for key in model.state_dict()
+                    if key.startswith("identity_context_layout_")
+                }
+            )
         if set(incompatible.missing_keys) - allowed_missing or incompatible.unexpected_keys:
             raise ValueError("independent verifier initialization is incompatible")
+        if checkpoint_format in {
+            "independent_rgb_candidate_verifier_v6",
+            "independent_rgb_candidate_verifier_v8",
+        }:
+            if identity_context_overrides:
+                raise ValueError(
+                    "a dual-scale verifier checkpoint must retain its declared identity context config"
+                )
+            if bool(model.identity_context_enabled) != bool(
+                initial_config.get("identity_context_enabled", False)
+            ):
+                raise ValueError("dual-scale verifier identity context is incompatible")
+            if checkpoint_format == "independent_rgb_candidate_verifier_v8" and (
+                identity_context_layout_overrides
+            ):
+                raise ValueError(
+                    "a layout verifier checkpoint must retain its declared layout config"
+                )
+            if checkpoint_format == "independent_rgb_candidate_verifier_v8" and (
+                bool(model.identity_context_layout_enabled)
+                != bool(initial_config.get("identity_context_layout_enabled", False))
+            ):
+                raise ValueError("layout verifier identity context is incompatible")
+            if set(incompatible.missing_keys) - allowed_missing:
+                raise ValueError("verifier v6 lacks its dual-scale identity branch")
+        elif model.identity_context_enabled:
+            model.initialize_identity_context_from_local_encoder()
+        if (
+            model.identity_context_layout_enabled
+            and checkpoint_format != "independent_rgb_candidate_verifier_v8"
+        ):
+            model.initialize_identity_context_layout_from_pooled_encoder()
         if checkpoint_format == "independent_rgb_candidate_verifier_v5":
-            if incompatible.missing_keys:
+            missing_non_context = {
+                key
+                for key in incompatible.missing_keys
+                if not key.startswith("identity_context_")
+            }
+            if missing_non_context:
                 raise ValueError("verifier v5 lacks its pose-view mixture head")
             if initial_config.get("pose_view_mixture_semantics") != (
                 POSE_VIEW_MIXTURE_SEMANTICS
@@ -1826,6 +2628,7 @@ def train_independent_rgb_candidate_verifier(
         split_name="train",
         positive_threshold_px=float(identity_threshold_px),
         negative_threshold_px=float(identity_negative_threshold_px),
+        identity_target=resolved_identity_target,
     )
     natural_group_positive_prior = data.availability_positive_prior(
         split_name="train",
@@ -1907,8 +2710,94 @@ def train_independent_rgb_candidate_verifier(
             lr=float(head_learning_rate),
             weight_decay=float(weight_decay),
         )
+    elif bool(freeze_for_identity_context_layout_residual):
+        if not initialized_from_independent:
+            raise ValueError(
+                "frozen identity-context layout training requires an independent checkpoint"
+            )
+        if (
+            model.identity_context_encoder is None
+            or model.identity_context_layout_encoder is None
+            or model.identity_context_layout_fusion is None
+            or model.identity_context_layout_evidence is None
+            or model.identity_context_layout_residual is None
+        ):
+            raise ValueError(
+                "frozen identity-context layout training requires an enabled "
+                "layout branch"
+            )
+        for parameter in model.parameters():
+            parameter.requires_grad_(False)
+        layout_encoder_parameters = list(
+            model.identity_context_layout_encoder.parameters()
+        )
+        layout_head_parameters = [
+            *model.identity_context_layout_fusion.parameters(),
+            *model.identity_context_layout_evidence.parameters(),
+            *model.identity_context_layout_residual.parameters(),
+        ]
+        for parameter in [*layout_encoder_parameters, *layout_head_parameters]:
+            parameter.requires_grad_(True)
+        optimizer = torch.optim.AdamW(
+            [
+                {
+                    "params": layout_encoder_parameters,
+                    "lr": float(encoder_learning_rate),
+                },
+                {
+                    "params": layout_head_parameters,
+                    "lr": float(head_learning_rate),
+                },
+            ],
+            weight_decay=float(weight_decay),
+        )
+    elif bool(freeze_for_identity_context_residual):
+        if not initialized_from_independent:
+            raise ValueError(
+                "frozen identity-context residual training requires an independent checkpoint"
+            )
+        if (
+            model.identity_context_encoder is None
+            or model.identity_context_evidence is None
+            or model.identity_context_residual is None
+        ):
+            raise ValueError(
+                "frozen identity-context residual training requires an enabled "
+                "identity-context branch"
+            )
+        for parameter in model.parameters():
+            parameter.requires_grad_(False)
+        context_encoder_parameters = list(model.identity_context_encoder.parameters())
+        context_head_parameters = [
+            *model.identity_context_evidence.parameters(),
+            *model.identity_context_residual.parameters(),
+        ]
+        for parameter in [*context_encoder_parameters, *context_head_parameters]:
+            parameter.requires_grad_(True)
+        optimizer = torch.optim.AdamW(
+            [
+                {
+                    "params": context_encoder_parameters,
+                    "lr": float(encoder_learning_rate),
+                },
+                {
+                    "params": context_head_parameters,
+                    "lr": float(head_learning_rate),
+                },
+            ],
+            weight_decay=float(weight_decay),
+        )
     else:
-        encoder_parameters = list(model.encoder.parameters())
+        encoder_modules = [model.encoder]
+        if model.identity_context_encoder is not None:
+            encoder_modules.append(model.identity_context_encoder)
+        if model.identity_context_layout_encoder is not None:
+            encoder_modules.append(model.identity_context_layout_encoder)
+        encoder_parameters = [
+            parameter
+            for module in encoder_modules
+            for parameter in module.parameters()
+        ]
         encoder_parameter_ids = {id(parameter) for parameter in encoder_parameters}
         head_parameters = [
             parameter
@@ -1932,8 +2821,15 @@ def train_independent_rgb_candidate_verifier(
     )
     if float(gpu_non_cache_reserve_gb) < 0.0:
         raise ValueError("gpu_non_cache_reserve_gb must be non-negative")
+    cache_location = str(image_cache_location).strip().lower()
+    if cache_location not in {"cpu", "gpu"}:
+        raise ValueError("image_cache_location must be cpu or gpu")
     cache_bytes = requested_cache_bytes
-    if torch_device.type == "cuda" and requested_cache_bytes is not None:
+    if (
+        cache_location == "gpu"
+        and torch_device.type == "cuda"
+        and requested_cache_bytes is not None
+    ):
         total_device_bytes = int(
             torch.cuda.get_device_properties(torch_device).total_memory
         )
@@ -1957,6 +2853,7 @@ def train_independent_rgb_candidate_verifier(
     image_cache = TensorImageLRUCache(
         max_bytes=cache_bytes, storage_dtype=cache_storage_dtype
     )
+    cache_storage_device = torch_device if cache_location == "gpu" else None
     train_indices = data.indices_by_split["train"]
     train_indices = train_indices[data.has_any_rgb[train_indices]].tolist()
     if not train_indices:
@@ -1965,24 +2862,24 @@ def train_independent_rgb_candidate_verifier(
     for index in train_indices:
         train_indices_by_query[str(data.query_ids[int(index)])].append(int(index))
     train_query_ids = sorted(train_indices_by_query)
-    appearance_positive = (
-        data.candidate_valid[train_indices]
-        & data.actual_query_observation[train_indices]
-        & np.isfinite(data.actual_center_residuals[train_indices])
-        & (
-            data.actual_center_residuals[train_indices]
-            <= float(identity_threshold_px)
-        )
+    identity_positive, _identity_supervision = _identity_training_masks(
+        valid=data.candidate_valid[train_indices],
+        actual_query_observation=data.actual_query_observation[train_indices],
+        actual_center_residuals=data.actual_center_residuals[train_indices],
+        target_projection_residuals=data.residuals[train_indices],
+        identity_target=resolved_identity_target,
+        positive_threshold_px=float(identity_threshold_px),
+        negative_threshold_px=float(identity_negative_threshold_px),
     )
-    appearance_positive_indices = [
+    identity_positive_indices = [
         int(index)
         for index, positive in zip(
-            train_indices, np.any(appearance_positive, axis=1).tolist()
+            train_indices, np.any(identity_positive, axis=1).tolist()
         )
         if bool(positive)
     ]
-    if not appearance_positive_indices:
-        raise ValueError("training split has no actual-observation identity positives")
+    if not identity_positive_indices:
+        raise ValueError("training split has no identity-target positive candidates")
     positive_fraction = float(appearance_positive_group_fraction)
     if not 0.0 <= positive_fraction < 1.0:
         raise ValueError("appearance_positive_group_fraction must be in [0, 1)")
@@ -1997,7 +2894,21 @@ def train_independent_rgb_candidate_verifier(
     rng = random.Random(int(seed))
     rolling: dict[str, list[float]] = defaultdict(list)
     started = time.perf_counter()
-    model.train()
+    if bool(freeze_for_identity_context_layout_residual):
+        _set_identity_context_layout_residual_training_mode(model)
+    elif bool(freeze_for_identity_context_residual):
+        _set_identity_context_residual_training_mode(model)
+    else:
+        model.train()
+    training_context_scale = (
+        0.0 if bool(freeze_for_identity_context_layout_residual) else 1.0
+    )
+    training_layout_scale = (
+        1.0
+        if model.identity_context_layout_enabled
+        and not bool(freeze_for_identity_context_residual)
+        else 0.0
+    )
     for step in range(1, int(steps) + 1):
         selected_queries = [
             train_query_ids[rng.randrange(len(train_query_ids))]
@@ -2012,8 +2923,8 @@ def train_independent_rgb_candidate_verifier(
             natural_supervision_mask.append(True)
         for _ in range(positive_group_count):
             batch_indices.append(
-                appearance_positive_indices[
-                    rng.randrange(len(appearance_positive_indices))
+                identity_positive_indices[
+                    rng.randrange(len(identity_positive_indices))
                 ]
             )
             natural_supervision_mask.append(False)
@@ -2030,21 +2941,50 @@ def train_independent_rgb_candidate_verifier(
             image_width=int(image_width),
             image_height=int(image_height),
             image_cache=image_cache,
-            image_cache_device=torch_device,
+            image_cache_device=cache_storage_device,
+            image_crop_device=torch_device,
             crop_radius_px=model.crop_radius_px,
             step_px=model.step_px,
+            identity_context_crop_radius_px=(
+                model.identity_context_crop_radius_px
+                if training_context_scale > 0.0 or training_layout_scale > 0.0
+                else None
+            ),
+            identity_context_step_px=(
+                model.identity_context_step_px
+                if training_context_scale > 0.0 or training_layout_scale > 0.0
+                else None
+            ),
             identity_threshold_px=float(identity_threshold_px),
             identity_negative_threshold_px=float(identity_negative_threshold_px),
+            identity_target=resolved_identity_target,
             spatial_radius_px=model.search_radius_px,
             natural_supervision_mask=natural_supervision_mask,
         )
-        prediction = _forward_batch(model, batch, device=torch_device, use_amp=bool(use_amp))
+        prediction = _forward_batch(
+            model,
+            batch,
+            device=torch_device,
+            use_amp=bool(use_amp),
+            identity_context_residual_scale=training_context_scale,
+            identity_context_layout_residual_scale=training_layout_scale,
+        )
         loss, components = _training_loss(
             prediction,
             batch,
             identity_loss_weight=float(identity_loss_weight),
             availability_loss_weight=float(availability_loss_weight),
             pair_loss_weight=float(pair_loss_weight),
+            coarse_hard_negative_loss_weight=float(
+                coarse_hard_negative_loss_weight
+            ),
+            coarse_hard_negative_margin=float(coarse_hard_negative_margin),
+            coarse_hard_negative_prior_power=float(
+                coarse_hard_negative_prior_power
+            ),
+            coarse_hard_negative_evidence_weight=float(
+                coarse_hard_negative_evidence_weight
+            ),
             spatial_loss_weight=float(spatial_loss_weight),
             spatial_target_sigma_px=float(spatial_target_sigma_px),
             measurement_validity_loss_weight=float(
@@ -2090,7 +3030,11 @@ def train_independent_rgb_candidate_verifier(
     output.mkdir(parents=True, exist_ok=True)
     checkpoint = output / "independent_rgb_candidate_verifier.pt"
     checkpoint_format = (
-        "independent_rgb_candidate_verifier_v5"
+        "independent_rgb_candidate_verifier_v8"
+        if model.identity_context_layout_enabled
+        else "independent_rgb_candidate_verifier_v6"
+        if model.identity_context_enabled
+        else "independent_rgb_candidate_verifier_v5"
         if pose_view_mixture_enabled
         and float(pose_view_mixture_loss_weight) > 0.0
         else "independent_rgb_candidate_verifier_v4"
@@ -2109,9 +3053,27 @@ def train_independent_rgb_candidate_verifier(
             "identity_negative_threshold_px": float(
                 identity_negative_threshold_px
             ),
+            "identity_target": resolved_identity_target,
+            "identity_target_semantics": _identity_target_semantics(
+                resolved_identity_target
+            ),
             "identity_loss_weight": float(identity_loss_weight),
             "availability_loss_weight": float(availability_loss_weight),
             "pair_loss_weight": float(pair_loss_weight),
+            "coarse_hard_negative_loss_weight": float(
+                coarse_hard_negative_loss_weight
+            ),
+            "coarse_hard_negative_margin": float(coarse_hard_negative_margin),
+            "coarse_hard_negative_prior_power": float(
+                coarse_hard_negative_prior_power
+            ),
+            "coarse_hard_negative_evidence_weight": float(
+                coarse_hard_negative_evidence_weight
+            ),
+            "coarse_hard_negative_semantics": (
+                "target_only_frozen_candidate_prior_weighted_geometric_group_ranking_"
+                "at_declared_fusion_evidence_weight"
+            ),
             "spatial_loss_weight": float(spatial_loss_weight),
             "spatial_target_sigma_px": float(spatial_target_sigma_px),
             "measurement_validity_loss_weight": float(
@@ -2138,73 +3100,109 @@ def train_independent_rgb_candidate_verifier(
             "freeze_for_pose_view_mixture": bool(
                 freeze_for_pose_view_mixture
             ),
+            "freeze_for_identity_context_residual": bool(
+                freeze_for_identity_context_residual
+            ),
+            "freeze_for_identity_context_layout_residual": bool(
+                freeze_for_identity_context_layout_residual
+            ),
+            "collect_spatial_diagnostics": bool(spatial_diagnostics_enabled),
+            **initialization_provenance,
         },
     }
     torch.save(checkpoint_payload, checkpoint)
     split_metrics: dict[str, object] = {}
-    prediction_blocks: list[dict[str, np.ndarray]] = []
-    for split_name in prediction_splits:
-        metrics, predictions = _evaluate(
-            model,
-            data,
-            split_name=str(split_name),
-            image_root=Path(image_root),
-            image_width=int(image_width),
-            image_height=int(image_height),
-            image_cache=image_cache,
-            device=torch_device,
-            batch_size=int(eval_group_batch_size),
-            identity_threshold_px=float(identity_threshold_px),
-            identity_negative_threshold_px=float(identity_negative_threshold_px),
-            measurement_success_threshold_px=float(
-                measurement_success_threshold_px
+    prediction_path: Path | None = None
+    if prediction_splits:
+        prediction_blocks: list[dict[str, np.ndarray]] = []
+        for split_name in prediction_splits:
+            metrics, predictions = _evaluate(
+                model,
+                data,
+                split_name=str(split_name),
+                image_root=Path(image_root),
+                image_width=int(image_width),
+                image_height=int(image_height),
+                image_cache=image_cache,
+                image_cache_device=cache_storage_device,
+                image_crop_device=torch_device,
+                device=torch_device,
+                batch_size=int(eval_group_batch_size),
+                identity_threshold_px=float(identity_threshold_px),
+                identity_negative_threshold_px=float(identity_negative_threshold_px),
+                measurement_success_threshold_px=float(
+                    measurement_success_threshold_px
+                ),
+                spatial_density_target_sigma_px=float(
+                    spatial_target_sigma_px
+                ),
+                use_amp=bool(use_amp),
+                collect_spatial_diagnostics=bool(spatial_diagnostics_enabled),
+                identity_context_residual_scale=prediction_context_scale,
+                identity_context_layout_residual_scale=prediction_layout_scale,
+            )
+            split_metrics[str(split_name)] = metrics
+            prediction_blocks.append(predictions)
+        prediction_path = output / "predictions.npz"
+        prediction_arrays = {
+            key: np.concatenate([block[key] for block in prediction_blocks], axis=0)
+            for key in prediction_blocks[0]
+        }
+        order = np.argsort(prediction_arrays["evidence_row_indices"], kind="stable")
+        prediction_arrays = {
+            key: value[order] for key, value in prediction_arrays.items()
+        }
+        prediction_metadata = {
+            "format": "independent_rgb_candidate_predictions_v1",
+            "checkpoint_sha256": file_sha256_short(checkpoint),
+            **initialization_provenance,
+            "candidate_evidence_sha256": file_sha256_short(Path(candidate_evidence)),
+            "availability_evidence_sha256": file_sha256_short(
+                Path(availability_evidence)
             ),
-            spatial_density_target_sigma_px=float(
-                spatial_target_sigma_px
+            "candidate_evidence_format": data.metadata.get("format"),
+            "candidate_probability_semantics": data.metadata.get(
+                "candidate_probability_semantics"
             ),
-            use_amp=bool(use_amp),
+            "data_contract": runtime_data_contract,
+            "rgb_evidence_semantics": "candidate_log_likelihood_ratio_missing_is_zero",
+            "support_view_mixture": model.config()["support_view_mixture"],
+            "view_likelihood_ratio_conversion": (
+                "raw_binary_logit_minus_logit_natural_train_positive_prior"
+            ),
+            "identity_context_semantics": model.config()["identity_context_semantics"],
+            "identity_context_changes_spatial_density": False,
+            "identity_context_residual_scale": prediction_context_scale,
+            "identity_context_residual_scale_semantics": (
+                "evaluation_only_zero_is_same_checkpoint_local_branch_counterfactual"
+            ),
+            "identity_context_layout_semantics": model.config()[
+                "identity_context_layout_semantics"
+            ],
+            "identity_context_layout_changes_spatial_density": False,
+            "identity_context_layout_residual_scale": prediction_layout_scale,
+            "identity_context_layout_residual_scale_semantics": (
+                "evaluation_only_zero_is_same_checkpoint_without_layout_residual"
+            ),
+            "natural_train_view_positive_prior": natural_view_positive_prior,
+            "natural_train_group_positive_prior": natural_group_positive_prior,
+            "identity_training_target": resolved_identity_target,
+            "identity_training_target_semantics": _identity_target_semantics(
+                resolved_identity_target
+            ),
+            "rgb_full_top_l_availability_semantics": (
+                "P(at_least_one_2px_candidate_in_frozen_full_top_l)"
+            ),
+            "rgb_availability_changes_coarse_candidate_mass": (
+                "only_after_validation_calibrated_likelihood_ratio_fusion"
+            ),
+            "prediction_splits": [str(value) for value in prediction_splits],
+        }
+        np.savez_compressed(
+            prediction_path,
+            **prediction_arrays,
+            metadata_json=np.asarray(json.dumps(prediction_metadata, sort_keys=True)),
         )
-        split_metrics[str(split_name)] = metrics
-        prediction_blocks.append(predictions)
-    prediction_path = output / "predictions.npz"
-    prediction_arrays = {
-        key: np.concatenate([block[key] for block in prediction_blocks], axis=0)
-        for key in prediction_blocks[0]
-    }
-    order = np.argsort(prediction_arrays["evidence_row_indices"], kind="stable")
-    prediction_arrays = {key: value[order] for key, value in prediction_arrays.items()}
-    prediction_metadata = {
-        "format": "independent_rgb_candidate_predictions_v1",
-        "checkpoint_sha256": file_sha256_short(checkpoint),
-        "candidate_evidence_sha256": file_sha256_short(Path(candidate_evidence)),
-        "availability_evidence_sha256": file_sha256_short(
-            Path(availability_evidence)
-        ),
-        "candidate_evidence_format": data.metadata.get("format"),
-        "candidate_probability_semantics": data.metadata.get(
-            "candidate_probability_semantics"
-        ),
-        "data_contract": runtime_data_contract,
-        "rgb_evidence_semantics": "candidate_log_likelihood_ratio_missing_is_zero",
-        "support_view_mixture": model.config()["support_view_mixture"],
-        "view_likelihood_ratio_conversion": (
-            "raw_binary_logit_minus_logit_natural_train_positive_prior"
-        ),
-        "natural_train_view_positive_prior": natural_view_positive_prior,
-        "natural_train_group_positive_prior": natural_group_positive_prior,
-        "rgb_full_top_l_availability_semantics": (
-            "P(at_least_one_2px_candidate_in_frozen_full_top_l)"
-        ),
-        "rgb_availability_changes_coarse_candidate_mass": (
-            "only_after_validation_calibrated_likelihood_ratio_fusion"
-        ),
-        "prediction_splits": [str(value) for value in prediction_splits],
-    }
-    np.savez_compressed(
-        prediction_path,
-        **prediction_arrays,
-        metadata_json=np.asarray(json.dumps(prediction_metadata, sort_keys=True)),
-    )
     summary = {
         "stage": "independent_rgb_candidate_identity_train",
         "protocol": {
@@ -2212,14 +3210,29 @@ def train_independent_rgb_candidate_verifier(
                 "q_and_pair_calibration_loss_only"
             ),
             "identity_positive_group_enrichment": positive_fraction,
-            "candidate_pool": "frozen_current_system_top5",
+            "candidate_pool": (
+                "frozen_current_system_top"
+                f"{int(data.candidate_valid.shape[1])}"
+            ),
             "hard_negatives": (
                 "same_query_current_system_candidates_with_gt_projection_residual_ge_5px"
             ),
-            "appearance_positive": (
+            "coarse_hard_negative_ranking": (
+                "disabled"
+                if float(coarse_hard_negative_loss_weight) == 0.0
+                else "frozen_candidate_prior_weighted_geometric_positive_vs_hard_negative"
+            ),
+            "coarse_hard_negative_prior_is_model_input": False,
+            "identity_training_target": resolved_identity_target,
+            "identity_training_target_semantics": _identity_target_semantics(
+                resolved_identity_target
+            ),
+            "appearance_positive_diagnostic": (
                 "actual_query_sfm_observation_with_center_residual_le_2px"
             ),
-            "ambiguous_unobserved_near_candidates_in_identity_loss": False,
+            "ambiguous_unobserved_near_candidates_in_identity_loss": bool(
+                resolved_identity_target == IDENTITY_TARGET_APPEARANCE
+            ),
             "spatial_target": (
                 "gt_pose_projected_candidate_offset_for_every_evaluable_view"
                 if model.measurement_validity_semantics
@@ -2279,9 +3292,32 @@ def train_independent_rgb_candidate_verifier(
             "availability_target": "frozen_full_top_l_2px_geometric_availability",
             "coordinate_space_runtime_validated": True,
             "real_rgb_source_manifest_runtime_validated": True,
+            "spatial_support_override_requires_fresh_joint_training": bool(
+                spatial_support_overrides
+            ),
+            "pair_forward_microbatch_changes_likelihood_semantics": False,
+            "identity_context_residual_scale_evaluation_only": prediction_context_scale,
+            "identity_context_residual_training": bool(
+                freeze_for_identity_context_residual
+            ),
+            "identity_context_layout_residual_scale_evaluation_only": (
+                prediction_layout_scale
+            ),
+            "identity_context_layout_residual_training": bool(
+                freeze_for_identity_context_layout_residual
+            ),
+            "identity_context_changes_measured_set_availability": False,
+            "prediction_export": (
+                "disabled_explicitly_for_training_throughput"
+                if not prediction_splits
+                else "completed"
+            ),
         },
         "config": {
             **model.config(),
+            "spatial_support_overrides": spatial_support_overrides,
+            "identity_context_overrides": identity_context_overrides,
+            "identity_context_layout_overrides": identity_context_layout_overrides,
             "steps": int(steps),
             "group_batch_size": int(group_batch_size),
             "query_images_per_batch": int(queries_per_batch),
@@ -2296,9 +3332,23 @@ def train_independent_rgb_candidate_verifier(
             "identity_negative_threshold_px": float(
                 identity_negative_threshold_px
             ),
+            "identity_target": resolved_identity_target,
+            "identity_target_semantics": _identity_target_semantics(
+                resolved_identity_target
+            ),
             "identity_loss_weight": float(identity_loss_weight),
             "availability_loss_weight": float(availability_loss_weight),
             "pair_loss_weight": float(pair_loss_weight),
+            "coarse_hard_negative_loss_weight": float(
+                coarse_hard_negative_loss_weight
+            ),
+            "coarse_hard_negative_margin": float(coarse_hard_negative_margin),
+            "coarse_hard_negative_prior_power": float(
+                coarse_hard_negative_prior_power
+            ),
+            "coarse_hard_negative_evidence_weight": float(
+                coarse_hard_negative_evidence_weight
+            ),
             "spatial_loss_weight": float(spatial_loss_weight),
             "spatial_target_sigma_px": float(spatial_target_sigma_px),
             "measurement_validity_loss_weight": float(
@@ -2314,8 +3364,12 @@ def train_independent_rgb_candidate_verifier(
                 measurement_success_threshold_px
             ),
             "seed": int(seed),
+            "prediction_identity_context_residual_scale": prediction_context_scale,
+            "prediction_identity_context_layout_residual_scale": prediction_layout_scale,
             "use_amp": bool(use_amp),
             "image_cache_dtype": cache_dtype_name,
+            "image_cache_location": cache_location,
+            "collect_spatial_diagnostics": bool(spatial_diagnostics_enabled),
             "coordinate_image_width": int(image_width),
             "coordinate_image_height": int(image_height),
             "freeze_for_measurement_validity": bool(
@@ -2327,6 +3381,12 @@ def train_independent_rgb_candidate_verifier(
             "freeze_for_pose_view_mixture": bool(
                 freeze_for_pose_view_mixture
             ),
+            "freeze_for_identity_context_residual": bool(
+                freeze_for_identity_context_residual
+            ),
+            "freeze_for_identity_context_layout_residual": bool(
+                freeze_for_identity_context_layout_residual
+            ),
         },
         "data": data.summary(),
         "metrics": split_metrics,
@@ -2336,6 +3396,7 @@ def train_independent_rgb_candidate_verifier(
             "requested_max_gb": float(image_cache_max_gb),
             "gpu_non_cache_reserve_gb": float(gpu_non_cache_reserve_gb),
             "effective_max_bytes": cache_bytes,
+            "storage_location": cache_location,
         },
         "inputs": {
             "candidate_evidence": str(candidate_evidence),
@@ -2364,6 +3425,7 @@ def train_independent_rgb_candidate_verifier(
                 if init_independent_checkpoint is None
                 else file_sha256_short(Path(init_independent_checkpoint))
             ),
+            **initialization_provenance,
             "image_root": str(Path(image_root).resolve()),
             "image_source_manifest_sha256": runtime_data_contract[
                 "image_source"
@@ -2375,8 +3437,14 @@ def train_independent_rgb_candidate_verifier(
         "outputs": {
             "checkpoint": str(checkpoint),
             "checkpoint_sha256": file_sha256_short(checkpoint),
-            "predictions": str(prediction_path),
-            "predictions_sha256": file_sha256_short(prediction_path),
+            "predictions": (
+                None if prediction_path is None else str(prediction_path)
+            ),
+            "predictions_sha256": (
+                None
+                if prediction_path is None
+                else file_sha256_short(prediction_path)
+            ),
             "summary": str(output / "summary.json"),
         },
     }

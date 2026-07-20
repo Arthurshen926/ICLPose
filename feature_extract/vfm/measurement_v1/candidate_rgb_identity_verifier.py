@@ -16,6 +16,7 @@ from typing import Mapping, Sequence
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint
 
 from feature_extract.vfm.measurement_v1.rgb_patch_measurement_branch import (
     TexturePatchEncoder,
@@ -35,6 +36,12 @@ GT_POSE_SPATIAL_DENSITY_SEMANTICS = (
 )
 POSE_VIEW_MIXTURE_SEMANTICS = (
     "candidate_masked_softmax_rgb_pair_hidden_gt_pose_density_nll_v1"
+)
+IDENTITY_CONTEXT_SEMANTICS = (
+    "per_view_aligned_broad_real_rgb_context_identity_residual_no_spatial_density_v1"
+)
+IDENTITY_CONTEXT_LAYOUT_SEMANTICS = (
+    "per_view_anchor_aligned_broad_real_rgb_relative_layout_separate_encoder_identity_residual_no_spatial_density_v1"
 )
 
 
@@ -460,12 +467,37 @@ class IndependentRGBCandidateVerifier(nn.Module):
         max_views: int = 4,
         measurement_validity_semantics: str = MEASUREMENT_MODE_SUCCESS_SEMANTICS,
         pose_view_mixture_enabled: bool = False,
+        pair_forward_batch_size: int = 0,
+        pair_forward_gradient_checkpointing: bool = False,
+        identity_context_radius_px: float | None = None,
+        identity_context_step_px: float | None = None,
+        identity_context_layout_grid_size: int | None = None,
     ) -> None:
         super().__init__()
         if float(search_radius_px) <= 0.0 or float(context_radius_px) < 0.0 or float(step_px) <= 0.0:
             raise ValueError("RGB verifier radii and step are invalid")
         if int(max_views) <= 0:
             raise ValueError("max_views must be positive")
+        if int(pair_forward_batch_size) < 0:
+            raise ValueError("pair_forward_batch_size must be non-negative")
+        if (identity_context_radius_px is None) != (
+            identity_context_step_px is None
+        ):
+            raise ValueError(
+                "identity context radius and step must be provided together"
+            )
+        if identity_context_radius_px is not None and (
+            float(identity_context_radius_px) <= 0.0
+            or float(identity_context_step_px) <= 0.0
+        ):
+            raise ValueError("identity context radius and step must be positive")
+        if identity_context_layout_grid_size is not None and (
+            int(identity_context_layout_grid_size) < 2
+            or int(identity_context_layout_grid_size) > 8
+        ):
+            raise ValueError("identity context layout grid size must be in [2, 8]")
+        if identity_context_layout_grid_size is not None and identity_context_radius_px is None:
+            raise ValueError("identity context layout requires broad identity context")
         self.search_radius_px = float(search_radius_px)
         self.context_radius_px = float(context_radius_px)
         self.step_px = float(step_px)
@@ -479,6 +511,25 @@ class IndependentRGBCandidateVerifier(nn.Module):
             measurement_validity_semantics
         )
         self.pose_view_mixture_enabled = bool(pose_view_mixture_enabled)
+        self.pair_forward_batch_size = int(pair_forward_batch_size)
+        self.pair_forward_gradient_checkpointing = bool(
+            pair_forward_gradient_checkpointing
+        )
+        self.identity_context_radius_px = (
+            None
+            if identity_context_radius_px is None
+            else float(identity_context_radius_px)
+        )
+        self.identity_context_step_px = (
+            None
+            if identity_context_step_px is None
+            else float(identity_context_step_px)
+        )
+        self.identity_context_layout_grid_size = (
+            None
+            if identity_context_layout_grid_size is None
+            else int(identity_context_layout_grid_size)
+        )
         if self.measurement_validity_semantics not in {
             MEASUREMENT_MODE_SUCCESS_SEMANTICS,
             GT_POSE_SPATIAL_DENSITY_SEMANTICS,
@@ -489,6 +540,29 @@ class IndependentRGBCandidateVerifier(nn.Module):
             hidden_dim=int(hidden_dim),
             input_mode=str(input_mode),
             encoder_arch=str(encoder_arch),
+        )
+        self.identity_context_encoder = (
+            None
+            if self.identity_context_radius_px is None
+            else TexturePatchEncoder(
+                feature_dim=int(feature_dim),
+                hidden_dim=int(hidden_dim),
+                input_mode=str(input_mode),
+                encoder_arch=str(encoder_arch),
+            )
+        )
+        # The layout encoder must be physically separate from v6's pooled
+        # context encoder. Otherwise layout-only training would silently alter
+        # the pooled v6 baseline and invalidate the scale counterfactual.
+        self.identity_context_layout_encoder = (
+            None
+            if self.identity_context_layout_grid_size is None
+            else TexturePatchEncoder(
+                feature_dim=int(feature_dim),
+                hidden_dim=int(hidden_dim),
+                input_mode=str(input_mode),
+                encoder_arch=str(encoder_arch),
+            )
         )
         self.logit_scale = nn.Parameter(torch.tensor(10.0, dtype=torch.float32))
         pair_dim = int(feature_dim) * 4
@@ -521,10 +595,84 @@ class IndependentRGBCandidateVerifier(nn.Module):
             nn.GELU(),
             nn.Linear(int(hidden_dim), 1),
         )
+        if self.identity_context_encoder is not None:
+            # This branch consumes broad aligned RGB context only as an identity
+            # residual.  It deliberately has no offset/dustbin head: local
+            # measurement density remains owned by the fine-support branch.
+            self.identity_context_evidence = nn.Sequential(
+                nn.Linear(pair_dim + 6, int(hidden_dim)),
+                nn.GELU(),
+                nn.Linear(int(hidden_dim), int(hidden_dim)),
+                nn.GELU(),
+            )
+            self.identity_context_residual = nn.Sequential(
+                nn.Linear(int(hidden_dim), int(hidden_dim)),
+                nn.GELU(),
+                nn.Linear(int(hidden_dim), int(hidden_dim)),
+            )
+            nn.init.zeros_(self.identity_context_residual[-1].weight)
+            nn.init.zeros_(self.identity_context_residual[-1].bias)
+            if self.identity_context_layout_grid_size is not None:
+                assert self.identity_context_layout_encoder is not None
+                # Preserve the broad crop's relative layout instead of reducing
+                # it to a single pooled texture vector.  The only positional
+                # channels are coordinates relative to the candidate anchor,
+                # so the branch cannot use image IDs, retrieval rank, or pose.
+                layout_channels = 4 * int(feature_dim) + 2
+                self.identity_context_layout_fusion = nn.Sequential(
+                    nn.Conv2d(layout_channels, int(hidden_dim), 1),
+                    nn.GroupNorm(1, int(hidden_dim)),
+                    nn.GELU(),
+                    nn.Conv2d(int(hidden_dim), int(hidden_dim), 3, padding=1),
+                    nn.GroupNorm(1, int(hidden_dim)),
+                    nn.GELU(),
+                )
+                layout_features = int(hidden_dim) * int(
+                    self.identity_context_layout_grid_size
+                ) ** 2
+                self.identity_context_layout_evidence = nn.Sequential(
+                    nn.Linear(layout_features, int(hidden_dim)),
+                    nn.GELU(),
+                    nn.Linear(int(hidden_dim), int(hidden_dim)),
+                    nn.GELU(),
+                )
+                self.identity_context_layout_residual = nn.Sequential(
+                    nn.Linear(int(hidden_dim), int(hidden_dim)),
+                    nn.GELU(),
+                    nn.Linear(int(hidden_dim), int(hidden_dim)),
+                )
+                nn.init.zeros_(self.identity_context_layout_residual[-1].weight)
+                nn.init.zeros_(self.identity_context_layout_residual[-1].bias)
+            else:
+                self.identity_context_layout_fusion = None
+                self.identity_context_layout_evidence = None
+                self.identity_context_layout_residual = None
+        else:
+            self.identity_context_evidence = None
+            self.identity_context_residual = None
+            self.identity_context_layout_encoder = None
+            self.identity_context_layout_fusion = None
+            self.identity_context_layout_evidence = None
+            self.identity_context_layout_residual = None
 
     @property
     def crop_radius_px(self) -> float:
         return float(self.search_radius_px + self.context_radius_px)
+
+    @property
+    def identity_context_enabled(self) -> bool:
+        return self.identity_context_encoder is not None
+
+    @property
+    def identity_context_layout_enabled(self) -> bool:
+        return (
+            self.identity_context_layout_encoder is not None
+            and self.identity_context_layout_fusion is not None
+        )
+
+    @property
+    def identity_context_crop_radius_px(self) -> float | None:
+        return self.identity_context_radius_px
 
     def config(self) -> dict[str, object]:
         return {
@@ -547,6 +695,25 @@ class IndependentRGBCandidateVerifier(nn.Module):
             "pose_view_mixture_semantics": (
                 POSE_VIEW_MIXTURE_SEMANTICS
                 if self.pose_view_mixture_enabled
+                else "disabled"
+            ),
+            "pair_forward_batch_size": self.pair_forward_batch_size,
+            "pair_forward_gradient_checkpointing": (
+                self.pair_forward_gradient_checkpointing
+            ),
+            "identity_context_enabled": self.identity_context_enabled,
+            "identity_context_radius_px": self.identity_context_radius_px,
+            "identity_context_step_px": self.identity_context_step_px,
+            "identity_context_semantics": (
+                IDENTITY_CONTEXT_SEMANTICS
+                if self.identity_context_enabled
+                else "disabled"
+            ),
+            "identity_context_layout_enabled": self.identity_context_layout_enabled,
+            "identity_context_layout_grid_size": self.identity_context_layout_grid_size,
+            "identity_context_layout_semantics": (
+                IDENTITY_CONTEXT_LAYOUT_SEMANTICS
+                if self.identity_context_layout_enabled
                 else "disabled"
             ),
             "view_identity_prior_logit": float(
@@ -592,42 +759,85 @@ class IndependentRGBCandidateVerifier(nn.Module):
         if not encoder_state:
             raise ValueError("measurement checkpoint has no encoder state")
         self.encoder.load_state_dict(encoder_state, strict=True)
+        if self.identity_context_encoder is not None:
+            self.identity_context_encoder.load_state_dict(encoder_state, strict=True)
+        if self.identity_context_layout_encoder is not None:
+            self.identity_context_layout_encoder.load_state_dict(
+                encoder_state, strict=True
+            )
         if "logit_scale" in state:
             with torch.no_grad():
                 self.logit_scale.copy_(state["logit_scale"].reshape_as(self.logit_scale))
         return dict(payload.get("config", {}) if isinstance(payload, Mapping) else {})
 
-    def forward(
-        self,
-        *,
-        query_patches_by_group: torch.Tensor,
-        support_patches: torch.Tensor,
-        pair_group_indices: torch.Tensor,
-        pair_candidate_indices: torch.Tensor,
-        pair_view_slots: torch.Tensor,
-        pair_view_probabilities: torch.Tensor,
-        candidate_valid: torch.Tensor,
-    ) -> RGBCandidateIdentityPrediction:
-        if query_patches_by_group.ndim != 4 or support_patches.ndim != 4:
-            raise ValueError("query and support patches must have shape (B,3,H,W)")
-        batch_size = int(query_patches_by_group.shape[0])
-        valid = candidate_valid.to(device=query_patches_by_group.device, dtype=torch.bool)
-        if valid.ndim != 2 or int(valid.shape[0]) != batch_size:
-            raise ValueError("candidate_valid must have shape (B,L)")
-        candidate_count = int(valid.shape[1])
-        groups = pair_group_indices.to(device=query_patches_by_group.device, dtype=torch.long).reshape(-1)
-        if int(support_patches.shape[0]) != int(groups.numel()):
-            raise ValueError("support patches and pair indices must share row count")
-        if int(groups.numel()) == 0:
-            raise ValueError("at least one measured RGB pair is required")
+    def initialize_identity_context_from_local_encoder(self) -> None:
+        """Clone a calibrated local encoder into a newly added context branch."""
 
-        query_features_by_group = self.encoder(query_patches_by_group)
+        if self.identity_context_encoder is None:
+            return
+        self.identity_context_encoder.load_state_dict(self.encoder.state_dict(), strict=True)
+
+    def initialize_identity_context_layout_from_pooled_encoder(self) -> None:
+        """Clone v6 broad features into the isolated layout branch."""
+
+        if self.identity_context_layout_encoder is None:
+            return
+        if self.identity_context_encoder is None:
+            raise RuntimeError("layout context requires a pooled context encoder")
+        self.identity_context_layout_encoder.load_state_dict(
+            self.identity_context_encoder.state_dict(), strict=True
+        )
+
+    @staticmethod
+    def _aligned_context_quality_features(
+        query_features: torch.Tensor,
+        support_features: torch.Tensor,
+    ) -> torch.Tensor:
+        """Summarize aligned broad context without producing an offset density."""
+
+        if query_features.shape != support_features.shape:
+            raise ValueError("identity context query/support feature maps must align")
+        normalized_query = F.normalize(query_features.float(), dim=1)
+        normalized_support = F.normalize(support_features.float(), dim=1)
+        aligned = torch.sum(normalized_query * normalized_support, dim=1)
+        flattened = aligned.flatten(1)
+        center = aligned[
+            :,
+            int(aligned.shape[1] // 2),
+            int(aligned.shape[2] // 2),
+        ]
+        query_pool = torch.mean(query_features.flatten(2), dim=2).float()
+        support_pool = torch.mean(support_features.flatten(2), dim=2).float()
+        pooled_cosine = F.cosine_similarity(query_pool, support_pool, dim=1)
+        return torch.stack(
+            [
+                torch.mean(flattened, dim=1),
+                torch.std(flattened, dim=1, unbiased=False),
+                torch.amax(flattened, dim=1),
+                torch.amin(flattened, dim=1),
+                center,
+                pooled_cosine,
+            ],
+            dim=1,
+        )
+
+    def _forward_pair_chunk(
+        self,
+        query_features: torch.Tensor,
+        support_patches: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Score a contiguous subset of independent query-support pairs."""
+
         support_features = self.encoder(support_patches)
-        query_features = query_features_by_group[groups]
         query_pool = torch.mean(query_features.flatten(2), dim=2)
         support_pool = torch.mean(support_features.flatten(2), dim=2)
         pair = torch.cat(
-            [query_pool, support_pool, query_pool - support_pool, query_pool * support_pool],
+            [
+                query_pool,
+                support_pool,
+                query_pool - support_pool,
+                query_pool * support_pool,
+            ],
             dim=1,
         )
         scale = torch.clamp(self.logit_scale, min=1.0, max=100.0)
@@ -642,14 +852,420 @@ class IndependentRGBCandidateVerifier(nn.Module):
         )
         quality = cost_volume_quality_features(spatial_logits)
         view_hidden = self.view_evidence(
-            torch.cat([pair, quality.to(device=pair.device, dtype=pair.dtype)], dim=1)
+            torch.cat(
+                [pair, quality.to(device=pair.device, dtype=pair.dtype)], dim=1
+            )
         )
+        return view_hidden, spatial_logits, spatial_offsets
+
+    def _forward_pairs(
+        self,
+        query_features_by_group: torch.Tensor,
+        support_patches: torch.Tensor,
+        groups: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Bound pair-level activation memory without changing group semantics."""
+
+        query_features = query_features_by_group[groups]
+        pair_count = int(support_patches.shape[0])
+        limit = int(self.pair_forward_batch_size)
+        if limit <= 0 or limit >= pair_count:
+            return self._forward_pair_chunk(query_features, support_patches)
+
+        view_hidden_chunks: list[torch.Tensor] = []
+        spatial_logit_chunks: list[torch.Tensor] = []
+        spatial_offsets: torch.Tensor | None = None
+        for start in range(0, pair_count, limit):
+            stop = min(pair_count, start + limit)
+            query_chunk = query_features[start:stop]
+            support_chunk = support_patches[start:stop]
+            if (
+                self.training
+                and self.pair_forward_gradient_checkpointing
+                and torch.is_grad_enabled()
+            ):
+                result = checkpoint(
+                    self._forward_pair_chunk,
+                    query_chunk,
+                    support_chunk,
+                    use_reentrant=False,
+                )
+            else:
+                result = self._forward_pair_chunk(query_chunk, support_chunk)
+            view_hidden, spatial_logits, chunk_spatial_offsets = result
+            view_hidden_chunks.append(view_hidden)
+            spatial_logit_chunks.append(spatial_logits)
+            # The offset grid is fixed by the model's radius/step configuration,
+            # not by the pair chunk. It remains a (K,2) tensor for all pairs.
+            if spatial_offsets is None:
+                spatial_offsets = chunk_spatial_offsets
+        if spatial_offsets is None:
+            raise ValueError("pair microbatching produced no spatial offset grid")
+        return (
+            torch.cat(view_hidden_chunks, dim=0),
+            torch.cat(spatial_logit_chunks, dim=0),
+            spatial_offsets,
+        )
+
+    def _forward_identity_context_pair_chunk(
+        self,
+        query_features: torch.Tensor,
+        support_features: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.identity_context_encoder is None or self.identity_context_evidence is None:
+            raise RuntimeError("identity context branch is disabled")
+        query_pool = torch.mean(query_features.flatten(2), dim=2)
+        support_pool = torch.mean(support_features.flatten(2), dim=2)
+        pair = torch.cat(
+            [
+                query_pool,
+                support_pool,
+                query_pool - support_pool,
+                query_pool * support_pool,
+            ],
+            dim=1,
+        )
+        quality = self._aligned_context_quality_features(
+            query_features, support_features
+        ).to(device=pair.device, dtype=pair.dtype)
+        return self.identity_context_evidence(torch.cat([pair, quality], dim=1))
+
+    def _forward_identity_context_pairs(
+        self,
+        query_features_by_group: torch.Tensor,
+        support_features: torch.Tensor,
+        groups: torch.Tensor,
+    ) -> torch.Tensor:
+        """Encode broad context in the same pair chunks as the local branch."""
+
+        query_features = query_features_by_group[groups]
+        pair_count = int(support_features.shape[0])
+        limit = int(self.pair_forward_batch_size)
+        if limit <= 0 or limit >= pair_count:
+            return self._forward_identity_context_pair_chunk(
+                query_features, support_features
+            )
+        chunks: list[torch.Tensor] = []
+        for start in range(0, pair_count, limit):
+            stop = min(pair_count, start + limit)
+            query_chunk = query_features[start:stop]
+            support_chunk = support_features[start:stop]
+            if (
+                self.training
+                and self.pair_forward_gradient_checkpointing
+                and torch.is_grad_enabled()
+            ):
+                chunk = checkpoint(
+                    self._forward_identity_context_pair_chunk,
+                    query_chunk,
+                    support_chunk,
+                    use_reentrant=False,
+                )
+            else:
+                chunk = self._forward_identity_context_pair_chunk(
+                    query_chunk, support_chunk
+                )
+            chunks.append(chunk)
+        return torch.cat(chunks, dim=0)
+
+    def _forward_identity_context_patch_chunk(
+        self,
+        query_features: torch.Tensor,
+        support_patches: torch.Tensor,
+    ) -> torch.Tensor:
+        """Encode and score one pooled-context support microbatch."""
+
+        if self.identity_context_encoder is None:
+            raise RuntimeError("identity context branch is disabled")
+        support_features = self.identity_context_encoder(support_patches)
+        return self._forward_identity_context_pair_chunk(
+            query_features, support_features
+        )
+
+    def _forward_identity_context_layout_patch_chunk(
+        self,
+        query_features: torch.Tensor,
+        support_patches: torch.Tensor,
+    ) -> torch.Tensor:
+        """Encode and score one layout-context support microbatch."""
+
+        if self.identity_context_layout_encoder is None:
+            raise RuntimeError("identity context layout branch is disabled")
+        support_features = self.identity_context_layout_encoder(support_patches)
+        return self._forward_identity_context_layout_pair_chunk(
+            query_features, support_features
+        )
+
+    def _forward_identity_context_patch_pairs(
+        self,
+        query_features_by_group: torch.Tensor,
+        support_patches: torch.Tensor,
+        groups: torch.Tensor,
+        *,
+        layout: bool,
+    ) -> torch.Tensor:
+        """Stream broad support encoding under the pair microbatch contract.
+
+        Encoding every broad support crop before pair chunking defeats the
+        memory bound for the FPN activations. GroupNorm makes this chunking
+        batch-independent, so the operation preserves the per-pair model
+        semantics while releasing support-encoder activations chunk by chunk.
+        """
+
+        query_features = query_features_by_group[groups]
+        pair_count = int(support_patches.shape[0])
+        limit = int(self.pair_forward_batch_size)
+        forward_chunk = (
+            self._forward_identity_context_layout_patch_chunk
+            if bool(layout)
+            else self._forward_identity_context_patch_chunk
+        )
+        if limit <= 0 or limit >= pair_count:
+            return forward_chunk(query_features, support_patches)
+        chunks: list[torch.Tensor] = []
+        for start in range(0, pair_count, limit):
+            stop = min(pair_count, start + limit)
+            query_chunk = query_features[start:stop]
+            support_chunk = support_patches[start:stop]
+            if (
+                self.training
+                and self.pair_forward_gradient_checkpointing
+                and torch.is_grad_enabled()
+            ):
+                chunk = checkpoint(
+                    forward_chunk,
+                    query_chunk,
+                    support_chunk,
+                    use_reentrant=False,
+                )
+            else:
+                chunk = forward_chunk(query_chunk, support_chunk)
+            chunks.append(chunk)
+        return torch.cat(chunks, dim=0)
+
+    def _forward_identity_context_layout_pair_chunk(
+        self,
+        query_features: torch.Tensor,
+        support_features: torch.Tensor,
+    ) -> torch.Tensor:
+        """Encode anchor-relative broad layout as identity evidence only."""
+
+        if (
+            self.identity_context_layout_fusion is None
+            or self.identity_context_layout_evidence is None
+        ):
+            raise RuntimeError("identity context layout branch is disabled")
+        if query_features.shape != support_features.shape:
+            raise ValueError("identity context layout query/support maps must align")
+        batch_size, _channels, height, width = query_features.shape
+        query_normalized = F.normalize(query_features.float(), dim=1)
+        support_normalized = F.normalize(support_features.float(), dim=1)
+        y = torch.linspace(
+            -1.0,
+            1.0,
+            int(height),
+            device=query_features.device,
+            dtype=query_features.dtype,
+        )
+        x = torch.linspace(
+            -1.0,
+            1.0,
+            int(width),
+            device=query_features.device,
+            dtype=query_features.dtype,
+        )
+        yy, xx = torch.meshgrid(y, x, indexing="ij")
+        coordinates = torch.stack([xx, yy], dim=0).expand(
+            int(batch_size), -1, -1, -1
+        )
+        layout_input = torch.cat(
+            [
+                query_normalized,
+                support_normalized,
+                query_normalized - support_normalized,
+                query_normalized * support_normalized,
+                coordinates,
+            ],
+            dim=1,
+        ).to(dtype=query_features.dtype)
+        fused = self.identity_context_layout_fusion(layout_input)
+        assert self.identity_context_layout_grid_size is not None
+        pooled = F.adaptive_avg_pool2d(
+            fused, (self.identity_context_layout_grid_size,) * 2
+        ).flatten(1)
+        return self.identity_context_layout_evidence(pooled)
+
+    def _forward_identity_context_layout_pairs(
+        self,
+        query_features_by_group: torch.Tensor,
+        support_features: torch.Tensor,
+        groups: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply the layout branch with the same pair microbatch contract."""
+
+        query_features = query_features_by_group[groups]
+        pair_count = int(support_features.shape[0])
+        limit = int(self.pair_forward_batch_size)
+        if limit <= 0 or limit >= pair_count:
+            return self._forward_identity_context_layout_pair_chunk(
+                query_features, support_features
+            )
+        chunks: list[torch.Tensor] = []
+        for start in range(0, pair_count, limit):
+            stop = min(pair_count, start + limit)
+            query_chunk = query_features[start:stop]
+            support_chunk = support_features[start:stop]
+            if (
+                self.training
+                and self.pair_forward_gradient_checkpointing
+                and torch.is_grad_enabled()
+            ):
+                chunk = checkpoint(
+                    self._forward_identity_context_layout_pair_chunk,
+                    query_chunk,
+                    support_chunk,
+                    use_reentrant=False,
+                )
+            else:
+                chunk = self._forward_identity_context_layout_pair_chunk(
+                    query_chunk, support_chunk
+                )
+            chunks.append(chunk)
+        return torch.cat(chunks, dim=0)
+
+    def forward(
+        self,
+        *,
+        query_patches_by_group: torch.Tensor,
+        support_patches: torch.Tensor,
+        pair_group_indices: torch.Tensor,
+        pair_candidate_indices: torch.Tensor,
+        pair_view_slots: torch.Tensor,
+        pair_view_probabilities: torch.Tensor,
+        candidate_valid: torch.Tensor,
+        identity_context_query_patches_by_group: torch.Tensor | None = None,
+        identity_context_support_patches: torch.Tensor | None = None,
+        identity_context_residual_scale: float = 1.0,
+        identity_context_layout_residual_scale: float = 0.0,
+    ) -> RGBCandidateIdentityPrediction:
+        if query_patches_by_group.ndim != 4 or support_patches.ndim != 4:
+            raise ValueError("query and support patches must have shape (B,3,H,W)")
+        batch_size = int(query_patches_by_group.shape[0])
+        valid = candidate_valid.to(device=query_patches_by_group.device, dtype=torch.bool)
+        if valid.ndim != 2 or int(valid.shape[0]) != batch_size:
+            raise ValueError("candidate_valid must have shape (B,L)")
+        candidate_count = int(valid.shape[1])
+        groups = pair_group_indices.to(device=query_patches_by_group.device, dtype=torch.long).reshape(-1)
+        if int(support_patches.shape[0]) != int(groups.numel()):
+            raise ValueError("support patches and pair indices must share row count")
+        if int(groups.numel()) == 0:
+            raise ValueError("at least one measured RGB pair is required")
+        context_residual_scale = float(identity_context_residual_scale)
+        if not math.isfinite(context_residual_scale) or not (
+            0.0 <= context_residual_scale <= 1.0
+        ):
+            raise ValueError(
+                "identity_context_residual_scale must be finite and in [0, 1]"
+            )
+        context_layout_residual_scale = float(identity_context_layout_residual_scale)
+        if not math.isfinite(context_layout_residual_scale) or not (
+            0.0 <= context_layout_residual_scale <= 1.0
+        ):
+            raise ValueError(
+                "identity_context_layout_residual_scale must be finite and in [0, 1]"
+            )
+        if context_layout_residual_scale > 0.0 and not self.identity_context_layout_enabled:
+            raise ValueError("identity context layout residual is disabled")
+
+        query_features_by_group = self.encoder(query_patches_by_group)
+        local_view_hidden, spatial_logits, spatial_offsets = self._forward_pairs(
+            query_features_by_group,
+            support_patches,
+            groups,
+        )
+        context_requested = (
+            context_residual_scale > 0.0
+            or context_layout_residual_scale > 0.0
+        )
+        if self.identity_context_enabled and context_requested:
+            if (
+                identity_context_query_patches_by_group is None
+                or identity_context_support_patches is None
+            ):
+                raise ValueError(
+                    "identity context patches are required by the dual-scale verifier"
+                )
+            context_query = identity_context_query_patches_by_group.to(
+                device=query_patches_by_group.device,
+                dtype=query_patches_by_group.dtype,
+            )
+            context_support = identity_context_support_patches.to(
+                device=query_patches_by_group.device,
+                dtype=support_patches.dtype,
+            )
+            if (
+                context_query.ndim != 4
+                or context_support.ndim != 4
+                or int(context_query.shape[0]) != batch_size
+                or int(context_support.shape[0]) != int(groups.numel())
+            ):
+                raise ValueError("identity context patches are misaligned with RGB pairs")
+            view_hidden = local_view_hidden
+            if context_residual_scale > 0.0:
+                assert self.identity_context_encoder is not None
+                assert self.identity_context_residual is not None
+                context_features_by_group = self.identity_context_encoder(
+                    context_query
+                )
+                context_hidden = self._forward_identity_context_patch_pairs(
+                    context_features_by_group,
+                    context_support,
+                    groups,
+                    layout=False,
+                )
+                view_hidden = view_hidden + context_residual_scale * (
+                    self.identity_context_residual(context_hidden)
+                )
+            if context_layout_residual_scale > 0.0:
+                assert self.identity_context_layout_encoder is not None
+                assert self.identity_context_layout_residual is not None
+                layout_features_by_group = self.identity_context_layout_encoder(
+                    context_query
+                )
+                layout_hidden = self._forward_identity_context_patch_pairs(
+                    layout_features_by_group,
+                    context_support,
+                    groups,
+                    layout=True,
+                )
+                view_hidden = view_hidden + context_layout_residual_scale * (
+                    self.identity_context_layout_residual(layout_hidden)
+                )
+        elif self.identity_context_enabled:
+            # Evaluation-only counterfactual: keep exactly the trained local
+            # branch and remove only the broad identity residual.  This avoids
+            # attributing a local fine-tuning effect to broad RGB context.
+            view_hidden = local_view_hidden
+        else:
+            if (
+                identity_context_query_patches_by_group is not None
+                or identity_context_support_patches is not None
+            ):
+                raise ValueError("identity context patches were provided to a local-only verifier")
+            view_hidden = local_view_hidden
+        # Keep the fine-support branch as the sole source of availability
+        # evidence.  Broad context is candidate-specific identity evidence: it
+        # may change which track is favored, but must not relabel a query as
+        # globally available merely through the residual pathway.
+        local_view_identity_logits = self.view_identity_head(
+            local_view_hidden
+        ).reshape(-1).float()
         view_identity_logits = self.view_identity_head(view_hidden).reshape(-1).float()
         view_measurement_validity_logits = self.view_measurement_validity_head(
-            view_hidden
+            local_view_hidden
         ).reshape(-1).float()
         view_pose_mixture_logits = self.view_pose_mixture_head(
-            view_hidden
+            local_view_hidden
         ).reshape(-1).float()
         (
             view_pose_mixture_probabilities,
@@ -680,8 +1296,49 @@ class IndependentRGBCandidateVerifier(nn.Module):
         coverage = torch.where(valid, coverage, torch.zeros_like(coverage))
         conditional = _masked_softmax(candidate_llr, valid)
 
+        if self.identity_context_enabled:
+            local_view_llr = (
+                local_view_identity_logits - self.view_identity_prior_logit.float()
+            )
+            (
+                availability_candidate_llr,
+                availability_candidate_hidden,
+                _availability_measured,
+                _availability_coverage,
+            ) = aggregate_view_log_likelihood_ratios(
+                local_view_llr,
+                local_view_hidden,
+                pair_view_probabilities=pair_view_probabilities,
+                pair_group_indices=groups,
+                pair_candidate_indices=pair_candidate_indices,
+                pair_view_slots=pair_view_slots,
+                batch_size=batch_size,
+                candidate_count=candidate_count,
+                max_views=self.max_views,
+            )
+            availability_candidate_llr = torch.where(
+                valid,
+                availability_candidate_llr,
+                torch.zeros_like(availability_candidate_llr),
+            )
+            availability_candidate_hidden = torch.where(
+                valid[..., None],
+                availability_candidate_hidden,
+                torch.zeros_like(availability_candidate_hidden),
+            )
+        else:
+            availability_candidate_llr = candidate_llr
+            availability_candidate_hidden = candidate_hidden
+
         candidate_set_features = self.set_candidate_encoder(
-            torch.cat([candidate_hidden, candidate_llr[..., None], coverage[..., None]], dim=2)
+            torch.cat(
+                [
+                    availability_candidate_hidden,
+                    availability_candidate_llr[..., None],
+                    coverage[..., None],
+                ],
+                dim=2,
+            )
         )
         candidate_set_features = torch.where(
             valid[..., None], candidate_set_features, torch.zeros_like(candidate_set_features)
