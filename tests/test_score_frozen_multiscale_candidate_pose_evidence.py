@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import numpy as np
 import pytest
 
 from feature_extract.tools.vfm.score_frozen_multiscale_candidate_pose_evidence import (
     _fixed_candidate_views,
+    _load_exact_hypotheses,
     _load_npz_allowlist,
     _parse_profiles,
     _select_s0_verification_rows,
@@ -89,3 +91,61 @@ def test_zero_posterior_candidate_retains_support_layout_but_not_weight() -> Non
     assert views.valid.tolist() == [[[True, True], [True, False]]]
     assert np.allclose(views.weights[0, 0], [0.75, 0.25])
     assert np.allclose(views.weights[0, 1], [0.0, 0.0])
+
+
+def test_exact_hypothesis_loader_selects_a_query_before_join(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import feature_extract.tools.vfm.score_frozen_multiscale_candidate_pose_evidence as module
+
+    baseline = {
+        "query_ids": np.asarray(["query-a", "query-b", "query-b"], dtype=np.str_),
+        "split_names": np.asarray(["train", "train", "train"], dtype=np.str_),
+        "evaluation_labels": np.asarray(["a0", "b0", "b1"], dtype=np.str_),
+        "hypothesis_indices": np.asarray([3, 7, 8], dtype=np.int64),
+        "source_chosen_for_optional_pose": np.asarray([False, True, False]),
+        "independent_score_top1": np.asarray([False, True, False]),
+        "independent_selection_scores": np.asarray([0.1, 0.7, 0.2]),
+    }
+    # Deliberately reorder source rows: exact identity, not artifact order,
+    # must select the matching frozen pose.
+    hypotheses = {
+        "query_ids": np.asarray(["query-b", "query-a", "query-b"], dtype=np.str_),
+        "split_names": np.asarray(["train", "train", "train"], dtype=np.str_),
+        "evaluation_labels": np.asarray(["b1", "a0", "b0"], dtype=np.str_),
+        "hypothesis_indices": np.asarray([8, 3, 7], dtype=np.int64),
+        "poses_w2c": np.asarray(
+            [
+                [[1.0, 0.0, 0.0, 80.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]],
+                [[1.0, 0.0, 0.0, 30.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]],
+                [[1.0, 0.0, 0.0, 70.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]],
+            ],
+            dtype=np.float64,
+        ),
+    }
+    monkeypatch.setattr(
+        module,
+        "_load_npz_allowlist",
+        lambda *_args, **_kwargs: (baseline, {}, tuple(baseline)),
+    )
+    monkeypatch.setattr(module, "_validate_baseline_score_metadata", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        module,
+        "load_inference_artifact_fields",
+        lambda *_args, **_kwargs: (hypotheses, {}),
+    )
+
+    exact, _hypothesis_metadata, _baseline_metadata = _load_exact_hypotheses(
+        hypothesis_path=Path("hypotheses.npz"),
+        baseline_path=Path("baseline.npz"),
+        detector_path=Path("detector.npz"),
+        proposals_path=Path("proposals.npz"),
+        candidate_path=Path("candidate.npz"),
+        prior_path=Path("prior.npz"),
+        fixed_candidate_top_k=20,
+        query_id="query-b",
+    )
+
+    assert exact["query_ids"].tolist() == ["query-b", "query-b"]
+    assert exact["hypothesis_indices"].tolist() == [7, 8]
+    np.testing.assert_allclose(exact["poses_w2c"][:, 0, 3], [70.0, 80.0])

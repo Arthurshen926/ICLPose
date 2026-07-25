@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
+import feature_extract.tools.vfm.mine_pose_conditioned_system_hard_negatives as hard_mining
 from feature_extract.tools.vfm.mine_pose_conditioned_system_hard_negatives import (
     PoseConditionedHardNegativeConfig,
     mine_query_system_error_modes,
@@ -142,3 +144,184 @@ def test_pose_conditioned_mining_never_labels_no_positive_group() -> None:
     assert not np.any(result["hard_negative_mask"][0])
     assert not result["group_hard_mask"][0]
     assert np.all(result["hard_negative_mask"][1:, 1])
+
+
+def test_hard_mode_mining_rejects_mixed_pose_evidence_versions(monkeypatch, tmp_path) -> None:
+    first = tmp_path / "first.npz"
+    second = tmp_path / "second.npz"
+    first.touch()
+    second.touch()
+    metadata = {
+        "format": "grouped_pose_hypotheses_inference_only_v1",
+        "contains_target_fields": False,
+        "pose_or_ground_truth_used_for_generation": False,
+        "inputs": {"candidate_artifact_sha256": "same"},
+        "grouped_config": {"latent_em_enabled": True},
+    }
+
+    def fake_load(path, _fields):
+        version = "spatial_kernel_mixture_v10" if path == first else "spatial_kernel_mixture_v11"
+        return (
+            {
+                "query_ids": np.asarray([path.stem]),
+                "evaluation_labels": np.asarray(["frozen"]),
+                "hypothesis_indices": np.asarray([0], dtype=np.int64),
+            },
+            {**metadata, "candidate_pose_evidence_version": version},
+        )
+
+    monkeypatch.setattr(hard_mining, "load_inference_artifact_fields", fake_load)
+    with pytest.raises(ValueError, match="incompatible"):
+        hard_mining._load_hypotheses((first, second))
+
+
+def test_hard_mode_mining_requires_pose_evidence_version(monkeypatch, tmp_path) -> None:
+    artifact = tmp_path / "hypotheses.npz"
+    artifact.touch()
+
+    def fake_load(_path, _fields):
+        return (
+            {
+                "query_ids": np.asarray(["query.png"]),
+                "evaluation_labels": np.asarray(["frozen"]),
+                "hypothesis_indices": np.asarray([0], dtype=np.int64),
+            },
+            {
+                "inputs": {"candidate_artifact_sha256": "same"},
+                "grouped_config": {"latent_em_enabled": True},
+            },
+        )
+
+    monkeypatch.setattr(hard_mining, "load_inference_artifact_fields", fake_load)
+    with pytest.raises(ValueError, match="evidence version"):
+        hard_mining._load_hypotheses((artifact,))
+
+
+def test_hard_mode_mining_merges_variable_relation_edge_axes(monkeypatch, tmp_path) -> None:
+    first = tmp_path / "first.npz"
+    second = tmp_path / "second.npz"
+    first.touch()
+    second.touch()
+    metadata = {
+        "candidate_pose_evidence_version": "spatial_kernel_mixture_v10",
+        "inputs": {"candidate_artifact_sha256": "same"},
+        "grouped_config": {"latent_em_enabled": True},
+    }
+
+    def fake_load(path, _fields):
+        edge_count = 54 if path == first else 55
+        row_offset = 0 if path == first else 1
+        return (
+            {
+                "query_ids": np.asarray([path.stem]),
+                "evaluation_labels": np.asarray(["frozen"]),
+                "hypothesis_indices": np.asarray([row_offset], dtype=np.int64),
+                "verification_relation_feature_edge_histograms": np.full(
+                    (1, edge_count, 208), float(row_offset), dtype=np.float32
+                ),
+                "verification_relation_feature_edge_null_touching_masses": np.full(
+                    (1, edge_count), float(row_offset), dtype=np.float32
+                ),
+            },
+            metadata,
+        )
+
+    monkeypatch.setattr(hard_mining, "load_inference_artifact_fields", fake_load)
+    merged, _compatibility, _manifests = hard_mining._load_hypotheses(
+        (first, second)
+    )
+
+    histograms = merged["verification_relation_feature_edge_histograms"]
+    null_masses = merged["verification_relation_feature_edge_null_touching_masses"]
+    assert histograms.shape == (2, 55, 208)
+    assert null_masses.shape == (2, 55)
+    assert np.isnan(histograms[0, 54]).all()
+    assert np.isnan(null_masses[0, 54])
+    np.testing.assert_array_equal(histograms[1], np.ones((55, 208), dtype=np.float32))
+
+
+def test_hard_mode_mining_loads_only_fields_required_for_mode_targets(
+    monkeypatch, tmp_path
+) -> None:
+    artifact = tmp_path / "hypotheses.npz"
+    artifact.touch()
+    requested_fields: list[tuple[str, ...]] = []
+
+    def fake_load(path, fields):
+        assert path == artifact
+        requested_fields.append(tuple(fields))
+        return (
+            {
+                "query_ids": np.asarray(["query.png"]),
+                "split_names": np.asarray(["train"]),
+                "evaluation_labels": np.asarray(["frozen"]),
+                "hypothesis_indices": np.asarray([0], dtype=np.int64),
+                "poses_w2c": np.eye(4, dtype=np.float64)[None],
+                "verification_log_likelihood_means": np.asarray([0.0]),
+            },
+            {
+                "candidate_pose_evidence_version": "spatial_kernel_mixture_v10",
+                "inputs": {"candidate_artifact_sha256": "same"},
+                "grouped_config": {"latent_em_enabled": True},
+            },
+        )
+
+    monkeypatch.setattr(
+        hard_mining, "load_inference_artifact_fields", fake_load, raising=False
+    )
+    hard_mining._load_hypotheses((artifact,))
+
+    assert requested_fields == [
+        (
+            "query_ids",
+            "split_names",
+            "evaluation_labels",
+            "hypothesis_indices",
+            "poses_w2c",
+            "verification_log_likelihood_means",
+        )
+    ]
+
+
+def test_hard_mode_mining_derives_positive_mask_from_posthoc_residuals() -> None:
+    proposal_residuals = np.asarray(
+        [[1.5, 3.0, np.nan], [0.5, 5.0, 2.0]], dtype=np.float64
+    )
+    selected_rows = np.asarray([0, 1], dtype=np.int64)
+    selected_columns = np.asarray([[0, 1, -1], [1, 0, 2]], dtype=np.int64)
+    valid_edges = np.asarray([[True, True, False], [True, True, True]])
+
+    positive = hard_mining.positive_mask_from_posthoc_gt_residuals(
+        proposal_residuals=proposal_residuals,
+        selected_rows=selected_rows,
+        selected_columns=selected_columns,
+        valid_edges=valid_edges,
+        positive_threshold_px=2.0,
+    )
+
+    np.testing.assert_array_equal(
+        positive,
+        np.asarray([[True, False, False], [False, True, True]]),
+    )
+
+
+def test_hard_mode_mining_restricts_all_candidate_rows_to_requested_queries() -> None:
+    query_ids = np.asarray(
+        ["train/a.png", "validation/b.png", "train/c.png", "test/d.png"]
+    )
+    selected_ids, fields = hard_mining.select_candidate_rows_for_allowed_queries(
+        query_ids=query_ids,
+        allowed_query_ids={"train/a.png", "train/c.png"},
+        fields={
+            "selected_rows": np.asarray([2, 3, 5, 7], dtype=np.int64),
+            "valid_edges": np.asarray(
+                [[True, False], [False, True], [True, True], [False, False]]
+            ),
+        },
+    )
+
+    np.testing.assert_array_equal(selected_ids, ["train/a.png", "train/c.png"])
+    np.testing.assert_array_equal(fields["selected_rows"], [2, 5])
+    np.testing.assert_array_equal(
+        fields["valid_edges"], np.asarray([[True, False], [True, True]])
+    )

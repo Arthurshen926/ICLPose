@@ -634,3 +634,41 @@ def test_tensor_image_lru_cache_enforces_shared_byte_budget() -> None:
         "misses": 3,
         "evictions": 1,
     }
+
+
+def test_uint8_image_cache_normalizes_on_crop_gpu_without_cpu_float_storage() -> None:
+    image = torch.tensor(
+        [
+            [[0, 255, 0], [255, 128, 255], [0, 255, 0]],
+            [[255, 0, 255], [0, 128, 0], [255, 0, 255]],
+            [[128, 128, 128], [128, 128, 128], [128, 128, 128]],
+        ],
+        dtype=torch.uint8,
+    )
+    cache = rgb_patch_training.TensorImageLRUCache(
+        max_bytes=1024, storage_dtype=torch.uint8
+    )
+    patches = rgb_patch_training._crop_cached_rgb_windows_grouped(
+        [("image", lambda: image.clone())],
+        [[1.0, 1.0]],
+        cache=cache,
+        cache_device=None,
+        crop_device=None,
+        radius_px=1.0,
+        step_px=1.0,
+        image_width=3,
+        image_height=3,
+    )
+
+    expected, _ = rgb_patch_training.crop_rgb_windows_by_owner(
+        image.float().div(255.0).unsqueeze(0),
+        torch.tensor([0]),
+        torch.tensor([[1.0, 1.0]]),
+        radius_px=1.0,
+        step_px=1.0,
+        image_width=3,
+        image_height=3,
+    )
+    assert cache["image"].dtype == torch.uint8
+    torch.testing.assert_close(patches, expected)
+    assert rgb_patch_training.resolve_rgb_image_cache_storage_dtype("uint8") == torch.uint8

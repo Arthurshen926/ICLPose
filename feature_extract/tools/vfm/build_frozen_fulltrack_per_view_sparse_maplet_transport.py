@@ -290,6 +290,36 @@ def _topology_cache_source_contract(
     }
 
 
+def _normalise_topology_cache_source_contract_paths(
+    contract: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Canonicalize non-semantic cache paths before strict provenance compare.
+
+    Older topology caches were often written from an absolute workspace path,
+    while current callers may pass the identical files relative to the
+    repository.  The file hash, source manifest, PCA/checkpoint fields, and
+    geometry hash remain the identity checks; only this filesystem spelling is
+    normalized.
+    """
+
+    output = dict(contract)
+    metadata = output.get("source_metadata")
+    if not isinstance(metadata, list):
+        raise ValueError("sparse-maplet topology source contract lacks source metadata")
+    normalized: list[dict[str, Any]] = []
+    for item in metadata:
+        if not isinstance(item, Mapping):
+            raise ValueError("sparse-maplet topology source metadata is invalid")
+        entry = dict(item)
+        cache = entry.get("cache")
+        if not isinstance(cache, str) or not cache:
+            raise ValueError("sparse-maplet topology source cache path is invalid")
+        entry["cache"] = str(Path(cache).expanduser().resolve())
+        normalized.append(entry)
+    output["source_metadata"] = normalized
+    return output
+
+
 def write_sparse_maplet_neighbor_topology_cache(
     *,
     output: Path,
@@ -390,6 +420,12 @@ def load_sparse_maplet_neighbor_topology_cache(
         if "metadata_json" not in payload.files:
             raise ValueError("sparse-maplet topology cache lacks metadata")
         metadata = json.loads(str(np.asarray(payload["metadata_json"]).item()))
+        cached_contract = _normalise_topology_cache_source_contract_paths(
+            metadata.get("source_contract", {})
+            if isinstance(metadata, Mapping)
+            else {}
+        )
+        expected_contract = _normalise_topology_cache_source_contract_paths(contract)
         if (
             not isinstance(metadata, Mapping)
             or metadata.get("format") != TOPOLOGY_CACHE_FORMAT
@@ -403,7 +439,7 @@ def load_sparse_maplet_neighbor_topology_cache(
             or metadata.get("support_geometry_coordinate_source")
             != geometry_metadata.get("coordinate_source")
             or metadata.get("geometry_row_count") != int(geometry_row_count)
-            or metadata.get("source_contract") != contract
+            or cached_contract != expected_contract
         ):
             raise ValueError("sparse-maplet topology cache lineage is stale or incompatible")
         hashes = metadata.get("profile_topology_sha256")

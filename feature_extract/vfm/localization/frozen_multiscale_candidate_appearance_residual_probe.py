@@ -29,6 +29,9 @@ from feature_extract.vfm.localization.frozen_loftr_candidate_anchor_evidence imp
     FROZEN_LOFTR_CANDIDATE_ANCHOR_EVIDENCE_FORMAT,
     LOFTR_ANCHOR_FEATURE_NAMES,
 )
+from feature_extract.vfm.localization.frozen_loftr_coordinate_contract import (
+    validate_frozen_loftr_colmap_coordinate_metadata,
+)
 
 
 FROZEN_APPEARANCE_RESIDUAL_MODEL_FORMAT = (
@@ -238,6 +241,8 @@ def _metadata_from_payload(
             "all_mapping_images_pair_cached": True,
             "pair_cache_image_level_selection": False,
             "anchor_evidence_pose_free": True,
+            "source_to_colmap_coordinate_contract": True,
+            "legacy_coordinate_ambiguous_evidence_rejected": True,
         }
         if (
             not common
@@ -247,6 +252,7 @@ def _metadata_from_payload(
             or any(strict.get(key) is not expected for key, expected in required.items())
         ):
             raise ValueError(f"{path}: invalid target-free frozen LoFTR anchor contract")
+        validate_frozen_loftr_colmap_coordinate_metadata(metadata)
         return metadata, "candidate_view_features", "feature_names"
     raise ValueError(f"{path}: unsupported frozen per-view evidence format")
 

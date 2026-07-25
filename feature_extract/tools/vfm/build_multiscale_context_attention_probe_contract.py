@@ -21,10 +21,14 @@ from feature_extract.tools.vfm.build_global_context_candidate_probe_features imp
 from feature_extract.vfm.artifacts import file_sha256_short
 from feature_extract.vfm.localization.context_attention_candidate_probe import (
     CONTEXT_ATTENTION_CENTER_MASK_RADIUS,
-    CONTEXT_ATTENTION_FAMILIES,
     CONTEXT_ATTENTION_PROBE_CONTRACT_FORMAT,
-    CONTEXT_ATTENTION_SCALES,
+    CONTEXT_ATTENTION_PROBE_CONTRACT_FORMAT_V2,
+    CONTEXT_ATTENTION_PROBE_CONTRACT_FORMAT_V3,
+    CONTEXT_ATTENTION_PROBE_CONTRACT_FORMAT_V4,
+    CONTEXT_ATTENTION_PROBE_CONTRACT_FORMAT_V5,
     build_fixed_candidate_context_runtime,
+    context_attention_global_region_sizes,
+    context_attention_profile,
     load_context_attention_frozen_layout,
     load_context_attention_sources,
 )
@@ -35,6 +39,13 @@ from feature_extract.vfm.localization.local_maplet_geometry_probe import (
 
 _PROPOSAL_OVERLAY_CANDIDATE_INPUT = "proposal_overlay_v1"
 _MIXED_POINTS_CANDIDATE_INPUT = "mixed_verification_points_embedded_coarse_prior_v1"
+_LEGACY_ARCHITECTURE = "legacy_oneway_v1"
+_BIDIRECTIONAL_ABSOLUTE_ARCHITECTURE = "bidirectional_absolute_v2"
+_BIDIRECTIONAL_RAW_ABSOLUTE_ARCHITECTURE = "bidirectional_absolute_raw_v3"
+_BIDIRECTIONAL_RAW_LAYOUT_ABSOLUTE_ARCHITECTURE = "bidirectional_absolute_raw_layout_v4"
+_BIDIRECTIONAL_DUAL_HEAD_RAW_LAYOUT_ABSOLUTE_ARCHITECTURE = (
+    "bidirectional_absolute_dual_head_raw_layout_v5"
+)
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -44,15 +55,31 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--radio_final_context_cache", required=True)
     parser.add_argument("--radio_intermediate_context_cache", required=True)
     parser.add_argument("--alike_spatial_context_cache", required=True)
+    parser.add_argument(
+        "--architecture",
+        choices=(
+            _LEGACY_ARCHITECTURE,
+            _BIDIRECTIONAL_ABSOLUTE_ARCHITECTURE,
+            _BIDIRECTIONAL_RAW_ABSOLUTE_ARCHITECTURE,
+            _BIDIRECTIONAL_RAW_LAYOUT_ABSOLUTE_ARCHITECTURE,
+            _BIDIRECTIONAL_DUAL_HEAD_RAW_LAYOUT_ABSOLUTE_ARCHITECTURE,
+        ),
+        default=_LEGACY_ARCHITECTURE,
+        help="freeze the source/receptive-field profile consumed by the matcher",
+    )
     parser.add_argument("--output", required=True)
     parser.add_argument("--summary_json", required=True)
     parser.add_argument("--force", action="store_true")
     return parser.parse_args(argv)
 
 
-def _source_manifest(sources: Sequence[object]) -> list[dict[str, object]]:
+def _source_manifest(
+    sources: Sequence[object], *, scales: Sequence[object]
+) -> list[dict[str, object]]:
     output: list[dict[str, object]] = []
-    for source, scale in zip(sources, CONTEXT_ATTENTION_SCALES):
+    if len(sources) != len(scales):
+        raise ValueError("context-attention source/profile scale counts differ")
+    for source, scale in zip(sources, scales):
         metadata = source.metadata
         output.append(
             {
@@ -83,6 +110,7 @@ def build_multiscale_context_attention_probe_contract(
     output: Path,
     summary_json: Path,
     force: bool,
+    architecture: str = _LEGACY_ARCHITECTURE,
 ) -> dict[str, Any]:
     """Write a validated, immutable source manifest for direct token probing."""
 
@@ -90,6 +118,9 @@ def build_multiscale_context_attention_probe_contract(
     summary_json = Path(summary_json)
     if (output.exists() or summary_json.exists()) and not bool(force):
         raise FileExistsError("refusing to overwrite context-attention probe contract")
+    families, scales, uses_candidate_conditioned_global_regions = context_attention_profile(
+        str(architecture)
+    )
     layout, layout_metadata = load_context_attention_frozen_layout(
         Path(frozen_layout_features)
     )
@@ -144,12 +175,39 @@ def build_multiscale_context_attention_probe_contract(
     ):
         runtime_digest.update(np.ascontiguousarray(value).view(np.uint8))
     payload: dict[str, Any] = {
-        "format": CONTEXT_ATTENTION_PROBE_CONTRACT_FORMAT,
+        "format": (
+            CONTEXT_ATTENTION_PROBE_CONTRACT_FORMAT_V5
+            if str(architecture) == _BIDIRECTIONAL_DUAL_HEAD_RAW_LAYOUT_ABSOLUTE_ARCHITECTURE
+            else (
+                CONTEXT_ATTENTION_PROBE_CONTRACT_FORMAT_V4
+                if str(architecture) == _BIDIRECTIONAL_RAW_LAYOUT_ABSOLUTE_ARCHITECTURE
+                else (
+                    CONTEXT_ATTENTION_PROBE_CONTRACT_FORMAT_V3
+                    if str(architecture) == _BIDIRECTIONAL_RAW_ABSOLUTE_ARCHITECTURE
+                    else (
+                        CONTEXT_ATTENTION_PROBE_CONTRACT_FORMAT_V2
+                        if str(architecture) == _BIDIRECTIONAL_ABSOLUTE_ARCHITECTURE
+                        else CONTEXT_ATTENTION_PROBE_CONTRACT_FORMAT
+                    )
+                )
+            )
+        ),
         "contains_ground_truth": False,
         "contains_target_errors": False,
         "pose_or_ground_truth_used": False,
         "image_retrieval_or_submap_used": False,
-        "whole_image_summary_or_global_used": False,
+        # v2 may use only these fixed candidate/view image regions.  It cannot
+        # retrieve, reselect candidates, or inspect a pose hypothesis.
+        "whole_image_summary_or_global_used": bool(
+            uses_candidate_conditioned_global_regions
+        ),
+        "soft_global_context_factor_used": bool(
+            uses_candidate_conditioned_global_regions
+        ),
+        "global_context_hard_retrieval_or_candidate_reselection": False,
+        "candidate_conditioned_full_image_region_tokens": bool(
+            uses_candidate_conditioned_global_regions
+        ),
         "render": False,
         "candidate_set": "frozen_global_top20_tracks",
         "candidate_support_views": "frozen_layout_support_views_only",
@@ -159,8 +217,12 @@ def build_multiscale_context_attention_probe_contract(
             "radius": int(CONTEXT_ATTENTION_CENTER_MASK_RADIUS),
             "reason": "exclude_anchor_descriptor_from_candidate_specific_context_control",
         },
-        "families": list(CONTEXT_ATTENTION_FAMILIES),
-        "source_scales": _source_manifest(sources),
+        "architecture": str(architecture),
+        "global_region_size_by_scale": context_attention_global_region_sizes(
+            str(architecture)
+        ),
+        "families": list(families),
+        "source_scales": _source_manifest(sources, scales=scales),
         "source_image_manifest_sha256": source_manifest,
         "frozen_layout_features": str(Path(frozen_layout_features).resolve()),
         "frozen_layout_features_sha256": file_sha256_short(frozen_layout_features),
@@ -200,20 +262,24 @@ def build_multiscale_context_attention_probe_contract(
         "stage": "freeze_multiscale_context_attention_probe_contract",
         "output": str(output),
         "output_sha256": file_sha256_short(output),
-        "format": CONTEXT_ATTENTION_PROBE_CONTRACT_FORMAT,
+        "format": payload["format"],
         "row_count": int(payload["query_row_count"]),
         "candidate_top_k": int(payload["candidate_top_k"]),
         "support_view_count": int(payload["support_view_count"]),
         "valid_candidate_view_count": int(payload["valid_candidate_view_count"]),
         "scales": [
             {"name": scale.name, "grid_size": scale.grid_size, "window_size": scale.window_size}
-            for scale in CONTEXT_ATTENTION_SCALES
+            for scale in scales
         ],
         "protocol": {
             "image_retrieval_or_submap_used": False,
             "pose_or_ground_truth_used": False,
             "render": False,
-            "context_only_masks_anchor": True,
+            "context_only_masks_anchor": not bool(uses_candidate_conditioned_global_regions),
+            "candidate_conditioned_full_image_region_tokens": bool(
+                uses_candidate_conditioned_global_regions
+            ),
+            "architecture": str(architecture),
             "view_features_averaged_before_inference": False,
         },
     }
@@ -233,6 +299,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         output=Path(args.output),
         summary_json=Path(args.summary_json),
         force=bool(args.force),
+        architecture=str(args.architecture),
     )
     print(json.dumps(summary, indent=2, sort_keys=True))
 

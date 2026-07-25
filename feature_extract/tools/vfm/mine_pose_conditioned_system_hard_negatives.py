@@ -17,7 +17,8 @@ from typing import Mapping, Sequence
 import numpy as np
 
 from feature_extract.tools.vfm.eval_grouped_hypothesis_artifact import (
-    load_inference_artifact,
+    concatenate_hypothesis_shard_field,
+    load_inference_artifact_fields,
 )
 from feature_extract.vfm.artifacts import file_sha256_short
 from feature_extract.vfm.colmap_tracks import (
@@ -41,6 +42,14 @@ from feature_extract.vfm.query_to_3d_matching import (
 
 ARTIFACT_FORMAT = "pose_conditioned_system_hard_negatives_v1"
 STRUCTURED_ARTIFACT_FORMAT = "pose_conditioned_system_hard_modes_v2"
+_HYPOTHESIS_FIELDS_REQUIRED_BY_MINING = (
+    "query_ids",
+    "split_names",
+    "evaluation_labels",
+    "hypothesis_indices",
+    "poses_w2c",
+    "verification_log_likelihood_means",
+)
 
 
 @dataclass(frozen=True)
@@ -154,6 +163,56 @@ def _compact(
     else:
         output[columns < 0] = -1
     return output
+
+
+def positive_mask_from_posthoc_gt_residuals(
+    *,
+    proposal_residuals: np.ndarray,
+    selected_rows: np.ndarray,
+    selected_columns: np.ndarray,
+    valid_edges: np.ndarray,
+    positive_threshold_px: float,
+) -> np.ndarray:
+    """Join GT residual targets only after target-free candidates are frozen."""
+
+    threshold = float(positive_threshold_px)
+    if not np.isfinite(threshold) or threshold <= 0.0:
+        raise ValueError("positive threshold must be finite and positive")
+    valid = np.asarray(valid_edges, dtype=bool)
+    rows = np.asarray(selected_rows, dtype=np.int64).reshape(-1)
+    columns = np.asarray(selected_columns, dtype=np.int64)
+    if columns.shape != valid.shape or rows.shape != (len(valid),):
+        raise ValueError("selected candidate layout is not aligned with valid edges")
+    residuals = _compact(
+        np.asarray(proposal_residuals, dtype=np.float64), rows, columns
+    )
+    if residuals.shape != valid.shape:
+        raise ValueError("compacted proposal residuals are not candidate aligned")
+    return valid & np.isfinite(residuals) & (residuals <= threshold)
+
+
+def select_candidate_rows_for_allowed_queries(
+    *,
+    query_ids: np.ndarray,
+    allowed_query_ids: set[str],
+    fields: Mapping[str, np.ndarray],
+) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    """Keep all candidate-target rows inside the declared training split."""
+
+    ids = np.asarray(query_ids).astype(str).reshape(-1)
+    allowed = {str(query_id) for query_id in allowed_query_ids}
+    if len(ids) == 0 or not allowed:
+        raise ValueError("candidate row selection needs non-empty query sets")
+    selected = np.flatnonzero(np.isin(ids, np.asarray(sorted(allowed))))
+    if len(selected) == 0:
+        raise ValueError("candidate rows do not cover the requested query set")
+    filtered: dict[str, np.ndarray] = {}
+    for name, value in fields.items():
+        array = np.asarray(value)
+        if array.ndim == 0 or array.shape[0] != len(ids):
+            raise ValueError(f"candidate field {name!r} is not query-row aligned")
+        filtered[str(name)] = array[selected]
+    return ids[selected], filtered
 
 
 def _gt_pose_w2c(image) -> np.ndarray:
@@ -413,8 +472,14 @@ def _load_hypotheses(
     manifests = []
     compatibility = None
     for path in paths:
-        arrays, metadata = load_inference_artifact(path)
+        arrays, metadata = load_inference_artifact_fields(
+            path, _HYPOTHESIS_FIELDS_REQUIRED_BY_MINING
+        )
+        evidence_version = metadata.get("candidate_pose_evidence_version")
+        if not isinstance(evidence_version, str) or not evidence_version:
+            raise ValueError("hypothesis artifact lacks a candidate pose evidence version")
         current = {
+            "candidate_pose_evidence_version": evidence_version,
             "inputs": metadata.get("inputs"),
             "grouped_config": metadata.get("grouped_config"),
         }
@@ -434,7 +499,9 @@ def _load_hypotheses(
     if any(set(payload).difference({"metadata_json"}) != keys for payload in payloads):
         raise ValueError("hypothesis artifact schemas differ")
     merged = {
-        key: np.concatenate([np.asarray(payload[key]) for payload in payloads], axis=0)
+        key: concatenate_hypothesis_shard_field(
+            key, [np.asarray(payload[key]) for payload in payloads]
+        )
         for key in sorted(keys)
     }
     unique_keys = list(
@@ -529,8 +596,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     selected_rows = np.asarray(candidate["selected_rows"], dtype=np.int64)
     selected_columns = np.asarray(candidate["selected_columns"], dtype=np.int64)
     valid = np.asarray(candidate["valid_edges"], dtype=bool)
-    positive = np.asarray(candidate["labels"], dtype=bool)
-    if selected_columns.shape != valid.shape or positive.shape != valid.shape:
+    if selected_columns.shape != valid.shape or selected_rows.shape != (len(valid),):
         raise ValueError("candidate artifact arrays are not aligned")
     score_key = str(args.score_key)
     if score_key not in scores_payload:
@@ -542,34 +608,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
     if candidate_scores.shape != valid.shape:
         raise ValueError("candidate score matrix is not aligned with the candidate store")
-    if np.any(~np.isfinite(candidate_scores[valid])):
-        raise ValueError("valid candidate scores must be finite")
 
     query_ids = np.asarray(proposals["query_ids"])[selected_rows].astype(str)
-    query_xy = np.asarray(proposals["xy"], dtype=np.float64)[selected_rows]
-    compact_tracks = _compact(
-        proposals["candidate_track_ids"], selected_rows, selected_columns
-    ).astype(np.int64)
-    compact_gt_residuals = _compact(
-        proposals["candidate_gt_residuals_px"], selected_rows, selected_columns
-    ).astype(np.float64)
-    candidate_metadata = json.loads(str(candidate["metadata_json"].item()))
-    positive_threshold = float(candidate_metadata.get("positive_threshold_px", 2.0))
-    expected_positive = (
-        valid
-        & np.isfinite(compact_gt_residuals)
-        & (compact_gt_residuals <= positive_threshold)
-    )
-    if not np.array_equal(positive, expected_positive):
-        raise ValueError("candidate labels differ from frozen GT residual targets")
-
-    landmark_index, _ = load_landmark_index_npz(bank_path)
-    canonical_rows = canonical_rows_for_track_candidates(
-        compact_tracks, landmark_index.track_ids
-    )
-    valid &= canonical_rows >= 0
-    candidate_xyz = np.zeros((*valid.shape, 3), dtype=np.float64)
-    candidate_xyz[valid] = landmark_index.xyz[canonical_rows[valid]]
 
     split = json.loads(split_path.read_text())
     split_names = tuple(
@@ -609,6 +649,48 @@ def main(argv: Sequence[str] | None = None) -> None:
     if not bool(args.allow_partial_query_coverage) and artifact_query_set != allowed_query_ids:
         missing = sorted(allowed_query_ids.difference(artifact_query_set))
         raise ValueError(f"hypothesis artifacts do not cover requested split: {missing[:5]}")
+
+    query_ids, selected_candidate_fields = select_candidate_rows_for_allowed_queries(
+        query_ids=query_ids,
+        allowed_query_ids=allowed_query_ids,
+        fields={
+            "selected_rows": selected_rows,
+            "selected_columns": selected_columns,
+            "valid": valid,
+            "candidate_scores": candidate_scores,
+        },
+    )
+    selected_rows = np.asarray(selected_candidate_fields["selected_rows"], dtype=np.int64)
+    selected_columns = np.asarray(
+        selected_candidate_fields["selected_columns"], dtype=np.int64
+    )
+    valid = np.asarray(selected_candidate_fields["valid"], dtype=bool)
+    candidate_scores = np.asarray(
+        selected_candidate_fields["candidate_scores"], dtype=np.float64
+    )
+    if np.any(~np.isfinite(candidate_scores[valid])):
+        raise ValueError("valid candidate scores must be finite")
+    query_xy = np.asarray(proposals["xy"], dtype=np.float64)[selected_rows]
+    compact_tracks = _compact(
+        proposals["candidate_track_ids"], selected_rows, selected_columns
+    ).astype(np.int64)
+    candidate_metadata = json.loads(str(candidate["metadata_json"].item()))
+    positive_threshold = float(candidate_metadata.get("positive_threshold_px", 2.0))
+    positive = positive_mask_from_posthoc_gt_residuals(
+        proposal_residuals=proposals["candidate_gt_residuals_px"],
+        selected_rows=selected_rows,
+        selected_columns=selected_columns,
+        valid_edges=valid,
+        positive_threshold_px=positive_threshold,
+    )
+
+    landmark_index, _ = load_landmark_index_npz(bank_path)
+    canonical_rows = canonical_rows_for_track_candidates(
+        compact_tracks, landmark_index.track_ids
+    )
+    valid &= canonical_rows >= 0
+    candidate_xyz = np.zeros((*valid.shape, 3), dtype=np.float64)
+    candidate_xyz[valid] = landmark_index.xyz[canonical_rows[valid]]
 
     model_dir = Path(args.colmap_model_dir)
     cameras = read_colmap_cameras_binary(model_dir / "cameras.bin")
@@ -728,6 +810,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         "training_only_target_artifact": True,
         "pose_or_ground_truth_used_for_hypothesis_generation": False,
         "ground_truth_joined_after_generation": True,
+        "candidate_pose_evidence_version": compatibility.get(
+            "candidate_pose_evidence_version"
+        ),
         "evaluation_label": evaluation_label,
         "split_names": list(split_names),
         "config": asdict(config),

@@ -38,6 +38,7 @@ from feature_extract.vfm.localization.mixed_verification_points import (
     POINT_SOURCE_RADIO_FINAL,
     POINT_SOURCE_RADIO_INTERMEDIATE,
     fixed_topl_coarse_posterior,
+    mixed_verification_points_scoring_compatibility,
     select_detector_rows_spatial_quota,
     select_disjoint_lattice_points,
 )
@@ -702,6 +703,9 @@ def build_mixed_multiscale_verification_points(
         "colmap_cameras_sha256": file_sha256_short(model_dir / "cameras.bin"),
         "colmap_images_sha256": file_sha256_short(model_dir / "images.bin"),
     }
+    metadata["scoring_compatibility"] = mixed_verification_points_scoring_compatibility(
+        metadata
+    )
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_name(output.name + ".tmp")
     with temporary.open("wb") as handle:

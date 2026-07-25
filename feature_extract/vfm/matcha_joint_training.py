@@ -5517,6 +5517,30 @@ def train_matcha_joint_model_from_sample_provider(
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(cfg.lr), weight_decay=1e-4)
     rng = np.random.default_rng(int(cfg.seed) + int(rank) * 104729)
     landmark_memory_bank = _build_landmark_memory_bank(first_samples, cfg, device)
+    if int(rank) == 0:
+        print(
+            json.dumps(
+                {
+                    "stage": "provider_initialization",
+                    "steps": int(cfg.steps),
+                    "provider_sample_count": int(provider_sample_count),
+                    "first_pair_sample_count": int(first_samples.coarse_fine_samples.sample_count),
+                    "first_pair_landmark_count": int(
+                        0
+                        if first_samples.landmark_track_ids is None
+                        else np.asarray(first_samples.landmark_track_ids).shape[0]
+                    ),
+                    "landmark_memory_size": int(
+                        0 if landmark_memory_bank is None else len(landmark_memory_bank)
+                    ),
+                    "landmark_memory_candidate_pool_size": int(
+                        cfg.landmark_memory_candidate_pool_size
+                    ),
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
     landmark_metric_sums: dict[str, float] = {}
     landmark_metric_counts: dict[str, int] = {}
     total_loss_sum = 0.0
@@ -5538,6 +5562,17 @@ def train_matcha_joint_model_from_sample_provider(
         seed=int(cfg.seed),
         landmark_memory_bank=landmark_memory_bank,
     )
+    if int(rank) == 0:
+        print(
+            json.dumps(
+                {
+                    "stage": "provider_initial_loss",
+                    "loss": float(initial_loss),
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
     fixed_audit_history: list[dict[str, float | int]] = []
     if int(fixed_audit_interval_steps) > 0:
         fixed_audit_history.append({"step": 0, "loss": float(initial_loss)})

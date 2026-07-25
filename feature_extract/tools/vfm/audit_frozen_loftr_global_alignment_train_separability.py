@@ -28,6 +28,9 @@ from feature_extract.vfm.localization.frozen_loftr_global_alignment import (
     FROZEN_LOFTR_GLOBAL_ALIGNMENT_EVIDENCE_FORMAT,
     LOFTR_GLOBAL_ALIGNMENT_FEATURE_NAMES,
 )
+from feature_extract.vfm.localization.frozen_loftr_coordinate_contract import (
+    validate_frozen_loftr_colmap_coordinate_metadata,
+)
 from feature_extract.vfm.localization.frozen_multiscale_candidate_appearance_residual_probe import (
     FROZEN_APPEARANCE_ARTIFACT_FORMAT,
 )
@@ -170,6 +173,8 @@ def _load_alignment_artifacts(paths: Sequence[Path]) -> FrozenGlobalAlignmentEvi
             "global_alignment_pose_free": True,
             "global_alignment_model_per_candidate": False,
             "homography_fits_all_cached_pair_matches": True,
+            "source_to_colmap_coordinate_contract": True,
+            "legacy_coordinate_ambiguous_evidence_rejected": True,
         }
         if (
             metadata.get("format") != FROZEN_LOFTR_GLOBAL_ALIGNMENT_EVIDENCE_FORMAT
@@ -182,6 +187,7 @@ def _load_alignment_artifacts(paths: Sequence[Path]) -> FrozenGlobalAlignmentEvi
             or any(contract.get(key) is not expected for key, expected in expected_contract.items())
         ):
             raise ValueError(f"{path}: global alignment target-free contract is invalid")
+        validate_frozen_loftr_colmap_coordinate_metadata(metadata)
         query_ids = np.asarray(arrays["verification_query_ids"]).astype(str).reshape(-1)
         split_names = np.asarray(arrays["split_names"]).astype(str).reshape(-1)
         source_rows = np.asarray(arrays["verification_source_row_indices"], dtype=np.int64).reshape(-1)

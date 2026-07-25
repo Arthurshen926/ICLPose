@@ -151,6 +151,23 @@ def _load_query_rgb(path: Path) -> torch.Tensor:
     return image.to(dtype=torch.float32).div_(255.0)
 
 
+def _load_query_rgb_uint8(path: Path) -> torch.Tensor:
+    """Decode RGB without a CPU float conversion for a uint8 GPU image cache."""
+
+    return read_image(str(Path(path)), mode=ImageReadMode.RGB)
+
+
+def resolve_rgb_image_cache_storage_dtype(value: str) -> torch.dtype:
+    """Resolve the explicit full-image cache representation used by RGB crops."""
+
+    normalized = str(value).strip().lower()
+    options = {"float16": torch.float16, "uint8": torch.uint8}
+    dtype = options.get(normalized)
+    if dtype is None:
+        raise ValueError("RGB image cache dtype must be one of: float16, uint8")
+    return dtype
+
+
 def _load_render_rgb(path: Path) -> torch.Tensor:
     with np.load(Path(path)) as data:
         arr = np.asarray(data["rgb"], dtype=np.float32)
@@ -911,8 +928,14 @@ class TensorImageLRUCache(MutableMapping[str, torch.Tensor]):
     ) -> None:
         if max_bytes is not None and int(max_bytes) <= 0:
             raise ValueError("max_bytes must be positive when provided")
-        if storage_dtype not in {None, torch.float16, torch.float32, torch.bfloat16}:
-            raise ValueError("storage_dtype must be a floating-point torch dtype")
+        if storage_dtype not in {
+            None,
+            torch.float16,
+            torch.float32,
+            torch.bfloat16,
+            torch.uint8,
+        }:
+            raise ValueError("storage_dtype must be a supported image tensor dtype")
         self.max_bytes = None if max_bytes is None else int(max_bytes)
         self.storage_dtype = storage_dtype
         self._values: OrderedDict[str, torch.Tensor] = OrderedDict()
@@ -1083,6 +1106,10 @@ def _crop_cached_rgb_windows_grouped(
         image = torch.stack(images, dim=0)
         if crop_device is not None and image.device != crop_device:
             image = image.to(crop_device)
+        if image.dtype == torch.uint8:
+            # Keep all cached images compact and decode/upload them once.  The
+            # conversion and normalization then happen batched on the crop GPU.
+            image = image.to(dtype=torch.float32).div_(255.0)
         if bool(augment_query_image):
             image = _augment_render_query_image(image)
         centers = torch.tensor(

@@ -56,6 +56,108 @@ def _manifest_for_records(
     return payload
 
 
+def _record_key(record: Mapping[str, object]) -> tuple[str, str, str, str]:
+    return (
+        str(record.get("query_id", "")),
+        str(record.get("reference_image_id", "")),
+        str(record.get("query_feature_path", "")),
+        str(record.get("reference_feature_path", "")),
+    )
+
+
+def _load_compatible_referenced_manifest_union(
+    source_referenced_manifest: Path,
+    additional_source_referenced_manifests: Sequence[Path],
+) -> tuple[dict[str, object], list[dict[str, object]], list[dict[str, object]]]:
+    """Merge disjoint referenced shards while retaining strict source lineage.
+
+    Some real-RGB pairs are stored in separate train/validation CSV manifests.
+    A query-disjoint split must operate over their union, otherwise a valid
+    held-out query can silently disappear before training.  Pair collisions are
+    permitted only when their full records are byte-equivalent after JSON
+    canonicalization; conflicting supervision cannot be guessed safely.
+    """
+
+    paths = (Path(source_referenced_manifest),) + tuple(
+        Path(path) for path in additional_source_referenced_manifests
+    )
+    if len(set(paths)) != len(paths):
+        raise ValueError("referenced manifest sources must be unique")
+    base: dict[str, object] | None = None
+    records_by_key: dict[tuple[str, str, str, str], dict[str, object]] = {}
+    source_audit: list[dict[str, object]] = []
+    compatibility_fields = (
+        "format",
+        "cache_format",
+        "feature_key",
+        "feature_root",
+        "feature_path_template",
+        "image_root",
+        "reference_source",
+        "measurement_supervision",
+        "hard_negatives_per_match",
+        "roundtrip_heatmap_threshold_px",
+        "positive_reprojection_error_px",
+        "require_same_track",
+        "include_dustbin_rows",
+    )
+    for path in paths:
+        payload = json.loads(path.read_text())
+        records = [dict(record) for record in payload.get("records", [])]
+        if not records:
+            raise ValueError(f"source referenced manifest contains no records: {path}")
+        if base is None:
+            base = dict(payload)
+        else:
+            assert base is not None
+            mismatched = {
+                field: (base.get(field), payload.get(field))
+                for field in compatibility_fields
+                if base.get(field) != payload.get(field)
+            }
+            if mismatched:
+                raise ValueError(
+                    "referenced manifest sources are semantically incompatible: "
+                    f"{mismatched}"
+                )
+        duplicate_count = 0
+        for record in records:
+            key = _record_key(record)
+            if not all(key[:2]):
+                raise ValueError("referenced manifest record lacks a query/reference id")
+            existing = records_by_key.get(key)
+            if existing is None:
+                records_by_key[key] = record
+                continue
+            if json.dumps(existing, sort_keys=True) != json.dumps(record, sort_keys=True):
+                raise ValueError(
+                    "referenced manifest sources contain conflicting duplicate pair: "
+                    f"{key!r}"
+                )
+            duplicate_count += 1
+        source_audit.append(
+            {
+                "path": str(path),
+                "sha256": _sha256(path),
+                "record_count": int(len(records)),
+                "duplicate_record_count": int(duplicate_count),
+            }
+        )
+    if base is None or not records_by_key:
+        raise RuntimeError("referenced manifest union is unexpectedly empty")
+    records = list(records_by_key.values())
+    base["records"] = records
+    base["record_count"] = int(len(records))
+    base["sample_count"] = int(len(records))
+    base["source_manifest_union"] = {
+        "format": "referenced_manifest_union_v1",
+        "source_count": int(len(source_audit)),
+        "sources": source_audit,
+        "deduplicated_record_count": int(len(records)),
+    }
+    return base, records, source_audit
+
+
 def build_query_disjoint_referenced_manifests(
     *,
     source_referenced_manifest: Path,
@@ -64,14 +166,14 @@ def build_query_disjoint_referenced_manifests(
     output_development_manifest: Path,
     output_validation_manifest: Path,
     output_test_manifest: Path,
+    additional_source_referenced_manifests: Sequence[Path] = (),
 ) -> dict[str, object]:
     source_path = Path(source_referenced_manifest)
     split_path = Path(query_split_json)
-    source = json.loads(source_path.read_text())
+    source, records, source_audit = _load_compatible_referenced_manifest_union(
+        source_path, additional_source_referenced_manifests
+    )
     split = json.loads(split_path.read_text())
-    records = [dict(record) for record in source.get("records", [])]
-    if not records:
-        raise ValueError("source referenced manifest contains no records")
     split_ids = {
         name: {str(value) for value in split.get(name, [])}
         for name in ("train", "validation", "test")
@@ -151,6 +253,10 @@ def build_query_disjoint_referenced_manifests(
         "format": OUTPUT_FORMAT,
         "source_referenced_manifest": str(source_path),
         "source_referenced_manifest_sha256": _sha256(source_path),
+        "additional_source_referenced_manifests": [
+            str(Path(path)) for path in additional_source_referenced_manifests
+        ],
+        "source_manifest_union": source_audit,
         "query_split_json": str(split_path),
         "query_split_sha256": split_hash,
         "heldout_query_count": int(len(heldout)),
@@ -168,6 +274,11 @@ def build_query_disjoint_referenced_manifests(
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source_referenced_manifest", required=True)
+    parser.add_argument(
+        "--additional_source_referenced_manifests",
+        default="",
+        help="Comma-separated compatible referenced manifest shards merged before splitting.",
+    )
     parser.add_argument("--query_split_json", required=True)
     parser.add_argument("--output_train_manifest", required=True)
     parser.add_argument("--output_development_manifest", required=True)
@@ -181,6 +292,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = parse_args(argv)
     summary = build_query_disjoint_referenced_manifests(
         source_referenced_manifest=Path(args.source_referenced_manifest),
+        additional_source_referenced_manifests=tuple(
+            Path(value.strip())
+            for value in str(args.additional_source_referenced_manifests).split(",")
+            if value.strip()
+        ),
         query_split_json=Path(args.query_split_json),
         output_train_manifest=Path(args.output_train_manifest),
         output_development_manifest=Path(args.output_development_manifest),

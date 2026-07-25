@@ -76,6 +76,41 @@ def test_inference_artifact_rejects_target_fields() -> None:
         validate_inference_artifact(arrays)
 
 
+def test_gt_join_rejects_mixed_candidate_pose_evidence_versions(tmp_path: Path) -> None:
+    first = _artifact_arrays()
+    second = _artifact_arrays()
+    first_metadata = json.loads(str(first["metadata_json"].item()))
+    second_metadata = json.loads(str(second["metadata_json"].item()))
+    first["metadata_json"] = np.asarray(
+        json.dumps(
+            {**first_metadata, "candidate_pose_evidence_version": "spatial_kernel_mixture_v10"},
+            sort_keys=True,
+        )
+    )
+    second["metadata_json"] = np.asarray(
+        json.dumps(
+            {**second_metadata, "candidate_pose_evidence_version": "spatial_kernel_mixture_v11"},
+            sort_keys=True,
+        )
+    )
+    first_path = tmp_path / "first.npz"
+    second_path = tmp_path / "second.npz"
+    _write_artifact(first_path, first)
+    _write_artifact(second_path, second)
+
+    with pytest.raises(ValueError, match="incompatible hypothesis sources"):
+        main(
+            [
+                "--hypothesis_artifacts",
+                f"{first_path},{second_path}",
+                "--colmap_model_dir",
+                str(tmp_path / "unused-model"),
+                "--output_dir",
+                str(tmp_path / "unused-output"),
+            ]
+        )
+
+
 def test_gt_join_keeps_targets_separate_and_reports_stage_gaps(tmp_path: Path) -> None:
     source = tmp_path / "hypotheses.npz"
     model_dir = tmp_path / "model"

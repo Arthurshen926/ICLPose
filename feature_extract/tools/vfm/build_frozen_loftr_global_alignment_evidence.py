@@ -36,6 +36,9 @@ from feature_extract.vfm.localization.frozen_loftr_global_alignment import (
     FrozenLoFTRHomographyConfig,
     frozen_loftr_global_alignment_view_features,
 )
+from feature_extract.vfm.localization.frozen_loftr_coordinate_contract import (
+    build_frozen_loftr_colmap_coordinate_contract,
+)
 from feature_extract.vfm.localization.frozen_loftr_pair_cache import (
     load_frozen_loftr_pair_cache,
 )
@@ -56,6 +59,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--loftr-pair-cache", required=True)
     parser.add_argument("--maplet-support-index", required=True)
     parser.add_argument("--support-geometry-index", required=True)
+    parser.add_argument("--colmap-model-dir", required=True)
     parser.add_argument("--image-root", required=True)
     parser.add_argument("--loftr-checkpoint", required=True)
     parser.add_argument("--output", required=True)
@@ -100,6 +104,7 @@ def build_frozen_loftr_global_alignment_evidence(
     loftr_pair_cache: Path,
     maplet_support_index: Path,
     support_geometry_index: Path,
+    colmap_model_dir: Path,
     image_root: Path,
     loftr_checkpoint: Path,
     output: Path,
@@ -129,7 +134,13 @@ def build_frozen_loftr_global_alignment_evidence(
         image_root=Path(image_root),
         loftr_checkpoint=Path(loftr_checkpoint),
     )
-    source_size = _source_size_from_cache_metadata(cache.metadata)
+    coordinate_contract = build_frozen_loftr_colmap_coordinate_contract(
+        cache_metadata=cache.metadata,
+        query_id=query_id,
+        support_image_ids=cache.support_image_ids.tolist(),
+        colmap_model_dir=Path(colmap_model_dir),
+    )
+    source_size = coordinate_contract.source_size
     maplet_tracks, maplet_image_ids, maplet_image_indices, maplet_coverage, _maplet_metadata = (
         _load_maplet_support_fields(Path(maplet_support_index))
     )
@@ -156,13 +167,24 @@ def build_frozen_loftr_global_alignment_evidence(
         cache_image_ids=cache_image_ids,
         support_geometry=geometry,
     )
+    query_xy_source = coordinate_contract.model_to_source(
+        features.xy,
+        image_ids=np.repeat(np.asarray([query_id]), len(features.xy)),
+    )
+    support_xy_source = np.full_like(runtime.support_xy, np.nan, dtype=np.float32)
+    flat_valid = views.valid.reshape(-1)
+    if np.any(flat_valid):
+        support_xy_source.reshape(-1, 2)[flat_valid] = coordinate_contract.model_to_source(
+            runtime.support_xy.reshape(-1, 2)[flat_valid],
+            image_ids=views.support_image_ids.reshape(-1)[flat_valid],
+        )
     config = FrozenLoFTRHomographyConfig()
     started = time.monotonic()
     view_features, view_usable, pair_match_counts, view_model_valid = (
         frozen_loftr_global_alignment_view_features(
             cache=cache,
-            query_xy=features.xy,
-            candidate_support_xy=runtime.support_xy,
+            query_xy=query_xy_source,
+            candidate_support_xy=support_xy_source,
             candidate_support_image_ids=views.support_image_ids,
             candidate_view_valid=views.valid,
             source_size=source_size,
@@ -199,11 +221,13 @@ def build_frozen_loftr_global_alignment_evidence(
         "global_alignment_pose_free": True,
         "global_alignment_model_per_candidate": False,
         "homography_fits_all_cached_pair_matches": True,
+        "source_to_colmap_coordinate_contract": True,
+        "legacy_coordinate_ambiguous_evidence_rejected": True,
         "missing_pair_or_model": "explicit_nan_and_zero_usable_weight_mass_v1",
     }
     metadata: dict[str, Any] = {
         "format": FROZEN_LOFTR_GLOBAL_ALIGNMENT_EVIDENCE_FORMAT,
-        "version": 1,
+        "version": 2,
         "query_id": query_id,
         "split_name": next(iter(split_names)),
         "row_count": int(len(features.query_ids)),
@@ -233,12 +257,14 @@ def build_frozen_loftr_global_alignment_evidence(
                 "path": str(Path(support_geometry_index)),
                 "sha256": file_sha256_short(Path(support_geometry_index)),
             },
+            "colmap_model": coordinate_contract.metadata()["colmap_model"],
             "loftr_checkpoint": {
                 "path": str(Path(loftr_checkpoint)),
                 "sha256": file_sha256_short(Path(loftr_checkpoint)),
             },
         },
         "pair_cache_contract": cache.metadata["strict_global_pair_contract"],
+        "coordinate_contract": coordinate_contract.metadata(),
         "support_geometry_metadata": geometry_metadata,
         "appearance_source_contract": appearance_metadata.get(
             "strict_frozen_appearance_contract"
@@ -260,6 +286,7 @@ def build_frozen_loftr_global_alignment_evidence(
             split_names=features.split_names,
             verification_source_row_indices=features.source_row_indices,
             verification_xy=features.xy,
+            verification_xy_loftr_source=query_xy_source,
             candidate_track_ids=features.candidate_track_ids,
             candidate_probabilities=features.candidate_probabilities,
             null_probabilities=features.null_probabilities,
@@ -321,6 +348,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         loftr_pair_cache=Path(args.loftr_pair_cache),
         maplet_support_index=Path(args.maplet_support_index),
         support_geometry_index=Path(args.support_geometry_index),
+        colmap_model_dir=Path(args.colmap_model_dir),
         image_root=Path(args.image_root),
         loftr_checkpoint=Path(args.loftr_checkpoint),
         output=Path(args.output),

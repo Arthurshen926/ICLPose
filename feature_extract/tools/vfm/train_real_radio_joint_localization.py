@@ -362,6 +362,90 @@ def load_episode_support_image_ids(
     }
 
 
+def _referenced_manifest_query_image_ids(path: Path) -> set[str]:
+    """Read the supervised query-image scope from a referenced manifest."""
+
+    payload = json.loads(Path(path).read_text())
+    records = list(payload.get("records", []))
+    image_ids = {
+        str(record.get("query_id", "")).replace("\\", "/").lstrip("./")
+        for record in records
+        if isinstance(record, dict) and str(record.get("query_id", "")).strip()
+    }
+    if not image_ids:
+        raise ValueError(f"referenced training manifest contains no query ids: {path}")
+    return image_ids
+
+
+def validate_training_geometry_contract(
+    track_observation_index: SfMTrackObservationIndex,
+    *,
+    training_observations: Path,
+    query_image_ids: set[str],
+    allowed_support_image_ids: set[str] | None,
+) -> dict[str, object]:
+    """Validate query geometry without letting it redefine the map-support scope.
+
+    Query observations are required for query-to-landmark positives and cell-level
+    exclusion masks.  They may live in a full COLMAP export.  In contrast, the
+    support-image set remains an externally supplied, query-disjoint map contract
+    used for prototype episodes and frozen-bank validation.
+    """
+
+    normalized_queries = {
+        str(image_id).replace("\\", "/").lstrip("./")
+        for image_id in query_image_ids
+        if str(image_id).strip()
+    }
+    if not normalized_queries:
+        raise ValueError("training geometry contract requires at least one query image")
+    geometry_image_ids = {
+        str(image_id).replace("\\", "/").lstrip("./")
+        for image_id in track_observation_index.by_image
+    }
+    missing_queries = sorted(normalized_queries.difference(geometry_image_ids))
+    if missing_queries:
+        raise ValueError(
+            "training geometry is missing supervised query observations: "
+            f"count={len(missing_queries)}, preview={missing_queries[:3]!r}"
+        )
+    normalized_support = (
+        None
+        if allowed_support_image_ids is None
+        else {
+            str(image_id).replace("\\", "/").lstrip("./")
+            for image_id in allowed_support_image_ids
+            if str(image_id).strip()
+        }
+    )
+    if normalized_support is not None:
+        overlap = sorted(normalized_queries.intersection(normalized_support))
+        if overlap:
+            raise ValueError(
+                "training query images must not enter the map-support scope: "
+                f"count={len(overlap)}, preview={overlap[:3]!r}"
+            )
+        missing_support = sorted(normalized_support.difference(geometry_image_ids))
+        if missing_support:
+            raise ValueError(
+                "training geometry is missing allowed map-support observations: "
+                f"count={len(missing_support)}, preview={missing_support[:3]!r}"
+            )
+    return {
+        "validated": True,
+        "training_observations": str(training_observations),
+        "geometry_image_count": int(len(geometry_image_ids)),
+        "query_geometry_image_count": int(len(normalized_queries)),
+        "query_geometry_complete": True,
+        "allowed_support_image_count": (
+            None if normalized_support is None else int(len(normalized_support))
+        ),
+        "query_support_disjoint": True,
+        "geometry_scope": "query_supervision_plus_mapping_support",
+        "bank_scope": "external_query_disjoint_support_only",
+    }
+
+
 class RealRadioMultiViewEpisodeProvider:
     """Group one query with distinct real-image support views on demand."""
 
@@ -816,6 +900,24 @@ def _finish_distributed_runtime(runtime: dict[str, int | bool | str]) -> None:
     torch.distributed.destroy_process_group()
 
 
+def _emit_provider_setup_progress(
+    args: argparse.Namespace,
+    runtime: dict[str, int | bool | str],
+    stage: str,
+    **values: object,
+) -> None:
+    """Emit opt-in setup telemetry before the first lazy-provider loss."""
+
+    if int(getattr(args, "provider_progress_interval_steps", 0)) <= 0:
+        return
+    if int(runtime.get("rank", 0)) != 0:
+        return
+    print(
+        json.dumps({"stage": str(stage), **values}, sort_keys=True),
+        flush=True,
+    )
+
+
 def _requires_rgb_training(args: argparse.Namespace) -> bool:
     return bool(
         float(args.measurement_patch_loss_weight) > 0.0
@@ -824,18 +926,83 @@ def _requires_rgb_training(args: argparse.Namespace) -> bool:
     )
 
 
+def _resolve_training_track_observation_paths(
+    args: argparse.Namespace,
+) -> tuple[Path | None, Path | None, str]:
+    """Resolve query-geometry inputs while retaining the legacy single-source CLI.
+
+    ``landmark_track_*`` historically supplied both query geometry and frozen-bank
+    provenance.  New query-disjoint training must instead use a full geometry
+    index for query supervision while keeping that legacy input as the map-only
+    support source.  Falling back preserves existing non-disjoint callers.
+    """
+
+    explicit_source = str(getattr(args, "training_track_observations", "")).strip()
+    legacy_source = str(getattr(args, "landmark_track_observations", "")).strip()
+    explicit_cache = str(
+        getattr(args, "training_track_observation_index_cache", "")
+    ).strip()
+    legacy_cache = str(
+        getattr(args, "landmark_track_observation_index_cache", "")
+    ).strip()
+    if explicit_source:
+        return (
+            Path(explicit_source),
+            None if not explicit_cache else Path(explicit_cache),
+            "explicit_training_geometry",
+        )
+    if legacy_source:
+        return (
+            Path(legacy_source),
+            None if not legacy_cache else Path(legacy_cache),
+            "legacy_landmark_track_observations",
+        )
+    return None, None, "none"
+
+
+def _resolve_landmark_bank_support_observations(args: argparse.Namespace) -> Path:
+    """Resolve the immutable map-support source; never fall back to query geometry."""
+
+    explicit_support = str(
+        getattr(args, "landmark_frozen_bank_support_observations", "")
+    ).strip()
+    legacy_support = str(getattr(args, "landmark_track_observations", "")).strip()
+    source = explicit_support or legacy_support
+    if not source:
+        raise ValueError(
+            "landmark memory bank validation requires --landmark_frozen_bank_support_observations "
+            "or the legacy --landmark_track_observations support source; "
+            "--training_track_observations is query geometry only"
+        )
+    return Path(source)
+
+
+def validate_coherent_hard_negative_memory_contract(args: argparse.Namespace) -> None:
+    """Require a fixed descriptor space for pose-conditioned hard identities."""
+
+    enabled = float(getattr(args, "landmark_coherent_hard_negative_margin_weight", 0.0)) > 0.0
+    if not enabled:
+        return
+    frozen_bank = str(getattr(args, "landmark_frozen_negative_bank", "")).strip()
+    if not frozen_bank:
+        raise ValueError(
+            "coherent hard-negative training requires --landmark_frozen_negative_bank; "
+            "a mutable warm-start bank changes the hard identity descriptor space"
+        )
+    if str(getattr(args, "landmark_memory_warm_start_bank", "")).strip():
+        raise ValueError(
+            "coherent hard-negative training cannot combine a frozen bank with "
+            "--landmark_memory_warm_start_bank"
+        )
+
+
 def _load_training_track_observation_index(
     args: argparse.Namespace,
     distributed_runtime: dict[str, int | bool | str],
 ) -> SfMTrackObservationIndex | None:
-    if not str(args.landmark_track_observations):
+    source_path, cache_path, _scope = _resolve_training_track_observation_paths(args)
+    if source_path is None:
         return None
-    source_path = Path(args.landmark_track_observations)
-    cache_path = (
-        Path(args.landmark_track_observation_index_cache)
-        if str(args.landmark_track_observation_index_cache)
-        else None
-    )
     distributed = bool(distributed_runtime.get("enabled", False))
     rank = int(distributed_runtime.get("rank", 0))
     if distributed and cache_path is not None:
@@ -1218,7 +1385,23 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--landmark_track_observation_index_cache",
         default="",
-        help="Validated NPZ cache for the full SfM per-image observation index.",
+        help=(
+            "Legacy SfM observation source/cache. For query-disjoint training this "
+            "remains the map-only support source used by frozen-bank validation."
+        ),
+    )
+    parser.add_argument(
+        "--training_track_observations",
+        default="",
+        help=(
+            "Full SfM geometry used only for query-to-landmark training supervision; "
+            "it may contain supervised query images but never defines bank support."
+        ),
+    )
+    parser.add_argument(
+        "--training_track_observation_index_cache",
+        default="",
+        help="Validated NPZ cache paired with --training_track_observations.",
     )
     parser.add_argument(
         "--descriptor_token_manifest",
@@ -1445,6 +1628,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--measurement_patch_input_mode", default="rgb")
     parser.add_argument("--validation_interval", type=int, default=0)
     parser.add_argument(
+        "--validation_provider_max_samples",
+        type=int,
+        default=0,
+        help=(
+            "Limit lazy validation episodes for a smoke run; 0 evaluates the full "
+            "validation provider and remains the production default."
+        ),
+    )
+    parser.add_argument(
         "--validation_selection_metric",
         choices=("total_loss", "landmark_retrieval_loss"),
         default="total_loss",
@@ -1463,6 +1655,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = parse_args(argv)
     distributed_runtime = _initialize_distributed_runtime(args)
     started = time.perf_counter()
+    _emit_provider_setup_progress(
+        args,
+        distributed_runtime,
+        "provider_setup_start",
+        world_size=int(distributed_runtime["world_size"]),
+        device=str(args.device),
+    )
     train_path = Path(args.joint_cache_manifest or args.joint_cache)
     validation_path = (
         Path(args.validation_joint_cache_manifest or args.validation_joint_cache)
@@ -1480,6 +1679,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     require_measurement = float(args.measurement_patch_loss_weight) > 0.0
     require_rgb = _requires_rgb_training(args)
     require_landmark_retrieval = float(args.landmark_retrieval_loss_weight) > 0.0
+    if int(args.validation_provider_max_samples) < 0:
+        raise ValueError("validation_provider_max_samples must be non-negative")
+    validate_coherent_hard_negative_memory_contract(args)
     episode_support_image_ids: set[str] | None = None
     episode_support_manifest_audit: dict[str, object] = {}
     if str(args.landmark_episode_support_manifest):
@@ -1518,6 +1720,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             raise ValueError(
                 "query-disjoint frozen-bank positives require --internal_query_disjoint_split"
             )
+    training_geometry_source, training_geometry_cache, training_geometry_source_mode = (
+        _resolve_training_track_observation_paths(args)
+    )
     track_observation_index = _load_training_track_observation_index(
         args,
         distributed_runtime,
@@ -1527,6 +1732,39 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     train_provider = None
     train_is_referenced_manifest = bool(args.joint_cache_manifest) and _is_referenced_manifest(train_path)
+    training_geometry_contract: dict[str, object] = {}
+    if track_observation_index is not None and train_is_referenced_manifest:
+        geometry_query_ids = _referenced_manifest_query_image_ids(train_path)
+        validation_is_referenced_manifest = bool(
+            validation_path is not None
+            and args.validation_joint_cache_manifest
+            and _is_referenced_manifest(validation_path)
+        )
+        if validation_is_referenced_manifest and validation_path is not None:
+            geometry_query_ids.update(_referenced_manifest_query_image_ids(validation_path))
+        if training_geometry_source is None:
+            raise AssertionError("loaded training geometry without a source path")
+        training_geometry_contract = validate_training_geometry_contract(
+            track_observation_index,
+            training_observations=training_geometry_source,
+            query_image_ids=geometry_query_ids,
+            allowed_support_image_ids=episode_support_image_ids,
+        )
+        training_geometry_contract.update(
+            {
+                "source_mode": str(training_geometry_source_mode),
+                "index_cache": "" if training_geometry_cache is None else str(training_geometry_cache),
+            }
+        )
+    _emit_provider_setup_progress(
+        args,
+        distributed_runtime,
+        "provider_setup_geometry_ready",
+        geometry_image_count=int(len(track_observation_index.by_image))
+        if track_observation_index is not None
+        else 0,
+        geometry_source_mode=str(training_geometry_source_mode),
+    )
     if train_is_referenced_manifest:
         train_provider, train_samples, train_metadata, train_audit = _load_referenced_joint_provider(
             train_path,
@@ -1576,6 +1814,17 @@ def main(argv: Sequence[str] | None = None) -> None:
             require_measurement_supervision=bool(require_measurement),
             require_landmark_retrieval_supervision=True,
         )
+    _emit_provider_setup_progress(
+        args,
+        distributed_runtime,
+        "provider_setup_train_ready",
+        provider_sample_count=0 if train_provider is None else int(len(train_provider)),
+        initial_landmark_count=(
+            0
+            if train_samples.landmark_track_ids is None
+            else int(np.asarray(train_samples.landmark_track_ids).shape[0])
+        ),
+    )
     if train_provider is not None and bool(require_landmark_retrieval):
         dataset_audit = train_provider.landmark_retrieval_audit()
         if (
@@ -1593,6 +1842,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         train_audit["landmark_retrieval_dataset"] = dataset_audit
     validation_samples = None
     validation_provider = None
+    validation_provider_selected_sample_count = 0
     validation_manifest_path = None
     validation_metadata: dict[str, object] = {}
     validation_audit: dict[str, object] = {}
@@ -1651,6 +1901,26 @@ def main(argv: Sequence[str] | None = None) -> None:
         if bool(args.validation_joint_cache_manifest) and not validation_is_referenced:
             validation_manifest_path = validation_path
             validation_samples = None
+    if validation_provider is not None:
+        validation_provider_selected_sample_count = (
+            int(len(validation_provider))
+            if int(args.validation_provider_max_samples) <= 0
+            else min(
+                int(len(validation_provider)),
+                int(args.validation_provider_max_samples),
+            )
+        )
+    _emit_provider_setup_progress(
+        args,
+        distributed_runtime,
+        "provider_setup_validation_ready",
+        validation_provider_sample_count=(
+            0 if validation_provider is None else int(len(validation_provider))
+        ),
+        validation_provider_selected_sample_count=int(
+            validation_provider_selected_sample_count
+        ),
+    )
     frozen_bank_contract: dict[str, object] = {}
     warm_start_bank_contract: dict[str, object] = {}
     if (
@@ -1661,11 +1931,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             "landmark_frozen_negative_bank and landmark_memory_warm_start_bank are mutually exclusive"
         )
     if str(args.landmark_frozen_negative_bank) or str(args.landmark_memory_warm_start_bank):
-        support_observations = Path(
-            args.landmark_frozen_bank_support_observations or args.landmark_track_observations
-        )
-        if not str(support_observations):
-            raise ValueError("landmark memory bank validation requires support observations")
+        support_observations = _resolve_landmark_bank_support_observations(args)
         forbidden_source_image_ids: set[str] = set()
         if str(args.upstream_disjoint_query_split):
             query_split = json.loads(
@@ -1719,6 +1985,13 @@ def main(argv: Sequence[str] | None = None) -> None:
                 Path(args.landmark_memory_warm_start_bank),
                 **warm_start_validation_kwargs,
             )
+    _emit_provider_setup_progress(
+        args,
+        distributed_runtime,
+        "provider_setup_bank_ready",
+        frozen_bank_validated=bool(frozen_bank_contract),
+        warm_start_bank_validated=bool(warm_start_bank_contract),
+    )
     train_sample_get = None if train_provider is None else train_provider.get
     coherent_hard_negative_audit: dict[str, object] = {}
     coherent_enabled = float(args.landmark_coherent_hard_negative_margin_weight) > 0.0
@@ -1775,6 +2048,18 @@ def main(argv: Sequence[str] | None = None) -> None:
             ),
         )
         coherent_hard_negative_audit.update(attachment_audit)
+    _emit_provider_setup_progress(
+        args,
+        distributed_runtime,
+        "provider_setup_coherent_ready",
+        coherent_enabled=bool(coherent_enabled),
+        coherent_overlap_query_count=int(
+            coherent_hard_negative_audit.get("overlap_query_count", 0)
+        ),
+        coherent_attached_group_count=int(
+            coherent_hard_negative_audit.get("attached_group_count", 0)
+        ),
+    )
     cfg = _build_config(args, train_samples)
     descriptor_source_config: dict[str, object] = {}
     if str(args.descriptor_token_manifest):
@@ -1790,13 +2075,26 @@ def main(argv: Sequence[str] | None = None) -> None:
             )
     warm_start_model = None
     if str(args.warm_start_joint_checkpoint):
-        warm_start_model = load_matcha_joint_model(Path(args.warm_start_joint_checkpoint), device=str(args.device)).model
+        # The lazy trainer creates its trainable model on the target GPU.  Keeping
+        # the checkpoint on CPU avoids a transient second full model allocation.
+        warm_start_model = load_matcha_joint_model(
+            Path(args.warm_start_joint_checkpoint), device="cpu"
+        ).model
+    _emit_provider_setup_progress(
+        args,
+        distributed_runtime,
+        "provider_setup_warm_start_ready",
+        warm_start_loaded=warm_start_model is not None,
+        warm_start_device=(
+            "" if warm_start_model is None else str(next(warm_start_model.parameters()).device)
+        ),
+    )
     if train_provider is not None:
         run = train_matcha_joint_model_from_sample_provider(
             int(len(train_provider)),
             train_sample_get,
             cfg,
-            validation_sample_count=0 if validation_provider is None else int(len(validation_provider)),
+            validation_sample_count=int(validation_provider_selected_sample_count),
             get_validation_sample=None if validation_provider is None else validation_provider.get,
             validation_interval=int(args.validation_interval),
             steps_per_sample=int(args.manifest_steps_per_shard),
@@ -1858,8 +2156,13 @@ def main(argv: Sequence[str] | None = None) -> None:
             "frozen_landmark_bank_contract": frozen_bank_contract,
             "landmark_memory_warm_start_contract": warm_start_bank_contract,
             "coherent_hard_negative_audit": coherent_hard_negative_audit,
+            "training_geometry_contract": training_geometry_contract,
             "landmark_episode_support_pairs": int(args.landmark_episode_support_pairs),
             "landmark_episode_min_support_pairs": int(args.landmark_episode_min_support_pairs),
+            "validation_provider_selected_sample_count": int(
+                validation_provider_selected_sample_count
+            ),
+            "validation_provider_max_samples": int(args.validation_provider_max_samples),
         }
     )
     adapter_run = joint_run_as_coarse_fine_adapter_run(run)
@@ -1879,6 +2182,12 @@ def main(argv: Sequence[str] | None = None) -> None:
             "is_manifest": bool(args.validation_joint_cache_manifest),
             "metadata": validation_metadata,
             "audit": validation_audit,
+            "provider_total_sample_count": (
+                0 if validation_provider is None else int(len(validation_provider))
+            ),
+            "provider_selected_sample_count": int(
+                validation_provider_selected_sample_count
+            ),
         },
         "joint_training_contract": {
             "requires_full_feature_maps": True,
@@ -1944,6 +2253,15 @@ def main(argv: Sequence[str] | None = None) -> None:
                 cfg.landmark_exclude_known_cell_positives_from_memory
             ),
             "landmark_track_observations": str(args.landmark_track_observations),
+            "training_track_observations": "" if training_geometry_source is None else str(training_geometry_source),
+            "training_track_observation_index_cache": (
+                "" if training_geometry_cache is None else str(training_geometry_cache)
+            ),
+            "training_track_observation_source_mode": str(training_geometry_source_mode),
+            "landmark_bank_support_observations": (
+                str(args.landmark_frozen_bank_support_observations)
+                or str(args.landmark_track_observations)
+            ),
             "requires_rgb_measurement_images": bool(require_rgb),
             "rejects_row_only_sample_cache": True,
             "reference_source": "real_image",
@@ -1957,6 +2275,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         "frozen_landmark_bank_contract": frozen_bank_contract,
         "landmark_memory_warm_start_contract": warm_start_bank_contract,
         "coherent_hard_negative_audit": coherent_hard_negative_audit,
+        "training_geometry_contract": training_geometry_contract,
         "config": asdict(cfg),
         "training": dict(run.summary),
         "outputs": {

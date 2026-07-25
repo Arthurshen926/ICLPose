@@ -11,6 +11,7 @@ anchor that is not itself an SfM keypoint.
 from __future__ import annotations
 
 import argparse
+from itertools import combinations
 import json
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -96,6 +97,28 @@ SUPPORTED_SUPERVISION_MODES = frozenset(
     {GEOMETRIC_SET_SUPERVISION_MODE, REGISTERED_TRACK_IDENTITY_SUPERVISION_MODE}
 )
 AUDIT_SPLIT_NAMES = ("train", "validation", "test", "all")
+_BIDIRECTIONAL_VISUAL_CONTROL_FAMILIES = (
+    (
+        "bidirectional_absolute_v2",
+        "bidirectional_absolute_visual_v2",
+        "bidirectional_absolute_position_control_v2",
+    ),
+    (
+        "bidirectional_absolute_raw_v3",
+        "bidirectional_absolute_raw_visual_v3",
+        "bidirectional_absolute_raw_position_control_v3",
+    ),
+    (
+        "bidirectional_absolute_raw_layout_v4",
+        "bidirectional_absolute_raw_layout_visual_v4",
+        "bidirectional_absolute_raw_layout_position_control_v4",
+    ),
+    (
+        "bidirectional_absolute_dual_head_raw_layout_v5",
+        "bidirectional_absolute_dual_head_raw_layout_visual_v5",
+        "bidirectional_absolute_dual_head_raw_layout_position_control_v5",
+    ),
+)
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -158,6 +181,22 @@ def _allowed_soft_global_context(metadata: Mapping[str, Any]) -> bool:
         and metadata.get("soft_global_context_factor") is True
         and metadata.get("global_context_usage") == expected_usage
         and metadata.get("global_context_hard_retrieval_or_candidate_reselection") is False
+    )
+
+
+def _allowed_prediction_soft_global_context(metadata: Mapping[str, Any]) -> bool:
+    """Accept only fixed candidate/view region-token global evidence."""
+
+    protocol = metadata.get("source_feature_protocol")
+    if not isinstance(protocol, Mapping):
+        return False
+    return bool(
+        protocol.get("whole_image_summary_or_global_used") is True
+        and protocol.get("soft_global_context_factor_used") is True
+        and protocol.get("candidate_conditioned_full_image_region_tokens") is True
+        and protocol.get("global_context_hard_retrieval_or_candidate_reselection")
+        is False
+        and protocol.get("image_retrieval_or_submap_used") is False
     )
 
 
@@ -490,6 +529,379 @@ def _rank2_to_l_rescue_audit(
     }
 
 
+def _visual_vs_position_control_pre_gate(
+    *,
+    position_probability: np.ndarray,
+    position_null: np.ndarray,
+    visual_probability: np.ndarray,
+    visual_null: np.ndarray,
+    geometry_labels: np.ndarray,
+    exact_labels: np.ndarray,
+    exact_supervised: np.ndarray,
+    candidate_valid: np.ndarray,
+    position_identity_probability: np.ndarray | None = None,
+    position_identity_null: np.ndarray | None = None,
+    visual_identity_probability: np.ndarray | None = None,
+    visual_identity_null: np.ndarray | None = None,
+) -> dict[str, Any]:
+    """Compare actual visual evidence with its matched positional control.
+
+    A model that merely learns image-coordinate priors can beat the immutable
+    coarse distribution while adding no absolute appearance evidence.  This is
+    deliberately a *candidate* pre-gate only: it never promotes a pose model,
+    whose frozen-hypothesis rank/tail gate remains stricter and separate.
+    """
+
+    all_rows = np.ones((len(position_probability),), dtype=bool)
+    geometry_position = _set_valued_metrics(
+        position_probability,
+        position_null,
+        labels=geometry_labels,
+        valid=candidate_valid,
+        row_mask=all_rows,
+    )
+    geometry_visual = _set_valued_metrics(
+        visual_probability,
+        visual_null,
+        labels=geometry_labels,
+        valid=candidate_valid,
+        row_mask=all_rows,
+    )
+    geometry_paired = _paired_rank_audit(
+        position_probability,
+        visual_probability,
+        labels=geometry_labels,
+        valid=candidate_valid,
+        row_mask=all_rows,
+    )
+    rescue = _rank2_to_l_rescue_audit(
+        position_probability,
+        visual_probability,
+        labels=geometry_labels,
+        valid=candidate_valid,
+        row_mask=all_rows,
+    )
+    identity_values = (
+        position_identity_probability,
+        position_identity_null,
+        visual_identity_probability,
+        visual_identity_null,
+    )
+    if any(value is not None for value in identity_values) and not all(
+        value is not None for value in identity_values
+    ):
+        raise ValueError("identity control probabilities must be all present or all absent")
+    if position_identity_probability is None:
+        position_identity_probability = position_probability
+        position_identity_null = position_null
+        visual_identity_probability = visual_probability
+        visual_identity_null = visual_null
+    assert position_identity_null is not None
+    assert visual_identity_probability is not None
+    assert visual_identity_null is not None
+    _probability_contract(
+        np.asarray(position_identity_probability, dtype=np.float64),
+        np.asarray(position_identity_null, dtype=np.float64),
+        candidate_valid,
+    )
+    _probability_contract(
+        np.asarray(visual_identity_probability, dtype=np.float64),
+        np.asarray(visual_identity_null, dtype=np.float64),
+        candidate_valid,
+    )
+    exact_position = _exact_identity_metrics(
+        position_identity_probability,
+        position_identity_null,
+        labels=exact_labels,
+        valid=candidate_valid,
+        supervised=exact_supervised,
+    )
+    exact_visual = _exact_identity_metrics(
+        visual_identity_probability,
+        visual_identity_null,
+        labels=exact_labels,
+        valid=candidate_valid,
+        supervised=exact_supervised,
+    )
+    exact_paired = _paired_rank_audit(
+        position_identity_probability,
+        visual_identity_probability,
+        labels=exact_labels,
+        valid=candidate_valid,
+        row_mask=exact_supervised,
+    )
+    gate = {
+        "geometry_nll_improved": bool(
+            geometry_visual["group_target_nll"] < geometry_position["group_target_nll"]
+        ),
+        "geometry_candidate_ap_improved": bool(
+            geometry_visual["candidate_pair_average_precision"]
+            > geometry_position["candidate_pair_average_precision"]
+        ),
+        "geometry_paired_rank_wins_exceed_losses": bool(
+            geometry_paired["rank_win_count"] > geometry_paired["rank_loss_count"]
+        ),
+        "geometry_top1_rescues_not_below_harms": bool(
+            geometry_paired["top1_rescue_count"] >= geometry_paired["top1_harm_count"]
+        ),
+        "rank2_to_l_wins_exceed_losses": bool(
+            rescue["paired_rank"]["rank_win_count"]
+            > rescue["paired_rank"]["rank_loss_count"]
+        ),
+        "exact_identity_ap_not_degraded": bool(
+            exact_visual["exact_candidate_pair_average_precision"]
+            >= exact_position["exact_candidate_pair_average_precision"]
+        ),
+    }
+    gate["passed"] = bool(all(gate.values()))
+    gate["policy"] = (
+        "validation-only visual-versus-position candidate pre-gate; passing is "
+        "necessary but never sufficient for frozen hypothesis pose promotion"
+    )
+    return {
+        "position_control": {
+            "geometry_set": geometry_position,
+            "exact_registered_identity": exact_position,
+        },
+        "visual": {
+            "geometry_set": geometry_visual,
+            "exact_registered_identity": exact_visual,
+        },
+        "geometry_paired_rank": geometry_paired,
+        "exact_identity_paired_rank": exact_paired,
+        "rank2_to_l_geometry_rescue": rescue,
+        "exact_identity_probability_source": (
+            "separate_identity_side_head"
+            if identity_values[0] is not None
+            else "geometry_probability_shared_legacy_head"
+        ),
+        "candidate_pre_gate": gate,
+    }
+
+
+def _masked_view_log_mean_numpy(
+    values: np.ndarray, view_valid: np.ndarray
+) -> np.ndarray:
+    """Marginalize fixed support views without giving padded views a score.
+
+    The context probe is trained per candidate/view.  A scale ablation must
+    preserve that mixture rather than average support embeddings or substitute
+    a zero logit for a missing view.  Invalid candidates receive a neutral
+    residual; their immutable base-prior mass is already zero.
+    """
+
+    logits = np.asarray(values, dtype=np.float64)
+    valid = np.asarray(view_valid, dtype=bool)
+    if logits.ndim != 3 or logits.shape != valid.shape:
+        raise ValueError("per-scale view logits and validity masks differ")
+    count = np.sum(valid, axis=2)
+    masked = np.where(valid, logits, -np.inf)
+    maximum = np.max(masked, axis=2, keepdims=True)
+    with np.errstate(invalid="ignore", over="ignore", under="ignore"):
+        shifted = np.where(np.isfinite(maximum), masked - maximum, -np.inf)
+        log_mean = maximum[:, :, 0] + np.log(
+            np.maximum(np.sum(np.exp(shifted), axis=2), 1e-300)
+        ) - np.log(np.maximum(count, 1))
+    return np.where(count > 0, log_mean, 0.0)
+
+
+def _probabilities_from_base_prior_and_residual(
+    *,
+    base_candidate: np.ndarray,
+    base_null: np.ndarray,
+    candidate_residual: np.ndarray,
+    candidate_valid: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build a diagnostic posterior with a common immutable null reference.
+
+    Per-scale outputs intentionally omit the learned joint null head: assigning
+    that head to one scale would falsely attribute candidate-set evidence to
+    that scale.  Every visual/control ablation therefore uses the same frozen
+    base-null logit.  These probabilities are diagnostic only and cannot be
+    promoted as a production overlay.
+    """
+
+    candidate = np.asarray(base_candidate, dtype=np.float64)
+    null = np.asarray(base_null, dtype=np.float64).reshape(-1)
+    residual = np.asarray(candidate_residual, dtype=np.float64)
+    valid = np.asarray(candidate_valid, dtype=bool)
+    if (
+        candidate.ndim != 2
+        or candidate.shape != residual.shape
+        or candidate.shape != valid.shape
+        or null.shape != (len(candidate),)
+        or np.any(candidate < 0.0)
+        or np.any(null < 0.0)
+        or np.any(~np.isfinite(residual[valid]))
+        or np.any(candidate[valid] <= 0.0)
+        or np.any(candidate[~valid] != 0.0)
+    ):
+        raise ValueError("base-prior residual diagnostic inputs are invalid")
+    candidate_logits = np.where(valid, np.log(candidate) + residual, -np.inf)
+    null_logits = np.log(np.maximum(null, 1e-300))
+    logits = np.concatenate((candidate_logits, null_logits[:, None]), axis=1)
+    maximum = np.max(logits, axis=1, keepdims=True)
+    probabilities = np.exp(logits - maximum)
+    probabilities /= np.sum(probabilities, axis=1, keepdims=True)
+    return probabilities[:, :-1], probabilities[:, -1]
+
+
+def _per_scale_visual_control_diagnostic(
+    *,
+    visual_per_scale_view_logits: np.ndarray,
+    position_per_scale_view_logits: np.ndarray,
+    scale_names: Sequence[str],
+    base_candidate: np.ndarray,
+    base_null: np.ndarray,
+    view_valid: np.ndarray,
+    geometry_labels: np.ndarray,
+    exact_labels: np.ndarray,
+    exact_supervised: np.ndarray,
+    candidate_valid: np.ndarray,
+    visual_identity_per_scale_view_logits: np.ndarray | None = None,
+    position_identity_per_scale_view_logits: np.ndarray | None = None,
+) -> dict[str, Any]:
+    """Attribute a paired V2--V4 candidate result to frozen feature scales.
+
+    This is deliberately an after-the-fact *validation diagnostic*, not a
+    model-selection mechanism: its common base-null reference is not the
+    learned joint null likelihood, and no resulting scale subset is allowed to
+    enter pose scoring without a separately predeclared training run.
+    """
+
+    visual = np.asarray(visual_per_scale_view_logits, dtype=np.float64)
+    position = np.asarray(position_per_scale_view_logits, dtype=np.float64)
+    names = tuple(str(name) for name in scale_names)
+    if (
+        visual.ndim != 4
+        or position.shape != visual.shape
+        or visual.shape[:3] != np.asarray(view_valid, dtype=bool).shape
+        or visual.shape[3] != len(names)
+        or not names
+        or len(set(names)) != len(names)
+    ):
+        raise ValueError("per-scale visual/control diagnostic inputs are incompatible")
+    identity_per_scale_values = (
+        visual_identity_per_scale_view_logits,
+        position_identity_per_scale_view_logits,
+    )
+    if any(value is not None for value in identity_per_scale_values) and not all(
+        value is not None for value in identity_per_scale_values
+    ):
+        raise ValueError("per-scale identity inputs must be both present or both absent")
+    has_identity_side_head = visual_identity_per_scale_view_logits is not None
+    identity_visual: np.ndarray | None = None
+    identity_position: np.ndarray | None = None
+    if has_identity_side_head:
+        identity_visual = np.asarray(
+            visual_identity_per_scale_view_logits, dtype=np.float64
+        )
+        identity_position = np.asarray(
+            position_identity_per_scale_view_logits, dtype=np.float64
+        )
+        if identity_visual.shape != visual.shape or identity_position.shape != visual.shape:
+            raise ValueError("per-scale identity tensors differ from geometry tensors")
+    scale_residuals_visual = [
+        _masked_view_log_mean_numpy(visual[..., index], view_valid)
+        for index in range(len(names))
+    ]
+    scale_residuals_position = [
+        _masked_view_log_mean_numpy(position[..., index], view_valid)
+        for index in range(len(names))
+    ]
+    identity_scale_residuals_visual = (
+        [
+            _masked_view_log_mean_numpy(identity_visual[..., index], view_valid)
+            for index in range(len(names))
+        ]
+        if identity_visual is not None
+        else None
+    )
+    identity_scale_residuals_position = (
+        [
+            _masked_view_log_mean_numpy(identity_position[..., index], view_valid)
+            for index in range(len(names))
+        ]
+        if identity_position is not None
+        else None
+    )
+    result: dict[str, Any] = {
+        "diagnostic_only": True,
+        "null_reference": "immutable_base_null_only_no_learned_joint_null_head",
+        "promotion_allowed": False,
+        "scale_names": list(names),
+        "combinations": {},
+    }
+    for width in range(1, len(names) + 1):
+        for indices in combinations(range(len(names)), width):
+            key = "+".join(names[index] for index in indices)
+            visual_probability, visual_null = _probabilities_from_base_prior_and_residual(
+                base_candidate=base_candidate,
+                base_null=base_null,
+                candidate_residual=np.sum(
+                    [scale_residuals_visual[index] for index in indices], axis=0
+                ),
+                candidate_valid=candidate_valid,
+            )
+            position_probability, position_null = _probabilities_from_base_prior_and_residual(
+                base_candidate=base_candidate,
+                base_null=base_null,
+                candidate_residual=np.sum(
+                    [scale_residuals_position[index] for index in indices], axis=0
+                ),
+                candidate_valid=candidate_valid,
+            )
+            visual_identity_probability: np.ndarray | None = None
+            visual_identity_null: np.ndarray | None = None
+            position_identity_probability: np.ndarray | None = None
+            position_identity_null: np.ndarray | None = None
+            if identity_scale_residuals_visual is not None:
+                assert identity_scale_residuals_position is not None
+                visual_identity_probability, visual_identity_null = (
+                    _probabilities_from_base_prior_and_residual(
+                        base_candidate=base_candidate,
+                        base_null=base_null,
+                        candidate_residual=np.sum(
+                            [
+                                identity_scale_residuals_visual[index]
+                                for index in indices
+                            ],
+                            axis=0,
+                        ),
+                        candidate_valid=candidate_valid,
+                    )
+                )
+                position_identity_probability, position_identity_null = (
+                    _probabilities_from_base_prior_and_residual(
+                        base_candidate=base_candidate,
+                        base_null=base_null,
+                        candidate_residual=np.sum(
+                            [
+                                identity_scale_residuals_position[index]
+                                for index in indices
+                            ],
+                            axis=0,
+                        ),
+                        candidate_valid=candidate_valid,
+                    )
+                )
+            result["combinations"][key] = _visual_vs_position_control_pre_gate(
+                position_probability=position_probability,
+                position_null=position_null,
+                visual_probability=visual_probability,
+                visual_null=visual_null,
+                geometry_labels=geometry_labels,
+                exact_labels=exact_labels,
+                exact_supervised=exact_supervised,
+                candidate_valid=candidate_valid,
+                position_identity_probability=position_identity_probability,
+                position_identity_null=position_identity_null,
+                visual_identity_probability=visual_identity_probability,
+                visual_identity_null=visual_identity_null,
+            )
+    return result
+
+
 def _validate_frozen_inputs(
     *,
     features: Mapping[str, np.ndarray],
@@ -553,6 +965,36 @@ def _validate_frozen_inputs(
         raise ValueError("S1 prediction has an unsupported supervision mode")
     if probability_semantics != expected_semantics[supervision_mode]:
         raise ValueError("S1 prediction supervision and probability semantics disagree")
+    uses_separate_identity_head = bool(
+        prediction_metadata.get("separate_exact_identity_head", False)
+    )
+    identity_array_names = {
+        "identity_candidate_probabilities",
+        "identity_null_probabilities",
+        "identity_view_logits",
+        "identity_per_scale_view_logits",
+        "identity_view_log_probabilities",
+        "identity_candidate_log_likelihood_ratios",
+        "identity_null_log_likelihood_ratios",
+    }
+    if uses_separate_identity_head:
+        if (
+            str(prediction_metadata.get("identity_probability_semantics"))
+            != EXACT_IDENTITY_PROBABILITY_SEMANTICS
+            or prediction_metadata.get("identity_candidate_probability_allowed_for_pnp_overlay")
+            is not False
+        ):
+            raise ValueError("S1 dual-head identity semantics are unsafe")
+        missing_identity = identity_array_names - set(predictions)
+        if missing_identity:
+            raise ValueError(f"S1 dual-head prediction lacks {sorted(missing_identity)}")
+    elif identity_array_names & set(predictions):
+        raise ValueError("S1 legacy prediction unexpectedly carries a dual identity side head")
+    prediction_source_protocol = prediction_metadata.get("source_feature_protocol")
+    if isinstance(prediction_source_protocol, Mapping) and bool(
+        prediction_source_protocol.get("whole_image_summary_or_global_used", False)
+    ) and not _allowed_prediction_soft_global_context(prediction_metadata):
+        raise ValueError("S1 prediction has an unapproved global evidence path")
     if str(prediction_metadata.get("features_sha256")) != str(
         file_sha256_short(features_path)
     ) or str(prediction_metadata.get("proposals_sha256")) != str(
@@ -628,6 +1070,49 @@ def _validate_frozen_inputs(
         raise ValueError("S1 prediction probability arrays are invalid")
     for family_index in range(len(family_names)):
         _probability_contract(probability[family_index], null_probability[family_index], valid)
+    if uses_separate_identity_head:
+        identity_probability = np.asarray(
+            predictions["identity_candidate_probabilities"], dtype=np.float64
+        )
+        identity_null_probability = np.asarray(
+            predictions["identity_null_probabilities"], dtype=np.float64
+        )
+        identity_view_logits = np.asarray(predictions["identity_view_logits"], dtype=np.float64)
+        identity_per_scale_view_logits = np.asarray(
+            predictions["identity_per_scale_view_logits"], dtype=np.float64
+        )
+        identity_view_log_probabilities = np.asarray(
+            predictions["identity_view_log_probabilities"], dtype=np.float64
+        )
+        identity_candidate_llr = np.asarray(
+            predictions["identity_candidate_log_likelihood_ratios"], dtype=np.float64
+        )
+        identity_null_llr = np.asarray(
+            predictions["identity_null_log_likelihood_ratios"], dtype=np.float64
+        )
+        if (
+            identity_probability.shape != probability.shape
+            or identity_null_probability.shape != null_probability.shape
+            or identity_view_logits.shape
+            != (len(family_names), len(rows), valid.shape[1], view_valid.shape[2])
+            or identity_view_log_probabilities.shape != identity_view_logits.shape
+            or identity_per_scale_view_logits.ndim != 5
+            or identity_per_scale_view_logits.shape[:4] != identity_view_logits.shape
+            or identity_candidate_llr.shape != probability.shape
+            or identity_null_llr.shape != null_probability.shape
+            or not np.all(np.isfinite(identity_view_logits))
+            or not np.all(np.isfinite(identity_per_scale_view_logits))
+            or not np.all(np.isfinite(identity_view_log_probabilities))
+            or not np.all(np.isfinite(identity_candidate_llr))
+            or not np.all(np.isfinite(identity_null_llr))
+        ):
+            raise ValueError("S1 dual-head identity prediction arrays are invalid")
+        for family_index in range(len(family_names)):
+            _probability_contract(
+                identity_probability[family_index],
+                identity_null_probability[family_index],
+                valid,
+            )
     _probability_contract(
         np.asarray(base_overlay["candidate_probabilities"], dtype=np.float64)[rows],
         np.asarray(base_overlay["null_probabilities"], dtype=np.float64)[rows],
@@ -673,7 +1158,9 @@ def audit_multiscale_candidate_probe(
         base_overlay_path=base_overlay_path,
         allow_diagnostic_feature_artifact=allow_diagnostic_feature_artifact,
     )
-    soft_global_context = _allowed_soft_global_context(feature_metadata)
+    prediction_source_protocol = prediction_metadata.get("source_feature_protocol")
+    prediction_global_context = _allowed_prediction_soft_global_context(prediction_metadata)
+    soft_global_context = _allowed_soft_global_context(feature_metadata) or prediction_global_context
 
     rows = np.asarray(features["source_row_indices"], dtype=np.int64)
     query_ids = np.asarray(features["query_ids"]).astype(str)
@@ -681,9 +1168,25 @@ def audit_multiscale_candidate_probe(
     query_xy = np.asarray(features["xy"], dtype=np.float32)
     candidate_tracks = np.asarray(features["candidate_track_ids"], dtype=np.int64)
     valid = candidate_tracks >= 0
+    view_valid = np.asarray(features["candidate_view_valid"], dtype=bool)
+    if view_valid.shape[:2] != candidate_tracks.shape or view_valid.ndim != 3:
+        raise ValueError("frozen candidate support-view mask is invalid")
     family_names = np.asarray(predictions["family_names"]).astype(str)
     probe_probability = np.asarray(predictions["candidate_probabilities"], dtype=np.float64)
     probe_null = np.asarray(predictions["null_probabilities"], dtype=np.float64)
+    uses_separate_identity_head = bool(
+        prediction_metadata.get("separate_exact_identity_head", False)
+    )
+    identity_probe_probability = (
+        np.asarray(predictions["identity_candidate_probabilities"], dtype=np.float64)
+        if uses_separate_identity_head
+        else None
+    )
+    identity_probe_null = (
+        np.asarray(predictions["identity_null_probabilities"], dtype=np.float64)
+        if uses_separate_identity_head
+        else None
+    )
     baseline_probability = np.asarray(base_overlay["candidate_probabilities"], dtype=np.float64)[rows]
     baseline_null = np.asarray(base_overlay["null_probabilities"], dtype=np.float64)[rows]
 
@@ -759,8 +1262,11 @@ def audit_multiscale_candidate_probe(
             "fit_uses_train_registered_identity_targets_only": bool(
                 prediction_metadata.get("validation_or_test_labels_used_by_fit") is False
                 and prediction_metadata.get("training_supervision_split") == "train"
-                and prediction_metadata.get("supervision_mode")
-                == REGISTERED_TRACK_IDENTITY_SUPERVISION_MODE
+                and (
+                    prediction_metadata.get("supervision_mode")
+                    == REGISTERED_TRACK_IDENTITY_SUPERVISION_MODE
+                    or uses_separate_identity_head
+                )
             ),
             "training_supervision_mode": prediction_metadata.get(
                 "supervision_mode", GEOMETRIC_SET_SUPERVISION_MODE
@@ -772,10 +1278,24 @@ def audit_multiscale_candidate_probe(
             "image_retrieval_or_submap_used": False,
             "whole_image_summary_or_global_used": bool(
                 feature_metadata.get("whole_image_summary_or_global_used")
+                or (
+                    isinstance(prediction_source_protocol, Mapping)
+                    and prediction_source_protocol.get("whole_image_summary_or_global_used")
+                )
             ),
             "soft_global_context_factor_used": bool(soft_global_context),
-            "global_context_hard_retrieval_or_candidate_reselection": feature_metadata.get(
-                "global_context_hard_retrieval_or_candidate_reselection"
+            "global_context_hard_retrieval_or_candidate_reselection": (
+                prediction_source_protocol.get(
+                    "global_context_hard_retrieval_or_candidate_reselection"
+                )
+                if isinstance(prediction_source_protocol, Mapping)
+                else feature_metadata.get("global_context_hard_retrieval_or_candidate_reselection")
+            ),
+            "candidate_conditioned_full_image_region_tokens": bool(
+                isinstance(prediction_source_protocol, Mapping)
+                and prediction_source_protocol.get(
+                    "candidate_conditioned_full_image_region_tokens"
+                )
             ),
             "render": False,
             "exact_identity_is_strict_diagnostic_not_train_target": bool(
@@ -783,6 +1303,13 @@ def audit_multiscale_candidate_probe(
                     "supervision_mode", GEOMETRIC_SET_SUPERVISION_MODE
                 )
                 != REGISTERED_TRACK_IDENTITY_SUPERVISION_MODE
+                and not uses_separate_identity_head
+            ),
+            "separate_exact_identity_side_head": bool(uses_separate_identity_head),
+            "identity_side_head_allowed_for_pnp_overlay": bool(
+                prediction_metadata.get(
+                    "identity_candidate_probability_allowed_for_pnp_overlay", False
+                )
             ),
             "test_used_for_model_selection": False,
             "audit_target_splits": list(requested_splits),
@@ -815,6 +1342,7 @@ def audit_multiscale_candidate_probe(
                     "diagnostic_max_queries",
                 )
             },
+            "prediction_source_feature_protocol": prediction_source_protocol,
             "base_probability_semantics": base_metadata.get("probability_semantics"),
         },
         "families": {},
@@ -832,6 +1360,16 @@ def audit_multiscale_candidate_probe(
             baseline_split_null = baseline_null[mask]
             probe_candidate = probe_probability[family_index][mask]
             probe_split_null = probe_null[family_index][mask]
+            identity_probe_candidate = (
+                identity_probe_probability[family_index][mask]
+                if identity_probe_probability is not None
+                else probe_candidate
+            )
+            identity_probe_split_null = (
+                identity_probe_null[family_index][mask]
+                if identity_probe_null is not None
+                else probe_split_null
+            )
             all_rows = np.ones((len(baseline_candidate),), dtype=bool)
             exact_summary = summarize_registered_candidate_identity(
                 exact_labels, exact_targets
@@ -877,15 +1415,15 @@ def audit_multiscale_candidate_probe(
                         supervised=exact_targets.supervised,
                     ),
                     "probe": _exact_identity_metrics(
-                        probe_candidate,
-                        probe_split_null,
+                        identity_probe_candidate,
+                        identity_probe_split_null,
                         labels=exact_labels,
                         valid=selected_valid,
                         supervised=exact_targets.supervised,
                     ),
                     "paired_rank": _paired_rank_audit(
                         baseline_candidate,
-                        probe_candidate,
+                        identity_probe_candidate,
                         labels=exact_labels,
                         valid=selected_valid,
                         row_mask=np.asarray(exact_targets.supervised, dtype=bool),
@@ -893,6 +1431,123 @@ def audit_multiscale_candidate_probe(
                 },
             }
         output["families"][family_name] = family_result
+    family_index = {str(name): index for index, name in enumerate(family_names.tolist())}
+    paired_profiles = [
+        profile
+        for profile in _BIDIRECTIONAL_VISUAL_CONTROL_FAMILIES
+        if {profile[1], profile[2]}.issubset(family_index)
+    ]
+    if len(paired_profiles) > 1:
+        raise ValueError("prediction artifact mixes multiple paired visual/control profiles")
+    if paired_profiles:
+        profile_name, visual_family, position_control_family = paired_profiles[0]
+        comparison: dict[str, Any] = {"splits": {}}
+        comparison["family_profile"] = profile_name
+        comparison["visual_family"] = visual_family
+        comparison["position_control_family"] = position_control_family
+        visual_index = family_index[visual_family]
+        position_index = family_index[position_control_family]
+        for split_name in requested_splits:
+            target = split_targets[split_name]
+            mask = np.asarray(target["mask"], dtype=bool)
+            comparison["splits"][split_name] = _visual_vs_position_control_pre_gate(
+                position_probability=probe_probability[position_index][mask],
+                position_null=probe_null[position_index][mask],
+                visual_probability=probe_probability[visual_index][mask],
+                visual_null=probe_null[visual_index][mask],
+                geometry_labels=np.asarray(target["geometry_labels"], dtype=bool),
+                exact_labels=np.asarray(target["exact_labels"], dtype=bool),
+                exact_supervised=np.asarray(target["exact_targets"].supervised, dtype=bool),
+                candidate_valid=np.asarray(target["valid"], dtype=bool),
+                position_identity_probability=(
+                    identity_probe_probability[position_index][mask]
+                    if identity_probe_probability is not None
+                    else None
+                ),
+                position_identity_null=(
+                    identity_probe_null[position_index][mask]
+                    if identity_probe_null is not None
+                    else None
+                ),
+                visual_identity_probability=(
+                    identity_probe_probability[visual_index][mask]
+                    if identity_probe_probability is not None
+                    else None
+                ),
+                visual_identity_null=(
+                    identity_probe_null[visual_index][mask]
+                    if identity_probe_null is not None
+                    else None
+                ),
+            )
+        output["family_comparisons"] = {
+            "visual_vs_position_control": comparison,
+        }
+        if "per_scale_view_logits" in predictions:
+            per_scale = np.asarray(predictions["per_scale_view_logits"], dtype=np.float64)
+            identity_per_scale = (
+                np.asarray(predictions["identity_per_scale_view_logits"], dtype=np.float64)
+                if uses_separate_identity_head
+                else None
+            )
+            source_scales = (
+                prediction_source_protocol.get("source_scales")
+                if isinstance(prediction_source_protocol, Mapping)
+                else None
+            )
+            if not isinstance(source_scales, Sequence) or isinstance(source_scales, (str, bytes)):
+                raise ValueError("per-scale prediction lacks source-scale provenance")
+            scale_names = tuple(
+                str(item.get("name", ""))
+                for item in source_scales
+                if isinstance(item, Mapping)
+            )
+            if (
+                len(scale_names) != len(source_scales)
+                or not scale_names
+                or any(not name for name in scale_names)
+                or per_scale.shape
+                != (
+                    len(family_names),
+                    len(rows),
+                    candidate_tracks.shape[1],
+                    view_valid.shape[2],
+                    len(scale_names),
+                )
+            ):
+                raise ValueError("per-scale prediction arrays differ from the frozen contract")
+            diagnostic: dict[str, Any] = {
+                "family_profile": profile_name,
+                "visual_family": visual_family,
+                "position_control_family": position_control_family,
+                "splits": {},
+            }
+            for split_name in requested_splits:
+                target = split_targets[split_name]
+                mask = np.asarray(target["mask"], dtype=bool)
+                diagnostic["splits"][split_name] = _per_scale_visual_control_diagnostic(
+                    visual_per_scale_view_logits=per_scale[visual_index][mask],
+                    position_per_scale_view_logits=per_scale[position_index][mask],
+                    scale_names=scale_names,
+                    base_candidate=baseline_probability[mask],
+                    base_null=baseline_null[mask],
+                    view_valid=view_valid[mask],
+                    geometry_labels=np.asarray(target["geometry_labels"], dtype=bool),
+                    exact_labels=np.asarray(target["exact_labels"], dtype=bool),
+                    exact_supervised=np.asarray(target["exact_targets"].supervised, dtype=bool),
+                    candidate_valid=np.asarray(target["valid"], dtype=bool),
+                    visual_identity_per_scale_view_logits=(
+                        identity_per_scale[visual_index][mask]
+                        if identity_per_scale is not None
+                        else None
+                    ),
+                    position_identity_per_scale_view_logits=(
+                        identity_per_scale[position_index][mask]
+                        if identity_per_scale is not None
+                        else None
+                    ),
+                )
+            output["per_scale_visual_vs_position_control_diagnostic"] = diagnostic
     return output
 
 

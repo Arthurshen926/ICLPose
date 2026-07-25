@@ -16,6 +16,9 @@ import numpy as np
 
 
 MIXED_VERIFICATION_POINTS_FORMAT = "mixed_multiscale_verification_points_v1"
+MIXED_VERIFICATION_POINTS_SCORING_COMPATIBILITY_FORMAT = (
+    "mixed_multiscale_verification_points_scoring_compatibility_v1"
+)
 POINT_SOURCE_ALIKE = "alike_high_detail"
 POINT_SOURCE_RADIO_INTERMEDIATE = "radio_intermediate_uniform_context"
 POINT_SOURCE_RADIO_FINAL = "radio_final_uniform_context"
@@ -26,6 +29,178 @@ POINT_SOURCES = frozenset(
         POINT_SOURCE_RADIO_FINAL,
     }
 )
+
+
+def _canonical_json_mapping(value: Mapping[str, object]) -> dict[str, object]:
+    """Copy a JSON-compatible mapping with deterministic nested key ordering."""
+
+    try:
+        canonical = json.loads(json.dumps(dict(value), sort_keys=True))
+    except (TypeError, ValueError) as error:
+        raise ValueError("mixed verification metadata is not JSON-compatible") from error
+    if not isinstance(canonical, dict):  # Defensive despite the input conversion.
+        raise ValueError("mixed verification metadata is not an object")
+    return canonical
+
+
+def _declared_exported_splits(metadata: Mapping[str, object]) -> tuple[str, ...]:
+    raw = metadata.get("exported_splits")
+    if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
+        raise ValueError("mixed verification exported splits are invalid")
+    splits = tuple(str(value) for value in raw)
+    if (
+        not splits
+        or len(splits) != len(set(splits))
+        or set(splits) - {"train", "validation", "test"}
+    ):
+        raise ValueError("mixed verification exported splits are invalid")
+    return tuple(sorted(splits))
+
+
+def mixed_verification_points_scoring_compatibility(
+    metadata: Mapping[str, object],
+) -> dict[str, object]:
+    """Return the split-independent provenance required for held-out scoring.
+
+    The raw cache hash remains the normal checkpoint contract.  This manifest
+    only permits a separately materialized held-out cache when every source
+    that changes query descriptors or fixed global candidates agrees exactly.
+    Per-split point membership, worker timing, and local source-point IDs are
+    intentionally excluded because they must differ between train/validation
+    and test-only artifacts.
+    """
+
+    if not isinstance(metadata, Mapping):
+        raise ValueError("mixed verification scoring metadata is invalid")
+    exported_splits = _declared_exported_splits(metadata)
+    required_exact = {
+        "format": MIXED_VERIFICATION_POINTS_FORMAT,
+        "contains_ground_truth": False,
+        "contains_target_errors": False,
+        "pose_or_ground_truth_used": False,
+        "image_retrieval_or_submap_used": False,
+        "render": False,
+        "candidate_evidence_format": "candidate_evidence_v3",
+        "global_landmark_ann_used": True,
+        "global_landmark_ann_scope": "full_projected_landmark_bank_only",
+        "feature_key": "radio_final",
+        "candidate_set": "fixed_full_global_faiss_top_l_unique_tracks",
+        "candidate_top_k": 20,
+        "candidate_prior_semantics": "fixed_top20_coarse_softmax_with_explicit_diagnostic_null_v1",
+        "candidate_prior_pose_calibrated": False,
+        "candidate_reselection": False,
+        "query_split_source": "candidate_evidence_v3_split_names",
+        "token_manifest_split_role": "feature_storage_only_not_evaluation_split",
+        "test_target_labels_materialized": False,
+    }
+    if any(metadata.get(key) != value for key, value in required_exact.items()):
+        raise ValueError("mixed verification scoring metadata has an incompatible contract")
+    if bool(metadata.get("test_source_points_materialized")) != ("test" in exported_splits):
+        raise ValueError("mixed verification test-source provenance is inconsistent")
+    string_fields = (
+        "query_manifest_sha256",
+        "detector_query_cache_sha256",
+        "candidate_evidence_sha256",
+        "candidate_fit_artifact_sha256",
+        "matcha_joint_checkpoint_sha256",
+        "projected_landmark_bank_sha256",
+        "descriptor_space_id",
+        "projection_space_id",
+        "faiss_index_cache_sha256",
+        "faiss_index_metadata_sha256",
+        "colmap_cameras_sha256",
+        "colmap_images_sha256",
+    )
+    if any(not str(metadata.get(name, "")) for name in string_fields):
+        raise ValueError("mixed verification scoring provenance is incomplete")
+    numeric_fields = (
+        "faiss_nprobe",
+        "faiss_search_k",
+        "candidate_prior_temperature",
+        "candidate_null_probability",
+    )
+    try:
+        nprobe = int(metadata["faiss_nprobe"])
+        search_k = int(metadata["faiss_search_k"])
+        temperature = float(metadata["candidate_prior_temperature"])
+        null_probability = float(metadata["candidate_null_probability"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("mixed verification scoring numeric provenance is invalid") from error
+    if (
+        nprobe <= 0
+        or search_k < 20
+        or not np.isfinite(temperature)
+        or temperature <= 0.0
+        or not np.isfinite(null_probability)
+        or not 0.0 <= null_probability < 1.0
+    ):
+        raise ValueError("mixed verification scoring numeric provenance is invalid")
+    point_sources = metadata.get("point_sources")
+    if not isinstance(point_sources, Mapping) or set(point_sources) != POINT_SOURCES:
+        raise ValueError("mixed verification scoring point-source provenance is invalid")
+    manifest: dict[str, object] = {
+        "format": MIXED_VERIFICATION_POINTS_SCORING_COMPATIBILITY_FORMAT,
+        "point_artifact_format": MIXED_VERIFICATION_POINTS_FORMAT,
+        "query_manifest_sha256": str(metadata["query_manifest_sha256"]),
+        "detector_query_cache_sha256": str(metadata["detector_query_cache_sha256"]),
+        "candidate_evidence_format": str(metadata["candidate_evidence_format"]),
+        "candidate_evidence_sha256": str(metadata["candidate_evidence_sha256"]),
+        "candidate_fit_artifact_sha256": str(metadata["candidate_fit_artifact_sha256"]),
+        "matcha_joint_checkpoint_sha256": str(metadata["matcha_joint_checkpoint_sha256"]),
+        "projected_landmark_bank_sha256": str(metadata["projected_landmark_bank_sha256"]),
+        "descriptor_space_id": str(metadata["descriptor_space_id"]),
+        "projection_space_id": str(metadata["projection_space_id"]),
+        "faiss_index_cache_sha256": str(metadata["faiss_index_cache_sha256"]),
+        "faiss_index_metadata_sha256": str(metadata["faiss_index_metadata_sha256"]),
+        "global_landmark_ann_scope": str(metadata["global_landmark_ann_scope"]),
+        "faiss_nprobe": nprobe,
+        "faiss_search_k": search_k,
+        "feature_key": str(metadata["feature_key"]),
+        "candidate_set": str(metadata["candidate_set"]),
+        "candidate_top_k": int(metadata["candidate_top_k"]),
+        "candidate_prior_semantics": str(metadata["candidate_prior_semantics"]),
+        "candidate_prior_temperature": temperature,
+        "candidate_null_probability": null_probability,
+        "query_split_source": str(metadata["query_split_source"]),
+        "token_manifest_split_role": str(metadata["token_manifest_split_role"]),
+        "point_sources": _canonical_json_mapping(point_sources),
+        "colmap_cameras_sha256": str(metadata["colmap_cameras_sha256"]),
+        "colmap_images_sha256": str(metadata["colmap_images_sha256"]),
+    }
+    canonical = _canonical_json_mapping(manifest)
+    serialized = metadata.get("scoring_compatibility")
+    if serialized is not None:
+        if not isinstance(serialized, Mapping) or _canonical_json_mapping(serialized) != canonical:
+            raise ValueError("mixed verification serialized scoring compatibility is stale")
+    return canonical
+
+
+def validate_heldout_scoring_point_cache(
+    *,
+    metadata: Mapping[str, object],
+    point_split_names: Sequence[str] | np.ndarray,
+    requested_splits: Sequence[str],
+) -> dict[str, object]:
+    """Validate that a cache can supply the requested target-free held-out rows."""
+
+    compatibility = mixed_verification_points_scoring_compatibility(metadata)
+    declared = set(_declared_exported_splits(metadata))
+    observed = {
+        str(value) for value in np.asarray(point_split_names).astype(str).reshape(-1)
+    }
+    requested = {str(value) for value in requested_splits}
+    if "test" in requested and observed != {"test"}:
+        raise ValueError("mixed verification test scoring requires a test-only cache")
+    if (
+        not observed
+        or observed - {"train", "validation", "test"}
+        or not requested
+        or requested - {"validation", "test"}
+        or observed != declared
+        or not requested.issubset(observed)
+    ):
+        raise ValueError("mixed verification held-out scoring split provenance is invalid")
+    return compatibility
 
 
 def fixed_topl_coarse_posterior(

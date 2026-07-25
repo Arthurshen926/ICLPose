@@ -7,6 +7,11 @@ from typing import Mapping, Sequence
 
 import numpy as np
 
+try:
+    from scipy.spatial import cKDTree
+except ImportError:  # pragma: no cover - retained for minimal runtime installs.
+    cKDTree = None
+
 from feature_extract.vfm.colmap_tracks import ColmapImageObservation
 
 
@@ -71,19 +76,38 @@ def registered_query_observation_targets(
         valid_xy = observation_xy[valid]
         valid_tracks = observation_tracks[valid]
         rows = np.flatnonzero(ids == str(query_id))
-        for start in range(0, len(rows), int(query_chunk_size)):
-            chunk_rows = rows[start : start + int(query_chunk_size)]
-            distances2 = np.sum(
-                (xy[chunk_rows, None, :] - valid_xy[None, :, :]) ** 2, axis=2
+        if cKDTree is not None:
+            # The previous broadcasted distance matrix scaled as
+            # ``chunk_size * observations_per_image`` and made all-image
+            # identity supervision needlessly slow.  The KD-tree is exactly
+            # the same nearest-observation definition, with no pose or target
+            # information beyond the registered mapping observations.
+            tree = cKDTree(valid_xy.astype(np.float64, copy=False))
+            nearest_distances, nearest = tree.query(
+                xy[rows].astype(np.float64, copy=False),
+                k=1,
+                distance_upper_bound=float(max_distance_px),
             )
-            nearest = np.argmin(distances2, axis=1)
-            nearest_distances = np.sqrt(
-                distances2[np.arange(len(chunk_rows)), nearest]
-            ).astype(np.float32)
-            accepted = nearest_distances <= float(max_distance_px)
-            accepted_rows = chunk_rows[accepted]
+            nearest_distances = np.asarray(nearest_distances, dtype=np.float32)
+            nearest = np.asarray(nearest, dtype=np.int64)
+            accepted = np.isfinite(nearest_distances) & (nearest < len(valid_tracks))
+            accepted_rows = rows[accepted]
             output_tracks[accepted_rows] = valid_tracks[nearest[accepted]]
             output_distances[accepted_rows] = nearest_distances[accepted]
+        else:
+            for start in range(0, len(rows), int(query_chunk_size)):
+                chunk_rows = rows[start : start + int(query_chunk_size)]
+                distances2 = np.sum(
+                    (xy[chunk_rows, None, :] - valid_xy[None, :, :]) ** 2, axis=2
+                )
+                nearest = np.argmin(distances2, axis=1)
+                nearest_distances = np.sqrt(
+                    distances2[np.arange(len(chunk_rows)), nearest]
+                ).astype(np.float32)
+                accepted = nearest_distances <= float(max_distance_px)
+                accepted_rows = chunk_rows[accepted]
+                output_tracks[accepted_rows] = valid_tracks[nearest[accepted]]
+                output_distances[accepted_rows] = nearest_distances[accepted]
     supervised = output_tracks >= 0
     return RegisteredQueryObservationTargets(
         track_ids=output_tracks,

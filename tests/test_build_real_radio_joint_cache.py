@@ -245,6 +245,89 @@ def test_build_real_radio_joint_cache_writes_referenced_manifest_without_shards(
     assert not feature_only_provider._rgb_cache
 
 
+def test_feature_only_provider_uses_referenced_rgb_size_not_resized_sfm_size(
+    tmp_path: Path,
+) -> None:
+    image_root = tmp_path / "images"
+    feature_root = tmp_path / "features"
+    _write_rgb(image_root / "seq/q.png", value=16)
+    _write_rgb(image_root / "seq/r.png", value=48)
+    _write_feature(feature_root / "seq_q.npz", offset=1.0)
+    _write_feature(feature_root / "seq_r.npz", offset=2.0)
+    rows_csv = tmp_path / "rows.csv"
+    with rows_csv.open("w", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "query_id",
+                "support_image_id",
+                "track_id",
+                "support_track_id",
+                "query_gt_x",
+                "query_gt_y",
+                "support_x",
+                "support_y",
+            ],
+        )
+        writer.writeheader()
+        # These 16x16 RGB coordinates would be out of bounds in the 8x8 SfM frame.
+        writer.writerow(
+            {
+                "query_id": "seq/q.png",
+                "support_image_id": "seq/r.png",
+                "track_id": "1",
+                "support_track_id": "1",
+                "query_gt_x": "12",
+                "query_gt_y": "12",
+                "support_x": "12",
+                "support_y": "12",
+            }
+        )
+    manifest = tmp_path / "referenced_manifest.json"
+    build_real_radio_joint_cache.build_real_radio_joint_cache(
+        rows_csv=rows_csv,
+        image_root=image_root,
+        feature_root=feature_root,
+        feature_path_template="{image_stem}.npz",
+        feature_key="radio_final",
+        output_manifest=manifest,
+        split_name="train",
+        manifest_mode="referenced",
+        hard_negatives_per_match=1,
+    )
+    observations = tmp_path / "tracks.jsonl"
+    observations.write_text(
+        "\n".join(
+            json.dumps(
+                {
+                    "image_id": image_id,
+                    "track_id": 1,
+                    "xy": [6.0, 6.0],
+                    "image_width": 8,
+                    "image_height": 8,
+                    "xyz": [1.0, 2.0, 3.0],
+                    "track_length": 2,
+                    "reprojection_error": 0.1,
+                }
+            )
+            for image_id in ("seq/q.png", "seq/r.png")
+        )
+        + "\n"
+    )
+    provider = build_real_radio_joint_cache.RealRadioReferencedJointSampleProvider(
+        manifest,
+        load_rgb=False,
+        track_observation_index=build_real_radio_joint_cache.load_track_observation_index(observations),
+    )
+
+    sample = provider.get(0)
+
+    assert provider._image_size("seq/q.png") == (16, 16)
+    assert sample.pair_query_image_sizes.tolist() == [[16, 16]]
+    assert sample.pair_reference_image_sizes.tolist() == [[16, 16]]
+    assert int(sample.coarse_fine_samples.sample_count) > 0
+
+
 def test_referenced_cache_preserves_cell_colliding_tracks_for_landmark_retrieval(tmp_path: Path) -> None:
     image_root = tmp_path / "images"
     feature_root = tmp_path / "features"

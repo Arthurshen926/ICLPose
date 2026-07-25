@@ -29,8 +29,8 @@ from feature_extract.tools.vfm.build_frozen_loftr_global_alignment_evidence impo
 from feature_extract.vfm.artifacts import file_sha256_short
 
 
-ARTIFACT_FORMAT = "frozen_loftr_global_alignment_export_v1"
-ALIGNMENT_FILENAME = "frozen_loftr_global_alignment_evidence_v1.npz"
+ARTIFACT_FORMAT = "frozen_loftr_global_alignment_export_v2"
+ALIGNMENT_FILENAME = "frozen_loftr_global_alignment_evidence_v2.npz"
 SUMMARY_FILENAME = "summary.json"
 
 
@@ -48,6 +48,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--pair-cache-glob", default="**/pair_caches/*.npz")
     parser.add_argument("--maplet-support-index", required=True)
     parser.add_argument("--support-geometry-index", required=True)
+    parser.add_argument("--colmap-model-dir", required=True)
     parser.add_argument("--image-root", required=True)
     parser.add_argument("--loftr-checkpoint", required=True)
     parser.add_argument("--output-root", required=True)
@@ -123,6 +124,7 @@ def _run_config(
     source_cache_manifest: Sequence[Mapping[str, str]],
     maplet_support_index: Path,
     support_geometry_index: Path,
+    colmap_model_dir: Path,
     image_root: Path,
     loftr_checkpoint: Path,
     workers: int,
@@ -136,6 +138,11 @@ def _run_config(
         "support_geometry_index": str(Path(support_geometry_index).resolve()),
         "support_geometry_index_sha256": file_sha256_short(
             Path(support_geometry_index)
+        ),
+        "colmap_model_dir": str(Path(colmap_model_dir).resolve()),
+        "colmap_cameras_sha256": file_sha256_short(Path(colmap_model_dir) / "cameras.bin"),
+        "colmap_images_camera_ownership_sha256": file_sha256_short(
+            Path(colmap_model_dir) / "images.bin"
         ),
         "image_root": str(Path(image_root).resolve()),
         "loftr_checkpoint": str(Path(loftr_checkpoint).resolve()),
@@ -206,6 +213,7 @@ def _export_one(
     pair_cache: Path,
     maplet_support_index: Path,
     support_geometry_index: Path,
+    colmap_model_dir: Path,
     image_root: Path,
     loftr_checkpoint: Path,
     output_dir: Path,
@@ -217,6 +225,7 @@ def _export_one(
         loftr_pair_cache=Path(pair_cache),
         maplet_support_index=Path(maplet_support_index),
         support_geometry_index=Path(support_geometry_index),
+        colmap_model_dir=Path(colmap_model_dir),
         image_root=Path(image_root),
         loftr_checkpoint=Path(loftr_checkpoint),
         output=output,
@@ -245,6 +254,7 @@ def export_frozen_loftr_global_alignment_shards(
     pair_cache_glob: str,
     maplet_support_index: Path,
     support_geometry_index: Path,
+    colmap_model_dir: Path,
     image_root: Path,
     loftr_checkpoint: Path,
     output_root: Path,
@@ -270,6 +280,7 @@ def export_frozen_loftr_global_alignment_shards(
         source_cache_manifest=source_cache_manifest,
         maplet_support_index=Path(maplet_support_index),
         support_geometry_index=Path(support_geometry_index),
+        colmap_model_dir=Path(colmap_model_dir),
         image_root=Path(image_root),
         loftr_checkpoint=Path(loftr_checkpoint),
         workers=int(workers),
@@ -315,6 +326,7 @@ def export_frozen_loftr_global_alignment_shards(
                     pair_cache=pair_cache,
                     maplet_support_index=Path(maplet_support_index),
                     support_geometry_index=Path(support_geometry_index),
+                    colmap_model_dir=Path(colmap_model_dir),
                     image_root=Path(image_root),
                     loftr_checkpoint=Path(loftr_checkpoint),
                     output_dir=shard_dir,
@@ -370,6 +382,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         pair_cache_glob=str(args.pair_cache_glob),
         maplet_support_index=Path(args.maplet_support_index),
         support_geometry_index=Path(args.support_geometry_index),
+        colmap_model_dir=Path(args.colmap_model_dir),
         image_root=Path(args.image_root),
         loftr_checkpoint=Path(args.loftr_checkpoint),
         output_root=Path(args.output_root),

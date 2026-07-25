@@ -12,8 +12,10 @@ from feature_extract.vfm.localization.mixed_verification_points import (
     POINT_SOURCE_RADIO_INTERMEDIATE,
     fixed_topl_coarse_posterior,
     load_mixed_verification_points,
+    mixed_verification_points_scoring_compatibility,
     select_detector_rows_spatial_quota,
     select_disjoint_lattice_points,
+    validate_heldout_scoring_point_cache,
 )
 
 
@@ -128,3 +130,77 @@ def test_mixed_verification_loader_rejects_unknown_source(tmp_path) -> None:
     np.savez_compressed(path, **arrays)
     with pytest.raises(ValueError, match="arrays are invalid"):
         load_mixed_verification_points(path)
+
+
+def _scoring_metadata(*, exported_splits: list[str]) -> dict[str, object]:
+    return {
+        "format": MIXED_VERIFICATION_POINTS_FORMAT,
+        "contains_ground_truth": False,
+        "contains_target_errors": False,
+        "pose_or_ground_truth_used": False,
+        "image_retrieval_or_submap_used": False,
+        "render": False,
+        "query_manifest_sha256": "queries",
+        "detector_query_cache_sha256": "detector",
+        "candidate_evidence_format": "candidate_evidence_v3",
+        "candidate_evidence_sha256": "candidate",
+        "candidate_fit_artifact_sha256": "fit",
+        "matcha_joint_checkpoint_sha256": "mapper",
+        "projected_landmark_bank_sha256": "bank",
+        "descriptor_space_id": "descriptor-space",
+        "projection_space_id": "projection-space",
+        "faiss_index_cache_sha256": "faiss",
+        "faiss_index_metadata_sha256": "faiss-metadata",
+        "global_landmark_ann_used": True,
+        "global_landmark_ann_scope": "full_projected_landmark_bank_only",
+        "faiss_nprobe": 128,
+        "faiss_search_k": 80,
+        "feature_key": "radio_final",
+        "candidate_set": "fixed_full_global_faiss_top_l_unique_tracks",
+        "candidate_top_k": 20,
+        "candidate_prior_semantics": "fixed_top20_coarse_softmax_with_explicit_diagnostic_null_v1",
+        "candidate_prior_temperature": 0.04,
+        "candidate_null_probability": 0.1,
+        "candidate_prior_pose_calibrated": False,
+        "candidate_reselection": False,
+        "query_split_source": "candidate_evidence_v3_split_names",
+        "token_manifest_split_role": "feature_storage_only_not_evaluation_split",
+        "point_sources": {
+            POINT_SOURCE_ALIKE: {"count_per_image": 64},
+            POINT_SOURCE_RADIO_INTERMEDIATE: {"grid_rows": 8, "grid_columns": 8},
+            POINT_SOURCE_RADIO_FINAL: {"grid_rows": 8, "grid_columns": 8},
+        },
+        "colmap_cameras_sha256": "cameras",
+        "colmap_images_sha256": "images",
+        "test_target_labels_materialized": False,
+        "exported_splits": exported_splits,
+        "test_source_points_materialized": "test" in exported_splits,
+    }
+
+
+def test_scoring_compatibility_binds_sources_but_not_selected_split() -> None:
+    train_validation = _scoring_metadata(exported_splits=["train", "validation"])
+    test_only = _scoring_metadata(exported_splits=["test"])
+
+    compatibility = mixed_verification_points_scoring_compatibility(train_validation)
+    assert compatibility == mixed_verification_points_scoring_compatibility(test_only)
+
+    test_only["projected_landmark_bank_sha256"] = "other-bank"
+    assert compatibility != mixed_verification_points_scoring_compatibility(test_only)
+
+
+def test_test_scoring_cache_must_materialize_only_test_points() -> None:
+    test_only = _scoring_metadata(exported_splits=["test"])
+    compatibility = validate_heldout_scoring_point_cache(
+        metadata=test_only,
+        point_split_names=np.asarray(["test", "test"]),
+        requested_splits=("test",),
+    )
+    assert compatibility["candidate_top_k"] == 20
+
+    with pytest.raises(ValueError, match="test-only"):
+        validate_heldout_scoring_point_cache(
+            metadata=_scoring_metadata(exported_splits=["train", "validation"]),
+            point_split_names=np.asarray(["train", "validation"]),
+            requested_splits=("test",),
+        )

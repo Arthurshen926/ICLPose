@@ -158,6 +158,9 @@ def load_inference_artifact_fields(
 
 def _compatibility_payload(metadata: Mapping[str, object]) -> dict[str, object]:
     return {
+        "candidate_pose_evidence_version": metadata.get(
+            "candidate_pose_evidence_version"
+        ),
         "inputs": metadata.get("inputs"),
         "grouped_config": metadata.get("grouped_config"),
     }

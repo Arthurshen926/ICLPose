@@ -6947,6 +6947,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                             "format": "grouped_pose_hypotheses_inference_only_v1",
                             "pose_or_ground_truth_used_for_generation": False,
                             "contains_target_fields": False,
+                            "candidate_pose_evidence_version": str(
+                                CANDIDATE_POSE_EVIDENCE_VERSION
+                            ),
                             "row_count": int(len(grouped_hypothesis_export_rows)),
                             "inputs": manifest,
                             "grouped_config": (

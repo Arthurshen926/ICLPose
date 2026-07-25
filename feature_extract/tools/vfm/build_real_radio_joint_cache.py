@@ -918,6 +918,7 @@ class RealRadioReferencedJointSampleProvider:
         self.load_rgb = bool(load_rgb)
         self._feature_cache: OrderedDict[str, np.ndarray] = OrderedDict()
         self._rgb_cache: OrderedDict[str, np.ndarray] = OrderedDict()
+        self._image_size_cache: dict[str, tuple[int, int]] = {}
         self._cache_lock = RLock()
         self._landmark_retrieval_audit: dict[str, object] | None = None
 
@@ -1010,15 +1011,64 @@ class RealRadioReferencedJointSampleProvider:
         )
 
     def _image_size(self, image_id: str) -> tuple[int, int]:
+        """Return the image coordinate frame used by the feature map.
+
+        SfM often stores a resized reconstruction image (for example 1024x576),
+        whereas RADIO features and referenced CSV coordinates are generated from
+        the processed RGB image (for example 1920x1080).  The two frames are
+        geometrically compatible after scaling but are not interchangeable when
+        converting supervision into feature cells.  Therefore RGB dimensions are
+        authoritative whenever the referenced image is available; SfM dimensions
+        only verify aspect-ratio compatibility and remain a diagnostic fallback.
+        """
+
+        key = str(image_id)
+        with self._cache_lock:
+            cached = self._image_size_cache.get(key)
+        if cached is not None:
+            return cached
+
+        image_path = Path(self.image_root) / key
+        if image_path.exists():
+            with Image.open(image_path) as image:
+                size = (int(image.width), int(image.height))
+            if min(size) <= 0:
+                raise ValueError(f"referenced RGB image has invalid size for {image_id!r}")
+            observations = (
+                None
+                if self.track_observation_index is None
+                else self.track_observation_index.by_image.get(key)
+            )
+            if observations is not None and int(observations.image_sizes.shape[0]) > 0:
+                sfm_sizes = np.asarray(observations.image_sizes, dtype=np.int64).reshape(-1, 2)
+                if not bool(np.all(sfm_sizes == sfm_sizes[0])):
+                    raise ValueError(f"SfM observation index has inconsistent image sizes for {image_id!r}")
+                sfm_width, sfm_height = map(int, sfm_sizes[0].tolist())
+                sfm_aspect = float(sfm_width) / max(float(sfm_height), 1.0)
+                rgb_aspect = float(size[0]) / max(float(size[1]), 1.0)
+                if abs(sfm_aspect - rgb_aspect) > 1e-3:
+                    raise ValueError(
+                        "SfM and referenced RGB aspect ratios differ; an explicit crop transform is required "
+                        f"for {image_id!r}"
+                    )
+            with self._cache_lock:
+                self._image_size_cache[key] = size
+            return size
+
         if self.track_observation_index is None:
-            raise ValueError("feature-only referenced loading requires a full SfM observation index")
-        observations = self.track_observation_index.by_image.get(str(image_id))
+            raise ValueError(
+                "feature-only referenced loading requires a readable RGB image or a full SfM observation index"
+            )
+        observations = self.track_observation_index.by_image.get(key)
         if observations is None or int(observations.image_sizes.shape[0]) == 0:
-            raise ValueError(f"SfM observation index has no image size for {image_id!r}")
+            raise ValueError(f"no RGB image or SfM image size is available for {image_id!r}")
         sizes = np.asarray(observations.image_sizes, dtype=np.int64).reshape(-1, 2)
         if not bool(np.all(sizes == sizes[0])):
             raise ValueError(f"SfM observation index has inconsistent image sizes for {image_id!r}")
-        return int(sizes[0, 0]), int(sizes[0, 1])
+        size = (int(sizes[0, 0]), int(sizes[0, 1]))
+        with self._cache_lock:
+            self._image_size_cache[key] = size
+        return size
 
     def _record_rows(self, record: Mapping[str, object]) -> list[dict[str, str]]:
         row_indices = [int(value) for value in record.get("row_indices", [])]

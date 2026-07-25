@@ -28,7 +28,7 @@ from feature_extract.vfm.localization.mixed_verification_points import (
 
 ARTIFACT_FORMAT = "mixed_multiscale_verification_frozen_candidate_layout_v1"
 _FEATURE_NAMES = ("radio_final_anchor_cosine",)
-_ALLOWED_SPLITS = frozenset({"train", "validation"})
+_ALLOWED_SPLITS = frozenset({"train", "validation", "test"})
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -38,6 +38,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output", required=True)
     parser.add_argument("--summary_json", required=True)
     return parser.parse_args(argv)
+
+
+def validate_mixed_layout_exported_splits(split_names: np.ndarray) -> tuple[str, ...]:
+    """Allow target-free layouts for any explicit evaluation split subset."""
+
+    splits = np.asarray(split_names).astype(str).reshape(-1)
+    values = tuple(sorted(set(splits.tolist())))
+    if not values or set(values) - _ALLOWED_SPLITS:
+        raise ValueError("mixed frozen layout has an invalid evaluation split")
+    return values
 
 
 def build_mixed_multiscale_candidate_layout(
@@ -55,8 +65,7 @@ def build_mixed_multiscale_candidate_layout(
     if str(points.metadata.get("format", "")) != MIXED_VERIFICATION_POINTS_FORMAT:
         raise ValueError("mixed verification points have an unsupported format")
     split_names = np.asarray(points.split_names).astype(str)
-    if not len(split_names) or set(split_names.tolist()) - _ALLOWED_SPLITS:
-        raise ValueError("mixed frozen layout may contain train/validation points only")
+    exported_splits = validate_mixed_layout_exported_splits(split_names)
     if bool(points.metadata.get("pose_or_ground_truth_used", True)) or bool(
         points.metadata.get("image_retrieval_or_submap_used", True)
     ) or bool(points.metadata.get("render", True)):
@@ -128,13 +137,12 @@ def build_mixed_multiscale_candidate_layout(
         "maplet_support_index": str(Path(maplet_support_index)),
         "maplet_support_index_sha256": file_sha256_short(Path(maplet_support_index)),
         "maplet_support_index_format": maplet_metadata.get("format"),
-        "exported_splits": sorted(set(split_names.tolist())),
-        "source_test_rows_materialized": False,
+        "exported_splits": list(exported_splits),
+        "source_test_rows_materialized": "test" in exported_splits,
         "source_target_arrays_read": False,
         "source_target_arrays_excluded": ["pose", "residual", "registered_track_identity"],
         "row_counts": {
-            split: int(np.count_nonzero(split_names == split))
-            for split in sorted(set(split_names.tolist()))
+            split: int(np.count_nonzero(split_names == split)) for split in exported_splits
         },
     }
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -170,8 +178,8 @@ def build_mixed_multiscale_candidate_layout(
             for source in sorted(set(np.asarray(points.point_sources).astype(str).tolist()))
         },
         "protocol": {
-            "train_validation_only": True,
-            "test_rows_materialized": False,
+            "train_validation_only": set(exported_splits) <= {"train", "validation"},
+            "test_rows_materialized": "test" in exported_splits,
             "target_residuals_read": False,
             "candidate_reselection": False,
             "image_retrieval_or_submap_used": False,

@@ -18,7 +18,7 @@ from feature_extract.vfm.localization.frozen_loftr_pair_cache import FrozenLoFTR
 
 
 FROZEN_LOFTR_CANDIDATE_ANCHOR_EVIDENCE_FORMAT = (
-    "frozen_loftr_candidate_anchor_evidence_v1"
+    "frozen_loftr_candidate_anchor_evidence_v2"
 )
 LOFTR_ANCHOR_FEATURE_NAMES = (
     "loftr_joint_peak_sigma8",

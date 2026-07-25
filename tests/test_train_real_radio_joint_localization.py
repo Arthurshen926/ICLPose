@@ -83,8 +83,11 @@ def test_train_real_radio_joint_localization_cli_defaults_to_full_joint_training
     assert not hasattr(args, "render_cache_manifest_csv")
     assert args.landmark_episode_support_pairs == 0
     assert args.validation_landmark_episodes_per_query == 0
+    assert args.validation_provider_max_samples == 0
     assert args.validation_selection_metric == "total_loss"
     assert args.internal_query_disjoint_split == ""
+    assert args.training_track_observations == ""
+    assert args.training_track_observation_index_cache == ""
     assert args.landmark_prototype_aggregation_method == "mean"
     assert args.landmark_l2_normalize_observations is False
     assert args.landmark_normalize_final_prototypes is True
@@ -322,6 +325,93 @@ def test_distributed_track_index_cache_is_built_by_rank_zero(
 
     assert result is sentinel
     assert events == expected_events
+
+
+def test_training_geometry_paths_prefer_explicit_full_geometry_and_keep_legacy_fallback() -> None:
+    explicit = SimpleNamespace(
+        training_track_observations="full.jsonl",
+        training_track_observation_index_cache="full.index.npz",
+        landmark_track_observations="support.jsonl",
+        landmark_track_observation_index_cache="support.index.npz",
+    )
+    source, cache, mode = (
+        train_real_radio_joint_localization._resolve_training_track_observation_paths(explicit)
+    )
+    assert source == Path("full.jsonl")
+    assert cache == Path("full.index.npz")
+    assert mode == "explicit_training_geometry"
+
+    legacy = SimpleNamespace(
+        landmark_track_observations="support.jsonl",
+        landmark_track_observation_index_cache="support.index.npz",
+    )
+    source, cache, mode = (
+        train_real_radio_joint_localization._resolve_training_track_observation_paths(legacy)
+    )
+    assert source == Path("support.jsonl")
+    assert cache == Path("support.index.npz")
+    assert mode == "legacy_landmark_track_observations"
+
+
+def test_training_geometry_contract_allows_query_observations_but_not_support_leakage() -> None:
+    index = SimpleNamespace(by_image={"query.png": object(), "support.png": object()})
+    audit = train_real_radio_joint_localization.validate_training_geometry_contract(
+        index,
+        training_observations=Path("full.jsonl"),
+        query_image_ids={"query.png"},
+        allowed_support_image_ids={"support.png"},
+    )
+    assert audit["query_geometry_complete"] is True
+    assert audit["query_support_disjoint"] is True
+    assert audit["geometry_scope"] == "query_supervision_plus_mapping_support"
+
+    with pytest.raises(ValueError, match="missing supervised query observations"):
+        train_real_radio_joint_localization.validate_training_geometry_contract(
+            index,
+            training_observations=Path("full.jsonl"),
+            query_image_ids={"missing.png"},
+            allowed_support_image_ids={"support.png"},
+        )
+    with pytest.raises(ValueError, match="must not enter the map-support scope"):
+        train_real_radio_joint_localization.validate_training_geometry_contract(
+            index,
+            training_observations=Path("full.jsonl"),
+            query_image_ids={"query.png"},
+            allowed_support_image_ids={"query.png", "support.png"},
+        )
+
+
+def test_landmark_bank_support_resolver_never_falls_back_to_query_geometry() -> None:
+    args = SimpleNamespace(
+        training_track_observations="full.jsonl",
+        landmark_track_observations="",
+        landmark_frozen_bank_support_observations="",
+    )
+    with pytest.raises(ValueError, match="query geometry only"):
+        train_real_radio_joint_localization._resolve_landmark_bank_support_observations(args)
+
+    args.landmark_track_observations = "support.jsonl"
+    assert (
+        train_real_radio_joint_localization._resolve_landmark_bank_support_observations(args)
+        == Path("support.jsonl")
+    )
+
+
+def test_coherent_hard_negative_training_requires_frozen_descriptor_bank() -> None:
+    args = SimpleNamespace(
+        landmark_coherent_hard_negative_margin_weight=0.25,
+        landmark_frozen_negative_bank="",
+        landmark_memory_warm_start_bank="warm.npz",
+    )
+    with pytest.raises(ValueError, match="requires --landmark_frozen_negative_bank"):
+        train_real_radio_joint_localization.validate_coherent_hard_negative_memory_contract(args)
+
+    args.landmark_frozen_negative_bank = "frozen.npz"
+    with pytest.raises(ValueError, match="cannot combine"):
+        train_real_radio_joint_localization.validate_coherent_hard_negative_memory_contract(args)
+
+    args.landmark_memory_warm_start_bank = ""
+    train_real_radio_joint_localization.validate_coherent_hard_negative_memory_contract(args)
 
 
 def test_multiview_episode_provider_groups_distinct_support_images() -> None:
@@ -580,6 +670,74 @@ def test_frozen_landmark_bank_contract_validates_source_image_sets(
             support_observations=observations,
             required_source_image_ids={"missing.png"},
             forbidden_source_image_ids=set(),
+        )
+
+
+def test_full_query_geometry_is_rejected_when_misused_as_bank_support(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "joint.pt"
+    checkpoint.write_text("checkpoint")
+    full_geometry = tmp_path / "full_geometry.jsonl"
+    full_geometry.write_text("query and support observations\n")
+    token_path = tmp_path / "token.npz"
+    np.savez(token_path, radio_final=np.ones((4, 2, 2), dtype=np.float32))
+    source_manifest = tmp_path / "full_geometry_tokens.json"
+    source_manifest.write_text(
+        json.dumps(
+            {
+                "records": [
+                    {
+                        "image_id": image_id,
+                        "token_path": str(token_path),
+                        "layers": [
+                            {
+                                "name": "radio_final",
+                                "model": "C-RADIO",
+                                "layer": "final",
+                                "channels": 4,
+                                "stride": 16,
+                            }
+                        ],
+                        "split": "train",
+                        "scene": "scene",
+                    }
+                    for image_id in ("support.png", "query.png")
+                ]
+            }
+        )
+    )
+    from feature_extract.vfm.artifacts import file_sha256_short
+
+    bank = tmp_path / "bank.npz"
+    np.savez(
+        bank,
+        track_ids=np.asarray([1], dtype=np.int64),
+        features=np.ones((1, 4), dtype=np.float32),
+        metadata_json=np.asarray(
+            json.dumps(
+                {
+                    "descriptor_space_id": "space",
+                    "descriptor_space_manifest": {
+                        "version": 2,
+                        "projection_source": "projected_observation_full_map",
+                    },
+                    "track_observations_sha256": file_sha256_short(full_geometry),
+                    "matcha_joint_checkpoint_sha256": file_sha256_short(checkpoint),
+                    "source_image_count": 2,
+                    "token_manifest": str(source_manifest),
+                    "token_manifest_sha256": file_sha256_short(source_manifest),
+                }
+            )
+        ),
+    )
+
+    with pytest.raises(ValueError, match="held-out query images"):
+        train_real_radio_joint_localization.validate_landmark_memory_warm_start_contract(
+            bank,
+            warm_start_checkpoint=checkpoint,
+            support_observations=full_geometry,
+            forbidden_source_image_ids={"query.png"},
         )
 
 

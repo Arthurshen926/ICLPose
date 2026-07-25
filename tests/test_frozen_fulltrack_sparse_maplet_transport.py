@@ -10,6 +10,9 @@ from feature_extract.vfm.localization.frozen_fulltrack_sparse_maplet_transport i
     sparse_maplet_support_usable,
     sparse_maplet_topology_control_features,
 )
+from feature_extract.tools.vfm.build_frozen_fulltrack_per_view_sparse_maplet_transport import (
+    _normalise_topology_cache_source_contract_paths,
+)
 
 
 def test_partial_sparse_maplet_retains_visual_evidence_with_one_missing_quadrant() -> None:
@@ -64,3 +67,26 @@ def test_query_quadrants_exclude_the_anchor_cell_from_pooling() -> None:
     assert valid.tolist() == [[True, True, True, True]]
     assert torch.allclose(coverage, torch.ones_like(coverage))
     assert torch.allclose(values, torch.zeros_like(values))
+
+
+def test_topology_source_contract_normalizes_only_cache_path_spelling(tmp_path, monkeypatch) -> None:
+    cache = tmp_path / "cache.npz"
+    cache.touch()
+    common = {
+        "context_cache_sha256": {"radio_final": "abcd"},
+        "source_image_ids_sha256": "ids",
+        "source_image_sizes_sha256": "sizes",
+        "profiles": [],
+        "maximum_neighbors_per_quadrant": 4,
+        "minimum_total_neighbors": 4,
+    }
+    relative = {
+        **common,
+        "source_metadata": [{"cache": str(cache.relative_to(tmp_path.parent)), "cache_sha256": "abcd"}],
+    }
+    absolute = {
+        **common,
+        "source_metadata": [{"cache": str(cache.resolve()), "cache_sha256": "abcd"}],
+    }
+    monkeypatch.chdir(tmp_path.parent)
+    assert _normalise_topology_cache_source_contract_paths(relative) == _normalise_topology_cache_source_contract_paths(absolute)

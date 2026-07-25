@@ -25,6 +25,9 @@ from feature_extract.vfm.localization.frozen_loftr_global_alignment import (
     FROZEN_LOFTR_GLOBAL_ALIGNMENT_EVIDENCE_FORMAT,
     LOFTR_GLOBAL_ALIGNMENT_FEATURE_NAMES,
 )
+from feature_extract.vfm.localization.frozen_loftr_coordinate_contract import (
+    validate_frozen_loftr_colmap_coordinate_metadata,
+)
 
 
 ARTIFACT_FORMAT = "frozen_loftr_global_alignment_coverage_audit_v1"
@@ -179,6 +182,8 @@ def _validate_alignment_shard(
         "global_alignment_pose_free": True,
         "global_alignment_model_per_candidate": False,
         "homography_fits_all_cached_pair_matches": True,
+        "source_to_colmap_coordinate_contract": True,
+        "legacy_coordinate_ambiguous_evidence_rejected": True,
     }
     inputs = metadata.get("inputs")
     source_input = inputs.get("appearance_artifact") if isinstance(inputs, Mapping) else None
@@ -203,6 +208,7 @@ def _validate_alignment_shard(
         != file_sha256_short(Path(str(entry["pair_cache"])))
     ):
         raise ValueError(f"{output}: global-alignment target-free contract is invalid")
+    validate_frozen_loftr_colmap_coordinate_metadata(metadata)
     if any(not np.array_equal(arrays[name], source_arrays[name]) for name in _BASE_FIELDS):
         raise ValueError(f"{output}: global alignment changed its frozen source layout")
     query_ids = np.asarray(arrays["verification_query_ids"]).astype(str).reshape(-1)

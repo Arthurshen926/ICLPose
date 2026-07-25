@@ -26,6 +26,9 @@ from feature_extract.vfm.localization.frozen_loftr_candidate_anchor_evidence imp
 from feature_extract.vfm.localization.frozen_loftr_pair_cache import (
     load_frozen_loftr_pair_cache,
 )
+from feature_extract.vfm.localization.frozen_loftr_coordinate_contract import (
+    validate_frozen_loftr_colmap_coordinate_metadata,
+)
 from feature_extract.vfm.localization.frozen_multiscale_candidate_appearance_residual_probe import (
     FROZEN_APPEARANCE_ARTIFACT_FORMAT,
 )
@@ -117,6 +120,8 @@ def _required_contract(*, metadata: Mapping[str, Any], anchor: bool, path: Path)
                 "all_mapping_images_pair_cached": True,
                 "pair_cache_image_level_selection": False,
                 "anchor_evidence_pose_free": True,
+                "source_to_colmap_coordinate_contract": True,
+                "legacy_coordinate_ambiguous_evidence_rejected": True,
             }
         )
     if (
@@ -157,6 +162,8 @@ def _load_query_artifact(path: Path, *, anchor: bool) -> FrozenQueryArtifact:
     if metadata.get("format") != expected_format:
         raise ValueError(f"{path}: artifact format differs from expected frozen schema")
     _required_contract(metadata=metadata, anchor=anchor, path=Path(path))
+    if anchor:
+        validate_frozen_loftr_colmap_coordinate_metadata(metadata)
     query_ids = np.asarray(arrays["verification_query_ids"]).astype(str).reshape(-1)
     split_names = np.asarray(arrays["split_names"]).astype(str).reshape(-1)
     rows = np.asarray(arrays["verification_source_row_indices"], dtype=np.int64).reshape(-1)

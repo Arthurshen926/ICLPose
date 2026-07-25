@@ -9,6 +9,10 @@ from feature_extract.tools.vfm.build_multiscale_context_attention_probe_contract
 )
 from feature_extract.vfm.localization.context_attention_candidate_probe import (
     CONTEXT_ATTENTION_PROBE_CONTRACT_FORMAT,
+    CONTEXT_ATTENTION_PROBE_CONTRACT_FORMAT_V2,
+    CONTEXT_ATTENTION_PROBE_CONTRACT_FORMAT_V3,
+    CONTEXT_ATTENTION_PROBE_CONTRACT_FORMAT_V4,
+    CONTEXT_ATTENTION_PROBE_CONTRACT_FORMAT_V5,
 )
 from feature_extract.vfm.localization.local_maplet_geometry_probe import (
     SupportObservationGeometryIndex,
@@ -176,3 +180,119 @@ def test_context_attention_contract_freezes_multiscale_target_free_sources(tmp_p
         "alike",
     ]
     assert contract["valid_candidate_view_count"] == 2
+
+
+def test_bidirectional_contract_binds_global_regions_to_fixed_candidates(tmp_path) -> None:
+    layout, geometry, final, intermediate, alike = _write_inputs(tmp_path)
+    output = tmp_path / "v2_contract.json"
+    summary = tmp_path / "v2_summary.json"
+
+    build_multiscale_context_attention_probe_contract(
+        frozen_layout_features=layout,
+        support_geometry_index=geometry,
+        radio_final_context_cache=final,
+        radio_intermediate_context_cache=intermediate,
+        alike_spatial_context_cache=alike,
+        output=output,
+        summary_json=summary,
+        force=False,
+        architecture="bidirectional_absolute_v2",
+    )
+
+    contract = json.loads(output.read_text())
+    assert contract["format"] == CONTEXT_ATTENTION_PROBE_CONTRACT_FORMAT_V2
+    assert contract["architecture"] == "bidirectional_absolute_v2"
+    assert contract["whole_image_summary_or_global_used"] is True
+    assert contract["soft_global_context_factor_used"] is True
+    assert contract["global_context_hard_retrieval_or_candidate_reselection"] is False
+    assert contract["candidate_conditioned_full_image_region_tokens"] is True
+    assert [item["window_size"] for item in contract["source_scales"]] == [5, 9, 13]
+
+
+def test_raw_v3_contract_binds_shared_raw_cost_volume_profile(tmp_path) -> None:
+    layout, geometry, final, intermediate, alike = _write_inputs(tmp_path)
+    output = tmp_path / "v3_contract.json"
+    summary = tmp_path / "v3_summary.json"
+
+    build_multiscale_context_attention_probe_contract(
+        frozen_layout_features=layout,
+        support_geometry_index=geometry,
+        radio_final_context_cache=final,
+        radio_intermediate_context_cache=intermediate,
+        alike_spatial_context_cache=alike,
+        output=output,
+        summary_json=summary,
+        force=False,
+        architecture="bidirectional_absolute_raw_v3",
+    )
+
+    contract = json.loads(output.read_text())
+    assert contract["format"] == CONTEXT_ATTENTION_PROBE_CONTRACT_FORMAT_V3
+    assert contract["architecture"] == "bidirectional_absolute_raw_v3"
+    assert contract["families"] == [
+        "bidirectional_absolute_raw_visual_v3",
+        "bidirectional_absolute_raw_position_control_v3",
+    ]
+    assert contract["global_region_size_by_scale"] == {
+        "radio_final": 6,
+        "radio_intermediate": 6,
+        "alike": 0,
+    }
+
+
+def test_raw_layout_v4_contract_binds_the_low_capacity_phase_profile(tmp_path) -> None:
+    layout, geometry, final, intermediate, alike = _write_inputs(tmp_path)
+    output = tmp_path / "v4_contract.json"
+    summary = tmp_path / "v4_summary.json"
+
+    build_multiscale_context_attention_probe_contract(
+        frozen_layout_features=layout,
+        support_geometry_index=geometry,
+        radio_final_context_cache=final,
+        radio_intermediate_context_cache=intermediate,
+        alike_spatial_context_cache=alike,
+        output=output,
+        summary_json=summary,
+        force=False,
+        architecture="bidirectional_absolute_raw_layout_v4",
+    )
+
+    contract = json.loads(output.read_text())
+    assert contract["format"] == CONTEXT_ATTENTION_PROBE_CONTRACT_FORMAT_V4
+    assert contract["architecture"] == "bidirectional_absolute_raw_layout_v4"
+    assert contract["families"] == [
+        "bidirectional_absolute_raw_layout_visual_v4",
+        "bidirectional_absolute_raw_layout_position_control_v4",
+    ]
+    assert contract["global_region_size_by_scale"]["radio_final"] == 6
+
+
+def test_dual_head_v5_contract_binds_the_same_frozen_raw_layout_sources(tmp_path) -> None:
+    layout, geometry, final, intermediate, alike = _write_inputs(tmp_path)
+    output = tmp_path / "v5_contract.json"
+    summary = tmp_path / "v5_summary.json"
+
+    build_multiscale_context_attention_probe_contract(
+        frozen_layout_features=layout,
+        support_geometry_index=geometry,
+        radio_final_context_cache=final,
+        radio_intermediate_context_cache=intermediate,
+        alike_spatial_context_cache=alike,
+        output=output,
+        summary_json=summary,
+        force=False,
+        architecture="bidirectional_absolute_dual_head_raw_layout_v5",
+    )
+
+    contract = json.loads(output.read_text())
+    assert contract["format"] == CONTEXT_ATTENTION_PROBE_CONTRACT_FORMAT_V5
+    assert contract["architecture"] == "bidirectional_absolute_dual_head_raw_layout_v5"
+    assert contract["families"] == [
+        "bidirectional_absolute_dual_head_raw_layout_visual_v5",
+        "bidirectional_absolute_dual_head_raw_layout_position_control_v5",
+    ]
+    assert contract["global_region_size_by_scale"] == {
+        "radio_final": 6,
+        "radio_intermediate": 6,
+        "alike": 0,
+    }

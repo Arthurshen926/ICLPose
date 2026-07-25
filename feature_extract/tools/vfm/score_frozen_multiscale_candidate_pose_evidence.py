@@ -771,8 +771,15 @@ def _load_exact_hypotheses(
     candidate_path: Path,
     prior_path: Path,
     fixed_candidate_top_k: int,
+    query_id: str | None = None,
 ) -> tuple[dict[str, np.ndarray], dict[str, object], dict[str, object]]:
-    """Join S0 rows to their source poses by exact immutable row identity."""
+    """Join S0 rows to source poses by exact immutable row identity.
+
+    Normal scoring artifacts contain one query.  The optional ``query_id`` is
+    reserved for train-only OOF scoring, where an otherwise immutable shard
+    can contain several query groups.  Selection happens before the exact
+    pose join so no prefix truncation can silently cross query boundaries.
+    """
 
     baseline, baseline_metadata, _names = _load_npz_allowlist(
         baseline_path,
@@ -795,12 +802,25 @@ def _load_exact_hypotheses(
         prior_path=prior_path,
         fixed_candidate_top_k=fixed_candidate_top_k,
     )
+    if query_id is not None:
+        requested_query_id = str(query_id).strip()
+        if not requested_query_id:
+            raise ValueError("requested exact hypothesis query ID is empty")
+        baseline_query_ids = np.asarray(baseline["query_ids"]).astype(str).reshape(-1)
+        rows = np.flatnonzero(baseline_query_ids == requested_query_id).astype(np.int64)
+        if len(rows) == 0:
+            raise ValueError("requested query is absent from baseline score artifact")
+        baseline = {
+            name: np.asarray(value)[rows].copy()
+            for name, value in baseline.items()
+        }
     hypotheses, hypothesis_metadata = load_inference_artifact_fields(
         hypothesis_path, ("poses_w2c",)
     )
     source_keys = list(
         zip(
             np.asarray(hypotheses["query_ids"]).astype(str).tolist(),
+            np.asarray(hypotheses["split_names"]).astype(str).tolist(),
             np.asarray(hypotheses["evaluation_labels"]).astype(str).tolist(),
             np.asarray(hypotheses["hypothesis_indices"], dtype=np.int64).tolist(),
         )
@@ -809,6 +829,7 @@ def _load_exact_hypotheses(
     requested_keys = list(
         zip(
             np.asarray(baseline["query_ids"]).astype(str).tolist(),
+            np.asarray(baseline["split_names"]).astype(str).tolist(),
             np.asarray(baseline["evaluation_labels"]).astype(str).tolist(),
             np.asarray(baseline["hypothesis_indices"], dtype=np.int64).tolist(),
         )
@@ -832,6 +853,8 @@ def _load_exact_hypotheses(
     query_ids = np.unique(np.asarray(output["query_ids"]).astype(str))
     if len(query_ids) != 1:
         raise ValueError("one S1 scoring shard must contain exactly one query image")
+    if query_id is not None and str(query_ids[0]) != str(query_id):
+        raise RuntimeError("exact hypothesis query selection is inconsistent")
     if len(output["poses_w2c"]) == 0:
         raise ValueError("S1 source shard contains no frozen S0 hypotheses")
     return output, hypothesis_metadata, baseline_metadata

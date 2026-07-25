@@ -47,6 +47,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--mapping-support-manifest", required=True)
     parser.add_argument("--maplet-support-index", required=True)
     parser.add_argument("--support-geometry-index", required=True)
+    parser.add_argument("--colmap-model-dir", required=True)
     parser.add_argument("--image-root", required=True)
     parser.add_argument("--hloc-root", default="third_party/Hierarchical-Localization")
     parser.add_argument("--loftr-checkpoint", required=True)
@@ -124,6 +125,7 @@ def run_frozen_loftr_pair_cache_shard(
     mapping_support_manifest: Path,
     maplet_support_index: Path,
     support_geometry_index: Path,
+    colmap_model_dir: Path,
     image_root: Path,
     hloc_root: Path,
     loftr_checkpoint: Path,
@@ -179,6 +181,7 @@ def run_frozen_loftr_pair_cache_shard(
             loftr_pair_cache=cache_path,
             maplet_support_index=Path(maplet_support_index),
             support_geometry_index=Path(support_geometry_index),
+            colmap_model_dir=Path(colmap_model_dir),
             image_root=Path(image_root),
             loftr_checkpoint=Path(loftr_checkpoint),
             match_chunk_size=int(match_chunk_size),
@@ -241,6 +244,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         mapping_support_manifest=Path(args.mapping_support_manifest),
         maplet_support_index=Path(args.maplet_support_index),
         support_geometry_index=Path(args.support_geometry_index),
+        colmap_model_dir=Path(args.colmap_model_dir),
         image_root=Path(args.image_root),
         hloc_root=Path(args.hloc_root),
         loftr_checkpoint=Path(args.loftr_checkpoint),

@@ -25,7 +25,7 @@ from feature_extract.vfm.localization.frozen_loftr_pair_cache import FrozenLoFTR
 
 
 FROZEN_LOFTR_GLOBAL_ALIGNMENT_EVIDENCE_FORMAT = (
-    "frozen_loftr_global_alignment_evidence_v1"
+    "frozen_loftr_global_alignment_evidence_v2"
 )
 LOFTR_GLOBAL_ALIGNMENT_FEATURE_NAMES = (
     "loftr_homography_anchor_forward_error_px",
