@@ -1,13 +1,10 @@
 from __future__ import annotations
 
-import json
-
 import numpy as np
 import pytest
 import torch
 
 from feature_extract.vfm.colmap_tracks import ColmapCamera
-from feature_extract.vfm.artifacts import file_sha256_short
 from feature_extract.vfm.localization.surface_maplet_mapper import (
     SurfaceMapletMapper,
     SurfaceMapletMapperConfig,
@@ -21,27 +18,14 @@ from feature_extract.vfm.localization.surface_maplet_mapper import (
 from feature_extract.vfm.localization.surface_localization import (
     LocalFeatureFrame,
     SurfaceMapletMatchConfig,
-    SurfaceAnchorObservationIndex,
     SurfacePoseConfig,
-    SurfacePoseHypothesis,
-    SurfacePoseResult,
     build_anchor_local_descriptor_bank,
     build_maplet_conditioned_surface_anchor_candidate_pool,
     build_surface_anchor_candidate_pool,
     estimate_vfm_query_to_support_layout,
     generate_grouped_surface_pose_hypotheses,
-    lift_pairwise_matches_with_2dgs_depth,
-    lift_pairwise_matches_to_surface_anchors,
     match_radio_final_regions_to_maplets,
-)
-from feature_extract.vfm.surface_depth_bank import (
-    TWO_DGS_SURFACE_DEPTH_BANK_FORMAT,
-    TwoDGSSurfaceDepthBank,
-)
-from feature_extract.tools.vfm.localize_2dgs_surface_queries import (
-    _direct_support_result_key,
-    _pose_disagreement,
-    _select_pose_by_geometric_support,
+    select_vfm_surface_feature_modes,
 )
 from feature_extract.vfm.surface_maplet_bank import (
     RadioFinalRegionConfig,
@@ -68,144 +52,6 @@ def _camera(width: int = 100, height: int = 100, focal: float = 80.0) -> ColmapC
         height=height,
         params=(focal, focal, width / 2.0, height / 2.0),
     )
-
-
-def test_direct_support_pose_selection_uses_geometric_evidence() -> None:
-    weaker_pose = np.eye(4, dtype=np.float64)
-    stronger_pose = np.eye(4, dtype=np.float64)
-    stronger_pose[0, 3] = 1.0
-    result = SurfacePoseResult(
-        success=True,
-        pose_w2c=weaker_pose,
-        hypotheses=(
-            SurfacePoseHypothesis(
-                pose_w2c=weaker_pose,
-                generation_score=50.0,
-                verification_score=20.0,
-                inlier_count=8,
-                source="weaker",
-            ),
-            SurfacePoseHypothesis(
-                pose_w2c=stronger_pose,
-                generation_score=10.0,
-                verification_score=5.0,
-                inlier_count=12,
-                source="stronger",
-            ),
-        ),
-        fit_mask=np.ones((16,), dtype=bool),
-        verification_mask=np.ones((4,), dtype=bool),
-    )
-    selected = _select_pose_by_geometric_support(result, minimum_selected_inliers=8)
-    assert selected.success
-    assert selected.hypotheses[0].source == "stronger"
-    np.testing.assert_allclose(selected.pose_w2c, stronger_pose)
-    assert _direct_support_result_key(
-        selected,
-        layout_inliers=20,
-        layout_median_residual=0.5,
-        support_rank=1,
-    ) > _direct_support_result_key(
-        result,
-        layout_inliers=20,
-        layout_median_residual=0.5,
-        support_rank=0,
-    )
-    translation, rotation = _pose_disagreement(weaker_pose, stronger_pose)
-    assert translation == pytest.approx(1.0)
-    assert rotation == pytest.approx(0.0)
-
-
-def test_pairwise_matches_lift_to_unique_2dgs_surface_anchors() -> None:
-    index = SurfaceAnchorObservationIndex(
-        image_ids=("support",),
-        row_offsets=np.asarray([0, 2], dtype=np.int64),
-        xy=np.asarray([[10.0, 10.0], [30.0, 30.0]], dtype=np.float32),
-        anchor_ids=np.asarray([101, 202], dtype=np.int64),
-        xyz=np.asarray(
-            [[0.0, 0.0, 5.0], [1.0, 0.0, 5.0]],
-            dtype=np.float64,
-        ),
-        observation_quality=np.ones((2,), dtype=np.float32),
-        _row_by_image={"support": 0},
-        _trees={},
-    )
-    pool = lift_pairwise_matches_to_surface_anchors(
-        query_xy=np.asarray(
-            [[11.0, 12.0], [12.0, 13.0], [31.0, 29.0], [50.0, 50.0]],
-            dtype=np.float32,
-        ),
-        support_xy=np.asarray(
-            [[10.0, 10.0], [11.0, 10.0], [30.0, 31.0], [50.0, 50.0]],
-            dtype=np.float32,
-        ),
-        confidence=np.asarray([0.7, 0.95, 0.8, 1.0], dtype=np.float32),
-        support_view_id="support",
-        observation_index=index,
-        maximum_support_distance_px=5.0,
-    )
-    assert len(pool) == 2
-    np.testing.assert_array_equal(pool.anchor_ids[:, 0], [101, 202])
-    np.testing.assert_allclose(pool.query_xy, [[12.0, 13.0], [31.0, 29.0]])
-    assert np.all(pool.valid_mask)
-
-
-def test_pairwise_matches_backproject_through_2dgs_depth() -> None:
-    camera = _camera(width=100, height=100, focal=80.0)
-    support_xy = np.asarray(
-        [[50.0, 50.0], [58.0, 50.0], [50.0, 58.0], [42.0, 50.0]],
-        dtype=np.float32,
-    )
-    pool = lift_pairwise_matches_with_2dgs_depth(
-        query_xy=support_xy,
-        support_xy=support_xy,
-        confidence=np.full((4,), 0.9, dtype=np.float32),
-        support_pose_w2c=np.eye(4, dtype=np.float64),
-        support_depth=np.full((100, 100), 5.0, dtype=np.float32),
-        camera=camera,
-        maximum_points=4,
-        query_nms_radius_px=0.0,
-    )
-    assert len(pool) == 4
-    expected = np.stack(
-        [
-            (pool.query_xy[:, 0] - 50.0) / 80.0 * 5.0,
-            (pool.query_xy[:, 1] - 50.0) / 80.0 * 5.0,
-            np.full((4,), 5.0),
-        ],
-        axis=1,
-    )
-    np.testing.assert_allclose(pool.xyz[:, 0], expected, atol=1e-6)
-
-
-def test_2dgs_surface_depth_bank_loads_lazily(tmp_path) -> None:
-    depth_path = tmp_path / "depth.npy"
-    np.save(depth_path, np.full((3, 4), 2.0, dtype=np.float32))
-    manifest = tmp_path / "manifest.json"
-    manifest.write_text(
-        json.dumps(
-            {
-                "format": TWO_DGS_SURFACE_DEPTH_BANK_FORMAT,
-                "width": 4,
-                "height": 3,
-                "records": [
-                    {
-                        "image_id": "mapping.png",
-                        "path": depth_path.name,
-                        "byte_size": depth_path.stat().st_size,
-                        "sha256": file_sha256_short(depth_path),
-                    }
-                ],
-                "metadata": {
-                    "uses_sfm_points": False,
-                    "uses_sfm_tracks": False,
-                    "uses_radio_intermediate": False,
-                },
-            }
-        )
-    )
-    bank = TwoDGSSurfaceDepthBank.load_json(manifest)
-    np.testing.assert_allclose(bank.depth_for_image("mapping.png"), 2.0)
 
 
 def _synthetic_surface_inputs():
@@ -390,6 +236,27 @@ def test_direct_vfm_support_layout_recovers_full_affine_geometry() -> None:
     np.testing.assert_allclose(estimated_translation, translation, atol=1e-5)
 
 
+def test_surface_feature_modes_are_map_only_and_can_be_maplet_scoped() -> None:
+    (
+        _surface,
+        _region_map,
+        observation_bank,
+        features,
+        _poses,
+        _cameras,
+    ) = _synthetic_surface_inputs()
+    modes, scores = select_vfm_surface_feature_modes(
+        features["view0"],
+        observation_bank,
+        maximum_global_modes=2,
+        maximum_modes=2,
+        allowed_mode_ids=("view1",),
+    )
+    assert modes == ("view1",)
+    assert scores.shape == (1,)
+    assert np.isfinite(scores).all()
+
+
 def test_surface_maplet_contrastive_supervision_and_disjoint_retrieval() -> None:
     descriptors = torch.tensor(
         [
@@ -523,6 +390,39 @@ def test_maplet_matching_uses_whole_image_support_layout() -> None:
     np.testing.assert_array_equal(result.selected_maplet_ids, maplets.maplet_ids)
     assert result.support_view_id in {"view0", "view1"}
     assert np.all(result.null_probabilities < np.max(result.candidate_probabilities, axis=1))
+
+
+def test_maplet_matching_can_skip_support_layout_for_point_aligned_vfm() -> None:
+    surface, region_map, observations, features, poses, cameras = _synthetic_surface_inputs()
+    maplets, _anchors, _summary = build_track_free_surface_map(
+        surface,
+        region_map,
+        observations,
+        features,
+        poses,
+        cameras,
+        primitive_quality=TwoDGSPrimitiveQuality.neutral(8),
+        build_config=SurfaceMapletBuildConfig(
+            min_anchor_views=2,
+            min_anchors_per_maplet=2,
+            max_anchors_per_maplet=4,
+            min_anchor_separation=0.01,
+        ),
+    )
+    result = match_radio_final_regions_to_maplets(
+        query_region_xy=np.asarray([[1, 1], [3, 3]], dtype=np.float32),
+        query_descriptors=maplets.descriptors.copy(),
+        query_grid_size=(5, 5),
+        bank=maplets,
+        config=SurfaceMapletMatchConfig(
+            top_k=2,
+            minimum_layout_pairs=2,
+            enable_support_layout=False,
+        ),
+    )
+    assert result.support_view_id is None
+    assert result.support_mode_view_ids == ()
+    assert np.all(np.isinf(result.layout_residuals))
 
 
 def test_local_anchor_candidates_are_conditioned_on_nearest_vfm_maplet() -> None:

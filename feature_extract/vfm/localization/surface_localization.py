@@ -51,6 +51,9 @@ class SurfaceMapletMatchConfig:
     layout_logit_weight: float = 2.0
     maximum_layout_models: int = 4096
     maximum_support_views: int = 64
+    maximum_layout_candidate_views: int = 32
+    maximum_layout_modes: int = 4
+    enable_support_layout: bool = True
 
     def __post_init__(self) -> None:
         if int(self.top_k) <= 0:
@@ -63,8 +66,12 @@ class SurfaceMapletMatchConfig:
             raise ValueError("layout_inlier_threshold must be positive")
         if int(self.maximum_layout_models) <= 0:
             raise ValueError("maximum_layout_models must be positive")
-        if int(self.maximum_support_views) <= 0:
-            raise ValueError("maximum_support_views must be positive")
+        if (
+            int(self.maximum_support_views) <= 0
+            or int(self.maximum_layout_candidate_views) <= 0
+            or int(self.maximum_layout_modes) <= 0
+        ):
+            raise ValueError("support-view/layout-mode counts must be positive")
 
 
 @dataclass(frozen=True)
@@ -79,6 +86,10 @@ class SurfaceMapletMatchResult:
     support_view_score: float
     support_transform_matrix: np.ndarray | None = None
     support_transform_translation: np.ndarray | None = None
+    support_mode_view_ids: tuple[str, ...] = ()
+    support_mode_scores: np.ndarray | None = None
+    support_mode_matrices: np.ndarray | None = None
+    support_mode_translations: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         candidate_ids = np.asarray(self.candidate_maplet_ids, dtype=np.int64)
@@ -109,6 +120,42 @@ class SurfaceMapletMatchResult:
             object.__setattr__(self, "support_transform_translation", translation)
         elif self.support_transform_translation is not None:
             raise ValueError("support transform translation requires a matrix")
+        mode_ids = tuple(str(value) for value in self.support_mode_view_ids)
+        mode_count = len(mode_ids)
+        mode_scores = np.asarray(
+            (
+                np.zeros((0,), dtype=np.float32)
+                if self.support_mode_scores is None
+                else self.support_mode_scores
+            ),
+            dtype=np.float32,
+        ).reshape(-1)
+        mode_matrices = np.asarray(
+            (
+                np.zeros((0, 2, 2), dtype=np.float64)
+                if self.support_mode_matrices is None
+                else self.support_mode_matrices
+            ),
+            dtype=np.float64,
+        )
+        mode_translations = np.asarray(
+            (
+                np.zeros((0, 2), dtype=np.float64)
+                if self.support_mode_translations is None
+                else self.support_mode_translations
+            ),
+            dtype=np.float64,
+        )
+        if (
+            mode_scores.shape != (mode_count,)
+            or mode_matrices.shape != (mode_count, 2, 2)
+            or mode_translations.shape != (mode_count, 2)
+        ):
+            raise ValueError("support layout modes have incompatible shapes")
+        object.__setattr__(self, "support_mode_view_ids", mode_ids)
+        object.__setattr__(self, "support_mode_scores", mode_scores)
+        object.__setattr__(self, "support_mode_matrices", mode_matrices)
+        object.__setattr__(self, "support_mode_translations", mode_translations)
 
 
 def _maplet_view_lookup(bank: VfmSurfaceMapletBank) -> tuple[list[dict[str, int]], dict[str, list[int]]]:
@@ -193,7 +240,13 @@ def _best_support_layout(
     bank: VfmSurfaceMapletBank,
     per_maplet_views: list[dict[str, int]],
     config: SurfaceMapletMatchConfig,
-) -> tuple[str | None, np.ndarray | None, np.ndarray | None, float]:
+) -> tuple[
+    str | None,
+    np.ndarray | None,
+    np.ndarray | None,
+    float,
+    tuple[tuple[str, float, np.ndarray, np.ndarray], ...],
+]:
     support_images = sorted(
         {
             image_id
@@ -205,7 +258,7 @@ def _best_support_layout(
     best_matrix = None
     best_translation = None
     best_score = -np.inf
-    model_count = 0
+    modes: list[tuple[str, float, np.ndarray, np.ndarray]] = []
     evidence_by_image: dict[str, tuple[list[int], list[np.ndarray], list[float]]] = {}
     for image_id in support_images:
         # A maplet has one representative location in a support view.  Allowing
@@ -242,17 +295,31 @@ def _best_support_layout(
             else float("inf"),
             image_id,
         ),
-    )[: int(config.maximum_support_views)]
+    )[
+        : min(
+            int(config.maximum_support_views),
+            int(config.maximum_layout_candidate_views),
+        )
+    ]
     for image_id in support_images:
         query_rows, support_points, similarities = evidence_by_image[image_id]
         if len(query_rows) < int(config.minimum_layout_pairs):
             continue
+        local_best_score = -np.inf
+        local_best_matrix = None
+        local_best_translation = None
+        model_count = 0
         query_points = query_xy_normalized[np.asarray(query_rows, dtype=np.int64)]
         support = np.stack(support_points, axis=0).astype(np.float64)
         similarity_values = np.asarray(similarities, dtype=np.float64)
+        per_view_model_budget = max(
+            128,
+            int(config.maximum_layout_models)
+            // max(len(support_images), 1),
+        )
         for left, right in combinations(range(len(query_rows)), 2):
             model_count += 1
-            if model_count > int(config.maximum_layout_models):
+            if model_count > per_view_model_budget:
                 break
             transform = _similarity_transform_from_pairs(
                 query_points[left], query_points[right], support[left], support[right]
@@ -284,9 +351,31 @@ def _best_support_layout(
                 best_image = image_id
                 best_matrix = matrix
                 best_translation = translation
-        if model_count > int(config.maximum_layout_models):
-            break
-    return best_image, best_matrix, best_translation, float(best_score)
+            if score > local_best_score:
+                local_best_score = score
+                local_best_matrix = matrix
+                local_best_translation = translation
+        if (
+            local_best_matrix is not None
+            and local_best_translation is not None
+        ):
+            modes.append(
+                (
+                    str(image_id),
+                    float(local_best_score),
+                    np.asarray(local_best_matrix, dtype=np.float64),
+                    np.asarray(local_best_translation, dtype=np.float64),
+                )
+            )
+    modes.sort(key=lambda item: (-item[1], item[0]))
+    modes = modes[: int(config.maximum_layout_modes)]
+    return (
+        best_image,
+        best_matrix,
+        best_translation,
+        float(best_score),
+        tuple(modes),
+    )
 
 
 def match_radio_final_regions_to_maplets(
@@ -335,34 +424,60 @@ def match_radio_final_regions_to_maplets(
     base_logits = np.take_along_axis(logits_full, columns, axis=1)
     candidate_ids = bank.maplet_ids[columns]
 
-    per_maplet_views, _rows_by_image = _maplet_view_lookup(bank)
-    query_normalized = _normalized_xy(query_xy, query_grid_size)
-    support_view, matrix, translation, support_score = _best_support_layout(
-        query_normalized,
-        columns,
-        base_logits,
-        bank,
-        per_maplet_views,
-        config,
-    )
     layout_residuals = np.full(candidate_ids.shape, np.inf, dtype=np.float32)
     final_logits = np.asarray(base_logits, dtype=np.float64).copy()
-    if support_view is not None and matrix is not None and translation is not None:
-        predicted = query_normalized @ matrix.T + translation
-        for query_row in range(query_count):
-            for column in range(keep):
-                maplet_row = int(columns[query_row, column])
-                view_row = per_maplet_views[maplet_row].get(support_view)
-                if view_row is None:
-                    continue
-                support_xy = _normalized_xy(bank.view_token_xy[view_row], bank.view_grid_sizes[view_row])
-                residual = float(np.linalg.norm(predicted[query_row] - support_xy))
-                layout_residuals[query_row, column] = residual
-                compatibility = max(
-                    0.0,
-                    1.0 - residual / float(config.layout_inlier_threshold),
-                )
-                final_logits[query_row, column] += float(config.layout_logit_weight) * compatibility
+    support_view: str | None = None
+    matrix: np.ndarray | None = None
+    translation: np.ndarray | None = None
+    support_score = float("-inf")
+    support_modes: tuple[
+        tuple[str, float, np.ndarray, np.ndarray], ...
+    ] = ()
+    if bool(config.enable_support_layout):
+        per_maplet_views, _rows_by_image = _maplet_view_lookup(bank)
+        query_normalized = _normalized_xy(query_xy, query_grid_size)
+        (
+            support_view,
+            matrix,
+            translation,
+            support_score,
+            support_modes,
+        ) = _best_support_layout(
+            query_normalized,
+            columns,
+            base_logits,
+            bank,
+            per_maplet_views,
+            config,
+        )
+        if (
+            support_view is not None
+            and matrix is not None
+            and translation is not None
+        ):
+            predicted = query_normalized @ matrix.T + translation
+            for query_row in range(query_count):
+                for column in range(keep):
+                    maplet_row = int(columns[query_row, column])
+                    view_row = per_maplet_views[maplet_row].get(support_view)
+                    if view_row is None:
+                        continue
+                    support_xy = _normalized_xy(
+                        bank.view_token_xy[view_row],
+                        bank.view_grid_sizes[view_row],
+                    )
+                    residual = float(
+                        np.linalg.norm(predicted[query_row] - support_xy)
+                    )
+                    layout_residuals[query_row, column] = residual
+                    compatibility = max(
+                        0.0,
+                        1.0
+                        - residual / float(config.layout_inlier_threshold),
+                    )
+                    final_logits[query_row, column] += (
+                        float(config.layout_logit_weight) * compatibility
+                    )
     null_logits = np.full((query_count,), float(config.null_logit), dtype=np.float64)
     probabilities, null_probabilities = _softmax_with_null(final_logits, null_logits)
     best_columns = np.argmax(probabilities, axis=1)
@@ -380,6 +495,20 @@ def match_radio_final_regions_to_maplets(
         support_view_score=support_score,
         support_transform_matrix=matrix,
         support_transform_translation=translation,
+        support_mode_view_ids=tuple(item[0] for item in support_modes),
+        support_mode_scores=np.asarray(
+            [item[1] for item in support_modes], dtype=np.float32
+        ),
+        support_mode_matrices=(
+            np.stack([item[2] for item in support_modes])
+            if support_modes
+            else np.zeros((0, 2, 2), dtype=np.float64)
+        ),
+        support_mode_translations=(
+            np.stack([item[3] for item in support_modes])
+            if support_modes
+            else np.zeros((0, 2), dtype=np.float64)
+        ),
     )
 
 
@@ -590,296 +719,6 @@ class SurfaceAnchorCandidatePool:
 
     def __len__(self) -> int:
         return int(self.query_xy.shape[0])
-
-
-@dataclass
-class SurfaceAnchorObservationIndex:
-    """Spatial index for lifting pairwise image matches to stable 2DGS anchors."""
-
-    image_ids: tuple[str, ...]
-    row_offsets: np.ndarray
-    xy: np.ndarray
-    anchor_ids: np.ndarray
-    xyz: np.ndarray
-    observation_quality: np.ndarray
-    _row_by_image: dict[str, int]
-    _trees: dict[str, cKDTree]
-
-    @classmethod
-    def from_anchor_map(
-        cls,
-        anchors: StableSurfaceAnchorMap,
-    ) -> "SurfaceAnchorObservationIndex":
-        best_by_image: dict[
-            str,
-            dict[int, tuple[float, np.ndarray, np.ndarray]],
-        ] = {}
-        for anchor_row, anchor_id_value in enumerate(anchors.anchor_ids.tolist()):
-            anchor_id = int(anchor_id_value)
-            start = int(anchors.observation_offsets[anchor_row])
-            end = int(anchors.observation_offsets[anchor_row + 1])
-            for observation_row in range(start, end):
-                image_id = str(anchors.observation_image_ids[observation_row])
-                quality = float(anchors.observation_weights[observation_row])
-                previous = best_by_image.setdefault(image_id, {}).get(anchor_id)
-                if previous is None or quality > previous[0]:
-                    best_by_image[image_id][anchor_id] = (
-                        quality,
-                        np.asarray(
-                            anchors.observation_xy[observation_row],
-                            dtype=np.float32,
-                        ),
-                        np.asarray(anchors.xyz[anchor_row], dtype=np.float64),
-                    )
-        image_ids = tuple(sorted(best_by_image))
-        offsets = [0]
-        xy: list[np.ndarray] = []
-        anchor_ids: list[int] = []
-        xyz: list[np.ndarray] = []
-        quality: list[float] = []
-        for image_id in image_ids:
-            for anchor_id, (score, point, center) in sorted(
-                best_by_image[image_id].items()
-            ):
-                anchor_ids.append(int(anchor_id))
-                xy.append(point)
-                xyz.append(center)
-                quality.append(float(score))
-            offsets.append(len(anchor_ids))
-        return cls(
-            image_ids=image_ids,
-            row_offsets=np.asarray(offsets, dtype=np.int64),
-            xy=(
-                np.stack(xy).astype(np.float32)
-                if xy
-                else np.zeros((0, 2), dtype=np.float32)
-            ),
-            anchor_ids=np.asarray(anchor_ids, dtype=np.int64),
-            xyz=(
-                np.stack(xyz).astype(np.float64)
-                if xyz
-                else np.zeros((0, 3), dtype=np.float64)
-            ),
-            observation_quality=np.asarray(quality, dtype=np.float32),
-            _row_by_image={
-                image_id: row for row, image_id in enumerate(image_ids)
-            },
-            _trees={},
-        )
-
-    def rows_for_image(self, image_id: str) -> slice | None:
-        row = self._row_by_image.get(str(image_id))
-        if row is None:
-            return None
-        return slice(int(self.row_offsets[row]), int(self.row_offsets[row + 1]))
-
-    def tree_for_image(self, image_id: str) -> cKDTree | None:
-        rows = self.rows_for_image(str(image_id))
-        if rows is None or rows.start == rows.stop:
-            return None
-        tree = self._trees.get(str(image_id))
-        if tree is None:
-            tree = cKDTree(self.xy[rows])
-            self._trees[str(image_id)] = tree
-        return tree
-
-
-def lift_pairwise_matches_to_surface_anchors(
-    query_xy: np.ndarray,
-    support_xy: np.ndarray,
-    confidence: np.ndarray,
-    *,
-    support_view_id: str,
-    observation_index: SurfaceAnchorObservationIndex,
-    maximum_support_distance_px: float = 5.0,
-) -> SurfaceAnchorCandidatePool:
-    """Attach VFM-shortlisted pair matches to stable 2DGS observations."""
-
-    query = np.asarray(query_xy, dtype=np.float32).reshape(-1, 2)
-    support = np.asarray(support_xy, dtype=np.float32).reshape(-1, 2)
-    scores = np.asarray(confidence, dtype=np.float32).reshape(-1)
-    if (
-        query.shape != support.shape
-        or len(scores) != len(query)
-        or float(maximum_support_distance_px) <= 0.0
-        or np.any(~np.isfinite(query))
-        or np.any(~np.isfinite(support))
-        or np.any(~np.isfinite(scores))
-    ):
-        raise ValueError("pairwise surface-lifting inputs are invalid")
-    rows = observation_index.rows_for_image(str(support_view_id))
-    tree = observation_index.tree_for_image(str(support_view_id))
-    if rows is None or tree is None or len(query) == 0:
-        return SurfaceAnchorCandidatePool(
-            query_xy=np.zeros((0, 2), dtype=np.float32),
-            anchor_ids=np.zeros((0, 1), dtype=np.int64),
-            xyz=np.zeros((0, 1, 3), dtype=np.float64),
-            descriptor_scores=np.zeros((0, 1), dtype=np.float32),
-            candidate_probabilities=np.zeros((0, 1), dtype=np.float32),
-            null_probabilities=np.zeros((0,), dtype=np.float32),
-            valid_mask=np.zeros((0, 1), dtype=bool),
-        )
-    distances, local_rows = tree.query(support, k=1)
-    candidate_rows = np.arange(int(rows.start), int(rows.stop), dtype=np.int64)
-    global_rows = candidate_rows[np.asarray(local_rows, dtype=np.int64)]
-    valid = np.isfinite(distances) & (
-        distances <= float(maximum_support_distance_px)
-    )
-    best_by_anchor: dict[int, tuple[float, float, int, int]] = {}
-    for match_row in np.flatnonzero(valid).tolist():
-        anchor_row = int(global_rows[match_row])
-        anchor_id = int(observation_index.anchor_ids[anchor_row])
-        rank_score = (
-            float(scores[match_row])
-            * float(observation_index.observation_quality[anchor_row])
-            * np.exp(
-                -0.5
-                * (
-                    float(distances[match_row])
-                    / float(maximum_support_distance_px)
-                )
-                ** 2
-            )
-        )
-        previous = best_by_anchor.get(anchor_id)
-        record = (
-            float(rank_score),
-            -float(distances[match_row]),
-            int(match_row),
-            int(anchor_row),
-        )
-        if previous is None or record[:2] > previous[:2]:
-            best_by_anchor[anchor_id] = record
-    selected = sorted(best_by_anchor.values(), key=lambda item: item[2])
-    if not selected:
-        return SurfaceAnchorCandidatePool(
-            query_xy=np.zeros((0, 2), dtype=np.float32),
-            anchor_ids=np.zeros((0, 1), dtype=np.int64),
-            xyz=np.zeros((0, 1, 3), dtype=np.float64),
-            descriptor_scores=np.zeros((0, 1), dtype=np.float32),
-            candidate_probabilities=np.zeros((0, 1), dtype=np.float32),
-            null_probabilities=np.zeros((0,), dtype=np.float32),
-            valid_mask=np.zeros((0, 1), dtype=bool),
-        )
-    match_rows = np.asarray([item[2] for item in selected], dtype=np.int64)
-    anchor_rows = np.asarray([item[3] for item in selected], dtype=np.int64)
-    probabilities = np.clip(scores[match_rows], 1e-3, 1.0).reshape(-1, 1)
-    return SurfaceAnchorCandidatePool(
-        query_xy=query[match_rows],
-        anchor_ids=observation_index.anchor_ids[anchor_rows, None],
-        xyz=observation_index.xyz[anchor_rows, None, :],
-        descriptor_scores=scores[match_rows, None],
-        candidate_probabilities=probabilities,
-        null_probabilities=(1.0 - probabilities[:, 0]),
-        valid_mask=np.ones((len(match_rows), 1), dtype=bool),
-    )
-
-
-def lift_pairwise_matches_with_2dgs_depth(
-    query_xy: np.ndarray,
-    support_xy: np.ndarray,
-    confidence: np.ndarray,
-    *,
-    support_pose_w2c: np.ndarray,
-    support_depth: np.ndarray,
-    camera,
-    maximum_points: int = 768,
-    query_nms_radius_px: float = 2.0,
-) -> SurfaceAnchorCandidatePool:
-    """Backproject pairwise support endpoints through official 2DGS depth."""
-
-    import cv2
-
-    from feature_extract.vfm.localization.real_image_observation_features import (
-        spatially_diverse_detection_indices,
-    )
-
-    query = np.asarray(query_xy, dtype=np.float32).reshape(-1, 2)
-    support = np.asarray(support_xy, dtype=np.float32).reshape(-1, 2)
-    scores = np.asarray(confidence, dtype=np.float32).reshape(-1)
-    depth = np.asarray(support_depth)
-    if (
-        query.shape != support.shape
-        or len(scores) != len(query)
-        or depth.shape != (int(camera.height), int(camera.width))
-        or int(maximum_points) <= 0
-        or float(query_nms_radius_px) < 0.0
-        or np.any(~np.isfinite(query))
-        or np.any(~np.isfinite(support))
-        or np.any(~np.isfinite(scores))
-    ):
-        raise ValueError("2DGS depth-lifting inputs are invalid")
-    matrix, distortion = camera_matrix_and_distortion(camera)
-    undistorted = cv2.undistortPoints(
-        support.reshape(-1, 1, 2).astype(np.float64),
-        np.asarray(matrix, dtype=np.float64),
-        np.asarray(distortion, dtype=np.float64),
-        P=np.asarray(matrix, dtype=np.float64),
-    ).reshape(-1, 2)
-    x = np.clip(undistorted[:, 0], 0.0, float(camera.width - 1))
-    y = np.clip(undistorted[:, 1], 0.0, float(camera.height - 1))
-    x0 = np.floor(x).astype(np.int64)
-    y0 = np.floor(y).astype(np.int64)
-    x1 = np.minimum(x0 + 1, int(camera.width - 1))
-    y1 = np.minimum(y0 + 1, int(camera.height - 1))
-    wx = x - x0
-    wy = y - y0
-    z = (
-        (1.0 - wx) * (1.0 - wy) * depth[y0, x0]
-        + wx * (1.0 - wy) * depth[y0, x1]
-        + (1.0 - wx) * wy * depth[y1, x0]
-        + wx * wy * depth[y1, x1]
-    )
-    valid = np.isfinite(z) & (z > 0.0)
-    if not np.any(valid):
-        return SurfaceAnchorCandidatePool(
-            query_xy=np.zeros((0, 2), dtype=np.float32),
-            anchor_ids=np.zeros((0, 1), dtype=np.int64),
-            xyz=np.zeros((0, 1, 3), dtype=np.float64),
-            descriptor_scores=np.zeros((0, 1), dtype=np.float32),
-            candidate_probabilities=np.zeros((0, 1), dtype=np.float32),
-            null_probabilities=np.zeros((0,), dtype=np.float32),
-            valid_mask=np.zeros((0, 1), dtype=bool),
-        )
-    selected_valid = np.flatnonzero(valid)
-    selected_local = spatially_diverse_detection_indices(
-        query[selected_valid],
-        scores[selected_valid],
-        top_k=min(int(maximum_points), int(np.sum(valid))),
-        nms_radius_px=float(query_nms_radius_px),
-        image_width=int(camera.width),
-        image_height=int(camera.height),
-        grid_rows=8,
-        grid_cols=8,
-    )
-    selected = selected_valid[selected_local]
-    selected_z = z[selected]
-    selected_support = undistorted[selected]
-    fx = float(matrix[0, 0])
-    fy = float(matrix[1, 1])
-    cx = float(matrix[0, 2])
-    cy = float(matrix[1, 2])
-    camera_xyz = np.stack(
-        [
-            (selected_support[:, 0] - cx) / fx * selected_z,
-            (selected_support[:, 1] - cy) / fy * selected_z,
-            selected_z,
-        ],
-        axis=1,
-    )
-    pose = np.asarray(support_pose_w2c, dtype=np.float64).reshape(4, 4)
-    world_xyz = (camera_xyz - pose[:3, 3]) @ pose[:3, :3]
-    selected_scores = scores[selected]
-    probabilities = np.clip(selected_scores, 1e-3, 1.0).reshape(-1, 1)
-    return SurfaceAnchorCandidatePool(
-        query_xy=query[selected],
-        anchor_ids=np.arange(len(selected), dtype=np.int64).reshape(-1, 1),
-        xyz=world_xyz.reshape(-1, 1, 3),
-        descriptor_scores=selected_scores.reshape(-1, 1),
-        candidate_probabilities=probabilities,
-        null_probabilities=(1.0 - probabilities[:, 0]),
-        valid_mask=np.ones((len(selected), 1), dtype=bool),
-    )
 
 
 @dataclass(frozen=True)
@@ -1112,6 +951,82 @@ def build_vfm_surface_observation_candidate_pool(
         ),
         tuple(item[1] for item in selected_views),
         np.asarray([item[0] for item in selected_views], dtype=np.float32),
+    )
+
+
+def select_vfm_surface_feature_modes(
+    query_feature_map: np.ndarray,
+    observation_bank: Vfm2DgsObservationBank,
+    *,
+    maximum_global_modes: int = 64,
+    maximum_modes: int = 8,
+    allowed_mode_ids: Sequence[str] | None = None,
+    observation_index: VfmSurfaceObservationIndex | None = None,
+) -> tuple[tuple[str, ...], np.ndarray]:
+    """Select view-conditioned RADIO-final map modes without reading images.
+
+    Image IDs are persistent labels for appearance/visibility modes stored in
+    the feature-bearing 2DGS map.  This function consumes only cached surface
+    descriptors; it neither accepts nor opens mapping RGB paths.
+    """
+
+    feature_map = np.asarray(query_feature_map, dtype=np.float32)
+    if feature_map.ndim == 4 and int(feature_map.shape[0]) == 1:
+        feature_map = feature_map[0]
+    if feature_map.ndim != 3:
+        raise ValueError("query_feature_map must have shape (C,H,W)")
+    if int(maximum_global_modes) <= 0 or int(maximum_modes) <= 0:
+        raise ValueError("surface feature-mode limits must be positive")
+    channels = int(feature_map.shape[0])
+    query_descriptors = _normalize_rows(
+        feature_map.transpose(1, 2, 0).reshape(-1, channels)
+    )
+    index = (
+        VfmSurfaceObservationIndex.from_bank(observation_bank)
+        if observation_index is None
+        else observation_index
+    )
+    if channels != int(index.descriptors.shape[1]):
+        raise ValueError("query and surface feature-mode dimensions differ")
+    allowed = (
+        None
+        if allowed_mode_ids is None
+        else {str(value) for value in allowed_mode_ids}
+    )
+    query_global = _normalize_rows(
+        np.mean(query_descriptors, axis=0, keepdims=True)
+    )[0]
+    global_values = index.global_descriptors @ query_global
+    global_scores = [
+        (float(global_values[row]), image_id)
+        for row, image_id in enumerate(index.image_ids)
+        if allowed is None or image_id in allowed
+    ]
+    global_scores.sort(key=lambda item: (-item[0], item[1]))
+    shortlisted = global_scores[: int(maximum_global_modes)]
+    reranked: list[tuple[float, str]] = []
+    for global_score, image_id in shortlisted:
+        rows = index.rows_for_image(image_id)
+        if len(rows) == 0:
+            continue
+        similarities = query_descriptors @ index.descriptors[rows].T
+        support_coverage = np.max(similarities, axis=0)
+        coverage_keep = min(64, len(support_coverage))
+        coverage_score = float(
+            np.mean(
+                np.partition(support_coverage, -coverage_keep)[
+                    -coverage_keep:
+                ]
+            )
+        )
+        reranked.append(
+            (coverage_score + 0.15 * float(global_score), image_id)
+        )
+    reranked.sort(key=lambda item: (-item[0], item[1]))
+    selected = reranked[: int(maximum_modes)]
+    return (
+        tuple(item[1] for item in selected),
+        np.asarray([item[0] for item in selected], dtype=np.float32),
     )
 
 
@@ -1714,6 +1629,7 @@ def predict_vfm_support_anchor_query_points(
     query_to_support_translation: np.ndarray,
     anchors: StableSurfaceAnchorMap,
     descriptor_bank: AnchorLocalDescriptorBank,
+    allowed_anchor_ids: Sequence[int] | np.ndarray | None = None,
     maximum_points: int = 512,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Transfer visible support anchors and their ALIKE prototypes to a query."""
@@ -1740,9 +1656,21 @@ def predict_vfm_support_anchor_query_points(
     )
     grid_to_pixel = 1.0 / pixel_to_grid
     anchor_row_by_id = anchors.row_by_id()
+    allowed = (
+        None
+        if allowed_anchor_ids is None
+        else {
+            int(value)
+            for value in np.asarray(allowed_anchor_ids, dtype=np.int64)
+            .reshape(-1)
+            .tolist()
+        }
+    )
     records: list[tuple[float, int, np.ndarray, np.ndarray]] = []
     for descriptor_row, anchor_id_value in enumerate(descriptor_bank.anchor_ids.tolist()):
         anchor_id = int(anchor_id_value)
+        if allowed is not None and anchor_id not in allowed:
+            continue
         anchor_row = anchor_row_by_id.get(anchor_id)
         if anchor_row is None:
             continue
@@ -1904,6 +1832,7 @@ def build_pose_guided_surface_anchor_candidate_pool(
     camera,
     descriptor_bank: AnchorLocalDescriptorBank,
     anchors: StableSurfaceAnchorMap,
+    allowed_anchor_ids: Sequence[int] | np.ndarray | None = None,
     top_l: int = 5,
     search_radius_px: float = 32.0,
     maximum_query_points: int = 768,
@@ -1926,10 +1855,23 @@ def build_pose_guided_surface_anchor_candidate_pool(
     if query.descriptors.shape[1] != descriptor_bank.feature_dim:
         raise ValueError("query and support local descriptor dimensions differ")
     anchor_row_by_id = anchors.row_by_id()
+    allowed = (
+        None
+        if allowed_anchor_ids is None
+        else {
+            int(value)
+            for value in np.asarray(allowed_anchor_ids, dtype=np.int64)
+            .reshape(-1)
+            .tolist()
+        }
+    )
     descriptor_anchor_rows: list[int] = []
     descriptor_rows: list[int] = []
     for descriptor_row, anchor_id_value in enumerate(descriptor_bank.anchor_ids.tolist()):
-        anchor_row = anchor_row_by_id.get(int(anchor_id_value))
+        anchor_id = int(anchor_id_value)
+        if allowed is not None and anchor_id not in allowed:
+            continue
+        anchor_row = anchor_row_by_id.get(anchor_id)
         if anchor_row is not None:
             descriptor_rows.append(descriptor_row)
             descriptor_anchor_rows.append(anchor_row)
@@ -2440,7 +2382,13 @@ def generate_grouped_surface_pose_hypotheses(
             verification_mask=verification,
             failure_reason="no_valid_surface_pose_hypothesis",
         )
-    if int(hypotheses[0].inlier_count) < int(config.minimum_selected_inliers):
+    feasible = [
+        hypothesis
+        for hypothesis in hypotheses
+        if int(hypothesis.inlier_count)
+        >= int(config.minimum_selected_inliers)
+    ]
+    if not feasible:
         return SurfacePoseResult(
             success=False,
             pose_w2c=np.eye(4),
@@ -2449,9 +2397,22 @@ def generate_grouped_surface_pose_hypotheses(
             verification_mask=verification,
             failure_reason="insufficient_selected_pose_inliers",
         )
+    # Reprojection support is a hard geometric feasibility condition.  Within
+    # that feasible set, retain the independent held-out ordering used above.
+    # This prevents a slightly better held-out score with too few fit inliers
+    # from suppressing every geometrically valid mode.
+    selected = feasible[0]
+    hypotheses = [
+        selected,
+        *[
+            hypothesis
+            for hypothesis in hypotheses
+            if hypothesis is not selected
+        ],
+    ]
     return SurfacePoseResult(
         success=True,
-        pose_w2c=hypotheses[0].pose_w2c,
+        pose_w2c=selected.pose_w2c,
         hypotheses=tuple(hypotheses),
         fit_mask=fit,
         verification_mask=verification,
