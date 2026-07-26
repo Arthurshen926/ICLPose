@@ -1993,7 +1993,7 @@ def build_pose_guided_surface_anchor_candidate_pool(
 class SurfacePoseConfig:
     random_seed: int = 7
     hypothesis_count: int = 256
-    minimal_sample_size: int = 6
+    minimal_sample_size: int = 4
     minimum_fit_groups: int = 8
     minimum_verification_groups: int = 4
     reprojection_sigma_px: float = 3.0
@@ -2004,6 +2004,9 @@ class SurfacePoseConfig:
     duplicate_translation_m: float = 0.02
     duplicate_rotation_deg: float = 0.25
     minimum_selected_inliers: int = 8
+    soft_em_iterations: int = 3
+    soft_em_minimum_responsibility: float = 0.01
+    soft_em_maximum_residual_px: float = 12.0
 
     def __post_init__(self) -> None:
         if int(self.hypothesis_count) <= 0:
@@ -2018,6 +2021,12 @@ class SurfacePoseConfig:
             raise ValueError("heldout_stride must be at least two")
         if int(self.minimum_selected_inliers) < 4:
             raise ValueError("minimum_selected_inliers must be at least four")
+        if int(self.soft_em_iterations) < 0:
+            raise ValueError("soft_em_iterations must be non-negative")
+        if not 0.0 <= float(self.soft_em_minimum_responsibility) <= 1.0:
+            raise ValueError("soft EM responsibility threshold must be in [0, 1]")
+        if float(self.soft_em_maximum_residual_px) <= 0.0:
+            raise ValueError("soft EM residual threshold must be positive")
 
 
 @dataclass(frozen=True)
@@ -2186,9 +2195,18 @@ def _refine_pose_from_pool(
     del score
     best_columns = np.argmax(posterior, axis=1)
     best_posterior = posterior[np.arange(len(pool)), best_columns]
+    posterior_null = np.maximum(
+        0.0,
+        1.0 - np.sum(posterior, axis=1),
+    )
     rows = np.flatnonzero(
         np.asarray(fit_mask, dtype=bool)
-        & (best_posterior > pool.null_probabilities)
+        # `posterior` already includes geometric likelihood and the explicit
+        # null likelihood.  Comparing it with the *prior* null probability
+        # mixes two different distributions and rejects every correspondence
+        # when the scene-level maplet posterior is diffuse.  Compare posterior
+        # identity and posterior null mass in the same distribution.
+        & (best_posterior > posterior_null)
         & (residual[np.arange(len(pool)), best_columns] <= float(config.inlier_threshold_px))
     )
     if rows.size < 4:
@@ -2214,6 +2232,126 @@ def _refine_pose_from_pool(
     return (pose if refined is None else refined), int(rows.size)
 
 
+def _soft_refine_pose_from_pool(
+    pool: SurfaceAnchorCandidatePool,
+    pose: np.ndarray,
+    camera,
+    fit_mask: np.ndarray,
+    config: SurfacePoseConfig,
+) -> tuple[np.ndarray, int]:
+    """Latent soft-responsibility EM with one total unit of mass per query."""
+
+    import cv2
+    from scipy.optimize import least_squares
+
+    current = np.asarray(pose, dtype=np.float64).reshape(4, 4).copy()
+    matrix, distortion = camera_matrix_and_distortion(camera)
+    mask = np.asarray(fit_mask, dtype=bool).reshape(-1)
+    final_inliers = 0
+    for _iteration in range(int(config.soft_em_iterations)):
+        _score, residual, posterior = score_surface_pose(
+            pool, current, camera, mask, config
+        )
+        pair_valid = (
+            pool.valid_mask
+            & mask[:, None]
+            & (
+                posterior
+                >= float(config.soft_em_minimum_responsibility)
+            )
+            & (
+                residual
+                <= float(config.soft_em_maximum_residual_px)
+            )
+        )
+        query_rows, columns = np.nonzero(pair_valid)
+        if len(query_rows) < 4 or len(np.unique(query_rows)) < 4:
+            break
+        responsibilities = posterior[query_rows, columns].astype(np.float64)
+        # The posterior already includes the explicit null and therefore sums
+        # to at most one for every query.  Renormalizing here would undo the
+        # dustbin and over-weight ambiguous query points.
+        xyz = pool.xyz[query_rows, columns].astype(np.float64)
+        xy = pool.query_xy[query_rows].astype(np.float64)
+        rvec, _jacobian = cv2.Rodrigues(current[:3, :3])
+        initial = np.concatenate(
+            [rvec.reshape(3), current[:3, 3].reshape(3)]
+        )
+
+        def residual_function(parameters: np.ndarray) -> np.ndarray:
+            projected, _jacobian = cv2.projectPoints(
+                xyz,
+                parameters[:3].reshape(3, 1),
+                parameters[3:6].reshape(3, 1),
+                matrix,
+                distortion,
+            )
+            delta = projected.reshape(-1, 2) - xy
+            return (
+                np.sqrt(np.maximum(responsibilities, 1e-8))[:, None]
+                * delta
+            ).reshape(-1)
+
+        optimized = least_squares(
+            residual_function,
+            initial,
+            method="trf",
+            loss="huber",
+            f_scale=float(config.reprojection_sigma_px),
+            max_nfev=40,
+        )
+        if not bool(optimized.success) or not np.isfinite(optimized.x).all():
+            break
+        rotation, _jacobian = cv2.Rodrigues(
+            optimized.x[:3].reshape(3, 1)
+        )
+        updated = np.eye(4, dtype=np.float64)
+        updated[:3, :3] = rotation
+        updated[:3, 3] = optimized.x[3:6]
+        translation_delta, rotation_delta = _pose_distance(current, updated)
+        current = updated
+        best_columns = np.argmax(posterior, axis=1)
+        final_inliers = int(
+            np.sum(
+                mask
+                & (
+                    residual[np.arange(len(pool)), best_columns]
+                    <= float(config.inlier_threshold_px)
+                )
+            )
+        )
+        if translation_delta < 1e-5 and rotation_delta < 1e-3:
+            break
+    return current, int(final_inliers)
+
+
+def _deterministic_crossfit_masks(
+    pool: SurfaceAnchorCandidatePool,
+    heldout_stride: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Partition by top anchor identity, independent of detector row order."""
+
+    query_count = len(pool)
+    top_columns = np.argmax(
+        np.where(
+            pool.valid_mask,
+            pool.candidate_probabilities,
+            -np.inf,
+        ),
+        axis=1,
+    )
+    top_ids = pool.anchor_ids[np.arange(query_count), top_columns]
+    cell_xy = np.floor(pool.query_xy / 48.0).astype(np.int64)
+    identity_hash = np.where(
+        np.any(pool.valid_mask, axis=1),
+        np.asarray(top_ids, dtype=np.int64) * 2_654_435_761,
+        cell_xy[:, 0] * 73_856_093 + cell_xy[:, 1] * 19_349_663,
+    )
+    verification = np.mod(np.abs(identity_hash), int(heldout_stride)) == 0
+    fit = ~verification
+    return fit.astype(bool), verification.astype(bool)
+
+
 def generate_grouped_surface_pose_hypotheses(
     pool: SurfaceAnchorCandidatePool,
     camera,
@@ -2225,9 +2363,9 @@ def generate_grouped_surface_pose_hypotheses(
 
     query_count = len(pool)
     if fit_mask is None and verification_mask is None:
-        verification = np.zeros((query_count,), dtype=bool)
-        verification[np.arange(query_count) % int(config.heldout_stride) == 0] = True
-        fit = ~verification
+        fit, verification = _deterministic_crossfit_masks(
+            pool, int(config.heldout_stride)
+        )
     elif fit_mask is None or verification_mask is None:
         raise ValueError("fit_mask and verification_mask must be provided together")
     else:
@@ -2402,6 +2540,41 @@ def generate_grouped_surface_pose_hypotheses(
     # This prevents a slightly better held-out score with too few fit inliers
     # from suppressing every geometrically valid mode.
     selected = feasible[0]
+    if int(config.soft_em_iterations) > 0:
+        soft_pose, soft_inliers = _soft_refine_pose_from_pool(
+            pool,
+            selected.pose_w2c,
+            camera,
+            fit,
+            config,
+        )
+        soft_generation, _residual, _posterior = score_surface_pose(
+            pool, soft_pose, camera, fit, config
+        )
+        soft_verification, _residual, _posterior = score_surface_pose(
+            pool, soft_pose, camera, verification, config
+        )
+        soft_hypothesis = SurfacePoseHypothesis(
+            pose_w2c=soft_pose,
+            generation_score=soft_generation,
+            verification_score=soft_verification,
+            inlier_count=max(int(soft_inliers), int(selected.inlier_count)),
+            source=f"{selected.source}_soft_em",
+        )
+        if (
+            int(soft_hypothesis.inlier_count)
+            >= int(config.minimum_selected_inliers)
+            and (
+                float(soft_hypothesis.verification_score),
+                float(soft_hypothesis.generation_score),
+            )
+            > (
+                float(selected.verification_score),
+                float(selected.generation_score),
+            )
+        ):
+            selected = soft_hypothesis
+            hypotheses.insert(0, soft_hypothesis)
     hypotheses = [
         selected,
         *[

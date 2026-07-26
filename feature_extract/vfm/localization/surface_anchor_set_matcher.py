@@ -188,6 +188,7 @@ def _episode_anchor_ids(
     descriptor_bank: AnchorLocalDescriptorBank,
     maplet_id: int,
     maximum_anchors: int,
+    feature_preferred_base_fill_target: int | None = None,
 ) -> np.ndarray:
     maplet_row = _maplet_row(maplets, int(maplet_id))
     start = int(maplets.anchor_offsets[maplet_row])
@@ -206,6 +207,25 @@ def _episode_anchor_ids(
             continue
         candidates.append((float(anchors.quality_scores[anchor_row]), anchor_id))
     candidates.sort(key=lambda item: (-item[0], item[1]))
+    if feature_preferred_base_fill_target is not None:
+        feature = [
+            item for item in candidates if int(item[1]) >= 1_000_000_000
+        ][: int(maximum_anchors)]
+        geometry_first = [
+            item for item in candidates if int(item[1]) < 1_000_000_000
+        ]
+        fill_target = min(
+            int(maximum_anchors),
+            max(
+                len(feature),
+                int(feature_preferred_base_fill_target),
+            ),
+        )
+        candidates = [
+            *feature,
+            *geometry_first[: max(fill_target - len(feature), 0)],
+        ]
+        candidates.sort(key=lambda item: (-item[0], item[1]))
     return np.asarray(
         [item[1] for item in candidates[: int(maximum_anchors)]],
         dtype=np.int64,
@@ -226,6 +246,7 @@ def build_surface_anchor_episode(
     config: SurfaceAnchorSetMatcherConfig,
     target_anchor_ids: np.ndarray | None = None,
     excluded_support_image_ids: Sequence[str] = (),
+    feature_preferred_base_fill_target: int | None = None,
 ) -> tuple[LocalAssignmentEpisode, SurfaceAnchorEpisodeIndex]:
     """Build one maplet-conditioned set episode without reading mapping RGB."""
 
@@ -260,6 +281,7 @@ def build_surface_anchor_episode(
         descriptor_bank,
         int(maplet_id),
         int(config.maximum_anchors),
+        feature_preferred_base_fill_target,
     )
     if len(anchor_ids) < 4:
         raise ValueError("maplet has fewer than four deployable stable anchors")
@@ -473,6 +495,7 @@ def match_query_to_surface_anchors(
     device: str | torch.device,
     top_l: int = 5,
     query_aligned_maplet_match: SurfaceMapletMatchResult | None = None,
+    feature_preferred_base_fill_target: int | None = None,
 ) -> tuple[SurfaceAnchorCandidatePool, dict[str, object]]:
     """Run maplet-first feature-only partial assignment over query ALIKE sets."""
 
@@ -529,7 +552,10 @@ def match_query_to_surface_anchors(
                 )
                 entry["rows"].append(int(query_row))
                 entry["probabilities"].append(probability)
-                entry["distances"].append(0.0)
+                # Query-aligned retrieval has no spatial proxy distance.  Its
+                # calibrated uncertainty is the appropriate deployment-time
+                # analogue and is also replayed during matcher training.
+                entry["distances"].append(float(1.0 - probability))
     else:
         if len(region_xy) == 0:
             raise ValueError("query_region_xy cannot be empty")
@@ -648,6 +674,9 @@ def match_query_to_surface_anchors(
                 anchors=anchors,
                 descriptor_bank=descriptor_bank,
                 config=config,
+                feature_preferred_base_fill_target=(
+                    feature_preferred_base_fill_target
+                ),
             )
         except ValueError:
             continue
@@ -694,6 +723,12 @@ def match_query_to_surface_anchors(
     )
     valid = np.zeros_like(output_probabilities, dtype=bool)
     null = np.ones((len(query.keypoints_xy),), dtype=np.float32)
+    conditional_null = np.ones(
+        (len(query.keypoints_xy),), dtype=np.float32
+    )
+    conditional_retained_anchor = np.zeros(
+        (len(query.keypoints_xy),), dtype=np.float32
+    )
     for query_row, records in enumerate(candidate_records):
         by_anchor: dict[int, tuple[float, float]] = {}
         for probability, anchor_id, descriptor_score in records:
@@ -705,12 +740,40 @@ def match_query_to_surface_anchors(
                     previous[0] + probability,
                     max(previous[1], descriptor_score),
                 )
-        ranked = sorted(
+        all_ranked = sorted(
             by_anchor.items(), key=lambda item: (-item[1][0], item[0])
-        )[: int(top_l)]
+        )
+        ranked = all_ranked[: int(top_l)]
         null_mass = max(0.0, 1.0 - float(used_maplet_mass[query_row]))
         null_mass += float(conditional_null_mass[query_row])
+        total_anchor_mass = sum(item[1][0] for item in all_ranked)
         candidate_mass = sum(item[1][0] for item in ranked)
+        omitted_anchor_mass = max(0.0, total_anchor_mass - candidate_mass)
+        null_mass += omitted_anchor_mass
+        # Keep a second, conditional confidence for deciding whether enough
+        # query groups can seed PnP.  The public posterior below remains the
+        # calibrated scene posterior and therefore includes probability mass
+        # from maplets outside the bounded scene budget.  Using its mean (or
+        # comparing each retained anchor directly with that absolute null) as
+        # a pose gate is invalid for a sparse anchor map: most real detector
+        # nodes should be null, and the unprocessed maplet mass dominates even
+        # when a small set of nodes has an unambiguous identity inside the
+        # retrieved maplets.
+        query_conditional_null_mass = (
+            float(conditional_null_mass[query_row])
+            + float(omitted_anchor_mass)
+        )
+        conditional_total_mass = (
+            float(candidate_mass) + query_conditional_null_mass
+        )
+        conditional_normalizer = max(conditional_total_mass, 1e-12)
+        if conditional_total_mass > 0.0:
+            conditional_null[query_row] = float(
+                query_conditional_null_mass / conditional_normalizer
+            )
+            conditional_retained_anchor[query_row] = float(
+                candidate_mass / conditional_normalizer
+            )
         normalizer = max(candidate_mass + null_mass, 1e-12)
         null[query_row] = float(null_mass / normalizer)
         for column, (anchor_id, (probability, descriptor_score)) in enumerate(
@@ -726,6 +789,14 @@ def match_query_to_surface_anchors(
                 probability / normalizer
             )
             valid[query_row, column] = True
+        probability_sum = float(
+            output_probabilities[query_row].sum(dtype=np.float64)
+            + null[query_row]
+        )
+        if not np.isclose(probability_sum, 1.0, atol=1e-5, rtol=1e-5):
+            raise RuntimeError(
+                "surface-anchor top-L posterior does not conserve probability"
+            )
     pool = SurfaceAnchorCandidatePool(
         query_xy=query.keypoints_xy,
         anchor_ids=output_ids,
@@ -743,8 +814,25 @@ def match_query_to_surface_anchors(
             "maximum_scene_maplets": int(config.maximum_scene_maplets),
             "matched_query_count": int(np.sum(np.any(valid, axis=1))),
             "mean_null_probability": float(np.mean(null)) if len(null) else 1.0,
+            "mean_conditional_null_probability": (
+                float(np.mean(conditional_null)) if len(conditional_null) else 1.0
+            ),
+            "conditionally_confident_group_count": int(
+                np.sum(conditional_retained_anchor > conditional_null)
+            ),
+            "conditionally_matchable_group_count": int(
+                np.sum(conditional_retained_anchor > 0.0)
+            ),
+            "conditional_pose_gate_ignores_unprocessed_maplet_mass": True,
+            "omitted_top_l_anchor_mass_transferred_to_null": True,
+            "posterior_probability_conserved": True,
             "uses_query_aligned_radio_final_maplets": bool(
                 query_aligned_maplet_match is not None
+            ),
+            "feature_preferred_base_fill_target": (
+                int(feature_preferred_base_fill_target)
+                if feature_preferred_base_fill_target is not None
+                else None
             ),
             "uses_mapping_rgb_at_inference": False,
             "uses_loftr": False,

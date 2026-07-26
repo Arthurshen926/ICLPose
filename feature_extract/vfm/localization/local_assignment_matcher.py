@@ -349,10 +349,40 @@ def local_assignment_loss(
     *,
     pair_loss_weight: float = 0.2,
     no_match_loss_weight: float = 1.0,
+    positive_assignment_weight: float = 1.0,
+    balance_no_match_classes: bool = False,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     log_probabilities = output["query_log_probabilities"]
     targets = episode.target_track_indices.long()
-    assignment_loss = F.nll_loss(log_probabilities, targets)
+    assignment_rows = F.nll_loss(
+        log_probabilities,
+        targets,
+        reduction="none",
+    )
+    positive_nodes = targets != int(episode.track_features.shape[0])
+    requested_positive_weight = float(positive_assignment_weight)
+    if requested_positive_weight <= 0.0:
+        positive_count_nodes = torch.sum(positive_nodes)
+        null_count_nodes = int(targets.numel()) - positive_count_nodes
+        requested_positive_weight = float(
+            torch.clamp(
+                null_count_nodes
+                / torch.clamp(positive_count_nodes, min=1),
+                min=1.0,
+                max=50.0,
+            ).detach().cpu().item()
+        )
+    assignment_weights = torch.where(
+        positive_nodes,
+        torch.full_like(
+            assignment_rows,
+            requested_positive_weight,
+        ),
+        torch.ones_like(assignment_rows),
+    )
+    assignment_loss = torch.sum(
+        assignment_rows * assignment_weights
+    ) / torch.clamp(torch.sum(assignment_weights), min=1.0)
     edge_targets = (
         episode.edge_track_indices.long()
         == targets[episode.edge_query_indices.long()]
@@ -368,7 +398,29 @@ def local_assignment_loss(
     no_match_targets = (targets == int(episode.track_features.shape[0])).to(
         dtype=output["no_match_logits"].dtype
     )
-    no_match_loss = F.binary_cross_entropy_with_logits(output["no_match_logits"], no_match_targets)
+    no_match_rows = F.binary_cross_entropy_with_logits(
+        output["no_match_logits"],
+        no_match_targets,
+        reduction="none",
+    )
+    if bool(balance_no_match_classes):
+        non_null_count = torch.sum(positive_nodes)
+        null_count = int(targets.numel()) - non_null_count
+        non_null_weight = torch.clamp(
+            null_count / torch.clamp(non_null_count, min=1),
+            min=1.0,
+            max=50.0,
+        ).to(dtype=no_match_rows.dtype)
+        no_match_weights = torch.where(
+            positive_nodes,
+            non_null_weight,
+            torch.ones_like(no_match_rows),
+        )
+        no_match_loss = torch.sum(
+            no_match_rows * no_match_weights
+        ) / torch.clamp(torch.sum(no_match_weights), min=1.0)
+    else:
+        no_match_loss = torch.mean(no_match_rows)
     loss = (
         assignment_loss
         + float(pair_loss_weight) * pair_loss
@@ -381,6 +433,9 @@ def local_assignment_loss(
             "assignment_loss": float(assignment_loss.detach().cpu().item()),
             "pair_loss": float(pair_loss.detach().cpu().item()),
             "no_match_loss": float(no_match_loss.detach().cpu().item()),
+            "positive_assignment_weight": float(
+                requested_positive_weight
+            ),
             "assignment_accuracy": float(torch.mean((predictions == targets).float()).cpu().item()),
             "dustbin_target_rate": float(torch.mean((targets == int(episode.track_features.shape[0])).float()).cpu().item()),
             "positive_edge_count": float(positive_count.cpu().item()),

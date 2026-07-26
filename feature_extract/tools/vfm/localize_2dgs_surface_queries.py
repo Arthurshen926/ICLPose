@@ -53,6 +53,7 @@ from feature_extract.vfm.surface_maplet_bank import (
     encode_radio_final_regions,
 )
 from feature_extract.vfm.tokens import TokenBankManifest
+from feature_extract.vfm.query_to_3d_matching import camera_matrix_and_distortion
 from feature_extract.vfm.vfm_2dgs_mapping import Vfm2DgsObservationBank
 
 
@@ -86,6 +87,14 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--surface_anchor_matcher_checkpoint", required=True)
     parser.add_argument("--camera_model_dir", required=True)
+    parser.add_argument(
+        "--query_camera_manifest",
+        default="",
+        help=(
+            "Optional per-query calibration-only JSON. It must not contain "
+            "camera poses, SfM points, or tracks."
+        ),
+    )
     parser.add_argument("--output_jsonl", required=True)
     parser.add_argument("--summary_json", required=True)
     parser.add_argument("--device", default="cuda")
@@ -97,6 +106,11 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--maplet_top_k", type=int, default=8)
     parser.add_argument("--maximum_support_views", type=int, default=64)
     parser.add_argument("--maximum_layout_models", type=int, default=4096)
+    parser.add_argument(
+        "--disable_maplet_support_layout",
+        action="store_true",
+        help="Disable stored support-mode layout evidence during coarse maplet retrieval.",
+    )
     parser.add_argument("--maximum_feature_modes", type=int, default=8)
     parser.add_argument("--maximum_global_feature_modes", type=int, default=64)
     parser.add_argument("--feature_mode_minimum_similarity", type=float, default=0.20)
@@ -104,6 +118,17 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--local_candidate_top_k", type=int, default=8192)
     parser.add_argument("--local_nms_radius_px", type=float, default=2.0)
     parser.add_argument("--anchor_top_l", type=int, default=20)
+    parser.add_argument(
+        "--matcher_feature_preferred_base_fill_target",
+        type=int,
+        default=0,
+        help=(
+            "When positive, learned set matching uses every feature-aligned "
+            "anchor (stable IDs >=1e9) and only enough geometry-first anchors "
+            "to reach this per-maplet target. The full map remains available "
+            "to feature-only layout, verification, and refinement."
+        ),
+    )
     parser.add_argument("--verification_anchor_top_l", type=int, default=10)
     parser.add_argument("--layout_guided_maximum_points", type=int, default=256)
     parser.add_argument("--layout_guided_search_radius_px", type=int, default=18)
@@ -125,6 +150,26 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--pose_refinement_radius_px", type=float, default=24.0)
     parser.add_argument("--pose_refinement_maximum_points", type=int, default=768)
+    parser.add_argument(
+        "--featuremetric_refinement_radius_px", type=int, default=14
+    )
+    parser.add_argument(
+        "--featuremetric_refinement_maximum_anchors", type=int, default=256
+    )
+    parser.add_argument(
+        "--featuremetric_refinement_minimum_similarity",
+        type=float,
+        default=0.65,
+    )
+    parser.add_argument(
+        "--disable_featuremetric_refinement", action="store_true"
+    )
+    parser.add_argument(
+        "--feature_pose_evidence_maximum_anchors", type=int, default=384
+    )
+    parser.add_argument(
+        "--feature_pose_evidence_weight", type=float, default=0.75
+    )
     parser.add_argument("--disable_pose_refinement", action="store_true")
     parser.add_argument("--max_queries", type=int, default=0)
     parser.add_argument("--force", action="store_true")
@@ -161,6 +206,33 @@ def _camera_from_model(model_dir: Path) -> ColmapCamera:
             float(value) for value in np.median(parameters, axis=0).tolist()
         ),
     )
+
+
+def _load_query_camera_manifest(
+    path: Path,
+) -> tuple[dict[str, ColmapCamera], dict[str, object]]:
+    payload = json.loads(Path(path).read_text())
+    if payload.get("format") != "per_query_colmap_calibration_only_v1":
+        raise ValueError("unsupported query camera manifest format")
+    contract = dict(payload.get("production_contract") or {})
+    if (
+        bool(contract.get("contains_camera_pose", True))
+        or bool(contract.get("contains_sfm_points", True))
+        or bool(contract.get("contains_sfm_tracks", True))
+    ):
+        raise ValueError("query camera manifest contains forbidden geometry")
+    output: dict[str, ColmapCamera] = {}
+    for row, (image_id, record) in enumerate(
+        sorted(dict(payload["cameras"]).items())
+    ):
+        output[str(image_id)] = ColmapCamera(
+            camera_id=int(row),
+            model_id=int(record["model_id"]),
+            width=int(record["width"]),
+            height=int(record["height"]),
+            params=tuple(float(value) for value in record["params"]),
+        )
+    return output, dict(payload.get("intrinsic_audit") or {})
 
 
 def _load_raw_final(path: Path, layer_name: str) -> np.ndarray:
@@ -234,7 +306,7 @@ def _fixed_pose_evidence(
 ) -> tuple[float, int]:
     if not result.success or not result.hypotheses or len(pool) == 0:
         return float("-inf"), 0
-    score, residuals, _posterior = score_surface_pose(
+    score, residuals, posterior = score_surface_pose(
         pool,
         result.pose_w2c,
         camera,
@@ -242,13 +314,297 @@ def _fixed_pose_evidence(
         config,
     )
     valid_residuals = np.where(pool.valid_mask, residuals, np.inf)
-    inlier_count = int(
-        np.sum(
-            np.min(valid_residuals, axis=1)
+    identity_supported = np.where(
+        pool.valid_mask
+        & (
+            valid_residuals
             <= float(config.inlier_threshold_px)
-        )
+        ),
+        posterior,
+        0.0,
+    )
+    inlier_count = int(
+        np.sum(np.max(identity_supported, axis=1) >= 0.05)
     )
     return float(score / max(len(pool), 1)), inlier_count
+
+
+def _feature_pose_anchor_rows(
+    *,
+    candidate_anchor_ids: Sequence[int],
+    anchors: StableSurfaceAnchorMap,
+    descriptor_bank: AnchorLocalDescriptorBank,
+    maximum_anchors: int,
+) -> np.ndarray:
+    anchor_row_by_id = anchors.row_by_id()
+    bank_row_by_id = {
+        int(anchor_id): int(row)
+        for row, anchor_id in enumerate(descriptor_bank.anchor_ids.tolist())
+    }
+    records: list[tuple[float, int]] = []
+    for anchor_id_value in candidate_anchor_ids:
+        anchor_id = int(anchor_id_value)
+        anchor_row = anchor_row_by_id.get(anchor_id)
+        bank_row = bank_row_by_id.get(anchor_id)
+        if anchor_row is None or bank_row is None:
+            continue
+        start = int(descriptor_bank.descriptor_offsets[bank_row])
+        end = int(descriptor_bank.descriptor_offsets[bank_row + 1])
+        if end <= start:
+            continue
+        local_quality = float(
+            np.median(descriptor_bank.descriptor_quality[start:end])
+        )
+        quality = (
+            max(float(anchors.quality_scores[anchor_row]), 1e-8)
+            * max(local_quality, 1e-8)
+            * np.log1p(end - start)
+        )
+        records.append((float(quality), anchor_id))
+    records.sort(key=lambda item: (-item[0], item[1]))
+    return np.asarray(
+        [
+            anchor_row_by_id[anchor_id]
+            for _quality, anchor_id in records[: int(maximum_anchors)]
+        ],
+        dtype=np.int64,
+    )
+
+
+def _feature_map_pose_evidence(
+    *,
+    result: SurfacePoseResult,
+    anchor_rows: np.ndarray,
+    anchors: StableSurfaceAnchorMap,
+    descriptor_bank: AnchorLocalDescriptorBank,
+    alike: AlikeDenseObservationExtractor,
+    image_path: Path,
+    camera: ColmapCamera,
+    support_view_id: str | None,
+) -> tuple[float, int]:
+    """Independent query dense-feature likelihood at pose-projected map anchors."""
+
+    if not result.success or len(anchor_rows) == 0:
+        return float("-inf"), 0
+    import cv2
+
+    pose = np.asarray(result.pose_w2c, dtype=np.float64).reshape(4, 4)
+    xyz = anchors.xyz[np.asarray(anchor_rows, dtype=np.int64)]
+    camera_xyz = xyz @ pose[:3, :3].T + pose[:3, 3]
+    matrix, distortion = camera_matrix_and_distortion(camera)
+    rvec, _jacobian = cv2.Rodrigues(pose[:3, :3])
+    projected, _jacobian = cv2.projectPoints(
+        xyz,
+        rvec,
+        pose[:3, 3],
+        matrix,
+        distortion,
+    )
+    projected = projected.reshape(-1, 2)
+    visible = (
+        (camera_xyz[:, 2] > 1e-6)
+        & (projected[:, 0] >= 0.0)
+        & (projected[:, 0] <= float(camera.width - 1))
+        & (projected[:, 1] >= 0.0)
+        & (projected[:, 1] <= float(camera.height - 1))
+    )
+    rows = np.flatnonzero(visible)
+    if len(rows) < 8:
+        return float("-inf"), int(len(rows))
+    query_descriptors, detector_scores, _image_hash = alike.sample_points(
+        image_path,
+        projected[rows],
+        image_width=int(camera.width),
+        image_height=int(camera.height),
+    )
+    bank_row_by_id = {
+        int(anchor_id): int(row)
+        for row, anchor_id in enumerate(descriptor_bank.anchor_ids.tolist())
+    }
+    similarities: list[float] = []
+    for query_row, anchor_row in enumerate(anchor_rows[rows].tolist()):
+        anchor_id = int(anchors.anchor_ids[int(anchor_row)])
+        bank_row = bank_row_by_id[anchor_id]
+        start = int(descriptor_bank.descriptor_offsets[bank_row])
+        end = int(descriptor_bank.descriptor_offsets[bank_row + 1])
+        descriptor_rows = np.arange(start, end, dtype=np.int64)
+        if support_view_id is not None:
+            mode_rows = descriptor_rows[
+                np.asarray(
+                    [
+                        descriptor_bank.support_image_ids[int(row)]
+                        == str(support_view_id)
+                        for row in descriptor_rows.tolist()
+                    ],
+                    dtype=bool,
+                )
+            ]
+            if len(mode_rows):
+                descriptor_rows = mode_rows
+        similarities.append(
+            float(
+                np.max(
+                    descriptor_bank.descriptors[descriptor_rows]
+                    @ query_descriptors[query_row]
+                )
+            )
+        )
+    similarity = np.asarray(similarities, dtype=np.float64)
+    # Proper log-match probability with an explicit feature dustbin.  Dense
+    # detector score contributes only a bounded repeatability term.
+    logits = (similarity - 0.65) / 0.08
+    log_match = -np.logaddexp(0.0, -logits)
+    score_term = np.log1p(
+        np.maximum(np.asarray(detector_scores, dtype=np.float64), 0.0)
+        * 1000.0
+    )
+    repeatability = np.tanh(score_term / 3.0)
+    visible_fraction = float(len(rows) / max(len(anchor_rows), 1))
+    score = float(
+        np.mean(log_match + 0.15 * repeatability)
+        - 0.25 * (1.0 - visible_fraction)
+    )
+    supported = int(np.sum((similarity >= 0.65) & (repeatability >= 0.05)))
+    return score, supported
+
+
+def _pose_projected_anchor_measurements(
+    *,
+    pose_w2c: np.ndarray,
+    candidate_anchor_ids: Sequence[int],
+    support_view_id: str | None,
+    anchors: StableSurfaceAnchorMap,
+    descriptor_bank: AnchorLocalDescriptorBank,
+    camera: ColmapCamera,
+    maximum_anchors: int,
+    projection_margin_px: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Project high-quality map anchors and retain a spatially balanced set."""
+
+    import cv2
+
+    anchor_row_by_id = anchors.row_by_id()
+    bank_row_by_id = {
+        int(anchor_id): int(row)
+        for row, anchor_id in enumerate(descriptor_bank.anchor_ids.tolist())
+    }
+    records: list[tuple[float, int, np.ndarray]] = []
+    for anchor_id_value in candidate_anchor_ids:
+        anchor_id = int(anchor_id_value)
+        anchor_row = anchor_row_by_id.get(anchor_id)
+        bank_row = bank_row_by_id.get(anchor_id)
+        if anchor_row is None or bank_row is None:
+            continue
+        descriptor_rows = np.arange(
+            int(descriptor_bank.descriptor_offsets[bank_row]),
+            int(descriptor_bank.descriptor_offsets[bank_row + 1]),
+            dtype=np.int64,
+        )
+        if len(descriptor_rows) == 0:
+            continue
+        if support_view_id is not None:
+            mode_rows = descriptor_rows[
+                np.asarray(
+                    [
+                        descriptor_bank.support_image_ids[int(row)]
+                        == str(support_view_id)
+                        for row in descriptor_rows.tolist()
+                    ],
+                    dtype=bool,
+                )
+            ]
+            if len(mode_rows):
+                descriptor_rows = mode_rows
+        weights = np.maximum(
+            descriptor_bank.descriptor_quality[descriptor_rows], 1e-8
+        )
+        prototype = np.sum(
+            descriptor_bank.descriptors[descriptor_rows] * weights[:, None],
+            axis=0,
+        )
+        prototype /= max(float(np.linalg.norm(prototype)), 1e-8)
+        quality = (
+            max(float(anchors.quality_scores[anchor_row]), 1e-8)
+            * max(float(np.median(weights)), 1e-8)
+            * np.log1p(len(descriptor_rows))
+        )
+        records.append((float(quality), anchor_id, prototype.astype(np.float32)))
+    if not records:
+        return (
+            np.zeros((0, 2), dtype=np.float32),
+            np.zeros((0, descriptor_bank.feature_dim), dtype=np.float32),
+            np.zeros((0,), dtype=np.int64),
+        )
+    pose = np.asarray(pose_w2c, dtype=np.float64).reshape(4, 4)
+    ids = np.asarray([item[1] for item in records], dtype=np.int64)
+    rows = np.asarray([anchor_row_by_id[int(value)] for value in ids], dtype=np.int64)
+    xyz = anchors.xyz[rows]
+    camera_xyz = xyz @ pose[:3, :3].T + pose[:3, 3]
+    matrix, distortion = camera_matrix_and_distortion(camera)
+    rvec, _jacobian = cv2.Rodrigues(pose[:3, :3])
+    projected, _jacobian = cv2.projectPoints(
+        xyz, rvec, pose[:3, 3], matrix, distortion
+    )
+    projected = projected.reshape(-1, 2)
+    margin = float(projection_margin_px)
+    visible = (
+        (camera_xyz[:, 2] > 1e-6)
+        & (projected[:, 0] >= -margin)
+        & (projected[:, 0] <= float(camera.width - 1) + margin)
+        & (projected[:, 1] >= -margin)
+        & (projected[:, 1] <= float(camera.height - 1) + margin)
+    )
+    visible_rows = np.flatnonzero(visible)
+    ranked = sorted(
+        visible_rows.tolist(),
+        key=lambda row: (-records[row][0], int(ids[row])),
+    )
+    cell_quota = max(1, int(np.ceil(int(maximum_anchors) / 64.0)))
+    cell_counts: dict[tuple[int, int], int] = {}
+    selected: list[int] = []
+    for use_quota in (True, False):
+        for row in ranked:
+            if row in selected or len(selected) >= int(maximum_anchors):
+                continue
+            cell = (
+                int(np.clip(projected[row, 1] / max(camera.height, 1) * 8, 0, 7)),
+                int(np.clip(projected[row, 0] / max(camera.width, 1) * 8, 0, 7)),
+            )
+            if use_quota and cell_counts.get(cell, 0) >= cell_quota:
+                continue
+            selected.append(int(row))
+            cell_counts[cell] = cell_counts.get(cell, 0) + 1
+    selected_rows = np.asarray(selected, dtype=np.int64)
+    return (
+        projected[selected_rows].astype(np.float32),
+        np.stack([records[row][2] for row in selected]).astype(np.float32),
+        ids[selected_rows],
+    )
+
+
+def _unique_featuremetric_measurements(
+    *,
+    xy: np.ndarray,
+    descriptors: np.ndarray,
+    similarities: np.ndarray,
+    anchor_ids: np.ndarray,
+    minimum_similarity: float,
+    minimum_separation_px: float = 2.0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    order = np.argsort(-np.asarray(similarities), kind="mergesort")
+    selected: list[int] = []
+    for row in order.tolist():
+        if float(similarities[row]) < float(minimum_similarity):
+            continue
+        if selected:
+            distance = np.linalg.norm(
+                xy[np.asarray(selected, dtype=np.int64)] - xy[row], axis=1
+            )
+            if float(np.min(distance)) < float(minimum_separation_px):
+                continue
+        selected.append(int(row))
+    rows = np.asarray(selected, dtype=np.int64)
+    return xy[rows], descriptors[rows], similarities[rows], anchor_ids[rows]
 
 
 def _result_key(result: SurfacePoseResult) -> tuple[float, ...]:
@@ -368,7 +724,25 @@ def main(argv: Sequence[str] | None = None) -> None:
     if set(local_bank.anchor_ids.tolist()) - set(anchors.anchor_ids.tolist()):
         raise ValueError("local descriptor bank contains unknown surface anchors")
 
-    camera = _camera_from_model(Path(args.camera_model_dir))
+    fallback_camera = _camera_from_model(Path(args.camera_model_dir))
+    if str(args.query_camera_manifest):
+        query_camera_by_image, intrinsic_audit = (
+            _load_query_camera_manifest(Path(args.query_camera_manifest))
+        )
+        missing_query_cameras = sorted(
+            {record.image_id for record in records}
+            - set(query_camera_by_image)
+        )
+        if missing_query_cameras:
+            raise ValueError(
+                f"query camera manifest is missing {missing_query_cameras[0]}"
+            )
+    else:
+        query_camera_by_image = {}
+        intrinsic_audit = {
+            "uses_per_query_calibration": False,
+            "fallback_is_parameter_median": True,
+        }
     pool_sizes = tuple(
         int(value) for value in mapper_metadata.get("pool_sizes", (1, 3, 5, 9))
     )
@@ -382,6 +756,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         pool_sizes=pool_sizes, pool_weights=pool_weights
     )
     maplet_config = SurfaceMapletMatchConfig(
+        top_k=int(args.maplet_top_k),
+        maximum_support_views=int(args.maximum_support_views),
+        maximum_layout_models=int(args.maximum_layout_models),
+        enable_support_layout=not bool(args.disable_maplet_support_layout),
+    )
+    query_aligned_maplet_config = SurfaceMapletMatchConfig(
         top_k=int(args.maplet_top_k),
         maximum_support_views=int(args.maximum_support_views),
         maximum_layout_models=int(args.maximum_layout_models),
@@ -408,6 +788,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     with output_path.open("w") as output:
         for query_index, record in enumerate(records):
             query_started = time.time()
+            camera = query_camera_by_image.get(
+                record.image_id, fallback_camera
+            )
             stage_started = time.time()
             raw = _load_raw_final(
                 record.token_path, str(args.radio_final_layer)
@@ -449,6 +832,25 @@ def main(argv: Sequence[str] | None = None) -> None:
                 descriptors=detected.descriptors,
                 scores=detected.scores,
             )
+            query_grid_xy = query.keypoints_xy * np.asarray(
+                [
+                    max(grid_size[0] - 1, 1) / max(int(camera.width) - 1, 1),
+                    max(grid_size[1] - 1, 1) / max(int(camera.height) - 1, 1),
+                ],
+                dtype=np.float32,
+            )
+            query_aligned_region_descriptors = encode_radio_final_regions(
+                mapped,
+                query_grid_xy,
+                region_config,
+            )
+            query_aligned_maplet_match = match_radio_final_regions_to_maplets(
+                query_grid_xy,
+                query_aligned_region_descriptors,
+                grid_size,
+                maplets,
+                query_aligned_maplet_config,
+            )
             query_feature_runtime = time.time() - stage_started
             stage_started = time.time()
             anchor_pool, matcher_diagnostics = match_query_to_surface_anchors(
@@ -463,22 +865,24 @@ def main(argv: Sequence[str] | None = None) -> None:
                 descriptor_bank=local_bank,
                 device=str(args.device),
                 top_l=int(args.anchor_top_l),
+                query_aligned_maplet_match=query_aligned_maplet_match,
+                feature_preferred_base_fill_target=(
+                    int(
+                        args.matcher_feature_preferred_base_fill_target
+                    )
+                    if int(
+                        args.matcher_feature_preferred_base_fill_target
+                    )
+                    > 0
+                    else None
+                ),
             )
             anchor_set_runtime = time.time() - stage_started
             stage_started = time.time()
-            maximum_set_probability = np.max(
-                np.where(
-                    anchor_pool.valid_mask,
-                    anchor_pool.candidate_probabilities,
-                    0.0,
-                ),
-                axis=1,
-            )
             confident_set_groups = int(
-                np.sum(
-                    maximum_set_probability
-                    > anchor_pool.null_probabilities
-                )
+                matcher_diagnostics[
+                    "conditionally_matchable_group_count"
+                ]
             )
             mean_set_null = (
                 float(np.mean(anchor_pool.null_probabilities))
@@ -486,9 +890,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 else 1.0
             )
             set_pose_gate_passed = bool(
-                mean_set_null
-                <= float(args.set_pose_maximum_mean_null)
-                and confident_set_groups
+                confident_set_groups
                 >= int(args.set_pose_minimum_confident_groups)
             )
             if set_pose_gate_passed:
@@ -535,6 +937,14 @@ def main(argv: Sequence[str] | None = None) -> None:
             selected_layout_score = None
             refinement_pool_size = 0
             retrieved_anchor_ids = _retrieved_anchor_ids(maplet_match, maplets)
+            feature_pose_anchor_rows = _feature_pose_anchor_rows(
+                candidate_anchor_ids=retrieved_anchor_ids,
+                anchors=anchors,
+                descriptor_bank=local_bank,
+                maximum_anchors=int(
+                    args.feature_pose_evidence_maximum_anchors
+                ),
+            )
             allowed_mode_ids = _retrieved_support_mode_ids(
                 maplet_match, maplets
             )
@@ -913,15 +1323,91 @@ def main(argv: Sequence[str] | None = None) -> None:
                             ),
                         )
                     )
+            feature_pose_evidence: list[dict[str, object]] = []
             if pose_candidates:
-                selected_candidate = max(
-                    pose_candidates,
+                scored_pose_candidates = []
+                for candidate_index, candidate in enumerate(pose_candidates):
+                    (
+                        fixed_score,
+                        fixed_inliers,
+                        vfm_score,
+                        rank_score,
+                        candidate_result,
+                        candidate_branch,
+                        candidate_view_id,
+                    ) = candidate
+                    feature_score, feature_support = (
+                        _feature_map_pose_evidence(
+                            result=candidate_result,
+                            anchor_rows=feature_pose_anchor_rows,
+                            anchors=anchors,
+                            descriptor_bank=local_bank,
+                            alike=alike,
+                            image_path=image_path,
+                            camera=camera,
+                            support_view_id=candidate_view_id,
+                        )
+                    )
+                    combined_score = float(fixed_score)
+                    if np.isfinite(feature_score):
+                        combined_score += float(
+                            args.feature_pose_evidence_weight
+                        ) * float(feature_score)
+                    scored_pose_candidates.append(
+                        (
+                            combined_score,
+                            fixed_score,
+                            fixed_inliers,
+                            vfm_score,
+                            rank_score,
+                            candidate_result,
+                            candidate_branch,
+                            candidate_view_id,
+                        )
+                    )
+                    feature_pose_evidence.append(
+                        {
+                            "candidate_index": int(candidate_index),
+                            "branch": str(candidate_branch),
+                            "support_view_id": candidate_view_id,
+                            "feature_map_log_likelihood": (
+                                float(feature_score)
+                                if np.isfinite(feature_score)
+                                else None
+                            ),
+                            "feature_supported_anchor_count": int(
+                                feature_support
+                            ),
+                            "fixed_candidate_log_likelihood": (
+                                float(fixed_score)
+                                if np.isfinite(fixed_score)
+                                else None
+                            ),
+                            "combined_log_likelihood": (
+                                float(combined_score)
+                                if np.isfinite(combined_score)
+                                else None
+                            ),
+                        }
+                    )
+                selected_scored = max(
+                    scored_pose_candidates,
                     key=lambda item: (
                         float(item[0]),
-                        int(item[1]),
-                        float(item[2]),
-                        int(item[3]),
+                        float(item[1]),
+                        int(item[2]),
+                        float(item[3]),
+                        int(item[4]),
                     ),
+                )
+                selected_candidate = (
+                    selected_scored[1],
+                    selected_scored[2],
+                    selected_scored[3],
+                    selected_scored[4],
+                    selected_scored[5],
+                    selected_scored[6],
+                    selected_scored[7],
                 )
                 result = selected_candidate[4]
                 branch = selected_candidate[5]
@@ -931,6 +1417,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             feature_mode_measurement_runtime = time.time() - stage_started
             stage_started = time.time()
             refinement_fixed_evidence_delta = None
+            refinement_feature_evidence_delta = None
+            featuremetric_seed_count = 0
+            featuremetric_measurement_count = 0
+            featuremetric_fixed_evidence_delta = None
+            featuremetric_accepted = False
             if result.success and not bool(args.disable_pose_refinement):
                 refinement_pool = (
                     build_pose_guided_surface_anchor_candidate_pool(
@@ -969,11 +1460,190 @@ def main(argv: Sequence[str] | None = None) -> None:
                     refinement_fixed_evidence_delta = float(
                         refinement_fixed_score - base_fixed_score
                     )
-                    if refinement_fixed_score > base_fixed_score:
+                    base_refinement_feature_score, _base_support = (
+                        _feature_map_pose_evidence(
+                            result=result,
+                            anchor_rows=feature_pose_anchor_rows,
+                            anchors=anchors,
+                            descriptor_bank=local_bank,
+                            alike=alike,
+                            image_path=image_path,
+                            camera=camera,
+                            support_view_id=selected_layout_view_id,
+                        )
+                    )
+                    refined_feature_score, _refined_support = (
+                        _feature_map_pose_evidence(
+                            result=refinement_result,
+                            anchor_rows=feature_pose_anchor_rows,
+                            anchors=anchors,
+                            descriptor_bank=local_bank,
+                            alike=alike,
+                            image_path=image_path,
+                            camera=camera,
+                            support_view_id=selected_layout_view_id,
+                        )
+                    )
+                    if np.isfinite(base_refinement_feature_score) and np.isfinite(
+                        refined_feature_score
+                    ):
+                        refinement_feature_evidence_delta = float(
+                            refined_feature_score
+                            - base_refinement_feature_score
+                        )
+                    if (
+                        refinement_fixed_score > base_fixed_score
+                        and (
+                            not np.isfinite(base_refinement_feature_score)
+                            or refined_feature_score
+                            >= base_refinement_feature_score - 0.05
+                        )
+                    ):
                         result = refinement_result
                         branch = (
                             "radio_maplet_alike_set_ot_pose_guided_feature_em"
                         )
+            if (
+                result.success
+                and not bool(args.disable_featuremetric_refinement)
+            ):
+                (
+                    projected_anchor_xy,
+                    projected_anchor_descriptors,
+                    projected_anchor_ids,
+                ) = _pose_projected_anchor_measurements(
+                    pose_w2c=result.pose_w2c,
+                    candidate_anchor_ids=retrieved_anchor_ids,
+                    support_view_id=selected_layout_view_id,
+                    anchors=anchors,
+                    descriptor_bank=local_bank,
+                    camera=camera,
+                    maximum_anchors=int(
+                        args.featuremetric_refinement_maximum_anchors
+                    ),
+                    projection_margin_px=float(
+                        args.featuremetric_refinement_radius_px
+                    ),
+                )
+                featuremetric_seed_count = len(projected_anchor_ids)
+                if len(projected_anchor_ids) >= 4:
+                    (
+                        measured_xy,
+                        measured_descriptors,
+                        measured_similarities,
+                        _measured_image_hash,
+                    ) = alike.match_descriptor_points(
+                        image_path,
+                        projected_anchor_xy,
+                        projected_anchor_descriptors,
+                        image_width=int(camera.width),
+                        image_height=int(camera.height),
+                        search_radius_px=int(
+                            args.featuremetric_refinement_radius_px
+                        ),
+                        search_step_px=1,
+                    )
+                    (
+                        measured_xy,
+                        measured_descriptors,
+                        measured_similarities,
+                        measured_anchor_ids,
+                    ) = _unique_featuremetric_measurements(
+                        xy=measured_xy,
+                        descriptors=measured_descriptors,
+                        similarities=measured_similarities,
+                        anchor_ids=projected_anchor_ids,
+                        minimum_similarity=float(
+                            args.featuremetric_refinement_minimum_similarity
+                        ),
+                    )
+                    featuremetric_measurement_count = len(measured_anchor_ids)
+                    if len(measured_anchor_ids) >= 4:
+                        featuremetric_query = LocalFeatureFrame(
+                            image_id=record.image_id,
+                            keypoints_xy=measured_xy,
+                            descriptors=measured_descriptors,
+                            scores=np.maximum(
+                                measured_similarities, 0.0
+                            ),
+                        )
+                        featuremetric_pool = (
+                            build_seeded_surface_anchor_candidate_pool(
+                                featuremetric_query,
+                                measured_anchor_ids,
+                                descriptor_bank=local_bank,
+                                anchors=anchors,
+                                top_l=min(5, int(args.anchor_top_l)),
+                                seed_prior_logit=float(
+                                    args.layout_guided_seed_prior_logit
+                                ),
+                            )
+                        )
+                        featuremetric_result = (
+                            generate_grouped_surface_pose_hypotheses(
+                                featuremetric_pool, camera, pose_config
+                            )
+                        )
+                        if featuremetric_result.success:
+                            base_fixed_score = score_surface_pose(
+                                selection_pool,
+                                result.pose_w2c,
+                                camera,
+                                np.ones(
+                                    (len(selection_pool),), dtype=bool
+                                ),
+                                pose_config,
+                            )[0]
+                            metric_fixed_score = score_surface_pose(
+                                selection_pool,
+                                featuremetric_result.pose_w2c,
+                                camera,
+                                np.ones(
+                                    (len(selection_pool),), dtype=bool
+                                ),
+                                pose_config,
+                            )[0]
+                            featuremetric_fixed_evidence_delta = float(
+                                metric_fixed_score - base_fixed_score
+                            )
+                            base_feature_score, _base_support = (
+                                _feature_map_pose_evidence(
+                                    result=result,
+                                    anchor_rows=feature_pose_anchor_rows,
+                                    anchors=anchors,
+                                    descriptor_bank=local_bank,
+                                    alike=alike,
+                                    image_path=image_path,
+                                    camera=camera,
+                                    support_view_id=selected_layout_view_id,
+                                )
+                            )
+                            metric_feature_score, _metric_support = (
+                                _feature_map_pose_evidence(
+                                    result=featuremetric_result,
+                                    anchor_rows=feature_pose_anchor_rows,
+                                    anchors=anchors,
+                                    descriptor_bank=local_bank,
+                                    alike=alike,
+                                    image_path=image_path,
+                                    camera=camera,
+                                    support_view_id=selected_layout_view_id,
+                                )
+                            )
+                            if (
+                                metric_fixed_score > base_fixed_score
+                                and (
+                                    not np.isfinite(base_feature_score)
+                                    or metric_feature_score
+                                    >= base_feature_score - 0.05
+                                )
+                            ):
+                                result = featuremetric_result
+                                branch = (
+                                    "radio_maplet_2dgs_feature_map_metric_"
+                                    "refinement"
+                                )
+                                featuremetric_accepted = True
             refinement_runtime = time.time() - stage_started
             if result.success:
                 successes += 1
@@ -1002,6 +1672,15 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "set_pose_confident_group_count": int(
                     confident_set_groups
                 ),
+                "set_pose_absolute_mean_null_probability": float(
+                    mean_set_null
+                ),
+                "set_pose_gate_uses_conditional_identity_confidence": True,
+                "set_pose_strictly_confident_group_count": int(
+                    matcher_diagnostics[
+                        "conditionally_confident_group_count"
+                    ]
+                ),
                 "fixed_verification_pool_size": len(
                     fixed_verification_pool
                 ),
@@ -1021,11 +1700,33 @@ def main(argv: Sequence[str] | None = None) -> None:
                     direct_surface_fallback_inliers
                 ),
                 "feature_mode_diagnostics": feature_mode_diagnostics,
+                "feature_pose_evidence_anchor_count": int(
+                    len(feature_pose_anchor_rows)
+                ),
+                "feature_pose_evidence": feature_pose_evidence,
+                "uses_per_query_calibration": bool(
+                    str(args.query_camera_manifest)
+                ),
                 "selected_layout_feature_view_id": selected_layout_view_id,
                 "selected_layout_feature_score": selected_layout_score,
                 "refinement_pool_size": int(refinement_pool_size),
                 "refinement_fixed_evidence_delta": (
                     refinement_fixed_evidence_delta
+                ),
+                "refinement_feature_evidence_delta": (
+                    refinement_feature_evidence_delta
+                ),
+                "featuremetric_refinement_seed_count": int(
+                    featuremetric_seed_count
+                ),
+                "featuremetric_refinement_measurement_count": int(
+                    featuremetric_measurement_count
+                ),
+                "featuremetric_refinement_fixed_evidence_delta": (
+                    featuremetric_fixed_evidence_delta
+                ),
+                "featuremetric_refinement_accepted": bool(
+                    featuremetric_accepted
                 ),
                 "runtime_seconds": float(time.time() - query_started),
                 "stage_runtime_seconds": {
@@ -1105,6 +1806,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             ),
         )
     }
+    if str(args.query_camera_manifest):
+        artifacts["query_camera_manifest"] = {
+            "path": str(args.query_camera_manifest),
+            "sha256": file_sha256_short(Path(args.query_camera_manifest)),
+        }
     summary = {
         "stage": "localize_2dgs_surface_queries_map_only",
         "query_count": len(records),
@@ -1125,6 +1831,22 @@ def main(argv: Sequence[str] | None = None) -> None:
             "anchor_set_matcher": anchor_matcher.config.to_dict(),
             "local_top_k": int(args.local_top_k),
             "anchor_top_l": int(args.anchor_top_l),
+            "matcher_feature_preferred_base_fill_target": int(
+                args.matcher_feature_preferred_base_fill_target
+            ),
+            "set_pose_gate": {
+                "minimum_confident_groups": int(
+                    args.set_pose_minimum_confident_groups
+                ),
+                "confidence_semantics": (
+                    "conditional_identity_given_matchable_with_absolute_"
+                    "posterior_retained_for_pose_scoring"
+                ),
+                "legacy_maximum_mean_null_argument": float(
+                    args.set_pose_maximum_mean_null
+                ),
+                "legacy_maximum_mean_null_applied": False,
+            },
             "layout_guided_feature_measurement": {
                 "maximum_global_feature_modes": int(
                     args.maximum_global_feature_modes
@@ -1151,12 +1873,38 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "maximum_points": int(args.pose_refinement_maximum_points),
                 "scope": "radio_retrieved_maplet_anchors_only",
             },
+            "featuremetric_refinement": {
+                "enabled": not bool(args.disable_featuremetric_refinement),
+                "search_radius_px": int(
+                    args.featuremetric_refinement_radius_px
+                ),
+                "maximum_anchors": int(
+                    args.featuremetric_refinement_maximum_anchors
+                ),
+                "minimum_similarity": float(
+                    args.featuremetric_refinement_minimum_similarity
+                ),
+                "acceptance": (
+                    "fixed_candidate_evidence_improves_and_"
+                    "dense_feature_likelihood_non_degrades"
+                ),
+            },
+            "independent_feature_pose_evidence": {
+                "maximum_anchors": int(
+                    args.feature_pose_evidence_maximum_anchors
+                ),
+                "weight": float(args.feature_pose_evidence_weight),
+                "source": (
+                    "query_radio_final_vs_stored_2dgs_surface_features"
+                ),
+            },
         },
         "runtime_access_audit": {
             "query_image_root": str(query_root),
             "opened_query_image_count": len(query_file_audit),
             "opened_query_images": query_file_audit,
             "mapping_image_paths_accepted_by_cli": False,
+            "intrinsic_calibration": intrinsic_audit,
         },
         "production_contract": {
             "map_representation": (

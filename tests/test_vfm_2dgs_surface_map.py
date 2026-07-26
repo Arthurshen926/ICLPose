@@ -32,10 +32,39 @@ from feature_extract.vfm.surface_maplet_bank import (
     StableSurfaceAnchorMap,
     SurfaceMapletBuildConfig,
     TwoDGSPrimitiveQuality,
+    load_2dgs_primitive_quality,
     VfmSurfaceMapletBank,
     build_track_free_surface_map,
     encode_radio_final_regions,
 )
+
+
+def test_clean_2dgs_quality_uses_source_index_as_explicit_mask(
+    tmp_path: Path,
+) -> None:
+    from plyfile import PlyData, PlyElement
+
+    vertices = np.zeros(
+        (2,),
+        dtype=[
+            ("x", "f4"),
+            ("y", "f4"),
+            ("z", "f4"),
+            ("source_index", "i4"),
+            ("primitive_class", "i2"),
+        ],
+    )
+    vertices["source_index"] = np.asarray([2, 5], dtype=np.int32)
+    path = tmp_path / "clean.ply"
+    PlyData([PlyElement.describe(vertices, "vertex")], text=False).write(path)
+    quality = load_2dgs_primitive_quality(path)
+    assert len(quality) == 6
+    np.testing.assert_array_equal(
+        quality.geometry_confidence,
+        np.asarray([0.0, 0.0, 1.0, 0.0, 0.0, 1.0], dtype=np.float32),
+    )
+    assert quality.metadata["clean_mask_active"] is True
+    assert quality.metadata["field_presence"]["geometry_confidence"] is False
 from feature_extract.vfm.vfm_2dgs_mapping import (
     SurfaceElementMap,
     Vfm2DgsAnchorMap,

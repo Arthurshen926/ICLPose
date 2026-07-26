@@ -141,6 +141,7 @@ class TwoDGSPrimitiveQuality:
     primitive_class: np.ndarray
     protected_flag: np.ndarray
     block_id: np.ndarray
+    metadata: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
         geometry = np.asarray(self.geometry_confidence, dtype=np.float32).reshape(-1)
@@ -155,6 +156,7 @@ class TwoDGSPrimitiveQuality:
             if value.shape != (count,):
                 raise ValueError(f"{name} must have the same length as geometry_confidence")
             object.__setattr__(self, name, value)
+        object.__setattr__(self, "metadata", dict(self.metadata or {}))
 
     def __len__(self) -> int:
         return int(self.geometry_confidence.shape[0])
@@ -166,6 +168,11 @@ class TwoDGSPrimitiveQuality:
             primitive_class=np.zeros((int(count),), dtype=np.int32),
             protected_flag=np.zeros((int(count),), dtype=np.int8),
             block_id=np.full((int(count),), -1, dtype=np.int32),
+            metadata={
+                "source_indexed": False,
+                "neutral_defaults": True,
+                "field_presence": {},
+            },
         )
 
 
@@ -174,18 +181,60 @@ def load_2dgs_primitive_quality(path: Path) -> TwoDGSPrimitiveQuality:
 
     vertex = PlyData.read(Path(path), mmap=True).elements[0]
     names = set(vertex.data.dtype.names or ())
-    count = int(vertex.count)
+    input_count = int(vertex.count)
+    source_indexed = "source_index" in names
+    if source_indexed:
+        source_indices = np.asarray(vertex["source_index"], dtype=np.int64)
+        if (
+            source_indices.shape != (input_count,)
+            or np.any(source_indices < 0)
+            or len(np.unique(source_indices)) != input_count
+        ):
+            raise ValueError("2DGS clean-prior source_index must be unique and non-negative")
+        count = int(np.max(source_indices, initial=-1)) + 1
+    else:
+        source_indices = np.arange(input_count, dtype=np.int64)
+        count = input_count
 
     def field(name: str, default: float, dtype) -> np.ndarray:
-        if name not in names:
-            return np.full((count,), default, dtype=dtype)
-        return np.asarray(vertex[name], dtype=dtype)
+        output = np.full(
+            (count,),
+            0 if source_indexed and name == "geometry_confidence" else default,
+            dtype=dtype,
+        )
+        if name in names:
+            output[source_indices] = np.asarray(vertex[name], dtype=dtype)
+        elif not source_indexed:
+            output.fill(default)
+        elif name == "geometry_confidence":
+            # A source-indexed clean PLY is an explicit retained-primitive mask.
+            output[source_indices] = float(default)
+        return output
 
     return TwoDGSPrimitiveQuality(
         geometry_confidence=field("geometry_confidence", 1.0, np.float32),
         primitive_class=field("primitive_class", 0, np.int32),
         protected_flag=field("protected_flag", 0, np.int8),
         block_id=field("block_id", -1, np.int32),
+        metadata={
+            "source_indexed": bool(source_indexed),
+            "input_primitive_count": int(input_count),
+            "indexed_primitive_count": int(count),
+            "retained_source_primitive_count": int(input_count),
+            "field_presence": {
+                name: bool(name in names)
+                for name in (
+                    "source_index",
+                    "geometry_confidence",
+                    "primitive_class",
+                    "protected_flag",
+                    "block_id",
+                    "opacity",
+                    "maximum_scale",
+                )
+            },
+            "clean_mask_active": bool(source_indexed),
+        },
     )
 
 
@@ -790,7 +839,39 @@ def build_track_free_surface_map(
     max_parent = int(np.max(surface_elements.parent_gaussian_indices, initial=-1))
     quality_fields = primitive_quality or TwoDGSPrimitiveQuality.neutral(max_parent + 1)
     if len(quality_fields) <= max_parent:
-        raise ValueError("primitive quality table does not cover every 2DGS parent primitive")
+        if bool((quality_fields.metadata or {}).get("clean_mask_active", False)):
+            missing = max_parent + 1 - len(quality_fields)
+            quality_fields = TwoDGSPrimitiveQuality(
+                geometry_confidence=np.pad(
+                    quality_fields.geometry_confidence,
+                    (0, missing),
+                    constant_values=0.0,
+                ),
+                primitive_class=np.pad(
+                    quality_fields.primitive_class,
+                    (0, missing),
+                    constant_values=0,
+                ),
+                protected_flag=np.pad(
+                    quality_fields.protected_flag,
+                    (0, missing),
+                    constant_values=0,
+                ),
+                block_id=np.pad(
+                    quality_fields.block_id,
+                    (0, missing),
+                    constant_values=-1,
+                ),
+                metadata={
+                    **dict(quality_fields.metadata or {}),
+                    "indexed_primitive_count": int(max_parent + 1),
+                    "zero_padded_clean_mask_count": int(missing),
+                },
+            )
+        else:
+            raise ValueError(
+                "primitive quality table does not cover every 2DGS parent primitive"
+            )
 
     assignments = _assign_observations_to_maplets(region_map, observation_bank, build_config)
     evidence = _element_view_evidence(assignments, observation_bank, build_config)
@@ -1133,6 +1214,36 @@ def build_track_free_surface_map(
             "median": float(np.median(anchors_per_maplet)) if anchors_per_maplet.size else 0.0,
             "mean": float(np.mean(anchors_per_maplet)) if anchors_per_maplet.size else 0.0,
             "max": int(np.max(anchors_per_maplet)) if anchors_per_maplet.size else 0,
+        },
+        "primitive_quality": dict(quality_fields.metadata or {}),
+        "primitive_filter": {
+            "min_geometry_confidence": float(build_config.min_geometry_confidence),
+            "allowed_primitive_classes": (
+                None
+                if build_config.allowed_primitive_classes is None
+                else [
+                    int(value)
+                    for value in build_config.allowed_primitive_classes
+                ]
+            ),
+            "geometry_filter_active": bool(
+                np.any(quality_fields.geometry_confidence != 1.0)
+            ),
+            "primitive_class_filter_active": bool(
+                build_config.allowed_primitive_classes is not None
+                and (
+                    bool(
+                        (quality_fields.metadata or {})
+                        .get("field_presence", {})
+                        .get("primitive_class", False)
+                    )
+                    or bool(
+                        (quality_fields.metadata or {}).get(
+                            "clean_mask_active", False
+                        )
+                    )
+                )
+            ),
         },
         "radio_intermediate_used": False,
         "sfm_points_used": False,

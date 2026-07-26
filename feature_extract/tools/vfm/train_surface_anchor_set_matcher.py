@@ -41,6 +41,16 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--anchors", required=True)
     parser.add_argument("--local_descriptor_bank", required=True)
     parser.add_argument("--camera_model_dir", required=True)
+    parser.add_argument(
+        "--deployment_replay_dir",
+        default="",
+        help=(
+            "Optional feature-only replay cache produced by "
+            "build_surface_anchor_deployment_replay.py. When set, real ALIKE "
+            "detections, null points, and RADIO-final maplet priors replace "
+            "projection-centered synthetic query nodes."
+        ),
+    )
     parser.add_argument("--output_checkpoint", required=True)
     parser.add_argument("--summary_json", required=True)
     parser.add_argument("--device", default="cuda")
@@ -53,6 +63,20 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--gradient_clip_norm", type=float, default=5.0)
     parser.add_argument("--pair_loss_weight", type=float, default=0.2)
     parser.add_argument("--no_match_loss_weight", type=float, default=1.0)
+    parser.add_argument(
+        "--positive_assignment_weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Positive-node weight in assignment NLL; <=0 uses the per-episode "
+            "null/positive ratio capped at 50."
+        ),
+    )
+    parser.add_argument(
+        "--disable_balanced_no_match_classes",
+        action="store_true",
+        help="Disable per-episode balancing of match versus null BCE.",
+    )
     parser.add_argument("--negative_episode_fraction", type=float, default=0.35)
     parser.add_argument("--maximum_positive_nodes", type=int, default=64)
     parser.add_argument("--maximum_null_nodes", type=int, default=16)
@@ -85,6 +109,7 @@ def _average_precision(target: np.ndarray, score: np.ndarray) -> float:
 
 
 class SurfaceAnchorTrainingCorpus:
+    deployment_replay = False
     def __init__(
         self,
         *,
@@ -302,6 +327,142 @@ class SurfaceAnchorTrainingCorpus:
         )[0]
 
 
+class DeploymentReplaySurfaceAnchorTrainingCorpus:
+    """Image-disjoint matcher episodes from the exact online input distribution."""
+
+    deployment_replay = True
+
+    def __init__(
+        self,
+        *,
+        replay_dir: Path,
+        maplets: VfmSurfaceMapletBank,
+        anchors: StableSurfaceAnchorMap,
+        bank: AnchorLocalDescriptorBank,
+        camera_by_image,
+        config: SurfaceAnchorSetMatcherConfig,
+        validation_images: set[str],
+    ) -> None:
+        self.maplets = maplets
+        self.anchors = anchors
+        self.bank = bank
+        self.camera_by_image = camera_by_image
+        self.config = config
+        self.validation_images = set(validation_images)
+        self.path_by_image: dict[str, Path] = {}
+        self.keys: list[tuple[int, str]] = []
+        deployable_maplets = set(int(value) for value in maplets.maplet_ids.tolist())
+        for path in sorted(Path(replay_dir).glob("*.npz")):
+            with np.load(path) as data:
+                image_id = str(np.asarray(data["image_id"]).item())
+                candidate_ids = np.asarray(
+                    data["candidate_maplet_ids"], dtype=np.int64
+                )
+                candidate_probabilities = np.asarray(
+                    data["candidate_probabilities"], dtype=np.float32
+                )
+                target_owner = np.asarray(
+                    data["target_owner_maplet_ids"], dtype=np.int64
+                )
+            if image_id not in camera_by_image or candidate_ids.ndim != 2:
+                continue
+            self.path_by_image[image_id] = path
+            mass_by_maplet: dict[int, float] = {}
+            for maplet_id in np.unique(candidate_ids).tolist():
+                maplet_id = int(maplet_id)
+                if maplet_id < 0 or maplet_id not in deployable_maplets:
+                    continue
+                mass_by_maplet[maplet_id] = float(
+                    np.sum(
+                        np.where(
+                            candidate_ids == maplet_id,
+                            candidate_probabilities,
+                            0.0,
+                        )
+                    )
+                )
+            scene_maplets = [
+                item[0]
+                for item in sorted(
+                    mass_by_maplet.items(),
+                    key=lambda item: (-item[1], item[0]),
+                )[: int(config.maximum_scene_maplets)]
+            ]
+            positive_maplets = [
+                maplet_id
+                for maplet_id in scene_maplets
+                if bool(np.any(target_owner == int(maplet_id)))
+            ]
+            negative_maplets = [
+                maplet_id
+                for maplet_id in scene_maplets
+                if maplet_id not in set(positive_maplets)
+            ][: max(2, len(positive_maplets))]
+            self.keys.extend(
+                (int(maplet_id), image_id)
+                for maplet_id in positive_maplets + negative_maplets
+            )
+        self.keys = sorted(set(self.keys))
+        if not self.keys:
+            raise ValueError("deployment replay contains no matcher episodes")
+
+    def episode(self, key: tuple[int, str], *, negative: bool):
+        del negative
+        maplet_id, image_id = int(key[0]), str(key[1])
+        path = self.path_by_image[image_id]
+        with np.load(path) as data:
+            xy = np.asarray(data["xy"], dtype=np.float32)
+            descriptors = np.asarray(data["descriptors"], dtype=np.float32)
+            scores = np.asarray(data["scores"], dtype=np.float32)
+            target_anchor_ids = np.asarray(
+                data["target_anchor_ids"], dtype=np.int64
+            )
+            target_owner = np.asarray(
+                data["target_owner_maplet_ids"], dtype=np.int64
+            )
+            candidate_ids = np.asarray(
+                data["candidate_maplet_ids"], dtype=np.int64
+            )
+            candidate_probabilities = np.asarray(
+                data["candidate_probabilities"], dtype=np.float32
+            )
+        matches = candidate_ids == int(maplet_id)
+        rows, columns = np.nonzero(matches)
+        if len(rows) < 4:
+            raise ValueError("deployment replay maplet has too few query nodes")
+        unique_rows, first = np.unique(rows, return_index=True)
+        columns = columns[first]
+        probabilities = candidate_probabilities[unique_rows, columns]
+        targets = np.where(
+            target_owner[unique_rows] == int(maplet_id),
+            target_anchor_ids[unique_rows],
+            -1,
+        ).astype(np.int64)
+        query = LocalFeatureFrame(
+            image_id=image_id,
+            keypoints_xy=xy,
+            descriptors=descriptors,
+            scores=np.maximum(scores, 0.0),
+        )
+        camera = self.camera_by_image[image_id]
+        excluded = set(self.validation_images)
+        excluded.add(image_id)
+        return build_surface_anchor_episode(
+            query=query,
+            query_rows=unique_rows.astype(np.int64),
+            query_image_size=(int(camera.width), int(camera.height)),
+            maplet_id=int(maplet_id),
+            maplet_probabilities=probabilities.astype(np.float32),
+            region_distances=(1.0 - probabilities).astype(np.float32),
+            maplets=self.maplets,
+            anchors=self.anchors,
+            descriptor_bank=self.bank,
+            config=self.config,
+            target_anchor_ids=targets,
+            excluded_support_image_ids=tuple(sorted(excluded)),
+        )[0]
+
+
 @torch.no_grad()
 def _evaluate(
     model: SurfaceAnchorSetMatcher,
@@ -312,6 +473,8 @@ def _evaluate(
     maximum_episodes: int,
     pair_loss_weight: float,
     no_match_loss_weight: float,
+    positive_assignment_weight: float,
+    balance_no_match_classes: bool,
 ) -> dict[str, float]:
     model.eval()
     losses: list[float] = []
@@ -321,7 +484,8 @@ def _evaluate(
     dustbin_scores: list[float] = []
     evaluated = 0
     for key in list(keys)[: int(maximum_episodes)]:
-        for negative in (False, True):
+        negative_modes = (False,) if corpus.deployment_replay else (False, True)
+        for negative in negative_modes:
             try:
                 episode = corpus.episode(key, negative=negative).to(device)
             except ValueError:
@@ -332,6 +496,12 @@ def _evaluate(
                 episode,
                 pair_loss_weight=float(pair_loss_weight),
                 no_match_loss_weight=float(no_match_loss_weight),
+                positive_assignment_weight=float(
+                    positive_assignment_weight
+                ),
+                balance_no_match_classes=bool(
+                    balance_no_match_classes
+                ),
             )
             losses.append(float(loss.cpu().item()))
             probabilities = torch.exp(output["query_log_probabilities"]).cpu().numpy()
@@ -437,17 +607,28 @@ def main(argv: Sequence[str] | None = None) -> None:
         maximum_query_nodes=int(args.maximum_positive_nodes)
         + int(args.maximum_null_nodes),
     )
-    corpus = SurfaceAnchorTrainingCorpus(
-        maplets=maplets,
-        anchors=anchors,
-        bank=bank,
-        camera_by_image=camera_by_image,
-        config=config,
-        minimum_positive_nodes=int(args.minimum_positive_nodes),
-        maximum_positive_nodes=int(args.maximum_positive_nodes),
-        maximum_null_nodes=int(args.maximum_null_nodes),
-        validation_images=validation_images,
-    )
+    if str(args.deployment_replay_dir):
+        corpus = DeploymentReplaySurfaceAnchorTrainingCorpus(
+            replay_dir=Path(args.deployment_replay_dir),
+            maplets=maplets,
+            anchors=anchors,
+            bank=bank,
+            camera_by_image=camera_by_image,
+            config=config,
+            validation_images=validation_images,
+        )
+    else:
+        corpus = SurfaceAnchorTrainingCorpus(
+            maplets=maplets,
+            anchors=anchors,
+            bank=bank,
+            camera_by_image=camera_by_image,
+            config=config,
+            minimum_positive_nodes=int(args.minimum_positive_nodes),
+            maximum_positive_nodes=int(args.maximum_positive_nodes),
+            maximum_null_nodes=int(args.maximum_null_nodes),
+            validation_images=validation_images,
+        )
     train_keys = [key for key in corpus.keys if key[1] in training_images]
     validation_keys = [key for key in corpus.keys if key[1] in validation_images]
     if not train_keys or not validation_keys:
@@ -483,7 +664,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                 raise RuntimeError("too many invalid sampled training episodes")
             key = train_keys[int(rng.integers(0, len(train_keys)))]
             negative = bool(
-                rng.random() < float(args.negative_episode_fraction)
+                not corpus.deployment_replay
+                and rng.random() < float(args.negative_episode_fraction)
             )
             try:
                 episode = corpus.episode(key, negative=negative).to(device)
@@ -495,6 +677,12 @@ def main(argv: Sequence[str] | None = None) -> None:
                 episode,
                 pair_loss_weight=float(args.pair_loss_weight),
                 no_match_loss_weight=float(args.no_match_loss_weight),
+                positive_assignment_weight=float(
+                    args.positive_assignment_weight
+                ),
+                balance_no_match_classes=not bool(
+                    args.disable_balanced_no_match_classes
+                ),
             )
             (loss / int(args.gradient_accumulation)).backward()
             losses.append(float(loss.detach().cpu().item()))
@@ -516,6 +704,12 @@ def main(argv: Sequence[str] | None = None) -> None:
             maximum_episodes=int(args.validation_episodes),
             pair_loss_weight=float(args.pair_loss_weight),
             no_match_loss_weight=float(args.no_match_loss_weight),
+            positive_assignment_weight=float(
+                args.positive_assignment_weight
+            ),
+            balance_no_match_classes=not bool(
+                args.disable_balanced_no_match_classes
+            ),
         )
         key = (
             float(validation["positive_recall_at_1"]),
@@ -542,12 +736,17 @@ def main(argv: Sequence[str] | None = None) -> None:
                     "best_validation": validation,
                     "selection_key": list(key),
                     "split": {
-                        "strategy": "sha256_image_disjoint_mod5_v1",
+                        "strategy": (
+                            "sha256_image_disjoint_mod5_deployment_replay_v2"
+                            if corpus.deployment_replay
+                            else "sha256_image_disjoint_mod5_v1"
+                        ),
                         "seed": int(args.seed),
                         "training_image_count": len(training_images),
                         "validation_image_count": len(validation_images),
                         "training_episode_count": len(train_keys),
                         "validation_episode_count": len(validation_keys),
+                        "deployment_replay": bool(corpus.deployment_replay),
                     },
                     "artifacts": {
                         "maplets": {

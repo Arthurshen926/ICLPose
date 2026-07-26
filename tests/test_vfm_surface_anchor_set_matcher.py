@@ -208,6 +208,65 @@ def test_maplet_first_surface_set_matcher_returns_anchor_groups() -> None:
     assert diagnostics["uses_sfm_tracks"] is False
 
 
+def test_surface_anchor_top_l_moves_omitted_probability_to_null() -> None:
+    maplets, anchors, bank, query = _fixture()
+    config = SurfaceAnchorSetMatcherConfig(
+        descriptor_dim=8,
+        model_dim=16,
+        num_heads=4,
+        query_layers=1,
+        anchor_layers=1,
+        dropout=0.0,
+        maximum_support_descriptors=2,
+        maximum_query_nodes=8,
+        maximum_anchors=8,
+        maximum_maplets_per_region=1,
+    )
+    model = SurfaceAnchorSetMatcher(config).eval()
+    maplet_match = SurfaceMapletMatchResult(
+        candidate_maplet_ids=np.asarray([[5]], dtype=np.int64),
+        candidate_logits=np.asarray([[5.0]], dtype=np.float32),
+        candidate_probabilities=np.asarray([[0.95]], dtype=np.float32),
+        null_probabilities=np.asarray([0.05], dtype=np.float32),
+        selected_maplet_ids=np.asarray([5], dtype=np.int64),
+        layout_residuals=np.asarray([[0.0]], dtype=np.float32),
+        support_view_id=None,
+        support_view_score=0.0,
+    )
+    common = dict(
+        model=model,
+        query=query,
+        query_image_size=(100, 100),
+        query_region_xy=np.asarray([[2.0, 2.0]], dtype=np.float32),
+        query_region_grid_size=(4, 4),
+        maplet_match=maplet_match,
+        maplets=maplets,
+        anchors=anchors,
+        descriptor_bank=bank,
+        device="cpu",
+    )
+    full, _diagnostics = match_query_to_surface_anchors(top_l=4, **common)
+    truncated, diagnostics = match_query_to_surface_anchors(top_l=2, **common)
+    for row in range(len(query.keypoints_xy)):
+        for column in range(2):
+            anchor_id = int(truncated.anchor_ids[row, column])
+            full_column = int(
+                np.flatnonzero(full.anchor_ids[row] == anchor_id)[0]
+            )
+            np.testing.assert_allclose(
+                truncated.candidate_probabilities[row, column],
+                full.candidate_probabilities[row, full_column],
+                atol=1e-6,
+            )
+        np.testing.assert_allclose(
+            truncated.candidate_probabilities[row].sum()
+            + truncated.null_probabilities[row],
+            1.0,
+            atol=1e-6,
+        )
+    assert diagnostics["omitted_top_l_anchor_mass_transferred_to_null"] is True
+
+
 def test_query_aligned_radio_maplets_override_sparse_region_assignment() -> None:
     maplets, anchors, bank, query = _fixture()
     config = SurfaceAnchorSetMatcherConfig(
@@ -258,7 +317,14 @@ def test_query_aligned_radio_maplets_override_sparse_region_assignment() -> None
         query_aligned_maplet_match=aligned_match,
     )
     assert np.all(np.any(pool.valid_mask, axis=1))
+    np.testing.assert_allclose(
+        pool.candidate_probabilities.sum(axis=1) + pool.null_probabilities,
+        np.ones((len(pool),), dtype=np.float32),
+        atol=1e-5,
+    )
     assert diagnostics["uses_query_aligned_radio_final_maplets"] is True
+    assert diagnostics["omitted_top_l_anchor_mass_transferred_to_null"] is True
+    assert diagnostics["posterior_probability_conserved"] is True
 
 
 def test_surface_anchor_checkpoint_fails_closed_on_runtime_contract(
