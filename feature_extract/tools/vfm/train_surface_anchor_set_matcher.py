@@ -413,6 +413,11 @@ class DeploymentReplaySurfaceAnchorTrainingCorpus:
         with np.load(path) as data:
             xy = np.asarray(data["xy"], dtype=np.float32)
             descriptors = np.asarray(data["descriptors"], dtype=np.float32)
+            vfm_descriptors = (
+                np.asarray(data["vfm_descriptors"], dtype=np.float32)
+                if "vfm_descriptors" in data
+                else None
+            )
             scores = np.asarray(data["scores"], dtype=np.float32)
             target_anchor_ids = np.asarray(
                 data["target_anchor_ids"], dtype=np.int64
@@ -425,6 +430,19 @@ class DeploymentReplaySurfaceAnchorTrainingCorpus:
             )
             candidate_probabilities = np.asarray(
                 data["candidate_probabilities"], dtype=np.float32
+            )
+        if (
+            vfm_descriptors is not None
+            and int(descriptors.shape[1] + vfm_descriptors.shape[1])
+            == int(self.bank.feature_dim)
+        ):
+            descriptors = np.concatenate(
+                [descriptors, vfm_descriptors],
+                axis=1,
+            )
+        if int(descriptors.shape[1]) != int(self.bank.feature_dim):
+            raise ValueError(
+                "replay query and anchor descriptor dimensions differ"
             )
         matches = candidate_ids == int(maplet_id)
         rows, columns = np.nonzero(matches)

@@ -584,6 +584,7 @@ def _rebuild_artifacts(
     maplets: VfmSurfaceMapletBank,
     anchors: StableSurfaceAnchorMap,
     selected_by_maplet: dict[int, list[tuple[_FeatureAnchor, float, float]]],
+    pose_by_image: dict[str, np.ndarray],
     args: argparse.Namespace,
 ) -> tuple[VfmSurfaceMapletBank, StableSurfaceAnchorMap, AnchorLocalDescriptorBank]:
     kept_rows = [
@@ -612,6 +613,7 @@ def _rebuild_artifacts(
     descriptors: list[np.ndarray] = []
     descriptor_image_ids: list[str] = []
     descriptor_quality: list[float] = []
+    descriptor_view_directions: list[np.ndarray] = []
     anchor_ids_by_maplet: dict[int, list[int]] = {}
     next_anchor_id = 1_000_000_000
     for maplet_row in kept_rows:
@@ -627,7 +629,29 @@ def _rebuild_artifacts(
             surface_ids.append(int(anchors.surface_element_ids[source_row]))
             parent_ids.append(int(anchors.parent_primitive_indices[source_row]))
             xyz.append(candidate.xyz)
-            normals.append(anchors.normals[source_row])
+            normal = anchors.normals[source_row].astype(
+                np.float64
+            ).copy()
+            weighted_view = np.zeros((3,), dtype=np.float64)
+            weight_sum = 0.0
+            for observation in candidate.observations:
+                pose = pose_by_image.get(observation.image_id)
+                if pose is None:
+                    continue
+                camera_center = -pose[:3, :3].T @ pose[:3, 3]
+                direction = camera_center - candidate.xyz
+                direction_norm = float(np.linalg.norm(direction))
+                if direction_norm <= 1e-12:
+                    continue
+                weight = max(float(observation.weight), 1e-8)
+                weighted_view += weight * direction / direction_norm
+                weight_sum += weight
+            if (
+                weight_sum > 0.0
+                and float(np.dot(normal, weighted_view)) < 0.0
+            ):
+                normal *= -1.0
+            normals.append(normal)
             covariances.append(anchors.tangent_covariances[source_row])
             radii.append(float(candidate.support_radius))
             qualities.append(float(quality))
@@ -647,6 +671,14 @@ def _rebuild_artifacts(
             for item in chosen:
                 descriptors.append(item.descriptor)
                 descriptor_image_ids.append(item.image_id)
+                pose = pose_by_image[item.image_id]
+                camera_center = -pose[:3, :3].T @ pose[:3, 3]
+                view_direction = camera_center - candidate.xyz
+                view_direction /= max(
+                    float(np.linalg.norm(view_direction)),
+                    1e-12,
+                )
+                descriptor_view_directions.append(view_direction)
                 descriptor_quality.append(
                     float(
                         max(item.detector_score, 1e-8)
@@ -676,6 +708,10 @@ def _rebuild_artifacts(
         metadata={
             "representation": "feature_aligned_2dgs_surface_anchor",
             "identity": "multiview_alike_detection_cluster_on_2dgs_surface",
+            "normal_orientation": (
+                "signed_toward_weighted_mapping_observation_camera_centers"
+            ),
+            "normal_orientation_uses_mapping_pose_at_runtime": False,
             "uses_mapping_rgb_at_inference": False,
             "uses_sfm_points": False,
             "uses_sfm_tracks": False,
@@ -691,9 +727,16 @@ def _rebuild_artifacts(
         ),
         support_image_ids=tuple(descriptor_image_ids),
         descriptor_quality=np.asarray(descriptor_quality, dtype=np.float32),
+        support_view_directions=np.asarray(
+            descriptor_view_directions, dtype=np.float32
+        ).reshape(-1, 3),
         metadata={
             "representation": "feature_aligned_2dgs_surface_anchor_local_descriptors",
             "local_feature": "alike_detected_points",
+            "view_conditioning": (
+                "per_descriptor_anchor_to_support_camera_unit_direction"
+            ),
+            "stores_mapping_pose": False,
             "uses_mapping_rgb_at_inference": False,
             "uses_sfm_points": False,
             "uses_sfm_tracks": False,
@@ -848,6 +891,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         maplets=maplets,
         anchors=anchors,
         selected_by_maplet=selected_by_maplet,
+        pose_by_image=pose_by_image,
         args=args,
     )
     rebuilt_maplets.save_npz(Path(args.output_maplets))

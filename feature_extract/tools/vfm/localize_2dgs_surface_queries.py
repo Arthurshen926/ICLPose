@@ -13,7 +13,9 @@ import time
 from pathlib import Path
 from typing import Mapping, Sequence
 
+import cv2
 import numpy as np
+from scipy.special import logsumexp
 
 from feature_extract.vfm.artifacts import file_sha256_short
 from feature_extract.vfm.colmap_tracks import ColmapCamera, read_colmap_cameras_binary
@@ -113,10 +115,26 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--maximum_feature_modes", type=int, default=8)
     parser.add_argument("--maximum_global_feature_modes", type=int, default=64)
+    parser.add_argument(
+        "--feature_mode_spatial_rerank",
+        action="store_true",
+        help=(
+            "Rerank the frozen VFM mode shortlist by query-to-support "
+            "spatial-layout consensus before ALIKE anchor measurement."
+        ),
+    )
     parser.add_argument("--feature_mode_minimum_similarity", type=float, default=0.20)
     parser.add_argument("--local_top_k", type=int, default=2048)
     parser.add_argument("--local_candidate_top_k", type=int, default=8192)
     parser.add_argument("--local_nms_radius_px", type=float, default=2.0)
+    parser.add_argument(
+        "--augment_alike_with_radio_final",
+        action="store_true",
+        help=(
+            "Concatenate normalized RADIO-final sampled at query ALIKE "
+            "points; requires an equally augmented map descriptor bank."
+        ),
+    )
     parser.add_argument("--anchor_top_l", type=int, default=20)
     parser.add_argument(
         "--matcher_feature_preferred_base_fill_target",
@@ -134,6 +152,14 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--layout_guided_search_radius_px", type=int, default=18)
     parser.add_argument("--layout_guided_seed_prior_logit", type=float, default=32.0)
     parser.add_argument("--disable_layout_guided_measurement", action="store_true")
+    parser.add_argument(
+        "--always_direct_surface_candidate",
+        action="store_true",
+        help=(
+            "Let query RADIO-final to 2DGS observation-field pose compete "
+            "with set/mode candidates instead of waiting for total failure."
+        ),
+    )
     parser.add_argument("--hypothesis_count", type=int, default=256)
     parser.add_argument("--minimum_fit_groups", type=int, default=8)
     parser.add_argument("--minimum_verification_groups", type=int, default=4)
@@ -171,6 +197,11 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--feature_pose_evidence_weight", type=float, default=0.75
     )
     parser.add_argument("--disable_pose_refinement", action="store_true")
+    parser.add_argument(
+        "--emit_candidate_pose_trace",
+        action="store_true",
+        help="Store candidate poses for offline branch/hypothesis oracle audit.",
+    )
     parser.add_argument("--max_queries", type=int, default=0)
     parser.add_argument("--force", action="store_true")
     return parser.parse_args(argv)
@@ -247,6 +278,41 @@ def _load_raw_final(path: Path, layer_name: str) -> np.ndarray:
     if feature.ndim != 3:
         raise ValueError("RADIO-final query feature must have shape (C,H,W)")
     return feature
+
+
+def _sample_mapped_vfm_at_pixels(
+    mapped_feature: np.ndarray,
+    xy: np.ndarray,
+    *,
+    image_width: int,
+    image_height: int,
+) -> np.ndarray:
+    feature = np.asarray(mapped_feature, dtype=np.float32)
+    if feature.ndim != 3:
+        raise ValueError("mapped VFM feature must have shape (C,H,W)")
+    points = np.asarray(xy, dtype=np.float32).reshape(-1, 2)
+    grid_x = (
+        points[:, 0]
+        * max(int(feature.shape[2]) - 1, 1)
+        / max(int(image_width) - 1, 1)
+    ).astype(np.float32)
+    grid_y = (
+        points[:, 1]
+        * max(int(feature.shape[1]) - 1, 1)
+        / max(int(image_height) - 1, 1)
+    ).astype(np.float32)
+    sampled = cv2.remap(
+        feature.transpose(1, 2, 0),
+        grid_x.reshape(-1, 1),
+        grid_y.reshape(-1, 1),
+        interpolation=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REPLICATE,
+    ).reshape(len(points), int(feature.shape[0]))
+    sampled /= np.maximum(
+        np.linalg.norm(sampled, axis=1, keepdims=True),
+        1e-8,
+    )
+    return sampled.astype(np.float32)
 
 
 def _validate_metadata(metadata: Mapping[str, object], name: str) -> None:
@@ -381,12 +447,12 @@ def _feature_map_pose_evidence(
     image_path: Path,
     camera: ColmapCamera,
     support_view_id: str | None,
+    mapped_feature: np.ndarray | None = None,
 ) -> tuple[float, int]:
     """Independent query dense-feature likelihood at pose-projected map anchors."""
 
     if not result.success or len(anchor_rows) == 0:
         return float("-inf"), 0
-    import cv2
 
     pose = np.asarray(result.pose_w2c, dtype=np.float64).reshape(4, 4)
     xyz = anchors.xyz[np.asarray(anchor_rows, dtype=np.int64)]
@@ -417,11 +483,38 @@ def _feature_map_pose_evidence(
         image_width=int(camera.width),
         image_height=int(camera.height),
     )
+    if int(query_descriptors.shape[1]) != int(descriptor_bank.feature_dim):
+        if mapped_feature is None:
+            raise ValueError(
+                "fused pose evidence requires the query RADIO-final field"
+            )
+        query_descriptors = np.concatenate(
+            [
+                query_descriptors,
+                _sample_mapped_vfm_at_pixels(
+                    mapped_feature,
+                    projected[rows],
+                    image_width=int(camera.width),
+                    image_height=int(camera.height),
+                ),
+            ],
+            axis=1,
+        )
+        query_descriptors /= np.maximum(
+            np.linalg.norm(query_descriptors, axis=1, keepdims=True),
+            1e-8,
+        )
     bank_row_by_id = {
         int(anchor_id): int(row)
         for row, anchor_id in enumerate(descriptor_bank.anchor_ids.tolist())
     }
-    similarities: list[float] = []
+    camera_center = -pose[:3, :3].T @ pose[:3, 3]
+    view_directions = camera_center[None, :] - xyz[rows]
+    view_directions /= np.maximum(
+        np.linalg.norm(view_directions, axis=1, keepdims=True),
+        1e-12,
+    )
+    mixture_log_match: list[float] = []
     for query_row, anchor_row in enumerate(anchor_rows[rows].tolist()):
         anchor_id = int(anchors.anchor_ids[int(anchor_row)])
         bank_row = bank_row_by_id[anchor_id]
@@ -441,19 +534,41 @@ def _feature_map_pose_evidence(
             ]
             if len(mode_rows):
                 descriptor_rows = mode_rows
-        similarities.append(
-            float(
-                np.max(
-                    descriptor_bank.descriptors[descriptor_rows]
-                    @ query_descriptors[query_row]
-                )
-            )
+        edge_similarity = (
+            descriptor_bank.descriptors[descriptor_rows]
+            @ query_descriptors[query_row]
         )
-    similarity = np.asarray(similarities, dtype=np.float64)
-    # Proper log-match probability with an explicit feature dustbin.  Dense
-    # detector score contributes only a bounded repeatability term.
-    logits = (similarity - 0.65) / 0.08
-    log_match = -np.logaddexp(0.0, -logits)
+        edge_log_match = -np.logaddexp(
+            0.0,
+            -(edge_similarity - 0.65) / 0.08,
+        )
+        prior_logits = np.log(
+            np.maximum(
+                descriptor_bank.descriptor_quality[descriptor_rows],
+                1e-8,
+            )
+        ).astype(np.float64)
+        support_directions = descriptor_bank.support_view_directions[
+            descriptor_rows
+        ].astype(np.float64)
+        valid_direction = (
+            np.linalg.norm(support_directions, axis=1) > 0.5
+        )
+        if np.any(valid_direction):
+            geometry_cosine = (
+                support_directions @ view_directions[query_row]
+            )
+            prior_logits += np.where(
+                valid_direction,
+                geometry_cosine / 0.10,
+                np.min(geometry_cosine[valid_direction]) / 0.10,
+            )
+        log_weights = prior_logits - logsumexp(prior_logits)
+        mixture_log_match.append(
+            float(logsumexp(log_weights + edge_log_match))
+        )
+    log_match = np.asarray(mixture_log_match, dtype=np.float64)
+    # Dense detector score contributes only a bounded repeatability term.
     score_term = np.log1p(
         np.maximum(np.asarray(detector_scores, dtype=np.float64), 0.0)
         * 1000.0
@@ -464,8 +579,26 @@ def _feature_map_pose_evidence(
         np.mean(log_match + 0.15 * repeatability)
         - 0.25 * (1.0 - visible_fraction)
     )
-    supported = int(np.sum((similarity >= 0.65) & (repeatability >= 0.05)))
+    supported = int(
+        np.sum((log_match >= np.log(0.5)) & (repeatability >= 0.05))
+    )
     return score, supported
+
+
+def _strict_pose_gate_group_count(
+    matcher_diagnostics: dict[str, object],
+) -> int:
+    """Return groups whose retained identity mass beats conditional null.
+
+    A merely matchable group has non-zero anchor mass but may still be almost
+    entirely null.  Counting those groups as confident forces PnP to sample
+    from ambiguous detector nodes and can turn abstainable queries into
+    arbitrary poses.
+    """
+
+    return int(
+        matcher_diagnostics["conditionally_confident_group_count"]
+    )
 
 
 def _pose_projected_anchor_measurements(
@@ -829,7 +962,22 @@ def main(argv: Sequence[str] | None = None) -> None:
             query = LocalFeatureFrame(
                 image_id=record.image_id,
                 keypoints_xy=detected.xy,
-                descriptors=detected.descriptors,
+                descriptors=(
+                    np.concatenate(
+                        [
+                            detected.descriptors,
+                            _sample_mapped_vfm_at_pixels(
+                                mapped,
+                                detected.xy,
+                                image_width=int(camera.width),
+                                image_height=int(camera.height),
+                            ),
+                        ],
+                        axis=1,
+                    )
+                    if bool(args.augment_alike_with_radio_final)
+                    else detected.descriptors
+                ),
                 scores=detected.scores,
             )
             query_grid_xy = query.keypoints_xy * np.asarray(
@@ -879,10 +1027,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             )
             anchor_set_runtime = time.time() - stage_started
             stage_started = time.time()
-            confident_set_groups = int(
-                matcher_diagnostics[
-                    "conditionally_matchable_group_count"
-                ]
+            confident_set_groups = _strict_pose_gate_group_count(
+                matcher_diagnostics
             )
             mean_set_null = (
                 float(np.mean(anchor_pool.null_probabilities))
@@ -962,6 +1108,12 @@ def main(argv: Sequence[str] | None = None) -> None:
                         maximum_modes=int(args.maximum_feature_modes),
                         allowed_mode_ids=allowed_mode_ids,
                         observation_index=surface_feature_index,
+                        spatial_layout_rerank=bool(
+                            args.feature_mode_spatial_rerank
+                        ),
+                        minimum_layout_similarity=float(
+                            args.feature_mode_minimum_similarity
+                        ),
                     )
                 )
             feature_mode_selection_runtime = (
@@ -1063,7 +1215,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                     ) = alike.match_descriptor_points(
                         image_path,
                         predicted_xy,
-                        support_descriptors,
+                        support_descriptors[
+                            :, : int(detected.descriptors.shape[1])
+                        ],
                         image_width=int(camera.width),
                         image_height=int(camera.height),
                         search_radius_px=int(
@@ -1071,6 +1225,19 @@ def main(argv: Sequence[str] | None = None) -> None:
                         ),
                         search_step_px=1,
                     )
+                    if bool(args.augment_alike_with_radio_final):
+                        measured_descriptors = np.concatenate(
+                            [
+                                measured_descriptors,
+                                _sample_mapped_vfm_at_pixels(
+                                    mapped,
+                                    measured_xy,
+                                    image_width=int(camera.width),
+                                    image_height=int(camera.height),
+                                ),
+                            ],
+                            axis=1,
+                        )
                     layout_query = LocalFeatureFrame(
                         image_id=record.image_id,
                         keypoints_xy=measured_xy,
@@ -1188,7 +1355,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                     ) = alike.match_descriptor_points(
                         image_path,
                         predicted_xy,
-                        support_descriptors,
+                        support_descriptors[
+                            :, : int(detected.descriptors.shape[1])
+                        ],
                         image_width=int(camera.width),
                         image_height=int(camera.height),
                         search_radius_px=int(
@@ -1196,6 +1365,19 @@ def main(argv: Sequence[str] | None = None) -> None:
                         ),
                         search_step_px=1,
                     )
+                    if bool(args.augment_alike_with_radio_final):
+                        measured_descriptors = np.concatenate(
+                            [
+                                measured_descriptors,
+                                _sample_mapped_vfm_at_pixels(
+                                    mapped,
+                                    measured_xy,
+                                    image_width=int(camera.width),
+                                    image_height=int(camera.height),
+                                ),
+                            ],
+                            axis=1,
+                        )
                     expanded_query = LocalFeatureFrame(
                         image_id=record.image_id,
                         keypoints_xy=measured_xy,
@@ -1256,7 +1438,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                         )
             direct_surface_fallback_group_count = 0
             direct_surface_fallback_inliers = 0
-            if not pose_candidates:
+            if bool(args.always_direct_surface_candidate) or not pose_candidates:
                 (
                     direct_surface_pool,
                     direct_surface_mode_ids,
@@ -1314,7 +1496,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                             direct_surface_result,
                             (
                                 "radio_final_2dgs_surface_observation_"
-                                "fallback"
+                                "candidate"
                             ),
                             (
                                 str(direct_surface_mode_ids[0])
@@ -1346,6 +1528,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                             image_path=image_path,
                             camera=camera,
                             support_view_id=candidate_view_id,
+                            mapped_feature=mapped,
                         )
                     )
                     combined_score = float(fixed_score)
@@ -1381,6 +1564,12 @@ def main(argv: Sequence[str] | None = None) -> None:
                             "fixed_candidate_log_likelihood": (
                                 float(fixed_score)
                                 if np.isfinite(fixed_score)
+                                else None
+                            ),
+                            "candidate_pose_w2c": (
+                                candidate_result.pose_w2c.tolist()
+                                if bool(args.emit_candidate_pose_trace)
+                                and candidate_result.success
                                 else None
                             ),
                             "combined_log_likelihood": (
@@ -1470,6 +1659,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                             image_path=image_path,
                             camera=camera,
                             support_view_id=selected_layout_view_id,
+                            mapped_feature=mapped,
                         )
                     )
                     refined_feature_score, _refined_support = (
@@ -1482,6 +1672,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                             image_path=image_path,
                             camera=camera,
                             support_view_id=selected_layout_view_id,
+                            mapped_feature=mapped,
                         )
                     )
                     if np.isfinite(base_refinement_feature_score) and np.isfinite(
@@ -1535,7 +1726,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                     ) = alike.match_descriptor_points(
                         image_path,
                         projected_anchor_xy,
-                        projected_anchor_descriptors,
+                        projected_anchor_descriptors[
+                            :, : int(detected.descriptors.shape[1])
+                        ],
                         image_width=int(camera.width),
                         image_height=int(camera.height),
                         search_radius_px=int(
@@ -1543,6 +1736,19 @@ def main(argv: Sequence[str] | None = None) -> None:
                         ),
                         search_step_px=1,
                     )
+                    if bool(args.augment_alike_with_radio_final):
+                        measured_descriptors = np.concatenate(
+                            [
+                                measured_descriptors,
+                                _sample_mapped_vfm_at_pixels(
+                                    mapped,
+                                    measured_xy,
+                                    image_width=int(camera.width),
+                                    image_height=int(camera.height),
+                                ),
+                            ],
+                            axis=1,
+                        )
                     (
                         measured_xy,
                         measured_descriptors,
@@ -1616,6 +1822,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                                     image_path=image_path,
                                     camera=camera,
                                     support_view_id=selected_layout_view_id,
+                                    mapped_feature=mapped,
                                 )
                             )
                             metric_feature_score, _metric_support = (
@@ -1628,6 +1835,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                                     image_path=image_path,
                                     camera=camera,
                                     support_view_id=selected_layout_view_id,
+                                    mapped_feature=mapped,
                                 )
                             )
                             if (
@@ -1654,6 +1862,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             diagnostics = {
                 **matcher_diagnostics,
                 "query_feature_count": len(query.keypoints_xy),
+                "anchor_identity_uses_radio_final": bool(
+                    args.augment_alike_with_radio_final
+                ),
                 "retrieved_maplet_count": len(
                     set(
                         int(value)
@@ -1692,12 +1903,18 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "initial_fixed_evidence_inliers": int(initial_fixed_inliers),
                 "layout_pool_size": int(layout_pool_size),
                 "layout_mode_count": len(feature_mode_ids),
+                "feature_mode_spatial_rerank": bool(
+                    args.feature_mode_spatial_rerank
+                ),
                 "layout_success_count": int(layout_success_count),
                 "direct_surface_fallback_group_count": int(
                     direct_surface_fallback_group_count
                 ),
                 "direct_surface_fallback_inliers": int(
                     direct_surface_fallback_inliers
+                ),
+                "direct_surface_candidate_always_enabled": bool(
+                    args.always_direct_surface_candidate
                 ),
                 "feature_mode_diagnostics": feature_mode_diagnostics,
                 "feature_pose_evidence_anchor_count": int(
@@ -1830,6 +2047,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             "maplet_match": maplet_config.__dict__,
             "anchor_set_matcher": anchor_matcher.config.to_dict(),
             "local_top_k": int(args.local_top_k),
+            "augment_alike_with_radio_final": bool(
+                args.augment_alike_with_radio_final
+            ),
             "anchor_top_l": int(args.anchor_top_l),
             "matcher_feature_preferred_base_fill_target": int(
                 args.matcher_feature_preferred_base_fill_target
@@ -1852,6 +2072,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                     args.maximum_global_feature_modes
                 ),
                 "maximum_feature_modes": int(args.maximum_feature_modes),
+                "spatial_layout_rerank": bool(
+                    args.feature_mode_spatial_rerank
+                ),
                 "minimum_vfm_similarity": float(
                     args.feature_mode_minimum_similarity
                 ),
@@ -1864,7 +2087,18 @@ def main(argv: Sequence[str] | None = None) -> None:
                     "stored_radio_final_2dgs_feature_modes_and_"
                     "stable_anchor_prototypes"
                 ),
-                "query_rgb_only": True,
+                "query_measurement": (
+                    "alike_dense_plus_radio_final_at_same_pixels"
+                    if bool(args.augment_alike_with_radio_final)
+                    else "alike_dense"
+                ),
+            },
+            "direct_surface_observation_candidate": {
+                "always_enabled": bool(
+                    args.always_direct_surface_candidate
+                ),
+                "query_feature": "radio_final",
+                "map_feature": "2dgs_surface_observation_field",
             },
             "pose": pose_config.__dict__,
             "pose_refinement": {
@@ -1895,7 +2129,10 @@ def main(argv: Sequence[str] | None = None) -> None:
                 ),
                 "weight": float(args.feature_pose_evidence_weight),
                 "source": (
-                    "query_radio_final_vs_stored_2dgs_surface_features"
+                    "query_alike_plus_radio_final_vs_stored_anchor_"
+                    "prototypes"
+                    if bool(args.augment_alike_with_radio_final)
+                    else "query_alike_vs_stored_anchor_prototypes"
                 ),
             },
         },
@@ -1912,7 +2149,15 @@ def main(argv: Sequence[str] | None = None) -> None:
             ),
             "coarse_match": "radio_final_region_to_maplet",
             "fine_match": (
-                "alike_query_set_to_anchor_set_cross_attention_ot_dustbin"
+                (
+                    "alike_plus_radio_final_query_set_to_anchor_set_"
+                    "cross_attention_ot_dustbin"
+                )
+                if bool(args.augment_alike_with_radio_final)
+                else (
+                    "alike_query_set_to_anchor_set_cross_attention_"
+                    "ot_dustbin"
+                )
             ),
             "geometry": "grouped_pnp_with_heldout_feature_evidence",
             "support_mode_semantics": (

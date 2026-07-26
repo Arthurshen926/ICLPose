@@ -14,10 +14,12 @@ mapping RGB + calibrated poses + high-quality 2DGS --offline only-->
 
 query RGB
   -> RADIO-final query-aligned maplet posterior
-  -> ALIKE point-to-anchor partial assignment with explicit null mass
+  -> ALIKE anchor identity, optionally augmented by RADIO-final sampled at
+     the identical query pixels
+  -> partial assignment with an explicit null state and strict confidence gate
   -> independent 2DGS feature-map pose evidence
   -> grouped AP3P/PnP + soft geometric EM
-  -> feature-support-gated map-only coverage fallback
+  -> safe selection between complementary map-only candidate experts
 ```
 
 The deployed prior stores metric 2DGS geometry and feature statistics. It does
@@ -38,6 +40,9 @@ only as a historical baseline.
 - `feature_extract/tools/vfm/build_feature_aligned_surface_anchors.py`
 - `feature_extract/tools/vfm/build_hybrid_feature_surface_map.py`
 - `feature_extract/tools/vfm/build_surface_anchor_deployment_replay.py`
+- `feature_extract/tools/vfm/augment_surface_replay_with_radio_final.py`
+- `feature_extract/tools/vfm/build_alike_radio_final_anchor_bank.py`
+- `feature_extract/tools/vfm/orient_surface_anchor_normals.py`
 - `feature_extract/tools/vfm/train_surface_anchor_set_matcher.py`
 - `feature_extract/tools/vfm/localize_2dgs_surface_queries.py`
 - `feature_extract/tools/vfm/cascade_surface_localization_results.py`

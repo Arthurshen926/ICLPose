@@ -547,6 +547,7 @@ class AnchorLocalDescriptorBank:
     support_image_ids: tuple[str, ...]
     descriptor_quality: np.ndarray
     metadata: Mapping[str, object] | None = None
+    support_view_directions: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         anchor_ids = np.asarray(self.anchor_ids, dtype=np.int64).reshape(-1)
@@ -564,11 +565,30 @@ class AnchorLocalDescriptorBank:
         quality = np.asarray(self.descriptor_quality, dtype=np.float32).reshape(-1)
         if quality.shape != (descriptors.shape[0],):
             raise ValueError("descriptor_quality must align with descriptors")
+        directions = (
+            np.zeros((descriptors.shape[0], 3), dtype=np.float32)
+            if self.support_view_directions is None
+            else np.asarray(
+                self.support_view_directions, dtype=np.float32
+            )
+        )
+        if directions.shape != (descriptors.shape[0], 3):
+            raise ValueError(
+                "support_view_directions must have shape (M, 3)"
+            )
+        direction_norm = np.linalg.norm(directions, axis=1, keepdims=True)
+        directions = np.divide(
+            directions,
+            np.maximum(direction_norm, 1e-8),
+            out=np.zeros_like(directions),
+            where=direction_norm > 1e-8,
+        )
         object.__setattr__(self, "anchor_ids", anchor_ids)
         object.__setattr__(self, "descriptor_offsets", offsets)
         object.__setattr__(self, "descriptors", _normalize_rows(descriptors))
         object.__setattr__(self, "support_image_ids", image_ids)
         object.__setattr__(self, "descriptor_quality", quality)
+        object.__setattr__(self, "support_view_directions", directions)
         object.__setattr__(self, "metadata", dict(self.metadata or {}))
 
     def __len__(self) -> int:
@@ -586,6 +606,7 @@ class AnchorLocalDescriptorBank:
             descriptor_offsets=self.descriptor_offsets,
             descriptors=self.descriptors,
             descriptor_quality=self.descriptor_quality,
+            support_view_directions=self.support_view_directions,
             support_image_ids_json=np.asarray(json.dumps(list(self.support_image_ids))),
             metadata_json=np.asarray(json.dumps(dict(self.metadata or {}), sort_keys=True)),
         )
@@ -599,6 +620,14 @@ class AnchorLocalDescriptorBank:
                 descriptors=np.asarray(data["descriptors"], dtype=np.float32),
                 support_image_ids=tuple(json.loads(str(np.asarray(data["support_image_ids_json"]).item()))),
                 descriptor_quality=np.asarray(data["descriptor_quality"], dtype=np.float32),
+                support_view_directions=(
+                    np.asarray(
+                        data["support_view_directions"],
+                        dtype=np.float32,
+                    )
+                    if "support_view_directions" in data
+                    else None
+                ),
                 metadata=(
                     json.loads(str(np.asarray(data["metadata_json"]).item()))
                     if "metadata_json" in data
@@ -962,6 +991,8 @@ def select_vfm_surface_feature_modes(
     maximum_modes: int = 8,
     allowed_mode_ids: Sequence[str] | None = None,
     observation_index: VfmSurfaceObservationIndex | None = None,
+    spatial_layout_rerank: bool = False,
+    minimum_layout_similarity: float = 0.20,
 ) -> tuple[tuple[str, ...], np.ndarray]:
     """Select view-conditioned RADIO-final map modes without reading images.
 
@@ -1004,7 +1035,7 @@ def select_vfm_surface_feature_modes(
     ]
     global_scores.sort(key=lambda item: (-item[0], item[1]))
     shortlisted = global_scores[: int(maximum_global_modes)]
-    reranked: list[tuple[float, str]] = []
+    reranked: list[tuple[float, float, int, float, str]] = []
     for global_score, image_id in shortlisted:
         rows = index.rows_for_image(image_id)
         if len(rows) == 0:
@@ -1019,14 +1050,56 @@ def select_vfm_surface_feature_modes(
                 ]
             )
         )
+        descriptor_score = coverage_score + 0.15 * float(global_score)
+        layout_inliers = 0
+        layout_residual = float("inf")
+        layout_score = -float("inf")
+        if bool(spatial_layout_rerank):
+            (
+                _layout_matrix,
+                _layout_translation,
+                layout_inliers,
+                layout_residual,
+            ) = estimate_vfm_query_to_support_layout(
+                feature_map,
+                observation_bank,
+                image_id,
+                minimum_similarity=float(minimum_layout_similarity),
+                observation_index=index,
+            )
+            if int(layout_inliers) >= 3 and np.isfinite(layout_residual):
+                # Normalize consensus by support-set size so richly observed
+                # views do not win only because they contain more tokens.
+                layout_score = (
+                    float(layout_inliers)
+                    / np.sqrt(max(len(rows), 1))
+                    - 0.25 * float(layout_residual)
+                )
         reranked.append(
-            (coverage_score + 0.15 * float(global_score), image_id)
+            (
+                float(layout_score),
+                float(descriptor_score),
+                int(layout_inliers),
+                float(layout_residual),
+                image_id,
+            )
         )
-    reranked.sort(key=lambda item: (-item[0], item[1]))
+    if bool(spatial_layout_rerank):
+        reranked.sort(
+            key=lambda item: (
+                -item[0],
+                -item[2],
+                item[3],
+                -item[1],
+                item[4],
+            )
+        )
+    else:
+        reranked.sort(key=lambda item: (-item[1], item[4]))
     selected = reranked[: int(maximum_modes)]
     return (
-        tuple(item[1] for item in selected),
-        np.asarray([item[0] for item in selected], dtype=np.float32),
+        tuple(item[4] for item in selected),
+        np.asarray([item[1] for item in selected], dtype=np.float32),
     )
 
 

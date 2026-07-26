@@ -109,11 +109,12 @@ new and stable map-only pose candidates
 
 The learned set matcher is deliberately budgeted to the retrieved scene
 maplets. It is not run independently for every maplet touched by every query
-point. Its PnP branch has an explicit conditional matchability gate: points
-whose mass is predominantly null remain uncertainty evidence but do not trigger
-expensive, low-information hypothesis generation. Absolute posterior mass is
-retained for hypothesis scoring; conditional identity confidence is used only
-after conditioning on the point being matchable.
+point. Its PnP branch has an explicit conditional identity-confidence gate:
+only groups whose retained anchor mass exceeds their conditional null mass
+count toward the minimum needed to start PnP. Merely having non-zero candidate
+mass is not confidence. Null-dominated points remain uncertainty evidence and
+do not trigger low-information hypothesis generation. Absolute posterior mass
+is retained for hypothesis scoring.
 
 ## Why the branches are complementary
 
@@ -133,9 +134,14 @@ operation.
 
 The fixed verifier is constructed before pose-mode generation from query ALIKE
 features, retrieved maplets, and stored anchor prototypes. Every generated pose
-is scored against this identical candidate pool and an independent RADIO-final
-2DGS feature-map likelihood. This rejects repeated-structure modes that have
+is scored against this identical candidate pool and an independent 2DGS anchor
+feature-map likelihood. This rejects repeated-structure modes that have
 many self-consistent generation inliers but little independent map evidence.
+
+Support descriptors are not reduced with a maximum over mapping views. The
+likelihood uses a normalized mixture whose prior combines descriptor quality
+and the stored anchor-to-camera direction. This prevents a single accidental
+high-similarity view from dominating repeated-facade evidence.
 
 ## Production invariants
 
@@ -212,6 +218,21 @@ feature-preferred StMaryChurch deployment-replay checkpoint achieved:
 | cosine R@1 / R@5 | 43.15% / 77.40% |
 | dustbin AUPRC | 99.38% |
 
+The RADIO-final identity expert samples the mapped RADIO-final field at the
+same ALIKE pixels and concatenates it with the local descriptor. The persistent
+map stores these fused prototypes, never the source images. Its image-disjoint
+deployment-replay validation achieved:
+
+| Metric | ALIKE + RADIO-final identity expert |
+|---|---:|
+| learned R@1 / R@3 / R@5 | 53.97% / 78.91% / 86.62% |
+| cosine R@1 / R@3 / R@5 | 51.25% / 74.38% / 83.45% |
+| dustbin AUPRC | 99.82% |
+
+The expert is not a drop-in replacement for the ALIKE main candidate. It adds
+candidate diversity; final promotion still requires a fixed, ALIKE-only 2DGS
+feature-map score margin and the pose-disagreement safety rule.
+
 ## StMaryChurch map
 
 The current experiment uses `/root/StMaryChurch2dgs_clean.ply`. This clean file
@@ -227,6 +248,8 @@ The feature-preferred deployment map contains:
 - 5,638 bounded geometry coverage anchors;
 - 37,426 ALIKE observations attached to the feature-aligned subset;
 - 1,476 deployment-replay examples containing 755,712 detected query nodes.
+- 10,580 anchors and 25,890 exact replay-aligned 192-D
+  ALIKE+RADIO-final support descriptors in the semantic identity expert.
 
 The persistent deployment artifacts contain no mapping RGB. Historical
 mapping-depth or image artifacts may remain elsewhere in experiment storage,
@@ -253,6 +276,8 @@ PYTHONPATH=. python feature_extract/tools/vfm/localize_2dgs_surface_queries.py \
 ```
 
 The only RGB path accepted by this CLI is `query_image_root`.
+For the complementary semantic identity expert, use its 192-D descriptor bank
+and matcher checkpoint together with `--augment_alike_with_radio_final`.
 
 ## Validation status
 
@@ -260,50 +285,42 @@ StMaryChurch is a development scene: query GT had already been consumed during
 diagnosis and parameter selection, so the final 530-query result is a complete
 development/non-regression evaluation, not an untouched test claim.
 
-The new feature-preferred primary completed all eight query shards, 530/530.
-Its fine recall improved sharply, but low feature-support queries exposed
-repeated-facade aliases. A GT-free support gate routed 97/530 queries to the
-broader stable feature-map candidate generator.
+The final ALIKE+RADIO-final identity expert completed all eight query shards.
+Its strict conditional-null gate returned a pose for 516/530 queries and
+abstained on 14 instead of forcing ambiguous PnP. The final selector compares
+that expert with the previous safe feature-map result against one fixed,
+oriented ALIKE-anchor map. It keeps the safe candidate unless the expert
+improves fixed-map log likelihood by at least `0.05`; disagreement above
+`5 m` or `10°` also retains the safe candidate. These tests use no GT.
 
-The two map-only candidate systems are finally compared against one fixed
-feature-aligned 2DGS anchor map. The verifier projects a spatially diverse
-anchor set under each pose, samples query ALIKE densely, and scores descriptor,
-repeatability, surface-normal, and image-coverage evidence. It keeps the stable
-candidate unless the new candidate improves fixed-map log likelihood by at
-least `0.05`; candidate disagreement above `5 m` or `10°` also retains the
-stable candidate. These tests use no GT. They are explicit rejection/fallback
-rules, not extra hypothesis generation.
+The selector retained the expert on 82 queries and the safe candidate on 448.
+Final coverage and pose success are 530/530.
 
-The selector retained the new clean-2DGS candidate on 247 queries and the
-stable feature-map candidate on 283. Seventy-four stable selections were due
-to insufficient feature-score margin and 36 were due to excessive pose
-disagreement. Final coverage and pose success are 530/530.
-
-| Metric | Feature-aligned safe selector | v2 stable feature map |
+| Metric | Final identity-expert selector | Previous fixed selector |
 |---|---:|---:|
-| Median translation | **0.228 m** | 0.302 m |
-| Mean translation | **0.854 m** | 0.932 m |
-| P90 translation | **2.019 m** | 2.040 m |
-| P95 translation | 3.739 m | 3.739 m |
+| Median translation | **0.197 m** | 0.216 m |
+| Mean translation | **0.794 m** | 0.828 m |
+| P90 translation | **1.627 m** | 1.890 m |
+| P95 translation | 3.702 m | 3.702 m |
 | Maximum translation | 25.068 m | 25.068 m |
-| Median rotation | **0.720°** | 0.948° |
-| Mean rotation | **2.634°** | 2.870° |
-| P90 rotation | **5.558°** | 6.109° |
-| P95 rotation | **13.203°** | 13.462° |
+| Median rotation | **0.619°** | 0.680° |
+| Mean rotation | **2.444°** | 2.557° |
+| P90 rotation | **4.031°** | 5.203° |
+| P95 rotation | **13.113°** | 13.462° |
 | Maximum rotation | 53.537° | 53.537° |
-| 5 cm / 5° recall | **5.09%** | 1.13% |
-| 10 cm / 5° recall | **19.25%** | 9.25% |
-| 25 cm / 10° recall | **52.64%** | 40.94% |
-| 50 cm / 10° recall | **76.60%** | 70.19% |
-| 5 m / 10° recall | **93.58%** | 92.83% |
+| 5 cm / 5° recall | **7.17%** | 5.85% |
+| 10 cm / 5° recall | **24.15%** | 21.13% |
+| 25 cm / 10° recall | **58.49%** | 54.53% |
+| 50 cm / 10° recall | **78.87%** | 77.55% |
+| 5 m / 10° recall | **93.77%** | 93.40% |
 | Pose success | 100% | 100% |
 
-Thus every reported central, tail, rotation, recall, and success metric is
-equal to or better than v2. The strict 5 cm recall improves by 4.5x, while the
-translation median drops by 24.5%. The result still does **not** meet a 4 cm
-median target; local anchor identity and sub-pixel metric accuracy remain the
-next bottlenecks. This limitation is explicit and must not be hidden behind the
-non-regression result.
+The candidate-pose oracle over the two experts reaches a `0.183 m` translation
+median. The oracle over every stored hypothesis reaches `0.105 m`, but only
+15.85% of all queries have a stored hypothesis within `4 cm / 1°`. Therefore
+selection regret remains measurable, while the dominant 4 cm bottleneck is
+still candidate identity/generation and a missing reliable local metric
+refinement basin. The result must not be presented as meeting a 4 cm target.
 
 Every final row records selector evidence and all forbidden runtime flags as
 false. No mapping RGB is stored or opened by either candidate generator or the
@@ -311,7 +328,8 @@ final verifier.
 
 Canonical reports:
 
-- `output/vfm/2dgs_surface/StMarysChurch/full_train/mainline_v3_feature_aligned/full_feature_selector_safe/full_results.jsonl`
-- `output/vfm/2dgs_surface/StMarysChurch/full_train/mainline_v3_feature_aligned/full_feature_selector_safe/merge_summary.json`
-- `output/vfm/2dgs_surface/StMarysChurch/full_train/mainline_v3_feature_aligned/full_feature_selector_safe/evaluation.json`
-- `output/vfm/2dgs_surface/StMarysChurch/full_train/mainline_v3_feature_aligned/full_feature_selector_safe/errors.jsonl`
+- `output/vfm/2dgs_surface/StMarysChurch/full_train/mainline_v3_feature_aligned/full_vfm_identity_mixture_selector_safe/full_results.jsonl`
+- `output/vfm/2dgs_surface/StMarysChurch/full_train/mainline_v3_feature_aligned/full_vfm_identity_mixture_selector_safe/merge_summary.json`
+- `output/vfm/2dgs_surface/StMarysChurch/full_train/mainline_v3_feature_aligned/full_vfm_identity_mixture_selector_safe/evaluation.json`
+- `output/vfm/2dgs_surface/StMarysChurch/full_train/mainline_v3_feature_aligned/full_vfm_identity_mixture_selector_safe/errors.jsonl`
+- `output/vfm/2dgs_surface/StMarysChurch/full_train/mainline_v3_feature_aligned/full_vfm_identity_mixture_selector_safe/oracle_audit.json`

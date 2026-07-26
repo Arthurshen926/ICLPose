@@ -15,6 +15,7 @@ from typing import Sequence
 
 import cv2
 import numpy as np
+from scipy.special import logsumexp
 
 from feature_extract.tools.vfm.localize_2dgs_surface_queries import (
     _load_query_camera_manifest,
@@ -53,6 +54,42 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--minimum_normal_cosine", type=float, default=0.15)
     parser.add_argument("--minimum_similarity", type=float, default=0.65)
     parser.add_argument(
+        "--fixed_evidence_union",
+        action="store_true",
+        help=(
+            "Freeze the union of candidate-visible anchor IDs and score every "
+            "pose with that identical denominator and explicit null mass."
+        ),
+    )
+    parser.add_argument(
+        "--signed_normal_visibility",
+        action="store_true",
+        help="Require normals oriented toward mapping observation cameras.",
+    )
+    parser.add_argument(
+        "--view_conditioning_candidate",
+        default="",
+        help=(
+            "Candidate whose query-level RADIO feature-mode scores define the "
+            "fixed support-view mixture."
+        ),
+    )
+    parser.add_argument("--similarity_scale", type=float, default=0.08)
+    parser.add_argument("--anchor_null_probability", type=float, default=0.5)
+    parser.add_argument("--view_prior_temperature", type=float, default=0.08)
+    parser.add_argument(
+        "--geometry_view_temperature", type=float, default=0.10
+    )
+    parser.add_argument(
+        "--zbuffer_occlusion",
+        action="store_true",
+        help="Reject anchors hidden by the oriented 2DGS anchor depth field.",
+    )
+    parser.add_argument("--occlusion_cell_px", type=int, default=4)
+    parser.add_argument(
+        "--occlusion_depth_tolerance_m", type=float, default=0.15
+    )
+    parser.add_argument(
         "--safety_candidate",
         default="",
         help=(
@@ -78,6 +115,12 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--matcha_repo", default="/root/matcha")
     parser.add_argument("--alike_model_name", default="alike-t")
+    parser.add_argument(
+        "--max_queries",
+        type=int,
+        default=0,
+        help="Optional positive prefix length for bounded validation runs.",
+    )
     parser.add_argument("--output_jsonl", required=True)
     parser.add_argument("--summary_json", required=True)
     parser.add_argument(
@@ -167,6 +210,7 @@ def _visible_anchor_rows(
     grid_rows: int,
     grid_cols: int,
     minimum_normal_cosine: float,
+    signed_normals: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     pose = np.asarray(pose_w2c, dtype=np.float64).reshape(4, 4)
     xyz = anchors.xyz
@@ -187,8 +231,14 @@ def _visible_anchor_rows(
         np.linalg.norm(view_direction, axis=1, keepdims=True),
         1e-12,
     )
-    normal_cosine = np.abs(
-        np.sum(anchors.normals * view_direction, axis=1)
+    signed_normal_cosine = np.sum(
+        anchors.normals * view_direction,
+        axis=1,
+    )
+    normal_cosine = (
+        signed_normal_cosine
+        if bool(signed_normals)
+        else np.abs(signed_normal_cosine)
     )
     valid = (
         (descriptor_quality > 0.0)
@@ -278,6 +328,7 @@ def _pose_feature_evidence(
         grid_rows=int(args.grid_rows),
         grid_cols=int(args.grid_cols),
         minimum_normal_cosine=float(args.minimum_normal_cosine),
+        signed_normals=False,
     )
     if len(rows) < 8:
         return {
@@ -362,6 +413,343 @@ def _pose_feature_evidence(
         "evaluated_anchor_count": int(len(rows)),
         "supported_cell_count": int(len(supported_cells)),
         "median_similarity": float(np.median(similarities)),
+    }
+
+
+def _query_feature_mode_scores(
+    candidate: dict[str, object],
+) -> dict[str, float]:
+    diagnostics = dict(candidate.get("diagnostics") or {})
+    output: dict[str, float] = {}
+    for value in diagnostics.get("feature_mode_diagnostics", []):
+        row = dict(value)
+        mode_id = str(row.get("mode_id") or "")
+        score = row.get("vfm_score")
+        if not mode_id or score is None or not np.isfinite(float(score)):
+            continue
+        output[mode_id] = max(
+            output.get(mode_id, -float("inf")),
+            float(score),
+        )
+    return output
+
+
+def _fixed_anchor_union(
+    *,
+    candidate_rows: dict[str, dict[str, object]],
+    anchors: StableSurfaceAnchorMap,
+    descriptor_quality: np.ndarray,
+    camera,
+    args: argparse.Namespace,
+) -> np.ndarray:
+    rows: set[int] = set()
+    for candidate in candidate_rows.values():
+        if (
+            not bool(candidate.get("success", False))
+            or candidate.get("pose_w2c") is None
+        ):
+            continue
+        selected, _xy, _normal = _visible_anchor_rows(
+            pose_w2c=np.asarray(candidate["pose_w2c"], dtype=np.float64),
+            anchors=anchors,
+            descriptor_quality=descriptor_quality,
+            camera=camera,
+            maximum_anchors=int(args.maximum_anchors),
+            maximum_anchors_per_cell=int(
+                args.maximum_anchors_per_cell
+            ),
+            grid_rows=int(args.grid_rows),
+            grid_cols=int(args.grid_cols),
+            minimum_normal_cosine=float(args.minimum_normal_cosine),
+            signed_normals=bool(args.signed_normal_visibility),
+        )
+        rows.update(int(value) for value in selected.tolist())
+    return np.asarray(sorted(rows), dtype=np.int64)
+
+
+def _fixed_pose_feature_evidence(
+    *,
+    pose_w2c: np.ndarray,
+    fixed_anchor_rows: np.ndarray,
+    anchors: StableSurfaceAnchorMap,
+    descriptor_bank: AnchorLocalDescriptorBank,
+    descriptor_offsets: np.ndarray,
+    alike: AlikeDenseObservationExtractor,
+    image_path: Path,
+    camera,
+    view_mode_scores: dict[str, float],
+    args: argparse.Namespace,
+) -> dict[str, object]:
+    fixed_rows = np.asarray(fixed_anchor_rows, dtype=np.int64).reshape(-1)
+    if len(fixed_rows) == 0:
+        return {
+            "log_likelihood": None,
+            "supported_anchor_count": 0,
+            "evaluated_anchor_count": 0,
+            "visible_anchor_count": 0,
+            "supported_cell_count": 0,
+            "median_similarity": None,
+            "fixed_denominator": True,
+        }
+    pose = np.asarray(pose_w2c, dtype=np.float64).reshape(4, 4)
+    xyz = anchors.xyz[fixed_rows]
+    camera_xyz = xyz @ pose[:3, :3].T + pose[:3, 3]
+    matrix, distortion = camera_matrix_and_distortion(camera)
+    rvec, _jacobian = cv2.Rodrigues(pose[:3, :3])
+    projected, _jacobian = cv2.projectPoints(
+        xyz,
+        rvec,
+        pose[:3, 3],
+        matrix,
+        distortion,
+    )
+    projected = projected.reshape(-1, 2)
+    camera_center = -pose[:3, :3].T @ pose[:3, 3]
+    view_direction = camera_center[None, :] - xyz
+    view_direction /= np.maximum(
+        np.linalg.norm(view_direction, axis=1, keepdims=True),
+        1e-12,
+    )
+    signed_normal = np.sum(
+        anchors.normals[fixed_rows] * view_direction,
+        axis=1,
+    )
+    normal_visibility = (
+        signed_normal
+        if bool(args.signed_normal_visibility)
+        else np.abs(signed_normal)
+    )
+    visible = (
+        (camera_xyz[:, 2] > 1e-6)
+        & (projected[:, 0] >= 0.0)
+        & (projected[:, 0] <= float(camera.width - 1))
+        & (projected[:, 1] >= 0.0)
+        & (projected[:, 1] <= float(camera.height - 1))
+        & (
+            normal_visibility
+            >= float(args.minimum_normal_cosine)
+        )
+    )
+    occlusion_visible = np.ones((len(fixed_rows),), dtype=bool)
+    if bool(args.zbuffer_occlusion):
+        all_camera_xyz = (
+            anchors.xyz @ pose[:3, :3].T + pose[:3, 3]
+        )
+        all_projected, _jacobian = cv2.projectPoints(
+            anchors.xyz,
+            rvec,
+            pose[:3, 3],
+            matrix,
+            distortion,
+        )
+        all_projected = all_projected.reshape(-1, 2)
+        cell_size = max(int(args.occlusion_cell_px), 1)
+        cell_cols = int(np.ceil(float(camera.width) / cell_size))
+        cell_rows = int(np.ceil(float(camera.height) / cell_size))
+        all_in_frame = (
+            (all_camera_xyz[:, 2] > 1e-6)
+            & (all_projected[:, 0] >= 0.0)
+            & (all_projected[:, 0] <= float(camera.width - 1))
+            & (all_projected[:, 1] >= 0.0)
+            & (all_projected[:, 1] <= float(camera.height - 1))
+        )
+        zbuffer = np.full(
+            (cell_rows * cell_cols,),
+            float("inf"),
+            dtype=np.float64,
+        )
+        all_cells = (
+            np.floor(all_projected[all_in_frame, 1] / cell_size)
+            .astype(np.int64)
+            * cell_cols
+            + np.floor(all_projected[all_in_frame, 0] / cell_size)
+            .astype(np.int64)
+        )
+        np.minimum.at(
+            zbuffer,
+            all_cells,
+            all_camera_xyz[all_in_frame, 2],
+        )
+        fixed_cells = (
+            np.clip(
+                np.floor(projected[:, 1] / cell_size),
+                0,
+                cell_rows - 1,
+            ).astype(np.int64)
+            * cell_cols
+            + np.clip(
+                np.floor(projected[:, 0] / cell_size),
+                0,
+                cell_cols - 1,
+            ).astype(np.int64)
+        )
+        occlusion_visible = (
+            camera_xyz[:, 2]
+            <= zbuffer[fixed_cells]
+            + float(args.occlusion_depth_tolerance_m)
+        )
+        visible &= occlusion_visible
+    visible_local_rows = np.flatnonzero(visible)
+    anchor_llr = np.zeros((len(fixed_rows),), dtype=np.float64)
+    similarities = np.full(
+        (len(fixed_rows),),
+        np.nan,
+        dtype=np.float64,
+    )
+    supported = np.zeros((len(fixed_rows),), dtype=bool)
+    if len(visible_local_rows):
+        query_descriptors, _detector_scores, _image_hash = (
+            alike.sample_points(
+                image_path,
+                projected[visible_local_rows],
+                image_width=int(camera.width),
+                image_height=int(camera.height),
+            )
+        )
+        for query_row, local_row in enumerate(
+            visible_local_rows.tolist()
+        ):
+            anchor_row = int(fixed_rows[local_row])
+            start, end = descriptor_offsets[anchor_row]
+            descriptors = descriptor_bank.descriptors[
+                int(start) : int(end)
+            ]
+            edge_similarity = (
+                descriptors @ query_descriptors[query_row]
+            ).astype(np.float64)
+            similarities[local_row] = float(
+                np.max(edge_similarity)
+            )
+            support_ids = descriptor_bank.support_image_ids[
+                int(start) : int(end)
+            ]
+            support_quality = np.maximum(
+                descriptor_bank.descriptor_quality[
+                    int(start) : int(end)
+                ].astype(np.float64),
+                1e-8,
+            )
+            prior_logits = np.log(support_quality)
+            support_directions = (
+                descriptor_bank.support_view_directions[
+                    int(start) : int(end)
+                ].astype(np.float64)
+            )
+            valid_direction = (
+                np.linalg.norm(support_directions, axis=1) > 0.5
+            )
+            if np.any(valid_direction):
+                geometry_cosine = (
+                    support_directions @ view_direction[local_row]
+                )
+                prior_logits += np.where(
+                    valid_direction,
+                    geometry_cosine
+                    / float(args.geometry_view_temperature),
+                    np.min(geometry_cosine[valid_direction])
+                    / float(args.geometry_view_temperature),
+                )
+            if view_mode_scores and any(
+                value in view_mode_scores for value in support_ids
+            ):
+                prior_logits += np.asarray(
+                    [
+                        (
+                            view_mode_scores[value]
+                            if value in view_mode_scores
+                            else min(view_mode_scores.values())
+                            - float(args.view_prior_temperature)
+                        )
+                        / float(args.view_prior_temperature)
+                        for value in support_ids
+                    ],
+                    dtype=np.float64,
+                )
+            log_weights = prior_logits - logsumexp(prior_logits)
+            edge_llr = np.clip(
+                (
+                    edge_similarity
+                    - float(args.minimum_similarity)
+                )
+                / float(args.similarity_scale),
+                -12.0,
+                12.0,
+            )
+            view_mixture_llr = float(
+                logsumexp(log_weights + edge_llr)
+            )
+            null_probability = float(args.anchor_null_probability)
+            anchor_llr[local_row] = float(
+                np.logaddexp(
+                    np.log(null_probability),
+                    np.log1p(-null_probability)
+                    + view_mixture_llr,
+                )
+            )
+            supported[local_row] = bool(
+                view_mixture_llr > 0.0
+            )
+    score = float(
+        np.sum(np.clip(anchor_llr, -2.0, 4.0))
+        / max(len(fixed_rows), 1)
+    )
+    supported_xy = projected[supported]
+    supported_cells = {
+        (
+            int(
+                np.clip(
+                    point[1]
+                    / max(float(camera.height), 1.0)
+                    * int(args.grid_rows),
+                    0,
+                    int(args.grid_rows) - 1,
+                )
+            ),
+            int(
+                np.clip(
+                    point[0]
+                    / max(float(camera.width), 1.0)
+                    * int(args.grid_cols),
+                    0,
+                    int(args.grid_cols) - 1,
+                )
+            ),
+        )
+        for point in supported_xy
+    }
+    finite_similarity = similarities[np.isfinite(similarities)]
+    return {
+        "log_likelihood": score,
+        "supported_anchor_count": int(np.sum(supported)),
+        "evaluated_anchor_count": int(len(fixed_rows)),
+        "visible_anchor_count": int(np.sum(visible)),
+        "occlusion_rejected_anchor_count": int(
+            np.sum(~occlusion_visible)
+            if bool(args.zbuffer_occlusion)
+            else 0
+        ),
+        "supported_cell_count": int(len(supported_cells)),
+        "median_similarity": (
+            float(np.median(finite_similarity))
+            if len(finite_similarity)
+            else None
+        ),
+        "fixed_denominator": True,
+        "explicit_null_probability": float(
+            args.anchor_null_probability
+        ),
+        "view_conditioned_mixture": bool(
+            view_mode_scores
+            or np.any(
+                np.linalg.norm(
+                    descriptor_bank.support_view_directions,
+                    axis=1,
+                )
+                > 0.5
+            )
+        ),
+        "zbuffer_occlusion": bool(args.zbuffer_occlusion),
+        "uses_max_over_views": False,
     }
 
 
@@ -518,6 +906,13 @@ def main(argv: Sequence[str] | None = None) -> None:
         and str(args.safety_candidate) not in candidate_paths
     ):
         raise ValueError("safety_candidate is absent from candidate results")
+    if (
+        str(args.view_conditioning_candidate)
+        and str(args.view_conditioning_candidate) not in candidate_paths
+    ):
+        raise ValueError(
+            "view_conditioning_candidate is absent from candidate results"
+        )
     if float(args.minimum_score_margin) < 0.0:
         raise ValueError("minimum_score_margin must be non-negative")
     if (
@@ -535,12 +930,29 @@ def main(argv: Sequence[str] | None = None) -> None:
         raise ValueError(
             "safety disagreement limits require safety_candidate"
         )
+    if float(args.similarity_scale) <= 0.0:
+        raise ValueError("similarity_scale must be positive")
+    if not 0.0 < float(args.anchor_null_probability) < 1.0:
+        raise ValueError("anchor_null_probability must be in (0, 1)")
+    if float(args.view_prior_temperature) <= 0.0:
+        raise ValueError("view_prior_temperature must be positive")
+    if float(args.geometry_view_temperature) <= 0.0:
+        raise ValueError("geometry_view_temperature must be positive")
+    if (
+        int(args.occlusion_cell_px) <= 0
+        or float(args.occlusion_depth_tolerance_m) < 0.0
+    ):
+        raise ValueError("occlusion cell/tolerance is invalid")
     candidates = {
         name: _read_results(path)
         for name, path in candidate_paths.items()
     }
     manifest = TokenBankManifest.from_json(Path(args.query_manifest))
     image_ids = [record.image_id for record in manifest.records]
+    if int(args.max_queries) < 0:
+        raise ValueError("max_queries must be non-negative")
+    if int(args.max_queries) > 0:
+        image_ids = image_ids[: int(args.max_queries)]
     for name, rows in candidates.items():
         missing_ids = set(image_ids) - set(rows)
         if missing_ids:
@@ -552,6 +964,17 @@ def main(argv: Sequence[str] | None = None) -> None:
         Path(args.query_camera_manifest)
     )
     anchors = StableSurfaceAnchorMap.load_npz(Path(args.anchors))
+    if (
+        bool(args.signed_normal_visibility)
+        and "signed_toward" not in str(
+            dict(anchors.metadata or {}).get(
+                "normal_orientation", ""
+            )
+        )
+    ):
+        raise ValueError(
+            "signed normal visibility requires offline-oriented anchor normals"
+        )
     descriptor_bank = AnchorLocalDescriptorBank.load_npz(
         Path(args.local_descriptor_bank)
     )
@@ -572,6 +995,30 @@ def main(argv: Sequence[str] | None = None) -> None:
         for query_index, image_id in enumerate(image_ids):
             if image_id not in cameras:
                 raise ValueError(f"missing query calibration: {image_id}")
+            candidate_rows = {
+                name: rows[image_id]
+                for name, rows in candidates.items()
+            }
+            fixed_anchor_rows = (
+                _fixed_anchor_union(
+                    candidate_rows=candidate_rows,
+                    anchors=anchors,
+                    descriptor_quality=descriptor_quality,
+                    camera=cameras[image_id],
+                    args=args,
+                )
+                if bool(args.fixed_evidence_union)
+                else np.zeros((0,), dtype=np.int64)
+            )
+            view_mode_scores = (
+                _query_feature_mode_scores(
+                    candidate_rows[
+                        str(args.view_conditioning_candidate)
+                    ]
+                )
+                if str(args.view_conditioning_candidate)
+                else {}
+            )
             evidence_by_name: dict[str, dict[str, object]] = {}
             for name, rows in candidates.items():
                 candidate = rows[image_id]
@@ -587,20 +1034,39 @@ def main(argv: Sequence[str] | None = None) -> None:
                         "median_similarity": None,
                     }
                     continue
-                evidence_by_name[name] = _pose_feature_evidence(
-                    pose_w2c=np.asarray(
-                        candidate["pose_w2c"],
-                        dtype=np.float64,
-                    ),
-                    anchors=anchors,
-                    descriptor_bank=descriptor_bank,
-                    descriptor_offsets=descriptor_offsets,
-                    descriptor_quality=descriptor_quality,
-                    alike=alike,
-                    image_path=query_root / image_id,
-                    camera=cameras[image_id],
-                    args=args,
-                )
+                if bool(args.fixed_evidence_union):
+                    evidence_by_name[name] = (
+                        _fixed_pose_feature_evidence(
+                            pose_w2c=np.asarray(
+                                candidate["pose_w2c"],
+                                dtype=np.float64,
+                            ),
+                            fixed_anchor_rows=fixed_anchor_rows,
+                            anchors=anchors,
+                            descriptor_bank=descriptor_bank,
+                            descriptor_offsets=descriptor_offsets,
+                            alike=alike,
+                            image_path=query_root / image_id,
+                            camera=cameras[image_id],
+                            view_mode_scores=view_mode_scores,
+                            args=args,
+                        )
+                    )
+                else:
+                    evidence_by_name[name] = _pose_feature_evidence(
+                        pose_w2c=np.asarray(
+                            candidate["pose_w2c"],
+                            dtype=np.float64,
+                        ),
+                        anchors=anchors,
+                        descriptor_bank=descriptor_bank,
+                        descriptor_offsets=descriptor_offsets,
+                        descriptor_quality=descriptor_quality,
+                        alike=alike,
+                        image_path=query_root / image_id,
+                        camera=cameras[image_id],
+                        args=args,
+                    )
             (
                 selected_name,
                 safety_reason,
@@ -625,6 +1091,10 @@ def main(argv: Sequence[str] | None = None) -> None:
             diagnostics["feature_map_pose_selector"] = {
                 "selected_candidate": selected_name,
                 "candidate_evidence": evidence_by_name,
+                "fixed_evidence_anchor_count": int(
+                    len(fixed_anchor_rows)
+                ),
+                "view_mode_prior_count": int(len(view_mode_scores)),
                 "safety_candidate": (
                     str(args.safety_candidate)
                     if str(args.safety_candidate)
@@ -697,6 +1167,30 @@ def main(argv: Sequence[str] | None = None) -> None:
                 args.minimum_normal_cosine
             ),
             "minimum_similarity": float(args.minimum_similarity),
+            "fixed_evidence_union": bool(args.fixed_evidence_union),
+            "signed_normal_visibility": bool(
+                args.signed_normal_visibility
+            ),
+            "view_conditioning_candidate": (
+                str(args.view_conditioning_candidate)
+                if str(args.view_conditioning_candidate)
+                else None
+            ),
+            "similarity_scale": float(args.similarity_scale),
+            "anchor_null_probability": float(
+                args.anchor_null_probability
+            ),
+            "view_prior_temperature": float(
+                args.view_prior_temperature
+            ),
+            "geometry_view_temperature": float(
+                args.geometry_view_temperature
+            ),
+            "zbuffer_occlusion": bool(args.zbuffer_occlusion),
+            "occlusion_cell_px": int(args.occlusion_cell_px),
+            "occlusion_depth_tolerance_m": float(
+                args.occlusion_depth_tolerance_m
+            ),
             "safety_candidate": (
                 str(args.safety_candidate)
                 if str(args.safety_candidate)

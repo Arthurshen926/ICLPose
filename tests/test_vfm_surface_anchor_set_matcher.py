@@ -5,6 +5,10 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from feature_extract.tools.vfm.localize_2dgs_surface_queries import (
+    _sample_mapped_vfm_at_pixels,
+    _strict_pose_gate_group_count,
+)
 from feature_extract.vfm.localization.surface_anchor_set_matcher import (
     SurfaceAnchorSetMatcher,
     SurfaceAnchorSetMatcherConfig,
@@ -356,6 +360,64 @@ def test_surface_anchor_checkpoint_fails_closed_on_runtime_contract(
         assert "map-only contract" in str(error)
     else:
         raise AssertionError("illegal checkpoint must fail closed")
+
+
+def test_pose_gate_does_not_treat_nonzero_candidate_mass_as_confidence() -> None:
+    diagnostics = {
+        "conditionally_confident_group_count": 3,
+        "conditionally_matchable_group_count": 817,
+    }
+    assert _strict_pose_gate_group_count(diagnostics) == 3
+
+
+def test_mapped_radio_final_sampling_aligns_image_corners() -> None:
+    feature = np.asarray(
+        [
+            [[1.0, 0.0], [0.0, 1.0]],
+            [[0.0, 1.0], [1.0, 0.0]],
+        ],
+        dtype=np.float32,
+    )
+    sampled = _sample_mapped_vfm_at_pixels(
+        feature,
+        np.asarray([[0.0, 0.0], [99.0, 0.0]], dtype=np.float32),
+        image_width=100,
+        image_height=50,
+    )
+    np.testing.assert_allclose(
+        sampled,
+        np.asarray([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32),
+        atol=1e-6,
+    )
+
+
+def test_anchor_descriptor_bank_roundtrips_view_directions(
+    tmp_path: Path,
+) -> None:
+    _maplets, _anchors, bank, _query = _fixture()
+    directions = np.tile(
+        np.asarray([[3.0, 0.0, 0.0]], dtype=np.float32),
+        (len(bank.descriptors), 1),
+    )
+    conditioned = AnchorLocalDescriptorBank(
+        anchor_ids=bank.anchor_ids,
+        descriptor_offsets=bank.descriptor_offsets,
+        descriptors=bank.descriptors,
+        support_image_ids=bank.support_image_ids,
+        descriptor_quality=bank.descriptor_quality,
+        support_view_directions=directions,
+        metadata=bank.metadata,
+    )
+    path = tmp_path / "bank.npz"
+    conditioned.save_npz(path)
+    loaded = AnchorLocalDescriptorBank.load_npz(path)
+    np.testing.assert_allclose(
+        loaded.support_view_directions,
+        np.tile(
+            np.asarray([[1.0, 0.0, 0.0]], dtype=np.float32),
+            (len(bank.descriptors), 1),
+        ),
+    )
 
 
 def test_production_localizer_has_no_mapping_image_or_pairwise_match_cli() -> None:
