@@ -1,5 +1,11 @@
 # Real-Image Landmark Localization Mainline
 
+> Legacy SfM-track baseline. The active track-free production architecture is
+> documented in
+> [`2dgs_surface_localization_mainline.md`](2dgs_surface_localization_mainline.md).
+> This file remains the frozen accuracy/reference history used for paired
+> non-regression evaluation.
+
 ## Scope
 
 The active method localizes a real query image against an SfM landmark map. It

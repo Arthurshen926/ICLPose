@@ -1,0 +1,18 @@
+# Spatially/temporally distributed mapping-train views for the track-free
+# 2DGS integration smoke. This is not a query/test split.
+seq12/frame00002.png
+seq1/frame00089.png
+seq2/frame00197.png
+seq12/frame00103.png
+seq7/frame00057.png
+seq7/frame00033.png
+seq4/frame00289.png
+seq9/frame00041.png
+seq9/frame00098.png
+seq1/frame00045.png
+seq4/frame00096.png
+seq9/frame00067.png
+seq4/frame00282.png
+seq2/frame00323.png
+seq11/frame00008.png
+seq1/frame00064.png

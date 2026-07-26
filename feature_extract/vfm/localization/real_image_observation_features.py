@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -60,6 +61,208 @@ class DetectedImageFeatures:
         object.__setattr__(self, "descriptors", descriptors)
         object.__setattr__(self, "scores", scores)
         object.__setattr__(self, "dispersions", dispersions)
+
+
+@dataclass(frozen=True)
+class PairwiseImageMatches:
+    """Pose-free query/support correspondences in the camera-model pixel grid."""
+
+    query_xy: np.ndarray
+    support_xy: np.ndarray
+    confidence: np.ndarray
+    support_image_sha256: str
+
+    def __post_init__(self) -> None:
+        query = np.asarray(self.query_xy, dtype=np.float32).reshape(-1, 2)
+        support = np.asarray(self.support_xy, dtype=np.float32).reshape(-1, 2)
+        confidence = np.asarray(self.confidence, dtype=np.float32).reshape(-1)
+        if (
+            query.shape != support.shape
+            or len(confidence) != len(query)
+            or np.any(~np.isfinite(query))
+            or np.any(~np.isfinite(support))
+            or np.any(~np.isfinite(confidence))
+        ):
+            raise ValueError("pairwise image matches are invalid")
+        object.__setattr__(self, "query_xy", query)
+        object.__setattr__(self, "support_xy", support)
+        object.__setattr__(self, "confidence", confidence)
+
+
+class VfmGuidedLoFTRMatcher:
+    """Run local correspondence only on support views selected by RADIO-final."""
+
+    def __init__(
+        self,
+        *,
+        device: str,
+        hloc_root: Path,
+        checkpoint: Path,
+        weights: str = "outdoor",
+        match_threshold: float = 0.2,
+        resize_width: int = 960,
+        resize_height: int = 540,
+    ) -> None:
+        root = Path(hloc_root).resolve(strict=True)
+        wrapper_path = root / "hloc" / "matchers" / "loftr.py"
+        checkpoint_path = Path(checkpoint).resolve(strict=True)
+        if not wrapper_path.is_file():
+            raise FileNotFoundError(f"LoFTR wrapper is absent: {wrapper_path}")
+        if (
+            not 0.0 < float(match_threshold) < 1.0
+            or int(resize_width) <= 0
+            or int(resize_height) <= 0
+        ):
+            raise ValueError("LoFTR matching configuration is invalid")
+        root_value = str(root)
+        if root_value not in sys.path:
+            sys.path.insert(0, root_value)
+        module = importlib.import_module("hloc.matchers.loftr")
+        if Path(getattr(module, "__file__", "")).resolve() != wrapper_path.resolve():
+            raise RuntimeError("imported LoFTR wrapper differs from the declared root")
+        self.device = torch.device(str(device))
+        self.model = module.LoFTR(
+            {
+                "weights": str(weights),
+                "match_threshold": float(match_threshold),
+                "max_num_matches": None,
+            }
+        ).eval().to(self.device)
+        self.weights = str(weights)
+        self.match_threshold = float(match_threshold)
+        self.resize_width = int(resize_width)
+        self.resize_height = int(resize_height)
+        self.wrapper_path = wrapper_path
+        self.checkpoint_path = checkpoint_path
+
+    @property
+    def metadata(self) -> dict[str, object]:
+        return {
+            "feature_type": "vfm_guided_loftr_local_correspondence",
+            "support_selection": "radio_final_only",
+            "weights": self.weights,
+            "match_threshold": self.match_threshold,
+            "resize": [self.resize_width, self.resize_height],
+            "wrapper": str(self.wrapper_path),
+            "wrapper_sha256": file_sha256_short(self.wrapper_path),
+            "checkpoint": str(self.checkpoint_path),
+            "checkpoint_sha256": file_sha256_short(self.checkpoint_path),
+            "uses_radio_intermediate": False,
+            "uses_sfm_points": False,
+            "uses_sfm_tracks": False,
+        }
+
+    def _load_gray(self, image_path: Path) -> tuple[torch.Tensor, str]:
+        import cv2
+
+        payload = Path(image_path).read_bytes()
+        digest = hashlib.sha256(payload).hexdigest()
+        image = cv2.imdecode(np.frombuffer(payload, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
+        if image is None or image.ndim != 2:
+            raise ValueError(f"failed to decode grayscale image: {image_path}")
+        height, width = int(image.shape[0]), int(image.shape[1])
+        if width * self.resize_height != height * self.resize_width:
+            raise ValueError(
+                "VFM-guided LoFTR requires an aspect-preserving matcher resize"
+            )
+        resized = cv2.resize(
+            image,
+            (self.resize_width, self.resize_height),
+            interpolation=cv2.INTER_LINEAR,
+        )
+        tensor = torch.from_numpy(np.ascontiguousarray(resized)).to(dtype=torch.float32)
+        return tensor[None, None] / 255.0, digest
+
+    @staticmethod
+    def _to_camera_grid(
+        xy: np.ndarray,
+        *,
+        source_width: int,
+        source_height: int,
+        camera_width: int,
+        camera_height: int,
+    ) -> np.ndarray:
+        points = np.asarray(xy, dtype=np.float32).reshape(-1, 2)
+        scale = np.asarray(
+            [
+                float(camera_width) / float(source_width),
+                float(camera_height) / float(source_height),
+            ],
+            dtype=np.float32,
+        )
+        return ((points + 0.5) * scale - 0.5).astype(np.float32, copy=False)
+
+    @torch.no_grad()
+    def match_support_views(
+        self,
+        query_image_path: Path,
+        support_image_paths: Sequence[Path],
+        *,
+        camera_width: int,
+        camera_height: int,
+        batch_size: int = 4,
+    ) -> tuple[PairwiseImageMatches, ...]:
+        """Match one query against its fixed VFM support shortlist in batches."""
+
+        if (
+            int(camera_width) <= 0
+            or int(camera_height) <= 0
+            or int(batch_size) <= 0
+            or not support_image_paths
+        ):
+            raise ValueError("LoFTR support matching dimensions are invalid")
+        query, _query_hash = self._load_gray(Path(query_image_path))
+        query = query.to(self.device)
+        output: list[PairwiseImageMatches] = []
+        for start in range(0, len(support_image_paths), int(batch_size)):
+            paths = support_image_paths[start : start + int(batch_size)]
+            loaded = [self._load_gray(Path(path)) for path in paths]
+            support = torch.cat([item[0] for item in loaded], dim=0).to(self.device)
+            prediction = self.model(
+                {
+                    "image0": query.expand(len(paths), -1, -1, -1).contiguous(),
+                    "image1": support,
+                }
+            )
+            query_xy = prediction["keypoints0"].detach().cpu().numpy()
+            support_xy = prediction["keypoints1"].detach().cpu().numpy()
+            confidence = prediction["scores"].detach().cpu().numpy().reshape(-1)
+            batch_indices = (
+                prediction["batch_indexes"].detach().cpu().numpy().astype(np.int64)
+            )
+            if (
+                query_xy.shape != support_xy.shape
+                or query_xy.shape != (len(confidence), 2)
+                or len(batch_indices) != len(confidence)
+                or np.any((batch_indices < 0) | (batch_indices >= len(paths)))
+                or np.any(confidence < self.match_threshold - 1e-6)
+            ):
+                raise RuntimeError("LoFTR returned incompatible or truncated matches")
+            for batch_row, (_tensor, image_hash) in enumerate(loaded):
+                selected = batch_indices == int(batch_row)
+                output.append(
+                    PairwiseImageMatches(
+                        query_xy=self._to_camera_grid(
+                            query_xy[selected],
+                            source_width=self.resize_width,
+                            source_height=self.resize_height,
+                            camera_width=int(camera_width),
+                            camera_height=int(camera_height),
+                        ),
+                        support_xy=self._to_camera_grid(
+                            support_xy[selected],
+                            source_width=self.resize_width,
+                            source_height=self.resize_height,
+                            camera_width=int(camera_width),
+                            camera_height=int(camera_height),
+                        ),
+                        confidence=confidence[selected],
+                        support_image_sha256=image_hash,
+                    )
+                )
+        if len(output) != len(support_image_paths):
+            raise RuntimeError("LoFTR did not return one result per support view")
+        return tuple(output)
 
 
 def _sample_dense_features(
@@ -278,6 +481,53 @@ class AlikeDenseObservationExtractor:
         self.model_name = str(model_name)
         self.model_path = Path(str(config["model_path"]))
         self.model = ALike(**config).to(self.device).eval()
+        self._cached_dense_key: tuple[str, int, int] | None = None
+        self._cached_descriptor_map: torch.Tensor | None = None
+        self._cached_score_map: torch.Tensor | None = None
+        self._cached_image_hash: str | None = None
+
+    @torch.no_grad()
+    def _dense_maps(
+        self,
+        image_path: Path,
+        *,
+        image_width: int,
+        image_height: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, str]:
+        """Extract once and reuse the dense ALIKE map within one query image."""
+
+        import cv2
+
+        key = (str(Path(image_path).resolve()), int(image_width), int(image_height))
+        if (
+            key == self._cached_dense_key
+            and self._cached_descriptor_map is not None
+            and self._cached_score_map is not None
+            and self._cached_image_hash is not None
+        ):
+            return (
+                self._cached_descriptor_map,
+                self._cached_score_map,
+                self._cached_image_hash,
+            )
+        rgb, image_hash = _decode_rgb(Path(image_path))
+        if rgb.shape[:2] != (int(image_height), int(image_width)):
+            rgb = cv2.resize(
+                rgb,
+                (int(image_width), int(image_height)),
+                interpolation=cv2.INTER_AREA,
+            )
+        image = torch.from_numpy(np.ascontiguousarray(rgb)).to(
+            self.device,
+            dtype=torch.float32,
+        )
+        image = image.permute(2, 0, 1).unsqueeze(0) / 255.0
+        descriptor_map, score_map = self.model.extract_dense_map(image)
+        self._cached_dense_key = key
+        self._cached_descriptor_map = descriptor_map
+        self._cached_score_map = score_map
+        self._cached_image_hash = image_hash
+        return descriptor_map, score_map, image_hash
 
     @property
     def metadata(self) -> dict[str, object]:
@@ -333,16 +583,13 @@ class AlikeDenseObservationExtractor:
     ) -> DetectedImageFeatures:
         """Detect deployable ALIKE points while retaining sub-pixel locations."""
 
-        import cv2
-
         if int(top_k) <= 0 or int(candidate_top_k) < int(top_k):
             raise ValueError("candidate_top_k must be at least top_k > 0")
-        rgb, image_hash = _decode_rgb(Path(image_path))
-        if rgb.shape[:2] != (int(image_height), int(image_width)):
-            rgb = cv2.resize(rgb, (int(image_width), int(image_height)), interpolation=cv2.INTER_AREA)
-        image = torch.from_numpy(np.ascontiguousarray(rgb)).to(self.device, dtype=torch.float32)
-        image = image.permute(2, 0, 1).unsqueeze(0) / 255.0
-        descriptor_map, score_map = self.model.extract_dense_map(image)
+        descriptor_map, score_map, image_hash = self._dense_maps(
+            image_path,
+            image_width=int(image_width),
+            image_height=int(image_height),
+        )
         previous_top_k = int(self.model.dkd.top_k)
         try:
             self.model.dkd.top_k = min(int(candidate_top_k), int(image_height) * int(image_width))
@@ -381,6 +628,108 @@ class AlikeDenseObservationExtractor:
             scores=score_values[selected],
             dispersions=dispersion_values[selected],
             image_sha256=image_hash,
+        )
+
+    @torch.no_grad()
+    def sample_points(
+        self,
+        image_path: Path,
+        xy: np.ndarray,
+        *,
+        image_width: int,
+        image_height: int,
+    ) -> tuple[np.ndarray, np.ndarray, str]:
+        """Sample dense ALIKE at arbitrary pixels without constructing SfM tracks."""
+
+        points = np.asarray(xy, dtype=np.float32).reshape(-1, 2)
+        descriptor_map, score_map, image_hash = self._dense_maps(
+            image_path,
+            image_width=int(image_width),
+            image_height=int(image_height),
+        )
+        descriptors, scores = sample_dense_feature_points(
+            descriptor_map,
+            points,
+            image_width=int(image_width),
+            image_height=int(image_height),
+            score_map=score_map,
+        )
+        return descriptors, scores, image_hash
+
+    @torch.no_grad()
+    def match_descriptor_points(
+        self,
+        image_path: Path,
+        predicted_xy: np.ndarray,
+        reference_descriptors: np.ndarray,
+        *,
+        image_width: int,
+        image_height: int,
+        search_radius_px: int = 12,
+        search_step_px: int = 1,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, str]:
+        """Find local ALIKE modes around VFM-transferred anchor projections."""
+
+        points = np.asarray(predicted_xy, dtype=np.float32).reshape(-1, 2)
+        references = np.asarray(reference_descriptors, dtype=np.float32)
+        if references.ndim != 2 or references.shape[0] != len(points):
+            raise ValueError("one reference descriptor is required per predicted point")
+        if int(search_radius_px) < 0 or int(search_step_px) <= 0:
+            raise ValueError("local search radius/step is invalid")
+        descriptor_map, score_map, image_hash = self._dense_maps(
+            image_path,
+            image_width=int(image_width),
+            image_height=int(image_height),
+        )
+        offsets = np.arange(
+            -int(search_radius_px),
+            int(search_radius_px) + 1,
+            int(search_step_px),
+            dtype=np.float32,
+        )
+        offset_xy = np.stack(
+            np.meshgrid(offsets, offsets, indexing="xy"),
+            axis=-1,
+        ).reshape(-1, 2)
+        candidate_xy = points[:, None, :] + offset_xy[None, :, :]
+        candidate_xy[..., 0] = np.clip(
+            candidate_xy[..., 0], 0.0, float(image_width - 1)
+        )
+        candidate_xy[..., 1] = np.clip(
+            candidate_xy[..., 1], 0.0, float(image_height - 1)
+        )
+        sampled_descriptors, sampled_scores = sample_dense_feature_points(
+            descriptor_map,
+            candidate_xy.reshape(-1, 2),
+            image_width=int(image_width),
+            image_height=int(image_height),
+            score_map=score_map,
+        )
+        sampled_descriptors = sampled_descriptors.reshape(
+            len(points), len(offset_xy), -1
+        )
+        sampled_scores = sampled_scores.reshape(len(points), len(offset_xy))
+        references /= np.maximum(
+            np.linalg.norm(references, axis=1, keepdims=True), 1e-8
+        )
+        similarities = np.einsum(
+            "nkd,nd->nk",
+            sampled_descriptors,
+            references,
+        )
+        spatial_prior = np.sum(offset_xy * offset_xy, axis=1)[None, :] / max(
+            float(search_radius_px * search_radius_px), 1.0
+        )
+        # Descriptor agreement remains decisive.  Detector confidence and the
+        # transferred VFM position only break near-ties.
+        combined = similarities + 0.001 * sampled_scores - 0.001 * spatial_prior
+        best = np.argmax(combined, axis=1)
+        rows = np.arange(len(points), dtype=np.int64)
+        return (
+            candidate_xy[rows, best].astype(np.float32, copy=False),
+            sampled_descriptors[rows, best].astype(np.float32, copy=False),
+            similarities[rows, best].astype(np.float32, copy=False),
+            image_hash,
         )
 
 

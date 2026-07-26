@@ -1,0 +1,175 @@
+protocol_id: stmaryschurch_2dgs_surface_v1
+dataset_family: CambridgeLandmarks
+scene: StMarysChurch
+role: completed_full_mapping_training_and_frozen_530_query_non_regression
+
+map:
+  representation: 2dgs_surface
+  gaussian_ply: /root/StMaryChurch2dgs.ply
+  mapping_rgb_root: /hy-tmp/Cambridge_stdloc/StMarysChurch
+  mapping_pose_file: /hy-tmp/Cambridge_stdloc/StMarysChurch/dataset_train.txt
+  mapping_smoke_split: feature_extract/configs/vfm/data/stmaryschurch_mapping_smoke16.txt
+  mapping_camera_model: /hy-tmp/Cambridge_stdloc/CambridgeLandmarks_Colmap_Retriangulated_1024px/StMarysChurch/model_train
+  use_sfm_points: false
+  use_sfm_tracks: false
+  identities:
+    coarse: surface_maplet_id
+    fine: stable_surface_anchor_id
+
+vfm:
+  model: c-radio_v4-h
+  layer: final
+  canonical_input_size: [1024, 576]
+  use_radio_intermediate: false
+  full_map_mapper_before_sampling: true
+  mapper:
+    type: surface_maplet
+    supervision: 2dgs_surface_maplet_cross_view_identity
+    use_sfm_tracks: false
+    fit_validation_split: mapping_image_disjoint
+    selection_metric_order: [maplet_recall_at_5, maplet_recall_at_1, mrr]
+  region_pool_sizes: [1, 3, 5, 9]
+  region_pool_weights: [0.40, 0.30, 0.20, 0.10]
+  global_context_weight: 0.0
+  retrieval_top_k: 8
+  whole_image_support_layout: true
+
+surface_maplets:
+  source: renderer_alpha_composited_token_footprints
+  fusion: graph
+  adjacency_element_radius_cap_m: 0.10
+  minimum_anchor_views: 2
+  minimum_anchors: 4
+  maximum_anchors: 64
+  minimum_anchor_opacity: 0.05
+  minimum_geometry_confidence: 0.5
+  allowed_primitive_classes: [0]
+  minimum_anchor_normal_cosine: 0.5
+  minimum_anchor_separation_m: 0.02
+
+local_measurement:
+  primary_feature: LoFTR
+  fallback_feature: ALIKE
+  role: vfm_selected_pair_pixel_correspondence
+  support_selection: radio_final_top_4_only
+  support_images: real_mapping_rgb
+  primary_metric_lift: official_2dgs_mapping_view_depth
+  independent_metric_lift: stable_2dgs_anchor_projection
+  cross_modal_pose_gate:
+    maximum_translation_m: 2.0
+    maximum_rotation_deg: 10.0
+  loftr:
+    weights: outdoor
+    resize: [960, 540]
+    match_threshold: 0.2
+    maximum_depth_points: 768
+    query_nms_radius_px: 2.0
+  rendered_rgb_as_primary_support: false
+  explicit_null: true
+  retain_top_l_anchor_candidates: 5
+
+pose:
+  primary_solver: grouped_ransac_pnp
+  latent_refinement: optional_only_when_identity_remains_multimodal
+  fit_and_verification_groups_disjoint: true
+  fixed_candidate_set_during_verification: true
+  unique_surface_anchor_capacity: true
+  optional_surfel_covariance_refinement: true
+
+forbidden_inputs:
+  - sfm_point_id
+  - sfm_track_id
+  - sfm_track_observations
+  - radio_intermediate
+  - query_ground_truth_pose_at_inference
+  - selected_pose_dependent_support_candidate_expansion
+
+validation:
+  st_marys_query_ground_truth_policy:
+    inference_used_query_ground_truth: false
+    final_530_ground_truth_joined_only_after_all_shards_completed: true
+    pre_run_source_and_artifact_hashes_verified_post_run: true
+    consumed_for_future_method_selection: true
+    disclosure: >-
+      Final architecture and fixed thresholds used a 32-query stratified
+      diagnostic probe after the original v1 530-query result was opened.
+  non_regression:
+    compare_on_identical_frozen_query_ids: true
+    require_no_worse_median_translation: true
+    require_no_worse_p90_translation: true
+    require_no_worse_median_rotation: true
+    require_no_lower_success_rate: true
+  gates:
+    - stable_anchor_multiview_geometry
+    - maplet_recall_at_1_5_10
+    - retrieved_maplet_contains_correct_anchor
+    - maplet_internal_anchor_assignment
+    - grouped_hypothesis_oracle
+    - independent_selected_pose
+    - abstention_and_catastrophic_tail
+
+completed_evidence:
+  scope: full_1487_mapping_images_and_530_query_images
+  source_gaussian_count: 1031773
+  surface_element_count: 538369
+  maplet_count: 864
+  stable_anchor_count: 23150
+  stable_anchor_observation_count: 293268
+  mapping_depth_bank:
+    view_count: 1487
+    resolution: [1024, 576]
+    official_renderer: gsplat_2dgs
+  full_map_mapper_image_disjoint:
+    best_epoch: 120
+    query_count: 4433
+    prototype_count: 857
+    recall_at_1: 0.7302052786
+    recall_at_5: 0.9560117302
+    recall_at_10: 0.9819535303
+    mean_reciprocal_rank: 0.8303012339
+  maplet_leave_one_view_out:
+    query_count: 17591
+    recall_at_1: 0.7727246888
+    recall_at_5: 0.9787959752
+    recall_at_10: 0.9927235518
+  local_anchor_leave_one_view_out_within_maplet:
+    query_count: 140547
+    same_support_image_excluded: true
+    recall_at_1: 0.2520011099
+    recall_at_3: 0.4587433385
+    recall_at_5: 0.5713747003
+  coordinate_contract:
+    exact_translation_median_cm: 0.0000141
+    one_pixel_noise_translation_median_cm: 1.201
+    one_pixel_noise_rotation_median_deg: 0.04169
+  final_530_query_evaluation:
+    query_count: 530
+    success_count: 530
+    selected_branch_counts:
+      vfm_guided_loftr_2dgs_depth_surface: 509
+      vfm_guided_loftr_2dgs_anchor: 21
+    translation_m:
+      median: 0.1536540939
+      p90: 0.4408205235
+      p95: 0.8878903895
+      maximum: 50.5665810208
+    rotation_deg:
+      median: 0.4040362636
+      p90: 1.4365819000
+      p95: 3.3425978740
+      maximum: 177.1581256116
+    recall:
+      10cm_5deg: 0.2547169811
+      25cm_10deg: 0.7396226415
+      50cm_10deg: 0.9150943396
+      5m_10deg: 0.9716981132
+    frozen_previous_version:
+      translation_median: 1.1777768664
+      translation_p90: 6.0587381574
+      rotation_median_deg: 3.5190687198
+      success_rate: 1.0
+    non_regression_all_required_gates_pass: true
+    reports:
+      evaluation: output/vfm/2dgs_surface/StMarysChurch/full_train/evaluation_final/evaluation.json
+      freeze: output/vfm/2dgs_surface/StMarysChurch/full_train/evaluation_final/inference_freeze.json
+      long_tail: output/vfm/2dgs_surface/StMarysChurch/full_train/evaluation_final/long_tail_analysis.json

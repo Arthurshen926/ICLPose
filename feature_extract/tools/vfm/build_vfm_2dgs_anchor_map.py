@@ -22,9 +22,14 @@ from feature_extract.tools.vfm.build_stage_h2_raw_gaussian_anchor_map import (
 )
 from feature_extract.vfm.cambridge_pose_lattice import parse_cambridge_pose_file
 from feature_extract.vfm.gaussian_vfm_field import GaussianVFMFeatureView, load_gaussian_vfm_source_from_ply
+from feature_extract.vfm.localization.feature_mapper import JointFeatureMapper
+from feature_extract.vfm.localization.surface_maplet_mapper import load_surface_maplet_mapper
+from feature_extract.vfm.matcha_joint_training import load_matcha_joint_model
 from feature_extract.vfm.tokens import TokenBankManifest
 from feature_extract.vfm.vfm_2dgs_mapping import (
+    SurfaceElementMap,
     Vfm2DgsAnchorFusionConfig,
+    Vfm2DgsContributionBuffer,
     Vfm2DgsMappingConfig,
     Vfm2DgsObservationBank,
     anchor_map_summary,
@@ -64,6 +69,21 @@ def _strength_counts(values: Sequence[str]) -> dict[str, int]:
     return counts
 
 
+def _validate_final_only_manifest(manifest: TokenBankManifest, layer_name: str) -> None:
+    if "intermediate" in str(layer_name).lower():
+        raise ValueError("RADIO intermediate is forbidden by the 2DGS production protocol")
+    found = False
+    for record in manifest.records:
+        for layer in record.layers:
+            if layer.name != layer_name:
+                continue
+            found = True
+            if str(layer.layer).lower() != "final":
+                raise ValueError("the requested production VFM layer is not RADIO final")
+    if not found:
+        raise ValueError(f"RADIO-final layer {layer_name!r} is absent from the token manifest")
+
+
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build VFM-aware 2DGS surface anchor map")
     parser.add_argument("--gaussian_ply", required=True)
@@ -71,6 +91,22 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--reference_pose_file", required=True)
     parser.add_argument("--camera_model_dir", default="")
     parser.add_argument("--layer_name", default="radio_final")
+    parser.add_argument(
+        "--matcha_joint_checkpoint",
+        default="",
+        help="Optional localization mapper. It is applied to each complete RADIO-final feature map before token/surface sampling.",
+    )
+    parser.add_argument(
+        "--surface_maplet_mapper_checkpoint",
+        default="",
+        help="Production mapper trained from 2DGS surface-maplet cross-view identity.",
+    )
+    parser.add_argument("--mapper_device", default="cuda")
+    parser.add_argument(
+        "--require_full_map_mapper",
+        action="store_true",
+        help="Fail unless --matcha_joint_checkpoint is supplied; intended for the production descriptor-space contract.",
+    )
     parser.add_argument("--max_views", type=int, default=0)
     parser.add_argument("--view_selection", default="uniform", choices=("prefix", "uniform"))
     parser.add_argument("--max_gaussians", type=int, default=0)
@@ -88,6 +124,12 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--surface_min_opacity", type=float, default=0.05)
     parser.add_argument("--surface_max_scale", type=float, default=None)
     parser.add_argument("--surface_adjacency_radius", type=float, default=0.05)
+    parser.add_argument(
+        "--surface_adjacency_element_radius_cap",
+        type=float,
+        default=0.0,
+        help="Cap disk support radius only while building adjacency; prevents rare huge splats from causing a near-dense graph.",
+    )
     parser.add_argument("--surface_normal_cosine_threshold", type=float, default=0.8)
     parser.add_argument("--virtual_cell_max_scale", type=float, default=0.0)
     parser.add_argument("--auto_virtual_cell_target_px", type=float, default=0.0)
@@ -167,13 +209,33 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output_npz", required=True)
     parser.add_argument("--summary_json", required=True)
     parser.add_argument("--surface_npz", default="")
+    parser.add_argument(
+        "--reuse_surface_npz",
+        default="",
+        help="Reuse a validated 2DGS surface-element topology instead of rebuilding it from the PLY.",
+    )
     parser.add_argument("--descriptor_index_npz", default="")
     parser.add_argument("--descriptor_faiss_index", default="")
     parser.add_argument("--descriptor_index_no_prototypes", action="store_true")
     parser.add_argument("--contribution_dir", default="")
+    parser.add_argument(
+        "--reuse_contribution_dir",
+        default="",
+        help="Load immutable renderer/token-to-surface buffers instead of rerendering them.",
+    )
     parser.add_argument("--contribution_renderer", default="projection_depth_soft", choices=("projection_depth_soft", "gsplat_2dgs"))
     parser.add_argument("--contribution_device", default="cuda")
     parser.add_argument("--observation_bank_npz", default="")
+    parser.add_argument(
+        "--reuse_observation_bank_npz",
+        default="",
+        help="Resume fusion from a frozen observation bank without rebuilding per-view observations.",
+    )
+    parser.add_argument(
+        "--contributions_only",
+        action="store_true",
+        help="Render and persist per-view token/surface buffers, then stop before graph fusion.",
+    )
     return parser.parse_args(argv)
 
 
@@ -208,7 +270,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         args.fusion_mode = "graph"
         if not args.contribution_dir:
             args.contribution_dir = str(output_dir / "contributions")
-        if not args.surface_npz:
+        if not args.surface_npz and not args.reuse_surface_npz:
             args.surface_npz = str(output_dir / "surface_elements.npz")
         if not args.observation_bank_npz:
             args.observation_bank_npz = str(output_dir / "observation_bank.npz")
@@ -218,6 +280,45 @@ def main(argv: Sequence[str] | None = None) -> None:
             args.auto_virtual_cell_target_px = 1.0
     manifest = TokenBankManifest.from_json(Path(args.reference_manifest))
     manifest.validate(verify_checksums=False)
+    _validate_final_only_manifest(manifest, str(args.layer_name))
+    mapper_paths = [
+        value
+        for value in (str(args.matcha_joint_checkpoint), str(args.surface_maplet_mapper_checkpoint))
+        if value
+    ]
+    if len(mapper_paths) > 1:
+        raise ValueError("matcha and surface-maplet mapper checkpoints are mutually exclusive")
+    if bool(args.require_full_map_mapper) and not mapper_paths:
+        raise ValueError("--require_full_map_mapper requires a full-map mapper checkpoint")
+    feature_mapper = None
+    mapper_metadata: dict[str, object] = {}
+    if str(args.matcha_joint_checkpoint):
+        mapper_run = load_matcha_joint_model(
+            Path(args.matcha_joint_checkpoint),
+            device=str(args.mapper_device),
+        )
+        feature_mapper = JointFeatureMapper(mapper_run.model, device=str(args.mapper_device))
+        mapper_metadata = {"mapper_type": "legacy_matcha_joint"}
+    elif str(args.surface_maplet_mapper_checkpoint):
+        feature_mapper, checkpoint_metadata = load_surface_maplet_mapper(
+            Path(args.surface_maplet_mapper_checkpoint),
+            device=str(args.mapper_device),
+        )
+        if bool(checkpoint_metadata.get("uses_radio_intermediate", False)):
+            raise ValueError("surface-maplet mapper checkpoint illegally uses RADIO intermediate")
+        if bool(checkpoint_metadata.get("uses_sfm_tracks", False)):
+            raise ValueError("surface-maplet mapper checkpoint illegally uses SfM tracks")
+        mapper_metadata = {
+            "mapper_type": "surface_maplet",
+            "surface_maplet_mapper_metadata": checkpoint_metadata,
+        }
+
+    def load_mapping_feature(record) -> np.ndarray:
+        raw_feature = _load_feature(Path(record.token_path), args.layer_name)
+        if feature_mapper is None:
+            return raw_feature
+        return feature_mapper.project(raw_feature).coarse_descriptors
+
     pose_by_image = {record.image_id: record for record in parse_cambridge_pose_file(Path(args.reference_pose_file))}
     camera_by_image = _load_camera_by_image(args.camera_model_dir)
     fallback_camera = _parse_default_camera(args.default_camera)
@@ -226,38 +327,51 @@ def main(argv: Sequence[str] | None = None) -> None:
     if not records:
         raise ValueError("no reference views with both token features and poses")
 
-    source = load_gaussian_vfm_source_from_ply(Path(args.gaussian_ply), max_gaussians=int(args.max_gaussians))
     auto_virtual_cell_max_scale = 0.0
-    if float(args.auto_virtual_cell_target_px) > 0.0:
-        estimator_records = records[: max(1, min(len(records), int(args.auto_virtual_cell_max_views)))]
-        estimator_views = [
-            GaussianVFMFeatureView(
-                image_id=record.image_id,
-                feature_map=_load_feature(Path(record.token_path), args.layer_name),
-                pose_w2c=pose_by_image[record.image_id].pose_w2c,
-                camera=camera_by_image.get(record.image_id, fallback_camera),
+    if str(args.reuse_surface_npz):
+        surface_elements = SurfaceElementMap.load_npz(Path(args.reuse_surface_npz))
+        source_gaussian_count = int(
+            dict(surface_elements.metadata or {}).get(
+                "source_gaussian_count",
+                len(np.unique(surface_elements.parent_gaussian_indices)),
             )
-            for record in estimator_records
-        ]
-        auto_virtual_cell_max_scale = estimate_virtual_cell_max_scale_for_token_projection(
-            source,
-            estimator_views,
-            target_projected_radius_px=float(args.auto_virtual_cell_target_px),
-            depth_quantile=float(args.auto_virtual_cell_depth_quantile),
-            max_samples=int(args.auto_virtual_cell_max_samples),
-            min_opacity=float(args.surface_min_opacity),
         )
-        if auto_virtual_cell_max_scale > 0.0:
-            args.virtual_cell_max_scale = float(auto_virtual_cell_max_scale)
-    surface_elements = build_surface_elements_from_2dgs_source(
-        source,
-        min_opacity=float(args.surface_min_opacity),
-        max_scale=args.surface_max_scale,
-        adjacency_radius=float(args.surface_adjacency_radius),
-        normal_cosine_threshold=float(args.surface_normal_cosine_threshold),
-        virtual_cell_max_scale=float(args.virtual_cell_max_scale),
-        virtual_cell_grid_cap=int(args.virtual_cell_grid_cap),
-    )
+    else:
+        source = load_gaussian_vfm_source_from_ply(
+            Path(args.gaussian_ply), max_gaussians=int(args.max_gaussians)
+        )
+        source_gaussian_count = int(source.xyz.shape[0])
+        if float(args.auto_virtual_cell_target_px) > 0.0:
+            estimator_records = records[: max(1, min(len(records), int(args.auto_virtual_cell_max_views)))]
+            estimator_views = [
+                GaussianVFMFeatureView(
+                    image_id=record.image_id,
+                    feature_map=load_mapping_feature(record),
+                    pose_w2c=pose_by_image[record.image_id].pose_w2c,
+                    camera=camera_by_image.get(record.image_id, fallback_camera),
+                )
+                for record in estimator_records
+            ]
+            auto_virtual_cell_max_scale = estimate_virtual_cell_max_scale_for_token_projection(
+                source,
+                estimator_views,
+                target_projected_radius_px=float(args.auto_virtual_cell_target_px),
+                depth_quantile=float(args.auto_virtual_cell_depth_quantile),
+                max_samples=int(args.auto_virtual_cell_max_samples),
+                min_opacity=float(args.surface_min_opacity),
+            )
+            if auto_virtual_cell_max_scale > 0.0:
+                args.virtual_cell_max_scale = float(auto_virtual_cell_max_scale)
+        surface_elements = build_surface_elements_from_2dgs_source(
+            source,
+            min_opacity=float(args.surface_min_opacity),
+            max_scale=args.surface_max_scale,
+            adjacency_radius=float(args.surface_adjacency_radius),
+            adjacency_element_radius_cap=float(args.surface_adjacency_element_radius_cap),
+            normal_cosine_threshold=float(args.surface_normal_cosine_threshold),
+            virtual_cell_max_scale=float(args.virtual_cell_max_scale),
+            virtual_cell_grid_cap=int(args.virtual_cell_grid_cap),
+        )
     if args.surface_npz:
         surface_elements.save_npz(Path(args.surface_npz))
     mapping_config = Vfm2DgsMappingConfig(
@@ -329,29 +443,63 @@ def main(argv: Sequence[str] | None = None) -> None:
     observations = []
     per_view = []
     contribution_dir = Path(args.contribution_dir) if args.contribution_dir else None
+    reuse_contribution_dir = (
+        Path(args.reuse_contribution_dir) if args.reuse_contribution_dir else None
+    )
     aggregate_rejection_stats: dict[str, int] = {}
     aggregate_strength_counts = {"strong": 0, "weak": 0}
-    for record in records:
+    records_for_observation_build = records
+    if str(args.reuse_observation_bank_npz):
+        reusable_observation_bank = Vfm2DgsObservationBank.load_npz(
+            Path(args.reuse_observation_bank_npz)
+        )
+        observations.extend(reusable_observation_bank.to_observations())
+        aggregate_strength_counts = _strength_counts(
+            reusable_observation_bank.observation_strengths
+        )
+        records_for_observation_build = []
+    for record in records_for_observation_build:
         view = GaussianVFMFeatureView(
             image_id=record.image_id,
-            feature_map=_load_feature(Path(record.token_path), args.layer_name),
+            feature_map=load_mapping_feature(record),
             pose_w2c=pose_by_image[record.image_id].pose_w2c,
             camera=camera_by_image.get(record.image_id, fallback_camera),
         )
         contribution_summary = None
         if contribution_dir is not None:
-            if args.contribution_renderer == "gsplat_2dgs":
-                contribution_buffer = compute_renderer_token_surface_contribution_buffer(
-                    surface_elements,
-                    view,
-                    mapping_config,
-                    device=str(args.contribution_device),
-                    renderer="gsplat_2dgs",
-                )
-            else:
-                contribution_buffer = compute_token_surface_contribution_buffer(surface_elements, view, mapping_config)
             contribution_path = contribution_dir / f"{_safe_image_stem(record.image_id)}.npz"
-            contribution_buffer.save_npz(contribution_path)
+            reuse_path = (
+                reuse_contribution_dir / f"{_safe_image_stem(record.image_id)}.npz"
+                if reuse_contribution_dir is not None
+                else None
+            )
+            if reuse_path is not None:
+                if not reuse_path.exists():
+                    raise ValueError(f"reusable contribution buffer is missing: {reuse_path}")
+                contribution_buffer = Vfm2DgsContributionBuffer.load_npz(reuse_path)
+                if contribution_buffer.image_id != record.image_id:
+                    raise ValueError(
+                        "reusable contribution buffer image mismatch: "
+                        f"{contribution_buffer.image_id!r} != {record.image_id!r}"
+                    )
+            else:
+                if args.contribution_renderer == "gsplat_2dgs":
+                    contribution_buffer = compute_renderer_token_surface_contribution_buffer(
+                        surface_elements,
+                        view,
+                        mapping_config,
+                        device=str(args.contribution_device),
+                        renderer="gsplat_2dgs",
+                    )
+                else:
+                    contribution_buffer = compute_token_surface_contribution_buffer(
+                        surface_elements, view, mapping_config
+                    )
+            if (
+                reuse_path is None
+                or contribution_path.resolve() != reuse_path.resolve()
+            ):
+                contribution_buffer.save_npz(contribution_path)
             view_observations = token_surface_observations_from_contribution_buffer(
                 surface_elements,
                 view,
@@ -397,6 +545,63 @@ def main(argv: Sequence[str] | None = None) -> None:
             row["contribution_buffer"] = contribution_summary
         per_view.append(row)
 
+    if bool(args.contributions_only):
+        if contribution_dir is None:
+            raise ValueError("--contributions_only requires --contribution_dir")
+        summary = {
+            "stage": "vfm_2dgs_contribution_rendering",
+            "source_gaussian_count": int(source_gaussian_count),
+            "surface_element_count": int(len(surface_elements)),
+            "view_count": int(len(records)),
+            "observation_count": int(len(observations)),
+            "mapping_config": mapping_config.to_dict(),
+            "observation_strength_counts": aggregate_strength_counts,
+            "observation_rejection_stats": aggregate_rejection_stats,
+            "per_view": per_view,
+            "inputs": {
+                "gaussian_ply": str(args.gaussian_ply),
+                "reuse_surface_npz": str(args.reuse_surface_npz),
+                "reference_manifest": str(args.reference_manifest),
+                "reference_pose_file": str(args.reference_pose_file),
+                "camera_model_dir": str(args.camera_model_dir),
+                "layer_name": str(args.layer_name),
+                "surface_maplet_mapper_checkpoint": str(
+                    args.surface_maplet_mapper_checkpoint
+                ),
+                "mapper_device": str(args.mapper_device),
+                **mapper_metadata,
+            },
+            "outputs": {
+                "contribution_dir": str(contribution_dir),
+                "summary": str(args.summary_json),
+            },
+            "production_contract": {
+                "vfm_layer": "radio_final",
+                "uses_radio_intermediate": False,
+                "uses_sfm_points": False,
+                "uses_sfm_tracks": False,
+            },
+        }
+        summary_path = Path(args.summary_json)
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+        return
+
+    if args.observation_bank_npz:
+        if (
+            not str(args.reuse_observation_bank_npz)
+            or Path(args.observation_bank_npz).resolve()
+            != Path(args.reuse_observation_bank_npz).resolve()
+        ):
+            observation_bank = Vfm2DgsObservationBank.from_observations(
+                observations,
+                metadata={
+                    "stage": "vfm_2dgs_token_observation_layer",
+                    "mapping_config": mapping_config.to_dict(),
+                    "view_count": int(len(records)),
+                },
+            )
+            observation_bank.save_npz(Path(args.observation_bank_npz))
     anchor_map = fuse_token_surface_observations(
         surface_elements,
         observations,
@@ -407,16 +612,6 @@ def main(argv: Sequence[str] | None = None) -> None:
             "surface_metadata": dict(surface_elements.metadata or {}),
         },
     )
-    if args.observation_bank_npz:
-        observation_bank = Vfm2DgsObservationBank.from_observations(
-            observations,
-            metadata={
-                "stage": "vfm_2dgs_token_observation_layer",
-                "mapping_config": mapping_config.to_dict(),
-                "view_count": int(len(records)),
-            },
-        )
-        observation_bank.save_npz(Path(args.observation_bank_npz))
     pre_selection_anchor_count = int(len(anchor_map))
     if float(args.spatial_nms_radius) > 0.0 or int(args.max_anchors) > 0:
         anchor_map = spatial_nms_anchor_map(
@@ -444,7 +639,7 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     summary = {
         "stage": "vfm_2dgs_anchor_mapping",
-        "source_gaussian_count": int(source.xyz.shape[0]),
+        "source_gaussian_count": int(source_gaussian_count),
         "surface_element_count": int(len(surface_elements)),
         "view_count": int(len(records)),
         "mapping_config": mapping_config.to_dict(),
@@ -479,10 +674,16 @@ def main(argv: Sequence[str] | None = None) -> None:
         "per_view": per_view,
         "inputs": {
             "gaussian_ply": str(args.gaussian_ply),
+            "reuse_surface_npz": str(args.reuse_surface_npz),
             "reference_manifest": str(args.reference_manifest),
             "reference_pose_file": str(args.reference_pose_file),
             "camera_model_dir": str(args.camera_model_dir),
             "layer_name": str(args.layer_name),
+            "matcha_joint_checkpoint": str(args.matcha_joint_checkpoint),
+            "surface_maplet_mapper_checkpoint": str(args.surface_maplet_mapper_checkpoint),
+            "full_map_mapper_applied": bool(feature_mapper is not None),
+            "mapper_device": str(args.mapper_device),
+            **mapper_metadata,
             "view_selection": str(args.view_selection),
         },
         "outputs": {"anchor_map": str(args.output_npz), "summary": str(args.summary_json)},
@@ -494,6 +695,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         summary["contribution_renderer"] = {
             "renderer": str(args.contribution_renderer),
             "device": str(args.contribution_device),
+            "reuse_contribution_dir": str(args.reuse_contribution_dir),
         }
     if args.observation_bank_npz:
         summary["outputs"]["observation_bank"] = str(args.observation_bank_npz)

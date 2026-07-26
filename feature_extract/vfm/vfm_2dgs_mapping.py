@@ -1384,6 +1384,7 @@ def build_surface_elements_from_2dgs_source(
     min_opacity: float = 0.0,
     max_scale: float | None = None,
     adjacency_radius: float = 0.05,
+    adjacency_element_radius_cap: float = 0.0,
     normal_cosine_threshold: float = 0.8,
     virtual_cell_max_scale: float = 0.0,
     virtual_cell_grid_cap: int = 8,
@@ -1427,6 +1428,7 @@ def build_surface_elements_from_2dgs_source(
         float(adjacency_radius),
         float(normal_cosine_threshold),
         element_radius=np.maximum(scale1, scale2),
+        element_radius_cap=float(adjacency_element_radius_cap),
     )
     return SurfaceElementMap(
         element_ids=element_ids,
@@ -1448,6 +1450,7 @@ def build_surface_elements_from_2dgs_source(
             "min_opacity": float(min_opacity),
             "max_scale": None if max_scale is None else float(max_scale),
             "adjacency_radius": float(adjacency_radius),
+            "adjacency_element_radius_cap": float(adjacency_element_radius_cap),
             "normal_cosine_threshold": float(normal_cosine_threshold),
             "virtual_cell_max_scale": float(virtual_cell_max_scale),
             "virtual_cell_grid_cap": int(virtual_cell_grid_cap),
@@ -1632,6 +1635,7 @@ def _build_adjacency(
     radius: float,
     normal_cosine_threshold: float,
     element_radius: np.ndarray | None = None,
+    element_radius_cap: float = 0.0,
 ) -> tuple[np.ndarray, ...]:
     if centers.shape[0] == 0:
         return ()
@@ -1642,11 +1646,23 @@ def _build_adjacency(
     )
     if element_radius_arr.shape != (centers.shape[0],):
         raise ValueError("element_radius must have shape (N,)")
-    search_radius = float(radius) + 2.0 * float(np.max(np.maximum(element_radius_arr, 0.0)))
-    if search_radius <= 0.0:
+    if float(element_radius_cap) < 0.0:
+        raise ValueError("element_radius_cap must be non-negative")
+    effective_radius = np.maximum(element_radius_arr, 0.0)
+    if float(element_radius_cap) > 0.0:
+        effective_radius = np.minimum(effective_radius, float(element_radius_cap))
+    maximum_radius = float(np.max(effective_radius, initial=0.0))
+    search_radii = float(radius) + effective_radius + maximum_radius
+    if float(np.max(search_radii, initial=0.0)) <= 0.0:
         return tuple(np.zeros((0,), dtype=np.int64) for _ in range(centers.shape[0]))
     tree = cKDTree(np.asarray(centers, dtype=np.float64))
-    neighbors = tree.query_ball_point(np.asarray(centers, dtype=np.float64), r=search_radius)
+    # Per-element radii avoid one unusually large splat turning the complete
+    # reconstruction into a near-all-pairs query.  The explicit cap affects
+    # topology only; rendering retains the original 2DGS disk extent.
+    neighbors = tree.query_ball_point(
+        np.asarray(centers, dtype=np.float64),
+        r=search_radii,
+    )
     adjacency = []
     for row, candidates in enumerate(neighbors):
         current = []
@@ -1656,7 +1672,7 @@ def _build_adjacency(
             if float(np.dot(normals[row], normals[int(col)])) < float(normal_cosine_threshold):
                 continue
             center_distance = float(np.linalg.norm(centers[row] - centers[int(col)]))
-            support_distance = float(radius) + float(element_radius_arr[row]) + float(element_radius_arr[int(col)])
+            support_distance = float(radius) + float(effective_radius[row]) + float(effective_radius[int(col)])
             if center_distance > support_distance:
                 continue
             current.append(int(col))
@@ -2928,8 +2944,46 @@ def _weighted_iou(
     second_ids: np.ndarray,
     second_weights: np.ndarray,
 ) -> float:
-    first = {int(idx): float(weight) for idx, weight in zip(first_ids.tolist(), first_weights.tolist())}
-    second = {int(idx): float(weight) for idx, weight in zip(second_ids.tolist(), second_weights.tolist())}
+    first_ids_arr = np.asarray(first_ids, dtype=np.int64).reshape(-1)
+    second_ids_arr = np.asarray(second_ids, dtype=np.int64).reshape(-1)
+    first_weights_arr = np.asarray(first_weights, dtype=np.float32).reshape(-1)
+    second_weights_arr = np.asarray(second_weights, dtype=np.float32).reshape(-1)
+    if first_ids_arr.shape != first_weights_arr.shape or second_ids_arr.shape != second_weights_arr.shape:
+        raise ValueError("weighted-IoU IDs and weights must have matching shapes")
+    first_is_unique_sorted = first_ids_arr.size < 2 or bool(np.all(np.diff(first_ids_arr) > 0))
+    second_is_unique_sorted = second_ids_arr.size < 2 or bool(np.all(np.diff(second_ids_arr) > 0))
+    if first_is_unique_sorted and second_is_unique_sorted:
+        # Observation, dilated, and parent supports are emitted as sorted
+        # unique IDs.  The histogram-intersection identity below is exactly
+        # equivalent to the dictionary implementation, but performs the
+        # production hot path in NumPy instead of allocating two Python
+        # dictionaries and their union for every candidate edge.
+        _shared_ids, first_rows, second_rows = np.intersect1d(
+            first_ids_arr,
+            second_ids_arr,
+            assume_unique=True,
+            return_indices=True,
+        )
+        intersection = float(
+            np.minimum(
+                first_weights_arr[first_rows],
+                second_weights_arr[second_rows],
+            ).sum(dtype=np.float64)
+        )
+        union = (
+            float(first_weights_arr.sum(dtype=np.float64))
+            + float(second_weights_arr.sum(dtype=np.float64))
+            - intersection
+        )
+        return float(intersection / max(union, 1e-12))
+    first = {
+        int(idx): float(weight)
+        for idx, weight in zip(first_ids_arr.tolist(), first_weights_arr.tolist())
+    }
+    second = {
+        int(idx): float(weight)
+        for idx, weight in zip(second_ids_arr.tolist(), second_weights_arr.tolist())
+    }
     keys = set(first) | set(second)
     if not keys:
         return 0.0
@@ -2956,16 +3010,21 @@ def _dilated_support(
     element_ids: np.ndarray,
     element_weights: np.ndarray,
     hops: int,
+    row_by_id: Mapping[int, int] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     if int(hops) <= 0:
         return np.asarray(element_ids, dtype=np.int64), np.asarray(element_weights, dtype=np.float32)
-    row_by_id = elements.row_by_element_id
+    # Building this 2DGS-wide lookup is O(number of surface elements).  Callers
+    # that process a bank of observations must construct it once and reuse it;
+    # rebuilding it for every token makes full-scene graph fusion effectively
+    # O(number of observations * number of surface elements).
+    element_row_by_id = elements.row_by_element_id if row_by_id is None else row_by_id
     output_ids: list[int] = []
     output_weights: list[float] = []
     for element_id, weight in zip(element_ids.tolist(), element_weights.tolist()):
-        if int(element_id) not in row_by_id:
+        if int(element_id) not in element_row_by_id:
             continue
-        frontier = {int(row_by_id[int(element_id)])}
+        frontier = {int(element_row_by_id[int(element_id)])}
         visited = set(frontier)
         for _hop in range(int(hops)):
             next_frontier = set()
@@ -2988,14 +3047,15 @@ def _parent_support(
     elements: SurfaceElementMap,
     element_ids: np.ndarray,
     element_weights: np.ndarray,
+    row_by_id: Mapping[int, int] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    row_by_id = elements.row_by_element_id
+    element_row_by_id = elements.row_by_element_id if row_by_id is None else row_by_id
     parent_ids: list[int] = []
     parent_weights: list[float] = []
     for element_id, weight in zip(element_ids.tolist(), element_weights.tolist()):
-        if int(element_id) not in row_by_id:
+        if int(element_id) not in element_row_by_id:
             continue
-        row = row_by_id[int(element_id)]
+        row = element_row_by_id[int(element_id)]
         parent_ids.append(int(elements.parent_gaussian_indices[int(row)]))
         parent_weights.append(float(weight))
     return _aggregate_weighted_ids(parent_ids, parent_weights)
@@ -3010,6 +3070,7 @@ def _support_association_scores(
     cfg: Vfm2DgsAnchorFusionConfig,
     dilated_cache: dict[tuple[tuple[int, ...], tuple[float, ...], int], tuple[np.ndarray, np.ndarray]] | None = None,
     parent_cache: dict[tuple[tuple[int, ...], tuple[float, ...]], tuple[np.ndarray, np.ndarray]] | None = None,
+    row_by_id: Mapping[int, int] | None = None,
 ) -> dict[str, float]:
     exact = _weighted_iou(first_ids, first_weights, second_ids, second_weights)
     dilated = 0.0
@@ -3020,6 +3081,7 @@ def _support_association_scores(
             first_weights,
             int(cfg.support_iou_dilation_hops),
             dilated_cache,
+            row_by_id=row_by_id,
         )
         second_d_ids, second_d_weights = _cached_dilated_support(
             elements,
@@ -3027,12 +3089,25 @@ def _support_association_scores(
             second_weights,
             int(cfg.support_iou_dilation_hops),
             dilated_cache,
+            row_by_id=row_by_id,
         )
         dilated = _weighted_iou(first_d_ids, first_d_weights, second_d_ids, second_d_weights)
     parent = 0.0
     if float(cfg.min_parent_surface_iou) > 0.0:
-        first_p_ids, first_p_weights = _cached_parent_support(elements, first_ids, first_weights, parent_cache)
-        second_p_ids, second_p_weights = _cached_parent_support(elements, second_ids, second_weights, parent_cache)
+        first_p_ids, first_p_weights = _cached_parent_support(
+            elements,
+            first_ids,
+            first_weights,
+            parent_cache,
+            row_by_id=row_by_id,
+        )
+        second_p_ids, second_p_weights = _cached_parent_support(
+            elements,
+            second_ids,
+            second_weights,
+            parent_cache,
+            row_by_id=row_by_id,
+        )
         parent = _weighted_iou(first_p_ids, first_p_weights, second_p_ids, second_p_weights)
     return {"exact": exact, "dilated": dilated, "parent": parent}
 
@@ -3049,12 +3124,19 @@ def _cached_dilated_support(
     element_weights: np.ndarray,
     hops: int,
     cache: dict[tuple[tuple[int, ...], tuple[float, ...], int], tuple[np.ndarray, np.ndarray]] | None,
+    row_by_id: Mapping[int, int] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     key_base = _support_cache_key(element_ids, element_weights)
     key = (key_base[0], key_base[1], int(hops))
     if cache is not None and key in cache:
         return cache[key]
-    value = _dilated_support(elements, element_ids, element_weights, int(hops))
+    value = _dilated_support(
+        elements,
+        element_ids,
+        element_weights,
+        int(hops),
+        row_by_id=row_by_id,
+    )
     if cache is not None:
         cache[key] = value
     return value
@@ -3065,11 +3147,12 @@ def _cached_parent_support(
     element_ids: np.ndarray,
     element_weights: np.ndarray,
     cache: dict[tuple[tuple[int, ...], tuple[float, ...]], tuple[np.ndarray, np.ndarray]] | None,
+    row_by_id: Mapping[int, int] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     key = _support_cache_key(element_ids, element_weights)
     if cache is not None and key in cache:
         return cache[key]
-    value = _parent_support(elements, element_ids, element_weights)
+    value = _parent_support(elements, element_ids, element_weights, row_by_id=row_by_id)
     if cache is not None:
         cache[key] = value
     return value
@@ -3089,6 +3172,7 @@ def fuse_token_surface_observations(
     states: list[dict[str, object]] = []
     dilated_cache: dict[tuple[tuple[int, ...], tuple[float, ...], int], tuple[np.ndarray, np.ndarray]] = {}
     parent_cache: dict[tuple[tuple[int, ...], tuple[float, ...]], tuple[np.ndarray, np.ndarray]] = {}
+    row_by_id = elements.row_by_element_id
     for obs in observations:
         best_index = -1
         best_score = 0.0
@@ -3116,6 +3200,7 @@ def fuse_token_surface_observations(
                 cfg,
                 dilated_cache=dilated_cache,
                 parent_cache=parent_cache,
+                row_by_id=row_by_id,
             )
             normal_cos = float(np.dot(obs.normal, np.asarray(state["normal"], dtype=np.float32)))
             center_dist = float(np.linalg.norm(obs.center - np.asarray(state["center"], dtype=np.float64)))
@@ -3139,7 +3224,7 @@ def fuse_token_surface_observations(
         else:
             _merge_anchor_state(states[best_index], obs)
     rows = [
-        _finalize_anchor_state(elements, state, cfg)
+        _finalize_anchor_state(elements, state, cfg, row_by_id=row_by_id)
         for state in states
         if _anchor_state_observation_count_ok(state, cfg)
     ]
@@ -3259,13 +3344,17 @@ def _fuse_token_surface_observations_surface_first(
         bucket = buckets[int(seed_id)]
         if not bucket:
             continue
-        state = _new_anchor_state(bucket[0])
+        state = _anchor_state_from_observations(bucket)
         state["surface_first_seed_element_id"] = int(seed_id)
-        for obs in bucket[1:]:
-            _merge_anchor_state(state, obs)
         states.append(state)
+    row_by_id = elements.row_by_element_id
     rows = [
-        _finalize_anchor_state(elements, state, cfg)
+        _finalize_anchor_state(
+            elements,
+            state,
+            cfg,
+            row_by_id=row_by_id,
+        )
         for state in states
         if _anchor_state_observation_count_ok(state, cfg)
     ]
@@ -3372,14 +3461,105 @@ def _fuse_token_surface_observations_graph(
         root_first = find(first)
         root_second = find(second)
         if root_first != root_second:
-            parent[root_second] = root_first
+            # Canonicalize the component representative so graph output is
+            # independent of candidate traversal order.
+            low = min(root_first, root_second)
+            high = max(root_first, root_second)
+            parent[high] = low
 
-    dilated_cache: dict[tuple[tuple[int, ...], tuple[float, ...], int], tuple[np.ndarray, np.ndarray]] = {}
-    parent_cache: dict[tuple[tuple[int, ...], tuple[float, ...]], tuple[np.ndarray, np.ndarray]] = {}
-    for first_idx in range(count):
-        first = observations[first_idx]
-        for second_idx in range(first_idx + 1, count):
-            second = observations[second_idx]
+    exact_enabled = float(cfg.min_surface_iou) > 0.0
+    dilated_enabled = (
+        int(cfg.support_iou_dilation_hops) > 0
+        and float(cfg.min_dilated_surface_iou) > 0.0
+    )
+    parent_enabled = float(cfg.min_parent_surface_iou) > 0.0
+    # A zero exact-IoU threshold means every spatially compatible pair is a
+    # candidate under the historical contract.  Otherwise, a pair can only
+    # pass if at least one enabled support representation has a shared ID.
+    unrestricted_support = not exact_enabled
+    support_postings: dict[tuple[str, int], list[int]] = {}
+    spatial_postings: dict[tuple[int, int, int], list[int]] = {}
+    dilated_supports: list[tuple[np.ndarray, np.ndarray] | None] = []
+    parent_supports: list[tuple[np.ndarray, np.ndarray] | None] = []
+    row_by_id = elements.row_by_element_id
+    cell_size = max(float(cfg.max_center_distance), 1e-8)
+    candidate_pair_count = 0
+    evaluated_pair_count = 0
+    merged_pair_count = 0
+    connected_pair_skip_count = 0
+    for second_idx, second in enumerate(observations):
+        second_dilated = (
+            _dilated_support(
+                elements,
+                second.element_ids,
+                second.element_weights,
+                int(cfg.support_iou_dilation_hops),
+                row_by_id=row_by_id,
+            )
+            if dilated_enabled
+            else None
+        )
+        second_parent = (
+            _parent_support(
+                elements,
+                second.element_ids,
+                second.element_weights,
+                row_by_id=row_by_id,
+            )
+            if parent_enabled
+            else None
+        )
+        support_keys: list[tuple[str, int]] = []
+        if exact_enabled:
+            support_keys.extend(
+                ("exact", int(element_id))
+                for element_id in np.asarray(second.element_ids, dtype=np.int64).tolist()
+            )
+        if second_dilated is not None:
+            support_keys.extend(
+                ("dilated", int(element_id))
+                for element_id in second_dilated[0].tolist()
+            )
+        if second_parent is not None:
+            support_keys.extend(
+                ("parent", int(parent_id))
+                for parent_id in second_parent[0].tolist()
+            )
+
+        center_cell_array = np.floor(
+            np.asarray(second.center, dtype=np.float64) / cell_size
+        ).astype(np.int64)
+        center_cell = tuple(int(value) for value in center_cell_array.tolist())
+        spatial_candidates: set[int] = set()
+        for dz in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    spatial_candidates.update(
+                        spatial_postings.get(
+                            (
+                                center_cell[0] + dx,
+                                center_cell[1] + dy,
+                                center_cell[2] + dz,
+                            ),
+                            (),
+                        )
+                    )
+        if unrestricted_support:
+            candidates = spatial_candidates
+        else:
+            candidates: set[int] = set()
+            for key in support_keys:
+                candidates.update(support_postings.get(key, ()))
+            candidates.intersection_update(spatial_candidates)
+        candidate_pair_count += len(candidates)
+        # Connected components do not depend on edge traversal order.  Integer
+        # set iteration is deterministic here, while sorting every dense
+        # per-observation candidate set is a substantial full-scene cost.
+        for first_idx in candidates:
+            if find(int(first_idx)) == find(int(second_idx)):
+                connected_pair_skip_count += 1
+                continue
+            first = observations[int(first_idx)]
             if not _source_merge_allowed(
                 first.source_id,
                 second.source_id,
@@ -3394,37 +3574,96 @@ def _fuse_token_surface_observations_graph(
             center_dist = float(np.linalg.norm(first.center - second.center))
             if center_dist > float(cfg.max_center_distance):
                 continue
-            scores = _support_association_scores(
-                elements,
-                first.element_ids,
-                first.element_weights,
-                second.element_ids,
-                second.element_weights,
-                cfg,
-                dilated_cache=dilated_cache,
-                parent_cache=parent_cache,
-            )
+            evaluated_pair_count += 1
+            scores = {
+                "exact": _weighted_iou(
+                    first.element_ids,
+                    first.element_weights,
+                    second.element_ids,
+                    second.element_weights,
+                ),
+                "dilated": 0.0,
+                "parent": 0.0,
+            }
+            if second_dilated is not None:
+                first_dilated = dilated_supports[int(first_idx)]
+                if first_dilated is None:
+                    raise RuntimeError("dilated support index is inconsistent")
+                scores["dilated"] = _weighted_iou(
+                    first_dilated[0],
+                    first_dilated[1],
+                    second_dilated[0],
+                    second_dilated[1],
+                )
+            if second_parent is not None:
+                first_parent = parent_supports[int(first_idx)]
+                if first_parent is None:
+                    raise RuntimeError("parent support index is inconsistent")
+                scores["parent"] = _weighted_iou(
+                    first_parent[0],
+                    first_parent[1],
+                    second_parent[0],
+                    second_parent[1],
+                )
             if _support_match(scores, cfg):
                 union(first_idx, second_idx)
+                merged_pair_count += 1
+        dilated_supports.append(second_dilated)
+        parent_supports.append(second_parent)
+        for key in set(support_keys):
+            support_postings.setdefault(key, []).append(int(second_idx))
+        spatial_postings.setdefault(center_cell, []).append(int(second_idx))
+        if count >= 10_000 and (second_idx + 1) % 10_000 == 0:
+            print(
+                json.dumps(
+                    {
+                        "stage": "vfm_2dgs_sparse_graph_fusion",
+                        "completed_observations": int(second_idx + 1),
+                        "total_observations": int(count),
+                        "candidate_pair_count": int(candidate_pair_count),
+                        "evaluated_pair_count": int(evaluated_pair_count),
+                        "merged_pair_count": int(merged_pair_count),
+                        "connected_pair_skip_count": int(
+                            connected_pair_skip_count
+                        ),
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
 
     clusters: dict[int, list[TokenSurfaceObservation]] = {}
     for idx, obs in enumerate(observations):
         clusters.setdefault(find(idx), []).append(obs)
     states: list[dict[str, object]] = []
     for cluster in clusters.values():
-        state = _new_anchor_state(cluster[0])
-        for obs in cluster[1:]:
-            _merge_anchor_state(state, obs)
-        states.append(state)
+        states.append(_anchor_state_from_observations(cluster))
     rows = [
-        _finalize_anchor_state(elements, state, cfg)
+        _finalize_anchor_state(elements, state, cfg, row_by_id=row_by_id)
         for state in states
         if _anchor_state_observation_count_ok(state, cfg)
     ]
     if not rows:
         feature_dim = int(observations[0].feature.shape[0]) if observations else 0
         return _empty_anchor_map(feature_dim, metadata={"fusion_config": cfg.to_dict(), **dict(metadata or {})})
-    return _anchor_map_from_finalized_rows(elements, rows, cfg, metadata)
+    return _anchor_map_from_finalized_rows(
+        elements,
+        rows,
+        cfg,
+        {
+            "sparse_graph_fusion": {
+                "observation_count": int(count),
+                "all_pair_count": int(count * (count - 1) // 2),
+                "candidate_pair_count": int(candidate_pair_count),
+                "evaluated_pair_count": int(evaluated_pair_count),
+                "merged_pair_count": int(merged_pair_count),
+                "connected_pair_skip_count": int(connected_pair_skip_count),
+                "spatial_cell_size": float(cell_size),
+                "support_inverted_index": True,
+            },
+            **dict(metadata or {}),
+        },
+    )
 
 
 def _anchor_map_from_finalized_rows(
@@ -3510,9 +3749,21 @@ def _compute_feature_distinctiveness(features: np.ndarray) -> np.ndarray:
     if feats.shape[0] == 1:
         return np.ones((1,), dtype=np.float32)
     normalized, _valid = normalize_rows(feats)
-    similarity = normalized @ normalized.T
-    np.fill_diagonal(similarity, -np.inf)
-    nearest = np.max(similarity, axis=1)
+    # Keep the historical exact all-anchor nearest-neighbour definition, but
+    # do not materialize the complete N x N similarity matrix.  Full-scene
+    # maps can contain tens of thousands of anchors, for which the old
+    # allocation could consume several gigabytes after an otherwise
+    # successful fusion.  Blocking only changes peak memory, not the result.
+    row_count = int(normalized.shape[0])
+    target_similarity_values = 16 * 1024 * 1024  # 64 MiB at float32.
+    block_size = max(1, min(row_count, target_similarity_values // row_count))
+    nearest = np.full((row_count,), -np.inf, dtype=np.float32)
+    for start in range(0, row_count, block_size):
+        stop = min(start + block_size, row_count)
+        similarity = normalized[start:stop] @ normalized.T
+        local_rows = np.arange(stop - start, dtype=np.int64)
+        similarity[local_rows, np.arange(start, stop, dtype=np.int64)] = -np.inf
+        nearest[start:stop] = np.max(similarity, axis=1)
     return np.clip(1.0 - nearest, 0.0, 1.0).astype(np.float32, copy=False)
 
 
@@ -3757,8 +4008,8 @@ def _cluster_feature_prototypes(
     weight_arr = np.asarray(weights, dtype=np.float64).reshape(-1)
     weight_arr = weight_arr / max(float(np.sum(weight_arr)), 1e-12)
     order = np.argsort(-weight_arr, kind="mergesort")
-    clusters: list[list[int]] = []
     proto_vectors: list[np.ndarray] = []
+    weighted_sums: list[np.ndarray] = []
     for idx in order.tolist():
         vector = normalized[int(idx)]
         best = -1
@@ -3769,21 +4020,25 @@ def _cluster_feature_prototypes(
                 best_sim = sim
                 best = cluster_idx
         if best >= 0 and best_sim >= float(min_cosine):
-            clusters[best].append(int(idx))
-        elif len(clusters) < proto_count:
-            clusters.append([int(idx)])
+            assigned = best
+        elif len(proto_vectors) < proto_count:
+            assigned = len(proto_vectors)
+            proto_vectors.append(np.zeros_like(vector, dtype=np.float32))
+            weighted_sums.append(
+                np.zeros_like(vector, dtype=np.float64)
+            )
         else:
             if best >= 0:
-                clusters[best].append(int(idx))
+                assigned = best
             else:
-                clusters[0].append(int(idx))
-        proto_vectors = []
-        for cluster in clusters:
-            cluster_weights = weight_arr[np.asarray(cluster, dtype=np.int64)]
-            cluster_weights = cluster_weights / max(float(np.sum(cluster_weights)), 1e-12)
-            proto = np.sum(normalized[np.asarray(cluster, dtype=np.int64)] * cluster_weights[:, None], axis=0)
-            proto = proto / max(float(np.linalg.norm(proto)), 1e-8)
-            proto_vectors.append(proto.astype(np.float32))
+                assigned = 0
+        weighted_sums[assigned] += (
+            normalized[int(idx)].astype(np.float64)
+            * float(weight_arr[int(idx)])
+        )
+        proto = weighted_sums[assigned]
+        proto = proto / max(float(np.linalg.norm(proto)), 1e-8)
+        proto_vectors[assigned] = proto.astype(np.float32)
     prototypes = np.zeros((proto_count, feats.shape[1]), dtype=np.float32)
     for idx, proto in enumerate(proto_vectors[:proto_count]):
         prototypes[idx] = proto
@@ -3918,6 +4173,63 @@ def _new_anchor_state(obs: TokenSurfaceObservation) -> dict[str, object]:
     }
 
 
+def _anchor_state_from_observations(
+    observations: Sequence[TokenSurfaceObservation],
+) -> dict[str, object]:
+    """Build the exact final aggregate state in one linear pass.
+
+    Repeated ``_merge_anchor_state`` calls are appropriate for online greedy
+    fusion, where the current center and support affect the next association.
+    Graph and surface-first fusion already know their complete membership, so
+    recomputing all preceding centers and normals at every append is an
+    unnecessary O(k^2) operation for a component of size k.
+    """
+    if not observations:
+        raise ValueError("anchor state requires at least one observation")
+    support: dict[int, float] = {}
+    source_ids: set[str] = set()
+    quality_weights = np.empty((len(observations),), dtype=np.float64)
+    centers = np.empty((len(observations), 3), dtype=np.float64)
+    normals = np.empty((len(observations), 3), dtype=np.float64)
+    for row, obs in enumerate(observations):
+        for element_id, weight in zip(
+            obs.element_ids.tolist(),
+            obs.element_weights.tolist(),
+        ):
+            key = int(element_id)
+            support[key] = (
+                float(support.get(key, 0.0))
+                + float(weight) * float(obs.quality_score)
+            )
+        if str(obs.source_id):
+            source_ids.add(str(obs.source_id))
+        quality_weights[row] = max(float(obs.quality_score), 1e-6)
+        centers[row] = obs.center
+        normals[row] = obs.normal
+    support_total = max(sum(float(value) for value in support.values()), 1e-12)
+    element_ids = np.asarray(sorted(support), dtype=np.int64)
+    element_weights = np.asarray(
+        [float(support[int(idx)]) / support_total for idx in element_ids.tolist()],
+        dtype=np.float32,
+    )
+    quality_weights = quality_weights / max(
+        float(np.sum(quality_weights)),
+        1e-12,
+    )
+    center = np.sum(centers * quality_weights[:, None], axis=0)
+    normal = np.sum(normals * quality_weights[:, None], axis=0)
+    normal = normal / max(float(np.linalg.norm(normal)), 1e-8)
+    return {
+        "support": support,
+        "observations": list(observations),
+        "source_ids": source_ids,
+        "center": center.astype(np.float64, copy=False),
+        "normal": normal.astype(np.float32, copy=False),
+        "element_ids": element_ids,
+        "element_weights": element_weights,
+    }
+
+
 def _anchor_state_observation_count_ok(state: Mapping[str, object], cfg: Vfm2DgsAnchorFusionConfig) -> bool:
     observations = state.get("observations", [])
     if not isinstance(observations, list):
@@ -3961,6 +4273,7 @@ def _finalize_anchor_state(
     elements: SurfaceElementMap,
     state: dict[str, object],
     cfg: Vfm2DgsAnchorFusionConfig,
+    row_by_id: Mapping[int, int] | None = None,
 ) -> dict[str, object]:
     observations = state["observations"]
     assert isinstance(observations, list)
@@ -3999,8 +4312,16 @@ def _finalize_anchor_state(
         [float(support[int(element_id)]) / total_support for element_id in element_ids.tolist()],
         dtype=np.float32,
     )
-    row_by_id = elements.row_by_element_id
-    rows = np.asarray([row_by_id[int(element_id)] for element_id in element_ids.tolist()], dtype=np.int64)
+    element_row_by_id = (
+        elements.row_by_element_id if row_by_id is None else row_by_id
+    )
+    rows = np.asarray(
+        [
+            element_row_by_id[int(element_id)]
+            for element_id in element_ids.tolist()
+        ],
+        dtype=np.int64,
+    )
     center, normal, covariance = _support_geometry(elements, rows, element_weights)
     support_obs_weights = np.asarray([max(float(obs.quality_score), 1e-6) for obs in support_observations], dtype=np.float64)
     support_obs_weights = support_obs_weights / max(float(np.sum(support_obs_weights)), 1e-12)

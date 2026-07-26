@@ -223,10 +223,16 @@ class RadioTokenExtractor:
         device: str,
         radio_repo: str,
         array_name: str = "radio_final",
+        input_width: int = 0,
+        input_height: int = 0,
     ):
         from feature_extract.extractors import RADIOFeatureExtractor
 
         self.array_name = array_name
+        if (int(input_width) > 0) != (int(input_height) > 0):
+            raise ValueError("RADIO input_width and input_height must be set together")
+        self.input_width = int(input_width)
+        self.input_height = int(input_height)
         self.extractor = RADIOFeatureExtractor(
             version=version,
             device=device,
@@ -247,6 +253,8 @@ class RadioTokenExtractor:
         from PIL import Image
 
         image = Image.open(image_path).convert("RGB")
+        if self.input_width > 0:
+            image = image.resize((self.input_width, self.input_height), resample=Image.Resampling.BILINEAR)
         array = np.asarray(image, dtype=np.float32) / 255.0
         tensor = torch.from_numpy(array).permute(2, 0, 1).unsqueeze(0)
         outputs = self.extractor.extract(tensor)
@@ -260,6 +268,8 @@ class RadioTokenExtractor:
         shapes = set()
         for image_path in image_paths:
             image = Image.open(image_path).convert("RGB")
+            if self.input_width > 0:
+                image = image.resize((self.input_width, self.input_height), resample=Image.Resampling.BILINEAR)
             array = np.asarray(image, dtype=np.float32) / 255.0
             tensor = torch.from_numpy(array).permute(2, 0, 1)
             tensors.append(tensor)
@@ -335,6 +345,8 @@ def build_model_extractors(
     radio_version: str,
     dinov2_model: str,
     dinov2_stride: int,
+    radio_input_width: int = 0,
+    radio_input_height: int = 0,
 ) -> tuple[TokenExtractor, ...]:
     extractors: list[TokenExtractor] = []
     for name in model_names:
@@ -345,6 +357,8 @@ def build_model_extractors(
                     version=radio_version if name == "radio" else name,
                     device=device,
                     radio_repo=radio_repo,
+                    input_width=int(radio_input_width),
+                    input_height=int(radio_input_height),
                 )
             )
         elif "dino" in lower:
@@ -381,6 +395,8 @@ def main() -> None:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--radio_repo", default="feature_extract/checkpoints/RADIO")
     parser.add_argument("--radio_version", default="c-radio_v4-h")
+    parser.add_argument("--radio_input_width", type=int, default=0)
+    parser.add_argument("--radio_input_height", type=int, default=0)
     parser.add_argument("--dinov2_model", default="dinov2_vits14")
     parser.add_argument("--dinov2_stride", type=int, default=14)
     parser.add_argument("--storage_dtype", default="float16", choices=["float16", "float32"])
@@ -435,6 +451,8 @@ def main() -> None:
             radio_version=args.radio_version,
             dinov2_model=args.dinov2_model,
             dinov2_stride=args.dinov2_stride,
+            radio_input_width=int(args.radio_input_width),
+            radio_input_height=int(args.radio_input_height),
         ),
         storage_dtype=args.storage_dtype,
         batch_size=args.batch_size,
