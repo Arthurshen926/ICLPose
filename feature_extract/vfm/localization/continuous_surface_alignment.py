@@ -38,6 +38,10 @@ class ContinuousSurfaceAlignmentConfig:
     detector_evidence_weight: float = 0.35
     detector_radio_gate: float = 0.05
     minimum_confidence: float = 0.02
+    minimum_null_probability: float = 0.05
+    maximum_null_probability: float = 0.80
+    null_feature_likelihood: float = 0.05
+    out_of_view_likelihood: float = 0.01
 
     def __post_init__(self) -> None:
         if (
@@ -64,6 +68,17 @@ class ContinuousSurfaceAlignmentConfig:
             raise ValueError("detector_evidence_floor must be in [0, 1]")
         if float(self.detector_evidence_weight) < 0.0:
             raise ValueError("detector_evidence_weight must be non-negative")
+        if not (
+            0.0 < float(self.minimum_null_probability)
+            < float(self.maximum_null_probability)
+            < 1.0
+        ):
+            raise ValueError("null probability limits must lie strictly inside (0, 1)")
+        if not (
+            0.0 < float(self.null_feature_likelihood) <= 1.0
+            and 0.0 < float(self.out_of_view_likelihood) <= 1.0
+        ):
+            raise ValueError("null and out-of-view likelihoods must lie in (0, 1]")
 
 
 @dataclass(frozen=True)
@@ -307,6 +322,7 @@ def _alignment_loss(
     xyz: torch.Tensor,
     map_features: torch.Tensor,
     weights: torch.Tensor,
+    uncertainty: torch.Tensor,
     query_feature: torch.Tensor,
     camera: ColmapCamera,
     robust_delta: float,
@@ -316,6 +332,11 @@ def _alignment_loss(
     detector_evidence_floor: float = 0.15,
     detector_evidence_weight: float = 0.35,
     detector_radio_gate: float = 0.05,
+    minimum_null_probability: float = 0.05,
+    maximum_null_probability: float = 0.80,
+    null_feature_likelihood: float = 0.05,
+    out_of_view_likelihood: float = 0.01,
+    align_corners: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     pose = _compose_delta(delta, base_pose)
     camera_xyz = xyz @ pose[:3, :3].T + pose[:3, 3]
@@ -325,19 +346,28 @@ def _alignment_loss(
     radial = 1.0 + float(k) * torch.sum(normalized * normalized, dim=1)
     pixel_x = float(f) * normalized[:, 0] * radial + float(cx)
     pixel_y = float(f) * normalized[:, 1] * radial + float(cy)
-    grid = torch.stack(
-        [
-            2.0 * pixel_x / max(int(camera.width) - 1, 1) - 1.0,
-            2.0 * pixel_y / max(int(camera.height) - 1, 1) - 1.0,
-        ],
-        dim=1,
-    )
+    if bool(align_corners):
+        grid = torch.stack(
+            [
+                2.0 * pixel_x / max(int(camera.width) - 1, 1) - 1.0,
+                2.0 * pixel_y / max(int(camera.height) - 1, 1) - 1.0,
+            ],
+            dim=1,
+        )
+    else:
+        grid = torch.stack(
+            [
+                2.0 * (pixel_x + 0.5) / max(int(camera.width), 1) - 1.0,
+                2.0 * (pixel_y + 0.5) / max(int(camera.height), 1) - 1.0,
+            ],
+            dim=1,
+        )
     sampled = F.grid_sample(
         query_feature[None],
         grid.reshape(1, 1, -1, 2),
         mode="bilinear",
         padding_mode="zeros",
-        align_corners=True,
+        align_corners=bool(align_corners),
     )[0, :, 0, :].T
     sampled = F.normalize(sampled, p=2, dim=1, eps=1e-8)
     cosine = torch.sum(sampled * map_features, dim=1)
@@ -346,32 +376,52 @@ def _alignment_loss(
         & (torch.abs(grid[:, 0]) <= 1.0)
         & (torch.abs(grid[:, 1]) <= 1.0)
     )
-    # A null mixture is essential: many surfels in a retrieved region are not
-    # repeatable in a particular view.  Maximizing every cosine lets those
-    # outliers rotate the camera toward a spurious average.  Softplus is a
-    # smooth inlier evidence term; similarities below the null threshold have
-    # exponentially vanishing influence.
     del robust_delta  # Kept in the signature for artifact compatibility.
     temperature = float(similarity_temperature)
-    evidence = temperature * F.softplus(
-        (cosine - float(similarity_threshold)) / temperature
-    )
+    feature_logit = (cosine - float(similarity_threshold)) / temperature
     if detector_heatmap is not None:
         detector = F.grid_sample(
             detector_heatmap.reshape(1, 1, *detector_heatmap.shape[-2:]),
             grid.reshape(1, 1, -1, 2),
             mode="bilinear",
             padding_mode="zeros",
-            align_corners=True,
+            align_corners=bool(align_corners),
         )[0, 0, 0, :]
         floor = float(detector_evidence_floor)
-        radio_gate = floor + (1.0 - floor) * torch.sigmoid(
+        matchability = floor + (1.0 - floor) * detector * torch.sigmoid(
             (cosine - float(detector_radio_gate)) / 0.10
         )
-        evidence = evidence + float(detector_evidence_weight) * detector * radio_gate
-    active_weight = weights * valid.to(weights.dtype)
-    score = torch.sum(active_weight * evidence) / torch.clamp(
-        torch.sum(active_weight), min=1e-8
+        feature_logit = feature_logit + float(detector_evidence_weight) * torch.log(
+            torch.clamp(matchability, min=1e-6)
+        )
+    inlier_log_likelihood = F.logsigmoid(feature_logit)
+    null_probability = torch.clamp(
+        float(minimum_null_probability)
+        + (
+            float(maximum_null_probability) - float(minimum_null_probability)
+        )
+        * torch.clamp(uncertainty, 0.0, 1.0),
+        min=float(minimum_null_probability),
+        max=float(maximum_null_probability),
+    )
+    visible_log_likelihood = torch.logaddexp(
+        torch.log(null_probability)
+        + np.log(max(float(null_feature_likelihood), 1e-12)),
+        torch.log1p(-null_probability) + inlier_log_likelihood,
+    )
+    per_sample = torch.where(
+        valid,
+        visible_log_likelihood,
+        torch.full_like(
+            visible_log_likelihood,
+            np.log(max(float(out_of_view_likelihood), 1e-12)),
+        ),
+    )
+    # The denominator is fixed for the chosen surface sample set. Moving hard
+    # points outside the image can no longer improve the score by deleting
+    # them from the normalization.
+    score = torch.sum(weights * per_sample) / torch.clamp(
+        torch.sum(weights), min=1e-8
     )
     return -score, score
 
@@ -389,6 +439,10 @@ def score_surface_alignment(
     detector_evidence_floor: float = 0.15,
     detector_evidence_weight: float = 0.35,
     detector_radio_gate: float = 0.05,
+    minimum_null_probability: float = 0.05,
+    maximum_null_probability: float = 0.80,
+    null_feature_likelihood: float = 0.05,
+    out_of_view_likelihood: float = 0.01,
 ) -> float:
     if np.asarray(sample_rows).size == 0:
         return float("-inf")
@@ -402,6 +456,7 @@ def score_surface_alignment(
             torch.as_tensor(field.centers[sample_rows], dtype=torch.float32, device=torch_device),
             torch.as_tensor(field.features[sample_rows], dtype=torch.float32, device=torch_device),
             torch.as_tensor(field.confidence[sample_rows], dtype=torch.float32, device=torch_device),
+            torch.as_tensor(field.uncertainty[sample_rows], dtype=torch.float32, device=torch_device),
             torch.as_tensor(query_feature, dtype=torch.float32, device=torch_device),
             camera,
             robust_delta,
@@ -415,6 +470,12 @@ def score_surface_alignment(
             detector_evidence_floor=float(detector_evidence_floor),
             detector_evidence_weight=float(detector_evidence_weight),
             detector_radio_gate=float(detector_radio_gate),
+            minimum_null_probability=float(minimum_null_probability),
+            maximum_null_probability=float(maximum_null_probability),
+            null_feature_likelihood=float(null_feature_likelihood),
+            out_of_view_likelihood=float(out_of_view_likelihood),
+            align_corners=field.metadata.get("pixel_grid_convention")
+            != "half_pixel_centers_align_corners_false",
         )
     return float(score.detach().cpu().item())
 
@@ -492,11 +553,18 @@ def _align_surface_feature_field_lbfgs(
             weights = torch.as_tensor(
                 field.confidence[rows], dtype=torch.float32, device=torch_device
             )
+            uncertainty = torch.as_tensor(
+                field.uncertainty[rows], dtype=torch.float32, device=torch_device
+            )
             base_pose = torch.as_tensor(
                 current_pose, dtype=torch.float32, device=torch_device
             )
             unconstrained_delta = torch.zeros(
                 6, dtype=torch.float32, device=torch_device, requires_grad=True
+            )
+            field_align_corners = (
+                field.metadata.get("pixel_grid_convention")
+                != "half_pixel_centers_align_corners_false"
             )
 
             def bounded_delta() -> torch.Tensor:
@@ -516,6 +584,7 @@ def _align_surface_feature_field_lbfgs(
                     xyz,
                     map_features,
                     weights,
+                    uncertainty,
                     query_level,
                     camera,
                     config.robust_delta,
@@ -525,6 +594,11 @@ def _align_surface_feature_field_lbfgs(
                     config.detector_evidence_floor,
                     config.detector_evidence_weight,
                     config.detector_radio_gate,
+                    config.minimum_null_probability,
+                    config.maximum_null_probability,
+                    config.null_feature_likelihood,
+                    config.out_of_view_likelihood,
+                    field_align_corners,
                 )
                 if not np.isfinite(initial_score):
                     initial_score = float(before_score.detach().cpu().item())
@@ -545,6 +619,7 @@ def _align_surface_feature_field_lbfgs(
                     xyz,
                     map_features,
                     weights,
+                    uncertainty,
                     query_level,
                     camera,
                     config.robust_delta,
@@ -554,6 +629,11 @@ def _align_surface_feature_field_lbfgs(
                     config.detector_evidence_floor,
                     config.detector_evidence_weight,
                     config.detector_radio_gate,
+                    config.minimum_null_probability,
+                    config.maximum_null_probability,
+                    config.null_feature_likelihood,
+                    config.out_of_view_likelihood,
+                    field_align_corners,
                 )
                 loss.backward()
                 return loss
@@ -566,6 +646,7 @@ def _align_surface_feature_field_lbfgs(
                     xyz,
                     map_features,
                     weights,
+                    uncertainty,
                     query_level,
                     camera,
                     config.robust_delta,
@@ -575,6 +656,11 @@ def _align_surface_feature_field_lbfgs(
                     config.detector_evidence_floor,
                     config.detector_evidence_weight,
                     config.detector_radio_gate,
+                    config.minimum_null_probability,
+                    config.maximum_null_probability,
+                    config.null_feature_likelihood,
+                    config.out_of_view_likelihood,
+                    field_align_corners,
                 )
                 actual_delta = bounded_delta()
                 candidate = _compose_delta(actual_delta, base_pose).detach().cpu().numpy()
@@ -644,6 +730,35 @@ def _left_pose_step(
     return step @ np.asarray(pose_w2c, dtype=np.float64).reshape(4, 4)
 
 
+def _left_pose_vector_step(
+    pose_w2c: np.ndarray,
+    normalized_direction: np.ndarray,
+    *,
+    rotation_step: float,
+    translation_step: float,
+) -> np.ndarray:
+    direction = np.asarray(normalized_direction, dtype=np.float64).reshape(6)
+    step = np.eye(4, dtype=np.float64)
+    rotation_vector = direction[:3] * float(rotation_step)
+    theta = float(np.linalg.norm(rotation_vector))
+    if theta > 0.0:
+        skew = np.asarray(
+            [
+                [0.0, -rotation_vector[2], rotation_vector[1]],
+                [rotation_vector[2], 0.0, -rotation_vector[0]],
+                [-rotation_vector[1], rotation_vector[0], 0.0],
+            ],
+            dtype=np.float64,
+        )
+        step[:3, :3] = (
+            np.eye(3)
+            + np.sin(theta) / theta * skew
+            + (1.0 - np.cos(theta)) / (theta * theta) * (skew @ skew)
+        )
+    step[:3, 3] = direction[3:] * float(translation_step)
+    return step @ np.asarray(pose_w2c, dtype=np.float64).reshape(4, 4)
+
+
 def _align_surface_feature_field_trust_region(
     field: SurfaceFeatureField,
     query_feature: np.ndarray,
@@ -671,19 +786,19 @@ def _align_surface_feature_field_trust_region(
     trace: list[dict[str, object]] = []
     initial_score = float("-inf")
     current_score = float("-inf")
-    last_rows = np.zeros((0,), dtype=np.int64)
+    fixed_rows = select_render_samples(
+        field,
+        current,
+        camera,
+        selected_ids,
+        feature_height=int(feature.shape[1]),
+        feature_width=int(feature.shape[2]),
+        config=config,
+    )
+    last_rows = fixed_rows
 
     for iteration in range(int(config.trust_region_iterations)):
-        rows = select_render_samples(
-            field,
-            current,
-            camera,
-            selected_ids,
-            feature_height=int(feature.shape[1]),
-            feature_width=int(feature.shape[2]),
-            config=config,
-        )
-        last_rows = rows
+        rows = fixed_rows
         if rows.size < 12:
             trace.append(
                 {
@@ -693,9 +808,17 @@ def _align_surface_feature_field_trust_region(
                 }
             )
             break
-        heldout = (field.source_indices[rows] % 5) == 0
+        maplet_ids = np.unique(field.owner_maplet_ids[rows])
+        heldout_maplets = maplet_ids[np.arange(maplet_ids.size) % 5 == 0]
+        heldout = np.isin(field.owner_maplet_ids[rows], heldout_maplets)
         if np.sum(heldout) < 4 or np.sum(~heldout) < 6:
-            heldout = (np.arange(rows.size) % 5) == 0
+            # Spatially coherent fallback: split by tangent-plane blocks rather
+            # than source-index hashing.
+            centers = field.centers[rows]
+            dominant_axis = int(np.argmax(np.var(centers, axis=0)))
+            order = np.argsort(centers[:, dominant_axis], kind="mergesort")
+            heldout = np.zeros((rows.size,), dtype=bool)
+            heldout[order[::5]] = True
         fit_rows = rows[~heldout]
         validation_rows = rows[heldout]
         fit_before = score_surface_alignment(
@@ -737,6 +860,7 @@ def _align_surface_feature_field_trust_region(
         if not np.isfinite(initial_score):
             initial_score = all_before
         candidates: list[tuple[float, float, float, int, int, np.ndarray]] = []
+        axis_combined = np.zeros((6, 2), dtype=np.float64)
         for axis in range(6):
             amount = rotation_step if axis < 3 else translation_step
             for sign in (-1, 1):
@@ -771,6 +895,54 @@ def _align_surface_feature_field_trust_region(
                         fit_score,
                         validation_score,
                         axis,
+                        sign,
+                        candidate,
+                    )
+                )
+                axis_combined[axis, 0 if sign < 0 else 1] = (
+                    fit_score + validation_score
+                )
+        normalized_gradient = axis_combined[:, 1] - axis_combined[:, 0]
+        gradient_norm = float(np.linalg.norm(normalized_gradient))
+        if gradient_norm > 1e-10:
+            direction = normalized_gradient / gradient_norm
+            for sign in (1, -1):
+                candidate = _left_pose_vector_step(
+                    current,
+                    float(sign) * direction,
+                    rotation_step=rotation_step,
+                    translation_step=translation_step,
+                )
+                fit_score = score_surface_alignment(
+                    field,
+                    feature,
+                    candidate,
+                    camera,
+                    fit_rows,
+                    device=device,
+                    detector_heatmap=detector_heatmap,
+                    detector_evidence_floor=config.detector_evidence_floor,
+                    detector_evidence_weight=config.detector_evidence_weight,
+                    detector_radio_gate=config.detector_radio_gate,
+                )
+                validation_score = score_surface_alignment(
+                    field,
+                    feature,
+                    candidate,
+                    camera,
+                    validation_rows,
+                    device=device,
+                    detector_heatmap=detector_heatmap,
+                    detector_evidence_floor=config.detector_evidence_floor,
+                    detector_evidence_weight=config.detector_evidence_weight,
+                    detector_radio_gate=config.detector_radio_gate,
+                )
+                candidates.append(
+                    (
+                        fit_score + validation_score,
+                        fit_score,
+                        validation_score,
+                        6,
                         sign,
                         candidate,
                     )
@@ -813,6 +985,7 @@ def _align_surface_feature_field_trust_region(
                 "fit_score_candidate": float(fit_after),
                 "heldout_score_candidate": float(validation_after),
                 "candidate_axis": int(axis),
+                "candidate_type": "joint_6d" if int(axis) == 6 else "axis",
                 "candidate_sign": int(sign),
                 "accepted": accepted,
                 "rotation_step_deg": float(np.rad2deg(rotation_step)),

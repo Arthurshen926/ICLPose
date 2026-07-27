@@ -30,6 +30,11 @@ materialize an ALIKE dense descriptor map.
 
 See [the anchor-free V4 mainline](docs/vfm/2dgs_surface_feature_field_v4.md)
 for its architecture, contracts, construction, and mandatory local-basin gate.
+The stricter [V5 first-principles revision](docs/vfm/2dgs_surface_feature_field_v5.md)
+documents exact ray/disk texels, fixed-likelihood scoring, the independent
+stride-4 metric decoder, and the score-landscape gate. V5 remains experimental
+until that gate passes; a failed gate is never promoted by running the
+downstream optimizer longer.
 The [V3 anchor/PnP mainline](docs/vfm/2dgs_surface_localization_mainline.md) is
 frozen as a measured baseline, not extended with new modules. The
 [SfM landmark mainline](docs/vfm/landmark_localization_mainline.md) is retained
@@ -42,6 +47,8 @@ only as a historical baseline.
 - `feature_extract/tools/vfm/train_surface_metric_feature_mapper.py`
 - `feature_extract/tools/vfm/apply_surface_metric_mapper_to_field.py`
 - `feature_extract/tools/vfm/evaluate_2dgs_surface_alignment_basin.py`
+- `feature_extract/tools/vfm/evaluate_2dgs_surface_score_landscape.py`
+- `feature_extract/tools/vfm/train_highres_surface_metric_decoder.py`
 - `feature_extract/tools/vfm/evaluate_surface_maplet_retrieval.py`
 - `feature_extract/tools/vfm/localize_2dgs_surface_feature_field.py`
 - `feature_extract/vfm/localization/surface_feature_field.py`
@@ -49,6 +56,7 @@ only as a historical baseline.
 - `feature_extract/vfm/localization/alike_detector_only.py`
 - `feature_extract/vfm/localization/surface_metric_feature_mapper.py`
 - `feature_extract/vfm/localization/continuous_surface_alignment.py`
+- `feature_extract/vfm/localization/highres_surface_metric_decoder.py`
 
 ## Historical And Reference Lines
 

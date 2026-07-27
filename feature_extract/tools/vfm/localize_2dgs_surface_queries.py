@@ -286,28 +286,51 @@ def _sample_mapped_vfm_at_pixels(
     *,
     image_width: int,
     image_height: int,
+    align_corners: bool = True,
 ) -> np.ndarray:
     feature = np.asarray(mapped_feature, dtype=np.float32)
     if feature.ndim != 3:
         raise ValueError("mapped VFM feature must have shape (C,H,W)")
     points = np.asarray(xy, dtype=np.float32).reshape(-1, 2)
-    grid_x = (
-        points[:, 0]
-        * max(int(feature.shape[2]) - 1, 1)
-        / max(int(image_width) - 1, 1)
-    ).astype(np.float32)
-    grid_y = (
-        points[:, 1]
-        * max(int(feature.shape[1]) - 1, 1)
-        / max(int(image_height) - 1, 1)
-    ).astype(np.float32)
-    sampled = cv2.remap(
-        feature.transpose(1, 2, 0),
-        grid_x.reshape(-1, 1),
-        grid_y.reshape(-1, 1),
-        interpolation=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_REPLICATE,
-    ).reshape(len(points), int(feature.shape[0]))
+    if bool(align_corners):
+        grid_x = (
+            points[:, 0]
+            * max(int(feature.shape[2]) - 1, 1)
+            / max(int(image_width) - 1, 1)
+        ).astype(np.float32)
+        grid_y = (
+            points[:, 1]
+            * max(int(feature.shape[1]) - 1, 1)
+            / max(int(image_height) - 1, 1)
+        ).astype(np.float32)
+    else:
+        grid_x = (
+            (points[:, 0] + 0.5)
+            * int(feature.shape[2])
+            / max(int(image_width), 1)
+            - 0.5
+        ).astype(np.float32)
+        grid_y = (
+            (points[:, 1] + 0.5)
+            * int(feature.shape[1])
+            / max(int(image_height), 1)
+            - 0.5
+        ).astype(np.float32)
+    # OpenCV remap has implementation-dependent limits for very large channel
+    # counts (raw RADIO-final has 1280). Chunking preserves the exact spatial
+    # sampling protocol without routing raw features through a retrieval head.
+    chunks = []
+    for begin in range(0, int(feature.shape[0]), 128):
+        end = min(begin + 128, int(feature.shape[0]))
+        value = cv2.remap(
+            feature[begin:end].transpose(1, 2, 0),
+            grid_x.reshape(-1, 1),
+            grid_y.reshape(-1, 1),
+            interpolation=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REPLICATE,
+        )
+        chunks.append(value.reshape(len(points), end - begin))
+    sampled = np.concatenate(chunks, axis=1)
     sampled /= np.maximum(
         np.linalg.norm(sampled, axis=1, keepdims=True),
         1e-8,

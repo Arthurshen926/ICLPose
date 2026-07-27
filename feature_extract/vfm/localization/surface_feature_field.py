@@ -1,9 +1,9 @@
 """Feature-only continuous 2DGS surface field for VFM pose alignment.
 
-This is deliberately not an anchor map.  A row is a retained 2DGS surfel and
-stores one robust RADIO-final feature estimate plus metric geometry and
-uncertainty.  It has no image identity, keypoint identity, descriptor list, or
-2D-to-3D correspondence identity.
+This is deliberately not an anchor map. A row is a geometric feature texel on
+a retained 2DGS disk and stores one robust RADIO-final feature distribution.
+Several texels may share the same source primitive without acquiring point or
+observation identity.
 """
 
 from __future__ import annotations
@@ -52,14 +52,38 @@ class SurfaceFeatureField:
     support_weight: np.ndarray
     support_count: np.ndarray
     owner_maplet_ids: np.ndarray
+    surface_cell_ids: np.ndarray | None = None
+    tangent_uv: np.ndarray | None = None
     metadata: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
         source_indices = np.asarray(self.source_indices, dtype=np.int64).reshape(-1)
         count = int(source_indices.size)
-        if np.unique(source_indices).size != count or np.any(source_indices < 0):
-            raise ValueError("source_indices must be unique and non-negative")
+        if np.any(source_indices < 0):
+            raise ValueError("source_indices must be non-negative")
         object.__setattr__(self, "source_indices", source_indices)
+        surface_cell_ids = (
+            source_indices.copy()
+            if self.surface_cell_ids is None
+            else np.asarray(self.surface_cell_ids, dtype=np.int64).reshape(-1)
+        )
+        if (
+            surface_cell_ids.shape != (count,)
+            or np.any(surface_cell_ids < 0)
+            or np.unique(surface_cell_ids).size != count
+        ):
+            raise ValueError("surface_cell_ids must be unique and non-negative")
+        if self.surface_cell_ids is None and np.unique(source_indices).size != count:
+            raise ValueError("legacy source-indexed fields require unique source_indices")
+        object.__setattr__(self, "surface_cell_ids", surface_cell_ids)
+        tangent_uv = (
+            np.zeros((count, 2), dtype=np.float32)
+            if self.tangent_uv is None
+            else np.asarray(self.tangent_uv, dtype=np.float32)
+        )
+        if tangent_uv.shape != (count, 2) or not np.all(np.isfinite(tangent_uv)):
+            raise ValueError("tangent_uv must have finite shape (N, 2)")
+        object.__setattr__(self, "tangent_uv", tangent_uv)
         for name in ("centers", "normals", "tangent1", "tangent2"):
             value = np.asarray(
                 getattr(self, name),
@@ -130,6 +154,8 @@ class SurfaceFeatureField:
             support_weight=self.support_weight.astype(np.float32),
             support_count=self.support_count.astype(np.int32),
             owner_maplet_ids=self.owner_maplet_ids.astype(np.int64),
+            surface_cell_ids=self.surface_cell_ids.astype(np.int64),
+            tangent_uv=self.tangent_uv.astype(np.float16),
             metadata_json=np.asarray(json.dumps(dict(self.metadata), sort_keys=True)),
         )
 
@@ -151,5 +177,15 @@ class SurfaceFeatureField:
                 support_weight=np.asarray(data["support_weight"], dtype=np.float32),
                 support_count=np.asarray(data["support_count"], dtype=np.int32),
                 owner_maplet_ids=np.asarray(data["owner_maplet_ids"], dtype=np.int64),
+                surface_cell_ids=(
+                    np.asarray(data["surface_cell_ids"], dtype=np.int64)
+                    if "surface_cell_ids" in data
+                    else None
+                ),
+                tangent_uv=(
+                    np.asarray(data["tangent_uv"], dtype=np.float32)
+                    if "tangent_uv" in data
+                    else None
+                ),
                 metadata=json.loads(str(np.asarray(data["metadata_json"]).item())),
             )

@@ -48,6 +48,37 @@ def test_surface_feature_field_roundtrip(tmp_path):
     assert loaded.owner_maplet_ids.tolist() == [4, 5]
 
 
+def test_surface_feature_field_allows_multiple_tangent_texels_per_primitive(tmp_path):
+    field = SurfaceFeatureField(
+        source_indices=np.asarray([3, 3]),
+        surface_cell_ids=np.asarray([3 * 64, 3 * 64 + 1]),
+        tangent_uv=np.asarray([[-0.5, 0.0], [0.5, 0.0]], dtype=np.float32),
+        centers=np.asarray([[0, 0, 1], [0.1, 0, 1]], dtype=np.float64),
+        normals=np.tile(np.asarray([[0, 0, 1]], dtype=np.float32), (2, 1)),
+        tangent1=np.tile(np.asarray([[1, 0, 0]], dtype=np.float32), (2, 1)),
+        tangent2=np.tile(np.asarray([[0, 1, 0]], dtype=np.float32), (2, 1)),
+        scale1=np.ones(2),
+        scale2=np.ones(2),
+        opacity=np.ones(2),
+        features=np.eye(2, dtype=np.float32),
+        uncertainty=np.zeros(2),
+        confidence=np.ones(2),
+        support_weight=np.ones(2),
+        support_count=np.ones(2),
+        owner_maplet_ids=np.asarray([4, 4]),
+        metadata={
+            "artifact_type": "radio_final_2dgs_surface_feature_field",
+            "vfm_layer": "radio_final",
+        },
+    )
+    path = tmp_path / "texels.npz"
+    field.save_npz(path)
+    loaded = SurfaceFeatureField.load_npz(path)
+    assert loaded.source_indices.tolist() == [3, 3]
+    assert loaded.surface_cell_ids.tolist() == [192, 193]
+    assert np.allclose(loaded.tangent_uv, [[-0.5, 0.0], [0.5, 0.0]])
+
+
 def test_surface_feature_field_rejects_anchor_identity():
     with pytest.raises(ValueError, match="stable_anchor"):
         _field(
