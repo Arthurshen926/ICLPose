@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 import torch
 from types import SimpleNamespace
 
@@ -37,6 +38,16 @@ from feature_extract.vfm.localization_v6.maplet_atlas import (
 from feature_extract.vfm.localization_v6.maplet_pose_proposal import (
     propose_maplet_surface_mode_poses,
 )
+from feature_extract.vfm.localization_v6.maplet_footprint_pose import (
+    score_maplet_footprint_pose,
+)
+from feature_extract.vfm.localization_v6.maplet_pose_voting import (
+    AnonymousMapletPoseVoteBank,
+    _bearing_from_normalized_image_xy,
+    retrieval_descriptor_sha256,
+    retrieval_geometry_sha256,
+    vote_maplet_poses,
+)
 from feature_extract.vfm.localization_v6.metric_encoder import (
     V6MetricEncoder,
     V6MetricEncoderConfig,
@@ -66,6 +77,10 @@ from feature_extract.vfm.localization_v6.surface_spatial_projection import (
     SurfaceSpatialProjectionConfig,
     load_surface_spatial_projection,
     save_surface_spatial_projection,
+)
+from feature_extract.vfm.localization_v6.probability_calibration import (
+    DistributionNullCalibration,
+    V6ProbabilityCalibration,
 )
 from feature_extract.vfm.surface_maplet_bank import VfmSurfaceMapletBank
 
@@ -113,6 +128,30 @@ def _camera():
         width=100,
         height=80,
         params=(50.0, 50.0, 40.0, 0.0),
+    )
+
+
+def _probability_calibration(
+    *,
+    identity_bias: float = -20.0,
+    spatial_bias: float = -20.0,
+) -> V6ProbabilityCalibration:
+    return V6ProbabilityCalibration(
+        identity=DistributionNullCalibration(
+            weights=np.asarray([identity_bias, 0, 0, 0, 0])
+        ),
+        spatial=DistributionNullCalibration(
+            weights=np.asarray([spatial_bias, 0, 0, 0, 0])
+        ),
+        metadata={
+            "artifact_type": "v6_probability_calibration",
+            "calibration_trajectory_ids": ["validation"],
+            "strict_holdout_trajectory_ids": ["test"],
+            "spatial_calibration_condition": (
+                "identity_is_true_and_atlas_available"
+            ),
+            "calibration_objective": "unweighted_bernoulli_nll",
+        },
     )
 
 
@@ -781,6 +820,7 @@ def test_v6_retrieval_preserves_groups_and_transfers_omitted_mass_to_null(
         bank,
         preliminary_candidates=3,
         maximum_maplets=1,
+        probability_calibration=_probability_calibration(),
     )
     group = result.groups[0]
     assert group.query_region_xy.tolist() == [20, 30]
@@ -792,7 +832,11 @@ def test_v6_retrieval_preserves_groups_and_transfers_omitted_mass_to_null(
     assert group.component_offsets.tolist() == [0, 1]
     assert group.component_centers.shape == (1, 3)
     assert group.component_covariances.shape == (1, 3, 3)
-    assert np.isclose(group.component_probabilities.sum(), 1.0)
+    assert np.isclose(
+        group.component_probabilities.sum()
+        + group.spatial_null_probabilities[0],
+        1.0,
+    )
     path = tmp_path / "retrieval-maplets.npz"
     bank.save_npz(path)
     restored = SurfaceRetrievalMapletBank.load_npz(path)
@@ -836,6 +880,7 @@ def test_retrieval_marginalizes_descriptor_conditioned_surface_location():
         np.asarray([[5, 7]], dtype=np.float32),
         bank,
         preliminary_candidates=1,
+        probability_calibration=_probability_calibration(),
     )
     assert result.groups[0].candidate_centers[0, 0] > 0.49
     assert result.groups[0].component_offsets.tolist() == [0, 2]
@@ -872,11 +917,16 @@ def test_retrieval_aggregates_appearance_modes_at_one_surface_location():
         np.asarray([[5, 7]], dtype=np.float32),
         bank,
         preliminary_candidates=1,
+        probability_calibration=_probability_calibration(),
     )
     group = result.groups[0]
     assert group.component_offsets.tolist() == [0, 2]
     assert group.component_centers.shape == (2, 3)
-    assert np.isclose(group.component_probabilities.sum(), 1.0)
+    assert np.isclose(
+        group.component_probabilities.sum()
+        + group.spatial_null_probabilities[0],
+        1.0,
+    )
     assert group.component_probabilities[0] > 0.99
 
 
@@ -914,11 +964,142 @@ def test_retrieval_separates_maplet_identity_from_spatial_likelihood():
         preliminary_candidates=1,
         spatial_query_descriptors=np.asarray([[0, 1]], dtype=np.float32),
         spatial_bank=spatial_bank,
+        probability_calibration=_probability_calibration(),
     )
     group = result.groups[0]
     best = int(np.argmax(group.component_probabilities))
     assert group.component_centers[best, 0] > 0.49
     assert group.candidate_centers[0, 0] > 0.49
+
+
+def test_spatially_unavailable_maplet_remains_in_identity_posterior():
+    identity_bank = SurfaceRetrievalMapletBank(
+        maplet_ids=np.asarray([10, 11]),
+        centers=np.asarray([[0, 0, 4], [1, 0, 4]], dtype=np.float32),
+        normals=np.asarray([[0, 0, 1], [0, 0, 1]], dtype=np.float32),
+        extents=np.ones((2, 3), dtype=np.float32),
+        descriptor_offsets=np.asarray([0, 1, 2]),
+        descriptors=np.asarray([[0, 1], [1, 0]], dtype=np.float32),
+        descriptor_weights=np.ones(2, dtype=np.float32),
+        descriptor_centers=np.asarray(
+            [[0, 0, 4], [1, 0, 4]], dtype=np.float32
+        ),
+        descriptor_covariances=np.tile(
+            np.eye(3, dtype=np.float32)[None] * 0.01, (2, 1, 1)
+        ),
+        quality_scores=np.ones(2),
+        descriptor_uncertainties=np.zeros(2),
+        metadata={"vfm_layer": "radio_final"},
+    )
+    spatial_bank = identity_bank.subset_maplets(np.asarray([10]))
+    result = retrieve_candidate_groups(
+        np.asarray([[1, 0]], dtype=np.float32),
+        np.asarray([[20, 30]], dtype=np.float32),
+        np.asarray([[5, 7]], dtype=np.float32),
+        identity_bank,
+        preliminary_candidates=2,
+        maximum_maplets=2,
+        spatial_query_descriptors=np.asarray([[1, 0]], dtype=np.float32),
+        spatial_bank=spatial_bank,
+        probability_calibration=_probability_calibration(),
+    )
+    group = result.groups[0]
+    row = int(np.flatnonzero(group.maplet_ids == 11)[0])
+    assert 11 in result.ranked_maplet_ids
+    assert not bool(group.spatial_available[row])
+    assert float(group.spatial_null_probabilities[row]) == 1.0
+    assert int(group.component_offsets[row]) == int(
+        group.component_offsets[row + 1]
+    )
+
+
+def test_surface_mode_truncation_transfers_mass_to_spatial_null():
+    bank = SurfaceRetrievalMapletBank(
+        maplet_ids=np.asarray([10]),
+        centers=np.asarray([[0, 0, 4]], dtype=np.float32),
+        normals=np.asarray([[0, 0, 1]], dtype=np.float32),
+        extents=np.ones((1, 3), dtype=np.float32),
+        descriptor_offsets=np.asarray([0, 3]),
+        descriptors=np.asarray(
+            [[1, 0], [1, 0], [1, 0]], dtype=np.float32
+        ),
+        descriptor_weights=np.ones(3, dtype=np.float32) / 3.0,
+        descriptor_centers=np.asarray(
+            [[-1, 0, 4], [0, 0, 4], [1, 0, 4]], dtype=np.float32
+        ),
+        descriptor_covariances=np.tile(
+            np.eye(3, dtype=np.float32)[None] * 0.01, (3, 1, 1)
+        ),
+        quality_scores=np.ones(1),
+        descriptor_uncertainties=np.zeros(1),
+        metadata={"vfm_layer": "radio_final"},
+    )
+    result = retrieve_candidate_groups(
+        np.asarray([[1, 0]], dtype=np.float32),
+        np.asarray([[20, 30]], dtype=np.float32),
+        np.asarray([[5, 7]], dtype=np.float32),
+        bank,
+        preliminary_candidates=1,
+        maximum_components_per_maplet=1,
+        component_nms_distance_m=0.0,
+        probability_calibration=_probability_calibration(),
+    )
+    group = result.groups[0]
+    retained = float(np.sum(group.component_probabilities))
+    spatial_null = float(group.spatial_null_probabilities[0])
+    assert retained < 0.34
+    assert spatial_null > 0.66
+    assert np.isclose(retained + spatial_null, 1.0, atol=1e-6)
+
+
+def test_garbage_spatial_scores_increase_calibrated_spatial_null():
+    bank = SurfaceRetrievalMapletBank(
+        maplet_ids=np.asarray([10]),
+        centers=np.asarray([[0, 0, 4]], dtype=np.float32),
+        normals=np.asarray([[0, 0, 1]], dtype=np.float32),
+        extents=np.ones((1, 3), dtype=np.float32),
+        descriptor_offsets=np.asarray([0, 1]),
+        descriptors=np.asarray([[1, 0]], dtype=np.float32),
+        descriptor_weights=np.ones(1, dtype=np.float32),
+        descriptor_centers=np.asarray([[0, 0, 4]], dtype=np.float32),
+        descriptor_covariances=np.eye(3, dtype=np.float32)[None] * 0.01,
+        quality_scores=np.ones(1),
+        descriptor_uncertainties=np.zeros(1),
+        metadata={"vfm_layer": "radio_final"},
+    )
+    calibration = V6ProbabilityCalibration(
+        identity=_probability_calibration().identity,
+        spatial=DistributionNullCalibration(
+            weights=np.asarray([5.0, -0.6, 0.0, 0.0, 0.0])
+        ),
+        metadata={
+            "artifact_type": "v6_probability_calibration",
+            "calibration_trajectory_ids": ["validation"],
+            "strict_holdout_trajectory_ids": ["test"],
+            "spatial_calibration_condition": (
+                "identity_is_true_and_atlas_available"
+            ),
+            "calibration_objective": "unweighted_bernoulli_nll",
+        },
+    )
+
+    def spatial_null(descriptor):
+        return float(
+            retrieve_candidate_groups(
+                np.asarray([[1, 0]], dtype=np.float32),
+                np.asarray([[20, 30]], dtype=np.float32),
+                np.asarray([[5, 7]], dtype=np.float32),
+                bank,
+                preliminary_candidates=1,
+                spatial_query_descriptors=np.asarray(
+                    [descriptor], dtype=np.float32
+                ),
+                spatial_bank=bank,
+                probability_calibration=calibration,
+            ).groups[0].spatial_null_probabilities[0]
+        )
+
+    assert spatial_null([0, 1]) > spatial_null([1, 0])
 
 
 def test_descriptor_oracle_deduplicates_by_surface_position_not_local_rank():
@@ -937,7 +1118,7 @@ def test_descriptor_oracle_deduplicates_by_surface_position_not_local_rank():
         support_count=np.ones((1, 1, 2), dtype=np.int32),
         valid_mask=np.ones((1, 1, 2), dtype=bool),
     )
-    bank = SurfaceRetrievalMapletBank(
+    spatial_bank = SurfaceRetrievalMapletBank(
         maplet_ids=np.asarray([10]),
         centers=np.asarray([[0.0, 0.0, 5.0]], dtype=np.float32),
         normals=np.asarray([[0.0, 0.0, 1.0]], dtype=np.float32),
@@ -949,6 +1130,22 @@ def test_descriptor_oracle_deduplicates_by_surface_position_not_local_rank():
         descriptor_covariances=np.tile(
             np.eye(3, dtype=np.float32)[None] * 0.01, (2, 1, 1)
         ),
+        quality_scores=np.ones(1),
+        descriptor_uncertainties=np.zeros(1),
+        metadata={"vfm_layer": "radio_final"},
+    )
+    identity_bank = SurfaceRetrievalMapletBank(
+        maplet_ids=np.asarray([10]),
+        centers=np.asarray([[0.0, 0.0, 5.0]], dtype=np.float32),
+        normals=np.asarray([[0.0, 0.0, 1.0]], dtype=np.float32),
+        extents=np.ones((1, 3), dtype=np.float32),
+        descriptor_offsets=np.asarray([0, 1]),
+        descriptors=np.asarray([[1.0, 0.0]], dtype=np.float32),
+        descriptor_weights=np.ones(1, dtype=np.float32),
+        descriptor_centers=np.asarray(
+            [[0.0, 0.0, 5.0]], dtype=np.float32
+        ),
+        descriptor_covariances=np.eye(3, dtype=np.float32)[None] * 0.01,
         quality_scores=np.ones(1),
         descriptor_uncertainties=np.zeros(1),
         metadata={"vfm_layer": "radio_final"},
@@ -976,7 +1173,15 @@ def test_descriptor_oracle_deduplicates_by_surface_position_not_local_rank():
         )
         for index in range(2)
     )
-    result = _coarse_observation_oracles(groups, view, atlas, bank)
+    result = _coarse_observation_oracles(
+        groups, view, atlas, identity_bank, spatial_bank
+    )
+    assert (
+        result["true_maplet_oracle_spatial_component"][
+            "correspondence_count"
+        ]
+        == 2
+    )
     assert (
         result["true_maplet_descriptor_map_component"][
             "correspondence_count"
@@ -1048,5 +1253,280 @@ def test_deterministic_regional_proposal_does_not_require_random_trials():
     )
     assert hypotheses
     assert all(
-        item.source.startswith("regional_map_ransac") for item in hypotheses
+        item.source.startswith("regional_center_pseudo_pnp")
+        for item in hypotheses
     )
+
+
+def test_maplet_footprint_score_uses_region_area_without_surface_points():
+    bank = SurfaceRetrievalMapletBank(
+        maplet_ids=np.asarray([10]),
+        centers=np.asarray([[0.0, 0.0, 5.0]], dtype=np.float32),
+        normals=np.asarray([[0.0, 0.0, 1.0]], dtype=np.float32),
+        extents=np.asarray([[0.5, 0.5, 0.1]], dtype=np.float32),
+        tangent_frames=np.eye(3, dtype=np.float32)[None],
+        descriptor_offsets=np.asarray([0, 1]),
+        descriptors=np.asarray([[1.0, 0.0]], dtype=np.float32),
+        descriptor_weights=np.ones(1),
+        descriptor_centers=np.asarray([[0.0, 0.0, 5.0]], dtype=np.float32),
+        descriptor_covariances=np.eye(3, dtype=np.float32)[None] * 0.01,
+        quality_scores=np.ones(1),
+        descriptor_uncertainties=np.zeros(1),
+        metadata={
+            "vfm_layer": "radio_final",
+            "has_canonical_tangent_frames": True,
+        },
+    )
+    group = QueryMapletGroup(
+        query_region_xy=np.asarray([50.0, 40.0]),
+        query_region_extent=np.asarray([8.0, 8.0]),
+        maplet_ids=np.asarray([10]),
+        probabilities=np.asarray([0.9]),
+        null_probability=0.1,
+        omitted_probability=0.0,
+    )
+    correct, correct_support = score_maplet_footprint_pose(
+        np.eye(4), (group,), bank, _camera()
+    )
+    wrong_pose = np.eye(4)
+    wrong_pose[0, 3] = 5.0
+    wrong, wrong_support = score_maplet_footprint_pose(
+        wrong_pose, (group,), bank, _camera()
+    )
+    assert correct > wrong
+    assert correct > 0.0
+    assert correct_support == 1
+    assert wrong_support == 0
+
+
+def test_retrieval_maplet_roundtrip_preserves_canonical_frames(tmp_path):
+    frame = np.asarray(
+        [[[0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]],
+        dtype=np.float32,
+    )
+    bank = SurfaceRetrievalMapletBank(
+        maplet_ids=np.asarray([10]),
+        centers=np.asarray([[0.0, 0.0, 5.0]], dtype=np.float32),
+        normals=np.asarray([[0.0, 0.0, 1.0]], dtype=np.float32),
+        extents=np.asarray([[0.6, 0.2, 0.1]], dtype=np.float32),
+        tangent_frames=frame,
+        descriptor_offsets=np.asarray([0, 1]),
+        descriptors=np.asarray([[1.0, 0.0]], dtype=np.float32),
+        descriptor_weights=np.ones(1),
+        quality_scores=np.ones(1),
+        descriptor_uncertainties=np.zeros(1),
+        metadata={
+            "vfm_layer": "radio_final",
+            "has_canonical_tangent_frames": True,
+        },
+    )
+    path = tmp_path / "maplets.npz"
+    bank.save_npz(path)
+    loaded = SurfaceRetrievalMapletBank.load_npz(path)
+    np.testing.assert_allclose(loaded.tangent_frames, frame)
+    assert loaded.metadata["has_canonical_tangent_frames"] is True
+    with np.load(path, allow_pickle=False) as payload:
+        assert "tangent_frames" in payload.files
+        assert not any(
+            value in payload.files
+            for value in (
+                "mapping_rgb",
+                "mapping_image_ids",
+                "observation_descriptors",
+            )
+        )
+
+
+def test_anonymous_pose_vote_uses_query_region_geometry():
+    bank = SurfaceRetrievalMapletBank(
+        maplet_ids=np.asarray([10]),
+        centers=np.asarray([[0.0, 0.0, 5.0]], dtype=np.float32),
+        normals=np.asarray([[0.0, 0.0, 1.0]], dtype=np.float32),
+        extents=np.asarray([[0.5, 0.5, 0.1]], dtype=np.float32),
+        descriptor_offsets=np.asarray([0, 1]),
+        descriptors=np.asarray([[1.0, 0.0]], dtype=np.float32),
+        descriptor_weights=np.ones(1),
+        descriptor_centers=np.asarray(
+            [[0.0, 0.0, 5.0]], dtype=np.float32
+        ),
+        descriptor_covariances=np.eye(3, dtype=np.float32)[None],
+        quality_scores=np.ones(1),
+        descriptor_uncertainties=np.zeros(1),
+        metadata={"vfm_layer": "radio_final"},
+    )
+    votes = AnonymousMapletPoseVoteBank(
+        component_maplet_ids=np.asarray([10]),
+        vote_offsets=np.asarray([0, 2]),
+        camera_centers=np.asarray(
+            [[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]]
+        ),
+        rotations_w2c=np.tile(np.eye(3)[None], (2, 1, 1)),
+        vote_weights=np.asarray([0.5, 0.5]),
+        translation_sigma_m=np.zeros(2),
+        rotation_sigma_deg=np.zeros(2),
+        region_xy_mean=np.asarray([[0.2, 0.5], [0.8, 0.5]]),
+        region_xy_covariance=np.tile(
+            np.eye(2, dtype=np.float32)[None] * 1e-4, (2, 1, 1)
+        ),
+        region_support_count=np.asarray([3, 3]),
+        component_descriptor_sha256=retrieval_descriptor_sha256(bank),
+        retrieval_geometry_sha256=retrieval_geometry_sha256(bank),
+        metadata={
+            "artifact_type": "v6_anonymous_maplet_pose_vote_bank",
+            "representation": (
+                "maplet_component_pose_and_region_sufficient_statistics"
+            ),
+            "uses_query_region_geometry": True,
+            "mapping_trajectory_ids": ["mapping"],
+            "stores_mapping_rgb": False,
+            "stores_mapping_image_ids": False,
+        },
+    )
+    group = QueryMapletGroup(
+        query_region_xy=np.asarray([19.5, 49.5]),
+        query_region_extent=np.asarray([2.0, 2.0]),
+        maplet_ids=np.asarray([10]),
+        probabilities=np.asarray([0.9]),
+        null_probability=0.1,
+        omitted_probability=0.0,
+    )
+    hypotheses = vote_maplet_poses(
+        np.asarray([[1.0, 0.0]], dtype=np.float32),
+        bank,
+        votes,
+        candidate_groups=(group,),
+        image_size_wh=(100, 100),
+        translation_kernel_m=0.1,
+        rotation_kernel_deg=0.1,
+        maximum_modes=2,
+    )
+    assert len(hypotheses) == 2
+    top_center = (
+        -hypotheses[0].pose_w2c[:3, :3].T
+        @ hypotheses[0].pose_w2c[:3, 3]
+    )
+    assert np.linalg.norm(top_center) < 1e-3
+
+
+def test_region_conditioned_vote_rotates_source_bearing_to_query():
+    bank = SurfaceRetrievalMapletBank(
+        maplet_ids=np.asarray([10]),
+        centers=np.asarray([[0.0, 0.0, 5.0]], dtype=np.float32),
+        normals=np.asarray([[0.0, 0.0, 1.0]], dtype=np.float32),
+        extents=np.asarray([[0.5, 0.5, 0.1]], dtype=np.float32),
+        tangent_frames=np.eye(3, dtype=np.float32)[None],
+        descriptor_offsets=np.asarray([0, 1]),
+        descriptors=np.asarray([[1.0, 0.0]], dtype=np.float32),
+        descriptor_weights=np.ones(1),
+        quality_scores=np.ones(1),
+        descriptor_uncertainties=np.zeros(1),
+        metadata={
+            "vfm_layer": "radio_final",
+            "has_canonical_tangent_frames": True,
+        },
+    )
+    votes = AnonymousMapletPoseVoteBank(
+        component_maplet_ids=np.asarray([10]),
+        vote_offsets=np.asarray([0, 1]),
+        camera_centers=np.zeros((1, 3)),
+        rotations_w2c=np.eye(3)[None],
+        vote_weights=np.ones(1),
+        translation_sigma_m=np.zeros(1),
+        rotation_sigma_deg=np.zeros(1),
+        region_xy_mean=np.asarray([[0.2, 0.5]]),
+        region_xy_covariance=np.eye(2, dtype=np.float32)[None] * 1e-4,
+        region_support_count=np.asarray([4]),
+        component_descriptor_sha256=retrieval_descriptor_sha256(bank),
+        retrieval_geometry_sha256=retrieval_geometry_sha256(bank),
+        metadata={
+            "artifact_type": "v6_anonymous_maplet_pose_vote_bank",
+            "representation": (
+                "maplet_component_pose_and_region_sufficient_statistics"
+            ),
+            "uses_query_region_geometry": True,
+            "mapping_trajectory_ids": ["mapping"],
+        },
+    )
+    group = QueryMapletGroup(
+        query_region_xy=np.asarray([79.5, 49.5]),
+        query_region_extent=np.asarray([2.0, 2.0]),
+        maplet_ids=np.asarray([10]),
+        probabilities=np.asarray([0.9]),
+        null_probability=0.1,
+        omitted_probability=0.0,
+    )
+    camera = _camera()
+    hypotheses = vote_maplet_poses(
+        np.asarray([[1.0, 0.0]], dtype=np.float32),
+        bank,
+        votes,
+        candidate_groups=(group,),
+        image_size_wh=(100, 80),
+        camera=camera,
+        maximum_modes=1,
+    )
+    assert len(hypotheses) == 1
+    source = _bearing_from_normalized_image_xy(
+        np.asarray([[0.2, 0.5]]), camera
+    )[0]
+    target = _bearing_from_normalized_image_xy(
+        np.asarray([[0.8, 0.625]]), camera
+    )[0]
+    rotated = hypotheses[0].pose_w2c[:3, :3] @ source
+    assert np.dot(rotated, target) > 1.0 - 1e-6
+
+
+def test_pose_vote_rejects_retrieval_geometry_lineage_mismatch():
+    bank = SurfaceRetrievalMapletBank(
+        maplet_ids=np.asarray([10]),
+        centers=np.asarray([[0.0, 0.0, 5.0]], dtype=np.float32),
+        normals=np.asarray([[0.0, 0.0, 1.0]], dtype=np.float32),
+        extents=np.asarray([[0.5, 0.5, 0.1]], dtype=np.float32),
+        descriptor_offsets=np.asarray([0, 1]),
+        descriptors=np.asarray([[1.0, 0.0]], dtype=np.float32),
+        descriptor_weights=np.ones(1),
+        quality_scores=np.ones(1),
+        descriptor_uncertainties=np.zeros(1),
+        metadata={"vfm_layer": "radio_final"},
+    )
+    votes = AnonymousMapletPoseVoteBank(
+        component_maplet_ids=np.asarray([10]),
+        vote_offsets=np.asarray([0, 1]),
+        camera_centers=np.zeros((1, 3)),
+        rotations_w2c=np.eye(3)[None],
+        vote_weights=np.ones(1),
+        translation_sigma_m=np.zeros(1),
+        rotation_sigma_deg=np.zeros(1),
+        region_xy_mean=np.asarray([[0.5, 0.5]]),
+        region_xy_covariance=np.eye(2, dtype=np.float32)[None],
+        region_support_count=np.asarray([1]),
+        component_descriptor_sha256=retrieval_descriptor_sha256(bank),
+        retrieval_geometry_sha256=retrieval_geometry_sha256(bank),
+        metadata={
+            "artifact_type": "v6_anonymous_maplet_pose_vote_bank",
+            "representation": (
+                "maplet_component_pose_and_region_sufficient_statistics"
+            ),
+            "uses_query_region_geometry": True,
+            "mapping_trajectory_ids": ["mapping"],
+        },
+    )
+    shifted = SurfaceRetrievalMapletBank(
+        maplet_ids=bank.maplet_ids,
+        centers=bank.centers + np.asarray([[1.0, 0.0, 0.0]]),
+        normals=bank.normals,
+        extents=bank.extents,
+        descriptor_offsets=bank.descriptor_offsets,
+        descriptors=bank.descriptors,
+        descriptor_weights=bank.descriptor_weights,
+        quality_scores=bank.quality_scores,
+        descriptor_uncertainties=bank.descriptor_uncertainties,
+        metadata={"vfm_layer": "radio_final"},
+    )
+    with pytest.raises(ValueError, match="geometry lineage"):
+        vote_maplet_poses(
+            np.asarray([[1.0, 0.0]], dtype=np.float32),
+            shifted,
+            votes,
+            maximum_modes=1,
+        )

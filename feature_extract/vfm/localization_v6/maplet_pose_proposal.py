@@ -45,6 +45,11 @@ def _group_candidate_geometry(
         dtype=np.int64,
     )
     valid = rows >= 0
+    if group.spatial_available is not None:
+        available = np.asarray(group.spatial_available, dtype=bool)
+        if available.shape != (group.maplet_ids.size,):
+            raise ValueError("spatial_available differs from group candidates")
+        valid &= available
     valid_rows = rows[valid]
     if group.candidate_centers is None:
         centers = np.asarray(bank.centers[valid_rows], dtype=np.float64)
@@ -105,9 +110,22 @@ def _group_component_geometry(
         or offsets[-1] != centers.shape[0]
         or covariances.shape != (centers.shape[0], 3, 3)
         or conditional.shape != (centers.shape[0],)
-        or np.any(np.diff(offsets) <= 0)
+        or np.any(np.diff(offsets) < 0)
     ):
         raise ValueError("invalid query-conditioned component geometry")
+    spatial_null = (
+        np.zeros(group.maplet_ids.size, dtype=np.float64)
+        if group.spatial_null_probabilities is None
+        else np.asarray(
+            group.spatial_null_probabilities, dtype=np.float64
+        )
+    )
+    if (
+        spatial_null.shape != (group.maplet_ids.size,)
+        or np.any(spatial_null < -1e-6)
+        or np.any(spatial_null > 1.0 + 1e-6)
+    ):
+        raise ValueError("invalid conditional spatial-null probabilities")
     maplet_ids = []
     joint_probability = []
     for candidate, maplet_id in enumerate(group.maplet_ids.tolist()):
@@ -115,7 +133,10 @@ def _group_component_geometry(
             continue
         begin, end = int(offsets[candidate]), int(offsets[candidate + 1])
         local = np.maximum(conditional[begin:end], 0.0)
-        local /= max(float(np.sum(local)), 1e-12)
+        if abs(float(np.sum(local) + spatial_null[candidate]) - 1.0) > 2e-5:
+            raise ValueError(
+                "surface-mode and conditional spatial-null mass differ from one"
+            )
         maplet_ids.extend([int(maplet_id)] * (end - begin))
         joint_probability.extend(
             (float(group.probabilities[candidate]) * local).tolist()
@@ -139,6 +160,39 @@ def _group_component_geometry(
     )
 
 
+def _group_unmatched_probability(group: QueryMapletGroup) -> float:
+    """Identity-null plus identity-weighted conditional spatial-null mass."""
+
+    unmatched = float(group.null_probability)
+    if group.spatial_null_probabilities is not None:
+        spatial_null = np.asarray(
+            group.spatial_null_probabilities, dtype=np.float64
+        )
+        if spatial_null.shape != (group.maplet_ids.size,):
+            raise ValueError("spatial-null mass differs from group candidates")
+        unmatched += float(
+            np.sum(
+                np.asarray(group.probabilities, dtype=np.float64)
+                * spatial_null
+            )
+        )
+    return float(np.clip(unmatched, 0.0, 1.0))
+
+
+def _group_resolved_candidate_probability(
+    group: QueryMapletGroup,
+) -> np.ndarray:
+    probability = np.asarray(group.probabilities, dtype=np.float64).copy()
+    if group.spatial_null_probabilities is not None:
+        probability *= 1.0 - np.asarray(
+            group.spatial_null_probabilities, dtype=np.float64
+        )
+    if group.component_offsets is not None:
+        offsets = np.asarray(group.component_offsets, dtype=np.int64)
+        probability[np.diff(offsets) <= 0] = 0.0
+    return np.maximum(probability, 0.0)
+
+
 def _sample_group_component_center(
     group: QueryMapletGroup,
     candidate: int,
@@ -153,6 +207,8 @@ def _sample_group_component_center(
     ):
         offsets = np.asarray(group.component_offsets, dtype=np.int64)
         begin, end = int(offsets[candidate]), int(offsets[candidate + 1])
+        if end <= begin:
+            raise ValueError("cannot sample an unavailable spatial candidate")
         probability = np.maximum(
             np.asarray(
                 group.component_probabilities[begin:end], dtype=np.float64
@@ -268,8 +324,8 @@ def _refine_hypothesis_em(
                 )
             )
             likelihood = prior_probability * spatial
-            denominator = float(np.sum(likelihood)) + 0.1 * float(
-                group.null_probability
+            denominator = float(
+                np.sum(likelihood) + _group_unmatched_probability(group)
             )
             responsibility = likelihood / max(denominator, 1e-12)
             keep = finite & (responsibility > 1e-6)
@@ -350,7 +406,9 @@ def _score_hypothesis(
             _group_component_geometry(group, bank, row_by_id)
         )
         if component_maplet_ids.size == 0:
-            total += np.log(max(float(group.null_probability), 1e-8))
+            total += np.log(
+                max(_group_unmatched_probability(group), 1e-8)
+            )
             continue
         pixels, depth = project_world_points(
             candidate_centers, pose, camera
@@ -382,9 +440,13 @@ def _score_hypothesis(
         )
         likelihood[~finite] = 0.0
         mass = float(np.sum(likelihood))
-        combined = mass + float(group.null_probability) * 0.1
+        # Scores are likelihood ratios relative to the unmatched event,
+        # whose density is exactly one by definition.  There is no arbitrary
+        # null multiplier; identity and spatial null mass are marginalized.
+        unmatched = _group_unmatched_probability(group)
+        combined = mass + unmatched
         total += np.log(max(combined, 1e-8))
-        if mass > float(group.null_probability) * 0.1:
+        if mass > unmatched:
             support += 1
     return total, support
 
@@ -393,7 +455,7 @@ def _regional_map_correspondences(
     groups: tuple[QueryMapletGroup, ...],
     bank: SurfaceRetrievalMapletBank,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """One deployable MAP surface component per query region.
+    """One diagnostic pseudo-point per RADIO region.
 
     A physical surface position may be proposed by several overlapping RADIO
     regions. It is retained only once, using the observation with the largest
@@ -458,12 +520,14 @@ def _regional_map_correspondences(
     )
 
 
-def _deterministic_regional_ransac_hypotheses(
+def _deterministic_regional_center_pseudo_pnp_hypotheses(
     groups: tuple[QueryMapletGroup, ...],
     bank: SurfaceRetrievalMapletBank,
     camera: ColmapCamera,
+    *,
+    seed: int,
 ) -> list[MapletPoseHypothesis]:
-    """Generate coarse modes from confidence-ranked regional MAP components."""
+    """Diagnostic baseline that treats a RADIO region centre as a point."""
 
     xyz, xy, _confidence, maplet_ids, region_radii = (
         _regional_map_correspondences(groups, bank)
@@ -486,6 +550,9 @@ def _deterministic_regional_ransac_hypotheses(
         # measurement precision.
         reprojection_threshold = max(
             6.0, 1.5 * float(np.median(region_radii[:prefix]))
+        )
+        cv2.setRNGSeed(
+            int((int(seed) + 104729 * int(prefix)) % (2**31 - 1))
         )
         success, rotation, translation, inliers = cv2.solvePnPRansac(
             xyz[:prefix],
@@ -518,13 +585,13 @@ def _deterministic_regional_ransac_hypotheses(
                 score=score,
                 supporting_group_count=support,
                 sampled_maplet_ids=np.unique(maplet_ids[:prefix][keep]),
-                source=f"regional_map_ransac_prefix_{prefix}",
+                source=f"regional_center_pseudo_pnp_prefix_{prefix}",
             )
         )
     return hypotheses
 
 
-def propose_maplet_surface_mode_poses(
+def propose_regional_center_pseudo_pnp_poses(
     groups: tuple[QueryMapletGroup, ...],
     bank: SurfaceRetrievalMapletBank,
     camera: ColmapCamera,
@@ -536,14 +603,18 @@ def propose_maplet_surface_mode_poses(
     em_iterations: int = 0,
     seed: int = 73,
 ) -> tuple[MapletPoseHypothesis, ...]:
-    """Grouped probabilistic surface-mode PnP for basin entry only.
+    """Diagnostic regional-centre pseudo-correspondence PnP baseline.
 
-    Each sampled 3D observation is a real query-conditioned atlas location.
-    A maplet centre is used only by legacy banks that do not carry spatial
-    component geometry.
+    RADIO regions are area/context observations, not keypoints.  This routine
+    is retained only for decomposition against historical reports and must
+    not be used as the production coarse-pose definition.
     """
 
-    usable = tuple(group for group in groups if group.maplet_ids.size)
+    usable = tuple(
+        group
+        for group in groups
+        if float(np.sum(_group_resolved_candidate_probability(group))) > 0.0
+    )
     if len(usable) < max(int(sample_size), 4):
         return tuple()
     matrix, distortion = camera_matrix_and_distortion(camera)
@@ -554,7 +625,12 @@ def propose_maplet_surface_mode_poses(
     group_sampling_probability = np.asarray(
         [
             max(
-                float(np.max(group.probabilities, initial=0.0)),
+                float(
+                    np.max(
+                        _group_resolved_candidate_probability(group),
+                        initial=0.0,
+                    )
+                ),
                 1e-8,
             )
             for group in usable
@@ -563,8 +639,8 @@ def propose_maplet_surface_mode_poses(
     )
     group_sampling_probability /= np.sum(group_sampling_probability)
     deterministic_hypotheses = (
-        _deterministic_regional_ransac_hypotheses(
-            usable, bank, camera
+        _deterministic_regional_center_pseudo_pnp_hypotheses(
+            usable, bank, camera, seed=int(seed)
         )
     )
     hypotheses: list[MapletPoseHypothesis] = deterministic_hypotheses
@@ -581,7 +657,7 @@ def propose_maplet_surface_mode_poses(
         sampled_surface_keys = set()
         for group_row in selected_groups.tolist():
             group = usable[group_row]
-            probability = np.asarray(group.probabilities, dtype=np.float64)
+            probability = _group_resolved_candidate_probability(group)
             probability /= max(float(np.sum(probability)), 1e-12)
             choice = int(rng.choice(group.maplet_ids.size, p=probability))
             maplet_id = int(group.maplet_ids[choice])
@@ -673,7 +749,6 @@ def propose_maplet_surface_mode_poses(
     return tuple(modes)
 
 
-# Compatibility for frozen experiments.  The active evaluator imports the
-# surface-mode name above, so production reports cannot silently describe this
-# as maplet-centre PnP.
-propose_maplet_center_poses = propose_maplet_surface_mode_poses
+# Compatibility names for frozen diagnostic experiments only.
+propose_maplet_surface_mode_poses = propose_regional_center_pseudo_pnp_poses
+propose_maplet_center_poses = propose_regional_center_pseudo_pnp_poses

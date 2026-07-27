@@ -8,17 +8,22 @@ arrays and is the only maplet artifact accepted by the V4 refinement entry.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 from typing import Sequence
 
 import numpy as np
+import torch
 
 from feature_extract.vfm.localization.surface_retrieval_maplets import (
     SurfaceRetrievalMapletBank,
 )
 from feature_extract.vfm.localization.surface_metric_feature_mapper import (
     load_surface_metric_feature_mapper,
+)
+from feature_extract.vfm.localization.surface_maplet_mapper import (
+    load_surface_maplet_mapper,
 )
 from feature_extract.vfm.surface_maplet_bank import VfmSurfaceMapletBank
 from feature_extract.vfm.surface_maplet_bank import (
@@ -48,6 +53,22 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Region map paired with --observation_bank.",
     )
     parser.add_argument("--metric_mapper_checkpoint", default="")
+    parser.add_argument(
+        "--surface_mapper_checkpoint",
+        default="",
+        help=(
+            "RADIO-final maplet-identity mapper applied before anonymous "
+            "per-maplet appearance clustering."
+        ),
+    )
+    parser.add_argument(
+        "--source_already_surface_mapped",
+        action="store_true",
+        help=(
+            "Declare that construction descriptors were produced by the "
+            "specified surface mapper; validate lineage without reapplying it."
+        ),
+    )
     parser.add_argument("--maximum_components", type=int, default=4)
     parser.add_argument(
         "--spatial_grid_size",
@@ -315,6 +336,88 @@ def main(argv: Sequence[str] | None = None) -> None:
     if (output.exists() or summary_path.exists()) and not bool(args.force):
         raise FileExistsError("refusing to overwrite output")
     source = VfmSurfaceMapletBank.load_npz(Path(args.legacy_maplets))
+    if str(args.metric_mapper_checkpoint) and str(
+        args.surface_mapper_checkpoint
+    ):
+        raise ValueError("choose only one descriptor mapper")
+    identity_view_descriptors = np.asarray(
+        source.view_descriptors, dtype=np.float32
+    )
+    identity_fallback_descriptors = np.asarray(
+        source.descriptors, dtype=np.float32
+    )
+    surface_mapper_sha256 = ""
+    if str(args.surface_mapper_checkpoint):
+        mapper_path = Path(args.surface_mapper_checkpoint)
+        mapper, _mapper_metadata = load_surface_maplet_mapper(
+            mapper_path, device="cpu"
+        )
+        if bool(args.source_already_surface_mapped):
+            if (
+                identity_view_descriptors.shape[1]
+                != int(mapper.model.config.output_dim)
+            ):
+                raise ValueError(
+                    "declared mapped descriptors differ from mapper output"
+                )
+            descriptor_space = dict(
+                (source.metadata or {}).get("descriptor_space", {})
+            )
+            declared_mapper = str(
+                descriptor_space.get(
+                    "surface_maplet_mapper_checkpoint", ""
+                )
+            )
+            if (
+                not bool(
+                    descriptor_space.get("full_map_mapper_applied", False)
+                )
+                or descriptor_space.get("mapper_type") != "surface_maplet"
+                or not declared_mapper
+            ):
+                raise ValueError(
+                    "source does not declare a pre-applied surface mapper"
+                )
+            declared_mapper_path = Path(declared_mapper)
+            if not declared_mapper_path.exists():
+                raise FileNotFoundError(
+                    "cannot verify the source descriptor mapper: "
+                    f"{declared_mapper_path}"
+                )
+            if hashlib.sha256(
+                declared_mapper_path.read_bytes()
+            ).hexdigest() != hashlib.sha256(
+                mapper_path.read_bytes()
+            ).hexdigest():
+                raise ValueError(
+                    "source descriptors were produced by a different "
+                    "surface mapper"
+                )
+        else:
+            with torch.no_grad():
+                identity_view_descriptors = (
+                    mapper.model(
+                        torch.from_numpy(identity_view_descriptors)[
+                            :, :, None, None
+                        ]
+                    )[:, :, 0, 0]
+                    .cpu()
+                    .numpy()
+                    .astype(np.float32)
+                )
+                identity_fallback_descriptors = (
+                    mapper.model(
+                        torch.from_numpy(identity_fallback_descriptors)[
+                            :, :, None, None
+                        ]
+                    )[:, :, 0, 0]
+                    .cpu()
+                    .numpy()
+                    .astype(np.float32)
+                )
+        surface_mapper_sha256 = hashlib.sha256(
+            mapper_path.read_bytes()
+        ).hexdigest()
     if bool(str(args.observation_bank)) != bool(str(args.region_map)):
         raise ValueError(
             "observation_bank and region_map must be provided together"
@@ -379,12 +482,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     offsets = [0]
     for row in range(len(source)) if spatial_grid_size == 0 else []:
         begin, end = int(source.view_offsets[row]), int(source.view_offsets[row + 1])
-        observations = source.view_descriptors[begin:end]
+        observations = identity_view_descriptors[begin:end]
         observation_weights = np.clip(
             source.view_quality_scores[begin:end], 1e-4, None
         )
         if observations.shape[0] == 0:
-            observations = source.descriptors[row : row + 1]
+            observations = identity_fallback_descriptors[row : row + 1]
             observation_weights = np.ones((1,), dtype=np.float32)
         centers, assignments, weights = _cluster_features(
             observations, observation_weights, maximum_components
@@ -455,11 +558,14 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
         descriptors = metric.project_points(descriptors)
         feature_space = "surface_metric_radio_final"
+    elif str(args.surface_mapper_checkpoint):
+        feature_space = "surface_maplet_mapper_radio_final"
     bank = SurfaceRetrievalMapletBank(
         maplet_ids=source.maplet_ids,
         centers=source.centers,
         normals=source.normals,
         extents=source.extents,
+        tangent_frames=source.tangent_frames,
         descriptor_offsets=np.asarray(offsets, dtype=np.int64),
         descriptors=descriptors,
         descriptor_weights=descriptor_weights,
@@ -497,12 +603,15 @@ def main(argv: Sequence[str] | None = None) -> None:
             "uses_sfm_tracks": False,
             "uses_stable_anchor_identity": False,
             "uses_point_correspondences": False,
+            "has_canonical_tangent_frames": True,
+            "surface_mapper_sha256": surface_mapper_sha256,
         },
     )
     bank.save_npz(output)
     summary = {
         "stage": "build_anchor_free_surface_retrieval_maplets",
         "output_maplets": str(output),
+        "output_sha256": hashlib.sha256(output.read_bytes()).hexdigest(),
         "maplet_count": len(bank),
         "feature_dim": int(bank.descriptors.shape[1]),
         "descriptor_component_count": int(bank.descriptors.shape[0]),
@@ -527,6 +636,13 @@ def main(argv: Sequence[str] | None = None) -> None:
             "view_grid_sizes",
             "view_quality_scores",
         ],
+        "retained_geometry_fields": [
+            "centers",
+            "normals",
+            "tangent_frames",
+            "extents",
+        ],
+        "surface_mapper_sha256": surface_mapper_sha256,
         "production_contract": dict(bank.metadata or {}),
     }
     summary_path.parent.mkdir(parents=True, exist_ok=True)

@@ -41,6 +41,7 @@ class SurfaceRetrievalMapletBank:
     descriptor_weights: np.ndarray
     quality_scores: np.ndarray
     descriptor_uncertainties: np.ndarray
+    tangent_frames: np.ndarray | None = None
     descriptor_centers: np.ndarray | None = None
     descriptor_covariances: np.ndarray | None = None
     query_projection: np.ndarray | None = None
@@ -58,6 +59,54 @@ class SurfaceRetrievalMapletBank:
                 raise ValueError(f"{name} must have shape (N, 3)")
             object.__setattr__(self, name, value)
         object.__setattr__(self, "normals", _normalize_rows(self.normals))
+        if self.tangent_frames is None:
+            # Backward-compatible geometry for historical artifacts.  New
+            # production banks store the construction frame explicitly;
+            # inferring it from the normal loses the physical chart axes and
+            # is therefore exposed in metadata rather than presented as a
+            # canonical frame.
+            normal = np.asarray(self.normals, dtype=np.float32)
+            reference = np.zeros_like(normal)
+            reference[:, 0] = 1.0
+            use_y = np.abs(normal[:, 0]) > 0.8
+            reference[use_y] = np.asarray([0.0, 1.0, 0.0])
+            tangent_u = np.cross(reference, normal)
+            tangent_u /= np.maximum(
+                np.linalg.norm(tangent_u, axis=1, keepdims=True), 1e-8
+            )
+            tangent_v = np.cross(normal, tangent_u)
+            tangent_frames = np.stack(
+                [tangent_u, tangent_v, normal], axis=1
+            )
+            has_canonical_frames = False
+        else:
+            tangent_frames = np.asarray(
+                self.tangent_frames, dtype=np.float32
+            )
+            if tangent_frames.shape != (count, 3, 3):
+                raise ValueError(
+                    "tangent_frames must have shape (N,3,3)"
+                )
+            if not np.all(np.isfinite(tangent_frames)):
+                raise ValueError("tangent_frames contain non-finite values")
+            gram = tangent_frames @ np.swapaxes(tangent_frames, 1, 2)
+            if not np.allclose(
+                gram, np.eye(3, dtype=np.float32)[None], atol=2e-3
+            ):
+                raise ValueError("tangent_frames must be orthonormal")
+            if np.any(
+                np.sum(tangent_frames[:, 2] * self.normals, axis=1)
+                < 0.999
+            ):
+                raise ValueError(
+                    "tangent-frame normal differs from maplet normal"
+                )
+            if np.any(np.linalg.det(tangent_frames) < 0.999):
+                raise ValueError("tangent_frames must be right-handed")
+            has_canonical_frames = True
+        object.__setattr__(
+            self, "tangent_frames", tangent_frames.astype(np.float32)
+        )
         offsets = np.asarray(self.descriptor_offsets, dtype=np.int64).reshape(-1)
         descriptors = _normalize_rows(self.descriptors)
         weights = np.asarray(self.descriptor_weights, dtype=np.float32).reshape(-1)
@@ -154,6 +203,16 @@ class SurfaceRetrievalMapletBank:
                 raise ValueError(f"{name} contains non-finite values")
             object.__setattr__(self, name, value)
         metadata = dict(self.metadata or {})
+        declared_frames = metadata.get("has_canonical_tangent_frames")
+        if declared_frames is not None and bool(declared_frames) != bool(
+            has_canonical_frames
+        ):
+            raise ValueError(
+                "canonical tangent-frame metadata differs from artifact"
+            )
+        metadata["has_canonical_tangent_frames"] = bool(
+            has_canonical_frames
+        )
         for key in (
             "stores_mapping_rgb",
             "stores_mapping_image_paths",
@@ -209,6 +268,15 @@ class SurfaceRetrievalMapletBank:
             centers=self.centers[rows],
             normals=self.normals[rows],
             extents=self.extents[rows],
+            tangent_frames=(
+                self.tangent_frames[rows]
+                if bool(
+                    (self.metadata or {}).get(
+                        "has_canonical_tangent_frames", False
+                    )
+                )
+                else None
+            ),
             descriptor_offsets=np.asarray(offsets, dtype=np.int64),
             descriptors=self.descriptors[components],
             descriptor_weights=self.descriptor_weights[components],
@@ -256,6 +324,12 @@ class SurfaceRetrievalMapletBank:
         )
         if self.query_projection is not None:
             payload["query_projection"] = self.query_projection
+        if bool(
+            (self.metadata or {}).get(
+                "has_canonical_tangent_frames", False
+            )
+        ):
+            payload["tangent_frames"] = self.tangent_frames
         np.savez_compressed(Path(path), **payload)
 
     @classmethod
@@ -282,7 +356,10 @@ class SurfaceRetrievalMapletBank:
                 raise ValueError(
                     "descriptor surface moments must be stored together"
                 )
-            optional_fields = spatial_fields | {"query_projection"}
+            optional_fields = spatial_fields | {
+                "query_projection",
+                "tangent_frames",
+            }
             extra = set(data.files) - expected - optional_fields
             missing = expected - set(data.files)
             if extra or missing:
@@ -295,6 +372,11 @@ class SurfaceRetrievalMapletBank:
                 centers=data["centers"],
                 normals=data["normals"],
                 extents=data["extents"],
+                tangent_frames=(
+                    data["tangent_frames"]
+                    if "tangent_frames" in data
+                    else None
+                ),
                 descriptor_offsets=data["descriptor_offsets"],
                 descriptors=data["descriptors"],
                 descriptor_weights=data["descriptor_weights"],
@@ -442,6 +524,7 @@ def package_surface_feature_atlas(
         "uses_sfm_tracks": False,
         "uses_stable_anchor_identity": False,
         "uses_point_correspondences": False,
+        "has_canonical_tangent_frames": True,
     }
     contract.update(dict(metadata or {}))
     return SurfaceRetrievalMapletBank(
@@ -449,6 +532,7 @@ def package_surface_feature_atlas(
         centers=atlas.centers[retained],
         normals=atlas.frames[retained, 2],
         extents=atlas.extents[retained],
+        tangent_frames=atlas.frames[retained],
         descriptor_offsets=np.asarray(offsets, dtype=np.int64),
         descriptors=descriptors,
         descriptor_weights=weights,

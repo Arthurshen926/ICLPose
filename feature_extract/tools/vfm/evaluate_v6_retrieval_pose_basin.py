@@ -1,4 +1,4 @@
-"""Evaluate deployable V6 maplet retrieval and coarse-pose basin coverage.
+"""Evaluate V6 maplet retrieval and experimental coarse-pose basin coverage.
 
 This is deliberately separate from the oracle-maplet local-correlation
 evaluator.  Ground truth is used only after hypotheses have been generated, so
@@ -38,7 +38,11 @@ from feature_extract.vfm.localization.surface_retrieval_maplets import (
     SurfaceRetrievalMapletBank,
 )
 from feature_extract.vfm.localization_v6.maplet_pose_proposal import (
-    propose_maplet_surface_mode_poses,
+    propose_regional_center_pseudo_pnp_poses,
+)
+from feature_extract.vfm.localization_v6.maplet_footprint_pose import (
+    propose_maplet_footprint_poses,
+    score_maplet_footprint_pose,
 )
 from feature_extract.vfm.localization_v6.maplet_retrieval import (
     retrieve_candidate_groups,
@@ -49,6 +53,10 @@ from feature_extract.vfm.localization_v6.metric_encoder import (
 from feature_extract.vfm.localization_v6.maplet_pose_voting import (
     AnonymousMapletPoseVoteBank,
     vote_maplet_poses,
+)
+from feature_extract.vfm.localization_v6.probability_calibration import (
+    V6ProbabilityCalibration,
+    probability_calibration_sha256,
 )
 from feature_extract.vfm.localization_v6.maplet_atlas import (
     MapletFeatureAtlasBank,
@@ -72,6 +80,13 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--surface_mapper_checkpoint", default="")
     parser.add_argument("--maplets", required=True)
     parser.add_argument(
+        "--probability_calibration",
+        required=True,
+        help=(
+            "Frozen trajectory-disjoint identity/spatial null calibration."
+        ),
+    )
+    parser.add_argument(
         "--spatial_maplets",
         default="",
         help=(
@@ -90,6 +105,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output_json", required=True)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--max_queries", type=int, default=0)
+    parser.add_argument("--query_trajectory_ids", nargs="*", default=[])
     parser.add_argument("--preliminary_candidates", type=int, default=64)
     parser.add_argument("--maximum_maplets", type=int, default=64)
     parser.add_argument(
@@ -106,8 +122,8 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=int,
         default=0,
         help=(
-            "Optional stochastic hypotheses after deterministic regional MAP "
-            "RANSAC. Disabled by default; positive values are an ablation."
+            "Regional-center pseudo-PnP diagnostic only: optional stochastic "
+            "grouped hypotheses. Ignored by region-level coarse methods."
         ),
     )
     parser.add_argument(
@@ -118,16 +134,44 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=int,
         default=0,
         help=(
-            "Experimental likelihood-only EM refinement. Disabled by default "
-            "because trajectory-disjoint validation showed worse pose error."
+            "Regional-center pseudo-PnP diagnostic only: experimental "
+            "likelihood EM. Ignored by region-level coarse methods."
         ),
     )
     parser.add_argument("--maximum_modes", type=int, default=16)
     parser.add_argument("--pose_vote_bank", default="")
+    parser.add_argument(
+        "--coarse_pose_method",
+        choices=(
+            "maplet_footprint",
+            "anonymous_view_mode",
+            "regional_center_pseudo_pnp",
+        ),
+        default="anonymous_view_mode",
+        help=(
+            "Anonymous view-mode voting is the region-level default. "
+            "Footprint CEM remains experimental; regional-center pseudo-PnP "
+            "is a diagnostic baseline only."
+        ),
+    )
+    parser.add_argument("--footprint_cem_iterations", type=int, default=3)
+    parser.add_argument("--footprint_particles_per_mode", type=int, default=64)
+    parser.add_argument(
+        "--footprint_candidates_per_region", type=int, default=16
+    )
     parser.add_argument("--atlas_geometry", default="")
     parser.add_argument("--visibility_contributor_dir", default="")
     parser.add_argument("--image_root", default="")
     parser.add_argument("--seed", type=int, default=731)
+    parser.add_argument(
+        "--allow_reference_trajectory_diagnostic",
+        action="store_true",
+        help=(
+            "Allow query trajectories used by probability calibration or "
+            "pose-vote map construction. This is a replay diagnostic and "
+            "must not be reported as independent validation."
+        ),
+    )
     parser.add_argument("--force", action="store_true")
     return parser.parse_args(argv)
 
@@ -190,6 +234,19 @@ def _geometric_diversity(
     }
 
 
+def _binary_average_precision(
+    labels: list[bool], scores: list[float]
+) -> float | None:
+    if not labels or not any(labels):
+        return None
+    label = np.asarray(labels, dtype=bool)
+    score = np.asarray(scores, dtype=np.float64)
+    order = np.argsort(-score, kind="stable")
+    ranked = label[order]
+    precision = np.cumsum(ranked) / np.arange(1, ranked.size + 1)
+    return float(np.sum(precision[ranked]) / np.sum(ranked))
+
+
 def _region_identity_diagnostics(
     groups,
     view,
@@ -209,12 +266,23 @@ def _region_identity_diagnostics(
     }
     labeled = 0
     hits = {1: 0, 5: 0, 64: 0}
+    dominant_hits = {1: 0, 5: 0, 64: 0}
     correct_mass = []
     maplet_center_residual = []
     component_center_residual = []
     component_map_residual = []
     component_oracle_residual = []
     surface_center_residual = []
+    identity_null_labels: list[bool] = []
+    identity_null_scores: list[float] = []
+    spatial_null_labels: list[bool] = []
+    spatial_null_scores: list[float] = []
+    spatial_null_true_identity_labels: list[bool] = []
+    spatial_null_true_identity_scores: list[float] = []
+    spatial_surface_errors = []
+    spatial_rank1 = []
+    spatial_rank5 = []
+    spatial_mode_entropy = []
     for group in groups:
         extent = np.maximum(
             np.asarray(group.query_region_extent, dtype=np.float64), 1.0
@@ -224,7 +292,18 @@ def _region_identity_diagnostics(
             - np.asarray(group.query_region_xy, dtype=np.float64)[None]
         ) / extent[None]
         inside = np.max(normalized, axis=1) <= 1.0
+        identity_null_labels.append(not bool(np.any(inside)))
+        identity_null_scores.append(float(group.null_probability))
         if not np.any(inside):
+            if group.spatial_null_probabilities is not None:
+                spatial_null_scores.extend(
+                    np.asarray(
+                        group.spatial_null_probabilities, dtype=np.float64
+                    ).tolist()
+                )
+                spatial_null_labels.extend(
+                    [True] * int(group.maplet_ids.size)
+                )
             continue
         local_ids, local_counts = np.unique(
             surface_maplet_ids[inside], return_counts=True
@@ -234,6 +313,7 @@ def _region_identity_diagnostics(
         # Retaining the strongest eight labels avoids declaring every nearby
         # facade a correct identity while preserving genuine multilayer cases.
         true_ids = local_ids[order[:8]]
+        dominant_id = int(local_ids[order[0]])
         labeled += 1
         candidate_ids = np.asarray(group.maplet_ids, dtype=np.int64)
         true_candidate = np.isin(candidate_ids, true_ids)
@@ -241,10 +321,90 @@ def _region_identity_diagnostics(
             hits[rank] += int(
                 np.any(true_candidate[: min(rank, true_candidate.size)])
             )
+            dominant_hits[rank] += int(
+                dominant_id
+                in candidate_ids[: min(rank, candidate_ids.size)]
+            )
         correct_mass.append(
             float(np.sum(group.probabilities[true_candidate]))
         )
         correct_rows = np.flatnonzero(true_candidate)
+        if (
+            group.component_offsets is not None
+            and group.component_centers is not None
+            and group.component_probabilities is not None
+            and group.spatial_null_probabilities is not None
+        ):
+            offsets = np.asarray(group.component_offsets, dtype=np.int64)
+            component_centers = np.asarray(
+                group.component_centers, dtype=np.float64
+            )
+            component_probability = np.asarray(
+                group.component_probabilities, dtype=np.float64
+            )
+            spatial_null = np.asarray(
+                group.spatial_null_probabilities, dtype=np.float64
+            )
+            local_surface_ids = surface_ids[inside]
+            local_surface_maplet_ids = surface_maplet_ids[inside]
+            local_surface_xyz = atlas.xyz.reshape(-1, 3)[local_surface_ids]
+            for candidate, maplet_id in enumerate(candidate_ids.tolist()):
+                begin, end = (
+                    int(offsets[candidate]),
+                    int(offsets[candidate + 1]),
+                )
+                target = local_surface_maplet_ids == int(maplet_id)
+                identity_is_true = bool(np.any(target))
+                resolved = False
+                map_error = float("inf")
+                if end > begin and np.any(target):
+                    probability = component_probability[begin:end]
+                    order_by_probability = np.argsort(
+                        -probability, kind="stable"
+                    )
+                    distance = np.linalg.norm(
+                        component_centers[begin:end, None]
+                        - local_surface_xyz[target][None],
+                        axis=2,
+                    )
+                    per_mode_error = np.min(distance, axis=1)
+                    map_error = float(
+                        per_mode_error[order_by_probability[0]]
+                    )
+                    resolved = map_error <= 0.30
+                    spatial_surface_errors.append(map_error)
+                    spatial_rank1.append(
+                        float(per_mode_error[order_by_probability[0]] <= 0.30)
+                    )
+                    spatial_rank5.append(
+                        float(
+                            np.any(
+                                per_mode_error[
+                                    order_by_probability[:5]
+                                ]
+                                <= 0.30
+                            )
+                        )
+                    )
+                    distribution = np.r_[
+                        probability, spatial_null[candidate]
+                    ]
+                    distribution /= max(float(np.sum(distribution)), 1e-12)
+                    spatial_mode_entropy.append(
+                        float(
+                            -np.sum(
+                                distribution
+                                * np.log(np.maximum(distribution, 1e-12))
+                            )
+                        )
+                    )
+                spatial_null_labels.append(not resolved)
+                spatial_null_scores.append(float(spatial_null[candidate]))
+                if identity_is_true:
+                    spatial_null_true_identity_labels.append(not resolved)
+                    spatial_null_true_identity_scores.append(
+                        float(spatial_null[candidate])
+                    )
         if correct_rows.size:
             selected_ids = candidate_ids[correct_rows]
             bank_rows = np.asarray(
@@ -313,6 +473,8 @@ def _region_identity_diagnostics(
                         int(offsets[candidate]),
                         int(offsets[candidate + 1]),
                     )
+                    if end <= begin:
+                        continue
                     local = conditional[begin:end]
                     map_centers.append(
                         all_centers[begin + int(np.argmax(local))]
@@ -387,6 +549,58 @@ def _region_identity_diagnostics(
         "region_true_maplet_recall_at_1": float(hits[1] / denominator),
         "region_true_maplet_recall_at_5": float(hits[5] / denominator),
         "region_true_maplet_recall_at_64": float(hits[64] / denominator),
+        "region_dominant_maplet_recall_at_1": float(
+            dominant_hits[1] / denominator
+        ),
+        "region_dominant_maplet_recall_at_5": float(
+            dominant_hits[5] / denominator
+        ),
+        "region_dominant_maplet_recall_at_64": float(
+            dominant_hits[64] / denominator
+        ),
+        "identity_null_auprc": _binary_average_precision(
+            identity_null_labels, identity_null_scores
+        ),
+        "spatial_null_auprc": _binary_average_precision(
+            spatial_null_labels, spatial_null_scores
+        ),
+        "spatial_null_true_identity_auprc": _binary_average_precision(
+            spatial_null_true_identity_labels,
+            spatial_null_true_identity_scores,
+        ),
+        "spatial_null_example_count": int(len(spatial_null_labels)),
+        "spatial_null_true_identity_example_count": int(
+            len(spatial_null_true_identity_labels)
+        ),
+        "spatial_null_prevalence": (
+            float(np.mean(spatial_null_labels))
+            if spatial_null_labels
+            else None
+        ),
+        "spatial_null_true_identity_prevalence": (
+            float(np.mean(spatial_null_true_identity_labels))
+            if spatial_null_true_identity_labels
+            else None
+        ),
+        "spatial_surface_error_median_m": (
+            float(np.median(spatial_surface_errors))
+            if spatial_surface_errors
+            else None
+        ),
+        "spatial_surface_error_sample_count": int(
+            len(spatial_surface_errors)
+        ),
+        "spatial_rank1_within_30cm": (
+            float(np.mean(spatial_rank1)) if spatial_rank1 else None
+        ),
+        "spatial_rank5_within_30cm": (
+            float(np.mean(spatial_rank5)) if spatial_rank5 else None
+        ),
+        "spatial_mode_entropy_mean": (
+            float(np.mean(spatial_mode_entropy))
+            if spatial_mode_entropy
+            else None
+        ),
         "region_true_probability_mass_mean": (
             float(np.mean(correct_mass)) if correct_mass else 0.0
         ),
@@ -432,6 +646,9 @@ def _diagnostic_pnp(
             "inlier_count": 0,
         }
     matrix, distortion = camera_matrix_and_distortion(camera)
+    # OpenCV's RANSAC RNG is global and otherwise makes layered oracle rows
+    # vary between identical evaluator runs.
+    cv2.setRNGSeed(194917)
     success, rotation, translation, inliers = cv2.solvePnPRansac(
         np.asarray(xyz, dtype=np.float64),
         np.asarray(xy, dtype=np.float64),
@@ -475,7 +692,8 @@ def _coarse_observation_oracles(
     groups,
     view,
     atlas: MapletFeatureAtlasBank,
-    bank: SurfaceRetrievalMapletBank,
+    identity_bank: SurfaceRetrievalMapletBank,
+    spatial_bank: SurfaceRetrievalMapletBank,
 ) -> dict[str, dict[str, float | int | None]]:
     """Measure which coarse observation model first destroys the pose basin."""
 
@@ -486,7 +704,11 @@ def _coarse_observation_oracles(
     surface_maplet_ids = atlas.maplet_ids[surface_ids // flat_cells]
     bank_row_by_id = {
         int(value): int(row)
-        for row, value in enumerate(bank.maplet_ids.tolist())
+        for row, value in enumerate(identity_bank.maplet_ids.tolist())
+    }
+    spatial_row_by_id = {
+        int(value): int(row)
+        for row, value in enumerate(spatial_bank.maplet_ids.tolist())
     }
     exact: dict[int, tuple[float, np.ndarray, np.ndarray]] = {}
     maplet_center: dict[int, tuple[float, np.ndarray, np.ndarray]] = {}
@@ -531,7 +753,7 @@ def _coarse_observation_oracles(
         if bank_row is None:
             continue
         projected, depth = project_world_points(
-            bank.centers[bank_row : bank_row + 1],
+            identity_bank.centers[bank_row : bank_row + 1],
             view.pose_w2c,
             view.camera,
         )
@@ -541,44 +763,52 @@ def _coarse_observation_oracles(
             if previous is None or residual < previous[0]:
                 maplet_center[maplet_id] = (
                     residual,
-                    np.asarray(bank.centers[bank_row], dtype=np.float64),
+                    np.asarray(
+                        identity_bank.centers[bank_row], dtype=np.float64
+                    ),
                     query_xy,
                 )
-        begin, end = (
-            int(bank.descriptor_offsets[bank_row]),
-            int(bank.descriptor_offsets[bank_row + 1]),
-        )
-        component_xyz = np.asarray(
-            bank.descriptor_centers[begin:end], dtype=np.float64
-        )
-        projected, depth = project_world_points(
-            component_xyz, view.pose_w2c, view.camera
-        )
-        valid = (
-            np.isfinite(projected).all(axis=1)
-            & np.isfinite(depth)
-            & (depth > 0.0)
-        )
-        if np.any(valid):
-            local_rows = np.flatnonzero(valid)
-            local = int(
-                local_rows[
-                    np.argmin(
-                        np.linalg.norm(
-                            projected[local_rows] - query_xy[None], axis=1
-                        )
-                    )
-                ]
+        spatial_row = spatial_row_by_id.get(maplet_id)
+        if spatial_row is not None:
+            begin, end = (
+                int(spatial_bank.descriptor_offsets[spatial_row]),
+                int(spatial_bank.descriptor_offsets[spatial_row + 1]),
             )
-            component_id = begin + local
-            residual = float(np.linalg.norm(projected[local] - query_xy))
-            previous = oracle_component.get(component_id)
-            if previous is None or residual < previous[0]:
-                oracle_component[component_id] = (
-                    residual,
-                    component_xyz[local],
-                    query_xy,
+            component_xyz = np.asarray(
+                spatial_bank.descriptor_centers[begin:end],
+                dtype=np.float64,
+            )
+            projected, depth = project_world_points(
+                component_xyz, view.pose_w2c, view.camera
+            )
+            valid = (
+                np.isfinite(projected).all(axis=1)
+                & np.isfinite(depth)
+                & (depth > 0.0)
+            )
+            if np.any(valid):
+                local_rows = np.flatnonzero(valid)
+                local = int(
+                    local_rows[
+                        np.argmin(
+                            np.linalg.norm(
+                                projected[local_rows] - query_xy[None],
+                                axis=1,
+                            )
+                        )
+                    ]
                 )
+                component_id = begin + local
+                residual = float(
+                    np.linalg.norm(projected[local] - query_xy)
+                )
+                previous = oracle_component.get(component_id)
+                if previous is None or residual < previous[0]:
+                    oracle_component[component_id] = (
+                        residual,
+                        component_xyz[local],
+                        query_xy,
+                    )
         candidate = np.flatnonzero(
             np.asarray(group.maplet_ids, dtype=np.int64) == maplet_id
         )
@@ -594,6 +824,8 @@ def _coarse_observation_oracles(
                 int(offsets[candidate]),
                 int(offsets[candidate + 1]),
             )
+            if local_end <= local_begin:
+                continue
             candidate_positions = np.asarray(
                 group.component_centers[local_begin:local_end],
                 dtype=np.float64,
@@ -698,6 +930,22 @@ def _aggregate(rows: list[dict[str, object]]) -> dict[str, object]:
         "probability_conservation_max_error": float(
             np.max([float(row["probability_conservation_error"]) for row in rows])
         ),
+        "spatial_probability_conservation_max_error": float(
+            np.max(
+                [
+                    float(row["spatial_probability_conservation_error"])
+                    for row in rows
+                ]
+            )
+        ),
+        "spatial_available_candidate_fraction": float(
+            np.mean(
+                [
+                    float(row["spatial_available_candidate_fraction"])
+                    for row in rows
+                ]
+            )
+        ),
     }
     exact_rows = [row for row in rows if "visible_surface_coverage" in row]
     if exact_rows:
@@ -740,7 +988,19 @@ def _aggregate(rows: list[dict[str, object]]) -> dict[str, object]:
             "region_true_maplet_recall_at_1",
             "region_true_maplet_recall_at_5",
             "region_true_maplet_recall_at_64",
+            "region_dominant_maplet_recall_at_1",
+            "region_dominant_maplet_recall_at_5",
+            "region_dominant_maplet_recall_at_64",
             "region_true_probability_mass_mean",
+            "identity_null_auprc",
+            "spatial_null_auprc",
+            "spatial_null_true_identity_auprc",
+            "spatial_null_prevalence",
+            "spatial_null_true_identity_prevalence",
+            "spatial_surface_error_median_m",
+            "spatial_rank1_within_30cm",
+            "spatial_rank5_within_30cm",
+            "spatial_mode_entropy_mean",
             "correct_maplet_center_reprojection_median_px",
             "correct_component_center_reprojection_median_px",
             "correct_map_component_reprojection_median_px",
@@ -753,6 +1013,19 @@ def _aggregate(rows: list[dict[str, object]]) -> dict[str, object]:
                 if row.get(key) is not None
             ]
             output[key] = float(np.mean(values)) if values else None
+        for key in (
+            "spatial_null_example_count",
+            "spatial_null_true_identity_example_count",
+            "spatial_surface_error_sample_count",
+        ):
+            output[key] = int(
+                np.sum(
+                    [
+                        int(row.get(key, 0))
+                        for row in exact_rows
+                    ]
+                )
+            )
         oracle_names = sorted(
             {
                 name
@@ -847,6 +1120,22 @@ def _aggregate(rows: list[dict[str, object]]) -> dict[str, object]:
     output["top1_rotation_p90_deg"] = (
         float(np.quantile(top1_rotation, 0.9)) if top1_rotation else None
     )
+    footprint_margins = [
+        float(row["diagnostic_footprint_gt_minus_best_proposal"])
+        for row in rows
+        if row.get("diagnostic_footprint_gt_minus_best_proposal")
+        is not None
+    ]
+    output["diagnostic_footprint_gt_preferred_fraction"] = (
+        float(np.mean(np.asarray(footprint_margins) > 0.0))
+        if footprint_margins
+        else None
+    )
+    output["diagnostic_footprint_gt_minus_best_proposal_median"] = (
+        float(np.median(footprint_margins))
+        if footprint_margins
+        else None
+    )
     return output
 
 
@@ -861,19 +1150,40 @@ def main(argv: Sequence[str] | None = None) -> None:
         if str(args.spatial_maplets)
         else bank
     )
-    identity_bank_maplet_count_before_spatial_intersection = len(bank)
-    if spatial_bank is not bank and not np.all(
-        np.isin(bank.maplet_ids, spatial_bank.maplet_ids)
-    ):
-        # A maplet without a baked spatial feature cannot produce a visual
-        # surface-location likelihood. Exclude it before identity posterior
-        # normalization instead of inventing a zero descriptor or centre.
-        bank = bank.subset_maplets(spatial_bank.maplet_ids)
+    probability_calibration_path = Path(args.probability_calibration)
+    probability_calibration = V6ProbabilityCalibration.load_json(
+        probability_calibration_path
+    )
+    calibration_metadata = dict(probability_calibration.metadata)
+    expected_identity_hash = str(
+        calibration_metadata.get("identity_bank_sha256", "")
+    )
+    expected_spatial_hash = str(
+        calibration_metadata.get("spatial_bank_sha256", "")
+    )
+    observed_identity_hash = hashlib.sha256(
+        Path(args.maplets).read_bytes()
+    ).hexdigest()
+    observed_spatial_hash = hashlib.sha256(
+        Path(args.spatial_maplets or args.maplets).read_bytes()
+    ).hexdigest()
+    if expected_identity_hash and expected_identity_hash != observed_identity_hash:
+        raise ValueError("probability calibration identity-bank lineage differs")
+    if expected_spatial_hash and expected_spatial_hash != observed_spatial_hash:
+        raise ValueError("probability calibration spatial-bank lineage differs")
     pose_vote_bank = (
         AnonymousMapletPoseVoteBank.load_npz(Path(args.pose_vote_bank))
         if str(args.pose_vote_bank)
         else None
     )
+    if (
+        str(args.coarse_pose_method)
+        in {"maplet_footprint", "anonymous_view_mode"}
+        and pose_vote_bank is None
+    ):
+        raise ValueError(
+            f"{args.coarse_pose_method} requires --pose_vote_bank"
+        )
     exact_visibility = {}
     atlas_geometry = None
     if str(args.atlas_geometry) or str(args.visibility_contributor_dir):
@@ -961,13 +1271,17 @@ def main(argv: Sequence[str] | None = None) -> None:
     spatial_map_representation = str(
         (spatial_bank.metadata or {}).get("representation", "")
     )
-    spatial_texture_retrieval = map_representation in {
+    identity_texture_retrieval = map_representation in {
+        "canonical_spatial_radio_final_mixture_per_maplet",
+        "exact_canonical_radio_final_spatial_texture",
+    }
+    spatial_texture_retrieval = spatial_map_representation in {
         "canonical_spatial_radio_final_mixture_per_maplet",
         "exact_canonical_radio_final_spatial_texture",
     }
     query_region_config = (
         RadioFinalRegionConfig(pool_sizes=(1,), pool_weights=(1.0,))
-        if spatial_texture_retrieval
+        if identity_texture_retrieval
         else config
     )
     manifest = TokenBankManifest.from_json(Path(args.query_manifest))
@@ -985,6 +1299,15 @@ def main(argv: Sequence[str] | None = None) -> None:
         if record.image_id in pose_by_image
         and record.image_id in camera_by_image
     ]
+    requested_trajectories = {
+        str(value) for value in args.query_trajectory_ids
+    }
+    if requested_trajectories:
+        records = [
+            record
+            for record in records
+            if record.image_id.split("/", 1)[0] in requested_trajectories
+        ]
     if exact_visibility:
         records = [
             record
@@ -998,6 +1321,36 @@ def main(argv: Sequence[str] | None = None) -> None:
             0, len(records) - 1, int(args.max_queries), dtype=np.int64
         )
         records = [records[int(index)] for index in indices.tolist()]
+    query_trajectory_ids = sorted(
+        {record.image_id.split("/", 1)[0] for record in records}
+    )
+    calibration_overlap = sorted(
+        set(query_trajectory_ids)
+        & set(calibration_metadata["calibration_trajectory_ids"])
+    )
+    pose_vote_mapping_ids = sorted(
+        str(value)
+        for value in (
+            (pose_vote_bank.metadata or {}).get(
+                "mapping_trajectory_ids", []
+            )
+            if pose_vote_bank is not None
+            else []
+        )
+    )
+    pose_vote_mapping_overlap = sorted(
+        set(query_trajectory_ids) & set(pose_vote_mapping_ids)
+    )
+    if (
+        calibration_overlap or pose_vote_mapping_overlap
+    ) and not bool(args.allow_reference_trajectory_diagnostic):
+        raise ValueError(
+            "independent evaluation overlaps map/calibration trajectories; "
+            f"calibration={calibration_overlap}, "
+            f"pose_vote_map={pose_vote_mapping_overlap}. Use "
+            "--allow_reference_trajectory_diagnostic only for replay "
+            "diagnostics."
+        )
     rows: list[dict[str, object]] = []
     for query_index, record in enumerate(records):
         raw = _load_raw_final(Path(record.token_path), "radio_final")
@@ -1081,6 +1434,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             spatial_bank=(
                 spatial_bank if spatial_bank is not bank else None
             ),
+            probability_calibration=probability_calibration,
         )
         conservation_error = max(
             (
@@ -1093,15 +1447,82 @@ def main(argv: Sequence[str] | None = None) -> None:
             ),
             default=0.0,
         )
-        hypotheses = (
+        spatial_conservation_errors = []
+        spatial_available_count = 0
+        spatial_candidate_count = 0
+        for group in retrieval.groups:
+            if (
+                group.component_offsets is None
+                or group.component_probabilities is None
+                or group.spatial_null_probabilities is None
+            ):
+                continue
+            offsets = np.asarray(group.component_offsets, dtype=np.int64)
+            spatial_null = np.asarray(
+                group.spatial_null_probabilities, dtype=np.float64
+            )
+            available = np.asarray(group.spatial_available, dtype=bool)
+            spatial_available_count += int(np.sum(available))
+            spatial_candidate_count += int(available.size)
+            for candidate in range(group.maplet_ids.size):
+                begin, end = int(offsets[candidate]), int(offsets[candidate + 1])
+                spatial_conservation_errors.append(
+                    abs(
+                        float(
+                            np.sum(
+                                group.component_probabilities[begin:end]
+                            )
+                        )
+                        + float(spatial_null[candidate])
+                        - 1.0
+                    )
+                )
+        spatial_conservation_error = max(
+            spatial_conservation_errors, default=0.0
+        )
+        view_mode_hypotheses = (
             vote_maplet_poses(
                 descriptors,
                 bank,
                 pose_vote_bank,
+                candidate_groups=retrieval.groups,
+                image_size_wh=(
+                    int(camera_by_image[record.image_id].width),
+                    int(camera_by_image[record.image_id].height),
+                ),
+                camera=camera_by_image[record.image_id],
+                region_match_probability=np.asarray(
+                    [
+                        1.0 - float(group.null_probability)
+                        for group in retrieval.groups
+                    ],
+                    dtype=np.float64,
+                ),
                 maximum_modes=int(args.maximum_modes),
             )
             if pose_vote_bank is not None
-            else propose_maplet_surface_mode_poses(
+            else tuple()
+        )
+        if str(args.coarse_pose_method) == "maplet_footprint":
+            hypotheses = propose_maplet_footprint_poses(
+                retrieval.groups,
+                bank,
+                camera_by_image[record.image_id],
+                view_mode_hypotheses,
+                maximum_modes=int(args.maximum_modes),
+                candidates_per_region=int(
+                    args.footprint_candidates_per_region
+                ),
+                cem_iterations=int(args.footprint_cem_iterations),
+                particles_per_mode=int(
+                    args.footprint_particles_per_mode
+                ),
+                seed=int(args.seed) + query_index,
+            )
+        elif str(args.coarse_pose_method) == "anonymous_view_mode":
+            hypotheses = view_mode_hypotheses
+        else:
+            hypotheses = propose_regional_center_pseudo_pnp_poses(
                 retrieval.groups,
                 bank,
                 camera_by_image[record.image_id],
@@ -1113,12 +1534,37 @@ def main(argv: Sequence[str] | None = None) -> None:
                 em_iterations=int(args.proposal_em_iterations),
                 seed=int(args.seed) + query_index,
             )
+        # Diagnostic only: GT is evaluated strictly after every hypothesis has
+        # been generated.  Comparing its footprint likelihood with proposal
+        # likelihoods separates a failed pose search from a misspecified
+        # footprint observation model without leaking GT into localization.
+        gt_footprint_score, gt_footprint_support = (
+            score_maplet_footprint_pose(
+                pose_by_image[record.image_id],
+                retrieval.groups,
+                bank,
+                camera_by_image[record.image_id],
+                candidates_per_region=int(
+                    args.footprint_candidates_per_region
+                ),
+            )
         )
         errors = []
+        proposal_footprint_scores = []
         for hypothesis in hypotheses:
             error = pnp_pose_error(
                 hypothesis.pose_w2c, pose_by_image[record.image_id]
             )
+            footprint_score, footprint_support = score_maplet_footprint_pose(
+                hypothesis.pose_w2c,
+                retrieval.groups,
+                bank,
+                camera_by_image[record.image_id],
+                candidates_per_region=int(
+                    args.footprint_candidates_per_region
+                ),
+            )
+            proposal_footprint_scores.append(float(footprint_score))
             errors.append(
                 {
                     "translation_m": float(error.translation_m),
@@ -1128,6 +1574,12 @@ def main(argv: Sequence[str] | None = None) -> None:
                         hypothesis.supporting_group_count
                     ),
                     "proposal_source": str(hypothesis.source),
+                    "diagnostic_footprint_log_likelihood_ratio": float(
+                        footprint_score
+                    ),
+                    "diagnostic_footprint_supporting_region_count": int(
+                        footprint_support
+                    ),
                 }
             )
         row = {
@@ -1136,8 +1588,28 @@ def main(argv: Sequence[str] | None = None) -> None:
             "ranked_maplet_count": int(retrieval.ranked_maplet_ids.size),
             "ranked_maplet_ids": retrieval.ranked_maplet_ids.tolist(),
             "probability_conservation_error": float(conservation_error),
+            "spatial_probability_conservation_error": float(
+                spatial_conservation_error
+            ),
+            "spatial_available_candidate_fraction": float(
+                spatial_available_count / max(spatial_candidate_count, 1)
+            ),
             "hypothesis_count": len(hypotheses),
             "hypothesis_errors": errors,
+            "diagnostic_footprint_ground_truth_log_likelihood_ratio": float(
+                gt_footprint_score
+            ),
+            "diagnostic_footprint_ground_truth_supporting_region_count": int(
+                gt_footprint_support
+            ),
+            "diagnostic_footprint_gt_minus_best_proposal": (
+                float(
+                    gt_footprint_score
+                    - max(proposal_footprint_scores)
+                )
+                if proposal_footprint_scores
+                else None
+            ),
             **_geometric_diversity(retrieval.ranked_maplet_ids, bank),
         }
         if record.image_id in exact_visibility:
@@ -1180,6 +1652,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                             exact_view,
                             atlas_geometry,
                             bank,
+                            spatial_bank,
                         )
                     ),
                 }
@@ -1187,11 +1660,19 @@ def main(argv: Sequence[str] | None = None) -> None:
         rows.append(row)
         print(json.dumps(row), flush=True)
     report = {
-        "stage": "v6_deployable_retrieval_coarse_pose_basin",
+        "stage": "v6_retrieval_and_coarse_pose_dashboard",
         **_aggregate(rows),
         "camera_audit": camera_audit,
-        "query_trajectory_ids": sorted(
-            {str(row["image_id"]).split("/", 1)[0] for row in rows}
+        "query_trajectory_ids": query_trajectory_ids,
+        "calibration_trajectory_overlap": calibration_overlap,
+        "pose_vote_mapping_trajectory_overlap": (
+            pose_vote_mapping_overlap
+        ),
+        "independent_trajectory_protocol": not bool(
+            calibration_overlap or pose_vote_mapping_overlap
+        ),
+        "reference_trajectory_overlap_allowed_for_diagnostic": bool(
+            args.allow_reference_trajectory_diagnostic
         ),
         "set_reranker_strength": 0.0,
         "preliminary_candidates": int(args.preliminary_candidates),
@@ -1200,21 +1681,27 @@ def main(argv: Sequence[str] | None = None) -> None:
             args.maximum_components_per_maplet
         ),
         "component_nms_distance_m": float(args.component_nms_distance_m),
-        "proposal_trials": int(args.proposal_trials),
-        "proposal_refinement_candidates": int(
-            args.proposal_refinement_candidates
-        ),
-        "proposal_em_iterations": int(args.proposal_em_iterations),
-        "deterministic_regional_ransac_prefixes": [
-            12,
-            16,
-            24,
-            32,
-            48,
-            64,
-            96,
-            "all",
-        ],
+        "diagnostic_regional_center_pseudo_pnp": {
+            "enabled": (
+                str(args.coarse_pose_method)
+                == "regional_center_pseudo_pnp"
+            ),
+            "proposal_trials": int(args.proposal_trials),
+            "proposal_refinement_candidates": int(
+                args.proposal_refinement_candidates
+            ),
+            "proposal_em_iterations": int(args.proposal_em_iterations),
+            "deterministic_ransac_prefixes": [
+                12,
+                16,
+                24,
+                32,
+                48,
+                64,
+                96,
+                "all",
+            ],
+        },
         "uses_canonical_spatial_retrieval_texture": bool(
             spatial_texture_retrieval
         ),
@@ -1228,21 +1715,48 @@ def main(argv: Sequence[str] | None = None) -> None:
             spatial_metric_model is not None
         ),
         "spatial_metric_feature_level": spatial_metric_level,
-        "identity_bank_maplet_count_before_spatial_intersection": int(
-            identity_bank_maplet_count_before_spatial_intersection
-        ),
-        "identity_bank_maplet_count_after_spatial_intersection": len(bank),
-        "coarse_pose_method": (
-            "anonymous_maplet_appearance_mode_pose_voting"
-            if pose_vote_bank is not None
-            else (
-                "regional_map_ransac"
-                if int(args.proposal_trials) == 0
-                else (
-                    "regional_map_ransac_plus_"
-                    "stochastic_probabilistic_surface_mode_pnp"
-                )
+        "identity_bank_maplet_count": len(bank),
+        "spatial_bank_maplet_count": len(spatial_bank),
+        "identity_bank_is_never_spatially_intersected": True,
+        "identity_bank_has_canonical_tangent_frames": bool(
+            (bank.metadata or {}).get(
+                "has_canonical_tangent_frames", False
             )
+        ),
+        "coarse_pose_method": str(args.coarse_pose_method),
+        "coarse_pose_method_status": (
+            "experimental_region_level"
+            if str(args.coarse_pose_method)
+            in {"anonymous_view_mode", "maplet_footprint"}
+            else "diagnostic_pseudo_correspondence_only"
+        ),
+        "regional_center_pseudo_pnp_is_diagnostic_only": True,
+        "probability_calibration_sha256": (
+            probability_calibration_sha256(probability_calibration_path)
+        ),
+        "probability_calibration_trajectory_ids": list(
+            calibration_metadata["calibration_trajectory_ids"]
+        ),
+        "spatial_calibration_condition": str(
+            calibration_metadata.get(
+                "spatial_calibration_condition",
+                "legacy_or_unspecified",
+            )
+        ),
+        "probability_calibration_metrics": {
+            "identity": dict(
+                calibration_metadata.get("identity_metrics", {})
+            ),
+            "conditional_spatial": dict(
+                calibration_metadata.get("spatial_metrics", {})
+            ),
+        },
+        "footprint_cem_iterations": int(args.footprint_cem_iterations),
+        "footprint_particles_per_mode": int(
+            args.footprint_particles_per_mode
+        ),
+        "footprint_candidates_per_region": int(
+            args.footprint_candidates_per_region
         ),
         "production_contract": {
             "map_representation": map_representation,
@@ -1255,6 +1769,15 @@ def main(argv: Sequence[str] | None = None) -> None:
             "uses_sfm_points": False,
             "uses_sfm_tracks": False,
             "ground_truth_used_after_hypothesis_generation_only": True,
+            "identity_bank_intersected_with_spatial_bank": False,
+            "has_explicit_conditional_spatial_null": True,
+            "mode_truncation_mass_transferred_to_spatial_null": True,
+            "uses_virtual_surface_mean": False,
+            "uses_fixed_pose_null_multiplier": False,
+            "ground_truth_footprint_scoring_is_diagnostic_only": True,
+            "fine_correlation_typed_null_is_runtime_qualified": False,
+            "iterative_fine_alignment_is_runtime_closed": False,
+            "end_to_end_production_qualified": False,
         },
         "rows": rows,
     }

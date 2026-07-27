@@ -10,6 +10,9 @@ from scipy.special import logsumexp
 from feature_extract.vfm.localization.surface_retrieval_maplets import (
     SurfaceRetrievalMapletBank,
 )
+from feature_extract.vfm.localization_v6.probability_calibration import (
+    V6ProbabilityCalibration,
+)
 
 
 @dataclass(frozen=True)
@@ -26,6 +29,8 @@ class QueryMapletGroup:
     component_centers: np.ndarray | None = None
     component_covariances: np.ndarray | None = None
     component_probabilities: np.ndarray | None = None
+    spatial_available: np.ndarray | None = None
+    spatial_null_probabilities: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -118,6 +123,18 @@ def _restrict_group_to_maplets(
         component_centers=component_centers,
         component_covariances=component_covariances,
         component_probabilities=component_probabilities,
+        spatial_available=(
+            None
+            if group.spatial_available is None
+            else np.asarray(group.spatial_available, dtype=bool)[keep]
+        ),
+        spatial_null_probabilities=(
+            None
+            if group.spatial_null_probabilities is None
+            else np.asarray(
+                group.spatial_null_probabilities, dtype=np.float32
+            )[keep]
+        ),
     )
 
 
@@ -133,8 +150,8 @@ def _compress_surface_location_modes(
     *,
     maximum_modes: int,
     nms_distance_m: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Keep distinct, real 3D modes without creating a virtual mean point."""
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    """Keep real 3D modes and return all discarded mass as spatial null."""
 
     probability = np.maximum(
         np.asarray(probabilities, dtype=np.float64).reshape(-1), 0.0
@@ -185,11 +202,15 @@ def _compress_surface_location_modes(
             break
     selected_rows = np.asarray(selected, dtype=np.int64)
     selected_probability = aggregate_probability[selected_rows]
-    selected_probability /= max(float(np.sum(selected_probability)), 1e-12)
+    discarded_probability = max(
+        float(np.sum(aggregate_probability) - np.sum(selected_probability)),
+        0.0,
+    )
     return (
         aggregate_center[selected_rows].astype(np.float32),
         aggregate_covariance[selected_rows].astype(np.float32),
         selected_probability.astype(np.float32),
+        discarded_probability,
     )
 
 
@@ -203,14 +224,18 @@ def retrieve_candidate_groups(
     maximum_maplets: int = 64,
     descriptor_temperature: float = 0.08,
     mixture_temperature: float = 0.06,
-    null_logit: float = 0.0,
     set_rerank_strength: float = 0.0,
     set_rerank_neighbors: int = 8,
     maximum_components_per_maplet: int = 16,
     component_nms_distance_m: float = 0.02,
     spatial_query_descriptors: np.ndarray | None = None,
     spatial_bank: SurfaceRetrievalMapletBank | None = None,
+    probability_calibration: V6ProbabilityCalibration | None = None,
 ) -> MapletRetrievalResult:
+    if probability_calibration is None:
+        raise ValueError(
+            "V6 retrieval requires a frozen probability calibration artifact"
+        )
     query = _normalize(query_descriptors)
     spatial_query = (
         query
@@ -230,15 +255,6 @@ def retrieve_candidate_groups(
         int(value): int(row)
         for row, value in enumerate(geometry_bank.maplet_ids.tolist())
     }
-    missing_geometry = [
-        int(value)
-        for value in bank.maplet_ids.tolist()
-        if int(value) not in geometry_row_by_id
-    ]
-    if missing_geometry:
-        raise ValueError(
-            "identity bank contains maplets absent from spatial bank"
-        )
     xy = np.asarray(query_region_xy, dtype=np.float32)
     extent = np.asarray(query_region_extent, dtype=np.float32)
     if xy.shape != (query.shape[0], 2) or extent.shape != (query.shape[0], 2):
@@ -265,16 +281,13 @@ def retrieve_candidate_groups(
     logits += 0.15 * np.log(np.clip(bank.quality_scores[None], 1e-4, 1.0))
     logits -= 0.10 * np.clip(bank.descriptor_uncertainties[None], 0.0, 10.0)
     scaled = logits / max(float(descriptor_temperature), 1e-4)
-    joint = np.concatenate(
-        [
-            scaled,
-            np.full((query.shape[0], 1), float(null_logit), dtype=np.float64),
-        ],
-        axis=1,
+    base_null = probability_calibration.identity.probability(scaled)
+    conditional_maplet_probability = np.exp(
+        scaled - logsumexp(scaled, axis=1, keepdims=True)
     )
-    posterior = np.exp(joint - logsumexp(joint, axis=1, keepdims=True))
-    maplet_probability = posterior[:, :-1]
-    base_null = posterior[:, -1]
+    maplet_probability = (
+        (1.0 - base_null[:, None]) * conditional_maplet_probability
+    )
     keep = min(max(int(preliminary_candidates), 1), len(bank))
     columns = np.argpartition(-maplet_probability, kth=keep - 1, axis=1)[
         :, :keep
@@ -337,7 +350,9 @@ def retrieve_candidate_groups(
     selected_component_slices: dict[int, tuple[int, int, int, int]] = {}
     cursor = 0
     for maplet_id in ranked_maplet_ids.tolist():
-        geometry_row = geometry_row_by_id[int(maplet_id)]
+        geometry_row = geometry_row_by_id.get(int(maplet_id))
+        if geometry_row is None:
+            continue
         begin, end = (
             int(geometry_bank.descriptor_offsets[geometry_row]),
             int(geometry_bank.descriptor_offsets[geometry_row + 1]),
@@ -351,118 +366,142 @@ def retrieve_candidate_groups(
             end,
         )
         cursor += rows.size
+    spatial_component_scores = None
     if selected_component_rows:
         spatial_rows = np.concatenate(selected_component_rows)
         spatial_component_scores = (
             spatial_query @ geometry_bank.descriptors[spatial_rows].T
         )
-        enriched_groups = []
-        for region, group in enumerate(groups):
-            if group.maplet_ids.size == 0:
-                enriched_groups.append(group)
-                continue
-            component_offsets = [0]
-            component_centers = []
-            component_covariances = []
-            component_probabilities = []
-            candidate_centers = []
-            candidate_covariances = []
-            for maplet_id in group.maplet_ids.tolist():
-                local_begin, local_end, begin, end = (
-                    selected_component_slices[int(maplet_id)]
-                )
-                local_score = spatial_component_scores[
-                    region, local_begin:local_end
-                ]
-                local_logit = (
-                    local_score / tau
-                    + np.log(
-                        np.clip(
-                            geometry_bank.descriptor_weights[begin:end],
-                            1e-12,
-                            1.0,
-                        )
-                    )
-                )
-                local_probability = np.exp(
-                    local_logit - logsumexp(local_logit)
-                ).astype(np.float32)
-                all_centers = np.asarray(
-                    geometry_bank.descriptor_centers[begin:end],
-                    dtype=np.float64,
-                )
-                all_covariances = np.asarray(
-                    geometry_bank.descriptor_covariances[begin:end],
-                    dtype=np.float64,
-                )
-                moment_center = (
-                    np.asarray(local_probability, dtype=np.float64)
-                    @ all_centers
-                )
-                moment_residual = all_centers - moment_center[None]
-                moment_covariance = np.sum(
-                    np.asarray(local_probability, dtype=np.float64)[
-                        :, None, None
-                    ]
-                    * (
-                        all_covariances
-                        + moment_residual[:, :, None]
-                        * moment_residual[:, None, :]
-                    ),
-                    axis=0,
-                )
+    enriched_groups = []
+    for region, group in enumerate(groups):
+        component_offsets = [0]
+        component_centers = []
+        component_covariances = []
+        component_probabilities = []
+        candidate_centers = []
+        candidate_covariances = []
+        spatial_available = []
+        spatial_null_probabilities = []
+        for maplet_id in group.maplet_ids.tolist():
+            component_slice = selected_component_slices.get(int(maplet_id))
+            if component_slice is None or spatial_component_scores is None:
+                spatial_available.append(False)
+                spatial_null_probabilities.append(1.0)
                 candidate_centers.append(
-                    moment_center.astype(np.float32)
+                    np.full((3,), np.nan, dtype=np.float32)
                 )
                 candidate_covariances.append(
-                    moment_covariance.astype(np.float32)
+                    np.full((3, 3), np.nan, dtype=np.float32)
                 )
-                (
-                    local_centers,
-                    local_covariances,
-                    local_probability,
-                ) = _compress_surface_location_modes(
-                    local_probability,
-                    all_centers,
-                    all_covariances,
-                    maximum_modes=int(maximum_components_per_maplet),
-                    nms_distance_m=float(component_nms_distance_m),
-                )
-                component_centers.append(local_centers)
-                component_covariances.append(local_covariances)
-                component_probabilities.append(local_probability)
-                component_offsets.append(
-                    component_offsets[-1] + int(local_probability.size)
-                )
-            enriched_groups.append(
-                QueryMapletGroup(
-                    query_region_xy=group.query_region_xy,
-                    query_region_extent=group.query_region_extent,
-                    maplet_ids=group.maplet_ids,
-                    probabilities=group.probabilities,
-                    null_probability=group.null_probability,
-                    omitted_probability=group.omitted_probability,
-                    candidate_centers=np.asarray(
-                        candidate_centers, dtype=np.float32
-                    ),
-                    candidate_covariances=np.asarray(
-                        candidate_covariances, dtype=np.float32
-                    ),
-                    component_offsets=np.asarray(
-                        component_offsets, dtype=np.int64
-                    ),
-                    component_centers=np.concatenate(
-                        component_centers, axis=0
-                    ),
-                    component_covariances=np.concatenate(
-                        component_covariances, axis=0
-                    ),
-                    component_probabilities=np.concatenate(
-                        component_probabilities, axis=0
-                    ),
+                component_offsets.append(component_offsets[-1])
+                continue
+            spatial_available.append(True)
+            local_begin, local_end, begin, end = component_slice
+            local_score = spatial_component_scores[
+                region, local_begin:local_end
+            ]
+            local_logit = (
+                local_score / tau
+                + np.log(
+                    np.clip(
+                        geometry_bank.descriptor_weights[begin:end],
+                        1e-12,
+                        1.0,
+                    )
                 )
             )
-        groups = enriched_groups
+            base_spatial_null = float(
+                probability_calibration.spatial.probability(local_logit)[0]
+            )
+            local_probability = (
+                (1.0 - base_spatial_null)
+                * np.exp(local_logit - logsumexp(local_logit))
+            ).astype(np.float32)
+            all_centers = np.asarray(
+                geometry_bank.descriptor_centers[begin:end],
+                dtype=np.float64,
+            )
+            all_covariances = np.asarray(
+                geometry_bank.descriptor_covariances[begin:end],
+                dtype=np.float64,
+            )
+            # A candidate representative is a real MAP surface cell, never
+            # the mean of distinct locations.
+            map_component = int(np.argmax(local_probability))
+            candidate_centers.append(
+                all_centers[map_component].astype(np.float32)
+            )
+            candidate_covariances.append(
+                all_covariances[map_component].astype(np.float32)
+            )
+            (
+                local_centers,
+                local_covariances,
+                retained_probability,
+                discarded_probability,
+            ) = _compress_surface_location_modes(
+                local_probability,
+                all_centers,
+                all_covariances,
+                maximum_modes=int(maximum_components_per_maplet),
+                nms_distance_m=float(component_nms_distance_m),
+            )
+            spatial_null_probabilities.append(
+                float(
+                    np.clip(
+                        base_spatial_null + discarded_probability,
+                        0.0,
+                        1.0,
+                    )
+                )
+            )
+            component_centers.append(local_centers)
+            component_covariances.append(local_covariances)
+            component_probabilities.append(retained_probability)
+            component_offsets.append(
+                component_offsets[-1] + int(retained_probability.size)
+            )
+        enriched_groups.append(
+            QueryMapletGroup(
+                query_region_xy=group.query_region_xy,
+                query_region_extent=group.query_region_extent,
+                maplet_ids=group.maplet_ids,
+                probabilities=group.probabilities,
+                null_probability=group.null_probability,
+                omitted_probability=group.omitted_probability,
+                candidate_centers=np.asarray(
+                    candidate_centers, dtype=np.float32
+                ).reshape(-1, 3),
+                candidate_covariances=np.asarray(
+                    candidate_covariances, dtype=np.float32
+                ).reshape(-1, 3, 3),
+                component_offsets=np.asarray(
+                    component_offsets, dtype=np.int64
+                ),
+                component_centers=(
+                    np.concatenate(component_centers, axis=0)
+                    if component_centers
+                    else np.empty((0, 3), dtype=np.float32)
+                ),
+                component_covariances=(
+                    np.concatenate(component_covariances, axis=0)
+                    if component_covariances
+                    else np.empty((0, 3, 3), dtype=np.float32)
+                ),
+                component_probabilities=(
+                    np.concatenate(component_probabilities, axis=0)
+                    if component_probabilities
+                    else np.empty((0,), dtype=np.float32)
+                ),
+                spatial_available=np.asarray(
+                    spatial_available, dtype=bool
+                ),
+                spatial_null_probabilities=np.asarray(
+                    spatial_null_probabilities, dtype=np.float32
+                ),
+            )
+        )
+    groups = enriched_groups
     return MapletRetrievalResult(
         groups=tuple(groups),
         ranked_maplet_ids=ranked_maplet_ids,
@@ -588,6 +627,8 @@ def rerank_candidate_groups(
                 component_centers=group.component_centers,
                 component_covariances=group.component_covariances,
                 component_probabilities=group.component_probabilities,
+                spatial_available=group.spatial_available,
+                spatial_null_probabilities=group.spatial_null_probabilities,
             )
         )
     return tuple(reranked)

@@ -13,16 +13,17 @@ mapping RGB + calibrated poses + high-quality 2DGS --offline only-->
 
 query RGB
   -> RADIO-final maplet retrieval with complete candidate groups
-  -> probabilistic maplet pose proposals
+  -> region-level coarse pose distribution
   -> area-render selected canonical maplet atlases
   -> local multi-modal displacement correlation
   -> analytic robust joint-SE(3) update
   -> maplet-disjoint held-out verification
 ```
 
-The deployed prior stores only metric 2DGS geometry and fused feature-atlas
-statistics. It stores no mapping RGB, mapping image path, stable-anchor
-identity, descriptor list, or ALIKE descriptor map. Runtime uses no SfM
+The target prior stores only metric 2DGS geometry and bounded anonymous
+feature-map statistics. It stores no mapping RGB, mapping image path/ID,
+stable-anchor identity, per-view descriptor list, or ALIKE descriptor map.
+Runtime uses no SfM
 points/tracks, RADIO intermediate features, LoFTR, pairwise query/reference
 matching, single-point cosine pose energy, or final point-correspondence PnP.
 
@@ -30,6 +31,11 @@ matching, single-point cosine pose energy, or final point-correspondence PnP.
 
 See [the V6 mainline](docs/vfm/2dgs_maplet_atlas_localization_v6.md) for its
 architecture, artifact contracts and strict G0–G4 promotion gates.
+P0 identity/spatial probability semantics are corrected, but the current
+region-level coarse proposal is still 0/12 at the 30 cm / 3 degree strict
+audit gate. Typed correlation nulls, iterative fine alignment, adaptive
+charts and full-scene runtime occlusion are also still open. V6 is therefore
+not production-qualified and no 530-query accuracy claim is made.
 The V5 point-similarity route is retained as a failed diagnostic: it never
 implemented atlas/query correlation and is not extended.
 The [V3 anchor/PnP mainline](docs/vfm/2dgs_surface_localization_mainline.md) is
@@ -40,11 +46,15 @@ only as a historical baseline.
 ## Active Code
 
 - `feature_extract/tools/vfm/build_v6_canonical_maplet_atlas.py`
+- `feature_extract/tools/vfm/build_surface_retrieval_maplet_bank.py`
+- `feature_extract/tools/vfm/calibrate_v6_retrieval_probabilities.py`
+- `feature_extract/tools/vfm/build_v6_anonymous_pose_vote_bank.py`
 - `feature_extract/tools/vfm/audit_v6_primitive_contributors.py`
 - `feature_extract/tools/vfm/build_v6_contributor_cache.py`
 - `feature_extract/tools/vfm/train_v6_metric_encoder.py`
 - `feature_extract/tools/vfm/bake_v6_metric_atlas.py`
 - `feature_extract/tools/vfm/evaluate_v6_oracle_basin.py`
+- `feature_extract/tools/vfm/evaluate_v6_retrieval_pose_basin.py`
 - `feature_extract/vfm/localization_v6/`
 
 ## Historical And Reference Lines

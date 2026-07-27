@@ -1,368 +1,278 @@
-# V6: 2DGS Maplet-Atlas Correlation Localization
+# V6: 2DGS Maplet-Atlas Localization
 
-V6 is the sole active research line. V3 is the frozen production baseline and
-V5 is a failed point-similarity diagnostic.
+V6 is the active research line. It localizes a query against a feature-bearing
+2DGS map; it does not retrieve or match a stored reference image.
 
-## Runtime graph
-
-```text
-RADIO-final maplet retrieval
-  -> grouped probabilistic maplet pose proposals
-  -> selected canonical maplet atlas area rendering
-  -> stride-16/8/4 local correlation distributions
-  -> analytic robust joint-SE(3) update
-  -> maplet-identity-disjoint held-out verification
-```
-
-The fine stage predicts a two-dimensional displacement distribution, including
-an explicit null outcome. It does not convert descriptor cosine directly into
-an SE(3) energy and does not end in point-correspondence PnP.
-
-## Map contract
-
-Canonical geometry is determined only by maplet coordinates and intersections
-with declared clean 2DGS support disks. Mapping observations may update feature
-mean, dispersion and support count; they never move a texel.
-
-Feature baking accepts an observation only when the texel's primitive ID is
-present in the declared clean-2DGS rasterizer's top-k source-index buffer.
-Canonical geometry, contributor caches and baked atlases carry SHA-256 hashes
-of the full source PLY, clean PLY and retained source-index mask; a mismatch is
-fatal. KD-tree assignment is not a production fallback. The saved atlas
-contains:
-
-- fixed XYZ and primitive ID per texel;
-- fused unit metric feature retained as the K=1 ablation;
-- optionally 2 or 4 anonymous appearance modes, each with a unit feature
-  mean, mixture weight, view-direction mean/covariance and feature dispersion;
-- support count and valid mask;
-- maplet frame, extent and identity.
-
-It contains no mapping RGB, mapping image path, observation descriptor list,
-SfM point/track, ALIKE descriptor or RADIO-intermediate feature.
-Appearance modes are sufficient statistics, not stored per-view descriptors.
-The atlas records the metric-encoder SHA-256; evaluation rejects a known
-map/query encoder lineage mismatch.
-
-## Metric encoder
-
-The metric encoder uses a phase-preserving RGB stem:
+## Frozen method definition
 
 ```text
-Conv3x3 stride2 -> residual
--> Conv3x3 stride2 -> residual blocks
+Stage A  query RADIO-final regions
+         -> full-map maplet identity posterior + identity null
+
+Stage B  region identities + canonical maplet geometry
+         -> several region-level coarse SE(3) modes
+
+Stage C  render selected canonical feature atlases at every coarse mode
+         -> multi-scale local displacement distributions
+         -> robust joint SE(3) updates, retaining multiple flow modes
+
+Stage D  maplet-disjoint evidence
+         -> accept, reject, or retain several pose modes
 ```
 
-RADIO-final context conditions the stride-4 phase features with FiLM and
-spatial residual fusion. Stride-8 and stride-16 use independent downsampling
-residual trunks and descriptor heads rather than average-pooling stride-4.
-Query-location matchability is supervised independently from pairwise null.
-Pairwise null is a class in the complete map/query correlation distribution;
-it is not predicted by a query-only head. Displacement covariance comes from
-that distribution and map uncertainty comes from atlas feature dispersion.
-The unused legacy query-only null and variance heads have been removed.
-Training uses coupled translation
-and rotation perturbations up to 30 cm and 2 degrees and differentiates through
-the analytic joint-6DoF normal equations for the one-step pose objective.
-Episodes are selected by actual correlation-grid flow, not metric translation
-alone. Validation is a fixed, trajectory-disjoint, scale-stratified set and
-reports NLL, EPE, correct-mode recall, direction cosine and in-window rate.
-With a frozen atlas, the default episode path invokes the production atlas
-renderer (including selected-maplet z-buffer/coverage), applies the same candidate-offset
-correlation and K-mode marginalisation, then differentiates through the
-analytic one-step SE(3) objective. The old point-pair episode is an explicit
-diagnostic opt-out only.
-Wrong texels use a 20/30/50 mixture of random, same-maplet neighbouring and
-appearance-nearest cross-maplet negatives. Query-unmatchable regions are
-sampled separately and do not conflate pairwise null with query matchability.
+RADIO regions are area/context observations. Their centers are not keypoints
+and must not be interpreted as exact 2D measurements of surface cells.
+Consequently, regional-center PnP is a diagnostic decomposition only. It is
+not the coarse estimator and never becomes the final estimator.
 
-## Correlation and geometry
+The target runtime map contains 2DGS geometry and bounded anonymous feature
+sufficient statistics. It contains no mapping RGB, mapping image paths or IDs,
+per-view descriptor list, SfM point/track, stable-anchor identity, ALIKE
+descriptor map, RADIO-intermediate feature, or pairwise image matcher input.
+A maplet may retain a small anonymous appearance mixture; this is not a bundle
+of reference-image descriptors.
 
-Selected atlases are triangle-rasterized with perspective-correct feature,
-XYZ and uncertainty interpolation. Conservative subpixel coverage prevents a
-small surface chart from disappearing on coarser grids. Complete local
-correlation probabilities are retained; mean and covariance are derived only
-after normalization with the null outcome. Query matchability is unfolded at
-every candidate offset. For K-mode atlases, correlation marginalises
-`p(mode|view) * p(query candidate|mode)`; it never hard-selects an appearance
-mode before observing the query. Atlas uncertainty increases correlation
-temperature and null prior.
+## P0 probability and representation contract
 
-The solver uses the calibrated radial-camera projection Jacobian, covariance
-weighting, robust IRLS and LM damping. Evidence is normalised within each
-maplet before the joint system is formed, so projected area does not let one
-large repetitive facade dominate. Fit and held-out maplets are split by
-stable maplet identity rather than by view index.
+The identity and spatial posteriors are different random variables.
 
-The solver does not assume that a raster cell's integer index is the exact
-projection of its perspective-interpolated XYZ. It converts
-`raster center + correlation displacement` to original-image coordinates and
-subtracts the XYZ's actual subpixel projection before applying the Jacobian.
-This term is mandatory for conservative subpixel triangles and coarse grids.
+```text
+p(identity m | query region)
 
-## Retrieval and coarse proposal
+p(surface mode k | identity m, query region, spatial atlas available)
+```
 
-Retrieval scores every maplet mixture with its component weights. Probability
-outside retained candidates is transferred exactly to unknown/null.
-`QueryMapletGroup` preserves region position, extent, candidate identities,
-probabilities and query-conditioned real surface-location modes. Appearance
-modes at the same 3D cell are probability-aggregated, spatially distinct modes
-are retained, and no posterior-average virtual 3D point is sent to PnP. Coarse
-grouped PnP samples these real surface modes and is used only to enter the
-local basin; it is never the final estimator. Legacy banks without spatial
-geometry may still fall back to a maplet centre, but that is not the active
-map contract.
+The identity bank is always the full bank. A maplet absent from the spatial
+atlas remains an identity candidate with:
 
-## Contract, diagnostic and promotion gates
+```text
+spatial_available = false
+p(spatial null | m, q) = 1
+```
 
-Contract gates are strict: coordinate conventions, fixed canonical XYZ,
-primitive contributor identity, probability conservation, trajectory
-isolation, forbidden-path checks and map/query encoder lineage.
+Every available identity candidate has its own conditional spatial null:
 
-Scientific diagnostics continue when a metric is below target. They include
-flow EPE, correct-mode recall, direction/parallel/orthogonal flow
-decomposition, null prevalence/AUPRC, support-view gap and basin curves.
-Production promotion and the 530-query claim remain gated:
+```text
+sum_k p(surface mode k | m,q) + p(spatial null | m,q) = 1
+```
 
-- G0: exact contributor IDs, canonical reprojection RMS below 0.5 px,
-  sufficient atlas coverage and consistent coordinates.
-- G1: oracle-maplet flow EPE, correct-mode recall, null AUPRC and one-step pose
-  improvement.
-- G2: at least 90%, 80% and 60% of 5 cm, 20 cm and 30 cm starts respectively
-  reach 4 cm / 1 degree.
-- G3: retrieved maplet groups place at least 60% of queries inside the
-  20–30 cm basin.
-- G4: end-to-end evaluation is run only after G0–G3 pass.
+Mass removed by spatial NMS or mode truncation is transferred to that spatial
+null. Retained modes are not renormalized. A representative geometry value is
+a real MAP cell; a posterior mean of distinct 3D cells is forbidden.
+Scene-level Top-K removal is transferred to identity null.
 
-Encoder validation is trajectory-disjoint. A failed scientific target is
-reported but does not prevent the next targeted oracle/ablation; it only
-prevents production replacement and the full-query accuracy claim.
+Identity-null and conditional-spatial-null probabilities come from a frozen,
+trajectory-disjoint artifact fitted with unweighted Bernoulli NLL. Class
+balanced classifier scores are not probabilities and are rejected by the
+artifact loader. Conditional-spatial labels contain only true identities with
+an available atlas; wrong identities are not relabelled as spatial nulls.
 
-## StMaryChurch P0/P1 diagnostic (2026-07-27)
+The compact identity map now retains canonical tangent frames as geometry.
+This is required for an oriented projected-area model. Inferring a chart frame
+from only a normal is explicitly non-canonical and is rejected by footprint
+localization. Pose-vote artifacts hash both descriptor components and retrieval
+geometry.
 
-Using the fixed 32x32 canonical atlas, the existing trajectory-disjoint
-encoder, 12 seq2/seq4 mapping views and four held-out seq11 views:
+## Stage B implementations and status
 
-- K=4 baking accepted 109,934 texel observations and produced 17,805 valid
-  texels; no mapping RGB/path or per-view descriptor list is stored.
-- The new per-maplet audit is much more revealing than global texel coverage:
-  only 71/848 geometry-bearing maplets receive any baked feature (777 are
-  empty). Median coverage among those 71 is 19.0%, while the median over all
-  maplets is zero. Even among the 71 baked maplets, view-direction dispersion
-  is small (median about 0.0027, p90 about 0.0066), so these 12 neighbouring
-  views do not provide a genuine wide-baseline appearance-mode experiment.
-- The previous unconditional-mean replay and query-conditioned K=4 replay
-  both failed the 5 cm production gate (0/4 below 4 cm/1 degree).
-- Mean coarse EPE/mode recall over the four cases were approximately
-  2.06 cells/45.5%; K=4 marginalisation gave 2.01 cells/44.0%.
-- Median final translation remained 5.0 cm. One case accepted a useful update
-  (to 4.27 cm), while three held-out checks correctly rejected harmful steps.
-- A real-data inference-matched smoke replay completed on 66 seq2/seq4 pairs
-  and six trajectory-disjoint seq11 pairs. It also exposed that the older
-  seq1/seq2 training cache has zero renderable-maplet overlap with this local
-  12-view atlas; such pairs are no longer silently admitted as validation.
+Three coarse methods are present:
 
-Therefore K-mode representation is supported and removes the premature
-single-mean assumption, but this particular 12-view bake cannot test the full
-hypothesis: it lacks both surface coverage and view-angle diversity. The next
-required experiment is trajectory/view set-cover baking across the scene,
-followed by inference-matched fine-tuning. The remaining blockers are atlas
-coverage/view support, the atlas-render/query-correlation training
-distribution and weak null/flow calibration—not the analytic geometry solver.
-These are scientific diagnostics, not a production-accuracy claim.
+1. `anonymous_view_mode`: an image-free maplet/component pose mixture,
+   conditioned on query-region position. The query/source bearing difference
+   rotates each vote before symmetric SE(3) clustering. Repeated overlapping
+   RADIO regions use max aggregation.
+2. `maplet_footprint`: projected canonical maplet quads are dilated by the
+   RADIO support footprint. Candidate identities are marginalized against an
+   explicit unit-likelihood unmatched event, and CEM refines coarse modes.
+3. `regional_center_pseudo_pnp`: a named diagnostic baseline. It treats a
+   region center as a pseudo point, uses deterministic OpenCV RNG, and cannot
+   be reported as production localization.
 
-## Implementation audit after the strict-test correction (2026-07-27)
+The footprint foreground term is an image-background density ratio. The older
+unnormalized expression was bounded by one, so a match could never beat the
+unmatched branch; that implementation was invalid. The older spherical
+maplet approximation was also invalid because canonical chart axes and
+extents were discarded. The current model projects an oriented canonical
+quad and uses its dilated area.
 
-The earlier `seq11` checks were validation diagnostics, not Cambridge's
-official held-out test. The strict test protocol is now `dataset_test.txt`
-(`seq3`, `seq5`, `seq13`, 530 queries); `seq11` remains encoder validation.
-No 530-query production claim is made until the layered gates pass.
+Neither region-level method is production-qualified yet. In particular,
+stored anonymous view modes are not a substitute for cross-trajectory pose
+extrapolation.
 
-Implemented and active:
+## Stage C/D contract and current blocker
 
-- clean 2DGS source-index lineage across canonical geometry, contributors and
-  baked feature maps;
-- exact contributor-ID atlas baking, fixed canonical XYZ and no KD-tree
-  production fallback;
-- RADIO-final-only region retrieval with exact omitted mass and no LoFTR,
-  mapping RGB, SfM, RADIO-intermediate or ALIKE descriptor dependency;
-- K=1/2/4 anonymous per-texel appearance sufficient statistics;
-- exact canonical RADIO-final spatial retrieval texture, replacing the old
-  whole-maplet-centre observation model;
-- real query-conditioned surface-location modes for coarse pose, with
-  component preservation and no virtual posterior-average point;
-- per-offset query matchability, structured wrong-mode negatives, query-only
-  unmatchable samples, independent pyramid heads and frozen-atlas
-  render/correlate training;
-- deterministic trajectory-disjoint validation with scale-level EPE,
-  direction, mode, one-step and null calibration metrics;
-- maplet-balanced multi-hypothesis SE(3), held-out null-mass correction and
-  exact subpixel projection correction.
+Canonical atlases use fixed clean-2DGS geometry and raster contributor IDs.
+Mapping observations update only anonymous feature sufficient statistics,
+support and uncertainty; they never move canonical XYZ. Rendering uses
+perspective-correct area interpolation and selected-maplet z-buffering. The
+analytic solver uses the radial-camera Jacobian, robust covariance weighting,
+per-maplet balancing, and maplet-disjoint verification.
 
-Not yet implemented or not yet production-qualified:
+The current correlation null remains:
 
-- adaptive 16/32/64 atlas resolution (the current fixed-32 physical texel
-  p90 is about 4.81 cm);
-- automatic splitting of multilayer, disconnected or strongly non-planar
-  maplets into separate charts;
-- complete-scene clean-2DGS occlusion at every runtime proposal (the renderer
-  currently z-buffers selected maplets; exact full-scene visibility is used
-  only as a training/evaluation label);
-- 2–3-step unrolled training and per-null-type calibration;
-- a successful hierarchical/context/set retrieval model; tested anonymous
-  pose voting and global spatial priors did not pass the coarse-basin gate;
-- production promotion on all 530 strict-test queries.
+```text
+fixed pair-null logit + atlas-uncertainty term
+```
 
-These omissions are intentionally reported as open work. Several historical
-recommendations are mutually exclusive: the stable-anchor/ALIKE-descriptor
-branch has been superseded by the anchor-free surface-atlas correlation
-branch, rather than being simultaneously retained in the active graph.
+and still uses a random-unit-vector partition approximation. It is not the
+required typed calibration over correlation peak, top-2 margin, entropy,
+periodicity, spread, identity probability, visibility, occlusion and
+matchability. Therefore Stage C/D is not runtime-qualified. The missing typed
+outcomes are at least:
 
-## Cross-round audit and clean-2DGS result (2026-07-27)
+```text
+wrong identity
+spatial unavailable
+out of search window
+occluded
+query unmatchable
+valid flow / zero flow
+```
 
-The answer to “were all earlier recommendations implemented?” is **no**.
-The active graph now implements the recommendations that are compatible with
-the anchor-free surface-atlas design, explicitly rejects failed or superseded
-branches, and keeps the remaining items below as open work. Earlier reports
-that only compared nearby hyperparameters were insufficient evidence.
+The runtime path also does not yet close two or three render/correlate/update/
+verify iterations. A one-step oracle experiment is a component diagnostic,
+not end-to-end localization.
 
-### Validation-chain defects found in this audit
+## StMaryChurch artifacts used by the corrected audit
 
-The following were implementation or protocol defects, not tunable choices:
+The corrected map lineage uses the clean 2DGS geometry and these generated
+artifacts:
 
-- `seq11` had previously been described as held-out test data. It is now used
-  only for trajectory-disjoint model selection; official strict test images
-  come from `dataset_test.txt` (`seq3`, `seq5`, `seq13`).
-- Exact visibility labels had leaked query ground-truth depth into an
-  evaluator path. Ground truth is now restricted to labels and post-hoc error
-  measurement; deployable hypotheses see query RGB/RADIO-final features,
-  camera calibration and the feature map only.
-- Query-unmatchable null mass was counted twice in one held-out aggregation.
-- The old query matchability label was derived from pair agreement instead of
-  clean-2DGS surface support.
-- Spatial components were selected before identity retrieval in one path,
-  turning a full-scene search into an invalid location-conditioned search.
-  Identity retrieval now precedes query-conditioned spatial decoding.
-- Descriptor-component deduplication used a component's local rank. After
-  sorting and NMS, equal local ranks can refer to different physical points.
-  Deduplication now uses stable maplet identity plus rounded physical XYZ.
-- `maximum_maplets` was once only reported while the proposal path still
-  consumed a different fixed candidate budget. The budget now controls the
-  candidates actually passed downstream and is recorded in every report.
-- Validation paired view and scale indices, suppressing part of the intended
-  cross-view/cross-scale distribution. They are sampled independently now.
-- Coarse PnP required six sampled groups although calibrated PnP needs four,
-  sampled groups almost uniformly, prohibited two distinct cells from the
-  same maplet, and lacked a geometric-rank check. These defects made the
-  success probability unnecessarily small. The active deterministic solver
-  uses regional posterior guidance and physical-cell identity; the optional
-  stochastic ablation uses four-point minimal samples.
-- EM refinement unconditionally replaced the initial pose. A monotonic
-  likelihood rollback was added, but `seq11` still showed lower true pose
-  accuracy even when the internal likelihood improved. EM is therefore
-  disabled by default; it remains an explicit diagnostic only.
+- full identity map: `identity_maplets_full864_mapper_k4_frames_v2.npz`
+  (864 maplets, 3,226 anonymous appearance components);
+- separate spatial map: 783/864 identities have at least one spatial atlas
+  component;
+- pose statistics:
+  `anonymous_pose_votes_full_identity_region_conditioned_k4_frames_v5.npz`;
+- probability calibration:
+  `probability_calibration_seq11_full_identity_frames_conditional_proper_v6.json`.
 
-All new strict-test diagnostics use the same calibrated PnP implementation.
-This matters because it separates observation quality from solver quality:
-using exact visible clean-2DGS surface observations solves all 12 audit
-queries, with 6.78 cm / 0.256 degree median error. Replacing those locations
-with true maplet centres solves 0/12 within 30 cm / 3 degrees and gives
-1.271 m / 2.963 degrees median error. Maplet centres are consequently not a
-valid observation model.
+The frozen audit lineage is:
 
-### Representation learning that is more than a parameter sweep
+| Artifact | SHA-256 |
+| --- | --- |
+| `/root/StMaryChurch2dgs_clean.ply` | `4127e187090baa3ab1f21cdba7e3b0de8b51c0e177d29a425120964f18c506af` |
+| canonical atlas geometry | `43cbc9c0effb2932baa449ab72b45e185ef6241b989b54321f3de13b39b92c48` |
+| full identity map | `be3b0617a9ffc0521f544e631fced3a13ae9ae4c73a3eee41f6b24bd9030eceb` |
+| separate spatial map | `fbe0f54ce14b1442097b971df963daf6cefcc4db133c642932489d613848811f` |
+| anonymous pose statistics | `e112f3f94bc411052a2be118d61f88befafdee5ef13a94d6c7940d4d8ead5780` |
+| probability calibration | `319626aef6b65997e61a5e50c8148d84ded7c09beccd55cb5af25d3f188bcd6c` |
+| corrected strict-12 dashboard (`dashboard_bearing_corrected_view_vote_strict12_v13.json`) | `8d53f233e65f548f1b091cedc9a844969383ae9e5d218696684cb95c164be177` |
 
-The raw RADIO-final descriptor is useful for identity retrieval but is not
-spatially precise enough inside a surface chart. A small origin-preserving
-linear projection is now trained using clean-2DGS cell identity. Its second
-version replays the deployed K-mode atlas: each query surface cell is matched
-against anonymous observations of that cell from at least two distinct
-reference trajectories, appearance modes are marginalized, and negatives are
-different physical cells balanced within maplets. Mapping images, image IDs
-and per-view descriptor lists are discarded after sufficient statistics are
-baked.
+The calibration trajectory is `seq11`; the fixed strict audit trajectories are
+`seq3`, `seq5`, and `seq13`. They are disjoint. The calibration artifact has:
 
-On fixed `seq11` validation episodes, the atlas-matched projection changes:
+| Posterior | Examples | Null prevalence | AUPRC | Brier | ECE |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| identity null | 768 | 42.19% | 61.11% | 0.2283 | 0.0667 |
+| spatial null, conditional on true identity + atlas | 608 | 12.34% | 18.50% | 0.1072 | 0.0130 |
 
-| Metric | Raw RADIO-final | Spatial projection V2 |
+The conditional spatial probability is calibrated in prevalence but has weak
+ranking power. The near-perfect AUPRC obtained by mixing wrong identities into
+spatial-null labels was a metric-definition bug and is invalid.
+
+Pose-vote artifacts now record every mapping trajectory. By default the
+evaluator rejects any query trajectory that overlaps either probability
+calibration or pose-vote map construction. The
+`--allow_reference_trajectory_diagnostic` escape hatch is diagnostic-only:
+such a run is reference replay, not independent localization evidence. In
+particular, the earlier `seq11` result produced from an all-training pose bank
+cannot support a generalization claim.
+
+The 128-view bake covers 787 of 848 geometry-bearing maplets, but only 47.38%
+of valid canonical texels. Median coverage among baked maplets is 51.97%;
+physical texel size has a 4.81 cm P90. Adaptive 16/32/64 charts, automatic
+split of disconnected/non-planar maplets, and full-scene runtime occlusion
+remain open.
+
+## Corrected fixed strict audit
+
+The promotion audit contains 12 deterministic queries sampled from the
+official test trajectories. It is not the 530-query result.
+
+After full identity/spatial decoupling, proper null calibration, region
+conditioning, symmetric pose kernels, canonical-frame geometry and bearing
+correction:
+
+| Metric | Result |
+| --- | ---: |
+| identity probability conservation max error | about `1.2e-7` |
+| conditional spatial conservation max error | about `6.9e-7` |
+| dominant identity recall @1 / @5 / @64 | 29.92% / 62.04% / 71.06% |
+| visible surface coverage | 67.91% |
+| true-identity conditional spatial-null AUPRC | 24.50% |
+| anonymous region-mode Top-1 within 30 cm / 3 deg | 0/12 |
+| anonymous region-mode oracle Top-16 within 30 cm / 3 deg | 0/12 |
+| Top-1 translation median / P90 | 2.96 m / 8.52 m |
+| Top-1 rotation median / P90 | 7.77 deg / 29.16 deg |
+
+This is a failed coarse-pose gate, not a production result. The bearing update
+is a small improvement over fixed-pose voting, but it does not solve
+cross-trajectory extrapolation.
+
+The oracle decomposition was also corrected. An older evaluator accidentally
+read “true-maplet spatial components” from the identity bank, whose component
+geometry collapses to the maplet center. It now reads them from the separate
+spatial bank:
+
+| Region-center diagnostic | Median translation / rotation | Within 30 cm / 3 deg |
 | --- | ---: | ---: |
-| within-maplet cell recall | 18.63% | 21.32% |
-| global cell recall | 12.17% | 14.95% |
-| median surface error | 18.06 cm | 15.91 cm |
-| surface error below 30 cm | 65.65% | 68.48% |
+| nearest exact visible surface | 13.57 cm / 0.33 deg | 10/12 |
+| true identity + oracle spatial component | 11.87 cm / 0.48 deg | 11/12 |
+| retrieved true identity + oracle spatial component | 27.25 cm / 0.93 deg | 6/12 |
+| true identity + descriptor-MAP spatial component | 58.18 cm / 2.01 deg | 2/12 |
+| true maplet center | 1.25 m / 3.07 deg | 0/12 |
 
-This is a structural, geometry-supervised change rather than temperature or
-Top-K tuning. Its strict-test benefit is real but modest, so it is not
-presented as a solved localization system.
+This corrected split is decisive: clean geometry is not the dominant failure.
+Identity/component selection and the region-level pose proposal lose most of
+the basin coverage. Even the two oracle rows remain region-center PnP
+diagnostics and do not establish the final 4 cm observation model.
 
-### Layered strict-test audit on 12 deterministic queries
+Ground-truth pose is also scored strictly after hypothesis generation as a
+diagnostic only. With the oriented quad footprint, GT has higher likelihood
+than every generated proposal on 10/12 queries. This shows that proposal
+coverage/search is the dominant failure on most queries. On 2/12, a
+repetitive wrong structure still has higher footprint likelihood, so merely
+widening CEM cannot be promoted safely.
 
-The 12-query set is only a fixed promotion audit, not the final 530-query
-accuracy result. The following rows use the clean
-`StMaryChurch2dgs_clean.ply` lineage and stable physical-point deduplication.
+A fixed two-query CEM check confirmed that warning: it remained 0/2 inside
+30 cm / 3 degrees (Top-1 median 4.29 m / 14.06 degrees), and its optimized
+false modes outscored GT footprint likelihood on both queries. The footprint
+optimizer is therefore retained as an experimental diagnostic, not selected
+as the default coarse method.
 
-| Observation/proposal path | within 30 cm / 3 degrees | median translation | median rotation |
-| --- | ---: | ---: | ---: |
-| exact visible clean-2DGS surface + PnP | 12/12 | 6.78 cm | 0.256 deg |
-| retrieved maplets + oracle surface cell, Top-64 | 12/12 | 10.14 cm | 0.330 deg |
-| projected descriptor MAP cell, Top-64 | 6/12 | 31.36 cm | 1.103 deg |
-| deployable regional MAP RANSAC, Top-1 | 3/12 | 51.93 cm | 1.980 deg |
-| deployable regional MAP RANSAC, oracle Top-5 | 6/12 | -- | -- |
+The exact-surface and surface-component PnP rows in the dashboard are
+observation-model diagnostics. They use RADIO region centers and therefore do
+not establish final metric accuracy. Earlier tables that described regional
+MAP-PnP as deployable are historical and invalid under the corrected method
+definition.
 
-Top-24 was an architectural bottleneck rather than a harmless efficiency
-setting. Widening identity recall to Top-64 changes mean visible-maplet recall
-from 35.40% to 67.84%, visible-surface coverage from 44.35% to 75.67%, and
-retrieved-maplet oracle-surface PnP from 9/12 to 12/12. Descriptor MAP
-localization moves only from 5/12 to 6/12, proving that the remaining dominant
-error is the map-feature-to-surface posterior, not geometry or candidate
-coverage.
+## Promotion policy
 
-The deployable deterministic regional solver reaches 4/6 Top-1 and 6/6
-oracle Top-5 on `seq11`, but only 3/12 Top-1 and 6/12 oracle Top-5 on strict
-queries. This validation-to-test gap is why no 530-query production claim is
-made. The previous random Top-24 proposal path was far worse (0/12 Top-1,
-7.98 m / 22.31 degrees median); the new result is a genuine chain repair, but
-still fails G3 and is not a satisfactory final accuracy level.
+The 530-query run is not permitted while the following remain false:
 
-### Disposition of the accumulated recommendations
+- G0: sufficient adaptive atlas coverage, chart quality and full-scene
+  visibility;
+- G1: trajectory-disjoint typed-null correlation and reliable flow direction;
+- G2: two or three verified fine iterations improve fixed 5/20/30 cm starts;
+- G3: actual retrieval and region-level proposal put enough strict queries
+  inside the 20–30 cm / 3 degree basin;
+- G4: only then run and report all 530 end-to-end queries.
 
-Implemented and retained:
+Scientific diagnostics continue below a gate, but a failed component cannot be
+renamed production or used to claim final accuracy.
 
-- clean 2DGS lineage, exact surface texels, K-mode anonymous atlas statistics;
-- identity-first wide recall, query-conditioned spatial posterior and
-  probability conservation;
-- RADIO-final-only matching, ALIKE detection only where an optional sampling
-  policy needs it, and no ALIKE descriptor map;
-- region-aware multi-hypothesis PnP with stable physical correspondences;
-- trajectory-disjoint model selection, layered geometry/retrieval/spatial/
-  proposal oracles, and explicit production gates.
+## Active implementation
 
-Implemented but rejected by validation:
-
-- a monolithic learned metric encoder (training loss fell while
-  trajectory-disjoint spatial validation degraded);
-- global RADIO pose priors and anonymous pose voting;
-- multi-prefix consensus aggregation;
-- likelihood-only EM pose refinement.
-
-Superseded and absent from the production graph:
-
-- SfM tracks, stable-anchor descriptor bundles, maplet-centre PnP,
-  LoFTR/pairwise image matching, stored mapping RGB, RADIO-intermediate
-  features and ALIKE/RADIO concatenated descriptors.
-
-Still open:
-
-- adaptive atlas resolution and automatic maplet chart splitting;
-- full-scene occlusion for every runtime proposal;
-- a better calibrated continuous surface posterior, especially across the
-  `seq11` to strict-test appearance/domain gap;
-- per-null-type calibration and 2–3-step unrolled local alignment;
-- a production-qualified final estimator and the gated 530-query evaluation.
-
-The next rational research target is therefore not another Top-K/temperature
-sweep. It is to improve the continuous RADIO-final surface posterior under
-strict trajectory shift, while keeping the exact-geometry and identity-first
-contracts fixed. Until its fixed strict audit exceeds the G3 basin-entry gate,
-running all 530 queries would produce a precise measurement of an unqualified
-system rather than a valid production result.
+- `feature_extract/tools/vfm/build_surface_retrieval_maplet_bank.py`
+- `feature_extract/tools/vfm/calibrate_v6_retrieval_probabilities.py`
+- `feature_extract/tools/vfm/build_v6_anonymous_pose_vote_bank.py`
+- `feature_extract/tools/vfm/evaluate_v6_retrieval_pose_basin.py`
+- `feature_extract/vfm/localization_v6/maplet_retrieval.py`
+- `feature_extract/vfm/localization_v6/maplet_pose_voting.py`
+- `feature_extract/vfm/localization_v6/maplet_footprint_pose.py`
+- `feature_extract/vfm/localization_v6/maplet_pose_proposal.py`
+- `feature_extract/vfm/localization_v6/probability_calibration.py`
+- `feature_extract/vfm/localization_v6/atlas_renderer.py`
+- `feature_extract/vfm/localization_v6/local_correlation.py`
+- `feature_extract/vfm/localization_v6/se3_update.py`

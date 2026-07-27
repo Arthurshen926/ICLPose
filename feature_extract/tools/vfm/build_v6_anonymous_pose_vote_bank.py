@@ -20,6 +20,7 @@ from feature_extract.vfm.localization_v6.maplet_pose_voting import (
     _rotation_angle_deg,
     _weighted_rotation_mean,
     retrieval_descriptor_sha256,
+    retrieval_geometry_sha256,
 )
 from feature_extract.vfm.surface_maplet_bank import VfmSurfaceMapletBank
 
@@ -41,11 +42,23 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def _pose_clusters(
     centers: np.ndarray,
     rotations: np.ndarray,
+    region_xy: np.ndarray,
     weights: np.ndarray,
     maximum_modes: int,
     translation_scale_m: float,
     rotation_scale_deg: float,
-) -> list[tuple[np.ndarray, np.ndarray, float, float, float]]:
+) -> list[
+    tuple[
+        np.ndarray,
+        np.ndarray,
+        float,
+        float,
+        float,
+        np.ndarray,
+        np.ndarray,
+        int,
+    ]
+]:
     count = int(centers.shape[0])
     cluster_count = min(max(int(maximum_modes), 1), count)
     translation_distance = np.linalg.norm(
@@ -112,6 +125,16 @@ def _pose_clusters(
                 ** 2
             )
         )
+        region_mean = np.sum(
+            region_xy[local] * local_weights[:, None], axis=0
+        )
+        region_residual = region_xy[local] - region_mean[None]
+        region_covariance = np.einsum(
+            "n,ni,nj->ij",
+            local_weights,
+            region_residual,
+            region_residual,
+        )
         output.append(
             (
                 center_modes[mode],
@@ -119,6 +142,9 @@ def _pose_clusters(
                 float(np.sum(weights[local]) / total),
                 float(translation_sigma),
                 float(rotation_sigma),
+                region_mean,
+                region_covariance,
+                int(np.sum(local)),
             )
         )
     return output
@@ -134,15 +160,30 @@ def main(argv: Sequence[str] | None = None) -> None:
     retrieval = SurfaceRetrievalMapletBank.load_npz(
         Path(args.retrieval_maplets)
     )
-    if (
-        not np.array_equal(source.maplet_ids, retrieval.maplet_ids)
-        or not np.allclose(source.centers, retrieval.centers, atol=1e-5)
+    source_row_by_id = {
+        int(value): int(row)
+        for row, value in enumerate(source.maplet_ids.tolist())
+    }
+    source_rows = np.asarray(
+        [
+            source_row_by_id.get(int(value), -1)
+            for value in retrieval.maplet_ids.tolist()
+        ],
+        dtype=np.int64,
+    )
+    if np.any(source_rows < 0):
+        raise ValueError("retrieval maplet is absent from construction bank")
+    if not np.allclose(
+        source.centers[source_rows], retrieval.centers, atol=1e-5
     ):
         raise ValueError("construction/retrieval maplet geometry differs")
+    pose_records = parse_cambridge_pose_file(Path(args.mapping_pose_file))
     pose_by_image = {
-        record.image_id: record.pose_w2c
-        for record in parse_cambridge_pose_file(Path(args.mapping_pose_file))
+        record.image_id: record.pose_w2c for record in pose_records
     }
+    mapping_trajectory_ids = sorted(
+        {record.image_id.split("/", 1)[0] for record in pose_records}
+    )
     component_ids = np.repeat(
         retrieval.maplet_ids, np.diff(retrieval.descriptor_offsets)
     )
@@ -152,11 +193,14 @@ def main(argv: Sequence[str] | None = None) -> None:
     output_weights = []
     output_translation_sigma = []
     output_rotation_sigma = []
+    output_region_mean = []
+    output_region_covariance = []
+    output_region_support = []
     missing_observations = 0
-    for maplet_row in range(len(source)):
+    for maplet_row, source_row in enumerate(source_rows.tolist()):
         view_begin, view_end = (
-            int(source.view_offsets[maplet_row]),
-            int(source.view_offsets[maplet_row + 1]),
+            int(source.view_offsets[source_row]),
+            int(source.view_offsets[source_row + 1]),
         )
         descriptor_begin, descriptor_end = (
             int(retrieval.descriptor_offsets[maplet_row]),
@@ -173,8 +217,21 @@ def main(argv: Sequence[str] | None = None) -> None:
             ],
             dtype=bool,
         )
+        view_grid_sizes = np.asarray(
+            source.view_grid_sizes[view_begin:view_end], dtype=np.float64
+        )
+        view_token_xy = np.asarray(
+            source.view_token_xy[view_begin:view_end], dtype=np.float64
+        )
+        valid &= (
+            np.all(view_grid_sizes > 0.0, axis=1)
+            & np.isfinite(view_token_xy).all(axis=1)
+        )
         descriptors = descriptors[valid]
         quality = quality[valid]
+        normalized_region_xy = (
+            view_token_xy[valid] + 0.5
+        ) / view_grid_sizes[valid]
         image_ids = [
             image_id
             for image_id, keep in zip(
@@ -215,17 +272,30 @@ def main(argv: Sequence[str] | None = None) -> None:
             modes = _pose_clusters(
                 centers[members],
                 rotations[members],
+                normalized_region_xy[members],
                 quality[members].copy(),
                 int(args.maximum_pose_modes),
                 float(args.translation_scale_m),
                 float(args.rotation_scale_deg),
             )
-            for center, rotation, weight, t_sigma, r_sigma in modes:
+            for (
+                center,
+                rotation,
+                weight,
+                t_sigma,
+                r_sigma,
+                region_mean,
+                region_covariance,
+                region_support,
+            ) in modes:
                 output_centers.append(center)
                 output_rotations.append(rotation)
                 output_weights.append(weight)
                 output_translation_sigma.append(t_sigma)
                 output_rotation_sigma.append(r_sigma)
+                output_region_mean.append(region_mean)
+                output_region_covariance.append(region_covariance)
+                output_region_support.append(region_support)
             offsets.append(len(output_centers))
     bank = AnonymousMapletPoseVoteBank(
         component_maplet_ids=component_ids,
@@ -239,11 +309,26 @@ def main(argv: Sequence[str] | None = None) -> None:
         rotation_sigma_deg=np.asarray(
             output_rotation_sigma, dtype=np.float32
         ),
+        region_xy_mean=np.asarray(
+            output_region_mean, dtype=np.float32
+        ),
+        region_xy_covariance=np.asarray(
+            output_region_covariance, dtype=np.float32
+        ),
+        region_support_count=np.asarray(
+            output_region_support, dtype=np.int32
+        ),
         component_descriptor_sha256=retrieval_descriptor_sha256(retrieval),
+        retrieval_geometry_sha256=retrieval_geometry_sha256(retrieval),
         metadata={
             "artifact_type": "v6_anonymous_maplet_pose_vote_bank",
-            "representation": "maplet_component_pose_sufficient_statistics",
+            "representation": (
+                "maplet_component_pose_and_region_sufficient_statistics"
+            ),
             "maximum_pose_modes_per_component": int(args.maximum_pose_modes),
+            "region_coordinates": "normalized_image_xy",
+            "uses_query_region_geometry": True,
+            "mapping_trajectory_ids": mapping_trajectory_ids,
             "stores_mapping_rgb": False,
             "stores_mapping_image_ids": False,
             "stores_mapping_image_paths": False,
@@ -259,7 +344,14 @@ def main(argv: Sequence[str] | None = None) -> None:
         "stage": "build_v6_anonymous_maplet_pose_vote_bank",
         "component_count": int(component_ids.size),
         "pose_vote_count": int(bank.camera_centers.shape[0]),
+        "component_descriptor_sha256": str(
+            bank.component_descriptor_sha256
+        ),
+        "retrieval_geometry_sha256": str(
+            bank.retrieval_geometry_sha256
+        ),
         "maximum_pose_modes_per_component": int(args.maximum_pose_modes),
+        "mapping_trajectory_ids": mapping_trajectory_ids,
         "component_without_direct_assignment_count": int(
             missing_observations
         ),
@@ -270,6 +362,14 @@ def main(argv: Sequence[str] | None = None) -> None:
         "rotation_sigma_deg": {
             "median": float(np.median(bank.rotation_sigma_deg)),
             "p90": float(np.quantile(bank.rotation_sigma_deg, 0.9)),
+        },
+        "region_support_count": {
+            "median": float(np.median(bank.region_support_count)),
+            "p10": float(np.quantile(bank.region_support_count, 0.1)),
+            "p90": float(np.quantile(bank.region_support_count, 0.9)),
+            "single_observation_fraction": float(
+                np.mean(bank.region_support_count == 1)
+            ),
         },
         "production_contract": dict(bank.metadata or {}),
         "output_bank": str(output_path),
