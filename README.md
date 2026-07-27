@@ -1,54 +1,54 @@
 # ICLPose
 
-Real-image VFM localization against a feature-bearing 2DGS surface map, with
-RADIO-final maplet retrieval, ALIKE anchor assignment, and a geometry-safe PnP
-backend.
+Real-image VFM localization against a feature-bearing 2DGS surface map.
 
 ## Active Mainline
 
-The current mainline is **real-image, feature-map-only 2DGS localization**:
+The development mainline is **anchor-free 2DGS surface feature alignment**:
 
 ```text
 mapping RGB + calibrated poses + high-quality 2DGS --offline only-->
-  RADIO-final surface/maplet modes + multi-view ALIKE surface anchors
+  RADIO-final maplets
+  + one RADIO-final distribution per detector-repeatable clean 2DGS surface cell
 
 query RGB
-  -> RADIO-final query-aligned maplet posterior
-  -> ALIKE anchor identity, optionally augmented by RADIO-final sampled at
-     the identical query pixels
-  -> partial assignment with an explicit null state and strict confidence gate
-  -> independent 2DGS feature-map pose evidence
-  -> grouped AP3P/PnP + soft geometric EM
-  -> safe selection between complementary map-only candidate experts
+  -> RADIO-final maplet retrieval / coarse pose
+  -> render disconnected selected maplet feature patches
+  -> continuous SE(3) RADIO feature-field alignment
+  -> ALIKE detector response as a spatial weight only
 ```
 
 The deployed prior stores metric 2DGS geometry and feature statistics. It does
-not store or retrieve mapping RGB. The runtime does not use SfM points/tracks,
-RADIO intermediate features, LoFTR, or any pairwise query/reference image
-matching.
+not store or retrieve mapping RGB. It has no stable anchor identity, ALIKE
+descriptor, descriptor list, or mapping image path. The runtime does not use
+SfM points/tracks, RADIO intermediate features, LoFTR, pairwise
+query/reference image matching, or final point-correspondence PnP.
+The V4 query path evaluates only ALIKE's detector score channel; it does not
+materialize an ALIKE dense descriptor map.
 
 ## Current Status
 
-See [the 2DGS surface mainline](docs/vfm/2dgs_surface_localization_mainline.md)
-for the architecture, data contracts, prohibited path combinations, and
-StMaryChurch development-validation status. The
+See [the anchor-free V4 mainline](docs/vfm/2dgs_surface_feature_field_v4.md)
+for its architecture, contracts, construction, and mandatory local-basin gate.
+The [V3 anchor/PnP mainline](docs/vfm/2dgs_surface_localization_mainline.md) is
+frozen as a measured baseline, not extended with new modules. The
 [SfM landmark mainline](docs/vfm/landmark_localization_mainline.md) is retained
 only as a historical baseline.
 
 ## Active Code
 
-- `feature_extract/tools/vfm/build_feature_aligned_surface_anchors.py`
-- `feature_extract/tools/vfm/build_hybrid_feature_surface_map.py`
-- `feature_extract/tools/vfm/build_surface_anchor_deployment_replay.py`
-- `feature_extract/tools/vfm/augment_surface_replay_with_radio_final.py`
-- `feature_extract/tools/vfm/build_alike_radio_final_anchor_bank.py`
-- `feature_extract/tools/vfm/orient_surface_anchor_normals.py`
-- `feature_extract/tools/vfm/train_surface_anchor_set_matcher.py`
-- `feature_extract/tools/vfm/localize_2dgs_surface_queries.py`
-- `feature_extract/tools/vfm/cascade_surface_localization_results.py`
-- `feature_extract/tools/vfm/select_surface_pose_by_feature_map.py`
-- `feature_extract/vfm/localization/surface_anchor_set_matcher.py`
-- `feature_extract/vfm/localization/surface_localization.py`
+- `feature_extract/tools/vfm/build_detector_weighted_2dgs_surface_field.py`
+- `feature_extract/tools/vfm/build_surface_retrieval_maplet_bank.py`
+- `feature_extract/tools/vfm/train_surface_metric_feature_mapper.py`
+- `feature_extract/tools/vfm/apply_surface_metric_mapper_to_field.py`
+- `feature_extract/tools/vfm/evaluate_2dgs_surface_alignment_basin.py`
+- `feature_extract/tools/vfm/evaluate_surface_maplet_retrieval.py`
+- `feature_extract/tools/vfm/localize_2dgs_surface_feature_field.py`
+- `feature_extract/vfm/localization/surface_feature_field.py`
+- `feature_extract/vfm/localization/surface_retrieval_maplets.py`
+- `feature_extract/vfm/localization/alike_detector_only.py`
+- `feature_extract/vfm/localization/surface_metric_feature_mapper.py`
+- `feature_extract/vfm/localization/continuous_surface_alignment.py`
 
 ## Historical And Reference Lines
 
@@ -58,10 +58,10 @@ or ablation paths. They must not be mixed into production 2DGS surface results.
 
 ## Evaluation Discipline
 
-Every result must identify its 2DGS source, feature-map artifacts, camera
-calibration manifest, query manifest, maplet proposal budget, anchor assignment
-checkpoint, pose policy, and split role. Reused development data cannot produce
-an untouched-test or production-promotion claim.
+Every result must identify its 2DGS source, surface-field and mapper artifacts,
+camera calibration, query manifest, maplet budget, pose policy, and split role.
+A full localization run is not promoted when the oracle-maplet local-basin gate
+fails. Reused development data cannot produce an untouched-test claim.
 
 ## Verification
 
@@ -70,9 +70,8 @@ focused tests from this checkout:
 
 ```bash
 PYTHONPATH=. pytest -q \
-  tests/test_vfm_2dgs_surface_map.py \
-  tests/test_vfm_surface_anchor_set_matcher.py \
-  tests/test_cascade_surface_localization_results.py
+  tests/test_vfm_surface_feature_field.py \
+  tests/test_vfm_continuous_surface_alignment.py
 
 python -m compileall -q feature_extract/vfm feature_extract/tools/vfm feature_extract/extractors
 ```
