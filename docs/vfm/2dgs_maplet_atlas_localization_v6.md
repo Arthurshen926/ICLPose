@@ -56,9 +56,12 @@ Every available identity candidate has its own conditional spatial null:
 sum_k p(surface mode k | m,q) + p(spatial null | m,q) = 1
 ```
 
-Mass removed by spatial NMS or mode truncation is transferred to that spatial
-null. Retained modes are not renormalized. A representative geometry value is
-a real MAP cell; a posterior mean of distinct 3D cells is forbidden.
+Nearby spatial samples suppressed within the metric NMS radius describe one
+wider resolved mode: their probability, mean and covariance are merged by the
+law of total covariance. Only distinct modes removed by the top-M capacity
+limit are transferred to spatial null. Retained modes are not renormalized. A
+representative geometry value is a real MAP cell; a posterior mean of distinct
+3D cells is forbidden.
 Scene-level Top-K removal is transferred to identity null.
 
 Identity-null and conditional-spatial-null probabilities come from a frozen,
@@ -73,20 +76,57 @@ from only a normal is explicitly non-canonical and is rejected by footprint
 localization. Pose-vote artifacts hash both descriptor components and retrieval
 geometry.
 
-## Stage B implementations and status
+## Stage B implementation and status
 
-Three coarse methods are present:
+The active research bridge is `MapletFrameAlignment`:
 
-1. `anonymous_view_mode`: an image-free maplet/component pose mixture,
-   conditioned on query-region position. The query/source bearing difference
-   rotates each vote before symmetric SE(3) clustering. Repeated overlapping
-   RADIO regions use max aggregation.
-2. `maplet_footprint`: projected canonical maplet quads are dilated by the
-   RADIO support footprint. Candidate identities are marginalized against an
-   explicit unit-likelihood unmatched event, and CEM refines coarse modes.
-3. `regional_center_pseudo_pnp`: a named diagnostic baseline. It treats a
-   region center as a pseudo point, uses deterministic OpenCV RNG, and cannot
-   be reported as production localization.
+```text
+RADIO-final RetrievalRegions
+  -> overlap-aware Top-q / noisy-OR / block-balanced scene evidence
+  -> many-to-many RegionChartIndex
+  -> several independent MetricSurfaceCharts
+  -> per-chart full-query translation / scale / rotation / shear correlation
+  -> optional continuous local affine refinement
+  -> additive independent-chart evidence + canonical frame controls
+  -> IPPE or grouped regional pose modes
+```
+
+`RetrievalRegionBank` and `MetricSurfaceChartBank` are intentionally different
+entities. Retrieval regions may be larger, overlapping and context-rich;
+metric charts remain locally planar and continuous. `RegionChartIndex` is
+strict CSR in both directions and its artifact loader rejects unknown versions,
+non-canonical fields and any image/SfM/point-correspondence contract violation.
+The current StMaryChurch retrieval bank is still a legacy single-scale
+maplet proxy. Expanding its Region→Chart adjacency improves geometric support
+but does **not** create a learned context-rich superregion descriptor; this is
+now recorded explicitly by the index builder in newly generated metadata.
+
+Overlapping RADIO regions are correlated observations. The default scene
+ranking therefore uses spatial NMS followed by a capped Top-q sum. Legacy
+unbounded sum, noisy-OR after NMS and block-balanced aggregation remain
+reported side by side. Frame hypotheses use joint translation/affine NMS:
+nearby translations may retain a bounded number of genuinely different
+scale/rotation/shear modes instead of discarding them all as one center mode.
+Composite charts preserve bounded per-texel anonymous appearance mixtures,
+and local refinement marginalizes those modes with their priors. However,
+flattening disconnected/non-coplanar charts into one virtual plane is retained
+only as a diagnostic; the active bridge aligns the associated metric charts
+independently and combines their regional evidence in pose space.
+
+Cross-scale hypotheses are compared by mean regional correlation. The older
+`support**0.35` factor was methodologically invalid: it rewarded larger
+projected templates even when their mean match was worse. Independent chart
+evidence is additive rather than averaged. Averaging caused single-chart
+modes to swamp geometrically supported three/four-chart modes.
+
+Three older coarse methods remain diagnostic only:
+
+1. `anonymous_view_mode` reuses an anonymous mapping-camera pose distribution;
+   it is a historical-view seed baseline, not the V6 coarse definition.
+2. `maplet_footprint` is a pose scorer/refinement objective. It is not a
+   from-scratch proposal generator.
+3. `regional_center_pseudo_pnp` treats a region center as a pseudo point and
+   cannot be reported as production localization.
 
 The footprint foreground term is an image-background density ratio. The older
 unnormalized expression was bounded by one, so a match could never beat the
@@ -95,9 +135,10 @@ maplet approximation was also invalid because canonical chart axes and
 extents were discarded. The current model projects an oriented canonical
 quad and uses its dilated area.
 
-Neither region-level method is production-qualified yet. In particular,
-stored anonymous view modes are not a substitute for cross-trajectory pose
-extrapolation.
+None of the Stage-B runtime methods is production-qualified yet. In
+particular, stored anonymous view modes are not a substitute for
+cross-trajectory pose extrapolation, and a high footprint likelihood does not
+generate the missing global frame mode.
 
 ## Stage C/D contract and current blocker
 
@@ -247,6 +288,136 @@ not establish final metric accuracy. Earlier tables that described regional
 MAP-PnP as deployable are historical and invalid under the corrected method
 definition.
 
+## MapletFrameAlignment strict M1/M2/M3 audit
+
+The latest audit uses clean 2DGS geometry, map trajectories
+`seq1/2/4/6/7/8`, training trajectories `seq9/10/12/14`, calibration
+trajectory `seq11`, and the fixed test trajectories `seq3/5/13`. Test
+trajectories are disjoint from every map, training and calibration source.
+Ground truth selects/scores the correct chart only in the explicitly named
+oracle diagnostics and is never an input to frame-mode generation.
+
+This audit corrected seven implementation/metric errors that could previously
+hide the real bottleneck:
+
+- dominant-region and visible-region metrics now traverse the many-to-many
+  `RegionChartIndex`; chart IDs are never assumed to equal region IDs;
+- nearby spatial posterior modes merge probability and covariance, while only
+  distinct Top-M truncation contributes to null;
+- frame NMS is joint over translation and affine state, so different
+  scale/rotation/shear modes at one center are not accidentally deleted;
+- disconnected composite charts retain bounded per-texel appearance mixtures,
+  and refinement marginalizes those modes rather than collapsing them to one
+  mean descriptor;
+- cross-scale scores no longer include the invalid large-template support
+  reward;
+- grouped mode enumeration no longer duplicates every single-chart pose or
+  truncate the intended per-chart Top-5 modes before grouping;
+- evidence from independent charts is accumulated rather than averaged.
+
+The generated Region→Chart index has 864 retrieval regions, 734 metric charts
+and 2,582 edges. 468 regions contain multiple charts, while 573 charts can be
+recalled by multiple regions. Charts per region have P10/P50/P90 of
+0/2/8; physical chart texel size is 0.49/2.03/5.80 cm. This verifies the
+many-to-many geometric representation, but the retrieval descriptors are
+still the explicitly labelled single-scale proxy described above.
+
+Scene evidence improves recall without double-counting overlapping query
+regions:
+
+| Aggregation | Dominant region R@16 | Visible surface @16 | Dominant region R@64 |
+| --- | ---: | ---: | ---: |
+| legacy unbounded sum | 8/12 | 51.14% | 11/12 |
+| Top-q after NMS | 9/12 | 53.05% | 11/12 |
+| noisy-OR after NMS | 9/12 | 53.42% | 11/12 |
+| block balanced | 9/12 | 55.66% | 11/12 |
+
+M1 holds region identity correct and measures whether the map/query feature
+field recovers the chart's 2D frame. “Center” is only the projected chart
+center; “control” requires the scale/orientation-bearing frame controls and is
+the relevant gate:
+
+| Correct-identity feature source | Examples | Center R@16 (32 px) | Control R@16 (32 px) | Median best control error @16 |
+| --- | ---: | ---: | ---: | ---: |
+| old support-biased frozen mapper | 12 charts | 11/12 | 2/12 | 73.09 px |
+| corrected frozen mapper | 48 charts | 46/48 | 33/48 | 26.87 px |
+| corrected frozen mapper + local refinement | 48 charts | 44/48 | 33/48 | 25.99 px |
+| corrected fine metric student | 36 charts | 21/36 | 11/36 | 37.27 px |
+
+The score correction is a material result, not a small parameter movement:
+frozen-map chart-control R@16 rose from 16.67% to 68.75%. Its Top-5 center
+error is 10.35 px median, while full frame controls remain 26.87 px; scale and
+orientation are therefore now the dominant visual errors. The trained
+stride-4 student is worse despite its finer grid, confirming that its current
+pointwise global-location objective did not learn the required structured
+frame field. Disconnected composite refinement remains invalid as a main
+route.
+
+M2 bypasses visual frame prediction and feeds exact projected controls to the
+same frame-to-pose solver:
+
+| Frame model | 1 chart | 2 charts | 3 charts |
+| --- | ---: | ---: | ---: |
+| oriented similarity, within 30 cm / 3 deg | 2/12 | 7/12 | 12/12 |
+| affine, within 30 cm / 3 deg | 12/12 | 12/12 | 12/12 |
+| homography, within 30 cm / 3 deg | 12/12 | 12/12 | 12/12 |
+| oriented similarity median translation | 1.080 m | 0.161 m | 0.013 m |
+| affine median translation | 0.681 mm | 0.537 mm | 0.025 mm |
+
+Thus the clean geometry, chart controls and grouped pose solver are sufficient
+when the visual frame is correct. M3 replaces the oracle frame with predicted
+frames and keeps charts independent:
+
+| M3 source | Basin recall @1/@5/@16 | Bounded candidate oracle | Top-1 median translation / rotation |
+| --- | ---: | ---: | ---: |
+| correct identities, four independent charts | 0/12, 0/12, 1/12 | 3/12; 0.54 m / 2.59 deg median | 2.88 m / 11.48 deg |
+| actual Top-16 retrieval, up to six charts | 0/12, 0/12, 0/12 | 1/12; 1.40 m / 5.77 deg median | 10.91 m / 48.80 deg |
+
+The candidate oracle is scored with ground truth only after a bounded set of
+at most 1,024 frame-generated pose modes exists. The three correct-identity
+successes and the one actual-retrieval success come from a separately labelled
+multi-chart-center diagnostic. Those centers are projections estimated by
+whole-chart atlas correlation—not RADIO region centers, stable anchors or
+local point descriptors—but this diagnostic is not promoted as the final
+observation model.
+
+The new results show that valid signal now survives identity→frame→pose, but
+mode precision and ranking remain insufficient. Meter-level Top-1 errors are
+geometric amplification of wrong scale/orientation modes, not evidence that
+the 2DGS map itself is meter-inaccurate. The first-principles bottleneck is now
+localized to:
+
+```text
+context-rich retrieval-region identity
+  -> query-conditioned metric-chart appearance field
+  -> precise translation/scale/rotation/shear modes
+  -> calibrated multi-chart geometric ranking
+```
+
+An 80-step full-query hard-negative encoder experiment selected step 20, but
+trajectory-disjoint `seq11` radius-1 R@5 remained only 25.00% / 13.28% /
+6.38% at coarse/middle/fine. It plateaued and was not promoted.
+
+Key immutable results:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| corrected four-chart M1/M3 (`radio_mapper_four_chart_additive_evidence_m3_strict12_v23.json`) | `6f5415e5271f1f6fa680aaecb09d34cfb89c82073e12dd5ba5e5e9facd9bd6e5` |
+| actual-retrieval M3 (`radio_mapper_runtime_retrieval_additive_center_m3_strict12_v24.json`) | `301a887d5f7d6a444575b066c91f71b09a432edfa5ccce04713b96cc4f947703` |
+| corrected fine-student diagnostic (`frame_alignment_fine_scale_unbiased_independent_chart_strict12_v19.json`) | `84032fa22390c7ae8abaee657fddd042d4287354ccd611eba1876227ba9b74b4` |
+| Region→Chart index | `95875d5500244b0f93790143d60b5c4ab3d948809c0d08a84b42f735cc221208` |
+| hard-negative encoder | `46c2faf46c7eaff9e78d77346f7d98dbcd47d072fa27ccbbcbecf67d5880806a` |
+
+The next justified implementation is a genuinely context-trained
+RetrievalRegion representation plus structured joint map/query frame learning
+whose loss is defined on complete chart transforms—not independent texel
+classification—with rotation/scale/homography perturbations and
+repeated-facade hard negatives. Pose-mode confidence must then be calibrated
+on runtime retrieval replay.
+Typed correlation nulls, P3 proposal integration and Stage-C fine alignment
+remain downstream work; advancing them before M1 control recall passes would
+only optimize around a broken observation model.
+
 ## Promotion policy
 
 The 530-query run is not permitted while the following remain false:
@@ -266,9 +437,16 @@ renamed production or used to claim final accuracy.
 
 - `feature_extract/tools/vfm/build_surface_retrieval_maplet_bank.py`
 - `feature_extract/tools/vfm/calibrate_v6_retrieval_probabilities.py`
+- `feature_extract/tools/vfm/build_v6_region_chart_index.py`
+- `feature_extract/tools/vfm/bake_v6_retrieval_atlas.py`
 - `feature_extract/tools/vfm/build_v6_anonymous_pose_vote_bank.py`
 - `feature_extract/tools/vfm/evaluate_v6_retrieval_pose_basin.py`
+- `feature_extract/tools/vfm/evaluate_v6_maplet_frame_alignment.py`
+- `feature_extract/tools/vfm/evaluate_v6_radio_frame_source.py`
+- `feature_extract/tools/vfm/train_v6_global_frame_encoder.py`
 - `feature_extract/vfm/localization_v6/maplet_retrieval.py`
+- `feature_extract/vfm/localization_v6/map_entities.py`
+- `feature_extract/vfm/localization_v6/maplet_frame_alignment.py`
 - `feature_extract/vfm/localization_v6/maplet_pose_voting.py`
 - `feature_extract/vfm/localization_v6/maplet_footprint_pose.py`
 - `feature_extract/vfm/localization_v6/maplet_pose_proposal.py`

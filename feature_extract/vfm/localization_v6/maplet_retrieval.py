@@ -38,6 +38,7 @@ class MapletRetrievalResult:
     groups: tuple[QueryMapletGroup, ...]
     ranked_maplet_ids: np.ndarray
     evidence: np.ndarray
+    scene_evidence_aggregation: str = "legacy_sum"
 
 
 def _restrict_group_to_maplets(
@@ -151,7 +152,13 @@ def _compress_surface_location_modes(
     maximum_modes: int,
     nms_distance_m: float,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
-    """Keep real 3D modes and return all discarded mass as spatial null."""
+    """Merge nearby samples, then return capacity-truncated mass as null.
+
+    NMS and capacity truncation are different probability events.  Samples
+    inside one metric neighbourhood describe one wider resolved mode, so
+    their mass and moments are merged.  Only complete, mutually distinct
+    clusters removed by ``maximum_modes`` become spatial-null mass.
+    """
 
     probability = np.maximum(
         np.asarray(probabilities, dtype=np.float64).reshape(-1), 0.0
@@ -187,31 +194,223 @@ def _compress_surface_location_modes(
     aggregate_covariance /= np.maximum(
         aggregate_probability[:, None, None], 1e-12
     )
-    limit = max(int(maximum_modes), 1)
     separation = max(float(nms_distance_m), 0.0)
-    selected: list[int] = []
-    for mode in np.argsort(-aggregate_probability, kind="mergesort").tolist():
-        if selected and separation > 0.0:
-            distance = np.linalg.norm(
-                aggregate_center[selected] - aggregate_center[mode], axis=1
+    unassigned = np.ones(mode_count, dtype=bool)
+    cluster_probability = []
+    cluster_center = []
+    cluster_covariance = []
+    for seed in np.argsort(
+        -aggregate_probability, kind="mergesort"
+    ).tolist():
+        if not bool(unassigned[seed]):
+            continue
+        if separation > 0.0:
+            members = np.flatnonzero(
+                unassigned
+                & (
+                    np.linalg.norm(
+                        aggregate_center - aggregate_center[seed],
+                        axis=1,
+                    )
+                    < separation
+                )
             )
-            if np.any(distance < separation):
-                continue
-        selected.append(int(mode))
-        if len(selected) >= limit:
-            break
-    selected_rows = np.asarray(selected, dtype=np.int64)
-    selected_probability = aggregate_probability[selected_rows]
+        else:
+            members = np.asarray([seed], dtype=np.int64)
+        unassigned[members] = False
+        local_probability = aggregate_probability[members]
+        total_probability = float(np.sum(local_probability))
+        mean = np.sum(
+            local_probability[:, None] * aggregate_center[members],
+            axis=0,
+        ) / max(total_probability, 1e-12)
+        residual = aggregate_center[members] - mean[None]
+        covariance_value = np.sum(
+            local_probability[:, None, None]
+            * (
+                aggregate_covariance[members]
+                + residual[:, :, None] * residual[:, None, :]
+            ),
+            axis=0,
+        ) / max(total_probability, 1e-12)
+        cluster_probability.append(total_probability)
+        cluster_center.append(mean)
+        cluster_covariance.append(covariance_value)
+    clustered_probability = np.asarray(
+        cluster_probability, dtype=np.float64
+    )
+    clustered_center = np.asarray(cluster_center, dtype=np.float64)
+    clustered_covariance = np.asarray(
+        cluster_covariance, dtype=np.float64
+    )
+    limit = min(max(int(maximum_modes), 1), clustered_probability.size)
+    selected_rows = np.argsort(
+        -clustered_probability, kind="mergesort"
+    )[:limit]
+    selected_probability = clustered_probability[selected_rows]
     discarded_probability = max(
-        float(np.sum(aggregate_probability) - np.sum(selected_probability)),
+        float(np.sum(clustered_probability) - np.sum(selected_probability)),
         0.0,
     )
     return (
-        aggregate_center[selected_rows].astype(np.float32),
-        aggregate_covariance[selected_rows].astype(np.float32),
+        clustered_center[selected_rows].astype(np.float32),
+        clustered_covariance[selected_rows].astype(np.float32),
         selected_probability.astype(np.float32),
         discarded_probability,
     )
+
+
+def _rectangle_iou(
+    center: np.ndarray,
+    extent: np.ndarray,
+    selected_centers: np.ndarray,
+    selected_extents: np.ndarray,
+) -> np.ndarray:
+    lower = center - extent
+    upper = center + extent
+    selected_lower = selected_centers - selected_extents
+    selected_upper = selected_centers + selected_extents
+    intersection = np.maximum(
+        np.minimum(upper[None], selected_upper)
+        - np.maximum(lower[None], selected_lower),
+        0.0,
+    )
+    intersection_area = intersection[:, 0] * intersection[:, 1]
+    area = float(np.prod(np.maximum(2.0 * extent, 0.0)))
+    selected_area = np.prod(
+        np.maximum(2.0 * selected_extents, 0.0), axis=1
+    )
+    return intersection_area / np.maximum(
+        area + selected_area - intersection_area, 1e-8
+    )
+
+
+def aggregate_scene_maplet_evidence(
+    groups: tuple[QueryMapletGroup, ...] | list[QueryMapletGroup],
+    maplet_ids: np.ndarray,
+    *,
+    method: str = "topq_nms",
+    top_q: int = 4,
+    overlap_iou: float = 0.30,
+    block_grid_shape: tuple[int, int] = (4, 4),
+) -> np.ndarray:
+    """Aggregate independent regional support for each scene maplet.
+
+    Overlapping RADIO regions are correlated measurements.  All non-legacy
+    methods first suppress overlapping rectangles independently per maplet.
+    ``topq_nms`` caps the remaining support count, ``noisy_or_nms`` computes
+    a bounded union probability, and ``block_balanced`` allows at most one
+    contribution per fixed image block.
+    """
+
+    allowed = {
+        "legacy_sum",
+        "topq_nms",
+        "noisy_or_nms",
+        "block_balanced",
+    }
+    name = str(method)
+    if name not in allowed:
+        raise ValueError(f"unknown scene evidence aggregation: {name}")
+    ids = np.asarray(maplet_ids, dtype=np.int64).reshape(-1)
+    row_by_id = {
+        int(value): int(row) for row, value in enumerate(ids.tolist())
+    }
+    observations: list[list[tuple[float, np.ndarray, np.ndarray]]] = [
+        [] for _ in range(ids.size)
+    ]
+    for group in groups:
+        center = np.asarray(group.query_region_xy, dtype=np.float64)
+        extent = np.maximum(
+            np.asarray(group.query_region_extent, dtype=np.float64), 1e-3
+        )
+        for maplet_id, probability in zip(
+            np.asarray(group.maplet_ids, dtype=np.int64).tolist(),
+            np.asarray(group.probabilities, dtype=np.float64).tolist(),
+        ):
+            row = row_by_id.get(int(maplet_id))
+            if row is not None and float(probability) > 0.0:
+                observations[row].append(
+                    (float(probability), center, extent)
+                )
+    evidence = np.zeros(ids.size, dtype=np.float64)
+    if name == "legacy_sum":
+        for row, values in enumerate(observations):
+            evidence[row] = sum(value[0] for value in values)
+        return evidence
+    if not groups:
+        return evidence
+    all_centers = np.asarray(
+        [group.query_region_xy for group in groups], dtype=np.float64
+    )
+    all_extents = np.asarray(
+        [group.query_region_extent for group in groups], dtype=np.float64
+    )
+    image_upper = np.max(
+        all_centers + np.maximum(all_extents, 0.0), axis=0
+    )
+    block_width = max(int(block_grid_shape[0]), 1)
+    block_height = max(int(block_grid_shape[1]), 1)
+    for row, values in enumerate(observations):
+        if not values:
+            continue
+        values.sort(key=lambda value: -value[0])
+        retained: list[tuple[float, np.ndarray, np.ndarray]] = []
+        for value in values:
+            if retained:
+                iou = _rectangle_iou(
+                    value[1],
+                    value[2],
+                    np.asarray([item[1] for item in retained]),
+                    np.asarray([item[2] for item in retained]),
+                )
+                if np.any(iou > float(overlap_iou)):
+                    continue
+            retained.append(value)
+        probability = np.asarray(
+            [value[0] for value in retained], dtype=np.float64
+        )
+        if name == "topq_nms":
+            evidence[row] = float(
+                np.sum(probability[: max(int(top_q), 1)])
+            )
+        elif name == "noisy_or_nms":
+            evidence[row] = float(
+                1.0 - np.prod(1.0 - np.clip(probability, 0.0, 1.0))
+            )
+        else:
+            per_block: dict[tuple[int, int], float] = {}
+            for probability_value, center, _extent in retained:
+                normalized = center / np.maximum(image_upper, 1.0)
+                block = (
+                    max(
+                        0,
+                        min(
+                            int(
+                                np.floor(
+                                    normalized[0] * block_width
+                                )
+                            ),
+                            block_width - 1,
+                        ),
+                    ),
+                    max(
+                        0,
+                        min(
+                            int(
+                                np.floor(
+                                    normalized[1] * block_height
+                                )
+                            ),
+                            block_height - 1,
+                        ),
+                    ),
+                )
+                per_block[block] = max(
+                    per_block.get(block, 0.0), probability_value
+                )
+            evidence[row] = float(np.sum(list(per_block.values())))
+    return evidence
 
 
 def retrieve_candidate_groups(
@@ -231,6 +430,10 @@ def retrieve_candidate_groups(
     spatial_query_descriptors: np.ndarray | None = None,
     spatial_bank: SurfaceRetrievalMapletBank | None = None,
     probability_calibration: V6ProbabilityCalibration | None = None,
+    scene_evidence_aggregation: str = "topq_nms",
+    scene_evidence_top_q: int = 4,
+    scene_evidence_overlap_iou: float = 0.30,
+    compute_spatial_modes: bool = True,
 ) -> MapletRetrievalResult:
     if probability_calibration is None:
         raise ValueError(
@@ -293,7 +496,6 @@ def retrieve_candidate_groups(
         :, :keep
     ]
     groups = []
-    evidence = np.zeros((len(bank),), dtype=np.float64)
     for region in range(query.shape[0]):
         order = np.argsort(
             -maplet_probability[region, columns[region]], kind="mergesort"
@@ -314,7 +516,6 @@ def retrieve_candidate_groups(
                 candidate_centers=bank.centers[selected],
             )
         )
-        evidence[selected] += probability
     if float(set_rerank_strength) > 0.0 and len(groups) >= 2:
         groups = list(
             rerank_candidate_groups(
@@ -324,17 +525,13 @@ def retrieve_candidate_groups(
                 neighbors=int(set_rerank_neighbors),
             )
         )
-        evidence.fill(0.0)
-        row_by_id = {
-            int(value): int(row)
-            for row, value in enumerate(bank.maplet_ids.tolist())
-        }
-        for group in groups:
-            rows = np.asarray(
-                [row_by_id[int(value)] for value in group.maplet_ids],
-                dtype=np.int64,
-            )
-            evidence[rows] += group.probabilities
+    evidence = aggregate_scene_maplet_evidence(
+        groups,
+        bank.maplet_ids,
+        method=str(scene_evidence_aggregation),
+        top_q=int(scene_evidence_top_q),
+        overlap_iou=float(scene_evidence_overlap_iou),
+    )
     ranked = np.argsort(-evidence, kind="mergesort")
     ranked = ranked[evidence[ranked] > 0.0][: int(maximum_maplets)]
     ranked_maplet_ids = bank.maplet_ids[ranked]
@@ -342,6 +539,13 @@ def retrieve_candidate_groups(
         _restrict_group_to_maplets(group, ranked_maplet_ids)
         for group in groups
     ]
+    if not bool(compute_spatial_modes):
+        return MapletRetrievalResult(
+            groups=tuple(groups),
+            ranked_maplet_ids=ranked_maplet_ids,
+            evidence=evidence[ranked].astype(np.float32),
+            scene_evidence_aggregation=str(scene_evidence_aggregation),
+        )
     # Only now evaluate within-maplet surface locations.  Computing the
     # spatial bank over the whole scene before identity Top-K both violates
     # the intended coarse-to-fine graph and is needlessly quadratic in map
@@ -506,6 +710,7 @@ def retrieve_candidate_groups(
         groups=tuple(groups),
         ranked_maplet_ids=ranked_maplet_ids,
         evidence=evidence[ranked].astype(np.float32),
+        scene_evidence_aggregation=str(scene_evidence_aggregation),
     )
 
 

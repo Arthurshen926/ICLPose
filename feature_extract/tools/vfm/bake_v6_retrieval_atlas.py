@@ -43,6 +43,12 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--surface_mapper_checkpoint", default="")
     parser.add_argument("--surface_spatial_projection_checkpoint", default="")
     parser.add_argument("--contributor_dirs", nargs="+", required=True)
+    parser.add_argument(
+        "--trajectory_ids",
+        nargs="*",
+        default=[],
+        help="Optional explicit mapping-trajectory subset.",
+    )
     parser.add_argument("--output_atlas", required=True)
     parser.add_argument("--output_maplets", required=True)
     parser.add_argument("--summary_json", required=True)
@@ -223,6 +229,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     if any(path.exists() for path in outputs) and not bool(args.force):
         raise FileExistsError("refusing to overwrite retrieval atlas outputs")
     geometry = MapletFeatureAtlasBank.load_npz(Path(args.atlas_geometry))
+    requested_trajectories = {
+        str(value) for value in args.trajectory_ids
+    }
     cache_paths = sorted(
         {
             path.resolve()
@@ -230,6 +239,14 @@ def main(argv: Sequence[str] | None = None) -> None:
             for path in Path(directory).glob("*.npz")
         }
     )
+    if requested_trajectories:
+        filtered_paths = []
+        for path in cache_paths:
+            with np.load(path, allow_pickle=False) as data:
+                metadata = json.loads(str(data["metadata_json"].item()))
+            if str(metadata["trajectory_id"]) in requested_trajectories:
+                filtered_paths.append(path)
+        cache_paths = filtered_paths
     feature_transform = str(args.feature_transform)
     mapper = None
     mapper_metadata: dict[str, object] = {}
@@ -294,6 +311,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     for index, path in enumerate(cache_paths):
         with np.load(path, allow_pickle=False) as data:
             metadata = json.loads(str(data["metadata_json"].item()))
+            trajectory_id = str(metadata["trajectory_id"])
             raw = _load_raw_final(
                 Path(str(metadata["token_path"])), "radio_final"
             )
@@ -336,7 +354,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             )
         )
         metadata_rows.append(metadata)
-        trajectories.append(str(metadata["trajectory_id"]))
+        trajectories.append(trajectory_id)
         occlusion_policies.append(
             str(metadata.get("occlusion_primitive_policy", ""))
         )

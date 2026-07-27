@@ -12,8 +12,11 @@ mapping RGB + calibrated poses + high-quality 2DGS --offline only-->
   + raster-contributor-verified dense metric feature atlases
 
 query RGB
-  -> RADIO-final maplet retrieval with complete candidate groups
-  -> region-level coarse pose distribution
+  -> RADIO-final RetrievalRegion posterior with complete candidate groups
+  -> overlap-aware scene evidence
+  -> associated disconnected MetricSurfaceCharts
+  -> global canonical-region frame correlation (translation/affine modes)
+  -> regional frame-control coarse pose distribution
   -> area-render selected canonical maplet atlases
   -> local multi-modal displacement correlation
   -> analytic robust joint-SE(3) update
@@ -31,11 +34,17 @@ matching, single-point cosine pose energy, or final point-correspondence PnP.
 
 See [the V6 mainline](docs/vfm/2dgs_maplet_atlas_localization_v6.md) for its
 architecture, artifact contracts and strict G0–G4 promotion gates.
-P0 identity/spatial probability semantics are corrected, but the current
-region-level coarse proposal is still 0/12 at the 30 cm / 3 degree strict
-audit gate. Typed correlation nulls, iterative fine alignment, adaptive
-charts and full-scene runtime occlusion are also still open. V6 is therefore
-not production-qualified and no 530-query accuracy claim is made.
+P0 identity/spatial probability semantics are corrected. Retrieval regions
+and metric charts are now separate map entities with a strict many-to-many
+index, overlapping query-region evidence is deduplicated, and the current
+research bridge is `MapletFrameAlignment`. Its strict M1/M2/M3 diagnostics
+show that affine/homography frame geometry is sufficient. Removing an invalid
+large-template score bias raises correct-identity chart-control R@16 to
+33/48, but actual-retrieval coarse-pose R@16 remains 0/12. The remaining
+breakpoint is frame precision and calibrated multi-chart pose ranking, not
+2DGS geometry. It is not production-qualified and no 530-query accuracy
+claim is made. Typed correlation nulls, iterative fine alignment, adaptive
+charts and full-scene runtime occlusion remain open.
 The V5 point-similarity route is retained as a failed diagnostic: it never
 implemented atlas/query correlation and is not extended.
 The [V3 anchor/PnP mainline](docs/vfm/2dgs_surface_localization_mainline.md) is
@@ -48,13 +57,17 @@ only as a historical baseline.
 - `feature_extract/tools/vfm/build_v6_canonical_maplet_atlas.py`
 - `feature_extract/tools/vfm/build_surface_retrieval_maplet_bank.py`
 - `feature_extract/tools/vfm/calibrate_v6_retrieval_probabilities.py`
-- `feature_extract/tools/vfm/build_v6_anonymous_pose_vote_bank.py`
+- `feature_extract/tools/vfm/build_v6_region_chart_index.py`
 - `feature_extract/tools/vfm/audit_v6_primitive_contributors.py`
 - `feature_extract/tools/vfm/build_v6_contributor_cache.py`
 - `feature_extract/tools/vfm/train_v6_metric_encoder.py`
 - `feature_extract/tools/vfm/bake_v6_metric_atlas.py`
 - `feature_extract/tools/vfm/evaluate_v6_oracle_basin.py`
 - `feature_extract/tools/vfm/evaluate_v6_retrieval_pose_basin.py`
+- `feature_extract/tools/vfm/evaluate_v6_maplet_frame_alignment.py`
+- `feature_extract/tools/vfm/evaluate_v6_radio_frame_source.py`
+- `feature_extract/tools/vfm/train_v6_global_frame_encoder.py`
+- `feature_extract/tools/vfm/bake_v6_retrieval_atlas.py`
 - `feature_extract/vfm/localization_v6/`
 
 ## Historical And Reference Lines
@@ -78,7 +91,8 @@ focused tests from this checkout:
 
 ```bash
 PYTHONPATH=. pytest -q \
-  tests/test_v6_maplet_atlas_correlation.py
+  tests/test_v6_maplet_atlas_correlation.py \
+  tests/test_v6_maplet_frame_alignment.py
 
 python -m compileall -q feature_extract/vfm feature_extract/tools/vfm feature_extract/extractors
 ```

@@ -6,9 +6,17 @@ and converts them to pose updates with explicit projective geometry.
 """
 
 from .atlas_baking import bake_feature_atlas
+from .map_entities import (
+    MetricSurfaceChartBank,
+    RegionChartIndex,
+    RetrievalRegionBank,
+)
 from .maplet_atlas import MapletFeatureAtlasBank
 
 __all__ = [
     "bake_feature_atlas",
     "MapletFeatureAtlasBank",
+    "MetricSurfaceChartBank",
+    "RegionChartIndex",
+    "RetrievalRegionBank",
 ]
