@@ -64,11 +64,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         raise FileExistsError("refusing to overwrite contributor audit")
     source = load_gaussian_vfm_source_from_ply(Path(args.gaussian_ply))
     clean = _clean_source_indices(Path(args.clean_gaussian_ply))
-    # Occlusion must come from the complete 2DGS, including primitives that
-    # are not retained as atlas texture carriers.  Filtering before
-    # rasterization incorrectly exposes hidden clean disks.
+    # Contributor identity and occlusion must use the same declared clean 2DGS
+    # prior as canonical atlas geometry.  The full PLY supplies stable source
+    # indices; removed primitives must not re-enter as invisible occluders.
     elements = clean_primitive_surface_elements(
-        source, np.arange(source.xyz.shape[0], dtype=np.int64)
+        source, clean
     )
     clean_lookup = np.zeros((source.xyz.shape[0],), dtype=bool)
     clean_lookup[clean] = True

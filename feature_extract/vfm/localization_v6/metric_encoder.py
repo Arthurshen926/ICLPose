@@ -41,6 +41,7 @@ class V6MetricEncoder(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
+        self._legacy_average_pool_pyramid = False
         hidden = int(config.hidden_dim)
         self.rgb_stem = nn.Sequential(
             nn.Conv2d(3, hidden // 2, 3, stride=2, padding=1, bias=False),
@@ -70,9 +71,28 @@ class V6MetricEncoder(nn.Module):
             ResidualBlock(hidden),
         )
         self.descriptor_head = nn.Conv2d(hidden, int(config.output_dim), 1)
+        self.middle_trunk = nn.Sequential(
+            nn.Conv2d(hidden, hidden, 3, stride=2, padding=1, bias=False),
+            nn.GroupNorm(1, hidden),
+            nn.GELU(),
+            ResidualBlock(hidden),
+        )
+        self.middle_descriptor_head = nn.Conv2d(
+            hidden, int(config.output_dim), 1
+        )
+        self.middle_residual_gate = nn.Parameter(torch.zeros(()))
+        self.coarse_trunk = nn.Sequential(
+            nn.Conv2d(hidden, hidden, 3, stride=2, padding=1, bias=False),
+            nn.GroupNorm(1, hidden),
+            nn.GELU(),
+            ResidualBlock(hidden),
+            ResidualBlock(hidden),
+        )
+        self.coarse_descriptor_head = nn.Conv2d(
+            hidden, int(config.output_dim), 1
+        )
+        self.coarse_residual_gate = nn.Parameter(torch.zeros(()))
         self.matchability_head = nn.Conv2d(hidden, 1, 1)
-        self.null_head = nn.Conv2d(hidden, 1, 1)
-        self.log_variance_head = nn.Conv2d(hidden, 1, 1)
 
     def forward(
         self, radio_final: torch.Tensor, rgb: torch.Tensor
@@ -93,67 +113,37 @@ class V6MetricEncoder(nn.Module):
         fused = self.fusion(torch.cat([conditioned_phase, context], dim=1))
         fine = F.normalize(self.descriptor_head(fused), dim=1)
         matchability_logits = self.matchability_head(fused)
-        null_logits = self.null_head(fused)
-        middle = F.normalize(
-            F.avg_pool2d(fine, kernel_size=2, stride=2), dim=1
-        )
-        coarse = F.normalize(
-            F.avg_pool2d(fine, kernel_size=4, stride=4), dim=1
-        )
+        if self._legacy_average_pool_pyramid:
+            middle = F.normalize(
+                F.avg_pool2d(fine, kernel_size=2, stride=2), dim=1
+            )
+            coarse = F.normalize(
+                F.avg_pool2d(fine, kernel_size=4, stride=4), dim=1
+            )
+        else:
+            middle_hidden = self.middle_trunk(fused)
+            middle_base = F.avg_pool2d(fine, kernel_size=2, stride=2)
+            middle = F.normalize(
+                middle_base
+                + torch.tanh(self.middle_residual_gate)
+                * self.middle_descriptor_head(middle_hidden),
+                dim=1,
+            )
+            coarse_hidden = self.coarse_trunk(middle_hidden)
+            coarse_base = F.avg_pool2d(fine, kernel_size=4, stride=4)
+            coarse = F.normalize(
+                coarse_base
+                + torch.tanh(self.coarse_residual_gate)
+                * self.coarse_descriptor_head(coarse_hidden),
+                dim=1,
+            )
         return {
             "fine": fine,
             "middle": middle,
             "coarse": coarse,
             "matchability_logits": matchability_logits,
             "matchability": torch.sigmoid(matchability_logits),
-            "null_logits": null_logits,
-            "null_probability": torch.sigmoid(null_logits),
-            "log_variance": torch.clamp(
-                self.log_variance_head(fused), min=-6.0, max=6.0
-            ),
         }
-
-
-def probabilistic_metric_losses(
-    output: Mapping[str, torch.Tensor],
-    *,
-    match_labels: torch.Tensor,
-    displacement_error: torch.Tensor,
-    displacement_valid: torch.Tensor,
-) -> dict[str, torch.Tensor]:
-    """Supervise matchability, explicit null and calibrated uncertainty.
-
-    ``match_labels`` must include both positives and negatives (wrong maplet,
-    occluded, out-of-view or textureless).  ``displacement_error`` is squared
-    EPE for visible matches and supplies heteroscedastic calibration.
-    """
-
-    labels = match_labels.float()
-    if labels.shape != output["matchability_logits"].shape:
-        raise ValueError("match_labels must match probability-head shape")
-    valid = displacement_valid.bool()
-    if displacement_error.shape != labels.shape or valid.shape != labels.shape:
-        raise ValueError("displacement supervision shapes differ")
-    matchability_loss = F.binary_cross_entropy_with_logits(
-        output["matchability_logits"], labels
-    )
-    null_loss = F.binary_cross_entropy_with_logits(
-        output["null_logits"], 1.0 - labels
-    )
-    log_variance = output["log_variance"]
-    nll = 0.5 * (
-        displacement_error.float() * torch.exp(-log_variance) + log_variance
-    )
-    uncertainty_loss = (
-        nll[valid].mean() if torch.any(valid) else nll.sum() * 0.0
-    )
-    total = matchability_loss + null_loss + uncertainty_loss
-    return {
-        "total": total,
-        "matchability": matchability_loss,
-        "null": null_loss,
-        "uncertainty": uncertainty_loss,
-    }
 
 
 def save_v6_metric_encoder(
@@ -189,6 +179,39 @@ def load_v6_metric_encoder(
         raise ValueError("not a V6 metric-encoder checkpoint")
     config = V6MetricEncoderConfig(**dict(payload["config"]))
     model = V6MetricEncoder(config)
-    model.load_state_dict(payload["state_dict"], strict=True)
+    missing, unexpected = model.load_state_dict(payload["state_dict"], strict=False)
+    legacy_unused_heads = {
+        name
+        for name in unexpected
+        if name.startswith(("null_head.", "log_variance_head."))
+    }
+    unexpected = [name for name in unexpected if name not in legacy_unused_heads]
+    legacy_pyramid = bool(
+        missing
+        and all(
+            name.startswith(
+                (
+                    "middle_trunk.",
+                    "middle_descriptor_head.",
+                    "middle_residual_gate",
+                    "coarse_trunk.",
+                    "coarse_descriptor_head.",
+                    "coarse_residual_gate",
+                )
+            )
+            for name in missing
+        )
+        and not unexpected
+    )
+    if missing and not legacy_pyramid:
+        raise ValueError(f"checkpoint is missing parameters: {missing}")
+    if unexpected:
+        raise ValueError(f"checkpoint has unexpected parameters: {unexpected}")
+    model._legacy_average_pool_pyramid = legacy_pyramid
     model.to(device)
-    return model, dict(payload.get("metadata", {}))
+    metadata = dict(payload.get("metadata", {}))
+    metadata["legacy_average_pool_pyramid"] = legacy_pyramid
+    metadata["legacy_unused_probability_heads_ignored"] = bool(
+        legacy_unused_heads
+    )
+    return model, metadata

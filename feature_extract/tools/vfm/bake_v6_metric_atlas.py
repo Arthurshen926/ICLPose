@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 from typing import Sequence
@@ -33,7 +34,19 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--image_root", required=True)
     parser.add_argument("--output_atlas", required=True)
     parser.add_argument("--summary_json", required=True)
+    parser.add_argument(
+        "--trajectory_ids",
+        nargs="*",
+        default=[],
+        help="Optional explicit mapping-trajectory subset.",
+    )
     parser.add_argument("--minimum_support", type=int, default=2)
+    parser.add_argument("--appearance_modes", type=int, choices=(1, 2, 4), default=4)
+    parser.add_argument(
+        "--feature_level",
+        choices=("fine", "middle", "coarse"),
+        default="fine",
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--force", action="store_true")
     return parser.parse_args(argv)
@@ -49,6 +62,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     model, encoder_metadata = load_v6_metric_encoder(
         Path(args.metric_encoder), device=str(args.device)
     )
+    encoder_sha256 = hashlib.sha256(
+        Path(args.metric_encoder).read_bytes()
+    ).hexdigest()
     model.eval()
     cache_paths = sorted(
         path
@@ -58,10 +74,21 @@ def main(argv: Sequence[str] | None = None) -> None:
     views = []
     buffers = []
     trajectories = []
+    occlusion_policies = []
+    clean_source_index_hashes = []
+    clean_geometry_source_hashes = []
+    geometry_source_hashes = []
+    requested_trajectories = {str(value) for value in args.trajectory_ids}
     with torch.no_grad():
         for index, path in enumerate(cache_paths):
             with np.load(path, allow_pickle=False) as data:
                 metadata = json.loads(str(data["metadata_json"].item()))
+                trajectory_id = str(metadata["trajectory_id"])
+                if (
+                    requested_trajectories
+                    and trajectory_id not in requested_trajectories
+                ):
+                    continue
                 image_id = str(metadata["image_id"])
                 token_path = Path(str(metadata["token_path"]))
                 camera = ColmapCamera(
@@ -92,11 +119,13 @@ def main(argv: Sequence[str] | None = None) -> None:
                 radio = torch.from_numpy(
                     np.asarray(token_data["radio_final"], dtype=np.float32)
                 )[None].to(str(args.device))
-            fine = model(radio, rgb)["fine"][0].cpu().numpy()
+            metric_feature = model(radio, rgb)[str(args.feature_level)][
+                0
+            ].cpu().numpy()
             views.append(
                 GaussianVFMFeatureView(
                     image_id=image_id,
-                    feature_map=fine,
+                    feature_map=metric_feature,
                     pose_w2c=pose,
                     camera=camera,
                 )
@@ -111,20 +140,90 @@ def main(argv: Sequence[str] | None = None) -> None:
                     metadata=metadata,
                 )
             )
-            trajectories.append(str(metadata["trajectory_id"]))
+            trajectories.append(trajectory_id)
+            occlusion_policies.append(
+                str(
+                    metadata.get(
+                        "occlusion_primitive_policy",
+                        (
+                            "declared_clean_source_index_mask"
+                            if bool(
+                                metadata.get(
+                                    "uses_declared_clean_2dgs_for_occlusion",
+                                    False,
+                                )
+                            )
+                            else "complete_input_2dgs"
+                        ),
+                    )
+                )
+            )
+            clean_source_index_hashes.append(
+                str(metadata.get("clean_source_index_sha256", ""))
+            )
+            clean_geometry_source_hashes.append(
+                str(metadata.get("clean_geometry_source_sha256", ""))
+            )
+            geometry_source_hashes.append(
+                str(metadata.get("geometry_source_sha256", ""))
+            )
             print(f"[{index + 1}/{len(cache_paths)}] {image_id}", flush=True)
+    if len(set(occlusion_policies)) != 1:
+        raise ValueError("contributor caches mix incompatible occlusion priors")
+    occlusion_policy = occlusion_policies[0]
+    contributor_lineage = {
+        "clean_source_index_sha256": set(clean_source_index_hashes),
+        "clean_geometry_source_sha256": set(clean_geometry_source_hashes),
+        "geometry_source_sha256": set(geometry_source_hashes),
+    }
+    if any(len(values) != 1 for values in contributor_lineage.values()):
+        raise ValueError("contributor caches mix geometry source lineages")
+    contributor_lineage = {
+        key: next(iter(values)) for key, values in contributor_lineage.items()
+    }
+    geometry_metadata = dict(geometry.metadata or {})
+    geometry_lineage_verified = all(
+        bool(contributor_lineage[key])
+        and contributor_lineage[key] == str(geometry_metadata.get(key, ""))
+        for key in contributor_lineage
+    )
+    lineage_declared = any(
+        bool(value) for value in contributor_lineage.values()
+    ) or any(
+        bool(geometry_metadata.get(key, "")) for key in contributor_lineage
+    )
+    if lineage_declared and not geometry_lineage_verified:
+        raise ValueError(
+            "contributor cache and canonical atlas geometry lineages differ"
+        )
     atlas, report = bake_feature_atlas(
         geometry,
         views,
         buffers,
         minimum_support=int(args.minimum_support),
+        appearance_modes=int(args.appearance_modes),
         trajectory_ids=trajectories,
         metadata={
             "metric_encoder_artifact": str(args.metric_encoder),
             "metric_encoder_best_step": encoder_metadata.get("best_step", -1),
+            "metric_encoder_sha256": encoder_sha256,
             "vfm_layer": "radio_final",
+            "metric_feature_level": str(args.feature_level),
+            "metric_feature_stride": {
+                "fine": 4,
+                "middle": 8,
+                "coarse": 16,
+            }[str(args.feature_level)],
             "uses_shallow_rgb_phase_stem": True,
             "uses_radio_final_conditioning": True,
+            "contributor_occlusion_primitive_policy": occlusion_policy,
+            "contributor_geometry_lineage_verified": bool(
+                geometry_lineage_verified
+            ),
+            **{
+                f"contributor_{key}": value
+                for key, value in contributor_lineage.items()
+            },
         },
     )
     atlas.save_npz(output_path)
@@ -132,7 +231,17 @@ def main(argv: Sequence[str] | None = None) -> None:
         {
             "output_atlas": str(output_path),
             "metric_encoder": str(args.metric_encoder),
+            "metric_feature_level": str(args.feature_level),
+            "metric_encoder_sha256": encoder_sha256,
             "trajectory_ids": sorted(set(trajectories)),
+            "contributor_occlusion_primitive_policy": occlusion_policy,
+            "contributor_geometry_lineage_verified": bool(
+                geometry_lineage_verified
+            ),
+            **{
+                f"contributor_{key}": value
+                for key, value in contributor_lineage.items()
+            },
             "deployment_contract": {
                 "stores_mapping_rgb": False,
                 "stores_mapping_image_paths": False,

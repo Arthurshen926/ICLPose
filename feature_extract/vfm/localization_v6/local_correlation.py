@@ -25,6 +25,7 @@ class CorrelationDistribution:
     covariance: np.ndarray
     entropy: np.ndarray
     matchability: np.ndarray
+    surface_ids: np.ndarray | None = None
 
 
 def local_correlation_distribution(
@@ -34,8 +35,9 @@ def local_correlation_distribution(
     radius: int,
     temperature: float = 0.07,
     query_matchability: np.ndarray | None = None,
-    query_null_probability: np.ndarray | None = None,
     null_logit: float = 0.0,
+    uncertainty_temperature_scale: float = 2.0,
+    uncertainty_null_scale: float = 2.0,
     maximum_points: int = 8192,
     device: str = "cuda",
 ) -> CorrelationDistribution:
@@ -75,6 +77,7 @@ def local_correlation_distribution(
             covariance=np.zeros((0, 2, 2), dtype=np.float32),
             entropy=np.zeros((0,), dtype=np.float32),
             matchability=np.zeros((0,), dtype=np.float32),
+            surface_ids=np.zeros((0,), dtype=np.int64),
         )
     torch_device = torch.device(
         device
@@ -105,9 +108,39 @@ def local_correlation_distribution(
     )
     candidates = patches[:, :, linear].permute(2, 1, 0)
     candidates = F.normalize(candidates, dim=2)
-    logits = torch.sum(render_values[:, None] * candidates, dim=2) / max(
-        float(temperature), 1e-4
+    atlas_uncertainty = torch.as_tensor(
+        np.asarray(rendered.uncertainty[rows_y, rows_x], dtype=np.float32),
+        device=torch_device,
+    ).clamp(0.0, 1.0)
+    effective_temperature = max(float(temperature), 1e-4) * (
+        1.0 + float(uncertainty_temperature_scale) * atlas_uncertainty
     )
+    if rendered.mode_feature is None:
+        logits = torch.sum(render_values[:, None] * candidates, dim=2) / (
+            effective_temperature[:, None]
+        )
+    else:
+        if rendered.mode_log_prior is None:
+            raise ValueError("rendered modes require mode_log_prior")
+        mode_values = torch.as_tensor(
+            rendered.mode_feature[:, :, rows_y, rows_x].transpose(2, 0, 1),
+            dtype=torch.float32,
+            device=torch_device,
+        )
+        mode_values = F.normalize(mode_values, dim=2)
+        mode_prior = torch.as_tensor(
+            rendered.mode_log_prior[:, rows_y, rows_x].T,
+            dtype=torch.float32,
+            device=torch_device,
+        )
+        mode_similarity = torch.einsum(
+            "nkc,noc->nko", mode_values, candidates
+        ) / effective_temperature[:, None, None]
+        # Do not choose an appearance mode before observing the query.  This
+        # is p(delta|q) ∝ Σ_k p(k|view) p(q_delta|mode_k).
+        logits = torch.logsumexp(
+            mode_similarity + mode_prior[:, :, None], dim=1
+        )
     offset_tensor = torch.as_tensor(offsets, device=torch_device)
     point_x = torch.as_tensor(rows_x, device=torch_device)[:, None]
     point_y = torch.as_tensor(rows_y, device=torch_device)[:, None]
@@ -119,39 +152,58 @@ def local_correlation_distribution(
         & (candidate_y >= 0)
         & (candidate_y < feature.shape[1])
     )
+    valid_count = torch.clamp(valid.sum(dim=1), min=1).to(logits.dtype)
+    # Convert cosine scores into an approximate match/non-match density ratio.
+    # Without the offset prior and the random-unit-vector partition term, the
+    # maximum of many unrelated candidates almost always overwhelms null.
+    negative_log_partition = 0.5 / (
+        feature.shape[0] * effective_temperature * effective_temperature
+    )
+    logits = (
+        logits
+        - torch.log(valid_count)[:, None]
+        - negative_log_partition[:, None]
+    )
     logits = torch.where(valid, logits, torch.full_like(logits, -1e4))
     if query_matchability is None:
-        matchability = torch.ones(
-            (point_count,), dtype=torch.float32, device=torch_device
-        )
+        candidate_matchability = torch.ones_like(logits)
     else:
         match_map = np.asarray(query_matchability, dtype=np.float32)
         if match_map.shape != rendered.mask.shape:
             raise ValueError("query_matchability shape differs")
-        matchability = torch.as_tensor(
-            match_map[rows_y, rows_x], device=torch_device
-        ).clamp(1e-4, 1.0)
-        logits = logits + torch.log(matchability[:, None])
-    if query_null_probability is None:
-        null_logits = torch.full(
-            (point_count, 1),
-            float(null_logit),
-            dtype=torch.float32,
-            device=torch_device,
+        match_tensor = torch.as_tensor(
+            match_map[None, None], dtype=torch.float32, device=torch_device
         )
-    else:
-        null_map = np.asarray(query_null_probability, dtype=np.float32)
-        if null_map.shape != rendered.mask.shape:
-            raise ValueError("query_null_probability shape differs")
-        null_values = torch.as_tensor(
-            null_map[rows_y, rows_x], device=torch_device
-        ).clamp(1e-5, 1.0 - 1e-5)
-        null_logits = torch.logit(null_values)[:, None] + float(null_logit)
+        match_patches = F.unfold(
+            match_tensor, kernel_size=kernel, padding=search_radius
+        )[0]
+        candidate_matchability = match_patches[:, linear].T.clamp(1e-4, 1.0)
+        # Matchability belongs to the candidate query location.  A value
+        # sampled only at the rendered centre is constant over offsets and
+        # therefore cancels from the displacement posterior.
+        logits = logits + torch.log(candidate_matchability)
+    candidate_matchability = torch.where(
+        valid, candidate_matchability, torch.zeros_like(candidate_matchability)
+    )
+    # Pairwise null cannot be predicted from the query image alone: it depends
+    # on the rendered map feature and its complete candidate correlations.
+    # Query-only unmatchability already enters every offset above.  Keep a
+    # separate calibrated pair-null prior instead of reusing a spatial head.
+    null_logits = torch.full(
+        (point_count, 1),
+        float(null_logit),
+        dtype=torch.float32,
+        device=torch_device,
+    )
+    null_logits = null_logits + (
+        float(uncertainty_null_scale) * atlas_uncertainty[:, None]
+    )
     joint = torch.softmax(torch.cat([logits, null_logits], dim=1), dim=1)
     probability = joint[:, :-1]
     null_probability = joint[:, -1]
     visible_mass = torch.clamp(probability.sum(dim=1), min=1e-8)
     conditional = probability / visible_mass[:, None]
+    matchability = torch.sum(conditional * candidate_matchability, dim=1)
     mean = conditional @ offset_tensor
     residual = offset_tensor[None] - mean[:, None]
     covariance = torch.einsum(
@@ -174,4 +226,9 @@ def local_correlation_distribution(
         covariance=covariance.detach().cpu().numpy().astype(np.float32),
         entropy=entropy.detach().cpu().numpy().astype(np.float32),
         matchability=matchability.detach().cpu().numpy().astype(np.float32),
+        surface_ids=(
+            np.asarray(rendered.surface_id[rows_y, rows_x], dtype=np.int64)
+            if rendered.surface_id is not None
+            else None
+        ),
     )

@@ -24,6 +24,11 @@ class RenderedMapletAtlases:
     maplet_id: np.ndarray
     mask: np.ndarray
     depth: np.ndarray
+    mode_feature: np.ndarray | None = None
+    mode_log_prior: np.ndarray | None = None
+    surface_id: np.ndarray | None = None
+    primitive_id: np.ndarray | None = None
+    atlas_xy: np.ndarray | None = None
 
 
 def _scaled_pixels(
@@ -69,6 +74,8 @@ def render_selected_maplet_atlases(
     height: int,
     full_scene_depth: np.ndarray | None = None,
     occlusion_epsilon: float = 0.03,
+    maximum_edge_stretch: float = 4.0,
+    minimum_triangle_normal_cosine: float = 0.10,
 ) -> RenderedMapletAtlases:
     """Rasterize atlas quads with perspective-correct feature interpolation."""
 
@@ -80,6 +87,37 @@ def render_selected_maplet_atlases(
     output_uncertainty = np.ones((int(height), int(width)), dtype=np.float32)
     output_maplet = np.full((int(height), int(width)), -1, dtype=np.int64)
     output_depth = np.full((int(height), int(width)), np.inf, dtype=np.float32)
+    output_surface_id = np.full(
+        (int(height), int(width)), -1, dtype=np.int64
+    )
+    output_primitive_id = np.full(
+        (int(height), int(width)), -1, dtype=np.int64
+    )
+    output_atlas_xy = np.full(
+        (int(height), int(width), 2), -1, dtype=np.int32
+    )
+    output_mode_feature = (
+        np.zeros(
+            (
+                atlas.appearance_mode_count,
+                atlas.feature_dim,
+                int(height),
+                int(width),
+            ),
+            dtype=np.float32,
+        )
+        if atlas.mode_features is not None
+        else None
+    )
+    output_mode_log_prior = (
+        np.full(
+            (atlas.appearance_mode_count, int(height), int(width)),
+            -np.inf,
+            dtype=np.float32,
+        )
+        if atlas.mode_features is not None
+        else None
+    )
     id_to_row = {
         int(value): int(row) for row, value in enumerate(atlas.maplet_ids.tolist())
     }
@@ -88,6 +126,10 @@ def render_selected_maplet_atlases(
         for value in np.asarray(selected_maplet_ids, dtype=np.int64).tolist()
         if int(value) in id_to_row
     ]
+    camera_center = (
+        -np.asarray(pose_w2c[:3, :3], dtype=np.float64).T
+        @ np.asarray(pose_w2c[:3, 3], dtype=np.float64)
+    )
     triangles = ((0, 1, 2), (0, 2, 3))
     corner_offsets = ((0, 0), (0, 1), (1, 1), (1, 0))
     for maplet_row in selected_rows:
@@ -103,24 +145,99 @@ def render_selected_maplet_atlases(
                     [atlas.xyz[maplet_row, yy, xx] for yy, xx in corners],
                     dtype=np.float64,
                 )
+                expected_u = max(
+                    2.0 * float(atlas.extents[maplet_row, 0]) / atlas.width,
+                    1e-5,
+                )
+                expected_v = max(
+                    2.0 * float(atlas.extents[maplet_row, 1]) / atlas.height,
+                    1e-5,
+                )
+                if (
+                    max(
+                        np.linalg.norm(world[1] - world[0]),
+                        np.linalg.norm(world[2] - world[3]),
+                    )
+                    > float(maximum_edge_stretch) * expected_u
+                    or max(
+                        np.linalg.norm(world[3] - world[0]),
+                        np.linalg.norm(world[2] - world[1]),
+                    )
+                    > float(maximum_edge_stretch) * expected_v
+                ):
+                    # Adjacent chart cells on different depth layers must not
+                    # be stitched into a fictitious surface triangle.
+                    continue
+                geometric_normal = np.cross(world[1] - world[0], world[3] - world[0])
+                geometric_normal /= max(np.linalg.norm(geometric_normal), 1e-8)
+                if float(
+                    geometric_normal
+                    @ np.asarray(atlas.frames[maplet_row, 2], dtype=np.float64)
+                ) < float(minimum_triangle_normal_cosine):
+                    # Signed test catches folded/inverted chart patches.
+                    continue
                 pixels, depth = project_world_points(world, pose_w2c, camera)
                 if np.any(depth <= 0.01) or not np.all(np.isfinite(pixels)):
                     continue
                 pixels = _scaled_pixels(pixels, camera, int(width), int(height))
-                features = np.asarray(
-                    [
-                        atlas.features[maplet_row, :, yy, xx]
-                        for yy, xx in corners
-                    ],
-                    dtype=np.float32,
-                )
-                uncertainties = np.asarray(
-                    [
-                        atlas.variance[maplet_row, yy, xx]
-                        for yy, xx in corners
-                    ],
-                    dtype=np.float32,
-                )
+                if atlas.mode_features is None:
+                    features = np.asarray(
+                        [
+                            atlas.features[maplet_row, :, yy, xx]
+                            for yy, xx in corners
+                        ],
+                        dtype=np.float32,
+                    )
+                    uncertainties = np.asarray(
+                        [
+                            atlas.variance[maplet_row, yy, xx]
+                            for yy, xx in corners
+                        ],
+                        dtype=np.float32,
+                    )
+                else:
+                    features = []
+                    uncertainties = []
+                    for (yy, xx), position in zip(corners, world):
+                        direction = camera_center - position
+                        direction /= max(np.linalg.norm(direction), 1e-8)
+                        valid_modes = atlas.mode_valid_mask[
+                            maplet_row, :, yy, xx
+                        ]
+                        score = (
+                            2.0
+                            * (
+                                atlas.mode_view_directions[
+                                    maplet_row, :, yy, xx
+                                ]
+                                @ direction
+                            )
+                            + np.log(
+                                np.maximum(
+                                    atlas.mode_weights[maplet_row, :, yy, xx],
+                                    1e-8,
+                                )
+                            )
+                            - atlas.mode_variance[maplet_row, :, yy, xx]
+                        )
+                        score[~valid_modes] = -np.inf
+                        mode = int(np.argmax(score))
+                        features.append(
+                            atlas.mode_features[maplet_row, mode, :, yy, xx]
+                        )
+                        uncertainties.append(
+                            atlas.mode_variance[maplet_row, mode, yy, xx]
+                            + float(
+                                np.trace(
+                                    atlas.mode_view_covariance[
+                                        maplet_row, mode, yy, xx
+                                    ]
+                                )
+                            )
+                            / 3.0
+                        )
+                    features = np.asarray(features, dtype=np.float32)
+                    uncertainties = np.asarray(uncertainties, dtype=np.float32)
                 normal = np.asarray(
                     atlas.frames[maplet_row, 2], dtype=np.float32
                 )
@@ -213,6 +330,77 @@ def render_selected_maplet_atlases(
                         np.linalg.norm(interpolated, axis=1, keepdims=True), 1e-8
                     )
                     output_feature[:, sample_y, sample_x] = interpolated.T
+                    dominant_corner = indices[np.argmax(weights, axis=1)]
+                    for output_index, corner_index in enumerate(
+                        dominant_corner.tolist()
+                    ):
+                        yy_corner, xx_corner = corners[int(corner_index)]
+                        px = sample_x[output_index]
+                        py = sample_y[output_index]
+                        output_surface_id[py, px] = (
+                            maplet_row * atlas.height * atlas.width
+                            + yy_corner * atlas.width
+                            + xx_corner
+                        )
+                        output_primitive_id[py, px] = atlas.primitive_ids[
+                            maplet_row, yy_corner, xx_corner
+                        ]
+                        output_atlas_xy[py, px] = (xx_corner, yy_corner)
+                    if output_mode_feature is not None:
+                        # Mode identities are local to each texel and need not
+                        # align across chart neighbours.  Use the dominant
+                        # perspective corner, preserve all of its modes, and
+                        # let correlation marginalise them with a view prior.
+                        for output_index, corner_index in enumerate(
+                            dominant_corner.tolist()
+                        ):
+                            yy_corner, xx_corner = corners[int(corner_index)]
+                            position = world[int(corner_index)]
+                            direction = camera_center - position
+                            direction /= max(np.linalg.norm(direction), 1e-8)
+                            valid_modes = atlas.mode_valid_mask[
+                                maplet_row, :, yy_corner, xx_corner
+                            ]
+                            logits = (
+                                2.0
+                                * (
+                                    atlas.mode_view_directions[
+                                        maplet_row, :, yy_corner, xx_corner
+                                    ]
+                                    @ direction
+                                )
+                                + np.log(
+                                    np.maximum(
+                                        atlas.mode_weights[
+                                            maplet_row, :, yy_corner, xx_corner
+                                        ],
+                                        1e-8,
+                                    )
+                                )
+                                - atlas.mode_variance[
+                                    maplet_row, :, yy_corner, xx_corner
+                                ]
+                            )
+                            logits[~valid_modes] = -np.inf
+                            finite_logits = np.isfinite(logits)
+                            normalizer = np.log(
+                                np.sum(
+                                    np.exp(
+                                        logits[finite_logits]
+                                        - np.max(logits[finite_logits])
+                                    )
+                                )
+                            ) + np.max(logits[finite_logits])
+                            px = sample_x[output_index]
+                            py = sample_y[output_index]
+                            output_mode_feature[:, :, py, px] = (
+                                atlas.mode_features[
+                                    maplet_row, :, :, yy_corner, xx_corner
+                                ]
+                            )
+                            output_mode_log_prior[:, py, px] = (
+                                logits - normalizer
+                            )
                     output_uncertainty[sample_y, sample_x] = (
                         weights @ uncertainties[indices]
                     )
@@ -230,4 +418,9 @@ def render_selected_maplet_atlases(
         maplet_id=output_maplet,
         mask=mask,
         depth=output_depth,
+        mode_feature=output_mode_feature,
+        mode_log_prior=output_mode_log_prior,
+        surface_id=output_surface_id,
+        primitive_id=output_primitive_id,
+        atlas_xy=output_atlas_xy,
     )

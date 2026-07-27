@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 from typing import Sequence
@@ -21,12 +22,21 @@ from feature_extract.vfm.localization_v6.primitive_contributors import (
     clean_primitive_surface_elements,
     render_primitive_contributors,
 )
+from feature_extract.vfm.surface_maplet_bank import load_2dgs_primitive_quality
 from feature_extract.vfm.tokens import TokenBankManifest
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--gaussian_ply", required=True)
+    parser.add_argument(
+        "--clean_gaussian_ply",
+        default="",
+        help=(
+            "Optional source-indexed clean PLY mask. Geometry is loaded from "
+            "--gaussian_ply so contributor IDs remain canonical."
+        ),
+    )
     parser.add_argument("--mapping_manifest", required=True)
     parser.add_argument("--mapping_pose_file", required=True)
     parser.add_argument("--mapping_camera_manifest", required=True)
@@ -39,6 +49,8 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--width", type=int, default=256)
     parser.add_argument("--height", type=int, default=144)
     parser.add_argument("--top_k", type=int, default=4)
+    parser.add_argument("--shard_index", type=int, default=0)
+    parser.add_argument("--shard_count", type=int, default=1)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--force", action="store_true")
     return parser.parse_args(argv)
@@ -49,6 +61,19 @@ def _frame_number(image_id: str) -> int:
     return int(stem.replace("frame", ""))
 
 
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _source_index_sha256(values: np.ndarray) -> str:
+    canonical = np.asarray(values, dtype="<i8")
+    return hashlib.sha256(canonical.tobytes(order="C")).hexdigest()
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     args = _parse_args(argv)
     output_dir = Path(args.output_dir)
@@ -56,10 +81,33 @@ def main(argv: Sequence[str] | None = None) -> None:
     if summary_path.exists() and not bool(args.force):
         raise FileExistsError("refusing to overwrite contributor cache")
     source = load_gaussian_vfm_source_from_ply(Path(args.gaussian_ply))
-    # All primitives participate so that occlusion/transmittance are correct.
+    clean_source_indices = np.arange(source.xyz.shape[0], dtype=np.int64)
+    if str(args.clean_gaussian_ply):
+        quality = load_2dgs_primitive_quality(Path(args.clean_gaussian_ply))
+        if not bool((quality.metadata or {}).get("source_indexed", False)):
+            raise ValueError(
+                "clean_gaussian_ply must carry canonical source_index"
+            )
+        if len(quality) > source.xyz.shape[0]:
+            raise ValueError("clean PLY source indices exceed full 2DGS")
+        clean_source_indices = np.flatnonzero(
+            quality.geometry_confidence > 0.0
+        ).astype(np.int64)
+        if clean_source_indices.size == 0:
+            raise ValueError("clean PLY retained no source primitives")
+    # Occlusion and contributor identity must come from the same declared clean
+    # 2DGS prior as the canonical atlas.  The full source is retained only to
+    # preserve stable source-index identity.
     elements = clean_primitive_surface_elements(
-        source, np.arange(source.xyz.shape[0], dtype=np.int64)
+        source, clean_source_indices
     )
+    geometry_source_sha256 = _file_sha256(Path(args.gaussian_ply))
+    clean_geometry_source_sha256 = (
+        _file_sha256(Path(args.clean_gaussian_ply))
+        if str(args.clean_gaussian_ply)
+        else geometry_source_sha256
+    )
+    clean_source_index_sha256 = _source_index_sha256(clean_source_indices)
     pose_by_image = {
         record.image_id: record.pose_w2c
         for record in parse_cambridge_pose_file(Path(args.mapping_pose_file))
@@ -105,6 +153,17 @@ def main(argv: Sequence[str] | None = None) -> None:
         selected.extend(records[: int(args.views_per_trajectory)])
     if not selected:
         raise ValueError("no requested mapping records were found")
+    shard_count = int(args.shard_count)
+    shard_index = int(args.shard_index)
+    if shard_count < 1 or shard_index < 0 or shard_index >= shard_count:
+        raise ValueError("invalid shard_index/shard_count")
+    selected = [
+        record
+        for index, record in enumerate(selected)
+        if index % shard_count == shard_index
+    ]
+    if not selected:
+        raise ValueError("requested shard contains no mapping records")
     output_dir.mkdir(parents=True, exist_ok=True)
     rows = []
     for index, record in enumerate(selected):
@@ -139,7 +198,20 @@ def main(argv: Sequence[str] | None = None) -> None:
             "height": int(args.height),
             "top_k": int(args.top_k),
             "assignment": "gsplat_topk_contributor_source_index",
-            "uses_complete_2dgs_for_occlusion": True,
+            "uses_complete_2dgs_for_occlusion": not bool(
+                str(args.clean_gaussian_ply)
+            ),
+            "uses_declared_clean_2dgs_for_occlusion": bool(
+                str(args.clean_gaussian_ply)
+            ),
+            "occlusion_primitive_policy": (
+                "declared_clean_source_index_mask"
+                if str(args.clean_gaussian_ply)
+                else "complete_input_2dgs"
+            ),
+            "geometry_source_sha256": geometry_source_sha256,
+            "clean_geometry_source_sha256": clean_geometry_source_sha256,
+            "clean_source_index_sha256": clean_source_index_sha256,
             "stores_rgb": False,
             "stores_rgb_path": False,
             "uses_kdtree_fallback": False,
@@ -161,13 +233,30 @@ def main(argv: Sequence[str] | None = None) -> None:
     report = {
         "stage": "v6_exact_primitive_contributor_cache",
         "view_count": len(rows),
+        "shard_index": shard_index,
+        "shard_count": shard_count,
         "trajectory_ids": sorted(
             {row["trajectory_id"] for row in rows}
         ),
         "trajectory_disjoint_role": "caller_declared_split",
         "camera_audit": camera_audit,
         "assignment": "gsplat_topk_contributor_source_index",
-        "uses_complete_2dgs_for_occlusion": True,
+        "uses_complete_2dgs_for_occlusion": not bool(
+            str(args.clean_gaussian_ply)
+        ),
+        "uses_declared_clean_2dgs_for_occlusion": bool(
+            str(args.clean_gaussian_ply)
+        ),
+        "occlusion_primitive_policy": (
+            "declared_clean_source_index_mask"
+            if str(args.clean_gaussian_ply)
+            else "complete_input_2dgs"
+        ),
+        "full_primitive_count": int(source.xyz.shape[0]),
+        "retained_primitive_count": int(clean_source_indices.size),
+        "geometry_source_sha256": geometry_source_sha256,
+        "clean_geometry_source_sha256": clean_geometry_source_sha256,
+        "clean_source_index_sha256": clean_source_index_sha256,
         "stores_rgb": False,
         "uses_kdtree_fallback": False,
         "records": rows,

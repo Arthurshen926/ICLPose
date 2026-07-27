@@ -34,6 +34,12 @@ class MapletFeatureAtlasBank:
     support_count: np.ndarray
     valid_mask: np.ndarray
     metadata: Mapping[str, object] | None = None
+    mode_features: np.ndarray | None = None
+    mode_weights: np.ndarray | None = None
+    mode_view_directions: np.ndarray | None = None
+    mode_view_covariance: np.ndarray | None = None
+    mode_variance: np.ndarray | None = None
+    mode_valid_mask: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         ids = np.asarray(self.maplet_ids, dtype=np.int64).reshape(-1)
@@ -91,6 +97,61 @@ class MapletFeatureAtlasBank:
         object.__setattr__(self, "features", normalized)
         object.__setattr__(self, "valid_mask", valid)
         object.__setattr__(self, "metadata", metadata)
+        mode_values = (
+            self.mode_features,
+            self.mode_weights,
+            self.mode_view_directions,
+            self.mode_view_covariance,
+            self.mode_variance,
+            self.mode_valid_mask,
+        )
+        if any(value is not None for value in mode_values):
+            if not all(value is not None for value in mode_values):
+                raise ValueError("all view-conditioned mode arrays are required")
+            mode_features = np.asarray(self.mode_features, dtype=np.float32)
+            if (
+                mode_features.ndim != 5
+                or mode_features.shape[0] != count
+                or mode_features.shape[2] != features.shape[1]
+                or mode_features.shape[3:] != (height, width)
+            ):
+                raise ValueError("mode_features must have shape (N,K,C,H,W)")
+            modes = int(mode_features.shape[1])
+            expected = (count, modes, height, width)
+            mode_weights = np.asarray(self.mode_weights, dtype=np.float32)
+            mode_directions = np.asarray(
+                self.mode_view_directions, dtype=np.float32
+            )
+            mode_covariance = np.asarray(
+                self.mode_view_covariance, dtype=np.float32
+            )
+            mode_variance = np.asarray(self.mode_variance, dtype=np.float32)
+            mode_valid = np.asarray(self.mode_valid_mask, dtype=bool)
+            if mode_weights.shape != expected:
+                raise ValueError("mode_weights shape differs")
+            if mode_directions.shape != (*expected, 3):
+                raise ValueError("mode_view_directions shape differs")
+            if mode_covariance.shape != (*expected, 3, 3):
+                raise ValueError("mode_view_covariance shape differs")
+            if mode_variance.shape != expected or mode_valid.shape != expected:
+                raise ValueError("mode variance/valid shape differs")
+            normalized_modes = _normalize_features(
+                mode_features.transpose(0, 1, 3, 4, 2).reshape(
+                    -1, features.shape[1]
+                )
+            ).reshape(count, modes, height, width, features.shape[1])
+            normalized_modes = normalized_modes.transpose(0, 1, 4, 2, 3)
+            normalized_modes *= mode_valid[:, :, None]
+            mode_weights = np.where(mode_valid, mode_weights, 0.0)
+            mode_weights /= np.maximum(
+                np.sum(mode_weights, axis=1, keepdims=True), 1e-8
+            )
+            object.__setattr__(self, "mode_features", normalized_modes)
+            object.__setattr__(self, "mode_weights", mode_weights)
+            object.__setattr__(self, "mode_view_directions", mode_directions)
+            object.__setattr__(self, "mode_view_covariance", mode_covariance)
+            object.__setattr__(self, "mode_variance", mode_variance)
+            object.__setattr__(self, "mode_valid_mask", mode_valid)
 
     @property
     def height(self) -> int:
@@ -104,13 +165,16 @@ class MapletFeatureAtlasBank:
     def feature_dim(self) -> int:
         return int(self.features.shape[1])
 
+    @property
+    def appearance_mode_count(self) -> int:
+        return 1 if self.mode_features is None else int(self.mode_features.shape[1])
+
     def __len__(self) -> int:
         return int(self.maplet_ids.size)
 
     def save_npz(self, path: Path) -> None:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(
-            Path(path),
+        payload = dict(
             maplet_ids=self.maplet_ids,
             centers=self.centers.astype(np.float32),
             frames=self.frames.astype(np.float32),
@@ -123,10 +187,32 @@ class MapletFeatureAtlasBank:
             valid_mask=self.valid_mask.astype(np.uint8),
             metadata_json=np.asarray(json.dumps(dict(self.metadata), sort_keys=True)),
         )
+        if self.mode_features is not None:
+            payload.update(
+                mode_features=self.mode_features.astype(np.float16),
+                mode_weights=self.mode_weights.astype(np.float16),
+                mode_view_directions=self.mode_view_directions.astype(np.float16),
+                mode_view_covariance=self.mode_view_covariance.astype(np.float16),
+                mode_variance=self.mode_variance.astype(np.float16),
+                mode_valid_mask=self.mode_valid_mask.astype(np.uint8),
+            )
+        np.savez_compressed(Path(path), **payload)
 
     @classmethod
     def load_npz(cls, path: Path) -> "MapletFeatureAtlasBank":
         with np.load(Path(path), allow_pickle=False) as data:
+            optional = {}
+            if "mode_features" in data.files:
+                optional = {
+                    "mode_features": data["mode_features"],
+                    "mode_weights": data["mode_weights"],
+                    "mode_view_directions": data["mode_view_directions"],
+                    "mode_view_covariance": data["mode_view_covariance"],
+                    "mode_variance": data["mode_variance"],
+                    "mode_valid_mask": np.asarray(
+                        data["mode_valid_mask"], dtype=bool
+                    ),
+                }
             return cls(
                 maplet_ids=data["maplet_ids"],
                 centers=data["centers"],
@@ -139,6 +225,7 @@ class MapletFeatureAtlasBank:
                 support_count=data["support_count"],
                 valid_mask=np.asarray(data["valid_mask"], dtype=bool),
                 metadata=json.loads(str(data["metadata_json"].item())),
+                **optional,
             )
 
 

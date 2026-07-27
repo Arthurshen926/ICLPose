@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 from typing import Sequence
@@ -68,6 +69,19 @@ def _subset_maplets(
     )
 
 
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _source_index_sha256(values: np.ndarray) -> str:
+    canonical = np.asarray(values, dtype="<i8")
+    return hashlib.sha256(canonical.tobytes(order="C")).hexdigest()
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     args = _parse_args(argv)
     output = Path(args.output_atlas)
@@ -80,6 +94,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         VfmSurfaceMapletBank.load_npz(Path(args.maplets)),
         int(args.maximum_maplets),
     )
+    geometry_source_sha256 = _file_sha256(Path(args.gaussian_ply))
+    clean_source_sha256 = _file_sha256(Path(args.clean_gaussian_ply))
+    clean_source_index_sha256 = _source_index_sha256(clean)
+    maplet_source_sha256 = _file_sha256(Path(args.maplets))
     xyz, primitive_ids, valid, audit = canonical_maplet_geometry(
         source,
         maplets,
@@ -96,6 +114,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         metadata={
             "artifact_type": "v6_canonical_maplet_atlas_geometry",
             "geometry_source": audit["geometry_source"],
+            "geometry_source_sha256": geometry_source_sha256,
+            "clean_geometry_source_sha256": clean_source_sha256,
+            "clean_source_index_sha256": clean_source_index_sha256,
+            "maplet_source_sha256": maplet_source_sha256,
             "observation_dependent_geometry": False,
             "feature_state": "unbaked",
             "stores_mapping_rgb": False,
@@ -112,6 +134,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         "stage": "v6_g0_canonical_maplet_atlas_geometry",
         **audit,
         "clean_primitive_count": int(clean.size),
+        "geometry_source_sha256": geometry_source_sha256,
+        "clean_geometry_source_sha256": clean_source_sha256,
+        "clean_source_index_sha256": clean_source_index_sha256,
+        "maplet_source_sha256": maplet_source_sha256,
         "output_atlas": str(output),
         "gate": {
             "observation_independent_geometry": True,

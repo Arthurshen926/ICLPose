@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from dataclasses import replace
 
 import numpy as np
 
@@ -123,6 +124,7 @@ def solve_correlation_se3_update(
     maximum_rotation_step_deg: float = 2.0,
     dominant_mode_conditioning: bool = True,
     mode_radius_cells: float = 1.5,
+    balance_maplet_weights: bool = True,
 ) -> SE3UpdateResult:
     count = int(correlation.xyz.shape[0])
     keep = (
@@ -201,6 +203,18 @@ def solve_correlation_se3_update(
         (1.0 - correlation.null_probability[rows])
         * correlation.matchability[rows]
     ).astype(np.float64)
+    if bool(balance_maplet_weights):
+        # Equalise total evidence per maplet before robust reweighting.  Pixel
+        # area must not let one large repetitive facade suppress several
+        # smaller, geometrically independent maplets.
+        row_maplets = correlation.maplet_ids[rows]
+        unique_maplets = np.unique(row_maplets)
+        target_mass = float(np.sum(confidence)) / max(unique_maplets.size, 1)
+        for maplet_id in unique_maplets:
+            local = row_maplets == maplet_id
+            confidence[local] *= target_mass / max(
+                float(np.sum(confidence[local])), 1e-8
+            )
     delta = np.zeros((6,), dtype=np.float64)
     normal_matrix = np.eye(6, dtype=np.float64)
     for _ in range(max(int(iterations), 1)):
@@ -252,3 +266,70 @@ def solve_correlation_se3_update(
         residual_rms_px=float(np.sqrt(np.mean(np.sum(residual * residual, axis=1)))),
         success=success,
     )
+
+
+def _mode_conditioned_correlation(
+    correlation: CorrelationDistribution,
+    *,
+    mode_rank: int,
+    radius_cells: float = 1.5,
+) -> CorrelationDistribution:
+    probability = np.asarray(correlation.probabilities, dtype=np.float64)
+    if probability.shape[1] <= int(mode_rank):
+        return correlation
+    order = np.argsort(-probability, axis=1, kind="stable")
+    centres = correlation.offsets_xy[order[:, int(mode_rank)]]
+    local = (
+        np.linalg.norm(
+            correlation.offsets_xy[None] - centres[:, None], axis=2
+        )
+        <= float(radius_cells)
+    )
+    conditioned = probability * local
+    conditioned /= np.maximum(np.sum(conditioned, axis=1, keepdims=True), 1e-12)
+    mean = conditioned @ np.asarray(correlation.offsets_xy, dtype=np.float64)
+    residual = correlation.offsets_xy[None] - mean[:, None]
+    covariance = np.einsum(
+        "nk,nki,nkj->nij", conditioned, residual, residual
+    )
+    return replace(
+        correlation,
+        mean_displacement=mean.astype(np.float32),
+        covariance=covariance.astype(np.float32),
+    )
+
+
+def solve_correlation_se3_hypotheses(
+    correlation: CorrelationDistribution,
+    pose_w2c: np.ndarray,
+    camera: ColmapCamera,
+    *,
+    include_second_mode: bool = True,
+    **solver_kwargs,
+) -> tuple[SE3UpdateResult, ...]:
+    """Preserve posterior-mean/top-mode alternatives until verification."""
+
+    variants = [
+        correlation,
+        _mode_conditioned_correlation(correlation, mode_rank=0),
+    ]
+    if bool(include_second_mode):
+        variants.append(_mode_conditioned_correlation(correlation, mode_rank=1))
+    results = []
+    for variant in variants:
+        result = solve_correlation_se3_update(
+            variant,
+            pose_w2c,
+            camera,
+            dominant_mode_conditioning=False,
+            **solver_kwargs,
+        )
+        if not result.success:
+            continue
+        if any(
+            np.linalg.norm(result.delta - previous.delta) < 1e-5
+            for previous in results
+        ):
+            continue
+        results.append(result)
+    return tuple(results)
