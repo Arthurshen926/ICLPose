@@ -115,6 +115,25 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--minimum_supported_maplets", type=int, default=4)
     parser.add_argument("--minimum_reference_trajectories", type=int, default=2)
     parser.add_argument("--reference_modes", type=int, default=4)
+    parser.add_argument(
+        "--output_dim",
+        type=int,
+        default=0,
+        help=(
+            "Spatial projection width. Zero preserves the initialization "
+            "bank width; larger values complete its RADIO subspace with "
+            "orthogonal residual directions."
+        ),
+    )
+    parser.add_argument(
+        "--local_hard_fraction",
+        type=float,
+        default=0.5,
+        help=(
+            "Fraction of each maplet batch drawn from one metric-local "
+            "surface neighbourhood instead of only farthest/easy cells."
+        ),
+    )
     parser.add_argument("--temperature", type=float, default=0.07)
     parser.add_argument("--within_maplet_loss_weight", type=float, default=1.0)
     parser.add_argument("--global_loss_weight", type=float, default=0.25)
@@ -437,6 +456,39 @@ def _farthest_rows(
     return candidates[np.asarray(selected, dtype=np.int64)]
 
 
+def _spatial_projection_initialization(
+    source: np.ndarray,
+    *,
+    output_dim: int,
+    seed: int,
+) -> np.ndarray:
+    """Complete a fitted RADIO subspace without discarding its span."""
+
+    initial = np.asarray(source, dtype=np.float64)
+    if initial.ndim != 2 or not np.all(np.isfinite(initial)):
+        raise ValueError("initial RADIO projection must be a finite matrix")
+    dimension = int(output_dim) if int(output_dim) > 0 else initial.shape[0]
+    if dimension <= 0 or dimension > initial.shape[1]:
+        raise ValueError("spatial projection output dimension is invalid")
+    # QR removes harmless row-scale/non-orthogonality while preserving the
+    # fitted PCA span used by the existing map artifacts.
+    base = np.linalg.qr(initial.T, mode="reduced")[0].T
+    if dimension <= base.shape[0]:
+        return base[:dimension].astype(np.float32)
+    rng = np.random.default_rng(int(seed))
+    extra_count = dimension - base.shape[0]
+    random = rng.standard_normal(
+        (initial.shape[1], extra_count), dtype=np.float64
+    )
+    random -= base.T @ (base @ random)
+    extra = np.linalg.qr(random, mode="reduced")[0].T
+    if extra.shape[0] < extra_count:
+        raise ValueError("could not complete RADIO projection subspace")
+    return np.concatenate([base, extra[:extra_count]], axis=0).astype(
+        np.float32
+    )
+
+
 def _balanced_surface_rows(
     common_rows: np.ndarray,
     *,
@@ -445,6 +497,7 @@ def _balanced_surface_rows(
     maplets_per_batch: int,
     cells_per_maplet: int,
     rng: np.random.Generator,
+    local_hard_fraction: float = 0.5,
 ) -> np.ndarray:
     rows = np.asarray(common_rows, dtype=np.int64)
     _, inverse, counts = np.unique(
@@ -461,14 +514,30 @@ def _balanced_surface_rows(
     sampled = []
     for group in chosen.tolist():
         candidates = rows[inverse == int(group)]
-        sampled.append(
-            _farthest_rows(
-                candidates,
-                xyz,
-                int(cells_per_maplet),
-                rng,
-            )
+        count = min(int(cells_per_maplet), int(candidates.size))
+        local_count = min(
+            count,
+            max(
+                2,
+                int(round(count * float(local_hard_fraction))),
+            ),
         )
+        points = np.asarray(xyz[candidates], dtype=np.float64)
+        seed_index = int(rng.integers(candidates.size))
+        distance = np.linalg.norm(
+            points - points[seed_index][None], axis=1
+        )
+        local = candidates[
+            np.argsort(distance, kind="mergesort")[:local_count]
+        ]
+        remaining = np.setdiff1d(candidates, local, assume_unique=False)
+        far_count = count - int(local.size)
+        far = (
+            _farthest_rows(remaining, xyz, far_count, rng)
+            if far_count > 0
+            else np.zeros((0,), dtype=np.int64)
+        )
+        sampled.append(np.concatenate([local, far]))
     result = np.concatenate(sampled)
     if np.unique(result).size != result.size:
         raise AssertionError("surface-row sampler emitted duplicate cells")
@@ -702,6 +771,7 @@ def _make_validation_episodes(
     cells_per_maplet: int,
     reference_modes: int,
     seed: int,
+    local_hard_fraction: float = 0.5,
 ) -> list[ValidationEpisode]:
     rng = np.random.default_rng(int(seed))
     count = max(1, int(episode_count))
@@ -716,6 +786,7 @@ def _make_validation_episodes(
             maplets_per_batch=int(maplets_per_batch),
             cells_per_maplet=int(cells_per_maplet),
             rng=rng,
+            local_hard_fraction=float(local_hard_fraction),
         )
         reference_view_indices, reference_mode_mask = (
             _select_reference_modes(
@@ -794,15 +865,17 @@ def _validate(
 
 def _selection_key(metrics: Mapping[str, float]) -> tuple[float, ...]:
     return (
-        -float(metrics["within_maplet_recall"]),
         float(metrics["surface_error_median"]),
         -float(metrics["surface_within_10cm"]),
+        -float(metrics["within_maplet_recall"]),
         -float(metrics["global_recall"]),
     )
 
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = _parse_args(argv)
+    if not 0.0 <= float(args.local_hard_fraction) <= 1.0:
+        raise ValueError("local_hard_fraction must lie in [0,1]")
     output_checkpoint = Path(args.output_checkpoint)
     summary_json = Path(args.summary_json)
     if (
@@ -880,8 +953,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     initial_bank = SurfaceRetrievalMapletBank.load_npz(initial_bank_path)
     if initial_bank.query_projection is None:
         raise ValueError("initial maplet bank has no RADIO query projection")
-    initial_projection = np.asarray(
+    source_projection = np.asarray(
         initial_bank.query_projection, dtype=np.float32
+    )
+    initial_projection = _spatial_projection_initialization(
+        source_projection,
+        output_dim=int(args.output_dim),
+        seed=int(args.seed),
     )
     model = SurfaceSpatialProjection(
         SurfaceSpatialProjectionConfig(
@@ -909,6 +987,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         cells_per_maplet=int(args.cells_per_maplet),
         reference_modes=int(args.reference_modes),
         seed=int(args.seed) + 1,
+        local_hard_fraction=float(args.local_hard_fraction),
     )
     metadata_base: dict[str, object] = {
         "stage": "v6_exact_surface_spatial_projection",
@@ -926,7 +1005,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         "trajectory_roles_disjoint": True,
         "strict_holdout_used_for_training_or_selection": False,
         "positive_identity": "exact_canonical_clean_2dgs_surface_cell",
-        "negative_sampling": "maplet_balanced_same_maplet_different_cell",
+        "negative_sampling": (
+            "maplet_balanced_metric_local_hard_and_farthest_cells"
+        ),
+        "local_hard_fraction": float(args.local_hard_fraction),
         "map_side_training_target": (
             "multi_trajectory_reference_mode_marginalization"
         ),
@@ -983,6 +1065,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             maplets_per_batch=int(args.maplets_per_batch),
             cells_per_maplet=int(args.cells_per_maplet),
             rng=rng,
+            local_hard_fraction=float(args.local_hard_fraction),
         )
         reference_view_indices, reference_mode_mask_numpy = (
             _select_reference_modes(
@@ -1094,9 +1177,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         "baseline_validation_metrics": baseline,
         "best_validation_metrics": best_metrics,
         "selection_order": [
-            "maximize_within_maplet_recall",
             "minimize_surface_error_median",
             "maximize_surface_within_10cm",
+            "maximize_within_maplet_recall",
             "maximize_global_recall",
         ],
         "history": history,

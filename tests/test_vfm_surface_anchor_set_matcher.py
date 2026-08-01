@@ -6,8 +6,14 @@ import numpy as np
 import torch
 
 from feature_extract.tools.vfm.localize_2dgs_surface_queries import (
+    _match_radio_final_descriptor_points,
     _sample_mapped_vfm_at_pixels,
     _strict_pose_gate_group_count,
+)
+from feature_extract.vfm.localization.anchor_feature_contract import (
+    RADIO_FINAL_ANCHOR_FEATURE,
+    anchor_feature_kind,
+    compose_anchor_query_descriptors,
 )
 from feature_extract.vfm.localization.surface_anchor_set_matcher import (
     SurfaceAnchorSetMatcher,
@@ -389,6 +395,51 @@ def test_mapped_radio_final_sampling_aligns_image_corners() -> None:
         np.asarray([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32),
         atol=1e-6,
     )
+
+
+def test_radio_only_anchor_contract_discards_alike_descriptors() -> None:
+    alike = np.asarray([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32)
+    radio = np.asarray([[0.0, 3.0, 0.0], [4.0, 0.0, 0.0]], dtype=np.float32)
+    output = compose_anchor_query_descriptors(
+        alike_descriptors=alike,
+        radio_final_descriptors=radio,
+        feature_kind=RADIO_FINAL_ANCHOR_FEATURE,
+        expected_dim=3,
+    )
+    np.testing.assert_allclose(
+        output,
+        np.asarray([[0.0, 1.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float32),
+    )
+    assert (
+        anchor_feature_kind(
+            {"local_feature": "radio_final_at_alike_detection"}
+        )
+        == RADIO_FINAL_ANCHOR_FEATURE
+    )
+
+
+def test_radio_only_local_measurement_uses_radio_correlation() -> None:
+    feature = np.asarray(
+        [
+            [[1.0, 0.0], [0.0, 1.0]],
+            [[0.0, 1.0], [1.0, 0.0]],
+        ],
+        dtype=np.float32,
+    )
+    xy, descriptors, scores = _match_radio_final_descriptor_points(
+        mapped_feature=feature,
+        predicted_xy=np.asarray([[99.0, 0.0]], dtype=np.float32),
+        support_descriptors=np.asarray([[1.0, 0.0]], dtype=np.float32),
+        image_width=100,
+        image_height=100,
+        search_radius_px=99,
+        search_step_px=99,
+    )
+    np.testing.assert_allclose(xy, np.asarray([[0.0, 0.0]], np.float32))
+    np.testing.assert_allclose(
+        descriptors, np.asarray([[1.0, 0.0]], np.float32), atol=1e-6
+    )
+    np.testing.assert_allclose(scores, np.ones((1,), np.float32), atol=1e-6)
 
 
 def test_anchor_descriptor_bank_roundtrips_view_directions(

@@ -89,6 +89,90 @@ class RADIOFeatureExtractor:
         }
 
     @torch.no_grad()
+    def extract_phase_interleaved(
+        self,
+        image_tensor,
+        *,
+        output_stride: int = 8,
+    ):
+        """Extract final-layer tokens on interleaved patch phases.
+
+        Bilinear upsampling a stride-16 token grid cannot create localization
+        phase.  This method instead shifts the ViT patch lattice while keeping
+        the input scale and final RADIO layer unchanged, then interleaves the
+        independently observed grids.  For stride 8 this uses four forward
+        passes whose token centres land at 4, 12, 20, ... input pixels.
+        """
+
+        stride = int(output_stride)
+        patch = int(self.patch_size)
+        if (
+            image_tensor.ndim != 4
+            or int(image_tensor.shape[0]) != 1
+            or stride <= 0
+            or patch % stride != 0
+        ):
+            raise ValueError(
+                "phase-interleaved RADIO requires one image and a stride "
+                "that divides the patch size"
+            )
+        factor = patch // stride
+        if factor not in (1, 2, 4):
+            raise ValueError("supported RADIO phase factors are 1, 2, and 4")
+        if factor == 1:
+            return self.extract(image_tensor)
+        _, _, height, width = image_tensor.shape
+        if height % patch or width % patch:
+            raise ValueError(
+                "phase-interleaved RADIO input dimensions must divide the "
+                "patch size exactly"
+            )
+        # A phase p should place its first patch centre at
+        # (p + 0.5) * output_stride.  Relative to the ordinary patch centre
+        # at patch_size / 2, this is a symmetric integer crop displacement.
+        displacements = [
+            int((phase + 0.5) * stride - 0.5 * patch)
+            for phase in range(factor)
+        ]
+        padding = max(abs(value) for value in displacements)
+        padded = F.pad(
+            image_tensor,
+            (padding, padding, padding, padding),
+            mode="reflect",
+        )
+        grids = {}
+        summaries = []
+        for phase_y, displacement_y in enumerate(displacements):
+            for phase_x, displacement_x in enumerate(displacements):
+                start_y = padding + displacement_y
+                start_x = padding + displacement_x
+                crop = padded[
+                    :,
+                    :,
+                    start_y : start_y + height,
+                    start_x : start_x + width,
+                ]
+                output = self.extract(crop)
+                grids[(phase_y, phase_x)] = output["local"]
+                summaries.append(output["summary"])
+        example = grids[(0, 0)]
+        combined = torch.empty(
+            (
+                int(example.shape[0]),
+                int(example.shape[1]) * factor,
+                int(example.shape[2]) * factor,
+            ),
+            dtype=example.dtype,
+            device=example.device,
+        )
+        for (phase_y, phase_x), grid in grids.items():
+            combined[:, phase_y::factor, phase_x::factor] = grid
+        return {
+            "local": combined,
+            "summary": torch.stack(summaries, dim=0).mean(dim=0),
+        }
+
+    @torch.no_grad()
     def extract_batch(self, image_tensors):
         """
         Extract features from a batch of images (same resolution).

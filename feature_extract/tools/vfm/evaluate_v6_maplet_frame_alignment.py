@@ -14,6 +14,7 @@ import argparse
 import hashlib
 import itertools
 import json
+import math
 from dataclasses import replace
 from pathlib import Path
 from typing import Mapping, Sequence
@@ -33,11 +34,14 @@ from feature_extract.vfm.localization.surface_retrieval_maplets import (
     SurfaceRetrievalMapletBank,
 )
 from feature_extract.vfm.localization_v6.map_entities import (
+    ChartExpansionPosterior,
     MetricSurfaceChartBank,
     RegionChartIndex,
     RetrievalRegionBank,
     compose_metric_region_atlas,
+    expand_region_posterior_to_charts,
     merge_metric_atlases,
+    region_chart_conditional_probabilities,
 )
 from feature_extract.vfm.localization_v6.maplet_atlas import (
     MapletFeatureAtlasBank,
@@ -46,9 +50,11 @@ from feature_extract.vfm.localization_v6.maplet_frame_alignment import (
     MapletFrameMatch,
     MapletFrameSearchConfig,
     align_maplet_frame_global,
+    frame_log_likelihood_ratio,
     frame_matches_to_pose_hypotheses,
     frame_parameter_errors,
     ground_truth_chart_frame,
+    marginal_frame_log_likelihood_ratio,
     pose_hypotheses_for_mode_sets,
     refine_maplet_frame_matches,
 )
@@ -100,7 +106,11 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--m1_regions_per_query", type=int, default=2)
     parser.add_argument("--m2_candidate_charts", type=int, default=12)
     parser.add_argument("--m3_retrieval_regions", type=int, default=16)
-    parser.add_argument("--m3_charts", type=int, default=6)
+    parser.add_argument("--m3_charts", type=int, default=24)
+    parser.add_argument("--m3_min_charts", type=int, default=12)
+    parser.add_argument(
+        "--m3_chart_probability_mass", type=float, default=0.95
+    )
     parser.add_argument("--m3_level", choices=tuple(LEVEL_STRIDE), default="middle")
     parser.add_argument(
         "--frame_levels",
@@ -474,6 +484,11 @@ def _frame_row(
             "scale_xy": target.scale_xy.tolist(),
             "rotation_deg": float(target.in_plane_rotation_deg),
             "canonical_to_query": target.canonical_to_query.tolist(),
+            "canonical_homography": (
+                target.canonical_homography.tolist()
+                if target.canonical_homography is not None
+                else None
+            ),
         },
         "modes": [
             {
@@ -482,6 +497,26 @@ def _frame_row(
                 "rotation_deg": float(match.in_plane_rotation_deg),
                 "canonical_to_query": (
                     match.canonical_to_query.tolist()
+                ),
+                "canonical_homography": (
+                    match.canonical_homography.tolist()
+                    if match.canonical_homography is not None
+                    else None
+                ),
+                "support_fraction": float(match.support_fraction),
+                "support_canonical_hull": (
+                    match.support_canonical_hull.tolist()
+                    if match.support_canonical_hull is not None
+                    else None
+                ),
+                "control_covariance_px": (
+                    match.control_covariance_px.tolist()
+                    if match.control_covariance_px is not None
+                    else None
+                ),
+                "mode_probability": float(match.probability),
+                "identity_probability": float(
+                    match.identity_probability
                 ),
             }
             for match in matches
@@ -494,19 +529,36 @@ def _chart_priors(
     chart_id: int,
     retrieval: MapletRetrievalResult,
     index: RegionChartIndex,
+    regions: RetrievalRegionBank | None = None,
+    charts: MetricSurfaceChartBank | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     associated = set(
         index.regions_for_charts(np.asarray([chart_id])).tolist()
     )
     xy = []
     probability = []
+    conditional_by_region: dict[int, float] = {}
+    if regions is not None and charts is not None:
+        for region_id in associated:
+            chart_ids, conditional = (
+                region_chart_conditional_probabilities(
+                    int(region_id), regions, charts, index
+                )
+            )
+            rows = np.flatnonzero(chart_ids == int(chart_id))
+            conditional_by_region[int(region_id)] = (
+                float(conditional[int(rows[0])]) if rows.size else 0.0
+            )
     for group in retrieval.groups:
         for region_id, value in zip(
             group.maplet_ids.tolist(), group.probabilities.tolist()
         ):
             if int(region_id) in associated and float(value) > 0.0:
                 xy.append(np.asarray(group.query_region_xy, dtype=np.float32))
-                probability.append(float(value))
+                probability.append(
+                    float(value)
+                    * conditional_by_region.get(int(region_id), 1.0)
+                )
     if not xy:
         return np.zeros((0, 2), dtype=np.float32), np.zeros(
             (0,), dtype=np.float32
@@ -578,7 +630,7 @@ def _region_priors(
 
 def _pose_errors(
     hypotheses: Sequence[object], pose_w2c: np.ndarray
-) -> list[dict[str, object]]:
+) -> list[FramePoseHypothesis]:
     result = []
     for hypothesis in hypotheses:
         error = pnp_pose_error(hypothesis.pose_w2c, pose_w2c)
@@ -592,6 +644,21 @@ def _pose_errors(
                 ),
                 "source_chart_ids": list(hypothesis.source_chart_ids),
                 "control_model": str(hypothesis.control_model),
+                "seed_model": str(hypothesis.seed_model),
+                "factor_cost": (
+                    float(hypothesis.factor_cost)
+                    if np.isfinite(hypothesis.factor_cost)
+                    else None
+                ),
+                "pose_mode_support_count": int(
+                    getattr(hypothesis, "mode_support_count", 1)
+                ),
+                "pose_mode_member_count": int(
+                    getattr(hypothesis, "mode_member_count", 1)
+                ),
+                "pose_w2c": np.asarray(
+                    hypothesis.pose_w2c, dtype=np.float64
+                ).reshape(4, 4).tolist(),
             }
         )
     return result
@@ -664,14 +731,381 @@ def _m2_oracle(
     return result
 
 
-def _predicted_pose_diagnostic(
+def _geometry_balanced_chart_subsets(
+    ordered: Sequence[tuple[int, Sequence[MapletFrameMatch]]],
+    atlas: MapletFeatureAtlasBank,
+    *,
+    count: int,
+    maximum_subsets: int,
+) -> list[tuple[int, ...]]:
+    """Cover chart supports before ranking alternatives inside each support.
+
+    Prefix-only Cartesian products silently excluded lower-ranked but
+    geometrically correct charts from every multi-chart pose.  Candidate
+    charts already carry phase evidence, while the 2DGS map supplies their
+    metric neighbourhood. For triples/quads, retain the old high-evidence
+    prefix and compact local coverage. For pairs, enumerate the finite set
+    when the caller's budget permits so distractors cannot delete a support.
+    """
+
+    subset_size = int(count)
+    limit = max(int(maximum_subsets), 0)
+    if subset_size < 2 or limit == 0 or len(ordered) < subset_size:
+        return []
+    row_by_id = {
+        int(value): row
+        for row, value in enumerate(atlas.maplet_ids.tolist())
+    }
+    valid_indices = [
+        index
+        for index, value in enumerate(ordered)
+        if int(value[0]) in row_by_id
+    ]
+    if len(valid_indices) < subset_size:
+        return []
+    centers = {
+        index: np.asarray(
+            atlas.centers[row_by_id[int(ordered[index][0])]],
+            dtype=np.float64,
+        )
+        for index in valid_indices
+    }
+    evidence = {
+        index: marginal_frame_log_likelihood_ratio(ordered[index][1])
+        for index in valid_indices
+    }
+
+    def subset_metrics(
+        subset: tuple[int, ...],
+    ) -> tuple[float, float, int, tuple[int, ...]]:
+        points = np.stack([centers[index] for index in subset])
+        distances = np.linalg.norm(
+            points[:, None] - points[None], axis=2
+        )
+        compactness = float(np.max(distances))
+        mass = float(
+            np.sum(
+                [
+                    evidence[index]
+                    if np.isfinite(evidence[index])
+                    else -50.0
+                    for index in subset
+                ]
+            )
+        )
+        return compactness, -mass, int(np.sum(subset)), subset
+
+    local_candidates: set[tuple[int, ...]] = set()
+    coverage = []
+    neighbourhood_size = max(6, subset_size + 2)
+    for anchor in valid_indices:
+        neighbours = sorted(
+            (index for index in valid_indices if index != anchor),
+            key=lambda index: (
+                float(np.linalg.norm(centers[index] - centers[anchor])),
+                index,
+            ),
+        )[:neighbourhood_size]
+        candidates = [
+            tuple(sorted((anchor, *others)))
+            for others in itertools.combinations(
+                neighbours, subset_size - 1
+            )
+        ]
+        if not candidates:
+            continue
+        local_candidates.update(candidates)
+        coverage.append(min(candidates, key=subset_metrics))
+
+    # Keep the established high-posterior combinations as complementary
+    # hypotheses, but no longer let that prefix define candidate coverage.
+    prefix = valid_indices[: min(len(valid_indices), 8)]
+    local_candidates.update(
+        tuple(value)
+        for value in itertools.combinations(prefix, subset_size)
+    )
+    if subset_size == 2:
+        # With at most 24 phase-screened charts there are only 276 pairs.
+        # Covering every pair is affordable and essential under uncertain
+        # identity: distractor charts otherwise change the nearest-neighbour
+        # graph and can remove a correct two-chart support altogether.  Mode
+        # combinations inside each support remain likelihood/geometry ranked.
+        local_candidates.update(
+            tuple(value)
+            for value in itertools.combinations(valid_indices, 2)
+        )
+    result = []
+    seen: set[tuple[int, ...]] = set()
+    for subset in coverage:
+        if subset not in seen:
+            result.append(subset)
+            seen.add(subset)
+            if len(result) >= limit:
+                return result
+    for subset in sorted(local_candidates, key=subset_metrics):
+        if subset in seen:
+            continue
+        result.append(subset)
+        seen.add(subset)
+        if len(result) >= limit:
+            break
+    return result
+
+
+def _support_balanced_pose_prefix(
+    hypotheses: Sequence[object], limit: int
+) -> list[object]:
+    """Retain chart supports and solver basins before score duplicates."""
+
+    maximum = max(int(limit), 0)
+    representatives = []
+    solver_variants = []
+    remaining = []
+    seen: set[tuple[int, ...]] = set()
+    seen_variant: set[tuple[tuple[int, ...], str]] = set()
+    for hypothesis in hypotheses:
+        support = tuple(
+            sorted(
+                {
+                    int(value)
+                    for value in getattr(
+                        hypothesis, "source_chart_ids", ()
+                    )
+                }
+            )
+        )
+        variant = str(
+            getattr(hypothesis, "control_model", "default")
+        )
+        if support not in seen:
+            representatives.append(hypothesis)
+            seen.add(support)
+            seen_variant.add((support, variant))
+        elif (support, variant) not in seen_variant:
+            # A regional seed and its correlated-factor optimum are distinct
+            # coarse basins even though they use the same charts. Preserve one
+            # of each before near-duplicate solver outputs.
+            solver_variants.append(hypothesis)
+            seen_variant.add((support, variant))
+        else:
+            remaining.append(hypothesis)
+    return [*representatives, *solver_variants, *remaining][:maximum]
+
+
+def _frame_mode_pose_signatures(
+    atlas: MapletFeatureAtlasBank,
+    matches: Sequence[MapletFrameMatch],
+    camera: object,
+) -> dict[int, tuple[tuple[np.ndarray, np.ndarray], ...]]:
+    """Resolve each regional mode to its planar pose branches once."""
+
+    result = {}
+    for match in matches:
+        hypotheses = frame_matches_to_pose_hypotheses(
+            atlas,
+            [match],
+            camera,
+            include_individual_poses=True,
+            include_grouped_pose=False,
+            include_grouped_center_pose=False,
+        )
+        signatures = []
+        for hypothesis in hypotheses:
+            pose = np.asarray(
+                hypothesis.pose_w2c, dtype=np.float64
+            ).reshape(4, 4)
+            signatures.append(
+                (
+                    -pose[:3, :3].T @ pose[:3, 3],
+                    pose[:3, :3],
+                )
+            )
+        result[id(match)] = tuple(signatures)
+    return result
+
+
+def _frame_mode_pose_compatibility(
+    first: MapletFrameMatch,
+    second: MapletFrameMatch,
+    signatures: Mapping[
+        int, tuple[tuple[np.ndarray, np.ndarray], ...]
+    ],
+    *,
+    translation_scale_m: float = 2.0,
+    rotation_scale_deg: float = 10.0,
+) -> float:
+    """Minimum normalized SE(3) distance between two planar branches."""
+
+    first_values = signatures.get(id(first), ())
+    second_values = signatures.get(id(second), ())
+    if not first_values or not second_values:
+        return float("inf")
+    best = float("inf")
+    for first_center, first_rotation in first_values:
+        for second_center, second_rotation in second_values:
+            translation = float(
+                np.linalg.norm(first_center - second_center)
+            )
+            relative = first_rotation @ second_rotation.T
+            rotation = float(
+                np.degrees(
+                    np.arccos(
+                        np.clip(
+                            (np.trace(relative) - 1.0) * 0.5,
+                            -1.0,
+                            1.0,
+                        )
+                    )
+                )
+            )
+            best = min(
+                best,
+                float(
+                    np.hypot(
+                        translation / max(float(translation_scale_m), 1e-6),
+                        rotation / max(float(rotation_scale_deg), 1e-6),
+                    )
+                ),
+            )
+    return best
+
+
+def _geometry_consistent_frame_mode_combinations(
+    mode_lists: Sequence[Sequence[MapletFrameMatch]],
+    signatures: Mapping[
+        int, tuple[tuple[np.ndarray, np.ndarray], ...]
+    ],
+    *,
+    maximum_combinations: int,
+    beam_width: int = 64,
+) -> list[tuple[MapletFrameMatch, ...]]:
+    """Beam-marginalize complete chart-mode distributions.
+
+    Raw frame posterior alone often ranks a locally repetitive facade mode
+    above the geometrically compatible one. The beam therefore combines the
+    mode likelihood with cross-chart agreement of their planar pose branches.
+    It never uses GT and never creates persistent point identities.
+    """
+
+    if not mode_lists or int(maximum_combinations) <= 0:
+        return []
+    beam: list[tuple[float, tuple[MapletFrameMatch, ...]]] = [
+        (0.0, ())
+    ]
+    width = max(int(beam_width), int(maximum_combinations))
+    for modes in mode_lists:
+        expanded = []
+        for _old_score, prefix in beam:
+            for match in modes:
+                values = (*prefix, match)
+                log_evidence = float(
+                    np.mean(
+                        [
+                            frame_log_likelihood_ratio(value)
+                            for value in values
+                        ]
+                    )
+                )
+                pairwise = [
+                    _frame_mode_pose_compatibility(
+                        values[first],
+                        values[second],
+                        signatures,
+                    )
+                    for first in range(len(values))
+                    for second in range(first + 1, len(values))
+                ]
+                finite = [
+                    value for value in pairwise if np.isfinite(value)
+                ]
+                compatibility = (
+                    float(np.mean(finite))
+                    if finite
+                    else (0.0 if len(values) == 1 else 1e3)
+                )
+                expanded.append(
+                    (
+                        log_evidence - 1.5 * compatibility,
+                        values,
+                    )
+                )
+        expanded.sort(
+            key=lambda value: (
+                -value[0],
+                tuple(
+                    -frame_log_likelihood_ratio(match)
+                    for match in value[1]
+                ),
+            )
+        )
+        beam = expanded[:width]
+    return [
+        values
+        for _score, values in beam[: int(maximum_combinations)]
+    ]
+
+
+def _likelihood_ranked_frame_mode_combinations(
+    mode_lists: Sequence[Sequence[MapletFrameMatch]],
+    *,
+    maximum_combinations: int,
+) -> list[tuple[MapletFrameMatch, ...]]:
+    """Retain high-probability regional modes independently of geometry.
+
+    Planar charts have two pose branches.  A wrong branch from two repetitive
+    facades can therefore look more mutually compatible than the correct
+    image-space frames.  Geometry compatibility remains useful, but it must
+    not be the only gate before atlas evidence is evaluated.  This finite
+    likelihood list is its complementary proposal family; it contains no GT
+    signal and preserves the complete chart-frame observations.
+    """
+
+    limit = max(int(maximum_combinations), 0)
+    if not mode_lists or limit == 0 or any(not values for values in mode_lists):
+        return []
+    combinations = itertools.product(*mode_lists)
+    return sorted(
+        (tuple(values) for values in combinations),
+        key=lambda values: (
+            -float(
+                np.mean(
+                    [frame_log_likelihood_ratio(value) for value in values]
+                )
+            ),
+            tuple(-frame_log_likelihood_ratio(value) for value in values),
+        ),
+    )[:limit]
+
+
+def _deduplicated_mode_combinations(
+    *families: Sequence[Sequence[MapletFrameMatch]],
+    maximum_combinations: int,
+) -> list[tuple[MapletFrameMatch, ...]]:
+    """Merge proposal families without spending budget on duplicate modes."""
+
+    result = []
+    seen: set[tuple[int, ...]] = set()
+    for family in families:
+        for values in family:
+            combination = tuple(values)
+            key = tuple(id(value) for value in combination)
+            if key in seen:
+                continue
+            result.append(combination)
+            seen.add(key)
+            if len(result) >= int(maximum_combinations):
+                return result
+    return result
+
+
+def _predicted_pose_hypotheses(
     chart_matches: Mapping[int, Sequence[MapletFrameMatch]],
     atlas: MapletFeatureAtlasBank,
     view: object,
     *,
     maximum_charts: int,
-    maximum_modes_per_chart_for_groups: int = 5,
-    maximum_pose_hypotheses: int = 1024,
+    maximum_modes_per_chart_for_groups: int = 8,
+    maximum_pose_hypotheses: int = 4096,
 ) -> list[dict[str, object]]:
     ordered = sorted(
         (
@@ -679,63 +1113,373 @@ def _predicted_pose_diagnostic(
             for chart_id, matches in chart_matches.items()
             if matches
         ),
-        key=lambda value: -float(value[1][0].score),
+        key=lambda value: -marginal_frame_log_likelihood_ratio(value[1]),
     )[: int(maximum_charts)]
     mode_sets: list[Sequence[MapletFrameMatch]] = []
+    refined_mode_set_keys: set[tuple[int, ...]] = set()
+
+    def mode_set_key(
+        values: Sequence[MapletFrameMatch],
+    ) -> tuple[int, ...]:
+        return tuple(id(value) for value in values)
+
     for _chart_id, matches in ordered:
-        mode_sets.extend((match,) for match in matches[:16])
+        # Four single-chart planar modes retain IPPE branch coverage without
+        # consuming the budget needed for uncertain multi-chart identity.
+        singles = [(match,) for match in matches[:4]]
+        mode_sets.extend(singles)
+        refined_mode_set_keys.update(mode_set_key(value) for value in singles)
+    signature_matches = [
+        match
+        for _chart_id, matches in ordered
+        for match in matches[
+            : int(maximum_modes_per_chart_for_groups)
+        ]
+    ]
+    signatures = _frame_mode_pose_signatures(
+        atlas, signature_matches, view.camera
+    )
+    pair_subset_count = len(ordered) * (len(ordered) - 1) // 2
+    triple_subset_count = min(
+        48,
+        math.comb(len(ordered), 3) if len(ordered) >= 3 else 0,
+    )
+    quad_subset_count = min(
+        24,
+        math.comb(len(ordered), 4) if len(ordered) >= 4 else 0,
+    )
+    # A 1024-mode pool was sufficient to cover every chart pair, but it gave
+    # each triple only three mode combinations.  That is not a faithful
+    # marginalization of the structured frame distribution: on strict q2 the
+    # three correct RADIO chart frames form geometry rank 19 (and likelihood
+    # rank 28) inside their triple, despite each frame being within roughly
+    # one feature cell of its target.  The downstream 2DGS atlas therefore
+    # never received the valid basin that it was meant to disambiguate.
+    #
+    # At the production 4096 budget, retain complementary geometry/appearance
+    # branches for every pair, 32 modes for every screened triple, and twelve
+    # modes for quads.  The resulting finite distribution is still cheap for
+    # the sparse GPU atlas screen.  Smaller diagnostic budgets preserve the
+    # historical coverage-first allocation below.
+    expanded_distribution = int(maximum_pose_hypotheses) >= 2048
+    reserved = (
+        4 * len(ordered)
+        + pair_subset_count
+        + 3 * triple_subset_count
+        + 3 * quad_subset_count
+    )
+    rich_pair_count = min(
+        pair_subset_count,
+        max(int(maximum_pose_hypotheses) - reserved, 0) // 7,
+    )
+    historical_rich_pair_count = min(
+        pair_subset_count,
+        max(1024 - reserved, 0) // 7,
+    )
     for count in (2, 3, 4):
-        for chart_subset in itertools.combinations(ordered[:4], count):
-            per_chart_limit = (
-                min(
-                    int(maximum_modes_per_chart_for_groups),
-                    3,
-                )
-                if count == 4
-                else int(maximum_modes_per_chart_for_groups)
-            )
+        if count == 2:
+            maximum_subsets = pair_subset_count
+            maximum_combinations = 1
+        elif count == 3:
+            maximum_subsets = 48
+            maximum_combinations = 3
+        else:
+            maximum_subsets = 24
+            maximum_combinations = 3
+        subset_indices = _geometry_balanced_chart_subsets(
+            ordered,
+            atlas,
+            count=count,
+            maximum_subsets=maximum_subsets,
+        )
+        for subset_rank, indices in enumerate(subset_indices):
+            chart_subset = [ordered[index] for index in indices]
             mode_lists = [
-                value[1][:per_chart_limit]
+                value[1][
+                    : int(maximum_modes_per_chart_for_groups)
+                ]
                 for value in chart_subset
             ]
-            for combination in itertools.product(*mode_lists):
+            if expanded_distribution:
+                if count == 2:
+                    geometry_count = 4
+                    likelihood_count = 4
+                    combination_count = 8
+                elif count == 3:
+                    geometry_count = 24
+                    likelihood_count = 8
+                    combination_count = 32
+                else:
+                    geometry_count = 8
+                    likelihood_count = 4
+                    combination_count = 12
+                combinations = _deduplicated_mode_combinations(
+                    _geometry_consistent_frame_mode_combinations(
+                        mode_lists,
+                        signatures,
+                        maximum_combinations=geometry_count,
+                    ),
+                    _likelihood_ranked_frame_mode_combinations(
+                        mode_lists,
+                        maximum_combinations=likelihood_count,
+                    ),
+                    maximum_combinations=combination_count,
+                )
+                if count == 2 and subset_rank < historical_rich_pair_count:
+                    refined_combinations = (
+                        _deduplicated_mode_combinations(
+                            _geometry_consistent_frame_mode_combinations(
+                                mode_lists,
+                                signatures,
+                                maximum_combinations=4,
+                            ),
+                            _likelihood_ranked_frame_mode_combinations(
+                                mode_lists,
+                                maximum_combinations=4,
+                            ),
+                            maximum_combinations=8,
+                        )
+                    )
+                else:
+                    refined_combinations = (
+                        _geometry_consistent_frame_mode_combinations(
+                            mode_lists,
+                            signatures,
+                            maximum_combinations=(1 if count == 2 else 3),
+                        )
+                    )
+                refined_mode_set_keys.update(
+                    mode_set_key(value) for value in refined_combinations
+                )
+            elif count == 2 and subset_rank < rich_pair_count:
+                # Four geometry-compatible modes plus the four strongest
+                # independent frame-likelihood modes give each selected pair
+                # complementary branch coverage.  The union is capped at
+                # eight and de-duplicated, so the global finite budget is
+                # preserved.
+                combinations = _deduplicated_mode_combinations(
+                    _geometry_consistent_frame_mode_combinations(
+                        mode_lists,
+                        signatures,
+                        maximum_combinations=4,
+                    ),
+                    _likelihood_ranked_frame_mode_combinations(
+                        mode_lists,
+                        maximum_combinations=4,
+                    ),
+                    maximum_combinations=8,
+                )
+            else:
+                combinations = (
+                    _geometry_consistent_frame_mode_combinations(
+                        mode_lists,
+                        signatures,
+                        maximum_combinations=maximum_combinations,
+                    )
+                )
+            for combination in combinations:
                 mode_sets.append(combination)
-    hypotheses = pose_hypotheses_for_mode_sets(
-        atlas, mode_sets, view.camera
+                if len(mode_sets) >= int(maximum_pose_hypotheses):
+                    break
+            if len(mode_sets) >= int(maximum_pose_hypotheses):
+                break
+        if len(mode_sets) >= int(maximum_pose_hypotheses):
+            break
+    if expanded_distribution:
+        refined_mode_sets = [
+            value
+            for value in mode_sets
+            if mode_set_key(value) in refined_mode_set_keys
+        ]
+        seed_only_mode_sets = [
+            value
+            for value in mode_sets
+            if mode_set_key(value) not in refined_mode_set_keys
+        ]
+        hypotheses = [
+            *pose_hypotheses_for_mode_sets(
+                atlas,
+                refined_mode_sets,
+                view.camera,
+                refine_grouped_pose=True,
+            ),
+            *pose_hypotheses_for_mode_sets(
+                atlas,
+                seed_only_mode_sets,
+                view.camera,
+                refine_grouped_pose=False,
+            ),
+        ]
+        hypotheses.sort(
+            key=lambda value: (
+                -value.score,
+                value.reprojection_error_px,
+                -len(value.source_chart_ids),
+            )
+        )
+    else:
+        hypotheses = list(
+            pose_hypotheses_for_mode_sets(
+                atlas, mode_sets, view.camera
+            )
+        )
+    return _support_balanced_pose_prefix(
+        hypotheses, int(maximum_pose_hypotheses)
+    )
+
+
+def _predicted_pose_diagnostic(
+    chart_matches: Mapping[int, Sequence[MapletFrameMatch]],
+    atlas: MapletFeatureAtlasBank,
+    view: object,
+    *,
+    maximum_charts: int,
+    maximum_modes_per_chart_for_groups: int = 8,
+    maximum_pose_hypotheses: int = 1024,
+) -> list[dict[str, object]]:
+    hypotheses = _predicted_pose_hypotheses(
+        chart_matches,
+        atlas,
+        view,
+        maximum_charts=int(maximum_charts),
+        maximum_modes_per_chart_for_groups=int(
+            maximum_modes_per_chart_for_groups
+        ),
+        maximum_pose_hypotheses=int(maximum_pose_hypotheses),
     )
     return _pose_errors(
-        hypotheses[: int(maximum_pose_hypotheses)], view.pose_w2c
+        hypotheses, view.pose_w2c
     )
 
 
 def _candidate_retrieved_charts(
     retrieval: MapletRetrievalResult,
     index: RegionChartIndex,
+    regions: RetrievalRegionBank,
+    charts: MetricSurfaceChartBank,
     region_limit: int,
     chart_limit: int,
-) -> np.ndarray:
+    *,
+    minimum_charts: int = 12,
+    cumulative_probability: float = 0.95,
+) -> ChartExpansionPosterior:
     region_ids = retrieval.ranked_maplet_ids[: int(region_limit)]
-    region_evidence = {
+    evidence_by_id = {
         int(region_id): float(value)
         for region_id, value in zip(
             retrieval.ranked_maplet_ids.tolist(),
             retrieval.evidence.tolist(),
         )
     }
-    candidates = index.charts_for_regions(region_ids)
-    scored = []
-    for chart_id in candidates.tolist():
-        associated = index.regions_for_charts(np.asarray([chart_id]))
-        evidence = sum(
-            region_evidence.get(int(region_id), 0.0)
-            for region_id in associated.tolist()
-        )
-        scored.append((float(evidence), int(chart_id)))
-    scored.sort(reverse=True)
-    return np.asarray(
-        [chart_id for _score, chart_id in scored[: int(chart_limit)]],
-        dtype=np.int64,
+    return expand_region_posterior_to_charts(
+        region_ids,
+        np.asarray(
+            [evidence_by_id.get(int(value), 0.0) for value in region_ids],
+            dtype=np.float64,
+        ),
+        regions,
+        charts,
+        index,
+        minimum_charts=min(int(minimum_charts), int(chart_limit)),
+        maximum_charts=int(chart_limit),
+        cumulative_probability=float(cumulative_probability),
     )
+
+
+def _chart_expansion_diagnostics(
+    retrieval: MapletRetrievalResult,
+    posterior: ChartExpansionPosterior,
+    visible_ids: np.ndarray,
+    visible_counts: np.ndarray,
+    index: RegionChartIndex,
+    *,
+    region_limit: int,
+) -> dict[str, object]:
+    """Separate retrieval, index expansion, ranking and truncation losses."""
+
+    if visible_ids.size == 0:
+        return {}
+    dominant = int(visible_ids[int(np.argmax(visible_counts))])
+    dominant_regions = set(
+        index.regions_for_charts(np.asarray([dominant])).tolist()
+    )
+    retrieval_rank = {
+        int(value): row + 1
+        for row, value in enumerate(
+            retrieval.ranked_maplet_ids.tolist()
+        )
+    }
+    dominant_region_rank = min(
+        (
+            retrieval_rank[int(value)]
+            for value in dominant_regions
+            if int(value) in retrieval_rank
+        ),
+        default=None,
+    )
+    normalized_rank = {
+        int(value): row + 1
+        for row, value in enumerate(posterior.chart_ids.tolist())
+    }
+    # Historical degree-biased score retained only to quantify the bug.
+    selected_regions = retrieval.ranked_maplet_ids[: int(region_limit)]
+    evidence_by_region = {
+        int(region_id): float(value)
+        for region_id, value in zip(
+            retrieval.ranked_maplet_ids.tolist(),
+            retrieval.evidence.tolist(),
+        )
+    }
+    expanded = index.charts_for_regions(selected_regions)
+    legacy = sorted(
+        (
+            (
+                sum(
+                    evidence_by_region.get(int(region_id), 0.0)
+                    for region_id in index.regions_for_charts(
+                        np.asarray([chart_id])
+                    ).tolist()
+                ),
+                int(chart_id),
+            )
+            for chart_id in expanded.tolist()
+        ),
+        key=lambda value: (-value[0], value[1]),
+    )
+    legacy_rank = {
+        chart_id: row + 1
+        for row, (_score, chart_id) in enumerate(legacy)
+    }
+    total = max(float(np.sum(visible_counts)), 1.0)
+    result: dict[str, object] = {
+        "dominant_chart_id": dominant,
+        "dominant_region_rank": dominant_region_rank,
+        "dominant_region_in_top_regions": bool(
+            dominant_region_rank is not None
+            and int(dominant_region_rank) <= int(region_limit)
+        ),
+        "dominant_chart_in_expanded_candidates": bool(
+            dominant in set(expanded.tolist())
+        ),
+        "dominant_chart_degree_biased_rank": legacy_rank.get(dominant),
+        "dominant_chart_normalized_rank": normalized_rank.get(dominant),
+        "expanded_chart_count": int(posterior.chart_ids.size),
+        "selected_chart_count": int(posterior.selected_chart_ids.size),
+        "selected_probability_mass": float(
+            posterior.selected_probability_mass
+        ),
+    }
+    for rank in (6, 12, 24):
+        chart_ids = posterior.chart_ids[:rank]
+        hit = np.isin(visible_ids, chart_ids)
+        result[f"dominant_chart_recall_at_{rank}"] = bool(
+            dominant in set(chart_ids.tolist())
+        )
+        result[f"visible_chart_count_at_{rank}"] = int(np.sum(hit))
+        result[f"visible_surface_coverage_at_{rank}"] = float(
+            np.sum(visible_counts[hit]) / total
+        )
+    return result
 
 
 def _aggregate_boolean(rows: Sequence[Mapping[str, object]], key: str) -> float:
@@ -765,6 +1509,60 @@ def _aggregate_retrieval(
                     for row in rows
                 ]
             )
+        )
+    return result
+
+
+def _aggregate_chart_expansion(
+    rows: Sequence[Mapping[str, object]],
+) -> dict[str, object]:
+    local = [
+        row["d1_region_chart_expansion"]
+        for row in rows
+        if row.get("d1_region_chart_expansion")
+    ]
+    if not local:
+        return {"query_count": 0}
+    result: dict[str, object] = {"query_count": len(local)}
+    for key in (
+        "dominant_region_in_top_regions",
+        "dominant_chart_in_expanded_candidates",
+    ):
+        result[f"{key}_fraction"] = float(
+            np.mean([bool(row[key]) for row in local])
+        )
+    for rank in (6, 12, 24):
+        result[f"dominant_chart_recall_at_{rank}"] = float(
+            np.mean(
+                [
+                    bool(row[f"dominant_chart_recall_at_{rank}"])
+                    for row in local
+                ]
+            )
+        )
+        result[f"visible_surface_coverage_at_{rank}"] = float(
+            np.mean(
+                [
+                    float(row[f"visible_surface_coverage_at_{rank}"])
+                    for row in local
+                ]
+            )
+        )
+    for key in (
+        "dominant_region_rank",
+        "dominant_chart_degree_biased_rank",
+        "dominant_chart_normalized_rank",
+        "expanded_chart_count",
+        "selected_chart_count",
+        "selected_probability_mass",
+    ):
+        values = [
+            float(row[key])
+            for row in local
+            if row.get(key) is not None
+        ]
+        result[f"{key}_median"] = (
+            float(np.median(values)) if values else None
         )
     return result
 
@@ -945,7 +1743,11 @@ def _aggregate_pose_rows(
         if oracle
         else None
     )
-    for control_model in ("frame_controls", "chart_centers"):
+    for control_model in (
+        "chart_factor",
+        "diagnostic_chart_centers",
+        "frame_controls",
+    ):
         result[
             f"candidate_oracle_{control_model}_recall_30cm_3deg"
         ] = float(
@@ -973,6 +1775,38 @@ def _aggregate_pose_rows(
         if top
         else None
     )
+    return result
+
+
+def _oracle_best_frame_modes(
+    chart_matches: Mapping[int, Sequence[MapletFrameMatch]],
+    atlas: MapletFeatureAtlasBank,
+    view: object,
+) -> dict[int, tuple[MapletFrameMatch, ...]]:
+    """GT-only diagnostic: keep the generated mode with least control error."""
+
+    result = {}
+    for chart_id, matches in chart_matches.items():
+        if not matches:
+            continue
+        target = ground_truth_chart_frame(
+            atlas,
+            int(chart_id),
+            view.pose_w2c,
+            view.camera,
+            feature_stride=int(matches[0].feature_stride),
+            feature_level="diagnostic_gt_homography",
+            model="homography",
+        )
+        if target is None:
+            continue
+        best = min(
+            matches,
+            key=lambda value: frame_parameter_errors(
+                value, target
+            )["control_error_px"],
+        )
+        result[int(chart_id)] = (best,)
     return result
 
 
@@ -1158,8 +1992,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                     view.pose_w2c,
                     view.camera,
                     feature_stride=stride,
-                    feature_level="m1_gt_affine",
-                    model="affine",
+                    feature_level="m1_gt_homography",
+                    model="homography",
                 )
                 if target is not None:
                     m1_rows.append(
@@ -1218,8 +2052,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                     view.pose_w2c,
                     view.camera,
                     feature_stride=stride,
-                    feature_level="m1_composite_gt_affine",
-                    model="affine",
+                    feature_level="m1_composite_gt_homography",
+                    model="homography",
                 )
                 if composite_target is not None:
                     m1_composite_rows.append(
@@ -1344,11 +2178,20 @@ def main(argv: Sequence[str] | None = None) -> None:
         else:
             retrieved_pose_errors = []
         retrieved_chart_matches = {}
-        retrieved_chart_ids = _candidate_retrieved_charts(
+        retrieved_chart_posterior = _candidate_retrieved_charts(
             retrieval,
             index,
+            retrieval_region_bank,
+            chart_banks[m3_level],
             int(args.m3_retrieval_regions),
             int(args.m3_charts),
+            minimum_charts=int(args.m3_min_charts),
+            cumulative_probability=float(
+                args.m3_chart_probability_mass
+            ),
+        )
+        retrieved_chart_ids = (
+            retrieved_chart_posterior.selected_chart_ids
         )
         for chart_id in retrieved_chart_ids.tolist():
             prior_xy, prior_probability = _chart_priors(
@@ -1371,8 +2214,16 @@ def main(argv: Sequence[str] | None = None) -> None:
                 location_prior_sigma_px=96.0,
                 location_prior_strength=0.20,
             )
-            retrieved_chart_matches[int(chart_id)] = (
-                refine_maplet_frame_matches(
+            retrieved_chart_matches[int(chart_id)] = tuple(
+                replace(
+                    value,
+                    identity_probability=(
+                        retrieved_chart_posterior.probability_for(
+                            int(chart_id)
+                        )
+                    ),
+                )
+                for value in refine_maplet_frame_matches(
                     atlases[m3_level],
                     raw_matches[:8],
                     encoded[m3_level],
@@ -1382,6 +2233,66 @@ def main(argv: Sequence[str] | None = None) -> None:
             )
         retrieved_chart_pose_errors = _predicted_pose_diagnostic(
             retrieved_chart_matches,
+            atlases[m3_level],
+            view,
+            maximum_charts=int(args.m3_charts),
+        )
+        expansion_diagnostic = _chart_expansion_diagnostics(
+            retrieval,
+            retrieved_chart_posterior,
+            visible_ids,
+            visible_counts,
+            index,
+            region_limit=int(args.m3_retrieval_regions),
+        )
+        correct_oracle_mode_errors = _predicted_pose_diagnostic(
+            _oracle_best_frame_modes(
+                refined_predicted_by_level[m3_level],
+                atlases[m3_level],
+                view,
+            ),
+            atlases[m3_level],
+            view,
+            maximum_charts=int(args.m1_charts_per_query),
+        )
+        retrieved_oracle_mode_matches = _oracle_best_frame_modes(
+            retrieved_chart_matches,
+            atlases[m3_level],
+            view,
+        )
+        retrieved_oracle_mode_errors = _predicted_pose_diagnostic(
+            retrieved_oracle_mode_matches,
+            atlases[m3_level],
+            view,
+            maximum_charts=int(args.m3_charts),
+        )
+        retrieved_gt_frame_matches = {}
+        visible_set = set(int(value) for value in visible_ids.tolist())
+        for chart_id in retrieved_chart_ids.tolist():
+            if int(chart_id) not in visible_set:
+                continue
+            target = ground_truth_chart_frame(
+                atlases[m3_level],
+                int(chart_id),
+                view.pose_w2c,
+                view.camera,
+                feature_stride=LEVEL_STRIDE[m3_level],
+                feature_level="diagnostic_runtime_retrieval_gt_homography",
+                model="homography",
+            )
+            if target is not None:
+                retrieved_gt_frame_matches[int(chart_id)] = (
+                    replace(
+                        target,
+                        identity_probability=(
+                            retrieved_chart_posterior.probability_for(
+                                int(chart_id)
+                            )
+                        ),
+                    ),
+                )
+        retrieved_gt_frame_pose_errors = _predicted_pose_diagnostic(
+            retrieved_gt_frame_matches,
             atlases[m3_level],
             view,
             maximum_charts=int(args.m3_charts),
@@ -1397,9 +2308,30 @@ def main(argv: Sequence[str] | None = None) -> None:
             "m1_region_ids": correct_regions.tolist(),
             "m2": m2,
             "m3_correct_chart_pose_errors": correct_chart_pose_errors,
+            "d3_correct_identity_oracle_mode_pose_errors": (
+                correct_oracle_mode_errors
+            ),
             "m3_correct_region_pose_errors": correct_pose_errors,
             "m3_retrieved_region_ids": retrieved_region_ids,
             "m3_retrieved_chart_ids": retrieved_chart_ids.tolist(),
+            "m3_chart_expansion": {
+                "ranked_chart_ids": (
+                    retrieved_chart_posterior.chart_ids.tolist()
+                ),
+                "ranked_chart_probability": (
+                    retrieved_chart_posterior.chart_probability.tolist()
+                ),
+                "selected_probability_mass": float(
+                    retrieved_chart_posterior.selected_probability_mass
+                ),
+            },
+            "d1_region_chart_expansion": expansion_diagnostic,
+            "d2_retrieved_charts_gt_frame_pose_errors": (
+                retrieved_gt_frame_pose_errors
+            ),
+            "d4_retrieved_predicted_frame_oracle_mode_pose_errors": (
+                retrieved_oracle_mode_errors
+            ),
             "m3_retrieved_visible_region_count": int(
                 np.sum(np.isin(retrieved_region_ids, visible_region_ids))
             ),
@@ -1499,10 +2431,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             "uses_loftr": False,
             "uses_point_correspondence_pnp": False,
             "uses_final_point_correspondence_pnp": False,
-            "uses_regional_frame_control_pose_solver": True,
-            "includes_chart_center_grouped_diagnostic": True,
+            "uses_regional_frame_control_seed_solver": True,
+            "uses_chart_block_factor_refinement": True,
+            "includes_chart_center_grouped_diagnostic": False,
             "coarse_geometry": (
-                "canonical_metric_chart_frame_controls_to_IPPE_or_grouped_pose"
+                "chart_projection_to_IPPE_or_EPNP_seed_then_correlated_chart_factor"
             ),
         },
         "scene_evidence": {
@@ -1534,6 +2467,24 @@ def main(argv: Sequence[str] | None = None) -> None:
         "m3_retrieved_composite_region_predicted_frame_pose": _aggregate_pose_rows(
             query_rows, "m3_retrieved_pose_errors"
         ),
+        "d1_region_to_chart_coverage": _aggregate_chart_expansion(
+            query_rows
+        ),
+        "d2_actual_retrieval_gt_frame_pose": _aggregate_pose_rows(
+            query_rows, "d2_retrieved_charts_gt_frame_pose_errors"
+        ),
+        "d3_correct_identity_predicted_frame_oracle_mode_pose": (
+            _aggregate_pose_rows(
+                query_rows,
+                "d3_correct_identity_oracle_mode_pose_errors",
+            )
+        ),
+        "d4_actual_retrieval_predicted_frame_oracle_mode_pose": (
+            _aggregate_pose_rows(
+                query_rows,
+                "d4_retrieved_predicted_frame_oracle_mode_pose_errors",
+            )
+        ),
         "diagnostic_probability_note": (
             "frame-mode null/probabilities are explicitly uncalibrated "
             "diagnostics; they are not production confidence"
@@ -1544,6 +2495,10 @@ def main(argv: Sequence[str] | None = None) -> None:
             "m2_candidate_charts": int(args.m2_candidate_charts),
             "m3_retrieval_regions": int(args.m3_retrieval_regions),
             "m3_charts": int(args.m3_charts),
+            "m3_min_charts": int(args.m3_min_charts),
+            "m3_chart_probability_mass": float(
+                args.m3_chart_probability_mass
+            ),
             "m3_level": m3_level,
             "frame_levels": list(frame_levels),
             "scene_evidence_for_m3": "topq_nms",
@@ -1551,6 +2506,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             "retrieval_location_prior_strength": 0.20,
             "composite_region_resolution": 48,
             "local_refinement_iterations": 20,
+            "local_refinement_model": "projective_homography",
+            "local_refinement_fixed_canonical_denominator": True,
             "joint_translation_affine_nms": True,
             "maximum_modes_per_spatial_cluster": 2,
             "maximum_appearance_modes": 2,
@@ -1592,6 +2549,10 @@ def main(argv: Sequence[str] | None = None) -> None:
                         "m3_correct_composite_region_predicted_frame_pose",
                         "m3_retrieved_metric_charts_predicted_frame_pose",
                         "m3_retrieved_composite_region_predicted_frame_pose",
+                        "d1_region_to_chart_coverage",
+                        "d2_actual_retrieval_gt_frame_pose",
+                        "d3_correct_identity_predicted_frame_oracle_mode_pose",
+                        "d4_actual_retrieval_predicted_frame_oracle_mode_pose",
                     )
                 },
             },

@@ -22,6 +22,12 @@ from feature_extract.vfm.colmap_tracks import ColmapCamera, read_colmap_cameras_
 from feature_extract.vfm.localization.real_image_observation_features import (
     AlikeDenseObservationExtractor,
 )
+from feature_extract.vfm.localization.anchor_feature_contract import (
+    ALIKE_RADIO_FINAL_ANCHOR_FEATURE,
+    RADIO_FINAL_ANCHOR_FEATURE,
+    anchor_feature_kind,
+    compose_anchor_query_descriptors,
+)
 from feature_extract.vfm.localization.surface_anchor_set_matcher import (
     load_surface_anchor_set_matcher,
     match_query_to_surface_anchors,
@@ -338,6 +344,136 @@ def _sample_mapped_vfm_at_pixels(
     return sampled.astype(np.float32)
 
 
+def _match_radio_final_descriptor_points(
+    *,
+    mapped_feature: np.ndarray,
+    predicted_xy: np.ndarray,
+    support_descriptors: np.ndarray,
+    image_width: int,
+    image_height: int,
+    search_radius_px: int,
+    search_step_px: int = 2,
+    point_chunk_size: int = 32,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Measure map descriptors by local RADIO-final correlation only."""
+
+    predicted = np.asarray(predicted_xy, dtype=np.float32).reshape(-1, 2)
+    support = np.asarray(support_descriptors, dtype=np.float32)
+    if support.ndim != 2 or support.shape[0] != predicted.shape[0]:
+        raise ValueError(
+            "support descriptors must align with predicted points"
+        )
+    if support.shape[1] != int(np.asarray(mapped_feature).shape[0]):
+        raise ValueError(
+            "support and query RADIO-final descriptor dimensions differ"
+        )
+    radius = int(search_radius_px)
+    step = int(search_step_px)
+    if radius < 0 or step <= 0 or int(point_chunk_size) <= 0:
+        raise ValueError("RADIO-final local-search limits are invalid")
+    axis = np.arange(-radius, radius + 1, step, dtype=np.float32)
+    if not np.any(axis == 0.0):
+        axis = np.unique(np.concatenate([axis, np.zeros((1,), np.float32)]))
+    offset_y, offset_x = np.meshgrid(axis, axis, indexing="ij")
+    offsets = np.stack([offset_x.reshape(-1), offset_y.reshape(-1)], axis=1)
+    measured_xy: list[np.ndarray] = []
+    measured_descriptors: list[np.ndarray] = []
+    measured_scores: list[np.ndarray] = []
+    for begin in range(0, len(predicted), int(point_chunk_size)):
+        end = min(begin + int(point_chunk_size), len(predicted))
+        candidates = predicted[begin:end, None, :] + offsets[None, :, :]
+        candidates[..., 0] = np.clip(
+            candidates[..., 0], 0.0, float(int(image_width) - 1)
+        )
+        candidates[..., 1] = np.clip(
+            candidates[..., 1], 0.0, float(int(image_height) - 1)
+        )
+        flat_descriptors = _sample_mapped_vfm_at_pixels(
+            mapped_feature,
+            candidates.reshape(-1, 2),
+            image_width=int(image_width),
+            image_height=int(image_height),
+        )
+        candidate_descriptors = flat_descriptors.reshape(
+            end - begin, len(offsets), -1
+        )
+        similarities = np.einsum(
+            "nkd,nd->nk",
+            candidate_descriptors,
+            support[begin:end],
+            optimize=True,
+        )
+        best = np.argmax(similarities, axis=1)
+        row = np.arange(end - begin)
+        measured_xy.append(candidates[row, best])
+        measured_descriptors.append(candidate_descriptors[row, best])
+        measured_scores.append(similarities[row, best])
+    return (
+        np.concatenate(measured_xy, axis=0).astype(np.float32),
+        np.concatenate(measured_descriptors, axis=0).astype(np.float32),
+        np.concatenate(measured_scores, axis=0).astype(np.float32),
+    )
+
+
+def _measure_anchor_descriptor_points(
+    *,
+    feature_kind: str,
+    alike: AlikeDenseObservationExtractor,
+    image_path: Path,
+    mapped_feature: np.ndarray,
+    predicted_xy: np.ndarray,
+    support_descriptors: np.ndarray,
+    alike_descriptor_dim: int,
+    image_width: int,
+    image_height: int,
+    search_radius_px: int,
+    search_step_px: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, str | None]:
+    """Use exactly the descriptor family declared by the persistent map."""
+
+    if str(feature_kind) == RADIO_FINAL_ANCHOR_FEATURE:
+        xy, descriptors, scores = _match_radio_final_descriptor_points(
+            mapped_feature=mapped_feature,
+            predicted_xy=predicted_xy,
+            support_descriptors=support_descriptors,
+            image_width=int(image_width),
+            image_height=int(image_height),
+            search_radius_px=int(search_radius_px),
+            search_step_px=max(2, int(search_step_px)),
+        )
+        return xy, descriptors, scores, None
+    measured_xy, measured_alike, measured_scores, image_hash = (
+        alike.match_descriptor_points(
+            image_path,
+            predicted_xy,
+            np.asarray(support_descriptors, dtype=np.float32)[
+                :, : int(alike_descriptor_dim)
+            ],
+            image_width=int(image_width),
+            image_height=int(image_height),
+            search_radius_px=int(search_radius_px),
+            search_step_px=int(search_step_px),
+        )
+    )
+    measured_radio = (
+        _sample_mapped_vfm_at_pixels(
+            mapped_feature,
+            measured_xy,
+            image_width=int(image_width),
+            image_height=int(image_height),
+        )
+        if str(feature_kind) == ALIKE_RADIO_FINAL_ANCHOR_FEATURE
+        else None
+    )
+    measured = compose_anchor_query_descriptors(
+        alike_descriptors=measured_alike,
+        radio_final_descriptors=measured_radio,
+        feature_kind=str(feature_kind),
+        expected_dim=int(np.asarray(support_descriptors).shape[1]),
+    )
+    return measured_xy, measured, measured_scores, image_hash
+
+
 def _validate_metadata(metadata: Mapping[str, object], name: str) -> None:
     illegal = [key for key in FORBIDDEN_RUNTIME_FLAGS if bool(metadata.get(key))]
     if illegal:
@@ -470,6 +606,7 @@ def _feature_map_pose_evidence(
     image_path: Path,
     camera: ColmapCamera,
     support_view_id: str | None,
+    feature_kind: str,
     mapped_feature: np.ndarray | None = None,
 ) -> tuple[float, int]:
     """Independent query dense-feature likelihood at pose-projected map anchors."""
@@ -500,32 +637,45 @@ def _feature_map_pose_evidence(
     rows = np.flatnonzero(visible)
     if len(rows) < 8:
         return float("-inf"), int(len(rows))
-    query_descriptors, detector_scores, _image_hash = alike.sample_points(
-        image_path,
-        projected[rows],
-        image_width=int(camera.width),
-        image_height=int(camera.height),
-    )
-    if int(query_descriptors.shape[1]) != int(descriptor_bank.feature_dim):
+    if str(feature_kind) == RADIO_FINAL_ANCHOR_FEATURE:
         if mapped_feature is None:
             raise ValueError(
-                "fused pose evidence requires the query RADIO-final field"
+                "RADIO-only pose evidence requires the query feature field"
             )
-        query_descriptors = np.concatenate(
-            [
-                query_descriptors,
-                _sample_mapped_vfm_at_pixels(
-                    mapped_feature,
-                    projected[rows],
-                    image_width=int(camera.width),
-                    image_height=int(camera.height),
-                ),
-            ],
-            axis=1,
+        query_descriptors = _sample_mapped_vfm_at_pixels(
+            mapped_feature,
+            projected[rows],
+            image_width=int(camera.width),
+            image_height=int(camera.height),
         )
-        query_descriptors /= np.maximum(
-            np.linalg.norm(query_descriptors, axis=1, keepdims=True),
-            1e-8,
+        detector_scores = np.ones((len(rows),), dtype=np.float32)
+    else:
+        query_alike, detector_scores, _image_hash = alike.sample_points(
+            image_path,
+            projected[rows],
+            image_width=int(camera.width),
+            image_height=int(camera.height),
+        )
+        query_radio = (
+            _sample_mapped_vfm_at_pixels(
+                mapped_feature,
+                projected[rows],
+                image_width=int(camera.width),
+                image_height=int(camera.height),
+            )
+            if str(feature_kind) == ALIKE_RADIO_FINAL_ANCHOR_FEATURE
+            and mapped_feature is not None
+            else None
+        )
+        query_descriptors = compose_anchor_query_descriptors(
+            alike_descriptors=query_alike,
+            radio_final_descriptors=query_radio,
+            feature_kind=str(feature_kind),
+            expected_dim=int(descriptor_bank.feature_dim),
+        )
+    if int(query_descriptors.shape[1]) != int(descriptor_bank.feature_dim):
+        raise ValueError(
+            "pose-evidence query and map descriptor dimensions differ"
         )
     bank_row_by_id = {
         int(anchor_id): int(row)
@@ -877,6 +1027,22 @@ def main(argv: Sequence[str] | None = None) -> None:
         _validate_metadata(metadata, name)
     if int(local_bank.feature_dim) != int(anchor_matcher.config.descriptor_dim):
         raise ValueError("anchor matcher and local descriptor dimensions differ")
+    sparse_anchor_feature = anchor_feature_kind(local_bank.metadata)
+    sparse_branch_label = (
+        "radio_final_at_alike_detections"
+        if sparse_anchor_feature == RADIO_FINAL_ANCHOR_FEATURE
+        else "alike_anchor_features"
+    )
+    initial_sparse_branch = (
+        f"radio_maplet_{sparse_branch_label}_set_ot_grouped_pnp"
+    )
+    if bool(args.augment_alike_with_radio_final) and (
+        sparse_anchor_feature != ALIKE_RADIO_FINAL_ANCHOR_FEATURE
+    ):
+        raise ValueError(
+            "--augment_alike_with_radio_final conflicts with the explicit "
+            f"map descriptor contract {sparse_anchor_feature!r}"
+        )
     if set(local_bank.anchor_ids.tolist()) - set(anchors.anchor_ids.tolist()):
         raise ValueError("local descriptor bank contains unknown surface anchors")
 
@@ -982,24 +1148,28 @@ def main(argv: Sequence[str] | None = None) -> None:
                 grid_rows=8,
                 grid_cols=8,
             )
+            detected_radio = (
+                _sample_mapped_vfm_at_pixels(
+                    mapped,
+                    detected.xy,
+                    image_width=int(camera.width),
+                    image_height=int(camera.height),
+                )
+                if sparse_anchor_feature
+                in (
+                    ALIKE_RADIO_FINAL_ANCHOR_FEATURE,
+                    RADIO_FINAL_ANCHOR_FEATURE,
+                )
+                else None
+            )
             query = LocalFeatureFrame(
                 image_id=record.image_id,
                 keypoints_xy=detected.xy,
-                descriptors=(
-                    np.concatenate(
-                        [
-                            detected.descriptors,
-                            _sample_mapped_vfm_at_pixels(
-                                mapped,
-                                detected.xy,
-                                image_width=int(camera.width),
-                                image_height=int(camera.height),
-                            ),
-                        ],
-                        axis=1,
-                    )
-                    if bool(args.augment_alike_with_radio_final)
-                    else detected.descriptors
+                descriptors=compose_anchor_query_descriptors(
+                    alike_descriptors=detected.descriptors,
+                    radio_final_descriptors=detected_radio,
+                    feature_kind=sparse_anchor_feature,
+                    expected_dim=int(local_bank.feature_dim),
                 ),
                 scores=detected.scores,
             )
@@ -1099,7 +1269,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             fixed_pool_runtime = time.time() - stage_started
             result = initial_result
             selection_pool = fixed_verification_pool
-            branch = "radio_maplet_alike_set_ot_grouped_pnp"
+            branch = initial_sparse_branch
             layout_pool_size = 0
             layout_success_count = 0
             selected_layout_view_id = None
@@ -1168,7 +1338,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                         float("-inf"),
                         -1,
                         initial_result,
-                        "radio_maplet_alike_set_ot_grouped_pnp",
+                        initial_sparse_branch,
                         None,
                     )
                 )
@@ -1235,12 +1405,16 @@ def main(argv: Sequence[str] | None = None) -> None:
                         measured_descriptors,
                         measured_scores,
                         _measured_image_hash,
-                    ) = alike.match_descriptor_points(
-                        image_path,
-                        predicted_xy,
-                        support_descriptors[
-                            :, : int(detected.descriptors.shape[1])
-                        ],
+                    ) = _measure_anchor_descriptor_points(
+                        feature_kind=sparse_anchor_feature,
+                        alike=alike,
+                        image_path=image_path,
+                        mapped_feature=mapped,
+                        predicted_xy=predicted_xy,
+                        support_descriptors=support_descriptors,
+                        alike_descriptor_dim=int(
+                            detected.descriptors.shape[1]
+                        ),
                         image_width=int(camera.width),
                         image_height=int(camera.height),
                         search_radius_px=int(
@@ -1248,19 +1422,6 @@ def main(argv: Sequence[str] | None = None) -> None:
                         ),
                         search_step_px=1,
                     )
-                    if bool(args.augment_alike_with_radio_final):
-                        measured_descriptors = np.concatenate(
-                            [
-                                measured_descriptors,
-                                _sample_mapped_vfm_at_pixels(
-                                    mapped,
-                                    measured_xy,
-                                    image_width=int(camera.width),
-                                    image_height=int(camera.height),
-                                ),
-                            ],
-                            axis=1,
-                        )
                     layout_query = LocalFeatureFrame(
                         image_id=record.image_id,
                         keypoints_xy=measured_xy,
@@ -1313,8 +1474,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                                 -int(feature_mode_rank),
                                 layout_result,
                                 (
-                                    "radio_maplet_feature_mode_alike_"
-                                    "anchor_measurement"
+                                    "radio_maplet_feature_mode_"
+                                    f"{sparse_branch_label}_measurement"
                                 ),
                                 str(layout_view_id),
                             )
@@ -1375,12 +1536,16 @@ def main(argv: Sequence[str] | None = None) -> None:
                         measured_descriptors,
                         measured_scores,
                         _measured_image_hash,
-                    ) = alike.match_descriptor_points(
-                        image_path,
-                        predicted_xy,
-                        support_descriptors[
-                            :, : int(detected.descriptors.shape[1])
-                        ],
+                    ) = _measure_anchor_descriptor_points(
+                        feature_kind=sparse_anchor_feature,
+                        alike=alike,
+                        image_path=image_path,
+                        mapped_feature=mapped,
+                        predicted_xy=predicted_xy,
+                        support_descriptors=support_descriptors,
+                        alike_descriptor_dim=int(
+                            detected.descriptors.shape[1]
+                        ),
                         image_width=int(camera.width),
                         image_height=int(camera.height),
                         search_radius_px=int(
@@ -1388,19 +1553,6 @@ def main(argv: Sequence[str] | None = None) -> None:
                         ),
                         search_step_px=1,
                     )
-                    if bool(args.augment_alike_with_radio_final):
-                        measured_descriptors = np.concatenate(
-                            [
-                                measured_descriptors,
-                                _sample_mapped_vfm_at_pixels(
-                                    mapped,
-                                    measured_xy,
-                                    image_width=int(camera.width),
-                                    image_height=int(camera.height),
-                                ),
-                            ],
-                            axis=1,
-                        )
                     expanded_query = LocalFeatureFrame(
                         image_id=record.image_id,
                         keypoints_xy=measured_xy,
@@ -1453,8 +1605,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                                 -int(feature_mode_rank),
                                 expanded_result,
                                 (
-                                    "radio_feature_mode_expanded_stable_"
-                                    "anchor_fallback"
+                                    "radio_feature_mode_expanded_"
+                                    f"{sparse_branch_label}_fallback"
                                 ),
                                 str(layout_view_id),
                             )
@@ -1551,6 +1703,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                             image_path=image_path,
                             camera=camera,
                             support_view_id=candidate_view_id,
+                            feature_kind=sparse_anchor_feature,
                             mapped_feature=mapped,
                         )
                     )
@@ -1682,6 +1835,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                             image_path=image_path,
                             camera=camera,
                             support_view_id=selected_layout_view_id,
+                            feature_kind=sparse_anchor_feature,
                             mapped_feature=mapped,
                         )
                     )
@@ -1695,6 +1849,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                             image_path=image_path,
                             camera=camera,
                             support_view_id=selected_layout_view_id,
+                            feature_kind=sparse_anchor_feature,
                             mapped_feature=mapped,
                         )
                     )
@@ -1715,7 +1870,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                     ):
                         result = refinement_result
                         branch = (
-                            "radio_maplet_alike_set_ot_pose_guided_feature_em"
+                            f"radio_maplet_{sparse_branch_label}_set_ot_"
+                            "pose_guided_feature_em"
                         )
             if (
                 result.success
@@ -1746,12 +1902,16 @@ def main(argv: Sequence[str] | None = None) -> None:
                         measured_descriptors,
                         measured_similarities,
                         _measured_image_hash,
-                    ) = alike.match_descriptor_points(
-                        image_path,
-                        projected_anchor_xy,
-                        projected_anchor_descriptors[
-                            :, : int(detected.descriptors.shape[1])
-                        ],
+                    ) = _measure_anchor_descriptor_points(
+                        feature_kind=sparse_anchor_feature,
+                        alike=alike,
+                        image_path=image_path,
+                        mapped_feature=mapped,
+                        predicted_xy=projected_anchor_xy,
+                        support_descriptors=projected_anchor_descriptors,
+                        alike_descriptor_dim=int(
+                            detected.descriptors.shape[1]
+                        ),
                         image_width=int(camera.width),
                         image_height=int(camera.height),
                         search_radius_px=int(
@@ -1759,19 +1919,6 @@ def main(argv: Sequence[str] | None = None) -> None:
                         ),
                         search_step_px=1,
                     )
-                    if bool(args.augment_alike_with_radio_final):
-                        measured_descriptors = np.concatenate(
-                            [
-                                measured_descriptors,
-                                _sample_mapped_vfm_at_pixels(
-                                    mapped,
-                                    measured_xy,
-                                    image_width=int(camera.width),
-                                    image_height=int(camera.height),
-                                ),
-                            ],
-                            axis=1,
-                        )
                     (
                         measured_xy,
                         measured_descriptors,
@@ -1845,6 +1992,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                                     image_path=image_path,
                                     camera=camera,
                                     support_view_id=selected_layout_view_id,
+                                    feature_kind=sparse_anchor_feature,
                                     mapped_feature=mapped,
                                 )
                             )
@@ -1858,6 +2006,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                                     image_path=image_path,
                                     camera=camera,
                                     support_view_id=selected_layout_view_id,
+                                    feature_kind=sparse_anchor_feature,
                                     mapped_feature=mapped,
                                 )
                             )
@@ -1885,8 +2034,17 @@ def main(argv: Sequence[str] | None = None) -> None:
             diagnostics = {
                 **matcher_diagnostics,
                 "query_feature_count": len(query.keypoints_xy),
+                "anchor_identity_feature": sparse_anchor_feature,
                 "anchor_identity_uses_radio_final": bool(
-                    args.augment_alike_with_radio_final
+                    sparse_anchor_feature
+                    in (
+                        ALIKE_RADIO_FINAL_ANCHOR_FEATURE,
+                        RADIO_FINAL_ANCHOR_FEATURE,
+                    )
+                ),
+                "anchor_identity_uses_alike_descriptor": bool(
+                    sparse_anchor_feature
+                    != RADIO_FINAL_ANCHOR_FEATURE
                 ),
                 "retrieved_maplet_count": len(
                     set(
@@ -2073,6 +2231,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             "augment_alike_with_radio_final": bool(
                 args.augment_alike_with_radio_final
             ),
+            "anchor_identity_feature": sparse_anchor_feature,
             "anchor_top_l": int(args.anchor_top_l),
             "matcher_feature_preferred_base_fill_target": int(
                 args.matcher_feature_preferred_base_fill_target
@@ -2111,9 +2270,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                     "stable_anchor_prototypes"
                 ),
                 "query_measurement": (
-                    "alike_dense_plus_radio_final_at_same_pixels"
-                    if bool(args.augment_alike_with_radio_final)
-                    else "alike_dense"
+                    sparse_anchor_feature
                 ),
             },
             "direct_surface_observation_candidate": {
@@ -2152,10 +2309,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                 ),
                 "weight": float(args.feature_pose_evidence_weight),
                 "source": (
-                    "query_alike_plus_radio_final_vs_stored_anchor_"
+                    f"query_{sparse_anchor_feature}_vs_stored_anchor_"
                     "prototypes"
-                    if bool(args.augment_alike_with_radio_final)
-                    else "query_alike_vs_stored_anchor_prototypes"
                 ),
             },
         },
@@ -2172,15 +2327,13 @@ def main(argv: Sequence[str] | None = None) -> None:
             ),
             "coarse_match": "radio_final_region_to_maplet",
             "fine_match": (
-                (
-                    "alike_plus_radio_final_query_set_to_anchor_set_"
-                    "cross_attention_ot_dustbin"
-                )
-                if bool(args.augment_alike_with_radio_final)
-                else (
-                    "alike_query_set_to_anchor_set_cross_attention_"
-                    "ot_dustbin"
-                )
+                f"{sparse_anchor_feature}_query_set_to_anchor_set_"
+                "cross_attention_ot_dustbin"
+            ),
+            "alike_role": (
+                "detector_only"
+                if sparse_anchor_feature == RADIO_FINAL_ANCHOR_FEATURE
+                else "detector_and_identity_descriptor"
             ),
             "geometry": "grouped_pnp_with_heldout_feature_evidence",
             "support_mode_semantics": (

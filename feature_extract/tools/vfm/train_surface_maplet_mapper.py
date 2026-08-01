@@ -87,6 +87,33 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--validation_offset", type=int, default=0)
     parser.add_argument(
+        "--training_trajectory_ids",
+        nargs="*",
+        default=(),
+        help=(
+            "Optional trajectory-level fit split. Must be paired with "
+            "--validation_trajectory_ids; unlisted trajectories are ignored."
+        ),
+    )
+    parser.add_argument(
+        "--validation_trajectory_ids", nargs="*", default=()
+    )
+    parser.add_argument(
+        "--prototype_trajectory_ids",
+        nargs="*",
+        default=(),
+        help=(
+            "Optional subset of training trajectories used as retrieval prototypes "
+            "during validation. This must match the trajectories baked into the "
+            "deployed identity map; mapper fitting still uses every training trajectory."
+        ),
+    )
+    parser.add_argument(
+        "--strict_holdout_trajectory_ids",
+        nargs="*",
+        default=("seq3", "seq5", "seq13"),
+    )
+    parser.add_argument(
         "--batch_maplets",
         type=int,
         default=64,
@@ -186,6 +213,89 @@ def _split_images(
     return training, validation
 
 
+def _split_images_by_trajectory(
+    image_ids: np.ndarray,
+    training_trajectory_ids: Sequence[str],
+    validation_trajectory_ids: Sequence[str],
+    strict_holdout_trajectory_ids: Sequence[str],
+) -> tuple[set[str], set[str]]:
+    training_ids = {str(value) for value in training_trajectory_ids}
+    validation_ids = {str(value) for value in validation_trajectory_ids}
+    strict_ids = {str(value) for value in strict_holdout_trajectory_ids}
+    if (
+        not training_ids
+        or not validation_ids
+        or training_ids & validation_ids
+        or training_ids & strict_ids
+        or validation_ids & strict_ids
+    ):
+        raise ValueError(
+            "mapper fit/validation/strict-holdout trajectory roles must be "
+            "non-empty and mutually disjoint"
+        )
+    images = {str(value) for value in image_ids.tolist()}
+    training = {
+        image for image in images if image.split("/", 1)[0] in training_ids
+    }
+    validation = {
+        image
+        for image in images
+        if image.split("/", 1)[0] in validation_ids
+    }
+    if not training or not validation:
+        raise ValueError("trajectory-level mapper split has an empty role")
+    return training, validation
+
+
+def _resolve_prototype_images(
+    training_images: set[str],
+    validation_images: set[str],
+    prototype_trajectory_ids: Sequence[str],
+    strict_holdout_trajectory_ids: Sequence[str],
+    *,
+    trajectory_split: bool,
+) -> set[str]:
+    """Resolve the deployment-faithful prototype side of validation.
+
+    A mapper may be fitted from more trajectories than are baked into the
+    production map. Model selection must nevertheless use only the production
+    map trajectories as prototypes, otherwise validation measures a richer map
+    than the one available at localization time.
+    """
+
+    prototype_ids = {str(value) for value in prototype_trajectory_ids}
+    if not prototype_ids:
+        return set(training_images)
+    if not trajectory_split:
+        raise ValueError(
+            "explicit prototype trajectory IDs require a trajectory-level mapper split"
+        )
+    training_ids = {
+        str(image_id).split("/", 1)[0] for image_id in training_images
+    }
+    validation_ids = {
+        str(image_id).split("/", 1)[0] for image_id in validation_images
+    }
+    strict_ids = {str(value) for value in strict_holdout_trajectory_ids}
+    if (
+        not prototype_ids.issubset(training_ids)
+        or prototype_ids & validation_ids
+        or prototype_ids & strict_ids
+    ):
+        raise ValueError(
+            "prototype trajectories must be a non-empty subset of mapper-fit "
+            "trajectories and disjoint from validation/strict holdout"
+        )
+    prototype_images = {
+        image_id
+        for image_id in training_images
+        if str(image_id).split("/", 1)[0] in prototype_ids
+    }
+    if not prototype_images:
+        raise ValueError("prototype trajectory selection contains no mapper observations")
+    return prototype_images
+
+
 def _mapped_observation_descriptors(
     model: SurfaceMapletMapper,
     feature_maps: dict[str, np.ndarray],
@@ -251,7 +361,7 @@ def _evaluate_model(
     token_xy: np.ndarray,
     labels: np.ndarray,
     quality: np.ndarray,
-    train_mask: np.ndarray,
+    prototype_mask: np.ndarray,
     validation_mask: np.ndarray,
     device: torch.device,
     pool_sizes: tuple[int, ...],
@@ -275,7 +385,7 @@ def _evaluate_model(
     return maplet_prototype_retrieval_metrics(
         descriptor_array,
         labels,
-        train_mask,
+        prototype_mask,
         validation_mask,
         quality,
     )
@@ -287,7 +397,7 @@ def _evaluate_raw_radio(
     token_xy: np.ndarray,
     labels: np.ndarray,
     quality: np.ndarray,
-    train_mask: np.ndarray,
+    prototype_mask: np.ndarray,
     validation_mask: np.ndarray,
     region_config: RadioFinalRegionConfig,
 ) -> dict[str, float | int]:
@@ -303,7 +413,7 @@ def _evaluate_raw_radio(
     return maplet_prototype_retrieval_metrics(
         descriptors,
         labels,
-        train_mask,
+        prototype_mask,
         validation_mask,
         quality,
     )
@@ -337,19 +447,48 @@ def main(argv: Sequence[str] | None = None) -> None:
     labels, image_ids, quality, centers = _observation_labels(bank)
     if len(labels) != len(bank.view_image_ids):
         raise RuntimeError("surface-maplet view offsets are inconsistent")
+    use_trajectory_split = bool(args.training_trajectory_ids) or bool(
+        args.validation_trajectory_ids
+    )
+    if use_trajectory_split:
+        if not (
+            bool(args.training_trajectory_ids)
+            and bool(args.validation_trajectory_ids)
+        ):
+            raise ValueError(
+                "training and validation trajectory IDs must be paired"
+            )
+        training_images, validation_images = _split_images_by_trajectory(
+            image_ids,
+            args.training_trajectory_ids,
+            args.validation_trajectory_ids,
+            args.strict_holdout_trajectory_ids,
+        )
+    else:
+        training_images, validation_images = _split_images(
+            image_ids,
+            int(args.validation_stride),
+            int(args.validation_offset),
+        )
+    prototype_images = _resolve_prototype_images(
+        training_images,
+        validation_images,
+        args.prototype_trajectory_ids,
+        args.strict_holdout_trajectory_ids,
+        trajectory_split=bool(use_trajectory_split),
+    )
     feature_maps = _load_raw_feature_maps(
         manifest,
-        set(str(value) for value in image_ids.tolist()),
+        training_images | validation_images,
         str(args.radio_final_layer),
-    )
-    training_images, validation_images = _split_images(
-        image_ids,
-        int(args.validation_stride),
-        int(args.validation_offset),
     )
     train_mask = np.asarray([str(value) in training_images for value in image_ids], dtype=bool)
     validation_mask = np.asarray(
         [str(value) in validation_images for value in image_ids],
+        dtype=bool,
+    )
+    prototype_mask = np.asarray(
+        [str(value) in prototype_images for value in image_ids],
         dtype=bool,
     )
     pool_sizes = _parse_int_tuple(args.pool_sizes)
@@ -361,14 +500,14 @@ def main(argv: Sequence[str] | None = None) -> None:
         bank.view_token_xy,
         labels,
         quality,
-        train_mask,
+        prototype_mask,
         validation_mask,
         region_config,
     )
     input_descriptor_metrics = maplet_prototype_retrieval_metrics(
         bank.view_descriptors,
         labels,
-        train_mask,
+        prototype_mask,
         validation_mask,
         quality,
     )
@@ -426,7 +565,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         bank.view_token_xy,
         labels,
         quality,
-        train_mask,
+        prototype_mask,
         validation_mask,
         device,
         pool_sizes,
@@ -447,6 +586,20 @@ def main(argv: Sequence[str] | None = None) -> None:
         "uses_sfm_tracks": False,
         "training_images": sorted(training_images),
         "validation_images": sorted(validation_images),
+        "prototype_images": sorted(prototype_images),
+        "training_trajectory_ids": sorted(
+            {value.split("/", 1)[0] for value in training_images}
+        ),
+        "validation_trajectory_ids": sorted(
+            {value.split("/", 1)[0] for value in validation_images}
+        ),
+        "prototype_trajectory_ids": sorted(
+            {value.split("/", 1)[0] for value in prototype_images}
+        ),
+        "strict_holdout_trajectory_ids": sorted(
+            str(value) for value in args.strict_holdout_trajectory_ids
+        ),
+        "trajectory_split": bool(use_trajectory_split),
         "pool_sizes": list(pool_sizes),
         "pool_weights": list(pool_weights),
         "initial_checkpoint": str(args.initial_checkpoint),
@@ -544,7 +697,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             bank.view_token_xy,
             labels,
             quality,
-            train_mask,
+            prototype_mask,
             validation_mask,
             device,
             pool_sizes,
@@ -590,12 +743,28 @@ def main(argv: Sequence[str] | None = None) -> None:
             "uses_sfm_tracks": False,
             "query_or_test_pose_used": False,
             "validation_views_disjoint_from_fit": True,
+            "trajectory_level_split": bool(use_trajectory_split),
+            "validation_prototypes_match_deployed_map": True,
         },
         "split": {
             "training_images": sorted(training_images),
             "validation_images": sorted(validation_images),
+            "prototype_images": sorted(prototype_images),
+            "training_trajectory_ids": sorted(
+                {value.split("/", 1)[0] for value in training_images}
+            ),
+            "validation_trajectory_ids": sorted(
+                {value.split("/", 1)[0] for value in validation_images}
+            ),
+            "prototype_trajectory_ids": sorted(
+                {value.split("/", 1)[0] for value in prototype_images}
+            ),
+            "strict_holdout_trajectory_ids": sorted(
+                str(value) for value in args.strict_holdout_trajectory_ids
+            ),
             "training_observations": int(np.sum(train_mask)),
             "validation_observations": int(np.sum(validation_mask)),
+            "prototype_observations": int(np.sum(prototype_mask)),
         },
         "raw_radio_final_validation": raw_metrics,
         "input_maplet_descriptor_validation": input_descriptor_metrics,

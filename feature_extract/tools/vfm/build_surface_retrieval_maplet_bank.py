@@ -30,9 +30,15 @@ from feature_extract.vfm.surface_maplet_bank import (
     SurfaceMapletBuildConfig,
     _assign_observations_to_maplets,
 )
+from feature_extract.vfm.tokens import TokenBankManifest
 from feature_extract.vfm.vfm_2dgs_mapping import (
     Vfm2DgsAnchorMap,
     Vfm2DgsObservationBank,
+)
+from feature_extract.tools.vfm.train_surface_maplet_mapper import (
+    _load_raw_feature_maps,
+    _mapped_observation_descriptors,
+    _validate_final_only_manifest,
 )
 
 
@@ -62,6 +68,17 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--radio_final_manifest",
+        default="",
+        help=(
+            "Raw RADIO-final manifest used to rebuild mapping descriptors as "
+            "full map -> mapper -> context pooling. Required when the legacy "
+            "maplets were produced by another mapper."
+        ),
+    )
+    parser.add_argument("--radio_final_layer", default="radio_final")
+    parser.add_argument("--device", default="cpu")
+    parser.add_argument(
         "--source_already_surface_mapped",
         action="store_true",
         help=(
@@ -83,6 +100,15 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--appearance_modes_per_cell",
         type=int,
         default=2,
+    )
+    parser.add_argument(
+        "--trajectory_ids",
+        nargs="*",
+        default=(),
+        help=(
+            "Optional mapping trajectories whose anonymous view features "
+            "may enter the production prototypes."
+        ),
     )
     parser.add_argument("--output_maplets", required=True)
     parser.add_argument("--summary_json", required=True)
@@ -220,6 +246,87 @@ def _cluster_features(
     return centers, assignments, weights
 
 
+def _full_map_mapped_view_descriptors(
+    source: VfmSurfaceMapletBank,
+    mapper: object,
+    mapper_metadata: dict[str, object],
+    manifest_path: Path,
+    *,
+    layer_name: str,
+    selected_rows: np.ndarray,
+    device: str,
+) -> np.ndarray:
+    """Rebuild map descriptors with the exact deployed operation order.
+
+    A surface mapper is nonlinear, so ``mapper(pool(raw))`` is not
+    interchangeable with ``pool(mapper(full_raw_map))``. The legacy artifact
+    supplies only geometry, view membership, and token locations here; raw
+    RADIO-final maps are projected before regional context pooling exactly as
+    they are for an online query.
+    """
+
+    rows = np.asarray(selected_rows, dtype=np.int64).reshape(-1)
+    if rows.size == 0:
+        raise ValueError("full-map descriptor rebuild selected no views")
+    if np.any(rows < 0) or np.any(rows >= len(source.view_image_ids)):
+        raise ValueError("selected mapping-view row is out of range")
+    manifest = TokenBankManifest.from_json(Path(manifest_path))
+    manifest.validate(verify_checksums=False)
+    _validate_final_only_manifest(manifest, str(layer_name))
+    image_ids = np.asarray(source.view_image_ids, dtype=object)
+    required_images = {str(image_ids[row]) for row in rows.tolist()}
+    feature_maps = _load_raw_feature_maps(
+        manifest, required_images, str(layer_name)
+    )
+    selected_mask = np.zeros((len(image_ids),), dtype=bool)
+    selected_mask[rows] = True
+    pool_sizes = tuple(
+        int(value)
+        for value in mapper_metadata.get("pool_sizes", (1, 3, 5, 9))
+    )
+    pool_weights = tuple(
+        float(value)
+        for value in mapper_metadata.get(
+            "pool_weights", (0.4, 0.3, 0.2, 0.1)
+        )
+    )
+    resolved_device = torch.device(
+        str(device)
+        if torch.cuda.is_available()
+        or not str(device).startswith("cuda")
+        else "cpu"
+    )
+    mapper.model.to(resolved_device)
+    mapper.model.eval()
+    with torch.no_grad():
+        descriptors, rebuilt_rows = _mapped_observation_descriptors(
+            mapper.model,
+            feature_maps,
+            image_ids,
+            np.asarray(source.view_token_xy, dtype=np.float32),
+            selected_mask,
+            resolved_device,
+            pool_sizes,
+            pool_weights,
+        )
+    if not np.array_equal(rebuilt_rows, np.sort(rows)):
+        raise RuntimeError(
+            "full-map mapping descriptor rebuild changed observation rows"
+        )
+    output = np.full(
+        (
+            len(source.view_image_ids),
+            int(mapper.model.config.output_dim),
+        ),
+        np.nan,
+        dtype=np.float32,
+    )
+    output[rebuilt_rows] = (
+        descriptors.detach().cpu().numpy().astype(np.float32)
+    )
+    return output
+
+
 def _spatial_maplet_components(
     source: VfmSurfaceMapletBank,
     observations: Vfm2DgsObservationBank,
@@ -336,6 +443,28 @@ def main(argv: Sequence[str] | None = None) -> None:
     if (output.exists() or summary_path.exists()) and not bool(args.force):
         raise FileExistsError("refusing to overwrite output")
     source = VfmSurfaceMapletBank.load_npz(Path(args.legacy_maplets))
+    requested_trajectories = {
+        str(value) for value in args.trajectory_ids
+    }
+    source_view_image_ids = np.asarray(
+        source.view_image_ids, dtype=object
+    )
+    selected_mapping_view_rows = np.asarray(
+        [
+            row
+            for row, image_id in enumerate(
+                source_view_image_ids.tolist()
+            )
+            if (
+                not requested_trajectories
+                or str(image_id).split("/", 1)[0]
+                in requested_trajectories
+            )
+        ],
+        dtype=np.int64,
+    )
+    if selected_mapping_view_rows.size == 0:
+        raise ValueError("requested mapping trajectories contain no views")
     if str(args.metric_mapper_checkpoint) and str(
         args.surface_mapper_checkpoint
     ):
@@ -347,12 +476,29 @@ def main(argv: Sequence[str] | None = None) -> None:
         source.descriptors, dtype=np.float32
     )
     surface_mapper_sha256 = ""
+    radio_final_manifest_sha256 = ""
+    descriptor_construction = "legacy_precomputed_view_descriptors"
     if str(args.surface_mapper_checkpoint):
         mapper_path = Path(args.surface_mapper_checkpoint)
-        mapper, _mapper_metadata = load_surface_maplet_mapper(
-            mapper_path, device="cpu"
+        mapper, mapper_metadata = load_surface_maplet_mapper(
+            mapper_path, device=str(args.device)
         )
+        strict_holdout = {
+            str(value)
+            for value in mapper_metadata.get(
+                "strict_holdout_trajectory_ids", []
+            )
+        }
+        if requested_trajectories & strict_holdout:
+            raise ValueError(
+                "mapping trajectories overlap mapper strict holdout"
+            )
         if bool(args.source_already_surface_mapped):
+            if str(args.radio_final_manifest):
+                raise ValueError(
+                    "source_already_surface_mapped and "
+                    "radio_final_manifest are mutually exclusive"
+                )
             if (
                 identity_view_descriptors.shape[1]
                 != int(mapper.model.config.output_dim)
@@ -393,13 +539,52 @@ def main(argv: Sequence[str] | None = None) -> None:
                     "source descriptors were produced by a different "
                     "surface mapper"
                 )
+            descriptor_construction = (
+                "verified_existing_full_map_mapper_then_context_pooling"
+            )
+        elif str(args.radio_final_manifest):
+            manifest_path = Path(args.radio_final_manifest)
+            identity_view_descriptors = (
+                _full_map_mapped_view_descriptors(
+                    source,
+                    mapper,
+                    dict(mapper_metadata),
+                    manifest_path,
+                    layer_name=str(args.radio_final_layer),
+                    selected_rows=selected_mapping_view_rows,
+                    device=str(args.device),
+                )
+            )
+            identity_fallback_descriptors = np.zeros(
+                (
+                    len(source),
+                    int(mapper.model.config.output_dim),
+                ),
+                dtype=np.float32,
+            )
+            radio_final_manifest_sha256 = hashlib.sha256(
+                manifest_path.read_bytes()
+            ).hexdigest()
+            descriptor_construction = (
+                "full_radio_map_then_mapper_then_context_pooling"
+            )
         else:
+            if (
+                identity_view_descriptors.shape[1]
+                != int(mapper.model.config.input_dim)
+            ):
+                raise ValueError(
+                    "legacy view descriptors do not inhabit the mapper input "
+                    "space; provide --radio_final_manifest to rebuild them "
+                    "from full RADIO-final maps"
+                )
+            parameter_device = next(mapper.model.parameters()).device
             with torch.no_grad():
                 identity_view_descriptors = (
                     mapper.model(
                         torch.from_numpy(identity_view_descriptors)[
                             :, :, None, None
-                        ]
+                        ].to(parameter_device)
                     )[:, :, 0, 0]
                     .cpu()
                     .numpy()
@@ -409,15 +594,22 @@ def main(argv: Sequence[str] | None = None) -> None:
                     mapper.model(
                         torch.from_numpy(identity_fallback_descriptors)[
                             :, :, None, None
-                        ]
+                        ].to(parameter_device)
                     )[:, :, 0, 0]
                     .cpu()
                     .numpy()
                     .astype(np.float32)
                 )
+            descriptor_construction = (
+                "legacy_pooled_descriptor_mapper_baseline"
+            )
         surface_mapper_sha256 = hashlib.sha256(
             mapper_path.read_bytes()
         ).hexdigest()
+    elif str(args.radio_final_manifest):
+        raise ValueError(
+            "radio_final_manifest requires surface_mapper_checkpoint"
+        )
     if bool(str(args.observation_bank)) != bool(str(args.region_map)):
         raise ValueError(
             "observation_bank and region_map must be provided together"
@@ -451,6 +643,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     if spatial_grid_size < 0:
         raise ValueError("spatial_grid_size must be non-negative")
     if spatial_grid_size > 0:
+        if args.trajectory_ids:
+            raise ValueError(
+                "trajectory filtering is currently defined for compact "
+                "retrieval-region prototypes, not legacy spatial grids"
+            )
         if (
             observation_bank is None
             or region_map is None
@@ -480,15 +677,45 @@ def main(argv: Sequence[str] | None = None) -> None:
         component_centers = []
         component_covariances = []
     offsets = [0]
+    retained_source_rows = []
+    mapping_trajectories = (
+        requested_trajectories
+        if requested_trajectories
+        else {
+            str(value).split("/", 1)[0]
+            for value in source_view_image_ids.tolist()
+        }
+    )
     for row in range(len(source)) if spatial_grid_size == 0 else []:
         begin, end = int(source.view_offsets[row]), int(source.view_offsets[row + 1])
-        observations = identity_view_descriptors[begin:end]
+        view_rows = np.arange(begin, end, dtype=np.int64)
+        if requested_trajectories:
+            view_rows = view_rows[
+                np.asarray(
+                    [
+                        str(source.view_image_ids[index]).split("/", 1)[0]
+                        in requested_trajectories
+                        for index in view_rows.tolist()
+                    ],
+                    dtype=bool,
+                )
+            ]
+        if view_rows.size == 0 and requested_trajectories:
+            continue
+        retained_source_rows.append(int(row))
+        observations = identity_view_descriptors[view_rows]
         observation_weights = np.clip(
-            source.view_quality_scores[begin:end], 1e-4, None
+            source.view_quality_scores[view_rows], 1e-4, None
         )
         if observations.shape[0] == 0:
-            observations = identity_fallback_descriptors[row : row + 1]
-            observation_weights = np.ones((1,), dtype=np.float32)
+            raise RuntimeError(
+                "retained retrieval region has no mapping observation"
+            )
+        if not np.all(np.isfinite(observations)):
+            raise RuntimeError(
+                "retained retrieval region contains an unreconstructed "
+                "mapping descriptor"
+            )
         centers, assignments, weights = _cluster_features(
             observations, observation_weights, maximum_components
         )
@@ -509,10 +736,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                 radius = max(float(np.max(source.extents[row])), 1e-3)
                 spatial_covariance = np.eye(3, dtype=np.float64) * radius**2
             else:
-                local_centers = view_surface_centers[begin:end][members]
-                local_covariances = view_surface_covariances[begin:end][
-                    members
-                ]
+                local_centers = view_surface_centers[view_rows][members]
+                local_covariances = view_surface_covariances[view_rows][members]
                 local_weights = observation_weights[members].astype(
                     np.float64
                 )
@@ -542,6 +767,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
         offsets.append(offsets[-1] + component_count)
     if spatial_grid_size > 0:
+        retained_source_rows = list(range(len(source)))
         offsets = [0]
         for value in components:
             offsets.append(offsets[-1] + int(value.shape[0]))
@@ -560,23 +786,24 @@ def main(argv: Sequence[str] | None = None) -> None:
         feature_space = "surface_metric_radio_final"
     elif str(args.surface_mapper_checkpoint):
         feature_space = "surface_maplet_mapper_radio_final"
+    retained = np.asarray(retained_source_rows, dtype=np.int64)
     bank = SurfaceRetrievalMapletBank(
-        maplet_ids=source.maplet_ids,
-        centers=source.centers,
-        normals=source.normals,
-        extents=source.extents,
-        tangent_frames=source.tangent_frames,
+        maplet_ids=source.maplet_ids[retained],
+        centers=source.centers[retained],
+        normals=source.normals[retained],
+        extents=source.extents[retained],
+        tangent_frames=source.tangent_frames[retained],
         descriptor_offsets=np.asarray(offsets, dtype=np.int64),
         descriptors=descriptors,
         descriptor_weights=descriptor_weights,
         descriptor_centers=descriptor_centers,
         descriptor_covariances=descriptor_covariances,
-        quality_scores=source.quality_scores,
-        descriptor_uncertainties=source.descriptor_variances,
+        quality_scores=source.quality_scores[retained],
+        descriptor_uncertainties=source.descriptor_variances[retained],
         metadata={
             "artifact_type": "anchor_free_surface_retrieval_maplets",
             "vfm_layer": "radio_final",
-            "maplet_count": len(source),
+            "maplet_count": int(retained.size),
             "representation": (
                 "canonical_spatial_radio_final_mixture_per_maplet"
                 if spatial_grid_size > 0
@@ -605,6 +832,12 @@ def main(argv: Sequence[str] | None = None) -> None:
             "uses_point_correspondences": False,
             "has_canonical_tangent_frames": True,
             "surface_mapper_sha256": surface_mapper_sha256,
+            "mapping_trajectory_ids": sorted(mapping_trajectories),
+            "descriptor_construction": descriptor_construction,
+            "radio_final_manifest_sha256": (
+                radio_final_manifest_sha256
+            ),
+            "radio_final_layer": str(args.radio_final_layer),
         },
     )
     bank.save_npz(output)
@@ -643,6 +876,10 @@ def main(argv: Sequence[str] | None = None) -> None:
             "extents",
         ],
         "surface_mapper_sha256": surface_mapper_sha256,
+        "descriptor_construction": descriptor_construction,
+        "radio_final_manifest_sha256": radio_final_manifest_sha256,
+        "radio_final_layer": str(args.radio_final_layer),
+        "mapping_trajectory_ids": sorted(mapping_trajectories),
         "production_contract": dict(bank.metadata or {}),
     }
     summary_path.parent.mkdir(parents=True, exist_ok=True)

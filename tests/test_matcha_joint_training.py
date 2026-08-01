@@ -523,6 +523,27 @@ def _fake_radio_feature_extractor(model: _CountingRadioModel) -> RADIOFeatureExt
     return extractor
 
 
+def test_radio_phase_interleaving_adds_real_stride8_patch_centres() -> None:
+    extractor = RADIOFeatureExtractor.__new__(RADIOFeatureExtractor)
+    extractor.patch_size = 16
+    yy, xx = torch.meshgrid(
+        torch.arange(32), torch.arange(32), indexing="ij"
+    )
+    image = (100 * yy + xx).float()[None, None].repeat(1, 3, 1, 1)
+
+    def fake_extract(value):
+        # Stand in for one final-layer token at every ViT patch centre.
+        local = value[0, 0, 8::16, 8::16][None]
+        return {"local": local, "summary": local.mean().reshape(1)}
+
+    extractor.extract = fake_extract
+    output = extractor.extract_phase_interleaved(image, output_stride=8)
+
+    expected = image[0, 0, 4::8, 4::8]
+    assert output["local"].shape == (1, 4, 4)
+    assert torch.equal(output["local"][0], expected)
+
+
 def test_radio_extract_dual_uses_single_forward_when_coarse_is_final() -> None:
     model = _CountingRadioModel()
     extractor = _fake_radio_feature_extractor(model)

@@ -83,12 +83,12 @@ The active research bridge is `MapletFrameAlignment`:
 ```text
 RADIO-final RetrievalRegions
   -> overlap-aware Top-q / noisy-OR / block-balanced scene evidence
-  -> many-to-many RegionChartIndex
-  -> several independent MetricSurfaceCharts
-  -> per-chart full-query translation / scale / rotation / shear correlation
-  -> optional continuous local affine refinement
-  -> additive independent-chart evidence + canonical frame controls
-  -> IPPE or grouped regional pose modes
+  -> normalized P(chart | query) through the many-to-many RegionChartIndex
+  -> adaptive set of independent MetricSurfaceCharts
+  -> per-chart full-query translation / scale / rotation / shear modes
+  -> fixed-support continuous projective refinement
+  -> one correlated eight-dimensional control factor per chart
+  -> bounded coarse SE(3) modes
 ```
 
 `RetrievalRegionBank` and `MetricSurfaceChartBank` are intentionally different
@@ -113,11 +113,20 @@ flattening disconnected/non-coplanar charts into one virtual plane is retained
 only as a diagnostic; the active bridge aligns the associated metric charts
 independently and combines their regional evidence in pose space.
 
-Cross-scale hypotheses are compared by mean regional correlation. The older
-`support**0.35` factor was methodologically invalid: it rewarded larger
-projected templates even when their mean match was worse. Independent chart
-evidence is additive rather than averaged. Averaging caused single-chart
-modes to swamp geometrically supported three/four-chart modes.
+Region scores are not summed over every adjacent edge. The runtime expansion
+first normalizes `P(chart | region)` for each region and then computes
+`P(chart | query) = sum_region P(region | query) P(chart | region)`. This
+removes graph-degree bias and uses cumulative posterior mass with a bounded
+12--24 chart budget. Cross-scale hypotheses are compared by mean regional
+correlation. The older `support**0.35` factor was methodologically invalid:
+it rewarded larger projected templates even when their mean match was worse.
+
+IPPE/EPNP may convert the four projected controls of one or more charts into
+an initial SE(3) seed. They are not fed independently matched points, stable
+point identities, ALIKE descriptors or SfM tracks. Every seed is refined and
+ranked by robust correlated chart-block factors. This seed conversion does
+not make V6 a point-correspondence-PnP localization route; the final estimator
+remains atlas correlation and continuous surface alignment.
 
 Three older coarse methods remain diagnostic only:
 
@@ -170,9 +179,22 @@ query unmatchable
 valid flow / zero flow
 ```
 
-The runtime path also does not yet close two or three render/correlate/update/
-verify iterations. A one-step oracle experiment is a component diagnostic,
-not end-to-end localization.
+The runtime evaluator now closes the intended loop:
+
+```text
+coarse pose mode
+  -> select pose-visible disconnected maplets
+  -> render maplet atlases
+  -> local displacement distributions
+  -> robust SE(3) proposals
+  -> maplet-disjoint fit/held-out acceptance
+  -> re-render at the accepted pose
+```
+
+This makes Stage C executable, but not yet accurate. The current
+cross-trajectory smoke accepted no SE(3) update; atlas evidence only improved
+the ranking of coarse modes. A connected implementation is not a passed G1/G2
+gate, and a one-query smoke is not an end-to-end accuracy result.
 
 ## StMaryChurch artifacts used by the corrected audit
 
@@ -418,6 +440,181 @@ Typed correlation nulls, P3 proposal integration and Stage-C fine alignment
 remain downstream work; advancing them before M1 control recall passes would
 only optimize around a broken observation model.
 
+## Route-repair D1--D6 audit
+
+The current strict audit supersedes the preceding V24 M3 row for the active
+implementation. It uses the same 12 trajectory-disjoint queries and the
+clean-2DGS lineage, removes the chart-center SQPnP diagnostic from candidate
+generation, and separates identity, frame observation, geometry and ranking.
+
+The implementation fixes the following protocol errors:
+
+- Region-to-Chart expansion is a normalized conditional posterior instead of
+  a degree-biased sum of every neighboring region score;
+- the chart budget covers 95% posterior mass subject to a 12--24 bound instead
+  of truncating unconditionally to six;
+- local frame refinement uses the observed support hull, a fixed canonical
+  denominator, an explicit out-of-view penalty and a full homography;
+- four chart corners form one correlated chart factor rather than four
+  independent pseudo-points;
+- IPPE/EPNP is labelled and retained only as a regional seed mechanism;
+- raw cosine-score addition and the grouped chart-center SQPnP diagnostic no
+  longer determine the reported production candidate set;
+- Stage C is called by the actual runtime evaluator and saves every
+  render/correlate/update/verify decision.
+
+The decomposition is:
+
+| Gate | Strict-12 result |
+| --- | ---: |
+| D1 dominant region in retrieval Top-16 | 9/12 |
+| D1 dominant chart after normalized expansion, @12 / @24 | 5/12 / 7/12 |
+| D1 visible-surface coverage, @12 / @24 | 21.78% / 40.73% |
+| D2 actual retrieval charts + GT projective frames, basin @1/@5/@16 | 12/12 / 12/12 / 12/12 |
+| D3 correct chart identity + best generated frame mode, candidate oracle | 0/12; 2.46 m / 6.99 deg median |
+| D4 actual retrieval + best generated frame mode, candidate oracle | 0/12; 0.95 m / 3.72 deg median |
+| actual runtime frame modes, bounded candidate oracle | 1/12; 1.12 m / 3.57 deg median |
+| actual runtime frame modes, Top-1 | 5.78 m / 19.03 deg median |
+
+D2 is the decisive control: although the dominant chart is not always
+retrieved, the selected set contains other visible charts sufficient for the
+same chart-factor solver on every query. D3 then fails even when chart identity
+is supplied. Therefore retrieval coverage should still improve, but it is not
+the immediate cause of the meter-scale pose error. The missing variable is a
+precise, cross-trajectory chart-frame probability distribution.
+
+Correct-identity local refinement now has 48 examples, control R@16 (32 px)
+of 37/48 and median best-control error of 21.85 px. This threshold remains far
+too loose for metric pose initialization. The geometry-only D6 control also
+shows that affine-versus-homography approximation is small for these charts:
+0.19 px median and 0.86 px P90 over 48 charts. Projective support is still the
+correct representation, but it is not the current bottleneck.
+
+One Stage-C connectivity smoke on `seq13/frame00001.png` used a diverse
+64-mode coarse pool and refined the atlas-ranked Top-4. Atlas ranking changed
+the selected pose from 1.10 m / 3.11 deg to 0.54 m / 1.56 deg, but no proposed
+SE(3) update passed held-out verification. A 0.093 m / 1.16 deg coarse mode
+existed only at raw rank 158, outside that render budget. This is evidence that
+both frame-mode coverage/ranking and the visual flow likelihood remain weak;
+it is not evidence that local atlas alignment can recover an arbitrary
+meter-scale initialization.
+
+The D5 local-basin control removes coarse retrieval and frame prediction
+entirely. GT selects 12 visible charts and creates only a 5 cm / 0.33 degree
+initial perturbation; subsequent rendering, correlation, SE(3) updates and
+held-out checks receive no GT. With the original likelihood-only verifier,
+7/12 cases accepted an update but only 1/12 improved, six became worse, and
+the final translation median/P90 was 5.30/7.12 cm. Thus “accepted by held-out
+likelihood” was not equivalent to “geometrically correct.”
+
+The repaired verifier additionally requires fit and maplet-disjoint held-out
+sets to estimate a consistent six-dimensional update before committing it.
+This reduces accepted updates from 7/12 to 3/12 and final translation
+median/P90 to 5.00/5.95 cm, while preserving the one genuine improvement.
+However, two consistent updates are still geometrically wrong and the
+4 cm / 1 degree success remains only 1/12. The guard is a useful safety fix,
+not a solution: the same uncalibrated RADIO atlas likelihood can agree on a
+wrong repeated-facade direction across both subsets.
+
+The immutable reports are:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `route_repair_d1_d4_strict12_merged_v28.json` | `41bcb6e49a94ff6ad18c59b853e3b4147a11737616d35fa36f0b5f40cd9f7fe8` |
+| `route_repair_d6_projection_gap_strict12_v29.json` | `da4bfb012b43d1ac070b9c08a1e63964d992c2ba9d231f734ddc063a6ea562f6` |
+| `route_repair_stage_c_prerank_smoke1_v27.json` | `1362a9a9b51211aa5937c327fd88aaf7800b26ef4d4ef72bf12921c96fea7d43` |
+| `route_repair_stage_c_oracle_basin_strict12_merged_v31.json` | `c4d2490c58c53213401c5d6705a91d7952178d674761467c6b3706ace001afe4` |
+| `route_repair_stage_c_consensus_basin_strict12_merged_v33.json` | `c8b93cb53ee0c082f377ae159611f844af494cd33b70d4ebb2dddbb22f7c6cd7` |
+
+The next promotion target is not another candidate-count or threshold sweep.
+It is a shared RADIO-final structured frame matcher trained on complete
+translation/scale/rotation/projective modes, with chart-level soft-min
+likelihood, repeated-facade hard negatives, explicit null outcomes and
+trajectory-disjoint deployment replay. Until D3 begins to enter the coarse
+basin and M1 control error falls to roughly 8--12 px, full Stage-C and
+530-query runs are intentionally blocked.
+
+A bounded 400-step precursor was implemented to test whether a query-side
+linear RADIO metric adapter is sufficient. Its loss consumes complete chart
+transform candidates (translation, rotation, scale, shear and global facade
+modes), not independent texel labels. On 192 fixed `seq11` validation
+episodes, transform Top-1 improved from 45.83% to 52.08%, but the hardest-mode
+margin remained negative and control error changed only from 1.87 to 1.83
+stride-16 cells. The strict `seq13/frame00001` replay then failed the real
+promotion gate: refined M1 control error worsened from 9.23 px to 17.40 px,
+D3 candidate-oracle translation worsened from 0.58 m to 0.96 m, and basin
+recall remained zero. The adapter is therefore retained as a diagnostic and
+is not enabled by default. A shallow channel metric cannot substitute for a
+model that predicts a calibrated structured projection distribution and
+typed nulls.
+
+| Structured-training artifact | SHA-256 |
+| --- | --- |
+| `structured_frame_adapter_chart_transform_stable_v36.json` | `a5206b2fb8644b3d8448eb447d6012fc39ac4c1a691eb8903e8c0bad305140fd` |
+| `structured_frame_adapter_strict_smoke1_v37.json` | `3d6bc3508353123f4e09458450fe9a42b5831f37074573d710d78e6cb324746c` |
+
+## Repaired complete-pool Stage-C result
+
+The latest strict run uses the clean 2DGS source
+`/root/StMaryChurch2dgs_clean.ply`, a stride-8 RADIO-final atlas, 4,096
+structured frame-derived pose hypotheses, a complete sparse Top-64 atlas
+screen, the preserved four-exact/four-local candidate union, 24 fixed scoring
+charts, 12 pose-visible refinement charts, three render/correlate/update
+rounds and at most one accepted translation-bearing update. ALIKE supplies
+detector scores only; no ALIKE descriptor is computed or stored.
+
+| Strict-12 metric | Result |
+| --- | ---: |
+| Top-1 translation median / P90 | 0.405 m / 0.730 m |
+| Top-1 rotation median / P90 | 0.665 deg / 2.551 deg |
+| Top-1 recall at 30 cm / 3 deg | 2/12 |
+| final eight-candidate oracle median | 0.293 m / 0.703 deg |
+| final eight-candidate oracle recall at 30 cm / 3 deg | 7/12 |
+| complete approximately 4k-pose oracle median | 0.279 m / 0.940 deg |
+| complete-pool oracle recall at 20 cm / 3 deg | 4/12 |
+| complete-pool oracle recall at 30 cm / 3 deg | 7/12 |
+
+The complete-pool and sparse Top-64 oracle results are identical. The GPU
+broad screen therefore does not remove a useful basin. Compression from 64
+to the exact/local eight loses useful alternatives on individual queries,
+and final ranking loses additional accuracy, but neither can lower the
+complete-pool 27.9 cm median by itself.
+
+A target-labelled component diagnostic selected the 16.0 cm / 1.92 degree
+q7 pool mode. With target information removed after selection, the normal
+Stage-C renderer, RADIO correlation and held-out verifier left the mode
+unchanged. This establishes that Stage C can preserve a good basin; the mode
+was lost by finite selection, not corrupted by the SE(3) optimizer.
+
+An optional trajectory-disjoint score calibration path was implemented as a
+safe supplement to the exact/local union, never as its replacement. It uses
+within-query ranks of fixed-chart exact evidence, fit and held-out evidence,
+local displacement-marginal evidence and the structured-frame coarse score.
+The fitter requires at least two calibration trajectories, leaves out whole
+trajectories during cross-validation and refuses all-negative candidate
+pools. The available six-frame `seq11` replay was correctly rejected: none
+of its complete Top-64 pools contained a 30 cm / 3 degree mode and their best
+errors ranged from 0.57 m to 3.00 m. No score-calibration artifact was
+promoted and the strict result was not tuned with target poses.
+
+The immutable reports are:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `stagec_strict12_score24_refine12_trans1_merged_v264.json` | `ecd2cbc0a28a7c9c58eeea3095f7ea8b4559c7070369700c64ddcf325d54f91e` |
+| `stagec_q7_pool3903_16cm_diagnostic_v265.json` | `87f8a0165555b33a465f8ecf923a198a6a8ddce5feec9176527d9b506d848a4f` |
+| `stagec_q7_full64_round0_v269.json` | `c6e2fd8a9d6d7363309afb69d3c2a45d73aaf65a4884583df60dcedc2aebfaf9` |
+| `frame_modes_seq11_calibration6_v261.json` | `90cd7d8d06cb3d4c24e31a86f0778cf7650068596b40e564ccf318d9fce4b8bc` |
+
+This run removes the previous meter-scale implementation failure, but it is
+not a promotion result. The remaining first-order error is the structured
+chart-frame observation: even perfect selection from the generated pool is
+about 28 cm median. The next high-value experiment must improve the
+query-conditioned projective chart distribution and runtime correlation
+null/flow calibration on multiple training trajectories. More candidate
+counts, translation steps or strict-set score tuning are explicitly not
+justified. The full 530-query run remains blocked by G1--G3.
+
 ## Promotion policy
 
 The 530-query run is not permitted while the following remain false:
@@ -443,6 +640,10 @@ renamed production or used to claim final accuracy.
 - `feature_extract/tools/vfm/evaluate_v6_retrieval_pose_basin.py`
 - `feature_extract/tools/vfm/evaluate_v6_maplet_frame_alignment.py`
 - `feature_extract/tools/vfm/evaluate_v6_radio_frame_source.py`
+- `feature_extract/tools/vfm/replay_v6_stage_c.py`
+- `feature_extract/tools/vfm/diagnose_v6_stage_c_pool_coverage.py`
+- `feature_extract/tools/vfm/merge_v6_stage_c_reports.py`
+- `feature_extract/tools/vfm/fit_v6_stage_c_score_calibration.py`
 - `feature_extract/tools/vfm/train_v6_global_frame_encoder.py`
 - `feature_extract/vfm/localization_v6/maplet_retrieval.py`
 - `feature_extract/vfm/localization_v6/map_entities.py`

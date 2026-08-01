@@ -69,6 +69,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         metadata={
             "retrieval_region_sha256": _sha256(region_path),
             "metric_chart_sha256": _sha256(chart_path),
+            "retrieval_region_representation": str(
+                (regions.feature_bank.metadata or {}).get(
+                    "representation", ""
+                )
+            ),
         },
     )
     index.save_npz(output)

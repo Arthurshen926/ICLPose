@@ -18,6 +18,10 @@ from feature_extract.vfm.artifacts import file_sha256_short
 from feature_extract.vfm.localization.local_assignment_matcher import (
     local_assignment_loss,
 )
+from feature_extract.vfm.localization.anchor_feature_contract import (
+    anchor_feature_kind,
+    compose_anchor_query_descriptors,
+)
 from feature_extract.vfm.localization.surface_anchor_set_matcher import (
     SurfaceAnchorSetMatcher,
     SurfaceAnchorSetMatcherConfig,
@@ -126,6 +130,7 @@ class SurfaceAnchorTrainingCorpus:
         self.maplets = maplets
         self.anchors = anchors
         self.bank = bank
+        self.feature_kind = anchor_feature_kind(bank.metadata)
         self.camera_by_image = camera_by_image
         self.config = config
         self.minimum_positive_nodes = int(minimum_positive_nodes)
@@ -346,6 +351,7 @@ class DeploymentReplaySurfaceAnchorTrainingCorpus:
         self.maplets = maplets
         self.anchors = anchors
         self.bank = bank
+        self.feature_kind = anchor_feature_kind(bank.metadata)
         self.camera_by_image = camera_by_image
         self.config = config
         self.validation_images = set(validation_images)
@@ -431,19 +437,12 @@ class DeploymentReplaySurfaceAnchorTrainingCorpus:
             candidate_probabilities = np.asarray(
                 data["candidate_probabilities"], dtype=np.float32
             )
-        if (
-            vfm_descriptors is not None
-            and int(descriptors.shape[1] + vfm_descriptors.shape[1])
-            == int(self.bank.feature_dim)
-        ):
-            descriptors = np.concatenate(
-                [descriptors, vfm_descriptors],
-                axis=1,
-            )
-        if int(descriptors.shape[1]) != int(self.bank.feature_dim):
-            raise ValueError(
-                "replay query and anchor descriptor dimensions differ"
-            )
+        descriptors = compose_anchor_query_descriptors(
+            alike_descriptors=descriptors,
+            radio_final_descriptors=vfm_descriptors,
+            feature_kind=self.feature_kind,
+            expected_dim=int(self.bank.feature_dim),
+        )
         matches = candidate_ids == int(maplet_id)
         rows, columns = np.nonzero(matches)
         if len(rows) < 4:
@@ -803,6 +802,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         "production_contract": {
             "map_representation": "2dgs_surface_maplets_and_stable_anchors",
             "identity": "stable_surface_anchor_id",
+            "anchor_identity_feature": anchor_feature_kind(bank.metadata),
+            "alike_descriptor_used_for_identity": (
+                anchor_feature_kind(bank.metadata)
+                != "radio_final_at_alike_detection"
+            ),
             "uses_mapping_rgb_at_inference": False,
             "uses_loftr": False,
             "uses_sfm_points": False,

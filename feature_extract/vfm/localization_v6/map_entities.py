@@ -49,6 +49,13 @@ class RetrievalRegionBank:
             raise ValueError(
                 "retrieval regions require stored canonical tangent frames"
             )
+        if metadata.get("descriptor_construction") == (
+            "legacy_pooled_descriptor_mapper_baseline"
+        ):
+            raise ValueError(
+                "retrieval regions may not apply a nonlinear mapper after "
+                "regional descriptor pooling"
+            )
 
     @property
     def region_ids(self) -> np.ndarray:
@@ -325,6 +332,255 @@ class RegionChartIndex:
             )
 
 
+@dataclass(frozen=True)
+class ChartExpansionPosterior:
+    """Normalized ``RetrievalRegion -> MetricSurfaceChart`` expansion.
+
+    ``chart_probability`` is a true finite-candidate probability mass, not a
+    sum of unrelated region scores.  ``selected_chart_ids`` retains at least
+    ``minimum_charts`` (when available), then enough candidates to cover the
+    requested cumulative mass, up to ``maximum_charts``.
+    """
+
+    region_ids: np.ndarray
+    region_probability: np.ndarray
+    chart_ids: np.ndarray
+    chart_probability: np.ndarray
+    selected_chart_ids: np.ndarray
+    selected_probability_mass: float
+
+    def __post_init__(self) -> None:
+        region_ids = np.asarray(self.region_ids, dtype=np.int64).reshape(-1)
+        region_probability = np.asarray(
+            self.region_probability, dtype=np.float64
+        ).reshape(-1)
+        chart_ids = np.asarray(self.chart_ids, dtype=np.int64).reshape(-1)
+        chart_probability = np.asarray(
+            self.chart_probability, dtype=np.float64
+        ).reshape(-1)
+        selected = np.asarray(
+            self.selected_chart_ids, dtype=np.int64
+        ).reshape(-1)
+        if (
+            region_probability.shape != region_ids.shape
+            or chart_probability.shape != chart_ids.shape
+            or np.any(region_probability < 0.0)
+            or np.any(chart_probability < 0.0)
+            or np.unique(chart_ids).size != chart_ids.size
+            or not np.all(np.isin(selected, chart_ids))
+        ):
+            raise ValueError("invalid normalized region-to-chart posterior")
+        object.__setattr__(self, "region_ids", region_ids)
+        object.__setattr__(
+            self, "region_probability", region_probability.astype(np.float32)
+        )
+        object.__setattr__(self, "chart_ids", chart_ids)
+        object.__setattr__(
+            self, "chart_probability", chart_probability.astype(np.float32)
+        )
+        object.__setattr__(self, "selected_chart_ids", selected)
+
+    def probability_for(self, chart_id: int) -> float:
+        rows = np.flatnonzero(self.chart_ids == int(chart_id))
+        return float(self.chart_probability[int(rows[0])]) if rows.size else 0.0
+
+
+def region_chart_conditional_probabilities(
+    region_id: int,
+    regions: RetrievalRegionBank,
+    charts: MetricSurfaceChartBank,
+    index: RegionChartIndex,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return the normalized geometry factor ``P(chart | region)``."""
+
+    index_rows = np.flatnonzero(index.region_ids == int(region_id))
+    region_rows = np.flatnonzero(regions.region_ids == int(region_id))
+    if index_rows.size != 1 or region_rows.size != 1:
+        return (
+            np.zeros((0,), dtype=np.int64),
+            np.zeros((0,), dtype=np.float64),
+        )
+    index_row = int(index_rows[0])
+    retrieval_row = int(region_rows[0])
+    atlas = charts.atlas
+    chart_row = {
+        int(value): row for row, value in enumerate(atlas.maplet_ids.tolist())
+    }
+    usable = set(int(value) for value in charts.chart_ids.tolist())
+    associated = index.region_chart_ids[
+        index.region_offsets[index_row] : index.region_offsets[index_row + 1]
+    ]
+    associated = np.asarray(
+        [
+            int(value)
+            for value in associated.tolist()
+            if int(value) in usable and int(value) in chart_row
+        ],
+        dtype=np.int64,
+    )
+    if associated.size == 0:
+        return associated, np.zeros((0,), dtype=np.float64)
+    rows = np.asarray(
+        [chart_row[int(value)] for value in associated.tolist()],
+        dtype=np.int64,
+    )
+    relative = (
+        atlas.centers[rows].astype(np.float64)
+        - regions.centers[retrieval_row][None].astype(np.float64)
+    ) @ regions.frames[retrieval_row].astype(np.float64).T
+    extent = np.maximum(
+        regions.extents[retrieval_row].astype(np.float64), 1e-3
+    )
+    tangent_distance2 = np.sum(
+        (relative[:, :2] / extent[None, :2]) ** 2, axis=1
+    )
+    normal_distance2 = (
+        relative[:, 2] / max(float(extent[2]) * 3.0, 0.05)
+    ) ** 2
+    normal_cosine = np.abs(
+        atlas.frames[rows, 2].astype(np.float64)
+        @ regions.frames[retrieval_row, 2].astype(np.float64)
+    )
+    valid_fraction = np.maximum(
+        np.mean(atlas.valid_mask[rows], axis=(1, 2)).astype(np.float64),
+        1e-4,
+    )
+    physical_area = np.maximum(
+        4.0
+        * atlas.extents[rows, 0].astype(np.float64)
+        * atlas.extents[rows, 1].astype(np.float64),
+        1e-6,
+    )
+    conditional = (
+        np.exp(-0.5 * tangent_distance2 - 0.5 * normal_distance2)
+        * np.maximum(normal_cosine, 1e-3) ** 2
+        * np.sqrt(valid_fraction)
+        * physical_area**0.25
+    )
+    conditional /= max(float(np.sum(conditional)), 1e-12)
+    return associated, conditional
+
+
+def expand_region_posterior_to_charts(
+    region_ids: np.ndarray,
+    region_evidence: np.ndarray,
+    regions: RetrievalRegionBank,
+    charts: MetricSurfaceChartBank,
+    index: RegionChartIndex,
+    *,
+    minimum_charts: int = 12,
+    maximum_charts: int = 24,
+    cumulative_probability: float = 0.95,
+) -> ChartExpansionPosterior:
+    """Apply ``P(c|q) = sum_r P(r|q) P(c|r)`` without degree bias.
+
+    The conditional ``P(c|r)`` is normalized independently for every region.
+    Its deterministic geometry weight combines center overlap in the region's
+    tangent frame, normal compatibility, usable atlas area and chart validity.
+    Consequently, a chart does not receive extra evidence merely because it
+    happens to be adjacent to many retrieved regions.
+    """
+
+    ids = np.asarray(region_ids, dtype=np.int64).reshape(-1)
+    evidence = np.asarray(region_evidence, dtype=np.float64).reshape(-1)
+    if ids.shape != evidence.shape:
+        raise ValueError("region IDs and evidence differ")
+    if int(minimum_charts) < 0 or int(maximum_charts) <= 0:
+        raise ValueError("chart candidate limits must be non-negative")
+    if int(minimum_charts) > int(maximum_charts):
+        raise ValueError("minimum_charts exceeds maximum_charts")
+    if not 0.0 < float(cumulative_probability) <= 1.0:
+        raise ValueError("cumulative_probability must lie in (0,1]")
+
+    index_region_row = {
+        int(value): row for row, value in enumerate(index.region_ids.tolist())
+    }
+    region_row = {
+        int(value): row for row, value in enumerate(regions.region_ids.tolist())
+    }
+    retained_ids = []
+    retained_evidence = []
+    for region_id, value in zip(ids.tolist(), evidence.tolist()):
+        if (
+            int(region_id) in index_region_row
+            and int(region_id) in region_row
+            and np.isfinite(value)
+            and float(value) > 0.0
+        ):
+            retained_ids.append(int(region_id))
+            retained_evidence.append(float(value))
+    if not retained_ids:
+        return ChartExpansionPosterior(
+            region_ids=np.zeros((0,), dtype=np.int64),
+            region_probability=np.zeros((0,), dtype=np.float32),
+            chart_ids=np.zeros((0,), dtype=np.int64),
+            chart_probability=np.zeros((0,), dtype=np.float32),
+            selected_chart_ids=np.zeros((0,), dtype=np.int64),
+            selected_probability_mass=0.0,
+        )
+    retained_evidence_array = np.asarray(
+        retained_evidence, dtype=np.float64
+    )
+    retained_evidence_array /= max(
+        float(np.sum(retained_evidence_array)), 1e-12
+    )
+    accumulated: dict[int, float] = {}
+    for region_id, region_probability in zip(
+        retained_ids, retained_evidence_array.tolist()
+    ):
+        associated, conditional_weight = (
+            region_chart_conditional_probabilities(
+                int(region_id), regions, charts, index
+            )
+        )
+        if associated.size == 0:
+            continue
+        for chart_id, conditional in zip(
+            associated.tolist(), conditional_weight.tolist()
+        ):
+            accumulated[int(chart_id)] = accumulated.get(
+                int(chart_id), 0.0
+            ) + float(region_probability) * float(conditional)
+
+    ordered = sorted(
+        accumulated.items(), key=lambda value: (-value[1], value[0])
+    )
+    ranked_ids = np.asarray(
+        [value[0] for value in ordered], dtype=np.int64
+    )
+    probability = np.asarray(
+        [value[1] for value in ordered], dtype=np.float64
+    )
+    if probability.size:
+        probability /= max(float(np.sum(probability)), 1e-12)
+        mass_count = int(
+            np.searchsorted(
+                np.cumsum(probability),
+                float(cumulative_probability),
+                side="left",
+            )
+            + 1
+        )
+        selected_count = min(
+            max(
+                min(int(minimum_charts), int(probability.size)),
+                mass_count,
+            ),
+            int(maximum_charts),
+            int(probability.size),
+        )
+    else:
+        selected_count = 0
+    return ChartExpansionPosterior(
+        region_ids=np.asarray(retained_ids, dtype=np.int64),
+        region_probability=retained_evidence_array,
+        chart_ids=ranked_ids,
+        chart_probability=probability,
+        selected_chart_ids=ranked_ids[:selected_count],
+        selected_probability_mass=float(np.sum(probability[:selected_count])),
+    )
+
+
 def build_region_chart_index(
     regions: RetrievalRegionBank,
     charts: MetricSurfaceChartBank,
@@ -415,9 +671,12 @@ def build_region_chart_index(
         association_expands_geometry_only=True,
         context_descriptor_retrained=False,
         retrieval_region_representation=str(
-            (regions.feature_bank.metadata or {}).get(
+            contract.get(
                 "retrieval_region_representation",
-                "legacy_single_scale_maplet_proxy",
+                (regions.feature_bank.metadata or {}).get(
+                    "representation",
+                    "legacy_single_scale_maplet_proxy",
+                ),
             )
         ),
         maximum_charts_per_region=int(maximum_charts_per_region),

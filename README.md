@@ -14,9 +14,9 @@ mapping RGB + calibrated poses + high-quality 2DGS --offline only-->
 query RGB
   -> RADIO-final RetrievalRegion posterior with complete candidate groups
   -> overlap-aware scene evidence
-  -> associated disconnected MetricSurfaceCharts
-  -> global canonical-region frame correlation (translation/affine modes)
-  -> regional frame-control coarse pose distribution
+  -> normalized Region-to-Chart posterior over disconnected MetricSurfaceCharts
+  -> per-chart projective frame distributions
+  -> correlated chart-factor coarse SE(3) distribution
   -> area-render selected canonical maplet atlases
   -> local multi-modal displacement correlation
   -> analytic robust joint-SE(3) update
@@ -37,14 +37,23 @@ architecture, artifact contracts and strict G0–G4 promotion gates.
 P0 identity/spatial probability semantics are corrected. Retrieval regions
 and metric charts are now separate map entities with a strict many-to-many
 index, overlapping query-region evidence is deduplicated, and the current
-research bridge is `MapletFrameAlignment`. Its strict M1/M2/M3 diagnostics
-show that affine/homography frame geometry is sufficient. Removing an invalid
-large-template score bias raises correct-identity chart-control R@16 to
-33/48, but actual-retrieval coarse-pose R@16 remains 0/12. The remaining
-breakpoint is frame precision and calibrated multi-chart pose ranking, not
-2DGS geometry. It is not production-qualified and no 530-query accuracy
-claim is made. Typed correlation nulls, iterative fine alignment, adaptive
-charts and full-scene runtime occlusion remain open.
+research bridge is `MapletFrameAlignment`. The route-repair audit normalizes
+Region-to-Chart probability, uses projective chart observations and a robust
+correlated chart-factor solver, and connects runtime atlas re-rendering and
+held-out verification. Complete 4,096-mode generation plus a lossless sparse
+Top-64 atlas screen has removed the earlier meter-scale implementation
+failure: on the strict 12-query set the current Top-1 translation is
+0.405 m median / 0.730 m P90 and rotation is 0.665 / 2.551 degrees. The full
+generated-pool oracle is 0.279 m / 0.940 degrees median, with 4/12 and 7/12
+inside 20 cm and 30 cm respectively. A 16 cm q7 component control remains
+stable through normal atlas refinement, localizing the residual losses to
+finite candidate selection/final ranking and, more fundamentally, the
+cross-trajectory RADIO chart-frame distribution. An attempted `seq11`
+ranking calibration was rejected because 0/6 complete Top-64 pools contained
+a 30 cm / 3 degree mode. It is not production-qualified and no 530-query
+accuracy claim is made. Structured frame/flow learning on multiple
+trajectories, typed correlation nulls, adaptive charts and full-scene runtime
+occlusion remain open.
 The V5 point-similarity route is retained as a failed diagnostic: it never
 implemented atlas/query correlation and is not extended.
 The [V3 anchor/PnP mainline](docs/vfm/2dgs_surface_localization_mainline.md) is
@@ -66,6 +75,14 @@ only as a historical baseline.
 - `feature_extract/tools/vfm/evaluate_v6_retrieval_pose_basin.py`
 - `feature_extract/tools/vfm/evaluate_v6_maplet_frame_alignment.py`
 - `feature_extract/tools/vfm/evaluate_v6_radio_frame_source.py`
+- `feature_extract/tools/vfm/evaluate_v6_projection_model_gap.py`
+- `feature_extract/tools/vfm/evaluate_v6_radio_atlas_basin.py`
+- `feature_extract/tools/vfm/merge_v6_radio_frame_reports.py`
+- `feature_extract/tools/vfm/replay_v6_stage_c.py`
+- `feature_extract/tools/vfm/diagnose_v6_stage_c_pool_coverage.py`
+- `feature_extract/tools/vfm/merge_v6_stage_c_reports.py`
+- `feature_extract/tools/vfm/fit_v6_stage_c_score_calibration.py`
+- `feature_extract/tools/vfm/train_v6_structured_frame_adapter.py`
 - `feature_extract/tools/vfm/train_v6_global_frame_encoder.py`
 - `feature_extract/tools/vfm/bake_v6_retrieval_atlas.py`
 - `feature_extract/vfm/localization_v6/`

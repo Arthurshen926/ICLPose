@@ -206,6 +206,38 @@ def main(argv: Sequence[str] | None = None) -> None:
     mapper, mapper_metadata = load_surface_maplet_mapper(
         Path(args.surface_mapper_checkpoint), device=str(args.device)
     )
+    mapper_sha256 = _sha256(Path(args.surface_mapper_checkpoint))
+    identity_metadata = dict(identity_bank.metadata or {})
+    declared_identity_mapper = str(
+        identity_metadata.get("surface_mapper_sha256", "")
+    )
+    if (
+        not declared_identity_mapper
+        or declared_identity_mapper != mapper_sha256
+    ):
+        raise ValueError(
+            "identity map was not built with the supplied full-map mapper"
+        )
+    if identity_metadata.get("descriptor_construction") == (
+        "legacy_pooled_descriptor_mapper_baseline"
+    ):
+        raise ValueError(
+            "identity calibration rejects post-pooling mapper projection"
+        )
+    mapping_ids = {
+        str(value)
+        for value in identity_metadata.get(
+            "mapping_trajectory_ids", []
+        )
+    }
+    if mapping_ids & calibration_ids:
+        raise ValueError(
+            "identity-map observations overlap probability calibration"
+        )
+    if mapping_ids & strict_ids:
+        raise ValueError(
+            "identity-map observations overlap strict holdout"
+        )
     identity_config = RadioFinalRegionConfig(
         pool_sizes=tuple(mapper_metadata.get("pool_sizes", (1, 3, 5, 9))),
         pool_weights=tuple(
@@ -350,9 +382,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         "identity_bank_sha256": _sha256(Path(args.identity_maplets)),
         "spatial_bank_sha256": _sha256(Path(args.spatial_maplets)),
         "atlas_geometry_sha256": _sha256(Path(args.atlas_geometry)),
-        "surface_mapper_sha256": _sha256(
-            Path(args.surface_mapper_checkpoint)
-        ),
+        "surface_mapper_sha256": mapper_sha256,
+        "identity_mapping_trajectory_ids": sorted(mapping_ids),
         "surface_resolution_m": float(args.surface_resolution_m),
         "identity_candidates": int(args.identity_candidates),
         "identity_metrics": identity_metrics,

@@ -225,6 +225,7 @@ class RadioTokenExtractor:
         array_name: str = "radio_final",
         input_width: int = 0,
         input_height: int = 0,
+        phase_stride: int = 0,
     ):
         from feature_extract.extractors import RADIOFeatureExtractor
 
@@ -233,6 +234,9 @@ class RadioTokenExtractor:
             raise ValueError("RADIO input_width and input_height must be set together")
         self.input_width = int(input_width)
         self.input_height = int(input_height)
+        self.phase_stride = int(phase_stride)
+        if self.phase_stride not in (0, 4, 8, 16):
+            raise ValueError("RADIO phase_stride must be 0, 4, 8, or 16")
         self.extractor = RADIOFeatureExtractor(
             version=version,
             device=device,
@@ -244,7 +248,9 @@ class RadioTokenExtractor:
                 model=version,
                 layer="final",
                 channels=1280,
-                stride=16,
+                stride=(
+                    16 if self.phase_stride == 0 else self.phase_stride
+                ),
             ),
         )
 
@@ -257,7 +263,13 @@ class RadioTokenExtractor:
             image = image.resize((self.input_width, self.input_height), resample=Image.Resampling.BILINEAR)
         array = np.asarray(image, dtype=np.float32) / 255.0
         tensor = torch.from_numpy(array).permute(2, 0, 1).unsqueeze(0)
-        outputs = self.extractor.extract(tensor)
+        outputs = (
+            self.extractor.extract(tensor)
+            if self.phase_stride in (0, 16)
+            else self.extractor.extract_phase_interleaved(
+                tensor, output_stride=self.phase_stride
+            )
+        )
         return {self.array_name: outputs["local"].detach().cpu().numpy()}
 
     def extract_batch(self, image_paths: Sequence[Path]) -> list[Mapping[str, np.ndarray]]:
@@ -275,6 +287,8 @@ class RadioTokenExtractor:
             tensors.append(tensor)
             shapes.add(tuple(tensor.shape))
         if len(shapes) != 1:
+            return [self.extract(path) for path in image_paths]
+        if self.phase_stride not in (0, 16):
             return [self.extract(path) for path in image_paths]
         batch = torch.stack(tensors, dim=0)
         outputs = self.extractor.extract_batch(batch)
@@ -347,6 +361,7 @@ def build_model_extractors(
     dinov2_stride: int,
     radio_input_width: int = 0,
     radio_input_height: int = 0,
+    radio_phase_stride: int = 0,
 ) -> tuple[TokenExtractor, ...]:
     extractors: list[TokenExtractor] = []
     for name in model_names:
@@ -359,6 +374,7 @@ def build_model_extractors(
                     radio_repo=radio_repo,
                     input_width=int(radio_input_width),
                     input_height=int(radio_input_height),
+                    phase_stride=int(radio_phase_stride),
                 )
             )
         elif "dino" in lower:
@@ -397,6 +413,16 @@ def main() -> None:
     parser.add_argument("--radio_version", default="c-radio_v4-h")
     parser.add_argument("--radio_input_width", type=int, default=0)
     parser.add_argument("--radio_input_height", type=int, default=0)
+    parser.add_argument(
+        "--radio_phase_stride",
+        type=int,
+        choices=(0, 4, 8, 16),
+        default=0,
+        help=(
+            "Interleave shifted RADIO-final patch lattices at this true "
+            "spatial stride; zero keeps the native stride-16 grid."
+        ),
+    )
     parser.add_argument("--dinov2_model", default="dinov2_vits14")
     parser.add_argument("--dinov2_stride", type=int, default=14)
     parser.add_argument("--storage_dtype", default="float16", choices=["float16", "float32"])
@@ -453,6 +479,7 @@ def main() -> None:
             dinov2_stride=args.dinov2_stride,
             radio_input_width=int(args.radio_input_width),
             radio_input_height=int(args.radio_input_height),
+            radio_phase_stride=int(args.radio_phase_stride),
         ),
         storage_dtype=args.storage_dtype,
         batch_size=args.batch_size,

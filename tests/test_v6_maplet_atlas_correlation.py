@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import numpy as np
 import pytest
 import torch
@@ -14,6 +16,7 @@ from feature_extract.tools.vfm.train_v6_metric_encoder import (
 from feature_extract.tools.vfm.train_v6_surface_spatial_projection import (
     _balanced_surface_rows,
     _mode_marginalized_logits,
+    _spatial_projection_initialization,
 )
 from feature_extract.vfm.colmap_tracks import ColmapCamera
 from feature_extract.vfm.gaussian_vfm_field import GaussianVFMSource
@@ -21,14 +24,35 @@ from feature_extract.vfm.gaussian_vfm_field import GaussianVFMFeatureView
 from feature_extract.vfm.localization_v6.atlas_baking import bake_feature_atlas
 from feature_extract.vfm.localization_v6.atlas_renderer import (
     RenderedMapletAtlases,
+    _atlas_cell_view_mode_log_densities,
+    _atlas_chart_view_mode_log_densities,
+    _view_mode_log_densities,
+    atlas_view_direction_log_likelihood,
+    atlas_scene_geometry_points,
+    render_scene_depth_from_points,
+    render_sampled_maplet_atlases,
     render_selected_maplet_atlases,
+    render_selected_maplet_atlases_fast,
+)
+from feature_extract.vfm.localization_v6.atlas_pose_alignment import (
+    AtlasAlignmentLevel,
+    _heldout_update_agreement,
+    _joint_update_candidates,
+    build_radio_final_feature_pyramid,
 )
 from feature_extract.vfm.localization_v6.local_correlation import (
     CorrelationDistribution,
+    build_local_correlation_query_cache,
     local_correlation_distribution,
 )
 from feature_extract.vfm.localization_v6.heldout_verifier import (
     accept_pose_update,
+    accept_pose_update_bayes_factor,
+    fixed_chart_local_match_log_bayes_factor,
+    fixed_chart_zero_displacement_log_bayes_factor,
+    fixed_chart_zero_displacement_log_likelihood_ratio,
+    paired_chart_log_likelihood_gains,
+    zero_displacement_log_bayes_factor,
     zero_displacement_log_likelihood,
 )
 from feature_extract.vfm.localization_v6.maplet_atlas import (
@@ -78,6 +102,12 @@ from feature_extract.vfm.localization_v6.surface_spatial_projection import (
     load_surface_spatial_projection,
     save_surface_spatial_projection,
 )
+from feature_extract.vfm.localization_v6.structured_frame_adapter import (
+    StructuredFrameAdapter,
+    StructuredFrameAdapterConfig,
+    load_structured_frame_adapter,
+    save_structured_frame_adapter,
+)
 from feature_extract.vfm.localization_v6.probability_calibration import (
     DistributionNullCalibration,
     V6ProbabilityCalibration,
@@ -107,6 +137,28 @@ def _maplets():
         view_quality_scores=np.ones(1),
         metadata={"vfm_layer": "radio_final"},
     )
+
+
+def test_radio_final_feature_pyramid_is_normalized_and_final_only():
+    feature = np.asarray(
+        [
+            [[1.0, 0.0], [1.0, 0.0]],
+            [[0.0, 1.0], [0.0, 1.0]],
+        ],
+        dtype=np.float32,
+    )
+    pyramid = build_radio_final_feature_pyramid(feature)
+
+    assert set(pyramid) == {"coarse", "middle", "fine"}
+    assert pyramid["coarse"].shape == (2, 2, 2)
+    assert pyramid["middle"].shape == (2, 4, 4)
+    assert pyramid["fine"].shape == (2, 8, 8)
+    for level in pyramid.values():
+        np.testing.assert_allclose(
+            np.linalg.norm(level, axis=0),
+            np.ones(level.shape[1:], dtype=np.float32),
+            atol=1e-6,
+        )
 
 
 def _source():
@@ -201,6 +253,80 @@ def test_checkpoint_selection_prioritizes_spatial_mode_signal():
     )
 
 
+def test_heldout_update_agreement_rejects_opposite_surface_flow():
+    level = AtlasAlignmentLevel(
+        name="coarse",
+        feature_stride=16,
+        correlation_radius=6,
+        maximum_translation_step_m=0.10,
+        maximum_rotation_step_deg=2.0,
+    )
+    fit = SimpleNamespace(
+        delta=np.asarray([0.01, 0, 0, 0.05, 0, 0], dtype=np.float64)
+    )
+    agreeing = SimpleNamespace(
+        delta=np.asarray([0.008, 0, 0, 0.045, 0.005, 0], dtype=np.float64)
+    )
+    opposite = SimpleNamespace(
+        delta=np.asarray([-0.008, 0, 0, -0.045, 0, 0], dtype=np.float64)
+    )
+    accepted, disagreement = _heldout_update_agreement(
+        fit, [agreeing], level, maximum_disagreement=0.85
+    )
+    assert accepted
+    assert disagreement < 0.85
+    rejected, _disagreement = _heldout_update_agreement(
+        fit, [opposite], level, maximum_disagreement=0.85
+    )
+    assert not rejected
+
+
+def test_joint_update_candidates_preserve_rotation_translation_coupling():
+    source = SimpleNamespace(
+        delta=np.asarray([0.1, 0.0, 0.0, 0.0, 0.2, 0.0]),
+        covariance=np.eye(6),
+        used_point_count=12,
+        used_maplet_count=4,
+        condition_number=3.0,
+        residual_rms_px=0.5,
+        success=True,
+    )
+    candidates, names = _joint_update_candidates(
+        [source], np.eye(4), scales=(0.5, 1.0)
+    )
+    assert names == (
+        "analytic_joint_0_scale_0.5",
+        "analytic_joint_0_scale_1",
+    )
+    assert len(candidates) == 2
+    assert np.allclose(candidates[0].delta, 0.5 * source.delta)
+    assert np.linalg.norm(candidates[0].delta[:3]) > 0.0
+    assert np.linalg.norm(candidates[0].delta[3:]) > 0.0
+    assert np.allclose(candidates[1].delta, source.delta)
+
+
+def test_structured_frame_adapter_starts_identity_and_round_trips(tmp_path):
+    model = StructuredFrameAdapter(
+        StructuredFrameAdapterConfig(feature_dim=4)
+    )
+    feature = torch.randn(1, 4, 3, 5)
+    expected = torch.nn.functional.normalize(feature, dim=1)
+    assert torch.allclose(model(feature), expected, atol=1e-6)
+    path = tmp_path / "structured-frame.pt"
+    save_structured_frame_adapter(
+        path,
+        model,
+        {
+            "vfm_layer": "radio_final",
+            "stores_mapping_rgb": False,
+            "uses_sfm_tracks": False,
+        },
+    )
+    restored, metadata = load_structured_frame_adapter(path)
+    assert metadata["vfm_layer"] == "radio_final"
+    assert torch.allclose(restored(feature), expected, atol=1e-6)
+
+
 def test_surface_spatial_projection_round_trip_and_contract(tmp_path):
     initial = np.eye(3, 5, dtype=np.float32)
     model = SurfaceSpatialProjection(
@@ -246,6 +372,22 @@ def test_surface_row_sampler_balances_maplets_and_has_no_duplicates():
     assert sampled.size == 6
     assert np.unique(sampled).size == sampled.size
     assert counts.tolist() == [3, 3]
+
+
+def test_spatial_projection_expansion_preserves_source_subspace():
+    source = np.eye(6, dtype=np.float32)[:2]
+    expanded = _spatial_projection_initialization(
+        source,
+        output_dim=4,
+        seed=7,
+    )
+    assert expanded.shape == (4, 6)
+    assert np.allclose(expanded @ expanded.T, np.eye(4), atol=1e-6)
+    source_projector = source.T @ source
+    expanded_source_projector = expanded[:2].T @ expanded[:2]
+    assert np.allclose(
+        source_projector, expanded_source_projector, atol=1e-6
+    )
 
 
 def test_surface_spatial_training_marginalizes_reference_modes():
@@ -315,6 +457,263 @@ def test_area_atlas_renderer_fills_surface_pixels():
     assert spatial_bank.maplet_ids.tolist() == [7]
     assert spatial_bank.descriptor_centers.shape == (4, 3)
     assert np.allclose(spatial_bank.descriptor_centers[:, 2], 2.0)
+
+
+def test_compiled_area_renderer_matches_reference_geometry_and_features():
+    xyz, primitive_ids, valid, _audit = canonical_maplet_geometry(
+        _source(), _maplets(), resolution=4
+    )
+    features = np.zeros((1, 2, 4, 4), dtype=np.float32)
+    features[:, 0] = 1.0
+    atlas = MapletFeatureAtlasBank(
+        maplet_ids=np.asarray([7]),
+        centers=np.asarray([[0, 0, 2]], dtype=np.float32),
+        frames=np.asarray([np.eye(3)], dtype=np.float32),
+        extents=np.asarray([[0.2, 0.2, 0.1]], dtype=np.float32),
+        xyz=xyz,
+        primitive_ids=primitive_ids,
+        features=features,
+        variance=np.zeros((1, 4, 4), dtype=np.float32),
+        support_count=np.ones((1, 4, 4), dtype=np.int32),
+        valid_mask=valid,
+        metadata={},
+    )
+    reference = render_selected_maplet_atlases(
+        atlas, np.asarray([7]), np.eye(4), _camera(), width=100, height=80
+    )
+    actual = render_selected_maplet_atlases_fast(
+        atlas, np.asarray([7]), np.eye(4), _camera(), width=100, height=80
+    )
+    assert np.array_equal(actual.mask, reference.mask)
+    assert np.allclose(actual.depth, reference.depth, atol=1e-5)
+    assert np.allclose(actual.feature, reference.feature, atol=1e-5)
+    assert np.array_equal(actual.maplet_id, reference.maplet_id)
+
+
+def test_atlas_scene_depth_uses_all_map_geometry_and_nearest_surface():
+    xyz, primitive_ids, valid, _audit = canonical_maplet_geometry(
+        _source(), _maplets(), resolution=4
+    )
+    atlas = MapletFeatureAtlasBank(
+        maplet_ids=np.asarray([7]),
+        centers=np.asarray([[0, 0, 2]], dtype=np.float32),
+        frames=np.asarray([np.eye(3)], dtype=np.float32),
+        extents=np.asarray([[0.2, 0.2, 0.1]], dtype=np.float32),
+        xyz=xyz,
+        primitive_ids=primitive_ids,
+        features=np.ones((1, 1, 4, 4), dtype=np.float32),
+        variance=np.zeros((1, 4, 4), dtype=np.float32),
+        support_count=np.ones((1, 4, 4), dtype=np.int32),
+        valid_mask=valid,
+        metadata={},
+    )
+    points = atlas_scene_geometry_points(atlas)
+    assert points.shape == (16, 3)
+    depth = render_scene_depth_from_points(
+        np.asarray([[0, 0, 3], [0, 0, 2]], dtype=np.float32),
+        np.eye(4),
+        _camera(),
+        width=100,
+        height=80,
+    )
+    assert depth[40, 50] == pytest.approx(2.0)
+
+
+def test_sampled_atlas_renderer_respects_a_finite_surface_budget():
+    xyz, primitive_ids, valid, _audit = canonical_maplet_geometry(
+        _source(), _maplets(), resolution=4
+    )
+    atlas = MapletFeatureAtlasBank(
+        maplet_ids=np.asarray([7]),
+        centers=np.asarray([[0, 0, 2]], dtype=np.float32),
+        frames=np.asarray([np.eye(3)], dtype=np.float32),
+        extents=np.asarray([[0.2, 0.2, 0.1]], dtype=np.float32),
+        xyz=xyz,
+        primitive_ids=primitive_ids,
+        features=np.ones((1, 2, 4, 4), dtype=np.float32),
+        variance=np.zeros((1, 4, 4), dtype=np.float32),
+        support_count=np.ones((1, 4, 4), dtype=np.int32),
+        valid_mask=valid,
+        metadata={},
+    )
+    rendered = render_sampled_maplet_atlases(
+        atlas,
+        np.asarray([7]),
+        np.eye(4),
+        _camera(),
+        width=100,
+        height=80,
+        maximum_samples=5,
+    )
+    assert 0 < int(np.sum(rendered.mask)) <= 5
+    assert np.all(rendered.maplet_id[rendered.mask] == 7)
+    assert np.all(rendered.surface_id[rendered.mask] >= 0)
+
+
+def test_view_conditioned_atlas_rejects_opposite_side_extrapolation():
+    xyz, primitive_ids, valid, _audit = canonical_maplet_geometry(
+        _source(), _maplets(), resolution=4
+    )
+    features = np.ones((1, 1, 4, 4), dtype=np.float32)
+    base = MapletFeatureAtlasBank(
+        maplet_ids=np.asarray([7]),
+        centers=np.asarray([[0, 0, 2]], dtype=np.float32),
+        frames=np.asarray([np.eye(3)], dtype=np.float32),
+        extents=np.asarray([[0.2, 0.2, 0.1]], dtype=np.float32),
+        xyz=xyz,
+        primitive_ids=primitive_ids,
+        features=features,
+        variance=np.zeros((1, 4, 4), dtype=np.float32),
+        support_count=np.ones((1, 4, 4), dtype=np.int32),
+        valid_mask=valid,
+        metadata={},
+    )
+    valid_modes = valid[:, None]
+    direction = np.zeros((1, 1, 4, 4, 3), dtype=np.float32)
+    direction[..., 2] = 1.0
+    mode_atlas = replace(
+        base,
+        mode_features=features[:, None],
+        mode_weights=np.ones((1, 1, 4, 4), dtype=np.float32),
+        mode_view_directions=direction,
+        mode_view_covariance=np.zeros(
+            (1, 1, 4, 4, 3, 3), dtype=np.float32
+        ),
+        mode_variance=np.zeros((1, 1, 4, 4), dtype=np.float32),
+        mode_valid_mask=valid_modes,
+    )
+    query_direction = -np.asarray(mode_atlas.xyz[0], dtype=np.float64)
+    query_direction /= np.maximum(
+        np.linalg.norm(query_direction, axis=2, keepdims=True), 1e-8
+    )
+    chart_density = _atlas_chart_view_mode_log_densities(
+        mode_atlas, 0, query_direction
+    )
+    for yy in range(mode_atlas.height):
+        for xx in range(mode_atlas.width):
+            np.testing.assert_allclose(
+                chart_density[:, yy, xx],
+                _atlas_cell_view_mode_log_densities(
+                    mode_atlas, 0, yy, xx, query_direction[yy, xx]
+                ),
+                atol=1e-12,
+            )
+    unsupported = render_selected_maplet_atlases(
+        mode_atlas,
+        np.asarray([7]),
+        np.eye(4),
+        _camera(),
+        width=100,
+        height=80,
+    )
+    assert not np.any(unsupported.mask)
+
+    supported_direction = direction.copy()
+    supported_direction[..., 2] = -1.0
+    supported = render_selected_maplet_atlases(
+        replace(mode_atlas, mode_view_directions=supported_direction),
+        np.asarray([7]),
+        np.eye(4),
+        _camera(),
+        width=100,
+        height=80,
+    )
+    assert np.any(supported.mask)
+
+    identity_score = atlas_view_direction_log_likelihood(
+        replace(mode_atlas, mode_view_directions=supported_direction),
+        np.asarray([7]),
+        np.eye(4),
+    )
+    shifted_pose = np.eye(4, dtype=np.float64)
+    shifted_pose[0, 3] = -0.5
+    shifted_score = atlas_view_direction_log_likelihood(
+        replace(mode_atlas, mode_view_directions=supported_direction),
+        np.asarray([7]),
+        shifted_pose,
+    )
+    assert identity_score > shifted_score
+
+    # Camera centre z=4 observes the z=2 chart from the exact opposite
+    # direction.  A chord projected onto the tangent plane has zero residual
+    # at this antipode; the spherical log-map must reject it instead.
+    opposite_pose = np.eye(4, dtype=np.float64)
+    opposite_pose[2, 3] = -4.0
+    opposite_score = atlas_view_direction_log_likelihood(
+        replace(mode_atlas, mode_view_directions=supported_direction),
+        np.asarray([7]),
+        opposite_pose,
+    )
+    assert np.isfinite(opposite_score)
+    assert identity_score > opposite_score + 100.0
+
+
+def test_view_mode_prior_uses_baked_covariance_not_cosine_heuristic():
+    angle = np.deg2rad(2.0)
+    means = np.asarray(
+        [[0.0, 0.0, -1.0], [np.sin(angle), 0.0, -np.cos(angle)]],
+        dtype=np.float64,
+    )
+    covariance = np.stack(
+        [
+            np.eye(3) * np.deg2rad(60.0) ** 2,
+            np.eye(3) * np.deg2rad(1.0) ** 2,
+        ]
+    )
+    score = _view_mode_log_densities(
+        means,
+        covariance,
+        np.asarray([0.5, 0.5]),
+        np.asarray([True, True]),
+        np.asarray([0.0, 0.0, -1.0]),
+    )
+
+    # A raw cosine heuristic would choose the exact but extremely broad
+    # first mode.  Its normalized directional density is lower than the
+    # nearby, tightly observed second mode.
+    assert score[1] > score[0]
+
+
+def test_full_scene_depth_occludes_unselected_rear_atlas():
+    xyz, primitive_ids, valid, _audit = canonical_maplet_geometry(
+        _source(), _maplets(), resolution=4
+    )
+    features = np.ones((1, 1, 4, 4), dtype=np.float32)
+    atlas = MapletFeatureAtlasBank(
+        maplet_ids=np.asarray([7]),
+        centers=np.asarray([[0, 0, 2]], dtype=np.float32),
+        frames=np.asarray([np.eye(3)], dtype=np.float32),
+        extents=np.asarray([[0.2, 0.2, 0.1]], dtype=np.float32),
+        xyz=xyz,
+        primitive_ids=primitive_ids,
+        features=features,
+        variance=np.zeros((1, 4, 4), dtype=np.float32),
+        support_count=np.ones((1, 4, 4), dtype=np.int32),
+        valid_mask=valid,
+        metadata={},
+    )
+    unobstructed = render_selected_maplet_atlases(
+        atlas, np.asarray([7]), np.eye(4), _camera(), width=100, height=80
+    )
+    scene_depth = render_scene_depth_from_points(
+        np.asarray([[0, 0, 1]], dtype=np.float32),
+        np.eye(4),
+        _camera(),
+        width=100,
+        height=80,
+    )
+    occluded = render_selected_maplet_atlases(
+        atlas,
+        np.asarray([7]),
+        np.eye(4),
+        _camera(),
+        width=100,
+        height=80,
+        full_scene_depth=scene_depth,
+    )
+    assert unobstructed.mask[40, 50]
+    assert not occluded.mask[40, 50]
+    assert int(np.sum(occluded.mask)) < int(np.sum(unobstructed.mask))
 
 
 def test_atlas_baking_requires_exact_raster_identity_and_keeps_geometry():
@@ -447,7 +846,44 @@ def test_local_correlation_recovers_shift_distribution():
     assert np.median(np.abs(result.mean_displacement[:, 1])) < 0.2
 
 
-def test_candidate_matchability_changes_offset_posterior():
+def test_cached_local_correlation_matches_uncached_result():
+    rng = np.random.default_rng(41)
+    feature = rng.normal(size=(8, 7, 9)).astype(np.float32)
+    query = rng.normal(size=feature.shape).astype(np.float32)
+    mask = np.zeros((7, 9), dtype=bool)
+    mask[2:5, 2:7] = True
+    rendered = RenderedMapletAtlases(
+        feature=feature,
+        xyz=np.zeros((7, 9, 3), dtype=np.float32),
+        normal=np.zeros((7, 9, 3), dtype=np.float32),
+        uncertainty=np.zeros((7, 9), dtype=np.float32),
+        maplet_id=np.where(mask, 7, -1),
+        mask=mask,
+        depth=mask.astype(np.float32),
+    )
+    expected = local_correlation_distribution(
+        rendered,
+        query,
+        radius=2,
+        background_samples=17,
+        device="cpu",
+    )
+    cache = build_local_correlation_query_cache(
+        query, radius=2, background_samples=17, device="cpu"
+    )
+    actual = local_correlation_distribution(
+        rendered,
+        query,
+        radius=2,
+        background_samples=17,
+        device="cpu",
+        query_cache=cache,
+    )
+    assert np.allclose(actual.probabilities, expected.probabilities)
+    assert np.allclose(actual.null_probability, expected.null_probability)
+
+
+def test_detector_matchability_cannot_create_offset_evidence():
     feature = np.ones((1, 5, 5), dtype=np.float32)
     mask = np.zeros((5, 5), dtype=bool)
     mask[2, 2] = True
@@ -471,8 +907,11 @@ def test_candidate_matchability_changes_offset_posterior():
         null_logit=-10.0,
         device="cpu",
     )
-    assert result.mean_displacement[0, 0] > 0.99
+    # A detector peak makes this rendered cell reliable, but RADIO is flat;
+    # therefore the displacement posterior must remain symmetric.
+    assert abs(float(result.mean_displacement[0, 0])) < 1e-6
     assert abs(float(result.mean_displacement[0, 1])) < 1e-3
+    assert float(result.matchability[0]) > 0.99
 
 
 def test_heldout_zero_mass_is_not_multiplied_by_non_null_twice():
@@ -490,6 +929,163 @@ def test_heldout_zero_mass_is_not_multiplied_by_non_null_twice():
     )
     value = zero_displacement_log_likelihood(correlation, np.asarray([7]))
     assert np.isclose(value, np.log(0.4))
+
+
+def test_zero_displacement_score_is_invariant_to_raster_area():
+    correlation = CorrelationDistribution(
+        pixel_xy=np.zeros((4, 2), dtype=np.float32),
+        xyz=np.zeros((4, 3), dtype=np.float32),
+        maplet_ids=np.asarray([7, 7, 7, 8]),
+        offsets_xy=np.asarray([[0, 0]], dtype=np.float32),
+        probabilities=np.asarray([[0.8], [0.8], [0.8], [0.2]], dtype=np.float32),
+        null_probability=np.asarray([0.2, 0.2, 0.2, 0.8], dtype=np.float32),
+        mean_displacement=np.zeros((4, 2), dtype=np.float32),
+        covariance=np.zeros((4, 2, 2), dtype=np.float32),
+        entropy=np.zeros(4, dtype=np.float32),
+        matchability=np.ones(4, dtype=np.float32),
+        surface_ids=np.asarray([70, 70, 70, 80], dtype=np.int64),
+    )
+    value = zero_displacement_log_likelihood(
+        correlation, np.asarray([7, 8])
+    )
+    assert np.isclose(value, 0.5 * (np.log(0.8) + np.log(0.2)))
+
+
+def test_candidate_score_keeps_missing_charts_in_fixed_null_denominator():
+    correlation = CorrelationDistribution(
+        pixel_xy=np.zeros((1, 2), dtype=np.float32),
+        xyz=np.zeros((1, 3), dtype=np.float32),
+        maplet_ids=np.asarray([7]),
+        offsets_xy=np.asarray([[0, 0], [1, 0]], dtype=np.float32),
+        probabilities=np.asarray([[0.75, 0.05]], dtype=np.float32),
+        null_probability=np.asarray([0.20], dtype=np.float32),
+        mean_displacement=np.zeros((1, 2), dtype=np.float32),
+        covariance=np.zeros((1, 2, 2), dtype=np.float32),
+        entropy=np.zeros(1, dtype=np.float32),
+        matchability=np.ones(1, dtype=np.float32),
+    )
+    # Uniform mass is 1 / (two offsets + explicit null). Chart 8 is absent
+    # and must contribute a zero LLR rather than vanish from the average.
+    value = fixed_chart_zero_displacement_log_likelihood_ratio(
+        correlation, np.asarray([7, 8])
+    )
+    assert np.isclose(value, 0.5 * np.log(0.75 / (1.0 / 3.0)))
+
+
+def test_coarse_match_bayes_factor_marginalizes_local_displacement():
+    correlation = CorrelationDistribution(
+        pixel_xy=np.zeros((1, 2), dtype=np.float32),
+        xyz=np.zeros((1, 3), dtype=np.float32),
+        maplet_ids=np.asarray([7]),
+        offsets_xy=np.asarray([[0, 0], [1, 0]], dtype=np.float32),
+        probabilities=np.asarray([[0.05, 0.75]], dtype=np.float32),
+        null_probability=np.asarray([0.20], dtype=np.float32),
+        mean_displacement=np.zeros((1, 2), dtype=np.float32),
+        covariance=np.zeros((1, 2, 2), dtype=np.float32),
+        entropy=np.zeros(1, dtype=np.float32),
+        matchability=np.ones(1, dtype=np.float32),
+        valid_offset_count=np.asarray([2]),
+    )
+    value = fixed_chart_local_match_log_bayes_factor(
+        correlation, np.asarray([7, 8])
+    )
+    assert np.isclose(value, 0.5 * np.log(0.80 / 0.20))
+
+
+def test_exact_match_bayes_factor_removes_displacement_search_prior():
+    correlation = CorrelationDistribution(
+        pixel_xy=np.zeros((1, 2), dtype=np.float32),
+        xyz=np.zeros((1, 3), dtype=np.float32),
+        maplet_ids=np.asarray([7]),
+        offsets_xy=np.asarray([[0, 0], [1, 0]], dtype=np.float32),
+        probabilities=np.asarray([[0.75, 0.05]], dtype=np.float32),
+        null_probability=np.asarray([0.20], dtype=np.float32),
+        mean_displacement=np.zeros((1, 2), dtype=np.float32),
+        covariance=np.zeros((1, 2, 2), dtype=np.float32),
+        entropy=np.zeros(1, dtype=np.float32),
+        matchability=np.ones(1, dtype=np.float32),
+        valid_offset_count=np.asarray([2]),
+    )
+    value = fixed_chart_zero_displacement_log_bayes_factor(
+        correlation, np.asarray([7, 8])
+    )
+    assert np.isclose(value, 0.5 * np.log((0.75 / 0.20) * 2.0))
+
+
+def test_alignment_exact_evidence_is_not_suppressed_by_an_offzero_peak():
+    def distribution(zero, other, null):
+        return CorrelationDistribution(
+            pixel_xy=np.zeros((2, 2), dtype=np.float32),
+            xyz=np.zeros((2, 3), dtype=np.float32),
+            maplet_ids=np.asarray([7, 8]),
+            offsets_xy=np.asarray([[0, 0], [1, 0]], dtype=np.float32),
+            probabilities=np.asarray(
+                [[zero, other], [zero, other]], dtype=np.float32
+            ),
+            null_probability=np.asarray([null, null], dtype=np.float32),
+            mean_displacement=np.zeros((2, 2), dtype=np.float32),
+            covariance=np.zeros((2, 2, 2), dtype=np.float32),
+            entropy=np.zeros(2, dtype=np.float32),
+            matchability=np.ones(2, dtype=np.float32),
+            surface_ids=np.asarray([70, 80], dtype=np.int64),
+            valid_offset_count=np.asarray([2, 2]),
+        )
+
+    before = distribution(0.40, 0.10, 0.50)
+    after = distribution(0.30, 0.65, 0.05)
+    assert zero_displacement_log_likelihood(
+        after, np.asarray([7, 8])
+    ) < zero_displacement_log_likelihood(before, np.asarray([7, 8]))
+    assert zero_displacement_log_bayes_factor(
+        after, np.asarray([7, 8])
+    ) > zero_displacement_log_bayes_factor(before, np.asarray([7, 8]))
+    accepted, evidence = accept_pose_update_bayes_factor(
+        before,
+        after,
+        fit_maplet_ids=np.asarray([7]),
+        heldout_maplet_ids=np.asarray([8]),
+    )
+    assert accepted
+    assert evidence["fit_after"] > evidence["fit_before"]
+    assert evidence["heldout_after"] > evidence["heldout_before"]
+
+
+def test_bayes_factor_update_does_not_pair_pose_dependent_raster_texels():
+    def distribution(maplet_ids, surface_ids, zero, null):
+        count = len(maplet_ids)
+        zero = np.asarray(zero, dtype=np.float32)
+        null = np.asarray(null, dtype=np.float32)
+        return CorrelationDistribution(
+            pixel_xy=np.zeros((count, 2), dtype=np.float32),
+            xyz=np.zeros((count, 3), dtype=np.float32),
+            maplet_ids=np.asarray(maplet_ids, dtype=np.int64),
+            offsets_xy=np.asarray([[0, 0], [1, 0]], dtype=np.float32),
+            probabilities=np.stack(
+                [zero, np.maximum(1.0 - zero - null, 0.0)], axis=1
+            ),
+            null_probability=null,
+            mean_displacement=np.zeros((count, 2), dtype=np.float32),
+            covariance=np.zeros((count, 2, 2), dtype=np.float32),
+            entropy=np.zeros(count, dtype=np.float32),
+            matchability=np.ones(count, dtype=np.float32),
+            surface_ids=np.asarray(surface_ids, dtype=np.int64),
+            valid_offset_count=np.full(count, 2, dtype=np.int64),
+        )
+
+    # The same two fixed chart identities improve, while rasterization at the
+    # new pose selects different canonical texels.  Pairing seed texel IDs
+    # would falsely mark every after-row missing and lock the pose.
+    before = distribution([7, 8], [70, 80], [0.4, 0.4], [0.5, 0.5])
+    after = distribution([7, 8], [71, 81], [0.7, 0.7], [0.2, 0.2])
+    accepted, evidence = accept_pose_update_bayes_factor(
+        before,
+        after,
+        fit_maplet_ids=np.asarray([7]),
+        heldout_maplet_ids=np.asarray([8]),
+    )
+    assert accepted
+    assert evidence["fit_after"] > evidence["fit_before"]
+    assert evidence["heldout_after"] > evidence["heldout_before"]
 
 
 def test_heldout_verifier_uses_fixed_surface_identity_denominator():
@@ -526,6 +1122,89 @@ def test_heldout_verifier_uses_fixed_surface_identity_denominator():
     )
 
 
+def test_heldout_verifier_does_not_drop_a_surface_after_update():
+    def distribution(probability, surface_ids):
+        values = np.asarray(probability, dtype=np.float32)
+        count = values.size
+        return CorrelationDistribution(
+            pixel_xy=np.zeros((count, 2), dtype=np.float32),
+            xyz=np.zeros((count, 3), dtype=np.float32),
+            maplet_ids=np.full(count, 7, dtype=np.int64),
+            offsets_xy=np.asarray([[0, 0], [1, 0]], dtype=np.float32),
+            probabilities=np.stack(
+                [values, np.zeros_like(values)], axis=1
+            ),
+            null_probability=1.0 - values,
+            mean_displacement=np.zeros((count, 2), dtype=np.float32),
+            covariance=np.zeros((count, 2, 2), dtype=np.float32),
+            entropy=np.zeros(count, dtype=np.float32),
+            matchability=np.ones(count, dtype=np.float32),
+            surface_ids=np.asarray(surface_ids, dtype=np.int64),
+        )
+
+    before = distribution([0.9, 0.9], [1, 2])
+    after = distribution([0.95], [1])
+    accepted, evidence = accept_pose_update(
+        before,
+        after,
+        fit_maplet_ids=np.asarray([7]),
+        heldout_maplet_ids=np.asarray([8]),
+    )
+    assert not accepted
+    assert evidence["fit_surface_count"] == 2
+    assert np.isclose(
+        evidence["fit_after"],
+        np.mean(np.log([0.95, 1.0 / 3.0])),
+    )
+
+
+def test_heldout_verifier_gives_each_chart_equal_mass():
+    def distribution(maplet_ids, surface_ids, probability):
+        values = np.asarray(probability, dtype=np.float32)
+        count = values.size
+        return CorrelationDistribution(
+            pixel_xy=np.zeros((count, 2), dtype=np.float32),
+            xyz=np.zeros((count, 3), dtype=np.float32),
+            maplet_ids=np.asarray(maplet_ids, dtype=np.int64),
+            offsets_xy=np.asarray([[0, 0]], dtype=np.float32),
+            probabilities=values[:, None],
+            null_probability=1.0 - values,
+            mean_displacement=np.zeros((count, 2), dtype=np.float32),
+            covariance=np.zeros((count, 2, 2), dtype=np.float32),
+            entropy=np.zeros(count, dtype=np.float32),
+            matchability=np.ones(count, dtype=np.float32),
+            surface_ids=np.asarray(surface_ids, dtype=np.int64),
+        )
+
+    before = distribution(
+        [7, 7, 7, 8],
+        [70, 71, 72, 80],
+        [0.5, 0.5, 0.5, 0.5],
+    )
+    after = distribution(
+        [7, 7, 7, 8],
+        [70, 71, 72, 80],
+        [0.8, 0.8, 0.8, 0.2],
+    )
+    _accepted, evidence = accept_pose_update(
+        before,
+        after,
+        fit_maplet_ids=np.asarray([7, 8]),
+        heldout_maplet_ids=np.asarray([9]),
+    )
+    assert np.isclose(evidence["fit_before"], np.log(0.5))
+    assert np.isclose(
+        evidence["fit_after"],
+        0.5 * (np.log(0.8) + np.log(0.2)),
+    )
+
+    gains = paired_chart_log_likelihood_gains(
+        before, after, np.asarray([7, 8])
+    )
+    assert np.isclose(gains[7], np.log(0.8) - np.log(0.5))
+    assert np.isclose(gains[8], np.log(0.2) - np.log(0.5))
+
+
 def test_density_ratio_null_is_not_overwhelmed_by_search_window_size():
     rng = np.random.default_rng(19)
     channels, height, width = 64, 12, 12
@@ -552,6 +1231,42 @@ def test_density_ratio_null_is_not_overwhelmed_by_search_window_size():
         rendered, query_feature, radius=4, temperature=0.07, device="cpu"
     )
     assert 0.25 < float(np.median(result.null_probability)) < 0.75
+
+
+def test_density_ratio_null_accounts_for_anisotropic_descriptor_cone():
+    rng = np.random.default_rng(23)
+    channels, height, width = 64, 12, 12
+    bias = np.zeros((channels, 1, 1), dtype=np.float32)
+    bias[0] = 3.0
+    rendered_feature = (
+        bias
+        + rng.normal(size=(channels, height, width)).astype(np.float32)
+    )
+    query_feature = (
+        bias
+        + rng.normal(size=(channels, height, width)).astype(np.float32)
+    )
+    rendered_feature /= np.linalg.norm(
+        rendered_feature, axis=0, keepdims=True
+    )
+    query_feature /= np.linalg.norm(
+        query_feature, axis=0, keepdims=True
+    )
+    mask = np.zeros((height, width), dtype=bool)
+    mask[3:-3, 3:-3] = True
+    rendered = RenderedMapletAtlases(
+        feature=rendered_feature,
+        xyz=np.zeros((height, width, 3), dtype=np.float32),
+        normal=np.zeros((height, width, 3), dtype=np.float32),
+        uncertainty=np.zeros((height, width), dtype=np.float32),
+        maplet_id=np.where(mask, 7, -1),
+        mask=mask,
+        depth=mask.astype(np.float32),
+    )
+    result = local_correlation_distribution(
+        rendered, query_feature, radius=4, temperature=0.07, device="cpu"
+    )
+    assert 0.20 < float(np.median(result.null_probability)) < 0.80
 
 
 def test_geometry_solver_recovers_joint_pose_step():

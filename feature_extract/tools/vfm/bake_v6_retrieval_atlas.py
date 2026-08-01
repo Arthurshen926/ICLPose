@@ -44,6 +44,22 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--surface_spatial_projection_checkpoint", default="")
     parser.add_argument("--contributor_dirs", nargs="+", required=True)
     parser.add_argument(
+        "--radio_token_dir",
+        default="",
+        help=(
+            "Optional per-image RADIO token override. This lets the same "
+            "geometry-only contributor cache bake a phase-matched map atlas "
+            "without storing or changing mapping RGB."
+        ),
+    )
+    parser.add_argument(
+        "--feature_stride",
+        type=int,
+        choices=(4, 8, 16),
+        default=16,
+        help="Physical stride of radio_final in the selected token bank.",
+    )
+    parser.add_argument(
         "--trajectory_ids",
         nargs="*",
         default=[],
@@ -129,6 +145,7 @@ def _fit_radio_projection(
     maximum_samples: int,
     seed: int,
     device: str,
+    radio_token_dir: Path | None = None,
 ) -> np.ndarray:
     """Fit an origin-preserving RADIO subspace without maplet-ID collapse."""
 
@@ -144,7 +161,8 @@ def _fit_radio_projection(
         with np.load(path, allow_pickle=False) as data:
             metadata = json.loads(str(data["metadata_json"].item()))
         raw = _load_raw_final(
-            Path(str(metadata["token_path"])), "radio_final"
+            _radio_token_path(metadata, radio_token_dir),
+            "radio_final",
         )
         flat = np.asarray(raw, dtype=np.float32).reshape(raw.shape[0], -1).T
         flat /= np.maximum(np.linalg.norm(flat, axis=1, keepdims=True), 1e-8)
@@ -169,6 +187,23 @@ def _fit_radio_projection(
         tensor, q=dimension, center=False, niter=4
     )
     return right[:, :dimension].T.detach().cpu().numpy().astype(np.float32)
+
+
+def _radio_token_path(
+    metadata: dict[str, object],
+    override_dir: Path | None,
+) -> Path:
+    if override_dir is None:
+        return Path(str(metadata["token_path"]))
+    image_id = str(metadata["image_id"])
+    path = Path(override_dir) / (
+        image_id.replace("/", "__").replace("\\", "__") + ".npz"
+    )
+    if not path.exists():
+        raise FileNotFoundError(
+            f"phase-matched RADIO token is missing: {path}"
+        )
+    return path
 
 
 def _project_radio(
@@ -239,6 +274,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             for path in Path(directory).glob("*.npz")
         }
     )
+    radio_token_dir = (
+        Path(args.radio_token_dir)
+        if str(args.radio_token_dir)
+        else None
+    )
     if requested_trajectories:
         filtered_paths = []
         for path in cache_paths:
@@ -301,6 +341,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             maximum_samples=int(args.projection_samples),
             seed=int(args.projection_seed),
             device=str(args.device),
+            radio_token_dir=radio_token_dir,
         )
         feature_transform_sha256 = _array_sha256(query_projection)
     views = []
@@ -313,8 +354,18 @@ def main(argv: Sequence[str] | None = None) -> None:
             metadata = json.loads(str(data["metadata_json"].item()))
             trajectory_id = str(metadata["trajectory_id"])
             raw = _load_raw_final(
-                Path(str(metadata["token_path"])), "radio_final"
+                _radio_token_path(metadata, radio_token_dir),
+                "radio_final",
             )
+            expected_shape = (
+                int(data["camera_height"]) // int(args.feature_stride),
+                int(data["camera_width"]) // int(args.feature_stride),
+            )
+            if tuple(raw.shape[-2:]) != expected_shape:
+                raise ValueError(
+                    "RADIO token grid differs from declared feature stride: "
+                    f"{raw.shape[-2:]} != {expected_shape}"
+                )
             mapped = (
                 mapper.project(raw).measurement_context
                 if mapper is not None
@@ -379,7 +430,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         metadata={
             "vfm_layer": "radio_final",
             "metric_feature_level": "retrieval",
-            "metric_feature_stride": 16,
+            "metric_feature_stride": int(args.feature_stride),
+            "radio_phase_stride": int(args.feature_stride),
             "query_feature_transform": feature_transform,
             "query_feature_transform_sha256": feature_transform_sha256,
             "surface_mapper_best_epoch": mapper_metadata.get(
@@ -417,6 +469,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         "output_maplets": str(outputs[1]),
         "retrieval_component_count": int(bank.descriptors.shape[0]),
         "spatial_stride": int(args.spatial_stride),
+        "metric_feature_stride": int(args.feature_stride),
+        "uses_radio_token_override": bool(radio_token_dir is not None),
         "query_feature_transform": feature_transform,
         "query_feature_transform_sha256": feature_transform_sha256,
         "projection_input_dim": (
