@@ -25,6 +25,9 @@ from feature_extract.tools.vfm.train_v6_metric_encoder import _load_views
 from feature_extract.vfm.localization.surface_maplet_mapper import (
     load_surface_maplet_mapper,
 )
+from feature_extract.vfm.localization.continuous_surface_alignment import (
+    project_world_points,
+)
 from feature_extract.vfm.localization_v6.atlas_pose_alignment import (
     AtlasAlignmentLevel,
     _translation_search_step,
@@ -144,6 +147,10 @@ def _aggregate(rows: Sequence[Mapping[str, object]]) -> dict[str, object]:
         [float(row["final_rotation_deg"]) for row in rows],
         dtype=np.float64,
     )
+    flow = np.asarray(
+        [float(row["initial_pixel_flow_median_px"]) for row in rows],
+        dtype=np.float64,
+    )
     return {
         "query_count": len(rows),
         "accepted_update_fraction": (
@@ -159,7 +166,10 @@ def _aggregate(rows: Sequence[Mapping[str, object]]) -> dict[str, object]:
             else 0.0
         ),
         "translation_improved_fraction": (
-            float(np.mean(final_t < initial_t)) if rows else 0.0
+            # A strict floating-point comparison previously counted unchanged
+            # 5/20 cm poses as improvements at ~1e-15 m.  Require a meaningful
+            # one-millimetre reduction for this basin diagnostic.
+            float(np.mean(final_t < initial_t - 1e-3)) if rows else 0.0
         ),
         "success_4cm_1deg": (
             float(np.mean((final_t <= 0.04) & (final_r <= 1.0)))
@@ -187,6 +197,77 @@ def _aggregate(rows: Sequence[Mapping[str, object]]) -> dict[str, object]:
         ),
         "final_rotation_p90_deg": (
             float(np.quantile(final_r, 0.90)) if rows else None
+        ),
+        "initial_pixel_flow_median_px": (
+            float(np.median(flow)) if rows else None
+        ),
+        "initial_pixel_flow_p90_px": (
+            float(np.quantile(flow, 0.90)) if rows else None
+        ),
+    }
+
+
+def _initial_flow_statistics(
+    atlas: MapletFeatureAtlasBank,
+    selected_ids: np.ndarray,
+    initial_pose_w2c: np.ndarray,
+    target_pose_w2c: np.ndarray,
+    camera: object,
+    *,
+    maximum_points: int = 4096,
+) -> dict[str, object]:
+    row_by_id = {
+        int(value): row for row, value in enumerate(atlas.maplet_ids.tolist())
+    }
+    rows = np.asarray(
+        [row_by_id[int(value)] for value in selected_ids if int(value) in row_by_id],
+        dtype=np.int64,
+    )
+    if rows.size == 0:
+        return {
+            "initial_pixel_flow_sample_count": 0,
+            "initial_pixel_flow_median_px": 0.0,
+            "initial_pixel_flow_p90_px": 0.0,
+            "selected_surface_depth_median_m": 0.0,
+        }
+    xyz = np.asarray(atlas.xyz[rows], dtype=np.float64)
+    valid = np.asarray(atlas.valid_mask[rows], dtype=bool)
+    points = xyz[valid]
+    if points.shape[0] > int(maximum_points):
+        indices = np.linspace(
+            0, points.shape[0] - 1, int(maximum_points), dtype=np.int64
+        )
+        points = points[indices]
+    target_xy, target_depth = project_world_points(
+        points, target_pose_w2c, camera
+    )
+    initial_xy, initial_depth = project_world_points(
+        points, initial_pose_w2c, camera
+    )
+    keep = (
+        np.isfinite(target_xy).all(axis=1)
+        & np.isfinite(initial_xy).all(axis=1)
+        & np.isfinite(target_depth)
+        & np.isfinite(initial_depth)
+        & (target_depth > 0.10)
+        & (initial_depth > 0.10)
+        & (target_xy[:, 0] >= 0.0)
+        & (target_xy[:, 0] < float(camera.width))
+        & (target_xy[:, 1] >= 0.0)
+        & (target_xy[:, 1] < float(camera.height))
+    )
+    flow = np.linalg.norm(initial_xy[keep] - target_xy[keep], axis=1)
+    depth = target_depth[keep]
+    return {
+        "initial_pixel_flow_sample_count": int(flow.size),
+        "initial_pixel_flow_median_px": (
+            float(np.median(flow)) if flow.size else 0.0
+        ),
+        "initial_pixel_flow_p90_px": (
+            float(np.quantile(flow, 0.90)) if flow.size else 0.0
+        ),
+        "selected_surface_depth_median_m": (
+            float(np.median(depth)) if depth.size else 0.0
         ),
     }
 
@@ -384,6 +465,13 @@ def main(argv: Sequence[str] | None = None) -> None:
             seed=int(args.seed),
         )
         initial_pose = se3_exp(delta) @ view.pose_w2c
+        flow_statistics = _initial_flow_statistics(
+            atlas,
+            selected,
+            initial_pose,
+            view.pose_w2c,
+            view.camera,
+        )
         alignment = refine_pose_with_maplet_atlases(
             alignment_atlases,
             query_pyramid,
@@ -395,6 +483,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             device=str(args.device),
             minimum_fit_gain=0.01,
             minimum_heldout_gain=0.0,
+            maximum_committed_translation_updates=1,
         )
         initial_error = pnp_pose_error(initial_pose, view.pose_w2c)
         final_error = pnp_pose_error(
@@ -418,6 +507,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             "initial_translation_error_world": (
                 initial_center - gt_center
             ).tolist(),
+            "initial_translation_error_camera": (
+                view.pose_w2c[:3, :3] @ (initial_center - gt_center)
+            ).tolist(),
             "final_translation_error_world": (
                 final_center - gt_center
             ).tolist(),
@@ -426,6 +518,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             "final_translation_m": float(final_error.translation_m),
             "final_rotation_deg": float(final_error.rotation_deg),
             "accepted_step_count": int(alignment.accepted_step_count),
+            **flow_statistics,
             "atlas_score": (
                 float(alignment.score)
                 if np.isfinite(alignment.score)
