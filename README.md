@@ -61,6 +61,14 @@ frozen production baseline, not extended with new modules. The
 [SfM landmark mainline](docs/vfm/landmark_localization_mainline.md) is retained
 only as a historical baseline.
 
+The [V8.1 structured-region diagnostic](docs/vfm/nonredundant_region_surface_localization_v81.md)
+is isolated from the active V6 line. It fixes directed-edge duplication,
+correlated-support counting, footprint semantics, virtual-pose truncation and
+SE(3) mode collapse, but is not promoted: its final Strict12 result remains
+1.72 m median translation. Its O1--O4 oracles identify continuous
+maplet-interior RADIO alignment, rather than a larger pose lattice or another
+stored embedding, as the next required research module.
+
 ## Active Code
 
 - `feature_extract/tools/vfm/build_v6_canonical_maplet_atlas.py`
