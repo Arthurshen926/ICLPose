@@ -35,6 +35,9 @@ from feature_extract.vfm.surface_maplet_bank import (
     RadioFinalRegionConfig,
     encode_radio_final_regions,
 )
+from feature_extract.vfm.localization_v8.multi_teacher_student import (
+    load_maplet_retrieval_adaptor,
+)
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -45,6 +48,11 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--identity_maplets", required=True)
     parser.add_argument("--spatial_maplets", required=True)
     parser.add_argument("--surface_mapper_checkpoint", required=True)
+    parser.add_argument(
+        "--localization_adaptor",
+        default="",
+        help="Optional V8 single-student regional localization adaptor.",
+    )
     parser.add_argument("--output_calibration", required=True)
     parser.add_argument("--summary_json", required=True)
     parser.add_argument(
@@ -207,6 +215,13 @@ def main(argv: Sequence[str] | None = None) -> None:
         Path(args.surface_mapper_checkpoint), device=str(args.device)
     )
     mapper_sha256 = _sha256(Path(args.surface_mapper_checkpoint))
+    localization_adaptor = None
+    if str(args.localization_adaptor):
+        localization_adaptor, _localization_metadata = (
+            load_maplet_retrieval_adaptor(
+                Path(args.localization_adaptor), device=str(args.device)
+            )
+        )
     identity_metadata = dict(identity_bank.metadata or {})
     declared_identity_mapper = str(
         identity_metadata.get("surface_mapper_sha256", "")
@@ -272,6 +287,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         identity_descriptor = encode_radio_final_regions(
             identity_map, token_xy, identity_config
         )
+        if localization_adaptor is not None:
+            identity_descriptor = localization_adaptor.project_numpy(
+                identity_descriptor, device=str(args.device)
+            )
         spatial_descriptor = _normalize(
             encode_radio_final_regions(
                 spatial_map,
