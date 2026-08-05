@@ -16,7 +16,9 @@ from feature_extract.vfm.localization_goal_maplet.child_local_factor import Chil
 from feature_extract.vfm.localization_goal_maplet.child_retrieval import retrieve_children_given_parents
 from feature_extract.vfm.localization_goal_maplet.configuration_evidence import (
     FEATURE_NAMES,
+    LATENT_FEATURE_NAMES,
     configuration_candidate_evidence,
+    configuration_candidate_latent_evidence,
 )
 from feature_extract.vfm.localization_goal_maplet.feature_contract import FieldFeatureContract
 from feature_extract.vfm.localization_goal_maplet.lineage import file_sha256
@@ -59,6 +61,7 @@ def main() -> None:
     parser.add_argument("--output_json", required=True)
     parser.add_argument("--maximum_groups", type=int, default=64)
     parser.add_argument("--maximum_children", type=int, default=4)
+    parser.add_argument("--evidence_version", choices=("v2", "v3"), default="v2")
     parser.add_argument("--shard_index", type=int, default=0)
     parser.add_argument("--shard_count", type=int, default=1)
     parser.add_argument("--include_trajectories", nargs="+", default=[])
@@ -114,6 +117,7 @@ def main() -> None:
     mapper, _ = load_surface_maplet_mapper(Path(args.surface_mapper), device=str(args.device))
     context_config = RadioFinalRegionConfig()
     local_config = RadioFinalRegionConfig(pool_sizes=(1,), pool_weights=(1.0,))
+    evidence_names = LATENT_FEATURE_NAMES if str(args.evidence_version) == "v3" else FEATURE_NAMES
     paths = sorted(Path(args.contributors).glob("*.npz"))[int(args.shard_index) :: int(args.shard_count)]
     rows = []
     for path in paths:
@@ -158,26 +162,43 @@ def main() -> None:
         )
         row = pool_rows[image_id]
         poses = np.asarray([item["pose_w2c"] for item in row["mode_details"][MODE]], dtype=np.float64)
-        evidence = configuration_candidate_evidence(
-            poses, grouped_local, xy, scale,
-            group_parent_ids, group_parent_probability, group_parent_null,
-            child, physical, field, graph, eligibility, calibrator, camera,
-            maximum_groups=int(args.maximum_groups), maximum_children=int(args.maximum_children),
-        )
+        if str(args.evidence_version) == "v3":
+            extent = grouped.extent * np.asarray([camera.width, camera.height], dtype=np.float64)
+            evidence = configuration_candidate_latent_evidence(
+                poses, grouped_local, xy, extent, scale,
+                group_parent_ids, group_parent_probability, group_parent_null,
+                child, physical, field, graph, eligibility, calibrator, camera,
+                maximum_groups=int(args.maximum_groups), maximum_children=int(args.maximum_children),
+            )
+            evidence_key = "configuration_evidence_v3"
+        else:
+            evidence = configuration_candidate_evidence(
+                poses, grouped_local, xy, scale,
+                group_parent_ids, group_parent_probability, group_parent_null,
+                child, physical, field, graph, eligibility, calibrator, camera,
+                maximum_groups=int(args.maximum_groups), maximum_children=int(args.maximum_children),
+            )
+            evidence_key = "configuration_evidence_v2"
         updated = json.loads(json.dumps(row))
-        updated["ranking_diagnostics"][MODE]["configuration_evidence_v2"] = {
-            name: evidence[:, index].tolist() for index, name in enumerate(FEATURE_NAMES)
+        updated["ranking_diagnostics"][MODE][evidence_key] = {
+            name: evidence[:, index].tolist() for index, name in enumerate(evidence_names)
         }
         rows.append(updated)
         print(json.dumps({"image_id": image_id, "candidate_count": int(poses.shape[0])}), flush=True)
     result = {
         **{key: value for key, value in pool.items() if key not in ("rows", "summary", "source_shards", "shard_count", "query_count")},
-        "stage": "goal_maplet_configuration_evidence_v2",
+        "stage": f"goal_maplet_configuration_evidence_{args.evidence_version}",
         "query_count": len(rows), "rows": rows,
         "configuration_evidence_contract": {
-            "feature_names": list(FEATURE_NAMES),
+            "feature_names": list(evidence_names),
             "maximum_groups": int(args.maximum_groups), "maximum_children": int(args.maximum_children),
             "child_local_mode_source": "fixed_vfm_topm",
+            "evidence_version": str(args.evidence_version),
+            "fixed_group_denominator": bool(str(args.evidence_version) == "v3"),
+            "one_mode_per_group": bool(str(args.evidence_version) == "v3"),
+            "typed_null_marginalization": bool(str(args.evidence_version) == "v3"),
+            "child_capacity": "projected_area_correlated_cluster_cap1to6" if str(args.evidence_version) == "v3" else None,
+            "primitive_capacity": "one_independent_cluster_per_primitive" if str(args.evidence_version) == "v3" else None,
             "child_local_factor_calibrator_sha256": file_sha256(Path(args.child_local_factor_calibrator)),
             "application_trajectories": sorted(application_trajectories),
             "factor_training_pool_disjoint": not training_pool_reuse,

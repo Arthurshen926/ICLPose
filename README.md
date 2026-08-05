@@ -122,6 +122,9 @@ stored embedding, as the next required research module.
 - `feature_extract/tools/vfm/train_goal_maplet_child_local_factor_calibrator.py`
 - `feature_extract/tools/vfm/augment_goal_maplet_configuration_evidence.py`
 - `feature_extract/tools/vfm/train_goal_maplet_configuration_pairwise_ranker.py`
+- `feature_extract/tools/vfm/evaluate_goal_maplet_latent_configuration.py`
+- `feature_extract/tools/vfm/train_goal_maplet_latent_safety_selector.py`
+- `feature_extract/tools/vfm/apply_goal_maplet_latent_safety_selector.py`
 
 ## Frozen V6 Code
 

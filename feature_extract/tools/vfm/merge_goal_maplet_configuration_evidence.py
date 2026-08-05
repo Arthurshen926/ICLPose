@@ -25,7 +25,12 @@ def main() -> None:
         if len({json.dumps(item.get(key), sort_keys=True) for item in shards}) != 1:
             raise ValueError(f"configuration evidence shards differ: {key}")
     contracts = [dict(item.get("configuration_evidence_contract", {})) for item in shards]
-    for key in ("feature_names", "maximum_groups", "maximum_children", "child_local_mode_source"):
+    semantic_contract_keys = (
+        "feature_names", "maximum_groups", "maximum_children", "child_local_mode_source",
+        "evidence_version", "fixed_group_denominator", "one_mode_per_group",
+        "typed_null_marginalization", "child_capacity", "primitive_capacity",
+    )
+    for key in semantic_contract_keys:
         if len({json.dumps(item.get(key), sort_keys=True) for item in contracts}) != 1:
             raise ValueError(f"configuration evidence contracts differ: {key}")
     rows = [row for shard in shards for row in shard.get("rows", [])]
@@ -37,9 +42,7 @@ def main() -> None:
         value for contract in contracts for value in contract.get("application_trajectories", ())
     })
     merged_contract = {
-        **{key: contracts[0].get(key) for key in (
-            "feature_names", "maximum_groups", "maximum_children", "child_local_mode_source",
-        )},
+        **{key: contracts[0].get(key) for key in semantic_contract_keys},
         "application_trajectories": application,
         "child_local_factor_calibrator_sha256": sorted({
             str(contract.get("child_local_factor_calibrator_sha256")) for contract in contracts

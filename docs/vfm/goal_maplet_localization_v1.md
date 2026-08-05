@@ -441,6 +441,101 @@ its tail gain, and no untouched test block has been opened.  A calibrated
 group-capacity latent solver is justified next; another graph-weight sweep or
 unconstrained joint PnP is not.
 
+### G12 — fixed-denominator group-aware latent configurations
+
+This pass froze the physical map, canonical field, parent/child retrieval,
+typed graph, typed-null calibrator and every Top-M VFM local mode.  It adds no
+map embedding, image cache, landmark bank or point matcher.  A candidate pose
+can evaluate the frozen modes but cannot regenerate their feature identities
+or probability denominator.
+
+#### Protocol and implementation corrections
+
+- G11 fixed the local-mode denominator but still averaged only groups that had
+  an eligible child option.  G12 keeps all 64 selected query groups in every
+  candidate denominator; missing options are explicit unresolved nulls.  In
+  the measured mapping/Dev pools every group happened to have an eligible
+  child, so this is a real protocol fix but does not explain the metric change.
+- An all-geometry-invalid Top-M set now follows a tested empty-assignment path
+  to null instead of indexing a synthetic option.
+- Correlated receptive fields are de-duplicated without map identity.  A first
+  connected-component implementation was rejected because overlap chains
+  merged distant supports.  The retained complete-link rule requires every
+  pair in a support cluster to have at least 0.5 box IoU.  Each cluster has unit
+  evidence mass; the median 64-group query has 45 effective groups (typical
+  10th--90th percentile 41--51 across mapping and Dev).
+- Every group chooses one fixed child-local primitive mode or typed null.
+  Independent support clusters cannot reuse one primitive.  Child capacity is
+  derived from projected tile area relative to query support area and bounded
+  to 1--6 clusters.  The solver is deterministic and does not update SE(3).
+
+The implementation reports the old eligible-only mean, a fixed unweighted
+mean, a correlation-corrected mean, uncapacitated latent assignment and
+capacitated latent assignment separately.  This prevents a denominator fix,
+support de-correlation and capacity constraint from being credited to one
+another.
+
+#### Mapping outer-cross-fit gate
+
+All 106 mapping diagnostics use trajectory outer-cross-fitted typed factors;
+seq12/14 (17 queries) remains the configuration validation partition.
+
+| Predefined mapping policy | translation median / P90 | success <=0.5m/5° | catastrophic |
+|---|---:|---:|---:|
+| graph proposal | 0.533 / 2.144 m | 45.28% | 14.15% |
+| legacy valid-factor mean | 0.434 / 1.535 m | 55.66% | 8.49% |
+| correlation-corrected mean | **0.418** / 1.535 m | **57.55%** | 8.49% |
+| uncapacitated latent | 0.489 / 1.486 m | 50.00% | 6.60% |
+| capacitated latent | 0.456 / **1.442 m** | 52.83% | **5.66%** |
+
+Capacity is active rather than cosmetic: it changes 73% of candidates in the
+seq6/7/8 cross-fit shard.  It behaves as a safety/tail factor on the combined
+mapping pool, but on clean seq12/14 validation it does not improve catastrophic
+rate and reduces success.  It is therefore retained as evidence, not selected
+as the primary Top-1 policy.
+
+A low-capacity basin head and catastrophic head were trained as a correction
+bounded to 0.25 of each query's base-score IQR.  Candidate-level validation
+AUPRC is 0.959/0.968.  The correction deliberately leaves validation Top-1
+unchanged.  It improves validation risk ordering at 70% coverage to 0.201 /
+0.766 m, 75.0% success and zero catastrophic errors, but this full risk gain
+does not transfer unchanged to Dev48.
+
+#### Frozen Dev48 result
+
+| Dev48 policy | translation median / P90 | rotation median / P90 | success <=0.5m/5° | catastrophic |
+|---|---:|---:|---:|---:|
+| graph proposal | 0.555 / 1.680 m | 1.994° / 5.561° | 45.83% | 8.33% |
+| G11 legacy valid-factor mean | **0.455** / 1.499 m | 1.667° / 5.058° | **54.17%** | 6.25% |
+| correlation-corrected mean | 0.495 / **1.301 m** | **1.599° / 3.760°** | 50.00% | **4.17%** |
+| uncapacitated latent | 0.577 / 1.539 m | 1.925° / 4.216° | 39.58% | 8.33% |
+| capacitated latent | 0.577 / 1.637 m | 2.020° / 4.548° | 45.83% | 8.33% |
+| bounded safety residual | 0.495 / 1.301 m | 1.599° / 3.760° | 50.00% | 4.17% |
+
+The correlation-corrected policy improves every robustness metric relative to
+the graph proposal and halves the catastrophic count from four to two.  Its
+Top-3 0.5 m / 5 degree recall is 72.92%, versus 70.83% for the legacy factor
+mean.  Relative to G11 it explicitly trades 4 cm median and 4.17 percentage
+points of Top-1 success for 20 cm P90, 1.30 degrees rotation P90 and one fewer
+catastrophic failure.  This is aligned with a robustness-first claim, but it
+does not recover the requested centimetre/decimetre precision.
+
+The safety residual does not alter any Dev48 Top-1 choice.  At 70% accepted
+coverage its confidence ordering reports 0.473 / 1.115 m and 2.94%
+catastrophic rate.  Basin/catastrophic AUPRC falls from 0.959/0.968 on mapping
+validation to 0.748/0.619 on Dev48, so abstention remains useful but is not yet
+reliably calibrated enough for production.  The two remaining catastrophic frames are
+both seq13: one has a 0.459 m Top-32 oracle but is mis-ranked by every factor
+policy; the other has only a 1.030 m Top-32 oracle and is partly a proposal
+coverage failure.
+
+The group-aware solver therefore answers an important method question rather
+than merely adding another score: support de-correlation is a stable tail
+improvement; hard child/primitive capacity is not a stable Top-1 improvement.
+Because the latent-selection gate fails on Dev48, no SE(3) update or continuous
+refiner is started.  Doing so would again allow a weak assignment to move and
+then validate its own pose.
+
 ## Development-set result
 
 The best deployable Goal-Maplet Top-1 remains the frozen graph v9 result, not
@@ -468,8 +563,8 @@ relevant, but it does not yet meet the requested accuracy.
 | M1 trustworthy map | pass | exact hierarchy, geometry/visibility audit, lineage |
 | M2 trustworthy retrieval | partial pass | pose-sufficient R@64=1; R@1/calibration still weak |
 | M3 structured coarse localization | partial pass | strong Top-32, unreliable Top-1 rank |
-| M3.1 configuration ranking | scientific partial / production fail | factor aggregation 0.455/1.499 m, but 0.217 m regret |
-| M3.2 child-local measurement | scientific partial / production fail | point 0.194 m, pose 0.287 m; grouped inference missing |
+| M3.1 configuration ranking | scientific partial / production fail | robust aggregate 0.495/1.301 m and 4.17% catastrophic, but 0.235 m regret |
+| M3.2 child-local measurement | scientific partial / production fail | grouped assignment implemented; hard capacity fails Dev promotion |
 | M4 refiner handoff | fail | no stable 0.1–0.5 m convergence basin |
 | M5 final paper claim | fail | no untouched test, hard-subset comparison or target accuracy |
 
@@ -534,8 +629,11 @@ not an unsupported claim that VFM regions directly yield centimetre pose.
 - cross-fit factor pool: `goal_maplet/config_rank_pool_mapping_factor_crossfit_v22.json`
 - configuration-factor Dev48 audit: `goal_maplet/configuration_evidence_dev48_v2.json`
 - learned factor ranker Dev48: `goal_maplet/configuration_pairwise_ranker_factor_dev48_v3.json`
+- latent mapping cross-fit pool: `goal_maplet/config_rank_pool_mapping_latent_crossfit_v23.json`
+- latent mapping/Dev audits: `goal_maplet/latent_configuration_mapping_crossfit_v23.json`, `goal_maplet/latent_configuration_dev48_v23.json`
+- bounded safety selector/audit: `goal_maplet/latent_safety_selector_v1.joblib`, `goal_maplet/latent_safety_selector_dev48_v1.json`
 - rejected conditional rank: `goal_maplet/pose_modes_graph_conditionalrank_dev48_v17.json`
 - 4x GT round-trip audit: `goal_maplet/surface_basin_radio_pca256_supersample4_oracle_smoke_gt1round_v4.json`
 
-Focused verification: `38 passed` for `tests/test_goal_maplet_*.py` plus the
+Focused verification: `43 passed` for `tests/test_goal_maplet_*.py` plus the
 exact 2DGS compositing equivalence test.
