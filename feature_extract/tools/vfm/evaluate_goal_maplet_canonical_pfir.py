@@ -16,6 +16,7 @@ from feature_extract.vfm.localization_goal_maplet.canonical_field import (
     CanonicalSurfaceField,
     readout_canonical_field,
 )
+from feature_extract.vfm.localization_goal_maplet.feature_contract import FieldFeatureContract
 from feature_extract.vfm.localization_goal_maplet.pfir import (
     ContributorLabels,
     QuerySupportPosterior,
@@ -54,6 +55,7 @@ def main() -> None:
     parser.add_argument("--physical_map", required=True)
     parser.add_argument("--canonical_field", required=True)
     parser.add_argument("--surface_mapper", required=True)
+    parser.add_argument("--field_feature_contract", required=True)
     parser.add_argument("--output_json", required=True)
     parser.add_argument("--pooling", choices=tuple(POOLING), required=True)
     parser.add_argument("--support_mode", choices=("balanced128", "all_tokens", "all_grouped"), required=True)
@@ -74,6 +76,10 @@ def main() -> None:
         raise FileExistsError("refusing to overwrite canonical PFIR output")
     physical = GoalMapletPhysicalMap.load_npz(Path(args.physical_map))
     field = CanonicalSurfaceField.load_npz(Path(args.canonical_field))
+    feature_contract = FieldFeatureContract.load_json(Path(args.field_feature_contract))
+    if feature_contract.query_readout_type != "surface_maplet_mapper":
+        raise ValueError("canonical PFIR evaluator requires the retrieval mapper readout")
+    feature_contract.validate(field, query_readout_path=Path(args.surface_mapper))
     readout = readout_canonical_field(field, physical)
     calibration = None
     if str(args.validity_calibration):
@@ -209,6 +215,7 @@ def main() -> None:
         "shard_count": int(args.shard_count),
         "physical_map_sha256": physical.content_sha256,
         "canonical_field_sha256": field.content_sha256,
+        "field_feature_contract_sha256": feature_contract.content_sha256,
         "stored_feature_type_count": 1,
         "stored_downstream_embedding_count": 0,
         "validity_calibration_sha256": calibration.content_sha256 if calibration is not None else None,

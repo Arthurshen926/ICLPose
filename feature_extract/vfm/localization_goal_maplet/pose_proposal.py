@@ -258,7 +258,7 @@ def generate_graph_conditioned_pose_modes(
     maximum_modes: int = 32,
     seed_parent_count: int = 64,
     pair_anchor_count: int = 16,
-    seed_parent_pair_count: int = 32,
+    seed_parent_pair_count: int = 0,
     covisibility_weight: float = 0.75,
     local_evidence_weight: float = 1.0,
     ransac_reprojection_px: float = 32.0,

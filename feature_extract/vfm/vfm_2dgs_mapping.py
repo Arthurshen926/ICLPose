@@ -2101,6 +2101,49 @@ def _accumulate_token_surface_weights(
     return rows[depth_keep], surface_radius[depth_keep], raw_weights[depth_keep]
 
 
+def _composite_sorted_packed_hits(
+    packed: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Vectorized front-to-back alpha compositing for pixel-sorted hits.
+
+    ``packed`` columns are pixel id, depth, element row and alpha.  The
+    implementation preserves the legacy 1e-4 transmittance early-stop rule
+    without a Python loop over potentially millions of raster hits.
+    """
+
+    values = np.asarray(packed, dtype=np.float64)
+    if values.ndim != 2 or values.shape[1] != 4:
+        raise ValueError("packed raster hits must have four columns")
+    if values.shape[0] == 0:
+        return (
+            np.zeros((0,), dtype=np.int64),
+            np.zeros((0,), dtype=np.int64),
+            np.zeros((0,), dtype=np.float32),
+        )
+    pixels = values[:, 0].astype(np.int64)
+    rows = values[:, 2].astype(np.int64)
+    alpha = np.clip(values[:, 3], 0.0, 0.999)
+    starts = np.r_[True, pixels[1:] != pixels[:-1]]
+    start_indices = np.flatnonzero(starts)
+    counts = np.diff(np.r_[start_indices, values.shape[0]])
+    log_survival = np.log1p(-alpha)
+    prefix = np.cumsum(log_survival)
+    group_base = np.r_[0.0, prefix[start_indices[1:] - 1]]
+    base = np.repeat(group_base, counts)
+    log_transmittance = prefix - log_survival - base
+    transmittance = np.exp(np.clip(log_transmittance, -745.0, 0.0))
+    weights = transmittance * alpha
+    transmittance_after = np.exp(np.clip(prefix - base, -745.0, 0.0))
+    group_ids = np.cumsum(starts) - 1
+    stop = transmittance_after <= 1e-4
+    first_stop = np.full((start_indices.size,), values.shape[0], dtype=np.int64)
+    indices = np.arange(values.shape[0], dtype=np.int64)
+    np.minimum.at(first_stop, group_ids[stop], indices[stop])
+    active = indices <= first_stop[group_ids]
+    keep = active & (weights > 1e-12)
+    return pixels[keep], rows[keep], weights[keep].astype(np.float32)
+
+
 def _render_surface_element_pixel_contributions_2dgs(
     elements: SurfaceElementMap,
     view: GaussianVFMFeatureView,
@@ -2198,29 +2241,11 @@ def _render_surface_element_pixel_contributions_2dgs(
     ).detach().cpu().numpy()
     order = np.lexsort((packed[:, 2], packed[:, 1], packed[:, 0]))
     packed = packed[order]
-    out_pixels: list[int] = []
-    out_rows: list[int] = []
-    out_weights: list[float] = []
-    current_pixel = -1
-    transmittance = 1.0
-    for pixel_f, _depth_f, row_f, alpha_f in packed.tolist():
-        pixel = int(pixel_f)
-        if pixel != current_pixel:
-            current_pixel = pixel
-            transmittance = 1.0
-        alpha = float(np.clip(alpha_f, 0.0, 0.999))
-        weight = transmittance * alpha
-        if weight > 1e-12:
-            out_pixels.append(pixel)
-            out_rows.append(int(row_f))
-            out_weights.append(float(weight))
-        transmittance *= max(1.0 - alpha, 0.0)
-        if transmittance <= 1e-4:
-            transmittance = 0.0
+    out_pixels, out_rows, out_weights = _composite_sorted_packed_hits(packed)
     return (
-        np.asarray(out_pixels, dtype=np.int64),
-        np.asarray(out_rows, dtype=np.int64),
-        np.asarray(out_weights, dtype=np.float32),
+        out_pixels,
+        out_rows,
+        out_weights,
         np.asarray(meta["depths"][0].detach().cpu().numpy(), dtype=np.float32),
     )
 

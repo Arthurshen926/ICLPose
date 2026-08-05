@@ -12,6 +12,7 @@ from feature_extract.vfm.colmap_tracks import ColmapCamera
 from feature_extract.vfm.localization.surface_maplet_mapper import load_surface_maplet_mapper
 from feature_extract.vfm.localization_goal_maplet.canonical_field import CanonicalSurfaceField
 from feature_extract.vfm.localization_goal_maplet.canonical_codec import CanonicalRadioCodec
+from feature_extract.vfm.localization_goal_maplet.feature_contract import FieldFeatureContract
 from feature_extract.vfm.localization_goal_maplet.local_head import load_child_local_head
 from feature_extract.vfm.localization_goal_maplet.pfir import ContributorLabels, _primitive_to_child_links
 from feature_extract.vfm.localization_goal_maplet.physical_map import GoalMapletPhysicalMap
@@ -55,8 +56,9 @@ def main() -> None:
     parser.add_argument("--contributors", required=True)
     parser.add_argument("--physical_map", required=True)
     parser.add_argument("--canonical_field", required=True)
-    parser.add_argument("--surface_mapper", required=True)
+    parser.add_argument("--surface_mapper", default="")
     parser.add_argument("--canonical_codec", default="")
+    parser.add_argument("--field_feature_contract", required=True)
     parser.add_argument("--child_local_head", default=None)
     parser.add_argument("--output_json", required=True)
     parser.add_argument("--candidate_surface_mode", choices=("oracle_children", "all_field"), default="oracle_children")
@@ -75,6 +77,7 @@ def main() -> None:
         raise FileExistsError("refusing to overwrite surface-basin report")
     physical = GoalMapletPhysicalMap.load_npz(Path(args.physical_map))
     field = CanonicalSurfaceField.load_npz(Path(args.canonical_field))
+    feature_contract = FieldFeatureContract.load_json(Path(args.field_feature_contract))
     local_head = None
     if args.child_local_head:
         artifact = load_child_local_head(Path(args.child_local_head), device=str(args.device))
@@ -83,8 +86,20 @@ def main() -> None:
         if str(artifact.metadata.get("canonical_field_sha256", "")) != field.content_sha256:
             raise ValueError("child-local head and canonical field lineage differ")
         local_head = artifact.model
-    mapper, _ = load_surface_maplet_mapper(Path(args.surface_mapper), device=str(args.device))
-    codec = CanonicalRadioCodec.load_npz(Path(args.canonical_codec)) if args.canonical_codec else None
+    mapper = None
+    codec = None
+    if feature_contract.query_readout_type == "surface_maplet_mapper":
+        if not args.surface_mapper:
+            raise ValueError("surface-maplet feature contract requires --surface_mapper")
+        feature_contract.validate(field, query_readout_path=Path(args.surface_mapper))
+        mapper, _ = load_surface_maplet_mapper(Path(args.surface_mapper), device=str(args.device))
+    elif feature_contract.query_readout_type == "canonical_radio_codec":
+        if not args.canonical_codec:
+            raise ValueError("canonical-codec feature contract requires --canonical_codec")
+        feature_contract.validate(field, query_readout_path=Path(args.canonical_codec))
+        codec = CanonicalRadioCodec.load_npz(Path(args.canonical_codec))
+    else:
+        feature_contract.validate(field)
     paths = sorted(Path(args.contributors).glob("*.npz"))[int(args.shard_index) :: int(args.shard_count)]
     if int(args.maximum_queries) > 0:
         paths = paths[: int(args.maximum_queries)]
@@ -101,11 +116,11 @@ def main() -> None:
             metadata = json.loads(str(np.asarray(data["metadata_json"]).item()))
         with np.load(Path(str(metadata["token_path"])), allow_pickle=False) as data:
             raw = np.asarray(data["radio_final"], dtype=np.float32)
-        if codec is not None:
+        if feature_contract.query_readout_type == "canonical_radio_codec":
             if str(field.metadata.get("canonical_codec_sha256", "")) != codec.content_sha256:
                 raise ValueError("canonical codec and field lineage differ")
             query = codec.transform_map(raw)
-        elif int(field.feature_dim) == int(raw.shape[0]):
+        elif feature_contract.query_readout_type == "raw_radio_final":
             query = raw / np.maximum(np.linalg.norm(raw, axis=0, keepdims=True), 1e-8)
         else:
             query = mapper.project(raw).measurement_context
@@ -179,6 +194,7 @@ def main() -> None:
         "candidate_surface_mode": str(args.candidate_surface_mode),
         "physical_map_sha256": physical.content_sha256,
         "canonical_field_sha256": field.content_sha256,
+        "field_feature_contract_sha256": feature_contract.content_sha256,
         "child_local_head": str(args.child_local_head) if args.child_local_head else None,
         "render_supersample_factor": int(args.render_supersample_factor),
         "acceptance_supersample_factor": int(args.acceptance_supersample_factor),

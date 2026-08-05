@@ -241,6 +241,102 @@ flow has useful direction on that frame (10 cm to 4.41 cm) but drifts from GT;
 using 4x acceptance does not close the loop. The current flow-to-SE(3)
 refiner therefore has no validated convergence basin and is not promoted.
 
+### G10 — frozen contracts, independent ranking and child-local likelihood
+
+The latest pass followed the ranking/measurement gates without changing the
+exact map, retrieval or graph backbone.
+
+#### P0 implementation corrections
+
+- A fail-closed field/readout contract now binds field SHA-256, query readout
+  type/SHA-256 and render protocol. Evaluators no longer infer the query path
+  from feature dimension. The retrieval contract SHA-256 is
+  `f64a5d7b...e42664`.
+- Child geometry has nested retrieval/proposal/refinement eligibility masks.
+  Of 7,653 children, 95.51% / 92.53% / 70.01% pass the three roles. The
+  eligibility SHA-256 is `42dd3d6a...32daa0`.
+- Proposal RNG is now `sha256(image_id)` masked to a signed 31-bit OpenCV
+  seed. This fixes both shard-dependent candidates and unsigned-C-int
+  overflow on roughly half of image hashes.
+- Configuration density medians use `nanmedian`; the earlier implementation
+  included each candidate's NaN self-distance and silently zeroed both median
+  distance features.
+- Exact-cascade reranking now permutes pose and every diagnostic together and
+  stores an explicit exact-evaluated mask. Previously exact Top-K reordered
+  poses while leaving cheap features in the old order.
+- Front-to-back 2DGS contribution compositing is vectorized. A reference-loop
+  equivalence test confirms identical candidate score/coverage on overlapping
+  exact renders.
+
+These are implementation fixes, not accuracy claims.
+
+#### P1 independent configuration ranker
+
+A fixed 128-query mapping pool was split by trajectory: seq1/2/4/6/7/8 train,
+seq9/10/12/14 validation, and seq11 excluded because it calibrated validity.
+The ranker uses 16 runtime-only relative features and no GT, absolute position,
+mapping RGB, image identity or stored downstream embedding. Logistic and one
+small GBDT were compared once; logistic passed mapping validation but not the
+Dev48 promotion gate.
+
+| Frozen Dev48 Top-1 | translation median | P90 | rotation median | P90 | catastrophic >2m or >10° |
+|---|---:|---:|---:|---:|---:|
+| graph proposal | 0.555 m | **1.680 m** | 1.994° | **5.561°** | 8.33% |
+| cheap identity | 0.650 m | 2.148 m | 2.170° | 5.810° | 12.50% |
+| learned logistic | **0.515 m** | 1.690 m | **1.917°** | 6.455° | **6.25%** |
+| Top-32 oracle | 0.242 m | 0.538 m | — | — | — |
+
+The learned ranker improves median and catastrophic rate, but its 0.263 m
+median selection regret and slightly worse translation/rotation tails fail the
+5–8 cm regret and sub-metre P90 gates. It is retained as a diagnostic artifact,
+not promoted over graph proposal.
+
+Exact full-2DGS Top-4 reranking was also audited on every Dev48 query. It fired
+on 37/48 cascade gates and produced 0.627 m / 1.986 m translation, worse than
+the graph proposal. The exact renderer is trustworthy geometry evidence, but
+raw exact identity remains a retrieval likelihood rather than pose
+correctness. An explicit exact-feature ranker contract and always-exact mask
+are implemented, but an exact Top-8 mapping pool was stopped: same-GPU gsplat
+kernels serialized, no shard completed its first query after 2m17s, projected
+runtime exceeded the evidence value, and cheap Top-4's 0.339 m oracle already
+bounded that experiment above the required accuracy. No incomplete artifact
+is used.
+
+#### P2 parent-conditioned child-local surface likelihood
+
+A new readout conditions one query descriptor on one candidate child and
+scores only that child's exact primitive membership. It outputs a multi-modal
+primitive distribution, MAP/expected 3D points, child-local covariance and
+null. It reuses the single canonical primitive field and stores no dense ALIKE
+map, point landmark descriptor bank or second per-map embedding.
+
+The measurement was first evaluated with oracle child identity so child-ID
+errors could not be confused with local-coordinate quality. Only
+refinement-qualified children participate.
+
+| Dev48 oracle-child diagnostic | query-balanced point median / P90 | pose translation median / P90 |
+|---|---:|---:|
+| child center | 0.299 / 0.406 m | 0.326 / 0.459 m |
+| VFM primitive MAP | 0.234 / 0.338 m | 0.273 / 0.422 m |
+| coarse-pose conditioned MAP | **0.224 / 0.328 m** | 0.279 / 0.438 m |
+| learned Top-8 mode | 0.230 / **0.326 m** | **0.265 / 0.406 m** |
+| Top-8 local-mode oracle | **0.151 / 0.222 m** | — |
+| exact child-local surface | — | **0.016 / 0.053 m** |
+
+The lightweight Top-8 mode GBDT uses only relative VFM, confidence,
+visibility, incidence and normalized child geometry features. It consistently
+improves child-center pose, but does not reach the requested 0.15–0.20 m
+candidate-precision gate. A joint multi-modal solver was rejected at smoke:
+its learned mixture score moved one frame from a 0.307 m child-center pose to
+0.345 m, showing that the current probabilities are not calibrated pose-factor
+likelihoods. It was not swept or run on Dev48.
+
+P2 therefore establishes the right information hierarchy—correct local modes
+often exist—but does not close independent mode selection. The next method
+change must learn `p(u,v,null | query, child, geometry)` as a calibrated
+pose-factor likelihood from exact contributor round-trips, rather than add
+another fixed score or average multi-modal coordinates.
+
 ## Development-set result
 
 The best deployable Goal-Maplet Top-1 remains the frozen graph v9 result, not
@@ -268,6 +364,8 @@ relevant, but it does not yet meet the requested accuracy.
 | M1 trustworthy map | pass | exact hierarchy, geometry/visibility audit, lineage |
 | M2 trustworthy retrieval | partial pass | pose-sufficient R@64=1; R@1/calibration still weak |
 | M3 structured coarse localization | partial pass | strong Top-32, unreliable Top-1 rank |
+| M3.1 configuration ranking | fail | 0.515 m median but 1.690 m P90 and 0.263 m regret |
+| M3.2 child-local measurement | partial/fail gate | oracle-child 0.265 m; Top-8 mode oracle 0.151 m |
 | M4 refiner handoff | fail | no stable 0.1–0.5 m convergence basin |
 | M5 final paper claim | fail | no untouched test, hard-subset comparison or target accuracy |
 
@@ -298,6 +396,11 @@ The next work should change two previously under-questioned foundations:
    coverage and calibrated factor LLRs. Selection is a different task from
    retrieval and cannot reuse retrieval probabilities as a pose score.
 
+The lightweight versions of both items above have now been tested. The next
+iteration needs stronger *probability semantics*, not additional weight
+sweeps: a batched/cached exact renderer for tractable configuration evidence,
+and a pose-likelihood/local-mode readout trained with exact deployment replay.
+
 Only after both gates pass should the system run an untouched test and a fair
 V3/STDLoc comparison. A useful paper claim is likely Top-N structured physical
 localization under repetitive/low-texture conditions plus reliable uncertainty,
@@ -314,7 +417,15 @@ not an unsupported claim that VFM regions directly yield centimetre pose.
 - exact Dev48 PFIR: `goal_maplet/canonical_pfir_exact_grouped_dev48_calibrated_v2.json`
 - oracle ladder: `goal_maplet/oracle_ladder_strict12_surface_v2.json`
 - frozen Dev48 pose result: `goal_maplet/pose_modes_graph_actual_dev48_exact_v9.json`
+- reproducible candidate pool: `goal_maplet/config_rank_pool_dev48_v18.json`
+- rejected configuration ranker: `goal_maplet/configuration_ranker_v1.joblib`
+- configuration Dev48 audit: `goal_maplet/configuration_ranker_dev48_v1.json`
+- field/readout contract: `goal_maplet/retrieval_field_exact_v2_contract.json`
+- child eligibility: `goal_maplet/child_geometry_eligibility_exact_v1.npz`
+- child-local mode ranker: `goal_maplet/child_local_mode_ranker_v1.joblib`
+- child-local Dev48 audit: `goal_maplet/child_local_likelihood_ranked_dev48_v4.json`
 - rejected conditional rank: `goal_maplet/pose_modes_graph_conditionalrank_dev48_v17.json`
 - 4x GT round-trip audit: `goal_maplet/surface_basin_radio_pca256_supersample4_oracle_smoke_gt1round_v4.json`
 
-Focused verification: `24 passed` for `tests/test_goal_maplet_*.py`.
+Focused verification: `33 passed` for `tests/test_goal_maplet_*.py` plus the
+exact 2DGS compositing equivalence test.

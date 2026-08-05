@@ -42,6 +42,15 @@ RADIO surface-flow refiner has no reliable convergence basin. Goal-Maplet is
 therefore an active research line, not a production or paper-ready accuracy
 claim.
 
+The latest independent configuration logistic improves Dev48 median to
+0.515 m and catastrophic errors to 6.25%, but is also rejected because P90 is
+1.690 m and median selection regret remains 0.263 m. A parent-conditioned
+child-local Top-8 likelihood reuses the single canonical primitive feature and
+improves the oracle-child pose from 0.326/0.459 m to 0.265/0.406 m
+median/P90; its Top-8 mode oracle is 0.151 m at the point-measurement level,
+but mode selection does not yet meet the 0.15–0.20 m gate. These results and
+the exact artifact contracts are recorded in the Goal-Maplet report.
+
 ## Frozen V6 Status
 
 See [the V6 mainline](docs/vfm/2dgs_maplet_atlas_localization_v6.md) for its
@@ -91,6 +100,12 @@ stored embedding, as the next required research module.
 - `feature_extract/tools/vfm/evaluate_goal_maplet_oracle_ladder.py`
 - `feature_extract/tools/vfm/evaluate_goal_maplet_pose_modes.py`
 - `feature_extract/tools/vfm/evaluate_goal_maplet_surface_basin.py`
+- `feature_extract/tools/vfm/build_goal_maplet_feature_contract.py`
+- `feature_extract/tools/vfm/build_goal_maplet_child_eligibility.py`
+- `feature_extract/tools/vfm/train_goal_maplet_configuration_ranker.py`
+- `feature_extract/tools/vfm/apply_goal_maplet_configuration_ranker.py`
+- `feature_extract/tools/vfm/evaluate_goal_maplet_child_local_likelihood.py`
+- `feature_extract/tools/vfm/train_goal_maplet_child_local_mode_ranker.py`
 
 ## Frozen V6 Code
 

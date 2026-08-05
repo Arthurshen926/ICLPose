@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from feature_extract.vfm.colmap_tracks import ColmapCamera
 from feature_extract.vfm.localization.alike_detector_only import AlikeDetectorOnly
 from feature_extract.vfm.localization.surface_maplet_mapper import load_surface_maplet_mapper
 from feature_extract.vfm.localization_goal_maplet.canonical_field import CanonicalSurfaceField, readout_canonical_field
+from feature_extract.vfm.localization_goal_maplet.feature_contract import FieldFeatureContract
 from feature_extract.vfm.localization_goal_maplet.child_retrieval import ChildTilePosterior, retrieve_children_given_parents
 from feature_extract.vfm.localization_goal_maplet.detector_radio_refiner import refine_pose_with_detector_radio
 from feature_extract.vfm.localization_goal_maplet.local_head import load_child_local_head
@@ -28,7 +30,10 @@ from feature_extract.vfm.localization_goal_maplet.pose_proposal import (
     generate_region_pose_modes,
     CoarsePoseModes,
 )
-from feature_extract.vfm.localization_goal_maplet.pose_ranking import rerank_modes_with_rendered_identity
+from feature_extract.vfm.localization_goal_maplet.pose_ranking import (
+    merge_cascade_identity_rankings,
+    rerank_modes_with_rendered_identity,
+)
 from feature_extract.vfm.localization_goal_maplet.query_support import (
     aggregate_group_descriptors,
     aggregate_group_posteriors,
@@ -97,12 +102,19 @@ def _pose_details(modes, gt_pose: np.ndarray) -> list[dict[str, object]]:
     return result
 
 
+def _stable_proposal_seed(image_id: str) -> int:
+    """Return a deterministic seed accepted by OpenCV's signed C-int API."""
+    digest = hashlib.sha256(str(image_id).encode("utf8")).digest()
+    return int.from_bytes(digest[:4], byteorder="little", signed=False) & 0x7FFFFFFF
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--contributors", required=True)
     parser.add_argument("--physical_map", required=True)
     parser.add_argument("--canonical_field", required=True)
     parser.add_argument("--surface_mapper", required=True)
+    parser.add_argument("--field_feature_contract", required=True)
     parser.add_argument("--validity_calibration", required=True)
     parser.add_argument("--typed_graph", default="")
     parser.add_argument("--output_json", required=True)
@@ -123,6 +135,7 @@ def main() -> None:
     parser.add_argument("--cascade_disagreement_m", type=float, default=0.75)
     parser.add_argument("--cascade_disagreement_deg", type=float, default=3.0)
     parser.add_argument("--cascade_margin", type=float, default=0.015)
+    parser.add_argument("--cascade_always_exact", action="store_true")
     parser.add_argument("--detector_radio_refine_topn", type=int, default=0)
     parser.add_argument("--query_image_root", default="")
     parser.add_argument("--alike_matcha_repo", default="/root/matcha")
@@ -138,6 +151,10 @@ def main() -> None:
         raise FileExistsError("refusing to overwrite pose-mode report")
     physical = GoalMapletPhysicalMap.load_npz(Path(args.physical_map))
     field = CanonicalSurfaceField.load_npz(Path(args.canonical_field))
+    feature_contract = FieldFeatureContract.load_json(Path(args.field_feature_contract))
+    if feature_contract.query_readout_type != "surface_maplet_mapper":
+        raise ValueError("pose-mode retrieval requires the frozen surface-maplet mapper readout")
+    feature_contract.validate(field, query_readout_path=Path(args.surface_mapper))
     readout = readout_canonical_field(field, physical)
     calibration = ValidityCalibration.load_json(Path(args.validity_calibration))
     mapper, _ = load_surface_maplet_mapper(Path(args.surface_mapper), device=str(args.device))
@@ -270,6 +287,7 @@ def main() -> None:
             oracle_parent_values = parent_inputs.get("oracle_parent", next(iter(parent_inputs.values())))
             child_inputs["oracle_child"] = (ChildTilePosterior(columns, probability, truth_child_null), oracle_parent_values)
         for name, (child, parent_values) in child_inputs.items():
+            stable_seed = _stable_proposal_seed(str(metadata["image_id"]))
             if args.proposal_method in ("graph", "hierarchical"):
                 proposal = (
                     generate_parent_then_child_pose_modes
@@ -279,7 +297,7 @@ def main() -> None:
                 modes = proposal(
                     xy_px, extent_px, *parent_values, child, physical, graph, camera,
                     maximum_modes=int(args.maximum_modes),
-                    random_seed=194917 + len(reports),
+                    random_seed=stable_seed,
                     **(
                         {"local_evidence_weight": float(args.local_evidence_weight)}
                         if args.proposal_method == "graph" else {}
@@ -289,7 +307,7 @@ def main() -> None:
                 modes = generate_region_pose_modes(
                     xy_px, extent_px, child, physical, camera,
                     maximum_modes=int(args.maximum_modes), proposal_trials=int(args.proposal_trials),
-                    random_seed=194917 + len(reports),
+                    random_seed=stable_seed,
                 )
             if args.render_identity_rerank and modes.poses_w2c.shape[0]:
                 base_modes = modes
@@ -313,6 +331,8 @@ def main() -> None:
                     "parent_log_likelihood": ranking.parent_log_likelihood.tolist(),
                     "child_log_likelihood": ranking.child_log_likelihood.tolist(),
                     "rendered_coverage": ranking.rendered_coverage.tolist(),
+                    "proposal_scores": ranking.proposal_scores.tolist(),
+                    "original_indices": ranking.original_indices.tolist(),
                 }
                 if args.identity_render_mode == "cascade" and modes.poses_w2c.shape[0]:
                     base_center = -base_modes.poses_w2c[0, :3, :3].T @ base_modes.poses_w2c[0, :3, 3]
@@ -325,6 +345,8 @@ def main() -> None:
                         if ranking.identity_scores.size > 1 else float("inf")
                     )
                     gate = bool(
+                        bool(args.cascade_always_exact)
+                        or
                         translation_disagreement >= float(args.cascade_disagreement_m)
                         or rotation_disagreement >= float(args.cascade_disagreement_deg)
                         or splat_margin <= float(args.cascade_margin)
@@ -352,12 +374,23 @@ def main() -> None:
                             render_mode="full_2dgs",
                             device=str(args.device),
                         )
-                        modes = CoarsePoseModes(
-                            np.concatenate([exact.modes.poses_w2c, modes.poses_w2c[take:]], axis=0),
-                            np.concatenate([exact.modes.scores, modes.scores[take:]], axis=0),
-                            np.concatenate([exact.modes.supporting_region_count, modes.supporting_region_count[take:]], axis=0),
+                        cascade = merge_cascade_identity_rankings(
+                            ranking, exact, exact_candidate_count=take
                         )
-                        ranking_diagnostics[name]["cascade_exact_scores"] = exact.identity_scores.tolist()
+                        modes = cascade.modes
+                        ranking_diagnostics[name].update({
+                            "identity_scores": cascade.cheap_identity_scores.tolist(),
+                            "parent_log_likelihood": cascade.cheap_parent_log_likelihood.tolist(),
+                            "child_log_likelihood": cascade.cheap_child_log_likelihood.tolist(),
+                            "rendered_coverage": cascade.cheap_rendered_coverage.tolist(),
+                            "proposal_scores": cascade.proposal_scores.tolist(),
+                            "original_indices": cascade.original_indices.tolist(),
+                            "cascade_exact_evaluated": cascade.exact_evaluated.tolist(),
+                            "cascade_exact_scores": cascade.exact_identity_scores.tolist(),
+                            "cascade_exact_parent_log_likelihood": cascade.exact_parent_log_likelihood.tolist(),
+                            "cascade_exact_child_log_likelihood": cascade.exact_child_log_likelihood.tolist(),
+                            "cascade_exact_rendered_coverage": cascade.exact_rendered_coverage.tolist(),
+                        })
             modes_report[name] = _pose_report(modes, labels.pose_w2c)
             mode_details[name] = _pose_details(modes, labels.pose_w2c)
             if detected is not None and modes.poses_w2c.shape[0]:
@@ -432,11 +465,13 @@ def main() -> None:
         "query_count": len(reports),
         "physical_map_sha256": physical.content_sha256,
         "canonical_field_sha256": field.content_sha256,
+        "field_feature_contract_sha256": feature_contract.content_sha256,
         "validity_calibration_sha256": calibration.content_sha256,
         "parent_mode": str(args.parent_mode),
         "child_mode": str(args.child_mode),
         "proposal_trials": int(args.proposal_trials),
         "proposal_method": str(args.proposal_method),
+        "proposal_seed_policy": "sha256_image_id_uint31_little_endian_v1",
         "local_evidence_weight": float(args.local_evidence_weight),
         "render_identity_rerank": bool(args.render_identity_rerank),
         "identity_render_mode": str(args.identity_render_mode),
@@ -445,6 +480,7 @@ def main() -> None:
             "disagreement_m": float(args.cascade_disagreement_m),
             "disagreement_deg": float(args.cascade_disagreement_deg),
             "splat_margin": float(args.cascade_margin),
+            "always_exact": bool(args.cascade_always_exact),
         },
         "detector_radio_refine_topn": int(args.detector_radio_refine_topn),
         "alike_detector_only": bool(detector is not None),

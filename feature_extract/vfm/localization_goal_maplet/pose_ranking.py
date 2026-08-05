@@ -80,6 +80,71 @@ class RenderIdentityRanking:
     parent_log_likelihood: np.ndarray
     child_log_likelihood: np.ndarray
     rendered_coverage: np.ndarray
+    proposal_scores: np.ndarray
+    original_indices: np.ndarray
+
+
+@dataclass(frozen=True)
+class CascadeIdentityRanking:
+    modes: CoarsePoseModes
+    cheap_identity_scores: np.ndarray
+    cheap_parent_log_likelihood: np.ndarray
+    cheap_child_log_likelihood: np.ndarray
+    cheap_rendered_coverage: np.ndarray
+    proposal_scores: np.ndarray
+    original_indices: np.ndarray
+    exact_evaluated: np.ndarray
+    exact_identity_scores: np.ndarray
+    exact_parent_log_likelihood: np.ndarray
+    exact_child_log_likelihood: np.ndarray
+    exact_rendered_coverage: np.ndarray
+
+
+def merge_cascade_identity_rankings(
+    cheap: RenderIdentityRanking,
+    exact: RenderIdentityRanking,
+    *,
+    exact_candidate_count: int,
+) -> CascadeIdentityRanking:
+    """Merge a cheap Top-N screen and exact Top-K rerank without losing alignment."""
+
+    count = int(cheap.modes.poses_w2c.shape[0])
+    take = min(int(exact_candidate_count), count)
+    if exact.modes.poses_w2c.shape[0] != take:
+        raise ValueError("exact cascade result differs from requested candidate count")
+    local_order = np.asarray(exact.original_indices, dtype=np.int64)
+    if sorted(local_order.tolist()) != list(range(take)):
+        raise ValueError("exact cascade ordering is not a permutation of its input")
+    final_order = np.concatenate([local_order, np.arange(take, count, dtype=np.int64)])
+    score = np.asarray(cheap.identity_scores, dtype=np.float64)[final_order]
+    score[:take] = np.asarray(exact.identity_scores, dtype=np.float64)
+    modes = CoarsePoseModes(
+        np.asarray(cheap.modes.poses_w2c)[final_order],
+        score,
+        np.asarray(cheap.modes.supporting_region_count)[final_order],
+    )
+
+    def exact_array(values: np.ndarray) -> np.ndarray:
+        # Unevaluated values are explicit zeros and must only be consumed with
+        # exact_evaluated; this keeps the serialized artifact strict JSON.
+        output = np.zeros((count,), dtype=np.float64)
+        output[:take] = np.asarray(values, dtype=np.float64)
+        return output
+
+    return CascadeIdentityRanking(
+        modes=modes,
+        cheap_identity_scores=np.asarray(cheap.identity_scores)[final_order],
+        cheap_parent_log_likelihood=np.asarray(cheap.parent_log_likelihood)[final_order],
+        cheap_child_log_likelihood=np.asarray(cheap.child_log_likelihood)[final_order],
+        cheap_rendered_coverage=np.asarray(cheap.rendered_coverage)[final_order],
+        proposal_scores=np.asarray(cheap.proposal_scores)[final_order],
+        original_indices=np.asarray(cheap.original_indices)[final_order],
+        exact_evaluated=np.arange(count) < take,
+        exact_identity_scores=exact_array(exact.identity_scores),
+        exact_parent_log_likelihood=exact_array(exact.parent_log_likelihood),
+        exact_child_log_likelihood=exact_array(exact.child_log_likelihood),
+        exact_rendered_coverage=exact_array(exact.rendered_coverage),
+    )
 
 
 def rerank_modes_with_rendered_identity(
@@ -189,4 +254,6 @@ def rerank_modes_with_rendered_identity(
         parent_log_likelihood=parent_array[order],
         child_log_likelihood=child_array[order],
         rendered_coverage=np.asarray(coverages, dtype=np.float64)[order],
+        proposal_scores=np.asarray(modes.scores, dtype=np.float64)[order],
+        original_indices=np.asarray(order, dtype=np.int64),
     )
