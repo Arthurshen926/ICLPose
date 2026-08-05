@@ -337,6 +337,110 @@ change must learn `p(u,v,null | query, child, geometry)` as a calibrated
 pose-factor likelihood from exact contributor round-trips, rather than add
 another fixed score or average multi-modal coordinates.
 
+### G11 — pairwise utility, typed nulls and configuration factors
+
+This pass retained the frozen physical map, canonical field, mapper, graph and
+Top-32 pool.  Gates are now reported separately as correctness, scientific
+signal and production promotion; a research module is no longer discarded
+merely because it is not production-ready.
+
+#### Correctness and probability semantics
+
+- Child-local VFM modes now use a fixed denominator: `Top-M(query, child)` is
+  generated once without candidate-pose geometry.  A pose may evaluate those
+  modes but cannot change their identity or VFM probability and then use the
+  changed result to validate itself.
+- If every primitive is behind the camera or sidedness-incompatible, the
+  geometry-conditioned diagnostic returns explicit null/invalid modes instead
+  of normalizing identical invalid logits into a spurious uniform posterior.
+- Joint multi-modal sampling is opt-in (`joint_pose_trials=0` by default).
+- Configuration-factor training fails closed unless its upstream factor
+  evidence is trajectory outer-cross-fitted or factor-training-pool disjoint.
+
+The new typed-null target is
+
+```text
+valid | wrong_child | pose_incompatible | unresolved | field_missing
+```
+
+and is supervised by exact-GT factors, retrieved hard wrong children, frozen
+graph Top-1 poses and the nearest out-of-basin Top-32 pose.  The 63,232 mapping
+samples store 18 runtime statistics and training identities only; no RGB or
+additional map embedding is stored.
+
+#### Query-group pairwise local-mode ranking
+
+The child-local ranker is trained on ordered feature differences and continuous
+exact surface error rather than independent best-mode labels.  On mapping
+validation its query-balanced point median improves from 0.242 m to 0.210 m.
+On frozen Dev48:
+
+| Oracle-child diagnostic | v1 learned mode | pairwise v2 |
+|---|---:|---:|
+| point median / P90 | 0.230 / 0.326 m | **0.194 / 0.285 m** |
+| pose translation median / P90 | **0.265** / 0.406 m | 0.287 / **0.391 m** |
+| pose rotation median / P90 | 0.583° / 1.063° | **0.567° / 1.049°** |
+
+The point measurement reaches the 20 cm neighbourhood, while independent
+group choices do not produce a more coherent pose.  This isolates the next
+gap to group-aware latent-factor inference rather than point-mode recall.
+
+#### Typed-null calibration
+
+The final factor calibrator trains on seq1/2/4/6/7/8, calibrates on seq9 and
+selects once on seq10; seq11/12/14 are excluded.  Frozen Dev48 reports NLL
+1.012, ECE 0.080 and the following AUPRC:
+
+| null type | AUPRC |
+|---|---:|
+| valid | 0.477 |
+| wrong child | **0.784** |
+| pose incompatible | 0.505 |
+| unresolved | 0.372 |
+| field missing | **0.943** |
+
+Single-factor discrimination is therefore useful for wrong-child and missing
+field evidence but weak for repetitive-structure near-miss poses.  In
+particular, per-factor near-miss classification accuracy is only 9.0%; a
+single region cannot reliably reject a globally wrong facade phase.
+
+#### Configuration-level aggregation and listwise ranking
+
+The configuration ranker now learns within-query pairwise preferences using
+continuous utility
+
+```text
+translation_m / 0.5 + rotation_deg / 5
+```
+
+instead of independent 0.5 m / 5 degree labels.  The base pairwise Dev48
+result is 0.535 / 1.591 m, 1.898° / 5.055°, and 6.25% catastrophic failures:
+it improves the graph proposal tail but still has 0.252 m median regret.
+
+Complete configuration evidence aggregates 64 groups and four latent children
+per group: typed null mass, fixed local-mode uncertainty, reprojection,
+retrieval probability, child capacity, eligibility and graph co-visibility.
+Mapping training evidence is outer-cross-fitted by trajectory.  On the clean
+seq12/14 mapping validation split, adding these factors changes median only
+0.389 to 0.388 m but improves P90 1.477 to 1.301 m and P90 regret 0.763 to
+0.473 m.
+
+Frozen Dev48 separates the signal from the still-unstable learned fusion:
+
+| Dev48 configuration policy | translation median / P90 | rotation median / P90 | success <=0.5m/5° | catastrophic |
+|---|---:|---:|---:|---:|
+| graph proposal | 0.555 / 1.680 m | 1.994° / 5.561° | 45.83% | 8.33% |
+| pairwise base ranker | 0.535 / 1.591 m | 1.898° / 5.055° | 45.83% | **6.25%** |
+| learned cross-fit factor ranker | 0.482 / 1.791 m | **1.622°** / 5.508° | 50.00% | 8.33% |
+| predefined mean valid-factor mass | **0.455 / 1.499 m** | 1.667° / **5.058°** | **54.17%** | **6.25%** |
+
+The predefined factor aggregation is the strongest Goal-Maplet research
+diagnostic so far and has within-query pair concordance 0.659.  It is not
+promoted: median regret remains 0.217 m, the learned fusion does not preserve
+its tail gain, and no untouched test block has been opened.  A calibrated
+group-capacity latent solver is justified next; another graph-weight sweep or
+unconstrained joint PnP is not.
+
 ## Development-set result
 
 The best deployable Goal-Maplet Top-1 remains the frozen graph v9 result, not
@@ -364,8 +468,8 @@ relevant, but it does not yet meet the requested accuracy.
 | M1 trustworthy map | pass | exact hierarchy, geometry/visibility audit, lineage |
 | M2 trustworthy retrieval | partial pass | pose-sufficient R@64=1; R@1/calibration still weak |
 | M3 structured coarse localization | partial pass | strong Top-32, unreliable Top-1 rank |
-| M3.1 configuration ranking | fail | 0.515 m median but 1.690 m P90 and 0.263 m regret |
-| M3.2 child-local measurement | partial/fail gate | oracle-child 0.265 m; Top-8 mode oracle 0.151 m |
+| M3.1 configuration ranking | scientific partial / production fail | factor aggregation 0.455/1.499 m, but 0.217 m regret |
+| M3.2 child-local measurement | scientific partial / production fail | point 0.194 m, pose 0.287 m; grouped inference missing |
 | M4 refiner handoff | fail | no stable 0.1–0.5 m convergence basin |
 | M5 final paper claim | fail | no untouched test, hard-subset comparison or target accuracy |
 
@@ -424,8 +528,14 @@ not an unsupported claim that VFM regions directly yield centimetre pose.
 - child eligibility: `goal_maplet/child_geometry_eligibility_exact_v1.npz`
 - child-local mode ranker: `goal_maplet/child_local_mode_ranker_v1.joblib`
 - child-local Dev48 audit: `goal_maplet/child_local_likelihood_ranked_dev48_v4.json`
+- pairwise child-local Dev48: `goal_maplet/child_local_likelihood_pairwise_dev48_v5.json`
+- typed-null calibrator: `goal_maplet/child_local_factor_calibrator_v2.joblib`
+- typed-null Dev48 audit: `goal_maplet/child_local_factor_calibrator_dev48_v2.json`
+- cross-fit factor pool: `goal_maplet/config_rank_pool_mapping_factor_crossfit_v22.json`
+- configuration-factor Dev48 audit: `goal_maplet/configuration_evidence_dev48_v2.json`
+- learned factor ranker Dev48: `goal_maplet/configuration_pairwise_ranker_factor_dev48_v3.json`
 - rejected conditional rank: `goal_maplet/pose_modes_graph_conditionalrank_dev48_v17.json`
 - 4x GT round-trip audit: `goal_maplet/surface_basin_radio_pca256_supersample4_oracle_smoke_gt1round_v4.json`
 
-Focused verification: `33 passed` for `tests/test_goal_maplet_*.py` plus the
+Focused verification: `38 passed` for `tests/test_goal_maplet_*.py` plus the
 exact 2DGS compositing equivalence test.

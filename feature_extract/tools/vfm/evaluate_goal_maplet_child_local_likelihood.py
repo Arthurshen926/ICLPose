@@ -16,6 +16,7 @@ from feature_extract.vfm.localization_goal_maplet.canonical_field import Canonic
 from feature_extract.vfm.localization_goal_maplet.child_eligibility import ChildGeometryEligibility
 from feature_extract.vfm.localization_goal_maplet.child_local_likelihood import predict_child_local_surface_likelihood
 from feature_extract.vfm.localization_goal_maplet.child_local_mode_ranker import (
+    ChildLocalPairwiseRankerArtifact,
     ChildLocalModeRankerArtifact,
     child_local_mode_runtime_features,
 )
@@ -101,7 +102,9 @@ def main() -> None:
     parser.add_argument("--child_local_mode_ranker", default="")
     parser.add_argument("--temperature", type=float, default=0.07)
     parser.add_argument("--maximum_modes", type=int, default=8)
-    parser.add_argument("--joint_pose_trials", type=int, default=512)
+    # Joint mode sampling is opt-in until typed-null factor calibration and
+    # group-capacity constraints are explicitly supplied.
+    parser.add_argument("--joint_pose_trials", type=int, default=0)
     parser.add_argument("--maximum_queries", type=int, default=0)
     parser.add_argument("--shard_index", type=int, default=0)
     parser.add_argument("--shard_count", type=int, default=1)
@@ -128,7 +131,10 @@ def main() -> None:
     mapper, _ = load_surface_maplet_mapper(Path(args.surface_mapper), device=str(args.device))
     mode_ranker = None
     if str(args.child_local_mode_ranker):
-        mode_ranker = ChildLocalModeRankerArtifact.load(Path(args.child_local_mode_ranker))
+        try:
+            mode_ranker = ChildLocalPairwiseRankerArtifact.load(Path(args.child_local_mode_ranker))
+        except ValueError:
+            mode_ranker = ChildLocalModeRankerArtifact.load(Path(args.child_local_mode_ranker))
         for key, expected in (
             ("physical_map_sha256", physical.content_sha256),
             ("canonical_field_sha256", field.content_sha256),
@@ -266,10 +272,13 @@ def main() -> None:
                     str(metadata["image_id"]).split("/", 1)[0]
                 ] * child_array.size)
                 if mode_ranker is not None:
-                    probability = mode_ranker.predict_probability(
-                        mode_features.reshape(-1, mode_features.shape[2])
-                    ).reshape(mode_valid.shape)
-                    probability[~mode_valid] = -np.inf
+                    if isinstance(mode_ranker, ChildLocalPairwiseRankerArtifact):
+                        _, probability = mode_ranker.score_modes(mode_features, mode_valid)
+                    else:
+                        probability = mode_ranker.predict_probability(
+                            mode_features.reshape(-1, mode_features.shape[2])
+                        ).reshape(mode_valid.shape)
+                        probability[~mode_valid] = 0.0
                     selected_mode = np.argmax(probability, axis=1)
                     learned_points = mode_points[np.arange(child_array.size), selected_mode]
                     metric["learned_mode"] = np.linalg.norm(learned_points - truth, axis=1)

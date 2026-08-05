@@ -25,6 +25,7 @@ def main() -> None:
         "typed_graph_sha256", "render_identity_rerank", "identity_render_mode",
         "field_feature_contract_sha256", "proposal_seed_policy",
         "cascade_contract",
+        "configuration_evidence_contract",
     ):
         values = {json.dumps(item.get(key), sort_keys=True) for item in shards}
         if len(values) != 1:
@@ -62,6 +63,7 @@ def main() -> None:
             "typed_graph_sha256", "render_identity_rerank", "identity_render_mode",
             "field_feature_contract_sha256", "proposal_seed_policy",
             "cascade_contract", "detector_radio_refine_topn", "alike_detector_only",
+            "configuration_evidence_contract",
         )},
         "query_count": len(rows),
         "shard_count": len(shards),

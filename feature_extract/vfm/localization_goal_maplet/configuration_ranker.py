@@ -11,6 +11,7 @@ import joblib
 import numpy as np
 
 from .lineage import file_sha256
+from .configuration_evidence import FEATURE_NAMES as CONFIGURATION_EVIDENCE_FEATURE_NAMES
 
 
 BASE_FEATURE_NAMES = (
@@ -42,6 +43,9 @@ EXACT_FEATURE_NAMES = BASE_FEATURE_NAMES + (
     "exact_minus_cheap_identity",
 )
 
+BASE_CONFIGURATION_FEATURE_NAMES = BASE_FEATURE_NAMES + CONFIGURATION_EVIDENCE_FEATURE_NAMES
+EXACT_CONFIGURATION_FEATURE_NAMES = EXACT_FEATURE_NAMES + CONFIGURATION_EVIDENCE_FEATURE_NAMES
+
 # Backwards-compatible public name for the frozen v1 cheap ranker.
 FEATURE_NAMES = BASE_FEATURE_NAMES
 
@@ -57,6 +61,7 @@ def candidate_runtime_features(
     *,
     mode_name: str = "actual_parent_actual_child",
     include_exact: bool = False,
+    include_configuration: bool = False,
 ) -> np.ndarray:
     details = list(report_row["mode_details"][mode_name])
     diagnostics = dict(report_row["ranking_diagnostics"][mode_name])
@@ -67,7 +72,12 @@ def candidate_runtime_features(
     ):
         if len(diagnostics.get(name, [])) != count:
             raise ValueError(f"candidate rank feature {name} differs from mode count")
-    feature_names = EXACT_FEATURE_NAMES if include_exact else BASE_FEATURE_NAMES
+    feature_names = (
+        EXACT_CONFIGURATION_FEATURE_NAMES if include_exact and include_configuration
+        else EXACT_FEATURE_NAMES if include_exact
+        else BASE_CONFIGURATION_FEATURE_NAMES if include_configuration
+        else BASE_FEATURE_NAMES
+    )
     if count == 0:
         return np.zeros((0, len(feature_names)), dtype=np.float32)
     proposal = np.asarray(diagnostics["proposal_scores"], dtype=np.float64)
@@ -135,6 +145,17 @@ def candidate_runtime_features(
                 exact_coverage, exact_identity, exact_margin, exact_delta,
             ], axis=1),
         ], axis=1)
+    if include_configuration:
+        evidence = diagnostics.get("configuration_evidence_v2")
+        if not isinstance(evidence, Mapping):
+            raise ValueError("configuration evidence is missing")
+        columns = []
+        for name in CONFIGURATION_EVIDENCE_FEATURE_NAMES:
+            value = np.asarray(evidence.get(name, []), dtype=np.float64)
+            if value.shape != (count,):
+                raise ValueError(f"configuration evidence {name} differs from mode count")
+            columns.append(value)
+        output = np.concatenate([output, np.stack(columns, axis=1)], axis=1)
     if not np.all(np.isfinite(output)):
         raise ValueError("configuration rank features contain non-finite values")
     return output.astype(np.float32)
@@ -161,10 +182,66 @@ class ConfigurationRankerArtifact:
         payload = joblib.load(Path(path))
         metadata = dict(payload["metadata"])
         names = tuple(metadata.get("feature_names", ()))
-        if names not in (BASE_FEATURE_NAMES, EXACT_FEATURE_NAMES):
+        if names not in (
+            BASE_FEATURE_NAMES, EXACT_FEATURE_NAMES,
+            BASE_CONFIGURATION_FEATURE_NAMES, EXACT_CONFIGURATION_FEATURE_NAMES,
+        ):
             raise ValueError("configuration ranker feature contract differs")
         return cls(payload["estimator"], metadata)
 
 
 def source_pool_sha256(path: Path) -> str:
     return file_sha256(Path(path))
+
+
+@dataclass(frozen=True)
+class ConfigurationPairwiseRankerArtifact:
+    """Rank a complete query candidate set using ordered utility comparisons."""
+
+    estimator: object
+    metadata: Mapping[str, object]
+
+    def score_candidates(self, features: np.ndarray) -> np.ndarray:
+        value = np.asarray(features, dtype=np.float32)
+        names = tuple(self.metadata.get("feature_names", ()))
+        if names not in (
+            BASE_FEATURE_NAMES, EXACT_FEATURE_NAMES,
+            BASE_CONFIGURATION_FEATURE_NAMES, EXACT_CONFIGURATION_FEATURE_NAMES,
+        ):
+            raise ValueError("configuration pairwise feature contract differs")
+        if value.ndim != 2 or value.shape[1] != len(names):
+            raise ValueError("configuration pairwise feature dimension differs")
+        count = value.shape[0]
+        if count == 0:
+            return np.zeros((0,), dtype=np.float64)
+        if count == 1:
+            return np.ones((1,), dtype=np.float64)
+        left, right = np.triu_indices(count, 1)
+        probability = np.asarray(
+            self.estimator.predict_proba(value[left] - value[right])[:, 1], dtype=np.float64
+        )
+        score = np.zeros((count,), dtype=np.float64)
+        comparisons = np.zeros((count,), dtype=np.float64)
+        np.add.at(score, left, probability)
+        np.add.at(score, right, 1.0 - probability)
+        np.add.at(comparisons, left, 1.0)
+        np.add.at(comparisons, right, 1.0)
+        return score / np.maximum(comparisons, 1.0)
+
+    def save(self, path: Path) -> None:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        joblib.dump({"estimator": self.estimator, "metadata": dict(self.metadata)}, Path(path))
+
+    @classmethod
+    def load(cls, path: Path) -> "ConfigurationPairwiseRankerArtifact":
+        payload = joblib.load(Path(path))
+        metadata = dict(payload["metadata"])
+        if metadata.get("artifact_type") != "goal_maplet_configuration_pairwise_ranker_v2":
+            raise ValueError("not a Goal-Maplet pairwise configuration ranker")
+        names = tuple(metadata.get("feature_names", ()))
+        if names not in (
+            BASE_FEATURE_NAMES, EXACT_FEATURE_NAMES,
+            BASE_CONFIGURATION_FEATURE_NAMES, EXACT_CONFIGURATION_FEATURE_NAMES,
+        ):
+            raise ValueError("configuration pairwise feature contract differs")
+        return cls(payload["estimator"], metadata)

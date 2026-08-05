@@ -132,3 +132,87 @@ class ChildLocalModeRankerArtifact:
         if tuple(metadata.get("feature_names", ())) != FEATURE_NAMES:
             raise ValueError("child-local mode ranker feature contract differs")
         return cls(payload["estimator"], metadata)
+
+
+@dataclass(frozen=True)
+class ChildLocalPairwiseRankerArtifact:
+    """Query-group ranker trained on continuous within-group surface utility.
+
+    The estimator consumes ordered feature differences.  At runtime every
+    valid mode is compared with the other modes from the *same* query group;
+    the Borda mean is therefore a genuinely group-relative score rather than
+    an independently calibrated binary label.
+    """
+
+    estimator: object
+    metadata: Mapping[str, object]
+
+    def score_modes(
+        self,
+        features: np.ndarray,
+        valid: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        value = np.asarray(features, dtype=np.float32)
+        mask = np.asarray(valid, dtype=bool)
+        if value.ndim != 3 or value.shape[2] != len(FEATURE_NAMES):
+            raise ValueError("child-local pairwise feature dimension differs")
+        if mask.shape != value.shape[:2]:
+            raise ValueError("child-local pairwise validity shape differs")
+        count, modes = mask.shape
+        score = np.full((count, modes), -np.inf, dtype=np.float64)
+        probability = np.zeros((count, modes), dtype=np.float64)
+        temperature = max(float(self.metadata.get("score_temperature", 1.0)), 1e-4)
+        pair_features: list[np.ndarray] = []
+        pair_groups: list[tuple[int, np.ndarray, np.ndarray]] = []
+        offset = 0
+        for group in range(count):
+            rows = np.flatnonzero(mask[group])
+            if rows.size == 0:
+                continue
+            if rows.size == 1:
+                score[group, rows[0]] = 1.0
+                probability[group, rows[0]] = 1.0
+                continue
+            left, right = np.triu_indices(rows.size, 1)
+            left, right = rows[left], rows[right]
+            difference = value[group, left] - value[group, right]
+            pair_features.append(difference)
+            pair_groups.append((group, left, right))
+            offset += difference.shape[0]
+        if pair_features:
+            pair_probability = np.asarray(
+                self.estimator.predict_proba(np.concatenate(pair_features, axis=0))[:, 1],
+                dtype=np.float64,
+            )
+            offset = 0
+            for group, left, right in pair_groups:
+                size = left.size
+                current = pair_probability[offset : offset + size]
+                offset += size
+                total = np.zeros((modes,), dtype=np.float64)
+                comparisons = np.zeros((modes,), dtype=np.float64)
+                np.add.at(total, left, current)
+                np.add.at(total, right, 1.0 - current)
+                np.add.at(comparisons, left, 1.0)
+                np.add.at(comparisons, right, 1.0)
+                rows = np.flatnonzero(mask[group])
+                score[group, rows] = total[rows] / np.maximum(comparisons[rows], 1.0)
+                logits = score[group, rows] / temperature
+                logits -= np.max(logits)
+                mass = np.exp(np.clip(logits, -60.0, 0.0))
+                probability[group, rows] = mass / np.maximum(np.sum(mass), 1e-12)
+        return score, probability
+
+    def save(self, path: Path) -> None:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        joblib.dump({"estimator": self.estimator, "metadata": dict(self.metadata)}, Path(path))
+
+    @classmethod
+    def load(cls, path: Path) -> "ChildLocalPairwiseRankerArtifact":
+        payload = joblib.load(Path(path))
+        metadata = dict(payload["metadata"])
+        if metadata.get("artifact_type") != "goal_maplet_child_local_pairwise_ranker_v2":
+            raise ValueError("not a child-local pairwise ranker")
+        if tuple(metadata.get("feature_names", ())) != FEATURE_NAMES:
+            raise ValueError("child-local pairwise feature contract differs")
+        return cls(payload["estimator"], metadata)
