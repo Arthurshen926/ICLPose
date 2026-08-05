@@ -62,6 +62,18 @@ catastrophic failures. The learned factor ranker does not preserve the P90
 gain, median selection regret remains 0.217 m, and there is no untouched test;
 the frozen graph proposal therefore remains the production default.
 
+The G14 sparse mode-relation pass now adds a query-only local/long-range/
+depth-normal edge graph over fixed Top-16 child options.  Paired relation LLRs
+reach 0.711 edge concordance and 0.902 aggregate candidate concordance on held
+out seq10. Exact tree inference uses Sum-Product for pose evidence, Max-Sum for
+the interpretable configuration, and disjoint edges for verification.  A
+zero-LLR safety gate improves Dev48 over the G13 Top-16 baseline from 0.638 m
+to 0.582 m median while preserving its 1.711 m P90 and 6.25% catastrophic
+rate, but it remains worse in translation than the frozen graph result
+(0.555/1.680 m). The unbounded verification diagnostic reaches 0.512/1.600 m
+on Dev48 but fails the independent validation tail gate, so neither relation
+policy is promoted and no untouched test or continuous refiner is opened.
+
 ## Frozen V6 Status
 
 See [the V6 mainline](docs/vfm/2dgs_maplet_atlas_localization_v6.md) for its
@@ -121,7 +133,10 @@ stored embedding, as the next required research module.
 - `feature_extract/tools/vfm/build_goal_maplet_child_local_factor_samples.py`
 - `feature_extract/tools/vfm/train_goal_maplet_child_local_factor_calibrator.py`
 - `feature_extract/tools/vfm/train_goal_maplet_pose_likelihood_ratio.py`
+- `feature_extract/tools/vfm/build_goal_maplet_mode_relation_samples.py`
+- `feature_extract/tools/vfm/train_goal_maplet_mode_relation_likelihood_ratio.py`
 - `feature_extract/tools/vfm/augment_goal_maplet_configuration_evidence.py`
+- `feature_extract/tools/vfm/evaluate_goal_maplet_mode_relation.py`
 - `feature_extract/tools/vfm/train_goal_maplet_configuration_pairwise_ranker.py`
 - `feature_extract/tools/vfm/evaluate_goal_maplet_latent_configuration.py`
 - `feature_extract/tools/vfm/train_goal_maplet_latent_safety_selector.py`

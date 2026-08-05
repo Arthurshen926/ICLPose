@@ -30,6 +30,10 @@ def main() -> None:
         "evidence_version", "fixed_group_denominator", "one_mode_per_group",
         "typed_null_marginalization", "child_capacity", "primitive_capacity",
         "pose_likelihood_pairing_contract", "soft_assignment", "soft_capacity",
+        "mode_relation_pairing_contract", "mode_relation_edge_contract",
+        "mode_relation_option_contract", "mode_relation_feature_names",
+        "mode_relation_inference", "mode_relation_shortlist",
+        "mode_relation_pose_evidence", "mode_relation_decode", "mode_relation_verification",
     )
     for key in semantic_contract_keys:
         if len({json.dumps(item.get(key), sort_keys=True) for item in contracts}) != 1:
@@ -51,6 +55,10 @@ def main() -> None:
         "pose_likelihood_ratio_sha256": sorted({
             str(contract.get("pose_likelihood_ratio_sha256")) for contract in contracts
             if contract.get("pose_likelihood_ratio_sha256") is not None
+        }),
+        "mode_relation_likelihood_ratio_sha256": sorted({
+            str(contract.get("mode_relation_likelihood_ratio_sha256")) for contract in contracts
+            if contract.get("mode_relation_likelihood_ratio_sha256") is not None
         }),
         "factor_training_pool_disjoint": bool(all(
             contract.get("factor_training_pool_disjoint", False) for contract in contracts

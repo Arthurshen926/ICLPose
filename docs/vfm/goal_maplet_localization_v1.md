@@ -639,6 +639,111 @@ Its gate must be configuration-level trajectory transfer, not exact-factor
 pair accuracy.  Only if it improves both basin selection and tail risk should
 the frozen Top-3 refiner handoff be reopened.
 
+### G14 — sparse mode relations and exact tree inference
+
+G14 freezes the G13 map, canonical field, mapper, graph, pose pool and local
+LLR.  It adds no map embedding.  A relation edge joins two fixed query groups
+and two fixed child-local primitive modes; the candidate pose may only project
+and evaluate them.  The edge set is built before any pose is read and contains
+three explicit families:
+
+```text
+local image neighbours
+descriptor-distinct long-range supports
+support-scale probes evaluated for depth / normal diversity
+```
+
+Strongly overlapping supports contribute one representative relation node.
+The fit edges form a deterministic information tree/forest.  Long-range and
+depth/normal edges not used by that tree are held out for verification.  The
+two sets are fail-closed disjoint.  Runtime retrieves Top-16 children, retains
+at most eight with no more than two per parent family, and retains the first
+two modes from the fixed VFM Top-M distribution for each child.  This is a
+family-preserving query-only shortlist, not a Top-K sweep or a pose-conditioned
+mode search.
+
+The analytic baseline exposed and fixed two protocol bugs before learning:
+
+1. a local pair could be silently relabelled long/depth when it was also
+   informative, eliminating the local family from the sample protocol;
+2. visibility was initially renormalized over the modes left alive by each
+   candidate pose, allowing a wrong pose to manufacture unit mode mass.
+
+The corrected denominator is normalized exactly once from the fixed VFM
+distribution.  Geometry can only remove probability mass into typed relation
+null; it cannot redistribute that mass.  Invalid/missing, behind-camera,
+back-facing and same-primitive conflicts have explicit meanings.  Only the
+same-primitive choice by independent groups is a hard conflict.
+
+The fixed analytic statistic is already directional.  Across the four mapping
+shards its concordance is about 0.64 overall, 0.59--0.66 for local edges,
+0.65--0.69 for long-range edges and 0.61--0.64 for depth/normal edges.  Phase
+negatives reach 0.74--0.80, while one-wrong-endpoint identity negatives remain
+hard at 0.54--0.56.  The learned same-query/same-edge density ratio transfers
+to held-out seq10 as follows:
+
+| paired relation gate | seq10 result |
+|---|---:|
+| all edge concordance | 0.711 |
+| local / long-range / depth-normal | 0.722 / 0.756 / 0.667 |
+| low-rotation phase | 0.773 |
+| aggregate candidate concordance | 0.902 |
+
+The first Max-Sum replay selected null for every group.  This identified a
+probability-definition error rather than a weight problem: a unit null state
+was being compared with each individual mode after the total valid mass had
+been split across many modes.  G14 therefore uses exact Sum-Product on the fit
+tree for the pose log-partition and uncertainty, while exact Max-Sum is kept
+only for the interpretable configuration decode.  Held-out verification is
+the predictive relation LLR conditional on both endpoints being valid; its
+valid mass and null mass remain separate confidence/abstention outputs.  An
+empty valid edge is neutral evidence, and equal-rank policies now assign true
+average ranks to tied scores instead of injecting candidate-order bias.
+
+On the frozen seq12/14 validation set, unrestricted held-out verification
+shows that the relation signal genuinely changes configuration ranking, but
+also that low-valid-mass overrides are unsafe:
+
+| fixed policy (17 queries) | translation median / P90 | rotation median / P90 | success <=0.5m/5deg | catastrophic | median regret |
+|---|---:|---:|---:|---:|---:|
+| G13 Top-16 equal-rank | 0.389 / 1.486 m | 1.321 / 7.129 deg | 64.71% | 11.76% | 0.247 m |
+| G13 + unrestricted held-out verification | **0.210** / 3.335 m | **0.971** / 9.329 deg | **70.59%** | 17.65% | **0.075 m** |
+| G13 + positive-verification safety gate | 0.389 / **1.486 m** | 1.321 / **7.033 deg** | 64.71% | **11.76%** | **0.180 m** |
+
+The safety gate has no fitted threshold: a relation override is permitted only
+when the fused winner has LLR greater than the independently calibrated neutral
+point zero.  It preserves P90, success and catastrophic rate, reduces selection
+regret on both seq12 and seq14, and therefore was frozen before Dev48 was opened.
+
+The single frozen Dev48 run gives:
+
+| Dev48 policy | translation median / P90 | rotation median / P90 | success <=0.5m/5deg | catastrophic |
+|---|---:|---:|---:|---:|
+| frozen graph proposal | **0.555 / 1.680 m** | 1.994 / 5.561 deg | 45.83% | 8.33% |
+| G13 Top-16 equal-rank | 0.638 / 1.711 m | 2.015 / **5.033 deg** | 43.75% | **6.25%** |
+| unrestricted held-out verification (diagnostic) | 0.512 / **1.600 m** | **1.568** / 5.058 deg | **47.92%** | **6.25%** |
+| frozen positive-verification gate | 0.582 / 1.711 m | 2.007 / **5.033 deg** | 45.83% | **6.25%** |
+
+The unrestricted policy is not eligible for promotion because it failed the
+validation tail gate before Dev48.  The frozen safe policy transfers modestly
+but remains worse in translation than the graph proposal.  G14 is therefore a
+scientific partial pass and a production fail: sparse relations do address
+ranking failure, but the current endpoint-valid mass is too low for them to
+reliably determine absolute facade identity.  The strict 0.5 m / 5 degree pose
+pool coverage failure is 11.76% on seq12/14 and 12.5% on Dev48; relation ranking
+cannot repair those queries.  Continuous refinement, relation-guided proposal
+generation and untouched test remain closed.
+
+This limitation is visible directly in the latent state, not inferred only
+from pose error.  The unconditional Max-Sum decode assigns zero non-null groups
+for every candidate in both final audits.  Median held-out endpoint-valid mass
+is only 5.5% on seq12/14 and 8.6% on Dev48 (median null mass 94.5% and 91.4%).
+Consequently the observed accuracy gain comes from conditional marginal
+relation evidence, not from a solved hard physical identity configuration.
+The next method change must raise and calibrate endpoint-valid mass or generate
+relation-supported proposal families; forcing a non-null decode or tuning the
+null prior would merely hide the unresolved identity uncertainty.
+
 ## Development-set result
 
 The best deployable Goal-Maplet Top-1 remains the frozen graph v9 result, not
@@ -668,6 +773,7 @@ relevant, but it does not yet meet the requested accuracy.
 | M3 structured coarse localization | partial pass | strong Top-32, unreliable Top-1 rank |
 | M3.1 configuration ranking | scientific partial / production fail | robust aggregate 0.495/1.301 m and 4.17% catastrophic, but 0.235 m regret |
 | M3.2 child-local measurement | scientific partial / production fail | grouped assignment implemented; hard capacity fails Dev promotion |
+| M3.3 sparse mode relation | scientific partial / production fail | held-out relation improves Dev median/ranking, but safe policy remains below graph Top-1 |
 | M4 refiner handoff | fail | no stable 0.1–0.5 m convergence basin |
 | M5 final paper claim | fail | no untouched test, hard-subset comparison or target accuracy |
 
@@ -738,8 +844,11 @@ not an unsupported claim that VFM regions directly yield centimetre pose.
 - corrected Top-4 paired factor/audit: `goal_maplet/pose_likelihood_ratio_top4_corrected_v2.joblib`, `goal_maplet/pose_likelihood_ratio_top4_corrected_v2.json`
 - corrected Top-4 validation audit: `goal_maplet/likelihood_configuration_mapping_top4_corrected_validation_v26.json`
 - Top-16 coverage diagnostic: `goal_maplet/pose_likelihood_ratio_top16_v1.json`, `goal_maplet/likelihood_configuration_mapping_top16_validation_v25.json`
+- G14 paired relation model/audit: `goal_maplet/mode_relation_likelihood_ratio_top16_v1.joblib`, `goal_maplet/mode_relation_likelihood_ratio_top16_v1.json`
+- G14 frozen validation: `goal_maplet/config_rank_pool_mapping_relation_top16_validation_v31.json`, `goal_maplet/mode_relation_mapping_top16_validation_v31.json`
+- G14 single Dev48 audit: `goal_maplet/config_rank_pool_dev48_relation_top16_v32.json`, `goal_maplet/mode_relation_dev48_top16_v32.json`
 - rejected conditional rank: `goal_maplet/pose_modes_graph_conditionalrank_dev48_v17.json`
 - 4x GT round-trip audit: `goal_maplet/surface_basin_radio_pca256_supersample4_oracle_smoke_gt1round_v4.json`
 
-Focused verification: `49 passed` for `tests/test_goal_maplet_*.py` plus the
-exact 2DGS compositing equivalence test.
+Focused verification: `58 passed` across the Goal-Maplet relation/mainline
+tests plus the exact 2DGS compositing equivalence test.

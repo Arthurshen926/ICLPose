@@ -25,6 +25,11 @@ from feature_extract.vfm.localization_goal_maplet.feature_contract import FieldF
 from feature_extract.vfm.localization_goal_maplet.lineage import file_sha256
 from feature_extract.vfm.localization_goal_maplet.physical_map import GoalMapletPhysicalMap
 from feature_extract.vfm.localization_goal_maplet.pose_likelihood_ratio import PoseLikelihoodRatioArtifact
+from feature_extract.vfm.localization_goal_maplet.mode_relation import (
+    RELATION_EVIDENCE_NAMES,
+    ModeRelationLikelihoodRatioArtifact,
+    configuration_mode_relation_evidence,
+)
 from feature_extract.vfm.localization_goal_maplet.query_support import (
     aggregate_group_descriptors,
     aggregate_group_posteriors,
@@ -61,6 +66,7 @@ def main() -> None:
     parser.add_argument("--child_eligibility", required=True)
     parser.add_argument("--child_local_factor_calibrator", required=True)
     parser.add_argument("--pose_likelihood_ratio")
+    parser.add_argument("--mode_relation_likelihood_ratio")
     parser.add_argument("--output_json", required=True)
     parser.add_argument("--maximum_groups", type=int, default=64)
     parser.add_argument("--maximum_children", type=int, default=4)
@@ -90,17 +96,29 @@ def main() -> None:
         PoseLikelihoodRatioArtifact.load(Path(args.pose_likelihood_ratio))
         if args.pose_likelihood_ratio else None
     )
+    relation_ratio = (
+        ModeRelationLikelihoodRatioArtifact.load(Path(args.mode_relation_likelihood_ratio))
+        if args.mode_relation_likelihood_ratio else None
+    )
+    if relation_ratio is not None and likelihood_ratio is None:
+        raise ValueError("mode-relation evidence requires --pose_likelihood_ratio unary factors")
+    if relation_ratio is not None and str(args.evidence_version) != "v4":
+        raise ValueError("mode-relation evidence requires fixed-denominator evidence v4")
     if likelihood_ratio is not None and int(
         likelihood_ratio.metadata.get("runtime_maximum_children", -1)
     ) != int(args.maximum_children):
         raise ValueError(
             "pose-likelihood training Top-C differs from runtime maximum_children"
         )
+    if relation_ratio is not None and int(
+        relation_ratio.metadata.get("runtime_maximum_children", -1)
+    ) != int(args.maximum_children):
+        raise ValueError("mode-relation training Top-C differs from runtime maximum_children")
     candidate_pool_sha256 = file_sha256(Path(args.candidate_pool))
     training_pool_reuse = calibrator.metadata.get("candidate_pool_sha256") == candidate_pool_sha256
     application_trajectories = set(args.include_trajectories)
     supervised_trajectories = set()
-    for artifact in (calibrator, likelihood_ratio):
+    for artifact in (calibrator, likelihood_ratio, relation_ratio):
         if artifact is None:
             continue
         supervised_trajectories |= set(artifact.metadata.get("training_trajectories", ()))
@@ -122,7 +140,7 @@ def main() -> None:
     ):
         if pool.get(key) != expected:
             raise ValueError(f"candidate pool lineage differs: {key}")
-    for artifact in (calibrator, likelihood_ratio):
+    for artifact in (calibrator, likelihood_ratio, relation_ratio):
         if artifact is None:
             continue
         for key, expected in (
@@ -209,6 +227,32 @@ def main() -> None:
         updated["ranking_diagnostics"][MODE][evidence_key] = {
             name: evidence[:, index].tolist() for index, name in enumerate(evidence_names)
         }
+        if relation_ratio is not None:
+            relation = configuration_mode_relation_evidence(
+                poses, grouped_local, xy, extent, scale,
+                group_parent_ids, group_parent_probability, group_parent_null,
+                child, physical, field, eligibility, likelihood_ratio, relation_ratio, camera,
+                maximum_groups=int(args.maximum_groups),
+                retrieval_maximum_children=int(args.maximum_children),
+            )
+            updated["ranking_diagnostics"][MODE]["mode_relation_evidence_v1"] = {
+                name: relation.features[:, index].tolist()
+                for index, name in enumerate(RELATION_EVIDENCE_NAMES)
+            }
+            updated["ranking_diagnostics"][MODE]["mode_relation_assignments_v1"] = {
+                "selected_child_rows": relation.selected_child_rows.tolist(),
+                "selected_primitive_rows": relation.selected_primitive_rows.tolist(),
+                "fit_edges": np.stack([
+                    relation.relation_edges.fit_left,
+                    relation.relation_edges.fit_right,
+                    relation.relation_edges.fit_family,
+                ], axis=1).tolist() if relation.relation_edges.fit_left.size else [],
+                "verify_edges": np.stack([
+                    relation.relation_edges.verify_left,
+                    relation.relation_edges.verify_right,
+                    relation.relation_edges.verify_family,
+                ], axis=1).tolist() if relation.relation_edges.verify_left.size else [],
+            }
         rows.append(updated)
         print(json.dumps({"image_id": image_id, "candidate_count": int(poses.shape[0])}), flush=True)
     result = {
@@ -229,6 +273,16 @@ def main() -> None:
             "pose_likelihood_pairing_contract": likelihood_ratio.metadata.get("pairing_contract") if likelihood_ratio is not None else None,
             "soft_assignment": "entropy_regularized_fixed_topm_with_explicit_null" if str(args.evidence_version) == "v4" else None,
             "soft_capacity": "projected_dual_expected_occupancy" if str(args.evidence_version) == "v4" else None,
+            "mode_relation_likelihood_ratio_sha256": file_sha256(Path(args.mode_relation_likelihood_ratio)) if args.mode_relation_likelihood_ratio else None,
+            "mode_relation_pairing_contract": relation_ratio.metadata.get("pairing_contract") if relation_ratio is not None else None,
+            "mode_relation_edge_contract": relation_ratio.metadata.get("edge_contract") if relation_ratio is not None else None,
+            "mode_relation_option_contract": relation_ratio.metadata.get("option_contract") if relation_ratio is not None else None,
+            "mode_relation_feature_names": list(RELATION_EVIDENCE_NAMES) if relation_ratio is not None else None,
+            "mode_relation_inference": "exact_max_sum_fit_tree_disjoint_heldout_verification" if relation_ratio is not None else None,
+            "mode_relation_pose_evidence": "exact_sum_product_log_partition_fixed_denominator" if relation_ratio is not None else None,
+            "mode_relation_decode": "exact_max_sum" if relation_ratio is not None else None,
+            "mode_relation_verification": "endpoint_valid_conditional_predictive_llr_with_separate_null_mass" if relation_ratio is not None else None,
+            "mode_relation_shortlist": "runtime_top16_family_preserving_8x2_top2_modes" if relation_ratio is not None else None,
             "child_local_factor_calibrator_sha256": file_sha256(Path(args.child_local_factor_calibrator)),
             "application_trajectories": sorted(application_trajectories),
             "factor_training_pool_disjoint": not training_pool_reuse,
