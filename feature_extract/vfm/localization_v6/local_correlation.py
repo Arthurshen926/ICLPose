@@ -104,6 +104,7 @@ def local_correlation_distribution(
     background_samples: int = 512,
     device: str = "cuda",
     query_cache: LocalCorrelationQueryCache | None = None,
+    displacement_prior_sigma_cells: float | None = None,
 ) -> CorrelationDistribution:
     """Keep the complete local displacement posterior, including null."""
 
@@ -258,6 +259,12 @@ def local_correlation_distribution(
         - torch.log(valid_count)[:, None]
         - background_log_partition[:, None]
     )
+    if displacement_prior_sigma_cells is not None:
+        sigma = float(displacement_prior_sigma_cells)
+        if sigma <= 0.0:
+            raise ValueError("displacement_prior_sigma_cells must be positive")
+        spatial_log_prior = -0.5 * torch.sum(offset_tensor * offset_tensor, dim=1) / (sigma * sigma)
+        logits = logits + spatial_log_prior[None]
     logits = torch.where(valid, logits, torch.full_like(logits, -1e4))
     if query_matchability is None:
         cell_matchability = torch.ones(

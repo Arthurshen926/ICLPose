@@ -4,23 +4,22 @@ Real-image VFM localization against a feature-bearing 2DGS surface map.
 
 ## Active Mainline
 
-The sole active research line is **V6 maplet-atlas correlation localization**:
+The active research line is **Goal-Maplet structured physical-surface
+localization**. V6/V8/V8.1 are frozen diagnostics and V3 remains the frozen
+production baseline.
 
 ```text
-mapping RGB + calibrated poses + high-quality 2DGS --offline only-->
-  fixed canonical 2DGS maplet geometry
-  + raster-contributor-verified dense metric feature atlases
+mapping RGB + calibrated poses + clean 2DGS --offline only-->
+  exact primitive -> child surface tile -> context-parent hierarchy
+  + one canonical RADIO-final-derived code per observed primitive
+  + typed geometry/continuity/co-visibility/context graph
 
 query RGB
-  -> RADIO-final RetrievalRegion posterior with complete candidate groups
-  -> overlap-aware scene evidence
-  -> normalized Region-to-Chart posterior over disconnected MetricSurfaceCharts
-  -> per-chart projective frame distributions
-  -> correlated chart-factor coarse SE(3) distribution
-  -> area-render selected canonical maplet atlases
-  -> local multi-modal displacement correlation
-  -> analytic robust joint-SE(3) update
-  -> maplet-disjoint held-out verification
+  -> RADIO-final all-token physical-maplet posterior
+  -> post-retrieval correlated-support grouping
+  -> parent/child surface posterior + typed graph configurations
+  -> diverse Top-N coarse SE(3) modes
+  -> optional exact-surface ranking/refinement plugin
 ```
 
 The target prior stores only metric 2DGS geometry and bounded anonymous
@@ -31,6 +30,19 @@ points/tracks, RADIO intermediate features, LoFTR, pairwise query/reference
 matching, single-point cosine pose energy, or final point-correspondence PnP.
 
 ## Current Status
+
+The [Goal-Maplet report](docs/vfm/goal_maplet_localization_v1.md) defines the
+active contracts, artifacts, oracle ladder and promotion decision. Exact clean
+geometry and PFIR retrieval pass their current gates. On the trajectory-disjoint
+48-query development set, current Top-32 proposals contain a 0.241 m median
+oracle candidate and cover 97.92% within 1 m / 10 degrees, but the deployable
+Top-1 remains 0.555 m median / 1.680 m P90. The attempted corrected rendered
+ranker is rejected on Dev48 (0.660 m / 1.990 m), and the current continuous
+RADIO surface-flow refiner has no reliable convergence basin. Goal-Maplet is
+therefore an active research line, not a production or paper-ready accuracy
+claim.
+
+## Frozen V6 Status
 
 See [the V6 mainline](docs/vfm/2dgs_maplet_atlas_localization_v6.md) for its
 architecture, artifact contracts and strict G0–G4 promotion gates.
@@ -70,6 +82,17 @@ maplet-interior RADIO alignment, rather than a larger pose lattice or another
 stored embedding, as the next required research module.
 
 ## Active Code
+
+- `feature_extract/vfm/localization_goal_maplet/`
+- `feature_extract/tools/vfm/build_goal_maplet_physical_map.py`
+- `feature_extract/tools/vfm/build_goal_maplet_canonical_field_from_contributors.py`
+- `feature_extract/tools/vfm/build_goal_maplet_typed_graph.py`
+- `feature_extract/tools/vfm/evaluate_goal_maplet_canonical_pfir.py`
+- `feature_extract/tools/vfm/evaluate_goal_maplet_oracle_ladder.py`
+- `feature_extract/tools/vfm/evaluate_goal_maplet_pose_modes.py`
+- `feature_extract/tools/vfm/evaluate_goal_maplet_surface_basin.py`
+
+## Frozen V6 Code
 
 - `feature_extract/tools/vfm/build_v6_canonical_maplet_atlas.py`
 - `feature_extract/tools/vfm/build_surface_retrieval_maplet_bank.py`
@@ -116,6 +139,7 @@ focused tests from this checkout:
 
 ```bash
 PYTHONPATH=. pytest -q \
+  tests/test_goal_maplet_*.py \
   tests/test_v6_maplet_atlas_correlation.py \
   tests/test_v6_maplet_frame_alignment.py
 

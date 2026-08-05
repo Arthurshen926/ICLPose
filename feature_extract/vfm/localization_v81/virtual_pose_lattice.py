@@ -426,15 +426,20 @@ def rank_pose_candidates_by_region_centres(
                 dim=4,
             )
             ratio = 16.0 * torch.exp(torch.clamp(-0.5 * relation_residual, min=-40.0))
-            distinct = (
-                relation_rows[edge_source, :, None]
-                != relation_rows[edge_target, None, :]
-            ) & (
+            valid_relation = (
                 relation_rows[edge_source, :, None] >= 0
             ) & (
                 relation_rows[edge_target, None, :] >= 0
             )
-            ratio = torch.where(distinct[None], ratio, 0.0)
+            distinct = (
+                relation_rows[edge_source, :, None]
+                != relation_rows[edge_target, None, :]
+            )
+            ratio = torch.where(
+                valid_relation[None],
+                torch.where(distinct[None], ratio, torch.ones_like(ratio)),
+                torch.zeros_like(ratio),
+            )
             pair_probability = (
                 relation_probability[edge_source, :, None]
                 * relation_probability[edge_target, None, :]

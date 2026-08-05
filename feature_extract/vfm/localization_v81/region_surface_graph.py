@@ -408,8 +408,11 @@ def score_region_surface_pose(
             )[min(max(level, 0), 2)]
         )
         ratio *= compatibility[relation_level[safe_a[:, None], safe_b[None]]]
-        # Distinct evidence groups represent distinct local surface regions.
-        ratio = np.where(safe_a[:, None] == safe_b[None], 0.0, ratio)
+        # Without maplet-local coordinates, two distinct query groups assigned
+        # to one large maplet have an *unknown* relation, not a contradiction.
+        # A likelihood ratio of one is neutral evidence.  Capacity remains the
+        # term that decides how many groups a projected maplet can explain.
+        ratio = np.where(safe_a[:, None] == safe_b[None], 1.0, ratio)
         ratio = np.where(valid_pair, ratio, 0.0)
         pair_probability = (
             query.candidate_probabilities[source, :, None]

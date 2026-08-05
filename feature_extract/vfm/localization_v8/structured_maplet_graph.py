@@ -469,7 +469,9 @@ def score_structured_maplet_pose(
         # Overlapping query supports may legitimately select the same physical
         # maplet.  Non-overlapping instance nodes may not collapse to one ID.
         if float(query.edge_features[edge, 4]) < 0.10:
-            ratio = np.where(safe_a[:, None] == safe_b[None], 0.0, ratio)
+            # Same-maplet cross-group geometry is unknown until a maplet-local
+            # child coordinate exists; it is neutral rather than impossible.
+            ratio = np.where(safe_a[:, None] == safe_b[None], 1.0, ratio)
         ratio = np.where(valid_pair, ratio, 0.0)
         pair_probability = (
             query.candidate_probabilities[source, :, None]
