@@ -17,12 +17,14 @@ from feature_extract.vfm.localization_goal_maplet.child_retrieval import retriev
 from feature_extract.vfm.localization_goal_maplet.configuration_evidence import (
     FEATURE_NAMES,
     LATENT_FEATURE_NAMES,
+    LIKELIHOOD_FEATURE_NAMES,
     configuration_candidate_evidence,
     configuration_candidate_latent_evidence,
 )
 from feature_extract.vfm.localization_goal_maplet.feature_contract import FieldFeatureContract
 from feature_extract.vfm.localization_goal_maplet.lineage import file_sha256
 from feature_extract.vfm.localization_goal_maplet.physical_map import GoalMapletPhysicalMap
+from feature_extract.vfm.localization_goal_maplet.pose_likelihood_ratio import PoseLikelihoodRatioArtifact
 from feature_extract.vfm.localization_goal_maplet.query_support import (
     aggregate_group_descriptors,
     aggregate_group_posteriors,
@@ -58,10 +60,11 @@ def main() -> None:
     parser.add_argument("--typed_graph", required=True)
     parser.add_argument("--child_eligibility", required=True)
     parser.add_argument("--child_local_factor_calibrator", required=True)
+    parser.add_argument("--pose_likelihood_ratio")
     parser.add_argument("--output_json", required=True)
     parser.add_argument("--maximum_groups", type=int, default=64)
     parser.add_argument("--maximum_children", type=int, default=4)
-    parser.add_argument("--evidence_version", choices=("v2", "v3"), default="v2")
+    parser.add_argument("--evidence_version", choices=("v2", "v3", "v4"), default="v2")
     parser.add_argument("--shard_index", type=int, default=0)
     parser.add_argument("--shard_count", type=int, default=1)
     parser.add_argument("--include_trajectories", nargs="+", default=[])
@@ -81,12 +84,28 @@ def main() -> None:
     graph = TypedParentGraph.load_npz(Path(args.typed_graph))
     eligibility = ChildGeometryEligibility.load_npz(Path(args.child_eligibility))
     calibrator = ChildLocalFactorCalibratorArtifact.load(Path(args.child_local_factor_calibrator))
+    if str(args.evidence_version) == "v4" and not args.pose_likelihood_ratio:
+        raise ValueError("configuration evidence v4 requires --pose_likelihood_ratio")
+    likelihood_ratio = (
+        PoseLikelihoodRatioArtifact.load(Path(args.pose_likelihood_ratio))
+        if args.pose_likelihood_ratio else None
+    )
+    if likelihood_ratio is not None and int(
+        likelihood_ratio.metadata.get("runtime_maximum_children", -1)
+    ) != int(args.maximum_children):
+        raise ValueError(
+            "pose-likelihood training Top-C differs from runtime maximum_children"
+        )
     candidate_pool_sha256 = file_sha256(Path(args.candidate_pool))
     training_pool_reuse = calibrator.metadata.get("candidate_pool_sha256") == candidate_pool_sha256
     application_trajectories = set(args.include_trajectories)
-    supervised_trajectories = set(calibrator.metadata.get("training_trajectories", ()))
-    supervised_trajectories |= set(calibrator.metadata.get("calibration_trajectories", ()))
-    supervised_trajectories |= set(calibrator.metadata.get("validation_trajectories", ()))
+    supervised_trajectories = set()
+    for artifact in (calibrator, likelihood_ratio):
+        if artifact is None:
+            continue
+        supervised_trajectories |= set(artifact.metadata.get("training_trajectories", ()))
+        supervised_trajectories |= set(artifact.metadata.get("calibration_trajectories", ()))
+        supervised_trajectories |= set(artifact.metadata.get("validation_trajectories", ()))
     trajectory_cross_fit = bool(application_trajectories) and not bool(
         application_trajectories & supervised_trajectories
     )
@@ -103,7 +122,9 @@ def main() -> None:
     ):
         if pool.get(key) != expected:
             raise ValueError(f"candidate pool lineage differs: {key}")
-    for artifact in (calibrator,):
+    for artifact in (calibrator, likelihood_ratio):
+        if artifact is None:
+            continue
         for key, expected in (
             ("physical_map_sha256", physical.content_sha256),
             ("canonical_field_sha256", field.content_sha256),
@@ -117,7 +138,11 @@ def main() -> None:
     mapper, _ = load_surface_maplet_mapper(Path(args.surface_mapper), device=str(args.device))
     context_config = RadioFinalRegionConfig()
     local_config = RadioFinalRegionConfig(pool_sizes=(1,), pool_weights=(1.0,))
-    evidence_names = LATENT_FEATURE_NAMES if str(args.evidence_version) == "v3" else FEATURE_NAMES
+    evidence_names = (
+        LIKELIHOOD_FEATURE_NAMES if str(args.evidence_version) == "v4"
+        else LATENT_FEATURE_NAMES if str(args.evidence_version) == "v3"
+        else FEATURE_NAMES
+    )
     paths = sorted(Path(args.contributors).glob("*.npz"))[int(args.shard_index) :: int(args.shard_count)]
     rows = []
     for path in paths:
@@ -162,15 +187,16 @@ def main() -> None:
         )
         row = pool_rows[image_id]
         poses = np.asarray([item["pose_w2c"] for item in row["mode_details"][MODE]], dtype=np.float64)
-        if str(args.evidence_version) == "v3":
+        if str(args.evidence_version) in ("v3", "v4"):
             extent = grouped.extent * np.asarray([camera.width, camera.height], dtype=np.float64)
             evidence = configuration_candidate_latent_evidence(
                 poses, grouped_local, xy, extent, scale,
                 group_parent_ids, group_parent_probability, group_parent_null,
                 child, physical, field, graph, eligibility, calibrator, camera,
+                pose_likelihood_ratio=likelihood_ratio,
                 maximum_groups=int(args.maximum_groups), maximum_children=int(args.maximum_children),
             )
-            evidence_key = "configuration_evidence_v3"
+            evidence_key = f"configuration_evidence_{args.evidence_version}"
         else:
             evidence = configuration_candidate_evidence(
                 poses, grouped_local, xy, scale,
@@ -194,11 +220,15 @@ def main() -> None:
             "maximum_groups": int(args.maximum_groups), "maximum_children": int(args.maximum_children),
             "child_local_mode_source": "fixed_vfm_topm",
             "evidence_version": str(args.evidence_version),
-            "fixed_group_denominator": bool(str(args.evidence_version) == "v3"),
-            "one_mode_per_group": bool(str(args.evidence_version) == "v3"),
-            "typed_null_marginalization": bool(str(args.evidence_version) == "v3"),
-            "child_capacity": "projected_area_correlated_cluster_cap1to6" if str(args.evidence_version) == "v3" else None,
-            "primitive_capacity": "one_independent_cluster_per_primitive" if str(args.evidence_version) == "v3" else None,
+            "fixed_group_denominator": bool(str(args.evidence_version) in ("v3", "v4")),
+            "one_mode_per_group": bool(str(args.evidence_version) in ("v3", "v4")),
+            "typed_null_marginalization": bool(str(args.evidence_version) in ("v3", "v4")),
+            "child_capacity": "projected_area_correlated_cluster_cap1to6" if str(args.evidence_version) in ("v3", "v4") else None,
+            "primitive_capacity": "one_independent_cluster_per_primitive" if str(args.evidence_version) in ("v3", "v4") else None,
+            "pose_likelihood_ratio_sha256": file_sha256(Path(args.pose_likelihood_ratio)) if args.pose_likelihood_ratio else None,
+            "pose_likelihood_pairing_contract": likelihood_ratio.metadata.get("pairing_contract") if likelihood_ratio is not None else None,
+            "soft_assignment": "entropy_regularized_fixed_topm_with_explicit_null" if str(args.evidence_version) == "v4" else None,
+            "soft_capacity": "projected_dual_expected_occupancy" if str(args.evidence_version) == "v4" else None,
             "child_local_factor_calibrator_sha256": file_sha256(Path(args.child_local_factor_calibrator)),
             "application_trajectories": sorted(application_trajectories),
             "factor_training_pool_disjoint": not training_pool_reuse,

@@ -20,6 +20,28 @@ POLICIES = {
     "latent_typed_consistency": ("configuration_latent_typed_consistency_mass_mean", 1.0),
 }
 
+LIKELIHOOD_POLICIES = {
+    "pose_llr_fixed_mean": ("configuration_pose_llr_fixed_mean", 1.0),
+    "pose_llr_fixed_median": ("configuration_pose_llr_fixed_median", 1.0),
+    "pose_llr_log_bayes_mean": ("configuration_pose_llr_log_bayes_mean", 1.0),
+    "soft_valid_probability": ("configuration_soft_valid_probability_mean", 1.0),
+    "soft_cap_valid_probability": ("configuration_soft_cap_valid_probability_mean", 1.0),
+}
+
+FUSION_POLICIES = (
+    "legacy_llr_median_equal_rank_fusion",
+    "decorrelated_llr_mean_equal_rank_fusion",
+)
+
+
+def _rank_percentile(score: np.ndarray) -> np.ndarray:
+    value = np.asarray(score, dtype=np.float64).reshape(-1)
+    order = np.argsort(-value, kind="stable")
+    output = np.ones(value.shape, dtype=np.float64)
+    if value.size > 1:
+        output[order] = np.linspace(1.0, 0.0, value.size)
+    return output
+
 
 def _metrics(translation: np.ndarray, rotation: np.ndarray, oracle: np.ndarray) -> dict:
     t = np.asarray(translation, dtype=np.float64)
@@ -82,19 +104,26 @@ def main() -> None:
         raise FileExistsError("refusing to overwrite latent configuration audit")
     payload = json.loads(Path(args.candidate_pool).read_text())
     contract = dict(payload.get("configuration_evidence_contract", {}))
+    evidence_version = str(contract.get("evidence_version"))
     if not (
-        contract.get("evidence_version") == "v3"
+        evidence_version in ("v3", "v4")
         and bool(contract.get("fixed_group_denominator"))
         and bool(contract.get("one_mode_per_group"))
     ):
         raise ValueError("candidate pool is not fixed-denominator latent evidence v3")
 
     rows = []
-    topn_success = {name: {3: [], 5: []} for name in POLICIES}
+    policies = dict(POLICIES)
+    if evidence_version == "v4":
+        policies.update(LIKELIHOOD_POLICIES)
+    evaluated_policy_names = list(policies)
+    if evidence_version == "v4":
+        evaluated_policy_names.extend(FUSION_POLICIES)
+    topn_success = {name: {3: [], 5: []} for name in evaluated_policy_names}
     for row in payload["rows"]:
         details = row["mode_details"][MODE]
         diagnostics = row["ranking_diagnostics"][MODE]
-        evidence = diagnostics["configuration_evidence_v3"]
+        evidence = diagnostics[f"configuration_evidence_{evidence_version}"]
         translation = np.asarray([item["translation_m"] for item in details], dtype=np.float64)
         rotation = np.asarray([item["rotation_deg"] for item in details], dtype=np.float64)
         utility = translation / 0.5 + rotation / 5.0
@@ -104,9 +133,26 @@ def main() -> None:
             "proposal": proposal_score,
             **{
                 name: float(direction) * np.asarray(evidence[feature], dtype=np.float64)
-                for name, (feature, direction) in POLICIES.items()
+                for name, (feature, direction) in policies.items()
             },
         }
+        if evidence_version == "v4":
+            policy_score["legacy_llr_median_equal_rank_fusion"] = (
+                _rank_percentile(np.asarray(
+                    evidence["configuration_legacy_valid_factor_mass_mean"], dtype=np.float64,
+                ))
+                + _rank_percentile(np.asarray(
+                    evidence["configuration_pose_llr_fixed_median"], dtype=np.float64,
+                ))
+            )
+            policy_score["decorrelated_llr_mean_equal_rank_fusion"] = (
+                _rank_percentile(np.asarray(
+                    evidence["configuration_fixed_valid_factor_mass_mean"], dtype=np.float64,
+                ))
+                + _rank_percentile(np.asarray(
+                    evidence["configuration_pose_llr_fixed_mean"], dtype=np.float64,
+                ))
+            )
         result = {
             "image_id": row["image_id"],
             "oracle": {
@@ -145,7 +191,7 @@ def main() -> None:
                     evidence["configuration_latent_assignment_margin_mean"]
                 )[selected]),
             }
-            if name in POLICIES:
+            if name in evaluated_policy_names:
                 for topn in (3, 5):
                     keep = order[: min(topn, order.size)]
                     topn_success[name][topn].append(bool(np.any(
@@ -153,9 +199,9 @@ def main() -> None:
                     )))
         rows.append(result)
 
-    policies = ["proposal", *POLICIES]
+    policy_names = ["proposal", *evaluated_policy_names]
     summary = {}
-    for name in policies:
+    for name in policy_names:
         summary[name] = _metrics(
             np.asarray([row[name]["translation_m"] for row in rows]),
             np.asarray([row[name]["rotation_deg"] for row in rows]),
@@ -165,13 +211,13 @@ def main() -> None:
             summary[name]["top3_0p5m_5deg_recall"] = float(np.mean(topn_success[name][3]))
             summary[name]["top5_0p5m_5deg_recall"] = float(np.mean(topn_success[name][5]))
     report = {
-        "stage": "evaluate_goal_maplet_latent_configuration_v3",
-        "protocol": "predefined_fixed_denominator_group_aware_policies",
+        "stage": f"evaluate_goal_maplet_latent_configuration_{evidence_version}",
+        "protocol": "predefined_fixed_denominator_group_aware_likelihood_policies",
         "query_count": len(rows),
         "candidate_pool": str(args.candidate_pool),
         "configuration_evidence_contract": contract,
         "summary": summary,
-        "risk_coverage": {name: _risk_coverage(rows, name) for name in POLICIES},
+        "risk_coverage": {name: _risk_coverage(rows, name) for name in evaluated_policy_names},
         "runtime_ambiguity_subsets": {
             name: {
                 "high_primitive_collision_proxy": _subset_metrics(
@@ -184,7 +230,7 @@ def main() -> None:
                     rows, name, "eligible_group_fraction", high=False,
                 ),
             }
-            for name in POLICIES
+            for name in evaluated_policy_names
         },
         "rows": rows,
     }

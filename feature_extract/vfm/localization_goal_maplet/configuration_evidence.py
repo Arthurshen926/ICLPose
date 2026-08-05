@@ -19,10 +19,13 @@ from .latent_configuration import (
     correlated_support_clusters,
     effective_group_weights,
     independent_assignment,
+    soft_assignment,
+    soft_capacitated_assignment,
     weighted_mean,
     weighted_quantile,
 )
 from .physical_map import GoalMapletPhysicalMap
+from .pose_likelihood_ratio import PoseLikelihoodRatioArtifact
 from .typed_graph import TypedParentGraph
 
 
@@ -81,6 +84,30 @@ LATENT_FEATURE_NAMES = (
     "configuration_effective_group_fraction",
     "configuration_latent_uncap_primitive_collision_fraction",
     "configuration_latent_uncap_child_overflow_fraction",
+)
+
+
+LIKELIHOOD_FEATURE_NAMES = LATENT_FEATURE_NAMES + (
+    "configuration_pose_llr_fixed_mean",
+    "configuration_pose_llr_fixed_q10",
+    "configuration_pose_llr_fixed_median",
+    "configuration_pose_llr_log_bayes_mean",
+    "configuration_pose_llr_log_bayes_q10",
+    "configuration_pose_llr_log_bayes_median",
+    "configuration_pose_llr_log_bayes_q90",
+    "configuration_soft_valid_probability_mean",
+    "configuration_soft_null_probability_mean",
+    "configuration_soft_wrong_child_probability_mean",
+    "configuration_soft_pose_incompatible_probability_mean",
+    "configuration_soft_unresolved_probability_mean",
+    "configuration_soft_field_missing_probability_mean",
+    "configuration_soft_assignment_entropy_mean",
+    "configuration_soft_expected_residual_median",
+    "configuration_soft_expected_residual_p90",
+    "configuration_soft_cap_valid_probability_mean",
+    "configuration_soft_cap_assignment_entropy_mean",
+    "configuration_soft_cap_child_violation",
+    "configuration_soft_cap_primitive_violation",
 )
 
 
@@ -302,6 +329,7 @@ def configuration_candidate_latent_evidence(
     factor_calibrator: ChildLocalFactorCalibratorArtifact,
     camera,
     *,
+    pose_likelihood_ratio: PoseLikelihoodRatioArtifact = None,
     maximum_groups: int = 64,
     maximum_children: int = 4,
     temperature: float = 0.07,
@@ -329,7 +357,8 @@ def configuration_candidate_latent_evidence(
     priority = 1.0 - parent_null
     groups = np.argsort(-priority, kind="stable")[: int(maximum_groups)]
     groups = groups[priority[groups] > 0.02]
-    output = np.zeros((poses.shape[0], len(LATENT_FEATURE_NAMES)), dtype=np.float64)
+    evidence_names = LIKELIHOOD_FEATURE_NAMES if pose_likelihood_ratio is not None else LATENT_FEATURE_NAMES
+    output = np.zeros((poses.shape[0], len(evidence_names)), dtype=np.float64)
     if groups.size == 0:
         return output.astype(np.float32)
 
@@ -347,6 +376,15 @@ def configuration_candidate_latent_evidence(
         # fraction remains a query property and is therefore still emitted.
         output[:, LATENT_FEATURE_NAMES.index("configuration_fixed_unresolved_mass_mean")] = 1.0
         output[:, LATENT_FEATURE_NAMES.index("configuration_effective_group_fraction")] = effective_fraction
+        if pose_likelihood_ratio is not None:
+            for name in (
+                "configuration_pose_llr_fixed_mean", "configuration_pose_llr_fixed_q10",
+                "configuration_pose_llr_fixed_median", "configuration_pose_llr_log_bayes_mean",
+                "configuration_pose_llr_log_bayes_q10", "configuration_pose_llr_log_bayes_median",
+                "configuration_pose_llr_log_bayes_q90",
+            ):
+                output[:, LIKELIHOOD_FEATURE_NAMES.index(name)] = -12.0
+            output[:, LIKELIHOOD_FEATURE_NAMES.index("configuration_soft_null_probability_mean")] = 1.0
         return output.astype(np.float32)
 
     selected_groups = groups[group_index]
@@ -502,7 +540,7 @@ def configuration_candidate_latent_evidence(
         assigned_weight = group_weight * cap.assigned
         residual_weight = assigned_weight if np.sum(assigned_weight) > 0.0 else group_weight
 
-        output[pose_row] = np.asarray([
+        base_output = np.asarray([
             weighted_mean(fixed_eligible, group_weight),
             float(np.mean(fixed_valid[fixed_eligible])) if np.any(fixed_eligible) else 0.0,
             float(np.mean(fixed_valid)),
@@ -536,6 +574,118 @@ def configuration_candidate_latent_evidence(
             weighted_mean(collision, group_weight),
             float(overflow_excess / max(uncap_cluster_count, 1)),
         ], dtype=np.float64)
+        output[pose_row, : len(LATENT_FEATURE_NAMES)] = base_output
+
+        if pose_likelihood_ratio is not None:
+            llr = pose_likelihood_ratio.score_log_likelihood_ratio(factor_feature)
+            factor_has_mode = np.any(mode_valid, axis=1)
+            factor_log_weight = np.log(np.maximum(conditional_child_probability, 1e-12)) + llr
+
+            # A fixed child-local factor contributes one Bayes factor.  Its
+            # geometry-conditioned Top-M distribution only allocates that
+            # mass among modes; it cannot multiply the factor evidence again.
+            mode_log_posterior = np.full(factor_row.shape, -np.inf, dtype=np.float64)
+            raw_mode_logit = (
+                np.log(np.maximum(conditional_mode_probability[factor_row, mode_row], 1e-12))
+                + np.clip(np.asarray(mode_feature, dtype=np.float64)[factor_row, mode_row, 5], -12.0, 0.0)
+            )
+            for current_factor in np.unique(factor_row).tolist():
+                rows = np.flatnonzero(factor_row == int(current_factor))
+                values = raw_mode_logit[rows]
+                maximum = float(np.max(values))
+                normalizer = maximum + np.log(np.sum(np.exp(values - maximum)))
+                mode_log_posterior[rows] = values - normalizer
+            soft_option_score = factor_log_weight[factor_row] + mode_log_posterior
+            soft = soft_assignment(
+                group_count=groups.size,
+                option_group_rows=option_group,
+                option_child_rows=option_child,
+                option_primitive_rows=option_primitive,
+                option_scores=soft_option_score,
+            )
+            soft_cap = soft_capacitated_assignment(
+                group_count=groups.size,
+                option_group_rows=option_group,
+                option_child_rows=option_child,
+                option_primitive_rows=option_primitive,
+                option_scores=soft_option_score,
+                group_weights=group_weight,
+                child_capacities=capacities,
+            )
+
+            fixed_llr = np.full((groups.size,), -12.0, dtype=np.float64)
+            group_log_bf = np.full((groups.size,), -12.0, dtype=np.float64)
+            for local_group in range(groups.size):
+                factors = np.flatnonzero((group_index == local_group) & factor_has_mode)
+                if factors.size == 0:
+                    continue
+                best = int(factors[np.argmax(factor_log_weight[factors])])
+                fixed_llr[local_group] = llr[best]
+                values = factor_log_weight[factors]
+                maximum = float(np.max(values))
+                group_log_bf[local_group] = maximum + np.log(np.sum(np.exp(values - maximum)))
+
+            soft_valid = np.bincount(
+                option_group, weights=soft.option_probabilities, minlength=groups.size,
+            )
+            soft_cap_valid = np.bincount(
+                option_group, weights=soft_cap.option_probabilities, minlength=groups.size,
+            )
+            option_residual = np.asarray(mode_feature, dtype=np.float64)[factor_row, mode_row, 4]
+            residual_numerator = np.bincount(
+                option_group,
+                weights=soft.option_probabilities * option_residual,
+                minlength=groups.size,
+            )
+            expected_residual = residual_numerator / np.maximum(soft_valid, 1e-12)
+            residual_soft_weight = group_weight * soft_valid
+            if float(np.sum(residual_soft_weight)) <= 0.0:
+                residual_soft_weight = group_weight
+
+            # Four explicit null states share the unit null Bayes factor.  A
+            # typed-null calibrator only divides null mass among failure
+            # causes; it is never reused as the pose-correctness likelihood.
+            null_type_probability = np.zeros((groups.size, 4), dtype=np.float64)
+            null_indices = np.asarray(
+                [wrong_index, pose_index, unresolved_index, missing_index], dtype=np.int64,
+            )
+            for local_group in range(groups.size):
+                factors = np.flatnonzero(group_index == local_group)
+                if factors.size == 0:
+                    null_type_probability[local_group, 2] = 1.0
+                    continue
+                value = np.sum(
+                    conditional_child_probability[factors, None]
+                    * typed[factors][:, null_indices],
+                    axis=0,
+                )
+                if float(np.sum(value)) <= 1e-12:
+                    value[2] = 1.0
+                null_type_probability[local_group] = value / np.sum(value)
+            soft_typed_null = soft.null_probabilities[:, None] * null_type_probability
+            likelihood_output = np.asarray([
+                weighted_mean(fixed_llr, group_weight),
+                weighted_quantile(fixed_llr, group_weight, 0.10),
+                weighted_quantile(fixed_llr, group_weight, 0.50),
+                weighted_mean(group_log_bf, group_weight),
+                weighted_quantile(group_log_bf, group_weight, 0.10),
+                weighted_quantile(group_log_bf, group_weight, 0.50),
+                weighted_quantile(group_log_bf, group_weight, 0.90),
+                weighted_mean(soft_valid, group_weight),
+                weighted_mean(soft.null_probabilities, group_weight),
+                weighted_mean(soft_typed_null[:, 0], group_weight),
+                weighted_mean(soft_typed_null[:, 1], group_weight),
+                weighted_mean(soft_typed_null[:, 2], group_weight),
+                weighted_mean(soft_typed_null[:, 3], group_weight),
+                weighted_mean(soft.group_entropy, group_weight),
+                weighted_quantile(expected_residual, residual_soft_weight, 0.50),
+                weighted_quantile(expected_residual, residual_soft_weight, 0.90),
+                weighted_mean(soft_cap_valid, group_weight),
+                weighted_mean(soft_cap.group_entropy, group_weight),
+                float(soft_cap.child_capacity_violation),
+                float(soft_cap.primitive_capacity_violation),
+            ], dtype=np.float64)
+            output[pose_row, len(LATENT_FEATURE_NAMES) :] = likelihood_output
     if not np.all(np.isfinite(output)):
         raise ValueError("latent configuration evidence contains non-finite values")
     return output.astype(np.float32)

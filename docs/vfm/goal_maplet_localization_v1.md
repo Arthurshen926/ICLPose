@@ -536,6 +536,109 @@ Because the latent-selection gate fails on Dev48, no SE(3) update or continuous
 refiner is started.  Doing so would again allow a weak assignment to move and
 then validate its own pose.
 
+### G13 — paired pose likelihood and deployment-replay audit
+
+This pass implemented the probability correction requested after G12 instead
+of another configuration-weight sweep.  The map remains the clean exact 2DGS
+hierarchy with one canonical `radio_final` code.  No RGB, RADIO intermediate,
+ALIKE descriptor, SfM track, image matcher or additional downstream map
+embedding was introduced.
+
+#### Two protocol bugs fixed
+
+The old 63k factor sample artifact stored feature rows and class labels but
+dropped query-group, tested-child and candidate-pose identity.  It therefore
+could not train the claimed same-query/same-group density ratio.  Paired v3
+samples now persist image, group, truth/tested child, runtime child rank,
+candidate index, negative family and pose error.  Structured negatives include
+frozen graph Top-1, the closest out-of-basin Top-32 pose, a low-rotation
+translated facade phase, and the highest-probability wrong runtime child.
+
+A second, more consequential mismatch was found during full replay.  Training
+used the oracle-child member centroid as the query coordinate while deployment
+uses the complete query-group centre.  Across 16,384 exact groups this hidden
+offset is 0.82 px median, 16.14 px P90, 24.48 px P95 and 240.59 px maximum.
+Labels still use exact contributor membership, but all factor inputs now use
+the deployment group centre.  The oracle offset is retained only as a
+non-deployment audit column.
+
+The factor direction is fit from symmetric positive-minus-negative differences
+inside the same image/group.  A disjoint trajectory then calibrates its affine
+zero point, yielding
+
+```text
+log p(e | correct) / p(e | structured wrong)
+```
+
+rather than reinterpreting a typed multi-class confidence as additive pose
+evidence.  Runtime uses no GT or absolute world-coordinate feature.  On held
+out seq10 after fixing both deployment gaps, Top-4 pair concordance is 0.749;
+the low-rotation facade and nearest-pose families are 0.739 and 0.664.  26 of
+27 query/candidate-family aggregates rank exact GT over the paired wrong pose.
+
+#### The previously unmeasured Top-C bottleneck
+
+Exact replay also shows that the truth child is absent from the deployment
+option set much more often than the G12 solver assumed:
+
+| child retrieval cutoff | exact group recall |
+|---:|---:|
+| Top-1 | 18.98% |
+| Top-4 | 42.55% |
+| Top-8 | 55.62% |
+| Top-16 | 67.41% |
+| Top-32 | 77.15% |
+| Top-64 | 84.47% |
+| Top-128 | 89.64% |
+
+Thus Top-4 deleted 57.5% of correct physical explanations before factor
+scoring.  Factor positives and wrong-child negatives are now restricted to the
+same runtime Top-C.  Top-16 was selected from this recall/cost curve before
+pose evaluation as the single coverage diagnostic; Top-32/64 were not swept.
+
+#### Soft assignment and configuration gate
+
+G13 adds an entropy-regularized posterior over every fixed child/primitive mode
+plus four explicit null types.  The per-child mode posterior only distributes
+one factor Bayes mass, so geometry is not counted twice.  A soft-capacity
+diagnostic uses projected dual penalties on expected child/primitive occupancy;
+it never hard-deletes an option.  Every query group remains in the denominator.
+
+The local factor gate does not transfer to full Top-32 configuration selection:
+
+| seq12/14 validation policy (17 queries) | translation median / P90 | rotation median / P90 | success <=0.5m/5deg | catastrophic |
+|---|---:|---:|---:|---:|
+| graph proposal | 0.389 / 3.617 m | 1.472 / 9.970 deg | 52.94% | 17.65% |
+| Top-4 legacy valid mass | 0.359 / 1.967 m | 1.384 / 8.703 deg | **64.71%** | **11.76%** |
+| Top-4 paired LLR mean | 0.364 / 7.524 m | 1.384 / 24.116 deg | 58.82% | 17.65% |
+| Top-4 legacy + LLR-median equal-rank fusion | 0.373 / **1.372 m** | 1.265 / **4.692 deg** | **64.71%** | **11.76%** |
+| Top-16 legacy valid mass | 0.364 / 3.700 m | 1.091 / 9.373 deg | **64.71%** | 17.65% |
+| Top-16 paired LLR mean | 0.381 / 3.290 m | **0.971** / 8.487 deg | 58.82% | 17.65% |
+| Top-16 legacy + LLR-median equal-rank fusion | 0.389 / **1.486 m** | 1.321 / 7.129 deg | **64.71%** | **11.76%** |
+
+The predefined equal-rank fusion is scale-free.  On the corrected Top-4
+validation replay it improves the legacy P90 from 1.967 to 1.372 m and rotation
+P90 from 8.703 to 4.692 degrees without changing success or catastrophic rate;
+median regresses by 1.4 cm.  At Top-16 its P90 is 1.486 m, but its median is
+0.389 m.  This is a useful robustness diagnostic, not a promotion: neither
+version improves the three primary accuracy/safety decisions together.
+
+The first-principles conclusion is that two different losses are currently
+being conflated.  Correct-child/exact-group factors can learn pose
+compatibility, while deployment first has to infer region identity from a
+diffuse and repetitive child posterior.  Increasing Top-C restores coverage
+but introduces ambiguity at nearly the same rate.  Independent factor means,
+soft assignment and capacity cannot create the missing cross-group identity
+constraint.  Because the configuration gate still fails, mode-relation,
+continuous SE(3) refinement and Dev48 were deliberately not run in G13.
+
+The next implementation should train a sparse mode-relation factor on full
+deployment option sets: relative query displacement versus projected selected
+primitive displacement, with local, long-range and depth/normal edge types.
+Its gate must be configuration-level trajectory transfer, not exact-factor
+pair accuracy.  Only if it improves both basin selection and tail risk should
+the frozen Top-3 refiner handoff be reopened.
+
 ## Development-set result
 
 The best deployable Goal-Maplet Top-1 remains the frozen graph v9 result, not
@@ -632,8 +735,11 @@ not an unsupported claim that VFM regions directly yield centimetre pose.
 - latent mapping cross-fit pool: `goal_maplet/config_rank_pool_mapping_latent_crossfit_v23.json`
 - latent mapping/Dev audits: `goal_maplet/latent_configuration_mapping_crossfit_v23.json`, `goal_maplet/latent_configuration_dev48_v23.json`
 - bounded safety selector/audit: `goal_maplet/latent_safety_selector_v1.joblib`, `goal_maplet/latent_safety_selector_dev48_v1.json`
+- corrected Top-4 paired factor/audit: `goal_maplet/pose_likelihood_ratio_top4_corrected_v2.joblib`, `goal_maplet/pose_likelihood_ratio_top4_corrected_v2.json`
+- corrected Top-4 validation audit: `goal_maplet/likelihood_configuration_mapping_top4_corrected_validation_v26.json`
+- Top-16 coverage diagnostic: `goal_maplet/pose_likelihood_ratio_top16_v1.json`, `goal_maplet/likelihood_configuration_mapping_top16_validation_v25.json`
 - rejected conditional rank: `goal_maplet/pose_modes_graph_conditionalrank_dev48_v17.json`
 - 4x GT round-trip audit: `goal_maplet/surface_basin_radio_pca256_supersample4_oracle_smoke_gt1round_v4.json`
 
-Focused verification: `43 passed` for `tests/test_goal_maplet_*.py` plus the
+Focused verification: `49 passed` for `tests/test_goal_maplet_*.py` plus the
 exact 2DGS compositing equivalence test.

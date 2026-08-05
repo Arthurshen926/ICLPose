@@ -29,6 +29,7 @@ def main() -> None:
         "feature_names", "maximum_groups", "maximum_children", "child_local_mode_source",
         "evidence_version", "fixed_group_denominator", "one_mode_per_group",
         "typed_null_marginalization", "child_capacity", "primitive_capacity",
+        "pose_likelihood_pairing_contract", "soft_assignment", "soft_capacity",
     )
     for key in semantic_contract_keys:
         if len({json.dumps(item.get(key), sort_keys=True) for item in contracts}) != 1:
@@ -46,6 +47,10 @@ def main() -> None:
         "application_trajectories": application,
         "child_local_factor_calibrator_sha256": sorted({
             str(contract.get("child_local_factor_calibrator_sha256")) for contract in contracts
+        }),
+        "pose_likelihood_ratio_sha256": sorted({
+            str(contract.get("pose_likelihood_ratio_sha256")) for contract in contracts
+            if contract.get("pose_likelihood_ratio_sha256") is not None
         }),
         "factor_training_pool_disjoint": bool(all(
             contract.get("factor_training_pool_disjoint", False) for contract in contracts

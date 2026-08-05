@@ -98,6 +98,7 @@ def main() -> None:
     parser.add_argument("--temperature", type=float, default=0.07)
     parser.add_argument("--maximum_modes", type=int, default=8)
     parser.add_argument("--maximum_groups_per_query", type=int, default=128)
+    parser.add_argument("--runtime_maximum_children", type=int, default=4)
     parser.add_argument("--shard_index", type=int, default=0)
     parser.add_argument("--shard_count", type=int, default=1)
     parser.add_argument("--device", default="cuda")
@@ -130,7 +131,11 @@ def main() -> None:
     local_config = RadioFinalRegionConfig(pool_sizes=(1,), pool_weights=(1.0,))
     paths = sorted(Path(args.contributors).glob("*.npz"))[int(args.shard_index) :: int(args.shard_count)]
     sample_feature, sample_target, sample_image, sample_trajectory = [], [], [], []
-    sample_source = []
+    sample_source, sample_group, sample_child, sample_truth_child, sample_truth_rank = [], [], [], [], []
+    sample_candidate, sample_translation, sample_rotation, sample_xy_offset = [], [], [], []
+    exact_group_count, truth_topc_group_count = 0, 0
+    child_recall_cutoffs = (1, 4, 8, 16, 32, 64, 128)
+    child_recall_count = {cutoff: 0 for cutoff in child_recall_cutoffs}
     for path in paths:
         labels = ContributorLabels.load_npz(path)
         camera = _camera(path)
@@ -197,15 +202,40 @@ def main() -> None:
             continue
         children = np.asarray(child_rows, dtype=np.int64)
         truth = np.asarray(truth_xyz, dtype=np.float64)
-        xy = np.asarray(truth_xy, dtype=np.float64)
+        oracle_xy = np.asarray(truth_xy, dtype=np.float64)
         groups = np.asarray(group_rows, dtype=np.int64)
         if groups.size > int(args.maximum_groups_per_query):
             selected = np.linspace(
                 0, groups.size - 1, int(args.maximum_groups_per_query), dtype=np.int64
             )
-            children, truth, xy, groups = (
-                value[selected] for value in (children, truth, xy, groups)
+            children, truth, oracle_xy, groups = (
+                value[selected] for value in (children, truth, oracle_xy, groups)
             )
+        exact_group_count += int(groups.size)
+        truth_rank = np.full(children.shape, -1, dtype=np.int64)
+        for index, (group, truth_child) in enumerate(zip(groups.tolist(), children.tolist())):
+            runtime_rows = child_posterior.candidate_child_rows[group]
+            slot = np.flatnonzero(runtime_rows == truth_child)
+            if slot.size:
+                truth_rank[index] = int(slot[0])
+        for cutoff in child_recall_cutoffs:
+            child_recall_count[cutoff] += int(np.sum((truth_rank >= 0) & (truth_rank < cutoff)))
+        runtime_available = (truth_rank >= 0) & (
+            truth_rank < int(args.runtime_maximum_children)
+        )
+        truth_topc_group_count += int(np.sum(runtime_available))
+        if not np.any(runtime_available):
+            continue
+        children, truth, oracle_xy, groups, truth_rank = (
+            value[runtime_available]
+            for value in (children, truth, oracle_xy, groups, truth_rank)
+        )
+        # Feature inputs must replay deployment exactly.  Exact contributor
+        # membership supplies the training target only; using its child-only
+        # pixel centroid here would leak an oracle coordinate unavailable at
+        # runtime, where the full query-group centre is used.
+        xy = grouped.xy[groups] * np.asarray([camera.width, camera.height], dtype=np.float64)
+        xy_offset = np.linalg.norm(xy - oracle_xy, axis=1).astype(np.float32)
         descriptor = grouped_local[groups]
         scale = np.maximum(
             0.5 * np.linalg.norm(
@@ -269,6 +299,7 @@ def main() -> None:
         ]
         near_miss_feature = np.zeros((0, gt_feature.shape[1]), dtype=np.float32)
         near_miss_target = np.zeros((0,), dtype=np.int64)
+        bad_index = -1
         if bad_candidates:
             _, bad_index = min(bad_candidates)
             bad_pose = np.asarray(details[bad_index]["pose_w2c"], dtype=np.float64)
@@ -283,26 +314,53 @@ def main() -> None:
             )
             near_miss_target[gt_target == NULL_TYPES.index("field_missing")] = NULL_TYPES.index("field_missing")
 
+        # Repetitive facades often produce a translated phase hypothesis with
+        # a nearly correct orientation.  Keep one such candidate separate
+        # from the closest normalized-error near miss.  The thresholds are the
+        # evaluation basin definition, not a score-dependent hard-negative
+        # mining rule, and the selected index is persisted for exact pairing.
+        phase_candidates = [
+            (float(item["rotation_deg"]), float(item["translation_m"]), index)
+            for index, item in enumerate(details)
+            if index != bad_index
+            and 0.5 < float(item["translation_m"]) <= 3.0
+            and float(item["rotation_deg"]) <= 5.0
+        ]
+        phase_feature = np.zeros((0, gt_feature.shape[1]), dtype=np.float32)
+        phase_target = np.zeros((0,), dtype=np.int64)
+        phase_index = -1
+        if phase_candidates:
+            # Prefer the most orientation-compatible translated hypothesis;
+            # translation breaks ties toward the closest facade phase.
+            _, _, phase_index = min(phase_candidates)
+            phase_pose = np.asarray(details[phase_index]["pose_w2c"], dtype=np.float64)
+            phase_feature, _, _ = _factor_features(
+                descriptor, children, xy, scale, phase_pose, camera, physical, field,
+                p_parent, p_child, p_null,
+                temperature=float(args.temperature), maximum_modes=int(args.maximum_modes),
+                likelihood=gt_likelihood,
+            )
+            phase_target = np.full(
+                children.shape, NULL_TYPES.index("pose_incompatible"), dtype=np.int64
+            )
+            phase_target[gt_target == NULL_TYPES.index("field_missing")] = NULL_TYPES.index("field_missing")
+
         # Hard wrong children come from the actual retrieval posterior.  This
         # is the missing negative branch in v1, not a random easy negative.
         wrong = np.full(children.shape, -1, dtype=np.int64)
         wrong_probability = np.zeros(children.shape, dtype=np.float64)
         for index, (group, truth_child) in enumerate(zip(groups.tolist(), children.tolist())):
-            rows = child_posterior.candidate_child_rows[group]
-            probabilities = child_posterior.candidate_probabilities[group]
+            rows = child_posterior.candidate_child_rows[
+                group, : int(args.runtime_maximum_children)
+            ]
+            probabilities = child_posterior.candidate_probabilities[
+                group, : int(args.runtime_maximum_children)
+            ]
             valid = (rows >= 0) & (rows != truth_child)
             if np.any(valid):
                 slots = np.flatnonzero(valid)
                 slot = int(slots[np.argmax(probabilities[slots])])
                 wrong[index], wrong_probability[index] = int(rows[slot]), float(probabilities[slot])
-            else:
-                siblings = np.flatnonzero(
-                    (physical.child_parent_rows == physical.child_parent_rows[truth_child])
-                    & (np.arange(physical.child_parent_rows.size) != truth_child)
-                    & eligibility.retrieval_qualified
-                )
-                if siblings.size:
-                    wrong[index] = int(siblings[0])
         keep_wrong = wrong >= 0
         if np.any(keep_wrong):
             wrong_parent_rows = physical.child_parent_rows[wrong[keep_wrong]]
@@ -320,23 +378,71 @@ def main() -> None:
         else:
             wrong_feature = np.zeros((0, gt_feature.shape[1]), dtype=np.float32)
 
-        feature_parts = [gt_feature, proposal_feature, near_miss_feature, wrong_feature]
+        feature_parts = [gt_feature, proposal_feature, near_miss_feature, phase_feature, wrong_feature]
         target_parts = [
             gt_target,
             proposal_target,
             near_miss_target,
+            phase_target,
             np.full((wrong_feature.shape[0],), NULL_TYPES.index("wrong_child"), dtype=np.int64),
         ]
         source_parts = [
             np.full(children.shape, "exact_gt_pose", dtype="U32"),
             np.full(children.shape, "frozen_graph_top1", dtype="U32"),
             np.full((near_miss_feature.shape[0],), "top32_near_miss_pose", dtype="U32"),
+            np.full((phase_feature.shape[0],), "top32_low_rotation_phase_pose", dtype="U32"),
             np.full((wrong_feature.shape[0],), "retrieved_hard_wrong_child", dtype="U32"),
         ]
-        for feature_part, target_part, source_part in zip(feature_parts, target_parts, source_parts):
+        group_parts = [groups, groups, groups[: near_miss_feature.shape[0]], groups[: phase_feature.shape[0]], groups[keep_wrong]]
+        child_parts = [children, children, children[: near_miss_feature.shape[0]], children[: phase_feature.shape[0]], wrong[keep_wrong]]
+        truth_child_parts = [children, children, children[: near_miss_feature.shape[0]], children[: phase_feature.shape[0]], children[keep_wrong]]
+        truth_rank_parts = [truth_rank, truth_rank, truth_rank[: near_miss_feature.shape[0]], truth_rank[: phase_feature.shape[0]], truth_rank[keep_wrong]]
+        candidate_parts = [
+            np.full(children.shape, -1, dtype=np.int64),
+            np.full(children.shape, proposal_index, dtype=np.int64),
+            np.full((near_miss_feature.shape[0],), bad_index, dtype=np.int64),
+            np.full((phase_feature.shape[0],), phase_index, dtype=np.int64),
+            np.full((wrong_feature.shape[0],), -1, dtype=np.int64),
+        ]
+        translation_parts = [
+            np.zeros(children.shape, dtype=np.float32),
+            np.full(children.shape, float(detail["translation_m"]), dtype=np.float32),
+            np.full((near_miss_feature.shape[0],), float(details[bad_index]["translation_m"]) if bad_index >= 0 else 0.0, dtype=np.float32),
+            np.full((phase_feature.shape[0],), float(details[phase_index]["translation_m"]) if phase_index >= 0 else 0.0, dtype=np.float32),
+            np.zeros((wrong_feature.shape[0],), dtype=np.float32),
+        ]
+        rotation_parts = [
+            np.zeros(children.shape, dtype=np.float32),
+            np.full(children.shape, float(detail["rotation_deg"]), dtype=np.float32),
+            np.full((near_miss_feature.shape[0],), float(details[bad_index]["rotation_deg"]) if bad_index >= 0 else 0.0, dtype=np.float32),
+            np.full((phase_feature.shape[0],), float(details[phase_index]["rotation_deg"]) if phase_index >= 0 else 0.0, dtype=np.float32),
+            np.zeros((wrong_feature.shape[0],), dtype=np.float32),
+        ]
+        xy_offset_parts = [
+            xy_offset, xy_offset,
+            xy_offset[: near_miss_feature.shape[0]],
+            xy_offset[: phase_feature.shape[0]],
+            xy_offset[keep_wrong],
+        ]
+        for (
+            feature_part, target_part, source_part, group_part, child_part,
+            truth_child_part, truth_rank_part, candidate_part, translation_part, rotation_part, xy_offset_part,
+        ) in zip(
+            feature_parts, target_parts, source_parts, group_parts, child_parts,
+            truth_child_parts, truth_rank_parts, candidate_parts, translation_parts,
+            rotation_parts, xy_offset_parts,
+        ):
             sample_feature.append(feature_part)
             sample_target.append(target_part)
             sample_source.append(source_part)
+            sample_group.append(group_part)
+            sample_child.append(child_part)
+            sample_truth_child.append(truth_child_part)
+            sample_truth_rank.append(truth_rank_part)
+            sample_candidate.append(candidate_part)
+            sample_translation.append(translation_part)
+            sample_rotation.append(rotation_part)
+            sample_xy_offset.append(xy_offset_part)
             sample_image.extend([image_id] * feature_part.shape[0])
             sample_trajectory.extend([image_id.split("/", 1)[0]] * feature_part.shape[0])
         print(json.dumps({
@@ -350,7 +456,7 @@ def main() -> None:
     target = np.concatenate(sample_target, axis=0).astype(np.int64)
     source = np.concatenate(sample_source, axis=0)
     metadata = {
-        "artifact_type": "goal_maplet_child_local_factor_samples_v2",
+        "artifact_type": "goal_maplet_child_local_factor_samples_v3",
         "physical_map_sha256": physical.content_sha256,
         "canonical_field_sha256": field.content_sha256,
         "field_feature_contract_sha256": contract.content_sha256,
@@ -359,6 +465,22 @@ def main() -> None:
         "null_types": list(NULL_TYPES),
         "temperature": float(args.temperature), "maximum_modes": int(args.maximum_modes),
         "maximum_groups_per_query": int(args.maximum_groups_per_query),
+        "runtime_maximum_children": int(args.runtime_maximum_children),
+        "exact_group_count": int(exact_group_count),
+        "truth_child_runtime_topc_group_count": int(truth_topc_group_count),
+        "truth_child_runtime_topc_fraction": float(
+            truth_topc_group_count / max(exact_group_count, 1)
+        ),
+        "truth_child_retrieval_recall": {
+            f"top{cutoff}": float(child_recall_count[cutoff] / max(exact_group_count, 1))
+            for cutoff in child_recall_cutoffs
+        },
+        "pairing_contract": "same_image_same_query_group_exact_v1",
+        "feature_input_contract": "deployment_query_group_center_v1",
+        "structured_negative_families": [
+            "frozen_graph_top1", "top32_near_miss_pose",
+            "top32_low_rotation_phase_pose", "retrieved_hard_wrong_child",
+        ],
         "uses_gt_only_for_training_target": True, "deployment_artifact": False,
         "stores_mapping_rgb": False, "stores_mapping_image_paths": False,
         "stores_mapping_image_ids": True, "stored_downstream_embedding_count": 0,
@@ -367,7 +489,16 @@ def main() -> None:
     np.savez_compressed(
         output, features=feature, targets=target,
         image_ids=np.asarray(sample_image), trajectories=np.asarray(sample_trajectory),
-        source_types=source, metadata_json=np.asarray(json.dumps(metadata, sort_keys=True)),
+        source_types=source,
+        group_rows=np.concatenate(sample_group, axis=0).astype(np.int64),
+        child_rows=np.concatenate(sample_child, axis=0).astype(np.int64),
+        truth_child_rows=np.concatenate(sample_truth_child, axis=0).astype(np.int64),
+        truth_child_runtime_ranks=np.concatenate(sample_truth_rank, axis=0).astype(np.int64),
+        candidate_indices=np.concatenate(sample_candidate, axis=0).astype(np.int64),
+        pose_translation_m=np.concatenate(sample_translation, axis=0).astype(np.float32),
+        pose_rotation_deg=np.concatenate(sample_rotation, axis=0).astype(np.float32),
+        oracle_child_center_offset_px=np.concatenate(sample_xy_offset, axis=0).astype(np.float32),
+        metadata_json=np.asarray(json.dumps(metadata, sort_keys=True)),
     )
     print(json.dumps({
         "output": str(output), "sample_count": int(feature.shape[0]),

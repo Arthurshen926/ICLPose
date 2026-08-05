@@ -36,6 +36,28 @@ class LatentAssignment:
                 raise ValueError("latent assignment arrays differ")
 
 
+@dataclass(frozen=True)
+class SoftLatentAssignment:
+    """Entropy-regularized posterior over fixed options plus typed null."""
+
+    option_probabilities: np.ndarray
+    null_probabilities: np.ndarray
+    group_entropy: np.ndarray
+    adjusted_option_scores: np.ndarray
+    child_capacity_violation: float
+    primitive_capacity_violation: float
+
+    def __post_init__(self) -> None:
+        option = np.asarray(self.option_probabilities, dtype=np.float64).reshape(-1)
+        adjusted = np.asarray(self.adjusted_option_scores, dtype=np.float64).reshape(-1)
+        null = np.asarray(self.null_probabilities, dtype=np.float64).reshape(-1)
+        entropy = np.asarray(self.group_entropy, dtype=np.float64).reshape(-1)
+        if option.shape != adjusted.shape or null.shape != entropy.shape:
+            raise ValueError("soft latent assignment arrays differ")
+        if np.any(option < 0.0) or np.any(null < 0.0):
+            raise ValueError("soft latent probabilities are invalid")
+
+
 def correlated_support_clusters(
     xy_px: np.ndarray,
     extent_px: np.ndarray,
@@ -98,6 +120,145 @@ def effective_group_weights(cluster_rows: np.ndarray) -> np.ndarray:
         raise ValueError("invalid correlated support cluster")
     count = np.bincount(cluster, minlength=int(np.max(cluster)) + 1) if cluster.size else np.zeros(0)
     return (1.0 / np.maximum(count[cluster], 1)).astype(np.float64)
+
+
+def _softmax_with_null(
+    group_count: int,
+    option_group_rows: np.ndarray,
+    option_scores: np.ndarray,
+    *,
+    temperature: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    group = np.asarray(option_group_rows, dtype=np.int64).reshape(-1)
+    score = np.asarray(option_scores, dtype=np.float64).reshape(-1)
+    if group.shape != score.shape or np.any((group < 0) | (group >= int(group_count))):
+        raise ValueError("invalid soft latent options")
+    tau = max(float(temperature), 1e-4)
+    logits = score / tau
+    maximum = np.zeros((int(group_count),), dtype=np.float64)
+    np.maximum.at(maximum, group, logits)
+    exponential = np.exp(np.clip(logits - maximum[group], -60.0, 0.0))
+    null_exponential = np.exp(np.clip(-maximum, -60.0, 0.0))
+    denominator = np.bincount(
+        group, weights=exponential, minlength=int(group_count),
+    ).astype(np.float64, copy=False)
+    denominator += null_exponential
+    probability = exponential / denominator[group]
+    null = null_exponential / denominator
+    entropy = -np.bincount(
+        group,
+        weights=probability * np.log(np.maximum(probability, 1e-12)),
+        minlength=int(group_count),
+    ).astype(np.float64, copy=False)
+    entropy -= null * np.log(np.maximum(null, 1e-12))
+    option_count = np.bincount(group, minlength=int(group_count))
+    entropy /= np.where(option_count > 0, np.log(option_count + 1), 1.0)
+    return probability, null, entropy
+
+
+def soft_assignment(
+    *,
+    group_count: int,
+    option_group_rows: np.ndarray,
+    option_child_rows: np.ndarray,
+    option_primitive_rows: np.ndarray,
+    option_scores: np.ndarray,
+    temperature: float = 1.0,
+) -> SoftLatentAssignment:
+    """Exact independent entropy-regularized assignment with explicit null."""
+
+    group = np.asarray(option_group_rows, dtype=np.int64).reshape(-1)
+    child = np.asarray(option_child_rows, dtype=np.int64).reshape(-1)
+    primitive = np.asarray(option_primitive_rows, dtype=np.int64).reshape(-1)
+    score = np.asarray(option_scores, dtype=np.float64).reshape(-1)
+    if not all(value.shape == group.shape for value in (child, primitive, score)):
+        raise ValueError("soft latent option arrays differ")
+    probability, null, entropy = _softmax_with_null(
+        int(group_count), group, score, temperature=float(temperature),
+    )
+    return SoftLatentAssignment(
+        option_probabilities=probability,
+        null_probabilities=null,
+        group_entropy=entropy,
+        adjusted_option_scores=score.copy(),
+        child_capacity_violation=0.0,
+        primitive_capacity_violation=0.0,
+    )
+
+
+def soft_capacitated_assignment(
+    *,
+    group_count: int,
+    option_group_rows: np.ndarray,
+    option_child_rows: np.ndarray,
+    option_primitive_rows: np.ndarray,
+    option_scores: np.ndarray,
+    group_weights: np.ndarray,
+    child_capacities: Mapping[int, int],
+    temperature: float = 1.0,
+    iterations: int = 40,
+    dual_step: float = 0.25,
+) -> SoftLatentAssignment:
+    """Soft capacity through projected dual updates, never hard deletion.
+
+    Capacity acts on expected independent-support mass.  Null is always
+    feasible and has fixed log score zero.  This is deliberately a diagnostic
+    relaxation: it cannot manufacture new feature modes or update the pose.
+    """
+
+    group = np.asarray(option_group_rows, dtype=np.int64).reshape(-1)
+    child = np.asarray(option_child_rows, dtype=np.int64).reshape(-1)
+    primitive = np.asarray(option_primitive_rows, dtype=np.int64).reshape(-1)
+    raw_score = np.asarray(option_scores, dtype=np.float64).reshape(-1)
+    weight = np.asarray(group_weights, dtype=np.float64).reshape(-1)
+    if not all(value.shape == group.shape for value in (child, primitive, raw_score)):
+        raise ValueError("soft capacity option arrays differ")
+    if weight.shape != (int(group_count),) or np.any(weight <= 0.0):
+        raise ValueError("soft capacity group weights differ")
+    unique_child, child_inverse = np.unique(child, return_inverse=True)
+    unique_primitive, primitive_inverse = np.unique(primitive, return_inverse=True)
+    child_dual = np.zeros(unique_child.shape, dtype=np.float64)
+    primitive_dual = np.zeros(unique_primitive.shape, dtype=np.float64)
+    child_capacity = np.asarray([
+        max(float(child_capacities.get(int(value), 1)), 1.0)
+        for value in unique_child.tolist()
+    ], dtype=np.float64)
+    adjusted = raw_score.copy()
+    for iteration in range(max(int(iterations), 1)):
+        adjusted = raw_score - child_dual[child_inverse] - primitive_dual[primitive_inverse]
+        probability, _, _ = _softmax_with_null(
+            int(group_count), group, adjusted, temperature=float(temperature),
+        )
+        option_mass = probability * weight[group]
+        step = float(dual_step) / np.sqrt(iteration + 1.0)
+        child_occupancy = np.bincount(
+            child_inverse, weights=option_mass, minlength=unique_child.size,
+        )
+        primitive_occupancy = np.bincount(
+            primitive_inverse, weights=option_mass, minlength=unique_primitive.size,
+        )
+        child_dual = np.maximum(child_dual + step * (child_occupancy - child_capacity), 0.0)
+        primitive_dual = np.maximum(primitive_dual + step * (primitive_occupancy - 1.0), 0.0)
+    probability, null, entropy = _softmax_with_null(
+        int(group_count), group, adjusted, temperature=float(temperature),
+    )
+    option_mass = probability * weight[group]
+    child_occupancy = np.bincount(
+        child_inverse, weights=option_mass, minlength=unique_child.size,
+    )
+    primitive_occupancy = np.bincount(
+        primitive_inverse, weights=option_mass, minlength=unique_primitive.size,
+    )
+    child_violation = float(np.sum(np.maximum(child_occupancy - child_capacity, 0.0)))
+    primitive_violation = float(np.sum(np.maximum(primitive_occupancy - 1.0, 0.0)))
+    return SoftLatentAssignment(
+        option_probabilities=probability,
+        null_probabilities=null,
+        group_entropy=entropy,
+        adjusted_option_scores=adjusted,
+        child_capacity_violation=float(child_violation),
+        primitive_capacity_violation=float(primitive_violation),
+    )
 
 
 def independent_assignment(
