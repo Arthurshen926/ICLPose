@@ -34,6 +34,8 @@ def main() -> None:
         "mode_relation_option_contract", "mode_relation_feature_names",
         "mode_relation_inference", "mode_relation_shortlist",
         "mode_relation_pose_evidence", "mode_relation_decode", "mode_relation_verification",
+        "mode_relation_support_decorrelation", "mode_relation_probability_mass",
+        "mode_relation_null_evidence",
     )
     for key in semantic_contract_keys:
         if len({json.dumps(item.get(key), sort_keys=True) for item in contracts}) != 1:

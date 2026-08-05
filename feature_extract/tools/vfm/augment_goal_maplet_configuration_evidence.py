@@ -28,8 +28,17 @@ from feature_extract.vfm.localization_goal_maplet.pose_likelihood_ratio import P
 from feature_extract.vfm.localization_goal_maplet.mode_relation import (
     RELATION_EVIDENCE_NAMES,
     ModeRelationLikelihoodRatioArtifact,
+    family_preserving_child_shortlist,
     configuration_mode_relation_evidence,
 )
+from feature_extract.vfm.localization_goal_maplet.child_local_likelihood import (
+    predict_child_local_surface_likelihood,
+)
+from feature_extract.vfm.localization_goal_maplet.child_local_mode_ranker import (
+    child_local_mode_runtime_features,
+)
+from feature_extract.vfm.localization_goal_maplet.oracle_pose import token_oracle_evidence
+from feature_extract.vfm.localization_goal_maplet.pfir import ContributorLabels
 from feature_extract.vfm.localization_goal_maplet.query_support import (
     aggregate_group_descriptors,
     aggregate_group_posteriors,
@@ -51,6 +60,193 @@ def _camera(path: Path) -> ColmapCamera:
             width=int(data["camera_width"]), height=int(data["camera_height"]),
             params=tuple(np.asarray(data["camera_params"], dtype=np.float64).tolist()),
         )
+
+
+def _offline_truth_coverage_ladder(
+    *,
+    contributor_path: Path,
+    camera: ColmapCamera,
+    token_xy: np.ndarray,
+    token_height: int,
+    token_width: int,
+    grouped,
+    grouped_local: np.ndarray,
+    child_posterior,
+    physical: GoalMapletPhysicalMap,
+    field: CanonicalSurfaceField,
+    eligibility: ChildGeometryEligibility,
+    relation,
+    runtime_maximum_children: int,
+    maximum_modes: int = 8,
+    shortlist_modes_per_child: int = 2,
+    temperature: float = 0.07,
+) -> dict[str, object]:
+    """Report the GT endpoint funnel without exposing GT to runtime scores."""
+
+    labels = ContributorLabels.load_npz(contributor_path)
+    oracle = token_oracle_evidence(
+        labels, physical, token_xy,
+        token_height=int(token_height), token_width=int(token_width),
+        image_height=int(camera.height), image_width=int(camera.width), camera=camera,
+    )
+    selected_groups = np.asarray(
+        (relation.query_diagnostics or {}).get("selected_group_rows", ()), dtype=np.int64,
+    )
+    stage_names = (
+        "truth_child_top16", "truth_child_parent_quota_top2",
+        "truth_child_family_top8", "truth_primitive_top8",
+        "truth_primitive_relation_top2", "endpoint_pose_valid",
+    )
+    if selected_groups.size == 0:
+        return {
+            "offline_gt_only": True, "observable_group_count": 0,
+            **{name: {"count": 0, "fraction": 0.0} for name in stage_names},
+            "pair_both_endpoints_valid": {"count": 0, "fraction": 0.0},
+        }
+    runtime_child = np.asarray(
+        child_posterior.candidate_child_rows[
+            selected_groups, : int(runtime_maximum_children)
+        ], dtype=np.int64,
+    )
+    runtime_probability = np.asarray(
+        child_posterior.candidate_probabilities[
+            selected_groups, : int(runtime_maximum_children)
+        ], dtype=np.float64,
+    )
+    shortlist = family_preserving_child_shortlist(
+        runtime_child, runtime_probability, physical,
+        maximum_children=8, maximum_per_parent=2,
+    )
+    shortlist &= runtime_child >= 0
+    shortlist &= eligibility.proposal_qualified[np.maximum(runtime_child, 0)]
+
+    truth_child, truth_xyz, truth_local_group = [], [], []
+    for local_group, group in enumerate(selected_groups.tolist()):
+        members = grouped.member_token_indices[
+            int(grouped.member_offsets[group]) : int(grouped.member_offsets[group + 1])
+        ]
+        members = members[oracle.child_rows[members] >= 0]
+        if members.size == 0:
+            continue
+        mass: dict[int, float] = {}
+        for token in members.tolist():
+            value = int(oracle.child_rows[token])
+            mass[value] = mass.get(value, 0.0) + float(oracle.child_mass[token])
+        child = min(mass, key=lambda value: (-mass[value], value))
+        owned = members[oracle.child_rows[members] == child]
+        weight = np.asarray(oracle.child_mass[owned], dtype=np.float64)
+        if float(np.sum(weight)) <= 0.0:
+            continue
+        truth_child.append(int(child))
+        truth_xyz.append(np.average(oracle.child_local_xyz[owned], axis=0, weights=weight))
+        truth_local_group.append(int(local_group))
+    count = len(truth_child)
+    if count == 0:
+        return {
+            "offline_gt_only": True, "observable_group_count": 0,
+            **{name: {"count": 0, "fraction": 0.0} for name in stage_names},
+            "pair_both_endpoints_valid": {"count": 0, "fraction": 0.0},
+        }
+    truth_child = np.asarray(truth_child, dtype=np.int64)
+    truth_xyz = np.asarray(truth_xyz, dtype=np.float64)
+    truth_local_group = np.asarray(truth_local_group, dtype=np.int64)
+    rows = runtime_child[truth_local_group]
+    top16 = np.any(rows == truth_child[:, None], axis=1)
+    family = np.any((rows == truth_child[:, None]) & shortlist[truth_local_group], axis=1)
+    parent_quota = np.zeros((count,), dtype=bool)
+    for index, (local_group, child) in enumerate(zip(truth_local_group.tolist(), truth_child.tolist())):
+        parent = int(physical.child_parent_rows[child])
+        same_parent = (
+            (rows[index] >= 0)
+            & (physical.child_parent_rows[np.maximum(rows[index], 0)] == parent)
+            & eligibility.proposal_qualified[np.maximum(rows[index], 0)]
+        )
+        ranked = rows[index][same_parent][:2]
+        parent_quota[index] = bool(np.any(ranked == child))
+
+    likelihood = predict_child_local_surface_likelihood(
+        grouped_local[selected_groups[truth_local_group]], truth_child, physical, field,
+        temperature=float(temperature), maximum_modes=int(maximum_modes),
+    )
+    mode_rows = np.asarray(likelihood.mode_primitive_rows, dtype=np.int64)
+    actual_primitive = np.full((count,), -1, dtype=np.int64)
+    for index, child in enumerate(truth_child.tolist()):
+        start, end = int(physical.child_member_offsets[child]), int(physical.child_member_offsets[child + 1])
+        members = physical.child_member_primitive_rows[start:end]
+        if members.size:
+            actual_primitive[index] = int(members[np.argmin(
+                np.linalg.norm(physical.primitive_centers[members] - truth_xyz[index], axis=1)
+            )])
+    top8 = np.any(mode_rows == actual_primitive[:, None], axis=1)
+    top2 = np.any(
+        mode_rows[:, : int(shortlist_modes_per_child)] == actual_primitive[:, None], axis=1,
+    )
+    scale_px = np.maximum(
+        0.5 * np.linalg.norm(
+            grouped.extent[selected_groups[truth_local_group]]
+            * np.asarray([camera.width, camera.height], dtype=np.float64),
+            axis=1,
+        ),
+        8.0,
+    )
+    xy_px = grouped.xy[selected_groups[truth_local_group]] * np.asarray(
+        [camera.width, camera.height], dtype=np.float64,
+    )
+    _, mode_valid = child_local_mode_runtime_features(
+        likelihood, truth_child, xy_px, scale_px, labels.pose_w2c,
+        camera, physical, field,
+    )
+    endpoint_valid = np.zeros((count,), dtype=bool)
+    for index in range(count):
+        slots = np.flatnonzero(mode_rows[index] == actual_primitive[index])
+        if slots.size:
+            endpoint_valid[index] = bool(
+                slots[0] < int(shortlist_modes_per_child) and mode_valid[index, slots[0]]
+            )
+    stages = {
+        "truth_child_top16": top16,
+        "truth_child_parent_quota_top2": top16 & parent_quota,
+        "truth_child_family_top8": top16 & family,
+        "truth_primitive_top8": top16 & family & top8,
+        "truth_primitive_relation_top2": top16 & family & top2,
+        "endpoint_pose_valid": top16 & family & top2 & endpoint_valid,
+    }
+    endpoint_by_group = np.zeros((selected_groups.size,), dtype=bool)
+    endpoint_by_group[truth_local_group] = stages["endpoint_pose_valid"]
+    edge_left = np.concatenate([
+        relation.relation_edges.fit_left, relation.relation_edges.verify_left,
+    ])
+    edge_right = np.concatenate([
+        relation.relation_edges.fit_right, relation.relation_edges.verify_right,
+    ])
+    edge_family = np.concatenate([
+        relation.relation_edges.fit_family, relation.relation_edges.verify_family,
+    ])
+    both = endpoint_by_group[edge_left] & endpoint_by_group[edge_right]
+    output: dict[str, object] = {
+        "offline_gt_only": True,
+        "excluded_from_runtime_score": True,
+        "observable_group_count": int(count),
+    }
+    previous = np.ones((count,), dtype=bool)
+    for name in stage_names:
+        value = stages[name]
+        output[name] = {
+            "count": int(np.sum(value)),
+            "fraction": float(np.mean(value)),
+            "conditional_survival": float(np.sum(value) / max(int(np.sum(previous)), 1)),
+        }
+        previous = value
+    output["pair_both_endpoints_valid"] = {
+        "count": int(np.sum(both)), "edge_count": int(both.size),
+        "fraction": float(np.mean(both)) if both.size else 0.0,
+        "by_family": {
+            name: float(np.mean(both[edge_family == family]))
+            if np.any(edge_family == family) else 0.0
+            for family, name in enumerate(("local", "long_range", "depth_normal"))
+        },
+    }
+    return output
 
 
 def main() -> None:
@@ -235,11 +431,11 @@ def main() -> None:
                 maximum_groups=int(args.maximum_groups),
                 retrieval_maximum_children=int(args.maximum_children),
             )
-            updated["ranking_diagnostics"][MODE]["mode_relation_evidence_v1"] = {
+            updated["ranking_diagnostics"][MODE]["mode_relation_evidence_v2"] = {
                 name: relation.features[:, index].tolist()
                 for index, name in enumerate(RELATION_EVIDENCE_NAMES)
             }
-            updated["ranking_diagnostics"][MODE]["mode_relation_assignments_v1"] = {
+            updated["ranking_diagnostics"][MODE]["mode_relation_assignments_v2"] = {
                 "selected_child_rows": relation.selected_child_rows.tolist(),
                 "selected_primitive_rows": relation.selected_primitive_rows.tolist(),
                 "fit_edges": np.stack([
@@ -252,6 +448,39 @@ def main() -> None:
                     relation.relation_edges.verify_right,
                     relation.relation_edges.verify_family,
                 ], axis=1).tolist() if relation.relation_edges.verify_left.size else [],
+                "representative_group_rows": relation.relation_edges.representative_groups.tolist(),
+                "support_cluster_rows": relation.relation_edges.support_cluster_rows.tolist(),
+                "legacy_connected_cluster_rows": relation.relation_edges.legacy_connected_cluster_rows.tolist(),
+                "query_diagnostics": dict(relation.query_diagnostics or {}),
+            }
+            updated["ranking_diagnostics"][MODE]["mode_relation_endpoint_coverage_v2"] = (
+                _offline_truth_coverage_ladder(
+                    contributor_path=path, camera=camera, token_xy=token_xy,
+                    token_height=int(raw.shape[1]), token_width=int(raw.shape[2]),
+                    grouped=grouped, grouped_local=grouped_local,
+                    child_posterior=child, physical=physical, field=field,
+                    eligibility=eligibility, relation=relation,
+                    runtime_maximum_children=int(args.maximum_children),
+                )
+            )
+            # One exact-GT replay is an offline probability-semantics audit;
+            # its values are stored separately and never enter candidate
+            # ranking or deployment state.
+            gt_pose = ContributorLabels.load_npz(path).pose_w2c
+            gt_relation = configuration_mode_relation_evidence(
+                np.asarray(gt_pose, dtype=np.float64)[None], grouped_local, xy, extent, scale,
+                group_parent_ids, group_parent_probability, group_parent_null,
+                child, physical, field, eligibility, likelihood_ratio, relation_ratio, camera,
+                maximum_groups=int(args.maximum_groups),
+                retrieval_maximum_children=int(args.maximum_children),
+            )
+            updated["ranking_diagnostics"][MODE]["mode_relation_gt_pose_evidence_v2"] = {
+                "offline_gt_only": True,
+                "excluded_from_runtime_score": True,
+                **{
+                    name: float(gt_relation.features[0, index])
+                    for index, name in enumerate(RELATION_EVIDENCE_NAMES)
+                },
             }
         rows.append(updated)
         print(json.dumps({"image_id": image_id, "candidate_count": int(poses.shape[0])}), flush=True)
@@ -278,11 +507,14 @@ def main() -> None:
             "mode_relation_edge_contract": relation_ratio.metadata.get("edge_contract") if relation_ratio is not None else None,
             "mode_relation_option_contract": relation_ratio.metadata.get("option_contract") if relation_ratio is not None else None,
             "mode_relation_feature_names": list(RELATION_EVIDENCE_NAMES) if relation_ratio is not None else None,
-            "mode_relation_inference": "exact_max_sum_fit_tree_disjoint_heldout_verification" if relation_ratio is not None else None,
-            "mode_relation_pose_evidence": "exact_sum_product_log_partition_fixed_denominator" if relation_ratio is not None else None,
+            "mode_relation_inference": "mass_conserving_exact_sum_product_fit_tree_pairwise_heldout_v2" if relation_ratio is not None else None,
+            "mode_relation_pose_evidence": "node_log_evidence_plus_fit_incremental_llr_common_state_measure_v2" if relation_ratio is not None else None,
             "mode_relation_decode": "exact_max_sum" if relation_ratio is not None else None,
-            "mode_relation_verification": "endpoint_valid_conditional_predictive_llr_with_separate_null_mass" if relation_ratio is not None else None,
-            "mode_relation_shortlist": "runtime_top16_family_preserving_8x2_top2_modes" if relation_ratio is not None else None,
+            "mode_relation_verification": "exact_fit_tree_pair_marginal_unconditional_predictive_llr_v2" if relation_ratio is not None else None,
+            "mode_relation_shortlist": "runtime_top16_family_preserving_8x2_top2_modes_with_omitted_mass" if relation_ratio is not None else None,
+            "mode_relation_support_decorrelation": "g12_complete_link_query_quality_medoid_v2" if relation_ratio is not None else None,
+            "mode_relation_probability_mass": "non_null_plus_retrieval_child_mode_geometry_field_typed_null_equals_one" if relation_ratio is not None else None,
+            "mode_relation_null_evidence": "fixed_physical_invalid_llr_query_uncertainty_neutral_v2" if relation_ratio is not None else None,
             "child_local_factor_calibrator_sha256": file_sha256(Path(args.child_local_factor_calibrator)),
             "application_trajectories": sorted(application_trajectories),
             "factor_training_pool_disjoint": not training_pool_reuse,

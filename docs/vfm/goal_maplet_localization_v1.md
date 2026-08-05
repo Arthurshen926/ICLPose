@@ -744,6 +744,96 @@ The next method change must raise and calibrate endpoint-valid mass or generate
 relation-supported proposal families; forcing a non-null decode or tuning the
 null prior would merely hide the unresolved identity uncertainty.
 
+### G15 — relation probability semantics v2
+
+G15 changes the probability definition without changing the clean 2DGS map,
+the single canonical RADIO-final field, the frozen Top-32 pose pool, or either
+learned LLR model.  It implements the five correctness fixes identified after
+G14:
+
+1. relation supports reuse the G12 complete-link overlap clusters; the
+   representative is a query-only highest-quality support with a medoid
+   tie-break rather than the first raster-order member;
+2. retrieval null, omitted child, omitted mode, geometry-invalid and
+   field-missing mass are explicit states, and together with all non-null
+   child/mode states sum to one;
+3. every state is scored as log prior plus likelihood-ratio evidence in one
+   coordinate system rather than comparing conditional non-null logits with a
+   unit null score;
+4. a held-out endpoint pair uses its exact joint marginal along the fit tree,
+   not the product of two node marginals;
+5. physical invalidity has a frozen conservative likelihood loss, while query
+   retrieval/shortlist uncertainty remains neutral.  A wrong pose can no
+   longer delete an endpoint and receive the same pair score as an ordinary
+   query-null event.
+
+The state normalizer is numerically closed: the maximum residual over every
+candidate in validation and Dev48 is `4.44e-16`.  A brute-force unit test also
+checks non-adjacent pair marginals, and a tree-potential reparameterization
+test leaves both the log partition and endpoint joint unchanged.
+
+The overlap bug was much larger than expected.  Across seq12/14, complete-link
+keeps 47.94 relation nodes per query versus 10.12 under the retired connected
+components, restoring 643 nodes in 17 queries.  Dev48 keeps 45.71 versus
+10.23, restoring 1,703 nodes.  Thus G14 had silently collapsed most of the
+query relation graph through transitive overlap chains.
+
+The newly fixed GT coverage ladder localizes the remaining probability loss:
+
+| offline endpoint stage | seq12/14 validation | Dev48 |
+|---|---:|---:|
+| truth child in runtime Top-16 | 82.73% | 83.35% |
+| survives per-parent Top-2 quota | 54.02% | 48.99% |
+| survives final family Top-8 | 53.21% | 48.61% |
+| truth primitive in VFM Top-8 | 42.57% | 39.05% |
+| truth primitive in relation Top-2 | 22.89% | 20.37% |
+| endpoint pose-valid | 21.69% | 20.37% |
+| relation edge has two valid GT endpoints | 5.08% | 2.45% |
+
+Visibility is not the main late-stage loss: almost every Top-2 truth primitive
+is pose-valid.  The dominant losses are the parent-family quota and then the
+fixed Top-2 local-mode truncation.  The probability audit agrees.  Mean prior
+retrieval-null mass is 59.68%/59.25% and child-omitted mass is 24.27%/26.85%
+on validation/Dev48.  Median posterior non-null mass over candidates is only
+2.64%/3.32%; exact-GT medians are 4.27%/3.65%, barely above phase near misses
+at 3.97%/3.57%.  Exact Max-Sum therefore still selects all-null for every
+query.  This is now a trustworthy model failure, not the G14 coordinate bug.
+
+The predefined v2 score is the sum of node, fit-tree incremental and exact
+held-out predictive LLR evidence.  Its frozen-pool results are:
+
+| policy | validation translation median/P90 | validation success/catastrophic | Dev48 translation median/P90 | Dev48 success/catastrophic |
+|---|---:|---:|---:|---:|
+| G13 equal-rank | 0.389 / 1.486 m | 64.71% / 11.76% | 0.638 / 1.711 m | 43.75% / 6.25% |
+| G14 research relation | 0.210 / 3.335 m | 70.59% / 17.65% | 0.512 / 1.600 m | 47.92% / 6.25% |
+| G15 node + fit + held-out | 0.381 / 1.572 m | 64.71% / 11.76% | **0.461 / 1.596 m** | **52.08%** / 8.33% |
+| G15 node + fit only | 0.381 / 1.509 m | 64.71% / 11.76% | **0.457 / 1.596 m** | **54.17%** / 8.33% |
+
+The main v2 score is a method-level improvement in Dev48 median, rotation
+(`1.565/4.547` degrees), success and selection regret.  It is nevertheless not
+promoted: validation P90 is worse than G13, Dev48 catastrophic rate is worse
+than G13/G14, and seq13 carries the regression.  The exact held-out term is
+especially non-transferable: by itself it is excellent on validation
+(`0.270/1.260` m, 11.76% catastrophic) but fails on Dev48
+(`0.592/3.064` m, 16.67% catastrophic).  It is retained as a diagnostic, not a
+promotion signal.
+
+A scale-free G13 plus G15-node/fit equal-rank fusion was inspected after these
+research sets were already visible.  It reaches `0.381/1.301` m on validation
+and `0.482/1.617` m on Dev48 while preserving the 6.25% Dev catastrophic rate.
+This is the most robust observed G15 diagnostic, but it is explicitly post-hoc
+and cannot be called frozen or production-qualified without a new disjoint
+selection protocol.
+
+G15 therefore passes probability mass conservation, exact inference and bug
+repair, but fails the endpoint-identifiability and cross-trajectory promotion
+gates.  No threshold sweep, larger relation model, Top-K expansion,
+continuous refiner, relation-guided proposal generator or untouched test was
+run.  The next justified work is a query-only, mass-adaptive child/mode state
+representation or retraining/calibration under the corrected complete-link
+edge distribution; proposal-family expansion remains Phase D only after the
+endpoint model closes.
+
 ## Development-set result
 
 The best deployable Goal-Maplet Top-1 remains the frozen graph v9 result, not
@@ -774,6 +864,7 @@ relevant, but it does not yet meet the requested accuracy.
 | M3.1 configuration ranking | scientific partial / production fail | robust aggregate 0.495/1.301 m and 4.17% catastrophic, but 0.235 m regret |
 | M3.2 child-local measurement | scientific partial / production fail | grouped assignment implemented; hard capacity fails Dev promotion |
 | M3.3 sparse mode relation | scientific partial / production fail | held-out relation improves Dev median/ranking, but safe policy remains below graph Top-1 |
+| M3.4 relation probability semantics v2 | correctness pass / production fail | exact mass and pair marginals; 0.461/1.596 m Dev joint, but 8.33% catastrophic and all-null MAP |
 | M4 refiner handoff | fail | no stable 0.1–0.5 m convergence basin |
 | M5 final paper claim | fail | no untouched test, hard-subset comparison or target accuracy |
 
@@ -847,8 +938,10 @@ not an unsupported claim that VFM regions directly yield centimetre pose.
 - G14 paired relation model/audit: `goal_maplet/mode_relation_likelihood_ratio_top16_v1.joblib`, `goal_maplet/mode_relation_likelihood_ratio_top16_v1.json`
 - G14 frozen validation: `goal_maplet/config_rank_pool_mapping_relation_top16_validation_v31.json`, `goal_maplet/mode_relation_mapping_top16_validation_v31.json`
 - G14 single Dev48 audit: `goal_maplet/config_rank_pool_dev48_relation_top16_v32.json`, `goal_maplet/mode_relation_dev48_top16_v32.json`
+- G15 validation probability audit: `goal_maplet/config_rank_pool_mapping_relation_semantics_v2_validation_v33.json`, `goal_maplet/mode_relation_semantics_v2_validation_v35.json`
+- G15 Dev48 probability audit: `goal_maplet/config_rank_pool_dev48_relation_semantics_v2_v34.json`, `goal_maplet/mode_relation_semantics_v2_dev48_v35.json`
 - rejected conditional rank: `goal_maplet/pose_modes_graph_conditionalrank_dev48_v17.json`
 - 4x GT round-trip audit: `goal_maplet/surface_basin_radio_pca256_supersample4_oracle_smoke_gt1round_v4.json`
 
-Focused verification: `58 passed` across the Goal-Maplet relation/mainline
+Focused verification: `61 passed` across the Goal-Maplet relation/mainline
 tests plus the exact 2DGS compositing equivalence test.

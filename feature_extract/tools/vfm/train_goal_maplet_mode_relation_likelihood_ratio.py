@@ -42,7 +42,10 @@ def _load(paths: list[Path]) -> tuple[dict[str, np.ndarray], dict]:
             raise ValueError("relation training requires mode-relation samples v1")
         if current.get("pairing_contract") != "same_image_same_query_edge_fixed_options_v1":
             raise ValueError("relation sample pairing contract differs")
-        if current.get("edge_contract") != "query_only_fit_tree_disjoint_verify_v1":
+        if current.get("edge_contract") not in (
+            "query_only_fit_tree_disjoint_verify_v1",
+            "query_only_complete_link_fit_tree_disjoint_verify_v2",
+        ):
             raise ValueError("relation sample edge contract differs")
         if tuple(current.get("feature_names", ())) != FEATURE_NAMES:
             raise ValueError("relation sample feature contract differs")

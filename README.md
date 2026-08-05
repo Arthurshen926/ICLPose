@@ -74,6 +74,16 @@ rate, but it remains worse in translation than the frozen graph result
 on Dev48 but fails the independent validation tail gate, so neither relation
 policy is promoted and no untouched test or continuous refiner is opened.
 
+The G15 probability-semantics pass fixes G14's connected-component support
+chaining, conserves all child/mode/geometry/field null mass, and uses exact
+fit-tree joint marginals for held-out edges.  The predefined joint score
+improves Dev48 to 0.461/1.596 m and 1.565/4.547 degrees with 52.08% strict
+success, but catastrophic errors rise to 8.33% and validation P90 is 1.572 m.
+Exact-GT non-null posterior remains only 3.65% on Dev48 and Max-Sum is still
+all-null.  G15 is therefore a correctness and diagnostic advance, not a
+production promotion; untouched test, proposal-family expansion and the
+continuous refiner remain closed.
+
 ## Frozen V6 Status
 
 See [the V6 mainline](docs/vfm/2dgs_maplet_atlas_localization_v6.md) for its

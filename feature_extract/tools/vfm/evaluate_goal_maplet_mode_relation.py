@@ -98,6 +98,39 @@ def _risk_coverage(rows: list[dict], policy: str) -> dict:
     return result
 
 
+def _aggregate_endpoint_coverage(rows: list[dict]) -> dict:
+    names = (
+        "truth_child_top16", "truth_child_parent_quota_top2",
+        "truth_child_family_top8", "truth_primitive_top8",
+        "truth_primitive_relation_top2", "endpoint_pose_valid",
+    )
+    denominator = int(sum(int(row["endpoint_coverage"]["observable_group_count"]) for row in rows))
+    result = {"observable_group_count": denominator}
+    previous = denominator
+    for name in names:
+        count = int(sum(int(row["endpoint_coverage"][name]["count"]) for row in rows))
+        result[name] = {
+            "count": count, "fraction": float(count / max(denominator, 1)),
+            "conditional_survival": float(count / max(previous, 1)),
+        }
+        previous = count
+    pair_count = int(sum(
+        int(row["endpoint_coverage"]["pair_both_endpoints_valid"]["count"]) for row in rows
+    ))
+    edge_count = int(sum(
+        int(row["endpoint_coverage"]["pair_both_endpoints_valid"]["edge_count"]) for row in rows
+    ))
+    result["pair_both_endpoints_valid"] = {
+        "count": pair_count, "edge_count": edge_count,
+        "fraction": float(pair_count / max(edge_count, 1)),
+    }
+    return result
+
+
+def _optional_median(values: list[float]) -> float | None:
+    return float(np.median(values)) if values else None
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--candidate_pool", required=True)
@@ -109,22 +142,22 @@ def main() -> None:
         raise FileExistsError("refusing to overwrite mode-relation audit")
     payload = json.loads(Path(args.candidate_pool).read_text())
     contract = dict(payload.get("configuration_evidence_contract", {}))
-    if contract.get("mode_relation_inference") != "exact_max_sum_fit_tree_disjoint_heldout_verification":
-        raise ValueError("candidate pool lacks exact fit-tree relation evidence")
+    if contract.get("mode_relation_inference") != "mass_conserving_exact_sum_product_fit_tree_pairwise_heldout_v2":
+        raise ValueError("candidate pool lacks mass-conserving relation evidence v2")
     rows = []
     policy_names = (
-        "proposal", "g13_equal_rank", "relation_tree_fit", "relation_fit_verify_equal_rank",
-        "relation_verify_conditional", "g13_verify_equal_rank", "g13_positive_verify_gate",
-        "g13_relation_equal_rank",
+        "proposal", "g13_equal_rank", "g14_research_baseline", "relation_v2_node_only",
+        "relation_v2_node_fit", "relation_v2_heldout_only", "relation_v2_joint",
+        "g13_relation_v2_node_fit_equal_rank",
     )
     topn = {name: {3: [], 5: [], "diverse3": []} for name in policy_names}
     for row in payload["rows"]:
         details = row["mode_details"][MODE]
         diagnostics = row["ranking_diagnostics"][MODE]
         base = diagnostics["configuration_evidence_v4"]
-        relation = diagnostics["mode_relation_evidence_v1"]
+        relation = diagnostics["mode_relation_evidence_v2"]
         assignment = np.asarray(
-            diagnostics["mode_relation_assignments_v1"]["selected_child_rows"], dtype=np.int64,
+            diagnostics["mode_relation_assignments_v2"]["selected_child_rows"], dtype=np.int64,
         )
         poses = np.asarray([item["pose_w2c"] for item in details], dtype=np.float64)
         translation = np.asarray([item["translation_m"] for item in details], dtype=np.float64)
@@ -134,24 +167,32 @@ def main() -> None:
         legacy = np.asarray(base["configuration_legacy_valid_factor_mass_mean"], dtype=np.float64)
         llr_median = np.asarray(base["configuration_pose_llr_fixed_median"], dtype=np.float64)
         g13 = _rank_percentile(legacy) + _rank_percentile(llr_median)
-        tree = np.asarray(relation["relation_tree_fit_score_mean"], dtype=np.float64)
-        verify = np.asarray(relation["relation_verify_llr_median"], dtype=np.float64)
+        node = np.asarray(relation["relation_node_log_evidence_mean"], dtype=np.float64)
+        fit = np.asarray(relation["relation_fit_incremental_llr_mean"], dtype=np.float64)
+        verify = np.asarray(relation["relation_verify_predictive_llr_mean"], dtype=np.float64)
         verify_valid = np.asarray(relation["relation_verify_valid_fraction"], dtype=np.float64)
-        relation_combined = (
-            _rank_percentile(tree) + _rank_percentile(verify) + _rank_percentile(verify_valid)
+        old_relation = diagnostics.get("mode_relation_evidence_v1", {})
+        old_verify = np.asarray(
+            old_relation.get("relation_verify_llr_median", np.zeros_like(verify)), dtype=np.float64,
         )
-        g13_verify = _rank_percentile(g13) + _rank_percentile(verify)
-        verify_winner = int(np.argmax(g13_verify))
-        positive_verify_gate = g13_verify if verify[verify_winner] > 0.0 else g13
         score = {
             "proposal": np.asarray(diagnostics["proposal_scores"], dtype=np.float64),
             "g13_equal_rank": g13,
-            "relation_tree_fit": tree,
-            "relation_fit_verify_equal_rank": relation_combined,
-            "relation_verify_conditional": verify,
-            "g13_verify_equal_rank": g13_verify,
-            "g13_positive_verify_gate": positive_verify_gate,
-            "g13_relation_equal_rank": _rank_percentile(g13) + _rank_percentile(relation_combined),
+            "g14_research_baseline": _rank_percentile(g13) + _rank_percentile(old_verify),
+            "relation_v2_node_only": node,
+            "relation_v2_node_fit": node + fit,
+            "relation_v2_heldout_only": verify,
+            # All three terms are mean log likelihood-ratio evidence on their
+            # own fixed denominators; no promotion threshold or Dev-fitted
+            # override is introduced.
+            "relation_v2_joint": node + fit + verify,
+            # Preserve the independently useful G13 local/configuration
+            # statistic while injecting only relation evidence observed on the
+            # fit tree.  This is a fixed scale-free fusion, not a threshold or
+            # a fitted component weight.
+            "g13_relation_v2_node_fit_equal_rank": (
+                _rank_percentile(g13) + _rank_percentile(node + fit)
+            ),
         }
         covered = bool(np.any((translation <= 0.5) & (rotation <= 5.0)))
         result = {
@@ -161,6 +202,26 @@ def main() -> None:
                 "rank": oracle + 1, "translation_m": float(translation[oracle]),
                 "rotation_deg": float(rotation[oracle]),
             },
+            "relation_v2_query_diagnostics": diagnostics[
+                "mode_relation_assignments_v2"
+            ].get("query_diagnostics", {}),
+            "endpoint_coverage": diagnostics["mode_relation_endpoint_coverage_v2"],
+        }
+        gt_evidence = diagnostics["mode_relation_gt_pose_evidence_v2"]
+        candidate_non_null = np.asarray(
+            relation["relation_posterior_non_null_mass_mean"], dtype=np.float64,
+        )
+        phase_mask = (
+            (translation > 0.5) & (translation <= 3.0) & (rotation <= 5.0)
+        )
+        result["probability_semantics"] = {
+            "gt_pose_non_null_mass": float(
+                gt_evidence["relation_posterior_non_null_mass_mean"]
+            ),
+            "near_miss_phase_non_null_mass_median": float(np.median(
+                candidate_non_null[phase_mask]
+            )) if np.any(phase_mask) else None,
+            "oracle_candidate_non_null_mass": float(candidate_non_null[oracle]),
         }
         for name, value in score.items():
             order = np.argsort(-value, kind="stable")
@@ -184,6 +245,23 @@ def main() -> None:
             topn[name]["diverse3"].append(bool(np.any(
                 (translation[diverse] <= 0.5) & (rotation[diverse] <= 5.0)
             )))
+            if name in ("relation_v2_joint", "g13_relation_v2_node_fit_equal_rank"):
+                keep = order[: min(5, order.size)]
+                non_null_mass = np.asarray(
+                    relation["relation_posterior_non_null_mass_mean"], dtype=np.float64,
+                )
+                entropy = np.asarray(relation["relation_posterior_entropy_mean"], dtype=np.float64)
+                result[name].update({
+                    "poses_topk": [
+                        {"candidate_index": int(index), "pose_w2c": poses[index].tolist()}
+                        for index in keep.tolist()
+                    ],
+                    "configuration_assignments_topk": assignment[keep].tolist(),
+                    "endpoint_valid_mass": float(non_null_mass[selected]),
+                    "ambiguity_entropy": float(entropy[selected]),
+                    "abstain_probability": float(np.clip(1.0 - non_null_mass[selected], 0.0, 1.0)),
+                    "relation_verify_evidence": float(verify[selected]),
+                })
         rows.append(result)
     summary = {}
     trajectory_summary = {}
@@ -209,12 +287,63 @@ def main() -> None:
                 [row["oracle"]["translation_m"] for row in selected],
             )
     report = {
-        "stage": "evaluate_goal_maplet_mode_relation_v1",
-        "protocol": "frozen_top32_fit_tree_disjoint_verify_configuration_diverse_modes",
+        "stage": "evaluate_goal_maplet_mode_relation_v2",
+        "protocol": "frozen_top32_mass_conserving_fit_tree_exact_pair_verify_multimode",
         "query_count": len(rows), "candidate_pool": str(args.candidate_pool),
         "configuration_evidence_contract": contract,
+        "decision_status": {
+            "production_promoted": False,
+            "untouched_test_opened": False,
+            "continuous_refiner_opened": False,
+            "relation_guided_proposals_opened": False,
+            "g13_relation_v2_node_fit_equal_rank": "posthoc_research_diagnostic_only",
+        },
         "summary": summary, "trajectory_summary": trajectory_summary,
         "risk_coverage": {name: _risk_coverage(rows, name) for name in policy_names},
+        "endpoint_coverage_ladder": _aggregate_endpoint_coverage(rows),
+        "endpoint_coverage_ladder_by_trajectory": {
+            trajectory: _aggregate_endpoint_coverage([
+                row for row in rows if row["trajectory"] == trajectory
+            ])
+            for trajectory in sorted({row["trajectory"] for row in rows})
+        },
+        "probability_semantics_audit": {
+            "maximum_prior_mass_residual": float(max(
+                max(row["ranking_diagnostics"][MODE]["mode_relation_evidence_v2"][
+                    "relation_prior_mass_residual_max"
+                ]) for row in payload["rows"]
+            )),
+            "complete_link_relation_nodes_mean": float(np.mean([
+                row["relation_v2_query_diagnostics"].get("complete_link_relation_node_count", 0)
+                for row in rows
+            ])),
+            "legacy_connected_relation_nodes_mean": float(np.mean([
+                row["relation_v2_query_diagnostics"].get("legacy_connected_relation_node_count", 0)
+                for row in rows
+            ])),
+            "chain_restored_relation_nodes_total": int(np.sum([
+                row["relation_v2_query_diagnostics"].get("chain_restored_relation_node_count", 0)
+                for row in rows
+            ])),
+            "maxsum_non_null_query_fraction": float(np.mean([
+                row["relation_v2_joint"]["endpoint_valid_mass"] > 0.0
+                and any(value >= 0 for value in row["relation_v2_joint"][
+                    "configuration_assignments_topk"
+                ][0])
+                for row in rows
+            ])),
+            "gt_pose_non_null_mass_median": float(np.median([
+                row["probability_semantics"]["gt_pose_non_null_mass"] for row in rows
+            ])),
+            "oracle_candidate_non_null_mass_median": float(np.median([
+                row["probability_semantics"]["oracle_candidate_non_null_mass"] for row in rows
+            ])),
+            "near_miss_phase_non_null_mass_median": _optional_median([
+                row["probability_semantics"]["near_miss_phase_non_null_mass_median"]
+                for row in rows
+                if row["probability_semantics"]["near_miss_phase_non_null_mass_median"] is not None
+            ]),
+        },
         "rows": rows,
     }
     output.parent.mkdir(parents=True, exist_ok=True)

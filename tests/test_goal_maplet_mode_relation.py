@@ -8,6 +8,7 @@ from feature_extract.vfm.localization_goal_maplet.mode_relation import (
     ModeRelationLikelihoodRatioArtifact,
     analytic_relation_score,
     build_sparse_relation_edges,
+    exact_pair_log_marginal,
     family_preserving_child_shortlist,
     max_sum_forest,
     sum_product_forest,
@@ -76,6 +77,66 @@ def test_sum_product_tree_matches_brute_force_partition_and_marginal():
     expected_left = np.log(np.sum(np.exp(joint - expected_logz), axis=1))
     assert result.log_partition == pytest.approx(expected_logz)
     assert np.exp(result.node_log_marginals[0]) == pytest.approx(np.exp(expected_left))
+
+
+def test_exact_nonadjacent_pair_marginal_matches_brute_force():
+    unary = [
+        np.log(np.asarray([0.4, 0.6])),
+        np.log(np.asarray([0.7, 0.2, 0.1])),
+        np.log(np.asarray([0.3, 0.7])),
+    ]
+    left, right = np.asarray([0, 1]), np.asarray([1, 2])
+    pair = [
+        np.asarray([[0.0, -0.3, 0.2], [0.1, 0.4, -0.2]]),
+        np.asarray([[0.2, -0.1], [-0.4, 0.3], [0.0, 0.5]]),
+    ]
+    result = sum_product_forest(unary, left, right, pair)
+    exact = exact_pair_log_marginal(result, unary, left, right, pair, 0, 2)
+    joint = np.full((2, 2), -np.inf)
+    for a in range(2):
+        for c in range(2):
+            joint[a, c] = np.log(np.sum(np.exp([
+                unary[0][a] + unary[1][b] + unary[2][c]
+                + pair[0][a, b] + pair[1][b, c]
+                for b in range(3)
+            ])))
+    joint -= np.log(np.sum(np.exp(joint)))
+    assert np.exp(exact) == pytest.approx(np.exp(joint))
+
+
+def test_pair_marginal_is_stable_under_tree_reparameterization():
+    unary = [np.asarray([0.2, -0.1]), np.asarray([0.0, 0.3]), np.asarray([-0.2, 0.4])]
+    left, right = np.asarray([0, 1]), np.asarray([1, 2])
+    pair = [np.asarray([[0.1, -0.2], [0.3, 0.0]]), np.asarray([[0.0, 0.2], [-0.1, 0.4]])]
+    original = sum_product_forest(unary, left, right, pair)
+    original_pair = exact_pair_log_marginal(original, unary, left, right, pair, 0, 2)
+    delta = np.asarray([0.7, -0.4])
+    changed_unary = [unary[0] + delta, unary[1].copy(), unary[2].copy()]
+    changed_pair = [pair[0] - delta[:, None], pair[1].copy()]
+    changed = sum_product_forest(changed_unary, left, right, changed_pair)
+    changed_endpoint = exact_pair_log_marginal(
+        changed, changed_unary, left, right, changed_pair, 0, 2,
+    )
+    assert changed.log_partition == pytest.approx(original.log_partition)
+    assert np.exp(changed_endpoint) == pytest.approx(np.exp(original_pair))
+
+
+def test_relation_supports_use_complete_link_and_quality_representative():
+    # A overlaps B and B overlaps C, while A/C do not overlap enough.  The
+    # retired connected component collapses all three; complete-link keeps C.
+    xy = np.asarray([[0.0, 0.0], [3.0, 0.0], [6.0, 0.0], [40.0, 0.0]])
+    extent = np.asarray([[5.0, 5.0]] * 4)
+    descriptor = np.eye(4, dtype=np.float32)
+    scale = np.full((4,), 8.0)
+    edges = build_sparse_relation_edges(
+        xy, extent, descriptor, scale,
+        query_priority=np.asarray([0.2, 0.9, 0.5, 0.4]),
+    )
+    assert np.unique(edges.support_cluster_rows).size > np.unique(
+        edges.legacy_connected_cluster_rows,
+    ).size
+    # Highest-quality B represents the first complete-link support cluster.
+    assert 1 in edges.representative_groups
 
 
 def test_relation_artifact_contract_and_scalar_llr(tmp_path):

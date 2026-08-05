@@ -17,12 +17,31 @@ import numpy as np
 
 from feature_extract.vfm.query_to_3d_matching import camera_matrix_and_distortion
 
+from .latent_configuration import correlated_support_clusters
 from .physical_map import GoalMapletPhysicalMap
 
 
 EDGE_FAMILIES = ("local", "long_range", "depth_normal")
 RELATION_NULL_TYPES = (
     "valid", "missing_endpoint", "behind_camera", "back_facing", "primitive_conflict",
+)
+
+NODE_NULL_TYPES = (
+    "retrieval_null",
+    "child_shortlist_omitted",
+    "mode_shortlist_omitted",
+    "geometry_invalid",
+    "field_missing",
+)
+
+# Fixed, deliberately conservative physical-null evidence.  Query/map
+# uncertainty is neutral; a state which claims a physical endpoint but places
+# it behind the camera or on a back-facing surface is evidence against the
+# pose.  Primitive conflicts remain impossible.  These are likelihood ratios,
+# not priors and are therefore added only after the mass-conserving state prior
+# has been constructed.
+RELATION_NULL_LOG_LIKELIHOOD_RATIOS = np.asarray(
+    [0.0, 0.0, np.log(0.05), np.log(0.05), -1.0e6], dtype=np.float64,
 )
 
 FEATURE_NAMES = (
@@ -61,6 +80,8 @@ class SparseRelationEdges:
     verify_right: np.ndarray
     verify_family: np.ndarray
     representative_groups: np.ndarray
+    support_cluster_rows: np.ndarray | None = None
+    legacy_connected_cluster_rows: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         for prefix in ("fit", "verify"):
@@ -76,14 +97,28 @@ class SparseRelationEdges:
             object.__setattr__(self, f"{prefix}_family", family)
         representative = np.asarray(self.representative_groups, dtype=np.int64).reshape(-1)
         object.__setattr__(self, "representative_groups", representative)
+        cluster = (
+            np.asarray(self.support_cluster_rows, dtype=np.int64).reshape(-1)
+            if self.support_cluster_rows is not None else np.arange(
+                int(np.max(representative)) + 1 if representative.size else 0, dtype=np.int64,
+            )
+        )
+        legacy = (
+            np.asarray(self.legacy_connected_cluster_rows, dtype=np.int64).reshape(-1)
+            if self.legacy_connected_cluster_rows is not None else cluster.copy()
+        )
+        if cluster.shape != legacy.shape:
+            raise ValueError("relation support cluster diagnostics differ")
+        object.__setattr__(self, "support_cluster_rows", cluster)
+        object.__setattr__(self, "legacy_connected_cluster_rows", legacy)
         fit = {tuple(sorted(value)) for value in zip(self.fit_left.tolist(), self.fit_right.tolist())}
         verify = {tuple(sorted(value)) for value in zip(self.verify_left.tolist(), self.verify_right.tolist())}
         if fit & verify:
             raise ValueError("fit and verification relation evidence overlap")
 
 
-def _overlap_clusters(xy: np.ndarray, extent: np.ndarray) -> np.ndarray:
-    """Deterministic connected components for strongly overlapping supports."""
+def _legacy_connected_overlap_clusters(xy: np.ndarray, extent: np.ndarray) -> np.ndarray:
+    """Return the retired G14 components, only for chain-collapse auditing."""
 
     count = xy.shape[0]
     parent = np.arange(count, dtype=np.int64)
@@ -145,6 +180,7 @@ def build_sparse_relation_edges(
     query_descriptors: np.ndarray,
     query_scale_px: np.ndarray,
     *,
+    query_priority: np.ndarray | None = None,
     maximum_verify_edges: int | None = None,
 ) -> SparseRelationEdges:
     """Build a query-only information tree plus held-out relation edges.
@@ -158,19 +194,44 @@ def build_sparse_relation_edges(
     extent = np.asarray(query_extent_px, dtype=np.float64).reshape(-1, 2)
     descriptor = np.asarray(query_descriptors, dtype=np.float64)
     scale = np.asarray(query_scale_px, dtype=np.float64).reshape(-1)
+    priority = (
+        np.ones((xy.shape[0],), dtype=np.float64)
+        if query_priority is None
+        else np.asarray(query_priority, dtype=np.float64).reshape(-1)
+    )
     count = xy.shape[0]
-    if extent.shape != xy.shape or descriptor.ndim != 2 or descriptor.shape[0] != count or scale.size != count:
+    if (
+        extent.shape != xy.shape or descriptor.ndim != 2
+        or descriptor.shape[0] != count or scale.size != count or priority.size != count
+        or not np.all(np.isfinite(priority))
+    ):
         raise ValueError("relation query evidence differs")
     if count == 0:
         empty = np.zeros((0,), dtype=np.int64)
-        return SparseRelationEdges(empty, empty, empty, empty, empty, empty, empty)
-    cluster = _overlap_clusters(xy, extent)
-    representative = np.asarray(
-        [int(np.flatnonzero(cluster == value)[0]) for value in np.unique(cluster)], dtype=np.int64,
-    )
+        return SparseRelationEdges(empty, empty, empty, empty, empty, empty, empty, empty, empty)
+    # Reuse the G12 complete-link definition.  Connected components are kept
+    # only as an audit output so A--B--C overlap chains can be measured rather
+    # than silently deleting the distant A/C relation node.
+    cluster = correlated_support_clusters(xy, extent, minimum_iou=0.50)
+    legacy_cluster = _legacy_connected_overlap_clusters(xy, extent)
+    representatives: list[int] = []
+    for value in np.unique(cluster).tolist():
+        members = np.flatnonzero(cluster == int(value))
+        maximum_priority = float(np.max(priority[members]))
+        quality = members[np.isclose(priority[members], maximum_priority, rtol=0.0, atol=1e-12)]
+        if quality.size == 1:
+            representatives.append(int(quality[0]))
+            continue
+        # A stable query-only medoid breaks equal-quality ties without raster
+        # order becoming an accidental source of physical identity.
+        distance = np.linalg.norm(xy[quality, None] - xy[members][None], axis=2)
+        representatives.append(int(quality[int(np.argmin(np.sum(distance, axis=1)))]))
+    representative = np.asarray(representatives, dtype=np.int64)
     if representative.size < 2:
         empty = np.zeros((0,), dtype=np.int64)
-        return SparseRelationEdges(empty, empty, empty, empty, empty, empty, representative)
+        return SparseRelationEdges(
+            empty, empty, empty, empty, empty, empty, representative, cluster, legacy_cluster,
+        )
     point = xy[representative]
     desc = descriptor[representative]
     desc /= np.maximum(np.linalg.norm(desc, axis=1, keepdims=True), 1e-8)
@@ -242,6 +303,8 @@ def build_sparse_relation_edges(
         verify_right=representative[edge_right[verify_rows]],
         verify_family=family[verify_rows],
         representative_groups=representative,
+        support_cluster_rows=cluster,
+        legacy_connected_cluster_rows=legacy_cluster,
     )
 
 
@@ -446,7 +509,10 @@ class ModeRelationLikelihoodRatioArtifact:
             raise ValueError("mode-relation feature contract differs")
         if metadata.get("pairing_contract") != "same_image_same_query_edge_fixed_options_v1":
             raise ValueError("mode-relation pairing contract differs")
-        if metadata.get("edge_contract") != "query_only_fit_tree_disjoint_verify_v1":
+        if metadata.get("edge_contract") not in (
+            "query_only_fit_tree_disjoint_verify_v1",
+            "query_only_complete_link_fit_tree_disjoint_verify_v2",
+        ):
             raise ValueError("mode-relation edge contract differs")
         return cls(
             payload["pair_estimator"], float(payload["calibration_scale"]),
@@ -464,6 +530,7 @@ class TreeInferenceResult:
 class TreeMarginalResult:
     log_partition: float
     node_log_marginals: tuple[np.ndarray, ...]
+    directed_log_messages: Mapping[tuple[int, int], np.ndarray]
 
 
 def _logsumexp(value: np.ndarray, axis=None) -> np.ndarray:
@@ -555,7 +622,92 @@ def sum_product_forest(
         for neighbour, _ in adjacency[root]:
             belief += message[(neighbour, root)]
         log_partition += float(_logsumexp(belief))
-    return TreeMarginalResult(log_partition, tuple(marginal))
+    return TreeMarginalResult(log_partition, tuple(marginal), message)
+
+
+def exact_pair_log_marginal(
+    inference: TreeMarginalResult,
+    unary_scores: Sequence[np.ndarray],
+    edge_left: np.ndarray,
+    edge_right: np.ndarray,
+    pair_scores: Sequence[np.ndarray],
+    node_left: int,
+    node_right: int,
+) -> np.ndarray:
+    """Return exact ``log P(z_left,z_right | fit tree)``.
+
+    Verification edges are usually not fit-tree neighbours.  Multiplying two
+    node marginals discards every dependency along their tree path.  This
+    routine integrates the off-path subtrees through the already-computed
+    directed messages and eliminates every internal path state exactly.
+    """
+
+    unary = [np.asarray(value, dtype=np.float64).reshape(-1) for value in unary_scores]
+    left = np.asarray(edge_left, dtype=np.int64).reshape(-1)
+    right = np.asarray(edge_right, dtype=np.int64).reshape(-1)
+    a, b = int(node_left), int(node_right)
+    if a < 0 or b < 0 or a >= len(unary) or b >= len(unary) or a == b:
+        raise ValueError("invalid pair-marginal endpoints")
+    adjacency: list[list[tuple[int, int]]] = [[] for _ in unary]
+    for edge, (u, v) in enumerate(zip(left.tolist(), right.tolist())):
+        adjacency[u].append((v, edge))
+        adjacency[v].append((u, edge))
+    parent = np.full((len(unary),), -1, dtype=np.int64)
+    parent_edge = np.full((len(unary),), -1, dtype=np.int64)
+    queue = [a]
+    parent[a] = a
+    for node in queue:
+        if node == b:
+            break
+        for neighbour, edge in adjacency[node]:
+            if parent[neighbour] >= 0:
+                continue
+            parent[neighbour] = node
+            parent_edge[neighbour] = edge
+            queue.append(neighbour)
+    if parent[b] < 0:
+        # Distinct forest components are independent after conditioning on the
+        # fit evidence.  This is exact, unlike using the same approximation for
+        # connected endpoints.
+        output = (
+            inference.node_log_marginals[a][:, None]
+            + inference.node_log_marginals[b][None, :]
+        )
+        return output - float(_logsumexp(output))
+    path = [b]
+    while path[-1] != a:
+        path.append(int(parent[path[-1]]))
+    path.reverse()
+
+    def cavity(node: int, excluded: set[int]) -> np.ndarray:
+        value = unary[node].copy()
+        for neighbour, _ in adjacency[node]:
+            if neighbour not in excluded:
+                value += np.asarray(
+                    inference.directed_log_messages[(neighbour, node)], dtype=np.float64,
+                )
+        return value
+
+    first, second = path[0], path[1]
+    first_edge = int(parent_edge[second])
+    matrix = np.asarray(pair_scores[first_edge], dtype=np.float64)
+    oriented = matrix if int(left[first_edge]) == first else matrix.T
+    transfer = cavity(first, {second})[:, None] + oriented
+    for position in range(1, len(path) - 1):
+        node, destination = path[position], path[position + 1]
+        previous = path[position - 1]
+        edge = int(parent_edge[destination])
+        matrix = np.asarray(pair_scores[edge], dtype=np.float64)
+        oriented = matrix if int(left[edge]) == node else matrix.T
+        local = cavity(node, {previous, destination})
+        # transfer axes are (left endpoint, current path state).
+        transfer = _logsumexp(
+            transfer[:, :, None] + local[None, :, None] + oriented[None, :, :],
+            axis=1,
+        )
+    last, previous = path[-1], path[-2]
+    transfer += cavity(last, {previous})[None, :]
+    return transfer - float(_logsumexp(transfer))
 
 
 def max_sum_forest(
@@ -643,6 +795,21 @@ RELATION_EVIDENCE_NAMES = (
     "relation_long_range_llr_median",
     "relation_depth_normal_llr_median",
     "relation_null_edge_fraction",
+    "relation_node_log_evidence_mean",
+    "relation_fit_incremental_llr_mean",
+    "relation_verify_predictive_llr_mean",
+    "relation_posterior_non_null_mass_mean",
+    "relation_posterior_entropy_mean",
+    "relation_maxsum_non_null_fraction",
+    "relation_prior_retrieval_null_mass_mean",
+    "relation_prior_child_omitted_mass_mean",
+    "relation_prior_mode_omitted_mass_mean",
+    "relation_prior_geometry_invalid_mass_mean",
+    "relation_prior_field_missing_mass_mean",
+    "relation_prior_mass_residual_max",
+    "relation_complete_link_node_count",
+    "relation_legacy_connected_node_count",
+    "relation_chain_restored_node_count",
 )
 
 
@@ -652,6 +819,7 @@ class RelationConfigurationEvidence:
     selected_child_rows: np.ndarray
     selected_primitive_rows: np.ndarray
     relation_edges: SparseRelationEdges
+    query_diagnostics: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
         value = np.asarray(self.features, dtype=np.float32)
@@ -661,6 +829,52 @@ class RelationConfigurationEvidence:
             raise ValueError("relation configuration feature shape differs")
         if child.shape != primitive.shape or child.shape[0] != value.shape[0]:
             raise ValueError("relation configuration assignment shape differs")
+
+
+def _relation_pair_potential(
+    query_xy: np.ndarray,
+    query_scale: np.ndarray,
+    left: int,
+    right: int,
+    family: int,
+    state_child: Sequence[np.ndarray],
+    state_primitive: Sequence[np.ndarray],
+    state_null_type: Sequence[np.ndarray],
+    pose: np.ndarray,
+    camera,
+    physical: GoalMapletPhysicalMap,
+    likelihood_ratio: ModeRelationLikelihoodRatioArtifact,
+) -> tuple[np.ndarray, np.ndarray]:
+    left_count, right_count = state_child[left].size, state_child[right].size
+    left_state = np.repeat(np.arange(left_count), right_count)
+    right_state = np.tile(np.arange(right_count), left_count)
+    feature, relation_valid, null_type = mode_relation_runtime_features(
+        query_xy, query_scale,
+        np.full(left_state.shape, left), np.full(left_state.shape, right),
+        np.full(left_state.shape, family),
+        state_primitive[left][left_state], state_primitive[right][right_state],
+        state_child[left][left_state], state_child[right][right_state],
+        pose, camera, physical,
+    )
+    score = RELATION_NULL_LOG_LIKELIHOOD_RATIOS[null_type].copy()
+    score[relation_valid] = likelihood_ratio.score_log_likelihood_ratio(feature[relation_valid])
+    # A missing pair caused by ordinary retrieval/shortlist uncertainty is
+    # unobserved, not contradictory.  Geometry-invalid node states are
+    # different: they are candidate-induced and retain their fixed coverage
+    # loss instead of making a wrong pose's edge disappear for free.
+    missing = null_type == RELATION_NULL_TYPES.index("missing_endpoint")
+    if np.any(missing):
+        node_null_llr = np.zeros((len(NODE_NULL_TYPES),), dtype=np.float64)
+        node_null_llr[NODE_NULL_TYPES.index("geometry_invalid")] = np.log(0.05)
+        left_null = state_null_type[left][left_state]
+        right_null = state_null_type[right][right_state]
+        missing_score = np.zeros(left_state.shape, dtype=np.float64)
+        has_left = left_null >= 0
+        has_right = right_null >= 0
+        missing_score[has_left] += node_null_llr[left_null[has_left]]
+        missing_score[has_right] += node_null_llr[right_null[has_right]]
+        score[missing] = missing_score[missing]
+    return score.reshape(left_count, right_count), relation_valid.reshape(left_count, right_count)
 
 
 def family_preserving_child_shortlist(
@@ -722,12 +936,12 @@ def configuration_mode_relation_evidence(
     shortlist_modes_per_child: int = 2,
     temperature: float = 0.07,
 ) -> RelationConfigurationEvidence:
-    """Exact fit-tree inference with disjoint held-out relation verification."""
+    """Mass-conserving exact fit-tree inference and held-out prediction."""
 
     from .child_local_factor import child_local_factor_runtime_features
     from .child_local_likelihood import predict_child_local_surface_likelihood
     from .child_local_mode_ranker import child_local_mode_runtime_features
-    from .latent_configuration import correlated_support_clusters, effective_group_weights
+    from .latent_configuration import effective_group_weights
 
     poses = np.asarray(poses_w2c, dtype=np.float64).reshape(-1, 4, 4)
     descriptor = np.asarray(query_descriptors, dtype=np.float32)
@@ -747,14 +961,18 @@ def configuration_mode_relation_evidence(
     primitive_assignments = np.full_like(assignments, -1)
     empty_edges = build_sparse_relation_edges(
         xy[groups], extent[groups], descriptor[groups], scale[groups],
-    ) if groups.size else SparseRelationEdges(*([np.zeros(0, dtype=np.int64)] * 7))
+        query_priority=priority[groups],
+    ) if groups.size else SparseRelationEdges(*([np.zeros(0, dtype=np.int64)] * 9))
     if groups.size == 0:
         return RelationConfigurationEvidence(output, assignments, primitive_assignments, empty_edges)
     group_xy, group_extent, group_descriptor, group_scale = (
         xy[groups], extent[groups], descriptor[groups], scale[groups],
     )
-    edges = build_sparse_relation_edges(group_xy, group_extent, group_descriptor, group_scale)
-    cluster = correlated_support_clusters(group_xy, group_extent)
+    edges = build_sparse_relation_edges(
+        group_xy, group_extent, group_descriptor, group_scale,
+        query_priority=priority[groups],
+    )
+    cluster = np.asarray(edges.support_cluster_rows, dtype=np.int64)
     group_weight = effective_group_weights(cluster)
     child_rows = np.asarray(
         child_posterior.candidate_child_rows[groups, : int(retrieval_maximum_children)], dtype=np.int64,
@@ -773,13 +991,18 @@ def configuration_mode_relation_evidence(
     if group_index.size == 0:
         return RelationConfigurationEvidence(output, assignments, primitive_assignments, edges)
     selected_child = child_rows[group_index, child_slot]
-    selected_child_probability = child_probability[group_index, child_slot]
-    child_denominator = np.bincount(
-        group_index, weights=selected_child_probability, minlength=groups.size,
-    )
-    conditional_child_probability = selected_child_probability / np.maximum(
-        child_denominator[group_index], 1e-12,
-    )
+    # Normalize the complete retrieval posterior exactly once.  Runtime Top-16
+    # and the family shortlist only move omitted mass into an explicit null;
+    # they never renormalize the surviving child identities.
+    all_child_rows = np.asarray(child_posterior.candidate_child_rows[groups], dtype=np.int64)
+    all_child_probability = np.asarray(child_posterior.candidate_probabilities[groups], dtype=np.float64)
+    all_child_probability = np.where(all_child_rows >= 0, all_child_probability, 0.0)
+    raw_retrieval_null = np.asarray(child_posterior.null_probabilities[groups], dtype=np.float64)
+    posterior_total = raw_retrieval_null + np.sum(all_child_probability, axis=1)
+    posterior_total = np.maximum(posterior_total, 1e-12)
+    normalized_all_child_probability = all_child_probability / posterior_total[:, None]
+    retrieval_null_mass = raw_retrieval_null / posterior_total
+    selected_child_probability = child_probability[group_index, child_slot] / posterior_total[group_index]
     selected_parent_rows = physical.child_parent_rows[selected_child]
     selected_parent_ids = physical.maplet_ids[selected_parent_rows]
     selected_parent_probability = np.asarray([
@@ -816,61 +1039,94 @@ def configuration_mode_relation_evidence(
             image_diagonal_px=float(np.hypot(camera.width, camera.height)),
         )
         factor_llr = pose_likelihood_ratio.score_log_likelihood_ratio(factor_feature)
-        # Fixed Top-M probabilities allocate one child-factor Bayes mass.  The
-        # geometry term is normalized within each fixed child and never changes
-        # which states exist.
-        # The VFM Top-M denominator is normalized once, before a candidate is
-        # inspected.  Geometry only removes mass (which becomes typed null);
-        # it must never renormalize the few modes a bad pose leaves visible.
-        fixed_mode_denominator = np.maximum(np.sum(probability_matrix, axis=1, keepdims=True), 1e-12)
-        mode_log_probability = (
-            np.log(np.maximum(probability_matrix / fixed_mode_denominator, 1e-12))
-            + np.clip(np.asarray(mode_feature, dtype=np.float64)[:, :, 5], -12.0, 0.0)
+        # Construct one common state measure.  Canonical coverage, omitted
+        # modes and candidate geometry can only transfer mass into typed nulls.
+        # The sum of all non-null and null priors is one for every group/pose.
+        coverage = np.clip(1.0 - np.asarray(likelihood.null_probabilities, dtype=np.float64), 0.0, 1.0)
+        retained_mode_probability = np.zeros_like(probability_matrix)
+        retained_mode_probability[fixed_mode] = probability_matrix[fixed_mode]
+        retained_mode_mass = np.sum(retained_mode_probability, axis=1)
+        fixed_geometry_probability = np.exp(np.clip(
+            np.asarray(mode_feature, dtype=np.float64)[factor_row_fixed, mode_row_fixed, 5],
+            -60.0, 0.0,
+        ))
+        fixed_geometry_probability *= mode_valid[factor_row_fixed, mode_row_fixed]
+        fixed_base_mass = (
+            selected_child_probability[factor_row_fixed]
+            * coverage[factor_row_fixed]
+            * probability_matrix[factor_row_fixed, mode_row_fixed]
         )
-        mode_log_probability[~mode_valid] = -np.inf
-        fixed_valid = mode_valid[factor_row_fixed, mode_row_fixed]
-        fixed_unary = np.full(fixed_group.shape, -1.0e6, dtype=np.float64)
-        fixed_unary[fixed_valid] = (
-            np.log(np.maximum(conditional_child_probability[factor_row_fixed[fixed_valid]], 1e-12))
-            + factor_llr[factor_row_fixed[fixed_valid]]
-            + mode_log_probability[factor_row_fixed[fixed_valid], mode_row_fixed[fixed_valid]]
+        fixed_non_null_mass = fixed_base_mass * fixed_geometry_probability
+        fixed_geometry_invalid_mass = fixed_base_mass - fixed_non_null_mass
+
+        selected_child_mass = np.bincount(
+            group_index, weights=selected_child_probability, minlength=groups.size,
+        )
+        child_omitted_mass = np.maximum(
+            np.sum(normalized_all_child_probability, axis=1) - selected_child_mass, 0.0,
+        )
+        field_missing_mass = np.bincount(
+            group_index,
+            weights=selected_child_probability * (1.0 - coverage),
+            minlength=groups.size,
+        )
+        mode_omitted_mass = np.bincount(
+            group_index,
+            weights=selected_child_probability * coverage * np.maximum(1.0 - retained_mode_mass, 0.0),
+            minlength=groups.size,
+        )
+        geometry_invalid_mass = np.bincount(
+            fixed_group, weights=fixed_geometry_invalid_mass, minlength=groups.size,
         )
         unary: list[np.ndarray] = []
         state_child: list[np.ndarray] = []
         state_primitive: list[np.ndarray] = []
+        state_null_type: list[np.ndarray] = []
+        state_prior_mass: list[np.ndarray] = []
+        null_mass_matrix = np.stack([
+            retrieval_null_mass, child_omitted_mass, mode_omitted_mass,
+            geometry_invalid_mass, field_missing_mass,
+        ], axis=1)
+        mass_residual = np.zeros((groups.size,), dtype=np.float64)
         for group in range(groups.size):
             current = np.flatnonzero(fixed_group == group)
-            unary.append(np.concatenate([
-                group_weight[group] * fixed_unary[current], np.asarray([0.0]),
+            non_null = fixed_non_null_mass[current]
+            prior = np.concatenate([non_null, null_mass_matrix[group]])
+            total = float(np.sum(prior))
+            mass_residual[group] = abs(total - 1.0)
+            if total <= 1e-12:
+                prior[-len(NODE_NULL_TYPES) + NODE_NULL_TYPES.index("retrieval_null")] = 1.0
+                total = 1.0
+            prior /= total
+            score = np.log(np.maximum(prior, 1e-300))
+            if current.size:
+                score[: current.size] += group_weight[group] * factor_llr[factor_row_fixed[current]]
+            unary.append(score)
+            state_prior_mass.append(prior)
+            state_child.append(np.concatenate([
+                fixed_child[current], np.full((len(NODE_NULL_TYPES),), -1, dtype=np.int64),
             ]))
-            state_child.append(np.concatenate([fixed_child[current], np.asarray([-1], dtype=np.int64)]))
-            state_primitive.append(np.concatenate([fixed_primitive[current], np.asarray([-1], dtype=np.int64)]))
+            state_primitive.append(np.concatenate([
+                fixed_primitive[current], np.full((len(NODE_NULL_TYPES),), -1, dtype=np.int64),
+            ]))
+            state_null_type.append(np.concatenate([
+                np.full((current.size,), -1, dtype=np.int64),
+                np.arange(len(NODE_NULL_TYPES), dtype=np.int64),
+            ]))
 
         pair_matrices: list[np.ndarray] = []
-        fit_valid_count, fit_total_count = 0, 0
+        pair_valid_masks: list[np.ndarray] = []
         for left, right, family in zip(
             edges.fit_left.tolist(), edges.fit_right.tolist(), edges.fit_family.tolist(),
         ):
-            left_count, right_count = unary[left].size, unary[right].size
-            left_state = np.repeat(np.arange(left_count), right_count)
-            right_state = np.tile(np.arange(right_count), left_count)
-            feature, relation_valid, null_type = mode_relation_runtime_features(
-                group_xy, group_scale,
-                np.full(left_state.shape, left), np.full(left_state.shape, right),
-                np.full(left_state.shape, family),
-                state_primitive[left][left_state], state_primitive[right][right_state],
-                state_child[left][left_state], state_child[right][right_state],
-                pose, camera, physical,
+            matrix, relation_valid = _relation_pair_potential(
+                group_xy, group_scale, left, right, family,
+                state_child, state_primitive, state_null_type,
+                pose, camera, physical, relation_likelihood_ratio,
             )
-            score = np.zeros(left_state.shape, dtype=np.float64)
-            score[relation_valid] = relation_likelihood_ratio.score_log_likelihood_ratio(
-                feature[relation_valid]
-            )
-            conflict = null_type == RELATION_NULL_TYPES.index("primitive_conflict")
-            score[conflict] = -1.0e6
-            pair_matrices.append(score.reshape(left_count, right_count))
-            fit_valid_count += int(np.sum(relation_valid))
-            fit_total_count += int(relation_valid.size)
+            pair_matrices.append(matrix)
+            pair_valid_masks.append(relation_valid)
+        node_log_partition = float(sum(float(_logsumexp(value)) for value in unary))
         result = max_sum_forest(
             unary, edges.fit_left, edges.fit_right, pair_matrices,
         )
@@ -885,43 +1141,29 @@ def configuration_mode_relation_evidence(
         ], dtype=np.int64)
         assignments[pose_row] = selected_child_for_pose
         primitive_assignments[pose_row] = selected_primitive_for_pose
+        fit_valid_mass = []
+        for edge, (left, right) in enumerate(zip(edges.fit_left.tolist(), edges.fit_right.tolist())):
+            log_joint = exact_pair_log_marginal(
+                marginal, unary, edges.fit_left, edges.fit_right, pair_matrices, left, right,
+            )
+            fit_valid_mass.append(float(np.sum(np.exp(log_joint)[pair_valid_masks[edge]])))
         verify_scores, verify_families = [], []
         verify_valid_mass, null_mass = [], []
         for left, right, family in zip(
             edges.verify_left.tolist(), edges.verify_right.tolist(), edges.verify_family.tolist(),
         ):
-            left_count, right_count = unary[left].size, unary[right].size
-            left_state = np.repeat(np.arange(left_count), right_count)
-            right_state = np.tile(np.arange(right_count), left_count)
-            feature, relation_valid, null_type = mode_relation_runtime_features(
-                group_xy, group_scale,
-                np.full(left_state.shape, left), np.full(left_state.shape, right),
-                np.full(left_state.shape, family),
-                state_primitive[left][left_state], state_primitive[right][right_state],
-                state_child[left][left_state], state_child[right][right_state],
-                pose, camera, physical,
+            pair_score, relation_valid = _relation_pair_potential(
+                group_xy, group_scale, left, right, family,
+                state_child, state_primitive, state_null_type,
+                pose, camera, physical, relation_likelihood_ratio,
             )
-            pair_score = np.zeros(left_state.shape, dtype=np.float64)
-            pair_score[relation_valid] = relation_likelihood_ratio.score_log_likelihood_ratio(
-                feature[relation_valid]
+            log_joint = exact_pair_log_marginal(
+                marginal, unary, edges.fit_left, edges.fit_right, pair_matrices, left, right,
             )
-            conflict = null_type == RELATION_NULL_TYPES.index("primitive_conflict")
-            pair_score[conflict] = -1.0e6
-            log_weight = (
-                marginal.node_log_marginals[left][left_state]
-                + marginal.node_log_marginals[right][right_state]
-            )
-            if np.any(relation_valid):
-                valid_log_weight = log_weight[relation_valid]
-                predictive = float(
-                    _logsumexp(valid_log_weight + pair_score[relation_valid])
-                    - _logsumexp(valid_log_weight)
-                )
-            else:
-                predictive = 0.0
+            predictive = float(_logsumexp(log_joint + pair_score))
             verify_scores.append(predictive)
             verify_families.append(int(family))
-            probability = np.exp(log_weight - float(_logsumexp(log_weight)))
+            probability = np.exp(log_joint)
             verify_valid_mass.append(float(np.sum(probability[relation_valid])))
             null_mass.append(float(np.sum(probability[~relation_valid])))
         verify_array = np.asarray(verify_scores, dtype=np.float64)
@@ -932,16 +1174,51 @@ def configuration_mode_relation_evidence(
             for family in range(len(EDGE_FAMILIES))
         ]
         assigned = selected_child_for_pose >= 0
+        posterior_non_null = []
+        posterior_entropy = []
+        for group in range(groups.size):
+            probability = np.exp(marginal.node_log_marginals[group])
+            posterior_non_null.append(float(np.sum(probability[state_null_type[group] < 0])))
+            posterior_entropy.append(float(-np.sum(probability * np.log(np.maximum(probability, 1e-12)))))
+        normalizer = max(float(np.sum(group_weight)) + edges.fit_left.size, 1.0)
+        complete_count = int(np.unique(edges.support_cluster_rows).size)
+        legacy_count = int(np.unique(edges.legacy_connected_cluster_rows).size)
         output[pose_row] = np.asarray([
-            float(marginal.log_partition / max(float(np.sum(group_weight)) + edges.fit_left.size, 1.0)),
+            float(marginal.log_partition / normalizer),
             float(np.median(verify_array)) if verify_array.size else 0.0,
             float(np.mean(verify_valid_mass)) if verify_valid_mass else 0.0,
-            float(fit_valid_count / max(fit_total_count, 1)),
+            float(np.mean(fit_valid_mass)) if fit_valid_mass else 0.0,
             float(np.mean(assigned)),
             float(np.unique(selected_child_for_pose[assigned]).size / max(int(np.sum(assigned)), 1)),
             *family_median,
             float(np.mean(null_mass)) if null_mass else 1.0,
+            float(node_log_partition / max(float(np.sum(group_weight)), 1.0)),
+            float((marginal.log_partition - node_log_partition) / max(edges.fit_left.size, 1)),
+            float(np.mean(verify_array)) if verify_array.size else 0.0,
+            float(np.mean(posterior_non_null)),
+            float(np.mean(posterior_entropy)),
+            float(np.mean(assigned)),
+            *np.mean(null_mass_matrix, axis=0).tolist(),
+            float(np.max(mass_residual)),
+            float(complete_count), float(legacy_count), float(max(complete_count - legacy_count, 0)),
         ], dtype=np.float32)
     if not np.all(np.isfinite(output)):
         raise ValueError("relation configuration evidence contains non-finite values")
-    return RelationConfigurationEvidence(output, assignments, primitive_assignments, edges)
+    query_diagnostics = {
+        "selected_group_rows": groups.tolist(),
+        "selected_group_count": int(groups.size),
+        "complete_link_relation_node_count": int(np.unique(edges.support_cluster_rows).size),
+        "legacy_connected_relation_node_count": int(np.unique(edges.legacy_connected_cluster_rows).size),
+        "chain_restored_relation_node_count": int(max(
+            np.unique(edges.support_cluster_rows).size
+            - np.unique(edges.legacy_connected_cluster_rows).size,
+            0,
+        )),
+        "retrieval_top16_probability_mass_mean": float(np.mean(np.sum(child_probability, axis=1))),
+        "family_shortlist_probability_mass_mean": float(np.mean(selected_child_mass)),
+        "fixed_mode_top2_probability_mass_mean": float(np.mean(retained_mode_mass)),
+        "probability_mass_contract": "sum_non_null_plus_five_typed_nulls_equals_one_v2",
+    }
+    return RelationConfigurationEvidence(
+        output, assignments, primitive_assignments, edges, query_diagnostics,
+    )

@@ -388,7 +388,7 @@ def main() -> None:
         "feature_names": list(FEATURE_NAMES), "edge_families": list(EDGE_FAMILIES),
         "relation_null_types": list(RELATION_NULL_TYPES),
         "pairing_contract": "same_image_same_query_edge_fixed_options_v1",
-        "edge_contract": "query_only_fit_tree_disjoint_verify_v1",
+        "edge_contract": "query_only_complete_link_fit_tree_disjoint_verify_v2",
         "option_contract": "fixed_vfm_topm_runtime_topc_v1",
         "runtime_maximum_children": int(args.runtime_maximum_children),
         "maximum_modes": int(args.maximum_modes), "temperature": float(args.temperature),
