@@ -834,6 +834,93 @@ representation or retraining/calibration under the corrected complete-link
 edge distribution; proposal-family expansion remains Phase D only after the
 endpoint model closes.
 
+### G16 — mass-adaptive hierarchical endpoints
+
+G16 implements the fixed-compute endpoint correction without changing the
+clean 2DGS hierarchy, canonical RADIO-final field, query readout, typed graph,
+or frozen Top-32 pose pool.  Each complete-link endpoint now evaluates the
+full query-only child posterior and Top-8 local modes, then retains the 16
+largest parent->child->mode leaf masses.  Omitted probability is represented
+by separate support-invalid, parent-tail, child-tail, mode-tail,
+geometry-invalid and field-missing states.  A candidate pose can score but
+cannot change this universe.  Maximum normalization residual is
+`6.66e-16`.
+
+The support-correlation seam was tested on the same frozen validation pool.
+Keeping every overlapping node and fractionally scaling its full unary raises
+non-null mass but duplicates correlated observations; its node+fit P90 is
+`10.464 m`.  The retired G15 convention (fractional LLR only) gives a strong
+Dev diagnostic (`0.489/1.215 m`) but still multiplies the same retrieval prior
+more than once.  Neither is admissible.  The active implementation collapses
+each complete-link cluster once and averages its sparse identity posterior.
+An additional audit found that the first collapse implementation averaged the
+descriptor/posterior but retained a single representative's image center and
+extent.  G16 now collapses descriptor, posterior and the union observation
+geometry together; relation training and deployment use this identical
+endpoint definition.
+
+Hierarchy calibration is fitted with exact contributor truth and categorical
+log score, not a null threshold.  `seq9` is the fit split and `seq10` is the
+predefined level-selection split.  Support and parent calibration are rejected
+because their validation NLL worsens.  Only child and mode calibration are
+enabled:
+
+| hierarchy level | seq10 NLL before | fitted NLL | decision |
+|---|---:|---:|---|
+| support-valid | 0.767 | 0.863 | identity |
+| parent given valid | 1.513 | 1.557 | identity |
+| child given parent | 1.570 | **1.549** | temperature 0.482 |
+| mode given child | 2.000 | **1.654** | temperature 2.735 |
+
+The relation LLR is then retrained on corrected cluster geometry and the exact
+runtime adaptive options.  It uses a shared paired direction plus
+family-specific affine calibration.  Pair/aggregate concordance is
+`70.72%/79.93%` on its training trajectories and `78.60%/82.86%` on held-out
+`seq10`.  It stores no RGB, path, extra embedding, SfM track, ALIKE descriptor,
+or RADIO intermediate.
+
+The endpoint funnel improves, but remains sparse:
+
+| endpoint stage | G15 validation | G16 validation | G15 Dev48 | G16 Dev48 |
+|---|---:|---:|---:|---:|
+| truth child in full runtime posterior | 82.73% | 98.13% | 83.35% | 97.94% |
+| truth child in relation budget | 53.21% | 53.15% | 48.61% | 42.70% |
+| truth primitive in relation budget | 22.89% | 35.61% | 20.37% | 29.91% |
+| endpoint pose-valid | 21.69% | 33.20% | 20.37% | 29.60% |
+| relation edge has two valid GT endpoints | 5.08% | **10.34%** | 2.45% | **5.40%** |
+
+Thus the adaptive mode allocation substantially improves primitive and
+two-endpoint coverage, although the calibrated mode distribution expands only
+5.91 children per Dev group on average and child-identity coverage is lower
+than the old fixed family quota.  This is a real remaining allocation/identity
+trade-off, not a visibility failure.
+
+Frozen-pool accuracy is:
+
+| policy | validation median/P90 | validation success / Top-3 / catastrophic | Dev48 median/P90 | Dev48 success / Top-3 / catastrophic |
+|---|---:|---:|---:|---:|
+| G15 node + fit | 0.381 / 1.509 m | 64.71% / 70.59% / 11.76% | **0.457** / 1.596 m | **54.17%** / **70.83%** / 8.33% |
+| G16 node + fit | **0.359** / **1.509 m** | **70.59%** / 70.59% / 11.76% | 0.563 / **1.370 m** | 45.83% / 62.50% / **6.25%** |
+| G16 joint, held-out diagnostic | 0.279 / 1.509 m | 70.59% / 70.59% / 11.76% | 0.447 / 1.370 m | 52.08% / 62.50% / 6.25% |
+
+G16 passes the independent validation gate relative to G15 and improves the
+Dev tail, but the predefined node+fit main score loses Dev median, success and
+Top-3 recall.  The joint diagnostic cannot rescue promotion because held-out
+evidence was explicitly diagnostic-only and its Top-3 also regresses.  Seq3
+and seq5 remain controlled; seq13 still has `3.765 m` translation P90 and
+18.75% catastrophic failures.
+
+Most importantly, exact-GT versus phase-near-miss posterior non-null medians
+are `0.0763/0.0708` on validation but reverse to `0.0705/0.0783` on Dev48.
+Max-Sum is still all-null for every query.  G16 therefore proves that
+mass-adaptive states and cross-group relations increase usable endpoint
+coverage, but does not establish cross-trajectory physical instance identity.
+Production remains graph v9; untouched test, continuous refinement and
+relation-guided proposal generation remain closed.  The next justified method
+work is at the query-support/local-readout boundary of the single canonical
+field, especially the repeated-structure seq13 distribution, rather than more
+back-end Top-K, null-prior or LLR tuning.
+
 ## Development-set result
 
 The best deployable Goal-Maplet Top-1 remains the frozen graph v9 result, not
@@ -865,6 +952,7 @@ relevant, but it does not yet meet the requested accuracy.
 | M3.2 child-local measurement | scientific partial / production fail | grouped assignment implemented; hard capacity fails Dev promotion |
 | M3.3 sparse mode relation | scientific partial / production fail | held-out relation improves Dev median/ranking, but safe policy remains below graph Top-1 |
 | M3.4 relation probability semantics v2 | correctness pass / production fail | exact mass and pair marginals; 0.461/1.596 m Dev joint, but 8.33% catastrophic and all-null MAP |
+| M3.5 mass-adaptive hierarchical endpoints | method pass / production fail | two-valid endpoints 2.45% -> 5.40%; 0.563/1.370 m Dev node+fit, but median/Top-3 regress and GT-vs-phase reverses |
 | M4 refiner handoff | fail | no stable 0.1–0.5 m convergence basin |
 | M5 final paper claim | fail | no untouched test, hard-subset comparison or target accuracy |
 
@@ -940,8 +1028,13 @@ not an unsupported claim that VFM regions directly yield centimetre pose.
 - G14 single Dev48 audit: `goal_maplet/config_rank_pool_dev48_relation_top16_v32.json`, `goal_maplet/mode_relation_dev48_top16_v32.json`
 - G15 validation probability audit: `goal_maplet/config_rank_pool_mapping_relation_semantics_v2_validation_v33.json`, `goal_maplet/mode_relation_semantics_v2_validation_v35.json`
 - G15 Dev48 probability audit: `goal_maplet/config_rank_pool_dev48_relation_semantics_v2_v34.json`, `goal_maplet/mode_relation_semantics_v2_dev48_v35.json`
+- G16 selected hierarchy calibration: `goal_maplet/endpoint_hierarchy_calibration_seq9_g16_v3.json`, `goal_maplet/endpoint_hierarchy_calibration_seq9_g16_v3_summary.json`
+- G16 corrected relation model: `goal_maplet/mode_relation_likelihood_ratio_g16_calibrated_v3.joblib`, `goal_maplet/mode_relation_likelihood_ratio_g16_calibrated_v3.json`
+- G16 validation audit: `goal_maplet/config_rank_pool_g16_calibrated_validation_v40.json`, `goal_maplet/mode_relation_g16_calibrated_validation_v40.json`
+- G16 Dev48 audit: `goal_maplet/config_rank_pool_g16_calibrated_dev48_v40.json`, `goal_maplet/mode_relation_g16_calibrated_dev48_v40.json`
 - rejected conditional rank: `goal_maplet/pose_modes_graph_conditionalrank_dev48_v17.json`
 - 4x GT round-trip audit: `goal_maplet/surface_basin_radio_pca256_supersample4_oracle_smoke_gt1round_v4.json`
 
-Focused verification: `61 passed` across the Goal-Maplet relation/mainline
-tests plus the exact 2DGS compositing equivalence test.
+Focused verification: `65 passed` across all Goal-Maplet tests, including the
+hierarchy calibrator, coherent complete-link collapse, adaptive mass
+conservation, relation inference and exact 2DGS map contracts.

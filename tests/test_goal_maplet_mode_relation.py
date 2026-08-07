@@ -1,18 +1,41 @@
 import numpy as np
 import pytest
 from sklearn.linear_model import LogisticRegression
+from types import SimpleNamespace
 
 from feature_extract.vfm.localization_goal_maplet.mode_relation import (
     EDGE_FAMILIES,
     FEATURE_NAMES,
     ModeRelationLikelihoodRatioArtifact,
+    _aggregate_complete_link_observations,
     analytic_relation_score,
     build_sparse_relation_edges,
     exact_pair_log_marginal,
     family_preserving_child_shortlist,
+    mass_adaptive_endpoint_options,
     max_sum_forest,
     sum_product_forest,
 )
+
+
+def test_complete_link_collapse_aggregates_visual_and_geometric_support_together():
+    descriptor = np.asarray([[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]], dtype=np.float32)
+    xy = np.asarray([[10.0, 10.0], [14.0, 10.0], [50.0, 30.0]])
+    extent = np.asarray([[8.0, 6.0], [8.0, 10.0], [4.0, 4.0]])
+    collapsed_descriptor, collapsed_xy, collapsed_extent, collapsed_scale = (
+        _aggregate_complete_link_observations(
+            descriptor, xy, extent,
+            np.asarray([0, 0, 1]), np.asarray([0, 2]),
+        )
+    )
+    assert collapsed_descriptor[0] == pytest.approx(
+        np.asarray([1.0, 1.0]) / np.sqrt(2.0),
+    )
+    # The first cluster covers x=[6,18], y=[5,15]; no single member has this
+    # center/extent pair.
+    assert collapsed_xy[0] == pytest.approx([12.0, 10.0])
+    assert collapsed_extent[0] == pytest.approx([12.0, 10.0])
+    assert collapsed_scale[0] == pytest.approx(8.0)
 
 
 def test_relation_edges_are_query_only_tree_and_disjoint_verification():
@@ -161,6 +184,31 @@ def test_relation_artifact_contract_and_scalar_llr(tmp_path):
     assert loaded.score_log_likelihood_ratio(np.zeros((0, len(FEATURE_NAMES)))).shape == (0,)
 
 
+def test_relation_artifact_applies_edge_family_specific_affine_calibration():
+    x = np.zeros((6, len(FEATURE_NAMES)), dtype=np.float32)
+    x[:, 0] = [-2.0, -1.0, -0.5, 0.5, 1.0, 2.0]
+    estimator = LogisticRegression(random_state=0).fit(
+        x, np.asarray([1, 1, 1, 0, 0, 0]),
+    )
+    probe = np.zeros((3, len(FEATURE_NAMES)), dtype=np.float32)
+    probe[:, 0] = 0.75
+    probe[:, -3:] = np.eye(3, dtype=np.float32)
+    artifact = ModeRelationLikelihoodRatioArtifact(
+        estimator, 1.0, 0.0,
+        {
+            "artifact_type": "goal_maplet_mode_relation_likelihood_ratio_v1",
+            "feature_names": list(FEATURE_NAMES),
+            "pairing_contract": "same_image_same_runtime_query_edge_adaptive_options_v2",
+            "edge_contract": "query_only_complete_link_cluster_collapse_fit_verify_v3",
+        },
+        np.asarray([1.0, 2.0, 3.0]),
+        np.asarray([0.0, 0.5, 1.0]),
+    )
+    raw = estimator.decision_function(probe)
+    expected = np.asarray([raw[0], 2.0 * raw[1] + 0.5, 3.0 * raw[2] + 1.0])
+    assert artifact.score_log_likelihood_ratio(probe) == pytest.approx(expected)
+
+
 def test_family_shortlist_prevents_one_parent_from_filling_every_slot():
     class Physical:
         child_parent_rows = np.asarray([0, 0, 0, 1, 2], dtype=np.int64)
@@ -171,3 +219,50 @@ def test_family_shortlist_prevents_one_parent_from_filling_every_slot():
         child, probability, Physical(), maximum_children=4, maximum_per_parent=2,
     )
     assert mask.tolist() == [[True, True, False, True, True]]
+
+
+def test_mass_adaptive_endpoint_budget_follows_leaf_mass_and_conserves_probability(monkeypatch):
+    class Physical:
+        maplet_ids = np.asarray([10], dtype=np.int64)
+        child_parent_rows = np.asarray([0, 0], dtype=np.int64)
+
+    class Eligibility:
+        proposal_qualified = np.asarray([True, True])
+
+    likelihood = SimpleNamespace(
+        mode_primitive_rows=np.asarray([[100, 101], [200, 201]], dtype=np.int64),
+        mode_probabilities=np.asarray([[0.9, 0.1], [0.5, 0.5]], dtype=np.float64),
+        null_probabilities=np.asarray([0.0, 0.0], dtype=np.float64),
+    )
+    monkeypatch.setattr(
+        "feature_extract.vfm.localization_goal_maplet.child_local_likelihood."
+        "predict_child_local_surface_likelihood",
+        lambda *args, **kwargs: likelihood,
+    )
+    child = SimpleNamespace(
+        candidate_child_rows=np.asarray([[0, 1]], dtype=np.int64),
+        candidate_probabilities=np.asarray([[0.6, 0.3]], dtype=np.float64),
+    )
+    result = mass_adaptive_endpoint_options(
+        np.ones((1, 4), dtype=np.float32),
+        np.asarray([0.95]),
+        np.asarray([[10]], dtype=np.int64),
+        np.asarray([[0.90]], dtype=np.float64),
+        child, Physical(), object(), Eligibility(),
+        state_budget=3, maximum_modes=2,
+    )
+    selected_child = result.factor_child_rows[result.selected_factor_rows]
+    # The concentrated child spends only one state; the ambiguous child earns
+    # two because both of its leaves carry more mass than the first child's
+    # low-probability second mode.
+    assert selected_child.tolist().count(0) == 1
+    assert selected_child.tolist().count(1) == 2
+    assert result.parent_tail_mass[0] == pytest.approx(0.05)
+    total = (
+        np.sum(result.selected_base_masses)
+        + result.support_invalid_mass[0] + result.parent_tail_mass[0]
+        + result.child_tail_mass[0] + result.mode_tail_mass[0]
+        + result.field_missing_mass[0]
+    )
+    assert total == pytest.approx(1.0)
+    assert result.query_mass_residual[0] < 1e-12

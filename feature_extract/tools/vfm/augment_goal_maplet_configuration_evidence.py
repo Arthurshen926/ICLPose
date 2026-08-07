@@ -22,6 +22,7 @@ from feature_extract.vfm.localization_goal_maplet.configuration_evidence import 
     configuration_candidate_latent_evidence,
 )
 from feature_extract.vfm.localization_goal_maplet.feature_contract import FieldFeatureContract
+from feature_extract.vfm.localization_goal_maplet.endpoint_hierarchy import EndpointHierarchyCalibration
 from feature_extract.vfm.localization_goal_maplet.lineage import file_sha256
 from feature_extract.vfm.localization_goal_maplet.physical_map import GoalMapletPhysicalMap
 from feature_extract.vfm.localization_goal_maplet.pose_likelihood_ratio import PoseLikelihoodRatioArtifact
@@ -93,9 +94,9 @@ def _offline_truth_coverage_ladder(
         (relation.query_diagnostics or {}).get("selected_group_rows", ()), dtype=np.int64,
     )
     stage_names = (
-        "truth_child_top16", "truth_child_parent_quota_top2",
-        "truth_child_family_top8", "truth_primitive_top8",
-        "truth_primitive_relation_top2", "endpoint_pose_valid",
+        "truth_child_full_posterior", "truth_child_adaptive_budget",
+        "truth_primitive_top8_given_adaptive_child",
+        "truth_primitive_adaptive_budget", "endpoint_pose_valid",
     )
     if selected_groups.size == 0:
         return {
@@ -103,28 +104,19 @@ def _offline_truth_coverage_ladder(
             **{name: {"count": 0, "fraction": 0.0} for name in stage_names},
             "pair_both_endpoints_valid": {"count": 0, "fraction": 0.0},
         }
-    runtime_child = np.asarray(
-        child_posterior.candidate_child_rows[
-            selected_groups, : int(runtime_maximum_children)
-        ], dtype=np.int64,
-    )
-    runtime_probability = np.asarray(
-        child_posterior.candidate_probabilities[
-            selected_groups, : int(runtime_maximum_children)
-        ], dtype=np.float64,
-    )
-    shortlist = family_preserving_child_shortlist(
-        runtime_child, runtime_probability, physical,
-        maximum_children=8, maximum_per_parent=2,
-    )
-    shortlist &= runtime_child >= 0
-    shortlist &= eligibility.proposal_qualified[np.maximum(runtime_child, 0)]
-
     truth_child, truth_xyz, truth_local_group = [], [], []
+    cluster_members = (relation.query_diagnostics or {}).get("cluster_member_group_rows", ())
     for local_group, group in enumerate(selected_groups.tolist()):
-        members = grouped.member_token_indices[
-            int(grouped.member_offsets[group]) : int(grouped.member_offsets[group + 1])
-        ]
+        source_groups = (
+            [int(value) for value in cluster_members[local_group]]
+            if local_group < len(cluster_members) else [int(group)]
+        )
+        members = np.concatenate([
+            grouped.member_token_indices[
+                int(grouped.member_offsets[source]) : int(grouped.member_offsets[source + 1])
+            ]
+            for source in source_groups
+        ])
         members = members[oracle.child_rows[members] >= 0]
         if members.size == 0:
             continue
@@ -150,19 +142,27 @@ def _offline_truth_coverage_ladder(
     truth_child = np.asarray(truth_child, dtype=np.int64)
     truth_xyz = np.asarray(truth_xyz, dtype=np.float64)
     truth_local_group = np.asarray(truth_local_group, dtype=np.int64)
-    rows = runtime_child[truth_local_group]
-    top16 = np.any(rows == truth_child[:, None], axis=1)
-    family = np.any((rows == truth_child[:, None]) & shortlist[truth_local_group], axis=1)
-    parent_quota = np.zeros((count,), dtype=bool)
-    for index, (local_group, child) in enumerate(zip(truth_local_group.tolist(), truth_child.tolist())):
-        parent = int(physical.child_parent_rows[child])
-        same_parent = (
-            (rows[index] >= 0)
-            & (physical.child_parent_rows[np.maximum(rows[index], 0)] == parent)
-            & eligibility.proposal_qualified[np.maximum(rows[index], 0)]
+    active_candidate_rows = np.asarray(
+        (relation.query_diagnostics or {}).get("active_candidate_child_rows", ()), dtype=np.int64,
+    )
+    adaptive_child_rows = (relation.query_diagnostics or {}).get(
+        "adaptive_selected_child_rows", (),
+    )
+    adaptive_primitive_rows = (relation.query_diagnostics or {}).get(
+        "adaptive_selected_primitive_rows", (),
+    )
+    full_child = np.asarray([
+        bool(
+            active_candidate_rows.ndim == 2
+            and local_group < active_candidate_rows.shape[0]
+            and np.any(active_candidate_rows[local_group] == child)
         )
-        ranked = rows[index][same_parent][:2]
-        parent_quota[index] = bool(np.any(ranked == child))
+        for local_group, child in zip(truth_local_group.tolist(), truth_child.tolist())
+    ], dtype=bool)
+    adaptive_child = np.asarray([
+        bool(local_group < len(adaptive_child_rows) and child in adaptive_child_rows[local_group])
+        for local_group, child in zip(truth_local_group.tolist(), truth_child.tolist())
+    ], dtype=bool)
 
     likelihood = predict_child_local_surface_likelihood(
         grouped_local[selected_groups[truth_local_group]], truth_child, physical, field,
@@ -178,9 +178,15 @@ def _offline_truth_coverage_ladder(
                 np.linalg.norm(physical.primitive_centers[members] - truth_xyz[index], axis=1)
             )])
     top8 = np.any(mode_rows == actual_primitive[:, None], axis=1)
-    top2 = np.any(
-        mode_rows[:, : int(shortlist_modes_per_child)] == actual_primitive[:, None], axis=1,
-    )
+    adaptive_primitive = np.asarray([
+        bool(
+            local_group < len(adaptive_primitive_rows)
+            and int(primitive) in adaptive_primitive_rows[local_group]
+        )
+        for local_group, primitive in zip(
+            truth_local_group.tolist(), actual_primitive.tolist(),
+        )
+    ], dtype=bool)
     scale_px = np.maximum(
         0.5 * np.linalg.norm(
             grouped.extent[selected_groups[truth_local_group]]
@@ -201,15 +207,14 @@ def _offline_truth_coverage_ladder(
         slots = np.flatnonzero(mode_rows[index] == actual_primitive[index])
         if slots.size:
             endpoint_valid[index] = bool(
-                slots[0] < int(shortlist_modes_per_child) and mode_valid[index, slots[0]]
+                adaptive_primitive[index] and mode_valid[index, slots[0]]
             )
     stages = {
-        "truth_child_top16": top16,
-        "truth_child_parent_quota_top2": top16 & parent_quota,
-        "truth_child_family_top8": top16 & family,
-        "truth_primitive_top8": top16 & family & top8,
-        "truth_primitive_relation_top2": top16 & family & top2,
-        "endpoint_pose_valid": top16 & family & top2 & endpoint_valid,
+        "truth_child_full_posterior": full_child,
+        "truth_child_adaptive_budget": full_child & adaptive_child,
+        "truth_primitive_top8_given_adaptive_child": full_child & adaptive_child & top8,
+        "truth_primitive_adaptive_budget": full_child & adaptive_child & adaptive_primitive,
+        "endpoint_pose_valid": full_child & adaptive_child & adaptive_primitive & endpoint_valid,
     }
     endpoint_by_group = np.zeros((selected_groups.size,), dtype=bool)
     endpoint_by_group[truth_local_group] = stages["endpoint_pose_valid"]
@@ -258,6 +263,7 @@ def main() -> None:
     parser.add_argument("--surface_mapper", required=True)
     parser.add_argument("--field_feature_contract", required=True)
     parser.add_argument("--validity_calibration", required=True)
+    parser.add_argument("--endpoint_hierarchy_calibration")
     parser.add_argument("--typed_graph", required=True)
     parser.add_argument("--child_eligibility", required=True)
     parser.add_argument("--child_local_factor_calibrator", required=True)
@@ -266,12 +272,20 @@ def main() -> None:
     parser.add_argument("--output_json", required=True)
     parser.add_argument("--maximum_groups", type=int, default=64)
     parser.add_argument("--maximum_children", type=int, default=4)
+    parser.add_argument("--endpoint_state_budget", type=int, default=16)
+    parser.add_argument(
+        "--relation_support_policy",
+        choices=("cluster_collapse", "fractional_unary", "g15_llr_only"),
+        default="cluster_collapse",
+    )
     parser.add_argument("--evidence_version", choices=("v2", "v3", "v4"), default="v2")
     parser.add_argument("--shard_index", type=int, default=0)
     parser.add_argument("--shard_count", type=int, default=1)
     parser.add_argument("--include_trajectories", nargs="+", default=[])
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--diagnostic_allow_non_crossfit", action="store_true")
+    parser.add_argument("--diagnostic_allow_legacy_relation_model", action="store_true")
+    parser.add_argument("--reuse_existing_configuration_evidence", action="store_true")
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
     output = Path(args.output_json)
@@ -296,6 +310,10 @@ def main() -> None:
         ModeRelationLikelihoodRatioArtifact.load(Path(args.mode_relation_likelihood_ratio))
         if args.mode_relation_likelihood_ratio else None
     )
+    hierarchy_calibration = (
+        EndpointHierarchyCalibration.load_json(Path(args.endpoint_hierarchy_calibration))
+        if args.endpoint_hierarchy_calibration else None
+    )
     if relation_ratio is not None and likelihood_ratio is None:
         raise ValueError("mode-relation evidence requires --pose_likelihood_ratio unary factors")
     if relation_ratio is not None and str(args.evidence_version) != "v4":
@@ -310,16 +328,36 @@ def main() -> None:
         relation_ratio.metadata.get("runtime_maximum_children", -1)
     ) != int(args.maximum_children):
         raise ValueError("mode-relation training Top-C differs from runtime maximum_children")
+    if (
+        relation_ratio is not None
+        and relation_ratio.metadata.get("option_contract")
+        != "mass_adaptive_parent_child_mode_budget_v3"
+        and not bool(args.diagnostic_allow_legacy_relation_model)
+    ):
+        raise ValueError(
+            "G16 deployment replay requires a relation model trained on mass-adaptive states"
+        )
+    if (
+        relation_ratio is not None
+        and relation_ratio.metadata.get("option_contract")
+        == "mass_adaptive_parent_child_mode_budget_v3"
+        and int(relation_ratio.metadata.get("endpoint_state_budget", -1))
+        != int(args.endpoint_state_budget)
+    ):
+        raise ValueError("mode-relation endpoint-state budget differs from runtime")
     candidate_pool_sha256 = file_sha256(Path(args.candidate_pool))
     training_pool_reuse = calibrator.metadata.get("candidate_pool_sha256") == candidate_pool_sha256
     application_trajectories = set(args.include_trajectories)
     supervised_trajectories = set()
-    for artifact in (calibrator, likelihood_ratio, relation_ratio):
+    for artifact in (calibrator, likelihood_ratio, relation_ratio, hierarchy_calibration):
         if artifact is None:
             continue
         supervised_trajectories |= set(artifact.metadata.get("training_trajectories", ()))
+        supervised_trajectories |= set(artifact.metadata.get("fit_trajectories", ()))
         supervised_trajectories |= set(artifact.metadata.get("calibration_trajectories", ()))
         supervised_trajectories |= set(artifact.metadata.get("validation_trajectories", ()))
+        supervised_trajectories |= set(artifact.metadata.get("endpoint_hierarchy_fit_trajectories", ()))
+        supervised_trajectories |= set(artifact.metadata.get("endpoint_hierarchy_validation_trajectories", ()))
     trajectory_cross_fit = bool(application_trajectories) and not bool(
         application_trajectories & supervised_trajectories
     )
@@ -349,6 +387,19 @@ def main() -> None:
                 raise ValueError(f"child-local artifact lineage differs: {key}")
     readout = readout_canonical_field(field, physical)
     validity = ValidityCalibration.load_json(Path(args.validity_calibration))
+    if hierarchy_calibration is not None:
+        for key, expected in (
+            ("physical_map_sha256", physical.content_sha256),
+            ("canonical_field_sha256", field.content_sha256),
+            ("field_feature_contract_sha256", contract.content_sha256),
+        ):
+            if hierarchy_calibration.metadata.get(key) != expected:
+                raise ValueError(f"endpoint hierarchy calibration lineage differs: {key}")
+    if relation_ratio is not None:
+        expected_hierarchy = relation_ratio.metadata.get("endpoint_hierarchy_calibration_sha256")
+        actual_hierarchy = hierarchy_calibration.content_sha256 if hierarchy_calibration is not None else None
+        if expected_hierarchy != actual_hierarchy:
+            raise ValueError("relation model and runtime endpoint hierarchy calibration differ")
     mapper, _ = load_surface_maplet_mapper(Path(args.surface_mapper), device=str(args.device))
     context_config = RadioFinalRegionConfig()
     local_config = RadioFinalRegionConfig(pool_sizes=(1,), pool_weights=(1.0,))
@@ -374,7 +425,7 @@ def main() -> None:
         _, token_xy = all_token_coordinates(int(raw.shape[1]), int(raw.shape[2]))
         context = encode_radio_final_regions(mapped, token_xy, context_config)
         local = encode_radio_final_regions(mapped, token_xy, local_config)
-        parent_ids, parent_probability, parent_null, _ = retrieve_maplet_posterior(
+        parent_ids, parent_probability, parent_null, parent_best_similarity = retrieve_maplet_posterior(
             context, readout.parent_descriptors, physical.maplet_ids,
             readout.parent_coverage > 0.0, maximum_candidates=64, temperature=0.07,
             null_similarity_center=float(validity.center), null_similarity_scale=float(validity.scale),
@@ -389,6 +440,15 @@ def main() -> None:
             parent_ids, parent_probability, parent_null,
             grouped.member_offsets, grouped.member_token_indices, maximum_candidates=64,
         )
+        token_support_valid = validity.predict_valid(parent_best_similarity)
+        group_support_valid = np.asarray([
+            np.mean(token_support_valid[
+                grouped.member_token_indices[
+                    int(grouped.member_offsets[group]) : int(grouped.member_offsets[group + 1])
+                ]
+            ])
+            for group in range(grouped.member_offsets.size - 1)
+        ], dtype=np.float64)
         grouped_local = aggregate_group_descriptors(local, grouped.member_offsets, grouped.member_token_indices)
         child = retrieve_children_given_parents(
             grouped_local, group_parent_ids, group_parent_probability, group_parent_null,
@@ -401,28 +461,37 @@ def main() -> None:
         )
         row = pool_rows[image_id]
         poses = np.asarray([item["pose_w2c"] for item in row["mode_details"][MODE]], dtype=np.float64)
-        if str(args.evidence_version) in ("v3", "v4"):
-            extent = grouped.extent * np.asarray([camera.width, camera.height], dtype=np.float64)
-            evidence = configuration_candidate_latent_evidence(
-                poses, grouped_local, xy, extent, scale,
-                group_parent_ids, group_parent_probability, group_parent_null,
-                child, physical, field, graph, eligibility, calibrator, camera,
-                pose_likelihood_ratio=likelihood_ratio,
-                maximum_groups=int(args.maximum_groups), maximum_children=int(args.maximum_children),
-            )
-            evidence_key = f"configuration_evidence_{args.evidence_version}"
-        else:
-            evidence = configuration_candidate_evidence(
-                poses, grouped_local, xy, scale,
-                group_parent_ids, group_parent_probability, group_parent_null,
-                child, physical, field, graph, eligibility, calibrator, camera,
-                maximum_groups=int(args.maximum_groups), maximum_children=int(args.maximum_children),
-            )
-            evidence_key = "configuration_evidence_v2"
         updated = json.loads(json.dumps(row))
-        updated["ranking_diagnostics"][MODE][evidence_key] = {
-            name: evidence[:, index].tolist() for index, name in enumerate(evidence_names)
-        }
+        extent = grouped.extent * np.asarray([camera.width, camera.height], dtype=np.float64)
+        evidence_key = (
+            f"configuration_evidence_{args.evidence_version}"
+            if str(args.evidence_version) in ("v3", "v4") else "configuration_evidence_v2"
+        )
+        if bool(args.reuse_existing_configuration_evidence):
+            existing = updated["ranking_diagnostics"][MODE].get(evidence_key)
+            if existing is None or any(name not in existing for name in evidence_names):
+                raise ValueError(
+                    f"candidate pool cannot reuse missing {evidence_key}: {image_id}"
+                )
+        else:
+            if str(args.evidence_version) in ("v3", "v4"):
+                evidence = configuration_candidate_latent_evidence(
+                    poses, grouped_local, xy, extent, scale,
+                    group_parent_ids, group_parent_probability, group_parent_null,
+                    child, physical, field, graph, eligibility, calibrator, camera,
+                    pose_likelihood_ratio=likelihood_ratio,
+                    maximum_groups=int(args.maximum_groups), maximum_children=int(args.maximum_children),
+                )
+            else:
+                evidence = configuration_candidate_evidence(
+                    poses, grouped_local, xy, scale,
+                    group_parent_ids, group_parent_probability, group_parent_null,
+                    child, physical, field, graph, eligibility, calibrator, camera,
+                    maximum_groups=int(args.maximum_groups), maximum_children=int(args.maximum_children),
+                )
+            updated["ranking_diagnostics"][MODE][evidence_key] = {
+                name: evidence[:, index].tolist() for index, name in enumerate(evidence_names)
+            }
         if relation_ratio is not None:
             relation = configuration_mode_relation_evidence(
                 poses, grouped_local, xy, extent, scale,
@@ -430,6 +499,10 @@ def main() -> None:
                 child, physical, field, eligibility, likelihood_ratio, relation_ratio, camera,
                 maximum_groups=int(args.maximum_groups),
                 retrieval_maximum_children=int(args.maximum_children),
+                endpoint_state_budget=int(args.endpoint_state_budget),
+                support_correlation_policy=str(args.relation_support_policy),
+                support_valid_probabilities=group_support_valid,
+                endpoint_hierarchy_calibration=hierarchy_calibration,
             )
             updated["ranking_diagnostics"][MODE]["mode_relation_evidence_v2"] = {
                 name: relation.features[:, index].tolist()
@@ -473,6 +546,9 @@ def main() -> None:
                 child, physical, field, eligibility, likelihood_ratio, relation_ratio, camera,
                 maximum_groups=int(args.maximum_groups),
                 retrieval_maximum_children=int(args.maximum_children),
+                endpoint_state_budget=int(args.endpoint_state_budget),
+                support_correlation_policy=str(args.relation_support_policy),
+                support_valid_probabilities=group_support_valid,
             )
             updated["ranking_diagnostics"][MODE]["mode_relation_gt_pose_evidence_v2"] = {
                 "offline_gt_only": True,
@@ -507,13 +583,17 @@ def main() -> None:
             "mode_relation_edge_contract": relation_ratio.metadata.get("edge_contract") if relation_ratio is not None else None,
             "mode_relation_option_contract": relation_ratio.metadata.get("option_contract") if relation_ratio is not None else None,
             "mode_relation_feature_names": list(RELATION_EVIDENCE_NAMES) if relation_ratio is not None else None,
-            "mode_relation_inference": "mass_conserving_exact_sum_product_fit_tree_pairwise_heldout_v2" if relation_ratio is not None else None,
-            "mode_relation_pose_evidence": "node_log_evidence_plus_fit_incremental_llr_common_state_measure_v2" if relation_ratio is not None else None,
+            "mode_relation_inference": "mass_adaptive_hierarchical_exact_sum_product_fit_tree_v3" if relation_ratio is not None else None,
+            "mode_relation_pose_evidence": "layered_endpoint_mass_plus_node_and_fit_llr_v3" if relation_ratio is not None else None,
             "mode_relation_decode": "exact_max_sum" if relation_ratio is not None else None,
             "mode_relation_verification": "exact_fit_tree_pair_marginal_unconditional_predictive_llr_v2" if relation_ratio is not None else None,
-            "mode_relation_shortlist": "runtime_top16_family_preserving_8x2_top2_modes_with_omitted_mass" if relation_ratio is not None else None,
-            "mode_relation_support_decorrelation": "g12_complete_link_query_quality_medoid_v2" if relation_ratio is not None else None,
-            "mode_relation_probability_mass": "non_null_plus_retrieval_child_mode_geometry_field_typed_null_equals_one" if relation_ratio is not None else None,
+            "mode_relation_shortlist": f"best_first_parent_child_mode_fixed_budget_{int(args.endpoint_state_budget)}_v3" if relation_ratio is not None else None,
+            "mode_relation_support_decorrelation": f"complete_link_{str(args.relation_support_policy)}_v3" if relation_ratio is not None else None,
+            "mode_relation_probability_mass": "support_invalid_plus_parent_child_mode_tails_plus_geometry_field_and_nonnull_equals_one_v3" if relation_ratio is not None else None,
+            "mode_relation_endpoint_state_budget": int(args.endpoint_state_budget) if relation_ratio is not None else None,
+            "endpoint_hierarchy_calibration_sha256": (
+                hierarchy_calibration.content_sha256 if hierarchy_calibration is not None else None
+            ),
             "mode_relation_null_evidence": "fixed_physical_invalid_llr_query_uncertainty_neutral_v2" if relation_ratio is not None else None,
             "child_local_factor_calibrator_sha256": file_sha256(Path(args.child_local_factor_calibrator)),
             "application_trajectories": sorted(application_trajectories),

@@ -38,13 +38,20 @@ def _load(paths: list[Path]) -> tuple[dict[str, np.ndarray], dict]:
             current = json.loads(str(np.asarray(data["metadata_json"]).item()))
             for key in required:
                 parts[key].append(np.asarray(data[key]))
-        if current.get("artifact_type") != "goal_maplet_mode_relation_samples_v1":
-            raise ValueError("relation training requires mode-relation samples v1")
-        if current.get("pairing_contract") != "same_image_same_query_edge_fixed_options_v1":
+        if current.get("artifact_type") not in (
+            "goal_maplet_mode_relation_samples_v1",
+            "goal_maplet_mode_relation_samples_v2",
+        ):
+            raise ValueError("relation training requires mode-relation samples")
+        if current.get("pairing_contract") not in (
+            "same_image_same_query_edge_fixed_options_v1",
+            "same_image_same_runtime_query_edge_adaptive_options_v2",
+        ):
             raise ValueError("relation sample pairing contract differs")
         if current.get("edge_contract") not in (
             "query_only_fit_tree_disjoint_verify_v1",
             "query_only_complete_link_fit_tree_disjoint_verify_v2",
+            "query_only_complete_link_cluster_collapse_fit_verify_v3",
         ):
             raise ValueError("relation sample edge contract differs")
         if tuple(current.get("feature_names", ())) != FEATURE_NAMES:
@@ -57,6 +64,10 @@ def _load(paths: list[Path]) -> tuple[dict[str, np.ndarray], dict]:
                 "child_eligibility_sha256", "candidate_pool_sha256", "temperature",
                 "maximum_modes", "runtime_maximum_children", "pairing_contract", "edge_contract",
                 "option_contract",
+                "endpoint_state_budget",
+                "endpoint_hierarchy_calibration_sha256",
+                "endpoint_hierarchy_fit_trajectories",
+                "endpoint_hierarchy_validation_trajectories",
             ):
                 if current.get(key) != metadata.get(key):
                     raise ValueError(f"relation sample shards differ: {key}")
@@ -131,7 +142,26 @@ def _raw(estimator, features: np.ndarray) -> np.ndarray:
     return np.asarray(estimator.decision_function(features), dtype=np.float64).reshape(-1)
 
 
-def _calibrate(estimator, rows: dict[str, np.ndarray]) -> tuple[float, float]:
+def _fit_affine_calibration(
+    positive_raw: np.ndarray,
+    negative_raw: np.ndarray,
+) -> tuple[float, float]:
+    positive_raw = np.asarray(positive_raw, dtype=np.float64).reshape(-1)
+    negative_raw = np.asarray(negative_raw, dtype=np.float64).reshape(-1)
+    if positive_raw.size == 0 or negative_raw.size == 0:
+        raise ValueError("affine relation calibration has an empty class")
+    x = np.concatenate([positive_raw, negative_raw])[:, None]
+    y = np.concatenate([np.ones(positive_raw.size), np.zeros(negative_raw.size)]).astype(np.int64)
+    weight = np.where(y == 1, 0.5 / positive_raw.size, 0.5 / negative_raw.size)
+    weight *= y.size / np.sum(weight)
+    calibrator = LogisticRegression(C=1.0e6, max_iter=2000, random_state=214133)
+    calibrator.fit(x, y, sample_weight=weight)
+    return float(calibrator.coef_[0, 0]), float(calibrator.intercept_[0])
+
+
+def _calibrate(
+    estimator, rows: dict[str, np.ndarray],
+) -> tuple[float, float, np.ndarray, np.ndarray]:
     key = np.asarray([
         f"{image}\0{left}\0{right}\0{role}"
         for image, left, right, role in zip(
@@ -142,18 +172,32 @@ def _calibrate(estimator, rows: dict[str, np.ndarray]) -> tuple[float, float]:
     _, first = np.unique(key, return_index=True)
     positive = rows["positive_features"][np.sort(first)]
     negative = rows["negative_features"]
-    x = np.concatenate([_raw(estimator, positive), _raw(estimator, negative)])[:, None]
-    y = np.concatenate([np.ones(positive.shape[0]), np.zeros(negative.shape[0])]).astype(np.int64)
-    weight = np.where(y == 1, 0.5 / positive.shape[0], 0.5 / negative.shape[0])
-    weight *= y.size / np.sum(weight)
-    calibrator = LogisticRegression(C=1.0e6, max_iter=2000, random_state=214133)
-    calibrator.fit(x, y, sample_weight=weight)
-    return float(calibrator.coef_[0, 0]), float(calibrator.intercept_[0])
+    scale, intercept = _fit_affine_calibration(
+        _raw(estimator, positive), _raw(estimator, negative),
+    )
+    family_scale = np.full((len(EDGE_FAMILIES),), scale, dtype=np.float64)
+    family_intercept = np.full((len(EDGE_FAMILIES),), intercept, dtype=np.float64)
+    for family in range(len(EDGE_FAMILIES)):
+        selected = rows["edge_families"] == family
+        if int(np.sum(selected)) >= 8:
+            family_scale[family], family_intercept[family] = _fit_affine_calibration(
+                _raw(estimator, rows["positive_features"][selected]),
+                _raw(estimator, rows["negative_features"][selected]),
+            )
+    return scale, intercept, family_scale, family_intercept
 
 
-def _report(estimator, scale: float, intercept: float, rows: dict[str, np.ndarray]) -> dict:
-    positive = scale * _raw(estimator, rows["positive_features"]) + intercept
-    negative = scale * _raw(estimator, rows["negative_features"]) + intercept
+def _report(
+    estimator,
+    scale: float,
+    intercept: float,
+    family_scale: np.ndarray,
+    family_intercept: np.ndarray,
+    rows: dict[str, np.ndarray],
+) -> dict:
+    family = np.asarray(rows["edge_families"], dtype=np.int64)
+    positive = family_scale[family] * _raw(estimator, rows["positive_features"]) + family_intercept[family]
+    negative = family_scale[family] * _raw(estimator, rows["negative_features"]) + family_intercept[family]
     margin = positive - negative
     analytic_margin = analytic_relation_score(
         rows["positive_features"], np.ones(margin.shape, dtype=bool),
@@ -221,7 +265,9 @@ def main() -> None:
     }
     partitions = {name: _pairs(arrays, mask) for name, mask in masks.items()}
     estimator = _fit(partitions["train"])
-    scale, intercept = _calibrate(estimator, partitions["calibration"])
+    scale, intercept, family_scale, family_intercept = _calibrate(
+        estimator, partitions["calibration"],
+    )
     metadata = {
         "artifact_type": "goal_maplet_mode_relation_likelihood_ratio_v1",
         "feature_names": list(FEATURE_NAMES), "edge_families": list(EDGE_FAMILIES),
@@ -240,18 +286,40 @@ def main() -> None:
         "stored_downstream_embedding_count": 0, "uses_alike_descriptors": False,
         "uses_radio_intermediate": False, "uses_sfm_points": False,
         "uses_sfm_tracks": False, "uses_point_correspondences": False,
+        "relation_direction": "shared_paired_direction",
+        "relation_calibration": "edge_family_specific_affine",
         **{key: sample_metadata[key] for key in (
             "physical_map_sha256", "canonical_field_sha256", "field_feature_contract_sha256",
             "child_eligibility_sha256", "candidate_pool_sha256", "temperature", "maximum_modes",
         )},
     }
-    artifact = ModeRelationLikelihoodRatioArtifact(estimator, scale, intercept, metadata)
+    if "endpoint_state_budget" in sample_metadata:
+        metadata["endpoint_state_budget"] = int(sample_metadata["endpoint_state_budget"])
+    if sample_metadata.get("endpoint_hierarchy_calibration_sha256") is not None:
+        metadata["endpoint_hierarchy_calibration_sha256"] = str(
+            sample_metadata["endpoint_hierarchy_calibration_sha256"]
+        )
+        metadata["endpoint_hierarchy_fit_trajectories"] = list(
+            sample_metadata.get("endpoint_hierarchy_fit_trajectories", ())
+        )
+        metadata["endpoint_hierarchy_validation_trajectories"] = list(
+            sample_metadata.get("endpoint_hierarchy_validation_trajectories", ())
+        )
+    artifact = ModeRelationLikelihoodRatioArtifact(
+        estimator, scale, intercept, metadata, family_scale, family_intercept,
+    )
     artifact.save(model_path)
     result = {
         "stage": "train_goal_maplet_mode_relation_likelihood_ratio_v1",
         "model": str(model_path), "calibration_scale": scale,
         "calibration_intercept": intercept, "metadata": metadata,
-        "reports": {name: _report(estimator, scale, intercept, rows) for name, rows in partitions.items()},
+        "family_calibration_scale": family_scale.tolist(),
+        "family_calibration_intercept": family_intercept.tolist(),
+        "reports": {
+            name: _report(
+                estimator, scale, intercept, family_scale, family_intercept, rows,
+            ) for name, rows in partitions.items()
+        },
     }
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     summary_path.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")

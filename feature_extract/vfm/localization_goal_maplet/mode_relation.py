@@ -27,9 +27,10 @@ RELATION_NULL_TYPES = (
 )
 
 NODE_NULL_TYPES = (
-    "retrieval_null",
-    "child_shortlist_omitted",
-    "mode_shortlist_omitted",
+    "support_invalid",
+    "parent_tail",
+    "child_tail",
+    "mode_tail",
     "geometry_invalid",
     "field_missing",
 )
@@ -477,6 +478,8 @@ class ModeRelationLikelihoodRatioArtifact:
     calibration_scale: float
     calibration_intercept: float
     metadata: Mapping[str, object]
+    family_calibration_scale: np.ndarray | None = None
+    family_calibration_intercept: np.ndarray | None = None
 
     def score_log_likelihood_ratio(self, features: np.ndarray) -> np.ndarray:
         value = np.asarray(features, dtype=np.float32)
@@ -485,7 +488,26 @@ class ModeRelationLikelihoodRatioArtifact:
         if value.shape[0] == 0:
             return np.zeros((0,), dtype=np.float64)
         raw = np.asarray(self.pair_estimator.decision_function(value), dtype=np.float64).reshape(-1)
-        score = float(self.calibration_scale) * raw + float(self.calibration_intercept)
+        family_scale = (
+            None if self.family_calibration_scale is None
+            else np.asarray(self.family_calibration_scale, dtype=np.float64).reshape(-1)
+        )
+        family_intercept = (
+            None if self.family_calibration_intercept is None
+            else np.asarray(self.family_calibration_intercept, dtype=np.float64).reshape(-1)
+        )
+        if family_scale is not None or family_intercept is not None:
+            if (
+                family_scale is None or family_intercept is None
+                or family_scale.shape != (len(EDGE_FAMILIES),)
+                or family_intercept.shape != (len(EDGE_FAMILIES),)
+            ):
+                raise ValueError("mode-relation family calibration differs")
+            family_columns = np.asarray(value[:, -len(EDGE_FAMILIES):], dtype=np.float64)
+            family = np.argmax(family_columns, axis=1)
+            score = family_scale[family] * raw + family_intercept[family]
+        else:
+            score = float(self.calibration_scale) * raw + float(self.calibration_intercept)
         if not np.all(np.isfinite(score)):
             raise ValueError("mode-relation likelihood ratio contains non-finite values")
         return score
@@ -496,6 +518,14 @@ class ModeRelationLikelihoodRatioArtifact:
             "pair_estimator": self.pair_estimator,
             "calibration_scale": float(self.calibration_scale),
             "calibration_intercept": float(self.calibration_intercept),
+            "family_calibration_scale": (
+                None if self.family_calibration_scale is None
+                else np.asarray(self.family_calibration_scale, dtype=np.float64)
+            ),
+            "family_calibration_intercept": (
+                None if self.family_calibration_intercept is None
+                else np.asarray(self.family_calibration_intercept, dtype=np.float64)
+            ),
             "metadata": dict(self.metadata),
         }, Path(path))
 
@@ -507,16 +537,22 @@ class ModeRelationLikelihoodRatioArtifact:
             raise ValueError("not a Goal-Maplet mode-relation likelihood ratio")
         if tuple(metadata.get("feature_names", ())) != FEATURE_NAMES:
             raise ValueError("mode-relation feature contract differs")
-        if metadata.get("pairing_contract") != "same_image_same_query_edge_fixed_options_v1":
+        if metadata.get("pairing_contract") not in (
+            "same_image_same_query_edge_fixed_options_v1",
+            "same_image_same_runtime_query_edge_adaptive_options_v2",
+        ):
             raise ValueError("mode-relation pairing contract differs")
         if metadata.get("edge_contract") not in (
             "query_only_fit_tree_disjoint_verify_v1",
             "query_only_complete_link_fit_tree_disjoint_verify_v2",
+            "query_only_complete_link_cluster_collapse_fit_verify_v3",
         ):
             raise ValueError("mode-relation edge contract differs")
         return cls(
             payload["pair_estimator"], float(payload["calibration_scale"]),
             float(payload["calibration_intercept"]), metadata,
+            payload.get("family_calibration_scale"),
+            payload.get("family_calibration_intercept"),
         )
 
 
@@ -801,9 +837,10 @@ RELATION_EVIDENCE_NAMES = (
     "relation_posterior_non_null_mass_mean",
     "relation_posterior_entropy_mean",
     "relation_maxsum_non_null_fraction",
-    "relation_prior_retrieval_null_mass_mean",
-    "relation_prior_child_omitted_mass_mean",
-    "relation_prior_mode_omitted_mass_mean",
+    "relation_prior_support_invalid_mass_mean",
+    "relation_prior_parent_tail_mass_mean",
+    "relation_prior_child_tail_mass_mean",
+    "relation_prior_mode_tail_mass_mean",
     "relation_prior_geometry_invalid_mass_mean",
     "relation_prior_field_missing_mass_mean",
     "relation_prior_mass_residual_max",
@@ -911,6 +948,408 @@ def family_preserving_child_shortlist(
     return output
 
 
+@dataclass(frozen=True)
+class MassAdaptiveEndpointOptions:
+    """A fixed-budget, query-only parent->child->mode endpoint expansion.
+
+    ``factor_*`` arrays describe every eligible child branch whose local modes
+    were evaluated.  ``selected_*`` indexes the leaf states retained by the
+    fixed endpoint-state budget.  All masses are unconditional probabilities
+    in one common hierarchy; no candidate pose has been inspected yet.
+    """
+
+    factor_group_rows: np.ndarray
+    factor_child_rows: np.ndarray
+    factor_child_probabilities: np.ndarray
+    factor_parent_probabilities: np.ndarray
+    likelihood: object
+    selected_factor_rows: np.ndarray
+    selected_mode_rows: np.ndarray
+    selected_base_masses: np.ndarray
+    support_invalid_mass: np.ndarray
+    parent_tail_mass: np.ndarray
+    child_tail_mass: np.ndarray
+    mode_tail_mass: np.ndarray
+    field_missing_mass: np.ndarray
+    query_mass_residual: np.ndarray
+
+    def __post_init__(self) -> None:
+        factor_group = np.asarray(self.factor_group_rows, dtype=np.int64).reshape(-1)
+        factor_child = np.asarray(self.factor_child_rows, dtype=np.int64).reshape(-1)
+        factor_probability = np.asarray(
+            self.factor_child_probabilities, dtype=np.float64,
+        ).reshape(-1)
+        parent_probability = np.asarray(
+            self.factor_parent_probabilities, dtype=np.float64,
+        ).reshape(-1)
+        selected_factor = np.asarray(self.selected_factor_rows, dtype=np.int64).reshape(-1)
+        selected_mode = np.asarray(self.selected_mode_rows, dtype=np.int64).reshape(-1)
+        selected_mass = np.asarray(self.selected_base_masses, dtype=np.float64).reshape(-1)
+        if not (
+            factor_group.shape == factor_child.shape == factor_probability.shape
+            == parent_probability.shape
+            and selected_factor.shape == selected_mode.shape == selected_mass.shape
+        ):
+            raise ValueError("mass-adaptive endpoint option arrays differ")
+        if np.any((selected_factor < 0) | (selected_factor >= factor_group.size)):
+            raise ValueError("mass-adaptive endpoint factor index is invalid")
+        if np.any(selected_mode < 0) or np.any(selected_mass < 0.0):
+            raise ValueError("mass-adaptive endpoint leaf is invalid")
+        group_count = np.asarray(self.support_invalid_mass).reshape(-1).size
+        for name in (
+            "support_invalid_mass", "parent_tail_mass", "child_tail_mass",
+            "mode_tail_mass", "field_missing_mass", "query_mass_residual",
+        ):
+            value = np.asarray(getattr(self, name), dtype=np.float64).reshape(-1)
+            if value.shape != (group_count,) or np.any(~np.isfinite(value)):
+                raise ValueError("mass-adaptive endpoint mass arrays differ")
+            object.__setattr__(self, name, value)
+        object.__setattr__(self, "factor_group_rows", factor_group)
+        object.__setattr__(self, "factor_child_rows", factor_child)
+        object.__setattr__(self, "factor_child_probabilities", factor_probability)
+        object.__setattr__(self, "factor_parent_probabilities", parent_probability)
+        object.__setattr__(self, "selected_factor_rows", selected_factor)
+        object.__setattr__(self, "selected_mode_rows", selected_mode)
+        object.__setattr__(self, "selected_base_masses", selected_mass)
+
+
+def mass_adaptive_endpoint_options(
+    query_descriptors: np.ndarray,
+    support_valid_probabilities: np.ndarray,
+    parent_candidate_ids: np.ndarray,
+    parent_probabilities: np.ndarray,
+    child_posterior,
+    physical: GoalMapletPhysicalMap,
+    field,
+    eligibility,
+    *,
+    state_budget: int = 16,
+    maximum_modes: int = 8,
+    temperature: float = 0.07,
+    endpoint_hierarchy_calibration=None,
+) -> MassAdaptiveEndpointOptions:
+    """Allocate a fixed leaf-state budget by posterior mass.
+
+    The finite parent->child->mode tree has a depth shared by every branch, so
+    sorting its leaf frontier by unconditional mass is exactly the result of a
+    best-first expansion with zero-cost internal nodes.  Unlike a Top-K quota,
+    this lets confident children use one state and genuinely multi-modal
+    children use several.  Every unexpanded subtree is retained as an explicit
+    typed tail, which makes the construction strictly mass conserving.
+    """
+
+    from .child_local_likelihood import predict_child_local_surface_likelihood
+
+    descriptor = np.asarray(query_descriptors, dtype=np.float32)
+    support_valid = np.clip(
+        np.asarray(support_valid_probabilities, dtype=np.float64).reshape(-1), 0.0, 1.0,
+    )
+    parent_ids = np.asarray(parent_candidate_ids, dtype=np.int64)
+    parent_probability = np.asarray(parent_probabilities, dtype=np.float64)
+    child_rows = np.asarray(child_posterior.candidate_child_rows, dtype=np.int64)
+    child_probability = np.asarray(child_posterior.candidate_probabilities, dtype=np.float64)
+    group_count = descriptor.shape[0]
+    if (
+        descriptor.ndim != 2 or support_valid.shape != (group_count,)
+        or parent_ids.ndim != 2 or parent_ids.shape[0] != group_count
+        or parent_probability.shape != parent_ids.shape
+        or child_rows.ndim != 2 or child_rows.shape[0] != group_count
+        or child_probability.shape != child_rows.shape
+        or int(state_budget) < 1 or int(maximum_modes) < 1
+    ):
+        raise ValueError("mass-adaptive endpoint hierarchy arrays differ")
+
+    old_support_valid = support_valid.copy()
+    old_parent_probability = parent_probability.copy()
+    old_child_probability = child_probability.copy()
+    if endpoint_hierarchy_calibration is not None:
+        from .endpoint_hierarchy import conditional_with_tail
+
+        support_valid = np.asarray(
+            endpoint_hierarchy_calibration.calibrate_support(support_valid), dtype=np.float64,
+        )
+        calibrated_parent = np.zeros_like(parent_probability)
+        for group in range(group_count):
+            valid = (parent_ids[group] >= 0) & (old_parent_probability[group] > 0.0)
+            if not np.any(valid):
+                continue
+            conditional = conditional_with_tail(
+                old_parent_probability[group, valid], old_support_valid[group],
+            )
+            calibrated = endpoint_hierarchy_calibration.calibrate_distribution(
+                conditional, level="parent",
+            )
+            calibrated_parent[group, valid] = support_valid[group] * calibrated[:-1]
+        parent_probability = calibrated_parent
+
+        # Child retrieval is P(parent)P(child|parent).  Re-temperature every
+        # parent-conditioned child distribution, then attach it to the newly
+        # calibrated parent mass.  No identity is introduced or removed.
+        calibrated_child = np.zeros_like(child_probability)
+        for group in range(group_count):
+            valid = (child_rows[group] >= 0) & (old_child_probability[group] > 0.0)
+            if not np.any(valid):
+                continue
+            child_parent_ids = physical.maplet_ids[
+                physical.child_parent_rows[child_rows[group, valid]]
+            ]
+            valid_slots = np.flatnonzero(valid)
+            for parent_id in np.unique(child_parent_ids).tolist():
+                parent_old = float(np.sum(
+                    old_parent_probability[group][parent_ids[group] == int(parent_id)]
+                ))
+                parent_new = float(np.sum(
+                    parent_probability[group][parent_ids[group] == int(parent_id)]
+                ))
+                slots = valid_slots[child_parent_ids == int(parent_id)]
+                if parent_old <= 0.0 or parent_new <= 0.0 or slots.size == 0:
+                    continue
+                conditional = conditional_with_tail(
+                    old_child_probability[group, slots], parent_old,
+                )
+                calibrated = endpoint_hierarchy_calibration.calibrate_distribution(
+                    conditional, level="child",
+                )
+                calibrated_child[group, slots] = parent_new * calibrated[:-1]
+        child_probability = calibrated_child
+
+    valid_parent = (parent_ids >= 0) & (parent_probability > 0.0)
+    raw_parent_mass = np.sum(np.where(valid_parent, parent_probability, 0.0), axis=1)
+    # The validity head owns the root probability.  Sparse parent retrieval is
+    # conditional below it and may only retain, never create, valid mass.
+    retained_parent_mass = np.minimum(raw_parent_mass, support_valid)
+    parent_probability = parent_probability * (
+        retained_parent_mass / np.maximum(raw_parent_mass, 1e-12)
+    )[:, None]
+    support_invalid_mass = 1.0 - support_valid
+    parent_tail_mass = np.maximum(support_valid - retained_parent_mass, 0.0)
+
+    valid_child = (child_rows >= 0) & (child_probability > 0.0)
+    child_probability = np.where(valid_child, child_probability, 0.0)
+    child_total = np.sum(child_probability, axis=1)
+    child_scale = np.minimum(
+        1.0, retained_parent_mass / np.maximum(child_total, 1e-12),
+    )
+    child_probability *= child_scale[:, None]
+    child_total = np.sum(child_probability, axis=1)
+    child_retrieval_tail = np.maximum(retained_parent_mass - child_total, 0.0)
+
+    safe_child = np.maximum(child_rows, 0)
+    eligible = valid_child & eligibility.proposal_qualified[safe_child]
+    factor_group, factor_slot = np.nonzero(eligible)
+    factor_child = child_rows[factor_group, factor_slot]
+    factor_probability = child_probability[factor_group, factor_slot]
+    if factor_group.size:
+        likelihood = predict_child_local_surface_likelihood(
+            descriptor[factor_group], factor_child, physical, field,
+            temperature=float(temperature), maximum_modes=int(maximum_modes),
+        )
+        primitive = np.asarray(likelihood.mode_primitive_rows, dtype=np.int64)
+        mode_probability = np.asarray(likelihood.mode_probabilities, dtype=np.float64)
+        if endpoint_hierarchy_calibration is not None:
+            from .endpoint_hierarchy import conditional_with_tail
+
+            calibrated_mode = np.zeros_like(mode_probability)
+            for factor in range(mode_probability.shape[0]):
+                valid_mode = (primitive[factor] >= 0) & (mode_probability[factor] > 0.0)
+                if not np.any(valid_mode):
+                    continue
+                conditional = conditional_with_tail(
+                    mode_probability[factor, valid_mode], 1.0,
+                )
+                calibrated = endpoint_hierarchy_calibration.calibrate_distribution(
+                    conditional, level="mode",
+                )
+                calibrated_mode[factor, valid_mode] = calibrated[:-1]
+            mode_probability = calibrated_mode
+        coverage = np.clip(
+            1.0 - np.asarray(likelihood.null_probabilities, dtype=np.float64), 0.0, 1.0,
+        )
+    else:
+        likelihood = predict_child_local_surface_likelihood(
+            descriptor[:0], np.zeros((0,), dtype=np.int64), physical, field,
+            temperature=float(temperature), maximum_modes=int(maximum_modes),
+        )
+        primitive = np.asarray(likelihood.mode_primitive_rows, dtype=np.int64)
+        mode_probability = np.asarray(likelihood.mode_probabilities, dtype=np.float64)
+        coverage = np.zeros((0,), dtype=np.float64)
+
+    parent_probability_by_factor = np.zeros((factor_group.size,), dtype=np.float64)
+    if factor_group.size:
+        parent_id = physical.maplet_ids[physical.child_parent_rows[factor_child]]
+        for factor, (group, current_parent) in enumerate(zip(
+            factor_group.tolist(), parent_id.tolist(),
+        )):
+            parent_probability_by_factor[factor] = float(np.sum(
+                parent_probability[group][parent_ids[group] == int(current_parent)]
+            ))
+
+    leaf_factor, leaf_mode = np.nonzero((primitive >= 0) & (mode_probability > 0.0))
+    leaf_group = factor_group[leaf_factor] if leaf_factor.size else np.zeros((0,), dtype=np.int64)
+    leaf_mass = (
+        factor_probability[leaf_factor] * coverage[leaf_factor]
+        * mode_probability[leaf_factor, leaf_mode]
+        if leaf_factor.size else np.zeros((0,), dtype=np.float64)
+    )
+    selected_leaf_rows: list[int] = []
+    for group in range(group_count):
+        rows = np.flatnonzero(leaf_group == group)
+        if rows.size == 0:
+            continue
+        # Stable identity/mode tie breakers make the state universe exactly
+        # reproducible across sharding and BLAS implementations.
+        order = np.lexsort((
+            leaf_mode[rows], factor_child[leaf_factor[rows]], -leaf_mass[rows],
+        ))
+        selected_leaf_rows.extend(rows[order[: int(state_budget)]].tolist())
+    selected_leaf = np.asarray(selected_leaf_rows, dtype=np.int64)
+    selected_factor = leaf_factor[selected_leaf]
+    selected_mode = leaf_mode[selected_leaf]
+    selected_mass = leaf_mass[selected_leaf]
+
+    selected_probability_by_factor = np.zeros((factor_group.size,), dtype=np.float64)
+    if selected_factor.size:
+        np.add.at(
+            selected_probability_by_factor, selected_factor,
+            mode_probability[selected_factor, selected_mode],
+        )
+    expanded = selected_probability_by_factor > 0.0
+    field_missing_mass = np.bincount(
+        factor_group,
+        weights=factor_probability * (1.0 - coverage),
+        minlength=group_count,
+    )
+    mode_tail_mass = np.bincount(
+        factor_group[expanded],
+        weights=(
+            factor_probability[expanded] * coverage[expanded]
+            * np.maximum(1.0 - selected_probability_by_factor[expanded], 0.0)
+        ),
+        minlength=group_count,
+    )
+    ineligible_mass = np.sum(np.where(valid_child & ~eligible, child_probability, 0.0), axis=1)
+    unexpanded_eligible_mass = np.bincount(
+        factor_group[~expanded],
+        weights=factor_probability[~expanded] * coverage[~expanded],
+        minlength=group_count,
+    )
+    child_tail_mass = child_retrieval_tail + ineligible_mass + unexpanded_eligible_mass
+    selected_mass_by_group = np.bincount(
+        leaf_group[selected_leaf], weights=selected_mass, minlength=group_count,
+    )
+    total = (
+        support_invalid_mass + parent_tail_mass + child_tail_mass + mode_tail_mass
+        + field_missing_mass + selected_mass_by_group
+    )
+    query_mass_residual = np.abs(total - 1.0)
+    if np.any(query_mass_residual > 2e-5):
+        raise ValueError(
+            "mass-adaptive endpoint hierarchy does not conserve probability: "
+            f"{float(np.max(query_mass_residual))}"
+        )
+
+    return MassAdaptiveEndpointOptions(
+        factor_group_rows=factor_group,
+        factor_child_rows=factor_child,
+        factor_child_probabilities=factor_probability,
+        factor_parent_probabilities=parent_probability_by_factor,
+        likelihood=likelihood,
+        selected_factor_rows=selected_factor,
+        selected_mode_rows=selected_mode,
+        selected_base_masses=selected_mass,
+        support_invalid_mass=support_invalid_mass,
+        parent_tail_mass=parent_tail_mass,
+        child_tail_mass=child_tail_mass,
+        mode_tail_mass=mode_tail_mass,
+        field_missing_mass=field_missing_mass,
+        query_mass_residual=query_mass_residual,
+    )
+
+
+def _aggregate_sparse_probability_rows(
+    identities: np.ndarray,
+    probabilities: np.ndarray,
+    clusters: np.ndarray,
+    representatives: np.ndarray,
+    *,
+    maximum_candidates: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Average correlated sparse posteriors without duplicating their mass."""
+
+    identity = np.asarray(identities, dtype=np.int64)
+    probability = np.asarray(probabilities, dtype=np.float64)
+    cluster = np.asarray(clusters, dtype=np.int64).reshape(-1)
+    representative = np.asarray(representatives, dtype=np.int64).reshape(-1)
+    if identity.shape != probability.shape or identity.shape[0] != cluster.size:
+        raise ValueError("sparse posterior aggregation arrays differ")
+    keep = max(1, int(maximum_candidates))
+    output_identity = np.full((representative.size, keep), -1, dtype=np.int64)
+    output_probability = np.zeros((representative.size, keep), dtype=np.float64)
+    for output_row, source_row in enumerate(representative.tolist()):
+        members = np.flatnonzero(cluster == cluster[source_row])
+        accumulated: dict[int, float] = {}
+        scale = 1.0 / max(float(members.size), 1.0)
+        for value, mass in zip(
+            identity[members].reshape(-1).tolist(), probability[members].reshape(-1).tolist(),
+        ):
+            if int(value) >= 0 and float(mass) > 0.0:
+                accumulated[int(value)] = accumulated.get(int(value), 0.0) + scale * float(mass)
+        ranked = sorted(accumulated.items(), key=lambda item: (-item[1], item[0]))[:keep]
+        if ranked:
+            output_identity[output_row, : len(ranked)] = [item[0] for item in ranked]
+            output_probability[output_row, : len(ranked)] = [item[1] for item in ranked]
+    return output_identity, output_probability
+
+
+def _aggregate_complete_link_observations(
+    descriptors: np.ndarray,
+    xy_px: np.ndarray,
+    extent_px: np.ndarray,
+    clusters: np.ndarray,
+    representatives: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Collapse every correlated support cluster into one coherent endpoint.
+
+    Sparse identity posteriors are averaged by
+    :func:`_aggregate_sparse_probability_rows`.  The observation geometry must
+    be collapsed over the *same* members: retaining a representative center
+    while averaging all descriptors/posteriors creates an endpoint whose
+    visual and geometric evidence refer to different supports.  Complete-link
+    members overlap strongly, so their bounding-box union is the conservative
+    footprint and its center is the corresponding observation coordinate.
+    """
+
+    descriptor = np.asarray(descriptors, dtype=np.float32)
+    xy = np.asarray(xy_px, dtype=np.float64)
+    extent = np.asarray(extent_px, dtype=np.float64)
+    cluster = np.asarray(clusters, dtype=np.int64).reshape(-1)
+    representative = np.asarray(representatives, dtype=np.int64).reshape(-1)
+    if (
+        descriptor.ndim != 2 or xy.shape != (descriptor.shape[0], 2)
+        or extent.shape != xy.shape or cluster.shape != (descriptor.shape[0],)
+    ):
+        raise ValueError("complete-link observation arrays differ")
+    output_descriptor, output_xy, output_extent = [], [], []
+    for source_row in representative.tolist():
+        members = np.flatnonzero(cluster == cluster[source_row])
+        value = np.mean(descriptor[members], axis=0)
+        output_descriptor.append(value / max(float(np.linalg.norm(value)), 1e-8))
+        lower = np.min(xy[members] - 0.5 * extent[members], axis=0)
+        upper = np.max(xy[members] + 0.5 * extent[members], axis=0)
+        output_xy.append(0.5 * (lower + upper))
+        output_extent.append(np.maximum(upper - lower, 0.0))
+    collapsed_extent = np.asarray(output_extent, dtype=np.float64)
+    collapsed_scale = np.maximum(
+        0.5 * np.linalg.norm(collapsed_extent, axis=1), 8.0,
+    )
+    return (
+        np.asarray(output_descriptor, dtype=np.float32),
+        np.asarray(output_xy, dtype=np.float64),
+        collapsed_extent,
+        collapsed_scale,
+    )
+
+
 def configuration_mode_relation_evidence(
     poses_w2c: np.ndarray,
     query_descriptors: np.ndarray,
@@ -934,14 +1373,31 @@ def configuration_mode_relation_evidence(
     shortlist_children_per_parent: int = 2,
     maximum_modes: int = 8,
     shortlist_modes_per_child: int = 2,
+    endpoint_state_budget: int = 16,
+    endpoint_state_policy: str = "mass_adaptive_g16",
+    support_correlation_policy: str = "cluster_collapse",
+    support_valid_probabilities: np.ndarray | None = None,
     temperature: float = 0.07,
+    endpoint_hierarchy_calibration=None,
 ) -> RelationConfigurationEvidence:
     """Mass-conserving exact fit-tree inference and held-out prediction."""
 
     from .child_local_factor import child_local_factor_runtime_features
-    from .child_local_likelihood import predict_child_local_surface_likelihood
+    from .child_local_likelihood import (
+        ChildLocalSurfaceLikelihood,
+        predict_child_local_surface_likelihood,
+    )
     from .child_local_mode_ranker import child_local_mode_runtime_features
     from .latent_configuration import effective_group_weights
+
+    from .child_retrieval import ChildTilePosterior
+
+    if endpoint_state_policy != "mass_adaptive_g16":
+        raise ValueError("G16 relation inference requires mass_adaptive_g16 endpoint states")
+    if support_correlation_policy not in (
+        "cluster_collapse", "fractional_unary", "g15_llr_only",
+    ):
+        raise ValueError("unknown support correlation policy")
 
     poses = np.asarray(poses_w2c, dtype=np.float64).reshape(-1, 4, 4)
     descriptor = np.asarray(query_descriptors, dtype=np.float32)
@@ -953,128 +1409,150 @@ def configuration_mode_relation_evidence(
     parent_null = np.asarray(parent_null_probabilities, dtype=np.float64).reshape(-1)
     if descriptor.shape[0] != xy.shape[0] or xy.shape != extent.shape or scale.size != xy.shape[0]:
         raise ValueError("relation configuration query evidence differs")
-    priority = 1.0 - parent_null
+    support_valid_all = (
+        np.clip(np.asarray(support_valid_probabilities, dtype=np.float64).reshape(-1), 0.0, 1.0)
+        if support_valid_probabilities is not None else np.clip(1.0 - parent_null, 0.0, 1.0)
+    )
+    if support_valid_all.shape != parent_null.shape:
+        raise ValueError("support-valid probability and query groups differ")
+    priority = support_valid_all
     groups = np.argsort(-priority, kind="stable")[: int(maximum_groups)]
     groups = groups[priority[groups] > 0.02]
     output = np.zeros((poses.shape[0], len(RELATION_EVIDENCE_NAMES)), dtype=np.float32)
-    assignments = np.full((poses.shape[0], groups.size), -1, dtype=np.int64)
-    primitive_assignments = np.full_like(assignments, -1)
     empty_edges = build_sparse_relation_edges(
         xy[groups], extent[groups], descriptor[groups], scale[groups],
         query_priority=priority[groups],
     ) if groups.size else SparseRelationEdges(*([np.zeros(0, dtype=np.int64)] * 9))
     if groups.size == 0:
+        assignments = np.full((poses.shape[0], 0), -1, dtype=np.int64)
+        primitive_assignments = np.full_like(assignments, -1)
         return RelationConfigurationEvidence(output, assignments, primitive_assignments, empty_edges)
     group_xy, group_extent, group_descriptor, group_scale = (
         xy[groups], extent[groups], descriptor[groups], scale[groups],
     )
-    edges = build_sparse_relation_edges(
+    original_edges = build_sparse_relation_edges(
         group_xy, group_extent, group_descriptor, group_scale,
         query_priority=priority[groups],
     )
-    cluster = np.asarray(edges.support_cluster_rows, dtype=np.int64)
-    group_weight = effective_group_weights(cluster)
-    child_rows = np.asarray(
-        child_posterior.candidate_child_rows[groups, : int(retrieval_maximum_children)], dtype=np.int64,
+    original_complete_count = int(np.unique(original_edges.support_cluster_rows).size)
+    original_legacy_count = int(np.unique(original_edges.legacy_connected_cluster_rows).size)
+
+    selected_parent_ids = parent_ids[groups]
+    selected_parent_probability = parent_probability[groups]
+    selected_child_rows = np.asarray(child_posterior.candidate_child_rows[groups], dtype=np.int64)
+    selected_child_probability = np.asarray(
+        child_posterior.candidate_probabilities[groups], dtype=np.float64,
     )
-    child_probability = np.asarray(
-        child_posterior.candidate_probabilities[groups, : int(retrieval_maximum_children)], dtype=np.float64,
+    selected_support_valid = support_valid_all[groups]
+    cluster_members_global: list[list[int]] = [[int(value)] for value in groups.tolist()]
+    if support_correlation_policy == "cluster_collapse":
+        cluster = np.asarray(original_edges.support_cluster_rows, dtype=np.int64)
+        representatives = np.asarray(original_edges.representative_groups, dtype=np.int64)
+        parent_keep = selected_parent_ids.shape[1]
+        child_keep = selected_child_rows.shape[1]
+        selected_parent_ids, selected_parent_probability = _aggregate_sparse_probability_rows(
+            selected_parent_ids, selected_parent_probability, cluster, representatives,
+            maximum_candidates=parent_keep,
+        )
+        selected_child_rows, selected_child_probability = _aggregate_sparse_probability_rows(
+            selected_child_rows, selected_child_probability, cluster, representatives,
+            maximum_candidates=child_keep,
+        )
+        selected_support_valid = np.asarray([
+            np.mean(selected_support_valid[cluster == cluster[row]]) for row in representatives.tolist()
+        ], dtype=np.float64)
+        cluster_members_global = []
+        for row in representatives.tolist():
+            members = np.flatnonzero(cluster == cluster[row])
+            cluster_members_global.append(groups[members].astype(np.int64).tolist())
+        group_descriptor, group_xy, group_extent, group_scale = (
+            _aggregate_complete_link_observations(
+                group_descriptor, group_xy, group_extent, cluster, representatives,
+            )
+        )
+        groups = groups[representatives]
+        remap = {int(source): target for target, source in enumerate(representatives.tolist())}
+        edges = SparseRelationEdges(
+            fit_left=np.asarray([remap[int(value)] for value in original_edges.fit_left], dtype=np.int64),
+            fit_right=np.asarray([remap[int(value)] for value in original_edges.fit_right], dtype=np.int64),
+            fit_family=original_edges.fit_family,
+            verify_left=np.asarray([remap[int(value)] for value in original_edges.verify_left], dtype=np.int64),
+            verify_right=np.asarray([remap[int(value)] for value in original_edges.verify_right], dtype=np.int64),
+            verify_family=original_edges.verify_family,
+            representative_groups=np.arange(representatives.size, dtype=np.int64),
+            support_cluster_rows=np.arange(representatives.size, dtype=np.int64),
+            legacy_connected_cluster_rows=np.arange(representatives.size, dtype=np.int64),
+        )
+        group_weight = np.ones((groups.size,), dtype=np.float64)
+    else:
+        edges = original_edges
+        group_weight = effective_group_weights(np.asarray(edges.support_cluster_rows, dtype=np.int64))
+
+    active_child_posterior = ChildTilePosterior(
+        selected_child_rows, selected_child_probability,
+        np.clip(1.0 - np.sum(selected_child_probability, axis=1), 0.0, 1.0),
     )
-    shortlist = family_preserving_child_shortlist(
-        child_rows, child_probability, physical,
-        maximum_children=int(shortlist_maximum_children),
-        maximum_per_parent=int(shortlist_children_per_parent),
+    options = mass_adaptive_endpoint_options(
+        group_descriptor, selected_support_valid,
+        selected_parent_ids, selected_parent_probability,
+        active_child_posterior, physical, field, eligibility,
+        state_budget=int(endpoint_state_budget), maximum_modes=int(maximum_modes),
+        temperature=float(temperature),
+        endpoint_hierarchy_calibration=endpoint_hierarchy_calibration,
     )
-    shortlist &= child_rows >= 0
-    shortlist &= eligibility.proposal_qualified[np.maximum(child_rows, 0)]
-    group_index, child_slot = np.nonzero(shortlist)
-    if group_index.size == 0:
-        return RelationConfigurationEvidence(output, assignments, primitive_assignments, edges)
-    selected_child = child_rows[group_index, child_slot]
-    # Normalize the complete retrieval posterior exactly once.  Runtime Top-16
-    # and the family shortlist only move omitted mass into an explicit null;
-    # they never renormalize the surviving child identities.
-    all_child_rows = np.asarray(child_posterior.candidate_child_rows[groups], dtype=np.int64)
-    all_child_probability = np.asarray(child_posterior.candidate_probabilities[groups], dtype=np.float64)
-    all_child_probability = np.where(all_child_rows >= 0, all_child_probability, 0.0)
-    raw_retrieval_null = np.asarray(child_posterior.null_probabilities[groups], dtype=np.float64)
-    posterior_total = raw_retrieval_null + np.sum(all_child_probability, axis=1)
-    posterior_total = np.maximum(posterior_total, 1e-12)
-    normalized_all_child_probability = all_child_probability / posterior_total[:, None]
-    retrieval_null_mass = raw_retrieval_null / posterior_total
-    selected_child_probability = child_probability[group_index, child_slot] / posterior_total[group_index]
-    selected_parent_rows = physical.child_parent_rows[selected_child]
-    selected_parent_ids = physical.maplet_ids[selected_parent_rows]
-    selected_parent_probability = np.asarray([
-        np.sum(parent_probability[groups[group]][parent_ids[groups[group]] == parent_id])
-        for group, parent_id in zip(group_index.tolist(), selected_parent_ids.tolist())
-    ], dtype=np.float64)
-    likelihood = predict_child_local_surface_likelihood(
-        group_descriptor[group_index], selected_child, physical, field,
-        temperature=float(temperature), maximum_modes=int(maximum_modes),
+    assignments = np.full((poses.shape[0], groups.size), -1, dtype=np.int64)
+    primitive_assignments = np.full_like(assignments, -1)
+    full_likelihood = options.likelihood
+    pose_factor_rows, factor_row_fixed = np.unique(
+        options.selected_factor_rows, return_inverse=True,
     )
+    likelihood = ChildLocalSurfaceLikelihood(**{
+        name: np.asarray(getattr(full_likelihood, name))[pose_factor_rows]
+        for name in (
+            "map_points", "expected_points", "covariance_local",
+            "mode_primitive_rows", "mode_probabilities", "maximum_similarity",
+            "entropy", "feature_coverage", "null_probabilities",
+        )
+    })
     primitive_matrix = np.asarray(likelihood.mode_primitive_rows, dtype=np.int64)
     probability_matrix = np.asarray(likelihood.mode_probabilities, dtype=np.float64)
-    fixed_mode = (
-        (primitive_matrix >= 0) & (probability_matrix > 0.0)
-        & (np.arange(primitive_matrix.shape[1])[None] < int(shortlist_modes_per_child))
-    )
-    factor_row_fixed, mode_row_fixed = np.nonzero(fixed_mode)
-    fixed_group = group_index[factor_row_fixed]
-    fixed_child = selected_child[factor_row_fixed]
+    mode_row_fixed = options.selected_mode_rows
+    fixed_group = options.factor_group_rows[pose_factor_rows[factor_row_fixed]]
+    fixed_child = options.factor_child_rows[pose_factor_rows[factor_row_fixed]]
     fixed_primitive = primitive_matrix[factor_row_fixed, mode_row_fixed]
     if fixed_group.size == 0:
         return RelationConfigurationEvidence(output, assignments, primitive_assignments, edges)
     for pose_row, pose in enumerate(poses):
         mode_feature, mode_valid = child_local_mode_runtime_features(
-            likelihood, selected_child, group_xy[group_index], group_scale[group_index],
+            likelihood, options.factor_child_rows[pose_factor_rows],
+            group_xy[options.factor_group_rows[pose_factor_rows]],
+            group_scale[options.factor_group_rows[pose_factor_rows]],
             pose, camera, physical, field,
         )
         factor_feature = child_local_factor_runtime_features(
-            likelihood, mode_feature, mode_valid, selected_child, physical,
-            parent_probability=selected_parent_probability,
-            child_probability=selected_child_probability,
-            parent_null_probability=parent_null[groups[group_index]],
-            query_scale_px=group_scale[group_index],
+            likelihood, mode_feature, mode_valid,
+            options.factor_child_rows[pose_factor_rows], physical,
+            parent_probability=options.factor_parent_probabilities[pose_factor_rows],
+            child_probability=options.factor_child_probabilities[pose_factor_rows],
+            parent_null_probability=(
+                1.0 - selected_support_valid[options.factor_group_rows[pose_factor_rows]]
+            ),
+            query_scale_px=group_scale[options.factor_group_rows[pose_factor_rows]],
             image_diagonal_px=float(np.hypot(camera.width, camera.height)),
         )
         factor_llr = pose_likelihood_ratio.score_log_likelihood_ratio(factor_feature)
         # Construct one common state measure.  Canonical coverage, omitted
         # modes and candidate geometry can only transfer mass into typed nulls.
         # The sum of all non-null and null priors is one for every group/pose.
-        coverage = np.clip(1.0 - np.asarray(likelihood.null_probabilities, dtype=np.float64), 0.0, 1.0)
-        retained_mode_probability = np.zeros_like(probability_matrix)
-        retained_mode_probability[fixed_mode] = probability_matrix[fixed_mode]
-        retained_mode_mass = np.sum(retained_mode_probability, axis=1)
         fixed_geometry_probability = np.exp(np.clip(
             np.asarray(mode_feature, dtype=np.float64)[factor_row_fixed, mode_row_fixed, 5],
             -60.0, 0.0,
         ))
         fixed_geometry_probability *= mode_valid[factor_row_fixed, mode_row_fixed]
-        fixed_base_mass = (
-            selected_child_probability[factor_row_fixed]
-            * coverage[factor_row_fixed]
-            * probability_matrix[factor_row_fixed, mode_row_fixed]
-        )
+        fixed_base_mass = options.selected_base_masses
         fixed_non_null_mass = fixed_base_mass * fixed_geometry_probability
         fixed_geometry_invalid_mass = fixed_base_mass - fixed_non_null_mass
 
-        selected_child_mass = np.bincount(
-            group_index, weights=selected_child_probability, minlength=groups.size,
-        )
-        child_omitted_mass = np.maximum(
-            np.sum(normalized_all_child_probability, axis=1) - selected_child_mass, 0.0,
-        )
-        field_missing_mass = np.bincount(
-            group_index,
-            weights=selected_child_probability * (1.0 - coverage),
-            minlength=groups.size,
-        )
-        mode_omitted_mass = np.bincount(
-            group_index,
-            weights=selected_child_probability * coverage * np.maximum(1.0 - retained_mode_mass, 0.0),
-            minlength=groups.size,
-        )
         geometry_invalid_mass = np.bincount(
             fixed_group, weights=fixed_geometry_invalid_mass, minlength=groups.size,
         )
@@ -1084,8 +1562,9 @@ def configuration_mode_relation_evidence(
         state_null_type: list[np.ndarray] = []
         state_prior_mass: list[np.ndarray] = []
         null_mass_matrix = np.stack([
-            retrieval_null_mass, child_omitted_mass, mode_omitted_mass,
-            geometry_invalid_mass, field_missing_mass,
+            options.support_invalid_mass, options.parent_tail_mass,
+            options.child_tail_mass, options.mode_tail_mass,
+            geometry_invalid_mass, options.field_missing_mass,
         ], axis=1)
         mass_residual = np.zeros((groups.size,), dtype=np.float64)
         for group in range(groups.size):
@@ -1095,12 +1574,20 @@ def configuration_mode_relation_evidence(
             total = float(np.sum(prior))
             mass_residual[group] = abs(total - 1.0)
             if total <= 1e-12:
-                prior[-len(NODE_NULL_TYPES) + NODE_NULL_TYPES.index("retrieval_null")] = 1.0
+                prior[-len(NODE_NULL_TYPES) + NODE_NULL_TYPES.index("support_invalid")] = 1.0
                 total = 1.0
             prior /= total
             score = np.log(np.maximum(prior, 1e-300))
             if current.size:
-                score[: current.size] += group_weight[group] * factor_llr[factor_row_fixed[current]]
+                score[: current.size] += factor_llr[factor_row_fixed[current]]
+            if support_correlation_policy == "fractional_unary":
+                score *= group_weight[group]
+            elif support_correlation_policy == "g15_llr_only" and current.size:
+                # Undo the full LLR above, then apply the retired G15 seam for
+                # a controlled audit on the same adaptive state universe.
+                score[: current.size] += (
+                    group_weight[group] - 1.0
+                ) * factor_llr[factor_row_fixed[current]]
             unary.append(score)
             state_prior_mass.append(prior)
             state_child.append(np.concatenate([
@@ -1181,8 +1668,8 @@ def configuration_mode_relation_evidence(
             posterior_non_null.append(float(np.sum(probability[state_null_type[group] < 0])))
             posterior_entropy.append(float(-np.sum(probability * np.log(np.maximum(probability, 1e-12)))))
         normalizer = max(float(np.sum(group_weight)) + edges.fit_left.size, 1.0)
-        complete_count = int(np.unique(edges.support_cluster_rows).size)
-        legacy_count = int(np.unique(edges.legacy_connected_cluster_rows).size)
+        complete_count = original_complete_count
+        legacy_count = original_legacy_count
         output[pose_row] = np.asarray([
             float(marginal.log_partition / normalizer),
             float(np.median(verify_array)) if verify_array.size else 0.0,
@@ -1204,20 +1691,45 @@ def configuration_mode_relation_evidence(
         ], dtype=np.float32)
     if not np.all(np.isfinite(output)):
         raise ValueError("relation configuration evidence contains non-finite values")
+    selected_state_count = np.bincount(fixed_group, minlength=groups.size)
+    retained_endpoint_mass = np.bincount(
+        fixed_group, weights=options.selected_base_masses, minlength=groups.size,
+    )
+    adaptive_child_rows = [
+        np.unique(fixed_child[fixed_group == group]).astype(np.int64).tolist()
+        for group in range(groups.size)
+    ]
+    adaptive_primitive_rows = [
+        fixed_primitive[fixed_group == group].astype(np.int64).tolist()
+        for group in range(groups.size)
+    ]
     query_diagnostics = {
         "selected_group_rows": groups.tolist(),
         "selected_group_count": int(groups.size),
-        "complete_link_relation_node_count": int(np.unique(edges.support_cluster_rows).size),
-        "legacy_connected_relation_node_count": int(np.unique(edges.legacy_connected_cluster_rows).size),
+        "cluster_member_group_rows": cluster_members_global,
+        "complete_link_relation_node_count": int(original_complete_count),
+        "legacy_connected_relation_node_count": int(original_legacy_count),
         "chain_restored_relation_node_count": int(max(
-            np.unique(edges.support_cluster_rows).size
-            - np.unique(edges.legacy_connected_cluster_rows).size,
-            0,
+            original_complete_count - original_legacy_count, 0,
         )),
-        "retrieval_top16_probability_mass_mean": float(np.mean(np.sum(child_probability, axis=1))),
-        "family_shortlist_probability_mass_mean": float(np.mean(selected_child_mass)),
-        "fixed_mode_top2_probability_mass_mean": float(np.mean(retained_mode_mass)),
-        "probability_mass_contract": "sum_non_null_plus_five_typed_nulls_equals_one_v2",
+        "inference_relation_node_count": int(groups.size),
+        "support_correlation_policy": str(support_correlation_policy),
+        "endpoint_state_policy": str(endpoint_state_policy),
+        "endpoint_state_budget": int(endpoint_state_budget),
+        "endpoint_state_count_mean": float(np.mean(selected_state_count)),
+        "endpoint_state_count_max": int(np.max(selected_state_count)),
+        "expanded_child_count_mean": float(np.mean([
+            len(value) for value in adaptive_child_rows
+        ])),
+        "adaptive_selected_child_rows": adaptive_child_rows,
+        "adaptive_selected_primitive_rows": adaptive_primitive_rows,
+        "active_candidate_child_rows": selected_child_rows.astype(np.int64).tolist(),
+        "full_child_probability_mass_mean": float(np.mean(np.sum(selected_child_probability, axis=1))),
+        "adaptive_endpoint_probability_mass_mean": float(np.mean(retained_endpoint_mass)),
+        "query_hierarchy_mass_residual_max": float(np.max(options.query_mass_residual)),
+        "probability_mass_contract": (
+            "support_invalid_plus_parent_child_mode_tails_plus_geometry_field_and_nonnull_equals_one_v3"
+        ),
     }
     return RelationConfigurationEvidence(
         output, assignments, primitive_assignments, edges, query_diagnostics,

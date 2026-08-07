@@ -84,6 +84,20 @@ all-null.  G15 is therefore a correctness and diagnostic advance, not a
 production promotion; untouched test, proposal-family expansion and the
 continuous refiner remain closed.
 
+The G16 endpoint pass replaces fixed parent/child/mode quotas with a
+mass-adaptive 16-leaf hierarchy and explicit parent/child/mode tails.  It also
+collapses complete-link descriptor, posterior and image footprint into one
+coherent endpoint, validates child/mode temperatures with proper log score,
+and retrains relation LLRs on the exact deployment state distribution.  On
+seq12/14 validation, node+fit improves from G15's 0.381/1.509 m and 64.71%
+strict success to 0.359/1.509 m and 70.59% without worsening Top-3 or
+catastrophic rate.  Dev48 improves P90 from 1.596 m to 1.370 m and catastrophic
+rate from 8.33% to 6.25%, but regresses median/success/Top-3 to
+0.563 m/45.83%/62.50%.  GT non-null mass also fails to separate repeated-
+facade phase errors on Dev48.  G16 is therefore a method-level partial pass,
+not a promotion; graph v9 remains production and the next blocker is
+cross-trajectory endpoint identity at the query-support/local-readout boundary.
+
 ## Frozen V6 Status
 
 See [the V6 mainline](docs/vfm/2dgs_maplet_atlas_localization_v6.md) for its

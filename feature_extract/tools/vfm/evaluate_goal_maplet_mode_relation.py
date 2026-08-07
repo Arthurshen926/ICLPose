@@ -99,10 +99,17 @@ def _risk_coverage(rows: list[dict], policy: str) -> dict:
 
 
 def _aggregate_endpoint_coverage(rows: list[dict]) -> dict:
+    adaptive = bool(rows) and "truth_child_adaptive_budget" in rows[0]["endpoint_coverage"]
     names = (
-        "truth_child_top16", "truth_child_parent_quota_top2",
-        "truth_child_family_top8", "truth_primitive_top8",
-        "truth_primitive_relation_top2", "endpoint_pose_valid",
+        (
+            "truth_child_full_posterior", "truth_child_adaptive_budget",
+            "truth_primitive_top8_given_adaptive_child",
+            "truth_primitive_adaptive_budget", "endpoint_pose_valid",
+        ) if adaptive else (
+            "truth_child_top16", "truth_child_parent_quota_top2",
+            "truth_child_family_top8", "truth_primitive_top8",
+            "truth_primitive_relation_top2", "endpoint_pose_valid",
+        )
     )
     denominator = int(sum(int(row["endpoint_coverage"]["observable_group_count"]) for row in rows))
     result = {"observable_group_count": denominator}
@@ -142,7 +149,10 @@ def main() -> None:
         raise FileExistsError("refusing to overwrite mode-relation audit")
     payload = json.loads(Path(args.candidate_pool).read_text())
     contract = dict(payload.get("configuration_evidence_contract", {}))
-    if contract.get("mode_relation_inference") != "mass_conserving_exact_sum_product_fit_tree_pairwise_heldout_v2":
+    if contract.get("mode_relation_inference") not in (
+        "mass_conserving_exact_sum_product_fit_tree_pairwise_heldout_v2",
+        "mass_adaptive_hierarchical_exact_sum_product_fit_tree_v3",
+    ):
         raise ValueError("candidate pool lacks mass-conserving relation evidence v2")
     rows = []
     policy_names = (
@@ -297,6 +307,12 @@ def main() -> None:
             "continuous_refiner_opened": False,
             "relation_guided_proposals_opened": False,
             "g13_relation_v2_node_fit_equal_rank": "posthoc_research_diagnostic_only",
+            "g16_mass_adaptive_endpoint": (
+                "frozen_pool_research_candidate"
+                if contract.get("mode_relation_inference")
+                == "mass_adaptive_hierarchical_exact_sum_product_fit_tree_v3"
+                else "not_present"
+            ),
         },
         "summary": summary, "trajectory_summary": trajectory_summary,
         "risk_coverage": {name: _risk_coverage(rows, name) for name in policy_names},
@@ -323,6 +339,18 @@ def main() -> None:
             ])),
             "chain_restored_relation_nodes_total": int(np.sum([
                 row["relation_v2_query_diagnostics"].get("chain_restored_relation_node_count", 0)
+                for row in rows
+            ])),
+            "inference_relation_nodes_mean": float(np.mean([
+                row["relation_v2_query_diagnostics"].get("inference_relation_node_count", 0)
+                for row in rows
+            ])),
+            "endpoint_state_count_mean": float(np.mean([
+                row["relation_v2_query_diagnostics"].get("endpoint_state_count_mean", 0.0)
+                for row in rows
+            ])),
+            "expanded_child_count_mean": float(np.mean([
+                row["relation_v2_query_diagnostics"].get("expanded_child_count_mean", 0.0)
                 for row in rows
             ])),
             "maxsum_non_null_query_fraction": float(np.mean([

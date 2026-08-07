@@ -12,17 +12,23 @@ from feature_extract.vfm.colmap_tracks import ColmapCamera
 from feature_extract.vfm.localization.surface_maplet_mapper import load_surface_maplet_mapper
 from feature_extract.vfm.localization_goal_maplet.canonical_field import CanonicalSurfaceField, readout_canonical_field
 from feature_extract.vfm.localization_goal_maplet.child_eligibility import ChildGeometryEligibility
-from feature_extract.vfm.localization_goal_maplet.child_local_likelihood import predict_child_local_surface_likelihood
-from feature_extract.vfm.localization_goal_maplet.child_local_mode_ranker import child_local_mode_runtime_features
-from feature_extract.vfm.localization_goal_maplet.child_retrieval import retrieve_children_given_parents
+from feature_extract.vfm.localization_goal_maplet.child_retrieval import (
+    ChildTilePosterior,
+    retrieve_children_given_parents,
+)
 from feature_extract.vfm.localization_goal_maplet.feature_contract import FieldFeatureContract
+from feature_extract.vfm.localization_goal_maplet.endpoint_hierarchy import EndpointHierarchyCalibration
 from feature_extract.vfm.localization_goal_maplet.lineage import file_sha256
 from feature_extract.vfm.localization_goal_maplet.mode_relation import (
     EDGE_FAMILIES,
     FEATURE_NAMES,
     RELATION_NULL_TYPES,
+    SparseRelationEdges,
+    _aggregate_complete_link_observations,
+    _aggregate_sparse_probability_rows,
     analytic_relation_score,
     build_sparse_relation_edges,
+    mass_adaptive_endpoint_options,
     mode_relation_runtime_features,
 )
 from feature_extract.vfm.localization_goal_maplet.oracle_pose import token_oracle_evidence
@@ -98,11 +104,13 @@ def main() -> None:
     parser.add_argument("--surface_mapper", required=True)
     parser.add_argument("--field_feature_contract", required=True)
     parser.add_argument("--validity_calibration", required=True)
+    parser.add_argument("--endpoint_hierarchy_calibration")
     parser.add_argument("--child_eligibility", required=True)
     parser.add_argument("--output_npz", required=True)
     parser.add_argument("--runtime_maximum_children", type=int, default=16)
     parser.add_argument("--maximum_groups_per_query", type=int, default=64)
     parser.add_argument("--maximum_modes", type=int, default=8)
+    parser.add_argument("--endpoint_state_budget", type=int, default=16)
     parser.add_argument("--temperature", type=float, default=0.07)
     parser.add_argument("--shard_index", type=int, default=0)
     parser.add_argument("--shard_count", type=int, default=1)
@@ -131,6 +139,18 @@ def main() -> None:
     pool_rows = {str(row["image_id"]): row for row in pool["rows"]}
     readout = readout_canonical_field(field, physical)
     calibration = ValidityCalibration.load_json(Path(args.validity_calibration))
+    hierarchy_calibration = (
+        EndpointHierarchyCalibration.load_json(Path(args.endpoint_hierarchy_calibration))
+        if args.endpoint_hierarchy_calibration else None
+    )
+    if hierarchy_calibration is not None:
+        for key, expected in (
+            ("physical_map_sha256", physical.content_sha256),
+            ("canonical_field_sha256", field.content_sha256),
+            ("field_feature_contract_sha256", contract.content_sha256),
+        ):
+            if hierarchy_calibration.metadata.get(key) != expected:
+                raise ValueError(f"endpoint hierarchy calibration lineage differs: {key}")
     mapper, _ = load_surface_maplet_mapper(Path(args.surface_mapper), device=str(args.device))
     context_config = RadioFinalRegionConfig()
     local_config = RadioFinalRegionConfig(pool_sizes=(1,), pool_weights=(1.0,))
@@ -156,7 +176,7 @@ def main() -> None:
         _, token_xy = all_token_coordinates(int(raw.shape[1]), int(raw.shape[2]))
         context = encode_radio_final_regions(mapped, token_xy, context_config)
         local = encode_radio_final_regions(mapped, token_xy, local_config)
-        parent_ids, parent_probability, parent_null, _ = retrieve_maplet_posterior(
+        parent_ids, parent_probability, parent_null, parent_best_similarity = retrieve_maplet_posterior(
             context, readout.parent_descriptors, physical.maplet_ids,
             readout.parent_coverage > 0.0, maximum_candidates=64, temperature=0.07,
             null_similarity_center=float(calibration.center), null_similarity_scale=float(calibration.scale),
@@ -171,6 +191,15 @@ def main() -> None:
             parent_ids, parent_probability, parent_null,
             grouped.member_offsets, grouped.member_token_indices, maximum_candidates=64,
         )
+        token_support_valid = calibration.predict_valid(parent_best_similarity)
+        group_support_valid = np.asarray([
+            np.mean(token_support_valid[
+                grouped.member_token_indices[
+                    int(grouped.member_offsets[group]) : int(grouped.member_offsets[group + 1])
+                ]
+            ])
+            for group in range(grouped.member_offsets.size - 1)
+        ], dtype=np.float64)
         grouped_local = aggregate_group_descriptors(local, grouped.member_offsets, grouped.member_token_indices)
         child_posterior = retrieve_children_given_parents(
             grouped_local, group_parent_ids, group_parent_probability, group_parent_null,
@@ -182,11 +211,82 @@ def main() -> None:
             token_height=int(raw.shape[1]), token_width=int(raw.shape[2]),
             image_height=int(camera.height), image_width=int(camera.width), camera=camera,
         )
-        truth_child, truth_xyz, group_rows = [], [], []
-        for group in range(grouped.member_offsets.size - 1):
-            members = grouped.member_token_indices[
-                int(grouped.member_offsets[group]) : int(grouped.member_offsets[group + 1])
-            ]
+        priority = group_support_valid
+        initial_groups = np.argsort(-priority, kind="stable")[: int(args.maximum_groups_per_query)]
+        initial_groups = initial_groups[priority[initial_groups] > 0.02]
+        if initial_groups.size < 2:
+            continue
+        descriptor = grouped_local[initial_groups]
+        xy = grouped.xy[initial_groups] * np.asarray([camera.width, camera.height], dtype=np.float64)
+        extent = grouped.extent[initial_groups] * np.asarray([camera.width, camera.height], dtype=np.float64)
+        scale = np.maximum(0.5 * np.linalg.norm(extent, axis=1), 8.0)
+        original_edges = build_sparse_relation_edges(
+            xy, extent, descriptor, scale, query_priority=priority[initial_groups],
+        )
+        cluster = np.asarray(original_edges.support_cluster_rows, dtype=np.int64)
+        representatives = np.asarray(original_edges.representative_groups, dtype=np.int64)
+        if representatives.size < 2:
+            continue
+        active_parent_ids, active_parent_probability = _aggregate_sparse_probability_rows(
+            group_parent_ids[initial_groups], group_parent_probability[initial_groups],
+            cluster, representatives, maximum_candidates=group_parent_ids.shape[1],
+        )
+        active_child_rows, active_child_probability = _aggregate_sparse_probability_rows(
+            child_posterior.candidate_child_rows[initial_groups],
+            child_posterior.candidate_probabilities[initial_groups],
+            cluster, representatives,
+            maximum_candidates=child_posterior.candidate_child_rows.shape[1],
+        )
+        active_support_valid = np.asarray([
+            np.mean(group_support_valid[initial_groups[cluster == cluster[row]]])
+            for row in representatives.tolist()
+        ], dtype=np.float64)
+        cluster_member_groups = []
+        for row_index in representatives.tolist():
+            members = np.flatnonzero(cluster == cluster[row_index])
+            cluster_member_groups.append(initial_groups[members])
+        descriptor, xy, extent, scale = _aggregate_complete_link_observations(
+            descriptor, xy, extent, cluster, representatives,
+        )
+        groups = initial_groups[representatives]
+        remap = {int(source): target for target, source in enumerate(representatives.tolist())}
+        edges = SparseRelationEdges(
+            fit_left=np.asarray([remap[int(value)] for value in original_edges.fit_left], dtype=np.int64),
+            fit_right=np.asarray([remap[int(value)] for value in original_edges.fit_right], dtype=np.int64),
+            fit_family=original_edges.fit_family,
+            verify_left=np.asarray([remap[int(value)] for value in original_edges.verify_left], dtype=np.int64),
+            verify_right=np.asarray([remap[int(value)] for value in original_edges.verify_right], dtype=np.int64),
+            verify_family=original_edges.verify_family,
+            representative_groups=np.arange(representatives.size, dtype=np.int64),
+            support_cluster_rows=np.arange(representatives.size, dtype=np.int64),
+            legacy_connected_cluster_rows=np.arange(representatives.size, dtype=np.int64),
+        )
+        active_child_posterior = ChildTilePosterior(
+            active_child_rows, active_child_probability,
+            np.clip(1.0 - np.sum(active_child_probability, axis=1), 0.0, 1.0),
+        )
+        options = mass_adaptive_endpoint_options(
+            descriptor, active_support_valid,
+            active_parent_ids, active_parent_probability,
+            active_child_posterior, physical, field, eligibility,
+            state_budget=int(args.endpoint_state_budget), maximum_modes=int(args.maximum_modes),
+            temperature=float(args.temperature),
+            endpoint_hierarchy_calibration=hierarchy_calibration,
+        )
+        selected_child = options.factor_child_rows[options.selected_factor_rows]
+        selected_primitive = np.asarray(options.likelihood.mode_primitive_rows, dtype=np.int64)[
+            options.selected_factor_rows, options.selected_mode_rows,
+        ]
+        children = np.full((groups.size,), -1, dtype=np.int64)
+        truth_primitive = np.full((groups.size,), -1, dtype=np.int64)
+        resolved = np.zeros((groups.size,), dtype=bool)
+        for active_group, source_groups in enumerate(cluster_member_groups):
+            members = np.concatenate([
+                grouped.member_token_indices[
+                    int(grouped.member_offsets[source]) : int(grouped.member_offsets[source + 1])
+                ]
+                for source in source_groups.tolist()
+            ])
             members = members[oracle.child_rows[members] >= 0]
             if members.size == 0:
                 continue
@@ -195,50 +295,26 @@ def main() -> None:
                 child = int(oracle.child_rows[token])
                 mass[child] = mass.get(child, 0.0) + float(oracle.child_mass[token])
             child = min(mass, key=lambda value: (-mass[value], value))
-            selected = members[oracle.child_rows[members] == child]
-            weight = oracle.child_mass[selected]
+            owned = members[oracle.child_rows[members] == child]
+            weight = np.asarray(oracle.child_mass[owned], dtype=np.float64)
             if float(np.sum(weight)) <= 0.0:
                 continue
-            runtime = child_posterior.candidate_child_rows[group, : int(args.runtime_maximum_children)]
-            if not np.any(runtime == child) or not eligibility.proposal_qualified[child]:
+            truth_xyz = np.average(oracle.child_local_xyz[owned], axis=0, weights=weight)
+            start, end = int(physical.child_member_offsets[child]), int(physical.child_member_offsets[child + 1])
+            primitive_members = physical.child_member_primitive_rows[start:end]
+            if primitive_members.size == 0:
                 continue
-            truth_child.append(child)
-            truth_xyz.append(np.average(oracle.child_local_xyz[selected], axis=0, weights=weight))
-            group_rows.append(group)
-        if len(group_rows) < 2:
-            continue
-        groups = np.asarray(group_rows, dtype=np.int64)
-        priority = 1.0 - group_parent_null[groups]
-        order = np.argsort(-priority, kind="stable")[: int(args.maximum_groups_per_query)]
-        groups = groups[order]
-        children = np.asarray(truth_child, dtype=np.int64)[order]
-        truth = np.asarray(truth_xyz, dtype=np.float64)[order]
-        descriptor = grouped_local[groups]
-        xy = grouped.xy[groups] * np.asarray([camera.width, camera.height], dtype=np.float64)
-        extent = grouped.extent[groups] * np.asarray([camera.width, camera.height], dtype=np.float64)
-        scale = np.maximum(0.5 * np.linalg.norm(extent, axis=1), 8.0)
-        likelihood = predict_child_local_surface_likelihood(
-            descriptor, children, physical, field,
-            temperature=float(args.temperature), maximum_modes=int(args.maximum_modes),
-        )
-        mode_feature, mode_valid = child_local_mode_runtime_features(
-            likelihood, children, xy, scale, labels.pose_w2c, camera, physical, field,
-        )
-        primitive = np.asarray(likelihood.mode_primitive_rows, dtype=np.int64)
-        point = physical.primitive_centers[np.maximum(primitive, 0)]
-        error = np.linalg.norm(point - truth[:, None], axis=2)
-        error[~mode_valid] = np.inf
-        mode = np.argmin(error, axis=1)
-        resolved = (
-            np.min(error, axis=1) <= 0.20
-        ) & (np.asarray(likelihood.feature_coverage) >= 0.75)
-        if np.sum(resolved) < 2:
-            continue
-        groups, children, descriptor, xy, extent, scale, mode, primitive = (
-            value[resolved] for value in (groups, children, descriptor, xy, extent, scale, mode, primitive)
-        )
-        truth_primitive = primitive[np.arange(mode.size), mode]
-        edges = build_sparse_relation_edges(xy, extent, descriptor, scale)
+            primitive = int(primitive_members[np.argmin(
+                np.linalg.norm(physical.primitive_centers[primitive_members] - truth_xyz, axis=1)
+            )])
+            state = (
+                (options.factor_group_rows[options.selected_factor_rows] == active_group)
+                & (selected_child == child) & (selected_primitive == primitive)
+            )
+            if np.any(state) and float(np.linalg.norm(physical.primitive_centers[primitive] - truth_xyz)) <= 0.20:
+                children[active_group] = child
+                truth_primitive[active_group] = primitive
+                resolved[active_group] = True
         edge_left = np.concatenate([edges.fit_left, edges.verify_left])
         edge_right = np.concatenate([edges.fit_right, edges.verify_right])
         edge_family = np.concatenate([edges.fit_family, edges.verify_family])
@@ -246,6 +322,10 @@ def main() -> None:
             np.zeros(edges.fit_left.size, dtype=np.int64),
             np.ones(edges.verify_left.size, dtype=np.int64),
         ])
+        supported_edge = resolved[edge_left] & resolved[edge_right]
+        edge_left, edge_right, edge_family, edge_role = (
+            value[supported_edge] for value in (edge_left, edge_right, edge_family, edge_role)
+        )
         if edge_left.size == 0:
             continue
         positive_feature, positive_valid, positive_null = mode_relation_runtime_features(
@@ -304,32 +384,20 @@ def main() -> None:
                 analytic_family.extend(edge_family[paired].tolist())
 
         wrong_child = np.full(children.shape, -1, dtype=np.int64)
-        for index, (group, truth_value) in enumerate(zip(groups.tolist(), children.tolist())):
-            rows = child_posterior.candidate_child_rows[group, : int(args.runtime_maximum_children)]
-            probability = child_posterior.candidate_probabilities[group, : int(args.runtime_maximum_children)]
-            valid = (rows >= 0) & (rows != truth_value) & eligibility.proposal_qualified[np.maximum(rows, 0)]
-            if np.any(valid):
-                slots = np.flatnonzero(valid)
-                wrong_child[index] = int(rows[int(slots[np.argmax(probability[slots])])])
-        wrong_keep = wrong_child >= 0
         wrong_primitive = np.full(children.shape, -1, dtype=np.int64)
-        if np.any(wrong_keep):
-            wrong_likelihood = predict_child_local_surface_likelihood(
-                descriptor[wrong_keep], wrong_child[wrong_keep], physical, field,
-                temperature=float(args.temperature), maximum_modes=int(args.maximum_modes),
+        selected_group = options.factor_group_rows[options.selected_factor_rows]
+        for group in np.flatnonzero(resolved).tolist():
+            state = np.flatnonzero(
+                (selected_group == group)
+                & (
+                    (selected_child != children[group])
+                    | (selected_primitive != truth_primitive[group])
+                )
             )
-            wrong_feature, wrong_valid = child_local_mode_runtime_features(
-                wrong_likelihood, wrong_child[wrong_keep], xy[wrong_keep], scale[wrong_keep],
-                labels.pose_w2c, camera, physical, field,
-            )
-            score = np.log(np.maximum(wrong_likelihood.mode_probabilities, 1e-12)) + np.clip(
-                np.asarray(wrong_feature, dtype=np.float64)[:, :, 5], -12.0, 0.0,
-            )
-            score[~wrong_valid] = -np.inf
-            best = np.argmax(score, axis=1)
-            value = wrong_likelihood.mode_primitive_rows[np.arange(best.size), best]
-            value[~np.any(wrong_valid, axis=1)] = -1
-            wrong_primitive[wrong_keep] = value
+            if state.size:
+                best = int(state[np.argmax(options.selected_base_masses[state])])
+                wrong_child[group] = int(selected_child[best])
+                wrong_primitive[group] = int(selected_primitive[best])
         endpoint_specs = (
             ("wrong_left_endpoint", wrong_primitive[edge_left], truth_primitive[edge_right], wrong_child[edge_left], children[edge_right]),
             ("wrong_right_endpoint", truth_primitive[edge_left], wrong_primitive[edge_right], children[edge_left], wrong_child[edge_right]),
@@ -355,7 +423,8 @@ def main() -> None:
                 analytic_family.extend(edge_family[paired].tolist())
         processed_queries += 1
         print(json.dumps({
-            "image_id": image_id, "resolved_groups": int(groups.size),
+            "image_id": image_id, "resolved_groups": int(np.sum(resolved)),
+            "supported_edges": int(edge_left.size),
             "fit_edges": int(edges.fit_left.size), "verify_edges": int(edges.verify_left.size),
         }), flush=True)
     if not store["features"]:
@@ -384,13 +453,25 @@ def main() -> None:
         },
     }
     metadata = {
-        "artifact_type": "goal_maplet_mode_relation_samples_v1",
+        "artifact_type": "goal_maplet_mode_relation_samples_v2",
         "feature_names": list(FEATURE_NAMES), "edge_families": list(EDGE_FAMILIES),
         "relation_null_types": list(RELATION_NULL_TYPES),
-        "pairing_contract": "same_image_same_query_edge_fixed_options_v1",
-        "edge_contract": "query_only_complete_link_fit_tree_disjoint_verify_v2",
-        "option_contract": "fixed_vfm_topm_runtime_topc_v1",
+        "pairing_contract": "same_image_same_runtime_query_edge_adaptive_options_v2",
+        "edge_contract": "query_only_complete_link_cluster_collapse_fit_verify_v3",
+        "option_contract": "mass_adaptive_parent_child_mode_budget_v3",
         "runtime_maximum_children": int(args.runtime_maximum_children),
+        "endpoint_state_budget": int(args.endpoint_state_budget),
+        "endpoint_hierarchy_calibration_sha256": (
+            hierarchy_calibration.content_sha256 if hierarchy_calibration is not None else None
+        ),
+        "endpoint_hierarchy_fit_trajectories": (
+            list(hierarchy_calibration.metadata.get("fit_trajectories", ()))
+            if hierarchy_calibration is not None else []
+        ),
+        "endpoint_hierarchy_validation_trajectories": (
+            list(hierarchy_calibration.metadata.get("validation_trajectories", ()))
+            if hierarchy_calibration is not None else []
+        ),
         "maximum_modes": int(args.maximum_modes), "temperature": float(args.temperature),
         "physical_map_sha256": physical.content_sha256,
         "canonical_field_sha256": field.content_sha256,
