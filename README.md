@@ -19,7 +19,9 @@ query RGB
   -> post-retrieval correlated-support grouping
   -> parent/child surface posterior + typed graph configurations
   -> fixed Top-16 coarse SE(3) modes
-  -> exact full-scene canonical-field likelihood
+  -> 2x anti-aliased full-scene canonical-field observation
+  -> orientation-equivariant RADIO Jacobian phase
+  -> low-capacity candidate posterior + explicit null
 ```
 
 The target prior stores only metric 2DGS geometry and bounded anonymous
@@ -183,6 +185,53 @@ refinement objective.  Mask-aware 2x 2DGS compositing improves `seq11` to
 fails closed.  Continuous refinement remains disabled and strict12 is closed
 again for future tuning.
 
+G20 closes the remaining observation-model semantics without adding another
+stored map feature.  Factor-2 rendering now preserves exact fractional
+feature/visible/missing/background mass, uses area-mixture features but the
+dominant physical component for depth and surface frame, and marks mixed
+surface tokens explicitly.  The active phase-policy v2 is
+`phase_residual_only`: mapper/context identity and the legacy mixture are
+forbidden.  Its sole phase term is the Frobenius cosine between query/rendered
+128D feature Jacobians, weighted only by query-side gradient carrier and
+reported separately from fractional observability.
+
+On 41 selected queries from seq6/7/8/9/12/14, outer leave-one-query-trajectory-
+out calibration improves the frozen proposal identity baseline from
+0.378/1.209 m, 63.41% strict and 87.80% within 1 m to a phase-only
+0.235/0.661 m, 87.80% strict and 92.68% within 1 m.  The full monotonic
+identity+phase+observation energy reaches 0.267/0.661 m and 85.37% strict;
+therefore identity/observation are retained as an auditable structured-energy
+variant, but the gain is attributed to Jacobian phase rather than claimed for
+every additive term.  A one-class absolute phase-support null rejects the one
+extreme 12.79 m/31.1 degree candidate set; accepted catastrophic rate is 0%,
+while a second 2.17 m/11.9 degree no-success set remains undetected.
+
+The new factor-2 Jacobian objective also passes the predeclared six-DoF gate on
+12 selected self-map queries: GT beats +/-0.25 m, +/-0.5 m and +/-3 degrees on
+98.61%, 100% and 100% of perturbations; strict local maxima are
+66.67%/66.67%/83.33% on tangent1/tangent2/normal and 100% on roll/pitch/yaw.
+Projected scale is weaker on the normal axis (41.67%), so no extra scale term
+is added.
+
+A final lineage audit prevents overclaiming these numbers: all 115 evaluated
+images were among the 122 images fused into the fixed canonical field.  LOTO
+isolates energy-weight calibration, but it does not make the map query-
+disjoint.  The ranking and basin numbers are therefore self-map development
+diagnostics, not cross-acquisition localization evidence.  G21 remains closed
+until a canonical field and candidate pool are rebuilt without the audited
+queries; neither production nor final-paper accuracy is promoted.
+
+A subsequent fixed-method replay on trajectory-disjoint field exclusions
+confirms the restriction.  With no refit, Jacobian phase reaches 0.483 m
+median and 54.55% strict on seq11, a small median/strict gain over G19-C but a
+worse tail; on the historical strict12 block it regresses from 0.303 m/75%
+strict to 0.335 m/66.67%.  The frozen full energy transfers poorly on seq11
+(0.854 m median, 5.643 m P90, 18.18% catastrophe) and its self-map-calibrated
+null abstains on every query.  The strict12 candidate generator differs from
+the calibration generator and is rejected rather than mixed into a full-
+energy claim.  Therefore G19-C remains the selected discrete ranker, the G20
+full energy is rejected for deployment, and G21 stays closed.
+
 ## Frozen V6 Status
 
 See [the V6 mainline](docs/vfm/2dgs_maplet_atlas_localization_v6.md) for its
@@ -238,6 +287,10 @@ stored embedding, as the next required research module.
 - `feature_extract/tools/vfm/build_goal_maplet_phase_survival_samples.py`
 - `feature_extract/tools/vfm/evaluate_goal_maplet_phase_survival.py`
 - `feature_extract/tools/vfm/evaluate_goal_maplet_dual_band_phase_readout.py`
+- `feature_extract/tools/vfm/create_goal_maplet_phase_policy_v2.py`
+- `feature_extract/tools/vfm/audit_goal_maplet_phase_basin.py`
+- `feature_extract/tools/vfm/fit_evaluate_goal_maplet_conditional_energy.py`
+- `feature_extract/tools/vfm/summarize_goal_maplet_g20.py`
 - `feature_extract/tools/vfm/evaluate_goal_maplet_surface_basin.py`
 - `feature_extract/tools/vfm/build_goal_maplet_feature_contract.py`
 - `feature_extract/tools/vfm/build_goal_maplet_child_eligibility.py`

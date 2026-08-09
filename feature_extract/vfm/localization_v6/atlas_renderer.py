@@ -352,6 +352,15 @@ class RenderedMapletAtlases:
     field_missing: np.ndarray | None = None
     incidence: np.ndarray | None = None
     projected_scale: np.ndarray | None = None
+    # Fractional token-footprint state for anti-aliased surface rendering.
+    # Legacy renderers may leave these unset; the Goal-Maplet supersampled
+    # renderer closes feature/missing/background mass exactly.
+    feature_fraction: np.ndarray | None = None
+    visibility_fraction: np.ndarray | None = None
+    missing_fraction: np.ndarray | None = None
+    background_fraction: np.ndarray | None = None
+    dominant_surface_fraction: np.ndarray | None = None
+    mixed_surface: np.ndarray | None = None
 
 
 def render_sampled_maplet_atlases(

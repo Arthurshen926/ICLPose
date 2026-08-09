@@ -19,8 +19,8 @@ from feature_extract.vfm.localization_goal_maplet.canonical_field import Canonic
 from feature_extract.vfm.localization_goal_maplet.pfir import ContributorLabels
 from feature_extract.vfm.localization_goal_maplet.phase_preserving_readout import (
     DualBandPhaseEvidence,
-    dual_band_phase_evidence,
     load_phase_readout_policy,
+    orientation_equivariant_phase_evidence,
 )
 from feature_extract.vfm.localization_goal_maplet.physical_map import GoalMapletPhysicalMap
 from feature_extract.vfm.localization_goal_maplet.surface_renderer import render_canonical_surface_field
@@ -81,6 +81,7 @@ def _score(
     field: CanonicalSurfaceField,
     policy,
     device: str,
+    supersample_factor: int,
 ) -> tuple[float, DualBandPhaseEvidence, object]:
     rendered = render_canonical_surface_field(
         physical,
@@ -90,13 +91,18 @@ def _score(
         width=int(query.shape[2]),
         height=int(query.shape[1]),
         device=device,
+        supersample_factor=int(supersample_factor),
     )
-    evidence = dual_band_phase_evidence(
-        query,
-        np.asarray(rendered.feature, dtype=np.float32),
+    evidence = orientation_equivariant_phase_evidence(
         query,
         np.asarray(rendered.feature, dtype=np.float32),
         np.asarray(rendered.mask, dtype=bool),
+        feature_fraction=getattr(rendered, "feature_fraction", None),
+        visibility_fraction=getattr(rendered, "visibility_fraction", None),
+        missing_fraction=getattr(rendered, "missing_fraction", None),
+        background_fraction=getattr(rendered, "background_fraction", None),
+        dominant_surface_fraction=getattr(rendered, "dominant_surface_fraction", None),
+        mixed_surface=getattr(rendered, "mixed_surface", None),
     )
     return float(policy.score(evidence)), evidence, rendered
 
@@ -165,6 +171,28 @@ def _sequence_metrics(
     return result
 
 
+def _component_metrics(
+    rows: list[dict[str, object]],
+    ground_truth: list[dict[str, object]],
+    component: str,
+    translation_magnitudes: list[float],
+    rotation_magnitudes: list[float],
+) -> dict[str, object]:
+    gt = {
+        str(item["image_id"]): float(item["phase"][component])
+        for item in ground_truth
+    }
+    component_rows = []
+    for row in rows:
+        value = dict(row)
+        value["gt_score"] = gt[str(row["image_id"])]
+        value["score"] = float(row["phase"][component])
+        component_rows.append(value)
+    return _sequence_metrics(
+        component_rows, translation_magnitudes, rotation_magnitudes,
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--contributors", required=True)
@@ -175,6 +203,9 @@ def main() -> None:
     parser.add_argument("--output_json", required=True)
     parser.add_argument("--translation_magnitudes", default="0.1,0.25,0.5,1.0")
     parser.add_argument("--rotation_magnitudes_deg", default="1,3,5")
+    parser.add_argument("--render_supersample_factor", type=int, default=2)
+    parser.add_argument("--trajectory_ids", nargs="*", default=())
+    parser.add_argument("--maximum_queries_per_trajectory", type=int, default=0)
     parser.add_argument("--maximum_queries", type=int, default=0)
     parser.add_argument("--shard_index", type=int, default=0)
     parser.add_argument("--shard_count", type=int, default=1)
@@ -195,7 +226,31 @@ def main() -> None:
     for key, expected in (("physical_map_sha256", physical.content_sha256), ("canonical_field_sha256", field.content_sha256)):
         if str(policy.metadata.get(key, "")) != expected:
             raise ValueError(f"phase policy lineage differs: {key}")
-    paths = sorted(Path(args.contributors).glob("*.npz"))[int(args.shard_index)::int(args.shard_count)]
+    required_factor = int(policy.metadata.get("required_render_supersample_factor", 0))
+    if required_factor > 0 and required_factor != int(args.render_supersample_factor):
+        raise ValueError(
+            f"phase policy requires factor {required_factor}, got "
+            f"{int(args.render_supersample_factor)}"
+        )
+    paths = sorted(Path(args.contributors).glob("*.npz"))
+    requested_trajectories = set(str(value) for value in args.trajectory_ids)
+    if requested_trajectories:
+        paths = [
+            path for path in paths
+            if str(_metadata(path)["image_id"]).replace("\\", "/").split("/", 1)[0]
+            in requested_trajectories
+        ]
+    if int(args.maximum_queries_per_trajectory) > 0:
+        count: dict[str, int] = {}
+        selected = []
+        for path in paths:
+            trajectory = str(_metadata(path)["image_id"]).replace("\\", "/").split("/", 1)[0]
+            if count.get(trajectory, 0) >= int(args.maximum_queries_per_trajectory):
+                continue
+            count[trajectory] = count.get(trajectory, 0) + 1
+            selected.append(path)
+        paths = selected
+    paths = paths[int(args.shard_index)::int(args.shard_count)]
     if int(args.maximum_queries) > 0:
         paths = paths[:int(args.maximum_queries)]
     translation_magnitudes = [float(value) for value in str(args.translation_magnitudes).split(",")]
@@ -210,6 +265,7 @@ def main() -> None:
         query = _query_mapper(path, mapper)
         gt_score, gt_evidence, gt_render = _score(
             query, labels.pose_w2c, camera, physical, field, policy, str(args.device),
+            int(args.render_supersample_factor),
         )
         primitive = np.asarray(gt_render.surface_id, dtype=np.int64)
         valid_rows = primitive[np.asarray(gt_render.mask, dtype=bool) & (primitive >= 0)]
@@ -231,25 +287,48 @@ def main() -> None:
             for magnitude in translation_magnitudes:
                 for sign in (-1, 1):
                     pose = _translate_camera(labels.pose_w2c, float(sign) * magnitude * axis)
-                    score, evidence, _ = _score(query, pose, camera, physical, field, policy, str(args.device))
+                    score, evidence, _ = _score(
+                        query, pose, camera, physical, field, policy, str(args.device),
+                        int(args.render_supersample_factor),
+                    )
                     rows.append({"image_id": image_id, "axis": axis_name, "unit": "m", "sign": sign, "magnitude": magnitude, "gt_score": gt_score, "score": score, "margin_to_gt": gt_score - score, "phase": evidence.as_dict()})
         camera_axes = {"roll": np.asarray([0.0, 0.0, 1.0]), "pitch": np.asarray([1.0, 0.0, 0.0]), "yaw": np.asarray([0.0, 1.0, 0.0])}
         for axis_name, axis in camera_axes.items():
             for magnitude in rotation_magnitudes:
                 for sign in (-1, 1):
                     pose = _rotate_camera(labels.pose_w2c, axis, np.deg2rad(float(sign) * magnitude))
-                    score, evidence, _ = _score(query, pose, camera, physical, field, policy, str(args.device))
+                    score, evidence, _ = _score(
+                        query, pose, camera, physical, field, policy, str(args.device),
+                        int(args.render_supersample_factor),
+                    )
                     rows.append({"image_id": image_id, "axis": axis_name, "unit": "deg", "sign": sign, "magnitude": magnitude, "gt_score": gt_score, "score": score, "margin_to_gt": gt_score - score, "phase": evidence.as_dict()})
         print(json.dumps({"image_id": image_id, "gt_score": gt_score, "row_count": len(rows)}), flush=True)
+    component_summary = {
+        component: _component_metrics(
+            rows, gt_rows, component, translation_magnitudes, rotation_magnitudes,
+        )
+        for component in (
+            "jacobian_phase_visible",
+            "jacobian_log_scale_agreement",
+            "jacobian_observability",
+        )
+    }
     result = {
-        "stage": "goal_maplet_phase_basin_g19_c",
-        "definition": "serialized_phase_score_around_ground_truth_in_surface_and_camera_frames",
+        "stage": "goal_maplet_phase_basin_g20",
+        "definition": "factor2_fractional_orientation_equivariant_phase_around_ground_truth",
         "query_count": len(paths),
         "physical_map_sha256": physical.content_sha256,
         "canonical_field_sha256": field.content_sha256,
         "translation_magnitudes": translation_magnitudes,
         "rotation_magnitudes_deg": rotation_magnitudes,
+        "render_supersample_factor": int(args.render_supersample_factor),
+        "phase_readout_artifact_type": policy.metadata.get("artifact_type"),
+        "trajectory_ids": sorted({
+            str(item["image_id"]).replace("\\", "/").split("/", 1)[0]
+            for item in gt_rows
+        }),
         "summary": _sequence_metrics(rows, translation_magnitudes, rotation_magnitudes),
+        "component_summary": component_summary,
         "ground_truth": gt_rows,
         "rows": rows,
     }

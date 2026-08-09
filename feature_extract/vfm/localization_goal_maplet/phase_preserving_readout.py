@@ -36,6 +36,17 @@ class DualBandPhaseEvidence:
     vertical_step2_observability: float
     diagonal_down_observability: float
     diagonal_up_observability: float
+    jacobian_phase: float
+    jacobian_phase_visible: float
+    jacobian_observability: float
+    jacobian_carrier_mass: float
+    jacobian_log_scale_agreement: float
+    feature_fraction_mean: float
+    visibility_fraction_mean: float
+    missing_fraction_mean: float
+    background_fraction_mean: float
+    dominant_surface_fraction_mean: float
+    mixed_surface_fraction: float
     coverage: float
 
     @property
@@ -94,6 +105,21 @@ class DualBandPhaseEvidence:
             "vertical_step2_observability": float(self.vertical_step2_observability),
             "diagonal_down_observability": float(self.diagonal_down_observability),
             "diagonal_up_observability": float(self.diagonal_up_observability),
+            "jacobian_phase": float(self.jacobian_phase),
+            "jacobian_phase_visible": float(self.jacobian_phase_visible),
+            "jacobian_observability": float(self.jacobian_observability),
+            "jacobian_carrier_mass": float(self.jacobian_carrier_mass),
+            "jacobian_log_scale_agreement": float(
+                self.jacobian_log_scale_agreement
+            ),
+            "feature_fraction_mean": float(self.feature_fraction_mean),
+            "visibility_fraction_mean": float(self.visibility_fraction_mean),
+            "missing_fraction_mean": float(self.missing_fraction_mean),
+            "background_fraction_mean": float(self.background_fraction_mean),
+            "dominant_surface_fraction_mean": float(
+                self.dominant_surface_fraction_mean
+            ),
+            "mixed_surface_fraction": float(self.mixed_surface_fraction),
             "phase_score": float(self.phase_score),
             "phase_visible": float(self.phase_visible),
             "phase_observability": float(self.phase_observability),
@@ -121,7 +147,11 @@ class PhaseReadoutPolicy:
 
 def load_phase_readout_policy(path: Path) -> PhaseReadoutPolicy:
     payload = json.loads(Path(path).read_text())
-    if payload.get("artifact_type") != "goal_maplet_phase_readout_policy_v1":
+    artifact_type = str(payload.get("artifact_type", ""))
+    if artifact_type not in {
+        "goal_maplet_phase_readout_policy_v1",
+        "goal_maplet_phase_readout_policy_v2",
+    }:
         raise ValueError("not a Goal-Maplet phase-readout policy")
     names = tuple(str(value) for value in payload.get("component_names", ()))
     mean = np.asarray(payload.get("standardizer_mean", ()), dtype=np.float64)
@@ -137,6 +167,16 @@ def load_phase_readout_policy(path: Path) -> PhaseReadoutPolicy:
     }
     if any(name not in allowed for name in names):
         raise ValueError("phase-readout policy requests an unknown component")
+    if artifact_type == "goal_maplet_phase_readout_policy_v2":
+        if str(payload.get("role", "")) != "phase_residual_only":
+            raise ValueError("phase policy v2 must declare phase_residual_only role")
+        if names != ("jacobian_phase_visible",):
+            raise ValueError(
+                "phase-residual policy v2 must consume exactly one orientation-equivariant "
+                "conditional phase; identity and observability belong to the joint energy"
+            )
+        if coefficient[0] <= 0.0:
+            raise ValueError("phase-residual policy v2 must be monotonic in phase agreement")
     return PhaseReadoutPolicy(names, mean, scale, coefficient, payload)
 
 
@@ -170,6 +210,18 @@ class DirectionalPhaseStatistics:
     observability: float
     informative_edge_count: int
     grid_edge_count: int
+
+
+@dataclass(frozen=True)
+class JacobianPhaseStatistics:
+    """Common-orientation-equivariant VFM differential evidence."""
+
+    fixed_grid_score: float
+    conditional_score: float
+    observability: float
+    query_carrier_mass: float
+    informative_token_count: int
+    log_scale_agreement: float
 
 
 def _directional_phase_statistics_normalized(
@@ -247,12 +299,225 @@ def directional_phase_statistics(
     )
 
 
+def _feature_jacobian(feature: np.ndarray) -> np.ndarray:
+    """Central VFM derivative tensor with image-axis components last."""
+
+    value = _normalize_map(feature)
+    channels, height, width = value.shape
+    gradient = np.zeros((channels, height, width, 2), dtype=np.float32)
+    if width > 1:
+        gradient[:, :, 0, 0] = value[:, :, 1] - value[:, :, 0]
+        gradient[:, :, -1, 0] = value[:, :, -1] - value[:, :, -2]
+    if width > 2:
+        gradient[:, :, 1:-1, 0] = 0.5 * (value[:, :, 2:] - value[:, :, :-2])
+    if height > 1:
+        gradient[:, 0, :, 1] = value[:, 1, :] - value[:, 0, :]
+        gradient[:, -1, :, 1] = value[:, -1, :] - value[:, -2, :]
+    if height > 2:
+        gradient[:, 1:-1, :, 1] = 0.5 * (value[:, 2:, :] - value[:, :-2, :])
+    return gradient
+
+
+def jacobian_phase_statistics(
+    query: np.ndarray,
+    rendered: np.ndarray,
+    *,
+    feature_fraction: np.ndarray | None = None,
+    dominant_surface_fraction: np.ndarray | None = None,
+) -> JacobianPhaseStatistics:
+    """Compare VFM Jacobians with query-only carrier weights.
+
+    The Frobenius product is invariant when a common image rotation changes
+    both derivative bases.  Candidate-dependent visibility is returned as a
+    separate scalar rather than being interpreted as phase disagreement.
+    """
+
+    query_gradient = _feature_jacobian(query)
+    render_gradient = _feature_jacobian(rendered)
+    if query_gradient.shape != render_gradient.shape:
+        raise ValueError("phase-preserving feature grids differ")
+    shape = query_gradient.shape[1:3]
+    feature_mass = (
+        np.ones(shape, dtype=np.float32)
+        if feature_fraction is None
+        else np.asarray(feature_fraction, dtype=np.float32)
+    )
+    purity = (
+        np.ones(shape, dtype=np.float32)
+        if dominant_surface_fraction is None
+        else np.asarray(dominant_surface_fraction, dtype=np.float32)
+    )
+    if feature_mass.shape != shape or purity.shape != shape:
+        raise ValueError("fractional phase support differs from the feature grid")
+    if np.any(~np.isfinite(feature_mass)) or np.any(~np.isfinite(purity)):
+        raise ValueError("fractional phase support is not finite")
+    support = np.clip(feature_mass, 0.0, 1.0) * np.clip(purity, 0.0, 1.0)
+    query_norm = np.linalg.norm(query_gradient, axis=(0, 3))
+    render_norm = np.linalg.norm(render_gradient, axis=(0, 3))
+    carrier = query_norm.astype(np.float64)
+    informative = (query_norm >= 1.0e-4) & (render_norm >= 1.0e-4) & (support > 0.0)
+    cosine = np.sum(query_gradient * render_gradient, axis=(0, 3))
+    cosine /= np.maximum(query_norm * render_norm, 1.0e-8)
+    cosine = np.clip(cosine, -1.0, 1.0)
+    carrier_total = float(np.sum(carrier))
+    observed_weight = carrier * support * informative
+    observed_total = float(np.sum(observed_weight))
+    conditional = float(np.sum(observed_weight * cosine) / max(observed_total, 1.0e-12))
+    observability = observed_total / max(carrier_total, 1.0e-12)
+    log_scale_residual = np.abs(np.log(
+        np.maximum(render_norm, 1.0e-4) / np.maximum(query_norm, 1.0e-4)
+    ))
+    # A separate orientation-invariant metric measurement.  It is not part of
+    # the phase policy: phase answers "same spatial direction?", whereas this
+    # term measures the projected spatial scale needed for surface-normal
+    # motion.  Larger (closer to zero) is better.
+    log_scale_agreement = -float(
+        np.sum(observed_weight * np.minimum(log_scale_residual, 5.0))
+        / max(observed_total, 1.0e-12)
+    )
+    return JacobianPhaseStatistics(
+        fixed_grid_score=conditional * observability,
+        conditional_score=conditional,
+        observability=observability,
+        query_carrier_mass=carrier_total / max(float(carrier.size), 1.0),
+        informative_token_count=int(np.count_nonzero(informative)),
+        log_scale_agreement=log_scale_agreement,
+    )
+
+
+def _fractional_observation_means(
+    valid: np.ndarray,
+    *,
+    feature_fraction: np.ndarray | None,
+    visibility_fraction: np.ndarray | None,
+    missing_fraction: np.ndarray | None,
+    background_fraction: np.ndarray | None,
+    dominant_surface_fraction: np.ndarray | None,
+    mixed_surface: np.ndarray | None,
+) -> dict[str, float]:
+    spatial_shape = np.asarray(valid).shape
+
+    def fraction(value: np.ndarray, name: str) -> np.ndarray:
+        result = np.asarray(value, dtype=np.float32)
+        if result.shape != spatial_shape or np.any(~np.isfinite(result)):
+            raise ValueError(f"fractional {name} grid differs from the feature grid")
+        return np.clip(result, 0.0, 1.0)
+
+    feature_mass = fraction(
+        np.asarray(valid, dtype=np.float32)
+        if feature_fraction is None else feature_fraction,
+        "feature",
+    )
+    visibility_mass = fraction(
+        feature_mass if visibility_fraction is None else visibility_fraction,
+        "visibility",
+    )
+    missing_mass = fraction(
+        np.zeros(spatial_shape, dtype=np.float32)
+        if missing_fraction is None else missing_fraction,
+        "missing",
+    )
+    background_mass = fraction(
+        1.0 - visibility_mass
+        if background_fraction is None else background_fraction,
+        "background",
+    )
+    dominant_mass = fraction(
+        np.ones(spatial_shape, dtype=np.float32)
+        if dominant_surface_fraction is None else dominant_surface_fraction,
+        "dominant-surface",
+    )
+    mixed = fraction(
+        np.zeros(spatial_shape, dtype=np.float32)
+        if mixed_surface is None else mixed_surface,
+        "mixed-surface",
+    )
+    return {
+        "feature_fraction_mean": float(np.mean(feature_mass)),
+        "visibility_fraction_mean": float(np.mean(visibility_mass)),
+        "missing_fraction_mean": float(np.mean(missing_mass)),
+        "background_fraction_mean": float(np.mean(background_mass)),
+        "dominant_surface_fraction_mean": float(np.mean(dominant_mass)),
+        "mixed_surface_fraction": float(np.mean(mixed)),
+    }
+
+
+def orientation_equivariant_phase_evidence(
+    query_mapper: np.ndarray,
+    rendered_mapper: np.ndarray,
+    valid: np.ndarray,
+    *,
+    feature_fraction: np.ndarray | None = None,
+    visibility_fraction: np.ndarray | None = None,
+    missing_fraction: np.ndarray | None = None,
+    background_fraction: np.ndarray | None = None,
+    dominant_surface_fraction: np.ndarray | None = None,
+    mixed_surface: np.ndarray | None = None,
+) -> DualBandPhaseEvidence:
+    """Minimal active G20 phase path; legacy identity/directions are not computed."""
+
+    jacobian = jacobian_phase_statistics(
+        query_mapper,
+        rendered_mapper,
+        feature_fraction=(
+            np.asarray(valid, dtype=np.float32)
+            if feature_fraction is None else feature_fraction
+        ),
+        dominant_surface_fraction=dominant_surface_fraction,
+    )
+    observation = _fractional_observation_means(
+        valid,
+        feature_fraction=feature_fraction,
+        visibility_fraction=visibility_fraction,
+        missing_fraction=missing_fraction,
+        background_fraction=background_fraction,
+        dominant_surface_fraction=dominant_surface_fraction,
+        mixed_surface=mixed_surface,
+    )
+    return DualBandPhaseEvidence(
+        mapper_cosine=0.0,
+        context_cosine=0.0,
+        horizontal_phase=0.0,
+        vertical_phase=0.0,
+        horizontal_phase_step2=0.0,
+        vertical_phase_step2=0.0,
+        diagonal_down_phase=0.0,
+        diagonal_up_phase=0.0,
+        horizontal_phase_visible=0.0,
+        vertical_phase_visible=0.0,
+        horizontal_phase_step2_visible=0.0,
+        vertical_phase_step2_visible=0.0,
+        diagonal_down_phase_visible=0.0,
+        diagonal_up_phase_visible=0.0,
+        horizontal_observability=0.0,
+        vertical_observability=0.0,
+        horizontal_step2_observability=0.0,
+        vertical_step2_observability=0.0,
+        diagonal_down_observability=0.0,
+        diagonal_up_observability=0.0,
+        jacobian_phase=jacobian.fixed_grid_score,
+        jacobian_phase_visible=jacobian.conditional_score,
+        jacobian_observability=jacobian.observability,
+        jacobian_carrier_mass=jacobian.query_carrier_mass,
+        jacobian_log_scale_agreement=jacobian.log_scale_agreement,
+        **observation,
+        coverage=float(np.mean(np.asarray(valid, dtype=bool))),
+    )
+
+
 def dual_band_phase_evidence(
     query_mapper: np.ndarray,
     rendered_mapper: np.ndarray,
     query_context: np.ndarray,
     rendered_context: np.ndarray,
     valid: np.ndarray,
+    *,
+    feature_fraction: np.ndarray | None = None,
+    visibility_fraction: np.ndarray | None = None,
+    missing_fraction: np.ndarray | None = None,
+    background_fraction: np.ndarray | None = None,
+    dominant_surface_fraction: np.ndarray | None = None,
+    mixed_surface: np.ndarray | None = None,
 ) -> DualBandPhaseEvidence:
     """Compare identity and spatial phase without discrete correspondences."""
 
@@ -278,6 +543,24 @@ def dual_band_phase_evidence(
     diagonal_up = _directional_phase_statistics_normalized(
         query_unit, render_unit, valid, delta_y=1, delta_x=-1,
     )
+    jacobian = jacobian_phase_statistics(
+        query_mapper,
+        rendered_mapper,
+        feature_fraction=(
+            np.asarray(valid, dtype=np.float32)
+            if feature_fraction is None else feature_fraction
+        ),
+        dominant_surface_fraction=dominant_surface_fraction,
+    )
+    observation = _fractional_observation_means(
+        valid,
+        feature_fraction=feature_fraction,
+        visibility_fraction=visibility_fraction,
+        missing_fraction=missing_fraction,
+        background_fraction=background_fraction,
+        dominant_surface_fraction=dominant_surface_fraction,
+        mixed_surface=mixed_surface,
+    )
     return DualBandPhaseEvidence(
         mapper_cosine=mapper,
         context_cosine=context,
@@ -299,5 +582,11 @@ def dual_band_phase_evidence(
         vertical_step2_observability=vertical_step2.observability,
         diagonal_down_observability=diagonal_down.observability,
         diagonal_up_observability=diagonal_up.observability,
+        jacobian_phase=jacobian.fixed_grid_score,
+        jacobian_phase_visible=jacobian.conditional_score,
+        jacobian_observability=jacobian.observability,
+        jacobian_carrier_mass=jacobian.query_carrier_mass,
+        jacobian_log_scale_agreement=jacobian.log_scale_agreement,
+        **observation,
         coverage=float(np.mean(np.asarray(valid, dtype=bool))),
     )

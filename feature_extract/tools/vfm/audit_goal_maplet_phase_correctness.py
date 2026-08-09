@@ -61,7 +61,15 @@ def _rotate_grid(feature: np.ndarray, mask: np.ndarray, angle_deg: float) -> tup
 
 
 def _phase_score(query: np.ndarray, rendered, policy) -> tuple[float, dict[str, float]]:
-    evidence = dual_band_phase_evidence(query, np.asarray(rendered.feature, dtype=np.float32), query, np.asarray(rendered.feature, dtype=np.float32), np.asarray(rendered.mask, dtype=bool))
+    evidence = dual_band_phase_evidence(
+        query,
+        np.asarray(rendered.feature, dtype=np.float32),
+        query,
+        np.asarray(rendered.feature, dtype=np.float32),
+        np.asarray(rendered.mask, dtype=bool),
+        feature_fraction=getattr(rendered, "feature_fraction", None),
+        dominant_surface_fraction=getattr(rendered, "dominant_surface_fraction", None),
+    )
     return float(policy.score(evidence)), evidence.as_dict()
 
 

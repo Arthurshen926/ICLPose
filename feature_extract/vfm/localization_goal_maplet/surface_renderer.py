@@ -297,6 +297,81 @@ def render_canonical_surface_field(
         field_missing=field_missing.reshape(shape),
         incidence=incidence.reshape(shape),
         projected_scale=projected_scale.reshape(shape),
+        feature_fraction=mask.reshape(shape).astype(np.float32),
+        visibility_fraction=visibility.reshape(shape).astype(np.float32),
+        missing_fraction=field_missing.reshape(shape).astype(np.float32),
+        background_fraction=(~visibility.reshape(shape)).astype(np.float32),
+        dominant_surface_fraction=visibility.reshape(shape).astype(np.float32),
+        mixed_surface=np.zeros(shape, dtype=bool),
+    )
+
+
+def _dominant_subpixel_choice(
+    component_blocks: np.ndarray,
+    depth_blocks: np.ndarray,
+    visibility_blocks: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Choose frontmost sample of the dominant physical component per token."""
+
+    component = np.asarray(component_blocks, dtype=np.int64)
+    depth = np.asarray(depth_blocks, dtype=np.float32)
+    visible = np.asarray(visibility_blocks, dtype=bool)
+    if component.shape != depth.shape or component.shape != visible.shape or component.ndim != 4:
+        raise ValueError("subpixel component/depth/visibility blocks differ")
+    height, width, factor_y, factor_x = component.shape
+    flat_component = component.reshape(height, width, factor_y * factor_x)
+    flat_depth = depth.reshape(height, width, factor_y * factor_x)
+    flat_visible = visible.reshape(height, width, factor_y * factor_x)
+    sample_count = factor_y * factor_x
+    component_2d = flat_component.reshape(-1, sample_count)
+    depth_2d = flat_depth.reshape(-1, sample_count)
+    eligible = flat_visible.reshape(-1, sample_count) & (depth_2d > 0.0)
+    identified = eligible & (component_2d >= 0)
+    same_component = component_2d[:, :, None] == component_2d[:, None, :]
+    component_count = np.sum(
+        same_component & identified[:, None, :], axis=2,
+    ).astype(np.int64)
+    component_count[~identified] = 0
+    maximum_count = np.max(component_count, axis=1)
+    candidate_component = identified & (
+        component_count == maximum_count[:, None]
+    )
+    component_front_depth = np.min(
+        np.where(
+            same_component & eligible[:, None, :],
+            depth_2d[:, None, :],
+            np.inf,
+        ),
+        axis=2,
+    )
+    tied_front = np.min(
+        np.where(candidate_component, component_front_depth, np.inf), axis=1,
+    )
+    selected = candidate_component & (
+        component_front_depth == tied_front[:, None]
+    )
+    # If all visible samples lack a component identity, retain the frontmost
+    # physical sample and declare the visible footprint pure.
+    has_identity = maximum_count > 0
+    selected[~has_identity] = eligible[~has_identity]
+    choice_flat = np.argmin(
+        np.where(selected, depth_2d, np.inf), axis=1,
+    ).astype(np.int64)
+    visible_count = np.sum(eligible, axis=1)
+    purity_flat = np.zeros(component_2d.shape[0], dtype=np.float32)
+    valid = visible_count > 0
+    purity_flat[valid & has_identity] = (
+        maximum_count[valid & has_identity] / visible_count[valid & has_identity]
+    ).astype(np.float32)
+    purity_flat[valid & ~has_identity] = 1.0
+    different = (
+        component_2d[:, :, None] != component_2d[:, None, :]
+    ) & identified[:, :, None] & identified[:, None, :]
+    mixed_flat = np.any(different, axis=(1, 2))
+    return (
+        choice_flat.reshape(height, width),
+        purity_flat.reshape(height, width),
+        mixed_flat.reshape(height, width),
     )
 
 
@@ -313,6 +388,8 @@ def _pool_rendered_surface(rendered: RenderedMapletAtlases, factor: int) -> Rend
     ).transpose(0, 2, 1, 3)
     count = np.sum(mask_blocks, axis=(2, 3)).astype(np.float32)
     mask = count > 0.0
+    footprint = float(int(factor) * int(factor))
+    feature_fraction = count / footprint
     feature_blocks = feature.reshape(
         channels, height, factor, width, factor
     ).transpose(0, 1, 3, 2, 4)
@@ -329,68 +406,47 @@ def _pool_rendered_surface(rendered: RenderedMapletAtlases, factor: int) -> Rend
         ).transpose(0, 2, 1, 3)
     )
     visibility_count = np.sum(visibility_blocks, axis=(2, 3)).astype(np.float32)
+    visibility_fraction = visibility_count / footprint
+    missing_blocks = (
+        visibility_blocks & ~mask_blocks
+        if rendered.field_missing is None
+        else np.asarray(rendered.field_missing, dtype=bool).reshape(
+            height, factor, width, factor
+        ).transpose(0, 2, 1, 3)
+    )
+    missing_fraction = np.sum(missing_blocks, axis=(2, 3)).astype(np.float32) / footprint
+    background_fraction = 1.0 - visibility_fraction
 
-    def mean_values(
-        values: np.ndarray,
-        support_blocks: np.ndarray = mask_blocks,
-        support_count: np.ndarray = count,
-    ) -> np.ndarray:
-        source = np.asarray(values, dtype=np.float32)
-        trailing = source.shape[2:]
-        blocks = source.reshape(height, factor, width, factor, *trailing).transpose(
-            0, 2, 1, 3, *range(4, 4 + len(trailing))
-        )
-        weighted = blocks * support_blocks[(...,) + (None,) * len(trailing)]
-        denominator = np.maximum(support_count[(...,) + (None,) * len(trailing)], 1.0)
-        return np.sum(weighted, axis=(2, 3)) / denominator
-
-    xyz = mean_values(rendered.xyz, visibility_blocks, visibility_count)
-    normal = mean_values(rendered.normal, visibility_blocks, visibility_count)
-    normal /= np.maximum(np.linalg.norm(normal, axis=2, keepdims=True), 1e-8)
-    depth = mean_values(
-        np.asarray(rendered.depth)[..., None], visibility_blocks, visibility_count,
-    )[..., 0]
-    uncertainty = mean_values(np.asarray(rendered.uncertainty)[..., None])[..., 0]
     visibility = (
         mask
         if rendered.visibility is None
         else np.any(visibility_blocks, axis=(2, 3))
     )
-    field_missing = (
-        visibility & ~mask
-        if rendered.field_missing is None
-        else np.any(
-            np.asarray(rendered.field_missing, dtype=bool).reshape(
-                height, factor, width, factor
-            ).transpose(0, 2, 1, 3),
-            axis=(2, 3),
-        )
-    )
-    incidence = (
-        np.zeros((height, width), dtype=np.float32)
-        if rendered.incidence is None
-        else mean_values(
-            np.asarray(rendered.incidence)[..., None], visibility_blocks, visibility_count,
-        )[..., 0]
-    )
-    projected_scale = (
-        np.zeros((height, width), dtype=np.float32)
-        if rendered.projected_scale is None
-        else mean_values(
-            np.asarray(rendered.projected_scale)[..., None], visibility_blocks, visibility_count,
-        )[..., 0]
-    )
+    field_missing = missing_fraction > 0.0
 
-    # Identity is categorical.  Select the closest valid high-resolution
-    # sample in each token footprint; geometry above remains area-averaged.
+    # Identity and geometry are categorical.  Select one real dominant
+    # physical component in every token footprint.
     ids = {}
     depth_blocks = np.asarray(rendered.depth, dtype=np.float32).reshape(
         height, factor, width, factor
     ).transpose(0, 2, 1, 3)
-    choice_cost = np.where(visibility_blocks & (depth_blocks > 0.0), depth_blocks, np.inf).reshape(
-        height, width, factor * factor
+    component_source = (
+        np.asarray(rendered.child_id, dtype=np.int64)
+        if rendered.child_id is not None
+        else np.asarray(rendered.surface_id, dtype=np.int64)
     )
-    choice = np.argmin(choice_cost, axis=2)
+    if rendered.child_id is not None and rendered.surface_id is not None:
+        component_source = component_source.copy()
+        missing_component = component_source < 0
+        component_source[missing_component] = np.asarray(
+            rendered.surface_id, dtype=np.int64,
+        )[missing_component]
+    component_blocks = component_source.reshape(
+        height, factor, width, factor
+    ).transpose(0, 2, 1, 3)
+    choice, dominant_fraction, mixed_surface = _dominant_subpixel_choice(
+        component_blocks, depth_blocks, visibility_blocks,
+    )
     yy = (choice // factor) + np.arange(height)[:, None] * factor
     xx = (choice % factor) + np.arange(width)[None, :] * factor
     identity_names = ["maplet_id", "surface_id", "primitive_id"]
@@ -401,6 +457,26 @@ def _pool_rendered_surface(rendered: RenderedMapletAtlases, factor: int) -> Rend
         value = source[yy, xx].copy()
         value[~visibility] = -1
         ids[name] = value
+    # Feature is an area mixture over the token footprint.  Pose geometry is
+    # categorical and must belong to one real physical component; use the
+    # frontmost sample of the dominant child/surface instead of averaging a
+    # normal that may not exist anywhere in the scene.
+    xyz = np.asarray(rendered.xyz, dtype=np.float32)[yy, xx].copy()
+    normal = np.asarray(rendered.normal, dtype=np.float32)[yy, xx].copy()
+    depth = np.asarray(rendered.depth, dtype=np.float32)[yy, xx].copy()
+    uncertainty = np.asarray(rendered.uncertainty, dtype=np.float32)[yy, xx].copy()
+    incidence = (
+        np.zeros((height, width), dtype=np.float32)
+        if rendered.incidence is None
+        else np.asarray(rendered.incidence, dtype=np.float32)[yy, xx].copy()
+    )
+    projected_scale = (
+        np.zeros((height, width), dtype=np.float32)
+        if rendered.projected_scale is None
+        else np.asarray(rendered.projected_scale, dtype=np.float32)[yy, xx].copy()
+    )
+    for value in (xyz, normal, depth, uncertainty, incidence, projected_scale):
+        value[~visibility] = 0.0
     return RenderedMapletAtlases(
         feature=pooled_feature,
         xyz=xyz,
@@ -416,4 +492,10 @@ def _pool_rendered_surface(rendered: RenderedMapletAtlases, factor: int) -> Rend
         field_missing=field_missing,
         incidence=incidence,
         projected_scale=projected_scale,
+        feature_fraction=feature_fraction,
+        visibility_fraction=visibility_fraction,
+        missing_fraction=missing_fraction,
+        background_fraction=background_fraction,
+        dominant_surface_fraction=dominant_fraction,
+        mixed_surface=mixed_surface,
     )

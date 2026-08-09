@@ -20,6 +20,10 @@ import torch
 
 from feature_extract.vfm.localization.surface_maplet_mapper import load_surface_maplet_mapper
 from feature_extract.vfm.localization_goal_maplet.canonical_field import CanonicalSurfaceField
+from feature_extract.vfm.localization_goal_maplet.conditional_pose_energy import (
+    candidate_measurements,
+    load_conditional_pose_energy,
+)
 from feature_extract.vfm.localization_goal_maplet.feature_contract import FieldFeatureContract
 from feature_extract.vfm.localization_goal_maplet.lineage import file_sha256
 from feature_extract.vfm.localization_goal_maplet.physical_instance_readout import (
@@ -32,6 +36,7 @@ from feature_extract.vfm.localization_goal_maplet.pfir import ContributorLabels
 from feature_extract.vfm.localization_goal_maplet.phase_preserving_readout import (
     dual_band_phase_evidence,
     load_phase_readout_policy,
+    orientation_equivariant_phase_evidence,
 )
 from feature_extract.vfm.localization_goal_maplet.surface_refiner import canonical_alignment_score
 from feature_extract.vfm.localization_goal_maplet.surface_pose_likelihood import (
@@ -232,6 +237,12 @@ def main() -> None:
     parser.add_argument("--surface_pose_likelihood", default="")
     parser.add_argument("--phase_preserving_dual_band", action="store_true")
     parser.add_argument("--phase_readout_model", default="")
+    parser.add_argument("--conditional_pose_energy", default="")
+    parser.add_argument(
+        "--allow_self_map_diagnostic",
+        action="store_true",
+        help="Allow a policy explicitly marked non-deployable by map/query overlap audit.",
+    )
     parser.add_argument("--allow_legacy_dual_band_score", action="store_true")
     parser.add_argument("--render_supersample_factor", type=int, default=1)
     parser.add_argument("--output_json", required=True)
@@ -293,8 +304,6 @@ def main() -> None:
     if bool(args.phase_preserving_dual_band):
         if pose_likelihood is not None:
             raise ValueError("dual-band audit and learned likelihood are separate policies")
-        if not bool(args.spatial_role_readout) or str(args.role) != "context":
-            raise ValueError("dual-band phase readout requires symmetric context readout")
         if args.resume_scores:
             raise ValueError("dual-band phase readout cannot resume scalar-only scores")
         if not args.phase_readout_model and not bool(args.allow_legacy_dual_band_score):
@@ -323,9 +332,56 @@ def main() -> None:
                 f"{required_factor}, got {int(args.render_supersample_factor)}"
             )
         phase_policy_sha256 = file_sha256(phase_policy_path)
+    phase_v2_active = bool(
+        phase_policy is not None
+        and phase_policy.metadata.get("artifact_type")
+        == "goal_maplet_phase_readout_policy_v2"
+    )
+    if bool(args.phase_preserving_dual_band) and not phase_v2_active:
+        if not bool(args.spatial_role_readout) or str(args.role) != "context":
+            raise ValueError("legacy phase readout requires symmetric context readout")
+    conditional_energy = None
+    conditional_energy_sha256 = None
+    if args.conditional_pose_energy:
+        if phase_policy is None or str(phase_policy.metadata.get("artifact_type")) != (
+            "goal_maplet_phase_readout_policy_v2"
+        ):
+            raise ValueError(
+                "conditional pose energy requires the orientation-equivariant phase v2 policy"
+            )
+        if pose_likelihood is not None:
+            raise ValueError("conditional pose energy and learned surface likelihood are exclusive")
+        energy_path = Path(args.conditional_pose_energy)
+        conditional_energy = load_conditional_pose_energy(energy_path)
+        if (
+            conditional_energy.metadata.get("deployment_allowed") is False
+            and not bool(args.allow_self_map_diagnostic)
+        ):
+            raise ValueError(
+                "conditional pose energy is self-map diagnostic only; rebuild a query-"
+                "disjoint field or pass --allow_self_map_diagnostic for an explicit audit"
+            )
+        for key, expected in (
+            ("physical_map_sha256", physical.content_sha256),
+            ("canonical_field_sha256", field.content_sha256),
+            (
+                "physical_instance_readout_sha256",
+                file_sha256(Path(args.physical_instance_readout)),
+            ),
+            ("phase_readout_policy_sha256", phase_policy_sha256),
+        ):
+            if conditional_energy.metadata.get(key) != expected:
+                raise ValueError(f"conditional pose energy lineage differs: {key}")
+        if int(conditional_energy.metadata.get("render_supersample_factor", 0)) != int(
+            args.render_supersample_factor
+        ):
+            raise ValueError("conditional pose energy render protocol differs")
+        if int(conditional_energy.metadata.get("maximum_modes", 0)) != int(args.maximum_modes):
+            raise ValueError("conditional pose energy candidate-set width differs")
+        conditional_energy_sha256 = file_sha256(energy_path)
     role_field = (
         field
-        if bool(args.spatial_role_readout)
+        if phase_v2_active or bool(args.spatial_role_readout)
         else transform_canonical_field_for_role(
             readout, field, role=str(args.role), device=str(args.device),
         )
@@ -437,7 +493,9 @@ def main() -> None:
         mapped = mapper.project(raw).measurement_context
         grid_y, grid_x = np.mgrid[: mapped.shape[1], : mapped.shape[2]]
         token_xy = np.stack([grid_x.reshape(-1), grid_y.reshape(-1)], axis=1)
-        if bool(args.spatial_role_readout):
+        if phase_v2_active:
+            query = mapped
+        elif bool(args.spatial_role_readout):
             query_flat = encode_physical_instance_regions(
                 readout,
                 mapped,
@@ -445,14 +503,17 @@ def main() -> None:
                 role=str(args.role),
                 device=str(args.device),
             )
+            query = query_flat.reshape(
+                mapped.shape[1], mapped.shape[2], mapped.shape[0],
+            ).transpose(2, 0, 1)
         else:
             flat = mapped.transpose(1, 2, 0).reshape(-1, mapped.shape[0])
             query_flat = readout.project_numpy(
                 flat, role=str(args.role), device=str(args.device),
             )
-        query = query_flat.reshape(
-            mapped.shape[1], mapped.shape[2], mapped.shape[0],
-        ).transpose(2, 0, 1)
+            query = query_flat.reshape(
+                mapped.shape[1], mapped.shape[2], mapped.shape[0],
+            ).transpose(2, 0, 1)
 
         row = json.loads(json.dumps(source))
         for name, details in row.get("mode_details", {}).items():
@@ -486,7 +547,7 @@ def main() -> None:
                     supersample_factor=int(args.render_supersample_factor),
                 )
                 rendered_mapper = np.asarray(rendered.feature, dtype=np.float32)
-                if bool(args.spatial_role_readout):
+                if bool(args.spatial_role_readout) and not phase_v2_active:
                     rendered_flat = encode_physical_instance_regions(
                         readout,
                         np.asarray(rendered.feature, dtype=np.float32),
@@ -500,12 +561,36 @@ def main() -> None:
                     ).transpose(2, 0, 1)
                     rendered = replace(rendered, feature=rendered_feature)
                 if bool(args.phase_preserving_dual_band):
-                    phase = dual_band_phase_evidence(
-                        mapped,
-                        rendered_mapper,
-                        query,
-                        np.asarray(rendered.feature, dtype=np.float32),
-                        np.asarray(rendered.mask, dtype=bool),
+                    phase_kwargs = {
+                        "feature_fraction": getattr(rendered, "feature_fraction", None),
+                        "visibility_fraction": getattr(
+                            rendered, "visibility_fraction", None,
+                        ),
+                        "missing_fraction": getattr(rendered, "missing_fraction", None),
+                        "background_fraction": getattr(
+                            rendered, "background_fraction", None,
+                        ),
+                        "dominant_surface_fraction": getattr(
+                            rendered, "dominant_surface_fraction", None,
+                        ),
+                        "mixed_surface": getattr(rendered, "mixed_surface", None),
+                    }
+                    phase = (
+                        orientation_equivariant_phase_evidence(
+                            mapped,
+                            rendered_mapper,
+                            np.asarray(rendered.mask, dtype=bool),
+                            **phase_kwargs,
+                        )
+                        if phase_v2_active
+                        else dual_band_phase_evidence(
+                            mapped,
+                            rendered_mapper,
+                            query,
+                            np.asarray(rendered.feature, dtype=np.float32),
+                            np.asarray(rendered.mask, dtype=bool),
+                            **phase_kwargs,
+                        )
                     )
                     scores.append(float(
                         phase.legacy_dual_band_score
@@ -525,6 +610,17 @@ def main() -> None:
                     likelihood_query_summary = query_summary
             null_probability = None
             event_fraction = None
+            if conditional_energy is not None:
+                if len(phase_components) != take:
+                    raise ValueError("conditional pose energy requires every candidate phase")
+                measurements = candidate_measurements(
+                    np.asarray(
+                        [detail["score"] for detail in details[:take]], dtype=np.float64,
+                    ),
+                    phase_components,
+                )
+                probability, null_probability = conditional_energy.posterior(measurements)
+                scores = probability.astype(np.float64).tolist()
             if pose_likelihood is not None:
                 if len(likelihood_features) != take or likelihood_query_summary is None:
                     raise ValueError("typed likelihood requires every frozen candidate render")
@@ -575,6 +671,7 @@ def main() -> None:
                 phase_components if bool(args.phase_preserving_dual_band) else None
             )
             diagnostics["surface_phase_readout_policy_sha256"] = phase_policy_sha256
+            diagnostics["conditional_pose_energy_sha256"] = conditional_energy_sha256
         rows.append(row)
         print(json.dumps({"image_id": image_id, "surface_verified_modes": {
             name: min(int(args.maximum_modes), len(value))
@@ -590,32 +687,54 @@ def main() -> None:
         "render": "complete_clean_2dgs_single_canonical_field",
         "render_supersample_factor": int(args.render_supersample_factor),
         "score": (
-            "same_query_typed_candidate_posterior_with_null"
-            if pose_likelihood is not None else (
+            "low_capacity_identity_phase_observation_posterior_with_null"
+            if conditional_energy is not None else (
+                "same_query_typed_candidate_posterior_with_null"
+                if pose_likelihood is not None else (
                 "phase_preserving_dual_band_fixed_grid_evidence"
                 if bool(args.phase_preserving_dual_band) and phase_policy is None
                 else (
-                    "learned_coordinate_free_phase_readout"
+                    (
+                        "orientation_equivariant_phase_residual"
+                        if phase_policy.metadata.get("artifact_type")
+                        == "goal_maplet_phase_readout_policy_v2"
+                        else "learned_coordinate_free_phase_readout"
+                    )
                     if phase_policy is not None
                     else "fixed_full_query_grid_mean_cosine"
                 )
-            )
+            ))
         ),
         "surface_pose_likelihood_sha256": pose_likelihood_sha256,
+        "conditional_pose_energy_sha256": conditional_energy_sha256,
         "score_semantics": (
-            "same_query_typed_candidate_posterior_with_null"
-            if pose_likelihood is not None else (
+            "monotonic_identity_plus_jacobian_phase_plus_fractional_observation"
+            if conditional_energy is not None else (
+                "same_query_typed_candidate_posterior_with_null"
+                if pose_likelihood is not None else (
                 "mapper_and_context_identity_plus_directional_mapper_phase"
                 if bool(args.phase_preserving_dual_band) and phase_policy is None
                 else (
-                    "proposal_identity_plus_learned_directional_mapper_phase"
+                    (
+                        "orientation_equivariant_conditional_mapper_phase_only"
+                        if phase_policy.metadata.get("artifact_type")
+                        == "goal_maplet_phase_readout_policy_v2"
+                        else "proposal_identity_plus_learned_directional_mapper_phase"
+                    )
                     if phase_policy is not None
                     else "fixed_full_query_grid_mean_cosine"
                 )
-            )
+            ))
         ),
-        "same_query_candidate_normalization": bool(pose_likelihood is not None),
-        "typed_null_hypothesis": bool(pose_likelihood is not None),
+        "same_query_candidate_normalization": bool(
+            pose_likelihood is not None or conditional_energy is not None
+        ),
+        "typed_null_hypothesis": bool(
+            pose_likelihood is not None or conditional_energy is not None
+        ),
+        "self_map_diagnostic_override": bool(
+            conditional_energy is not None and args.allow_self_map_diagnostic
+        ),
         "phase_preserving_dual_band": bool(args.phase_preserving_dual_band),
         "phase_readout_stored_as_second_map_feature": False,
         "phase_readout_policy_sha256": phase_policy_sha256,

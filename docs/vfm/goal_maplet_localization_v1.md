@@ -1282,6 +1282,165 @@ low-capacity conditional identity/phase/observability energy and a
 surface-frame or orientation-equivariant phase field; it must not multiply
 two falsely independent RADIO probabilities or reopen strict12 for tuning.
 
+### G20 — fractional surface observation and Jacobian phase
+
+G20 turns the empirical factor-2 fix into an explicit VFM-token observation
+contract.  For token footprint `Omega_u`, the rendered canonical feature is
+defined as the normalized surface-weighted footprint integral
+
+```text
+F_bar_T(u) = integral K_u A_T F_T dx / integral K_u A_T dx .
+```
+
+The factor-2 renderer is its current bounded quadrature.  It now exports
+`p_feature`, `p_visible`, `p_missing` and `p_background`, with
+
+```text
+p_feature + p_missing + p_background = 1
+p_feature + p_missing = p_visible .
+```
+
+Across 1,105 rendered candidates, the maximum closure residuals are
+`3.35e-8` and `5.31e-8`.  Features remain an area-aware mixture.  Depth,
+position and normal instead come from the frontmost sample of the dominant
+physical component, so a wall/window boundary can no longer create a
+non-physical averaged normal.  `mixed_surface` and dominant-component purity
+remain explicit; median/P90 mixed-marker rates are 0.726/0.849 and are not
+collapsed back to mutually exclusive feature/missing states.  These are token
+marker rates, not non-dominant area mass.
+
+The phase artifact schema is upgraded to
+`goal_maplet_phase_readout_policy_v2`, with role `phase_residual_only`.
+Loading fails closed unless the only active component is
+`jacobian_phase_visible`; mapper cosine, context cosine and the legacy
+dual-band score are forbidden.  Given the 128D feature Jacobian
+
+```text
+J_F = [dF/dx, dF/dy],
+S_phase = <J_query,J_render>_F / (||J_query||_F ||J_render||_F + eps),
+```
+
+the phase is invariant when query and render share the same in-plane basis
+rotation.  Carrier weight comes only from query gradient magnitude.  Phase
+agreement, fractional observability and gradient log-scale are separate
+measurements; the map still stores one canonical feature type and no
+downstream embedding.
+
+G20-C fits a non-negative three-term linear energy over the frozen Top-16
+candidate set and normalizes candidates jointly with one explicit null.  The
+rank weights are learned only from candidate-conditional targets.  Null is a
+separate one-class open-set test on absolute candidate-set phase support;
+query-local centering is not allowed to erase the case where every candidate
+is poor.  Seq1/2/4 rows are excluded from query-side calibration.  Outer
+leave-one-query-trajectory-out calibration uses seq6/7/8/9/12/14; closed
+seq11 and seq3/5/13 strict12 are not reopened.
+
+| 41-query fixed-map trajectory LOTO diagnostic | translation median/P90 | rotation median/P90 | strict | 1 m/10 deg | accepted catastrophic |
+|---|---:|---:|---:|---:|---:|
+| proposal identity only | 0.378 / 1.209 m | 1.34 / 3.37 deg | 63.41% | 87.80% | 2.50% |
+| **Jacobian phase only** | **0.235 / 0.661 m** | **0.85 / 1.97 deg** | **87.80%** | **92.68%** | **0%** |
+| identity + phase | 0.235 / 0.695 m | 0.85 / 1.97 deg | 85.37% | 92.68% | 0% |
+| identity + phase + observation | 0.267 / 0.661 m | 0.99 / 2.14 deg | 85.37% | 92.68% | 0% |
+
+All variants use the same absolute phase-support null.  It abstains on one of
+41 queries (2.44%), correctly catching the 12.79 m/31.1 degree candidate-set
+failure and giving 0% catastrophic rate among accepted full-energy results.
+The other no-success candidate set has strong but wrong phase support and is
+not rejected (2.17 m/11.9 degrees), so null classification is 97.56%, not
+perfect.  Compared with identity, phase gains ten strict successes and loses
+none.  The additive observation term loses one strict case relative to
+phase-only; therefore G20 establishes the conditional-energy interface and
+typed null, but the measured ranking gain belongs primarily to Jacobian phase.
+The final diagnostic full-energy artifact has weights
+`[0.0417, 0.9730, 0.9032]`.  A fresh verifier replay matches its offline
+candidate and null probabilities exactly; this replay is distinct from the
+outer-fold metrics and is not reported as held-out accuracy.  The artifact is
+marked `deployment_allowed=false`; the verifier rejects it by default and
+requires an explicit `--allow_self_map_diagnostic` override for such a replay.
+
+G20-D reruns the predefined six-DoF basin audit on 18 queries, and reports a
+12-query seq6/7/8/9/12/14 subset separately:
+
+| fixed-map factor-2 Jacobian basin diagnostic | result |
+|---|---:|
+| GT beats +/-0.25 m surface-frame translations | 98.61% |
+| GT beats +/-0.50 m surface-frame translations | 100% |
+| GT beats +/-3 deg camera rotations | 100% |
+| strict local maximum, tangent1 / tangent2 / normal | 66.67% / 66.67% / **83.33%** |
+| strict local maximum, roll / pitch / yaw | 100% / 100% / 100% |
+
+This is a qualitative change from G19-C's 0% surface-normal local maximum.
+The separate gradient-scale diagnostic is weaker on the normal axis (41.67%)
+than phase itself, so a scale/parallax term is not added merely for model
+completeness.  Every numerical basin check passes.  The old surface-flow
+refiner is not silently re-enabled, and G20 itself contains no continuous
+refinement.
+
+The final offline lineage audit exposes a more restrictive protocol fact.  The
+canonical field was fused from 122 images in
+`contributors_setcover128_clean` after the declared exclusions, and all 115
+images in the G20 evidence report occur in that exact mapping-image set:
+
+```text
+mapping images:             122
+evaluated images:           115
+exact map/query overlap:    115 (100%)
+map/query image disjoint:   false
+```
+
+The map still stores no image identity or RGB; this is an evaluation leakage,
+not a deployment-storage violation.  Query-trajectory LOTO isolates only the
+fit of the three energy weights.  It does not undo the fact that the query's
+own VFM observation contributed to the canonical field or that the frozen
+candidate pool was built against that field.  Consequently the 0.235/0.661 m
+ranking result and the strong six-DoF basin are **self-map development
+diagnostics**, not map-disjoint cross-acquisition localization evidence.
+`g20_decision_record_v1.json` therefore records the numerical diagnostic pass
+but sets both `map_disjoint_cross_acquisition_pass` and
+`g21_continuous_refinement_open` to false.  A proper next run must rebuild the
+canonical field, readout/proposals and evidence with the audited query
+acquisition excluded before G21 is opened.  G20 remains a useful
+method/observation-model implementation advance, but makes no production,
+paper-accuracy or centimetre-precision claim.
+
+#### Fixed-method map-disjoint replay
+
+After discovering the self-map leakage, the serialized v2 phase policy was
+replayed once, without fitting or threshold selection, on the two field-
+excluded historical blocks.  The canonical field contains 122 images from
+seq1/2/4/6/7/8/9/10/12/14; seq11 and strict12 (seq3/5/13) therefore have both
+zero exact image overlap and zero trajectory overlap with field construction.
+These blocks were used in earlier method development, so this is a
+map-disjoint regression audit, not a new untouched test set.
+
+| frozen phase replay | translation median/P90 | rotation median/P90 | strict | 1 m/10 deg | catastrophe |
+|---|---:|---:|---:|---:|---:|
+| seq11 G19-C directional 2x | 0.563 / 0.674 m | 1.03 / 1.48 deg | 45.45% | 100% | 0% |
+| seq11 G20 Jacobian 2x | **0.483** / 0.723 m | **0.99** / 1.99 deg | **54.55%** | 90.91% | 0% |
+| strict12 G19-C directional 2x | **0.303 / 0.705 m** | **1.25 / 2.18 deg** | **75.00%** | 100% | 0% |
+| strict12 G20 Jacobian 2x | 0.335 / 0.715 m | 1.48 / 2.19 deg | 66.67% | 100% | 0% |
+
+Seq11 uses the same graph proposal seed, typed graph, validity calibration,
+identity renderer, cascade, map, field and physical readout as G20
+calibration.  Applying the frozen full energy to that unchanged generator
+does not transfer:
+
+| seq11 frozen transfer | translation median/P90 | rotation median/P90 | strict | 1 m/10 deg | catastrophe / abstain |
+|---|---:|---:|---:|---:|---:|
+| identity only | 1.082 / 2.506 m | 2.27 / 7.53 deg | 9.09% | 36.36% | 0% / 100% |
+| Jacobian phase only | **0.483 / 0.723 m** | **0.99 / 1.99 deg** | **54.55%** | **90.91%** | **0% / 100%** |
+| frozen full energy | 0.854 / 5.643 m | 1.96 / 17.14 deg | 27.27% | 63.64% | 18.18% / 100% |
+
+The all-abstain result is itself a failed transfer of the self-map-calibrated
+absolute null, not a successful safety mechanism.  The strict12 pool uses an
+older proposal seed/typed-graph/validity contract; the evaluator therefore
+fails closed before applying the full energy, while the parameter-free phase
+comparison remains reportable on its frozen candidate set.  Taken together,
+the replay rejects the learned G20 energy and does not establish a consistent
+Jacobian-phase improvement over G19-C.  G19-C remains selected for discrete
+ranking, and neither a production promotion nor G21 continuous refinement is
+opened.
+
 ## Development-set result
 
 The best deployable Goal-Maplet Top-1 remains the frozen graph v9 result, not
@@ -1317,7 +1476,8 @@ relevant, but it does not yet meet the requested accuracy.
 | M3.6 physical-instance surface likelihood | tail pass / production fail | validation 0.366/0.837 m and 76.47% strict; Dev catastrophic 2.08%, but strict 39.58% |
 | M3.7 typed competing-phase likelihood | correctness pass / production fail | exact geometry audit passes; seq11 strict 18.18% and zero catastrophe, but 1.335/2.670 m and no transferable phase basin |
 | M3.8 phase-survival/readout | method pass / production fail | phase survives through mapper (81.82% pair concordance); selected coordinate-free phase readout reaches 0.625/0.854 m, 45.45% strict, 90.91% within 1 m and zero catastrophe on seq11 |
-| M4 refiner handoff | fail | no stable 0.1–0.5 m convergence basin |
+| M3.9 fractional Jacobian phase | implementation pass / protocol fail | self-map trajectory LOTO phase-only 0.235/0.661 m and 87.80% strict; all 115 evidence images contributed to the canonical field, so cross-acquisition accuracy is unproven |
+| M4 refiner handoff | self-map basin pass / closed | factor-2 Jacobian phase passes the numerical six-DoF checks, but query/map overlap blocks G21 until a disjoint field and candidate pool are rebuilt |
 | M5 final paper claim | fail | no untouched test, hard-subset comparison or target accuracy |
 
 ## Rejected directions
@@ -1418,11 +1578,19 @@ not an unsupported claim that VFM regions directly yield centimetre pose.
 - G19-C 2x seq11/strict12 confirmation: `goal_maplet/pose_modes_phase_readout_g19_c_supersample2_seq11_v1.json`, `goal_maplet/pose_modes_phase_readout_g19_c_strict12_2x_v1.json`
 - G19-C selected render-bound policy: `goal_maplet/phase_readout_g19_c_supersample2_selected_v1.json`
 - G19-C final lineaged decision record: `goal_maplet/g19_c_decision_record_v1.json`
+- G20 phase-only policy: `goal_maplet/phase_readout_g20_jacobian_v2.json`
+- G20 full frozen evidence: `goal_maplet/pose_modes_g20_jacobian_train_v1.json`
+- G20 self-map query-trajectory LOTO audit/policy: `goal_maplet/conditional_energy_g20_query_trajectory_loto_v1.json`, `goal_maplet/conditional_energy_g20_selected_v1.json`
+- G20 six-DoF basin: `goal_maplet/phase_basin_g20_mapping_v1.json`
+- G20 explicit self-map runtime posterior replay: `goal_maplet/pose_modes_g20_runtime_smoke_v1.json`
+- G20 lineaged decision record: `goal_maplet/g20_decision_record_v1.json`
+- G20 map-disjoint seq11 phase replay and frozen-energy transfer: `goal_maplet/pose_modes_g20_mapdisjoint_seq11_v1.json`, `goal_maplet/conditional_energy_g20_mapdisjoint_seq11_v1.json`
+- G20 map-disjoint strict12 phase-only regression: `goal_maplet/pose_modes_g20_mapdisjoint_strict12_v1.json`
 - rejected teacher-weighted field/readout: `goal_maplet/canonical_surface_field_teacher_g17_v3.npz`, `goal_maplet/physical_instance_readout_teacher_g17_v3.pt`
 - rejected conditional rank: `goal_maplet/pose_modes_graph_conditionalrank_dev48_v17.json`
 - 4x GT round-trip audit: `goal_maplet/surface_basin_radio_pca256_supersample4_oracle_smoke_gt1round_v4.json`
 
-Focused verification: `284 passed` across all Goal-Maplet, V6 atlas/frame and
-2DGS mapping tests, including phase-survival lineage, pose-defined typed phase
-labels, fixed-denominator phase readout, hierarchy calibration, exact 2DGS map
-contracts and typed surface-likelihood/risk semantics.
+Focused G20 verification: `325 passed` across Goal-Maplet, V6 atlas/frame and
+2DGS mapping tests.  G20 additionally covers fractional mass closure,
+dominant-surface pooling, common-roll Jacobian invariance, v2 fail-closed
+policy loading, conditional null semantics and the basin gate.
