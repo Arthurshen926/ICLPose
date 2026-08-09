@@ -1441,6 +1441,97 @@ Jacobian-phase improvement over G19-C.  G19-C remains selected for discrete
 ranking, and neither a production promotion nor G21 continuous refinement is
 opened.
 
+#### G20.1 outer feature-pipeline cross-fit audit
+
+The historical replay above still reused a mapper/readout trained with some
+of the audited acquisitions.  G20.1 therefore rebuilds the complete feature
+pipeline twice.  In the `hold_seq12` fold, seq12 is excluded from a mapper
+trained from scratch, the canonical field, the physical-instance readout,
+typed graph and validity/candidate calibration; `hold_seq14` applies the same
+rule to seq14.  Query evidence is generated only after every fold-local
+artifact has been hashed and checked for held-trajectory overlap.  Ranking
+and abstention are now separate: these runs contain no conditional energy,
+null, observation reward or refiner.
+
+The old G19-C directional weights are not reused in the primary comparison:
+their fit set included seq12/14.  Instead, the two cross-fit operators are
+analytic and parameter-free: equal-weight horizontal/vertical directional
+phase versus the unscaled visible Jacobian-phase cosine.  This changes the
+question from transfer of a leaked historical calibration to the intrinsic
+stability of the two phase definitions.
+
+| held acquisition / factor-2 phase | translation median/P90 | rotation median/P90 | strict | 1 m/10 deg | catastrophe |
+|---|---:|---:|---:|---:|---:|
+| seq12 directional | 0.383 / 9.926 m | 1.41 / 10.86 deg | 54.55% | 63.64% | 27.27% |
+| seq12 Jacobian | 0.383 / 9.016 m | 1.41 / 10.86 deg | 54.55% | 63.64% | 27.27% |
+| seq14 directional | 0.261 / 0.449 m | 1.15 / 1.47 deg | 83.33% | 100% | 0% |
+| seq14 Jacobian | 0.261 / 0.449 m | 1.15 / 1.47 deg | 83.33% | 100% | 0% |
+| merged directional | **0.296 / 9.193 m** | **1.15 / 10.01 deg** | **64.71%** | **76.47%** | **17.65%** |
+| merged Jacobian | **0.296 / 8.829 m** | 1.25 / 10.68 deg | **64.71%** | **76.47%** | **17.65%** |
+
+The apparent tail is not a phase-operator failure.  The same fold-local
+candidate pools provide the following exact ceiling/decomposition:
+
+| candidate/selection event over 17 queries | strict | 1 m/10 deg |
+|---|---:|---:|
+| full Top-32 oracle | 70.59% | 82.35% |
+| phase-evaluated Top-16 oracle | 70.59% | 76.47% |
+| directional selected | 64.71% | 76.47% |
+| no valid candidate in full pool | 5 | 3 |
+| valid candidate only outside Top-16 | 0 | 1 |
+| phase miss despite an available Top-16 candidate | 1 | **0** |
+
+Thus directional phase captures 11/12 available strict successes and all
+13/13 available one-metre successes.  Both operators have exactly the same
+success set: 11 both-right, six both-wrong, zero directional-only and zero
+Jacobian-only successes; 14/17 Top-1 poses are identical.  Per-query score
+correlation is correspondingly high (median Kendall 0.905, Pearson 0.986).
+Overall pose-quality pairwise concordance is 77.83% for directional and
+78.04% for Jacobian.  Directional/Jacobian oracle-negative concordance is
+90.0/90.0% at 0.25--0.5 m, 86.79/88.68% at 0.5--1 m, and
+97.14/91.43% at 1--2.5 m.  There is no evidence for a learned phase mixture;
+the simpler directional operator remains selected.
+
+The typed factor-2 basin audit is run around GT on every one of the 17 held
+queries, with only the predeclared ±0.25/±0.5 m surface-frame and ±3 degree
+camera perturbations:
+
+| outer-feature-cross-fit basin | ±0.25 m | ±0.50 m | ±3 deg | tangent1 / tangent2 / normal local max | roll / pitch / yaw local max |
+|---|---:|---:|---:|---:|---:|
+| seq12 directional | 98.48% | 100% | 100% | 100 / 90.91 / 100% | 100 / 100 / 100% |
+| seq12 Jacobian | 98.48% | 100% | 100% | 100 / 90.91 / 100% | 100 / 100 / 100% |
+| seq14 directional | 100% | 100% | 100% | 100 / 100 / 100% | 100 / 100 / 100% |
+| seq14 Jacobian | 100% | 100% | 100% | 100 / 100 / 100% | 100 / 100 / 100% |
+| merged, either operator | **99.02%** | **100%** | **100%** | **100 / 94.12 / 100%** | **100 / 100 / 100%** |
+
+The two ranking operators therefore also have indistinguishable binary basin
+gates.  In contrast, Jacobian log-scale agreement reaches only
+69.61/75.49/84.31% on ±0.25 m/±0.50 m/±3 degrees, and raw observability only
+50.98/57.84/50.98%.  This directly supports the revised semantics:
+observability can parameterize phase uncertainty, but is not a monotonic pose
+reward; scale agreement is not added merely for completeness.
+
+This run also repaired two protocol-affecting implementation errors.  The
+trajectory-split mapper evaluator previously demanded feature maps for strict
+holdout observation rows even though those rows must not be loaded; it now
+evaluates exactly `prototype | validation`.  The basin audit previously sent
+new v1 directional replays through the v2 Jacobian evidence path after the
+G20 integration, making their horizontal/vertical components identically
+zero; dispatch is now explicitly policy-typed.  This does not invalidate the
+older serialized G19-C basin artifact, whose stored directional components
+are nonzero.  A misleading directional report label implying proposal-score
+addition was also corrected: the serialized ranking score is phase-only.
+
+G20.1 is still **feature-pipeline outer cross-fit, not geometry outer
+cross-fit**.  `/root/StMaryChurch2dgs_clean.ply` and the physical hierarchy
+were built before these folds and can contain held-acquisition geometry.
+Therefore these numbers identify the current method bottleneck but cannot be
+promoted as a final cross-acquisition paper result.  They make that bottleneck
+unambiguous: Stage C nearly saturates its candidate set, while Stage A/B fails
+to place a one-metre candidate in the full pool for three seq12 queries and a
+strict candidate for five.  Top-K or phase-weight tuning cannot repair those
+failures.
+
 ## Development-set result
 
 The best deployable Goal-Maplet Top-1 remains the frozen graph v9 result, not
@@ -1586,11 +1677,17 @@ not an unsupported claim that VFM regions directly yield centimetre pose.
 - G20 lineaged decision record: `goal_maplet/g20_decision_record_v1.json`
 - G20 map-disjoint seq11 phase replay and frozen-energy transfer: `goal_maplet/pose_modes_g20_mapdisjoint_seq11_v1.json`, `goal_maplet/conditional_energy_g20_mapdisjoint_seq11_v1.json`
 - G20 map-disjoint strict12 phase-only regression: `goal_maplet/pose_modes_g20_mapdisjoint_strict12_v1.json`
+- G20.1 fold-local maps/readouts/evidence: `goal_maplet/map_crossfit_g20_1/hold_seq12`, `goal_maplet/map_crossfit_g20_1/hold_seq14`
+- G20.1 merged operator decision: `goal_maplet/map_crossfit_g20_1/phase_operator_evaluation_merged.json`
+- G20.1 typed outer-feature-cross-fit basins: `goal_maplet/map_crossfit_g20_1/directional_basin_merged.json`, `goal_maplet/map_crossfit_g20_1/jacobian_basin_merged.json`
 - rejected teacher-weighted field/readout: `goal_maplet/canonical_surface_field_teacher_g17_v3.npz`, `goal_maplet/physical_instance_readout_teacher_g17_v3.pt`
 - rejected conditional rank: `goal_maplet/pose_modes_graph_conditionalrank_dev48_v17.json`
 - 4x GT round-trip audit: `goal_maplet/surface_basin_radio_pca256_supersample4_oracle_smoke_gt1round_v4.json`
 
-Focused G20 verification: `325 passed` across Goal-Maplet, V6 atlas/frame and
+Focused G20.1 verification: `333 passed` across Goal-Maplet, V6 atlas/frame and
 2DGS mapping tests.  G20 additionally covers fractional mass closure,
 dominant-surface pooling, common-roll Jacobian invariance, v2 fail-closed
-policy loading, conditional null semantics and the basin gate.
+policy loading, conditional null semantics and the basin gate.  G20.1 adds
+strict holdout mapper evaluation, typed v1/v2 basin dispatch, parameter-free
+operator contracts, exact fold merging, candidate-ceiling decomposition and
+held-trajectory lineage rejection.

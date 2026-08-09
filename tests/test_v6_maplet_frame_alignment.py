@@ -10,6 +10,7 @@ from feature_extract.tools.vfm.train_v6_global_frame_encoder import (
     _soft_projection_nll,
 )
 from feature_extract.tools.vfm.train_surface_maplet_mapper import (
+    _evaluate_model,
     _resolve_prototype_images,
     _split_images_by_trajectory,
 )
@@ -50,6 +51,10 @@ from feature_extract.vfm.localization_v6.atlas_pose_alignment import (
 from feature_extract.vfm.colmap_tracks import ColmapCamera
 from feature_extract.vfm.localization.surface_retrieval_maplets import (
     SurfaceRetrievalMapletBank,
+)
+from feature_extract.vfm.localization.surface_maplet_mapper import (
+    SurfaceMapletMapper,
+    SurfaceMapletMapperConfig,
 )
 from feature_extract.vfm.localization_v6.map_entities import (
     MetricSurfaceChartBank,
@@ -209,6 +214,34 @@ def test_surface_mapper_rejects_nontraining_prototype_trajectory():
             ("seq3", "seq5", "seq13"),
             trajectory_split=True,
         )
+
+
+def test_surface_mapper_evaluation_ignores_strict_holdout_observation_rows():
+    model = SurfaceMapletMapper(
+        SurfaceMapletMapperConfig(input_dim=4, hidden_dim=4, output_dim=3)
+    )
+    image_ids = np.asarray(
+        ["train0", "valid0", "holdout", "train1", "valid1"], dtype=object
+    )
+    feature_maps = {
+        image_id: np.full((4, 2, 2), index + 1, dtype=np.float32)
+        for index, image_id in enumerate(("train0", "valid0", "train1", "valid1"))
+    }
+    metrics = _evaluate_model(
+        model,
+        feature_maps,
+        image_ids,
+        np.zeros((5, 2), dtype=np.float32),
+        np.asarray([0, 0, 0, 1, 1], dtype=np.int64),
+        np.ones((5,), dtype=np.float32),
+        np.asarray([True, False, False, True, False]),
+        np.asarray([False, True, False, False, True]),
+        torch.device("cpu"),
+        (1,),
+        (1.0,),
+    )
+    assert metrics["query_count"] == 2
+    assert metrics["prototype_count"] == 2
 
 
 def test_atlas_alignment_exposes_six_rotation_directions():

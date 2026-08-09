@@ -368,26 +368,32 @@ def _evaluate_model(
     pool_weights: tuple[float, ...],
 ) -> dict[str, float | int]:
     model.eval()
+    evaluation_mask = np.asarray(prototype_mask, dtype=bool) | np.asarray(
+        validation_mask, dtype=bool
+    )
+    expected_rows = np.flatnonzero(evaluation_mask)
+    if not len(expected_rows):
+        raise ValueError("mapper evaluation split contains no observations")
     with torch.no_grad():
         descriptors, rows = _mapped_observation_descriptors(
             model,
             feature_maps,
             image_ids,
             token_xy,
-            np.ones((len(image_ids),), dtype=bool),
+            evaluation_mask,
             device,
             pool_sizes,
             pool_weights,
         )
     descriptor_array = descriptors.detach().cpu().numpy()
-    if not np.array_equal(rows, np.arange(len(image_ids))):
+    if not np.array_equal(rows, expected_rows):
         raise RuntimeError("mapper evaluation did not preserve observation order")
     return maplet_prototype_retrieval_metrics(
         descriptor_array,
-        labels,
-        prototype_mask,
-        validation_mask,
-        quality,
+        labels[rows],
+        np.asarray(prototype_mask, dtype=bool)[rows],
+        np.asarray(validation_mask, dtype=bool)[rows],
+        quality[rows],
     )
 
 

@@ -232,6 +232,32 @@ the calibration generator and is rejected rather than mixed into a full-
 energy claim.  Therefore G19-C remains the selected discrete ranker, the G20
 full energy is rejected for deployment, and G21 stays closed.
 
+G20.1 replaces the leaked score-level LOTO with two outer feature-pipeline
+outer folds (`hold_seq12`, `hold_seq14`).  Each fold retrains the RADIO-final
+surface mapper from scratch and rebuilds its single-feature canonical field,
+physical readout, typed graph, validity calibration and candidate pool without
+the held acquisition.  Ranking and null are separated; the comparison is
+between analytic parameter-free directional 2x and Jacobian 2x phase, with no
+joint energy or refiner.  Over 17 held queries both operators obtain the same
+64.71% strict, 76.47% one-metre success and 17.65% catastrophe, with no
+operator-exclusive success and median Kendall/Pearson correlation of
+0.905/0.986.  The simpler directional operator is retained and phase-mixture
+training is forbidden.
+
+The cross-fit decomposition localizes the tail upstream: Top-16 contains a
+strict/one-metre solution for only 70.59%/76.47% of queries, while directional
+phase captures 11/12 strict and 13/13 one-metre opportunities.  Five queries
+have no strict candidate anywhere in Top-32 and three have no one-metre
+candidate.  Stage C is therefore near its discrete ceiling; phase weights,
+null thresholds and Top-K tuning cannot repair the main seq12 failures.  This
+same feature-disjoint audit finds a strong local phase basin for both
+operators: merged GT superiority is 99.02% at ±0.25 m and 100% at ±0.5 m and
+±3 degrees; five axes have a 100% strict local maximum and tangent2 has
+94.12%.  Raw observability is not monotonic and remains confidence rather than
+an additive reward.  This is feature-pipeline cross-fit only: the clean 2DGS
+geometry was not rebuilt per fold and no optimizer convergence test was run,
+so production/paper promotion and G21 remain closed.
+
 ## Frozen V6 Status
 
 See [the V6 mainline](docs/vfm/2dgs_maplet_atlas_localization_v6.md) for its

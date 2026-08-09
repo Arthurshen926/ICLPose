@@ -19,6 +19,7 @@ from feature_extract.vfm.localization_goal_maplet.canonical_field import Canonic
 from feature_extract.vfm.localization_goal_maplet.pfir import ContributorLabels
 from feature_extract.vfm.localization_goal_maplet.phase_preserving_readout import (
     DualBandPhaseEvidence,
+    dual_band_phase_evidence,
     load_phase_readout_policy,
     orientation_equivariant_phase_evidence,
 )
@@ -73,6 +74,22 @@ def _rotate_camera(pose_w2c: np.ndarray, camera_axis: np.ndarray, angle: float) 
     return pose
 
 
+def _phase_evidence_for_policy(
+    query: np.ndarray,
+    rendered: np.ndarray,
+    valid: np.ndarray,
+    policy,
+    **phase_kwargs,
+) -> DualBandPhaseEvidence:
+    if policy.metadata.get("artifact_type") == "goal_maplet_phase_readout_policy_v2":
+        return orientation_equivariant_phase_evidence(
+            query, rendered, valid, **phase_kwargs,
+        )
+    return dual_band_phase_evidence(
+        query, rendered, query, rendered, valid, **phase_kwargs,
+    )
+
+
 def _score(
     query: np.ndarray,
     pose: np.ndarray,
@@ -93,16 +110,24 @@ def _score(
         device=device,
         supersample_factor=int(supersample_factor),
     )
-    evidence = orientation_equivariant_phase_evidence(
-        query,
-        np.asarray(rendered.feature, dtype=np.float32),
-        np.asarray(rendered.mask, dtype=bool),
-        feature_fraction=getattr(rendered, "feature_fraction", None),
-        visibility_fraction=getattr(rendered, "visibility_fraction", None),
-        missing_fraction=getattr(rendered, "missing_fraction", None),
-        background_fraction=getattr(rendered, "background_fraction", None),
-        dominant_surface_fraction=getattr(rendered, "dominant_surface_fraction", None),
-        mixed_surface=getattr(rendered, "mixed_surface", None),
+    rendered_feature = np.asarray(rendered.feature, dtype=np.float32)
+    valid = np.asarray(rendered.mask, dtype=bool)
+    phase_kwargs = {
+        "feature_fraction": getattr(rendered, "feature_fraction", None),
+        "visibility_fraction": getattr(rendered, "visibility_fraction", None),
+        "missing_fraction": getattr(rendered, "missing_fraction", None),
+        "background_fraction": getattr(rendered, "background_fraction", None),
+        "dominant_surface_fraction": getattr(
+            rendered, "dominant_surface_fraction", None
+        ),
+        "mixed_surface": getattr(rendered, "mixed_surface", None),
+    }
+    # A v1 directional policy consumes only horizontal/vertical phase.
+    # Supplying the base mapped feature for both identity/context arguments
+    # exactly preserves those directional components without inventing a
+    # second learned role inside this no-training basin audit.
+    evidence = _phase_evidence_for_policy(
+        query, rendered_feature, valid, policy, **phase_kwargs,
     )
     return float(policy.score(evidence)), evidence, rendered
 
