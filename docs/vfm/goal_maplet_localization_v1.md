@@ -1219,12 +1219,68 @@ round prioritizes eliminating localization failures and long tails.  This
 ablation is also evidence that mapping-trajectory LOTO is not a substitute for
 cross-acquisition validation.
 
-G19-B makes a continuous phase basin plausible but does not yet prove it.
-Continuous refinement stays disabled until multi-axis perturbation tests show
-stable descent around GT.  The next bounded work is a small full-grid spatial
-phase likelihood/null calibration and proposal-prior multiplication; it must
-beat the selected G19-B tail metrics before any refiner or untouched test is
-opened.
+G19-B made a continuous phase basin plausible but did not prove it.  G19-C
+below closes that gate and corrects the raster protocol before any continuous
+refiner is opened.
+
+### G19-C — phase semantics, raster falsification and six-DoF basin gate
+
+G19-C first removes two implementation footguns.  The historical fixed
+`0.50 mapper + 0.20 context + 0.15 horizontal + 0.15 vertical` mixture is now
+named `legacy_dual_band_score`; the active verifier fails closed unless a
+serialized policy is supplied.  Directional evidence is also exposed as
+`conditional phase agreement × phase observability`.  This preserves the
+exact G19-B replay score while stopping future conditional energies from
+silently treating missing evidence as phase disagreement.
+
+The no-training six-DoF GT perturbation audit rejects continuous refinement:
+
+| G19-C basin gate on `seq11` | result |
+|---|---:|
+| GT beats ±0.25 m surface-frame translations | 59.09% |
+| GT beats ±0.50 m surface-frame translations | 77.27% |
+| GT beats ±3° camera rotations | 84.85% |
+| strict local maximum, tangent 1 / tangent 2 / normal | 36.36% / 36.36% / **0%** |
+| strict local maximum, roll / pitch / yaw | 18.18% / 9.09% / 9.09% |
+
+The score is therefore a discrete candidate ranker, not a differentiable
+surface likelihood with a verified 0.25--0.5 m basin.  The continuous refiner
+remains disabled.  The expanded pair benchmark agrees: GT beats frozen
+negatives only 50% of the time in the 0.25--0.5 m band, versus 90.91% in each
+of the 0.5--1.0 m and 1.0--2.5 m bands.  Phase helps coarse candidate
+selection before it becomes a reliable local derivative.
+
+The raster falsification audit then reveals the main G19-B implementation
+error.  Common roll preserves only 54.55% of small-pool Top-1 choices at +20°;
+1x versus mask-aware 2x/4x rendering preserves only 45.45%, with pairwise
+order agreement 0.742/0.727.  About 98.43% of informative edges lie in the
+one-pixel neighborhood of primitive boundaries.  Five-percent opacity jitter
+is stable (100% Top-1), while deterministic five-percent primitive pruning
+preserves 90.91%.  Thus the signal is not arbitrary opacity noise, but 1x
+sampling is too coupled to the discrete fine-primitive raster.
+
+Mask-aware 2x supersampling is the bounded fix: high-resolution 2DGS
+compositing is pooled into the same query token grid, so the stored map,
+query feature, two coefficients and candidate pool remain unchanged.
+
+| frozen policy / split | translation median/P90 | rotation median/P90 | strict | 1 m/10 deg | catastrophic |
+|---|---:|---:|---:|---:|---:|
+| G19-B 1x, `seq11` | 0.625 / 0.854 m | 1.43 / 2.23° | 45.45% | 90.91% | 0% |
+| **G19-C 2x, `seq11`** | **0.563 / 0.674 m** | **1.03 / 1.48°** | 45.45% | **100%** | 0% |
+| graph conditional rank, strict12 | 0.518 / 1.514 m | 1.67 / 6.99° | 50.00% | 75.00% | 0% |
+| G19-B 1x, strict12 | 0.626 / 1.576 m | 1.92 / 7.09° | 41.67% | 75.00% | 0% |
+| **G19-C 2x, strict12** | **0.303 / 0.705 m** | **1.25 / 2.18°** | **75.00%** | **100%** | 0% |
+| strict12 Top-16 oracle | 0.266 / 0.456 m | 0.90 / 1.66° | 91.67% | 100% | n/a |
+
+The 2x protocol was chosen on `seq11`, then confirmed once on the disjoint
+`seq3/seq5/seq13` strict12 trajectories; strict12 was not used to choose its
+factor or coefficients and is now closed again.  A promoted policy artifact
+records the required factor and the verifier rejects a 1x invocation.  This
+is a real cross-trajectory ranking improvement, but it does not rescue the
+continuous basin or meet the centimetre-level target.  G20 must use a
+low-capacity conditional identity/phase/observability energy and a
+surface-frame or orientation-equivariant phase field; it must not multiply
+two falsely independent RADIO probabilities or reopen strict12 for tuning.
 
 ## Development-set result
 
@@ -1357,11 +1413,16 @@ not an unsupported claim that VFM regions directly yield centimetre pose.
 - G19-B full train/seq11 evidence: `goal_maplet/surface_dual_band_g19_train_v2.json`, `goal_maplet/surface_dual_band_g19_seq11_v2.json`
 - G19-B promotion/model: `goal_maplet/dual_band_phase_readout_g19_b_v5.json`, `goal_maplet/phase_readout_g19_b_selected_v1.json`
 - G19-B runtime replay: `goal_maplet/pose_modes_phase_readout_g19_b_seq11_v1.json`
+- G19-C six-DoF basin: `goal_maplet/phase_basin_g19_c_seq11_v1.json`
+- G19-C raster/roll/boundary audit: `goal_maplet/phase_correctness_g19_c_seq11_v1.json`
+- G19-C 2x seq11/strict12 confirmation: `goal_maplet/pose_modes_phase_readout_g19_c_supersample2_seq11_v1.json`, `goal_maplet/pose_modes_phase_readout_g19_c_strict12_2x_v1.json`
+- G19-C selected render-bound policy: `goal_maplet/phase_readout_g19_c_supersample2_selected_v1.json`
+- G19-C final lineaged decision record: `goal_maplet/g19_c_decision_record_v1.json`
 - rejected teacher-weighted field/readout: `goal_maplet/canonical_surface_field_teacher_g17_v3.npz`, `goal_maplet/physical_instance_readout_teacher_g17_v3.pt`
 - rejected conditional rank: `goal_maplet/pose_modes_graph_conditionalrank_dev48_v17.json`
 - 4x GT round-trip audit: `goal_maplet/surface_basin_radio_pca256_supersample4_oracle_smoke_gt1round_v4.json`
 
-Focused verification: `250 passed` across all Goal-Maplet, V6 atlas/frame and
+Focused verification: `284 passed` across all Goal-Maplet, V6 atlas/frame and
 2DGS mapping tests, including phase-survival lineage, pose-defined typed phase
 labels, fixed-denominator phase readout, hierarchy calibration, exact 2DGS map
 contracts and typed surface-likelihood/risk semantics.

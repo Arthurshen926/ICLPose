@@ -170,6 +170,19 @@ LOTO because held-out P90/1 m success regress to 1.082 m/81.82%.  G19-B is a
 method-level research promotion, not production: it remains above the
 0.270/0.593 m Top-16 oracle and the untouched test/refiner stay closed.
 
+G19-C finds and fixes a raster-protocol error in that result.  The 1x phase
+ranking has no reliable six-DoF basin (strict GT local maxima are only
+36.36%/36.36%/0% along surface tangent1/tangent2/normal), and 1x versus
+mask-aware 2x/4x preserves only 45.45% of small-pool Top-1 choices.  The
+runtime phase score is therefore still a candidate ranker, not a continuous
+refinement objective.  Mask-aware 2x 2DGS compositing improves `seq11` to
+0.563/0.674 m and 100% within 1 m, then independently confirms on the closed
+`seq3/seq5/seq13` strict12 block at **0.303/0.705 m, 75% strict, 100% within
+1 m and zero catastrophe**, versus graph conditional rank's 0.518/1.514 m,
+50%/75%.  The promoted policy now requires 2x in its lineage contract; 1x
+fails closed.  Continuous refinement remains disabled and strict12 is closed
+again for future tuning.
+
 ## Frozen V6 Status
 
 See [the V6 mainline](docs/vfm/2dgs_maplet_atlas_localization_v6.md) for its

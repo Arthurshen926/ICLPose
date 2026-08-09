@@ -232,6 +232,8 @@ def main() -> None:
     parser.add_argument("--surface_pose_likelihood", default="")
     parser.add_argument("--phase_preserving_dual_band", action="store_true")
     parser.add_argument("--phase_readout_model", default="")
+    parser.add_argument("--allow_legacy_dual_band_score", action="store_true")
+    parser.add_argument("--render_supersample_factor", type=int, default=1)
     parser.add_argument("--output_json", required=True)
     parser.add_argument("--maximum_modes", type=int, default=16)
     parser.add_argument("--role", choices=("local", "context"), default="local")
@@ -251,6 +253,10 @@ def main() -> None:
         raise FileExistsError("refusing to overwrite surface verification")
     if not 0 <= int(args.shard_index) < int(args.shard_count):
         raise ValueError("invalid surface-verification shard")
+    if int(args.render_supersample_factor) <= 0:
+        raise ValueError("render supersample factor must be positive")
+    if bool(args.allow_legacy_dual_band_score) and not bool(args.phase_preserving_dual_band):
+        raise ValueError("legacy dual-band score flag requires dual-band evidence")
 
     physical = GoalMapletPhysicalMap.load_npz(Path(args.physical_map))
     field = CanonicalSurfaceField.load_npz(Path(args.canonical_field))
@@ -291,6 +297,11 @@ def main() -> None:
             raise ValueError("dual-band phase readout requires symmetric context readout")
         if args.resume_scores:
             raise ValueError("dual-band phase readout cannot resume scalar-only scores")
+        if not args.phase_readout_model and not bool(args.allow_legacy_dual_band_score):
+            raise ValueError(
+                "active dual-band verification requires --phase_readout_model; "
+                "legacy fixed scoring is diagnostic-only"
+            )
     phase_policy = None
     phase_policy_sha256 = None
     if args.phase_readout_model:
@@ -305,6 +316,12 @@ def main() -> None:
         ):
             if phase_policy.metadata.get(key) != expected:
                 raise ValueError(f"phase-readout policy lineage differs: {key}")
+        required_factor = int(phase_policy.metadata.get("required_render_supersample_factor", 0))
+        if required_factor > 0 and required_factor != int(args.render_supersample_factor):
+            raise ValueError(
+                "phase-readout policy requires render supersample factor "
+                f"{required_factor}, got {int(args.render_supersample_factor)}"
+            )
         phase_policy_sha256 = file_sha256(phase_policy_path)
     role_field = (
         field
@@ -466,6 +483,7 @@ def main() -> None:
                     width=int(query.shape[2]),
                     height=int(query.shape[1]),
                     device=str(args.device),
+                    supersample_factor=int(args.render_supersample_factor),
                 )
                 rendered_mapper = np.asarray(rendered.feature, dtype=np.float32)
                 if bool(args.spatial_role_readout):
@@ -490,7 +508,8 @@ def main() -> None:
                         np.asarray(rendered.mask, dtype=bool),
                     )
                     scores.append(float(
-                        phase.score if phase_policy is None else phase_policy.score(phase)
+                        phase.legacy_dual_band_score
+                        if phase_policy is None else phase_policy.score(phase)
                     ))
                     phase_components.append(phase.as_dict())
                 else:
@@ -569,6 +588,7 @@ def main() -> None:
         "spatial_role_readout": bool(args.spatial_role_readout),
         "maximum_modes": int(args.maximum_modes),
         "render": "complete_clean_2dgs_single_canonical_field",
+        "render_supersample_factor": int(args.render_supersample_factor),
         "score": (
             "same_query_typed_candidate_posterior_with_null"
             if pose_likelihood is not None else (
@@ -599,6 +619,9 @@ def main() -> None:
         "phase_preserving_dual_band": bool(args.phase_preserving_dual_band),
         "phase_readout_stored_as_second_map_feature": False,
         "phase_readout_policy_sha256": phase_policy_sha256,
+        "legacy_dual_band_score_enabled": bool(
+            args.allow_legacy_dual_band_score and phase_policy is None
+        ),
         "candidate_dependent_surface_subset": False,
         "stored_map_feature_type_count": 1,
         "stored_downstream_embedding_count": 0,
