@@ -29,6 +29,10 @@ from feature_extract.vfm.localization_goal_maplet.physical_instance_readout impo
 )
 from feature_extract.vfm.localization_goal_maplet.physical_map import GoalMapletPhysicalMap
 from feature_extract.vfm.localization_goal_maplet.pfir import ContributorLabels
+from feature_extract.vfm.localization_goal_maplet.phase_preserving_readout import (
+    dual_band_phase_evidence,
+    load_phase_readout_policy,
+)
 from feature_extract.vfm.localization_goal_maplet.surface_refiner import canonical_alignment_score
 from feature_extract.vfm.localization_goal_maplet.surface_pose_likelihood import (
     EVENT_NAMES,
@@ -226,6 +230,8 @@ def main() -> None:
     parser.add_argument("--field_feature_contract", required=True)
     parser.add_argument("--physical_instance_readout", required=True)
     parser.add_argument("--surface_pose_likelihood", default="")
+    parser.add_argument("--phase_preserving_dual_band", action="store_true")
+    parser.add_argument("--phase_readout_model", default="")
     parser.add_argument("--output_json", required=True)
     parser.add_argument("--maximum_modes", type=int, default=16)
     parser.add_argument("--role", choices=("local", "context"), default="local")
@@ -278,6 +284,28 @@ def main() -> None:
         pose_likelihood_sha256 = file_sha256(pose_likelihood_path)
         if args.resume_scores:
             raise ValueError("typed surface likelihood cannot resume independent cosine scores")
+    if bool(args.phase_preserving_dual_band):
+        if pose_likelihood is not None:
+            raise ValueError("dual-band audit and learned likelihood are separate policies")
+        if not bool(args.spatial_role_readout) or str(args.role) != "context":
+            raise ValueError("dual-band phase readout requires symmetric context readout")
+        if args.resume_scores:
+            raise ValueError("dual-band phase readout cannot resume scalar-only scores")
+    phase_policy = None
+    phase_policy_sha256 = None
+    if args.phase_readout_model:
+        if not bool(args.phase_preserving_dual_band):
+            raise ValueError("phase readout model requires dual-band evidence")
+        phase_policy_path = Path(args.phase_readout_model)
+        phase_policy = load_phase_readout_policy(phase_policy_path)
+        for key, expected in (
+            ("physical_map_sha256", physical.content_sha256),
+            ("canonical_field_sha256", field.content_sha256),
+            ("physical_instance_readout_sha256", file_sha256(Path(args.physical_instance_readout))),
+        ):
+            if phase_policy.metadata.get(key) != expected:
+                raise ValueError(f"phase-readout policy lineage differs: {key}")
+        phase_policy_sha256 = file_sha256(phase_policy_path)
     role_field = (
         field
         if bool(args.spatial_role_readout)
@@ -423,6 +451,7 @@ def main() -> None:
             coverages: list[float] = []
             likelihood_features: list[np.ndarray] = []
             likelihood_query_summary = None
+            phase_components: list[dict[str, float]] = []
             for detail in details[:take]:
                 resumed = resumed_by_image.get(image_id, {}).get(_pose_key(detail["pose_w2c"]))
                 if resumed is not None:
@@ -438,6 +467,7 @@ def main() -> None:
                     height=int(query.shape[1]),
                     device=str(args.device),
                 )
+                rendered_mapper = np.asarray(rendered.feature, dtype=np.float32)
                 if bool(args.spatial_role_readout):
                     rendered_flat = encode_physical_instance_regions(
                         readout,
@@ -451,7 +481,20 @@ def main() -> None:
                         mapped.shape[1], mapped.shape[2], mapped.shape[0],
                     ).transpose(2, 0, 1)
                     rendered = replace(rendered, feature=rendered_feature)
-                scores.append(float(canonical_alignment_score(rendered, query)))
+                if bool(args.phase_preserving_dual_band):
+                    phase = dual_band_phase_evidence(
+                        mapped,
+                        rendered_mapper,
+                        query,
+                        np.asarray(rendered.feature, dtype=np.float32),
+                        np.asarray(rendered.mask, dtype=bool),
+                    )
+                    scores.append(float(
+                        phase.score if phase_policy is None else phase_policy.score(phase)
+                    ))
+                    phase_components.append(phase.as_dict())
+                else:
+                    scores.append(float(canonical_alignment_score(rendered, query)))
                 coverages.append(float(np.mean(np.asarray(rendered.mask, dtype=bool))))
                 if pose_likelihood is not None:
                     token_feature, _typed_target, query_summary = extract_surface_likelihood_features(
@@ -509,6 +552,10 @@ def main() -> None:
                 null_probability is not None and null_probability >= max(scores, default=0.0)
             )
             diagnostics["surface_pose_event_fraction_preorder"] = event_fraction
+            diagnostics["surface_phase_components_preorder"] = (
+                phase_components if bool(args.phase_preserving_dual_band) else None
+            )
+            diagnostics["surface_phase_readout_policy_sha256"] = phase_policy_sha256
         rows.append(row)
         print(json.dumps({"image_id": image_id, "surface_verified_modes": {
             name: min(int(args.maximum_modes), len(value))
@@ -524,15 +571,34 @@ def main() -> None:
         "render": "complete_clean_2dgs_single_canonical_field",
         "score": (
             "same_query_typed_candidate_posterior_with_null"
-            if pose_likelihood is not None else "fixed_full_query_grid_mean_cosine"
+            if pose_likelihood is not None else (
+                "phase_preserving_dual_band_fixed_grid_evidence"
+                if bool(args.phase_preserving_dual_band) and phase_policy is None
+                else (
+                    "learned_coordinate_free_phase_readout"
+                    if phase_policy is not None
+                    else "fixed_full_query_grid_mean_cosine"
+                )
+            )
         ),
         "surface_pose_likelihood_sha256": pose_likelihood_sha256,
         "score_semantics": (
             "same_query_typed_candidate_posterior_with_null"
-            if pose_likelihood is not None else "fixed_full_query_grid_mean_cosine"
+            if pose_likelihood is not None else (
+                "mapper_and_context_identity_plus_directional_mapper_phase"
+                if bool(args.phase_preserving_dual_band) and phase_policy is None
+                else (
+                    "proposal_identity_plus_learned_directional_mapper_phase"
+                    if phase_policy is not None
+                    else "fixed_full_query_grid_mean_cosine"
+                )
+            )
         ),
         "same_query_candidate_normalization": bool(pose_likelihood is not None),
         "typed_null_hypothesis": bool(pose_likelihood is not None),
+        "phase_preserving_dual_band": bool(args.phase_preserving_dual_band),
+        "phase_readout_stored_as_second_map_feature": False,
+        "phase_readout_policy_sha256": phase_policy_sha256,
         "candidate_dependent_surface_subset": False,
         "stored_map_feature_type_count": 1,
         "stored_downstream_embedding_count": 0,

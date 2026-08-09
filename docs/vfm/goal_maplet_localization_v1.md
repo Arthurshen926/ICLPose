@@ -1144,6 +1144,88 @@ no reliable local SE(3) basin around GT.  G18 is not promoted, Dev48 is not
 reused for model selection, the untouched test remains closed, and the old
 surface-flow refiner is not started.
 
+### G19-A/G19-B — phase-survival audit and coordinate-free phase readout
+
+G19-A first removes an over-strong conclusion from G18: its failure did not
+show that RADIO-final lacks metric phase.  It fixes GT versus a pose-defined
+nearby phase negative (median 0.772 m / 1.63 deg on `seq11`) and audits the
+same pair through the complete feature chain.  The negative is selected only
+from frozen-candidate pose error; feature cosine is not used to define it.
+For additional diagnosis only, an aligned 1280D RADIO-final canonical field
+was built from the same 122 clean-2DGS contributors.  This 1.4 GB artifact is
+not a deployment map and does not add a runtime feature.
+
+| `seq11` phase pair level | GT > phase | candidate AUC | median margin | discriminative token fraction |
+|---|---:|---:|---:|---:|
+| 1280D RADIO-final canonical | **81.82%** | 0.603 | +0.0095 | 34.86% |
+| PCA256 canonical | **81.82%** | **0.628** | +0.0101 | **39.65%** |
+| mapper canonical | **81.82%** | 0.595 | **+0.0122** | 36.87% |
+| local flat/spatial readout | 63.64% | 0.562/0.570 | +0.0112/+0.0134 | 37.02%/34.72% |
+| 9x9 context readout | 63.64% | 0.562 | +0.0137 | 27.78% |
+
+This is case A of the phase-survival decision tree: phase remains in the raw,
+PCA and mapper canonical fields, while the learned local/context readouts
+reduce cross-trajectory concordance and context pooling removes about one
+quarter of the phase-discriminative tokens.  The audit does not claim to
+separate native RADIO invariance from multi-view fusion—its raw level is still
+post-fusion—but it is sufficient to reject a new view-conditioned map latent
+as the next step.  The map is not the current bottleneck.
+
+The coordinate audit also rejects a trajectory-framing dependency.  Fixed
+tiny probes on G18 summaries have `seq11` AUC 0.438 with absolute grid XY,
+0.463 with camera rays and 0.471 with no coordinate; all are near chance and
+none justifies absolute image position.  G19-B therefore uses no absolute
+coordinate.  G18's old typed token label was also circular (`cosine < 0.35`
+defined `wrong_phase`).  New samples leave comparable tokens unresolved in
+the feature extractor and assign `surface_match`/`wrong_phase` from frozen
+candidate pose semantics; appearance is input evidence only.
+
+G19-B keeps the one 128D mapper field and regenerates a high-frequency branch
+at runtime.  For adjacent grid tokens it compares normalized mapper-feature
+differences in horizontal and vertical directions.  The low-frequency
+physical identity band is already supplied by Goal-Maplet proposal; adding
+context cosine again at surface ranking double-counts it and transfers badly.
+The phase score is a two-variable L2 pairwise logistic model trained on 115
+mapping-trajectory candidate sets, with nearby 0.5--2.5 m physical negatives
+upweighted.  It uses no RGB, keypoint, discrete correspondence, PnP, absolute
+grid coordinate, second stored field or downstream embedding.
+
+| frozen `seq11` Top-16 policy | translation median/P90 | rotation median/P90 | strict | 1 m/10 deg | catastrophic |
+|---|---:|---:|---:|---:|---:|
+| frozen proposal Top-1 | 1.082 / 2.506 m | 2.27 / 7.53 deg | 9.09% | 36.36% | 0% |
+| context cosine | 1.335 / 2.067 m | 3.81 / 5.36 deg | 18.18% | 36.36% | 9.09% |
+| G18 competing-phase posterior | 1.335 / 2.670 m | n/a | 18.18% | 27.27% | 0% |
+| fixed single-scale directional phase | 0.673 / 1.732 m | 1.90 / 4.28 deg | 36.36% | 72.73% | 0% |
+| **G19-B single-scale pairwise phase** | **0.625 / 0.854 m** | **1.43 / 2.23 deg** | **45.45%** | **90.91%** | **0%** |
+| Top-16 oracle | 0.270 / 0.593 m | 1.06 / 1.49 deg | 72.73% | 100% | n/a |
+
+The selected standardizer and two linear coefficients are serialized without
+GT or feature tensors and loaded by the production verifier with strict map/
+readout hashes.  A fresh two-GPU runtime replay reproduces the table exactly;
+the gain is not an offline-only reorder.
+
+This is a real method-level recovery: versus G18, median/P90 improve by
+0.710/1.816 m and 1 m success by 63.64 percentage points without introducing
+a catastrophic pose.  It still does not meet the requested centimetre-level
+target and remains below the Top-16 oracle, so it is a research promotion, not
+a production/final-test promotion.
+
+A multiscale/diagonal relation extension was preselected by mapping-trajectory
+leave-one-trajectory-out (0.967 m versus 1.198 m P90), but the locked `seq11`
+promotion check rejected it: median improves to 0.535 m, while P90 regresses
+to 1.082 m and 1 m success falls to 81.82%; strict and catastrophe remain
+45.45%/0%.  The simpler single-scale phase readout is retained because this
+round prioritizes eliminating localization failures and long tails.  This
+ablation is also evidence that mapping-trajectory LOTO is not a substitute for
+cross-acquisition validation.
+
+G19-B makes a continuous phase basin plausible but does not yet prove it.
+Continuous refinement stays disabled until multi-axis perturbation tests show
+stable descent around GT.  The next bounded work is a small full-grid spatial
+phase likelihood/null calibration and proposal-prior multiplication; it must
+beat the selected G19-B tail metrics before any refiner or untouched test is
+opened.
+
 ## Development-set result
 
 The best deployable Goal-Maplet Top-1 remains the frozen graph v9 result, not
@@ -1178,6 +1260,7 @@ relevant, but it does not yet meet the requested accuracy.
 | M3.5 mass-adaptive hierarchical endpoints | method pass / production fail | two-valid endpoints 2.45% -> 5.40%; 0.563/1.370 m Dev node+fit, but median/Top-3 regress and GT-vs-phase reverses |
 | M3.6 physical-instance surface likelihood | tail pass / production fail | validation 0.366/0.837 m and 76.47% strict; Dev catastrophic 2.08%, but strict 39.58% |
 | M3.7 typed competing-phase likelihood | correctness pass / production fail | exact geometry audit passes; seq11 strict 18.18% and zero catastrophe, but 1.335/2.670 m and no transferable phase basin |
+| M3.8 phase-survival/readout | method pass / production fail | phase survives through mapper (81.82% pair concordance); selected coordinate-free phase readout reaches 0.625/0.854 m, 45.45% strict, 90.91% within 1 m and zero catastrophe on seq11 |
 | M4 refiner handoff | fail | no stable 0.1–0.5 m convergence basin |
 | M5 final paper claim | fail | no untouched test, hard-subset comparison or target accuracy |
 
@@ -1269,11 +1352,16 @@ not an unsupported claim that VFM regions directly yield centimetre pose.
 - G18 role-directed full training samples: `goal_maplet/surface_likelihood_samples_g18_train_full_shard{0..3}_v2.npz`
 - G18 selected competing-phase likelihood: `goal_maplet/surface_pose_likelihood_g18_competing_phase_v4.pt`, `goal_maplet/surface_pose_likelihood_g18_competing_phase_v4.json`
 - G18 runtime integration smoke: `goal_maplet/pose_modes_surface_likelihood_g18_seq11_smoke_v1.json`
+- G19 raw RADIO-final diagnostic field: `goal_maplet/canonical_surface_field_radio_raw1280_exact_g19_v1.npz`
+- G19-A phase-survival audit: `goal_maplet/phase_survival_g19_a_v2.json`
+- G19-B full train/seq11 evidence: `goal_maplet/surface_dual_band_g19_train_v2.json`, `goal_maplet/surface_dual_band_g19_seq11_v2.json`
+- G19-B promotion/model: `goal_maplet/dual_band_phase_readout_g19_b_v5.json`, `goal_maplet/phase_readout_g19_b_selected_v1.json`
+- G19-B runtime replay: `goal_maplet/pose_modes_phase_readout_g19_b_seq11_v1.json`
 - rejected teacher-weighted field/readout: `goal_maplet/canonical_surface_field_teacher_g17_v3.npz`, `goal_maplet/physical_instance_readout_teacher_g17_v3.pt`
 - rejected conditional rank: `goal_maplet/pose_modes_graph_conditionalrank_dev48_v17.json`
 - 4x GT round-trip audit: `goal_maplet/surface_basin_radio_pca256_supersample4_oracle_smoke_gt1round_v4.json`
 
-Focused verification: `81 passed` across all Goal-Maplet tests, including the
-hierarchy calibrator, coherent complete-link collapse, adaptive mass
-conservation, relation inference, exact 2DGS map contracts and typed
-surface-likelihood/risk semantics.
+Focused verification: `250 passed` across all Goal-Maplet, V6 atlas/frame and
+2DGS mapping tests, including phase-survival lineage, pose-defined typed phase
+labels, fixed-denominator phase readout, hierarchy calibration, exact 2DGS map
+contracts and typed surface-likelihood/risk semantics.

@@ -210,9 +210,9 @@ def extract_surface_likelihood_features(
     target[field_missing] = EVENT_NAMES.index("field_missing")
     geometric = valid & (incidence < 0.15)
     target[geometric] = EVENT_NAMES.index("occluded")
-    comparable = valid & ~geometric
-    target[comparable & (cosine < 0.35)] = EVENT_NAMES.index("wrong_phase")
-    target[comparable & (cosine >= 0.35)] = EVENT_NAMES.index("surface_match")
+    # Appearance cannot define physical phase without becoming circular.
+    # Comparable tokens remain unresolved here; the sample builder assigns
+    # surface_match/wrong_phase from frozen-candidate pose/identity semantics.
     summary = np.asarray(
         [
             float(np.mean(query_contrast)),
@@ -223,6 +223,44 @@ def extract_surface_likelihood_features(
         dtype=np.float32,
     )
     return feature.reshape(-1, feature.shape[-1]), target.reshape(-1), summary
+
+
+def assign_pose_defined_typed_targets(
+    provisional_target: np.ndarray,
+    token_feature: np.ndarray,
+    *,
+    translation_m: float,
+    rotation_deg: float,
+    is_listwise_target: bool,
+) -> np.ndarray:
+    """Assign match/phase events without consulting feature similarity."""
+
+    target = np.asarray(provisional_target, dtype=np.uint8).reshape(-1).copy()
+    feature = np.asarray(token_feature, dtype=np.float32)
+    if feature.ndim != 2 or feature.shape[0] != target.size or feature.shape[1] != len(FEATURE_NAMES):
+        raise ValueError("pose-defined typed target feature shape differs")
+    valid = feature[:, FEATURE_NAMES.index("render_valid")] >= 0.5
+    incidence = feature[:, FEATURE_NAMES.index("incidence")]
+    comparable = valid & (incidence >= 0.15)
+    # Preserve typed support/null events assigned by geometry.  Only visually
+    # comparable rendered surface receives a physical pose label.
+    target[comparable] = EVENT_NAMES.index("unresolved")
+    translation = float(translation_m)
+    rotation = float(rotation_deg)
+    physical_match = bool(
+        (translation <= 0.5 and rotation <= 5.0)
+        or (bool(is_listwise_target) and translation <= 1.0 and rotation <= 10.0)
+    )
+    physical_phase = bool(
+        not physical_match
+        and 0.5 <= translation <= 2.5
+        and rotation <= 10.0
+    )
+    if physical_match:
+        target[comparable] = EVENT_NAMES.index("surface_match")
+    elif physical_phase:
+        target[comparable] = EVENT_NAMES.index("wrong_phase")
+    return target
 
 
 class ViewGeometryConditionedSurfaceLikelihood(nn.Module):

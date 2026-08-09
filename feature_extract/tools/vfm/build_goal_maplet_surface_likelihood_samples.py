@@ -21,6 +21,7 @@ from feature_extract.vfm.localization_goal_maplet.physical_map import GoalMaplet
 from feature_extract.vfm.localization_goal_maplet.surface_pose_likelihood import (
     EVENT_NAMES,
     FEATURE_NAMES,
+    assign_pose_defined_typed_targets,
     extract_surface_likelihood_features,
 )
 from feature_extract.vfm.localization_goal_maplet.surface_renderer import render_canonical_surface_field
@@ -246,6 +247,14 @@ def main() -> None:
         quality = np.asarray(translation[:candidate_count]) / 0.5 + np.asarray(rotation[:candidate_count]) / 5.0
         has_usable = np.any((np.asarray(translation) <= 1.0) & (np.asarray(rotation) <= 10.0))
         target = int(np.argmin(quality)) if has_usable else maximum_modes
+        for candidate_index in range(candidate_count):
+            candidate_type[candidate_index] = assign_pose_defined_typed_targets(
+                candidate_type[candidate_index],
+                candidate_feature[candidate_index],
+                translation_m=float(translation[candidate_index]),
+                rotation_deg=float(rotation[candidate_index]),
+                is_listwise_target=bool(candidate_index == target),
+            )
         teacher_weight = np.ones((maximum_modes, height * width), dtype=np.float32)
         teacher_report = {"teacher_available": False}
         if args.teacher_cache:
@@ -286,6 +295,10 @@ def main() -> None:
         "candidate_count": maximum_modes,
         "candidate_set_frozen_before_scoring": True,
         "fixed_full_query_denominator": True,
+        "typed_phase_target_semantics": (
+            "pose_defined_frozen_candidate_error_not_feature_cosine"
+        ),
+        "typed_phase_target_uses_appearance": False,
         "training_teacher_roles": {
             "dino_v3_7b": "local_surface_affinity_hard_negative_weight",
             "sam3": "support_boundary_weight",

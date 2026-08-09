@@ -147,6 +147,29 @@ G18 is therefore a method/correctness diagnostic, not a promotion: G17.1
 remains the selected tail verifier, graph v9 remains production, and neither
 the untouched test nor continuous refiner is opened.
 
+G19 now localizes the G18 failure instead of assuming RADIO-final lost metric
+phase.  On frozen GT/near-phase pairs from the trajectory-disjoint `seq11`
+block, 1280D RADIO-final, PCA256 and mapper canonical fields all rank GT first
+on 81.82% of queries; local/context readout drops this to 63.64%, and context
+reduces phase-discriminative tokens from 36.87% to 27.78%.  Absolute-grid,
+camera-ray and no-coordinate G18 probes are all near chance (AUC
+0.438/0.463/0.471), so the new main research readout uses no absolute image
+coordinate.  It derives horizontal/vertical mapper-feature differences at
+runtime from the same single 128D field; physical identity remains the job of
+the proposal, and surface verification supplies only high-frequency phase.
+
+The selected two-component pairwise phase readout is trained on 115 mapping-
+trajectory candidate sets and evaluated once on frozen `seq11` Top-16.  It
+reaches 0.625/0.854 m translation median/P90, 1.43/2.23 degrees rotation,
+45.45% strict success, 90.91% within 1 m / 10 degrees and zero catastrophic
+poses, versus G18's 1.335/2.670 m, 18.18% strict and 27.27% within 1 m.  A
+lineage-checked runtime replay loading the serialized two-coefficient policy
+reproduces these metrics exactly.  A
+multiscale/diagonal extension is rejected despite better mapping-trajectory
+LOTO because held-out P90/1 m success regress to 1.082 m/81.82%.  G19-B is a
+method-level research promotion, not production: it remains above the
+0.270/0.593 m Top-16 oracle and the untouched test/refiner stay closed.
+
 ## Frozen V6 Status
 
 See [the V6 mainline](docs/vfm/2dgs_maplet_atlas_localization_v6.md) for its
@@ -199,6 +222,9 @@ stored embedding, as the next required research module.
 - `feature_extract/tools/vfm/evaluate_goal_maplet_oracle_ladder.py`
 - `feature_extract/tools/vfm/evaluate_goal_maplet_pose_modes.py`
 - `feature_extract/tools/vfm/verify_goal_maplet_pose_modes_with_surface_field.py`
+- `feature_extract/tools/vfm/build_goal_maplet_phase_survival_samples.py`
+- `feature_extract/tools/vfm/evaluate_goal_maplet_phase_survival.py`
+- `feature_extract/tools/vfm/evaluate_goal_maplet_dual_band_phase_readout.py`
 - `feature_extract/tools/vfm/evaluate_goal_maplet_surface_basin.py`
 - `feature_extract/tools/vfm/build_goal_maplet_feature_contract.py`
 - `feature_extract/tools/vfm/build_goal_maplet_child_eligibility.py`

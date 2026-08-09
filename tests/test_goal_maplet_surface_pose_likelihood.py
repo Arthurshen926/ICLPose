@@ -19,6 +19,7 @@ from feature_extract.vfm.localization_goal_maplet.surface_pose_likelihood import
     FEATURE_NAMES,
     SurfacePoseLikelihoodConfig,
     ViewGeometryConditionedSurfaceLikelihood,
+    assign_pose_defined_typed_targets,
     extract_surface_likelihood_features,
     listwise_surface_pose_loss,
     load_surface_pose_likelihood,
@@ -45,7 +46,7 @@ def _rendered(feature: np.ndarray, *, valid: bool = True):
     )
 
 
-def test_typed_surface_evidence_distinguishes_match_phase_and_missing() -> None:
+def test_typed_surface_evidence_defers_physical_phase_to_pose_labels() -> None:
     query = np.zeros((4, 3, 5), dtype=np.float32)
     query[0] = 1.0
     match, typed, summary = extract_surface_likelihood_features(
@@ -61,9 +62,19 @@ def test_typed_surface_evidence_distinguishes_match_phase_and_missing() -> None:
     )
     assert match.shape == wrong.shape == missing.shape == (15, len(FEATURE_NAMES))
     assert summary.shape == (4,)
-    assert set(typed.tolist()) == {EVENT_NAMES.index("surface_match")}
-    assert set(wrong_typed.tolist()) == {EVENT_NAMES.index("wrong_phase")}
+    assert set(typed.tolist()) == {EVENT_NAMES.index("unresolved")}
+    assert set(wrong_typed.tolist()) == {EVENT_NAMES.index("unresolved")}
     assert set(missing_typed.tolist()) == {EVENT_NAMES.index("field_missing")}
+    match_target = assign_pose_defined_typed_targets(
+        typed, match, translation_m=0.2, rotation_deg=2.0,
+        is_listwise_target=True,
+    )
+    phase_target = assign_pose_defined_typed_targets(
+        wrong_typed, wrong, translation_m=0.8, rotation_deg=2.0,
+        is_listwise_target=False,
+    )
+    assert set(match_target.tolist()) == {EVENT_NAMES.index("surface_match")}
+    assert set(phase_target.tolist()) == {EVENT_NAMES.index("wrong_phase")}
 
 
 def test_listwise_surface_likelihood_competes_with_typed_null() -> None:
