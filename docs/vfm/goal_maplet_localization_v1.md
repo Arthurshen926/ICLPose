@@ -1066,6 +1066,84 @@ the production default.  The relation probability gate still fails, the
 surface score is not yet a calibrated non-null likelihood, and neither the
 untouched test nor continuous refiner is opened.
 
+### G17.2/G18 — exact-render audit and competing-phase surface likelihood
+
+G17.2 freezes the G17.1 map, readout, candidate pool and Dev48 result, then
+uses a new `seq11` trajectory-disjoint development block.  `seq11` is absent
+from the canonical map, readout training, candidate-validity calibration and
+G18 training.  The candidate-validity calibration was rebuilt on `seq10`
+only; the selected G17 readout remains the lineaged `g17_v1` artifact.
+
+The diagnostic dashboard writes RGB only for visual inspection and never to
+the map.  It also writes depth, normal, primitive/parent/child identity,
+canonical PCA, valid/missing masks, symmetric attention, per-token evidence,
+candidate clouds and four-axis score landscapes.  One fixed `seq11` query
+gives:
+
+| exact-render audit | value |
+|---|---:|
+| primitive Top-1 / Top-K agreement | 98.91% / 99.79% |
+| render/truth mask IoU | 99.98% |
+| matched-primitive center-depth RMS | 1.65e-6 m |
+| canonical feature coverage | 93.80% |
+| GT local/global peak axes | 1 / 4 |
+| raw score/coverage correlation | 0.801 |
+| GT minus phase-near-miss score | +0.0233 |
+
+The previous meter-scale depth audit was a diagnostic-definition error: it
+mixed primitive-ID disagreements and compared gsplat primitive-center depth
+with ray/primitive-plane intersection depth.  The corrected matched-identity
+metric above shows no geometry-coordinate drift.  Plane-vs-center depth is
+still reported separately because it is a definition difference, not a
+renderer error.
+
+G18 replaces independent mean cosine with a view/geometry-conditioned typed
+surface likelihood.  Its runtime token evidence includes same-pixel RADIO
+agreement, parent/child boundary, depth/gradient, camera-frame normal,
+incidence, projected scale, primitive uncertainty, visibility and field
+missing.  It predicts `surface_match`, `wrong_phase`, `occluded`,
+`field_missing`, `query_unmapped_dynamic` and `unresolved`; all frozen
+candidates compete in one posterior with a typed null.  The null is
+conditioned on the fixed candidate-set evidence as well as query statistics,
+because a query-only head cannot determine whether this particular set lacks
+a valid pose.  A shared cross-candidate token-disagreement weight emphasizes
+phase-discriminative regions without letting any candidate choose its own
+denominator.
+
+Offline DINO/SAM/SigLIP tensors remain training-only.  They are not averaged
+into another static reliability map: DINO/SigLIP spatial cues supervise only
+match/phase events, while SAM cues supervise boundary/visibility null events.
+Only scalar role-directed supervision weights enter the training cache; no
+teacher embedding enters the model or deployment map.  The map still stores
+one canonical RADIO-derived primitive field and runtime uses no RGB, point
+correspondence or PnP.
+
+The frozen Top-16 pool and G18 result on the 11-query `seq11` block are:
+
+| seq11 policy | median/P90 | strict 0.5 m/5 deg | 1 m/10 deg | catastrophic |
+|---|---:|---:|---:|---:|
+| frozen candidate Top-1 | 1.082 / 2.506 m | 9.09% | 36.36% | **0%** |
+| fixed-grid cosine | 1.335 / 2.067 m | **18.18%** | 36.36% | 9.09% |
+| **G18 competing-phase posterior** | 1.335 / 2.670 m | **18.18%** | 27.27% | **0%** |
+| frozen Top-16 oracle | 0.270 / 0.593 m | 72.73% | 100% | n/a |
+
+G18 training uses all 115 available queries from nine trajectories with equal
+trajectory mass.  Its training strict/1 m success is 63.48%/86.09% and its
+translation median/P90 is 0.394/1.181 m, but this does not transfer to
+`seq11`.  Posterior risk is also not useful yet: reducing coverage to 50%
+retains only one strict success and removes no additional catastrophic pose.
+The initial 26-query smoke improved seq11 P90 to 1.743 m and 1 m success to
+45.45%, but introduced one catastrophic output; it is rejected rather than
+used to tune the development block.
+
+This closes two implementation questions.  The exact clean-2DGS geometry
+chain is sound, and same-query probabilistic competition can remove unsafe
+null/catastrophic behavior.  The remaining failure is representational:
+cross-trajectory canonical/readout features are too smooth and the score has
+no reliable local SE(3) basin around GT.  G18 is not promoted, Dev48 is not
+reused for model selection, the untouched test remains closed, and the old
+surface-flow refiner is not started.
+
 ## Development-set result
 
 The best deployable Goal-Maplet Top-1 remains the frozen graph v9 result, not
@@ -1099,6 +1177,7 @@ relevant, but it does not yet meet the requested accuracy.
 | M3.4 relation probability semantics v2 | correctness pass / production fail | exact mass and pair marginals; 0.461/1.596 m Dev joint, but 8.33% catastrophic and all-null MAP |
 | M3.5 mass-adaptive hierarchical endpoints | method pass / production fail | two-valid endpoints 2.45% -> 5.40%; 0.563/1.370 m Dev node+fit, but median/Top-3 regress and GT-vs-phase reverses |
 | M3.6 physical-instance surface likelihood | tail pass / production fail | validation 0.366/0.837 m and 76.47% strict; Dev catastrophic 2.08%, but strict 39.58% |
+| M3.7 typed competing-phase likelihood | correctness pass / production fail | exact geometry audit passes; seq11 strict 18.18% and zero catastrophe, but 1.335/2.670 m and no transferable phase basin |
 | M4 refiner handoff | fail | no stable 0.1–0.5 m convergence basin |
 | M5 final paper claim | fail | no untouched test, hard-subset comparison or target accuracy |
 
@@ -1185,10 +1264,16 @@ not an unsupported claim that VFM regions directly yield centimetre pose.
 - G17 fully rebuilt Dev48 relation audit: `goal_maplet/config_rank_pool_g17_massonly_dev48_v46.json`, `goal_maplet/mode_relation_g17_massonly_dev48_v46.json`
 - G17.1 selected validation surface audit: `goal_maplet/pose_modes_surface_spatial_context_g17_validation_v50.json`
 - G17.1 selected Dev48 surface audit: `goal_maplet/pose_modes_surface_spatial_context_g17_dev48_v51.json`
+- G17.2 corrected diagnostic: `goal_maplet/g17_2_diagnostics_seq11_v2.json`, `goal_maplet/g17_2_diagnostics_seq11_v2/`
+- G18 trajectory-disjoint candidate pools: `goal_maplet/pose_modes_g18_train_v1.json`, `goal_maplet/pose_modes_g18_seq11_v1.json`
+- G18 role-directed full training samples: `goal_maplet/surface_likelihood_samples_g18_train_full_shard{0..3}_v2.npz`
+- G18 selected competing-phase likelihood: `goal_maplet/surface_pose_likelihood_g18_competing_phase_v4.pt`, `goal_maplet/surface_pose_likelihood_g18_competing_phase_v4.json`
+- G18 runtime integration smoke: `goal_maplet/pose_modes_surface_likelihood_g18_seq11_smoke_v1.json`
 - rejected teacher-weighted field/readout: `goal_maplet/canonical_surface_field_teacher_g17_v3.npz`, `goal_maplet/physical_instance_readout_teacher_g17_v3.pt`
 - rejected conditional rank: `goal_maplet/pose_modes_graph_conditionalrank_dev48_v17.json`
 - 4x GT round-trip audit: `goal_maplet/surface_basin_radio_pca256_supersample4_oracle_smoke_gt1round_v4.json`
 
-Focused verification: `75 passed` across all Goal-Maplet tests, including the
+Focused verification: `81 passed` across all Goal-Maplet tests, including the
 hierarchy calibrator, coherent complete-link collapse, adaptive mass
-conservation, relation inference and exact 2DGS map contracts.
+conservation, relation inference, exact 2DGS map contracts and typed
+surface-likelihood/risk semantics.

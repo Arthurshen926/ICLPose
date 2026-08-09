@@ -144,7 +144,7 @@ def render_canonical_surface_field(
         raise ValueError("feature_codes must align with the canonical field")
     code_norm = np.linalg.norm(codes, axis=1, keepdims=True)
     codes = codes / np.maximum(code_norm, 1e-8)
-    front, _ = signed_surface_visibility(
+    front, primitive_incidence = signed_surface_visibility(
         physical.primitive_centers,
         physical.primitive_normals,
         physical.primitive_sidedness,
@@ -204,6 +204,8 @@ def render_canonical_surface_field(
     mask = (feature_alpha >= float(minimum_feature_alpha)) & (
         feature_alpha / np.maximum(total_alpha, 1e-8) >= float(minimum_feature_fraction)
     )
+    visibility = total_alpha >= float(minimum_feature_alpha)
+    field_missing = visibility & ~mask
     normalized_feature = np.zeros_like(feature_sum)
     normalized_feature[mask] = feature_sum[mask] / np.maximum(feature_alpha[mask, None], 1e-8)
     norm = np.linalg.norm(normalized_feature, axis=1, keepdims=True)
@@ -211,21 +213,27 @@ def render_canonical_surface_field(
     uncertainty = np.ones((pixel_count,), dtype=np.float32)
     uncertainty[mask] = uncertainty_sum[mask] / np.maximum(feature_alpha[mask], 1e-8)
     dominant_scene_row = np.full((pixel_count,), -1, dtype=np.int64)
-    if np.any(feature_valid):
-        selected = np.flatnonzero(feature_valid)
+    # Geometry/null evidence must remain available even when the dominant
+    # primitive has no canonical code.  Selecting identity only from
+    # ``feature_valid`` silently collapsed field-missing into background.
+    if contribution.size:
+        selected = np.arange(contribution.size, dtype=np.int64)
         order = np.lexsort((scene_primitive_rows[selected], -contribution[selected], pixel_ids[selected]))
         ordered = selected[order]
         ordered_pixels = pixel_ids[ordered]
         first = np.r_[True, ordered_pixels[1:] != ordered_pixels[:-1]]
         chosen = ordered[first]
         dominant_scene_row[pixel_ids[chosen]] = scene_primitive_rows[chosen]
-    valid_pixels = np.flatnonzero(mask & (dominant_scene_row >= 0))
+    valid_pixels = np.flatnonzero(visibility & (dominant_scene_row >= 0))
     xyz = np.zeros((pixel_count, 3), dtype=np.float32)
     normal = np.zeros((pixel_count, 3), dtype=np.float32)
     depth = np.zeros((pixel_count,), dtype=np.float32)
     maplet_id = np.full((pixel_count,), -1, dtype=np.int64)
     surface_id = np.full((pixel_count,), -1, dtype=np.int64)
     primitive_id = np.full((pixel_count,), -1, dtype=np.int64)
+    child_id = np.full((pixel_count,), -1, dtype=np.int64)
+    incidence = np.zeros((pixel_count,), dtype=np.float32)
+    projected_scale = np.zeros((pixel_count,), dtype=np.float32)
     maplet_owner = dominant_maplet_owner(physical)
     if valid_pixels.size:
         px = valid_pixels % int(width)
@@ -241,7 +249,10 @@ def render_canonical_surface_field(
         point, intersection_valid = intersect_rays_with_primitive_planes(
             xy_original, primitive_rows, physical, pose_w2c, camera
         )
-        mask[valid_pixels[~intersection_valid]] = False
+        invalid_pixels = valid_pixels[~intersection_valid]
+        mask[invalid_pixels] = False
+        visibility[invalid_pixels] = False
+        field_missing[invalid_pixels] = False
         valid_pixels = valid_pixels[intersection_valid]
         primitive_rows = primitive_rows[intersection_valid]
         point = point[intersection_valid]
@@ -255,6 +266,21 @@ def render_canonical_surface_field(
         maplet_id[valid_pixels[owner_valid]] = physical.maplet_ids[owner_rows[owner_valid]]
         surface_id[valid_pixels] = primitive_rows
         primitive_id[valid_pixels] = physical.primitive_ids[primitive_rows]
+        child_rows = child_owner[primitive_rows]
+        child_valid = child_rows >= 0
+        child_id[valid_pixels[child_valid]] = child_rows[child_valid]
+        incidence[valid_pixels] = np.abs(primitive_incidence[primitive_rows]).astype(np.float32)
+        focal = 0.5 * (float(camera.params[0]) + float(camera.params[1]))
+        primitive_radius = np.sqrt(
+            np.maximum(
+                physical.primitive_scale1[primitive_rows]
+                * physical.primitive_scale2[primitive_rows],
+                0.0,
+            )
+        )
+        projected_scale[valid_pixels] = (
+            primitive_radius * focal / np.maximum(camera_xyz[:, 2], 1.0e-6)
+        ).astype(np.float32)
     shape = (int(height), int(width))
     return RenderedMapletAtlases(
         feature=normalized_feature.reshape(int(height), int(width), field.feature_dim).transpose(2, 0, 1),
@@ -266,6 +292,11 @@ def render_canonical_surface_field(
         depth=depth.reshape(shape),
         surface_id=surface_id.reshape(shape),
         primitive_id=primitive_id.reshape(shape),
+        child_id=child_id.reshape(shape),
+        visibility=visibility.reshape(shape),
+        field_missing=field_missing.reshape(shape),
+        incidence=incidence.reshape(shape),
+        projected_scale=projected_scale.reshape(shape),
     )
 
 
@@ -290,21 +321,65 @@ def _pool_rendered_surface(rendered: RenderedMapletAtlases, factor: int) -> Rend
     pooled_feature /= np.maximum(np.linalg.norm(pooled_feature, axis=0, keepdims=True), 1e-8)
     pooled_feature[:, ~mask] = 0.0
 
-    def mean_values(values: np.ndarray) -> np.ndarray:
+    visibility_blocks = (
+        mask_blocks
+        if rendered.visibility is None
+        else np.asarray(rendered.visibility, dtype=bool).reshape(
+            height, factor, width, factor
+        ).transpose(0, 2, 1, 3)
+    )
+    visibility_count = np.sum(visibility_blocks, axis=(2, 3)).astype(np.float32)
+
+    def mean_values(
+        values: np.ndarray,
+        support_blocks: np.ndarray = mask_blocks,
+        support_count: np.ndarray = count,
+    ) -> np.ndarray:
         source = np.asarray(values, dtype=np.float32)
         trailing = source.shape[2:]
         blocks = source.reshape(height, factor, width, factor, *trailing).transpose(
             0, 2, 1, 3, *range(4, 4 + len(trailing))
         )
-        weighted = blocks * mask_blocks[(...,) + (None,) * len(trailing)]
-        denominator = np.maximum(count[(...,) + (None,) * len(trailing)], 1.0)
+        weighted = blocks * support_blocks[(...,) + (None,) * len(trailing)]
+        denominator = np.maximum(support_count[(...,) + (None,) * len(trailing)], 1.0)
         return np.sum(weighted, axis=(2, 3)) / denominator
 
-    xyz = mean_values(rendered.xyz)
-    normal = mean_values(rendered.normal)
+    xyz = mean_values(rendered.xyz, visibility_blocks, visibility_count)
+    normal = mean_values(rendered.normal, visibility_blocks, visibility_count)
     normal /= np.maximum(np.linalg.norm(normal, axis=2, keepdims=True), 1e-8)
-    depth = mean_values(np.asarray(rendered.depth)[..., None])[..., 0]
+    depth = mean_values(
+        np.asarray(rendered.depth)[..., None], visibility_blocks, visibility_count,
+    )[..., 0]
     uncertainty = mean_values(np.asarray(rendered.uncertainty)[..., None])[..., 0]
+    visibility = (
+        mask
+        if rendered.visibility is None
+        else np.any(visibility_blocks, axis=(2, 3))
+    )
+    field_missing = (
+        visibility & ~mask
+        if rendered.field_missing is None
+        else np.any(
+            np.asarray(rendered.field_missing, dtype=bool).reshape(
+                height, factor, width, factor
+            ).transpose(0, 2, 1, 3),
+            axis=(2, 3),
+        )
+    )
+    incidence = (
+        np.zeros((height, width), dtype=np.float32)
+        if rendered.incidence is None
+        else mean_values(
+            np.asarray(rendered.incidence)[..., None], visibility_blocks, visibility_count,
+        )[..., 0]
+    )
+    projected_scale = (
+        np.zeros((height, width), dtype=np.float32)
+        if rendered.projected_scale is None
+        else mean_values(
+            np.asarray(rendered.projected_scale)[..., None], visibility_blocks, visibility_count,
+        )[..., 0]
+    )
 
     # Identity is categorical.  Select the closest valid high-resolution
     # sample in each token footprint; geometry above remains area-averaged.
@@ -312,16 +387,19 @@ def _pool_rendered_surface(rendered: RenderedMapletAtlases, factor: int) -> Rend
     depth_blocks = np.asarray(rendered.depth, dtype=np.float32).reshape(
         height, factor, width, factor
     ).transpose(0, 2, 1, 3)
-    choice_cost = np.where(mask_blocks & (depth_blocks > 0.0), depth_blocks, np.inf).reshape(
+    choice_cost = np.where(visibility_blocks & (depth_blocks > 0.0), depth_blocks, np.inf).reshape(
         height, width, factor * factor
     )
     choice = np.argmin(choice_cost, axis=2)
     yy = (choice // factor) + np.arange(height)[:, None] * factor
     xx = (choice % factor) + np.arange(width)[None, :] * factor
-    for name in ("maplet_id", "surface_id", "primitive_id"):
+    identity_names = ["maplet_id", "surface_id", "primitive_id"]
+    if rendered.child_id is not None:
+        identity_names.append("child_id")
+    for name in identity_names:
         source = np.asarray(getattr(rendered, name))
         value = source[yy, xx].copy()
-        value[~mask] = -1
+        value[~visibility] = -1
         ids[name] = value
     return RenderedMapletAtlases(
         feature=pooled_feature,
@@ -333,4 +411,9 @@ def _pool_rendered_surface(rendered: RenderedMapletAtlases, factor: int) -> Rend
         depth=depth,
         surface_id=ids["surface_id"],
         primitive_id=ids["primitive_id"],
+        child_id=ids.get("child_id"),
+        visibility=visibility,
+        field_missing=field_missing,
+        incidence=incidence,
+        projected_scale=projected_scale,
     )

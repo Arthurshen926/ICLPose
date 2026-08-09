@@ -342,7 +342,16 @@ class RenderedMapletAtlases:
     mode_log_prior: np.ndarray | None = None
     surface_id: np.ndarray | None = None
     primitive_id: np.ndarray | None = None
+    child_id: np.ndarray | None = None
     atlas_xy: np.ndarray | None = None
+    # Optional exact-surface evidence.  Legacy atlas renderers leave these
+    # unset; the Goal-Maplet full-scene renderer fills them from the very same
+    # compositing pass used for ``feature``.  Keeping them pose-conditioned and
+    # ephemeral avoids introducing a second stored map representation.
+    visibility: np.ndarray | None = None
+    field_missing: np.ndarray | None = None
+    incidence: np.ndarray | None = None
+    projected_scale: np.ndarray | None = None
 
 
 def render_sampled_maplet_atlases(

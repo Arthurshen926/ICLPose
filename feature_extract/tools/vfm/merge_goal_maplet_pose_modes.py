@@ -8,6 +8,8 @@ from pathlib import Path
 
 import numpy as np
 
+from feature_extract.tools.vfm.verify_goal_maplet_pose_modes_with_surface_field import _risk_summary
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -74,6 +76,7 @@ def main() -> None:
         "shard_count": len(shards),
         "source_shards": [str(value) for value in args.inputs],
         "summary": summary,
+        "risk_summary": _risk_summary(rows),
         "rows": rows,
     }
     output.parent.mkdir(parents=True, exist_ok=True)

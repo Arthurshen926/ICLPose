@@ -131,6 +131,22 @@ but not a success-rate promotion.  Top-32 verification, a second G16 proposal
 branch and teacher-consistency reweighting of canonical map observations all
 fail their benefit/complexity gates and remain ablations.
 
+G17.2/G18 now audit and probability-normalize that verifier without changing
+the deployment map.  A new `seq11` trajectory-disjoint block confirms exact
+renderer identity (98.91% primitive Top-1, 99.98% mask IoU and 1.65e-6 m
+matched-primitive center-depth RMS), but the raw GT score is a local/global
+peak on only one of four scanned pose axes and correlates 0.80 with rendered
+coverage.  G18 adds view/geometry-conditioned typed token events, a
+candidate-aware null, same-query listwise normalization and explicit
+same-token competing-phase contrast; DINO/SAM/SigLIP are used only as
+role-directed offline supervision weights.  On the untouched-for-G18 11-query
+`seq11` block it improves strict success from 9.09% to 18.18% and preserves
+zero catastrophic poses, but reaches only 27.27% within 1 m / 10 degrees and
+1.335/2.670 m median/P90.  The 63.48% training strict result does not transfer.
+G18 is therefore a method/correctness diagnostic, not a promotion: G17.1
+remains the selected tail verifier, graph v9 remains production, and neither
+the untouched test nor continuous refiner is opened.
+
 ## Frozen V6 Status
 
 See [the V6 mainline](docs/vfm/2dgs_maplet_atlas_localization_v6.md) for its

@@ -212,6 +212,62 @@ def encode_physical_instance_regions(
     return np.concatenate(output, axis=0).astype(np.float32)
 
 
+def physical_instance_attention_weights(
+    model: PhysicalInstanceReadout,
+    feature_map: np.ndarray,
+    token_xy: np.ndarray,
+    *,
+    role: str,
+    device: str,
+    batch_size: int = 512,
+    spatial_valid_mask: np.ndarray | None = None,
+) -> dict[str, np.ndarray]:
+    """Expose legacy, learned and final attention for diagnostics only.
+
+    The returned arrays are query/render-local measurements.  They are never
+    stored in the deployment map and do not participate in retrieval.
+    """
+
+    tokens, relative, base, mask = _region_token_sets(
+        feature_map,
+        token_xy,
+        role=role,
+        config=model.config,
+        spatial_valid_mask=spatial_valid_mask,
+    )
+    delta_parts, final_parts = [], []
+    head = model.role_head(role).eval()
+    with torch.inference_mode():
+        for start in range(0, tokens.shape[0], int(batch_size)):
+            end = min(start + int(batch_size), tokens.shape[0])
+            value = torch.from_numpy(tokens[start:end]).to(device)
+            position_xy = torch.from_numpy(relative[start:end]).to(device)
+            radius2 = torch.sum(position_xy * position_xy, dim=-1, keepdim=True)
+            position = torch.cat(
+                [position_xy, radius2, position_xy[..., :1] * position_xy[..., 1:]],
+                dim=-1,
+            )
+            delta = head.attention(
+                torch.cat([F.normalize(value, dim=-1), position], dim=-1)
+            ).squeeze(-1)
+            support = torch.from_numpy(mask[start:end]).to(device)
+            base_weight = torch.from_numpy(base[start:end]).to(device)
+            has_support = torch.any(support, dim=-1, keepdim=True)
+            safe_support = support.clone()
+            safe_support[..., 0] |= ~has_support.squeeze(-1)
+            log_weight = torch.log(torch.clamp(base_weight, min=1.0e-12)) + delta
+            log_weight = log_weight.masked_fill(~safe_support, -torch.inf)
+            final = torch.softmax(log_weight, dim=-1) * has_support.to(log_weight.dtype)
+            delta_parts.append(delta.cpu().numpy())
+            final_parts.append(final.cpu().numpy())
+    return {
+        "base_weight": base.astype(np.float32),
+        "learned_delta": np.concatenate(delta_parts, axis=0).astype(np.float32),
+        "final_weight": np.concatenate(final_parts, axis=0).astype(np.float32),
+        "valid_mask": mask,
+    }
+
+
 def transform_canonical_field_for_role(
     model: PhysicalInstanceReadout,
     field,

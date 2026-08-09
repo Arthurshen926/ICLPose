@@ -16,6 +16,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import torch
 
 from feature_extract.vfm.localization.surface_maplet_mapper import load_surface_maplet_mapper
 from feature_extract.vfm.localization_goal_maplet.canonical_field import CanonicalSurfaceField
@@ -29,6 +30,11 @@ from feature_extract.vfm.localization_goal_maplet.physical_instance_readout impo
 from feature_extract.vfm.localization_goal_maplet.physical_map import GoalMapletPhysicalMap
 from feature_extract.vfm.localization_goal_maplet.pfir import ContributorLabels
 from feature_extract.vfm.localization_goal_maplet.surface_refiner import canonical_alignment_score
+from feature_extract.vfm.localization_goal_maplet.surface_pose_likelihood import (
+    EVENT_NAMES,
+    extract_surface_likelihood_features,
+    load_surface_pose_likelihood,
+)
 from feature_extract.vfm.localization_goal_maplet.surface_renderer import render_canonical_surface_field
 from feature_extract.vfm.colmap_tracks import ColmapCamera
 
@@ -118,6 +124,98 @@ def _pose_report(details: list[dict[str, object]]) -> dict[str, object]:
     return report
 
 
+def _risk_summary(rows: list[dict[str, object]]) -> dict[str, object]:
+    """Summarize posterior risk without pretending an abstention is a pose."""
+
+    names = sorted({name for row in rows for name in row.get("mode_details", {})})
+    result = {}
+    for name in names:
+        values = []
+        for row in rows:
+            details = row.get("mode_details", {}).get(name, [])
+            diagnostics = row.get("ranking_diagnostics", {}).get(name, {})
+            null = diagnostics.get("surface_pose_null_probability")
+            if null is None or not details:
+                continue
+            probability = np.asarray([
+                float(item.get("surface_alignment_score") or 0.0)
+                for item in details
+                if item.get("surface_alignment_score") is not None
+            ], dtype=np.float64)
+            null = float(null)
+            abstain = bool(null >= (float(np.max(probability)) if probability.size else 0.0))
+            success = bool(
+                not abstain
+                and float(details[0]["translation_m"]) <= 0.5
+                and float(details[0]["rotation_deg"]) <= 5.0
+            )
+            catastrophic = bool(
+                not abstain
+                and (
+                    float(details[0]["translation_m"]) > 5.0
+                    or float(details[0]["rotation_deg"]) > 30.0
+                )
+            )
+            top3 = details[:3]
+            top3_success = bool(any(
+                float(item["translation_m"]) <= 0.5
+                and float(item["rotation_deg"]) <= 5.0
+                for item in top3
+            ))
+            posterior = np.r_[probability, null]
+            posterior = posterior / max(float(np.sum(posterior)), 1.0e-12)
+            entropy = float(-np.sum(posterior * np.log(np.maximum(posterior, 1.0e-12))))
+            normalized_entropy = entropy / max(float(np.log(posterior.size)), 1.0e-12)
+            candidate_confidence = float(np.max(probability)) if probability.size else 0.0
+            values.append({
+                "confidence": candidate_confidence * (1.0 - normalized_entropy),
+                "abstain": abstain,
+                "success": success,
+                "catastrophic": catastrophic,
+                "top3_success": top3_success,
+                "entropy": entropy,
+            })
+        if not values:
+            continue
+        ordered = sorted(
+            (item for item in values if not bool(item["abstain"])),
+            key=lambda item: -float(item["confidence"]),
+        )
+        curve = {}
+        for coverage in (1.0, 0.9, 0.8, 0.5):
+            requested = max(1, int(np.ceil(float(coverage) * len(values))))
+            accepted = ordered[:requested]
+            curve[f"coverage_{coverage:.1f}"] = {
+                "requested_count": requested,
+                "accepted_count": len(accepted),
+                "realized_coverage": float(len(accepted) / len(values)),
+                "strict_success": (
+                    float(np.mean([item["success"] for item in accepted]))
+                    if accepted else None
+                ),
+                "strict_success_yield": float(
+                    np.sum([item["success"] for item in accepted]) / len(values)
+                ),
+                "catastrophic_pose_rate": (
+                    float(np.mean([item["catastrophic"] for item in accepted]))
+                    if accepted else None
+                ),
+            }
+        result[name] = {
+            "query_count": len(values),
+            "abstain_rate": float(np.mean([item["abstain"] for item in values])),
+            "strict_success": float(np.mean([item["success"] for item in values])),
+            "catastrophic_rate": float(np.mean([item["catastrophic"] for item in values])),
+            "catastrophic_or_abstain_rate": float(np.mean([
+                item["catastrophic"] or item["abstain"] for item in values
+            ])),
+            "top3_strict_success": float(np.mean([item["top3_success"] for item in values])),
+            "posterior_entropy_median": float(np.median([item["entropy"] for item in values])),
+            "risk_coverage": curve,
+        }
+    return result
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--contributors", required=True)
@@ -127,6 +225,7 @@ def main() -> None:
     parser.add_argument("--surface_mapper", required=True)
     parser.add_argument("--field_feature_contract", required=True)
     parser.add_argument("--physical_instance_readout", required=True)
+    parser.add_argument("--surface_pose_likelihood", default="")
     parser.add_argument("--output_json", required=True)
     parser.add_argument("--maximum_modes", type=int, default=16)
     parser.add_argument("--role", choices=("local", "context"), default="local")
@@ -159,6 +258,26 @@ def main() -> None:
         raise ValueError("physical-instance readout and physical map differ")
     if str(readout_metadata.get("canonical_field_sha256", "")) != field.content_sha256:
         raise ValueError("physical-instance readout and canonical field differ")
+    pose_likelihood = None
+    pose_likelihood_metadata = None
+    pose_likelihood_sha256 = None
+    if args.surface_pose_likelihood:
+        if not bool(args.spatial_role_readout):
+            raise ValueError("typed surface likelihood requires symmetric spatial role readout")
+        pose_likelihood_path = Path(args.surface_pose_likelihood)
+        pose_likelihood, pose_likelihood_metadata = load_surface_pose_likelihood(
+            pose_likelihood_path, device=str(args.device),
+        )
+        for key, expected in (
+            ("physical_map_sha256", physical.content_sha256),
+            ("canonical_field_sha256", field.content_sha256),
+            ("physical_instance_readout_sha256", file_sha256(Path(args.physical_instance_readout))),
+        ):
+            if pose_likelihood_metadata.get(key) != expected:
+                raise ValueError(f"surface pose likelihood lineage differs: {key}")
+        pose_likelihood_sha256 = file_sha256(pose_likelihood_path)
+        if args.resume_scores:
+            raise ValueError("typed surface likelihood cannot resume independent cosine scores")
     role_field = (
         field
         if bool(args.spatial_role_readout)
@@ -302,6 +421,8 @@ def main() -> None:
             take = min(max(int(args.maximum_modes), 0), len(details))
             scores: list[float] = []
             coverages: list[float] = []
+            likelihood_features: list[np.ndarray] = []
+            likelihood_query_summary = None
             for detail in details[:take]:
                 resumed = resumed_by_image.get(image_id, {}).get(_pose_key(detail["pose_w2c"]))
                 if resumed is not None:
@@ -332,6 +453,36 @@ def main() -> None:
                     rendered = replace(rendered, feature=rendered_feature)
                 scores.append(float(canonical_alignment_score(rendered, query)))
                 coverages.append(float(np.mean(np.asarray(rendered.mask, dtype=bool))))
+                if pose_likelihood is not None:
+                    token_feature, _typed_target, query_summary = extract_surface_likelihood_features(
+                        query,
+                        rendered,
+                        np.asarray(detail["pose_w2c"], dtype=np.float64),
+                    )
+                    likelihood_features.append(token_feature)
+                    likelihood_query_summary = query_summary
+            null_probability = None
+            event_fraction = None
+            if pose_likelihood is not None:
+                if len(likelihood_features) != take or likelihood_query_summary is None:
+                    raise ValueError("typed likelihood requires every frozen candidate render")
+                with torch.inference_mode():
+                    feature_tensor = torch.from_numpy(
+                        np.stack(likelihood_features, axis=0)[None].astype(np.float32)
+                    ).to(str(args.device))
+                    summary_tensor = torch.from_numpy(
+                        np.asarray(likelihood_query_summary, dtype=np.float32)[None]
+                    ).to(str(args.device))
+                    probability, null, event = pose_likelihood.posterior(
+                        feature_tensor, summary_tensor,
+                    )
+                scores = probability[0].cpu().numpy().astype(np.float64).tolist()
+                null_probability = float(null[0].cpu())
+                event_mean = torch.mean(event[0], dim=1).cpu().numpy()
+                event_fraction = [
+                    {name: float(value) for name, value in zip(EVENT_NAMES, row_values)}
+                    for row_values in event_mean
+                ]
             order = sorted(range(take), key=lambda index: (-scores[index], index))
             order.extend(range(take, len(details)))
             reordered = [details[index] for index in order]
@@ -352,6 +503,12 @@ def main() -> None:
             diagnostics["surface_alignment_scores_preorder"] = scores
             diagnostics["surface_alignment_coverage_preorder"] = coverages
             diagnostics["surface_alignment_original_indices"] = order
+            diagnostics["surface_pose_likelihood_sha256"] = pose_likelihood_sha256
+            diagnostics["surface_pose_null_probability"] = null_probability
+            diagnostics["surface_pose_abstains"] = bool(
+                null_probability is not None and null_probability >= max(scores, default=0.0)
+            )
+            diagnostics["surface_pose_event_fraction_preorder"] = event_fraction
         rows.append(row)
         print(json.dumps({"image_id": image_id, "surface_verified_modes": {
             name: min(int(args.maximum_modes), len(value))
@@ -365,7 +522,17 @@ def main() -> None:
         "spatial_role_readout": bool(args.spatial_role_readout),
         "maximum_modes": int(args.maximum_modes),
         "render": "complete_clean_2dgs_single_canonical_field",
-        "score": "fixed_full_query_grid_mean_cosine",
+        "score": (
+            "same_query_typed_candidate_posterior_with_null"
+            if pose_likelihood is not None else "fixed_full_query_grid_mean_cosine"
+        ),
+        "surface_pose_likelihood_sha256": pose_likelihood_sha256,
+        "score_semantics": (
+            "same_query_typed_candidate_posterior_with_null"
+            if pose_likelihood is not None else "fixed_full_query_grid_mean_cosine"
+        ),
+        "same_query_candidate_normalization": bool(pose_likelihood is not None),
+        "typed_null_hypothesis": bool(pose_likelihood is not None),
         "candidate_dependent_surface_subset": False,
         "stored_map_feature_type_count": 1,
         "stored_downstream_embedding_count": 0,
@@ -383,6 +550,7 @@ def main() -> None:
         "shard_count": int(args.shard_count),
         "surface_verification_contract": verification_contract,
         "summary": _summary(rows),
+        "risk_summary": _risk_summary(rows),
         "rows": rows,
     }
     output.parent.mkdir(parents=True, exist_ok=True)

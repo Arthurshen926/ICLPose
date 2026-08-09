@@ -10,6 +10,7 @@ from feature_extract.vfm.localization_goal_maplet.physical_instance_readout impo
     _region_token_sets,
     encode_physical_instance_regions,
     load_physical_instance_readout,
+    physical_instance_attention_weights,
     save_physical_instance_readout,
     transform_canonical_field_for_role,
 )
@@ -73,6 +74,19 @@ def test_region_sets_mask_missing_rendered_neighbours() -> None:
     )
     assert np.all(np.isfinite(missing))
     assert np.allclose(missing, 0.0)
+    attention = physical_instance_attention_weights(
+        model,
+        feature,
+        np.asarray([[2, 2]], dtype=np.int64),
+        role="context",
+        device="cpu",
+        spatial_valid_mask=valid,
+    )
+    assert set(attention) == {
+        "base_weight", "learned_delta", "final_weight", "valid_mask",
+    }
+    assert attention["final_weight"].shape == (1, 81)
+    assert np.isclose(np.sum(attention["final_weight"]), 1.0)
 
 
 def test_physical_instance_artifact_forbids_teacher_payload(tmp_path: Path) -> None:
