@@ -45,6 +45,7 @@ def _load(paths: list[Path], calibration: set[str], validation: set[str], exclud
             for key in (
                 "physical_map_sha256", "canonical_field_sha256", "field_feature_contract_sha256",
                 "child_eligibility_sha256", "candidate_pool_sha256", "temperature", "maximum_modes",
+                "physical_instance_readout_sha256",
             ):
                 if current.get(key) != metadata.get(key):
                     raise ValueError(f"child-local factor shards differ: {key}")
@@ -206,6 +207,10 @@ def main() -> None:
             "child_eligibility_sha256", "candidate_pool_sha256", "temperature", "maximum_modes",
         )},
     }
+    if sample_metadata.get("physical_instance_readout_sha256") is not None:
+        metadata["physical_instance_readout_sha256"] = str(
+            sample_metadata["physical_instance_readout_sha256"]
+        )
     ChildLocalFactorCalibratorArtifact(fitted[selected_name], metadata).save(output)
     result = {
         "stage": "train_goal_maplet_child_local_factor_calibrator_v2",

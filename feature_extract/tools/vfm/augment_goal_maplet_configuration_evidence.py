@@ -25,6 +25,11 @@ from feature_extract.vfm.localization_goal_maplet.feature_contract import FieldF
 from feature_extract.vfm.localization_goal_maplet.endpoint_hierarchy import EndpointHierarchyCalibration
 from feature_extract.vfm.localization_goal_maplet.lineage import file_sha256
 from feature_extract.vfm.localization_goal_maplet.physical_map import GoalMapletPhysicalMap
+from feature_extract.vfm.localization_goal_maplet.physical_instance_readout import (
+    encode_physical_instance_regions,
+    load_physical_instance_readout,
+    transform_canonical_field_for_role,
+)
 from feature_extract.vfm.localization_goal_maplet.pose_likelihood_ratio import PoseLikelihoodRatioArtifact
 from feature_extract.vfm.localization_goal_maplet.mode_relation import (
     RELATION_EVIDENCE_NAMES,
@@ -264,6 +269,7 @@ def main() -> None:
     parser.add_argument("--field_feature_contract", required=True)
     parser.add_argument("--validity_calibration", required=True)
     parser.add_argument("--endpoint_hierarchy_calibration")
+    parser.add_argument("--physical_instance_readout", default="")
     parser.add_argument("--typed_graph", required=True)
     parser.add_argument("--child_eligibility", required=True)
     parser.add_argument("--child_local_factor_calibrator", required=True)
@@ -273,6 +279,11 @@ def main() -> None:
     parser.add_argument("--maximum_groups", type=int, default=64)
     parser.add_argument("--maximum_children", type=int, default=4)
     parser.add_argument("--endpoint_state_budget", type=int, default=16)
+    parser.add_argument(
+        "--endpoint_state_policy",
+        choices=("mass_adaptive_g16", "mass_adaptive_g17_breadth_depth"),
+        default="mass_adaptive_g16",
+    )
     parser.add_argument(
         "--relation_support_policy",
         choices=("cluster_collapse", "fractional_unary", "g15_llr_only"),
@@ -328,19 +339,23 @@ def main() -> None:
         relation_ratio.metadata.get("runtime_maximum_children", -1)
     ) != int(args.maximum_children):
         raise ValueError("mode-relation training Top-C differs from runtime maximum_children")
+    expected_option_contract = (
+        "mass_adaptive_parent_child_mode_breadth_depth_budget_v4"
+        if args.endpoint_state_policy == "mass_adaptive_g17_breadth_depth"
+        else "mass_adaptive_parent_child_mode_budget_v3"
+    )
     if (
         relation_ratio is not None
         and relation_ratio.metadata.get("option_contract")
-        != "mass_adaptive_parent_child_mode_budget_v3"
+        != expected_option_contract
         and not bool(args.diagnostic_allow_legacy_relation_model)
     ):
         raise ValueError(
-            "G16 deployment replay requires a relation model trained on mass-adaptive states"
+            "deployment replay requires a relation model trained on the selected endpoint states"
         )
     if (
         relation_ratio is not None
-        and relation_ratio.metadata.get("option_contract")
-        == "mass_adaptive_parent_child_mode_budget_v3"
+        and relation_ratio.metadata.get("option_contract") == expected_option_contract
         and int(relation_ratio.metadata.get("endpoint_state_budget", -1))
         != int(args.endpoint_state_budget)
     ):
@@ -386,6 +401,43 @@ def main() -> None:
             if artifact.metadata.get(key) != expected:
                 raise ValueError(f"child-local artifact lineage differs: {key}")
     readout = readout_canonical_field(field, physical)
+    instance_readout = None
+    local_field = field
+    if args.physical_instance_readout:
+        instance_readout, instance_metadata = load_physical_instance_readout(
+            Path(args.physical_instance_readout), device=str(args.device),
+        )
+        for key, expected in (
+            ("physical_map_sha256", physical.content_sha256),
+            ("canonical_field_sha256", field.content_sha256),
+        ):
+            if instance_metadata.get(key) != expected:
+                raise ValueError(f"physical-instance readout lineage differs: {key}")
+        readout = type(readout)(
+            instance_readout.project_numpy(readout.parent_descriptors, role="context", device=str(args.device)),
+            readout.parent_coverage,
+            instance_readout.project_numpy(readout.child_descriptors, role="local", device=str(args.device)),
+            readout.child_coverage,
+        )
+        local_field = transform_canonical_field_for_role(
+            instance_readout, field, role="local", device=str(args.device),
+        )
+    actual_instance = (
+        file_sha256(Path(args.physical_instance_readout))
+        if args.physical_instance_readout else None
+    )
+    if pool.get("physical_instance_readout_sha256") != actual_instance:
+        raise ValueError("candidate pool and runtime physical-instance readout differ")
+    graph_instance = graph.metadata.get("physical_instance_readout_sha256")
+    if graph_instance != actual_instance:
+        raise ValueError("typed graph and runtime physical-instance readout differ")
+    if likelihood_ratio is not None:
+        unary_instance = likelihood_ratio.metadata.get("physical_instance_readout_sha256")
+        if unary_instance != actual_instance and not bool(args.diagnostic_allow_legacy_relation_model):
+            raise ValueError("pose-likelihood model and runtime physical-instance readout differ")
+    calibrator_instance = calibrator.metadata.get("physical_instance_readout_sha256")
+    if calibrator_instance != actual_instance and not bool(args.diagnostic_allow_legacy_relation_model):
+        raise ValueError("child-local calibrator and runtime physical-instance readout differ")
     validity = ValidityCalibration.load_json(Path(args.validity_calibration))
     if hierarchy_calibration is not None:
         for key, expected in (
@@ -400,6 +452,9 @@ def main() -> None:
         actual_hierarchy = hierarchy_calibration.content_sha256 if hierarchy_calibration is not None else None
         if expected_hierarchy != actual_hierarchy:
             raise ValueError("relation model and runtime endpoint hierarchy calibration differ")
+        expected_instance = relation_ratio.metadata.get("physical_instance_readout_sha256")
+        if expected_instance != actual_instance:
+            raise ValueError("relation model and runtime physical-instance readout differ")
     mapper, _ = load_surface_maplet_mapper(Path(args.surface_mapper), device=str(args.device))
     context_config = RadioFinalRegionConfig()
     local_config = RadioFinalRegionConfig(pool_sizes=(1,), pool_weights=(1.0,))
@@ -423,8 +478,16 @@ def main() -> None:
             raw = np.asarray(data["radio_final"], dtype=np.float32)
         mapped = mapper.project(raw).measurement_context
         _, token_xy = all_token_coordinates(int(raw.shape[1]), int(raw.shape[2]))
-        context = encode_radio_final_regions(mapped, token_xy, context_config)
-        local = encode_radio_final_regions(mapped, token_xy, local_config)
+        if instance_readout is None:
+            context = encode_radio_final_regions(mapped, token_xy, context_config)
+            local = encode_radio_final_regions(mapped, token_xy, local_config)
+        else:
+            context = encode_physical_instance_regions(
+                instance_readout, mapped, token_xy, role="context", device=str(args.device),
+            )
+            local = encode_physical_instance_regions(
+                instance_readout, mapped, token_xy, role="local", device=str(args.device),
+            )
         parent_ids, parent_probability, parent_null, parent_best_similarity = retrieve_maplet_posterior(
             context, readout.parent_descriptors, physical.maplet_ids,
             readout.parent_coverage > 0.0, maximum_candidates=64, temperature=0.07,
@@ -478,7 +541,7 @@ def main() -> None:
                 evidence = configuration_candidate_latent_evidence(
                     poses, grouped_local, xy, extent, scale,
                     group_parent_ids, group_parent_probability, group_parent_null,
-                    child, physical, field, graph, eligibility, calibrator, camera,
+                    child, physical, local_field, graph, eligibility, calibrator, camera,
                     pose_likelihood_ratio=likelihood_ratio,
                     maximum_groups=int(args.maximum_groups), maximum_children=int(args.maximum_children),
                 )
@@ -486,7 +549,7 @@ def main() -> None:
                 evidence = configuration_candidate_evidence(
                     poses, grouped_local, xy, scale,
                     group_parent_ids, group_parent_probability, group_parent_null,
-                    child, physical, field, graph, eligibility, calibrator, camera,
+                    child, physical, local_field, graph, eligibility, calibrator, camera,
                     maximum_groups=int(args.maximum_groups), maximum_children=int(args.maximum_children),
                 )
             updated["ranking_diagnostics"][MODE][evidence_key] = {
@@ -496,10 +559,11 @@ def main() -> None:
             relation = configuration_mode_relation_evidence(
                 poses, grouped_local, xy, extent, scale,
                 group_parent_ids, group_parent_probability, group_parent_null,
-                child, physical, field, eligibility, likelihood_ratio, relation_ratio, camera,
+                child, physical, local_field, eligibility, likelihood_ratio, relation_ratio, camera,
                 maximum_groups=int(args.maximum_groups),
                 retrieval_maximum_children=int(args.maximum_children),
                 endpoint_state_budget=int(args.endpoint_state_budget),
+                endpoint_state_policy=str(args.endpoint_state_policy),
                 support_correlation_policy=str(args.relation_support_policy),
                 support_valid_probabilities=group_support_valid,
                 endpoint_hierarchy_calibration=hierarchy_calibration,
@@ -531,7 +595,7 @@ def main() -> None:
                     contributor_path=path, camera=camera, token_xy=token_xy,
                     token_height=int(raw.shape[1]), token_width=int(raw.shape[2]),
                     grouped=grouped, grouped_local=grouped_local,
-                    child_posterior=child, physical=physical, field=field,
+                    child_posterior=child, physical=physical, field=local_field,
                     eligibility=eligibility, relation=relation,
                     runtime_maximum_children=int(args.maximum_children),
                 )
@@ -543,10 +607,11 @@ def main() -> None:
             gt_relation = configuration_mode_relation_evidence(
                 np.asarray(gt_pose, dtype=np.float64)[None], grouped_local, xy, extent, scale,
                 group_parent_ids, group_parent_probability, group_parent_null,
-                child, physical, field, eligibility, likelihood_ratio, relation_ratio, camera,
+                child, physical, local_field, eligibility, likelihood_ratio, relation_ratio, camera,
                 maximum_groups=int(args.maximum_groups),
                 retrieval_maximum_children=int(args.maximum_children),
                 endpoint_state_budget=int(args.endpoint_state_budget),
+                endpoint_state_policy=str(args.endpoint_state_policy),
                 support_correlation_policy=str(args.relation_support_policy),
                 support_valid_probabilities=group_support_valid,
             )
@@ -587,10 +652,20 @@ def main() -> None:
             "mode_relation_pose_evidence": "layered_endpoint_mass_plus_node_and_fit_llr_v3" if relation_ratio is not None else None,
             "mode_relation_decode": "exact_max_sum" if relation_ratio is not None else None,
             "mode_relation_verification": "exact_fit_tree_pair_marginal_unconditional_predictive_llr_v2" if relation_ratio is not None else None,
-            "mode_relation_shortlist": f"best_first_parent_child_mode_fixed_budget_{int(args.endpoint_state_budget)}_v3" if relation_ratio is not None else None,
+            "mode_relation_shortlist": (
+                f"breadth_then_depth_parent_child_mode_fixed_budget_{int(args.endpoint_state_budget)}_v4"
+                if relation_ratio is not None and args.endpoint_state_policy == "mass_adaptive_g17_breadth_depth"
+                else f"best_first_parent_child_mode_fixed_budget_{int(args.endpoint_state_budget)}_v3"
+                if relation_ratio is not None else None
+            ),
             "mode_relation_support_decorrelation": f"complete_link_{str(args.relation_support_policy)}_v3" if relation_ratio is not None else None,
             "mode_relation_probability_mass": "support_invalid_plus_parent_child_mode_tails_plus_geometry_field_and_nonnull_equals_one_v3" if relation_ratio is not None else None,
             "mode_relation_endpoint_state_budget": int(args.endpoint_state_budget) if relation_ratio is not None else None,
+            "mode_relation_endpoint_state_policy": str(args.endpoint_state_policy) if relation_ratio is not None else None,
+            "physical_instance_readout_sha256": (
+                file_sha256(Path(args.physical_instance_readout))
+                if args.physical_instance_readout else None
+            ),
             "endpoint_hierarchy_calibration_sha256": (
                 hierarchy_calibration.content_sha256 if hierarchy_calibration is not None else None
             ),

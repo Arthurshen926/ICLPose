@@ -1013,6 +1013,87 @@ class MassAdaptiveEndpointOptions:
         object.__setattr__(self, "selected_base_masses", selected_mass)
 
 
+def _select_endpoint_leaf_rows(
+    rows: np.ndarray,
+    leaf_factor: np.ndarray,
+    leaf_mode: np.ndarray,
+    leaf_mass: np.ndarray,
+    factor_child: np.ndarray,
+    factor_parent: np.ndarray,
+    factor_branch_mass: np.ndarray,
+    parent_branch_mass: np.ndarray,
+    *,
+    state_budget: int,
+    policy: str,
+) -> np.ndarray:
+    """Select one fixed endpoint frontier without discarding tail mass.
+
+    G16 treated every internal hierarchy node as free and consequently spent
+    most of a 16-state budget on multiple modes of the first few children.
+    G17 uses the probability mass revealed by opening a previously unseen
+    parent or child as the exact breadth gain; once a branch is represented,
+    additional leaves compete only by their own mode mass.  There is no tuned
+    novelty coefficient: each hierarchy mass is counted once when its branch
+    first becomes observable.
+    """
+
+    candidate = np.asarray(rows, dtype=np.int64).reshape(-1)
+    if policy == "mass_only_v3":
+        order = np.lexsort((
+            leaf_mode[candidate], factor_child[leaf_factor[candidate]], -leaf_mass[candidate],
+        ))
+        return candidate[order[: int(state_budget)]]
+    if policy != "breadth_then_depth_v1":
+        raise ValueError("unknown endpoint leaf selection policy")
+    remaining = set(int(value) for value in candidate.tolist())
+    selected: list[int] = []
+    seen_parent: set[int] = set()
+    seen_child: set[int] = set()
+    factors = np.unique(leaf_factor[candidate])
+    branch = np.maximum(factor_branch_mass[factors], 0.0)
+    branch /= max(float(np.sum(branch)), 1e-12)
+    effective_child_count = float(np.exp(-np.sum(
+        branch * np.log(np.maximum(branch, 1e-12)),
+    )))
+    breadth_budget = min(int(state_budget), max(1, int(np.ceil(effective_child_count))))
+    # Breadth phase: at most one leaf per child.  Its size is the exponential
+    # posterior entropy (the effective number of plausible children), rather
+    # than a tuned quota.  Parent novelty decides which physical branches open;
+    # the remaining states deepen high-mass or genuinely multimodal children.
+    while remaining and len(selected) < breadth_budget:
+        breadth_candidates = [
+            row for row in remaining
+            if int(factor_child[int(leaf_factor[row])]) not in seen_child
+        ]
+        if not breadth_candidates:
+            break
+        best_row, best_key = -1, None
+        for row in breadth_candidates:
+            factor = int(leaf_factor[row])
+            child = int(factor_child[factor])
+            parent = int(factor_parent[factor])
+            gain = float(leaf_mass[row]) + float(factor_branch_mass[factor])
+            if parent not in seen_parent:
+                gain += float(parent_branch_mass[factor])
+            # Deterministic physical-identity tie breakers are part of the
+            # method contract, not dependent on raster or dictionary order.
+            key = (-gain, child, int(leaf_mode[row]), int(row))
+            if best_key is None or key < best_key:
+                best_key, best_row = key, int(row)
+        selected.append(best_row)
+        remaining.remove(best_row)
+        factor = int(leaf_factor[best_row])
+        seen_child.add(int(factor_child[factor]))
+        seen_parent.add(int(factor_parent[factor]))
+    if remaining and len(selected) < int(state_budget):
+        depth = np.asarray(sorted(remaining), dtype=np.int64)
+        order = np.lexsort((
+            leaf_mode[depth], factor_child[leaf_factor[depth]], -leaf_mass[depth],
+        ))
+        selected.extend(depth[order[: int(state_budget) - len(selected)]].tolist())
+    return np.asarray(selected, dtype=np.int64)
+
+
 def mass_adaptive_endpoint_options(
     query_descriptors: np.ndarray,
     support_valid_probabilities: np.ndarray,
@@ -1027,6 +1108,7 @@ def mass_adaptive_endpoint_options(
     maximum_modes: int = 8,
     temperature: float = 0.07,
     endpoint_hierarchy_calibration=None,
+    leaf_selection_policy: str = "mass_only_v3",
 ) -> MassAdaptiveEndpointOptions:
     """Allocate a fixed leaf-state budget by posterior mass.
 
@@ -1191,17 +1273,20 @@ def mass_adaptive_endpoint_options(
         * mode_probability[leaf_factor, leaf_mode]
         if leaf_factor.size else np.zeros((0,), dtype=np.float64)
     )
+    factor_parent = (
+        physical.child_parent_rows[factor_child]
+        if factor_child.size else np.zeros((0,), dtype=np.int64)
+    )
     selected_leaf_rows: list[int] = []
     for group in range(group_count):
         rows = np.flatnonzero(leaf_group == group)
         if rows.size == 0:
             continue
-        # Stable identity/mode tie breakers make the state universe exactly
-        # reproducible across sharding and BLAS implementations.
-        order = np.lexsort((
-            leaf_mode[rows], factor_child[leaf_factor[rows]], -leaf_mass[rows],
-        ))
-        selected_leaf_rows.extend(rows[order[: int(state_budget)]].tolist())
+        selected_leaf_rows.extend(_select_endpoint_leaf_rows(
+            rows, leaf_factor, leaf_mode, leaf_mass, factor_child, factor_parent,
+            factor_probability * coverage, parent_probability_by_factor,
+            state_budget=int(state_budget), policy=str(leaf_selection_policy),
+        ).tolist())
     selected_leaf = np.asarray(selected_leaf_rows, dtype=np.int64)
     selected_factor = leaf_factor[selected_leaf]
     selected_mode = leaf_mode[selected_leaf]
@@ -1392,8 +1477,10 @@ def configuration_mode_relation_evidence(
 
     from .child_retrieval import ChildTilePosterior
 
-    if endpoint_state_policy != "mass_adaptive_g16":
-        raise ValueError("G16 relation inference requires mass_adaptive_g16 endpoint states")
+    if endpoint_state_policy not in (
+        "mass_adaptive_g16", "mass_adaptive_g17_breadth_depth",
+    ):
+        raise ValueError("unknown mass-adaptive endpoint-state policy")
     if support_correlation_policy not in (
         "cluster_collapse", "fractional_unary", "g15_llr_only",
     ):
@@ -1499,6 +1586,11 @@ def configuration_mode_relation_evidence(
         state_budget=int(endpoint_state_budget), maximum_modes=int(maximum_modes),
         temperature=float(temperature),
         endpoint_hierarchy_calibration=endpoint_hierarchy_calibration,
+        leaf_selection_policy=(
+            "breadth_then_depth_v1"
+            if endpoint_state_policy == "mass_adaptive_g17_breadth_depth"
+            else "mass_only_v3"
+        ),
     )
     assignments = np.full((poses.shape[0], groups.size), -1, dtype=np.int64)
     primitive_assignments = np.full_like(assignments, -1)

@@ -18,8 +18,8 @@ query RGB
   -> RADIO-final all-token physical-maplet posterior
   -> post-retrieval correlated-support grouping
   -> parent/child surface posterior + typed graph configurations
-  -> diverse Top-N coarse SE(3) modes
-  -> optional exact-surface ranking/refinement plugin
+  -> fixed Top-16 coarse SE(3) modes
+  -> exact full-scene canonical-field likelihood
 ```
 
 The target prior stores only metric 2DGS geometry and bounded anonymous
@@ -34,13 +34,16 @@ matching, single-point cosine pose energy, or final point-correspondence PnP.
 The [Goal-Maplet report](docs/vfm/goal_maplet_localization_v1.md) defines the
 active contracts, artifacts, oracle ladder and promotion decision. Exact clean
 geometry and PFIR retrieval pass their current gates. On the trajectory-disjoint
-48-query development set, current Top-32 proposals contain a 0.241 m median
-oracle candidate and cover 97.92% within 1 m / 10 degrees, but the deployable
-Top-1 remains 0.555 m median / 1.680 m P90. The attempted corrected rendered
-ranker is rejected on Dev48 (0.660 m / 1.990 m), and the current continuous
-RADIO surface-flow refiner has no reliable convergence basin. Goal-Maplet is
-therefore an active research line, not a production or paper-ready accuracy
-claim.
+48-query development set, current Top-32 proposals contain a 0.253 m median
+oracle candidate and cover 97.92% within 1 m / 10 degrees.  The G17 exact
+full-scene feature likelihood is a real tail improvement: it reduces the
+catastrophic rate from G16's 6.25% to 2.08% and repeated-facade seq13 from
+18.75% to 6.25%.  It is not promoted, because Dev48 strict success is only
+39.58% and translation is 0.596/1.495 m median/P90, below the frozen graph/G16
+accuracy gates.  The deployable Top-1 therefore remains graph v9 at
+0.555/1.680 m, and the continuous RADIO surface-flow refiner remains closed.
+Goal-Maplet is an active research line, not a production or paper-ready
+accuracy claim.
 
 The earlier independent configuration logistic improves Dev48 median to
 0.515 m and catastrophic errors to 6.25%, but is also rejected because P90 is
@@ -98,6 +101,36 @@ facade phase errors on Dev48.  G16 is therefore a method-level partial pass,
 not a promotion; graph v9 remains production and the next blocker is
 cross-trajectory endpoint identity at the query-support/local-readout boundary.
 
+The G17 physical-instance pass uses the three RADIO downstream adaptors only
+as offline mapping teachers: SigLIP supervises parent/context identity, DINO
+supervises child/local identity, and SAM supervises support-boundary affinity.
+Deployment still stores exactly one canonical RADIO-final code per observed
+2DGS primitive; two small context/local readout heads are regenerated from
+that code and no RGB, teacher embedding, image path, ALIKE descriptor or RADIO
+intermediate is retained.  On independent seq12/14, the readout raises child
+R@16 from 69.43% to 77.44% and joint parent-R@32/child-R@16 from 68.23% to
+76.15%.  A proposed breadth-first 16-leaf allocator is rejected because it
+reduces exact primitive and two-endpoint relation coverage.  Retaining the
+validated mass-only leaf allocation with the new readout gives the current
+G17 validation result: 0.255/1.028 m median/P90, 70.59% strict success,
+76.47% Top-3 and 5.88% catastrophic failures.  This improves every frozen G16
+ranking metric except that success is tied, but GT non-null mass still trails
+phase-near-miss mass (0.0758 vs 0.1132).  G17 is therefore a method-level
+advance under Dev stress testing, not a production or untouched-test
+promotion.
+
+The G17.1 verification pass removes a remaining implementation mismatch: the
+learned 9x9 context readout is now applied symmetrically to the query and the
+rendered canonical field with explicit missing-surface masks.  It renders the
+complete clean 2DGS scene, uses a fixed full-query denominator, creates no
+2D--3D point correspondences and invokes no PnP.  On seq12/14 it improves the
+frozen candidate Top-1 from 0.441/4.710 m and 52.94% strict success to
+0.366/0.837 m and 76.47%, while catastrophic failures fall from 17.65% to
+5.88%.  The cross-trajectory Dev48 result above confirms the tail reduction
+but not a success-rate promotion.  Top-32 verification, a second G16 proposal
+branch and teacher-consistency reweighting of canonical map observations all
+fail their benefit/complexity gates and remain ablations.
+
 ## Frozen V6 Status
 
 See [the V6 mainline](docs/vfm/2dgs_maplet_atlas_localization_v6.md) for its
@@ -143,9 +176,13 @@ stored embedding, as the next required research module.
 - `feature_extract/tools/vfm/build_goal_maplet_physical_map.py`
 - `feature_extract/tools/vfm/build_goal_maplet_canonical_field_from_contributors.py`
 - `feature_extract/tools/vfm/build_goal_maplet_typed_graph.py`
+- `feature_extract/tools/vfm/train_goal_maplet_physical_instance_readout.py`
+- `feature_extract/tools/vfm/calibrate_goal_maplet_validity.py`
+- `feature_extract/tools/vfm/train_goal_maplet_endpoint_hierarchy_calibration.py`
 - `feature_extract/tools/vfm/evaluate_goal_maplet_canonical_pfir.py`
 - `feature_extract/tools/vfm/evaluate_goal_maplet_oracle_ladder.py`
 - `feature_extract/tools/vfm/evaluate_goal_maplet_pose_modes.py`
+- `feature_extract/tools/vfm/verify_goal_maplet_pose_modes_with_surface_field.py`
 - `feature_extract/tools/vfm/evaluate_goal_maplet_surface_basin.py`
 - `feature_extract/tools/vfm/build_goal_maplet_feature_contract.py`
 - `feature_extract/tools/vfm/build_goal_maplet_child_eligibility.py`

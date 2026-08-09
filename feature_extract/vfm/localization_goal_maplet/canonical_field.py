@@ -132,6 +132,7 @@ class CanonicalFieldFusionAccumulator:
         primitive_rows: np.ndarray,
         descriptors: np.ndarray,
         contribution_mass: np.ndarray,
+        observation_quality: np.ndarray | None = None,
     ) -> None:
         rows = np.asarray(primitive_rows, dtype=np.int64).reshape(-1)
         feature = _normalize(np.asarray(descriptors, dtype=np.float32))
@@ -140,9 +141,19 @@ class CanonicalFieldFusionAccumulator:
             raise ValueError("one fusion view must contain unique aligned primitive rows")
         if np.any((rows < 0) | (rows >= self.feature_sum.shape[0])) or np.any(mass <= 0.0):
             raise ValueError("invalid canonical fusion observation")
+        quality = (
+            np.ones(rows.shape, dtype=np.float32)
+            if observation_quality is None
+            else np.asarray(observation_quality, dtype=np.float32).reshape(-1)
+        )
+        if quality.shape != rows.shape or np.any(~np.isfinite(quality)) or np.any(quality <= 0.0):
+            raise ValueError("invalid canonical fusion observation quality")
         # Cap projected footprint dominance: one large close-up surfel is one
-        # view observation, not hundreds of independent descriptors.
-        weight = np.clip(np.sqrt(mass), 0.25, 4.0).astype(np.float32)
+        # view observation, not hundreds of independent descriptors.  An
+        # optional offline-teacher quality multiplies the view weight; it may
+        # downweight an inconsistent observation but never creates another
+        # deployed feature or removes physical support.
+        weight = np.clip(np.sqrt(mass), 0.25, 4.0).astype(np.float32) * quality
         self.feature_sum[rows] += weight[:, None] * feature
         self.weight_sum[rows] += weight
         self.view_count[rows] += 1

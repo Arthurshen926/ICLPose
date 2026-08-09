@@ -31,3 +31,23 @@ def test_exact_contributor_canonical_fusion_is_view_balanced():
     # The footprint cap prevents the first close-up view from receiving 100x
     # the influence of the second view.
     assert field.codes[0, 1] > 0.2
+
+
+def test_offline_teacher_quality_downweights_but_does_not_remove_view():
+    geometry, maplets, region, poses = _inputs()
+    physical = build_goal_maplet_physical_map(
+        maplets, region, geometry, poses, minimum_child_count=2, maximum_child_count=4,
+    )
+    accumulator = CanonicalFieldFusionAccumulator(physical.primitive_ids.size, 2)
+    accumulator.add_view(
+        np.asarray([0]), np.asarray([[1.0, 0.0]]), np.asarray([1.0]),
+        observation_quality=np.asarray([1.0]),
+    )
+    accumulator.add_view(
+        np.asarray([0]), np.asarray([[0.0, 1.0]]), np.asarray([1.0]),
+        observation_quality=np.asarray([0.25]),
+    )
+    field = accumulator.finalize(physical, metadata={"fusion": "teacher_quality_test"})
+    assert field.primitive_rows.tolist() == [0]
+    assert field.codes[0, 0] > field.codes[0, 1] > 0.0
+    assert accumulator.view_count[0] == 2

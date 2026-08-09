@@ -20,7 +20,8 @@ def main() -> None:
     for key in (
         "stage", "physical_map_sha256", "canonical_field_sha256",
         "validity_calibration_sha256", "proposal_method", "maximum_modes",
-        "typed_graph_sha256", "field_feature_contract_sha256", "proposal_seed_policy",
+        "graph_seed_parent_pair_count", "typed_graph_sha256",
+        "field_feature_contract_sha256", "proposal_seed_policy",
     ):
         if len({json.dumps(item.get(key), sort_keys=True) for item in shards}) != 1:
             raise ValueError(f"configuration evidence shards differ: {key}")
@@ -36,6 +37,7 @@ def main() -> None:
         "mode_relation_pose_evidence", "mode_relation_decode", "mode_relation_verification",
         "mode_relation_support_decorrelation", "mode_relation_probability_mass",
         "mode_relation_null_evidence", "mode_relation_endpoint_state_budget",
+        "mode_relation_endpoint_state_policy", "physical_instance_readout_sha256",
         "endpoint_hierarchy_calibration_sha256",
     )
     for key in semantic_contract_keys:

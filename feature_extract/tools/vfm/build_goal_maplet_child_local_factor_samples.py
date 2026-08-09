@@ -24,6 +24,11 @@ from feature_extract.vfm.localization_goal_maplet.lineage import file_sha256
 from feature_extract.vfm.localization_goal_maplet.oracle_pose import token_oracle_evidence
 from feature_extract.vfm.localization_goal_maplet.pfir import ContributorLabels
 from feature_extract.vfm.localization_goal_maplet.physical_map import GoalMapletPhysicalMap
+from feature_extract.vfm.localization_goal_maplet.physical_instance_readout import (
+    encode_physical_instance_regions,
+    load_physical_instance_readout,
+    transform_canonical_field_for_role,
+)
 from feature_extract.vfm.localization_goal_maplet.query_support import (
     aggregate_group_descriptors,
     aggregate_group_posteriors,
@@ -93,6 +98,7 @@ def main() -> None:
     parser.add_argument("--surface_mapper", required=True)
     parser.add_argument("--field_feature_contract", required=True)
     parser.add_argument("--validity_calibration", required=True)
+    parser.add_argument("--physical_instance_readout", default="")
     parser.add_argument("--child_eligibility", required=True)
     parser.add_argument("--output_npz", required=True)
     parser.add_argument("--temperature", type=float, default=0.07)
@@ -125,6 +131,31 @@ def main() -> None:
             raise ValueError(f"candidate pool lineage differs: {key}")
     pool_rows = {str(row["image_id"]): row for row in pool["rows"]}
     readout = readout_canonical_field(field, physical)
+    local_field = field
+    instance_readout = None
+    if args.physical_instance_readout:
+        instance_readout, instance_metadata = load_physical_instance_readout(
+            Path(args.physical_instance_readout), device=str(args.device),
+        )
+        for key, expected in (
+            ("physical_map_sha256", physical.content_sha256),
+            ("canonical_field_sha256", field.content_sha256),
+        ):
+            if instance_metadata.get(key) != expected:
+                raise ValueError(f"physical-instance readout lineage differs: {key}")
+        readout = type(readout)(
+            instance_readout.project_numpy(
+                readout.parent_descriptors, role="context", device=str(args.device),
+            ),
+            readout.parent_coverage,
+            instance_readout.project_numpy(
+                readout.child_descriptors, role="local", device=str(args.device),
+            ),
+            readout.child_coverage,
+        )
+        local_field = transform_canonical_field_for_role(
+            instance_readout, field, role="local", device=str(args.device),
+        )
     calibration = ValidityCalibration.load_json(Path(args.validity_calibration))
     mapper, _ = load_surface_maplet_mapper(Path(args.surface_mapper), device=str(args.device))
     context_config = RadioFinalRegionConfig()
@@ -148,8 +179,16 @@ def main() -> None:
             raw = np.asarray(data["radio_final"], dtype=np.float32)
         mapped = mapper.project(raw).measurement_context
         _, token_xy = all_token_coordinates(int(raw.shape[1]), int(raw.shape[2]))
-        context = encode_radio_final_regions(mapped, token_xy, context_config)
-        local = encode_radio_final_regions(mapped, token_xy, local_config)
+        if instance_readout is None:
+            context = encode_radio_final_regions(mapped, token_xy, context_config)
+            local = encode_radio_final_regions(mapped, token_xy, local_config)
+        else:
+            context = encode_physical_instance_regions(
+                instance_readout, mapped, token_xy, role="context", device=str(args.device),
+            )
+            local = encode_physical_instance_regions(
+                instance_readout, mapped, token_xy, role="local", device=str(args.device),
+            )
         parent_ids, parent_probability, parent_null, _ = retrieve_maplet_posterior(
             context, readout.parent_descriptors, physical.maplet_ids,
             readout.parent_coverage > 0.0, maximum_candidates=64, temperature=0.07,
@@ -258,7 +297,7 @@ def main() -> None:
         # Exact GT-pose factors teach local validity without a self-generated
         # pose.  A correct child can still be unresolved or field-missing.
         gt_feature, gt_likelihood, gt_valid = _factor_features(
-            descriptor, children, xy, scale, labels.pose_w2c, camera, physical, field,
+            descriptor, children, xy, scale, labels.pose_w2c, camera, physical, local_field,
             p_parent, p_child, p_null,
             temperature=float(args.temperature), maximum_modes=int(args.maximum_modes),
         )
@@ -278,7 +317,7 @@ def main() -> None:
         detail = pool_row["mode_details"][MODE][proposal_index]
         proposal_pose = np.asarray(detail["pose_w2c"], dtype=np.float64)
         proposal_feature, _, _ = _factor_features(
-            descriptor, children, xy, scale, proposal_pose, camera, physical, field,
+            descriptor, children, xy, scale, proposal_pose, camera, physical, local_field,
             p_parent, p_child, p_null,
             temperature=float(args.temperature), maximum_modes=int(args.maximum_modes),
             likelihood=gt_likelihood,
@@ -304,7 +343,7 @@ def main() -> None:
             _, bad_index = min(bad_candidates)
             bad_pose = np.asarray(details[bad_index]["pose_w2c"], dtype=np.float64)
             near_miss_feature, _, _ = _factor_features(
-                descriptor, children, xy, scale, bad_pose, camera, physical, field,
+                descriptor, children, xy, scale, bad_pose, camera, physical, local_field,
                 p_parent, p_child, p_null,
                 temperature=float(args.temperature), maximum_modes=int(args.maximum_modes),
                 likelihood=gt_likelihood,
@@ -335,7 +374,7 @@ def main() -> None:
             _, _, phase_index = min(phase_candidates)
             phase_pose = np.asarray(details[phase_index]["pose_w2c"], dtype=np.float64)
             phase_feature, _, _ = _factor_features(
-                descriptor, children, xy, scale, phase_pose, camera, physical, field,
+                descriptor, children, xy, scale, phase_pose, camera, physical, local_field,
                 p_parent, p_child, p_null,
                 temperature=float(args.temperature), maximum_modes=int(args.maximum_modes),
                 likelihood=gt_likelihood,
@@ -371,7 +410,7 @@ def main() -> None:
             ], dtype=np.float64)
             wrong_feature, _, _ = _factor_features(
                 descriptor[keep_wrong], wrong[keep_wrong], xy[keep_wrong], scale[keep_wrong],
-                labels.pose_w2c, camera, physical, field,
+                labels.pose_w2c, camera, physical, local_field,
                 wrong_parent_probability, wrong_probability[keep_wrong], p_null[keep_wrong],
                 temperature=float(args.temperature), maximum_modes=int(args.maximum_modes),
             )
@@ -462,6 +501,10 @@ def main() -> None:
         "field_feature_contract_sha256": contract.content_sha256,
         "child_eligibility_sha256": eligibility.content_sha256,
         "candidate_pool_sha256": file_sha256(pool_path),
+        "physical_instance_readout_sha256": (
+            file_sha256(Path(args.physical_instance_readout))
+            if args.physical_instance_readout else None
+        ),
         "null_types": list(NULL_TYPES),
         "temperature": float(args.temperature), "maximum_modes": int(args.maximum_modes),
         "maximum_groups_per_query": int(args.maximum_groups_per_query),

@@ -68,6 +68,7 @@ def _load(paths: list[Path]) -> tuple[dict[str, np.ndarray], dict]:
                 "endpoint_hierarchy_calibration_sha256",
                 "endpoint_hierarchy_fit_trajectories",
                 "endpoint_hierarchy_validation_trajectories",
+                "physical_instance_readout_sha256", "endpoint_state_policy",
             ):
                 if current.get(key) != metadata.get(key):
                     raise ValueError(f"relation sample shards differ: {key}")
@@ -136,6 +137,18 @@ def _fit(rows: dict[str, np.ndarray]):
     with threadpool_limits(limits=8):
         estimator.fit(x, y, logisticregression__sample_weight=np.concatenate([weight, weight]))
     return estimator
+
+
+def _concatenate_pairs(*parts: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    """Join paired supervision sets while preserving their common schema."""
+
+    keys = set(parts[0])
+    if any(set(part) != keys for part in parts[1:]):
+        raise ValueError("relation direction pair schemas differ")
+    return {
+        key: np.concatenate([np.asarray(part[key]) for part in parts], axis=0)
+        for key in sorted(keys)
+    }
 
 
 def _raw(estimator, features: np.ndarray) -> np.ndarray:
@@ -241,6 +254,22 @@ def _report(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--samples", nargs="+", required=True)
+    parser.add_argument(
+        "--direction_samples", nargs="+", default=None,
+        help=(
+            "Optional prior-policy paired samples used only to estimate the "
+            "proposal-invariant relation direction. Calibration and lineage "
+            "always come from --samples."
+        ),
+    )
+    parser.add_argument(
+        "--direction_model", default=None,
+        help=(
+            "Optional previously cross-fitted relation artifact supplying only "
+            "the proposal-invariant paired direction; it is recalibrated on "
+            "the current endpoint policy."
+        ),
+    )
     parser.add_argument("--calibration_trajectories", nargs="+", default=["seq9"])
     parser.add_argument("--validation_trajectories", nargs="+", default=["seq10"])
     parser.add_argument("--excluded_trajectories", nargs="+", default=["seq11", "seq12", "seq14"])
@@ -248,6 +277,8 @@ def main() -> None:
     parser.add_argument("--summary_json", required=True)
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
+    if args.direction_samples and args.direction_model:
+        raise ValueError("choose either direction samples or a frozen direction model")
     model_path, summary_path = Path(args.output_model), Path(args.summary_json)
     if not args.force and (model_path.exists() or summary_path.exists()):
         raise FileExistsError("refusing to overwrite relation artifact")
@@ -264,7 +295,42 @@ def main() -> None:
         "validation": np.isin(trajectory, list(validation)),
     }
     partitions = {name: _pairs(arrays, mask) for name, mask in masks.items()}
-    estimator = _fit(partitions["train"])
+    direction_parts = [partitions["train"]]
+    direction_metadata = []
+    direction_sha256 = []
+    direction_trajectories = set(trajectory[masks["train"]].tolist())
+    if args.direction_samples:
+        prior_arrays, prior_metadata = _load([Path(value) for value in args.direction_samples])
+        for key in (
+            "physical_map_sha256", "canonical_field_sha256", "field_feature_contract_sha256",
+            "child_eligibility_sha256",
+        ):
+            if prior_metadata.get(key) != sample_metadata.get(key):
+                raise ValueError(f"relation direction sample lineage differs: {key}")
+        prior_mask = ~np.isin(
+            prior_arrays["trajectories"], list(calibration | validation | excluded),
+        )
+        direction_parts.append(_pairs(prior_arrays, prior_mask))
+        direction_metadata.append({
+            "option_contract": prior_metadata.get("option_contract"),
+            "endpoint_state_policy": prior_metadata.get("endpoint_state_policy", "mass_adaptive_g16"),
+        })
+        direction_sha256 = [file_sha256(Path(value)) for value in args.direction_samples]
+        direction_trajectories.update(prior_arrays["trajectories"][prior_mask].tolist())
+    direction_train = _concatenate_pairs(*direction_parts)
+    frozen_direction_sha256 = None
+    if args.direction_model:
+        frozen_direction = ModeRelationLikelihoodRatioArtifact.load(Path(args.direction_model))
+        for key in (
+            "physical_map_sha256", "canonical_field_sha256", "field_feature_contract_sha256",
+            "child_eligibility_sha256",
+        ):
+            if frozen_direction.metadata.get(key) != sample_metadata.get(key):
+                raise ValueError(f"frozen relation direction lineage differs: {key}")
+        estimator = frozen_direction.pair_estimator
+        frozen_direction_sha256 = file_sha256(Path(args.direction_model))
+    else:
+        estimator = _fit(direction_train)
     scale, intercept, family_scale, family_intercept = _calibrate(
         estimator, partitions["calibration"],
     )
@@ -287,6 +353,16 @@ def main() -> None:
         "uses_radio_intermediate": False, "uses_sfm_points": False,
         "uses_sfm_tracks": False, "uses_point_correspondences": False,
         "relation_direction": "shared_paired_direction",
+        "relation_direction_sampling": (
+            "frozen_prior_policy_paired_direction_current_policy_recalibration"
+            if args.direction_model else
+            "current_plus_prior_policy_paired_physical_endpoints"
+            if args.direction_samples else "current_policy_paired_physical_endpoints"
+        ),
+        "frozen_direction_model_sha256": frozen_direction_sha256,
+        "direction_sample_sha256": direction_sha256,
+        "direction_sample_contracts": direction_metadata,
+        "direction_training_trajectories": sorted(direction_trajectories),
         "relation_calibration": "edge_family_specific_affine",
         **{key: sample_metadata[key] for key in (
             "physical_map_sha256", "canonical_field_sha256", "field_feature_contract_sha256",
@@ -305,6 +381,13 @@ def main() -> None:
         metadata["endpoint_hierarchy_validation_trajectories"] = list(
             sample_metadata.get("endpoint_hierarchy_validation_trajectories", ())
         )
+    if sample_metadata.get("physical_instance_readout_sha256") is not None:
+        metadata["physical_instance_readout_sha256"] = str(
+            sample_metadata["physical_instance_readout_sha256"]
+        )
+    metadata["endpoint_state_policy"] = str(
+        sample_metadata.get("endpoint_state_policy", "mass_adaptive_g16")
+    )
     artifact = ModeRelationLikelihoodRatioArtifact(
         estimator, scale, intercept, metadata, family_scale, family_intercept,
     )
@@ -318,7 +401,7 @@ def main() -> None:
         "reports": {
             name: _report(
                 estimator, scale, intercept, family_scale, family_intercept, rows,
-            ) for name, rows in partitions.items()
+            ) for name, rows in {**partitions, "direction_train": direction_train}.items()
         },
     }
     summary_path.parent.mkdir(parents=True, exist_ok=True)

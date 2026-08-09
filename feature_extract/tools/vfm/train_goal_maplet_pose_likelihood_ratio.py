@@ -56,6 +56,7 @@ def _load(paths: list[Path]) -> tuple[dict[str, np.ndarray], dict]:
             for key in (
                 "physical_map_sha256", "canonical_field_sha256", "field_feature_contract_sha256",
                 "child_eligibility_sha256", "candidate_pool_sha256", "temperature", "maximum_modes",
+                "physical_instance_readout_sha256",
                 "pairing_contract",
                 "feature_input_contract",
                 "runtime_maximum_children",
@@ -294,6 +295,10 @@ def main() -> None:
             "child_eligibility_sha256", "candidate_pool_sha256", "temperature", "maximum_modes",
         )},
     }
+    if sample_metadata.get("physical_instance_readout_sha256") is not None:
+        metadata["physical_instance_readout_sha256"] = str(
+            sample_metadata["physical_instance_readout_sha256"]
+        )
     artifact = PoseLikelihoodRatioArtifact(estimator, scale, intercept, metadata)
     artifact.save(model_path)
     result = {

@@ -921,6 +921,151 @@ work is at the query-support/local-readout boundary of the single canonical
 field, especially the repeated-structure seq13 distribution, rather than more
 back-end Top-K, null-prior or LLR tuning.
 
+### G17 — offline multi-teacher physical-instance readout
+
+G17 changes the map readout without changing the physical map or deployment
+storage contract.  The physical map is built from
+`/root/StMaryChurch2dgs_clean.ply` (SHA-256 prefix `4127e187`) and keeps exact
+primitive membership.  Every observed primitive still stores one canonical
+RADIO-final code.  During mapping only, three RADIO downstream adaptors provide
+separate supervisory signals:
+
+- SigLIP2-G: parent/context identity and long-support similarity;
+- DINOv3-7B: child/local physical-instance identity and hard negatives;
+- SAM3: within-image support-boundary affinity.
+
+The teacher tensors are discarded after training.  The deployed artifact is a
+pair of small residual context/local functions of the same canonical code, not
+per-primitive downstream embeddings.  Query regions retain their relative 2D
+token coordinates and masks; context uses the legacy 1/3/5/9 support mixture
+as a zero-update baseline, while local uses a center-dominant 3x3 support.  The
+same local transform is regenerated for the canonical primitive field before
+query-map comparison.  An audit caught and fixed the earlier asymmetric case
+where only the query was transformed.  Shard merging now also preserves and
+checks the physical-readout SHA and endpoint-state policy.
+
+The independently evaluated readout gain is:
+
+| seq12/14 token identity | canonical baseline | G17 readout |
+|---|---:|---:|
+| parent R@32 | 93.19% | 94.01% |
+| child R@16 | 69.43% | **77.44%** |
+| joint parent-R@32 / child-R@16 | 68.23% | **76.15%** |
+| child median rank | 6 | **4** |
+
+Adding an exact nearest-primitive loss was separately tested.  It improves
+within-child primitive R@8 by 0.83 points but reduces R@1 from 40.98% to
+40.52%, so that checkpoint is rejected.  It confirms that a token's nearest
+visible Gaussian is not a stable semantic identity target by itself.
+
+G17 also implements the proposed breadth-then-depth fixed-16 endpoint frontier
+with explicit support, parent, child, mode, geometry and field tails.  The
+implementation conserves probability to a maximum residual of `6.66e-16`, but
+the empirical first-principles test rejects it for this downstream task:
+
+| seq12/14 endpoint funnel | breadth->depth | mass-only leaves |
+|---|---:|---:|
+| truth child in 16-state budget | **76.31%** | 51.70% |
+| truth primitive in budget | 24.08% | **35.08%** |
+| endpoint pose-valid | 22.91% | **33.38%** |
+| relation edge with two valid endpoints | 5.89% | **8.65%** |
+| mapping relation training pairs | 1,060 | **3,226** |
+
+The reason is structural: relation inference needs a geometrically resolved
+primitive at both ends.  Spending nearly all 16 leaves on one uncertain mode
+from 14.7 different children improves identity breadth but destroys the depth
+needed for a physical relation.  This is not repaired by more relation
+training.  The selected G17 line therefore retains the new readout and unary
+models but reuses the validated mass-only leaf frontier.  Its held-out seq10
+GT-versus-phase relation concordance is 78.38%, compared with 37.50% for the
+breadth frontier.
+
+Fully rebuilt, lineage-consistent seq12/14 results are:
+
+| policy | median/P90 | strict success | Top-3 | catastrophic |
+|---|---:|---:|---:|---:|
+| G16 node+fit | 0.359/1.509 m | 70.59% | 70.59% | 11.76% |
+| G17 breadth node+fit | 0.255/1.091 m | 58.82% | 76.47% | 5.88% |
+| **G17 selected mass-only node+fit** | **0.255/1.028 m** | **70.59%** | **76.47%** | **5.88%** |
+
+Two failure-directed proposal tests are negative.  Expanding the retained
+graph modes from 32 to all 42--44 available modes does not recover the
+catastrophic seq12 frame 139, and activating 32 parent-pair seeds does not
+recover either frame 139 or the 0.846 m near miss at frame 144.  Their failure
+is upstream physical-instance evidence, not proposal truncation.
+
+The probability gate remains closed: exact-GT non-null mass is `0.0758`, below
+the phase-near-miss median `0.1132`, and Max-Sum remains all-null.  Consequently
+the breadth allocator, pair-seed proposal change, primitive-loss checkpoint,
+untouched test and continuous refiner are not promoted.  Dev48 is used only as
+a trajectory stress test of the selected mass-only G17 line.
+
+### G17.1 — exact physical-instance surface likelihood
+
+The G17 relation result isolates the final ranking problem but does not solve
+it.  A further audit found that the first surface verifier transformed each
+query/map code independently with `project_flat`; it therefore bypassed the
+position-preserving context attention trained from SigLIP and the rendered
+missing-surface mask.  G17.1 fixes that mismatch:
+
+1. generate a frozen Top-16 geometric pose set;
+2. render the **complete** clean 2DGS scene from the one canonical field at
+   every pose (no candidate-dependent maplet crop);
+3. apply the same 9x9 context role head to query and rendered token sets;
+4. mask missing rendered neighbours explicitly;
+5. rank by full-query-grid mean cosine, so deleting difficult rendered support
+   cannot improve the denominator.
+
+This remains feature-map alignment.  It creates no 2D--3D correspondences,
+uses no PnP/LoFTR/ALIKE descriptors, reads no mapping image and stores no second
+map embedding.  The three offline teachers affect the learned context/local
+readout, but their tensors are absent at runtime.
+
+| seq12/14 validation | candidate identity rank | G17.1 spatial-context surface |
+|---|---:|---:|
+| translation median/P90 | 0.441 / 4.710 m | **0.366 / 0.837 m** |
+| rotation median/P90 | 1.91 / 21.35 deg | **1.59 / 3.78 deg** |
+| strict 0.5 m / 5 deg | 52.94% | **76.47%** |
+| 1 m / 10 deg | 76.47% | **94.12%** |
+| catastrophic | 17.65% | **5.88%** |
+
+The independent Dev48 stress test proves a narrower but important claim:
+
+| Dev48 policy | median/P90 | strict | 1 m / 10 deg | catastrophic |
+|---|---:|---:|---:|---:|
+| G16 node+fit | 0.569 / 1.405 m | **43.75%** | **77.08%** | 6.25% |
+| G17 relation node+fit | 0.601 / 1.885 m | 41.67% | 72.92% | 8.33% |
+| **G17.1 spatial-context Top-16** | 0.596 / 1.495 m | 39.58% | 72.92% | **2.08%** |
+
+On the hardest repeated-facade `seq13`, catastrophic failure falls from
+G16's 18.75% to 6.25% and translation P90 from 3.28 m to 1.54 m.  This is a
+method-level tail improvement, but not a final-accuracy promotion: median and
+strict success do not beat G16 or graph v9.
+
+The following controlled extensions are rejected:
+
+- verifying Top-32 leaves strict success at 39.58% but worsens P90 to 1.873 m
+  and catastrophic rate to 8.33%; fixed Top-16 is retained;
+- adding the G16-selected geometric pose as a seventeenth candidate leaves
+  success unchanged and improves Dev P90 by only 0.032 m, which does not
+  justify a second proposal branch;
+- weighting canonical fusion observations by leave-one-view-out DINO/SAM/
+  SigLIP consistency raises child R@16 only from 77.44% to 77.62%, while
+  reducing validation pose Top-16 strict coverage from 88.24% to 76.47%.
+  The teacher-weighted field is an ablation and does not replace the exact v2
+  field.
+
+The renderer hot path was also corrected: conversion of roughly 0.51 million
+2DGS surface rotations from matrices to quaternions is now vectorized rather
+than repeated in a Python loop for every pose.  Random 10,000-rotation
+round-trip agreement has minimum absolute quaternion dot `0.9999998`, and all
+52 2DGS mapping tests pass.
+
+G17.1 is therefore the selected research verifier for failure reduction, not
+the production default.  The relation probability gate still fails, the
+surface score is not yet a calibrated non-null likelihood, and neither the
+untouched test nor continuous refiner is opened.
+
 ## Development-set result
 
 The best deployable Goal-Maplet Top-1 remains the frozen graph v9 result, not
@@ -953,6 +1098,7 @@ relevant, but it does not yet meet the requested accuracy.
 | M3.3 sparse mode relation | scientific partial / production fail | held-out relation improves Dev median/ranking, but safe policy remains below graph Top-1 |
 | M3.4 relation probability semantics v2 | correctness pass / production fail | exact mass and pair marginals; 0.461/1.596 m Dev joint, but 8.33% catastrophic and all-null MAP |
 | M3.5 mass-adaptive hierarchical endpoints | method pass / production fail | two-valid endpoints 2.45% -> 5.40%; 0.563/1.370 m Dev node+fit, but median/Top-3 regress and GT-vs-phase reverses |
+| M3.6 physical-instance surface likelihood | tail pass / production fail | validation 0.366/0.837 m and 76.47% strict; Dev catastrophic 2.08%, but strict 39.58% |
 | M4 refiner handoff | fail | no stable 0.1–0.5 m convergence basin |
 | M5 final paper claim | fail | no untouched test, hard-subset comparison or target accuracy |
 
@@ -974,10 +1120,12 @@ Do not continue by tuning these components:
 
 The next work should change two previously under-questioned foundations:
 
-1. **Learn a pose-likelihood field/readout, not another retrieval embedding.**
-   Keep one canonical map code, but train a view/geometry-conditioned readout
-   or explicit surface-flow head on exact 4x contributor round-trips. Its first
-   gate is GT stability and a measured 0.1/0.25/0.5/1 m basin.
+1. **Calibrate or learn the exact surface score as a pose likelihood.**  The
+   fixed-denominator spatial-context score controls catastrophic phases, but
+   does not yet convert score mass into a calibrated non-null probability.
+   Keep one canonical code and add view/geometry conditioning only through a
+   shared regenerable readout.  Its first gate is GT stability, GT-vs-phase
+   NLL and a measured 0.1/0.25/0.5/1 m basin.
 2. **Train/calibrate a configuration ranker against pose correctness.** It must
    consume complete Top-N assignments, typed structure, exact rendered
    coverage and calibrated factor LLRs. Selection is a different task from
@@ -1032,9 +1180,15 @@ not an unsupported claim that VFM regions directly yield centimetre pose.
 - G16 corrected relation model: `goal_maplet/mode_relation_likelihood_ratio_g16_calibrated_v3.joblib`, `goal_maplet/mode_relation_likelihood_ratio_g16_calibrated_v3.json`
 - G16 validation audit: `goal_maplet/config_rank_pool_g16_calibrated_validation_v40.json`, `goal_maplet/mode_relation_g16_calibrated_validation_v40.json`
 - G16 Dev48 audit: `goal_maplet/config_rank_pool_g16_calibrated_dev48_v40.json`, `goal_maplet/mode_relation_g16_calibrated_dev48_v40.json`
+- G17 physical-instance readout: `goal_maplet/physical_instance_readout_g17_v1.pt`, `goal_maplet/physical_instance_readout_g17_v1.json`
+- G17 selected validation relation audit: `goal_maplet/config_rank_pool_g17_massonly_validation_v44.json`, `goal_maplet/mode_relation_g17_massonly_validation_v44.json`
+- G17 fully rebuilt Dev48 relation audit: `goal_maplet/config_rank_pool_g17_massonly_dev48_v46.json`, `goal_maplet/mode_relation_g17_massonly_dev48_v46.json`
+- G17.1 selected validation surface audit: `goal_maplet/pose_modes_surface_spatial_context_g17_validation_v50.json`
+- G17.1 selected Dev48 surface audit: `goal_maplet/pose_modes_surface_spatial_context_g17_dev48_v51.json`
+- rejected teacher-weighted field/readout: `goal_maplet/canonical_surface_field_teacher_g17_v3.npz`, `goal_maplet/physical_instance_readout_teacher_g17_v3.pt`
 - rejected conditional rank: `goal_maplet/pose_modes_graph_conditionalrank_dev48_v17.json`
 - 4x GT round-trip audit: `goal_maplet/surface_basin_radio_pca256_supersample4_oracle_smoke_gt1round_v4.json`
 
-Focused verification: `65 passed` across all Goal-Maplet tests, including the
+Focused verification: `75 passed` across all Goal-Maplet tests, including the
 hierarchy calibrator, coherent complete-link collapse, adaptive mass
 conservation, relation inference and exact 2DGS map contracts.

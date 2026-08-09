@@ -8,6 +8,7 @@ from feature_extract.vfm.localization_goal_maplet.mode_relation import (
     FEATURE_NAMES,
     ModeRelationLikelihoodRatioArtifact,
     _aggregate_complete_link_observations,
+    _select_endpoint_leaf_rows,
     analytic_relation_score,
     build_sparse_relation_edges,
     exact_pair_log_marginal,
@@ -266,3 +267,27 @@ def test_mass_adaptive_endpoint_budget_follows_leaf_mass_and_conserves_probabili
     )
     assert total == pytest.approx(1.0)
     assert result.query_mass_residual[0] < 1e-12
+
+
+def test_g17_breadth_then_depth_opens_physical_families_before_extra_modes():
+    # Child 0 owns the three largest individual leaves.  Pure mass therefore
+    # collapses the budget into one repeated instance, whereas G17 counts the
+    # probability revealed by opening a new child/parent branch exactly once.
+    rows = np.arange(6, dtype=np.int64)
+    leaf_factor = np.asarray([0, 0, 0, 1, 2, 2], dtype=np.int64)
+    leaf_mode = np.asarray([0, 1, 2, 0, 0, 1], dtype=np.int64)
+    leaf_mass = np.asarray([0.30, 0.20, 0.10, 0.08, 0.07, 0.03])
+    factor_child = np.asarray([10, 11, 12], dtype=np.int64)
+    factor_parent = np.asarray([0, 0, 1], dtype=np.int64)
+    child_mass = np.asarray([0.60, 0.08, 0.10])
+    parent_mass = np.asarray([0.68, 0.68, 0.10])
+    mass_only = _select_endpoint_leaf_rows(
+        rows, leaf_factor, leaf_mode, leaf_mass, factor_child, factor_parent,
+        child_mass, parent_mass, state_budget=3, policy="mass_only_v3",
+    )
+    breadth = _select_endpoint_leaf_rows(
+        rows, leaf_factor, leaf_mode, leaf_mass, factor_child, factor_parent,
+        child_mass, parent_mass, state_budget=3, policy="breadth_then_depth_v1",
+    )
+    assert factor_child[leaf_factor[mass_only]].tolist() == [10, 10, 10]
+    assert set(factor_child[leaf_factor[breadth]].tolist()) == {10, 11, 12}

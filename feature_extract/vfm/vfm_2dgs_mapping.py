@@ -1495,40 +1495,60 @@ def _fallback_tangent_basis(normals: np.ndarray) -> tuple[np.ndarray, np.ndarray
 
 def _rotation_matrices_to_quaternions_wxyz(matrices: np.ndarray) -> np.ndarray:
     mats = np.asarray(matrices, dtype=np.float64).reshape(-1, 3, 3)
-    quats = np.zeros((mats.shape[0], 4), dtype=np.float32)
-    for idx, matrix in enumerate(mats):
-        trace = float(np.trace(matrix))
-        if trace > 0.0:
-            scale = np.sqrt(trace + 1.0) * 2.0
-            qw = 0.25 * scale
-            qx = (matrix[2, 1] - matrix[1, 2]) / scale
-            qy = (matrix[0, 2] - matrix[2, 0]) / scale
-            qz = (matrix[1, 0] - matrix[0, 1]) / scale
-        else:
-            diagonal = np.diag(matrix)
-            axis = int(np.argmax(diagonal))
-            if axis == 0:
-                scale = np.sqrt(1.0 + matrix[0, 0] - matrix[1, 1] - matrix[2, 2]) * 2.0
-                qw = (matrix[2, 1] - matrix[1, 2]) / scale
-                qx = 0.25 * scale
-                qy = (matrix[0, 1] + matrix[1, 0]) / scale
-                qz = (matrix[0, 2] + matrix[2, 0]) / scale
-            elif axis == 1:
-                scale = np.sqrt(1.0 + matrix[1, 1] - matrix[0, 0] - matrix[2, 2]) * 2.0
-                qw = (matrix[0, 2] - matrix[2, 0]) / scale
-                qx = (matrix[0, 1] + matrix[1, 0]) / scale
-                qy = 0.25 * scale
-                qz = (matrix[1, 2] + matrix[2, 1]) / scale
+    quats = np.zeros((mats.shape[0], 4), dtype=np.float64)
+    if mats.shape[0] == 0:
+        return quats.astype(np.float32)
+    trace = np.trace(mats, axis1=1, axis2=2)
+
+    positive = trace > 0.0
+    if np.any(positive):
+        matrix = mats[positive]
+        scale = np.sqrt(np.maximum(trace[positive] + 1.0, 0.0)) * 2.0
+        scale = np.maximum(scale, 1e-12)
+        quats[positive, 0] = 0.25 * scale
+        quats[positive, 1] = (matrix[:, 2, 1] - matrix[:, 1, 2]) / scale
+        quats[positive, 2] = (matrix[:, 0, 2] - matrix[:, 2, 0]) / scale
+        quats[positive, 3] = (matrix[:, 1, 0] - matrix[:, 0, 1]) / scale
+
+    nonpositive_rows = np.flatnonzero(~positive)
+    if nonpositive_rows.size:
+        matrix = mats[nonpositive_rows]
+        axis = np.argmax(np.diagonal(matrix, axis1=1, axis2=2), axis=1)
+        for selected_axis in range(3):
+            local = np.flatnonzero(axis == selected_axis)
+            if local.size == 0:
+                continue
+            rows = nonpositive_rows[local]
+            value = matrix[local]
+            if selected_axis == 0:
+                scale = np.sqrt(np.maximum(
+                    1.0 + value[:, 0, 0] - value[:, 1, 1] - value[:, 2, 2], 0.0,
+                )) * 2.0
+                scale = np.maximum(scale, 1e-12)
+                quats[rows, 0] = (value[:, 2, 1] - value[:, 1, 2]) / scale
+                quats[rows, 1] = 0.25 * scale
+                quats[rows, 2] = (value[:, 0, 1] + value[:, 1, 0]) / scale
+                quats[rows, 3] = (value[:, 0, 2] + value[:, 2, 0]) / scale
+            elif selected_axis == 1:
+                scale = np.sqrt(np.maximum(
+                    1.0 + value[:, 1, 1] - value[:, 0, 0] - value[:, 2, 2], 0.0,
+                )) * 2.0
+                scale = np.maximum(scale, 1e-12)
+                quats[rows, 0] = (value[:, 0, 2] - value[:, 2, 0]) / scale
+                quats[rows, 1] = (value[:, 0, 1] + value[:, 1, 0]) / scale
+                quats[rows, 2] = 0.25 * scale
+                quats[rows, 3] = (value[:, 1, 2] + value[:, 2, 1]) / scale
             else:
-                scale = np.sqrt(1.0 + matrix[2, 2] - matrix[0, 0] - matrix[1, 1]) * 2.0
-                qw = (matrix[1, 0] - matrix[0, 1]) / scale
-                qx = (matrix[0, 2] + matrix[2, 0]) / scale
-                qy = (matrix[1, 2] + matrix[2, 1]) / scale
-                qz = 0.25 * scale
-        quat = np.asarray([qw, qx, qy, qz], dtype=np.float64)
-        quat = quat / max(float(np.linalg.norm(quat)), 1e-8)
-        quats[idx] = quat.astype(np.float32)
-    return quats
+                scale = np.sqrt(np.maximum(
+                    1.0 + value[:, 2, 2] - value[:, 0, 0] - value[:, 1, 1], 0.0,
+                )) * 2.0
+                scale = np.maximum(scale, 1e-12)
+                quats[rows, 0] = (value[:, 1, 0] - value[:, 0, 1]) / scale
+                quats[rows, 1] = (value[:, 0, 2] + value[:, 2, 0]) / scale
+                quats[rows, 2] = (value[:, 1, 2] + value[:, 2, 1]) / scale
+                quats[rows, 3] = 0.25 * scale
+    quats /= np.maximum(np.linalg.norm(quats, axis=1, keepdims=True), 1e-8)
+    return quats.astype(np.float32)
 
 
 def _surface_element_quaternions_and_scales(elements: SurfaceElementMap) -> tuple[np.ndarray, np.ndarray]:

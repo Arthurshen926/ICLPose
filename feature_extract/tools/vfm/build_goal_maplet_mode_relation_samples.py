@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -34,6 +35,11 @@ from feature_extract.vfm.localization_goal_maplet.mode_relation import (
 from feature_extract.vfm.localization_goal_maplet.oracle_pose import token_oracle_evidence
 from feature_extract.vfm.localization_goal_maplet.pfir import ContributorLabels
 from feature_extract.vfm.localization_goal_maplet.physical_map import GoalMapletPhysicalMap
+from feature_extract.vfm.localization_goal_maplet.physical_instance_readout import (
+    encode_physical_instance_regions,
+    load_physical_instance_readout,
+    transform_canonical_field_for_role,
+)
 from feature_extract.vfm.localization_goal_maplet.query_support import (
     aggregate_group_descriptors,
     aggregate_group_posteriors,
@@ -105,12 +111,18 @@ def main() -> None:
     parser.add_argument("--field_feature_contract", required=True)
     parser.add_argument("--validity_calibration", required=True)
     parser.add_argument("--endpoint_hierarchy_calibration")
+    parser.add_argument("--physical_instance_readout", default="")
     parser.add_argument("--child_eligibility", required=True)
     parser.add_argument("--output_npz", required=True)
     parser.add_argument("--runtime_maximum_children", type=int, default=16)
     parser.add_argument("--maximum_groups_per_query", type=int, default=64)
     parser.add_argument("--maximum_modes", type=int, default=8)
     parser.add_argument("--endpoint_state_budget", type=int, default=16)
+    parser.add_argument(
+        "--endpoint_state_policy",
+        choices=("mass_adaptive_g16", "mass_adaptive_g17_breadth_depth"),
+        default="mass_adaptive_g16",
+    )
     parser.add_argument("--temperature", type=float, default=0.07)
     parser.add_argument("--shard_index", type=int, default=0)
     parser.add_argument("--shard_count", type=int, default=1)
@@ -138,6 +150,27 @@ def main() -> None:
             raise ValueError(f"candidate pool lineage differs: {key}")
     pool_rows = {str(row["image_id"]): row for row in pool["rows"]}
     readout = readout_canonical_field(field, physical)
+    instance_readout = None
+    local_field = field
+    if args.physical_instance_readout:
+        instance_readout, instance_metadata = load_physical_instance_readout(
+            Path(args.physical_instance_readout), device=str(args.device),
+        )
+        for key, expected in (
+            ("physical_map_sha256", physical.content_sha256),
+            ("canonical_field_sha256", field.content_sha256),
+        ):
+            if instance_metadata.get(key) != expected:
+                raise ValueError(f"physical-instance readout lineage differs: {key}")
+        readout = type(readout)(
+            instance_readout.project_numpy(readout.parent_descriptors, role="context", device=str(args.device)),
+            readout.parent_coverage,
+            instance_readout.project_numpy(readout.child_descriptors, role="local", device=str(args.device)),
+            readout.child_coverage,
+        )
+        local_field = transform_canonical_field_for_role(
+            instance_readout, field, role="local", device=str(args.device),
+        )
     calibration = ValidityCalibration.load_json(Path(args.validity_calibration))
     hierarchy_calibration = (
         EndpointHierarchyCalibration.load_json(Path(args.endpoint_hierarchy_calibration))
@@ -161,6 +194,7 @@ def main() -> None:
         "candidate_indices", "pose_translation_m", "pose_rotation_deg", "relation_null_types",
     )}
     analytic_positive, analytic_negative, analytic_source, analytic_family = [], [], [], []
+    coverage = defaultdict(lambda: defaultdict(int))
     processed_queries = 0
     for path in paths:
         labels = ContributorLabels.load_npz(path)
@@ -174,8 +208,16 @@ def main() -> None:
             raw = np.asarray(data["radio_final"], dtype=np.float32)
         mapped = mapper.project(raw).measurement_context
         _, token_xy = all_token_coordinates(int(raw.shape[1]), int(raw.shape[2]))
-        context = encode_radio_final_regions(mapped, token_xy, context_config)
-        local = encode_radio_final_regions(mapped, token_xy, local_config)
+        if instance_readout is None:
+            context = encode_radio_final_regions(mapped, token_xy, context_config)
+            local = encode_radio_final_regions(mapped, token_xy, local_config)
+        else:
+            context = encode_physical_instance_regions(
+                instance_readout, mapped, token_xy, role="context", device=str(args.device),
+            )
+            local = encode_physical_instance_regions(
+                instance_readout, mapped, token_xy, role="local", device=str(args.device),
+            )
         parent_ids, parent_probability, parent_null, parent_best_similarity = retrieve_maplet_posterior(
             context, readout.parent_descriptors, physical.maplet_ids,
             readout.parent_coverage > 0.0, maximum_candidates=64, temperature=0.07,
@@ -268,10 +310,15 @@ def main() -> None:
         options = mass_adaptive_endpoint_options(
             descriptor, active_support_valid,
             active_parent_ids, active_parent_probability,
-            active_child_posterior, physical, field, eligibility,
+            active_child_posterior, physical, local_field, eligibility,
             state_budget=int(args.endpoint_state_budget), maximum_modes=int(args.maximum_modes),
             temperature=float(args.temperature),
             endpoint_hierarchy_calibration=hierarchy_calibration,
+            leaf_selection_policy=(
+                "breadth_then_depth_v1"
+                if args.endpoint_state_policy == "mass_adaptive_g17_breadth_depth"
+                else "mass_only_v3"
+            ),
         )
         selected_child = options.factor_child_rows[options.selected_factor_rows]
         selected_primitive = np.asarray(options.likelihood.mode_primitive_rows, dtype=np.int64)[
@@ -307,6 +354,27 @@ def main() -> None:
             primitive = int(primitive_members[np.argmin(
                 np.linalg.norm(physical.primitive_centers[primitive_members] - truth_xyz, axis=1)
             )])
+            trajectory = image_id.split("/", 1)[0]
+            coverage[trajectory]["observable_groups"] += 1
+            if np.any(active_child_rows[active_group] == child):
+                coverage[trajectory]["truth_child_full_posterior"] += 1
+            selected_truth_child = (
+                (options.factor_group_rows[options.selected_factor_rows] == active_group)
+                & (selected_child == child)
+            )
+            if np.any(selected_truth_child):
+                coverage[trajectory]["truth_child_fixed_budget"] += 1
+            factor_truth = (
+                (options.factor_group_rows == active_group)
+                & (options.factor_child_rows == child)
+            )
+            if np.any(factor_truth):
+                factor_rows = np.flatnonzero(factor_truth)
+                full_primitive = np.asarray(
+                    options.likelihood.mode_primitive_rows, dtype=np.int64,
+                )[factor_rows]
+                if np.any(full_primitive == primitive):
+                    coverage[trajectory]["truth_primitive_full_modes"] += 1
             state = (
                 (options.factor_group_rows[options.selected_factor_rows] == active_group)
                 & (selected_child == child) & (selected_primitive == primitive)
@@ -315,6 +383,7 @@ def main() -> None:
                 children[active_group] = child
                 truth_primitive[active_group] = primitive
                 resolved[active_group] = True
+                coverage[trajectory]["truth_endpoint_fixed_budget"] += 1
         edge_left = np.concatenate([edges.fit_left, edges.verify_left])
         edge_right = np.concatenate([edges.fit_right, edges.verify_right])
         edge_family = np.concatenate([edges.fit_family, edges.verify_family])
@@ -458,7 +527,12 @@ def main() -> None:
         "relation_null_types": list(RELATION_NULL_TYPES),
         "pairing_contract": "same_image_same_runtime_query_edge_adaptive_options_v2",
         "edge_contract": "query_only_complete_link_cluster_collapse_fit_verify_v3",
-        "option_contract": "mass_adaptive_parent_child_mode_budget_v3",
+        "option_contract": (
+            "mass_adaptive_parent_child_mode_breadth_depth_budget_v4"
+            if args.endpoint_state_policy == "mass_adaptive_g17_breadth_depth"
+            else "mass_adaptive_parent_child_mode_budget_v3"
+        ),
+        "endpoint_state_policy": str(args.endpoint_state_policy),
         "runtime_maximum_children": int(args.runtime_maximum_children),
         "endpoint_state_budget": int(args.endpoint_state_budget),
         "endpoint_hierarchy_calibration_sha256": (
@@ -478,7 +552,24 @@ def main() -> None:
         "field_feature_contract_sha256": contract.content_sha256,
         "child_eligibility_sha256": eligibility.content_sha256,
         "candidate_pool_sha256": file_sha256(pool_path),
+        "physical_instance_readout_sha256": (
+            file_sha256(Path(args.physical_instance_readout))
+            if args.physical_instance_readout else None
+        ),
         "processed_queries": int(processed_queries), "analytic_report": analytic_report,
+        "endpoint_coverage_by_trajectory": {
+            trajectory: {
+                **dict(values),
+                **{
+                    f"{name}_fraction": float(values[name] / max(values["observable_groups"], 1))
+                    for name in (
+                        "truth_child_full_posterior", "truth_child_fixed_budget",
+                        "truth_primitive_full_modes", "truth_endpoint_fixed_budget",
+                    )
+                },
+            }
+            for trajectory, values in sorted(coverage.items())
+        },
         "uses_gt_only_for_training_target": True, "deployment_artifact": False,
         "stores_mapping_rgb": False, "stores_mapping_image_paths": False,
         "stores_mapping_image_ids": True, "stored_downstream_embedding_count": 0,

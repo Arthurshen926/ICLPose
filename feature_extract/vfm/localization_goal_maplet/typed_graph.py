@@ -133,6 +133,7 @@ def build_typed_parent_graph(
     field: CanonicalSurfaceField,
     contributor_paths: list[Path],
     *,
+    parent_descriptors: np.ndarray | None = None,
     geometry_neighbors: int = 8,
     continuity_neighbors: int = 16,
     distinctive_anchor_count: int = 64,
@@ -143,7 +144,12 @@ def build_typed_parent_graph(
     if field.physical_map_sha256 != physical.content_sha256:
         raise ValueError("canonical field and physical map lineage differ")
     readout = readout_canonical_field(field, physical)
-    descriptor = readout.parent_descriptors.astype(np.float64)
+    descriptor = np.asarray(
+        readout.parent_descriptors if parent_descriptors is None else parent_descriptors,
+        dtype=np.float64,
+    )
+    if descriptor.shape != readout.parent_descriptors.shape:
+        raise ValueError("typed-graph parent readout shape differs")
     descriptor /= np.maximum(np.linalg.norm(descriptor, axis=1, keepdims=True), 1e-8)
     similarity = descriptor @ descriptor.T
     np.fill_diagonal(similarity, -1.0)

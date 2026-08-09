@@ -24,6 +24,12 @@ from feature_extract.vfm.localization_goal_maplet.pfir import (
     contributor_multiscale_maplet_distribution,
 )
 from feature_extract.vfm.localization_goal_maplet.physical_map import GoalMapletPhysicalMap
+from feature_extract.vfm.localization_goal_maplet.physical_instance_readout import (
+    encode_physical_instance_regions,
+    load_physical_instance_readout,
+    transform_canonical_field_for_role,
+)
+from feature_extract.vfm.localization_goal_maplet.lineage import file_sha256
 from feature_extract.vfm.localization_goal_maplet.pose_proposal import (
     generate_graph_conditioned_pose_modes,
     generate_parent_then_child_pose_modes,
@@ -117,6 +123,7 @@ def main() -> None:
     parser.add_argument("--field_feature_contract", required=True)
     parser.add_argument("--validity_calibration", required=True)
     parser.add_argument("--typed_graph", default="")
+    parser.add_argument("--physical_instance_readout", default="")
     parser.add_argument("--output_json", required=True)
     parser.add_argument("--child_local_head", default="")
     parser.add_argument("--parent_mode", choices=("actual", "oracle", "both"), default="both")
@@ -128,6 +135,7 @@ def main() -> None:
     parser.add_argument("--maximum_modes", type=int, default=32)
     parser.add_argument("--proposal_trials", type=int, default=2048)
     parser.add_argument("--proposal_method", choices=("random", "graph", "hierarchical"), default="graph")
+    parser.add_argument("--graph_seed_parent_pair_count", type=int, default=0)
     parser.add_argument("--local_evidence_weight", type=float, default=0.0)
     parser.add_argument("--render_identity_rerank", action="store_true")
     parser.add_argument("--identity_render_mode", choices=("child_splat", "full_2dgs", "cascade"), default="child_splat")
@@ -141,6 +149,7 @@ def main() -> None:
     parser.add_argument("--alike_matcha_repo", default="/root/matcha")
     parser.add_argument("--maximum_queries", type=int, default=0)
     parser.add_argument("--image_id", default="")
+    parser.add_argument("--include_trajectories", nargs="+", default=None)
     parser.add_argument("--shard_index", type=int, default=0)
     parser.add_argument("--shard_count", type=int, default=1)
     parser.add_argument("--device", default="cuda")
@@ -156,6 +165,33 @@ def main() -> None:
         raise ValueError("pose-mode retrieval requires the frozen surface-maplet mapper readout")
     feature_contract.validate(field, query_readout_path=Path(args.surface_mapper))
     readout = readout_canonical_field(field, physical)
+    local_field = field
+    instance_readout = None
+    instance_readout_sha256 = None
+    if args.physical_instance_readout:
+        instance_readout, instance_metadata = load_physical_instance_readout(
+            Path(args.physical_instance_readout), device=str(args.device),
+        )
+        for key, expected in (
+            ("physical_map_sha256", physical.content_sha256),
+            ("canonical_field_sha256", field.content_sha256),
+        ):
+            if instance_metadata.get(key) != expected:
+                raise ValueError(f"physical-instance readout lineage differs: {key}")
+        readout = type(readout)(
+            instance_readout.project_numpy(
+                readout.parent_descriptors, role="context", device=str(args.device),
+            ),
+            readout.parent_coverage,
+            instance_readout.project_numpy(
+                readout.child_descriptors, role="local", device=str(args.device),
+            ),
+            readout.child_coverage,
+        )
+        local_field = transform_canonical_field_for_role(
+            instance_readout, field, role="local", device=str(args.device),
+        )
+        instance_readout_sha256 = file_sha256(Path(args.physical_instance_readout))
     calibration = ValidityCalibration.load_json(Path(args.validity_calibration))
     mapper, _ = load_surface_maplet_mapper(Path(args.surface_mapper), device=str(args.device))
     graph = None
@@ -165,6 +201,9 @@ def main() -> None:
         graph = TypedParentGraph.load_npz(Path(args.typed_graph))
         if graph.physical_map_sha256 != physical.content_sha256 or graph.canonical_field_sha256 != field.content_sha256:
             raise ValueError("typed graph lineage differs")
+        graph_readout = graph.metadata.get("physical_instance_readout_sha256")
+        if graph_readout != instance_readout_sha256:
+            raise ValueError("typed graph physical-instance readout lineage differs")
     detector = None
     if int(args.detector_radio_refine_topn) > 0:
         if not args.query_image_root:
@@ -192,6 +231,15 @@ def main() -> None:
             if str(item.get("image_id", "")) == str(args.image_id):
                 selected_paths.append(path)
         paths = selected_paths
+    if args.include_trajectories:
+        requested = set(str(value) for value in args.include_trajectories)
+        selected_paths = []
+        for path in paths:
+            with np.load(path, allow_pickle=False) as data:
+                item = json.loads(str(np.asarray(data["metadata_json"]).item()))
+            if str(item.get("trajectory_id", str(item.get("image_id", "")).split("/", 1)[0])) in requested:
+                selected_paths.append(path)
+        paths = selected_paths
     if int(args.maximum_queries) > 0:
         paths = paths[: int(args.maximum_queries)]
     reports = []
@@ -206,8 +254,16 @@ def main() -> None:
             raw = np.asarray(data["radio_final"], dtype=np.float32)
         mapped = mapper.project(raw).measurement_context
         _, token_xy = all_token_coordinates(int(raw.shape[1]), int(raw.shape[2]))
-        context_descriptor = encode_radio_final_regions(mapped, token_xy, context_config)
-        local_descriptor = encode_radio_final_regions(mapped, token_xy, local_config)
+        if instance_readout is None:
+            context_descriptor = encode_radio_final_regions(mapped, token_xy, context_config)
+            local_descriptor = encode_radio_final_regions(mapped, token_xy, local_config)
+        else:
+            context_descriptor = encode_physical_instance_regions(
+                instance_readout, mapped, token_xy, role="context", device=str(args.device),
+            )
+            local_descriptor = encode_physical_instance_regions(
+                instance_readout, mapped, token_xy, role="local", device=str(args.device),
+            )
         if local_head is not None:
             with torch.no_grad():
                 local_descriptor = local_head.encode_query(
@@ -299,7 +355,10 @@ def main() -> None:
                     maximum_modes=int(args.maximum_modes),
                     random_seed=stable_seed,
                     **(
-                        {"local_evidence_weight": float(args.local_evidence_weight)}
+                        {
+                            "local_evidence_weight": float(args.local_evidence_weight),
+                            "seed_parent_pair_count": int(args.graph_seed_parent_pair_count),
+                        }
                         if args.proposal_method == "graph" else {}
                     ),
                 )
@@ -318,7 +377,7 @@ def main() -> None:
                     *parent_values,
                     child,
                     physical,
-                    field,
+                    local_field,
                     camera,
                     token_height=int(raw.shape[1]),
                     token_width=int(raw.shape[2]),
@@ -367,7 +426,7 @@ def main() -> None:
                             *parent_values,
                             child,
                             physical,
-                            field,
+                            local_field,
                             camera,
                             token_height=int(raw.shape[1]),
                             token_width=int(raw.shape[2]),
@@ -405,7 +464,7 @@ def main() -> None:
                         child,
                         pose,
                         physical,
-                        field,
+                        local_field,
                         camera,
                     )
                     if value.success:
@@ -471,6 +530,9 @@ def main() -> None:
         "child_mode": str(args.child_mode),
         "proposal_trials": int(args.proposal_trials),
         "proposal_method": str(args.proposal_method),
+        "graph_seed_parent_pair_count": (
+            int(args.graph_seed_parent_pair_count) if args.proposal_method == "graph" else None
+        ),
         "proposal_seed_policy": "sha256_image_id_uint31_little_endian_v1",
         "local_evidence_weight": float(args.local_evidence_weight),
         "render_identity_rerank": bool(args.render_identity_rerank),
@@ -485,6 +547,7 @@ def main() -> None:
         "detector_radio_refine_topn": int(args.detector_radio_refine_topn),
         "alike_detector_only": bool(detector is not None),
         "typed_graph_sha256": graph.content_sha256 if graph is not None else None,
+        "physical_instance_readout_sha256": instance_readout_sha256,
         "maximum_modes": int(args.maximum_modes),
         "summary": summary,
         "rows": reports,

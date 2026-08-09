@@ -8,8 +8,15 @@ from pathlib import Path
 
 import numpy as np
 
-from feature_extract.vfm.localization_goal_maplet.canonical_field import CanonicalSurfaceField
+from feature_extract.vfm.localization_goal_maplet.canonical_field import (
+    CanonicalSurfaceField,
+    readout_canonical_field,
+)
+from feature_extract.vfm.localization_goal_maplet.lineage import file_sha256
 from feature_extract.vfm.localization_goal_maplet.physical_map import GoalMapletPhysicalMap
+from feature_extract.vfm.localization_goal_maplet.physical_instance_readout import (
+    load_physical_instance_readout,
+)
 from feature_extract.vfm.localization_goal_maplet.typed_graph import build_typed_parent_graph
 
 
@@ -18,6 +25,8 @@ def main() -> None:
     parser.add_argument("--contributors", required=True)
     parser.add_argument("--physical_map", required=True)
     parser.add_argument("--canonical_field", required=True)
+    parser.add_argument("--physical_instance_readout", default="")
+    parser.add_argument("--device", default="cuda")
     parser.add_argument("--output_graph", required=True)
     parser.add_argument("--summary_json", required=True)
     parser.add_argument("--exclude_trajectories", nargs="*", default=["seq11", "seq3", "seq5", "seq13"])
@@ -35,7 +44,34 @@ def main() -> None:
             item = json.loads(str(data["metadata_json"].item()))
         if str(item.get("trajectory_id", "")) not in excluded:
             paths.append(path)
-    graph = build_typed_parent_graph(physical, field, paths)
+    parent_descriptors = None
+    if args.physical_instance_readout:
+        model, metadata = load_physical_instance_readout(
+            Path(args.physical_instance_readout), device=str(args.device),
+        )
+        for key, expected in (
+            ("physical_map_sha256", physical.content_sha256),
+            ("canonical_field_sha256", field.content_sha256),
+        ):
+            if metadata.get(key) != expected:
+                raise ValueError(f"physical-instance readout lineage differs: {key}")
+        parent_descriptors = model.project_numpy(
+            readout_canonical_field(field, physical).parent_descriptors,
+            role="context", device=str(args.device),
+        )
+    graph = build_typed_parent_graph(
+        physical, field, paths, parent_descriptors=parent_descriptors,
+        metadata={
+            "physical_instance_readout_sha256": (
+                file_sha256(Path(args.physical_instance_readout))
+                if args.physical_instance_readout else None
+            ),
+            "parent_appearance_readout": (
+                "g17_siglip_distilled_context_head"
+                if args.physical_instance_readout else "canonical_mean"
+            ),
+        },
+    )
     graph.save_npz(output)
     type_count = {
         str(kind): int((graph.edge_type == kind).sum()) for kind in sorted(set(graph.edge_type.tolist()))

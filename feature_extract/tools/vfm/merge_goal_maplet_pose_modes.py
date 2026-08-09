@@ -22,10 +22,13 @@ def main() -> None:
     for key in (
         "stage", "physical_map_sha256", "canonical_field_sha256",
         "validity_calibration_sha256", "proposal_method", "maximum_modes",
+        "graph_seed_parent_pair_count",
         "typed_graph_sha256", "render_identity_rerank", "identity_render_mode",
-        "field_feature_contract_sha256", "proposal_seed_policy",
+        "field_feature_contract_sha256", "physical_instance_readout_sha256",
+        "proposal_seed_policy",
         "cascade_contract",
         "configuration_evidence_contract",
+        "surface_verification_contract",
     ):
         values = {json.dumps(item.get(key), sort_keys=True) for item in shards}
         if len(values) != 1:
@@ -60,10 +63,12 @@ def main() -> None:
         **{key: shards[0].get(key) for key in (
             "stage", "physical_map_sha256", "canonical_field_sha256",
             "validity_calibration_sha256", "proposal_method", "maximum_modes",
+            "graph_seed_parent_pair_count",
             "typed_graph_sha256", "render_identity_rerank", "identity_render_mode",
-            "field_feature_contract_sha256", "proposal_seed_policy",
+            "field_feature_contract_sha256", "physical_instance_readout_sha256",
+            "proposal_seed_policy",
             "cascade_contract", "detector_radio_refine_topn", "alike_detector_only",
-            "configuration_evidence_contract",
+            "configuration_evidence_contract", "surface_verification_contract",
         )},
         "query_count": len(rows),
         "shard_count": len(shards),

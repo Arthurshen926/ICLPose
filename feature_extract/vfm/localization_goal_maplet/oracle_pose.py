@@ -13,6 +13,12 @@ from .pfir import ContributorLabels, _primitive_to_maplet_links
 from .physical_map import GoalMapletPhysicalMap
 
 
+_ORACLE_PHYSICAL_INDEX_CACHE: dict[
+    int,
+    tuple[dict[int, int], np.ndarray, np.ndarray, np.ndarray, dict[tuple[int, int], int]],
+] = {}
+
+
 @dataclass(frozen=True)
 class TokenOracleEvidence:
     xy_px: np.ndarray
@@ -78,6 +84,25 @@ def _child_by_parent_primitive(physical: GoalMapletPhysicalMap) -> dict[tuple[in
     return result
 
 
+def _oracle_physical_indices(
+    physical: GoalMapletPhysicalMap,
+) -> tuple[dict[int, int], np.ndarray, np.ndarray, np.ndarray, dict[tuple[int, int], int]]:
+    """Cache immutable physical hierarchy indices across query images."""
+
+    # The physical object is immutable for its process lifetime.  Using its
+    # identity avoids re-hashing all ~500k primitive arrays for every image.
+    key = id(physical)
+    cached = _ORACLE_PHYSICAL_INDEX_CACHE.get(key)
+    if cached is None:
+        cached = (
+            {int(value): row for row, value in enumerate(physical.primitive_ids.tolist())},
+            *_primitive_to_maplet_links(physical),
+            _child_by_parent_primitive(physical),
+        )
+        _ORACLE_PHYSICAL_INDEX_CACHE[key] = cached
+    return cached
+
+
 def token_oracle_evidence(
     labels: ContributorLabels,
     physical: GoalMapletPhysicalMap,
@@ -93,9 +118,9 @@ def token_oracle_evidence(
 
     xy = np.asarray(token_xy, dtype=np.int64).reshape(-1, 2)
     height, width, topk = labels.topk_primitive_ids.shape
-    primitive_row_by_id = {int(value): row for row, value in enumerate(physical.primitive_ids.tolist())}
-    link_offsets, link_rows, link_weights = _primitive_to_maplet_links(physical)
-    child_by_key = _child_by_parent_primitive(physical)
+    (
+        primitive_row_by_id, link_offsets, link_rows, link_weights, child_by_key,
+    ) = _oracle_physical_indices(physical)
     count = xy.shape[0]
     clean_xyz = np.zeros((count, 3), dtype=np.float64)
     clean_mass = np.zeros((count,), dtype=np.float64)
