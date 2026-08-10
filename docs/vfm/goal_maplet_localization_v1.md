@@ -1532,6 +1532,71 @@ to place a one-metre candidate in the full pool for three seq12 queries and a
 strict candidate for five.  Top-K or phase-weight tuning cannot repair those
 failures.
 
+#### G20.3 candidate-coverage autopsy and configuration gate
+
+G20.3 freezes the two G20.1 folds and decomposes every query before adding a
+new Stage-B model.  It audits runtime parent/child recall, support topology,
+raw versus post-NMS proposals, oracle parent/child assignments and exact
+2DGS-surface geometry.  The resulting failure classification is unambiguous:
+
+| 17-query cross-fit event | strict | 1 m/10 deg |
+|---|---:|---:|
+| graph proposal, post-NMS | 70.59% (12/17) | 82.35% (14/17) |
+| parent-conditioned child fix | 70.59% (12/17) | 82.35% (14/17) |
+| same proposals before pose NMS (up to 65) | 70.59% (12/17) | 82.35% (14/17) |
+| oracle parent, runtime child readout | 88.24% (15/17) | **100% (17/17)** |
+| oracle parent and child | 88.24% (15/17) | **100% (17/17)** |
+
+All 17 queries pass the structural pose-sufficient parent and child recall
+gate.  A runtime-posterior-supported child-center oracle is within one metre
+on 16/17.  The three no-one-metre frames (`seq12/frame00139`, `00144`,
+`00155`) are therefore all classified as **B1 configuration inference**:
+the physical identities needed for a pose are present, but the independent
+pre-pose hard assignment does not assemble the correct physical phase.
+Neither B3 proposal retention nor a simple candidate-count shortage explains
+the tail.
+
+The support audit also rejects an indiscriminate G20.4 regrouping rewrite.
+Those three frames retain respectively 70, 135 and 173 truth-child-supported
+groups over 6, 7 and 9 image bins.  Their exact-surface bbox-center oracles
+reach 7.5, 11.7 and 4.5 cm translation, while contributor-weighted exact
+surface coordinates are at least as good.  In contrast, a child tile center
+can be tens or hundreds of pixels from a support center.  Thus current support
+topology is not what removes the coarse pose, although child centers remain an
+inadequate final observation and the eventual solver must marginalize a
+surface footprint.
+
+Two real implementation errors were repaired during the autopsy:
+
+1. disabling `local_evidence_weight` also disabled the already-computed
+   parent-conditioned child enumeration.  Enumeration and score weighting are
+   now independent;
+2. `_score_pose()` returned compact Top-96 child rows and a refinement caller
+   treated them as aligned to supports 0--95.  It now returns an explicit
+   full-support array, preventing silent 2D/3D index mismatch on the 442--832
+   group tail frames.
+
+The first fix is necessary for correct method semantics but produces no
+coverage gain, and the second does not alter the active graph generator's
+candidate ceiling.  Increasing graph pair seeds to 32, disabling NMS, a
+low-capacity covisibility beam and coherent physical-transport diagnostics
+all fail to recover the three B1 frames.  The failed beam/transport variants
+are not promoted into the production entry point.  This negative result is
+important: the current typed graph stores co-visibility strength and scalar
+distance, but the proposal does not preserve query-edge direction/order or a
+pose-conditioned child mixture.  A larger beam over the same unary and
+Jaccard factors is therefore not a principled solution.
+
+Replaying the fixed conditioned candidate pool with the parameter-free
+directional Stage C gives 0.329 m median, 5.868 m P90, 64.71% strict and
+82.35% within one metre; all three catastrophes are exactly the B1 frames.
+The score metadata now correctly records a parameter-free analytic operator.
+G21 remains closed.  The next Stage-B implementation gate is a fixed Top-32,
+assignment-diverse physical configuration generator whose pair factors retain
+query displacement/order and whose child likelihood is marginalized under
+pose; only after it raises candidate coverage should projected-tile
+region-to-surface refinement be evaluated.
+
 ## Development-set result
 
 The best deployable Goal-Maplet Top-1 remains the frozen graph v9 result, not
@@ -1680,6 +1745,10 @@ not an unsupported claim that VFM regions directly yield centimetre pose.
 - G20.1 fold-local maps/readouts/evidence: `goal_maplet/map_crossfit_g20_1/hold_seq12`, `goal_maplet/map_crossfit_g20_1/hold_seq14`
 - G20.1 merged operator decision: `goal_maplet/map_crossfit_g20_1/phase_operator_evaluation_merged.json`
 - G20.1 typed outer-feature-cross-fit basins: `goal_maplet/map_crossfit_g20_1/directional_basin_merged.json`, `goal_maplet/map_crossfit_g20_1/jacobian_basin_merged.json`
+- G20.3 merged candidate-coverage autopsy: `goal_maplet/map_crossfit_g20_1/candidate_coverage_autopsy_g20_3_merged.json`
+- G20.3 fixed conditioned/pre-NMS/oracle ladders: `goal_maplet/map_crossfit_g20_1/hold_seq{12,14}/candidate_pool_conditioned_child_g20_3.json`, `candidate_pool_conditioned_child_pre_nms_g20_3.json`, `candidate_pool_oracle_ladder_g20_3.json`
+- G20.3 corrected parameter-free Stage-C replays: `goal_maplet/map_crossfit_g20_1/hold_seq{12,14}/directional_report_conditioned_child_g20_3.json`
+- G20.3 lineaged decision: `goal_maplet/map_crossfit_g20_1/g20_3_candidate_coverage_decision.json`
 - rejected teacher-weighted field/readout: `goal_maplet/canonical_surface_field_teacher_g17_v3.npz`, `goal_maplet/physical_instance_readout_teacher_g17_v3.pt`
 - rejected conditional rank: `goal_maplet/pose_modes_graph_conditionalrank_dev48_v17.json`
 - 4x GT round-trip audit: `goal_maplet/surface_basin_radio_pca256_supersample4_oracle_smoke_gt1round_v4.json`

@@ -43,6 +43,39 @@ def _rotation_distance_degrees(left: np.ndarray, right: np.ndarray) -> float:
     return float(np.degrees(np.arccos(cosine)))
 
 
+def _select_child_for_parent(
+    posterior: ChildTilePosterior,
+    physical: GoalMapletPhysicalMap,
+    *,
+    support: int,
+    parent_slot: int,
+    parent_row: int,
+    parent_probability: float,
+) -> tuple[int, float]:
+    """Enumerate a parent-conditioned child independently of score weights."""
+
+    if posterior.best_child_rows_by_parent is not None:
+        child = int(posterior.best_child_rows_by_parent[support, parent_slot])
+        if child < 0:
+            return -1, 0.0
+        if int(physical.child_parent_rows[child]) != int(parent_row):
+            raise ValueError("parent-conditioned child belongs to another parent")
+        return child, float(
+            parent_probability
+            * posterior.best_child_probabilities_by_parent[support, parent_slot]
+        )
+    rows = posterior.candidate_child_rows[support]
+    probability = posterior.candidate_probabilities[support]
+    valid = rows >= 0
+    selected = np.flatnonzero(
+        valid & (physical.child_parent_rows[np.maximum(rows, 0)] == int(parent_row))
+    )
+    if selected.size == 0:
+        return -1, 0.0
+    slot = int(selected[np.argmax(probability[selected])])
+    return int(rows[slot]), float(probability[slot])
+
+
 def _project(points: np.ndarray, pose: np.ndarray, camera: ColmapCamera) -> tuple[np.ndarray, np.ndarray]:
     matrix, distortion = camera_matrix_and_distortion(camera)
     rotation, _ = cv2.Rodrigues(np.asarray(pose[:3, :3], dtype=np.float64))
@@ -71,7 +104,7 @@ def _score_pose(
     probability = posterior.candidate_probabilities[selected_regions, : int(maximum_children)].astype(np.float64)
     valid = (rows >= 0) & (probability > 0.0)
     if not np.any(valid):
-        return float("-inf"), 0, np.full((selected_regions.size,), -1, dtype=np.int64)
+        return float("-inf"), 0, np.full((xy.shape[0],), -1, dtype=np.int64)
     safe_rows = np.maximum(rows, 0)
     flat_xy, flat_depth = _project(physical.child_centers[safe_rows.reshape(-1)], pose, camera)
     projected = flat_xy.reshape(rows.shape + (2,))
@@ -95,8 +128,10 @@ def _score_pose(
     score = float(np.sum(weight * np.log(np.maximum(region_likelihood, floor))) / np.sum(weight))
     best_slot = np.argmax(likelihood, axis=1)
     best_rows = rows[np.arange(rows.shape[0]), best_slot]
+    aligned_best_rows = np.full((xy.shape[0],), -1, dtype=np.int64)
+    aligned_best_rows[selected_regions] = best_rows
     support = int(np.sum(region_likelihood > np.maximum(floor, 1e-4)))
-    return score, support, best_rows
+    return score, support, aligned_best_rows
 
 
 def _refine_region_mode(
@@ -263,6 +298,8 @@ def generate_graph_conditioned_pose_modes(
     local_evidence_weight: float = 1.0,
     ransac_reprojection_px: float = 32.0,
     ransac_iterations: int = 6000,
+    translation_nms_m: float = 0.20,
+    rotation_nms_deg: float = 3.0,
     random_seed: int = 194917,
 ) -> CoarsePoseModes:
     """Build coherent parent modes, then solve robust child-region factors.
@@ -291,31 +328,26 @@ def generate_graph_conditioned_pose_modes(
         for slot in range(parent_ids.shape[1]):
             candidate_rows[support, slot] = row_by_id.get(int(parent_ids[support, slot]), -1)
     valid_parent = (candidate_rows >= 0) & (parent_probability > 0.0)
-    conditioned_child = (
-        child_posterior.conditional_parent_ids is not None
-        and float(local_evidence_weight) > 0.0
-    )
+    conditioned_child = child_posterior.conditional_parent_ids is not None
+    uses_local_evidence_score = conditioned_child and float(local_evidence_weight) > 0.0
     if conditioned_child:
         conditional_parent_ids = np.asarray(child_posterior.conditional_parent_ids, dtype=np.int64)
         if conditional_parent_ids.shape != parent_ids.shape or not np.array_equal(
             conditional_parent_ids, parent_ids
         ):
             raise ValueError("parent-conditioned child evidence is not aligned to parent candidates")
-        local_evidence = np.asarray(
-            child_posterior.conditional_parent_log_evidence, dtype=np.float64
-        ).copy()
-        finite = np.isfinite(local_evidence) & valid_parent
-        # Cosine/temperature logits are not calibrated LLRs and can be an
-        # order of magnitude larger than the context and graph factors.  Use
-        # a per-support standardized contrast across the same parent set;
-        # this preserves rank while giving the factor an explicit unit scale.
-        for support in range(local_evidence.shape[0]):
-            values = local_evidence[support, finite[support]]
-            if values.size:
-                center = float(np.mean(values))
-                scale = max(float(np.std(values)), 1e-4)
-                local_evidence[support, finite[support]] = (values - center) / scale
-            local_evidence[support, ~finite[support]] = -1e4
+        if uses_local_evidence_score:
+            local_evidence = np.asarray(
+                child_posterior.conditional_parent_log_evidence, dtype=np.float64
+            ).copy()
+            finite = np.isfinite(local_evidence) & valid_parent
+            for support in range(local_evidence.shape[0]):
+                values = local_evidence[support, finite[support]]
+                if values.size:
+                    center = float(np.mean(values))
+                    scale = max(float(np.std(values)), 1e-4)
+                    local_evidence[support, finite[support]] = (values - center) / scale
+                local_evidence[support, ~finite[support]] = -1e4
     global_mass = np.zeros((physical.maplet_ids.size,), dtype=np.float64)
     np.add.at(global_mass, candidate_rows[valid_parent], parent_probability[valid_parent])
     seeds = np.argsort(-global_mass, kind="stable")[: int(seed_parent_count)]
@@ -357,7 +389,7 @@ def generate_graph_conditioned_pose_modes(
             compatibility[candidate_rows < 0] = 0.0
         assignment_score = np.log(np.maximum(parent_probability, 1e-12))
         assignment_score += float(covisibility_weight) * np.log(np.maximum(compatibility, 1e-8))
-        if conditioned_child:
+        if uses_local_evidence_score:
             assignment_score += float(local_evidence_weight) * local_evidence
         assignment_score[~valid_parent] = -np.inf
         chosen_slot = np.argmax(assignment_score, axis=1)
@@ -369,26 +401,17 @@ def generate_graph_conditioned_pose_modes(
             parent = int(chosen_parent[support])
             if parent < 0 or not np.isfinite(chosen_parent_score[support]):
                 continue
-            if conditioned_child:
-                slot = int(chosen_slot[support])
-                child = int(child_posterior.best_child_rows_by_parent[support, slot])
-                if child >= 0:
-                    child_rows[support] = child
-                    child_probability[support] = float(
-                        parent_probability[support, slot]
-                        * child_posterior.best_child_probabilities_by_parent[support, slot]
-                    )
-                continue
-            rows = child_posterior.candidate_child_rows[support]
-            probability = child_posterior.candidate_probabilities[support]
-            valid = rows >= 0
-            if not np.any(valid):
-                continue
-            selected = np.flatnonzero(valid & (physical.child_parent_rows[np.maximum(rows, 0)] == parent))
-            if selected.size:
-                slot = int(selected[np.argmax(probability[selected])])
-                child_rows[support] = int(rows[slot])
-                child_probability[support] = float(probability[slot])
+            slot = int(chosen_slot[support])
+            child, probability = _select_child_for_parent(
+                child_posterior,
+                physical,
+                support=support,
+                parent_slot=slot,
+                parent_row=parent,
+                parent_probability=float(parent_probability[support, slot]),
+            )
+            child_rows[support] = child
+            child_probability[support] = probability
         selected = np.flatnonzero(
             (child_rows >= 0) & (child_probability > 0.0) & (parent_null < 0.98)
         )
@@ -431,8 +454,10 @@ def generate_graph_conditioned_pose_modes(
     for candidate in candidates:
         center = -candidate[2][:3, :3].T @ candidate[2][:3, 3]
         if any(
-            np.linalg.norm(center - (-other[2][:3, :3].T @ other[2][:3, 3])) < 0.20
-            and _rotation_distance_degrees(candidate[2], other[2]) < 3.0
+            np.linalg.norm(center - (-other[2][:3, :3].T @ other[2][:3, 3]))
+            < float(translation_nms_m)
+            and _rotation_distance_degrees(candidate[2], other[2])
+            < float(rotation_nms_deg)
             for other in retained
         ):
             continue

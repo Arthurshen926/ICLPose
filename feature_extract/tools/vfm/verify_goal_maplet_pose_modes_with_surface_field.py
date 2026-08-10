@@ -724,7 +724,12 @@ def main() -> None:
                         "orientation_equivariant_conditional_mapper_phase_only"
                         if phase_policy.metadata.get("artifact_type")
                         == "goal_maplet_phase_readout_policy_v2"
-                        else "learned_directional_mapper_phase_only"
+                        else (
+                            "parameter_free_directional_mapper_phase_only"
+                            if phase_policy.metadata.get("operator_parameter_source")
+                            == "analytic_parameter_free"
+                            else "learned_directional_mapper_phase_only"
+                        )
                     )
                     if phase_policy is not None
                     else "fixed_full_query_grid_mean_cosine"

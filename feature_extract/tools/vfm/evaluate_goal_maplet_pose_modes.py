@@ -137,6 +137,8 @@ def main() -> None:
     parser.add_argument("--proposal_method", choices=("random", "graph", "hierarchical"), default="graph")
     parser.add_argument("--graph_seed_parent_pair_count", type=int, default=0)
     parser.add_argument("--local_evidence_weight", type=float, default=0.0)
+    parser.add_argument("--translation_nms_m", type=float, default=0.20)
+    parser.add_argument("--rotation_nms_deg", type=float, default=3.0)
     parser.add_argument("--render_identity_rerank", action="store_true")
     parser.add_argument("--identity_render_mode", choices=("child_splat", "full_2dgs", "cascade"), default="child_splat")
     parser.add_argument("--cascade_topk", type=int, default=4)
@@ -153,6 +155,7 @@ def main() -> None:
     parser.add_argument("--shard_index", type=int, default=0)
     parser.add_argument("--shard_count", type=int, default=1)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--quiet_rows", action="store_true")
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
     output = Path(args.output_json)
@@ -358,6 +361,8 @@ def main() -> None:
                         {
                             "local_evidence_weight": float(args.local_evidence_weight),
                             "seed_parent_pair_count": int(args.graph_seed_parent_pair_count),
+                            "translation_nms_m": float(args.translation_nms_m),
+                            "rotation_nms_deg": float(args.rotation_nms_deg),
                         }
                         if args.proposal_method == "graph" else {}
                     ),
@@ -504,7 +509,8 @@ def main() -> None:
             "ranking_diagnostics": ranking_diagnostics,
         }
         reports.append(report)
-        print(json.dumps(report), flush=True)
+        if not bool(args.quiet_rows):
+            print(json.dumps(report), flush=True)
     mode_names = sorted({name for row in reports for name in row["modes"]})
     metric_names = sorted({name for row in reports for mode in row["modes"].values() for name in mode})
     summary = {}
@@ -535,6 +541,9 @@ def main() -> None:
         ),
         "proposal_seed_policy": "sha256_image_id_uint31_little_endian_v1",
         "local_evidence_weight": float(args.local_evidence_weight),
+        "parent_conditioned_child_enumeration": True,
+        "translation_nms_m": float(args.translation_nms_m),
+        "rotation_nms_deg": float(args.rotation_nms_deg),
         "render_identity_rerank": bool(args.render_identity_rerank),
         "identity_render_mode": str(args.identity_render_mode),
         "cascade_contract": {

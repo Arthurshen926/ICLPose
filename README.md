@@ -258,6 +258,22 @@ an additive reward.  This is feature-pipeline cross-fit only: the clean 2DGS
 geometry was not rebuilt per fold and no optimizer convergence test was run,
 so production/paper promotion and G21 remain closed.
 
+G20.3 now completes the requested candidate-coverage autopsy.  Parent- and
+child-pose-sufficient physical recall is structurally adequate on all 17
+queries, but the active proposal reaches only 12/17 strict and 14/17 within
+one metre; an oracle parent configuration with the unchanged runtime child
+readout reaches 15/17 and 17/17.  The three no-one-metre seq12 frames are all
+configuration-inference failures, not NMS or missing-geometry failures.
+Exact 2DGS-surface support oracles on them are at 4.5--11.7 cm.  Candidate
+enumeration is now independent of the local-evidence score weight, and a
+Top-96/full-support refinement indexing bug is fixed.  Larger raw pools,
+32 pair seeds and low-capacity configuration diagnostics do not recover the
+tail, so none is promoted.  The fixed parameter-free Stage-C replay is
+0.329 m median but 5.868 m P90, with all three catastrophes explained by the
+same upstream B1 failures.  The next admissible Stage-B change must preserve
+query displacement/order and pose-conditioned child mixtures under a fixed
+Top-32 budget; further phase or graph-weight tuning remains stopped.
+
 ## Frozen V6 Status
 
 See [the V6 mainline](docs/vfm/2dgs_maplet_atlas_localization_v6.md) for its
