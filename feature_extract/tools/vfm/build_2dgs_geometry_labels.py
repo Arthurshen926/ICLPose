@@ -23,15 +23,37 @@ from feature_extract.vfm.vfm_2dgs_mapping import SurfaceElementMap, _normalize_v
 
 def _render_surface_from_ply(
     gaussian_ply: Path,
+    clean_membership_ply: Path | None = None,
     max_gaussians: int = 0,
     min_opacity: float = 0.0,
     max_scale: float = 0.0,
 ) -> SurfaceElementMap:
-    source = load_gaussian_vfm_source_from_ply(Path(gaussian_ply), max_gaussians=int(max_gaussians))
-    keep = np.asarray(source.opacity, dtype=np.float32) >= float(min_opacity)
+    # Geometry must come from the full oriented 2DGS.  A cleaned PLY may only
+    # provide membership via source_index; it is not allowed to replace the
+    # missing rotations/scales with isotropic points.
+    source = load_gaussian_vfm_source_from_ply(Path(gaussian_ply), max_gaussians=0)
+    if source.rotation is None or source.normal is None:
+        raise ValueError(
+            "geometry labels require an oriented 2DGS PLY with rotation/normal; "
+            "pass a clean point PLY through --clean_membership_ply instead"
+        )
+    if clean_membership_ply is not None:
+        membership = load_gaussian_vfm_source_from_ply(
+            Path(clean_membership_ply), max_gaussians=int(max_gaussians),
+        )
+        rows = np.asarray(membership.gaussian_indices, dtype=np.int64)
+        if np.any(rows < 0) or np.any(rows >= source.xyz.shape[0]):
+            raise ValueError("clean membership source_index is outside the oriented 2DGS")
+        if not np.allclose(membership.xyz, source.xyz[rows], rtol=0.0, atol=1e-6):
+            raise ValueError("clean membership xyz does not match oriented 2DGS source_index")
+    else:
+        rows = np.arange(source.xyz.shape[0], dtype=np.int64)
+        if int(max_gaussians) > 0:
+            rows = rows[: int(max_gaussians)]
+    keep = np.asarray(source.opacity, dtype=np.float32)[rows] >= float(min_opacity)
     if float(max_scale) > 0.0:
-        keep &= np.asarray(source.scale, dtype=np.float32) <= float(max_scale)
-    rows = np.flatnonzero(keep)
+        keep &= np.asarray(source.scale, dtype=np.float32)[rows] <= float(max_scale)
+    rows = rows[keep]
     centers = np.asarray(source.xyz, dtype=np.float64)[rows]
     normals = (
         np.asarray(source.normal, dtype=np.float32)[rows]
@@ -55,6 +77,9 @@ def _render_surface_from_ply(
         adjacency=(),
         metadata={
             "gaussian_ply": str(gaussian_ply),
+            "clean_membership_ply": (
+                None if clean_membership_ply is None else str(clean_membership_ply)
+            ),
             "source_gaussian_count": int(source.xyz.shape[0]),
             "surface_element_count": int(rows.size),
             "min_opacity": float(min_opacity),
@@ -143,6 +168,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--token_manifest", required=True)
     parser.add_argument("--pose_file", required=True)
     parser.add_argument("--gaussian_ply", required=True)
+    parser.add_argument("--clean_membership_ply", default="")
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--camera_model_dir", default="")
     parser.add_argument("--default_camera", default="2,1024,576,883.0,512.0,288.0,0.0")
@@ -182,6 +208,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     width, height = _render_size(camera, int(args.max_long_edge), int(args.render_width), int(args.render_height))
     surface = _render_surface_from_ply(
         Path(args.gaussian_ply),
+        clean_membership_ply=(
+            Path(args.clean_membership_ply) if args.clean_membership_ply else None
+        ),
         max_gaussians=int(args.max_gaussians),
         min_opacity=float(args.surface_min_opacity),
         max_scale=float(args.surface_max_scale),

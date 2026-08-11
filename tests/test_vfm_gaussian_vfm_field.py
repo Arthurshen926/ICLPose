@@ -220,6 +220,23 @@ def test_load_gaussian_vfm_source_handles_2dgs_two_scale_geometry(tmp_path):
     np.testing.assert_allclose(np.abs(source.normal[0]), np.asarray([0.0, 0.0, 1.0], dtype=np.float32), atol=1e-6)
 
 
+def test_load_gaussian_vfm_source_preserves_clean_source_indices(tmp_path):
+    source_ply = tmp_path / "clean_membership.ply"
+    dtype = [
+        ("x", "f4"), ("y", "f4"), ("z", "f4"),
+        ("opacity", "f4"), ("maximum_scale", "f4"),
+        ("source_index", "i4"),
+    ]
+    rows = np.zeros((2,), dtype=dtype)
+    rows["z"] = 1.0
+    rows["source_index"] = [7, 19]
+    PlyData([PlyElement.describe(rows, "vertex")]).write(source_ply)
+
+    source = load_gaussian_vfm_source_from_ply(source_ply)
+
+    assert source.gaussian_indices.tolist() == [7, 19]
+
+
 def test_export_gaussian_vfm_field_to_ply_preserves_gaussian_rows_and_writes_loc_features(tmp_path):
     source_ply = tmp_path / "gaussians.ply"
     output_ply = tmp_path / "gaussians_loc.ply"

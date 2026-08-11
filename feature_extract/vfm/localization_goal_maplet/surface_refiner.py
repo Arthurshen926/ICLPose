@@ -43,6 +43,85 @@ def canonical_alignment_score(rendered, query_feature: np.ndarray) -> float:
     return float(np.sum(positive[valid]) / float(valid.size))
 
 
+def dense_scale_invariant_geometry_evidence(
+    rendered,
+    pose_w2c: np.ndarray,
+    query_depth: np.ndarray,
+    query_normal_cam: np.ndarray,
+    query_confidence: np.ndarray,
+    *,
+    minimum_confidence: float = 0.05,
+    log_depth_sigma: float = 0.20,
+) -> dict[str, float | int | None]:
+    """Score a rendered 2DGS pose against VFM-derived dense geometry.
+
+    A single robust depth scale is marginalized per query.  Coverage uses a
+    fixed denominator over every geometry-confident query cell, preventing a
+    pose from winning by rendering only an easy subset.  2DGS normals are
+    treated as unoriented tangent-plane normals.
+    """
+
+    depth = np.asarray(query_depth, dtype=np.float64)
+    normal = np.asarray(query_normal_cam, dtype=np.float64)
+    confidence = np.asarray(query_confidence, dtype=np.float64)
+    rendered_depth = np.asarray(rendered.depth, dtype=np.float64)
+    rendered_normal = np.asarray(rendered.normal, dtype=np.float64)
+    rendered_mask = np.asarray(rendered.mask, dtype=bool)
+    if (
+        depth.ndim != 2
+        or confidence.shape != depth.shape
+        or normal.shape != depth.shape + (3,)
+        or rendered_depth.shape != depth.shape
+        or rendered_mask.shape != depth.shape
+        or rendered_normal.shape != normal.shape
+    ):
+        raise ValueError("dense query and rendered geometry differ")
+    query_valid = (
+        np.isfinite(depth) & (depth > 0.05)
+        & np.isfinite(confidence) & (confidence >= float(minimum_confidence))
+        & np.all(np.isfinite(normal), axis=2)
+    )
+    fixed_denominator = float(np.sum(confidence[query_valid]))
+    valid = query_valid & rendered_mask & np.isfinite(rendered_depth) & (rendered_depth > 0.05)
+    if not np.any(valid) or fixed_denominator <= 0.0:
+        return {
+            "score": None,
+            "depth_score": None,
+            "normal_score": None,
+            "coverage": 0.0,
+            "scale": None,
+            "valid_count": 0,
+        }
+    weight = confidence[valid]
+    log_ratio = np.log(depth[valid]) - np.log(rendered_depth[valid])
+    log_scale = float(np.median(log_ratio))
+    residual = log_ratio - log_scale
+    depth_numerator = float(np.sum(
+        weight * np.exp(-0.5 * np.square(residual / max(float(log_depth_sigma), 1e-6)))
+    ))
+
+    rotation = np.asarray(pose_w2c, dtype=np.float64).reshape(4, 4)[:3, :3]
+    map_normal_camera = rendered_normal[valid] @ rotation.T
+    map_normal_camera /= np.maximum(
+        np.linalg.norm(map_normal_camera, axis=1, keepdims=True), 1e-8,
+    )
+    query_normal = normal[valid]
+    query_normal /= np.maximum(np.linalg.norm(query_normal, axis=1, keepdims=True), 1e-8)
+    cosine = np.abs(np.sum(map_normal_camera * query_normal, axis=1))
+    normal_numerator = float(np.sum(weight * np.clip(cosine, 0.0, 1.0)))
+    depth_score = depth_numerator / fixed_denominator
+    normal_score = normal_numerator / fixed_denominator
+    coverage = float(np.sum(weight) / fixed_denominator)
+    return {
+        "score": float(0.8 * depth_score + 0.2 * normal_score),
+        "depth_score": float(depth_score),
+        "normal_score": float(normal_score),
+        "coverage": coverage,
+        "scale": float(np.exp(log_scale)),
+        "valid_count": int(np.sum(valid)),
+    }
+
+
 def apply_local_readout(
     query_feature: np.ndarray,
     field: CanonicalSurfaceField,

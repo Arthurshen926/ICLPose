@@ -274,6 +274,82 @@ same upstream B1 failures.  The next admissible Stage-B change must preserve
 query displacement/order and pose-conditioned child mixtures under a fixed
 Top-32 budget; further phase or graph-weight tuning remains stopped.
 
+G20.5 implements that change with a cross-fit RADIO geometry head and a
+scale-marginalized three-region configuration/pose beam (no PnP or point
+correspondences).  On the 17-query outer-fold audit, fixed Top-32 coverage
+improves from 14/17 to 15/17 within 1 m/10 degrees and from 12/17 to 13/17 at
+0.5 m/5 degrees.  The unchanged Stage C improves strict Top-1 from 11/17 to
+12/17 and translation P90 from 5.868 m to 3.552 m, but remains 14/17 within
+1 m because one newly recovered mode is misranked.  Dense scale-invariant
+RADIO-depth/normal versus rendered-2DGS evidence identifies that mode on the
+key frame, but pure geometry reranking regresses the full set and remains an
+audit pending query-disjoint fusion calibration.  The map still stores one
+canonical RADIO field, no downstream embeddings and no mapping RGB.
+
+G20.6 completes the map/query/head-disjoint fusion calibration instead of
+tuning on that key frame.  Dense geometry receives positive weights in the
+inner LOTO fits but gives no outer-fold success gain and worsens the combined
+translation/rotation tail, so it is rejected.  A smaller phase+fractional-
+observation reliability posterior improves strict Stage-C success from 12/17
+to **13/17** with no lost query, while preserving 14/17 within 1 m/10 degrees,
+2/17 catastrophic failures and 0.318/3.552 m median/P90.  It passes the
+development gate but not production: seq12 00139/00155 still lack a valid
+candidate and no untouched test has run.  A two-seed mapping-only audit also
+shows that higher-fidelity signed sketches of DINO/SAM/SigLIP teachers do not
+beat the frozen G17 readout, so the deployed map remains exactly one canonical
+RADIO-derived primitive field.  The runtime verifier has replayed the selected
+policy without loading a dense head, downstream embedding, mapping RGB, point
+correspondence or PnP.
+
+G20.7 isolates the remaining upstream failure without widening the production
+beam.  A new experimental `soft_geometry` route marginalizes probability mass
+over physical-phase anchors and `8 parent x 4 child` surface alternatives from
+the same single canonical VFM field.  It also fixes typed-null Stage-C fitting,
+development-policy fail-closed replay and the pair-beam look-elsewhere bias.
+Oracle-parent controls recover seq12 frame00139 at 0.303 m/1.966 degrees and a
+frame00155 Top-16 mode at 0.449 m/1.437 degrees, proving the cross-fit RADIO
+geometry proposal is adequate.  Actual phase marginalization creates four
+one-metre seeds for frame00139 (best 0.967 m/8.119 degrees), but frame00155
+remains uncovered.  An exhaustive bounded 6,232-pose frame00139 audit retains
+those seeds yet the current retrieval-posterior surrogate likelihood ranks
+none in Top-32, including after mass-conserving parent/child marginalization.
+The route is therefore not promoted and the full fold replay is stopped at the
+candidate-ranking gate.  The next method requirement is batched
+pose-conditioned canonical-VFM feature-map likelihood on sparse/disconnected
+rendered maplet regions, not another scalar weight, beam or stored embedding.
+
+G20.8 implements that likelihood and separates two roles that must not be
+conflated. Batched projection of all 509,572 clean-2DGS primitive centres
+provides a fast pose-conditioned fixed-grid VFM score from the sole canonical
+map field. As a replacement proposal ranker it is rejected: under the same
+2x/context Stage-C protocol the new pool does not raise the 17-query success
+ceiling, and direct old/new score fusion regresses. As a bounded continuous
+objective it is useful. A correspondence-free SE(3) coordinate trust region,
+enabled only by a two-feature risk gate (same-query posterior peak and phase
+Top-2 margin), passes seq3/seq5/seq13 trajectory LOTO: strict success rises
+from 8/12 to 9/12 with 12/12 retained within 1 m and no catastrophe. Frozen
+replay on seq12/seq14 then preserves **13/17** strict and improves 1 m/10
+degree success from **14/17 to 15/17**, translation P90 from 3.552 m to
+3.365 m and rotation median from 1.246 to 1.171 degrees. The two catastrophic
+queries remain, so this is a development improvement rather than an untouched
+production claim. It stores no second feature field, downstream embedding or
+RGB and uses neither PnP nor point correspondences.
+
+G21 adds the higher-order relation that was still missing: calibrated mapping
+poses connected to sparse physical-maplet visibility, with no retained image
+identity, RGB or feature tensor. Structural anchors generate alternative
+camera states without query/map feature interaction; a hierarchical full-map
+primitive-VFM screen and the existing continuous alignment then evaluate
+them. A replay bug that substituted proposal rank one for the deployed G20.6
+likelihood state is fixed and guarded by lineage tests. On the same frozen
+17-query development replay, the protected state union changes exactly one
+pose: seq12 frame00155 improves from 13.172 m/29.150 degrees to
+0.470 m/2.168 degrees. Aggregate success is now **14/17** strict and
+**16/17** within 1 m/10 degrees, with one catastrophe; translation/rotation
+P90 improve to **0.805 m/3.731 degrees**. Frame00139 still lacks a one-metre
+generated state, and the typed-null threshold still requires map-fold
+cross-calibration plus untouched testing before production/paper promotion.
+
 ## Frozen V6 Status
 
 See [the V6 mainline](docs/vfm/2dgs_maplet_atlas_localization_v6.md) for its
@@ -332,6 +408,12 @@ stored embedding, as the next required research module.
 - `feature_extract/tools/vfm/create_goal_maplet_phase_policy_v2.py`
 - `feature_extract/tools/vfm/audit_goal_maplet_phase_basin.py`
 - `feature_extract/tools/vfm/fit_evaluate_goal_maplet_conditional_energy.py`
+- `feature_extract/tools/vfm/fit_evaluate_goal_maplet_joint_phase_geometry.py`
+- `feature_extract/tools/vfm/audit_goal_maplet_teacher_compression.py`
+- `feature_extract/tools/vfm/summarize_goal_maplet_g20_6.py`
+- `feature_extract/tools/vfm/refine_goal_maplet_pose_modes_with_primitive_vfm.py`
+- `feature_extract/tools/vfm/fit_goal_maplet_primitive_refinement_gate.py`
+- `feature_extract/tools/vfm/evaluate_goal_maplet_primitive_refinement_gate.py`
 - `feature_extract/tools/vfm/summarize_goal_maplet_g20.py`
 - `feature_extract/tools/vfm/evaluate_goal_maplet_surface_basin.py`
 - `feature_extract/tools/vfm/build_goal_maplet_feature_contract.py`

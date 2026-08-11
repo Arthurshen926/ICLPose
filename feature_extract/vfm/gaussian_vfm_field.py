@@ -373,7 +373,14 @@ def load_gaussian_vfm_source_from_ply(path: Path, max_gaussians: int = 0) -> Gau
     vertex = PlyData.read(Path(path)).elements[0]
     row_count = int(vertex.count)
     limit = row_count if max_gaussians <= 0 else min(int(max_gaussians), row_count)
-    indices = np.arange(limit, dtype=np.int64)
+    # Cleaned derivative PLYs retain the row identity of the original 2DGS in
+    # ``source_index``.  Treating those rows as a new 0..N index silently
+    # breaks primitive lineage and prevents recovery of the original oriented
+    # Gaussian geometry.
+    if "source_index" in vertex.data.dtype.names:
+        indices = np.asarray(vertex["source_index"], dtype=np.int64)[:limit]
+    else:
+        indices = np.arange(limit, dtype=np.int64)
     xyz = np.stack(
         [
             np.asarray(vertex["x"], dtype=np.float64)[:limit],

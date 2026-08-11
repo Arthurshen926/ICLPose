@@ -18,6 +18,14 @@ from feature_extract.vfm.localization_goal_maplet.feature_contract import FieldF
 from feature_extract.vfm.localization_goal_maplet.child_retrieval import ChildTilePosterior, retrieve_children_given_parents
 from feature_extract.vfm.localization_goal_maplet.detector_radio_refiner import refine_pose_with_detector_radio
 from feature_extract.vfm.localization_goal_maplet.local_head import load_child_local_head
+from feature_extract.vfm.localization_goal_maplet.joint_pose_proposal import (
+    generate_joint_configuration_pose_modes,
+)
+from feature_extract.vfm.localization_goal_maplet.geometry_guided_pose_proposal import (
+    generate_geometry_guided_configuration_pose_modes,
+    scale_invariant_configuration_geometry,
+    unproject_query_depth,
+)
 from feature_extract.vfm.localization_goal_maplet.pfir import (
     ContributorLabels,
     contributor_multiscale_child_distribution,
@@ -30,6 +38,11 @@ from feature_extract.vfm.localization_goal_maplet.physical_instance_readout impo
     transform_canonical_field_for_role,
 )
 from feature_extract.vfm.localization_goal_maplet.lineage import file_sha256
+from feature_extract.vfm.localization_goal_maplet.mapping_view_graph import (
+    MappingViewGraph,
+    mapping_view_pose_modes,
+    retrieve_mapping_view_posterior,
+)
 from feature_extract.vfm.localization_goal_maplet.pose_proposal import (
     generate_graph_conditioned_pose_modes,
     generate_parent_then_child_pose_modes,
@@ -42,14 +55,25 @@ from feature_extract.vfm.localization_goal_maplet.pose_ranking import (
 )
 from feature_extract.vfm.localization_goal_maplet.query_support import (
     aggregate_group_descriptors,
-    aggregate_group_posteriors,
+    aggregate_group_sparse_posteriors,
     all_token_coordinates,
     group_tokens_after_retrieval,
+    group_tokens_identity_free,
 )
-from feature_extract.vfm.localization_goal_maplet.retrieval import ValidityCalibration, retrieve_maplet_posterior
+from feature_extract.vfm.localization_goal_maplet.retrieval import (
+    ValidityCalibration,
+    retrieve_maplet_posterior_decomposed,
+)
+from feature_extract.vfm.localization_goal_maplet.structured_parent_posterior import (
+    refine_parent_posteriors_with_query_graph,
+)
 from feature_extract.vfm.localization_goal_maplet.typed_graph import TypedParentGraph
 from feature_extract.vfm.query_to_3d_matching import pnp_pose_error
 from feature_extract.vfm.surface_maplet_bank import RadioFinalRegionConfig, encode_radio_final_regions
+from feature_extract.vfm.vfm_highres_geometry_head import (
+    load_radio_highres_geometry_head,
+    predict_radio_geometry_at_normalized_xy,
+)
 
 
 def _camera(path: Path) -> ColmapCamera:
@@ -96,7 +120,7 @@ def _pose_details(modes, gt_pose: np.ndarray) -> list[dict[str, object]]:
     ):
         error = pnp_pose_error(pose, gt_pose)
         center = -pose[:3, :3].T @ pose[:3, 3]
-        result.append({
+        detail = {
             "rank": int(rank),
             "score": float(score),
             "supporting_region_count": int(support),
@@ -104,7 +128,31 @@ def _pose_details(modes, gt_pose: np.ndarray) -> list[dict[str, object]]:
             "rotation_deg": float(error.rotation_deg),
             "camera_center": center.tolist(),
             "pose_w2c": pose.tolist(),
-        })
+        }
+        if modes.configuration_parent_rows is not None:
+            parent = modes.configuration_parent_rows[rank - 1]
+            child = modes.configuration_child_rows[rank - 1]
+            signature = hashlib.sha256(
+                np.asarray(parent, dtype="<i8").tobytes()
+                + np.asarray(child, dtype="<i8").tobytes()
+            ).hexdigest()
+            detail.update({
+                "configuration_signature_sha256": signature,
+                "configuration_parent_rows": parent.tolist(),
+                "configuration_child_rows": child.tolist(),
+                "configuration_assigned_support_count": int(np.sum(child >= 0)),
+                "configuration_unique_parent_count": int(np.unique(parent[parent >= 0]).size),
+                "configuration_unique_child_count": int(np.unique(child[child >= 0]).size),
+            })
+        if modes.proposal_seed_parent_rows is not None:
+            detail["proposal_seed_parent_rows"] = modes.proposal_seed_parent_rows[rank - 1].tolist()
+            detail["proposal_seed_support_rows"] = modes.proposal_seed_support_rows[rank - 1].tolist()
+        if modes.mapping_view_anchor_labels is not None:
+            label = int(modes.mapping_view_anchor_labels[rank - 1])
+            detail["mapping_view_anchor_label"] = label if label >= 0 else None
+            prior = float(modes.mapping_view_prior_scores[rank - 1])
+            detail["mapping_view_prior_score"] = prior if np.isfinite(prior) else None
+        result.append(detail)
     return result
 
 
@@ -132,10 +180,70 @@ def main() -> None:
     parser.add_argument("--child_candidates", type=int, default=64)
     parser.add_argument("--child_temperature", type=float, default=0.07)
     parser.add_argument("--grouping_cosine", type=float, default=0.96)
+    parser.add_argument(
+        "--support_grouping",
+        choices=("retrieval_top1", "identity_free"),
+        default="retrieval_top1",
+    )
+    parser.add_argument("--maximum_group_diameter_tokens", type=float, default=2.0)
+    parser.add_argument("--parent_message_passing_iterations", type=int, default=0)
     parser.add_argument("--maximum_modes", type=int, default=32)
     parser.add_argument("--proposal_trials", type=int, default=2048)
-    parser.add_argument("--proposal_method", choices=("random", "graph", "hierarchical"), default="graph")
+    parser.add_argument(
+        "--proposal_method",
+        choices=(
+            "random", "graph", "hierarchical", "joint", "geometry", "soft_geometry",
+            "vfm_geometry", "primitive_vfm_geometry", "mapping_view", "view_geometry",
+        ),
+        default="graph",
+    )
+    parser.add_argument("--geometry_head", default="")
+    parser.add_argument("--mapping_view_graph", default="")
+    parser.add_argument("--mapping_view_candidates", type=int, default=64)
+    parser.add_argument("--mapping_view_anchors", type=int, default=32)
+    parser.add_argument("--mapping_view_support_pairs", type=int, default=64)
+    parser.add_argument("--mapping_view_hypotheses", type=int, default=4)
+    parser.add_argument("--mapping_view_missing_probability", type=float, default=0.02)
+    parser.add_argument("--mapping_view_temperature", type=float, default=0.10)
+    parser.add_argument(
+        "--view_geometry_disable_seed_vfm",
+        action="store_true",
+        help="Audit mapping-view geometry without the expensive experimental seed VFM gate.",
+    )
+    parser.add_argument("--view_geometry_prescore_per_anchor", type=int, default=96)
+    parser.add_argument("--view_geometry_exact_verify_count", type=int, default=0)
+    parser.add_argument("--geometry_proposal_confidence", type=float, default=0.05)
+    parser.add_argument("--geometry_pair_supports", type=int, default=64)
+    parser.add_argument("--geometry_support_pairs", type=int, default=512)
+    parser.add_argument("--geometry_pair_candidates", type=int, default=8)
+    parser.add_argument("--geometry_extension_candidates", type=int, default=16)
+    parser.add_argument("--geometry_pair_hypotheses", type=int, default=2)
+    parser.add_argument("--geometry_preliminary_poses", type=int, default=768)
+    parser.add_argument("--geometry_orientation_normal_weight", type=float, default=0.0)
+    parser.add_argument("--soft_phase_anchors", type=int, default=24)
+    parser.add_argument("--soft_phase_anchor_pairs", type=int, default=64)
+    parser.add_argument("--soft_phase_keep_per_anchor", type=int, default=0)
+    parser.add_argument("--soft_parent_candidates", type=int, default=8)
+    parser.add_argument("--soft_edge_candidates", type=int, default=4)
+    parser.add_argument("--soft_maximum_edges", type=int, default=128)
+    parser.add_argument("--sparse_vfm_temperature", type=float, default=0.07)
+    parser.add_argument("--sparse_vfm_batch_size", type=int, default=16)
+    parser.add_argument("--sparse_vfm_maximum_splat_radius_tokens", type=int, default=2)
+    parser.add_argument(
+        "--sparse_vfm_score_semantics",
+        choices=("raw_cosine", "marginal_centered", "log_partition_llr"),
+        default="marginal_centered",
+    )
+    parser.add_argument("--sparse_vfm_primitives_per_child", type=int, default=8)
+    parser.add_argument(
+        "--sparse_primitive_score_semantics",
+        choices=("fixed_grid", "visible_sample_mean"),
+        default="visible_sample_mean",
+    )
     parser.add_argument("--graph_seed_parent_pair_count", type=int, default=0)
+    parser.add_argument("--graph_seed_parent_count", type=int, default=64)
+    parser.add_argument("--graph_support_anchor_count", type=int, default=0)
+    parser.add_argument("--graph_support_anchor_pair_count", type=int, default=0)
     parser.add_argument("--local_evidence_weight", type=float, default=0.0)
     parser.add_argument("--translation_nms_m", type=float, default=0.20)
     parser.add_argument("--rotation_nms_deg", type=float, default=3.0)
@@ -151,6 +259,12 @@ def main() -> None:
     parser.add_argument("--alike_matcha_repo", default="/root/matcha")
     parser.add_argument("--maximum_queries", type=int, default=0)
     parser.add_argument("--image_id", default="")
+    parser.add_argument(
+        "--image_ids",
+        nargs="+",
+        default=None,
+        help="Evaluate an explicit deployment-gated query subset.",
+    )
     parser.add_argument("--include_trajectories", nargs="+", default=None)
     parser.add_argument("--shard_index", type=int, default=0)
     parser.add_argument("--shard_count", type=int, default=1)
@@ -197,8 +311,23 @@ def main() -> None:
         instance_readout_sha256 = file_sha256(Path(args.physical_instance_readout))
     calibration = ValidityCalibration.load_json(Path(args.validity_calibration))
     mapper, _ = load_surface_maplet_mapper(Path(args.surface_mapper), device=str(args.device))
+    geometry_head = None
+    geometry_head_sha256 = None
+    if args.proposal_method in (
+        "geometry", "soft_geometry", "vfm_geometry", "primitive_vfm_geometry",
+        "view_geometry",
+    ):
+        if not args.geometry_head:
+            raise ValueError("geometry proposal requires --geometry_head")
+        geometry_head, _geometry_metadata = load_radio_highres_geometry_head(
+            Path(args.geometry_head), device=str(args.device),
+        )
+        geometry_head_sha256 = file_sha256(Path(args.geometry_head))
     graph = None
-    if args.proposal_method in ("graph", "hierarchical"):
+    if args.proposal_method in (
+        "graph", "hierarchical", "joint", "geometry", "soft_geometry", "vfm_geometry",
+        "primitive_vfm_geometry", "view_geometry",
+    ):
         if not args.typed_graph:
             raise ValueError("graph proposal requires --typed_graph")
         graph = TypedParentGraph.load_npz(Path(args.typed_graph))
@@ -207,6 +336,16 @@ def main() -> None:
         graph_readout = graph.metadata.get("physical_instance_readout_sha256")
         if graph_readout != instance_readout_sha256:
             raise ValueError("typed graph physical-instance readout lineage differs")
+    mapping_graph = None
+    if args.proposal_method in ("mapping_view", "view_geometry"):
+        if not args.mapping_view_graph:
+            raise ValueError("mapping-view proposal requires --mapping_view_graph")
+        mapping_graph = MappingViewGraph.load_npz(Path(args.mapping_view_graph))
+        if (
+            mapping_graph.physical_map_sha256 != physical.content_sha256
+            or mapping_graph.canonical_field_sha256 != field.content_sha256
+        ):
+            raise ValueError("mapping-view graph lineage differs")
     detector = None
     if int(args.detector_radio_refine_topn) > 0:
         if not args.query_image_root:
@@ -233,6 +372,21 @@ def main() -> None:
                 item = json.loads(str(np.asarray(data["metadata_json"]).item()))
             if str(item.get("image_id", "")) == str(args.image_id):
                 selected_paths.append(path)
+        paths = selected_paths
+    if args.image_ids:
+        requested_images = set(str(value) for value in args.image_ids)
+        selected_paths = []
+        selected_images: set[str] = set()
+        for path in paths:
+            with np.load(path, allow_pickle=False) as data:
+                item = json.loads(str(np.asarray(data["metadata_json"]).item()))
+            image_id = str(item.get("image_id", ""))
+            if image_id in requested_images:
+                selected_paths.append(path)
+                selected_images.add(image_id)
+        missing_images = requested_images.difference(selected_images)
+        if missing_images:
+            raise ValueError(f"requested query images are missing: {sorted(missing_images)}")
         paths = selected_paths
     if args.include_trajectories:
         requested = set(str(value) for value in args.include_trajectories)
@@ -272,25 +426,53 @@ def main() -> None:
                 local_descriptor = local_head.encode_query(
                     torch.as_tensor(local_descriptor, dtype=torch.float32, device=str(args.device))
                 ).cpu().numpy()
-        parent_ids, parent_probability, parent_null, _ = retrieve_maplet_posterior(
+        token_parent = retrieve_maplet_posterior_decomposed(
             context_descriptor, readout.parent_descriptors, physical.maplet_ids,
             readout.parent_coverage > 0.0,
             maximum_candidates=int(args.parent_candidates), temperature=0.07,
             null_similarity_center=float(calibration.center), null_similarity_scale=float(calibration.scale),
         )
-        grouped = group_tokens_after_retrieval(
-            token_xy, context_descriptor, parent_ids[:, 0],
-            token_height=int(raw.shape[1]), token_width=int(raw.shape[2]),
-            image_width=int(camera.width), image_height=int(camera.height),
-            descriptor_half_size_tokens=2.0,
-            minimum_descriptor_cosine=float(args.grouping_cosine),
-        )
-        grouped_parent_ids, grouped_parent_probability, grouped_parent_null = aggregate_group_posteriors(
-            parent_ids, parent_probability, parent_null,
+        if args.support_grouping == "identity_free":
+            grouped = group_tokens_identity_free(
+                token_xy, context_descriptor,
+                token_height=int(raw.shape[1]), token_width=int(raw.shape[2]),
+                image_width=int(camera.width), image_height=int(camera.height),
+                descriptor_half_size_tokens=2.0,
+                minimum_descriptor_cosine=float(args.grouping_cosine),
+                maximum_group_diameter_tokens=float(args.maximum_group_diameter_tokens),
+            )
+        else:
+            grouped = group_tokens_after_retrieval(
+                token_xy, context_descriptor, token_parent.candidate_ids[:, 0],
+                token_height=int(raw.shape[1]), token_width=int(raw.shape[2]),
+                image_width=int(camera.width), image_height=int(camera.height),
+                descriptor_half_size_tokens=2.0,
+                minimum_descriptor_cosine=float(args.grouping_cosine),
+            )
+        grouped_parent = aggregate_group_sparse_posteriors(
+            token_parent,
             grouped.member_offsets, grouped.member_token_indices,
             maximum_candidates=int(args.parent_candidates),
         )
+        grouped_parent_ids = grouped_parent.candidate_ids
+        grouped_parent_probability = grouped_parent.candidate_probabilities
+        grouped_parent_null = grouped_parent.unresolved_probabilities
         grouped_local = aggregate_group_descriptors(local_descriptor, grouped.member_offsets, grouped.member_token_indices)
+        grouped_structure_diagnostics = None
+        if int(args.parent_message_passing_iterations) > 0:
+            if graph is None:
+                raise ValueError("parent message passing requires --typed_graph")
+            grouped_parent_probability, grouped_structure_diagnostics = (
+                refine_parent_posteriors_with_query_graph(
+                    grouped_parent_ids,
+                    grouped_parent_probability,
+                    grouped.xy,
+                    grouped.descriptors,
+                    physical,
+                    graph,
+                    iterations=int(args.parent_message_passing_iterations),
+                )
+            )
         parent_inputs = {}
         truth_child = truth_child_null = None
         if args.parent_mode in ("actual", "both"):
@@ -316,9 +498,18 @@ def main() -> None:
             )
         xy_px = grouped.xy * np.asarray([camera.width, camera.height], dtype=np.float32)
         extent_px = grouped.extent * np.asarray([camera.width, camera.height], dtype=np.float32)
+        geometry_support = None
+        if geometry_head is not None:
+            geometry_support = predict_radio_geometry_at_normalized_xy(
+                geometry_head,
+                raw,
+                grouped.xy,
+                output_size=(2 * int(raw.shape[1]), 2 * int(raw.shape[2])),
+            )
         modes_report = {}
         mode_details = {}
         ranking_diagnostics = {}
+        proposal_diagnostics = {}
         detected = None
         if detector is not None:
             detected = detector.detect(
@@ -347,7 +538,181 @@ def main() -> None:
             child_inputs["oracle_child"] = (ChildTilePosterior(columns, probability, truth_child_null), oracle_parent_values)
         for name, (child, parent_values) in child_inputs.items():
             stable_seed = _stable_proposal_seed(str(metadata["image_id"]))
-            if args.proposal_method in ("graph", "hierarchical"):
+            view_posterior = None
+            actual_parent = name.startswith("actual_parent")
+            if args.proposal_method in ("mapping_view", "view_geometry"):
+                view_posterior = retrieve_mapping_view_posterior(
+                    mapping_graph,
+                    physical,
+                    *parent_values[:2],
+                    (
+                        grouped_parent.out_of_map_probabilities
+                        if actual_parent else parent_values[2]
+                    ),
+                    parent_values[2],
+                    maximum_views=int(args.mapping_view_candidates),
+                    missing_view_probability=float(args.mapping_view_missing_probability),
+                    temperature=float(args.mapping_view_temperature),
+                )
+            if args.proposal_method == "mapping_view":
+                modes = mapping_view_pose_modes(
+                    mapping_graph,
+                    view_posterior,
+                    maximum_modes=int(args.maximum_modes),
+                    translation_nms_m=float(args.translation_nms_m),
+                    rotation_nms_deg=float(args.rotation_nms_deg),
+                )
+                proposal_diagnostics[name] = {
+                    "typed_null_probability": float(view_posterior.null_probability),
+                    "retrieved_view_count": int(view_posterior.view_rows.size),
+                    "top1_view_row": (
+                        int(view_posterior.view_rows[0])
+                        if view_posterior.view_rows.size else None
+                    ),
+                    "top1_support_coverage": (
+                        float(view_posterior.support_coverage[0])
+                        if view_posterior.support_coverage.size else None
+                    ),
+                }
+            elif args.proposal_method in (
+                "geometry", "soft_geometry", "vfm_geometry", "primitive_vfm_geometry",
+                "view_geometry",
+            ):
+                actual_parent = name.startswith("actual_parent")
+                geometry_diagnostics = {}
+                modes = generate_geometry_guided_configuration_pose_modes(
+                    xy_px,
+                    extent_px,
+                    grouped.descriptors,
+                    geometry_support.depth,
+                    geometry_support.normal,
+                    geometry_support.confidence,
+                    *parent_values[:2],
+                    (
+                        grouped_parent.out_of_map_probabilities
+                        if actual_parent else parent_values[2]
+                    ),
+                    parent_values[2],
+                    child,
+                    physical,
+                    graph,
+                    camera,
+                    maximum_modes=int(args.maximum_modes),
+                    proposal_trials=int(args.proposal_trials),
+                    minimum_geometry_confidence=float(args.geometry_proposal_confidence),
+                    pair_beam_support_count=int(args.geometry_pair_supports),
+                    maximum_support_pairs=int(args.geometry_support_pairs),
+                    pair_candidate_count=int(args.geometry_pair_candidates),
+                    extension_candidate_count=int(args.geometry_extension_candidates),
+                    pair_hypotheses_per_support_pair=int(args.geometry_pair_hypotheses),
+                    preliminary_pose_count=int(args.geometry_preliminary_poses),
+                    orientation_normal_weight=float(args.geometry_orientation_normal_weight),
+                    phase_anchor_count=(
+                        int(args.soft_phase_anchors)
+                        if args.proposal_method in (
+                            "soft_geometry", "vfm_geometry", "primitive_vfm_geometry",
+                        ) else 0
+                    ),
+                    phase_anchor_support_pairs=int(args.soft_phase_anchor_pairs),
+                    phase_anchor_keep_per_anchor=int(args.soft_phase_keep_per_anchor),
+                    mapping_view_parent_weights=(
+                        mapping_graph.dense_parent_weights(physical.maplet_ids.size)[
+                            view_posterior.view_rows[: int(args.mapping_view_anchors)]
+                        ]
+                        if args.proposal_method == "view_geometry" else None
+                    ),
+                    mapping_view_anchor_scores=(
+                        view_posterior.scores[: int(args.mapping_view_anchors)]
+                        if args.proposal_method == "view_geometry" else None
+                    ),
+                    mapping_view_support_pairs=int(args.mapping_view_support_pairs),
+                    mapping_view_hypotheses=int(args.mapping_view_hypotheses),
+                    seed_identity_vfm_alignment=(
+                        args.proposal_method == "view_geometry"
+                        and not bool(args.view_geometry_disable_seed_vfm)
+                    ),
+                    seed_identity_canonical_primitives=args.proposal_method == "view_geometry",
+                    seed_identity_full_map_primitives=args.proposal_method == "view_geometry",
+                    seed_identity_prescore_per_anchor=int(
+                        args.view_geometry_prescore_per_anchor
+                    ),
+                    seed_identity_exact_verify_count=int(
+                        args.view_geometry_exact_verify_count
+                    ),
+                    soft_identity_marginalization=args.proposal_method == "soft_geometry",
+                    marginal_pair_consensus=args.proposal_method in (
+                        "soft_geometry", "vfm_geometry", "primitive_vfm_geometry",
+                    ),
+                    soft_parent_candidate_count=int(args.soft_parent_candidates),
+                    soft_edge_candidate_count=int(args.soft_edge_candidates),
+                    soft_maximum_edges=int(args.soft_maximum_edges),
+                    pose_conditioned_vfm_alignment=args.proposal_method == "vfm_geometry",
+                    pose_conditioned_primitive_vfm_alignment=(
+                        args.proposal_method == "primitive_vfm_geometry"
+                    ),
+                    query_token_context_descriptors=context_descriptor,
+                    query_token_local_descriptors=local_descriptor,
+                    map_parent_descriptors=readout.parent_descriptors,
+                    map_child_descriptors=child_map_descriptor,
+                    parent_descriptor_valid=readout.parent_coverage > 0.0,
+                    child_descriptor_valid=readout.child_coverage > 0.0,
+                    token_height=int(raw.shape[1]),
+                    token_width=int(raw.shape[2]),
+                    sparse_vfm_temperature=float(args.sparse_vfm_temperature),
+                    sparse_vfm_batch_size=int(args.sparse_vfm_batch_size),
+                    sparse_vfm_maximum_splat_radius_tokens=int(
+                        args.sparse_vfm_maximum_splat_radius_tokens
+                    ),
+                    sparse_vfm_score_semantics=str(args.sparse_vfm_score_semantics),
+                    query_token_canonical_descriptors=mapped.transpose(1, 2, 0).reshape(
+                        -1, mapped.shape[0]
+                    ),
+                    canonical_field_primitive_rows=field.primitive_rows,
+                    canonical_field_codes=field.codes,
+                    canonical_field_confidence=field.confidence,
+                    sparse_vfm_primitives_per_child=int(args.sparse_vfm_primitives_per_child),
+                    sparse_primitive_score_semantics=str(args.sparse_primitive_score_semantics),
+                    sparse_vfm_device=str(args.device),
+                    translation_nms_m=float(args.translation_nms_m),
+                    rotation_nms_deg=float(args.rotation_nms_deg),
+                    random_seed=stable_seed,
+                    diagnostic_pose_w2c=labels.pose_w2c,
+                    diagnostics_out=geometry_diagnostics,
+                )
+                proposal_diagnostics[name] = geometry_diagnostics
+                if view_posterior is not None:
+                    proposal_diagnostics[name]["mapping_view_posterior"] = {
+                        "typed_null_probability": float(view_posterior.null_probability),
+                        "anchor_view_rows": view_posterior.view_rows[
+                            : int(args.mapping_view_anchors)
+                        ].tolist(),
+                        "anchor_scores": view_posterior.scores[
+                            : int(args.mapping_view_anchors)
+                        ].tolist(),
+                    }
+            elif args.proposal_method == "joint":
+                actual_parent = name.startswith("actual_parent")
+                modes = generate_joint_configuration_pose_modes(
+                    xy_px,
+                    extent_px,
+                    grouped.descriptors,
+                    *parent_values[:2],
+                    (
+                        grouped_parent.out_of_map_probabilities
+                        if actual_parent else parent_values[2]
+                    ),
+                    parent_values[2],
+                    child,
+                    physical,
+                    graph,
+                    camera,
+                    maximum_modes=int(args.maximum_modes),
+                    proposal_trials=int(args.proposal_trials),
+                    translation_nms_m=float(args.translation_nms_m),
+                    rotation_nms_deg=float(args.rotation_nms_deg),
+                    random_seed=stable_seed,
+                )
+            elif args.proposal_method in ("graph", "hierarchical"):
                 proposal = (
                     generate_parent_then_child_pose_modes
                     if args.proposal_method == "hierarchical"
@@ -360,7 +725,10 @@ def main() -> None:
                     **(
                         {
                             "local_evidence_weight": float(args.local_evidence_weight),
+                            "seed_parent_count": int(args.graph_seed_parent_count),
                             "seed_parent_pair_count": int(args.graph_seed_parent_pair_count),
+                            "support_anchor_count": int(args.graph_support_anchor_count),
+                            "support_anchor_pair_count": int(args.graph_support_anchor_pair_count),
                             "translation_nms_m": float(args.translation_nms_m),
                             "rotation_nms_deg": float(args.rotation_nms_deg),
                         }
@@ -422,7 +790,23 @@ def main() -> None:
                     if gate:
                         take = min(int(args.cascade_topk), modes.poses_w2c.shape[0])
                         subset = CoarsePoseModes(
-                            modes.poses_w2c[:take], modes.scores[:take], modes.supporting_region_count[:take]
+                            modes.poses_w2c[:take], modes.scores[:take], modes.supporting_region_count[:take],
+                            (
+                                modes.configuration_parent_rows[:take]
+                                if modes.configuration_parent_rows is not None else None
+                            ),
+                            (
+                                modes.configuration_child_rows[:take]
+                                if modes.configuration_child_rows is not None else None
+                            ),
+                            (
+                                modes.proposal_seed_parent_rows[:take]
+                                if modes.proposal_seed_parent_rows is not None else None
+                            ),
+                            (
+                                modes.proposal_seed_support_rows[:take]
+                                if modes.proposal_seed_support_rows is not None else None
+                            ),
                         )
                         exact = rerank_modes_with_rendered_identity(
                             subset,
@@ -456,7 +840,29 @@ def main() -> None:
                             "cascade_exact_rendered_coverage": cascade.exact_rendered_coverage.tolist(),
                         })
             modes_report[name] = _pose_report(modes, labels.pose_w2c)
-            mode_details[name] = _pose_details(modes, labels.pose_w2c)
+            details = _pose_details(modes, labels.pose_w2c)
+            if (
+                args.proposal_method in (
+                    "geometry", "soft_geometry", "vfm_geometry", "primitive_vfm_geometry",
+                    "view_geometry",
+                )
+                and modes.configuration_child_rows is not None
+            ):
+                query_xyz = unproject_query_depth(xy_px, geometry_support.depth, camera)
+                for detail, pose, assigned_child in zip(
+                    details, modes.poses_w2c, modes.configuration_child_rows,
+                ):
+                    component = scale_invariant_configuration_geometry(
+                        pose,
+                        query_xyz,
+                        geometry_support.normal,
+                        geometry_support.confidence,
+                        assigned_child,
+                        physical.child_centers,
+                        physical.child_normals,
+                    )
+                    detail["geometry_consistency"] = component
+            mode_details[name] = details
             if detected is not None and modes.poses_w2c.shape[0]:
                 refined = []
                 for pose in modes.poses_w2c[: int(args.detector_radio_refine_topn)]:
@@ -504,9 +910,35 @@ def main() -> None:
         report = {
             "image_id": str(metadata["image_id"]),
             "support_count": int(grouped.xy.shape[0]),
+            "posterior_mass": {
+                "retained_mean": float(np.mean(np.sum(grouped_parent.candidate_probabilities, axis=1))),
+                "out_of_map_mean": float(np.mean(grouped_parent.out_of_map_probabilities)),
+                "truncated_in_map_tail_mean": float(np.mean(grouped_parent.truncated_tail_probabilities)),
+            },
+            "structured_parent_posterior": (
+                None if grouped_structure_diagnostics is None else {
+                    "iterations": int(args.parent_message_passing_iterations),
+                    "entropy_before": grouped_structure_diagnostics.entropy_before,
+                    "entropy_after": grouped_structure_diagnostics.entropy_after,
+                    "top1_changed_fraction": grouped_structure_diagnostics.top1_changed_fraction,
+                    "edge_count": grouped_structure_diagnostics.edge_count,
+                }
+            ),
             "modes": modes_report,
             "mode_details": mode_details,
             "ranking_diagnostics": ranking_diagnostics,
+            "proposal_diagnostics": proposal_diagnostics,
+            "query_geometry": (
+                None if geometry_support is None else {
+                    "depth_median_m": float(np.median(geometry_support.depth)),
+                    "depth_p10_m": float(np.percentile(geometry_support.depth, 10.0)),
+                    "depth_p90_m": float(np.percentile(geometry_support.depth, 90.0)),
+                    "confidence_mean": float(np.mean(geometry_support.confidence)),
+                    "confidence_above_threshold": int(np.sum(
+                        geometry_support.confidence >= float(args.geometry_proposal_confidence)
+                    )),
+                }
+            ),
         }
         reports.append(report)
         if not bool(args.quiet_rows):
@@ -536,8 +968,140 @@ def main() -> None:
         "child_mode": str(args.child_mode),
         "proposal_trials": int(args.proposal_trials),
         "proposal_method": str(args.proposal_method),
+        "geometry_head_sha256": geometry_head_sha256,
+        "geometry_proposal_confidence": (
+            float(args.geometry_proposal_confidence)
+            if args.proposal_method in (
+                "geometry", "soft_geometry", "vfm_geometry", "primitive_vfm_geometry",
+                "view_geometry",
+            ) else None
+        ),
+        "geometry_pair_beam": (
+            {
+                "support_count": int(args.geometry_pair_supports),
+                "maximum_support_pairs": int(args.geometry_support_pairs),
+                "pair_candidate_count": int(args.geometry_pair_candidates),
+                "extension_candidate_count": int(args.geometry_extension_candidates),
+                "pair_hypotheses_per_support_pair": int(args.geometry_pair_hypotheses),
+                "preliminary_pose_count": int(args.geometry_preliminary_poses),
+                "orientation_normal_weight": float(args.geometry_orientation_normal_weight),
+                "pose_conditioned_soft_identity": args.proposal_method == "soft_geometry",
+                "pose_conditioned_sparse_vfm_alignment": args.proposal_method == "vfm_geometry",
+                "pose_conditioned_sparse_primitive_vfm_alignment": (
+                    args.proposal_method == "primitive_vfm_geometry"
+                ),
+                "phase_anchor_count": (
+                    int(args.soft_phase_anchors)
+                    if args.proposal_method in (
+                        "soft_geometry", "vfm_geometry", "primitive_vfm_geometry",
+                    ) else 0
+                ),
+                "phase_anchor_support_pairs": (
+                    int(args.soft_phase_anchor_pairs)
+                    if args.proposal_method in (
+                        "soft_geometry", "vfm_geometry", "primitive_vfm_geometry",
+                    ) else 0
+                ),
+                "phase_anchor_keep_per_anchor": (
+                    int(args.soft_phase_keep_per_anchor)
+                    if args.proposal_method in (
+                        "soft_geometry", "vfm_geometry", "primitive_vfm_geometry",
+                    ) else 0
+                ),
+                "soft_edge_candidate_count": (
+                    int(args.soft_edge_candidates)
+                    if args.proposal_method == "soft_geometry" else 0
+                ),
+                "soft_parent_candidate_count": (
+                    int(args.soft_parent_candidates)
+                    if args.proposal_method == "soft_geometry" else 0
+                ),
+                "soft_maximum_edges": (
+                    int(args.soft_maximum_edges)
+                    if args.proposal_method in ("soft_geometry", "vfm_geometry") else 0
+                ),
+                "sparse_vfm_temperature": (
+                    float(args.sparse_vfm_temperature)
+                    if args.proposal_method == "vfm_geometry" else None
+                ),
+                "sparse_vfm_batch_size": (
+                    int(args.sparse_vfm_batch_size)
+                    if args.proposal_method in (
+                        "vfm_geometry", "primitive_vfm_geometry", "view_geometry",
+                    ) else None
+                ),
+                "sparse_vfm_maximum_splat_radius_tokens": (
+                    int(args.sparse_vfm_maximum_splat_radius_tokens)
+                    if args.proposal_method in (
+                        "vfm_geometry", "primitive_vfm_geometry", "view_geometry",
+                    ) else None
+                ),
+                "sparse_vfm_score_semantics": (
+                    str(args.sparse_vfm_score_semantics)
+                    if args.proposal_method == "vfm_geometry" else None
+                ),
+                "sparse_vfm_primitives_per_child": (
+                    int(args.sparse_vfm_primitives_per_child)
+                    if args.proposal_method in (
+                        "primitive_vfm_geometry", "view_geometry",
+                    ) else None
+                ),
+                "sparse_primitive_score_semantics": (
+                    str(args.sparse_primitive_score_semantics)
+                    if args.proposal_method in (
+                        "primitive_vfm_geometry", "view_geometry",
+                    ) else None
+                ),
+                "mapping_view_anchor_count": (
+                    int(args.mapping_view_anchors)
+                    if args.proposal_method == "view_geometry" else 0
+                ),
+                "mapping_view_support_pairs": (
+                    int(args.mapping_view_support_pairs)
+                    if args.proposal_method == "view_geometry" else 0
+                ),
+                "mapping_view_hypotheses": (
+                    int(args.mapping_view_hypotheses)
+                    if args.proposal_method == "view_geometry" else 0
+                ),
+                "full_map_seed_vfm_alignment": (
+                    args.proposal_method == "view_geometry"
+                    and not bool(args.view_geometry_disable_seed_vfm)
+                ),
+                "full_map_seed_feature": (
+                    "single_canonical_primitive_vfm_code"
+                    if args.proposal_method == "view_geometry"
+                    and not bool(args.view_geometry_disable_seed_vfm) else None
+                ),
+                "seed_prescore_per_structural_anchor": (
+                    int(args.view_geometry_prescore_per_anchor)
+                    if args.proposal_method == "view_geometry" else 0
+                ),
+                "seed_exact_verify_count": (
+                    int(args.view_geometry_exact_verify_count)
+                    if args.proposal_method == "view_geometry" else 0
+                ),
+            }
+            if args.proposal_method in (
+                "geometry", "soft_geometry", "vfm_geometry", "primitive_vfm_geometry",
+                "view_geometry",
+            ) else None
+        ),
+        "support_grouping": str(args.support_grouping),
+        "maximum_group_diameter_tokens": float(args.maximum_group_diameter_tokens),
+        "parent_message_passing_iterations": int(args.parent_message_passing_iterations),
+        "posterior_mass_semantics": "retained_in_map_plus_truncated_in_map_tail_plus_out_of_map_equals_one",
         "graph_seed_parent_pair_count": (
             int(args.graph_seed_parent_pair_count) if args.proposal_method == "graph" else None
+        ),
+        "graph_seed_parent_count": (
+            int(args.graph_seed_parent_count) if args.proposal_method == "graph" else None
+        ),
+        "graph_support_anchor_count": (
+            int(args.graph_support_anchor_count) if args.proposal_method == "graph" else None
+        ),
+        "graph_support_anchor_pair_count": (
+            int(args.graph_support_anchor_pair_count) if args.proposal_method == "graph" else None
         ),
         "proposal_seed_policy": "sha256_image_id_uint31_little_endian_v1",
         "local_evidence_weight": float(args.local_evidence_weight),
@@ -556,6 +1120,22 @@ def main() -> None:
         "detector_radio_refine_topn": int(args.detector_radio_refine_topn),
         "alike_detector_only": bool(detector is not None),
         "typed_graph_sha256": graph.content_sha256 if graph is not None else None,
+        "mapping_view_graph_sha256": (
+            mapping_graph.content_sha256 if mapping_graph is not None else None
+        ),
+        "mapping_view_contract": (
+            {
+                "candidate_count": int(args.mapping_view_candidates),
+                "anchor_count": int(args.mapping_view_anchors),
+                "missing_view_probability": float(args.mapping_view_missing_probability),
+                "temperature": float(args.mapping_view_temperature),
+                "stores_mapping_rgb": False,
+                "stores_mapping_image_ids": False,
+                "stores_downstream_embeddings": False,
+                "uses_point_correspondences": False,
+            }
+            if mapping_graph is not None else None
+        ),
         "physical_instance_readout_sha256": instance_readout_sha256,
         "maximum_modes": int(args.maximum_modes),
         "summary": summary,

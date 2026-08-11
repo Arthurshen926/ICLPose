@@ -26,6 +26,10 @@ from feature_extract.vfm.localization_goal_maplet.conditional_pose_energy import
 )
 from feature_extract.vfm.localization_goal_maplet.feature_contract import FieldFeatureContract
 from feature_extract.vfm.localization_goal_maplet.lineage import file_sha256
+from feature_extract.vfm.localization_goal_maplet.joint_phase_geometry_likelihood import (
+    candidate_measurements as joint_candidate_measurements,
+    load_joint_phase_geometry_likelihood,
+)
 from feature_extract.vfm.localization_goal_maplet.physical_instance_readout import (
     encode_physical_instance_regions,
     load_physical_instance_readout,
@@ -38,7 +42,10 @@ from feature_extract.vfm.localization_goal_maplet.phase_preserving_readout impor
     load_phase_readout_policy,
     orientation_equivariant_phase_evidence,
 )
-from feature_extract.vfm.localization_goal_maplet.surface_refiner import canonical_alignment_score
+from feature_extract.vfm.localization_goal_maplet.surface_refiner import (
+    canonical_alignment_score,
+    dense_scale_invariant_geometry_evidence,
+)
 from feature_extract.vfm.localization_goal_maplet.surface_pose_likelihood import (
     EVENT_NAMES,
     extract_surface_likelihood_features,
@@ -46,6 +53,10 @@ from feature_extract.vfm.localization_goal_maplet.surface_pose_likelihood import
 )
 from feature_extract.vfm.localization_goal_maplet.surface_renderer import render_canonical_surface_field
 from feature_extract.vfm.colmap_tracks import ColmapCamera
+from feature_extract.vfm.vfm_highres_geometry_head import (
+    load_radio_highres_geometry_head,
+    predict_radio_geometry_map,
+)
 
 
 def _camera(path: Path) -> ColmapCamera:
@@ -61,6 +72,22 @@ def _camera(path: Path) -> ColmapCamera:
 
 def _pose_key(value: object) -> tuple[float, ...]:
     return tuple(np.asarray(value, dtype=np.float64).round(9).reshape(-1).tolist())
+
+
+def _trajectory(image_id: str) -> str:
+    return str(image_id).replace("\\", "/").split("/", 1)[0]
+
+
+def _training_trajectories(metadata: dict[str, object]) -> set[str]:
+    """Recover declared training trajectories from old and new checkpoints."""
+
+    result = {
+        str(value) for value in metadata.get("training_trajectory_ids", ())
+    }
+    result.update(
+        _trajectory(str(value)) for value in metadata.get("training_images", ())
+    )
+    return result
 
 
 def _summary(rows: list[dict[str, object]]) -> dict[str, dict[str, object]]:
@@ -234,10 +261,17 @@ def main() -> None:
     parser.add_argument("--surface_mapper", required=True)
     parser.add_argument("--field_feature_contract", required=True)
     parser.add_argument("--physical_instance_readout", required=True)
+    parser.add_argument("--dense_geometry_head", default="")
     parser.add_argument("--surface_pose_likelihood", default="")
     parser.add_argument("--phase_preserving_dual_band", action="store_true")
     parser.add_argument("--phase_readout_model", default="")
     parser.add_argument("--conditional_pose_energy", default="")
+    parser.add_argument("--joint_phase_geometry_likelihood", default="")
+    parser.add_argument(
+        "--allow_development_policy",
+        action="store_true",
+        help="Explicitly replay a policy that has not passed an untouched production test.",
+    )
     parser.add_argument(
         "--allow_self_map_diagnostic",
         action="store_true",
@@ -268,12 +302,16 @@ def main() -> None:
         raise ValueError("render supersample factor must be positive")
     if bool(args.allow_legacy_dual_band_score) and not bool(args.phase_preserving_dual_band):
         raise ValueError("legacy dual-band score flag requires dual-band evidence")
+    if args.resume_scores and args.dense_geometry_head:
+        raise ValueError("dense geometry audit requires rendered depth and cannot resume scalar scores")
 
     physical = GoalMapletPhysicalMap.load_npz(Path(args.physical_map))
     field = CanonicalSurfaceField.load_npz(Path(args.canonical_field))
     contract = FieldFeatureContract.load_json(Path(args.field_feature_contract))
     contract.validate(field, query_readout_path=Path(args.surface_mapper))
-    mapper, _ = load_surface_maplet_mapper(Path(args.surface_mapper), device=str(args.device))
+    mapper, mapper_metadata = load_surface_maplet_mapper(
+        Path(args.surface_mapper), device=str(args.device),
+    )
     readout, readout_metadata = load_physical_instance_readout(
         Path(args.physical_instance_readout), device=str(args.device),
     )
@@ -379,6 +417,33 @@ def main() -> None:
         if int(conditional_energy.metadata.get("maximum_modes", 0)) != int(args.maximum_modes):
             raise ValueError("conditional pose energy candidate-set width differs")
         conditional_energy_sha256 = file_sha256(energy_path)
+    joint_likelihood = None
+    joint_likelihood_sha256 = None
+    if args.joint_phase_geometry_likelihood:
+        if phase_policy is None:
+            raise ValueError("joint phase-geometry likelihood requires frozen phase evidence")
+        if conditional_energy is not None or pose_likelihood is not None:
+            raise ValueError(
+                "joint phase-geometry, conditional energy and typed surface likelihood "
+                "are mutually exclusive policies"
+            )
+        joint_path = Path(args.joint_phase_geometry_likelihood)
+        joint_likelihood = load_joint_phase_geometry_likelihood(joint_path)
+        if joint_likelihood.metadata.get("deployment_allowed") is not True:
+            raise ValueError("joint phase-geometry likelihood did not pass promotion protocol")
+        if (
+            joint_likelihood.metadata.get("production_deployment_allowed") is not True
+            and not bool(args.allow_development_policy)
+        ):
+            raise ValueError(
+                "joint phase-geometry likelihood is development-only; pass "
+                "--allow_development_policy for an explicit replay"
+            )
+        if int(joint_likelihood.metadata.get("required_render_supersample_factor", 0)) != int(
+            args.render_supersample_factor
+        ):
+            raise ValueError("joint phase-geometry likelihood render protocol differs")
+        joint_likelihood_sha256 = file_sha256(joint_path)
     role_field = (
         field
         if phase_v2_active or bool(args.spatial_role_readout)
@@ -388,6 +453,33 @@ def main() -> None:
     )
     pool_path = Path(args.candidate_pool)
     pool = json.loads(pool_path.read_text())
+    proposal_method = str(pool.get("proposal_method", "unknown"))
+    pool_uses_pnp = bool(
+        pool.get(
+            "uses_pnp",
+            proposal_method in {"random", "graph", "hierarchical", "joint"},
+        )
+    )
+    dense_geometry_head = None
+    dense_geometry_head_sha256 = None
+    if args.dense_geometry_head:
+        dense_geometry_head_path = Path(args.dense_geometry_head)
+        dense_geometry_head, _dense_geometry_metadata = load_radio_highres_geometry_head(
+            dense_geometry_head_path, device=str(args.device),
+        )
+        dense_geometry_head_sha256 = file_sha256(dense_geometry_head_path)
+        expected_geometry_head = pool.get("geometry_head_sha256")
+        if expected_geometry_head and str(expected_geometry_head) != dense_geometry_head_sha256:
+            raise ValueError("candidate pool and dense geometry head differ")
+    if joint_likelihood is not None and bool(
+        joint_likelihood.metadata.get("dense_geometry_selected")
+    ):
+        if dense_geometry_head is None:
+            raise ValueError("selected joint geometry component requires --dense_geometry_head")
+        if str(joint_likelihood.metadata.get("dense_geometry_head_sha256", "")) != str(
+            dense_geometry_head_sha256
+        ):
+            raise ValueError("joint likelihood and dense geometry head differ")
     expected_readout = file_sha256(Path(args.physical_instance_readout))
     if str(pool.get("physical_map_sha256", "")) != physical.content_sha256:
         raise ValueError("candidate pool and physical map differ")
@@ -481,6 +573,17 @@ def main() -> None:
     source_rows = source_rows[int(args.shard_index) :: int(args.shard_count)]
     for source in source_rows:
         image_id = str(source["image_id"])
+        if joint_likelihood is not None:
+            query_trajectory = _trajectory(image_id)
+            for artifact, training in (
+                ("surface mapper", _training_trajectories(dict(mapper_metadata))),
+                ("physical-instance readout", _training_trajectories(dict(readout_metadata))),
+            ):
+                if query_trajectory in training:
+                    raise ValueError(
+                        f"joint policy query trajectory overlaps {artifact} training: "
+                        f"{query_trajectory}"
+                    )
         contributor = contributor_by_image.get(image_id)
         if contributor is None:
             raise ValueError(f"missing contributor for candidate query: {image_id}")
@@ -491,6 +594,15 @@ def main() -> None:
         with np.load(Path(str(metadata["token_path"])), allow_pickle=False) as data:
             raw = np.asarray(data["radio_final"], dtype=np.float32)
         mapped = mapper.project(raw).measurement_context
+        dense_query_geometry = (
+            None
+            if dense_geometry_head is None
+            else predict_radio_geometry_map(
+                dense_geometry_head,
+                raw,
+                output_size=(int(mapped.shape[1]), int(mapped.shape[2])),
+            )
+        )
         grid_y, grid_x = np.mgrid[: mapped.shape[1], : mapped.shape[2]]
         token_xy = np.stack([grid_x.reshape(-1), grid_y.reshape(-1)], axis=1)
         if phase_v2_active:
@@ -530,6 +642,7 @@ def main() -> None:
             likelihood_features: list[np.ndarray] = []
             likelihood_query_summary = None
             phase_components: list[dict[str, float]] = []
+            dense_geometry_components: list[dict[str, float | int | None]] = []
             for detail in details[:take]:
                 resumed = resumed_by_image.get(image_id, {}).get(_pose_key(detail["pose_w2c"]))
                 if resumed is not None:
@@ -600,6 +713,16 @@ def main() -> None:
                 else:
                     scores.append(float(canonical_alignment_score(rendered, query)))
                 coverages.append(float(np.mean(np.asarray(rendered.mask, dtype=bool))))
+                if dense_query_geometry is not None:
+                    dense_geometry_components.append(
+                        dense_scale_invariant_geometry_evidence(
+                            rendered,
+                            np.asarray(detail["pose_w2c"], dtype=np.float64),
+                            dense_query_geometry.depth,
+                            dense_query_geometry.normal,
+                            dense_query_geometry.confidence,
+                        )
+                    )
                 if pose_likelihood is not None:
                     token_feature, _typed_target, query_summary = extract_surface_likelihood_features(
                         query,
@@ -610,6 +733,7 @@ def main() -> None:
                     likelihood_query_summary = query_summary
             null_probability = None
             event_fraction = None
+            phase_policy_scores = list(scores)
             if conditional_energy is not None:
                 if len(phase_components) != take:
                     raise ValueError("conditional pose energy requires every candidate phase")
@@ -620,6 +744,30 @@ def main() -> None:
                     phase_components,
                 )
                 probability, null_probability = conditional_energy.posterior(measurements)
+                scores = probability.astype(np.float64).tolist()
+            if joint_likelihood is not None:
+                if len(phase_components) != take:
+                    raise ValueError("joint likelihood requires every candidate phase")
+                geometry_selected = bool(
+                    joint_likelihood.metadata.get("dense_geometry_selected")
+                )
+                if geometry_selected and len(dense_geometry_components) != take:
+                    raise ValueError("joint likelihood requires every candidate geometry score")
+                geometry_evidence = (
+                    dense_geometry_components
+                    if geometry_selected else [{"score": 0.0}] * take
+                )
+                measurements = joint_candidate_measurements(
+                    np.asarray(
+                        [detail["score"] for detail in details[:take]], dtype=np.float64,
+                    ),
+                    np.asarray(scores, dtype=np.float64),
+                    phase_components,
+                    geometry_evidence,
+                )
+                probability, null_probability = joint_likelihood.posterior_with_null(
+                    measurements
+                )
                 scores = probability.astype(np.float64).tolist()
             if pose_likelihood is not None:
                 if len(likelihood_features) != take or likelihood_query_summary is None:
@@ -659,6 +807,7 @@ def main() -> None:
             diagnostics["surface_alignment_role"] = str(args.role)
             diagnostics["surface_alignment_evaluated_count"] = int(take)
             diagnostics["surface_alignment_scores_preorder"] = scores
+            diagnostics["surface_phase_policy_scores_preorder"] = phase_policy_scores
             diagnostics["surface_alignment_coverage_preorder"] = coverages
             diagnostics["surface_alignment_original_indices"] = order
             diagnostics["surface_pose_likelihood_sha256"] = pose_likelihood_sha256
@@ -670,8 +819,12 @@ def main() -> None:
             diagnostics["surface_phase_components_preorder"] = (
                 phase_components if bool(args.phase_preserving_dual_band) else None
             )
+            diagnostics["dense_geometry_components_preorder"] = (
+                dense_geometry_components if dense_query_geometry is not None else None
+            )
             diagnostics["surface_phase_readout_policy_sha256"] = phase_policy_sha256
             diagnostics["conditional_pose_energy_sha256"] = conditional_energy_sha256
+            diagnostics["joint_phase_geometry_likelihood_sha256"] = joint_likelihood_sha256
         rows.append(row)
         print(json.dumps({"image_id": image_id, "surface_verified_modes": {
             name: min(int(args.maximum_modes), len(value))
@@ -684,11 +837,18 @@ def main() -> None:
         "role": str(args.role),
         "spatial_role_readout": bool(args.spatial_role_readout),
         "maximum_modes": int(args.maximum_modes),
+        "generated_mode_limit": int(pool.get("maximum_modes", 0)),
+        "verified_mode_limit": int(args.maximum_modes),
+        "unevaluated_tail_preserved": bool(
+            int(pool.get("maximum_modes", 0)) > int(args.maximum_modes)
+        ),
         "render": "complete_clean_2dgs_single_canonical_field",
         "render_supersample_factor": int(args.render_supersample_factor),
         "score": (
-            "low_capacity_identity_phase_observation_posterior_with_null"
-            if conditional_energy is not None else (
+            "query_local_joint_phase_geometry_posterior"
+            if joint_likelihood is not None else (
+                "low_capacity_identity_phase_observation_posterior_with_null"
+                if conditional_energy is not None else (
                 "same_query_typed_candidate_posterior_with_null"
                 if pose_likelihood is not None else (
                 "phase_preserving_dual_band_fixed_grid_evidence"
@@ -708,13 +868,16 @@ def main() -> None:
                     if phase_policy is not None
                     else "fixed_full_query_grid_mean_cosine"
                 )
-            ))
+            )))
         ),
         "surface_pose_likelihood_sha256": pose_likelihood_sha256,
         "conditional_pose_energy_sha256": conditional_energy_sha256,
+        "joint_phase_geometry_likelihood_sha256": joint_likelihood_sha256,
         "score_semantics": (
-            "monotonic_identity_plus_jacobian_phase_plus_fractional_observation"
-            if conditional_energy is not None else (
+            "monotonic_query_local_phase_geometry_likelihood"
+            if joint_likelihood is not None else (
+                "monotonic_identity_plus_jacobian_phase_plus_fractional_observation"
+                if conditional_energy is not None else (
                 "same_query_typed_candidate_posterior_with_null"
                 if pose_likelihood is not None else (
                 "mapper_and_context_identity_plus_directional_mapper_phase"
@@ -734,13 +897,25 @@ def main() -> None:
                     if phase_policy is not None
                     else "fixed_full_query_grid_mean_cosine"
                 )
-            ))
+            )))
         ),
         "same_query_candidate_normalization": bool(
             pose_likelihood is not None or conditional_energy is not None
+            or joint_likelihood is not None
         ),
         "typed_null_hypothesis": bool(
             pose_likelihood is not None or conditional_energy is not None
+            or (
+                joint_likelihood is not None
+                and joint_likelihood.null_logit is not None
+            )
+        ),
+        "joint_dense_geometry_selected": bool(
+            joint_likelihood is not None
+            and joint_likelihood.metadata.get("dense_geometry_selected")
+        ),
+        "development_policy_override": bool(
+            joint_likelihood is not None and args.allow_development_policy
         ),
         "self_map_diagnostic_override": bool(
             conditional_energy is not None and args.allow_self_map_diagnostic
@@ -748,6 +923,20 @@ def main() -> None:
         "phase_preserving_dual_band": bool(args.phase_preserving_dual_band),
         "phase_readout_stored_as_second_map_feature": False,
         "phase_readout_policy_sha256": phase_policy_sha256,
+        "dense_geometry_head_sha256": dense_geometry_head_sha256,
+        "dense_geometry_role": (
+            (
+                "scale_marginalized_fixed_denominator_joint_ranking"
+                if joint_likelihood is not None
+                and joint_likelihood.metadata.get("dense_geometry_selected")
+                else "scale_marginalized_fixed_denominator_audit_only"
+            )
+            if dense_geometry_head is not None else None
+        ),
+        "dense_geometry_changes_ranking": bool(
+            joint_likelihood is not None
+            and joint_likelihood.metadata.get("dense_geometry_selected")
+        ),
         "legacy_dual_band_score_enabled": bool(
             args.allow_legacy_dual_band_score and phase_policy is None
         ),
@@ -755,8 +944,9 @@ def main() -> None:
         "stored_map_feature_type_count": 1,
         "stored_downstream_embedding_count": 0,
         "stores_mapping_rgb": False,
-        "uses_point_correspondences": False,
-        "uses_pnp": False,
+        "candidate_proposal_method": proposal_method,
+        "uses_point_correspondences": bool(pool_uses_pnp),
+        "uses_pnp": bool(pool_uses_pnp),
         "resumed_score_artifact_sha256": resume_sha256,
         "base_maximum_modes": int(args.base_maximum_modes),
         "additional_candidate_contract": additional_contract,

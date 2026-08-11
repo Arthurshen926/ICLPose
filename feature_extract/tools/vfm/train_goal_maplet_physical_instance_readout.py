@@ -50,18 +50,51 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--learning_rate", type=float, default=2e-4)
     parser.add_argument("--primitive_loss_weight", type=float, default=0.0)
+    parser.add_argument(
+        "--teacher_compression",
+        default="legacy_block_mean",
+        choices=("legacy_block_mean", "signed_block_sketch"),
+    )
+    parser.add_argument("--teacher_compact_dimensions", type=int, default=64)
+    parser.add_argument(
+        "--selection_metric",
+        default="joint_parent32_child16_primitive8",
+        choices=("joint_parent32_child16", "joint_parent32_child16_primitive8"),
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=1701)
     parser.add_argument("--force", action="store_true")
     return parser.parse_args()
 
 
-def _compress(value: np.ndarray, dimensions: int = 64) -> np.ndarray:
+def _compress(
+    value: np.ndarray,
+    dimensions: int = 64,
+    *,
+    method: str = "legacy_block_mean",
+    seed: int = 0,
+) -> np.ndarray:
     array = np.asarray(value, dtype=np.float32)
     width = int(array.shape[-1])
     if width % int(dimensions):
         raise ValueError("teacher width is not divisible by the compact width")
-    compact = array.reshape(*array.shape[:-1], int(dimensions), width // int(dimensions)).mean(axis=-1)
+    grouped = array.reshape(
+        *array.shape[:-1], int(dimensions), width // int(dimensions),
+    )
+    if str(method) == "legacy_block_mean":
+        compact = grouped.mean(axis=-1)
+    elif str(method) == "signed_block_sketch":
+        # A deterministic signed sketch avoids the common-mode bias of
+        # averaging every teacher channel with the same positive sign.  It is
+        # used only while distilling pairwise teacher affinity; no sketch or
+        # downstream embedding is serialized into the deployment map.
+        signs = np.random.default_rng(int(seed)).choice(
+            (-1.0, 1.0),
+            size=(int(dimensions), width // int(dimensions)),
+        ).astype(np.float32)
+        compact = np.sum(grouped * signs, axis=-1)
+    else:
+        raise ValueError(f"unknown teacher compression: {method}")
     return compact / np.maximum(np.linalg.norm(compact, axis=-1, keepdims=True), 1e-8)
 
 
@@ -103,10 +136,26 @@ def _build_dataset(
             continue
         with np.load(teacher_path, allow_pickle=False) as teacher:
             token_xy = np.asarray(teacher["token_xy"], dtype=np.float32)
-            dino = _compress(np.asarray(teacher["dino_v3_7b"], dtype=np.float32))
-            sam = _compress(np.asarray(teacher["sam3"], dtype=np.float32))
-            siglip_spatial = _compress(np.asarray(teacher["siglip2-g"], dtype=np.float32))
-            siglip_summary = _compress(np.asarray(teacher["siglip2-g_summary"], dtype=np.float32)[None])
+            compression = {
+                "dimensions": int(args.teacher_compact_dimensions),
+                "method": str(args.teacher_compression),
+            }
+            dino = _compress(
+                np.asarray(teacher["dino_v3_7b"], dtype=np.float32),
+                **compression, seed=17011,
+            )
+            sam = _compress(
+                np.asarray(teacher["sam3"], dtype=np.float32),
+                **compression, seed=17013,
+            )
+            siglip_spatial = _compress(
+                np.asarray(teacher["siglip2-g"], dtype=np.float32),
+                **compression, seed=17017,
+            )
+            siglip_summary = _compress(
+                np.asarray(teacher["siglip2-g_summary"], dtype=np.float32)[None],
+                **compression, seed=17017,
+            )
         siglip = _normalize(np.concatenate([
             siglip_spatial,
             np.broadcast_to(siglip_summary, siglip_spatial.shape).copy(),
@@ -422,7 +471,7 @@ def main() -> None:
                 primitive_prototype, field_row_by_primitive, physical,
                 parent_valid, child_valid, device=device,
             )
-            score = float(selection_metrics["joint_parent32_child16_primitive8"])
+            score = float(selection_metrics[str(args.selection_metric)])
             row = {
                 "step": int(step), "loss": float(loss.item()),
                 "parent_loss": float(parent_loss.item()), "child_loss": float(child_loss.item()),
@@ -453,6 +502,11 @@ def main() -> None:
             "sam3": "support_boundary_affinity",
         },
         "teacher_use": "offline_training_only_separate_role_losses",
+        "teacher_compression": {
+            "method": str(args.teacher_compression),
+            "dimensions": int(args.teacher_compact_dimensions),
+            "stored_at_deployment": False,
+        },
         "exact_geometry_supervision": (
             "nearest_observed_2dgs_primitive_within_truth_child_training_only"
             if float(args.primitive_loss_weight) > 0.0 else "disabled_after_g17_v2_ablation"
@@ -464,7 +518,10 @@ def main() -> None:
         "physical_map_sha256": physical.content_sha256,
         "canonical_field_sha256": field.content_sha256,
         "surface_mapper_sha256": file_sha256(Path(args.surface_mapper)),
-        "selection_rule": "maximum_joint_parent32_child16_primitive8_on_predeclared_selection_trajectories",
+        "selection_rule": (
+            f"maximum_{str(args.selection_metric)}_on_predeclared_selection_trajectories"
+        ),
+        "selection_metric": str(args.selection_metric),
         "selected_score": float(best_score),
     })
     result = {
@@ -476,7 +533,8 @@ def main() -> None:
         },
         "baseline_validation": baseline,
         "selected_validation": selected_validation,
-        "selection_best_joint_parent32_child16_primitive8": float(best_score),
+        "selection_metric": str(args.selection_metric),
+        "selection_best_score": float(best_score),
         "history": history,
         "deployment_contract": {
             "map_feature_type_count": 1,
@@ -485,6 +543,7 @@ def main() -> None:
             "stores_mapping_rgb": False,
             "position_preserving_context_token_set": True,
             "separate_regenerable_context_and_local_heads": True,
+            "teacher_compression_stored_at_deployment": False,
         },
         "output_readout": str(output),
     }

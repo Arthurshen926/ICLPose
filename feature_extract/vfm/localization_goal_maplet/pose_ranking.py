@@ -122,6 +122,30 @@ def merge_cascade_identity_rankings(
         np.asarray(cheap.modes.poses_w2c)[final_order],
         score,
         np.asarray(cheap.modes.supporting_region_count)[final_order],
+        (
+            np.asarray(cheap.modes.configuration_parent_rows)[final_order]
+            if cheap.modes.configuration_parent_rows is not None else None
+        ),
+        (
+            np.asarray(cheap.modes.configuration_child_rows)[final_order]
+            if cheap.modes.configuration_child_rows is not None else None
+        ),
+        (
+            np.asarray(cheap.modes.proposal_seed_parent_rows)[final_order]
+            if cheap.modes.proposal_seed_parent_rows is not None else None
+        ),
+        (
+            np.asarray(cheap.modes.proposal_seed_support_rows)[final_order]
+            if cheap.modes.proposal_seed_support_rows is not None else None
+        ),
+        (
+            np.asarray(cheap.modes.mapping_view_anchor_labels)[final_order]
+            if cheap.modes.mapping_view_anchor_labels is not None else None
+        ),
+        (
+            np.asarray(cheap.modes.mapping_view_prior_scores)[final_order]
+            if cheap.modes.mapping_view_prior_scores is not None else None
+        ),
     )
 
     def exact_array(values: np.ndarray) -> np.ndarray:
@@ -246,7 +270,31 @@ def rerank_modes_with_rendered_identity(
     # rendered categorical likelihood defines the ranking semantics.
     order = np.lexsort((-modes.supporting_region_count, -identity))
     reranked = CoarsePoseModes(
-        modes.poses_w2c[order], identity[order], modes.supporting_region_count[order]
+        modes.poses_w2c[order], identity[order], modes.supporting_region_count[order],
+        (
+            modes.configuration_parent_rows[order]
+            if modes.configuration_parent_rows is not None else None
+        ),
+        (
+            modes.configuration_child_rows[order]
+            if modes.configuration_child_rows is not None else None
+        ),
+        (
+            modes.proposal_seed_parent_rows[order]
+            if modes.proposal_seed_parent_rows is not None else None
+        ),
+        (
+            modes.proposal_seed_support_rows[order]
+            if modes.proposal_seed_support_rows is not None else None
+        ),
+        (
+            modes.mapping_view_anchor_labels[order]
+            if modes.mapping_view_anchor_labels is not None else None
+        ),
+        (
+            modes.mapping_view_prior_scores[order]
+            if modes.mapping_view_prior_scores is not None else None
+        ),
     )
     return RenderIdentityRanking(
         modes=reranked,

@@ -15,6 +15,7 @@ from feature_extract.vfm.localization_goal_maplet.physical_instance_readout impo
     transform_canonical_field_for_role,
 )
 from feature_extract.vfm.localization_goal_maplet.canonical_field import CanonicalSurfaceField
+from feature_extract.tools.vfm.train_goal_maplet_physical_instance_readout import _compress
 
 
 def test_position_preserving_region_sets_and_roles() -> None:
@@ -124,3 +125,19 @@ def test_local_role_regenerates_primitive_codes_without_extra_map_payload() -> N
     assert local.metadata["stored_feature_type_count"] == 1
     assert local.metadata["stored_downstream_embedding_count"] == 0
     assert np.allclose(local.codes, field.codes)
+
+
+def test_signed_teacher_sketch_is_deterministic_and_normalized() -> None:
+    value = np.arange(3 * 16, dtype=np.float32).reshape(3, 16) - 7.0
+    first = _compress(
+        value, dimensions=8, method="signed_block_sketch", seed=17,
+    )
+    second = _compress(
+        value, dimensions=8, method="signed_block_sketch", seed=17,
+    )
+    other = _compress(
+        value, dimensions=8, method="signed_block_sketch", seed=19,
+    )
+    assert np.allclose(first, second)
+    assert np.allclose(np.linalg.norm(first, axis=1), 1.0)
+    assert not np.allclose(first, other)

@@ -18,23 +18,39 @@ from feature_extract.vfm.vfm_highres_geometry_head import (
     RadioHighResGeometryHead,
     masked_geometry_loss,
     masked_log_depth_l1,
+    masked_log_depth_gradient_loss,
     masked_normal_cosine_loss,
+    masked_scale_invariant_log_depth_loss,
 )
 
 
 class HighResGeometryDataset(Dataset):
-    def __init__(self, manifest_path: Path, max_records: int = 0, layer_name: str = "radio_final") -> None:
+    def __init__(
+        self,
+        manifest_path: Path,
+        max_records: int = 0,
+        layer_name: str = "radio_final",
+        cache_in_memory: bool = False,
+    ) -> None:
         payload = json.loads(Path(manifest_path).read_text())
         records = list(payload["records"])
         if int(max_records) > 0:
             records = records[: int(max_records)]
         self.records = records
         self.layer_name = str(layer_name)
+        # RADIO token NPZs are deliberately compressed and expensive to decode.
+        # Repeating that work every epoch starves the GPU, while each St Mary's
+        # fold comfortably fits in host RAM.  Keep this opt-in so larger scenes
+        # retain the streaming behaviour.
+        self._cache = (
+            tuple(self._load_item(index) for index in range(len(self.records)))
+            if bool(cache_in_memory) else None
+        )
 
     def __len__(self) -> int:
         return len(self.records)
 
-    def __getitem__(self, index: int) -> dict[str, object]:
+    def _load_item(self, index: int) -> dict[str, object]:
         record = self.records[int(index)]
         with np.load(record["token_path"]) as token_data:
             if self.layer_name not in token_data:
@@ -55,6 +71,11 @@ class HighResGeometryDataset(Dataset):
             "normal": torch.from_numpy(normal),
             "valid": torch.from_numpy(valid),
         }
+
+    def __getitem__(self, index: int) -> dict[str, object]:
+        if self._cache is not None:
+            return self._cache[int(index)]
+        return self._load_item(int(index))
 
 
 def _collate(batch: Sequence[Mapping[str, object]]) -> dict[str, object]:
@@ -212,7 +233,14 @@ def evaluate(
     model.eval()
     depth_rows = []
     baseline_rows = []
+    scale_aligned_rows = []
     normal_rows = []
+    confidence_brier_sum = 0.0
+    confidence_valid_sum = 0.0
+    confidence_invalid_sum = 0.0
+    confidence_count = 0
+    confidence_valid_count = 0
+    confidence_invalid_count = 0
     vis_written = 0
     with torch.no_grad():
         for batch in loader:
@@ -223,13 +251,31 @@ def evaluate(
             output = model(token, output_size=tuple(target_depth.shape[-2:]))
             pred_depth = output.depth.detach().cpu().numpy()
             pred_normal = output.normal.detach().cpu().numpy()
+            pred_confidence = output.confidence.detach().cpu().numpy()
             target_depth_np = target_depth.detach().cpu().numpy()
             target_normal_np = target_normal.detach().cpu().numpy()
             valid_np = valid.detach().cpu().numpy()
+            target_confidence = valid_np.astype(np.float32)
+            confidence_brier_sum += float(np.sum(np.square(pred_confidence - target_confidence)))
+            confidence_count += int(pred_confidence.size)
+            confidence_valid_sum += float(np.sum(pred_confidence[valid_np]))
+            confidence_valid_count += int(np.sum(valid_np))
+            confidence_invalid_sum += float(np.sum(pred_confidence[~valid_np]))
+            confidence_invalid_count += int(np.sum(~valid_np))
             baseline_np = np.full_like(target_depth_np, float(baseline_depth), dtype=np.float32)
             for idx in range(pred_depth.shape[0]):
                 depth_rows.append(compute_depth_metrics(pred_depth[idx], target_depth_np[idx], valid_np[idx]))
                 baseline_rows.append(compute_depth_metrics(baseline_np[idx], target_depth_np[idx], valid_np[idx]))
+                if np.any(valid_np[idx]):
+                    ratio = target_depth_np[idx][valid_np[idx]] / np.maximum(
+                        pred_depth[idx][valid_np[idx]], 1e-6,
+                    )
+                    scale = float(np.median(ratio))
+                else:
+                    scale = 1.0
+                scale_aligned_rows.append(compute_depth_metrics(
+                    pred_depth[idx] * scale, target_depth_np[idx], valid_np[idx],
+                ))
                 normal_rows.append(_normal_metrics(pred_normal[idx], target_normal_np[idx], valid_np[idx]))
             if output_dir is not None and vis_written < int(visualize_limit):
                 _write_visualizations(
@@ -246,8 +292,15 @@ def evaluate(
                 vis_written = min(int(visualize_limit), vis_written + int(pred_depth.shape[0]))
     return {
         "depth": aggregate_depth_metrics(depth_rows),
+        "depth_scale_aligned": aggregate_depth_metrics(scale_aligned_rows),
         "median_depth_baseline": aggregate_depth_metrics(baseline_rows),
         "normal": _aggregate_normal_metrics(normal_rows),
+        "confidence": {
+            "brier": float(confidence_brier_sum / max(confidence_count, 1)),
+            "valid_mean": float(confidence_valid_sum / max(confidence_valid_count, 1)),
+            "invalid_mean": float(confidence_invalid_sum / max(confidence_invalid_count, 1)),
+            "pixel_count": int(confidence_count),
+        },
     }
 
 
@@ -267,8 +320,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--normal_weight", type=float, default=0.25)
+    parser.add_argument("--confidence_weight", type=float, default=0.10)
+    parser.add_argument("--absolute_depth_weight", type=float, default=1.0)
+    parser.add_argument("--scale_invariant_depth_weight", type=float, default=0.0)
+    parser.add_argument("--depth_gradient_weight", type=float, default=0.0)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument("--cache_in_memory", action="store_true")
+    parser.add_argument("--amp", action="store_true")
     parser.add_argument("--visualize", type=int, default=4)
     parser.add_argument("--seed", type=int, default=0)
     return parser.parse_args()
@@ -283,8 +342,14 @@ def main() -> None:
         torch.cuda.manual_seed_all(int(args.seed))
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    train_dataset = HighResGeometryDataset(Path(args.train_geometry_manifest), int(args.max_train_records), args.layer_name)
-    eval_dataset = HighResGeometryDataset(Path(args.eval_geometry_manifest), int(args.max_eval_records), args.layer_name)
+    train_dataset = HighResGeometryDataset(
+        Path(args.train_geometry_manifest), int(args.max_train_records), args.layer_name,
+        cache_in_memory=bool(args.cache_in_memory),
+    )
+    eval_dataset = HighResGeometryDataset(
+        Path(args.eval_geometry_manifest), int(args.max_eval_records), args.layer_name,
+        cache_in_memory=bool(args.cache_in_memory),
+    )
     if len(train_dataset) == 0:
         raise ValueError("empty training geometry manifest")
     if len(eval_dataset) == 0:
@@ -301,6 +366,8 @@ def main() -> None:
         architecture=str(args.architecture),
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
+    amp_enabled = bool(args.amp) and device.type == "cuda"
+    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
     train_loader = DataLoader(
         train_dataset,
         batch_size=int(args.batch_size),
@@ -328,23 +395,30 @@ def main() -> None:
             target_depth = batch["depth"].to(device=device, dtype=torch.float32)
             target_normal = batch["normal"].to(device=device, dtype=torch.float32)
             valid = batch["valid"].to(device=device, dtype=torch.bool)
-            output = model(token, output_size=tuple(target_depth.shape[-2:]))
-            if str(args.task) == "depth_only":
-                loss = masked_log_depth_l1(output.depth, target_depth, valid)
-            elif str(args.task) == "normal_only":
-                loss = masked_normal_cosine_loss(output.normal, F.normalize(target_normal, dim=1, eps=1e-6), valid)
-            else:
-                loss = masked_geometry_loss(
-                    output.depth,
-                    output.normal,
-                    target_depth,
-                    F.normalize(target_normal, dim=1, eps=1e-6),
-                    valid,
-                    normal_weight=float(args.normal_weight),
-                )
+            with torch.cuda.amp.autocast(enabled=amp_enabled):
+                output = model(token, output_size=tuple(target_depth.shape[-2:]))
+                if str(args.task) == "depth_only":
+                    loss = masked_log_depth_l1(output.depth, target_depth, valid)
+                elif str(args.task) == "normal_only":
+                    loss = masked_normal_cosine_loss(output.normal, F.normalize(target_normal, dim=1, eps=1e-6), valid)
+                else:
+                    loss = masked_geometry_loss(
+                        output.depth,
+                        output.normal,
+                        target_depth,
+                        F.normalize(target_normal, dim=1, eps=1e-6),
+                        valid,
+                        normal_weight=float(args.normal_weight),
+                        pred_confidence=output.confidence,
+                        confidence_weight=float(args.confidence_weight),
+                        absolute_depth_weight=float(args.absolute_depth_weight),
+                        scale_invariant_depth_weight=float(args.scale_invariant_depth_weight),
+                        depth_gradient_weight=float(args.depth_gradient_weight),
+                    )
             optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            optimizer.step()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             losses.append(float(loss.detach().cpu()))
             valid_counts.append(int(torch.sum(valid).detach().cpu()))
         history.append(

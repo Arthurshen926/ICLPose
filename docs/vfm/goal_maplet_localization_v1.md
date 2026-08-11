@@ -1597,6 +1597,360 @@ query displacement/order and whose child likelihood is marginalized under
 pose; only after it raises candidate coverage should projected-tile
 region-to-surface refinement be evaluated.
 
+## G20.4 pose-conditioned query-edge audit
+
+G20.4-A implements the missing factor without training or changing the
+production candidate pool.  Query topology is fixed before a candidate is
+examined: four nearest-neighbour edges and two long-range edges are built from
+normalized query-region locations and RADIO context contrast.  For a pose and
+surface assignment, child tangent rectangles are projected into the same
+camera image and signed displacement is scored by an extent-normalized analytic
+Huber loss.  Relative scale and left/right/above/below order are reported as
+separate measurements, so no fitted weight can hide a failed displacement
+hypothesis.
+
+The three B1 frames all pass the oracle factor gate:
+
+| frame | truth - current all-edge | truth - hardest near-phase all-edge | long-range | distinctive-context |
+|---|---:|---:|---:|---:|
+| 00139 | +0.346 | +0.119 | +1.559 | +0.968 |
+| 00144 | +0.188 | +0.059 | +1.281 | +0.455 |
+| 00155 | +0.063 | +0.033 | unavailable on the common assigned subset | +0.155 |
+
+Here the truth configuration pose is taken from the already frozen
+oracle-parent/runtime-child candidate pool.  It is independent of edge
+evaluation.  A same-support PnP sanity control is deliberately not accepted:
+on frame 00139 it creates a self-consistent edge residual at **20.32 m / 109.8
+degrees**, demonstrating that using the same correspondences to generate and
+validate a pose is circular.  This check fixes an important evaluation bug in
+the first draft of the audit.
+
+The factor result is positive, but the G20.4-B search gate is not.  An
+assignment/SE(3)-diverse diagnostic expanded frame 00139 to 4,096 parent
+configurations and retained 512 raw poses.  It still produced zero candidates
+within 1 m / 10 degrees; the best joint candidate remains 5.87 m / 18.99
+degrees, and even the minimum-translation candidate is 2.94 m with unusable
+rotation.  An oracle physical-translation audit also rejects the historical
+rigid-transport shortcut: although truth/current parents show a dominant
+4--9 m facade shift, nearest translated candidates recover only 35--53% of
+truth parents and solve to 7.97--14.45 m.
+
+Therefore only the analytic query-edge factor and its fail-closed audit are
+promoted.  The wide beam, random provisional-PnP and rigid transport branches
+are not present in the production entry point.  This result narrows the next
+foundational gate further: improve the pose-sufficient parent-support and
+configuration proposal process under mapping-trajectory LOTO, then replay one
+frozen Top-32 regression.  G20.5 child mixtures, G20.6 projected-tile
+likelihood and G21 remain closed until that proposal gate improves 14/17
+within-one-metre coverage.
+
+## G20.5 RADIO geometry as a configuration proposal factor
+
+G20.5 changes the missing variable rather than widening the old graph beam.
+The clean PLY is used only for exact primitive membership because it has lost
+the oriented 2DGS tangent frames; centers, tangents, scales, opacity and
+normals are read from the original oriented 2DGS through `source_index`.
+Using the clean PLY itself as oriented geometry was a real label-generation
+error and is now rejected.  The resulting 509,572-element labels supervise a
+small, regenerable RADIO-final head on mapping images.  Mapping RGB is not
+stored.  Under outer trajectory holdout its scale-aligned depth AbsRel is
+0.135/0.141 for seq12/seq14, versus 0.634/0.735 for a constant-depth baseline;
+mean normal error is 26.23/26.76 degrees.
+
+The proposal is deliberately not PnP.  Two query-region/physical-child
+hypotheses define a relative metric relation, query geometry chooses a third
+region, and a three-region Sim(3) alignment estimates rotation and translation
+while marginalizing the one global query-depth scale.  A deterministic pair
+beam then evaluates every provisional pose against all fixed query supports
+using projected 2DGS surface support and the signed query-edge graph.  The
+output remains a multimodal Top-32 physical configuration/SE(3) set; no point
+descriptor, SfM track, raw mapping image or stored downstream embedding is
+introduced.
+
+The frozen 17-query outer-fold candidate result is a genuine coverage gain:
+
+| fixed Top-32 candidate set | strict | 1 m/10 deg | median t | P90 t | P90 r |
+|---|---:|---:|---:|---:|---:|
+| G20.3 graph | 12/17 | 14/17 | 0.227 m | 4.491 m | 11.813 deg |
+| G20.5 geometry | **13/17** | **15/17** | **0.210 m** | **3.286 m** | **4.819 deg** |
+
+An oracle-parent/runtime-child control reaches 17/17 within one metre, and the
+geometry proposal reaches 0.221 m/2.90 degrees and 0.089 m/1.14 degrees on the
+previously failed 00139/00144 frames under that control.  This proves both the
+query-geometry-to-pose path and the 2DGS geometry are usable.  With actual
+retrieval, 00144 is newly recovered at 0.802 m/4.78 degrees; 00139 and 00155
+remain configuration-identity misses.  Increasing candidate slots, using
+identity-free regrouping or normal-guided initialization does not recover
+them, so those variants are not promoted.
+
+Parameter-free Stage C does not yet convert all of the candidate gain into one
+pose:
+
+| Stage-C Top-1 | strict | 1 m/10 deg | median t | P90 t | median r | P90 r |
+|---|---:|---:|---:|---:|---:|---:|
+| G20.3 graph | 11/17 | 14/17 | 0.329 m | 5.868 m | 1.149 deg | 6.878 deg |
+| G20.5 geometry | **12/17** | 14/17 | **0.318 m** | **3.552 m** | 1.626 deg | **6.675 deg** |
+
+The exact failure is now observable.  On 00144 the phase score places the
+0.802 m candidate fourth and selects a 1.247 m candidate.  Six rounds of
+continuous surface flow improve the selected pose only to 1.213 m; refining
+the correct mode improves it to 0.697 m, but its final feature score remains
+lower.  This is a repeated-facade likelihood ambiguity, not a missing local
+optimizer basin.
+
+A further dense audit compares RADIO-predicted query depth/normals with the
+complete rendered 2DGS depth/normals.  It marginalizes one query-depth scale
+and uses a fixed confident-query denominator.  This factor correctly prefers
+the recovered 00144 mode (0.933 versus 0.919), but using it alone over all 17
+queries falls to 9/17 strict and 13/17 within one metre.  No post-hoc threshold
+is promoted.  It is retained as lineaged evidence for a future query-disjoint
+calibration of a joint appearance/geometry likelihood.
+
+Therefore G20.5 passes the fixed-budget **candidate proposal** gate and is the
+new research proposal branch, but it does not replace the frozen graph Top-1
+policy.  The next admissible experiment is not another beam or scalar weight
+sweep: it is a mapping-trajectory-LOTO calibration of the joint phase and
+dense-geometry likelihood, followed by one untouched outer-fold replay.  In
+parallel, the two remaining candidate failures require better physical-parent
+identity evidence, not Stage-C refinement.
+
+## G20.6 map/query/head-disjoint likelihood and mapping-teacher audit
+
+G20.6 executes that experiment with three independent leakage barriers.  The
+canonical field excludes the evaluated query trajectory, the geometry head
+excludes the evaluation and calibration trajectories, and likelihood fitting
+uses trajectory LOTO over seq3/seq5/seq13 before frozen transfer to seq12/14.
+Candidate pools are unchanged.  Every candidate exposes four typed quantities:
+proposal identity, frozen surface phase, fractional observation quality and
+scale-marginalized rendered/query geometry.  They are normalized only within
+the same query by robust median/IQR statistics and receive non-negative
+weights, so cross-map transfer does not depend on an absolute feature-score
+scale.
+
+This stricter protocol changes the conclusion suggested by the G20.5
+single-frame audit.  Fold-specific heads give dense geometry positive LOTO
+weights, but the frozen outer replay gains no strict or one-metre successes.
+On seq12 its translation P90 changes from 7.011 m to 7.180 m and rotation P90
+from 9.983 to 11.965 degrees; on seq14 the median/P90 translation changes from
+0.182/0.326 m to 0.276/0.405 m.  The combined result is therefore rejected:
+
+| frozen 17-query Stage C | strict | 1 m/10 deg | median t | P90 t | median r | P90 r |
+|---|---:|---:|---:|---:|---:|---:|
+| G20.5 phase | 12/17 | 14/17 | **0.318 m** | **3.552 m** | 1.626 deg | **6.675 deg** |
+| phase + dense geometry | 12/17 | 14/17 | 0.334 m | 3.620 m | 1.855 deg | 7.468 deg |
+
+The common-head fit drives both proposal identity and dense geometry to exactly
+zero and retains only phase plus a small fractional-observation reliability
+term.  This fallback passes the predeclared outer development gates: strict
+success rises from 12/17 to **13/17**, rotation median improves from 1.626 to
+**1.246 degrees**, no query is worsened, and one-metre success, catastrophic
+rate and translation median/P90 remain exactly 14/17, 2/17 and
+0.318/3.552 m.  It is the selected G20.6 development policy, but is not a
+production promotion because no untouched test has been evaluated.  In
+particular, seq12 00139/00155 still contain no correct candidate; reranking
+cannot remove those failures.  On 00144 the runtime Top-16 contains a
+0.802 m/4.78 degree mode but still selects 1.247 m/4.47 degrees, so successful
+entry-point replay is not confused with a recovered strict localization.
+
+The requested use of all three RADIO downstream adaptors at mapping time is
+also audited without changing the deployment map contract.  Replacing the old
+64-D block means with a deterministic signed 128-D teacher sketch greatly
+improves preservation of teacher cosine geometry: DINO 0.899 to 0.940, SAM
+0.747 to 0.951 and SigLIP 0.921 to 0.965.  The sketch is mapping-only and is
+never stored in the deployed map.  Nevertheless, two readout seeds reach only
+0.7587/0.7597 joint parent-R@32/child-R@16 versus **0.7615** for the frozen G17
+readout.  The new compression and both readouts are therefore rejected.  This
+separates representation fidelity from endpoint utility and avoids replacing a
+validated readout merely because its teacher reconstruction is better.
+
+The actual verifier has replayed the selected policy on a frozen seq12 query.
+Its lineaged contract confirms one stored canonical VFM field, zero stored
+downstream embeddings, no mapping RGB, no point correspondence and no PnP; the
+unselected dense head is not loaded.  G20.6 consequently closes the Stage-C
+fusion question: the next high-return change is upstream physical-parent/
+configuration identity evidence that creates a valid mode for 00139/00155,
+not a larger likelihood model or another scalar fusion sweep.
+
+## G20.7 latent phase/child marginalization audit
+
+G20.7 tests the upstream failure directly instead of widening the existing
+beam again.  The experimental `soft_geometry` route aggregates retrieval mass
+into anonymous physical-phase anchors, proposes metric SE(3) modes with the
+cross-fit RADIO geometry head, and postpones parent/child identity until after
+a pose exists.  Query edges and complete projected 2DGS child rectangles are
+scored in the same normalized image frame.  The map contract is unchanged:
+one canonical VFM primitive field, no stored downstream embedding, no mapping
+RGB, no point correspondence and no PnP.
+
+The audit found and fixed three correctness problems:
+
+1. Stage C now has a typed all-candidates-wrong state.  Its v2 likelihood fits
+   candidate weights and a null logit jointly; production replay fails closed
+   when only a development policy is supplied, unless an explicit development
+   override is requested.
+2. The pair beam no longer scores an ambiguous phase by taking the best of K
+   independent extension residuals.  It marginalizes explained probability
+   mass, eliminating the look-elsewhere reward for diffuse wrong phases.
+3. Runtime surface identity is marginalized over `8 parent x 4 child`
+   alternatives from the same canonical field.  Out-of-map mass weights a
+   support's pose evidence, while truncated-parent and unretained-child mass
+   remain explicit missing identity.  No extra descriptor is stored per
+   maplet or anchor.
+
+The causal result is informative but does **not** pass promotion.  With the
+same geometry generator and only oracle parent identities, seq12 frame00139
+recovers 0.303 m/1.966 degrees at Top-1 and frame00155 contains
+0.449 m/1.437 degrees at Top-16.  Actual retrieval therefore remains the
+limiting variable.  Probability-marginal phase anchors improve frame00139's
+raw seed beam from no one-metre candidate to four; the best is
+0.967 m/8.119 degrees.  Frame00155 still has no one-metre seed.
+
+Most importantly, retaining every bounded phase seed proves that the present
+pose likelihood is not yet the missing solution.  Frame00139 carries all four
+correct seeds through a 6,232-pose final scoring pool, but neither the
+mass-conserving conditional likelihood nor the parent x child version places
+one in Top-32.  Static per-anchor quotas also fail before final scoring.  The
+full seq12/seq14 replay is intentionally stopped at this predeclared gate; it
+would only repeat a known candidate-ranking failure at much higher cost.
+
+Consequently `soft_geometry` remains an isolated research mode and the frozen
+G20.6 development policy remains selected.  The next admissible method change
+is a batched pose-conditioned canonical-VFM feature-map likelihood over sparse,
+possibly disconnected rendered maplet regions.  It must compare query and map
+VFM tensors after the pose, rather than reuse independent retrieval posterior
+mass as a surrogate pose score.  Its gates are: recover the frame00139 seed in
+Top-32, create a one-metre frame00155 seed, then improve the frozen 17-query
+success/P90 before any untouched test.
+
+### G20.8 — pose-conditioned primitive VFM and selective SE(3) refinement
+
+G20.8 implements the missing pose-conditioned measurement without adding a
+second map feature. Every clean-2DGS primitive centre participates in a
+batched z-buffer; a visible primitive contributes the single canonical RADIO
+code stored for that physical surface, and a primitive without a canonical
+code remains an occluder. Query/map cosine is accumulated on the complete
+48x48 query-token grid, so missing coverage cannot improve the score. This is
+continuous-surface evidence, not retrieval posterior reuse, a point matcher or
+PnP.
+
+The first implementation audit exposed a protocol error in the experimental
+replay: the old baseline used the symmetric `context` directional readout,
+whereas the new report had defaulted to the `local` Jacobian readout. The
+policy SHA and score scale differed. All G20.8 comparisons below were rerun
+with the matching fold-local field/readout, context policy and 2x render. The
+invalid cross-policy score union is retained only as a negative diagnostic.
+
+Three representation levels were tested:
+
+- one aggregated child descriptor destroys within-child phase and leaves the
+  frame00139 correct mode around rank 1,394;
+- eight stratified physical primitives per child cover only about 10% of the
+  grid and do not recover Top-32;
+- all 509,572 physical primitive centres recover the direction of the exact
+  clean-2DGS score and evaluate a two-pose gate in about 0.06 s after load.
+
+The dense-centre score is still not a valid replacement proposal expert. On
+the frozen seq12/seq14 pools, exact Stage C gives 12/17 strict and 13/17 within
+1 m, versus 12/17 and 14/17 for the old phase baseline. Combining old Top-16
+and new Top-4 candidates by exact phase gives 11/17 strict; the G20.6 joint
+posterior gives 12/17. A source-conditioned gate trained on seq3/seq5/seq13
+also has no LOTO gain. Therefore the new expert is not merged into Stage B.
+
+The same score is effective as a local optimization objective. The selected
+operator evaluates the current pose and the positive/negative directions of
+all six left-SE(3) axes in one batch, using a fixed
+`0.60/0.40/0.25/0.12 m` and `5/3/2/1 degree` trust-region schedule. A step is
+accepted only when the fixed-grid primitive VFM score increases. Because an
+increasing coarse VFM score is not sufficient for decreasing metric error, an
+explicit two-feature risk gate controls whether the refiner is called:
+
+```text
+joint phase posterior max <= 0.5374847939
+and phase Top-2 margin >= 0.0031293709
+```
+
+Both features are defined within the same query candidate set; the gate
+stores no scene feature. The thresholds are fitted on seq3/seq5/seq13. Outer
+trajectory LOTO changes strict success from 8/12 to 9/12, retains 12/12 within
+1 m/10 degrees and zero catastrophes, and does not lose a strict or loose
+success in any fold. The gate therefore passes its declared development
+promotion criterion.
+
+Frozen seq12/seq14 replay against the G20.6 selected poses gives:
+
+| 17-query development replay | strict 0.5 m/5 deg | within 1 m/10 deg | translation median/P90 | rotation median/P90 | catastrophic |
+|---|---:|---:|---:|---:|---:|
+| G20.6 | 13/17 | 14/17 | 0.318 / 3.552 m | 1.246 / 6.675 deg | 2/17 |
+| G20.8 selective primitive refinement | **13/17** | **15/17** | 0.333 / **3.365 m** | **1.171** / 6.675 deg | 2/17 |
+
+The new success is seq12 frame00144, refined from 1.247 m/4.470 degrees to
+0.935 m/4.470 degrees. Unconditional refinement is explicitly rejected: it
+would reduce strict seq12 success from 6/11 to 5/11. The remaining failure
+ceiling is still upstream identity/configuration recall: frame00139 and
+frame00155 remain catastrophic, and neither the primitive proposal pool nor
+local refinement creates a valid basin for them. G20.8 is therefore the new
+selected development policy, but production/paper promotion remains closed
+until an untouched test is run and those two null modes are addressed.
+
+### G21 — feature-free mapping-view topology and full-map VFM state verification
+
+G21 addresses the remaining failure from first principles: independent
+maplet identities do not encode which repeated surfaces were jointly visible
+from one realizable camera state. A new mapping-view graph therefore stores
+only calibrated mapping poses and sparse pose-to-physical-maplet incidence.
+It stores no mapping RGB, image ID/path, VFM tensor, downstream embedding,
+SfM point/track or correspondence. Query interaction remains deferred: the
+view graph first turns the existing parent posterior into higher-order
+structural pose hypotheses, and the sole canonical primitive RADIO field then
+verifies those hypotheses against the query.
+
+Three implementation errors exposed by the tail audit are now fixed:
+
+1. global and within-anchor truncation used to delete structurally equivalent
+   hypotheses before their appearance was evaluated; mapping-view anchor
+   provenance and per-anchor survival are now explicit;
+2. the first VFM verifier rendered only the seed's three hypothesized maplets,
+   making its evidence circular; the selected verifier renders the complete
+   physical map, uses an 8-primitives-per-child prescreen, then exact
+   all-primitive verification for the retained 128 states;
+3. the first union replay used the baseline report's rank one rather than the
+   frozen G20.6 likelihood decision. In particular, this changed seq12
+   frame00097 from 0.352 m to 0.582 m. The replay now resolves the deployed
+   pre-order index through the report's stored ranking permutation, checks the
+   report hash, and reads no metric-error label.
+
+The causal frame00155 trace demonstrates the resulting chain. The
+mapping-view hyperedge generator creates a 0.464 m/4.392 degree hypothesis,
+but it is raw rank 4,590/16,033 and rank 67/508 within its structural anchor.
+Full-map sparse VFM moves it to rank 104/3,840; exact all-primitive VFM moves
+it to rank 2. Correspondence-free SE(3) alignment then produces
+0.470 m/2.168 degrees. The remaining rank-one alias and the correct state
+have nearly equal final primary scores, so arbitrary cross-expert maximum
+score is not safe.
+
+Deployment replay consequently treats the added graph as an optional state
+expert, not a replacement pipeline. The existing query-local G20.8 gate
+decides whether the expert is invoked. The frozen baseline state is always
+kept. A calibration-only lower control limit on the baseline's full-grid
+primitive score defines a typed null; a non-null baseline cannot be
+overridden, while a null baseline can be replaced only when radius-0 and
+radius-1 rendering select the same state. This protects frame00144 from a
+41 m/178 degree repeated-facade alias and makes frame00155 the only changed
+output among all 17 frozen queries.
+
+| frozen 17-query replay | strict 0.5 m/5 deg | within 1 m/10 deg | translation median/P90 | rotation median/P90 | catastrophic |
+|---|---:|---:|---:|---:|---:|
+| G20.8 selected | 13/17 | 15/17 | 0.333 / 3.365 m | 1.171 / 6.675 deg | 2/17 |
+| G21 protected state union | **14/17** | **16/17** | **0.333 / 0.805 m** | **1.171 / 3.731 deg** | **1/17** |
+
+Frame00139 remains a genuine proposal-generation failure: the mapping-view
+generator's best state is 1.059 m/3.946 degrees and does not survive exact
+screening. G21 is therefore a credible method-level development gain, but
+not a production or paper-test result. The absolute typed-null control limit
+also transfers across fold-local fields; its next required replacement is a
+trajectory- and map-fold-cross-fitted, coverage-conditioned likelihood ratio.
+Only after that calibration and an untouched test may G21 be promoted.
+
 ## Development-set result
 
 The best deployable Goal-Maplet Top-1 remains the frozen graph v9 result, not
@@ -1633,6 +1987,12 @@ relevant, but it does not yet meet the requested accuracy.
 | M3.7 typed competing-phase likelihood | correctness pass / production fail | exact geometry audit passes; seq11 strict 18.18% and zero catastrophe, but 1.335/2.670 m and no transferable phase basin |
 | M3.8 phase-survival/readout | method pass / production fail | phase survives through mapper (81.82% pair concordance); selected coordinate-free phase readout reaches 0.625/0.854 m, 45.45% strict, 90.91% within 1 m and zero catastrophe on seq11 |
 | M3.9 fractional Jacobian phase | implementation pass / protocol fail | self-map trajectory LOTO phase-only 0.235/0.661 m and 87.80% strict; all 115 evidence images contributed to the canonical field, so cross-acquisition accuracy is unproven |
+| M3.10 pose-conditioned query edges | oracle factor pass / solver fail | truth beats current and eight near-phase configurations on all 3 B1 frames; 4,096-config/512-pose search still has zero 1 m candidates on 00139 |
+| M3.11 RADIO geometry proposal | candidate pass / Top-1 partial | Top-32 rises from 14/17 to 15/17 within 1 m; Stage C improves strict 11/17 to 12/17 and P90 5.868 to 3.552 m, but remains 14/17 within 1 m |
+| M3.12 disjoint joint likelihood | reliability pass / dense geometry fail | phase+observation raises strict 12/17 to 13/17 with zero losses; dense geometry gains no success and regresses outer P90; production remains closed |
+| M3.13 latent phase/child marginalization | correctness pass / production fail | oracle parent gives 0.303/0.449 m on the two tail frames and phase marginalization creates four 1 m seeds on 00139, but a 6,232-pose all-phase audit still ranks none in Top-32 and 00155 remains uncovered |
+| M3.14 primitive VFM trust region | development pass / production open | seq3/5/13 LOTO 8/12 -> 9/12 strict without success loss; held seq12/14 replay preserves 13/17 strict and improves 1 m success 14/17 -> 15/17, but two catastrophes remain |
+| M3.15 mapping-view state expert | method pass / production open | corrected frozen replay changes only frame00155, reaching 14/17 strict, 16/17 within 1 m and one catastrophe; frame00139 and cross-map typed-null calibration remain open |
 | M4 refiner handoff | self-map basin pass / closed | factor-2 Jacobian phase passes the numerical six-DoF checks, but query/map overlap blocks G21 until a disjoint field and candidate pool are rebuilt |
 | M5 final paper claim | fail | no untouched test, hard-subset comparison or target accuracy |
 
@@ -1649,6 +2009,7 @@ Do not continue by tuning these components:
 - current child local head;
 - detector-only ALIKE + RADIO matching;
 - larger virtual pose lattices or graph-weight sweeps.
+- wider static/transport configuration beams without a new proposal factor.
 
 ## Required foundational work
 
@@ -1749,6 +2110,25 @@ not an unsupported claim that VFM regions directly yield centimetre pose.
 - G20.3 fixed conditioned/pre-NMS/oracle ladders: `goal_maplet/map_crossfit_g20_1/hold_seq{12,14}/candidate_pool_conditioned_child_g20_3.json`, `candidate_pool_conditioned_child_pre_nms_g20_3.json`, `candidate_pool_oracle_ladder_g20_3.json`
 - G20.3 corrected parameter-free Stage-C replays: `goal_maplet/map_crossfit_g20_1/hold_seq{12,14}/directional_report_conditioned_child_g20_3.json`
 - G20.3 lineaged decision: `goal_maplet/map_crossfit_g20_1/g20_3_candidate_coverage_decision.json`
+- G20.4-A query-edge oracle audit: `goal_maplet/map_crossfit_g20_1/hold_seq12/query_edge_oracle_audit_g20_4_a.json`
+- G20.4-B rejected wide frame-00139 coverage audit: `goal_maplet/map_crossfit_g20_1/hold_seq12/candidate_pose_conditioned_wide_frame00139_g20_4_b.json`
+- G20.4 lineaged decision: `goal_maplet/map_crossfit_g20_1/g20_4_query_edge_decision.json`
+- G20.5 outer-fold RADIO geometry heads and reports: `goal_maplet/g20_5_geometry/head_relative_hold_seq{12,14}`, `goal_maplet/map_crossfit_g20_1/hold_seq{12,14}/candidate_pool_relative_geometry_g20_5_j.json`
+- G20.5 Stage-C and dense rendered-geometry audits: `goal_maplet/map_crossfit_g20_1/hold_seq{12,14}/directional_report_relative_geometry_g20_5_j.json`, `directional_report_relative_geometry_dense_audit_g20_5_k.json`
+- G20.5 lineaged decision: `goal_maplet/map_crossfit_g20_1/g20_5_geometry_decision.json`
+- G20.6 strict LOTO likelihood and selected development policy: `goal_maplet/g20_6_joint/joint_loto_common_transfer.json`, `goal_maplet/g20_6_joint/joint_policy_common_transfer.json`
+- G20.6 rejected fold-specific dense-geometry audits: `goal_maplet/g20_6_joint/joint_loto_head_seq{12,14}.json`
+- G20.6 mapping-teacher compression/readout audit: `goal_maplet/g20_6_mapping/teacher_compression_audit.json`, `goal_maplet/g20_6_mapping/physical_instance_readout_signed128_seed{1720,1721}.json`
+- G20.6 runtime smoke and lineaged decision: `goal_maplet/g20_6_joint/runtime_smoke_seq12_frame00144.json`, `goal_maplet/g20_6_decision.json`
+- G20.7 latent-phase diagnostics: `goal_maplet/g20_7_soft/oracle_parent_geometry_frame001{39,55}.json`, `goal_maplet/g20_7_soft/candidate_marginal_phase_frame001{39,55}.json`, `goal_maplet/g20_7_soft/candidate_all_phase_likelihood_frame00139.json`, `goal_maplet/g20_7_soft/candidate_parent_child_marginal_all_phase_frame00139.json`
+- G20.7 lineaged decision: `goal_maplet/g20_7_soft/g20_7_decision.json`
+- G20.8 sparse primitive experiments and selected replay: `goal_maplet/g20_8_sparse_vfm/`
+- G20.8 refinement gate: `goal_maplet/g20_8_sparse_vfm/primitive_refinement_gate.json`
+- G20.8 frozen 17-query evaluation: `goal_maplet/g20_8_sparse_vfm/selective_refinement_test.json`
+- G21 fold-local mapping-view graphs: `goal_maplet/map_crossfit_g20_1/hold_seq{12,14}/mapping_view_graph_g21.npz`
+- G21 causal tail audits and gated candidates: `goal_maplet/g21_mapping_view/`
+- G21 corrected frozen replays: `goal_maplet/g21_mapping_view/g21_protocol_corrected_state_union_seq{12,14}.json`
+- G21 lineaged decision: `goal_maplet/g21_mapping_view/g21_decision.json`
 - rejected teacher-weighted field/readout: `goal_maplet/canonical_surface_field_teacher_g17_v3.npz`, `goal_maplet/physical_instance_readout_teacher_g17_v3.pt`
 - rejected conditional rank: `goal_maplet/pose_modes_graph_conditionalrank_dev48_v17.json`
 - 4x GT round-trip audit: `goal_maplet/surface_basin_radio_pca256_supersample4_oracle_smoke_gt1round_v4.json`
@@ -1760,3 +2140,32 @@ policy loading, conditional null semantics and the basin gate.  G20.1 adds
 strict holdout mapper evaluation, typed v1/v2 basin dispatch, parameter-free
 operator contracts, exact fold merging, candidate-ceiling decomposition and
 held-trajectory lineage rejection.
+
+Focused G20.5 verification: `161 passed` across all Goal-Maplet tests plus the
+2DGS geometry-label, canonical-field and RADIO high-resolution geometry-head
+tests.  This includes clean/oriented PLY lineage, scale-invariant depth losses,
+fixed-denominator dense geometry evidence, decomposed posterior mass, query
+edges, configuration provenance and dominant-child render caching.
+
+Focused G20.6 verification: `164 passed` on the same scope.  The added tests
+cover monotonic joint-likelihood semantics, robust query-local normalization,
+fail-closed component contracts and deterministic signed teacher sketches.
+
+Focused G20.7 verification: `169 passed`.  The new coverage checks typed
+candidate/null mass conservation, parent-conditioned top-L child
+marginalization, recovery from an incorrect descriptor Top-1 child, and both
+hard and soft geometry-proposal branches.  `compileall` and `git diff --check`
+also pass.
+
+Focused G20.8 verification adds the sparse child/primitive pose likelihood,
+all-primitive fixed-grid occlusion semantics, monotone SE(3) trust-region and
+low-capacity refinement-gate tests. The focused changed scope passes 16 tests;
+the complete current `tests/test_goal_maplet_*` regression passes 157 tests.
+
+Focused G21 verification adds feature-free mapping-view graph serialization,
+conditional in-map posterior invariance, deployed-baseline permutation and
+lineage checks, structural-anchor provenance, hierarchical full-map primitive
+screening and protected multi-expert state replay. The current Goal-Maplet
+suite passes 165 tests; including changed Gaussian-field and RADIO geometry
+head scope gives **185 passed**. Python compilation and `git diff --check`
+also pass.

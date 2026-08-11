@@ -84,7 +84,14 @@ def render_surface_identity(
     return RenderedSurfaceIdentity(primitive.reshape(shape), mask.reshape(shape))
 
 
+_DOMINANT_CHILD_OWNER_CACHE: dict[str, np.ndarray] = {}
+
+
 def dominant_child_owner(physical: GoalMapletPhysicalMap) -> np.ndarray:
+    cache_key = str(physical.content_sha256)
+    cached = _DOMINANT_CHILD_OWNER_CACHE.get(cache_key)
+    if cached is not None and cached.shape == (physical.primitive_ids.size,):
+        return cached
     owner = np.full((physical.primitive_ids.size,), -1, dtype=np.int64)
     weight = np.full((physical.primitive_ids.size,), -np.inf, dtype=np.float32)
     for child in range(physical.child_parent_rows.size):
@@ -95,6 +102,8 @@ def dominant_child_owner(physical: GoalMapletPhysicalMap) -> np.ndarray:
         replace = values > weight[rows]
         owner[rows[replace]] = child
         weight[rows[replace]] = values[replace]
+    owner.setflags(write=False)
+    _DOMINANT_CHILD_OWNER_CACHE[cache_key] = owner
     return owner
 
 

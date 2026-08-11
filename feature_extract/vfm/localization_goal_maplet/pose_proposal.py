@@ -25,6 +25,12 @@ class CoarsePoseModes:
     poses_w2c: np.ndarray
     scores: np.ndarray
     supporting_region_count: np.ndarray
+    configuration_parent_rows: np.ndarray | None = None
+    configuration_child_rows: np.ndarray | None = None
+    proposal_seed_parent_rows: np.ndarray | None = None
+    proposal_seed_support_rows: np.ndarray | None = None
+    mapping_view_anchor_labels: np.ndarray | None = None
+    mapping_view_prior_scores: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         pose = np.asarray(self.poses_w2c, dtype=np.float64)
@@ -32,6 +38,44 @@ class CoarsePoseModes:
         support = np.asarray(self.supporting_region_count, dtype=np.int64).reshape(-1)
         if pose.shape != (score.size, 4, 4) or support.shape != score.shape:
             raise ValueError("invalid coarse pose modes")
+        parent = self.configuration_parent_rows
+        child = self.configuration_child_rows
+        seed = self.proposal_seed_parent_rows
+        seed_support = self.proposal_seed_support_rows
+        mapping_label = self.mapping_view_anchor_labels
+        mapping_score = self.mapping_view_prior_scores
+        if (parent is None) != (child is None):
+            raise ValueError("coarse pose configuration provenance is incomplete")
+        if parent is not None:
+            parent = np.asarray(parent, dtype=np.int64)
+            child = np.asarray(child, dtype=np.int64)
+            if parent.ndim != 2 or child.shape != parent.shape or parent.shape[0] != score.size:
+                raise ValueError("coarse pose configuration provenance differs")
+            object.__setattr__(self, "configuration_parent_rows", parent)
+            object.__setattr__(self, "configuration_child_rows", child)
+        if seed is not None:
+            seed = np.asarray(seed, dtype=np.int64)
+            if seed.ndim != 2 or seed.shape[0] != score.size:
+                raise ValueError("coarse pose seed provenance differs")
+            object.__setattr__(self, "proposal_seed_parent_rows", seed)
+        if (seed is None) != (seed_support is None):
+            raise ValueError("coarse pose seed parent/support provenance is incomplete")
+        if seed_support is not None:
+            seed_support = np.asarray(seed_support, dtype=np.int64)
+            if seed_support.shape != seed.shape:
+                raise ValueError("coarse pose seed support provenance differs")
+            object.__setattr__(self, "proposal_seed_support_rows", seed_support)
+        if (mapping_label is None) != (mapping_score is None):
+            raise ValueError("coarse pose mapping-view provenance is incomplete")
+        if mapping_label is not None:
+            mapping_label = np.asarray(mapping_label, dtype=np.int64).reshape(-1)
+            mapping_score = np.asarray(mapping_score, dtype=np.float64).reshape(-1)
+            if mapping_label.shape != score.shape or mapping_score.shape != score.shape:
+                raise ValueError("coarse pose mapping-view provenance differs")
+            if np.any((mapping_label < 0) & np.isfinite(mapping_score)):
+                raise ValueError("unanchored pose cannot carry a mapping-view prior")
+            object.__setattr__(self, "mapping_view_anchor_labels", mapping_label)
+            object.__setattr__(self, "mapping_view_prior_scores", mapping_score)
         object.__setattr__(self, "poses_w2c", pose)
         object.__setattr__(self, "scores", score)
         object.__setattr__(self, "supporting_region_count", support)
@@ -128,6 +172,7 @@ def _score_pose(
     score = float(np.sum(weight * np.log(np.maximum(region_likelihood, floor))) / np.sum(weight))
     best_slot = np.argmax(likelihood, axis=1)
     best_rows = rows[np.arange(rows.shape[0]), best_slot]
+    best_rows[region_likelihood <= np.maximum(floor, 1e-4)] = -1
     aligned_best_rows = np.full((xy.shape[0],), -1, dtype=np.int64)
     aligned_best_rows[selected_regions] = best_rows
     support = int(np.sum(region_likelihood > np.maximum(floor, 1e-4)))
@@ -212,7 +257,7 @@ def generate_region_pose_modes(
     region_probability /= np.sum(region_probability)
     rng = np.random.default_rng(int(random_seed))
     matrix, distortion = camera_matrix_and_distortion(camera)
-    candidates: list[tuple[float, int, np.ndarray]] = []
+    candidates: list[tuple[float, int, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
     for _ in range(int(proposal_trials)):
         region = rng.choice(
             eligible, size=int(minimal_region_count), replace=False,
@@ -253,8 +298,14 @@ def generate_region_pose_modes(
         if not np.isfinite(score):
             continue
         pose = _refine_region_mode(pose, xy, posterior, physical, camera, chosen)
-        score, support, _ = _score_pose(pose, xy, extent, posterior, physical, camera=camera)
-        candidates.append((score, support, pose))
+        score, support, chosen = _score_pose(pose, xy, extent, posterior, physical, camera=camera)
+        parent_rows = np.full(chosen.shape, -1, dtype=np.int64)
+        valid_chosen = chosen >= 0
+        parent_rows[valid_chosen] = physical.child_parent_rows[chosen[valid_chosen]]
+        candidates.append((
+            score, support, pose, parent_rows, chosen,
+            np.full((2,), -1, dtype=np.int64),
+        ))
     candidates.sort(key=lambda value: (-value[0], -value[1]))
     retained: list[tuple[float, int, np.ndarray]] = []
     for candidate in candidates:
@@ -276,6 +327,16 @@ def generate_region_pose_modes(
         poses_w2c=np.asarray([value[2] for value in retained], dtype=np.float64).reshape(-1, 4, 4),
         scores=np.asarray([value[0] for value in retained], dtype=np.float64),
         supporting_region_count=np.asarray([value[1] for value in retained], dtype=np.int64),
+        configuration_parent_rows=np.asarray(
+            [value[3] for value in retained], dtype=np.int64,
+        ).reshape(-1, xy.shape[0]),
+        configuration_child_rows=np.asarray(
+            [value[4] for value in retained], dtype=np.int64,
+        ).reshape(-1, xy.shape[0]),
+        proposal_seed_parent_rows=np.asarray(
+            [value[5] for value in retained], dtype=np.int64,
+        ).reshape(-1, 2),
+        proposal_seed_support_rows=np.full((len(retained), 2), -1, dtype=np.int64),
     )
 
 
@@ -294,6 +355,9 @@ def generate_graph_conditioned_pose_modes(
     seed_parent_count: int = 64,
     pair_anchor_count: int = 16,
     seed_parent_pair_count: int = 0,
+    support_anchor_count: int = 0,
+    support_anchor_pair_count: int = 0,
+    support_anchor_candidate_count: int = 8,
     covisibility_weight: float = 0.75,
     local_evidence_weight: float = 1.0,
     ransac_reprojection_px: float = 32.0,
@@ -354,12 +418,17 @@ def generate_graph_conditioned_pose_modes(
     seeds = seeds[global_mass[seeds] > 0.0]
     covis = graph.covisibility_matrix().astype(np.float64)
     matrix, distortion = camera_matrix_and_distortion(camera)
-    candidates: list[tuple[float, int, np.ndarray]] = []
+    candidates: list[tuple[float, int, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
     cv2.setRNGSeed(int(random_seed))
     # The unconditioned mode is retained as a regression reference.  Pair
     # seeds encode a jointly visible context configuration; this is essential
     # on periodic facades where any one window/parent is an ambiguous phase.
-    seed_modes: list[tuple[int, ...]] = [(-1,)] + [(int(seed),) for seed in seeds.tolist()]
+    # Each seed item is (query support, physical parent, candidate slot).  A
+    # support of -1 denotes the historical image-wide parent seed.  Explicit
+    # support anchors retain the missing query-to-map association without
+    # pretending that a parent centre is a point measurement.
+    seed_modes: list[tuple[tuple[int, int, int], ...]] = [((-1, -1, -1),)]
+    seed_modes.extend([((-1, int(seed), -1),) for seed in seeds.tolist()])
     pair_anchors = seeds[: int(pair_anchor_count)]
     pair_modes = []
     for left_offset, left in enumerate(pair_anchors.tolist()):
@@ -374,17 +443,104 @@ def generate_graph_conditioned_pose_modes(
             )
             pair_modes.append((priority, (int(left), int(right))))
     pair_modes.sort(key=lambda item: (-item[0], item[1]))
-    seed_modes.extend([item[1] for item in pair_modes[: int(seed_parent_pair_count)]])
+    seed_modes.extend([
+        tuple((-1, int(parent), -1) for parent in item[1])
+        for item in pair_modes[: int(seed_parent_pair_count)]
+    ])
+
+    anchor_candidates: list[tuple[float, int, int, int]] = []
+    normalized_xy = xy / np.asarray([float(camera.width), float(camera.height)])
+    image_leverage = 0.5 + np.linalg.norm(normalized_xy - 0.5, axis=1)
+    candidate_limit = min(int(support_anchor_candidate_count), parent_probability.shape[1])
+    for support in range(xy.shape[0]):
+        if parent_null[support] >= 0.98:
+            continue
+        for slot in range(candidate_limit):
+            parent = int(candidate_rows[support, slot])
+            probability = float(parent_probability[support, slot])
+            if parent < 0 or probability <= 0.0:
+                continue
+            priority = (
+                np.log(max(probability, 1e-12))
+                + np.log(max(1.0 - float(parent_null[support]), 1e-4))
+                + np.log(float(image_leverage[support]))
+                + 0.25 * float(graph.parent_distinctiveness[parent])
+            )
+            anchor_candidates.append((priority, int(support), parent, int(slot)))
+    anchor_candidates.sort(key=lambda value: (-value[0], value[1], value[2], value[3]))
+    retained_anchors: list[tuple[float, int, int, int]] = []
+    per_support_count: dict[int, int] = {}
+    for value in anchor_candidates:
+        support = int(value[1])
+        # Keep alternatives across the image instead of spending the complete
+        # budget on one large high-confidence facade region.
+        if per_support_count.get(support, 0) >= 2:
+            continue
+        retained_anchors.append(value)
+        per_support_count[support] = per_support_count.get(support, 0) + 1
+        if len(retained_anchors) >= int(support_anchor_count):
+            break
+    seed_modes.extend([((support, parent, slot),) for _, support, parent, slot in retained_anchors])
+
+    anchor_pair_modes: list[tuple[float, tuple[tuple[int, int, int], tuple[int, int, int]]]] = []
+    # Pair hypotheses need identity alternatives, not just Top-1 hypotheses
+    # from many near-duplicate supports.  Select spatially spread supports and
+    # retain their first ``support_anchor_candidate_count`` alternatives.
+    support_priority = np.clip(1.0 - parent_null, 0.0, 1.0) * image_leverage
+    support_order = np.argsort(-support_priority, kind="stable")
+    selected_pair_supports: list[int] = []
+    spatial_count: dict[int, int] = {}
+    bins = np.clip(np.floor(3.0 * normalized_xy).astype(np.int64), 0, 2)
+    for support in support_order.tolist():
+        if not np.any(valid_parent[support, :candidate_limit]):
+            continue
+        spatial_bin = int(3 * bins[support, 1] + bins[support, 0])
+        if spatial_count.get(spatial_bin, 0) >= 4:
+            continue
+        selected_pair_supports.append(int(support))
+        spatial_count[spatial_bin] = spatial_count.get(spatial_bin, 0) + 1
+        if len(selected_pair_supports) >= 32:
+            break
+    selected_pair_support_set = set(selected_pair_supports)
+    pair_pool = [
+        value for value in anchor_candidates
+        if int(value[1]) in selected_pair_support_set
+    ]
+    for left_offset, left_value in enumerate(pair_pool):
+        _, left_support, left_parent, left_slot = left_value
+        for right_value in pair_pool[left_offset + 1 :]:
+            _, right_support, right_parent, right_slot = right_value
+            if left_support == right_support:
+                continue
+            displacement = float(np.linalg.norm(normalized_xy[left_support] - normalized_xy[right_support]))
+            if displacement < 0.20:
+                continue
+            relation = float(covis[left_parent, right_parent])
+            if relation <= 0.0:
+                continue
+            priority = (
+                float(left_value[0]) + float(right_value[0])
+                + np.log(0.05 + 0.95 * relation)
+                + np.log(0.5 + displacement)
+            )
+            anchors = (
+                (int(left_support), int(left_parent), int(left_slot)),
+                (int(right_support), int(right_parent), int(right_slot)),
+            )
+            anchor_pair_modes.append((priority, anchors))
+    anchor_pair_modes.sort(key=lambda value: (-value[0], value[1]))
+    seed_modes.extend([value[1] for value in anchor_pair_modes[: int(support_anchor_pair_count)]])
     for seed_mode in seed_modes:
         compatibility = np.ones_like(parent_probability)
-        if seed_mode[0] >= 0:
+        seed_parents = [int(value[1]) for value in seed_mode if int(value[1]) >= 0]
+        if seed_parents:
             safe = np.maximum(candidate_rows, 0)
             log_compatibility = np.zeros_like(parent_probability)
-            for seed in seed_mode:
+            for seed in seed_parents:
                 value = 0.05 + 0.95 * covis[safe, int(seed)]
                 value[candidate_rows < 0] = 0.05
                 log_compatibility += np.log(np.maximum(value, 1e-8))
-            compatibility = np.exp(log_compatibility / float(len(seed_mode)))
+            compatibility = np.exp(log_compatibility / float(len(seed_parents)))
             # Unseen co-visibility is uncertainty, not an impossible edge.
             compatibility[candidate_rows < 0] = 0.0
         assignment_score = np.log(np.maximum(parent_probability, 1e-12))
@@ -393,6 +549,12 @@ def generate_graph_conditioned_pose_modes(
             assignment_score += float(local_evidence_weight) * local_evidence
         assignment_score[~valid_parent] = -np.inf
         chosen_slot = np.argmax(assignment_score, axis=1)
+        for anchor_support, anchor_parent, anchor_slot in seed_mode:
+            if anchor_support < 0:
+                continue
+            if int(candidate_rows[anchor_support, anchor_slot]) != int(anchor_parent):
+                raise ValueError("support anchor provenance differs from candidates")
+            chosen_slot[anchor_support] = int(anchor_slot)
         chosen_parent = candidate_rows[np.arange(candidate_rows.shape[0]), chosen_slot]
         chosen_parent_score = assignment_score[np.arange(candidate_rows.shape[0]), chosen_slot]
         child_rows = np.full((xy.shape[0],), -1, dtype=np.int64)
@@ -446,9 +608,17 @@ def generate_graph_conditioned_pose_modes(
             pose, xy, extent, child_posterior, physical, camera=camera
         )
         inlier_fraction = float(len(inlier_rows) / max(selected.size, 1))
-        seed_mass = float(np.mean([global_mass[max(seed, 0)] for seed in seed_mode]))
+        seed_mass = float(np.mean([global_mass[parent] for parent in seed_parents])) if seed_parents else 0.0
         score = float(region_score + 2.0 * inlier_fraction + 0.1 * np.log1p(seed_mass))
-        candidates.append((score, int(len(inlier_rows)), pose))
+        padded_seed = np.full((2,), -1, dtype=np.int64)
+        padded_support = np.full((2,), -1, dtype=np.int64)
+        for index, (anchor_support, anchor_parent, _anchor_slot) in enumerate(seed_mode[:2]):
+            padded_seed[index] = int(anchor_parent)
+            padded_support[index] = int(anchor_support)
+        candidates.append((
+            score, int(len(inlier_rows)), pose,
+            chosen_parent.copy(), child_rows.copy(), padded_seed, padded_support,
+        ))
     candidates.sort(key=lambda value: (-value[0], -value[1]))
     retained: list[tuple[float, int, np.ndarray]] = []
     for candidate in candidates:
@@ -468,6 +638,10 @@ def generate_graph_conditioned_pose_modes(
         np.asarray([value[2] for value in retained], dtype=np.float64).reshape(-1, 4, 4),
         np.asarray([value[0] for value in retained], dtype=np.float64),
         np.asarray([value[1] for value in retained], dtype=np.int64),
+        np.asarray([value[3] for value in retained], dtype=np.int64).reshape(-1, xy.shape[0]),
+        np.asarray([value[4] for value in retained], dtype=np.int64).reshape(-1, xy.shape[0]),
+        np.asarray([value[5] for value in retained], dtype=np.int64).reshape(-1, 2),
+        np.asarray([value[6] for value in retained], dtype=np.int64).reshape(-1, 2),
     )
 
 
@@ -548,7 +722,7 @@ def generate_parent_then_child_pose_modes(
     pairs.sort(key=lambda value: (-value[0], value[1]))
     seed_modes.extend([value[1] for value in pairs[: int(seed_parent_pair_count)]])
     matrix, distortion = camera_matrix_and_distortion(camera)
-    candidates: list[tuple[float, int, np.ndarray]] = []
+    candidates: list[tuple[float, int, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
     cv2.setRNGSeed(int(random_seed))
 
     for seed_mode in seed_modes:
@@ -686,7 +860,12 @@ def generate_parent_then_child_pose_modes(
         weight = np.maximum(1.0 - parent_null[selected], 0.05)
         score = float(np.sum(weight * (geometric + 0.25 * identity)) / np.sum(weight))
         support_count = int(np.sum(child_residual[selected] <= 2.0 * sigma))
-        candidates.append((score, support_count, pose.copy()))
+        padded_seed = np.full((2,), -1, dtype=np.int64)
+        padded_seed[: min(2, len(seed_mode))] = np.asarray(seed_mode[:2], dtype=np.int64)
+        candidates.append((
+            score, support_count, pose.copy(), chosen_parent.copy(),
+            child_rows.copy(), padded_seed,
+        ))
 
     candidates.sort(key=lambda value: (-value[0], -value[1]))
     retained: list[tuple[float, int, np.ndarray]] = []
@@ -705,4 +884,7 @@ def generate_parent_then_child_pose_modes(
         np.asarray([value[2] for value in retained], dtype=np.float64).reshape(-1, 4, 4),
         np.asarray([value[0] for value in retained], dtype=np.float64),
         np.asarray([value[1] for value in retained], dtype=np.int64),
+        np.asarray([value[3] for value in retained], dtype=np.int64).reshape(-1, xy.shape[0]),
+        np.asarray([value[4] for value in retained], dtype=np.int64).reshape(-1, xy.shape[0]),
+        np.asarray([value[5] for value in retained], dtype=np.int64).reshape(-1, 2),
     )

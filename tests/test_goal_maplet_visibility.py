@@ -24,5 +24,8 @@ def test_dominant_child_owner_is_defined_only_for_owned_primitives():
         maplets, region, geometry, poses, minimum_child_count=2, maximum_child_count=4
     )
     owner = dominant_child_owner(physical)
+    cached = dominant_child_owner(physical)
     assert np.all(owner[:8] >= 0)
     assert np.all(owner[8:] == -1)
+    assert cached is owner
+    assert not owner.flags.writeable

@@ -18,6 +18,8 @@ class ChildTilePosterior:
     conditional_parent_log_evidence: np.ndarray | None = None
     best_child_rows_by_parent: np.ndarray | None = None
     best_child_probabilities_by_parent: np.ndarray | None = None
+    child_rows_by_parent: np.ndarray | None = None
+    child_probabilities_by_parent: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         rows = np.asarray(self.candidate_child_rows, dtype=np.int64)
@@ -57,6 +59,28 @@ class ChildTilePosterior:
             object.__setattr__(self, "conditional_parent_log_evidence", log_evidence)
             object.__setattr__(self, "best_child_rows_by_parent", best_rows)
             object.__setattr__(self, "best_child_probabilities_by_parent", best_probability)
+        alternatives = (self.child_rows_by_parent, self.child_probabilities_by_parent)
+        if any(value is not None for value in alternatives):
+            if not all(value is not None for value in alternatives):
+                raise ValueError("incomplete parent-conditioned child alternatives")
+            if self.conditional_parent_ids is None:
+                raise ValueError("child alternatives require parent-conditioned evidence")
+            alternative_rows = np.asarray(self.child_rows_by_parent, dtype=np.int64)
+            alternative_probability = np.asarray(
+                self.child_probabilities_by_parent, dtype=np.float64,
+            )
+            expected = np.asarray(self.conditional_parent_ids).shape
+            if (
+                alternative_rows.ndim != 3
+                or alternative_rows.shape[:2] != expected
+                or alternative_probability.shape != alternative_rows.shape
+                or np.any((alternative_probability < 0.0) | (alternative_probability > 1.0))
+            ):
+                raise ValueError("invalid parent-conditioned child alternatives")
+            object.__setattr__(self, "child_rows_by_parent", alternative_rows)
+            object.__setattr__(
+                self, "child_probabilities_by_parent", alternative_probability,
+            )
         object.__setattr__(self, "candidate_child_rows", rows)
         object.__setattr__(self, "candidate_probabilities", probability)
         object.__setattr__(self, "null_probabilities", null)
@@ -102,6 +126,13 @@ def retrieve_children_given_parents(
     conditional_log_evidence = np.full(parent_ids.shape, -np.inf, dtype=np.float64)
     best_rows_by_parent = np.full(parent_ids.shape, -1, dtype=np.int64)
     best_probability_by_parent = np.zeros(parent_ids.shape, dtype=np.float64)
+    alternatives_per_parent = 4
+    rows_by_parent = np.full(
+        parent_ids.shape + (alternatives_per_parent,), -1, dtype=np.int64,
+    )
+    probability_by_parent = np.zeros(
+        parent_ids.shape + (alternatives_per_parent,), dtype=np.float64,
+    )
     for support in range(local.shape[0]):
         accumulated: dict[int, float] = {}
         for parent_slot, (parent_id, parent_value) in enumerate(
@@ -130,6 +161,14 @@ def retrieve_children_given_parents(
             best = int(np.argmax(conditional))
             best_rows_by_parent[support, parent_slot] = int(children[best])
             best_probability_by_parent[support, parent_slot] = float(conditional[best])
+            alternative_count = min(int(alternatives_per_parent), int(children.size))
+            alternative_order = np.argsort(-conditional, kind="stable")[:alternative_count]
+            rows_by_parent[
+                support, parent_slot, :alternative_count
+            ] = children[alternative_order]
+            probability_by_parent[
+                support, parent_slot, :alternative_count
+            ] = conditional[alternative_order]
             for child, value in zip(children.tolist(), conditional.tolist()):
                 accumulated[int(child)] = accumulated.get(int(child), 0.0) + float(parent_value) * float(value)
         ranked = sorted(accumulated.items(), key=lambda item: (-item[1], item[0]))[:keep]
@@ -145,4 +184,6 @@ def retrieve_children_given_parents(
         conditional_log_evidence.astype(np.float32),
         best_rows_by_parent,
         best_probability_by_parent.astype(np.float32),
+        rows_by_parent,
+        probability_by_parent.astype(np.float32),
     )
