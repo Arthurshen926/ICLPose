@@ -260,6 +260,128 @@ def contributor_multiscale_maplet_distribution(
     return output.astype(np.float32), null.astype(np.float32)
 
 
+def contributor_multiscale_in_map_probability(
+    labels: ContributorLabels,
+    physical_map: GoalMapletPhysicalMap,
+    token_xy: np.ndarray,
+    *,
+    token_height: int,
+    token_width: int,
+    pool_sizes: tuple[int, ...],
+    pool_weights: tuple[float, ...],
+    sorted_owned_primitive_ids: np.ndarray | None = None,
+    group_member_offsets: np.ndarray | None = None,
+    group_member_token_indices: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute only in-map/null mass without materializing maplet distributions.
+
+    Summing the normalized primitive-to-maplet links in
+    :func:`contributor_multiscale_maplet_distribution` gives one for every
+    primitive owned by at least one maplet and zero otherwise.  Therefore the
+    validity target can be computed exactly from two contributor-mass integral
+    images.  This avoids allocating and updating an ``N_tokens x N_maplets``
+    array when the caller discards that distribution.
+    """
+
+    xy = np.asarray(token_xy, dtype=np.int64).reshape(-1, 2)
+    if len(pool_sizes) != len(pool_weights) or not pool_sizes:
+        raise ValueError("pool sizes and weights differ")
+    if np.any((xy[:, 0] < 0) | (xy[:, 0] >= int(token_width))) or np.any(
+        (xy[:, 1] < 0) | (xy[:, 1] >= int(token_height))
+    ):
+        raise ValueError("token coordinate outside feature grid")
+    if sorted_owned_primitive_ids is None:
+        owned_rows = np.unique(
+            np.asarray(physical_map.membership_primitive_rows, dtype=np.int64)
+        )
+        owned_ids = np.sort(
+            np.asarray(physical_map.primitive_ids, dtype=np.int64)[owned_rows]
+        )
+    else:
+        owned_ids = np.asarray(sorted_owned_primitive_ids, dtype=np.int64).reshape(-1)
+        if np.any(np.diff(owned_ids) <= 0):
+            raise ValueError("sorted_owned_primitive_ids must be unique and increasing")
+
+    ids = np.asarray(labels.topk_primitive_ids, dtype=np.int64)
+    weights = np.maximum(np.asarray(labels.topk_weights, dtype=np.float64), 0.0)
+    if ids.shape != weights.shape or ids.ndim != 3:
+        raise ValueError("contributor IDs and weights must share shape (H,W,K)")
+    height, width, _ = ids.shape
+    positions = np.searchsorted(owned_ids, ids)
+    safe_positions = np.minimum(positions, max(owned_ids.size - 1, 0))
+    matched = (
+        (positions < owned_ids.size)
+        & (owned_ids.size > 0)
+        & (owned_ids[safe_positions] == ids)
+    ) if owned_ids.size else np.zeros(ids.shape, dtype=bool)
+    total_pixel_mass = np.sum(weights, axis=2)
+    in_map_pixel_mass = np.sum(weights * matched, axis=2)
+
+    def integral(values: np.ndarray) -> np.ndarray:
+        prefix = np.cumsum(np.cumsum(values, axis=0), axis=1)
+        return np.pad(prefix, ((1, 0), (1, 0)), mode="constant")
+
+    total_integral = integral(total_pixel_mass)
+    in_map_integral = integral(in_map_pixel_mass)
+
+    def rectangle_sum(
+        prefix: np.ndarray,
+        x0: np.ndarray,
+        y0: np.ndarray,
+        x1: np.ndarray,
+        y1: np.ndarray,
+    ) -> np.ndarray:
+        return prefix[y1, x1] - prefix[y0, x1] - prefix[y1, x0] + prefix[y0, x0]
+
+    token_total = np.zeros((xy.shape[0],), dtype=np.float64)
+    token_in_map = np.zeros_like(token_total)
+    x, y = xy[:, 0], xy[:, 1]
+    for size, scale_weight in zip(pool_sizes, pool_weights):
+        if float(scale_weight) <= 0.0:
+            continue
+        radius = int(size) // 2
+        tx0, tx1 = np.maximum(0, x - radius), np.minimum(int(token_width), x + radius + 1)
+        ty0, ty1 = np.maximum(0, y - radius), np.minimum(int(token_height), y + radius + 1)
+        px0 = np.floor(tx0 * width / float(token_width)).astype(np.int64)
+        px1 = np.ceil(tx1 * width / float(token_width)).astype(np.int64)
+        py0 = np.floor(ty0 * height / float(token_height)).astype(np.int64)
+        py1 = np.ceil(ty1 * height / float(token_height)).astype(np.int64)
+        area = np.maximum((px1 - px0) * (py1 - py0), 1)
+        factor = float(scale_weight) / area
+        token_total += factor * rectangle_sum(total_integral, px0, py0, px1, py1)
+        token_in_map += factor * rectangle_sum(in_map_integral, px0, py0, px1, py1)
+
+    if group_member_offsets is None:
+        support_total, support_in_map = token_total, token_in_map
+    else:
+        offsets = np.asarray(group_member_offsets, dtype=np.int64).reshape(-1)
+        members = np.asarray(group_member_token_indices, dtype=np.int64).reshape(-1)
+        if (
+            offsets.size < 1
+            or offsets[0] != 0
+            or offsets[-1] != members.size
+            or np.any(np.diff(offsets) <= 0)
+            or np.any((members < 0) | (members >= xy.shape[0]))
+        ):
+            raise ValueError("invalid exact-mask group membership")
+        support_total = np.asarray([
+            np.mean(token_total[members[offsets[index] : offsets[index + 1]]])
+            for index in range(offsets.size - 1)
+        ], dtype=np.float64)
+        support_in_map = np.asarray([
+            np.mean(token_in_map[members[offsets[index] : offsets[index + 1]]])
+            for index in range(offsets.size - 1)
+        ], dtype=np.float64)
+    in_map = np.divide(
+        support_in_map,
+        support_total,
+        out=np.zeros_like(support_in_map),
+        where=support_total > 1.0e-12,
+    )
+    in_map = np.clip(in_map, 0.0, 1.0)
+    return in_map.astype(np.float32), (1.0 - in_map).astype(np.float32)
+
+
 def contributor_multiscale_child_distribution(
     labels: ContributorLabels,
     physical_map: GoalMapletPhysicalMap,

@@ -7,7 +7,10 @@ import numpy as np
 import torch
 import pytest
 
-from feature_extract.tools.vfm.train_vfm_highres_geometry_head import HighResGeometryDataset
+from feature_extract.tools.vfm.train_vfm_highres_geometry_head import (
+    HighResGeometryDataset,
+    _parse_args,
+)
 from feature_extract.vfm.vfm_highres_geometry_head import (
     RadioHighResGeometryHead,
     geometry_confidence_loss,
@@ -20,6 +23,16 @@ from feature_extract.vfm.vfm_highres_geometry_head import (
 from feature_extract.vfm.localization_goal_maplet.surface_refiner import (
     dense_scale_invariant_geometry_evidence,
 )
+
+
+def test_geometry_head_fixed_epoch_parser_allows_final_fit_without_eval() -> None:
+    args = _parse_args([
+        "--train_geometry_manifest", "train.json",
+        "--output_dir", "out",
+        "--checkpoint_protocol", "fixed_epoch_no_selection",
+    ])
+    assert args.eval_geometry_manifest == ""
+    assert args.checkpoint_protocol == "fixed_epoch_no_selection"
 
 
 def test_radio_highres_geometry_head_decodes_to_requested_resolution() -> None:

@@ -23,6 +23,7 @@ from feature_extract.vfm.localization_goal_maplet.canonical_field import (
     readout_canonical_field,
 )
 from feature_extract.vfm.localization_goal_maplet.lineage import file_sha256
+from feature_extract.vfm.official_oof_protocol import ordered_id_sha256
 from feature_extract.vfm.localization_goal_maplet.oracle_pose import token_oracle_evidence
 from feature_extract.vfm.localization_goal_maplet.pfir import ContributorLabels
 from feature_extract.vfm.localization_goal_maplet.physical_instance_readout import (
@@ -44,8 +45,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--output_readout", required=True)
     parser.add_argument("--summary_json", required=True)
     parser.add_argument("--train_trajectories", nargs="+", default=["seq1", "seq2", "seq4", "seq6", "seq7", "seq8"])
-    parser.add_argument("--selection_trajectories", nargs="+", default=["seq9", "seq10"])
-    parser.add_argument("--validation_trajectories", nargs="+", default=["seq12", "seq14"])
+    parser.add_argument("--selection_trajectories", nargs="*", default=["seq9", "seq10"])
+    parser.add_argument("--validation_trajectories", nargs="*", default=["seq12", "seq14"])
     parser.add_argument("--steps", type=int, default=800)
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--learning_rate", type=float, default=2e-4)
@@ -63,6 +64,11 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=1701)
+    parser.add_argument(
+        "--checkpoint_protocol",
+        choices=("selection_selected", "fixed_step_no_selection"),
+        default="selection_selected",
+    )
     parser.add_argument("--force", action="store_true")
     return parser.parse_args()
 
@@ -115,7 +121,7 @@ def _build_dataset(
             "local_tokens", "local_xy", "local_weight", "local_mask",
             "parent", "child", "primitive_field_row", "image_row", "token_xy",
             "siglip", "dino", "sam",
-            "trajectory",
+            "trajectory", "image_id",
         )
     }
     field_row_by_primitive = np.full((physical.primitive_ids.size,), -1, dtype=np.int64)
@@ -207,6 +213,7 @@ def _build_dataset(
         collections["dino"].append(dino[valid])
         collections["sam"].append(sam[valid])
         collections["trajectory"].append(np.asarray([trajectory] * count))
+        collections["image_id"].append(np.asarray([str(metadata["image_id"])] * count))
         print(json.dumps({
             "image_id": str(metadata["image_id"]), "trajectory": trajectory,
             "physical_instance_samples": count,
@@ -325,6 +332,17 @@ def main() -> None:
     output, summary = Path(args.output_readout), Path(args.summary_json)
     if not args.force and (output.exists() or summary.exists()):
         raise FileExistsError("refusing to overwrite physical-instance readout artifacts")
+    fixed_step = str(args.checkpoint_protocol) == "fixed_step_no_selection"
+    if int(args.steps) <= 0:
+        raise ValueError("physical-instance training steps must be positive")
+    if fixed_step and (args.selection_trajectories or args.validation_trajectories):
+        raise ValueError(
+            "fixed_step_no_selection requires empty selection/validation trajectories"
+        )
+    if not fixed_step and (
+        not args.selection_trajectories or not args.validation_trajectories
+    ):
+        raise ValueError("selection-selected training requires both held partitions")
     partitions = [set(args.train_trajectories), set(args.selection_trajectories), set(args.validation_trajectories)]
     if any(partitions[a] & partitions[b] for a in range(3) for b in range(a + 1, 3)):
         raise ValueError("physical-instance trajectory partitions overlap")
@@ -335,11 +353,14 @@ def main() -> None:
     raw_readout = readout_canonical_field(field, physical)
     mapper, _ = load_surface_maplet_mapper(Path(args.surface_mapper), device=str(args.device))
     data = _build_dataset(args, mapper, physical, field)
+    teacher_image_ids = sorted(set(data["image_id"].astype(str).tolist()))
     trajectory = data["trajectory"].astype(str)
     train = np.isin(trajectory, list(args.train_trajectories))
     selection = np.isin(trajectory, list(args.selection_trajectories))
     validation = np.isin(trajectory, list(args.validation_trajectories))
-    if not np.any(train) or not np.any(selection) or not np.any(validation):
+    if not np.any(train) or (
+        not fixed_step and (not np.any(selection) or not np.any(validation))
+    ):
         raise ValueError("one or more physical-instance partitions are empty")
     parent_valid = raw_readout.parent_coverage > 0.0
     child_valid = raw_readout.child_coverage > 0.0
@@ -356,10 +377,13 @@ def main() -> None:
     )
     model = PhysicalInstanceReadout(PhysicalInstanceReadoutConfig(feature_dim=field.feature_dim)).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(args.learning_rate), weight_decay=1e-4)
-    baseline = _subset_metrics(
-        model, data, validation, parent_prototype, child_prototype,
-        primitive_prototype, field_row_by_primitive, physical,
-        parent_valid, child_valid, device=device,
+    baseline = (
+        _subset_metrics(
+            model, data, validation, parent_prototype, child_prototype,
+            primitive_prototype, field_row_by_primitive, physical,
+            parent_valid, child_valid, device=device,
+        )
+        if np.any(validation) else None
     )
     train_rows = np.flatnonzero(train)
     history, best_state, best_score = [], None, -np.inf
@@ -466,6 +490,26 @@ def main() -> None:
         torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
         optimizer.step()
         if step % 100 == 0 or step + 1 == int(args.steps):
+            if fixed_step:
+                row = {
+                    "step": int(step), "loss": float(loss.item()),
+                    "parent_loss": float(parent_loss.item()),
+                    "child_loss": float(child_loss.item()),
+                    "primitive_loss": float(primitive_loss.item()),
+                    "siglip_distillation": float(siglip_loss.item()),
+                    "dino_distillation": float(dino_loss.item()),
+                    "sam_boundary_distillation": float(sam_loss.item()),
+                    "physical_hard_negative_loss": float(hard_negative_loss.item()),
+                    "selection": None,
+                }
+                history.append(row)
+                print(json.dumps(row), flush=True)
+                if step + 1 == int(args.steps):
+                    best_state = {
+                        key: value.detach().cpu().clone()
+                        for key, value in model.state_dict().items()
+                    }
+                continue
             selection_metrics = _subset_metrics(
                 model, data, selection, parent_prototype, child_prototype,
                 primitive_prototype, field_row_by_primitive, physical,
@@ -491,10 +535,13 @@ def main() -> None:
         raise RuntimeError("physical-instance selection did not produce a checkpoint")
     model.load_state_dict(best_state)
     model.eval()
-    selected_validation = _subset_metrics(
-        model, data, validation, parent_prototype, child_prototype,
-        primitive_prototype, field_row_by_primitive, physical,
-        parent_valid, child_valid, device=device,
+    selected_validation = (
+        _subset_metrics(
+            model, data, validation, parent_prototype, child_prototype,
+            primitive_prototype, field_row_by_primitive, physical,
+            parent_valid, child_valid, device=device,
+        )
+        if np.any(validation) else None
     )
     save_physical_instance_readout(model, output, metadata={
         "teacher_roles": {
@@ -519,10 +566,17 @@ def main() -> None:
         "canonical_field_sha256": field.content_sha256,
         "surface_mapper_sha256": file_sha256(Path(args.surface_mapper)),
         "selection_rule": (
+            "fixed_final_step_without_selection"
+            if fixed_step else
             f"maximum_{str(args.selection_metric)}_on_predeclared_selection_trajectories"
         ),
         "selection_metric": str(args.selection_metric),
-        "selected_score": float(best_score),
+        "selected_score": float(best_score) if np.isfinite(best_score) else None,
+        "checkpoint_protocol": str(args.checkpoint_protocol),
+        "checkpoint_selection_uses_teacher_labels": not fixed_step,
+        "teacher_cache": str(Path(args.teacher_cache)),
+        "teacher_supervised_image_count": len(teacher_image_ids),
+        "teacher_supervised_image_ids_sha256": ordered_id_sha256(teacher_image_ids),
     })
     result = {
         "stage": "g17_physical_instance_readout",
@@ -531,10 +585,12 @@ def main() -> None:
             "train": int(np.sum(train)), "selection": int(np.sum(selection)),
             "validation": int(np.sum(validation)),
         },
+        "teacher_supervised_image_count": len(teacher_image_ids),
+        "teacher_supervised_image_ids_sha256": ordered_id_sha256(teacher_image_ids),
         "baseline_validation": baseline,
         "selected_validation": selected_validation,
         "selection_metric": str(args.selection_metric),
-        "selection_best_score": float(best_score),
+        "selection_best_score": float(best_score) if np.isfinite(best_score) else None,
         "history": history,
         "deployment_contract": {
             "map_feature_type_count": 1,

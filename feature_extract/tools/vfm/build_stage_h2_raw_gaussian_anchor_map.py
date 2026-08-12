@@ -45,11 +45,20 @@ def _load_camera_by_image(model_dir: str) -> dict[str, ColmapCamera]:
     model_path = Path(model_dir)
     cameras = read_colmap_cameras_binary(model_path / "cameras.bin")
     images = read_colmap_images_binary(model_path / "images.bin")
-    return {
+    result = {
         image.image_name: cameras[image.camera_id]
         for image in images.values()
         if image.camera_id in cameras
     }
+    # Strict MAtCha datasets flatten ``seqN/frame.png`` to
+    # ``seqN__frame.png`` because their RGB directory is single-level.  Keep
+    # the original Cambridge ID as a deterministic alias for downstream VFM
+    # manifests; no pose or image content is duplicated here.
+    for name, camera in list(result.items()):
+        if "/" not in name and "__" in name and name.startswith("seq"):
+            route, image = name.split("__", 1)
+            result.setdefault(f"{route}/{image}", camera)
+    return result
 
 
 def _load_feature(path: Path, layer_name: str) -> np.ndarray:

@@ -69,6 +69,66 @@ def test_pose_merge_rejects_mixed_surface_verification_contract(tmp_path, monkey
         merge_goal_maplet_pose_modes.main()
 
 
+def test_pose_merge_rejects_new_unlisted_lineage_fields(tmp_path, monkeypatch):
+    first_payload = _pose_shard("seq/a.png", "readout")
+    second_payload = _pose_shard("seq/b.png", "readout")
+    first_payload["mapping_view_graph_sha256"] = "view-a"
+    second_payload["mapping_view_graph_sha256"] = "view-b"
+    first = _write_json(tmp_path / "a.json", first_payload)
+    second = _write_json(tmp_path / "b.json", second_payload)
+    monkeypatch.setattr(
+        sys, "argv", ["merge", "--inputs", first, second, "--output_json", str(tmp_path / "out.json")],
+    )
+    with pytest.raises(ValueError, match="mapping_view_graph_sha256"):
+        merge_goal_maplet_pose_modes.main()
+
+
+def test_pose_merge_emits_standard_manifest_for_strict_freeze(tmp_path, monkeypatch):
+    source_state = {
+        "git_commit_sha": "commit",
+        "git_tracked_worktree_dirty": True,
+        "git_tracked_status_sha256": "a" * 64,
+        "git_tracked_diff_sha256": "b" * 64,
+        "untracked_source_file_count": 2,
+        "untracked_source_files_sha256": "c" * 64,
+        "repository_state_capture": "process_start_before_long_computation",
+    }
+    payloads = [
+        _pose_shard("seq/a.png", "readout"),
+        _pose_shard("seq/b.png", "readout"),
+    ]
+    for shard_index, payload in enumerate(payloads):
+        configuration = {"parent_mode": "actual", "shard_index": shard_index, "shard_count": 2}
+        payload["run_manifest"] = {
+            "schema": "goal_maplet_run_manifest_v1",
+            **source_state,
+            "argv": ["python", "tool.py"],
+            "configuration": configuration,
+            "numeric_contract": {"feature_dtype": "float32"},
+            "input_artifacts": {"map": "same", "queries": str(shard_index)},
+            "candidate_counts": {
+                payload["rows"][0]["image_id"]: {"raw": 10},
+            },
+            "device": "cuda:0",
+        }
+    paths = [
+        _write_json(tmp_path / f"{index}.json", payload)
+        for index, payload in enumerate(payloads)
+    ]
+    output = tmp_path / "merged.json"
+    monkeypatch.setattr(
+        sys, "argv", ["merge", "--inputs", *paths, "--output_json", str(output)],
+    )
+    merge_goal_maplet_pose_modes.main()
+    manifest = json.loads(output.read_text())["run_manifest"]
+    assert manifest["schema"] == "goal_maplet_run_manifest_v1"
+    assert manifest["repository_state_capture"] == (
+        "process_start_before_long_computation"
+    )
+    assert "shard_index" not in manifest["configuration"]
+    assert set(manifest["candidate_counts"]) == {"seq/a.png", "seq/b.png"}
+
+
 def _configuration_shard(image_id: str, readout_sha: str) -> dict:
     return {
         "stage": "configuration",

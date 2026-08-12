@@ -12,6 +12,9 @@ from feature_extract.tools.vfm.build_goal_maplet_surface_likelihood_samples impo
     _teacher_cues,
     _typed_teacher_weight,
 )
+from feature_extract.vfm.localization_goal_maplet.surface_pose_likelihood import (
+    SAMPLE_SCHEMA,
+)
 
 
 def main() -> None:
@@ -29,7 +32,7 @@ def main() -> None:
     with np.load(source, allow_pickle=False) as data:
         values = {key: np.asarray(data[key]) for key in data.files if key != "metadata_json"}
         metadata = json.loads(str(np.asarray(data["metadata_json"]).item()))
-    if metadata.get("artifact_type") != "goal_maplet_surface_likelihood_samples_v1":
+    if metadata.get("artifact_type") != SAMPLE_SCHEMA:
         raise ValueError("not a G18 surface-likelihood sample artifact")
     token_count = int(args.height) * int(args.width)
     if values["typed_target"].shape[-1] != token_count:

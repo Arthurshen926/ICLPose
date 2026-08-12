@@ -22,7 +22,16 @@ from feature_extract.vfm.vfm_2dgs_mapping import Vfm2DgsAnchorMap
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--surface_elements", required=True)
-    parser.add_argument("--clean_gaussian_ply", required=True)
+    clean = parser.add_mutually_exclusive_group(required=True)
+    clean.add_argument("--clean_gaussian_ply")
+    clean.add_argument(
+        "--clean_surface_elements",
+        action="store_true",
+        help=(
+            "Declare every primitive in --surface_elements clean. This is the "
+            "strict MAtCha path and avoids a separate source-indexed clean PLY."
+        ),
+    )
     parser.add_argument("--legacy_maplets", required=True)
     parser.add_argument("--region_map", required=True)
     parser.add_argument("--mapping_pose_file", required=True)
@@ -42,11 +51,18 @@ def main(argv: Sequence[str] | None = None) -> None:
         raise FileExistsError("refusing to overwrite Goal-Maplet physical artifacts")
     inputs = {
         "surface_elements": Path(args.surface_elements),
-        "clean_gaussian_ply": Path(args.clean_gaussian_ply),
         "legacy_maplets": Path(args.legacy_maplets),
         "region_map": Path(args.region_map),
         "mapping_pose_file": Path(args.mapping_pose_file),
     }
+    if args.clean_gaussian_ply:
+        inputs["clean_gaussian_ply"] = Path(args.clean_gaussian_ply)
+    geometry = load_surface_primitive_geometry(inputs["surface_elements"])
+    clean_primitive_ids = (
+        geometry.primitive_ids
+        if bool(args.clean_surface_elements)
+        else _clean_source_indices(inputs["clean_gaussian_ply"])
+    )
     poses = {
         record.image_id: record.pose_w2c
         for record in parse_cambridge_pose_file(inputs["mapping_pose_file"])
@@ -54,20 +70,28 @@ def main(argv: Sequence[str] | None = None) -> None:
     physical_map = build_goal_maplet_physical_map(
         VfmSurfaceMapletBank.load_npz(inputs["legacy_maplets"]),
         Vfm2DgsAnchorMap.load_npz(inputs["region_map"]),
-        load_surface_primitive_geometry(inputs["surface_elements"]),
+        geometry,
         poses,
-        clean_primitive_ids=_clean_source_indices(inputs["clean_gaussian_ply"]),
+        clean_primitive_ids=clean_primitive_ids,
         minimum_orientation_confidence=float(args.minimum_orientation_confidence),
         minimum_child_count=int(args.minimum_child_count),
         maximum_child_count=int(args.maximum_child_count),
         metadata={
             "lineage_sha256": {name: file_sha256(path) for name, path in inputs.items()},
+            "clean_primitive_selection": (
+                "all_declared_surface_elements"
+                if bool(args.clean_surface_elements)
+                else "source_indexed_clean_ply"
+            ),
             "mapping_pose_use": "normal_orientation_only_not_stored",
         },
     )
     physical_map.save_npz(output_path)
     report = audit_physical_map(physical_map)
     report["inputs"] = {name: str(path) for name, path in inputs.items()}
+    report["clean_primitive_selection"] = physical_map.metadata[
+        "clean_primitive_selection"
+    ]
     report["output_map"] = str(output_path)
     audit_path.parent.mkdir(parents=True, exist_ok=True)
     audit_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")

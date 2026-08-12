@@ -235,13 +235,15 @@ def retrieve_mapping_view_posterior(
     missing_view_probability: float = 0.02,
     temperature: float = 0.10,
 ) -> MappingViewPosterior:
-    """Retrieve pose-bearing view nodes with a fixed-denominator likelihood.
+    """Retrieve pose-bearing view nodes with separated null semantics.
 
     Candidate probabilities are normalized by retained mass per query support.
     This makes the retrieval posterior a proposal distribution: an ambiguous
     but retained parent cannot be erased merely because another support has a
     much sharper absolute score.  Out-of-map and truncated mass stay in a
     typed query-null branch and never become evidence for a particular view.
+    The returned null is computed before normalizing over view nodes, so it is
+    invariant to ``maximum_views`` and to the number of graph nodes.
     """
 
     if graph.physical_map_sha256 != physical.content_sha256:
@@ -257,6 +259,12 @@ def retrieve_mapping_view_posterior(
         or int(maximum_views) <= 0
         or not 0.0 < float(missing_view_probability) < 1.0
         or float(temperature) <= 0.0
+        or np.any(~np.isfinite(probability))
+        or np.any(~np.isfinite(out_of_map))
+        or np.any(~np.isfinite(unresolved))
+        or np.any(probability < 0.0)
+        or np.any((out_of_map < 0.0) | (out_of_map > 1.0))
+        or np.any((unresolved < out_of_map) | (unresolved > 1.0))
     ):
         raise ValueError("invalid mapping-view retrieval inputs")
     row_by_id = {int(value): row for row, value in enumerate(physical.maplet_ids.tolist())}
@@ -278,36 +286,46 @@ def retrieve_mapping_view_posterior(
         dense_view[:, safe_rows] * conditional[None] * valid[None], axis=2,
     )
     explained = np.clip(explained, 0.0, 1.0)
-    # Reliability is candidate-independent and therefore cannot favor a view
-    # by converting typed null into an arbitrary map identity.
-    in_map = np.clip(1.0 - out_of_map, 0.0, 1.0)
-    truncated = np.clip(unresolved - out_of_map, 0.0, 1.0)
-    reliability = in_map * np.clip(1.0 - truncated, 0.0, 1.0)
-    reliability *= np.sqrt(np.clip(retained, 0.0, 1.0))
-    if not np.any(reliability > 0.0):
-        reliability = np.ones_like(reliability)
+    # Resolved in-map mass is the evidence that a support can identify a view.
+    # Truncated in-map mass remains uncertainty and out-of-map mass remains H0;
+    # neither is allowed to become an arbitrary identity when retained mass is
+    # zero.  Averaging supports avoids treating correlated token groups as
+    # independent repeated trials.
+    reliability = np.clip(1.0 - unresolved, 0.0, 1.0)
+    h1_probability = float(np.mean(reliability)) if reliability.size else 0.0
+    h1_probability = float(np.clip(h1_probability, 0.0, 1.0))
+    null_probability = 1.0 - h1_probability
     likelihood = (
         float(missing_view_probability)
         + (1.0 - float(missing_view_probability)) * explained
     )
-    score = np.sum(reliability[None] * np.log(np.maximum(likelihood, 1e-12)), axis=1)
-    score /= max(float(np.sum(reliability)), 1e-12)
+    reliability_sum = float(np.sum(reliability))
+    if reliability_sum > 0.0:
+        score = np.sum(
+            reliability[None] * np.log(np.maximum(likelihood, 1e-12)), axis=1,
+        ) / reliability_sum
+        coverage = np.sum(reliability[None] * explained, axis=1) / reliability_sum
+    else:
+        score = np.full(
+            (dense_view.shape[0],), np.log(float(missing_view_probability)),
+            dtype=np.float64,
+        )
+        coverage = np.zeros((dense_view.shape[0],), dtype=np.float64)
     take = min(int(maximum_views), int(score.size))
     order = np.argsort(-score, kind="stable")[:take]
     logits = score[order] / float(temperature)
-    null_logit = float(np.log(float(missing_view_probability)) / float(temperature))
-    joined = np.r_[logits, null_logit]
-    joined -= float(np.max(joined))
-    posterior = np.exp(joined)
-    posterior /= max(float(np.sum(posterior)), 1e-12)
-    coverage = np.sum(reliability[None] * explained, axis=1) / max(
-        float(np.sum(reliability)), 1e-12,
-    )
+    if logits.size and h1_probability > 0.0:
+        logits -= float(np.max(logits))
+        conditional_view = np.exp(logits)
+        conditional_view /= max(float(np.sum(conditional_view)), 1e-12)
+        view_probability = h1_probability * conditional_view
+    else:
+        view_probability = np.zeros((take,), dtype=np.float64)
     return MappingViewPosterior(
         view_rows=order.astype(np.int64),
         scores=score[order].astype(np.float32),
-        probabilities=posterior[:-1].astype(np.float32),
-        null_probability=float(posterior[-1]),
+        probabilities=view_probability.astype(np.float32),
+        null_probability=float(null_probability),
         support_coverage=coverage[order].astype(np.float32),
     )
 
@@ -324,6 +342,8 @@ def mapping_view_pose_modes(
 
     retained: list[int] = []
     for candidate, view in enumerate(posterior.view_rows.tolist()):
+        if float(posterior.probabilities[candidate]) <= 0.0:
+            continue
         pose = graph.poses_w2c[int(view)]
         center = -pose[:3, :3].T @ pose[:3, 3]
         duplicate = False

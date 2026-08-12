@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -37,7 +39,12 @@ from feature_extract.vfm.localization_goal_maplet.physical_instance_readout impo
     load_physical_instance_readout,
     transform_canonical_field_for_role,
 )
-from feature_extract.vfm.localization_goal_maplet.lineage import file_sha256
+from feature_extract.vfm.localization_goal_maplet.lineage import (
+    build_run_manifest,
+    canonical_json_sha256,
+    capture_repository_state,
+    file_sha256,
+)
 from feature_extract.vfm.localization_goal_maplet.mapping_view_graph import (
     MappingViewGraph,
     mapping_view_pose_modes,
@@ -67,7 +74,13 @@ from feature_extract.vfm.localization_goal_maplet.retrieval import (
 from feature_extract.vfm.localization_goal_maplet.structured_parent_posterior import (
     refine_parent_posteriors_with_query_graph,
 )
+from feature_extract.vfm.localization_goal_maplet.sparse_vfm_pose_likelihood import (
+    PRIMITIVE_Z_TIE_BREAK,
+)
 from feature_extract.vfm.localization_goal_maplet.typed_graph import TypedParentGraph
+from feature_extract.vfm.localization_goal_maplet.view_conditioned_field import (
+    ViewConditionedPrimitiveField,
+)
 from feature_extract.vfm.query_to_3d_matching import pnp_pose_error
 from feature_extract.vfm.surface_maplet_bank import RadioFinalRegionConfig, encode_radio_final_regions
 from feature_extract.vfm.vfm_highres_geometry_head import (
@@ -85,6 +98,18 @@ def _camera(path: Path) -> ColmapCamera:
             height=int(data["camera_height"]),
             params=tuple(np.asarray(data["camera_params"], dtype=np.float64).tolist()),
         )
+
+
+def _load_query_evaluation_payload(
+    path: Path, *, load_oracle_labels: bool,
+) -> tuple[dict[str, object], np.ndarray, ContributorLabels | None]:
+    """Load GT pose for metrics while keeping identity labels out of actual inference."""
+
+    with np.load(path, allow_pickle=False) as data:
+        metadata = json.loads(str(np.asarray(data["metadata_json"]).item()))
+        gt_pose_w2c = np.asarray(data["pose_w2c"], dtype=np.float64)
+    labels = ContributorLabels.load_npz(path) if bool(load_oracle_labels) else None
+    return metadata, gt_pose_w2c, labels
 
 
 def _pose_report(modes, gt_pose: np.ndarray) -> dict[str, object]:
@@ -167,6 +192,14 @@ def main() -> None:
     parser.add_argument("--contributors", required=True)
     parser.add_argument("--physical_map", required=True)
     parser.add_argument("--canonical_field", required=True)
+    parser.add_argument(
+        "--view_conditioned_field",
+        default="",
+        help=(
+            "Optional cross-fitted low-rank view/scale residual field; outside its "
+            "observed chart the verifier falls back to the canonical code."
+        ),
+    )
     parser.add_argument("--surface_mapper", required=True)
     parser.add_argument("--field_feature_contract", required=True)
     parser.add_argument("--validity_calibration", required=True)
@@ -200,7 +233,7 @@ def main() -> None:
     parser.add_argument("--geometry_head", default="")
     parser.add_argument("--mapping_view_graph", default="")
     parser.add_argument("--mapping_view_candidates", type=int, default=64)
-    parser.add_argument("--mapping_view_anchors", type=int, default=32)
+    parser.add_argument("--mapping_view_anchors", type=int, default=16)
     parser.add_argument("--mapping_view_support_pairs", type=int, default=64)
     parser.add_argument("--mapping_view_hypotheses", type=int, default=4)
     parser.add_argument("--mapping_view_missing_probability", type=float, default=0.02)
@@ -212,6 +245,52 @@ def main() -> None:
     )
     parser.add_argument("--view_geometry_prescore_per_anchor", type=int, default=96)
     parser.add_argument("--view_geometry_exact_verify_count", type=int, default=0)
+    parser.add_argument(
+        "--view_geometry_exact_keep_per_anchor",
+        type=int,
+        default=4,
+        help=(
+            "Protect this many sparse-ranked states per structural anchor before "
+            "filling the exact-verification budget from the global sparse order."
+        ),
+    )
+    parser.add_argument(
+        "--view_geometry_exact_protected_anchors",
+        type=int,
+        default=16,
+        help=(
+            "Protect sparse states only for this retrieval-ordered prefix of "
+            "mapping anchors; all generated anchors still compete for the global fill."
+        ),
+    )
+    parser.add_argument(
+        "--view_geometry_exact_pool_semantics",
+        choices=("anchor_quota", "pose_basin", "vfm_geometry_union"),
+        default="anchor_quota",
+    )
+    parser.add_argument(
+        "--view_geometry_exact_basin_translation_m", type=float, default=0.5,
+    )
+    parser.add_argument(
+        "--view_geometry_exact_basin_rotation_deg", type=float, default=5.0,
+    )
+    parser.add_argument(
+        "--view_geometry_final_ranking_semantics",
+        choices=("exact_vfm", "vfm_geometry_interleave"),
+        default="exact_vfm",
+    )
+    parser.add_argument(
+        "--view_geometry_geometry_candidate_count", type=int, default=8,
+    )
+    parser.add_argument("--view_geometry_visibility_chart", action="store_true")
+    parser.add_argument("--view_geometry_chart_iterations", type=int, default=2)
+    parser.add_argument("--view_geometry_chart_candidate_count", type=int, default=8)
+    parser.add_argument(
+        "--view_geometry_chart_maximum_translation_m", type=float, default=2.0,
+    )
+    parser.add_argument(
+        "--view_geometry_chart_maximum_rotation_deg", type=float, default=15.0,
+    )
     parser.add_argument("--geometry_proposal_confidence", type=float, default=0.05)
     parser.add_argument("--geometry_pair_supports", type=int, default=64)
     parser.add_argument("--geometry_support_pairs", type=int, default=512)
@@ -270,13 +349,38 @@ def main() -> None:
     parser.add_argument("--shard_count", type=int, default=1)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--quiet_rows", action="store_true")
+    parser.add_argument(
+        "--candidate_selection_report",
+        default="",
+        help="Optional train-OOF selection artifact that fixed this inference recipe.",
+    )
+    parser.add_argument(
+        "--checkpoint_every", type=int, default=10,
+        help="Atomically checkpoint completed query rows every N queries.",
+    )
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
+    run_started = time.perf_counter()
     output = Path(args.output_json)
     if output.exists() and not args.force:
         raise FileExistsError("refusing to overwrite pose-mode report")
+    if int(args.checkpoint_every) < 1:
+        raise ValueError("checkpoint_every must be positive")
+    repository_root = Path(__file__).resolve().parents[3]
+    repository_state_at_start = capture_repository_state(repository_root)
     physical = GoalMapletPhysicalMap.load_npz(Path(args.physical_map))
     field = CanonicalSurfaceField.load_npz(Path(args.canonical_field))
+    view_conditioned_field = None
+    if args.view_conditioned_field:
+        view_conditioned_field = ViewConditionedPrimitiveField.load_npz(
+            Path(args.view_conditioned_field)
+        )
+        view_conditioned_field.validate_alignment(
+            physical_map_sha256=physical.content_sha256,
+            canonical_field_sha256=field.content_sha256,
+            canonical_primitive_rows=field.primitive_rows,
+            canonical_feature_dim=field.feature_dim,
+        )
     feature_contract = FieldFeatureContract.load_json(Path(args.field_feature_contract))
     if feature_contract.query_readout_type != "surface_maplet_mapper":
         raise ValueError("pose-mode retrieval requires the frozen surface-maplet mapper readout")
@@ -399,14 +503,63 @@ def main() -> None:
         paths = selected_paths
     if int(args.maximum_queries) > 0:
         paths = paths[: int(args.maximum_queries)]
+    partial_path = output.with_suffix(output.suffix + ".partial.json")
+    partial_configuration = {
+        key: value for key, value in vars(args).items()
+        if key not in {"output_json", "force", "quiet_rows"}
+    }
+    partial_contract_sha256 = canonical_json_sha256({
+        "configuration": partial_configuration,
+        "physical_map_sha256": physical.content_sha256,
+        "canonical_field_sha256": field.content_sha256,
+        "field_feature_contract_sha256": feature_contract.content_sha256,
+        "validity_calibration_sha256": calibration.content_sha256,
+        "selected_contributor_names": [path.name for path in paths],
+        "repository_state_at_start": repository_state_at_start,
+    })
     reports = []
+    if partial_path.is_file() and not bool(args.force):
+        partial = json.loads(partial_path.read_text())
+        if str(partial.get("contract_sha256")) != partial_contract_sha256:
+            raise ValueError("partial pose-mode checkpoint contract differs")
+        reports = list(partial.get("rows", []))
+    completed_image_ids = {str(value["image_id"]) for value in reports}
+    if len(completed_image_ids) != len(reports):
+        raise ValueError("partial pose-mode checkpoint contains duplicate queries")
+
+    def checkpoint_rows() -> None:
+        partial_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = partial_path.with_suffix(partial_path.suffix + ".tmp")
+        temporary.write_text(json.dumps({
+            "artifact_type": "goal_maplet_pose_mode_partial_checkpoint_v1",
+            "contract_sha256": partial_contract_sha256,
+            "repository_state_at_start": repository_state_at_start,
+            "completed_query_count": len(reports),
+            "rows": reports,
+        }, indent=2, sort_keys=True) + "\n")
+        temporary.replace(partial_path)
+
     context_config = RadioFinalRegionConfig()
     local_config = RadioFinalRegionConfig(pool_sizes=(1,), pool_weights=(1.0,))
+    oracle_labels_requested = (
+        args.parent_mode in ("oracle", "both")
+        or args.child_mode in ("oracle", "both")
+    )
     for path in paths:
-        labels = ContributorLabels.load_npz(path)
+        with np.load(path, allow_pickle=False) as checkpoint_data:
+            checkpoint_metadata = json.loads(
+                str(np.asarray(checkpoint_data["metadata_json"]).item())
+            )
+        if str(checkpoint_metadata["image_id"]) in completed_image_ids:
+            continue
+        query_started = time.perf_counter()
         camera = _camera(path)
-        with np.load(path, allow_pickle=False) as data:
-            metadata = json.loads(str(np.asarray(data["metadata_json"]).item()))
+        # Exact contributor identities are evaluation/oracle labels.  The
+        # deployed actual-parent/actual-child path must not even deserialize
+        # them, preventing an accidental query-GT map-assignment dependency.
+        metadata, gt_pose_w2c, labels = _load_query_evaluation_payload(
+            path, load_oracle_labels=oracle_labels_requested,
+        )
         with np.load(Path(str(metadata["token_path"])), allow_pickle=False) as data:
             raw = np.asarray(data["radio_final"], dtype=np.float32)
         mapped = mapper.project(raw).measurement_context
@@ -478,6 +631,8 @@ def main() -> None:
         if args.parent_mode in ("actual", "both"):
             parent_inputs["actual_parent"] = (grouped_parent_ids, grouped_parent_probability, grouped_parent_null)
         if args.parent_mode in ("oracle", "both"):
+            if labels is None:
+                raise AssertionError("oracle parent mode requires contributor labels")
             truth, truth_null = contributor_multiscale_maplet_distribution(
                 labels, physical, token_xy,
                 token_height=int(raw.shape[1]), token_width=int(raw.shape[2]),
@@ -490,6 +645,8 @@ def main() -> None:
                 physical.maplet_ids[parent_row, None], (1.0 - truth_null)[:, None], truth_null,
             )
         if args.child_mode in ("oracle", "both"):
+            if labels is None:
+                raise AssertionError("oracle child mode requires contributor labels")
             truth_child, truth_child_null = contributor_multiscale_child_distribution(
                 labels, physical, token_xy,
                 token_height=int(raw.shape[1]), token_width=int(raw.shape[2]),
@@ -639,6 +796,42 @@ def main() -> None:
                     seed_identity_exact_verify_count=int(
                         args.view_geometry_exact_verify_count
                     ),
+                    seed_identity_exact_keep_per_anchor=int(
+                        args.view_geometry_exact_keep_per_anchor
+                    ),
+                    seed_identity_exact_protected_mapping_anchors=int(
+                        args.view_geometry_exact_protected_anchors
+                    ),
+                    seed_identity_exact_pool_semantics=str(
+                        args.view_geometry_exact_pool_semantics
+                    ),
+                    seed_identity_exact_basin_translation_m=float(
+                        args.view_geometry_exact_basin_translation_m
+                    ),
+                    seed_identity_exact_basin_rotation_deg=float(
+                        args.view_geometry_exact_basin_rotation_deg
+                    ),
+                    seed_identity_final_ranking_semantics=str(
+                        args.view_geometry_final_ranking_semantics
+                    ),
+                    seed_identity_geometry_candidate_count=int(
+                        args.view_geometry_geometry_candidate_count
+                    ),
+                    visibility_chart_refinement=bool(
+                        args.view_geometry_visibility_chart
+                    ),
+                    visibility_chart_iterations=int(
+                        args.view_geometry_chart_iterations
+                    ),
+                    visibility_chart_candidate_count=int(
+                        args.view_geometry_chart_candidate_count
+                    ),
+                    visibility_chart_maximum_translation_m=float(
+                        args.view_geometry_chart_maximum_translation_m
+                    ),
+                    visibility_chart_maximum_rotation_deg=float(
+                        args.view_geometry_chart_maximum_rotation_deg
+                    ),
                     soft_identity_marginalization=args.proposal_method == "soft_geometry",
                     marginal_pair_consensus=args.proposal_method in (
                         "soft_geometry", "vfm_geometry", "primitive_vfm_geometry",
@@ -670,13 +863,14 @@ def main() -> None:
                     canonical_field_primitive_rows=field.primitive_rows,
                     canonical_field_codes=field.codes,
                     canonical_field_confidence=field.confidence,
+                    view_conditioned_primitive_field=view_conditioned_field,
                     sparse_vfm_primitives_per_child=int(args.sparse_vfm_primitives_per_child),
                     sparse_primitive_score_semantics=str(args.sparse_primitive_score_semantics),
                     sparse_vfm_device=str(args.device),
                     translation_nms_m=float(args.translation_nms_m),
                     rotation_nms_deg=float(args.rotation_nms_deg),
                     random_seed=stable_seed,
-                    diagnostic_pose_w2c=labels.pose_w2c,
+                    diagnostic_pose_w2c=gt_pose_w2c,
                     diagnostics_out=geometry_diagnostics,
                 )
                 proposal_diagnostics[name] = geometry_diagnostics
@@ -839,8 +1033,8 @@ def main() -> None:
                             "cascade_exact_child_log_likelihood": cascade.exact_child_log_likelihood.tolist(),
                             "cascade_exact_rendered_coverage": cascade.exact_rendered_coverage.tolist(),
                         })
-            modes_report[name] = _pose_report(modes, labels.pose_w2c)
-            details = _pose_details(modes, labels.pose_w2c)
+            modes_report[name] = _pose_report(modes, gt_pose_w2c)
+            details = _pose_details(modes, gt_pose_w2c)
             if (
                 args.proposal_method in (
                     "geometry", "soft_geometry", "vfm_geometry", "primitive_vfm_geometry",
@@ -894,7 +1088,7 @@ def main() -> None:
                         np.asarray([item[1].inlier_count for item in refined]),
                     )
                     refined_name = f"{name}_detector_radio"
-                    modes_report[refined_name] = _pose_report(refined_modes, labels.pose_w2c)
+                    modes_report[refined_name] = _pose_report(refined_modes, gt_pose_w2c)
                     mode_details[refined_name] = [
                         {
                             **detail,
@@ -905,10 +1099,11 @@ def main() -> None:
                             "median_reprojection_px": float(item[1].median_reprojection_px),
                             "mean_inlier_similarity": float(item[1].mean_inlier_similarity),
                         }
-                        for detail, item in zip(_pose_details(refined_modes, labels.pose_w2c), refined)
+                        for detail, item in zip(_pose_details(refined_modes, gt_pose_w2c), refined)
                     ]
         report = {
             "image_id": str(metadata["image_id"]),
+            "elapsed_sec": float(time.perf_counter() - query_started),
             "support_count": int(grouped.xy.shape[0]),
             "posterior_mass": {
                 "retained_mean": float(np.mean(np.sum(grouped_parent.candidate_probabilities, axis=1))),
@@ -941,6 +1136,9 @@ def main() -> None:
             ),
         }
         reports.append(report)
+        completed_image_ids.add(str(report["image_id"]))
+        if len(reports) % int(args.checkpoint_every) == 0:
+            checkpoint_rows()
         if not bool(args.quiet_rows):
             print(json.dumps(report), flush=True)
     mode_names = sorted({name for row in reports for name in row["modes"]})
@@ -960,12 +1158,32 @@ def main() -> None:
     result = {
         "stage": "goal_maplet_region_child_topn_pose_proposal",
         "query_count": len(reports),
+        "elapsed_sec": float(time.perf_counter() - run_started),
+        "per_query_elapsed_sec": {
+            "median": float(np.median([row["elapsed_sec"] for row in reports]))
+            if reports else None,
+            "p90": float(np.quantile([row["elapsed_sec"] for row in reports], 0.9))
+            if reports else None,
+        },
         "physical_map_sha256": physical.content_sha256,
         "canonical_field_sha256": field.content_sha256,
+        "view_conditioned_field_sha256": (
+            view_conditioned_field.content_sha256
+            if view_conditioned_field is not None else None
+        ),
         "field_feature_contract_sha256": feature_contract.content_sha256,
         "validity_calibration_sha256": calibration.content_sha256,
         "parent_mode": str(args.parent_mode),
         "child_mode": str(args.child_mode),
+        "query_input_contract": {
+            "query_contributor_identity_labels_deserialized": bool(
+                oracle_labels_requested
+            ),
+            "actual_path_uses_query_contributor_identity_labels": False,
+            "query_contributor_identity_labels_requested_only_for_oracle_ablation": True,
+            "ground_truth_pose_used_for_candidate_selection": False,
+            "ground_truth_pose_used_for_offline_error_and_stage_diagnostics": True,
+        },
         "proposal_trials": int(args.proposal_trials),
         "proposal_method": str(args.proposal_method),
         "geometry_head_sha256": geometry_head_sha256,
@@ -1056,6 +1274,13 @@ def main() -> None:
                     int(args.mapping_view_anchors)
                     if args.proposal_method == "view_geometry" else 0
                 ),
+                "mapping_view_exact_protected_anchor_count": (
+                    min(
+                        int(args.mapping_view_anchors),
+                        max(int(args.view_geometry_exact_protected_anchors), 0),
+                    )
+                    if args.proposal_method == "view_geometry" else 0
+                ),
                 "mapping_view_support_pairs": (
                     int(args.mapping_view_support_pairs)
                     if args.proposal_method == "view_geometry" else 0
@@ -1080,6 +1305,14 @@ def main() -> None:
                 "seed_exact_verify_count": (
                     int(args.view_geometry_exact_verify_count)
                     if args.proposal_method == "view_geometry" else 0
+                ),
+                "seed_exact_keep_per_structural_anchor": (
+                    int(args.view_geometry_exact_keep_per_anchor)
+                    if args.proposal_method == "view_geometry" else 0
+                ),
+                "continuous_visibility_chart": (
+                    bool(args.view_geometry_visibility_chart)
+                    if args.proposal_method == "view_geometry" else False
                 ),
             }
             if args.proposal_method in (
@@ -1125,10 +1358,16 @@ def main() -> None:
         ),
         "mapping_view_contract": (
             {
-                "candidate_count": int(args.mapping_view_candidates),
+                "candidate_count": min(
+                    int(args.mapping_view_candidates), int(mapping_graph.poses_w2c.shape[0]),
+                ),
+                "candidate_budget": int(args.mapping_view_candidates),
+                "graph_view_node_count": int(mapping_graph.poses_w2c.shape[0]),
                 "anchor_count": int(args.mapping_view_anchors),
                 "missing_view_probability": float(args.mapping_view_missing_probability),
                 "temperature": float(args.mapping_view_temperature),
+                "null_semantics": "mean_unresolved_support_mass_before_view_normalization",
+                "view_probability_semantics": "p_h1_times_p_view_given_h1",
                 "stores_mapping_rgb": False,
                 "stores_mapping_image_ids": False,
                 "stores_downstream_embeddings": False,
@@ -1141,8 +1380,99 @@ def main() -> None:
         "summary": summary,
         "rows": reports,
     }
+    manifest_configuration = {
+        key: value
+        for key, value in vars(args).items()
+        if key not in {"output_json", "force", "quiet_rows"}
+    }
+    contributor_hashes = {
+        path.name: file_sha256(path)
+        for path in paths
+    }
+    token_hashes = {}
+    for path in paths:
+        with np.load(path, allow_pickle=False) as data:
+            item = json.loads(str(np.asarray(data["metadata_json"]).item()))
+        token_path = Path(str(item["token_path"]))
+        token_hashes[str(item["image_id"])] = file_sha256(token_path)
+
+    def stage_counts(value, prefix=""):
+        output_counts = {}
+        if isinstance(value, dict):
+            for key, child in value.items():
+                name = f"{prefix}.{key}" if prefix else str(key)
+                if key in {"pose_count", "mode_count", "raw_candidate_count"}:
+                    output_counts[name] = int(child)
+                else:
+                    output_counts.update(stage_counts(child, name))
+        return output_counts
+
+    candidate_counts = {
+        str(row["image_id"]): {
+            **{
+                f"modes.{name}": int(metrics["mode_count"])
+                for name, metrics in row["modes"].items()
+                if metrics.get("mode_count") is not None
+            },
+            **stage_counts(row.get("proposal_diagnostics", {}), "proposal"),
+        }
+        for row in reports
+    }
+    result["run_manifest"] = build_run_manifest(
+        repository_root=repository_root,
+        argv=[sys.executable, *sys.argv],
+        configuration=manifest_configuration,
+        input_artifacts={
+            "physical_map_content_sha256": physical.content_sha256,
+            "canonical_field_content_sha256": field.content_sha256,
+            "view_conditioned_field_content_sha256": (
+                view_conditioned_field.content_sha256
+                if view_conditioned_field is not None else None
+            ),
+            "field_feature_contract_content_sha256": feature_contract.content_sha256,
+            "validity_calibration_content_sha256": calibration.content_sha256,
+            "surface_mapper_file_sha256": file_sha256(Path(args.surface_mapper)),
+            "physical_instance_readout_file_sha256": instance_readout_sha256,
+            "geometry_head_file_sha256": geometry_head_sha256,
+            "typed_graph_content_sha256": graph.content_sha256 if graph is not None else None,
+            "mapping_view_graph_content_sha256": (
+                mapping_graph.content_sha256 if mapping_graph is not None else None
+            ),
+            "query_contributors_sha256": canonical_json_sha256(contributor_hashes),
+            "query_radio_tokens_sha256": canonical_json_sha256(token_hashes),
+            "candidate_selection_report_sha256": (
+                file_sha256(Path(args.candidate_selection_report))
+                if str(args.candidate_selection_report) else None
+            ),
+        },
+        query_ids=[str(row["image_id"]) for row in reports],
+        device=str(args.device),
+        numeric_contract={
+            "pose_dtype": "float64",
+            "feature_and_render_dtype": "float32",
+            "sparse_visibility": "all_clean_primitives_depth_prepass",
+            "map_feature_conditioning": (
+                "low_rank_view_direction_and_projected_scale_with_canonical_fallback"
+                if view_conditioned_field is not None else "single_canonical_code"
+            ),
+            "primitive_tie_break": PRIMITIVE_Z_TIE_BREAK,
+            "random_seed_policy": "sha256_image_id_uint31_little_endian_v1",
+        },
+        candidate_counts=candidate_counts,
+        repository_state_at_start=repository_state_at_start,
+    )
+    result["candidate_selection_report"] = (
+        str(Path(args.candidate_selection_report).resolve())
+        if str(args.candidate_selection_report) else None
+    )
+    result["candidate_selection_report_sha256"] = (
+        file_sha256(Path(args.candidate_selection_report))
+        if str(args.candidate_selection_report) else None
+    )
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+    if partial_path.is_file():
+        partial_path.unlink()
     print(json.dumps({key: value for key, value in result.items() if key != "rows"}, indent=2, sort_keys=True))
 
 

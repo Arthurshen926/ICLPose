@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from feature_extract.vfm.colmap_tracks import colmap_camera_focal_lengths
 from feature_extract.vfm.gaussian_vfm_field import GaussianVFMFeatureView
 from feature_extract.vfm.localization_v6.atlas_renderer import RenderedMapletAtlases
 from feature_extract.vfm.vfm_2dgs_mapping import SurfaceElementMap, _render_surface_element_pixel_contributions_2dgs
@@ -20,6 +21,24 @@ from .visibility import dominant_maplet_owner, signed_surface_visibility
 class RenderedSurfaceIdentity:
     primitive_rows: np.ndarray
     mask: np.ndarray
+
+
+def _deterministic_contribution_order(
+    pixel_ids: np.ndarray,
+    stable_primitive_ids: np.ndarray,
+    contribution: np.ndarray,
+) -> np.ndarray:
+    """Canonical accumulation order independent of physical-map row order."""
+
+    pixel = np.asarray(pixel_ids, dtype=np.int64).reshape(-1)
+    primitive = np.asarray(stable_primitive_ids, dtype=np.int64).reshape(-1)
+    weight = np.asarray(contribution, dtype=np.float32).reshape(-1)
+    if pixel.shape != primitive.shape or pixel.shape != weight.shape:
+        raise ValueError("surface contribution arrays differ")
+    # ``pixel`` is the primary key, then persistent primitive identity.  The
+    # weight key also canonicalizes the unlikely case of duplicate splats from
+    # one primitive to one pixel.
+    return np.lexsort((weight, primitive, pixel))
 
 
 def render_surface_identity(
@@ -73,7 +92,11 @@ def render_surface_identity(
     if np.any(valid):
         selected = np.flatnonzero(valid)
         scene_primitive_rows = scene_rows[local_rows[selected]]
-        order = np.lexsort((scene_primitive_rows, -contribution[selected], pixel_ids[selected]))
+        order = np.lexsort((
+            physical.primitive_ids[scene_primitive_rows],
+            -contribution[selected],
+            pixel_ids[selected],
+        ))
         ordered = selected[order]
         ordered_pixels = pixel_ids[ordered]
         first = np.r_[True, ordered_pixels[1:] != ordered_pixels[:-1]]
@@ -201,6 +224,11 @@ def render_canonical_surface_field(
     uncertainty_sum = np.zeros((pixel_count,), dtype=np.float32)
     if np.any(feature_valid):
         selected = np.flatnonzero(feature_valid)
+        selected = selected[_deterministic_contribution_order(
+            pixel_ids[selected],
+            physical.primitive_ids[scene_primitive_rows[selected]],
+            contribution[selected],
+        )]
         for offset in range(0, selected.size, 250_000):
             rows = selected[offset : offset + 250_000]
             value = contribution[rows].astype(np.float32)
@@ -209,7 +237,16 @@ def render_canonical_surface_field(
             np.add.at(uncertainty_sum, pixel_ids[rows], value * field.uncertainty[field_rows[rows]])
     total_alpha = np.zeros((pixel_count,), dtype=np.float32)
     if pixel_ids.size:
-        np.add.at(total_alpha, pixel_ids, contribution.astype(np.float32))
+        accumulation_order = _deterministic_contribution_order(
+            pixel_ids,
+            physical.primitive_ids[scene_primitive_rows],
+            contribution,
+        )
+        np.add.at(
+            total_alpha,
+            pixel_ids[accumulation_order],
+            contribution[accumulation_order].astype(np.float32),
+        )
     mask = (feature_alpha >= float(minimum_feature_alpha)) & (
         feature_alpha / np.maximum(total_alpha, 1e-8) >= float(minimum_feature_fraction)
     )
@@ -227,7 +264,11 @@ def render_canonical_surface_field(
     # ``feature_valid`` silently collapsed field-missing into background.
     if contribution.size:
         selected = np.arange(contribution.size, dtype=np.int64)
-        order = np.lexsort((scene_primitive_rows[selected], -contribution[selected], pixel_ids[selected]))
+        order = np.lexsort((
+            physical.primitive_ids[scene_primitive_rows[selected]],
+            -contribution[selected],
+            pixel_ids[selected],
+        ))
         ordered = selected[order]
         ordered_pixels = pixel_ids[ordered]
         first = np.r_[True, ordered_pixels[1:] != ordered_pixels[:-1]]
@@ -279,7 +320,8 @@ def render_canonical_surface_field(
         child_valid = child_rows >= 0
         child_id[valid_pixels[child_valid]] = child_rows[child_valid]
         incidence[valid_pixels] = np.abs(primitive_incidence[primitive_rows]).astype(np.float32)
-        focal = 0.5 * (float(camera.params[0]) + float(camera.params[1]))
+        fx, fy = colmap_camera_focal_lengths(camera)
+        focal = 0.5 * (abs(float(fx)) + abs(float(fy)))
         primitive_radius = np.sqrt(
             np.maximum(
                 physical.primitive_scale1[primitive_rows]

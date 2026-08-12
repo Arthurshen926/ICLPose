@@ -24,6 +24,7 @@ from feature_extract.vfm.localization_v6.primitive_contributors import (
 )
 from feature_extract.vfm.surface_maplet_bank import load_2dgs_primitive_quality
 from feature_extract.vfm.tokens import TokenBankManifest
+from feature_extract.vfm.vfm_2dgs_mapping import SurfaceElementMap
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -35,6 +36,15 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help=(
             "Optional source-indexed clean PLY mask. Geometry is loaded from "
             "--gaussian_ply so contributor IDs remain canonical."
+        ),
+    )
+    parser.add_argument(
+        "--clean_surface_elements",
+        default="",
+        help=(
+            "Optional surface-element declaration of the clean source mask. "
+            "Its parent_gaussian_indices select source PLY disks; this is the "
+            "strict MAtCha path and is mutually exclusive with --clean_gaussian_ply."
         ),
     )
     parser.add_argument("--mapping_manifest", required=True)
@@ -54,6 +64,47 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--force", action="store_true")
     return parser.parse_args(argv)
+
+
+def _declared_clean_source_indices(
+    source_count: int,
+    *,
+    clean_gaussian_ply: str = "",
+    clean_surface_elements: str = "",
+) -> tuple[np.ndarray, str, Path | None]:
+    """Resolve one auditable clean-geometry declaration in source-ID space."""
+
+    if clean_gaussian_ply and clean_surface_elements:
+        raise ValueError(
+            "clean_gaussian_ply and clean_surface_elements are mutually exclusive"
+        )
+    declaration: Path | None = None
+    if clean_gaussian_ply:
+        declaration = Path(clean_gaussian_ply)
+        quality = load_2dgs_primitive_quality(declaration)
+        if not bool((quality.metadata or {}).get("source_indexed", False)):
+            raise ValueError("clean_gaussian_ply must carry canonical source_index")
+        if len(quality) > int(source_count):
+            raise ValueError("clean PLY source indices exceed full 2DGS")
+        indices = np.flatnonzero(quality.geometry_confidence > 0.0).astype(np.int64)
+        policy = "declared_clean_source_index_mask"
+    elif clean_surface_elements:
+        declaration = Path(clean_surface_elements)
+        surface = SurfaceElementMap.load_npz(declaration)
+        indices = np.unique(
+            np.asarray(surface.parent_gaussian_indices, dtype=np.int64)
+        )
+        policy = "declared_surface_element_parent_source_mask"
+    else:
+        indices = np.arange(int(source_count), dtype=np.int64)
+        policy = "complete_input_2dgs"
+    if (
+        indices.size == 0
+        or np.any(indices < 0)
+        or np.any(indices >= int(source_count))
+    ):
+        raise ValueError("declared clean geometry retained invalid source primitives")
+    return indices, policy, declaration
 
 
 def _frame_number(image_id: str) -> int:
@@ -81,20 +132,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     if summary_path.exists() and not bool(args.force):
         raise FileExistsError("refusing to overwrite contributor cache")
     source = load_gaussian_vfm_source_from_ply(Path(args.gaussian_ply))
-    clean_source_indices = np.arange(source.xyz.shape[0], dtype=np.int64)
-    if str(args.clean_gaussian_ply):
-        quality = load_2dgs_primitive_quality(Path(args.clean_gaussian_ply))
-        if not bool((quality.metadata or {}).get("source_indexed", False)):
-            raise ValueError(
-                "clean_gaussian_ply must carry canonical source_index"
-            )
-        if len(quality) > source.xyz.shape[0]:
-            raise ValueError("clean PLY source indices exceed full 2DGS")
-        clean_source_indices = np.flatnonzero(
-            quality.geometry_confidence > 0.0
-        ).astype(np.int64)
-        if clean_source_indices.size == 0:
-            raise ValueError("clean PLY retained no source primitives")
+    clean_source_indices, occlusion_policy, clean_declaration = (
+        _declared_clean_source_indices(
+            int(source.xyz.shape[0]),
+            clean_gaussian_ply=str(args.clean_gaussian_ply),
+            clean_surface_elements=str(args.clean_surface_elements),
+        )
+    )
     # Occlusion and contributor identity must come from the same declared clean
     # 2DGS prior as the canonical atlas.  The full source is retained only to
     # preserve stable source-index identity.
@@ -103,8 +147,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     geometry_source_sha256 = _file_sha256(Path(args.gaussian_ply))
     clean_geometry_source_sha256 = (
-        _file_sha256(Path(args.clean_gaussian_ply))
-        if str(args.clean_gaussian_ply)
+        _file_sha256(clean_declaration)
+        if clean_declaration is not None
         else geometry_source_sha256
     )
     clean_source_index_sha256 = _source_index_sha256(clean_source_indices)
@@ -198,16 +242,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             "height": int(args.height),
             "top_k": int(args.top_k),
             "assignment": "gsplat_topk_contributor_source_index",
-            "uses_complete_2dgs_for_occlusion": not bool(
-                str(args.clean_gaussian_ply)
-            ),
-            "uses_declared_clean_2dgs_for_occlusion": bool(
-                str(args.clean_gaussian_ply)
-            ),
-            "occlusion_primitive_policy": (
-                "declared_clean_source_index_mask"
-                if str(args.clean_gaussian_ply)
-                else "complete_input_2dgs"
+            "uses_complete_2dgs_for_occlusion": clean_declaration is None,
+            "uses_declared_clean_2dgs_for_occlusion": clean_declaration is not None,
+            "occlusion_primitive_policy": occlusion_policy,
+            "clean_geometry_declaration": (
+                "" if clean_declaration is None else str(clean_declaration)
             ),
             "geometry_source_sha256": geometry_source_sha256,
             "clean_geometry_source_sha256": clean_geometry_source_sha256,
@@ -241,16 +280,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         "trajectory_disjoint_role": "caller_declared_split",
         "camera_audit": camera_audit,
         "assignment": "gsplat_topk_contributor_source_index",
-        "uses_complete_2dgs_for_occlusion": not bool(
-            str(args.clean_gaussian_ply)
-        ),
-        "uses_declared_clean_2dgs_for_occlusion": bool(
-            str(args.clean_gaussian_ply)
-        ),
-        "occlusion_primitive_policy": (
-            "declared_clean_source_index_mask"
-            if str(args.clean_gaussian_ply)
-            else "complete_input_2dgs"
+        "uses_complete_2dgs_for_occlusion": clean_declaration is None,
+        "uses_declared_clean_2dgs_for_occlusion": clean_declaration is not None,
+        "occlusion_primitive_policy": occlusion_policy,
+        "clean_geometry_declaration": (
+            "" if clean_declaration is None else str(clean_declaration)
         ),
         "full_primitive_count": int(source.xyz.shape[0]),
         "retained_primitive_count": int(clean_source_indices.size),

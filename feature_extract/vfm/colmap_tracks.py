@@ -19,6 +19,31 @@ class ColmapCamera:
     params: Tuple[float, ...]
 
 
+def colmap_camera_focal_lengths(camera: ColmapCamera) -> tuple[float, float]:
+    """Return ``(fx, fy)`` according to the COLMAP camera model contract.
+
+    In the single-focal models, ``params[1]`` is a principal-point coordinate,
+    not a second focal length.  Keeping this parsing in one place prevents
+    projected-scale and splat-footprint code from silently depending on the
+    number and ordering of camera parameters.
+    """
+
+    model_id = int(camera.model_id)
+    params = tuple(float(value) for value in camera.params)
+    single_focal_models = {0, 2, 3, 8, 9}
+    dual_focal_models = {1, 4, 5, 6, 7, 10}
+    if model_id in single_focal_models:
+        if len(params) < 1:
+            raise ValueError("single-focal COLMAP camera has no focal length")
+        focal = float(params[0])
+        return focal, focal
+    if model_id in dual_focal_models:
+        if len(params) < 2:
+            raise ValueError("dual-focal COLMAP camera has incomplete focal lengths")
+        return float(params[0]), float(params[1])
+    raise ValueError(f"unsupported COLMAP camera model id: {camera.model_id}")
+
+
 @dataclass(frozen=True)
 class ColmapImageObservation:
     image_id: int

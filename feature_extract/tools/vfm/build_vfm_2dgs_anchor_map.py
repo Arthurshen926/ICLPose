@@ -90,6 +90,11 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--reference_manifest", required=True)
     parser.add_argument("--reference_pose_file", required=True)
     parser.add_argument("--camera_model_dir", default="")
+    parser.add_argument(
+        "--require_camera_for_every_view",
+        action="store_true",
+        help="Fail instead of using --default_camera for an unmapped image ID.",
+    )
     parser.add_argument("--layer_name", default="radio_final")
     parser.add_argument(
         "--matcha_joint_checkpoint",
@@ -132,6 +137,14 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--surface_normal_cosine_threshold", type=float, default=0.8)
     parser.add_argument("--virtual_cell_max_scale", type=float, default=0.0)
+    parser.add_argument(
+        "--disable_virtual_surface_cells",
+        action="store_true",
+        help=(
+            "Keep one surface element per source Gaussian. Required when source "
+            "primitive IDs must remain stable across strict geometry artifacts."
+        ),
+    )
     parser.add_argument("--auto_virtual_cell_target_px", type=float, default=0.0)
     parser.add_argument("--auto_virtual_cell_depth_quantile", type=float, default=0.5)
     parser.add_argument("--auto_virtual_cell_max_samples", type=int, default=20000)
@@ -243,6 +256,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = _parse_args(argv)
     output_path = Path(args.output_npz)
     output_dir = output_path.parent
+    if bool(args.disable_virtual_surface_cells):
+        if float(args.virtual_cell_max_scale) > 0.0:
+            raise ValueError(
+                "disable_virtual_surface_cells conflicts with virtual_cell_max_scale"
+            )
+        args.virtual_cell_max_scale = 0.0
+        args.auto_virtual_cell_target_px = 0.0
     if bool(args.canonical_vfm_2dgs):
         args.support_mode = "surface_component"
         args.contribution_renderer = "gsplat_2dgs"
@@ -276,7 +296,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             args.observation_bank_npz = str(output_dir / "observation_bank.npz")
         if not args.descriptor_index_npz:
             args.descriptor_index_npz = str(output_dir / "descriptor_index.npz")
-        if float(args.auto_virtual_cell_target_px) <= 0.0 and float(args.virtual_cell_max_scale) <= 0.0:
+        if (
+            not bool(args.disable_virtual_surface_cells)
+            and float(args.auto_virtual_cell_target_px) <= 0.0
+            and float(args.virtual_cell_max_scale) <= 0.0
+        ):
             args.auto_virtual_cell_target_px = 1.0
     manifest = TokenBankManifest.from_json(Path(args.reference_manifest))
     manifest.validate(verify_checksums=False)
@@ -326,6 +350,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     records = _select_records(records, int(args.max_views), args.view_selection)
     if not records:
         raise ValueError("no reference views with both token features and poses")
+    missing_camera_ids = [
+        record.image_id for record in records if record.image_id not in camera_by_image
+    ]
+    if bool(args.require_camera_for_every_view) and missing_camera_ids:
+        raise ValueError(
+            f"camera model is absent for mapping view: {missing_camera_ids[0]}"
+        )
 
     auto_virtual_cell_max_scale = 0.0
     if str(args.reuse_surface_npz):
@@ -655,6 +686,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         },
         "canonical_vfm_2dgs": bool(args.canonical_vfm_2dgs),
         "auto_virtual_cell": {
+            "disabled": bool(args.disable_virtual_surface_cells),
             "target_projected_radius_px": float(args.auto_virtual_cell_target_px),
             "depth_quantile": float(args.auto_virtual_cell_depth_quantile),
             "max_samples": int(args.auto_virtual_cell_max_samples),
@@ -685,6 +717,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             "mapper_device": str(args.mapper_device),
             **mapper_metadata,
             "view_selection": str(args.view_selection),
+            "require_camera_for_every_view": bool(args.require_camera_for_every_view),
+            "missing_camera_view_count": len(missing_camera_ids),
         },
         "outputs": {"anchor_map": str(args.output_npz), "summary": str(args.summary_json)},
     }

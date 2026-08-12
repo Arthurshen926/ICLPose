@@ -70,6 +70,15 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=120)
     parser.add_argument("--eval_every", type=int, default=5)
     parser.add_argument("--patience", type=int, default=30)
+    parser.add_argument(
+        "--checkpoint_protocol",
+        choices=("validation_selected", "fixed_epoch_no_selection"),
+        default="validation_selected",
+        help=(
+            "Use fixed_epoch_no_selection for the final all-train fit after "
+            "the epoch count has been frozen by train-only OOF evaluation."
+        ),
+    )
     parser.add_argument("--learning_rate", type=float, default=2e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--gradient_clip_norm", type=float, default=5.0)
@@ -245,6 +254,32 @@ def _split_images_by_trajectory(
     if not training or not validation:
         raise ValueError("trajectory-level mapper split has an empty role")
     return training, validation
+
+
+def _fixed_epoch_training_images(
+    image_ids: np.ndarray,
+    training_trajectory_ids: Sequence[str],
+    strict_holdout_trajectory_ids: Sequence[str],
+) -> set[str]:
+    """Resolve an all-fit split with no checkpoint-selection observations."""
+
+    images = {str(value) for value in image_ids.tolist()}
+    available = {value.split("/", 1)[0] for value in images}
+    requested = {str(value) for value in training_trajectory_ids}
+    strict = {str(value) for value in strict_holdout_trajectory_ids}
+    if requested & strict:
+        raise ValueError("fixed-epoch training and strict holdout trajectories overlap")
+    if requested - available:
+        raise ValueError(
+            f"fixed-epoch training trajectories are absent: {sorted(requested - available)}"
+        )
+    selected_trajectories = requested or (available - strict)
+    selected = {
+        image for image in images if image.split("/", 1)[0] in selected_trajectories
+    }
+    if not selected:
+        raise ValueError("fixed-epoch training split is empty")
+    return selected
 
 
 def _resolve_prototype_images(
@@ -453,10 +488,26 @@ def main(argv: Sequence[str] | None = None) -> None:
     labels, image_ids, quality, centers = _observation_labels(bank)
     if len(labels) != len(bank.view_image_ids):
         raise RuntimeError("surface-maplet view offsets are inconsistent")
+    fixed_epoch = str(args.checkpoint_protocol) == "fixed_epoch_no_selection"
+    if fixed_epoch and args.validation_trajectory_ids:
+        raise ValueError(
+            "fixed_epoch_no_selection does not accept validation trajectories"
+        )
+    if fixed_epoch and args.prototype_trajectory_ids:
+        raise ValueError(
+            "fixed_epoch_no_selection does not accept validation prototypes"
+        )
     use_trajectory_split = bool(args.training_trajectory_ids) or bool(
         args.validation_trajectory_ids
     )
-    if use_trajectory_split:
+    if fixed_epoch:
+        training_images = _fixed_epoch_training_images(
+            image_ids,
+            args.training_trajectory_ids,
+            args.strict_holdout_trajectory_ids,
+        )
+        validation_images: set[str] = set()
+    elif use_trajectory_split:
         if not (
             bool(args.training_trajectory_ids)
             and bool(args.validation_trajectory_ids)
@@ -476,12 +527,16 @@ def main(argv: Sequence[str] | None = None) -> None:
             int(args.validation_stride),
             int(args.validation_offset),
         )
-    prototype_images = _resolve_prototype_images(
-        training_images,
-        validation_images,
-        args.prototype_trajectory_ids,
-        args.strict_holdout_trajectory_ids,
-        trajectory_split=bool(use_trajectory_split),
+    prototype_images = (
+        set(training_images)
+        if not validation_images
+        else _resolve_prototype_images(
+            training_images,
+            validation_images,
+            args.prototype_trajectory_ids,
+            args.strict_holdout_trajectory_ids,
+            trajectory_split=bool(use_trajectory_split),
+        )
     )
     feature_maps = _load_raw_feature_maps(
         manifest,
@@ -500,22 +555,28 @@ def main(argv: Sequence[str] | None = None) -> None:
     pool_sizes = _parse_int_tuple(args.pool_sizes)
     pool_weights = _parse_float_tuple(args.pool_weights)
     region_config = RadioFinalRegionConfig(pool_sizes=pool_sizes, pool_weights=pool_weights)
-    raw_metrics = _evaluate_raw_radio(
-        feature_maps,
-        image_ids,
-        bank.view_token_xy,
-        labels,
-        quality,
-        prototype_mask,
-        validation_mask,
-        region_config,
+    raw_metrics = (
+        _evaluate_raw_radio(
+            feature_maps,
+            image_ids,
+            bank.view_token_xy,
+            labels,
+            quality,
+            prototype_mask,
+            validation_mask,
+            region_config,
+        )
+        if validation_images else None
     )
-    input_descriptor_metrics = maplet_prototype_retrieval_metrics(
-        bank.view_descriptors,
-        labels,
-        prototype_mask,
-        validation_mask,
-        quality,
+    input_descriptor_metrics = (
+        maplet_prototype_retrieval_metrics(
+            bank.view_descriptors,
+            labels,
+            prototype_mask,
+            validation_mask,
+            quality,
+        )
+        if validation_images else None
     )
 
     input_dim = int(next(iter(feature_maps.values())).shape[0])
@@ -564,20 +625,25 @@ def main(argv: Sequence[str] | None = None) -> None:
             raise ValueError("large-map batch_maplets/steps_per_epoch are invalid")
     batch_rng = np.random.default_rng(int(args.seed) + 101)
 
-    initial_metrics = _evaluate_model(
-        model,
-        feature_maps,
-        image_ids,
-        bank.view_token_xy,
-        labels,
-        quality,
-        prototype_mask,
-        validation_mask,
-        device,
-        pool_sizes,
-        pool_weights,
+    initial_metrics = (
+        _evaluate_model(
+            model,
+            feature_maps,
+            image_ids,
+            bank.view_token_xy,
+            labels,
+            quality,
+            prototype_mask,
+            validation_mask,
+            device,
+            pool_sizes,
+            pool_weights,
+        )
+        if validation_images else None
     )
-    best_metrics: dict[str, float | int] | None = dict(initial_metrics)
+    best_metrics: dict[str, float | int] | None = (
+        dict(initial_metrics) if initial_metrics is not None else None
+    )
     best_epoch = 0
     best_loss = float("inf")
     history: list[dict[str, object]] = [
@@ -606,20 +672,24 @@ def main(argv: Sequence[str] | None = None) -> None:
             str(value) for value in args.strict_holdout_trajectory_ids
         ),
         "trajectory_split": bool(use_trajectory_split),
+        "checkpoint_protocol": str(args.checkpoint_protocol),
+        "checkpoint_selection_uses_validation": not fixed_epoch,
+        "fixed_epoch": int(args.epochs) if fixed_epoch else None,
         "pool_sizes": list(pool_sizes),
         "pool_weights": list(pool_weights),
         "initial_checkpoint": str(args.initial_checkpoint),
         "initial_checkpoint_metadata": initial_checkpoint_metadata,
     }
-    save_surface_maplet_mapper(
-        Path(args.output_checkpoint),
-        model,
-        metadata={
-            **checkpoint_metadata_base,
-            "best_epoch": 0,
-            "best_validation": best_metrics,
-        },
-    )
+    if not fixed_epoch:
+        save_surface_maplet_mapper(
+            Path(args.output_checkpoint),
+            model,
+            metadata={
+                **checkpoint_metadata_base,
+                "best_epoch": 0,
+                "best_validation": best_metrics,
+            },
+        )
     for epoch in range(1, int(args.epochs) + 1):
         model.train()
         step_losses: list[float] = []
@@ -689,6 +759,26 @@ def main(argv: Sequence[str] | None = None) -> None:
             for key in step_stats[0]
         }
 
+        if fixed_epoch:
+            if epoch == int(args.epochs):
+                best_epoch = int(epoch)
+                best_loss = loss_value
+                save_surface_maplet_mapper(
+                    Path(args.output_checkpoint),
+                    model,
+                    metadata={
+                        **checkpoint_metadata_base,
+                        "best_epoch": int(best_epoch),
+                        "best_validation": None,
+                    },
+                )
+                history.append({
+                    "epoch": int(epoch),
+                    "loss": loss_value,
+                    "loss_stats": loss_stats,
+                    "validation": None,
+                })
+            continue
         should_evaluate = (
             epoch == 1
             or epoch == int(args.epochs)
@@ -737,7 +827,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         if int(args.patience) > 0 and stale_epochs >= int(args.patience):
             break
 
-    if best_metrics is None:
+    if best_metrics is None and not fixed_epoch:
         raise RuntimeError("surface-maplet mapper training produced no validation measurement")
     summary = {
         "stage": "train_surface_maplet_mapper",
@@ -748,9 +838,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             "uses_sfm_points": False,
             "uses_sfm_tracks": False,
             "query_or_test_pose_used": False,
-            "validation_views_disjoint_from_fit": True,
+            "validation_views_disjoint_from_fit": bool(validation_images),
             "trajectory_level_split": bool(use_trajectory_split),
-            "validation_prototypes_match_deployed_map": True,
+            "validation_prototypes_match_deployed_map": bool(validation_images),
+            "all_selected_images_used_for_fit": not bool(validation_images),
+            "checkpoint_selection_uses_validation": not fixed_epoch,
         },
         "split": {
             "training_images": sorted(training_images),
@@ -801,6 +893,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             "optimization_mode": "full_batch" if use_full_batch else "sampled_maplet_batches",
             "batch_maplets": int(args.batch_maplets),
             "steps_per_epoch": int(args.steps_per_epoch),
+            "checkpoint_protocol": str(args.checkpoint_protocol),
         },
     }
     summary_path = Path(args.summary_json)

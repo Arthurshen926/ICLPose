@@ -19,6 +19,10 @@ import numpy as np
 from feature_extract.vfm.colmap_tracks import ColmapCamera
 
 from .physical_map import GoalMapletPhysicalMap
+from .view_conditioned_field import ViewConditionedPrimitiveField
+
+
+PRIMITIVE_Z_TIE_BREAK = "minimum_stable_primitive_id_within_1e-5_depth"
 
 
 @dataclass(frozen=True)
@@ -40,6 +44,7 @@ class SparsePrimitiveVFMEvidence:
     visible_sample_mean_scores: np.ndarray
     rendered_coverage: np.ndarray
     feature_coverage: np.ndarray
+    conditioned_feature_coverage: np.ndarray
     sample_count: int
     primitives_per_child: int
 
@@ -236,7 +241,7 @@ def score_pose_conditioned_sparse_vfm(
         allowed = np.asarray(allowed_parent_rows, dtype=np.int64)
         if allowed.ndim != 2 or allowed.shape[0] != poses.shape[0]:
             raise ValueError("allowed parent rows must have one row per pose")
-        if np.any(allowed >= parent_map.shape[0]):
+        if np.any((allowed < -1) | (allowed >= parent_map.shape[0])):
             raise ValueError("allowed parent row is outside the physical map")
     planned_mask = None
     if query_token_mask is not None:
@@ -292,7 +297,9 @@ def score_pose_conditioned_sparse_vfm(
                     allowed[start:stop], dtype=torch.long, device=torch_device,
                 )
                 identity_allowed = torch.any(
-                    rendered_parent[:, :, None] == allowed_t[:, None, :], dim=2,
+                    (allowed_t[:, None, :] >= 0)
+                    & (rendered_parent[:, :, None] == allowed_t[:, None, :]),
+                    dim=2,
                 )
                 feature_valid &= identity_allowed
             if planned_mask is not None:
@@ -407,7 +414,8 @@ def _stratified_primitive_samples(
         primitive_rows = field_rows[field_indices]
         delta = physical.primitive_centers[primitive_rows] - physical.child_centers[int(child)]
         frame = physical.child_frames[int(child)]
-        uv = np.stack((delta @ frame[:, 0], delta @ frame[:, 1]), axis=1)
+        # Frames store local axes by row throughout ``physical_map.py``.
+        uv = delta @ frame[:2].T
         scale = np.maximum(np.asarray(physical.child_extents[int(child), :2]), 1e-4)
         uv /= scale[None, :]
         quality = (
@@ -448,7 +456,17 @@ def _render_primitive_sample_owner_batch(
     token_width: int,
     device: str,
     maximum_splat_radius_tokens: int,
+    geometry_tensors=None,
 ):
+    """Render sampled feature owners behind a full-geometry depth prepass.
+
+    Feature evaluation is sparse, but visibility is not: every clean physical
+    primitive contributes to the low-resolution z-buffer, including unowned
+    primitives and primitives without canonical codes.  If the front surface
+    has no selected feature sample, the token is explicitly field-missing
+    instead of exposing a high-similarity surface behind it.
+    """
+
     import torch
 
     torch_device = torch.device(
@@ -456,92 +474,145 @@ def _render_primitive_sample_owner_batch(
     )
     rows = np.asarray(primitive_rows, dtype=np.int64).reshape(-1)
     pose = torch.as_tensor(poses_w2c, dtype=torch.float32, device=torch_device)
-    center = torch.as_tensor(physical.primitive_centers[rows], dtype=torch.float32, device=torch_device)
-    normal = torch.as_tensor(physical.primitive_normals[rows], dtype=torch.float32, device=torch_device)
-    sidedness = torch.as_tensor(
-        physical.primitive_sidedness[rows], dtype=torch.uint8, device=torch_device,
-    )
-    scale1 = torch.as_tensor(physical.primitive_scale1[rows], dtype=torch.float32, device=torch_device)
-    scale2 = torch.as_tensor(physical.primitive_scale2[rows], dtype=torch.float32, device=torch_device)
-    batch_size, sample_count = int(pose.shape[0]), int(center.shape[0])
+    batch_size, sample_count = int(pose.shape[0]), int(rows.size)
     pixel_count = int(token_height) * int(token_width)
     rotation, translation = pose[:, :3, :3], pose[:, :3, 3]
-    camera_xyz = torch.einsum("bij,nj->bni", rotation, center) + translation[:, None, :]
-    depth = camera_xyz[:, :, 2]
-    normalized_xy = camera_xyz[:, :, :2] / torch.clamp(depth[:, :, None], min=1e-6)
     fx, fy, cx, cy, radial = _camera_parameters(camera)
-    if radial != 0.0:
-        radius_squared = torch.sum(torch.square(normalized_xy), dim=2)
-        normalized_xy = normalized_xy * (1.0 + float(radial) * radius_squared)[:, :, None]
-    projected_x = (float(fx) * normalized_xy[:, :, 0] + float(cx)) * (
-        float(token_width) / float(camera.width)
-    )
-    projected_y = (float(fy) * normalized_xy[:, :, 1] + float(cy)) * (
-        float(token_height) / float(camera.height)
-    )
     camera_center = -torch.einsum("bji,bj->bi", rotation, translation)
-    view = camera_center[:, None, :] - center[None, :, :]
-    view /= torch.clamp(torch.linalg.vector_norm(view, dim=2, keepdim=True), min=1e-8)
-    incidence = torch.sum(normal[None, :, :] * view, dim=2)
-    front = (sidedness[None, :] == 2) | (incidence >= 0.02)
     focal = 0.5 * (float(fx) + float(fy))
-    radius_world = torch.sqrt(torch.clamp(scale1 * scale2, min=1e-10))
-    radius_pixel = float(focal) * radius_world[None, :] / torch.clamp(depth, min=1e-4)
-    radius_token = radius_pixel * 0.5 * (
-        float(token_width) / float(camera.width) + float(token_height) / float(camera.height)
-    )
-    valid_sample = front & (depth > 0.05)
     maximum_radius = int(maximum_splat_radius_tokens)
-    if maximum_radius <= 0:
-        pixel_x = torch.floor(projected_x).long()[:, :, None]
-        pixel_y = torch.floor(projected_y).long()[:, :, None]
-        valid = (
-            valid_sample[:, :, None]
-            & (pixel_x >= 0) & (pixel_x < int(token_width))
-            & (pixel_y >= 0) & (pixel_y < int(token_height))
+    if geometry_tensors is None:
+        geometry_tensors = tuple(
+            torch.as_tensor(value, dtype=dtype, device=torch_device)
+            for value, dtype in (
+                (physical.primitive_centers, torch.float32),
+                (physical.primitive_normals, torch.float32),
+                (physical.primitive_sidedness, torch.uint8),
+                (physical.primitive_scale1, torch.float32),
+                (physical.primitive_scale2, torch.float32),
+            )
         )
-    else:
-        radius_token = torch.clamp(radius_token, min=0.6, max=float(maximum_radius))
-        offset_y, offset_x = torch.meshgrid(
-            torch.arange(-maximum_radius, maximum_radius + 1, device=torch_device),
-            torch.arange(-maximum_radius, maximum_radius + 1, device=torch_device),
-            indexing="ij",
-        )
-        offset_x, offset_y = offset_x.reshape(1, 1, -1), offset_y.reshape(1, 1, -1)
-        pixel_x = torch.floor(projected_x).long()[:, :, None] + offset_x
-        pixel_y = torch.floor(projected_y).long()[:, :, None] + offset_y
-        dx = (pixel_x.float() + 0.5 - projected_x[:, :, None]) / radius_token[:, :, None]
-        dy = (pixel_y.float() + 0.5 - projected_y[:, :, None]) / radius_token[:, :, None]
-        valid = (
-            valid_sample[:, :, None] & ((torch.square(dx) + torch.square(dy)) <= 1.0)
-            & (pixel_x >= 0) & (pixel_x < int(token_width))
-            & (pixel_y >= 0) & (pixel_y < int(token_height))
-        )
-    global_pixel = (
-        torch.arange(batch_size, device=torch_device)[:, None, None] * pixel_count
-        + pixel_y * int(token_width) + pixel_x
+    all_center, all_normal, all_sidedness, all_scale1, all_scale2 = geometry_tensors
+    stable_primitive_id = torch.as_tensor(
+        physical.primitive_ids, dtype=torch.long, device=torch_device,
     )
-    flat_valid = valid.reshape(-1)
-    selected_pixel = global_pixel.reshape(-1)[flat_valid]
-    selected_depth = depth[:, :, None].expand_as(global_pixel).reshape(-1)[flat_valid]
-    selected_sample = torch.arange(sample_count, device=torch_device)[None, :, None].expand_as(
-        global_pixel
-    ).reshape(-1)[flat_valid]
+
+    def splats(primitive_chunk: np.ndarray):
+        chunk = np.asarray(primitive_chunk, dtype=np.int64).reshape(-1)
+        chunk_t = torch.as_tensor(chunk, dtype=torch.long, device=torch_device)
+        center = all_center.index_select(0, chunk_t)
+        normal = all_normal.index_select(0, chunk_t)
+        sidedness = all_sidedness.index_select(0, chunk_t)
+        scale1 = all_scale1.index_select(0, chunk_t)
+        scale2 = all_scale2.index_select(0, chunk_t)
+        stable_id = stable_primitive_id.index_select(0, chunk_t)
+        camera_xyz = torch.einsum("bij,nj->bni", rotation, center) + translation[:, None, :]
+        depth = camera_xyz[:, :, 2]
+        normalized_xy = camera_xyz[:, :, :2] / torch.clamp(depth[:, :, None], min=1e-6)
+        if radial != 0.0:
+            radius_squared = torch.sum(torch.square(normalized_xy), dim=2)
+            normalized_xy = normalized_xy * (1.0 + float(radial) * radius_squared)[:, :, None]
+        projected_x = (float(fx) * normalized_xy[:, :, 0] + float(cx)) * (
+            float(token_width) / float(camera.width)
+        )
+        projected_y = (float(fy) * normalized_xy[:, :, 1] + float(cy)) * (
+            float(token_height) / float(camera.height)
+        )
+        view = camera_center[:, None, :] - center[None, :, :]
+        view /= torch.clamp(torch.linalg.vector_norm(view, dim=2, keepdim=True), min=1e-8)
+        incidence = torch.sum(normal[None, :, :] * view, dim=2)
+        front = (sidedness[None, :] == 2) | (incidence >= 0.02)
+        radius_world = torch.sqrt(torch.clamp(scale1 * scale2, min=1e-10))
+        radius_pixel = float(focal) * radius_world[None, :] / torch.clamp(depth, min=1e-4)
+        radius_token = radius_pixel * 0.5 * (
+            float(token_width) / float(camera.width) + float(token_height) / float(camera.height)
+        )
+        valid_sample = front & (depth > 0.05)
+        if maximum_radius <= 0:
+            pixel_x = torch.floor(projected_x).long()[:, :, None]
+            pixel_y = torch.floor(projected_y).long()[:, :, None]
+            valid = (
+                valid_sample[:, :, None]
+                & (pixel_x >= 0) & (pixel_x < int(token_width))
+                & (pixel_y >= 0) & (pixel_y < int(token_height))
+            )
+        else:
+            radius_token = torch.clamp(radius_token, min=0.6, max=float(maximum_radius))
+            offset_y, offset_x = torch.meshgrid(
+                torch.arange(-maximum_radius, maximum_radius + 1, device=torch_device),
+                torch.arange(-maximum_radius, maximum_radius + 1, device=torch_device),
+                indexing="ij",
+            )
+            offset_x = offset_x.reshape(1, 1, -1)
+            offset_y = offset_y.reshape(1, 1, -1)
+            pixel_x = torch.floor(projected_x).long()[:, :, None] + offset_x
+            pixel_y = torch.floor(projected_y).long()[:, :, None] + offset_y
+            dx = (pixel_x.float() + 0.5 - projected_x[:, :, None]) / radius_token[:, :, None]
+            dy = (pixel_y.float() + 0.5 - projected_y[:, :, None]) / radius_token[:, :, None]
+            valid = (
+                valid_sample[:, :, None] & ((torch.square(dx) + torch.square(dy)) <= 1.0)
+                & (pixel_x >= 0) & (pixel_x < int(token_width))
+                & (pixel_y >= 0) & (pixel_y < int(token_height))
+            )
+        global_pixel = (
+            torch.arange(batch_size, device=torch_device)[:, None, None] * pixel_count
+            + pixel_y * int(token_width) + pixel_x
+        )
+        flat_valid = valid.reshape(-1)
+        selected_pixel = global_pixel.reshape(-1)[flat_valid]
+        selected_depth = depth[:, :, None].expand_as(global_pixel).reshape(-1)[flat_valid]
+        selected_local = torch.arange(
+            chunk.size, device=torch_device,
+        )[None, :, None].expand_as(global_pixel).reshape(-1)[flat_valid]
+        selected_stable_id = stable_id[None, :, None].expand_as(
+            global_pixel,
+        ).reshape(-1)[flat_valid]
+        return selected_pixel, selected_depth, selected_local, selected_stable_id
+
     zbuffer = torch.full(
         (batch_size * pixel_count,), float("inf"), dtype=torch.float32, device=torch_device,
     )
-    if selected_pixel.numel():
-        zbuffer.scatter_reduce_(0, selected_pixel, selected_depth, reduce="amin", include_self=True)
+    geometry_rows = np.arange(physical.primitive_ids.size, dtype=np.int64)
+    for offset in range(0, geometry_rows.size, 16_384):
+        geometry_pixel, geometry_depth, _, _ = splats(
+            geometry_rows[offset : offset + 16_384]
+        )
+        if geometry_pixel.numel():
+            zbuffer.scatter_reduce_(
+                0, geometry_pixel, geometry_depth, reduce="amin", include_self=True,
+            )
+    geometry_rendered = torch.isfinite(zbuffer)
+    selected_pixel, selected_depth, selected_sample, selected_stable_id = splats(rows)
     closest = selected_depth <= zbuffer[selected_pixel] + 1e-5
+    # Resolve z ties by the persistent primitive identity, never by the local
+    # row/order in ``primitive_rows``.  This keeps exact scoring invariant to
+    # harmless canonical-field serialization or sample-order changes.
+    maximum_int64 = torch.iinfo(torch.long).max
+    winning_stable_id = torch.full(
+        (batch_size * pixel_count,), maximum_int64,
+        dtype=torch.long, device=torch_device,
+    )
+    if torch.any(closest):
+        winning_stable_id.scatter_reduce_(
+            0, selected_pixel[closest], selected_stable_id[closest],
+            reduce="amin", include_self=True,
+        )
+    stable_winner = closest & (
+        selected_stable_id == winning_stable_id[selected_pixel]
+    )
     owner = torch.full(
         (batch_size * pixel_count,), sample_count, dtype=torch.long, device=torch_device,
     )
-    if torch.any(closest):
+    if torch.any(stable_winner):
         owner.scatter_reduce_(
-            0, selected_pixel[closest], selected_sample[closest], reduce="amin", include_self=True,
+            0, selected_pixel[stable_winner], selected_sample[stable_winner],
+            reduce="amin", include_self=True,
         )
     owner[owner == sample_count] = -1
-    return owner.reshape(batch_size, pixel_count)
+    return (
+        owner.reshape(batch_size, pixel_count),
+        geometry_rendered.reshape(batch_size, pixel_count),
+    )
 
 
 def score_pose_conditioned_sparse_primitives(
@@ -561,6 +632,7 @@ def score_pose_conditioned_sparse_primitives(
     score_semantics: str = "visible_sample_mean",
     allowed_parent_rows: np.ndarray | None = None,
     query_token_mask: np.ndarray | None = None,
+    view_conditioned_field: ViewConditionedPrimitiveField | None = None,
     device: str = "cuda",
 ) -> SparsePrimitiveVFMEvidence:
     """Approximate exact canonical rendering with spatial real-code samples."""
@@ -574,6 +646,13 @@ def score_pose_conditioned_sparse_primitives(
     token_count = int(token_height) * int(token_width)
     if query.shape[0] != token_count or codes.shape[0] != field_rows.size:
         raise ValueError("sparse primitive query/canonical field differs")
+    if view_conditioned_field is not None:
+        if (
+            not np.array_equal(view_conditioned_field.primitive_rows, field_rows)
+            or view_conditioned_field.feature_dim != int(codes.shape[1])
+            or view_conditioned_field.physical_map_sha256 != physical.content_sha256
+        ):
+            raise ValueError("view-conditioned and canonical primitive fields differ")
     if int(primitives_per_child) > 0:
         selected_field_rows = _stratified_primitive_samples(
             physical, field_rows, np.asarray(field_confidence),
@@ -584,6 +663,7 @@ def score_pose_conditioned_sparse_primitives(
         selected_primitive_rows = field_rows[selected_field_rows]
         selected_codes = codes[selected_field_rows]
         field_index_by_sample = np.arange(selected_field_rows.size, dtype=np.int64)
+        canonical_field_index_by_sample = selected_field_rows
     else:
         selected_primitive_rows = np.arange(physical.primitive_ids.size, dtype=np.int64)
         selected_codes = codes
@@ -591,6 +671,7 @@ def score_pose_conditioned_sparse_primitives(
             (selected_primitive_rows.size,), -1, dtype=np.int64,
         )
         field_index_by_sample[field_rows] = np.arange(field_rows.size, dtype=np.int64)
+        canonical_field_index_by_sample = field_index_by_sample.copy()
     from .visibility import dominant_maplet_owner
     parent_by_sample = dominant_maplet_owner(physical)[selected_primitive_rows]
     allowed = None
@@ -598,6 +679,8 @@ def score_pose_conditioned_sparse_primitives(
         allowed = np.asarray(allowed_parent_rows, dtype=np.int64)
         if allowed.ndim != 2 or allowed.shape[0] != poses.shape[0]:
             raise ValueError("allowed primitive parent rows must match poses")
+        if np.any((allowed < -1) | (allowed >= physical.maplet_ids.size)):
+            raise ValueError("allowed primitive parent row is outside the physical map")
     planned_mask = None
     if query_token_mask is not None:
         planned_mask = np.asarray(query_token_mask, dtype=bool)
@@ -613,32 +696,201 @@ def score_pose_conditioned_sparse_primitives(
     field_index_t = torch.as_tensor(
         field_index_by_sample, dtype=torch.long, device=torch_device,
     )
+    canonical_field_index_t = torch.as_tensor(
+        canonical_field_index_by_sample, dtype=torch.long, device=torch_device,
+    )
     parent_by_sample_t = torch.as_tensor(
         parent_by_sample, dtype=torch.long, device=torch_device,
     )
     if str(score_semantics) not in ("fixed_grid", "visible_sample_mean"):
         raise ValueError(f"unknown sparse primitive score semantics: {score_semantics}")
-    scores, fixed_scores, visible_mean_scores, coverage, feature_coverage = [], [], [], [], []
+    scores, fixed_scores, visible_mean_scores = [], [], []
+    coverage, feature_coverage, conditioned_feature_coverage = [], [], []
+    geometry_tensors = tuple(
+        torch.as_tensor(value, dtype=dtype, device=torch_device)
+        for value, dtype in (
+            (physical.primitive_centers, torch.float32),
+            (physical.primitive_normals, torch.float32),
+            (physical.primitive_sidedness, torch.uint8),
+            (physical.primitive_scale1, torch.float32),
+            (physical.primitive_scale2, torch.float32),
+        )
+    )
+    conditioning_tensors = None
+    if view_conditioned_field is not None:
+        conditioning_tensors = {
+            "basis": torch.as_tensor(
+                view_conditioned_field.residual_basis,
+                dtype=torch.float32, device=torch_device,
+            ),
+            "coefficient": torch.as_tensor(
+                view_conditioned_field.coefficients,
+                dtype=torch.float32, device=torch_device,
+            ),
+            "count": torch.as_tensor(
+                view_conditioned_field.observation_count,
+                dtype=torch.int32, device=torch_device,
+            ),
+            "mean_direction": torch.as_tensor(
+                view_conditioned_field.mean_local_direction,
+                dtype=torch.float32, device=torch_device,
+            ),
+            "concentration": torch.as_tensor(
+                view_conditioned_field.direction_concentration,
+                dtype=torch.float32, device=torch_device,
+            ),
+            "minimum_cosine": torch.as_tensor(
+                view_conditioned_field.minimum_direction_cosine,
+                dtype=torch.float32, device=torch_device,
+            ),
+            "mean_log_scale": torch.as_tensor(
+                view_conditioned_field.mean_log_projected_scale,
+                dtype=torch.float32, device=torch_device,
+            ),
+            "minimum_log_scale": torch.as_tensor(
+                view_conditioned_field.minimum_log_projected_scale,
+                dtype=torch.float32, device=torch_device,
+            ),
+            "maximum_log_scale": torch.as_tensor(
+                view_conditioned_field.maximum_log_projected_scale,
+                dtype=torch.float32, device=torch_device,
+            ),
+            "center": torch.as_tensor(
+                physical.primitive_centers,
+                dtype=torch.float32, device=torch_device,
+            ),
+            "tangent1": _normalized_tensor(
+                physical.primitive_tangent1, torch, torch_device,
+            ),
+            "tangent2": _normalized_tensor(
+                physical.primitive_tangent2, torch, torch_device,
+            ),
+            "normal": _normalized_tensor(
+                physical.primitive_normals, torch, torch_device,
+            ),
+            "radius": torch.sqrt(torch.clamp(
+                torch.as_tensor(
+                    physical.primitive_scale1 * physical.primitive_scale2,
+                    dtype=torch.float32, device=torch_device,
+                ), min=1e-12,
+            )),
+        }
+        conditioning_direction_margin = float(
+            view_conditioned_field.metadata.get("direction_cosine_margin", 0.05)
+        )
+        conditioning_scale_margin = float(
+            view_conditioned_field.metadata.get("log_scale_margin", 0.25)
+        )
+        conditioning_minimum_views = int(view_conditioned_field.minimum_views)
+        fx, fy, _cx, _cy, _radial = _camera_parameters(camera)
+        conditioning_focal = float(np.sqrt(max(float(fx) * float(fy), 1e-8)))
     with torch.no_grad():
         for start in range(0, poses.shape[0], max(int(batch_size), 1)):
             stop = min(start + max(int(batch_size), 1), poses.shape[0])
-            owner = _render_primitive_sample_owner_batch(
+            owner, geometry_rendered = _render_primitive_sample_owner_batch(
                 physical, selected_primitive_rows, poses[start:stop], camera,
                 token_height=int(token_height), token_width=int(token_width),
                 device=str(torch_device),
                 maximum_splat_radius_tokens=int(maximum_splat_radius_tokens),
+                geometry_tensors=geometry_tensors,
             )
-            rendered = owner >= 0
+            rendered = geometry_rendered
+            sampled_feature = owner >= 0
             safe_owner = torch.clamp(owner, min=0)
             field_index = field_index_t[safe_owner]
-            valid = rendered & (field_index >= 0)
+            valid = sampled_feature & (field_index >= 0)
+            map_code = code_t[torch.clamp(field_index, min=0)]
+            conditioned = torch.zeros_like(valid)
+            if conditioning_tensors is not None:
+                canonical_index = canonical_field_index_t[safe_owner]
+                safe_canonical_index = torch.clamp(canonical_index, min=0)
+                primitive_row_by_sample = torch.as_tensor(
+                    selected_primitive_rows, dtype=torch.long, device=torch_device,
+                )
+                primitive_row = primitive_row_by_sample[safe_owner]
+                center = conditioning_tensors["center"][primitive_row]
+                pose_t = torch.as_tensor(
+                    poses[start:stop], dtype=torch.float32, device=torch_device,
+                )
+                rotation, translation = pose_t[:, :3, :3], pose_t[:, :3, 3]
+                camera_center = -torch.einsum("bji,bj->bi", rotation, translation)
+                view_world = camera_center[:, None, :] - center
+                view_world /= torch.clamp(
+                    torch.linalg.vector_norm(view_world, dim=2, keepdim=True), min=1e-8,
+                )
+                local_direction = torch.stack((
+                    torch.sum(
+                        view_world * conditioning_tensors["tangent1"][primitive_row], dim=2,
+                    ),
+                    torch.sum(
+                        view_world * conditioning_tensors["tangent2"][primitive_row], dim=2,
+                    ),
+                    torch.sum(
+                        view_world * conditioning_tensors["normal"][primitive_row], dim=2,
+                    ),
+                ), dim=2)
+                local_direction /= torch.clamp(
+                    torch.linalg.vector_norm(local_direction, dim=2, keepdim=True), min=1e-8,
+                )
+                camera_xyz = torch.einsum(
+                    "bij,btj->bti", rotation, center,
+                ) + translation[:, None, :]
+                depth = camera_xyz[:, :, 2]
+                log_scale = torch.log(torch.clamp(
+                    float(conditioning_focal)
+                    * conditioning_tensors["radius"][primitive_row]
+                    / torch.clamp(depth, min=1e-4),
+                    min=1e-6,
+                ))
+                mean_direction = conditioning_tensors["mean_direction"][safe_canonical_index]
+                direction_center = mean_direction * conditioning_tensors[
+                    "concentration"
+                ][safe_canonical_index, None]
+                direction_cosine = torch.sum(local_direction * mean_direction, dim=2)
+                conditioned = (
+                    valid
+                    & (conditioning_tensors["count"][safe_canonical_index]
+                       >= int(conditioning_minimum_views))
+                    & (direction_cosine >= conditioning_tensors[
+                        "minimum_cosine"
+                    ][safe_canonical_index] - float(conditioning_direction_margin))
+                    & (log_scale >= conditioning_tensors[
+                        "minimum_log_scale"
+                    ][safe_canonical_index] - float(conditioning_scale_margin))
+                    & (log_scale <= conditioning_tensors[
+                        "maximum_log_scale"
+                    ][safe_canonical_index] + float(conditioning_scale_margin))
+                )
+                predictor = torch.cat((
+                    torch.ones_like(log_scale[:, :, None]),
+                    local_direction - direction_center,
+                    (log_scale - conditioning_tensors[
+                        "mean_log_scale"
+                    ][safe_canonical_index])[:, :, None],
+                ), dim=2)
+                latent = torch.einsum(
+                    "btp,btpr->btr",
+                    predictor,
+                    conditioning_tensors["coefficient"][safe_canonical_index],
+                )
+                residual = torch.einsum(
+                    "btr,rd->btd", latent, conditioning_tensors["basis"],
+                )
+                map_code = map_code + torch.where(
+                    conditioned[:, :, None], residual, torch.zeros_like(residual),
+                )
+                map_code = map_code / torch.clamp(
+                    torch.linalg.vector_norm(map_code, dim=2, keepdim=True), min=1e-8,
+                )
             if allowed is not None:
                 allowed_t = torch.as_tensor(
                     allowed[start:stop], dtype=torch.long, device=torch_device,
                 )
                 rendered_parent = parent_by_sample_t[safe_owner]
                 valid &= torch.any(
-                    rendered_parent[:, :, None] == allowed_t[:, None, :], dim=2,
+                    (allowed_t[:, None, :] >= 0)
+                    & (rendered_parent[:, :, None] == allowed_t[:, None, :]),
+                    dim=2,
                 )
             if planned_mask is not None:
                 planned_t = torch.as_tensor(
@@ -654,7 +906,7 @@ def score_pose_conditioned_sparse_primitives(
                 )
                 rendered_for_coverage = rendered
             cosine = torch.sum(
-                query_t[None, :, :] * code_t[torch.clamp(field_index, min=0)], dim=2,
+                query_t[None, :, :] * map_code, dim=2,
             )
             cosine = torch.where(valid, cosine, torch.zeros((), device=torch_device))
             fixed = torch.sum(cosine, dim=1) / denominator
@@ -674,12 +926,18 @@ def score_pose_conditioned_sparse_primitives(
             feature_coverage.append(
                 (torch.sum(valid, dim=1) / denominator).cpu().numpy()
             )
+            conditioned_feature_coverage.append(
+                (torch.sum(conditioned, dim=1) / denominator).cpu().numpy()
+            )
     return SparsePrimitiveVFMEvidence(
         scores=np.concatenate(scores).astype(np.float64),
         fixed_grid_scores=np.concatenate(fixed_scores).astype(np.float64),
         visible_sample_mean_scores=np.concatenate(visible_mean_scores).astype(np.float64),
         rendered_coverage=np.concatenate(coverage).astype(np.float64),
         feature_coverage=np.concatenate(feature_coverage).astype(np.float64),
+        conditioned_feature_coverage=np.concatenate(
+            conditioned_feature_coverage,
+        ).astype(np.float64),
         sample_count=int(selected_primitive_rows.size),
         primitives_per_child=int(primitives_per_child),
     )

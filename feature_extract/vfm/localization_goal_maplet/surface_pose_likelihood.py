@@ -19,13 +19,14 @@ from torch import nn
 import torch.nn.functional as F
 
 
-SCHEMA = "goal_maplet_surface_pose_likelihood_v1"
+SCHEMA = "goal_maplet_surface_pose_likelihood_v2"
+SAMPLE_SCHEMA = "goal_maplet_surface_likelihood_samples_v2"
 EVENT_NAMES = (
     "surface_match",
     "wrong_phase",
-    "occluded",
+    "grazing_surface",
     "field_missing",
-    "query_unmapped_dynamic",
+    "outside_render_support",
     "unresolved",
 )
 FEATURE_NAMES = (
@@ -206,10 +207,13 @@ def extract_surface_likelihood_features(
     # for the same-query listwise pose objective.  Their precedence makes the
     # known null events mutually exclusive.
     target = np.full(valid.shape, EVENT_NAMES.index("unresolved"), dtype=np.uint8)
-    target[~visibility] = EVENT_NAMES.index("query_unmapped_dynamic")
+    target[~visibility] = EVENT_NAMES.index("outside_render_support")
     target[field_missing] = EVENT_NAMES.index("field_missing")
     geometric = valid & (incidence < 0.15)
-    target[geometric] = EVENT_NAMES.index("occluded")
+    # A low-incidence front surface is grazing, not occluded. True occlusion
+    # has already been resolved by the all-geometry z-buffer and cannot be
+    # supervised as a separate query event from this render alone.
+    target[geometric] = EVENT_NAMES.index("grazing_surface")
     # Appearance cannot define physical phase without becoming circular.
     # Comparable tokens remain unresolved here; the sample builder assigns
     # surface_match/wrong_phase from frozen-candidate pose/identity semantics.

@@ -1,6 +1,10 @@
 import numpy as np
 
-from feature_extract.vfm.localization_goal_maplet.surface_renderer import _pool_rendered_surface
+from feature_extract.vfm.colmap_tracks import ColmapCamera, colmap_camera_focal_lengths
+from feature_extract.vfm.localization_goal_maplet.surface_renderer import (
+    _deterministic_contribution_order,
+    _pool_rendered_surface,
+)
 from feature_extract.vfm.localization_v6.atlas_renderer import RenderedMapletAtlases
 
 
@@ -67,3 +71,32 @@ def test_supersampled_geometry_uses_dominant_component_not_frontmost_outlier():
     np.testing.assert_allclose(pooled.depth[0, 0], 5.0)
     np.testing.assert_allclose(pooled.dominant_surface_fraction[0, 0], 0.75)
     assert pooled.mixed_surface[0, 0]
+
+
+def test_colmap_focal_parsing_does_not_treat_principal_point_as_fy():
+    simple = ColmapCamera(1, 0, 640, 480, (500.0, 320.0, 240.0))
+    radial = ColmapCamera(2, 3, 640, 480, (450.0, 315.0, 235.0, 0.01, -0.001))
+    pinhole = ColmapCamera(3, 1, 640, 480, (510.0, 490.0, 320.0, 240.0))
+    assert colmap_camera_focal_lengths(simple) == (500.0, 500.0)
+    assert colmap_camera_focal_lengths(radial) == (450.0, 450.0)
+    assert colmap_camera_focal_lengths(pinhole) == (510.0, 490.0)
+
+
+def test_surface_contribution_order_uses_stable_primitive_identity():
+    pixel = np.asarray([1, 0, 1, 0], dtype=np.int64)
+    primitive = np.asarray([20, 20, 10, 10], dtype=np.int64)
+    weight = np.asarray([0.4, 0.3, 0.5, 0.2], dtype=np.float32)
+    expected = [(0, 10, 0.2), (0, 20, 0.3), (1, 10, 0.5), (1, 20, 0.4)]
+    for permutation in (
+        np.arange(4, dtype=np.int64),
+        np.asarray([2, 0, 3, 1], dtype=np.int64),
+    ):
+        order = _deterministic_contribution_order(
+            pixel[permutation], primitive[permutation], weight[permutation],
+        )
+        actual = [
+            (int(pixel[permutation][row]), int(primitive[permutation][row]),
+             round(float(weight[permutation][row]), 1))
+            for row in order.tolist()
+        ]
+        assert actual == expected

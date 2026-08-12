@@ -1,4 +1,4 @@
-"""Render frozen candidates into G18 listwise surface-likelihood samples."""
+"""Render frozen candidates into listwise surface-likelihood samples."""
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ from feature_extract.vfm.localization_goal_maplet.physical_map import GoalMaplet
 from feature_extract.vfm.localization_goal_maplet.surface_pose_likelihood import (
     EVENT_NAMES,
     FEATURE_NAMES,
+    SAMPLE_SCHEMA,
     assign_pose_defined_typed_targets,
     extract_surface_likelihood_features,
 )
@@ -121,9 +122,9 @@ def _typed_teacher_weight(
     match = target == EVENT_NAMES.index("surface_match")
     wrong_phase = target == EVENT_NAMES.index("wrong_phase")
     support_event = np.isin(target, [
-        EVENT_NAMES.index("occluded"),
+        EVENT_NAMES.index("grazing_surface"),
         EVENT_NAMES.index("field_missing"),
-        EVENT_NAMES.index("query_unmapped_dynamic"),
+        EVENT_NAMES.index("outside_render_support"),
     ])
     weight += 0.35 * cue["dino_local_affinity"][None] * (match | wrong_phase)
     weight += 0.25 * cue["siglip_context"][None] * match
@@ -193,7 +194,7 @@ def main() -> None:
         image_id = str(row["image_id"])
         contributor = contributors.get(image_id)
         if contributor is None:
-            raise ValueError(f"missing G18 contributor: {image_id}")
+            raise ValueError(f"missing Goal-Maplet contributor: {image_id}")
         camera = _camera(contributor)
         with np.load(contributor, allow_pickle=False) as data:
             item = json.loads(str(np.asarray(data["metadata_json"]).item()))
@@ -209,7 +210,9 @@ def main() -> None:
         query = query_flat.reshape(height, width, mapped.shape[0]).transpose(2, 0, 1)
         details = list(row.get("mode_details", {}).get(str(args.mode_name), []))[:maximum_modes]
         if not details:
-            raise ValueError(f"G18 requires at least one frozen candidate: {image_id}")
+            raise ValueError(
+                f"surface likelihood requires at least one frozen candidate: {image_id}"
+            )
         candidate_feature, candidate_type = [], []
         translation, rotation = [], []
         query_summary = None
@@ -282,9 +285,9 @@ def main() -> None:
             "teacher_available": bool(teacher_report["teacher_available"]),
         }), flush=True)
     if not feature_rows:
-        raise ValueError("no G18 surface samples")
+        raise ValueError("no surface-likelihood samples")
     metadata = {
-        "artifact_type": "goal_maplet_surface_likelihood_samples_v1",
+        "artifact_type": SAMPLE_SCHEMA,
         "candidate_pool_sha256": file_sha256(pool_path),
         "physical_map_sha256": physical.content_sha256,
         "canonical_field_sha256": field.content_sha256,

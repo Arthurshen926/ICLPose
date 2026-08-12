@@ -18,6 +18,19 @@ from feature_extract.vfm.localization_goal_maplet.primitive_refinement_gate impo
 )
 
 
+def _refinement_uses_candidate_report(
+    refinement_payload: dict[str, object], candidate_sha256: str,
+) -> bool:
+    """Accept legacy single-source and current multi-source lineage."""
+
+    lineage = refinement_payload.get("candidate_report_sha256")
+    if isinstance(lineage, str):
+        return lineage == candidate_sha256
+    if isinstance(lineage, list):
+        return candidate_sha256 in {str(value) for value in lineage}
+    return False
+
+
 def _evidence(row: dict[str, object], likelihood) -> tuple[float, float]:
     name = "actual_parent_actual_child"
     details = row["mode_details"][name]
@@ -104,7 +117,9 @@ def main() -> None:
         candidate_path, refinement_path = Path(candidate_name), Path(refinement_name)
         candidates = json.loads(candidate_path.read_text())
         refinements = json.loads(refinement_path.read_text())
-        if refinements.get("candidate_report_sha256") != file_sha256(candidate_path):
+        if not _refinement_uses_candidate_report(
+            refinements, file_sha256(candidate_path)
+        ):
             raise ValueError("refinement and candidate report differ")
         refined_by_image = {
             str(row["image_id"]): row for row in refinements.get("rows", [])

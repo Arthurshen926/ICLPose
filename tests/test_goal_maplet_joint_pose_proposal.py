@@ -10,7 +10,12 @@ from feature_extract.vfm.localization_goal_maplet.joint_pose_proposal import (
     generate_joint_configuration_pose_modes,
 )
 from feature_extract.vfm.localization_goal_maplet.geometry_guided_pose_proposal import (
+    _greedy_pose_basin_count,
     _disconnected_query_token_masks,
+    _per_anchor_pose_basin_diagnostics,
+    _pose_basin_diverse_top_rows,
+    _two_channel_pose_basin_union_rows,
+    _structurally_stratified_top_rows,
     estimate_pose_from_scaled_query_geometry,
     generate_geometry_guided_configuration_pose_modes,
     unproject_query_depth,
@@ -23,6 +28,9 @@ from feature_extract.vfm.localization_goal_maplet.soft_maplet_pose_likelihood im
     pose_conditioned_soft_maplet_evidence,
 )
 from feature_extract.vfm.localization_goal_maplet.typed_graph import TypedParentGraph
+from feature_extract.vfm.localization_goal_maplet.visibility_chart import (
+    refine_pose_in_visibility_chart,
+)
 from feature_extract.vfm.query_to_3d_matching import camera_matrix_and_distortion
 
 
@@ -38,6 +46,139 @@ def test_disconnected_query_mask_is_union_of_fixed_seed_regions():
     assert int(np.sum(mask[0])) == 8
     assert int(np.sum(mask[1])) == 4
     assert not np.array_equal(mask[0], mask[1])
+
+
+def test_structural_exact_pool_protects_each_anchor_then_fills_globally():
+    rows, diagnostic = _structurally_stratified_top_rows(
+        np.asarray([10.0, 9.0, 8.0, 7.0, 1.0, 0.0]),
+        np.asarray([100, 101, 102, 103, 104, 105]),
+        {100: 0, 101: 0, 102: 0, 103: 0, 104: 1, 105: 1},
+        maximum_count=4,
+        keep_per_anchor=1,
+    )
+    # Anchor 1 survives even though all of its states lie below anchor 0 in
+    # the global sparse order. The rest of the budget follows global rank.
+    np.testing.assert_array_equal(rows, np.asarray([0, 4, 1, 2]))
+    assert diagnostic["protected_state_count"] == 2
+    assert diagnostic["global_fill_count"] == 2
+    assert diagnostic["protected_anchor_count"] == 2
+
+
+def test_structural_exact_pool_quota_zero_is_stable_global_topk():
+    rows, diagnostic = _structurally_stratified_top_rows(
+        np.asarray([0.2, 0.5, 0.5, -1.0]),
+        np.asarray([10, 11, 12, 13]),
+        {10: 0, 13: 1},
+        maximum_count=3,
+        keep_per_anchor=0,
+    )
+    np.testing.assert_array_equal(rows, np.asarray([1, 2, 0]))
+    assert diagnostic["selection_semantics"] == "global_sparse_topk"
+
+
+def test_structural_exact_pool_can_protect_anchor_prefix_without_dropping_global_tail():
+    scores = np.asarray([10.0, 9.0, 8.0, 7.0, 6.0, 5.0])
+    serials = np.arange(100, 106)
+    all_anchors = {100: 0, 101: 0, 102: 1, 103: 1, 104: 2, 105: 2}
+    protected_prefix = {
+        serial: anchor for serial, anchor in all_anchors.items() if anchor < 2
+    }
+    rows, diagnostic = _structurally_stratified_top_rows(
+        scores, serials, protected_prefix, maximum_count=5, keep_per_anchor=2,
+    )
+    # Anchors 0 and 1 consume four protected slots.  The best state from the
+    # unprotected tail anchor remains eligible through the global fill.
+    np.testing.assert_array_equal(rows, np.asarray([0, 1, 2, 3, 4]))
+    assert diagnostic["protected_anchor_count"] == 2
+    assert diagnostic["global_fill_count"] == 1
+
+
+def test_pose_basin_exact_pool_removes_cross_anchor_duplicate_states():
+    poses = np.tile(np.eye(4, dtype=np.float64)[None], (5, 1, 1))
+    poses[1, 0, 3] = 0.05  # Same camera basin as row 0.
+    poses[2, 0, 3] = 2.0
+    poses[3, 1, 3] = 3.0
+    poses[4, 2, 3] = 4.0
+    rows, diagnostic = _pose_basin_diverse_top_rows(
+        np.asarray([10.0, 9.0, 8.0, 7.0, 6.0]), poses, 3,
+        translation_radius_m=0.5, rotation_radius_deg=5.0,
+    )
+    np.testing.assert_array_equal(rows, np.asarray([0, 2, 3]))
+    assert diagnostic["selected_pose_basin_count"] == 3
+    assert diagnostic["near_duplicate_rejection_count"] == 1
+    assert diagnostic["duplicate_fill_count"] == 0
+
+
+def test_greedy_pose_basin_count_deduplicates_near_identical_states():
+    poses = np.tile(np.eye(4, dtype=np.float64)[None], (3, 1, 1))
+    poses[1, 0, 3] = 0.05
+    poses[2, 0, 3] = 2.0
+    assert _greedy_pose_basin_count(
+        poses, translation_radius_m=0.5, rotation_radius_deg=5.0,
+    ) == 2
+
+
+def test_per_anchor_basin_diagnostic_reports_multiplicity_and_exact_survival():
+    poses = np.tile(np.eye(4, dtype=np.float64)[None], (5, 1, 1))
+    poses[1, 0, 3] = 0.05
+    poses[2, 0, 3] = 2.0
+    poses[3, 1, 3] = 3.0
+    poses[4, 1, 3] = 3.05
+    diagnostic = _per_anchor_pose_basin_diagnostics(
+        poses, np.asarray([0, 0, 0, 1, 1]), np.asarray([0, 2, 3]),
+    )
+    assert diagnostic["0"] == {
+        "raw_state_count": 3,
+        "selected_exact_state_count": 2,
+        "unique_pose_basin_count_0_5m_5deg": 2,
+        "unique_pose_basin_count_1m_10deg": 2,
+    }
+    assert diagnostic["1"]["raw_state_count"] == 2
+    assert diagnostic["1"]["selected_exact_state_count"] == 1
+    assert diagnostic["1"]["unique_pose_basin_count_0_5m_5deg"] == 1
+
+
+def test_two_channel_pose_basin_union_reserves_geometry_capacity():
+    poses = np.tile(np.eye(4, dtype=np.float64)[None], (6, 1, 1))
+    for row in range(6):
+        poses[row, 0, 3] = 2.0 * row
+    rows, diagnostic = _two_channel_pose_basin_union_rows(
+        np.asarray([10.0, 9.0, 8.0, 7.0, 6.0, 5.0]),
+        np.asarray([0.0, 1.0, 2.0, 7.0, 8.0, 9.0]),
+        poses,
+        4,
+        translation_radius_m=0.5,
+        rotation_radius_deg=5.0,
+    )
+    # Two VFM states and two different geometry states reach the shared pool.
+    np.testing.assert_array_equal(rows, np.asarray([0, 1, 5, 4]))
+    assert diagnostic["primary_channel_count"] == 2
+    assert diagnostic["secondary_channel_count"] == 2
+
+
+def test_visibility_chart_soft_update_improves_bounded_pose_without_gt():
+    world = np.asarray([
+        [-1.0, -0.8, 4.5], [1.0, -0.7, 5.0],
+        [-0.8, 0.9, 5.4], [1.1, 0.8, 4.8],
+        [0.1, -1.1, 5.8], [-1.2, 0.2, 5.1],
+    ])
+    query = world.copy()
+    wrong = world + np.asarray([8.0, 0.0, 0.0])
+    centers = np.concatenate((world, wrong), axis=0)
+    child = np.stack((np.arange(6), np.arange(6, 12)), axis=1)
+    parent = np.stack((np.zeros(6, dtype=np.int64), np.ones(6, dtype=np.int64)), axis=1)
+    initial = np.eye(4)
+    initial[:3, 3] = np.asarray([0.35, -0.15, 0.10])
+    update = refine_pose_in_visibility_chart(
+        initial, 1.0, query, child, parent,
+        np.tile(np.asarray([[0.55, 0.45]]), (6, 1)),
+        np.ones((6, 2), dtype=bool), centers,
+        np.asarray([1.0, 0.0]), np.ones((6,)),
+        iterations=3, maximum_translation_update_m=1.0,
+    )
+    assert update.accepted_iterations > 0
+    assert update.final_objective > update.initial_objective
+    assert np.linalg.norm(update.pose_w2c[:3, 3]) < np.linalg.norm(initial[:3, 3])
 
 
 def _fixture():

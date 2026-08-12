@@ -1,4 +1,4 @@
-"""Train G18 typed surface likelihood on same-query frozen candidates."""
+"""Train a typed surface likelihood on same-query frozen candidates."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ import torch
 from feature_extract.vfm.localization_goal_maplet.lineage import file_sha256
 from feature_extract.vfm.localization_goal_maplet.surface_pose_likelihood import (
     FEATURE_NAMES,
+    SAMPLE_SCHEMA,
     SurfacePoseLikelihoodConfig,
     ViewGeometryConditionedSurfaceLikelihood,
     listwise_surface_pose_loss,
@@ -27,8 +28,8 @@ def _load(paths: list[str]) -> dict[str, np.ndarray]:
         with np.load(path, allow_pickle=False) as data:
             item = {key: np.asarray(data[key]) for key in data.files if key != "metadata_json"}
             meta = json.loads(str(np.asarray(data["metadata_json"]).item()))
-        if meta.get("artifact_type") != "goal_maplet_surface_likelihood_samples_v1":
-            raise ValueError("not a G18 surface-likelihood sample artifact")
+        if meta.get("artifact_type") != SAMPLE_SCHEMA:
+            raise ValueError("not a Goal-Maplet surface-likelihood sample artifact")
         metadata.append((path, meta))
         for key, value in item.items():
             collections.setdefault(key, []).append(value)
@@ -47,7 +48,7 @@ def _lineage(data: dict[str, np.ndarray]) -> dict[str, object]:
     for key in keys:
         values = {json.dumps(item.get(key), sort_keys=True) for item in metadata}
         if len(values) != 1:
-            raise ValueError(f"G18 sample lineage differs: {key}")
+            raise ValueError(f"surface-likelihood sample lineage differs: {key}")
         result[key] = metadata[0].get(key)
     return result
 
@@ -232,7 +233,17 @@ def _baseline_metrics(data: dict[str, np.ndarray], policy: str) -> dict[str, obj
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--train_samples", nargs="+", required=True)
-    parser.add_argument("--selection_samples", nargs="+", required=True)
+    parser.add_argument("--selection_samples", nargs="+", default=())
+    parser.add_argument(
+        "--checkpoint_protocol",
+        choices=("selection_set", "fixed_epoch_no_selection"),
+        default="selection_set",
+        help=(
+            "selection_set retains the historical validation-selected checkpoint; "
+            "fixed_epoch_no_selection always emits the final predeclared epoch and "
+            "forbids a selection set, which is required for strict outer-fold tests."
+        ),
+    )
     parser.add_argument("--output_model", required=True)
     parser.add_argument("--summary_json", required=True)
     parser.add_argument("--epochs", type=int, default=60)
@@ -247,19 +258,32 @@ def main() -> None:
     args = parser.parse_args()
     output, summary_path = Path(args.output_model), Path(args.summary_json)
     if not args.force and (output.exists() or summary_path.exists()):
-        raise FileExistsError("refusing to overwrite G18 likelihood")
+        raise FileExistsError("refusing to overwrite surface likelihood")
     torch.manual_seed(int(args.seed))
     rng = np.random.default_rng(int(args.seed))
     train = _load(list(args.train_samples))
-    selection = _load(list(args.selection_samples))
-    train_lineage, selection_lineage = _lineage(train), _lineage(selection)
-    for key in train_lineage:
-        if train_lineage[key] != selection_lineage[key]:
-            raise ValueError(f"G18 train/selection lineage differs: {key}")
+    fixed_epoch = str(args.checkpoint_protocol) == "fixed_epoch_no_selection"
+    if fixed_epoch and args.selection_samples:
+        raise ValueError("fixed-epoch protocol forbids selection samples")
+    if not fixed_epoch and not args.selection_samples:
+        raise ValueError("selection-set protocol requires selection samples")
+    selection = None if fixed_epoch else _load(list(args.selection_samples))
+    train_lineage = _lineage(train)
+    if selection is not None:
+        selection_lineage = _lineage(selection)
+        for key in train_lineage:
+            if train_lineage[key] != selection_lineage[key]:
+                raise ValueError(
+                    f"surface-likelihood train/selection lineage differs: {key}"
+                )
     train_trajectories = set(np.asarray(train["trajectory_ids"]).astype(str).tolist())
-    selection_trajectories = set(np.asarray(selection["trajectory_ids"]).astype(str).tolist())
-    if train_trajectories & selection_trajectories:
-        raise ValueError("G18 train and selection trajectories overlap")
+    selection_trajectories = (
+        set()
+        if selection is None
+        else set(np.asarray(selection["trajectory_ids"]).astype(str).tolist())
+    )
+    if selection is not None and train_trajectories & selection_trajectories:
+        raise ValueError("surface-likelihood train and selection trajectories overlap")
     model = ViewGeometryConditionedSurfaceLikelihood(
         SurfacePoseLikelihoodConfig(
             hidden_dim=int(args.hidden_dim),
@@ -324,26 +348,47 @@ def main() -> None:
             losses.append(float(loss.detach().cpu()))
             listwise.append(report["listwise_nll"])
             typed.append(report["typed_nll"])
-        if epoch == 0 or (epoch + 1) % 5 == 0 or epoch + 1 == int(args.epochs):
-            metrics = _metric_summary(model, selection, device=str(args.device))
-            key = _selection_key(metrics)
-            history.append({
+        report_epoch = epoch == 0 or (epoch + 1) % 5 == 0 or epoch + 1 == int(args.epochs)
+        if report_epoch:
+            item = {
                 "epoch": int(epoch + 1),
                 "train_loss": float(np.mean(losses)),
                 "train_listwise_nll": float(np.mean(listwise)),
                 "train_typed_nll": float(np.mean(typed)),
-                "selection": metrics,
-            })
+                "selection": (
+                    None
+                    if selection is None
+                    else _metric_summary(model, selection, device=str(args.device))
+                ),
+            }
+            history.append(item)
             print(json.dumps(history[-1]), flush=True)
-            if best_key is None or key < best_key:
+            if selection is not None:
+                key = _selection_key(item["selection"])
+                if best_key is not None and key >= best_key:
+                    continue
                 best_key = key
-                best_state = {name: value.detach().cpu().clone() for name, value in model.state_dict().items()}
+                best_state = {
+                    name: value.detach().cpu().clone()
+                    for name, value in model.state_dict().items()
+                }
+            elif epoch + 1 == int(args.epochs):
+                # The checkpoint is fixed before seeing an outer-fold target.
+                # Intermediate training diagnostics must never select a state.
+                best_state = {
+                    name: value.detach().cpu().clone()
+                    for name, value in model.state_dict().items()
+                }
     if best_state is None:
-        raise RuntimeError("G18 training produced no selected checkpoint")
+        raise RuntimeError("surface-likelihood training produced no selected checkpoint")
     model.load_state_dict(best_state)
     model.eval()
     train_metrics = _metric_summary(model, train, device=str(args.device))
-    selection_metrics = _metric_summary(model, selection, device=str(args.device))
+    selection_metrics = (
+        None
+        if selection is None
+        else _metric_summary(model, selection, device=str(args.device))
+    )
     metadata = {
         **train_lineage,
         "candidate_set_frozen_before_scoring": True,
@@ -357,26 +402,37 @@ def main() -> None:
         "selection_trajectory_ids": sorted(selection_trajectories),
         "training_sample_sha256": [file_sha256(Path(value)) for value in args.train_samples],
         "selection_sample_sha256": [file_sha256(Path(value)) for value in args.selection_samples],
+        "checkpoint_protocol": str(args.checkpoint_protocol),
+        "checkpoint_epoch": int(args.epochs) if fixed_epoch else None,
+        "checkpoint_selection_uses_pose_labels": not fixed_epoch,
         "teacher_use": "offline_typed_supervision_weights_only",
         "teacher_embeddings_stored": False,
         "trajectory_balanced_training": bool(args.trajectory_balanced),
         "selection_priority": (
-            "catastrophic_pose,catastrophic_or_abstain,p90,"
-            "top3_strict,top1_strict,nll"
+            None
+            if fixed_epoch
+            else (
+                "catastrophic_pose,catastrophic_or_abstain,p90,"
+                "top3_strict,top1_strict,nll"
+            )
         ),
     }
     save_surface_pose_likelihood(model, output, metadata=metadata)
     report = {
-        "stage": "g18_view_geometry_conditioned_surface_pose_likelihood",
+        "stage": "goal_maplet_typed_surface_pose_likelihood_v2",
         "output_model": str(output),
         "model_sha256": file_sha256(output),
         "history": history,
         "train": train_metrics,
         "selection": selection_metrics,
-        "selection_baselines": {
-            policy: _baseline_metrics(selection, policy)
-            for policy in ("frozen_candidate_top1", "fixed_grid_cosine")
-        },
+        "selection_baselines": (
+            None
+            if selection is None
+            else {
+                policy: _baseline_metrics(selection, policy)
+                for policy in ("frozen_candidate_top1", "fixed_grid_cosine")
+            }
+        ),
         "metadata": metadata,
     }
     summary_path.parent.mkdir(parents=True, exist_ok=True)

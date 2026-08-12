@@ -35,6 +35,8 @@ from .sparse_vfm_pose_likelihood import (
     score_pose_conditioned_sparse_vfm,
 )
 from .typed_graph import GEOMETRY_ADJACENCY, SURFACE_CONTINUITY, TypedParentGraph
+from .visibility_chart import refine_pose_in_visibility_chart
+from .view_conditioned_field import ViewConditionedPrimitiveField
 
 
 def unproject_query_depth(
@@ -317,12 +319,73 @@ def _empty_modes() -> CoarsePoseModes:
     )
 
 
+def _greedy_pose_basin_count(
+    poses_w2c: list[np.ndarray] | np.ndarray,
+    *,
+    translation_radius_m: float,
+    rotation_radius_deg: float,
+) -> int:
+    """Count score-ordered SE(3) basins with a spatial-hash NMS."""
+
+    pose = np.asarray(list(poses_w2c), dtype=np.float64).reshape(-1, 4, 4)
+    if pose.shape[0] == 0:
+        return 0
+    translation_radius = float(translation_radius_m)
+    rotation_radius = float(rotation_radius_deg)
+    if translation_radius <= 0.0 or rotation_radius <= 0.0:
+        return int(pose.shape[0])
+    centers = -np.einsum("nji,nj->ni", pose[:, :3, :3], pose[:, :3, 3])
+    grid: dict[tuple[int, int, int], list[int]] = {}
+    representatives: list[int] = []
+    for row, center in enumerate(centers):
+        cell = tuple(np.floor(center / translation_radius).astype(np.int64).tolist())
+        duplicate = False
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for dz in (-1, 0, 1):
+                    for other in grid.get(
+                        (cell[0] + dx, cell[1] + dy, cell[2] + dz), ()
+                    ):
+                        if (
+                            np.linalg.norm(center - centers[other])
+                            < translation_radius
+                            and _rotation_distance_degrees(pose[row], pose[other])
+                            < rotation_radius
+                        ):
+                            duplicate = True
+                            break
+                    if duplicate:
+                        break
+                if duplicate:
+                    break
+            if duplicate:
+                break
+        if duplicate:
+            continue
+        representatives.append(int(row))
+        grid.setdefault(cell, []).append(int(row))
+    return len(representatives)
+
+
 def _pose_stage_diagnostic(
     poses: list[np.ndarray] | np.ndarray,
     gt_pose_w2c: np.ndarray | None,
 ) -> dict[str, object]:
     values = list(poses)
-    result: dict[str, object] = {"pose_count": int(len(values))}
+    strict_basin_count = _greedy_pose_basin_count(
+        values, translation_radius_m=0.5, rotation_radius_deg=5.0,
+    )
+    loose_basin_count = _greedy_pose_basin_count(
+        values, translation_radius_m=1.0, rotation_radius_deg=10.0,
+    )
+    result: dict[str, object] = {
+        "pose_count": int(len(values)),
+        "unique_pose_basin_count_0_5m_5deg": int(strict_basin_count),
+        "unique_pose_basin_count_1m_10deg": int(loose_basin_count),
+        "duplicate_pose_count_0_5m_5deg": int(len(values) - strict_basin_count),
+        "duplicate_pose_count_1m_10deg": int(len(values) - loose_basin_count),
+        "basin_count_uses_ground_truth": False,
+    }
     if gt_pose_w2c is None or not values:
         return result
     errors = [pnp_pose_error(pose, gt_pose_w2c) for pose in values]
@@ -345,6 +408,40 @@ def _pose_stage_diagnostic(
             if np.any((translation <= 0.5) & (rotation <= 5.0)) else None
         ),
     })
+    return result
+
+
+def _per_anchor_pose_basin_diagnostics(
+    poses_w2c: np.ndarray,
+    anchor_labels: np.ndarray,
+    selected_rows: np.ndarray,
+) -> dict[str, dict[str, int]]:
+    """Report multiplicity and basin diversity without using ground truth."""
+
+    poses = np.asarray(poses_w2c, dtype=np.float64).reshape(-1, 4, 4)
+    labels = np.asarray(anchor_labels, dtype=np.int64).reshape(-1)
+    selected = np.asarray(selected_rows, dtype=np.int64).reshape(-1)
+    if labels.shape[0] != poses.shape[0] or np.any(
+        (selected < 0) | (selected >= poses.shape[0])
+    ):
+        raise ValueError("per-anchor basin diagnostic arrays differ")
+    selected_count = np.bincount(
+        labels[selected] + 1, minlength=int(np.max(labels, initial=-1)) + 2,
+    )
+    result: dict[str, dict[str, int]] = {}
+    for label in np.unique(labels).tolist():
+        rows = np.flatnonzero(labels == int(label))
+        key = "unanchored" if int(label) < 0 else str(int(label))
+        result[key] = {
+            "raw_state_count": int(rows.size),
+            "selected_exact_state_count": int(selected_count[int(label) + 1]),
+            "unique_pose_basin_count_0_5m_5deg": _greedy_pose_basin_count(
+                poses[rows], translation_radius_m=0.5, rotation_radius_deg=5.0,
+            ),
+            "unique_pose_basin_count_1m_10deg": _greedy_pose_basin_count(
+                poses[rows], translation_radius_m=1.0, rotation_radius_deg=10.0,
+            ),
+        }
     return result
 
 
@@ -937,6 +1034,246 @@ def _physical_phase_compatibility(
     return compatibility, radius
 
 
+def _structurally_stratified_top_rows(
+    scores: np.ndarray,
+    item_serials: np.ndarray,
+    structural_anchor_by_serial: dict[int, int],
+    maximum_count: int,
+    keep_per_anchor: int,
+) -> tuple[np.ndarray, dict[str, int | str]]:
+    """Select an exact-verification pool without collapsing proposal basins.
+
+    Sparse VFM scores are comparable globally, but the states entering that
+    screen were deliberately generated from distinct structural anchors.  A
+    pure global Top-K can spend the whole exact budget on many states from one
+    facade and silently erase every state from another valid physical basin.
+    Protect a bounded number of the best sparse states from every represented
+    anchor, then spend the remaining budget on the global sparse ranking.
+
+    This is a proposal-pool operation, not a posterior calculation: no anchor
+    score is added to the verifier score and every selected state is still
+    judged by the same exact surface evidence downstream.
+    """
+
+    value = np.asarray(scores, dtype=np.float64).reshape(-1)
+    serials = np.asarray(item_serials, dtype=np.int64).reshape(-1)
+    if serials.shape != value.shape:
+        raise ValueError("item_serials must have one entry per score")
+    if not np.all(np.isfinite(value)):
+        raise ValueError("structural exact-pool scores must be finite")
+    budget = min(max(int(maximum_count), 0), int(value.size))
+    quota = max(int(keep_per_anchor), 0)
+    order = np.argsort(-value, kind="stable")
+    if budget == 0:
+        return np.zeros((0,), dtype=np.int64), {
+            "selection_semantics": "empty_exact_pool",
+            "exact_budget": 0,
+            "per_anchor_quota": quota,
+            "protected_state_count": 0,
+            "global_fill_count": 0,
+            "represented_anchor_count": 0,
+            "protected_anchor_count": 0,
+        }
+    represented_anchors = {
+        int(structural_anchor_by_serial[int(serials[row])])
+        for row in order.tolist()
+        if int(serials[row]) in structural_anchor_by_serial
+    }
+    if quota == 0 or not represented_anchors:
+        return order[:budget], {
+            "selection_semantics": "global_sparse_topk",
+            "exact_budget": int(budget),
+            "per_anchor_quota": quota,
+            "protected_state_count": 0,
+            "global_fill_count": int(budget),
+            "represented_anchor_count": int(len(represented_anchors)),
+            "protected_anchor_count": 0,
+        }
+
+    selected: list[int] = []
+    selected_set: set[int] = set()
+    anchor_counts: dict[int, int] = {}
+    # Stable global score order also determines which anchors win if an invalid
+    # configuration asks for more protected states than the total budget.
+    for row in order.tolist():
+        serial = int(serials[row])
+        anchor = structural_anchor_by_serial.get(serial)
+        if anchor is None or anchor_counts.get(int(anchor), 0) >= quota:
+            continue
+        selected.append(int(row))
+        selected_set.add(int(row))
+        anchor_counts[int(anchor)] = anchor_counts.get(int(anchor), 0) + 1
+        if len(selected) >= budget:
+            break
+    protected_count = len(selected)
+    for row in order.tolist():
+        if len(selected) >= budget:
+            break
+        if int(row) in selected_set:
+            continue
+        selected.append(int(row))
+        selected_set.add(int(row))
+    return np.asarray(selected, dtype=np.int64), {
+        "selection_semantics": "per_structural_anchor_sparse_quota_then_global_sparse_fill",
+        "exact_budget": int(budget),
+        "per_anchor_quota": int(quota),
+        "protected_state_count": int(protected_count),
+        "global_fill_count": int(len(selected) - protected_count),
+        "represented_anchor_count": int(len(represented_anchors)),
+        "protected_anchor_count": int(len(anchor_counts)),
+    }
+
+
+def _pose_basin_diverse_top_rows(
+    scores: np.ndarray,
+    poses_w2c: np.ndarray,
+    maximum_count: int,
+    *,
+    translation_radius_m: float,
+    rotation_radius_deg: float,
+) -> tuple[np.ndarray, dict[str, int | float | str]]:
+    """Select exact-verifier states as continuous SE(3) basins, not samples.
+
+    Mapping-view labels describe acquisition provenance and are not physical
+    equivalence classes.  The same pose can be emitted under several labels,
+    so label quotas may spend multiple exact slots on one state.  Greedy NMS
+    over camera center and rotation keeps the best sparse representative of
+    each continuous basin.  If fewer basins exist than the requested budget,
+    the remaining slots are filled in global score order rather than silently
+    shrinking the exact workload.
+    """
+
+    value = np.asarray(scores, dtype=np.float64).reshape(-1)
+    pose = np.asarray(poses_w2c, dtype=np.float64).reshape(-1, 4, 4)
+    if pose.shape[0] != value.size or not np.all(np.isfinite(value)):
+        raise ValueError("pose-basin exact-pool arrays differ")
+    budget = min(max(int(maximum_count), 0), int(value.size))
+    translation_radius = float(translation_radius_m)
+    rotation_radius = float(rotation_radius_deg)
+    if translation_radius < 0.0 or rotation_radius < 0.0:
+        raise ValueError("pose-basin radii must be non-negative")
+    order = np.argsort(-value, kind="stable")
+    if budget == 0:
+        return np.zeros((0,), dtype=np.int64), {
+            "selection_semantics": "empty_exact_pool",
+            "exact_budget": 0,
+            "pose_basin_translation_radius_m": translation_radius,
+            "pose_basin_rotation_radius_deg": rotation_radius,
+            "selected_pose_basin_count": 0,
+            "near_duplicate_rejection_count": 0,
+            "duplicate_fill_count": 0,
+        }
+    center = -np.einsum("nji,nj->ni", pose[:, :3, :3], pose[:, :3, 3])
+    selected: list[int] = []
+    selected_set: set[int] = set()
+    near_duplicate_count = 0
+    for row in order.tolist():
+        is_duplicate = any(
+            np.linalg.norm(center[int(row)] - center[other]) < translation_radius
+            and _rotation_distance_degrees(pose[int(row)], pose[other]) < rotation_radius
+            for other in selected
+        )
+        if is_duplicate:
+            near_duplicate_count += 1
+            continue
+        selected.append(int(row))
+        selected_set.add(int(row))
+        if len(selected) >= budget:
+            break
+    basin_count = len(selected)
+    for row in order.tolist():
+        if len(selected) >= budget:
+            break
+        if int(row) not in selected_set:
+            selected.append(int(row))
+            selected_set.add(int(row))
+    return np.asarray(selected, dtype=np.int64), {
+        "selection_semantics": "global_sparse_pose_basin_representatives_then_duplicate_fill",
+        "exact_budget": int(budget),
+        "pose_basin_translation_radius_m": translation_radius,
+        "pose_basin_rotation_radius_deg": rotation_radius,
+        "selected_pose_basin_count": int(basin_count),
+        "near_duplicate_rejection_count": int(near_duplicate_count),
+        "duplicate_fill_count": int(len(selected) - basin_count),
+    }
+
+
+def _two_channel_pose_basin_union_rows(
+    primary_scores: np.ndarray,
+    secondary_scores: np.ndarray,
+    poses_w2c: np.ndarray,
+    maximum_count: int,
+    *,
+    translation_radius_m: float,
+    rotation_radius_deg: float,
+) -> tuple[np.ndarray, dict[str, int | float | str]]:
+    """Allocate equal exact-pool capacity to appearance and geometry ranks."""
+
+    primary = np.asarray(primary_scores, dtype=np.float64).reshape(-1)
+    secondary = np.asarray(secondary_scores, dtype=np.float64).reshape(-1)
+    pose = np.asarray(poses_w2c, dtype=np.float64).reshape(-1, 4, 4)
+    if primary.shape != secondary.shape or pose.shape[0] != primary.size:
+        raise ValueError("two-channel exact-pool arrays differ")
+    budget = min(max(int(maximum_count), 0), int(primary.size))
+    if budget == 0:
+        return np.zeros((0,), dtype=np.int64), {
+            "selection_semantics": "empty_exact_pool",
+            "exact_budget": 0,
+            "primary_channel_count": 0,
+            "secondary_channel_count": 0,
+        }
+    primary_budget = (budget + 1) // 2
+    first, first_diagnostic = _pose_basin_diverse_top_rows(
+        primary, pose, primary_budget,
+        translation_radius_m=float(translation_radius_m),
+        rotation_radius_deg=float(rotation_radius_deg),
+    )
+    center = -np.einsum("nji,nj->ni", pose[:, :3, :3], pose[:, :3, 3])
+    selected = first.tolist()
+    selected_set = set(selected)
+
+    def near_selected(row: int) -> bool:
+        return any(
+            np.linalg.norm(center[int(row)] - center[other]) < float(translation_radius_m)
+            and _rotation_distance_degrees(pose[int(row)], pose[other])
+            < float(rotation_radius_deg)
+            for other in selected
+        )
+
+    secondary_rejections = 0
+    for row in np.argsort(-secondary, kind="stable").tolist():
+        if len(selected) >= budget:
+            break
+        if int(row) in selected_set or near_selected(int(row)):
+            secondary_rejections += 1
+            continue
+        selected.append(int(row))
+        selected_set.add(int(row))
+    secondary_count = len(selected) - len(first)
+    # Degenerate inputs may contain fewer distinct basins than the budget.
+    # Fill deterministically from the primary order while retaining both
+    # channel allocations in diagnostics.
+    for row in np.argsort(-primary, kind="stable").tolist():
+        if len(selected) >= budget:
+            break
+        if int(row) not in selected_set:
+            selected.append(int(row))
+            selected_set.add(int(row))
+    return np.asarray(selected, dtype=np.int64), {
+        "selection_semantics": "equal_capacity_vfm_geometry_pose_basin_union",
+        "exact_budget": int(budget),
+        "pose_basin_translation_radius_m": float(translation_radius_m),
+        "pose_basin_rotation_radius_deg": float(rotation_radius_deg),
+        "primary_channel_count": int(len(first)),
+        "secondary_channel_count": int(secondary_count),
+        "secondary_near_duplicate_rejection_count": int(secondary_rejections),
+        "duplicate_fill_count": int(budget - len(first) - secondary_count),
+        "primary_near_duplicate_rejection_count": int(
+            first_diagnostic["near_duplicate_rejection_count"]
+        ),
+    }
+
+
 def generate_geometry_guided_configuration_pose_modes(
     query_xy_px: np.ndarray,
     query_extent_px: np.ndarray,
@@ -995,6 +1332,18 @@ def generate_geometry_guided_configuration_pose_modes(
     seed_identity_full_map_primitives: bool = False,
     seed_identity_prescore_per_anchor: int = 0,
     seed_identity_exact_verify_count: int = 0,
+    seed_identity_exact_keep_per_anchor: int = 0,
+    seed_identity_exact_protected_mapping_anchors: int = 0,
+    seed_identity_exact_pool_semantics: str = "anchor_quota",
+    seed_identity_exact_basin_translation_m: float = 0.5,
+    seed_identity_exact_basin_rotation_deg: float = 5.0,
+    seed_identity_final_ranking_semantics: str = "exact_vfm",
+    seed_identity_geometry_candidate_count: int = 8,
+    visibility_chart_refinement: bool = False,
+    visibility_chart_iterations: int = 2,
+    visibility_chart_candidate_count: int = 8,
+    visibility_chart_maximum_translation_m: float = 2.0,
+    visibility_chart_maximum_rotation_deg: float = 15.0,
     soft_identity_marginalization: bool = False,
     marginal_pair_consensus: bool = False,
     soft_parent_candidate_count: int = 8,
@@ -1018,6 +1367,7 @@ def generate_geometry_guided_configuration_pose_modes(
     canonical_field_primitive_rows: np.ndarray | None = None,
     canonical_field_codes: np.ndarray | None = None,
     canonical_field_confidence: np.ndarray | None = None,
+    view_conditioned_primitive_field: ViewConditionedPrimitiveField | None = None,
     sparse_vfm_primitives_per_child: int = 8,
     sparse_primitive_score_semantics: str = "visible_sample_mean",
     sparse_vfm_device: str = "cuda",
@@ -1397,6 +1747,8 @@ def generate_geometry_guided_configuration_pose_modes(
 
     seed_identity_vfm = None
     seed_identity_score_by_serial: dict[int, float] = {}
+    seed_identity_final_score_by_serial: dict[int, float] = {}
+    seed_geometry_score_by_serial: dict[int, float] = {}
     if bool(seed_identity_vfm_alignment):
         required = (
             (
@@ -1460,6 +1812,94 @@ def generate_geometry_guided_configuration_pose_modes(
                     "unanchored_capacity": int(preliminary_pose_count),
                     "score_semantics": "proposal_score_compared_within_anchor_only",
                 }
+        if bool(visibility_chart_refinement) and phase_anchor_by_serial:
+            chart_items = []
+            accepted_updates = []
+            initial_chart_poses = []
+            refined_chart_poses = []
+            chart_support = extension_order
+            chart_slots = min(
+                max(int(visibility_chart_candidate_count), 1), slot_count,
+            )
+            for value in seed_pool:
+                anchor_label = phase_anchor_by_serial.get(int(value[1]))
+                if anchor_label is None:
+                    continue
+                parent_visibility = np.ones(
+                    (physical.maplet_ids.size,), dtype=np.float64,
+                )
+                if (
+                    mapping_anchor_label_offset is not None
+                    and mapping_view_parent_weights is not None
+                    and int(anchor_label) >= int(mapping_anchor_label_offset)
+                ):
+                    local_anchor = int(anchor_label) - int(mapping_anchor_label_offset)
+                    view_weights = np.asarray(mapping_view_parent_weights, dtype=np.float64)
+                    if 0 <= local_anchor < view_weights.shape[0]:
+                        parent_visibility = view_weights[local_anchor]
+                update = refine_pose_in_visibility_chart(
+                    value[2], value[5], query_xyz[chart_support],
+                    child_rows[chart_support, :chart_slots],
+                    parent_rows[chart_support, :chart_slots],
+                    candidate_mass[chart_support, :chart_slots],
+                    valid_candidate[chart_support, :chart_slots],
+                    physical.child_centers,
+                    parent_visibility,
+                    support_weight[chart_support],
+                    iterations=int(visibility_chart_iterations),
+                    maximum_translation_update_m=float(
+                        visibility_chart_maximum_translation_m
+                    ),
+                    maximum_rotation_update_deg=float(
+                        visibility_chart_maximum_rotation_deg
+                    ),
+                )
+                if update.accepted_iterations <= 0:
+                    continue
+                chart_item = (
+                    float(value[0]), serial, update.pose_w2c,
+                    value[3], value[4], float(update.scale),
+                )
+                phase_anchor_by_serial[serial] = int(anchor_label)
+                serial += 1
+                chart_items.append(chart_item)
+                initial_chart_poses.append(value[2])
+                refined_chart_poses.append(update.pose_w2c)
+                accepted_updates.append(update)
+            # The chart update is conservative: it adds one state and never
+            # replaces the discrete proposal that initialized the chart.
+            seed_pool = seed_pool + chart_items
+            if diagnostics_out is not None:
+                diagnostics_out["continuous_visibility_chart"] = {
+                    **_pose_stage_diagnostic(
+                        refined_chart_poses, diagnostic_pose_w2c,
+                    ),
+                    "input_state_count": int(len(initial_chart_poses)),
+                    "accepted_state_count": int(len(chart_items)),
+                    "initial_state_diagnostic": _pose_stage_diagnostic(
+                        initial_chart_poses, diagnostic_pose_w2c,
+                    ),
+                    "mean_translation_update_m": (
+                        float(np.mean([
+                            update.translation_update_m for update in accepted_updates
+                        ])) if accepted_updates else 0.0
+                    ),
+                    "mean_rotation_update_deg": (
+                        float(np.mean([
+                            update.rotation_update_deg for update in accepted_updates
+                        ])) if accepted_updates else 0.0
+                    ),
+                    "mean_effective_support_count": (
+                        float(np.mean([
+                            update.effective_support_count for update in accepted_updates
+                        ])) if accepted_updates else 0.0
+                    ),
+                    "candidate_count_per_support": int(chart_slots),
+                    "proposal_semantics": (
+                        "soft_child_marginalization_and_bounded_weighted_sim3; "
+                        "original_state_preserved"
+                    ),
+                }
         seed_poses = np.asarray([value[2] for value in seed_pool], dtype=np.float64)
         seed_parents = np.asarray([value[3] for value in seed_pool], dtype=np.int64)
         seed_query_mask = (
@@ -1493,6 +1933,7 @@ def generate_geometry_guided_configuration_pose_modes(
                 score_semantics="fixed_grid",
                 allowed_parent_rows=seed_allowed_parents,
                 query_token_mask=seed_query_mask,
+                view_conditioned_field=view_conditioned_primitive_field,
                 device=str(sparse_vfm_device),
             )
         else:
@@ -1518,14 +1959,271 @@ def generate_geometry_guided_configuration_pose_modes(
             )
         sparse_seed_identity_vfm = seed_identity_vfm
         sparse_seed_pool = seed_pool
+        geometry_scores = None
+        needs_geometry_channel = (
+            str(seed_identity_exact_pool_semantics) == "vfm_geometry_union"
+            or str(seed_identity_final_ranking_semantics)
+            == "vfm_geometry_interleave"
+        )
+        if needs_geometry_channel:
+            geometry_candidate_count = min(
+                max(int(seed_identity_geometry_candidate_count), 1), slot_count,
+            )
+            geometry_values = []
+            geometry_components = []
+            geometry_support_counts = []
+            mapping_parent_weights = (
+                None
+                if mapping_view_parent_weights is None
+                else np.asarray(mapping_view_parent_weights, dtype=np.float64)
+            )
+            for value in seed_pool:
+                seed_geometry_support = np.asarray(value[4], dtype=np.int64)
+                seed_geometry_support = seed_geometry_support[
+                    (seed_geometry_support >= 0)
+                    & (seed_geometry_support < support_count)
+                ]
+                conditioned_parent_probability = parent_probability[
+                    :, :geometry_candidate_count
+                ].copy()
+                conditioned_mass = candidate_mass[:, :geometry_candidate_count].copy()
+                anchor_label = phase_anchor_by_serial.get(int(value[1]))
+                if (
+                    anchor_label is not None
+                    and mapping_anchor_label_offset is not None
+                    and mapping_parent_weights is not None
+                    and int(anchor_label) >= int(mapping_anchor_label_offset)
+                ):
+                    local_anchor = int(anchor_label) - int(mapping_anchor_label_offset)
+                    if 0 <= local_anchor < mapping_parent_weights.shape[0]:
+                        safe_parent = np.maximum(
+                            parent_rows[:, :geometry_candidate_count], 0,
+                        )
+                        visibility = mapping_parent_weights[local_anchor, safe_parent]
+                        visibility[parent_rows[:, :geometry_candidate_count] < 0] = 0.0
+                        message = np.power(
+                            0.02 + 0.98 * visibility,
+                            float(mapping_view_message_power),
+                        )
+                        conditioned_mass *= message
+                        conditioned_parent_probability *= message
+                        # Preserve each support's retained in-map mass.  The
+                        # anchor conditions identity alternatives; it must not
+                        # turn a low-mass phase into artificial certainty.
+                        original_sum = np.sum(
+                            parent_probability[:, :geometry_candidate_count], axis=1,
+                        )
+                        conditioned_sum = np.sum(conditioned_parent_probability, axis=1)
+                        rescale = original_sum / np.maximum(conditioned_sum, 1e-12)
+                        conditioned_parent_probability *= rescale[:, None]
+                support_phase_mass = np.sum(conditioned_mass, axis=1)
+                held_out = np.ones((support_count,), dtype=bool)
+                held_out[seed_geometry_support] = False
+                support_order = np.flatnonzero(
+                    held_out
+                    & np.any(valid_candidate[:, :geometry_candidate_count], axis=1)
+                    & np.isfinite(depth) & (depth > 0.05)
+                    & np.isfinite(geometry_conf) & (geometry_conf > 0.0)
+                    & (support_phase_mass > 0.0)
+                )
+                support_order = support_order[np.argsort(
+                    -support_phase_mass[support_order], kind="stable",
+                )]
+                geometry_support = _diverse_support_subset(
+                    support_order,
+                    xy_normalized,
+                    maximum_count=int(extension_support_count),
+                )
+                geometry_support_counts.append(int(geometry_support.size))
+                if geometry_support.size:
+                    _surface_score, _assigned_parent, assigned_child, _support = (
+                        _projected_surface_assignment(
+                            value[2],
+                            xy_normalized[geometry_support],
+                            extent_normalized[geometry_support],
+                            conditioned_parent_probability[geometry_support],
+                            unresolved[geometry_support],
+                            child_rows[geometry_support, :geometry_candidate_count],
+                            child_probability[
+                                geometry_support, :geometry_candidate_count
+                            ],
+                            physical,
+                            camera,
+                            maximum_parent_candidates=geometry_candidate_count,
+                        )
+                    )
+                    geometry_value = scale_invariant_configuration_geometry(
+                        value[2],
+                        query_xyz[geometry_support],
+                        query_normal[geometry_support],
+                        geometry_conf[geometry_support],
+                        assigned_child,
+                        physical.child_centers,
+                        physical.child_normals,
+                    )
+                else:
+                    geometry_value = {
+                        "score": None,
+                        "unique_child_count": 0,
+                        "scale": None,
+                        "point_score": None,
+                        "pair_score": None,
+                        "ray_score": None,
+                        "normal_score": None,
+                    }
+                scalar = geometry_value["score"]
+                geometry_values.append(
+                    -1.0 if scalar is None else float(scalar)
+                )
+                geometry_components.append(geometry_value)
+            geometry_scores = np.asarray(geometry_values, dtype=np.float64)
+            seed_geometry_score_by_serial = {
+                int(value[1]): float(geometry_scores[index])
+                for index, value in enumerate(seed_pool)
+            }
+            if diagnostics_out is not None:
+                geometry_order = np.argsort(-geometry_scores, kind="stable")
+                valid_geometry = geometry_scores >= 0.0
+                diagnostic_best = None
+                if diagnostic_pose_w2c is not None and seed_pool:
+                    errors = [
+                        pnp_pose_error(value[2], diagnostic_pose_w2c)
+                        for value in seed_pool
+                    ]
+                    joint = np.asarray([
+                        error.translation_m / 0.5 + error.rotation_deg / 5.0
+                        for error in errors
+                    ], dtype=np.float64)
+                    best_row = int(np.argmin(joint))
+                    rank_by_row = np.empty((len(seed_pool),), dtype=np.int64)
+                    rank_by_row[geometry_order] = np.arange(
+                        1, len(seed_pool) + 1, dtype=np.int64,
+                    )
+                    diagnostic_best = {
+                        "translation_m": float(errors[best_row].translation_m),
+                        "rotation_deg": float(errors[best_row].rotation_deg),
+                        "geometry_rank": int(rank_by_row[best_row]),
+                        "geometry_score": float(geometry_scores[best_row]),
+                        **geometry_components[best_row],
+                    }
+                diagnostics_out["scale_invariant_configuration_geometry"] = {
+                    **_pose_stage_diagnostic(
+                        [seed_pool[int(row)][2] for row in geometry_order.tolist()],
+                        diagnostic_pose_w2c,
+                    ),
+                    "valid_score_count": int(np.sum(valid_geometry)),
+                    "score_min": (
+                        float(np.min(geometry_scores[valid_geometry]))
+                        if np.any(valid_geometry) else None
+                    ),
+                    "score_max": (
+                        float(np.max(geometry_scores[valid_geometry]))
+                        if np.any(valid_geometry) else None
+                    ),
+                    "support_count_min": int(np.min(geometry_support_counts)),
+                    "support_count_max": int(np.max(geometry_support_counts)),
+                    "support_semantics": (
+                        "held_out_mapping_anchor_conditioned_high_mass_diverse_supports"
+                    ),
+                    "candidate_count_per_support": int(geometry_candidate_count),
+                    "diagnostic_best_joint_candidate": diagnostic_best,
+                    "score_semantics": (
+                        "scale_invariant_global_point_pair_ray_normal_consistency_"
+                        "after_mapping_anchor_and_pose_conditioned_soft_surface_assignment"
+                    ),
+                }
         exact_verify_count = min(
             max(int(seed_identity_exact_verify_count), 0), len(seed_pool),
         )
+        exact_pool_selection: dict[str, object] = {
+            "selection_semantics": "exact_verification_disabled",
+            "exact_budget": 0,
+            "per_anchor_quota": max(
+                int(seed_identity_exact_keep_per_anchor), 0,
+            ),
+            "protected_state_count": 0,
+            "global_fill_count": 0,
+            "represented_anchor_count": 0,
+            "protected_anchor_count": 0,
+        }
         if exact_verify_count > 0:
             if not bool(seed_identity_full_map_primitives):
                 raise ValueError("exact seed verification requires full-map primitive evidence")
-            sparse_order = np.argsort(-seed_identity_vfm.scores, kind="stable")
-            exact_rows = sparse_order[:exact_verify_count]
+            exact_protection_by_serial = phase_anchor_by_serial
+            protected_mapping_anchor_budget = max(
+                int(seed_identity_exact_protected_mapping_anchors), 0,
+            )
+            if protected_mapping_anchor_budget > 0 and mapping_anchor_label_offset is not None:
+                # Proposal coverage and verifier-pool protection are distinct
+                # budgets.  More mapping anchors may generate valid basins,
+                # while protecting every such anchor would consume the whole
+                # exact budget and eliminate its global competition channel.
+                # Phase anchors, when present, retain their existing protection;
+                # only the retrieval-ordered mapping anchors are truncated.
+                maximum_mapping_label = (
+                    int(mapping_anchor_label_offset) + protected_mapping_anchor_budget
+                )
+                exact_protection_by_serial = {
+                    int(item_serial): int(anchor_label)
+                    for item_serial, anchor_label in phase_anchor_by_serial.items()
+                    if (
+                        int(anchor_label) < int(mapping_anchor_label_offset)
+                        or int(anchor_label) < maximum_mapping_label
+                    )
+                }
+            exact_source_pool = list(seed_pool)
+            if str(seed_identity_exact_pool_semantics) == "pose_basin":
+                exact_rows, exact_pool_selection = _pose_basin_diverse_top_rows(
+                    seed_identity_vfm.scores,
+                    np.asarray([value[2] for value in seed_pool], dtype=np.float64),
+                    exact_verify_count,
+                    translation_radius_m=float(
+                        seed_identity_exact_basin_translation_m
+                    ),
+                    rotation_radius_deg=float(seed_identity_exact_basin_rotation_deg),
+                )
+            elif str(seed_identity_exact_pool_semantics) == "vfm_geometry_union":
+                if geometry_scores is None:
+                    raise RuntimeError("geometry exact-pool channel was not evaluated")
+                exact_rows, exact_pool_selection = _two_channel_pose_basin_union_rows(
+                    seed_identity_vfm.scores,
+                    geometry_scores,
+                    np.asarray([value[2] for value in seed_pool], dtype=np.float64),
+                    exact_verify_count,
+                    translation_radius_m=float(
+                        seed_identity_exact_basin_translation_m
+                    ),
+                    rotation_radius_deg=float(seed_identity_exact_basin_rotation_deg),
+                )
+            elif str(seed_identity_exact_pool_semantics) == "anchor_quota":
+                exact_rows, exact_pool_selection = _structurally_stratified_top_rows(
+                    seed_identity_vfm.scores,
+                    np.asarray([value[1] for value in seed_pool], dtype=np.int64),
+                    exact_protection_by_serial,
+                    exact_verify_count,
+                    int(seed_identity_exact_keep_per_anchor),
+                )
+                exact_pool_selection["protected_mapping_anchor_budget"] = int(
+                    protected_mapping_anchor_budget
+                )
+            else:
+                raise ValueError(
+                    "unknown exact-pool semantics: "
+                    f"{seed_identity_exact_pool_semantics}"
+                )
+            exact_anchor_labels = np.asarray([
+                phase_anchor_by_serial.get(int(value[1]), -1)
+                for value in exact_source_pool
+            ], dtype=np.int64)
+            exact_pool_selection["per_anchor_basin_statistics"] = (
+                _per_anchor_pose_basin_diagnostics(
+                    np.asarray(
+                        [value[2] for value in exact_source_pool], dtype=np.float64,
+                    ),
+                    exact_anchor_labels,
+                    exact_rows,
+                )
+            )
             seed_pool = [seed_pool[int(row)] for row in exact_rows.tolist()]
             seed_identity_vfm = score_pose_conditioned_sparse_primitives(
                 np.asarray([value[2] for value in seed_pool], dtype=np.float64),
@@ -1541,12 +2239,43 @@ def generate_geometry_guided_configuration_pose_modes(
                 batch_size=max(1, min(int(sparse_vfm_batch_size), 2)),
                 maximum_splat_radius_tokens=int(sparse_vfm_maximum_splat_radius_tokens),
                 score_semantics=str(sparse_primitive_score_semantics),
+                view_conditioned_field=view_conditioned_primitive_field,
                 device=str(sparse_vfm_device),
             )
         seed_identity_score_by_serial = {
             int(value[1]): float(seed_identity_vfm.scores[index])
             for index, value in enumerate(seed_pool)
         }
+        seed_identity_final_score_by_serial = dict(seed_identity_score_by_serial)
+        if str(seed_identity_final_ranking_semantics) == "vfm_geometry_interleave":
+            if not seed_geometry_score_by_serial:
+                raise RuntimeError("geometry final-ranking channel was not evaluated")
+            vfm_order = np.argsort(-seed_identity_vfm.scores, kind="stable")
+            selected_geometry_scores = np.asarray([
+                seed_geometry_score_by_serial[int(value[1])] for value in seed_pool
+            ], dtype=np.float64)
+            geometry_order = np.argsort(-selected_geometry_scores, kind="stable")
+            vfm_rank = np.empty((len(seed_pool),), dtype=np.int64)
+            geometry_rank = np.empty((len(seed_pool),), dtype=np.int64)
+            vfm_rank[vfm_order] = np.arange(len(seed_pool), dtype=np.int64)
+            geometry_rank[geometry_order] = np.arange(len(seed_pool), dtype=np.int64)
+            # Exact VFM retains the first output slot.  Thereafter the ranking
+            # is a deterministic round-robin union of appearance and global
+            # scale-invariant geometry modes.  This is a mode-set ordering,
+            # not a calibrated posterior score.
+            fused_rank = np.minimum(2 * vfm_rank, 2 * geometry_rank + 1)
+            fused_score = -fused_rank.astype(np.float64) - 1e-4 * (
+                vfm_rank + geometry_rank
+            )
+            seed_identity_final_score_by_serial = {
+                int(value[1]): float(fused_score[index])
+                for index, value in enumerate(seed_pool)
+            }
+        elif str(seed_identity_final_ranking_semantics) != "exact_vfm":
+            raise ValueError(
+                "unknown seed identity final ranking semantics: "
+                f"{seed_identity_final_ranking_semantics}"
+            )
         if diagnostics_out is not None:
             sparse_order = np.argsort(-sparse_seed_identity_vfm.scores, kind="stable")
             diagnostics_out["full_map_sparse_seed_vfm_likelihood"] = {
@@ -1558,6 +2287,21 @@ def generate_geometry_guided_configuration_pose_modes(
                 "full_map_evidence": bool(seed_identity_full_map_primitives),
                 "primitives_per_child": int(sparse_vfm_primitives_per_child),
                 "selected_score_semantics": str(sparse_primitive_score_semantics),
+            }
+            diagnostics_out["exact_verification_pool_selection"] = {
+                **exact_pool_selection,
+                **_pose_stage_diagnostic(
+                    [value[2] for value in seed_pool], diagnostic_pose_w2c,
+                ),
+                "state_unit": "structural_anchor_conditioned_pose_state",
+                "selection_order_semantics": (
+                    "protected_pass_then_global_fill; diagnostic rank is a pool "
+                    "slot, not a verifier-score rank"
+                ),
+                "score_semantics": (
+                    "sparse_surface_score_selects_candidates_only; "
+                    "exact_surface_score_ranks_selected_pool"
+                ),
             }
             order = np.argsort(-seed_identity_vfm.scores, kind="stable")
             ranked_seed_snapshots = []
@@ -1585,6 +2329,9 @@ def generate_geometry_guided_configuration_pose_modes(
                     "mapping_view_score": mapping_score,
                     "seed_parent_rows": np.asarray(value[3], dtype=np.int64).tolist(),
                     "seed_support_rows": np.asarray(value[4], dtype=np.int64).tolist(),
+                    "scale_invariant_geometry_score": (
+                        seed_geometry_score_by_serial.get(int(value[1]))
+                    ),
                 }
                 if diagnostic_pose_w2c is not None:
                     error = pnp_pose_error(value[2], diagnostic_pose_w2c)
@@ -1602,6 +2349,19 @@ def generate_geometry_guided_configuration_pose_modes(
                 "score_max": float(np.max(seed_identity_vfm.scores)),
                 "rendered_coverage_mean": float(np.mean(seed_identity_vfm.rendered_coverage)),
                 "feature_coverage_mean": float(np.mean(seed_identity_vfm.feature_coverage)),
+                "top1_rendered_coverage": float(
+                    seed_identity_vfm.rendered_coverage[int(order[0])]
+                ),
+                "top1_feature_coverage": float(
+                    seed_identity_vfm.feature_coverage[int(order[0])]
+                ),
+                "conditioned_feature_coverage_mean": float(np.mean(
+                    getattr(
+                        seed_identity_vfm,
+                        "conditioned_feature_coverage",
+                        np.zeros_like(seed_identity_vfm.feature_coverage),
+                    )
+                )),
                 "fixed_denominator_token_count": int(token_height) * int(token_width),
                 "denominator_semantics": (
                     "full_query_grid"
@@ -1614,6 +2374,12 @@ def generate_geometry_guided_configuration_pose_modes(
                     else "non_hypothesized_or_missing_canonical_surface_zero_llr"
                 ),
                 "canonical_primitive_codes": bool(seed_identity_canonical_primitives),
+                "view_conditioned_residual_codes": bool(
+                    view_conditioned_primitive_field is not None
+                ),
+                "final_mode_ranking_semantics": str(
+                    seed_identity_final_ranking_semantics
+                ),
                 "exact_all_primitive_verification": bool(exact_verify_count > 0),
                 "exact_verify_count": int(exact_verify_count),
                 "top_ranked_seed_snapshots": ranked_seed_snapshots,
@@ -1738,6 +2504,7 @@ def generate_geometry_guided_configuration_pose_modes(
             batch_size=int(sparse_vfm_batch_size),
             maximum_splat_radius_tokens=int(sparse_vfm_maximum_splat_radius_tokens),
             score_semantics=str(sparse_primitive_score_semantics),
+            view_conditioned_field=view_conditioned_primitive_field,
             device=str(sparse_vfm_device),
         )
         primitive_order = np.argsort(-sparse_primitive_vfm.scores, kind="stable")
@@ -1755,11 +2522,16 @@ def generate_geometry_guided_configuration_pose_modes(
                 "feature_coverage_mean": float(np.mean(
                     sparse_primitive_vfm.feature_coverage
                 )),
+                "conditioned_feature_coverage_mean": float(np.mean(
+                    sparse_primitive_vfm.conditioned_feature_coverage
+                )),
                 "sample_count": int(sparse_primitive_vfm.sample_count),
                 "primitives_per_child": int(sparse_primitive_vfm.primitives_per_child),
                 "fixed_denominator_token_count": int(token_height) * int(token_width),
                 "map_feature_semantics": (
-                    "all_physical_primitive_centers_zbuffer_plus_single_canonical_field_codes"
+                    "all_physical_primitive_centers_zbuffer_plus_canonical_codes_with_low_rank_view_residual"
+                    if view_conditioned_primitive_field is not None
+                    else "all_physical_primitive_centers_zbuffer_plus_single_canonical_field_codes"
                     if int(sparse_vfm_primitives_per_child) <= 0
                     else "spatially_stratified_real_codes_from_single_canonical_primitive_field"
                 ),
@@ -1905,7 +2677,7 @@ def generate_geometry_guided_configuration_pose_modes(
             assigned_parent = np.full((support_count,), -1, dtype=np.int64)
             assigned_child = np.full((support_count,), -1, dtype=np.int64)
         elif seed_identity_vfm is not None:
-            score = float(seed_identity_score_by_serial[int(item_serial)])
+            score = float(seed_identity_final_score_by_serial[int(item_serial)])
             surface_score, assigned_parent, assigned_child, support = _projected_surface_assignment(
                 pose,
                 xy_normalized,

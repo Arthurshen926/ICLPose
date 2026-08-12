@@ -1,0 +1,18 @@
+diff --git a/mast3r/dust3r/croco/models/curope/setup.py b/mast3r/dust3r/croco/models/curope/setup.py
+index 230632e..fdaed10 100644
+--- a/mast3r/dust3r/croco/models/curope/setup.py
++++ b/mast3r/dust3r/croco/models/curope/setup.py
+@@ -5,8 +5,11 @@ from setuptools import setup
+ from torch import cuda
+ from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+ 
+-# compile for all possible CUDA architectures
+-all_cuda_archs = cuda.get_gencode_flags().replace('compute=','arch=').split()
++# This experiment runs on RTX 3090 (sm_86).  The upstream implementation asks
++# PyTorch for every architecture it knows about, including compute_90, which
++# nvcc 11.6 cannot compile.  Restricting the extension to the deployed GPU is
++# both reproducible and substantially faster to build.
++all_cuda_archs = ['-gencode', 'arch=compute_86,code=sm_86']
+ # alternatively, you can list cuda archs that you want, eg:
+ # all_cuda_archs = [
+     # '-gencode', 'arch=compute_70,code=sm_70',

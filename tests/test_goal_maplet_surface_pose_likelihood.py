@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,14 +11,19 @@ from feature_extract.tools.vfm.verify_goal_maplet_pose_modes_with_surface_field 
 )
 from feature_extract.tools.vfm.train_goal_maplet_surface_pose_likelihood import (
     _trajectory_balanced_order,
+    main as train_surface_likelihood,
 )
 from feature_extract.tools.vfm.build_goal_maplet_surface_likelihood_samples import (
     _typed_teacher_weight,
+)
+from feature_extract.tools.vfm.evaluate_goal_maplet_surface_likelihood_crossfit import (
+    _threshold_oracle_choice,
 )
 from feature_extract.vfm.localization_goal_maplet.surface_pose_likelihood import (
     EVENT_NAMES,
     FEATURE_NAMES,
     SurfacePoseLikelihoodConfig,
+    SAMPLE_SCHEMA,
     ViewGeometryConditionedSurfaceLikelihood,
     assign_pose_defined_typed_targets,
     extract_surface_likelihood_features,
@@ -75,6 +81,25 @@ def test_typed_surface_evidence_defers_physical_phase_to_pose_labels() -> None:
     )
     assert set(match_target.tolist()) == {EVENT_NAMES.index("surface_match")}
     assert set(phase_target.tolist()) == {EVENT_NAMES.index("wrong_phase")}
+
+
+def test_typed_support_events_do_not_mislabel_grazing_as_occlusion() -> None:
+    query = np.zeros((4, 2, 2), dtype=np.float32)
+    query[0] = 1.0
+    grazing = _rendered(query.copy())
+    grazing.incidence[:] = 0.05
+    _feature, typed, _summary = extract_surface_likelihood_features(
+        query, grazing, np.eye(4),
+    )
+    assert set(typed.tolist()) == {EVENT_NAMES.index("grazing_surface")}
+
+    outside = _rendered(query.copy(), valid=False)
+    outside.visibility[:] = False
+    outside.field_missing[:] = False
+    _feature, typed, _summary = extract_surface_likelihood_features(
+        query, outside, np.eye(4),
+    )
+    assert set(typed.tolist()) == {EVENT_NAMES.index("outside_render_support")}
 
 
 def test_listwise_surface_likelihood_competes_with_typed_null() -> None:
@@ -162,6 +187,15 @@ def test_risk_summary_does_not_treat_abstention_as_a_pose_catastrophe() -> None:
     assert summary["risk_coverage"]["coverage_1.0"]["accepted_count"] == 0
 
 
+def test_exact_pool_oracle_prioritizes_declared_success_threshold() -> None:
+    choice = _threshold_oracle_choice(
+        np.asarray([0.51, 0.49, 0.1]),
+        np.asarray([0.1, 4.9, 0.1]),
+        np.asarray([True, True, False]),
+    )
+    assert choice == 1
+
+
 def test_trajectory_balanced_training_does_not_follow_frame_count_skew() -> None:
     trajectory = np.asarray(["seq1"] * 6 + ["seq2"] * 2 + ["seq3"])
     order = _trajectory_balanced_order(trajectory, np.random.default_rng(3))
@@ -184,3 +218,55 @@ def test_teacher_cues_are_routed_to_typed_roles_instead_of_static_average() -> N
     weight = _typed_teacher_weight(target, cue)
     assert weight[0, 1] > weight[0, 0]
     assert weight[0, 2] == pytest.approx(1.5)
+
+
+def test_fixed_epoch_training_never_requires_or_selects_a_validation_set(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sample = tmp_path / "train.npz"
+    model_path = tmp_path / "model.pt"
+    report_path = tmp_path / "report.json"
+    feature = np.zeros((1, 2, 3, len(FEATURE_NAMES)), dtype=np.float16)
+    feature[0, 0, :, FEATURE_NAMES.index("cosine")] = 0.8
+    feature[0, 1, :, FEATURE_NAMES.index("cosine")] = 0.2
+    feature[..., FEATURE_NAMES.index("render_valid")] = 1.0
+    feature[..., FEATURE_NAMES.index("surface_visible")] = 1.0
+    metadata = {
+        "artifact_type": SAMPLE_SCHEMA,
+        "physical_map_sha256": "physical",
+        "canonical_field_sha256": "field",
+        "surface_mapper_sha256": "mapper",
+        "physical_instance_readout_sha256": "readout",
+        "candidate_count": 2,
+    }
+    np.savez_compressed(
+        sample,
+        token_feature=feature,
+        typed_target=np.zeros((1, 2, 3), dtype=np.uint8),
+        query_summary=np.zeros((1, 4), dtype=np.float32),
+        translation_m=np.asarray([[0.2, 3.0]], dtype=np.float32),
+        rotation_deg=np.asarray([[2.0, 20.0]], dtype=np.float32),
+        candidate_valid=np.ones((1, 2), dtype=bool),
+        target_index=np.asarray([0], dtype=np.int64),
+        teacher_weight=np.ones((1, 2, 3), dtype=np.float16),
+        image_ids=np.asarray(["seq12/frame.png"]),
+        trajectory_ids=np.asarray(["seq12"]),
+        metadata_json=np.asarray(json.dumps(metadata)),
+    )
+    monkeypatch.setattr("sys.argv", [
+        "train_goal_maplet_surface_pose_likelihood.py",
+        "--train_samples", str(sample),
+        "--checkpoint_protocol", "fixed_epoch_no_selection",
+        "--epochs", "1",
+        "--hidden_dim", "8",
+        "--output_model", str(model_path),
+        "--summary_json", str(report_path),
+        "--device", "cpu",
+    ])
+    train_surface_likelihood()
+    _model, trained = load_surface_pose_likelihood(model_path)
+    assert trained["checkpoint_protocol"] == "fixed_epoch_no_selection"
+    assert trained["checkpoint_epoch"] == 1
+    assert trained["checkpoint_selection_uses_pose_labels"] is False
+    assert trained["selection_trajectory_ids"] == []

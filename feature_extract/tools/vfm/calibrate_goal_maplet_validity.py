@@ -13,7 +13,7 @@ from feature_extract.vfm.localization_goal_maplet.canonical_field import Canonic
 from feature_extract.vfm.localization_goal_maplet.lineage import file_sha256
 from feature_extract.vfm.localization_goal_maplet.pfir import (
     ContributorLabels,
-    contributor_multiscale_maplet_distribution,
+    contributor_multiscale_in_map_probability,
 )
 from feature_extract.vfm.localization_goal_maplet.physical_map import GoalMapletPhysicalMap
 from feature_extract.vfm.localization_goal_maplet.physical_instance_readout import (
@@ -84,6 +84,12 @@ def main() -> None:
             readout.child_coverage,
         )
     valid_maplets = readout.parent_coverage > 0.0
+    owned_primitive_rows = np.unique(
+        np.asarray(physical.membership_primitive_rows, dtype=np.int64)
+    )
+    sorted_owned_primitive_ids = np.sort(
+        np.asarray(physical.primitive_ids, dtype=np.int64)[owned_primitive_rows]
+    )
     mapper, _ = load_surface_maplet_mapper(Path(args.surface_mapper), device=str(args.device))
     pool_sizes, pool_weights = POOLING[str(args.pooling)]
     config = RadioFinalRegionConfig(pool_sizes=pool_sizes, pool_weights=pool_weights)
@@ -116,7 +122,7 @@ def main() -> None:
             null_similarity_center=0.35,
             null_similarity_scale=0.08,
         )
-        _, truth_null = contributor_multiscale_maplet_distribution(
+        _, truth_null = contributor_multiscale_in_map_probability(
             labels,
             physical,
             token_xy,
@@ -124,6 +130,7 @@ def main() -> None:
             token_width=int(raw.shape[2]),
             pool_sizes=pool_sizes,
             pool_weights=pool_weights,
+            sorted_owned_primitive_ids=sorted_owned_primitive_ids,
         )
         all_score.append(best.astype(np.float64))
         all_target.append(1.0 - truth_null.astype(np.float64))
@@ -144,6 +151,9 @@ def main() -> None:
             ),
             "pooling": str(args.pooling),
             "fit_support_mode": "all_tokens_exact_multiscale_masks",
+            "validity_target_algorithm": (
+                "exact_owned_contributor_mass_integral_image_v1"
+            ),
             "fit_image_ids": image_ids,
             "fit_trajectory_ids": sorted({value.split("/", 1)[0] for value in image_ids}),
             "stores_scores_or_query_features": False,

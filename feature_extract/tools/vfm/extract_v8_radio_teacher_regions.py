@@ -19,6 +19,7 @@ from feature_extract.vfm.surface_maplet_bank import (
     RadioFinalRegionConfig,
     encode_radio_final_regions,
 )
+from feature_extract.vfm.official_oof_protocol import ordered_id_sha256
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -26,6 +27,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--contributors", required=True)
     parser.add_argument("--image_root", required=True)
     parser.add_argument("--output_dir", required=True)
+    parser.add_argument("--summary_json", default="")
     parser.add_argument("--radio_repo", default="/root/.cache/torch/hub/NVlabs_RADIO_main")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--shard_index", type=int, default=0)
@@ -36,6 +38,9 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = _parse_args(argv)
+    summary_path = Path(args.summary_json) if str(args.summary_json) else None
+    if summary_path is not None and summary_path.exists() and not bool(args.force):
+        raise FileExistsError(f"refusing to overwrite teacher summary: {summary_path}")
     paths = sorted(Path(args.contributors).glob("*.npz"))
     if not 0 <= int(args.shard_index) < int(args.shard_count):
         raise ValueError("invalid teacher extraction shard")
@@ -52,6 +57,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         pool_sizes=(1, 3, 5, 9), pool_weights=(0.4, 0.3, 0.2, 0.1)
     )
     written = 0
+    image_ids = []
     for source in paths:
         with np.load(source, allow_pickle=False) as data:
             metadata = json.loads(str(data["metadata_json"].item()))
@@ -59,6 +65,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         token_path = Path(str(metadata["token_path"]))
         output_path = output_dir / (image_id.replace("/", "__") + ".npz")
         if output_path.exists() and not bool(args.force):
+            with np.load(output_path, allow_pickle=False) as existing:
+                existing_metadata = json.loads(str(existing["metadata_json"].item()))
+            if str(existing_metadata.get("image_id")) != image_id:
+                raise ValueError(f"teacher cache image mismatch: {output_path}")
+            image_ids.append(image_id)
             continue
         with np.load(token_path, allow_pickle=False) as data:
             raw = np.asarray(data["radio_final"], dtype=np.float32)
@@ -89,9 +100,27 @@ def main(argv: Sequence[str] | None = None) -> None:
             }, sort_keys=True)),
         )
         np.savez_compressed(output_path, **payload)
+        image_ids.append(image_id)
         written += 1
         print(json.dumps({"image_id": image_id, "written": written}), flush=True)
-    print(json.dumps({"processed": len(paths), "written": written, "output_dir": str(output_dir)}))
+    summary = {
+        "artifact_type": "v8_offline_radio_teacher_regions_shard_v1",
+        "processed": len(paths),
+        "written": written,
+        "output_dir": str(output_dir),
+        "shard_index": int(args.shard_index),
+        "shard_count": int(args.shard_count),
+        "image_ids": image_ids,
+        "image_ids_sha256": ordered_id_sha256(image_ids),
+        "teacher_names": ["dino_v3_7b", "sam3", "siglip2-g"],
+        "runtime_map_payload": False,
+        "stores_rgb": False,
+        "stores_image_path": False,
+    }
+    if summary_path is not None:
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+    print(json.dumps(summary, indent=2, sort_keys=True))
 
 
 if __name__ == "__main__":

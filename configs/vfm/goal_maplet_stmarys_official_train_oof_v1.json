@@ -1,0 +1,176 @@
+{
+  "artifact_type": "goal_maplet_official_train_oof_protocol_v1",
+  "benchmark": "CambridgeLandmarks/StMarysChurch",
+  "development": {
+    "confirmation_geometry_protocol": "fold_rebuilt_2dgs_excluding_held_query_trajectories",
+    "each_official_train_frame_is_oof_query_once": true,
+    "folds": [
+      {
+        "fold_id": "fold0",
+        "held_query_trajectories": [
+          "seq2"
+        ],
+        "mapping_count": 1135,
+        "mapping_image_ids_sha256": "3601c21e482bd58b52f08d090c8ebf80eda37f3ccf7b94a56a43d8a73e9f13a7",
+        "mapping_trajectories": [
+          "seq1",
+          "seq10",
+          "seq11",
+          "seq12",
+          "seq14",
+          "seq4",
+          "seq6",
+          "seq7",
+          "seq8",
+          "seq9"
+        ],
+        "query_count": 352,
+        "query_image_ids_sha256": "9bde409a7ccb2e500285d08abcbd4fed0e8f49c9eaf11bc2dca4dcff6f57e5d9"
+      },
+      {
+        "fold_id": "fold1",
+        "held_query_trajectories": [
+          "seq4"
+        ],
+        "mapping_count": 1158,
+        "mapping_image_ids_sha256": "1d459f16579dd3f28845605863958b73cd057665d42866a1f61be6119151e077",
+        "mapping_trajectories": [
+          "seq1",
+          "seq10",
+          "seq11",
+          "seq12",
+          "seq14",
+          "seq2",
+          "seq6",
+          "seq7",
+          "seq8",
+          "seq9"
+        ],
+        "query_count": 329,
+        "query_image_ids_sha256": "96165489965357df276f3e69660095a17187c5c8dadbe6d999b184309c633bf0"
+      },
+      {
+        "fold_id": "fold2",
+        "held_query_trajectories": [
+          "seq1",
+          "seq14",
+          "seq8"
+        ],
+        "mapping_count": 1206,
+        "mapping_image_ids_sha256": "e9c54c9a5d1a14132c9e0da32e2e868f7e48a762338c401653c5de3b59883f34",
+        "mapping_trajectories": [
+          "seq10",
+          "seq11",
+          "seq12",
+          "seq2",
+          "seq4",
+          "seq6",
+          "seq7",
+          "seq9"
+        ],
+        "query_count": 281,
+        "query_image_ids_sha256": "9d2af22706fc74caafbe0c28badb382b359b7ddf0cd0631ab8b103b205d65c23"
+      },
+      {
+        "fold_id": "fold3",
+        "held_query_trajectories": [
+          "seq12",
+          "seq7"
+        ],
+        "mapping_count": 1219,
+        "mapping_image_ids_sha256": "c374f5c359d8353a5669c2b9878e74a6772b6ee97e9d0bf5aa89cee2474e3de7",
+        "mapping_trajectories": [
+          "seq1",
+          "seq10",
+          "seq11",
+          "seq14",
+          "seq2",
+          "seq4",
+          "seq6",
+          "seq8",
+          "seq9"
+        ],
+        "query_count": 268,
+        "query_image_ids_sha256": "8b9cb44750d05104215e0a417ebcddb808facd23b426159a3d22cdad21c14365"
+      },
+      {
+        "fold_id": "fold4",
+        "held_query_trajectories": [
+          "seq10",
+          "seq11",
+          "seq6",
+          "seq9"
+        ],
+        "mapping_count": 1230,
+        "mapping_image_ids_sha256": "d91303523316152cb93abfa6f7e3c906418208e4f0189d04637c3099970430d1",
+        "mapping_trajectories": [
+          "seq1",
+          "seq12",
+          "seq14",
+          "seq2",
+          "seq4",
+          "seq7",
+          "seq8"
+        ],
+        "query_count": 257,
+        "query_image_ids_sha256": "7a8051b2300b8801852e619db1af9aaabaa95607aea591482f89647255db6e6d"
+      }
+    ],
+    "method": "five_fold_route_grouped_out_of_fold",
+    "screening_geometry_protocol": "fixed_full_train_2dgs_non_publishable_screening",
+    "uses_permanent_validation_split": false
+  },
+  "final_fit": {
+    "hyperparameters": "frozen_from_train_only_oof",
+    "test_feedback_allowed": false,
+    "train_count": 1487,
+    "training_data": "all_official_train"
+  },
+  "integrity": {
+    "extra_train_manifest_counts": {
+      "mapping_camera_manifest": 1487,
+      "mapping_depth_bank": 1487
+    },
+    "mapping_camera_manifest": "output/vfm/2dgs_surface/StMarysChurch/full_train/mainline_v3_feature_aligned/mapping_camera_manifest.json",
+    "mapping_depth_bank": "output/vfm/2dgs_surface/StMarysChurch/full_train/final_surface/mapping_depth_bank.json",
+    "official_train_test_disjoint": true,
+    "test_token_ids_equal_pose_ids": true,
+    "train_token_ids_equal_pose_ids": true
+  },
+  "official_test": {
+    "count": 530,
+    "historical_exposure": "The current project used this split in pre-G23 diagnostics; it is the standard benchmark test, not a newly untouched set.",
+    "image_ids_sha256": "3435ec1fb7134fb27a8f3863e5d70fe4d54ab007335fbb30c6eff9b1f1b9c46c",
+    "pose_file": "/hy-tmp/Cambridge_stdloc/StMarysChurch/dataset_test.txt",
+    "pose_file_sha256": "5dc0b9aa1aadeb9bccbd4f789a040cc20a32bcf743895f5943b0a7269475d3c4",
+    "token_manifest": "output/vfm_tokens/StMarysChurch/full_1024x576/test_manifest.json",
+    "token_manifest_sha256": "875b2b5d7124a440ff3e8a784229a2846a31aa01144e317289b896f950323bf3",
+    "trajectory_counts": {
+      "seq13": 350,
+      "seq3": 98,
+      "seq5": 82
+    },
+    "use": "frozen_final_evaluation_only"
+  },
+  "official_train": {
+    "count": 1487,
+    "image_ids_sha256": "5ed183ce657c244edd902165976b126a488a630512d29d2f50dd6f14905239c7",
+    "pose_file": "/hy-tmp/Cambridge_stdloc/StMarysChurch/dataset_train.txt",
+    "pose_file_sha256": "bbc8c42a193380d4525583e40509a380124e4e6afe9a4e8dc9ae5b67f140c774",
+    "token_manifest": "output/vfm_tokens/StMarysChurch/full_1024x576/train_manifest.json",
+    "token_manifest_sha256": "234d91b4d89b47c8f441f21669d3843e018cdfdf26e24ecaaf3f8a871ef16430",
+    "trajectory_counts": {
+      "seq1": 223,
+      "seq10": 88,
+      "seq11": 23,
+      "seq12": 188,
+      "seq14": 36,
+      "seq2": 352,
+      "seq4": 329,
+      "seq6": 48,
+      "seq7": 80,
+      "seq8": 22,
+      "seq9": 98
+    }
+  }
+}

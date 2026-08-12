@@ -15,13 +15,12 @@ mapping RGB + calibrated poses + clean 2DGS --offline only-->
   + typed geometry/continuity/co-visibility/context graph
 
 query RGB
-  -> RADIO-final all-token physical-maplet posterior
-  -> post-retrieval correlated-support grouping
-  -> parent/child surface posterior + typed graph configurations
-  -> fixed Top-16 coarse SE(3) modes
-  -> 2x anti-aliased full-scene canonical-field observation
-  -> orientation-equivariant RADIO Jacobian phase
-  -> low-capacity candidate posterior + explicit null
+  -> RADIO-final all-token physical-maplet evidence
+  -> multimodal SE(3)-basin proposal over typed map configurations
+  -> structural-equivalence prescreen + anchor-balanced quota
+  -> full-map physical-surface verification energy
+  -> adaptive shared-energy alignment with exact-score acceptance
+  -> post-selection success calibration + typed null/abstention
 ```
 
 The target prior stores only metric 2DGS geometry and bounded anonymous
@@ -33,8 +32,26 @@ matching, single-point cosine pose energy, or final point-correspondence PnP.
 
 ## Current Status
 
+G23 is the current paper protocol.  All 1,487 official training frames are
+used: trajectory groups define five outer folds, each query is evaluated only
+against a map, learned feature field and calibrators built without its held-out
+route, and the resulting out-of-fold predictions are the only inputs to
+hyperparameter selection and success-risk calibration.  The historical 17
+frames are an official-train stress subset, not a validation or test set.  The
+530 official test frames remain sealed until the complete candidate,
+refinement and abstention policy is frozen.  The executable contract and
+current limitations are recorded in the
+[G23 official-train OOF protocol](docs/vfm/g23_official_train_oof_protocol_20260811.md).
+G23 is deliberately defined as a proposal--verification--selection system,
+not as a normalized generative posterior over continuous SE(3).
+
 The [Goal-Maplet report](docs/vfm/goal_maplet_localization_v1.md) defines the
-active contracts, artifacts, oracle ladder and promotion decision. Exact clean
+historical artifacts, oracle ladder and promotion decisions. The
+[G21 P0 contract](docs/vfm/g21_p0_method_and_correctness_contract.md) freezes
+the paper-level proposal--verification--selection semantics, correctness gates,
+and reproducible two-GPU stress replay. The
+[P0 correctness results](docs/vfm/g21_p0_correctness_results_20260811.md)
+record the bug impact and candidate-budget ablations. Exact clean
 geometry and PFIR retrieval pass their current gates. On the trajectory-disjoint
 48-query development set, current Top-32 proposals contain a 0.253 m median
 oracle candidate and cover 97.92% within 1 m / 10 degrees.  The G17 exact
@@ -46,6 +63,22 @@ accuracy gates.  The deployable Top-1 therefore remains graph v9 at
 0.555/1.680 m, and the continuous RADIO surface-flow refiner remains closed.
 Goal-Maplet is an active research line, not a production or paper-ready
 accuracy claim.
+
+The [G22 view-field and basin audit](docs/vfm/g22_p1_view_field_and_basin_results_20260811.md)
+rejects three tempting capacity increases: a local visibility chart follows
+the wrong repeated facade, a rank-4 view-conditioned field improves held
+feature reconstruction by only 0.0088 cosine without changing localization,
+and SE(3) basin de-duplication cannot protect the frame00139 near state using
+additional correlated evidence. The subsequent
+[outer-feature-cross-fit likelihood audit](docs/vfm/g22_p1_outer_feature_crossfit_likelihood_results_20260811.md)
+also rejects the typed candidate/null model: it changes strict success from
+7/17 to 5/17 and 1 m/10 degree success from 11/17 to 7/17, while accepting the
+remaining catastrophe. Its confidence is explicitly not a calibrated success
+probability, the fixed physical 2DGS is not geometry-cross-fit, and the 17
+queries remain a development stress set. The exact-pool strict basin recall
+continues from 9/17 at Top-2 to 12/17 at Top-32, so the next method study is a
+frozen basin-aware adaptive shared-energy refinement policy on new fully
+rebuilt map/route folds, followed by untouched success-risk calibration.
 
 The earlier independent configuration logistic improves Dev48 median to
 0.515 m and catastrophic errors to 6.25%, but is also rejected because P90 is
@@ -324,7 +357,8 @@ provides a fast pose-conditioned fixed-grid VFM score from the sole canonical
 map field. As a replacement proposal ranker it is rejected: under the same
 2x/context Stage-C protocol the new pool does not raise the 17-query success
 ceiling, and direct old/new score fusion regresses. As a bounded continuous
-objective it is useful. A correspondence-free SE(3) coordinate trust region,
+objective it is useful. A hard-correspondence-free, PnP-free SE(3) coordinate
+trust region under the fixed-grid full-surface score,
 enabled only by a two-feature risk gate (same-query posterior peak and phase
 Top-2 margin), passes seq3/seq5/seq13 trajectory LOTO: strict success rises
 from 8/12 to 9/12 with 12/12 retained within 1 m and no catastrophe. Frozen
@@ -403,6 +437,10 @@ stored embedding, as the next required research module.
 - `feature_extract/tools/vfm/evaluate_goal_maplet_pose_modes.py`
 - `feature_extract/tools/vfm/verify_goal_maplet_pose_modes_with_surface_field.py`
 - `feature_extract/tools/vfm/build_goal_maplet_phase_survival_samples.py`
+- `feature_extract/tools/vfm/build_goal_maplet_surface_likelihood_samples.py`
+- `feature_extract/tools/vfm/train_goal_maplet_surface_pose_likelihood.py`
+- `feature_extract/tools/vfm/evaluate_goal_maplet_surface_likelihood_crossfit.py`
+- `feature_extract/tools/vfm/build_goal_maplet_view_conditioned_field.py`
 - `feature_extract/tools/vfm/evaluate_goal_maplet_phase_survival.py`
 - `feature_extract/tools/vfm/evaluate_goal_maplet_dual_band_phase_readout.py`
 - `feature_extract/tools/vfm/create_goal_maplet_phase_policy_v2.py`
@@ -434,6 +472,8 @@ stored embedding, as the next required research module.
 - `feature_extract/tools/vfm/evaluate_goal_maplet_latent_configuration.py`
 - `feature_extract/tools/vfm/train_goal_maplet_latent_safety_selector.py`
 - `feature_extract/tools/vfm/apply_goal_maplet_latent_safety_selector.py`
+- `scripts/run_goal_maplet_g21_p0_replay.sh`
+- `scripts/run_goal_maplet_g22_crossfit_likelihood.sh`
 
 ## Frozen V6 Code
 

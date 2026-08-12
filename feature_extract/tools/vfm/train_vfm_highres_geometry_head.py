@@ -304,15 +304,28 @@ def evaluate(
     }
 
 
-def _parse_args() -> argparse.Namespace:
+def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--train_geometry_manifest", required=True)
-    parser.add_argument("--eval_geometry_manifest", required=True)
+    parser.add_argument(
+        "--eval_geometry_manifest",
+        default="",
+        help=(
+            "Optional evaluation-only manifest. Leave empty for final all-train "
+            "fixed-epoch fitting; it never affects the saved checkpoint."
+        ),
+    )
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--layer_name", default="radio_final")
     parser.add_argument("--max_train_records", type=int, default=0)
     parser.add_argument("--max_eval_records", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument(
+        "--checkpoint_protocol",
+        choices=("fixed_epoch_no_selection",),
+        default="fixed_epoch_no_selection",
+        help="Always save the final fixed epoch; eval data never selects a checkpoint.",
+    )
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--hidden_channels", type=int, default=64)
     parser.add_argument("--architecture", default="shared", choices=("shared", "separate_decoders"))
@@ -330,11 +343,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--visualize", type=int, default=4)
     parser.add_argument("--seed", type=int, default=0)
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def main() -> None:
     args = _parse_args()
+    if int(args.epochs) <= 0:
+        raise ValueError("epochs must be positive")
     started = time.perf_counter()
     torch.manual_seed(int(args.seed))
     np.random.seed(int(args.seed))
@@ -346,13 +361,16 @@ def main() -> None:
         Path(args.train_geometry_manifest), int(args.max_train_records), args.layer_name,
         cache_in_memory=bool(args.cache_in_memory),
     )
-    eval_dataset = HighResGeometryDataset(
-        Path(args.eval_geometry_manifest), int(args.max_eval_records), args.layer_name,
-        cache_in_memory=bool(args.cache_in_memory),
+    eval_dataset = (
+        HighResGeometryDataset(
+            Path(args.eval_geometry_manifest), int(args.max_eval_records), args.layer_name,
+            cache_in_memory=bool(args.cache_in_memory),
+        )
+        if str(args.eval_geometry_manifest) else None
     )
     if len(train_dataset) == 0:
         raise ValueError("empty training geometry manifest")
-    if len(eval_dataset) == 0:
+    if eval_dataset is not None and len(eval_dataset) == 0:
         raise ValueError("empty eval geometry manifest")
     first = train_dataset[0]
     in_channels = int(first["token"].shape[0])
@@ -376,13 +394,16 @@ def main() -> None:
         collate_fn=_collate,
         pin_memory=device.type == "cuda",
     )
-    eval_loader = DataLoader(
-        eval_dataset,
-        batch_size=int(args.batch_size),
-        shuffle=False,
-        num_workers=int(args.num_workers),
-        collate_fn=_collate,
-        pin_memory=device.type == "cuda",
+    eval_loader = (
+        DataLoader(
+            eval_dataset,
+            batch_size=int(args.batch_size),
+            shuffle=False,
+            num_workers=int(args.num_workers),
+            collate_fn=_collate,
+            pin_memory=device.type == "cuda",
+        )
+        if eval_dataset is not None else None
     )
     baseline_depth = _train_depth_median(train_dataset)
     history = []
@@ -428,7 +449,13 @@ def main() -> None:
                 "train_valid_pixels": int(np.sum(valid_counts)),
             }
         )
-    metrics = evaluate(model, eval_loader, device, baseline_depth, output_dir=output_dir, visualize_limit=int(args.visualize))
+    metrics = (
+        evaluate(
+            model, eval_loader, device, baseline_depth, output_dir=output_dir,
+            visualize_limit=int(args.visualize),
+        )
+        if eval_loader is not None else None
+    )
     checkpoint_path = output_dir / "radio_highres_geometry_head.pt"
     torch.save(
         {
@@ -446,9 +473,17 @@ def main() -> None:
     )
     summary = {
         "stage": "radio_highres_geometry_head",
+        "checkpoint_protocol": str(args.checkpoint_protocol),
+        "production_contract": {
+            "all_train_manifest_records_used_for_fit": True,
+            "eval_manifest_used_for_gradient": False,
+            "eval_manifest_used_for_checkpoint_selection": False,
+            "eval_manifest_present": eval_dataset is not None,
+            "saved_checkpoint_epoch": int(args.epochs),
+        },
         "elapsed_sec": float(time.perf_counter() - started),
         "train_count": int(len(train_dataset)),
-        "eval_count": int(len(eval_dataset)),
+        "eval_count": int(len(eval_dataset)) if eval_dataset is not None else 0,
         "device": str(device),
         "architecture": str(args.architecture),
         "task": str(args.task),

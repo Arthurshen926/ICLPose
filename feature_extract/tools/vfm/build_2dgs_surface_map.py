@@ -52,6 +52,9 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--radio_final_manifest", required=True)
     parser.add_argument("--reference_pose_file", required=True)
     parser.add_argument("--camera_model_dir", required=True)
+    parser.add_argument(
+        "--require_camera_for_every_view", action="store_true",
+    )
     parser.add_argument("--gaussian_ply", default="")
     parser.add_argument("--radio_final_layer", default="radio_final")
     parser.add_argument("--matcha_joint_checkpoint", default="")
@@ -166,6 +169,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         for record in parse_cambridge_pose_file(Path(args.reference_pose_file))
     }
     camera_by_image = _load_camera_by_image(str(args.camera_model_dir))
+    missing_camera_ids = sorted(set(required_images) - set(camera_by_image))
+    if bool(args.require_camera_for_every_view) and missing_camera_ids:
+        raise ValueError(
+            f"camera model is absent for surface observation: {missing_camera_ids[0]}"
+        )
     primitive_quality = (
         load_2dgs_primitive_quality(Path(args.gaussian_ply))
         if str(args.gaussian_ply)
@@ -226,6 +234,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "radio_final_manifest": str(args.radio_final_manifest),
                 "reference_pose_file": str(args.reference_pose_file),
                 "camera_model_dir": str(args.camera_model_dir),
+                "require_camera_for_every_view": bool(args.require_camera_for_every_view),
+                "missing_camera_view_count": len(missing_camera_ids),
                 "gaussian_ply": str(args.gaussian_ply),
                 "matcha_joint_checkpoint": str(args.matcha_joint_checkpoint),
                 "surface_maplet_mapper_checkpoint": str(args.surface_maplet_mapper_checkpoint),
