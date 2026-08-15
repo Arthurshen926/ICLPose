@@ -89,6 +89,34 @@ from feature_extract.vfm.vfm_highres_geometry_head import (
 )
 
 
+def _mapping_view_anchor_diagnostics(view_posterior, anchor_count: int) -> dict[str, object]:
+    """Serialize a probability-conserving mapping-view prefix."""
+
+    take = min(max(int(anchor_count), 0), int(view_posterior.view_rows.size))
+    probabilities = np.asarray(view_posterior.probabilities, dtype=np.float64)
+    omitted = float(view_posterior.null_probability)
+    if take < probabilities.size:
+        omitted += float(np.sum(probabilities[take:]))
+    omitted = float(np.clip(omitted, 0.0, 1.0))
+    prefix = probabilities[:take]
+    if not np.all(np.isfinite(prefix)) or np.any(prefix < 0.0):
+        raise ValueError("mapping-view posterior contains invalid anchor probabilities")
+    if not np.isclose(float(np.sum(prefix)) + omitted, 1.0, atol=5e-6):
+        raise ValueError("mapping-view anchor prefix does not conserve probability mass")
+    return {
+        "anchor_view_rows": view_posterior.view_rows[:take].tolist(),
+        "anchor_scores": view_posterior.scores[:take].tolist(),
+        "anchor_probabilities": prefix.astype(np.float32).tolist(),
+        "anchor_null_probability": omitted,
+        "anchor_omitted_view_probability": float(max(
+            omitted - float(view_posterior.null_probability), 0.0,
+        )),
+        "anchor_probability_semantics": (
+            "full_mapping_view_probability_prefix_with_omitted_mass_to_null_v1"
+        ),
+    }
+
+
 def _camera(path: Path) -> ColmapCamera:
     with np.load(path, allow_pickle=False) as data:
         return ColmapCamera(
@@ -730,6 +758,9 @@ def main() -> None:
                         float(view_posterior.support_coverage[0])
                         if view_posterior.support_coverage.size else None
                     ),
+                    **_mapping_view_anchor_diagnostics(
+                        view_posterior, int(args.mapping_view_anchors),
+                    ),
                 }
             elif args.proposal_method in (
                 "geometry", "soft_geometry", "vfm_geometry", "primitive_vfm_geometry",
@@ -877,12 +908,9 @@ def main() -> None:
                 if view_posterior is not None:
                     proposal_diagnostics[name]["mapping_view_posterior"] = {
                         "typed_null_probability": float(view_posterior.null_probability),
-                        "anchor_view_rows": view_posterior.view_rows[
-                            : int(args.mapping_view_anchors)
-                        ].tolist(),
-                        "anchor_scores": view_posterior.scores[
-                            : int(args.mapping_view_anchors)
-                        ].tolist(),
+                        **_mapping_view_anchor_diagnostics(
+                            view_posterior, int(args.mapping_view_anchors),
+                        ),
                     }
             elif args.proposal_method == "joint":
                 actual_parent = name.startswith("actual_parent")

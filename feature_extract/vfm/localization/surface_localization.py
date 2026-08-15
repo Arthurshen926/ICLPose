@@ -16,6 +16,7 @@ from typing import Mapping, Sequence
 
 import numpy as np
 from scipy.spatial import cKDTree
+from scipy.special import logsumexp
 
 from feature_extract.vfm.query_to_3d_matching import camera_matrix_and_distortion
 from feature_extract.vfm.surface_maplet_bank import StableSurfaceAnchorMap, VfmSurfaceMapletBank
@@ -39,6 +40,113 @@ def _softmax_with_null(logits: np.ndarray, null_logits: np.ndarray) -> tuple[np.
     return probabilities[:, :-1].astype(np.float32), probabilities[:, -1].astype(np.float32)
 
 
+def _probability_conserving_top_l(
+    logits: np.ndarray,
+    valid: np.ndarray,
+    keep: int,
+    null_logits: np.ndarray | float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Select candidates while transferring omitted mass to the null state."""
+
+    full_logits = np.asarray(logits, dtype=np.float64)
+    full_valid = np.asarray(valid, dtype=bool)
+    if full_logits.ndim != 2 or full_valid.shape != full_logits.shape:
+        raise ValueError("logits and valid must share shape (Q, N)")
+    if int(keep) <= 0:
+        raise ValueError("keep must be positive")
+    null = np.asarray(null_logits, dtype=np.float64)
+    if null.ndim == 0:
+        null = np.full((full_logits.shape[0],), float(null), dtype=np.float64)
+    else:
+        null = null.reshape(-1)
+    if null.shape != (full_logits.shape[0],) or not np.isfinite(null).all():
+        raise ValueError("null_logits must be finite and have shape (Q,)")
+    safe_logits = np.where(
+        full_valid & np.isfinite(full_logits), full_logits, -np.inf
+    )
+    selected_count = min(int(keep), int(safe_logits.shape[1]))
+    order = np.argsort(-safe_logits, axis=1, kind="mergesort")
+    selected_indices = order[:, :selected_count].astype(np.int64, copy=False)
+    selected_logits = np.take_along_axis(safe_logits, selected_indices, axis=1)
+    selected_valid = np.take_along_axis(
+        full_valid & np.isfinite(full_logits), selected_indices, axis=1,
+    )
+    selected_mask = np.zeros_like(full_valid, dtype=bool)
+    if selected_count:
+        query_rows = np.arange(full_logits.shape[0], dtype=np.int64)[:, None]
+        selected_mask[query_rows, selected_indices] = selected_valid
+    omitted_logits = np.where(
+        (full_valid & np.isfinite(full_logits)) & ~selected_mask,
+        safe_logits, -np.inf,
+    )
+    omitted_log_mass = logsumexp(omitted_logits, axis=1)
+    probabilities, null_probabilities = _normalize_selected_logits_with_omitted_mass(
+        selected_logits, selected_valid, omitted_log_mass, null,
+    )
+    return (
+        selected_indices, selected_logits, probabilities, null_probabilities,
+        selected_valid,
+    )
+
+
+def _normalize_selected_logits_with_omitted_mass(
+    selected_logits: np.ndarray,
+    selected_valid: np.ndarray,
+    omitted_log_mass: np.ndarray | float,
+    null_logits: np.ndarray | float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Normalize retained logits while keeping externally computed omitted mass."""
+
+    selected = np.asarray(selected_logits, dtype=np.float64)
+    valid = np.asarray(selected_valid, dtype=bool)
+    if selected.ndim != 2 or valid.shape != selected.shape:
+        raise ValueError("selected logits and valid must share shape (Q, K)")
+    omitted = np.asarray(omitted_log_mass, dtype=np.float64)
+    omitted = (
+        np.full((selected.shape[0],), float(omitted), dtype=np.float64)
+        if omitted.ndim == 0 else omitted.reshape(-1)
+    )
+    null = np.asarray(null_logits, dtype=np.float64)
+    null = (
+        np.full((selected.shape[0],), float(null), dtype=np.float64)
+        if null.ndim == 0 else null.reshape(-1)
+    )
+    if (
+        omitted.shape != (selected.shape[0],)
+        or null.shape != (selected.shape[0],)
+        or not np.isfinite(omitted[~np.isneginf(omitted)]).all()
+        or not np.isfinite(null).all()
+    ):
+        raise ValueError("omitted/null logits have incompatible or non-finite values")
+    safe_selected = np.where(valid & np.isfinite(selected), selected, -np.inf)
+    effective_null = np.logaddexp(null, omitted)
+    joint_logits = np.concatenate([safe_selected, effective_null[:, None]], axis=1)
+    log_normalizer = logsumexp(joint_logits, axis=1)
+    probabilities = np.exp(safe_selected - log_normalizer[:, None])
+    probabilities[~valid] = 0.0
+    null_probabilities = np.exp(effective_null - log_normalizer)
+    return probabilities.astype(np.float32), null_probabilities.astype(np.float32)
+
+
+def _stable_top_indices(
+    logits: np.ndarray,
+    stable_ids: np.ndarray,
+    keep: int,
+) -> np.ndarray:
+    """Return deterministic descending logits with ID tie-breaking."""
+
+    values = np.asarray(logits, dtype=np.float64)
+    ids = np.asarray(stable_ids, dtype=np.int64).reshape(-1)
+    if values.ndim != 2 or ids.shape != (values.shape[1],):
+        raise ValueError("stable top-index inputs have incompatible shapes")
+    count = min(max(int(keep), 0), int(values.shape[1]))
+    if count == 0:
+        return np.zeros((values.shape[0], 0), dtype=np.int64)
+    tiled_ids = np.broadcast_to(ids[None, :], values.shape)
+    order = np.lexsort((tiled_ids, -values), axis=1)
+    return np.asarray(order[:, :count], dtype=np.int64)
+
+
 @dataclass(frozen=True)
 class SurfaceMapletMatchConfig:
     top_k: int = 8
@@ -52,6 +160,11 @@ class SurfaceMapletMatchConfig:
     maximum_layout_models: int = 4096
     maximum_support_views: int = 64
     maximum_layout_candidate_views: int = 32
+    # Layout is estimated from a wider raw-descriptor pool than the final
+    # returned Top-K.  Otherwise a geometrically consistent but descriptor-
+    # lower-ranked maplet can never be promoted by the very evidence intended
+    # to resolve repeated structure.
+    maximum_layout_candidate_maplets: int = 64
     maximum_layout_modes: int = 4
     enable_support_layout: bool = True
 
@@ -69,6 +182,7 @@ class SurfaceMapletMatchConfig:
         if (
             int(self.maximum_support_views) <= 0
             or int(self.maximum_layout_candidate_views) <= 0
+            or int(self.maximum_layout_candidate_maplets) <= 0
             or int(self.maximum_layout_modes) <= 0
         ):
             raise ValueError("support-view/layout-mode counts must be positive")
@@ -105,6 +219,15 @@ class SurfaceMapletMatchResult:
             raise ValueError("query-level maplet outputs have the wrong shape")
         if residuals.shape != candidate_ids.shape:
             raise ValueError("layout_residuals must have shape (Q, K)")
+        if (
+            np.any(~np.isfinite(probabilities))
+            or np.any(probabilities < 0.0)
+            or np.any(~np.isfinite(null))
+            or np.any((null < 0.0) | (null > 1.0))
+            or np.any(np.abs(np.sum(probabilities, axis=1) + null - 1.0) > 2e-5)
+            or np.any(probabilities[candidate_ids < 0] != 0.0)
+        ):
+            raise ValueError("maplet probability mass is invalid or not conserved")
         object.__setattr__(self, "candidate_maplet_ids", candidate_ids)
         object.__setattr__(self, "candidate_logits", logits)
         object.__setattr__(self, "candidate_probabilities", probabilities)
@@ -417,15 +540,20 @@ def match_radio_final_regions_to_maplets(
         + float(config.quality_prior_weight) * quality
         - float(config.variance_penalty_weight) * variance
     )
-    columns = np.argpartition(-logits_full, kth=keep - 1, axis=1)[:, :keep]
-    top_logits = np.take_along_axis(logits_full, columns, axis=1)
-    order = np.argsort(-top_logits, axis=1, kind="mergesort")
-    columns = np.take_along_axis(columns, order, axis=1)
-    base_logits = np.take_along_axis(logits_full, columns, axis=1)
-    candidate_ids = bank.maplet_ids[columns]
-
-    layout_residuals = np.full(candidate_ids.shape, np.inf, dtype=np.float32)
-    final_logits = np.asarray(base_logits, dtype=np.float64).copy()
+    # Use a wider raw pool to estimate the support layout.  The final Top-K is
+    # selected only after layout compatibility has been applied to that pool;
+    # raw candidates outside it remain valid fallback candidates with their
+    # descriptor-only logits.  This preserves a bounded cost while preventing
+    # an early Top-K cut from making layout evidence causally useless.
+    layout_keep = min(
+        len(bank),
+        max(int(keep), int(config.maximum_layout_candidate_maplets)),
+    )
+    layout_columns = _stable_top_indices(
+        logits_full, bank.maplet_ids, layout_keep
+    )
+    adjusted_logits_full = np.asarray(logits_full, dtype=np.float64).copy()
+    layout_residual_full = np.full(logits_full.shape, np.inf, dtype=np.float32)
     support_view: str | None = None
     matrix: np.ndarray | None = None
     translation: np.ndarray | None = None
@@ -444,42 +572,82 @@ def match_radio_final_regions_to_maplets(
             support_modes,
         ) = _best_support_layout(
             query_normalized,
-            columns,
-            base_logits,
+            layout_columns,
+            np.take_along_axis(logits_full, layout_columns, axis=1),
             bank,
             per_maplet_views,
             config,
         )
-        if (
+        # Competing support-layout modes are alternative explanations, not
+        # independent evidence.  Evaluate every retained mode and keep the
+        # best compatible one per query/maplet; falling back to a different
+        # mode would otherwise leak appearance evidence across repeated views.
+        layout_modes = list(support_modes)
+        if not layout_modes and (
             support_view is not None
             and matrix is not None
             and translation is not None
         ):
-            predicted = query_normalized @ matrix.T + translation
+            layout_modes = [(
+                str(support_view), float(support_score),
+                np.asarray(matrix, dtype=np.float64),
+                np.asarray(translation, dtype=np.float64),
+            )]
+        if layout_modes:
             for query_row in range(query_count):
-                for column in range(keep):
-                    maplet_row = int(columns[query_row, column])
-                    view_row = per_maplet_views[maplet_row].get(support_view)
-                    if view_row is None:
+                for column in range(layout_keep):
+                    maplet_row = int(layout_columns[query_row, column])
+                    mode_scores: list[tuple[float, float, str]] = []
+                    for mode_id, _mode_score, mode_matrix, mode_translation in (
+                        layout_modes
+                    ):
+                        view_row = per_maplet_views[maplet_row].get(str(mode_id))
+                        if view_row is None:
+                            continue
+                        predicted = (
+                            query_normalized[query_row] @ mode_matrix.T
+                            + mode_translation
+                        )
+                        support_xy = _normalized_xy(
+                            bank.view_token_xy[view_row],
+                            bank.view_grid_sizes[view_row],
+                        )
+                        residual = float(np.linalg.norm(predicted - support_xy))
+                        compatibility = max(
+                            0.0,
+                            1.0 - residual / float(config.layout_inlier_threshold),
+                        )
+                        mode_scores.append((compatibility, residual, str(mode_id)))
+                    if not mode_scores:
                         continue
-                    support_xy = _normalized_xy(
-                        bank.view_token_xy[view_row],
-                        bank.view_grid_sizes[view_row],
+                    compatibility, residual, _mode_id = max(
+                        mode_scores, key=lambda item: (
+                            item[0], -item[1], item[2],
+                        )
                     )
-                    residual = float(
-                        np.linalg.norm(predicted[query_row] - support_xy)
-                    )
-                    layout_residuals[query_row, column] = residual
-                    compatibility = max(
-                        0.0,
-                        1.0
-                        - residual / float(config.layout_inlier_threshold),
-                    )
-                    final_logits[query_row, column] += (
+                    layout_residual_full[query_row, maplet_row] = residual
+                    adjusted_logits_full[query_row, maplet_row] += (
                         float(config.layout_logit_weight) * compatibility
                     )
+    columns = _stable_top_indices(adjusted_logits_full, bank.maplet_ids, keep)
+    base_logits = np.take_along_axis(adjusted_logits_full, columns, axis=1)
+    candidate_ids = bank.maplet_ids[columns]
+    layout_residuals = np.take_along_axis(
+        layout_residual_full, columns, axis=1
+    )
+    selected_mask = np.zeros_like(adjusted_logits_full, dtype=bool)
+    selected_mask[np.arange(query_count)[:, None], columns] = True
+    omitted_log_mass = logsumexp(
+        np.where(~selected_mask, adjusted_logits_full, -np.inf), axis=1,
+    )
+    final_logits = np.asarray(base_logits, dtype=np.float64).copy()
     null_logits = np.full((query_count,), float(config.null_logit), dtype=np.float64)
-    probabilities, null_probabilities = _softmax_with_null(final_logits, null_logits)
+    probabilities, null_probabilities = _normalize_selected_logits_with_omitted_mass(
+        final_logits,
+        np.ones(final_logits.shape, dtype=bool),
+        omitted_log_mass,
+        null_logits,
+    )
     best_columns = np.argmax(probabilities, axis=1)
     best_probability = probabilities[np.arange(query_count), best_columns]
     selected = candidate_ids[np.arange(query_count), best_columns].copy()
@@ -738,6 +906,15 @@ class SurfaceAnchorCandidatePool:
         null = np.asarray(self.null_probabilities, dtype=np.float32).reshape(-1)
         if null.shape != (query_xy.shape[0],):
             raise ValueError("null_probabilities must have shape (Q,)")
+        if (
+            np.any(~np.isfinite(probabilities))
+            or np.any(probabilities < 0.0)
+            or np.any(~np.isfinite(null))
+            or np.any((null < 0.0) | (null > 1.0))
+            or np.any(np.abs(np.sum(probabilities, axis=1) + null - 1.0) > 2e-5)
+            or np.any(probabilities[~valid] != 0.0)
+        ):
+            raise ValueError("candidate probability mass is invalid or not conserved")
         object.__setattr__(self, "query_xy", query_xy)
         object.__setattr__(self, "anchor_ids", anchor_ids)
         object.__setattr__(self, "xyz", xyz)
@@ -925,34 +1102,45 @@ def build_vfm_surface_observation_candidate_pool(
     output_ids = np.full((query_count, int(top_l)), -1, dtype=np.int64)
     output_xyz = np.zeros((query_count, int(top_l), 3), dtype=np.float64)
     output_scores = np.full((query_count, int(top_l)), -np.inf, dtype=np.float32)
-    output_logits = np.full((query_count, int(top_l)), -np.inf, dtype=np.float64)
     valid = np.zeros((query_count, int(top_l)), dtype=bool)
+    output_probabilities = np.zeros((query_count, int(top_l)), dtype=np.float32)
+    output_null_probabilities = np.ones((query_count,), dtype=np.float32)
     for output_row, query_row in enumerate(ordered_query_rows):
         records = sorted(
             candidates_by_query[query_row],
             key=lambda item: (-item[0], item[1]),
         )
         used_centers: list[np.ndarray] = []
-        output_column = 0
+        unique_records: list[tuple[float, int, np.ndarray]] = []
         for score, observation_row, center in records:
             if any(float(np.linalg.norm(center - used)) < 0.01 for used in used_centers):
                 continue
+            used_centers.append(np.asarray(center, dtype=np.float64))
+            unique_records.append((score, observation_row, center))
+        if not unique_records:
+            continue
+        row_logits = np.asarray(
+            [item[0] / float(descriptor_temperature) for item in unique_records],
+            dtype=np.float64,
+        )[None, :]
+        selected, _selected_logits, probabilities, null_probabilities, selected_valid = (
+            _probability_conserving_top_l(
+                row_logits, np.ones(row_logits.shape, dtype=bool),
+                int(top_l), float(null_logit),
+            )
+        )
+        output_null_probabilities[output_row] = null_probabilities[0]
+        for output_column, source_column in enumerate(selected[0].tolist()):
+            if not bool(selected_valid[0, output_column]):
+                continue
+            score, observation_row, center = unique_records[int(source_column)]
             output_ids[output_row, output_column] = int(observation_row)
             output_xyz[output_row, output_column] = center
             output_scores[output_row, output_column] = float(score)
-            output_logits[output_row, output_column] = float(score) / float(
-                descriptor_temperature
-            )
+            output_probabilities[output_row, output_column] = probabilities[
+                0, output_column
+            ]
             valid[output_row, output_column] = True
-            used_centers.append(np.asarray(center, dtype=np.float64))
-            output_column += 1
-            if output_column >= int(top_l):
-                break
-    candidate_probabilities, null_probabilities = _softmax_with_null(
-        output_logits,
-        np.full((query_count,), float(null_logit), dtype=np.float64),
-    )
-    candidate_probabilities[~valid] = 0.0
     image_width, image_height = int(query_image_size[0]), int(query_image_size[1])
     query_rows_array = np.asarray(ordered_query_rows, dtype=np.int64)
     query_grid_xy = np.stack(
@@ -974,8 +1162,8 @@ def build_vfm_surface_observation_candidate_pool(
             anchor_ids=output_ids,
             xyz=output_xyz,
             descriptor_scores=output_scores,
-            candidate_probabilities=candidate_probabilities,
-            null_probabilities=null_probabilities,
+            candidate_probabilities=output_probabilities,
+            null_probabilities=output_null_probabilities,
             valid_mask=valid,
         ),
         tuple(item[1] for item in selected_views),
@@ -1219,7 +1407,11 @@ def build_surface_anchor_candidate_pool(
             null_probabilities=np.ones((query_count,), dtype=np.float32),
             valid_mask=np.zeros((query_count, 0), dtype=bool),
         )
-    per_anchor_scores = np.full((query_count, len(bank_rows)), -1.0, dtype=np.float32)
+    # Empty descriptor rows are unknown, not a weak descriptor.  Keeping them
+    # finite would let them enter the top-L pool and receive probability mass.
+    per_anchor_scores = np.full(
+        (query_count, len(bank_rows)), -np.inf, dtype=np.float32,
+    )
     for output_column, bank_row in enumerate(bank_rows):
         start, end = (
             int(descriptor_bank.descriptor_offsets[bank_row]),
@@ -1229,23 +1421,27 @@ def build_surface_anchor_candidate_pool(
             continue
         similarities = query.descriptors @ descriptor_bank.descriptors[start:end].T
         per_anchor_scores[:, output_column] = np.max(similarities, axis=1)
-    columns = np.argpartition(-per_anchor_scores, kth=keep - 1, axis=1)[:, :keep]
-    top_scores = np.take_along_axis(per_anchor_scores, columns, axis=1)
-    order = np.argsort(-top_scores, axis=1, kind="mergesort")
-    columns = np.take_along_axis(columns, order, axis=1)
+    columns, candidate_logits, probabilities, null_probabilities, valid = (
+        _probability_conserving_top_l(
+            per_anchor_scores / float(descriptor_temperature),
+            np.isfinite(per_anchor_scores),
+            keep,
+            float(null_logit),
+        )
+    )
     top_scores = np.take_along_axis(per_anchor_scores, columns, axis=1)
     bank_rows_array = np.asarray(bank_rows, dtype=np.int64)
     selected_bank_rows = bank_rows_array[columns]
     selected_anchor_ids = descriptor_bank.anchor_ids[selected_bank_rows]
-    anchor_rows = np.vectorize(lambda value: anchor_row_by_id[int(value)], otypes=[np.int64])(selected_anchor_ids)
+    anchor_rows = np.zeros(selected_anchor_ids.shape, dtype=np.int64)
+    for query_row, column in zip(*np.nonzero(valid)):
+        anchor_rows[query_row, column] = anchor_row_by_id[
+            int(selected_anchor_ids[query_row, column])
+        ]
+    selected_anchor_ids = selected_anchor_ids.copy()
+    selected_anchor_ids[~valid] = -1
     xyz = anchors.xyz[anchor_rows]
-    candidate_logits = top_scores / float(descriptor_temperature)
-    probabilities, null_probabilities = _softmax_with_null(
-        candidate_logits,
-        np.full((query_count,), float(null_logit), dtype=np.float32),
-    )
-    valid = np.isfinite(top_scores)
-    probabilities[~valid] = 0.0
+    xyz[~valid] = 0.0
     return SurfaceAnchorCandidatePool(
         query_xy=query.keypoints_xy,
         anchor_ids=selected_anchor_ids,
@@ -1356,8 +1552,9 @@ def build_maplet_conditioned_surface_anchor_candidate_pool(
     output_ids = np.full((query_count, int(top_l)), -1, dtype=np.int64)
     output_xyz = np.zeros((query_count, int(top_l), 3), dtype=np.float64)
     output_scores = np.full((query_count, int(top_l)), -np.inf, dtype=np.float32)
-    output_logits = np.full((query_count, int(top_l)), -np.inf, dtype=np.float64)
     valid = np.zeros((query_count, int(top_l)), dtype=bool)
+    output_probabilities = np.zeros((query_count, int(top_l)), dtype=np.float32)
+    output_null_probabilities = np.ones((query_count,), dtype=np.float32)
     null_logits = np.full((query_count,), float(null_logit), dtype=np.float64)
     for query_row, region_row_value in enumerate(np.asarray(nearest_region).reshape(-1).tolist()):
         region_row = int(region_row_value)
@@ -1370,13 +1567,20 @@ def build_maplet_conditioned_surface_anchor_candidate_pool(
             if probability < float(minimum_maplet_probability) or maplet_id not in maplet_anchor_ids:
                 continue
             maplet_prior[maplet_id] = max(probability, 1e-8)
-        candidate_rows: list[tuple[int, int, float, float | None]] = []
+        # An anchor can belong to several retrieved maplets.  It remains one
+        # metric identity; choose the strongest maplet explanation rather than
+        # letting duplicate membership multiply its probability.
+        candidate_rows_by_anchor: dict[int, tuple[int, int, float, float | None]] = {}
         for maplet_id, prior in maplet_prior.items():
             for anchor_id_value in maplet_anchor_ids[maplet_id].tolist():
                 anchor_id = int(anchor_id_value)
                 descriptor_row = descriptor_row_by_id.get(anchor_id)
                 anchor_row = anchor_row_by_id.get(anchor_id)
                 if descriptor_row is None or anchor_row is None:
+                    continue
+                if int(descriptor_bank.descriptor_offsets[descriptor_row]) == int(
+                    descriptor_bank.descriptor_offsets[descriptor_row + 1]
+                ):
                     continue
                 spatial_distance = None
                 if predicted_support_xy is not None:
@@ -1388,7 +1592,22 @@ def build_maplet_conditioned_surface_anchor_candidate_pool(
                     )
                     if spatial_distance > float(maximum_support_distance):
                         continue
-                candidate_rows.append((descriptor_row, anchor_row, prior, spatial_distance))
+                current = candidate_rows_by_anchor.get(anchor_id)
+                proposed = (descriptor_row, anchor_row, prior, spatial_distance)
+                if current is None or (
+                    float(prior),
+                    -float("inf") if spatial_distance is None else -float(spatial_distance),
+                    -int(anchor_id),
+                ) > (
+                    float(current[2]),
+                    -float("inf") if current[3] is None else -float(current[3]),
+                    -int(anchor_id),
+                ):
+                    candidate_rows_by_anchor[anchor_id] = proposed
+        candidate_rows = [
+            candidate_rows_by_anchor[anchor_id]
+            for anchor_id in sorted(candidate_rows_by_anchor)
+        ]
         if not candidate_rows:
             continue
         logits: list[float] = []
@@ -1413,27 +1632,39 @@ def build_maplet_conditioned_surface_anchor_candidate_pool(
             if spatial_distance is not None:
                 logit -= 0.5 * (float(spatial_distance) / float(support_spatial_sigma)) ** 2
             logits.append(logit)
-        order = np.argsort(-np.asarray(logits), kind="mergesort")[: int(top_l)]
-        for output_column, candidate_index in enumerate(order.tolist()):
-            descriptor_row, anchor_row, _prior, _distance = candidate_rows[int(candidate_index)]
+        null_logits[query_row] += float(maplet_prior_weight) * np.log(
+            max(float(maplet_match.null_probabilities[region_row]), 1e-8)
+        )
+        selected, _selected_logits, probabilities, null_probabilities, selected_valid = (
+            _probability_conserving_top_l(
+                np.asarray(logits, dtype=np.float64)[None, :],
+                np.ones((1, len(logits)), dtype=bool),
+                int(top_l),
+                float(null_logits[query_row]),
+            )
+        )
+        output_null_probabilities[query_row] = null_probabilities[0]
+        for output_column, candidate_index in enumerate(selected[0].tolist()):
+            if not bool(selected_valid[0, output_column]):
+                continue
+            descriptor_row, anchor_row, _prior, _distance = candidate_rows[
+                int(candidate_index)
+            ]
             anchor_id = int(descriptor_bank.anchor_ids[descriptor_row])
             output_ids[query_row, output_column] = anchor_id
             output_xyz[query_row, output_column] = anchors.xyz[anchor_row]
             output_scores[query_row, output_column] = float(local_scores[int(candidate_index)])
-            output_logits[query_row, output_column] = float(logits[int(candidate_index)])
+            output_probabilities[query_row, output_column] = probabilities[
+                0, output_column
+            ]
             valid[query_row, output_column] = True
-        null_logits[query_row] += float(maplet_prior_weight) * np.log(
-            max(float(maplet_match.null_probabilities[region_row]), 1e-8)
-        )
-    probabilities, null_probabilities = _softmax_with_null(output_logits, null_logits)
-    probabilities[~valid] = 0.0
     return SurfaceAnchorCandidatePool(
         query_xy=query.keypoints_xy,
         anchor_ids=output_ids,
         xyz=output_xyz,
         descriptor_scores=output_scores,
-        candidate_probabilities=probabilities,
-        null_probabilities=null_probabilities,
+        candidate_probabilities=output_probabilities,
+        null_probabilities=output_null_probabilities,
         valid_mask=valid,
     )
 
@@ -1831,8 +2062,9 @@ def build_seeded_surface_anchor_candidate_pool(
     output_ids = np.full((query_count, int(top_l)), -1, dtype=np.int64)
     output_xyz = np.zeros((query_count, int(top_l), 3), dtype=np.float64)
     output_scores = np.full((query_count, int(top_l)), -np.inf, dtype=np.float32)
-    output_logits = np.full((query_count, int(top_l)), -np.inf, dtype=np.float64)
     valid = np.zeros((query_count, int(top_l)), dtype=bool)
+    output_probabilities = np.zeros((query_count, int(top_l)), dtype=np.float32)
+    output_null_probabilities = np.ones((query_count,), dtype=np.float32)
     anchor_row_by_id = anchors.row_by_id()
     descriptor_row_by_id = {
         int(anchor_id): int(row)
@@ -1874,27 +2106,38 @@ def build_seeded_surface_anchor_candidate_pool(
                 logit += float(seed_prior_logit)
             candidate_records.append((logit, local_score, anchor_id, anchor_row))
         candidate_records.sort(key=lambda item: (-item[0], item[2]))
-        for output_column, (logit, local_score, anchor_id, anchor_row) in enumerate(
-            candidate_records[: int(top_l)]
-        ):
+        if not candidate_records:
+            continue
+        full_logits = np.asarray(
+            [record[0] for record in candidate_records], dtype=np.float64,
+        )[None, :]
+        selected, _selected_logits, probabilities, null_probabilities, selected_valid = (
+            _probability_conserving_top_l(
+                full_logits, np.ones(full_logits.shape, dtype=bool),
+                int(top_l), float(null_logit),
+            )
+        )
+        output_null_probabilities[query_row] = null_probabilities[0]
+        for output_column, source_column in enumerate(selected[0].tolist()):
+            if not bool(selected_valid[0, output_column]):
+                continue
+            _logit, local_score, anchor_id, anchor_row = candidate_records[
+                int(source_column)
+            ]
             output_ids[query_row, output_column] = anchor_id
             output_xyz[query_row, output_column] = anchors.xyz[anchor_row]
             output_scores[query_row, output_column] = local_score
-            output_logits[query_row, output_column] = logit
+            output_probabilities[query_row, output_column] = probabilities[
+                0, output_column
+            ]
             valid[query_row, output_column] = True
-
-    probabilities, null_probabilities = _softmax_with_null(
-        output_logits,
-        np.full((query_count,), float(null_logit), dtype=np.float64),
-    )
-    probabilities[~valid] = 0.0
     return SurfaceAnchorCandidatePool(
         query_xy=query.keypoints_xy,
         anchor_ids=output_ids,
         xyz=output_xyz,
         descriptor_scores=output_scores,
-        candidate_probabilities=probabilities,
-        null_probabilities=null_probabilities,
+        candidate_probabilities=output_probabilities,
+        null_probabilities=output_null_probabilities,
         valid_mask=valid,
     )
 
@@ -2028,36 +2271,47 @@ def build_pose_guided_surface_anchor_candidate_pool(
     output_ids = np.full((query_count, int(top_l)), -1, dtype=np.int64)
     output_xyz = np.zeros((query_count, int(top_l), 3), dtype=np.float64)
     output_scores = np.full((query_count, int(top_l)), -np.inf, dtype=np.float32)
-    output_logits = np.full((query_count, int(top_l)), -np.inf, dtype=np.float64)
     valid = np.zeros((query_count, int(top_l)), dtype=bool)
+    output_probabilities = np.zeros((query_count, int(top_l)), dtype=np.float32)
+    output_null_probabilities = np.ones((query_count,), dtype=np.float32)
     for output_row, query_row in enumerate(ordered_query_rows):
         records = sorted(
             candidates_by_query[query_row],
             key=lambda item: (-item[0], int(descriptor_bank.anchor_ids[item[2]])),
         )
-        for output_column, (logit, local_score, descriptor_row, anchor_row) in enumerate(
-            records[: int(top_l)]
-        ):
+        full_logits = np.asarray(
+            [record[0] for record in records], dtype=np.float64,
+        )[None, :]
+        selected, _selected_logits, probabilities, null_probabilities, selected_valid = (
+            _probability_conserving_top_l(
+                full_logits, np.ones(full_logits.shape, dtype=bool),
+                int(top_l), float(null_logit),
+            )
+        )
+        output_null_probabilities[output_row] = null_probabilities[0]
+        for output_column, source_column in enumerate(selected[0].tolist()):
+            if not bool(selected_valid[0, output_column]):
+                continue
+            _logit, local_score, descriptor_row, anchor_row = records[
+                int(source_column)
+            ]
             output_ids[output_row, output_column] = int(
                 descriptor_bank.anchor_ids[descriptor_row]
             )
             output_xyz[output_row, output_column] = anchors.xyz[anchor_row]
             output_scores[output_row, output_column] = local_score
-            output_logits[output_row, output_column] = logit
+            output_probabilities[output_row, output_column] = probabilities[
+                0, output_column
+            ]
             valid[output_row, output_column] = True
-    probabilities, null_probabilities = _softmax_with_null(
-        output_logits,
-        np.full((query_count,), float(null_logit), dtype=np.float64),
-    )
-    probabilities[~valid] = 0.0
     rows = np.asarray(ordered_query_rows, dtype=np.int64)
     return SurfaceAnchorCandidatePool(
         query_xy=query.keypoints_xy[rows],
         anchor_ids=output_ids,
         xyz=output_xyz,
         descriptor_scores=output_scores,
-        candidate_probabilities=probabilities,
-        null_probabilities=null_probabilities,
+        candidate_probabilities=output_probabilities,
+        null_probabilities=output_null_probabilities,
         valid_mask=valid,
     )
 
@@ -2472,10 +2726,19 @@ def generate_grouped_surface_pose_hypotheses(
 
     generated: list[tuple[np.ndarray, str]] = []
     fit_rows = np.flatnonzero(fit)
-    top_columns = np.argmax(pool.candidate_probabilities, axis=1)
-    top_order = fit_rows[
+    positive_probability = pool.valid_mask & (pool.candidate_probabilities > 0.0)
+    top_columns = np.argmax(
+        np.where(positive_probability, pool.candidate_probabilities, -np.inf),
+        axis=1,
+    )
+    positive_fit_rows = fit_rows[
+        np.any(positive_probability[fit_rows], axis=1)
+    ]
+    top_order = positive_fit_rows[
         np.argsort(
-            -pool.candidate_probabilities[fit_rows, top_columns[fit_rows]],
+            -pool.candidate_probabilities[
+                positive_fit_rows, top_columns[positive_fit_rows]
+            ],
             kind="mergesort",
         )
     ]
@@ -2501,9 +2764,13 @@ def generate_grouped_surface_pose_hypotheses(
     rng = np.random.default_rng(int(config.random_seed))
     group_mass = np.sum(pool.candidate_probabilities, axis=1)
     fit_weights = group_mass[fit_rows].astype(np.float64)
-    fit_weights /= max(float(np.sum(fit_weights)), 1e-12)
+    fit_weight_total = float(np.sum(fit_weights))
+    if fit_weight_total > 0.0:
+        fit_weights /= fit_weight_total
     sample_size = min(int(config.minimal_sample_size), len(fit_rows))
-    for _iteration in range(int(config.hypothesis_count)):
+    for _iteration in range(
+        int(config.hypothesis_count) if fit_weight_total > 0.0 else 0
+    ):
         sampled_rows = rng.choice(fit_rows, size=sample_size, replace=False, p=fit_weights)
         sampled_columns = []
         used: set[int] = set()
@@ -2517,21 +2784,20 @@ def generate_grouped_surface_pose_hypotheses(
             probabilities = np.maximum(probabilities, 0.0)
             positive = probabilities > 0.0
             positive_columns = valid_columns[positive]
-            zero_columns = valid_columns[~positive]
-            if positive_columns.size:
-                positive_probabilities = probabilities[positive]
-                positive_probabilities /= float(np.sum(positive_probabilities))
-                sampled_positive = rng.choice(
-                    positive_columns,
-                    size=len(positive_columns),
-                    replace=False,
-                    p=positive_probabilities,
-                )
-            else:
-                sampled_positive = np.zeros((0,), dtype=np.int64)
-            column_order = np.concatenate(
-                [sampled_positive, rng.permutation(zero_columns)]
+            if not positive_columns.size:
+                valid_sample = False
+                break
+            positive_probabilities = probabilities[positive]
+            positive_probabilities /= float(np.sum(positive_probabilities))
+            sampled_positive = rng.choice(
+                positive_columns,
+                size=len(positive_columns),
+                replace=False,
+                p=positive_probabilities,
             )
+            # Zero-probability placeholders are not evidence and must never
+            # be selected merely to satisfy the four-point sample size.
+            column_order = sampled_positive
             chosen = next(
                 (int(column) for column in column_order if int(pool.anchor_ids[row, column]) not in used),
                 None,

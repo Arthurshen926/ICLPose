@@ -17,6 +17,11 @@ from feature_extract.vfm.localization_goal_maplet.canonical_field import (
 from feature_extract.vfm.localization_goal_maplet.canonical_codec import CanonicalRadioCodec
 from feature_extract.vfm.localization_goal_maplet.lineage import file_sha256
 from feature_extract.vfm.localization_goal_maplet.physical_map import GoalMapletPhysicalMap
+from feature_extract.vfm.localization_goal_maplet.retrieval_surface_metrics import (
+    COORDINATE_CONTRACT,
+    LEGACY_COORDINATE_CONTRACT,
+    load_contributors_in_radio_coordinates,
+)
 
 
 TEACHER_NAMES = ("dino_v3_7b", "sam3", "siglip2-g")
@@ -130,6 +135,14 @@ def main() -> None:
     parser.add_argument("--teacher_cache", default="")
     parser.add_argument("--teacher_dimensions", type=int, default=32)
     parser.add_argument("--teacher_quality_floor", type=float, default=0.25)
+    parser.add_argument(
+        "--legacy_pinhole_as_raw_diagnostic",
+        action="store_true",
+        help=(
+            "diagnostic-only control that reproduces the old coordinate-misaligned "
+            "pinhole-contributor to raw-RADIO fusion"
+        ),
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
@@ -163,6 +176,7 @@ def main() -> None:
     teacher_sum: dict[str, np.ndarray] | None = None
     teacher_view_count: np.ndarray | None = None
     teacher_cache_hash = hashlib.sha256()
+    coordinate_audits: list[dict[str, object]] = []
     if teacher_root is not None:
         dimensions = int(args.teacher_dimensions)
         if dimensions <= 0:
@@ -178,9 +192,11 @@ def main() -> None:
                 raise ValueError(f"missing offline teacher cache: {teacher_path}")
             teacher_cache_hash.update(teacher_path.name.encode("utf-8"))
             teacher_cache_hash.update(bytes.fromhex(file_sha256(teacher_path)))
-            with np.load(path, allow_pickle=False) as data:
-                ids = np.asarray(data["topk_ids"], dtype=np.int64)
-                weights = np.asarray(data["topk_weights"], dtype=np.float32)
+            labels, coordinate_audit = load_contributors_in_radio_coordinates(
+                path,
+                legacy_pinhole_as_raw_diagnostic=bool(args.legacy_pinhole_as_raw_diagnostic),
+            )
+            ids, weights = labels.topk_primitive_ids, labels.topk_weights
             with np.load(Path(str(metadata["token_path"])), allow_pickle=False) as data:
                 raw_shape = tuple(np.asarray(data["radio_final"]).shape[1:])
             rows, mass, contributing_pixel, starts, token_x, token_y = _pixel_layout(
@@ -211,9 +227,12 @@ def main() -> None:
     quality_values: list[np.ndarray] = []
     teacher_similarity_values: dict[str, list[np.ndarray]] = {name: [] for name in TEACHER_NAMES}
     for path, metadata in eligible:
-        with np.load(path, allow_pickle=False) as data:
-            ids = np.asarray(data["topk_ids"], dtype=np.int64)
-            weights = np.asarray(data["topk_weights"], dtype=np.float32)
+        labels, coordinate_audit = load_contributors_in_radio_coordinates(
+            path,
+            legacy_pinhole_as_raw_diagnostic=bool(args.legacy_pinhole_as_raw_diagnostic),
+        )
+        ids, weights = labels.topk_primitive_ids, labels.topk_weights
+        coordinate_audits.append(coordinate_audit)
         trajectory = str(metadata["trajectory_id"])
         with np.load(Path(str(metadata["token_path"])), allow_pickle=False) as data:
             raw = np.asarray(data["radio_final"], dtype=np.float32)
@@ -291,6 +310,13 @@ def main() -> None:
             "canonical_codec_sha256": codec.content_sha256 if codec is not None else None,
             "retrieval_mapper_is_regenerable_readout": bool(args.feature_space != "retrieval_mapper"),
             "surface_mapper_file_sha256": file_sha256(Path(args.surface_mapper)),
+            "contributor_to_radio_coordinate_contract": (
+                LEGACY_COORDINATE_CONTRACT
+                if args.legacy_pinhole_as_raw_diagnostic
+                else COORDINATE_CONTRACT
+            ),
+            "coordinate_correct": bool(not args.legacy_pinhole_as_raw_diagnostic),
+            "promotion_eligible": bool(not args.legacy_pinhole_as_raw_diagnostic),
             "mapping_image_count": int(image_count),
             "mapping_trajectory_ids": sorted(trajectories),
             "contributor_geometry_source_sha256": sorted(geometry_hashes),
@@ -327,6 +353,27 @@ def main() -> None:
         "child_nonempty_fraction": float(np.mean(readout.child_coverage > 0.0)),
         "child_coverage_median": float(np.median(readout.child_coverage)),
         "storage_contract": dict(field.metadata),
+        "coordinate_audit": {
+            "coordinate_contract": (
+                LEGACY_COORDINATE_CONTRACT
+                if args.legacy_pinhole_as_raw_diagnostic
+                else COORDINATE_CONTRACT
+            ),
+            "view_count": int(len(coordinate_audits)),
+            "camera_model_ids": sorted({int(value["camera_model_id"]) for value in coordinate_audits}),
+            "minimum_valid_raw_sample_fraction": (
+                float(min(float(value["valid_raw_sample_fraction"]) for value in coordinate_audits))
+                if coordinate_audits and not args.legacy_pinhole_as_raw_diagnostic else None
+            ),
+            "maximum_inverse_roundtrip_residual_contributor_px": (
+                float(max(float(value["maximum_inverse_roundtrip_residual_contributor_px"]) for value in coordinate_audits))
+                if coordinate_audits and not args.legacy_pinhole_as_raw_diagnostic else None
+            ),
+            "maximum_pinhole_to_raw_displacement_contributor_px": (
+                float(max(float(value["maximum_pinhole_to_raw_displacement_contributor_px"]) for value in coordinate_audits))
+                if coordinate_audits and not args.legacy_pinhole_as_raw_diagnostic else None
+            ),
+        },
         "output_field": str(output),
         "teacher_quality": (
             {

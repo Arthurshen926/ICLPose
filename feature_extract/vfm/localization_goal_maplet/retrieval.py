@@ -104,6 +104,47 @@ def retrieve_maplet_posterior_decomposed(
     query = query / np.maximum(np.linalg.norm(query, axis=1, keepdims=True), 1e-8)
     map_feature = map_feature / np.maximum(np.linalg.norm(map_feature, axis=1, keepdims=True), 1e-8)
     score = query @ map_feature.T
+    return retrieve_maplet_posterior_from_scores(
+        score,
+        identifiers,
+        valid,
+        maximum_candidates=maximum_candidates,
+        temperature=temperature,
+        null_similarity_center=null_similarity_center,
+        null_similarity_scale=null_similarity_scale,
+    )
+
+
+def retrieve_maplet_posterior_from_scores(
+    similarity: np.ndarray,
+    maplet_ids: np.ndarray,
+    valid_maplets: np.ndarray,
+    *,
+    maximum_candidates: int,
+    temperature: float,
+    null_similarity_center: float,
+    null_similarity_scale: float,
+) -> SparseMapletPosterior:
+    """Convert one score per physical parent into a calibrated posterior.
+
+    Keeping this probability step separate lets a parent use several anonymous
+    RADIO modes while remaining one mutually-exclusive physical event.  It
+    prevents repeated modes from receiving repeated softmax prior mass.
+    """
+
+    score = np.asarray(similarity, dtype=np.float64)
+    identifiers = np.asarray(maplet_ids, dtype=np.int64).reshape(-1)
+    valid = np.asarray(valid_maplets, dtype=bool).reshape(-1)
+    if (
+        score.ndim != 2
+        or score.shape[1] != identifiers.size
+        or valid.shape != identifiers.shape
+        or not np.any(valid)
+        or int(maximum_candidates) <= 0
+        or np.any(~np.isfinite(score[:, valid]))
+    ):
+        raise ValueError("invalid precomputed maplet similarity")
+    score = score.copy()
     score[:, ~valid] = -np.inf
     count = min(int(maximum_candidates), int(np.sum(valid)))
     columns = np.argpartition(-score, kth=count - 1, axis=1)[:, :count]

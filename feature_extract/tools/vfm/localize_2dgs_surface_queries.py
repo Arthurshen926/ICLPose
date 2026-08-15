@@ -554,6 +554,19 @@ def _fixed_pose_evidence(
     return float(score / max(len(pool), 1)), inlier_count
 
 
+def _fixed_evidence_is_usable(
+    score: float,
+    inlier_count: int,
+    config: SurfacePoseConfig,
+) -> bool:
+    """Require independent fixed-map support before promoting a pose mode."""
+
+    return bool(
+        np.isfinite(float(score))
+        and int(inlier_count) >= int(config.minimum_selected_inliers)
+    )
+
+
 def _feature_pose_anchor_rows(
     *,
     candidate_anchor_ids: Sequence[int],
@@ -705,8 +718,14 @@ def _feature_map_pose_evidence(
                     dtype=bool,
                 )
             ]
-            if len(mode_rows):
-                descriptor_rows = mode_rows
+            # A mode-specific hypothesis with no support descriptor is
+            # missing evidence.  Falling back to descriptors from another
+            # view mode leaks appearance across competing explanations and
+            # makes repeated structures look artificially certain.
+            if not len(mode_rows):
+                mixture_log_match.append(float(np.log(1e-3)))
+                continue
+            descriptor_rows = mode_rows
         edge_similarity = (
             descriptor_bank.descriptors[descriptor_rows]
             @ query_descriptors[query_row]
@@ -774,6 +793,41 @@ def _strict_pose_gate_group_count(
     )
 
 
+def _surface_pose_gate_passes(
+    matcher_diagnostics: Mapping[str, object],
+    *,
+    minimum_confident_groups: int,
+    maximum_mean_null_probability: float,
+) -> tuple[bool, str]:
+    """Require both conditional identity and absolute retained mass.
+
+    Conditioning on ``candidate / (candidate + null)`` is useful for deciding
+    whether a group is *matchable*, but it is not sufficient for starting PnP:
+    a group with candidate mass 1e-6 and null mass 0.999999 would otherwise
+    look perfectly confident after conditioning.  The absolute null mass is
+    therefore a separate, conservative gate.  Keeping the two tests separate
+    also makes the reason for an abstention auditable.
+    """
+
+    minimum = int(minimum_confident_groups)
+    maximum_null = float(maximum_mean_null_probability)
+    if minimum <= 0 or not 0.0 <= maximum_null <= 1.0:
+        raise ValueError("pose-gate limits are invalid")
+    confident = int(
+        matcher_diagnostics.get("conditionally_confident_group_count", 0)
+    )
+    mean_null = float(
+        matcher_diagnostics.get("mean_null_probability", 1.0)
+    )
+    if not np.isfinite(mean_null):
+        return False, "nonfinite_mean_null_probability"
+    if confident < minimum:
+        return False, "insufficient_conditionally_confident_groups"
+    if mean_null > maximum_null:
+        return False, "absolute_null_mass_gate"
+    return True, "passed"
+
+
 def _pose_projected_anchor_measurements(
     *,
     pose_w2c: np.ndarray,
@@ -819,8 +873,9 @@ def _pose_projected_anchor_measurements(
                     dtype=bool,
                 )
             ]
-            if len(mode_rows):
-                descriptor_rows = mode_rows
+            if not len(mode_rows):
+                continue
+            descriptor_rows = mode_rows
         weights = np.maximum(
             descriptor_bank.descriptor_quality[descriptor_rows], 1e-8
         )
@@ -1228,9 +1283,14 @@ def main(argv: Sequence[str] | None = None) -> None:
                 if len(anchor_pool)
                 else 1.0
             )
-            set_pose_gate_passed = bool(
-                confident_set_groups
-                >= int(args.set_pose_minimum_confident_groups)
+            set_pose_gate_passed, set_pose_gate_reason = _surface_pose_gate_passes(
+                matcher_diagnostics,
+                minimum_confident_groups=int(
+                    args.set_pose_minimum_confident_groups
+                ),
+                maximum_mean_null_probability=float(
+                    args.set_pose_maximum_mean_null
+                ),
             )
             if set_pose_gate_passed:
                 initial_result = generate_grouped_surface_pose_hypotheses(
@@ -1245,7 +1305,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                     verification_mask=np.zeros(
                         (len(anchor_pool),), dtype=bool
                     ),
-                    failure_reason="set_matcher_confidence_gate",
+                    failure_reason=f"set_matcher_confidence_gate:{set_pose_gate_reason}",
                 )
             initial_pose_runtime = time.time() - stage_started
             stage_started = time.time()
@@ -1267,7 +1327,21 @@ def main(argv: Sequence[str] | None = None) -> None:
                 )
             )
             fixed_pool_runtime = time.time() - stage_started
-            result = initial_result
+            # Do not let a PnP-generated success escape before it has passed
+            # the independent fixed-map evidence gate below.  The initial
+            # result is only a proposal at this point.
+            result = (
+                initial_result
+                if not initial_result.success
+                else SurfacePoseResult(
+                    success=False,
+                    pose_w2c=np.eye(4, dtype=np.float64),
+                    hypotheses=(),
+                    fit_mask=initial_result.fit_mask,
+                    verification_mask=initial_result.verification_mask,
+                    failure_reason="fixed_map_evidence_gate",
+                )
+            )
             selection_pool = fixed_verification_pool
             branch = initial_sparse_branch
             layout_pool_size = 0
@@ -1330,7 +1404,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                 camera,
                 pose_config,
             )
-            if initial_result.success:
+            if initial_result.success and _fixed_evidence_is_usable(
+                initial_fixed_score, initial_fixed_inliers, pose_config
+            ):
                 pose_candidates.append(
                     (
                         initial_fixed_score,
@@ -1465,7 +1541,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                     mode_diagnostic["fixed_evidence_inliers"] = int(
                         fixed_inliers
                     )
-                    if layout_result.success:
+                    if layout_result.success and _fixed_evidence_is_usable(
+                        fixed_score, fixed_inliers, pose_config
+                    ):
                         pose_candidates.append(
                             (
                                 fixed_score,
@@ -1596,7 +1674,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                         camera,
                         pose_config,
                     )
-                    if expanded_result.success:
+                    if expanded_result.success and _fixed_evidence_is_usable(
+                        fixed_score, fixed_inliers, pose_config
+                    ):
                         pose_candidates.append(
                             (
                                 fixed_score,
@@ -1651,13 +1731,15 @@ def main(argv: Sequence[str] | None = None) -> None:
                     if direct_surface_result.hypotheses
                     else 0
                 )
-                if direct_surface_result.success:
-                    fixed_score, fixed_inliers = _fixed_pose_evidence(
-                        fixed_verification_pool,
-                        direct_surface_result,
-                        camera,
-                        pose_config,
-                    )
+                fixed_score, fixed_inliers = _fixed_pose_evidence(
+                    fixed_verification_pool,
+                    direct_surface_result,
+                    camera,
+                    pose_config,
+                )
+                if direct_surface_result.success and _fixed_evidence_is_usable(
+                    fixed_score, fixed_inliers, pose_config
+                ):
                     pose_candidates.append(
                         (
                             fixed_score,
@@ -2061,6 +2143,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "maplet_layout_score": None,
                 "initial_pool_size": len(anchor_pool),
                 "set_pose_gate_passed": bool(set_pose_gate_passed),
+                "set_pose_gate_reason": str(set_pose_gate_reason),
                 "set_pose_confident_group_count": int(
                     confident_set_groups
                 ),
@@ -2068,6 +2151,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                     mean_set_null
                 ),
                 "set_pose_gate_uses_conditional_identity_confidence": True,
+                "set_pose_gate_uses_absolute_null_mass": True,
                 "set_pose_strictly_confident_group_count": int(
                     matcher_diagnostics[
                         "conditionally_confident_group_count"
@@ -2247,7 +2331,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "legacy_maximum_mean_null_argument": float(
                     args.set_pose_maximum_mean_null
                 ),
-                "legacy_maximum_mean_null_applied": False,
+                "legacy_maximum_mean_null_applied": True,
             },
             "layout_guided_feature_measurement": {
                 "maximum_global_feature_modes": int(

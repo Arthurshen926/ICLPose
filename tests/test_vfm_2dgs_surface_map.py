@@ -4,6 +4,8 @@ import numpy as np
 import pytest
 import torch
 
+import feature_extract.vfm.localization.surface_localization as surface_localization
+
 from feature_extract.vfm.colmap_tracks import ColmapCamera
 from feature_extract.vfm.localization.surface_maplet_mapper import (
     SurfaceMapletMapper,
@@ -17,6 +19,7 @@ from feature_extract.vfm.localization.surface_maplet_mapper import (
 )
 from feature_extract.vfm.localization.surface_localization import (
     LocalFeatureFrame,
+    SurfaceAnchorCandidatePool,
     SurfaceMapletMatchConfig,
     SurfacePoseConfig,
     build_anchor_local_descriptor_bank,
@@ -452,6 +455,106 @@ def test_maplet_matching_can_skip_support_layout_for_point_aligned_vfm() -> None
     assert result.support_view_id is None
     assert result.support_mode_view_ids == ()
     assert np.all(np.isinf(result.layout_residuals))
+
+
+def test_layout_pool_is_wider_than_the_returned_top_k(monkeypatch):
+    """Layout evidence is evaluated before the returned Top-K cut."""
+
+    # Maplet 3 is deliberately weaker in descriptor space, but its two
+    # support tokens exactly follow the query layout.  With a raw Top-1-only
+    # layout pool it can never be recovered; the wider bounded layout pool
+    # must promote it after compatibility is applied.
+    bank = VfmSurfaceMapletBank(
+        maplet_ids=np.asarray([1, 2, 3], dtype=np.int64),
+        centers=np.zeros((3, 3), dtype=np.float64),
+        normals=np.tile(np.asarray([[0.0, 0.0, 1.0]], dtype=np.float32), (3, 1)),
+        tangent_frames=np.tile(np.eye(3, dtype=np.float32)[None], (3, 1, 1)),
+        extents=np.ones((3, 3), dtype=np.float32),
+        descriptors=np.asarray([[1.0, 0.0], [0.99, 0.14], [0.6, 0.8]], dtype=np.float32),
+        quality_scores=np.ones((3,), dtype=np.float32),
+        descriptor_variances=np.zeros((3,), dtype=np.float32),
+        anchor_offsets=np.asarray([0, 0, 0, 0], dtype=np.int64),
+        anchor_ids=np.zeros((0,), dtype=np.int64),
+        support_offsets=np.asarray([0, 0, 0, 0], dtype=np.int64),
+        support_element_ids=np.zeros((0,), dtype=np.int64),
+        view_offsets=np.asarray([0, 2, 4, 6], dtype=np.int64),
+        view_image_ids=("mode",) * 6,
+        view_token_xy=np.asarray(
+            [
+                [0.2, 0.2], [0.2, 0.2],
+                [0.8, 0.2], [0.2, 0.8],
+                [0.0, 0.0], [1.0, 1.0],
+            ],
+            dtype=np.float32,
+        ),
+        view_grid_sizes=np.full((6, 2), 2, dtype=np.int32),
+        view_descriptors=np.tile(np.asarray([[1.0, 0.0]], dtype=np.float32), (6, 1)),
+        view_quality_scores=np.ones((6,), dtype=np.float32),
+        metadata={"vfm_layer": "radio_final"},
+    )
+    observed = {}
+
+    def record_layout_pool(
+        query_xy_normalized,
+        candidate_rows,
+        base_scores,
+        bank,
+        per_maplet_views,
+        config,
+    ):
+        del query_xy_normalized, base_scores, bank, per_maplet_views, config
+        observed["shape"] = tuple(candidate_rows.shape)
+        return None, None, None, float("-inf"), ()
+
+    monkeypatch.setattr(
+        surface_localization, "_best_support_layout", record_layout_pool
+    )
+    result = match_radio_final_regions_to_maplets(
+        query_region_xy=np.asarray([[0.0, 0.0], [1.0, 1.0]], dtype=np.float32),
+        query_descriptors=np.tile(np.asarray([[1.0, 0.0]], dtype=np.float32), (2, 1)),
+        query_grid_size=(2, 2),
+        bank=bank,
+        config=SurfaceMapletMatchConfig(
+            top_k=1,
+            minimum_layout_pairs=2,
+            maximum_layout_candidate_views=1,
+            maximum_layout_candidate_maplets=3,
+            maximum_layout_modes=1,
+            layout_logit_weight=20.0,
+        ),
+    )
+    assert observed["shape"] == (2, 3)
+    assert result.candidate_maplet_ids.shape == (2, 1)
+
+
+def test_zero_probability_valid_placeholders_never_generate_pnp_hypotheses():
+    pool = SurfaceAnchorCandidatePool(
+        query_xy=np.asarray(
+            [[20.0, 20.0], [30.0, 20.0], [20.0, 30.0], [30.0, 30.0]] * 2,
+            dtype=np.float32,
+        ),
+        anchor_ids=np.arange(8, dtype=np.int64)[:, None],
+        xyz=np.tile(
+            np.asarray([[[0.0, 0.0, 5.0]]], dtype=np.float64),
+            (8, 1, 1),
+        ),
+        descriptor_scores=np.zeros((8, 1), dtype=np.float32),
+        candidate_probabilities=np.zeros((8, 1), dtype=np.float32),
+        null_probabilities=np.ones((8,), dtype=np.float32),
+        valid_mask=np.ones((8, 1), dtype=bool),
+    )
+    result = generate_grouped_surface_pose_hypotheses(
+        pool,
+        _camera(),
+        SurfacePoseConfig(
+            hypothesis_count=16,
+            minimum_fit_groups=4,
+            minimum_verification_groups=1,
+            soft_em_iterations=0,
+        ),
+    )
+    assert not result.success
+    assert result.failure_reason == "no_valid_surface_pose_hypothesis"
 
 
 def test_local_anchor_candidates_are_conditioned_on_nearest_vfm_maplet() -> None:

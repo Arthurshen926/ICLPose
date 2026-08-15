@@ -116,13 +116,25 @@ def retrieve_children_given_parents(
         or coverage.shape != (physical.child_parent_rows.size,)
     ):
         raise ValueError("child retrieval arrays differ")
-    local = local / np.maximum(np.linalg.norm(local, axis=1, keepdims=True), 1e-8)
-    child_feature = child_feature / np.maximum(np.linalg.norm(child_feature, axis=1, keepdims=True), 1e-8)
-    parent_row_by_id = {int(value): row for row, value in enumerate(physical.maplet_ids.tolist())}
+    local = local / np.maximum(
+        np.linalg.norm(local, axis=1, keepdims=True), 1e-8
+    )
+    child_feature = child_feature / np.maximum(
+        np.linalg.norm(child_feature, axis=1, keepdims=True), 1e-8
+    )
+    parent_row_by_id = {
+        int(value): row for row, value in enumerate(physical.maplet_ids.tolist())
+    }
+    parent_rows = np.asarray(
+        [
+            [parent_row_by_id.get(int(value), -1) for value in values]
+            for values in parent_ids.tolist()
+        ],
+        dtype=np.int64,
+    )
     keep = max(1, int(maximum_child_candidates))
     output_rows = np.full((local.shape[0], keep), -1, dtype=np.int64)
     output_probability = np.zeros((local.shape[0], keep), dtype=np.float64)
-    output_null = np.ones((local.shape[0],), dtype=np.float64)
     conditional_log_evidence = np.full(parent_ids.shape, -np.inf, dtype=np.float64)
     best_rows_by_parent = np.full(parent_ids.shape, -1, dtype=np.int64)
     best_probability_by_parent = np.zeros(parent_ids.shape, dtype=np.float64)
@@ -133,49 +145,92 @@ def retrieve_children_given_parents(
     probability_by_parent = np.zeros(
         parent_ids.shape + (alternatives_per_parent,), dtype=np.float64,
     )
-    for support in range(local.shape[0]):
-        accumulated: dict[int, float] = {}
-        for parent_slot, (parent_id, parent_value) in enumerate(
-            zip(parent_ids[support].tolist(), parent_probability[support].tolist())
-        ):
-            parent_row = parent_row_by_id.get(int(parent_id))
-            if parent_row is None or float(parent_value) <= 0.0:
-                continue
-            start, end = int(physical.maplet_child_offsets[parent_row]), int(physical.maplet_child_offsets[parent_row + 1])
+
+    # The historical implementation issued one tiny dot-product and several
+    # Python reductions for every token×parent pair (2304×64 in production).
+    # Grouping equal parents keeps exactly the same parent-wise softmax and
+    # probability factorization while turning those operations into bounded
+    # matrix kernels.  The dense joint matrix is only T×7653 (~141 MiB in
+    # float64 for the current map), independent of the number of Python
+    # candidate objects.
+    joint = np.zeros(
+        (local.shape[0], physical.child_parent_rows.size), dtype=np.float64
+    )
+    flat_parent = parent_rows.reshape(-1)
+    flat_probability = parent_probability.reshape(-1)
+    valid_slots = np.flatnonzero((flat_parent >= 0) & (flat_probability > 0.0))
+    if valid_slots.size:
+        order = np.argsort(flat_parent[valid_slots], kind="stable")
+        ordered_slots = valid_slots[order]
+        ordered_parent = flat_parent[ordered_slots]
+        boundaries = np.r_[
+            0,
+            np.flatnonzero(ordered_parent[1:] != ordered_parent[:-1]) + 1,
+            ordered_parent.size,
+        ]
+        slot_count = parent_ids.shape[1]
+        scale = max(float(temperature), 1e-4)
+        for group in range(boundaries.size - 1):
+            slots = ordered_slots[boundaries[group] : boundaries[group + 1]]
+            parent_row = int(ordered_parent[boundaries[group]])
+            start = int(physical.maplet_child_offsets[parent_row])
+            end = int(physical.maplet_child_offsets[parent_row + 1])
             children = np.arange(start, end, dtype=np.int64)
             children = children[coverage[children] > 0.0]
             if children.size == 0:
                 continue
-            score = child_feature[children] @ local[support]
-            scaled_score = score / max(float(temperature), 1e-4)
-            maximum = float(np.max(scaled_score))
-            # Parent-wise softmax mass is always one and therefore cannot
-            # reject a contextually plausible but locally incompatible
-            # repeated instance.  Retain its calibrated local evidence before
-            # normalizing the child coordinate distribution.
-            conditional_log_evidence[support, parent_slot] = maximum + float(
-                np.log(np.mean(np.exp(scaled_score - maximum)))
+            support_rows = slots // slot_count
+            parent_slots = slots % slot_count
+            scaled_score = (
+                local[support_rows] @ child_feature[children].T
+            ).astype(np.float64) / scale
+            maximum = np.max(scaled_score, axis=1, keepdims=True)
+            exponential = np.exp(scaled_score - maximum)
+            conditional = exponential / np.maximum(
+                np.sum(exponential, axis=1, keepdims=True), 1e-12
             )
-            conditional = np.exp(scaled_score - maximum)
-            conditional /= max(float(np.sum(conditional)), 1e-12)
-            best = int(np.argmax(conditional))
-            best_rows_by_parent[support, parent_slot] = int(children[best])
-            best_probability_by_parent[support, parent_slot] = float(conditional[best])
-            alternative_count = min(int(alternatives_per_parent), int(children.size))
-            alternative_order = np.argsort(-conditional, kind="stable")[:alternative_count]
+            conditional_log_evidence[support_rows, parent_slots] = (
+                maximum[:, 0]
+                + np.log(np.mean(exponential, axis=1))
+            )
+            local_order = np.argsort(-conditional, axis=1, kind="stable")
+            best = local_order[:, 0]
+            best_rows_by_parent[support_rows, parent_slots] = children[best]
+            best_probability_by_parent[support_rows, parent_slots] = conditional[
+                np.arange(slots.size), best
+            ]
+            alternative_count = min(alternatives_per_parent, int(children.size))
+            alternatives = local_order[:, :alternative_count]
             rows_by_parent[
-                support, parent_slot, :alternative_count
-            ] = children[alternative_order]
+                support_rows, parent_slots, :alternative_count
+            ] = children[alternatives]
             probability_by_parent[
-                support, parent_slot, :alternative_count
-            ] = conditional[alternative_order]
-            for child, value in zip(children.tolist(), conditional.tolist()):
-                accumulated[int(child)] = accumulated.get(int(child), 0.0) + float(parent_value) * float(value)
-        ranked = sorted(accumulated.items(), key=lambda item: (-item[1], item[0]))[:keep]
-        if ranked:
-            output_rows[support, : len(ranked)] = [item[0] for item in ranked]
-            output_probability[support, : len(ranked)] = [item[1] for item in ranked]
-        output_null[support] = float(np.clip(max(parent_null[support], 1.0 - np.sum(output_probability[support])), 0.0, 1.0))
+                support_rows, parent_slots, :alternative_count
+            ] = np.take_along_axis(
+                conditional, alternatives, axis=1
+            )
+            joint_probability = (
+                flat_probability[slots, None] * conditional
+            )
+            np.add.at(
+                joint,
+                (support_rows[:, None], children[None, :]),
+                joint_probability,
+            )
+
+    # Stable sorting preserves ascending child row as the deterministic tie
+    # break, exactly matching the previous ``(-probability, child_row)`` key.
+    ranked_count = min(keep, int(physical.child_parent_rows.size))
+    ranked_rows = np.argsort(-joint, axis=1, kind="stable")[:, :ranked_count]
+    ranked_probability = np.take_along_axis(joint, ranked_rows, axis=1)
+    positive = ranked_probability > 0.0
+    output_rows[:, :ranked_count][positive] = ranked_rows[positive]
+    output_probability[:, :ranked_count][positive] = ranked_probability[positive]
+    output_null = np.clip(
+        np.maximum(parent_null, 1.0 - np.sum(output_probability, axis=1)),
+        0.0,
+        1.0,
+    )
     return ChildTilePosterior(
         output_rows,
         output_probability.astype(np.float32),

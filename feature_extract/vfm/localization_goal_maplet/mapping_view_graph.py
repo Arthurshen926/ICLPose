@@ -58,6 +58,20 @@ class MappingViewGraph:
             or np.any((weight <= 0.0) | (weight > 1.0))
         ):
             raise ValueError("invalid mapping-view graph")
+        rotations = pose[:, :3, :3]
+        if (
+            np.any(np.abs(pose[:, 3, :] - np.asarray([0.0, 0.0, 0.0, 1.0])) > 1e-8)
+            or np.any(
+                np.linalg.norm(
+                    np.matmul(rotations, np.swapaxes(rotations, 1, 2))
+                    - np.eye(3, dtype=np.float64),
+                    axis=(1, 2),
+                )
+                > 1e-6
+            )
+            or np.any(np.linalg.det(rotations) <= 0.0)
+        ):
+            raise ValueError("mapping-view poses must be proper SE(3) transforms")
         for view in range(pose.shape[0]):
             start, end = int(offsets[view]), int(offsets[view + 1])
             if np.unique(rows[start:end]).size != end - start:
@@ -133,6 +147,40 @@ class MappingViewPosterior:
     probabilities: np.ndarray
     null_probability: float
     support_coverage: np.ndarray
+    # Mass of graph views omitted by ``maximum_views``.  Truncation is an
+    # observation event and must not be converted into extra identity mass.
+    omitted_view_probability: float = 0.0
+
+    def __post_init__(self) -> None:
+        rows = np.asarray(self.view_rows, dtype=np.int64).reshape(-1)
+        scores = np.asarray(self.scores, dtype=np.float32).reshape(-1)
+        probabilities = np.asarray(self.probabilities, dtype=np.float32).reshape(-1)
+        coverage = np.asarray(self.support_coverage, dtype=np.float32).reshape(-1)
+        null = float(self.null_probability)
+        omitted = float(self.omitted_view_probability)
+        if (
+            scores.shape != rows.shape
+            or probabilities.shape != rows.shape
+            or coverage.shape != rows.shape
+            or np.any(~np.isfinite(scores))
+            or np.any(~np.isfinite(probabilities))
+            or np.any((probabilities < 0.0) | (probabilities > 1.0))
+            or np.any(~np.isfinite(coverage))
+            or np.any((coverage < 0.0) | (coverage > 1.0))
+            or not np.isfinite(null)
+            or not 0.0 <= null <= 1.0
+            or not np.isfinite(omitted)
+            or not 0.0 <= omitted <= 1.0
+            or abs(float(np.sum(probabilities, dtype=np.float64)) + null - 1.0)
+            > 2e-5
+        ):
+            raise ValueError("invalid mapping-view posterior mass or shape")
+        object.__setattr__(self, "view_rows", rows)
+        object.__setattr__(self, "scores", scores)
+        object.__setattr__(self, "probabilities", probabilities)
+        object.__setattr__(self, "support_coverage", coverage)
+        object.__setattr__(self, "null_probability", null)
+        object.__setattr__(self, "omitted_view_probability", omitted)
 
 
 def build_mapping_view_graph(
@@ -242,8 +290,10 @@ def retrieve_mapping_view_posterior(
     but retained parent cannot be erased merely because another support has a
     much sharper absolute score.  Out-of-map and truncated mass stay in a
     typed query-null branch and never become evidence for a particular view.
-    The returned null is computed before normalizing over view nodes, so it is
-    invariant to ``maximum_views`` and to the number of graph nodes.
+    The returned null includes both structural query-null mass and all view
+    mass omitted by ``maximum_views``. Increasing the view budget can therefore
+    only move mass from null to explicit identities, never manufacture
+    confidence for a retained identity.
     """
 
     if graph.physical_map_sha256 != physical.content_sha256:
@@ -263,6 +313,7 @@ def retrieve_mapping_view_posterior(
         or np.any(~np.isfinite(out_of_map))
         or np.any(~np.isfinite(unresolved))
         or np.any(probability < 0.0)
+        or np.any(np.sum(probability, axis=1) > 1.0 + 2e-5)
         or np.any((out_of_map < 0.0) | (out_of_map > 1.0))
         or np.any((unresolved < out_of_map) | (unresolved > 1.0))
     ):
@@ -311,22 +362,35 @@ def retrieve_mapping_view_posterior(
             dtype=np.float64,
         )
         coverage = np.zeros((dense_view.shape[0],), dtype=np.float64)
+    # Normalize over every graph view first; only then apply the output budget.
+    # The previous prefix-only normalization silently reassigned omitted view
+    # mass to whichever identities fit ``maximum_views``.
     take = min(int(maximum_views), int(score.size))
-    order = np.argsort(-score, kind="stable")[:take]
-    logits = score[order] / float(temperature)
+    order_all = np.argsort(-score, kind="stable")
+    order = order_all[:take]
+    logits = score / float(temperature)
     if logits.size and h1_probability > 0.0:
         logits -= float(np.max(logits))
-        conditional_view = np.exp(logits)
-        conditional_view /= max(float(np.sum(conditional_view)), 1e-12)
-        view_probability = h1_probability * conditional_view
+        conditional_all = np.exp(logits)
+        conditional_all /= max(float(np.sum(conditional_all)), 1e-12)
+        full_view_probability = h1_probability * conditional_all
+        view_probability = full_view_probability[order]
+        omitted_view_probability = float(
+            np.sum(full_view_probability[order_all[take:]])
+        )
     else:
         view_probability = np.zeros((take,), dtype=np.float64)
+        omitted_view_probability = 0.0
+    null_probability = float(
+        np.clip(null_probability + omitted_view_probability, 0.0, 1.0)
+    )
     return MappingViewPosterior(
         view_rows=order.astype(np.int64),
         scores=score[order].astype(np.float32),
         probabilities=view_probability.astype(np.float32),
         null_probability=float(null_probability),
         support_coverage=coverage[order].astype(np.float32),
+        omitted_view_probability=float(omitted_view_probability),
     )
 
 

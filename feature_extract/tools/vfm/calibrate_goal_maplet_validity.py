@@ -11,11 +11,14 @@ import numpy as np
 from feature_extract.vfm.localization.surface_maplet_mapper import load_surface_maplet_mapper
 from feature_extract.vfm.localization_goal_maplet.canonical_field import CanonicalSurfaceField, readout_canonical_field
 from feature_extract.vfm.localization_goal_maplet.lineage import file_sha256
-from feature_extract.vfm.localization_goal_maplet.pfir import (
-    ContributorLabels,
-    contributor_multiscale_in_map_probability,
-)
+from feature_extract.vfm.localization_goal_maplet.pfir import contributor_multiscale_in_map_probability
 from feature_extract.vfm.localization_goal_maplet.physical_map import GoalMapletPhysicalMap
+from feature_extract.vfm.localization_goal_maplet.multimodal_parent_retrieval import (
+    PARENT_SCORE_ANONYMOUS_MODES,
+    PARENT_SCORE_SINGLE_MEAN,
+    build_anonymous_parent_mode_readout,
+    score_anonymous_parent_modes,
+)
 from feature_extract.vfm.localization_goal_maplet.physical_instance_readout import (
     encode_physical_instance_regions,
     load_physical_instance_readout,
@@ -24,6 +27,12 @@ from feature_extract.vfm.localization_goal_maplet.query_support import all_token
 from feature_extract.vfm.localization_goal_maplet.retrieval import (
     fit_validity_calibration,
     retrieve_maplet_posterior,
+    retrieve_maplet_posterior_from_scores,
+)
+from feature_extract.vfm.localization_goal_maplet.retrieval_surface_metrics import (
+    COORDINATE_CONTRACT,
+    LEGACY_COORDINATE_CONTRACT,
+    load_contributors_in_radio_coordinates,
 )
 from feature_extract.vfm.surface_maplet_bank import RadioFinalRegionConfig, encode_radio_final_regions
 
@@ -54,10 +63,21 @@ def main() -> None:
     parser.add_argument("--surface_mapper", required=True)
     parser.add_argument("--physical_instance_readout", default="")
     parser.add_argument("--pooling", choices=tuple(POOLING), required=True)
+    parser.add_argument(
+        "--parent_score_semantics",
+        choices=(PARENT_SCORE_SINGLE_MEAN, PARENT_SCORE_ANONYMOUS_MODES),
+        default=PARENT_SCORE_SINGLE_MEAN,
+    )
+    parser.add_argument("--parent_mode_temperature", type=float, default=0.03)
     parser.add_argument("--output_calibration", required=True)
     parser.add_argument("--summary_json", required=True)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--include_trajectories", nargs="+", default=[])
+    parser.add_argument(
+        "--legacy_pinhole_as_raw_diagnostic",
+        action="store_true",
+        help="reproduce the old coordinate-misaligned validity target as a diagnostic control",
+    )
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
     output, summary = Path(args.output_calibration), Path(args.summary_json)
@@ -84,6 +104,11 @@ def main() -> None:
             readout.child_coverage,
         )
     valid_maplets = readout.parent_coverage > 0.0
+    anonymous_parent_readout = (
+        build_anonymous_parent_mode_readout(field, physical)
+        if str(args.parent_score_semantics) == PARENT_SCORE_ANONYMOUS_MODES
+        else None
+    )
     owned_primitive_rows = np.unique(
         np.asarray(physical.membership_primitive_rows, dtype=np.int64)
     )
@@ -95,13 +120,18 @@ def main() -> None:
     config = RadioFinalRegionConfig(pool_sizes=pool_sizes, pool_weights=pool_weights)
     all_score, all_target = [], []
     image_ids = []
+    coordinate_audits: list[dict[str, object]] = []
     included = set(str(value) for value in args.include_trajectories)
     for path in sorted(Path(args.contributors).glob("*.npz")):
         with np.load(path, allow_pickle=False) as data:
             metadata = json.loads(str(np.asarray(data["metadata_json"]).item()))
         if included and str(metadata["trajectory_id"]) not in included:
             continue
-        labels = ContributorLabels.load_npz(path)
+        labels, coordinate_audit = load_contributors_in_radio_coordinates(
+            path,
+            legacy_pinhole_as_raw_diagnostic=bool(args.legacy_pinhole_as_raw_diagnostic),
+        )
+        coordinate_audits.append(coordinate_audit)
         with np.load(Path(str(metadata["token_path"])), allow_pickle=False) as data:
             raw = np.asarray(data["radio_final"], dtype=np.float32)
         mapped = mapper.project(raw).measurement_context
@@ -112,16 +142,31 @@ def main() -> None:
                 instance_readout, mapped, token_xy, role="context", device=str(args.device),
             )
         )
-        _, _, _, best = retrieve_maplet_posterior(
-            descriptor,
-            readout.parent_descriptors,
-            physical.maplet_ids,
-            valid_maplets,
-            maximum_candidates=64,
-            temperature=0.07,
-            null_similarity_center=0.35,
-            null_similarity_scale=0.08,
-        )
+        if anonymous_parent_readout is None:
+            _, _, _, best = retrieve_maplet_posterior(
+                descriptor,
+                readout.parent_descriptors,
+                physical.maplet_ids,
+                valid_maplets,
+                maximum_candidates=64,
+                temperature=0.07,
+                null_similarity_center=0.35,
+                null_similarity_scale=0.08,
+            )
+        else:
+            best = retrieve_maplet_posterior_from_scores(
+                score_anonymous_parent_modes(
+                    descriptor,
+                    anonymous_parent_readout,
+                    mode_temperature=float(args.parent_mode_temperature),
+                ),
+                physical.maplet_ids,
+                anonymous_parent_readout.parent_coverage > 0.0,
+                maximum_candidates=64,
+                temperature=0.07,
+                null_similarity_center=0.35,
+                null_similarity_scale=0.08,
+            ).best_similarities
         _, truth_null = contributor_multiscale_in_map_probability(
             labels,
             physical,
@@ -150,6 +195,13 @@ def main() -> None:
                 if args.physical_instance_readout else None
             ),
             "pooling": str(args.pooling),
+            "parent_score_semantics": str(args.parent_score_semantics),
+            "parent_mode_temperature": float(args.parent_mode_temperature),
+            "anonymous_parent_mode_readout_sha256": (
+                anonymous_parent_readout.content_sha256
+                if anonymous_parent_readout is not None
+                else None
+            ),
             "fit_support_mode": "all_tokens_exact_multiscale_masks",
             "validity_target_algorithm": (
                 "exact_owned_contributor_mass_integral_image_v1"
@@ -157,6 +209,13 @@ def main() -> None:
             "fit_image_ids": image_ids,
             "fit_trajectory_ids": sorted({value.split("/", 1)[0] for value in image_ids}),
             "stores_scores_or_query_features": False,
+            "contributor_to_radio_coordinate_contract": (
+                LEGACY_COORDINATE_CONTRACT
+                if args.legacy_pinhole_as_raw_diagnostic
+                else COORDINATE_CONTRACT
+            ),
+            "coordinate_correct": bool(not args.legacy_pinhole_as_raw_diagnostic),
+            "promotion_eligible": bool(not args.legacy_pinhole_as_raw_diagnostic),
         },
     )
     calibrated = calibration.predict_valid(score)
@@ -180,6 +239,19 @@ def main() -> None:
         },
         "calibration_sha256": calibration.content_sha256,
         "calibration_metadata": dict(calibration.metadata),
+        "coordinate_audit": {
+            "coordinate_contract": (
+                LEGACY_COORDINATE_CONTRACT
+                if args.legacy_pinhole_as_raw_diagnostic
+                else COORDINATE_CONTRACT
+            ),
+            "view_count": int(len(coordinate_audits)),
+            "camera_model_ids": sorted({int(value["camera_model_id"]) for value in coordinate_audits}),
+            "minimum_valid_raw_sample_fraction": (
+                float(min(float(value["valid_raw_sample_fraction"]) for value in coordinate_audits))
+                if coordinate_audits and not args.legacy_pinhole_as_raw_diagnostic else None
+            ),
+        },
     }
     calibration.save_json(output)
     summary.parent.mkdir(parents=True, exist_ok=True)

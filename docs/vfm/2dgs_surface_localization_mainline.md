@@ -2,6 +2,14 @@
 
 ## Scope
 
+### Current execution scope
+
+The active engineering path is inference against the already-frozen 2DGS
+surface map and frozen RADIO-derived artifacts. It does **not** retrain or
+reconstruct a Gaussian scene, run MAtCha/SfM alignment, or require a five-fold
+geometry rebuild. Those pipelines are separate diagnostics and are not
+needed to execute or validate the mainline localizer.
+
 This is the production localization mainline. Its persistent map contains
 2DGS geometry and features, but no mapping RGB:
 
@@ -113,8 +121,18 @@ point. Its PnP branch has an explicit conditional identity-confidence gate:
 only groups whose retained anchor mass exceeds their conditional null mass
 count toward the minimum needed to start PnP. Merely having non-zero candidate
 mass is not confidence. Null-dominated points remain uncertainty evidence and
-do not trigger low-information hypothesis generation. Absolute posterior mass
-is retained for hypothesis scoring.
+do not trigger low-information hypothesis generation. The gate also requires
+the mean *absolute* null probability to stay below its configured ceiling;
+conditional normalization alone cannot turn a 1e-6 retained mass into a
+confident correspondence. Absolute posterior mass is retained for hypothesis
+scoring, and every gate failure records whether conditional support or
+absolute-null mass was the limiting condition.
+
+Mapping-view retrieval uses the same conservation rule: view probabilities are
+normalized over the complete graph before the returned view budget is applied;
+unreturned view mass is carried into the mapping-view null. The serialized
+anchor prefix includes its probability vector and null mass, so a smaller view
+budget cannot manufacture confidence for a retained identity.
 
 ## Why the branches are complementary
 
@@ -158,6 +176,11 @@ high-similarity view from dominating repeated-facade evidence.
 - Mapping image IDs are feature-mode labels, not runtime file handles.
 - Maplet retrieval and anchor assignment have separate probabilities and
   explicit null states.
+- Layout evidence is estimated from a bounded raw-descriptor maplet pool
+  wider than the returned maplet Top-K, then applied before the final Top-K;
+  the pool size is frozen in the serialized matcher config so a layout
+  explanation cannot be lost solely because descriptor ranking was truncated
+  first.
 - Truncating anchor candidates to top-L preserves probability: all omitted
   probability mass is added to the explicit null state.
 - Fit and verification query groups are disjoint.
@@ -165,6 +188,10 @@ high-similarity view from dominating repeated-facade evidence.
 - Pose selection also uses an independently constructed 2DGS feature-map
   likelihood; generation inlier count alone cannot promote a pose.
 - Pose-guided EM is restricted to RADIO-retrieved maplet anchors.
+- A generated PnP pose cannot be promoted by itself: every branch, including
+  direct RADIO surface-observation fallback, must pass finite fixed-map
+  likelihood and fixed-map inlier support. If all independent evidence fails,
+  the query abstains rather than retaining the proposal success flag.
 - Query intrinsics and distortion are loaded from an exact per-query manifest;
   no median-intrinsics substitution is allowed in the canonical run.
 - A GT-free feature-support gate may route coverage-poor queries to a broader
