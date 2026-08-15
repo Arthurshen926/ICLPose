@@ -18,6 +18,11 @@ import numpy as np
 from scipy import sparse
 from scipy.spatial import cKDTree
 
+from .connected_fine_support import (
+    COMPONENT_SEMANTICS,
+    connected_fine_support_components,
+)
+
 from .pfir import ContributorLabels
 from .physical_map import GoalMapletPhysicalMap
 from .pure_retrieval import (
@@ -592,6 +597,7 @@ def evaluate_pure_retrieval_query(
     ks: tuple[int, ...] = (1, 5, 20, 32, 64),
     surface_ks: tuple[int, ...] | None = None,
     tolerances_m: tuple[float, ...] = (0.0, 0.1, 0.25, 0.5, 1.0, 2.0),
+    precomputed_child_surface_area_m2: np.ndarray | None = None,
 ) -> dict[str, object]:
     """Evaluate one pose-free result; GT is opened only in this function."""
 
@@ -675,6 +681,47 @@ def evaluate_pure_retrieval_query(
         surface[f"child_top{int(requested)}"] = _surface_set_metrics(
             child_rows, scene_mass, physical, tolerances_m=tolerances_m
         )
+    returned_child_rows = _primitive_union_for_children(
+        physical, retrieval.scene_child_rows
+    )
+    surface["child_returned_set"] = _surface_set_metrics(
+        returned_child_rows, scene_mass, physical, tolerances_m=tolerances_m
+    )
+    surface["child_returned_set"]["selected_child_count"] = int(
+        retrieval.scene_child_rows.size
+    )
+    surface["child_returned_set"]["selection_semantics"] = str(
+        retrieval.metadata.get(
+            "fine_support_selection_semantics", "fixed_topk_block_peak_score_v1"
+        )
+    )
+    if float(physical.metadata.get("child_voxel_size_m", 0.0)) > 0.0:
+        components = connected_fine_support_components(
+            retrieval.scene_child_rows,
+            physical,
+            precomputed_child_surface_area_m2=precomputed_child_surface_area_m2,
+        )
+        component_sizes = np.diff(components.component_offsets)
+        component_count = components.component_count
+        component_semantics = COMPONENT_SEMANTICS
+    else:
+        component_sizes = np.ones(
+            retrieval.scene_child_rows.size, dtype=np.int64
+        )
+        component_count = int(component_sizes.size)
+        component_semantics = "singleton_nonvoxel_legacy_control_v1"
+    surface["child_returned_set"]["connected_component_semantics"] = (
+        component_semantics
+    )
+    surface["child_returned_set"]["connected_component_count"] = int(
+        component_count
+    )
+    surface["child_returned_set"]["mean_children_per_component"] = float(
+        np.mean(component_sizes) if component_sizes.size else 0.0
+    )
+    surface["child_returned_set"]["maximum_children_per_component"] = int(
+        np.max(component_sizes) if component_sizes.size else 0
+    )
     area_parent_rows, area_parent_count, area_used = (
         _parent_primitive_rows_under_surface_fraction(
             retrieval, physical, maximum_surface_fraction=0.20
@@ -782,12 +829,13 @@ def evaluate_pure_retrieval_query(
             "target_out_of_map_mean": float(np.mean(target_out_of_map)),
             "predicted_out_of_map_mean": float(np.mean(predicted_out_of_map)),
         },
-        "configuration_at_64": {
+        "retrieved_set_geometric_non_degeneracy_at_64": {
             "correct_child_count": int(correct.size),
             "correct_child_center_spread_m": spread,
             "bearing_rank": bearing_rank,
             "normal_rank": normal_rank,
-            "sufficient": configuration_sufficient,
+            "non_degenerate": configuration_sufficient,
+            "does_not_imply_pose_recall": True,
         },
         "claim_scope": {
             "retrieval_only": True,

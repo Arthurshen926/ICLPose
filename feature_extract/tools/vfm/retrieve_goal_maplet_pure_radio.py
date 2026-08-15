@@ -23,8 +23,18 @@ from feature_extract.vfm.localization_goal_maplet.canonical_field import (
 from feature_extract.vfm.localization_goal_maplet.child_retrieval import (
     retrieve_children_given_parents,
 )
+from feature_extract.vfm.localization_goal_maplet.connected_fine_support import (
+    COMPONENT_SEMANTICS as CONNECTED_FINE_SUPPORT_SEMANTICS,
+    connected_fine_support_components,
+)
 from feature_extract.vfm.localization_goal_maplet.feature_contract import (
     FieldFeatureContract,
+)
+from feature_extract.vfm.localization_goal_maplet.fine_support_selection import (
+    SELECTION_SEMANTICS as FINE_SUPPORT_SELECTION_SEMANTICS,
+    child_surface_area_m2,
+    select_fine_supports_under_area_budget,
+    total_map_surface_area_m2,
 )
 from feature_extract.vfm.localization_goal_maplet.physical_map import (
     GoalMapletPhysicalMap,
@@ -75,6 +85,16 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--maximum_child_candidates", type=int, default=64)
     parser.add_argument("--maximum_scene_parents", type=int, default=64)
     parser.add_argument("--maximum_scene_children", type=int, default=64)
+    parser.add_argument("--maximum_budgeted_scene_children", type=int, default=2048)
+    parser.add_argument(
+        "--target_candidate_posterior_mass_fraction", type=float, default=1.0
+    )
+    parser.add_argument(
+        "--fine_support_area_fraction",
+        type=float,
+        default=0.0,
+        help="positive value enables posterior-mass selection under this map-area budget",
+    )
     parser.add_argument("--parent_temperature", type=float, default=0.07)
     parser.add_argument(
         "--parent_score_semantics",
@@ -181,6 +201,16 @@ def main(argv: Sequence[str] | None = None) -> None:
     if calibration_parent_semantics != str(args.parent_score_semantics):
         raise ValueError("validity calibration parent score semantics differ")
     readout = readout_canonical_field(field, physical)
+    fine_child_area = (
+        child_surface_area_m2(physical)
+        if float(args.fine_support_area_fraction) > 0.0
+        else None
+    )
+    fine_total_map_area = (
+        total_map_surface_area_m2(physical)
+        if float(args.fine_support_area_fraction) > 0.0
+        else None
+    )
     anonymous_parent_readout = (
         build_anonymous_parent_mode_readout(field, physical)
         if str(args.parent_score_semantics) == PARENT_SCORE_ANONYMOUS_MODES
@@ -310,14 +340,40 @@ def main(argv: Sequence[str] | None = None) -> None:
             token_width=64,
         )
         positive_child_count = int(np.sum(child_scene_score > 0.0))
-        scene_child_rows, scene_child_scores, suppressed = (
-            rank_children_with_physical_iou_nms(
-                child_scene_score,
+        if float(args.fine_support_area_fraction) > 0.0:
+            fine_selection = select_fine_supports_under_area_budget(
+                child.candidate_child_rows,
+                child.candidate_probabilities,
+                physical.maplet_ids[parent_order],
                 physical,
-                maximum_children=int(args.maximum_scene_children),
+                maximum_area_fraction=float(args.fine_support_area_fraction),
+                maximum_children=int(args.maximum_budgeted_scene_children),
                 maximum_primitive_iou=float(args.maximum_child_primitive_iou),
+                target_candidate_posterior_mass_fraction=float(
+                    args.target_candidate_posterior_mass_fraction
+                ),
+                precomputed_child_surface_area_m2=fine_child_area,
+                precomputed_total_map_surface_area_m2=fine_total_map_area,
             )
-        )
+            scene_child_rows = fine_selection.child_rows
+            scene_child_scores = fine_selection.posterior_mass
+            suppressed = fine_selection.suppressed_duplicate_count
+            connected_supports = connected_fine_support_components(
+                scene_child_rows,
+                physical,
+                precomputed_child_surface_area_m2=fine_child_area,
+            )
+        else:
+            fine_selection = None
+            connected_supports = None
+            scene_child_rows, scene_child_scores, suppressed = (
+                rank_children_with_physical_iou_nms(
+                    child_scene_score,
+                    physical,
+                    maximum_children=int(args.maximum_scene_children),
+                    maximum_primitive_iou=float(args.maximum_child_primitive_iou),
+                )
+            )
         elapsed = float(time.perf_counter() - started)
         result = PureRadioPhysicalRetrieval(
             image_id=record.image_id,
@@ -356,7 +412,52 @@ def main(argv: Sequence[str] | None = None) -> None:
                 ),
                 "maximum_child_candidates": int(args.maximum_child_candidates),
                 "maximum_scene_parents": int(args.maximum_scene_parents),
-                "maximum_scene_children": int(args.maximum_scene_children),
+                "maximum_scene_children": int(
+                    args.maximum_budgeted_scene_children
+                    if fine_selection is not None
+                    else args.maximum_scene_children
+                ),
+                "maximum_budgeted_scene_children": int(
+                    args.maximum_budgeted_scene_children
+                ),
+                "fine_support_selection_semantics": (
+                    FINE_SUPPORT_SELECTION_SEMANTICS
+                    if fine_selection is not None
+                    else "fixed_topk_block_peak_score_v1"
+                ),
+                "maximum_fine_support_area_fraction": (
+                    float(args.fine_support_area_fraction)
+                    if fine_selection is not None
+                    else None
+                ),
+                "selected_fine_support_area_m2": (
+                    float(fine_selection.selected_surface_area_m2)
+                    if fine_selection is not None
+                    else None
+                ),
+                "target_candidate_posterior_mass_fraction": (
+                    float(args.target_candidate_posterior_mass_fraction)
+                    if fine_selection is not None
+                    else None
+                ),
+                "achieved_candidate_posterior_mass_fraction": (
+                    float(
+                        fine_selection.posterior_mass.sum()
+                        / max(fine_selection.eligible_posterior_mass, 1e-12)
+                    )
+                    if fine_selection is not None
+                    else None
+                ),
+                "connected_fine_support_semantics": (
+                    CONNECTED_FINE_SUPPORT_SEMANTICS
+                    if connected_supports is not None
+                    else None
+                ),
+                "connected_fine_support_count": (
+                    int(connected_supports.component_count)
+                    if connected_supports is not None
+                    else None
+                ),
                 "maximum_child_primitive_iou": float(
                     args.maximum_child_primitive_iou
                 ),

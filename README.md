@@ -4,9 +4,17 @@ Real-image VFM localization against a feature-bearing 2DGS surface map.
 
 ## Active Mainline
 
-The active research line is **Goal-Maplet structured physical-surface
-localization**. V6/V8/V8.1 are frozen diagnostics and V3 remains the frozen
-production baseline.
+The active research line is **G25 pose-free RADIO physical-surface retrieval**.
+The project has three deliberately separated states:
+
+- **V3** is the frozen production/traditional localization baseline.
+- **G23** is a frozen historical pose proposal--verification diagnostic; its
+  three-point Sim(3), ALIKE/PnP and full-map pose-search branches are not the
+  active method and must not be extended implicitly.
+- **G25** is the active research mainline.  It first retrieves a compact set of
+  physical 2DGS surfaces from the complete RADIO-final token grid.  Pose
+  generation remains closed until fine-support retrieval passes its own
+  area/coverage gates.
 
 ```text
 mapping RGB + calibrated poses + clean 2DGS --offline only-->
@@ -15,12 +23,13 @@ mapping RGB + calibrated poses + clean 2DGS --offline only-->
   + typed geometry/continuity/co-visibility/context graph
 
 query RGB
-  -> RADIO-final all-token physical-maplet evidence
-  -> multimodal SE(3)-basin proposal over typed map configurations
-  -> structural-equivalence prescreen + anchor-balanced quota
-  -> full-map physical-surface verification energy
-  -> adaptive shared-energy alignment with exact-score acceptance
-  -> post-selection success calibration + typed null/abstention
+  -> RADIO-final complete 36x64 token grid
+  -> one mapper projection
+  -> coverage-complete anonymous parent-region posterior
+  -> area/overlap/component-budgeted fine physical-support set
+  -> retrieval-only artifact + typed null/tail
+
+pose basin handoff (closed until the G25 fine-support gate passes)
 ```
 
 The target prior stores only metric 2DGS geometry and bounded anonymous
@@ -32,18 +41,37 @@ matching, single-point cosine pose energy, or final point-correspondence PnP.
 
 ## Current Status
 
-G23 is the current paper protocol.  All 1,487 official training frames are
-used: trajectory groups define five outer folds, each query is evaluated only
-against a map, learned feature field and calibrators built without its held-out
-route, and the resulting out-of-fold predictions are the only inputs to
-hyperparameter selection and success-risk calibration.  The historical 17
-frames are an official-train stress subset, not a validation or test set.  The
-530 official test frames remain sealed until the complete candidate,
-refinement and abstention policy is frozen.  The executable contract and
-current limitations are recorded in the
-[G23 official-train OOF protocol](docs/vfm/g23_official_train_oof_protocol_20260811.md).
-G23 is deliberately defined as a proposal--verification--selection system,
-not as a normalized generative posterior over continuous SE(3).
+G25 has established a trustworthy retrieval benchmark and a strong coarse
+region control, but not a finished localization system.  On the historically
+exposed 530-query St Mary's development set, the coverage-complete anonymous
+parent representation reaches 95.05% exact and 95.83% 0.5 m sampled-surface
+recall at Top-64.  A P0 loss decomposition showed that the token candidate
+union already contains 98.61% exact visible mass; the former 19.88% child
+result was caused primarily by the global Top-64 truncation.  The replacement
+posterior-mass/2DGS-area selector reaches:
+
+- 69.64% exact / 91.10% at 0.5 m using an adaptive 5.84% map-area budget;
+- 86.70% exact / 94.34% at 0.5 m using the high-recall 9.98% budget.
+
+The latter 1,181 one-metre children are deterministically grouped into about
+294 connected variable-scale physical supports without changing their
+primitive union.  Therefore:
+
+```text
+coarse parent retrieval:       passes the current development gate
+budgeted fine-support set:     large verified gain; final compactness gate pending
+real OOD/null calibration:     not evaluated
+pose-basin handoff:            closed
+end-to-end global localization:not yet formed in G25
+```
+
+The active results, cost audits and claim boundaries are recorded in the
+[G25 pure RADIO retrieval report](docs/vfm/g25_pure_radio_retrieval_20260815.md).
+The 530-query set has been opened repeatedly during development and is not an
+untouched test.  G23 material below is retained as historical evidence, not as
+authorization to return to its pose-search mainline.
+
+## Frozen G23 Historical Record
 
 The [Goal-Maplet report](docs/vfm/goal_maplet_localization_v1.md) defines the
 historical artifacts, oracle ladder and promotion decisions. The

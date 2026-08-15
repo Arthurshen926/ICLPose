@@ -283,6 +283,8 @@ def test_surface_metrics_credit_visible_physical_support_and_not_camera_distance
         hierarchical["selection_semantics"]
         == "global_top16_parents_then_top4_children_per_parent_v1"
     )
+    non_degeneracy = report["retrieved_set_geometric_non_degeneracy_at_64"]
+    assert non_degeneracy["does_not_imply_pose_recall"] is True
     assert report["claim_scope"]["metric_is_localization_success"] is False
 
 

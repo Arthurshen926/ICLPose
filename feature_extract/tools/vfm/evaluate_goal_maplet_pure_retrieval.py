@@ -12,6 +12,9 @@ from typing import Sequence
 
 import numpy as np
 
+from feature_extract.vfm.localization_goal_maplet.fine_support_selection import (
+    child_surface_area_m2,
+)
 from feature_extract.vfm.localization_goal_maplet.pfir import ContributorLabels
 from feature_extract.vfm.localization_goal_maplet.physical_map import (
     GoalMapletPhysicalMap,
@@ -116,7 +119,7 @@ def _failure_categories(row: dict[str, object]) -> list[str]:
     parent32 = float(row["token_parent"]["conditional_recall_at_32"])
     child64 = float(row["token_child"]["conditional_recall_at_64"])
     child_surface64 = float(
-        row["surface_sets"]["child_top64"]["exact_visible_mass_recall"]
+        row["surface_sets"]["child_returned_set"]["exact_visible_mass_recall"]
     )
     if float(row["coordinate_audit"]["valid_raw_sample_fraction"]) < 0.999:
         failures.append("R8_coordinate_or_render_truth_incomplete")
@@ -127,11 +130,13 @@ def _failure_categories(row: dict[str, object]) -> list[str]:
     if parent32 >= 0.80 and child64 < 0.80:
         failures.append("R2_parent_present_child_identity_missing")
     if child64 >= 0.80 and child_surface64 < min(0.80, 0.90 * parent_ceiling):
-        failures.append("R3_global_child_budget_fragmented_not_parent_region_failure")
+        failures.append("R3_returned_child_set_misses_positive_candidate_mass")
     if float(row["null_calibration"]["out_of_map_brier"]) > 0.10:
         failures.append("R5_in_map_false_null_probability_high")
-    if not bool(row["configuration_at_64"]["sufficient"]):
-        failures.append("R7_configuration_geometrically_insufficient")
+    if not bool(
+        row["retrieved_set_geometric_non_degeneracy_at_64"]["non_degenerate"]
+    ):
+        failures.append("R7_retrieved_set_geometrically_degenerate")
     return failures or ["baseline_passes_diagnostic_thresholds"]
 
 
@@ -153,6 +158,18 @@ def _sequence_summary(rows: list[dict[str, object]]) -> dict[str, object]:
                 values,
                 ("surface_sets", "child_top64", "exact_visible_mass_recall"),
             ),
+            "child_returned_set_exact_recall": _mean(
+                values,
+                ("surface_sets", "child_returned_set", "exact_visible_mass_recall"),
+            ),
+            "child_returned_set_tolerant_recall_0.5m": _mean(
+                values,
+                (
+                    "surface_sets",
+                    "child_returned_set",
+                    "tolerant_visible_mass_recall_0.5m",
+                ),
+            ),
             "child_surface_tolerant_recall_0.5m_at_64": _mean(
                 values,
                 (
@@ -169,8 +186,16 @@ def _sequence_summary(rows: list[dict[str, object]]) -> dict[str, object]:
                     "tolerant_visible_mass_recall_0.5m",
                 ),
             ),
-            "configuration_sufficient_at_64": float(
-                np.mean([bool(value["configuration_at_64"]["sufficient"]) for value in values])
+            "retrieved_set_geometric_non_degeneracy_at_64": float(
+                np.mean(
+                    [
+                        bool(
+                            value["retrieved_set_geometric_non_degeneracy_at_64"]
+                            ["non_degenerate"]
+                        )
+                        for value in values
+                    ]
+                )
             ),
         }
     return output
@@ -193,6 +218,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         "uses_image_retrieval",
     )
     physical = GoalMapletPhysicalMap.load_npz(Path(args.physical_map))
+    child_area = child_surface_area_m2(physical)
     incidence = PhysicalIncidence.from_physical_map(physical)
     summaries = [_json_without_duplicates(path) for path in summary_paths]
     records = []
@@ -248,6 +274,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             # decision and failure taxonomy only consume Top64, so compute it
             # once instead of rebuilding ten trees per query.
             surface_ks=(64,),
+            precomputed_child_surface_area_m2=child_area,
         )
         row["failure_categories"] = _failure_categories(row)
         rows.append(row)
@@ -355,6 +382,42 @@ def main(argv: Sequence[str] | None = None) -> None:
             rows,
             ("surface_sets", "child_top64", "visible_primitive_area_precision"),
         ),
+        "child_returned_set_exact_recall": _mean(
+            rows, ("surface_sets", "child_returned_set", "exact_visible_mass_recall")
+        ),
+        "child_returned_set_tolerant_recall_0.5m": _mean(
+            rows,
+            (
+                "surface_sets",
+                "child_returned_set",
+                "tolerant_visible_mass_recall_0.5m",
+            ),
+        ),
+        "child_returned_set_distance_p90_m": _mean(
+            rows, ("surface_sets", "child_returned_set", "weighted_distance_p90_m")
+        ),
+        "child_returned_set_predicted_surface_area_m2": _mean(
+            rows, ("surface_sets", "child_returned_set", "predicted_surface_area_m2")
+        ),
+        "child_returned_set_visible_surface_area_precision": _mean(
+            rows,
+            (
+                "surface_sets",
+                "child_returned_set",
+                "visible_primitive_area_precision",
+            ),
+        ),
+        "child_returned_set_selected_child_count": _mean(
+            rows, ("surface_sets", "child_returned_set", "selected_child_count")
+        ),
+        "child_returned_set_connected_component_count": _mean(
+            rows,
+            ("surface_sets", "child_returned_set", "connected_component_count"),
+        ),
+        "child_returned_set_mean_children_per_component": _mean(
+            rows,
+            ("surface_sets", "child_returned_set", "mean_children_per_component"),
+        ),
         "hierarchical_child_surface_exact_recall_parent16_x4": _mean(
             rows,
             (
@@ -395,8 +458,16 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "visible_primitive_area_precision",
             ),
         ),
-        "configuration_sufficient_at_64": float(
-            np.mean([bool(row["configuration_at_64"]["sufficient"]) for row in rows])
+        "retrieved_set_geometric_non_degeneracy_at_64": float(
+            np.mean(
+                [
+                    bool(
+                        row["retrieved_set_geometric_non_degeneracy_at_64"]
+                        ["non_degenerate"]
+                    )
+                    for row in rows
+                ]
+            )
         )
         if rows
         else 0.0,
@@ -425,6 +496,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     ] = float(
         aggregate["hierarchical_child_surface_exact_recall_parent16_x4"]
     ) / max(hierarchical_fraction, 1e-12)
+    returned_fraction = float(
+        aggregate["child_returned_set_predicted_surface_area_m2"]
+    ) / max(total_physical_surface_area_m2, 1e-12)
+    aggregate["child_returned_set_map_surface_area_fraction"] = returned_fraction
+    aggregate["child_returned_set_exact_surface_recall_enrichment"] = float(
+        aggregate["child_returned_set_exact_recall"]
+    ) / max(returned_fraction, 1e-12)
     gates = {
         "parent_conditional_recall_at_32_ge_0.97": bool(
             aggregate["parent_conditional_recall_at_32"] >= 0.97
@@ -435,8 +513,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         "parent_surface_tolerant_recall_0.5m_at_64_ge_0.95": bool(
             aggregate["parent_surface_tolerant_recall_0.5m_at_64"] >= 0.95
         ),
-        "configuration_sufficient_at_64_ge_0.95": bool(
-            aggregate["configuration_sufficient_at_64"] >= 0.95
+        "retrieved_set_geometric_non_degeneracy_at_64_ge_0.95": bool(
+            aggregate["retrieved_set_geometric_non_degeneracy_at_64"] >= 0.95
         ),
     }
     null_diagnostic = {
