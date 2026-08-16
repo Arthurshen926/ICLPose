@@ -318,6 +318,14 @@ class PureRadioPhysicalRetrieval:
                 raise ValueError(f"pure retrieval contract requires {key}=false")
         if metadata.get("scene_aggregation") != SCENE_AGGREGATION:
             raise ValueError("unknown pure retrieval scene aggregation")
+        declared_child_semantics = metadata.get("child_probability_semantics")
+        if declared_child_semantics is not None:
+            from .fine_support_selection import CHILD_PROBABILITY_SEMANTICS
+
+            if str(declared_child_semantics) != CHILD_PROBABILITY_SEMANTICS:
+                raise ValueError("unknown child probability semantics")
+            if metadata.get("child_probability_is_calibrated_credible_mass", False) is not False:
+                raise ValueError("joint child evidence cannot claim calibrated credible mass")
         object.__setattr__(self, "image_id", str(self.image_id))
         object.__setattr__(self, "token_xy", xy)
         object.__setattr__(self, "token_parent_ids", parent_ids)

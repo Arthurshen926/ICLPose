@@ -31,6 +31,7 @@ from feature_extract.vfm.localization_goal_maplet.feature_contract import (
     FieldFeatureContract,
 )
 from feature_extract.vfm.localization_goal_maplet.fine_support_selection import (
+    CHILD_PROBABILITY_SEMANTICS,
     SELECTION_SEMANTICS as FINE_SUPPORT_SELECTION_SEMANTICS,
     child_surface_area_m2,
     select_fine_supports_under_area_budget,
@@ -269,11 +270,14 @@ def main(argv: Sequence[str] | None = None) -> None:
             continue
         started = time.perf_counter()
         raw = _load_raw_final(Path(record.token_path), "radio_final")
+        loaded_at = time.perf_counter()
         if raw.ndim != 3 or raw.shape[1:] != (36, 64):
             raise ValueError("pure retrieval requires complete RADIO 36x64 final grid")
         token_xy = all_radio_token_coordinates(36, 64)
         mapped = mapper.project(raw).measurement_context
+        mapped_at = time.perf_counter()
         descriptor = encode_radio_final_regions(mapped, token_xy, config)
+        encoded_at = time.perf_counter()
         if anonymous_parent_readout is None:
             parent = retrieve_maplet_posterior_decomposed(
                 descriptor,
@@ -299,6 +303,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 null_similarity_center=float(calibration.center),
                 null_similarity_scale=float(calibration.scale),
             )
+        parent_at = time.perf_counter()
         child = retrieve_children_given_parents(
             descriptor,
             parent.candidate_ids,
@@ -310,6 +315,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             maximum_child_candidates=int(args.maximum_child_candidates),
             temperature=float(args.child_temperature),
         )
+        child_at = time.perf_counter()
         parent_rows = np.asarray(
             [
                 [parent_row_by_id.get(int(value), -1) for value in values]
@@ -375,6 +381,16 @@ def main(argv: Sequence[str] | None = None) -> None:
                 )
             )
         elapsed = float(time.perf_counter() - started)
+        stage_seconds = {
+            "radio_npz_load": float(loaded_at - started),
+            "surface_mapper_projection": float(mapped_at - loaded_at),
+            "full_radio_layout_encoding": float(encoded_at - mapped_at),
+            "parent_multimode_scoring": float(parent_at - encoded_at),
+            "child_joint_posterior_expansion": float(child_at - parent_at),
+            "scene_aggregation_and_set_selection": float(
+                started + elapsed - child_at
+            ),
+        }
         result = PureRadioPhysicalRetrieval(
             image_id=record.image_id,
             token_xy=token_xy,
@@ -411,6 +427,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                     else None
                 ),
                 "maximum_child_candidates": int(args.maximum_child_candidates),
+                "child_probability_semantics": CHILD_PROBABILITY_SEMANTICS,
+                "child_probability_is_calibrated_credible_mass": False,
                 "maximum_scene_parents": int(args.maximum_scene_parents),
                 "maximum_scene_children": int(
                     args.maximum_budgeted_scene_children
@@ -464,6 +482,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "positive_scene_children_before_iou_nms": positive_child_count,
                 "children_suppressed_by_primitive_iou_nms": suppressed,
                 "elapsed_seconds": elapsed,
+                "stage_seconds": stage_seconds,
                 "radio_final_content_sha256": _array_sha256(raw),
                 "physical_map_file_sha256": compute_file_sha256(physical_path),
                 "canonical_field_file_sha256": compute_file_sha256(field_path),
@@ -498,6 +517,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "artifact_sha256": compute_file_sha256(destination),
                 "content_sha256": result.content_sha256,
                 "elapsed_seconds": elapsed,
+                "stage_seconds": stage_seconds,
                 "reused_verified": False,
             }
         )
@@ -528,6 +548,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         "field_feature_contract_sha256": contract.content_sha256,
         "validity_calibration_sha256": calibration.content_sha256,
         "method": "full_radio_36x64_parent_then_child_physical_retrieval",
+        "child_probability_semantics": CHILD_PROBABILITY_SEMANTICS,
+        "child_probability_is_calibrated_credible_mass": False,
         "scene_aggregation": SCENE_AGGREGATION,
         "parent_score_semantics": str(args.parent_score_semantics),
         "parent_scene_ranking_semantics": str(args.parent_scene_ranking_semantics),
@@ -545,6 +567,27 @@ def main(argv: Sequence[str] | None = None) -> None:
         "uses_sfm_tracks": False,
         "uses_mapping_rgb": False,
         "uses_image_retrieval": False,
+        "stage_runtime_seconds": {
+            key: {
+                "median": float(np.median([
+                    float(row["stage_seconds"][key])
+                    for row in rows if "stage_seconds" in row
+                ])),
+                "p90": float(np.quantile([
+                    float(row["stage_seconds"][key])
+                    for row in rows if "stage_seconds" in row
+                ], 0.90)),
+            }
+            for key in (
+                "radio_npz_load",
+                "surface_mapper_projection",
+                "full_radio_layout_encoding",
+                "parent_multimode_scoring",
+                "child_joint_posterior_expansion",
+                "scene_aggregation_and_set_selection",
+            )
+            if any("stage_seconds" in row for row in rows)
+        },
         "rows": rows,
     }
     _atomic_json(report, summary_path)

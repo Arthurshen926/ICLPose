@@ -2,9 +2,16 @@ import numpy as np
 import pytest
 
 from feature_extract.vfm.localization_goal_maplet.fine_support_selection import (
+    EVIDENCE_BLOCK_CAPPED_SUM,
+    EVIDENCE_BLOCK_MAX_SUM,
+    aggregate_child_evidence,
+    audit_joint_child_probability_contract,
     child_surface_area_m2,
     select_fine_supports_under_area_budget,
     total_map_surface_area_m2,
+)
+from feature_extract.vfm.localization_goal_maplet.physical_map import (
+    GoalMapletPhysicalMap,
 )
 from test_goal_maplet_pure_retrieval import _physical
 
@@ -119,3 +126,68 @@ def test_budgeted_selection_rejects_invalid_probability():
             target_candidate_posterior_mass_fraction=0.0,
         )
     assert np.all(child_surface_area_m2(physical) > 0.0)
+
+
+def test_block_evidence_controls_correlated_token_repetition():
+    xy = np.asarray([[0, 0], [1, 0], [4, 0], [5, 0]], dtype=np.int64)
+    rows = np.asarray([[0], [0], [0], [1]], dtype=np.int64)
+    probability = np.asarray([[0.8], [0.7], [0.6], [0.9]], dtype=np.float32)
+    capped = aggregate_child_evidence(
+        rows, probability, xy, child_count=2,
+        semantics=EVIDENCE_BLOCK_CAPPED_SUM, block_size=4,
+    )
+    maximum = aggregate_child_evidence(
+        rows, probability, xy, child_count=2,
+        semantics=EVIDENCE_BLOCK_MAX_SUM, block_size=4,
+    )
+    np.testing.assert_allclose(capped, [1.6, 0.9])
+    np.testing.assert_allclose(maximum, [1.4, 0.9])
+
+
+def test_joint_child_contract_rejects_mass_above_parent():
+    physical = _physical()
+    child = 0
+    parent_row = int(physical.child_parent_rows[child])
+    parent_id = int(physical.maplet_ids[parent_row])
+    audit = audit_joint_child_probability_contract(
+        np.asarray([[parent_id]], dtype=np.int64),
+        np.asarray([[0.8]], dtype=np.float32),
+        np.asarray([[child]], dtype=np.int64),
+        np.asarray([[0.6]], dtype=np.float32),
+        physical,
+    )
+    assert audit["joint_mass_conservation_verified"] is True
+    with pytest.raises(ValueError, match="exceeds"):
+        audit_joint_child_probability_contract(
+            np.asarray([[parent_id]], dtype=np.int64),
+            np.asarray([[0.5]], dtype=np.float32),
+            np.asarray([[child]], dtype=np.int64),
+            np.asarray([[0.6]], dtype=np.float32),
+            physical,
+        )
+
+
+def test_connected_component_budget_is_hard():
+    base = _physical()
+    metadata = dict(base.metadata)
+    metadata.pop("content_sha256", None)
+    metadata["child_voxel_size_m"] = 1.0
+    centers = np.asarray(base.child_centers, dtype=np.float64).copy()
+    centers[:, 0] = 3.0 * np.arange(centers.shape[0])
+    physical = GoalMapletPhysicalMap(
+        **{**base.__dict__, "child_centers": centers, "metadata": metadata}
+    )
+    rows = np.tile(
+        np.arange(physical.child_parent_rows.size, dtype=np.int64), (4, 1)
+    )
+    result = select_fine_supports_under_area_budget(
+        rows,
+        np.ones_like(rows, dtype=np.float32) * 0.2,
+        physical.maplet_ids,
+        physical,
+        maximum_area_fraction=1.0,
+        maximum_children=rows.shape[1],
+        maximum_connected_components=1,
+    )
+    assert result.connected_component_count == 1
+    assert result.child_rows.size == 1

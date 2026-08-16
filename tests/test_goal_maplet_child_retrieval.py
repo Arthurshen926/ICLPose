@@ -2,7 +2,10 @@ import numpy as np
 from types import SimpleNamespace
 
 from feature_extract.vfm.localization_goal_maplet import build_goal_maplet_physical_map
-from feature_extract.vfm.localization_goal_maplet.child_retrieval import retrieve_children_given_parents
+from feature_extract.vfm.localization_goal_maplet.child_retrieval import (
+    _rank_sparse_joint_topk,
+    retrieve_children_given_parents,
+)
 from test_goal_maplet_physical_map import _inputs
 
 
@@ -110,3 +113,28 @@ def test_vectorized_child_retrieval_matches_scalar_probability_factorization():
     np.testing.assert_allclose(actual.best_child_probabilities_by_parent, expected[5], atol=2e-7)
     np.testing.assert_array_equal(actual.child_rows_by_parent, expected[6])
     np.testing.assert_allclose(actual.child_probabilities_by_parent, expected[7], atol=2e-7)
+
+
+def test_sparse_topk_matches_global_lexsort_including_boundary_ties():
+    token = np.repeat(np.arange(5, dtype=np.int64), [7, 3, 9, 1, 8])
+    child = np.concatenate([
+        np.arange(count, dtype=np.int64) for count in [7, 3, 9, 1, 8]
+    ])
+    probability = np.asarray(
+        [0.4, 0.1, 0.4, 0.3, 0.2, 0.3, 0.4,
+         0.2, 0.2, 0.1,
+         0.8, 0.7, 0.6, 0.5, 0.5, 0.5, 0.4, 0.3, 0.2,
+         0.9,
+         0.1, 0.9, 0.4, 0.4, 0.4, 0.2, 0.8, 0.3],
+        dtype=np.float64,
+    )
+    rows, scores = _rank_sparse_joint_topk(
+        token, child, probability, token_count=5, keep=4,
+    )
+    for index in range(5):
+        mask = token == index
+        order = np.lexsort((child[mask], -probability[mask]))[:4]
+        count = min(4, int(np.sum(mask)))
+        np.testing.assert_array_equal(rows[index, :count], child[mask][order])
+        np.testing.assert_array_equal(scores[index, :count], probability[mask][order])
+        assert np.all(rows[index, count:] == -1)

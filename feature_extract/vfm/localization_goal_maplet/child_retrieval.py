@@ -9,6 +9,69 @@ import numpy as np
 from .physical_map import GoalMapletPhysicalMap
 
 
+def _rank_sparse_joint_topk(
+    token_rows: np.ndarray,
+    child_rows: np.ndarray,
+    probabilities: np.ndarray,
+    *,
+    token_count: int,
+    keep: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Rank sparse rows per token without globally sorting every candidate.
+
+    Input is ordered by ``(token, child)`` and contains one value per key.
+    At the kth boundary all values strictly above the threshold are retained,
+    then the smallest child rows fill an exact tie.  This reproduces the
+    historical stable ``(-probability, child_row)`` ordering.
+    """
+
+    token = np.asarray(token_rows, dtype=np.int64).reshape(-1)
+    child = np.asarray(child_rows, dtype=np.int64).reshape(-1)
+    probability = np.asarray(probabilities, dtype=np.float64).reshape(-1)
+    count = int(token_count)
+    width = int(keep)
+    if (
+        child.shape != token.shape
+        or probability.shape != token.shape
+        or count <= 0
+        or width <= 0
+        or np.any((token < 0) | (token >= count))
+        or np.any(child < 0)
+        or np.any(~np.isfinite(probability))
+        or np.any(probability <= 0.0)
+        or (token.size > 1 and np.any(token[1:] < token[:-1]))
+    ):
+        raise ValueError("invalid sparse child ranking input")
+    output_rows = np.full((count, width), -1, dtype=np.int64)
+    output_probability = np.zeros((count, width), dtype=np.float64)
+    counts = np.bincount(token, minlength=count)
+    starts = np.cumsum(np.r_[0, counts[:-1]])
+    for token_row in np.flatnonzero(counts).tolist():
+        start = int(starts[token_row])
+        end = start + int(counts[token_row])
+        local_child = child[start:end]
+        local_probability = probability[start:end]
+        retained_count = min(width, int(local_child.size))
+        if local_child.size > retained_count:
+            threshold_index = local_child.size - retained_count
+            threshold = float(
+                np.partition(local_probability, threshold_index)[threshold_index]
+            )
+            above = np.flatnonzero(local_probability > threshold)
+            tied = np.flatnonzero(local_probability == threshold)
+            needed = retained_count - int(above.size)
+            retained = np.concatenate((above, tied[:needed]))
+        else:
+            retained = np.arange(local_child.size, dtype=np.int64)
+        order = np.lexsort(
+            (local_child[retained], -local_probability[retained])
+        )
+        retained = retained[order]
+        output_rows[token_row, :retained_count] = local_child[retained]
+        output_probability[token_row, :retained_count] = local_probability[retained]
+    return output_rows, output_probability
+
+
 @dataclass(frozen=True)
 class ChildTilePosterior:
     candidate_child_rows: np.ndarray
@@ -146,16 +209,15 @@ def retrieve_children_given_parents(
         parent_ids.shape + (alternatives_per_parent,), dtype=np.float64,
     )
 
-    # The historical implementation issued one tiny dot-product and several
-    # Python reductions for every token×parent pair (2304×64 in production).
-    # Grouping equal parents keeps exactly the same parent-wise softmax and
-    # probability factorization while turning those operations into bounded
-    # matrix kernels.  The dense joint matrix is only T×7653 (~141 MiB in
-    # float64 for the current map), independent of the number of Python
-    # candidate objects.
-    joint = np.zeros(
-        (local.shape[0], physical.child_parent_rows.size), dtype=np.float64
-    )
+    # Group equal parents, but retain only actual token×child triples.  The
+    # former dense T×all-children matrix allocated ~141 MiB and then sorted all
+    # 7,653 children for every token even though a token's 64 parent slots
+    # expose only a small subset.  Sparse triples preserve the exact
+    # P(parent|u)P(child|parent,u) factorization and deterministic child-row tie
+    # break while making work proportional to the exposed hierarchy edges.
+    joint_token_parts: list[np.ndarray] = []
+    joint_child_parts: list[np.ndarray] = []
+    joint_probability_parts: list[np.ndarray] = []
     flat_parent = parent_rows.reshape(-1)
     flat_probability = parent_probability.reshape(-1)
     valid_slots = np.flatnonzero((flat_parent >= 0) & (flat_probability > 0.0))
@@ -212,20 +274,43 @@ def retrieve_children_given_parents(
             joint_probability = (
                 flat_probability[slots, None] * conditional
             )
-            np.add.at(
-                joint,
-                (support_rows[:, None], children[None, :]),
-                joint_probability,
+            joint_token_parts.append(
+                np.repeat(support_rows, children.size).astype(np.int64)
             )
+            joint_child_parts.append(
+                np.tile(children, support_rows.size).astype(np.int64)
+            )
+            joint_probability_parts.append(joint_probability.reshape(-1))
 
-    # Stable sorting preserves ascending child row as the deterministic tie
-    # break, exactly matching the previous ``(-probability, child_row)`` key.
-    ranked_count = min(keep, int(physical.child_parent_rows.size))
-    ranked_rows = np.argsort(-joint, axis=1, kind="stable")[:, :ranked_count]
-    ranked_probability = np.take_along_axis(joint, ranked_rows, axis=1)
-    positive = ranked_probability > 0.0
-    output_rows[:, :ranked_count][positive] = ranked_rows[positive]
-    output_probability[:, :ranked_count][positive] = ranked_probability[positive]
+    if joint_token_parts:
+        joint_token = np.concatenate(joint_token_parts)
+        joint_child = np.concatenate(joint_child_parts)
+        joint_probability = np.concatenate(joint_probability_parts)
+        key = (
+            joint_token.astype(np.int64) * int(physical.child_parent_rows.size)
+            + joint_child
+        )
+        key_order = np.argsort(key, kind="stable")
+        ordered_key = key[key_order]
+        ordered_probability = joint_probability[key_order]
+        start = np.r_[
+            0, np.flatnonzero(ordered_key[1:] != ordered_key[:-1]) + 1
+        ]
+        unique_key = ordered_key[start]
+        unique_probability = np.add.reduceat(ordered_probability, start)
+        unique_token = unique_key // int(physical.child_parent_rows.size)
+        unique_child = unique_key % int(physical.child_parent_rows.size)
+        positive = unique_probability > 0.0
+        unique_token = unique_token[positive]
+        unique_child = unique_child[positive]
+        unique_probability = unique_probability[positive]
+        output_rows, output_probability = _rank_sparse_joint_topk(
+            unique_token,
+            unique_child,
+            unique_probability,
+            token_count=local.shape[0],
+            keep=keep,
+        )
     output_null = np.clip(
         np.maximum(parent_null, 1.0 - np.sum(output_probability, axis=1)),
         0.0,

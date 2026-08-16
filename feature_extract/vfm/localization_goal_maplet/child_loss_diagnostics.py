@@ -221,13 +221,32 @@ def evaluate_child_loss_decomposition(
                 pool, priority, child_area, maximum_area=maximum_area
             )
             curves[key][name] = _curve_row(chosen, child_truth, child_area, total)
+        matched_pool = np.flatnonzero(current_parent_candidate)
+        matched_truth_priority = np.divide(
+            child_truth,
+            child_area,
+            out=np.zeros_like(child_truth),
+            where=child_area > 0.0,
+        )
+        matched_oracle = _greedy_area_selection(
+            matched_pool,
+            matched_truth_priority,
+            child_area,
+            maximum_area=maximum_area,
+        )
+        curves[key]["matched_candidate_gt_budget_oracle"] = _curve_row(
+            matched_oracle, child_truth, child_area, total
+        )
+        curves[key]["matched_candidate_unconstrained_ceiling"] = _curve_row(
+            matched_pool, child_truth, child_area, total
+        )
 
     attribution = {
         "C0_visible_mass_without_canonical_feature": c0,
         "C1_visible_mass_parent_not_selected": c1,
         "C2_visible_mass_child_not_in_token_candidates_given_parent": c2,
         "C3_visible_mass_candidate_with_zero_scene_evidence": c3,
-        "C4_visible_mass_positive_candidate_removed_by_scene_budget": c4,
+        "C4_downstream_ranking_budget_and_set_construction_residual": c4,
         "C5_boundary_or_wrong_scale_credit_within_0.5m": c5,
         "C6_selected_child_area_overlap_waste_fraction": float(overlap_waste),
         "C7_mean_token_null_plus_tail_probability": c7,
@@ -250,6 +269,15 @@ def evaluate_child_loss_decomposition(
         "attribution": attribution,
         "dominant_attribution": dominant,
         "area_curves": curves,
+        "oracle_candidate_universe_contract": {
+            "full_map_oracle": "all canonical child supports",
+            "parent_oracle": "all child supports in selected physical parents",
+            "candidate_oracle": "stored sparse token child candidate union",
+            "budgeted_candidate_oracle": (
+                "stored sparse candidates in selected parents under identical map-area budget"
+            ),
+            "matched_candidate_oracle_is_evaluator_only": True,
+        },
         "claim_scope": {
             "evaluator_only": True,
             "ground_truth_not_returned_to_retrieval": True,

@@ -55,7 +55,7 @@ def test_child_loss_decomposition_separates_budget_and_feature_support():
     attribution = report["attribution"]
     assert attribution["C0_visible_mass_without_canonical_feature"] == 1.0
     assert (
-        attribution["C4_visible_mass_positive_candidate_removed_by_scene_budget"]
+        attribution["C4_downstream_ranking_budget_and_set_construction_residual"]
         == 1.0
     )
     assert attribution["C5_boundary_or_wrong_scale_credit_within_0.5m"] == 1.0
@@ -64,5 +64,8 @@ def test_child_loss_decomposition_separates_budget_and_feature_support():
         "current_parent_oracle_all_children"
     ]
     assert oracle["exact_visible_mass_recall"] == pytest.approx(1.0)
+    matched = report["area_curves"]["area_1.00"][
+        "matched_candidate_gt_budget_oracle"
+    ]
+    assert matched["exact_visible_mass_recall"] == pytest.approx(1.0)
     assert report["claim_scope"]["ground_truth_not_returned_to_retrieval"] is True
-

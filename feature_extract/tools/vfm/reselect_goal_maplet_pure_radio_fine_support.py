@@ -16,7 +16,10 @@ from feature_extract.vfm.localization_goal_maplet.connected_fine_support import 
     connected_fine_support_components,
 )
 from feature_extract.vfm.localization_goal_maplet.fine_support_selection import (
+    CHILD_PROBABILITY_SEMANTICS,
+    EVIDENCE_SEMANTICS,
     SELECTION_SEMANTICS,
+    audit_joint_child_probability_contract,
     child_surface_area_m2,
     select_fine_supports_under_area_budget,
     total_map_surface_area_m2,
@@ -39,9 +42,19 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--maximum_area_fraction", type=float, required=True)
     parser.add_argument("--maximum_children", type=int, default=2048)
     parser.add_argument(
-        "--target_candidate_posterior_mass_fraction", type=float, default=1.0
+        "--target_eligible_evidence_fraction",
+        "--target_candidate_posterior_mass_fraction",
+        dest="target_eligible_evidence_fraction",
+        type=float,
+        default=1.0,
     )
     parser.add_argument("--maximum_child_primitive_iou", type=float, default=0.50)
+    parser.add_argument(
+        "--evidence_semantics", choices=EVIDENCE_SEMANTICS,
+        default=EVIDENCE_SEMANTICS[0],
+    )
+    parser.add_argument("--evidence_block_size", type=int, default=4)
+    parser.add_argument("--maximum_connected_components", type=int, default=0)
     parser.add_argument("--expected_queries", type=int, default=0)
     parser.add_argument("--force", action="store_true")
     return parser.parse_args(argv)
@@ -109,6 +122,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     area_fractions: list[float] = []
     posterior_masses: list[float] = []
     component_counts: list[int] = []
+    primitive_counts: list[int] = []
+    probability_audits: list[dict[str, object]] = []
     for index, record in enumerate(records):
         source = Path(str(record["artifact"])).resolve()
         if compute_file_sha256(source) != str(record["artifact_sha256"]):
@@ -129,21 +144,47 @@ def main(argv: Sequence[str] | None = None) -> None:
             maximum_children=int(args.maximum_children),
             maximum_primitive_iou=float(args.maximum_child_primitive_iou),
             target_candidate_posterior_mass_fraction=float(
-                args.target_candidate_posterior_mass_fraction
+                args.target_eligible_evidence_fraction
             ),
             precomputed_child_surface_area_m2=child_area,
             precomputed_total_map_surface_area_m2=total_map_area,
+            token_xy=retrieval.token_xy,
+            evidence_semantics=str(args.evidence_semantics),
+            evidence_block_size=int(args.evidence_block_size),
+            maximum_connected_components=int(args.maximum_connected_components),
+        )
+        probability_audit = audit_joint_child_probability_contract(
+            retrieval.token_parent_ids,
+            retrieval.token_parent_probabilities,
+            retrieval.token_child_rows,
+            retrieval.token_child_probabilities,
+            physical,
         )
         components = connected_fine_support_components(
             selection.child_rows,
             physical,
             precomputed_child_surface_area_m2=child_area,
         )
+        selected_primitive_rows = np.unique(np.concatenate([
+            np.asarray(
+                physical.child_member_primitive_rows[
+                    int(physical.child_member_offsets[int(child)]):
+                    int(physical.child_member_offsets[int(child) + 1])
+                ],
+                dtype=np.int64,
+            )
+            for child in selection.child_rows.tolist()
+        ])) if selection.child_rows.size else np.zeros(0, dtype=np.int64)
         metadata = dict(retrieval.metadata)
         metadata.pop("content_sha256", None)
         metadata.update(
             {
                 "fine_support_selection_semantics": SELECTION_SEMANTICS,
+                "child_probability_semantics": CHILD_PROBABILITY_SEMANTICS,
+                "child_probability_is_calibrated_credible_mass": False,
+                "child_probability_contract_audit": probability_audit,
+                "summed_token_evidence_semantics": str(args.evidence_semantics),
+                "summed_token_evidence_is_calibrated_probability": False,
                 "maximum_fine_support_area_fraction": float(
                     args.maximum_area_fraction
                 ),
@@ -169,10 +210,19 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "selection_uses_ground_truth": False,
                 "connected_fine_support_semantics": COMPONENT_SEMANTICS,
                 "connected_fine_support_count": int(components.component_count),
-                "target_candidate_posterior_mass_fraction": float(
-                    args.target_candidate_posterior_mass_fraction
+                "selected_unique_primitive_count": int(
+                    selected_primitive_rows.size
                 ),
-                "achieved_candidate_posterior_mass_fraction": float(
+                "maximum_connected_fine_support_count": int(
+                    args.maximum_connected_components
+                ),
+                "connected_component_hard_cap_is_diagnostic_ablation": bool(
+                    args.maximum_connected_components > 0
+                ),
+                "target_eligible_evidence_fraction": float(
+                    args.target_eligible_evidence_fraction
+                ),
+                "achieved_eligible_evidence_fraction": float(
                     selection.posterior_mass.sum()
                     / max(selection.eligible_posterior_mass, 1e-12)
                 ),
@@ -198,6 +248,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
         posterior_masses.append(float(selection.posterior_mass.sum()))
         component_counts.append(int(components.component_count))
+        primitive_counts.append(int(selected_primitive_rows.size))
+        probability_audits.append(probability_audit)
         output_rows.append(
             {
                 "image_id": result.image_id,
@@ -208,6 +260,9 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "selected_child_count": int(selection.child_rows.size),
                 "selected_surface_area_m2": float(selection.selected_surface_area_m2),
                 "connected_fine_support_count": int(components.component_count),
+                "selected_unique_primitive_count": int(
+                    selected_primitive_rows.size
+                ),
             }
         )
         if (index + 1) % 50 == 0 or index + 1 == len(records):
@@ -232,20 +287,37 @@ def main(argv: Sequence[str] | None = None) -> None:
         "method": "full_radio_36x64_parent_then_area_budgeted_child_set",
         "scene_aggregation": str(records and PureRadioPhysicalRetrieval.load_npz(Path(str(records[0]["artifact"]))).metadata["scene_aggregation"]),
         "fine_support_selection_semantics": SELECTION_SEMANTICS,
+        "child_probability_semantics": CHILD_PROBABILITY_SEMANTICS,
+        "child_probability_is_calibrated_credible_mass": False,
+        "child_probability_contract_verified_for_every_query": bool(
+            all(bool(value["joint_mass_conservation_verified"])
+                for value in probability_audits)
+        ),
+        "summed_token_evidence_semantics": str(args.evidence_semantics),
+        "summed_token_evidence_is_calibrated_probability": False,
         "maximum_fine_support_area_fraction": float(args.maximum_area_fraction),
         "maximum_scene_children": int(args.maximum_children),
-        "target_candidate_posterior_mass_fraction": float(
-            args.target_candidate_posterior_mass_fraction
+        "target_eligible_evidence_fraction": float(
+            args.target_eligible_evidence_fraction
         ),
         "maximum_child_primitive_iou": float(args.maximum_child_primitive_iou),
+        "maximum_connected_fine_support_count": int(
+            args.maximum_connected_components
+        ),
+        "connected_component_hard_cap_is_diagnostic_ablation": bool(
+            args.maximum_connected_components > 0
+        ),
         "mean_selected_child_count": float(sum(selected_counts) / len(selected_counts)),
         "mean_selected_map_area_fraction": float(sum(area_fractions) / len(area_fractions)),
-        "mean_selected_token_posterior_mass": float(
+        "mean_selected_summed_token_evidence_mass": float(
             sum(posterior_masses) / len(posterior_masses)
         ),
         "connected_fine_support_semantics": COMPONENT_SEMANTICS,
         "mean_connected_fine_support_count": float(
             sum(component_counts) / len(component_counts)
+        ),
+        "mean_selected_unique_primitive_count": float(
+            sum(primitive_counts) / len(primitive_counts)
         ),
         **{key: False for key in required_false},
         "rows": output_rows,
