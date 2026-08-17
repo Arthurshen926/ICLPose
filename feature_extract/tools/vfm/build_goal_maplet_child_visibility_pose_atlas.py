@@ -51,7 +51,8 @@ def main() -> None:
     )
     atlas.save_npz(output)
     report = {
-        "artifact_type": "goal_maplet_child_visibility_pose_atlas_build_v1",
+        "artifact_type": "goal_maplet_child_visibility_pose_atlas_build_v3",
+        "content_hash_includes_schema_score_grid_and_physical_map": True,
         "output_atlas": str(output.resolve()),
         "content_sha256": atlas.content_sha256,
         "physical_map_sha256": atlas.physical_map_sha256,
@@ -59,6 +60,7 @@ def main() -> None:
         "child_count": atlas.child_count,
         "grid_rows": atlas.grid_rows,
         "grid_cols": atlas.grid_cols,
+        "layout_normalization": "joint_cell_child_probability_after_per_cell_truncation",
         "global_relation_count": int(atlas.global_child_rows.size),
         "layout_relation_count": int(atlas.layout_keys.size),
         "mean_global_children_per_view": float(

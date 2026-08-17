@@ -22,14 +22,14 @@ from typing import Mapping, Sequence
 import numpy as np
 from scipy import sparse
 
-from .lineage import arrays_sha256
+from .lineage import arrays_sha256, canonical_json_sha256
 from .physical_map import GoalMapletPhysicalMap
 from .pose_proposal import _rotation_distance_degrees
 from .pure_retrieval import PureRadioPhysicalRetrieval, all_radio_token_coordinates
 
 
-SCHEMA = "goal_maplet_child_visibility_pose_atlas_v1"
-SCORE_SEMANTICS = "global_and_fixed_grid_child_bhattacharyya_affinity_v1"
+SCHEMA = "goal_maplet_child_visibility_pose_atlas_v3"
+SCORE_SEMANTICS = "global_and_joint_grid_child_bhattacharyya_affinity_v3_semantic_hash"
 
 
 def _validate_pose_batch(poses_w2c: np.ndarray) -> np.ndarray:
@@ -139,7 +139,7 @@ class ChildVisibilityPoseAtlas:
 
     @property
     def content_sha256(self) -> str:
-        return arrays_sha256({
+        array_sha256 = arrays_sha256({
             "poses_w2c": self.poses_w2c,
             "global_offsets": self.global_offsets,
             "global_child_rows": self.global_child_rows,
@@ -147,6 +147,15 @@ class ChildVisibilityPoseAtlas:
             "layout_offsets": self.layout_offsets,
             "layout_keys": self.layout_keys,
             "layout_weights": self.layout_weights,
+        })
+        return canonical_json_sha256({
+            "artifact_type": SCHEMA,
+            "score_semantics": SCORE_SEMANTICS,
+            "array_sha256": array_sha256,
+            "child_count": int(self.child_count),
+            "grid_rows": int(self.grid_rows),
+            "grid_cols": int(self.grid_cols),
+            "physical_map_sha256": str(self.physical_map_sha256),
         })
 
     def save_npz(self, path: Path) -> None:
@@ -243,6 +252,43 @@ def _top_normalized_sqrt(
     return rows.astype(np.int32), weight.astype(np.float32)
 
 
+def _joint_layout_normalized_sqrt(
+    layout_mass: np.ndarray,
+    *,
+    maximum_children_per_cell: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Truncate per cell, then normalize the retained joint ``(cell,child)`` mass.
+
+    Normalizing every cell separately makes a nearly empty cell carry the same
+    norm as a reliable one.  The joint distribution preserves that reliability
+    while keeping the same deterministic per-cell sparsity budget.
+    """
+
+    mass = np.asarray(layout_mass, dtype=np.float64)
+    if mass.ndim != 2 or np.any(~np.isfinite(mass)) or np.any(mass < 0.0):
+        raise ValueError("layout mass must be a finite nonnegative matrix")
+    child_count = int(mass.shape[1])
+    keys_out: list[np.ndarray] = []
+    mass_out: list[np.ndarray] = []
+    for cell_row in range(int(mass.shape[0])):
+        value = mass[cell_row]
+        rows = np.flatnonzero(value > 0.0)
+        if rows.size > int(maximum_children_per_cell):
+            order = np.lexsort((rows, -value[rows]))[
+                : int(maximum_children_per_cell)
+            ]
+            rows = rows[order]
+        rows = np.sort(rows)
+        keys_out.append((cell_row * child_count + rows).astype(np.int32))
+        mass_out.append(value[rows])
+    keys = np.concatenate(keys_out)
+    retained_mass = np.concatenate(mass_out)
+    total = float(np.sum(retained_mass))
+    if total <= 0.0:
+        return np.zeros((0,), dtype=np.int32), np.zeros((0,), dtype=np.float32)
+    return keys, np.sqrt(retained_mass / total).astype(np.float32)
+
+
 def build_child_visibility_pose_atlas(
     physical: GoalMapletPhysicalMap,
     contributor_paths: Sequence[Path],
@@ -307,18 +353,10 @@ def build_child_visibility_pose_atlas(
         global_rows, global_weight = _top_normalized_sqrt(
             global_mass, maximum_entries=int(maximum_global_children)
         )
-        local_keys: list[np.ndarray] = []
-        local_weight: list[np.ndarray] = []
-        for cell_row in range(cell_count):
-            rows, value = _top_normalized_sqrt(
-                layout_mass[cell_row],
-                maximum_entries=int(maximum_children_per_cell),
-                scale=1.0 / np.sqrt(float(cell_count)),
-            )
-            local_keys.append((cell_row * child_count + rows).astype(np.int32))
-            local_weight.append(value)
-        keys = np.concatenate(local_keys)
-        values = np.concatenate(local_weight)
+        keys, values = _joint_layout_normalized_sqrt(
+            layout_mass,
+            maximum_children_per_cell=int(maximum_children_per_cell),
+        )
         poses.append(pose)
         global_rows_out.append(global_rows)
         global_weights_out.append(global_weight)
@@ -350,7 +388,7 @@ def build_child_visibility_pose_atlas(
             "uses_sfm_points": False,
             "uses_sfm_tracks": False,
             "mapping_pose_role": "visibility_chart_sample_not_final_pose",
-            "grid_semantics": "fixed_equal_image_blocks_coarse_layout",
+            "grid_semantics": "fixed_blocks_joint_cell_child_probability",
             "source_contributor_count": len(paths),
             **dict(metadata or {}),
         },
@@ -393,19 +431,11 @@ def query_child_affinity_vectors(
     global_rows, global_weight = _top_normalized_sqrt(
         global_mass, maximum_entries=atlas.child_count
     )
-    layout_keys: list[np.ndarray] = []
-    layout_weight: list[np.ndarray] = []
     cell_count = atlas.grid_rows * atlas.grid_cols
-    for cell_row in range(cell_count):
-        local_rows, local_value = _top_normalized_sqrt(
-            layout_mass[cell_row],
-            maximum_entries=atlas.child_count,
-            scale=1.0 / np.sqrt(float(cell_count)),
-        )
-        layout_keys.append(cell_row * atlas.child_count + local_rows)
-        layout_weight.append(local_value)
-    keys = np.concatenate(layout_keys).astype(np.int32)
-    values = np.concatenate(layout_weight).astype(np.float32)
+    keys, values = _joint_layout_normalized_sqrt(
+        layout_mass,
+        maximum_children_per_cell=atlas.child_count,
+    )
     return (
         sparse.csr_matrix(
             (global_weight, global_rows, np.asarray([0, global_rows.size])),
@@ -423,6 +453,7 @@ def score_visibility_pose_atlas(
     retrieval: PureRadioPhysicalRetrieval,
     *,
     layout_weight: float = 0.5,
+    layout_tolerance_cells: int = 0,
     selected_children_only: bool = True,
     matrices: tuple[sparse.csr_matrix, sparse.csr_matrix] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -431,14 +462,46 @@ def score_visibility_pose_atlas(
     alpha = float(layout_weight)
     if not 0.0 <= alpha <= 1.0:
         raise ValueError("layout_weight must lie in [0,1]")
+    if int(layout_tolerance_cells) < 0:
+        raise ValueError("layout_tolerance_cells must be nonnegative")
     global_query, layout_query = query_child_affinity_vectors(
         retrieval, atlas, selected_children_only=selected_children_only
     )
     global_atlas, layout_atlas = atlas.sparse_matrices() if matrices is None else matrices
     global_product = global_atlas @ global_query.T
-    layout_product = layout_atlas @ layout_query.T
     global_score = np.asarray(global_product.toarray()).reshape(-1)
-    layout_score = np.asarray(layout_product.toarray()).reshape(-1)
+    radius = int(layout_tolerance_cells)
+    layout_scores: list[np.ndarray] = []
+    base_keys = layout_query.indices.astype(np.int64)
+    base_values = layout_query.data.astype(np.float32)
+    base_cell = base_keys // atlas.child_count
+    base_child = base_keys % atlas.child_count
+    base_y = base_cell // atlas.grid_cols
+    base_x = base_cell % atlas.grid_cols
+    for delta_y in range(-radius, radius + 1):
+        for delta_x in range(-radius, radius + 1):
+            shifted_y = base_y + delta_y
+            shifted_x = base_x + delta_x
+            valid = (
+                (shifted_y >= 0) & (shifted_y < atlas.grid_rows)
+                & (shifted_x >= 0) & (shifted_x < atlas.grid_cols)
+            )
+            shifted_keys = (
+                (shifted_y[valid] * atlas.grid_cols + shifted_x[valid])
+                * atlas.child_count + base_child[valid]
+            )
+            shifted = sparse.csr_matrix(
+                (
+                    base_values[valid],
+                    shifted_keys.astype(np.int32),
+                    np.asarray([0, int(np.sum(valid))], dtype=np.int64),
+                ),
+                shape=(1, atlas.grid_rows * atlas.grid_cols * atlas.child_count),
+            )
+            layout_scores.append(
+                np.asarray((layout_atlas @ shifted.T).toarray()).reshape(-1)
+            )
+    layout_score = np.max(np.stack(layout_scores, axis=0), axis=0)
     score = (1.0 - alpha) * global_score + alpha * layout_score
     return score.astype(np.float32), global_score.astype(np.float32), layout_score.astype(np.float32)
 
@@ -468,6 +531,164 @@ def diverse_pose_rows(
             for prior in retained
         )
         if not duplicate:
+            retained.append(int(row))
+            if len(retained) >= int(maximum_modes):
+                break
+    return np.asarray(retained, dtype=np.int64)
+
+
+def diverse_dual_queue_pose_rows(
+    poses_w2c: np.ndarray,
+    global_scores: np.ndarray,
+    layout_scores: np.ndarray,
+    *,
+    maximum_modes: int = 32,
+    global_to_layout_ratio: int = 3,
+    translation_nms_m: float = 0.5,
+    rotation_nms_deg: float = 5.0,
+) -> np.ndarray:
+    """Interleave global/layout queues without averaging away either mode.
+
+    Three global proposals followed by one layout proposal is the default.
+    Duplicate or physically equivalent rows are skipped, and each queue keeps
+    advancing until the shared basin budget is filled.
+    """
+
+    pose = _validate_pose_batch(poses_w2c)
+    global_value = np.asarray(global_scores, dtype=np.float64).reshape(-1)
+    layout_value = np.asarray(layout_scores, dtype=np.float64).reshape(-1)
+    if (
+        global_value.shape != (pose.shape[0],)
+        or layout_value.shape != global_value.shape
+        or np.any(~np.isfinite(global_value))
+        or np.any(~np.isfinite(layout_value))
+        or int(maximum_modes) <= 0
+        or int(global_to_layout_ratio) <= 0
+    ):
+        raise ValueError("invalid dual-queue pose proposal inputs")
+    stable = np.arange(pose.shape[0], dtype=np.int64)
+    orders = (
+        np.lexsort((stable, -global_value)),
+        np.lexsort((stable, -layout_value)),
+    )
+    cursors = [0, 0]
+    schedule = [0] * int(global_to_layout_ratio) + [1]
+    retained: list[int] = []
+    retained_set: set[int] = set()
+    centers = -np.swapaxes(pose[:, :3, :3], 1, 2) @ pose[:, :3, 3, None]
+    centers = centers[..., 0]
+    schedule_cursor = 0
+    while len(retained) < int(maximum_modes) and (
+        cursors[0] < pose.shape[0] or cursors[1] < pose.shape[0]
+    ):
+        queue = schedule[schedule_cursor % len(schedule)]
+        schedule_cursor += 1
+        if cursors[queue] >= pose.shape[0]:
+            queue = 1 - queue
+            if cursors[queue] >= pose.shape[0]:
+                break
+        row = int(orders[queue][cursors[queue]])
+        cursors[queue] += 1
+        if row in retained_set:
+            continue
+        duplicate = any(
+            np.linalg.norm(centers[row] - centers[prior]) <= float(translation_nms_m)
+            and _rotation_distance_degrees(pose[row], pose[prior]) <= float(rotation_nms_deg)
+            for prior in retained
+        )
+        if not duplicate:
+            retained.append(row)
+            retained_set.add(row)
+    return np.asarray(retained, dtype=np.int64)
+
+
+def hierarchical_location_orientation_pose_rows(
+    poses_w2c: np.ndarray,
+    global_scores: np.ndarray,
+    layout_scores: np.ndarray,
+    *,
+    maximum_modes: int = 64,
+    orientations_per_location: int = 2,
+    location_radius_m: float = 2.0,
+    orientation_nms_degrees: float = 10.0,
+    translation_nms_m: float = 0.5,
+    rotation_nms_deg: float = 5.0,
+) -> np.ndarray:
+    """Select geography with global evidence, then orientation with layout.
+
+    This is deliberately staged rather than a linear global/layout sum.  The
+    first pass chooses spatially distinct location seeds; the second ranks
+    orientations only inside each fixed-radius location neighbourhood.
+    """
+
+    pose = _validate_pose_batch(poses_w2c)
+    global_value = np.asarray(global_scores, dtype=np.float64).reshape(-1)
+    layout_value = np.asarray(layout_scores, dtype=np.float64).reshape(-1)
+    count = pose.shape[0]
+    if (
+        global_value.shape != (count,) or layout_value.shape != (count,)
+        or np.any(~np.isfinite(global_value)) or np.any(~np.isfinite(layout_value))
+        or int(maximum_modes) <= 0 or int(orientations_per_location) <= 0
+        or float(location_radius_m) <= 0.0 or float(orientation_nms_degrees) <= 0.0
+    ):
+        raise ValueError("invalid hierarchical location-orientation inputs")
+    centers = -np.swapaxes(pose[:, :3, :3], 1, 2) @ pose[:, :3, 3, None]
+    centers = centers[..., 0]
+    location_budget = int(np.ceil(int(maximum_modes) / int(orientations_per_location)))
+    global_order = np.lexsort((np.arange(count), -global_value))
+    location_seeds: list[int] = []
+    for row in global_order:
+        if all(
+            np.linalg.norm(centers[int(row)] - centers[seed]) > float(location_radius_m)
+            for seed in location_seeds
+        ):
+            location_seeds.append(int(row))
+            if len(location_seeds) >= location_budget:
+                break
+    queues: list[list[int]] = []
+    for seed in location_seeds:
+        neighborhood = np.flatnonzero(
+            np.linalg.norm(centers - centers[seed][None], axis=1) <= float(location_radius_m)
+        )
+        order = neighborhood[
+            np.lexsort((neighborhood, -global_value[neighborhood], -layout_value[neighborhood]))
+        ]
+        orientation_rows: list[int] = []
+        for row in order:
+            if all(
+                _rotation_distance_degrees(pose[int(row)], pose[kept])
+                > float(orientation_nms_degrees)
+                for kept in orientation_rows
+            ):
+                orientation_rows.append(int(row))
+                if len(orientation_rows) >= int(orientations_per_location):
+                    break
+        queues.append(orientation_rows)
+    retained: list[int] = []
+    for depth in range(int(orientations_per_location)):
+        for queue in queues:
+            if depth >= len(queue):
+                continue
+            row = queue[depth]
+            if row in retained:
+                continue
+            if any(
+                np.linalg.norm(centers[row] - centers[kept]) <= float(translation_nms_m)
+                and _rotation_distance_degrees(pose[row], pose[kept]) <= float(rotation_nms_deg)
+                for kept in retained
+            ):
+                continue
+            retained.append(row)
+            if len(retained) >= int(maximum_modes):
+                return np.asarray(retained, dtype=np.int64)
+    # Deterministic global fallback only fills unused capacity; it cannot
+    # displace any staged location/orientation proposal.
+    fallback = diverse_pose_rows(
+        pose, global_value, maximum_modes=int(maximum_modes),
+        translation_nms_m=float(translation_nms_m), rotation_nms_deg=float(rotation_nms_deg),
+    )
+    for row in fallback:
+        if int(row) not in retained:
             retained.append(int(row))
             if len(retained) >= int(maximum_modes):
                 break

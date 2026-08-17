@@ -23,7 +23,9 @@ from feature_extract.vfm.localization_goal_maplet.pure_retrieval import (
 )
 from feature_extract.vfm.localization_goal_maplet.visibility_pose_atlas import (
     ChildVisibilityPoseAtlas,
+    diverse_dual_queue_pose_rows,
     diverse_pose_rows,
+    hierarchical_location_orientation_pose_rows,
     score_visibility_pose_atlas,
 )
 
@@ -71,9 +73,21 @@ def main() -> None:
     parser.add_argument("--query_pose_file", required=True)
     parser.add_argument("--output_json", required=True)
     parser.add_argument("--layout_weight", type=float, default=0.5)
+    parser.add_argument("--layout_tolerance_cells", type=int, default=0)
+    parser.add_argument(
+        "--proposal_fusion_semantics",
+        choices=(
+            "linear_score", "dual_queue_3global_1layout",
+            "hierarchical_location_then_orientation_v1",
+        ),
+        default="linear_score",
+    )
     parser.add_argument("--maximum_modes", type=int, default=32)
     parser.add_argument("--translation_nms_m", type=float, default=0.5)
     parser.add_argument("--rotation_nms_deg", type=float, default=5.0)
+    parser.add_argument("--orientations_per_location", type=int, default=2)
+    parser.add_argument("--location_radius_m", type=float, default=2.0)
+    parser.add_argument("--orientation_nms_deg", type=float, default=10.0)
     parser.add_argument(
         "--all_token_candidates",
         action="store_true",
@@ -118,16 +132,35 @@ def main() -> None:
             atlas,
             retrieval,
             layout_weight=float(args.layout_weight),
+            layout_tolerance_cells=int(args.layout_tolerance_cells),
             selected_children_only=not bool(args.all_token_candidates),
             matrices=matrices,
         )
-        selected = diverse_pose_rows(
-            atlas.poses_w2c,
-            score,
-            maximum_modes=int(args.maximum_modes),
-            translation_nms_m=float(args.translation_nms_m),
-            rotation_nms_deg=float(args.rotation_nms_deg),
-        )
+        if args.proposal_fusion_semantics == "hierarchical_location_then_orientation_v1":
+            selected = hierarchical_location_orientation_pose_rows(
+                atlas.poses_w2c, global_score, layout_score,
+                maximum_modes=int(args.maximum_modes),
+                orientations_per_location=int(args.orientations_per_location),
+                location_radius_m=float(args.location_radius_m),
+                orientation_nms_degrees=float(args.orientation_nms_deg),
+                translation_nms_m=float(args.translation_nms_m),
+                rotation_nms_deg=float(args.rotation_nms_deg),
+            )
+        elif args.proposal_fusion_semantics == "dual_queue_3global_1layout":
+            selected = diverse_dual_queue_pose_rows(
+                atlas.poses_w2c, global_score, layout_score,
+                maximum_modes=int(args.maximum_modes), global_to_layout_ratio=3,
+                translation_nms_m=float(args.translation_nms_m),
+                rotation_nms_deg=float(args.rotation_nms_deg),
+            )
+        else:
+            selected = diverse_pose_rows(
+                atlas.poses_w2c,
+                score,
+                maximum_modes=int(args.maximum_modes),
+                translation_nms_m=float(args.translation_nms_m),
+                rotation_nms_deg=float(args.rotation_nms_deg),
+            )
         translation_all, rotation_all = _pose_errors(
             atlas.poses_w2c, gt_by_id[image_id]
         )
@@ -183,10 +216,15 @@ def main() -> None:
         "gt_access_scope": "evaluation_only_after_pose_free_scores_and_nms",
         "score_semantics": "uncalibrated_proposal_affinity_not_pose_posterior",
         "layout_weight": float(args.layout_weight),
+        "layout_tolerance_cells": int(args.layout_tolerance_cells),
+        "proposal_fusion_semantics": str(args.proposal_fusion_semantics),
         "selected_children_only": not bool(args.all_token_candidates),
         "maximum_modes": int(args.maximum_modes),
         "translation_nms_m": float(args.translation_nms_m),
         "rotation_nms_deg": float(args.rotation_nms_deg),
+        "orientations_per_location": int(args.orientations_per_location),
+        "location_radius_m": float(args.location_radius_m),
+        "orientation_nms_deg": float(args.orientation_nms_deg),
         "metrics": metrics,
         "error_summary": {
             "top1_median_translation_m": float(np.median(top1_translation)),

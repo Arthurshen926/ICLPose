@@ -12,8 +12,11 @@ from feature_extract.vfm.localization_goal_maplet.pure_retrieval import (
 )
 from feature_extract.vfm.localization_goal_maplet.visibility_pose_atlas import (
     ChildVisibilityPoseAtlas,
+    _joint_layout_normalized_sqrt,
     build_child_visibility_pose_atlas,
+    diverse_dual_queue_pose_rows,
     diverse_pose_rows,
+    hierarchical_location_orientation_pose_rows,
     score_visibility_pose_atlas,
 )
 from test_goal_maplet_pure_retrieval import _physical
@@ -128,6 +131,15 @@ def test_visibility_atlas_roundtrip_and_forbidden_claim(tmp_path):
     atlas.save_npz(path)
     loaded = ChildVisibilityPoseAtlas.load_npz(path)
     assert loaded.content_sha256 == atlas.content_sha256
+    changed_semantics = ChildVisibilityPoseAtlas(
+        **{**atlas.__dict__, "grid_rows": atlas.grid_cols, "grid_cols": atlas.grid_rows}
+    )
+    if atlas.grid_rows != atlas.grid_cols:
+        assert changed_semantics.content_sha256 != atlas.content_sha256
+    changed_map = ChildVisibilityPoseAtlas(
+        **{**atlas.__dict__, "physical_map_sha256": "f" * 64}
+    )
+    assert changed_map.content_sha256 != atlas.content_sha256
     with pytest.raises(ValueError, match="pose-free handoff"):
         ChildVisibilityPoseAtlas(
             **{**atlas.__dict__, "metadata": {**atlas.metadata, "uses_pnp": True}}
@@ -144,3 +156,42 @@ def test_pose_nms_keeps_distinct_basins_and_stable_ties():
         rotation_nms_deg=5.0,
     )
     assert rows.tolist() == [0, 2, 3]
+
+
+def test_dual_queue_preserves_layout_modes_without_score_averaging():
+    poses = np.stack([_pose(float(index) * 2.0) for index in range(8)])
+    global_score = np.asarray([8, 7, 6, 5, 4, 3, 2, 1], dtype=np.float64)
+    layout_score = np.asarray([1, 2, 3, 4, 5, 6, 7, 8], dtype=np.float64)
+    rows = diverse_dual_queue_pose_rows(
+        poses, global_score, layout_score, maximum_modes=4,
+        global_to_layout_ratio=3,
+    )
+    assert rows.tolist() == [0, 1, 2, 7]
+
+
+def test_hierarchical_selection_uses_global_for_location_then_layout_for_orientation():
+    poses = np.stack([
+        _pose(0.0, 0.0), _pose(0.1, 40.0),
+        _pose(4.0, 0.0), _pose(4.1, 50.0),
+        _pose(8.0, 0.0), _pose(8.1, 60.0),
+    ])
+    global_score = np.asarray([10, 9, 8, 7, 6, 5], dtype=np.float64)
+    layout_score = np.asarray([1, 10, 1, 9, 1, 8], dtype=np.float64)
+    rows = hierarchical_location_orientation_pose_rows(
+        poses, global_score, layout_score,
+        maximum_modes=6, orientations_per_location=2,
+        location_radius_m=1.0, orientation_nms_degrees=10.0,
+    )
+    # First round keeps one layout-best orientation from every global-selected
+    # location; second round keeps the alternate orientations.
+    assert rows.tolist()[:3] == [1, 3, 5]
+    assert set(rows.tolist()) == set(range(6))
+
+
+def test_joint_layout_normalization_preserves_cell_reliability():
+    keys, weights = _joint_layout_normalized_sqrt(
+        np.asarray([[100.0, 0.0], [1.0, 0.0]]),
+        maximum_children_per_cell=2,
+    )
+    assert keys.tolist() == [0, 2]
+    np.testing.assert_allclose(weights * weights, [100.0 / 101.0, 1.0 / 101.0])

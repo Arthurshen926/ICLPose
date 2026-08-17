@@ -11,6 +11,7 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import time
 
 import numpy as np
 
@@ -23,10 +24,12 @@ from feature_extract.vfm.localization_goal_maplet.physical_map import GoalMaplet
 from feature_extract.vfm.localization_goal_maplet.pose_proposal import _rotation_distance_degrees
 from feature_extract.vfm.localization_goal_maplet.pure_retrieval import PureRadioPhysicalRetrieval
 from feature_extract.vfm.localization_goal_maplet.soft_surface_pose_energy import (
+    score_bidirectional_soft_surface_pose_energy,
     score_soft_surface_pose_energy,
 )
 from feature_extract.vfm.localization_goal_maplet.surface_renderer import (
     render_canonical_surface_field,
+    render_soft_child_surface_field,
 )
 from feature_extract.vfm.localization_goal_maplet.visibility_pose_atlas import (
     ChildVisibilityPoseAtlas,
@@ -78,6 +81,12 @@ def main() -> None:
     parser.add_argument("--output_json", required=True)
     parser.add_argument("--candidate_count", type=int, default=8)
     parser.add_argument("--radio_weight", type=float, default=0.5)
+    parser.add_argument(
+        "--energy_semantics",
+        choices=("dominant_child_v1", "bidirectional_soft_child_v2"),
+        default="bidirectional_soft_child_v2",
+    )
+    parser.add_argument("--render_top_l", type=int, default=4)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
@@ -114,24 +123,39 @@ def main() -> None:
     camera = _camera(contributor)
     candidate_rows = []
     for proposal_rank, atlas_row in enumerate(mode_rows.tolist(), start=1):
-        rendered = render_canonical_surface_field(
-            physical,
-            field,
-            atlas.poses_w2c[atlas_row],
-            camera,
-            width=query.shape[2],
-            height=query.shape[1],
-            selected_child_rows=retrieval.scene_child_rows,
-            device=str(args.device),
-        )
-        energy = score_soft_surface_pose_energy(
-            query, retrieval, rendered, radio_weight=float(args.radio_weight)
-        )
+        render_started = time.perf_counter()
+        if args.energy_semantics == "bidirectional_soft_child_v2":
+            rendered = render_soft_child_surface_field(
+                physical, field, atlas.poses_w2c[atlas_row], camera,
+                width=query.shape[2], height=query.shape[1],
+                selected_child_rows=retrieval.scene_child_rows,
+                top_l=int(args.render_top_l), device=str(args.device),
+            )
+        else:
+            rendered = render_canonical_surface_field(
+                physical, field, atlas.poses_w2c[atlas_row], camera,
+                width=query.shape[2], height=query.shape[1],
+                selected_child_rows=retrieval.scene_child_rows,
+                device=str(args.device),
+            )
+        render_seconds = time.perf_counter() - render_started
+        score_started = time.perf_counter()
+        if args.energy_semantics == "bidirectional_soft_child_v2":
+            energy = score_bidirectional_soft_surface_pose_energy(
+                query, retrieval, rendered, radio_weight=float(args.radio_weight)
+            )
+        else:
+            energy = score_soft_surface_pose_energy(
+                query, retrieval, rendered, radio_weight=float(args.radio_weight)
+            )
+        score_seconds = time.perf_counter() - score_started
         candidate_rows.append({
             "atlas_row": int(atlas_row),
             "proposal_rank": int(proposal_rank),
             "proposal_score": float(proposal[atlas_row]),
             "global_child_score": float(global_score[atlas_row]),
+            "render_seconds": float(render_seconds),
+            "score_seconds": float(score_seconds),
             **energy.__dict__,
         })
     order = sorted(
@@ -156,10 +180,18 @@ def main() -> None:
     proposal_top = candidate_rows[0]
     energy_top = candidate_rows[order[0]]
     report = {
-        "artifact_type": "goal_maplet_soft_pose_verification_evaluation_v1",
+        "artifact_type": "goal_maplet_soft_pose_verification_evaluation_v2",
         "image_id": args.image_id,
         "candidate_count": len(candidate_rows),
         "radio_weight": float(args.radio_weight),
+        "energy_semantics": str(args.energy_semantics),
+        "render_top_l": int(args.render_top_l),
+        "runtime": {
+            "total_render_seconds": float(sum(row["render_seconds"] for row in candidate_rows)),
+            "mean_render_seconds_per_pose": float(np.mean([row["render_seconds"] for row in candidate_rows])),
+            "total_score_seconds": float(sum(row["score_seconds"] for row in candidate_rows)),
+            "pose_batching_used": False,
+        },
         "proposal_top1_translation_m": proposal_top["translation_m"],
         "proposal_top1_rotation_deg": proposal_top["rotation_deg"],
         "soft_energy_top1_translation_m": energy_top["translation_m"],
@@ -178,6 +210,8 @@ def main() -> None:
             "uses_alike": False,
             "uses_pnp": False,
             "uses_hard_correspondences": False,
+            "map_side_child_distribution_is_soft": args.energy_semantics == "bidirectional_soft_child_v2",
+            "radio_feature_is_coupled_to_matching_child": args.energy_semantics == "bidirectional_soft_child_v2",
             "uses_query_pose_for_scoring": False,
             "gt_opened_only_after_all_candidate_scores": True,
             "is_full_localization_benchmark": False,
