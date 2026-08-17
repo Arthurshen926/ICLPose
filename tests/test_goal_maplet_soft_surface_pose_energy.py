@@ -154,6 +154,30 @@ def test_hierarchical_spatial_score_separates_parent_support_and_child_precision
     assert score.spatial_kernel.startswith("fixed_center_half")
 
 
+def test_direct_parent_mass_is_not_lost_with_child_top_l_tail():
+    query = np.zeros((2, 2, 2), dtype=np.float32)
+    query[0] = 1.0
+    rendered = _soft_render(coupled=True)
+    # Child Top-L has only 0.2 mass for the correct parent, while the direct
+    # primitive→parent segment retains 0.9.  Parent scoring must use the latter.
+    rendered.child_weights[:] = 0.1
+    rendered.parent_rows = np.zeros((2, 2, 1), dtype=np.int64)
+    rendered.parent_weights = np.full((2, 2, 1), 0.9, dtype=np.float32)
+    rendered.parent_tail_weight = np.zeros((2, 2), dtype=np.float32)
+    direct = score_hierarchical_spatial_soft_surface_pose_energy(
+        query, _retrieval(), rendered,
+        child_to_parent_ids=np.asarray([0, 0]), radio_weight=0.0,
+        spatial_kernel_radius=0,
+    )
+    del rendered.parent_rows, rendered.parent_weights, rendered.parent_tail_weight
+    legacy = score_hierarchical_spatial_soft_surface_pose_energy(
+        query, _retrieval(), rendered,
+        child_to_parent_ids=np.asarray([0, 0]), radio_weight=0.0,
+        spatial_kernel_radius=0,
+    )
+    assert direct.mean_parent_overlap > legacy.mean_parent_overlap
+
+
 def test_hierarchical_spatial_missing_and_offgrid_support_never_improve():
     query = np.zeros((2, 2, 2), dtype=np.float32)
     query[0] = 1.0

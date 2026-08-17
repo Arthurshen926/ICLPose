@@ -147,9 +147,11 @@ def batched_multibasin_pattern_search(
 ) -> MultiBasinPatternSearchResult:
     """Refine independent basins using cached-center, anisotropic probes.
 
-    Each of the six tangent axes owns its trust radius and shrinks only when
-    neither sign improves the cached center score.  The center is evaluated
-    once initially and after that is never rendered redundantly.  Optional
+    Each of the six tangent axes owns its trust radius.  A successful poll
+    moves to its best improving direction without shrinking any other axis:
+    those directions must be re-tested at the new center.  Radii shrink only
+    when the *entire* poll fails.  The center is evaluated once initially and
+    after that is never rendered redundantly.  Optional
     basin pruning occurs only after the first completed coarse sweep; with
     ``basin_location_ids`` it preserves at least one post-coarse survivor for
     every location.
@@ -234,6 +236,7 @@ def batched_multibasin_pattern_search(
             rotation_next = state.rotation_radii_deg.copy()
             best_score = state.score
             best_pose = state.pose_w2c
+            failed_axes: list[int] = []
             for axis in active_axes:
                 pair_pose = flat[cursor : cursor + 2]
                 pair_score = values[cursor : cursor + 2]
@@ -244,14 +247,21 @@ def batched_multibasin_pattern_search(
                     > state.score + float(score_improvement_epsilon)
                 )
                 if not axis_improves:
-                    if axis < 3:
-                        translation_next[axis] *= float(shrink_factor)
-                    else:
-                        rotation_next[axis - 3] *= float(shrink_factor)
+                    failed_axes.append(axis)
                 if float(pair_score[axis_best]) > best_score + float(score_improvement_epsilon):
                     best_score = float(pair_score[axis_best])
                     best_pose = pair_pose[axis_best].copy()
             improved = best_score > state.score + float(score_improvement_epsilon)
+            # Standard poll semantics: a move changes the local landscape, so
+            # failures measured at the old center cannot justify shrinking
+            # non-selected axes.  Only a wholly unsuccessful poll contracts
+            # its active trust radii.
+            if not improved:
+                for axis in failed_axes:
+                    if axis < 3:
+                        translation_next[axis] *= float(shrink_factor)
+                    else:
+                        rotation_next[axis - 3] *= float(shrink_factor)
             updated.append(PoseBasinState(
                 pose_w2c=best_pose.copy() if improved else state.pose_w2c,
                 score=best_score if improved else state.score,

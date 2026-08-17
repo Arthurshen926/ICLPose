@@ -71,3 +71,14 @@ def test_batched_raw_token_remap_matches_independent_scalar_remap():
         np.testing.assert_array_equal(token[mask] - batch * 4, scalar_token)
         np.testing.assert_array_equal(batch_rows[mask], scalar_rows)
         np.testing.assert_array_equal(batch_weights[mask], scalar_weights)
+
+
+def test_batched_raw_token_remap_rejects_unsorted_hits():
+    with np.testing.assert_raises_regex(ValueError, "globally sorted"):
+        FrozenSoftSurfaceSceneGPU._batch_token_remap(
+            np.asarray([2, 1], dtype=np.int64),
+            np.asarray([3, 4], dtype=np.int64),
+            np.asarray([0.2, 0.1], dtype=np.float32),
+            _camera(), batch_size=1, token_width=2, token_height=2,
+            supersample_factor=2,
+        )

@@ -186,9 +186,18 @@ def score_hierarchical_spatial_soft_surface_pose_energy(
         or np.any((map_rows >= child_parent.size) | (map_rows < -1))
     ):
         raise ValueError("rendered child arrays or parent lineage differ")
-    map_parent = np.full(map_rows.shape, -1, dtype=np.int64)
-    valid_map_row = map_rows >= 0
-    map_parent[valid_map_row] = child_parent[map_rows[valid_map_row]]
+    if hasattr(rendered, "parent_rows") and hasattr(rendered, "parent_weights"):
+        map_parent = np.asarray(rendered.parent_rows, dtype=np.int64).reshape(height * width, -1)
+        map_parent_mass = np.asarray(rendered.parent_weights, dtype=np.float64).reshape(height * width, -1)
+        if map_parent.shape != map_parent_mass.shape:
+            raise ValueError("direct rendered parent arrays differ")
+    else:
+        # Compatibility path for old diagnostics only.  New renderer outputs
+        # direct parent segments so child Top-L tail cannot erase parent mass.
+        map_parent = np.full(map_rows.shape, -1, dtype=np.int64)
+        valid_map_row = map_rows >= 0
+        map_parent[valid_map_row] = child_parent[map_rows[valid_map_row]]
+        map_parent_mass = map_mass
     query_parent = np.asarray(retrieval.token_parent_ids, dtype=np.int64)
     query_parent_mass = np.asarray(retrieval.token_parent_probabilities, dtype=np.float64)
     query_child = np.asarray(retrieval.token_child_rows, dtype=np.int64)
@@ -221,7 +230,7 @@ def score_hierarchical_spatial_soft_surface_pose_energy(
         parent_match = query_parent[query_index, :, None] == map_parent[map_index, None, :]
         parent_match &= (query_parent[query_index, :, None] >= 0) & (map_parent[map_index, None, :] >= 0)
         parent_overlap[query_index] += float(kernel_weight) * np.sum(
-            query_parent_mass[query_index, :, None] * map_mass[map_index, None, :] * parent_match,
+            query_parent_mass[query_index, :, None] * map_parent_mass[map_index, None, :] * parent_match,
             axis=(1, 2),
         )
         child_match = query_child[query_index, :, None] == map_rows[map_index, None, :]

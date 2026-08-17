@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import time
 
 import numpy as np
 
@@ -38,6 +39,9 @@ class RenderedSoftChildMixture:
     child_weights: np.ndarray
     child_features: np.ndarray
     child_feature_valid: np.ndarray
+    parent_rows: np.ndarray
+    parent_weights: np.ndarray
+    parent_tail_weight: np.ndarray
     child_tail_weight: np.ndarray
     unassigned_geometry_weight: np.ndarray
     background_weight: np.ndarray
@@ -435,6 +439,7 @@ def render_surface_identity(
 
 
 _DOMINANT_CHILD_OWNER_CACHE: dict[str, np.ndarray] = {}
+_PRIMITIVE_PARENT_MEMBERSHIP_CACHE: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
 
 
 def dominant_child_owner(physical: GoalMapletPhysicalMap) -> np.ndarray:
@@ -457,6 +462,100 @@ def dominant_child_owner(physical: GoalMapletPhysicalMap) -> np.ndarray:
     return owner
 
 
+def _primitive_parent_memberships(
+    physical: GoalMapletPhysicalMap,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return normalized primitive→parent CSR without passing through children.
+
+    Parent maplets overlap by construction.  A primitive's composited alpha is
+    therefore split by its normalized physical membership weights, preserving
+    unit mass while retaining overlapping parent support.  This hierarchy is
+    independent of child Top-L truncation.
+    """
+
+    key = str(physical.content_sha256)
+    cached = _PRIMITIVE_PARENT_MEMBERSHIP_CACHE.get(key)
+    if cached is not None:
+        return cached
+    primitive_count = int(physical.primitive_ids.size)
+    member_count = int(physical.membership_primitive_rows.size)
+    parents = np.repeat(
+        np.arange(physical.maplet_ids.size, dtype=np.int64),
+        np.diff(np.asarray(physical.membership_offsets, dtype=np.int64)),
+    )
+    primitive = np.asarray(physical.membership_primitive_rows, dtype=np.int64)
+    weight = np.asarray(physical.membership_weights, dtype=np.float64)
+    if parents.shape != (member_count,):
+        raise ValueError("physical parent membership offsets differ")
+    order = np.lexsort((parents, primitive))
+    primitive, parents, weight = primitive[order], parents[order], weight[order]
+    totals = np.bincount(primitive, weights=weight, minlength=primitive_count)
+    weight = weight / np.maximum(totals[primitive], 1e-12)
+    offsets = np.zeros((primitive_count + 1,), dtype=np.int64)
+    np.add.at(offsets, primitive + 1, 1)
+    np.cumsum(offsets, out=offsets)
+    for value in (offsets, parents, weight):
+        value.setflags(write=False)
+    result = offsets, parents, weight.astype(np.float32)
+    result[2].setflags(write=False)
+    _PRIMITIVE_PARENT_MEMBERSHIP_CACHE[key] = result
+    return result
+
+
+def _reduce_direct_parent_mass(
+    physical: GoalMapletPhysicalMap,
+    pixel_ids: np.ndarray,
+    primitive_rows: np.ndarray,
+    contribution: np.ndarray,
+    *,
+    pixel_count: int,
+    top_l: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Directly segment composited primitive alpha into parent maplets."""
+
+    rows = np.full((int(pixel_count), int(top_l)), -1, dtype=np.int64)
+    mass = np.zeros((int(pixel_count), int(top_l)), dtype=np.float32)
+    tail = np.zeros((int(pixel_count),), dtype=np.float32)
+    if not np.asarray(contribution).size:
+        return rows, mass, tail
+    offsets, parent_rows, membership = _primitive_parent_memberships(physical)
+    primitive = np.asarray(primitive_rows, dtype=np.int64)
+    counts = offsets[primitive + 1] - offsets[primitive]
+    valid_hit = counts > 0
+    if not np.any(valid_hit):
+        return rows, mass, tail
+    hit = np.flatnonzero(valid_hit)
+    counts = counts[valid_hit]
+    starts = np.repeat(offsets[primitive[hit]], counts)
+    origin = np.repeat(np.cumsum(counts) - counts, counts)
+    membership_row = starts + np.arange(int(np.sum(counts)), dtype=np.int64) - origin
+    expanded_pixel = np.repeat(np.asarray(pixel_ids, dtype=np.int64)[hit], counts)
+    expanded_parent = parent_rows[membership_row]
+    expanded_mass = (
+        np.repeat(np.asarray(contribution, dtype=np.float32)[hit], counts)
+        * membership[membership_row]
+    )
+    parent_count = int(physical.maplet_ids.size)
+    compound = expanded_pixel * parent_count + expanded_parent
+    order = np.lexsort((expanded_mass, expanded_parent, expanded_pixel))
+    unique, summed = _grouped_sum_sorted(compound[order], expanded_mass[order])
+    unique_pixel, unique_parent = unique // parent_count, unique % parent_count
+    rank = np.lexsort((unique_parent, -summed, unique_pixel))
+    ranked_pixel = unique_pixel[rank]
+    starts = np.r_[0, np.flatnonzero(ranked_pixel[1:] != ranked_pixel[:-1]) + 1]
+    group_count = np.diff(np.r_[starts, rank.size])
+    within = np.arange(rank.size) - np.repeat(starts, group_count)
+    keep = within < int(top_l)
+    selected = rank[keep]
+    rows[unique_pixel[selected], within[keep]] = np.asarray(
+        physical.maplet_ids, dtype=np.int64
+    )[unique_parent[selected]]
+    mass[unique_pixel[selected], within[keep]] = summed[selected]
+    total_parent = np.bincount(unique_pixel, weights=summed, minlength=int(pixel_count))
+    tail[:] = np.maximum(total_parent - np.sum(mass, axis=1, dtype=np.float64), 0.0)
+    return rows, mass, tail
+
+
 def _reduce_soft_child_token_hits(
     physical: GoalMapletPhysicalMap,
     field: CanonicalSurfaceField,
@@ -471,9 +570,12 @@ def _reduce_soft_child_token_hits(
     top_l: int,
     minimum_feature_alpha: float,
     alpha_conservation_tolerance: float,
+    timing_sink: dict[str, float] | None = None,
 ) -> RenderedSoftChildMixture:
     """Shared deterministic CPU reference reduction for scalar and batch rasterizers."""
 
+    reduction_started = time.perf_counter()
+    feature_loop_seconds = 0.0
     pixel_ids = np.asarray(token_pixel_ids, dtype=np.int64).reshape(-1)
     scene_primitive_rows = np.asarray(primitive_rows, dtype=np.int64).reshape(-1)
     contribution = np.asarray(contribution, dtype=np.float32).reshape(-1)
@@ -566,8 +668,10 @@ def _reduce_soft_child_token_hits(
             for feature_mask, accumulate_payload in (
                 (canonical_valid, False), (payload_valid, True),
             ):
+                feature_started = time.perf_counter()
                 feature_contribution = np.flatnonzero(feature_mask)
                 if not feature_contribution.size:
+                    feature_loop_seconds += time.perf_counter() - feature_started
                     continue
                 feature_key = (
                     pixel_ids[feature_contribution].astype(np.int64) * child_count
@@ -594,7 +698,10 @@ def _reduce_soft_child_token_hits(
                     mixture_payload_alpha.reshape(-1)[unique_slot] += alpha_sum
                 else:
                     mixture_canonical_alpha.reshape(-1)[unique_slot] += alpha_sum
+                feature_loop_seconds += time.perf_counter() - feature_started
 
+    child_feature_finished = time.perf_counter()
+    typed_started = child_feature_finished
     assigned_child = np.zeros((pixel_count,), dtype=np.float64)
     if contribution.size:
         assigned_mask = (
@@ -622,18 +729,37 @@ def _reduce_soft_child_token_hits(
         payload_feature_alpha=mixture_payload_alpha,
         alpha_conservation_tolerance=float(alpha_conservation_tolerance),
     )
+    typed_seconds = time.perf_counter() - typed_started
+    feature_finalize_started = time.perf_counter()
     feature_valid = mixture_payload_alpha >= float(minimum_feature_alpha)
     mixture_feature[feature_valid] /= np.maximum(
         mixture_payload_alpha[feature_valid, None], 1e-8
     )
     feature_norm = np.linalg.norm(mixture_feature, axis=2, keepdims=True)
     mixture_feature[feature_valid] /= np.maximum(feature_norm[feature_valid], 1e-8)
+    feature_seconds = feature_loop_seconds + time.perf_counter() - feature_finalize_started
     shape = (int(height), int(width))
+    parent_started = time.perf_counter()
+    parent_rows, parent_weights, parent_tail = _reduce_direct_parent_mass(
+        physical, pixel_ids, scene_primitive_rows, contribution,
+        pixel_count=pixel_count, top_l=int(top_l),
+    )
+    parent_seconds = time.perf_counter() - parent_started
+    if timing_sink is not None:
+        timing_sink["child_identity_reduction_seconds"] = (
+            child_feature_finished - reduction_started - feature_loop_seconds
+        )
+        timing_sink["feature_reduction_seconds"] = feature_seconds
+        timing_sink["typed_finalize_seconds"] = typed_seconds
+        timing_sink["direct_parent_reduction_seconds"] = parent_seconds
     return RenderedSoftChildMixture(
         child_rows=mixture_rows.reshape(*shape, int(top_l)),
         child_weights=mixture_weight.reshape(*shape, int(top_l)),
         child_features=mixture_feature.reshape(*shape, int(top_l), field.feature_dim),
         child_feature_valid=feature_valid.reshape(*shape, int(top_l)),
+        parent_rows=parent_rows.reshape(*shape, int(top_l)),
+        parent_weights=parent_weights.reshape(*shape, int(top_l)),
+        parent_tail_weight=parent_tail.reshape(shape),
         child_tail_weight=mass.child_tail_weight.reshape(shape),
         unassigned_geometry_weight=mass.unassigned_geometry_weight.reshape(shape),
         background_weight=mass.background_weight.reshape(shape),

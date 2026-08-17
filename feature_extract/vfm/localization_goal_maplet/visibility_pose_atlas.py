@@ -37,6 +37,99 @@ SCORE_SEMANTICS = "global_and_joint_grid_child_bhattacharyya_affinity_v3_semanti
 _LOCATION_NEIGHBOR_CACHE: dict[tuple[str, float], tuple[np.ndarray, ...]] = {}
 
 
+@dataclass(frozen=True)
+class NestedWideNearPoseBasins:
+    """Two proposal queues merged as continuous location basins.
+
+    ``wide`` protects geographic acquisition while ``near`` protects already
+    close view samples.  Budgets are applied independently, so a wide row can
+    never consume the near-view quota.  Exact duplicates are represented once
+    with origin ``wide+near`` rather than silently deleting near evidence.
+    """
+
+    pose_rows: np.ndarray
+    location_ids: np.ndarray
+    proposal_origins: tuple[str, ...]
+    translation_search_radius_m: np.ndarray
+    rotation_search_radius_deg: np.ndarray
+
+
+def nested_wide_near_pose_basins(
+    poses_w2c: np.ndarray,
+    wide_global_scores: np.ndarray,
+    wide_layout_scores: np.ndarray,
+    near_view_scores: np.ndarray,
+    *,
+    wide_budget: int = 48,
+    near_budget: int = 16,
+    location_radius_m: float = 2.0,
+    near_translation_nms_m: float = 0.5,
+    near_rotation_nms_deg: float = 5.0,
+    continuous_translation_radius_m: float = 2.0,
+    continuous_rotation_radius_deg: float = 45.0,
+) -> NestedWideNearPoseBasins:
+    """Build nested wide-location and near-view queues without score mixing."""
+
+    pose = _validate_pose_batch(poses_w2c)
+    count = int(pose.shape[0])
+    near = np.asarray(near_view_scores, dtype=np.float64).reshape(-1)
+    if (
+        near.shape != (count,) or np.any(~np.isfinite(near))
+        or int(wide_budget) <= 0 or int(near_budget) <= 0
+        or float(location_radius_m) <= 0.0
+        or float(continuous_translation_radius_m) <= 0.0
+        or float(continuous_rotation_radius_deg) <= 0.0
+    ):
+        raise ValueError("invalid nested wide/near proposal inputs")
+    wide_rows = hierarchical_location_orientation_pose_rows(
+        pose, wide_global_scores, wide_layout_scores,
+        maximum_modes=int(wide_budget), orientations_per_location=1,
+        location_radius_m=float(location_radius_m),
+        translation_nms_m=float(near_translation_nms_m),
+        rotation_nms_deg=float(near_rotation_nms_deg),
+    )
+    near_rows = diverse_pose_rows(
+        pose, near, maximum_modes=int(near_budget),
+        translation_nms_m=float(near_translation_nms_m),
+        rotation_nms_deg=float(near_rotation_nms_deg),
+    )
+    selected = [int(row) for row in wide_rows]
+    origins = ["wide" for _ in selected]
+    centers = -np.swapaxes(pose[:, :3, :3], 1, 2) @ pose[:, :3, 3, None]
+    centers = centers[..., 0]
+    for row_value in near_rows:
+        row = int(row_value)
+        duplicate = next((
+            index for index, prior in enumerate(selected)
+            if np.linalg.norm(centers[row] - centers[prior]) <= float(near_translation_nms_m)
+            and _rotation_distance_degrees(pose[row], pose[prior]) <= float(near_rotation_nms_deg)
+        ), None)
+        if duplicate is None:
+            selected.append(row)
+            origins.append("near")
+        elif origins[duplicate] == "wide":
+            origins[duplicate] = "wide+near"
+    location_centers: list[int] = []
+    location_ids: list[int] = []
+    for row in selected:
+        distance = np.asarray([
+            np.linalg.norm(centers[row] - centers[seed]) for seed in location_centers
+        ])
+        if not location_centers or float(np.min(distance)) > float(location_radius_m):
+            location_centers.append(row)
+            location_ids.append(len(location_centers) - 1)
+        else:
+            location_ids.append(int(np.argmin(distance)))
+    rows = np.asarray(selected, dtype=np.int64)
+    return NestedWideNearPoseBasins(
+        pose_rows=rows,
+        location_ids=np.asarray(location_ids, dtype=np.int64),
+        proposal_origins=tuple(origins),
+        translation_search_radius_m=np.full(rows.shape, float(continuous_translation_radius_m)),
+        rotation_search_radius_deg=np.full(rows.shape, float(continuous_rotation_radius_deg)),
+    )
+
+
 def _cached_location_neighborhoods(
     centers: np.ndarray, radius_m: float,
 ) -> tuple[np.ndarray, ...]:

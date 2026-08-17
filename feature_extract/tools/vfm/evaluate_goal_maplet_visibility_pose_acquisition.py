@@ -26,6 +26,7 @@ from feature_extract.vfm.localization_goal_maplet.visibility_pose_atlas import (
     diverse_dual_queue_pose_rows,
     diverse_pose_rows,
     hierarchical_location_orientation_pose_rows,
+    nested_wide_near_pose_basins,
     score_visibility_pose_atlas,
 )
 
@@ -80,6 +81,7 @@ def main() -> None:
             "linear_score", "dual_queue_3global_1layout",
             "hierarchical_location_then_orientation_v1",
             "hierarchical_location_marginal_then_orientation_v2",
+            "nested_wide_location_near_view_v3",
         ),
         default="linear_score",
     )
@@ -89,6 +91,8 @@ def main() -> None:
     parser.add_argument("--orientations_per_location", type=int, default=2)
     parser.add_argument("--location_radius_m", type=float, default=2.0)
     parser.add_argument("--orientation_nms_deg", type=float, default=10.0)
+    parser.add_argument("--wide_budget", type=int, default=48)
+    parser.add_argument("--near_budget", type=int, default=16)
     parser.add_argument(
         "--all_token_candidates",
         action="store_true",
@@ -117,6 +121,10 @@ def main() -> None:
         name: {str(k): 0 for k in K_VALUES} for name in THRESHOLDS
     }
     oracle_counts = {name: 0 for name in THRESHOLDS}
+    nested_queue_counts = {
+        queue: {name: 0 for name in THRESHOLDS}
+        for queue in ("wide", "near", "union")
+    }
     top1_translation: list[float] = []
     top1_rotation: list[float] = []
     best_pool_translation: list[float] = []
@@ -142,7 +150,17 @@ def main() -> None:
                 "legacy hierarchical v1 selection is intentionally not relabeled by the "
                 "location-marginal v2 implementation"
             )
-        if args.proposal_fusion_semantics == "hierarchical_location_marginal_then_orientation_v2":
+        nested = None
+        if args.proposal_fusion_semantics == "nested_wide_location_near_view_v3":
+            nested = nested_wide_near_pose_basins(
+                atlas.poses_w2c, global_score, layout_score, score,
+                wide_budget=int(args.wide_budget), near_budget=int(args.near_budget),
+                location_radius_m=float(args.location_radius_m),
+                near_translation_nms_m=float(args.translation_nms_m),
+                near_rotation_nms_deg=float(args.rotation_nms_deg),
+            )
+            selected = nested.pose_rows
+        elif args.proposal_fusion_semantics == "hierarchical_location_marginal_then_orientation_v2":
             selected = hierarchical_location_orientation_pose_rows(
                 atlas.poses_w2c, global_score, layout_score,
                 maximum_modes=int(args.maximum_modes),
@@ -172,6 +190,18 @@ def main() -> None:
         )
         translation = translation_all[selected]
         rotation = rotation_all[selected]
+        if nested is not None:
+            origin = np.asarray(nested.proposal_origins, dtype=str)
+            masks = {
+                "wide": np.char.find(origin, "wide") >= 0,
+                "near": np.char.find(origin, "near") >= 0,
+                "union": np.ones(origin.shape, dtype=bool),
+            }
+            for queue, mask in masks.items():
+                for name, threshold in THRESHOLDS.items():
+                    nested_queue_counts[queue][name] += int(
+                        _hit(translation[mask], rotation[mask], threshold)
+                    )
         for name, threshold in THRESHOLDS.items():
             oracle_counts[name] += int(_hit(translation_all, rotation_all, threshold))
             for k in K_VALUES:
@@ -194,6 +224,12 @@ def main() -> None:
             "mode_layout_scores": layout_score[selected].astype(float).tolist(),
             "translation_m": translation.astype(float).tolist(),
             "rotation_deg": rotation.astype(float).tolist(),
+            "nested_proposal_origins": (
+                list(nested.proposal_origins) if nested is not None else None
+            ),
+            "nested_location_ids": (
+                nested.location_ids.tolist() if nested is not None else None
+            ),
             "oracle_best_translation_m": float(translation_all[np.argmin(np.maximum(translation_all / 2.0, rotation_all / 45.0))]),
             "oracle_best_rotation_deg": float(rotation_all[np.argmin(np.maximum(translation_all / 2.0, rotation_all / 45.0))]),
         })
@@ -231,6 +267,19 @@ def main() -> None:
         "orientations_per_location": int(args.orientations_per_location),
         "location_radius_m": float(args.location_radius_m),
         "orientation_nms_deg": float(args.orientation_nms_deg),
+        "wide_budget": int(args.wide_budget),
+        "near_budget": int(args.near_budget),
+        "nested_queue_recall": (
+            {
+                queue: {
+                    name: float(count / query_count)
+                    for name, count in values.items()
+                }
+                for queue, values in nested_queue_counts.items()
+            }
+            if args.proposal_fusion_semantics == "nested_wide_location_near_view_v3"
+            else None
+        ),
         "metrics": metrics,
         "error_summary": {
             "top1_median_translation_m": float(np.median(top1_translation)),

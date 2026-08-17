@@ -88,7 +88,7 @@ def test_pattern_search_probes_use_the_shared_left_se3_retraction():
     np.testing.assert_allclose(probes, np.asarray(expected), atol=0.0, rtol=0.0)
 
 
-def test_pattern_search_shrinks_only_axes_without_improvement_and_caches_center():
+def test_pattern_search_success_does_not_shrink_other_axes_at_stale_center():
     calls = []
 
     def score(poses):
@@ -106,11 +106,65 @@ def test_pattern_search_shrinks_only_axes_without_improvement_and_caches_center(
     )
     assert calls == [1, 12]
     state = result.basins[0]
-    np.testing.assert_allclose(state.translation_radii_m, [1.0, 0.5, 0.5])
-    np.testing.assert_allclose(state.rotation_radii_deg, [4.0, 4.0, 4.0])
+    np.testing.assert_allclose(state.translation_radii_m, [1.0, 1.0, 1.0])
+    np.testing.assert_allclose(state.rotation_radii_deg, [8.0, 8.0, 8.0])
     np.testing.assert_allclose(
         -state.pose_w2c[:3, :3].T @ state.pose_w2c[:3, 3], [1.0, 0.0, 0.0]
     )
+
+
+def test_pattern_search_shrinks_active_axes_only_after_whole_poll_fails():
+    result = batched_multibasin_pattern_search(
+        np.asarray([_pose([0.0, 0.0, 0.0])]),
+        lambda poses: np.zeros((poses.shape[0],), dtype=np.float64),
+        translation_radius_m=[1.0, 2.0, 3.0],
+        rotation_radius_deg=[4.0, 5.0, 6.0],
+        minimum_translation_radius_m=0.1,
+        minimum_rotation_radius_deg=0.1,
+        maximum_sweeps=1,
+    )
+    state = result.basins[0]
+    np.testing.assert_allclose(state.translation_radii_m, [0.5, 1.0, 1.5])
+    np.testing.assert_allclose(state.rotation_radii_deg, [2.0, 2.5, 3.0])
+    assert state.accepted_updates == 0
+
+
+def test_pattern_search_tracks_failed_axes_independently_per_basin():
+    def score(poses):
+        centers = -np.swapaxes(poses[:, :3, :3], 1, 2) @ poses[:, :3, 3, None]
+        x = centers[:, 0, 0]
+        # Basin near zero can improve; basin near ten is already optimal.
+        return -np.minimum(np.square(x - 1.0), np.square(x - 10.0))
+
+    result = batched_multibasin_pattern_search(
+        np.asarray([_pose([0.0, 0.0, 0.0]), _pose([10.0, 0.0, 0.0])]), score,
+        translation_radius_m=1.0, rotation_radius_deg=4.0,
+        minimum_translation_radius_m=0.1,
+        minimum_rotation_radius_deg=0.1, maximum_sweeps=1,
+    )
+    states = sorted(result.basins, key=lambda state: state.source_basin_index)
+    np.testing.assert_allclose(states[0].translation_radii_m, [1.0, 1.0, 1.0])
+    np.testing.assert_allclose(states[1].translation_radii_m, [0.5, 0.5, 0.5])
+
+
+def test_pattern_search_repolls_coupled_axis_after_successful_move():
+    # y is useful only after x has moved.  The stale-center implementation
+    # shrank y during the successful x poll; standard poll semantics retain
+    # its full radius and reaches the coupled optimum on the next sweep.
+    def score(poses):
+        centers = -np.swapaxes(poses[:, :3, :3], 1, 2) @ poses[:, :3, 3, None]
+        x, y = centers[:, 0, 0], centers[:, 1, 0]
+        return -np.square(x - 1.0) - 0.25 * np.square(y - x)
+
+    result = batched_multibasin_pattern_search(
+        np.asarray([_pose([0.0, 0.0, 0.0])]), score,
+        translation_radius_m=1.0, rotation_radius_deg=8.0,
+        minimum_translation_radius_m=0.1,
+        minimum_rotation_radius_deg=0.5,
+        maximum_sweeps=2,
+    )
+    center = -result.basins[0].pose_w2c[:3, :3].T @ result.basins[0].pose_w2c[:3, 3]
+    np.testing.assert_allclose(center[:2], [1.0, 1.0], atol=1e-12)
 
 
 def test_pattern_search_prunes_after_coarse_and_preserves_each_location():

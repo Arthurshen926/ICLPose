@@ -29,9 +29,10 @@ from feature_extract.vfm.localization_goal_maplet.surface_renderer import (
 )
 
 
-EXACT_FIELDS = ("child_rows", "child_feature_valid")
+EXACT_FIELDS = ("child_rows", "child_feature_valid", "parent_rows")
 NUMERIC_FIELDS = (
     "child_weights", "child_features", "child_tail_weight",
+    "parent_weights", "parent_tail_weight",
     "unassigned_geometry_weight", "background_weight",
     "canonical_field_missing_weight", "payload_excluded_weight", "null_weight",
     "total_alpha",
@@ -137,7 +138,7 @@ def main() -> None:
         and forward.audit.gpu_child_reducer_implemented
     )
     report = {
-        "artifact_type": "goal_maplet_resident_soft_surface_renderer_audit_v1",
+        "artifact_type": "goal_maplet_resident_soft_surface_renderer_audit_v2_direct_parent_timing",
         "input_file_sha256": {
             "physical_map": file_sha256(physical_path),
             "canonical_field": file_sha256(field_path),

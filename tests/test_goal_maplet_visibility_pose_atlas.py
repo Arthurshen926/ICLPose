@@ -17,6 +17,7 @@ from feature_extract.vfm.localization_goal_maplet.visibility_pose_atlas import (
     diverse_dual_queue_pose_rows,
     diverse_pose_rows,
     hierarchical_location_orientation_pose_rows,
+    nested_wide_near_pose_basins,
     score_visibility_pose_atlas,
 )
 from test_goal_maplet_pure_retrieval import _physical
@@ -167,6 +168,28 @@ def test_dual_queue_preserves_layout_modes_without_score_averaging():
         global_to_layout_ratio=3,
     )
     assert rows.tolist() == [0, 1, 2, 7]
+
+
+def test_nested_wide_near_queues_have_independent_budgets_and_origins():
+    poses = np.stack([
+        _pose(0.0, 0.0), _pose(0.1, 2.0), _pose(0.2, 30.0),
+        _pose(4.0, 0.0), _pose(8.0, 0.0), _pose(12.0, 0.0),
+    ])
+    proposal = nested_wide_near_pose_basins(
+        poses,
+        np.asarray([10, 9, 8, 7, 6, 5], dtype=np.float64),
+        np.asarray([10, 2, 3, 4, 5, 6], dtype=np.float64),
+        np.asarray([1, 2, 10, 3, 4, 5], dtype=np.float64),
+        wide_budget=3, near_budget=2, location_radius_m=1.0,
+    )
+    # Near row 2 is protected even though the wide location queue already
+    # owns the same geographic basin with a different orientation.
+    assert 2 in proposal.pose_rows
+    assert proposal.proposal_origins[proposal.pose_rows.tolist().index(2)] == "near"
+    assert proposal.pose_rows.size >= 4
+    assert proposal.location_ids[proposal.pose_rows.tolist().index(2)] == 0
+    np.testing.assert_array_equal(proposal.translation_search_radius_m, 2.0)
+    np.testing.assert_array_equal(proposal.rotation_search_radius_deg, 45.0)
 
 
 def test_hierarchical_selection_uses_global_for_location_then_layout_for_orientation():

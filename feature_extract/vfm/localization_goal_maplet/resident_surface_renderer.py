@@ -33,6 +33,15 @@ from .surface_renderer import (
 @dataclass(frozen=True)
 class ResidentRendererBatchAudit:
     batch_size: int
+    projection_tile_raster_seconds: float
+    device_to_host_seconds: float
+    depth_sort_composite_seconds: float
+    raw_token_gather_seconds: float
+    child_identity_reduction_seconds: float
+    feature_reduction_seconds: float
+    typed_finalize_seconds: float
+    direct_parent_reduction_seconds: float
+    child_and_feature_reduction_seconds: float
     raster_seconds: float
     host_reduction_seconds: float
     total_seconds: float
@@ -157,7 +166,7 @@ class FrozenSoftSurfaceSceneGPU:
         render_width: int,
         render_height: int,
         minimum_incidence: float,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, float]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, dict[str, float]]:
         torch = self._torch
         try:
             from gsplat.cuda._wrapper import (
@@ -224,7 +233,11 @@ class FrozenSoftSurfaceSceneGPU:
                 np.zeros((0,), dtype=np.int64),
                 np.zeros((0,), dtype=np.int64),
                 np.zeros((0,), dtype=np.float32), 0,
-                time.perf_counter() - started,
+                {
+                    "projection_tile_raster_seconds": time.perf_counter() - started,
+                    "device_to_host_seconds": 0.0,
+                    "depth_sort_composite_seconds": 0.0,
+                },
             )
         px = (pixel_ids % int(render_width)).to(torch.float32) + 0.5
         py = (pixel_ids // int(render_width)).to(torch.float32) + 0.5
@@ -250,6 +263,9 @@ class FrozenSoftSurfaceSceneGPU:
         global_pixel = camera_ids.to(torch.int64) * (
             int(render_width) * int(render_height)
         ) + pixel_ids.to(torch.int64)
+        torch.cuda.synchronize(self.device)
+        projection_seconds = time.perf_counter() - started
+        transfer_started = time.perf_counter()
         arrays = [
             global_pixel.detach().cpu().numpy(),
             hit_depth.detach().cpu().numpy(),
@@ -257,8 +273,9 @@ class FrozenSoftSurfaceSceneGPU:
             alpha.detach().cpu().numpy(),
         ]
         torch.cuda.synchronize(self.device)
-        raster_seconds = time.perf_counter() - started
+        transfer_seconds = time.perf_counter() - transfer_started
         global_pixel_np, depth_np, rows_np, alpha_np = arrays
+        composite_started = time.perf_counter()
         order = np.lexsort((rows_np, depth_np, global_pixel_np))
         packed = np.stack([
             global_pixel_np[order].astype(np.float64),
@@ -267,7 +284,12 @@ class FrozenSoftSurfaceSceneGPU:
             alpha_np[order].astype(np.float64),
         ], axis=1)
         out_pixel, out_row, out_weight = _composite_sorted_packed_hits(packed)
-        return out_pixel, out_row, out_weight, packed_hit_count, raster_seconds
+        composite_seconds = time.perf_counter() - composite_started
+        return out_pixel, out_row, out_weight, packed_hit_count, {
+            "projection_tile_raster_seconds": float(projection_seconds),
+            "device_to_host_seconds": float(transfer_seconds),
+            "depth_sort_composite_seconds": float(composite_seconds),
+        }
 
     @staticmethod
     def _batch_token_remap(
@@ -297,6 +319,10 @@ class FrozenSoftSurfaceSceneGPU:
             + warp.destination_token_pixel_ids[None, :]
         ).reshape(-1)
         hits = np.asarray(global_ideal_pixels, dtype=np.int64).reshape(-1)
+        if hits.shape != np.asarray(primitive_rows).reshape(-1).shape or hits.shape != np.asarray(contribution).reshape(-1).shape:
+            raise ValueError("batched token-remap hit arrays differ")
+        if np.any(hits[1:] < hits[:-1]):
+            raise ValueError("batched token remap requires globally sorted pixel hits")
         left = np.searchsorted(hits, sources, side="left")
         right = np.searchsorted(hits, sources, side="right")
         keep = right > left
@@ -341,20 +367,24 @@ class FrozenSoftSurfaceSceneGPU:
             raise ValueError("exact resident batch cannot be empty")
         started = time.perf_counter()
         factor = int(coordinate_supersample_factor)
-        ideal_pixel, primitive, weight, packed_count, raster_seconds = self._batch_ideal_hits(
+        ideal_pixel, primitive, weight, packed_count, timings = self._batch_ideal_hits(
             pose, camera, render_width=int(width) * factor,
             render_height=int(height) * factor,
             minimum_incidence=float(minimum_incidence),
         )
+        gather_started = time.perf_counter()
         token, primitive, weight = self._batch_token_remap(
             ideal_pixel, primitive, weight, camera, batch_size=batch,
             token_width=int(width), token_height=int(height), supersample_factor=factor,
         )
+        gather_seconds = time.perf_counter() - gather_started
         reduction_started = time.perf_counter()
         token_count = int(width) * int(height)
         rendered: list[RenderedSoftChildMixture] = []
+        reduction_timings: list[dict[str, float]] = []
         for row in range(batch):
             mask = (token >= row * token_count) & (token < (row + 1) * token_count)
+            row_timing: dict[str, float] = {}
             rendered.append(_reduce_soft_child_token_hits(
                 self.physical, self.field,
                 token_pixel_ids=token[mask] - row * token_count,
@@ -364,13 +394,37 @@ class FrozenSoftSurfaceSceneGPU:
                 selected_child_rows=selected_child_rows, top_l=int(top_l),
                 minimum_feature_alpha=float(minimum_feature_alpha),
                 alpha_conservation_tolerance=float(alpha_conservation_tolerance),
+                timing_sink=row_timing,
             ))
+            reduction_timings.append(row_timing)
         host_seconds = time.perf_counter() - reduction_started
         total_seconds = time.perf_counter() - started
+        raster_seconds = (
+            timings["projection_tile_raster_seconds"]
+            + timings["device_to_host_seconds"]
+            + timings["depth_sort_composite_seconds"]
+        )
         return ResidentSoftSurfaceBatch(
             rendered=tuple(rendered),
             audit=ResidentRendererBatchAudit(
                 batch_size=batch, raster_seconds=float(raster_seconds),
+                projection_tile_raster_seconds=float(timings["projection_tile_raster_seconds"]),
+                device_to_host_seconds=float(timings["device_to_host_seconds"]),
+                depth_sort_composite_seconds=float(timings["depth_sort_composite_seconds"]),
+                raw_token_gather_seconds=float(gather_seconds),
+                child_identity_reduction_seconds=float(sum(
+                    row["child_identity_reduction_seconds"] for row in reduction_timings
+                )),
+                feature_reduction_seconds=float(sum(
+                    row["feature_reduction_seconds"] for row in reduction_timings
+                )),
+                typed_finalize_seconds=float(sum(
+                    row["typed_finalize_seconds"] for row in reduction_timings
+                )),
+                direct_parent_reduction_seconds=float(sum(
+                    row["direct_parent_reduction_seconds"] for row in reduction_timings
+                )),
+                child_and_feature_reduction_seconds=float(host_seconds),
                 host_reduction_seconds=float(host_seconds), total_seconds=float(total_seconds),
                 packed_hit_count=int(packed_count), remapped_hit_count=int(weight.size),
                 resident_geometry_bytes=self._resident_geometry_bytes,
