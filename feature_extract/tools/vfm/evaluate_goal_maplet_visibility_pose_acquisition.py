@@ -79,6 +79,7 @@ def main() -> None:
         choices=(
             "linear_score", "dual_queue_3global_1layout",
             "hierarchical_location_then_orientation_v1",
+            "hierarchical_location_marginal_then_orientation_v2",
         ),
         default="linear_score",
     )
@@ -137,6 +138,11 @@ def main() -> None:
             matrices=matrices,
         )
         if args.proposal_fusion_semantics == "hierarchical_location_then_orientation_v1":
+            raise ValueError(
+                "legacy hierarchical v1 selection is intentionally not relabeled by the "
+                "location-marginal v2 implementation"
+            )
+        if args.proposal_fusion_semantics == "hierarchical_location_marginal_then_orientation_v2":
             selected = hierarchical_location_orientation_pose_rows(
                 atlas.poses_w2c, global_score, layout_score,
                 maximum_modes=int(args.maximum_modes),

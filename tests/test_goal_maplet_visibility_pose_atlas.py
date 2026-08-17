@@ -188,6 +188,38 @@ def test_hierarchical_selection_uses_global_for_location_then_layout_for_orienta
     assert set(rows.tolist()) == set(range(6))
 
 
+def test_hierarchical_location_score_marginalizes_orientations_with_density_correction():
+    poses = np.stack([
+        _pose(0.0, 0.0), _pose(0.1, 30.0), _pose(-0.1, 60.0),
+        _pose(4.0, 0.0), _pose(4.1, 30.0), _pose(3.9, 60.0),
+    ])
+    # The isolated maximum at location A should not beat three consistently
+    # strong orientations at location B after log-mean-exp marginalization.
+    global_score = np.asarray([10.0, -10.0, -10.0, 9.0, 9.0, 9.0])
+    layout_score = np.asarray([3.0, 2.0, 1.0, 3.0, 2.0, 1.0])
+    rows = hierarchical_location_orientation_pose_rows(
+        poses, global_score, layout_score, maximum_modes=2,
+        orientations_per_location=1, location_radius_m=0.5,
+        orientation_nms_degrees=10.0,
+    )
+    assert rows[0] == 3
+
+
+def test_hierarchical_fallback_opens_new_location_before_extra_orientation():
+    poses = np.stack([
+        _pose(0.0, 0.0), _pose(0.1, 30.0), _pose(0.2, 60.0),
+        _pose(4.0, 0.0), _pose(8.0, 0.0), _pose(12.0, 0.0),
+    ])
+    rows = hierarchical_location_orientation_pose_rows(
+        poses, np.asarray([10, 9, 8, 7, 6, 1], dtype=np.float64),
+        np.asarray([3, 2, 1, 3, 3, 3], dtype=np.float64),
+        maximum_modes=5, orientations_per_location=2,
+        location_radius_m=1.0, orientation_nms_degrees=10.0,
+    )
+    assert 5 in rows
+    assert 2 not in rows
+
+
 def test_joint_layout_normalization_preserves_cell_reliability():
     keys, weights = _joint_layout_normalized_sqrt(
         np.asarray([[100.0, 0.0], [1.0, 0.0]]),

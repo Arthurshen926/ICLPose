@@ -15,12 +15,14 @@ surface set acquire a correct, geographically distinct SE(3) basin?
 from __future__ import annotations
 
 import json
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Sequence
 
 import numpy as np
 from scipy import sparse
+from scipy.spatial import cKDTree
 
 from .lineage import arrays_sha256, canonical_json_sha256
 from .physical_map import GoalMapletPhysicalMap
@@ -30,6 +32,27 @@ from .pure_retrieval import PureRadioPhysicalRetrieval, all_radio_token_coordina
 
 SCHEMA = "goal_maplet_child_visibility_pose_atlas_v3"
 SCORE_SEMANTICS = "global_and_joint_grid_child_bhattacharyya_affinity_v3_semantic_hash"
+
+
+_LOCATION_NEIGHBOR_CACHE: dict[tuple[str, float], tuple[np.ndarray, ...]] = {}
+
+
+def _cached_location_neighborhoods(
+    centers: np.ndarray, radius_m: float,
+) -> tuple[np.ndarray, ...]:
+    value = np.ascontiguousarray(centers, dtype=np.float64)
+    digest = hashlib.sha256(value.view(np.uint8)).hexdigest()
+    key = (digest, float(radius_m))
+    cached = _LOCATION_NEIGHBOR_CACHE.get(key)
+    if cached is not None:
+        return cached
+    tree = cKDTree(value)
+    rows = tuple(
+        np.asarray(sorted(neighbor), dtype=np.int64)
+        for neighbor in tree.query_ball_point(value, r=float(radius_m))
+    )
+    _LOCATION_NEIGHBOR_CACHE[key] = rows
+    return rows
 
 
 def _validate_pose_batch(poses_w2c: np.ndarray) -> np.ndarray:
@@ -635,7 +658,19 @@ def hierarchical_location_orientation_pose_rows(
     centers = -np.swapaxes(pose[:, :3, :3], 1, 2) @ pose[:, :3, 3, None]
     centers = centers[..., 0]
     location_budget = int(np.ceil(int(maximum_modes) / int(orientations_per_location)))
-    global_order = np.lexsort((np.arange(count), -global_value))
+    # Pose samples near one location represent alternative orientations, not
+    # independent geographical evidence.  Use a density-corrected local
+    # log-mean-exp before spatial NMS so dense acquisition trajectories do not
+    # receive a multiplicity prior.
+    location_neighbors = _cached_location_neighborhoods(
+        centers, float(location_radius_m)
+    )
+    location_value = np.empty((count,), dtype=np.float64)
+    for row, neighborhood in enumerate(location_neighbors):
+        values = global_value[neighborhood]
+        maximum = float(np.max(values))
+        location_value[row] = maximum + np.log(np.mean(np.exp(values - maximum)))
+    global_order = np.lexsort((np.arange(count), -global_value, -location_value))
     location_seeds: list[int] = []
     for row in global_order:
         if all(
@@ -647,9 +682,7 @@ def hierarchical_location_orientation_pose_rows(
                 break
     queues: list[list[int]] = []
     for seed in location_seeds:
-        neighborhood = np.flatnonzero(
-            np.linalg.norm(centers - centers[seed][None], axis=1) <= float(location_radius_m)
-        )
+        neighborhood = location_neighbors[seed]
         order = neighborhood[
             np.lexsort((neighborhood, -global_value[neighborhood], -layout_value[neighborhood]))
         ]
@@ -665,8 +698,9 @@ def hierarchical_location_orientation_pose_rows(
                     break
         queues.append(orientation_rows)
     retained: list[int] = []
+    retained_by_location: list[list[int]] = [[] for _ in queues]
     for depth in range(int(orientations_per_location)):
-        for queue in queues:
+        for location, queue in enumerate(queues):
             if depth >= len(queue):
                 continue
             row = queue[depth]
@@ -679,17 +713,63 @@ def hierarchical_location_orientation_pose_rows(
             ):
                 continue
             retained.append(row)
+            retained_by_location[location].append(row)
             if len(retained) >= int(maximum_modes):
                 return np.asarray(retained, dtype=np.int64)
-    # Deterministic global fallback only fills unused capacity; it cannot
-    # displace any staged location/orientation proposal.
-    fallback = diverse_pose_rows(
-        pose, global_value, maximum_modes=int(maximum_modes),
-        translation_nms_m=float(translation_nms_m), rotation_nms_deg=float(rotation_nms_deg),
-    )
-    for row in fallback:
-        if int(row) not in retained:
-            retained.append(int(row))
+    # Deterministic fallback preserves the hierarchy: first open new spatial
+    # locations, then fill missing orientation quota inside existing ones, and
+    # only then use an unrestricted global fallback.
+    def conflicts(row: int) -> bool:
+        return any(
+            np.linalg.norm(centers[row] - centers[kept]) <= float(translation_nms_m)
+            and _rotation_distance_degrees(pose[row], pose[kept]) <= float(rotation_nms_deg)
+            for kept in retained
+        )
+
+    # Scan the complete stable global order.  Running a second full-library
+    # greedy NMS here is both semantically redundant and O(N*selected) before
+    # the hierarchy even sees a candidate.
+    fallback_order = [int(row) for row in global_order if int(row) not in retained]
+    for row in fallback_order:
+        if conflicts(row):
+            continue
+        if all(
+            np.linalg.norm(centers[row] - centers[seed]) > float(location_radius_m)
+            for seed in location_seeds
+        ):
+            retained.append(row)
+            location_seeds.append(row)
+            queues.append([row])
+            retained_by_location.append([row])
             if len(retained) >= int(maximum_modes):
-                break
+                return np.asarray(retained, dtype=np.int64)
+
+    for row in fallback_order:
+        if row in retained or conflicts(row) or not location_seeds:
+            continue
+        distance = np.asarray([
+            np.linalg.norm(centers[row] - centers[seed]) for seed in location_seeds
+        ])
+        location = int(np.argmin(distance))
+        if distance[location] > float(location_radius_m):
+            continue
+        location_rows = retained_by_location[location]
+        if len(location_rows) >= int(orientations_per_location):
+            continue
+        if any(
+            _rotation_distance_degrees(pose[row], pose[kept])
+            <= float(orientation_nms_degrees)
+            for kept in location_rows
+        ):
+            continue
+        retained.append(row)
+        location_rows.append(row)
+        if len(retained) >= int(maximum_modes):
+            return np.asarray(retained, dtype=np.int64)
+
+    for row in fallback_order:
+        if row not in retained and not conflicts(row):
+            retained.append(row)
+            if len(retained) >= int(maximum_modes):
+                return np.asarray(retained, dtype=np.int64)
     return np.asarray(retained, dtype=np.int64)

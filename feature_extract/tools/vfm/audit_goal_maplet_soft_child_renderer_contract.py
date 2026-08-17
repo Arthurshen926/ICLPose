@@ -8,6 +8,8 @@ from pathlib import Path
 
 import numpy as np
 
+import feature_extract.vfm.localization_goal_maplet.surface_renderer as surface_renderer_module
+
 from feature_extract.vfm.colmap_tracks import ColmapCamera
 from feature_extract.vfm.localization_goal_maplet.canonical_field import CanonicalSurfaceField
 from feature_extract.vfm.localization_goal_maplet.lineage import canonical_json_sha256, file_sha256
@@ -145,7 +147,7 @@ def main() -> None:
     )
     identity_fields = (
         "child_rows", "child_weights", "child_tail_weight",
-        "field_missing_weight", "background_weight", "null_weight", "total_alpha",
+        "unassigned_geometry_weight", "background_weight", "null_weight", "total_alpha",
     )
     exact = {
         name: bool(np.array_equal(getattr(full, name), getattr(subset, name)))
@@ -153,7 +155,8 @@ def main() -> None:
     }
     retained = np.sum(full.child_weights, axis=2)
     conservation = (
-        retained + full.child_tail_weight + full.field_missing_weight + full.background_weight
+        retained + full.child_tail_weight
+        + full.unassigned_geometry_weight + full.background_weight
     )
     maximum_mass_error = float(np.max(np.abs(conservation - 1.0), initial=0.0))
     truth_rows, truth_mass, truth_null, coordinate_audit = _contributor_token_children(
@@ -177,7 +180,7 @@ def main() -> None:
         np.zeros_like(render_null),
     )
     report = {
-        "artifact_type": "goal_maplet_soft_child_renderer_contract_audit_v1",
+        "artifact_type": "goal_maplet_soft_child_renderer_contract_audit_v2",
         "image_id": str(retrieval.image_id),
         "physical_map_sha256": physical.content_sha256,
         "canonical_field_sha256": field.content_sha256,
@@ -187,6 +190,10 @@ def main() -> None:
             "canonical_field": file_sha256(field_path),
             "contributor": file_sha256(contributor_path),
             "retrieval": file_sha256(retrieval_path),
+        },
+        "source_file_sha256": {
+            "audit": file_sha256(Path(__file__).resolve()),
+            "surface_renderer": file_sha256(Path(surface_renderer_module.__file__).resolve()),
         },
         "coordinate_supersample_factor": int(args.coordinate_supersample_factor),
         "coordinate_audit": coordinate_audit,
@@ -200,10 +207,18 @@ def main() -> None:
         ),
         "mean_rendered_total_alpha": float(np.mean(full.total_alpha)),
         "mean_child_tail_weight": float(np.mean(full.child_tail_weight)),
-        "mean_field_missing_weight": float(np.mean(full.field_missing_weight)),
+        "mean_unassigned_geometry_weight": float(np.mean(full.unassigned_geometry_weight)),
         "mean_background_weight": float(np.mean(full.background_weight)),
-        "mean_payload_missing_weight_subset": float(np.mean(subset.payload_missing_weight)),
-        "renderer_internal_contract_passed": bool(all(exact.values()) and maximum_mass_error <= 2e-5),
+        "mean_canonical_field_missing_weight": float(
+            np.mean(full.canonical_field_missing_weight)
+        ),
+        "mean_payload_excluded_weight_subset": float(np.mean(subset.payload_excluded_weight)),
+        "maximum_alpha_overflow": float(full.maximum_alpha_overflow),
+        "overflow_token_fraction": float(full.overflow_token_fraction),
+        "renderer_internal_contract_passed": bool(
+            all(exact.values()) and maximum_mass_error <= 2e-5
+            and full.maximum_alpha_overflow <= 2e-5
+        ),
         "promotion_gate_passed": False,
         "promotion_blockers": [
             "mapping contributor stores only top4 primitive alpha while online renderer retains full composited mass; exact same-semantic round-trip authority is absent",

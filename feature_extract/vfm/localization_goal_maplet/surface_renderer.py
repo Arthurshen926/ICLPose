@@ -29,8 +29,9 @@ class RenderedSoftChildMixture:
     """Top-L child alpha and typed residual mass per token.
 
     Identity mass is an exclusive partition:
-    ``top_l + child_tail + field_missing + background == 1``.  Feature/payload
-    missingness is reported separately and never changes child identity.
+    ``top_l + child_tail + unassigned_geometry + background == 1``.
+    Canonical-field absence and payload exclusion are separate feature-side
+    channels and never change child identity.
     """
 
     child_rows: np.ndarray
@@ -38,11 +39,256 @@ class RenderedSoftChildMixture:
     child_features: np.ndarray
     child_feature_valid: np.ndarray
     child_tail_weight: np.ndarray
-    field_missing_weight: np.ndarray
+    unassigned_geometry_weight: np.ndarray
     background_weight: np.ndarray
-    payload_missing_weight: np.ndarray
+    canonical_field_missing_weight: np.ndarray
+    payload_excluded_weight: np.ndarray
     null_weight: np.ndarray
     total_alpha: np.ndarray
+    maximum_alpha_overflow: float
+    overflow_token_fraction: float
+
+
+@dataclass(frozen=True)
+class _SoftChildMassPartition:
+    total_alpha: np.ndarray
+    child_tail_weight: np.ndarray
+    unassigned_geometry_weight: np.ndarray
+    background_weight: np.ndarray
+    canonical_field_missing_weight: np.ndarray
+    payload_excluded_weight: np.ndarray
+    null_weight: np.ndarray
+    maximum_alpha_overflow: float
+    overflow_token_fraction: float
+
+
+@dataclass(frozen=True)
+class _RawToIdealTokenWarp:
+    source_ideal_pixel_ids: np.ndarray
+    destination_token_pixel_ids: np.ndarray
+
+
+_RAW_TO_IDEAL_TOKEN_WARP_CACHE: dict[tuple[object, ...], _RawToIdealTokenWarp] = {}
+
+
+def _camera_warp_cache_key(
+    camera, *, token_width: int, token_height: int, supersample_factor: int,
+) -> tuple[object, ...]:
+    return (
+        int(camera.model_id), int(camera.width), int(camera.height),
+        tuple(float(value) for value in np.asarray(camera.params, dtype=np.float64)),
+        int(token_width), int(token_height), int(supersample_factor),
+    )
+
+
+def _raw_to_ideal_token_warp(
+    camera, *, token_width: int, token_height: int, supersample_factor: int,
+) -> _RawToIdealTokenWarp:
+    """Cache the pose-independent raw-ray to ideal-pixel/token mapping."""
+
+    key = _camera_warp_cache_key(
+        camera, token_width=int(token_width), token_height=int(token_height),
+        supersample_factor=int(supersample_factor),
+    )
+    cached = _RAW_TO_IDEAL_TOKEN_WARP_CACHE.get(key)
+    if cached is not None:
+        return cached
+    factor = int(supersample_factor)
+    if factor <= 0:
+        raise ValueError("coordinate supersample factor must be positive")
+    render_width = int(token_width) * factor
+    render_height = int(token_height) * factor
+    params = np.asarray(camera.params, dtype=np.float64).reshape(-1)
+    if int(camera.model_id) == 0 and params.size >= 3:
+        fx, cx, cy = params[:3]
+        fy, k1 = fx, 0.0
+    elif int(camera.model_id) == 1 and params.size >= 4:
+        fx, fy, cx, cy = params[:4]
+        k1 = 0.0
+    elif int(camera.model_id) == 2 and params.size >= 4:
+        fx, cx, cy, k1 = params[:4]
+        fy = fx
+    else:
+        raise ValueError(
+            "soft renderer requires SIMPLE_PINHOLE, PINHOLE, or SIMPLE_RADIAL camera"
+        )
+    scale_x = render_width / float(camera.width)
+    scale_y = render_height / float(camera.height)
+    if float(fx) <= 0.0 or float(fy) <= 0.0:
+        raise ValueError("soft renderer camera/grid scale is invalid")
+    fx_grid, fy_grid = fx * scale_x, fy * scale_y
+    cx_grid, cy_grid = cx * scale_x, cy * scale_y
+    yy, xx = np.meshgrid(
+        np.arange(render_height, dtype=np.float64) + 0.5,
+        np.arange(render_width, dtype=np.float64) + 0.5,
+        indexing="ij",
+    )
+    distorted = np.stack(
+        [(xx - cx_grid) / fx_grid, (yy - cy_grid) / fy_grid], axis=-1
+    )
+    undistorted = inverse_simple_radial(distorted, float(k1))
+    ideal_x = np.floor(fx_grid * undistorted[..., 0] + cx_grid).astype(np.int64)
+    ideal_y = np.floor(fy_grid * undistorted[..., 1] + cy_grid).astype(np.int64)
+    valid = (
+        (ideal_x >= 0) & (ideal_x < render_width)
+        & (ideal_y >= 0) & (ideal_y < render_height)
+    ).reshape(-1)
+    raw_rows = np.flatnonzero(valid)
+    source = (
+        ideal_y.reshape(-1)[raw_rows] * render_width
+        + ideal_x.reshape(-1)[raw_rows]
+    ).astype(np.int64)
+    raw_y, raw_x = raw_rows // render_width, raw_rows % render_width
+    destination = (
+        (raw_y // factor) * int(token_width) + raw_x // factor
+    ).astype(np.int64)
+    source.setflags(write=False)
+    destination.setflags(write=False)
+    result = _RawToIdealTokenWarp(source, destination)
+    _RAW_TO_IDEAL_TOKEN_WARP_CACHE[key] = result
+    return result
+
+
+def _grouped_sum_sorted(
+    keys: np.ndarray, values: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Sum already-key-sorted rows with one deterministic reduction order."""
+
+    key = np.asarray(keys, dtype=np.int64).reshape(-1)
+    value = np.asarray(values)
+    if value.shape[0] != key.size:
+        raise ValueError("grouped reduction keys and values differ")
+    if key.size == 0:
+        return key, value[:0]
+    if np.any(key[1:] < key[:-1]):
+        raise ValueError("grouped reduction keys must be sorted")
+    starts = np.r_[0, np.flatnonzero(key[1:] != key[:-1]) + 1]
+    return key[starts], np.add.reduceat(value, starts, axis=0)
+
+
+def _accumulate_feature_rows_sorted(
+    destination: np.ndarray,
+    slots: np.ndarray,
+    contribution: np.ndarray,
+    codes: np.ndarray,
+    *,
+    channel_block: int = 16,
+) -> None:
+    """Deterministically reduce weighted codes without a giant hit×D buffer."""
+
+    slot = np.asarray(slots, dtype=np.int64).reshape(-1)
+    weight = np.asarray(contribution, dtype=np.float32).reshape(-1)
+    vector = np.asarray(codes, dtype=np.float32)
+    if slot.shape != weight.shape or vector.shape != (slot.size, destination.shape[1]):
+        raise ValueError("feature reduction arrays differ")
+    if slot.size == 0:
+        return
+    if np.any(slot[1:] < slot[:-1]):
+        raise ValueError("feature reduction slots must be sorted")
+    starts = np.r_[0, np.flatnonzero(slot[1:] != slot[:-1]) + 1]
+    unique = slot[starts]
+    for begin in range(0, destination.shape[1], int(channel_block)):
+        end = min(begin + int(channel_block), destination.shape[1])
+        weighted = weight[:, None] * vector[:, begin:end]
+        destination[unique, begin:end] += np.add.reduceat(weighted, starts, axis=0)
+
+
+def _finalize_soft_child_mass_partition(
+    *,
+    total_alpha: np.ndarray,
+    assigned_child_alpha: np.ndarray,
+    retained_child_weights: np.ndarray,
+    canonical_feature_alpha: np.ndarray,
+    payload_feature_alpha: np.ndarray,
+    alpha_conservation_tolerance: float,
+) -> _SoftChildMassPartition:
+    """Validate and finalize identity and feature-side mass channels.
+
+    The function deliberately never renormalizes renderer output.  Numerical
+    overflow inside the explicitly frozen tolerance is clipped only at the
+    physical [0, 1] boundary and is reported; larger overflow or any ordering
+    violation fails closed.
+    """
+
+    raw_total = np.asarray(total_alpha, dtype=np.float64).reshape(-1)
+    assigned = np.asarray(assigned_child_alpha, dtype=np.float64).reshape(-1)
+    retained_by_child = np.asarray(retained_child_weights, dtype=np.float64)
+    canonical_by_child = np.asarray(canonical_feature_alpha, dtype=np.float64)
+    payload_by_child = np.asarray(payload_feature_alpha, dtype=np.float64)
+    if retained_by_child.ndim != 2:
+        raise ValueError("retained child weights must have shape [token,top_l]")
+    if (
+        canonical_by_child.shape != retained_by_child.shape
+        or payload_by_child.shape != retained_by_child.shape
+        or raw_total.shape != assigned.shape
+        or raw_total.size != retained_by_child.shape[0]
+    ):
+        raise ValueError("soft child mass arrays differ")
+    tolerance = float(alpha_conservation_tolerance)
+    if not np.isfinite(tolerance) or tolerance <= 0.0:
+        raise ValueError("alpha_conservation_tolerance must be positive")
+    arrays = (raw_total, assigned, retained_by_child, canonical_by_child, payload_by_child)
+    if any(np.any(~np.isfinite(value)) for value in arrays):
+        raise ValueError("soft child mass is nonfinite")
+    if any(np.any(value < -tolerance) for value in arrays):
+        raise ValueError("soft child mass is negative")
+
+    retained = np.sum(retained_by_child, axis=1, dtype=np.float64)
+    overflow = np.maximum(raw_total - 1.0, 0.0)
+    if np.any(overflow > tolerance):
+        raise ValueError(
+            "rendered alpha overflow exceeds the transmittance-compositing tolerance"
+        )
+    if np.any(assigned > raw_total + tolerance):
+        raise ValueError("assigned child mass exceeds rendered total alpha")
+    if np.any(retained > assigned + tolerance):
+        raise ValueError("retained child mass exceeds assigned child mass")
+    if np.any(canonical_by_child > retained_by_child + tolerance):
+        raise ValueError("canonical feature mass exceeds retained child mass")
+    if np.any(payload_by_child > canonical_by_child + tolerance):
+        raise ValueError("payload feature mass exceeds canonical feature mass")
+
+    # Only epsilon-scale floating-point excursions are clipped.  Crucially,
+    # no token-dependent scale factor is applied to any contribution.
+    total = np.clip(raw_total, 0.0, 1.0)
+    assigned = np.minimum(np.maximum(assigned, 0.0), total)
+    retained_by_child = np.minimum(
+        np.maximum(retained_by_child, 0.0), assigned[:, None]
+    )
+    retained = np.minimum(
+        np.sum(retained_by_child, axis=1, dtype=np.float64), assigned
+    )
+    canonical_by_child = np.minimum(
+        np.maximum(canonical_by_child, 0.0), retained_by_child
+    )
+    payload_by_child = np.minimum(
+        np.maximum(payload_by_child, 0.0), canonical_by_child
+    )
+
+    child_tail = assigned - retained
+    unassigned = total - assigned
+    background = 1.0 - total
+    canonical_missing = np.sum(
+        retained_by_child - canonical_by_child, axis=1, dtype=np.float64
+    )
+    payload_excluded = np.sum(
+        canonical_by_child - payload_by_child, axis=1, dtype=np.float64
+    )
+    null = child_tail + unassigned + background
+    identity = retained + null
+    if np.any(np.abs(identity - 1.0) > tolerance):
+        raise ValueError("soft child identity partition does not conserve unit mass")
+    return _SoftChildMassPartition(
+        total_alpha=total.astype(np.float32),
+        child_tail_weight=child_tail.astype(np.float32),
+        unassigned_geometry_weight=unassigned.astype(np.float32),
+        background_weight=background.astype(np.float32),
+        canonical_field_missing_weight=canonical_missing.astype(np.float32),
+        payload_excluded_weight=payload_excluded.astype(np.float32),
+        null_weight=null.astype(np.float32),
+        maximum_alpha_overflow=float(np.max(overflow, initial=0.0)),
+        overflow_token_fraction=float(np.mean(overflow > 0.0)),
+    )
 
 
 def _deterministic_contribution_order(
@@ -81,42 +327,11 @@ def _remap_ideal_hits_to_raw_tokens(
     """
 
     factor = int(supersample_factor)
-    if factor <= 0:
-        raise ValueError("coordinate supersample factor must be positive")
-    render_width, render_height = int(token_width) * factor, int(token_height) * factor
-    params = np.asarray(camera.params, dtype=np.float64).reshape(-1)
-    if int(camera.model_id) == 0 and params.size >= 3:
-        focal, cx, cy = params[:3]
-        k1 = 0.0
-    elif int(camera.model_id) == 2 and params.size >= 4:
-        focal, cx, cy, k1 = params[:4]
-    else:
-        raise ValueError("soft renderer requires PINHOLE or SIMPLE_RADIAL camera")
-    scale_x = render_width / float(camera.width)
-    scale_y = render_height / float(camera.height)
-    if abs(scale_x - scale_y) > 1e-12 or float(focal) <= 0.0:
-        raise ValueError("soft renderer camera/grid scale is invalid")
-    focal_grid, cx_grid, cy_grid = focal * scale_x, cx * scale_x, cy * scale_y
-    yy, xx = np.meshgrid(
-        np.arange(render_height, dtype=np.float64) + 0.5,
-        np.arange(render_width, dtype=np.float64) + 0.5,
-        indexing="ij",
+    warp = _raw_to_ideal_token_warp(
+        camera, token_width=int(token_width), token_height=int(token_height),
+        supersample_factor=factor,
     )
-    distorted = np.stack(
-        [(xx - cx_grid) / focal_grid, (yy - cy_grid) / focal_grid], axis=-1
-    )
-    undistorted = inverse_simple_radial(distorted, float(k1))
-    ideal_x = np.floor(focal_grid * undistorted[..., 0] + cx_grid).astype(np.int64)
-    ideal_y = np.floor(focal_grid * undistorted[..., 1] + cy_grid).astype(np.int64)
-    valid_raw = (
-        (ideal_x >= 0) & (ideal_x < render_width)
-        & (ideal_y >= 0) & (ideal_y < render_height)
-    ).reshape(-1)
-    raw_rows = np.flatnonzero(valid_raw)
-    source = (
-        ideal_y.reshape(-1)[raw_rows] * render_width
-        + ideal_x.reshape(-1)[raw_rows]
-    )
+    source = warp.source_ideal_pixel_ids
     hits = np.asarray(pixel_ids, dtype=np.int64).reshape(-1)
     local = np.asarray(local_rows, dtype=np.int64).reshape(-1)
     weight = np.asarray(contribution, dtype=np.float32).reshape(-1)
@@ -127,16 +342,16 @@ def _remap_ideal_hits_to_raw_tokens(
     left = np.searchsorted(sorted_hits, source, side="left")
     right = np.searchsorted(sorted_hits, source, side="right")
     nonempty = right > left
-    raw_rows = raw_rows[nonempty]
     left, right = left[nonempty], right[nonempty]
-    if raw_rows.size == 0:
+    destination = warp.destination_token_pixel_ids[nonempty]
+    if destination.size == 0:
         return (
             np.zeros((0,), dtype=np.int64),
             np.zeros((0,), dtype=np.int64),
             np.zeros((0,), dtype=np.float32),
         )
     counts = right - left
-    expanded_raw = np.repeat(raw_rows, counts)
+    token_pixel = np.repeat(destination, counts)
     # Expand variable-length hit intervals without constructing one temporary
     # NumPy array per raw sample.  This is still an exact gather in the same
     # stable source-hit order.
@@ -146,8 +361,6 @@ def _remap_ideal_hits_to_raw_tokens(
         np.arange(int(np.sum(counts)), dtype=np.int64) - group_origin
     )
     selected_hits = order[selected_ranges]
-    raw_y, raw_x = expanded_raw // render_width, expanded_raw % render_width
-    token_pixel = (raw_y // factor) * int(token_width) + raw_x // factor
     return (
         token_pixel.astype(np.int64),
         local[selected_hits],
@@ -244,6 +457,195 @@ def dominant_child_owner(physical: GoalMapletPhysicalMap) -> np.ndarray:
     return owner
 
 
+def _reduce_soft_child_token_hits(
+    physical: GoalMapletPhysicalMap,
+    field: CanonicalSurfaceField,
+    *,
+    token_pixel_ids: np.ndarray,
+    primitive_rows: np.ndarray,
+    contribution: np.ndarray,
+    width: int,
+    height: int,
+    normalized_codes: np.ndarray,
+    selected_child_rows: np.ndarray | None,
+    top_l: int,
+    minimum_feature_alpha: float,
+    alpha_conservation_tolerance: float,
+) -> RenderedSoftChildMixture:
+    """Shared deterministic CPU reference reduction for scalar and batch rasterizers."""
+
+    pixel_ids = np.asarray(token_pixel_ids, dtype=np.int64).reshape(-1)
+    scene_primitive_rows = np.asarray(primitive_rows, dtype=np.int64).reshape(-1)
+    contribution = np.asarray(contribution, dtype=np.float32).reshape(-1)
+    if pixel_ids.shape != scene_primitive_rows.shape or pixel_ids.shape != contribution.shape:
+        raise ValueError("soft child token hit arrays differ")
+    if np.any((scene_primitive_rows < 0) | (scene_primitive_rows >= physical.primitive_ids.size)):
+        raise ValueError("soft child primitive rows are out of bounds")
+    pixel_count = int(width) * int(height)
+    if np.any((pixel_ids < 0) | (pixel_ids >= pixel_count)):
+        raise ValueError("soft child token pixels are out of bounds")
+    child_count = int(physical.child_parent_rows.size)
+    mixture_rows = np.full((pixel_count, int(top_l)), -1, dtype=np.int64)
+    mixture_weight = np.zeros((pixel_count, int(top_l)), dtype=np.float32)
+    mixture_feature = np.zeros(
+        (pixel_count, int(top_l), field.feature_dim), dtype=np.float32
+    )
+    mixture_canonical_alpha = np.zeros((pixel_count, int(top_l)), dtype=np.float32)
+    mixture_payload_alpha = np.zeros((pixel_count, int(top_l)), dtype=np.float32)
+    total_alpha = np.zeros((pixel_count,), dtype=np.float32)
+    contribution_child = np.zeros((0,), dtype=np.int64)
+    if contribution.size:
+        stable_order = _deterministic_contribution_order(
+            pixel_ids, physical.primitive_ids[scene_primitive_rows], contribution
+        )
+        total_pixels, total_values = _grouped_sum_sorted(
+            pixel_ids[stable_order], contribution[stable_order].astype(np.float32)
+        )
+        total_alpha[total_pixels] = total_values
+        child_owner = dominant_child_owner(physical)
+        contribution_child = child_owner[scene_primitive_rows]
+        valid_child = (
+            (contribution_child >= 0)
+            & (contribution_child < child_count)
+            & (contribution > 0.0)
+        )
+        selected = np.flatnonzero(valid_child)
+        if selected.size:
+            key = (
+                pixel_ids[selected].astype(np.int64) * child_count
+                + contribution_child[selected].astype(np.int64)
+            )
+            order = np.lexsort((
+                contribution[selected].astype(np.float32),
+                physical.primitive_ids[scene_primitive_rows[selected]], key,
+            ))
+            ordered_key = key[order]
+            starts = np.r_[0, np.flatnonzero(ordered_key[1:] != ordered_key[:-1]) + 1]
+            unique_key = ordered_key[starts]
+            unique_mass = np.add.reduceat(
+                contribution[selected[order]].astype(np.float32), starts
+            )
+            unique_pixel = unique_key // child_count
+            unique_child = unique_key % child_count
+            rank_order = np.lexsort((unique_child, -unique_mass, unique_pixel))
+            ranked_pixel = unique_pixel[rank_order]
+            group_starts = np.r_[
+                0, np.flatnonzero(ranked_pixel[1:] != ranked_pixel[:-1]) + 1
+            ]
+            group_count = np.diff(np.r_[group_starts, rank_order.size])
+            within = np.arange(rank_order.size) - np.repeat(group_starts, group_count)
+            keep = within < int(top_l)
+            chosen = rank_order[keep]
+            chosen_rank = within[keep]
+            mixture_rows[unique_pixel[chosen], chosen_rank] = unique_child[chosen]
+            mixture_weight[unique_pixel[chosen], chosen_rank] = unique_mass[chosen]
+
+            chosen_flat = unique_pixel[chosen] * int(top_l) + chosen_rank
+            chosen_key = unique_key[chosen]
+            chosen_sort = np.argsort(chosen_key, kind="stable")
+            sorted_key = chosen_key[chosen_sort]
+            sorted_flat = chosen_flat[chosen_sort]
+            field_row_by_scene = np.full(
+                (physical.primitive_ids.size,), -1, dtype=np.int64
+            )
+            field_row_by_scene[field.primitive_rows] = np.arange(
+                field.primitive_rows.size, dtype=np.int64
+            )
+            field_rows = field_row_by_scene[scene_primitive_rows]
+            canonical_valid = field_rows >= 0
+            payload_valid = canonical_valid.copy()
+            if selected_child_rows is not None:
+                payload = np.zeros((child_count,), dtype=bool)
+                payload_rows = np.asarray(selected_child_rows, dtype=np.int64)
+                if np.any((payload_rows < 0) | (payload_rows >= child_count)):
+                    raise ValueError("selected child payload rows are out of bounds")
+                payload[payload_rows] = True
+                payload_valid &= payload[np.maximum(contribution_child, 0)] & (
+                    contribution_child >= 0
+                )
+            for feature_mask, accumulate_payload in (
+                (canonical_valid, False), (payload_valid, True),
+            ):
+                feature_contribution = np.flatnonzero(feature_mask)
+                if not feature_contribution.size:
+                    continue
+                feature_key = (
+                    pixel_ids[feature_contribution].astype(np.int64) * child_count
+                    + contribution_child[feature_contribution].astype(np.int64)
+                )
+                position = np.searchsorted(sorted_key, feature_key)
+                present = position < sorted_key.size
+                present[present] &= sorted_key[position[present]] == feature_key[present]
+                feature_contribution = feature_contribution[present]
+                slot = sorted_flat[position[present]]
+                stable = physical.primitive_ids[scene_primitive_rows[feature_contribution]]
+                canonical_order = np.lexsort((
+                    contribution[feature_contribution].astype(np.float32), stable, slot,
+                ))
+                feature_contribution = feature_contribution[canonical_order]
+                slot = slot[canonical_order]
+                value = contribution[feature_contribution].astype(np.float32)
+                unique_slot, alpha_sum = _grouped_sum_sorted(slot, value)
+                if accumulate_payload:
+                    _accumulate_feature_rows_sorted(
+                        mixture_feature.reshape(-1, field.feature_dim), slot, value,
+                        normalized_codes[field_rows[feature_contribution]],
+                    )
+                    mixture_payload_alpha.reshape(-1)[unique_slot] += alpha_sum
+                else:
+                    mixture_canonical_alpha.reshape(-1)[unique_slot] += alpha_sum
+
+    assigned_child = np.zeros((pixel_count,), dtype=np.float64)
+    if contribution.size:
+        assigned_mask = (
+            (contribution_child >= 0)
+            & (contribution_child < child_count)
+            & (contribution > 0.0)
+        )
+        if np.any(assigned_mask):
+            assigned_rows = np.flatnonzero(assigned_mask)
+            assigned_order = _deterministic_contribution_order(
+                pixel_ids[assigned_rows],
+                physical.primitive_ids[scene_primitive_rows[assigned_rows]],
+                contribution[assigned_rows],
+            )
+            assigned_pixels, assigned_values = _grouped_sum_sorted(
+                pixel_ids[assigned_rows][assigned_order],
+                contribution[assigned_rows][assigned_order].astype(np.float64),
+            )
+            assigned_child[assigned_pixels] = assigned_values
+    mass = _finalize_soft_child_mass_partition(
+        total_alpha=total_alpha,
+        assigned_child_alpha=assigned_child,
+        retained_child_weights=mixture_weight,
+        canonical_feature_alpha=mixture_canonical_alpha,
+        payload_feature_alpha=mixture_payload_alpha,
+        alpha_conservation_tolerance=float(alpha_conservation_tolerance),
+    )
+    feature_valid = mixture_payload_alpha >= float(minimum_feature_alpha)
+    mixture_feature[feature_valid] /= np.maximum(
+        mixture_payload_alpha[feature_valid, None], 1e-8
+    )
+    feature_norm = np.linalg.norm(mixture_feature, axis=2, keepdims=True)
+    mixture_feature[feature_valid] /= np.maximum(feature_norm[feature_valid], 1e-8)
+    shape = (int(height), int(width))
+    return RenderedSoftChildMixture(
+        child_rows=mixture_rows.reshape(*shape, int(top_l)),
+        child_weights=mixture_weight.reshape(*shape, int(top_l)),
+        child_features=mixture_feature.reshape(*shape, int(top_l), field.feature_dim),
+        child_feature_valid=feature_valid.reshape(*shape, int(top_l)),
+        child_tail_weight=mass.child_tail_weight.reshape(shape),
+        unassigned_geometry_weight=mass.unassigned_geometry_weight.reshape(shape),
+        background_weight=mass.background_weight.reshape(shape),
+        canonical_field_missing_weight=mass.canonical_field_missing_weight.reshape(shape),
+        payload_excluded_weight=mass.payload_excluded_weight.reshape(shape),
+        null_weight=mass.null_weight.reshape(shape),
+        total_alpha=mass.total_alpha.reshape(shape),
+        maximum_alpha_overflow=mass.maximum_alpha_overflow,
+        overflow_token_fraction=mass.overflow_token_fraction,
+    )
+
+
 def render_soft_child_surface_field(
     physical: GoalMapletPhysicalMap,
     field: CanonicalSurfaceField,
@@ -259,6 +661,7 @@ def render_soft_child_surface_field(
     minimum_incidence: float = 0.05,
     minimum_feature_alpha: float = 1e-4,
     coordinate_supersample_factor: int = 4,
+    alpha_conservation_tolerance: float = 2e-5,
 ) -> RenderedSoftChildMixture:
     """Render a true map-side soft child distribution with coupled features.
 
@@ -316,155 +719,19 @@ def render_soft_child_surface_field(
         token_width=int(width), token_height=int(height),
         supersample_factor=factor,
     )
-    pixel_count = int(width) * int(height)
-    child_count = int(physical.child_parent_rows.size)
-    mixture_rows = np.full((pixel_count, int(top_l)), -1, dtype=np.int64)
-    mixture_weight = np.zeros((pixel_count, int(top_l)), dtype=np.float32)
-    mixture_feature = np.zeros(
-        (pixel_count, int(top_l), field.feature_dim), dtype=np.float32
+    return _reduce_soft_child_token_hits(
+        physical, field,
+        token_pixel_ids=pixel_ids,
+        primitive_rows=(
+            scene_rows[local_rows] if local_rows.size
+            else np.zeros((0,), dtype=np.int64)
+        ),
+        contribution=contribution,
+        width=int(width), height=int(height), normalized_codes=codes,
+        selected_child_rows=selected_child_rows, top_l=int(top_l),
+        minimum_feature_alpha=float(minimum_feature_alpha),
+        alpha_conservation_tolerance=float(alpha_conservation_tolerance),
     )
-    mixture_feature_alpha = np.zeros((pixel_count, int(top_l)), dtype=np.float32)
-    total_alpha = np.zeros((pixel_count,), dtype=np.float32)
-    if contribution.size:
-        scene_primitive_rows = scene_rows[local_rows]
-        stable_order = _deterministic_contribution_order(
-            pixel_ids, physical.primitive_ids[scene_primitive_rows], contribution
-        )
-        np.add.at(
-            total_alpha,
-            pixel_ids[stable_order],
-            contribution[stable_order].astype(np.float32),
-        )
-        child_owner = dominant_child_owner(physical)
-        contribution_child = child_owner[scene_primitive_rows]
-        valid_child = (
-            (contribution_child >= 0)
-            & (contribution_child < child_count)
-            & (contribution > 0.0)
-        )
-        selected = np.flatnonzero(valid_child)
-        if selected.size:
-            key = (
-                pixel_ids[selected].astype(np.int64) * child_count
-                + contribution_child[selected].astype(np.int64)
-            )
-            order = np.argsort(key, kind="stable")
-            ordered_key = key[order]
-            starts = np.r_[0, np.flatnonzero(ordered_key[1:] != ordered_key[:-1]) + 1]
-            unique_key = ordered_key[starts]
-            unique_mass = np.add.reduceat(
-                contribution[selected[order]].astype(np.float32), starts
-            )
-            unique_pixel = unique_key // child_count
-            unique_child = unique_key % child_count
-            rank_order = np.lexsort((unique_child, -unique_mass, unique_pixel))
-            ranked_pixel = unique_pixel[rank_order]
-            group_starts = np.r_[
-                0, np.flatnonzero(ranked_pixel[1:] != ranked_pixel[:-1]) + 1
-            ]
-            group_count = np.diff(np.r_[group_starts, rank_order.size])
-            within = np.arange(rank_order.size) - np.repeat(group_starts, group_count)
-            keep = within < int(top_l)
-            chosen = rank_order[keep]
-            chosen_rank = within[keep]
-            mixture_rows[unique_pixel[chosen], chosen_rank] = unique_child[chosen]
-            mixture_weight[unique_pixel[chosen], chosen_rank] = unique_mass[chosen]
-
-            chosen_flat = unique_pixel[chosen] * int(top_l) + chosen_rank
-            chosen_key = unique_key[chosen]
-            chosen_sort = np.argsort(chosen_key, kind="stable")
-            sorted_key = chosen_key[chosen_sort]
-            sorted_flat = chosen_flat[chosen_sort]
-            field_row_by_scene = np.full(
-                (physical.primitive_ids.size,), -1, dtype=np.int64
-            )
-            field_row_by_scene[field.primitive_rows] = np.arange(
-                field.primitive_rows.size, dtype=np.int64
-            )
-            field_rows = field_row_by_scene[scene_primitive_rows]
-            feature_valid = field_rows >= 0
-            if selected_child_rows is not None:
-                payload = np.zeros((child_count,), dtype=bool)
-                payload_rows = np.asarray(selected_child_rows, dtype=np.int64)
-                if np.any((payload_rows < 0) | (payload_rows >= child_count)):
-                    raise ValueError("selected child payload rows are out of bounds")
-                payload[payload_rows] = True
-                feature_valid &= payload[np.maximum(contribution_child, 0)] & (
-                    contribution_child >= 0
-                )
-            feature_contribution = np.flatnonzero(feature_valid)
-            if feature_contribution.size:
-                feature_key = (
-                    pixel_ids[feature_contribution].astype(np.int64) * child_count
-                    + contribution_child[feature_contribution].astype(np.int64)
-                )
-                position = np.searchsorted(sorted_key, feature_key)
-                present = position < sorted_key.size
-                present[present] &= sorted_key[position[present]] == feature_key[present]
-                feature_contribution = feature_contribution[present]
-                slot = sorted_flat[position[present]]
-                value = contribution[feature_contribution].astype(np.float32)
-                flat_feature = mixture_feature.reshape(-1, field.feature_dim)
-                flat_alpha = mixture_feature_alpha.reshape(-1)
-                np.add.at(
-                    flat_feature,
-                    slot,
-                    value[:, None] * codes[field_rows[feature_contribution]],
-                )
-                np.add.at(flat_alpha, slot, value)
-
-    retained = np.sum(mixture_weight, axis=1, dtype=np.float64)
-    assigned_child = np.zeros((pixel_count,), dtype=np.float64)
-    if contribution.size:
-        assigned_mask = (
-            (contribution_child >= 0)
-            & (contribution_child < child_count)
-            & (contribution > 0.0)
-        )
-        if np.any(assigned_mask):
-            np.add.at(
-                assigned_child,
-                pixel_ids[assigned_mask],
-                contribution[assigned_mask].astype(np.float64),
-            )
-    raw_total = np.asarray(total_alpha, dtype=np.float64)
-    child_tail = np.maximum(assigned_child - retained, 0.0)
-    field_missing = np.maximum(raw_total - assigned_child, 0.0)
-    background = np.maximum(1.0 - raw_total, 0.0)
-    distribution_total = retained + child_tail + field_missing + background
-    if np.any(~np.isfinite(distribution_total)) or np.any(distribution_total <= 0.0):
-        raise ValueError("rendered typed child mass is invalid")
-    scale = 1.0 / distribution_total
-    mixture_weight = (mixture_weight.astype(np.float64) * scale[:, None]).astype(np.float32)
-    child_tail = (child_tail * scale).astype(np.float32)
-    field_missing = (field_missing * scale).astype(np.float32)
-    background = (background * scale).astype(np.float32)
-    null_weight = (child_tail + field_missing + background).astype(np.float32)
-    normalized_feature_alpha = mixture_feature_alpha.astype(np.float64) * scale[:, None]
-    payload_missing = np.sum(
-        np.maximum(mixture_weight.astype(np.float64) - normalized_feature_alpha, 0.0),
-        axis=1,
-    ).astype(np.float32)
-    feature_valid = mixture_feature_alpha >= float(minimum_feature_alpha)
-    mixture_feature[feature_valid] /= np.maximum(
-        mixture_feature_alpha[feature_valid, None], 1e-8
-    )
-    feature_norm = np.linalg.norm(mixture_feature, axis=2, keepdims=True)
-    mixture_feature[feature_valid] /= np.maximum(feature_norm[feature_valid], 1e-8)
-    shape = (int(height), int(width))
-    return RenderedSoftChildMixture(
-        child_rows=mixture_rows.reshape(*shape, int(top_l)),
-        child_weights=mixture_weight.reshape(*shape, int(top_l)),
-        child_features=mixture_feature.reshape(*shape, int(top_l), field.feature_dim),
-        child_feature_valid=feature_valid.reshape(*shape, int(top_l)),
-        child_tail_weight=child_tail.reshape(shape),
-        field_missing_weight=field_missing.reshape(shape),
-        background_weight=background.reshape(shape),
-        payload_missing_weight=payload_missing.reshape(shape),
-        null_weight=null_weight.reshape(shape),
-        total_alpha=total_alpha.reshape(shape),
-    )
-
 
 def render_canonical_surface_field(
     physical: GoalMapletPhysicalMap,

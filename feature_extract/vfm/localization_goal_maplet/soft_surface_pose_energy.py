@@ -34,11 +34,13 @@ class BidirectionalSoftSurfacePoseEnergy:
     mean_child_overlap: float
     query_null_mass: float
     rendered_null_mass: float
-    coupled_feature_fraction: float
+    coupled_feature_mass: float
+    coupled_feature_agreement: float
     rendered_child_tail_mass: float
-    rendered_field_missing_mass: float
+    rendered_unassigned_geometry_mass: float
     rendered_background_mass: float
-    rendered_payload_missing_mass: float
+    rendered_canonical_field_missing_mass: float
+    rendered_payload_excluded_mass: float
 
 
 @dataclass(frozen=True)
@@ -50,8 +52,98 @@ class HierarchicalSpatialSoftSurfacePoseEnergy:
     child_coupled_radio_score: float
     mean_parent_overlap: float
     mean_child_overlap: float
-    coupled_feature_fraction: float
+    coupled_feature_mass: float
+    coupled_feature_agreement: float
     spatial_kernel: str
+    query_reliability_semantics: str
+    effective_query_reliability: float
+
+
+@dataclass(frozen=True)
+class SoftSurfaceOverlapLadder:
+    parent_overlap: float
+    child_overlap_radius2: float
+    child_overlap_radius1: float
+    child_overlap_radius0: float
+    query_reliability_semantics: str
+
+
+def query_only_pose_reliability_weights(
+    retrieval: PureRadioPhysicalRetrieval,
+    *,
+    semantics: str = "child_mass_entropy_background_v1",
+) -> np.ndarray:
+    """Return non-negative pose-independent token reliability.
+
+    The default combines retained child mass, posterior concentration and
+    out-of-map probability.  Every input is fixed by the query retrieval; no
+    rendered visibility or candidate pose can change a token's weight.
+    """
+
+    child = np.asarray(retrieval.token_child_probabilities, dtype=np.float64)
+    if child.ndim != 2 or np.any(~np.isfinite(child)) or np.any(child < 0.0):
+        raise ValueError("query child probabilities are invalid")
+    count = int(child.shape[0])
+    if semantics == "uniform_v1":
+        return np.ones((count,), dtype=np.float64)
+    if semantics != "child_mass_entropy_background_v1":
+        raise ValueError("unknown query-only reliability semantics")
+    support = np.sum(child, axis=1)
+    if np.any(support > 1.0 + 2e-5):
+        raise ValueError("query child probabilities exceed unit mass")
+    conditional = np.divide(
+        child, np.maximum(support[:, None], 1e-12),
+        out=np.zeros_like(child), where=support[:, None] > 0.0,
+    )
+    entropy = -np.sum(
+        np.where(conditional > 0.0, conditional * np.log(np.maximum(conditional, 1e-12)), 0.0),
+        axis=1,
+    )
+    entropy /= np.log(max(int(child.shape[1]), 2))
+    concentration = np.clip(1.0 - entropy, 0.0, 1.0)
+    background = np.asarray(
+        retrieval.token_out_of_map_probabilities, dtype=np.float64
+    ).reshape(-1)
+    if (
+        background.shape != (count,) or np.any(~np.isfinite(background))
+        or np.any(background < 0.0) or np.any(background > 1.0 + 2e-5)
+    ):
+        raise ValueError("query out-of-map probabilities are invalid")
+    return np.clip(
+        support * (0.25 + 0.75 * concentration) * (1.0 - np.clip(background, 0.0, 1.0)),
+        0.0, 1.0,
+    )
+
+
+def _fixed_spatial_kernel(radius: int) -> tuple[tuple[int, int, float], ...]:
+    value = int(radius)
+    if value < 0 or value > 3:
+        raise ValueError("spatial kernel radius must lie in [0,3]")
+    if value == 0:
+        return ((0, 0, 1.0),)
+    if value == 1:
+        return (
+            (0, 0, 0.5), (-1, 0, 0.125), (1, 0, 0.125),
+            (0, -1, 0.125), (0, 1, 0.125),
+        )
+    sigma = float(value) / 1.5
+    rows = []
+    for dy in range(-value, value + 1):
+        for dx in range(-value, value + 1):
+            rows.append((dx, dy, float(np.exp(-(dx * dx + dy * dy) / (2.0 * sigma * sigma)))))
+    normalizer = sum(row[2] for row in rows)
+    return tuple((dx, dy, weight / normalizer) for dx, dy, weight in rows)
+
+
+def _query_weighted_mean(value: np.ndarray, reliability: np.ndarray) -> float:
+    atom = np.asarray(value, dtype=np.float64).reshape(-1)
+    weight = np.asarray(reliability, dtype=np.float64).reshape(-1)
+    if atom.shape != weight.shape:
+        raise ValueError("query reliability differs from score atoms")
+    total = float(np.sum(weight))
+    if total <= 1e-12:
+        return -1.0
+    return float(np.sum(weight * atom) / total)
 
 
 def score_hierarchical_spatial_soft_surface_pose_energy(
@@ -61,8 +153,10 @@ def score_hierarchical_spatial_soft_surface_pose_energy(
     *,
     child_to_parent_ids: np.ndarray,
     radio_weight: float = 0.5,
+    spatial_kernel_radius: int = 1,
+    query_reliability_semantics: str = "child_mass_entropy_background_v1",
 ) -> HierarchicalSpatialSoftSurfacePoseEnergy:
-    """Diagnostic V3 parent→child score with a fixed 5-token support kernel.
+    """Parent→child score with a fixed, pose-independent spatial kernel.
 
     The kernel is *not* renormalized at borders: center has weight 1/2 and the
     four cardinal neighbours 1/8 each.  Off-grid/missing support stays at the
@@ -114,7 +208,9 @@ def score_hierarchical_spatial_soft_surface_pose_energy(
     parent_overlap = np.zeros((height * width,), dtype=np.float64)
     child_overlap = np.zeros_like(parent_overlap)
     coupled = np.zeros_like(parent_overlap)
-    offsets = ((0, 0, 0.5), (-1, 0, 0.125), (1, 0, 0.125), (0, -1, 0.125), (0, 1, 0.125))
+    coupled_mass = np.zeros_like(parent_overlap)
+    coupled_cosine = np.zeros_like(parent_overlap)
+    offsets = _fixed_spatial_kernel(int(spatial_kernel_radius))
     yy, xx = np.meshgrid(np.arange(height), np.arange(width), indexing="ij")
     query_index_full = (yy * width + xx).reshape(-1)
     for dx, dy, kernel_weight in offsets:
@@ -136,29 +232,75 @@ def score_hierarchical_spatial_soft_surface_pose_energy(
             np.einsum("tc,tlc->tl", query_token[query_index], map_feature[map_index]),
             -1.0, 1.0,
         )
-        coupled[query_index] += float(kernel_weight) * np.sum(
-            gamma * map_valid[map_index, None, :] * (cosine[:, None, :] + 1.0),
-            axis=(1, 2),
-        )
+        valid_gamma = gamma * map_valid[map_index, None, :]
+        local_mass = np.sum(valid_gamma, axis=(1, 2))
+        local_cosine = np.sum(valid_gamma * cosine[:, None, :], axis=(1, 2))
+        coupled_mass[query_index] += float(kernel_weight) * local_mass
+        coupled_cosine[query_index] += float(kernel_weight) * local_cosine
+        coupled[query_index] += float(kernel_weight) * (local_mass + local_cosine)
     parent_overlap = np.clip(parent_overlap, 0.0, 1.0)
     child_overlap = np.clip(child_overlap, 0.0, 1.0)
-    parent_score = float(np.mean(2.0 * parent_overlap - 1.0))
-    child_score = float(np.mean(2.0 * child_overlap - 1.0))
+    reliability = query_only_pose_reliability_weights(
+        retrieval, semantics=str(query_reliability_semantics)
+    )
+    parent_score = _query_weighted_mean(2.0 * parent_overlap - 1.0, reliability)
+    child_score = _query_weighted_mean(2.0 * child_overlap - 1.0, reliability)
     # Factorized coarse-to-fine evidence with a fixed 1/2 coarse floor:
     # P(parent) * [1/2 + 1/2 P(child|parent)] = (parent+child)/2.
     hierarchical_atom = np.clip(-1.0 + parent_overlap + child_overlap, -1.0, 1.0)
-    hierarchical_score = float(np.mean(hierarchical_atom))
-    feature_score = float(np.mean(np.clip(-1.0 + coupled, -1.0, 1.0)))
+    hierarchical_score = _query_weighted_mean(hierarchical_atom, reliability)
+    feature_score = _query_weighted_mean(
+        np.clip(-1.0 + coupled, -1.0, 1.0), reliability
+    )
+    reliability_total = max(float(np.sum(reliability)), 1e-12)
     return HierarchicalSpatialSoftSurfacePoseEnergy(
         combined_score=float((1.0 - alpha) * hierarchical_score + alpha * feature_score),
         hierarchical_identity_score=hierarchical_score,
         parent_support_score=parent_score,
         child_precision_score=child_score,
         child_coupled_radio_score=feature_score,
-        mean_parent_overlap=float(np.mean(parent_overlap)),
-        mean_child_overlap=float(np.mean(child_overlap)),
-        coupled_feature_fraction=float(np.mean(0.5 * coupled)),
-        spatial_kernel="fixed_center_half_cardinal_four_eighths_no_border_renormalization_v1",
+        mean_parent_overlap=float(np.sum(reliability * parent_overlap) / reliability_total),
+        mean_child_overlap=float(np.sum(reliability * child_overlap) / reliability_total),
+        coupled_feature_mass=float(np.sum(reliability * coupled_mass) / reliability_total),
+        coupled_feature_agreement=float(
+            np.sum(reliability * coupled_cosine)
+            / max(float(np.sum(reliability * coupled_mass)), 1e-12)
+        ),
+        spatial_kernel=(
+            "fixed_center_half_cardinal_four_eighths_no_border_renormalization_v1"
+            if int(spatial_kernel_radius) == 1 else
+            f"fixed_gaussian_radius{int(spatial_kernel_radius)}_no_border_renormalization_v1"
+        ),
+        query_reliability_semantics=str(query_reliability_semantics),
+        effective_query_reliability=float(np.mean(reliability)),
+    )
+
+
+def score_soft_surface_overlap_ladder(
+    query_feature: np.ndarray,
+    retrieval: PureRadioPhysicalRetrieval,
+    rendered,
+    *,
+    child_to_parent_ids: np.ndarray,
+    query_reliability_semantics: str = "child_mass_entropy_background_v1",
+) -> SoftSurfaceOverlapLadder:
+    """Report parent and child overlap from tolerant to exact support."""
+
+    scores = [
+        score_hierarchical_spatial_soft_surface_pose_energy(
+            query_feature, retrieval, rendered,
+            child_to_parent_ids=child_to_parent_ids, radio_weight=0.0,
+            spatial_kernel_radius=radius,
+            query_reliability_semantics=query_reliability_semantics,
+        )
+        for radius in (2, 1, 0)
+    ]
+    return SoftSurfaceOverlapLadder(
+        parent_overlap=scores[0].mean_parent_overlap,
+        child_overlap_radius2=scores[0].mean_child_overlap,
+        child_overlap_radius1=scores[1].mean_child_overlap,
+        child_overlap_radius0=scores[2].mean_child_overlap,
+        query_reliability_semantics=str(query_reliability_semantics),
     )
 
 
@@ -208,7 +350,7 @@ def score_bidirectional_soft_surface_pose_energy(
         raise ValueError("retrieval token order is not exact row-major (x,y)")
     flat_map_weight = map_weight.reshape(height * width, -1)
     typed_names = (
-        "child_tail_weight", "field_missing_weight", "background_weight",
+        "child_tail_weight", "unassigned_geometry_weight", "background_weight",
     )
     if all(hasattr(rendered, name) for name in typed_names):
         typed = [
@@ -257,13 +399,17 @@ def score_bidirectional_soft_surface_pose_energy(
     feature_atom = np.clip(-1.0 + coupled, -1.0, 1.0)
     feature_score = float(np.mean(feature_atom))
     combined = (1.0 - alpha) * identity_score + alpha * feature_score
-    coupled_fraction = float(np.mean(np.sum(valid_gamma, axis=(1, 2))))
+    feature_mass = float(np.mean(np.sum(valid_gamma, axis=(1, 2))))
+    feature_agreement = float(
+        np.sum(valid_gamma * cosine[:, None, :])
+        / max(float(np.sum(valid_gamma)), 1e-12)
+    )
     typed_mean = {
         name: float(np.mean(np.asarray(getattr(rendered, name), dtype=np.float64)))
         if hasattr(rendered, name) else float("nan")
         for name in (
-            "child_tail_weight", "field_missing_weight", "background_weight",
-            "payload_missing_weight",
+            "child_tail_weight", "unassigned_geometry_weight", "background_weight",
+            "canonical_field_missing_weight", "payload_excluded_weight",
         )
     }
     return BidirectionalSoftSurfacePoseEnergy(
@@ -273,11 +419,13 @@ def score_bidirectional_soft_surface_pose_energy(
         mean_child_overlap=float(np.mean(overlap)),
         query_null_mass=float(np.mean(query_null)),
         rendered_null_mass=float(np.mean(map_null)),
-        coupled_feature_fraction=coupled_fraction,
+        coupled_feature_mass=feature_mass,
+        coupled_feature_agreement=feature_agreement,
         rendered_child_tail_mass=typed_mean["child_tail_weight"],
-        rendered_field_missing_mass=typed_mean["field_missing_weight"],
+        rendered_unassigned_geometry_mass=typed_mean["unassigned_geometry_weight"],
         rendered_background_mass=typed_mean["background_weight"],
-        rendered_payload_missing_mass=typed_mean["payload_missing_weight"],
+        rendered_canonical_field_missing_mass=typed_mean["canonical_field_missing_weight"],
+        rendered_payload_excluded_mass=typed_mean["payload_excluded_weight"],
     )
 
 

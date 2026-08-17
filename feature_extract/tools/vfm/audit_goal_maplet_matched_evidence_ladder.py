@@ -89,7 +89,7 @@ def main() -> None:
         render_rows, render_mass, render_null,
     )
     report = {
-        "artifact_type": "goal_maplet_matched_child_evidence_ladder_v1",
+        "artifact_type": "goal_maplet_matched_child_evidence_ladder_v2",
         "image_id": retrieval.image_id,
         "diagnostic_uses_query_contributor_pose": True,
         "not_a_localization_metric": True,
@@ -114,8 +114,14 @@ def main() -> None:
         ),
         "render_typed_mass": {
             "child_tail": float(np.mean(rendered.child_tail_weight)),
-            "field_missing": float(np.mean(rendered.field_missing_weight)),
+            "unassigned_geometry": float(np.mean(rendered.unassigned_geometry_weight)),
             "background": float(np.mean(rendered.background_weight)),
+            "canonical_field_missing": float(
+                np.mean(rendered.canonical_field_missing_weight)
+            ),
+            "payload_excluded": float(np.mean(rendered.payload_excluded_weight)),
+            "maximum_alpha_overflow": float(rendered.maximum_alpha_overflow),
+            "overflow_token_fraction": float(rendered.overflow_token_fraction),
         },
         "interpretation_contract": {
             "retrieval_vs_contributor": "retrieval child evidence loss before online rendering",
