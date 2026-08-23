@@ -30,6 +30,87 @@ from .surface_renderer import (
 )
 
 
+def _composite_packed_hits_torch(
+    global_pixel,
+    depth,
+    primitive_row,
+    alpha,
+):
+    """GPU/CPU Torch equivalent of the deterministic NumPy compositor.
+
+    The lexicographic order is exactly ``(pixel, depth, primitive_row)`` and
+    the 1e-4 early-stop hit remains inclusive.  Float64 prefix arithmetic is
+    intentional: this is the first production-candidate GPU seam and keeps
+    compositing error below the CPU authority tolerance while avoiding D2H of
+    every raw raster hit.
+    """
+
+    import torch
+
+    values = (global_pixel, depth, primitive_row, alpha)
+    if any(not isinstance(value, torch.Tensor) for value in values):
+        raise TypeError("packed compositor inputs must be Torch tensors")
+    pixel, depth_value, row, opacity = values
+    if any(value.ndim != 1 for value in values) or len({int(value.numel()) for value in values}) != 1:
+        raise ValueError("packed compositor arrays must be aligned one-dimensional tensors")
+    if pixel.dtype != torch.int64 or row.dtype != torch.int64:
+        raise ValueError("packed compositor identity arrays must be int64")
+    if depth_value.dtype != torch.float32 or opacity.dtype != torch.float32:
+        raise ValueError("packed compositor numeric arrays must be float32")
+    if len({value.device for value in values}) != 1:
+        raise ValueError("packed compositor arrays must share one device")
+    if any(not value.is_contiguous() for value in values):
+        raise ValueError("packed compositor arrays must be contiguous")
+    if not torch.isfinite(depth_value).all() or not torch.isfinite(opacity).all():
+        raise ValueError("packed compositor numeric arrays must be finite")
+    if torch.any(pixel < 0) or torch.any(row < 0):
+        raise ValueError("packed compositor identities must be nonnegative")
+    if pixel.numel() == 0:
+        return pixel.clone(), row.clone(), opacity.clone()
+
+    # Stable least-significant to most-significant sorts reproduce np.lexsort.
+    order = torch.argsort(row, stable=True)
+    order = order[torch.argsort(depth_value[order], stable=True)]
+    order = order[torch.argsort(pixel[order], stable=True)]
+    pixel = pixel[order]
+    row = row[order]
+    opacity = torch.clamp(opacity[order].to(torch.float64), 0.0, 0.999)
+    starts = torch.empty_like(pixel, dtype=torch.bool)
+    starts[0] = True
+    starts[1:] = pixel[1:] != pixel[:-1]
+    start_indices = torch.nonzero(starts, as_tuple=False).reshape(-1)
+    counts = torch.diff(torch.cat([
+        start_indices,
+        torch.as_tensor([pixel.numel()], dtype=torch.int64, device=pixel.device),
+    ]))
+    log_survival = torch.log1p(-opacity)
+    prefix = torch.cumsum(log_survival, dim=0)
+    group_base = torch.cat([
+        torch.zeros((1,), dtype=torch.float64, device=pixel.device),
+        prefix[start_indices[1:] - 1],
+    ])
+    base = torch.repeat_interleave(group_base, counts)
+    log_transmittance = prefix - log_survival - base
+    transmittance = torch.exp(torch.clamp(log_transmittance, min=-745.0, max=0.0))
+    weight = transmittance * opacity
+    transmittance_after = torch.exp(torch.clamp(prefix - base, min=-745.0, max=0.0))
+    group = torch.cumsum(starts.to(torch.int64), dim=0) - 1
+    index = torch.arange(pixel.numel(), dtype=torch.int64, device=pixel.device)
+    stop = transmittance_after <= 1.0e-4
+    first_stop = torch.full(
+        (start_indices.numel(),), pixel.numel(), dtype=torch.int64, device=pixel.device
+    )
+    stop_index = index[stop]
+    stop_group = group[stop]
+    if stop_index.numel():
+        first = torch.empty_like(stop_group, dtype=torch.bool)
+        first[0] = True
+        first[1:] = stop_group[1:] != stop_group[:-1]
+        first_stop[stop_group[first]] = stop_index[first]
+    keep = (index <= first_stop[group]) & (weight > 1.0e-12)
+    return pixel[keep], row[keep], weight[keep].to(torch.float32)
+
+
 @dataclass(frozen=True)
 class ResidentRendererBatchAudit:
     batch_size: int
@@ -48,6 +129,7 @@ class ResidentRendererBatchAudit:
     packed_hit_count: int
     remapped_hit_count: int
     resident_geometry_bytes: int
+    gpu_compositor_implemented: bool
     gpu_child_reducer_implemented: bool
     production_speed_gate_passed: bool
 
@@ -265,27 +347,23 @@ class FrozenSoftSurfaceSceneGPU:
         ) + pixel_ids.to(torch.int64)
         torch.cuda.synchronize(self.device)
         projection_seconds = time.perf_counter() - started
+        composite_started = time.perf_counter()
+        out_pixel, out_row, out_weight = _composite_packed_hits_torch(
+            global_pixel.contiguous(), hit_depth.contiguous(),
+            gs_ids.to(torch.int64).contiguous(), alpha.contiguous(),
+        )
+        torch.cuda.synchronize(self.device)
+        composite_seconds = time.perf_counter() - composite_started
         transfer_started = time.perf_counter()
         arrays = [
-            global_pixel.detach().cpu().numpy(),
-            hit_depth.detach().cpu().numpy(),
-            gs_ids.detach().cpu().numpy(),
-            alpha.detach().cpu().numpy(),
+            out_pixel.detach().cpu().numpy(),
+            out_row.detach().cpu().numpy(),
+            out_weight.detach().cpu().numpy(),
         ]
         torch.cuda.synchronize(self.device)
         transfer_seconds = time.perf_counter() - transfer_started
-        global_pixel_np, depth_np, rows_np, alpha_np = arrays
-        composite_started = time.perf_counter()
-        order = np.lexsort((rows_np, depth_np, global_pixel_np))
-        packed = np.stack([
-            global_pixel_np[order].astype(np.float64),
-            depth_np[order].astype(np.float64),
-            rows_np[order].astype(np.float64),
-            alpha_np[order].astype(np.float64),
-        ], axis=1)
-        out_pixel, out_row, out_weight = _composite_sorted_packed_hits(packed)
-        composite_seconds = time.perf_counter() - composite_started
-        return out_pixel, out_row, out_weight, packed_hit_count, {
+        out_pixel_np, out_row_np, out_weight_np = arrays
+        return out_pixel_np, out_row_np, out_weight_np, packed_hit_count, {
             "projection_tile_raster_seconds": float(projection_seconds),
             "device_to_host_seconds": float(transfer_seconds),
             "depth_sort_composite_seconds": float(composite_seconds),
@@ -428,6 +506,7 @@ class FrozenSoftSurfaceSceneGPU:
                 host_reduction_seconds=float(host_seconds), total_seconds=float(total_seconds),
                 packed_hit_count=int(packed_count), remapped_hit_count=int(weight.size),
                 resident_geometry_bytes=self._resident_geometry_bytes,
+                gpu_compositor_implemented=True,
                 gpu_child_reducer_implemented=False,
                 production_speed_gate_passed=False,
             ),

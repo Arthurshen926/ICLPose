@@ -138,7 +138,7 @@ def main() -> None:
         and forward.audit.gpu_child_reducer_implemented
     )
     report = {
-        "artifact_type": "goal_maplet_resident_soft_surface_renderer_audit_v2_direct_parent_timing",
+        "artifact_type": "goal_maplet_resident_soft_surface_renderer_audit_v3_gpu_compositor",
         "input_file_sha256": {
             "physical_map": file_sha256(physical_path),
             "canonical_field": file_sha256(field_path),
@@ -167,7 +167,7 @@ def main() -> None:
         "exact_top8_speed_gate_passed": speed_gate,
         "promotion_eligible": bool(equivalence and speed_gate),
         "blockers": ([] if speed_gate else [
-            "deterministic child/feature reduction remains on CPU and exact Top8 speed gate is not passed",
+            "post-composite token remap and child/support/parent/feature/typed reduction remain on CPU and exact Top8 speed gate is not passed",
         ]),
     }
     report["content_sha256"] = canonical_json_sha256(report)

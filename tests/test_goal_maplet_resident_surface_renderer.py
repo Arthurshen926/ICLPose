@@ -5,12 +5,55 @@ import numpy as np
 from feature_extract.vfm.colmap_tracks import ColmapCamera
 from feature_extract.vfm.localization_goal_maplet.resident_surface_renderer import (
     FrozenSoftSurfaceSceneGPU,
+    _composite_packed_hits_torch,
 )
 from feature_extract.vfm.localization_goal_maplet.surface_renderer import (
     _RAW_TO_IDEAL_TOKEN_WARP_CACHE,
     _raw_to_ideal_token_warp,
     _remap_ideal_hits_to_raw_tokens,
 )
+from feature_extract.vfm.vfm_2dgs_mapping import _composite_sorted_packed_hits
+
+
+def _reference_composite(pixel, depth, row, alpha):
+    order = np.lexsort((row, depth, pixel))
+    packed = np.stack([
+        pixel[order].astype(np.float64), depth[order].astype(np.float64),
+        row[order].astype(np.float64), alpha[order].astype(np.float64),
+    ], axis=1)
+    return _composite_sorted_packed_hits(packed)
+
+
+def test_torch_compositor_matches_numpy_authority_with_ties_and_early_stop():
+    import torch
+
+    rng = np.random.default_rng(20260817)
+    pixel = rng.integers(0, 11, size=500, dtype=np.int64)
+    depth = rng.choice(np.asarray([1.0, 1.5, 2.0, 3.0], dtype=np.float32), size=500)
+    row = rng.integers(0, 37, size=500, dtype=np.int64)
+    alpha = rng.uniform(0.01, 0.999, size=500).astype(np.float32)
+    expected = _reference_composite(pixel, depth, row, alpha)
+    actual = _composite_packed_hits_torch(
+        torch.from_numpy(pixel.copy()), torch.from_numpy(depth.copy()),
+        torch.from_numpy(row.copy()), torch.from_numpy(alpha.copy()),
+    )
+    np.testing.assert_array_equal(actual[0].numpy(), expected[0])
+    np.testing.assert_array_equal(actual[1].numpy(), expected[1])
+    np.testing.assert_allclose(actual[2].numpy(), expected[2], atol=2e-7, rtol=2e-7)
+
+
+def test_torch_compositor_rejects_fractional_identity_and_nonfinite_depth():
+    import torch
+
+    with np.testing.assert_raises_regex(ValueError, "identity arrays"):
+        _composite_packed_hits_torch(
+            torch.ones(2), torch.ones(2), torch.ones(2, dtype=torch.int64), torch.ones(2)
+        )
+    with np.testing.assert_raises_regex(ValueError, "finite"):
+        _composite_packed_hits_torch(
+            torch.ones(2, dtype=torch.int64), torch.tensor([1.0, float("nan")]),
+            torch.ones(2, dtype=torch.int64), torch.ones(2),
+        )
 
 
 def _camera() -> ColmapCamera:
