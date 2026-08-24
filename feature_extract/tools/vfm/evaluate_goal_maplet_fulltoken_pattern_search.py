@@ -19,18 +19,24 @@ from feature_extract.tools.vfm.build_goal_maplet_sparse_pose_transport_dataset i
     _load_contributors,
 )
 from feature_extract.tools.vfm.evaluate_goal_maplet_visibility_pose_acquisition import _pose_errors
-from feature_extract.tools.vfm.train_evaluate_goal_maplet_sparse_pose_transport import _load_dataset
+from feature_extract.vfm.localization_goal_maplet.pose_candidate_dataset import (
+    load_pose_candidate_dataset,
+)
 from feature_extract.tools.vfm.verify_goal_maplet_pose_modes_with_surface_field import _camera
 from feature_extract.vfm.localization.surface_maplet_mapper import load_surface_maplet_mapper
 from feature_extract.vfm.localization_goal_maplet.canonical_field import CanonicalSurfaceField
 from feature_extract.vfm.localization_goal_maplet.fulltoken_surface_pose_energy import (
+    CONDITIONAL_PHASE_CONTROL_SEMANTICS,
+    CONDITIONAL_SHIFT_PHASE_CONTROL_SEMANTICS,
     CONTRASTIVE_SEMANTICS,
     PHASE_SEMANTICS,
+    SHIFT_TOLERANT_PHASE_SEMANTICS,
     SEMANTICS,
     PARENT_GATED_SEMANTICS,
     PARENT_GATED_CONTRASTIVE_SEMANTICS,
     fulltoken_surface_pose_energy,
     conservative_fulltoken_phase_pose_energy,
+    conditional_fulltoken_phase_pose_energy_control,
     parent_gated_fulltoken_surface_pose_energy,
 )
 from feature_extract.vfm.localization_goal_maplet.lineage import file_sha256
@@ -79,10 +85,14 @@ def main() -> None:
     parser.add_argument("--maximum_sweeps", type=int, default=3)
     parser.add_argument("--render_batch_size", type=int, default=8)
     parser.add_argument("--minimum_cosine_evidence", type=float, default=-1.0)
+    parser.add_argument("--phase_shift_radius_tokens", type=int, default=0)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument(
         "--score_semantics",
-        choices=("appearance_only", "appearance_parent_product", "conservative_phase"),
+        choices=(
+            "appearance_only", "appearance_parent_product",
+            "conservative_phase", "conditional_phase",
+        ),
         default="appearance_parent_product",
     )
     parser.add_argument(
@@ -95,10 +105,17 @@ def main() -> None:
     )
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
+    if not 0 <= int(args.phase_shift_radius_tokens) <= 4:
+        raise ValueError("phase_shift_radius_tokens must lie in [0,4]")
+    if (
+        int(args.phase_shift_radius_tokens) != 0
+        and str(args.score_semantics) not in {"conservative_phase", "conditional_phase"}
+    ):
+        raise ValueError("phase shift tolerance is only defined for phase scorers")
     output = Path(args.output)
     if output.exists() and not bool(args.force):
         raise FileExistsError("refusing to overwrite full-token search report")
-    arrays, dataset_metadata = _load_dataset(Path(args.dataset))
+    arrays, dataset_metadata = load_pose_candidate_dataset(Path(args.dataset))
     physical = GoalMapletPhysicalMap.load_npz(Path(args.physical_map))
     field = CanonicalSurfaceField.load_npz(Path(args.canonical_field))
     if (
@@ -145,7 +162,12 @@ def main() -> None:
             for candidate in range(1, int(frozen_score.size)):
                 if not bool(arrays["candidate_valid"][query_index, candidate]):
                     continue
-                phase = conservative_fulltoken_phase_pose_energy(
+                phase_function = (
+                    conditional_fulltoken_phase_pose_energy_control
+                    if str(args.score_semantics) == "conditional_phase"
+                    else conservative_fulltoken_phase_pose_energy
+                )
+                phase = phase_function(
                     query_descriptor,
                     torch.as_tensor(
                         arrays["target_canonical_features"][query_index, candidate],
@@ -160,6 +182,7 @@ def main() -> None:
                         device=device,
                     ),
                     height=36, width=64,
+                    maximum_shift_tokens=int(args.phase_shift_radius_tokens),
                 )
                 frozen_score[candidate] = float(phase.score.detach().cpu())
             order = np.argsort(-frozen_score, kind="stable")
@@ -263,10 +286,17 @@ def main() -> None:
                             local_radius_tokens=0,
                             minimum_cosine_evidence=float(args.minimum_cosine_evidence),
                         )
-                    else:
+                    elif str(args.score_semantics) == "conservative_phase":
                         value = conservative_fulltoken_phase_pose_energy(
                             query_descriptor, target_descriptor, target_mass, target_valid,
                             height=36, width=64,
+                            maximum_shift_tokens=int(args.phase_shift_radius_tokens),
+                        )
+                    else:
+                        value = conditional_fulltoken_phase_pose_energy_control(
+                            query_descriptor, target_descriptor, target_mass, target_valid,
+                            height=36, width=64,
+                            maximum_shift_tokens=int(args.phase_shift_radius_tokens),
                         )
                     score.append(float(value.score.detach().cpu()))
             result = np.asarray(score, dtype=np.float64)
@@ -324,8 +354,22 @@ def main() -> None:
             )
             if str(args.score_semantics) == "appearance_parent_product"
             else (
-                PHASE_SEMANTICS
-                if str(args.score_semantics) == "conservative_phase"
+                (
+                    (
+                        PHASE_SEMANTICS
+                        if int(args.phase_shift_radius_tokens) == 0
+                        else SHIFT_TOLERANT_PHASE_SEMANTICS
+                    )
+                    if str(args.score_semantics) == "conservative_phase"
+                    else (
+                        CONDITIONAL_PHASE_CONTROL_SEMANTICS
+                        if int(args.phase_shift_radius_tokens) == 0
+                        else CONDITIONAL_SHIFT_PHASE_CONTROL_SEMANTICS
+                    )
+                )
+                if str(args.score_semantics) in (
+                    "conservative_phase", "conditional_phase"
+                )
                 else (
                     CONTRASTIVE_SEMANTICS
                     if float(args.minimum_cosine_evidence) > -1.0
@@ -334,16 +378,17 @@ def main() -> None:
             )
         ),
         "score_semantics": str(args.score_semantics),
+        "phase_shift_radius_tokens": int(args.phase_shift_radius_tokens),
         "minimum_cosine_evidence": float(args.minimum_cosine_evidence),
         "dataset_file_sha256": file_sha256(Path(args.dataset)),
         "physical_map_sha256": physical.content_sha256,
         "canonical_field_sha256": field.content_sha256,
         "surface_mapper_file_sha256": mapper_sha,
         "initialization_semantics": (
-            "dataset_conservative_phase_best_basin_independent_of_first_no_gt_v1"
+            f"dataset_{args.score_semantics}_shift{int(args.phase_shift_radius_tokens)}_best_basin_independent_of_first_no_gt_v2"
             if str(args.initialization_semantics) == "dataset_best_phase_independent_of_first"
             else (
-                "dataset_conservative_phase_top1_no_gt_initialization_v1"
+                f"dataset_{args.score_semantics}_shift{int(args.phase_shift_radius_tokens)}_top1_no_gt_initialization_v2"
                 if str(args.initialization_semantics) == "dataset_best_phase"
                 else (
                     "dataset_first_retrieval_proposal_no_gt_initialization_v1"

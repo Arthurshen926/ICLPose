@@ -258,13 +258,15 @@ transport、full-token energy 全局 reranking、无保护连续优化。
 
 本轮最终回归：81 tests passed；唯一 warning 是 PyTorch `scatter_reduce` beta API。
 
-## 2026-08-19：完整 token phase 与 protected multiseed handoff
+## 2026-08-19：完整 token phase 与 protected multiseed handoff（历史结果，语义已纠正）
 
 parent/child identity 能量仍主要回答“看见哪个区域”，对区域内部的连续位姿不够
-敏感。新 phase 能量直接比较 query 与 candidate-rendered RADIO surface field 的
-水平/垂直局部差分。每条可观测边使用非负 `(cos(delta_q,delta_r)+1)` evidence，
-以完整网格边数作固定分母；水平和垂直分数取最小值，禁止单轴补偿另一轴。它不构造
-点对应，也不解 PnP。
+敏感。当时新增的 phase 实现直接比较 query 与 candidate-rendered RADIO surface
+field 的水平/垂直局部差分。它不构造点对应，也不解 PnP。需要特别更正：该历史
+实现虽然使用完整网格边数，但 token 内先做 candidate-dependent descriptor mixture
+归一化，因而不是 evidence-disappearance-monotone；下文的历史
+`fulltoken_conservative_phase*.json` 现在只能解释为 conditional phase control。
+严格 additive/max-bottleneck 合同及反例见 2026-08-23 小节。
 
 自然 Top8 静态评估的后 5 query：Spearman `0.852`、pairwise `86.4%`、GT anchor
 Top1 `5/5`；selected strict 从 `20%` 提高到 `40%`，loose 从 `80%` 提高到
@@ -319,6 +321,97 @@ dataset seed 一致，按 phase score 排序后执行真实 physical NMS。输�
 需要在更大、冻结的数据上验证 Top2 physical-basin recall，并为集合内最终
 pose/null 训练独立校准器。组合回归更新为85项通过。
 
+## 2026-08-23：source attribution oracle、phase 合同纠正与后端裁决
+
+本节覆盖并纠正上文对旧 phase v1 的理论表述。旧实现虽然使用完整网格边数作
+分母，但先把一个 token 的多个 rendered child descriptor 加权混合并重新单位
+化。删除一个不匹配 child 后，剩余混合向量可能更接近 query。一个 2x2 合成
+反例中，删除 distractor 后 score 从 `0.7071` 上升到 `1.0`。因此旧
+`fixed_grid_nonnegative...v1` 只能称为 **conditional normalized-mixture phase
+guide**，不能称为 evidence-disappearance-monotone conservative energy。
+
+### 已补的严格合同
+
+新增两种真正固定原子的 phase control：
+
+1. `additive_product`：每条图像边对全部 rendered slot-pair 求和，atom 为
+   `m_a m_b valid_a valid_b (cos+1)`；
+2. `maximum_bottleneck`：对 slot-pair 取
+   `max min(m_a,m_b) valid_a valid_b (cos+1)`。
+
+二者对 mass/validity 删除都严格不增，且 shift 只在同一组逐项不增的分数上取
+最大。合成反例与随机 fractional mass/validity property tests 已覆盖。但真实
+map-disjoint dev5 结果显示严格性有明显辨识代价：
+
+| score | held Spearman | pairwise | GT anchor Top1 | selected strict/loose |
+|---|---:|---:|---:|---:|
+| conditional phase shift r1 | 0.876 | 87.9% | 100% | 40% / 100% |
+| additive slot-pair r1 | 0.524 | 72.1% | 40% | 20% / 100% |
+| max-bottleneck slot-pair r1 | 0.490 | 69.3% | 20% | 0% / 100% |
+
+所以不能把严格原子核直接替换为主 ranking，也不能继续把 conditional guide
+误报为严格单调能量。正确统计语义改为双通道：
+
+* `conditional_content_score` 回答“在当前可观测证据条件下是否匹配”；
+* `mass_observability` 独立回答“有多少结构支持这个判断”。
+
+真实 held candidates 中，以 evaluator 的 joint error 定义逐 query 计算再平均，
+conditional scalar / conditional content / information mass 相对负误差的 Spearman
+分别为 `0.876 / 0.733 / -0.138`。GT mass 中位数0.661、范围0.568--0.703；
+获胜候选中位数0.649、范围0.577--0.708，没有发现靠低支持提高分数的主导作弊。
+后续 proposal 可以使用
+conditional guide，但 uncertainty/null 必须同时消费独立支持通道；不能再宣称
+一个标量同时表达内容和信息量。
+
+### source child oracle 给出的决定性分解
+
+在不改变 target render、candidate poses、RADIO、reliability 或 labels 的前提下，
+只把 query source child posterior 替换为 GT pose 的 exact contributor child mass：
+
+| input | held Spearman | pairwise | GT anchor Top1 | selected strict/loose |
+|---|---:|---:|---:|---:|
+| current source posterior | -0.095 | 44.3% | 20% | 20% / 80% |
+| source-child oracle | 0.757 | 82.1% | 100% | 40% / 100% |
+
+oracle 的 exact-edge control 进一步达到 held Spearman `0.838`、pairwise `85.7%`。
+这证明 target renderer 和目标侧 pose signal 是有效的，主要瓶颈是 query token 到
+child/support 的 attribution。当前 posterior 每 token 有效 child 约35个，held
+truth top-1 mass 只有6.3%，而 truth child 在 Top64 中的质量覆盖约81.5%。
+
+以下三个无训练修复均被真实 held 结果否决：
+
+* canonical primitive child modes：posterior cosine 只从约0.211升到0.222；
+* mapping-view observed child modes（1464 mapping views、约144万 child-view
+  observations）：held cosine 约0.215--0.217；
+* 完全绕过 child 的 query-token appearance capacity transport：held Spearman
+  最好0.186，局部 radius 增大后变负；
+* parent categorical layout capacity transport：held Spearman约
+  `-0.08--0.07`。
+
+因此不是“再加几个 prototype”、纯外观或纯 parent layout 能解决的问题。有效信号
+来自 candidate-rendered **完整 token 相位**；物理 parent/child 主要负责高召回
+basin support 和类型约束。
+
+### 当前主后端边界
+
+1. 冻结 RADIO parent/child 全局召回和原始多 basin seeds；不再继续优化单独 child
+   retrieval 指标。
+2. conditional full-token phase 只作为经验 proposal/搜索 guide，输出必须同时携带
+   information mass；严格 additive/max-bottleneck 作为可证控制与安全诊断。
+3. 所有 seed 永久保留；refinement 只能新增 hypothesis，不能覆盖输入 basin。
+   现有真实 pose-bound dev5 集合仍是2个独立 basin/query，strict acquisition 80%、
+   loose 100%，但不是 Top1 success。
+4. 当前 view-conditioned rank-4 field只解释约14.1%的残差，canonical 与 view-field
+   held ranking基本相同；不是主要瓶颈。
+5. 下一项真正需要训练的不是六个全局 transport 权重，而是 candidate-conditioned
+   full-layout query pose readout / local residual field。训练必须使用更多 mapping views
+   的 leave-one-view/leave-route-out supervision，并直接惩罚 score-improving/
+   error-worsening hard negatives。当前6-train/5-dev对角128D试验只把严格 phase held
+   Spearman从0.524提到0.562、Top1不变，已否决为不足证据。
+
+本节所有结果仍是 `seq11` map-disjoint backend diagnostic；没有打开或重新拟合
+530-query standard test，也不构成端到端定位成功声明。
+
 ## 2026-08-23：seq13 地图外 16-query 直接位姿后端复核
 
 本轮没有 ALIKE、PnP、点对应、五折或高斯重建。地图、canonical field 与
@@ -346,17 +439,17 @@ visible-mass recall 均值 `95.11%/96.02%`，parent token visible-mass coverage
 这说明主要断点已从 parent global retrieval 移到 child identity compression、
 pose-atlas orientation/location assignment 与最终 pose energy。
 
-零位移 conservative phase 在 seq13 的 Top1 strict/loose 都为 `0%`，Spearman
+旧零位移 conditional phase（历史文件名误写 conservative）在 seq13 的 Top1
+strict/loose 都为 `0%`，Spearman
 仅 `0.172`、pairwise `56.0%`；物理去重 Top8 也只有 strict `6.25%`、loose
 `18.75%`。GT anchor 却仍 16/16 排第一，说明能量有极窄正确峰，但从 coarse
 basin 到该峰的排序地形不成立。
 
-为检验投影平移，新增共同整数 shift 的 H/V conservative max：每个 shift 仍用
-full-edge fixed denominator，越界为 unknown floor，所有 evidence 非负；对每个
-shift 取 `min(H,V)` 后再 max，故 target evidence disappearing 不能提高任一
-shift，也不能提高最终 max。半径1/2/3在 seq11 完全同分，冻结最小半径1后回放
-seq13，只得到 Top1 strict/loose `6.25%/6.25%`、Spearman `0.195`。全局 shift
-无法表达真实 SE(3) 的非刚性视差与遮挡。
+为检验投影平移，当时新增共同整数 shift；同样由于 descriptor mixture 归一化，
+它也只能称 conditional shift control，不能称严格 conservative。半径1/2/3在
+seq11 完全同分，冻结最小半径1后回放 seq13，只得到 Top1 strict/loose
+`6.25%/6.25%`、Spearman `0.195`。全局 shift 无法表达真实 SE(3) 的非刚性视差
+与遮挡。
 
 最后从候选集中 GT 最近的 2m/45deg basin 启动 phase pattern search，仍得到两个
 确定性反例：
@@ -374,3 +467,88 @@ phase 后端正式 KILL；失败既不是纯召回缺少候选，也不是只差
 candidate-relative residual/energy，并以 coupled translation-rotation rank 与
 局部负曲率反例作为硬门。输出始终保留物理去重的多 basin 与 null；只有 oracle
 nearest basin 的局部 capture 通过后，才允许跑完整 test refinement。
+
+### 2026-08-23 同口径重放与最低容量残差读出
+
+评分器已从 sparse-transport-v2 专用 loader 解耦：trainable transport 仍严格只接收
+含 hierarchy 的 v2，而 full-token score、physical NMS 和 protected-set builder 可
+重放哈希闭合的 v1/v2 candidate grid。由此用纠正后的实现重新评估同一 seq13 16帧：
+
+| score | Spearman | pairwise | GT anchor Top1 | actual selected strict/loose |
+|---|---:|---:|---:|---:|
+| conditional phase shift r1 | 0.195 | 56.8% | 100% | 6.25% / 6.25% |
+| strict additive slot-pair r1 | 0.132 | 54.0% | 93.75% | 0% / 0% |
+| strict max-bottleneck r1 | 0.150 | 54.7% | 87.5% | 0% / 0% |
+
+对 conditional score 做真实 `0.5m/5deg` physical NMS 后，Top1--3 都只有
+strict/loose `6.25%/6.25%`；Top4--7 的 loose 为12.5%，Top8为18.75%，strict始终
+6.25%。这恰好触及现有候选池的 strict `1/16` 与 loose `3/16` 上限，进一步证明
+增加 TopK 或换 NMS 不能制造池中不存在的精位姿。
+
+另用已有 `seq11 controlled_local19` 的前6 query 训练一个252维空间金字塔线性
+residual readout（token content/support、水平/垂直 phase content/support，ridge
+强度仅用 train leave-one-query-out 选择），再一次性评估后5 query。它在受控 held
+上 Spearman 仅0.518，在 natural held 上仅0.250、pairwise58.1%、strict/loose
+40%/80%，不如无训练的 conditional phase（0.876、87.9%、40%/100%）。因此
+“在少量 GT-relative 对称扰动上拟合一个全局线性布局权重”也被否决；它既存在
+candidate-domain shift，也不能生成 candidate pool 之外的新位姿。
+
+最终剩余的核心不是再改 phase 标量，而是两个相互独立的模块：
+
+1. 在高召回 physical parent region 内生成连续、方向多样、物理去重的 pose basins，
+   解决 seq13 的 1m/10deg candidate support 缺失；
+2. 对每个 basin 使用 candidate-conditioned full-layout residual/energy，训练数据来自
+   mapping view 的 leave-view/leave-route-out renderer perturbation，并显式包含
+   natural coarse proposals 与 score-improving/error-worsening hard negatives，解决
+   受控扰动到自然候选的域偏移。
+
+在这两项完成前，RADIO physical region retrieval 可以冻结，但“pose-basin proposal”
+和“最终位姿测量”都不能冻结，也不能进入530-query Top1结论。
+
+## 2026-08-23：因子化局部域与 direct canonical renderer
+
+为把“候选池没有精位姿”与“局部域本身不可达”分开，新增固定、query-independent
+的 factorized basin：每个现有 coarse seed 周围使用125个 world translation offsets
+（0.75m间隔、范围±1.5m）和105个 left-camera axis-angle offsets（26个有符号立方
+方向，10/20/30/40度，加 identity）。它是隐式位置×朝向乘积，不显式物化每seed
+13,125个姿态；GT只在域与哈希冻结后用于 oracle gate。
+
+结果：
+
+| candidate pool | 原池 strict/loose | factorized-domain strict/loose |
+|---|---:|---:|
+| seq11 natural 8 | 依query约20--80% / 80--100% | 100% / 100% |
+| seq13 pose-free 15 | 6.25% / 18.75% | 68.75% / 87.5% |
+
+seq13 factorized oracle 的中位最近误差为0.408m/3.75deg。产物为
+`output/g25_pose_transport/seq13_map_disjoint_radio_atlas16_v1/factorized_pose_basin_oracle_v1.json`。
+它证明 coarse basin 周围的连续局部 support 基本足够；但它只是 acquisition upper
+bound，不是检索/搜索成功。全乘积约19.7万pose/query，禁止暴力展开，后续必须用
+分层位置/朝向 beam，并在预算耗尽时保留原始 coarse seed。
+
+同时新增 direct canonical token renderer：full-scene 2DGS 仍先做精确遮挡合成，
+随后直接把所有有 canonical RADIO code 的 primitive payload 归约成每token一个128D
+feature+mass，不再构造当前 phase/residual 并不消费的 child/parent Top4。真实3姿态：
+
+* 旧 exact Top4 path：20.183s，其中CPU post-reduction 19.782s；
+* direct path：0.449s，44.93x；raster 0.088s、token remap 0.314s、direct reducer
+  0.047s；
+* 正逆batch feature/mass最大差3.58e-7/1.37e-6；
+* 与旧Top4 mixture feature余弦中位数0.999982、p10 0.999407。
+
+完整重渲染评估中，seq11 每query 8 candidates 平均0.743s，held Spearman0.867、
+strict/loose40%/100%；seq13 每query 16 candidates平均1.971s，Spearman0.196、
+strict/loose6.25%/6.25%。它与存储Top4的排名近乎相同，说明 direct renderer 已把
+8--16 exact survivor 的吞吐问题降到约1--2秒/query，但也再次证明准确率瓶颈不是
+Top4 truncation或CPU reducer。
+
+因此现在的实现边界是：
+
+* `GO`：physical-region retrieval；factorized local support；direct canonical exact
+  survivor rendering；protected set-valued handoff；
+* `KILL`：把 conditional phase 当最终位姿能量；暴力展开factorized乘积；少量受控
+  扰动训练的全局线性readout；单Top1覆盖seed；
+* `下一硬门`：用现有冻结地图生成更大的 map-disjoint natural+perturbed backend
+  训练集（固定单一train/dev切分，不做五折），学习 candidate-relative full-layout
+  residual/uncertainty；先在 factorized domain 中证明 Top32/64 physical-basin
+  acquisition 与 natural drift gate，再进入完整测试。

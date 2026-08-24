@@ -10,7 +10,7 @@ from feature_extract.vfm.localization_goal_maplet.pose_transport_hierarchy impor
 from test_goal_maplet_pure_retrieval import _physical
 
 
-def test_geometry_hierarchy_is_symmetric_local_and_does_not_invent_support():
+def test_geometry_hierarchy_is_symmetric_local_and_builds_geometry_support():
     physical = _physical()
     # Reuse the fully validated fixture while supplying a small interpretable
     # child geometry: 0--1 touch, while 2 and 3 are far away.
@@ -27,8 +27,14 @@ def test_geometry_hierarchy_is_symmetric_local_and_does_not_invent_support():
         child_member_weights=np.ones(4, dtype=np.float32),
         child_member_local_uv=np.zeros((4, 2), dtype=np.float32),
     )
+    metadata = dict(physical.metadata)
+    metadata.pop("content_sha256", None)
+    metadata["child_voxel_size_m"] = 1.0
+    physical = replace(physical, metadata=metadata)
     hierarchy = build_pose_transport_hierarchy(physical, adjacency_gap_m=0.2)
-    assert np.all(hierarchy.child_support_ids == -1)
+    assert np.all(hierarchy.child_support_ids >= 0)
+    assert hierarchy.child_support_ids[0] == hierarchy.child_support_ids[1]
+    assert hierarchy.child_support_ids[1] != hierarchy.child_support_ids[2]
     adjacency = [
         set(hierarchy.adjacency_child_rows[hierarchy.adjacency_offsets[i]:hierarchy.adjacency_offsets[i+1]].tolist())
         for i in range(4)

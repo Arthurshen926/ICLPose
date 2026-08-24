@@ -18,20 +18,88 @@ import numpy as np
 from feature_extract.tools.vfm.evaluate_goal_maplet_visibility_pose_acquisition import _pose_errors
 from feature_extract.tools.vfm.verify_goal_maplet_pose_modes_with_surface_field import _camera
 from feature_extract.vfm.localization_goal_maplet.canonical_field import CanonicalSurfaceField
+from feature_extract.vfm.localization_goal_maplet.controlled_pose_stencil import (
+    CONTROLLED_MEDIUM_6DOF_CANDIDATE_SEMANTICS,
+    build_medium_quadratic_complete_6dof_stencil,
+    controlled_pose_stencil_audit,
+    stencil_candidate_poses,
+)
 from feature_extract.vfm.localization_goal_maplet.lineage import arrays_sha256, file_sha256
 from feature_extract.vfm.localization_goal_maplet.physical_map import (
     DOUBLE_SIDED,
     GoalMapletPhysicalMap,
+)
+from feature_extract.vfm.localization_goal_maplet.pose_transport_hierarchy import (
+    HIERARCHY_SEMANTICS,
+    build_pose_transport_hierarchy,
 )
 from feature_extract.vfm.localization_goal_maplet.pure_retrieval import PureRadioPhysicalRetrieval
 from feature_extract.vfm.localization_goal_maplet.resident_surface_renderer import FrozenSoftSurfaceSceneGPU
 from feature_extract.vfm.localization_goal_maplet.soft_surface_pose_energy import (
     query_only_pose_reliability_weights,
 )
+from feature_extract.vfm.localization_goal_maplet.view_conditioned_field import (
+    ViewConditionedPrimitiveField,
+)
 from feature_extract.vfm.localization_v6.se3_update import se3_exp
 
 
-SCHEMA = "goal_maplet_real_sparse_pose_transport_dataset_v1"
+SCHEMA = "goal_maplet_real_sparse_pose_transport_dataset_v2"
+_CANDIDATE_OBSERVATION_ARRAYS = (
+    "target_child_rows",
+    "target_child_weights",
+    "target_canonical_features",
+    "target_normals_camera",
+    "target_double_sided",
+    "target_relative_depth",
+    "target_boundary",
+    "target_modality_valid",
+    "target_modality_confidence",
+)
+
+
+def _dataset_budget_audit(
+    arrays: dict[str, np.ndarray],
+    *,
+    query_count: int,
+    candidate_count: int,
+    render_batch_size: int,
+    total_render_seconds: float,
+) -> dict[str, object]:
+    """Return exact storage/render counts without claiming future runtime."""
+
+    queries = int(query_count)
+    candidates = int(candidate_count)
+    batch = int(render_batch_size)
+    seconds = float(total_render_seconds)
+    if queries <= 0 or candidates <= 0 or batch <= 0 or not np.isfinite(seconds) or seconds < 0.0:
+        raise ValueError("invalid sparse transport dataset budget")
+    missing = sorted(set(_CANDIDATE_OBSERVATION_ARRAYS) - set(arrays))
+    if missing:
+        raise ValueError("candidate observation budget lacks arrays: " + ",".join(missing))
+    candidate_bytes = 0
+    for name in _CANDIDATE_OBSERVATION_ARRAYS:
+        value = np.asarray(arrays[name])
+        if value.shape[:2] != (queries, candidates):
+            raise ValueError(f"candidate observation {name} has the wrong leading axes")
+        candidate_bytes += int(value.nbytes)
+    return {
+        "rendered_pose_count": int(queries * candidates),
+        "render_batch_count": int(queries * ((candidates + batch - 1) // batch)),
+        "render_batch_size": batch,
+        "actual_total_render_seconds": seconds,
+        "actual_mean_render_seconds_per_pose": float(
+            seconds / max(queries * candidates, 1)
+        ),
+        "uncompressed_candidate_observation_bytes": int(candidate_bytes),
+        "uncompressed_candidate_observation_bytes_per_query": int(
+            candidate_bytes // queries
+        ),
+        "uncompressed_all_array_bytes": int(
+            sum(np.asarray(value).nbytes for value in arrays.values())
+        ),
+        "compressed_output_size_is_not_predicted": True,
+    }
 
 
 def _controlled_pose_candidates(target_pose: np.ndarray) -> list[np.ndarray]:
@@ -83,9 +151,22 @@ def _load_token_inventory(paths: list[Path], *, artifact_root: Path) -> dict[str
     return result
 
 
-def _load_contributors(path: Path) -> dict[str, Path]:
+def _load_contributors(
+    path: Path, *, required_image_ids: list[str] | None = None,
+) -> dict[str, Path]:
     result: dict[str, Path] = {}
-    for source in sorted(Path(path).glob("*.npz")):
+    if required_image_ids is None:
+        sources = sorted(Path(path).glob("*.npz"))
+    else:
+        if len(set(required_image_ids)) != len(required_image_ids):
+            raise ValueError("required contributor IDs are duplicated")
+        sources = [
+            Path(path) / (image_id.replace("/", "__") + ".npz")
+            for image_id in required_image_ids
+        ]
+    for source in sources:
+        if not source.is_file():
+            raise ValueError(f"missing contributor artifact: {source}")
         with np.load(source, allow_pickle=False) as data:
             metadata = json.loads(str(np.asarray(data["metadata_json"]).item()))
         image_id = str(metadata.get("image_id", ""))
@@ -149,15 +230,27 @@ def main() -> None:
     parser.add_argument("--physical_map", required=True)
     parser.add_argument("--canonical_field", required=True)
     parser.add_argument("--canonical_field_audit", required=True)
+    parser.add_argument("--view_conditioned_field", default="")
     parser.add_argument("--output_npz", required=True)
     parser.add_argument("--artifact_root", default=".")
     parser.add_argument("--query_route", default="seq11")
     parser.add_argument(
         "--candidate_semantics",
-        choices=("proposal_pool_v1", "controlled_local_oracle_v1"),
+        choices=(
+            "proposal_pool_v1",
+            "controlled_local_oracle_v1",
+            CONTROLLED_MEDIUM_6DOF_CANDIDATE_SEMANTICS,
+        ),
         default="proposal_pool_v1",
     )
     parser.add_argument("--maximum_candidates", type=int, default=8)
+    parser.add_argument(
+        "--maximum_queries", type=int, default=0,
+        help=(
+            "deterministic sorted query prefix for bounded diagnostic builds; "
+            "zero consumes the complete requested route"
+        ),
+    )
     parser.add_argument("--source_slots", type=int, default=16)
     parser.add_argument("--render_batch_size", type=int, default=4)
     parser.add_argument("--device", default="cuda:0")
@@ -166,18 +259,50 @@ def main() -> None:
     output = Path(args.output_npz)
     if output.exists() and not bool(args.force):
         raise FileExistsError("refusing to overwrite sparse pose transport dataset")
-    if int(args.maximum_candidates) < 2 or int(args.source_slots) <= 0:
+    if (
+        int(args.maximum_candidates) < 2 or int(args.source_slots) <= 0
+        or int(args.maximum_queries) < 0
+    ):
         raise ValueError("dataset requires at least two candidates and positive source slots")
     if int(args.render_batch_size) <= 0:
         raise ValueError("render_batch_size must be positive")
+    controlled_6dof_stencil = (
+        build_medium_quadratic_complete_6dof_stencil()
+        if str(args.candidate_semantics)
+        == CONTROLLED_MEDIUM_6DOF_CANDIDATE_SEMANTICS
+        else None
+    )
+    if (
+        controlled_6dof_stencil is not None
+        and int(args.maximum_candidates) != controlled_6dof_stencil.candidate_count
+    ):
+        raise ValueError(
+            "the complete medium 6DoF stencil requires exactly "
+            f"{controlled_6dof_stencil.candidate_count} candidates"
+        )
 
     physical_path = Path(args.physical_map)
     field_path = Path(args.canonical_field)
     field_audit_path = Path(args.canonical_field_audit)
     physical = GoalMapletPhysicalMap.load_npz(physical_path)
+    hierarchy = build_pose_transport_hierarchy(physical)
     field = CanonicalSurfaceField.load_npz(field_path)
+    view_field_path = Path(args.view_conditioned_field) if args.view_conditioned_field else None
+    view_field = (
+        ViewConditionedPrimitiveField.load_npz(view_field_path)
+        if view_field_path is not None else None
+    )
     if field.physical_map_sha256 != physical.content_sha256:
         raise ValueError("canonical field and physical map differ")
+    if view_field is not None:
+        view_field.validate_alignment(
+            physical_map_sha256=physical.content_sha256,
+            canonical_field_sha256=field.content_sha256,
+            canonical_primitive_rows=field.primitive_rows,
+            canonical_feature_dim=field.feature_dim,
+        )
+        if view_field.metadata.get("coordinate_correct") is not True:
+            raise ValueError("view-conditioned field is not coordinate-correct")
     field_audit = json.loads(field_audit_path.read_text())
     routes = set(str(value) for value in field_audit.get("mapping_trajectory_ids", ()))
     if str(args.query_route) in routes:
@@ -195,14 +320,22 @@ def main() -> None:
     }
     if not pool_rows:
         raise ValueError("candidate pool has no requested query route")
-    contributors = _load_contributors(Path(args.contributors))
+    all_image_ids = sorted(pool_rows)
+    full_query_count = len(all_image_ids)
+    image_ids = all_image_ids
+    if int(args.maximum_queries) > 0:
+        image_ids = image_ids[:int(args.maximum_queries)]
+    if len(image_ids) < 2:
+        raise ValueError("bounded transport dataset requires at least two queries")
+    contributors = _load_contributors(
+        Path(args.contributors), required_image_ids=image_ids,
+    )
     token_manifest_paths = [Path(value) for value in args.token_manifest]
     tokens = _load_token_inventory(
         token_manifest_paths, artifact_root=Path(args.artifact_root).resolve()
     )
     retrieval_dir = Path(args.retrieval_dir)
-    image_ids = sorted(set(pool_rows) & set(contributors) & set(tokens))
-    if set(image_ids) != set(pool_rows):
+    if not set(image_ids).issubset(tokens) or set(contributors) != set(image_ids):
         raise ValueError("candidate queries lack contributor or RADIO evidence")
 
     scene = FrozenSoftSurfaceSceneGPU(physical, field, device=str(args.device))
@@ -237,7 +370,11 @@ def main() -> None:
         contributor_path = contributors[image_id]
         with np.load(contributor_path, allow_pickle=False) as data:
             target_pose = np.asarray(data["pose_w2c"], dtype=np.float64)
-        if str(args.candidate_semantics) == "controlled_local_oracle_v1":
+        if controlled_6dof_stencil is not None:
+            candidate_values = list(
+                stencil_candidate_poses(target_pose, controlled_6dof_stencil)
+            )
+        elif str(args.candidate_semantics) == "controlled_local_oracle_v1":
             candidate_values = _controlled_pose_candidates(target_pose)[:maximum_candidates]
         else:
             candidate_values = [target_pose]
@@ -281,6 +418,7 @@ def main() -> None:
             batch = scene.render_exact_batch(
                 candidate_pose[start:stop], _camera(contributor_path),
                 width=64, height=36, top_l=4,
+                view_conditioned_field=view_field,
             )
             rendered_rows.extend(batch.rendered)
             render_seconds.append(float(batch.audit.total_seconds))
@@ -348,27 +486,109 @@ def main() -> None:
         "retrieval_content_sha256": np.asarray(retrieval_hashes),
         "radio_file_sha256": np.asarray(token_hashes),
         "contributor_file_sha256": np.asarray(contributor_hashes),
+        # The hierarchy participates directly in edge construction.  A file
+        # hash in JSON is insufficient because the source physical map may be
+        # moved or replaced after this expensive rendered dataset is built.
+        # Store the exact immutable arrays needed to replay transport, while
+        # still requiring any live physical map supplied by a trainer to
+        # match the original file/content lineage.
+        "hierarchy_child_parent_ids": np.asarray(
+            hierarchy.child_parent_ids, dtype=np.int32
+        ),
+        "hierarchy_child_support_ids": np.asarray(
+            hierarchy.child_support_ids, dtype=np.int32
+        ),
+        "hierarchy_adjacency_offsets": np.asarray(
+            hierarchy.adjacency_offsets, dtype=np.int64
+        ),
+        "hierarchy_adjacency_child_rows": np.asarray(
+            hierarchy.adjacency_child_rows, dtype=np.int32
+        ),
     }
+    if controlled_6dof_stencil is not None:
+        arrays.update({
+            "controlled_candidate_twists_left_camera": np.asarray(
+                controlled_6dof_stencil.twists_left_camera, dtype=np.float64
+            ),
+            "controlled_candidate_direction_ids": np.asarray(
+                controlled_6dof_stencil.candidate_direction_ids, dtype=np.int16
+            ),
+            "controlled_candidate_signs": np.asarray(
+                controlled_6dof_stencil.candidate_signs, dtype=np.int8
+            ),
+            "controlled_candidate_radius_fractions": np.asarray(
+                controlled_6dof_stencil.candidate_radius_fractions, dtype=np.float32
+            ),
+            "controlled_normalized_directions": np.asarray(
+                controlled_6dof_stencil.normalized_directions, dtype=np.float64
+            ),
+            "controlled_direction_axis_pairs": np.asarray(
+                controlled_6dof_stencil.direction_axis_pairs, dtype=np.int8
+            ),
+            "controlled_radial_paths": np.asarray(
+                controlled_6dof_stencil.radial_paths, dtype=np.int16
+            ),
+        })
+    stencil_audit = (
+        controlled_pose_stencil_audit(controlled_6dof_stencil)
+        if controlled_6dof_stencil is not None else None
+    )
+    dataset_budget = _dataset_budget_audit(
+        arrays,
+        query_count=len(image_ids),
+        candidate_count=maximum_candidates,
+        render_batch_size=int(args.render_batch_size),
+        total_render_seconds=float(sum(render_seconds)),
+    )
     metadata = {
         "artifact_type": SCHEMA,
         "content_sha256": arrays_sha256(arrays),
         "query_route": str(args.query_route),
         "query_count": len(image_ids),
+        "full_route_query_count": int(full_query_count),
+        "maximum_queries": int(args.maximum_queries),
+        "bounded_sorted_query_prefix_diagnostic": bool(
+            int(args.maximum_queries) > 0 and len(image_ids) < full_query_count
+        ),
         "candidate_count": maximum_candidates,
         "candidate_zero_is_diagnostic_gt_anchor": True,
         "candidate_pose_source_only": True,
         "candidate_semantics": str(args.candidate_semantics),
         "controlled_candidates_are_gt_relative_oracle_diagnostic": bool(
-            str(args.candidate_semantics) == "controlled_local_oracle_v1"
+            str(args.candidate_semantics) in {
+                "controlled_local_oracle_v1",
+                CONTROLLED_MEDIUM_6DOF_CANDIDATE_SEMANTICS,
+            }
         ),
+        "controlled_pose_stencil_audit": stencil_audit,
+        "full_6dof_observability_stencil": bool(
+            controlled_6dof_stencil is not None
+        ),
+        "local_quadratic_6dof_identifiable": bool(
+            stencil_audit is not None
+            and stencil_audit["local_quadratic_6dof_identifiable"]
+        ),
+        "dataset_budget_audit": dataset_budget,
         "old_candidate_scores_consumed": False,
         "pose_errors_recomputed": True,
         "canonical_map_excludes_query_route": True,
         "map_training_routes": sorted(routes),
         "physical_map_sha256": physical.content_sha256,
+        "hierarchy_content_sha256": hierarchy.content_sha256,
+        "hierarchy_semantics": HIERARCHY_SEMANTICS,
         "canonical_field_sha256": field.content_sha256,
         "physical_map_file_sha256": file_sha256(physical_path),
         "canonical_field_file_sha256": file_sha256(field_path),
+        "view_conditioned_field_sha256": (
+            view_field.content_sha256 if view_field is not None else None
+        ),
+        "view_conditioned_field_file_sha256": (
+            file_sha256(view_field_path) if view_field_path is not None else None
+        ),
+        "map_pose_field_semantics": (
+            "candidate_pose_evaluated_low_rank_view_conditioned_canonical_field_v1"
+            if view_field is not None else "single_view_independent_canonical_field_control_v1"
+        ),
         "canonical_field_audit_file_sha256": file_sha256(field_audit_path),
         "candidate_pool_file_sha256": file_sha256(pool_path),
         "retrieval_directory": str(retrieval_dir.resolve()),

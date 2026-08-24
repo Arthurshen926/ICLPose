@@ -9,11 +9,21 @@ from pathlib import Path
 import numpy as np
 
 from feature_extract.tools.vfm.evaluate_goal_maplet_visibility_pose_acquisition import _pose_errors
-from feature_extract.tools.vfm.train_evaluate_goal_maplet_sparse_pose_transport import _load_dataset
+from feature_extract.vfm.localization_goal_maplet.pose_candidate_dataset import (
+    load_pose_candidate_dataset,
+)
 from feature_extract.vfm.localization_goal_maplet.lineage import file_sha256
 
 
 SCHEMA = "goal_maplet_protected_phase_pose_set_v1"
+SUPPORTED_PHASE_SCORE_SEMANTICS = (
+    "conditional_phase_control",
+    "conditional_phase_shift_control",
+    "conservative_phase",
+    "conservative_phase_shift",
+    "conservative_phase_maxmin",
+    "conservative_phase_shift_maxmin",
+)
 
 
 def _same_basin(a: np.ndarray, b: np.ndarray) -> bool:
@@ -26,6 +36,15 @@ def main() -> None:
     parser.add_argument("--dataset", required=True)
     parser.add_argument("--phase_report", required=True)
     parser.add_argument("--refinement_report", action="append", default=[])
+    parser.add_argument(
+        "--expected_phase_score_semantics",
+        choices=SUPPORTED_PHASE_SCORE_SEMANTICS,
+        required=True,
+    )
+    parser.add_argument(
+        "--expected_refinement_score_semantics",
+        choices=("conservative_phase", "conditional_phase"),
+    )
     parser.add_argument("--output", required=True)
     parser.add_argument("--query_start", type=int, default=0)
     parser.add_argument("--maximum_queries", type=int)
@@ -35,28 +54,37 @@ def main() -> None:
     if output.exists():
         raise FileExistsError("refusing to overwrite protected phase pose set")
     dataset_path = Path(args.dataset)
-    arrays, _ = _load_dataset(dataset_path)
+    arrays, _ = load_pose_candidate_dataset(dataset_path)
     dataset_sha = file_sha256(dataset_path)
     phase_path = Path(args.phase_report)
     phase = json.loads(phase_path.read_text())
     if (
         phase.get("dataset_file_sha256") != dataset_sha
-        or phase.get("score_semantics") != "conservative_phase"
+        or phase.get("score_semantics") != str(args.expected_phase_score_semantics)
+        or phase.get("all_candidate_scores_built_before_pose_error_metrics") is not True
     ):
         raise ValueError("phase report differs from the dataset/scorer")
     phase_score = np.asarray(phase["candidate_score"], dtype=np.float64)
     if phase_score.shape != arrays["candidate_valid"].shape:
         raise ValueError("phase score matrix differs from the candidate inventory")
+    expected_shift_radius = (
+        int(phase.get("local_radius_tokens", 0))
+        if "phase_shift" in str(args.expected_phase_score_semantics)
+        else 0
+    )
     refinements: dict[str, list[dict[str, object]]] = {}
     refinement_bindings = []
+    if args.refinement_report and args.expected_refinement_score_semantics is None:
+        raise ValueError("refinement reports require an explicit expected scorer")
     for value in args.refinement_report:
         path = Path(value)
         report = json.loads(path.read_text())
         if (
             report.get("dataset_file_sha256") != dataset_sha
-            or report.get("score_semantics") != "conservative_phase"
+            or report.get("score_semantics") != str(args.expected_refinement_score_semantics)
             or report.get("uses_alike") is not False
             or report.get("uses_pnp") is not False
+            or int(report.get("phase_shift_radius_tokens", 0)) != expected_shift_radius
         ):
             raise ValueError("refinement report differs from the protected phase contract")
         refinement_bindings.append({"path": str(path.resolve()), "file_sha256": file_sha256(path)})
@@ -144,6 +172,10 @@ def main() -> None:
         "artifact_type": SCHEMA,
         "dataset_file_sha256": dataset_sha,
         "phase_report": {"path": str(phase_path.resolve()), "file_sha256": file_sha256(phase_path)},
+        "phase_score_semantics": str(args.expected_phase_score_semantics),
+        "phase_energy_semantics": str(phase.get("energy_semantics")),
+        "phase_shift_radius_tokens": expected_shift_radius,
+        "refinement_score_semantics": args.expected_refinement_score_semantics,
         "refinement_reports": refinement_bindings,
         "query_range": [begin, end],
         "maximum_seed_basins": int(args.maximum_seed_basins),

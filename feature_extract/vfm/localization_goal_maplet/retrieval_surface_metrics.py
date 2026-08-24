@@ -594,10 +594,12 @@ def evaluate_pure_retrieval_query(
     camera_height: int,
     camera_params: np.ndarray,
     incidence: PhysicalIncidence | None = None,
-    ks: tuple[int, ...] = (1, 5, 20, 32, 64),
+    ks: tuple[int, ...] = (1, 5, 10, 20, 32, 64),
     surface_ks: tuple[int, ...] | None = None,
     tolerances_m: tuple[float, ...] = (0.0, 0.1, 0.25, 0.5, 1.0, 2.0),
     precomputed_child_surface_area_m2: np.ndarray | None = None,
+    prototype_supported_parent_rows: np.ndarray | None = None,
+    prototype_supported_child_rows: np.ndarray | None = None,
 ) -> dict[str, object]:
     """Evaluate one pose-free result; GT is opened only in this function."""
 
@@ -656,6 +658,146 @@ def evaluate_pure_retrieval_query(
         ks,
         absolute_denominator=token_total_mass,
     )
+    prototype_support: dict[str, object] | None = None
+    if (prototype_supported_parent_rows is None) != (
+        prototype_supported_child_rows is None
+    ):
+        raise ValueError("parent and child prototype support masks must be paired")
+    if prototype_supported_parent_rows is not None:
+        parent_supported = np.asarray(
+            prototype_supported_parent_rows, dtype=bool
+        ).reshape(-1)
+        child_supported = np.asarray(
+            prototype_supported_child_rows, dtype=bool
+        ).reshape(-1)
+        if parent_supported.shape != (physical.maplet_ids.size,) or child_supported.shape != (
+            physical.child_parent_rows.size,
+        ):
+            raise ValueError("prototype support masks differ from physical ontology")
+        supported_parent_truth = token_parent.multiply(
+            parent_supported.astype(np.float64)[None, :]
+        ).tocsr()
+        supported_child_truth = token_child.multiply(
+            child_supported.astype(np.float64)[None, :]
+        ).tocsr()
+        supported_parent_recall = _candidate_recall(
+            supported_parent_truth,
+            parent_candidates,
+            ks,
+            absolute_denominator=token_total_mass,
+        )
+        supported_child_recall = _candidate_recall(
+            supported_child_truth,
+            retrieval.token_child_rows,
+            ks,
+            absolute_denominator=token_total_mass,
+        )
+        parent_all_by_token = np.asarray(token_parent.sum(axis=1)).reshape(-1)
+        child_all_by_token = np.asarray(token_child.sum(axis=1)).reshape(-1)
+        parent_supported_by_token = np.asarray(
+            supported_parent_truth.sum(axis=1)
+        ).reshape(-1)
+        child_supported_by_token = np.asarray(
+            supported_child_truth.sum(axis=1)
+        ).reshape(-1)
+        raw_nonempty = token_total_mass > 1e-12
+        parent_nonempty = parent_supported_by_token > 1e-12
+        child_nonempty = child_supported_by_token > 1e-12
+        parent_all_mass = float(np.sum(parent_all_by_token))
+        child_all_mass = float(np.sum(child_all_by_token))
+        raw_mass = float(np.sum(token_total_mass))
+        predicted_parent_probability = np.asarray(
+            retrieval.token_parent_probabilities, dtype=np.float64
+        )
+        predicted_child_probability = np.asarray(
+            retrieval.token_child_probabilities, dtype=np.float64
+        )
+        predicted_parent_supported = np.sum(
+            predicted_parent_probability
+            * (
+                (parent_candidates >= 0)
+                & parent_supported[np.maximum(parent_candidates, 0)]
+            ),
+            axis=1,
+        )
+        child_candidate = np.asarray(retrieval.token_child_rows, dtype=np.int64)
+        safe_child_candidate = np.maximum(child_candidate, 0)
+        predicted_child_supported = np.sum(
+            predicted_child_probability
+            * (
+                (child_candidate >= 0)
+                & child_supported[safe_child_candidate]
+            ),
+            axis=1,
+        )
+        prototype_support = {
+            "physical_parent_ontology_count": int(physical.maplet_ids.size),
+            "physical_child_ontology_count": int(physical.child_parent_rows.size),
+            "prototype_supported_parent_count": int(np.sum(parent_supported)),
+            "prototype_supported_child_count": int(np.sum(child_supported)),
+            "parent_gt_visible_mass_supported_fraction_within_physical": float(
+                np.sum(parent_supported_by_token) / max(parent_all_mass, 1e-12)
+            ),
+            "child_gt_visible_mass_supported_fraction_within_physical": float(
+                np.sum(child_supported_by_token) / max(child_all_mass, 1e-12)
+            ),
+            "parent_absolute_visible_mass_support_ceiling": float(
+                np.sum(parent_supported_by_token) / max(raw_mass, 1e-12)
+            ),
+            "child_absolute_visible_mass_support_ceiling": float(
+                np.sum(child_supported_by_token) / max(raw_mass, 1e-12)
+            ),
+            "parent_conditional_recall_within_prototype_support": {
+                f"recall_at_{key}": supported_parent_recall[key][0] for key in ks
+            },
+            "child_conditional_recall_within_prototype_support": {
+                f"recall_at_{key}": supported_child_recall[key][0] for key in ks
+            },
+            "token_support_posterior_diagnostic": {
+                "radio_token_count": int(token_total_mass.size),
+                "raw_empty_token_fraction": float(np.mean(~raw_nonempty)),
+                "parent_prototype_supported_nonempty_token_fraction": float(
+                    np.mean(parent_nonempty)
+                ),
+                "child_prototype_supported_nonempty_token_fraction": float(
+                    np.mean(child_nonempty)
+                ),
+                "parent_prototype_supported_mass_mean_per_token": float(
+                    np.mean(parent_supported_by_token)
+                ),
+                "child_prototype_supported_mass_mean_per_token": float(
+                    np.mean(child_supported_by_token)
+                ),
+                "parent_zero_support_given_raw_nonempty_fraction": float(
+                    np.mean(~parent_nonempty[raw_nonempty]) if np.any(raw_nonempty) else 1.0
+                ),
+                "child_zero_support_given_raw_nonempty_fraction": float(
+                    np.mean(~child_nonempty[raw_nonempty]) if np.any(raw_nonempty) else 1.0
+                ),
+                "predicted_parent_prototype_supported_probability_mass_mean_per_token": float(
+                    np.mean(predicted_parent_supported)
+                ),
+                "predicted_child_prototype_supported_probability_mass_mean_per_token": float(
+                    np.mean(predicted_child_supported)
+                ),
+                "predicted_parent_zero_prototype_supported_mass_token_fraction": float(
+                    np.mean(predicted_parent_supported <= 1e-12)
+                ),
+                "predicted_child_zero_prototype_supported_mass_token_fraction": float(
+                    np.mean(predicted_child_supported <= 1e-12)
+                ),
+                "predicted_out_of_map_probability_mean": float(
+                    np.mean(retrieval.token_out_of_map_probabilities)
+                ),
+                "predicted_in_map_tail_probability_mean": float(
+                    np.mean(retrieval.token_in_map_tail_probabilities)
+                ),
+                "semantics": (
+                    "gt_visibility_and_predicted_candidate_mass_available_to_"
+                    "token_times_surface_support_not_pose_posterior_v2"
+                ),
+            },
+        }
     scene_mass = np.asarray(token_primitive.sum(axis=0)).reshape(-1)
     total_visible_mass = max(float(np.sum(scene_mass)), 1e-12)
     parent_ceiling = float(
@@ -811,7 +953,7 @@ def evaluate_pure_retrieval_query(
             for key in ks
         }
     )
-    return {
+    result = {
         "image_id": retrieval.image_id,
         "coordinate_audit": coordinate_audit,
         "sampling_audit": sampling_audit,
@@ -845,3 +987,6 @@ def evaluate_pure_retrieval_query(
             "metric_is_real_world_geometry_truth": False,
         },
     }
+    if prototype_support is not None:
+        result["prototype_support"] = prototype_support
+    return result

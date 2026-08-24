@@ -6,6 +6,7 @@ import torch
 
 from feature_extract.vfm.localization_goal_maplet.fulltoken_surface_pose_energy import (
     child_gated_fulltoken_surface_pose_energy,
+    conditional_fulltoken_phase_pose_energy_control,
     conservative_fulltoken_phase_pose_energy,
     fulltoken_surface_pose_energy,
     parent_gated_fulltoken_surface_pose_energy,
@@ -195,6 +196,74 @@ def test_shift_tolerant_phase_recovers_joint_shift_and_preserves_missing_monoton
             query.reshape(30, 8), target, mass, valid, height=5, width=6,
             maximum_shift_tokens=5,
         )
+
+
+def test_additive_phase_fixes_conditional_mixture_disappearance_counterexample():
+    query = torch.tensor([
+        [1.0, 0.0], [0.0, 1.0],
+        [-1.0, 0.0], [0.0, -1.0],
+    ])
+    correct = query[:, None, :]
+    distractor = torch.tensor([
+        [0.0, 1.0], [-1.0, 0.0],
+        [0.0, -1.0], [1.0, 0.0],
+    ])[:, None, :]
+    target = torch.cat((correct, distractor), dim=1)
+    mass = torch.full((4, 2), 0.5)
+    valid = torch.ones(4, 2, dtype=torch.bool)
+    disappeared = mass.clone()
+    disappeared[:, 1] = 0.0
+
+    conditional_before = conditional_fulltoken_phase_pose_energy_control(
+        query, target, mass, valid, height=2, width=2
+    )
+    conditional_after = conditional_fulltoken_phase_pose_energy_control(
+        query, target, disappeared, valid, height=2, width=2
+    )
+    additive_before = conservative_fulltoken_phase_pose_energy(
+        query, target, mass, valid, height=2, width=2
+    )
+    additive_after = conservative_fulltoken_phase_pose_energy(
+        query, target, disappeared, valid, height=2, width=2
+    )
+    assert float(conditional_after.score) > float(conditional_before.score)
+    assert float(conditional_after.conditional_content_score) > float(
+        conditional_before.conditional_content_score
+    )
+    assert float(conditional_after.mass_observability) < float(
+        conditional_before.mass_observability
+    )
+    assert float(additive_after.score) <= float(additive_before.score) + 1.0e-7
+
+
+@pytest.mark.parametrize("maximum_shift_tokens", [0, 1, 2])
+@pytest.mark.parametrize("slot_pair_reduction", ["additive_product", "maximum_bottleneck"])
+def test_additive_phase_random_fractional_mass_and_validity_disappearance_is_monotone(
+    maximum_shift_tokens: int,
+    slot_pair_reduction: str,
+):
+    generator = torch.Generator().manual_seed(101 + maximum_shift_tokens)
+    height, width, slots, channels = 5, 6, 3, 9
+    query = torch.randn(height * width, channels, generator=generator)
+    target = torch.randn(height * width, slots, channels, generator=generator)
+    mass = torch.rand(height * width, slots, generator=generator)
+    mass = 0.9 * mass / mass.sum(dim=1, keepdim=True)
+    valid = torch.rand(height * width, slots, generator=generator) > 0.1
+    reduced_mass = mass * torch.rand(height * width, slots, generator=generator)
+    reduced_valid = valid & (torch.rand(height * width, slots, generator=generator) > 0.3)
+    before = conservative_fulltoken_phase_pose_energy(
+        query, target, mass, valid, height=height, width=width,
+        maximum_shift_tokens=maximum_shift_tokens,
+        slot_pair_reduction=slot_pair_reduction,
+    )
+    after = conservative_fulltoken_phase_pose_energy(
+        query, target, reduced_mass, reduced_valid, height=height, width=width,
+        maximum_shift_tokens=maximum_shift_tokens,
+        slot_pair_reduction=slot_pair_reduction,
+    )
+    assert float(after.score) <= float(before.score) + 2.0e-7
+    assert float(after.horizontal_observability) <= float(before.horizontal_observability) + 2.0e-7
+    assert float(after.vertical_observability) <= float(before.vertical_observability) + 2.0e-7
 
 
 def test_wide_oracle_diagnostic_excludes_gt_anchor_and_uses_joint_scale():

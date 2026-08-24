@@ -123,6 +123,14 @@ def connected_fine_support_components(
     threshold = float(np.cos(np.deg2rad(angle)))
     directions = ((1, 0, 0), (0, 1, 0), (0, 0, 1))
     for key, left_rows in by_key.items():
+        # Parent partition seams can create multiple child rows in the same
+        # metric voxel.  They are part of the same support whenever their
+        # unsigned normals agree; omitting this zero-distance union leaves an
+        # artificial seam even before checking the six neighbouring faces.
+        for local_index, left in enumerate(left_rows):
+            for right in left_rows[local_index + 1 :]:
+                if float(abs(np.dot(normals[left], normals[right]))) >= threshold:
+                    union(left, right)
         for dx, dy, dz in directions:
             neighbour = (key[0] + dx, key[1] + dy, key[2] + dz, key[3])
             for left in left_rows:

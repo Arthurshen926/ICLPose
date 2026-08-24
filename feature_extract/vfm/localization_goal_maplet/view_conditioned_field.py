@@ -23,6 +23,27 @@ import numpy as np
 from .lineage import arrays_sha256, validate_deployment_metadata
 
 
+def _camera_focal_pixels(camera) -> float:
+    """Return geometric-mean focal in the camera's declared pixel canvas."""
+
+    model = int(camera.model_id)
+    params = np.asarray(camera.params, dtype=np.float64).reshape(-1)
+    if model in (0, 2, 3):  # SIMPLE_PINHOLE / SIMPLE_RADIAL / RADIAL
+        if params.size < 1:
+            raise ValueError("camera lacks focal length")
+        fx = fy = float(params[0])
+    elif model in (1, 4, 5, 6, 8, 9, 10):  # PINHOLE and fx/fy models
+        if params.size < 2:
+            raise ValueError("camera lacks fx/fy")
+        fx, fy = float(params[0]), float(params[1])
+    else:
+        raise ValueError("unsupported camera model for view-conditioned field")
+    focal = float(np.sqrt(max(fx * fy, 0.0)))
+    if not np.isfinite(focal) or focal <= 0.0:
+        raise ValueError("camera focal must be finite and positive")
+    return focal
+
+
 SCHEMA = "goal_maplet_low_rank_view_conditioned_field_v1"
 PREDICTOR_COUNT = 5  # intercept, centered local view xyz, centered log scale
 
@@ -261,3 +282,72 @@ class ViewConditionedPrimitiveField:
         code = canonical[index] + residual
         return _unit_rows(code), active
 
+
+def condition_canonical_codes_for_pose(
+    field: ViewConditionedPrimitiveField,
+    canonical_field,
+    physical_map,
+    pose_w2c: np.ndarray,
+    camera,
+    *,
+    field_indices: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Evaluate the frozen view field for one candidate pose.
+
+    The pose is used only to evaluate camera-to-surface direction and
+    projected scale.  Returned rows remain aligned to canonical-field indices;
+    no mapping-view identity or absolute-pose label enters the descriptor.
+    ``field_indices`` permits renderers to condition only actually hit
+    primitives rather than materializing a dense pose-specific map copy.
+    """
+
+    field.validate_alignment(
+        physical_map_sha256=physical_map.content_sha256,
+        canonical_field_sha256=canonical_field.content_sha256,
+        canonical_primitive_rows=canonical_field.primitive_rows,
+        canonical_feature_dim=canonical_field.feature_dim,
+    )
+    pose = np.asarray(pose_w2c, dtype=np.float64)
+    if pose.shape != (4, 4) or np.any(~np.isfinite(pose)):
+        raise ValueError("candidate pose must be one finite 4x4 w2c matrix")
+    if field_indices is None:
+        index = np.arange(canonical_field.primitive_rows.size, dtype=np.int64)
+    else:
+        index = np.asarray(field_indices, dtype=np.int64).reshape(-1)
+        if np.unique(index).size != index.size:
+            raise ValueError("conditioned canonical field indices must be unique")
+        if np.any((index < 0) | (index >= canonical_field.primitive_rows.size)):
+            raise ValueError("conditioned canonical field index is out of range")
+    primitive = np.asarray(canonical_field.primitive_rows, dtype=np.int64)[index]
+    rotation, translation = pose[:3, :3], pose[:3, 3]
+    camera_center = -rotation.T @ translation
+    view_world = _unit_rows(
+        camera_center[None] - np.asarray(physical_map.primitive_centers)[primitive]
+    )
+    tangent1 = _unit_rows(np.asarray(physical_map.primitive_tangent1)[primitive])
+    tangent2 = _unit_rows(np.asarray(physical_map.primitive_tangent2)[primitive])
+    normal = _unit_rows(np.asarray(physical_map.primitive_normals)[primitive])
+    local_direction = _unit_rows(np.stack((
+        np.sum(view_world * tangent1, axis=1),
+        np.sum(view_world * tangent2, axis=1),
+        np.sum(view_world * normal, axis=1),
+    ), axis=1))
+    camera_xyz = (
+        np.asarray(physical_map.primitive_centers)[primitive] @ rotation.T
+        + translation[None]
+    )
+    depth = camera_xyz[:, 2]
+    radius = np.sqrt(np.maximum(
+        np.asarray(physical_map.primitive_scale1)[primitive]
+        * np.asarray(physical_map.primitive_scale2)[primitive],
+        1.0e-12,
+    ))
+    log_scale = np.log(np.maximum(
+        _camera_focal_pixels(camera) * radius / np.maximum(depth, 1.0e-4),
+        1.0e-6,
+    )).astype(np.float32)
+    code, active = field.condition_codes_numpy(
+        np.asarray(canonical_field.codes, dtype=np.float32),
+        index, local_direction, log_scale,
+    )
+    return index, code, active

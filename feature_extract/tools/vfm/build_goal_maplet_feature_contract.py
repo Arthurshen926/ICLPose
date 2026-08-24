@@ -36,7 +36,20 @@ def main() -> None:
         metadata={
             "artifact_type": "goal_maplet_field_feature_contract_v1",
             "canonical_field_path": str(args.canonical_field),
+            "canonical_field_file_sha256": file_sha256(Path(args.canonical_field)),
             "query_readout_path": str(args.query_readout),
+            # Compatibility and promotion are separate contracts.  Keeping
+            # this state here prevents a valid feature/readout pairing from
+            # silently upgrading a diagnostic canonical field.
+            "canonical_field_promotion_eligible": bool(
+                field.metadata.get("promotion_eligible", False)
+            ),
+            "canonical_field_promotion_blockers": list(
+                field.metadata.get("promotion_blockers", [])
+            ),
+            "control_only": bool(
+                not field.metadata.get("promotion_eligible", False)
+            ),
         },
     )
     contract.validate(field, query_readout_path=readout_path)

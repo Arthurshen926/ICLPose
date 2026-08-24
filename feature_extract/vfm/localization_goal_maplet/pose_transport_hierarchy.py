@@ -3,9 +3,10 @@
 Children remain the frozen geometry-complete physical partition.  Adjacency
 is not learned from query images: two children of the same parent are joined
 only when their conservative bounding spheres touch after a fixed metric gap
-and their unsigned surface normals are compatible.  The first version leaves
-the optional coarser ``support`` relation disabled rather than inventing an
-unverified semantic grouping.
+and their unsigned surface normals are compatible.  A second, coarser support
+ID is the deterministic six-connected metric-voxel component with compatible
+unsigned normals.  It may cross parent seams but never changes the exact child
+union or reads image/query evidence.
 """
 
 from __future__ import annotations
@@ -16,10 +17,13 @@ from .candidate_conditioned_pose_attribution import (
     PoseTransportHierarchy,
     pose_transport_hierarchy_content_sha256,
 )
+from .connected_fine_support import connected_fine_support_components
 from .physical_map import GoalMapletPhysicalMap
 
 
-HIERARCHY_SEMANTICS = "geometry_child_touching_sphere_unsigned_normal_adjacency_v1"
+HIERARCHY_SEMANTICS = (
+    "geometry_child_touching_adjacency_plus_six_connected_unsigned_normal_support_v2"
+)
 
 
 def build_pose_transport_hierarchy(
@@ -66,7 +70,19 @@ def build_pose_transport_hierarchy(
         rows_out.extend(sorted(values))
         offsets[child + 1] = len(rows_out)
     adjacency = np.asarray(rows_out, dtype=np.int64)
+    connected = connected_fine_support_components(
+        np.arange(parent.size, dtype=np.int64), physical,
+        maximum_normal_angle_degrees=float(
+            np.degrees(np.arccos(np.clip(cosine, 0.0, 1.0)))
+        ),
+    )
     support = np.full(parent.shape, -1, dtype=np.int64)
+    for component in range(connected.component_count):
+        begin = int(connected.component_offsets[component])
+        end = int(connected.component_offsets[component + 1])
+        support[connected.component_child_rows[begin:end]] = component
+    if np.any(support < 0):
+        raise AssertionError("connected support does not cover every physical child")
     return PoseTransportHierarchy(
         child_parent_ids=parent,
         child_support_ids=support,

@@ -20,6 +20,7 @@ from .pure_retrieval import PureRadioPhysicalRetrieval, aggregate_sparse_token_e
 
 
 DEFAULT_AREA_BUDGETS = (0.01, 0.02, 0.05, 0.10)
+DEFAULT_LOCAL_CHILD_KS = (1, 2, 4, 8, 16, 32)
 
 
 def _child_surface_area(physical: GoalMapletPhysicalMap) -> np.ndarray:
@@ -82,6 +83,7 @@ def evaluate_child_loss_decomposition(
     canonical_supported_primitive: np.ndarray,
     current_surface_metrics: Mapping[str, object] | None = None,
     area_budgets: Sequence[float] = DEFAULT_AREA_BUDGETS,
+    local_child_ks: Sequence[int] = DEFAULT_LOCAL_CHILD_KS,
 ) -> dict[str, object]:
     """Attribute one frozen retrieval result without changing its ranking."""
 
@@ -124,6 +126,115 @@ def evaluate_child_loss_decomposition(
     positive_child = child_score > 0.0
     child_parent_selected = selected_parent[physical.child_parent_rows]
     child_parent_oracle = oracle_parent[physical.child_parent_rows]
+
+    # Reconstruct parent-local alternatives from the stored sparse token
+    # candidates.  This is deliberately evaluator-only: it needs neither the
+    # discarded dense child tensor nor query pose, and it cannot insert a
+    # child that did not receive frozen RADIO evidence.
+    local_rank = np.full((child_truth.size,), np.iinfo(np.int32).max, dtype=np.int64)
+    candidate_count_by_parent = np.zeros(
+        (physical.maplet_ids.size,), dtype=np.int64
+    )
+    for parent_row in range(physical.maplet_ids.size):
+        start = int(physical.maplet_child_offsets[parent_row])
+        end = int(physical.maplet_child_offsets[parent_row + 1])
+        candidates = np.arange(start, end, dtype=np.int64)
+        candidates = candidates[child_score[candidates] > 0.0]
+        candidate_count_by_parent[parent_row] = int(candidates.size)
+        if candidates.size:
+            order = candidates[
+                np.lexsort((candidates, -child_score[candidates]))
+            ]
+            local_rank[order] = np.arange(1, order.size + 1, dtype=np.int64)
+
+    requested_local_ks = tuple(sorted({int(value) for value in local_child_ks}))
+    if not requested_local_ks or requested_local_ks[0] <= 0:
+        raise ValueError("local child cutoffs must be positive")
+    selected_parent_truth = float(np.sum(child_truth[child_parent_selected]))
+    local_candidate_truth = float(
+        np.sum(child_truth[child_parent_selected & (child_score > 0.0)])
+    )
+    predicted_local_recall: dict[str, float] = {}
+    candidate_conditional_local_recall: dict[str, float] = {}
+    oracle_local_recall: dict[str, float] = {}
+    for cutoff in requested_local_ks:
+        chosen = child_parent_selected & (local_rank <= int(cutoff))
+        retained = float(np.sum(child_truth[chosen]))
+        predicted_local_recall[f"recall_at_{cutoff}"] = retained / max(
+            selected_parent_truth, 1e-12
+        )
+        candidate_conditional_local_recall[f"recall_at_{cutoff}"] = retained / max(
+            local_candidate_truth, 1e-12
+        )
+        oracle_retained = 0.0
+        for parent_row in np.flatnonzero(selected_parent).tolist():
+            start = int(physical.maplet_child_offsets[parent_row])
+            end = int(physical.maplet_child_offsets[parent_row + 1])
+            local_truth = np.asarray(child_truth[start:end], dtype=np.float64)
+            keep = min(int(cutoff), int(local_truth.size))
+            if keep:
+                oracle_retained += float(
+                    np.sum(np.partition(local_truth, local_truth.size - keep)[-keep:])
+                )
+        oracle_local_recall[f"recall_at_{cutoff}"] = oracle_retained / max(
+            selected_parent_truth, 1e-12
+        )
+
+    children_per_parent = np.diff(
+        np.asarray(physical.maplet_child_offsets, dtype=np.int64)
+    )
+    selected_child_parent = np.asarray(physical.child_parent_rows, dtype=np.int64)[
+        np.asarray(retrieval.scene_child_rows, dtype=np.int64)
+    ]
+    selected_slot_count = np.bincount(
+        selected_child_parent, minlength=physical.maplet_ids.size
+    ).astype(np.int64)
+    represented_parent = selected_slot_count > 0
+    ordered_slot_count = np.sort(selected_slot_count)[::-1]
+    selected_child_count = max(int(selected_child_parent.size), 1)
+    visible_parent = parent_truth > 0.0
+    selected_child_in_scene_parent = selected_parent[selected_child_parent]
+    same_parent_covered = represented_parent[physical.child_parent_rows]
+    same_parent_visible_mass_recall = float(
+        np.sum(child_truth[same_parent_covered]) / total
+    )
+    budget_allocation = {
+        "selected_child_parent_count": int(np.sum(represented_parent)),
+        "selected_scene_parent_count": int(np.sum(selected_parent)),
+        "scene_parent_without_selected_child_count": int(
+            np.sum(selected_parent & ~represented_parent)
+        ),
+        "selected_child_outside_scene_parent_fraction": float(
+            np.mean(~selected_child_in_scene_parent)
+        ),
+        "selected_child_slots_on_gt_invisible_parent_fraction_oracle": float(
+            np.mean(~visible_parent[selected_child_parent])
+        ),
+        "maximum_slots_on_one_parent": int(ordered_slot_count[0]),
+        "top4_parent_slot_fraction": float(
+            np.sum(ordered_slot_count[:4]) / selected_child_count
+        ),
+        "top8_parent_slot_fraction": float(
+            np.sum(ordered_slot_count[:8]) / selected_child_count
+        ),
+        "mean_positive_candidate_children_per_selected_parent": float(
+            np.mean(candidate_count_by_parent[selected_parent])
+        ) if np.any(selected_parent) else 0.0,
+        "median_positive_candidate_children_per_selected_parent": float(
+            np.median(candidate_count_by_parent[selected_parent])
+        ) if np.any(selected_parent) else 0.0,
+    }
+    child_count_ledger = {
+        "physical_parent_count": int(children_per_parent.size),
+        "physical_child_count": int(child_truth.size),
+        "children_per_parent_minimum": int(np.min(children_per_parent)),
+        "children_per_parent_median": float(np.median(children_per_parent)),
+        "children_per_parent_p90": float(np.quantile(children_per_parent, 0.90)),
+        "children_per_parent_maximum": int(np.max(children_per_parent)),
+        "children_per_selected_parent_mean": float(
+            np.mean(children_per_parent[selected_parent])
+        ) if np.any(selected_parent) else 0.0,
+    }
 
     # C0 is independent of the later hierarchy.  C1--C4 form an exclusive
     # chain inside the current representation and selected-parent contract.
@@ -188,6 +299,15 @@ def evaluate_child_loss_decomposition(
             )
         )
     )
+    tolerance_recall = {
+        key: float(surface[key])
+        for key in (
+            "tolerant_visible_mass_recall_0.25m",
+            "tolerant_visible_mass_recall_0.5m",
+            "tolerant_visible_mass_recall_1m",
+        )
+        if key in surface
+    }
 
     curves: dict[str, object] = {}
     pools = {
@@ -266,6 +386,24 @@ def evaluate_child_loss_decomposition(
         "current_selected_parent_count": int(np.sum(selected_parent)),
         "oracle_visible_parent_count": int(np.sum(oracle_parent)),
         "current_selected_child_count": int(np.sum(selected_child)),
+        "hierarchy_bottleneck": {
+            "parent_miss_visible_mass_fraction": c1,
+            "correct_parent_child_candidate_miss_visible_mass_fraction": c2,
+            "candidate_present_but_scene_budget_miss_visible_mass_fraction": c4,
+            "same_parent_region_visible_mass_recall": same_parent_visible_mass_recall,
+            "spatial_child_region_recall": tolerance_recall,
+            "predicted_local_child_recall_given_selected_parent": predicted_local_recall,
+            "predicted_local_child_recall_given_candidate_support": (
+                candidate_conditional_local_recall
+            ),
+            "gt_oracle_local_child_recall_given_selected_parent": oracle_local_recall,
+            "selected_parent_visible_mass_fraction": selected_parent_truth / total,
+            "selected_parent_candidate_visible_mass_fraction": (
+                local_candidate_truth / total
+            ),
+            "budget_allocation": budget_allocation,
+            "child_count_ledger": child_count_ledger,
+        },
         "attribution": attribution,
         "dominant_attribution": dominant,
         "area_curves": curves,

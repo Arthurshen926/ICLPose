@@ -16,6 +16,10 @@ from feature_extract.vfm.localization.surface_maplet_mapper import load_surface_
 from feature_extract.vfm.localization_goal_maplet.canonical_field import CanonicalSurfaceField
 from feature_extract.vfm.localization_goal_maplet.lineage import file_sha256
 from feature_extract.vfm.localization_goal_maplet.physical_map import GoalMapletPhysicalMap
+from feature_extract.vfm.localization_goal_maplet.retrieval_surface_metrics import (
+    COORDINATE_CONTRACT,
+    load_contributors_in_radio_coordinates,
+)
 from feature_extract.vfm.localization_goal_maplet.sparse_vfm_pose_likelihood import (
     _camera_parameters,
 )
@@ -41,6 +45,7 @@ class ViewObservation:
     weights: np.ndarray
     local_directions: np.ndarray
     log_projected_scales: np.ndarray
+    coordinate_audit: dict[str, object]
 
 
 def _eligible_contributors(
@@ -66,10 +71,9 @@ def _observation(
     dense_physical_lookup: np.ndarray,
     dense_field_lookup: np.ndarray,
     mapper,
+    artifact_root: Path,
 ) -> ViewObservation:
     with np.load(path, allow_pickle=False) as data:
-        ids = np.asarray(data["topk_ids"], dtype=np.int64)
-        weights = np.asarray(data["topk_weights"], dtype=np.float32)
         pose_w2c = np.asarray(data["pose_w2c"], dtype=np.float64)
         camera = ColmapCamera(
             camera_id=0,
@@ -78,7 +82,17 @@ def _observation(
             height=int(data["camera_height"]),
             params=tuple(np.asarray(data["camera_params"], dtype=np.float64).tolist()),
         )
-    with np.load(Path(str(metadata["token_path"])), allow_pickle=False) as data:
+    labels, coordinate_audit = load_contributors_in_radio_coordinates(
+        path, legacy_pinhole_as_raw_diagnostic=False,
+    )
+    if coordinate_audit.get("coordinate_contract") != COORDINATE_CONTRACT:
+        raise ValueError("view-conditioned observation is not coordinate-correct")
+    ids = np.asarray(labels.topk_primitive_ids, dtype=np.int64)
+    weights = np.asarray(labels.topk_weights, dtype=np.float32)
+    token_path = Path(str(metadata["token_path"]))
+    if not token_path.is_absolute():
+        token_path = Path(artifact_root) / token_path
+    with np.load(token_path, allow_pickle=False) as data:
         raw = np.asarray(data["radio_final"], dtype=np.float32)
     mapped = mapper.project(raw).measurement_context
     rows, mass, contributing_pixel, starts, token_x, token_y = _pixel_layout(
@@ -131,6 +145,7 @@ def _observation(
         weights=observation_weight,
         local_directions=local_direction.astype(np.float32, copy=False),
         log_projected_scales=log_projected_scale,
+        coordinate_audit=dict(coordinate_audit),
     )
 
 
@@ -225,6 +240,7 @@ def main() -> None:
     parser.add_argument("--direction_cosine_margin", type=float, default=0.05)
     parser.add_argument("--log_scale_margin", type=float, default=0.25)
     parser.add_argument("--random_seed", type=int, default=194917)
+    parser.add_argument("--artifact_root", default=".")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
@@ -296,10 +312,13 @@ def main() -> None:
     sampled_directions: list[np.ndarray] = []
     sampled_log_scales: list[np.ndarray] = []
     total_observation_count = 0
+    coordinate_audits: list[dict[str, object]] = []
     for view_index, (path, metadata) in enumerate(eligible, start=1):
         value = _observation(
             path, metadata, physical, dense_physical_lookup, dense_field_lookup, mapper,
+            Path(args.artifact_root).resolve(),
         )
+        coordinate_audits.append(value.coordinate_audit)
         rows = value.field_indices
         observation_count[rows] += 1
         direction_sum[rows] += value.local_directions
@@ -382,7 +401,10 @@ def main() -> None:
     for view_index, (path, metadata) in enumerate(eligible, start=1):
         value = _observation(
             path, metadata, physical, dense_physical_lookup, dense_field_lookup, mapper,
+            Path(args.artifact_root).resolve(),
         )
+        if value.coordinate_audit != coordinate_audits[view_index - 1]:
+            raise ValueError("coordinate replay differs between view-field passes")
         rows = value.field_indices
         canonical_code = canonical.codes[rows]
         cosine = np.sum(value.descriptors * canonical_code, axis=1)
@@ -469,6 +491,8 @@ def main() -> None:
             "mapping_trajectory_ids": trajectories,
             "contributor_set_sha256": contributor_hash.hexdigest(),
             "surface_mapper_file_sha256": mapper_hash,
+            "contributor_to_radio_coordinate_contract": COORDINATE_CONTRACT,
+            "coordinate_correct": True,
             "stores_per_view_descriptors": False,
             "stores_mapping_rgb": False,
             "stores_mapping_image_paths": False,
@@ -518,6 +542,24 @@ def main() -> None:
                 conditioned_similarity[sample_active] - baseline_similarity[sample_active]
             )),
         },
+        "coordinate_audit": {
+            "coordinate_contract": COORDINATE_CONTRACT,
+            "view_count": int(len(coordinate_audits)),
+            "camera_model_ids": sorted({
+                int(value["camera_model_id"]) for value in coordinate_audits
+            }),
+            "minimum_valid_raw_sample_fraction": float(min(
+                float(value["valid_raw_sample_fraction"]) for value in coordinate_audits
+            )),
+            "maximum_inverse_roundtrip_residual_contributor_px": float(max(
+                float(value["maximum_inverse_roundtrip_residual_contributor_px"])
+                for value in coordinate_audits
+            )),
+            "maximum_pinhole_to_raw_displacement_contributor_px": float(max(
+                float(value["maximum_pinhole_to_raw_displacement_contributor_px"])
+                for value in coordinate_audits
+            )),
+        },
         "storage_bytes_uncompressed": int(
             sum(np.asarray(value).nbytes for value in (
                 artifact.residual_basis, artifact.coefficients,
@@ -538,4 +580,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

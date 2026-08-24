@@ -219,7 +219,52 @@ def main(argv: Sequence[str] | None = None) -> None:
             sorted(Counter(str(row["dominant_attribution"]) for row in rows).items())
         ),
         "area_curves": {},
+        "hierarchy_bottleneck": {
+            "parent_miss_visible_mass_fraction": _mean(
+                rows, "hierarchy_bottleneck", "parent_miss_visible_mass_fraction"
+            ),
+            "correct_parent_child_candidate_miss_visible_mass_fraction": _mean(
+                rows,
+                "hierarchy_bottleneck",
+                "correct_parent_child_candidate_miss_visible_mass_fraction",
+            ),
+            "candidate_present_but_scene_budget_miss_visible_mass_fraction": _mean(
+                rows,
+                "hierarchy_bottleneck",
+                "candidate_present_but_scene_budget_miss_visible_mass_fraction",
+            ),
+            "same_parent_region_visible_mass_recall": _mean(
+                rows, "hierarchy_bottleneck", "same_parent_region_visible_mass_recall"
+            ),
+            "selected_parent_visible_mass_fraction": _mean(
+                rows, "hierarchy_bottleneck", "selected_parent_visible_mass_fraction"
+            ),
+            "selected_parent_candidate_visible_mass_fraction": _mean(
+                rows,
+                "hierarchy_bottleneck",
+                "selected_parent_candidate_visible_mass_fraction",
+            ),
+            "spatial_child_region_recall": {},
+            "predicted_local_child_recall_given_selected_parent": {},
+            "predicted_local_child_recall_given_candidate_support": {},
+            "gt_oracle_local_child_recall_given_selected_parent": {},
+            "budget_allocation": {},
+            "child_count_ledger": rows[0]["hierarchy_bottleneck"]["child_count_ledger"]
+            if rows else {},
+        },
     }
+    hierarchy = aggregate["hierarchy_bottleneck"]
+    for name in (
+        "spatial_child_region_recall",
+        "predicted_local_child_recall_given_selected_parent",
+        "predicted_local_child_recall_given_candidate_support",
+        "gt_oracle_local_child_recall_given_selected_parent",
+        "budget_allocation",
+    ):
+        keys = sorted(rows[0]["hierarchy_bottleneck"][name]) if rows else []
+        hierarchy[name] = {
+            key: _mean(rows, "hierarchy_bottleneck", name, key) for key in keys
+        }
     for fraction in args.area_budgets:
         budget_key = f"area_{float(fraction):.2f}"
         aggregate["area_curves"][budget_key] = {}
@@ -286,4 +331,3 @@ def main(argv: Sequence[str] | None = None) -> None:
 
 if __name__ == "__main__":
     main()
-

@@ -8,7 +8,7 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Sequence
+from typing import Mapping, Sequence
 
 import numpy as np
 
@@ -26,6 +26,16 @@ from feature_extract.vfm.localization_goal_maplet.child_retrieval import (
 from feature_extract.vfm.localization_goal_maplet.connected_fine_support import (
     COMPONENT_SEMANTICS as CONNECTED_FINE_SUPPORT_SEMANTICS,
     connected_fine_support_components,
+)
+from feature_extract.vfm.localization_goal_maplet.hierarchical_child_allocator import (
+    SEMANTICS as HIERARCHICAL_CHILD_ALLOCATOR_SEMANTICS,
+    allocate_parent_balanced_scene_children,
+)
+from feature_extract.vfm.localization_goal_maplet.layout_child_allocator_config import (
+    SCORE_EVIDENCE_PER_AREA,
+    SCORE_RAW_EVIDENCE,
+    load_validate_layout_child_allocator_config,
+    validate_layout_source_signature,
 )
 from feature_extract.vfm.localization_goal_maplet.feature_contract import (
     FieldFeatureContract,
@@ -60,6 +70,10 @@ from feature_extract.vfm.localization_goal_maplet.retrieval import (
     ValidityCalibration,
     retrieve_maplet_posterior_decomposed,
     retrieve_maplet_posterior_from_scores,
+)
+from feature_extract.vfm.localization_goal_maplet.scene_child_evidence import (
+    SCENE_PARENT_MASK_SEMANTICS,
+    aggregate_scene_child_evidence,
 )
 from feature_extract.vfm.surface_maplet_bank import (
     RadioFinalRegionConfig,
@@ -110,6 +124,14 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--child_temperature", type=float, default=0.07)
     parser.add_argument("--maximum_child_primitive_iou", type=float, default=0.50)
+    parser.add_argument(
+        "--layout_child_allocator_config",
+        default="",
+        help=(
+            "signed seq10-frozen token-layout/parent-balanced child allocator; "
+            "mutually exclusive with fine_support_area_fraction"
+        ),
+    )
     parser.add_argument("--max_queries", type=int, default=0)
     parser.add_argument("--include_trajectories", nargs="+", default=[])
     parser.add_argument("--shard_index", type=int, default=0)
@@ -118,6 +140,19 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--allow_legacy_coordinate_misaligned_control",
         action="store_true",
         help="diagnostic-only opt-in for old canonical fields without raw-RADIO coordinate alignment",
+    )
+    parser.add_argument(
+        "--allow_unpromoted_mapper_control",
+        action="store_true",
+        help=(
+            "explicitly consume an unpromoted mapper/canonical/calibration "
+            "chain as a diagnostic control; outputs remain non-promotable"
+        ),
+    )
+    parser.add_argument(
+        "--allow_query_route_overlap_control",
+        action="store_true",
+        help="explicitly allow query-route overlap as a control-only retrieval run",
     )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--force", action="store_true")
@@ -148,6 +183,82 @@ def _validate_field_coordinate_contract(
             "legacy fields are diagnostic controls only"
         )
     return coordinate_correct, coordinate_contract
+
+
+def _validate_promotion_contract(
+    field: CanonicalSurfaceField,
+    calibration: ValidityCalibration | None,
+    *,
+    allow_unpromoted_mapper_control: bool,
+) -> tuple[bool, list[str]]:
+    field_eligible = bool(field.metadata.get("promotion_eligible", False))
+    calibration_eligible = bool(
+        calibration is not None
+        and calibration.metadata.get("promotion_eligible", False)
+    )
+    blockers: list[str] = []
+    if not field_eligible:
+        blockers.append("canonical_field_not_promotion_eligible")
+    if calibration is not None and not calibration_eligible:
+        blockers.append("validity_calibration_not_promotion_eligible")
+    eligible = bool(field_eligible and (calibration is None or calibration_eligible))
+    if not eligible and not bool(allow_unpromoted_mapper_control):
+        raise ValueError(
+            "pure retrieval refuses an unpromoted canonical/calibration chain; "
+            "pass --allow_unpromoted_mapper_control for a diagnostic control"
+        )
+    return eligible, blockers
+
+
+def _query_split_audit(
+    query_routes: set[str],
+    field_metadata: Mapping[str, object],
+    mapper_metadata: Mapping[str, object],
+    calibration_metadata: Mapping[str, object],
+) -> dict[str, object]:
+    mapping_routes = {
+        str(value) for value in field_metadata.get("mapping_trajectory_ids", ())
+    }
+    field_excluded = {
+        str(value) for value in field_metadata.get("excluded_trajectory_ids", ())
+    }
+    mapper_fit = {
+        str(value) for value in mapper_metadata.get("training_trajectory_ids", ())
+    }
+    mapper_validation = {
+        str(value) for value in mapper_metadata.get("validation_trajectory_ids", ())
+    }
+    mapper_holdout = {
+        str(value)
+        for value in mapper_metadata.get("strict_holdout_trajectory_ids", ())
+    }
+    calibration_fit = {
+        str(value) for value in calibration_metadata.get("fit_trajectory_ids", ())
+    }
+    blockers: list[str] = []
+    if not query_routes:
+        blockers.append("query_routes_not_explicit")
+    if query_routes & mapping_routes:
+        blockers.append("query_route_present_in_canonical_fusion")
+    if not query_routes.issubset(field_excluded):
+        blockers.append("canonical_field_does_not_declare_query_route_exclusion")
+    if query_routes & (mapper_fit | mapper_validation):
+        blockers.append("query_route_used_for_mapper_fit_or_selection")
+    if not query_routes.issubset(mapper_holdout):
+        blockers.append("mapper_does_not_declare_query_route_holdout")
+    if query_routes & calibration_fit:
+        blockers.append("query_route_used_for_validity_calibration")
+    return {
+        "disjoint": not blockers,
+        "query_trajectory_ids": sorted(query_routes),
+        "canonical_mapping_trajectory_ids": sorted(mapping_routes),
+        "canonical_excluded_trajectory_ids": sorted(field_excluded),
+        "mapper_training_trajectory_ids": sorted(mapper_fit),
+        "mapper_validation_trajectory_ids": sorted(mapper_validation),
+        "mapper_strict_holdout_trajectory_ids": sorted(mapper_holdout),
+        "validity_calibration_fit_trajectory_ids": sorted(calibration_fit),
+        "blockers": blockers,
+    }
 
 
 def _atomic_save(result: PureRadioPhysicalRetrieval, destination: Path) -> None:
@@ -188,10 +299,23 @@ def main(argv: Sequence[str] | None = None) -> None:
     if contract.query_readout_type != "surface_maplet_mapper":
         raise ValueError("pure retrieval requires the RADIO surface mapper")
     contract.validate(field, query_readout_path=mapper_path)
+    if str(contract.metadata.get("canonical_field_file_sha256", "")) != compute_file_sha256(
+        field_path
+    ):
+        raise ValueError("field feature contract does not bind canonical field bytes")
     calibration = ValidityCalibration.load_json(calibration_path)
+    promotion_eligible, promotion_blockers = _validate_promotion_contract(
+        field,
+        calibration,
+        allow_unpromoted_mapper_control=bool(
+            args.allow_unpromoted_mapper_control
+        ),
+    )
     for name, expected in (
         ("physical_map_sha256", physical.content_sha256),
         ("canonical_field_sha256", field.content_sha256),
+        ("canonical_field_file_sha256", compute_file_sha256(field_path)),
+        ("surface_mapper_file_sha256", compute_file_sha256(mapper_path)),
         ("pooling", "current_1x1_3x3_5x5_9x9"),
     ):
         if str(calibration.metadata.get(name, "")) != str(expected):
@@ -202,9 +326,15 @@ def main(argv: Sequence[str] | None = None) -> None:
     if calibration_parent_semantics != str(args.parent_score_semantics):
         raise ValueError("validity calibration parent score semantics differ")
     readout = readout_canonical_field(field, physical)
+    layout_config_path = (
+        Path(args.layout_child_allocator_config).resolve()
+        if str(args.layout_child_allocator_config)
+        else None
+    )
     fine_child_area = (
         child_surface_area_m2(physical)
         if float(args.fine_support_area_fraction) > 0.0
+        or layout_config_path is not None
         else None
     )
     fine_total_map_area = (
@@ -233,6 +363,82 @@ def main(argv: Sequence[str] | None = None) -> None:
             for record in records
             if str(record.image_id).split("/", 1)[0] in included_trajectories
         ]
+    selected_query_routes = {
+        str(record.image_id).split("/", 1)[0] for record in records
+    }
+    layout_config: dict[str, object] | None = None
+    layout_config_file_sha256: str | None = None
+    if layout_config_path is not None:
+        if float(args.fine_support_area_fraction) > 0.0:
+            raise ValueError(
+                "layout child allocator and fine-support area selection are mutually exclusive"
+            )
+        layout_config, tuning_signature = (
+            load_validate_layout_child_allocator_config(
+                layout_config_path,
+                physical,
+                physical_path=physical_path,
+                query_routes=selected_query_routes,
+            )
+        )
+        if (
+            int(layout_config["maximum_children"])
+            != int(args.maximum_scene_children)
+            or not np.isclose(
+                float(layout_config["maximum_primitive_iou"]),
+                float(args.maximum_child_primitive_iou),
+                rtol=0.0,
+                atol=1e-12,
+            )
+        ):
+            raise ValueError("layout config and retrieval child budget differ")
+        deployment_signature = {
+            "physical_map_file_sha256": compute_file_sha256(physical_path),
+            "canonical_field_file_sha256": compute_file_sha256(field_path),
+            "surface_mapper_file_sha256": compute_file_sha256(mapper_path),
+            "field_feature_contract_file_sha256": compute_file_sha256(contract_path),
+            "validity_calibration_file_sha256": compute_file_sha256(calibration_path),
+            "parent_score_semantics": str(args.parent_score_semantics),
+            "parent_scene_ranking_semantics": str(
+                args.parent_scene_ranking_semantics
+            ),
+            "parent_mode_temperature": float(args.parent_mode_temperature),
+            "anonymous_parent_mode_readout_sha256": (
+                anonymous_parent_readout.content_sha256
+                if anonymous_parent_readout is not None
+                else None
+            ),
+            "maximum_parent_candidates": int(args.maximum_parent_candidates),
+            "maximum_child_candidates": int(args.maximum_child_candidates),
+            "maximum_scene_parents": int(args.maximum_scene_parents),
+            "child_probability_semantics": CHILD_PROBABILITY_SEMANTICS,
+            "token_height": 36,
+            "token_width": 64,
+            "pool_sizes": list(POOL_SIZES),
+            "pool_weights": list(POOL_WEIGHTS),
+        }
+        validate_layout_source_signature(tuning_signature, deployment_signature)
+        layout_config_file_sha256 = compute_file_sha256(layout_config_path)
+    query_split_audit = _query_split_audit(
+        selected_query_routes, field.metadata, mapper_metadata, calibration.metadata
+    )
+    if not bool(query_split_audit["disjoint"]):
+        if not bool(args.allow_query_route_overlap_control):
+            raise ValueError(
+                "pure retrieval query routes overlap fitting/calibration: "
+                + ",".join(str(value) for value in query_split_audit["blockers"])
+            )
+        promotion_eligible = False
+        promotion_blockers.extend(
+            str(value) for value in query_split_audit["blockers"]
+        )
+    if layout_config is not None:
+        query_split_audit.update({
+            "allocator_tuning_trajectory_ids": [
+                str(layout_config["tuning_route"])
+            ],
+            "allocator_tuning_query_disjoint": True,
+        })
     if (
         int(args.shard_count) <= 0
         or int(args.shard_index) < 0
@@ -258,6 +464,12 @@ def main(argv: Sequence[str] | None = None) -> None:
             result = PureRadioPhysicalRetrieval.load_npz(destination)
             if result.image_id != record.image_id:
                 raise ValueError("existing pure retrieval image identity differs")
+            if layout_config is not None and str(
+                result.metadata.get(
+                    "layout_child_allocator_config_content_sha256", ""
+                )
+            ) != str(layout_config["content_sha256"]):
+                raise ValueError("existing retrieval uses a different layout config")
             rows.append(
                 {
                     "image_id": result.image_id,
@@ -337,14 +549,32 @@ def main(argv: Sequence[str] | None = None) -> None:
             maximum_parents=int(args.maximum_scene_parents),
             semantics=str(args.parent_scene_ranking_semantics),
         )
-        child_scene_score = aggregate_sparse_token_evidence(
-            token_xy,
-            child.candidate_child_rows,
-            child.candidate_probabilities,
-            entity_count=physical.child_parent_rows.size,
-            token_height=36,
-            token_width=64,
-        )
+        layout_evidence_audit: dict[str, object] | None = None
+        if layout_config is None:
+            child_scene_score = aggregate_sparse_token_evidence(
+                token_xy,
+                child.candidate_child_rows,
+                child.candidate_probabilities,
+                entity_count=physical.child_parent_rows.size,
+                token_height=36,
+                token_width=64,
+            )
+        else:
+            child_scene_score, layout_evidence_audit = (
+                aggregate_scene_child_evidence(
+                    token_xy,
+                    child.candidate_child_rows,
+                    child.candidate_probabilities,
+                    physical,
+                    token_height=36,
+                    token_width=64,
+                    semantics=str(layout_config["child_evidence_semantics"]),
+                    local_block_size=int(
+                        layout_config["child_evidence_local_block_size"]
+                    ),
+                    scene_parent_ids=physical.maplet_ids[parent_order],
+                )
+            )
         positive_child_count = int(np.sum(child_scene_score > 0.0))
         if float(args.fine_support_area_fraction) > 0.0:
             fine_selection = select_fine_supports_under_area_budget(
@@ -367,6 +597,44 @@ def main(argv: Sequence[str] | None = None) -> None:
             connected_supports = connected_fine_support_components(
                 scene_child_rows,
                 physical,
+                precomputed_child_surface_area_m2=fine_child_area,
+            )
+        elif layout_config is not None:
+            fine_selection = None
+            assert fine_child_area is not None
+            if str(layout_config["child_score_policy"]) == SCORE_RAW_EVIDENCE:
+                allocation_score = child_scene_score
+            elif str(layout_config["child_score_policy"]) == SCORE_EVIDENCE_PER_AREA:
+                allocation_score = np.divide(
+                    child_scene_score,
+                    fine_child_area,
+                    out=np.zeros_like(child_scene_score),
+                    where=fine_child_area > 0.0,
+                )
+            else:
+                raise ValueError("unknown frozen layout child score policy")
+            allocation = allocate_parent_balanced_scene_children(
+                physical.maplet_ids[parent_order],
+                ranked_parent_score,
+                allocation_score,
+                physical,
+                parent_mass_fraction=float(
+                    layout_config["parent_mass_fraction"]
+                ),
+                maximum_children=int(layout_config["maximum_children"]),
+                maximum_primitive_iou=float(
+                    layout_config["maximum_primitive_iou"]
+                ),
+            )
+            scene_child_rows = allocation.child_rows
+            scene_child_scores = allocation.child_scores
+            suppressed = allocation.suppressed_duplicate_count
+            connected_supports = connected_fine_support_components(
+                scene_child_rows,
+                physical,
+                maximum_normal_angle_degrees=float(
+                    layout_config["maximum_normal_angle_degrees"]
+                ),
                 precomputed_child_surface_area_m2=fine_child_area,
             )
         else:
@@ -441,7 +709,55 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "fine_support_selection_semantics": (
                     FINE_SUPPORT_SELECTION_SEMANTICS
                     if fine_selection is not None
-                    else "fixed_topk_block_peak_score_v1"
+                    else (
+                        HIERARCHICAL_CHILD_ALLOCATOR_SEMANTICS
+                        if layout_config is not None
+                        else "fixed_topk_block_peak_score_v1"
+                    )
+                ),
+                "scene_child_evidence_semantics": (
+                    str(layout_config["child_evidence_semantics"])
+                    if layout_config is not None
+                    else SCENE_AGGREGATION
+                ),
+                "scene_child_score_policy": (
+                    str(layout_config["child_score_policy"])
+                    if layout_config is not None
+                    else "raw_child_evidence_v1"
+                ),
+                "scene_child_candidate_parent_mask_semantics": (
+                    SCENE_PARENT_MASK_SEMANTICS
+                    if layout_config is not None
+                    else "none"
+                ),
+                "layout_child_allocator_config": (
+                    str(layout_config_path)
+                    if layout_config_path is not None
+                    else None
+                ),
+                "layout_child_allocator_config_file_sha256": (
+                    layout_config_file_sha256
+                    if layout_config is not None
+                    else None
+                ),
+                "layout_child_allocator_config_content_sha256": (
+                    str(layout_config["content_sha256"])
+                    if layout_config is not None
+                    else None
+                ),
+                "layout_child_allocator_tuning_route": (
+                    str(layout_config["tuning_route"])
+                    if layout_config is not None
+                    else None
+                ),
+                "layout_child_retained_evidence_fraction_after_parent_mask": (
+                    float(
+                        layout_evidence_audit[
+                            "retained_child_evidence_fraction_after_parent_mask"
+                        ]
+                    )
+                    if layout_evidence_audit is not None
+                    else None
                 ),
                 "maximum_fine_support_area_fraction": (
                     float(args.fine_support_area_fraction)
@@ -489,6 +805,10 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "canonical_field_coordinate_correct": coordinate_correct,
                 "canonical_field_coordinate_contract": coordinate_contract,
                 "legacy_coordinate_control": bool(not coordinate_correct),
+                "promotion_eligible": promotion_eligible,
+                "promotion_blockers": promotion_blockers,
+                "control_only": bool(not promotion_eligible),
+                "query_split_audit": query_split_audit,
                 "surface_mapper_file_sha256": compute_file_sha256(mapper_path),
                 "field_feature_contract_file_sha256": compute_file_sha256(
                     contract_path
@@ -545,12 +865,47 @@ def main(argv: Sequence[str] | None = None) -> None:
         "canonical_field_coordinate_correct": coordinate_correct,
         "canonical_field_coordinate_contract": coordinate_contract,
         "legacy_coordinate_control": bool(not coordinate_correct),
+        "promotion_eligible": promotion_eligible,
+        "promotion_blockers": promotion_blockers,
+        "control_only": bool(not promotion_eligible),
+        "query_split_audit": query_split_audit,
         "field_feature_contract_sha256": contract.content_sha256,
         "validity_calibration_sha256": calibration.content_sha256,
         "method": "full_radio_36x64_parent_then_child_physical_retrieval",
         "child_probability_semantics": CHILD_PROBABILITY_SEMANTICS,
         "child_probability_is_calibrated_credible_mass": False,
         "scene_aggregation": SCENE_AGGREGATION,
+        "scene_child_evidence_semantics": (
+            str(layout_config["child_evidence_semantics"])
+            if layout_config is not None
+            else SCENE_AGGREGATION
+        ),
+        "scene_child_score_policy": (
+            str(layout_config["child_score_policy"])
+            if layout_config is not None
+            else "raw_child_evidence_v1"
+        ),
+        "scene_child_candidate_parent_mask_semantics": (
+            SCENE_PARENT_MASK_SEMANTICS
+            if layout_config is not None
+            else "none"
+        ),
+        "layout_child_allocator_config": (
+            str(layout_config_path) if layout_config_path is not None else None
+        ),
+        "layout_child_allocator_config_file_sha256": (
+            layout_config_file_sha256 if layout_config is not None else None
+        ),
+        "layout_child_allocator_config_content_sha256": (
+            str(layout_config["content_sha256"])
+            if layout_config is not None
+            else None
+        ),
+        "layout_child_allocator_tuning_route": (
+            str(layout_config["tuning_route"])
+            if layout_config is not None
+            else None
+        ),
         "parent_score_semantics": str(args.parent_score_semantics),
         "parent_scene_ranking_semantics": str(args.parent_scene_ranking_semantics),
         "parent_mode_temperature": float(args.parent_mode_temperature),

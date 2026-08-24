@@ -41,6 +41,15 @@ class MultiBasinPatternSearchResult:
     pruning_applied_after_sweep: int | None
 
 
+@dataclass(frozen=True)
+class MultiBasinBeamSearchResult:
+    basins: tuple[PoseBasinState, ...]
+    evaluator_calls: int
+    evaluated_pose_count: int
+    completed_levels: int
+    beam_width_per_source: int
+
+
 def _vector3(value: float | Sequence[float], *, name: str) -> np.ndarray:
     array = np.asarray(value, dtype=np.float64)
     if array.ndim == 0:
@@ -284,4 +293,128 @@ def batched_multibasin_pattern_search(
         basins=tuple(states), evaluator_calls=evaluator_calls,
         evaluated_pose_count=evaluated_pose_count, completed_sweeps=completed,
         pruning_applied_after_sweep=pruning_after,
+    )
+
+
+def _poses_are_duplicate(
+    left: np.ndarray,
+    right: np.ndarray,
+    *,
+    translation_threshold_m: float,
+    rotation_threshold_deg: float,
+) -> bool:
+    left_rotation, right_rotation = left[:3, :3], right[:3, :3]
+    left_center = -left_rotation.T @ left[:3, 3]
+    right_center = -right_rotation.T @ right[:3, 3]
+    translation = float(np.linalg.norm(left_center - right_center))
+    relative = left_rotation @ right_rotation.T
+    cosine = float(np.clip((np.trace(relative) - 1.0) / 2.0, -1.0, 1.0))
+    rotation = float(np.degrees(np.arccos(cosine)))
+    return bool(
+        translation <= float(translation_threshold_m) + 1.0e-12
+        and rotation <= float(rotation_threshold_deg) + 1.0e-10
+    )
+
+
+def batched_multibasin_beam_pattern_search(
+    initial_poses_w2c: np.ndarray,
+    score_batch: Callable[[np.ndarray], np.ndarray],
+    *,
+    translation_radii_m: Sequence[float] = (4.0, 2.0, 1.0, 0.5, 0.25),
+    rotation_radii_deg: Sequence[float] = (22.5, 11.25, 5.625, 2.8125, 1.40625),
+    beam_width_per_source: int = 4,
+    duplicate_translation_m: float = 0.5,
+    duplicate_rotation_deg: float = 5.0,
+) -> MultiBasinBeamSearchResult:
+    """Retain multiple score-diverse paths through a bounded SE(3) poll tree.
+
+    The ordinary pattern search commits to one improving axis at each sweep.
+    That is efficient inside a genuinely unimodal local basin, but it cannot
+    traverse a coarse acquisition domain whose score contains false peaks.
+    This bounded beam keeps up to ``beam_width_per_source`` physically
+    distinct hypotheses for every original basin at every frozen scale.  It
+    is still a heuristic search: no completeness or continuous-domain claim
+    follows from the retained beam.
+    """
+
+    initial = np.asarray(initial_poses_w2c, dtype=np.float64)
+    translation = np.asarray(translation_radii_m, dtype=np.float64).reshape(-1)
+    rotation = np.asarray(rotation_radii_deg, dtype=np.float64).reshape(-1)
+    if initial.ndim != 3 or initial.shape[1:] != (4, 4) or initial.shape[0] == 0:
+        raise ValueError("beam initial poses must have shape [basin,4,4]")
+    if (
+        translation.size == 0 or translation.shape != rotation.shape
+        or np.any(~np.isfinite(translation)) or np.any(translation <= 0.0)
+        or np.any(~np.isfinite(rotation)) or np.any(rotation <= 0.0)
+        or np.any(translation[1:] >= translation[:-1])
+        or np.any(rotation[1:] >= rotation[:-1])
+        or int(beam_width_per_source) <= 0
+        or not np.isfinite(duplicate_translation_m)
+        or float(duplicate_translation_m) < 0.0
+        or not np.isfinite(duplicate_rotation_deg)
+        or float(duplicate_rotation_deg) < 0.0
+    ):
+        raise ValueError("beam-search schedule or budget is invalid")
+    initial_score = np.asarray(score_batch(initial), dtype=np.float64).reshape(-1)
+    if initial_score.shape != (initial.shape[0],) or np.any(~np.isfinite(initial_score)):
+        raise ValueError("beam initial scorer output differs")
+    states = [
+        PoseBasinState(
+            pose_w2c=initial[row].copy(), score=float(initial_score[row]),
+            translation_radii_m=np.full(3, translation[0]),
+            rotation_radii_deg=np.full(3, rotation[0]),
+            source_basin_index=row, accepted_updates=0,
+        )
+        for row in range(initial.shape[0])
+    ]
+    evaluator_calls = 1
+    evaluated = int(initial.shape[0])
+    for level, (translation_radius, rotation_radius) in enumerate(
+        zip(translation.tolist(), rotation.tolist())
+    ):
+        probes = np.concatenate([
+            _probe_basin(state.pose_w2c, translation_radius, rotation_radius)[1:]
+            for state in states
+        ], axis=0)
+        probe_score = np.asarray(score_batch(probes), dtype=np.float64).reshape(-1)
+        if probe_score.shape != (probes.shape[0],) or np.any(~np.isfinite(probe_score)):
+            raise ValueError("beam probe scorer output differs")
+        evaluator_calls += 1
+        evaluated += int(probes.shape[0])
+        expanded = list(states)
+        cursor = 0
+        for state in states:
+            for _ in range(12):
+                expanded.append(PoseBasinState(
+                    pose_w2c=probes[cursor].copy(), score=float(probe_score[cursor]),
+                    translation_radii_m=np.full(3, translation_radius),
+                    rotation_radii_deg=np.full(3, rotation_radius),
+                    source_basin_index=state.source_basin_index,
+                    accepted_updates=state.accepted_updates + 1,
+                ))
+                cursor += 1
+        retained: list[PoseBasinState] = []
+        for source in range(initial.shape[0]):
+            rows = [state for state in expanded if state.source_basin_index == source]
+            rows.sort(key=lambda state: (-state.score, state.accepted_updates))
+            source_rows: list[PoseBasinState] = []
+            for state in rows:
+                if any(_poses_are_duplicate(
+                    state.pose_w2c, previous.pose_w2c,
+                    translation_threshold_m=float(duplicate_translation_m),
+                    rotation_threshold_deg=float(duplicate_rotation_deg),
+                ) for previous in source_rows):
+                    continue
+                source_rows.append(state)
+                if len(source_rows) == int(beam_width_per_source):
+                    break
+            retained.extend(source_rows)
+        states = retained
+        if not states:
+            raise RuntimeError(f"beam search lost every state at level {level}")
+    states.sort(key=lambda state: (-state.score, state.source_basin_index))
+    return MultiBasinBeamSearchResult(
+        basins=tuple(states), evaluator_calls=evaluator_calls,
+        evaluated_pose_count=evaluated, completed_levels=int(translation.size),
+        beam_width_per_source=int(beam_width_per_source),
     )

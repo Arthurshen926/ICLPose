@@ -288,6 +288,35 @@ def test_surface_metrics_credit_visible_physical_support_and_not_camera_distance
     assert report["claim_scope"]["metric_is_localization_success"] is False
 
 
+def test_surface_metrics_separate_prototype_support_ceiling_from_retrieval_recall():
+    physical = _physical()
+    result = _result(physical)
+    ids = np.full((4, 4, 1), int(physical.primitive_ids[0]), dtype=np.int64)
+    labels = ContributorLabels(ids, np.ones_like(ids, dtype=np.float32), np.eye(4))
+    parent_support = np.zeros((physical.maplet_ids.size,), dtype=bool)
+    parent_support[0] = True
+    child_support = parent_support[physical.child_parent_rows]
+    report = evaluate_pure_retrieval_query(
+        result,
+        labels,
+        physical,
+        camera_model_id=0,
+        camera_width=4,
+        camera_height=4,
+        camera_params=np.asarray([4.0, 2.0, 2.0]),
+        ks=(1,),
+        surface_ks=(1,),
+        prototype_supported_parent_rows=parent_support,
+        prototype_supported_child_rows=child_support,
+    )
+    support = report["prototype_support"]
+    assert support["physical_parent_ontology_count"] == physical.maplet_ids.size
+    assert support["prototype_supported_parent_count"] == 1
+    assert support["parent_gt_visible_mass_supported_fraction_within_physical"] == 1.0
+    assert support["parent_conditional_recall_within_prototype_support"]["recall_at_1"] == 1.0
+    assert support["token_support_posterior_diagnostic"]["raw_empty_token_fraction"] == 0.0
+
+
 def test_vectorized_candidate_recall_matches_unique_sparse_reference():
     truth = sparse.csr_matrix(
         np.asarray(

@@ -27,6 +27,7 @@ from feature_extract.vfm.localization_goal_maplet.retrieval_surface_metrics impo
     evaluate_pure_retrieval_query,
 )
 from feature_extract.vfm.tokens import compute_file_sha256
+from feature_extract.vfm.surface_maplet_bank import VfmSurfaceMapletBank
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -34,6 +35,14 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--retrieval_summary", nargs="+", required=True)
     parser.add_argument("--contributors", required=True)
     parser.add_argument("--physical_map", required=True)
+    parser.add_argument(
+        "--surface_maplets",
+        default="",
+        help=(
+            "Optional mapper-supervision bank defining the trained parent-identity "
+            "support ceiling. Strict reports should provide it."
+        ),
+    )
     parser.add_argument("--output_json", required=True)
     parser.add_argument("--expected_queries", type=int, default=0)
     parser.add_argument("--max_queries", type=int, default=0)
@@ -113,6 +122,36 @@ def _mean(rows: list[dict[str, object]], path: Sequence[str]) -> float:
     return float(np.mean(values)) if values else 0.0
 
 
+_TOKEN_RECALL_KS = (1, 5, 10, 20, 32, 64)
+
+
+def _token_recall_curve(
+    rows: list[dict[str, object]], level: str
+) -> dict[str, float]:
+    return {
+        f"recall_at_{k}": _mean(
+            rows, (f"token_{level}", f"conditional_recall_at_{k}")
+        )
+        for k in _TOKEN_RECALL_KS
+    }
+
+
+def _prototype_support_recall_curve(
+    rows: list[dict[str, object]], level: str
+) -> dict[str, float]:
+    return {
+        f"recall_at_{k}": _mean(
+            rows,
+            (
+                "prototype_support",
+                f"{level}_conditional_recall_within_prototype_support",
+                f"recall_at_{k}",
+            ),
+        )
+        for k in _TOKEN_RECALL_KS
+    }
+
+
 def _failure_categories(row: dict[str, object]) -> list[str]:
     failures: list[str] = []
     parent_ceiling = float(row["parent_representable_visible_mass_ceiling"])
@@ -148,6 +187,8 @@ def _sequence_summary(rows: list[dict[str, object]]) -> dict[str, object]:
     for sequence, values in sorted(grouped.items()):
         output[sequence] = {
             "query_count": len(values),
+            "parent_conditional_recall": _token_recall_curve(values, "parent"),
+            "child_conditional_recall": _token_recall_curve(values, "child"),
             "parent_conditional_recall_at_32": _mean(
                 values, ("token_parent", "conditional_recall_at_32")
             ),
@@ -198,6 +239,101 @@ def _sequence_summary(rows: list[dict[str, object]]) -> dict[str, object]:
                 )
             ),
         }
+        if all("prototype_support" in value for value in values):
+            output[sequence]["prototype_support"] = {
+                "parent_conditional_recall_within_prototype_support": (
+                    _prototype_support_recall_curve(values, "parent")
+                ),
+                "child_conditional_recall_within_prototype_support": (
+                    _prototype_support_recall_curve(values, "child")
+                ),
+                "parent_gt_visible_mass_supported_fraction_within_physical": _mean(
+                    values,
+                    (
+                        "prototype_support",
+                        "parent_gt_visible_mass_supported_fraction_within_physical",
+                    ),
+                ),
+                "child_gt_visible_mass_supported_fraction_within_physical": _mean(
+                    values,
+                    (
+                        "prototype_support",
+                        "child_gt_visible_mass_supported_fraction_within_physical",
+                    ),
+                ),
+                "parent_conditional_recall_at_32_within_prototype_support": _mean(
+                    values,
+                    (
+                        "prototype_support",
+                        "parent_conditional_recall_within_prototype_support",
+                        "recall_at_32",
+                    ),
+                ),
+                "child_conditional_recall_at_64_within_prototype_support": _mean(
+                    values,
+                    (
+                        "prototype_support",
+                        "child_conditional_recall_within_prototype_support",
+                        "recall_at_64",
+                    ),
+                ),
+                "raw_empty_token_fraction": _mean(
+                    values,
+                    (
+                        "prototype_support",
+                        "token_support_posterior_diagnostic",
+                        "raw_empty_token_fraction",
+                    ),
+                ),
+                "parent_zero_support_given_raw_nonempty_fraction": _mean(
+                    values,
+                    (
+                        "prototype_support",
+                        "token_support_posterior_diagnostic",
+                        "parent_zero_support_given_raw_nonempty_fraction",
+                    ),
+                ),
+                "child_zero_support_given_raw_nonempty_fraction": _mean(
+                    values,
+                    (
+                        "prototype_support",
+                        "token_support_posterior_diagnostic",
+                        "child_zero_support_given_raw_nonempty_fraction",
+                    ),
+                ),
+                "predicted_parent_prototype_supported_probability_mass_mean_per_token": _mean(
+                    values,
+                    (
+                        "prototype_support",
+                        "token_support_posterior_diagnostic",
+                        "predicted_parent_prototype_supported_probability_mass_mean_per_token",
+                    ),
+                ),
+                "predicted_child_prototype_supported_probability_mass_mean_per_token": _mean(
+                    values,
+                    (
+                        "prototype_support",
+                        "token_support_posterior_diagnostic",
+                        "predicted_child_prototype_supported_probability_mass_mean_per_token",
+                    ),
+                ),
+                "predicted_parent_zero_prototype_supported_mass_token_fraction": _mean(
+                    values,
+                    (
+                        "prototype_support",
+                        "token_support_posterior_diagnostic",
+                        "predicted_parent_zero_prototype_supported_mass_token_fraction",
+                    ),
+                ),
+                "predicted_child_zero_prototype_supported_mass_token_fraction": _mean(
+                    values,
+                    (
+                        "prototype_support",
+                        "token_support_posterior_diagnostic",
+                        "predicted_child_zero_prototype_supported_mass_token_fraction",
+                    ),
+                ),
+            }
     return output
 
 
@@ -220,6 +356,48 @@ def main(argv: Sequence[str] | None = None) -> None:
     physical = GoalMapletPhysicalMap.load_npz(Path(args.physical_map))
     child_area = child_surface_area_m2(physical)
     incidence = PhysicalIncidence.from_physical_map(physical)
+    prototype_parent_mask = None
+    prototype_child_mask = None
+    mapper_bank_binding = None
+    if str(args.surface_maplets):
+        surface_maplets_path = Path(args.surface_maplets)
+        bank = VfmSurfaceMapletBank.load_npz(surface_maplets_path)
+        lineage = dict(bank.metadata or {}).get("supervision_coordinate_lineage", {})
+        if not isinstance(lineage, dict):
+            raise ValueError("surface-maplet bank coordinate lineage is missing")
+        if (
+            lineage.get("coordinate_correct") is not True
+            or str(lineage.get("physical_map_sha256", "")) != physical.content_sha256
+            or lineage.get("route_allowlist_applied_before_opening_contributor_archives")
+            is not True
+            or lineage.get("strict_holdout_present") is not False
+        ):
+            raise ValueError("surface-maplet bank is not strict coordinate/route bound")
+        parent_row_by_id = {
+            int(value): row for row, value in enumerate(physical.maplet_ids.tolist())
+        }
+        unknown = sorted(set(bank.maplet_ids.tolist()) - set(parent_row_by_id))
+        if unknown:
+            raise ValueError("surface-maplet bank contains unknown physical parents")
+        prototype_parent_mask = np.zeros((physical.maplet_ids.size,), dtype=bool)
+        prototype_parent_mask[
+            [parent_row_by_id[int(value)] for value in bank.maplet_ids.tolist()]
+        ] = True
+        prototype_child_mask = prototype_parent_mask[
+            np.asarray(physical.child_parent_rows, dtype=np.int64)
+        ]
+        mapper_bank_binding = {
+            "path": str(surface_maplets_path.resolve()),
+            "file_sha256": compute_file_sha256(surface_maplets_path),
+            "physical_parent_ontology_count": int(physical.maplet_ids.size),
+            "mapper_prototype_parent_count": int(np.sum(prototype_parent_mask)),
+            "mapper_prototype_parent_fraction": float(np.mean(prototype_parent_mask)),
+            "prototype_supported_child_count": int(np.sum(prototype_child_mask)),
+            "strict_holdout_trajectory_ids": sorted(
+                str(value)
+                for value in lineage.get("strict_holdout_trajectory_ids", [])
+            ),
+        }
     summaries = [_json_without_duplicates(path) for path in summary_paths]
     records = []
     for summary in summaries:
@@ -234,6 +412,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     image_ids = [str(record["image_id"]) for record in records]
     if len(set(image_ids)) != len(image_ids):
         raise ValueError("retrieval summaries contain duplicate query identities")
+    if mapper_bank_binding is not None:
+        query_routes = {value.split("/", 1)[0] for value in image_ids}
+        mapper_holdout = set(mapper_bank_binding["strict_holdout_trajectory_ids"])
+        if not query_routes <= mapper_holdout:
+            raise ValueError("retrieval query route is not a mapper strict holdout")
     records = sorted(records, key=lambda record: str(record["image_id"]))
     if int(args.max_queries) > 0:
         records = records[: int(args.max_queries)]
@@ -275,6 +458,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             # once instead of rebuilding ten trees per query.
             surface_ks=(64,),
             precomputed_child_surface_area_m2=child_area,
+            prototype_supported_parent_rows=prototype_parent_mask,
+            prototype_supported_child_rows=prototype_child_mask,
         )
         row["failure_categories"] = _failure_categories(row)
         rows.append(row)
@@ -302,6 +487,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     aggregate = {
         "query_count": len(rows),
+        "parent_conditional_recall": _token_recall_curve(rows, "parent"),
+        "child_conditional_recall": _token_recall_curve(rows, "child"),
         "parent_representable_visible_mass_ceiling": _mean(
             rows, ("parent_representable_visible_mass_ceiling",)
         ),
@@ -474,6 +661,102 @@ def main(argv: Sequence[str] | None = None) -> None:
         "out_of_map_brier": _mean(rows, ("null_calibration", "out_of_map_brier")),
         "out_of_map_ece": _mean(rows, ("null_calibration", "out_of_map_ece")),
     }
+    if mapper_bank_binding is not None:
+        aggregate["prototype_support"] = {
+            **mapper_bank_binding,
+            "parent_conditional_recall_within_prototype_support": (
+                _prototype_support_recall_curve(rows, "parent")
+            ),
+            "child_conditional_recall_within_prototype_support": (
+                _prototype_support_recall_curve(rows, "child")
+            ),
+            "parent_gt_visible_mass_supported_fraction_within_physical": _mean(
+                rows,
+                (
+                    "prototype_support",
+                    "parent_gt_visible_mass_supported_fraction_within_physical",
+                ),
+            ),
+            "child_gt_visible_mass_supported_fraction_within_physical": _mean(
+                rows,
+                (
+                    "prototype_support",
+                    "child_gt_visible_mass_supported_fraction_within_physical",
+                ),
+            ),
+            "parent_conditional_recall_at_32_within_prototype_support": _mean(
+                rows,
+                (
+                    "prototype_support",
+                    "parent_conditional_recall_within_prototype_support",
+                    "recall_at_32",
+                ),
+            ),
+            "child_conditional_recall_at_64_within_prototype_support": _mean(
+                rows,
+                (
+                    "prototype_support",
+                    "child_conditional_recall_within_prototype_support",
+                    "recall_at_64",
+                ),
+            ),
+            "raw_empty_token_fraction": _mean(
+                rows,
+                (
+                    "prototype_support",
+                    "token_support_posterior_diagnostic",
+                    "raw_empty_token_fraction",
+                ),
+            ),
+            "parent_zero_support_given_raw_nonempty_fraction": _mean(
+                rows,
+                (
+                    "prototype_support",
+                    "token_support_posterior_diagnostic",
+                    "parent_zero_support_given_raw_nonempty_fraction",
+                ),
+            ),
+            "child_zero_support_given_raw_nonempty_fraction": _mean(
+                rows,
+                (
+                    "prototype_support",
+                    "token_support_posterior_diagnostic",
+                    "child_zero_support_given_raw_nonempty_fraction",
+                ),
+            ),
+            "predicted_parent_prototype_supported_probability_mass_mean_per_token": _mean(
+                rows,
+                (
+                    "prototype_support",
+                    "token_support_posterior_diagnostic",
+                    "predicted_parent_prototype_supported_probability_mass_mean_per_token",
+                ),
+            ),
+            "predicted_child_prototype_supported_probability_mass_mean_per_token": _mean(
+                rows,
+                (
+                    "prototype_support",
+                    "token_support_posterior_diagnostic",
+                    "predicted_child_prototype_supported_probability_mass_mean_per_token",
+                ),
+            ),
+            "predicted_parent_zero_prototype_supported_mass_token_fraction": _mean(
+                rows,
+                (
+                    "prototype_support",
+                    "token_support_posterior_diagnostic",
+                    "predicted_parent_zero_prototype_supported_mass_token_fraction",
+                ),
+            ),
+            "predicted_child_zero_prototype_supported_mass_token_fraction": _mean(
+                rows,
+                (
+                    "prototype_support",
+                    "token_support_posterior_diagnostic",
+                    "predicted_child_zero_prototype_supported_mass_token_fraction",
+                ),
+            ),
+        }
     aggregate["total_physical_surface_area_m2"] = total_physical_surface_area_m2
     for level in ("parent", "child"):
         predicted_area = float(
@@ -531,6 +814,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         ],
         "contributors": str(Path(args.contributors).resolve()),
         "physical_map_sha256": physical.content_sha256,
+        "mapper_prototype_support_binding": mapper_bank_binding,
         "aggregate": aggregate,
         "sequence": _sequence_summary(rows),
         "failure_category_counts": dict(sorted(failure_counts.items())),

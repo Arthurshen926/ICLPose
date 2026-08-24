@@ -18,6 +18,7 @@ from feature_extract.vfm.localization_goal_maplet.visibility_pose_atlas import (
     diverse_pose_rows,
     hierarchical_location_orientation_pose_rows,
     nested_wide_near_pose_basins,
+    progressive_hierarchical_location_orientation_pose_rows,
     score_visibility_pose_atlas,
 )
 from test_goal_maplet_pure_retrieval import _physical
@@ -43,6 +44,10 @@ def _contributor(path: Path, physical, child: int, pose: np.ndarray) -> None:
         topk_ids=ids,
         topk_weights=np.ones(ids.shape, dtype=np.float16),
         pose_w2c=pose,
+        camera_model_id=np.asarray(0, dtype=np.int32),
+        camera_width=np.asarray(8, dtype=np.int32),
+        camera_height=np.asarray(8, dtype=np.int32),
+        camera_params=np.asarray([4.0, 4.0, 4.0], dtype=np.float64),
     )
 
 
@@ -93,6 +98,8 @@ def test_child_visibility_atlas_retrieves_covisible_child_pose(tmp_path):
         physical, paths, grid_rows=2, grid_cols=2,
         maximum_global_children=3, maximum_children_per_cell=3,
     )
+    assert atlas.metadata["coordinate_correct"] is True
+    assert atlas.metadata["coordinate_audit_count"] == 3
     retrieval = _retrieval(physical, 1)
     score, global_score, layout_score = score_visibility_pose_atlas(
         atlas, retrieval, layout_weight=0.5
@@ -241,6 +248,37 @@ def test_hierarchical_fallback_opens_new_location_before_extra_orientation():
     )
     assert 5 in rows
     assert 2 not in rows
+
+
+def test_progressive_hierarchy_is_exactly_prefix_stable_across_budgets():
+    poses = np.stack([
+        _pose(float(location) * 2.0, yaw)
+        for location in range(40)
+        for yaw in (0.0, 30.0)
+    ])
+    global_score = np.asarray([
+        100.0 - float(location) - 0.01 * orientation
+        for location in range(40)
+        for orientation in range(2)
+    ])
+    layout_score = np.asarray([
+        float(orientation) for _location in range(40) for orientation in range(2)
+    ])
+    outputs = [
+        progressive_hierarchical_location_orientation_pose_rows(
+            poses, global_score, layout_score,
+            maximum_modes=budget, orientations_per_location=2,
+            location_block_size=4, location_radius_m=0.5,
+            orientation_nms_degrees=10.0,
+        )
+        for budget in (7, 16, 31, 64)
+    ]
+    assert [value.size for value in outputs] == [7, 16, 31, 64]
+    for smaller, larger in zip(outputs[:-1], outputs[1:]):
+        np.testing.assert_array_equal(smaller, larger[: smaller.size])
+    # The first block opens four places before adding their alternate views;
+    # later budgets cannot rewrite that already-issued stage.
+    assert outputs[-1][:8].tolist() == [1, 3, 5, 7, 0, 2, 4, 6]
 
 
 def test_joint_layout_normalization_preserves_cell_reliability():

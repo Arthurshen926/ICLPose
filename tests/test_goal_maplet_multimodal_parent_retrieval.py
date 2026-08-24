@@ -5,7 +5,9 @@ from feature_extract.vfm.localization_goal_maplet.canonical_field import (
     CanonicalSurfaceField,
 )
 from feature_extract.vfm.localization_goal_maplet.multimodal_parent_retrieval import (
+    AnonymousChildModeReadout,
     AnonymousParentModeReadout,
+    build_anonymous_child_mode_readout,
     build_anonymous_parent_mode_readout,
     score_anonymous_parent_modes,
 )
@@ -91,4 +93,30 @@ def test_mode_builder_is_deterministic_and_parent_normalized():
     assert first.content_sha256 == second.content_sha256
     np.testing.assert_allclose(
         np.sum(first.weights, axis=1)[first.parent_coverage > 0.0], 1.0
+    )
+
+
+def test_child_mode_builder_is_deterministic_and_identity_normalized():
+    physical = _physical()
+    rows = np.arange(physical.primitive_ids.size, dtype=np.int64)
+    codes = np.stack(
+        [np.cos(rows.astype(np.float32)), np.sin(rows.astype(np.float32))], axis=1
+    )
+    field = CanonicalSurfaceField(
+        primitive_rows=rows,
+        codes=codes,
+        confidence=np.ones(rows.size, dtype=np.float32),
+        uncertainty=np.zeros(rows.size, dtype=np.float32),
+        physical_map_sha256=physical.content_sha256,
+        metadata={
+            "artifact_type": "goal_maplet_canonical_surface_field_v1",
+            "stored_downstream_embedding_count": 0,
+        },
+    )
+    first = build_anonymous_child_mode_readout(field, physical, maximum_modes=2)
+    second = build_anonymous_child_mode_readout(field, physical, maximum_modes=2)
+    assert isinstance(first, AnonymousChildModeReadout)
+    assert first.content_sha256 == second.content_sha256
+    np.testing.assert_allclose(
+        np.sum(first.weights, axis=1)[first.child_coverage > 0.0], 1.0
     )

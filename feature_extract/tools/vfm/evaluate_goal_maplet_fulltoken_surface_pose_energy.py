@@ -16,14 +16,17 @@ import numpy as np
 import torch
 
 from feature_extract.tools.vfm.train_evaluate_goal_maplet_sparse_pose_transport import (
-    _load_dataset,
     _metrics,
 )
 from feature_extract.vfm.localization.surface_maplet_mapper import load_surface_maplet_mapper
 from feature_extract.vfm.localization_goal_maplet.fulltoken_surface_pose_energy import (
     CHILD_GATED_CONTRASTIVE_SEMANTICS,
     CHILD_GATED_SEMANTICS,
+    CONDITIONAL_PHASE_CONTROL_SEMANTICS,
+    CONDITIONAL_SHIFT_PHASE_CONTROL_SEMANTICS,
     PHASE_SEMANTICS,
+    MAXMIN_PHASE_SEMANTICS,
+    SHIFT_TOLERANT_MAXMIN_PHASE_SEMANTICS,
     SHIFT_TOLERANT_PHASE_SEMANTICS,
     CONTRASTIVE_SEMANTICS,
     PARENT_GATED_SEMANTICS,
@@ -31,11 +34,21 @@ from feature_extract.vfm.localization_goal_maplet.fulltoken_surface_pose_energy 
     SEMANTICS,
     fulltoken_surface_pose_energy,
     child_gated_fulltoken_surface_pose_energy,
+    conditional_fulltoken_phase_pose_energy_control,
     conservative_fulltoken_phase_pose_energy,
     parent_gated_fulltoken_surface_pose_energy,
 )
+from feature_extract.vfm.localization_goal_maplet.differentiable_pose_transport import (
+    CATEGORICAL_TOKEN_CAPACITY_TRANSPORT_SEMANTICS,
+    QUERY_TOKEN_CAPACITY_TRANSPORT_SEMANTICS,
+    categorical_token_capacity_pose_transport,
+    query_token_capacity_pose_transport,
+)
 from feature_extract.vfm.localization_goal_maplet.lineage import file_sha256
 from feature_extract.vfm.localization_goal_maplet.physical_map import GoalMapletPhysicalMap
+from feature_extract.vfm.localization_goal_maplet.pose_candidate_dataset import (
+    load_pose_candidate_dataset,
+)
 from feature_extract.vfm.localization_goal_maplet.pure_retrieval import PureRadioPhysicalRetrieval
 
 
@@ -88,6 +101,10 @@ def main() -> None:
         choices=(
             "appearance_only", "appearance_parent_product", "appearance_child_product",
             "conservative_phase", "conservative_phase_shift",
+            "conservative_phase_maxmin", "conservative_phase_shift_maxmin",
+            "query_token_capacity",
+            "parent_layout_capacity",
+            "conditional_phase_control", "conditional_phase_shift_control",
         ),
         default="appearance_only",
     )
@@ -100,7 +117,7 @@ def main() -> None:
     output = Path(args.output)
     if output.exists() and not bool(args.force):
         raise FileExistsError("refusing to overwrite full-token pose evaluation")
-    arrays, metadata = _load_dataset(Path(args.dataset))
+    arrays, metadata = load_pose_candidate_dataset(Path(args.dataset))
     contract = json.loads(Path(args.field_feature_contract).read_text())
     mapper_sha = file_sha256(Path(args.surface_mapper))
     if (
@@ -114,13 +131,16 @@ def main() -> None:
     mapper, _ = load_surface_maplet_mapper(Path(args.surface_mapper), device=str(device))
     mapper.model.to(device).eval()
     physical = None
-    if str(args.score_semantics) == "appearance_parent_product":
+    if str(args.score_semantics) in (
+        "appearance_parent_product", "parent_layout_capacity"
+    ):
         if args.physical_map is None:
-            raise ValueError("appearance_parent_product requires --physical_map")
+            raise ValueError("parent-aware scoring requires --physical_map")
         physical = GoalMapletPhysicalMap.load_npz(Path(args.physical_map))
         if physical.content_sha256 != metadata.get("physical_map_sha256"):
             raise ValueError("physical map lineage differs from the dataset")
     score_rows = []
+    phase_component_rows = []
     with torch.no_grad():
         for query_index in range(int(arrays["image_ids"].size)):
             raw = torch.as_tensor(
@@ -149,9 +169,11 @@ def main() -> None:
                 device=device, dtype=torch.float32,
             )
             candidate_scores = []
+            candidate_components = []
             for candidate in range(int(arrays["candidate_valid"].shape[1])):
                 if not bool(arrays["candidate_valid"][query_index, candidate]):
                     candidate_scores.append(-1.0)
+                    candidate_components.append(None)
                     continue
                 target_descriptor = torch.as_tensor(
                     arrays["target_canonical_features"][query_index, candidate],
@@ -197,17 +219,92 @@ def main() -> None:
                         ),
                         minimum_cosine_evidence=float(args.minimum_cosine_evidence),
                     )
-                else:
+                elif str(args.score_semantics) == "query_token_capacity":
+                    result = query_token_capacity_pose_transport(
+                        query,
+                        query_child_probability.sum(dim=1),
+                        reliability,
+                        target_descriptor,
+                        target_mass,
+                        target_valid,
+                        height=36,
+                        width=64,
+                        local_radius_tokens=int(args.local_radius_tokens),
+                        minimum_cosine_evidence=float(args.minimum_cosine_evidence),
+                    )
+                elif str(args.score_semantics) == "parent_layout_capacity":
+                    child_rows = np.asarray(
+                        arrays["target_child_rows"][query_index, candidate]
+                    )
+                    safe_child = np.maximum(child_rows, 0)
+                    target_parent_ids = physical.maplet_ids[
+                        physical.child_parent_rows[safe_child]
+                    ]
+                    target_parent_ids[child_rows < 0] = -1
+                    result = categorical_token_capacity_pose_transport(
+                        query_parent_ids,
+                        query_parent_probability,
+                        reliability,
+                        torch.as_tensor(target_parent_ids, device=device),
+                        target_mass,
+                        target_valid,
+                        height=36,
+                        width=64,
+                        local_radius_tokens=int(args.local_radius_tokens),
+                    )
+                elif str(args.score_semantics) in (
+                    "conservative_phase", "conservative_phase_shift",
+                    "conservative_phase_maxmin", "conservative_phase_shift_maxmin",
+                ):
                     result = conservative_fulltoken_phase_pose_energy(
                         query, target_descriptor, target_mass, target_valid,
                         height=36, width=64,
                         maximum_shift_tokens=(
                             int(args.local_radius_tokens)
-                            if str(args.score_semantics) == "conservative_phase_shift" else 0
+                            if str(args.score_semantics) in (
+                                "conservative_phase_shift",
+                                "conservative_phase_shift_maxmin",
+                            ) else 0
+                        ),
+                        slot_pair_reduction=(
+                            "maximum_bottleneck"
+                            if str(args.score_semantics) in (
+                                "conservative_phase_maxmin",
+                                "conservative_phase_shift_maxmin",
+                            ) else "additive_product"
+                        ),
+                    )
+                else:
+                    result = conditional_fulltoken_phase_pose_energy_control(
+                        query, target_descriptor, target_mass, target_valid,
+                        height=36, width=64,
+                        maximum_shift_tokens=(
+                            int(args.local_radius_tokens)
+                            if str(args.score_semantics) == "conditional_phase_shift_control"
+                            else 0
                         ),
                     )
                 candidate_scores.append(float(result.score.cpu()))
+                content = getattr(result, "conditional_content_score", None)
+                information = getattr(result, "mass_observability", None)
+                candidate_components.append(
+                    None
+                    if content is None or information is None
+                    else {
+                        "conditional_content_score": float(content.cpu()),
+                        "mass_observability": float(information.cpu()),
+                        "horizontal_edge_observability": float(
+                            result.horizontal_observability.cpu()
+                        ),
+                        "vertical_edge_observability": float(
+                            result.vertical_observability.cpu()
+                        ),
+                        "selected_shift_y": int(result.selected_shift_y),
+                        "selected_shift_x": int(result.selected_shift_x),
+                    }
+                )
             score_rows.append(candidate_scores)
+            phase_component_rows.append(candidate_components)
     # Pose labels are consumed only after every score is frozen above.
     scores = np.asarray(score_rows, dtype=np.float32)
     query_count = int(scores.shape[0])
@@ -230,19 +327,46 @@ def main() -> None:
                 if str(args.score_semantics) == "appearance_child_product"
                 else (
                     (
-                        SHIFT_TOLERANT_PHASE_SEMANTICS
-                        if str(args.score_semantics) == "conservative_phase_shift"
-                        else PHASE_SEMANTICS
+                        (
+                            SHIFT_TOLERANT_MAXMIN_PHASE_SEMANTICS
+                            if str(args.score_semantics) == "conservative_phase_shift_maxmin"
+                            else MAXMIN_PHASE_SEMANTICS
+                        )
+                        if str(args.score_semantics) in (
+                            "conservative_phase_maxmin", "conservative_phase_shift_maxmin"
+                        )
+                        else (
+                            SHIFT_TOLERANT_PHASE_SEMANTICS
+                            if str(args.score_semantics) == "conservative_phase_shift"
+                            else PHASE_SEMANTICS
+                        )
                     )
                     if str(args.score_semantics) in (
-                        "conservative_phase", "conservative_phase_shift"
+                        "conservative_phase", "conservative_phase_shift",
+                        "conservative_phase_maxmin", "conservative_phase_shift_maxmin",
                     )
                     else (
-                        CONTRASTIVE_SEMANTICS
-                        if float(args.minimum_cosine_evidence) > -1.0
-                        else SEMANTICS
+                        (
+                            CONDITIONAL_SHIFT_PHASE_CONTROL_SEMANTICS
+                            if str(args.score_semantics) == "conditional_phase_shift_control"
+                            else CONDITIONAL_PHASE_CONTROL_SEMANTICS
+                        )
+                        if str(args.score_semantics) in (
+                            "conditional_phase_control", "conditional_phase_shift_control"
+                        )
+                        else (
+                            CONTRASTIVE_SEMANTICS
+                            if float(args.minimum_cosine_evidence) > -1.0
+                            else SEMANTICS
+                        )
                     )
                 )
+            ) if str(args.score_semantics) not in (
+                "query_token_capacity", "parent_layout_capacity"
+            ) else (
+                QUERY_TOKEN_CAPACITY_TRANSPORT_SEMANTICS
+                if str(args.score_semantics) == "query_token_capacity"
+                else CATEGORICAL_TOKEN_CAPACITY_TRANSPORT_SEMANTICS
             )
         ),
         "score_semantics": str(args.score_semantics),
@@ -258,6 +382,12 @@ def main() -> None:
         "local_radius_tokens": int(args.local_radius_tokens),
         "all_candidate_scores_built_before_pose_error_metrics": True,
         "candidate_score": scores.tolist(),
+        "candidate_phase_evidence_components": phase_component_rows,
+        "conditional_fit_and_information_are_separate": bool(
+            str(args.score_semantics) in (
+                "conditional_phase_control", "conditional_phase_shift_control"
+            )
+        ),
         "all_metrics": _metrics(
             scores, arrays["translation_m"], arrays["rotation_deg"],
             arrays["candidate_valid"], arrays["image_ids"],

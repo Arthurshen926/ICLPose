@@ -28,6 +28,10 @@ from .lineage import arrays_sha256, canonical_json_sha256
 from .physical_map import GoalMapletPhysicalMap
 from .pose_proposal import _rotation_distance_degrees
 from .pure_retrieval import PureRadioPhysicalRetrieval, all_radio_token_coordinates
+from .retrieval_surface_metrics import (
+    COORDINATE_CONTRACT,
+    load_contributors_in_radio_coordinates,
+)
 
 
 SCHEMA = "goal_maplet_child_visibility_pose_atlas_v3"
@@ -437,11 +441,15 @@ def build_child_visibility_pose_atlas(
     layout_weights_out: list[np.ndarray] = []
     global_offsets = [0]
     layout_offsets = [0]
+    coordinate_audits: list[dict[str, object]] = []
     for path in paths:
-        with np.load(path, allow_pickle=False) as data:
-            ids = np.asarray(data["topk_ids"], dtype=np.int64)
-            weights = np.asarray(data["topk_weights"], dtype=np.float64)
-            pose = np.asarray(data["pose_w2c"], dtype=np.float64)
+        labels, coordinate_audit = load_contributors_in_radio_coordinates(path)
+        if coordinate_audit.get("coordinate_contract") != COORDINATE_CONTRACT:
+            raise ValueError("visibility atlas contributor coordinate contract differs")
+        ids = np.asarray(labels.topk_primitive_ids, dtype=np.int64)
+        weights = np.asarray(labels.topk_weights, dtype=np.float64)
+        pose = np.asarray(labels.pose_w2c, dtype=np.float64)
+        coordinate_audits.append(dict(coordinate_audit))
         if ids.ndim != 3 or weights.shape != ids.shape or np.any(~np.isfinite(weights)):
             raise ValueError(f"invalid contributor cache {path}")
         height, width, _ = ids.shape
@@ -507,6 +515,32 @@ def build_child_visibility_pose_atlas(
             "grid_semantics": "fixed_blocks_joint_cell_child_probability",
             "source_contributor_count": len(paths),
             **dict(metadata or {}),
+            "coordinate_correct": True,
+            "coordinate_contract": COORDINATE_CONTRACT,
+            "coordinate_transform_applied_before_visibility_aggregation": True,
+            "coordinate_audit_count": len(coordinate_audits),
+            "coordinate_audits_sha256": canonical_json_sha256(coordinate_audits),
+            "coordinate_audit_summary": {
+                "camera_model_ids": sorted({
+                    int(audit["camera_model_id"]) for audit in coordinate_audits
+                }),
+                "minimum_valid_raw_sample_fraction": float(min(
+                    float(audit["valid_raw_sample_fraction"])
+                    for audit in coordinate_audits
+                )),
+                "maximum_inverse_roundtrip_residual_contributor_px": float(max(
+                    float(audit["maximum_inverse_roundtrip_residual_contributor_px"])
+                    for audit in coordinate_audits
+                )),
+                "mean_pinhole_to_raw_displacement_contributor_px": float(np.mean([
+                    float(audit["mean_pinhole_to_raw_displacement_contributor_px"])
+                    for audit in coordinate_audits
+                ])),
+                "maximum_pinhole_to_raw_displacement_contributor_px": float(max(
+                    float(audit["maximum_pinhole_to_raw_displacement_contributor_px"])
+                    for audit in coordinate_audits
+                )),
+            },
         },
     )
 
@@ -865,4 +899,87 @@ def hierarchical_location_orientation_pose_rows(
             retained.append(row)
             if len(retained) >= int(maximum_modes):
                 return np.asarray(retained, dtype=np.int64)
+    return np.asarray(retained, dtype=np.int64)
+
+
+def progressive_hierarchical_location_orientation_pose_rows(
+    poses_w2c: np.ndarray,
+    global_scores: np.ndarray,
+    layout_scores: np.ndarray,
+    *,
+    maximum_modes: int = 64,
+    orientations_per_location: int = 2,
+    location_block_size: int = 8,
+    location_radius_m: float = 2.0,
+    orientation_nms_degrees: float = 10.0,
+    translation_nms_m: float = 0.5,
+    rotation_nms_deg: float = 5.0,
+) -> np.ndarray:
+    """Return a budget-prefix-stable hierarchical pose ordering.
+
+    ``hierarchical_location_orientation_pose_rows`` deliberately derives its
+    number of location seeds from ``maximum_modes``.  That is appropriate for
+    a one-shot fixed budget, but it means that asking for 64 candidates can
+    replace the first 16 candidates produced by a 16-candidate call.  A staged
+    coarse/medium/exact backend then cannot say which basins survived: changing
+    only a later-stage budget silently changes the earlier candidate set.
+
+    This variant freezes a small location block and grows the hierarchy in
+    deterministic doubling stages.  Each stage reuses the established
+    selector, appending only previously unseen, physically non-conflicting
+    poses.  Consequently every smaller requested budget is an exact prefix of
+    every larger requested budget under the same inputs and configuration.
+    The existing selector and artifacts remain unchanged; this is an explicit
+    opt-in contract for staged retrieval.
+    """
+
+    pose = _validate_pose_batch(poses_w2c)
+    if int(maximum_modes) <= 0 or int(location_block_size) <= 0:
+        raise ValueError("progressive hierarchical budgets must be positive")
+    if int(orientations_per_location) <= 0:
+        raise ValueError("orientations_per_location must be positive")
+    target = min(int(maximum_modes), int(pose.shape[0]))
+    base_budget = max(
+        1, int(location_block_size) * int(orientations_per_location),
+    )
+    retained: list[int] = []
+    retained_set: set[int] = set()
+    centers = -np.swapaxes(pose[:, :3, :3], 1, 2) @ pose[:, :3, 3, None]
+    centers = centers[..., 0]
+
+    def conflicts(row: int) -> bool:
+        return any(
+            np.linalg.norm(centers[row] - centers[prior])
+            <= float(translation_nms_m)
+            and _rotation_distance_degrees(pose[row], pose[prior])
+            <= float(rotation_nms_deg)
+            for prior in retained
+        )
+
+    stage_budget = min(base_budget, int(pose.shape[0]))
+    while len(retained) < target:
+        stage_rows = hierarchical_location_orientation_pose_rows(
+            pose, global_scores, layout_scores,
+            maximum_modes=stage_budget,
+            orientations_per_location=int(orientations_per_location),
+            location_radius_m=float(location_radius_m),
+            orientation_nms_degrees=float(orientation_nms_degrees),
+            translation_nms_m=float(translation_nms_m),
+            rotation_nms_deg=float(rotation_nms_deg),
+        )
+        before = len(retained)
+        for value in stage_rows.tolist():
+            row = int(value)
+            if row in retained_set or conflicts(row):
+                continue
+            retained.append(row)
+            retained_set.add(row)
+            if len(retained) >= target:
+                break
+        if len(retained) >= target or stage_budget >= int(pose.shape[0]):
+            break
+        next_budget = min(int(pose.shape[0]), max(stage_budget + 1, stage_budget * 2))
+        if next_budget == stage_budget and len(retained) == before:
+            break
+        stage_budget = next_budget
     return np.asarray(retained, dtype=np.int64)

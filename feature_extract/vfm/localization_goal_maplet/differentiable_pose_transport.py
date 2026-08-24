@@ -22,6 +22,15 @@ from .trainable_pose_transport import MinimalPoseTransportReadout, QueryPoseHead
 
 
 TORCH_TRANSPORT_SEMANTICS = "differentiable_sparse_substochastic_pose_transport_v1"
+FIXED_KERNEL_CAPACITY_TRANSPORT_SEMANTICS = (
+    "differentiable_fixed_local_kernel_source_target_capacity_pose_transport_v2"
+)
+QUERY_TOKEN_CAPACITY_TRANSPORT_SEMANTICS = (
+    "query_token_to_candidate_slot_fixed_kernel_capacity_pose_transport_v1"
+)
+CATEGORICAL_TOKEN_CAPACITY_TRANSPORT_SEMANTICS = (
+    "categorical_token_layout_fixed_kernel_source_target_capacity_transport_v1"
+)
 
 
 @dataclass(frozen=True)
@@ -43,7 +52,291 @@ class DifferentiablePoseTransportResult:
     source_probability: torch.Tensor
     edge_probability: torch.Tensor
     edge_source_index: torch.Tensor
+    matched_target_probability: torch.Tensor | None = None
+    target_probability: torch.Tensor | None = None
+    transport_semantics: str = TORCH_TRANSPORT_SEMANTICS
     production_eligible: bool = False
+
+
+@dataclass(frozen=True)
+class QueryTokenCapacityPoseEnergy:
+    combined_score: torch.Tensor
+    token_score: torch.Tensor
+    matched_source_probability: torch.Tensor
+    unmatched_source_probability: torch.Tensor
+    matched_target_probability: torch.Tensor
+    target_probability: torch.Tensor
+    local_radius_tokens: int
+    minimum_cosine_evidence: float
+    transport_semantics: str = QUERY_TOKEN_CAPACITY_TRANSPORT_SEMANTICS
+    production_eligible: bool = False
+
+    @property
+    def score(self) -> torch.Tensor:
+        return self.combined_score
+
+
+def categorical_token_capacity_pose_transport(
+    source_category_ids: torch.Tensor,
+    source_category_probability: torch.Tensor,
+    query_reliability: torch.Tensor,
+    target_category_ids: torch.Tensor,
+    target_category_probability: torch.Tensor,
+    target_valid: torch.Tensor,
+    *,
+    height: int = 36,
+    width: int = 64,
+    local_radius_tokens: int = 1,
+) -> QueryTokenCapacityPoseEnergy:
+    """Transport parent/support probability by local categorical layout.
+
+    This is the coarse/medium identity channel.  It deliberately uses stable
+    physical parent/support categories instead of exact children or visual
+    appearance.  Duplicate target slots with the same category are harmless:
+    their masses remain separate capacities and their per-token sum is still
+    bounded by one.
+    """
+
+    source_ids = torch.as_tensor(source_category_ids, dtype=torch.long)
+    source = torch.as_tensor(source_category_probability)
+    if source.ndim != 2 or source_ids.shape != source.shape or not torch.is_floating_point(source):
+        raise ValueError("source categorical posterior must be aligned floating matrices")
+    device, dtype = source.device, source.dtype
+    source_ids = source_ids.to(device=device)
+    token_count, source_slots = int(source.shape[0]), int(source.shape[1])
+    target_ids = torch.as_tensor(target_category_ids, device=device, dtype=torch.long)
+    target = torch.as_tensor(target_category_probability, device=device, dtype=dtype)
+    valid = torch.as_tensor(target_valid, device=device, dtype=torch.bool)
+    reliability = torch.as_tensor(query_reliability, device=device, dtype=dtype).reshape(-1)
+    if (
+        token_count != int(height) * int(width)
+        or target.ndim != 2
+        or target_ids.shape != target.shape
+        or valid.shape != target.shape
+        or target.shape[0] != token_count
+        or reliability.shape != (token_count,)
+    ):
+        raise ValueError("categorical token transport shapes differ")
+    if any(not torch.isfinite(value).all() for value in (source, target, reliability)):
+        raise ValueError("categorical token transport inputs must be finite")
+    tolerance = 2.0e-5
+    if (
+        torch.any(source < 0.0)
+        or torch.any(target < 0.0)
+        or torch.any(reliability < 0.0)
+        or torch.any(source.sum(dim=1) > 1.0 + tolerance)
+        or torch.any(target.sum(dim=1) > 1.0 + tolerance)
+    ):
+        raise ValueError("categorical token transport masses are invalid")
+    radius = int(local_radius_tokens)
+    if radius < 0 or radius > 4:
+        raise ValueError("local_radius_tokens must lie in [0,4]")
+    target_slots = int(target.shape[1])
+    source_id_grid = source_ids.reshape(int(height), int(width), source_slots)
+    source_grid = source.reshape(int(height), int(width), source_slots)
+    target_id_grid = target_ids.reshape(int(height), int(width), target_slots)
+    target_grid = target.reshape(int(height), int(width), target_slots)
+    target_valid_grid = valid.reshape(int(height), int(width), target_slots)
+    matched_source_grid = torch.zeros_like(source_grid)
+    matched_target_grid = torch.zeros_like(target_grid)
+    spatial_kernel = 1.0 / float((2 * radius + 1) ** 2)
+    for shift_y in range(-radius, radius + 1):
+        for shift_x in range(-radius, radius + 1):
+            sy0, sy1 = max(0, -shift_y), min(int(height), int(height) - shift_y)
+            sx0, sx1 = max(0, -shift_x), min(int(width), int(width) - shift_x)
+            if sy1 <= sy0 or sx1 <= sx0:
+                continue
+            ty0, ty1 = sy0 + shift_y, sy1 + shift_y
+            tx0, tx1 = sx0 + shift_x, sx1 + shift_x
+            source_id = source_id_grid[sy0:sy1, sx0:sx1]
+            target_id = target_id_grid[ty0:ty1, tx0:tx1]
+            active = (
+                (source_id[:, :, :, None] >= 0)
+                & (target_id[:, :, None, :] >= 0)
+                & target_valid_grid[ty0:ty1, tx0:tx1, None, :]
+                & (source_id[:, :, :, None] == target_id[:, :, None, :])
+            )
+            allocation = (
+                source_grid[sy0:sy1, sx0:sx1, :, None]
+                * target_grid[ty0:ty1, tx0:tx1, None, :]
+                * float(spatial_kernel)
+                * active
+            )
+            matched_source_grid[sy0:sy1, sx0:sx1] += allocation.sum(dim=3)
+            matched_target_grid[ty0:ty1, tx0:tx1] += allocation.sum(dim=2)
+    capacity_tolerance = 3.0e-6
+    if torch.any(matched_source_grid > source_grid + capacity_tolerance):
+        raise AssertionError("categorical transport exceeds a source capacity")
+    if torch.any(matched_target_grid > target_grid + capacity_tolerance):
+        raise AssertionError("categorical transport exceeds a target capacity")
+    unmatched = torch.clamp_min(source_grid - matched_source_grid, 0.0)
+    token_matched = matched_source_grid.sum(dim=2)
+    token_score = -1.0 + 2.0 * token_matched
+    reliability_sum = reliability.sum()
+    combined = torch.where(
+        reliability_sum > 1.0e-12,
+        torch.sum(reliability * token_score.reshape(-1))
+        / reliability_sum.clamp_min(1.0e-12),
+        torch.full((), -1.0, device=device, dtype=dtype),
+    )
+    return QueryTokenCapacityPoseEnergy(
+        combined_score=combined,
+        token_score=token_score.reshape(-1),
+        matched_source_probability=matched_source_grid.reshape(-1),
+        unmatched_source_probability=unmatched.reshape(-1),
+        matched_target_probability=matched_target_grid.reshape_as(target),
+        target_probability=target,
+        local_radius_tokens=radius,
+        minimum_cosine_evidence=-1.0,
+        transport_semantics=CATEGORICAL_TOKEN_CAPACITY_TRANSPORT_SEMANTICS,
+    )
+
+
+def query_token_capacity_pose_transport(
+    query_feature: torch.Tensor,
+    source_token_probability: torch.Tensor,
+    query_reliability: torch.Tensor,
+    target_feature: torch.Tensor,
+    target_probability: torch.Tensor,
+    target_valid: torch.Tensor,
+    *,
+    height: int = 36,
+    width: int = 64,
+    local_radius_tokens: int = 1,
+    minimum_cosine_evidence: float = -1.0,
+) -> QueryTokenCapacityPoseEnergy:
+    """Conservative candidate-conditioned token-to-slot re-attribution.
+
+    Global child retrieval is used to find a physical basin, but it is not
+    trusted as an exact pose-stage child label.  Each query token instead
+    transports its retained sub-probability directly to rendered target slots
+    in a fixed local window.  The translation-invariant kernel sums to one on
+    the infinite grid and is never renormalized at image boundaries.  Thus
+    both source rows and target columns are sub-stochastic:
+
+    ``allocation = source_mass * target_mass * K * nonnegative_similarity``.
+
+    Removing a target slot, lowering its mass, or invalidating its feature can
+    only delete allocation.  No keypoint, point correspondence, PnP solve, or
+    absolute-pose regression is introduced.
+    """
+
+    query = torch.as_tensor(query_feature)
+    if query.ndim != 2 or not torch.is_floating_point(query):
+        raise ValueError("query token feature must be a floating matrix")
+    device, dtype = query.device, query.dtype
+    token_count, channels = int(query.shape[0]), int(query.shape[1])
+    if token_count != int(height) * int(width):
+        raise ValueError("query token feature differs from the declared grid")
+    source = torch.as_tensor(
+        source_token_probability, device=device, dtype=dtype
+    ).reshape(-1)
+    reliability = torch.as_tensor(
+        query_reliability, device=device, dtype=dtype
+    ).reshape(-1)
+    target = torch.as_tensor(target_feature, device=device, dtype=dtype)
+    target_mass = torch.as_tensor(target_probability, device=device, dtype=dtype)
+    valid = torch.as_tensor(target_valid, device=device, dtype=torch.bool)
+    if (
+        source.shape != (token_count,)
+        or reliability.shape != (token_count,)
+        or target.ndim != 3
+        or target.shape[0] != token_count
+        or target.shape[2] != channels
+        or target_mass.shape != target.shape[:2]
+        or valid.shape != target_mass.shape
+    ):
+        raise ValueError("query-token capacity transport shapes differ")
+    if any(
+        not torch.isfinite(value).all()
+        for value in (query, source, reliability, target, target_mass)
+    ):
+        raise ValueError("query-token capacity transport inputs must be finite")
+    tolerance = 2.0e-5
+    if (
+        torch.any(source < 0.0)
+        or torch.any(source > 1.0 + tolerance)
+        or torch.any(reliability < 0.0)
+        or torch.any(target_mass < 0.0)
+        or torch.any(target_mass.sum(dim=1) > 1.0 + tolerance)
+    ):
+        raise ValueError("query-token capacity transport masses are invalid")
+    radius = int(local_radius_tokens)
+    if radius < 0 or radius > 4:
+        raise ValueError("local_radius_tokens must lie in [0,4]")
+    cosine_floor = float(minimum_cosine_evidence)
+    if not np.isfinite(cosine_floor) or not -1.0 <= cosine_floor < 1.0:
+        raise ValueError("minimum_cosine_evidence must lie in [-1,1)")
+
+    query_norm = torch.linalg.vector_norm(query, dim=1)
+    query_valid = query_norm >= 1.0e-8
+    query_unit = query / query_norm[:, None].clamp_min(1.0e-8)
+    target_norm = torch.linalg.vector_norm(target, dim=2)
+    target_slot_valid = valid & (target_norm >= 1.0e-8)
+    target_unit = target / target_norm[:, :, None].clamp_min(1.0e-8)
+    slots = int(target.shape[1])
+    q_grid = query_unit.reshape(int(height), int(width), channels)
+    q_valid_grid = query_valid.reshape(int(height), int(width))
+    source_grid = source.reshape(int(height), int(width))
+    target_grid = target_unit.reshape(int(height), int(width), slots, channels)
+    target_mass_grid = target_mass.reshape(int(height), int(width), slots)
+    target_valid_grid = target_slot_valid.reshape(int(height), int(width), slots)
+    matched_source_grid = torch.zeros_like(source_grid)
+    matched_target_grid = torch.zeros_like(target_mass_grid)
+    spatial_kernel = 1.0 / float((2 * radius + 1) ** 2)
+    for shift_y in range(-radius, radius + 1):
+        for shift_x in range(-radius, radius + 1):
+            sy0, sy1 = max(0, -shift_y), min(int(height), int(height) - shift_y)
+            sx0, sx1 = max(0, -shift_x), min(int(width), int(width) - shift_x)
+            if sy1 <= sy0 or sx1 <= sx0:
+                continue
+            ty0, ty1 = sy0 + shift_y, sy1 + shift_y
+            tx0, tx1 = sx0 + shift_x, sx1 + shift_x
+            q_value = q_grid[sy0:sy1, sx0:sx1]
+            target_value = target_grid[ty0:ty1, tx0:tx1]
+            cosine = torch.sum(q_value[:, :, None, :] * target_value, dim=3).clamp(
+                -1.0, 1.0
+            )
+            similarity = ((cosine - cosine_floor) / (1.0 - cosine_floor)).clamp(
+                0.0, 1.0
+            )
+            active = (
+                q_valid_grid[sy0:sy1, sx0:sx1, None]
+                & target_valid_grid[ty0:ty1, tx0:tx1]
+            )
+            allocation = (
+                source_grid[sy0:sy1, sx0:sx1, None]
+                * target_mass_grid[ty0:ty1, tx0:tx1]
+                * float(spatial_kernel)
+                * torch.where(active, similarity, torch.zeros_like(similarity))
+            )
+            matched_source_grid[sy0:sy1, sx0:sx1] += allocation.sum(dim=2)
+            matched_target_grid[ty0:ty1, tx0:tx1] += allocation
+
+    capacity_tolerance = 3.0e-6
+    if torch.any(matched_source_grid > source_grid + capacity_tolerance):
+        raise AssertionError("query-token transport exceeds a source capacity")
+    if torch.any(matched_target_grid > target_mass_grid + capacity_tolerance):
+        raise AssertionError("query-token transport exceeds a target capacity")
+    unmatched = torch.clamp_min(source_grid - matched_source_grid, 0.0)
+    token_score = -1.0 + 2.0 * matched_source_grid
+    reliability_sum = reliability.sum()
+    combined = torch.where(
+        reliability_sum > 1.0e-12,
+        torch.sum(reliability * token_score.reshape(-1))
+        / reliability_sum.clamp_min(1.0e-12),
+        torch.full((), -1.0, device=device, dtype=dtype),
+    )
+    return QueryTokenCapacityPoseEnergy(
+        combined_score=combined,
+        token_score=token_score.reshape(-1),
+        matched_source_probability=matched_source_grid.reshape(-1),
+        unmatched_source_probability=unmatched.reshape(-1),
+        matched_target_probability=matched_target_grid.reshape_as(target_mass),
+        target_probability=target_mass,
+        local_radius_tokens=radius,
+        minimum_cosine_evidence=cosine_floor,
+    )
 
 
 def _validated_hierarchy(hierarchy: PoseTransportHierarchy) -> tuple[np.ndarray, tuple[set[int], ...]]:
@@ -117,12 +410,12 @@ def build_frozen_sparse_transport_edges(
     # bounded token neighbourhood; a Python loop over all 64 retrieval slots
     # was measured to dominate the real 36x64 experiment.
     for token in range(target_rows.shape[0]):
-        active = target_rows[token][target_mass[token] >= float(minimum_target_weight)]
+        active = target_rows[token]
         active = active[active >= 0]
         if np.unique(active).size != active.size:
             raise ValueError("target contains duplicate child at one token")
     for token in range(source_rows.shape[0]):
-        active = source_rows[token][source_mass[token] >= float(minimum_source_probability)]
+        active = source_rows[token]
         active = active[active >= 0]
         if np.unique(active).size != active.size:
             raise ValueError("source contains duplicate child at one token")
@@ -244,6 +537,10 @@ def differentiable_sparse_pose_transport(
 
     if str(edges.stage) not in _STAGE:
         raise ValueError("unknown frozen edge stage")
+    if query.normal_frame != "camera":
+        raise ValueError("query normal must be expressed in camera frame")
+    if query.depth_semantics != _STAGE[str(edges.stage)]["depth"]:
+        raise ValueError("query depth semantics differ from the transport stage")
     source = torch.as_tensor(source_probability)
     target_mass = torch.as_tensor(target_weight, device=source.device, dtype=source.dtype).reshape(-1)
     if source.ndim != 2 or int(source.numel()) != int(edges.source_count):
@@ -260,8 +557,7 @@ def differentiable_sparse_pose_transport(
     query_boundary = query.boundary.reshape(-1)
     query_valid = torch.stack([
         query.pose_code_valid.reshape(-1), query.normal_valid.reshape(-1),
-        torch.ones_like(query.relative_depth, dtype=torch.bool).reshape(-1),
-        torch.ones_like(query.boundary, dtype=torch.bool).reshape(-1),
+        query.depth_valid.reshape(-1), query.boundary_valid.reshape(-1),
     ], dim=1)
     query_conf = query.confidence.permute(0, 2, 3, 1).reshape(-1, 4)
     map_code, map_code_valid = model.project_map_code(target_canonical_feature)
@@ -273,6 +569,9 @@ def differentiable_sparse_pose_transport(
     map_valid = torch.as_tensor(target_validity, device=source.device, dtype=torch.bool).reshape(-1, 4).clone()
     map_conf = torch.as_tensor(target_confidence, device=source.device, dtype=source.dtype).reshape(-1, 4)
     map_valid[:, 0] &= map_code_valid.reshape(-1)
+    map_valid[:, 1] &= torch.linalg.vector_norm(map_normal, dim=1) >= float(
+        model.config.zero_norm_threshold
+    )
     if target_mass.numel() != int(edges.target_count) or map_code.shape[0] != int(edges.target_count):
         raise ValueError("target observation differs from frozen edges")
     finite_inputs = {
@@ -373,4 +672,241 @@ def differentiable_sparse_pose_transport(
         source_probability=source_flat,
         edge_probability=edge_probability,
         edge_source_index=edge_source,
+    )
+
+
+def differentiable_fixed_kernel_capacity_pose_transport(
+    model: MinimalPoseTransportReadout,
+    query: QueryPoseHeadOutput,
+    source_child_probability: torch.Tensor,
+    query_reliability: torch.Tensor,
+    target_child_weight: torch.Tensor,
+    target_canonical_feature: torch.Tensor,
+    target_normal_camera: torch.Tensor,
+    target_double_sided: torch.Tensor,
+    target_relative_depth: torch.Tensor,
+    target_boundary: torch.Tensor,
+    target_validity: torch.Tensor,
+    target_confidence: torch.Tensor,
+    edges: FrozenSparseTransportEdges,
+    *,
+    depth_scale: float = 0.25,
+) -> DifferentiablePoseTransportResult:
+    """Score a candidate with a bounded local source--target coupling.
+
+    The legacy source-softmax transport normalizes every source over the
+    *candidate's* available edges.  Consequently, adding many mediocre edges
+    can pull mass away from the sink and a single rendered target can accept
+    mass from arbitrarily many query sources.  That is useful as a learned
+    attention mechanism, but it is not a conservative physical transport.
+
+    This v2 path instead uses a fixed translation-invariant spatial kernel
+    ``1 / (2r+1)^2``.  It is not renormalized at image boundaries, so both its
+    row and column sums are at most one.  Query child probabilities and
+    rendered child weights are themselves sub-probabilities at every token.
+    Therefore the edge allocation
+
+    ``q(source) * m(target) * K(token,target_token) * compatibility``
+
+    simultaneously obeys source and target capacities.  Compatibility is a
+    fixed-denominator nonnegative sum of typed evidence.  Removing a target,
+    invalidating a modality, or lowering any compatibility term can only
+    remove allocation; it cannot improve the reported score.  The unmatched
+    sink is the exact residual source mass.
+    """
+
+    if str(edges.stage) not in _STAGE:
+        raise ValueError("pose transport stage must be coarse, medium, or fine")
+    if query.normal_frame != "camera":
+        raise ValueError("query normal must be expressed in camera frame")
+    if query.depth_semantics != _STAGE[str(edges.stage)]["depth"]:
+        raise ValueError("query depth semantics differ from the transport stage")
+    scale = float(depth_scale)
+    if not np.isfinite(scale) or scale <= 0.0:
+        raise ValueError("depth_scale must be positive")
+
+    source = torch.as_tensor(source_child_probability)
+    if source.ndim != 2 or not torch.is_floating_point(source):
+        raise ValueError("source child probability must be a floating matrix")
+    device, dtype = source.device, source.dtype
+    reliability = torch.as_tensor(query_reliability, device=device, dtype=dtype).reshape(-1)
+    target_mass_matrix = torch.as_tensor(
+        target_child_weight, device=device, dtype=dtype
+    )
+    if target_mass_matrix.ndim != 2 or reliability.shape != (source.shape[0],):
+        raise ValueError("fixed-kernel transport mass/layout shapes differ")
+    if (
+        int(edges.source_count) != int(source.numel())
+        or int(edges.target_count) != int(target_mass_matrix.numel())
+    ):
+        raise ValueError("fixed-kernel transport observations differ from frozen edges")
+    if any(not torch.isfinite(value).all() for value in (source, target_mass_matrix, reliability)):
+        raise ValueError("fixed-kernel transport masses must be finite")
+    tolerance = 2.0e-5
+    if (
+        torch.any(source < 0.0)
+        or torch.any(target_mass_matrix < 0.0)
+        or torch.any(reliability < 0.0)
+        or torch.any(source.sum(dim=1) > 1.0 + tolerance)
+        or torch.any(target_mass_matrix.sum(dim=1) > 1.0 + tolerance)
+    ):
+        raise ValueError("fixed-kernel source/target masses must be token sub-probabilities")
+
+    target_mass = target_mass_matrix.reshape(-1)
+    target_slots = int(target_mass_matrix.shape[1])
+    query_code = query.pose_code[0].permute(1, 2, 0).reshape(-1, query.pose_code.shape[1])
+    query_normal = query.normal_camera[0].permute(1, 2, 0).reshape(-1, 3)
+    query_depth = query.relative_depth[0].reshape(-1)
+    query_boundary_value = query.boundary[0].reshape(-1)
+    query_conf = query.confidence[0].permute(1, 2, 0).reshape(-1, 4)
+    query_valid = torch.stack(
+        [
+            query.pose_code_valid[0].reshape(-1),
+            query.normal_valid[0].reshape(-1),
+            query.depth_valid[0].reshape(-1),
+            query.boundary_valid[0].reshape(-1),
+        ],
+        dim=1,
+    )
+    map_code, map_code_valid = model.project_map_code(
+        torch.as_tensor(target_canonical_feature, device=device, dtype=dtype)
+    )
+    map_code = map_code.reshape(-1, map_code.shape[-1])
+    map_normal = torch.as_tensor(
+        target_normal_camera, device=device, dtype=dtype
+    ).reshape(-1, 3)
+    map_depth = torch.as_tensor(
+        target_relative_depth, device=device, dtype=dtype
+    ).reshape(-1)
+    map_boundary = torch.as_tensor(
+        target_boundary, device=device, dtype=dtype
+    ).reshape(-1)
+    map_double = torch.as_tensor(
+        target_double_sided, device=device, dtype=torch.bool
+    ).reshape(-1)
+    map_valid = torch.as_tensor(
+        target_validity, device=device, dtype=torch.bool
+    ).reshape(-1, 4).clone()
+    map_conf = torch.as_tensor(
+        target_confidence, device=device, dtype=dtype
+    ).reshape(-1, 4)
+    map_valid[:, 0] &= map_code_valid.reshape(-1)
+    map_valid[:, 1] &= torch.linalg.vector_norm(map_normal, dim=1) >= float(
+        model.config.zero_norm_threshold
+    )
+    finite_inputs = {
+        "query_code": query_code,
+        "query_normal": query_normal,
+        "query_depth": query_depth,
+        "query_boundary": query_boundary_value,
+        "query_confidence": query_conf,
+        "map_code": map_code,
+        "map_normal": map_normal,
+        "map_depth": map_depth,
+        "map_boundary": map_boundary,
+        "map_confidence": map_conf,
+    }
+    nonfinite = [name for name, value in finite_inputs.items() if not torch.isfinite(value).all()]
+    if nonfinite:
+        raise ValueError(
+            "fixed-kernel transport inputs must be finite: " + ",".join(nonfinite)
+        )
+    if torch.any((query_conf < 0.0) | (query_conf > 1.0)) or torch.any(
+        (map_conf < 0.0) | (map_conf > 1.0)
+    ):
+        raise ValueError("fixed-kernel transport confidence must lie in [0,1]")
+
+    edge_source = torch.as_tensor(edges.source_index, dtype=torch.long, device=device)
+    edge_target = torch.as_tensor(edges.target_index, dtype=torch.long, device=device)
+    if edge_source.numel() != edge_target.numel():
+        raise ValueError("fixed-kernel edge arrays differ")
+    source_token = torch.div(edge_source, source.shape[1], rounding_mode="floor")
+    target_token = torch.div(edge_target, target_slots, rounding_mode="floor")
+    source_flat = source.reshape(-1)
+
+    feature_cos = torch.sum(query_code[source_token] * map_code[edge_target], dim=1)
+    feature_similarity = 0.5 * (1.0 + feature_cos.clamp(-1.0, 1.0))
+    normal_cos = torch.sum(
+        query_normal[source_token] * map_normal[edge_target], dim=1
+    ).clamp(-1.0, 1.0)
+    normal_similarity = torch.where(
+        map_double[edge_target], torch.abs(normal_cos), 0.5 * (1.0 + normal_cos)
+    )
+    depth_similarity = 1.0 - torch.clamp(
+        torch.abs(query_depth[source_token] - map_depth[edge_target]) / scale,
+        0.0,
+        1.0,
+    )
+    boundary_similarity = 1.0 - torch.abs(
+        query_boundary_value[source_token] - map_boundary[edge_target]
+    ).clamp(0.0, 1.0)
+    similarities = (
+        feature_similarity,
+        normal_similarity,
+        depth_similarity,
+        boundary_similarity,
+    )
+    components: list[torch.Tensor] = []
+    confidence_epsilon = torch.as_tensor(1.0e-12, device=device, dtype=dtype)
+    for modality, similarity in enumerate(similarities):
+        active = query_valid[source_token, modality] & map_valid[edge_target, modality]
+        confidence_product = (
+            query_conf[source_token, modality] * map_conf[edge_target, modality]
+        )
+        confidence = torch.sqrt(confidence_product + confidence_epsilon) - torch.sqrt(
+            confidence_epsilon
+        )
+        components.append(
+            torch.where(active, confidence * similarity.clamp(0.0, 1.0), 0.0)
+        )
+    components.append(
+        torch.as_tensor(edges.hierarchy_score, device=device, dtype=dtype).clamp(0.0, 1.0)
+    )
+    components.append(
+        torch.as_tensor(edges.layout_score, device=device, dtype=dtype).clamp(0.0, 1.0)
+    )
+    weights = model.edge_weights().to(device=device, dtype=dtype)
+    compatibility = sum(
+        weights[index] * component for index, component in enumerate(components)
+    ) / weights.sum().clamp_min(torch.finfo(dtype).tiny)
+
+    radius = int(_STAGE[str(edges.stage)]["radius"])
+    spatial_kernel = 1.0 / float((2 * radius + 1) ** 2)
+    edge_allocation = (
+        source_flat[edge_source]
+        * target_mass[edge_target]
+        * float(spatial_kernel)
+        * compatibility
+    )
+    matched_source = torch.zeros_like(source_flat)
+    matched_target = torch.zeros_like(target_mass)
+    if edge_source.numel():
+        matched_source.scatter_add_(0, edge_source, edge_allocation)
+        matched_target.scatter_add_(0, edge_target, edge_allocation)
+    source_slack = source_flat - matched_source
+    source_capacity_tolerance = 3.0e-6
+    if torch.any(source_slack < -source_capacity_tolerance):
+        raise AssertionError("fixed-kernel transport exceeds a source capacity")
+    if torch.any(matched_target > target_mass + source_capacity_tolerance):
+        raise AssertionError("fixed-kernel transport exceeds a target capacity")
+    unmatched = torch.clamp_min(source_slack, 0.0)
+    token_matched = matched_source.reshape_as(source).sum(dim=1)
+    token_score = 2.0 * token_matched - 1.0
+    reliability_sum = reliability.sum()
+    combined = torch.where(
+        reliability_sum > 1.0e-12,
+        torch.sum(reliability * token_score) / reliability_sum.clamp_min(1.0e-12),
+        torch.full((), -1.0, dtype=dtype, device=device),
+    )
+    edge_fraction = edge_allocation / source_flat[edge_source].clamp_min(1.0e-12)
+    return DifferentiablePoseTransportResult(
+        combined_score=combined,
+        matched_source_probability=matched_source,
+        unmatched_source_probability=unmatched,
+        source_probability=source_flat,
+        edge_probability=edge_fraction,
+        edge_source_index=edge_source,
+        matched_target_probability=matched_target,
+        target_probability=target_mass,
+        transport_semantics=FIXED_KERNEL_CAPACITY_TRANSPORT_SEMANTICS,
     )

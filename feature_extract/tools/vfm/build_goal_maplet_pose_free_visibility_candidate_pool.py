@@ -22,10 +22,14 @@ from feature_extract.vfm.localization_goal_maplet.lineage import (
 from feature_extract.vfm.localization_goal_maplet.pure_retrieval import (
     PureRadioPhysicalRetrieval,
 )
+from feature_extract.vfm.localization_goal_maplet.retrieval_surface_metrics import (
+    COORDINATE_CONTRACT,
+)
 from feature_extract.vfm.localization_goal_maplet.visibility_pose_atlas import (
     ChildVisibilityPoseAtlas,
     diverse_pose_rows,
     hierarchical_location_orientation_pose_rows,
+    progressive_hierarchical_location_orientation_pose_rows,
     score_visibility_pose_atlas,
 )
 
@@ -51,6 +55,7 @@ def _select_pose_rows(
     orientations_per_location: int,
     location_radius_m: float,
     orientation_nms_deg: float,
+    location_block_size: int = 8,
 ) -> np.ndarray:
     if semantics == "global_physical_nms_v1":
         return diverse_pose_rows(
@@ -63,6 +68,17 @@ def _select_pose_rows(
             atlas.poses_w2c, global_score, layout_score,
             maximum_modes=maximum_modes,
             orientations_per_location=orientations_per_location,
+            location_radius_m=location_radius_m,
+            orientation_nms_degrees=orientation_nms_deg,
+            translation_nms_m=translation_nms_m,
+            rotation_nms_deg=rotation_nms_deg,
+        )
+    if semantics == "progressive_hierarchical_location_orientation_v3":
+        return progressive_hierarchical_location_orientation_pose_rows(
+            atlas.poses_w2c, global_score, layout_score,
+            maximum_modes=maximum_modes,
+            orientations_per_location=orientations_per_location,
+            location_block_size=location_block_size,
             location_radius_m=location_radius_m,
             orientation_nms_degrees=orientation_nms_deg,
             translation_nms_m=translation_nms_m,
@@ -88,16 +104,171 @@ def _requested_ids(paths: list[Path]) -> set[str] | None:
     return result
 
 
+def _validate_route_disjoint_atlas(
+    atlas: ChildVisibilityPoseAtlas, *, query_route: str,
+) -> dict[str, object]:
+    """Fail closed unless atlas poses come only from an explicit map allowlist."""
+
+    route = str(query_route)
+    metadata = dict(atlas.metadata or {})
+    if not route:
+        raise ValueError("route-disjoint atlas validation requires a query route")
+    if metadata.get("route_allowlist_enforced") is not True:
+        raise ValueError("visibility atlas lacks an enforced route allowlist")
+    allowed = [str(value) for value in metadata.get("allowed_trajectories", ())]
+    source_routes = [
+        str(value) for value in metadata.get("source_contributor_trajectories", ())
+    ]
+    image_ids = [str(value) for value in metadata.get("source_contributor_image_ids", ())]
+    counts = metadata.get("source_contributor_trajectory_counts")
+    if (
+        not allowed
+        or len(set(allowed)) != len(allowed)
+        or sorted(source_routes) != sorted(allowed)
+        or route in allowed
+        or not isinstance(counts, dict)
+        or sum(int(value) for value in counts.values()) != atlas.view_count
+        or len(image_ids) != atlas.view_count
+        or len(set(image_ids)) != atlas.view_count
+        or int(metadata.get("source_contributor_inventory_count", -1))
+        != atlas.view_count
+        or len(str(metadata.get("source_contributor_inventory_sha256", ""))) != 64
+        or metadata.get("source_contributor_inventory_semantics")
+        != "ordered_image_id_resolved_path_file_sha256_v1"
+        or metadata.get("coordinate_correct") is not True
+        or metadata.get("coordinate_contract") != COORDINATE_CONTRACT
+        or metadata.get(
+            "coordinate_transform_applied_before_visibility_aggregation"
+        ) is not True
+        or int(metadata.get("coordinate_audit_count", -1)) != atlas.view_count
+        or len(str(metadata.get("coordinate_audits_sha256", ""))) != 64
+        or canonical_json_sha256(image_ids)
+        != metadata.get("source_contributor_image_ids_sha256")
+    ):
+        raise ValueError("visibility atlas route allowlist lineage is inconsistent")
+    derived_routes = [value.split("/", 1)[0] for value in image_ids]
+    if (
+        sorted(set(derived_routes)) != sorted(source_routes)
+        or any(value == route for value in derived_routes)
+        or {
+            value: derived_routes.count(value) for value in sorted(set(derived_routes))
+        } != {str(key): int(value) for key, value in counts.items()}
+    ):
+        raise ValueError("visibility atlas source IDs violate route disjointness")
+    return {
+        "route_allowlist_enforced": True,
+        "query_route_excluded_from_atlas": True,
+        "allowed_trajectories": sorted(allowed),
+        "source_contributor_trajectory_counts": {
+            str(key): int(value) for key, value in sorted(counts.items())
+        },
+        "source_contributor_image_ids_sha256": str(
+            metadata["source_contributor_image_ids_sha256"]
+        ),
+        "source_contributor_inventory_sha256": str(
+            metadata["source_contributor_inventory_sha256"]
+        ),
+        "coordinate_correct": True,
+        "coordinate_contract": COORDINATE_CONTRACT,
+        "coordinate_audits_sha256": str(metadata["coordinate_audits_sha256"]),
+    }
+
+
+def _validate_promotion_eligible_retrieval_run(
+    run: dict[str, object],
+    *,
+    query_route: str,
+    atlas: ChildVisibilityPoseAtlas,
+) -> dict[str, object]:
+    """Fail closed on the strict fit/val/calibration/test route split."""
+
+    route = str(query_route)
+    split = run.get("query_split_audit")
+    atlas_routes = {
+        str(value) for value in (atlas.metadata or {}).get(
+            "allowed_trajectories", (),
+        )
+    }
+    if (
+        not route or not isinstance(split, dict)
+        or run.get("promotion_eligible") is not True
+        or run.get("control_only") is not False
+        or list(run.get("promotion_blockers", ()))
+        or split.get("disjoint") is not True
+        or list(split.get("blockers", ()))
+    ):
+        raise ValueError("retrieval run is not strict-promotion eligible")
+    query_routes = {str(value) for value in split.get("query_trajectory_ids", ())}
+    calibration_routes = {
+        str(value) for value in split.get(
+            "validity_calibration_fit_trajectory_ids", (),
+        )
+    }
+    canonical_routes = {
+        str(value) for value in split.get("canonical_mapping_trajectory_ids", ())
+    }
+    mapper_routes = {
+        str(value) for value in split.get("mapper_training_trajectory_ids", ())
+    } | {
+        str(value) for value in split.get("mapper_validation_trajectory_ids", ())
+    }
+    excluded_routes = {
+        str(value) for value in split.get("canonical_excluded_trajectory_ids", ())
+    }
+    if (
+        query_routes != {route}
+        or calibration_routes != {"seq10"}
+        or canonical_routes != atlas_routes
+        or mapper_routes != atlas_routes
+        or not {"seq10", "seq12", "seq14"}.issubset(excluded_routes)
+        or route in atlas_routes or route in calibration_routes
+        or calibration_routes & atlas_routes
+    ):
+        raise ValueError("retrieval run route split differs from the strict atlas contract")
+    hashes = {
+        key: str(run.get(key, ""))
+        for key in (
+            "validity_calibration_sha256", "canonical_field_sha256",
+            "field_feature_contract_sha256", "physical_map_sha256",
+        )
+    }
+    if any(len(value) != 64 for value in hashes.values()):
+        raise ValueError("retrieval run strict lineage hashes are absent")
+    return {
+        "promotion_eligible": True,
+        "control_only": False,
+        "promotion_blockers": [],
+        "query_route": route,
+        "query_split_disjoint": True,
+        "atlas_routes": sorted(atlas_routes),
+        "validity_calibration_fit_trajectories": ["seq10"],
+        "canonical_excluded_trajectories": sorted(excluded_routes),
+        **hashes,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--atlas", required=True)
     parser.add_argument("--retrieval_run", action="append", required=True)
     parser.add_argument("--query_inventory", action="append", default=[])
     parser.add_argument("--query_route")
+    parser.add_argument(
+        "--require_route_disjoint_atlas", action="store_true",
+        help="require an explicit atlas map-route allowlist excluding query_route",
+    )
+    parser.add_argument(
+        "--require_promotion_eligible_retrieval", action="store_true",
+        help="require the strict seq10-calibration/query-route-disjoint run audit",
+    )
     parser.add_argument("--output_json", required=True)
     parser.add_argument(
         "--candidate_semantics",
-        choices=("global_physical_nms_v1", "hierarchical_location_marginal_orientation_v2"),
+        choices=(
+            "global_physical_nms_v1",
+            "hierarchical_location_marginal_orientation_v2",
+            "progressive_hierarchical_location_orientation_v3",
+        ),
         default="hierarchical_location_marginal_orientation_v2",
     )
     parser.add_argument("--maximum_modes", type=int, default=8)
@@ -108,6 +279,13 @@ def main() -> None:
     parser.add_argument("--orientations_per_location", type=int, default=2)
     parser.add_argument("--location_radius_m", type=float, default=2.0)
     parser.add_argument("--orientation_nms_deg", type=float, default=10.0)
+    parser.add_argument(
+        "--location_block_size", type=int, default=8,
+        help=(
+            "fixed number of new location seeds per progressive v3 stage; "
+            "ignored by legacy candidate semantics"
+        ),
+    )
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
     output = Path(args.output_json)
@@ -118,10 +296,16 @@ def main() -> None:
 
     atlas_path = Path(args.atlas)
     atlas = ChildVisibilityPoseAtlas.load_npz(atlas_path)
+    route_audit = None
+    if bool(args.require_route_disjoint_atlas):
+        route_audit = _validate_route_disjoint_atlas(
+            atlas, query_route=str(args.query_route or ""),
+        )
     matrices = atlas.sparse_matrices()
     requested = _requested_ids([Path(value) for value in args.query_inventory])
     source_rows: dict[str, tuple[Path, dict[str, object], dict[str, object]]] = {}
     run_bindings: list[dict[str, object]] = []
+    strict_retrieval_audits: list[dict[str, object]] = []
     for value in args.retrieval_run:
         run_path = Path(value)
         run = json.loads(run_path.read_text())
@@ -132,6 +316,12 @@ def main() -> None:
                 raise ValueError(f"pure retrieval dependency flag is not false: {flag}")
         if run.get("physical_map_sha256") != atlas.physical_map_sha256:
             raise ValueError("retrieval and visibility atlas physical maps differ")
+        if bool(args.require_promotion_eligible_retrieval):
+            strict_retrieval_audits.append(
+                _validate_promotion_eligible_retrieval_run(
+                    run, query_route=str(args.query_route or ""), atlas=atlas,
+                )
+            )
         rows = run.get("rows")
         if not isinstance(rows, list):
             raise ValueError("pure retrieval run lacks rows")
@@ -170,6 +360,7 @@ def main() -> None:
             orientations_per_location=int(args.orientations_per_location),
             location_radius_m=float(args.location_radius_m),
             orientation_nms_deg=float(args.orientation_nms_deg),
+            location_block_size=int(args.location_block_size),
         )
         details = []
         for rank, row_index in enumerate(np.asarray(selected, dtype=np.int64).tolist(), start=1):
@@ -204,6 +395,11 @@ def main() -> None:
         "atlas": str(atlas_path.resolve()),
         "atlas_file_sha256": file_sha256(atlas_path),
         "atlas_content_sha256": atlas.content_sha256,
+        "route_disjoint_atlas_audit": route_audit,
+        "strict_retrieval_promotion_required": bool(
+            args.require_promotion_eligible_retrieval
+        ),
+        "strict_retrieval_promotion_audits": strict_retrieval_audits,
         "retrieval_runs": run_bindings,
         "candidate_semantics": str(args.candidate_semantics),
         "maximum_modes": int(args.maximum_modes),
@@ -222,6 +418,9 @@ def main() -> None:
         "uses_point_correspondences": False,
         "rows": rows_out,
     }
+    if str(args.candidate_semantics) == "progressive_hierarchical_location_orientation_v3":
+        report["location_block_size"] = int(args.location_block_size)
+        report["candidate_prefix_stable_across_budgets"] = True
     report["content_sha256"] = canonical_json_sha256(report)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")

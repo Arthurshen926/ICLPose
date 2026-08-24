@@ -566,6 +566,8 @@ def _reduce_soft_child_token_hits(
     width: int,
     height: int,
     normalized_codes: np.ndarray,
+    normalized_code_override_rows: np.ndarray | None = None,
+    normalized_code_override_values: np.ndarray | None = None,
     selected_child_rows: np.ndarray | None,
     top_l: int,
     minimum_feature_alpha: float,
@@ -579,6 +581,27 @@ def _reduce_soft_child_token_hits(
     pixel_ids = np.asarray(token_pixel_ids, dtype=np.int64).reshape(-1)
     scene_primitive_rows = np.asarray(primitive_rows, dtype=np.int64).reshape(-1)
     contribution = np.asarray(contribution, dtype=np.float32).reshape(-1)
+    override_rows = np.asarray(
+        [] if normalized_code_override_rows is None else normalized_code_override_rows,
+        dtype=np.int64,
+    ).reshape(-1)
+    override_values = np.asarray(
+        np.zeros((0, field.feature_dim), dtype=np.float32)
+        if normalized_code_override_values is None
+        else normalized_code_override_values,
+        dtype=np.float32,
+    )
+    if (
+        override_values.shape != (override_rows.size, field.feature_dim)
+        or np.unique(override_rows).size != override_rows.size
+        or np.any((override_rows < 0) | (override_rows >= field.primitive_rows.size))
+        or np.any(~np.isfinite(override_values))
+    ):
+        raise ValueError("invalid sparse normalized-code overrides")
+    if override_rows.size:
+        override_order = np.argsort(override_rows, kind="stable")
+        override_rows = override_rows[override_order]
+        override_values = override_values[override_order]
     if pixel_ids.shape != scene_primitive_rows.shape or pixel_ids.shape != contribution.shape:
         raise ValueError("soft child token hit arrays differ")
     if np.any((scene_primitive_rows < 0) | (scene_primitive_rows >= physical.primitive_ids.size)):
@@ -691,9 +714,23 @@ def _reduce_soft_child_token_hits(
                 value = contribution[feature_contribution].astype(np.float32)
                 unique_slot, alpha_sum = _grouped_sum_sorted(slot, value)
                 if accumulate_payload:
+                    code_rows = field_rows[feature_contribution]
+                    feature_codes = normalized_codes[code_rows]
+                    if override_rows.size:
+                        override_position = np.searchsorted(override_rows, code_rows)
+                        overridden = override_position < override_rows.size
+                        overridden[overridden] &= (
+                            override_rows[override_position[overridden]]
+                            == code_rows[overridden]
+                        )
+                        if np.any(overridden):
+                            feature_codes = feature_codes.copy()
+                            feature_codes[overridden] = override_values[
+                                override_position[overridden]
+                            ]
                     _accumulate_feature_rows_sorted(
                         mixture_feature.reshape(-1, field.feature_dim), slot, value,
-                        normalized_codes[field_rows[feature_contribution]],
+                        feature_codes,
                     )
                     mixture_payload_alpha.reshape(-1)[unique_slot] += alpha_sum
                 else:

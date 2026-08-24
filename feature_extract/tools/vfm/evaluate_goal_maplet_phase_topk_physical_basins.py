@@ -11,13 +11,21 @@ import numpy as np
 from feature_extract.tools.vfm.evaluate_goal_maplet_visibility_pose_acquisition import (
     _pose_errors,
 )
-from feature_extract.tools.vfm.train_evaluate_goal_maplet_sparse_pose_transport import (
-    _load_dataset,
+from feature_extract.vfm.localization_goal_maplet.pose_candidate_dataset import (
+    load_pose_candidate_dataset,
 )
 from feature_extract.vfm.localization_goal_maplet.lineage import file_sha256
 
 
 SCHEMA = "goal_maplet_phase_ranked_physical_basin_acquisition_v1"
+SUPPORTED_PHASE_SCORE_SEMANTICS = (
+    "conditional_phase_control",
+    "conditional_phase_shift_control",
+    "conservative_phase",
+    "conservative_phase_shift",
+    "conservative_phase_maxmin",
+    "conservative_phase_shift_maxmin",
+)
 
 
 def _physical_nms(
@@ -60,6 +68,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", required=True)
     parser.add_argument("--phase_report", required=True)
+    parser.add_argument(
+        "--expected_score_semantics",
+        choices=SUPPORTED_PHASE_SCORE_SEMANTICS,
+        required=True,
+    )
     parser.add_argument("--output", required=True)
     parser.add_argument("--maximum_k", type=int, default=4)
     parser.add_argument("--translation_nms_m", type=float, default=0.5)
@@ -70,11 +83,11 @@ def main() -> None:
     output = Path(args.output)
     if output.exists():
         raise FileExistsError("refusing to overwrite phase basin evaluation")
-    arrays, metadata = _load_dataset(Path(args.dataset))
+    arrays, metadata = load_pose_candidate_dataset(Path(args.dataset))
     phase = json.loads(Path(args.phase_report).read_text())
     if (
         phase.get("dataset_file_sha256") != file_sha256(Path(args.dataset))
-        or phase.get("score_semantics") != "conservative_phase"
+        or phase.get("score_semantics") != str(args.expected_score_semantics)
         or not phase.get("all_candidate_scores_built_before_pose_error_metrics", False)
     ):
         raise ValueError("phase report does not bind the frozen dataset/scorer")
@@ -126,6 +139,7 @@ def main() -> None:
     report = {
         "artifact_type": SCHEMA,
         "dataset_file_sha256": file_sha256(Path(args.dataset)),
+        "score_semantics": str(args.expected_score_semantics),
         "phase_report_file_sha256": file_sha256(Path(args.phase_report)),
         "energy_semantics": phase["energy_semantics"],
         "query_range": [begin, end],

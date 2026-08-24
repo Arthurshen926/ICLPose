@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from .physical_map import GoalMapletPhysicalMap
+from .multimodal_parent_retrieval import AnonymousChildModeReadout
 
 
 def _rank_sparse_joint_topk(
@@ -160,6 +161,8 @@ def retrieve_children_given_parents(
     *,
     maximum_child_candidates: int = 64,
     temperature: float = 0.07,
+    anonymous_child_mode_readout: AnonymousChildModeReadout | None = None,
+    child_mode_temperature: float = 0.03,
 ) -> ChildTilePosterior:
     """Factor P(child|query) as P(parent|context)P(child|parent,local)."""
 
@@ -179,6 +182,18 @@ def retrieve_children_given_parents(
         or coverage.shape != (physical.child_parent_rows.size,)
     ):
         raise ValueError("child retrieval arrays differ")
+    if anonymous_child_mode_readout is not None:
+        if (
+            anonymous_child_mode_readout.descriptors.shape[0]
+            != physical.child_parent_rows.size
+            or anonymous_child_mode_readout.descriptors.shape[2]
+            != local.shape[1]
+            or not np.array_equal(
+                anonymous_child_mode_readout.child_coverage, coverage.astype(np.float32)
+            )
+            or float(child_mode_temperature) <= 0.0
+        ):
+            raise ValueError("anonymous child mode readout differs")
     local = local / np.maximum(
         np.linalg.norm(local, axis=1, keepdims=True), 1e-8
     )
@@ -243,9 +258,32 @@ def retrieve_children_given_parents(
                 continue
             support_rows = slots // slot_count
             parent_slots = slots % slot_count
-            scaled_score = (
-                local[support_rows] @ child_feature[children].T
-            ).astype(np.float64) / scale
+            if anonymous_child_mode_readout is None:
+                child_score = (
+                    local[support_rows] @ child_feature[children].T
+                ).astype(np.float64)
+            else:
+                mode_descriptor = anonymous_child_mode_readout.descriptors[children]
+                mode_weight = anonymous_child_mode_readout.weights[children]
+                mode_score = np.einsum(
+                    "sd,cmd->scm", local[support_rows], mode_descriptor
+                ).astype(np.float64)
+                valid_mode = mode_weight > 0.0
+                mode_score[:, ~valid_mode] = -np.inf
+                maximum_mode = np.max(mode_score, axis=2)
+                safe_maximum = np.where(np.isfinite(maximum_mode), maximum_mode, 0.0)
+                mode_scale = max(float(child_mode_temperature), 1e-4)
+                exponential_mode = np.exp(
+                    (mode_score - safe_maximum[..., None]) / mode_scale
+                )
+                exponential_mode[:, ~valid_mode] = 0.0
+                mixture = np.sum(
+                    exponential_mode * mode_weight[None, :, :], axis=2
+                )
+                child_score = safe_maximum + mode_scale * np.log(
+                    np.maximum(mixture, 1e-30)
+                )
+            scaled_score = child_score / scale
             maximum = np.max(scaled_score, axis=1, keepdims=True)
             exponential = np.exp(scaled_score - maximum)
             conditional = exponential / np.maximum(

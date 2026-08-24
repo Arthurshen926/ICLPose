@@ -51,6 +51,8 @@ class QueryPoseHeadOutput:
     confidence: torch.Tensor
     pose_code_valid: torch.Tensor
     normal_valid: torch.Tensor
+    depth_valid: torch.Tensor
+    boundary_valid: torch.Tensor
     normal_frame: str
     depth_semantics: str
 
@@ -165,6 +167,8 @@ class MinimalPoseTransportReadout(nn.Module):
         threshold = float(self.config.zero_norm_threshold)
         code_valid = code_norm >= threshold
         normal_valid = normal_norm >= threshold
+        depth_valid = torch.isfinite(relative_depth)
+        boundary_valid = torch.isfinite(boundary)
         pose_code = code_raw / code_norm[:, None].clamp_min(threshold)
         normal_camera = normal_raw / normal_norm[:, None].clamp_min(threshold)
         # Invalid vectors carry exactly zero confidence and cannot masquerade
@@ -180,6 +184,8 @@ class MinimalPoseTransportReadout(nn.Module):
             confidence=confidence,
             pose_code_valid=code_valid,
             normal_valid=normal_valid,
+            depth_valid=depth_valid,
+            boundary_valid=boundary_valid,
             normal_frame="camera",
             depth_semantics=str(self.config.depth_semantics),
         )

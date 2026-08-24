@@ -4,6 +4,7 @@ import numpy as np
 
 from feature_extract.vfm.localization_goal_maplet.multibasin_pattern_search import (
     _probe_basin,
+    batched_multibasin_beam_pattern_search,
     batched_multibasin_pattern_search,
 )
 from feature_extract.vfm.localization_goal_maplet.se3_local_quadratic import (
@@ -198,4 +199,39 @@ def test_pattern_search_rejects_budget_that_cannot_preserve_locations():
             lambda poses: np.zeros((poses.shape[0],)),
             maximum_basins=1,
             basin_location_ids=[0, 1],
+        )
+
+
+def test_beam_pattern_search_retains_path_behind_false_greedy_peak():
+    def score(poses):
+        centers = -np.swapaxes(poses[:, :3, :3], 1, 2) @ poses[:, :3, 3, None]
+        x = centers[:, 0, 0]
+        # x=+4 is the best first-level false peak.  The globally better peak
+        # at -6 is reachable only if the second-ranked x=-4 branch survives.
+        return np.maximum(
+            20.0 - np.square(x - 4.0),
+            30.0 - 4.0 * np.square(x + 6.0),
+        )
+
+    result = batched_multibasin_beam_pattern_search(
+        np.asarray([_pose([0.0, 0.0, 0.0])]), score,
+        translation_radii_m=(4.0, 2.0),
+        rotation_radii_deg=(20.0, 10.0),
+        beam_width_per_source=2,
+    )
+    centers = np.asarray([
+        -state.pose_w2c[:3, :3].T @ state.pose_w2c[:3, 3]
+        for state in result.basins
+    ])
+    assert np.min(np.abs(centers[:, 0] + 6.0)) < 1.0e-12
+    assert result.evaluator_calls == 3
+    assert result.evaluated_pose_count == 1 + 12 + 24
+
+
+def test_beam_pattern_search_rejects_non_decreasing_schedule():
+    with np.testing.assert_raises_regex(ValueError, "schedule"):
+        batched_multibasin_beam_pattern_search(
+            np.asarray([_pose([0.0, 0.0, 0.0])]),
+            lambda poses: np.zeros((poses.shape[0],)),
+            translation_radii_m=(1.0, 1.0), rotation_radii_deg=(10.0, 5.0),
         )

@@ -6,6 +6,9 @@ from feature_extract.vfm.localization_goal_maplet.child_retrieval import (
     _rank_sparse_joint_topk,
     retrieve_children_given_parents,
 )
+from feature_extract.vfm.localization_goal_maplet.multimodal_parent_retrieval import (
+    AnonymousChildModeReadout,
+)
 from test_goal_maplet_physical_map import _inputs
 
 
@@ -138,3 +141,39 @@ def test_sparse_topk_matches_global_lexsort_including_boundary_ties():
         np.testing.assert_array_equal(rows[index, :count], child[mask][order])
         np.testing.assert_array_equal(scores[index, :count], probability[mask][order])
         assert np.all(rows[index, count:] == -1)
+
+
+def test_anonymous_child_modes_are_marginalized_before_identity_softmax():
+    physical = SimpleNamespace(
+        maplet_ids=np.asarray([10], dtype=np.int64),
+        maplet_child_offsets=np.asarray([0, 2], dtype=np.int64),
+        child_parent_rows=np.asarray([0, 0], dtype=np.int64),
+    )
+    coverage = np.ones(2, dtype=np.float32)
+    modes = AnonymousChildModeReadout(
+        descriptors=np.asarray(
+            [
+                [[1.0, 0.0], [0.0, 1.0]],
+                [[0.8, 0.6], [0.0, 0.0]],
+            ],
+            dtype=np.float32,
+        ),
+        weights=np.asarray([[0.5, 0.5], [1.0, 0.0]], dtype=np.float32),
+        child_coverage=coverage,
+    )
+    result = retrieve_children_given_parents(
+        np.asarray([[1.0, 0.0]], dtype=np.float32),
+        np.asarray([[10]], dtype=np.int64),
+        np.asarray([[0.9]], dtype=np.float32),
+        np.asarray([0.1], dtype=np.float32),
+        np.asarray([[0.7, 0.7], [0.8, 0.6]], dtype=np.float32),
+        coverage,
+        physical,
+        maximum_child_candidates=2,
+        temperature=0.05,
+        anonymous_child_mode_readout=modes,
+        child_mode_temperature=0.03,
+    )
+    assert result.candidate_child_rows.tolist() == [[0, 1]]
+    assert result.candidate_probabilities[0, 0] > result.candidate_probabilities[0, 1]
+    assert np.sum(result.candidate_probabilities) <= 0.9 + 1e-6
