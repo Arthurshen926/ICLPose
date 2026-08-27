@@ -65,6 +65,25 @@ The official `Ruicheng/moge-2-vitl-normal` checkpoint also fails:
 The large model runs at median 0.161s/image (p90 0.166s) and peaks at about
 2.62GB CUDA allocation, so runtime is not the blocker. Accuracy is.
 
+### MoGe-3-L
+
+After MoGe-3 was released, the official `Ruicheng/moge-3-vitl` model was run
+with true FOV and its default three sparse volumetric refinement steps. Relative
+to MoGe-2-L it improves the final rotation estimate but does not fix metric
+plane offset:
+
+- 1m/10 degrees: 0/88;
+- 2m/45 degrees: 0/88;
+- median rotation error: 15.65 degrees (better than 18.73 degrees);
+- median translation error: 9.02m;
+- median plane-normal error: 25.70 degrees;
+- median plane-offset error: 4.67m (worse than 4.22m).
+
+With ideal offsets, MoGe-3 normals reach 95.45% at 2m/45 degrees, compared with
+82.95% for MoGe-2. Thus the refinement is useful for coarse orientation and
+fine surface shape, but the tested localization remains blocked by absolute
+metric plane offset.
+
 ## Causal parameter ablation
 
 Using the same selected regions and robust solver on the balanced side map:
@@ -129,4 +148,6 @@ parameter accuracy passes a meaningful pose threshold.
   `output/g25_pose_transport/planar_query_geometry/moge2_vitl_normal_seq10_full_v1/manifest.json`
 - MoGe-2-L causal ablation:
   `output/g25_pose_transport/planar_query_geometry/moge2_vitl_normal_seq10_full_v1/gt_mask_planar_pose_parameter_ablation_v2.json`
-
+- MoGe-3-L geometry and causal ablation:
+  `output/g25_pose_transport/planar_query_geometry/moge3_vitl_seq10_full_v1/manifest.json`
+  and `gt_mask_planar_pose_parameter_ablation_v1.json`

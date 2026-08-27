@@ -22,7 +22,7 @@ from feature_extract.vfm.localization_goal_maplet.pose_candidate_dataset import 
 from feature_extract.vfm.localization_goal_maplet.visibility import render_exact_maplet_visibility
 
 
-SCHEMA = "goal_maplet_moge2_gt_mask_planar_oracle_v1"
+SCHEMA = "goal_maplet_moge_gt_mask_planar_oracle_v2"
 MINIMUM_REGION_PIXELS = 20
 MAXIMUM_PLANES = 16
 
@@ -259,7 +259,7 @@ def main() -> None:
         "moge_manifest": str(moge_path), "moge_manifest_file_sha256": _sha(moge_path), "moge_manifest_content_sha256": moge["content_sha256"],
         "evaluation_contract": {"query_geometry": f"pose-free {moge['model_id']} metric point map", "plane_parameter_source": args.plane_parameter_source, "plane_mask": "GT 2DGS visibility oracle", "region_correspondence": "GT planar side-map oracle", "maximum_planes": MAXIMUM_PLANES, "minimum_region_pixels": MINIMUM_REGION_PIXELS, "oracle_parameter_ablations": args.include_oracle_parameter_ablations},
         "variants": result, "best_metric_1m10_recall": best, "target": .80,
-        "decision": "GO_TO_REAL_PLANE_MASK_AND_MATCHING_GATE" if best >= .80 else "KILL_MOGE2_QUERY_GEOMETRY_FOR_PLANAR_POSE",
+        "decision": "GO_TO_REAL_PLANE_MASK_AND_MATCHING_GATE" if best >= .80 else "KILL_ZERO_SHOT_MOGE_QUERY_GEOMETRY_FOR_PLANAR_POSE",
         "uses_alike": False, "uses_pnp": False, "uses_pose_lattice": False,
         "production_eligible": False,
     }

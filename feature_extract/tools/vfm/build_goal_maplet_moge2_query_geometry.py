@@ -13,9 +13,10 @@ import cv2
 import numpy as np
 
 
-SCHEMA = "goal_maplet_moge2_query_geometry_v1"
+SCHEMA = "goal_maplet_moge_query_geometry_v2"
 DEFAULT_MODEL_ID = "Ruicheng/moge-2-vits-normal"
 MOGE_REPOSITORY_COMMIT = "7807b5de2bc0c1e80519f5f3d1f38a606f8f9925"
+MOGE3_REPOSITORY_COMMIT = "74fbce054ebed49800de42d0ad0e83495065719a"
 OUTPUT_WIDTH = 256
 OUTPUT_HEIGHT = 144
 
@@ -44,9 +45,11 @@ def main() -> None:
         "--model_id", default=DEFAULT_MODEL_ID,
         choices=(
             "Ruicheng/moge-2-vits-normal", "Ruicheng/moge-2-vitb-normal",
-            "Ruicheng/moge-2-vitl-normal",
+            "Ruicheng/moge-2-vitl-normal", "Ruicheng/moge-3-vitl",
+            "Ruicheng/moge-3-vitg",
         ),
     )
+    parser.add_argument("--refine_steps", type=int, default=3)
     parser.add_argument("--maximum_queries", type=int, default=0)
     args = parser.parse_args()
     output = Path(args.output_dir).resolve()
@@ -66,7 +69,12 @@ def main() -> None:
     import torch
     import torch.nn.functional as functional
     from huggingface_hub import snapshot_download
-    from moge.model.v2 import MoGeModel
+    is_v3 = "/moge-3-" in args.model_id
+    if is_v3:
+        from moge.model.v3 import MoGeModel
+    else:
+        from moge.model.v2 import MoGeModel
+    repository_commit = MOGE3_REPOSITORY_COMMIT if is_v3 else MOGE_REPOSITORY_COMMIT
 
     model = MoGeModel.from_pretrained(args.model_id).to(args.device).eval()
     model_snapshot = Path(snapshot_download(args.model_id, local_files_only=True)).resolve()
@@ -93,10 +101,13 @@ def main() -> None:
         tensor = torch.as_tensor(rgb, dtype=torch.float32, device=args.device).permute(2, 0, 1) / 255.0
         started = time.perf_counter()
         with torch.inference_mode():
-            prediction = model.infer(
-                tensor, resolution_level=int(args.resolution_level), fov_x=fov_x,
-                use_fp16=True, apply_mask=True,
-            )
+            infer_options = {
+                "resolution_level": int(args.resolution_level), "fov_x": fov_x,
+                "use_fp16": True, "apply_mask": True,
+            }
+            if is_v3:
+                infer_options["refine_steps"] = int(args.refine_steps)
+            prediction = model.infer(tensor, **infer_options)
         def resize(value, channels: bool, mode: str = "bilinear"):
             item = value.float()
             if channels:
@@ -120,8 +131,9 @@ def main() -> None:
         destination = output / f"{image_id.replace('/', '__')}.npz"
         metadata = {
             "artifact_type": SCHEMA, "image_id": image_id, "model_id": args.model_id,
-            "moge_repository_commit": MOGE_REPOSITORY_COMMIT,
+            "moge_repository_commit": repository_commit,
             "resolution_level": int(args.resolution_level), "fov_x_deg": fov_x,
+            "refine_steps": int(args.refine_steps) if is_v3 else 0,
             "source_image": str(image_path), "source_image_file_sha256": _sha256(image_path),
             "camera_model_id": int(camera["model_id"]), "camera_width": width,
             "camera_height": height, "camera_params": camera["params"],
@@ -143,12 +155,13 @@ def main() -> None:
         print(f"{index + 1}/{len(image_ids)} {image_id}", flush=True)
     manifest = {
         "artifact_type": SCHEMA + "_manifest", "model_id": args.model_id,
-        "moge_repository_commit": MOGE_REPOSITORY_COMMIT,
+        "moge_repository_commit": repository_commit,
         "model_snapshot": str(model_snapshot), "model_weight_file_sha256": model_weight_sha256,
         "camera_manifest": str(camera_path), "camera_manifest_file_sha256": _sha256(camera_path),
         "image_root": str(image_root), "route": str(args.route), "query_count": len(rows),
         "resolution_level": int(args.resolution_level), "output_width": OUTPUT_WIDTH,
         "output_height": OUTPUT_HEIGHT, "rows": rows,
+        "refine_steps": int(args.refine_steps) if is_v3 else 0,
         "uses_pose": False, "uses_ground_truth": False, "production_eligible": False,
         "peak_cuda_allocated_bytes": int(torch.cuda.max_memory_allocated(args.device)),
     }
