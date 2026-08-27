@@ -24,6 +24,12 @@ MINIMUM_MEMBER_COUNT = 1
 MERGE_NORMAL_COSINE = 0.90
 MERGE_PLANE_DISTANCE_M = 0.10
 MERGE_BOUNDARY_GAP_M = 0.25
+STRICT_MAP_DISTANCE_RMS_M = 0.03
+STRICT_MAP_DISTANCE_P95_M = 0.05
+STRICT_MAP_NORMAL_COSINE_P10 = float(np.cos(np.deg2rad(10.0)))
+STRICT_MERGE_NORMAL_COSINE = float(np.cos(np.deg2rad(5.0)))
+STRICT_MERGE_PLANE_DISTANCE_M = 0.03
+STRICT_MERGE_BOUNDARY_GAP_M = 0.15
 
 
 def _unit(value: np.ndarray) -> np.ndarray:
@@ -203,6 +209,7 @@ def merge_coplanar_child_regions(
     seed = (
         (child_planes.boundary_area_m2 >= MINIMUM_BOUNDARY_AREA_M2)
         & (child_planes.center_residual_rms_m <= PLANARITY_DISTANCE_RMS_M)
+        & (child_planes.normal_cosine_p10 >= PLANARITY_NORMAL_COSINE)
     )
     radius = np.empty((child_count,), np.float64)
     for child in range(child_count):
@@ -299,6 +306,190 @@ def merge_coplanar_child_regions(
     return merged, np.asarray(parents, np.int64), component_children
 
 
+def _segments_intersect(a: np.ndarray, b: np.ndarray, c: np.ndarray, d: np.ndarray) -> bool:
+    def cross(left: np.ndarray, right: np.ndarray) -> float:
+        return float(left[0] * right[1] - left[1] * right[0])
+
+    def orientation(left: np.ndarray, middle: np.ndarray, right: np.ndarray) -> float:
+        return cross(middle - left, right - left)
+
+    def on_segment(left: np.ndarray, point: np.ndarray, right: np.ndarray) -> bool:
+        return bool(
+            np.all(point >= np.minimum(left, right) - 1.0e-12)
+            and np.all(point <= np.maximum(left, right) + 1.0e-12)
+        )
+
+    o1, o2 = orientation(a, b, c), orientation(a, b, d)
+    o3, o4 = orientation(c, d, a), orientation(c, d, b)
+    if (o1 > 0.0) != (o2 > 0.0) and (o3 > 0.0) != (o4 > 0.0):
+        return True
+    return bool(
+        (abs(o1) <= 1.0e-12 and on_segment(a, c, b))
+        or (abs(o2) <= 1.0e-12 and on_segment(a, d, b))
+        or (abs(o3) <= 1.0e-12 and on_segment(c, a, d))
+        or (abs(o4) <= 1.0e-12 and on_segment(c, b, d))
+    )
+
+
+def _point_segment_distance(point: np.ndarray, left: np.ndarray, right: np.ndarray) -> float:
+    delta = right - left
+    ratio = float((point - left) @ delta) / max(float(delta @ delta), 1.0e-15)
+    projection = left + np.clip(ratio, 0.0, 1.0) * delta
+    return float(np.linalg.norm(point - projection))
+
+
+def convex_polygon_gap(left: np.ndarray, right: np.ndarray) -> float:
+    """Exact Euclidean gap between two ordered convex 2-D polygon boundaries."""
+
+    left = np.asarray(left, np.float64).reshape(-1, 2)
+    right = np.asarray(right, np.float64).reshape(-1, 2)
+    if left.shape[0] < 2 or right.shape[0] < 2:
+        return float("inf")
+    for a_index in range(left.shape[0]):
+        a, b = left[a_index], left[(a_index + 1) % left.shape[0]]
+        for c_index in range(right.shape[0]):
+            c, d = right[c_index], right[(c_index + 1) % right.shape[0]]
+            if _segments_intersect(a, b, c, d):
+                return 0.0
+    value = float("inf")
+    for point in left:
+        for index in range(right.shape[0]):
+            value = min(value, _point_segment_distance(
+                point, right[index], right[(index + 1) % right.shape[0]],
+            ))
+    for point in right:
+        for index in range(left.shape[0]):
+            value = min(value, _point_segment_distance(
+                point, left[index], left[(index + 1) % left.shape[0]],
+            ))
+    return value
+
+
+def strict_planar_side_map_from_child_seeds(
+    physical: GoalMapletPhysicalMap,
+    child_planes: PlanarMapletMap,
+    *,
+    distance_rms_m: float = STRICT_MAP_DISTANCE_RMS_M,
+    distance_p95_m: float = STRICT_MAP_DISTANCE_P95_M,
+    normal_cosine_p10: float = STRICT_MAP_NORMAL_COSINE_P10,
+) -> tuple[PlanarMapletMap, np.ndarray, list[np.ndarray], dict[str, object]]:
+    """Build a strict side map with connectivity and component-level rollback.
+
+    Physical children are only bounded micro-patch seeds.  They are not the
+    resulting plane identity.  Every accepted union is refitted using all
+    primitive ellipses in the prospective component and rejected atomically
+    when its complete geometry no longer satisfies the strict map contract.
+    """
+
+    seed = (
+        (child_planes.boundary_area_m2 >= MINIMUM_BOUNDARY_AREA_M2)
+        & (child_planes.center_residual_rms_m <= float(distance_rms_m))
+        & (child_planes.center_residual_p95_m <= float(distance_p95_m))
+        & (child_planes.normal_cosine_p10 >= float(normal_cosine_p10))
+    )
+    seed_rows = np.flatnonzero(seed)
+    owner = np.arange(int(physical.child_parent_rows.size), dtype=np.int64)
+    component: dict[int, list[int]] = {int(row): [int(row)] for row in seed_rows.tolist()}
+
+    def find(value: int) -> int:
+        while owner[value] != value:
+            owner[value] = owner[owner[value]]
+            value = int(owner[value])
+        return value
+
+    def child_boundary_world(row: int) -> np.ndarray:
+        lo, hi = int(child_planes.boundary_offsets[row]), int(child_planes.boundary_offsets[row + 1])
+        uv = child_planes.boundary_uv[lo:hi]
+        frame = child_planes.frames_world[row]
+        return (
+            child_planes.centers_world[row][None]
+            + uv[:, :1] * frame[0][None] + uv[:, 1:] * frame[1][None]
+        )
+
+    edges: list[tuple[float, int, int]] = []
+    for parent in range(int(physical.maplet_ids.size)):
+        lo, hi = int(physical.maplet_child_offsets[parent]), int(physical.maplet_child_offsets[parent + 1])
+        rows = np.arange(lo, hi, dtype=np.int64)
+        rows = rows[seed[rows]]
+        for local, left in enumerate(rows.tolist()):
+            for right in rows[local + 1:].tolist():
+                cosine = abs(float(child_planes.normals_world[left] @ child_planes.normals_world[right]))
+                if cosine < STRICT_MERGE_NORMAL_COSINE:
+                    continue
+                if abs(float(child_planes.normals_world[left] @ child_planes.centers_world[right] - child_planes.offsets_world[left])) > STRICT_MERGE_PLANE_DISTANCE_M:
+                    continue
+                if abs(float(child_planes.normals_world[right] @ child_planes.centers_world[left] - child_planes.offsets_world[right])) > STRICT_MERGE_PLANE_DISTANCE_M:
+                    continue
+                normal = _unit(child_planes.normals_world[left] + np.sign(
+                    child_planes.normals_world[left] @ child_planes.normals_world[right]
+                ) * child_planes.normals_world[right])
+                frame = _frame_from_normal(normal)
+                origin = 0.5 * (child_planes.centers_world[left] + child_planes.centers_world[right])
+                polygon_left = (child_boundary_world(left) - origin) @ frame[:2].T
+                polygon_right = (child_boundary_world(right) - origin) @ frame[:2].T
+                gap = convex_polygon_gap(polygon_left, polygon_right)
+                if gap <= STRICT_MERGE_BOUNDARY_GAP_M:
+                    edges.append((gap, int(left), int(right)))
+    accepted = rejected = 0
+    for _gap, left, right in sorted(edges):
+        a, b = find(left), find(right)
+        if a == b:
+            continue
+        children = sorted(component[a] + component[b])
+        members = np.unique(np.concatenate([
+            np.asarray(physical.child_member_primitive_rows[
+                int(physical.child_member_offsets[row]):int(physical.child_member_offsets[row + 1])
+            ], np.int64) for row in children
+        ]))
+        fitted = _fit_member_groups(
+            physical, [members], child_planes.normals_world[[children[0]]],
+        )
+        valid = bool(
+            fitted.boundary_area_m2[0] >= MINIMUM_BOUNDARY_AREA_M2
+            and fitted.center_residual_rms_m[0] <= float(distance_rms_m)
+            and fitted.center_residual_p95_m[0] <= float(distance_p95_m)
+            and fitted.normal_cosine_p10[0] >= float(normal_cosine_p10)
+        )
+        if not valid:
+            rejected += 1
+            continue
+        root, other = min(a, b), max(a, b)
+        owner[other] = root
+        component[root] = children
+        del component[other]
+        accepted += 1
+    child_groups = [np.asarray(value, np.int64) for _, value in sorted(component.items())]
+    primitive_groups = [np.unique(np.concatenate([
+        np.asarray(physical.child_member_primitive_rows[
+            int(physical.child_member_offsets[row]):int(physical.child_member_offsets[row + 1])
+        ], np.int64) for row in children.tolist()
+    ])) for children in child_groups]
+    reference = np.asarray([child_planes.normals_world[int(rows[0])] for rows in child_groups])
+    side_map = _fit_member_groups(physical, primitive_groups, reference)
+    strict = (
+        (side_map.boundary_area_m2 >= MINIMUM_BOUNDARY_AREA_M2)
+        & (side_map.center_residual_rms_m <= float(distance_rms_m))
+        & (side_map.center_residual_p95_m <= float(distance_p95_m))
+        & (side_map.normal_cosine_p10 >= float(normal_cosine_p10))
+    )
+    if not np.all(strict):
+        raise RuntimeError("accepted strict planar component failed replay")
+    parent_rows = np.asarray([
+        int(physical.child_parent_rows[int(rows[0])]) for rows in child_groups
+    ], np.int64)
+    return side_map, parent_rows, child_groups, {
+        "seed_count": int(seed_rows.size), "candidate_edge_count": len(edges),
+        "accepted_merge_count": accepted, "rejected_merge_count": rejected,
+        "component_count": len(child_groups),
+        "merge_is_component_refit_with_atomic_rollback": True,
+        "boundary_gap_is_exact_convex_polygon_distance": True,
+        "scale_semantics": "2dgs Gaussian standard deviation; old boundary uses explicit 1sigma support convention",
+        "distance_rms_m": float(distance_rms_m),
+        "distance_p95_m": float(distance_p95_m),
+        "normal_cosine_p10": float(normal_cosine_p10),
+    }
+
+
 def fit_weighted_plane(points: np.ndarray, weights: np.ndarray, reference_normal: np.ndarray):
     points = np.asarray(points, np.float64)
     weights = np.asarray(weights, np.float64).reshape(-1)
@@ -379,12 +570,75 @@ def solve_scaled_translation(map_normals: np.ndarray, map_offsets: np.ndarray, q
     return solution[:3], float(solution[3]), int(rank), singular
 
 
+def select_normal_diverse_planes(
+    normals: np.ndarray, reliability: np.ndarray, maximum_count: int,
+) -> np.ndarray:
+    """Deterministic D-optimal-like subset using the weighted normal Gram matrix."""
+
+    normal = np.asarray(normals, np.float64).reshape(-1, 3)
+    weight = np.asarray(reliability, np.float64).reshape(-1)
+    if normal.shape[0] != weight.size or int(maximum_count) <= 0:
+        raise ValueError("normal-diverse selection inputs differ")
+    remaining = set(range(weight.size))
+    selected: list[int] = []
+    gram = np.eye(3, dtype=np.float64) * 1.0e-9
+    while remaining and len(selected) < int(maximum_count):
+        best = None
+        for row in sorted(remaining):
+            candidate = gram + max(float(weight[row]), 1.0e-12) * np.outer(normal[row], normal[row])
+            sign, logdet = np.linalg.slogdet(candidate)
+            key = (float(logdet) if sign > 0 else -float("inf"), float(weight[row]), -row)
+            if best is None or key > best[0]:
+                best = (key, row, candidate)
+        assert best is not None
+        _, row, gram = best
+        selected.append(int(row))
+        remaining.remove(int(row))
+    return np.asarray(selected, np.int64)
+
+
+def solve_robust_metric_translation(
+    map_normals: np.ndarray,
+    map_offsets: np.ndarray,
+    query_offsets: np.ndarray,
+    inverse_variance: np.ndarray,
+    *,
+    iterations: int = 10,
+    huber_delta: float = 1.5,
+) -> tuple[np.ndarray, int, np.ndarray, np.ndarray]:
+    """IRLS plane-offset translation with fixed inverse-variance authority."""
+
+    base = np.asarray(inverse_variance, np.float64).reshape(-1)
+    if np.any(~np.isfinite(base)) or np.any(base <= 0.0):
+        raise ValueError("inverse plane variance must be finite and positive")
+    robust = np.ones_like(base)
+    solution = np.zeros(3, np.float64)
+    rank = 0
+    singular = np.zeros(3, np.float64)
+    residual = np.zeros_like(base)
+    for _ in range(int(iterations)):
+        solution, rank, singular = solve_metric_translation(
+            map_normals, map_offsets, query_offsets, base * robust,
+        )
+        residual = (
+            np.asarray(map_offsets, np.float64)
+            - np.asarray(query_offsets, np.float64)
+            - np.asarray(map_normals, np.float64) @ solution
+        )
+        scale = max(1.4826 * float(np.median(np.abs(residual))), 1.0e-4)
+        normalized = np.abs(residual) / (float(huber_delta) * scale)
+        robust = np.where(normalized <= 1.0, 1.0, 1.0 / np.maximum(normalized, 1.0))
+    return solution, int(rank), singular, residual
+
+
 __all__ = [
     "MERGE_BOUNDARY_GAP_M", "MERGE_NORMAL_COSINE", "MERGE_PLANE_DISTANCE_M",
     "MINIMUM_BOUNDARY_AREA_M2", "MINIMUM_MEMBER_COUNT",
     "PLANARITY_DISTANCE_RMS_M", "PLANARITY_NORMAL_COSINE", "PlanarMapletMap",
     "fit_child_planar_maplets", "fit_planar_maplets", "fit_weighted_plane",
     "fit_weighted_primitive_plane", "solve_metric_translation",
-    "merge_coplanar_child_regions", "solve_rotation_from_plane_normals",
+    "convex_polygon_gap", "merge_coplanar_child_regions",
+    "strict_planar_side_map_from_child_seeds", "solve_rotation_from_plane_normals",
+    "select_normal_diverse_planes", "solve_robust_metric_translation",
     "solve_scaled_translation",
 ]

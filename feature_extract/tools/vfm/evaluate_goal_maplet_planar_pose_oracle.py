@@ -102,6 +102,7 @@ def main() -> None:
     atomic_seed = (
         (child.boundary_area_m2 >= MINIMUM_BOUNDARY_AREA_M2)
         & (child.center_residual_rms_m <= PLANARITY_DISTANCE_RMS_M)
+        & (child.normal_cosine_p10 >= .90)
     )
     atomic_groups = [np.asarray([row], np.int64) for row in np.flatnonzero(atomic_seed)]
     atomic_rows = np.flatnonzero(atomic_seed)
@@ -117,6 +118,7 @@ def main() -> None:
         eligible = (
             (planes.boundary_area_m2 >= MINIMUM_BOUNDARY_AREA_M2)
             & (planes.center_residual_rms_m <= PLANARITY_DISTANCE_RMS_M)
+            & (planes.normal_cosine_p10 >= .90)
         )
         if variant_name == "atomic_child":
             eligible = np.ones(len(child_groups), dtype=bool)

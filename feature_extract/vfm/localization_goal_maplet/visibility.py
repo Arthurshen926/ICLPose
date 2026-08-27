@@ -137,7 +137,14 @@ def render_exact_maplet_visibility(
     valid = best_compact_row >= 0
     labels[valid] = owner[best_compact_row[valid]]
     primitive_ids[valid] = physical_map.primitive_ids[best_compact_row[valid]]
-    depth[valid] = primitive_depth[best_compact_row[valid]]
+    # ``primitive_depth`` is indexed in the compact front-facing ``elements``
+    # inventory, whereas ``best_compact_row`` has already been remapped to the
+    # full physical-map row inventory.  Expand once before the global lookup;
+    # indexing the compact array by a global row can silently select the wrong
+    # depth or raise when a high-index primitive is visible.
+    global_primitive_depth = np.zeros((physical_map.primitive_ids.size,), dtype=np.float32)
+    global_primitive_depth[rows] = primitive_depth
+    depth[valid] = global_primitive_depth[best_compact_row[valid]]
     visible_labels = labels[labels >= 0]
     visible_rows, counts = np.unique(visible_labels, return_counts=True)
     return MapletVisibilityBuffer(

@@ -1,5 +1,7 @@
 # G25 平面区域位姿路线：第一性原理 oracle 审计
 
+> 后续逐像素 surface oracle 已推翻本文对整个 plane-centric backend 的过强停机表述。本文只保留为“voxel child / primitive-center refit / one-shot LS”负对照；当前裁决见 `g25_planar_pixel_surface_oracle_v2_20260827.md`。
+
 ## 结论
 
 PlanaReLoc 式“平面区域匹配后直接求位姿”不应成为当前 Cambridge / 2DGS 地图的主位姿后端。它可保留为朝向约束和多假设旁路，但在 query 侧平面恢复前，平面 offset 已经被更强的可见 2DGS 几何 oracle 证明不足以稳定恢复平移。

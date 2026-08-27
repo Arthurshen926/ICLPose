@@ -3,8 +3,11 @@ from types import SimpleNamespace
 import numpy as np
 
 from feature_extract.vfm.localization_goal_maplet.planar_maplet_oracle import (
+    convex_polygon_gap,
     fit_weighted_primitive_plane,
+    select_normal_diverse_planes,
     solve_metric_translation,
+    solve_robust_metric_translation,
     solve_rotation_from_plane_normals,
     solve_scaled_translation,
 )
@@ -78,3 +81,32 @@ def test_single_2dgs_ellipse_has_a_well_defined_plane_normal() -> None:
     np.testing.assert_allclose(normal, [0.0, 0.0, 1.0], atol=1.0e-15)
     assert offset == 3.0
     np.testing.assert_allclose(eigenvalues, [0.0, 0.25, 1.0], atol=1.0e-15)
+
+
+def test_convex_polygon_gap_uses_boundaries_not_bounding_circles() -> None:
+    square = np.asarray([[0., 0.], [1., 0.], [1., 1.], [0., 1.]])
+    separated = square + np.asarray([2.0, 0.0])
+    crossing = np.asarray([[.5, -.5], [1.5, -.5], [1.5, .5], [.5, .5]])
+    assert abs(convex_polygon_gap(square, separated) - 1.0) < 1.0e-12
+    assert convex_polygon_gap(square, crossing) == 0.0
+
+
+def test_diverse_selection_and_robust_translation_reject_offset_outlier() -> None:
+    normals = np.asarray([
+        [1., 0., 0.], [0., 1., 0.], [0., 0., 1.],
+        [1., 1., 0.], [1., 0., 1.], [0., 1., 1.],
+    ])
+    normals /= np.linalg.norm(normals, axis=1, keepdims=True)
+    center = np.asarray([2.0, -1.0, 3.0])
+    map_offset = np.linspace(1.0, 3.5, normals.shape[0])
+    query_offset = map_offset - normals @ center
+    query_offset[-1] += 4.0
+    selected = select_normal_diverse_planes(normals, np.ones(6), 4)
+    assert selected.size == 4
+    assert np.linalg.matrix_rank(normals[selected]) == 3
+    ordinary, _, _ = solve_metric_translation(normals, map_offset, query_offset, np.ones(6))
+    robust, rank, _, _ = solve_robust_metric_translation(
+        normals, map_offset, query_offset, np.ones(6), iterations=20,
+    )
+    assert rank == 3
+    assert np.linalg.norm(robust - center) < np.linalg.norm(ordinary - center)
