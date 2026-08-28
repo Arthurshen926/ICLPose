@@ -37,6 +37,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--camera_manifest", required=True)
     parser.add_argument("--image_root", required=True)
+    parser.add_argument("--image_layout", choices=("flattened", "hierarchical"), default="flattened")
+    parser.add_argument("--resize_source_to_camera_canvas", action="store_true")
     parser.add_argument("--route", default="seq10")
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--device", default="cuda:0")
@@ -85,7 +87,7 @@ def main() -> None:
     torch.cuda.reset_peak_memory_stats(args.device)
     rows = []
     for index, image_id in enumerate(image_ids):
-        image_path = image_root / image_id.replace("/", "__")
+        image_path = image_root / (image_id.replace("/", "__") if args.image_layout == "flattened" else image_id)
         if not image_path.is_file():
             raise FileNotFoundError(image_path)
         bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
@@ -94,8 +96,11 @@ def main() -> None:
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         camera = cameras[image_id]
         width, height = int(camera["width"]), int(camera["height"])
+        source_height, source_width = rgb.shape[:2]
         if rgb.shape[:2] != (height, width):
-            raise ValueError("image and frozen camera canvas differ")
+            if not args.resize_source_to_camera_canvas:
+                raise ValueError("image and frozen camera canvas differ")
+            rgb = cv2.resize(rgb, (width, height), interpolation=cv2.INTER_AREA)
         focal = float(camera["params"][0])
         fov_x = math.degrees(2.0 * math.atan(width / (2.0 * focal)))
         tensor = torch.as_tensor(rgb, dtype=torch.float32, device=args.device).permute(2, 0, 1) / 255.0
@@ -135,6 +140,9 @@ def main() -> None:
             "resolution_level": int(args.resolution_level), "fov_x_deg": fov_x,
             "refine_steps": int(args.refine_steps) if is_v3 else 0,
             "source_image": str(image_path), "source_image_file_sha256": _sha256(image_path),
+            "source_image_width": int(source_width), "source_image_height": int(source_height),
+            "source_resized_to_camera_canvas": bool((source_width, source_height) != (width, height)),
+            "source_resize_interpolation": "opencv_inter_area" if (source_width, source_height) != (width, height) else "none",
             "camera_model_id": int(camera["model_id"]), "camera_width": width,
             "camera_height": height, "camera_params": camera["params"],
             "output_width": OUTPUT_WIDTH, "output_height": OUTPUT_HEIGHT,
@@ -159,6 +167,8 @@ def main() -> None:
         "model_snapshot": str(model_snapshot), "model_weight_file_sha256": model_weight_sha256,
         "camera_manifest": str(camera_path), "camera_manifest_file_sha256": _sha256(camera_path),
         "image_root": str(image_root), "route": str(args.route), "query_count": len(rows),
+        "image_layout": args.image_layout,
+        "resize_source_to_camera_canvas": bool(args.resize_source_to_camera_canvas),
         "resolution_level": int(args.resolution_level), "output_width": OUTPUT_WIDTH,
         "output_height": OUTPUT_HEIGHT, "rows": rows,
         "refine_steps": int(args.refine_steps) if is_v3 else 0,

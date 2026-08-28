@@ -2,6 +2,12 @@ from types import SimpleNamespace
 
 import numpy as np
 
+from feature_extract.tools.vfm.evaluate_goal_maplet_map_conditioned_plane_offset import (
+    _fit as fit_map_region_offset,
+    _fit_normal_calibration as fit_normal_calibration,
+    _predict as predict_map_region_offset,
+)
+
 from feature_extract.vfm.localization_goal_maplet.planar_maplet_oracle import (
     convex_polygon_gap,
     fit_weighted_primitive_plane,
@@ -10,6 +16,7 @@ from feature_extract.vfm.localization_goal_maplet.planar_maplet_oracle import (
     solve_robust_metric_translation,
     solve_rotation_from_plane_normals,
     solve_scaled_translation,
+    solve_affine_scaled_translation,
 )
 
 
@@ -67,6 +74,25 @@ def test_scale_aware_plane_pose_needs_rank_four_not_three_matches() -> None:
     assert singular.shape == (3,)
 
 
+def test_affine_scale_shift_plane_offsets_recover_metric_center() -> None:
+    normals = np.asarray([
+        [1., 0., 0.], [0., 1., 0.], [0., 0., 1.],
+        [1., 1., 0.], [1., 0., 1.], [0., 1., 1.],
+    ])
+    normals /= np.linalg.norm(normals, axis=1, keepdims=True)
+    center = np.asarray([2.0, -1.0, 3.0])
+    map_offset = np.asarray([4., 3., 8., 2., 6., 5.])
+    scale, shift = 1.7, -0.4
+    query_offset = (map_offset - normals @ center - shift) / scale
+    estimate, got_scale, got_shift, rank, _ = solve_affine_scaled_translation(
+        normals, map_offset, query_offset, np.ones(6),
+    )
+    np.testing.assert_allclose(estimate, center, atol=1e-12)
+    assert abs(got_scale - scale) < 1e-12
+    assert abs(got_shift - shift) < 1e-12
+    assert rank == 5
+
+
 def test_single_2dgs_ellipse_has_a_well_defined_plane_normal() -> None:
     physical = SimpleNamespace(
         primitive_centers=np.asarray([[1.0, 2.0, 3.0]]),
@@ -110,3 +136,28 @@ def test_diverse_selection_and_robust_translation_reject_offset_outlier() -> Non
     )
     assert rank == 3
     assert np.linalg.norm(robust - center) < np.linalg.norm(ordinary - center)
+
+
+def test_map_region_offset_calibrator_has_explicit_unseen_fallback() -> None:
+    data = {
+        "query_offsets": np.asarray([0, 2, 4], np.int64),
+        "region_rows": np.asarray([3, 7, 3, 7], np.int64),
+        "query_offset": np.asarray([1.0, 2.0, 2.0, 3.0]),
+        "ideal_query_offset": np.asarray([2.0, 1.0, 3.0, 2.0]),
+        "weight": np.ones(4),
+    }
+    model = fit_map_region_offset(data, np.asarray([True, True]), 1.0e-6)
+    predicted, seen = predict_map_region_offset(
+        model, np.asarray([4.0, 4.0, 4.0]), np.asarray([3, 7, 99]),
+    )
+    assert seen.tolist() == [True, True, False]
+    assert predicted[0] > predicted[1]
+    assert np.isfinite(predicted).all()
+
+
+def test_plane_normal_calibration_recovers_fixed_linear_bias() -> None:
+    predicted = np.asarray([[1., 0., 0.], [0., 1., 0.], [0., 0., 1.], [1., 1., 1.]])
+    transform = np.asarray([[1., .1, 0.], [0., 1., .2], [.1, 0., 1.]])
+    data = {"query_normal": predicted, "ideal_query_normal": predicted @ transform, "weight": np.ones(4)}
+    recovered = fit_normal_calibration(data)
+    np.testing.assert_allclose(recovered, transform, atol=1.0e-12)

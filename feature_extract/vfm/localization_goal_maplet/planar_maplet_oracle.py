@@ -570,6 +570,20 @@ def solve_scaled_translation(map_normals: np.ndarray, map_offsets: np.ndarray, q
     return solution[:3], float(solution[3]), int(rank), singular
 
 
+def solve_affine_scaled_translation(map_normals: np.ndarray, map_offsets: np.ndarray, query_offsets: np.ndarray, weights: np.ndarray):
+    """Jointly solve camera center and one image-wide query-offset scale/shift."""
+
+    a = np.column_stack((
+        np.asarray(map_normals, np.float64),
+        np.asarray(query_offsets, np.float64),
+        np.ones(np.asarray(query_offsets).shape, dtype=np.float64),
+    ))
+    b = np.asarray(map_offsets, np.float64)
+    w = np.sqrt(np.asarray(weights, np.float64)).reshape(-1, 1)
+    solution, _, rank, singular = np.linalg.lstsq(w * a, w[:, 0] * b, rcond=None)
+    return solution[:3], float(solution[3]), float(solution[4]), int(rank), singular
+
+
 def select_normal_diverse_planes(
     normals: np.ndarray, reliability: np.ndarray, maximum_count: int,
 ) -> np.ndarray:
@@ -640,5 +654,5 @@ __all__ = [
     "convex_polygon_gap", "merge_coplanar_child_regions",
     "strict_planar_side_map_from_child_seeds", "solve_rotation_from_plane_normals",
     "select_normal_diverse_planes", "solve_robust_metric_translation",
-    "solve_scaled_translation",
+    "solve_scaled_translation", "solve_affine_scaled_translation",
 ]

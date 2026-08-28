@@ -117,6 +117,87 @@ MoGe already fails when the mask and correspondence are perfect. The required
 promotion thresholds are therefore on metric offset and normal accuracy, not
 segmentation IoU.
 
+## Camera-contract and plane-source audit
+
+The six-way P0 audit requested after the MoGe-3 result is now complete.  The
+main MoGe-3 run used deterministically undistorted ideal-pinhole RGB and the
+exact SIMPLE_RADIAL-derived pinhole camera.  A second full 88-query run used
+the raw radial images with the same FOV contract.  The raw run changes the
+numbers slightly (balanced robust: 3.41% at 1m/10 degrees, 5.68% at 2m/45
+degrees, median offset error 4.14m), but remains catastrophically below the
+80% gate.  Radial distortion is therefore a real nuisance, not the root cause
+of the multi-metre error.
+
+On the ideal-pinhole run, fitting planes directly to the MoGe-3 point map and
+fitting planes after reconstructing points from MoGe depth with frozen exact K
+are numerically equivalent at the reported scale.  Both give about 15.13
+degrees median rotation error, 11.89m median translation error, and 4.77m
+median offset error.  This rejects a hidden point-map versus depth/K coordinate
+contract mismatch.  The normal-head plus robust-offset branch remains the
+better tested source (15.65 degrees / 9.02m), but it also fails metric pose.
+
+## Low-capacity metric-correction ladder
+
+An image-wide affine scale plus shift was added as a five-unknown analytic
+control.  It is ill-conditioned and worse than the raw metric solver: the
+balanced mass-WLS branch has median translation error 16.74m and the
+normal-diverse branches about 20.51m, with 0% recall at both pose thresholds.
+This formally kills global scale+shift as the correction mechanism.
+
+The first map-conditioned control is also complete.  Pose-free MoGe-3 geometry
+was built for all 98 mapping images on seq9.  GT masks/correspondences were
+used only to form a label-bearing fit artifact.  Regularization and model
+family were selected on an interleaved seq9 validation subset; seq10 was a
+different, held route.  Two deliberately small models were compared:
+
+- global affine plus an L2-shrunk intercept for each matched map region;
+- a continuous ridge using predicted offset, map normal and map offset.
+
+Neither passes.  The selected region model sees only 38.84% of held seq10
+plane observations, gives 0% at 1m/10 degrees and 3.41% at 2m/45 degrees, and
+changes median translation only from 9.019m to 9.005m (P90 32.76m to 26.41m).
+The continuous map-geometry model is already worse on seq9 validation.  Thus
+simple region-ID memorization and low-order map geometry are not the proposed
+map-conditioned recovery head; the missing information must be query-region
+appearance/shape/context (RADIO, bounded polygon cues, and uncertainty).
+
+This result does not kill map-conditioned recovery in general.  It kills the
+cheap low-capacity shortcuts and narrows the next model to a route-disjoint
+region-level predictor with actual query evidence.  Matcher development and
+predicted masks remain blocked until that predictor passes 80% at 1m/10
+degrees under GT masks and correspondence.
+
+A subsequent route-disjoint query-evidence control used the complete
+RADIO-final grid.  GT plane masks were inverse-SIMPLE_RADIAL warped onto the
+36x64 raw RADIO token grid.  Full 1280-D region descriptors were pooled, PCA
+was fit only on seq9 and frozen at 64 dimensions, and the residual regressor
+also received MoGe normals/offsets, map plane geometry, mask extent and an
+analytic projected-area distance proxy.  This still obtained 0% at both pose
+gates on seq9 validation, so the held seq10 selector correctly retained the
+region-intercept control.  The failure is not caused by the earlier 32-group
+RADIO compression.
+
+Finally, a weighted 3x3 normal calibration learned on seq9 was evaluated on
+seq10.  It changes the fraction below 10 degrees only from 26.14% to 27.27%
+and worsens median rotation from 15.65 to 16.35 degrees.  Combined with the
+selected offset correction it remains 0% at 1m/10 degrees and 3.41% at
+2m/45 degrees.  Thus all low-capacity P1 controls are now closed: neither
+distance nor normal can be repaired by global, region-ID, low-order geometry,
+pooled-RADIO ridge, projected-area proxy, or a fixed normal transform.
+
+The next experiment must preserve within-region token layout and explicitly
+predict structured plane geometry/uncertainty (or optimize bounded polygon
+reprojection), rather than regress one scalar from an average descriptor.
+
+## Cross-route map/solver audit
+
+The strong pixel-surface oracle was replayed on seq12 and seq14 without fitting
+query geometry.  Balanced robust reaches 89.36% / 94.68% (1m10 / 2m45) on
+seq12 and 94.44% / 97.22% on seq14, with median translation 0.050m and 0.173m.
+Strict robust is less available but remains precise when usable.  The planar
+side map and solver are therefore not a seq10-only accident; the remaining
+failure is still query measurement recovery.
+
 ## Mainline architecture after this gate
 
 The justified architecture is:
@@ -151,3 +232,12 @@ parameter accuracy passes a meaningful pose threshold.
 - MoGe-3-L geometry and causal ablation:
   `output/g25_pose_transport/planar_query_geometry/moge3_vitl_seq10_full_v1/manifest.json`
   and `gt_mask_planar_pose_parameter_ablation_v1.json`
+- Camera-contract controls:
+  `output/g25_pose_transport/planar_query_geometry/moge3_vitl_seq10_raw_radial_full_v1/gt_mask_planar_pose_normal_head_v1.json`,
+  `output/g25_pose_transport/planar_query_geometry/moge3_vitl_seq10_full_v1/gt_mask_planar_pose_point_pca_v1.json`,
+  and `gt_mask_planar_pose_depth_exact_k_pca_v1.json`
+- Map-conditioned low-capacity control:
+  `output/g25_pose_transport/planar_query_geometry/map_conditioned_offset_v1/seq9fit_seq10held_plane_parameter_recovery_v6.json`
+- Cross-route strong oracles:
+  `output/g25_pose_transport/planar_query_geometry/planar_pixel_oracle_seq12_crossroute_v1.json`
+  and `planar_pixel_oracle_seq14_crossroute_v1.json`
