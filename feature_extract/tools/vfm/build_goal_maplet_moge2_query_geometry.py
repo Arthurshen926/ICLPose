@@ -52,6 +52,7 @@ def main() -> None:
         ),
     )
     parser.add_argument("--refine_steps", type=int, default=3)
+    parser.add_argument("--use_fp16", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--maximum_queries", type=int, default=0)
     args = parser.parse_args()
     output = Path(args.output_dir).resolve()
@@ -108,7 +109,7 @@ def main() -> None:
         with torch.inference_mode():
             infer_options = {
                 "resolution_level": int(args.resolution_level), "fov_x": fov_x,
-                "use_fp16": True, "apply_mask": True,
+                "use_fp16": bool(args.use_fp16), "apply_mask": True,
             }
             if is_v3:
                 infer_options["refine_steps"] = int(args.refine_steps)
@@ -139,6 +140,7 @@ def main() -> None:
             "moge_repository_commit": repository_commit,
             "resolution_level": int(args.resolution_level), "fov_x_deg": fov_x,
             "refine_steps": int(args.refine_steps) if is_v3 else 0,
+            "use_fp16": bool(args.use_fp16),
             "source_image": str(image_path), "source_image_file_sha256": _sha256(image_path),
             "source_image_width": int(source_width), "source_image_height": int(source_height),
             "source_resized_to_camera_canvas": bool((source_width, source_height) != (width, height)),
@@ -172,6 +174,7 @@ def main() -> None:
         "resolution_level": int(args.resolution_level), "output_width": OUTPUT_WIDTH,
         "output_height": OUTPUT_HEIGHT, "rows": rows,
         "refine_steps": int(args.refine_steps) if is_v3 else 0,
+        "use_fp16": bool(args.use_fp16),
         "uses_pose": False, "uses_ground_truth": False, "production_eligible": False,
         "peak_cuda_allocated_bytes": int(torch.cuda.max_memory_allocated(args.device)),
     }

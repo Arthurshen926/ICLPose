@@ -84,6 +84,31 @@ With ideal offsets, MoGe-3 normals reach 95.45% at 2m/45 degrees, compared with
 fine surface shape, but the tested localization remains blocked by absolute
 metric plane offset.
 
+### MoGe-3 usage audit and official-default rerun
+
+The first MoGe-3 run used resolution level 5 and FP16.  That is a valid fast
+configuration, but not the model's default quality setting.  The full 88-query
+experiment was therefore rerun at resolution level 9, FP32, three refinement
+steps, exact horizontal FOV, default `force_projection=True`, and the frozen
+undistorted 1024x576 ideal-pinhole RGB.  No source image was resized before
+inference.  The repository commit and model weight remain frozen.
+
+Level-9 FP32 modestly improves median plane offset from 4.67m to 4.37m and
+median plane-normal error from 25.70 to 25.01 degrees.  It does not change the
+scientific conclusion: balanced robust remains 0% at 1m/10 degrees, reaches
+only 3.41% at 2m/45 degrees, and has 9.08m / 15.80 degrees median translation /
+rotation error.  With ideal offset, its normals reach 31.82% at 1m/10 degrees
+and 93.18% at 2m/45 degrees.  Peak CUDA allocation is 2.94GB and median
+inference-plus-resize time is 0.659s (p90 0.764s).
+
+The audit found no camera-ray, model-version, FOV, or point/depth projection
+bug that explains the failure.  Two implementation limitations remain and
+must be fixed before a final learned query-plane frontend: outputs are
+post-resized to 256x144 with bilinear interpolation, which can mix geometry at
+depth boundaries, and plane statistics are computed after this resize rather
+than at native MoGe resolution.  They may affect masks/boundaries locally but
+cannot explain the persistent multi-metre interior-plane offset error.
+
 ## Causal parameter ablation
 
 Using the same selected regions and robust solver on the balanced side map:
@@ -198,6 +223,24 @@ Strict robust is less available but remains precise when usable.  The planar
 side map and solver are therefore not a seq10-only accident; the remaining
 failure is still query measurement recovery.
 
+## Planar side-map extraction audit
+
+The balanced map contains 4,113 bounded regions and covers 14.01% of weighted
+2DGS surface; the strict map contains 3,285 regions and covers 8.83%.  Fit
+thresholds are obeyed, component refits are atomic, and convex-polygon gap is
+computed geometrically.  However, this is not yet a clean PlanaReLoc-style
+large-region map: 50.47% of balanced regions and 63.41% of strict regions are
+single-primitive microplanes; only 12.98% / 9.10% exceed 1m².  Balanced merging
+accepts only 51 edges from 4,164 seeds.
+
+This explains the apparently paradoxical result: the oracle solver succeeds
+because thousands of precise microplanes provide enough visible constraints,
+while a real matcher would face severe fragmentation and ambiguous region
+identity.  The current planar map is GO as a geometric oracle/side carrier but
+not yet GO as the final matching representation.  The next extractor needs
+multi-view visible-support consolidation, non-convex/holed boundaries and
+uncertainty-aware region merging without destroying primitive lineage.
+
 ## Mainline architecture after this gate
 
 The justified architecture is:
@@ -232,6 +275,9 @@ parameter accuracy passes a meaningful pose threshold.
 - MoGe-3-L geometry and causal ablation:
   `output/g25_pose_transport/planar_query_geometry/moge3_vitl_seq10_full_v1/manifest.json`
   and `gt_mask_planar_pose_parameter_ablation_v1.json`
+- MoGe-3 official-default level-9 FP32 rerun:
+  `output/g25_pose_transport/planar_query_geometry/moge3_vitl_seq10_level9_fp32_v2/manifest.json`
+  and `gt_mask_normal_head_ablation.json`
 - Camera-contract controls:
   `output/g25_pose_transport/planar_query_geometry/moge3_vitl_seq10_raw_radial_full_v1/gt_mask_planar_pose_normal_head_v1.json`,
   `output/g25_pose_transport/planar_query_geometry/moge3_vitl_seq10_full_v1/gt_mask_planar_pose_point_pca_v1.json`,
