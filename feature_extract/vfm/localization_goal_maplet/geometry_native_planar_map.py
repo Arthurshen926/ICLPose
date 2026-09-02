@@ -22,6 +22,7 @@ from .physical_map import GoalMapletPhysicalMap
 
 
 SCHEMA = "goal_maplet_geometry_native_planar_map_v1"
+PRIMITIVE_SURFACE_SCHEMA = "goal_maplet_primitive_surface_table_v1"
 
 
 def _unit_rows(value: np.ndarray) -> np.ndarray:
@@ -50,6 +51,7 @@ class PrimitiveSurfaceTable:
     scale1: np.ndarray
     scale2: np.ndarray
     opacity: np.ndarray
+    metadata: dict[str, object] | None = None
 
     @classmethod
     def from_physical_map(cls, physical: GoalMapletPhysicalMap) -> "PrimitiveSurfaceTable":
@@ -85,6 +87,53 @@ class PrimitiveSurfaceTable:
             raise ValueError("primitive normals must be unit length")
         return self
 
+    def arrays(self) -> dict[str, np.ndarray]:
+        return {
+            name: np.asarray(getattr(self, name))
+            for name in (
+                "primitive_ids", "centers", "tangent1", "tangent2", "normals",
+                "scale1", "scale2", "opacity",
+            )
+        }
+
+    def save_npz(self, path: Path) -> None:
+        arrays = self.validated().arrays()
+        metadata = dict(self.metadata or {})
+        metadata.update({
+            "artifact_type": PRIMITIVE_SURFACE_SCHEMA,
+            "primitive_count": int(self.primitive_ids.size),
+            "arrays_sha256": arrays_sha256(arrays),
+        })
+        metadata["content_sha256"] = canonical_json_sha256({
+            **{key: value for key, value in metadata.items() if key != "content_sha256"},
+        })
+        np.savez_compressed(
+            Path(path), **arrays,
+            metadata_json=np.asarray(json.dumps(metadata, sort_keys=True)),
+        )
+
+    @classmethod
+    def load_npz(cls, path: Path) -> "PrimitiveSurfaceTable":
+        with np.load(Path(path), allow_pickle=False) as data:
+            metadata = json.loads(str(data["metadata_json"].item()))
+            arrays = {
+                name: np.asarray(data[name])
+                for name in (
+                    "primitive_ids", "centers", "tangent1", "tangent2", "normals",
+                    "scale1", "scale2", "opacity",
+                )
+            }
+        if (
+            metadata.get("artifact_type") != PRIMITIVE_SURFACE_SCHEMA
+            or int(metadata.get("primitive_count", -1)) != len(arrays["primitive_ids"])
+            or metadata.get("arrays_sha256") != arrays_sha256(arrays)
+            or metadata.get("content_sha256") != canonical_json_sha256({
+                **{key: value for key, value in metadata.items() if key != "content_sha256"},
+            })
+        ):
+            raise ValueError("primitive surface table lineage differs")
+        return cls(metadata=metadata, **arrays).validated()
+
 
 @dataclass(frozen=True)
 class GeometryNativePlanarMap:
@@ -104,6 +153,20 @@ class GeometryNativePlanarMap:
     residual_p95_m: np.ndarray
     normal_cosine_p10: np.ndarray
     metadata: dict[str, object]
+
+    @property
+    def boundary_is_visual_summary_only(self) -> bool:
+        """Whether ``boundary_uv`` is a lossy convex visualization summary.
+
+        The actual finite support of a plane is its exact primitive-member
+        inventory.  A convex hull can bridge windows, occlusions, courtyards,
+        and disconnected observed patches, so it must never be rasterized as
+        localization geometry.
+        """
+
+        return self.metadata.get("boundary") == (
+            "convex_summary_plus_exact_member_primitive_inventory"
+        )
 
     def validated(self, primitive_count: int | None = None) -> "GeometryNativePlanarMap":
         count = np.asarray(self.plane_ids).size
@@ -440,6 +503,9 @@ def extract_geometry_native_planar_map(
         "broad_graph_component_count": int(component_count),
         "connectivity": "3d_ellipse_support_knn_graph",
         "boundary": "convex_summary_plus_exact_member_primitive_inventory",
+        "boundary_role": "visualization_and_broad_phase_only",
+        "finite_support_authority": "exact_member_primitive_rows",
+        "boundary_uv_localization_eligible": False,
         "configuration": {
             "neighbors": int(neighbors), "adjacency_normal_degrees": float(adjacency_normal_degrees),
             "adjacency_plane_distance_m": float(adjacency_plane_distance_m),

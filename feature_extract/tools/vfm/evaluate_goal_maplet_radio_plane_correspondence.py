@@ -11,13 +11,18 @@ def main():
  physical=GoalMapletPhysicalMap.load_npz(a.physical_map);plane=GeometryNativePlanarMap.load_npz(a.planar_map,primitive_count=len(physical.primitive_ids));primitive_owner=np.full(len(physical.primitive_ids),-1,np.int64)
  for row in range(len(plane.plane_ids)):lo,hi=map(int,plane.member_offsets[row:row+2]);primitive_owner[plane.member_primitive_rows[lo:hi]]=row
  row_by_id=np.full(int(physical.primitive_ids.max())+1,-1,np.int64);row_by_id[physical.primitive_ids]=np.arange(len(physical.primitive_ids))
- with np.load(a.incidence,allow_pickle=False) as d:offset=np.asarray(d['plane_cell_offsets']);child=np.asarray(d['child_rows']);mass=np.asarray(d['surface_mass_m2'])
+ with np.load(a.incidence,allow_pickle=False) as d:
+  offset=np.asarray(d['plane_cell_offsets']);child=np.asarray(d['child_rows']);mass=np.asarray(d['surface_mass_m2']);incidence_meta=json.loads(str(d['metadata_json'].item()))
+ incidence_plane_count=int(offset.size-1)
+ if incidence_plane_count!=len(plane.plane_ids) or int(incidence_meta.get('plane_count',-1))!=len(plane.plane_ids):
+  raise ValueError(f'incidence/planar-map row mismatch: incidence={incidence_plane_count}, map={len(plane.plane_ids)}')
  child_to_planes={}
  for row in range(len(plane.plane_ids)):
   lo,hi=map(int,offset[row:row+2]);total=max(float(mass[lo:hi].sum()),1e-15)
   for c,m in zip(child[lo:hi].tolist(),mass[lo:hi].tolist()):child_to_planes.setdefault(c,[]).append((row,float(m/total)))
- rows=[]
- for path in sorted(a.moge_dir.glob('*.npz')):
+ rows=[];source_dir=a.query_plane_dir if a.query_plane_dir else a.moge_dir
+ for path in sorted(source_dir.glob('*.npz')):
+  if path.name=='manifest.json':continue
   name=path.name;retrieval=a.retrieval_dir/name
   if not retrieval.exists():continue
   if a.query_plane_dir:q,_=QueryPlaneRegions.load_npz(a.query_plane_dir/name)

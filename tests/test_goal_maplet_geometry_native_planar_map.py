@@ -65,3 +65,39 @@ def test_output_explicitly_rejects_voxel_identity_semantics(tmp_path):
     loaded=type(result).load_npz(path,primitive_count=len(rows))
     assert loaded.metadata['uses_parent_child_partition'] is False
     assert loaded.metadata['uses_voxel_identity_or_boundary'] is False
+    assert loaded.boundary_is_visual_summary_only
+    assert loaded.metadata['finite_support_authority'] == 'exact_member_primitive_rows'
+    assert loaded.metadata['boundary_uv_localization_eligible'] is False
+
+
+def test_primitive_surface_table_roundtrip_binds_raw_geometry(tmp_path):
+    table = _table([
+        (np.array([0., 0., 0.]), np.array([0., 0., 1.])),
+        (np.array([.2, 0., 0.]), np.array([0., 0., 1.])),
+    ])
+    table = PrimitiveSurfaceTable(
+        **table.arrays(),
+        metadata={
+            'representation': 'raw_oriented_2dgs_disks_without_parent_child_hierarchy',
+            'uses_parent_child_partition': False,
+        },
+    )
+    path = tmp_path / 'surface.npz'
+    table.save_npz(path)
+    loaded = PrimitiveSurfaceTable.load_npz(path)
+    for name, expected in table.arrays().items():
+        assert np.array_equal(loaded.arrays()[name], expected)
+    assert loaded.metadata['uses_parent_child_partition'] is False
+
+    with np.load(path, allow_pickle=False) as data:
+        arrays = {key: np.asarray(data[key]) for key in table.arrays()}
+        metadata_json = np.asarray(data['metadata_json'])
+    arrays['centers'] = arrays['centers'].copy()
+    arrays['centers'][0, 0] += 1.
+    np.savez_compressed(path, **arrays, metadata_json=metadata_json)
+    try:
+        PrimitiveSurfaceTable.load_npz(path)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('tampered primitive geometry must fail closed')

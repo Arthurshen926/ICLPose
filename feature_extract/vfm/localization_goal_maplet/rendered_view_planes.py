@@ -81,10 +81,14 @@ def extract_rendered_plane_observations(
     with np.load(Path(contributor_path),allow_pickle=False) as d:
         ids=np.asarray(d['topk_ids'][:,:,0],np.int64);depth=np.asarray(d['dominant_depth'],np.float64)
         pose=np.asarray(d['pose_w2c'],np.float64);model=int(d['camera_model_id']);cw=int(d['camera_width']);ch=int(d['camera_height']);params=np.asarray(d['camera_params'],np.float64)
-    if model != 2 or params.size < 3: raise ValueError('rendered plane extraction requires SIMPLE_RADIAL source camera')
+    if model == 1 and params.size >= 4:
+        source_fx,source_fy,source_cx,source_cy=map(float,params[:4])
+    elif model in (0,2,8) and params.size >= 3:
+        source_fx=source_fy=float(params[0]);source_cx=float(params[1]);source_cy=float(params[2])
+    else:raise ValueError('rendered plane extraction requires a supported centered COLMAP camera')
     h,w=ids.shape; maximum_id=int(np.max(table.primitive_ids));row_by_id=np.full(maximum_id+1,-1,np.int32);row_by_id[table.primitive_ids]=np.arange(table.primitive_ids.size,dtype=np.int32)
     valid=(ids>=0)&(ids<=maximum_id)&np.isfinite(depth)&(depth>0);rows=np.full(ids.shape,-1,np.int64);rows[valid]=row_by_id[ids[valid]];valid &= rows>=0
-    fx=float(params[0])*w/cw;fy=float(params[0])*h/ch;cx=float(params[1])*w/cw;cy=float(params[2])*h/ch
+    fx=source_fx*w/cw;fy=source_fy*h/ch;cx=source_cx*w/cw;cy=source_cy*h/ch
     yy,xx=np.meshgrid(np.arange(h,dtype=np.float64)+.5,np.arange(w,dtype=np.float64)+.5,indexing='ij')
     camera=np.stack(((xx-cx)/fx*depth,(yy-cy)/fy*depth,depth),axis=-1)
     world=(camera-pose[:3,3])@pose[:3,:3]
