@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import time
 from pathlib import Path
 
@@ -23,14 +24,23 @@ from feature_extract.vfm.localization_goal_maplet.lineage import (
     file_sha256,
 )
 from feature_extract.vfm.localization_goal_maplet.physical_map import GoalMapletPhysicalMap
+from feature_extract.vfm.localization_goal_maplet.query_plane_regions import QueryPlaneRegions
 from feature_extract.vfm.localization_goal_maplet.visibility import signed_surface_visibility
 from feature_extract.vfm.localization_v6.primitive_contributors import (
     render_primitive_contributors,
 )
-from feature_extract.vfm.vfm_2dgs_mapping import SurfaceElementMap
+from feature_extract.vfm.vfm_2dgs_mapping import (
+    SurfaceElementMap,
+    _composite_sorted_packed_hits,
+    _intrinsic_matrix,
+    _surface_element_quaternions_and_scales,
+)
 
 from feature_extract.tools.vfm.evaluate_goal_maplet_radio_plane_pnp import (
     _camera_inventory,
+)
+from feature_extract.tools.vfm.build_goal_maplet_sparse_first_render_plan import (
+    _load_sparse_first_plan,
 )
 
 
@@ -77,13 +87,17 @@ def _load_frozen_poses(path: Path) -> tuple[dict[str, np.ndarray], dict[str, obj
             "goal_maplet_direct_plane_pnp_multiscale_reliability_cascade_v6",
             "goal_maplet_direct_plane_pnp_multiscale_reliability_cascade_v7",
             "goal_maplet_moge3_plane_scale_surface_refinement_v1",
+            "goal_maplet_moge3_plane_scale_surface_refinement_v2",
             "goal_maplet_canonical_plane_uv_view_geometry_refined_pose_v1",
             "goal_maplet_uncertainty_weighted_plane_pose_refinement_v1",
         )
         or metadata.get("query_pose_or_ground_truth_read", False) is not False
         or (
             depth_used is not (
-                True if artifact_type == "goal_maplet_moge3_plane_scale_surface_refinement_v1"
+                True if artifact_type in {
+                    "goal_maplet_moge3_plane_scale_surface_refinement_v1",
+                    "goal_maplet_moge3_plane_scale_surface_refinement_v2",
+                }
                 else False
             )
         )
@@ -97,6 +111,52 @@ def _load_frozen_poses(path: Path) -> tuple[dict[str, np.ndarray], dict[str, obj
     if not np.isfinite(arrays["pose_w2c"][usable]).all():
         raise ValueError("usable frozen PnP pose is nonfinite")
     return arrays, metadata
+
+
+def _validate_query_camera_lineage(
+    pose_metadata: dict[str, object],
+    query_camera_inventory: Path,
+    frozen_correspondence: Path | None,
+) -> dict[str, object] | None:
+    """Replay the pose -> correspondence -> camera chain when it is indirect.
+
+    Early pose inventories copied the query-camera hash into their own
+    metadata.  The current uncertainty-refined endpoints instead bind the
+    complete frozen-correspondence artifact, whose metadata owns that hash.
+    Accepting the latter without replaying the intermediate bytes would turn a
+    useful lineage compression into a camera-substitution hole.
+    """
+
+    camera_sha = file_sha256(query_camera_inventory)
+    if pose_metadata.get("query_camera_only_inventory_file_sha256") == camera_sha:
+        if frozen_correspondence is not None:
+            raise ValueError("direct camera lineage must not supply an unrelated correspondence")
+        return None
+    if frozen_correspondence is None:
+        raise ValueError(
+            "frozen poses use indirect camera lineage; --frozen_correspondence is required"
+        )
+    expected_file = pose_metadata.get("frozen_correspondence_file_sha256")
+    expected_content = pose_metadata.get("frozen_correspondence_content_sha256")
+    if file_sha256(frozen_correspondence) != expected_file:
+        raise ValueError("frozen pose does not bind the supplied correspondence bytes")
+    with np.load(frozen_correspondence, allow_pickle=False) as data:
+        if "metadata_json" not in data.files:
+            raise ValueError("frozen correspondence metadata is missing")
+        correspondence_metadata = json.loads(str(data["metadata_json"].item()))
+        correspondence_arrays = {
+            name: np.asarray(data[name]) for name in data.files if name != "metadata_json"
+        }
+    if (
+        arrays_sha256(correspondence_arrays)
+        != correspondence_metadata.get("arrays_sha256")
+        or correspondence_metadata.get("content_sha256") != expected_content
+        or correspondence_metadata.get("query_camera_only_inventory_file_sha256")
+        != camera_sha
+        or correspondence_metadata.get("pose_or_ground_truth_opened") is not False
+    ):
+        raise ValueError("frozen correspondence camera lineage differs")
+    return correspondence_metadata
 
 
 def _metric_depth_normal_agreement(
@@ -233,24 +293,304 @@ def _elements(physical: GoalMapletPhysicalMap, rows: np.ndarray) -> SurfaceEleme
     )
 
 
+def _resident_render_primitive_batches(
+    physical: GoalMapletPhysicalMap,
+    poses_w2c: np.ndarray,
+    cameras: list[ColmapCamera],
+    usable: np.ndarray,
+    *,
+    width: int,
+    height: int,
+    batch_size: int,
+    device: str,
+    minimum_incidence: float,
+    gpu_composite: bool,
+) -> dict[int, tuple[np.ndarray, np.ndarray, int]]:
+    """Render exact dominant primitive/depth buffers with resident geometry.
+
+    This is algebraically the same gsplat projection, tile rasterization and
+    deterministic alpha compositor as ``render_primitive_contributors``.  The
+    only optimization is keeping static map tensors resident and evaluating a
+    small batch of independently frozen camera hypotheses together.
+    """
+
+    try:
+        import torch
+        from gsplat.cuda._wrapper import (
+            fully_fused_projection_2dgs,
+            isect_offset_encode,
+            isect_tiles,
+            rasterize_to_indices_in_range_2dgs,
+        )
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError("torch and gsplat CUDA wrappers are required") from exc
+    torch_device = torch.device(str(device))
+    if torch_device.type != "cuda" or not torch.cuda.is_available():
+        raise RuntimeError("resident primitive rendering requires CUDA")
+    pose_array = np.asarray(poses_w2c, np.float64)
+    valid = np.asarray(usable, bool)
+    if (
+        pose_array.ndim != 3
+        or pose_array.shape[1:] != (4, 4)
+        or len(cameras) != len(pose_array)
+        or valid.shape != (len(pose_array),)
+        or int(batch_size) <= 0
+    ):
+        raise ValueError("resident primitive render inventory differs")
+    all_rows = np.arange(len(physical.primitive_ids), dtype=np.int64)
+    elements = _elements(physical, all_rows)
+    quaternions, scales = _surface_element_quaternions_and_scales(elements)
+    means = torch.as_tensor(
+        physical.primitive_centers, dtype=torch.float32, device=torch_device,
+    ).contiguous()
+    quats = torch.as_tensor(
+        quaternions, dtype=torch.float32, device=torch_device,
+    ).contiguous()
+    scale = torch.as_tensor(
+        scales, dtype=torch.float32, device=torch_device,
+    ).contiguous()
+    opacity = torch.as_tensor(
+        physical.primitive_opacity, dtype=torch.float32, device=torch_device,
+    ).reshape(-1).clamp(0.0, 1.0).contiguous()
+    stable_ids = np.asarray(physical.primitive_ids, np.int64)
+    output: dict[int, tuple[np.ndarray, np.ndarray, int]] = {}
+    usable_indices = np.flatnonzero(valid)
+    tile_size = 16
+    tile_width = math.ceil(int(width) / tile_size)
+    tile_height = math.ceil(int(height) / tile_size)
+    for begin in range(0, len(usable_indices), int(batch_size)):
+        indices = usable_indices[begin:begin + int(batch_size)]
+        batch = len(indices)
+        pose = torch.as_tensor(
+            pose_array[indices].astype(np.float32),
+            dtype=torch.float32, device=torch_device,
+        ).contiguous()
+        intrinsic = torch.as_tensor(
+            np.stack([
+                _intrinsic_matrix(cameras[int(index)], int(width), int(height))
+                for index in indices.tolist()
+            ]).astype(np.float32),
+            dtype=torch.float32, device=torch_device,
+        ).contiguous()
+        radii, means2d, depths, transforms, _normals = fully_fused_projection_2dgs(
+            means, quats, scale, pose, intrinsic, int(width), int(height), packed=False,
+        )
+        front_numpy = np.stack([
+            signed_surface_visibility(
+                physical.primitive_centers,
+                physical.primitive_normals,
+                physical.primitive_sidedness,
+                pose_array[int(index)],
+                minimum_incidence=float(minimum_incidence),
+            )[0]
+            for index in indices.tolist()
+        ])
+        front = torch.as_tensor(
+            front_numpy, dtype=torch.bool, device=torch_device,
+        ).contiguous()
+        radii = torch.where(front, radii, torch.zeros_like(radii)).contiguous()
+        per_camera_opacity = (
+            opacity[None, :].expand(batch, -1) * front.to(torch.float32)
+        ).contiguous()
+        _tiles, isect_ids, flatten_ids = isect_tiles(
+            means2d, radii, depths, tile_size, tile_width, tile_height,
+            packed=False, n_cameras=batch,
+        )
+        offsets = isect_offset_encode(
+            isect_ids, batch, tile_width, tile_height,
+        )
+        transmittance = torch.ones(
+            (batch, int(height), int(width)),
+            dtype=torch.float32, device=torch_device,
+        )
+        gs_ids, pixel_ids, camera_ids = rasterize_to_indices_in_range_2dgs(
+            0, 1_000_000_000, transmittance, means2d, transforms,
+            per_camera_opacity, int(width), int(height), tile_size,
+            offsets, flatten_ids,
+        )
+        if gs_ids.numel() == 0:
+            for local, index in enumerate(indices.tolist()):
+                output[int(index)] = (
+                    np.full((int(height), int(width)), -1, np.int64),
+                    np.zeros((int(height), int(width)), np.float32),
+                    int(np.sum(front_numpy[local])),
+                )
+            continue
+        pixel_x = (pixel_ids % int(width)).to(torch.float32) + 0.5
+        pixel_y = (pixel_ids // int(width)).to(torch.float32) + 0.5
+        pixel_coordinates = torch.stack([pixel_x, pixel_y], dim=-1)
+        deltas = pixel_coordinates - means2d[camera_ids, gs_ids]
+        transform = transforms[camera_ids, gs_ids]
+        h_u = -transform[..., 0, :3] + transform[..., 2, :3] * pixel_x[..., None]
+        h_v = -transform[..., 1, :3] + transform[..., 2, :3] * pixel_y[..., None]
+        temporary = torch.cross(h_u, h_v, dim=-1)
+        denominator = temporary[..., 2]
+        denominator = torch.where(
+            torch.abs(denominator) < 1e-12,
+            torch.where(denominator >= 0.0, 1e-12, -1e-12),
+            denominator,
+        )
+        local_u = temporary[..., 0] / denominator
+        local_v = temporary[..., 1] / denominator
+        sigma_3d = local_u * local_u + local_v * local_v
+        sigma_2d = 2.0 * torch.sum(deltas * deltas, dim=1)
+        sigma = 0.5 * torch.minimum(sigma_3d, sigma_2d)
+        alpha = torch.clamp(
+            per_camera_opacity[camera_ids, gs_ids] * torch.exp(-sigma), max=0.999,
+        )
+        global_pixels = camera_ids.to(torch.int64) * (int(width) * int(height)) + pixel_ids
+        if bool(gpu_composite):
+            from feature_extract.vfm.localization_goal_maplet.resident_surface_renderer import (
+                _composite_packed_hits_torch,
+            )
+            hit_pixel_t, hit_row_t, hit_weight_t = _composite_packed_hits_torch(
+                global_pixels.to(torch.int64).contiguous(),
+                depths[camera_ids, gs_ids].to(torch.float32).contiguous(),
+                gs_ids.to(torch.int64).contiguous(),
+                alpha.to(torch.float32).contiguous(),
+            )
+            hit_pixel = hit_pixel_t.detach().cpu().numpy()
+            hit_row = hit_row_t.detach().cpu().numpy()
+            hit_weight = hit_weight_t.detach().cpu().numpy()
+        else:
+            packed = torch.stack([
+                global_pixels.to(torch.float64),
+                depths[camera_ids, gs_ids].to(torch.float64),
+                gs_ids.to(torch.float64),
+                alpha.to(torch.float64),
+            ], dim=1).detach().cpu().numpy()
+            order = np.lexsort((packed[:, 2], packed[:, 1], packed[:, 0]))
+            hit_pixel, hit_row, hit_weight = _composite_sorted_packed_hits(packed[order])
+        pixels_per_camera = int(width) * int(height)
+        depth_numpy = depths.detach().cpu().numpy()
+        for local, index in enumerate(indices.tolist()):
+            lower = local * pixels_per_camera
+            mask = (hit_pixel >= lower) & (hit_pixel < lower + pixels_per_camera)
+            local_pixel = hit_pixel[mask] - lower
+            local_row = hit_row[mask]
+            local_weight = hit_weight[mask]
+            dominant = np.full((pixels_per_camera,), -1, np.int64)
+            depth_image = np.zeros((pixels_per_camera,), np.float32)
+            if local_pixel.size:
+                ranking = np.lexsort((stable_ids[local_row], -local_weight, local_pixel))
+                sorted_pixel = local_pixel[ranking]
+                keep = np.r_[True, sorted_pixel[1:] != sorted_pixel[:-1]]
+                chosen = ranking[keep]
+                chosen_pixel = local_pixel[chosen]
+                chosen_row = local_row[chosen]
+                dominant[chosen_pixel] = stable_ids[chosen_row]
+                depth_image[chosen_pixel] = depth_numpy[local, chosen_row]
+            output[int(index)] = (
+                dominant.reshape(int(height), int(width)),
+                depth_image.reshape(int(height), int(width)),
+                int(np.sum(front_numpy[local])),
+            )
+    return output
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--frozen_pose_inventory", type=Path, required=True)
     parser.add_argument("--physical_map", type=Path, required=True)
     parser.add_argument("--query_camera_inventory", type=Path, required=True)
+    parser.add_argument(
+        "--query_plane_regions", type=Path,
+        help=(
+            "Optional pose-free MoGe3 plane-region cache. When supplied, the report also "
+            "scores the render on observed finite planar pixels only."
+        ),
+    )
+    parser.add_argument(
+        "--frozen_correspondence",
+        type=Path,
+        help="Required when the final pose binds its camera through a correspondence artifact.",
+    )
+    parser.add_argument(
+        "--sparse_first_render_plan", type=Path,
+        help=(
+            "Optional pose/label-free plan that renders only queries where the frozen "
+            "sparse geometry test leaves the dense score able to change the decision."
+        ),
+    )
     parser.add_argument("--moge3_query", type=Path, nargs="+", required=True)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument(
+        "--resident_batch_size", type=int, default=4,
+        help="Keep full map geometry resident and render this many frozen poses per CUDA batch.",
+    )
+    parser.add_argument(
+        "--resident_gpu_composite", dest="resident_gpu_composite",
+        action="store_true", help="Use the deterministic GPU compositor (default).",
+    )
+    parser.add_argument(
+        "--no_resident_gpu_composite", dest="resident_gpu_composite",
+        action="store_false",
+        help="Disable the GPU compositor; required with batch size one for the legacy path.",
+    )
+    parser.set_defaults(resident_gpu_composite=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.output.exists():
         raise FileExistsError("refusing to overwrite render-consistency artifact")
-
+    if bool(args.resident_gpu_composite) and int(args.resident_batch_size) <= 1:
+        raise ValueError("resident GPU compositing requires resident_batch_size > 1")
     poses, pose_meta = _load_frozen_poses(args.frozen_pose_inventory)
+    sparse_plan = None
+    sparse_plan_meta = None
+    render_required = np.ones(len(poses["names"]), bool)
+    if args.sparse_first_render_plan is not None:
+        sparse_plan, sparse_plan_meta = _load_sparse_first_plan(args.sparse_first_render_plan)
+        pose_sha = file_sha256(args.frozen_pose_inventory)
+        pose_content = pose_meta.get("content_sha256")
+        if (
+            not np.array_equal(
+                poses["names"].astype(str), sparse_plan["names"].astype(str),
+            )
+            or not (
+                (
+                    sparse_plan_meta.get("primary_pose_file_sha256") == pose_sha
+                    and sparse_plan_meta.get("primary_pose_content_sha256") == pose_content
+                )
+                or (
+                    sparse_plan_meta.get("alternate_pose_file_sha256") == pose_sha
+                    and sparse_plan_meta.get("alternate_pose_content_sha256") == pose_content
+                )
+            )
+        ):
+            raise ValueError("sparse-first render plan does not bind this pose inventory")
+        render_required = np.asarray(sparse_plan["dense_render_required"], bool)
     camera_rows, camera_meta = _camera_inventory(args.query_camera_inventory)
-    if pose_meta.get("query_camera_only_inventory_file_sha256") != file_sha256(
-        args.query_camera_inventory
-    ):
-        raise ValueError("frozen poses and query camera inventory differ")
+    correspondence_meta = _validate_query_camera_lineage(
+        pose_meta, args.query_camera_inventory, args.frozen_correspondence,
+    )
+    query_plane_manifest_path = None
+    query_plane_manifest = None
+    query_plane_rows: dict[str, tuple[int, int, str]] = {}
+    if args.query_plane_regions is not None:
+        query_plane_manifest_path = args.query_plane_regions / "manifest.json"
+        query_plane_manifest = json.loads(query_plane_manifest_path.read_text())
+        plane_manifest_rows = query_plane_manifest.get("rows")
+        if (
+            query_plane_manifest.get("artifact_type") not in {
+                "goal_maplet_query_plane_region_cache_run_v1",
+                "goal_maplet_query_plane_region_cache_run_v2",
+                "goal_maplet_query_plane_region_cache_run_v3",
+            }
+            or query_plane_manifest.get("uses_pose_or_ground_truth") is not False
+            or not isinstance(plane_manifest_rows, list)
+        ):
+            raise ValueError("query-plane manifest differs")
+        for plane_manifest_row in plane_manifest_rows:
+            if not isinstance(plane_manifest_row, list) or len(plane_manifest_row) != 4:
+                raise ValueError("query-plane manifest row differs")
+            plane_name = str(plane_manifest_row[0])
+            if plane_name in query_plane_rows:
+                raise ValueError("query-plane manifest contains duplicate names")
+            query_plane_rows[plane_name] = (
+                int(plane_manifest_row[1]),
+                int(plane_manifest_row[2]),
+                str(plane_manifest_row[3]),
+            )
     manifests = []
     manifest_rows: dict[str, tuple[Path, dict[str, object]]] = {}
     for root in args.moge3_query:
@@ -274,9 +614,40 @@ def main() -> None:
     row_by_id[physical.primitive_ids] = np.arange(len(physical.primitive_ids), dtype=np.int32)
     rows = []
     start = time.perf_counter()
+    resident_rendered = None
+    if int(args.resident_batch_size) > 1:
+        cameras = []
+        for name in poses["names"].astype(str).tolist():
+            if name not in camera_rows:
+                raise ValueError("resident render input lacks a query camera")
+            model_id, camera_width, camera_height, camera_params = camera_rows[name]
+            cameras.append(ColmapCamera(
+                camera_id=0,
+                model_id=int(model_id),
+                width=int(camera_width),
+                height=int(camera_height),
+                params=tuple(float(value) for value in np.asarray(camera_params).tolist()),
+            ))
+        resident_rendered = _resident_render_primitive_batches(
+            physical,
+            poses["pose_w2c"],
+            cameras,
+            np.asarray(poses["usable"], bool) & render_required,
+            width=256,
+            height=144,
+            batch_size=int(args.resident_batch_size),
+            device=args.device,
+            minimum_incidence=0.05,
+            gpu_composite=bool(args.resident_gpu_composite),
+        )
     for index, name in enumerate(poses["names"].astype(str).tolist()):
         row: dict[str, object] = {"name": name, "usable": bool(poses["usable"][index])}
+        if sparse_plan is not None:
+            row["dense_score_evaluated"] = bool(row["usable"] and render_required[index])
         if not row["usable"]:
+            rows.append(row)
+            continue
+        if sparse_plan is not None and not render_required[index]:
             rows.append(row)
             continue
         if name not in camera_rows or name not in manifest_rows:
@@ -292,17 +663,26 @@ def main() -> None:
             moge_meta = json.loads(str(data["metadata_json"].item()))
         if moge_meta.get("content_sha256") != moge_row.get("content_sha256"):
             raise ValueError("MoGe3 embedded metadata differs")
+        query_plane = None
+        if args.query_plane_regions is not None:
+            if name not in query_plane_rows:
+                raise ValueError("query-plane cache lacks a rendered query")
+            query_plane, query_plane_meta = QueryPlaneRegions.load_npz(
+                args.query_plane_regions / name,
+            )
+            plane_count, plane_pixels, plane_content = query_plane_rows[name]
+            if (
+                query_plane_meta.get("content_sha256") != plane_content
+                or query_plane_meta.get("uses_pose_or_ground_truth") is not False
+                or query_plane_meta.get("source_file_sha256") != file_sha256(moge_path)
+                or query_plane_meta.get("source_name") != name
+                or len(query_plane.normals_camera) != plane_count
+                or int(np.sum(query_plane.pixel_counts)) != plane_pixels
+                or query_plane.labels.shape != query_valid.shape
+            ):
+                raise ValueError("query-plane cache does not replay MoGe3 geometry")
 
         pose = np.asarray(poses["pose_w2c"][index], np.float64)
-        front, _ = signed_surface_visibility(
-            physical.primitive_centers,
-            physical.primitive_normals,
-            physical.primitive_sidedness,
-            pose,
-            minimum_incidence=0.05,
-        )
-        scene_rows = np.flatnonzero(front)
-        elements = _elements(physical, scene_rows)
         model_id, width, height, params = camera_rows[name]
         camera = ColmapCamera(
             camera_id=0,
@@ -311,16 +691,30 @@ def main() -> None:
             height=int(height),
             params=tuple(float(value) for value in np.asarray(params).tolist()),
         )
-        view = GaussianVFMFeatureView(
-            image_id=name,
-            feature_map=np.zeros((1, 144, 256), np.float32),
-            pose_w2c=pose,
-            camera=camera,
-        )
-        rendered = render_primitive_contributors(
-            elements, view, width=256, height=144, top_k=1, device=args.device,
-        )
-        dominant = np.asarray(rendered.dominant_ids, np.int64)
+        if resident_rendered is None:
+            front, _ = signed_surface_visibility(
+                physical.primitive_centers,
+                physical.primitive_normals,
+                physical.primitive_sidedness,
+                pose,
+                minimum_incidence=0.05,
+            )
+            scene_rows = np.flatnonzero(front)
+            elements = _elements(physical, scene_rows)
+            view = GaussianVFMFeatureView(
+                image_id=name,
+                feature_map=np.zeros((1, 144, 256), np.float32),
+                pose_w2c=pose,
+                camera=camera,
+            )
+            rendered = render_primitive_contributors(
+                elements, view, width=256, height=144, top_k=1, device=args.device,
+            )
+            dominant = np.asarray(rendered.dominant_ids, np.int64)
+            rendered_depth = rendered.primitive_depth
+            front_facing_count = int(len(scene_rows))
+        else:
+            dominant, rendered_depth, front_facing_count = resident_rendered[index]
         valid_id = (dominant >= 0) & (dominant <= max_id)
         primitive_rows = np.full(dominant.shape, -1, np.int32)
         primitive_rows[valid_id] = row_by_id[dominant[valid_id]]
@@ -330,14 +724,23 @@ def main() -> None:
             physical.primitive_normals[primitive_rows[valid_id]] @ pose[:3, :3].T
         )
         score = _metric_depth_normal_agreement(
-            rendered.primitive_depth,
+            rendered_depth,
             normal_camera,
             query_depth,
             query_normal,
             query_valid,
         )
         row.update(score)
-        row["front_facing_primitive_count"] = int(len(scene_rows))
+        if query_plane is not None:
+            planar_score = _metric_depth_normal_agreement(
+                rendered_depth,
+                normal_camera,
+                query_depth,
+                query_normal,
+                query_valid & (query_plane.labels >= 0),
+            )
+            row.update({f"planar_{key}": value for key, value in planar_score.items()})
+        row["front_facing_primitive_count"] = front_facing_count
         rows.append(row)
         print(json.dumps({"completed": index + 1, "total": len(poses["names"]), "name": name}))
 
@@ -357,16 +760,52 @@ def main() -> None:
         "physical_map_content_sha256": physical.content_sha256,
         "query_camera_inventory_file_sha256": file_sha256(args.query_camera_inventory),
         "query_camera_inventory_content_sha256": camera_meta.get("content_sha256"),
+        "query_plane_manifest_file_sha256": (
+            None if query_plane_manifest_path is None
+            else file_sha256(query_plane_manifest_path)
+        ),
+        "query_plane_manifest_artifact_type": (
+            None if query_plane_manifest is None
+            else query_plane_manifest.get("artifact_type")
+        ),
+        "planar_pixel_score_role": (
+            None if query_plane_manifest is None
+            else "observed_finite_MoGe3_plane_pixels_only_missing_render_is_failure"
+        ),
+        "frozen_correspondence_file_sha256": (
+            None if args.frozen_correspondence is None else file_sha256(args.frozen_correspondence)
+        ),
+        "frozen_correspondence_content_sha256": (
+            None if correspondence_meta is None else correspondence_meta.get("content_sha256")
+        ),
         "moge3_manifest_file_sha256_in_order": [file_sha256(path) for path, _ in manifests],
         "moge3_manifest_content_sha256_in_order": [
             manifest.get("content_sha256") for _, manifest in manifests
         ],
-        "renderer": "clean_2dgs_disks_alpha_transmittance_dominant_depth",
+        "renderer": (
+            "clean_2dgs_disks_alpha_transmittance_dominant_depth"
+            if resident_rendered is None
+            else "resident_batched_clean_2dgs_disks_alpha_transmittance_dominant_depth"
+        ),
+        "resident_batch_size": int(args.resident_batch_size),
+        "resident_gpu_composite": bool(args.resident_gpu_composite),
         "minimum_front_incidence": 0.05,
         "elapsed_seconds": float(time.perf_counter() - start),
         "production_eligible": False,
         "rows": rows,
     }
+    if sparse_plan is not None:
+        report.update({
+            "sparse_first_render_plan_file_sha256": file_sha256(
+                args.sparse_first_render_plan,
+            ),
+            "sparse_first_render_plan_content_sha256": sparse_plan_meta.get(
+                "content_sha256",
+            ),
+            "dense_render_query_count": int(np.sum(
+                np.asarray(poses["usable"], bool) & render_required,
+            )),
+        })
     report["content_sha256"] = canonical_json_sha256(report)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")

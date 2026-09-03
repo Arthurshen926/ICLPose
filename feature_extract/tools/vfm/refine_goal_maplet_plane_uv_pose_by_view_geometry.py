@@ -141,8 +141,11 @@ def main() -> None:
         "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v2",
         "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v3",
         "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v4",
+        "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v5",
+        "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v6",
+        "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v7",
     ):
-        raise ValueError("view-geometry refinement requires correspondence v2, v3, or v4")
+        raise ValueError("view-geometry refinement requires correspondence v2 through v7")
     initial, initial_meta = _load_initial(args.initial_candidates)
     atlas, atlas_meta = _load_atlas(args.plane_uv_atlas)
     names = correspondence["names"].astype(str)

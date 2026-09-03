@@ -29,18 +29,45 @@ def _load(path: Path) -> tuple[dict[str, np.ndarray], dict[str, object]]:
             "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v2",
             "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v3",
             "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v4",
+            "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v5",
+            "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v6",
+            "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v7",
         ):
             keys += ["prototype_atlas_row", "query_plane_visible_fraction", "radio_match_score"]
         if metadata.get("artifact_type") in (
             "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v3",
             "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v4",
+            "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v5",
+            "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v6",
+            "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v7",
         ):
             keys += [
                 "prototype_world_covariance_m2", "prototype_plane_pixel_purity",
                 "prototype_plane_depth_dispersion_m",
             ]
-        if metadata.get("artifact_type") == "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v4":
+        if metadata.get("artifact_type") in (
+            "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v4",
+            "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v5",
+            "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v6",
+            "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v7",
+        ):
             keys += ["query_measurements_xy"]
+        if metadata.get("artifact_type") in (
+            "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v5",
+            "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v6",
+            "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v7",
+        ):
+            keys += ["query_measurement_variance_px2", "correspondence_match_probability"]
+        if metadata.get("artifact_type") in (
+            "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v6",
+            "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v7",
+        ):
+            keys += ["prototype_centroid_covariance_world_m2"]
+        if metadata.get("artifact_type") == "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v7":
+            keys += [
+                "prototype_chart_uv_measurement_m",
+                "prototype_chart_uv_cell_lower_m",
+            ]
         arrays = {key: np.asarray(data[key]) for key in keys}
     count = len(arrays["names"])
     if (
@@ -49,6 +76,9 @@ def _load(path: Path) -> tuple[dict[str, np.ndarray], dict[str, object]]:
             "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v2",
             "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v3",
             "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v4",
+            "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v5",
+            "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v6",
+            "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v7",
         )
         or metadata.get("pose_or_ground_truth_opened") is not False
         or arrays_sha256(arrays) != metadata.get("arrays_sha256")
@@ -66,6 +96,73 @@ def _load(path: Path) -> tuple[dict[str, np.ndarray], dict[str, object]]:
                 metadata.get("query_measurement_semantics")
                 != "centroid_of_observed_same_plane_region_pixels_inside_each_4x4_RADIO_token"
                 or metadata.get("hidden_or_occluded_pixels_added_to_query_measurement") != 0
+            )
+        )
+        or (
+            metadata.get("artifact_type") == "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v5"
+            and (
+                metadata.get("query_measurement_semantics") not in {
+                    "mapping_only_pairwise_RADIO_continuous_subtoken_mean_inside_original_4x4_token",
+                    "mapping_only_RADIO_query_to_anonymous_atlas_prototype_continuous_subtoken_mean_inside_original_4x4_token",
+                }
+                or metadata.get("query_measurement_uncertainty_semantics")
+                != "predicted_isotropic_centroid_measurement_variance_px2_not_surface_footprint"
+                or arrays["query_measurement_variance_px2"].shape != (len(arrays["world_points"]),)
+                or arrays["correspondence_match_probability"].shape != (len(arrays["world_points"]),)
+                or np.any(arrays["query_measurement_variance_px2"] <= 0.0)
+                or np.any((arrays["correspondence_match_probability"] < 0.0)
+                          | (arrays["correspondence_match_probability"] > 1.0))
+            )
+        )
+        or (
+            metadata.get("artifact_type") in {
+                "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v6",
+                "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v7",
+            }
+            and (
+                metadata.get("query_measurement_semantics")
+                != "mapping_only_joint_query_subtoken_and_continuous_chartUV_surface_coordinate_mean"
+                or metadata.get("query_measurement_uncertainty_semantics")
+                != "predicted_query_centroid_variance_px2_plus_tangent_chartUV_centroid_covariance_world_m2_not_surface_footprint"
+                or arrays["query_measurement_variance_px2"].shape != (len(arrays["world_points"]),)
+                or arrays["correspondence_match_probability"].shape != (len(arrays["world_points"]),)
+                or arrays["prototype_centroid_covariance_world_m2"].shape
+                != (len(arrays["world_points"]), 3, 3)
+                or np.any(arrays["query_measurement_variance_px2"] <= 0.0)
+                or np.any((arrays["correspondence_match_probability"] < 0.0)
+                          | (arrays["correspondence_match_probability"] > 1.0))
+                or not np.all(np.isfinite(arrays["prototype_centroid_covariance_world_m2"]))
+                or (
+                    metadata.get("artifact_type")
+                    == "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v7"
+                    and (
+                        metadata.get("chart_uv_metric_cell_support_enforced") is not True
+                        or arrays.get("prototype_chart_uv_measurement_m", np.zeros((0, 2))).shape
+                        != (len(arrays["world_points"]), 2)
+                        or arrays.get("prototype_chart_uv_cell_lower_m", np.zeros((0, 2))).shape
+                        != (len(arrays["world_points"]), 2)
+                        or not np.isfinite(float(metadata.get("chart_uv_metric_cell_size_m", -1.0)))
+                        or float(metadata.get("chart_uv_metric_cell_size_m", -1.0)) <= 0.0
+                        or not np.all(np.isfinite(arrays["prototype_chart_uv_measurement_m"]))
+                        or not np.all(np.isfinite(arrays["prototype_chart_uv_cell_lower_m"]))
+                        or not np.array_equal(
+                            np.floor(
+                                arrays["prototype_chart_uv_measurement_m"]
+                                / float(metadata.get("chart_uv_metric_cell_size_m", -1.0))
+                            ) * float(metadata.get("chart_uv_metric_cell_size_m", -1.0)),
+                            arrays["prototype_chart_uv_cell_lower_m"],
+                        )
+                        or np.any(
+                            arrays["prototype_chart_uv_measurement_m"]
+                            < arrays["prototype_chart_uv_cell_lower_m"]
+                        )
+                        or np.any(
+                            arrays["prototype_chart_uv_measurement_m"]
+                            >= arrays["prototype_chart_uv_cell_lower_m"]
+                            + float(metadata.get("chart_uv_metric_cell_size_m", -1.0))
+                        )
+                    )
+                )
             )
         )
     ):

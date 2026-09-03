@@ -38,6 +38,7 @@ def _poses(path: Path) -> tuple[dict[str, np.ndarray], dict[str, object]]:
     if (
         metadata.get("artifact_type") not in (
             "goal_maplet_moge3_plane_scale_surface_refinement_v1",
+            "goal_maplet_moge3_plane_scale_surface_refinement_v2",
             "goal_maplet_uncertainty_weighted_plane_pose_refinement_v1",
         )
         or metadata.get("query_pose_or_ground_truth_read") is not False

@@ -54,6 +54,30 @@ def _aggregate_observation_scores(
     return output
 
 
+def _query_subset_names(path: Path | None) -> list[str] | None:
+    """Load a frozen, pose-free query order used only to shard scoring work."""
+
+    if path is None:
+        return None
+    payload = json.loads(path.read_text())
+    if (
+        payload.get("artifact_type")
+        not in {
+            "goal_maplet_direct_radio_to_finite_plane_ranking_v1",
+            "goal_maplet_direct_radio_to_finite_plane_ranking_v2",
+            "goal_maplet_context_fused_direct_radio_to_finite_plane_ranking_v1",
+            "goal_maplet_context_fused_direct_radio_to_finite_plane_ranking_v2",
+        }
+        or payload.get("uses_pose_or_ground_truth") is not False
+        or payload.get("contains_postlabel_fields") is not False
+    ):
+        raise ValueError("query subset inventory is not pose/label-free")
+    names = [str(row["image"]) for row in payload.get("rows", [])]
+    if not names or len(set(names)) != len(names):
+        raise ValueError("query subset inventory is empty or duplicated")
+    return names
+
+
 def _consensus_supplement_ranking(
     own_plane_score: np.ndarray,
     group_plane_scores: np.ndarray,
@@ -115,6 +139,10 @@ def main() -> None:
     parser.add_argument("--candidate_sharing_vote_depth", type=int, default=10)
     parser.add_argument("--candidate_sharing_minimum_votes", type=int, default=2)
     parser.add_argument("--radio_manifest", type=Path, required=True)
+    parser.add_argument(
+        "--query_subset_inventory", type=Path,
+        help="Pose-free ranking whose exact query order shards this ranking run.",
+    )
     parser.add_argument("--context_field", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--topk", type=int, default=10)
@@ -173,6 +201,12 @@ def main() -> None:
     query_paths = sorted(args.query_plane_dir.glob("*.npz"))
     if [path.name for path in query_paths] != list(query_manifest.get("selected_names_in_order", [])):
         raise ValueError("query-plane inventory differs from its run manifest")
+    subset_names = _query_subset_names(args.query_subset_inventory)
+    if subset_names is not None:
+        path_by_name = {path.name: path for path in query_paths}
+        if any(name not in path_by_name for name in subset_names):
+            raise ValueError("query subset is not contained in the query-plane inventory")
+        query_paths = [path_by_name[name] for name in subset_names]
     sparse_carrier = bool(query_manifest.get("sparse_occlusion_carrier", False))
     if sparse_carrier and (
         query_manifest.get("hidden_pixel_count_added") != 0
@@ -380,6 +414,10 @@ def main() -> None:
         "context_field_content_sha256": None if context_meta is None else context_meta.get("content_sha256"),
         "fusion": None if context_descriptor is None else "geometric_mean_of_affine_local_and_view_context_cosine",
         "query_radio_manifest_file_sha256": file_sha256(args.radio_manifest),
+        "query_subset_inventory_file_sha256": (
+            None if args.query_subset_inventory is None
+            else file_sha256(args.query_subset_inventory)
+        ),
         "topk": int(args.topk),
         "token_grid": list(token_grid),
         "rows": rows,

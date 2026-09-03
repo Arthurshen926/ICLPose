@@ -4,7 +4,9 @@ import numpy as np
 
 from feature_extract.tools.vfm.build_goal_maplet_direct_plane_pnp_render_consistency import (
     _metric_depth_normal_agreement,
+    _validate_query_camera_lineage,
 )
+from feature_extract.vfm.localization_goal_maplet.lineage import arrays_sha256, file_sha256
 from feature_extract.tools.vfm.build_goal_maplet_direct_plane_pnp_pair_plan import (
     _pose_distance,
 )
@@ -84,6 +86,36 @@ def test_render_coverage_denominator_is_full_query_valid_domain() -> None:
     assert result["query_valid_pixel_count"] == 32
     assert result["common_valid_pixel_count"] == 16
     assert result["render_coverage_of_query_valid"] == 0.5
+
+
+def test_render_camera_lineage_replays_indirect_correspondence(tmp_path) -> None:
+    camera = tmp_path / "camera.npz"
+    camera.write_bytes(b"camera-only-inventory")
+    arrays = {"names": np.asarray(["q"]), "rows": np.asarray([3], np.int64)}
+    metadata = {
+        "arrays_sha256": arrays_sha256(arrays),
+        "content_sha256": "correspondence-content",
+        "query_camera_only_inventory_file_sha256": file_sha256(camera),
+        "pose_or_ground_truth_opened": False,
+    }
+    correspondence = tmp_path / "correspondence.npz"
+    np.savez_compressed(
+        correspondence, **arrays,
+        metadata_json=np.asarray(__import__("json").dumps(metadata, sort_keys=True)),
+    )
+    pose_metadata = {
+        "frozen_correspondence_file_sha256": file_sha256(correspondence),
+        "frozen_correspondence_content_sha256": "correspondence-content",
+    }
+    replayed = _validate_query_camera_lineage(
+        pose_metadata, camera, correspondence,
+    )
+    assert replayed == metadata
+
+    other_camera = tmp_path / "other-camera.npz"
+    other_camera.write_bytes(b"different-camera")
+    with __import__("pytest").raises(ValueError, match="camera lineage"):
+        _validate_query_camera_lineage(pose_metadata, other_camera, correspondence)
 
 
 def test_pair_plan_pose_distance_uses_camera_centers_and_rotation() -> None:

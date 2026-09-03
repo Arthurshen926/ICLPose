@@ -19,6 +19,20 @@ def test_fixed_hypotheses_use_one_best_row_per_token():
     assert error[0] < error[1]
 
 
+def test_probabilistic_fixed_hypothesis_can_reject_nearest_self_consistent_row():
+    pose = np.eye(4)
+    world = np.asarray([[0.0, 0.0, 2.0], [0.15, 0.0, 2.0]])
+    token = np.asarray([0, 0])
+    pixel = np.asarray([[1.5, 1.5], [1.5, 1.5]])
+    K = np.asarray([[4.0, 0.0, 1.5], [0.0, 4.0, 1.5], [0.0, 0.0, 1.0]])
+    rows, _ = _fixed_token_hypotheses(
+        pose, world, token, pixel, K, 0.0,
+        hypothesis_sigma_px=np.asarray([1.0, 1.0]),
+        correspondence_match_probability=np.asarray([0.001, 0.99]),
+    )
+    assert rows.tolist() == [1]
+
+
 def test_uncertainty_sigma_uses_covariance_dispersion_and_purity():
     pose = np.eye(4)
     world = np.asarray([[0.0, 0.0, 2.0]])
@@ -38,6 +52,51 @@ def test_uncertainty_sigma_uses_covariance_dispersion_and_purity():
     assert covariance[0] > clean[0]
     assert dispersion[0] > clean[0]
     assert impure[0] == 2.0 * clean[0]
+
+
+def test_centroid_variance_excludes_surface_footprint_scatter():
+    pose = np.eye(4)
+    world = np.asarray([[0.0, 0.0, 2.0]])
+    K = np.asarray([[4.0, 0.0, 1.5], [0.0, 4.0, 1.5], [0.0, 0.0, 1.0]])
+    learned = _fixed_reprojection_sigma_px(
+        pose, world, 100.0 * np.eye(3)[None], np.ones(1), np.asarray([100.0]), K,
+        query_measurement_variance_px2=np.asarray([2.25]),
+        include_map_footprint_scatter=False,
+    )
+    np.testing.assert_allclose(learned, np.asarray([1.5]), rtol=0.0, atol=1e-12)
+
+
+def test_chart_uv_centroid_covariance_is_used_without_surface_footprint_scatter():
+    pose = np.eye(4)
+    world = np.asarray([[0.0, 0.0, 2.0]])
+    K = np.asarray([[4.0, 0.0, 1.5], [0.0, 4.0, 1.5], [0.0, 0.0, 1.0]])
+    tangent_covariance = np.diag([0.25, 0.25, 0.0])[None]
+    learned = _fixed_reprojection_sigma_px(
+        pose, world, 100.0 * np.eye(3)[None], np.ones(1), np.asarray([100.0]), K,
+        query_measurement_variance_px2=np.asarray([1.0]),
+        centroid_covariance_world_m2=tangent_covariance,
+        include_map_footprint_scatter=False,
+    )
+    # fx/z=2, so each tangent axis contributes one px^2 and the mean
+    # per-image-axis propagated variance is exactly one px^2.
+    np.testing.assert_allclose(learned, np.asarray([np.sqrt(2.0)]), rtol=0.0, atol=1e-12)
+
+
+def test_centroid_variance_is_still_modulated_by_plane_purity():
+    pose = np.eye(4)
+    world = np.asarray([[0.0, 0.0, 2.0]])
+    K = np.asarray([[4.0, 0.0, 1.5], [0.0, 4.0, 1.5], [0.0, 0.0, 1.0]])
+    pure = _fixed_reprojection_sigma_px(
+        pose, world, np.zeros((1, 3, 3)), np.ones(1), np.zeros(1), K,
+        query_measurement_variance_px2=np.asarray([1.0]),
+        include_map_footprint_scatter=False,
+    )
+    impure = _fixed_reprojection_sigma_px(
+        pose, world, np.zeros((1, 3, 3)), np.asarray([0.25]), np.zeros(1), K,
+        query_measurement_variance_px2=np.asarray([1.0]),
+        include_map_footprint_scatter=False,
+    )
+    assert impure[0] == 2.0 * pure[0]
 
 
 def test_refinement_is_bounded_and_improves_weighted_reprojection():

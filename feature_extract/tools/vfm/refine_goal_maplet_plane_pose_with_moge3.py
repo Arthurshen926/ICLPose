@@ -47,11 +47,28 @@ def _reprojection_rows(
     maximum_error_px: float = 4.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     pose = np.asarray(pose_w2c, np.float64)
-    camera = np.asarray(world, np.float64) @ pose[:3, :3].T + pose[:3, 3]
+    world = np.asarray(world, np.float64).reshape(-1, 3)
+    pixel = np.asarray(pixel, np.float64).reshape(-1, 2)
+    if len(world) != len(pixel):
+        raise ValueError("world/pixel correspondence count differs")
+    error = np.full(len(world), np.inf, np.float64)
+    # An upstream solver may deliberately seal an unusable candidate with a
+    # non-finite pose.  It must contribute no verifier evidence rather than
+    # reaching OpenCV with NaNs (which can return ``projected=None``).
+    if (
+        pose.shape != (4, 4)
+        or not np.all(np.isfinite(pose))
+        or not np.all(np.isfinite(K))
+        or not np.isfinite(k1)
+    ):
+        return np.zeros(0, np.int64), error
+    camera = world @ pose[:3, :3].T + pose[:3, 3]
     projected, _ = cv2.projectPoints(
-        np.asarray(world, np.float64), cv2.Rodrigues(pose[:3, :3])[0], pose[:3, 3],
+        world, cv2.Rodrigues(pose[:3, :3])[0], pose[:3, 3],
         np.asarray(K, np.float64), np.asarray([k1, 0.0, 0.0, 0.0, 0.0]),
     )
+    if projected is None:
+        return np.zeros(0, np.int64), error
     error = np.linalg.norm(projected.reshape(-1, 2) - pixel, axis=1)
     rows = np.flatnonzero(
         (camera[:, 2] > 0.0) & np.isfinite(error) & (error <= float(maximum_error_px))
@@ -128,6 +145,23 @@ def _map_plane_balanced_association_weights(associations: np.ndarray) -> np.ndar
         rows = np.flatnonzero(pair[:, 1] == plane)
         total[rows] = float(np.sum(support[rows]))
     return np.sqrt(support / np.maximum(total, 1e-12))
+
+
+def _conditional_scalar_information(jacobian: np.ndarray, scalar_column: int = -1) -> float:
+    """Schur-complement information for one scalar after nuisance removal."""
+    jac = np.asarray(jacobian, np.float64)
+    if jac.ndim != 2 or jac.shape[0] == 0 or jac.shape[1] < 2:
+        raise ValueError("observability Jacobian differs")
+    column = int(scalar_column) % jac.shape[1]
+    nuisance = np.delete(jac, column, axis=1)
+    scalar = jac[:, column]
+    h_nn = nuisance.T @ nuisance
+    h_ns = nuisance.T @ scalar
+    value = float(scalar @ scalar - h_ns @ np.linalg.pinv(h_nn, rcond=1e-10) @ h_ns)
+    return max(value, 0.0)
+
+
+MINIMUM_SCALE_DATA_TO_PRIOR_INFORMATION_RATIO = 1.0
 
 
 def _refine_pose_scale(
@@ -207,6 +241,11 @@ def _refine_pose_scale(
     }
     if not solution.success or not np.all(np.isfinite(solution.x)):
         return pose.copy(), 1.0, False, diagnostics
+    # The last residual is the weak log-scale prior.  Excluding it makes this
+    # diagnostic measure whether image/plane data themselves observe scale
+    # after marginalizing the six pose nuisance variables.
+    data_scale_information = _conditional_scalar_information(solution.jac[:-1], -1)
+    prior_scale_information = float(1.0 / np.square(np.log(1.5)))
     final_reprojection, final_normal, final_offset, scale = components(solution.x)
     diagnostics.update({
         "final_reprojection_median_px": float(np.median(np.linalg.norm(final_reprojection, axis=1))),
@@ -215,6 +254,14 @@ def _refine_pose_scale(
         ))))),
         "final_plane_offset_median_m": float(np.median(np.abs(final_offset))),
         "fitted_moge3_depth_scale": scale,
+        "conditional_log_scale_data_information": data_scale_information,
+        "log_scale_prior_information": prior_scale_information,
+        "conditional_scale_data_to_prior_information_ratio": float(
+            data_scale_information / prior_scale_information
+        ),
+        "scale_data_observable_at_least_as_strong_as_prior": bool(
+            data_scale_information >= prior_scale_information
+        ),
     })
     output = np.eye(4, dtype=np.float64)
     output[:3, :3] = cv2.Rodrigues(solution.x[:3])[0]
@@ -222,6 +269,9 @@ def _refine_pose_scale(
     final_rows, final_error = _reprojection_rows(output, world, pixel, K, k1)
     initial_rows, initial_error = _reprojection_rows(pose, world, pixel, K, k1)
     accepted = bool(
+        data_scale_information
+        >= MINIMUM_SCALE_DATA_TO_PRIOR_INFORMATION_RATIO * prior_scale_information
+        and
         len(final_rows) >= max(6, int(np.floor(0.9 * len(initial_rows))))
         and float(np.median(final_error[final_rows]))
         <= float(np.median(initial_error[initial_rows])) + 0.25
@@ -328,7 +378,7 @@ def main() -> None:
         "plane_association_count": association_count,
     }
     metadata = {
-        "artifact_type": "goal_maplet_moge3_plane_scale_surface_refinement_v1",
+        "artifact_type": "goal_maplet_moge3_plane_scale_surface_refinement_v2",
         "arrays_sha256": arrays_sha256(arrays),
         "query_count": int(len(output_pose)),
         "query_pose_or_ground_truth_read": False,
@@ -338,6 +388,14 @@ def main() -> None:
         "plane_normal_scale_deg": 10.0,
         "plane_offset_scale_m": 0.20,
         "metric_scale_prior_log_sigma": float(np.log(1.5)),
+        "scale_observability": (
+            "Schur complement of robust data Jacobian after six pose nuisance variables; "
+            "prior row excluded; weakly observed scale rejects the joint update and falls "
+            "back to the input pose with unit scale"
+        ),
+        "minimum_scale_data_to_prior_information_ratio": (
+            MINIMUM_SCALE_DATA_TO_PRIOR_INFORMATION_RATIO
+        ),
         "minimum_pair_support": 3,
         "minimum_distinct_plane_pairs": 2,
         "query_support_weighting": str(args.query_support_weighting),
@@ -381,6 +439,10 @@ def main() -> None:
         "artifact_type": "goal_maplet_moge3_plane_scale_surface_refinement_evaluation_v2",
         "query_count": int(len(rows)),
         "accepted_count": int(np.sum(accepted)),
+        "scale_observable_count": int(sum(
+            row.get("scale_data_observable_at_least_as_strong_as_prior") is True
+            for row in diagnostics
+        )),
         "pose_frozen_before_query_pose_or_ground_truth_open": True,
         "frozen_pose_inventory_file_sha256": file_sha256(args.output_frozen_pose_inventory),
         "frozen_pose_inventory_content_sha256": metadata["content_sha256"],

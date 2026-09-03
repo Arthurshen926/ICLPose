@@ -4,9 +4,11 @@ import cv2
 import numpy as np
 
 from feature_extract.tools.vfm.refine_goal_maplet_plane_pose_with_moge3 import (
+    _conditional_scalar_information,
     _greedy_plane_associations,
     _many_to_one_plane_associations,
     _map_plane_balanced_association_weights,
+    _reprojection_rows,
     _refine_pose_scale,
 )
 
@@ -34,6 +36,27 @@ def test_many_to_one_fragment_weights_preserve_one_map_plane_mass() -> None:
     weight = _map_plane_balanced_association_weights(association)
     np.testing.assert_allclose(weight * weight, [2.0 / 3.0, 1.0 / 3.0, 1.0])
     assert np.isclose(np.sum(np.square(weight[association[:, 1] == 4])), 1.0)
+
+
+def test_reprojection_rows_fail_closed_for_nonfinite_unusable_pose() -> None:
+    pose = np.eye(4)
+    pose[0, 3] = np.nan
+    world = np.asarray([[0.0, 0.0, 2.0], [1.0, 0.0, 2.0]])
+    pixel = np.asarray([[10.0, 10.0], [20.0, 10.0]])
+    K = np.asarray([[100.0, 0.0, 10.0], [0.0, 100.0, 10.0], [0.0, 0.0, 1.0]])
+    rows, error = _reprojection_rows(pose, world, pixel, K, 0.0)
+    assert rows.dtype == np.int64
+    assert len(rows) == 0
+    assert np.all(np.isinf(error))
+
+
+def test_conditional_scale_information_removes_pose_confounding() -> None:
+    # Scalar is an exact copy of the nuisance column: no conditional evidence.
+    confounded = np.asarray([[1.0, 1.0], [2.0, 2.0], [-1.0, -1.0]])
+    assert _conditional_scalar_information(confounded) < 1e-12
+    # Orthogonal scalar/nuisance directions retain unit information.
+    independent = np.asarray([[1.0, 0.0], [0.0, 1.0]])
+    assert abs(_conditional_scalar_information(independent) - 1.0) < 1e-12
 
 
 def test_joint_plane_scale_refinement_recovers_two_plane_pose() -> None:

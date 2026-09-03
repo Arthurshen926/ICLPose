@@ -18,7 +18,11 @@ def _load_selected(path: Path) -> tuple[dict[str, np.ndarray], dict[str, object]
         arrays = {key: np.asarray(data[key]) for key in data.files if key != "metadata_json"}
     required = {"names", "pose_w2c", "usable", "selected_inlier_ratio"}
     if (
-        metadata.get("artifact_type") != "goal_maplet_dual_surface_geometry_consensus_selected_v1"
+        metadata.get("artifact_type") not in (
+            "goal_maplet_dual_surface_geometry_consensus_selected_v1",
+            "goal_maplet_uncertainty_normalized_plane_pose_selected_v1",
+            "goal_maplet_probabilistic_surface_pose_refinement_v1",
+        )
         or metadata.get("query_pose_or_ground_truth_read") is not False
         or metadata.get("source_rgb_stored_or_consumed_at_runtime") is not False
         or not required.issubset(arrays)

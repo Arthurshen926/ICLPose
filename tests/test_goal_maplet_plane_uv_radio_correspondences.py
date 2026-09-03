@@ -3,11 +3,14 @@ from __future__ import annotations
 import numpy as np
 
 from feature_extract.tools.vfm.build_goal_maplet_plane_uv_radio_correspondences import (
+    _clip_chart_coordinate_to_original_cell,
     _core_seeded_metric_homography_filter,
     _metric_homography_filter,
+    _metric_homography_filter_with_projection,
     _region_token_measurements,
     _top_distinct_hypotheses,
 )
+from feature_extract.tools.vfm.train_goal_maplet_mapping_subtoken_head import MappingSubtokenHead
 
 
 def test_metric_homography_keeps_an_exact_planar_mapping() -> None:
@@ -15,6 +18,18 @@ def test_metric_homography_keeps_an_exact_planar_mapping() -> None:
     xy = np.c_[token % 64, token // 64]
     uv = np.c_[0.5 * xy[:, 0] + 2.0, -0.25 * xy[:, 1] + 3.0]
     assert _metric_homography_filter(token, uv, threshold_m=0.1).all()
+
+
+def test_metric_homography_returns_the_same_continuous_uv_projection() -> None:
+    token = np.asarray([0, 10, 64 * 10, 64 * 10 + 10, 64 * 20 + 20])
+    xy = np.c_[token % 64, token // 64]
+    uv = np.c_[0.5 * xy[:, 0] + 2.0, -0.25 * xy[:, 1] + 3.0]
+    keep, projected, valid = _metric_homography_filter_with_projection(
+        token, uv, threshold_m=0.1,
+    )
+    assert keep.all()
+    assert valid.all()
+    np.testing.assert_allclose(projected, uv, atol=1e-12)
 
 
 def test_core_seeded_homography_does_not_let_boundary_outliers_set_warp() -> None:
@@ -46,3 +61,27 @@ def test_region_measurement_uses_only_observed_same_plane_pixels() -> None:
     np.testing.assert_array_equal(token, [0, 1])
     np.testing.assert_allclose(visible, [0.5, 1.0])
     np.testing.assert_allclose(measurement, [[0.5, 1.5], [5.5, 1.5]])
+
+
+def test_chart_offset_is_clipped_to_original_half_open_metric_cell() -> None:
+    prototype = np.asarray([[0.49, -0.01], [-0.51, 1.01]])
+    offset = np.asarray([[0.20, 0.20], [-1.00, -0.20]])
+    result = _clip_chart_coordinate_to_original_cell(prototype, offset, 0.5)
+    lower = np.floor(prototype / 0.5) * 0.5
+    assert np.all(result >= lower)
+    assert np.all(result < lower + 0.5)
+    assert result[0, 0] == np.nextafter(0.5, 0.0)
+    assert result[0, 1] == np.nextafter(0.0, -0.5)
+    np.testing.assert_allclose(result[1], [-1.0, 1.0])
+
+
+def test_mapping_pair_head_measurement_is_hypothesis_specific() -> None:
+    import torch
+    torch.manual_seed(4)
+    head = MappingSubtokenHead(64, 16)
+    query = torch.nn.functional.normalize(torch.randn(2, 64), dim=1)
+    mapping = torch.nn.functional.normalize(torch.randn(2, 64), dim=1)
+    mean, variance, probability = head(query, mapping, torch.asarray([10, 10]))
+    assert not torch.equal(mean[0], mean[1])
+    assert torch.all(variance > 0)
+    assert torch.all((torch.sigmoid(probability) >= 0) & (torch.sigmoid(probability) <= 1))

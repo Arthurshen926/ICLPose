@@ -73,10 +73,19 @@ def _fixed_token_hypotheses(
     query_pixels: np.ndarray,
     camera_matrix: np.ndarray,
     radial_k1: float,
+    hypothesis_sigma_px: np.ndarray | None = None,
+    correspondence_match_probability: np.ndarray | None = None,
     *,
     maximum_error_px: float = MAXIMUM_REPROJECTION_ERROR_PX,
+    image_area_px2: float = 256.0 * 144.0,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Freeze the best valid 3D hypothesis for every distinct query token."""
+    """Freeze one valid 3D hypothesis per token under an explicit null model.
+
+    Legacy callers without calibrated uncertainty retain nearest-reprojection
+    selection.  V5/V6/V7 callers use a normalized 2D Gaussian mixed with a
+    uniform-image null, so variance and matchability affect the choice without
+    adding a hypothesis-count bonus.
+    """
 
     token = np.asarray(query_tokens, np.int64).reshape(-1)
     pixel = np.asarray(query_pixels, np.float64).reshape(-1, 2)
@@ -85,12 +94,31 @@ def _fixed_token_hypotheses(
     projected, camera = _project(pose_w2c, world_points, camera_matrix, radial_k1)
     error = np.linalg.norm(projected - pixel, axis=1)
     valid = (camera[:, 2] > 0.0) & np.isfinite(error) & (error <= float(maximum_error_px))
+    if (hypothesis_sigma_px is None) != (correspondence_match_probability is None):
+        raise ValueError("probabilistic hypothesis selection inputs must be supplied together")
+    likelihood = None
+    if hypothesis_sigma_px is not None:
+        sigma = np.asarray(hypothesis_sigma_px, np.float64).reshape(-1)
+        match = np.asarray(correspondence_match_probability, np.float64).reshape(-1)
+        if (
+            len(sigma) != len(token) or len(match) != len(token)
+            or np.any(~np.isfinite(sigma)) or np.any(sigma <= 0.0)
+            or np.any(~np.isfinite(match)) or np.any((match < 0.0) | (match > 1.0))
+        ):
+            raise ValueError("probabilistic hypothesis selection inputs differ")
+        variance = np.square(sigma)
+        gaussian = np.exp(-0.5 * np.square(error) / variance) / (2.0 * np.pi * variance)
+        likelihood = match * gaussian + (1.0 - match) / float(image_area_px2)
     selected: list[int] = []
     for token_id in np.unique(token):
         rows = np.flatnonzero((token == token_id) & valid)
         if len(rows):
-            # argmin is stable and therefore breaks exact ties by source row.
-            selected.append(int(rows[np.argmin(error[rows])]))
+            if likelihood is None:
+                # argmin is stable and therefore breaks exact ties by source row.
+                selected.append(int(rows[np.argmin(error[rows])]))
+            else:
+                # argmax is stable and therefore breaks exact ties by source row.
+                selected.append(int(rows[np.argmax(likelihood[rows])]))
     return np.asarray(selected, np.int64), error
 
 
@@ -101,13 +129,19 @@ def _fixed_reprojection_sigma_px(
     plane_purity: np.ndarray,
     plane_depth_dispersion_m: np.ndarray,
     camera_matrix: np.ndarray,
+    query_measurement_variance_px2: np.ndarray | None = None,
+    centroid_covariance_world_m2: np.ndarray | None = None,
+    *,
+    include_map_footprint_scatter: bool = True,
+    radial_k1: float = 0.0,
 ) -> np.ndarray:
-    """Propagate atlas geometry uncertainty without double-counting depth.
+    """Build a fixed image-measurement sigma under explicit uncertainty semantics.
 
-    The world covariance and plane depth dispersion are two estimates of the
-    same map-point uncertainty.  Their maximum, rather than their sum, is used
-    conservatively.  Four-pixel RADIO cells contribute their exact uniform-cell
-    quantization variance per image coordinate.
+    Legacy inventories have no centroid estimator and retain their historical
+    footprint/depth-dispersion propagation.  V5/V6/V7 inventories provide a
+    learned query-centroid variance; their atlas footprint scatter and the
+    source-view depth dispersion are deliberately excluded.  V6/V7 additionally
+    supplies the covariance of the learned continuous chart-UV centroid itself.
     """
 
     pose = np.asarray(pose_w2c, np.float64)
@@ -118,17 +152,39 @@ def _fixed_reprojection_sigma_px(
     if not (len(world) == len(covariance) == len(purity) == len(dispersion)):
         raise ValueError("uncertainty arrays differ in length")
     camera = world @ pose[:3, :3].T + pose[:3, 3]
-    covariance_variance = _projection_variance_px2(
-        camera, covariance, pose[:3, :3], np.asarray(camera_matrix, np.float64),
-    )
-    focal = 0.5 * (float(camera_matrix[0, 0]) + float(camera_matrix[1, 1]))
-    depth_variance = np.square(
-        focal * np.maximum(dispersion, 0.0) / np.maximum(camera[:, 2], 1e-9)
-    )
-    variance = (
-        TOKEN_QUANTIZATION_VARIANCE_PX2
-        + np.maximum(covariance_variance, depth_variance)
-    ) / np.clip(purity, MINIMUM_PURITY, 1.0)
+    if query_measurement_variance_px2 is None:
+        query_variance = np.full(len(world), TOKEN_QUANTIZATION_VARIANCE_PX2, np.float64)
+    else:
+        query_variance = np.asarray(query_measurement_variance_px2, np.float64).reshape(-1)
+        if len(query_variance) != len(world) or np.any(query_variance <= 0.0):
+            raise ValueError("query centroid measurement variance differs")
+    if include_map_footprint_scatter:
+        covariance_variance = _projection_variance_px2(
+            camera, covariance, pose[:3, :3], np.asarray(camera_matrix, np.float64),
+            radial_k1=radial_k1,
+        )
+        focal = 0.5 * (float(camera_matrix[0, 0]) + float(camera_matrix[1, 1]))
+        depth_variance = np.square(
+            focal * np.maximum(dispersion, 0.0) / np.maximum(camera[:, 2], 1e-9)
+        )
+        map_variance = np.maximum(covariance_variance, depth_variance)
+    else:
+        # The v2 bank stores the scatter of pixels inside the surface footprint,
+        # not the covariance of its estimated centroid.  It is not legitimate
+        # to add that footprint extent as if it were measurement noise.
+        if centroid_covariance_world_m2 is None:
+            map_variance = np.zeros(len(world), np.float64)
+        else:
+            centroid_covariance = np.asarray(
+                centroid_covariance_world_m2, np.float64,
+            ).reshape(-1, 3, 3)
+            if len(centroid_covariance) != len(world):
+                raise ValueError("centroid covariance and correspondence lengths differ")
+            map_variance = _projection_variance_px2(
+                camera, centroid_covariance, pose[:3, :3],
+                np.asarray(camera_matrix, np.float64), radial_k1=radial_k1,
+            )
+    variance = (query_variance + map_variance) / np.clip(purity, MINIMUM_PURITY, 1.0)
     sigma = np.sqrt(np.maximum(variance, 1e-12))
     if not np.all(np.isfinite(sigma)):
         raise ValueError("propagated reprojection uncertainty is nonfinite")
@@ -266,6 +322,11 @@ def main() -> None:
     parser.add_argument("--frozen_pose_inventory", type=Path, required=True)
     parser.add_argument("--frozen_correspondences", type=Path, required=True)
     parser.add_argument("--query_contributors", type=Path, required=True)
+    parser.add_argument(
+        "--hypothesis_selection_policy",
+        choices=("nearest_reprojection", "calibrated_gaussian_null"),
+        default="nearest_reprojection",
+    )
     parser.add_argument("--output_frozen_pose_inventory", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
@@ -276,8 +337,11 @@ def main() -> None:
     if corr_metadata.get("artifact_type") not in (
         "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v3",
         "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v4",
+        "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v5",
+        "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v6",
+        "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v7",
     ):
-        raise ValueError("uncertainty refinement requires V3/V4 correspondences")
+        raise ValueError("uncertainty refinement requires V3 through V7 correspondences")
     if not np.array_equal(poses["names"].astype(str), corr["names"].astype(str)):
         raise ValueError("pose and correspondence query order differs")
 
@@ -305,16 +369,38 @@ def main() -> None:
         k1 = float(corr["radial_k1"][index])
         initial_score = _score(output_pose[index], world, token, provenance, K, k1,
                                pixel if "query_measurements_xy" in corr else None)
+        sigma_all = _fixed_reprojection_sigma_px(
+            output_pose[index], world,
+            corr["prototype_world_covariance_m2"][lo:hi],
+            corr["prototype_plane_pixel_purity"][lo:hi],
+            corr["prototype_plane_depth_dispersion_m"][lo:hi], K,
+            query_measurement_variance_px2=(
+                corr["query_measurement_variance_px2"][lo:hi]
+                if "query_measurement_variance_px2" in corr else None
+            ),
+            centroid_covariance_world_m2=(
+                corr["prototype_centroid_covariance_world_m2"][lo:hi]
+                if "prototype_centroid_covariance_world_m2" in corr else None
+            ),
+            include_map_footprint_scatter=(
+                "query_measurement_variance_px2" not in corr
+            ),
+            radial_k1=k1,
+        )
         selected, _ = _fixed_token_hypotheses(
             output_pose[index], world, token, pixel, K, k1,
+            hypothesis_sigma_px=(
+                sigma_all
+                if args.hypothesis_selection_policy == "calibrated_gaussian_null" else None
+            ),
+            correspondence_match_probability=(
+                np.asarray(corr["correspondence_match_probability"][lo:hi], np.float64)
+                * np.clip(np.asarray(corr["prototype_plane_pixel_purity"][lo:hi], np.float64), 0.0, 1.0)
+                if args.hypothesis_selection_policy == "calibrated_gaussian_null" else None
+            ),
         )
         fixed_count[index] = len(selected)
-        sigma = _fixed_reprojection_sigma_px(
-            output_pose[index], world[selected],
-            corr["prototype_world_covariance_m2"][lo:hi][selected],
-            corr["prototype_plane_pixel_purity"][lo:hi][selected],
-            corr["prototype_plane_depth_dispersion_m"][lo:hi][selected], K,
-        )
+        sigma = sigma_all[selected]
         refined, use, detail = _refine_pose(
             output_pose[index], world[selected], pixel[selected], provenance[selected, 1],
             sigma, K, k1,
@@ -356,14 +442,31 @@ def main() -> None:
         "artifact_type": "goal_maplet_uncertainty_weighted_plane_pose_refinement_v1",
         "arrays_sha256": arrays_sha256(arrays), "query_count": int(len(output_pose)),
         "query_pose_or_ground_truth_read": False,
+        "fixed_hypothesis_selection_policy": str(args.hypothesis_selection_policy),
         "query_depth_or_scale_used_by_pose_solver": False,
         "source_rgb_stored_or_consumed_at_runtime": False,
         "source_view_identity_retained_at_runtime": False,
         "uncertainty_model": {
-            "token_uniform_cell_variance_px2": TOKEN_QUANTIZATION_VARIANCE_PX2,
-            "world_covariance": "first_order_pinhole_J_R_Cworld_RT_JT",
-            "depth_dispersion": "focal_over_depth_times_metric_dispersion",
-            "combination": "token_variance_plus_max_covariance_or_depth_variance_divided_by_clipped_purity",
+            "query_measurement_variance": (
+                "mapping_only_pairwise_predicted_centroid_variance_px2"
+                if "query_measurement_variance_px2" in corr
+                else f"uniform_4px_token_variance_{TOKEN_QUANTIZATION_VARIANCE_PX2}"
+            ),
+            "map_world_covariance": (
+                "excluded_because_v2_value_is_surface_footprint_scatter_not_centroid_measurement_covariance"
+                if "query_measurement_variance_px2" in corr
+                else "legacy_first_order_pinhole_J_R_footprint_scatter_RT_JT"
+            ),
+            "depth_dispersion": (
+                "excluded_with_footprint_scatter_until_view_conditioned_centroid_uncertainty_exists"
+                if "query_measurement_variance_px2" in corr
+                else "legacy_focal_over_depth_times_metric_dispersion"
+            ),
+            "combination": (
+                "predicted_query_centroid_variance_divided_by_clipped_purity"
+                if "query_measurement_variance_px2" in corr
+                else "legacy_token_variance_plus_max_footprint_or_depth_dispersion_divided_by_clipped_purity"
+            ),
             "minimum_purity": MINIMUM_PURITY,
         },
         "fixed_hypothesis_rule": "one_minimum_residual_valid_3D_hypothesis_per_query_token",
