@@ -73,6 +73,9 @@ def main() -> None:
             "goal_maplet_direct_plane_pnp_top5_top10_inlier_selected_v1",
             "goal_maplet_direct_plane_pnp_top5_top10_moge3_normal_selected_v1",
             "goal_maplet_dual_surface_geometry_consensus_selected_v1",
+            "goal_maplet_dual_surface_probabilistic_fusion_selected_v1",
+            "goal_maplet_cross_atlas_geometry_consensus_selected_v1",
+            "goal_maplet_uncertainty_normalized_plane_pose_selected_v1",
         ):
             keys = (
                 "names", "pose_w2c", "usable", "selected_branch", "selected_inlier_ratio",
@@ -81,8 +84,28 @@ def main() -> None:
                     ("top5_normal_within_20deg", "top10_normal_within_20deg")
                     if metadata.get("artifact_type") == "goal_maplet_direct_plane_pnp_top5_top10_moge3_normal_selected_v1"
                     else (
-                        ("cross_geometry_inlier_ratio", "cross_geometry_reprojection_median_px")
-                        if metadata.get("artifact_type") == "goal_maplet_dual_surface_geometry_consensus_selected_v1"
+                        (
+                            ("cross_geometry_token_marginal_likelihood",)
+                            if metadata.get("artifact_type")
+                            == "goal_maplet_dual_surface_probabilistic_fusion_selected_v1"
+                            else (
+                                ("cross_atlas_geometry_inlier_ratio", "cross_atlas_geometry_inlier_count")
+                                if metadata.get("artifact_type")
+                                == "goal_maplet_cross_atlas_geometry_consensus_selected_v1"
+                                else (
+                                    ("cross_candidate_uncertainty_normalized_likelihood",)
+                                    if metadata.get("artifact_type")
+                                    == "goal_maplet_uncertainty_normalized_plane_pose_selected_v1"
+                                    else ("cross_geometry_inlier_ratio", "cross_geometry_reprojection_median_px")
+                                )
+                            )
+                        )
+                        if metadata.get("artifact_type") in (
+                            "goal_maplet_dual_surface_geometry_consensus_selected_v1",
+                            "goal_maplet_dual_surface_probabilistic_fusion_selected_v1",
+                            "goal_maplet_cross_atlas_geometry_consensus_selected_v1",
+                            "goal_maplet_uncertainty_normalized_plane_pose_selected_v1",
+                        )
                         else ("top5_inlier_ratio", "top10_inlier_ratio")
                     )
                 ),

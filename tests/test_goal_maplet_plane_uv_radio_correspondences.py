@@ -5,6 +5,7 @@ import numpy as np
 from feature_extract.tools.vfm.build_goal_maplet_plane_uv_radio_correspondences import (
     _core_seeded_metric_homography_filter,
     _metric_homography_filter,
+    _region_token_measurements,
     _top_distinct_hypotheses,
 )
 
@@ -35,3 +36,13 @@ def test_top_hypotheses_are_stable_and_distinct() -> None:
     texel = np.asarray([10, 10, 20, 30, 40])
     chosen = _top_distinct_hypotheses(token, score, plane, texel, maximum_per_token=3)
     np.testing.assert_array_equal(chosen, [3, 1, 2, 4])
+
+
+def test_region_measurement_uses_only_observed_same_plane_pixels() -> None:
+    labels = np.full((144, 256), -1, np.int32)
+    labels[:4, :2] = 7
+    labels[:4, 4:8] = 7
+    token, visible, measurement = _region_token_measurements(labels, 7)
+    np.testing.assert_array_equal(token, [0, 1])
+    np.testing.assert_allclose(visible, [0.5, 1.0])
+    np.testing.assert_allclose(measurement, [[0.5, 1.5], [5.5, 1.5]])

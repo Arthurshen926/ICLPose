@@ -22,6 +22,33 @@ from feature_extract.vfm.localization_goal_maplet.lineage import (
     file_sha256,
 )
 from feature_extract.vfm.localization_goal_maplet.query_plane_regions import QueryPlaneRegions
+from feature_extract.vfm.localization_goal_maplet.chart_local_radio_projection import (
+    load_chart_local_radio_projection,
+    project_chart_local_radio,
+)
+
+
+def _region_token_measurements(
+    labels: np.ndarray,
+    region: int,
+    token_grid: tuple[int, int] = (36, 64),
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return token support and the centroid of observed same-plane pixels."""
+
+    value = np.asarray(labels, np.int32)
+    token, visible = _region_token_support(value, int(region), token_grid=token_grid)
+    height, width = map(int, token_grid)
+    if value.shape != (height * 4, width * 4):
+        raise ValueError("plane mask/token-grid geometry differs")
+    measurement = np.empty((len(token), 2), np.float64)
+    mask = value == int(region)
+    for row, token_id in enumerate(token.tolist()):
+        ty, tx = divmod(int(token_id), width)
+        yy, xx = np.nonzero(mask[ty * 4 : (ty + 1) * 4, tx * 4 : (tx + 1) * 4])
+        if not len(xx):
+            raise AssertionError("visible plane token has no observed pixel")
+        measurement[row] = (float(np.mean(xx + tx * 4)), float(np.mean(yy + ty * 4)))
+    return token, visible, measurement
 
 
 def _metric_homography_filter(
@@ -114,6 +141,10 @@ def main() -> None:
     parser.add_argument("--query_plane_dir", type=Path, required=True)
     parser.add_argument("--plane_ranking", type=Path, required=True)
     parser.add_argument("--radio_manifest", type=Path, nargs="+", required=True)
+    parser.add_argument(
+        "--radio_projection", type=Path,
+        help="Mapping-only projection bound by the supplied projected atlas.",
+    )
     parser.add_argument("--query_camera_inventory", type=Path, required=True)
     parser.add_argument("--topk_planes", type=int, default=10)
     parser.add_argument("--hypotheses_per_query_token", type=int, default=3)
@@ -121,6 +152,11 @@ def main() -> None:
     parser.add_argument(
         "--query_support_policy", choices=("uniform", "core_seeded_halo_verified"),
         default="uniform",
+    )
+    parser.add_argument(
+        "--query_measurement_policy",
+        choices=("token_center", "observed_plane_pixel_centroid"),
+        default="token_center",
     )
     parser.add_argument("--output_correspondences", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -140,14 +176,25 @@ def main() -> None:
             "goal_maplet_metric_plane_uv_radio_atlas_v4",
             "goal_maplet_metric_plane_uv_radio_atlas_v5",
             "goal_maplet_metric_plane_uv_radio_atlas_v6",
+            "goal_maplet_metric_plane_uv_radio_atlas_v7",
+            "goal_maplet_metric_plane_uv_radio_atlas_v8",
         ):
             atlas_names += ["prototype_view_direction_world", "prototype_observation_range_m"]
         if atlas_meta.get("artifact_type") == "goal_maplet_metric_plane_uv_radio_atlas_v5":
             atlas_names += ["prototype_surface_height_m", "prototype_surface_height_std_m"]
-        if atlas_meta.get("artifact_type") == "goal_maplet_metric_plane_uv_radio_atlas_v6":
+        if atlas_meta.get("artifact_type") in (
+            "goal_maplet_metric_plane_uv_radio_atlas_v6",
+            "goal_maplet_metric_plane_uv_radio_atlas_v7",
+            "goal_maplet_metric_plane_uv_radio_atlas_v8",
+        ):
             atlas_names += [
                 "prototype_surface_height_m", "prototype_surface_height_std_m",
                 "prototype_surface_height_applied_m", "prototype_surface_height_valid",
+            ]
+        if atlas_meta.get("artifact_type") == "goal_maplet_metric_plane_uv_radio_atlas_v8":
+            atlas_names += [
+                "prototype_world_covariance_m2", "prototype_plane_pixel_purity",
+                "prototype_plane_depth_dispersion_m",
             ]
         atlas = {name: np.asarray(data[name]) for name in atlas_names}
     if (
@@ -157,6 +204,8 @@ def main() -> None:
             "goal_maplet_metric_plane_uv_radio_atlas_v4",
             "goal_maplet_metric_plane_uv_radio_atlas_v5",
             "goal_maplet_metric_plane_uv_radio_atlas_v6",
+            "goal_maplet_metric_plane_uv_radio_atlas_v7",
+            "goal_maplet_metric_plane_uv_radio_atlas_v8",
         )
         or atlas_meta.get("uses_query_pose_depth_or_ground_truth") is not False
         or arrays_sha256(atlas) != atlas_meta.get("arrays_sha256")
@@ -175,9 +224,18 @@ def main() -> None:
         raise ValueError("plane ranking is not pose/label-free")
     radio_records = _records(args.radio_manifest)
     cameras, camera_meta = _camera_inventory(args.query_camera_inventory)
+    projection_meta = None
+    projection_weight = None
+    if args.radio_projection is not None:
+        projection_weight, projection_meta = load_chart_local_radio_projection(args.radio_projection)
+    expected_projection = atlas_meta.get("chart_local_radio_projection_content_sha256")
+    actual_projection = None if projection_meta is None else projection_meta.get("content_sha256")
+    if expected_projection != actual_projection:
+        raise ValueError("query RADIO projection does not match the atlas projection")
 
-    names, point_rows, token_rows, provenance_rows, matrices, radial = [], [], [], [], [], []
+    names, point_rows, token_rows, measurement_rows, provenance_rows, matrices, radial = [], [], [], [], [], [], []
     prototype_rows, visible_rows, score_rows = [], [], []
+    covariance_rows, purity_rows, dispersion_rows = [], [], []
     diagnostic_rows = []
     for query in ranking["rows"]:
         name = str(query["image"])
@@ -191,11 +249,18 @@ def main() -> None:
         K, k1 = _scaled_intrinsics(model_id, params, width, height)
         planes, _ = QueryPlaneRegions.load_npz(args.query_plane_dir / name)
         query_feature = _radio(name, radio_records)
-        all_points, all_tokens, all_scores, all_planes, all_texels, all_regions = [], [], [], [], [], []
+        if projection_weight is not None:
+            query_feature = project_chart_local_radio(query_feature, projection_weight)
+        all_points, all_tokens, all_measurements, all_scores, all_planes, all_texels, all_regions = [], [], [], [], [], [], []
         all_prototypes, all_visible = [], []
+        all_covariance, all_purity, all_dispersion = [], [], []
         for region_row in query["regions"]:
             region = int(region_row["region"])
-            qtoken, qvisible = _region_token_support(planes.labels, region)
+            if args.query_measurement_policy == "observed_plane_pixel_centroid":
+                qtoken, qvisible, qmeasurement = _region_token_measurements(planes.labels, region)
+            else:
+                qtoken, qvisible = _region_token_support(planes.labels, region)
+                qmeasurement = np.c_[(qtoken % 64) * 4 + 1.5, (qtoken // 64) * 4 + 1.5]
             if len(qtoken) < 4:
                 continue
             qfeature = query_feature[qtoken]
@@ -223,15 +288,21 @@ def main() -> None:
                 prototype = lo + ti[selected]
                 all_points.append(atlas["world_points"][prototype])
                 all_tokens.append(qtoken[qi[selected]])
+                all_measurements.append(qmeasurement[qi[selected]])
                 all_scores.append(score[selected] - 0.02 * rank)
                 all_planes.append(np.full(len(selected), plane, np.int64))
                 all_texels.append(atlas["texel_identity"][prototype].astype(np.int64))
                 all_regions.append(np.full(len(selected), region, np.int64))
                 all_prototypes.append(prototype.astype(np.int64))
                 all_visible.append(qvisible[qi[selected]].astype(np.float64))
+                if atlas_meta.get("artifact_type") == "goal_maplet_metric_plane_uv_radio_atlas_v8":
+                    all_covariance.append(atlas["prototype_world_covariance_m2"][prototype])
+                    all_purity.append(atlas["prototype_plane_pixel_purity"][prototype])
+                    all_dispersion.append(atlas["prototype_plane_depth_dispersion_m"][prototype])
         if all_points:
             world = np.concatenate(all_points)
             token = np.concatenate(all_tokens)
+            measurement = np.concatenate(all_measurements)
             score = np.concatenate(all_scores)
             plane_row = np.concatenate(all_planes)
             texel_row = np.concatenate(all_texels)
@@ -242,21 +313,34 @@ def main() -> None:
                 token, score, plane_row, texel_row,
                 maximum_per_token=int(args.hypotheses_per_query_token),
             )
-            world, token = world[chosen], token[chosen]
+            world, token, measurement = world[chosen], token[chosen], measurement[chosen]
             provenance = np.c_[region_row[chosen], plane_row[chosen], texel_row[chosen]]
             prototype_row = prototype_row[chosen]
             visible_fraction = visible_fraction[chosen]
             match_score = score[chosen]
+            if atlas_meta.get("artifact_type") == "goal_maplet_metric_plane_uv_radio_atlas_v8":
+                covariance = np.concatenate(all_covariance)[chosen]
+                purity = np.concatenate(all_purity)[chosen]
+                dispersion = np.concatenate(all_dispersion)[chosen]
+            else:
+                covariance = np.zeros((len(chosen), 3, 3), np.float64)
+                purity = np.ones(len(chosen), np.float64)
+                dispersion = np.zeros(len(chosen), np.float64)
         else:
             world = np.zeros((0, 3), np.float64)
             token = np.zeros(0, np.int64)
+            measurement = np.zeros((0, 2), np.float64)
             provenance = np.zeros((0, 3), np.int64)
             prototype_row = np.zeros(0, np.int64)
             visible_fraction = np.zeros(0, np.float64)
             match_score = np.zeros(0, np.float64)
-        names.append(name); point_rows.append(world); token_rows.append(token)
+            covariance = np.zeros((0, 3, 3), np.float64)
+            purity = np.zeros(0, np.float64)
+            dispersion = np.zeros(0, np.float64)
+        names.append(name); point_rows.append(world); token_rows.append(token); measurement_rows.append(measurement)
         provenance_rows.append(provenance); matrices.append(K); radial.append(k1)
         prototype_rows.append(prototype_row); visible_rows.append(visible_fraction); score_rows.append(match_score)
+        covariance_rows.append(covariance); purity_rows.append(purity); dispersion_rows.append(dispersion)
         diagnostic_rows.append({
             "name": name,
             "correspondence_count": int(len(token)),
@@ -277,9 +361,19 @@ def main() -> None:
         "prototype_atlas_row": np.concatenate(prototype_rows).astype(np.int64),
         "query_plane_visible_fraction": np.concatenate(visible_rows).astype(np.float32),
         "radio_match_score": np.concatenate(score_rows).astype(np.float32),
+        "prototype_world_covariance_m2": np.concatenate(covariance_rows).astype(np.float32),
+        "prototype_plane_pixel_purity": np.concatenate(purity_rows).astype(np.float32),
+        "prototype_plane_depth_dispersion_m": np.concatenate(dispersion_rows).astype(np.float32),
     }
+    use_subtoken_measurement = args.query_measurement_policy == "observed_plane_pixel_centroid"
+    if use_subtoken_measurement:
+        arrays["query_measurements_xy"] = np.concatenate(measurement_rows).astype(np.float32)
     metadata = {
-        "artifact_type": "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v2",
+        "artifact_type": (
+            "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v4"
+            if use_subtoken_measurement
+            else "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v3"
+        ),
         "arrays_sha256": arrays_sha256(arrays),
         "query_count": int(len(names)),
         "correspondence_count": int(offsets[-1]),
@@ -296,14 +390,28 @@ def main() -> None:
         ),
         "prototype_geometry_binding": "explicit_atlas_row_not_texel_identity",
         "query_support_weight_available": "visible_fraction_for_soft_core_halo_weighting",
+        "prototype_geometry_uncertainty_available": bool(
+            atlas_meta.get("artifact_type") == "goal_maplet_metric_plane_uv_radio_atlas_v8"
+        ),
         "plane_uv_atlas_file_sha256": file_sha256(args.plane_uv_atlas),
         "plane_uv_atlas_content_sha256": atlas_meta.get("content_sha256"),
         "plane_ranking_file_sha256": file_sha256(args.plane_ranking),
         "query_camera_only_inventory_file_sha256": file_sha256(args.query_camera_inventory),
         "query_camera_only_inventory_content_sha256": camera_meta.get("content_sha256"),
         "radio_manifest_file_sha256_in_order": [file_sha256(path) for path in args.radio_manifest],
+        "chart_local_radio_projection_file_sha256": (
+            None if args.radio_projection is None else file_sha256(args.radio_projection)
+        ),
+        "chart_local_radio_projection_content_sha256": actual_projection,
         "runtime_map_stores_source_rgb": False,
     }
+    if use_subtoken_measurement:
+        metadata.update(
+            query_measurement_semantics=(
+                "centroid_of_observed_same_plane_region_pixels_inside_each_4x4_RADIO_token"
+            ),
+            hidden_or_occluded_pixels_added_to_query_measurement=0,
+        )
     metadata["content_sha256"] = canonical_json_sha256(metadata)
     args.output_correspondences.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(

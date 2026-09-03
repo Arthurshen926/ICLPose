@@ -47,16 +47,29 @@ def _load_atlas(path: Path) -> tuple[dict[str, np.ndarray], dict[str, object]]:
         if metadata.get("artifact_type") in (
             "goal_maplet_metric_plane_uv_radio_atlas_v5",
             "goal_maplet_metric_plane_uv_radio_atlas_v6",
+            "goal_maplet_metric_plane_uv_radio_atlas_v7",
+            "goal_maplet_metric_plane_uv_radio_atlas_v8",
         ):
             keys += ("prototype_surface_height_m", "prototype_surface_height_std_m")
-        if metadata.get("artifact_type") == "goal_maplet_metric_plane_uv_radio_atlas_v6":
+        if metadata.get("artifact_type") in (
+            "goal_maplet_metric_plane_uv_radio_atlas_v6",
+            "goal_maplet_metric_plane_uv_radio_atlas_v7",
+            "goal_maplet_metric_plane_uv_radio_atlas_v8",
+        ):
             keys += ("prototype_surface_height_applied_m", "prototype_surface_height_valid")
+        if metadata.get("artifact_type") == "goal_maplet_metric_plane_uv_radio_atlas_v8":
+            keys += (
+                "prototype_world_covariance_m2", "prototype_plane_pixel_purity",
+                "prototype_plane_depth_dispersion_m",
+            )
         arrays = {key: np.asarray(data[key]) for key in keys}
     if (
         metadata.get("artifact_type") not in (
             "goal_maplet_metric_plane_uv_radio_atlas_v4",
             "goal_maplet_metric_plane_uv_radio_atlas_v5",
             "goal_maplet_metric_plane_uv_radio_atlas_v6",
+            "goal_maplet_metric_plane_uv_radio_atlas_v7",
+            "goal_maplet_metric_plane_uv_radio_atlas_v8",
         )
         or metadata.get("source_view_identity_retained_at_runtime") is not False
         or metadata.get("source_rgb_stored_or_consumed_at_runtime") is not False
@@ -124,8 +137,12 @@ def main() -> None:
     if args.output.exists() or args.output_frozen_pose_inventory.exists():
         raise FileExistsError("refusing to overwrite view-geometry refinement")
     correspondence, corr_meta = _load(args.frozen_correspondences)
-    if corr_meta.get("artifact_type") != "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v2":
-        raise ValueError("view-geometry refinement requires correspondence v2")
+    if corr_meta.get("artifact_type") not in (
+        "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v2",
+        "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v3",
+        "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v4",
+    ):
+        raise ValueError("view-geometry refinement requires correspondence v2, v3, or v4")
     initial, initial_meta = _load_initial(args.initial_candidates)
     atlas, atlas_meta = _load_atlas(args.plane_uv_atlas)
     names = correspondence["names"].astype(str)
@@ -146,6 +163,10 @@ def main() -> None:
         lo, hi = map(int, correspondence["correspondence_offsets"][index:index + 2])
         world = correspondence["world_points"][lo:hi]
         tokens = correspondence["query_tokens"][lo:hi]
+        measurements = (
+            correspondence["query_measurements_xy"][lo:hi]
+            if "query_measurements_xy" in correspondence else None
+        )
         provenance = correspondence["provenance_region_plane_atlas_row"][lo:hi]
         prototype = correspondence["prototype_atlas_row"][lo:hi]
         K = correspondence["camera_matrices"][index]
@@ -155,13 +176,20 @@ def main() -> None:
             atlas["prototype_observation_range_m"],
         )
         compatible_count[index] = len(keep)
-        initial_global = _score(pose, world, tokens, provenance, K, k1)
-        initial_compatible = _score(pose, world[keep], tokens[keep], provenance[keep], K, k1) if len(keep) else None
-        candidate = _solve(world, tokens, K, k1, keep)
+        initial_global = _score(pose, world, tokens, provenance, K, k1, measurements)
+        initial_compatible = (
+            _score(
+                pose, world[keep], tokens[keep], provenance[keep], K, k1,
+                None if measurements is None else measurements[keep],
+            )
+            if len(keep) else None
+        )
+        candidate = _solve(world, tokens, K, k1, keep, measurements)
         if candidate is not None:
-            candidate_global = _score(candidate, world, tokens, provenance, K, k1)
+            candidate_global = _score(candidate, world, tokens, provenance, K, k1, measurements)
             candidate_compatible = _score(
                 candidate, world[keep], tokens[keep], provenance[keep], K, k1,
+                None if measurements is None else measurements[keep],
             )
             use = bool(
                 int(candidate_global["inlier_count"])

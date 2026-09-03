@@ -5,6 +5,8 @@ import numpy as np
 
 from feature_extract.tools.vfm.refine_goal_maplet_plane_pose_with_moge3 import (
     _greedy_plane_associations,
+    _many_to_one_plane_associations,
+    _map_plane_balanced_association_weights,
     _refine_pose_scale,
 )
 
@@ -16,6 +18,22 @@ def test_plane_associations_are_distinct_and_support_ordered() -> None:
     )
     result = _greedy_plane_associations(provenance, np.arange(len(provenance)))
     np.testing.assert_array_equal(result, [[0, 4, 6], [1, 6, 3]])
+
+
+def test_many_to_one_keeps_occlusion_fragments_without_double_assigning_region() -> None:
+    provenance = np.asarray(
+        [[0, 4, 0]] * 6 + [[0, 5, 1]] * 4 + [[1, 4, 2]] * 5 + [[2, 4, 3]] * 3,
+        np.int64,
+    )
+    result = _many_to_one_plane_associations(provenance, np.arange(len(provenance)))
+    np.testing.assert_array_equal(result, [[0, 4, 6], [1, 4, 5], [2, 4, 3]])
+
+
+def test_many_to_one_fragment_weights_preserve_one_map_plane_mass() -> None:
+    association = np.asarray([[0, 4, 6], [1, 4, 3], [2, 5, 7]], np.int64)
+    weight = _map_plane_balanced_association_weights(association)
+    np.testing.assert_allclose(weight * weight, [2.0 / 3.0, 1.0 / 3.0, 1.0])
+    assert np.isclose(np.sum(np.square(weight[association[:, 1] == 4])), 1.0)
 
 
 def test_joint_plane_scale_refinement_recovers_two_plane_pose() -> None:

@@ -86,6 +86,50 @@ def _greedy_plane_associations(
     return np.asarray(output, np.int64).reshape(-1, 3)
 
 
+def _many_to_one_plane_associations(
+    provenance: np.ndarray,
+    inlier_rows: np.ndarray,
+    *,
+    minimum_support: int = 3,
+) -> np.ndarray:
+    """Keep split query fragments while assigning each region only once.
+
+    Sparse foreground occlusion can split one facade into several disconnected
+    query regions.  A physical map plane may therefore repeat, but a query
+    region is assigned only to its strongest supported map plane.
+    """
+
+    values = np.asarray(provenance, np.int64).reshape(-1, 3)[np.asarray(inlier_rows, np.int64)]
+    if not len(values):
+        return np.zeros((0, 3), np.int64)
+    pair, count = np.unique(values[:, :2], axis=0, return_counts=True)
+    order = np.lexsort((pair[:, 1], pair[:, 0], -count))
+    output: list[tuple[int, int, int]] = []
+    used_region: set[int] = set()
+    for row in order.tolist():
+        region, plane = map(int, pair[row])
+        support = int(count[row])
+        if support < int(minimum_support) or region in used_region:
+            continue
+        used_region.add(region)
+        output.append((region, plane, support))
+    return np.asarray(output, np.int64).reshape(-1, 3)
+
+
+def _map_plane_balanced_association_weights(associations: np.ndarray) -> np.ndarray:
+    """Give every physical map plane unit total squared residual weight."""
+
+    pair = np.asarray(associations, np.int64).reshape(-1, 3)
+    if not len(pair):
+        return np.zeros(0, np.float64)
+    support = np.maximum(pair[:, 2].astype(np.float64), 1.0)
+    total = np.zeros(len(pair), np.float64)
+    for plane in np.unique(pair[:, 1]):
+        rows = np.flatnonzero(pair[:, 1] == plane)
+        total[rows] = float(np.sum(support[rows]))
+    return np.sqrt(support / np.maximum(total, 1e-12))
+
+
 def _refine_pose_scale(
     pose_w2c: np.ndarray,
     world: np.ndarray,
@@ -113,6 +157,7 @@ def _refine_pose_scale(
     map_d = np.asarray(map_offsets_world[map_plane], np.float64).copy()
     query_n = np.asarray(query_normals_camera[query_region], np.float64)
     query_d = np.asarray(query_offsets_camera[query_region], np.float64)
+    association_weight = _map_plane_balanced_association_weights(pair)
     initial_nc = map_n @ pose[:3, :3].T
     flip = np.sum(initial_nc * query_n, axis=1) < 0.0
     map_n[flip] *= -1.0; map_d[flip] *= -1.0
@@ -143,8 +188,8 @@ def _refine_pose_scale(
         reprojection, normal, offset, _ = components(parameter)
         return np.r_[
             (reprojection * point_weight[:, None] / 2.0).reshape(-1),
-            (normal / np.sin(np.deg2rad(10.0))).reshape(-1),
-            offset / 0.20,
+            (normal * association_weight[:, None] / np.sin(np.deg2rad(10.0))).reshape(-1),
+            offset * association_weight / 0.20,
             parameter[6] / np.log(1.5),
         ]
 
@@ -199,6 +244,11 @@ def main() -> None:
         "--query_support_weighting", choices=("uniform", "sqrt_visible_fraction"),
         default="uniform",
     )
+    parser.add_argument(
+        "--plane_association_policy",
+        choices=("one_to_one", "many_query_fragments_per_map_plane"),
+        default="one_to_one",
+    )
     parser.add_argument("--output_frozen_pose_inventory", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
@@ -230,11 +280,19 @@ def main() -> None:
         provenance = np.asarray(
             correspondence["provenance_region_plane_atlas_row"][lo:hi], np.int64,
         )
-        pixel = _token_pixels(token, tuple(correspondence_meta.get("token_grid", (36, 64))))
+        pixel = (
+            np.asarray(correspondence["query_measurements_xy"][lo:hi], np.float64)
+            if "query_measurements_xy" in correspondence
+            else _token_pixels(token, tuple(correspondence_meta.get("token_grid", (36, 64))))
+        )
         K = np.asarray(correspondence["camera_matrices"][index], np.float64)
         k1 = float(correspondence["radial_k1"][index])
         initial_rows, _ = _reprojection_rows(output_pose[index], world, pixel, K, k1)
-        association = _greedy_plane_associations(provenance, initial_rows)
+        association = (
+            _many_to_one_plane_associations(provenance, initial_rows)
+            if args.plane_association_policy == "many_query_fragments_per_map_plane"
+            else _greedy_plane_associations(provenance, initial_rows)
+        )
         query_plane, query_meta = QueryPlaneRegions.load_npz(args.query_plane_dir / name)
         if np.any(association[:, 0] >= len(query_plane.normals_camera)):
             raise ValueError("frozen region association lies outside query planes")
@@ -283,6 +341,10 @@ def main() -> None:
         "minimum_pair_support": 3,
         "minimum_distinct_plane_pairs": 2,
         "query_support_weighting": str(args.query_support_weighting),
+        "plane_association_policy": str(args.plane_association_policy),
+        "map_plane_fragment_weighting": (
+            "support_proportional_unit_total_squared_weight_per_physical_map_plane"
+        ),
         "frozen_pose_inventory_file_sha256": file_sha256(args.frozen_pose_inventory),
         "frozen_pose_inventory_content_sha256": pose_meta.get("content_sha256"),
         "frozen_correspondence_file_sha256": file_sha256(args.frozen_correspondences),

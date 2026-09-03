@@ -36,7 +36,10 @@ def _poses(path: Path) -> tuple[dict[str, np.ndarray], dict[str, object]]:
         "pnp_inlier_count",
     }
     if (
-        metadata.get("artifact_type") != "goal_maplet_moge3_plane_scale_surface_refinement_v1"
+        metadata.get("artifact_type") not in (
+            "goal_maplet_moge3_plane_scale_surface_refinement_v1",
+            "goal_maplet_uncertainty_weighted_plane_pose_refinement_v1",
+        )
         or metadata.get("query_pose_or_ground_truth_read") is not False
         or arrays_sha256(complete) != metadata.get("arrays_sha256")
         or not required.issubset(complete)
@@ -77,6 +80,8 @@ def main() -> None:
                     corr["query_tokens"][lo:hi],
                     corr["provenance_region_plane_atlas_row"][lo:hi],
                     corr["camera_matrices"][query], float(corr["radial_k1"][query]),
+                    corr["query_measurements_xy"][lo:hi]
+                    if "query_measurements_xy" in corr else None,
                 )
                 ratio[query, candidate, geometry] = float(score["inlier_ratio"])
                 inliers[query, candidate, geometry] = int(score["inlier_count"])

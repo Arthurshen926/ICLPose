@@ -25,14 +25,30 @@ def _load(path: Path) -> tuple[dict[str, np.ndarray], dict[str, object]]:
     with np.load(path, allow_pickle=False) as data:
         metadata = json.loads(str(data["metadata_json"].item()))
         keys = list(base_keys)
-        if metadata.get("artifact_type") == "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v2":
+        if metadata.get("artifact_type") in (
+            "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v2",
+            "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v3",
+            "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v4",
+        ):
             keys += ["prototype_atlas_row", "query_plane_visible_fraction", "radio_match_score"]
+        if metadata.get("artifact_type") in (
+            "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v3",
+            "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v4",
+        ):
+            keys += [
+                "prototype_world_covariance_m2", "prototype_plane_pixel_purity",
+                "prototype_plane_depth_dispersion_m",
+            ]
+        if metadata.get("artifact_type") == "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v4":
+            keys += ["query_measurements_xy"]
         arrays = {key: np.asarray(data[key]) for key in keys}
     count = len(arrays["names"])
     if (
         metadata.get("artifact_type") not in (
             "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v1",
             "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v2",
+            "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v3",
+            "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v4",
         )
         or metadata.get("pose_or_ground_truth_opened") is not False
         or arrays_sha256(arrays) != metadata.get("arrays_sha256")
@@ -40,6 +56,18 @@ def _load(path: Path) -> tuple[dict[str, np.ndarray], dict[str, object]]:
         or arrays["camera_matrices"].shape != (count, 3, 3)
         or arrays["provenance_region_plane_atlas_row"].shape
         != (len(arrays["world_points"]), 3)
+        or (
+            "query_measurements_xy" in arrays
+            and arrays["query_measurements_xy"].shape != (len(arrays["world_points"]), 2)
+        )
+        or (
+            metadata.get("artifact_type") == "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v4"
+            and (
+                metadata.get("query_measurement_semantics")
+                != "centroid_of_observed_same_plane_region_pixels_inside_each_4x4_RADIO_token"
+                or metadata.get("hidden_or_occluded_pixels_added_to_query_measurement") != 0
+            )
+        )
     ):
         raise ValueError("frozen PnP correspondence inventory differs")
     return arrays, metadata
@@ -51,10 +79,18 @@ def _solve(
     K: np.ndarray,
     k1: float,
     rows: np.ndarray,
+    query_measurements_xy: np.ndarray | None = None,
 ) -> np.ndarray | None:
     if len(rows) < 6:
         return None
-    pixel = np.c_[(tokens[rows] % 64) * 4 + 1.5, (tokens[rows] // 64) * 4 + 1.5]
+    pixel_all = (
+        np.c_[(tokens % 64) * 4 + 1.5, (tokens // 64) * 4 + 1.5]
+        if query_measurements_xy is None
+        else np.asarray(query_measurements_xy, np.float64).reshape(-1, 2)
+    )
+    if len(pixel_all) != len(tokens) or not np.all(np.isfinite(pixel_all)):
+        raise ValueError("query measurements differ from tokens")
+    pixel = pixel_all[rows]
     distortion = np.asarray([k1, 0.0, 0.0, 0.0, 0.0], np.float64)
     cv2.setRNGSeed(260901)
     ok, rvec, tvec, inlier = cv2.solvePnPRansac(
@@ -65,7 +101,7 @@ def _solve(
     if not ok or inlier is None or len(inlier) < 6:
         return None
     selected = rows[inlier.reshape(-1)]
-    all_pixel = np.c_[(tokens[selected] % 64) * 4 + 1.5, (tokens[selected] // 64) * 4 + 1.5]
+    all_pixel = pixel_all[selected]
     rvec, tvec = cv2.solvePnPRefineLM(
         world[selected], all_pixel, K, distortion, rvec, tvec,
     )
@@ -82,8 +118,15 @@ def _score(
     provenance: np.ndarray,
     K: np.ndarray,
     k1: float,
+    query_measurements_xy: np.ndarray | None = None,
 ) -> dict[str, object]:
-    pixel = np.c_[(tokens % 64) * 4 + 1.5, (tokens // 64) * 4 + 1.5]
+    pixel = (
+        np.c_[(tokens % 64) * 4 + 1.5, (tokens // 64) * 4 + 1.5]
+        if query_measurements_xy is None
+        else np.asarray(query_measurements_xy, np.float64).reshape(-1, 2)
+    )
+    if len(pixel) != len(tokens) or not np.all(np.isfinite(pixel)):
+        raise ValueError("query measurements differ from tokens")
     camera = world @ pose[:3, :3].T + pose[:3, 3]
     projected, _ = cv2.projectPoints(
         world, cv2.Rodrigues(pose[:3, :3])[0], pose[:3, 3], K,
@@ -171,6 +214,7 @@ def main() -> None:
         lo, hi = map(int, arrays["correspondence_offsets"][query_index:query_index + 2])
         world = arrays["world_points"][lo:hi]
         tokens = arrays["query_tokens"][lo:hi]
+        measurements = arrays["query_measurements_xy"][lo:hi] if "query_measurements_xy" in arrays else None
         provenance = arrays["provenance_region_plane_atlas_row"][lo:hi]
         K = arrays["camera_matrices"][query_index]
         k1 = float(arrays["radial_k1"][query_index])
@@ -181,10 +225,10 @@ def main() -> None:
             )
         candidates = []
         for origin, rows in seed_groups:
-            pose = _solve(world, tokens, K, k1, rows)
+            pose = _solve(world, tokens, K, k1, rows, measurements)
             if pose is None:
                 continue
-            score = _score(pose, world, tokens, provenance, K, k1)
+            score = _score(pose, world, tokens, provenance, K, k1, measurements)
             score["origin"] = origin
             candidates.append(score)
         if not candidates:

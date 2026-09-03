@@ -78,6 +78,7 @@ def _load_frozen_poses(path: Path) -> tuple[dict[str, np.ndarray], dict[str, obj
             "goal_maplet_direct_plane_pnp_multiscale_reliability_cascade_v7",
             "goal_maplet_moge3_plane_scale_surface_refinement_v1",
             "goal_maplet_canonical_plane_uv_view_geometry_refined_pose_v1",
+            "goal_maplet_uncertainty_weighted_plane_pose_refinement_v1",
         )
         or metadata.get("query_pose_or_ground_truth_read", False) is not False
         or (
