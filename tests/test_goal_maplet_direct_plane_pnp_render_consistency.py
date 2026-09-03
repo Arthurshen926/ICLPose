@@ -59,6 +59,20 @@ def test_render_consistency_detects_spatial_depth_shape_error() -> None:
     assert result["depth_ratio_within_20pct"] == 0.0
 
 
+def test_render_consistency_separates_metric_scale_and_affine_depth_shape() -> None:
+    query = np.geomspace(1.0, 12.0, 64).reshape(8, 8)
+    rendered = 3.0 * query ** 1.2
+    normal = np.zeros((8, 8, 3)); normal[..., 2] = 1.0
+    result = _metric_depth_normal_agreement(
+        rendered, normal, query, normal, np.ones(query.shape, bool),
+    )
+    assert result["metric_query_depth_scale_log_bias"] > 1.0
+    assert result["absolute_log_depth_p90"] > 0.1
+    assert abs(result["affine_log_depth_slope"] - 1.2) < 1e-10
+    assert result["affine_log_depth_p90"] < 1e-10
+    assert result["relative_log_depth_correlation"] > 0.999999
+
+
 def test_render_coverage_denominator_is_full_query_valid_domain() -> None:
     query = np.ones((4, 8), np.float64)
     rendered = np.ones((4, 8), np.float64)

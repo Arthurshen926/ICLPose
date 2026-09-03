@@ -18,17 +18,22 @@ from feature_extract.vfm.localization_goal_maplet.lineage import (
 
 
 def _load(path: Path) -> tuple[dict[str, np.ndarray], dict[str, object]]:
-    keys = (
+    base_keys = (
         "names", "correspondence_offsets", "world_points", "query_tokens",
         "provenance_region_plane_atlas_row", "camera_matrices", "radial_k1",
     )
     with np.load(path, allow_pickle=False) as data:
         metadata = json.loads(str(data["metadata_json"].item()))
+        keys = list(base_keys)
+        if metadata.get("artifact_type") == "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v2":
+            keys += ["prototype_atlas_row", "query_plane_visible_fraction", "radio_match_score"]
         arrays = {key: np.asarray(data[key]) for key in keys}
     count = len(arrays["names"])
     if (
-        metadata.get("artifact_type")
-        != "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v1"
+        metadata.get("artifact_type") not in (
+            "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v1",
+            "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v2",
+        )
         or metadata.get("pose_or_ground_truth_opened") is not False
         or arrays_sha256(arrays) != metadata.get("arrays_sha256")
         or arrays["correspondence_offsets"].shape != (count + 1,)

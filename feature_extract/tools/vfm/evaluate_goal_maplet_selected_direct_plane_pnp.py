@@ -69,11 +69,23 @@ def main() -> None:
         raise FileExistsError("refusing to overwrite selected PnP evaluation")
     with np.load(args.selected_pose_inventory, allow_pickle=False) as data:
         metadata = json.loads(str(data["metadata_json"].item()))
-        if metadata.get("artifact_type") == "goal_maplet_direct_plane_pnp_top5_top10_inlier_selected_v1":
+        if metadata.get("artifact_type") in (
+            "goal_maplet_direct_plane_pnp_top5_top10_inlier_selected_v1",
+            "goal_maplet_direct_plane_pnp_top5_top10_moge3_normal_selected_v1",
+            "goal_maplet_dual_surface_geometry_consensus_selected_v1",
+        ):
             keys = (
                 "names", "pose_w2c", "usable", "selected_branch", "selected_inlier_ratio",
                 "selected_candidate_correspondence_count", "selected_pnp_inlier_count",
-                "top5_inlier_ratio", "top10_inlier_ratio",
+                *(
+                    ("top5_normal_within_20deg", "top10_normal_within_20deg")
+                    if metadata.get("artifact_type") == "goal_maplet_direct_plane_pnp_top5_top10_moge3_normal_selected_v1"
+                    else (
+                        ("cross_geometry_inlier_ratio", "cross_geometry_reprojection_median_px")
+                        if metadata.get("artifact_type") == "goal_maplet_dual_surface_geometry_consensus_selected_v1"
+                        else ("top5_inlier_ratio", "top10_inlier_ratio")
+                    )
+                ),
             )
         elif metadata.get("artifact_type") == "goal_maplet_direct_plane_pnp_top5_top10_h3_balanced_selected_v1":
             keys = (

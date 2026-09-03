@@ -14,6 +14,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+from scipy.optimize import least_squares
 from scipy.spatial.transform import Rotation
 
 from feature_extract.vfm.localization_goal_maplet.lineage import file_sha256
@@ -41,6 +42,7 @@ MINIMUM_HOMOGRAPHY_MATCHES = 6
 MINIMUM_PNP_POINTS = 6
 SOURCE_SUBTOKEN_DEPTH_TOLERANCE_ABS_M = 0.5
 SOURCE_SUBTOKEN_DEPTH_TOLERANCE_REL = 0.05
+PLANE_BALANCE_QUADRATIC_MASS_CAP = 8
 
 
 def _records(paths: list[Path] | tuple[Path, ...]) -> dict[str, dict[str, object]]:
@@ -337,6 +339,83 @@ def _homography_source_world_points(
     return output, used
 
 
+def _homography_source_plane_points(
+    pose_w2c: np.ndarray,
+    camera_matrix: np.ndarray,
+    radial_k1: float,
+    projected_map_xy: np.ndarray,
+    token_grid: tuple[int, int],
+    plane_normal_world: np.ndarray,
+    plane_offset_world: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Intersect continuous source-image rays with one retrieved finite plane.
+
+    Unlike the legacy token-median lift, this measurement never mixes depth
+    pixels from an occluder or an adjacent surface into the retrieved plane.
+    The returned points are temporary samples of the continuous plane; source
+    token IDs remain appearance observations rather than persistent 3D
+    landmarks.  Finite support is supplied upstream by the exact visibility
+    atlas, while invalid/behind-camera/near-parallel intersections fail closed.
+    """
+
+    pose = np.asarray(pose_w2c, np.float64)
+    K = np.asarray(camera_matrix, np.float64)
+    map_xy = np.asarray(projected_map_xy, np.float64)
+    normal = np.asarray(plane_normal_world, np.float64).reshape(3)
+    if pose.shape != (4, 4) or K.shape != (3, 3):
+        raise ValueError("mapping plane-intersection camera arrays differ")
+    if map_xy.ndim != 2 or map_xy.shape[1] != 2:
+        raise ValueError("mapping plane-intersection coordinates must be Nx2")
+    normal_norm = float(np.linalg.norm(normal))
+    if (
+        not np.all(np.isfinite(pose))
+        or not np.all(np.isfinite(K))
+        or abs(float(K[0, 0])) <= 0.0
+        or abs(float(K[1, 1])) <= 0.0
+        or not np.isfinite(normal_norm)
+        or normal_norm <= 0.0
+        or not np.isfinite(plane_offset_world)
+    ):
+        raise ValueError("mapping plane-intersection authority is invalid")
+    normal = normal / normal_norm
+    offset = float(plane_offset_world) / normal_norm
+    token_height, token_width = map(int, token_grid)
+    finite_coordinate = np.all(np.isfinite(map_xy), axis=1)
+    pixel = np.full((len(map_xy), 2), np.nan, np.float64)
+    pixel[finite_coordinate] = np.c_[
+        (map_xy[finite_coordinate, 0] + 0.5) * 256.0 / token_width - 0.5,
+        (map_xy[finite_coordinate, 1] + 0.5) * 144.0 / token_height - 0.5,
+    ]
+    distorted = np.full((len(map_xy), 2), np.nan, np.float64)
+    distorted[finite_coordinate] = np.c_[
+        (pixel[finite_coordinate, 0] - K[0, 2]) / K[0, 0],
+        (pixel[finite_coordinate, 1] - K[1, 2]) / K[1, 1],
+    ]
+    ideal = np.full_like(distorted, np.nan)
+    ideal[finite_coordinate] = inverse_simple_radial(
+        distorted[finite_coordinate], float(radial_k1)
+    )
+    ray_camera = np.c_[ideal, np.ones(len(ideal), np.float64)]
+    rotation, translation = pose[:3, :3], pose[:3, 3]
+    center_world = -rotation.T @ translation
+    ray_world = ray_camera @ rotation
+    denominator = ray_world @ normal
+    numerator = offset - float(center_world @ normal)
+    depth = np.full(len(map_xy), np.nan, np.float64)
+    nonparallel = finite_coordinate & (np.abs(denominator) > 1e-10)
+    depth[nonparallel] = numerator / denominator[nonparallel]
+    valid = nonparallel & np.isfinite(depth) & (depth > 0.0)
+    output = np.full((len(map_xy), 3), np.nan, np.float64)
+    output[valid] = center_world + depth[valid, None] * ray_world[valid]
+    valid &= np.all(np.isfinite(output), axis=1)
+    # Recheck the actual plane equation after all coordinate conversions.
+    if np.any(valid):
+        residual = np.abs(output[valid] @ normal - offset)
+        if float(np.max(residual)) > 1e-7:
+            raise ValueError("mapping ray-plane intersection does not replay")
+    return output, valid
+
+
 def _project_points_to_plane(
     points: np.ndarray,
     normal: np.ndarray,
@@ -438,6 +517,121 @@ def _pnp(
     rotation = cv2.Rodrigues(rvec)[0]
     pose = np.eye(4, dtype=np.float64); pose[:3, :3] = rotation; pose[:3, 3] = tvec.reshape(3)
     return pose, selected
+
+
+def _plane_balance_weights(
+    plane_ids: np.ndarray,
+    *,
+    quadratic_mass_cap: int = PLANE_BALANCE_QUADRATIC_MASS_CAP,
+) -> np.ndarray:
+    """Bound the quadratic leverage of any one retrieved finite plane.
+
+    Sparse planes are never amplified.  A dense plane keeps at most ``cap``
+    units of squared weight, after which all weights are RMS-normalized.  This
+    prevents one facade patch with many repeated token observations from
+    drowning the independent orientation/translation evidence of other planes.
+    """
+
+    values = np.asarray(plane_ids, np.int64).reshape(-1)
+    if int(quadratic_mass_cap) < 1:
+        raise ValueError("plane balance mass cap must be positive")
+    if not len(values):
+        return np.ones(0, np.float64)
+    _, inverse, counts = np.unique(values, return_inverse=True, return_counts=True)
+    weight = np.sqrt(
+        np.minimum(counts[inverse], int(quadratic_mass_cap))
+        / counts[inverse].astype(np.float64)
+    )
+    return weight / max(float(np.sqrt(np.mean(weight * weight))), 1e-12)
+
+
+def _plane_balanced_surface_refine(
+    pose_w2c: np.ndarray,
+    inlier_rows: np.ndarray,
+    world_points: np.ndarray,
+    query_pixels: np.ndarray,
+    plane_ids: np.ndarray,
+    camera_matrix: np.ndarray,
+    radial_k1: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Robustly refine a PnP seed as balanced finite-surface reprojection.
+
+    The 3D inputs are temporary samples on retrieved plane surfaces.  The
+    optimizer keeps the PnP data association frozen, caps each plane's mass,
+    and uses a Huber loss.  It cannot manufacture support for a missing plane
+    and falls back to the seed if the fixed, label-free inlier support drops.
+    """
+
+    pose = np.asarray(pose_w2c, np.float64)
+    selected = np.asarray(inlier_rows, np.int64).reshape(-1)
+    world = np.asarray(world_points, np.float64)
+    pixel = np.asarray(query_pixels, np.float64)
+    planes = np.asarray(plane_ids, np.int64).reshape(-1)
+    K = np.asarray(camera_matrix, np.float64)
+    if (
+        pose.shape != (4, 4)
+        or world.ndim != 2 or world.shape[1] != 3
+        or pixel.shape != (len(world), 2)
+        or planes.shape != (len(world),)
+        or np.any(selected < 0) or np.any(selected >= len(world))
+    ):
+        raise ValueError("plane-balanced surface refinement arrays differ")
+    if len(selected) < MINIMUM_PNP_POINTS or len(np.unique(planes[selected])) < 2:
+        return pose.copy(), selected.copy()
+    weights = _plane_balance_weights(planes[selected])
+    distortion = np.asarray([radial_k1, 0.0, 0.0, 0.0, 0.0], np.float64)
+    initial = np.r_[cv2.Rodrigues(pose[:3, :3])[0].reshape(3), pose[:3, 3]]
+
+    def residual(parameter: np.ndarray) -> np.ndarray:
+        projected, _ = cv2.projectPoints(
+            world[selected], parameter[:3], parameter[3:], K, distortion,
+        )
+        return ((projected.reshape(-1, 2) - pixel[selected]) * weights[:, None]).reshape(-1)
+
+    solution = least_squares(
+        residual,
+        initial,
+        method="trf",
+        loss="huber",
+        f_scale=2.0,
+        max_nfev=100,
+        ftol=1e-10,
+        xtol=1e-10,
+        gtol=1e-10,
+    )
+    if not solution.success or not np.all(np.isfinite(solution.x)):
+        return pose.copy(), selected.copy()
+    initial_projected, _ = cv2.projectPoints(
+        world[selected], initial[:3], initial[3:], K, distortion,
+    )
+    refined_projected, _ = cv2.projectPoints(
+        world[selected], solution.x[:3], solution.x[3:], K, distortion,
+    )
+    initial_median = float(np.median(np.linalg.norm(
+        initial_projected.reshape(-1, 2) - pixel[selected], axis=1,
+    )))
+    refined_median = float(np.median(np.linalg.norm(
+        refined_projected.reshape(-1, 2) - pixel[selected], axis=1,
+    )))
+    # The balanced objective is a regularizer, not permission to degrade the
+    # ordinary geometric fit.  This monotonic, label-free acceptance test is
+    # what makes the refinement safe as a drop-in backend.
+    if refined_median > initial_median + 1e-12:
+        return pose.copy(), selected.copy()
+    refined = np.eye(4, dtype=np.float64)
+    refined[:3, :3] = cv2.Rodrigues(solution.x[:3])[0]
+    refined[:3, 3] = solution.x[3:]
+    camera = world @ refined[:3, :3].T + refined[:3, 3]
+    projected, _ = cv2.projectPoints(
+        world, solution.x[:3], solution.x[3:], K, distortion,
+    )
+    error = np.linalg.norm(projected.reshape(-1, 2) - pixel, axis=1)
+    final = np.flatnonzero((camera[:, 2] > 0.0) & np.isfinite(error) & (error <= 4.0))
+    # Refinement is not allowed to trade away substantial support merely to
+    # lower a robust objective on a small subset.
+    if len(final) < max(MINIMUM_PNP_POINTS, int(np.floor(0.9 * len(selected)))):
+        return pose.copy(), selected.copy()
+    return refined, final
 
 
 def _pose_diagnostics(
@@ -558,10 +752,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--source_subtoken_geometry",
-        choices=("token_median", "homography_depth"),
+        choices=("token_median", "homography_depth", "homography_plane"),
         default="token_median",
     )
     parser.add_argument("--mapping_depth_contributors", type=Path)
+    parser.add_argument("--mapping_camera_contributors", type=Path)
     parser.add_argument("--official_test_map_disjoint", action="store_true")
     parser.add_argument("--query_camera_inventory", type=Path)
     parser.add_argument("--output", type=Path, required=True)
@@ -578,6 +773,11 @@ def main() -> None:
         "--query_pixel_mode",
         choices=("token_center", "homography_projection"),
         default="token_center",
+    )
+    parser.add_argument(
+        "--pose_solver",
+        choices=("standard_pnp", "plane_balanced_surface"),
+        default="standard_pnp",
     )
     parser.add_argument("--homography_projection_fraction", type=float, default=1.0)
     args = parser.parse_args()
@@ -598,8 +798,20 @@ def main() -> None:
     if args.source_subtoken_geometry == "homography_depth":
         if args.mapping_depth_contributors is None:
             raise ValueError("homography source depth requires mapping depth contributors")
+    elif args.source_subtoken_geometry == "homography_plane":
+        if args.planar_map is None:
+            raise ValueError("homography source plane intersections require the planar map")
+        if args.mapping_camera_contributors is None:
+            raise ValueError("homography source plane intersections require mapping camera contributors")
+        if args.mapping_depth_contributors is not None:
+            raise ValueError("homography source plane intersections do not consume depth")
     elif args.mapping_depth_contributors is not None:
         raise ValueError("mapping depth contributors supplied without homography source depth")
+    if (
+        args.source_subtoken_geometry != "homography_plane"
+        and args.mapping_camera_contributors is not None
+    ):
+        raise ValueError("mapping camera contributors supplied without homography plane geometry")
     if args.output.exists():
         raise FileExistsError("refusing to overwrite RADIO plane PnP diagnostic")
     atlas, atlas_meta = PlaneVisibilityAtlas.load_npz(args.visibility_atlas)
@@ -607,7 +819,7 @@ def main() -> None:
     if list(token_grid) != list(atlas_meta.get("token_grid", (36, 64))):
         raise ValueError("visibility token grid metadata differs")
     planar_map = None
-    if args.source_point_geometry == "plane_projected":
+    if args.source_point_geometry == "plane_projected" or args.source_subtoken_geometry == "homography_plane":
         if args.planar_map is None:
             raise ValueError("plane-projected source points require the planar map")
         if file_sha256(args.planar_map) != atlas_meta.get("planar_map_file_sha256"):
@@ -746,6 +958,26 @@ def main() -> None:
         mapping_depth_hashes[name] = file_sha256(path)
         return mapping_depth_cache[name]
 
+    mapping_camera_cache: dict[str, tuple[np.ndarray, np.ndarray, float]] = {}
+    mapping_camera_hashes: dict[str, str] = {}
+
+    def mapping_camera_geometry(name: str):
+        if name in mapping_camera_cache:
+            return mapping_camera_cache[name]
+        path = args.mapping_camera_contributors / name
+        with np.load(path, allow_pickle=False) as data:
+            pose = np.asarray(data["pose_w2c"], np.float64)
+            model_id = int(data["camera_model_id"])
+            source_width = int(data["camera_width"])
+            source_height = int(data["camera_height"])
+            params = np.asarray(data["camera_params"], np.float64)
+        if pose.shape != (4, 4):
+            raise ValueError("mapping contributor camera geometry differs")
+        K, k1 = _scaled_intrinsics(model_id, params, source_width, source_height)
+        mapping_camera_cache[name] = pose, K, k1
+        mapping_camera_hashes[name] = file_sha256(path)
+        return mapping_camera_cache[name]
+
     frozen = []
     frozen_correspondences: list[dict[str, object]] = []
     for query_row in ranking["rows"]:
@@ -811,7 +1043,7 @@ def main() -> None:
                     )
                     if args.query_pixel_mode == "homography_projection":
                         keep &= np.all(np.isfinite(projected_query_xy), axis=1)
-                    if args.source_subtoken_geometry == "homography_depth":
+                    if args.source_subtoken_geometry in ("homography_depth", "homography_plane"):
                         keep &= np.all(np.isfinite(projected_map_xy), axis=1)
                     matched_points = np.asarray(points[si], np.float64)
                     if args.source_subtoken_geometry == "homography_depth":
@@ -821,6 +1053,19 @@ def main() -> None:
                             depth, source_pose, source_K, source_k1,
                             projected_map_xy, matched_points, token_grid,
                         )
+                    elif args.source_subtoken_geometry == "homography_plane":
+                        source_name = str(atlas.view_names[int(atlas_row)])
+                        source_pose, source_K, source_k1 = mapping_camera_geometry(source_name)
+                        matched_points, plane_intersection_valid = _homography_source_plane_points(
+                            source_pose,
+                            source_K,
+                            source_k1,
+                            projected_map_xy,
+                            token_grid,
+                            planar_map.normals_world[int(plane)],
+                            float(planar_map.offsets_world[int(plane)]),
+                        )
+                        keep &= plane_intersection_valid
                     for local in np.flatnonzero(keep).tolist():
                         query_token = int(qtoken[qi[local]])
                         query_xy = np.asarray(
@@ -892,6 +1137,16 @@ def main() -> None:
         pose, inlier = _pnp(
             world, token, K, k1, token_grid=token_grid, query_pixel=pixel,
         )
+        if pose is not None and args.pose_solver == "plane_balanced_surface":
+            pose, inlier = _plane_balanced_surface_refine(
+                pose,
+                inlier,
+                world,
+                pixel,
+                np.asarray(selected_rows, np.int64).reshape(-1, 3)[:, 1],
+                K,
+                k1,
+            )
         diagnostics = _pose_diagnostics(
             pose, inlier, world, token, selected_rows, K, k1,
             token_grid=token_grid, atlas_view_names=atlas.view_names,
@@ -943,7 +1198,7 @@ def main() -> None:
                 if (
                     args.query_pixel_mode == "homography_projection"
                     or args.source_point_geometry == "plane_projected"
-                    or args.source_subtoken_geometry == "homography_depth"
+                    or args.source_subtoken_geometry in ("homography_depth", "homography_plane")
                 )
                 else "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v1"
             ),
@@ -962,7 +1217,10 @@ def main() -> None:
             "homography_projection_fraction": homography_projection_fraction,
             "source_point_geometry": str(args.source_point_geometry),
             "source_subtoken_geometry": str(args.source_subtoken_geometry),
+            "pose_solver": str(args.pose_solver),
+            "plane_balance_quadratic_mass_cap": int(PLANE_BALANCE_QUADRATIC_MASS_CAP),
             "mapping_depth_contributor_file_sha256_by_name": dict(sorted(mapping_depth_hashes.items())),
+            "mapping_camera_contributor_file_sha256_by_name": dict(sorted(mapping_camera_hashes.items())),
             "planar_map_file_sha256": (
                 None if args.planar_map is None else file_sha256(args.planar_map)
             ),
@@ -1033,7 +1291,10 @@ def main() -> None:
             "homography_projection_fraction": homography_projection_fraction,
             "source_point_geometry": str(args.source_point_geometry),
             "source_subtoken_geometry": str(args.source_subtoken_geometry),
+            "pose_solver": str(args.pose_solver),
+            "plane_balance_quadratic_mass_cap": int(PLANE_BALANCE_QUADRATIC_MASS_CAP),
             "mapping_depth_contributor_file_sha256_by_name": dict(sorted(mapping_depth_hashes.items())),
+            "mapping_camera_contributor_file_sha256_by_name": dict(sorted(mapping_camera_hashes.items())),
             "planar_map_file_sha256": (
                 None if args.planar_map is None else file_sha256(args.planar_map)
             ),
@@ -1104,7 +1365,10 @@ def main() -> None:
         ),
         "source_point_geometry": str(args.source_point_geometry),
         "source_subtoken_geometry": str(args.source_subtoken_geometry),
+        "pose_solver": str(args.pose_solver),
+        "plane_balance_quadratic_mass_cap": int(PLANE_BALANCE_QUADRATIC_MASS_CAP),
         "mapping_depth_contributor_file_sha256_by_name": dict(sorted(mapping_depth_hashes.items())),
+        "mapping_camera_contributor_file_sha256_by_name": dict(sorted(mapping_camera_hashes.items())),
         "planar_map_file_sha256": (
             None if args.planar_map is None else file_sha256(args.planar_map)
         ),

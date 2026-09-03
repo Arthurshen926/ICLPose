@@ -14,7 +14,7 @@ from feature_extract.tools.vfm.evaluate_goal_maplet_radio_plane_pnp import (
     _mutual_matches,
     _radio,
     _records,
-    _region_tokens,
+    _region_token_support,
 )
 from feature_extract.vfm.localization_goal_maplet.lineage import (
     arrays_sha256,
@@ -44,6 +44,44 @@ def _metric_homography_filter(
         confidence=0.995,
     )
     return np.zeros(len(query_tokens), bool) if mask is None else mask.reshape(-1).astype(bool)
+
+
+def _core_seeded_metric_homography_filter(
+    query_tokens: np.ndarray,
+    plane_uv_m: np.ndarray,
+    visible_fraction: np.ndarray,
+    *,
+    threshold_m: float,
+) -> np.ndarray:
+    """Fit on plane-interior tokens, then admit geometrically consistent halo.
+
+    Boundary tokens remain useful for coverage but can no longer determine the
+    plane warp when at least four fully observed interior tokens are present.
+    No hidden/occluded pixel is added and an invalid core fit fails closed.
+    """
+
+    token = np.asarray(query_tokens, np.int64).reshape(-1)
+    target = np.asarray(plane_uv_m, np.float64).reshape(-1, 2)
+    fraction = np.asarray(visible_fraction, np.float64).reshape(-1)
+    if not (len(token) == len(target) == len(fraction)):
+        raise ValueError("core/halo metric homography arrays differ")
+    if len(token) < 4:
+        return np.zeros(len(token), bool)
+    query_xy = np.c_[token % 64, token // 64].astype(np.float64)
+    core = fraction >= 1.0 - 1e-7
+    seed = np.flatnonzero(core) if int(np.sum(core)) >= 4 else np.arange(len(token))
+    cv2.setRNGSeed(260901)
+    homography, mask = cv2.findHomography(
+        query_xy[seed], target[seed], cv2.RANSAC, float(threshold_m),
+        maxIters=2000, confidence=0.995,
+    )
+    if homography is None or mask is None or int(np.sum(mask)) < 4:
+        return np.zeros(len(token), bool)
+    projected = cv2.perspectiveTransform(
+        query_xy.reshape(-1, 1, 2), np.asarray(homography, np.float64),
+    ).reshape(-1, 2)
+    residual = np.linalg.norm(projected - target, axis=1)
+    return np.all(np.isfinite(projected), axis=1) & (residual <= float(threshold_m))
 
 
 def _top_distinct_hypotheses(
@@ -80,6 +118,10 @@ def main() -> None:
     parser.add_argument("--topk_planes", type=int, default=10)
     parser.add_argument("--hypotheses_per_query_token", type=int, default=3)
     parser.add_argument("--homography_threshold_m", type=float, default=1.0)
+    parser.add_argument(
+        "--query_support_policy", choices=("uniform", "core_seeded_halo_verified"),
+        default="uniform",
+    )
     parser.add_argument("--output_correspondences", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
@@ -90,12 +132,32 @@ def main() -> None:
 
     with np.load(args.plane_uv_atlas, allow_pickle=False) as data:
         atlas_meta = json.loads(str(data["metadata_json"].item()))
-        atlas = {name: np.asarray(data[name]) for name in (
+        atlas_names = [
             "plane_texel_offsets", "texel_uv_m", "world_points", "radio_features",
             "view_support", "token_support", "texel_identity", "prototype_rank",
-        )}
+        ]
+        if atlas_meta.get("artifact_type") in (
+            "goal_maplet_metric_plane_uv_radio_atlas_v4",
+            "goal_maplet_metric_plane_uv_radio_atlas_v5",
+            "goal_maplet_metric_plane_uv_radio_atlas_v6",
+        ):
+            atlas_names += ["prototype_view_direction_world", "prototype_observation_range_m"]
+        if atlas_meta.get("artifact_type") == "goal_maplet_metric_plane_uv_radio_atlas_v5":
+            atlas_names += ["prototype_surface_height_m", "prototype_surface_height_std_m"]
+        if atlas_meta.get("artifact_type") == "goal_maplet_metric_plane_uv_radio_atlas_v6":
+            atlas_names += [
+                "prototype_surface_height_m", "prototype_surface_height_std_m",
+                "prototype_surface_height_applied_m", "prototype_surface_height_valid",
+            ]
+        atlas = {name: np.asarray(data[name]) for name in atlas_names}
     if (
-        atlas_meta.get("artifact_type") != "goal_maplet_metric_plane_uv_radio_atlas_v2"
+        atlas_meta.get("artifact_type") not in (
+            "goal_maplet_metric_plane_uv_radio_atlas_v2",
+            "goal_maplet_metric_plane_uv_radio_atlas_v3",
+            "goal_maplet_metric_plane_uv_radio_atlas_v4",
+            "goal_maplet_metric_plane_uv_radio_atlas_v5",
+            "goal_maplet_metric_plane_uv_radio_atlas_v6",
+        )
         or atlas_meta.get("uses_query_pose_depth_or_ground_truth") is not False
         or arrays_sha256(atlas) != atlas_meta.get("arrays_sha256")
     ):
@@ -115,6 +177,7 @@ def main() -> None:
     cameras, camera_meta = _camera_inventory(args.query_camera_inventory)
 
     names, point_rows, token_rows, provenance_rows, matrices, radial = [], [], [], [], [], []
+    prototype_rows, visible_rows, score_rows = [], [], []
     diagnostic_rows = []
     for query in ranking["rows"]:
         name = str(query["image"])
@@ -129,9 +192,10 @@ def main() -> None:
         planes, _ = QueryPlaneRegions.load_npz(args.query_plane_dir / name)
         query_feature = _radio(name, radio_records)
         all_points, all_tokens, all_scores, all_planes, all_texels, all_regions = [], [], [], [], [], []
+        all_prototypes, all_visible = [], []
         for region_row in query["regions"]:
             region = int(region_row["region"])
-            qtoken = _region_tokens(planes.labels, region)
+            qtoken, qvisible = _region_token_support(planes.labels, region)
             if len(qtoken) < 4:
                 continue
             qfeature = query_feature[qtoken]
@@ -143,10 +207,16 @@ def main() -> None:
                 qi, ti, score = _mutual_matches(qfeature, atlas["radio_features"][lo:hi].astype(np.float32))
                 if len(qi) < 4:
                     continue
-                keep = _metric_homography_filter(
-                    qtoken[qi], atlas["texel_uv_m"][lo + ti],
-                    threshold_m=float(args.homography_threshold_m),
-                )
+                if args.query_support_policy == "core_seeded_halo_verified":
+                    keep = _core_seeded_metric_homography_filter(
+                        qtoken[qi], atlas["texel_uv_m"][lo + ti], qvisible[qi],
+                        threshold_m=float(args.homography_threshold_m),
+                    )
+                else:
+                    keep = _metric_homography_filter(
+                        qtoken[qi], atlas["texel_uv_m"][lo + ti],
+                        threshold_m=float(args.homography_threshold_m),
+                    )
                 selected = np.flatnonzero(keep)
                 if not len(selected):
                     continue
@@ -157,6 +227,8 @@ def main() -> None:
                 all_planes.append(np.full(len(selected), plane, np.int64))
                 all_texels.append(atlas["texel_identity"][prototype].astype(np.int64))
                 all_regions.append(np.full(len(selected), region, np.int64))
+                all_prototypes.append(prototype.astype(np.int64))
+                all_visible.append(qvisible[qi[selected]].astype(np.float64))
         if all_points:
             world = np.concatenate(all_points)
             token = np.concatenate(all_tokens)
@@ -164,18 +236,27 @@ def main() -> None:
             plane_row = np.concatenate(all_planes)
             texel_row = np.concatenate(all_texels)
             region_row = np.concatenate(all_regions)
+            prototype_row = np.concatenate(all_prototypes)
+            visible_fraction = np.concatenate(all_visible)
             chosen = _top_distinct_hypotheses(
                 token, score, plane_row, texel_row,
                 maximum_per_token=int(args.hypotheses_per_query_token),
             )
             world, token = world[chosen], token[chosen]
             provenance = np.c_[region_row[chosen], plane_row[chosen], texel_row[chosen]]
+            prototype_row = prototype_row[chosen]
+            visible_fraction = visible_fraction[chosen]
+            match_score = score[chosen]
         else:
             world = np.zeros((0, 3), np.float64)
             token = np.zeros(0, np.int64)
             provenance = np.zeros((0, 3), np.int64)
+            prototype_row = np.zeros(0, np.int64)
+            visible_fraction = np.zeros(0, np.float64)
+            match_score = np.zeros(0, np.float64)
         names.append(name); point_rows.append(world); token_rows.append(token)
         provenance_rows.append(provenance); matrices.append(K); radial.append(k1)
+        prototype_rows.append(prototype_row); visible_rows.append(visible_fraction); score_rows.append(match_score)
         diagnostic_rows.append({
             "name": name,
             "correspondence_count": int(len(token)),
@@ -193,9 +274,12 @@ def main() -> None:
         "provenance_region_plane_atlas_row": np.concatenate(provenance_rows).astype(np.int64),
         "camera_matrices": np.asarray(matrices, np.float64),
         "radial_k1": np.asarray(radial, np.float64),
+        "prototype_atlas_row": np.concatenate(prototype_rows).astype(np.int64),
+        "query_plane_visible_fraction": np.concatenate(visible_rows).astype(np.float32),
+        "radio_match_score": np.concatenate(score_rows).astype(np.float32),
     }
     metadata = {
-        "artifact_type": "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v1",
+        "artifact_type": "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v2",
         "arrays_sha256": arrays_sha256(arrays),
         "query_count": int(len(names)),
         "correspondence_count": int(offsets[-1]),
@@ -205,11 +289,20 @@ def main() -> None:
         "hypotheses_per_query_token": int(args.hypotheses_per_query_token),
         "topk_planes": int(args.topk_planes),
         "homography_threshold_m": float(args.homography_threshold_m),
+        "query_support_policy": str(args.query_support_policy),
+        "query_boundary_token_role": (
+            "verified_halo_only" if args.query_support_policy == "core_seeded_halo_verified"
+            else "equal_to_core"
+        ),
+        "prototype_geometry_binding": "explicit_atlas_row_not_texel_identity",
+        "query_support_weight_available": "visible_fraction_for_soft_core_halo_weighting",
         "plane_uv_atlas_file_sha256": file_sha256(args.plane_uv_atlas),
         "plane_uv_atlas_content_sha256": atlas_meta.get("content_sha256"),
         "plane_ranking_file_sha256": file_sha256(args.plane_ranking),
         "query_camera_only_inventory_file_sha256": file_sha256(args.query_camera_inventory),
         "query_camera_only_inventory_content_sha256": camera_meta.get("content_sha256"),
+        "radio_manifest_file_sha256_in_order": [file_sha256(path) for path in args.radio_manifest],
+        "runtime_map_stores_source_rgb": False,
     }
     metadata["content_sha256"] = canonical_json_sha256(metadata)
     args.output_correspondences.parent.mkdir(parents=True, exist_ok=True)

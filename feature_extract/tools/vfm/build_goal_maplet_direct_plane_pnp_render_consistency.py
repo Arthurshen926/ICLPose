@@ -1,4 +1,4 @@
-"""Score frozen direct-plane PnP poses by scale-free MoGe3/map agreement.
+"""Score frozen direct-plane poses by metric and scale-free MoGe3/map agreement.
 
 The input poses must have been sealed before any query pose/GT member was
 opened.  The query MoGe3 geometry is used only after pose estimation and a
@@ -60,8 +60,10 @@ def _load_frozen_poses(path: Path) -> tuple[dict[str, np.ndarray], dict[str, obj
         "pnp_inlier_count": all_arrays[inlier_key],
     }
     count = len(arrays["names"])
+    artifact_type = metadata.get("artifact_type")
+    depth_used = metadata.get("query_depth_or_scale_used_by_pose_solver")
     if (
-        metadata.get("artifact_type") not in (
+        artifact_type not in (
             "goal_maplet_frozen_direct_plane_pnp_pose_inventory_v1",
             "goal_maplet_direct_plane_pnp_map_density_inlier_selected_v1",
             "goal_maplet_direct_plane_pnp_top5_top10_pose_consensus_v1",
@@ -74,9 +76,16 @@ def _load_frozen_poses(path: Path) -> tuple[dict[str, np.ndarray], dict[str, obj
             "goal_maplet_direct_plane_pnp_reliability_cascade_v5",
             "goal_maplet_direct_plane_pnp_multiscale_reliability_cascade_v6",
             "goal_maplet_direct_plane_pnp_multiscale_reliability_cascade_v7",
+            "goal_maplet_moge3_plane_scale_surface_refinement_v1",
+            "goal_maplet_canonical_plane_uv_view_geometry_refined_pose_v1",
         )
         or metadata.get("query_pose_or_ground_truth_read", False) is not False
-        or metadata.get("query_depth_or_scale_used_by_pose_solver") is not False
+        or (
+            depth_used is not (
+                True if artifact_type == "goal_maplet_moge3_plane_scale_surface_refinement_v1"
+                else False
+            )
+        )
         or arrays_sha256(all_arrays) != metadata.get("arrays_sha256")
         or arrays["pose_w2c"].shape != (count, 4, 4)
         or arrays["usable"].shape != (count,)
@@ -96,7 +105,13 @@ def _metric_depth_normal_agreement(
     query_normal_camera: np.ndarray,
     query_valid: np.ndarray,
 ) -> dict[str, object]:
-    """Compute pose-confidence signals with one fitted global depth scale."""
+    """Compute metric, scale-only, and affine relative-depth diagnostics.
+
+    MoGe3's raw depth is retained as a metric cue, while a fitted scale and a
+    bounded affine log-depth model expose what remains if its global scale or
+    depth compression drifts.  The fitted variables never enter the pose that
+    produced the render; this function is a frozen-candidate verifier.
+    """
 
     rendered = np.asarray(rendered_depth, np.float64)
     query = np.asarray(query_depth, np.float64)
@@ -115,8 +130,16 @@ def _metric_depth_normal_agreement(
             "common_valid_pixel_count": common_count,
             "render_coverage_of_query_valid": 0.0 if query_count == 0 else common_count / query_count,
             "fitted_query_depth_scale": None,
+            "metric_query_depth_scale_log_bias": None,
+            "metric_absrel_median": None,
+            "metric_absrel_p90": None,
             "absolute_log_depth_median": None,
             "absolute_log_depth_p90": None,
+            "affine_log_depth_slope": None,
+            "affine_log_depth_intercept": None,
+            "affine_log_depth_median": None,
+            "affine_log_depth_p90": None,
+            "relative_log_depth_correlation": None,
             "depth_ratio_within_10pct": 0.0,
             "depth_ratio_within_20pct": 0.0,
             "depth_ratio_within_50pct": 0.0,
@@ -126,7 +149,40 @@ def _metric_depth_normal_agreement(
             "normal_within_30deg": 0.0,
         }
     scale = float(np.median(rendered[common] / query[common]))
-    log_error = np.abs(np.log(rendered[common] / (scale * query[common])))
+    rendered_common = rendered[common]
+    query_common = query[common]
+    log_query = np.log(query_common)
+    log_rendered = np.log(rendered_common)
+    log_error = np.abs(log_rendered - log_query - np.log(scale))
+    metric_absrel = np.abs(rendered_common - query_common) / np.maximum(
+        rendered_common, 1e-12,
+    )
+    centered_query = log_query - float(np.mean(log_query))
+    centered_rendered = log_rendered - float(np.mean(log_rendered))
+    denominator = float(np.sum(centered_query * centered_query))
+    slope = 1.0 if denominator <= 1e-12 else float(
+        np.sum(centered_query * centered_rendered) / denominator
+    )
+    slope = float(np.clip(slope, 0.5, 1.5))
+    intercept = float(np.median(log_rendered - slope * log_query))
+    signed_affine = log_rendered - (slope * log_query + intercept)
+    median_signed = float(np.median(signed_affine))
+    mad = float(np.median(np.abs(signed_affine - median_signed)))
+    trim = np.abs(signed_affine - median_signed) <= max(3.0 * 1.4826 * mad, 1e-6)
+    if int(np.sum(trim)) >= 16 and float(np.var(log_query[trim])) > 1e-12:
+        design = np.c_[log_query[trim], np.ones(int(np.sum(trim)), np.float64)]
+        fitted = np.linalg.lstsq(design, log_rendered[trim], rcond=None)[0]
+        slope = float(np.clip(fitted[0], 0.5, 1.5))
+        intercept = float(np.median(log_rendered[trim] - slope * log_query[trim]))
+        signed_affine = log_rendered - (slope * log_query + intercept)
+    affine_error = np.abs(signed_affine)
+    correlation_denominator = float(
+        np.linalg.norm(centered_query) * np.linalg.norm(centered_rendered)
+    )
+    correlation = (
+        0.0 if correlation_denominator <= 1e-12
+        else float(np.sum(centered_query * centered_rendered) / correlation_denominator)
+    )
     rn = rendered_normal[common]
     qn = query_normal[common]
     cosine = np.abs(np.sum(rn * qn, axis=1)) / np.maximum(
@@ -138,8 +194,16 @@ def _metric_depth_normal_agreement(
         "common_valid_pixel_count": common_count,
         "render_coverage_of_query_valid": float(common_count / query_count),
         "fitted_query_depth_scale": scale,
+        "metric_query_depth_scale_log_bias": float(abs(np.log(scale))),
+        "metric_absrel_median": float(np.median(metric_absrel)),
+        "metric_absrel_p90": float(np.quantile(metric_absrel, 0.9)),
         "absolute_log_depth_median": float(np.median(log_error)),
         "absolute_log_depth_p90": float(np.quantile(log_error, 0.9)),
+        "affine_log_depth_slope": slope,
+        "affine_log_depth_intercept": intercept,
+        "affine_log_depth_median": float(np.median(affine_error)),
+        "affine_log_depth_p90": float(np.quantile(affine_error, 0.9)),
+        "relative_log_depth_correlation": correlation,
         "depth_ratio_within_10pct": float(np.mean(log_error <= np.log(1.1))),
         "depth_ratio_within_20pct": float(np.mean(log_error <= np.log(1.2))),
         "depth_ratio_within_50pct": float(np.mean(log_error <= np.log(1.5))),
@@ -281,8 +345,11 @@ def main() -> None:
         "query_count": int(len(rows)),
         "query_pose_or_ground_truth_read": False,
         "query_depth_or_scale_used_by_pose_solver": False,
-        "query_moge3_role": "post_pose_scale_free_depth_and_normal_verification",
+        "query_moge3_role": "post_pose_metric_scale_relative_depth_and_normal_verification",
         "depth_scale_fit": "per_query_median_rendered_depth_over_moge3_depth",
+        "affine_log_depth_fit": "per_query_MAD_trimmed_bounded_slope_[0.5,1.5]",
+        "raw_metric_depth_retained": True,
+        "query_depth_changes_frozen_pose": False,
         "frozen_pose_inventory_file_sha256": file_sha256(args.frozen_pose_inventory),
         "frozen_pose_inventory_content_sha256": pose_meta.get("content_sha256"),
         "physical_map_file_sha256": file_sha256(args.physical_map),

@@ -11,6 +11,8 @@ from feature_extract.tools.vfm.evaluate_goal_maplet_radio_plane_pnp import (
     _homography_filter_with_bidirectional_projections,
     _homography_filter_with_query_projection,
     _homography_source_world_points,
+    _homography_source_plane_points,
+    _plane_balance_weights,
     _pose_diagnostics,
     _pnp,
     _project_points_to_plane,
@@ -169,6 +171,57 @@ def test_homography_source_lift_uses_continuous_pixel_and_fails_closed_at_depth_
     np.testing.assert_allclose(lifted[0], expected[0], atol=1e-12)
     np.testing.assert_allclose(lifted[1], reference[1], atol=1e-12)
     assert used.tolist() == [True, False]
+
+
+def test_homography_source_plane_intersection_is_continuous_and_plane_exact() -> None:
+    K = np.asarray([[100.0, 0.0, 127.5], [0.0, 100.0, 71.5], [0.0, 0.0, 1.0]])
+    map_xy = np.asarray([[10.25, 12.75], [70.5, 40.125]], np.float64)
+    points, valid = _homography_source_plane_points(
+        np.eye(4), K, 0.0, map_xy, (68, 120),
+        np.asarray([0.0, 0.0, 1.0]), 5.0,
+    )
+    pixel = np.c_[
+        (map_xy[:, 0] + .5) * 256.0 / 120 - .5,
+        (map_xy[:, 1] + .5) * 144.0 / 68 - .5,
+    ]
+    expected = np.c_[
+        (pixel[:, 0] - 127.5) / 100.0 * 5.0,
+        (pixel[:, 1] - 71.5) / 100.0 * 5.0,
+        np.full(2, 5.0),
+    ]
+    assert valid.tolist() == [True, True]
+    np.testing.assert_allclose(points, expected, atol=1e-12)
+    np.testing.assert_allclose(points[:, 2], 5.0, atol=1e-12)
+
+
+def test_homography_source_plane_intersection_rejects_behind_camera() -> None:
+    K = np.asarray([[100.0, 0.0, 127.5], [0.0, 100.0, 71.5], [0.0, 0.0, 1.0]])
+    points, valid = _homography_source_plane_points(
+        np.eye(4), K, 0.0, np.asarray([[10.0, 10.0]]), (68, 120),
+        np.asarray([0.0, 0.0, 1.0]), -2.0,
+    )
+    assert valid.tolist() == [False]
+    assert np.isnan(points).all()
+
+
+def test_homography_source_plane_intersection_rejects_nonfinite_row_only() -> None:
+    K = np.asarray([[100.0, 0.0, 127.5], [0.0, 100.0, 71.5], [0.0, 0.0, 1.0]])
+    points, valid = _homography_source_plane_points(
+        np.eye(4), K, 0.0, np.asarray([[10.0, 10.0], [np.nan, 4.0]]), (68, 120),
+        np.asarray([0.0, 0.0, 1.0]), 2.0,
+    )
+    assert valid.tolist() == [True, False]
+    assert np.all(np.isfinite(points[0]))
+    assert np.isnan(points[1]).all()
+
+
+def test_plane_balance_caps_dense_plane_without_amplifying_sparse_plane() -> None:
+    planes = np.asarray([3] * 32 + [7] * 4, np.int64)
+    weight = _plane_balance_weights(planes, quadratic_mass_cap=8)
+    dense_mass = float(np.sum(weight[planes == 3] ** 2))
+    sparse_mass = float(np.sum(weight[planes == 7] ** 2))
+    assert dense_mass == pytest.approx(2.0 * sparse_mass)
+    assert float(weight[planes == 7][0]) > float(weight[planes == 3][0])
 
 
 def test_pnp_accepts_continuous_query_pixels() -> None:
