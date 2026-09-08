@@ -963,3 +963,1059 @@ not a promotion result and no selected-pose artifact is designated as a new
 operating point.  The exact three-way rule may be preregistered unchanged for
 a genuinely unseen route, where it must pass per-route non-regression before
 it can replace the current global-normal consensus.
+
+## Candidate-anchored posterior and staged tail audit (V112--V119)
+
+The new review cycle first closed two methodological gaps rather than tuning
+another endpoint selector.
+
+The cross-coordinate probabilistic solver now assigns probability mass to a
+physical mode keyed by `(query token, physical plane, anonymous atlas
+prototype)`. V5/V11 components split that mode mass and exact duplicate rows
+split, rather than duplicate, the existing probability. Consequently adding
+an accidental duplicate cannot increase a token's total prior. The fixed
+`radio_gibbs_unit_temperature` prior uses no fitted temperature and retains an
+explicit null. This is a materially better candidate-count-invariant contract
+than uniform row priors, but it is not an empirical improvement: seq10 changes
+from `21/71/85/87/88` to `19/71/84/87/88`. The arm is therefore **KILL** and
+was not opened on a new held route. Alternating the current local EM update,
+rather than prior normalization alone, remains the dominant problem.
+
+A new post-label stage audit freezes all correspondence and pose inventories
+before opening each contributor. Across 438 queries it records `413` coarse
+successes and decomposes the `25` failures into:
+
+- 15 hard-coordinate/PnP initialization failures;
+- 6 PnP-candidate collapse or downstream-refinement regressions;
+- 3 retrieved chart/within-chart UV support failures;
+- 1 final V5/V11 selector failure;
+- 0 candidate-geometry degeneracies under the exact-projection oracle.
+
+The 15 initialization failures are not empty-map cases. Their existing
+GT-consistent rows have min/median/max counts `6/16/94`, span `2/5/21`
+physical planes, and have minimum GT reprojection error
+`.141/.424/1.273 px`. Cambridge has no depth ground truth, so the three support
+failures cannot honestly be split into "chart absent" versus "correct UV
+absent"; the report preserves that limitation explicitly.
+
+The aggregate audit is `pose_failure_attribution_all438_v115.json`, file
+SHA256 `ddf636306314445748b2765f1a71e56b486c4c64f01f68e022f5f07dab910245`,
+content SHA256
+`32286fec4978668f219569e68dba489e6186bcc645003939e8ec5fbff262e196`.
+
+The first bounded tail response uses a pose-free relative multi-plane layout
+test. For two query-region/map-plane associations it compares the unsigned
+angle between the query normals with the unsigned angle between the map
+normals. This quantity is invariant to unknown camera rotation and normal
+sign. Candidate generation is capped at 64 pairs and ranked lexicographically
+by angle error, existing RADIO evidence, support, and IDs; there is no
+continuous fusion weight. All candidate poses are hashed before labels open.
+
+On the 350 held queries the retained mainline has `325/350` coarse hits. The
+layout candidate pool alone has `322/350`, but its union with the existing pose
+contains `332/350`: it recovers 7 of the 25 existing held failures. However,
+the label-free supported-entity selection chooses only `310/350`, recovering
+just 3 failures while losing other cases. A sparse MoGe3 plane-geometry
+selection smoke on shard0 is coarse-neutral and heavily harms tighter
+thresholds. The correct conclusion is **candidate-generation headroom, no
+deployable selection gain**. The layout pool remains a bounded tail hypothesis
+source; it does not replace the mainline and does not justify more Top-K or
+pair enumeration.
+
+The aggregate is `multiplane_layout_all350_aggregate_v119.json`, file SHA256
+`d90c1a962a057a8ed1a70c5490f339154654df7b7deecd6931246420d62d6e80`,
+content SHA256
+`02da92371aff6ade98938c0b30e690bd3ef79406b6d39d26d6d291a825df8573`.
+An intermediate V117 report had a local variable-shadowing bug in evaluation
+bookkeeping (the frozen candidate NPZ was unaffected); it is superseded by
+V118 and is not evidence.
+
+The updated optimization target is precise. Coarse-tail work needs a
+query-conditioned, repeated-facade-aware multi-plane association posterior,
+not a larger map or an angle-only heuristic. Tight-threshold work still needs
+the candidate-conditioned local RADIO/chart-UV correlation head, followed by
+one joint null-aware surface solver rather than alternating hard PnP and local
+EM. Both must be frozen on mapping-only data before the next unseen route is
+opened.
+
+### P3 local RADIO correlation: mapping improvement, no mainline promotion (2026-09-07)
+
+Implemented a candidate-conditioned 3x3 query / 3x3 physical-chart RADIO64
+correlation head. Its 107 context inputs comprise the existing eight geometric
+values, 81 masked correlations, and 18 validity flags. The hidden width remains
+96. Outputs are bounded query subtoken and metric chart-UV residuals, positive
+measurement variances, and a match sigmoid. Runtime uses anonymous atlas
+descriptors, not source RGB or source-view retrieval. Fit neighbors exclude the
+query plane-observation; validation neighbors use fit routes only.
+
+The mapping-only V121 checkpoint improves held plane-observation image median
+error from 0.5267 to 0.4787 px (9.1%) and UV median error from 0.09112 to
+0.08767 m (3.8%); image/UV P90 and NLL also improve. All nine reference gates
+pass. These gates were introduced after the first local-correlation training
+run, so this is exploratory evidence, not a preregistered acceptance result.
+Calibration and evaluation alternate plane observations on seq9, not whole
+images; they are not image-disjoint validation sets.
+
+Seq10 results below use identical 79,536 correspondence candidates on 88
+development queries. Counts are joint translation/rotation successes.
+
+| Fixed selector | Coordinates | 0.1m/1deg | 0.25m/2deg | 0.5m/5deg | 1m/10deg | 2m/45deg | Median t (m) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| calibrated_gaussian_null | V11 | 25 | 70 | 84 | 87 | 88 | 0.1559 |
+| calibrated_gaussian_null | V12 | 22 | 71 | 84 | 87 | 88 | 0.1409 |
+| calibrated_gaussian_null | Pareto fusion | 24 | 73 | 84 | 87 | 88 | 0.1459 |
+| nearest_reprojection | V11 | 24 | 69 | 84 | 87 | 88 | 0.1583 |
+| nearest_reprojection | V12 | 21 | 72 | 84 | 86 | 88 | 0.1412 |
+| nearest_reprojection | Pareto fusion | 21 | 72 | 84 | 87 | 88 | 0.1476 |
+
+The original V122 paired report compared different selectors and must not be
+used as a head-only ablation. Fair reports are
+`learned64d_strict_seq10_h025_localcorr_v122_vs_v11cell_v123_paired.json`,
+`learned64d_strict_seq10_h025_localcorr_pareto_fused_v124_vs_v11_paired.json`,
+and the two `*_nearest_v125_paired.json` reports in the surface-coordinate
+upgrade output directory. Nearest-policy mean translation change confidence
+intervals include zero for both variants. Frame bootstrap also ignores temporal
+dependence. These development results do not establish blind-test superiority.
+
+Pareto fusion substitutes 32,923/79,536 coordinates (41.39%) only when predicted
+image and UV variance do not increase and the match sigmoid does not decrease.
+It has no query-GT gate, but cross-head sigmoid comparison is **not calibrated
+probability comparison**. It is a diagnostic, not a theoretically guaranteed
+non-regression rule. V126 corrects this documentation/lineage defect: records a
+per-row `coordinate_source_head_index`, nests both heads' calibration metadata,
+and removes misleading top-level single-head metadata. V124 is preserved as
+the historical numerical experiment; no claim that V126 itself was pose-replayed.
+
+Audit ruled out a suspected query-neighbor pixel-support discrepancy: both
+the observation bank and runtime require eight plane pixels per token. A real
+remaining distribution difference is training neighboring cell means from all
+fit representatives versus runtime means over at most four anonymous atlas
+modes. This needs a mapping-only deployment-equivalent ablation before any
+more query-side selector experiments. Neither variant passes strict-threshold
+non-regression; retain the existing mainline and do not expand to the remaining
+350 reused development queries merely to select the best variant. Verification:
+all 1,027 goal-maplet tests pass; `git diff --check` passes. V126's 19 original
+numerical arrays exactly match V124; only provenance/metadata was repaired.
+Next priority
+is aligned chart-neighbor construction and image/route-disjoint uncertainty
+validation, followed by a frozen unseen-route evaluation.
+
+### P3 neighbor-mode aggregation alignment ablation (2026-09-07)
+
+Added opt-in `--local_neighbor_policy atlas_modes_mean`. The default preserves
+the previous all-representative mean. The ablation changes only neighboring
+map-cell features: exclude the query observation first, select up to four modes
+using the atlas medoid-then-farthest rule, serialize at float16 precision, and
+normalize their mean. Candidate-center features, training targets, seed 260918,
+1200 steps, hidden width 96, and the V11 mapping gate stay fixed. The artifact
+records the policy and mode budget; runtime rejects a mismatched atlas budget.
+Tests compare the training aggregation directly to runtime aggregation and
+check observation exclusion under both policies. All 1,029 goal-maplet tests pass.
+
+Scope caveat: this aligns mode selection/aggregation, not the full descriptor
+pipeline. Training still uses the token nearest the cell center per
+plane-observation/cell; atlas construction averages multiple tokens per
+view/cell before selecting modes. That upstream difference is intentionally
+unchanged in this one-factor experiment. V127 is an intermediate smoke;
+V128 reruns with the exact runtime float64 accumulation / float32 normalization
+and invalid-norm guard. Neither uses query labels in fitting.
+
+V128 mapping validation image median/P90 = 0.478840/0.810099 px versus
+V121 0.478654/0.809736; UV median/P90 = 0.088133/0.179419 m versus
+0.087669/0.178657. Both pass the frozen V11-relative gate. Mode alignment
+does not improve the mapping coordinate metric by itself.
+
+The fixed nearest-reprojection seq10 replay V129 gives:
+
+| Coordinates | 0.1m/1deg | 0.25m/2deg | 0.5m/5deg | 1m/10deg | 2m/45deg | Median t (m) | Median r (deg) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| V11 reference | 24 | 69 | 84 | 87 | 88 | 0.15827 | 0.39003 |
+| V121 unaligned local head | 21 | 72 | 84 | 86 | 88 | 0.14115 | 0.36127 |
+| V128 mode-aligned local head | 22 | 72 | 84 | 87 | 88 | 0.13934 | 0.35986 |
+
+All 13 candidate/common arrays are exactly equal across old/new local heads
+(79,536 rows). Against the unaligned head, strict-threshold and 1m successes
+each recover one query with no losses at those thresholds. At 0.25m there are
+two gains and two losses, not per-query non-regression. The translation mean
+delta is -0.007676 m with frame-bootstrap 95% interval [-0.021846, +0.001001];
+there is no statistically established improvement, and these are reused
+development queries. Against V11, strict success remains two queries lower.
+Decision: promising small alignment benefit, **no mainline promotion** and no
+selector/fusion sweep. Next bounded ablation should replace representative-token
+neighbor inputs with view/cell token means while preserving targets and splits;
+whole-image/route-disjoint calibration remains separately required.
+
+Head: `stmarys_mapping_surface_coordinate_local_modes_head_v128.npz`, content
+SHA256 `7d1cd7e0c13a352036afcd1d12a4d8aa5b7d7aef59ff018b504846dc2db01e19`.
+Pose: `learned64d_strict_seq10_h025_local_modes_v129_final.npz`, file SHA256
+`e64fa99f6829ad1d7099c965bd463162875c4099e63650936abce46c1f4cf8af`.
+Both paired reports use the prefix `learned64d_strict_seq10_h025_local_modes_v129_vs_`
+in the existing surface-coordinate upgrade output directory.
+
+### P3 view/cell token-mean alignment and source-view exclusion (2026-09-07)
+
+Added opt-in `--local_neighbor_token_pooling view_cell_mean`, requiring the
+atlas-mode neighbor policy. All bank tokens are projected and normalized before
+averaging per physical cell and source view; the mean is normalized, then at
+most four anonymous modes are selected and aggregated. Only neighbor context
+changes: center descriptors, coordinate targets, query context, and pose backend
+remain unchanged. This is offline mapping processing; no source-view IDs or
+source images are introduced into runtime retrieval.
+
+The audit found **642 excess observations in 553 repeated plane/source-view
+groups across 111 planes**, among 13,043 observations. Plane observation IDs
+therefore cannot substitute for source-view IDs. V130 is a superseded
+observation-mean smoke and was not query-evaluated. V131 merges tokens by the
+actual source-view name, deduplicates cell/view representatives, and excludes
+the query's entire source view from neighbor mode construction before selection.
+Validation neighbor modes continue to use fit routes only. New tests cover
+multi-token means, cross-view isolation, and exclusion of all same-source rows.
+
+Important remaining boundary: the unchanged candidate-center training dataset
+still uses plane-observation exclusion; this experiment does not certify
+whole-pipeline source-view isolation or whole-image-disjoint calibration. That
+contract needs a separate audit/fix rather than calling this complete alignment.
+Specifically, 1,584 of 225,296 fit representatives belong to 792 cell/source-view
+groups containing multiple observations, before coordinate-target filtering.
+This is potential same-source fit contamination, not query-GT or held-route
+leakage. The atlas also requires two independent views per cell, whereas the
+training neighbor code still accepts one remaining view after exclusion. This
+support-validity discrepancy is unchanged and must not be hidden by the term
+"aligned"; a follow-up should freeze its policy before evaluating more queries.
+
+V131 mapping validation image median/P90 is 0.479406/0.809425 px; UV
+median/P90 is 0.087486/0.179680 m. V128 was 0.478840/0.810099 px and
+0.088133/0.179419 m. Thus token pooling slightly improves UV median, not every
+coordinate metric. All nine V11-relative gates pass. Head content SHA256:
+`53538f7e3f3ffb4451633d78b76300bf743000a2248a16bbb389f05b4db32885`.
+All 1,031 goal-maplet tests pass; `git diff --check` is clean.
+
+V132 fixed-nearest-reprojection replay uses exactly the same 79,536 candidates
+as V129 (all 13 common arrays match bitwise). On the same 88 development queries:
+
+| Coordinates | 0.1m/1deg | 0.25m/2deg | 0.5m/5deg | 1m/10deg | 2m/45deg | Median t (m) | Median r (deg) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| V128 representative/mode mean | 22 | 72 | 84 | 87 | 88 | 0.13934 | 0.35986 |
+| V131 source-view token mean | 20 | 69 | 84 | 87 | 88 | 0.14726 | 0.37461 |
+
+Strict threshold loses two queries without gains; 0.25m has one gain/four
+losses. Mean translation delta is +0.002121 m, frame-bootstrap interval
+[-0.001377, +0.005493]. Thus there is no gain warranting promotion; do not
+salvage it by searching selectors or expanding the reused development set.
+The one-pass treatment combines token pooling and necessary true-source
+deduplication/exclusion: this does not isolate which component causes the
+regression, nor prove that view/cell pooling is inherently unsuitable. It does
+show that improved mapping UV median alone is not a pose acceptance criterion.
+
+Keep the current production mainline and the prior diagnostic checkpoints.
+Next valuable work is a source-view-isolated center/neighbor training contract
+with deployment-equivalent support validity, then image-disjoint calibration;
+avoid interpreting another small seq10 fluctuation as a mainline-level result.
+The new pooling policy remains opt-in; correcting fit isolation should not be
+abandoned merely because this exploratory joint treatment regressed.
+
+Pose file `learned64d_strict_seq10_h025_local_viewmean_v132_final.npz`, SHA256
+`c8ac1311cd4d8b280d3b069e0bfe6a51ccdbd84b904af52fbf7a0412c8d540cd`.
+Paired reports use prefix `learned64d_strict_seq10_h025_local_viewmean_v132_vs_`
+in the existing surface-coordinate upgrade output directory. V130 was never
+query-evaluated. Training used the existing seed/steps with one BLAS/OMP CPU
+thread; inference candidate identity and scores were verified bitwise unchanged.
+
+### P3 source-view training contract (2026-09-07)
+
+The opt-in `--source_view_training_contract` unifies three previously mismatched
+rules. Canonical center targets exclude every observation from the query source
+view, average remaining observations within each source, then give sources equal
+weight. At least two independent remaining sources are required. Local chart
+neighbors also require two independent sources, matching the atlas admission
+rule. Shrinkage/variance calibration and evaluation alternate sorted **source
+images**, not plane observations; no image occurs in both subsets. These are
+still adjacent images within seq9, not independent unseen-route validation.
+
+Because targets and evaluation membership change, old V11/V12 mapping metrics
+are not comparable to this protocol. V133 is a newly trained V11 reference;
+the local head must use that reference with the same new source-view contract.
+The artifact records its contract, support minimum, and partition semantics;
+runtime checks the independent-view minimum against the atlas. Default legacy
+behavior remains available for reproduction. This fixes source isolation, not
+the still-distinct canonical-center versus anonymous-mode descriptor design.
+
+Both V133 and V134 use 68,936 fit pairs and 17,034 held mapping pairs, of which
+8,591 are calibration and 8,443 evaluation. With identical new targets and
+partitions, V134 reduces image median/P90 from 0.531019/0.870341 to
+0.485813/0.819919 px, and UV median/P90 from 0.092048/0.187220 to
+0.088256/0.180786 m. Both NLLs improve; all nine V11-relative gates pass.
+This supports a local-correlation coordinate benefit without same-image
+calibration overlap, not yet an unseen-route localization claim.
+
+V133 head content SHA256
+`641ef6f2236d9e9dda2cfdff5344ee6ec67468b8914b5eec67c0bc525225987f`;
+V134 `a9164c758f1c0666c59c4b4dd69ea6eb919e1489a5b2ef17c76289f900734005`.
+All 1,033 goal-maplet tests pass after the changes. Tests verify source-balanced
+center targets, complete query-source exclusion, and the two-source neighbor
+validity rule. No historical head or mainline pose was overwritten.
+
+Fixed-nearest-reprojection localization on the same 88 development queries:
+
+| Training/head | 0.1m/1deg | 0.25m/2deg | 0.5m/5deg | 1m/10deg | 2m/45deg | Median t (m) | Median r (deg) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Legacy V11 | 24 | 69 | 84 | 87 | 88 | 0.15827 | 0.39003 |
+| Source-isolated V11 (V135) | 22 | 73 | 84 | 87 | 88 | 0.15629 | 0.39604 |
+| Source-isolated local head (V136) | 23 | 71 | 84 | 87 | 88 | 0.14685 | 0.39045 |
+
+All 13 common correspondence arrays match exactly between V135 and V136
+(79,536 candidates). V136 versus V135 has five strict gains/four losses and
+zero 0.25m gains/two losses. Translation mean delta is -0.008415 m with ordinary
+frame-bootstrap interval [-0.018088, -0.000154]; rotation delta is -0.022350 deg
+with interval [-0.047678, -0.001497]. These narrow intervals do **not** establish
+generalization: frames are temporally correlated and seq10 is repeatedly reused
+development data. Threshold non-regression still fails. Do not promote either
+new head merely from these results or search another fusion threshold.
+
+The source-isolation/support/calibration corrections remain valuable independent
+of this mixed pose result. Coordinate improvements now survive a stricter
+mapping evaluation, but are not uniformly translated into localization success.
+The canonical-center versus runtime mode target mismatch and downstream
+hypothesis sensitivity remain unresolved; next work should diagnose those
+under this frozen corrected training protocol, not revert source isolation.
+
+V135 final pose SHA256
+`c3b1d3502c7ca315a228a81717175585281f3cf1b181ef6c8516b4a77e11453b`;
+V136 `668f2a33c8b4b68d5de18460a4127c53b987364a658127ed6632585b558645ae`.
+Report `learned64d_strict_seq10_h025_sourceisolated_local_v136_vs_v135_paired.json`
+and legacy-reference report `learned64d_strict_seq10_h025_sourceisolated_v11_v135_vs_legacy_paired.json`
+are in the existing surface-coordinate upgrade output directory. Mainline
+artifacts remain unchanged; these are diagnostic candidates only.
+
+## Latest external-review completion audit and temporal inference (V137)
+
+The latest attachment is `d5342896-3e23-48f2-a1ee-f5ac7da4395d/pasted-text.txt`.
+Its recommendations are **not all complete or validated**:
+
+| Recommendation | Verified status |
+| --- | --- |
+| P0 staged tail attribution | Completed aggregate of 438; 25 failures classified, but chart-missing versus UV-missing cannot be separated reliably without depth GT. |
+| P1 physical candidate priors and null | Candidate-anchored, duplicate-count-invariant prototype exists; match sigmoid is not independently probability-calibrated. |
+| P2 probability surface backend | Prototype tested and rejected for regression; no successful unified final solver. |
+| P3 local correlation/residual head | Implemented, source-isolated mapping gains verified; mixed query thresholds prevent promotion. Boundary-neighbor posterior and runtime-mode center targets remain open. |
+| P4 unified sparse/dense/depth/scale factors | Not complete; current sequential refinements/consensus are not one calibrated joint likelihood. |
+| Tail layout response | Extra oracle-recoverable poses found, but label-free selection regresses; no deployable tail gain. |
+| Final unseen-route/scene evaluation | Not done for these variants; 438 queries remain development evidence. |
+| Commit-level reproducibility and single entrypoint | Partial artifact hashes and reports exist; current local HEAD is d7dbbbb, with substantial uncommitted/untracked research code. No complete new release/tag or verified end-to-end single entrypoint. Remote HEAD was not queried in this audit. |
+
+V137 adds route-stratified circular moving-block bootstrap, ordered by numeric
+frame index, with fixed exploratory sensitivity lengths 5/10/20 observed frames and
+10,000 replicates each. Blocks preserve the paired method delta and never mix
+routes. This is conditional inference on observed routes, not route-level
+generalization; circular endpoint wrapping and block length are assumptions.
+Missing paired errors are kept in sequence positions and excluded only from
+each sampled mean. The threshold comparison also fixes a separate usability
+bug: count each method's successes independently, rather than discarding both
+when either is unusable. Both V135/V136 have 88 usable poses, so this repair
+does not change their historical counts.
+
+V136 minus V135 mean translation is -0.008415 m. Block 95% intervals:
+5 frames [-0.018757, -0.000518], 10 [-0.017744, -0.000848],
+20 [-0.017163, -0.001859]. The small translation benefit survives these
+within-sequence sensitivity checks. Rotation's 10-frame interval crosses zero
+[-0.048611, +0.000589] deg; do not claim robust rotation improvement. These
+post-development checks cannot undo repeated seq10 model selection, and the
+0.25m threshold regression still prevents promotion.
+
+Report: `learned64d_strict_seq10_h025_sourceisolated_local_v137_block_audit.json`,
+content SHA256 `adf028df0e554ee9e2a2f9f22e8363ce9a347b52512729d684cba5e28dd52bbe`.
+Next algorithmic work should isolate mean-coordinate versus covariance versus
+initialization effects using frozen candidates/initial poses, then align center
+targets to physical anonymous modes and calibrate null before another joint
+solver attempt. Do not treat more selector sweeps or larger universal Top-K as
+the primary optimization direction.
+
+## Fixed-initialization mean/covariance attribution (V138, 2026-09-08)
+
+New diagnostic `audit_goal_maplet_coordinate_solver_factors.py` freezes all
+eight poses before opening contributor GT. Factors are the V135/V136 upstream
+MoGe-refined initialization, V11/local coordinate means, and V11/local predicted
+coordinate covariance. Within each initial pose, selection always uses V11
+nearest reprojection, and covariance propagation always uses the V11 world-point
+Jacobian at that initial pose. Thus changing means cannot silently change row
+identity or its covariance Jacobian. The physical map footprint, purity, and
+dispersion are unchanged. Matchability does not participate in this fixed-row
+nearest-reprojection experiment.
+
+This runs the existing bounded local solver, not the production wrapper's
+global-support acceptance check. It is a conditional diagnostic, not a claimed
+new deployed pipeline. Row identities are equal across all four arms per
+initialization. At initialization 0 the V11/V11 control reproduces production
+V135's reported metrics. All 1,037 goal-maplet tests pass.
+
+| Initial pose | Mean | Covariance | Median t (m) | 0.1m/1deg | 0.25m/2deg | 0.5m/5deg |
+| --- | --- | --- | ---: | ---: | ---: | ---: |
+| V135 | V11 | V11 | 0.15629 | 22 | 73 | 84 |
+| V135 | V11 | local | 0.14909 | 23 | 70 | 84 |
+| V135 | local | V11 | 0.14980 | 19 | 72 | 84 |
+| V135 | local | local | 0.14320 | 22 | 72 | 84 |
+| V136 | V11 | V11 | 0.15933 | 24 | 73 | 84 |
+| V136 | V11 | local | 0.14972 | 25 | 70 | 84 |
+| V136 | local | V11 | 0.15789 | 22 | 72 | 83 |
+| V136 | local | local | 0.14911 | 21 | 72 | 83 |
+
+Every arm has 87/88 at 1m/10deg and 88/88 at 2m/45deg. This excludes a simple
+"only covariance is broken" or "new means are useless" explanation. Both
+factors improve some aggregate errors and worsen some thresholds; initialization
+interacts with their effects. Choosing the nicest cell after opening labels
+would be another development-set selector, not independent validation.
+
+Post-label geometry audit on the fixed rows provides stronger coordinate evidence:
+at initial 0, 29,079 rows have GT-pose reprojection median/P90 1.170529/2.691141 px
+with V11 means, versus 1.118181/2.626327 with local means; 56.87% improve. At
+initial 1, 29,081 rows give 1.170117/2.691923 versus 1.118445/2.627327; 56.69%
+improve. This measures consistency with camera-pose GT, not outdoor depth GT.
+If nearest-reprojection association is recomputed using local means at the same
+initial pose, initial 0 loses 1,503 original rows and adds 1,609; initial 1 loses
+1,539 and adds 1,658. Roughly 5% row removal shows a nontrivial discrete
+association change, but does not by itself prove that the changed rows cause
+every localization regression.
+
+The next solver direction should address physical multi-hypothesis association
+and calibrated correlated/anisotropic coordinate uncertainty, with fixed-pose
+and fixed-row controls retained. Do not promote a post-label-selected hybrid
+or discard the source-isolation fixes. Mainline remains unchanged.
+
+Report `fixed_row_factor_audit_v138/report.json`, content SHA256
+`d4e76361a17b01a71c86677a5a2b66716133f68e604e2f7c22b5f913017d83ae`, under the
+surface-coordinate upgrade output directory; all eight row/pose inventories are
+saved next to it with source hashes and factor IDs.
+
+## Exact conditional marginal objective experiment (V139, 2026-09-08)
+
+The existing EM prototype computes Gaussian-mixture responsibilities but its
+M-step optimizes plane-balanced Huber residuals, and its final acceptance scores
+the original mixture. Changing covariance with pose without differentiating its
+normalizer is another obstacle to an exact EM interpretation. These are
+surrogate-update limitations, not evidence that every previous pose is wrong.
+
+V139 directly minimizes one weighted token mixture negative log likelihood with
+an analytic radial-projection gradient. Covariance is frozen at initialization,
+so its determinant and projection do not silently change inside the objective.
+All candidate responsibilities are implicitly recomputed at every function
+evaluation. There is no extra Huber loss in this new update. Token weights and
+active tokens come from the same V11 nearest-reprojection anchor; all existing
+physical candidates for those tokens remain available. Physical-mode normalized
+RADIO priors split duplicate mass rather than creating extra evidence.
+
+Four arms were fixed before query evaluation: V133/V134 coordinate inventories,
+each with isotropic trace covariance or full 2x2 projected centroid covariance.
+All start from V135's MoGe-refined pose. Coordinate means, candidate sets,
+network parameters, and match priors are not tuned. The raw support and pose-step
+limits are inherited; effective match mass must also retain 95% of its initial
+value to limit null-only improvements. Match sigmoids remain uncalibrated
+diagnostic priors; this is not a claimed fully calibrated generative model.
+MoGe/scale is upstream, not a joint factor in this conditional experiment.
+
+The solver and acceptance evaluate the same scalar objective. Tests check its
+finite-difference gradient with radial distortion, duplicate-mass invariance,
+all-null constant density/zero gradient, and single-candidate reduction to
+weighted Gaussian reprojection (not exact reproduction of legacy Huber/PnP).
+The isotropic trace of full covariance reproduces the previous propagated sigma.
+The four pose inventories are all sealed before their query labels are opened.
+Acceptance for further evaluation requires tight-threshold gains without coarse
+regression against a same-head/same-initialization hard solve; objective descent
+alone is not a pose-accuracy criterion. No arm is automatically promoted.
+
+### V139--V143 outcomes: objective correctness is not sufficient
+
+The bounded follow-up comprises 11 new localization arms (four exact marginal,
+three hard-covariance controls, four pose-free-token marginal arms), plus two
+post-label GT-objective audits. The existing V135 hard/isotropic output supplies
+the twelfth table row/control. All runs use the same V135 MoGe-refined initial
+poses and unchanged source-isolated V133/V134 correspondence inventories.
+
+| Head | Solver / token support / covariance | Median t (m) | 0.1m/1deg | 0.25m/2deg | 0.5m/5deg |
+| --- | --- | ---: | ---: | ---: | ---: |
+| V11 | Hard / nearest / isotropic (control) | 0.15629 | 22 | 73 | 84 |
+| V11 | Hard / nearest / full | 0.15826 | 19 | 72 | 84 |
+| Local | Hard / nearest / isotropic | 0.14157 | 24 | 71 | 84 |
+| Local | Hard / nearest / full | 0.14739 | 22 | 73 | 84 |
+| V11 | Marginal / initial-nearest / isotropic | 0.15713 | 19 | 68 | 84 |
+| V11 | Marginal / initial-nearest / full | 0.16822 | 21 | 70 | 84 |
+| Local | Marginal / initial-nearest / isotropic | 0.14555 | 22 | 68 | 84 |
+| Local | Marginal / initial-nearest / full | 0.15300 | 21 | 68 | 84 |
+| V11 | Marginal / pose-free RADIO / isotropic | 0.15901 | 23 | 68 | 84 |
+| V11 | Marginal / pose-free RADIO / full | 0.16857 | 21 | 66 | 83 |
+| Local | Marginal / pose-free RADIO / isotropic | 0.15177 | 20 | 67 | 84 |
+| Local | Marginal / pose-free RADIO / full | 0.15487 | 18 | 66 | 83 |
+
+Every row is 87/88 at 1m/10deg and 88/88 at 2m/45deg. The full-covariance hard
+control changes only whitening, retaining row selection and global acceptance.
+Its symmetric inverse-square-root whitening reproduces the old solver for
+isotropic matrices (tested), but full covariance does not uniformly improve
+accuracy: for the local head it trades two strict successes for two 0.25m
+successes. This is not a promotion result.
+
+All logged exact-objective optimizer trajectories are nonincreasing within
+1e-9. V139 has one failed line search, correctly rejected; the other 351 solves
+terminate successfully. Nevertheless, 37--41 accepted V139 updates increase
+translation error relative to initialization, compared with 29 for the same
+local-head hard/isotropic control and 31 for the V11 control. Exact optimization
+of this model has not solved objective-improving/error-worsening behavior.
+
+V141 scores camera-pose GT under the **same frozen objective**, reconstructing
+and asserting each initial loss against the saved solve report. GT is preferred
+over initialization on only 4/5/6/9 queries (V11 isotropic/full, local
+isotropic/full); the fitted output is preferred over GT on 88/88/87/88. Fitted
+likelihood exceeding GT is normal with noisy measurements and is not alone a
+proof of a bug or miscalibration. Here it establishes that stronger optimization
+of this conditional score cannot be assumed to move toward GT.
+
+The initial token screen itself conditions on pose residual. V142 removes that
+screen without adding map candidates or changing Top-K: all existing RADIO
+tokens are retained, and their balance-plane anchor is selected by RADIO score
+with deterministic physical-ID ties. This raises the active token count from
+29,079 to 49,162. It does not restore precision. V143 repeats the GT-objective
+audit: GT beats initialization on 10/11/7/10 queries, and output still beats GT
+on 88/87/88/87. Thus pose-conditioned token screening is not the sole explanation.
+V142 has no optimizer termination failures; its rejected outputs fail the
+unchanged safety gates. None of these arms is opened on an unseen route or
+promoted; all remain exploratory development-set results.
+
+### Concrete next modeling gap
+
+Image and chart-UV coordinates come from the same head and shared geometric
+supervision. Current residual covariance adds their marginals as if independent:
+`Sigma_u + J Sigma_X J^T`. The general expression also contains
+`-Sigma_uX J^T - J Sigma_Xu`. Neither the cross-covariance nor an independently
+calibrated match/null prior is provided by the current head. The experiments do
+not establish these as the unique cause of regression, but they make
+mapping-only joint reprojection-residual calibration a more justified next
+target than another optimizer, arbitrary likelihood weight, or selector sweep.
+Calibration data should reproduce anonymous-mode runtime inputs and preserve
+the corrected source-view isolation. Do not fit it on the repeatedly reused
+seq10 labels or call a best table row a new generalization result.
+
+Implementation delivered: exact marginal solver, full-covariance hard-refinement
+option (default stays isotropic), pose-free token support option, and a frozen
+objective/GT audit. 1,044 goal-maplet tests pass; `git diff --check` passes.
+No mainline artifact, atlas, or network checkpoint was overwritten.
+
+Artifacts under `surface_coordinate_upgrade_v1`:
+
+- `exact_marginal_v139/report.json`, content SHA256
+  `213e6273dbd5702ade18d8ee2183de4958eb33e0a04eee587e1d165e9b74232a`.
+- `hard_covariance_v140_h{0,1}_{isotropic,full_centroid}.{npz,json}`;
+  h0 isotropic uses the existing V135 control, not a new file.
+- `exact_marginal_v141_gt_objective_audit.json`.
+- `exact_marginal_posefree_v142/report.json`, content SHA256
+  `cd3990d097557f5d979bb806402ab23e926dca867b4f368bd26db8d059074215`.
+- `exact_marginal_v143_posefree_gt_objective_audit.json`.
+
+## V144–V151: frozen joint-residual calibration and geometric error attribution
+
+The V133/V134 source-isolated heads were replayed without any optimizer steps.
+Checkpoint weight hashes and all four original coordinate/variance calibration
+scalars are asserted identical. Replay also validates mapping bank, plane map,
+visibility, projection, contributor inventory, source contract, seed, route,
+and neighborhood policies. Existing replay outputs and the original checkpoint
+cannot be overwritten. V144/V145 export 17,034 mapping pairs: 8,591 calibration
+pairs and 8,443 evaluation pairs from disjoint complete source images. These
+remain **canonical-center mapping inputs**, not anonymous runtime-mode inputs;
+this important distribution-alignment item is not completed by this experiment.
+
+### Calibration results, not a physical cross-correlation estimate
+
+The image and UV targets were checked to derive from the same mapping world
+point. The exported predicted UV is clipped using the actual runtime half-open
+cell rule before radial-camera projection. The covariance uses the full radial
+Jacobian. Five fixed families are fitted only on calibration images: unchanged
+independent marginals; overall scale; overall scale plus scalar correlation;
+separate image/UV scales; separate scales plus correlation. For projected UV
+covariance P and image variance q, the correlation family is
+`a*q*I + b*P - 2*rho*sqrt(a*q)*sqrt(b*P)`, with bounded rho and positive scales.
+This is SPD by construction; rho=0, a=b=1 recovers the original full covariance.
+
+| Held-image result | V133 baseline head | V134 local head |
+|---|---:|---:|
+| Independent NLL | 2.458981 | 2.301156 |
+| Overall-scale NLL | 2.439721 | 2.266425 |
+| Separate-scale NLL | 2.378315 | 2.228704 |
+| Separate-scale 90% coverage | 88.06% | 88.90% |
+| Joint separate-scale NLL | 2.376039 | 2.227793 |
+| Empirical image/world error correlation x/y | .196/.308 | .280/.326 |
+
+Separate scale factors (image, UV) are (2.8961, .13912) and (2.2159, .29581).
+These optimize the **joint residual distribution** and are not standalone
+evidence that one marginal predictor's variance is wrong by those factors.
+Both learned correlation families saturate rho=-.99, despite positive empirical
+error correlation. The constrained conditional covariance family is therefore
+not an interpretable empirical cross-covariance estimator. The full joint model
+fails the interior-solution gate and is NOT deployed. Its small NLL advantage
+over separate scales does not justify adding the correlation parameter.
+
+A numerical issue in the newly written calibrator was caught during development:
+float32 variance scaling erased scipy finite-difference perturbations and could
+leave the image scale at one. Calibration now converts inputs to float64 before
+parameter multiplication; the synthetic calibration regression uses float32
+input and verifies recovery and evaluation-label independence. This issue was
+in the new experiment, not evidence of a pre-existing mainline optimizer bug.
+
+### V148: mapping-frozen calibration does not establish a pose upgrade
+
+Four query arms use the exact same V135 MoGe-refined initialization, unchanged
+candidates and nearest-token associations, full centroid covariance, and existing
+robust/support/step gates. Only overall or separate variance scales change. All
+calibration reports are frozen before solving and head-hash checked. Query GT
+is used only by evaluation, not fitting. Counts are on the reused 88-query seq10
+development set; the mainline 438-query result remains unchanged.
+
+| Head / covariance | Median translation m | .1m/1deg | .25m/2deg | .5m/5deg |
+|---|---:|---:|---:|---:|
+| V133 full, original V140 | .15826 | 19 | 72 | 84 |
+| V133 full, overall scale | .15801 | 18 | 72 | 84 |
+| V133 full, separate scales | .15389 | 20 | 72 | 84 |
+| V134 full, original V140 | .14739 | 22 | 73 | 84 |
+| V134 full, overall scale | .14441 | 22 | 72 | 84 |
+| V134 full, separate scales | .14603 | 21 | 71 | 84 |
+
+Every arm retains 87/88 at 1m/10deg and 88/88 at 2m/45deg. The prior V134
+hard/isotropic control remains .14157m and 24/71/84/87/88; the new arms do not
+dominate it. For V134 overall scale vs original full covariance, mean paired
+translation change is -1.083mm, but the 10-frame block bootstrap 95% interval is
+[-2.271,+.103]mm and .25m success loses one query. All four arms' 5/10/20-frame
+translation intervals cross zero. No new pose artifact is promoted, and no
+selector or thresholds were tuned to recover the lost query.
+
+### V149/V150 geometric decomposition
+
+Additional frozen replays separate image error, chart-tangent UV error, and the
+normal-height mismatch between the mapping query point and the prototype's
+local tangent sheet. Exact squared-error decomposition includes all cross terms;
+component energies must not be interpreted as additive positive percentages.
+Coordinate oracles are mapping-only diagnostics, never runtime measurements.
+
+For V133, normal-height mismatch median/P90/P99 is .0202/.0557/.0969m.
+Predicted reprojection median/P90 is .915/1.764px. Perfect image coordinates alone
+give .915/1.717px; perfect UV alone gives .553/.964px; perfect normal height alone
+gives .904/1.747px. Perfect image AND UV leaves .143/.437px. Thus tangent-coordinate
+accuracy has more evident remaining leverage than scalar uncertainty tuning or
+height-only correction on these held mapping pairs. The limited image-only
+oracle gain reflects correlated errors; it is not proof image accuracy is useless.
+
+V151 confirms the same ordering for V134: predicted .857/1.630px, ideal UV
+.515/.913px, ideal normal height .841/1.623px, and ideal image alone
+.883/1.654px (the loss of favorable error cancellation can hurt). With both
+image and UV ideal, the same .143/.437px normal residual remains. Across 49 held
+source images, local-minus-baseline mean reprojection error with equal image
+weight is -.06805px; source-image bootstrap 95% CI is [-.07702,-.05880]px.
+This independently supports better **mapping joint coordinates** from the
+existing local head, but is not new query-pose improvement or an unseen-route
+generalization claim. The bootstrap does not remove neighboring-image temporal
+correlation. Full decomposition and input hashes are in
+`mapping_joint_geometry_audit_v151.json`.
+
+Delivered tools: frozen replay/export, joint covariance calibrator, optional
+mapping-calibrated full-covariance refinement, and exact geometric decomposition.
+Mainline source-image-free retrieval and MoGe factors are unchanged. 1,058
+goal-maplet tests pass (one pre-existing scatter_reduce warning).
+
+Artifacts under `surface_coordinate_upgrade_v1`: `mapping_joint_residual_v144/145.npz`,
+`mapping_joint_calibration_v146/147.json`, four `mapping_calibrated_v148_h*` pose,
+evaluation and paired-audit files, plus expanded `mapping_joint_residual_v149/150.npz`.
+Priority remains source-isolated **anonymous-mode-aligned continuous UV measurement**
+and joint-coordinate learning/evaluation, not more global solver-weight sweeps.
+
+## V152–V164: anonymous center alignment, negative-label repair, and controlled validation
+
+Implemented the previously missing `source_view_modes` center policy. It projects
+all mapping tokens, averages by physical-cell/source-image, normalizes each view
+mean, selects deterministic medoid/farthest modes, and retains each selected
+mode's own mean 3D geometry. Training removes the entire query source image BEFORE
+mode selection and requires two remaining independent images. Validation modes
+use fit routes only. The query representative cap limits query examples, not the
+mapping source pool. Unit tests compare the actual atlas fusion routine's mode
+features and geometry, test complete source exclusion and minimum-view support.
+Runtime rejects incompatible cell size, mode budget, view support or incomplete
+center contracts. Source identities remain mapping-only and are not exported to
+the runtime map or prediction head.
+
+### A real label issue exposed by multi-mode expansion
+
+The old within-plane rolled negative policy becomes particularly invalid after
+expanding several modes for each query. On the new frozen dataset it selects a
+mode from the SAME physical cell for **90.81% of fit negatives and 86.26% of
+validation negatives**; 8.20% of fit negatives even use the query source image.
+These percentages describe the new source-mode dataset under the legacy negative
+rule, not an audit of every historical canonical experiment.
+
+Added `source_isolated_nulls`: same physical plane, different cell, excluded query
+source, and world distance beyond the positive threshold. Invalid negatives are
+masked out of BCE and match-score diagnostics, not falsely labeled. Valid counts
+are 194,467/194,725 fit and 50,921/50,934 validation; same-cell and near-positive
+conflicts are zero among valid negatives. Source provenance exists transiently
+in the mapping dataset only. These deliberately distant negatives are EASY and
+do not calibrate the runtime match/null prior. High positive/negative separation
+after this repair must not be advertised as improved deployed discrimination.
+
+V152 replays V133 weights on the new positive examples and refits only mapping
+calibration; V153 retrains with the legacy negative rule and fails the full
+mapping gate. V154 retrains with repaired negatives and passes. V155 replays V133
+with the same repaired negative diagnostic and exports the aligned residual bank.
+V157 trains the local-correlation head against V154's frozen same-input reference;
+all nine relative gates pass. V158 replays V154 and exports joint residuals.
+Training remains 1,200 steps, batch 512, seed 260918; no query labels are used.
+The dataset has 194,725 fit pairs and 50,934 validation pairs, with 25,147 evaluation
+pairs on odd sorted source images (49 images). Modes share query tokens, so these
+are not 25,147 statistically independent image observations.
+
+| Same-input held mapping evaluation | Frozen old base V155 | Aligned base V154 | Aligned local V157 |
+|---|---:|---:|---:|
+| Image median px | .535960 | .532512 | .489155 |
+| Image P90 px | .880058 | .886003 | .816613 |
+| UV median m | .085611 | .083076 | .079881 |
+| UV P90 m | .176305 | .171587 | .163122 |
+| Joint reprojection median px | .838566 | .800819 | .753186 |
+| Joint reprojection P90 px | 1.578685 | 1.538813 | 1.451507 |
+
+V160: base alignment changes equal-image-weight mean joint error by -.03162px,
+source-image bootstrap CI [-.03899,-.02430]. V161: local vs aligned base gives
+-.04835px, CI [-.05772,-.03866]. Neither interval establishes query localization
+improvement or handles temporal correlation between neighboring mapping images.
+V154's image P90 still regresses slightly against the frozen old base; the local
+head's nine-gate pass is relative to V154, not an automatic upgrade over V134.
+
+V162 additionally freezes the OLD local V134 weights and evaluates them on these
+same anonymous inputs, with mapping-only recalibration. Its image median/P90 is
+.491420/.826746px, UV median/P90 .082873/.169174m, and joint reprojection
+.783390/1.484087px. V157 improves all six values on this matched dataset. V164
+compares their joint errors with equal image weights: -.02946px, source-image
+bootstrap CI [-.03676,-.02181]. Thus the measurement gain survives the stronger
+old-local rather than old-base control, while still failing to provide stable
+query-pose gains. Full results are in `mapping_mode_geometry_local_transfer_v164.json`.
+
+### Fixed query initialization: some gains, but no mainline promotion
+
+V156/V159 preserve all 79,536 candidate identities/tokens and use the same V135
+MoGe-refined poses. Retrieval, mode budget, source-image-free map, and support
+gates remain unchanged. Only the new coordinate heads feed refinement. Tests
+cover isotropic and full covariance as predefined controls, not a selector sweep.
+
+| Head/refinement, 88 reused seq10 queries | Median m | .1m/1deg | .25m/2deg | .5m/5deg |
+|---|---:|---:|---:|---:|
+| Old base isotropic V135 | .15629 | 22 | 73 | 84 |
+| Aligned base isotropic V156 | .16078 | 24 | 73 | 84 |
+| Aligned base full V156 | .15691 | 22 | 73 | 84 |
+| Old local isotropic V140 | .14157 | 24 | 71 | 84 |
+| Aligned local isotropic V159 | .14095 | 20 | 71 | 84 |
+| Old local full V140 | .14739 | 22 | 73 | 84 |
+| Aligned local full V159 | .14173 | 21 | 72 | 84 |
+
+All listed new arms retain 87/88 and 88/88 at the two loosest thresholds.
+The aligned base's +2 strict successes comprise four gains and two losses
+(McNemar p=.6875). The aligned local isotropic arm loses four strict successes
+net. Paired 10-frame translation intervals cross zero in every arm. These mixed
+results are NOT promoted and the existing 438-query mainline stays unchanged.
+
+V163 freezes the old local head's correspondence rows and initial Jacobians,
+then independently swaps means/covariances. Old/old, old/new, new/old, new/new
+yield strict hits 24/23/20/22 and .25m hits 71/72/71/73. Thus strict regression
+can occur with the new means even WITHOUT reselecting correspondences; row churn
+alone is not the explanation. These diagnostic solves omit the production global
+support gate and are not additional production candidates.
+
+Remaining gaps are explicit: mapping pairs are conditioned on a correct physical
+cell and the existing positive projection/distance screen; actual retrieval also
+contains wrong planes/cells and ambiguous candidates. The newly repaired far
+negatives do not model those deployment errors. Full center-feature alignment
+does not by itself align this conditional candidate distribution, the null
+prior, or the downstream pose sensitivity of coordinate errors. Next priorities
+are mapping-held retrieved-candidate supervision and geometry-valid HARD
+negatives, plus joint-coordinate evaluation; not another global weight sweep.
+
+All artifacts use `surface_coordinate_upgrade_v1`: source-mode checkpoints
+V152–V158, query inventories `source_modes_v156_*` and `source_modes_v159_*`,
+`mapping_mode_geometry_baseline_v160.json`, `mapping_mode_geometry_local_v161.json`,
+and `source_modes_fixed_row_v163/report.json`. V152's early residual export carries
+the original weight-head identity despite recalibrated scalars; it is superseded
+by V155 and is not used by any reported joint-residual audit. Recalibrated exports
+now bind the delivered calibrated head's content hash. Original checkpoints and
+mainline artifacts were not overwritten. 1,063 goal-maplet tests pass.
+
+## V165–V171: retrieved hard negatives and decoupled match-score learning
+
+Implemented a mapping-only candidate miner that uses the complete fit-route
+source-view/cell pool, not just centers surviving other positive-pair screens.
+Within the known physical plane it excludes the query source, requires two
+independent views per cell, selects at most four anonymous modes, then ranks
+them by frozen RADIO64. Query cell/world labels are used AFTER ranking to label
+geometrically safe negatives. `radio_topk` takes the first valid negative among
+the top 16; `pool_far` is the predefined full-pool farthest-negative control.
+No held query image, query pose label, or runtime source image is used to fit it.
+This is **known-plane within-chart retrieval**, not full physical-plane retrieval.
+Early artifact flags named `pool_filtered_by_query_labels=false` refer only to
+query-cell/world filtering; the known-plane conditioning is an explicit limit.
+The code now names those fields precisely and records selected-row digests.
+
+### Evidence for a real local ambiguity problem
+
+On the held mapping route, the median candidate pool is 227 modes. Even given
+the correct physical plane, the top-ranked candidate is in a different cell
+and beyond the positive world-distance threshold on 30.54% of eligible unique
+queries (22.65% on fit). This is not an end-to-end query failure rate.
+Far-negative median RADIO cosine/distance is .064/5.784m on validation;
+top-16 hard-negative values are .835/.523m. There are 50,932 valid validation
+negative pairs. Entire-source exclusion, geometry-safe labels, deterministic
+ranking, duplicate-query sharing, and atlas support constraints have tests.
+
+V165 trains with complete-pool far negatives and passes mapping coordinate
+gates. V166 trains jointly with retrieved hard negatives at the same seed,
+1,200 steps and batch 512. V167 replays the former aligned base V154 against
+the SAME hard-negative mining configuration without updating weights.
+V168 audits 25,145 common held pairs:
+
+| Hard-negative held metric | Old far-trained V167 | Joint hard-trained V166 |
+|---|---:|---:|
+| Sampled AUC | .86096 | .97053 |
+| Balanced BCE | 1.47890 | .21071 |
+| Positive recall at .5 | .98763 | .91796 |
+| Negative false positive at .5 | .93633 | .05818 |
+| Paired positive score above negative | .88284 | .95474 |
+
+The high old-model false-positive rate is a concrete reason NOT to treat its
+sigmoid as a deployed probability. The hard-trained classifier improves ranking,
+not just score offset. But V166 fails the unchanged image-uncertainty monotonicity
+gate: middle quartile mean errors are .5466625 and .5465763px. The difference is
+tiny, yet the gate is not relaxed after seeing it. No V166 query pose experiment
+is run. Its UV median/P90 .08314/.17203m also does not dominate the far control
+(.08250/.17194m), so joint training is not sold as a coordinate upgrade.
+
+### V169/V170: improve scores without changing coordinate weights
+
+Added `match_only_finetune`: load the validated V154 checkpoint, freeze every
+parameter except `match.weight` and `match.bias`, and train on the same hard
+negatives. Every non-match state tensor is asserted bitwise identical afterward;
+tests confirm AdamW cannot change the coordinate parameters or outputs.
+Mapping coordinate gates remain passing. V170 compares on the same 25,145 pairs:
+AUC .94242, BCE .32358, positive recall .90173 and negative false positive .10698
+at .5. This trades some of V166's discrimination for exact coordinate preservation.
+It is a useful learned-scoring improvement, not a calibrated deployment prior.
+
+Separately, a score rejection threshold is fitted ONLY on even-source-image
+calibration positives: the fixed 5th percentile is .1219096795. Odd-image
+evaluation retains 95.67% of positives and accepts 27.67% of hard negatives.
+The calibration target (95%) is fixed before query evaluation. The threshold
+serves as a rejection rule, not as a Gaussian-mixture existence probability.
+
+### V171 query switch test: late gating is not a pose upgrade
+
+The new score head is applied to the original 79,536 candidate hypotheses.
+World points, image coordinates, both covariance arrays, query tokens and
+candidate provenance are bitwise equal to V156. Same V135 MoGe initialization,
+same nearest-token selection, same isotropic refinement and safety gates.
+The sole intervention is applying the frozen mapping threshold AFTER geometric
+token-hypothesis selection. The no-gate control exactly reproduces V156 poses.
+
+| 88 reused seq10 queries | No gate | Fixed mapping gate |
+|---|---:|---:|
+| Median translation m | .160781 | .157109 |
+| Median rotation deg | .393792 | .396417 |
+| .1m/1deg successes | 24 | 22 |
+| .25m/2deg successes | 73 | 73 |
+| .5m/5deg successes | 84 | 84 |
+| 1m/10deg, 2m/45deg | 87 / 88 | 87 / 88 |
+| Fixed correspondence count | 29,051 | 28,704 |
+
+Mean paired translation change is +.525mm; 10-frame block CI [-.791,+2.000]mm.
+Both strict changes are losses, with no gains. Thus no mainline promotion and
+no threshold sweep follow this result. The existing 438-query baseline is intact.
+
+Post-freeze GT-pose reprojection audit: retained points have median/P90
+1.163/2.678px; rejected points 1.987/3.509px. The score identifies poorer points
+on average, but 50.43% of the 347 rejected points still have <2px GT-pose residual.
+This is a map-geometry consistency diagnostic, not sensor correspondence truth.
+Only 1.19% of already geometrically screened points are removed. The evidence
+supports testing learned scores EARLIER in candidate association/initialization;
+it does not establish that more aggressive late pruning will improve localization.
+
+Deliverables: complete-pool source-isolated mining, score-only fine-tuning,
+matched mining score audit, mapping-only positive-quantile rejection, and a fixed
+query on/off test. 1,069 goal-maplet tests pass (one existing warning), diff check
+passes. Artifacts under `surface_coordinate_upgrade_v1`: checkpoints/residuals
+`mapping_retrieved_*v165/166/167/169`, `retrieved_match_audit_v168/170.json`,
+`mapping_match_gate_v170.json`, and `retrieved_match_v171_*` query/paired reports.
+Remaining gaps: cross-plane retrieval negatives, hard positive examples outside
+the current correct-cell projection screen, and calibrated early association
+under the actual retrieved candidate population. No raw-source-image localization
+or traditional-image retrieval path was introduced.
+
+## V172–V177: implementation audit, unique-token LM, and early association
+
+### Confirmed implementation inconsistency and repairs
+
+`_score` already counts each query token once, but `_solve` previously sent ALL
+RANSAC inlier hypotheses to LM, including mutually exclusive alternatives for
+the same image token. On the 88 all-correspondence PnP seeds, there are 39,860
+raw inliers but only 28,337 distinct-token inliers: **11,523 duplicate supports**.
+All 88 seeds contain duplicates, with median multiplicity 1.398. This audit
+does not use query GT. In addition, six rows could previously mean fewer than
+six actual image measurements.
+
+The corrected default `unique_token_lm` retains the lowest-residual hypothesis
+per token at the RANSAC pose, requires six distinct tokens, and gives only those
+rows to LM. The same fix is used in anonymous-view-geometry refinement. Tests
+mock RANSAC/LM to verify six unique measurements rather than twelve alternatives,
+stable ties and rejection when duplicate rows fake six measurements. Explicit
+`--solver_policy legacy` preserves reproducible historical controls. The change
+does NOT replace OpenCV RANSAC's internal flattened-hypothesis scoring; a fully
+token-aware robust initializer remains a modeling gap. Do not claim the whole
+probabilistic backend is now solved.
+
+Two robustness/interpretation issues were also repaired:
+
+- Probability range checks alone do not reject NaN. Correspondence loading now
+  rejects nonfinite world/camera/distortion/measurement-variance/match arrays and
+  validates offset endpoints/order, token range/dtype and row shapes. Tests use
+  malformed inputs with recomputed valid hashes, so checks are not merely hash
+  failures. No evidence was found that current sealed inputs contain these NaNs.
+- The metric atlas's third provenance column is an anonymous prototype, not a
+  source view. Candidate origin and metadata now say so. Historical `view_*`
+  score keys are retained as compatibility aliases but explicitly do not mean
+  independent-view evidence. No source-view IDs or RGB were added to the map.
+
+### Early learned association, with unchanged scoring population
+
+Four predefined arms use the same V169 match-only head, same 79,536 candidates,
+same seed budgets and raw-inlier pose selection:
+V172 legacy LM/all hypotheses; V173 unique-token LM/all; V174 unique-token LM
+with the frozen V170 mapping score gate BEFORE PnP; V175 unique-token LM with
+one highest-match-score hypothesis per query token. Candidate poses are scored
+against ALL original correspondences with unique-token support, not only the
+retained subset. Thus deleting candidates cannot inflate the scoring denominator.
+All arms go through anonymous view geometry, MoGe plane/scale refinement and
+uncertainty refinement with fixed settings. The score-gate threshold is not tuned.
+
+| Complete backend, 88 reused seq10 queries | Median m | .1m/1deg | .25m/2deg | .5m/5deg | 1m/10deg | 2m/45deg |
+|---|---:|---:|---:|---:|---:|---:|
+| V172 legacy control | .15727 | 21 | 72 | 84 | 87 | 88 |
+| V173 unique-token LM | .16088 | 25 | 72 | 84 | 87 | 88 |
+| V174 early mapping gate | .15818 | 23 | 71 | 84 | 87 | 88 |
+| V175 global token Top-1 | .15711 | 21 | 72 | 84 | 87 | 88 |
+
+V173 gains four strict successes and loses none vs V172, but exact McNemar p=.125
+and the paired 10-frame translation CI spans zero (mean +.825mm, CI
+[-2.987,+4.685]mm). Median translation regresses slightly. This is a promising
+strict-threshold change with a sound consistency fix, not a universal accuracy
+upgrade. V174/V175 lose strict successes vs V173 and are not promoted.
+
+At the initialization stage, global Top-1 also harms broad recall: 2m/45deg
+successes drop from 88 to 86 and 1m/10deg from 87 to 84. Downstream geometry
+recovers them, which is why reporting only final medians would hide the damage.
+
+V176 repeats unique-token LM with the OLD V133 coordinate head and its original
+V135 correspondences, independently of the new match classifier. The final
+median improves .15629 -> .15178m; strict hits remain 22 (one gain/one loss),
+.25m hits drop 73 -> 72, and other thresholds are unchanged. Mean translation
+delta -3.393mm has 10-frame CI [-8.941,+1.862]mm. This cross-head control prevents
+claiming that the consistency fix improves every metric or every head.
+
+The initialization and full-backend tables are not directly comparable to V171's
+fixed-initialization score switch test. These experiments RECOMPUTE initialization.
+No branch is chosen per query using labels, and no new full438 score is claimed.
+
+### Scope-correct association follow-up
+
+The match head was trained on same-physical-plane negatives. Comparing its raw
+scores across different candidate planes and keeping global Top-1 is therefore
+an unsupported cross-plane calibration assumption. Added `match_top1_per_plane`:
+rank only inside each (query token, physical plane), retaining cross-plane
+ambiguity. Unit tests verify that two distinct planes survive while duplicate
+within-plane alternatives are reduced. V177 tests this specific scope correction
+after the negative global-Top1 diagnosis; it is exploratory, not a blind test.
+
+V177 final median is .15985m with 24/71/84/87/88 hits. Versus V173 it loses
+one strict success and one .25m success, with no gains at those thresholds.
+Its 10-frame mean-translation CI also crosses zero. Preserving cross-plane
+ambiguity limits the damage compared with global Top-1 but does not justify
+hard within-plane pruning. It remains disabled by default. The next principled
+target is a token-aware robust initializer that retains hypotheses while avoiding
+duplicated measurement support, not more match-score threshold sweeps.
+
+All 1,078 goal-maplet tests pass, with one existing scatter_reduce warning;
+`git diff --check` passes. This is a scoped audit, not a guarantee that every
+remaining implementation or design issue has been found.
+
+Artifacts live under `surface_coordinate_upgrade_v1` as `front_association_v172`
+through V175, their `_view/_moge/_final` stages and paired reports, and
+`unique_token_v176*`. Code fixes are implemented, historical pose artifacts remain
+untouched, and the 438-query mainline score is not replaced by this 88-query result.
+
+## V178–V181: token-level initialization and solver correctness audit (2026-09-08)
+
+Implemented `token_hypothesis_ransac.py`: canonical exact-hypothesis deduplication,
+four distinct query-token sampling with AP3P solution enumeration, positive-depth
+reprojection support counted once per token, and local LM proposals accepted only
+when the same token-level consensus score improves. All alternatives remain
+available; neither query GT nor match-score threshold tuning selects hypotheses.
+The experimental policy is opt-in; the default remains `unique_token_lm`.
+
+V178 uses 128 fixed trials per seed group, with the historical row-count group
+budget, then the existing view-geometry / MoGe3 / uncertainty backend. V179 is a
+fresh unique-token-LM control on the same V171 correspondence inventory. This is
+not a compute-matched comparison to OpenCV's 1000-iteration / .999-confidence
+adaptive initializer, nor a calibrated success-probability guarantee.
+
+| 88-query seq10 development experiment | Median translation | Hits: .1m/1deg, .25m/2deg, .5m/5deg, 1m/10deg, 2m/45deg |
+| --- | --- | --- |
+| V179 refreshed control, final | .160880 m | 25 / 72 / 84 / 87 / 88 |
+| V178 token RANSAC, initialization | .177595 m | 18 / 62 / 79 / 86 / 87 |
+| V178 token RANSAC, final | .160728 m | 22 / 72 / 84 / 87 / 88 |
+| V180 independent-token seed budget fix, final | .160880 m | 25 / 72 / 84 / 87 / 88 |
+
+The corresponding V179 initialization median is .167449 m, with
+20 / 64 / 82 / 87 / 88 hits. V178 loses three strict successes, gains none
+(paired McNemar p=.25); mean translation delta is +1.333 mm and its 10-frame
+block 95% CI is [-4.527, +8.303] mm. Final p90 translation worsens from
+.340298 m to .363745 m. Do not promote this initializer on the basis of its
+tiny median improvement. The negative result concerns this sampler/budget, not
+the feasibility of a token-aware or plane-based backend in general.
+
+Three additional implementation issues were fixed with regression tests:
+
+- Unique-token LM now excludes behind-camera RANSAC inliers before refinement.
+- A perfect zero reprojection median is no longer treated as a missing/worst
+  score by Python truthiness during candidate tie-breaking.
+- Seed groups are filtered and budgeted by independent tokens, not duplicated
+  rows; at least six distinct tokens are required before applying the group cap.
+  Explicit `--seed_group_support row_count` retains the historical control.
+
+On actual V171 inputs, old grouping selected 2747 groups across 88 queries and
+three group types, including nine groups with fewer than six independent tokens.
+The corrected version selects 2740 groups; selected group sets differ in 79
+query/type combinations. Nevertheless all three selected initial-pose rules,
+and V180's entire final pose array, are exactly unchanged versus V179. This is
+a correctness/budget fix, not a claimed accuracy gain on this sample.
+
+Token consensus scoring was vectorized with `minimum.reduceat`. A 1000-call
+first-query microbenchmark took 1.0894 s for reference scoring versus .1137 s
+for vectorized scoring (~9.6x), with exactly equal scores. This is a kernel
+microbenchmark, not an end-to-end runtime claim. Synthetic tests also check
+duplicate/permutation invariance, radial projection, cheirality, collinear
+samples, and rejection of harmful LM proposals.
+
+V181 reruns the vectorized initializer on all 88 queries with V178's explicit
+row-count group policy. Every non-metadata array is exactly equal to V178,
+including the complete candidate pose pool, origins, support and all three
+selected-pose rules. Thus the kernel optimization preserves actual experiment
+outputs, not only synthetic scores. Artifacts: `token_ransac_v181_vectorized.*`.
+
+Validation: `python -m pytest -q tests/test_goal_maplet*.py` passes 1087 tests
+with one existing scatter_reduce warning. Full `pytest -q tests` cannot collect
+`test_matcha_moge_validity_masks.py` because this environment lacks `pytorch3d`;
+therefore this is not a claim that the entire repository passes. `git diff
+--check` passes. Artifacts use `token_ransac_v178*`, `token_ransac_v179_control*`,
+and `token_ransac_v180_groupfix*` under `surface_coordinate_upgrade_v1`, including
+the V178 paired report. Reused seq10 remains development evidence; no new blind
+test claim or replacement of the 438-query mainline 104/336/395/409/413 result.
+
+Remaining design issue: legacy OpenCV RANSAC still scores flattened alternative
+rows internally. The new initializer fixes this semantic mismatch but has not
+improved accuracy. Future work should test proposal quality / geometric
+conditioning under a predeclared budget and verify on additional frozen query
+routes, rather than repeatedly tune thresholds against this same sequence.

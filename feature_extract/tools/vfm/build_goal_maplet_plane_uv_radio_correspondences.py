@@ -31,11 +31,125 @@ from feature_extract.vfm.localization_goal_maplet.chart_local_radio_projection i
     project_chart_local_radio,
 )
 from feature_extract.tools.vfm.train_goal_maplet_mapping_subtoken_head import (
+    MappingSurfaceCoordinateLocalCorrelationHead,
     load_mapping_subtoken_head,
 )
 from feature_extract.tools.vfm.train_goal_maplet_mapping_canonical_subtoken_head import (
+    LOCAL_CORRELATION_OFFSETS_YX,
+    _local_radio_correlation_volume,
     _undistort_simple_radial_xy,
 )
+
+
+def _atlas_local_cell_feature_lookup(
+    plane_texel_offsets: np.ndarray,
+    texel_uv_m: np.ndarray,
+    texel_identity: np.ndarray,
+    radio_features: np.ndarray,
+    cell_size_m: float,
+) -> dict[tuple[int, int, int], np.ndarray]:
+    """Aggregate anonymous atlas modes into a source-view-free cell descriptor."""
+    offsets = np.asarray(plane_texel_offsets, np.int64).reshape(-1)
+    uv = np.asarray(texel_uv_m, np.float64).reshape(-1, 2)
+    identity = np.asarray(texel_identity, np.int64).reshape(-1)
+    feature = np.asarray(radio_features, np.float32)
+    size = float(cell_size_m)
+    if (
+        len(offsets) < 2 or offsets[0] != 0 or offsets[-1] != len(uv)
+        or len(identity) != len(uv) or len(feature) != len(uv)
+        or feature.ndim != 2 or not np.isfinite(size) or size <= 0.0
+    ):
+        raise ValueError("atlas local RADIO inventory differs")
+    result: dict[tuple[int, int, int], np.ndarray] = {}
+    identity_contract: dict[int, tuple[int, int, int]] = {}
+    for plane in range(len(offsets) - 1):
+        lo, hi = map(int, offsets[plane : plane + 2])
+        if lo == hi:
+            continue
+        cell = np.floor(uv[lo:hi] / size).astype(np.int64)
+        for local_identity in np.unique(identity[lo:hi]).tolist():
+            rows = lo + np.flatnonzero(identity[lo:hi] == int(local_identity))
+            unique_cell = np.unique(cell[rows - lo], axis=0)
+            if len(unique_cell) != 1:
+                raise ValueError("anonymous atlas identity crosses metric cells")
+            key = (int(plane), int(unique_cell[0, 0]), int(unique_cell[0, 1]))
+            previous = identity_contract.setdefault(int(local_identity), key)
+            if previous != key or key in result:
+                raise ValueError("atlas metric cell identity is ambiguous")
+            mean = np.mean(feature[rows], axis=0, dtype=np.float64).astype(np.float32)
+            norm = float(np.linalg.norm(mean))
+            if not np.isfinite(norm) or norm <= 1e-8:
+                raise ValueError("atlas local RADIO descriptor is invalid")
+            result[key] = mean / norm
+    return result
+
+
+def _runtime_local_radio_context(
+    query_features: np.ndarray,
+    center_tokens: np.ndarray,
+    region_rows: np.ndarray,
+    region_token_support: dict[int, np.ndarray],
+    candidate_features: np.ndarray,
+    candidate_uv_m: np.ndarray,
+    candidate_plane_rows: np.ndarray,
+    atlas_cell_features: dict[tuple[int, int, int], np.ndarray],
+    cell_size_m: float,
+) -> np.ndarray:
+    """Build the deployment version of the candidate-conditioned local volume."""
+    query = np.asarray(query_features, np.float32)
+    token = np.asarray(center_tokens, np.int64).reshape(-1)
+    region = np.asarray(region_rows, np.int64).reshape(-1)
+    candidate = np.asarray(candidate_features, np.float32)
+    uv = np.asarray(candidate_uv_m, np.float64).reshape(-1, 2)
+    plane = np.asarray(candidate_plane_rows, np.int64).reshape(-1)
+    if (
+        query.ndim != 2 or query.shape[0] != 36 * 64
+        or candidate.shape != (len(token), query.shape[1])
+        or len(region) != len(token) or len(uv) != len(token) or len(plane) != len(token)
+        or np.any((token < 0) | (token >= len(query)))
+    ):
+        raise ValueError("runtime local RADIO inventory differs")
+    qgrid = np.zeros((len(token), 9, query.shape[1]), np.float32)
+    qvalid = np.zeros((len(token), 9), bool)
+    mgrid = np.zeros_like(qgrid)
+    mvalid = np.zeros_like(qvalid)
+    cell = np.floor(uv / float(cell_size_m)).astype(np.int64)
+    for row in range(len(token)):
+        support = np.asarray(region_token_support.get(int(region[row]), []), np.int64)
+        support_set = set(support.tolist())
+        ty, tx = divmod(int(token[row]), 64)
+        for offset_index, (dy, dx) in enumerate(LOCAL_CORRELATION_OFFSETS_YX.tolist()):
+            qy, qx = ty + int(dy), tx + int(dx)
+            qtoken = qy * 64 + qx
+            if 0 <= qy < 36 and 0 <= qx < 64 and qtoken in support_set:
+                qgrid[row, offset_index] = query[qtoken]
+                qvalid[row, offset_index] = True
+            if dy == 0 and dx == 0:
+                mgrid[row, offset_index] = candidate[row]
+                mvalid[row, offset_index] = True
+            else:
+                key = (
+                    int(plane[row]), int(cell[row, 0] + dx), int(cell[row, 1] + dy),
+                )
+                value = atlas_cell_features.get(key)
+                if value is not None:
+                    mgrid[row, offset_index] = value
+                    mvalid[row, offset_index] = True
+    return _local_radio_correlation_volume(qgrid, mgrid, qvalid, mvalid)
+
+
+def _validate_source_mode_center_contract(head, atlas):
+    if head.get("prototype_policy") != "source_view_modes":
+        return
+    if (head.get("source_view_training_contract") is not True
+            or head.get("source_isolated_nulls") is not True
+            or head.get("center_mode_token_pooling") != "all_tokens_per_source_view_cell"
+            or head.get("center_mode_geometry_binding") != "selected_mode_own_mean_world"
+            or head.get("center_mode_exclusion") != "entire_source_image_before_mode_selection"
+            or int(atlas.get("minimum_independent_mapping_views", -1)) != 2
+            or int(head.get("maximum_prototypes_per_cell", -1)) != int(atlas.get("maximum_anonymous_view_prototypes_per_texel", -2))
+            or abs(float(atlas.get("cell_size_m", -1))-.5)>1e-12):
+        raise ValueError("source-mode center training/atlas contract differs")
 
 
 def _clip_chart_coordinate_to_original_cell(
@@ -316,6 +430,7 @@ def main() -> None:
     use_surface_coordinate = False
     use_geometric_context = False
     use_homography_context = False
+    use_local_correlation = False
     if args.mapping_subtoken_head is not None:
         subtoken_head, subtoken_meta = load_mapping_subtoken_head(args.mapping_subtoken_head)
         if (
@@ -330,22 +445,31 @@ def main() -> None:
             "goal_maplet_mapping_only_pairwise_radio_surface_coordinate_context_head_v9",
             "goal_maplet_mapping_only_pairwise_radio_surface_coordinate_deep_context_head_v10",
             "goal_maplet_mapping_only_pairwise_radio_surface_coordinate_homography_context_head_v11",
+            "goal_maplet_mapping_only_pairwise_radio_surface_coordinate_local_correlation_head_v12",
         }
         use_geometric_context = (
             subtoken_meta.get("artifact_type") in {
                 "goal_maplet_mapping_only_pairwise_radio_surface_coordinate_context_head_v9",
                 "goal_maplet_mapping_only_pairwise_radio_surface_coordinate_deep_context_head_v10",
                 "goal_maplet_mapping_only_pairwise_radio_surface_coordinate_homography_context_head_v11",
+                "goal_maplet_mapping_only_pairwise_radio_surface_coordinate_local_correlation_head_v12",
             }
         )
-        use_homography_context = (
+        use_homography_context = subtoken_meta.get("artifact_type") in {
+            "goal_maplet_mapping_only_pairwise_radio_surface_coordinate_homography_context_head_v11",
+            "goal_maplet_mapping_only_pairwise_radio_surface_coordinate_local_correlation_head_v12",
+        }
+        use_local_correlation = (
             subtoken_meta.get("artifact_type")
-            == "goal_maplet_mapping_only_pairwise_radio_surface_coordinate_homography_context_head_v11"
+            == "goal_maplet_mapping_only_pairwise_radio_surface_coordinate_local_correlation_head_v12"
         )
         if use_geometric_context and (
             subtoken_meta.get("geometric_context_enabled") is not True
             or int(subtoken_meta.get("geometric_context_dimension", -1))
-            != (8 if use_homography_context else 5)
+            != (
+                MappingSurfaceCoordinateLocalCorrelationHead.CONTEXT_DIMENSION
+                if use_local_correlation else 8 if use_homography_context else 5
+            )
         ):
             raise ValueError("mapping surface-coordinate context contract differs")
         if use_homography_context and (
@@ -354,7 +478,27 @@ def main() -> None:
                    - float(args.homography_threshold_m)) > 1e-12
         ):
             raise ValueError("mapping homography context differs from the frozen coarse fit")
+        if use_local_correlation and (
+            subtoken_meta.get("local_radio_correlation_context_enabled") is not True
+            or subtoken_meta.get("local_radio_candidate_conditioned") is not True
+            or subtoken_meta.get("local_radio_v11_relative_gate_pass") is not True
+            or int(subtoken_meta.get("local_radio_correlation_context_dimension", -1))
+            != MappingSurfaceCoordinateLocalCorrelationHead.LOCAL_CORRELATION_DIMENSION
+            or subtoken_meta.get("local_radio_correlation_offsets_yx")
+            != LOCAL_CORRELATION_OFFSETS_YX.tolist()
+        ):
+            raise ValueError("mapping local RADIO correlation contract differs")
         if use_surface_coordinate:
+            _validate_source_mode_center_contract(subtoken_meta, atlas_meta)
+            if use_local_correlation and subtoken_meta.get("local_radio_neighbor_policy") == "atlas_modes_mean":
+                if subtoken_meta.get("source_view_training_contract") is True and int(
+                    subtoken_meta.get("minimum_neighbor_independent_views", -1)
+                ) != int(atlas_meta.get("minimum_independent_mapping_views", -2)):
+                    raise ValueError("local RADIO independent-view support differs from atlas")
+                if int(subtoken_meta.get("local_radio_neighbor_maximum_modes", -1)) != int(
+                    atlas_meta.get("maximum_anonymous_view_prototypes_per_texel", -2)
+                ):
+                    raise ValueError("local RADIO neighbor mode budget differs from atlas")
             if args.planar_map is None:
                 raise ValueError("surface-coordinate head requires its finite planar map")
             if (
@@ -367,6 +511,12 @@ def main() -> None:
             raise ValueError("planar map is only consumed by a surface-coordinate head")
     if not use_surface_coordinate and args.surface_coordinate_mean_policy != "conditional_match_mean":
         raise ValueError("surface-coordinate mean policy requires a surface-coordinate head")
+    atlas_cell_features = None
+    if use_local_correlation:
+        atlas_cell_features = _atlas_local_cell_feature_lookup(
+            atlas["plane_texel_offsets"], atlas["texel_uv_m"], atlas["texel_identity"],
+            atlas["radio_features"], float(atlas_meta.get("cell_size_m", 0.5)),
+        )
 
     names, point_rows, token_rows, measurement_rows, provenance_rows, matrices, radial = [], [], [], [], [], [], []
     prototype_rows, visible_rows, score_rows = [], [], []
@@ -395,6 +545,7 @@ def main() -> None:
         all_homography_valid = []
         all_prototypes, all_visible = [], []
         all_covariance, all_purity, all_dispersion = [], [], []
+        region_token_support: dict[int, np.ndarray] = {}
         for region_row in query["regions"]:
             region = int(region_row["region"])
             if args.query_measurement_policy == "observed_plane_pixel_centroid":
@@ -402,6 +553,7 @@ def main() -> None:
             else:
                 qtoken, qvisible = _region_token_support(planes.labels, region)
                 qmeasurement = np.c_[(qtoken % 64) * 4 + 1.5, (qtoken // 64) * 4 + 1.5]
+            region_token_support[region] = qtoken.copy()
             if len(qtoken) < 4:
                 continue
             qfeature = query_feature[qtoken]
@@ -517,6 +669,15 @@ def main() -> None:
                             context = np.c_[
                                 context, residual, projected_valid.astype(np.float32),
                             ].astype(np.float32)
+                        if use_local_correlation:
+                            assert atlas_cell_features is not None
+                            local = _runtime_local_radio_context(
+                                query_feature, token, provenance[:, 0], region_token_support,
+                                mdescriptor, atlas["texel_uv_m"][prototype_row],
+                                provenance[:, 1], atlas_cell_features,
+                                float(atlas_meta.get("cell_size_m", 0.5)),
+                            )
+                            context = np.c_[context, local].astype(np.float32)
                         head_arguments.append(torch.from_numpy(context))
                     head_output = subtoken_head(*head_arguments)
                 mean, variance = head_output[:2]

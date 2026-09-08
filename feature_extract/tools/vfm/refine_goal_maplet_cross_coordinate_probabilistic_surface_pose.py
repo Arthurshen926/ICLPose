@@ -59,6 +59,75 @@ MINIMUM_ROWS = 12
 MINIMUM_PLANES = 2
 IMAGE_AREA_PX2 = 256.0 * 144.0
 LIKELIHOOD_TOLERANCE = 1e-12
+CANDIDATE_PRIOR_POLICIES = ("uniform_candidate", "radio_gibbs_unit_temperature")
+
+
+def _anchored_component_prior(
+    token: np.ndarray,
+    plane: np.ndarray,
+    prototype: np.ndarray,
+    coordinate_arm: np.ndarray,
+    radio_score: np.ndarray,
+    *,
+    policy: str,
+) -> np.ndarray:
+    """Assign unit mass per token to physically identified candidate modes.
+
+    A mode is anchored by ``(token, physical plane, anonymous prototype)``.
+    Coordinate arms are alternative measurements of that same mode, so they
+    split its mass rather than increasing it.  Repeating an identical arm also
+    only splits existing mass.  This makes the likelihood invariant to storage
+    duplication and removes the unpenalized max-over-more-candidates effect.
+    """
+    if policy not in CANDIDATE_PRIOR_POLICIES:
+        raise ValueError("anchored candidate prior policy differs")
+    token = np.asarray(token, np.int64).reshape(-1)
+    plane = np.asarray(plane, np.int64).reshape(-1)
+    prototype = np.asarray(prototype, np.int64).reshape(-1)
+    arm = np.asarray(coordinate_arm, np.int64).reshape(-1)
+    score = np.asarray(radio_score, np.float64).reshape(-1)
+    if not (len(token) == len(plane) == len(prototype) == len(arm) == len(score)):
+        raise ValueError("anchored candidate prior arrays differ in length")
+    if np.any(~np.isfinite(score)):
+        raise ValueError("anchored candidate RADIO score is nonfinite")
+    if not len(token):
+        return np.zeros(0, np.float64)
+
+    # np.unique provides a deterministic lexicographic physical-mode index.
+    key = np.stack((token, plane, prototype), axis=1)
+    unique_mode, mode_inverse = np.unique(key, axis=0, return_inverse=True)
+    mode_score = np.full(len(unique_mode), -np.inf, np.float64)
+    for mode in range(len(unique_mode)):
+        rows = np.flatnonzero(mode_inverse == mode)
+        if np.ptp(score[rows]) > 1e-7:
+            raise ValueError("paired coordinate arms disagree on RADIO score")
+        mode_score[mode] = float(np.mean(score[rows]))
+
+    mode_mass = np.zeros(len(unique_mode), np.float64)
+    for token_id in np.unique(token):
+        modes = np.flatnonzero(unique_mode[:, 0] == token_id)
+        if policy == "uniform_candidate":
+            weight = np.ones(len(modes), np.float64)
+        else:
+            # Cosine RADIO similarity is already dimensionless.  Unit
+            # temperature is fixed, mapping-only and deliberately untuned.
+            shifted = mode_score[modes] - np.max(mode_score[modes])
+            weight = np.exp(shifted)
+        mode_mass[modes] = weight / np.sum(weight)
+
+    component = np.zeros(len(token), np.float64)
+    for mode in range(len(unique_mode)):
+        rows = np.flatnonzero(mode_inverse == mode)
+        # Each stored coordinate component (including accidental duplicates)
+        # shares the one physical mode's mass.  Arm identity is retained for
+        # diagnostics but cannot manufacture probability mass.
+        if np.any((arm[rows] < 0) | (arm[rows] > 1)):
+            raise ValueError("coordinate arm identity differs")
+        component[rows] = mode_mass[mode] / float(len(rows))
+    for token_id in np.unique(token):
+        if not np.isclose(np.sum(component[token == token_id]), 1.0, atol=1e-12):
+            raise ValueError("anchored candidate prior does not normalize per token")
+    return component
 
 
 def _candidate_pose(initial_pose: np.ndarray, parameter: np.ndarray) -> np.ndarray:
@@ -95,6 +164,8 @@ def _paired_query_hypotheses(
     point: dict[str, np.ndarray],
     surface: dict[str, np.ndarray],
     query: int,
+    *,
+    candidate_prior_policy: str = "uniform_candidate",
 ) -> dict[str, np.ndarray]:
     """Stack equal-prior coordinate arms without changing match multiplicity."""
     point_lo, point_hi = map(int, point["correspondence_offsets"][query:query + 2])
@@ -117,6 +188,14 @@ def _paired_query_hypotheses(
     ])
     plane = np.concatenate([
         np.asarray(item["provenance_region_plane_atlas_row"][slc, 1], np.int64)
+        for item, slc in zip(items, slices)
+    ])
+    prototype = np.concatenate([
+        np.asarray(item["prototype_atlas_row"][slc], np.int64)
+        for item, slc in zip(items, slices)
+    ])
+    radio_score = np.concatenate([
+        np.asarray(item["radio_match_score"][slc], np.float64)
         for item, slc in zip(items, slices)
     ])
     existence = np.concatenate([
@@ -144,17 +223,25 @@ def _paired_query_hypotheses(
         or np.any((existence < 0.0) | (existence > 1.0))
     ):
         raise ValueError("paired coordinate hypothesis values differ")
+    coordinate_arm = np.concatenate([
+        np.zeros(arm_count, np.int8), np.ones(arm_count, np.int8),
+    ])
+    component_prior = _anchored_component_prior(
+        token, plane, prototype, coordinate_arm, radio_score,
+        policy=candidate_prior_policy,
+    )
     return {
         "world": world,
         "pixel": pixel,
         "token": token,
         "plane": plane,
+        "prototype": prototype,
+        "radio_score": radio_score,
         "existence_probability": existence,
         "query_variance_px2": query_variance,
         "centroid_covariance_world_m2": centroid_covariance,
-        "coordinate_arm": np.concatenate([
-            np.zeros(arm_count, np.int8), np.ones(arm_count, np.int8),
-        ]),
+        "coordinate_arm": coordinate_arm,
+        "component_prior": component_prior,
     }
 
 
@@ -205,7 +292,16 @@ def _mixture_statistics(
     gaussian = np.exp(-0.5 * residual2 / variance) / (2.0 * np.pi * variance)
     gaussian[camera[:, 2] <= 0.0] = 0.0
     unique, inverse, count = np.unique(token, return_inverse=True, return_counts=True)
-    prior = 1.0 / count[inverse].astype(np.float64)
+    if "component_prior" in hypotheses:
+        prior = np.asarray(hypotheses["component_prior"], np.float64).reshape(-1)
+        if len(prior) != len(token) or np.any(~np.isfinite(prior)) or np.any(prior < 0.0):
+            raise ValueError("anchored component prior differs")
+        prior_sum = np.zeros(len(unique), np.float64)
+        np.add.at(prior_sum, inverse, prior)
+        if not np.allclose(prior_sum, 1.0, atol=1e-12, rtol=0.0):
+            raise ValueError("anchored component prior is not unit mass per token")
+    else:
+        prior = 1.0 / count[inverse].astype(np.float64)
     null_density = 1.0 / float(image_area_px2)
     match_mass = prior * existence * gaussian
     null_mass = prior * (1.0 - existence) * null_density
@@ -389,6 +485,11 @@ def main() -> None:
     parser.add_argument("--point_correspondences", type=Path, required=True)
     parser.add_argument("--surface_correspondences", type=Path, required=True)
     parser.add_argument("--query_contributors", type=Path, required=True)
+    parser.add_argument(
+        "--candidate_prior_policy",
+        choices=CANDIDATE_PRIOR_POLICIES,
+        default="uniform_candidate",
+    )
     parser.add_argument("--output_frozen_pose_inventory", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
@@ -417,7 +518,10 @@ def main() -> None:
         if not usable[query]:
             diagnostics.append(detail)
             continue
-        hypotheses = _paired_query_hypotheses(point, surface, query)
+        hypotheses = _paired_query_hypotheses(
+            point, surface, query,
+            candidate_prior_policy=args.candidate_prior_policy,
+        )
         candidate_count[query] = len(hypotheses["world"])
         K = np.asarray(point["camera_matrices"][query], np.float64)
         k1 = float(point["radial_k1"][query])
@@ -479,8 +583,14 @@ def main() -> None:
         "source_rgb_stored_or_consumed_at_runtime": False,
         "source_view_identity_retained_at_runtime": False,
         "coordinate_model": "equal_prior_latent_pointV5_or_continuous_surfaceV7_per_anonymous_RADIO_match",
-        "coordinate_arm_prior": [0.5, 0.5],
-        "hypothesis_prior": "unit_token_mass_uniform_over_coordinate_arms_and_matched_prototypes",
+        "coordinate_arm_prior": "each_physical_candidate_mass_split_over_its_stored_coordinate_components",
+        "candidate_prior_policy": args.candidate_prior_policy,
+        "candidate_identity": "query_token_plus_physical_plane_plus_anonymous_prototype_atlas_row",
+        "hypothesis_prior": (
+            "unit_token_mass_Gibbs_over_physical_candidates_from_frozen_RADIO_cosine_at_unit_temperature_then_split_over_coordinate_components"
+            if args.candidate_prior_policy == "radio_gibbs_unit_temperature" else
+            "unit_token_mass_uniform_over_physical_candidates_then_split_over_coordinate_components"
+        ),
         "null_model": "mapping_calibrated_correspondence_existence_times_gaussian_plus_uniform_image_null",
         "map_uncertainty": "continuous_surface_centroid_covariance_only; atlas_footprint_scatter_and_depth_dispersion_excluded",
         "em_rounds": EM_ROUNDS,

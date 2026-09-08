@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 
 import numpy as np
@@ -18,6 +19,54 @@ from feature_extract.vfm.statistics import mcnemar_exact_pvalue, paired_bootstra
 
 
 THRESHOLDS = ((0.1, 1.0), (0.25, 2.0), (0.5, 5.0), (1.0, 10.0), (2.0, 45.0))
+
+
+def _threshold_hits(translation, rotation, threshold_t, threshold_r):
+    # Each method's failure belongs to that method, not to the common subset.
+    return (np.isfinite(translation) & np.isfinite(rotation)
+            & (translation <= threshold_t) & (rotation <= threshold_r))
+
+
+def _temporal_block_ci(names, delta, block_length, resamples, seed):
+    """Route-stratified circular moving blocks, conditional on the observed routes."""
+    names = np.asarray(names).astype(str)
+    delta = np.asarray(delta, np.float64)
+    if delta.shape != names.shape or block_length < 1 or resamples < 1:
+        raise ValueError("invalid temporal bootstrap input")
+    routes = {}
+    for row, name in enumerate(names):
+        match = re.fullmatch(r"(.+)__frame(\d+)\.png\.npz", name)
+        if match is None:
+            raise ValueError("temporal bootstrap requires explicit route/frame names")
+        routes.setdefault(match[1], []).append((int(match[2]), row))
+    groups = []
+    for entries in routes.values():
+        entries = sorted(entries)
+        if len({frame for frame, _ in entries}) != len(entries):
+            raise ValueError("duplicate route/frame identity")
+        groups.append(np.asarray([row for _, row in entries], np.int64))
+    if not np.isfinite(delta).any():
+        raise ValueError("no finite temporal deltas")
+    rng = np.random.default_rng(seed)
+    samples = []
+    for _ in range(resamples):
+        selected = []
+        for rows in groups:
+            size = min(block_length, len(rows))
+            starts = rng.integers(0, len(rows), size=(len(rows) + size - 1) // size)
+            indices = ((starts[:, None] + np.arange(size)) % len(rows)).ravel()[:len(rows)]
+            selected.append(rows[indices])
+        value = delta[np.concatenate(selected)]
+        if np.isfinite(value).any():
+            samples.append(float(np.mean(value[np.isfinite(value)])))
+    if not samples:
+        raise ValueError("no usable temporal bootstrap samples")
+    lower, upper = np.quantile(samples, [.025, .975])
+    return {"estimate": float(np.mean(delta[np.isfinite(delta)])),
+            "lower": float(lower), "upper": float(upper),
+            "valid_resamples": len(samples), "route_count": len(groups),
+            "block_length_observed_frames": block_length,
+            "semantics": "route_stratified_circular_moving_blocks_sorted_numeric_frame;not_unseen_route_inference"}
 
 
 def _load(path: Path) -> tuple[dict[str, np.ndarray], dict[str, object]]:
@@ -57,6 +106,7 @@ def main() -> None:
     parser.add_argument("--query_contributors", type=Path, required=True)
     parser.add_argument("--bootstrap_resamples", type=int, default=10000)
     parser.add_argument("--bootstrap_seed", type=int, default=260907)
+    parser.add_argument("--temporal_block_lengths", type=int, nargs="+", default=[])
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.output.exists():
@@ -72,8 +122,8 @@ def main() -> None:
         raise ValueError("paired pose audit has no jointly usable rows")
     threshold_rows: dict[str, object] = {}
     for translation, rotation in THRESHOLDS:
-        base = finite & (baseline_t <= translation) & (baseline_r <= rotation)
-        new = finite & (method_t <= translation) & (method_r <= rotation)
+        base = _threshold_hits(baseline_t, baseline_r, translation, rotation)
+        new = _threshold_hits(method_t, method_r, translation, rotation)
         key = f"{translation:g}m_{rotation:g}deg"
         threshold_rows[key] = {
             "baseline_hits": int(np.sum(base)),
@@ -114,6 +164,19 @@ def main() -> None:
         "query_pose_or_ground_truth_opened": True,
         "production_eligible": False,
     }
+    if args.temporal_block_lengths:
+        td = np.full(len(finite), np.nan); rd = td.copy()
+        td[finite] = method_t[finite] - baseline_t[finite]
+        rd[finite] = method_r[finite] - baseline_r[finite]
+        report["temporal_block_bootstrap"] = {
+            str(length): {
+                "translation_m": _temporal_block_ci(baseline["names"], td, length,
+                                                     args.bootstrap_resamples, args.bootstrap_seed),
+                "rotation_deg": _temporal_block_ci(baseline["names"], rd, length,
+                                                   args.bootstrap_resamples, args.bootstrap_seed + 1),
+            } for length in args.temporal_block_lengths
+        }
+    report["threshold_population"] = "all_queries_independent_method_usability"
     report["content_sha256"] = canonical_json_sha256(report)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")

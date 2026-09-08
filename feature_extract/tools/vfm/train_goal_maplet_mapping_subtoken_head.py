@@ -340,6 +340,52 @@ class MappingSurfaceCoordinateHomographyContextHead(torch.nn.Module):
         return mean, variance, chart_uv_mean, chart_uv_variance, self.match(hidden)
 
 
+class MappingSurfaceCoordinateLocalCorrelationHead(torch.nn.Module):
+    """Surface-coordinate posterior with geometry and a local RADIO cost volume.
+
+    The first eight values retain the frozen V11 geometric/homography contract.
+    The remaining 99 values are a candidate-conditioned 3x3 query by 3x3 map
+    cosine volume followed by the two nine-element validity masks.  Candidate
+    identity therefore remains explicit; the head only predicts a bounded
+    residual inside that candidate's original metric cell.
+    """
+
+    GEOMETRIC_CONTEXT_DIMENSION = 8
+    LOCAL_CORRELATION_DIMENSION = 9 * 9 + 9 + 9
+    CONTEXT_DIMENSION = GEOMETRIC_CONTEXT_DIMENSION + LOCAL_CORRELATION_DIMENSION
+
+    def __init__(self, feature_dimension: int, hidden_dimension: int = 96) -> None:
+        super().__init__()
+        self.hidden = torch.nn.Linear(
+            4 * int(feature_dimension) + 3 + self.CONTEXT_DIMENSION,
+            int(hidden_dimension),
+        )
+        self.mean = torch.nn.Linear(int(hidden_dimension), 2)
+        self.log_variance = torch.nn.Linear(int(hidden_dimension), 1)
+        self.chart_uv_mean = torch.nn.Linear(int(hidden_dimension), 2)
+        self.chart_uv_log_variance = torch.nn.Linear(int(hidden_dimension), 1)
+        self.match = torch.nn.Linear(int(hidden_dimension), 1)
+
+    def forward(
+        self, query: torch.Tensor, mapping: torch.Tensor, token_ids: torch.Tensor,
+        geometric_context: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if geometric_context.ndim != 2 or geometric_context.shape != (
+            len(query), self.CONTEXT_DIMENSION,
+        ):
+            raise ValueError("surface-coordinate local-correlation context differs")
+        if not torch.isfinite(geometric_context).all():
+            raise ValueError("surface-coordinate local-correlation context differs")
+        hidden = F.gelu(self.hidden(
+            torch.cat((_pair_input(query, mapping, token_ids), geometric_context), dim=1),
+        ))
+        mean = SUBTOKEN_HALF_EXTENT_PX * torch.tanh(self.mean(hidden))
+        variance = MINIMUM_VARIANCE_PX2 + F.softplus(self.log_variance(hidden))
+        chart_uv_mean = MAXIMUM_CHART_UV_OFFSET_M * torch.tanh(self.chart_uv_mean(hidden))
+        chart_uv_variance = MINIMUM_UV_VARIANCE_M2 + F.softplus(self.chart_uv_log_variance(hidden))
+        return mean, variance, chart_uv_mean, chart_uv_variance, self.match(hidden)
+
+
 def _metrics(target: np.ndarray, mean: np.ndarray, variance: np.ndarray) -> dict[str, object]:
     target = np.asarray(target, np.float64); mean = np.asarray(mean, np.float64)
     error = np.linalg.norm(mean - target, axis=1)
@@ -377,7 +423,7 @@ def load_mapping_subtoken_head(
 ) -> tuple[
     MappingSubtokenHead | MappingSurfaceCoordinateHead | MappingSurfaceCoordinateMixtureHead
     | MappingSurfaceCoordinateContextHead | MappingSurfaceCoordinateDeepContextHead
-    | MappingSurfaceCoordinateHomographyContextHead,
+    | MappingSurfaceCoordinateHomographyContextHead | MappingSurfaceCoordinateLocalCorrelationHead,
     dict[str, object],
 ]:
     with np.load(path, allow_pickle=False) as data:
@@ -397,13 +443,18 @@ def load_mapping_subtoken_head(
             "goal_maplet_mapping_only_pairwise_radio_surface_coordinate_context_head_v9",
             "goal_maplet_mapping_only_pairwise_radio_surface_coordinate_deep_context_head_v10",
             "goal_maplet_mapping_only_pairwise_radio_surface_coordinate_homography_context_head_v11",
+            "goal_maplet_mapping_only_pairwise_radio_surface_coordinate_local_correlation_head_v12",
         }
         or metadata.get("query_rgb_pose_depth_or_ground_truth_read") is not False
         or arrays_sha256(arrays) != metadata.get("arrays_sha256")
         or canonical_json_sha256(content) != claimed
     ):
         raise ValueError("mapping subtoken head lineage differs")
-    if metadata.get("artifact_type") == "goal_maplet_mapping_only_pairwise_radio_surface_coordinate_homography_context_head_v11":
+    if metadata.get("artifact_type") == "goal_maplet_mapping_only_pairwise_radio_surface_coordinate_local_correlation_head_v12":
+        model = MappingSurfaceCoordinateLocalCorrelationHead(
+            int(metadata["feature_dimension"]), int(metadata["hidden_dimension"]),
+        )
+    elif metadata.get("artifact_type") == "goal_maplet_mapping_only_pairwise_radio_surface_coordinate_homography_context_head_v11":
         model = MappingSurfaceCoordinateHomographyContextHead(
             int(metadata["feature_dimension"]), int(metadata["hidden_dimension"]),
         )

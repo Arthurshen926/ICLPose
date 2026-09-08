@@ -133,6 +133,8 @@ def main() -> None:
     parser.add_argument("--query_contributors", type=Path, required=True)
     parser.add_argument("--output_frozen_pose_inventory", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--solver_policy",choices=('legacy','unique_token_lm','token_ransac'),default='unique_token_lm')
+    parser.add_argument("--token_ransac_iterations",type=int,default=128)
     args = parser.parse_args()
     if args.output.exists() or args.output_frozen_pose_inventory.exists():
         raise FileExistsError("refusing to overwrite view-geometry refinement")
@@ -187,7 +189,9 @@ def main() -> None:
             )
             if len(keep) else None
         )
-        candidate = _solve(world, tokens, K, k1, keep, measurements)
+        candidate = _solve(world, tokens, K, k1, keep, measurements,
+                           unique_token_lm=args.solver_policy!='legacy',
+                           token_ransac_iterations=args.token_ransac_iterations if args.solver_policy=='token_ransac' else 0)
         if candidate is not None:
             candidate_global = _score(candidate, world, tokens, provenance, K, k1, measurements)
             candidate_compatible = _score(
@@ -221,6 +225,8 @@ def main() -> None:
         "compatible_correspondence_count": compatible_count,
     }
     metadata = {
+        "solver_policy":args.solver_policy,
+        "token_ransac_iterations":args.token_ransac_iterations if args.solver_policy=='token_ransac' else None,
         "artifact_type": "goal_maplet_canonical_plane_uv_view_geometry_refined_pose_v1",
         "arrays_sha256": arrays_sha256(arrays), "query_count": int(len(names)),
         "query_pose_or_ground_truth_read": False,

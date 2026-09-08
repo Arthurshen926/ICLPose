@@ -30,6 +30,7 @@ def _load_pose_candidate(path: Path) -> tuple[dict[str, np.ndarray], dict[str, o
             "goal_maplet_cross_coordinate_probabilistic_surface_pose_refinement_v1",
             "goal_maplet_cross_coordinate_moge3_geometry_pose_selection_v1",
             "goal_maplet_coordinate_pose_geometry_consensus_v1",
+            "goal_maplet_relative_multiplane_layout_selected_pose_v1",
         }
         or metadata.get("query_pose_or_ground_truth_read") is not False
         or metadata.get("source_rgb_stored_or_consumed_at_runtime") is not False

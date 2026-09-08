@@ -1,6 +1,7 @@
 import numpy as np
 
 from feature_extract.tools.vfm.refine_goal_maplet_cross_coordinate_probabilistic_surface_pose import (
+    _anchored_component_prior,
     _candidate_pose,
     _mixture_statistics,
     _paired_query_hypotheses,
@@ -47,6 +48,37 @@ def test_duplicate_identical_coordinate_arm_has_no_multiplicity_bonus():
     np.testing.assert_allclose(one_null, two_null, atol=1e-12)
 
 
+def test_anchored_candidate_prior_is_mode_and_duplicate_invariant():
+    token = np.asarray([3, 3, 3, 3])
+    plane = np.asarray([7, 7, 8, 8])
+    prototype = np.asarray([11, 11, 12, 12])
+    arm = np.asarray([0, 1, 0, 1])
+    score = np.asarray([0.2, 0.2, 0.9, 0.9])
+    prior = _anchored_component_prior(
+        token, plane, prototype, arm, score,
+        policy="radio_gibbs_unit_temperature",
+    )
+    expected_mode = np.exp([0.2, 0.9]); expected_mode /= expected_mode.sum()
+    np.testing.assert_allclose(prior, np.repeat(expected_mode / 2.0, 2), atol=1e-12)
+    np.testing.assert_allclose(prior.sum(), 1.0, atol=1e-12)
+
+    duplicated = _anchored_component_prior(
+        np.r_[token, 3], np.r_[plane, 7], np.r_[prototype, 11],
+        np.r_[arm, 0], np.r_[score, 0.2],
+        policy="radio_gibbs_unit_temperature",
+    )
+    np.testing.assert_allclose(duplicated[[0, 1, 4]].sum(), expected_mode[0], atol=1e-12)
+    np.testing.assert_allclose(duplicated[[2, 3]].sum(), expected_mode[1], atol=1e-12)
+
+
+def test_anchored_candidate_prior_rejects_coordinate_score_disagreement():
+    with np.testing.assert_raises_regex(ValueError, "disagree on RADIO score"):
+        _anchored_component_prior(
+            [3, 3], [7, 7], [11, 11], [0, 1], [0.2, 0.3],
+            policy="uniform_candidate",
+        )
+
+
 def test_centroid_covariance_not_footprint_scatter_controls_surface_variance():
     K = np.asarray([[100.0, 0.0, 0.0], [0.0, 100.0, 0.0], [0.0, 0.0, 1.0]])
     base = _hypotheses([[0, 0, 2]], [[0, 0]], [0], [1.0], [1.0])
@@ -64,6 +96,8 @@ def test_paired_query_hypotheses_keeps_each_match_once_per_coordinate_arm():
         "query_measurements_xy": np.asarray([[1, 2], [3, 4]], np.float64),
         "query_tokens": np.asarray([4, 5]),
         "provenance_region_plane_atlas_row": np.asarray([[0, 7, 0], [0, 8, 1]]),
+        "prototype_atlas_row": np.asarray([11, 12]),
+        "radio_match_score": np.asarray([0.8, 0.7]),
         "correspondence_match_probability": np.asarray([0.8, 0.7]),
         "prototype_plane_pixel_purity": np.asarray([0.5, 1.0]),
         "query_measurement_variance_px2": np.asarray([1.0, 2.0]),
@@ -76,6 +110,7 @@ def test_paired_query_hypotheses_keeps_each_match_once_per_coordinate_arm():
     merged = _paired_query_hypotheses(base, surface, 0)
     assert merged["coordinate_arm"].tolist() == [0, 0, 1, 1]
     assert merged["token"].tolist() == [4, 5, 4, 5]
+    np.testing.assert_allclose(merged["component_prior"], 0.5)
     np.testing.assert_allclose(merged["existence_probability"], [0.4, 0.7, 0.4, 0.7])
     np.testing.assert_allclose(merged["centroid_covariance_world_m2"][:2], 0.0)
 

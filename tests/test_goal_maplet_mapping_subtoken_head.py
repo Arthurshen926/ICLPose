@@ -7,6 +7,7 @@ from feature_extract.tools.vfm.train_goal_maplet_mapping_subtoken_head import (
     MappingSurfaceCoordinateContextHead,
     MappingSurfaceCoordinateDeepContextHead,
     MappingSurfaceCoordinateHomographyContextHead,
+    MappingSurfaceCoordinateLocalCorrelationHead,
     MappingSurfaceCoordinateMixtureHead,
     MappingSubtokenHead,
     _directed_pairs,
@@ -71,6 +72,15 @@ def test_homography_surface_coordinate_context_head_requires_eight_values():
     assert output[0].shape == output[2].shape == (3, 2)
     with pytest.raises(ValueError, match="homography context"):
         model(query, mapping, token, torch.zeros(3, 7))
+
+
+def test_local_correlation_head_requires_full_candidate_conditioned_volume():
+    model = MappingSurfaceCoordinateLocalCorrelationHead(4, hidden_dimension=8)
+    query = torch.randn(3, 4); mapping = torch.randn(3, 4); token = torch.arange(3)
+    output = model(query, mapping, token, torch.zeros(3, 107))
+    assert output[0].shape == output[2].shape == (3, 2)
+    with pytest.raises(ValueError, match="local-correlation context"):
+        model(query, mapping, token, torch.zeros(3, 106))
 
 
 def test_project_world_to_pixel_and_token_phase():

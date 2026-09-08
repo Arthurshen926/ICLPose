@@ -70,6 +70,14 @@ def _load(path: Path) -> tuple[dict[str, np.ndarray], dict[str, object]]:
             ]
         arrays = {key: np.asarray(data[key]) for key in keys}
     count = len(arrays["names"])
+    offsets=arrays['correspondence_offsets'];n=len(arrays['world_points'])
+    if (offsets.shape!=(count+1,) or offsets.dtype.kind not in 'iu'
+            or offsets[0]!=0 or offsets[-1]!=n or np.any(np.diff(offsets.astype(np.int64))<0)
+            or arrays['world_points'].shape!=(n,3) or arrays['query_tokens'].shape!=(n,)
+            or arrays['query_tokens'].dtype.kind not in 'iu'
+            or np.any(arrays['query_tokens']>=64*36) or np.any(arrays['query_tokens']<0)
+            or arrays['radial_k1'].shape!=(count,)):
+        raise ValueError('malformed PnP row/token inventory')
     if (
         metadata.get("artifact_type") not in (
             "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v1",
@@ -167,6 +175,9 @@ def _load(path: Path) -> tuple[dict[str, np.ndarray], dict[str, object]]:
         )
     ):
         raise ValueError("frozen PnP correspondence inventory differs")
+    for key in ('world_points','camera_matrices','radial_k1','query_measurement_variance_px2','correspondence_match_probability'):
+        if key in arrays and not np.isfinite(arrays[key]).all():
+            raise ValueError('nonfinite PnP input: '+key)
     return arrays, metadata
 
 
@@ -177,8 +188,12 @@ def _solve(
     k1: float,
     rows: np.ndarray,
     query_measurements_xy: np.ndarray | None = None,
+    *, unique_token_lm: bool = True, token_ransac_iterations: int = 0,
 ) -> np.ndarray | None:
-    if len(rows) < 6:
+    if token_ransac_iterations:
+        from feature_extract.tools.vfm.token_hypothesis_ransac import solve
+        return solve(world,tokens,K,k1,rows,query_measurements_xy,iterations=token_ransac_iterations)
+    if len(rows) < 6 or (unique_token_lm and len(np.unique(tokens[rows])) < 6):
         return None
     pixel_all = (
         np.c_[(tokens % 64) * 4 + 1.5, (tokens // 64) * 4 + 1.5]
@@ -198,6 +213,14 @@ def _solve(
     if not ok or inlier is None or len(inlier) < 6:
         return None
     selected = rows[inlier.reshape(-1)]
+    if unique_token_lm:
+        camera=world[selected]@cv2.Rodrigues(rvec)[0].T+np.asarray(tvec).reshape(3)
+        selected=selected[np.isfinite(camera).all(axis=1)&(camera[:,2]>1e-8)]
+        if len(selected)<6:return None
+        projected,_=cv2.projectPoints(world[selected],rvec,tvec,K,distortion)
+        residual=np.linalg.norm(projected.reshape(-1,2)-pixel_all[selected],axis=1)
+        selected=_unique_token_rows(selected,tokens,residual)
+        if len(selected)<6:return None
     all_pixel = pixel_all[selected]
     rvec, tvec = cv2.solvePnPRefineLM(
         world[selected], all_pixel, K, distortion, rvec, tvec,
@@ -205,7 +228,23 @@ def _solve(
     pose = np.eye(4, dtype=np.float64)
     pose[:3, :3] = cv2.Rodrigues(rvec)[0]
     pose[:3, 3] = np.asarray(tvec).reshape(3)
-    return pose
+    return pose if np.isfinite(pose).all() else None
+
+
+def _unique_token_rows(rows,tokens,residual):
+    rows=np.asarray(rows,np.int64);residual=np.asarray(residual,float)
+    if residual.shape!=rows.shape or not np.isfinite(residual).all():
+        raise ValueError('invalid token association residual')
+    order=np.lexsort((rows,residual,tokens[rows]))
+    _,first=np.unique(tokens[rows[order]],return_index=True)
+    return rows[order[first]]
+
+
+def _select_match_rows(tokens,provenance,scores,per_plane=False):
+    group=tokens
+    if per_plane:
+        _,group=np.unique(np.c_[tokens,provenance[:,1]],axis=0,return_inverse=True)
+    return _unique_token_rows(np.arange(len(tokens)),group,-np.asarray(scores,float))
 
 
 def _score(
@@ -264,30 +303,33 @@ def _score(
     }
 
 
-def _top_groups(values: np.ndarray, maximum: int) -> list[np.ndarray]:
+def _top_groups(values: np.ndarray, maximum: int, tokens: np.ndarray | None = None) -> list[np.ndarray]:
     groups = []
     for value in np.unique(values):
         rows = np.flatnonzero(values == value)
-        if len(rows) >= 6:
+        support=len(rows) if tokens is None else len(np.unique(tokens[rows]))
+        if support >= 6:
             groups.append(rows)
-    groups.sort(key=lambda rows: (-len(rows), int(rows[0])))
+    groups.sort(key=lambda rows: (-(len(rows) if tokens is None else len(np.unique(tokens[rows]))), int(values[rows[0]]) if tokens is not None else int(rows[0])))
     return groups[:maximum]
 
 
 def _choice_key(candidate: dict[str, object], rule: str) -> tuple[object, ...]:
+    residual=candidate['reprojection_median_px']
+    penalty=float(residual) if residual is not None and np.isfinite(residual) else 1e9
     if rule == "raw_inliers":
-        return (candidate["inlier_count"], -float(candidate["reprojection_median_px"] or 1e9))
+        return (candidate["inlier_count"], -penalty)
     if rule == "balanced_support":
         return (
             candidate["region_capped_support"], candidate["plane_capped_support"],
             candidate["view_capped_support"], candidate["inlier_count"],
-            -float(candidate["reprojection_median_px"] or 1e9),
+            -penalty,
         )
     if rule == "supported_entities":
         return (
             candidate["supported_region_count"], candidate["supported_plane_count"],
             candidate["supported_view_count"], candidate["inlier_count"],
-            -float(candidate["reprojection_median_px"] or 1e9),
+            -penalty,
         )
     raise ValueError("unknown selection rule")
 
@@ -297,12 +339,24 @@ def main() -> None:
     parser.add_argument("--frozen_correspondences", type=Path, required=True)
     parser.add_argument("--query_contributors", type=Path, required=True)
     parser.add_argument("--maximum_groups_per_kind", type=int, default=16)
+    parser.add_argument("--seed_group_support",choices=('row_count','unique_tokens'),default='unique_tokens')
     parser.add_argument("--output_frozen_candidates", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--solver_policy",choices=('legacy','unique_token_lm','token_ransac'),default='unique_token_lm')
+    parser.add_argument("--token_ransac_iterations",type=int,default=128)
+    parser.add_argument("--association_policy",choices=('all','match_top1','match_top1_per_plane','mapping_gate'),default='all')
+    parser.add_argument("--mapping_match_gate",type=Path)
     args = parser.parse_args()
     if args.output.exists() or args.output_frozen_candidates.exists():
         raise FileExistsError("refusing to overwrite multi-hypothesis result")
     arrays, upstream = _load(args.frozen_correspondences)
+    gate=None
+    if args.association_policy=='mapping_gate':
+        if args.mapping_match_gate is None:raise ValueError('mapping gate required')
+        gate=json.loads(args.mapping_match_gate.read_text())
+        if (gate.get('head_content_sha256')!=upstream.get('mapping_subtoken_head_content_sha256')
+                or gate.get('query_data_used') is not False or not 0<=float(gate['threshold'])<=1):
+            raise ValueError('mapping gate lineage differs')
     rules = ("raw_inliers", "balanced_support", "supported_entities")
     selected: dict[str, list[dict[str, object]]] = {rule: [] for rule in rules}
     all_candidates: list[list[dict[str, object]]] = []
@@ -315,17 +369,28 @@ def main() -> None:
         provenance = arrays["provenance_region_plane_atlas_row"][lo:hi]
         K = arrays["camera_matrices"][query_index]
         k1 = float(arrays["radial_k1"][query_index])
+        score_world,score_tokens,score_provenance,score_measurements=world,tokens,provenance,measurements
+        if args.association_policy!='all':
+            scores=arrays['correspondence_match_probability'][lo:hi]
+            retained=(np.flatnonzero(scores>=float(gate['threshold'])) if gate is not None else
+                      _select_match_rows(tokens,provenance,scores,args.association_policy=='match_top1_per_plane'))
+            world,tokens,provenance=world[retained],tokens[retained],provenance[retained]
+            if measurements is not None:measurements=measurements[retained]
         seed_groups: list[tuple[str, np.ndarray]] = [("all", np.arange(len(world)))]
-        for label, column in (("plane", 1), ("source_view", 2), ("query_region", 0)):
+        third_label=('atlas_prototype' if upstream.get('correspondence_semantics')=='query_RADIO_to_view_independent_metric_plane_UV_texels' else 'source_view')
+        for label, column in (("plane", 1), (third_label, 2), ("query_region", 0)):
             seed_groups.extend(
-                (label, rows) for rows in _top_groups(provenance[:, column], args.maximum_groups_per_kind)
+                (label, rows) for rows in _top_groups(provenance[:, column], args.maximum_groups_per_kind,
+                                                     tokens if args.seed_group_support=='unique_tokens' else None)
             )
         candidates = []
         for origin, rows in seed_groups:
-            pose = _solve(world, tokens, K, k1, rows, measurements)
+            pose = _solve(world, tokens, K, k1, rows, measurements,
+                          unique_token_lm=args.solver_policy!='legacy',
+                          token_ransac_iterations=args.token_ransac_iterations if args.solver_policy=='token_ransac' else 0)
             if pose is None:
                 continue
-            score = _score(pose, world, tokens, provenance, K, k1, measurements)
+            score = _score(pose, score_world, score_tokens, score_provenance, K, k1, score_measurements)
             score["origin"] = origin
             candidates.append(score)
         if not candidates:
@@ -370,7 +435,15 @@ def main() -> None:
         "artifact_type": "goal_maplet_direct_plane_pnp_grouped_multihypothesis_v1",
         "arrays_sha256": arrays_sha256(frozen_arrays),
         "query_count": int(len(arrays["names"])),
-        "candidate_generation": "all plus top16 physical-plane/source-view/query-region grouped PnP seeds",
+        "candidate_generation": "all plus grouped physical-plane/third-provenance/query-region PnP seeds",
+        "third_provenance_semantics":('anonymous_atlas_prototype_not_source_view'
+            if upstream.get('correspondence_semantics')=='query_RADIO_to_view_independent_metric_plane_UV_texels' else 'upstream_source_view_or_atlas_row'),
+        "solver_policy":args.solver_policy,"association_policy":args.association_policy,
+        "seed_group_support":args.seed_group_support,
+        "token_ransac_iterations":args.token_ransac_iterations if args.solver_policy=='token_ransac' else None,
+        "mapping_match_gate":gate,
+        "candidate_scoring_population":"all_original_correspondences_unique_token_support",
+        "legacy_view_support_fields":"third_provenance_support_not_independent_view_evidence_for_metric_atlas",
         "selection_rules": list(rules),
         "query_pose_or_ground_truth_opened": False,
         "frozen_correspondence_file_sha256": file_sha256(args.frozen_correspondences),

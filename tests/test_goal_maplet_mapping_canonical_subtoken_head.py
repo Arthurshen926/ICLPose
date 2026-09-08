@@ -1,4 +1,59 @@
 import numpy as np
+import pytest
+
+
+def test_source_isolated_centers_remove_same_view_and_balance_remaining_views(monkeypatch):
+    from feature_extract.tools.vfm import train_goal_maplet_mapping_canonical_subtoken_head as module
+    monkeypatch.setattr(module, "_project_world_to_pixel", lambda world, *args:
+                        (np.tile([1.5, 1.5], (len(world), 1)), np.ones(len(world))))
+    world = np.c_[np.arange(5) * .01, np.zeros(5), np.ones(5)]
+    data = module._fit_prototype_dataset(
+        np.arange(5), np.zeros(5, np.int64), np.arange(5),
+        np.asarray(["fit"] * 4 + ["val"]), {"fit"}, "val", world,
+        np.tile([1., 0.], (5, 1)), np.zeros(5, np.int64),
+        np.tile(np.eye(4), (5, 1, 1)), np.tile(np.eye(3), (5, 1, 1)), np.zeros(5),
+        source_view_per_observation=np.asarray([0, 0, 1, 2, 3]),
+    )
+    rows = data["fit_query_rows"]
+    np.testing.assert_allclose(data["fit_map_world"][rows == 0, 0], [.025])
+    np.testing.assert_allclose(data["fit_map_world"][rows == 2, 0], [.0175])
+    np.testing.assert_allclose(data["validation_map_world"][:, 0], [(.005 + .02 + .03) / 3])
+
+
+def test_view_cell_mean_uses_all_tokens_without_cross_observation_mixing():
+    from feature_extract.tools.vfm.train_goal_maplet_mapping_canonical_subtoken_head import (
+        _view_cell_mean_features,
+    )
+    raw = np.asarray([[1, 0], [0, 1], [-1, 0], [0, -1]], np.float32)
+    original = raw.copy()
+    pooled = _view_cell_mean_features(raw, np.eye(2, dtype=np.float32),
+                                     np.asarray([0, 0, 0, 1]),
+                                     np.asarray([0, 0, 1, 0]), np.asarray([0, 2, 3]))
+    np.testing.assert_allclose(pooled[0], np.asarray([1, 1]) / np.sqrt(2), atol=1e-7)
+    np.testing.assert_allclose(pooled[2], [-1, 0])
+    np.testing.assert_allclose(pooled[3], [0, -1])
+    np.testing.assert_array_equal(pooled[1], [0, 0])
+    np.testing.assert_array_equal(raw, original)
+
+
+@pytest.mark.parametrize("minimum_views", [1, 2])
+def test_local_neighbors_exclude_all_rows_from_query_source_view(minimum_views):
+    from feature_extract.tools.vfm.train_goal_maplet_mapping_canonical_subtoken_head import (
+        _mapping_local_feature_grid,
+    )
+    grid, valid = _mapping_local_feature_grid(
+        np.asarray([0]), np.asarray([[1, 0]], np.float32), np.asarray([[0.25, 0.25, 0]]),
+        leave_query_observation_out=True, neighbor_policy="atlas_modes_mean",
+        minimum_neighbor_views=minimum_views,
+        representative_rows=np.arange(4), representative_identity=np.asarray([0, 1, 1, 1]),
+        identity_keys_plane_cell=np.asarray([[0, 0, 0], [0, 1, 0]]),
+        observation=np.asarray([0, 0, 0, 1]), route_per_observation=np.asarray(["fit", "fit"]),
+        fit_routes={"fit"}, projected_features=np.asarray([[1, 0], [1, 0], [1, 0], [0, 1]], np.float32),
+        plane_rows=np.zeros(4, np.int64), plane_centers_world=np.zeros((1, 3)),
+        plane_frames_world=np.asarray([np.eye(3)]),
+    )
+    assert bool(valid[0, 5]) == (minimum_views == 1)
+    np.testing.assert_array_equal(grid[0, 5], [0, 1] if minimum_views == 1 else [0, 0])
 
 from feature_extract.tools.vfm.train_goal_maplet_mapping_canonical_subtoken_head import (
     _apply_coordinate_calibration,
@@ -9,6 +64,10 @@ from feature_extract.tools.vfm.train_goal_maplet_mapping_canonical_subtoken_head
     _isotropic_gaussian_nll,
     _isotropic_mixture_nll,
     _isotropic_variance_scale,
+    _local_radio_correlation_volume,
+    _local_correlation_reference_gate,
+    _mapping_local_feature_grid,
+    _project_query_local_feature_grid,
     _mixture_offset_metrics,
     _mixture_variance_scale,
     _surface_geometric_context,
@@ -141,3 +200,108 @@ def test_surface_context_contains_cell_phase_and_valid_incidence():
     )
     np.testing.assert_allclose(context[0, 2:4], [-0.6, 0.6], atol=1e-6)
     assert 0.0 <= context[0, 4] <= 1.0
+
+
+def test_local_correlation_volume_masks_missing_query_and_map_cells():
+    query = np.zeros((1, 9, 2), np.float32)
+    mapping = np.zeros_like(query)
+    query[0, 4] = [1.0, 0.0]
+    mapping[0, 4] = [0.5, np.sqrt(0.75)]
+    qvalid = np.zeros((1, 9), bool); qvalid[0, 4] = True
+    mvalid = np.zeros((1, 9), bool); mvalid[0, 4] = True
+    context = _local_radio_correlation_volume(query, mapping, qvalid, mvalid)
+    assert context.shape == (1, 99)
+    assert context[0, 4 * 9 + 4] == np.float32(0.5)
+    assert np.count_nonzero(context[0, :81]) == 1
+    np.testing.assert_array_equal(context[0, 81:90], qvalid[0])
+    np.testing.assert_array_equal(context[0, 90:99], mvalid[0])
+
+
+def test_query_local_grid_stays_inside_same_plane_observation():
+    # Tokens 65/66 share an observation. Token65 from another observation must
+    # not be used even though it has the same grid location.
+    observation = np.asarray([0, 0, 1], np.int64)
+    token = np.asarray([65, 66, 65], np.int64)
+    raw = np.asarray([[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]], np.float32)
+    grid, valid = _project_query_local_feature_grid(
+        np.asarray([0]), observation=observation, token_ids=token,
+        raw_features=raw, projection=np.eye(2, dtype=np.float32),
+    )
+    assert valid[0, 4] and valid[0, 5]
+    np.testing.assert_allclose(grid[0, 4], [1.0, 0.0])
+    np.testing.assert_allclose(grid[0, 5], [0.0, 1.0])
+
+
+@pytest.mark.parametrize("neighbor_policy", ["canonical_mean", "atlas_modes_mean"])
+def test_mapping_local_grid_excludes_entire_fit_query_observation(neighbor_policy):
+    # Identity1's neighbor has observations0/1. Query observation0 must be
+    # removed, leaving only observation1's [0,1] descriptor.
+    grid, valid = _mapping_local_feature_grid(
+        np.asarray([0]), np.asarray([[1.0, 0.0]], np.float32),
+        np.asarray([[0.25, 0.25, 0.0]]),
+        leave_query_observation_out=True,
+        neighbor_policy=neighbor_policy,
+        representative_rows=np.arange(4),
+        representative_identity=np.asarray([0, 0, 1, 1]),
+        identity_keys_plane_cell=np.asarray([[0, 0, 0], [0, 1, 0]]),
+        observation=np.asarray([0, 1, 0, 1]),
+        route_per_observation=np.asarray(["seq1", "seq2"]),
+        fit_routes={"seq1", "seq2"},
+        projected_features=np.asarray(
+            [[1.0, 0.0], [1.0, 0.0], [1.0, 0.0], [0.0, 1.0]], np.float32,
+        ),
+        plane_rows=np.zeros(4, np.int64),
+        plane_centers_world=np.zeros((1, 3)),
+        plane_frames_world=np.asarray([np.eye(3)]),
+    )
+    assert valid[0, 4] and valid[0, 5]
+    np.testing.assert_allclose(grid[0, 5], [0.0, 1.0], atol=1e-7)
+
+
+def test_mapping_local_modes_match_runtime_aggregation_and_exclude_validation():
+    from feature_extract.tools.vfm.build_goal_maplet_plane_uv_radio_correspondences import (
+        _atlas_local_cell_feature_lookup,
+    )
+    from feature_extract.tools.vfm.train_goal_maplet_mapping_canonical_subtoken_head import (
+        _diverse_mode_indices,
+    )
+    features = np.asarray([[1, 0], [1, 0], [1, 0], [0, 1], [-0.8, 0.2], [0.3, -1],
+                           [0.7, 0.7]], np.float32)
+    features /= np.linalg.norm(features, axis=1, keepdims=True)
+    grid, valid = _mapping_local_feature_grid(
+        np.asarray([6]), features[6:7], np.asarray([[0.25, 0.25, 0]]),
+        leave_query_observation_out=False, neighbor_policy="atlas_modes_mean",
+        representative_rows=np.arange(7), representative_identity=np.ones(7, np.int64),
+        identity_keys_plane_cell=np.asarray([[0, 0, 0], [0, 1, 0]]),
+        observation=np.arange(7), route_per_observation=np.asarray(["fit"] * 6 + ["val"]),
+        fit_routes={"fit"}, projected_features=features, plane_rows=np.zeros(7, np.int64),
+        plane_centers_world=np.zeros((1, 3)), plane_frames_world=np.asarray([np.eye(3)]),
+    )
+    selected = features[:6][_diverse_mode_indices(features[:6], 4)].astype(np.float16)
+    lookup = _atlas_local_cell_feature_lookup(
+        np.asarray([0, 4]), np.tile([0.75, 0.25], (4, 1)), np.zeros(4, np.int64), selected, 0.5,
+    )
+    assert valid[0, 5]
+    np.testing.assert_allclose(grid[0, 5], lookup[(0, 1, 0)], atol=1e-7)
+
+
+def test_local_reference_gate_requires_every_v11_metric_to_be_nondecreasing():
+    def metrics(value: float):
+        return {
+            "predicted_error_px": {"median": value, "p90": value},
+            "predicted_isotropic_gaussian_nll": value,
+            "positive_match_probability_mean": 0.7,
+            "negative_match_probability_mean": 0.3,
+            "uncertainty_quantile_mean_error_px": [0.1, 0.2, 0.3, 0.4],
+            "chart_uv_offset": {
+                "predicted_error_m": {"median": value, "p90": value},
+                "predicted_isotropic_gaussian_nll": value,
+                "uncertainty_quantile_mean_error_m": [0.1, 0.2, 0.3, 0.4],
+            },
+        }
+    passed, summary = _local_correlation_reference_gate(metrics(0.5), metrics(0.6))
+    assert passed and all(summary["criteria"].values())
+    worse = metrics(0.5)
+    worse["chart_uv_offset"]["predicted_error_m"]["p90"] = 0.7
+    passed, summary = _local_correlation_reference_gate(worse, metrics(0.6))
+    assert not passed and not summary["criteria"]["chart_uv_p90_nonincrease"]

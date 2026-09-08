@@ -120,6 +120,25 @@ def test_refinement_is_bounded_and_improves_weighted_reprojection():
     assert np.linalg.norm(output - true_pose) < np.linalg.norm(initial - true_pose)
 
 
+def test_full_covariance_replays_isotropic_refinement_and_rejects_invalid_matrix():
+    import cv2
+    import pytest
+    rng = np.random.default_rng(63)
+    world = rng.uniform(-1., 1., (24, 3)); world[:, 2] += 5.
+    K = np.asarray([[100., 0., 128.], [0., 100., 72.], [0., 0., 1.]])
+    pixels = cv2.projectPoints(world, np.zeros(3), np.zeros(3), K, None)[0].reshape(-1, 2)
+    initial = np.eye(4); initial[0, 3] = .04
+    planes = np.arange(24) % 3; sigma = np.ones(24)
+    a, aa, _ = _refine_pose(initial, world, pixels, planes, sigma, K, 0.)
+    covariance = np.tile(np.eye(2), (24, 1, 1))
+    b, ba, _ = _refine_pose(initial, world, pixels, planes, sigma, K, 0., covariance)
+    assert aa and ba
+    np.testing.assert_allclose(a, b, atol=1e-9)
+    covariance[0, 0, 0] = -1.
+    with pytest.raises(ValueError, match="positive definite"):
+        _refine_pose(initial, world, pixels, planes, sigma, K, 0., covariance)
+
+
 def test_refinement_fails_closed_for_one_plane():
     world = np.c_[np.linspace(-1.0, 1.0, 12), np.zeros(12), np.full(12, 4.0)]
     K = np.asarray([[100.0, 0.0, 1.5], [0.0, 100.0, 1.5], [0.0, 0.0, 1.0]])

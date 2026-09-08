@@ -28,11 +28,14 @@ from feature_extract.tools.vfm.train_goal_maplet_mapping_subtoken_head import (
     MappingSurfaceCoordinateContextHead,
     MappingSurfaceCoordinateDeepContextHead,
     MappingSurfaceCoordinateHomographyContextHead,
+    MappingSurfaceCoordinateLocalCorrelationHead,
     MappingSurfaceCoordinateMixtureHead,
     SUBTOKEN_HALF_EXTENT_PX,
+    TOKEN_GRID,
     TOKEN_SIZE_PX,
     MappingSubtokenHead,
     _load_projection,
+    load_mapping_subtoken_head,
     _metrics,
     _project_world_to_pixel,
     _representative_rows,
@@ -46,6 +49,309 @@ from feature_extract.vfm.localization_goal_maplet.plane_visibility_atlas import 
 
 MAXIMUM_QUERY_ROWS_PER_IDENTITY = 8
 HOMOGRAPHY_CONTEXT_THRESHOLD_M = 0.25
+LOCAL_CORRELATION_OFFSETS_YX = np.asarray(
+    [(dy, dx) for dy in (-1, 0, 1) for dx in (-1, 0, 1)], np.int64,
+)
+
+
+def _local_radio_correlation_volume(
+    query_features: np.ndarray,
+    map_features: np.ndarray,
+    query_valid: np.ndarray,
+    map_valid: np.ndarray,
+) -> np.ndarray:
+    """Return a masked 3x3-by-3x3 cosine volume plus both validity masks."""
+    query = np.asarray(query_features, np.float32)
+    mapping = np.asarray(map_features, np.float32)
+    qvalid = np.asarray(query_valid, bool)
+    mvalid = np.asarray(map_valid, bool)
+    if (
+        query.ndim != 3 or mapping.shape != query.shape or query.shape[1] != 9
+        or qvalid.shape != query.shape[:2] or mvalid.shape != query.shape[:2]
+        or not (np.all(np.isfinite(query)) and np.all(np.isfinite(mapping)))
+    ):
+        raise ValueError("local RADIO correlation inputs differ")
+    pair_valid = qvalid[:, :, None] & mvalid[:, None, :]
+    correlation = np.einsum("nif,njf->nij", query, mapping, optimize=True)
+    correlation = np.where(pair_valid, np.clip(correlation, -1.0, 1.0), 0.0)
+    result = np.concatenate(
+        (correlation.reshape(len(query), -1), qvalid.astype(np.float32), mvalid.astype(np.float32)),
+        axis=1,
+    ).astype(np.float32)
+    if result.shape != (
+        len(query), MappingSurfaceCoordinateLocalCorrelationHead.LOCAL_CORRELATION_DIMENSION,
+    ):
+        raise AssertionError("local RADIO correlation dimension differs")
+    return result
+
+
+def _local_correlation_reference_gate(
+    current: dict[str, object], reference: dict[str, object],
+) -> tuple[bool, dict[str, object]]:
+    """Require the local head to dominate the frozen V11 held-route metrics."""
+    current_uv = current["chart_uv_offset"]
+    reference_uv = reference["chart_uv_offset"]
+    comparisons = {
+        "image_median_nonincrease": bool(
+            current["predicted_error_px"]["median"] <= reference["predicted_error_px"]["median"]
+        ),
+        "image_p90_nonincrease": bool(
+            current["predicted_error_px"]["p90"] <= reference["predicted_error_px"]["p90"]
+        ),
+        "image_nll_nonincrease": bool(
+            current["predicted_isotropic_gaussian_nll"]
+            <= reference["predicted_isotropic_gaussian_nll"]
+        ),
+        "chart_uv_median_nonincrease": bool(
+            current_uv["predicted_error_m"]["median"]
+            <= reference_uv["predicted_error_m"]["median"]
+        ),
+        "chart_uv_p90_nonincrease": bool(
+            current_uv["predicted_error_m"]["p90"]
+            <= reference_uv["predicted_error_m"]["p90"]
+        ),
+        "chart_uv_nll_nonincrease": bool(
+            current_uv["predicted_isotropic_gaussian_nll"]
+            <= reference_uv["predicted_isotropic_gaussian_nll"]
+        ),
+        "positive_negative_margin_nondecrease": bool(
+            current["positive_match_probability_mean"] - current["negative_match_probability_mean"]
+            >= reference["positive_match_probability_mean"]
+            - reference["negative_match_probability_mean"]
+        ),
+        "image_uncertainty_monotonic": bool(np.all(np.diff(
+            current["uncertainty_quantile_mean_error_px"],
+        ) >= 0.0)),
+        "chart_uv_uncertainty_monotonic": bool(np.all(np.diff(
+            current_uv["uncertainty_quantile_mean_error_m"],
+        ) >= 0.0)),
+    }
+    summary = {
+        "criteria": comparisons,
+        "image_median_delta_px": float(
+            current["predicted_error_px"]["median"] - reference["predicted_error_px"]["median"]
+        ),
+        "image_p90_delta_px": float(
+            current["predicted_error_px"]["p90"] - reference["predicted_error_px"]["p90"]
+        ),
+        "image_nll_delta": float(
+            current["predicted_isotropic_gaussian_nll"]
+            - reference["predicted_isotropic_gaussian_nll"]
+        ),
+        "chart_uv_median_delta_m": float(
+            current_uv["predicted_error_m"]["median"]
+            - reference_uv["predicted_error_m"]["median"]
+        ),
+        "chart_uv_p90_delta_m": float(
+            current_uv["predicted_error_m"]["p90"]
+            - reference_uv["predicted_error_m"]["p90"]
+        ),
+        "chart_uv_nll_delta": float(
+            current_uv["predicted_isotropic_gaussian_nll"]
+            - reference_uv["predicted_isotropic_gaussian_nll"]
+        ),
+    }
+    return bool(all(comparisons.values())), summary
+
+
+def _project_query_local_feature_grid(
+    query_rows: np.ndarray,
+    *,
+    observation: np.ndarray,
+    token_ids: np.ndarray,
+    raw_features: np.ndarray,
+    projection: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Project the same plane-observation's 3x3 RADIO token neighborhood.
+
+    The observation bank is plane specific, so a missing neighbor means that
+    the neighboring token is not part of the same physical-plane observation.
+    This mask is available at deployment from the query plane region itself.
+    """
+    rows = np.asarray(query_rows, np.int64).reshape(-1)
+    obs = np.asarray(observation, np.int64).reshape(-1)
+    token = np.asarray(token_ids, np.int64).reshape(-1)
+    raw = np.asarray(raw_features, np.float32)
+    weight = np.asarray(projection, np.float32)
+    if (
+        len(obs) != len(token) or raw.ndim != 2 or len(raw) != len(token)
+        or weight.ndim != 2 or raw.shape[1] != weight.shape[1]
+        or np.any((rows < 0) | (rows >= len(token)))
+    ):
+        raise ValueError("query local RADIO inventory differs")
+    key = obs.astype(np.int64) * int(np.prod(TOKEN_GRID)) + token
+    order = np.argsort(key, kind="stable")
+    sorted_key = key[order]
+    if np.any(sorted_key[1:] == sorted_key[:-1]):
+        raise ValueError("query plane observation contains duplicate RADIO tokens")
+    centre = token[rows]
+    cy, cx = np.divmod(centre, TOKEN_GRID[1])
+    neighbor_y = cy[:, None] + LOCAL_CORRELATION_OFFSETS_YX[None, :, 0]
+    neighbor_x = cx[:, None] + LOCAL_CORRELATION_OFFSETS_YX[None, :, 1]
+    inside = (
+        (neighbor_y >= 0) & (neighbor_y < TOKEN_GRID[0])
+        & (neighbor_x >= 0) & (neighbor_x < TOKEN_GRID[1])
+    )
+    neighbor_token = neighbor_y * TOKEN_GRID[1] + neighbor_x
+    target_key = obs[rows, None] * int(np.prod(TOKEN_GRID)) + neighbor_token
+    position = np.searchsorted(sorted_key, target_key)
+    clipped = np.minimum(position, max(len(sorted_key) - 1, 0))
+    valid = inside & (position < len(sorted_key))
+    if len(sorted_key):
+        valid &= sorted_key[clipped] == target_key
+    matched = np.zeros_like(position, dtype=np.int64)
+    matched[valid] = order[clipped[valid]]
+    unique = np.unique(matched[valid])
+    projected = np.zeros((len(token), weight.shape[0]), np.float32)
+    for start in range(0, len(unique), 8192):
+        selected = unique[start : start + 8192]
+        projected[selected] = _normalise(raw[selected] @ weight.T)
+    grid = projected[matched]
+    grid[~valid] = 0.0
+    return grid, valid
+
+
+def _view_cell_mean_features(raw_features, projection, identity, observation, representative_rows):
+    """Project each token before view/cell averaging; leave center inputs untouched."""
+    identity = np.asarray(identity, np.int64)
+    observation = np.asarray(observation, np.int64)
+    reps = np.asarray(representative_rows, np.int64)
+    if len(raw_features) != len(identity) or identity.shape != observation.shape:
+        raise ValueError("view-cell token inventory differs")
+    projected = np.empty((len(identity), projection.shape[0]), np.float32)
+    for lo in range(0, len(identity), 8192):
+        projected[lo:lo + 8192] = _normalise(
+            np.asarray(raw_features[lo:lo + 8192], np.float32) @ projection.T,
+        )
+    order = np.lexsort((observation, identity))
+    starts = np.flatnonzero(np.r_[True, (identity[order][1:] != identity[order][:-1])
+                                 | (observation[order][1:] != observation[order][:-1])])
+    counts = np.diff(np.r_[starts, len(order)])
+    means = _normalise(np.add.reduceat(projected[order], starts, axis=0) / counts[:, None])
+    lookup = {(int(identity[row]), int(observation[row])): i
+              for i, row in enumerate(order[starts])}
+    output = np.zeros_like(projected)
+    for row in reps:
+        output[row] = means[lookup[(int(identity[row]), int(observation[row]))]]
+    return output
+
+
+def _mapping_local_feature_grid(
+    query_rows: np.ndarray,
+    candidate_features: np.ndarray,
+    candidate_world: np.ndarray,
+    *,
+    leave_query_observation_out: bool,
+    representative_rows: np.ndarray,
+    representative_identity: np.ndarray,
+    identity_keys_plane_cell: np.ndarray,
+    observation: np.ndarray,
+    route_per_observation: np.ndarray,
+    fit_routes: set[str],
+    projected_features: np.ndarray,
+    plane_rows: np.ndarray,
+    plane_centers_world: np.ndarray,
+    plane_frames_world: np.ndarray,
+    cell_size_m: float = 0.5,
+    neighbor_policy: str = "canonical_mean",
+    maximum_neighbor_modes: int = 4,
+    minimum_neighbor_views: int = 1,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build a source-view-free local canonical map grid for each candidate."""
+    qrows = np.asarray(query_rows, np.int64).reshape(-1)
+    candidate = _normalise(np.asarray(candidate_features, np.float32))
+    candidate_xyz = np.asarray(candidate_world, np.float64).reshape(-1, 3)
+    reps = np.asarray(representative_rows, np.int64).reshape(-1)
+    rep_identity = np.asarray(representative_identity, np.int64).reshape(-1)
+    identity_keys = np.asarray(identity_keys_plane_cell, np.int64).reshape(-1, 3)
+    obs = np.asarray(observation, np.int64).reshape(-1)
+    route = np.asarray(route_per_observation).astype(str)
+    projected = np.asarray(projected_features, np.float32)
+    plane = np.asarray(plane_rows, np.int64).reshape(-1)
+    if (
+        len(qrows) != len(candidate) or len(qrows) != len(candidate_xyz)
+        or len(reps) != len(rep_identity) or len(obs) != len(plane)
+        or len(projected) != len(obs) or np.any((qrows < 0) | (qrows >= len(obs)))
+        or np.any((reps < 0) | (reps >= len(obs)))
+        or len(route) <= int(np.max(obs, initial=-1))
+    ):
+        raise ValueError("mapping local RADIO inventory differs")
+    fit_rep = np.isin(route[obs[reps]], sorted(fit_routes))
+    fit_rows = reps[fit_rep]
+    fit_identity = rep_identity[fit_rep]
+    if neighbor_policy not in ("canonical_mean", "atlas_modes_mean") or maximum_neighbor_modes < 1:
+        raise ValueError("invalid local neighbor policy")
+    grouped_rows = {}
+    for row, identity in zip(fit_rows.tolist(), fit_identity.tolist()):
+        grouped_rows.setdefault(identity, []).append(row)
+    mode_cache = {}
+    feature_sum = np.zeros((len(identity_keys), projected.shape[1]), np.float64)
+    feature_count = np.zeros(len(identity_keys), np.int64)
+    np.add.at(feature_sum, fit_identity, projected[fit_rows])
+    np.add.at(feature_count, fit_identity, 1)
+    per_observation: dict[tuple[int, int], int] = {
+        (int(identity), int(obs[row])): int(row)
+        for row, identity in zip(fit_rows.tolist(), fit_identity.tolist())
+    }
+    key_to_identity = {tuple(value.tolist()): index for index, value in enumerate(identity_keys)}
+    qplane = plane[qrows]
+    tangent = np.asarray(plane_frames_world, np.float64)[qplane, :2]
+    candidate_uv = np.einsum(
+        "ni,nji->nj",
+        candidate_xyz - np.asarray(plane_centers_world, np.float64)[qplane], tangent,
+    )
+    candidate_cell = np.floor(candidate_uv / float(cell_size_m)).astype(np.int64)
+    grid = np.zeros((len(qrows), 9, projected.shape[1]), np.float32)
+    valid = np.zeros((len(qrows), 9), bool)
+    for sample in range(len(qrows)):
+        for offset_index, (dy, dx) in enumerate(LOCAL_CORRELATION_OFFSETS_YX.tolist()):
+            if dy == 0 and dx == 0:
+                grid[sample, offset_index] = candidate[sample]
+                valid[sample, offset_index] = True
+                continue
+            key = (
+                int(qplane[sample]), int(candidate_cell[sample, 0] + dx),
+                int(candidate_cell[sample, 1] + dy),
+            )
+            identity = key_to_identity.get(key)
+            if identity is None:
+                continue
+            if neighbor_policy == "atlas_modes_mean":
+                excluded_obs = int(obs[qrows[sample]]) if leave_query_observation_out else -1
+                cache_key = (identity, excluded_obs)
+                if cache_key not in mode_cache:
+                    pool = np.asarray(sorted(grouped_rows.get(identity, [])), np.int64)
+                    pool = pool[obs[pool] != excluded_obs]
+                    if len(np.unique(obs[pool])) >= minimum_neighbor_views:
+                        modes = projected[pool][_diverse_mode_indices(
+                            projected[pool], maximum_neighbor_modes,
+                        )]
+                        # Atlas descriptors are persisted in float16 before runtime aggregation.
+                        modes = modes.astype(np.float16).astype(np.float32)
+                        mean = np.mean(modes, axis=0, dtype=np.float64).astype(np.float32)
+                        norm = float(np.linalg.norm(mean))
+                        if not np.isfinite(norm) or norm <= 1e-8:
+                            raise ValueError("atlas local RADIO descriptor is invalid")
+                        mode_cache[cache_key] = mean / norm
+                    else:
+                        mode_cache[cache_key] = None
+                value = mode_cache[cache_key]
+                if value is not None:
+                    grid[sample, offset_index] = value
+                    valid[sample, offset_index] = True
+                continue
+            total = feature_sum[identity].copy()
+            count = int(feature_count[identity])
+            if leave_query_observation_out:
+                excluded = per_observation.get((identity, int(obs[qrows[sample]])))
+                if excluded is not None:
+                    total -= projected[excluded]
+                    count -= 1
+            if count <= 0:
+                continue
+            grid[sample, offset_index] = _normalise(total / count)
+            valid[sample, offset_index] = True
+    return grid, valid
 
 
 def _undistort_simple_radial_xy(
@@ -403,6 +709,100 @@ def _mixture_offset_metrics(
     }
 
 
+def _freeze_coordinate_parameters(model):
+    count=0
+    for name,parameter in model.named_parameters():
+        trainable=name.startswith('match.')
+        parameter.requires_grad_(trainable)
+        count+=int(trainable)
+    if not count:
+        raise ValueError('model has no separate match layer')
+
+
+def _source_view_mode_pool(identity, source_views, world, features):
+    """Atlas-equivalent token pooling; each mode retains its own mean geometry."""
+    identity=np.asarray(identity); source_views=np.asarray(source_views)
+    if (identity.ndim != 1 or not len(identity) or source_views.shape != identity.shape
+            or np.shape(world) != (len(identity),3) or np.ndim(features) != 2
+            or len(features) != len(identity) or not np.isfinite(world).all()
+            or not np.isfinite(features).all()):
+        raise ValueError("source mode token inventory differs")
+    order=np.lexsort((source_views,identity))
+    keys=np.c_[identity[order],source_views[order]]
+    starts=np.flatnonzero(np.r_[True,np.any(keys[1:]!=keys[:-1],axis=1)])
+    counts=np.diff(np.r_[starts,len(order)])
+    feature=_normalise(np.add.reduceat(np.asarray(features,np.float32)[order],starts,axis=0)/counts[:,None])
+    point=np.add.reduceat(np.asarray(world,np.float64)[order],starts,axis=0)/counts[:,None]
+    return keys[starts],feature,point
+
+
+def _fit_source_view_mode_dataset(representatives, rep_identity, identity, observation,
+        source_view_per_observation, routes, fit_routes, validation_route, world,
+        all_projected, token_ids, poses, matrices, radial, maximum_modes):
+    source=source_view_per_observation[observation]
+    keys, features, points=_source_view_mode_pool(identity,source,world,all_projected)
+    source_route={int(v):str(routes[o]) for o,v in enumerate(source_view_per_observation)}
+    pool_by_identity={}
+    for i,key in enumerate(keys):
+        if source_route[int(key[1])] in fit_routes:
+            pool_by_identity.setdefault(int(key[0]),[]).append(i)
+    qs=[[],[]]; ms=[[],[]]; cache={}
+    counts={}
+    for query,ident in zip(representatives,rep_identity):
+        route=str(routes[observation[query]])
+        split=0 if route in fit_routes else 1 if route==validation_route else -1
+        if split<0:continue
+        countkey=(int(ident),split)
+        counts[countkey]=counts.get(countkey,0)+1
+        if counts[countkey]>MAXIMUM_QUERY_ROWS_PER_IDENTITY:continue
+        excluded=int(source[query]) if split==0 else -1
+        cachekey=(int(ident),excluded)
+        if cachekey not in cache:
+            pool=np.asarray(pool_by_identity.get(int(ident),[]),np.int64)
+            pool=pool[keys[pool,1]!=excluded]
+            cache[cachekey]=(pool[_diverse_mode_indices(features[pool],maximum_modes)]
+                             if len(pool)>=2 else np.zeros(0,np.int64))
+        selected=cache[cachekey]
+        qs[split].extend([int(query)]*len(selected));ms[split].extend(selected.tolist())
+    result={}
+    for split,prefix in enumerate(('fit','validation')):
+        q=np.asarray(qs[split],np.int64);m=np.asarray(ms[split],np.int64)
+        obs=observation[q]
+        pixel,depth=_project_world_to_pixel(points[m],poses[obs],matrices[obs],radial[obs])
+        target=pixel-_token_centres(token_ids[q])
+        keep=((depth>0)&np.isfinite(target).all(axis=1)&(np.max(np.abs(target),axis=1)<2.)
+              &(np.linalg.norm(world[q]-points[m],axis=1)<=MAXIMUM_POSITIVE_WORLD_DISTANCE_M))
+        result.update({prefix+'_query_rows':q[keep],prefix+'_map_features':features[m[keep]].astype(np.float32),
+                       prefix+'_map_world':points[m[keep]],prefix+'_targets':target[keep].astype(np.float32),
+                       prefix+'_map_source_views':keys[m[keep],1]})
+        if split==0 and np.any(source[q[keep]]==keys[m[keep],1]):
+            raise AssertionError('source view leaked into anonymous center')
+    pool=np.asarray([i for rows in pool_by_identity.values() for i in rows],np.int64)
+    result.update(negative_pool_features=features[pool].astype(np.float32),negative_pool_world=points[pool],
+                  negative_pool_source=keys[pool,1],negative_pool_identity=keys[pool,0])
+    return result
+
+
+def _isolated_null_indices(query_rows, map_world, map_source, observation, source_views, identity, plane, world):
+    """Same-plane, different-cell negatives; exclude the entire query source image."""
+    query_rows=np.asarray(query_rows); result=np.zeros(len(query_rows),np.int64)
+    valid=np.zeros(len(query_rows),bool)
+    qplane=plane[query_rows]; qcell=identity[query_rows]; qsource=source_views[observation[query_rows]]
+    for physical in np.unique(qplane):
+        rows=np.flatnonzero(qplane==physical)
+        for cell in np.unique(qcell[rows]):
+            queries=rows[qcell[rows]==cell]
+            for source in np.unique(qsource[queries]):
+                selected=queries[qsource[queries]==source]
+                pool=rows[(qcell[rows]!=cell)&(map_source[rows]!=source)]
+                if not len(pool):continue
+                center=np.mean(world[query_rows[selected]],axis=0)
+                far=pool[np.argmax(np.linalg.norm(map_world[pool]-center,axis=1))]
+                result[selected]=far
+                valid[selected]=np.linalg.norm(world[query_rows[selected]]-map_world[far],axis=1)>MAXIMUM_POSITIVE_WORLD_DISTANCE_M
+    return result,valid
+
+
 def _fit_mode_prototype_dataset(
     representative_rows: np.ndarray,
     representative_identity: np.ndarray,
@@ -487,6 +887,7 @@ def _fit_prototype_dataset(
     poses_w2c: np.ndarray,
     camera_matrices: np.ndarray,
     radial_coefficients: np.ndarray,
+    source_view_per_observation: np.ndarray | None = None,
 ) -> dict[str, np.ndarray]:
     order = np.lexsort((representative_rows, representative_identity))
     rows = representative_rows[order]; ids = representative_identity[order]
@@ -502,6 +903,26 @@ def _fit_prototype_dataset(
             continue
         fit = fit[:MAXIMUM_QUERY_ROWS_PER_IDENTITY]
         validation = validation[:MAXIMUM_QUERY_ROWS_PER_IDENTITY]
+        if source_view_per_observation is not None:
+            views = np.asarray(source_view_per_observation)[observation[fit]]
+            def source_mean(pool):
+                source = np.asarray(source_view_per_observation)[observation[pool]]
+                unique = np.unique(source)
+                if len(unique) < 2:
+                    return None
+                features = [_normalise(np.mean(projected_features[pool[source == v]], axis=0))
+                            for v in unique]
+                points = [np.mean(world[pool[source == v]], axis=0) for v in unique]
+                return _normalise(np.mean(features, axis=0)), np.mean(points, axis=0)
+            for query in fit.tolist():
+                value = source_mean(fit[views != source_view_per_observation[observation[query]]])
+                if value is not None:
+                    fit_q.append(query); fit_mf.append(value[0]); fit_mw.append(value[1])
+            value = source_mean(fit)
+            if value is not None:
+                for query in validation.tolist():
+                    val_q.append(query); val_mf.append(value[0]); val_mw.append(value[1])
+            continue
         total_feature = np.sum(projected_features[fit], axis=0, dtype=np.float64)
         total_world = np.sum(world[fit], axis=0, dtype=np.float64)
         for query in fit.tolist():
@@ -514,8 +935,9 @@ def _fit_prototype_dataset(
             val_q.append(query); val_mf.append(canonical_feature); val_mw.append(canonical_world)
 
     def finish(q: list[int], mf: list[np.ndarray], mw: list[np.ndarray]) -> tuple[np.ndarray, ...]:
-        qrow = np.asarray(q, np.int64); map_feature = np.asarray(mf, np.float32)
-        map_world = np.asarray(mw, np.float64)
+        qrow = np.asarray(q, np.int64)
+        map_feature = np.asarray(mf, np.float32).reshape(-1, projected_features.shape[1])
+        map_world = np.asarray(mw, np.float64).reshape(-1, 3)
         qobs = observation[qrow]
         pixel, depth = _project_world_to_pixel(
             map_world, poses_w2c[qobs], camera_matrices[qobs], radial_coefficients[qobs],
@@ -547,16 +969,29 @@ def main() -> None:
     parser.add_argument("--radio_projection", type=Path, required=True)
     parser.add_argument("--mapping_contributors", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--replay_head", type=Path, help="Replay frozen weights; no optimizer steps.")
+    parser.add_argument("--recalibrate_replay", action="store_true",
+                        help="Frozen-weight transfer audit on new prototype inputs; refit mapping calibration only.")
+    parser.add_argument("--match_only_finetune", action="store_true")
+    parser.add_argument("--output_joint_residual_bank", type=Path)
     parser.add_argument("--validation_route", default="seq9")
     parser.add_argument("--hidden_dimension", type=int, default=96)
     parser.add_argument("--steps", type=int, default=1200)
     parser.add_argument("--batch_size", type=int, default=512)
     parser.add_argument("--seed", type=int, default=260904)
     parser.add_argument(
-        "--prototype_policy", choices=("canonical_mean", "diverse_view_modes"),
+        "--prototype_policy", choices=("canonical_mean", "diverse_view_modes", "source_view_modes"),
         default="canonical_mean",
     )
     parser.add_argument("--maximum_prototypes_per_cell", type=int, default=4)
+    parser.add_argument("--source_isolated_nulls", action="store_true")
+    parser.add_argument("--null_mining_policy", choices=("legacy", "pool_far", "radio_topk"), default="legacy")
+    parser.add_argument("--local_neighbor_policy", choices=("canonical_mean", "atlas_modes_mean"),
+                        default="canonical_mean")
+    parser.add_argument("--local_neighbor_token_pooling", choices=("representative", "view_cell_mean"),
+                        default="representative")
+    parser.add_argument("--source_view_training_contract", action="store_true",
+                        help="Source-isolated centers, two-view support, image-disjoint calibration.")
     parser.add_argument(
         "--calibrate_coordinate_shrinkage", action="store_true",
         help="Fit one scalar on half of the held mapping route and evaluate on the other half.",
@@ -585,7 +1020,25 @@ def main() -> None:
         "--homography_context", action="store_true",
         help="Add a mapping-only coarse homography UV residual and validity bit.",
     )
+    parser.add_argument(
+        "--local_radio_correlation_context", action="store_true",
+        help="Add a candidate-conditioned 3x3 query-by-chart RADIO correlation volume.",
+    )
+    parser.add_argument(
+        "--reference_homography_head", type=Path,
+        help="Frozen V11 head whose held mapping metrics the local head must dominate.",
+    )
     args = parser.parse_args()
+    if args.recalibrate_replay and args.replay_head is None:
+        raise ValueError("recalibration requires frozen replay weights")
+    if args.match_only_finetune and not (args.replay_head is not None and args.recalibrate_replay):
+        raise ValueError("match-only training requires a source checkpoint and mapping recalibration")
+    if args.replay_head is not None:
+        if args.output.exists() or (args.output_joint_residual_bank is not None
+                                   and args.output_joint_residual_bank.exists()):
+            raise FileExistsError("refusing to overwrite frozen replay artifacts")
+        if args.output.resolve() == args.replay_head.resolve():
+            raise ValueError("replay must not overwrite the source checkpoint")
     if args.output.exists():
         raise FileExistsError("refusing to overwrite canonical subtoken head")
     if args.calibrate_coordinate_shrinkage and args.calibrate_coordinate_affine:
@@ -609,7 +1062,38 @@ def main() -> None:
         not args.geometric_context or args.deep_geometric_context
     ):
         raise ValueError("homography context requires the single-layer geometric context head")
+    if args.local_radio_correlation_context and not args.homography_context:
+        raise ValueError("local RADIO correlation requires homography context")
+    if args.local_neighbor_policy != "canonical_mean" and not args.local_radio_correlation_context:
+        raise ValueError("local neighbor policy requires local RADIO correlation")
+    if args.local_neighbor_token_pooling == "view_cell_mean" and (
+        not args.local_radio_correlation_context or args.local_neighbor_policy != "atlas_modes_mean"
+    ):
+        raise ValueError("view-cell pooling requires atlas-mode local correlation")
+    if args.local_radio_correlation_context != (args.reference_homography_head is not None):
+        raise ValueError("local RADIO correlation requires exactly one frozen V11 reference")
+    reference_meta = None
+    if args.reference_homography_head is not None:
+        _, reference_meta = load_mapping_subtoken_head(args.reference_homography_head)
+        if (
+            reference_meta.get("artifact_type")
+            != "goal_maplet_mapping_only_pairwise_radio_surface_coordinate_homography_context_head_v11"
+            or reference_meta.get("mapping_validation_gate_pass") is not True
+        ):
+            raise ValueError("local RADIO reference must be a validated V11 head")
+        if bool(reference_meta.get("source_view_training_contract", False)) != args.source_view_training_contract:
+            raise ValueError("frozen V11 source-view training contract differs")
+        if bool(reference_meta.get("source_isolated_nulls", False)) != args.source_isolated_nulls:
+            raise ValueError("frozen V11 negative sampling contract differs")
+        if reference_meta.get("null_mining_policy", "legacy") != args.null_mining_policy:
+            raise ValueError("frozen V11 negative mining policy differs")
     context_surface = bool(args.geometric_context)
+    if args.source_view_training_contract and args.prototype_policy not in ("canonical_mean", "source_view_modes"):
+        raise ValueError("source-view training contract requires canonical centers")
+    if args.source_view_training_contract and args.local_radio_correlation_context and (
+        args.local_neighbor_token_pooling != "view_cell_mean"
+    ):
+        raise ValueError("source-view local head requires view-cell pooling")
 
     visibility, visibility_meta = PlaneVisibilityAtlas.load_npz(args.visibility_atlas)
     planes = GeometryNativePlanarMap.load_npz(args.planar_map)
@@ -632,7 +1116,7 @@ def main() -> None:
         selected = np.flatnonzero(plane == row)
         uv[selected] = (world[selected] - planes.centers_world[row]) @ planes.frames_world[row, :2].T
     cell = np.floor(uv / 0.5).astype(np.int64)
-    _, identity = np.unique(np.c_[plane, cell], axis=0, return_inverse=True)
+    identity_keys, identity = np.unique(np.c_[plane, cell], axis=0, return_inverse=True)
     route_per_observation = np.asarray([str(name).split("__", 1)[0] for name in visibility.view_names.astype(str)])
     all_routes = set(route_per_observation.tolist()); fit_routes = all_routes - {str(args.validation_route)}
     if str(args.validation_route) not in all_routes or not fit_routes:
@@ -642,6 +1126,7 @@ def main() -> None:
     radial_coefficients = np.empty(len(visibility.view_names), np.float64)
     contributor_rows = []
     names = visibility.view_names.astype(str)
+    _, source_view_per_observation = np.unique(names, return_inverse=True)
     for name in sorted(set(names.tolist())):
         path = args.mapping_contributors / name
         _, pose, matrix, k1 = _load_contributor_geometry(path)
@@ -659,7 +1144,18 @@ def main() -> None:
     projected[representatives] = _normalise(
         np.asarray(bank["radio_features"][representatives], np.float32) @ projection.T,
     ).astype(np.float16)
-    if args.prototype_policy == "diverse_view_modes":
+    if args.prototype_policy == "source_view_modes":
+        if not args.source_view_training_contract:
+            raise ValueError("anonymous mode centers require source-view isolation")
+        all_projected=np.empty((len(world),projection.shape[0]),np.float32)
+        for lo in range(0,len(world),8192):
+            all_projected[lo:lo+8192]=_normalise(np.asarray(bank['radio_features'][lo:lo+8192],np.float32)@projection.T)
+        dataset=_fit_source_view_mode_dataset(representatives,rep_identity,identity,observation,
+            source_view_per_observation,route_per_observation,fit_routes,str(args.validation_route),world,
+            all_projected,token_ids,visibility.poses_w2c,camera_matrices,radial_coefficients,
+            int(args.maximum_prototypes_per_cell))
+        del all_projected
+    elif args.prototype_policy == "diverse_view_modes":
         dataset = _fit_mode_prototype_dataset(
             representatives, rep_identity, observation, route_per_observation,
             fit_routes, str(args.validation_route), world,
@@ -672,13 +1168,44 @@ def main() -> None:
             fit_routes, str(args.validation_route), world,
             projected.astype(np.float32), token_ids, visibility.poses_w2c,
             camera_matrices, radial_coefficients,
+            source_view_per_observation=(source_view_per_observation
+                                         if args.source_view_training_contract else None),
         )
     fit_q = dataset["fit_query_rows"]; val_q = dataset["validation_query_rows"]
+    null_indices={}; null_valid={}; mining_audit={}
+    for prefix,qrows in (("fit",fit_q),("validation",val_q)):
+        if args.source_isolated_nulls:
+            if args.prototype_policy != "source_view_modes":
+                raise ValueError("isolated nulls require source-mode provenance during training")
+            if args.null_mining_policy != "legacy":
+                from feature_extract.tools.vfm.mapping_retrieved_negatives import mine
+                null_indices[prefix],null_valid[prefix],mining_audit[prefix]=mine(
+                    qrows,projected[qrows].astype(np.float32),source_view_per_observation[observation[qrows]],
+                    identity[qrows],plane[qrows],world[qrows],dataset['negative_pool_features'],
+                    dataset['negative_pool_world'],dataset['negative_pool_source'],dataset['negative_pool_identity'],
+                    identity_keys[dataset['negative_pool_identity'],0],int(args.maximum_prototypes_per_cell),
+                    MAXIMUM_POSITIVE_WORLD_DISTANCE_M,args.null_mining_policy)
+            else:
+                null_indices[prefix],null_valid[prefix]=_isolated_null_indices(qrows,
+                    dataset[prefix+'_map_world'],dataset[prefix+'_map_source_views'],observation,
+                    source_view_per_observation,identity,plane,world)
+        else:
+            if args.null_mining_policy != "legacy":
+                raise ValueError("retrieved mining requires source-isolated nulls")
+            null_valid[prefix]=np.ones(len(qrows),bool)
+        if np.sum(null_valid[prefix]) < int(args.batch_size):
+            raise ValueError("insufficient valid mapping negative pairs")
     if min(len(fit_q), len(val_q)) < int(args.batch_size):
         raise ValueError("insufficient deployment-matched mapping-only pairs")
 
     # Local nulls are formed by rolling canonical prototypes within each physical plane.
     def null_map_features(query_rows: np.ndarray, positive_map: np.ndarray) -> np.ndarray:
+        if args.source_isolated_nulls:
+            prefix="fit" if query_rows is fit_q else "validation"
+            if args.null_mining_policy != "legacy":
+                key='negative_pool_world' if positive_map is dataset[prefix+'_map_world'] else 'negative_pool_features'
+                return dataset[key][null_indices[prefix]]
+            return positive_map[null_indices[prefix]]
         result = np.empty_like(positive_map)
         query_plane = plane[query_rows]
         for value in np.unique(query_plane):
@@ -690,6 +1217,23 @@ def main() -> None:
     val_null_map = null_map_features(val_q, dataset["validation_map_features"])
     fit_null_world = null_map_features(fit_q, dataset["fit_map_world"])
     val_null_world = null_map_features(val_q, dataset["validation_map_world"])
+    null_overlap_audit={}
+    for prefix,qrows,negative in (("fit",fit_q,fit_null_world),("validation",val_q,val_null_world)):
+        frame=planes.frames_world[plane[qrows],:2]
+        positive_uv=np.einsum('ni,nji->nj',dataset[prefix+'_map_world']-planes.centers_world[plane[qrows]],frame)
+        negative_uv=np.einsum('ni,nji->nj',negative-planes.centers_world[plane[qrows]],frame)
+        selected=null_valid[prefix]
+        null_overlap_audit[prefix]={'valid_count':int(selected.sum()),
+            'same_cell_fraction':float(np.mean(np.all(np.floor(positive_uv[selected]/.5)==np.floor(negative_uv[selected]/.5),axis=1))),
+            'within_positive_distance_fraction':float(np.mean(np.linalg.norm(world[qrows[selected]]-negative[selected],axis=1)<=MAXIMUM_POSITIVE_WORLD_DISTANCE_M))}
+        if args.prototype_policy == "source_view_modes":
+            legacy=np.arange(len(qrows))
+            for physical in np.unique(plane[qrows]):
+                grouped=np.flatnonzero(plane[qrows]==physical)
+                legacy[grouped]=np.roll(grouped,1)
+            null_overlap_audit[prefix]['legacy_rolled_same_identity_fraction']=float(np.mean(identity[qrows]==identity[qrows[legacy]]))
+            null_overlap_audit[prefix]['legacy_rolled_same_source_fraction']=float(np.mean(
+                dataset[prefix+'_map_source_views'][legacy]==source_view_per_observation[observation[qrows]]))
 
     fit_homography_uv = val_homography_uv = None
     fit_homography_valid = val_homography_valid = None
@@ -733,6 +1277,88 @@ def main() -> None:
         val_q, val_null_world, val_homography_uv, val_homography_valid,
     ) if context_surface else None
 
+    if args.local_radio_correlation_context:
+        neighbor_observation = observation
+        neighbor_routes = route_per_observation
+        neighbor_representatives = representatives
+        neighbor_identity = rep_identity
+        if args.local_neighbor_token_pooling == "view_cell_mean":
+            source_names, source_view = np.unique(visibility.view_names.astype(str), return_inverse=True)
+            neighbor_observation = source_view[observation]
+            neighbor_routes = np.asarray([name.split("__", 1)[0] for name in source_names])
+            # Multiple plane observations may belong to one source view.
+            # Their tokens form one anonymous view/cell mode, never duplicates.
+            pairs = np.c_[rep_identity, neighbor_observation[representatives]]
+            _, first = np.unique(pairs, axis=0, return_index=True)
+            neighbor_representatives = representatives[first]
+            neighbor_identity = rep_identity[first]
+        neighbor_projected = (
+            _view_cell_mean_features(bank["radio_features"], projection, identity,
+                                     neighbor_observation, neighbor_representatives)
+            if args.local_neighbor_token_pooling == "view_cell_mean"
+            else projected.astype(np.float32)
+        )
+        fit_query_grid, fit_query_valid = _project_query_local_feature_grid(
+            fit_q, observation=observation, token_ids=token_ids,
+            raw_features=bank["radio_features"], projection=projection,
+        )
+        val_query_grid, val_query_valid = _project_query_local_feature_grid(
+            val_q, observation=observation, token_ids=token_ids,
+            raw_features=bank["radio_features"], projection=projection,
+        )
+
+        def local_context(
+            qrows: np.ndarray, map_features: np.ndarray, map_world: np.ndarray,
+            query_grid: np.ndarray, query_valid: np.ndarray,
+            *, leave_query_observation_out: bool,
+        ) -> np.ndarray:
+            map_grid, map_valid = _mapping_local_feature_grid(
+                qrows, map_features, map_world,
+                leave_query_observation_out=leave_query_observation_out,
+                representative_rows=neighbor_representatives,
+                representative_identity=neighbor_identity,
+                identity_keys_plane_cell=identity_keys,
+                observation=neighbor_observation,
+                route_per_observation=neighbor_routes,
+                fit_routes=fit_routes,
+                projected_features=neighbor_projected,
+                plane_rows=plane,
+                plane_centers_world=planes.centers_world,
+                plane_frames_world=planes.frames_world,
+                neighbor_policy=args.local_neighbor_policy,
+                maximum_neighbor_modes=args.maximum_prototypes_per_cell,
+                minimum_neighbor_views=2 if args.source_view_training_contract else 1,
+            )
+            return _local_radio_correlation_volume(
+                query_grid, map_grid, query_valid, map_valid,
+            )
+
+        fit_local = local_context(
+            fit_q, dataset["fit_map_features"], dataset["fit_map_world"],
+            fit_query_grid, fit_query_valid, leave_query_observation_out=True,
+        )
+        fit_null_local = local_context(
+            fit_q, fit_null_map, fit_null_world,
+            fit_query_grid, fit_query_valid, leave_query_observation_out=True,
+        )
+        val_local = local_context(
+            val_q, dataset["validation_map_features"], dataset["validation_map_world"],
+            val_query_grid, val_query_valid, leave_query_observation_out=False,
+        )
+        val_null_local = local_context(
+            val_q, val_null_map, val_null_world,
+            val_query_grid, val_query_valid, leave_query_observation_out=False,
+        )
+        fit_context = np.c_[fit_context, fit_local].astype(np.float32)
+        fit_null_context = np.c_[fit_null_context, fit_null_local].astype(np.float32)
+        val_context = np.c_[val_context, val_local].astype(np.float32)
+        val_null_context = np.c_[val_null_context, val_null_local].astype(np.float32)
+        expected = MappingSurfaceCoordinateLocalCorrelationHead.CONTEXT_DIMENSION
+        if any(value.shape[1] != expected for value in (
+            fit_context, fit_null_context, val_context, val_null_context,
+        )):
+            raise AssertionError("local RADIO context dimension differs")
+
     def surface_targets(qrows: np.ndarray, map_world: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         qobs = observation[qrows]
         pixel, depth = _project_world_to_pixel(
@@ -767,6 +1393,10 @@ def main() -> None:
         if mixture_surface else
         MappingSurfaceCoordinateDeepContextHead(projection.shape[0], int(args.hidden_dimension))
         if args.deep_geometric_context else
+        MappingSurfaceCoordinateLocalCorrelationHead(
+            projection.shape[0], int(args.hidden_dimension),
+        )
+        if args.local_radio_correlation_context else
         MappingSurfaceCoordinateHomographyContextHead(
             projection.shape[0], int(args.hidden_dimension),
         )
@@ -777,10 +1407,41 @@ def main() -> None:
         if args.predict_chart_uv else
         MappingSubtokenHead(projection.shape[0], int(args.hidden_dimension))
     ).to(device)
+    replay_meta = None
+    if args.replay_head is not None:
+        frozen_model, replay_meta = load_mapping_subtoken_head(args.replay_head)
+        if not args.source_view_training_contract or not args.predict_chart_uv or mixture_surface:
+            raise ValueError("replay requires source-isolated single-UV surface head")
+        for key, expected in (
+            ("source_view_training_contract", True),
+            ("seed", int(args.seed)),
+            ("validation_mapping_route", str(args.validation_route)),
+            ("prototype_policy", str(args.prototype_policy)),
+            ("source_isolated_nulls", bool(args.source_isolated_nulls)),
+            ("null_mining_policy", str(args.null_mining_policy)),
+            ("local_radio_neighbor_policy", str(args.local_neighbor_policy)),
+            ("local_radio_neighbor_token_pooling", str(args.local_neighbor_token_pooling)),
+            ("visibility_atlas_file_sha256", file_sha256(args.visibility_atlas)),
+            ("observation_bank_file_sha256", file_sha256(args.observation_bank)),
+            ("planar_map_file_sha256", file_sha256(args.planar_map)),
+            ("radio_projection_file_sha256", file_sha256(args.radio_projection)),
+            ("mapping_contributor_inventory_sha256", contributor_inventory_sha),
+        ):
+            if key in ("prototype_policy", "source_isolated_nulls", "null_mining_policy") and args.recalibrate_replay:
+                continue
+            if key == "null_mining_policy" and replay_meta.get(key,"legacy") == expected:
+                continue
+            if key == "source_isolated_nulls" and bool(replay_meta.get(key, False)) == expected:
+                continue
+            if replay_meta.get(key) != expected:
+                raise ValueError(f"frozen replay contract differs: {key}")
+        model.load_state_dict(frozen_model.state_dict(), strict=True)
+        if args.match_only_finetune:
+            _freeze_coordinate_parameters(model)
     optimizer = torch.optim.AdamW(model.parameters(), lr=2e-3, weight_decay=1e-4)
     rng = np.random.default_rng(int(args.seed)); losses = []
     qfeature = projected
-    for step in range(int(args.steps)):
+    for step in range(0 if args.replay_head is not None and not args.match_only_finetune else int(args.steps)):
         rows = rng.integers(0, len(fit_q), size=int(args.batch_size))
         q = torch.from_numpy(qfeature[fit_q[rows]].astype(np.float32)).to(device)
         m = torch.from_numpy(dataset["fit_map_features"][rows]).to(device)
@@ -821,7 +1482,9 @@ def main() -> None:
                 nll = nll + (0.5 * uv_error2 / uv_variance + torch.log(uv_variance)).mean()
         loss = nll + 0.5 * F.smooth_l1_loss(mean, target, beta=0.25) + 0.5 * (
             F.binary_cross_entropy_with_logits(positive_logit, torch.ones_like(positive_logit))
-            + F.binary_cross_entropy_with_logits(negative_logit, torch.zeros_like(negative_logit))
+            + (F.binary_cross_entropy_with_logits(negative_logit, torch.zeros_like(negative_logit),reduction='none').reshape(-1)
+               * torch.from_numpy(null_valid['fit'][rows].astype(np.float32)).to(device)).sum()
+              / max(int(np.sum(null_valid['fit'][rows])),1)
         )
         optimizer.zero_grad(set_to_none=True); loss.backward(); optimizer.step()
         losses.append(float(loss.detach().cpu()))
@@ -868,7 +1531,10 @@ def main() -> None:
             if args.predict_chart_uv else
             (means, variances, pp, npv)
         )
-        return tuple(np.concatenate(value) for value in values)
+        prediction=list(np.concatenate(value) for value in values)
+        prefix="fit" if qrows is fit_q else "validation"
+        prediction[-1]=np.where(null_valid[prefix].reshape(prediction[-1].shape),prediction[-1],np.nan)
+        return tuple(prediction)
 
     def evaluate(
         targets: np.ndarray,
@@ -888,7 +1554,7 @@ def main() -> None:
         )
         result=_metrics(targets[selected],calibrated,variance[selected])
         result["positive_match_probability_mean"]=float(np.mean(pp[selected]))
-        result["negative_match_probability_mean"]=float(np.mean(npv[selected]))
+        result["negative_match_probability_mean"]=float(np.nanmean(npv[selected]))
         return result
 
     fit_prediction = predict(
@@ -910,6 +1576,8 @@ def main() -> None:
     validation_evaluation_rows: np.ndarray | None = None
     if args.calibrate_coordinate_shrinkage or args.calibrate_coordinate_affine:
         validation_observations = observation[val_q]
+        if args.source_view_training_contract:
+            validation_observations = source_view_per_observation[validation_observations]
         unique_observations = np.unique(validation_observations)
         calibration_observations = unique_observations[::2]
         evaluation_observations = unique_observations[1::2]
@@ -1098,8 +1766,29 @@ def main() -> None:
         base_coordinate_gate = bool(
             base_coordinate_gate and validation_metrics["relative_median_improvement"] >= 0.05
         )
-    gate=bool(base_coordinate_gate
-              and affine_vs_scalar_gate and surface_coordinate_gate)
+    local_reference_gate = True
+    local_reference_summary = None
+    if args.local_radio_correlation_context:
+        assert reference_meta is not None
+        if bool(reference_meta.get("source_view_training_contract", False)) != args.source_view_training_contract:
+            raise ValueError("frozen V11 source-view training contract differs")
+        if any(reference_meta.get(key) != value for key, value in (
+            ("observation_bank_content_sha256", bank_meta.get("content_sha256")),
+            ("visibility_atlas_content_sha256", visibility_meta.get("content_sha256")),
+            ("planar_map_file_sha256", file_sha256(args.planar_map)),
+            ("radio_projection_content_sha256", projection_meta.get("content_sha256")),
+            ("fit_mapping_routes", sorted(fit_routes)),
+            ("validation_mapping_route", str(args.validation_route)),
+            ("validation_metrics_observation_partition", "odd_sorted_validation_source_views"
+             if args.source_view_training_contract else "odd_sorted_validation_mapping_observations"),
+            ("prototype_policy", str(args.prototype_policy)),
+        )):
+            raise ValueError("frozen V11 reference split or lineage differs")
+        local_reference_gate, local_reference_summary = _local_correlation_reference_gate(
+            validation_metrics, reference_meta["validation_metrics"],
+        )
+    gate=bool(base_coordinate_gate and affine_vs_scalar_gate
+              and surface_coordinate_gate and local_reference_gate)
     arrays=_state_arrays(model)
     metadata: dict[str, object]={
         "artifact_type":(
@@ -1107,6 +1796,8 @@ def main() -> None:
             if mixture_surface
             else "goal_maplet_mapping_only_pairwise_radio_surface_coordinate_deep_context_head_v10"
             if args.deep_geometric_context
+            else "goal_maplet_mapping_only_pairwise_radio_surface_coordinate_local_correlation_head_v12"
+            if args.local_radio_correlation_context
             else "goal_maplet_mapping_only_pairwise_radio_surface_coordinate_homography_context_head_v11"
             if args.homography_context
             else "goal_maplet_mapping_only_pairwise_radio_surface_coordinate_context_head_v9"
@@ -1130,11 +1821,24 @@ def main() -> None:
             else "fit_query_token_to_leave_observation_out_fit_canonical_prototype_projection; validation_seq9_query_to_nonseq9_canonical_prototype_projection"
         ),
         "canonical_prototype":(
+            "all_token_source_view_cell_means_then_medoid_farthest_modes_with_own_mean_world_and_full_source_exclusion"
+            if args.prototype_policy == "source_view_modes" else
             "atlas_exact_medoid_then_farthest_anonymous_view_mode_RADIO64_and_mode_specific_metric_world_point_per_finite_plane_0.5m_cell"
             if args.prototype_policy == "diverse_view_modes"
             else "l2_normalized_mean_RADIO64_and_mean_metric_world_point_per_finite_plane_0.5m_cell"
         ),
         "prototype_policy":str(args.prototype_policy),
+        "source_isolated_nulls":bool(args.source_isolated_nulls),
+        "null_mining_policy":str(args.null_mining_policy),
+        "retrieved_negative_audit":mining_audit,
+        "null_overlap_audit":null_overlap_audit,
+        "null_valid_pair_counts":{k:int(v.sum()) for k,v in null_valid.items()},
+        "center_mode_token_pooling":("all_tokens_per_source_view_cell" if args.prototype_policy == "source_view_modes" else "legacy_representative"),
+        "center_mode_geometry_binding":("selected_mode_own_mean_world" if args.prototype_policy == "source_view_modes" else "legacy"),
+        "center_mode_exclusion":("entire_source_image_before_mode_selection" if args.prototype_policy == "source_view_modes" else "legacy"),
+        "mapping_recalibration_transfer_audit":bool(args.recalibrate_replay),
+        "source_view_training_contract":bool(args.source_view_training_contract),
+        "minimum_neighbor_independent_views":2 if args.source_view_training_contract else 1,
         "maximum_prototypes_per_cell":int(args.maximum_prototypes_per_cell),
         "chart_uv_mixture_modes":int(args.chart_uv_mixture_modes),
         "chart_uv_mixture_semantics":(
@@ -1144,20 +1848,55 @@ def main() -> None:
         "geometric_context_enabled":context_surface,
         "geometric_context_network_depth":2 if args.deep_geometric_context else 1 if context_surface else 0,
         "geometric_context_semantics":(
+            "SIMPLE_RADIAL_undistorted_token_center_xy_plus_prototype_metric_cell_phase_uv_plus_absolute_query_plane_ray_incidence_plus_frozen_coarse_homography_normalized_UV_residual_and_validity_plus_candidate_conditioned_3x3_query_by_3x3_chart_RADIO64_cosine_volume_and_validity"
+            if args.local_radio_correlation_context else
             "SIMPLE_RADIAL_undistorted_token_center_xy_plus_prototype_metric_cell_phase_uv_plus_absolute_query_plane_ray_incidence_plus_frozen_coarse_homography_normalized_UV_residual_and_validity"
             if args.homography_context else
             "SIMPLE_RADIAL_undistorted_token_center_xy_plus_prototype_metric_cell_phase_uv_plus_absolute_query_plane_ray_incidence"
             if context_surface else "none"
         ),
         "geometric_context_dimension":(
-            MappingSurfaceCoordinateHomographyContextHead.CONTEXT_DIMENSION
-            if args.homography_context else
+            MappingSurfaceCoordinateLocalCorrelationHead.CONTEXT_DIMENSION
+            if args.local_radio_correlation_context else
+            MappingSurfaceCoordinateHomographyContextHead.CONTEXT_DIMENSION if args.homography_context else
             MappingSurfaceCoordinateContextHead.CONTEXT_DIMENSION if context_surface else 0
         ),
         "homography_context_enabled":bool(args.homography_context),
         "homography_context_threshold_m":(
             HOMOGRAPHY_CONTEXT_THRESHOLD_M if args.homography_context else None
         ),
+        "local_radio_correlation_context_enabled":bool(args.local_radio_correlation_context),
+        "local_radio_correlation_context_dimension":(
+            MappingSurfaceCoordinateLocalCorrelationHead.LOCAL_CORRELATION_DIMENSION
+            if args.local_radio_correlation_context else 0
+        ),
+        "local_radio_correlation_offsets_yx":(
+            LOCAL_CORRELATION_OFFSETS_YX.tolist()
+            if args.local_radio_correlation_context else None
+        ),
+        "local_radio_correlation_semantics":(
+            "row_major_query_3x3_by_chart_metric_cell_3x3_RADIO64_cosines_then_query_and_map_validity;fit_map_neighborhood_excludes_entire_query_observation;validation_map_uses_fit_routes_only"
+            if args.local_radio_correlation_context else "none"
+        ),
+        "local_radio_candidate_conditioned":bool(args.local_radio_correlation_context),
+        "local_radio_neighbor_policy":str(args.local_neighbor_policy),
+        "local_radio_neighbor_token_pooling":str(args.local_neighbor_token_pooling),
+        "local_radio_neighbor_exclusion_unit":(
+            "entire_source_view" if args.local_neighbor_token_pooling == "view_cell_mean"
+            else "plane_observation"
+        ),
+        "local_radio_neighbor_maximum_modes":int(args.maximum_prototypes_per_cell),
+        "local_radio_reference_head_file_sha256":(
+            file_sha256(args.reference_homography_head)
+            if args.reference_homography_head is not None else None
+        ),
+        "local_radio_reference_head_content_sha256":(
+            reference_meta.get("content_sha256") if reference_meta is not None else None
+        ),
+        "local_radio_v11_relative_gate_pass":(
+            bool(local_reference_gate) if args.local_radio_correlation_context else None
+        ),
+        "local_radio_v11_relative_gate":local_reference_summary,
         "coordinate_shrinkage":float(shrinkage),
         "coordinate_affine_matrix":None if affine_matrix is None else affine_matrix.tolist(),
         "coordinate_affine_bias_px":None if affine_bias is None else affine_bias.tolist(),
@@ -1174,7 +1913,8 @@ def main() -> None:
         ),
         "coordinate_shrinkage_calibration_pair_count":int(shrinkage_calibration_count),
         "validation_metrics_observation_partition":(
-            "odd_sorted_validation_mapping_observations"
+            ("odd_sorted_validation_source_views" if args.source_view_training_contract
+             else "odd_sorted_validation_mapping_observations")
             if args.calibrate_coordinate_shrinkage or args.calibrate_coordinate_affine
             else "all_validation_mapping_observations"
         ),
@@ -1188,7 +1928,8 @@ def main() -> None:
             if args.predict_chart_uv else
             "isotropic_centroid_measurement_variance_px2_not_map_surface_footprint"
         ),
-        "null_output":"pair_match_probability_with_same_plane_rolled_canonical_prototype_negatives",
+        "null_output":("pair_score_with_same_plane_different_cell_source_excluded_far_negatives_not_deployment_calibrated_probability"
+                       if args.source_isolated_nulls else "pair_match_probability_with_same_plane_rolled_canonical_prototype_negatives"),
         "fit_mapping_routes":sorted(fit_routes),"validation_mapping_route":str(args.validation_route),
         "validation_prototype_routes":sorted(fit_routes),"validation_route_absent_from_prototypes":True,
         "fit_validation_route_disjoint":True,"query_rgb_pose_depth_or_ground_truth_read":False,
@@ -1196,6 +1937,8 @@ def main() -> None:
         "fit_positive_pair_count":int(len(fit_q)),"validation_positive_pair_count":int(len(val_q)),
         "fit_metrics":fit_metrics,"validation_metrics":validation_metrics,
         "mapping_validation_gate_definition":(
+            "base_surface_coordinate_gate_AND_frozen_V11_nonincrease_for_image_median_p90_NLL_chartUV_median_p90_NLL_AND_match_margin_nondecrease_AND_both_uncertainties_monotonic"
+            if args.local_radio_correlation_context else
             "subpixel_NLL_better_AND_chartUV_posterior_mean_median_improvement>=5pct_AND_p90_nonincrease_AND_better_fraction>0.5_AND_best_mode_median_improvement>=10pct_AND_effective_modes>=1.25_AND_mixture_NLL_better_than_zero_offset_AND_both_uncertainties_monotonic"
             if mixture_surface else
             "subpixel_NLL_better_than_token_center_AND_p90_nonincrease_AND_uncertainty_monotonic_AND_chartUV_median_improvement>=5pct_AND_chartUV_NLL_better_than_zero_offset_AND_chartUV_p90_nonincrease_AND_chartUV_uncertainty_monotonic"
@@ -1210,6 +1953,40 @@ def main() -> None:
         "mapping_contributor_inventory_sha256":contributor_inventory_sha,"arrays_sha256":arrays_sha256(arrays),
     }
     metadata["content_sha256"]=canonical_json_sha256(metadata)
+    if replay_meta is not None:
+        if args.match_only_finetune:
+            for name,value in model.state_dict().items():
+                if not name.startswith('match.') and not torch.equal(value.cpu(),frozen_model.state_dict()[name].cpu()):
+                    raise AssertionError('match-only training changed coordinate weights: '+name)
+        for key in ("arrays_sha256", "coordinate_shrinkage", "measurement_variance_scale",
+                    "chart_uv_measurement_variance_scale", "chart_uv_coordinate_shrinkage"):
+            if args.match_only_finetune and key == "arrays_sha256":
+                continue
+            if args.recalibrate_replay and key != "arrays_sha256":
+                continue
+            if metadata[key] != replay_meta[key]:
+                raise ValueError(f"frozen replay predictions/calibration differ: {key}")
+        metadata["replay_head_content_sha256"] = replay_meta["content_sha256"]
+        metadata["optimizer_steps_this_run"] = int(args.steps) if args.match_only_finetune else 0
+        metadata["match_only_finetune"] = bool(args.match_only_finetune)
+        metadata["nonmatch_weights_asserted_identical"] = bool(args.match_only_finetune)
+        metadata.pop("content_sha256")
+        metadata["content_sha256"] = canonical_json_sha256(metadata)
+    if args.output_joint_residual_bank is not None:
+        if (validation_evaluation_rows is None or not args.source_view_training_contract
+                or not args.predict_chart_uv or mixture_surface):
+            raise ValueError("joint residual export requires source-isolated single-UV disjoint calibration")
+        from feature_extract.tools.vfm.calibrate_goal_maplet_joint_reprojection import export_bank
+        export_bank(
+            args.output_joint_residual_bank, validation_prediction, shrinkage,
+            variance_scale, uv_coordinate_shrinkage, uv_variance_scale,
+            dataset["validation_map_world"], world[val_q], plane[val_q], planes,
+            _token_centres(token_ids[val_q]), observation[val_q],
+            source_view_per_observation[observation[val_q]], visibility.poses_w2c,
+            camera_matrices, radial_coefficients, calibration_rows,
+            validation_evaluation_rows, (replay_meta["content_sha256"]
+                if replay_meta is not None and not args.recalibrate_replay else metadata["content_sha256"]),
+        )
     args.output.parent.mkdir(parents=True,exist_ok=True)
     np.savez_compressed(args.output,**arrays,metadata_json=np.asarray(json.dumps(metadata,sort_keys=True)))
     print(json.dumps(metadata,indent=2))

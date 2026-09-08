@@ -3,11 +3,13 @@ from __future__ import annotations
 import numpy as np
 
 from feature_extract.tools.vfm.build_goal_maplet_plane_uv_radio_correspondences import (
+    _atlas_local_cell_feature_lookup,
     _clip_chart_coordinate_to_original_cell,
     _core_seeded_metric_homography_filter,
     _metric_homography_filter,
     _metric_homography_filter_with_projection,
     _region_token_measurements,
+    _runtime_local_radio_context,
     _top_distinct_hypotheses,
 )
 from feature_extract.tools.vfm.train_goal_maplet_mapping_subtoken_head import MappingSubtokenHead
@@ -85,3 +87,26 @@ def test_mapping_pair_head_measurement_is_hypothesis_specific() -> None:
     assert not torch.equal(mean[0], mean[1])
     assert torch.all(variance > 0)
     assert torch.all((torch.sigmoid(probability) >= 0) & (torch.sigmoid(probability) <= 1))
+
+
+def test_runtime_local_correlation_uses_anonymous_cell_mean_and_region_mask() -> None:
+    feature = np.asarray(
+        [[1.0, 0.0], [0.8, 0.2], [0.0, 1.0]], np.float32,
+    )
+    lookup = _atlas_local_cell_feature_lookup(
+        np.asarray([0, 3]),
+        np.asarray([[0.10, 0.10], [0.20, 0.20], [0.60, 0.10]]),
+        np.asarray([0, 0, 1]), feature, 0.5,
+    )
+    query = np.zeros((36 * 64, 2), np.float32)
+    query[65] = [1.0, 0.0]; query[66] = [0.0, 1.0]
+    context = _runtime_local_radio_context(
+        query, np.asarray([65]), np.asarray([7]), {7: np.asarray([65, 66])},
+        np.asarray([[1.0, 0.0]], np.float32), np.asarray([[0.10, 0.10]]),
+        np.asarray([0]), lookup, 0.5,
+    )
+    assert context.shape == (1, 99)
+    assert context[0, 4 * 9 + 4] == 1.0
+    assert context[0, 5 * 9 + 5] == 1.0
+    # A geometrically adjacent query token outside the selected plane region is masked.
+    assert context[0, 3 * 9 + 4] == 0.0

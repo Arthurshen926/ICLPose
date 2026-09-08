@@ -206,6 +206,30 @@ def _pose_step(initial: np.ndarray, final: np.ndarray) -> tuple[float, float]:
     return rotation, float(np.linalg.norm(final_center - initial_center))
 
 
+def _image_covariance(initial_pose, world, centroid, query_variance, purity, K, k1, isotropic,
+                      calibration=None):
+    """Propagate centroid covariance through the full radial image Jacobian."""
+    world = np.asarray(world, np.float64)
+    camera = world @ initial_pose[:3, :3].T + initial_pose[:3, 3]
+    _, jac = cv2.projectPoints(camera, np.zeros(3), np.zeros(3), K, np.asarray([k1, 0., 0., 0., 0.]))
+    spatial = jac[:, 3:6].reshape(-1, 2, 3) @ initial_pose[:3, :3]
+    cov = spatial @ centroid @ spatial.transpose(0, 2, 1)
+    if calibration is None:
+        cov += np.asarray(query_variance)[:, None, None] * np.eye(2)
+    else:
+        from feature_extract.tools.vfm.calibrate_goal_maplet_joint_reprojection import covariance
+        cov = covariance(
+            np.asarray(query_variance, np.float64)*calibration.get("query_variance_scale", 1.),
+            cov*calibration.get("projected_variance_scale", 1.),
+            calibration.get("rho", 0.), calibration.get("scale", 1.))
+    cov /= np.clip(purity, MINIMUM_PURITY, 1.)[:, None, None]
+    if isotropic:
+        cov = .5 * np.trace(cov, axis1=1, axis2=2)[:, None, None] * np.eye(2)
+    if not np.isfinite(cov).all() or np.any(np.linalg.eigvalsh(cov) <= 0):
+        raise ValueError("image covariance must be finite positive definite")
+    return cov
+
+
 def _refine_pose(
     pose_w2c: np.ndarray,
     world_points: np.ndarray,
@@ -214,6 +238,7 @@ def _refine_pose(
     reprojection_sigma_px: np.ndarray,
     camera_matrix: np.ndarray,
     radial_k1: float,
+    reprojection_covariance_px2: np.ndarray | None = None,
 ) -> tuple[np.ndarray, bool, dict[str, float | int | bool]]:
     """Bounded left-SE(3) robust solve on already frozen correspondences."""
 
@@ -234,6 +259,18 @@ def _refine_pose(
         diagnostics["solver_attempted"] = False
         return pose.copy(), False, diagnostics
     balance = _plane_balance_weights(plane)
+    whitening = None
+    if reprojection_covariance_px2 is not None:
+        covariance = np.asarray(reprojection_covariance_px2, np.float64)
+        if covariance.shape != (len(world), 2, 2) or not np.isfinite(covariance).all():
+            raise ValueError("full reprojection covariance differs")
+        if not np.allclose(covariance, covariance.transpose(0, 2, 1), atol=1e-10):
+            raise ValueError("full reprojection covariance is not symmetric")
+        values, vectors = np.linalg.eigh(covariance)
+        if np.any(values <= 0):
+            raise ValueError("full reprojection covariance is not positive definite")
+        whitening = (vectors * (1 / np.sqrt(values))[:, None, :]) @ vectors.transpose(0, 2, 1)
+    diagnostics["full_reprojection_covariance"] = whitening is not None
     distortion = np.asarray([radial_k1, 0.0, 0.0, 0.0, 0.0], np.float64)
 
     def candidate(parameter: np.ndarray) -> np.ndarray:
@@ -249,7 +286,9 @@ def _refine_pose(
             world, cv2.Rodrigues(output[:3, :3])[0], output[:3, 3],
             camera_matrix, distortion,
         )
-        normalized = (projected.reshape(-1, 2) - pixel) / sigma[:, None]
+        error = projected.reshape(-1, 2) - pixel
+        normalized = (error / sigma[:, None] if whitening is None
+                      else np.einsum("nij,nj->ni", whitening, error))
         return (normalized * balance[:, None]).reshape(-1)
 
     initial_parameter = np.zeros(6, np.float64)
@@ -328,12 +367,39 @@ def main() -> None:
         default="nearest_reprojection",
     )
     parser.add_argument("--output_frozen_pose_inventory", type=Path, required=True)
+    parser.add_argument("--reprojection_covariance_policy", choices=("isotropic", "full_centroid"),
+                        default="isotropic")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--mapping_covariance_calibration", type=Path)
+    parser.add_argument("--mapping_match_gate", type=Path,
+                        help="Mapping-only positive-recall score gate; not a Gaussian mixture prior.")
+    parser.add_argument("--mapping_covariance_model", choices=("scale_only", "separate_scales"),
+                        default="separate_scales")
     args = parser.parse_args()
     if args.output.exists() or args.output_frozen_pose_inventory.exists():
         raise FileExistsError("refusing to overwrite uncertainty refinement")
     poses, pose_metadata = _load_frozen_poses(args.frozen_pose_inventory)
     corr, corr_metadata = _load_correspondences(args.frozen_correspondences)
+    match_gate=None
+    if args.mapping_match_gate is not None:
+        match_gate=json.loads(args.mapping_match_gate.read_text())
+        if (match_gate['head_content_sha256'] != corr_metadata.get('mapping_subtoken_head_content_sha256')
+                or match_gate.get('query_data_used') is not False
+                or not 0. <= float(match_gate['threshold']) <= 1.):
+            raise ValueError('mapping match gate lineage differs')
+    covariance_calibration = None
+    if args.mapping_covariance_calibration is not None:
+        calibration_report = json.loads(args.mapping_covariance_calibration.read_text())
+        if (calibration_report["head_content_sha256"] != corr_metadata.get("mapping_subtoken_head_content_sha256")
+                or calibration_report["query_data_used"] is not False
+                or args.reprojection_covariance_policy != "full_centroid"):
+            raise ValueError("mapping covariance calibration lineage/policy mismatch")
+        covariance_calibration = calibration_report["models"][args.mapping_covariance_model]
+        base = calibration_report["models"]["independent"]["evaluation"]
+        candidate = covariance_calibration["evaluation"]
+        if not (candidate["nll"] < base["nll"] and
+                abs(candidate["coverage_90"]-.9) <= abs(base["coverage_90"]-.9)):
+            raise ValueError("mapping covariance calibration fails held-image gate")
     if corr_metadata.get("artifact_type") not in (
         "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v3",
         "goal_maplet_frozen_direct_plane_pnp_correspondence_inventory_v4",
@@ -400,10 +466,22 @@ def main() -> None:
             ),
         )
         fixed_count[index] = len(selected)
+        if match_gate is not None:
+            selected=selected[np.asarray(corr['correspondence_match_probability'][lo:hi])[selected]>=float(match_gate['threshold'])]
+            fixed_count[index]=len(selected)
         sigma = sigma_all[selected]
+        full_covariance = None
+        if args.reprojection_covariance_policy == "full_centroid":
+            if "prototype_centroid_covariance_world_m2" not in corr:
+                raise ValueError("full covariance requires centroid uncertainty")
+            full_covariance = _image_covariance(output_pose[index], world,
+                corr["prototype_centroid_covariance_world_m2"][lo:hi],
+                corr["query_measurement_variance_px2"][lo:hi],
+                corr["prototype_plane_pixel_purity"][lo:hi], K, k1, False,
+                calibration=covariance_calibration)[selected]
         refined, use, detail = _refine_pose(
             output_pose[index], world[selected], pixel[selected], provenance[selected, 1],
-            sigma, K, k1,
+            sigma, K, k1, reprojection_covariance_px2=full_covariance,
         )
         final_score = _score(refined, world, token, provenance, K, k1,
                              pixel if "query_measurements_xy" in corr else None)
@@ -443,6 +521,14 @@ def main() -> None:
         "arrays_sha256": arrays_sha256(arrays), "query_count": int(len(output_pose)),
         "query_pose_or_ground_truth_read": False,
         "fixed_hypothesis_selection_policy": str(args.hypothesis_selection_policy),
+        "reprojection_covariance_policy": str(args.reprojection_covariance_policy),
+        "mapping_match_gate":match_gate,
+        "mapping_match_gate_file_sha256":file_sha256(args.mapping_match_gate) if args.mapping_match_gate is not None else None,
+        "mapping_covariance_calibration_file_sha256": (
+            file_sha256(args.mapping_covariance_calibration)
+            if args.mapping_covariance_calibration is not None else None),
+        "mapping_covariance_model": (args.mapping_covariance_model if covariance_calibration is not None else None),
+        "mapping_covariance_parameters": covariance_calibration,
         "query_depth_or_scale_used_by_pose_solver": False,
         "source_rgb_stored_or_consumed_at_runtime": False,
         "source_view_identity_retained_at_runtime": False,
