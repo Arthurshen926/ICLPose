@@ -974,6 +974,7 @@ def main() -> None:
                         help="Frozen-weight transfer audit on new prototype inputs; refit mapping calibration only.")
     parser.add_argument("--match_only_finetune", action="store_true")
     parser.add_argument("--output_joint_residual_bank", type=Path)
+    parser.add_argument('--joint_reprojection_weight',type=float,default=0.)
     parser.add_argument("--validation_route", default="seq9")
     parser.add_argument("--hidden_dimension", type=int, default=96)
     parser.add_argument("--steps", type=int, default=1200)
@@ -1029,6 +1030,12 @@ def main() -> None:
         help="Frozen V11 head whose held mapping metrics the local head must dominate.",
     )
     args = parser.parse_args()
+    if not np.isfinite(args.joint_reprojection_weight) or args.joint_reprojection_weight<0:
+        raise ValueError('invalid joint coordinate loss weight')
+    if args.joint_reprojection_weight and (not args.predict_chart_uv or args.chart_uv_mixture_modes!=1):
+        raise ValueError('joint coordinate loss requires single candidate-anchored UV head')
+    if args.joint_reprojection_weight and args.match_only_finetune:
+        raise ValueError('joint coordinate loss is not a match-only training task')
     if args.recalibrate_replay and args.replay_head is None:
         raise ValueError("recalibration requires frozen replay weights")
     if args.match_only_finetune and not (args.replay_head is not None and args.recalibrate_replay):
@@ -1410,6 +1417,8 @@ def main() -> None:
     replay_meta = None
     if args.replay_head is not None:
         frozen_model, replay_meta = load_mapping_subtoken_head(args.replay_head)
+        if float(replay_meta.get('joint_reprojection_weight',0.))!=args.joint_reprojection_weight:
+            raise ValueError('replay joint coordinate loss contract differs')
         if not args.source_view_training_contract or not args.predict_chart_uv or mixture_surface:
             raise ValueError("replay requires source-isolated single-UV surface head")
         for key, expected in (
@@ -1486,6 +1495,20 @@ def main() -> None:
                * torch.from_numpy(null_valid['fit'][rows].astype(np.float32)).to(device)).sum()
               / max(int(np.sum(null_valid['fit'][rows])),1)
         )
+        if args.joint_reprojection_weight:
+            from feature_extract.tools.vfm.mapping_joint_coordinate_loss import joint_error
+            qrows=fit_q[rows];qobs=observation[qrows];qplane=plane[qrows]
+            pose=visibility.poses_w2c[qobs];anchor=dataset['fit_map_world'][rows]
+            frame=planes.frames_world[qplane,:2]
+            anchor_camera=np.einsum('nij,nj->ni',pose[:,:3,:3],anchor)+pose[:,:3,3]
+            tangent_camera=pose[:,:3,:3]@frame.transpose(0,2,1)
+            anchor_uv=np.einsum('ni,nji->nj',anchor-planes.centers_world[qplane],frame)
+            lower=(np.floor(anchor_uv/.5)*.5-anchor_uv).astype(np.float32)
+            upper=np.nextafter(lower+np.float32(.5),lower)
+            tensors=[torch.from_numpy(np.asarray(v,np.float32)).to(device) for v in
+                     [anchor_camera,tangent_camera,camera_matrices[qobs],radial_coefficients[qobs],lower,upper]]
+            error=joint_error(mean,target,uv_mean,uv_target,*tensors)
+            loss=loss+args.joint_reprojection_weight*F.smooth_l1_loss(error,torch.zeros_like(error),beta=.25)
         optimizer.zero_grad(set_to_none=True); loss.backward(); optimizer.step()
         losses.append(float(loss.detach().cpu()))
         if (step + 1) % 200 == 0:
@@ -1972,6 +1995,10 @@ def main() -> None:
         metadata["nonmatch_weights_asserted_identical"] = bool(args.match_only_finetune)
         metadata.pop("content_sha256")
         metadata["content_sha256"] = canonical_json_sha256(metadata)
+    if args.joint_reprojection_weight:
+        metadata['joint_reprojection_weight']=float(args.joint_reprojection_weight)
+        metadata['joint_reprojection_loss']='smooth_l1_joint_coordinate_error_on_same_anchor_tangent_sheet_not_raw_zero_reprojection'
+        metadata.pop('content_sha256',None);metadata['content_sha256']=canonical_json_sha256(metadata)
     if args.output_joint_residual_bank is not None:
         if (validation_evaluation_rows is None or not args.source_view_training_contract
                 or not args.predict_chart_uv or mixture_surface):

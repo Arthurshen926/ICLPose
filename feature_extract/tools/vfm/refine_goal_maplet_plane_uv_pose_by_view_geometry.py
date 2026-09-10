@@ -133,7 +133,7 @@ def main() -> None:
     parser.add_argument("--query_contributors", type=Path, required=True)
     parser.add_argument("--output_frozen_pose_inventory", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--solver_policy",choices=('legacy','unique_token_lm','token_ransac'),default='unique_token_lm')
+    parser.add_argument("--solver_policy",choices=('legacy','unique_token_lm','unique_token_guarded_lm','token_ransac'),default='unique_token_lm')
     parser.add_argument("--token_ransac_iterations",type=int,default=128)
     args = parser.parse_args()
     if args.output.exists() or args.output_frozen_pose_inventory.exists():
@@ -191,6 +191,7 @@ def main() -> None:
         )
         candidate = _solve(world, tokens, K, k1, keep, measurements,
                            unique_token_lm=args.solver_policy!='legacy',
+                           guard_lm=args.solver_policy=='unique_token_guarded_lm',
                            token_ransac_iterations=args.token_ransac_iterations if args.solver_policy=='token_ransac' else 0)
         if candidate is not None:
             candidate_global = _score(candidate, world, tokens, provenance, K, k1, measurements)

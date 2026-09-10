@@ -56,3 +56,45 @@ def test_lm_cannot_replace_pose_with_worse_unique_token_score(monkeypatch):
     monkeypatch.setattr(cv2,'solvePnPRefineLM',lambda *a,**kw:(np.zeros(3),np.array([100.,0.,0.])))
     pose=solve(world,tokens,K,.02,np.arange(len(world)),pixels)
     np.testing.assert_allclose(pose,np.eye(4),atol=1e-5)
+
+
+def test_guidance_is_duplicate_permutation_invariant_and_budget_matched():
+    world,tokens,pixels,K=fixture()
+    planes=tokens%3;scores=np.linspace(0,1,len(tokens));rows=np.arange(len(tokens));stats={}
+    first=solve(world,tokens,K,.02,rows,pixels,iterations=512,hypothesis_budget=64,
+                sampling_policy='geometry_score',planes=planes,scores=scores,stats=stats)
+    assert stats['scored_hypotheses']==64 and stats['budget_reached']
+    duplicate=np.r_[rows[::-1],rows[::2]]
+    second=solve(world[duplicate],tokens[duplicate],K,.02,np.arange(len(duplicate)),pixels[duplicate],
+                 iterations=512,hypothesis_budget=64,sampling_policy='geometry_score',
+                 planes=planes[duplicate],scores=scores[duplicate])
+    np.testing.assert_array_equal(first,second)
+
+
+def test_guided_samples_use_four_independent_tokens():
+    from feature_extract.tools.vfm.token_hypothesis_ransac import guided_sample
+    groups=[np.array([i,i+8]) for i in range(8)]
+    rng=np.random.default_rng(3)
+    for _ in range(100):
+        sample=guided_sample(rng,groups,np.c_[np.arange(8),np.zeros(8)],np.arange(16)%3,np.zeros(16),'geometry_score')
+        assert len(np.unique(sample%8))==4
+
+
+def test_opencv_lm_guard_retains_consensus_when_lm_proposal_is_bad(monkeypatch):
+    from feature_extract.tools.vfm.evaluate_goal_maplet_direct_plane_pnp_multihypothesis import _solve
+    world,tokens,pixels,K=fixture()
+    monkeypatch.setattr(cv2,'solvePnPRefineLM',lambda *a,**kw:(np.zeros(3),np.array([100.,0.,0.])))
+    stats={}
+    pose=_solve(world,tokens,K,.02,np.arange(20),pixels,guard_lm=True,sampling_stats=stats)
+    np.testing.assert_allclose(pose,np.eye(4),atol=1e-5)
+    assert not stats['lm_accepted']
+
+
+def test_equal_scores_are_exact_geometry_control_not_random_stream_change():
+    from feature_extract.tools.vfm.token_hypothesis_ransac import guided_sample
+    groups=[np.array([i,i+8]) for i in range(8)];centers=np.c_[np.arange(8),np.zeros(8)]
+    planes=np.arange(16)%3;scores=np.ones(16)
+    first=np.random.default_rng(5);second=np.random.default_rng(5)
+    for _ in range(50):
+        np.testing.assert_array_equal(guided_sample(first,groups,centers,planes,scores,'geometry'),
+                                      guided_sample(second,groups,centers,planes,scores,'geometry_score'))

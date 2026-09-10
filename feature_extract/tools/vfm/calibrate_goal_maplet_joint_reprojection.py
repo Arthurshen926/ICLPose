@@ -52,6 +52,8 @@ def export_bank(path, prediction, image_scale, variance_scale, uv_scale, uv_vari
     image_error = np.empty_like(residual)
     world_error = np.empty_like(residual)
     projected_cov = np.empty((len(anchor), 2, 2))
+    pose_jacobian = np.empty((len(anchor), 2, 6))
+    camera_points = np.empty((len(anchor), 3))
     offplane_image_error = np.empty_like(residual)
     for obs in np.unique(observations):
         rows = np.flatnonzero(observations == obs)
@@ -59,6 +61,8 @@ def export_bank(path, prediction, image_scale, variance_scale, uv_scale, uv_vari
         camera = predicted_world[rows] @ pose[:3, :3].T + pose[:3, 3]
         distortion = np.array([radial[obs], 0., 0., 0., 0.])
         projected, jac = cv2.projectPoints(camera, np.zeros(3), np.zeros(3), matrices[obs], distortion)
+        pose_jacobian[rows]=jac[:,:6].reshape(-1,2,6)
+        camera_points[rows]=camera
         target_camera = target_world[rows] @ pose[:3, :3].T + pose[:3, 3]
         target, _ = cv2.projectPoints(target_camera, np.zeros(3), np.zeros(3), matrices[obs], distortion)
         oracle_camera = oracle_world[rows] @ pose[:3, :3].T + pose[:3, 3]
@@ -78,6 +82,10 @@ def export_bank(path, prediction, image_scale, variance_scale, uv_scale, uv_vari
                         source_views=source_views, calibration_rows=calibration_rows, evaluation_rows=evaluation_rows,
                         head_content_sha256=np.asarray(head_hash),
                         positive_probability=prediction[-2], negative_probability=prediction[-1],
+                        plane_ids=plane_ids, observations=observations,
+                        token_ids=(np.floor(token_centers[:,1]/4)*64+np.floor(token_centers[:,0]/4)).astype(np.int64),
+                        pose_jacobian=pose_jacobian,camera_points=camera_points,
+                        pose_jacobian_semantics=np.asarray('prediction_derivative_left_camera_SE3_rotation_radians_then_translation_metres_at_mapping_pose'),
                         offplane_image_error=offplane_image_error, normal_residual_m=normal_residual_m)
 
 

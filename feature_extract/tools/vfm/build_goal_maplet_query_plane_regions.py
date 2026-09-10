@@ -14,6 +14,9 @@ def _work(job):
  source,output,base_path,carrier,config_payload=job;source,output=map(Path,(source,output));base_path=None if base_path is None else Path(base_path);config=SparseOcclusionCarrierConfig(**config_payload)
  if output.exists():
   value,meta=QueryPlaneRegions.load_npz(output)
+  if meta.get('source_file_sha256')!=_sha(source) or meta.get('uses_pose_or_ground_truth') is not False:raise ValueError('existing query-plane cache differs from MoGe source or pose-free contract')
+  expected_base=None if base_path is None else _sha(base_path)
+  if meta.get('base_query_plane_file_sha256')!=expected_base:raise ValueError('existing query-plane cache differs from base region source')
   if bool(meta.get('sparse_occlusion_carrier',False))!=bool(carrier) or (carrier and meta.get('carrier_diagnostics',{}).get('config')!=config.payload()):raise ValueError('existing query-plane cache has a different carrier contract')
   return output.name,len(value.normals_camera),int(value.pixel_counts.sum()),meta['content_sha256'],int(meta.get('carrier_diagnostics',{}).get('merged_component_count',0))
  with np.load(source,allow_pickle=False) as data:

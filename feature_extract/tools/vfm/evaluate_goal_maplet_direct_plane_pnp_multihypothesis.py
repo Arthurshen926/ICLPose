@@ -189,10 +189,13 @@ def _solve(
     rows: np.ndarray,
     query_measurements_xy: np.ndarray | None = None,
     *, unique_token_lm: bool = True, token_ransac_iterations: int = 0,
+    sampling_policy='uniform', hypothesis_budget=None, planes=None, scores=None, sampling_stats=None, guard_lm=False,
 ) -> np.ndarray | None:
     if token_ransac_iterations:
         from feature_extract.tools.vfm.token_hypothesis_ransac import solve
-        return solve(world,tokens,K,k1,rows,query_measurements_xy,iterations=token_ransac_iterations)
+        return solve(world,tokens,K,k1,rows,query_measurements_xy,iterations=token_ransac_iterations,
+                     sampling_policy=sampling_policy,hypothesis_budget=hypothesis_budget,
+                     planes=planes,scores=scores,stats=sampling_stats)
     if len(rows) < 6 or (unique_token_lm and len(np.unique(tokens[rows])) < 6):
         return None
     pixel_all = (
@@ -222,12 +225,21 @@ def _solve(
         selected=_unique_token_rows(selected,tokens,residual)
         if len(selected)<6:return None
     all_pixel = pixel_all[selected]
+    initial=np.eye(4);initial[:3,:3]=cv2.Rodrigues(rvec)[0];initial[:3,3]=np.asarray(tvec).reshape(3)
     rvec, tvec = cv2.solvePnPRefineLM(
         world[selected], all_pixel, K, distortion, rvec, tvec,
     )
     pose = np.eye(4, dtype=np.float64)
     pose[:3, :3] = cv2.Rodrigues(rvec)[0]
     pose[:3, 3] = np.asarray(tvec).reshape(3)
+    if guard_lm:
+        from feature_extract.tools.vfm.token_hypothesis_ransac import score_pose
+        local_tokens=tokens[rows];groups=[np.flatnonzero(local_tokens==t) for t in np.unique(local_tokens)]
+        before=score_pose(initial,world[rows],pixel_all[rows],groups,K,k1)[0]
+        after=score_pose(pose,world[rows],pixel_all[rows],groups,K,k1)[0] if np.isfinite(pose).all() else (-1,-np.inf)
+        accepted=after>before
+        if sampling_stats is not None:sampling_stats.update(lm_accepted=accepted,initial_unique_support=before[0],refined_unique_support=after[0])
+        return pose if accepted else initial
     return pose if np.isfinite(pose).all() else None
 
 
@@ -342,14 +354,19 @@ def main() -> None:
     parser.add_argument("--seed_group_support",choices=('row_count','unique_tokens'),default='unique_tokens')
     parser.add_argument("--output_frozen_candidates", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--solver_policy",choices=('legacy','unique_token_lm','token_ransac'),default='unique_token_lm')
+    parser.add_argument("--solver_policy",choices=('legacy','unique_token_lm','unique_token_guarded_lm','token_ransac'),default='unique_token_lm')
     parser.add_argument("--token_ransac_iterations",type=int,default=128)
+    parser.add_argument('--token_sampling_policy',choices=('uniform','geometry','geometry_score'),default='uniform')
+    parser.add_argument('--token_hypothesis_budget',type=int)
     parser.add_argument("--association_policy",choices=('all','match_top1','match_top1_per_plane','mapping_gate'),default='all')
     parser.add_argument("--mapping_match_gate",type=Path)
     args = parser.parse_args()
     if args.output.exists() or args.output_frozen_candidates.exists():
         raise FileExistsError("refusing to overwrite multi-hypothesis result")
     arrays, upstream = _load(args.frozen_correspondences)
+    if args.token_sampling_policy=='geometry_score' and (
+            args.association_policy!='all' or 'correspondence_match_probability' not in arrays):
+        raise ValueError('score-guided experiment requires full candidates and stored match scores')
     gate=None
     if args.association_policy=='mapping_gate':
         if args.mapping_match_gate is None:raise ValueError('mapping gate required')
@@ -361,6 +378,7 @@ def main() -> None:
     selected: dict[str, list[dict[str, object]]] = {rule: [] for rule in rules}
     all_candidates: list[list[dict[str, object]]] = []
     diagnostic_rows = []
+    sampling_records=[]
     for query_index, name in enumerate(arrays["names"].astype(str).tolist()):
         lo, hi = map(int, arrays["correspondence_offsets"][query_index:query_index + 2])
         world = arrays["world_points"][lo:hi]
@@ -385,9 +403,17 @@ def main() -> None:
             )
         candidates = []
         for origin, rows in seed_groups:
+            sampling_stats={'query_index':query_index,'origin':origin}
             pose = _solve(world, tokens, K, k1, rows, measurements,
                           unique_token_lm=args.solver_policy!='legacy',
-                          token_ransac_iterations=args.token_ransac_iterations if args.solver_policy=='token_ransac' else 0)
+                          guard_lm=args.solver_policy=='unique_token_guarded_lm',
+                          token_ransac_iterations=args.token_ransac_iterations if args.solver_policy=='token_ransac' else 0,
+                          sampling_policy=args.token_sampling_policy,hypothesis_budget=args.token_hypothesis_budget,
+                          planes=provenance[:,1],
+                          scores=(arrays['correspondence_match_probability'][lo:hi]
+                                  if args.association_policy=='all' and 'correspondence_match_probability' in arrays else None),
+                          sampling_stats=sampling_stats)
+            if args.solver_policy in ('token_ransac','unique_token_guarded_lm'):sampling_records.append(sampling_stats)
             if pose is None:
                 continue
             score = _score(pose, score_world, score_tokens, score_provenance, K, k1, score_measurements)
@@ -441,6 +467,10 @@ def main() -> None:
         "solver_policy":args.solver_policy,"association_policy":args.association_policy,
         "seed_group_support":args.seed_group_support,
         "token_ransac_iterations":args.token_ransac_iterations if args.solver_policy=='token_ransac' else None,
+        'token_sampling_policy':args.token_sampling_policy,
+        'token_sampling_implementation':'plane_first_spatial_score_token_priority_v2_shared_rng',
+        'token_hypothesis_budget':args.token_hypothesis_budget,
+        'sampling_records':sampling_records,
         "mapping_match_gate":gate,
         "candidate_scoring_population":"all_original_correspondences_unique_token_support",
         "legacy_view_support_fields":"third_provenance_support_not_independent_view_evidence_for_metric_atlas",
