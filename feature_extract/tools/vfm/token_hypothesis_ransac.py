@@ -6,6 +6,8 @@ import time
 
 def guided_sample(rng, groups, centers, planes, scores, policy, plane_groups=None, group_ids=None):
     """Retain 50% uniform exploration; guide sampling, never remove candidates."""
+    if policy == 'row_uniform':
+        return rng.choice(np.concatenate(groups),4,replace=False)
     if policy == 'uniform' or rng.random() < .5:
         chosen=rng.choice(len(groups),4,replace=False)
         return np.array([groups[g][rng.integers(len(groups[g]))] for g in chosen])
@@ -69,7 +71,7 @@ def score_pose(pose,world,pixels,groups,K,k1,threshold=4.,group_starts=None,retu
 def solve(world,tokens,K,k1,rows,pixels=None,iterations=128,seed=260901,
           sampling_policy='uniform',planes=None,scores=None,hypothesis_budget=None,stats=None):
     started=time.perf_counter()
-    if sampling_policy not in ('uniform','geometry','geometry_score'):raise ValueError('invalid sampling policy')
+    if sampling_policy not in ('uniform','geometry','geometry_score','row_uniform'):raise ValueError('invalid sampling policy')
     if hypothesis_budget is not None and hypothesis_budget<1:raise ValueError('positive hypothesis budget required')
     if iterations<1:raise ValueError('positive fixed RANSAC budget required')
     if pixels is None:pixels=np.c_[(tokens%64)*4+1.5,(tokens//64)*4+1.5]

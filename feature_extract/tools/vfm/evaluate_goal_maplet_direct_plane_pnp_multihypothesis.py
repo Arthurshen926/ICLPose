@@ -360,13 +360,47 @@ def main() -> None:
     parser.add_argument('--token_hypothesis_budget',type=int)
     parser.add_argument("--association_policy",choices=('all','match_top1','match_top1_per_plane','mapping_gate'),default='all')
     parser.add_argument("--mapping_match_gate",type=Path)
+    parser.add_argument("--physical_regions",type=Path,help="Opt-in frozen physical centers/radius for plane-group replacement or augmentation.")
+    parser.add_argument("--seed_group_reference",type=Path,help="Optional original correspondence inventory fixes per-query seed-group call budgets during augmentation.")
+    parser.add_argument("--physical_region_mode",choices=["replace","augment"],default="replace")
+    parser.add_argument('--global_proposal_sampler',choices=['cv','token','row'],default='cv')
+    parser.add_argument('--global_proposal_budget',type=int,default=1000)
+    parser.add_argument('--global_proposal_attempts',type=int,default=5000)
     args = parser.parse_args()
+    if args.global_proposal_budget<1 or args.global_proposal_attempts<1:
+        raise ValueError('positive global proposal limits required')
+    if args.global_proposal_sampler!='cv' and args.solver_policy!='unique_token_guarded_lm':
+        raise ValueError('global proposal experiment requires fixed guarded backend')
     if args.output.exists() or args.output_frozen_candidates.exists():
         raise FileExistsError("refusing to overwrite multi-hypothesis result")
     arrays, upstream = _load(args.frozen_correspondences)
     if args.token_sampling_policy=='geometry_score' and (
             args.association_policy!='all' or 'correspondence_match_probability' not in arrays):
         raise ValueError('score-guided experiment requires full candidates and stored match scores')
+    reference = None
+    if args.seed_group_reference:
+        if args.association_policy != 'all':
+            raise ValueError('reference budgets require unfiltered augmentation')
+        reference, _ = _load(args.seed_group_reference)
+        for key in ('names', 'camera_matrices', 'radial_k1'):
+            if not np.array_equal(reference[key], arrays[key]):
+                raise ValueError('seed reference query/camera inventory differs')
+        # Enforce the contract that every original row survives as a query prefix.
+        for i in range(len(arrays['names'])):
+            a, b = map(int, reference['correspondence_offsets'][i:i+2])
+            c, d = map(int, arrays['correspondence_offsets'][i:i+2])
+            for key in ('world_points', 'query_tokens', 'provenance_region_plane_atlas_row'):
+                if d-c < b-a or not np.array_equal(reference[key][a:b], arrays[key][c:c+b-a]):
+                    raise ValueError('seed reference is not an unchanged query prefix')
+    physical_centers=None;physical_radius=None
+    if args.physical_regions:
+        with np.load(args.physical_regions) as z:
+            if 'member_policy' in z and str(z['member_policy'])!='sphere':
+                raise ValueError('explicit point membership requires the prototype-aware structured-memory evaluator; this correspondence interface only supports metric envelopes')
+            physical_centers=z["centers"];physical_radius=np.asarray(z['radii'] if 'radii' in z else z['radius'],float)
+            if 'training_images' in z and set(z['training_images'].astype(str))&set(arrays['names'].astype(str)):raise ValueError('boundary training/test overlap')
+        if physical_radius.ndim>1 or (physical_radius.ndim==1 and len(physical_radius)!=len(physical_centers)):raise ValueError('boundary inventory differs')
+        if physical_centers.ndim!=2 or physical_centers.shape[1]!=3 or not np.isfinite(physical_centers).all() or not np.isfinite(physical_radius).all() or np.any(physical_radius<=0):raise ValueError("invalid physical regions")
     gate=None
     if args.association_policy=='mapping_gate':
         if args.mapping_match_gate is None:raise ValueError('mapping gate required')
@@ -397,18 +431,31 @@ def main() -> None:
         seed_groups: list[tuple[str, np.ndarray]] = [("all", np.arange(len(world)))]
         third_label=('atlas_prototype' if upstream.get('correspondence_semantics')=='query_RADIO_to_view_independent_metric_plane_UV_texels' else 'source_view')
         for label, column in (("plane", 1), (third_label, 2), ("query_region", 0)):
-            seed_groups.extend(
-                (label, rows) for rows in _top_groups(provenance[:, column], args.maximum_groups_per_kind,
-                                                     tokens if args.seed_group_support=='unique_tokens' else None)
-            )
+            maximum = args.maximum_groups_per_kind
+            if reference is not None:
+                rlo, rhi = map(int, reference['correspondence_offsets'][query_index:query_index+2])
+                maximum = len(_top_groups(reference['provenance_region_plane_atlas_row'][rlo:rhi, column],
+                    maximum, reference['query_tokens'][rlo:rhi] if args.seed_group_support=='unique_tokens' else None))
+            local_groups=_top_groups(provenance[:, column], maximum,
+                                     tokens if args.seed_group_support=='unique_tokens' else None)
+            if label=='plane' and physical_centers is not None:
+                from feature_extract.vfm.localization_goal_maplet.metric_region_memory import activate_regions
+                # Uniform token evidence: no uncalibrated cross-plane score comparison.
+                regional,_=activate_regions(world,tokens,np.zeros(len(tokens)),physical_centers,physical_radius,len(local_groups),False)
+                if args.physical_region_mode=='augment':seed_groups.extend(('plane',rows) for rows in local_groups)
+                seed_groups.extend(('physical_region',rows) for rows in regional)
+                if args.physical_region_mode=='replace':seed_groups.extend(('plane_fallback',rows) for rows in local_groups[:len(local_groups)-len(regional)])
+            else:seed_groups.extend((label,rows) for rows in local_groups)
         candidates = []
         for origin, rows in seed_groups:
             sampling_stats={'query_index':query_index,'origin':origin}
+            global_override = origin=='all' and args.global_proposal_sampler!='cv'
             pose = _solve(world, tokens, K, k1, rows, measurements,
                           unique_token_lm=args.solver_policy!='legacy',
                           guard_lm=args.solver_policy=='unique_token_guarded_lm',
-                          token_ransac_iterations=args.token_ransac_iterations if args.solver_policy=='token_ransac' else 0,
-                          sampling_policy=args.token_sampling_policy,hypothesis_budget=args.token_hypothesis_budget,
+                          token_ransac_iterations=(args.global_proposal_attempts if global_override else args.token_ransac_iterations if args.solver_policy=='token_ransac' else 0),
+                          sampling_policy=(('uniform' if args.global_proposal_sampler=='token' else 'row_uniform') if global_override else args.token_sampling_policy),
+                          hypothesis_budget=args.global_proposal_budget if global_override else args.token_hypothesis_budget,
                           planes=provenance[:,1],
                           scores=(arrays['correspondence_match_probability'][lo:hi]
                                   if args.association_policy=='all' and 'correspondence_match_probability' in arrays else None),
@@ -461,10 +508,19 @@ def main() -> None:
         "artifact_type": "goal_maplet_direct_plane_pnp_grouped_multihypothesis_v1",
         "arrays_sha256": arrays_sha256(frozen_arrays),
         "query_count": int(len(arrays["names"])),
-        "candidate_generation": "all plus grouped physical-plane/third-provenance/query-region PnP seeds",
+        "candidate_generation": "all plus grouped physical-plane/third-provenance/query-region PnP seeds; optional physical-region replacement or augmentation of plane groups",
+        "physical_regions_sha256":file_sha256(args.physical_regions) if args.physical_regions else None,
+        "physical_region_radius":physical_radius.tolist() if physical_radius is not None else None,
+        "physical_region_mode":args.physical_region_mode if args.physical_regions else None,
         "third_provenance_semantics":('anonymous_atlas_prototype_not_source_view'
             if upstream.get('correspondence_semantics')=='query_RADIO_to_view_independent_metric_plane_UV_texels' else 'upstream_source_view_or_atlas_row'),
+        "global_proposal_sampler":args.global_proposal_sampler,
+        "global_proposal_budget":args.global_proposal_budget if args.global_proposal_sampler!="cv" else None,
+        "global_proposal_attempts":args.global_proposal_attempts if args.global_proposal_sampler!="cv" else None,
+        "global_proposal_scope":"only all-correspondence proposal; other seed solvers unchanged; AP3P scored-model budget differs from OpenCV adaptive iteration cap",
         "solver_policy":args.solver_policy,"association_policy":args.association_policy,
+        "seed_group_reference_sha256":file_sha256(args.seed_group_reference) if args.seed_group_reference else None,
+        "seed_budget_semantics":("reference group counts; global AP3P uses separately declared scored-model and attempt budgets" if args.global_proposal_sampler!="cv" else "matched group call counts and maximum iterations, not adaptive iterations or wall time" if reference is not None else "native inventory group counts"),
         "seed_group_support":args.seed_group_support,
         "token_ransac_iterations":args.token_ransac_iterations if args.solver_policy=='token_ransac' else None,
         'token_sampling_policy':args.token_sampling_policy,

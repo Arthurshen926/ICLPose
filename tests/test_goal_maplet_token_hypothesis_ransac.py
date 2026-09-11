@@ -98,3 +98,14 @@ def test_equal_scores_are_exact_geometry_control_not_random_stream_change():
     for _ in range(50):
         np.testing.assert_array_equal(guided_sample(first,groups,centers,planes,scores,'geometry'),
                                       guided_sample(second,groups,centers,planes,scores,'geometry_score'))
+
+
+def test_row_and_token_controls_match_scored_model_budget():
+    world,tokens,pixels,K=fixture()
+    for policy in ['uniform','row_uniform']:
+        stats={}
+        pose=solve(world,tokens,K,.02,np.arange(len(world)),pixels,iterations=1024,
+                   hypothesis_budget=128,sampling_policy=policy,stats=stats)
+        assert pose is not None and np.isfinite(pose).all()
+        assert stats['scored_hypotheses']==128 and stats['budget_reached']
+        np.testing.assert_allclose(pose,np.eye(4),atol=1e-5)

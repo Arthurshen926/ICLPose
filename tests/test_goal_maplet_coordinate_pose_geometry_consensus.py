@@ -83,3 +83,17 @@ def test_selected_pose_loader_rejects_score_tampering(tmp_path) -> None:
     )
     with pytest.raises(ValueError, match="contract differs"):
         _load_selected(path)
+
+
+def test_missing_sparse_fallback_is_symmetric_and_requires_dense_evidence():
+    from feature_extract.tools.vfm.build_goal_maplet_sparse_first_render_plan import _dense_render_required
+    objective = np.array([[np.inf,np.inf],[np.inf,np.inf],[1,np.inf],[np.inf,1],[np.nan,np.nan],[2,1]])
+    normal = np.array([[.2,.4],[.4,.4],[.2,.4],[.4,.2],[.2,.4],[.2,.4]])
+    usable = np.ones((6,2),bool)
+    np.testing.assert_array_equal(_select_geometry_consensus(objective,normal,usable),[0,0,0,0,0,1])
+    np.testing.assert_array_equal(_select_geometry_consensus(objective,normal,usable,"dense_when_both_missing"),[1,0,0,0,0,1])
+    np.testing.assert_array_equal(_dense_render_required(objective,usable,"dense_when_both_missing"),[1,1,0,1,0,1])
+    normal[0] = -np.inf
+    assert _select_geometry_consensus(objective,normal,usable,"dense_when_both_missing")[0] == 0
+    with pytest.raises(ValueError,match="unknown missing"):
+        _select_geometry_consensus(objective,normal,usable,"other")

@@ -1,10 +1,14 @@
-"""Collapse V5/V11 only when two independent MoGe/map geometry tests agree.
+"""Collapse V5/V11 using sparse and dense MoGe/map geometry evidence.
 
 The sparse plane test uses frozen query-region/map-plane associations and one
 fitted MoGe3 scale.  The dense test renders the complete 2DGS surface and
 measures query-valid pixels whose rendered/MoGe3 normals agree within the
 already established 20 degree convention.  V11 replaces V5 only when it is
 strictly better on both tests; there is no learned or continuous fusion weight.
+
+An opt-in policy uses dense evidence alone only when both sparse objectives
+are positive infinity; default selection remains unchanged. These two geometry
+tests share MoGe input and are not statistically independent.
 
 The selected NPZ is written and strongly reloaded before label-bearing endpoint
 evaluation reports are opened.
@@ -93,17 +97,31 @@ def _normal_good_ray_score(row: dict[str, object], prefix: str = "") -> float:
     return float(conditional * common / query)
 
 
+def _sparse_allows_alternate(objective: np.ndarray, policy: str = "retain_primary") -> np.ndarray:
+    value = np.asarray(objective, np.float64)
+    if value.ndim != 2 or value.shape[1:] != (2,):
+        raise ValueError("sparse objective shape differs")
+    if policy not in {"retain_primary", "dense_when_both_missing"}:
+        raise ValueError("unknown missing sparse policy")
+    allowed = value[:, 1] < value[:, 0]
+    if policy == "dense_when_both_missing":
+        # Missing evidence is represented by positive infinity, not NaN or -inf.
+        allowed |= np.isposinf(value).all(axis=1)
+    return allowed
+
+
 def _select_geometry_consensus(
     objectives: np.ndarray,
     normal_good_ray: np.ndarray,
     usable: np.ndarray,
+    missing_sparse_policy: str = "retain_primary",
 ) -> np.ndarray:
     objective = np.asarray(objectives, np.float64)
     normal = np.asarray(normal_good_ray, np.float64)
     valid = np.asarray(usable, bool)
     if objective.shape != normal.shape or objective.shape != valid.shape or objective.shape[1:] != (2,):
         raise ValueError("geometry-consensus candidate arrays differ")
-    prefer_alternate = (objective[:, 1] < objective[:, 0]) & (normal[:, 1] > normal[:, 0])
+    prefer_alternate = _sparse_allows_alternate(objective, missing_sparse_policy) & (normal[:, 1] > normal[:, 0])
     return ((~valid[:, 0] & valid[:, 1]) | (valid[:, 1] & prefer_alternate)).astype(np.int8)
 
 
@@ -119,6 +137,7 @@ def _load_selected(path: Path) -> tuple[dict[str, np.ndarray], dict[str, object]
         metadata.get("artifact_type") != OUTPUT_ARTIFACT
         or metadata.get("query_pose_or_ground_truth_read") is not False
         or metadata.get("selection_has_continuous_fusion_weight") is not False
+        or metadata.get("missing_sparse_policy", "retain_primary") not in {"retain_primary", "dense_when_both_missing"}
         or arrays_sha256(arrays) != metadata.get("arrays_sha256")
         or metadata.get("content_sha256") != expected
         or arrays.get("pose_w2c", np.empty(0)).shape != (count, 4, 4)
@@ -166,6 +185,7 @@ def main() -> None:
         choices=("all_valid_query", "observed_query_planes"),
         default="all_valid_query",
     )
+    parser.add_argument("--missing_sparse_policy", choices=("retain_primary", "dense_when_both_missing"), default="retain_primary")
     parser.add_argument("--output_frozen_pose", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
@@ -216,7 +236,7 @@ def main() -> None:
         required = (
             candidate_usable[:, 0]
             & candidate_usable[:, 1]
-            & (objectives[:, 1] < objectives[:, 0])
+            & _sparse_allows_alternate(objectives, args.missing_sparse_policy)
         )
         primary_evaluated = np.asarray([
             row.get("dense_score_evaluated") is True for row in primary_render["rows"]
@@ -225,7 +245,8 @@ def main() -> None:
             row.get("dense_score_evaluated") is True for row in alternate_render["rows"]
         ], bool)
         if (
-            sparse_plan_sha != alternate_sparse_plan_sha
+            sparse_plan_meta.get("missing_sparse_policy", "retain_primary") != args.missing_sparse_policy
+            or sparse_plan_sha != alternate_sparse_plan_sha
             or sparse_plan_sha != file_sha256(args.sparse_first_render_plan)
             or sparse_plan_content is None
             or sparse_plan_content != alternate_sparse_plan_content
@@ -253,7 +274,7 @@ def main() -> None:
             for row in report["rows"]
         ):
             raise ValueError("dense-render evaluation mask lacks a sparse-first authority")
-    selected = _select_geometry_consensus(objectives, normal_good_ray, candidate_usable)
+    selected = _select_geometry_consensus(objectives, normal_good_ray, candidate_usable, args.missing_sparse_policy)
     row = np.arange(len(names))
     arrays = {
         "names": primary["names"],
@@ -271,8 +292,11 @@ def main() -> None:
         "candidate_order": "retained_point_coordinate_V5_then_continuous_chart_coordinate_V11",
         "selection_rule": (
             "V11_only_if_strictly_better_on_frozen_sparse_plane_scale_geometry_AND_"
-            f"dense_2DGS_MoGe3_normal20_{args.dense_normal_domain}_good_ray_recall_else_V5"
+            f"dense_2DGS_MoGe3_normal20_{args.dense_normal_domain}_good_ray_recall_else_V5;"
+            f"missing_sparse_policy={args.missing_sparse_policy}"
         ),
+        "missing_sparse_policy": args.missing_sparse_policy,
+        "missing_sparse_override": "both_positive_infinity_only_then_strict_dense_improvement" if args.missing_sparse_policy == "dense_when_both_missing" else "none",
         "dense_normal_domain": args.dense_normal_domain,
         "dense_normal_score_denominator": (
             "all_valid_query_MoGe3_pixels_missing_render_is_failure"

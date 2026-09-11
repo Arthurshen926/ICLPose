@@ -4,7 +4,8 @@ The V5/V11 consensus can select V11 only when its sparse plane/scale objective
 is already strictly better.  Dense full-map rendering is therefore unnecessary
 for every other query.  This pose/label-free plan records that logical
 short-circuit before either dense render is opened; it changes scheduling only,
-not the selection rule.
+not the declared selection rule. The optional missing-evidence policy also
+renders both candidates when both sparse objectives are positive infinity.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ import numpy as np
 
 from feature_extract.tools.vfm.select_goal_maplet_coordinate_pose_geometry_consensus import (
     _load_plane_geometry,
+    _sparse_allows_alternate,
 )
 from feature_extract.tools.vfm.select_goal_maplet_uncertainty_normalized_plane_pose import (
     _load_pose_candidate,
@@ -31,12 +33,12 @@ from feature_extract.vfm.localization_goal_maplet.lineage import (
 ARTIFACT_TYPE = "goal_maplet_sparse_first_dense_render_plan_v1"
 
 
-def _dense_render_required(objective: np.ndarray, usable: np.ndarray) -> np.ndarray:
+def _dense_render_required(objective: np.ndarray, usable: np.ndarray, missing_sparse_policy: str = "retain_primary") -> np.ndarray:
     value = np.asarray(objective, np.float64)
     valid = np.asarray(usable, bool)
     if value.ndim != 2 or value.shape[1:] != (2,) or valid.shape != value.shape:
         raise ValueError("sparse-first candidate arrays differ")
-    return valid[:, 0] & valid[:, 1] & (value[:, 1] < value[:, 0])
+    return valid[:, 0] & valid[:, 1] & _sparse_allows_alternate(value, missing_sparse_policy)
 
 
 def _load_sparse_first_plan(path: Path) -> tuple[dict[str, np.ndarray], dict[str, object]]:
@@ -52,6 +54,7 @@ def _load_sparse_first_plan(path: Path) -> tuple[dict[str, np.ndarray], dict[str
         metadata.get("artifact_type") != ARTIFACT_TYPE
         or metadata.get("query_pose_or_ground_truth_read") is not False
         or metadata.get("selection_rule_changed") is not False
+        or metadata.get("missing_sparse_policy", "retain_primary") not in {"retain_primary", "dense_when_both_missing"}
         or "names" not in arrays
         or arrays_sha256(arrays) != metadata.get("arrays_sha256")
         or metadata.get("content_sha256") != expected
@@ -70,6 +73,7 @@ def main() -> None:
     parser.add_argument("--primary_pose", type=Path, required=True)
     parser.add_argument("--alternate_pose", type=Path, required=True)
     parser.add_argument("--plane_geometry", type=Path, required=True)
+    parser.add_argument("--missing_sparse_policy", choices=("retain_primary", "dense_when_both_missing"), default="retain_primary")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.output.exists():
@@ -88,7 +92,7 @@ def main() -> None:
         raise ValueError("sparse-first pose/plane lineage differs")
     usable = np.stack([primary["usable"], alternate["usable"]], axis=1).astype(bool)
     objective = np.asarray(plane["moge3_plane_geometry_objective"], np.float64)
-    required = _dense_render_required(objective, usable)
+    required = _dense_render_required(objective, usable, args.missing_sparse_policy)
     arrays = {
         "names": primary["names"],
         "dense_render_required": required,
@@ -100,9 +104,11 @@ def main() -> None:
         "dense_render_query_count": int(np.sum(required)),
         "short_circuit_rule": (
             "render_both_candidates_iff_both_usable_and_V11_sparse_plane_scale_"
-            "objective_is_strictly_better_else_dense_score_is_logically_irrelevant"
+            "objective_is_strictly_better_or_declared_missing_sparse_override_applies"
         ),
+        "missing_sparse_policy": args.missing_sparse_policy,
         "selection_rule_changed": False,
+        "selection_rule_changed_semantics": "scheduling preserves the explicitly declared selection policy",
         "query_pose_or_ground_truth_read": False,
         "source_rgb_stored_or_consumed_at_runtime": False,
         "primary_pose_file_sha256": file_sha256(args.primary_pose),

@@ -36,7 +36,7 @@ def auc(y,score):
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--candidates',type=Path,required=True);p.add_argument('--labels',type=Path,required=True)
-    p.add_argument('--output',type=Path,required=True);a=p.parse_args()
+    p.add_argument('--output',type=Path,required=True);p.add_argument('--use_context',action='store_true');a=p.parse_args()
     if a.output.exists():raise FileExistsError(a.output)
     c=np.load(a.candidates,allow_pickle=False);l=np.load(a.labels,allow_pickle=False)
     if str(l['frozen_candidate_sha256'])!=file_sha256(a.candidates):raise ValueError('label lineage differs')
@@ -44,7 +44,9 @@ def main():
     images=np.unique(sources);train=np.isin(sources,images[::2])&keep&(y>=0)
     evaluation=np.isin(sources,images[1::2])&keep&(y>=0)
     if set(sources[train])&set(sources[evaluation]):raise ValueError('source image leakage')
-    x=np.c_[np.ones(len(y)),c['association_features']]
+    features=c['association_features']
+    if a.use_context and features.shape[1]!=5:raise ValueError('context feature missing')
+    x=np.c_[np.ones(len(y)),features if a.use_context else features[:,:4]]
     weight=token_image_weights(sources[train],tokens[train])
     beta=fit(x[train],y[train],weight);score=expit(x@beta)
     cosine_beta=fit(x[train,:2],y[train],weight)
@@ -59,8 +61,8 @@ def main():
         'candidate_sha256':file_sha256(a.candidates),'label_sha256':file_sha256(a.labels),
         'train_images':len(np.unique(sources[train])),'evaluation_images':len(np.unique(sources[evaluation])),
         'train_rows':int(train.sum()),'evaluation_rows':int(evaluation.sum()),
-        'ignored_ambiguous_rows':int((keep&(y<0)).sum()),'coefficients':beta.tolist(),
-        'features':['intercept','RADIO_cosine','plane_rank_div9','homography_residual_div025_clipped8','homography_valid'],
+        'ignored_ambiguous_rows':int((keep&(y==-1)).sum()),'ignored_unknown_rows':int((keep&(y==-2)).sum()),'coefficients':beta.tolist(),
+        'features':['intercept','RADIO_cosine','plane_rank_div9','homography_residual_div025_clipped8','homography_valid']+(['context_at_local_selected_mode_cosine'] if a.use_context else []),
         'fixed_l2':.001,'cosine_auc':auc(ev,c['association_features'][evaluation,0]),'probe_auc':auc(ev,pred),
         'probe_brier':float(np.mean((pred-ev)**2)),
         'cosine_only_brier':float(np.mean((cosine_probability-ev)**2)),
@@ -69,8 +71,8 @@ def main():
         'coordinate_or_descriptor_weights_updated':False,'query_test_data_used':False,
         'limitations':['same mapping route adjacent images, not unseen-route test',
             'binary metrics condition on geometrically unambiguous labels; do not calibrate missing/null candidates',
-            'MoGe region mode still restricts inputs to mapping-supervised tokens' if region_policy.startswith('moge') else 'query regions are mapping-defined, not independent MoGe3 segmentation',
-            'five-parameter score probe only; no runtime pose promotion']}
+            ('complete MoGe inputs but supervision still covers only a subset' if region_policy=='moge_regions_full_radio_input_independent_supervision' else 'MoGe region mode still restricts inputs to mapping-supervised tokens') if region_policy.startswith('moge') else 'query regions are mapping-defined, not independent MoGe3 segmentation',
+            'small score probe only; no runtime pose promotion']}
     a.output.write_text(json.dumps(report,indent=2)+'\n');print(json.dumps(report,indent=2))
 
 
