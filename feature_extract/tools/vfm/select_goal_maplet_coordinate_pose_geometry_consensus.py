@@ -1,9 +1,9 @@
-"""Collapse V5/V11 using sparse and dense MoGe/map geometry evidence.
+"""Compare frozen primary/alternate poses using sparse and dense MoGe/map evidence.
 
 The sparse plane test uses frozen query-region/map-plane associations and one
 fitted MoGe3 scale.  The dense test renders the complete 2DGS surface and
 measures query-valid pixels whose rendered/MoGe3 normals agree within the
-already established 20 degree convention.  V11 replaces V5 only when it is
+already established 20 degree convention.  The alternate replaces the primary only when it is
 strictly better on both tests; there is no learned or continuous fusion weight.
 
 An opt-in policy uses dense evidence alone only when both sparse objectives
@@ -289,10 +289,10 @@ def main() -> None:
         "artifact_type": OUTPUT_ARTIFACT,
         "arrays_sha256": arrays_sha256(arrays),
         "query_count": int(len(names)),
-        "candidate_order": "retained_point_coordinate_V5_then_continuous_chart_coordinate_V11",
+        "candidate_order": "primary_then_alternate",
         "selection_rule": (
-            "V11_only_if_strictly_better_on_frozen_sparse_plane_scale_geometry_AND_"
-            f"dense_2DGS_MoGe3_normal20_{args.dense_normal_domain}_good_ray_recall_else_V5;"
+            "alternate_only_if_strictly_better_on_frozen_sparse_plane_scale_geometry_AND_"
+            f"dense_2DGS_MoGe3_normal20_{args.dense_normal_domain}_good_ray_recall_else_primary;"
             f"missing_sparse_policy={args.missing_sparse_policy}"
         ),
         "missing_sparse_policy": args.missing_sparse_policy,

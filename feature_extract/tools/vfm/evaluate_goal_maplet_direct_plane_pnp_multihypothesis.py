@@ -111,6 +111,7 @@ def _load(path: Path) -> tuple[dict[str, np.ndarray], dict[str, object]]:
             and (
                 metadata.get("query_measurement_semantics") not in {
                     "mapping_only_pairwise_RADIO_continuous_subtoken_mean_inside_original_4x4_token",
+                    "native_matched_fine_query_pixel_update_inside_original_4x4_token",
                     "mapping_only_RADIO_query_to_anonymous_atlas_prototype_continuous_subtoken_mean_inside_original_4x4_token",
                 }
                 or metadata.get("query_measurement_uncertainty_semantics")
@@ -175,6 +176,34 @@ def _load(path: Path) -> tuple[dict[str, np.ndarray], dict[str, object]]:
         )
     ):
         raise ValueError("frozen PnP correspondence inventory differs")
+    if metadata.get('query_measurement_semantics') == 'native_matched_fine_query_pixel_update_inside_original_4x4_token':
+        protocol = metadata.get('fine_readout_protocol', {})
+        center = np.c_[(arrays['query_tokens'] % 64)*4+1.5, (arrays['query_tokens']//64)*4+1.5]
+        if (protocol.get('anchors_fixed') is not True
+                or protocol.get('query_ground_truth_read') is not False
+                or metadata.get('fine_readout_arm') not in {'coarse','fine','joint','fine_shrink','fine_calibrated','boundary','boundary_joint','joint_calibrated','fine_calibrated128','reliability_mean','reliability_both','reliability_full','reliability_uniform32','reliability_rank32'}
+                or not metadata.get('coarse_correspondence_file_sha256')
+                or not metadata.get('frozen_initial_pose_sha256')
+                or metadata.get('fine_measurement_variance_recalibrated') not in (False, True)
+                or not np.isfinite(arrays['query_measurements_xy']).all()
+                or np.any(np.abs(arrays['query_measurements_xy']-center)>2+1e-8)):
+            raise ValueError('native fine measurement contract differs')
+        if metadata.get('fine_readout_arm') in {'fine_shrink','fine_calibrated','joint_calibrated','fine_calibrated128','reliability_mean','reliability_both','reliability_full','reliability_uniform32','reliability_rank32'}:
+            calibration = protocol.get('mapping_calibration', {})
+            if (calibration.get('query_ground_truth_read') is not False
+                    or calibration.get('heldout_used_to_fit') is not False
+                    or not calibration.get('file_sha256')
+                    or not 0 <= float(calibration.get('alpha', -1)) <= 1
+                    or not np.isfinite(float(calibration.get('variance_scale', np.nan)))
+                    or float(calibration.get('variance_scale', 0)) <= 0):
+                raise ValueError('native fine calibration contract differs')
+        if metadata.get('fine_measurement_variance_recalibrated') is not (metadata.get('fine_readout_arm') in {'fine_calibrated','joint_calibrated','fine_calibrated128','reliability_mean','reliability_both','reliability_full','reliability_uniform32','reliability_rank32'}):
+            raise ValueError('native fine variance contract differs')
+        if metadata.get('fine_readout_arm','').startswith('reliability_'):
+            if (not protocol.get('reliability_model_sha256')
+                    or protocol.get('reliability_query_ground_truth_read') is not False
+                    or protocol.get('reliability_heldout_used_to_fit') is not False):
+                raise ValueError('native fine reliability contract differs')
     for key in ('world_points','camera_matrices','radial_k1','query_measurement_variance_px2','correspondence_match_probability'):
         if key in arrays and not np.isfinite(arrays[key]).all():
             raise ValueError('nonfinite PnP input: '+key)
@@ -363,7 +392,8 @@ def main() -> None:
     parser.add_argument("--physical_regions",type=Path,help="Opt-in frozen physical centers/radius for plane-group replacement or augmentation.")
     parser.add_argument("--seed_group_reference",type=Path,help="Optional original correspondence inventory fixes per-query seed-group call budgets during augmentation.")
     parser.add_argument("--physical_region_mode",choices=["replace","augment"],default="replace")
-    parser.add_argument('--global_proposal_sampler',choices=['cv','token','row'],default='cv')
+    parser.add_argument('--global_proposal_sampler',choices=['cv','token','row','token_prior'],default='cv')
+    parser.add_argument('--global_sampling_prior',type=Path)
     parser.add_argument('--global_proposal_budget',type=int,default=1000)
     parser.add_argument('--global_proposal_attempts',type=int,default=5000)
     args = parser.parse_args()
@@ -377,6 +407,14 @@ def main() -> None:
     if args.token_sampling_policy=='geometry_score' and (
             args.association_policy!='all' or 'correspondence_match_probability' not in arrays):
         raise ValueError('score-guided experiment requires full candidates and stored match scores')
+    sampling_prior = None
+    if args.global_proposal_sampler == 'token_prior':
+        if args.global_sampling_prior is None or args.association_policy != 'all':
+            raise ValueError('context prior requires full correspondence inventory and prior')
+        from feature_extract.tools.vfm.region_sampling_prior import load_region_sampling_prior
+        sampling_prior = load_region_sampling_prior(args.global_sampling_prior, args.frozen_correspondences, arrays)
+    elif args.global_sampling_prior is not None:
+        raise ValueError('unused global sampling prior')
     reference = None
     if args.seed_group_reference:
         if args.association_policy != 'all':
@@ -454,10 +492,10 @@ def main() -> None:
                           unique_token_lm=args.solver_policy!='legacy',
                           guard_lm=args.solver_policy=='unique_token_guarded_lm',
                           token_ransac_iterations=(args.global_proposal_attempts if global_override else args.token_ransac_iterations if args.solver_policy=='token_ransac' else 0),
-                          sampling_policy=(('uniform' if args.global_proposal_sampler=='token' else 'row_uniform') if global_override else args.token_sampling_policy),
+                          sampling_policy=({'token':'uniform','row':'row_uniform','token_prior':'context_prior'}[args.global_proposal_sampler] if global_override else args.token_sampling_policy),
                           hypothesis_budget=args.global_proposal_budget if global_override else args.token_hypothesis_budget,
                           planes=provenance[:,1],
-                          scores=(arrays['correspondence_match_probability'][lo:hi]
+                          scores=(sampling_prior[lo:hi] if global_override and sampling_prior is not None else arrays['correspondence_match_probability'][lo:hi]
                                   if args.association_policy=='all' and 'correspondence_match_probability' in arrays else None),
                           sampling_stats=sampling_stats)
             if args.solver_policy in ('token_ransac','unique_token_guarded_lm'):sampling_records.append(sampling_stats)
@@ -523,6 +561,7 @@ def main() -> None:
         "seed_budget_semantics":("reference group counts; global AP3P uses separately declared scored-model and attempt budgets" if args.global_proposal_sampler!="cv" else "matched group call counts and maximum iterations, not adaptive iterations or wall time" if reference is not None else "native inventory group counts"),
         "seed_group_support":args.seed_group_support,
         "token_ransac_iterations":args.token_ransac_iterations if args.solver_policy=='token_ransac' else None,
+        'global_sampling_prior_file_sha256':file_sha256(args.global_sampling_prior) if args.global_sampling_prior else None,
         'token_sampling_policy':args.token_sampling_policy,
         'token_sampling_implementation':'plane_first_spatial_score_token_priority_v2_shared_rng',
         'token_hypothesis_budget':args.token_hypothesis_budget,

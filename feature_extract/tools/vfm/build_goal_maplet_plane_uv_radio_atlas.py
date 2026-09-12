@@ -192,6 +192,7 @@ def _fuse_plane_texel_prototypes(
     geometry_covariance_m2: np.ndarray | None = None,
     plane_pixel_purity: np.ndarray | None = None,
     plane_depth_dispersion_m: np.ndarray | None = None,
+    mapping_lineage: list | None = None,
 ) -> tuple[np.ndarray, ...]:
     """Keep deterministic diverse view prototypes at one shared metric texel."""
     uv = np.asarray(uv, np.float64).reshape(-1, 2)
@@ -300,6 +301,8 @@ def _fuse_plane_texel_prototypes(
             # by that anonymous view-mode.  Assigning all diverse descriptors
             # to the cell mean silently creates false feature/geometry pairs
             # and was the main reason four-prototype atlases underperformed.
+            if mapping_lineage is not None:
+                mapping_lineage.append((int(views[starts[lo + local]]), int(pair_cells[lo + local,0]), int(pair_cells[lo + local,1])))
             output_uv.append(pair_uv[lo + local])
             output_feature.append(value[local])
             output_identity.append(identity)
@@ -358,6 +361,7 @@ def main() -> None:
         help="Optional aligned v2 bank supplying independent plane-specific geometry.",
     )
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--output_mapping_lineage", type=Path, help="Offline-only exact source/cell reconstruction; never a runtime map field.")
     parser.add_argument("--cell_size_m", type=float, default=0.5)
     parser.add_argument("--minimum_views", type=int, default=2)
     parser.add_argument("--maximum_prototypes_per_texel", type=int, default=1)
@@ -371,6 +375,8 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
+    if args.output_mapping_lineage is not None and (args.output_mapping_lineage.exists() or args.maximum_prototypes_per_texel <= 1):
+        raise ValueError("mapping lineage requires new path and multi-prototype atlas")
     if args.output.exists():
         raise FileExistsError("refusing to overwrite plane UV RADIO atlas")
     if (
@@ -487,6 +493,7 @@ def main() -> None:
     covariance_rows: list[np.ndarray] = []
     purity_rows: list[np.ndarray] = []
     dispersion_rows: list[np.ndarray] = []
+    mapping_lineage = [] if args.output_mapping_lineage is not None else None
     next_identity = 0
     for plane in range(len(planes.plane_ids)):
         token_uv, token_geometry_uv, token_feature = [], [], []
@@ -547,6 +554,7 @@ def main() -> None:
                         np.concatenate(token_view), cell_size_m=float(args.cell_size_m),
                         minimum_views=int(args.minimum_views),
                         maximum_prototypes=int(args.maximum_prototypes_per_texel),
+                        mapping_lineage=mapping_lineage,
                         view_directions_world=np.concatenate(token_direction),
                         observation_ranges_m=np.concatenate(token_range),
                         surface_height_m=np.concatenate(token_height),
@@ -600,6 +608,18 @@ def main() -> None:
         dispersion_rows.append(prototype_dispersion.astype(np.float32))
         next_identity += int(identity.max() + 1) if len(identity) else 0
         texel_offsets.append(texel_offsets[-1] + len(uv))
+
+    if mapping_lineage is not None:
+        lineage_array = np.asarray(mapping_lineage, np.int64).reshape(-1,3)
+        if len(lineage_array) != texel_offsets[-1]:
+            raise ValueError("mapping lineage row count differs")
+        args.output_mapping_lineage.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(args.output_mapping_lineage,
+            source_names=np.asarray(sorted(unique_views)),
+            prototype_source_and_cell=lineage_array,
+            source_observation_bank_sha256=np.asarray(file_sha256(args.observation_bank)),
+            source_visibility_atlas_sha256=np.asarray(file_sha256(args.visibility_atlas)),
+            offline_only=np.asarray(True))
 
     arrays = {
         "plane_texel_offsets": np.asarray(texel_offsets, np.int64),

@@ -313,6 +313,8 @@ def _top_distinct_hypotheses(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--plane_uv_atlas", type=Path, required=True)
+    parser.add_argument("--atlas_member_mask", type=Path,
+                        help="Mapping fold eligibility mask; retains native atlas row identities.")
     parser.add_argument("--query_plane_dir", type=Path, required=True)
     parser.add_argument("--plane_ranking", type=Path, required=True)
     parser.add_argument("--radio_manifest", type=Path, nargs="+", required=True)
@@ -402,6 +404,17 @@ def main() -> None:
     ):
         raise ValueError("metric plane UV atlas contract differs")
     ranking = json.loads(args.plane_ranking.read_text())
+    member_mask = None
+    if args.atlas_member_mask:
+        with np.load(args.atlas_member_mask, allow_pickle=False) as z:
+            member_mask = np.asarray(z['eligible'])
+            mask_meta = json.loads(str(z['metadata_json']))
+        if (member_mask.dtype != np.bool_ or member_mask.shape != (len(atlas['world_points']),)
+                or mask_meta.get('atlas_sha256') != file_sha256(args.plane_uv_atlas)
+                or mask_meta.get('query_pose_or_ground_truth_used') is not False
+                or arrays_sha256({'eligible':member_mask}) != mask_meta.get('arrays_sha256')
+                or any(str(q['image']).split('__')[0] != mask_meta.get('excluded_mapping_route') for q in ranking['rows'])):
+            raise ValueError('mapping atlas eligibility contract differs')
     if (
         ranking.get("artifact_type")
         not in (
@@ -560,25 +573,28 @@ def main() -> None:
             for rank, plane in enumerate(region_row["top10"][: int(args.topk_planes)]):
                 plane = int(plane)
                 lo, hi = map(int, atlas["plane_texel_offsets"][plane : plane + 2])
-                if hi - lo < 4:
+                atlas_rows = np.arange(lo, hi)
+                if member_mask is not None:
+                    atlas_rows = atlas_rows[member_mask[atlas_rows]]
+                if len(atlas_rows) < 4:
                     continue
-                qi, ti, score = _mutual_matches(qfeature, atlas["radio_features"][lo:hi].astype(np.float32))
+                qi, ti, score = _mutual_matches(qfeature, atlas["radio_features"][atlas_rows].astype(np.float32))
                 if len(qi) < 4:
                     continue
                 if args.query_support_policy == "core_seeded_halo_verified":
                     keep = _core_seeded_metric_homography_filter(
-                        qtoken[qi], atlas["texel_uv_m"][lo + ti], qvisible[qi],
+                        qtoken[qi], atlas["texel_uv_m"][atlas_rows[ti]], qvisible[qi],
                         threshold_m=float(args.homography_threshold_m),
                     )
                     homography_projection = np.full((len(qi), 2), np.nan)
                 elif use_homography_context:
                     keep, homography_projection, homography_valid = _metric_homography_filter_with_projection(
-                        qtoken[qi], atlas["texel_uv_m"][lo + ti],
+                        qtoken[qi], atlas["texel_uv_m"][atlas_rows[ti]],
                         threshold_m=float(args.homography_threshold_m),
                     )
                 else:
                     keep = _metric_homography_filter(
-                        qtoken[qi], atlas["texel_uv_m"][lo + ti],
+                        qtoken[qi], atlas["texel_uv_m"][atlas_rows[ti]],
                         threshold_m=float(args.homography_threshold_m),
                     )
                     homography_projection = np.full((len(qi), 2), np.nan)
@@ -586,7 +602,7 @@ def main() -> None:
                 selected = np.flatnonzero(keep)
                 if not len(selected):
                     continue
-                prototype = lo + ti[selected]
+                prototype = atlas_rows[ti[selected]]
                 all_points.append(atlas["world_points"][prototype])
                 all_tokens.append(qtoken[qi[selected]])
                 all_measurements.append(qmeasurement[qi[selected]])
@@ -859,6 +875,7 @@ def main() -> None:
         "plane_uv_atlas_file_sha256": file_sha256(args.plane_uv_atlas),
         "plane_uv_atlas_content_sha256": atlas_meta.get("content_sha256"),
         "plane_ranking_file_sha256": file_sha256(args.plane_ranking),
+        "atlas_member_mask_file_sha256": file_sha256(args.atlas_member_mask) if args.atlas_member_mask else None,
         "query_camera_only_inventory_file_sha256": file_sha256(args.query_camera_inventory),
         "query_camera_only_inventory_content_sha256": camera_meta.get("content_sha256"),
         "radio_manifest_file_sha256_in_order": [file_sha256(path) for path in args.radio_manifest],

@@ -239,6 +239,8 @@ def _refine_pose(
     camera_matrix: np.ndarray,
     radial_k1: float,
     reprojection_covariance_px2: np.ndarray | None = None,
+    measurement_group_ids: np.ndarray | None = None,
+    measurement_group_rho: float = 0.,
 ) -> tuple[np.ndarray, bool, dict[str, float | int | bool]]:
     """Bounded left-SE(3) robust solve on already frozen correspondences."""
 
@@ -271,6 +273,12 @@ def _refine_pose(
             raise ValueError("full reprojection covariance is not positive definite")
         whitening = (vectors * (1 / np.sqrt(values))[:, None, :]) @ vectors.transpose(0, 2, 1)
     diagnostics["full_reprojection_covariance"] = whitening is not None
+    if measurement_group_ids is not None:
+        from feature_extract.tools.vfm.native_fine_measurement import compound_whiten
+        if whitening is not None:
+            raise ValueError("compound groups currently require isotropic per-row covariance")
+        compound_whiten(np.zeros((len(world),2)),measurement_group_ids,measurement_group_rho)
+        diagnostics["measurement_group_rho"] = float(measurement_group_rho)
     distortion = np.asarray([radial_k1, 0.0, 0.0, 0.0, 0.0], np.float64)
 
     def candidate(parameter: np.ndarray) -> np.ndarray:
@@ -289,6 +297,8 @@ def _refine_pose(
         error = projected.reshape(-1, 2) - pixel
         normalized = (error / sigma[:, None] if whitening is None
                       else np.einsum("nij,nj->ni", whitening, error))
+        if measurement_group_ids is not None:
+            normalized = compound_whiten(normalized,measurement_group_ids,measurement_group_rho)
         return (normalized * balance[:, None]).reshape(-1)
 
     initial_parameter = np.zeros(6, np.float64)
@@ -371,6 +381,7 @@ def main() -> None:
                         default="isotropic")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--mapping_covariance_calibration", type=Path)
+    parser.add_argument("--correlated_measurement_groups", type=Path)
     parser.add_argument("--mapping_match_gate", type=Path,
                         help="Mapping-only positive-recall score gate; not a Gaussian mixture prior.")
     parser.add_argument("--mapping_covariance_model", choices=("scale_only", "separate_scales"),
@@ -380,6 +391,13 @@ def main() -> None:
         raise FileExistsError("refusing to overwrite uncertainty refinement")
     poses, pose_metadata = _load_frozen_poses(args.frozen_pose_inventory)
     corr, corr_metadata = _load_correspondences(args.frozen_correspondences)
+    measurement_groups = None
+    measurement_group_meta = None
+    if args.correlated_measurement_groups is not None:
+        from feature_extract.tools.vfm.native_fine_measurement import load_measurement_groups
+        if args.reprojection_covariance_policy != "isotropic":
+            raise ValueError("compound groups require isotropic measurement covariance")
+        measurement_groups,measurement_group_meta = load_measurement_groups(args.correlated_measurement_groups,args.frozen_correspondences,corr)
     match_gate=None
     if args.mapping_match_gate is not None:
         match_gate=json.loads(args.mapping_match_gate.read_text())
@@ -482,6 +500,8 @@ def main() -> None:
         refined, use, detail = _refine_pose(
             output_pose[index], world[selected], pixel[selected], provenance[selected, 1],
             sigma, K, k1, reprojection_covariance_px2=full_covariance,
+            measurement_group_ids=(None if measurement_groups is None else measurement_groups[lo:hi][selected]),
+            measurement_group_rho=(0. if measurement_group_meta is None else measurement_group_meta['rho']),
         )
         final_score = _score(refined, world, token, provenance, K, k1,
                              pixel if "query_measurements_xy" in corr else None)
@@ -568,6 +588,8 @@ def main() -> None:
         "frozen_correspondence_content_sha256": corr_metadata.get("content_sha256"),
         "accepted_count": int(np.sum(accepted)), "production_eligible": False,
     }
+    if measurement_group_meta is not None:
+        metadata["correlated_measurements"] = dict(file_sha256=file_sha256(args.correlated_measurement_groups),content_sha256=measurement_group_meta['content_sha256'],rho=measurement_group_meta['rho'],model="compound-symmetric standardized measurement covariance within disjoint physical groups; original robust Huber and support acceptance retained")
     metadata["content_sha256"] = canonical_json_sha256(metadata)
     args.output_frozen_pose_inventory.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(

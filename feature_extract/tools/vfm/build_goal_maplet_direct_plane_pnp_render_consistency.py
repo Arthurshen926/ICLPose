@@ -48,6 +48,14 @@ def _load_frozen_poses(path: Path) -> tuple[dict[str, np.ndarray], dict[str, obj
     with np.load(path, allow_pickle=False) as data:
         metadata = json.loads(str(data["metadata_json"].item()))
         all_arrays = {name: np.asarray(data[name]) for name in data.files if name != "metadata_json"}
+    if metadata.get("artifact_type") == "goal_maplet_coordinate_pose_geometry_consensus_v1":
+        from feature_extract.tools.vfm.select_goal_maplet_coordinate_pose_geometry_consensus import _load_selected
+        arrays, metadata = _load_selected(path)
+        if not np.isfinite(arrays["pose_w2c"][arrays["usable"].astype(bool)]).all():
+            raise ValueError("usable consensus pose is nonfinite")
+        # Rendering uses pose and usability, not PnP support counts. A consensus
+        # has no single such count; do not invent one for the selected pose.
+        return arrays, metadata
     required = ("names", "pose_w2c", "usable")
     if any(name not in all_arrays for name in required):
         raise ValueError("frozen direct-plane pose arrays are incomplete")
@@ -157,6 +165,33 @@ def _validate_query_camera_lineage(
     ):
         raise ValueError("frozen correspondence camera lineage differs")
     return correspondence_metadata
+
+
+def _validate_consensus_camera_lineage(pose_path, camera_path, manifest_path):
+    """Verify both original endpoints and the exact per-query selected pose."""
+    from feature_extract.tools.vfm.select_goal_maplet_coordinate_pose_geometry_consensus import _load_selected
+    selected, meta = _load_selected(pose_path)
+    manifest = json.loads(manifest_path.read_text())
+    endpoints = []
+    for key in ("primary", "alternate"):
+        path = Path(manifest[key + "_pose"])
+        endpoint, em = _load_frozen_poses(path)
+        if em.get("artifact_type") == "goal_maplet_coordinate_pose_geometry_consensus_v1":
+            raise ValueError("nested consensus lineage requires explicit flattening")
+        if (file_sha256(path) != meta[key + "_pose_file_sha256"]
+                or em.get("content_sha256") != meta[key + "_pose_content_sha256"]
+                or not np.array_equal(endpoint["names"], selected["names"])):
+            raise ValueError("consensus endpoint lineage differs")
+        corr = manifest.get(key + "_correspondence")
+        _validate_query_camera_lineage(em, camera_path, Path(corr) if corr else None)
+        endpoints.append(endpoint)
+    for i, branch in enumerate(selected["selected_branch"]):
+        if int(branch) not in (0, 1):
+            raise ValueError("consensus branch differs")
+        endpoint = endpoints[int(branch)]
+        if (not np.array_equal(selected["pose_w2c"][i], endpoint["pose_w2c"][i], equal_nan=True)
+                or bool(selected["usable"][i]) != bool(endpoint["usable"][i])):
+            raise ValueError("consensus pose does not equal its frozen endpoint")
 
 
 def _metric_depth_normal_agreement(
@@ -491,6 +526,7 @@ def _resident_render_primitive_batches(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--frozen_pose_inventory", type=Path, required=True)
+    parser.add_argument("--consensus_lineage_manifest", type=Path, help="Both authenticated endpoints and camera lineages for a frozen consensus pose.")
     parser.add_argument("--physical_map", type=Path, required=True)
     parser.add_argument("--query_camera_inventory", type=Path, required=True)
     parser.add_argument(
@@ -560,9 +596,16 @@ def main() -> None:
             raise ValueError("sparse-first render plan does not bind this pose inventory")
         render_required = np.asarray(sparse_plan["dense_render_required"], bool)
     camera_rows, camera_meta = _camera_inventory(args.query_camera_inventory)
-    correspondence_meta = _validate_query_camera_lineage(
-        pose_meta, args.query_camera_inventory, args.frozen_correspondence,
-    )
+    if args.consensus_lineage_manifest is not None:
+        if args.frozen_correspondence is not None:
+            raise ValueError("consensus lineage must bind both endpoint correspondences")
+        _validate_consensus_camera_lineage(args.frozen_pose_inventory, args.query_camera_inventory,
+                                           args.consensus_lineage_manifest)
+        correspondence_meta = None
+    else:
+        correspondence_meta = _validate_query_camera_lineage(
+            pose_meta, args.query_camera_inventory, args.frozen_correspondence,
+        )
     query_plane_manifest_path = None
     query_plane_manifest = None
     query_plane_rows: dict[str, tuple[int, int, str]] = {}
@@ -772,6 +815,7 @@ def main() -> None:
             None if query_plane_manifest is None
             else "observed_finite_MoGe3_plane_pixels_only_missing_render_is_failure"
         ),
+        "consensus_lineage_manifest_file_sha256": (None if args.consensus_lineage_manifest is None else file_sha256(args.consensus_lineage_manifest)),
         "frozen_correspondence_file_sha256": (
             None if args.frozen_correspondence is None else file_sha256(args.frozen_correspondence)
         ),

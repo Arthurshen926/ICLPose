@@ -72,6 +72,43 @@ def select_context_modes(patch_scores, mode_regions, number, policy='max'):
     return chosen
 
 
+def allocate_added_matches(triples, owners, limit=1024, policy='cosine'):
+    """Balance origin/quadrant buckets only when truncation is necessary.
+
+    A duplicate pair has one deterministic owner; output retains cosine order
+    so uncapped inventories exactly reproduce the existing solver inputs.
+    """
+    if limit < 1 or policy not in ('cosine', 'balanced'):
+        raise ValueError('invalid addition budget')
+    ordered = sorted(triples, key=lambda k: (-triples[k], k))
+    if policy == 'cosine' or len(ordered) <= limit:
+        return ordered[:limit]
+    buckets = {}
+    for k in ordered:
+        t = k[0]
+        bucket = (owners[k], int(t // 64 >= 18) * 2 + int(t % 64 >= 32))
+        buckets.setdefault(bucket, []).append(k)
+    keys = sorted(buckets)
+    selected = set()
+    depth = 0
+    while len(selected) < limit:
+        candidates = [buckets[k][depth] for k in keys if depth < len(buckets[k])]
+        if not candidates:
+            break
+        # Partial final round prefers higher cosine, without fixed region bias.
+        candidates.sort(key=lambda k: (-triples[k], k))
+        selected.update(candidates[:limit-len(selected)])
+        depth += 1
+    return [k for k in ordered if k in selected]
+
+
+def quadrant_support(patch_scores, mode_index, token):
+    """Bounded rank prior (not a probability); ties remain equivalent."""
+    values = np.asarray(patch_scores)[:, mode_index]
+    quadrant = int(token // 64 >= 18) * 2 + int(token % 64 >= 32)
+    return float((1 + np.sum(values < values[quadrant])) / 4.)
+
+
 def readout_radii(path, centers, query_names=()):
     """Transfer metric envelopes, never prototype indices, onto a native atlas."""
     if path is None:
@@ -97,28 +134,70 @@ def main():
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--splits', nargs='+', default=['seq10','shard0','shard1','shard2','shard3'])
     p.add_argument('--device', default='cuda:0')
+    p.add_argument('--addition_budget_policy', choices=['cosine','balanced'], default='cosine')
+    p.add_argument('--local_geometry_scope', choices=['region','recalled_planes'], default='region')
+    p.add_argument('--plane_ranking_manifest', type=Path)
     p.add_argument('--region_boundaries', type=Path)
+    p.add_argument('--context_library', type=Path)
+    p.add_argument('--marginal_value_model', type=Path)
+    p.add_argument('--selection_pose_manifest', type=Path)
+    p.add_argument('--novel_token_control', action='store_true')
+    p.add_argument('--marginal_stop', action='store_true')
     p.add_argument('--retrieved_regions', type=int, default=4)
     p.add_argument('--appearance_selection', choices=['max','coverage'], default='max')
     args = p.parse_args()
+    value_model = None
+    if args.marginal_stop and not args.marginal_value_model:
+        raise ValueError('marginal stopping requires a value model')
+    if args.novel_token_control and (args.marginal_value_model or args.context_library is None or args.retrieved_regions != 9):
+        raise ValueError('novel-token control requires native eight plus one without a learned model')
+    if args.marginal_value_model:
+        if args.context_library is None or args.retrieved_regions != 9:
+            raise ValueError('next-region model requires native context and eight plus one regions')
+        value_model = json.loads(args.marginal_value_model.read_text())
+        if value_model.get('query_GT_used') is not False or value_model.get('heldout_used_to_fit') is not False:
+            raise ValueError('next-region model supervision contract differs')
+    pose_paths = json.loads(args.selection_pose_manifest.read_text()) if args.selection_pose_manifest else {}
+    if value_model is not None and value_model.get('feature_contract') == 'pose33':
+        if not pose_paths:
+            raise ValueError('pose33 requires inferred native8 primary-final poses')
+    elif pose_paths:
+        raise ValueError('selection poses require pose33 model')
     if args.retrieved_regions < 1:
         raise ValueError('positive retrieval width required')
     b = args.base
+    ranking_paths = json.loads(args.plane_ranking_manifest.read_text()) if args.plane_ranking_manifest else {}
+    if args.local_geometry_scope == "recalled_planes" and not ranking_paths:
+        raise ValueError("recalled-plane control requires original ranking manifest")
     args.output.mkdir(exist_ok=False, parents=True)
     atlas_path = b/'stmarys_metric_plane_uv_radio_atlas_cell050_p4_learned64d_strict_v9.npz'
     atlas, atlas_meta = _load_atlas(atlas_path)
+    if value_model is not None and value_model.get('feature_contract') == 'pose33':
+        if value_model['feature_provenance']['native_atlas_sha256'] != file_sha256(atlas_path):
+            raise ValueError('pose33 atlas binding differs')
     head_path = b/'stmarys_mapping_canonical_subtoken_head_shrunk_v4.npz'
     head, hm = load_mapping_subtoken_head(head_path)
     head.eval()
     proj_path = b/'stmarys_chart_local_radio_projection_64d_v2.npz'
     with np.load(proj_path) as z:
         weight = z['weight']
-    region_path = b/'region_frontend_v246/map.npz'
+    region_path = args.context_library or b/'region_frontend_v246/map.npz'
     with np.load(region_path) as z:
         modes, mode_regions, centers = z['descriptors'], z['mode_regions'], z['centers']
+        if args.context_library:
+            library_meta = json.loads(str(z['metadata_json']))
+            library_arrays = {k:z[k] for k in z.files if k != 'metadata_json'}
+            if (library_meta.get('native_atlas_sha256') != file_sha256(atlas_path)
+                    or library_meta.get('excluded_mapping_route') is not None
+                    or arrays_sha256(library_arrays) != library_meta.get('arrays_sha256')
+                    or canonical_json_sha256({k:v for k,v in library_meta.items() if k != 'content_sha256'}) != library_meta.get('content_sha256')
+                    or library_meta.get('query_pose_or_ground_truth_used_for_retrieval') is not False):
+                raise ValueError('native full context library contract differs')
     with np.load(b/'adaptive_memory_v234/topology.npz') as z:
         source_names = z['source_names'].astype(str)
         used_sources = source_names[np.unique(z['prototype_keys'][:,1])]
+    if args.context_library:
+        used_sources = np.asarray(library_meta['offline_mapping_source_names'])
     radii = readout_radii(args.region_boundaries, centers)
     if args.retrieved_regions > len(np.unique(mode_regions)):
         raise ValueError('retrieval width exceeds region inventory')
@@ -126,10 +205,16 @@ def main():
     plane_ids = np.repeat(np.arange(len(atlas['plane_texel_offsets'])-1), np.diff(atlas['plane_texel_offsets']))
     descriptors = torch.as_tensor(atlas['radio_features'].astype(np.float32), device=args.device)
     records = _records([Path('output/vfm_tokens/StMarysChurch/full_1024x576')/f'{split}_manifest.json' for split in ['train','test']])
-    manifest = dict(query_GT_used=False, radius_m=radii.tolist(), retrieved_regions=args.retrieved_regions, maximum_added_rows=1024,
+    manifest = dict(query_GT_used=False, inferred_query_pose_used=bool(pose_paths), radius_m=radii.tolist(), retrieved_regions=args.retrieved_regions, maximum_added_rows=1024,
+                    selection_pose_sha256={s:file_sha256(Path(pose_paths[s])) for s in args.splits} if pose_paths else {},
+                    marginal_value_model_sha256=file_sha256(args.marginal_value_model) if args.marginal_value_model else None,
+                    novel_token_control=bool(args.novel_token_control),
+                    marginal_stop=bool(args.marginal_stop),
                     boundary_sha256=file_sha256(args.region_boundaries) if args.region_boundaries else None,
                     boundary_scope='metric local readout envelopes; retrieval context modes and geometry unchanged',
-                    appearance_selection=args.appearance_selection,
+                    appearance_selection=args.appearance_selection, addition_budget_policy=args.addition_budget_policy,
+                    local_geometry_scope=args.local_geometry_scope,
+                    plane_rankings_sha256={k:file_sha256(Path(v)) for k,v in ranking_paths.items()},
                     native_region_memberships=sum(map(len,groups)), minimum_visible_fraction=0.75,
                     local_matcher='native atlas RADIO64 mutual nearest neighbors on observed MoGe tokens',
                     retrieval='four quadrant context RADIO256, source-mode means, configured number of distinct physical regions',
@@ -143,6 +228,24 @@ def main():
         protocol = json.loads((b/f'guarded_lm_v197_{split}_primary/protocol.json').read_text())
         old_path = Path(protocol['correspondences'])
         old, meta = _load(old_path)
+        selection_poses = {}
+        if pose_paths:
+            from feature_extract.tools.vfm.select_goal_maplet_uncertainty_normalized_plane_pose import _load_pose_candidate
+            pa, pm = _load_pose_candidate(Path(pose_paths[split]))
+            if not np.array_equal(pa['usable'].astype(bool),np.isfinite(pa['pose_w2c']).all(axis=(1,2))):
+                raise ValueError('selection pose validity contract differs')
+            selection_poses = dict(zip(pa['names'].astype(str),pa['pose_w2c']))
+            if len(selection_poses) != len(pa['names']):
+                raise ValueError('duplicate selection pose query names')
+            if set(selection_poses) != set(old['names'].astype(str)):
+                raise ValueError('selection pose query inventory differs')
+        rankings = {}
+        if args.local_geometry_scope == 'recalled_planes':
+            rp = Path(ranking_paths[split])
+            rankdata = json.loads(rp.read_text())
+            if file_sha256(rp) != meta['plane_ranking_file_sha256'] or rankdata.get('uses_pose_or_ground_truth') is not False or rankdata.get('contains_postlabel_fields') is not False:
+                raise ValueError('original pose-free ranking contract differs')
+            rankings = {r['image']: sorted({int(v) for g in r['regions'] for v in g['top10']}) for r in rankdata['rows']}
         readout_radii(args.region_boundaries, centers, old['names'].astype(str))
         if set(old['names'].astype(str)) & set(used_sources):
             raise ValueError('query in appearance memory')
@@ -152,6 +255,7 @@ def main():
         plane_dir = Path(plane_cmd[plane_cmd.index('--query_plane_dir')+1])
         additions = {arm: [] for arm in ['appearance','random']}
         audit = []
+        trace = {arm: [] for arm in additions}
         for i,name in enumerate(old['names'].astype(str)):
             start = time.perf_counter()
             q = normalise(_radio(name, records) @ weight.T).astype(np.float32)
@@ -178,16 +282,24 @@ def main():
             for arm in additions:
                 rank = np.argsort(-scores,kind='stable') if arm=='appearance' else np.random.default_rng(
                     260924+int(hashlib.sha256(name.encode()).hexdigest()[:8],16)).permutation(len(modes))
-                if arm=='appearance':rank=select_context_modes(patch_scores,mode_regions,args.retrieved_regions,args.appearance_selection)
+                search_width = 16 if (value_model is not None or args.novel_token_control) and arm == 'appearance' else args.retrieved_regions
+                if arm=='appearance':rank=select_context_modes(patch_scores,mode_regions,search_width,args.appearance_selection)
                 chosen=[]
                 for j in rank:
                     rid=int(mode_regions[j])
                     if rid not in chosen:chosen.append(rid)
-                    if len(chosen)==args.retrieved_regions:break
+                    if len(chosen)==search_width:break
                 triples={}
+                origins={}
+                regional_matches={rid:[] for rid in chosen}
+                chosen_modes = {int(mode_regions[j]): int(j) for j in rank if int(mode_regions[j]) in chosen}
+                # First (highest ranked) appearance mode is the retrieval authority.
+                for j in reversed(list(rank)):
+                    if int(mode_regions[j]) in chosen: chosen_modes[int(mode_regions[j])] = int(j)
                 if len(valid_tokens):
                     for rid in chosen:
                         g=groups[rid]
+                        if args.local_geometry_scope == "recalled_planes": g=g[np.isin(plane_ids[g],rankings[name])]
                         if not len(g):continue
                         sim=tq@descriptors[g].T
                         val,ind=sim.max(1)
@@ -195,8 +307,44 @@ def main():
                         ts=valid_tokens[mutual.cpu().numpy()]
                         ps=g[ind[mutual].cpu().numpy()]
                         for t,r,v in zip(ts,ps,val[mutual].cpu().numpy()):
-                            if (int(t),int(r)) not in existing:triples[(int(t),int(r))]=float(v)
-                ordered=sorted(triples,key=lambda k:(-triples[k],k))[:1024]
+                            pair=(int(t),int(r))
+                            regional_matches[rid].append((int(t),int(r),float(v)))
+                            if pair not in existing:
+                                triples[pair]=float(v)
+                                origins.setdefault(pair,[]).append(rid)
+                if (value_model is not None or args.novel_token_control) and arm == 'appearance':
+                    from feature_extract.tools.vfm.native_region_value_features import addition_features
+                    from feature_extract.tools.vfm.train_goal_maplet_native_region_marginal_value import predict
+                    # Training features use each region's top 1024 MNN rows before
+                    # deduplication against the original plane frontend.
+                    rm={r:sorted(regional_matches[r],key=lambda x:-x[2])[:1024] for r in chosen}
+                    base_pairs=[x for r in chosen[:8] for x in rm[r]]
+                    bt=np.array([x[0] for x in base_pairs],int);bs=np.array([x[2] for x in base_pairs])
+                    bc=patch_scores[:,[chosen_modes[r] for r in chosen[:8]]].T
+                    xx=[addition_features(bt,bs,np.array([x[0] for x in rm[r]],int),np.array([x[2] for x in rm[r]]),patch_scores[:,chosen_modes[r]],bc,centers[r],centers[chosen[:8]]) for r in chosen[8:]]
+                    if value_model is not None and value_model.get('feature_contract') in ('hybrid19','pose33'):
+                        from feature_extract.tools.vfm.native_hybrid_region_value import hybrid_features
+                        xx=hybrid_features(old['query_tokens'][lo:hi],old['prototype_atlas_row'][lo:hi],old['radio_match_score'][lo:hi],
+                            [np.array([x[0] for x in rm[r]],int) for r in chosen],
+                            [np.array([x[1] for x in rm[r]],int) for r in chosen],
+                            [np.array([x[2] for x in rm[r]]) for r in chosen],patch_scores[:,[chosen_modes[r] for r in chosen]].T,centers[chosen])
+                    if value_model is not None and value_model.get('feature_contract') == 'pose33':
+                        from feature_extract.tools.vfm.native_pose_conditioned_region_value import pose_features
+                        gx=pose_features(old['query_tokens'][lo:hi],old['prototype_atlas_row'][lo:hi],
+                            [np.array([x[0] for x in rm[r]],int) for r in chosen],
+                            [np.array([x[1] for x in rm[r]],int) for r in chosen],
+                            [np.array([x[2] for x in rm[r]]) for r in chosen],
+                            atlas['world_points'],selection_poses[name],old['camera_matrices'][i],float(old['radial_k1'][i]))
+                        xx=np.concatenate([xx,gx],axis=1)
+                    gain=np.asarray(xx)[:,2] if args.novel_token_control else predict(value_model,np.asarray(xx))
+                    chosen=chosen[:8]+([] if args.marginal_stop and np.max(gain)<=0 else [chosen[8+int(np.argmax(gain))]])
+                    origins={k:[r for r in rs if r in chosen] for k,rs in origins.items()}
+                    origins={k:rs for k,rs in origins.items() if rs};triples={k:v for k,v in triples.items() if k in origins}
+                owners={k:v[0] for k,v in origins.items()}
+                ordered=allocate_added_matches(triples,owners,1024,args.addition_budget_policy)
+                trace[arm].append(dict(name=name, pairs=[list(k) for k in ordered],
+                    prior=[max(quadrant_support(patch_scores,chosen_modes[rid],k[0]) for rid in origins[k]) for k in ordered],
+                    origins=[origins[k] for k in ordered],selected_modes=chosen_modes,patch_scores=patch_scores[:,[chosen_modes[r] for r in chosen]].tolist()))
                 token=np.asarray([k[0] for k in ordered],np.int64)
                 proto=np.asarray([k[1] for k in ordered],np.int64)
                 extra={k:old[k][:0].copy() for k in old if k not in ['names','camera_matrices','radial_k1','correspondence_offsets']}
@@ -215,7 +363,12 @@ def main():
                         correspondence_match_probability=torch.sigmoid(logit).numpy().reshape(-1))
                     for k in ['prototype_world_covariance_m2','prototype_plane_pixel_purity','prototype_plane_depth_dispersion_m']:extra[k]=atlas[k][proto]
                 additions[arm].append(extra)
-                row_audit[arm]=dict(regions=chosen,added_rows=len(token))
+                row_audit[arm]=dict(regions=chosen,added_rows=len(token),precap_rows=len(triples),
+                    precap_unique_tokens=len({k[0] for k in triples}),postcap_unique_tokens=len(set(token.tolist())),
+                    precap_by_origin={str(r):len({k[0] for k in triples if r in origins[k]}) for r in chosen},
+                    postcap_by_origin={str(r):len({k[0] for k in ordered if r in origins[k]}) for r in chosen},
+                    precap_by_quadrant=[len({k[0] for k in triples if (int(k[0]//64>=18)*2+int(k[0]%64>=32))==q}) for q in range(4)],
+                    postcap_by_quadrant=[len({k[0] for k in ordered if (int(k[0]//64>=18)*2+int(k[0]%64>=32))==q}) for q in range(4)])
             row_audit['seconds']=time.perf_counter()-start
             audit.append(row_audit)
             if (i+1)%10==0:print(split,i+1,'/',len(old['names']),flush=True)
@@ -231,6 +384,15 @@ def main():
             out=args.output/f'{split}_{arm}.npz'
             np.savez_compressed(out,**arrays,metadata_json=np.asarray(json.dumps(outmeta,sort_keys=True)))
             checked,_=_load(out)
+            weights=np.ones(len(arrays['query_tokens']),np.float64)
+            for i,tr in enumerate(trace[arm]):
+                start=int(arrays['correspondence_offsets'][i])+int(old['correspondence_offsets'][i+1]-old['correspondence_offsets'][i])
+                weights[start:start+len(tr['prior'])]=tr['prior']
+            prior_arrays=dict(names=arrays['names'],correspondence_offsets=arrays['correspondence_offsets'],sampling_weights=weights)
+            prior_meta=dict(artifact_type='goal_maplet_region_sampling_prior_v1',query_pose_or_ground_truth_read=bool(pose_paths),query_ground_truth_used=False,inferred_query_pose_used=bool(pose_paths),correspondence_file_sha256=file_sha256(out),arrays_sha256=arrays_sha256(prior_arrays),semantics='quadrant rank among four for each retrieved mode; max over origins; old rows weight one; uncalibrated sampling prior')
+            prior_meta['content_sha256']=canonical_json_sha256(prior_meta)
+            np.savez_compressed(out.with_name(out.stem+'_prior.npz'),**prior_arrays,metadata_json=np.asarray(json.dumps(prior_meta,sort_keys=True)))
+            out.with_name(out.stem+'_trace.json').write_text(json.dumps(dict(correspondence_file_sha256=file_sha256(out),rows=trace[arm]),indent=2))
             for i in range(len(old['names'])):
                 l,h=map(int,old['correspondence_offsets'][i:i+2]);s=int(checked['correspondence_offsets'][i])
                 for k in extras[i]:

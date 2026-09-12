@@ -79,3 +79,17 @@ def test_plane_texel_prototypes_preserve_mode_specific_surface_height() -> None:
     np.testing.assert_allclose(texel, [[0.2, 0.2], [0.305, 0.205]])
     np.testing.assert_allclose(height, [0.2, 0.4])
     np.testing.assert_allclose(height_std, [0.0, 0.1])
+
+
+def test_offline_mapping_lineage_preserves_default_atlas_arrays():
+    uv=np.array([[.10,.12],[.12,.14],[.30,.32],[.31,.33]])
+    features=np.array([[1.,0.],[1.,0.],[0.,1.],[0.,1.]],np.float32)
+    views=np.array([7,7,2,2]);trace=[]
+    args=dict(cell_size_m=.5,minimum_views=2,maximum_prototypes=2)
+    original=_fuse_plane_texel_prototypes(uv,features,views,**args)
+    traced=_fuse_plane_texel_prototypes(uv,features,views,mapping_lineage=trace,**args)
+    for x,y in zip(original,traced):np.testing.assert_array_equal(x,y)
+    assert len(trace)==len(traced[0])
+    for xy,(view,cx,cy) in zip(traced[0],trace):
+        np.testing.assert_allclose(xy,uv[views==view].mean(0))
+        assert (cx,cy)==(0,0)

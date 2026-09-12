@@ -11,6 +11,9 @@ def guided_sample(rng, groups, centers, planes, scores, policy, plane_groups=Non
     if policy == 'uniform' or rng.random() < .5:
         chosen=rng.choice(len(groups),4,replace=False)
         return np.array([groups[g][rng.integers(len(groups[g]))] for g in chosen])
+    if policy == 'context_prior':
+        chosen = rng.choice(len(groups), 4, replace=False)
+        return np.asarray([rng.choice(groups[g], p=scores[groups[g]]/scores[groups[g]].sum()) for g in chosen])
     if group_ids is None:
         group_ids=np.empty(len(planes),np.int64)
         for i,rows in enumerate(groups):group_ids[rows]=i
@@ -71,7 +74,7 @@ def score_pose(pose,world,pixels,groups,K,k1,threshold=4.,group_starts=None,retu
 def solve(world,tokens,K,k1,rows,pixels=None,iterations=128,seed=260901,
           sampling_policy='uniform',planes=None,scores=None,hypothesis_budget=None,stats=None):
     started=time.perf_counter()
-    if sampling_policy not in ('uniform','geometry','geometry_score','row_uniform'):raise ValueError('invalid sampling policy')
+    if sampling_policy not in ('uniform','geometry','geometry_score','row_uniform','context_prior'):raise ValueError('invalid sampling policy')
     if hypothesis_budget is not None and hypothesis_budget<1:raise ValueError('positive hypothesis budget required')
     if iterations<1:raise ValueError('positive fixed RANSAC budget required')
     if pixels is None:pixels=np.c_[(tokens%64)*4+1.5,(tokens//64)*4+1.5]
@@ -89,6 +92,8 @@ def solve(world,tokens,K,k1,rows,pixels=None,iterations=128,seed=260901,
         if not np.isfinite(score_values).all():raise ValueError('nonfinite sampling scores')
         scores=np.full(len(first),-np.inf)
         np.maximum.at(scores,inverse,score_values)
+    if sampling_policy == 'context_prior' and np.any(scores <= 0):
+        raise ValueError('context sampling weights must be positive')
     unique=np.unique(tokens)
     if len(unique)<6:return None
     groups=[np.flatnonzero(tokens==t) for t in unique]
