@@ -98,11 +98,14 @@ def _load_frozen_poses(path: Path) -> tuple[dict[str, np.ndarray], dict[str, obj
             "goal_maplet_moge3_plane_scale_surface_refinement_v2",
             "goal_maplet_canonical_plane_uv_view_geometry_refined_pose_v1",
             "goal_maplet_uncertainty_weighted_plane_pose_refinement_v1",
+            "goal_maplet_retained_pnp_endpoint_v1",
+            "goal_maplet_relation_group_pnp_v1",
         )
         or metadata.get("query_pose_or_ground_truth_read", False) is not False
         or (
             depth_used is not (
                 True if artifact_type in {
+                    "goal_maplet_relation_group_pnp_v1",
                     "goal_maplet_moge3_plane_scale_surface_refinement_v1",
                     "goal_maplet_moge3_plane_scale_surface_refinement_v2",
                 }

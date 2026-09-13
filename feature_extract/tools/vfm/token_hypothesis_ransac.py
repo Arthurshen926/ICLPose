@@ -72,7 +72,7 @@ def score_pose(pose,world,pixels,groups,K,k1,threshold=4.,group_starts=None,retu
 
 
 def solve(world,tokens,K,k1,rows,pixels=None,iterations=128,seed=260901,
-          sampling_policy='uniform',planes=None,scores=None,hypothesis_budget=None,stats=None):
+          sampling_policy='uniform',planes=None,scores=None,hypothesis_budget=None,stats=None,proposal_sampler=None):
     started=time.perf_counter()
     if sampling_policy not in ('uniform','geometry','geometry_score','row_uniform','context_prior'):raise ValueError('invalid sampling policy')
     if hypothesis_budget is not None and hypothesis_budget<1:raise ValueError('positive hypothesis budget required')
@@ -107,7 +107,8 @@ def solve(world,tokens,K,k1,rows,pixels=None,iterations=128,seed=260901,
     for _ in range(iterations):
         if hypothesis_budget is not None and valid_models>=hypothesis_budget:break
         attempted+=1
-        sample=guided_sample(rng,groups,centers,planes,scores,sampling_policy,plane_groups,group_ids)
+        sample=(guided_sample(rng,groups,centers,planes,scores,sampling_policy,plane_groups,group_ids)
+                if proposal_sampler is None else proposal_sampler(rng,groups,world,tokens))
         singular=np.linalg.svd(world[sample]-world[sample].mean(axis=0),compute_uv=False)
         if singular[1]<=max(1e-10,singular[0]*1e-8):continue
         try:
