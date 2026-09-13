@@ -11,7 +11,7 @@ from feature_extract.vfm.localization_goal_maplet.lineage import arrays_sha256,c
 
 
 def main():
- p=argparse.ArgumentParser(description=__doc__);p.add_argument('--base',type=Path,required=True);p.add_argument('--input',type=Path,required=True);p.add_argument('--output',type=Path,required=True);p.add_argument('--split',required=True);p.add_argument('--retain-all',action='store_true');p.add_argument('--arms',nargs='+',choices=['mnn','independent','joint','shuffled'],default=['mnn','independent','joint','shuffled']);a=p.parse_args();b=a.base;s=a.split;o=a.output;o.mkdir(parents=True,exist_ok=True);start=time.perf_counter()
+ p=argparse.ArgumentParser(description=__doc__);p.add_argument('--base',type=Path,required=True);p.add_argument('--input',type=Path,required=True);p.add_argument('--output',type=Path,required=True);p.add_argument('--split',required=True);p.add_argument('--retain-all',action='store_true');p.add_argument('--arms',nargs='+',choices=['mnn','independent','joint','shuffled','learned','overlap_mnn','weighted_mnn'],default=['mnn','independent','joint','shuffled']);a=p.parse_args();b=a.base;s=a.split;o=a.output;o.mkdir(parents=True,exist_ok=True);start=time.perf_counter()
  mp=b/'native_fine_v264/readout/map.npz';cp=b/'native_reliability_v274/readout'/f'{s}_reliability_rank32.npz';bp=b/'regularized_stage_precision_v357'/f'{s}_stage_plain_reg_all.npz';base,bm=read(bp)
  with np.load(mp) as f:maps={k:f[k] for k in f.files if k!='metadata_json'};mm=json.loads(f['metadata_json'].item())
  assert arrays_sha256(maps)==mm['arrays_sha256']
