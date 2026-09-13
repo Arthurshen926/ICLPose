@@ -86,3 +86,35 @@ def test_batched_lod_matches_reference_leaf_expansion_with_ties():
         leaves.append(int(memory.fine_leaf[b.argmax()]))
         expected.append(sorted(set(leaves)))
     assert cost['opened_leaf_ids']==expected
+
+
+def test_nonperiodic_depth_boundary_ignores_invalid_neighbors():
+    from feature_extract.tools.vfm.partial_overlap_matcher import depth_boundary
+    depth=np.zeros((36,64));depth[-1]=1;valid=np.ones_like(depth,bool)
+    b=depth_boundary(depth,valid).reshape(36,64)
+    assert not b[0].any() and b[-1].max()==1
+    valid[-1]=False
+    assert not depth_boundary(depth,valid).any()
+
+
+def test_matcher_padding_batch_and_hidden_cache_invariance():
+    torch.manual_seed(19);model=PartialOverlapMatcher().eval()
+    q=torch.randn(1,5,136);m=torch.randn(1,5,4,133);e=torch.ones(1,5,5)-torch.eye(5)[None];s=torch.randn(1,5,4,2)
+    with torch.no_grad():
+        o,i=model(q,m,e,s)
+        qp=torch.cat([q,torch.zeros(1,3,136)],1);mp=torch.cat([m,torch.randn(1,3,4,133)*100],1);sp=torch.cat([s,torch.randn(1,3,4,2)*100],1);ep=torch.zeros(1,8,8);ep[:,:5,:5]=e
+        op,ip=model(qp,mp,ep,sp)
+        qb=torch.cat([qp,torch.randn_like(qp)],0);mb=torch.cat([mp,torch.randn_like(mp)],0);eb=torch.cat([ep,torch.ones_like(ep)],0);sb=torch.cat([sp,torch.randn_like(sp)],0);ob,ib=model(qb,mb,eb,sb)
+        oz,iz=model(torch.zeros_like(qp),mp,ep,sp)
+    assert torch.allclose(o,op[:,:5],atol=1e-5) and torch.allclose(i,ip[:,:5],atol=1e-5)
+    assert torch.allclose(o,ob[:1,:5],atol=1e-5) and torch.allclose(i,ib[:1,:5],atol=1e-5)
+    assert torch.isfinite(oz).all() and torch.isfinite(iz).all()
+
+
+def test_candidate_padding_does_not_change_valid_logits():
+    torch.manual_seed(44);model=PartialOverlapMatcher().eval();q=torch.randn(1,4,136);m=torch.randn(1,4,3,133);s=torch.randn(1,4,3,2);e=torch.eye(4)[None]
+    with torch.no_grad():
+        o,i=model(q,m,e,s)
+        op,ip=model(q,torch.cat([m,torch.zeros(1,4,2,133)],2),e,torch.cat([s,torch.randn(1,4,2,2)*100],2))
+    assert torch.allclose(o,op,atol=1e-5) and torch.allclose(i,ip[:,:,:3],atol=1e-5)
+    assert (ip[:,:,3:]<-100).all()

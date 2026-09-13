@@ -10,12 +10,25 @@ from feature_extract.vfm.localization_goal_maplet.structured_local_memory import
 from feature_extract.tools.vfm.build_goal_maplet_fine_readout import sample_grid
 
 
+def depth_boundary(log_depth, valid):
+    """Backward differences without periodic edges or invalid-neighbor evidence."""
+    depth=np.asarray(log_depth).reshape(36,64);valid=np.asarray(valid,bool).reshape(36,64)
+    boundary=np.zeros_like(depth)
+    for axis in [0,1]:
+        dst=(slice(1,None),slice(None)) if axis==0 else (slice(None),slice(1,None))
+        src=(slice(None,-1),slice(None)) if axis==0 else (slice(None),slice(None,-1))
+        difference=np.where(valid[dst]&valid[src],np.abs(depth[dst]-depth[src]),0)
+        boundary[dst]=np.maximum(boundary[dst],difference)
+    return np.clip(boundary,0,2).ravel()
+
+
 def query_inputs(grids,points,normals,reliable,tokens):
     tokens=np.asarray(tokens,int);xy=np.c_[tokens%64*4+1.5,tokens//64*4+1.5]
     coarse=normalise(grids[0].reshape(2304,64));fine=sample_grid(grids[1],xy)
-    z=np.maximum(points[:,2],1e-6);median=np.median(z[reliable]) if reliable.any() else 1.
-    logz=np.log(z/median);depth=logz.reshape(36,64);boundary=np.maximum(np.abs(depth-np.roll(depth,1,0)),np.abs(depth-np.roll(depth,1,1))).ravel();boundary=np.clip(boundary,0,2)
-    qgeo=np.c_[xy/np.array([128,72])-1,np.clip(logz[tokens],-4,4),normals[tokens],reliable[tokens],boundary[tokens]]
+    reliable=np.asarray(reliable,bool)&np.isfinite(points).all(1)&(points[:,2]>0)
+    z=np.where(reliable,points[:,2],1.);median=np.median(z[reliable]) if reliable.any() else 1.
+    logz=np.where(reliable,np.log(z/median),0.);boundary=depth_boundary(logz,reliable)
+    qgeo=np.c_[xy/np.array([128,72])-1,np.clip(logz[tokens],-4,4),np.nan_to_num(normals[tokens]),reliable[tokens],boundary[tokens]]
     feature=np.c_[coarse[tokens],fine,qgeo].astype(np.float32)
     pixel_distance=np.linalg.norm(xy[:,None]-xy[None,:],axis=-1)
     edge=(pixel_distance<=16)&(np.abs(logz[tokens,None]-logz[tokens][None,:])<=np.log(1.25))&reliable[tokens,None]&reliable[tokens][None,:]
@@ -52,21 +65,30 @@ class PartialOverlapMatcher(nn.Module):
         self.feature_weight=nn.Parameter(torch.tensor([10.,0.]))
 
     def forward(self,query,map,edges,similarity):
-        q=self.query_encoder(query);m=self.map_encoder(map)
-        context,_=self.context(q,q,q,key_padding_mask=query.abs().sum(-1)==0,need_weights=False);q=q+context
+        valid=query.abs().sum(-1)>0
+        map_valid=(map.abs().sum(-1)>0)&valid[...,None]
+        similarity=similarity.masked_fill(~map_valid[...,None],0)
+        q=self.query_encoder(query);m=self.map_encoder(map).masked_fill(~map_valid[...,None],0)
+        padding=~valid;safe_padding=padding.clone();safe_padding[padding.all(-1),0]=False
+        context,_=self.context(q,q,q,key_padding_mask=safe_padding,need_weights=False);q=q+context
         appearance=(similarity*self.feature_weight).sum(-1)
         logits=torch.einsum('bnd,bnkd->bnk',self.cross_query(q),self.cross_map(m))/self.width**.5+appearance
-        attended=(logits.softmax(-1)[...,None]*m).sum(-2)
+        attention=logits.masked_fill(~map_valid,-1e4).softmax(-1)*map_valid
+        attention=attention/attention.sum(-1,keepdim=True).clamp_min(1e-12)
+        attended=(attention[...,None]*m).sum(-2)
         q=q+self.cross_update(torch.cat([q,attended],-1))
-        region=m.mean((1,2))[:,None].expand_as(q)
-        stats=torch.cat([similarity.max(-2).values,similarity.mean(-2)],-1)
+        region=(m.sum((1,2))/map_valid.sum((1,2)).clamp_min(1)[:,None])[:,None].expand_as(q)
+        maximum=similarity.masked_fill(~map_valid[...,None],-1e4).max(-2).values
+        maximum=maximum.masked_fill(~map_valid.any(-1)[...,None],0)
+        mean=similarity.sum(-2)/map_valid.sum(-1).clamp_min(1)[...,None]
+        stats=torch.cat([maximum,mean],-1)
         overlap=self.overlap(torch.cat([q,attended,region,stats],-1)).squeeze(-1)
-        gate=edges*overlap.sigmoid()[:,:,None]*overlap.sigmoid()[:,None,:]
+        gate=edges*valid[:,:,None]*valid[:,None,:]*overlap.sigmoid()[:,:,None]*overlap.sigmoid()[:,None,:]
         message=torch.bmm(gate,q)/gate.sum(-1,keepdim=True).clamp_min(1)
         refined=q+self.geometry_update(message)
         expanded=refined[:,:,None].expand_as(m)
         identity=appearance+self.identity(torch.cat([expanded,m,expanded*m,similarity],-1)).squeeze(-1)
-        return overlap,identity
+        return overlap.masked_fill(~valid,0),identity.masked_fill(~map_valid,-1e4)
 
 
 def masked_losses(overlap,identity,target,positive,known):

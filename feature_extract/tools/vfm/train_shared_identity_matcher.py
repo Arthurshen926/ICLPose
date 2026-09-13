@@ -1,15 +1,32 @@
-"""Train overlap and conditional identity; calibrate on mapping seq7 only."""
+"""Train a shared-anchor identity residual with frozen overlap and fixed mapping splits."""
 import argparse,json,time
 from pathlib import Path
 import numpy as np,torch
 from scipy.optimize import minimize
 from scipy.special import expit
-from feature_extract.tools.vfm.partial_overlap_matcher import PartialOverlapMatcher,masked_losses
+from feature_extract.tools.vfm.partial_overlap_matcher import PartialOverlapMatcher
+from feature_extract.tools.vfm.shared_identity_matcher import SharedIdentityMatcher, AppearanceIdentityMatcher, identity_objective
 from feature_extract.vfm.localization_goal_maplet.lineage import file_sha256
 
 
+class DecoupledMatcher(torch.nn.Module):
+    def __init__(self, base_model=None, shared=True, appearance_only=False):
+        super().__init__()
+        checkpoint=torch.load(base_model,map_location='cpu') if base_model is not None else None
+        self.base_metadata=checkpoint['metadata'] if checkpoint is not None else {}
+        self.base=PartialOverlapMatcher()
+        if checkpoint is not None:self.base.load_state_dict(checkpoint['state_dict'])
+        self.base.requires_grad_(False)
+        self.identity_model=AppearanceIdentityMatcher() if appearance_only else SharedIdentityMatcher(shared=shared)
+
+    def forward(self,query,map,edges,similarity,ids):
+        self.base.eval()
+        with torch.no_grad():overlap,_=self.base(query,map,edges,similarity)
+        return overlap,self.identity_model(query,map,edges,similarity,ids)
+
+
 def load_example(path):
-    with np.load(path) as f:return {k:torch.from_numpy(f[k].astype(np.float32) if k in ['query','map','edges','similarity','target'] else f[k].astype(bool)) for k in ['query','map','edges','similarity','target','positive','known']}
+    with np.load(path) as f:return {k:torch.from_numpy(f[k].astype(np.float32) if k in ['query','map','edges','similarity','target'] else f[k].astype(np.int64) if k=='ids' else f[k].astype(bool)) for k in ['query','map','edges','similarity','target','positive','known','ids']}
 
 
 def batch(examples,device):
@@ -32,7 +49,7 @@ def evaluate(model,data,device):
     model.eval();records=[]
     with torch.no_grad():
         for e,r in data:
-            x=batch([e],device);overlap,identity=model(x['query'],x['map'],x['edges'],x['similarity']);pred=identity.argmax(-1);chosen=x['positive'].gather(-1,pred[...,None]).squeeze(-1)
+            x=batch([e],device);overlap,identity=model(x['query'],x['map'],x['edges'],x['similarity'],x['ids']);pred=identity.argmax(-1);chosen=x['positive'].gather(-1,pred[...,None]).squeeze(-1)
             records.append(dict(route=r['route'],name=r['name'],target=e['target'].numpy().tolist(),overlap_logits=overlap[0].cpu().tolist(),identity_correct=chosen[0].cpu().tolist(),identity_available=e['positive'].any(-1).tolist(),coarse_identity_correct=e['positive'][torch.arange(len(e['target'])),e['similarity'][...,0].argmax(-1)].tolist()))
     return records
 
@@ -44,11 +61,11 @@ def report(records,calibration):
 
 
 def main():
-    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--data',type=Path,required=True);p.add_argument('--output',type=Path,required=True);p.add_argument('--seed',type=int,default=402);p.add_argument('--device',default='cuda:0');p.add_argument('--epochs',type=int,default=12);a=p.parse_args();a.output.mkdir(parents=True,exist_ok=False)
+    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--data',type=Path,required=True);p.add_argument('--output',type=Path,required=True);p.add_argument('--base-model',type=Path,required=True);p.add_argument('--local',action='store_true');p.add_argument('--seed',type=int,default=402);p.add_argument('--device',default='cuda:0');p.add_argument('--epochs',type=int,default=12);a=p.parse_args();a.output.mkdir(parents=True,exist_ok=False)
     torch.set_num_threads(1);torch.manual_seed(a.seed);np.random.seed(a.seed);torch.backends.cudnn.benchmark=False;manifest=json.load(open(a.data/'manifest.json'));train=[];validation=[]
     for r in manifest['records']:
         assert r['route'] not in ['seq10','seq13'];e=load_example(a.data/r['path']);(train if r['split']=='train' else validation).append((e,r))
-    known=np.concatenate([e['target'].numpy() for e,r in train]);weight=float((known==0).sum()/max(1,(known==1).sum()));model=PartialOverlapMatcher().to(a.device);optimizer=torch.optim.AdamW(model.parameters(),lr=3e-4,weight_decay=1e-3);history=[];rng=np.random.default_rng(a.seed);started=time.perf_counter()
+    known=np.concatenate([e['target'].numpy() for e,r in train]);weight=float((known==0).sum()/max(1,(known==1).sum()));model=DecoupledMatcher(a.base_model,shared=not a.local).to(a.device);optimizer=torch.optim.AdamW(model.identity_model.parameters(),lr=3e-4,weight_decay=1e-3);history=[];rng=np.random.default_rng(a.seed);started=time.perf_counter()
     for epoch in range(a.epochs):
         model.train();order=rng.permutation(len(train));losses=[]
         for start in range(0,len(order),4):
@@ -57,9 +74,9 @@ def main():
             # never relabel a hidden surface as a visible positive or negative.
             if rng.random()<.5:
                 xy=x['query'][...,-8:-6];center=torch.tensor(rng.uniform(-.6,.6,2),device=a.device);half=torch.tensor(rng.uniform(.15,.5,2),device=a.device);hidden=((xy-center).abs()<half).all(-1);x['query']=x['query'].masked_fill(hidden[...,None],0);x['target']=x['target'].masked_fill(hidden,-1);x['positive']=x['positive']&~hidden[...,None];x['known']=x['known']&~hidden[...,None];x['edges']=x['edges']*(~hidden)[:,:,None]*(~hidden)[:,None,:];x['map']=x['map'].masked_fill(hidden[...,None,None],0);x['similarity']=x['similarity'].masked_fill(hidden[...,None,None],0)
-            overlap,identity=model(x['query'],x['map'],x['edges'],x['similarity']);_,_,identity_loss=masked_losses(overlap,identity,x['target'],x['positive'],x['known']);valid=x['target']>=0
+            overlap,identity=model(x['query'],x['map'],x['edges'],x['similarity'],x['ids']);identity_loss,supervised,trust=identity_objective(identity,x['similarity'],x['positive'],x['known'],(x['map'].abs().sum(-1)>0)&(x['query'].abs().sum(-1)>0)[...,None]);valid=x['target']>=0
             overlap_loss=torch.nn.functional.binary_cross_entropy_with_logits(overlap[valid],x['target'][valid],pos_weight=torch.tensor(weight,device=a.device)) if valid.any() else overlap.sum()*0
-            loss=overlap_loss+identity_loss
+            loss=identity_loss
             if not torch.isfinite(loss):raise ValueError('nonfinite training objective')
             optimizer.zero_grad();loss.backward();torch.nn.utils.clip_grad_norm_(model.parameters(),1);optimizer.step();losses.append([float(loss.detach()),float(overlap_loss.detach()),float(identity_loss.detach())])
         history.append(dict(epoch=epoch+1,losses=np.mean(losses,axis=0).tolist()));print(history[-1],flush=True)
@@ -67,7 +84,7 @@ def main():
     results=evaluate(model,validation,a.device);cal=[r for r in results if r['route']=='seq7'];y=np.concatenate([r['target'] for r in cal]);z=np.concatenate([r['overlap_logits'] for r in cal]);known=y>=0;y=y[known];z=z[known]
     def objective(v):
         logits=np.exp(v[0])*z+v[1];return float(np.mean(np.logaddexp(0,logits)-y*logits))
-    fit=minimize(objective,[0.,0.],method='L-BFGS-B',bounds=[(-3,3),(-10,10)]);calibration=[float(np.exp(fit.x[0])),float(fit.x[1])]
-    meta=dict(seed=a.seed,epochs=a.epochs,training_routes=manifest['training_routes'],calibration_routes=['seq7'],confirmation_routes=['seq8','seq11'],training_pairs=len(train),validation_pairs=len(validation),train_manifest_sha256=file_sha256(a.data/'manifest.json'),source_sha256={str(p):file_sha256(p) for p in [Path(__file__),Path(__file__).with_name('partial_overlap_matcher.py')]},query_test_routes_opened=False,coordinate_head_trained=False,map_members_trained=False,overlap_calibration=calibration,calibration_optimizer_success=bool(fit.success),seconds=time.perf_counter()-started,parameters=sum(p.numel() for p in model.parameters()),class_weight=weight)
+    fit=minimize(objective,[0.,0.],method='L-BFGS-B',bounds=[(-3,3),(-10,10)]);calibration=model.base_metadata['overlap_calibration']
+    meta=dict(shared_physical_identity=not a.local,overlap_frozen=True,unknown_is_negative=False,full_candidate_teacher_kl_weight=.1,base_model_sha256=file_sha256(a.base_model),seed=a.seed,epochs=a.epochs,training_routes=manifest['training_routes'],calibration_routes=['seq7'],confirmation_routes=['seq8','seq11'],training_pairs=len(train),validation_pairs=len(validation),train_manifest_sha256=file_sha256(a.data/'manifest.json'),source_sha256={str(p):file_sha256(p) for p in [Path(__file__),Path(__file__).with_name('partial_overlap_matcher.py'),Path(__file__).with_name('shared_identity_matcher.py')]},query_test_routes_opened=False,coordinate_head_trained=False,map_members_trained=False,overlap_calibration=calibration,calibration_optimizer_success=bool(fit.success),seconds=time.perf_counter()-started,parameters=sum(p.numel() for p in model.parameters()),class_weight=weight)
     torch.save(dict(state_dict={k:v.cpu() for k,v in model.state_dict().items()},metadata=meta),a.output/'matcher.pt');(a.output/'metadata.json').write_text(json.dumps(meta,indent=2));(a.output/'history.json').write_text(json.dumps(history,indent=2));(a.output/'validation_predictions.json').write_text(json.dumps(results));summaries={route:report([r for r in results if r['route']==route],calibration) for route in ['seq7','seq8','seq11']};(a.output/'validation.json').write_text(json.dumps(summaries,indent=2));print(summaries,flush=True)
 if __name__=='__main__':main()
