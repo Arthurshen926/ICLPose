@@ -131,6 +131,7 @@ def main() -> None:
     parser.add_argument("--initial_candidates", type=Path, required=True)
     parser.add_argument("--plane_uv_atlas", type=Path, required=True)
     parser.add_argument("--query_contributors", type=Path, required=True)
+    parser.add_argument("--defer-evaluation", action="store_true", help="seal inference without opening query pose labels")
     parser.add_argument("--output_frozen_pose_inventory", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--solver_policy",choices=('legacy','unique_token_lm','unique_token_guarded_lm','token_ransac'),default='unique_token_lm')
@@ -254,6 +255,11 @@ def main() -> None:
         args.output_frozen_pose_inventory, **arrays,
         metadata_json=np.asarray(json.dumps(metadata, sort_keys=True)),
     )
+    if args.defer_evaluation:
+        from feature_extract.tools.vfm.deferred_pose_evaluation import write_deferred_evaluation
+        write_deferred_evaluation(args.output, args.output_frozen_pose_inventory, len(arrays["names"]))
+        return
+
     # Phase 2 starts only after the pose inventory is sealed.
     rows = []
     for index, name in enumerate(names.tolist()):

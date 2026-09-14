@@ -371,6 +371,7 @@ def main() -> None:
     parser.add_argument("--frozen_pose_inventory", type=Path, required=True)
     parser.add_argument("--frozen_correspondences", type=Path, required=True)
     parser.add_argument("--query_contributors", type=Path, required=True)
+    parser.add_argument("--defer-evaluation", action="store_true", help="seal inference without opening query pose labels")
     parser.add_argument(
         "--hypothesis_selection_policy",
         choices=("nearest_reprojection", "calibrated_gaussian_null"),
@@ -596,6 +597,11 @@ def main() -> None:
         args.output_frozen_pose_inventory, **arrays,
         metadata_json=np.asarray(json.dumps(metadata, sort_keys=True)),
     )
+
+    if args.defer_evaluation:
+        from feature_extract.tools.vfm.deferred_pose_evaluation import write_deferred_evaluation
+        write_deferred_evaluation(args.output, args.output_frozen_pose_inventory, len(arrays["names"]))
+        return
 
     # Phase 2 starts only after the refined pose artifact is sealed.
     rows, translation, rotation, finite = _evaluate(

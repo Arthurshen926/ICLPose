@@ -72,14 +72,19 @@ The KL term is a teacher prior, not extra positive/negative supervision.
     return supervised + .1 * trust, supervised, trust
 
 
-def reciprocal_identity(logits, ids, coarse_similarity, threshold):
+def reciprocal_identity(logits, ids, coarse_similarity, threshold, normalize=True):
     """Sparse candidate-graph reciprocity, with the frozen appearance floor.
 
+Row log-softmax fixes the additive score gauge left unconstrained by training.
+This is not probability calibration. normalize=False is an explicit raw-score control.
 Ties admit all equal maxima; final PnP still counts each query token once.
     """
     import numpy as np
     logits = np.asarray(logits)
     ids = np.asarray(ids)
+    if normalize:
+        shifted = logits - logits.max(-1, keepdims=True)
+        logits = shifted - np.log(np.exp(shifted).sum(-1, keepdims=True))
     selected = logits.argmax(-1)
     row = np.arange(len(ids))
     _, inverse = np.unique(ids, return_inverse=True)

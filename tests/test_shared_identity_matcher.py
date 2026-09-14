@@ -35,7 +35,7 @@ def test_unknown_is_not_a_supervised_negative():
 def test_reciprocal_identity_rejects_competing_query_and_preserves_physical_keys():
     import numpy as np
     from feature_extract.tools.vfm.shared_identity_matcher import reciprocal_identity
-    scores=np.array([[5.,1.],[6.,2.],[1.,8.]])
+    scores=np.array([[5.,2.],[6.,2.],[1.,8.]])
     ids=np.array([[7,8],[7,9],[7,10]])
     rows,columns=reciprocal_identity(scores,ids,np.ones_like(scores),.5)
     assert rows.tolist()==[1,2] and columns.tolist()==[0,1]
@@ -71,3 +71,28 @@ def test_frontend_loads_shared_and_appearance_checkpoints():
         with torch.no_grad():
             a=model(*x);b=loaded(*x)
         assert all(torch.equal(aa,bb) for aa,bb in zip(a,b))
+
+
+def test_reciprocal_identity_is_invariant_to_row_shifts():
+    import numpy as np
+    from feature_extract.tools.vfm.shared_identity_matcher import reciprocal_identity
+    x=np.array([[2.,0.],[1.5,.5]])
+    ids=np.array([[7,8],[7,8]])
+    a=reciprocal_identity(x,ids,np.ones_like(x),0)
+    b=reciprocal_identity(x+np.array([[0.],[10.]]),ids,np.ones_like(x),0)
+    assert a[0].tolist()==b[0].tolist()==[0]
+    assert a[1].tolist()==b[1].tolist()==[0]
+    old=reciprocal_identity(x+np.array([[0.],[10.]]),ids,np.ones_like(x),0,normalize=False)
+    assert old[0].tolist()==[1]
+
+
+def test_identity_objective_has_the_same_row_shift_gauge_as_decoder():
+    torch.manual_seed(13)
+    logits=torch.randn(1,3,4,dtype=torch.float64)
+    similarity=torch.randn(1,3,4,2,dtype=torch.float64)
+    positive=torch.zeros(1,3,4,dtype=torch.bool);positive[...,0]=True
+    known=torch.ones_like(positive);known[...,3]=False
+    valid=torch.ones_like(positive)
+    a=identity_objective(logits,similarity,positive,known,valid)
+    b=identity_objective(logits+torch.tensor([[[10.],[-7.],[3.]]]),similarity,positive,known,valid)
+    assert all(torch.allclose(x,y,atol=1e-10) for x,y in zip(a,b))

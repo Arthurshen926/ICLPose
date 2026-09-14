@@ -76,7 +76,7 @@ def score_pose(pose,world,pixels,groups,K,k1,threshold=4.,group_starts=None,retu
 
 
 def solve(world,tokens,K,k1,rows,pixels=None,iterations=128,seed=260901,
-          sampling_policy='uniform',planes=None,scores=None,hypothesis_budget=None,stats=None,proposal_sampler=None):
+          sampling_policy='uniform',planes=None,scores=None,hypothesis_budget=None,stats=None,proposal_sampler=None,proposal_collector=None):
     started=time.perf_counter()
     if sampling_policy not in ('uniform','geometry','geometry_score','row_uniform','context_prior','overlap_prior'):raise ValueError('invalid sampling policy')
     if hypothesis_budget is not None and hypothesis_budget<1:raise ValueError('positive hypothesis budget required')
@@ -126,6 +126,8 @@ def solve(world,tokens,K,k1,rows,pixels=None,iterations=128,seed=260901,
             valid_models+=1
             pose=np.eye(4);pose[:3,:3]=cv2.Rodrigues(rv)[0];pose[:3,3]=tv.reshape(3)
             key,_=score_pose(pose,world,pixels,groups,K,k1,group_starts=starts,return_selected=False)
+            if proposal_collector is not None and key[0]>=6:
+                proposal_collector.append((key,pose.copy()))
             if key>best_key:best,best_key=pose,key
     if stats is not None:stats.update(attempted_samples=attempted,scored_hypotheses=valid_models,
                                     budget_reached=hypothesis_budget is None or valid_models==hypothesis_budget)

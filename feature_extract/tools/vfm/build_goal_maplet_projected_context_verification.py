@@ -13,16 +13,30 @@ from feature_extract.vfm.localization_goal_maplet.lineage import file_sha256,arr
 
 
 def main():
- p=argparse.ArgumentParser(description=__doc__);p.add_argument('--base',type=Path,required=True);p.add_argument('--output',type=Path,required=True);p.add_argument('--device',default='cuda:0');p.add_argument('--observed_surface',action='store_true');p.add_argument('--phase_average',action='store_true');p.add_argument('--depth_visibility',choices=['none','observed','shuffled'],default='none');p.add_argument('--include_centered',action='store_true');p.add_argument('--splits',nargs='+',default=['seq10','shard0','shard1','shard2','shard3']);a=p.parse_args();
+ p=argparse.ArgumentParser(description=__doc__);p.add_argument('--base',type=Path,required=True);p.add_argument('--output',type=Path,required=True);p.add_argument('--device',default='cuda:0');p.add_argument('--context-map',type=Path);p.add_argument('--observed_surface',action='store_true');p.add_argument('--phase_average',action='store_true');p.add_argument('--depth_visibility',choices=['none','observed','shuffled'],default='none');p.add_argument('--include_centered',action='store_true');p.add_argument('--splits',nargs='+',default=['seq10','shard0','shard1','shard2','shard3']);a=p.parse_args();
  if a.depth_visibility!='none' and a.phase_average:raise ValueError('depth visibility and phase average are separate experiments')
  b=a.base;a.output.mkdir(parents=True,exist_ok=False)
- ap=b/'stmarys_metric_plane_uv_radio_atlas_cell050_p4_learned64d_strict_v9.npz';atlas,am=_load_atlas(ap);pp=b/'stmarys_chart_local_radio_projection_64d_v2.npz';mp=b/'native_context_v278/map.npz'
+ ap=b/'stmarys_metric_plane_uv_radio_atlas_cell050_p4_learned64d_strict_v9.npz';atlas,am=_load_atlas(ap);pp=b/'stmarys_chart_local_radio_projection_64d_v2.npz';mp=a.context_map or b/'native_context_v278/map.npz'
  with np.load(pp) as z:weight=torch.as_tensor(z['weight'],device=a.device)
  with np.load(mp) as z:mm=json.loads(z['metadata_json'].item());ma={k:z[k] for k in z.files if k!='metadata_json'}
  if arrays_sha256(ma)!=mm['arrays_sha256'] or canonical_json_sha256({k:v for k,v in mm.items() if k!='content_sha256'})!=mm['content_sha256'] or mm.get('query_pose_or_ground_truth_used_for_retrieval') is not False:raise ValueError('mapping-source authority differs')
  if mm['native_atlas_sha256']!=file_sha256(ap):raise ValueError('mapping/query-exclusion authority differs')
- used=set(mm['offline_mapping_source_names']);manifests=[Path('output/vfm_tokens/StMarysChurch/full_1024x576')/f'{s}_manifest.json' for s in ['train','test']];records=_records(manifests)
+ used=set(mm.get('offline_mapping_source_names',[]));manifests=[Path('output/vfm_tokens/StMarysChurch/full_1024x576')/f'{s}_manifest.json' for s in ['train','test']];records=_records(manifests)
  world=atlas['world_points'].astype(float);features=normalise(atlas['radio_features']);directions=normalise(atlas['prototype_view_direction_world']);source={str(x):file_sha256(x) for x in [ap,pp,mp,Path(__file__),Path(__file__).with_name('projected_surface_context.py')]+manifests}
+ exclusion=None
+ if mm.get('artifact_type')=='goal_maplet_native_crossroute_region_library_v1':
+  route=mm['excluded_mapping_route']
+  if a.splits!=[route]:raise ValueError('cross-route projection requires exactly its excluded route')
+  lp=b/'native_fine_v264/mapping_lineage.npz';fp=b/'native_fine_v264/readout/map.npz'
+  with np.load(fp) as z:fm=json.loads(z['metadata_json'].item())
+  if fm['atlas_sha256']!=file_sha256(ap) or fm['lineage_sha256']!=file_sha256(lp):raise ValueError('projection source lineage differs')
+  with np.load(lp) as z:sn=z['source_names'].astype(str);identity=z['prototype_source_and_cell'][:,0]
+  from feature_extract.tools.vfm.refinement_source_contract import validate_crossroute_support
+  keep=np.flatnonzero(np.asarray([n.split('__')[0] for n in sn])[identity]!=route)
+  exclusion=validate_crossroute_support([route+'__mapping'],keep,ma['geometry_member_rows'],identity,sn,route)
+  if len(identity)!=len(world):raise ValueError('projection atlas/source rows differ')
+  world,features,directions=world[keep],features[keep],directions[keep]
+  used=set(sn[identity[keep]]);source.update({str(lp):file_sha256(lp),str(fp):file_sha256(fp)})
  for split in a.splits:
   started=time.perf_counter();dirs={'pnp':b/'diverse_candidate_retention_v307'/f'{split}_diverse_support_consensus','refined':b/'diverse_refined_retention_v309'/f'{split}_diverse_refined_consensus'};pairs={};corrs={}
   for label,d in dirs.items():
@@ -31,6 +45,7 @@ def main():
    for path,_,_ in pairs[label]:source[str(path)]=file_sha256(path)
   names=pairs['pnp'][0][1]['names'].astype(str)
   if set(names)&used:raise ValueError('query/source overlap')
+  if exclusion and {n.split('__')[0] for n in names}!={mm['excluded_mapping_route']}:raise ValueError('query route differs')
   for pair in pairs.values():
    for path,arr,meta in pair:
     if not np.array_equal(names,arr['names'].astype(str)):raise ValueError('pose query alignment differs')
@@ -83,7 +98,7 @@ def main():
   for label,pair in pairs.items():
    for arm,choices in chosen[label].items():
     ch=np.asarray(choices,np.int8);arr=dict(names=pair[0][1]['names'],pose_w2c=np.stack([v[1]['pose_w2c'] for v in pair],axis=1)[np.arange(len(ch)),ch],usable=np.stack([v[1]['usable'] for v in pair],axis=1)[np.arange(len(ch)),ch],selected_branch=ch)
-    meta=dict(artifact_type='goal_maplet_projected_surface_context_selection_v1',arrays_sha256=arrays_sha256(arr),query_pose_or_ground_truth_read=False,source_rgb_used=False,source_sha256=source,arm=arm,pair=label,token_budget=128,map_visibility='approximate atlas z-buffer; 0.25m band; geometric nearest token center then anonymous view direction; not full surface visibility',selection='strict higher mean cosine, ties/empty retain primary',not_independent_of_generator_backbone=True,depth_visibility=a.depth_visibility,depth_visibility_scope="common-domain per-pose median scale; fixed 1.5 foreground ratio; not calibrated",centered_structure_controls=a.include_centered,observed_query_surface_mask=a.observed_surface,phase_averaged=a.phase_average,phase_uncertainty_scope="five +/-1 pixel perturbations, sensitivity proxy only" if a.phase_average else None)
+    meta=dict(artifact_type='goal_maplet_projected_surface_context_selection_v1',arrays_sha256=arrays_sha256(arr),query_pose_or_ground_truth_read=False,mapping_source_exclusion=exclusion,source_rgb_used=False,source_sha256=source,arm=arm,pair=label,token_budget=128,map_visibility='approximate atlas z-buffer; 0.25m band; geometric nearest token center then anonymous view direction; not full surface visibility',selection='strict higher mean cosine, ties/empty retain primary',not_independent_of_generator_backbone=True,depth_visibility=a.depth_visibility,depth_visibility_scope="common-domain per-pose median scale; fixed 1.5 foreground ratio; not calibrated",centered_structure_controls=a.include_centered,observed_query_surface_mask=a.observed_surface,phase_averaged=a.phase_average,phase_uncertainty_scope="five +/-1 pixel perturbations, sensitivity proxy only" if a.phase_average else None)
     meta['content_sha256']=canonical_json_sha256(meta);np.savez_compressed(a.output/f'{split}_{label}_{arm}.npz',**arr,metadata_json=np.array(json.dumps(meta,sort_keys=True)))
    (a.output/f'{split}_{label}_evidence.json').write_text(json.dumps(rows[label]))
   (a.output/f'{split}_timing.json').write_text(json.dumps(dict(seconds=time.perf_counter()-started,queries=len(names),scope='cached feature loading/projection/scoring, not RGB-to-pose runtime')))

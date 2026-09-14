@@ -175,6 +175,7 @@ def _threshold_counts(translation: np.ndarray, rotation: np.ndarray) -> dict[str
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--defer-evaluation", action="store_true", help="Freeze inference without opening pose labels or endpoint evaluations.")
     parser.add_argument("--point_pose", type=Path, required=True)
     parser.add_argument("--surface_pose", type=Path, required=True)
     parser.add_argument("--point_correspondences", type=Path, required=True)
@@ -318,6 +319,11 @@ def main() -> None:
         **arrays,
         metadata_json=np.asarray(json.dumps(metadata, sort_keys=True)),
     )
+
+    if args.defer_evaluation:
+        from feature_extract.tools.vfm.deferred_pose_evaluation import write_deferred_evaluation
+        write_deferred_evaluation(args.output, args.output_frozen_pose_inventory, len(names))
+        return
 
     # Phase 2: the selected pose is immutable before opening pose-bearing files.
     point_translation = np.full(len(names), np.inf, np.float64)

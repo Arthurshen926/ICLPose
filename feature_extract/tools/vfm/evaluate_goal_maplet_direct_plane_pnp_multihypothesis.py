@@ -379,6 +379,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--frozen_correspondences", type=Path, required=True)
     parser.add_argument("--query_contributors", type=Path, required=True)
+    parser.add_argument("--defer-evaluation", action="store_true", help="seal inference without opening query pose labels")
     parser.add_argument("--maximum_groups_per_kind", type=int, default=16)
     parser.add_argument("--seed_group_support",choices=('row_count','unique_tokens'),default='unique_tokens')
     parser.add_argument("--output_frozen_candidates", type=Path, required=True)
@@ -580,6 +581,11 @@ def main() -> None:
         args.output_frozen_candidates, **frozen_arrays,
         metadata_json=np.asarray(json.dumps(frozen_metadata, sort_keys=True)),
     )
+
+    if args.defer_evaluation:
+        from feature_extract.tools.vfm.deferred_pose_evaluation import write_deferred_evaluation
+        write_deferred_evaluation(args.output, args.output_frozen_candidates, len(arrays["names"]))
+        return
 
     summaries = {}
     postlabel_rows = []

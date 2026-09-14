@@ -169,6 +169,7 @@ def _load_endpoint_evaluation(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--defer-evaluation", action="store_true", help="Freeze inference without opening pose labels or endpoint evaluations.")
     parser.add_argument("--primary_pose", type=Path, required=True)
     parser.add_argument("--alternate_pose", type=Path, required=True)
     parser.add_argument("--plane_geometry", type=Path, required=True)
@@ -337,6 +338,11 @@ def main() -> None:
     np.savez_compressed(temporary, **arrays, metadata_json=np.asarray(json.dumps(metadata, sort_keys=True)))
     temporary.replace(args.output_frozen_pose)
     arrays, metadata = _load_selected(args.output_frozen_pose)
+
+    if args.defer_evaluation:
+        from feature_extract.tools.vfm.deferred_pose_evaluation import write_deferred_evaluation
+        write_deferred_evaluation(args.output, args.output_frozen_pose, len(arrays["names"]))
+        return
 
     # Phase 2 starts only after the immutable selected-pose artifact reloads.
     primary_rows = _load_endpoint_evaluation(

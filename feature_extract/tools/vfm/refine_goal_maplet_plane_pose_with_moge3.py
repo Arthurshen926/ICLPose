@@ -290,6 +290,7 @@ def main() -> None:
     parser.add_argument("--planar_map", type=Path, required=True)
     parser.add_argument("--query_plane_dir", type=Path, required=True)
     parser.add_argument("--query_contributors", type=Path, required=True)
+    parser.add_argument("--defer-evaluation", action="store_true", help="seal inference without opening query pose labels")
     parser.add_argument(
         "--query_support_weighting", choices=("uniform", "sqrt_visible_fraction"),
         default="uniform",
@@ -415,6 +416,11 @@ def main() -> None:
         args.output_frozen_pose_inventory, **arrays,
         metadata_json=np.asarray(json.dumps(metadata, sort_keys=True)),
     )
+    if args.defer_evaluation:
+        from feature_extract.tools.vfm.deferred_pose_evaluation import write_deferred_evaluation
+        write_deferred_evaluation(args.output, args.output_frozen_pose_inventory, len(arrays["names"]))
+        return
+
     # Phase 2: labels are opened only after the refined inventory is sealed.
     rows = []
     for index, name in enumerate(arrays["names"].astype(str).tolist()):

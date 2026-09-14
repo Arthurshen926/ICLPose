@@ -109,3 +109,14 @@ def test_row_and_token_controls_match_scored_model_budget():
         assert pose is not None and np.isfinite(pose).all()
         assert stats['scored_hypotheses']==128 and stats['budget_reached']
         np.testing.assert_allclose(pose,np.eye(4),atol=1e-5)
+
+
+def test_observational_proposal_collector_preserves_winner_and_budget():
+    world,tokens,pixels,K=fixture();rows=np.arange(len(world));plain={};collected={};pool=[]
+    before=solve(world,tokens,K,.02,rows,pixels,iterations=512,hypothesis_budget=64,stats=plain)
+    after=solve(world,tokens,K,.02,rows,pixels,iterations=512,hypothesis_budget=64,stats=collected,proposal_collector=pool)
+    np.testing.assert_array_equal(before,after)
+    assert plain['scored_hypotheses']==collected['scored_hypotheses']==64
+    assert plain['attempted_samples']==collected['attempted_samples']
+    assert pool and len(pool)<=64
+    assert all(key[0]>=6 and p.shape==(4,4) for key,p in pool)
