@@ -18,8 +18,8 @@ from feature_extract.vfm.localization_goal_maplet.lineage import file_sha256,arr
 
 
 def main():
- p=argparse.ArgumentParser(description=__doc__);p.add_argument('--domain',choices=['mapping','query'],required=True);p.add_argument('--split',required=True);a=p.parse_args();s=a.split;mapping=a.domain=='mapping'
- b=Path('output/g25_pose_transport/planar_map_rendered_ransac_v1/surface_coordinate_upgrade_v1');root=b/'strong_local_precision_v414';out=root/a.domain/'pairs';out.mkdir(exist_ok=True,parents=True);dest=out/f'{s}_unlabelled.json';assert not dest.exists();rb=b/'strong_endpoint_replay_v413/replay_base' if mapping else b
+ p=argparse.ArgumentParser(description=__doc__);p.add_argument('--domain',choices=['mapping','query'],required=True);p.add_argument('--split',required=True);p.add_argument('--base',type=Path,default=Path('output/g25_pose_transport/planar_map_rendered_ransac_v1/surface_coordinate_upgrade_v1'));a=p.parse_args();s=a.split;mapping=a.domain=='mapping'
+ b=a.base;root=b/'strong_local_precision_v414';out=root/a.domain/'pairs';out.mkdir(exist_ok=True,parents=True);dest=out/f'{s}_unlabelled.json';assert not dest.exists();rb=b/'strong_endpoint_replay_v413/replay_base' if mapping else b
  if mapping:
   seal=b/'strong_endpoint_replay_v413/endpoint_seal_before_labels.json';sm=json.load(open(seal));assert sm['full_mapping_counterpart_through_v357_complete']
  bp=rb/'regularized_stage_precision_v357'/f'{s}_stage_plain_reg_all.npz';arms=['stage_plain_reg_all','stage_robust_reg_all'];candidates=[root/a.domain/'candidates'/f'{s}_{arm}.npz' for arm in arms]

@@ -1,6 +1,7 @@
 """Fit conditional fine coordinate/variance models on frozen mapping supervision."""
 import argparse,json
 from pathlib import Path
+from feature_extract.vfm.localization_goal_maplet.mapping_image_partition import image_groups
 import numpy as np
 from feature_extract.tools.vfm.native_fine_reliability import reliability_features,fit,predict
 from feature_extract.tools.vfm.build_goal_maplet_native_fine_readout import load_grids,select_offsets
@@ -24,7 +25,12 @@ def main():
   sim=np.sum(sample_grid(grids[1],probes)*maps[d['prototype'][rows],None].astype(np.float32),axis=-1);sim[(np.abs(probes-center[:,None])>2+1e-8).any(2)]=-np.inf;best=select_offsets(sim,[],False);update=probes[np.arange(len(rows)),best]
   if not np.array_equal(update,d['update'][rows]):raise ValueError('mapping readout replay differs')
   features[rows]=reliability_features(sim,update-d['original'][rows],d['variance'][rows])
- routes=np.array([str(d['source_names'][i]).split('__')[0] for i in d['source']]);train=np.isin(routes,cal['training_routes']);weights=np.zeros(len(train))
+ routes=np.array([str(d['source_names'][i]).split('__')[0] for i in d['source']])
+ if cal.get('mapping_image_partition'):
+  part=Path(cal['mapping_image_partition'])
+  if file_sha256(part)!=cal['mapping_image_partition_sha256']:raise ValueError('Calibration partition changed')
+  routes=image_groups(d['source_names'][d['source']],part)
+ train=np.isin(routes,cal.get('training_groups',cal['training_routes']));weights=np.zeros(len(train))
  for src in np.unique(d['source']):rows=d['source']==src;weights[rows]=1./rows.sum()
  model=fit(features[train],d['original'][train],d['update'][train],d['target'][train],d['variance'][train],weights[train],cal['alpha'],cal['variance_scale']);alpha,var=predict(model,features,d['variance']);report={}
  for split,mask in [('train',train),('heldout',~train)]:
@@ -34,6 +40,7 @@ def main():
    stats[arm]=dict(mean_pixel_error=float(error.mean()),median_pixel_error=float(np.median(error)),mean_gaussian_nll=float(np.mean(np.log(2*np.pi*v)+error**2/(2*v))))
   report[split]=stats
  payload=dict(artifact_type='goal_maplet_native_fine_reliability_v1',model=model,map_sha256=file_sha256(mapfile),source_mapping_rows_sha256=file_sha256(datafile),query_ground_truth_read=False,heldout_used_to_fit=False,training_routes=cal['training_routes'],heldout_routes=cal['heldout_routes'],conditional_correct_identity_only=True,report=report,fixed_alpha=cal['alpha'],fixed_variance_scale=cal['variance_scale'])
+ if cal.get('mapping_image_partition'):payload.update(mapping_image_partition_sha256=cal['mapping_image_partition_sha256'],fit_validation_image_disjoint=True,fit_validation_route_disjoint=False)
  payload['content_sha256']=canonical_json_sha256(payload);(o/'model.json').write_text(json.dumps(payload,indent=2));np.savez_compressed(o/'mapping_features.npz',features=features,source=d['source']);print(json.dumps(report),flush=True)
 
 if __name__=='__main__':main()

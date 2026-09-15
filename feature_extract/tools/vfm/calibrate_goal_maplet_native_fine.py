@@ -6,6 +6,7 @@ Independent mapping routes audit frozen coefficients; query GT is never read.
 """
 import argparse,json
 from pathlib import Path
+from feature_extract.vfm.localization_goal_maplet.mapping_image_partition import image_groups, partition_metadata
 import numpy as np
 import torch
 from feature_extract.tools.vfm.build_goal_maplet_native_fine_readout import load_grids,select_offsets
@@ -18,25 +19,32 @@ from feature_extract.vfm.localization_goal_maplet.lineage import arrays_sha256,c
 
 
 def main():
-    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--base',type=Path,required=True);p.add_argument('--output',type=Path,required=True);a=p.parse_args();b=a.base;o=a.output;o.mkdir(parents=True,exist_ok=True)
+    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--base',type=Path,required=True);p.add_argument('--output',type=Path,required=True);p.add_argument('--mapping-contributors',type=Path,default=Path('output/vfm/2dgs_surface/StMarysChurch/full_train/mainline_v6/contributors_alltrain_clean'));p.add_argument('--training-routes',nargs='+',default=['seq1','seq2','seq4','seq6']);p.add_argument('--heldout-routes',nargs='+',default=['seq7','seq8','seq9','seq11']);p.add_argument('--mapping-image-partition',type=Path);a=p.parse_args();b=a.base;o=a.output;o.mkdir(parents=True,exist_ok=True)
     if (o/'calibration.json').exists():raise FileExistsError(o/'calibration.json')
     atlaspath=b/'stmarys_metric_plane_uv_radio_atlas_cell050_p4_learned64d_strict_v9.npz';mapfile=b/'native_fine_v264/readout/map.npz';lineagefile=b/'native_fine_v264/mapping_lineage.npz';headfile=b/'stmarys_mapping_canonical_subtoken_head_shrunk_v4.npz'
     with np.load(mapfile) as z:maps={k:z[k] for k in ['world_points','fine','available']};meta=json.loads(str(z['metadata_json']))
     with np.load(atlaspath) as z:features=z['radio_features'].astype(np.float32)
     with np.load(lineagefile) as z:names=z['source_names'].astype(str);sources=z['prototype_source_and_cell'][:,0]
-    routes=np.array([n.split('__')[0] for n in names]);train=['seq1','seq2','seq4','seq6'];held=['seq7','seq8','seq9','seq11'];head,hm=load_mapping_subtoken_head(headfile);head.eval();torch.set_num_threads(1)
+    routes=np.array([n.split('__')[0] for n in names]);train=a.training_routes;held=a.heldout_routes;head,hm=load_mapping_subtoken_head(headfile);head.eval();torch.set_num_threads(1)
+    if a.mapping_image_partition is not None:
+        routes=image_groups(names,a.mapping_image_partition);train=['mapping_images_fit'];held=['mapping_images_validation']
+    if set(train)&set(held):raise ValueError('Calibration fit and validation groups overlap')
     selected=[]
     for route in train+held:
         indices=np.flatnonzero(routes==route);indices=np.array([i for i in indices if (b/'adaptive_memory_v234/fine_cache'/names[i]).exists()])
         selected.extend(indices[np.linspace(0,len(indices)-1,min(20,len(indices)),dtype=int)])
     frozen=dict(training_routes=train,heldout_routes=held,maximum_views_per_route=20,maximum_rows_per_view=128,depth_tolerance='abs(map projected z - 2DGS dominant z)<=max(0.10m,0.01*z)',source_route_exclusion=True,identity_teacher='visible native projected anchor within token; highest coarse cosine identity per token',query_ground_truth_read=False,map_sha256=file_sha256(mapfile),head_sha256=file_sha256(headfile))
+    if a.mapping_image_partition is not None:
+        pm=partition_metadata(a.mapping_image_partition)
+        frozen.update(mapping_image_partition=str(a.mapping_image_partition),mapping_image_partition_sha256=file_sha256(a.mapping_image_partition),training_groups=train,heldout_groups=held,training_routes=pm['fit_mapping_routes'],heldout_routes=pm['validation_mapping_routes'],source_route_exclusion=False,source_group_exclusion=True,fit_validation_image_disjoint=True)
     (o/'protocol.json').write_text(json.dumps(frozen,indent=2));chunks={k:[] for k in ['original','update','target','variance','source','prototype']};ledger={}
     offsets=np.array([(x,y) for y in [-4/3,0.,4/3] for x in [-4/3,0.,4/3]])
     for num,src in enumerate(selected):
-        name=names[src];path=Path('output/vfm/2dgs_surface/StMarysChurch/full_train/mainline_v6/contributors_alltrain_clean')/name
+        name=names[src];path=a.mapping_contributors/name
         with np.load(path) as z:pose=z['pose_w2c'];K,k1=_scaled_intrinsics(int(z['camera_model_id']),z['camera_params'],int(z['camera_width']),int(z['camera_height']));depth=z['dominant_depth'].astype(float)
         xy,cam=_project(pose,maps['world_points'],K,k1)
         valid=maps['available']&(routes[sources]!=routes[src])&(cam[:,2]>0)&np.isfinite(xy).all(1)&(xy[:,0]>=0)&(xy[:,0]<255)&(xy[:,1]>=0)&(xy[:,1]<143)
+        if a.mapping_image_partition is not None:valid &= np.isin(routes[sources],train+held)
         rows=np.flatnonzero(valid);pix=np.floor(xy[rows]+.5).astype(int);dz=depth[pix[:,1],pix[:,0]];rows=rows[np.isfinite(dz)&(dz>0)&(np.abs(dz-cam[rows,2])<=np.maximum(.1,.01*cam[rows,2]))]
         cache=b/'adaptive_memory_v234/fine_cache'/name;grids,ck=load_grids(cache,meta['projection_sha256'])
         if ck!=meta['checkpoint_sha256']:raise ValueError('mapping checkpoint mismatch')

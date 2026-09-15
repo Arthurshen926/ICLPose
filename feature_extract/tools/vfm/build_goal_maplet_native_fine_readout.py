@@ -40,6 +40,9 @@ def load_grids(path, projection_sha):
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--base',type=Path,required=True);p.add_argument('--output',type=Path,required=True);p.add_argument('--phase',choices=['map','query'],required=True)
+    p.add_argument('--mapping-contributors',type=Path,default=Path('output/vfm/2dgs_surface/StMarysChurch/full_train/mainline_v6/contributors_alltrain_clean'))
+    p.add_argument('--query-names',type=Path,help='Complete official query name list used for map/query exclusion.')
+    p.add_argument('--splits',nargs='+',default=['seq10','shard0','shard1','shard2','shard3'])
     a=p.parse_args();b=a.base;root=a.output;root.mkdir(parents=True,exist_ok=True);native=b/'native_fine_v264';atlaspath=b/'stmarys_metric_plane_uv_radio_atlas_cell050_p4_learned64d_strict_v9.npz';projsha=file_sha256(b/'stmarys_chart_local_radio_projection_64d_v2.npz')
     with np.load(atlaspath) as z:world=z['world_points'];plane=np.repeat(np.arange(len(z['plane_texel_offsets'])-1),np.diff(z['plane_texel_offsets']))
     if a.phase=='map':
@@ -49,10 +52,12 @@ def main():
             for k in old.files:
                 if k!='metadata_json' and not np.array_equal(old[k],z[k]):raise ValueError('native atlas reconstruction differs')
         with np.load(native/'mapping_lineage.npz') as z:names=z['source_names'].astype(str);lineage=z['prototype_source_and_cell'];assert bool(z['offline_only'])
-        if any(n.startswith(('seq10__','seq13__')) for n in names):raise ValueError('map/query source overlap')
+        if a.query_names is not None:
+            if set(names) & set(json.loads(a.query_names.read_text())):raise ValueError('map/query source overlap')
+        elif any(n.startswith(('seq10__','seq13__')) for n in names):raise ValueError('map/query source overlap')
         desc=np.zeros((2,len(world),64),np.float16);available=np.zeros(len(world),bool);hashes={};checkpoint=None
         for j,src in enumerate(np.unique(lineage[:,0])):
-            name=names[src];rows=np.flatnonzero(lineage[:,0]==src);path=Path('output/vfm/2dgs_surface/StMarysChurch/full_train/mainline_v6/contributors_alltrain_clean')/name
+            name=names[src];rows=np.flatnonzero(lineage[:,0]==src);path=a.mapping_contributors/name
             with np.load(path) as z:pose=z['pose_w2c'];K,k1=_scaled_intrinsics(int(z['camera_model_id']),z['camera_params'],int(z['camera_width']),int(z['camera_height']))
             xy=cv2.projectPoints(world[rows],cv2.Rodrigues(pose[:3,:3])[0],pose[:3,3],K,np.array([k1,0.,0.,0.,0.]))[0].reshape(-1,2);camera=world[rows]@pose[:3,:3].T+pose[:3,3];valid=(camera[:,2]>0)&np.isfinite(xy).all(1)&(xy[:,0]>=0)&(xy[:,0]<=255)&(xy[:,1]>=0)&(xy[:,1]<=143);available[rows]=valid
             cp=b/'adaptive_memory_v234/fine_cache'/name;grids,ck=load_grids(cp,projsha)
@@ -72,7 +77,7 @@ def main():
     offsets=np.array([(x,y) for y in [-4/3,0.,4/3] for x in [-4/3,0.,4/3]])
     protocol=dict(map_sha256=file_sha256(root/'map.npz'),maximum_tokens=128,patch='same physical plane, query plane, and 8x8 coarse-token image block; at least 3 distinct tokens',mask='smallest frozen MoGe pose residual per token; uniformly spaced token ids up to128; map available; residual<=4px',arms=['coarse','fine','joint'],anchors_fixed=True,uncertainty='original frozen variances retained; not recalibrated for fine updates',query_ground_truth_read=False)
     (root/'protocol.json').write_text(json.dumps(protocol,indent=2))
-    for split in ['seq10','shard0','shard1','shard2','shard3']:
+    for split in a.splits:
         corrpath=b/'native_scope_v254/wide'/f'{split}_appearance.npz';corr,meta=_load(corrpath);initialpath=b/'native_scope_mainline_v255'/(split+'_wide')/'moge.npz';poses,_=_load_pose_candidate(initialpath)
         if not np.array_equal(corr['names'],poses['names']):raise ValueError('query order differs')
         if not np.array_equal(corr['world_points'],world[corr['prototype_atlas_row']]):raise ValueError('native correspondence geometry differs from atlas')

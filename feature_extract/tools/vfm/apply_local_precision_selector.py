@@ -7,7 +7,7 @@ from feature_extract.tools.vfm.select_goal_maplet_separated_modes import separat
 from feature_extract.tools.vfm.build_goal_maplet_native_fine_readout import load_grids
 from feature_extract.tools.vfm.verification_bank_contract import validate_bank,validate_poses
 from feature_extract.vfm.localization_goal_maplet.lineage import file_sha256,arrays_sha256,canonical_json_sha256
-p=argparse.ArgumentParser();p.add_argument('--variant',required=True,choices=['control','control_seed2','appearance','appearance_seed2']);a=p.parse_args();v=a.variant
+p=argparse.ArgumentParser();p.add_argument('--variant',required=True,choices=['control','control_seed2','appearance','appearance_seed2']);p.add_argument('--base',type=Path,default=Path('output/g25_pose_transport/planar_map_rendered_ransac_v1/surface_coordinate_upgrade_v1'));p.add_argument('--splits',nargs='+',default=['seq10','shard0','shard1','shard2','shard3']);a=p.parse_args();v=a.variant
 blocked=[]
 def guard(event,args):
  if event=='open' and isinstance(args[0],(str,bytes,os.PathLike)):
@@ -15,8 +15,8 @@ def guard(event,args):
   if ('contributors' in s and path.name.startswith(('seq10__','seq13__'))) or path.name in ['metrics.json','comparison.json','candidate_pool_oracle.json']:
    blocked.append(s);raise PermissionError('query label/metric read prohibited')
 sys.addaudithook(guard)
-b=Path('output/g25_pose_transport/planar_map_rendered_ransac_v1/surface_coordinate_upgrade_v1');r=b/'local_precision_v409';o=r/v;o.mkdir(exist_ok=True);maps,meta,common=load_map(b);mp=b/'native_fine_v264/readout/map.npz';mh=file_sha256(mp);modelpath=r/'local_selector.joblib';fit=joblib.load(modelpath);assert not fit['metadata']['query_routes_read'];common[str(modelpath)]=file_sha256(modelpath);seed=2 if v.endswith('seed2') else 1
-for s in ['seq10','shard0','shard1','shard2','shard3']:
+b=a.base;r=b/'local_precision_v409';o=r/v;o.mkdir(exist_ok=True);maps,meta,common=load_map(b);mp=b/'native_fine_v264/readout/map.npz';mh=file_sha256(mp);modelpath=r/'local_selector.joblib';fit=joblib.load(modelpath);assert not fit['metadata']['query_routes_read'];common[str(modelpath)]=file_sha256(modelpath);seed=2 if v.endswith('seed2') else 1
+for s in a.splits:
  bp=b/'heldout_evidence_v405'/f'mnn_seed{seed}'/f'{s}_corroborate.npz';oldpath=b/'overlap_lod_v402/lod_fixed_final'/f'{s}_mnn_audit.json';newpath=b/'overlap_lod_v402/lod_seed2_final'/f'{s}_mnn_audit.json' if v.startswith('control') else b/'shared_identity_v408'/('pose_'+v)/'lod_final'/f'{s}_identity_mnn_audit.json';bank=b/'heldout_evidence_v405/banks'/f'{s}.npz';cp=b/'native_reliability_v274/readout'/f'{s}_reliability_rank32.npz'
  with np.load(bp) as f:names=f['names'];base=f['pose_w2c'];validate_poses(base)
  with np.load(bank) as f:bk={k:f[k] for k in f.files if k!='metadata_json'};bm=json.loads(f['metadata_json'].item())

@@ -13,6 +13,11 @@ def test_flattened_strict_colmap_image_has_cambridge_alias(monkeypatch, tmp_path
         xys=np.zeros((0, 2)), point3d_ids=np.zeros((0,), dtype=np.int64),
     )
     monkeypatch.setattr(builder, "read_colmap_cameras_binary", lambda _path: {1: camera})
-    monkeypatch.setattr(builder, "read_colmap_images_binary", lambda _path: {1: image})
+    from feature_extract.tools.vfm import cambridge_camera_authority
+    monkeypatch.setattr(cambridge_camera_authority, "camera_bindings",
+                        lambda _path: {image.image_name: image.camera_id})
+    def forbidden(_path):
+        raise AssertionError("Camera lookup must not decode extrinsics")
+    monkeypatch.setattr(builder, "read_colmap_images_binary", forbidden)
     result = builder._load_camera_by_image(str(tmp_path))
     assert result["seq2/frame00001.png"] is camera

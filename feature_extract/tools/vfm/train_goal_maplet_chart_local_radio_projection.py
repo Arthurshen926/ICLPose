@@ -6,6 +6,8 @@ import argparse
 import json
 from pathlib import Path
 
+from feature_extract.vfm.localization_goal_maplet.mapping_image_partition import image_groups, partition_metadata
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -137,6 +139,7 @@ def main() -> None:
     parser.add_argument("--planar_map", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--validation_route", default="seq9")
+    parser.add_argument("--mapping_image_partition", type=Path, help="Optional fixed train-image partition for a single mapping trajectory.")
     parser.add_argument("--cell_size_m", type=float, default=0.5)
     parser.add_argument("--output_dimension", type=int, default=64)
     parser.add_argument("--steps", type=int, default=1200)
@@ -181,8 +184,13 @@ def main() -> None:
     route_per_observation = np.asarray([
         str(name).split("__", 1)[0] for name in visibility.view_names.astype(str)
     ])
+    if args.mapping_image_partition is not None:
+        route_per_observation = image_groups(visibility.view_names.astype(str), args.mapping_image_partition)
+        args.validation_route = 'mapping_images_validation'
     all_routes = sorted(set(route_per_observation.tolist()))
     fit_routes = set(all_routes) - {str(args.validation_route)}
+    if args.mapping_image_partition is not None:
+        fit_routes = {'mapping_images_fit'}
     if str(args.validation_route) not in all_routes or not fit_routes:
         raise ValueError("validation route does not form a mapping-only split")
     fit = _pair_inventory(identity, observation, route_per_observation, fit_routes)
@@ -257,6 +265,8 @@ def main() -> None:
         "planar_map_file_sha256": file_sha256(args.planar_map),
         "arrays_sha256": arrays_sha256(arrays),
     }
+    if args.mapping_image_partition is not None:
+        metadata.update(partition_metadata(args.mapping_image_partition))
     metadata["content_sha256"] = canonical_json_sha256(metadata)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(args.output, **arrays, metadata_json=np.asarray(json.dumps(metadata, sort_keys=True)))

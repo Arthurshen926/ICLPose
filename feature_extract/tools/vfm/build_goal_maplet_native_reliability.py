@@ -25,7 +25,9 @@ def main():
   if a.protocol_reference:
    if not inputs:raise ValueError('protocol reference requires explicit input manifest')
    # Configuration metadata only: query arrays and evaluation errors are not loaded.
-   with np.load(a.protocol_reference) as z:meta=json.loads(z['metadata_json'].item())
+   if a.protocol_reference.suffix=='.json':meta=json.loads(a.protocol_reference.read_text())
+   else:
+    with np.load(a.protocol_reference) as z:meta=json.loads(z['metadata_json'].item())
    reference=None
   else:reference,meta=_load(b/'native_token_fine_v273/readout'/f'{split}_fine_calibrated.npz')
   exclusion=None

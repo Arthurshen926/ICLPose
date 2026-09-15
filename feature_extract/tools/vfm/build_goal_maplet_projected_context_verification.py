@@ -1,6 +1,7 @@
 """Freeze projected RADIO verification controls on two existing candidate pairs."""
 import argparse,json,time
 from pathlib import Path
+from feature_extract.tools.vfm.complete_scene_inputs import radio_manifests
 import numpy as np
 import torch
 from feature_extract.tools.vfm.projected_surface_context import project_field,score_pair,phase_averaged_field,foreground_visibility
@@ -21,7 +22,7 @@ def main():
  with np.load(mp) as z:mm=json.loads(z['metadata_json'].item());ma={k:z[k] for k in z.files if k!='metadata_json'}
  if arrays_sha256(ma)!=mm['arrays_sha256'] or canonical_json_sha256({k:v for k,v in mm.items() if k!='content_sha256'})!=mm['content_sha256'] or mm.get('query_pose_or_ground_truth_used_for_retrieval') is not False:raise ValueError('mapping-source authority differs')
  if mm['native_atlas_sha256']!=file_sha256(ap):raise ValueError('mapping/query-exclusion authority differs')
- used=set(mm.get('offline_mapping_source_names',[]));manifests=[Path('output/vfm_tokens/StMarysChurch/full_1024x576')/f'{s}_manifest.json' for s in ['train','test']];records=_records(manifests)
+ used=set(mm.get('offline_mapping_source_names',[]));manifests=radio_manifests(b);records=_records(manifests)
  world=atlas['world_points'].astype(float);features=normalise(atlas['radio_features']);directions=normalise(atlas['prototype_view_direction_world']);source={str(x):file_sha256(x) for x in [ap,pp,mp,Path(__file__),Path(__file__).with_name('projected_surface_context.py')]+manifests}
  exclusion=None
  if mm.get('artifact_type')=='goal_maplet_native_crossroute_region_library_v1':

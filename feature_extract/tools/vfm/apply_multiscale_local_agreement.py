@@ -6,10 +6,15 @@ from feature_extract.vfm.localization_goal_maplet.lineage import file_sha256,arr
 
 
 def main():
- p=argparse.ArgumentParser();p.add_argument('--domain',choices=['mapping','query'],required=True);args=p.parse_args();b=Path('output/g25_pose_transport/planar_map_rendered_ransac_v1/surface_coordinate_upgrade_v1');r=b/'strong_local_precision_v414'
- splits=['seq1','seq2','seq4','seq6','seq7','seq8','seq11'] if args.domain=='mapping' else ['seq10','shard0','shard1','shard2','shard3']
- for seed in ([0] if args.domain=='mapping' else [1,2]):
-  out=r/('mapping_agreement' if seed==0 else f'query_agreement_seed{seed}');out.mkdir(exist_ok=False)
+ p=argparse.ArgumentParser();p.add_argument('--domain',choices=['mapping','query'],required=True)
+ p.add_argument('--base',type=Path,default=Path('output/g25_pose_transport/planar_map_rendered_ransac_v1/surface_coordinate_upgrade_v1'))
+ p.add_argument('--splits',nargs='+');p.add_argument('--seeds',type=int,nargs='+');p.add_argument('--output',type=Path)
+ args=p.parse_args();b=args.base;r=b/'strong_local_precision_v414'
+ splits=args.splits or (['seq1','seq2','seq4','seq6','seq7','seq8','seq11'] if args.domain=='mapping' else ['seq10','shard0','shard1','shard2','shard3'])
+ seeds=args.seeds or ([0] if args.domain=='mapping' else [1,2])
+ if any(seed not in ([0] if args.domain=='mapping' else [1,2]) for seed in seeds):raise ValueError('seed does not belong to the requested domain')
+ for seed in seeds:
+  out=(args.output or r)/('mapping_agreement' if seed==0 else f'query_agreement_seed{seed}');out.mkdir(parents=True,exist_ok=False)
   for s in splits:
    up=r/args.domain/'pairs'/f'{s}_unlabelled.json';f=json.load(open(up));bp=Path(f['base_path']);assert file_sha256(bp)==f['sources'][str(bp)]
    with np.load(bp) as z:names=z['names'];base=z['pose_w2c']

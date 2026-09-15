@@ -1685,18 +1685,32 @@ def _build_adjacency(
     )
     adjacency = []
     for row, candidates in enumerate(neighbors):
-        current = []
-        for col in candidates:
-            if int(col) == int(row):
-                continue
-            if float(np.dot(normals[row], normals[int(col)])) < float(normal_cosine_threshold):
-                continue
-            center_distance = float(np.linalg.norm(centers[row] - centers[int(col)]))
-            support_distance = float(radius) + float(effective_radius[row]) + float(effective_radius[int(col)])
-            if center_distance > support_distance:
-                continue
-            current.append(int(col))
-        adjacency.append(np.asarray(sorted(current), dtype=np.int64))
+        columns = np.asarray(candidates, dtype=np.int64)
+        columns = columns[columns != row]
+        if not len(columns):
+            adjacency.append(columns)
+            continue
+        products = normals[columns] * normals[row]
+        cosine = products.sum(axis=1)
+        delta = centers[row] - centers[columns]
+        distance = np.linalg.norm(delta, axis=1)
+        support = float(radius) + float(effective_radius[row]) + effective_radius[columns]
+        keep = ~((cosine < float(normal_cosine_threshold)) | (distance > support))
+        # Batched reductions can round differently from the original scalar
+        # dot/norm. Re-evaluate boundary cases with exactly the old operations.
+        normal_eps = np.finfo(products.dtype).eps if products.dtype.kind == 'f' else 0.
+        distance_eps = np.finfo(distance.dtype).eps
+        near = ((np.abs(cosine - float(normal_cosine_threshold)) <=
+                 16 * normal_eps * (np.abs(products).sum(axis=1) + abs(float(normal_cosine_threshold)) + 1)) |
+                (np.abs(distance - support) <=
+                 16 * distance_eps * (np.abs(distance) + np.abs(support) + 1)))
+        for index in np.flatnonzero(near):
+            col = int(columns[index])
+            keep[index] = not (
+                float(np.dot(normals[row], normals[col])) < float(normal_cosine_threshold) or
+                float(np.linalg.norm(centers[row] - centers[col])) >
+                float(radius) + float(effective_radius[row]) + float(effective_radius[col]))
+        adjacency.append(np.sort(columns[keep]))
     return tuple(adjacency)
 
 

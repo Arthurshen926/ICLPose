@@ -15,6 +15,8 @@ import json
 from pathlib import Path
 
 import cv2
+from feature_extract.vfm.localization_goal_maplet.mapping_image_partition import image_groups, partition_metadata
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -521,6 +523,28 @@ def _closed_form_coordinate_shrinkage(mean: np.ndarray, target: np.ndarray) -> f
     ))
 
 
+def _tail_constrained_coordinate_shrinkage(mean, target):
+    """Minimize calibration MSE subject to nonincreasing calibration p90.
+
+    Uses only the caller's calibration rows. The independent validation gate
+    remains unchanged; this empirical constraint is not a test guarantee.
+    """
+    prediction = np.asarray(mean, np.float64).reshape(-1, 2)
+    truth = np.asarray(target, np.float64).reshape(-1, 2)
+    reference = _closed_form_coordinate_shrinkage(prediction, truth)
+    if not (np.isfinite(prediction).all() and np.isfinite(truth).all()):
+        raise ValueError("nonfinite calibration inputs")
+    baseline = np.quantile(np.linalg.norm(truth, axis=1), .9)
+    candidates = np.unique(np.r_[np.linspace(0., reference, 1001), reference])
+    best, best_loss = 0., float(np.mean(truth ** 2))
+    for alpha in candidates:
+        residual = alpha * prediction - truth
+        loss = float(np.mean(residual ** 2))
+        if np.quantile(np.linalg.norm(residual, axis=1), .9) <= baseline and loss < best_loss:
+            best, best_loss = float(alpha), loss
+    return best
+
+
 def _closed_form_coordinate_affine(mean: np.ndarray, target: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Fit the six-parameter 2D affine calibration on mapping observations."""
     prediction = np.asarray(mean, np.float64).reshape(-1, 2)
@@ -969,6 +993,7 @@ def main() -> None:
     parser.add_argument("--radio_projection", type=Path, required=True)
     parser.add_argument("--mapping_contributors", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--tail_constrained_shrinkage", action="store_true", help="Calibrate scalar with a train-calibration p90 constraint; original validation gate retained.")
     parser.add_argument("--replay_head", type=Path, help="Replay frozen weights; no optimizer steps.")
     parser.add_argument("--recalibrate_replay", action="store_true",
                         help="Frozen-weight transfer audit on new prototype inputs; refit mapping calibration only.")
@@ -976,6 +1001,7 @@ def main() -> None:
     parser.add_argument("--output_joint_residual_bank", type=Path)
     parser.add_argument('--joint_reprojection_weight',type=float,default=0.)
     parser.add_argument("--validation_route", default="seq9")
+    parser.add_argument("--mapping_image_partition", type=Path, help="Optional fixed train-image partition for a single mapping trajectory.")
     parser.add_argument("--hidden_dimension", type=int, default=96)
     parser.add_argument("--steps", type=int, default=1200)
     parser.add_argument("--batch_size", type=int, default=512)
@@ -1048,6 +1074,8 @@ def main() -> None:
             raise ValueError("replay must not overwrite the source checkpoint")
     if args.output.exists():
         raise FileExistsError("refusing to overwrite canonical subtoken head")
+    if args.tail_constrained_shrinkage and (not args.calibrate_coordinate_shrinkage or args.calibrate_coordinate_affine):
+        raise ValueError("tail constraint requires scalar shrinkage calibration")
     if args.calibrate_coordinate_shrinkage and args.calibrate_coordinate_affine:
         raise ValueError("coordinate calibration modes are mutually exclusive")
     if args.predict_chart_uv and not (
@@ -1125,7 +1153,12 @@ def main() -> None:
     cell = np.floor(uv / 0.5).astype(np.int64)
     identity_keys, identity = np.unique(np.c_[plane, cell], axis=0, return_inverse=True)
     route_per_observation = np.asarray([str(name).split("__", 1)[0] for name in visibility.view_names.astype(str)])
+    if args.mapping_image_partition is not None:
+        route_per_observation = image_groups(visibility.view_names.astype(str), args.mapping_image_partition)
+        args.validation_route = 'mapping_images_validation'
     all_routes = set(route_per_observation.tolist()); fit_routes = all_routes - {str(args.validation_route)}
+    if args.mapping_image_partition is not None:
+        fit_routes = {'mapping_images_fit'}
     if str(args.validation_route) not in all_routes or not fit_routes:
         raise ValueError("validation route does not form a mapping-only split")
 
@@ -1293,6 +1326,8 @@ def main() -> None:
             source_names, source_view = np.unique(visibility.view_names.astype(str), return_inverse=True)
             neighbor_observation = source_view[observation]
             neighbor_routes = np.asarray([name.split("__", 1)[0] for name in source_names])
+            if args.mapping_image_partition is not None:
+                neighbor_routes = image_groups(source_names, args.mapping_image_partition)
             # Multiple plane observations may belong to one source view.
             # Their tokens form one anonymous view/cell mode, never duplicates.
             pairs = np.c_[rep_identity, neighbor_observation[representatives]]
@@ -1614,7 +1649,8 @@ def main() -> None:
         if args.calibrate_coordinate_affine:
             affine_matrix, affine_bias = _closed_form_coordinate_affine(raw_mean, target)
         else:
-            shrinkage = scalar_reference_shrinkage
+            shrinkage = (_tail_constrained_coordinate_shrinkage(raw_mean, target)
+                         if args.tail_constrained_shrinkage else scalar_reference_shrinkage)
         calibrated_calibration_mean = _apply_coordinate_calibration(
             raw_mean, shrinkage=shrinkage,
             affine_matrix=affine_matrix, affine_bias=affine_bias,
@@ -1929,6 +1965,8 @@ def main() -> None:
         "zero_uv_calibrated_variance_m2":float(zero_uv_variance),
         "token_center_calibrated_variance_px2":float(token_center_variance),
         "coordinate_shrinkage_calibration":(
+            "minimum_MSE_scalar_under_calibration_p90_nonincrease_even_observations_only"
+            if args.tail_constrained_shrinkage else
             "closed_form_2d_affine_least_squares_on_even_sorted_validation_mapping_observations_only"
             if args.calibrate_coordinate_affine else
             "closed_form_scalar_least_squares_on_even_sorted_validation_mapping_observations_only"
@@ -1975,6 +2013,8 @@ def main() -> None:
         "radio_projection_file_sha256":file_sha256(args.radio_projection),"radio_projection_content_sha256":projection_meta.get("content_sha256"),
         "mapping_contributor_inventory_sha256":contributor_inventory_sha,"arrays_sha256":arrays_sha256(arrays),
     }
+    if args.mapping_image_partition is not None:
+        metadata.update(partition_metadata(args.mapping_image_partition))
     metadata["content_sha256"]=canonical_json_sha256(metadata)
     if replay_meta is not None:
         if args.match_only_finetune:

@@ -9,6 +9,7 @@ import json
 import time
 from pathlib import Path
 
+from feature_extract.tools.vfm.complete_scene_inputs import radio_manifests
 import numpy as np
 import torch
 from scipy.spatial import cKDTree
@@ -199,13 +200,18 @@ def main():
     if args.context_library:
         used_sources = np.asarray(library_meta['offline_mapping_source_names'])
     radii = readout_radii(args.region_boundaries, centers)
-    if args.retrieved_regions > len(np.unique(mode_regions)):
-        raise ValueError('retrieval width exceeds region inventory')
+    requested_retrieved_regions = args.retrieved_regions
+    available_regions = len(np.unique(mode_regions))
+    if available_regions < 1:
+        raise ValueError('empty region inventory')
+    # The retrieval budget is an upper bound; retain every available region
+    # in a small scene without inventing duplicate spatial units.
+    args.retrieved_regions = min(args.retrieved_regions, available_regions)
     groups = [np.asarray(g, np.int64) for g in cKDTree(atlas['world_points']).query_ball_point(centers, radii)]
     plane_ids = np.repeat(np.arange(len(atlas['plane_texel_offsets'])-1), np.diff(atlas['plane_texel_offsets']))
     descriptors = torch.as_tensor(atlas['radio_features'].astype(np.float32), device=args.device)
-    records = _records([Path('output/vfm_tokens/StMarysChurch/full_1024x576')/f'{split}_manifest.json' for split in ['train','test']])
-    manifest = dict(query_GT_used=False, inferred_query_pose_used=bool(pose_paths), radius_m=radii.tolist(), retrieved_regions=args.retrieved_regions, maximum_added_rows=1024,
+    records = _records(radio_manifests(b))
+    manifest = dict(requested_retrieved_regions=requested_retrieved_regions, query_GT_used=False, inferred_query_pose_used=bool(pose_paths), radius_m=radii.tolist(), retrieved_regions=args.retrieved_regions, maximum_added_rows=1024,
                     selection_pose_sha256={s:file_sha256(Path(pose_paths[s])) for s in args.splits} if pose_paths else {},
                     marginal_value_model_sha256=file_sha256(args.marginal_value_model) if args.marginal_value_model else None,
                     novel_token_control=bool(args.novel_token_control),

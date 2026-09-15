@@ -44,12 +44,10 @@ def _load_camera_by_image(model_dir: str) -> dict[str, ColmapCamera]:
         return {}
     model_path = Path(model_dir)
     cameras = read_colmap_cameras_binary(model_path / "cameras.bin")
-    images = read_colmap_images_binary(model_path / "images.bin")
-    result = {
-        image.image_name: cameras[image.camera_id]
-        for image in images.values()
-        if image.camera_id in cameras
-    }
+    from feature_extract.tools.vfm.cambridge_camera_authority import camera_bindings
+    bindings = camera_bindings(model_path / "images.bin")
+    result = {name: cameras[camera_id] for name, camera_id in bindings.items()
+              if camera_id in cameras}
     # Strict MAtCha datasets flatten ``seqN/frame.png`` to
     # ``seqN__frame.png`` because their RGB directory is single-level.  Keep
     # the original Cambridge ID as a deterministic alias for downstream VFM

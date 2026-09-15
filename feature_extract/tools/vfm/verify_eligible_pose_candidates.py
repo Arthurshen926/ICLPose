@@ -16,12 +16,12 @@ from feature_extract.tools.vfm.verification_bank_contract import validate_bank,v
 from feature_extract.vfm.localization_goal_maplet.lineage import file_sha256,arrays_sha256,canonical_json_sha256
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--policy',choices=['eligible','dual_support'],required=True);p.add_argument('--root',required=True);p.add_argument('--arms',nargs='+',required=True);p.add_argument('--output',required=True);p.add_argument('--baseline-root',default='heldout_evidence_v405/mnn_seed1');p.add_argument('--baseline-arm',default='corroborate');a=p.parse_args();b=Path('output/g25_pose_transport/planar_map_rendered_ransac_v1/surface_coordinate_upgrade_v1');r=b/a.root;mp=b/'native_fine_v264/readout/map.npz';modelpath=b/'spatial_verifier_v404/pairwise_verifier.joblib';fit=joblib.load(modelpath);model=fit['model'];meta=fit['metadata'];scale=meta['scale'];threshold=meta['threshold'];assert not meta['query_routes_read']
+    p=argparse.ArgumentParser();p.add_argument('--policy',choices=['eligible','dual_support'],required=True);p.add_argument('--root',required=True);p.add_argument('--arms',nargs='+',required=True);p.add_argument('--output',required=True);p.add_argument('--baseline-root',default='heldout_evidence_v405/mnn_seed1');p.add_argument('--baseline-arm',default='corroborate');p.add_argument('--base',type=Path,default=Path('output/g25_pose_transport/planar_map_rendered_ransac_v1/surface_coordinate_upgrade_v1'));p.add_argument('--splits',nargs='+',default=['seq10','shard0','shard1','shard2','shard3']);a=p.parse_args();b=a.base;r=b/a.root;mp=b/'native_fine_v264/readout/map.npz';modelpath=b/'spatial_verifier_v404/pairwise_verifier.joblib';fit=joblib.load(modelpath);model=fit['model'];meta=fit['metadata'];scale=meta['scale'];threshold=meta['threshold'];assert not meta['query_routes_read']
     with np.load(mp) as f:world=f['world_points'];mm=json.loads(f['metadata_json'].item())
     maphash=file_sha256(mp);atlas=b/'stmarys_metric_plane_uv_radio_atlas_cell050_p4_learned64d_strict_v9.npz';assert file_sha256(atlas)==mm['atlas_sha256']
     for arm in a.arms:
      o=b/a.output/(arm+'_verified');o.mkdir(exist_ok=True,parents=True)
-     for s in ['seq10','shard0','shard1','shard2','shard3']:
+     for s in a.splits:
       ap=r/'lod'/f'{s}_{arm}_audit.json';rp=r/'lod_final'/f'{s}_{arm}_audit.json';bp=b/a.baseline_root/f'{s}_{a.baseline_arm}.npz';cp=b/'native_reliability_v274/readout'/f'{s}_reliability_rank32.npz';bank=b/'heldout_evidence_v405/banks'/f'{s}.npz'
       with np.load(bp) as f:names=f['names'];base=f['pose_w2c']
       with np.load(cp) as f:Ks=f['camera_matrices'];ks=f['radial_k1'];assert np.array_equal(names,f['names'])
